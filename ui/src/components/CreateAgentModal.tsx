@@ -16,8 +16,11 @@ const ISOLATION_OPTIONS = [
   { value: "sandboxed", label: "Sandboxed", desc: "Own home dir only" },
 ] as const;
 
+// Types that use OAuth browser login instead of an API key
+const OAUTH_TYPES = new Set<AgentType>(["claude"]);
+
 const AUTH_HELP: Record<AgentType, { label: string; placeholder: string; docsUrl: string }> = {
-  claude:   { label: "Anthropic API key", placeholder: "sk-ant-api03-…", docsUrl: "https://console.anthropic.com/settings/keys" },
+  claude:   { label: "Anthropic API key (optional)", placeholder: "sk-ant-api03-…", docsUrl: "https://console.anthropic.com/settings/keys" },
   codex:    { label: "OpenAI API key",    placeholder: "sk-…",           docsUrl: "https://platform.openai.com/api-keys" },
   gemini:   { label: "Gemini API key",    placeholder: "AIza…",          docsUrl: "https://aistudio.google.com/apikey" },
   hermes:   { label: "OpenRouter API key",placeholder: "sk-or-v1-…",     docsUrl: "https://openrouter.ai/keys" },
@@ -41,6 +44,10 @@ export function CreateAgentModal({ onClose, onCreated }: Props) {
   // Step 2 state
   const [apiKey, setApiKey] = useState("");
   const [authNeeded, setAuthNeeded] = useState(false);
+  // OAuth flow state
+  const [oauthSessionId, setOauthSessionId] = useState<string | null>(null);
+  const [oauthUrl, setOauthUrl] = useState<string | null>(null);
+  const [oauthPolling, setOauthPolling] = useState(false);
 
   // Shared state
   const [step, setStep] = useState<Step>("config");
@@ -73,6 +80,47 @@ export function CreateAgentModal({ onClose, onCreated }: Props) {
       return;
     }
     await doCreate();
+  };
+
+  const startOAuth = async () => {
+    setError(null);
+    setBusy(true);
+    try {
+      const res = await fetch(`/api/auth/${type}/start`, { method: "POST" });
+      const j = await res.json();
+      if (!j.ok) {
+        setError(typeof j.error === "string" ? j.error : (j.error?.message ?? "Failed to start login"));
+        return;
+      }
+      setOauthSessionId(j.data.sessionId);
+      setOauthPolling(true);
+      pollOAuth(j.data.sessionId);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const pollOAuth = (sessionId: string) => {
+    const interval = setInterval(async () => {
+      try {
+        const res = await fetch(`/api/auth/${type}/poll/${sessionId}`);
+        const j = await res.json();
+        if (!j.ok) return;
+        const { state, url } = j.data as { state: string; url: string | null };
+        if (url && !oauthUrl) setOauthUrl(url);
+        if (state === "awaiting_code" && url) setOauthUrl(url);
+        if (state === "complete") {
+          clearInterval(interval);
+          setOauthPolling(false);
+          await doCreate();
+        }
+        if (state === "error") {
+          clearInterval(interval);
+          setOauthPolling(false);
+          setError("Authentication failed");
+        }
+      } catch { /* keep polling */ }
+    }, 2000);
   };
 
   const handleAuthAndCreate = async () => {
@@ -280,31 +328,64 @@ export function CreateAgentModal({ onClose, onCreated }: Props) {
                   </div>
                 </div>
 
-                <div className="flex flex-col gap-1.5">
-                  <div className="flex items-center justify-between">
-                    <label className="text-[0.8125rem] font-medium text-ink">{authHelp.label}</label>
-                    <a
-                      href={authHelp.docsUrl}
-                      target="_blank"
-                      rel="noopener noreferrer"
-                      className="text-[0.75rem] text-signal hover:underline"
-                    >
-                      Get key →
-                    </a>
+                {OAUTH_TYPES.has(type) ? (
+                  /* OAuth flow */
+                  <div className="flex flex-col gap-3">
+                    {!oauthUrl ? (
+                      <p className="text-[0.8125rem] text-ink-secondary">
+                        Sign in with your Claude account to authenticate this agent.
+                      </p>
+                    ) : (
+                      <>
+                        <p className="text-[0.8125rem] text-ink-secondary">
+                          A browser window will open. Sign in, then return here — this page will update automatically.
+                        </p>
+                        <a
+                          href={oauthUrl}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="flex items-center justify-center gap-2 rounded-xl border border-signal bg-signal-soft px-4 py-3 text-[0.875rem] font-medium text-signal hover:bg-signal hover:text-white transition-colors"
+                        >
+                          {(() => { const I = TYPE_ICON[type]; return I ? <I className="size-4" /> : null; })()}
+                          Open Claude sign-in →
+                        </a>
+                        {oauthPolling && (
+                          <div className="flex items-center gap-2 text-[0.8125rem] text-ink-muted">
+                            <div className="size-3.5 animate-spin rounded-full border-2 border-border-subtle border-t-signal" />
+                            Waiting for sign-in…
+                          </div>
+                        )}
+                      </>
+                    )}
                   </div>
-                  <input
-                    value={apiKey}
-                    onChange={(e) => setApiKey(e.target.value)}
-                    placeholder={authHelp.placeholder}
-                    type="password"
-                    autoFocus
-                    className="rounded-xl border border-border-subtle bg-surface-card px-3.5 py-2.5 font-mono text-[0.8125rem] text-ink outline-none focus:border-signal"
-                    onKeyDown={(e) => { if (e.key === "Enter") void handleAuthAndCreate(); }}
-                  />
-                  <p className="text-[0.75rem] text-ink-muted">
-                    Stored in <code className="rounded bg-surface-raised px-1">/etc/5dive/connectors/{type}.env</code>
-                  </p>
-                </div>
+                ) : (
+                  /* API key flow */
+                  <div className="flex flex-col gap-1.5">
+                    <div className="flex items-center justify-between">
+                      <label className="text-[0.8125rem] font-medium text-ink">{authHelp.label}</label>
+                      <a
+                        href={authHelp.docsUrl}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="text-[0.75rem] text-signal hover:underline"
+                      >
+                        Get key →
+                      </a>
+                    </div>
+                    <input
+                      value={apiKey}
+                      onChange={(e) => setApiKey(e.target.value)}
+                      placeholder={authHelp.placeholder}
+                      type="password"
+                      autoFocus
+                      className="rounded-xl border border-border-subtle bg-surface-card px-3.5 py-2.5 font-mono text-[0.8125rem] text-ink outline-none focus:border-signal"
+                      onKeyDown={(e) => { if (e.key === "Enter") void handleAuthAndCreate(); }}
+                    />
+                    <p className="text-[0.75rem] text-ink-muted">
+                      Stored in <code className="rounded bg-surface-raised px-1">/etc/5dive/connectors/{type}.env</code>
+                    </p>
+                  </div>
+                )}
 
                 {error && <p className="text-[0.8125rem] text-red-500">{error}</p>}
               </div>
@@ -331,7 +412,17 @@ export function CreateAgentModal({ onClose, onCreated }: Props) {
                     {authNeeded ? "Next →" : "Create agent"}
                   </Button>
                 )}
-                {step === "auth" && (
+                {step === "auth" && OAUTH_TYPES.has(type) && !oauthUrl && (
+                  <Button
+                    className="bg-signal text-white"
+                    isDisabled={busy}
+                    onPress={() => void startOAuth()}
+                  >
+                    {busy ? <Spinner size="sm" /> : null}
+                    Sign in with Claude
+                  </Button>
+                )}
+                {step === "auth" && !OAUTH_TYPES.has(type) && (
                   <Button
                     className="bg-signal text-white"
                     isDisabled={busy || !apiKey.trim()}

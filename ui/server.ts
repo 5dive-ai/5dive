@@ -110,6 +110,24 @@ const server = Bun.serve({
       }
     }
 
+    // POST /api/auth/:type/start  — start OAuth device-code flow
+    // GET  /api/auth/:type/poll/:sessionId  — poll for URL / completion
+    const authFlowMatch = path.match(/^\/api\/auth\/([^/]+)\/(start|poll(?:\/([^/]+))?)$/);
+    if (authFlowMatch) {
+      const type = authFlowMatch[1];
+      const action = authFlowMatch[2].startsWith("poll") ? "poll" : "start";
+      const sessionId = authFlowMatch[3];
+
+      if (req.method === "POST" && action === "start") {
+        const result = await runCLI("agent", "auth", "start", type);
+        return Response.json(result, { headers });
+      }
+      if (req.method === "GET" && action === "poll" && sessionId) {
+        const result = await runCLI("agent", "auth", "poll", sessionId);
+        return Response.json(result, { headers });
+      }
+    }
+
     // POST /api/agents  (create)
     if (req.method === "POST" && path === "/api/agents") {
       const body = await req.json() as Record<string, string>;
