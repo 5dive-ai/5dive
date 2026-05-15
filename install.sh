@@ -8,6 +8,7 @@ BIN_DIR="/usr/local/bin"
 STATE_DIR="/var/lib/5dive"
 CONNECTORS_DIR="/etc/5dive/connectors"
 SYSTEMD_DIR="/etc/systemd/system"
+NODE_VERSION="22"
 
 die() { echo "error: $*" >&2; exit 1; }
 ok()  { echo "  ✓ $*"; }
@@ -17,43 +18,71 @@ say() { echo "→ $*"; }
 
 say "Installing 5dive CLI"
 
+# System dependencies
+say "Installing system dependencies"
+apt-get update -qq
+DEBIAN_FRONTEND=noninteractive apt-get install -y -qq jq tmux git curl
+ok "jq, tmux, git, curl"
+
+# Create claude group + user (agents run as agent-<name> in the claude group)
+if ! getent group claude >/dev/null 2>&1; then
+  groupadd --system claude
+  ok "group 'claude' created"
+fi
+if ! id -u claude >/dev/null 2>&1; then
+  useradd --system --gid claude --shell /bin/bash --create-home --home-dir /home/claude claude
+  ok "user 'claude' created"
+fi
+
+# nvm + node (needed for codex, gemini agent types)
+say "Installing nvm + Node.js"
+if [[ ! -f /home/claude/.nvm/nvm.sh ]]; then
+  sudo -u claude bash -c 'curl -fsSL https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.3/install.sh | PROFILE=/dev/null bash'
+  ok "nvm installed"
+fi
+sudo -u claude bash -lc "source ~/.nvm/nvm.sh && nvm install $NODE_VERSION && nvm alias default $NODE_VERSION" 2>&1 | grep -E "Downloading|Now using|default" || true
+ok "Node.js $NODE_VERSION"
+
+# bun (needed for telegram plugin)
+say "Installing bun"
+if ! sudo -u claude bash -lc 'command -v bun' >/dev/null 2>&1; then
+  sudo -u claude bash -c 'curl -fsSL https://bun.sh/install | bash' 2>/dev/null
+  ok "bun installed"
+else
+  ok "bun already present"
+fi
+
 # Create directories
+say "Setting up 5dive directories"
 install -d -m 755 "$STATE_DIR"
 install -d -m 755 "$STATE_DIR/agents.d"
 install -d -m 755 "$CONNECTORS_DIR"
-ok "directories created"
+chown root:claude "$STATE_DIR" "$STATE_DIR/agents.d" "$CONNECTORS_DIR"
+chmod 750 "$CONNECTORS_DIR"
+ok "directories ready"
 
 # Install CLI
+say "Installing CLI binaries"
 curl -fsSL "$REPO/5dive" -o "$BIN_DIR/5dive"
 chmod 755 "$BIN_DIR/5dive"
-ok "5dive installed to $BIN_DIR/5dive"
+ok "5dive → $BIN_DIR/5dive"
 
-# Install agent-start helper
 curl -fsSL "$REPO/5dive-agent-start" -o "$BIN_DIR/5dive-agent-start"
 chmod 755 "$BIN_DIR/5dive-agent-start"
-ok "5dive-agent-start installed"
+ok "5dive-agent-start → $BIN_DIR/5dive-agent-start"
 
 # Install systemd template
 curl -fsSL "$REPO/systemd/5dive-agent%40.service" -o "$SYSTEMD_DIR/5dive-agent@.service"
 systemctl daemon-reload
 ok "systemd template installed"
 
-# Create claude group if missing (agents run in this group)
-if ! getent group claude >/dev/null 2>&1; then
-  groupadd --system claude
-  ok "group 'claude' created"
-fi
-
-# Create claude user if missing
-if ! id -u claude >/dev/null 2>&1; then
-  useradd --system --gid claude --shell /bin/bash --create-home --home-dir /home/claude claude
-  ok "user 'claude' created"
-fi
-
-chown root:claude "$STATE_DIR" "$STATE_DIR/agents.d" "$CONNECTORS_DIR"
-chmod 750 "$CONNECTORS_DIR"
-ok "permissions set"
-
 echo
-echo "5dive installed. Try: 5dive agent list"
+echo "5dive installed successfully."
+echo
+echo "Next steps:"
+echo "  5dive agent list                          # list agents"
+echo "  5dive doctor                              # check system health"
+echo "  5dive doctor --repair                     # auto-install agent type binaries"
+echo "  5dive agent create my-agent --type=claude # create your first agent"
+echo
 echo "Docs: https://github.com/5dive-com/5dive-cli"
