@@ -1,4 +1,5 @@
 import { useState, useEffect, useRef } from "react";
+import { Button, Spinner, Tabs } from "@heroui/react";
 import type { Agent } from "../types";
 import { StatusDot } from "./StatusDot";
 import { TypeBadge } from "./TypeBadge";
@@ -10,25 +11,29 @@ interface Props {
 }
 
 export function AgentDetail({ agent, onBack, onRefresh }: Props) {
-  const [tab, setTab] = useState<"logs" | "send" | "stats">("logs");
+  const [activeTab, setActiveTab] = useState("logs");
   const [logs, setLogs] = useState<string[]>([]);
+  const [logsLoading, setLogsLoading] = useState(true);
   const [stats, setStats] = useState<Record<string, string> | null>(null);
   const [message, setMessage] = useState("");
   const [sending, setSending] = useState(false);
   const [sendResult, setSendResult] = useState<string | null>(null);
+  const [busy, setBusy] = useState<string | null>(null);
   const logsEndRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
-    if (tab !== "logs") return;
+    if (activeTab !== "logs") return;
     setLogs([]);
-    const es = new EventSource(`/api/agents/${encodeURIComponent(agent.name)}/logs?lines=200`);
+    setLogsLoading(true);
+    const es = new EventSource(`/api/agents/${encodeURIComponent(agent.name)}/logs?lines=300`);
     es.onmessage = (e) => {
-      if (e.data === "[EOF]") { es.close(); return; }
+      if (e.data === "[EOF]") { setLogsLoading(false); es.close(); return; }
       const line = JSON.parse(e.data) as string;
       setLogs((prev) => [...prev, line]);
     };
+    es.onerror = () => { setLogsLoading(false); es.close(); };
     return () => es.close();
-  }, [agent.name, tab]);
+  }, [agent.name, activeTab]);
 
   useEffect(() => {
     if (logsEndRef.current) {
@@ -37,11 +42,22 @@ export function AgentDetail({ agent, onBack, onRefresh }: Props) {
   }, [logs]);
 
   useEffect(() => {
-    if (tab !== "stats") return;
+    if (activeTab !== "stats") return;
     fetch(`/api/agents/${encodeURIComponent(agent.name)}/stats`)
       .then((r) => r.json())
       .then((j) => { if (j.ok) setStats(j.data); });
-  }, [agent.name, tab]);
+  }, [agent.name, activeTab]);
+
+  const act = async (action: string) => {
+    if (busy) return;
+    setBusy(action);
+    try {
+      await fetch(`/api/agents/${encodeURIComponent(agent.name)}/${action}`, { method: "POST" });
+      await onRefresh();
+    } finally {
+      setBusy(null);
+    }
+  };
 
   const send = async () => {
     if (!message.trim() || sending) return;
@@ -54,147 +70,152 @@ export function AgentDetail({ agent, onBack, onRefresh }: Props) {
         body: JSON.stringify({ text: message }),
       });
       const j = await res.json();
-      setSendResult(j.ok ? "Sent!" : (j.error ?? "Failed"));
+      setSendResult(j.ok ? "Sent." : (j.error ?? "Failed"));
       if (j.ok) setMessage("");
     } finally {
       setSending(false);
     }
   };
 
+  const isActive = agent.status === "active";
+
   return (
-    <div className="flex flex-col gap-4">
-      {/* Back + header */}
-      <div className="flex items-center gap-3">
-        <button
-          onClick={onBack}
-          className="flex items-center gap-1.5 text-[0.8125rem] text-ink-secondary hover:text-ink"
+    <div className="flex flex-col gap-5">
+      {/* Breadcrumb */}
+      <div className="flex items-center gap-2 text-[0.8125rem]">
+        <Button
+          variant="ghost"
+          size="sm"
+          className="h-7 px-2 text-ink-secondary"
+          onPress={onBack}
         >
           ← Agents
-        </button>
-        <span className="text-ink-muted">/</span>
+        </Button>
+        <span className="text-border-hard">/</span>
         <div className="flex items-center gap-2">
-          <span className="text-[0.9375rem] font-medium text-ink">{agent.name}</span>
+          <span className="font-medium text-ink">{agent.name}</span>
           <StatusDot status={agent.status} />
           <TypeBadge type={agent.type} />
         </div>
       </div>
 
       {/* Quick actions */}
-      <div className="flex gap-2">
-        {agent.status === "active" ? (
-          <QuickBtn label="Stop" onClick={() => agentAction("stop", agent.name, onRefresh)} danger />
-        ) : (
-          <QuickBtn label="Start" onClick={() => agentAction("start", agent.name, onRefresh)} />
-        )}
-        <QuickBtn label="Restart" onClick={() => agentAction("restart", agent.name, onRefresh)} />
+      <div className="flex items-center gap-2">
+        <Button
+          size="sm"
+          variant="bordered"
+          className="border-border-subtle text-[0.8125rem]"
+          isDisabled={!!busy}
+          onPress={() => act(isActive ? "stop" : "start")}
+        >
+          {(busy === "stop" || busy === "start") ? <Spinner size="sm" /> : null}
+          {isActive ? "Stop" : "Start"}
+        </Button>
+        <Button
+          size="sm"
+          variant="bordered"
+          className="border-border-subtle text-[0.8125rem]"
+          isDisabled={!!busy}
+          onPress={() => act("restart")}
+        >
+          {busy === "restart" ? <Spinner size="sm" /> : null}
+          Restart
+        </Button>
       </div>
 
       {/* Tabs */}
-      <div className="flex gap-0 border-b border-zinc-100">
-        {(["logs", "send", "stats"] as const).map((t) => (
-          <button
-            key={t}
-            onClick={() => setTab(t)}
-            className={`px-4 pb-2.5 pt-0.5 text-[0.8125rem] font-medium transition-colors ${
-              tab === t
-                ? "border-b-2 border-signal text-signal"
-                : "text-ink-secondary hover:text-ink"
-            }`}
-          >
-            {t.charAt(0).toUpperCase() + t.slice(1)}
-          </button>
-        ))}
-      </div>
+      <Tabs
+        defaultSelectedKey="logs"
+        onSelectionChange={(key) => setActiveTab(key as string)}
+        variant="underline"
+      >
+        <Tabs.ListContainer>
+          <Tabs.List aria-label="Agent details">
+            <Tabs.Tab id="logs">Logs</Tabs.Tab>
+            <Tabs.Tab id="ask">Send</Tabs.Tab>
+            <Tabs.Tab id="stats">Stats</Tabs.Tab>
+          </Tabs.List>
+        </Tabs.ListContainer>
 
-      {/* Tab content */}
-      {tab === "logs" && (
-        <div className="h-96 overflow-y-auto rounded-xl bg-zinc-950 p-4 font-mono text-[0.75rem] text-zinc-300">
-          {logs.length === 0 ? (
-            <span className="text-zinc-600">Loading logs…</span>
-          ) : (
-            logs.map((line, i) => (
-              <div key={i} className="whitespace-pre-wrap leading-5">
-                {line}
-              </div>
-            ))
-          )}
-          <div ref={logsEndRef} />
-        </div>
-      )}
+        <Tabs.Panel id="logs">
+          <div className="terminal-block mt-3 h-96">
+            <div className="terminal-header">
+              <div className="terminal-dot" />
+              <div className="terminal-dot" />
+              <div className="terminal-dot" />
+              <span className="ml-2 text-[0.75rem] text-zinc-500">{agent.name}</span>
+            </div>
+            <div className="terminal-body h-[calc(100%-2.625rem)] overflow-y-auto">
+              {logsLoading && logs.length === 0 ? (
+                <span className="text-zinc-600">Loading…</span>
+              ) : logs.length === 0 ? (
+                <span className="text-zinc-600">No output yet.</span>
+              ) : (
+                logs.map((line, i) => (
+                  <div key={i} className="whitespace-pre-wrap leading-5">
+                    {line}
+                  </div>
+                ))
+              )}
+              <div ref={logsEndRef} />
+            </div>
+          </div>
+        </Tabs.Panel>
 
-      {tab === "send" && (
-        <div className="flex flex-col gap-3">
-          <p className="text-[0.8125rem] text-ink-secondary">
-            Send a message to this agent (injects into its terminal session).
-          </p>
-          <div className="flex gap-2">
-            <input
+        <Tabs.Panel id="ask">
+          <div className="mt-3 flex flex-col gap-3">
+            <p className="text-[0.8125rem] text-ink-secondary">
+              Inject a message into the agent's terminal session.
+            </p>
+            <textarea
               value={message}
               onChange={(e) => setMessage(e.target.value)}
-              onKeyDown={(e) => e.key === "Enter" && !e.shiftKey && void send()}
               placeholder="Type a message…"
-              className="min-w-0 flex-1 rounded-lg border border-zinc-200 px-3.5 py-2.5 text-[0.875rem] text-ink outline-none focus:border-signal"
+              rows={4}
+              className="w-full rounded-xl border border-border-subtle bg-surface-card px-3.5 py-2.5 text-[0.875rem] text-ink outline-none focus:border-signal resize-none"
+              onKeyDown={(e) => {
+                if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) void send();
+              }}
             />
-            <button
-              onClick={() => void send()}
-              disabled={sending || !message.trim()}
-              className="rounded-lg bg-signal px-4 py-2.5 text-[0.875rem] font-medium text-white disabled:opacity-40"
-            >
-              {sending ? "…" : "Send"}
-            </button>
+            <div className="flex items-center gap-2">
+              <Button
+                size="sm"
+                className="bg-signal text-white"
+                isDisabled={sending || !message.trim()}
+                onPress={() => void send()}
+              >
+                {sending ? <Spinner size="sm" /> : null}
+                Send
+              </Button>
+              <span className="text-[0.75rem] text-ink-muted">⌘↵ to send</span>
+            </div>
+            {sendResult && (
+              <p className={`text-[0.8125rem] ${sendResult === "Sent." ? "text-green-status" : "text-red-500"}`}>
+                {sendResult}
+              </p>
+            )}
           </div>
-          {sendResult && (
-            <p className={`text-[0.8125rem] ${sendResult === "Sent!" ? "text-green-600" : "text-red-500"}`}>
-              {sendResult}
-            </p>
-          )}
-        </div>
-      )}
+        </Tabs.Panel>
 
-      {tab === "stats" && (
-        <div className="rounded-xl border border-zinc-100 bg-white p-4">
-          {!stats ? (
-            <div className="text-[0.8125rem] text-ink-secondary">Loading…</div>
-          ) : (
-            <dl className="grid grid-cols-2 gap-x-8 gap-y-3 text-[0.8125rem]">
-              {Object.entries(stats).map(([k, v]) => (
-                <div key={k} className="flex flex-col gap-0.5">
-                  <dt className="text-[0.75rem] text-ink-muted">{k}</dt>
-                  <dd className="font-medium text-ink">{String(v) || "—"}</dd>
-                </div>
-              ))}
-            </dl>
-          )}
-        </div>
-      )}
+        <Tabs.Panel id="stats">
+          <div className="mt-3 rounded-xl border border-border-subtle bg-surface-card p-5">
+            {!stats ? (
+              <div className="flex justify-center py-6">
+                <Spinner size="sm" />
+              </div>
+            ) : (
+              <dl className="grid grid-cols-2 gap-x-8 gap-y-4 text-[0.8125rem] sm:grid-cols-3">
+                {Object.entries(stats).map(([k, v]) => (
+                  <div key={k} className="flex flex-col gap-0.5">
+                    <dt className="text-[0.75rem] text-ink-muted">{k}</dt>
+                    <dd className="font-medium text-ink">{String(v) || "—"}</dd>
+                  </div>
+                ))}
+              </dl>
+            )}
+          </div>
+        </Tabs.Panel>
+      </Tabs>
     </div>
-  );
-}
-
-async function agentAction(action: string, name: string, onRefresh: () => void) {
-  await fetch(`/api/agents/${encodeURIComponent(name)}/${action}`, { method: "POST" });
-  await onRefresh();
-}
-
-function QuickBtn({
-  label,
-  onClick,
-  danger,
-}: {
-  label: string;
-  onClick: () => void;
-  danger?: boolean;
-}) {
-  return (
-    <button
-      onClick={onClick}
-      className={`rounded-lg border px-3.5 py-1.5 text-[0.8125rem] font-medium transition-colors ${
-        danger
-          ? "border-red-200 text-red-500 hover:bg-red-50"
-          : "border-zinc-200 text-ink-secondary hover:bg-zinc-50 hover:text-ink"
-      }`}
-    >
-      {label}
-    </button>
   );
 }

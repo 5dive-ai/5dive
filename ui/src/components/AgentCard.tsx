@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { Button, Chip, Dropdown, Spinner } from "@heroui/react";
 import type { Agent } from "../types";
 import { StatusDot } from "./StatusDot";
 import { TypeBadge } from "./TypeBadge";
@@ -9,11 +10,13 @@ interface Props {
   onRefresh: () => void;
 }
 
-const ACTION_LABELS: Record<string, string> = {
-  start: "Starting…",
-  stop: "Stopping…",
-  restart: "Restarting…",
-  rm: "Deleting…",
+const TYPE_EMOJI: Record<string, string> = {
+  claude: "🤖",
+  codex: "💡",
+  gemini: "✨",
+  hermes: "⚡",
+  openclaw: "🦅",
+  opencode: "🔧",
 };
 
 export function AgentCard({ agent, onSelect, onRefresh }: Props) {
@@ -41,17 +44,25 @@ export function AgentCard({ agent, onSelect, onRefresh }: Props) {
     }
   };
 
+  const handleAction = (id: string) => {
+    if (id === "start") void act("start");
+    if (id === "stop") void act("stop");
+    if (id === "restart") void act("restart");
+    if (id === "delete") void del();
+    if (id === "view") onSelect();
+  };
+
   const isActive = agent.status === "active";
 
   return (
-    <div className="group flex items-center gap-4 rounded-xl border border-zinc-100 bg-white px-4 py-3.5 shadow-sm transition-shadow hover:shadow-md">
-      {/* Icon */}
-      <div className="flex size-9 shrink-0 items-center justify-center rounded-lg bg-zinc-50 text-[1.25rem]">
-        {typeEmoji(agent.type)}
+    <div className="group flex items-center gap-4 rounded-xl border border-border-subtle bg-surface-card px-4 py-3.5 transition-shadow hover:shadow-sm">
+      {/* Type icon */}
+      <div className="flex size-11 shrink-0 items-center justify-center rounded-xl bg-surface-raised text-[1.25rem]">
+        {TYPE_EMOJI[agent.type] ?? "🤖"}
       </div>
 
-      {/* Name + subtitle */}
-      <div className="flex min-w-0 flex-1 flex-col gap-0.5">
+      {/* Name + meta */}
+      <div className="flex min-w-0 flex-1 flex-col gap-1">
         <div className="flex items-center gap-2">
           <button
             onClick={onSelect}
@@ -61,16 +72,22 @@ export function AgentCard({ agent, onSelect, onRefresh }: Props) {
           </button>
           <StatusDot status={agent.status} />
           {agent.isolation === "sandboxed" && (
-            <span className="rounded-full bg-green-100 px-1.5 py-0.5 text-[0.625rem] font-medium text-green-700">
+            <Chip
+              size="sm"
+              classNames={{
+                base: "bg-green-100 border-0 h-auto py-0.5",
+                content: "text-green-700 text-[0.625rem] font-medium px-1.5 py-0",
+              }}
+            >
               sandboxed
-            </span>
+            </Chip>
           )}
         </div>
         <div className="flex items-center gap-2 text-[0.75rem] text-ink-secondary">
           <TypeBadge type={agent.type} />
           {agent.channels && agent.channels !== "none" && (
             <>
-              <span className="text-zinc-300">·</span>
+              <span className="text-border-hard">·</span>
               <span className="capitalize">{agent.channels}</span>
             </>
           )}
@@ -80,57 +97,35 @@ export function AgentCard({ agent, onSelect, onRefresh }: Props) {
       {/* Actions */}
       <div className="flex shrink-0 items-center gap-1.5 opacity-0 transition-opacity group-hover:opacity-100">
         {busy ? (
-          <span className="text-[0.75rem] text-ink-secondary">{ACTION_LABELS[busy]}</span>
+          <Spinner size="sm" />
         ) : (
           <>
-            {isActive ? (
-              <ActionBtn onClick={() => act("stop")} label="Stop" danger />
-            ) : (
-              <ActionBtn onClick={() => act("start")} label="Start" />
-            )}
-            <ActionBtn onClick={() => act("restart")} label="Restart" />
-            <ActionBtn onClick={del} label="Delete" danger />
+            <Button
+              size="sm"
+              variant="bordered"
+              className="h-7 min-w-0 border-border-subtle px-2.5 text-[0.75rem] text-ink-secondary"
+              onPress={() => act(isActive ? "stop" : "start")}
+            >
+              {isActive ? "Stop" : "Start"}
+            </Button>
+            <Dropdown>
+              <Dropdown.Trigger
+                className="inline-flex size-7 items-center justify-center rounded-lg text-[1rem] text-ink-muted outline-none hover:bg-surface-raised hover:text-ink"
+                aria-label={`Actions for ${agent.name}`}
+              >
+                ···
+              </Dropdown.Trigger>
+              <Dropdown.Popover placement="bottom end" className="min-w-36">
+                <Dropdown.Menu onAction={handleAction}>
+                  <Dropdown.Item id="view">View details</Dropdown.Item>
+                  <Dropdown.Item id="restart">Restart</Dropdown.Item>
+                  <Dropdown.Item id="delete" className="text-red-500">Delete</Dropdown.Item>
+                </Dropdown.Menu>
+              </Dropdown.Popover>
+            </Dropdown>
           </>
         )}
       </div>
     </div>
   );
-}
-
-function ActionBtn({
-  onClick,
-  label,
-  danger,
-}: {
-  onClick: () => void;
-  label: string;
-  danger?: boolean;
-}) {
-  return (
-    <button
-      onClick={(e) => {
-        e.stopPropagation();
-        onClick();
-      }}
-      className={`rounded-md px-2.5 py-1 text-[0.75rem] font-medium transition-colors ${
-        danger
-          ? "text-red-500 hover:bg-red-50"
-          : "text-ink-secondary hover:bg-zinc-100 hover:text-ink"
-      }`}
-    >
-      {label}
-    </button>
-  );
-}
-
-function typeEmoji(type: string): string {
-  const map: Record<string, string> = {
-    claude: "🤖",
-    codex: "💡",
-    gemini: "✨",
-    hermes: "⚡",
-    openclaw: "🦅",
-    opencode: "🔧",
-  };
-  return map[type] ?? "🤖";
 }

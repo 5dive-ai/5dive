@@ -1,7 +1,9 @@
 import { useState, useEffect, useCallback } from "react";
+import { Button } from "@heroui/react";
 import { AgentList } from "./components/AgentList";
 import { CreateAgentModal } from "./components/CreateAgentModal";
 import { AgentDetail } from "./components/AgentDetail";
+import { LogoMark } from "./components/Logo";
 import type { Agent } from "./types";
 
 export default function App() {
@@ -27,33 +29,34 @@ export default function App() {
   }, [refresh]);
 
   return (
-    <div className="min-h-screen bg-surface">
+    <div className="min-h-screen bg-surface-page">
       {/* Header */}
-      <header className="border-b border-zinc-100 bg-white">
+      <header className="sticky top-0 z-20 border-b border-border-subtle bg-surface-card/80 backdrop-blur-lg">
         <div className="mx-auto flex h-14 max-w-5xl items-center justify-between px-6">
           <div className="flex items-center gap-2.5">
-            <span className="text-[1.0625rem] font-semibold tracking-[-0.02em] text-ink">
+            <LogoMark className="size-7 shrink-0" />
+            <span className="text-[0.9375rem] font-semibold tracking-tight text-ink">
               5dive
             </span>
-            <span className="rounded-full bg-zinc-100 px-2 py-0.5 text-[0.6875rem] font-medium text-zinc-500">
+            <span className="rounded-full bg-surface-raised px-2 py-0.5 text-[0.6875rem] font-medium text-ink-muted">
               local
             </span>
           </div>
-          <button
-            onClick={() => setCreateOpen(true)}
-            className="inline-flex h-8 items-center gap-1.5 rounded-lg bg-signal px-3.5 text-[0.8125rem] font-medium text-white transition-opacity hover:opacity-90"
+          <Button
+            size="sm"
+            className="bg-signal text-white"
+            onPress={() => setCreateOpen(true)}
           >
-            <span className="text-[1.1rem] leading-none">+</span>
-            New agent
-          </button>
+            + New agent
+          </Button>
         </div>
       </header>
 
       {/* Main */}
       <main className="mx-auto max-w-5xl px-6 py-8">
         {loading ? (
-          <div className="flex items-center justify-center py-20">
-            <div className="size-5 animate-spin rounded-full border-2 border-zinc-200 border-t-signal" />
+          <div className="flex items-center justify-center py-24">
+            <div className="size-5 animate-spin rounded-full border-2 border-border-subtle border-t-signal" />
           </div>
         ) : selected ? (
           <AgentDetail
@@ -62,11 +65,22 @@ export default function App() {
             onRefresh={refresh}
           />
         ) : (
-          <AgentList
-            agents={agents}
-            onSelect={setSelected}
-            onRefresh={refresh}
-          />
+          <>
+            <div className="mb-6 flex flex-col gap-1">
+              <h1 className="text-[1.25rem] font-semibold tracking-tight text-ink">
+                Agents
+              </h1>
+              <p className="text-[0.875rem] text-ink-secondary">
+                Manage your AI agents running on this machine.
+              </p>
+            </div>
+            <hr className="mb-6 border-border-subtle" />
+            <AgentList
+              agents={agents}
+              onSelect={setSelected}
+              onRefresh={refresh}
+            />
+          </>
         )}
       </main>
 

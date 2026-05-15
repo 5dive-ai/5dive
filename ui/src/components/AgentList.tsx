@@ -1,3 +1,4 @@
+import { Button } from "@heroui/react";
 import type { Agent } from "../types";
 import { AgentCard } from "./AgentCard";
 
@@ -11,10 +12,16 @@ export function AgentList({ agents, onSelect, onRefresh }: Props) {
   if (agents.length === 0) {
     return (
       <div className="flex flex-col items-center justify-center gap-3 py-24 text-center">
-        <div className="text-4xl">🤖</div>
-        <p className="text-[0.9375rem] font-medium text-ink">No agents yet</p>
-        <p className="text-[0.8125rem] text-ink-secondary">
-          Create your first agent with the button above.
+        <div className="flex size-16 items-center justify-center rounded-2xl bg-surface-raised text-3xl">
+          🤖
+        </div>
+        <p className="text-[0.9375rem] font-semibold text-ink">No agents yet</p>
+        <p className="max-w-xs text-[0.8125rem] text-ink-secondary">
+          Create your first agent with the button above, or run{" "}
+          <code className="rounded bg-surface-raised px-1 font-mono text-[0.75rem]">
+            5dive agent create my-agent --type=claude
+          </code>{" "}
+          in the terminal.
         </p>
       </div>
     );
@@ -22,16 +29,18 @@ export function AgentList({ agents, onSelect, onRefresh }: Props) {
 
   return (
     <div className="flex flex-col gap-2">
-      <div className="mb-2 flex items-center justify-between">
-        <p className="text-[0.8125rem] text-ink-secondary">
+      <div className="mb-1 flex items-center justify-between">
+        <p className="text-[0.8125rem] text-ink-muted">
           {agents.length} agent{agents.length !== 1 ? "s" : ""}
         </p>
-        <button
-          onClick={onRefresh}
-          className="text-[0.8125rem] text-ink-secondary hover:text-ink"
+        <Button
+          size="sm"
+          variant="light"
+          className="h-7 px-2 text-[0.8125rem] text-ink-secondary"
+          onPress={onRefresh}
         >
           Refresh
-        </button>
+        </Button>
       </div>
       {agents.map((agent) => (
         <AgentCard
