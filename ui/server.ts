@@ -1,11 +1,16 @@
 #!/usr/bin/env bun
 // Local API server — wraps the 5dive CLI for the dashboard UI.
 // Run: bun run server.ts  (or 5dive ui)
+// In production (after `bun run build`), also serves the static frontend.
 
 import { spawn } from "child_process";
+import { existsSync } from "fs";
+import { join } from "path";
 
 const PORT = parseInt(process.env.PORT ?? "5175");
 const CLI = process.env.FIVE_CLI ?? "5dive";
+const DIST = join(import.meta.dir, "dist");
+const SERVE_STATIC = existsSync(DIST);
 
 async function runCLI(...args: string[]): Promise<{ ok: boolean; data?: unknown; error?: string }> {
   return new Promise((resolve) => {
@@ -139,8 +144,17 @@ const server = Bun.serve({
       }
     }
 
+    // Serve static frontend in production
+    if (SERVE_STATIC) {
+      let filePath = join(DIST, url.pathname === "/" ? "index.html" : url.pathname);
+      if (!existsSync(filePath)) filePath = join(DIST, "index.html"); // SPA fallback
+      const file = Bun.file(filePath);
+      return new Response(file);
+    }
+
     return new Response(JSON.stringify({ ok: false, error: "not found" }), { status: 404, headers });
   },
 });
 
-console.log(`5dive UI server running at http://localhost:${PORT}`);
+console.log(`5dive UI at http://localhost:${PORT}${SERVE_STATIC ? "" : " (API only — run `bun run build` for full UI)"}`);
+if (SERVE_STATIC) console.log(`  open http://localhost:${PORT}`);
