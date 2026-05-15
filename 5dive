@@ -5686,6 +5686,21 @@ main() {
       ensure_state
       paperclip_seed_all_from_registry
       ok "paperclip credentials seeded from registry" '{seeded:true}' ;;
+    ui)
+      # Start the local dashboard UI server and open the browser.
+      local port="${1:-5175}"
+      local ui_dir
+      # Look for ui/ relative to this script, then fall back to /usr/local/lib/5dive/ui
+      if [[ -d "$(dirname "$(realpath "$0")")/ui" ]]; then
+        ui_dir="$(dirname "$(realpath "$0")")/ui"
+      elif [[ -d /usr/local/lib/5dive/ui ]]; then
+        ui_dir="/usr/local/lib/5dive/ui"
+      else
+        fail "$E_NOT_FOUND" "5dive UI not found — install it at /usr/local/lib/5dive/ui or run from the 5dive-cli repo directory"
+      fi
+      echo "Starting 5dive UI at http://localhost:${port}" >&2
+      cd "$ui_dir"
+      PORT="$port" exec bun run server.ts ;;
     -h|--help|help) usage ;;
     *) fail "$E_USAGE" "unknown command: $top" ;;
   esac
