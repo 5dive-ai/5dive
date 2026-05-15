@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback } from "react";
 import { Sidebar } from "./components/Sidebar";
-import { CreateAgentModal } from "./components/CreateAgentModal";
+import { NewAgentFlow } from "./components/NewAgentFlow";
 import { AgentsPage } from "./pages/AgentsPage";
 import { AccountsPage } from "./pages/AccountsPage";
 import { HealthPage } from "./pages/HealthPage";
@@ -9,7 +9,7 @@ import type { Agent, Page } from "./types";
 
 export default function App() {
   const [agents, setAgents] = useState<Agent[] | null>(null);
-  const [createOpen, setCreateOpen] = useState(false);
+  const [creating, setCreating] = useState(false);
   const [selected, setSelected] = useState<Agent | null>(null);
   const [page, setPage] = useState<Page>("agents");
 
@@ -40,7 +40,7 @@ export default function App() {
         <Sidebar
           page={page}
           onNavigate={handleNavigate}
-          onNewAgent={() => setCreateOpen(true)}
+          onNewAgent={() => setCreating(true)}
         />
 
         <main className="flex-1 overflow-y-auto pt-14 pb-16 md:pt-0 md:pb-0">
@@ -59,11 +59,11 @@ export default function App() {
           </div>
         </main>
 
-        {createOpen && (
-          <CreateAgentModal
-            onClose={() => setCreateOpen(false)}
+        {creating && (
+          <NewAgentFlow
+            onExit={() => setCreating(false)}
             onCreated={() => {
-              setCreateOpen(false);
+              setCreating(false);
               void refresh();
             }}
           />
