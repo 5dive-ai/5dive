@@ -1,6 +1,8 @@
 import { useState, useEffect, useRef } from "react";
 import { Button, Spinner, Tabs } from "@heroui/react";
+import { ArrowLeft, Play, Square, RotateCw, Terminal, Send, BarChart2 } from "lucide-react";
 import type { Agent } from "../types";
+import { TYPE_ICON } from "./icons";
 import { StatusDot } from "./StatusDot";
 import { TypeBadge } from "./TypeBadge";
 
@@ -20,6 +22,7 @@ export function AgentDetail({ agent, onBack, onRefresh }: Props) {
   const [sendResult, setSendResult] = useState<string | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
   const logsEndRef = useRef<HTMLDivElement>(null);
+  const Icon = TYPE_ICON[agent.type] ?? TYPE_ICON.claude;
 
   useEffect(() => {
     if (activeTab !== "logs") return;
@@ -70,7 +73,7 @@ export function AgentDetail({ agent, onBack, onRefresh }: Props) {
         body: JSON.stringify({ text: message }),
       });
       const j = await res.json();
-      setSendResult(j.ok ? "Sent." : (j.error ?? "Failed"));
+      setSendResult(j.ok ? "Sent." : (j.error?.message ?? j.error ?? "Failed"));
       if (j.ok) setMessage("");
     } finally {
       setSending(false);
@@ -86,13 +89,17 @@ export function AgentDetail({ agent, onBack, onRefresh }: Props) {
         <Button
           variant="ghost"
           size="sm"
-          className="h-7 px-2 text-ink-secondary"
+          className="h-7 gap-1.5 px-2 text-ink-secondary"
           onPress={onBack}
         >
-          ← Agents
+          <ArrowLeft className="size-3.5" />
+          Agents
         </Button>
         <span className="text-border-hard">/</span>
         <div className="flex items-center gap-2">
+          <div className="flex size-6 items-center justify-center rounded-md bg-surface-raised text-ink-secondary">
+            <Icon className="size-3.5" />
+          </div>
           <span className="font-medium text-ink">{agent.name}</span>
           <StatusDot status={agent.status} />
           <TypeBadge type={agent.type} />
@@ -104,21 +111,23 @@ export function AgentDetail({ agent, onBack, onRefresh }: Props) {
         <Button
           size="sm"
           variant="bordered"
-          className="border-border-subtle text-[0.8125rem]"
+          className="gap-1.5 border-border-subtle text-[0.8125rem]"
           isDisabled={!!busy}
           onPress={() => act(isActive ? "stop" : "start")}
         >
-          {(busy === "stop" || busy === "start") ? <Spinner size="sm" /> : null}
+          {(busy === "stop" || busy === "start")
+            ? <Spinner size="sm" />
+            : isActive ? <Square className="size-3.5" /> : <Play className="size-3.5" />}
           {isActive ? "Stop" : "Start"}
         </Button>
         <Button
           size="sm"
           variant="bordered"
-          className="border-border-subtle text-[0.8125rem]"
+          className="gap-1.5 border-border-subtle text-[0.8125rem]"
           isDisabled={!!busy}
           onPress={() => act("restart")}
         >
-          {busy === "restart" ? <Spinner size="sm" /> : null}
+          {busy === "restart" ? <Spinner size="sm" /> : <RotateCw className="size-3.5" />}
           Restart
         </Button>
       </div>
@@ -131,9 +140,15 @@ export function AgentDetail({ agent, onBack, onRefresh }: Props) {
       >
         <Tabs.ListContainer>
           <Tabs.List aria-label="Agent details">
-            <Tabs.Tab id="logs">Logs</Tabs.Tab>
-            <Tabs.Tab id="ask">Send</Tabs.Tab>
-            <Tabs.Tab id="stats">Stats</Tabs.Tab>
+            <Tabs.Tab id="logs">
+              <span className="flex items-center gap-1.5"><Terminal className="size-3.5" /> Logs</span>
+            </Tabs.Tab>
+            <Tabs.Tab id="ask">
+              <span className="flex items-center gap-1.5"><Send className="size-3.5" /> Send</span>
+            </Tabs.Tab>
+            <Tabs.Tab id="stats">
+              <span className="flex items-center gap-1.5"><BarChart2 className="size-3.5" /> Stats</span>
+            </Tabs.Tab>
           </Tabs.List>
         </Tabs.ListContainer>
 
@@ -152,9 +167,7 @@ export function AgentDetail({ agent, onBack, onRefresh }: Props) {
                 <span className="text-zinc-600">No output yet.</span>
               ) : (
                 logs.map((line, i) => (
-                  <div key={i} className="whitespace-pre-wrap leading-5">
-                    {line}
-                  </div>
+                  <div key={i} className="whitespace-pre-wrap leading-5">{line}</div>
                 ))
               )}
               <div ref={logsEndRef} />
@@ -172,19 +185,17 @@ export function AgentDetail({ agent, onBack, onRefresh }: Props) {
               onChange={(e) => setMessage(e.target.value)}
               placeholder="Type a message…"
               rows={4}
-              className="w-full rounded-xl border border-border-subtle bg-surface-card px-3.5 py-2.5 text-[0.875rem] text-ink outline-none focus:border-signal resize-none"
-              onKeyDown={(e) => {
-                if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) void send();
-              }}
+              className="w-full resize-none rounded-xl border border-border-subtle bg-surface-card px-3.5 py-2.5 text-[0.875rem] text-ink outline-none focus:border-signal"
+              onKeyDown={(e) => { if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) void send(); }}
             />
             <div className="flex items-center gap-2">
               <Button
                 size="sm"
-                className="bg-signal text-white"
+                className="gap-1.5 bg-signal text-white"
                 isDisabled={sending || !message.trim()}
                 onPress={() => void send()}
               >
-                {sending ? <Spinner size="sm" /> : null}
+                {sending ? <Spinner size="sm" /> : <Send className="size-3.5" />}
                 Send
               </Button>
               <span className="text-[0.75rem] text-ink-muted">⌘↵ to send</span>
@@ -200,9 +211,7 @@ export function AgentDetail({ agent, onBack, onRefresh }: Props) {
         <Tabs.Panel id="stats">
           <div className="mt-3 rounded-xl border border-border-subtle bg-surface-card p-5">
             {!stats ? (
-              <div className="flex justify-center py-6">
-                <Spinner size="sm" />
-              </div>
+              <div className="flex justify-center py-6"><Spinner size="sm" /></div>
             ) : (
               <dl className="grid grid-cols-2 gap-x-8 gap-y-4 text-[0.8125rem] sm:grid-cols-3">
                 {Object.entries(stats).map(([k, v]) => (

@@ -1,5 +1,6 @@
 import { useState, useEffect } from "react";
 import { Button, Modal, Spinner, useOverlayState } from "@heroui/react";
+import { TYPE_ICON } from "./icons";
 
 interface Props {
   onClose: () => void;
@@ -24,10 +25,8 @@ const AUTH_HELP: Record<AgentType, { label: string; placeholder: string; docsUrl
   opencode: { label: "OpenAI API key",    placeholder: "sk-…",           docsUrl: "https://platform.openai.com/api-keys" },
 };
 
-const TYPE_EMOJI: Record<AgentType, string> = {
-  claude: "🤖", codex: "💡", gemini: "✨",
-  hermes: "⚡", openclaw: "🦅", opencode: "🔧",
-};
+// Types that support Telegram/Discord channels
+const CHANNEL_SUPPORTED = new Set(["claude", "hermes", "openclaw"]);
 
 type Step = "config" | "auth" | "creating";
 
@@ -61,6 +60,8 @@ export function CreateAgentModal({ onClose, onCreated }: Props) {
         setAuthNeeded(status !== "ok");
       })
       .catch(() => {});
+    // Reset channel when switching to a type that doesn't support it
+    if (!CHANNEL_SUPPORTED.has(type)) setChannels("none");
     return () => { cancelled = true; };
   }, [type]);
 
@@ -195,7 +196,7 @@ export function CreateAgentModal({ onClose, onCreated }: Props) {
                             : "border-border-subtle text-ink-secondary hover:bg-surface-raised"
                         }`}
                       >
-                        <span>{TYPE_EMOJI[t]}</span>
+                        {(() => { const I = TYPE_ICON[t] ?? TYPE_ICON.claude; return <I className="size-3.5 shrink-0" />; })()}
                         {t}
                       </button>
                     ))}
@@ -224,20 +225,22 @@ export function CreateAgentModal({ onClose, onCreated }: Props) {
                   </div>
                 </div>
 
-                <div className="flex flex-col gap-1.5">
-                  <label className="text-[0.8125rem] font-medium text-ink">Channel</label>
-                  <select
-                    value={channels}
-                    onChange={(e) => setChannels(e.target.value)}
-                    className="rounded-xl border border-border-subtle bg-surface-card px-3.5 py-2.5 text-[0.875rem] text-ink outline-none focus:border-signal"
-                  >
-                    <option value="none">None (terminal only)</option>
-                    <option value="telegram">Telegram</option>
-                    <option value="discord">Discord</option>
-                  </select>
-                </div>
+                {CHANNEL_SUPPORTED.has(type) && (
+                  <div className="flex flex-col gap-1.5">
+                    <label className="text-[0.8125rem] font-medium text-ink">Channel</label>
+                    <select
+                      value={channels}
+                      onChange={(e) => setChannels(e.target.value)}
+                      className="rounded-xl border border-border-subtle bg-surface-card px-3.5 py-2.5 text-[0.875rem] text-ink outline-none focus:border-signal"
+                    >
+                      <option value="none">None (terminal only)</option>
+                      <option value="telegram">Telegram</option>
+                      <option value="discord">Discord</option>
+                    </select>
+                  </div>
+                )}
 
-                {channels === "telegram" && (
+                {channels === "telegram" && CHANNEL_SUPPORTED.has(type) && (
                   <div className="flex flex-col gap-1.5">
                     <label className="text-[0.8125rem] font-medium text-ink">Telegram bot token</label>
                     <input
@@ -257,7 +260,9 @@ export function CreateAgentModal({ onClose, onCreated }: Props) {
             {step === "auth" && (
               <div className="flex flex-col gap-5 px-6 py-5">
                 <div className="flex items-center gap-3 rounded-xl bg-surface-raised p-4">
-                  <span className="text-2xl">{TYPE_EMOJI[type]}</span>
+                  <div className="flex size-10 items-center justify-center rounded-xl bg-surface-card text-ink-secondary">
+                    {(() => { const I = TYPE_ICON[type] ?? TYPE_ICON.claude; return <I className="size-5" />; })()}
+                  </div>
                   <div>
                     <p className="text-[0.875rem] font-medium text-ink">{type}</p>
                     <p className="text-[0.75rem] text-ink-secondary">Not yet authenticated on this machine</p>

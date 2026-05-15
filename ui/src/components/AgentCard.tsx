@@ -1,6 +1,8 @@
 import { useState } from "react";
 import { Button, Chip, Dropdown, Spinner } from "@heroui/react";
+import { MoreVertical, RotateCw, Square, Play, Trash2 } from "lucide-react";
 import type { Agent } from "../types";
+import { TYPE_ICON } from "./icons";
 import { StatusDot } from "./StatusDot";
 import { TypeBadge } from "./TypeBadge";
 
@@ -10,17 +12,9 @@ interface Props {
   onRefresh: () => void;
 }
 
-const TYPE_EMOJI: Record<string, string> = {
-  claude: "🤖",
-  codex: "💡",
-  gemini: "✨",
-  hermes: "⚡",
-  openclaw: "🦅",
-  opencode: "🔧",
-};
-
 export function AgentCard({ agent, onSelect, onRefresh }: Props) {
   const [busy, setBusy] = useState<string | null>(null);
+  const Icon = TYPE_ICON[agent.type] ?? TYPE_ICON.claude;
 
   const act = async (action: string) => {
     if (busy) return;
@@ -45,11 +39,11 @@ export function AgentCard({ agent, onSelect, onRefresh }: Props) {
   };
 
   const handleAction = (id: string) => {
-    if (id === "start") void act("start");
-    if (id === "stop") void act("stop");
+    if (id === "start")   void act("start");
+    if (id === "stop")    void act("stop");
     if (id === "restart") void act("restart");
-    if (id === "delete") void del();
-    if (id === "view") onSelect();
+    if (id === "delete")  void del();
+    if (id === "view")    onSelect();
   };
 
   const isActive = agent.status === "active";
@@ -57,8 +51,8 @@ export function AgentCard({ agent, onSelect, onRefresh }: Props) {
   return (
     <div className="group flex items-center gap-4 rounded-xl border border-border-subtle bg-surface-card px-4 py-3.5 transition-shadow hover:shadow-sm">
       {/* Type icon */}
-      <div className="flex size-11 shrink-0 items-center justify-center rounded-xl bg-surface-raised text-[1.25rem]">
-        {TYPE_EMOJI[agent.type] ?? "🤖"}
+      <div className="flex size-11 shrink-0 items-center justify-center rounded-xl bg-surface-raised text-ink-secondary">
+        <Icon className="size-5" />
       </div>
 
       {/* Name + meta */}
@@ -103,23 +97,29 @@ export function AgentCard({ agent, onSelect, onRefresh }: Props) {
             <Button
               size="sm"
               variant="bordered"
-              className="h-7 min-w-0 border-border-subtle px-2.5 text-[0.75rem] text-ink-secondary"
+              className="h-7 min-w-0 gap-1 border-border-subtle px-2.5 text-[0.75rem] text-ink-secondary"
               onPress={() => act(isActive ? "stop" : "start")}
             >
-              {isActive ? "Stop" : "Start"}
+              {isActive
+                ? <><Square className="size-3" /> Stop</>
+                : <><Play className="size-3" /> Start</>}
             </Button>
             <Dropdown>
               <Dropdown.Trigger
-                className="inline-flex size-7 items-center justify-center rounded-lg text-[1rem] text-ink-muted outline-none hover:bg-surface-raised hover:text-ink"
+                className="inline-flex size-7 items-center justify-center rounded-lg text-ink-muted outline-none hover:bg-surface-raised hover:text-ink"
                 aria-label={`Actions for ${agent.name}`}
               >
-                ···
+                <MoreVertical className="size-4" />
               </Dropdown.Trigger>
               <Dropdown.Popover placement="bottom end" className="min-w-36">
                 <Dropdown.Menu onAction={handleAction}>
                   <Dropdown.Item id="view">View details</Dropdown.Item>
-                  <Dropdown.Item id="restart">Restart</Dropdown.Item>
-                  <Dropdown.Item id="delete" className="text-red-500">Delete</Dropdown.Item>
+                  <Dropdown.Item id="restart">
+                    <span className="flex items-center gap-2"><RotateCw className="size-3.5" /> Restart</span>
+                  </Dropdown.Item>
+                  <Dropdown.Item id="delete" className="text-red-500">
+                    <span className="flex items-center gap-2"><Trash2 className="size-3.5" /> Delete</span>
+                  </Dropdown.Item>
                 </Dropdown.Menu>
               </Dropdown.Popover>
             </Dropdown>
