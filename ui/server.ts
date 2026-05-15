@@ -80,6 +80,36 @@ const server = Bun.serve({
       return Response.json(result, { headers });
     }
 
+    // GET /api/auth/:type  — check auth status
+    const authMatch = path.match(/^\/api\/auth\/([^/]+)$/);
+    if (authMatch) {
+      const type = authMatch[1];
+      if (req.method === "GET") {
+        const result = await runCLI("agent", "auth", "status", type);
+        return Response.json(result, { headers });
+      }
+      // POST /api/auth/:type  { apiKey }  — set API key via stdin
+      if (req.method === "POST") {
+        const body = await req.json() as { apiKey: string };
+        const result = await new Promise<{ ok: boolean; data?: unknown; error?: string }>((resolve) => {
+          const proc = spawn(CLI, ["agent", "auth", "set", type, "--api-key=-", "--json"], {
+            stdio: ["pipe", "pipe", "pipe"],
+          });
+          let stdout = "";
+          let stderr = "";
+          proc.stdout.on("data", (d: Buffer) => (stdout += d.toString()));
+          proc.stderr.on("data", (d: Buffer) => (stderr += d.toString()));
+          proc.on("close", (code) => {
+            try { resolve(JSON.parse(stdout.trim())); }
+            catch { resolve({ ok: false, error: stderr.trim() || `exit ${code}` }); }
+          });
+          proc.stdin.write(body.apiKey);
+          proc.stdin.end();
+        });
+        return Response.json(result, { headers });
+      }
+    }
+
     // POST /api/agents  (create)
     if (req.method === "POST" && path === "/api/agents") {
       const body = await req.json() as Record<string, string>;

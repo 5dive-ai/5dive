@@ -1,10 +1,5 @@
-import { useState } from "react";
-import {
-  Button,
-  Modal,
-  Spinner,
-  useOverlayState,
-} from "@heroui/react";
+import { useState, useEffect } from "react";
+import { Button, Modal, Spinner, useOverlayState } from "@heroui/react";
 
 interface Props {
   onClose: () => void;
@@ -12,27 +7,103 @@ interface Props {
 }
 
 const TYPES = ["claude", "codex", "gemini", "hermes", "openclaw", "opencode"] as const;
+type AgentType = typeof TYPES[number];
+
 const ISOLATION_OPTIONS = [
   { value: "admin",     label: "Admin",     desc: "Full server access" },
-  { value: "standard",  label: "Standard",  desc: "Limited access" },
-  { value: "sandboxed", label: "Sandboxed", desc: "Isolated home dir" },
+  { value: "standard",  label: "Standard",  desc: "Read-only /home/claude" },
+  { value: "sandboxed", label: "Sandboxed", desc: "Own home dir only" },
 ] as const;
 
+const AUTH_HELP: Record<AgentType, { label: string; placeholder: string; docsUrl: string }> = {
+  claude:   { label: "Anthropic API key", placeholder: "sk-ant-api03-…", docsUrl: "https://console.anthropic.com/settings/keys" },
+  codex:    { label: "OpenAI API key",    placeholder: "sk-…",           docsUrl: "https://platform.openai.com/api-keys" },
+  gemini:   { label: "Gemini API key",    placeholder: "AIza…",          docsUrl: "https://aistudio.google.com/apikey" },
+  hermes:   { label: "OpenRouter API key",placeholder: "sk-or-v1-…",     docsUrl: "https://openrouter.ai/keys" },
+  openclaw: { label: "OpenRouter API key",placeholder: "sk-or-v1-…",     docsUrl: "https://openrouter.ai/keys" },
+  opencode: { label: "OpenAI API key",    placeholder: "sk-…",           docsUrl: "https://platform.openai.com/api-keys" },
+};
+
+const TYPE_EMOJI: Record<AgentType, string> = {
+  claude: "🤖", codex: "💡", gemini: "✨",
+  hermes: "⚡", openclaw: "🦅", opencode: "🔧",
+};
+
+type Step = "config" | "auth" | "creating";
+
 export function CreateAgentModal({ onClose, onCreated }: Props) {
+  // Step 1 state
   const [name, setName] = useState("");
-  const [type, setType] = useState("claude");
+  const [type, setType] = useState<AgentType>("claude");
   const [isolation, setIsolation] = useState("admin");
   const [channels, setChannels] = useState("none");
   const [telegramToken, setTelegramToken] = useState("");
-  const [creating, setCreating] = useState(false);
+
+  // Step 2 state
+  const [apiKey, setApiKey] = useState("");
+  const [authNeeded, setAuthNeeded] = useState(false);
+
+  // Shared state
+  const [step, setStep] = useState<Step>("config");
+  const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   const modalState = useOverlayState({ isOpen: true, onOpenChange: (open) => { if (!open) onClose(); } });
 
-  const create = async () => {
-    if (!name.trim()) { setError("Name is required"); return; }
-    setCreating(true);
+  // Check auth status whenever type changes
+  useEffect(() => {
+    let cancelled = false;
+    fetch(`/api/auth/${type}`)
+      .then(r => r.json())
+      .then((j: { ok: boolean; data?: Record<string, string> }) => {
+        if (cancelled) return;
+        const status = j.ok ? (j.data?.[type] ?? "needs_login") : "needs_login";
+        setAuthNeeded(status !== "ok");
+      })
+      .catch(() => {});
+    return () => { cancelled = true; };
+  }, [type]);
+
+  const handleNext = async () => {
     setError(null);
+    if (!name.trim()) { setError("Name is required"); return; }
+    if (authNeeded) {
+      setStep("auth");
+      return;
+    }
+    await doCreate();
+  };
+
+  const handleAuthAndCreate = async () => {
+    setError(null);
+    if (!apiKey.trim()) { setError("API key is required"); return; }
+    setBusy(true);
+    setStep("creating");
+    try {
+      const authRes = await fetch(`/api/auth/${type}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ apiKey: apiKey.trim() }),
+      });
+      const authJ = await authRes.json();
+      if (!authJ.ok) {
+        const e = authJ.error;
+        setError(typeof e === "string" ? e : (e?.message ?? "Authentication failed"));
+        setStep("auth");
+        setBusy(false);
+        return;
+      }
+      await doCreate();
+    } catch {
+      setError("Network error");
+      setStep("auth");
+      setBusy(false);
+    }
+  };
+
+  const doCreate = async () => {
+    setBusy(true);
+    setStep("creating");
     try {
       const res = await fetch("/api/agents", {
         method: "POST",
@@ -45,122 +116,218 @@ export function CreateAgentModal({ onClose, onCreated }: Props) {
       } else {
         const e = j.error;
         setError(typeof e === "string" ? e : (e?.message ?? "Failed to create agent"));
+        setStep(authNeeded ? "auth" : "config");
       }
+    } catch {
+      setError("Network error");
+      setStep("config");
     } finally {
-      setCreating(false);
+      setBusy(false);
     }
   };
+
+  const authHelp = AUTH_HELP[type];
 
   return (
     <Modal state={modalState}>
       <Modal.Backdrop>
         <Modal.Container size="md" placement="center" className="sm:max-w-md">
           <Modal.Dialog className="p-0">
-            <div className="border-b border-border-subtle px-6 py-4">
-              <h2 className="text-[1rem] font-semibold tracking-tight text-ink">New agent</h2>
-            </div>
 
-            <div className="flex flex-col gap-5 px-6 py-5">
-              {/* Name */}
-              <div className="flex flex-col gap-1.5">
-                <label className="text-[0.8125rem] font-medium text-ink">Name</label>
-                <input
-                  value={name}
-                  onChange={(e) => setName(e.target.value)}
-                  placeholder="my-agent"
-                  className="rounded-xl border border-border-subtle bg-surface-card px-3.5 py-2.5 text-[0.875rem] text-ink outline-none focus:border-signal"
-                />
-              </div>
-
-              {/* Type */}
-              <div className="flex flex-col gap-1.5">
-                <span className="text-[0.8125rem] font-medium text-ink">Type</span>
-                <div className="grid grid-cols-3 gap-2">
-                  {TYPES.map((t) => (
-                    <button
-                      key={t}
-                      onClick={() => setType(t)}
-                      className={`rounded-xl border px-3 py-2 text-[0.8125rem] font-medium transition-colors ${
-                        type === t
-                          ? "border-signal bg-signal-soft text-signal"
-                          : "border-border-subtle text-ink-secondary hover:bg-surface-raised"
-                      }`}
-                    >
-                      {t}
-                    </button>
-                  ))}
-                </div>
-              </div>
-
-              {/* Isolation */}
-              <div className="flex flex-col gap-1.5">
-                <span className="text-[0.8125rem] font-medium text-ink">Isolation</span>
-                <div className="grid grid-cols-3 gap-2">
-                  {ISOLATION_OPTIONS.map((opt) => (
-                    <button
-                      key={opt.value}
-                      onClick={() => setIsolation(opt.value)}
-                      className={`flex flex-col items-start rounded-xl border px-3 py-2.5 text-left transition-colors ${
-                        isolation === opt.value
-                          ? "border-signal bg-signal-soft"
-                          : "border-border-subtle hover:bg-surface-raised"
-                      }`}
-                    >
-                      <span className={`text-[0.8125rem] font-medium ${isolation === opt.value ? "text-signal" : "text-ink"}`}>
-                        {opt.label}
-                      </span>
-                      <span className="text-[0.6875rem] text-ink-muted">{opt.desc}</span>
-                    </button>
-                  ))}
-                </div>
-              </div>
-
-              {/* Channel */}
-              <div className="flex flex-col gap-1.5">
-                <label className="text-[0.8125rem] font-medium text-ink">Channel</label>
-                <select
-                  value={channels}
-                  onChange={(e) => setChannels(e.target.value)}
-                  className="rounded-xl border border-border-subtle bg-surface-card px-3.5 py-2.5 text-[0.875rem] text-ink outline-none focus:border-signal"
+            {/* Header */}
+            <div className="flex items-center gap-3 border-b border-border-subtle px-6 py-4">
+              {step !== "config" && (
+                <button
+                  onClick={() => { setStep("config"); setError(null); }}
+                  className="text-ink-muted hover:text-ink"
+                  aria-label="Back"
+                  disabled={step === "creating"}
                 >
-                  <option value="none">None (terminal only)</option>
-                  <option value="telegram">Telegram</option>
-                  <option value="discord">Discord</option>
-                </select>
+                  ←
+                </button>
+              )}
+              <div>
+                <h2 className="text-[1rem] font-semibold tracking-tight text-ink">
+                  {step === "config" && "New agent"}
+                  {step === "auth" && `Connect ${type}`}
+                  {step === "creating" && `Creating ${name}…`}
+                </h2>
+                {step !== "creating" && (
+                  <p className="text-[0.75rem] text-ink-muted">
+                    {step === "config" && (authNeeded ? `Step 1 of 2 — ${type} needs an API key` : "Configure your agent")}
+                    {step === "auth" && "Step 2 of 2 — enter your API key"}
+                  </p>
+                )}
               </div>
-
-              {channels === "telegram" && (
-                <div className="flex flex-col gap-1.5">
-                  <label className="text-[0.8125rem] font-medium text-ink">Telegram bot token</label>
-                  <input
-                    value={telegramToken}
-                    onChange={(e) => setTelegramToken(e.target.value)}
-                    placeholder="1234567890:ABC…"
-                    className="rounded-xl border border-border-subtle bg-surface-card px-3.5 py-2.5 font-mono text-[0.8125rem] text-ink outline-none focus:border-signal"
-                  />
+              {/* Step dots */}
+              {authNeeded && step !== "creating" && (
+                <div className="ml-auto flex gap-1.5">
+                  <div className={`size-1.5 rounded-full ${step === "config" ? "bg-signal" : "bg-border-hard"}`} />
+                  <div className={`size-1.5 rounded-full ${step === "auth" ? "bg-signal" : "bg-border-hard"}`} />
                 </div>
               )}
-
-              {error && <p className="text-[0.8125rem] text-red-500">{error}</p>}
             </div>
 
-            <div className="flex justify-end gap-2 border-t border-border-subtle px-6 py-4">
-              <Button
-                variant="ghost"
-                className="text-ink-secondary"
-                onPress={onClose}
-              >
-                Cancel
-              </Button>
-              <Button
-                className="bg-signal text-white"
-                isDisabled={creating}
-                onPress={() => void create()}
-              >
-                {creating ? <Spinner size="sm" /> : null}
-                Create agent
-              </Button>
-            </div>
+            {/* Step 1: Config */}
+            {step === "config" && (
+              <div className="flex flex-col gap-5 px-6 py-5">
+                <div className="flex flex-col gap-1.5">
+                  <label className="text-[0.8125rem] font-medium text-ink">Name</label>
+                  <input
+                    value={name}
+                    onChange={(e) => setName(e.target.value)}
+                    placeholder="my-agent"
+                    autoFocus
+                    className="rounded-xl border border-border-subtle bg-surface-card px-3.5 py-2.5 text-[0.875rem] text-ink outline-none focus:border-signal"
+                  />
+                </div>
+
+                <div className="flex flex-col gap-1.5">
+                  <span className="text-[0.8125rem] font-medium text-ink">Type</span>
+                  <div className="grid grid-cols-3 gap-2">
+                    {TYPES.map((t) => (
+                      <button
+                        key={t}
+                        onClick={() => setType(t)}
+                        className={`flex items-center gap-2 rounded-xl border px-3 py-2.5 text-[0.8125rem] font-medium transition-colors ${
+                          type === t
+                            ? "border-signal bg-signal-soft text-signal"
+                            : "border-border-subtle text-ink-secondary hover:bg-surface-raised"
+                        }`}
+                      >
+                        <span>{TYPE_EMOJI[t]}</span>
+                        {t}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
+                <div className="flex flex-col gap-1.5">
+                  <span className="text-[0.8125rem] font-medium text-ink">Isolation</span>
+                  <div className="grid grid-cols-3 gap-2">
+                    {ISOLATION_OPTIONS.map((opt) => (
+                      <button
+                        key={opt.value}
+                        onClick={() => setIsolation(opt.value)}
+                        className={`flex flex-col items-start rounded-xl border px-3 py-2.5 text-left transition-colors ${
+                          isolation === opt.value
+                            ? "border-signal bg-signal-soft"
+                            : "border-border-subtle hover:bg-surface-raised"
+                        }`}
+                      >
+                        <span className={`text-[0.8125rem] font-medium ${isolation === opt.value ? "text-signal" : "text-ink"}`}>
+                          {opt.label}
+                        </span>
+                        <span className="text-[0.6875rem] text-ink-muted">{opt.desc}</span>
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
+                <div className="flex flex-col gap-1.5">
+                  <label className="text-[0.8125rem] font-medium text-ink">Channel</label>
+                  <select
+                    value={channels}
+                    onChange={(e) => setChannels(e.target.value)}
+                    className="rounded-xl border border-border-subtle bg-surface-card px-3.5 py-2.5 text-[0.875rem] text-ink outline-none focus:border-signal"
+                  >
+                    <option value="none">None (terminal only)</option>
+                    <option value="telegram">Telegram</option>
+                    <option value="discord">Discord</option>
+                  </select>
+                </div>
+
+                {channels === "telegram" && (
+                  <div className="flex flex-col gap-1.5">
+                    <label className="text-[0.8125rem] font-medium text-ink">Telegram bot token</label>
+                    <input
+                      value={telegramToken}
+                      onChange={(e) => setTelegramToken(e.target.value)}
+                      placeholder="1234567890:ABC…"
+                      className="rounded-xl border border-border-subtle bg-surface-card px-3.5 py-2.5 font-mono text-[0.8125rem] text-ink outline-none focus:border-signal"
+                    />
+                  </div>
+                )}
+
+                {error && <p className="text-[0.8125rem] text-red-500">{error}</p>}
+              </div>
+            )}
+
+            {/* Step 2: Auth */}
+            {step === "auth" && (
+              <div className="flex flex-col gap-5 px-6 py-5">
+                <div className="flex items-center gap-3 rounded-xl bg-surface-raised p-4">
+                  <span className="text-2xl">{TYPE_EMOJI[type]}</span>
+                  <div>
+                    <p className="text-[0.875rem] font-medium text-ink">{type}</p>
+                    <p className="text-[0.75rem] text-ink-secondary">Not yet authenticated on this machine</p>
+                  </div>
+                </div>
+
+                <div className="flex flex-col gap-1.5">
+                  <div className="flex items-center justify-between">
+                    <label className="text-[0.8125rem] font-medium text-ink">{authHelp.label}</label>
+                    <a
+                      href={authHelp.docsUrl}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="text-[0.75rem] text-signal hover:underline"
+                    >
+                      Get key →
+                    </a>
+                  </div>
+                  <input
+                    value={apiKey}
+                    onChange={(e) => setApiKey(e.target.value)}
+                    placeholder={authHelp.placeholder}
+                    type="password"
+                    autoFocus
+                    className="rounded-xl border border-border-subtle bg-surface-card px-3.5 py-2.5 font-mono text-[0.8125rem] text-ink outline-none focus:border-signal"
+                    onKeyDown={(e) => { if (e.key === "Enter") void handleAuthAndCreate(); }}
+                  />
+                  <p className="text-[0.75rem] text-ink-muted">
+                    Stored in <code className="rounded bg-surface-raised px-1">/etc/5dive/connectors/{type}.env</code>
+                  </p>
+                </div>
+
+                {error && <p className="text-[0.8125rem] text-red-500">{error}</p>}
+              </div>
+            )}
+
+            {/* Step creating */}
+            {step === "creating" && (
+              <div className="flex flex-col items-center gap-3 px-6 py-10">
+                <Spinner size="lg" />
+                <p className="text-[0.875rem] text-ink-secondary">
+                  {busy ? `Creating ${name}…` : "Almost there…"}
+                </p>
+              </div>
+            )}
+
+            {/* Footer */}
+            {step !== "creating" && (
+              <div className="flex justify-end gap-2 border-t border-border-subtle px-6 py-4">
+                <Button variant="ghost" className="text-ink-secondary" onPress={onClose}>
+                  Cancel
+                </Button>
+                {step === "config" && (
+                  <Button className="bg-signal text-white" onPress={() => void handleNext()}>
+                    {authNeeded ? "Next →" : "Create agent"}
+                  </Button>
+                )}
+                {step === "auth" && (
+                  <Button
+                    className="bg-signal text-white"
+                    isDisabled={busy || !apiKey.trim()}
+                    onPress={() => void handleAuthAndCreate()}
+                  >
+                    {busy ? <Spinner size="sm" /> : null}
+                    Authenticate & create
+                  </Button>
+                )}
+              </div>
+            )}
+
           </Modal.Dialog>
         </Modal.Container>
       </Modal.Backdrop>
