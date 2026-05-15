@@ -1,0 +1,388 @@
+#!/usr/bin/env bash
+# Starts (or attaches) the tmux session for a 5dive agent.
+# Invoked by 5dive-agent@<name>.service as User=agent-<name>.
+# Reads /var/lib/5dive/agents.d/<name>.env for AGENT_TYPE, AGENT_CHANNELS, AGENT_WORKDIR.
+set -euo pipefail
+
+NAME="${1:-${AGENT_NAME:-}}"
+[[ -n "$NAME" ]] || { echo "usage: 5dive-agent-start <name>" >&2; exit 2; }
+
+ENV_FILE="/var/lib/5dive/agents.d/${NAME}.env"
+[[ -r "$ENV_FILE" ]] || { echo "no env file: $ENV_FILE" >&2; exit 2; }
+# shellcheck disable=SC1090
+source "$ENV_FILE"
+
+TYPE="${AGENT_TYPE:?AGENT_TYPE missing}"
+CHANNELS="${AGENT_CHANNELS:-none}"
+DEFAULT_WORKDIR="/home/claude/projects"
+WORKDIR="${AGENT_WORKDIR:-$DEFAULT_WORKDIR}"
+PROFILE="${AGENT_AUTH_PROFILE:-}"
+if [[ ! -d "$WORKDIR" ]] || ! test -r "$WORKDIR"; then
+  echo "warn: workdir '$WORKDIR' not accessible to $(id -un) — falling back to $DEFAULT_WORKDIR" >&2
+  WORKDIR="$DEFAULT_WORKDIR"
+fi
+
+# Pull in nvm so `codex` / `gemini` / other npm-global tools are on PATH.
+# Agents run as agent-<name> but shared configs point to /home/claude, so we
+# source claude's nvm.sh (the agent user has no nvm of its own).
+export NVM_DIR="/home/claude/.nvm"
+# shellcheck disable=SC1091
+[[ -s "$NVM_DIR/nvm.sh" ]] && . "$NVM_DIR/nvm.sh" || true
+
+
+# openclaw splits "the agent that runs and answers chat messages"
+# (`openclaw gateway run`) from "the local TUI for talking to that
+# agent" (`openclaw chat`). Without a channel we want the TUI; with a
+# channel we want the gateway, which polls the bot, dispatches messages
+# to the agent runtime, and ships replies back. The user can still
+# attach to tmux to see gateway logs, and run `openclaw chat` from a
+# separate shell if they want a local TUI alongside. Default-deny on
+# the case (only `none|""` runs chat) so any future channel type added
+# via valid_channel automatically routes to the gateway without
+# requiring a parallel update here.
+case "$TYPE" in
+  claude)   BIN="/home/claude/.local/bin/claude"; ARGS=(--dangerously-skip-permissions) ;;
+  hermes)   BIN="/home/claude/.local/bin/hermes"; ARGS=() ;;
+  openclaw)
+    BIN="/home/claude/.local/bin/openclaw"
+    case "$CHANNELS" in
+      none|"") ARGS=(chat) ;;
+      *)       ARGS=(gateway run) ;;
+    esac ;;
+  codex)    BIN="/home/claude/.nvm/versions/node/v24/bin/codex"; ARGS=() ;;
+  gemini)   BIN="/home/claude/.nvm/versions/node/v24/bin/gemini"; ARGS=(--skip-trust --yolo) ;;
+  opencode) BIN="/home/claude/.local/bin/opencode"; ARGS=() ;;
+  *) echo "unknown AGENT_TYPE: $TYPE" >&2; exit 2 ;;
+esac
+
+[[ -x "$BIN" ]] || { echo "binary not installed: $BIN" >&2; exit 3; }
+
+# Only claude flows through the claude-plugins-official marketplace plugins
+# (the dashboard install_channel_for_agent step set the bot token there).
+# openclaw consumed CHANNELS in the type-dispatch above; hermes' gateway
+# reads ~/.hermes/.env directly, so neither needs a runtime --channels arg.
+case "$CHANNELS" in
+  none|"") : ;;
+  telegram)
+    case "$TYPE" in
+      claude) ARGS+=(--channels plugin:telegram@claude-plugins-official) ;;
+    esac ;;
+  discord)
+    case "$TYPE" in
+      claude) ARGS+=(--channels plugin:discord@claude-plugins-official) ;;
+    esac ;;
+  *) echo "unknown channels: $CHANNELS" >&2; exit 2 ;;
+esac
+
+# Per-profile state root for the agent's type — empty $PROFILE means the
+# legacy shared /home/claude/.<type> is the seed source (default profile,
+# unchanged). When a profile is bound, every per-type seed below points at
+# /var/lib/5dive/auth-profiles/<profile>/<type>/ so concurrent profiled
+# agents can re-auth without overwriting each other.
+PROFILE_STATE_DIR=""
+if [[ -n "$PROFILE" ]]; then
+  PROFILE_STATE_DIR="/var/lib/5dive/auth-profiles/${PROFILE}/${TYPE}"
+fi
+
+# Codex stores OAuth tokens in $CODEX_HOME/auth.json. profile.d points
+# CODEX_HOME at the shared /home/claude/.codex (mode 2770 group=claude),
+# but codex writes auth.json mode 0600 — agent-<name> is in the claude group
+# yet still can't read a 0600 file owned by claude. So for codex agents we
+# use a per-agent CODEX_HOME under $HOME, seeded from the shared auth.json.
+# After seeding, the agent owns its own token-rotation chain. We re-seed
+# only when the shared file is newer (i.e. someone re-ran `5dive auth login
+# codex` on the host). With a profile, the shared source is the per-profile
+# auth.json under $PROFILE_STATE_DIR instead of /home/claude/.codex.
+CODEX_OVERRIDE=""
+if [[ "$TYPE" == "codex" ]]; then
+  AGENT_CODEX_HOME="$HOME/.codex"
+  install -d -m 700 "$AGENT_CODEX_HOME"
+  SHARED_AUTH="${PROFILE_STATE_DIR:+$PROFILE_STATE_DIR/auth.json}"
+  SHARED_AUTH="${SHARED_AUTH:-/home/claude/.codex/auth.json}"
+  LOCAL_AUTH="$AGENT_CODEX_HOME/auth.json"
+  if [[ -e "$SHARED_AUTH" ]] && { [[ ! -f "$LOCAL_AUTH" ]] || [[ "$SHARED_AUTH" -nt "$LOCAL_AUTH" ]]; }; then
+    TMP="$(mktemp -p "$AGENT_CODEX_HOME" .auth.XXXXXX)"
+    if sudo -n cat "$SHARED_AUTH" > "$TMP" 2>/dev/null; then
+      chmod 600 "$TMP"
+      mv "$TMP" "$LOCAL_AUTH"
+    else
+      rm -f "$TMP"
+      echo "warn: could not seed codex auth.json from $SHARED_AUTH" >&2
+    fi
+  fi
+  # Bypass codex's first-run trust prompt + approval/sandbox dialogs. Mirrors
+  # the `--dangerously-skip-permissions` posture we use for claude-family.
+  cat > "$AGENT_CODEX_HOME/config.toml" <<TOML
+approval_policy = "never"
+sandbox_mode = "danger-full-access"
+check_for_update_on_startup = false
+
+[projects."${WORKDIR}"]
+trust_level = "trusted"
+TOML
+  chmod 600 "$AGENT_CODEX_HOME/config.toml"
+  CODEX_OVERRIDE="export CODEX_HOME=$(printf %q "$AGENT_CODEX_HOME"); "
+fi
+
+# Same shared/0600 problem as codex: hermes writes ~/.hermes/auth.json with
+# mode 0600 after `hermes auth add openai-codex`. agent-<name> can't read a
+# 0600 file owned by `claude` even though it's in the claude group. Seed the
+# agent's own ~/.hermes/auth.json from the shared file via sudo (re-seeding
+# only when the shared copy is newer, e.g. after a fresh device-code login).
+# HERMES_HOME defaults to $HOME/.hermes inside hermes itself, so we don't
+# need to override it once the per-agent auth.json is in place.
+#
+# Profile-scoped path: HERMES_HOME points at $PROFILE_STATE_DIR during the
+# device-code login, so `hermes auth add openai-codex` writes auth.json
+# there *and* tightens the dir back to mode 0700 owner=claude. agent-<name>
+# can't even traverse a 0700 dir, so a naive `[[ -e "$SHARED" ]]` returns
+# false and the seed silently no-ops — leaving the agent with no auth.json
+# and hermes erroring "No Codex credentials stored." on every message.
+# Route both checks through `sudo -n test` (same fix as openclaw below).
+if [[ "$TYPE" == "hermes" ]]; then
+  AGENT_HERMES_HOME="$HOME/.hermes"
+  install -d -m 700 "$AGENT_HERMES_HOME"
+  SHARED_HERMES_DIR="${PROFILE_STATE_DIR:-/home/claude/.hermes}"
+  hermes_seeded=0
+  # Seed auth.json + config.yaml from the shared/profile dir. auth.json uses
+  # an mtime check (newer SHARED wins) because both sides legitimately rotate
+  # tokens. config.yaml uses a content-diff because `hermes gateway install`
+  # (run during `cmd_create`) pre-writes a default config.yaml with
+  # provider=openai-codex into the agent user's dir *before* this seed loop
+  # runs — its mtime is freshly later than SHARED so an mtime-only test would
+  # silently lose the user's BYO provider choice. The profile dir's
+  # config.yaml is authoritative for model/provider; any drift in LOCAL just
+  # means hermes wrote a fresh default that needs to be overridden.
+  seed_one() {
+    local f="$1" mode="$2"  # mode: mtime | content
+    local SHARED="$SHARED_HERMES_DIR/$f"
+    local LOCAL="$AGENT_HERMES_HOME/$f"
+    sudo -n test -e "$SHARED" || return 0
+    local stale=0
+    if [[ ! -f "$LOCAL" ]]; then
+      stale=1
+    elif [[ "$mode" == "content" ]]; then
+      sudo -n cmp -s "$SHARED" "$LOCAL" 2>/dev/null || stale=1
+    else
+      sudo -n test "$SHARED" -nt "$LOCAL" && stale=1
+    fi
+    (( stale )) || return 0
+    local TMP
+    TMP="$(mktemp -p "$AGENT_HERMES_HOME" ".${f}.XXXXXX")"
+    if sudo -n cat "$SHARED" > "$TMP" 2>/dev/null; then
+      chmod 600 "$TMP"
+      mv "$TMP" "$LOCAL"
+      hermes_seeded=1
+    else
+      rm -f "$TMP"
+      echo "warn: could not seed hermes $f from $SHARED" >&2
+    fi
+  }
+  seed_one auth.json   mtime
+  seed_one config.yaml content
+  # hermes' messaging gateway is a long-lived user daemon that survives
+  # `systemctl restart 5dive-agent@<name>` (cmd_restart bounces the tmux
+  # unit; the gateway is a separate `loginctl enable-linger`'d process that
+  # caches model.provider in memory at startup). Always bounce it on agent
+  # start so an explicit `agent restart` reliably picks up provider/config
+  # changes — even when the change landed outside the profile dir (e.g.
+  # the operator edited `/home/claude/.hermes/config.yaml` directly or
+  # used hermes' own CLI) and the seed loop above had nothing to copy.
+  if [[ -x "$BIN" ]]; then
+    "$BIN" gateway restart >&2 2>&1 \
+      || echo "warn: hermes gateway restart failed — new config will only take effect on next boot" >&2
+  fi
+fi
+
+# Same shared/0600 problem as codex/hermes: openclaw writes its OAuth tokens to
+# ~/.openclaw/agents/main/agent/auth-profiles.json (mode 0600) after
+# `openclaw models auth login --provider openai-codex --method device-code`.
+# agent-<name> can't read a 0600 file owned by `claude` even though it's in the
+# claude group. Seed the agent's own copy from the shared file via sudo (re-
+# seeding only when the shared copy is newer, e.g. after a fresh device-code
+# login). openclaw's resolveStateDir respects the process HOME, so $HOME/
+# .openclaw is the path each agent process reads.
+if [[ "$TYPE" == "openclaw" ]]; then
+  AGENT_OPENCLAW_DIR="$HOME/.openclaw/agents/main/agent"
+  install -d -m 700 "$HOME/.openclaw"
+  install -d -m 700 "$HOME/.openclaw/agents"
+  install -d -m 700 "$HOME/.openclaw/agents/main"
+  install -d -m 700 "$AGENT_OPENCLAW_DIR"
+  # Profile-scoped login lands at $PROFILE_STATE_DIR/.openclaw/agents/main/
+  # agent/auth-profiles.json — that's the path cmd_auth_start created via
+  # HOME=$PROFILE_STATE_DIR redirect. Default profile keeps the legacy
+  # shared /home/claude/.openclaw layout.
+  SHARED_OPENCLAW_AUTH="${PROFILE_STATE_DIR:+$PROFILE_STATE_DIR/.openclaw/agents/main/agent/auth-profiles.json}"
+  SHARED_OPENCLAW_AUTH="${SHARED_OPENCLAW_AUTH:-/home/claude/.openclaw/agents/main/agent/auth-profiles.json}"
+  LOCAL_OPENCLAW_AUTH="$AGENT_OPENCLAW_DIR/auth-profiles.json"
+  # The shared openclaw state dirs land at mode 0700 owner=claude, so the
+  # agent user can't even traverse them — `[[ -e "$SHARED" ]]` returns false
+  # and the seed block silently no-ops. The agent user has NOPASSWD sudo
+  # though, so route the existence + staleness checks through sudo (same
+  # mechanism the cat below already uses).
+  if sudo -n test -e "$SHARED_OPENCLAW_AUTH" \
+      && { [[ ! -f "$LOCAL_OPENCLAW_AUTH" ]] \
+           || sudo -n test "$SHARED_OPENCLAW_AUTH" -nt "$LOCAL_OPENCLAW_AUTH"; }; then
+    TMP="$(mktemp -p "$AGENT_OPENCLAW_DIR" .auth-profiles.XXXXXX)"
+    if sudo -n cat "$SHARED_OPENCLAW_AUTH" > "$TMP" 2>/dev/null; then
+      chmod 600 "$TMP"
+      mv "$TMP" "$LOCAL_OPENCLAW_AUTH"
+    else
+      rm -f "$TMP"
+      echo "warn: could not seed openclaw auth-profiles.json from $SHARED_OPENCLAW_AUTH" >&2
+    fi
+  fi
+
+  # Inherit the profile's model defaults (`agents.defaults.model.primary`).
+  # `openclaw models auth login --set-default` writes that key into the
+  # *profile's* openclaw.json — but the agent has its own openclaw.json
+  # (channels + gateway token + telegram allowlist live there), so without
+  # this sync the gateway falls back to the openclaw global default of
+  # openai/gpt-5.5 and rejects every message with "Missing API key for
+  # OpenAI" since the agent only has openai-codex OAuth, not an OpenAI key.
+  # Patching every launch (rather than once at create time) means a later
+  # `5dive agent auth login openclaw` flips the model on next restart with
+  # no agent-recreate dance.
+  SHARED_OPENCLAW_CFG="${PROFILE_STATE_DIR:+$PROFILE_STATE_DIR/.openclaw/openclaw.json}"
+  SHARED_OPENCLAW_CFG="${SHARED_OPENCLAW_CFG:-/home/claude/.openclaw/openclaw.json}"
+  LOCAL_OPENCLAW_CFG="$HOME/.openclaw/openclaw.json"
+  if sudo -n test -e "$SHARED_OPENCLAW_CFG" && [[ -f "$LOCAL_OPENCLAW_CFG" ]]; then
+    PROFILE_DEFAULTS="$(sudo -n cat "$SHARED_OPENCLAW_CFG" 2>/dev/null \
+      | python3 -c 'import json,sys
+try:
+    cfg = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+defaults = cfg.get("agents", {}).get("defaults")
+if isinstance(defaults, dict) and defaults.get("model"):
+    print(json.dumps({"agents": {"defaults": defaults}}))
+' 2>/dev/null || true)"
+    LOCAL_PRIMARY="$(python3 -c 'import json,sys
+try:
+    cfg = json.load(open(sys.argv[1]))
+except Exception:
+    print("")
+    sys.exit(0)
+m = cfg.get("agents", {}).get("defaults", {}).get("model")
+if isinstance(m, dict):
+    print(m.get("primary") or "")
+elif isinstance(m, str):
+    print(m)
+' "$LOCAL_OPENCLAW_CFG" 2>/dev/null || true)"
+    PROFILE_PRIMARY="$(printf '%s' "$PROFILE_DEFAULTS" | python3 -c 'import json,sys
+try:
+    cfg = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+m = cfg.get("agents", {}).get("defaults", {}).get("model")
+if isinstance(m, dict):
+    print(m.get("primary") or "")
+elif isinstance(m, str):
+    print(m)
+' 2>/dev/null || true)"
+    if [[ -n "$PROFILE_DEFAULTS" && "$LOCAL_PRIMARY" != "$PROFILE_PRIMARY" ]]; then
+      printf '%s' "$PROFILE_DEFAULTS" \
+        | /home/claude/.local/bin/openclaw config patch --stdin >/dev/null 2>&1 \
+        || echo "warn: openclaw config patch (model defaults) failed" >&2
+    fi
+  fi
+fi
+
+# Same shared/0600 problem as codex: gemini stores OAuth tokens in
+# ~/.gemini/oauth_creds.json (mode 0600), and there's no GEMINI_HOME env to
+# redirect — gemini reads $HOME/.gemini directly. So seed the agent's own
+# ~/.gemini/oauth_creds.json from the shared file via sudo (re-seeding only
+# when the shared copy is newer, e.g. after `5dive auth login gemini`).
+# We also pin settings.json's selectedType to "oauth-personal" so gemini
+# skips the auth-method picker on launch, matching the auth-login preseed.
+if [[ "$TYPE" == "gemini" ]]; then
+  AGENT_GEMINI_HOME="$HOME/.gemini"
+  install -d -m 700 "$AGENT_GEMINI_HOME"
+  # Profile-scoped login lands at $PROFILE_STATE_DIR/.gemini/oauth_creds.json
+  # — that's the path cmd_auth_start created via HOME=$PROFILE_STATE_DIR
+  # redirect (gemini reads $HOME/.gemini, no GEMINI_HOME). Default profile
+  # keeps the legacy shared /home/claude/.gemini layout.
+  SHARED_GEMINI_AUTH="${PROFILE_STATE_DIR:+$PROFILE_STATE_DIR/.gemini/oauth_creds.json}"
+  SHARED_GEMINI_AUTH="${SHARED_GEMINI_AUTH:-/home/claude/.gemini/oauth_creds.json}"
+  LOCAL_GEMINI_AUTH="$AGENT_GEMINI_HOME/oauth_creds.json"
+  if [[ -e "$SHARED_GEMINI_AUTH" ]] && { [[ ! -f "$LOCAL_GEMINI_AUTH" ]] || [[ "$SHARED_GEMINI_AUTH" -nt "$LOCAL_GEMINI_AUTH" ]]; }; then
+    TMP="$(mktemp -p "$AGENT_GEMINI_HOME" .creds.XXXXXX)"
+    if sudo -n cat "$SHARED_GEMINI_AUTH" > "$TMP" 2>/dev/null; then
+      chmod 600 "$TMP"
+      mv "$TMP" "$LOCAL_GEMINI_AUTH"
+    else
+      rm -f "$TMP"
+      echo "warn: could not seed gemini oauth_creds.json from $SHARED_GEMINI_AUTH" >&2
+    fi
+  fi
+  SETTINGS="$AGENT_GEMINI_HOME/settings.json"
+  (jq '. + {security: ((.security // {}) + {auth: ((.security.auth // {}) + {selectedType: "oauth-personal"})})}' "$SETTINGS" 2>/dev/null \
+    || echo '{"security":{"auth":{"selectedType":"oauth-personal"}}}') > "$SETTINGS.tmp" \
+    && mv "$SETTINGS.tmp" "$SETTINGS"
+  chmod 600 "$SETTINGS"
+fi
+
+SESSION="agent-${NAME}"
+
+# Reset any stale session from a previous unit run.
+/usr/bin/tmux kill-session -t "$SESSION" 2>/dev/null || true
+
+# Build the inner command as a single shell string so the restart loop stays
+# inside the tmux window.
+# The leading `unset CLAUDE_CONFIG_DIR` drops profile.d/5dive-shared-configs.sh's
+# redirect to /home/claude/.claude (mode 0600, unreadable to agent-<name>) so
+# claude-family binaries read the per-agent preseed at $HOME/.claude/settings.json
+# (bypassPermissions, telegram plugin, StopFailure hook). Non-claude types don't
+# use CLAUDE_CONFIG_DIR, so unsetting it unconditionally is safe.
+#
+# Auth-profile note: %i-auth.env (loaded by systemd as EnvironmentFile) is what
+# swaps the CLAUDE_CODE_OAUTH_TOKEN / ANTHROPIC_API_KEY / etc. for a specific
+# profile — no CLAUDE_CONFIG_DIR gymnastics needed. We keep the unset below
+# (per-agent preseed still wants to win over the shared /home/claude/.claude).
+# Credential scrub: the systemd template (5dive-agent@.service) EnvironmentFile=s
+# anthropic.env / openai.env / gemini.env unconditionally so the auth-profile
+# %i-auth.env overlay can override any of them via last-wins. The side effect
+# is that anthropic.env's CLAUDE_CODE_OAUTH_TOKEN leaks into the env of
+# hermes/openclaw/codex/etc. agents — and hermes' provider="auto" detection
+# then routes requests to Anthropic, the exact third-party-harness pattern
+# Anthropic flagged for suspension in April 2026. Drop cross-type creds
+# before exec so each agent only sees env vars for its own provider.
+case "$TYPE" in
+  claude)
+    UNSET_CREDS="OPENAI_API_KEY GEMINI_API_KEY GOOGLE_API_KEY" ;;
+  codex|opencode)
+    UNSET_CREDS="CLAUDE_CODE_OAUTH_TOKEN ANTHROPIC_API_KEY GEMINI_API_KEY GOOGLE_API_KEY" ;;
+  gemini)
+    UNSET_CREDS="CLAUDE_CODE_OAUTH_TOKEN ANTHROPIC_API_KEY OPENAI_API_KEY" ;;
+  hermes|openclaw)
+    # OAuth via auth.json — no provider env vars belong here.
+    UNSET_CREDS="CLAUDE_CODE_OAUTH_TOKEN ANTHROPIC_API_KEY OPENAI_API_KEY GEMINI_API_KEY GOOGLE_API_KEY" ;;
+  *)
+    UNSET_CREDS="" ;;
+esac
+
+CMD_STR=$(printf '%q ' "$BIN" "${ARGS[@]}")
+
+# First-attach onboarding for openclaw with no channel: openclaw chat is the
+# bare TUI and never surfaces channel setup, so a non-technical user has no
+# obvious way to wire telegram/discord/etc. after agent create. Run
+# `openclaw configure` once on first attach so the user sees the channel
+# wizard, then drop into chat (and stay there on every subsequent attach).
+# Sentinel lives in $HOME/.openclaw so it's per-agent; rm it to re-run.
+PRELUDE=""
+if [[ "$TYPE" == "openclaw" ]] && [[ "$CHANNELS" == "none" || -z "$CHANNELS" ]]; then
+  SENTINEL_Q=$(printf %q "$HOME/.openclaw/.5dive-bootstrapped")
+  BIN_Q=$(printf %q "$BIN")
+  PRELUDE="[[ -e ${SENTINEL_Q} ]] || { mkdir -p $(printf %q "$HOME/.openclaw"); ${BIN_Q} configure; touch ${SENTINEL_Q}; }; "
+fi
+
+INNER="unset CLAUDE_CONFIG_DIR ${UNSET_CREDS}; ${CODEX_OVERRIDE}${PRELUDE}while true; do ${CMD_STR}; sleep 2; done"
+[[ -n "$PROFILE" ]] && echo "[5dive] agent=${NAME} using auth-profile=${PROFILE}" >&2
+
+/usr/bin/tmux new-session -d -s "$SESSION" -c "$WORKDIR" \
+  "bash --login -c $(printf %q "$INNER")"
+
+# Block so systemd keeps the unit "active" as long as the session lives.
+while /usr/bin/tmux has-session -t "$SESSION" 2>/dev/null; do
+  sleep 5
+done

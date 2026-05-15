@@ -1,0 +1,27 @@
+[Unit]
+Description=5dive agent %i (tmux-persistent CLI)
+After=network.target
+
+[Service]
+Type=simple
+User=agent-%i
+Group=claude
+EnvironmentFile=-/etc/5dive/connectors/anthropic.env
+EnvironmentFile=-/etc/5dive/connectors/openai.env
+EnvironmentFile=-/etc/5dive/connectors/gemini.env
+EnvironmentFile=-/etc/5dive/connectors/telegram-%i.env
+EnvironmentFile=-/etc/5dive/connectors/discord-%i.env
+EnvironmentFile=-/var/lib/5dive/agents.d/%i.env
+# Per-agent auth-profile overlay. Missing file is fine (default profile).
+# Populated as a symlink by `5dive agent create --auth-profile=<name>`; the
+# profile's combined.env overrides the shared anthropic/openai/gemini envs
+# above, letting two same-type agents run against different accounts.
+EnvironmentFile=-/var/lib/5dive/agents.d/%i-auth.env
+ExecStart=/usr/local/bin/5dive-agent-start %i
+ExecStop=/bin/bash -c '/usr/bin/tmux kill-session -t agent-%i 2>/dev/null || true'
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=60
+
+[Install]
+WantedBy=multi-user.target
