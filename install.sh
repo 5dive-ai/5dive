@@ -40,7 +40,14 @@ if [[ ! -f /home/claude/.nvm/nvm.sh ]]; then
   sudo -u claude bash -c 'curl -fsSL https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.3/install.sh | PROFILE=/dev/null bash'
   ok "nvm installed"
 fi
-sudo -u claude bash -lc "source ~/.nvm/nvm.sh && nvm install $NODE_VERSION && nvm alias default $NODE_VERSION" 2>&1 | grep -E "Downloading|Now using|default" || true
+# Write nvm init to .bash_profile so `bash -lc` commands (used by the CLI) find node/npm
+sudo -u claude bash -c 'cat >> /home/claude/.bash_profile <<'"'"'NVM_INIT'"'"'
+
+export NVM_DIR="$HOME/.nvm"
+[ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"
+NVM_INIT
+'
+sudo -u claude bash -lc "nvm install $NODE_VERSION && nvm alias default $NODE_VERSION" 2>&1 | grep -E "Downloading|Now using|default" || true
 ok "Node.js $NODE_VERSION"
 
 # bun (needed for telegram plugin)
