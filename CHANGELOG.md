@@ -9,6 +9,19 @@ release.
 
 ## [Unreleased]
 
+### Added
+
+- `5dive-cli` agent skill is now shipped with the install. Lives at
+  `/usr/local/lib/5dive/skills/5dive-cli/` (SKILL.md + references/).
+  Teaches a Claude Code / Codex / Gemini agent how to drive `5dive` —
+  spawn agents, inter-agent comms, doctor, account management.
+- README — split the "have your agent install it" section into two
+  copy-paste prompts: (a) same-machine install, (b) laptop-agent
+  installs onto a remote VM over SSH. Both now also instruct the agent
+  to drop the `5dive-cli` skill into its own `~/.claude/skills/` so the
+  user can keep managing agents through that same agent — no manual
+  CLI dance after the install.
+
 ## [0.1.1] — 2026-05-16
 
 ### Fixed

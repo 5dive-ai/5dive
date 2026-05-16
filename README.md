@@ -8,20 +8,49 @@ curl -fsSL https://raw.githubusercontent.com/5dive-com/5dive-cli/main/install.sh
 
 ### Or have your existing AI agent install it
 
-If you already have a coding agent running on the target server (Claude Code, Codex, Gemini, opencode, etc.), paste this into its chat and let it do the install:
+If you already use Claude Code / Codex / Gemini / opencode etc., paste one of these prompts in and let the agent do the install. After it's done, the agent will have learned the `5dive-cli` skill, so you can keep talking to it to create agents, set API keys, and pair Telegram bots — no manual CLI dance needed.
+
+**On the same machine the agent is running on:**
 
 ```
-Install 5dive-cli on this Linux server.
+Install 5dive-cli on this Linux host so I can use you to manage 5dive agents.
 
-1. Run the official installer:
+1. Run the official installer (idempotent — safe to rerun):
    curl -fsSL https://raw.githubusercontent.com/5dive-com/5dive-cli/main/install.sh | sudo bash
-2. Confirm it landed: `5dive --version` should print "5dive 0.1.x".
-3. Then STOP. Don't create any agents, don't set any API keys, don't pair any
-   Telegram bot — I'll do the rest interactively.
+2. Confirm: `5dive --version` should print "5dive 0.1.x".
+3. Install the 5dive-cli skill into my own home so I know how to drive it:
+   mkdir -p ~/.claude/skills
+   sudo cp -r /usr/local/lib/5dive/skills/5dive-cli ~/.claude/skills/
+   sudo chown -R "$(id -un):$(id -gn)" ~/.claude/skills/5dive-cli
+4. Tell me to restart so the skill loads, then wait for my next instruction —
+   I'll ask you to create the first agent.
 
-If the install errors out (apt deps, missing sudo, network), surface the
-exact error and don't retry blindly. The installer is idempotent, so a
-rerun is safe once the underlying issue is fixed.
+If the install errors out (apt deps, sudo, network), surface the exact error
+and don't retry blindly. Don't create any 5dive agents on your own yet.
+```
+
+**From your laptop, installing onto a remote VM over SSH:**
+
+```
+Install 5dive-cli on the remote VM at <user@host>, then teach yourself the
+5dive-cli skill so I can manage agents on it through you.
+
+1. Confirm you can reach it: `ssh <user@host> uname -a`. Stop here if that fails.
+2. Run the installer over SSH (the installer will sudo itself):
+   ssh -t <user@host> 'curl -fsSL https://raw.githubusercontent.com/5dive-com/5dive-cli/main/install.sh | sudo bash'
+3. Verify on the remote: `ssh <user@host> '/usr/local/bin/5dive --version'`
+   should print "5dive 0.1.x".
+4. Pull the 5dive-cli skill back to this machine and install it into my own
+   home so I know how to drive `5dive` over SSH:
+   mkdir -p ~/.claude/skills/5dive-cli
+   scp -r <user@host>:/usr/local/lib/5dive/skills/5dive-cli/* ~/.claude/skills/5dive-cli/
+5. Tell me to restart, then wait — I'll ask you which agent to spin up first
+   on the remote.
+
+For step 2+ you'll mostly be prefixing `5dive` calls with `ssh <user@host>`.
+Use `ssh -t` for anything that needs a TTY (`5dive agent auth login`, etc.).
+If sudo on the remote needs a password and your key isn't enough, surface
+that — don't try to pipe a password into ssh.
 ```
 
 No auth proxying. 5dive runs your AI CLI of choice (Claude Code, Codex, Gemini, Hermes, openclaw, opencode) on your own server — you log in with your own credentials, exactly like you would locally. Your auth tokens never touch us.
