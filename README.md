@@ -65,6 +65,12 @@ Rerunning the installer is safe — it won't touch your registry, auth profiles,
 5dive agent create my-agent --type=claude
 ```
 
+Or wire it to a Telegram bot so you can message it from your phone — [BotFather](https://t.me/BotFather) gives you the token:
+```sh
+5dive agent create my-agent --type=claude --channels=telegram --telegram-token=<bot-token>
+5dive agent pair my-agent --code=<pairing-code>   # one-time DM handshake
+```
+
 **4. Talk to it**
 ```sh
 5dive agent send my-agent "hello"
