@@ -89,10 +89,10 @@ Or wire it to a Telegram bot so you can message it from your phone — [BotFathe
 | Type | Model family | Auth method |
 |------|-------------|-------------|
 | `claude` | Anthropic Claude | OAuth / API key |
-| `codex` | OpenAI Codex | OAuth |
-| `gemini` | Google Gemini | OAuth |
-| `hermes` | Nous Hermes | API key |
-| `openclaw` | OpenClaw | OAuth |
+| `codex` | OpenAI Codex | OAuth / API key |
+| `gemini` | Google Gemini | OAuth / API key |
+| `hermes` | Nous Hermes | OpenAI OAuth / API key |
+| `openclaw` | OpenClaw | OpenAI OAuth / API key |
 | `opencode` | OpenCode | API key |
 
 ---
