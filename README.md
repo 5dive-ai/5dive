@@ -152,6 +152,19 @@ Group sign-ins so multiple agents share one login:
 
 ---
 
+## Local web dashboard
+
+```sh
+5dive ui                        # opens http://localhost:5175 (loopback only)
+5dive ui setup                  # configure password auth
+5dive ui --host=0.0.0.0         # expose on the network (requires setup first)
+```
+
+See [ui/README.md](ui/README.md) for the full auth model and a reverse-proxy
+recipe for exposing the dashboard publicly.
+
+---
+
 ## Managed platform
 
 [5dive.com](https://5dive.com) is a managed cloud that runs this CLI on provisioned VMs — adds a web dashboard, team access, cloud infrastructure, and uptime management on top of the same runtime.

@@ -14,12 +14,6 @@ Resume prompt: `continue OSS launch tasks from 5dive-cli/OSS_LAUNCH_TASKS.md —
 > Item numbers are stable — completed items are removed but the surviving
 > items keep their original IDs so they're easy to refer to in chat / commits.
 
-### 8. README: public-exposure docs
-Add a "Exposing the UI publicly" section to `ui/README.md`:
-- One-page Caddyfile reverse-proxy snippet with auto-HTTPS
-- Warning about `--host=0.0.0.0 --insecure`
-- Note that OIDC/SSO is on the roadmap but not in v1
-
 ---
 
 ## P1 — CLI hygiene (small, high-signal for OSS)
