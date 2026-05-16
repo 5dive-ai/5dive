@@ -11,10 +11,6 @@ Resume prompt: `continue pre-launch tasks from 5dive-cli/PRE_LAUNCH_TASKS.md —
 
 ## P0 — Repo hygiene (read-as-maintained signal)
 
-### 2. CONTRIBUTING.md — how to contribute
-Dev setup (bun, ./build.sh, test-vm.sh smoke), commit author requirement
-(lodar <markounik@gmail.com>), PR expectations, bundle-rebuild rule.
-
 ### 3. Issue + PR templates
 `.github/ISSUE_TEMPLATE/bug_report.md`, `.github/ISSUE_TEMPLATE/feature_request.md`,
 `.github/pull_request_template.md`. Short, low-friction.
