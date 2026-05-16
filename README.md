@@ -54,10 +54,6 @@ sudo on the remote needs a password and your key isn't enough, surface it
 — don't pipe a password into ssh.
 ```
 
-No auth proxying. 5dive runs your AI CLI of choice (Claude Code, Codex, Gemini, Hermes, openclaw, opencode) on your own server — you log in with your own credentials, exactly like you would locally. Your auth tokens never touch us.
-
-No telemetry. The CLI does not phone home, send usage data, or report errors anywhere — it only talks to the model providers you configure.
-
 ---
 
 ## What it does
@@ -218,14 +214,14 @@ sudo REPO=file:///opt/5dive-offline bash /opt/5dive-offline/install.sh --upgrade
 
 ## Supported agent types
 
-| Type | Model family | Auth method |
-|------|-------------|-------------|
-| `claude` | Anthropic Claude | OAuth / API key |
-| `codex` | OpenAI Codex | OAuth / API key |
-| `gemini` | Google Gemini | OAuth / API key |
-| `hermes` | Nous Hermes | OAuth / API key |
-| `openclaw` | OpenClaw | OAuth / API key |
-| `opencode` | OpenCode | API key |
+| Type | Model family | Auth method | Channels |
+|------|-------------|-------------|----------|
+| `claude` | Anthropic Claude | OAuth / API key | Telegram, Discord |
+| `codex` | OpenAI Codex | OAuth / API key | — |
+| `gemini` | Google Gemini | OAuth / API key | — |
+| `hermes` | Nous Hermes | OAuth / API key | Telegram, Discord |
+| `openclaw` | OpenClaw | OAuth / API key | Telegram, Discord |
+| `opencode` | OpenCode | API key | — |
 
 ---
 
@@ -322,6 +318,14 @@ Group sign-ins so multiple agents share one login:
 
 See [ui/README.md](ui/README.md) for the full auth model and a reverse-proxy
 recipe for exposing the dashboard publicly.
+
+---
+
+## No middlemen
+
+**No auth proxying.** 5dive runs your AI CLI of choice (Claude Code, Codex, Gemini, Hermes, openclaw, opencode) on your own server — you log in with your own credentials, exactly like you would locally. Your auth tokens never touch us.
+
+**No telemetry.** The CLI does not phone home, send usage data, or report errors anywhere — it only talks to the model providers you configure.
 
 ---
 
