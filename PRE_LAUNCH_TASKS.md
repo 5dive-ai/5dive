@@ -11,16 +11,6 @@ Resume prompt: `continue pre-launch tasks from 5dive-cli/PRE_LAUNCH_TASKS.md —
 
 ## P0 — Repo hygiene (read-as-maintained signal)
 
-## P1 — CI guard for install path
-
-### 5. CI: run install smoke on PRs touching install / agent-create paths
-`./scripts/test-vm.sh smoke` already exists and provisions a real Hetzner box.
-Wire to GitHub Actions on PRs that touch `install.sh`, `scripts/inc/5dive-cli.sh`,
-or `src/agent/`. Probably gated (manual trigger or label) since it costs real
-money per run; nightly cron as a fallback.
-
----
-
 ## P2 — Launch comms (delegate)
 
 ### 6. Launch blog post + HN/X thread
