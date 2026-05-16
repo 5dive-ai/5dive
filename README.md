@@ -2,6 +2,8 @@
 
 Open-source CLI to spawn, manage, and message AI agents — any model, any machine.
 
+> Prefer managed? [5dive.com](https://5dive.com) runs the same CLI on a hardened VM — point it at the agent, skip the ops.
+
 ```sh
 curl -fsSL https://raw.githubusercontent.com/5dive-com/5dive-cli/main/install.sh | sudo bash
 ```
@@ -67,6 +69,14 @@ sudo on the remote needs a password and your key isn't enough, surface it
 5dive agent list
 5dive agent logs my-agent --follow
 ```
+
+---
+
+## Demo
+
+Sixty seconds — install, spawn, send, attach, tear down.
+
+<!-- GIF here -->
 
 ---
 
@@ -349,7 +359,7 @@ For deeper baselines, the standard tools are well-maintained — [devsec.os_hard
 
 ## Managed platform
 
-Or skip the checklist. [5dive.com](https://5dive.com) runs the same CLI on a managed cloud: VM, hardening, dashboard, allowlists, backups, uptime — handled. You point it at the agent. We point it at the box.
+Or skip the checklist — [5dive.com](https://5dive.com) handles the hardening.
 
 ---
 
