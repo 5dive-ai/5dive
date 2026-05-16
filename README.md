@@ -6,6 +6,8 @@ Open-source CLI to spawn, manage, and message AI agents — any model, any machi
 curl -fsSL https://raw.githubusercontent.com/5dive-com/5dive-cli/main/install.sh | sudo bash
 ```
 
+No telemetry. The CLI does not phone home, send usage data, or report errors anywhere — it only talks to the model providers you configure.
+
 ---
 
 ## What it does

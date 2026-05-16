@@ -18,10 +18,6 @@ Resume prompt: `continue OSS launch tasks from 5dive-cli/OSS_LAUNCH_TASKS.md —
 
 ## P1 — CLI hygiene (small, high-signal for OSS)
 
-### 12. README: telemetry policy line
-One sentence in README near the top. Even "5dive collects no telemetry, ever"
-is positive signal; silence reads as "they'll add it later."
-
 ### 13. Idempotent install / `install.sh --upgrade`
 Verify rerunning `install.sh` on a populated host doesn't clobber registry,
 auth profiles, or agents. Add an explicit `--upgrade` path that only refreshes
