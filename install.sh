@@ -83,6 +83,25 @@ curl -fsSL "$REPO/systemd/5dive-agent%40.service" -o "$SYSTEMD_DIR/5dive-agent@.
 systemctl daemon-reload
 ok "systemd template installed"
 
+# Install shared hooks + skills for claude-family telegram agents.
+# preseed_claude_agent references these by absolute path under
+# /usr/local/lib/5dive/, and warns at agent-create time if any are missing.
+# Without these the channel-paired agent will appear to start fine but its
+# rate-limit handler / picker-blocking guard / missed-reply auto-relay are
+# all silently disabled.
+say "Installing telegram hooks + skills"
+HOOKS_DIR="/usr/local/lib/5dive"
+install -d -m 755 "$HOOKS_DIR" "$HOOKS_DIR/skills/notify-user"
+for hook in stop-failure-telegram.sh resume-after-reset.sh \
+            pretool-telegram-question.sh stop-telegram-reply-check.sh; do
+  curl -fsSL "$REPO/hooks/$hook" -o "$HOOKS_DIR/$hook"
+  chmod 755 "$HOOKS_DIR/$hook"
+  ok "$hook"
+done
+curl -fsSL "$REPO/skills/notify-user/SKILL.md" -o "$HOOKS_DIR/skills/notify-user/SKILL.md"
+chmod 644 "$HOOKS_DIR/skills/notify-user/SKILL.md"
+ok "notify-user skill"
+
 echo
 echo "5dive installed successfully."
 echo
