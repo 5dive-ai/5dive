@@ -1,0 +1,307 @@
+#!/usr/bin/env bash
+# 5dive agent management CLI — runs on user's runtime VM.
+# State: /var/lib/5dive/agents.json (registry) + agents.d/<name>.env (per-agent systemd env).
+# Each agent = Linux user `agent-<name>` in `claude` group (inherits shared
+# /home/claude/.config|.claude|.codex|.aws) + systemd unit 5dive-agent@<name>.service
+# running tmux session `agent-<name>` with the chosen CLI in a restart loop.
+#
+# Output contract:
+#   - `--json` is accepted as a GLOBAL flag on any subcommand; stdout is then an
+#     envelope `{ok:true,data:...}` on success or `{ok:false,error:{code,class,message}}`
+#     on error. Text-mode stderr stays human-readable. Exit code always matches
+#     error.code (see E_* below) so shell pipelines can branch without parsing.
+#   - Progress `==>` lines always go to stderr so JSON stdout parses cleanly.
+set -euo pipefail
+
+STATE_DIR="/var/lib/5dive"
+REGISTRY="${STATE_DIR}/agents.json"
+ENV_DIR="${STATE_DIR}/agents.d"
+SYSTEMD_UNIT="5dive-agent@"
+
+# Bumped when the on-disk registry shape changes in a way that older CLIs
+# can't read. ensure_state stamps this into agents.json on create + migrates
+# v0 (no version field) registries in place. Keep migrations pure-jq so they
+# run without extra deps.
+readonly REGISTRY_SCHEMA_VERSION=1
+
+# Exclusive lock for mutating commands. Two dashboard clicks on "create" with
+# the same name used to race on adduser + registry_write; now every mutation
+# goes through with_registry_lock so there's exactly one writer at a time.
+REGISTRY_LOCK="${STATE_DIR}/registry.lock"
+
+# Append-only audit trail. Every mutating CLI invocation emits one NDJSON
+# line with {ts,user,cmd,args,result,code}. Sensitive flags (api keys, bot
+# tokens, callback codes) are redacted before write. The HTTP/exec path can
+# pass the Clerk user via FIVEDIVE_AUDIT_USER; otherwise we fall back to
+# SUDO_USER / USER.
+AUDIT_LOG="/var/log/5dive/agent-audit.log"
+
+# Named auth profiles let two agents of the same type authenticate against
+# different accounts/keys. Each profile is a directory of env files (one per
+# type) + any captured CLI config (e.g. a per-profile ~/.claude). The default
+# profile has no name and uses the shared /etc/5dive/connectors/*.env files
+# so existing single-account setups keep working unchanged.
+AUTH_PROFILES_DIR="${STATE_DIR}/auth-profiles"
+
+# Device-code login sessions for the non-TTY auth flow. Each live session is
+# a tmux window owned by the `claude` user, driving `claude setup-token` (or
+# equivalent). State lives under sessions/<id>/ — the dashboard polls it via
+# `5dive agent auth poll` so no PTY bridge is required.
+AUTH_SESSIONS_DIR="${STATE_DIR}/auth-sessions"
+
+# Default tmux cwd for a newly-created agent. Per-agent override goes in the
+# registry as .agents[name].workdir and is written to AGENT_WORKDIR in the
+# systemd env file — 5dive-agent-start.sh reads it and falls back to this
+# path if the configured dir isn't accessible.
+DEFAULT_WORKDIR="/home/claude/projects"
+
+# Per-agent channel secrets live here (readable by the agent user via
+# EnvironmentFile in 5dive-agent@.service). Mode 0640 root:claude is written
+# by the 5dive-write-connector helper — we call it so perms stay consistent.
+CONNECTORS_DIR="/etc/5dive/connectors"
+
+# Known agent types -> (bin path, supports channels yes/no).
+# auth_file is the shared-config path that indicates the type is authenticated.
+# Extend here to add a new agent type.
+declare -A TYPE_BIN=(
+  [claude]="/home/claude/.local/bin/claude"
+  [codex]="/home/claude/.nvm/versions/node/v24/bin/codex"
+  [gemini]="/home/claude/.nvm/versions/node/v24/bin/gemini"
+  [hermes]="/home/claude/.local/bin/hermes"
+  [openclaw]="/home/claude/.local/bin/openclaw"
+  [opencode]="/home/claude/.local/bin/opencode"
+)
+# Which types accept --channels=telegram|discord. Each type wires the channel
+# differently (see install_channel_for_<type>_agent below):
+#   claude   — installs claude-plugins-official's telegram/discord plugin into
+#              the agent user's ~/.claude/plugins; the bun server writes
+#              ~/.claude/channels/<plugin>/access.json on first launch and
+#              cmd_pair pops a pairing code into it.
+#   openclaw — `openclaw channels add --channel <ch> --token <token>` writes
+#              the credential into the openclaw gateway config; the openclaw
+#              `pairing` subcommand handles inbound user approvals separately.
+#   hermes   — writes TELEGRAM_BOT_TOKEN / DISCORD_BOT_TOKEN to the agent
+#              user's ~/.hermes/.env; hermes' gateway picks it up at startup.
+# Only claude needs the pair-code roundtrip — see cmd_pair's dispatch.
+declare -A TYPE_CHANNELS=(
+  [claude]=1
+  [openclaw]=1
+  [hermes]=1
+  [codex]=0
+  [gemini]=0
+  [opencode]=0
+)
+# Auth sentinel per type. Agent users run as agent-<name> (in group `claude`)
+# and cannot read /home/claude/.claude/settings.json (mode 0600), so for
+# claude-family types we check /etc/5dive/connectors/anthropic.env (0640
+# root:claude) — that's the file systemd injects via EnvironmentFile.
+# Format: "<path>"          -> file must exist and be non-empty
+#         "<path>:<KEY>"    -> if path ends in .env, grep ^KEY=; else jq .env[KEY]
+# Omit a type entirely to mark it auth-optional — auth_status_one returns "ok"
+# without checking. opencode is the canonical example: it ships with free models
+# and runs out of the box, so the dashboard shouldn't gate `agent create` on a
+# sign-in the user doesn't need.
+declare -A TYPE_AUTH=(
+  [claude]="/etc/5dive/connectors/anthropic.env:CLAUDE_CODE_OAUTH_TOKEN"
+  [codex]="/home/claude/.codex/auth.json"
+  [gemini]="/home/claude/.gemini/oauth_creds.json"
+  # Apr 2026 Anthropic policy change: third-party harnesses can no longer ride
+  # the user's Claude Pro/Max subscription token (suspension risk). hermes and
+  # openclaw both sign in via OpenAI's /codex/device flow now. hermes writes
+  # ~/.hermes/auth.json; openclaw writes its agent-scoped auth-profiles.json
+  # under the default agent id "main" (resolved by openclaw's resolveAgentDir).
+  [hermes]="/home/claude/.hermes/auth.json"
+  [openclaw]="/home/claude/.openclaw/agents/main/agent/auth-profiles.json"
+)
+# Installer recipe per type. Run as `claude` user via `sudo -u claude -i bash -lc <recipe>`
+# so $HOME/.nvm and PATH resolve correctly. Empty string => no automated installer
+# (caller must hand-install). Idempotent: each recipe checks first.
+declare -A TYPE_INSTALL=(
+  [claude]="command -v claude >/dev/null || curl -fsSL https://claude.ai/install.sh | bash"
+  [codex]="command -v codex >/dev/null || npm install -g @openai/codex"
+  [gemini]="command -v gemini >/dev/null || npm install -g @google/gemini-cli"
+  # opencode.ai's installer drops the binary at ~/.opencode/bin/opencode and
+  # only adds it to PATH via .bashrc — but bash -lc skips .bashrc on
+  # non-interactive shells, so neither the verify check below nor the agent
+  # systemd unit (which uses TYPE_BIN's path directly) would find it.
+  # Symlink into ~/.local/bin so TYPE_BIN[opencode] resolves on every box.
+  [opencode]="[[ -x /home/claude/.local/bin/opencode ]] || { curl -fsSL https://opencode.ai/install | bash && mkdir -p /home/claude/.local/bin && ln -sf /home/claude/.opencode/bin/opencode /home/claude/.local/bin/opencode; }"
+  # Both upstreams launch an interactive setup wizard that opens /dev/tty
+  # after the binary lands. shelld runs us without a controlling terminal,
+  # so the wizard's `exec </dev/tty` blows up with ENXIO and the recipe
+  # exits non-zero even though install itself succeeded. Pass the upstream
+  # opt-outs (--skip-setup / --no-onboard) to land at the binary and stop.
+  # openclaw also defaults to an npm install that drops the binary in
+  # nvm's per-version bin dir, not ~/.local/bin — symlink it so TYPE_BIN
+  # resolves on every box (same dance as opencode above).
+  # hermes' upstream installer recreates /home/claude/.hermes at mode 0700,
+  # overriding the 2770 from users.sh and blocking agent-* (claude-group)
+  # users from traversing it to exec the venv binary — the unit then
+  # crash-loops with `binary not installed`. chmod back to 0775 to match
+  # the live perms of /home/claude/.opencode and .local/share/claude.
+  [hermes]="[[ -x /home/claude/.local/bin/hermes ]] || { curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash -s -- --skip-setup && chmod 0775 /home/claude/.hermes; }"
+  [openclaw]="[[ -x /home/claude/.local/bin/openclaw ]] || { curl -fsSL https://openclaw.ai/install.sh | bash -s -- --no-onboard && mkdir -p /home/claude/.local/bin && ln -sf \"\$(npm prefix -g)/bin/openclaw\" /home/claude/.local/bin/openclaw; }"
+)
+
+# vercel-labs/skills CLI agent ID per 5dive type. `npx skills add --agent <id>`
+# uses this to drop SKILL.md into the right per-type dir. openclaw isn't in
+# the upstream registry — passing through its own name makes the CLI fall
+# back to a generic project install at ./skills/<id>, which is what we want.
+declare -A SKILLS_AGENT_ID=(
+  [claude]=claude-code
+  [codex]=codex
+  [gemini]=gemini-cli
+  [hermes]=hermes-agent
+  [openclaw]=openclaw
+  [opencode]=opencode
+)
+# Where the skills CLI lands SKILL.md inside the agent user's $HOME, per type.
+# Used for post-install verification, the cmd_skill_list dir-scan fallback,
+# and cmd_skill_rm. Probed empirically against npx skills v0.x — if upstream
+# changes a path, update here. Unknown types fall through to ".claude/skills"
+# in the lookup sites below.
+declare -A SKILLS_INSTALL_DIR=(
+  [claude]=".claude/skills"
+  [codex]=".agents/skills"
+  [gemini]=".agents/skills"
+  [hermes]=".hermes/skills"
+  [openclaw]="skills"
+  [opencode]=".agents/skills"
+)
+
+# api-key target per type: the env file (in /etc/5dive/connectors for the
+# default profile) and the env var inside it. Claude-family is special-cased
+# in cmd_auth_set — `sk-ant-oat01-*` tokens write CLAUDE_CODE_OAUTH_TOKEN,
+# everything else is ANTHROPIC_API_KEY. Non-claude types use a single var
+# that matches what their CLI reads natively.
+declare -A TYPE_API_FILE=(
+  [claude]="anthropic.env"
+  # hermes and openclaw intentionally omitted: both now sign in via OpenAI's
+  # /codex/device flow and store credentials in their own files (~/.hermes/
+  # auth.json, ~/.openclaw/agents/main/agent/auth-profiles.json). The
+  # anthropic.env path no longer feeds either CLI. cmd_auth_set already
+  # fails gracefully when a type isn't in this map.
+  [codex]="openai.env"
+  [gemini]="gemini.env"
+  [opencode]="openai.env"
+)
+declare -A TYPE_API_VAR=(
+  [claude]="ANTHROPIC_API_KEY"
+  [codex]="OPENAI_API_KEY"
+  [gemini]="GEMINI_API_KEY"
+  [opencode]="OPENAI_API_KEY"
+)
+
+# BYO provider catalog for hermes/openclaw. The dashboard's new-agent
+# wizard collects a canonical id (lowercase, vendor-style) from the user;
+# this table maps it to the provider id each agent CLI's native registry
+# recognizes plus a sensible default model so the agent's first launch
+# doesn't sit at a "model not configured" prompt. Empty string in the
+# native column means the type's registry doesn't have that vendor — the
+# wizard hides that tile for that agent type.
+#
+# Native ids were verified empirically:
+#   - hermes auth add <p> --type api-key --api-key <k>   (writes ~/.hermes/auth.json,
+#       auto-resolves base_url from the in-tree provider catalog).
+#   - openclaw writes auth-profiles.json with type:"api_key" entries; provider
+#       ids must match openclaw's built-in provider registry (anthropic, openai,
+#       google, deepseek, moonshot, openrouter all present).
+#
+# hermes-moonshot is a special case: its registry has a Kimi provider but no
+# `hermes auth add moonshot` subcommand — the key is read from KIMI_API_KEY in
+# ~/.hermes/.env at gateway startup (see .env.example upstream). _apply_byo_hermes
+# branches on canonical=="moonshot" to take the env-var path instead of `auth add`,
+# and cmd_create copies the value into agent-<name>'s own .env before the gateway
+# is started. The HERMES_PROVIDER_ID value for moonshot ("kimi") is used as the
+# argument to `hermes config set model.provider`, not as an `auth add` id.
+declare -A HERMES_PROVIDER_ID=(
+  [openai]=""
+  [anthropic]="anthropic"
+  [google]="gemini"
+  [deepseek]="deepseek"
+  [moonshot]="kimi"
+  [openrouter]="openrouter"
+  [nous]="nous"
+  [zai]="zai"
+  [minimax]="minimax"
+  [qwen]="alibaba"
+  [huggingface]="huggingface"
+)
+declare -A OPENCLAW_PROVIDER_ID=(
+  [openai]="openai"
+  [anthropic]="anthropic"
+  [google]="google"
+  [deepseek]="deepseek"
+  [moonshot]="moonshot"
+  [openrouter]="openrouter"
+  [nous]=""
+  [zai]="zai"
+  [minimax]="minimax"
+  [qwen]="qwen"
+  [huggingface]="huggingface"
+)
+# Optional per-(type, canonical) default model. Missing entry => leave the
+# agent's own default selection logic alone. Conservative defaults: pick
+# the vendor's flagship general-purpose model that's likely to exist in
+# the in-tree catalog. When an entry turns out to be wrong (model id
+# renamed upstream), the user can override via `5dive agent <name> tui`
+# and the agent CLI's own model picker.
+declare -A HERMES_PROVIDER_MODEL=(
+  [anthropic]="claude-sonnet-4-5"
+  [google]="gemini-2.0-flash"
+  [deepseek]="deepseek-chat"
+  [moonshot]="kimi-k2-turbo-preview"
+  [openrouter]="openrouter/auto"
+)
+declare -A OPENCLAW_PROVIDER_MODEL=(
+  [openai]="openai/gpt-4o"
+  [anthropic]="anthropic/claude-sonnet-4-5"
+  [google]="google/gemini-2.0-flash"
+  [deepseek]="deepseek/deepseek-chat"
+  [moonshot]="moonshot/kimi-k2-instruct"
+  [openrouter]="openrouter/auto"
+)
+declare -A BYO_PROVIDER_LABEL=(
+  [openai]="OpenAI"
+  [anthropic]="Anthropic"
+  [google]="Google AI"
+  [deepseek]="DeepSeek"
+  [moonshot]="Moonshot / Kimi"
+  [openrouter]="OpenRouter"
+  [nous]="Nous Portal"
+  [zai]="Z.ai / GLM"
+  [minimax]="MiniMax"
+  [qwen]="Alibaba / Qwen"
+  [huggingface]="Hugging Face"
+)
+valid_byo_provider() {
+  [[ -n "${BYO_PROVIDER_LABEL[$1]:-}" ]]
+}
+# Resolve a canonical UI id to the agent CLI's native provider id. Empty
+# result means the type doesn't support that vendor and the caller should
+# fail with a clear error.
+resolve_native_provider() {
+  local type="$1" canonical="$2"
+  case "$type" in
+    hermes)   echo "${HERMES_PROVIDER_ID[$canonical]:-}" ;;
+    openclaw) echo "${OPENCLAW_PROVIDER_ID[$canonical]:-}" ;;
+    *)        echo "" ;;
+  esac
+}
+
+# Live auth probe: run "<cli> <args>" as user `claude` with a 5s wall-clock
+# cap and see if exit==0. Empty string disables the probe for that type
+# (fall back to sentinel-file presence). Args deliberately keep the prompt
+# short — we care about "did the API accept our creds", not the response.
+declare -A TYPE_PROBE=(
+  [claude]='/home/claude/.local/bin/claude --print ping'
+  # hermes/openclaw used to probe via `--print ping` against Anthropic; with the
+  # OpenAI OAuth flow that argument shape no longer maps to a quick health check
+  # we can rely on, so fall back to file-presence (auth_status_one returns "ok"
+  # when no probe is configured and the credential file exists).
+  [hermes]=''
+  [openclaw]=''
+  [codex]=''
+  [gemini]=''
+  [opencode]=''
+)

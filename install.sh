@@ -21,8 +21,8 @@ say "Installing 5dive CLI"
 # System dependencies
 say "Installing system dependencies"
 apt-get update -qq
-DEBIAN_FRONTEND=noninteractive apt-get install -y -qq jq tmux git curl
-ok "jq, tmux, git, curl"
+DEBIAN_FRONTEND=noninteractive apt-get install -y -qq jq tmux git curl python3-yaml
+ok "jq, tmux, git, curl, python3-yaml"
 
 # Create claude group + user (agents run as agent-<name> in the claude group)
 if ! getent group claude >/dev/null 2>&1; then

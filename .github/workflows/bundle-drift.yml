@@ -1,0 +1,27 @@
+name: bundle-drift
+
+# Catch "edited the bundled 5dive but forgot to edit src/" (or vice versa).
+# The installer fetches the single-file 5dive directly, so the committed
+# bundle must always match what build.sh produces from src/.
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Rebuild bundle from src/
+        run: ./build.sh
+      - name: Syntax-check the rebuilt bundle
+        run: bash -n 5dive
+      - name: Fail if the committed bundle drifted from src/
+        run: |
+          if ! git diff --exit-code 5dive; then
+            echo
+            echo "ERROR: the committed 5dive bundle does not match src/."
+            echo "Run ./build.sh locally and commit the result."
+            exit 1
+          fi

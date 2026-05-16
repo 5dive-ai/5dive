@@ -166,6 +166,25 @@ Group sign-ins so multiple agents share one login:
 
 ---
 
+## Contributing
+
+The installed `5dive` is a single bash file — that's deliberate, so `curl … | sudo bash` can fetch one artifact. The source is split for readability:
+
+```
+src/header.sh           # set -euo pipefail, globals, declare -A maps
+src/lib/*.sh            # error_codes, output, validation, state/audit/registry,
+                        # agent_setup (channel + skill + preseed installers)
+src/cmd_*.sh            # one file per top-level subcommand
+                        # (auth, account, agent, skill, doctor, watch, compose)
+src/main.sh             # usage(), main(), EXIT trap, main "$@"
+```
+
+`./build.sh` concatenates them (in an order pinned by the script — not a glob) into the single-file `5dive` bundle that lives at the repo root. The bundle is committed so the installer keeps fetching one file; CI runs `./build.sh && git diff --exit-code 5dive` on every push so the bundle and `src/` can never drift apart. If CI fails on bundle-drift, run `./build.sh` locally and commit the result.
+
+Don't `source` files at runtime — it breaks the one-liner install and bash's cross-file scoping has enough ordering footguns to avoid.
+
+---
+
 ## License
 
 MIT — see [LICENSE](LICENSE)
