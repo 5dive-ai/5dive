@@ -13,6 +13,10 @@
 #   - Progress `==>` lines always go to stderr so JSON stdout parses cleanly.
 set -euo pipefail
 
+# Bumped on every public release. `build.sh` checks this line exists; CI fails
+# the bundle-drift check if it's missing or empty.
+readonly FIVE_VERSION="0.1.0"
+
 STATE_DIR="/var/lib/5dive"
 REGISTRY="${STATE_DIR}/agents.json"
 ENV_DIR="${STATE_DIR}/agents.d"

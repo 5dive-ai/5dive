@@ -39,4 +39,13 @@ cat \
   > "$OUT"
 
 chmod +x "$OUT"
-echo "built $OUT ($(wc -l < "$OUT") lines)"
+
+# Sanity-check the version line landed in the bundle. CI's bundle-drift check
+# already catches missing src→bundle plumbing, but this gives a tighter error
+# when someone empties out FIVE_VERSION by accident.
+if ! grep -qE '^readonly FIVE_VERSION="[^"]+"' "$OUT"; then
+  echo "error: $OUT is missing FIVE_VERSION — check src/header.sh" >&2
+  exit 1
+fi
+
+echo "built $OUT ($(wc -l < "$OUT") lines, $(grep -oE '^readonly FIVE_VERSION="[^"]+"' "$OUT" | cut -d'"' -f2))"

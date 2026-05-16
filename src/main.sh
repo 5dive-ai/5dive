@@ -15,8 +15,8 @@ Live dashboard:
   5dive ui [--host=<addr>] [--port=<n>]              # local web dashboard. Defaults to
                                                      # 127.0.0.1:5175 (loopback). Setting --host
                                                      # to a non-loopback address exposes the API
-                                                     # to your network — set up auth first with
-                                                     # `5dive ui setup`.
+                                                     # to your network — set up auth first via
+                                                     # '5dive ui setup'.
 
 Compose (declarative agents via 5dive.yaml):
   5dive up   [-f file]                               # bring up agents declared in spec (idempotent)
@@ -155,6 +155,18 @@ main() {
 
   [[ $# -gt 0 ]] || { usage; exit "$E_USAGE"; }
   local top="$1"; shift
+  # Handle --version / -v / version before the dispatch table so it stays a
+  # zero-dependency one-liner check (reviewers grep for it first).
+  case "$top" in
+    -v|--version|version)
+      if [[ "${JSON_MODE:-0}" == 1 ]]; then
+        printf '{"ok":true,"data":{"version":"%s"}}\n' "$FIVE_VERSION"
+      else
+        echo "5dive $FIVE_VERSION"
+      fi
+      exit 0
+      ;;
+  esac
   # Mutating commands run under with_registry_lock so adduser/registry_write
   # can't race across concurrent dashboard clicks. Read-only commands (list,
   # logs, stats, types, auth status/poll) bypass the lock and the audit log.

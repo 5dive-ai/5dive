@@ -18,11 +18,6 @@ Resume prompt: `continue OSS launch tasks from 5dive-cli/OSS_LAUNCH_TASKS.md —
 
 ## P1 — CLI hygiene (small, high-signal for OSS)
 
-### 9. `5dive --version` / `-v`
-Read from a single source — bake `5DIVE_VERSION` into `header.sh` (or read from
-a top-level `VERSION` file). `build.sh` should fail if the bundled file is
-missing the version line. Every OSS CLI has this; reviewers check first.
-
 ### 10. `5dive uninstall` (or `install.sh --uninstall`)
 Remove `/usr/local/bin/5dive`, `/usr/local/bin/5dive-agent-start`,
 `/usr/local/lib/5dive`, `/etc/systemd/system/5dive-agent@.service`. Prompt
