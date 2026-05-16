@@ -39,8 +39,7 @@ refresh_managed_files() {
   systemctl daemon-reload
   ok "systemd template installed"
 
-  install -d -m 755 "$LIB_DIR" "$LIB_DIR/skills/notify-user" \
-                    "$LIB_DIR/skills/5dive-cli" "$LIB_DIR/skills/5dive-cli/references"
+  install -d -m 755 "$LIB_DIR" "$LIB_DIR/skills/notify-user"
   for hook in stop-failure-telegram.sh resume-after-reset.sh \
               pretool-telegram-question.sh stop-telegram-reply-check.sh; do
     curl -fsSL "$REPO/hooks/$hook" -o "$LIB_DIR/$hook"
@@ -50,19 +49,6 @@ refresh_managed_files() {
   curl -fsSL "$REPO/skills/notify-user/SKILL.md" -o "$LIB_DIR/skills/notify-user/SKILL.md"
   chmod 644 "$LIB_DIR/skills/notify-user/SKILL.md"
   ok "notify-user skill"
-
-  # 5dive-cli skill: teaches a Claude Code / Codex / Gemini etc. agent how
-  # to drive `5dive` (spawn agents, inter-agent comms, etc.). Lives system-
-  # wide here; the README's "have your agent install 5dive" prompt tells
-  # the agent to drop a copy into its own ~/.claude/skills/.
-  curl -fsSL "$REPO/skills/5dive-cli/SKILL.md" -o "$LIB_DIR/skills/5dive-cli/SKILL.md"
-  chmod 644 "$LIB_DIR/skills/5dive-cli/SKILL.md"
-  for ref in commands.md exit-codes.md paths.md; do
-    curl -fsSL "$REPO/skills/5dive-cli/references/$ref" \
-      -o "$LIB_DIR/skills/5dive-cli/references/$ref"
-    chmod 644 "$LIB_DIR/skills/5dive-cli/references/$ref"
-  done
-  ok "5dive-cli skill"
 }
 
 # --- Subcommand dispatch ---------------------------------------------------
