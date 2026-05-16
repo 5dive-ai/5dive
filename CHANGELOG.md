@@ -9,6 +9,15 @@ release.
 
 ## [Unreleased]
 
+## [0.1.1] — 2026-05-16
+
+### Fixed
+
+- `install.sh` now installs `unzip`. The bun installer (`curl … | bash`)
+  requires it, and on a clean ubuntu:22.04 it isn't preinstalled — the
+  one-liner install was failing silently mid-script. Caught by the new
+  install-smoke CI job on its first run.
+
 ## [0.1.0] — 2026-05-16
 
 First public release.
@@ -83,5 +92,6 @@ First public release.
 - `bundle-drift` workflow — fails any push where the committed `5dive`
   bundle disagrees with `./build.sh` output from `src/`.
 
-[Unreleased]: https://github.com/5dive-com/5dive-cli/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/5dive-com/5dive-cli/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/5dive-com/5dive-cli/releases/tag/v0.1.1
 [0.1.0]: https://github.com/5dive-com/5dive-cli/releases/tag/v0.1.0
