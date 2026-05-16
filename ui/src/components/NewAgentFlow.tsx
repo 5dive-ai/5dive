@@ -9,7 +9,7 @@ type IconComponent = ComponentType<{ className?: string } & SVGProps<SVGSVGEleme
 
 interface Props {
   onExit: () => void;
-  onCreated: () => void;
+  onCreated: (createdName?: string) => void;
 }
 
 const TYPES = ["claude", "codex", "gemini", "hermes", "openclaw", "opencode"] as const;
@@ -346,7 +346,7 @@ export function NewAgentFlow({ onExit, onCreated }: Props) {
         const j = await res.json();
         if (cancelled) return;
         if (j.ok) {
-          onCreated();
+          onCreated(name.trim());
         } else {
           const e = j.error;
           setError(typeof e === "string" ? e : (e?.message ?? "Failed to create agent"));

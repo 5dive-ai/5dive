@@ -9,9 +9,10 @@ interface Props {
   onSelect: (agent: Agent) => void;
   onBack: () => void;
   onRefresh: () => void;
+  onNewAgent: () => void;
 }
 
-export function AgentsPage({ agents, selected, onSelect, onBack, onRefresh }: Props) {
+export function AgentsPage({ agents, selected, onSelect, onBack, onRefresh, onNewAgent }: Props) {
   return (
     <ErrorBoundary>
       {selected ? (
@@ -24,7 +25,7 @@ export function AgentsPage({ agents, selected, onSelect, onBack, onRefresh }: Pr
               Manage your AI agents running on this machine.
             </p>
           </div>
-          <AgentList agents={agents} onSelect={onSelect} onRefresh={onRefresh} />
+          <AgentList agents={agents} onSelect={onSelect} onRefresh={onRefresh} onNewAgent={onNewAgent} />
         </div>
       )}
     </ErrorBoundary>

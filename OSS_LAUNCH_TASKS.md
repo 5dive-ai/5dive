@@ -14,15 +14,6 @@ Resume prompt: `continue OSS launch tasks from 5dive-cli/OSS_LAUNCH_TASKS.md —
 > Item numbers are stable — completed items are removed but the surviving
 > items keep their original IDs so they're easy to refer to in chat / commits.
 
-### 7. UI onboarding: empty-state agent wizard
-When `agents.length === 0` after auth, show a "Create your first agent"
-walkthrough instead of a blank dashboard:
-1. Pick a type (Claude / Codex / Gemini / Hermes / OpenClaw / OpenCode)
-2. Install binary if missing (stream `agent install <type>` output)
-3. Auth (reuse existing `CreateAgentModal` step 2)
-4. Name + optional channel
-5. Auto-open detail view with Send tab focused
-
 ### 8. README: public-exposure docs
 Add a "Exposing the UI publicly" section to `ui/README.md`:
 - One-page Caddyfile reverse-proxy snippet with auto-HTTPS

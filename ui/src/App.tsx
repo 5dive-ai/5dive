@@ -16,14 +16,19 @@ function Dashboard() {
   const [selected, setSelected] = useState<Agent | null>(null);
   const [page, setPage] = useState<Page>("agents");
 
-  const refresh = useCallback(async () => {
+  const refresh = useCallback(async (): Promise<Agent[] | null> => {
     try {
       const res = await fetch("/api/agents");
       const json = await res.json();
-      if (json.ok) setAgents(json.data ?? []);
+      if (json.ok) {
+        const next = (json.data ?? []) as Agent[];
+        setAgents(next);
+        return next;
+      }
     } catch {
       setAgents([]);
     }
+    return null;
   }, []);
 
   useEffect(() => {
@@ -36,6 +41,18 @@ function Dashboard() {
     setPage(p);
     if (p !== "agents") setSelected(null);
   };
+
+  const handleCreated = useCallback(async (name?: string) => {
+    setCreating(false);
+    const next = await refresh();
+    if (name && next) {
+      const found = next.find((a) => a.name === name);
+      if (found) {
+        setSelected(found);
+        setPage("agents");
+      }
+    }
+  }, [refresh]);
 
   return (
     <div className="flex h-screen overflow-hidden bg-surface-page">
@@ -53,7 +70,8 @@ function Dashboard() {
               selected={selected}
               onSelect={(agent) => { setSelected(agent); setPage("agents"); }}
               onBack={() => setSelected(null)}
-              onRefresh={refresh}
+              onRefresh={() => { void refresh(); }}
+              onNewAgent={() => setCreating(true)}
             />
           )}
           {page === "accounts" && <AccountsPage />}
@@ -64,10 +82,7 @@ function Dashboard() {
       {creating && (
         <NewAgentFlow
           onExit={() => setCreating(false)}
-          onCreated={() => {
-            setCreating(false);
-            void refresh();
-          }}
+          onCreated={handleCreated}
         />
       )}
     </div>
