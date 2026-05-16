@@ -14,14 +14,6 @@ Resume prompt: `continue OSS launch tasks from 5dive-cli/OSS_LAUNCH_TASKS.md —
 > Item numbers are stable — completed items are removed but the surviving
 > items keep their original IDs so they're easy to refer to in chat / commits.
 
-### 4. UI auth: session cookie + middleware
-- Cookie: `HttpOnly; SameSite=Strict; Path=/`. `Secure` flag set when request
-  came in over HTTPS (`X-Forwarded-Proto` or direct TLS).
-- HMAC-signed with `sessionSecret`. 7-day sliding expiry.
-- Middleware: all `/api/*` requests → check cookie; 401 if invalid.
-- `/api/login` POST { password } → check hash → issue cookie.
-- `/api/logout` POST → clear cookie.
-
 ### 5. UI auth: refuse public bind without auth
 On startup, if `bind.host != 127.0.0.1` and `auth.mode != password`, refuse to
 start with an error pointing to `5dive ui setup`. Exception: `--insecure` flag

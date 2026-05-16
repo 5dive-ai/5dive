@@ -6,7 +6,17 @@
 import { spawn } from "child_process";
 import { existsSync } from "fs";
 import { join } from "path";
-import { loadConfig } from "./lib/config";
+import { loadConfig, saveConfig } from "./lib/config";
+import {
+  signSession,
+  verifySession,
+  parseCookies,
+  sessionCookieHeader,
+  clearCookieHeader,
+  isRequestSecure,
+  SESSION_COOKIE,
+} from "./lib/auth";
+import { randomBytes } from "crypto";
 
 // Resolve bind + auth. Precedence: CLI flags / env > config file > defaults.
 // `5dive ui` plumbs --host / --port into HOST / PORT env vars (empty string
@@ -77,6 +87,23 @@ function originAllowed(req: Request): boolean {
   }
 }
 
+// Routes that bypass auth: the SPA's own bootstrap surface plus static files.
+// Everything else under /api requires a valid session when auth.mode=password.
+const PUBLIC_API_PATHS = new Set([
+  "/api/auth-status",
+  "/api/login",
+  "/api/logout",
+  "/api/setup",
+]);
+
+function hasValidSession(req: Request): boolean {
+  if (config.auth.mode !== "password") return true;
+  if (!config.auth.sessionSecret) return false;
+  const cookies = parseCookies(req.headers.get("cookie"));
+  const token = cookies[SESSION_COOKIE];
+  return verifySession(config.auth.sessionSecret, token) !== null;
+}
+
 const server = Bun.serve({
   port: PORT,
   hostname: HOST,
@@ -96,6 +123,79 @@ const server = Bun.serve({
     // OPTIONS handler kept for the rare case a same-origin client preflights;
     // no CORS headers needed since we only ever respond to same-origin.
     if (req.method === "OPTIONS") return new Response(null, { headers });
+
+    // --- Auth surface (always available) ---
+
+    // GET /api/auth-status — drives the SPA's setup/login/dashboard routing
+    if (req.method === "GET" && path === "/api/auth-status") {
+      return Response.json({
+        ok: true,
+        data: {
+          mode: config.auth.mode,
+          configured: Boolean(config.auth.passwordHash),
+          authenticated: hasValidSession(req),
+        },
+      }, { headers });
+    }
+
+    // POST /api/setup { password } — only valid when no password is set yet.
+    // After setup, auto-issues a session cookie so the user is logged in.
+    if (req.method === "POST" && path === "/api/setup") {
+      if (config.auth.passwordHash) {
+        return Response.json(
+          { ok: false, error: "auth already configured — run `5dive ui setup` from the CLI to rotate" },
+          { status: 409, headers },
+        );
+      }
+      const body = await req.json().catch(() => ({})) as { password?: string };
+      const pw = body.password ?? "";
+      if (pw.length < 8) {
+        return Response.json({ ok: false, error: "password must be at least 8 characters" }, { status: 400, headers });
+      }
+      const hash = await Bun.password.hash(pw, "argon2id");
+      const sessionSecret = randomBytes(32).toString("base64");
+      config.auth = { mode: "password", passwordHash: hash, sessionSecret };
+      config.bind = { host: HOST, port: PORT };
+      saveConfig(config);
+      const token = signSession(sessionSecret);
+      return new Response(JSON.stringify({ ok: true }), {
+        status: 200,
+        headers: { ...headers, "Set-Cookie": sessionCookieHeader(token, isRequestSecure(req)) },
+      });
+    }
+
+    // POST /api/login { password }
+    if (req.method === "POST" && path === "/api/login") {
+      if (config.auth.mode !== "password" || !config.auth.passwordHash || !config.auth.sessionSecret) {
+        return Response.json({ ok: false, error: "auth not configured" }, { status: 400, headers });
+      }
+      const body = await req.json().catch(() => ({})) as { password?: string };
+      const pw = body.password ?? "";
+      const ok = await Bun.password.verify(pw, config.auth.passwordHash).catch(() => false);
+      if (!ok) {
+        return Response.json({ ok: false, error: "invalid password" }, { status: 401, headers });
+      }
+      const token = signSession(config.auth.sessionSecret);
+      return new Response(JSON.stringify({ ok: true }), {
+        status: 200,
+        headers: { ...headers, "Set-Cookie": sessionCookieHeader(token, isRequestSecure(req)) },
+      });
+    }
+
+    // POST /api/logout
+    if (req.method === "POST" && path === "/api/logout") {
+      return new Response(JSON.stringify({ ok: true }), {
+        status: 200,
+        headers: { ...headers, "Set-Cookie": clearCookieHeader(isRequestSecure(req)) },
+      });
+    }
+
+    // --- Auth gate for everything else under /api ---
+    if (path.startsWith("/api/") && !PUBLIC_API_PATHS.has(path)) {
+      if (!hasValidSession(req)) {
+        return Response.json({ ok: false, error: "unauthorized" }, { status: 401, headers });
+      }
+    }
 
     // GET /api/agents
     if (req.method === "GET" && path === "/api/agents") {
