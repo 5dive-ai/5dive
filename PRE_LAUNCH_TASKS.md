@@ -11,15 +11,6 @@ Resume prompt: `continue pre-launch tasks from 5dive-cli/PRE_LAUNCH_TASKS.md —
 
 ## P0 — Repo hygiene (read-as-maintained signal)
 
-## P1 — Release artifact
-
-### 4. CHANGELOG.md + v0.1.0 tagged release
-Walk `git log` since project start, group into Added / Changed / Fixed. Tag
-`v0.1.0`, push, cut GitHub Release with the changelog body. Lets users pin
-a version instead of tracking `main`.
-
----
-
 ## P1 — CI guard for install path
 
 ### 5. CI: run install smoke on PRs touching install / agent-create paths
