@@ -26,6 +26,22 @@ No telemetry. The CLI does not phone home, send usage data, or report errors any
 
 ---
 
+## Agents that talk to each other
+
+Every agent can call `5dive agent send` and `5dive agent ask` on any other agent on the same host. Stand up a small team — drafter, reviewer, deployer — each with its own model, auth, isolation tier, and channel, all sharing one command surface.
+
+```sh
+# from inside one agent's own session, talking to another:
+5dive agent send  reviewer "review this diff before I push"
+5dive agent ask   researcher "find the canonical postgres tuning guide" --timeout=300
+```
+
+No coordinator service, no orchestration layer, no API. The CLI itself is the bus. Spawn a senior agent and a junior, give them different prompts, let them pass work. Have one agent delegate research while another holds the user-facing thread.
+
+This is the feature most people don't realize they need until they try it.
+
+---
+
 ## Quickstart
 
 **1. Install** (or upgrade an existing install with `bash -s -- --upgrade`)
@@ -171,9 +187,25 @@ recipe for exposing the dashboard publicly.
 
 ---
 
+## Securing your server
+
+5dive puts agents with shell access on a box you control. That's a powerful default — and a responsibility. Standard server hygiene matters more here than for a static web app, because a compromised agent is a compromised shell.
+
+The shortlist:
+- **Keep the OS patched.** Enable `unattended-upgrades` (Ubuntu) or your distro's equivalent.
+- **Lock down SSH.** Key-only auth, no root login, no password fallback (`/etc/ssh/sshd_config`).
+- **Firewall by default-deny.** Open only SSH and — if you're exposing it — the dashboard port. `ufw` is the easy option.
+- **Don't expose the dashboard naked.** `5dive ui setup` configures password auth before you bind beyond loopback. Behind a reverse proxy with TLS if you publish it.
+- **Restrict who can pair.** Each Telegram-paired agent has an access allowlist (`telegram:access` skill). Use it.
+- **Pick the right isolation tier.** `sandboxed` for untrusted work, `standard` for shared-file flows, `admin` only when an agent really needs to manage the host.
+
+For deeper baselines, the standard tools are well-maintained — [devsec.os_hardening](https://github.com/dev-sec/ansible-collection-hardening) (Ansible), [Lynis](https://github.com/CISOfy/lynis) (audit), [fail2ban](https://www.fail2ban.org/) (brute-force protection). 5dive doesn't reinvent any of this — use whichever fits your workflow.
+
+---
+
 ## Managed platform
 
-[5dive.com](https://5dive.com) is a managed cloud that runs this CLI on provisioned VMs — adds a web dashboard, team access, cloud infrastructure, and uptime management on top of the same runtime.
+Or skip the checklist. [5dive.com](https://5dive.com) runs the same CLI on a managed cloud: VM, hardening, dashboard, allowlists, backups, uptime — handled. You point it at the agent. We point it at the box.
 
 ---
 
