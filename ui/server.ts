@@ -8,6 +8,11 @@ import { existsSync } from "fs";
 import { join } from "path";
 
 const PORT = parseInt(process.env.PORT ?? "5175");
+// Default to loopback. Public bind (0.0.0.0 / public IP) is opt-in via HOST env
+// or `5dive ui --host=...` because without auth this server exposes shell-level
+// agent control. The dispatcher refuses non-loopback HOST when auth is unset
+// (see `5dive ui setup`).
+const HOST = process.env.HOST ?? "127.0.0.1";
 const CLI = process.env.FIVE_CLI ?? "5dive";
 const DIST = join(import.meta.dir, "dist");
 const SERVE_STATIC = existsSync(DIST);
@@ -55,6 +60,7 @@ async function runCLIStream(args: string[], onLine: (line: string) => void): Pro
 
 const server = Bun.serve({
   port: PORT,
+  hostname: HOST,
   async fetch(req) {
     const url = new URL(req.url);
     const path = url.pathname;
@@ -308,5 +314,12 @@ const server = Bun.serve({
   },
 });
 
-console.log(`5dive UI at http://localhost:${PORT}${SERVE_STATIC ? "" : " (API only — run `bun run build` for full UI)"}`);
-if (SERVE_STATIC) console.log(`  open http://localhost:${PORT}`);
+// Display "localhost" for the loopback bind so the printed URL is clickable in
+// every terminal; print the actual host otherwise so users know what they
+// exposed.
+const displayHost = HOST === "127.0.0.1" || HOST === "::1" ? "localhost" : HOST;
+console.log(`5dive UI at http://${displayHost}:${PORT}${SERVE_STATIC ? "" : " (API only — run `bun run build` for full UI)"}`);
+if (HOST !== "127.0.0.1" && HOST !== "::1") {
+  console.warn(`⚠  bound to ${HOST} — UI has no auth yet, anyone with network access can spawn agents on this host.`);
+  console.warn(`   set up auth: 5dive ui setup     (or bind loopback: HOST=127.0.0.1 ${process.argv[1]})`);
+}

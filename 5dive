@@ -6057,6 +6057,11 @@ Global flags:
 Live dashboard:
   5dive watch [--interval=N]                         # htop-style live view of every agent;
                                                      # ↑↓ select, ↵ attach, r refresh, q quit.
+  5dive ui [--host=<addr>] [--port=<n>]              # local web dashboard. Defaults to
+                                                     # 127.0.0.1:5175 (loopback). Setting --host
+                                                     # to a non-loopback address exposes the API
+                                                     # to your network — set up auth first with
+                                                     # `5dive ui setup`.
 
 Compose (declarative agents via 5dive.yaml):
   5dive up   [-f file]                               # bring up agents declared in spec (idempotent)
@@ -6356,8 +6361,22 @@ main() {
       # Read-only — no audit, no lock.
       cmd_compose_ps "$@" ;;
     ui)
-      # Start the local dashboard UI server and open the browser.
-      local port="${1:-5175}"
+      # Start the local dashboard UI server.
+      # Defaults to 127.0.0.1:5175 — loopback-only because the API has no auth
+      # yet and exposes shell-level agent control. Override with --host= /
+      # --port= but read the warning printed by the server first.
+      local ui_host="127.0.0.1"
+      local ui_port="5175"
+      while [[ $# -gt 0 ]]; do
+        case "$1" in
+          --host=*) ui_host="${1#--host=}"; shift ;;
+          --port=*) ui_port="${1#--port=}"; shift ;;
+          --host)   ui_host="${2:-}"; shift 2 ;;
+          --port)   ui_port="${2:-}"; shift 2 ;;
+          [0-9]*)   ui_port="$1"; shift ;;  # legacy positional port
+          *)        fail "$E_USAGE" "unknown ui flag: $1" ;;
+        esac
+      done
       local ui_dir
       # Look for ui/ relative to this script, then fall back to /usr/local/lib/5dive/ui
       if [[ -d "$(dirname "$(realpath "$0")")/ui" ]]; then
@@ -6367,9 +6386,8 @@ main() {
       else
         fail "$E_NOT_FOUND" "5dive UI not found — install it at /usr/local/lib/5dive/ui or run from the 5dive-cli repo directory"
       fi
-      echo "Starting 5dive UI at http://localhost:${port}" >&2
       cd "$ui_dir"
-      PORT="$port" exec bun run server.ts ;;
+      HOST="$ui_host" PORT="$ui_port" exec bun run server.ts ;;
     -h|--help|help) usage ;;
     *) fail "$E_USAGE" "unknown command: $top" ;;
   esac
