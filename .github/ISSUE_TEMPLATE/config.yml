@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/5dive-com/5dive-cli/security/advisories/new
+    about: Report security issues privately via GitHub advisories. Do NOT open a public issue.
+  - name: Question or discussion
+    url: https://github.com/5dive-com/5dive-cli/discussions
+    about: For general questions, ideas, or how-do-I help — not bugs.

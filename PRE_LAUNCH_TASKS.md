@@ -11,12 +11,6 @@ Resume prompt: `continue pre-launch tasks from 5dive-cli/PRE_LAUNCH_TASKS.md —
 
 ## P0 — Repo hygiene (read-as-maintained signal)
 
-### 3. Issue + PR templates
-`.github/ISSUE_TEMPLATE/bug_report.md`, `.github/ISSUE_TEMPLATE/feature_request.md`,
-`.github/pull_request_template.md`. Short, low-friction.
-
----
-
 ## P1 — Release artifact
 
 ### 4. CHANGELOG.md + v0.1.0 tagged release
