@@ -54,8 +54,8 @@ export function CloneAgentModal({ sourceName, onClose, onCloned }: Props) {
   return (
     <Modal state={modalState}>
       <Modal.Backdrop>
-        <Modal.Container size="sm" placement="center" className="sm:max-w-sm">
-          <Modal.Dialog className="p-0">
+        <Modal.Container size="sm" placement="center" className="max-sm:p-0 sm:max-w-sm">
+          <Modal.Dialog className="p-0 max-sm:h-full max-sm:max-w-full max-sm:rounded-none max-sm:shadow-none">
             <div className="flex items-center gap-3 border-b border-border-subtle px-6 py-4">
               <div>
                 <h2 className="text-[1rem] font-semibold tracking-tight text-ink">Clone agent</h2>

@@ -47,7 +47,7 @@ function AccountRow({
             </Chip>
           )}
         </div>
-        <div className="mt-0.5 flex items-center gap-2 text-[0.75rem] text-ink-secondary">
+        <div className="mt-0.5 flex flex-wrap items-center gap-x-2 gap-y-1 text-[0.75rem] text-ink-secondary">
           {account.types.length > 0 ? (
             account.types.map((t) => {
               const Icon = TYPE_ICON[t];
@@ -64,7 +64,7 @@ function AccountRow({
           <span>{account.agentCount} agent{account.agentCount !== 1 ? "s" : ""}</span>
         </div>
       </div>
-      <div className="flex items-center gap-1 opacity-0 group-hover:opacity-100">
+      <div className="flex items-center gap-1 sm:opacity-0 sm:group-hover:opacity-100">
         {account.name !== "default" && (
           <Button
             size="sm"

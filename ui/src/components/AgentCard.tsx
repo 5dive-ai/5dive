@@ -130,8 +130,8 @@ export function AgentCard({ agent, onSelect, onRefresh }: Props) {
         </div>
       </div>
 
-      {/* Actions */}
-      <div className="flex shrink-0 items-center gap-1.5 opacity-0 transition-opacity group-hover:opacity-100">
+      {/* Actions — always visible on touch; reveal on hover at sm+ */}
+      <div className="flex shrink-0 items-center gap-1.5 transition-opacity sm:opacity-0 sm:group-hover:opacity-100">
         {busy ? (
           <Spinner size="sm" />
         ) : (

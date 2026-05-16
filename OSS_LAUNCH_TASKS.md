@@ -18,5 +18,4 @@ Resume prompt: `continue OSS launch tasks from 5dive-cli/OSS_LAUNCH_TASKS.md —
 
 ## P3 — Day-2 (post-launch, ordered by likely demand)
 
-### 29b. UI_TASKS T13 — mobile polish: confirm modal full-screen + card stacking at narrow widths (sidebar+bottom-tab shell already done)
 ### 30. OIDC / SSO adapter (Authelia / Authentik compatible)

@@ -150,7 +150,7 @@ When `5dive doctor` reports a type binary is missing, let user fix it in one cli
 
 ---
 
-## T13 · Mobile / responsive layout  ✅ TODO
+## T13 · Mobile / responsive layout  ✅ DONE
 Current layout is desktop-only. Flagship has a bottom tab bar on mobile.
 
 **Changes:**
