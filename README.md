@@ -6,6 +6,8 @@ Open-source CLI to spawn, manage, and message AI agents — any model, any machi
 curl -fsSL https://raw.githubusercontent.com/5dive-com/5dive-cli/main/install.sh | sudo bash
 ```
 
+No auth proxying. 5dive installs the official vendor CLIs (Claude Code, Codex, Gemini, etc.) on your own server — you log in with your own subscription, exactly like you would locally. Your auth tokens never touch us.
+
 No telemetry. The CLI does not phone home, send usage data, or report errors anywhere — it only talks to the model providers you configure.
 
 ---
