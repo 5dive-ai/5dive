@@ -14,19 +14,6 @@ Resume prompt: `continue OSS launch tasks from 5dive-cli/OSS_LAUNCH_TASKS.md —
 > Item numbers are stable — completed items are removed but the surviving
 > items keep their original IDs so they're easy to refer to in chat / commits.
 
-### 3. UI auth: config file + argon2id password
-- Config path: `~/.config/5dive/ui.json` (per-user, mode 600).
-- Schema:
-  ```json
-  {
-    "bind": { "host": "127.0.0.1", "port": 5175 },
-    "auth": { "mode": "none|password", "passwordHash": "...", "sessionSecret": "..." }
-  }
-  ```
-- `5dive ui setup` (new subcommand): interactive prompt for password,
-  writes argon2id hash + random 32-byte session secret. Idempotent.
-- Use `bun:crypto` for argon2id (or `@node-rs/argon2` if not in bun stdlib).
-
 ### 4. UI auth: session cookie + middleware
 - Cookie: `HttpOnly; SameSite=Strict; Path=/`. `Secure` flag set when request
   came in over HTTPS (`X-Forwarded-Proto` or direct TLS).

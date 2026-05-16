@@ -316,24 +316,11 @@ main() {
       # Read-only — no audit, no lock.
       cmd_compose_ps "$@" ;;
     ui)
-      # Start the local dashboard UI server.
-      # Defaults to 127.0.0.1:5175 — loopback-only because the API has no auth
-      # yet and exposes shell-level agent control. Override with --host= /
-      # --port= but read the warning printed by the server first.
-      local ui_host="127.0.0.1"
-      local ui_port="5175"
-      while [[ $# -gt 0 ]]; do
-        case "$1" in
-          --host=*) ui_host="${1#--host=}"; shift ;;
-          --port=*) ui_port="${1#--port=}"; shift ;;
-          --host)   ui_host="${2:-}"; shift 2 ;;
-          --port)   ui_port="${2:-}"; shift 2 ;;
-          [0-9]*)   ui_port="$1"; shift ;;  # legacy positional port
-          *)        fail "$E_USAGE" "unknown ui flag: $1" ;;
-        esac
-      done
+      # Local dashboard UI.
+      #   5dive ui                       # start server (loopback by default)
+      #   5dive ui setup                 # configure password auth (interactive)
+      #   5dive ui --host=0.0.0.0 ...    # expose to network (requires setup)
       local ui_dir
-      # Look for ui/ relative to this script, then fall back to /usr/local/lib/5dive/ui
       if [[ -d "$(dirname "$(realpath "$0")")/ui" ]]; then
         ui_dir="$(dirname "$(realpath "$0")")/ui"
       elif [[ -d /usr/local/lib/5dive/ui ]]; then
@@ -341,8 +328,44 @@ main() {
       else
         fail "$E_NOT_FOUND" "5dive UI not found — install it at /usr/local/lib/5dive/ui or run from the 5dive-cli repo directory"
       fi
+
+      # `5dive ui setup` — one-shot interactive password setup
+      if [[ "${1:-}" == "setup" ]]; then
+        shift
+        cd "$ui_dir"
+        exec bun run setup.ts "$@"
+      fi
+
+      # Defaults to 127.0.0.1:5175 — loopback-only because without auth the
+      # API exposes shell-level agent control. Override with --host= /
+      # --port=; non-loopback bind will refuse to start unless `ui setup`
+      # has been run (or --insecure is passed).
+      local ui_host=""
+      local ui_port=""
+      local ui_insecure=""
+      while [[ $# -gt 0 ]]; do
+        case "$1" in
+          --host=*)   ui_host="${1#--host=}"; shift ;;
+          --port=*)   ui_port="${1#--port=}"; shift ;;
+          --host)     ui_host="${2:-}"; shift 2 ;;
+          --port)     ui_port="${2:-}"; shift 2 ;;
+          --insecure) ui_insecure=1; shift ;;
+          [0-9]*)     ui_port="$1"; shift ;;  # legacy positional port
+          *)          fail "$E_USAGE" "unknown ui flag: $1" ;;
+        esac
+      done
       cd "$ui_dir"
-      HOST="$ui_host" PORT="$ui_port" exec bun run server.ts ;;
+      # Only set env vars when the flag was actually given, so direct
+      # `HOST=... 5dive ui` still flows through to the server.
+      local -a ui_env=()
+      [[ -n "$ui_host" ]] && ui_env+=("HOST=$ui_host")
+      [[ -n "$ui_port" ]] && ui_env+=("PORT=$ui_port")
+      [[ -n "$ui_insecure" ]] && ui_env+=("INSECURE=$ui_insecure")
+      if [[ ${#ui_env[@]} -gt 0 ]]; then
+        exec env "${ui_env[@]}" bun run server.ts
+      else
+        exec bun run server.ts
+      fi ;;
     -h|--help|help) usage ;;
     *) fail "$E_USAGE" "unknown command: $top" ;;
   esac

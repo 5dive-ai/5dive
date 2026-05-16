@@ -6,13 +6,14 @@
 import { spawn } from "child_process";
 import { existsSync } from "fs";
 import { join } from "path";
+import { loadConfig } from "./lib/config";
 
-const PORT = parseInt(process.env.PORT ?? "5175");
-// Default to loopback. Public bind (0.0.0.0 / public IP) is opt-in via HOST env
-// or `5dive ui --host=...` because without auth this server exposes shell-level
-// agent control. The dispatcher refuses non-loopback HOST when auth is unset
-// (see `5dive ui setup`).
-const HOST = process.env.HOST ?? "127.0.0.1";
+// Resolve bind + auth. Precedence: CLI flags / env > config file > defaults.
+// `5dive ui` plumbs --host / --port into HOST / PORT env vars (empty string
+// when unset, so we fall through to config).
+const config = loadConfig();
+const PORT = parseInt(process.env.PORT || String(config.bind.port));
+const HOST = process.env.HOST || config.bind.host;
 const CLI = process.env.FIVE_CLI ?? "5dive";
 const DIST = join(import.meta.dir, "dist");
 const SERVE_STATIC = existsSync(DIST);
