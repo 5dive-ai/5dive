@@ -18,7 +18,6 @@ Resume prompt: `continue OSS launch tasks from 5dive-cli/OSS_LAUNCH_TASKS.md —
 
 ## P3 — Day-2 (post-launch, ordered by likely demand)
 
-### 24. `--user` mode (tmux-managed, no systemd)
 ### 25. Offline / air-gapped install (release tarball + manual steps)
 ### 26b. UI_TASKS T11 — "Install" button in Health for missing type binaries (T10 health page itself is done)
 ### 28b. UI_TASKS T12 — telegram auto-discover button (access-list management is done in Pair tab)

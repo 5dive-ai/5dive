@@ -239,6 +239,8 @@ Or skip the checklist. [5dive.com](https://5dive.com) runs the same CLI on a man
 - `bash` 5+, `jq`, `tmux`, `systemd`
 - Root access for install
 
+No systemd, no root, or not on Linux? Run the [Docker image](#try-it-in-docker-no-host-install) — it bundles systemd + a working install, and works on macOS and Windows hosts.
+
 ---
 
 ## Contributing
