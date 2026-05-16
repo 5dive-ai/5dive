@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback } from "react";
-import { CheckCircle, AlertCircle, AlertTriangle, RefreshCw, Wrench } from "lucide-react";
+import { CheckCircle, AlertCircle, AlertTriangle, RefreshCw, Wrench, Download } from "lucide-react";
 import { Button, Spinner } from "@heroui/react";
 import type { DoctorResult } from "../types";
 import { useToast } from "../context/ToastContext";
@@ -14,6 +14,7 @@ export function HealthPage() {
   const [result, setResult] = useState<DoctorResult | null>(null);
   const [loading, setLoading] = useState(true);
   const [repairing, setRepairing] = useState(false);
+  const [installing, setInstalling] = useState<string | null>(null);
   const toast = useToast();
 
   const run = useCallback(async (repair = false) => {
@@ -35,6 +36,25 @@ export function HealthPage() {
       if (repair) setRepairing(false); else setLoading(false);
     }
   }, [toast]);
+
+  const installType = useCallback(async (type: string) => {
+    if (installing) return;
+    setInstalling(type);
+    try {
+      const res = await fetch(`/api/agent/install/${encodeURIComponent(type)}`, { method: "POST" });
+      const j = await res.json();
+      if (j.ok) {
+        toast("success", `Installed ${type}`);
+        await run();
+      } else {
+        toast("error", j.error?.message ?? j.error ?? `Failed to install ${type}`);
+      }
+    } catch {
+      toast("error", `Failed to install ${type}`);
+    } finally {
+      setInstalling(null);
+    }
+  }, [installing, run, toast]);
 
   useEffect(() => { void run(); }, [run]);
 
@@ -70,7 +90,7 @@ export function HealthPage() {
         <div className="flex items-center gap-2">
           <Button
             size="sm"
-            variant="bordered"
+            variant="outline"
             className="gap-1.5 border-border-subtle text-[0.8125rem] text-ink-secondary"
             onPress={() => void run()}
             isDisabled={loading || repairing}
@@ -133,16 +153,31 @@ export function HealthPage() {
                     )}
                   </div>
                   <div className="flex items-center gap-2 shrink-0">
-                    {check.fixable && check.severity !== "ok" && (
+                    {check.fixable && check.severity !== "ok" && check.category === "types" ? (
                       <Button
                         size="sm"
-                        variant="bordered"
+                        variant="outline"
+                        className="h-6 gap-1 border-border-subtle px-2 text-[0.7rem] text-ink-secondary"
+                        onPress={() => void installType(check.name)}
+                        isDisabled={installing !== null || repairing}
+                      >
+                        {installing === check.name ? (
+                          <><Spinner size="sm" /> Installing…</>
+                        ) : (
+                          <><Download className="size-2.5" /> Install</>
+                        )}
+                      </Button>
+                    ) : check.fixable && check.severity !== "ok" ? (
+                      <Button
+                        size="sm"
+                        variant="outline"
                         className="h-6 gap-1 border-border-subtle px-2 text-[0.7rem] text-ink-secondary"
                         onPress={() => void run(true)}
+                        isDisabled={installing !== null || repairing}
                       >
                         <Wrench className="size-2.5" /> Fix
                       </Button>
-                    )}
+                    ) : null}
                     <span
                       className={`text-[0.75rem] font-medium capitalize ${
                         check.severity === "ok"

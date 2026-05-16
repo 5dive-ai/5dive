@@ -130,7 +130,7 @@ Account management (`5dive account *`) is entirely missing.
 
 ---
 
-## T11 · Install missing type CLI  ✅ TODO
+## T11 · Install missing type CLI  ✅ DONE
 When `5dive doctor` reports a type binary is missing, let user fix it in one click.
 
 **Changes:**
