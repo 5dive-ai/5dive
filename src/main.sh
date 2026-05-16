@@ -11,6 +11,7 @@ Global flags:
 
 Maintenance:
   5dive --version                                    # print version
+  5dive init                                         # interactive first-run wizard
   5dive uninstall [--purge] [--yes]                  # remove 5dive (--purge also wipes state + user)
 
 Live dashboard:
@@ -319,6 +320,11 @@ main() {
     watch)
       # Live multi-agent dashboard (htop-style). Read-only — no audit, no lock.
       cmd_watch "$@" ;;
+    init)
+      # Interactive first-run wizard: pick a type → install → auth → create
+      # → "send hello". Calls back into the same CLI for each step.
+      AUDIT_CMD="init"; AUDIT_ARGS=("$@")
+      cmd_init "$@" ;;
     up)
       # Compose-style: bring up agents declared in 5dive.yaml. Mutating but
       # the per-agent `agent create` calls take the registry lock + audit

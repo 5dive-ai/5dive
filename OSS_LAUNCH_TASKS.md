@@ -18,11 +18,6 @@ Resume prompt: `continue OSS launch tasks from 5dive-cli/OSS_LAUNCH_TASKS.md —
 
 ## P1 — CLI hygiene (small, high-signal for OSS)
 
-### 11. `5dive init` — first-run wizard
-Interactive: pick a type → run `agent install <type>` if missing → auth flow →
-create first agent → send "hello" and tail the reply. Single command from the
-README quickstart instead of five.
-
 ### 12. README: telemetry policy line
 One sentence in README near the top. Even "5dive collects no telemetry, ever"
 is positive signal; silence reads as "they'll add it later."

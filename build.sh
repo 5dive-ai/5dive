@@ -32,6 +32,7 @@ cat \
   src/cmd_account.sh \
   src/cmd_agent.sh \
   src/cmd_skill.sh \
+  src/cmd_init.sh \
   src/cmd_doctor.sh \
   src/cmd_watch.sh \
   src/cmd_compose.sh \
