@@ -6,6 +6,24 @@ Open-source CLI to spawn, manage, and message AI agents — any model, any machi
 curl -fsSL https://raw.githubusercontent.com/5dive-com/5dive-cli/main/install.sh | sudo bash
 ```
 
+### Or have your existing AI agent install it
+
+If you already have a coding agent running on the target server (Claude Code, Codex, Gemini, opencode, etc.), paste this into its chat and let it do the install:
+
+```
+Install 5dive-cli on this Linux server.
+
+1. Run the official installer:
+   curl -fsSL https://raw.githubusercontent.com/5dive-com/5dive-cli/main/install.sh | sudo bash
+2. Confirm it landed: `5dive --version` should print "5dive 0.1.x".
+3. Then STOP. Don't create any agents, don't set any API keys, don't pair any
+   Telegram bot — I'll do the rest interactively.
+
+If the install errors out (apt deps, missing sudo, network), surface the
+exact error and don't retry blindly. The installer is idempotent, so a
+rerun is safe once the underlying issue is fixed.
+```
+
 No auth proxying. 5dive runs your AI CLI of choice (Claude Code, Codex, Gemini, Hermes, openclaw, opencode) on your own server — you log in with your own credentials, exactly like you would locally. Your auth tokens never touch us.
 
 No telemetry. The CLI does not phone home, send usage data, or report errors anywhere — it only talks to the model providers you configure.
