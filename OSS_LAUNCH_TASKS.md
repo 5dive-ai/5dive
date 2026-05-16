@@ -18,10 +18,6 @@ Resume prompt: `continue OSS launch tasks from 5dive-cli/OSS_LAUNCH_TASKS.md —
 
 ## P1 — CLI hygiene (small, high-signal for OSS)
 
-### 14. Run `5dive doctor` after install
-Append `5dive doctor` to the end of `install.sh` so the user sees their health
-state immediately. Fail-soft if any check fails.
-
 ### 15. Strip / reword managed-platform refs
 - `cmd_agent.sh:1586` — `FIVE_DOMAIN` comment mentions `warm-hawk.5dive.com`;
   reword to a generic placeholder.

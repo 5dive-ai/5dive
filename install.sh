@@ -229,9 +229,17 @@ refresh_managed_files
 echo
 echo "5dive installed successfully."
 echo
+
+# Show health state immediately so a fresh user knows whether anything is
+# missing (e.g. agent type binaries) before they try to create an agent.
+# Fail-soft: doctor itself always exits 0, but `|| true` guards against
+# future regressions so a doctor crash never breaks the install.
+say "Running health check"
+5dive doctor || true
+
+echo
 echo "Next steps:"
 echo "  5dive agent list                          # list agents"
-echo "  5dive doctor                              # check system health"
 echo "  5dive doctor --repair                     # auto-install agent type binaries"
 echo "  5dive agent create my-agent --type=claude # create your first agent"
 echo
