@@ -18,8 +18,10 @@ Install 5dive-cli on this Linux host so I can use you to manage 5dive agents.
 1. Run the official installer (idempotent — safe to rerun):
    curl -fsSL https://raw.githubusercontent.com/5dive-com/5dive-cli/main/install.sh | sudo bash
 2. Confirm: `5dive --version` should print "5dive 0.1.x".
-3. Install the 5dive-cli skill so you know how to drive it:
-   npx -y skills add https://github.com/5dive-com/skills --skill 5dive-cli --agent claude-code --yes
+3. Install the 5dive-cli skill so you know how to drive it. Use the
+   `--agent` value that matches your runtime — `claude-code`, `codex`,
+   `gemini-cli`, `hermes-agent`, `openclaw`, or `opencode`:
+   npx -y skills add https://github.com/5dive-com/skills --skill 5dive-cli --agent <your-runtime> --yes
 4. Tell me to restart so the skill loads, then wait — I'll ask which agent
    to create first.
 
@@ -39,8 +41,10 @@ it through you over SSH.
 3. Verify: `ssh <user@host> '/usr/local/bin/5dive --version'` should print
    "5dive 0.1.x".
 4. Install the 5dive-cli skill into your own (local) home — that's where
-   you'll be issuing `ssh <user@host> 5dive ...` calls from:
-   npx -y skills add https://github.com/5dive-com/skills --skill 5dive-cli --agent claude-code --yes
+   you'll be issuing `ssh <user@host> 5dive ...` calls from. Use the
+   `--agent` value that matches your runtime — `claude-code`, `codex`,
+   `gemini-cli`, `hermes-agent`, `openclaw`, or `opencode`:
+   npx -y skills add https://github.com/5dive-com/skills --skill 5dive-cli --agent <your-runtime> --yes
 5. Tell me to restart, then wait — I'll ask which agent to spin up first on
    the remote.
 
