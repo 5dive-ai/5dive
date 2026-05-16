@@ -157,7 +157,7 @@ say "Installing 5dive CLI"
 # unattended-upgrades is running concurrently (common on freshly-provisioned
 # boxes).
 say "Installing system dependencies"
-APT_PKGS="jq tmux git curl python3-yaml"
+APT_PKGS="jq tmux git curl python3-yaml unzip"
 apt_need=0
 for p in $APT_PKGS; do
   dpkg -s "$p" >/dev/null 2>&1 || { apt_need=1; break; }
