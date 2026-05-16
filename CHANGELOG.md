@@ -18,6 +18,12 @@ release.
   one-liner install was failing silently mid-script. Caught by the new
   install-smoke CI job on its first run.
 
+### Added
+
+- README — copy-paste prompt block for users who'd rather have their
+  existing AI agent run the install (instead of pasting the curl line
+  themselves).
+
 ## [0.1.0] — 2026-05-16
 
 First public release.
