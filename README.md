@@ -1,5 +1,10 @@
 # 5dive CLI
 
+[![install-smoke](https://github.com/5dive-com/5dive-cli/actions/workflows/install-smoke.yml/badge.svg)](https://github.com/5dive-com/5dive-cli/actions/workflows/install-smoke.yml)
+[![bundle-drift](https://github.com/5dive-com/5dive-cli/actions/workflows/bundle-drift.yml/badge.svg)](https://github.com/5dive-com/5dive-cli/actions/workflows/bundle-drift.yml)
+[![Latest release](https://img.shields.io/github/v/release/5dive-com/5dive-cli)](https://github.com/5dive-com/5dive-cli/releases)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 Open-source CLI to spawn, manage, and message AI agents — any model, any machine.
 
 > Prefer managed? [5dive.com](https://5dive.com) runs the same CLI on a hardened VM — point it at the agent, skip the ops.
