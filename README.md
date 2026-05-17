@@ -99,6 +99,16 @@ Every agent can call `5dive agent send` and `5dive agent ask` on any other agent
 5dive agent ask  main "summarize the v0.4 changelog — 3 bullets" --timeout=120
 ```
 
+Different runtimes for different jobs — pass files through a shared host path:
+
+```sh
+# main → codex: generate a still image
+5dive agent ask codex  "generate a 1024x1024 photo of a fox in fog, save to /tmp/fox.png" --timeout=180
+
+# main → gemini: animate it
+5dive agent ask gemini "animate /tmp/fox.png into a 3s loop, save to /tmp/fox.mp4"        --timeout=300
+```
+
 No coordinator service, no orchestration layer, no API. The CLI itself is the bus. Spawn a senior agent and a junior, give them different prompts, let them pass work. Have one agent delegate research while another holds the user-facing thread.
 
 This is the feature most people don't realize they need until they try it.
