@@ -24,7 +24,10 @@ Install 5dive-cli on this Linux host so I can use you to manage 5dive agents.
    `--agent` value that matches your runtime — `claude-code`, `codex`,
    `gemini-cli`, `hermes-agent`, `openclaw`, or `opencode`:
    npx -y skills add https://github.com/5dive-com/skills --skill 5dive-cli --agent <your-runtime> --yes
-4. Tell me to restart so the skill loads, then wait — I'll ask which agent
+4. Ask me whether to set up the local web dashboard. If yes, run
+   `5dive ui setup` (interactive password prompt) — I can launch it later
+   with `5dive ui`. If no, skip; it can be set up anytime.
+5. Tell me to restart so the skill loads, then wait — I'll ask which agent
    to create first.
 
 If the install errors out (apt deps, sudo, network), surface the exact error
@@ -47,7 +50,11 @@ it through you over SSH.
    `--agent` value that matches your runtime — `claude-code`, `codex`,
    `gemini-cli`, `hermes-agent`, `openclaw`, or `opencode`:
    npx -y skills add https://github.com/5dive-com/skills --skill 5dive-cli --agent <your-runtime> --yes
-5. Tell me to restart, then wait — I'll ask which agent to spin up first on
+5. Ask me whether to set up the dashboard on the remote VM. If yes, run
+   `ssh -t <user@host> 5dive ui setup` (interactive password) — I'll bind
+   it later (loopback, or `--host=0.0.0.0` behind a reverse proxy). If no,
+   skip; it can be set up anytime.
+6. Tell me to restart, then wait — I'll ask which agent to spin up first on
    the remote.
 
 For step 2+ you'll mostly prefix `5dive` calls with `ssh <user@host>`. Use
