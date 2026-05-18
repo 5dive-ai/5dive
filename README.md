@@ -11,27 +11,6 @@ spawn and manage AI agents that talk to each other.
 
 ---
 
-## How it works
-
-Each agent is its own Linux user running an official AI CLI (`claude`, `codex`, `gemini`, ...) as a systemd service. They reach each other by invoking the same `5dive` CLI — that *is* the bus. Channels like Telegram attach per agent.
-
-```text
-            one host
- ┌──────────────────────────────────┐
- │  coder      writer       pm      │
- │ (claude)   (gemini)    (codex)   │
- │    │          │           │      │
- │    └────  5dive CLI  ─────┘      │
- │       send · ask · logs          │
- └──────────────────────────────────┘
-        ↕ Telegram / Discord
-        (attach per agent)
-```
-
-No broker, no protocol, no orchestrator. Shared filesystem, shared CLI.
-
----
-
 ## Quickstart
 
 ```sh
@@ -50,6 +29,27 @@ Want it on your phone? Wire any agent to a Telegram bot ([BotFather](https://t.m
 ```
 
 For scripted / CI setup, see `5dive init --help`.
+
+---
+
+## How it works
+
+Each agent is its own Linux user running an official AI CLI (`claude`, `codex`, `gemini`, ...) as a systemd service. They reach each other by invoking the same `5dive` CLI — that *is* the bus. Channels like Telegram attach per agent.
+
+```text
+            one host
+ ┌──────────────────────────────────┐
+ │  coder      writer       pm      │
+ │ (claude)   (gemini)    (codex)   │
+ │    │          │           │      │
+ │    └────  5dive CLI  ─────┘      │
+ │       send · ask · logs          │
+ └──────────────────────────────────┘
+        ↕ Telegram / Discord
+        (attach per agent)
+```
+
+No broker, no protocol, no orchestrator. Shared filesystem, shared CLI.
 
 ---
 
