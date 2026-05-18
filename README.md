@@ -57,7 +57,7 @@ Wire it to a Telegram bot to message it from your phone — [BotFather](https://
 
 ## Inter-agent messaging
 
-The 60-second demo. Spawn a team, let them pass work — different models, shared host filesystem, one CLI.
+60-second demo. Spawn a team, let them pass work — different models, shared host filesystem, one CLI.
 
 ```sh
 # main → marketing: hand off, fire-and-forget
@@ -106,11 +106,11 @@ Full flag reference: `5dive --help` (or `5dive <verb> --help`). Machine-readable
 | `claude`   | Anthropic Claude | OAuth / API key | Telegram, Discord |
 | `codex`    | OpenAI Codex     | OAuth / API key | — |
 | `gemini`   | Google Gemini    | OAuth / API key | — |
-| `hermes`   | Nous Hermes (Claude wrapper)   | API key | Telegram, Discord |
-| `openclaw` | OpenClaw (Claude wrapper)      | API key | Telegram, Discord |
+| `hermes`   | third-party multi-provider harness | API key | Telegram, Discord |
+| `openclaw` | third-party multi-provider harness | API key | Telegram, Discord |
 | `opencode` | OpenCode | API key | — |
 
-`hermes` and `openclaw` are community wrappers around Claude. As of April 4, 2026, Anthropic does not permit routing Pro/Max subscription OAuth through third-party harnesses — use the `claude` type with your own API key or the official Anthropic CLI for Pro/Max work. Background: [We Ditched OpenClaw for Claude →](https://blog.5dive.com/blog/we-ditched-openclaw-for-claude/).
+`hermes` and `openclaw` are community-built harnesses that can route to many providers (OpenRouter, Anthropic, Google, Moonshot, etc.). As of April 4, 2026, Anthropic and Google no longer permit routing consumer subscription OAuth (Claude Pro/Max, Gemini) through third-party harnesses — for that work, use the official `claude` or `gemini` types with your own API key. Background: [We Ditched OpenClaw for Claude →](https://blog.5dive.com/blog/we-ditched-openclaw-for-claude/).
 
 ---
 
