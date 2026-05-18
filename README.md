@@ -67,6 +67,18 @@ No broker, no protocol, no orchestrator. Shared filesystem, shared CLI.
 
 ---
 
+## Local web dashboard
+
+```sh
+5dive ui                  # http://localhost:5175, loopback only
+5dive ui setup            # password auth — required before binding non-loopback
+5dive ui --host=0.0.0.0   # expose on the network
+```
+
+Auth model + reverse-proxy recipes: [ui/README.md](ui/README.md).
+
+---
+
 ## Agent types
 
 | Type | Model family | Auth | Channels |
@@ -152,18 +164,6 @@ Rename or rotate the account, every bound agent rebinds automatically.
 ```sh
 5dive agent create my-agent --type=claude --isolation=sandboxed
 ```
-
----
-
-## Local web dashboard
-
-```sh
-5dive ui                  # http://localhost:5175, loopback only
-5dive ui setup            # password auth — required before binding non-loopback
-5dive ui --host=0.0.0.0   # expose on the network
-```
-
-Auth model + reverse-proxy recipes: [ui/README.md](ui/README.md).
 
 ---
 
