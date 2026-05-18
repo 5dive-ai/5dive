@@ -63,7 +63,7 @@ No broker, no protocol, no orchestrator. Shared filesystem, shared CLI.
 
 **A subscription that's yours.** Official `claude` CLI on your own Pro/Max — no middleman, no OAuth proxy, Anthropic-policy safe.
 
-**Safe by default.** Each agent is its own Linux user under one of three isolation tiers — `admin`, `standard`, or `sandboxed` (own home only, no sudo).
+**Safe by default.** Each agent is its own Linux user under one of three isolation tiers — sandbox an agent and it can't read your home dir or sudo your box.
 
 ---
 
