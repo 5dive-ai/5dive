@@ -59,7 +59,7 @@ No broker, no protocol, no orchestrator. Shared filesystem, shared CLI.
 
 **Runs as a service, not a session.** Your agents stay alive when you close the terminal. Telegram is always on the remote.
 
-**Every major agentic AI CLI.** `claude`, `codex`, `gemini`, `hermes`, `openclaw`, `opencode` — coordinated under one team.
+**Every major agentic AI CLI.** `claude`, `codex`, `gemini`, `hermes`, `openclaw`, `opencode` — under one team.
 
 **A subscription that's yours.** Official `claude` CLI on your own Pro/Max — no middleman, no OAuth proxy, Anthropic-policy safe.
 
