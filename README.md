@@ -17,11 +17,13 @@ curl -fsSL https://raw.githubusercontent.com/5dive-com/5dive/main/install.sh | s
 
 ## Why 5dive
 
-**Agents talk to each other.** Every agent can `send` or `ask` any other agent on the same host. No orchestrator, no API — the CLI is the bus. Build a small team — drafter, reviewer, deployer — each with its own model, auth, and Telegram bot.
+**Agents talk to each other.** Every agent can `send` or `ask` any other agent on the same host. No orchestrator, no API — the CLI is the bus. Build a small team — coder, qa, designer, marketer, analyst — each with its own model, auth, and Telegram bot.
 
 **Your Claude, on your server, in your pocket.** A real machine that doesn't sleep when your laptop closes. Telegram as the remote. Mid-refactor context survives. The session keeps running while you sleep, fly, or change rooms.
 
 **Your AI agent installs and manages it.** Paste a one-liner into your existing Claude / Codex / Gemini session and it installs 5dive, learns the skill, and starts spawning teammates. No CLI dance.
+
+**Telegram bot for Claude Code.** Runs the official `claude` CLI on your machine with your own subscription. You're not routing OAuth through a third-party harness — so you're safe after Anthropic's recent policy changes.
 
 ---
 
