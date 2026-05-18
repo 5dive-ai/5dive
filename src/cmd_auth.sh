@@ -672,9 +672,41 @@ cmd_auth_login() {
 
   case "$type" in
     claude)
-      # claude reads CLAUDE_CONFIG_DIR; -i sets HOME=/home/claude which is
-      # fine since CLAUDE_CONFIG_DIR overrides the default ~/.claude.
-      exec sudo -u claude -i env $extra_env "$bin" setup-token ;;
+      # claude setup-token only displays the token on stdout — it doesn't
+      # write anywhere on disk. Without capture, the wrapper has no way to
+      # promote the token into combined.env (profile case) or anthropic.env
+      # (default case), so `5dive account show` reports types=- even after
+      # a successful login. Use `script(1)` to tee stdout to a log file
+      # while keeping the interactive TTY working, then post-process with
+      # extract_claude_token (shared with the device-code flow).
+      #
+      # CLAUDE_CONFIG_DIR (passed via $extra_env when profile is set)
+      # overrides claude's default ~/.claude location for config; the
+      # token itself isn't persisted by claude anywhere — only printed.
+      require_root
+      local log rc=0
+      log=$(sudo -u claude mktemp /tmp/5dive-claude-login.XXXXXX.log)
+      sudo -u claude -i env $extra_env script -fq -c "$bin setup-token" "$log" || rc=$?
+      local tok=""
+      tok=$(extract_claude_token "$log" 2>/dev/null || true)
+      # Token transited through this file — shred so it doesn't linger.
+      sudo -u claude shred -u "$log" 2>/dev/null || sudo -u claude rm -f "$log"
+      if [[ -z "$tok" ]]; then
+        (( rc != 0 )) \
+          && fail "$E_GENERIC" "claude setup-token exited with code $rc"
+        fail "$E_GENERIC" "no OAuth token found in setup-token output — login may have been cancelled"
+      fi
+      if [[ -n "$profile" ]]; then
+        step "Writing CLAUDE_CODE_OAUTH_TOKEN to auth profile '${profile}'"
+        printf '%s' "$tok" | profile_set_var "$profile" "CLAUDE_CODE_OAUTH_TOKEN"
+      else
+        step "Writing CLAUDE_CODE_OAUTH_TOKEN to /etc/5dive/connectors/anthropic.env"
+        printf '%s' "$tok" | write_default_connector "anthropic.env" "CLAUDE_CODE_OAUTH_TOKEN"
+      fi
+      ok "claude OAuth token stored${profile:+ (profile=$profile)}" \
+         '{type:$t, var:$v, profile:$p}' \
+         --arg t "claude" --arg v "CLAUDE_CODE_OAUTH_TOKEN" --arg p "${profile:-}"
+      return ;;
     hermes)
       # hermes signs in to OpenAI via its own device-code flow. Run it
       # interactively so the user can see the URL/code and Ctrl+C cleanly.
