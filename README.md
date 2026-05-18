@@ -5,7 +5,7 @@
 [![Latest release](https://img.shields.io/github/v/release/5dive-com/5dive)](https://github.com/5dive-com/5dive/releases)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-spawn AI agents that talk to each other.
+spawn and manage AI agents that talk to each other.
 
 > Prefer managed? [5dive.com](https://5dive.com) runs the same CLI on a hardened VM — point it at the agent, skip the ops.
 
