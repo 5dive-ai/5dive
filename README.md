@@ -57,7 +57,7 @@ No broker, no protocol, no orchestrator. Shared filesystem, shared CLI.
 
 **A team that works without you.** Multiple agents on one host, coordinating with each other.
 
-**Runs as a service, not a session.** Your agents stay alive when you close the terminal. Telegram is always on the remote.
+**Runs as a service, not a session.** Your agents stay alive when you close the terminal. Message them from Telegram any time.
 
 **Every major agentic AI CLI.** `claude`, `codex`, `gemini`, `hermes`, `openclaw`, `opencode` — under one team.
 
