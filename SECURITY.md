@@ -47,7 +47,6 @@ will list the supported version range.
 In scope:
 
 - The `5dive` CLI and its installer (`install.sh`).
-- The `5dive ui` dashboard (server + SPA), including its auth layer.
 - The systemd units shipped by the installer.
 - The `5dive-com/*` GitHub Actions workflows.
 
@@ -55,14 +54,11 @@ Out of scope (report upstream instead):
 
 - Vulnerabilities in the underlying coding CLIs (`claude`, `codex`, `gemini`,
   `hermes`, `openclaw`, `opencode`) — report to their respective vendors.
-- Vulnerabilities in apt/nvm/bun/Node — report to their maintainers.
-- Configuration issues that only manifest when running with `--insecure` or
-  with auth disabled. Those are documented foot-guns, not bugs.
+- Vulnerabilities in apt/nvm/Node — report to their maintainers.
 - Findings that require already having root on the host. 5dive trusts the
   host operator by design.
 
 ## Hardening guidance
 
 If you're deploying 5dive somewhere accessible beyond your laptop, read the
-**Securing your server** section in the README and the **Authentication** +
-**OIDC / SSO** sections in `ui/README.md` before exposing the dashboard.
+**Securing your server** section in the README.

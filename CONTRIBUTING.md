@@ -34,16 +34,6 @@ cd 5dive
 bash -n 5dive     # syntax-check the bundle
 ```
 
-UI dev loop:
-
-```bash
-cd ui
-bun install
-bun run dev       # runs the Bun API server + Vite together (concurrently)
-```
-
-Vite serves the SPA and proxies `/api/*` to the Bun server on `127.0.0.1:5175`.
-
 ## Project layout
 
 ```
@@ -54,8 +44,7 @@ src/              # CLI source — split for readability
   main.sh         # usage(), main(), EXIT trap (must be last)
 5dive             # built bundle — committed, kept in sync with src/ by CI
 install.sh        # one-liner installer fetched by curl
-ui/               # React + Vite + Tailwind dashboard + Bun API server
-systemd/          # unit files installed for agents + the UI
+systemd/          # unit files installed for agents
 hooks/            # shell hooks the CLI drops into the user's $HOME
 docker/           # demo container for tire-kickers
 skills/           # agent skills installed alongside the CLI
@@ -85,7 +74,6 @@ Lightweight checks (always run before opening a PR):
 ```bash
 ./build.sh        # rebuilds the bundle
 bash -n 5dive     # bundle syntax check
-cd ui && bun run build   # UI typecheck + production build (if you touched ui/)
 ```
 
 Heavyweight smoke test: if you touched `install.sh`, `src/cmd_agent.sh`,

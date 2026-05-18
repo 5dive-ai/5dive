@@ -210,7 +210,6 @@ Try it out:
   5dive agent send '$name' 'hello, who are you?'
   5dive agent ask  '$name' 'what model are you?' --timeout=60
   5dive agent $name tui                # attach a terminal
-  5dive ui                              # web dashboard
 
 NEXT
 

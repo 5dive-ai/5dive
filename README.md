@@ -67,15 +67,13 @@ No broker, no protocol, no orchestrator. Shared filesystem, shared CLI.
 
 ---
 
-## Local web dashboard
+## Want a dashboard?
 
-```sh
-5dive ui                  # http://localhost:5175, loopback only
-5dive ui setup            # password auth — required before binding non-loopback
-5dive ui --host=0.0.0.0   # expose on the network
-```
+The CLI is the OSS surface — every verb here, every agent, every host, all driven from `/usr/local/bin/5dive`.
 
-Auth model + reverse-proxy recipes: [ui/README.md](ui/README.md).
+If you'd rather click than `ssh`, [5dive.com](https://5dive.com) is the managed version: same CLI under the hood, but the VM, hardening, backups, and dashboard are run for you.
+
+<video src="https://5dive.com/hero-demo.webm" autoplay loop muted playsinline width="100%"></video>
 
 ---
 
@@ -107,7 +105,6 @@ Auth model + reverse-proxy recipes: [ui/README.md](ui/README.md).
 5dive auth      set / login / status     # lower-level; account is the human path
 5dive skill     add / list / remove
 5dive doctor [--repair] [--json]
-5dive ui     [setup]
 5dive watch                              # htop-style live view
 5dive compose up / down / ps             # declarative agents via 5dive.yaml
 ```
@@ -160,7 +157,6 @@ Long form: [your auth tokens don't touch us →](https://blog.5dive.com/blog/you
 - patch the OS (`unattended-upgrades`)
 - SSH key-only, no root login
 - firewall default-deny
-- dashboard behind auth + TLS if you expose it
 - per-agent isolation tiers
 - Telegram bot allowlists
 
@@ -178,11 +174,6 @@ docker exec -it 5dive-demo bash
 ```
 
 **Offline / air-gapped** — `install.sh` reads from `$REPO` (default GitHub raw). Override with `REPO=file:///path/to/local/tree` and pre-install apt deps. The fetched files are listed at the top of `install.sh`.
-
-**Headless / CLI-only** — add `--no-ui` to skip the local dashboard install (saves ~30s + ~300MB of node_modules). You can install the UI later with `--upgrade` (without `--no-ui`):
-```sh
-curl -fsSL https://raw.githubusercontent.com/5dive-com/5dive/main/install.sh | sudo bash -s -- --no-ui
-```
 
 **Context rot** — long sessions degrade. Restart daily via cron:
 ```cron
@@ -205,8 +196,7 @@ Install 5dive on this Linux host so I can use you to manage 5dive agents.
 3. Install the 5dive-cli skill — replace <runtime> with one of
    claude-code, codex, gemini-cli, hermes-agent, openclaw, opencode:
    npx -y skills add https://github.com/5dive-com/skills --skill 5dive-cli --agent <runtime> --yes
-4. Optional: `5dive ui setup` to configure the local dashboard.
-5. Tell me to restart so the skill loads, then ask which agent to create first.
+4. Tell me to restart so the skill loads, then ask which agent to create first.
 ```
 
 **Installing onto a remote VM over SSH?** Same prompt, prefix the install line with `ssh -t <user@host>`. Install the skill on the laptop where you're issuing `ssh` from, not the remote. Use `ssh -t` for anything needing a TTY (e.g. `5dive agent auth login`).

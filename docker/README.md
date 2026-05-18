@@ -30,20 +30,6 @@ and start agent units. Inside the shell, use `5dive` as you would on a host:
 5dive agent send my-agent "hello"
 ```
 
-## Expose the dashboard
-
-```sh
-docker run -d --name 5dive-demo --privileged -p 5175:5175 5dive
-docker exec -it 5dive-demo bash
-# inside the container:
-5dive ui setup                       # set a password
-5dive ui --host=0.0.0.0 &            # bind to all interfaces
-```
-
-Then open `http://localhost:5175` on the host. The same security guidance from
-the main README applies — don't bind beyond loopback without setting an auth
-password first.
-
 ## Teardown
 
 ```sh

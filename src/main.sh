@@ -14,14 +14,9 @@ Maintenance:
   5dive init                                         # interactive first-run wizard
   5dive uninstall [--purge] [--yes]                  # remove 5dive (--purge also wipes state + user)
 
-Live dashboard:
+Live view:
   5dive watch [--interval=N]                         # htop-style live view of every agent;
                                                      # ↑↓ select, ↵ attach, r refresh, q quit.
-  5dive ui [--host=<addr>] [--port=<n>]              # local web dashboard. Defaults to
-                                                     # 127.0.0.1:5175 (loopback). Setting --host
-                                                     # to a non-loopback address exposes the API
-                                                     # to your network — set up auth first via
-                                                     # '5dive ui setup'.
 
 Compose (declarative agents via 5dive.yaml):
   5dive up   [-f file]                               # bring up agents declared in spec (idempotent)
@@ -339,91 +334,6 @@ main() {
     ps)
       # Read-only — no audit, no lock.
       cmd_compose_ps "$@" ;;
-    ui)
-      # Local dashboard UI.
-      #   5dive ui                       # start server (loopback by default)
-      #   5dive ui setup                 # configure password auth (interactive)
-      #   5dive ui --host=0.0.0.0 ...    # expose to network (requires setup)
-      local ui_dir
-      if [[ -d "$(dirname "$(realpath "$0")")/ui" ]]; then
-        ui_dir="$(dirname "$(realpath "$0")")/ui"
-      elif [[ -d /usr/local/lib/5dive/ui ]]; then
-        ui_dir="/usr/local/lib/5dive/ui"
-      else
-        fail "$E_NOT_FOUND" "5dive UI not found — install it at /usr/local/lib/5dive/ui or run from the 5dive repo directory"
-      fi
-
-      # The UI server runs on bun. install.sh provisions it for the `claude`
-      # user, but anyone can invoke `5dive ui`, so detect missing bun and
-      # point to the installer instead of leaking a raw "bun: command not
-      # found" through exec.
-      if ! command -v bun >/dev/null 2>&1; then
-        fail "$E_NOT_FOUND" "$(printf '%s\n%s\n  %s\n%s\n  %s' \
-          "bun is required for 5dive ui but was not found in PATH." \
-          "Install via the 5dive installer (recommended):" \
-          "curl -fsSL https://raw.githubusercontent.com/5dive-com/5dive/main/install.sh | sudo bash" \
-          "or directly:" \
-          "curl -fsSL https://bun.sh/install | bash")"
-      fi
-
-      # `5dive ui setup` — one-shot interactive password setup
-      if [[ "${1:-}" == "setup" ]]; then
-        shift
-        cd "$ui_dir"
-        exec bun run setup.ts "$@"
-      fi
-
-      # Defaults to 127.0.0.1:5175 — loopback-only because without auth the
-      # API exposes shell-level agent control. Override with --host= /
-      # --port=; non-loopback bind will refuse to start unless `ui setup`
-      # has been run (or --insecure is passed).
-      local ui_host=""
-      local ui_port=""
-      local ui_insecure=""
-      local ui_no_browser=""
-      while [[ $# -gt 0 ]]; do
-        case "$1" in
-          --host=*)     ui_host="${1#--host=}"; shift ;;
-          --port=*)     ui_port="${1#--port=}"; shift ;;
-          --host)       ui_host="${2:-}"; shift 2 ;;
-          --port)       ui_port="${2:-}"; shift 2 ;;
-          --insecure)   ui_insecure=1; shift ;;
-          --no-browser) ui_no_browser=1; shift ;;
-          [0-9]*)       ui_port="$1"; shift ;;  # legacy positional port
-          *)            fail "$E_USAGE" "unknown ui flag: $1" ;;
-        esac
-      done
-      cd "$ui_dir"
-
-      # Auto-open the browser when binding loopback in an interactive shell.
-      # Skip when bound to a non-loopback host (anything beyond localhost is
-      # almost certainly headless / remote / proxied), when stdout isn't a
-      # TTY (cron, systemd, scripts), or when NO_BROWSER / --no-browser /
-      # SSH_CONNECTION says otherwise. The subshell sleeps briefly so the
-      # server can start listening before xdg-open hits it.
-      local effective_host="${ui_host:-${HOST:-127.0.0.1}}"
-      local effective_port="${ui_port:-${PORT:-5175}}"
-      local is_loopback=""
-      case "$effective_host" in
-        ""|127.0.0.1|localhost|::1) is_loopback=1 ;;
-      esac
-      if [[ -z "$ui_no_browser" && -z "${NO_BROWSER:-}" && -z "${SSH_CONNECTION:-}" \
-            && -n "$is_loopback" && -t 1 ]] \
-         && command -v xdg-open >/dev/null 2>&1; then
-        ( sleep 1 && xdg-open "http://localhost:${effective_port}/" >/dev/null 2>&1 ) &
-      fi
-
-      # Only set env vars when the flag was actually given, so direct
-      # `HOST=... 5dive ui` still flows through to the server.
-      local -a ui_env=()
-      [[ -n "$ui_host" ]] && ui_env+=("HOST=$ui_host")
-      [[ -n "$ui_port" ]] && ui_env+=("PORT=$ui_port")
-      [[ -n "$ui_insecure" ]] && ui_env+=("INSECURE=$ui_insecure")
-      if [[ ${#ui_env[@]} -gt 0 ]]; then
-        exec env "${ui_env[@]}" bun run server.ts
-      else
-        exec bun run server.ts
-      fi ;;
     uninstall)
       # Thin wrapper: fetch install.sh and exec --uninstall. Keeps a single
       # source of truth for what gets removed (install.sh) and dodges the

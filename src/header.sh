@@ -15,10 +15,10 @@ set -euo pipefail
 
 # Some sbin tools (adduser, usermod, userdel) live in /usr/sbin and /sbin. On
 # a normal interactive shell they're on PATH already, but when this script is
-# spawned as a child of `5dive ui` (the bun server.ts wrapper) or from any
-# systemd unit that overrides PATH=, /usr/sbin can be missing and the very
-# first agent-create fails with "adduser: command not found". Prepend them
-# unconditionally — duplicate entries are harmless.
+# spawned from a systemd unit that overrides PATH= (or any other restricted
+# parent), /usr/sbin can be missing and the very first agent-create fails
+# with "adduser: command not found". Prepend them unconditionally — duplicate
+# entries are harmless.
 case ":$PATH:" in
   *":/usr/sbin:"*) ;;
   *) export PATH="/usr/local/sbin:/usr/sbin:/sbin:$PATH" ;;

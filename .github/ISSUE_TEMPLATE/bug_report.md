@@ -26,7 +26,7 @@ $ 5dive ...
 - `5dive --version`:
 - OS / distro:
 - Install method: <!-- curl one-liner / docker / manual git clone -->
-- Affects: <!-- CLI / dashboard (5dive ui) / installer / agent runtime -->
+- Affects: <!-- CLI / installer / agent runtime -->
 
 ## Logs / output
 

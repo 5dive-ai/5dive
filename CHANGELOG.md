@@ -55,35 +55,20 @@ First public release.
 - Agent-to-agent messaging: every agent can `send` / `ask` any other agent
   on the same host.
 
-### Dashboard (`5dive ui`)
-
-- Local dashboard at `127.0.0.1:5175` by default; Vite + React + HeroUI v3
-  on Tailwind v4.
-- Full CLI surface coverage: agents (create wizard, clone, watch, logs),
-  accounts, skills, health, config, Telegram pairing, agent-to-agent Ask
-  panel.
-- `5dive ui setup` — argon2id password auth + HMAC-signed session cookies.
-- Server refuses public bind without auth (`--insecure` to override, with
-  a 60s-loud warning log).
-- CORS locked down to same-origin.
-- Mobile layout polish, brand SVG icons for agent types and channels.
-- Empty-state CTA + auto-select after creating an agent.
-
 ### Installer
 
 - One-liner installer (`curl install.5dive.com | sudo bash`).
-- Sets up nvm + Node + Bun for the dashboard.
+- Sets up nvm + Node for the agent runtimes that need it.
 - Idempotent: re-running won't touch your registry, auth profiles, or
   agents.
 - `install.sh --upgrade` — refresh CLI binaries, systemd unit, and hooks
-  only (skips apt/nvm/bun).
+  only (skips apt/nvm).
 - Runs `5dive doctor` automatically after install.
 
 ### Telegram
 
 - Stop hook auto-relays missed replies for telegram-paired agents.
 - `notify-user` skill for sending progress updates from agents.
-- Dashboard "Pair" tab with auto-discover and access policy controls.
 
 ### Docker
 
@@ -94,8 +79,6 @@ First public release.
 
 - README — quickstart, auth model, agent-to-agent example, securing-your-server,
   telemetry policy, reverse-proxy recipe.
-- `ui/README.md` — UI auth model, Caddy + Nginx recipes, OIDC/SSO via
-  forward-auth (Authelia / Authentik / oauth2-proxy).
 - Offline / air-gapped install recipe.
 - Pointer for non-systemd / non-root users at the Docker path.
 - SECURITY.md — private vulnerability reporting via GitHub advisories.
