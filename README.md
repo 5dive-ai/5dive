@@ -179,6 +179,11 @@ docker exec -it 5dive-demo bash
 
 **Offline / air-gapped** — `install.sh` reads from `$REPO` (default GitHub raw). Override with `REPO=file:///path/to/local/tree` and pre-install apt deps. The fetched files are listed at the top of `install.sh`.
 
+**Headless / CLI-only** — add `--no-ui` to skip the local dashboard install (saves ~30s + ~300MB of node_modules). You can install the UI later with `--upgrade` (without `--no-ui`):
+```sh
+curl -fsSL https://raw.githubusercontent.com/5dive-com/5dive/main/install.sh | sudo bash -s -- --no-ui
+```
+
 **Context rot** — long sessions degrade. Restart daily via cron:
 ```cron
 0 4 * * * curl -fsSL https://raw.githubusercontent.com/5dive-com/5dive/main/install.sh | bash -s -- --upgrade && systemctl restart '5dive-agent@*.service'

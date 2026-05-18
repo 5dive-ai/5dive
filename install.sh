@@ -3,6 +3,7 @@
 # Install:   curl -fsSL https://raw.githubusercontent.com/5dive-com/5dive/main/install.sh | sudo bash
 # Upgrade:   curl -fsSL https://raw.githubusercontent.com/5dive-com/5dive/main/install.sh | sudo bash -s -- --upgrade
 # Uninstall: curl -fsSL https://raw.githubusercontent.com/5dive-com/5dive/main/install.sh | sudo bash -s -- --uninstall
+# Skip UI:   add --no-ui to any of the above (CLI-only, ~5min faster, no bun build)
 set -euo pipefail
 
 # Source for binaries / hooks / skills. Overridable for offline installs,
@@ -14,6 +15,7 @@ STATE_DIR="/var/lib/5dive"
 CONNECTORS_DIR="/etc/5dive/connectors"
 SYSTEMD_DIR="/etc/systemd/system"
 LIB_DIR="/usr/local/lib/5dive"
+UI_DIR="$LIB_DIR/ui"
 NODE_VERSION="22"
 
 die() { echo "error: $*" >&2; exit 1; }
@@ -21,6 +23,25 @@ ok()  { echo "  ✓ $*"; }
 say() { echo "→ $*"; }
 
 [[ $EUID -eq 0 ]] || die "run as root: curl -fsSL ... | sudo bash"
+
+# Pre-parse cross-subcommand flags so they can appear anywhere on the line
+# (--no-ui works with install, --upgrade, and --uninstall doesn't care). We
+# strip them from $@ and re-set so the subcommand dispatch below sees a clean
+# arg list.
+INSTALL_UI=1
+_FILTERED_ARGS=()
+for _arg in "$@"; do
+  case "$_arg" in
+    --no-ui) INSTALL_UI=0 ;;
+    *)       _FILTERED_ARGS+=("$_arg") ;;
+  esac
+done
+if (( ${#_FILTERED_ARGS[@]} )); then
+  set -- "${_FILTERED_ARGS[@]}"
+else
+  set --
+fi
+unset _FILTERED_ARGS _arg
 
 # Refresh CLI binaries, systemd unit, hooks, and skills from $REPO. Shared by
 # the default install path and `--upgrade`. Never touches state, auth profiles,
@@ -49,6 +70,94 @@ refresh_managed_files() {
   curl -fsSL "$REPO/skills/notify-user/SKILL.md" -o "$LIB_DIR/skills/notify-user/SKILL.md"
   chmod 644 "$LIB_DIR/skills/notify-user/SKILL.md"
   ok "notify-user skill"
+}
+
+# Derive a UI source URL/path from $REPO unless UI_SOURCE was set explicitly.
+# - file:// REPO → "${REPO}/ui" directory (smoke test / offline install path)
+# - raw.githubusercontent.com REPO → codeload tarball of the same {owner,repo,ref}
+#   (the published one-liner path). We use a tarball instead of fetching every
+#   ui/ file by curl because the tree is several hundred files; a tarball is
+#   one round-trip and ~200 KB.
+# - Anything else → user must set UI_SOURCE explicitly (mirrored install).
+derive_ui_source() {
+  if [[ -n "${UI_SOURCE:-}" ]]; then
+    echo "$UI_SOURCE"
+    return
+  fi
+  if [[ "$REPO" == file://* ]]; then
+    echo "${REPO%/}/ui"
+    return
+  fi
+  if [[ "$REPO" =~ ^https?://raw\.githubusercontent\.com/([^/]+)/([^/]+)/([^/]+)/?$ ]]; then
+    echo "https://codeload.github.com/${BASH_REMATCH[1]}/${BASH_REMATCH[2]}/tar.gz/refs/heads/${BASH_REMATCH[3]}"
+    return
+  fi
+  die "UI install: REPO ($REPO) doesn't match raw.githubusercontent.com pattern; set UI_SOURCE or pass --no-ui"
+}
+
+# Drop ui/ at $UI_DIR + `bun install` + `bun run build`. Idempotent: wipes
+# $UI_DIR first so reruns aren't fooled by half-stale trees. node_modules and
+# dist are excluded on the copy and rebuilt locally so the host bun matches
+# the host arch + node version.
+install_ui() {
+  local src tmp tarball_root local_src
+  src="$(derive_ui_source)"
+
+  say "Installing 5dive UI ($src)"
+  install -d -m 755 "$LIB_DIR"
+  rm -rf "$UI_DIR"
+
+  if [[ "$src" == file://* ]] || [[ "$src" != http* && -d "$src" ]]; then
+    local_src="${src#file://}"
+    [[ -d "$local_src" ]] || die "UI source dir not found: $local_src"
+    install -d -m 755 "$UI_DIR"
+    # tar pipe rather than cp -a — excludes node_modules (~300MB) + dist
+    # without depending on rsync; everything else is a few hundred files.
+    (cd "$local_src" && tar --exclude=./node_modules --exclude=./dist -cf - .) \
+      | (cd "$UI_DIR" && tar -xf -)
+    ok "ui files copied from $local_src"
+  else
+    tmp=$(mktemp -d)
+    curl -fsSL "$src" -o "$tmp/ui.tgz" \
+      || die "failed to download UI source from $src"
+    tar -xzf "$tmp/ui.tgz" -C "$tmp"
+    # Codeload tarballs unpack to <repo>-<ref>/ ; pluck ui/ from the first
+    # top-level dir. If $src was a direct ui/ tarball, it'll already be at
+    # $tmp/ui after extract.
+    if [[ -d "$tmp/ui" ]]; then
+      mv "$tmp/ui" "$UI_DIR"
+    else
+      tarball_root=$(find "$tmp" -mindepth 1 -maxdepth 1 -type d | head -1)
+      if [[ -n "$tarball_root" && -d "$tarball_root/ui" ]]; then
+        mv "$tarball_root/ui" "$UI_DIR"
+      else
+        die "UI tarball at $src didn't contain a ui/ folder"
+      fi
+    fi
+    rm -rf "$tmp"
+    ok "ui files extracted from $src"
+  fi
+
+  chown -R claude:claude "$UI_DIR"
+
+  # bun.lock is gitignored upstream, so frozen-lockfile would fail on the
+  # codeload path. Use a plain install — slightly less reproducible but works
+  # whether bun.lock was carried over from a file:// copy or not.
+  say "Installing UI dependencies (bun install — ~30s)"
+  if ! sudo -u claude bash -lc "cd '$UI_DIR' && bun install 2>&1" >/tmp/5dive-ui-bun.log; then
+    tail -20 /tmp/5dive-ui-bun.log >&2
+    die "bun install failed in $UI_DIR (full log: /tmp/5dive-ui-bun.log)"
+  fi
+  ok "ui dependencies installed"
+
+  # Build the production bundle. server.ts serves dist/ when it exists, so
+  # without this the UI would 404 on /. Re-runnable; vite is idempotent.
+  say "Building UI bundle (vite build — ~20s)"
+  if ! sudo -u claude bash -lc "cd '$UI_DIR' && bun run build 2>&1" >/tmp/5dive-ui-build.log; then
+    tail -20 /tmp/5dive-ui-build.log >&2
+    die "vite build failed in $UI_DIR (full log: /tmp/5dive-ui-build.log)"
+  fi
+  ok "ui bundle built → $UI_DIR/dist"
 }
 
 # --- Subcommand dispatch ---------------------------------------------------
@@ -136,12 +245,24 @@ fi
 
 if [[ "${1:-}" == "--upgrade" ]]; then
   shift
-  [[ $# -eq 0 ]] || die "--upgrade takes no extra flags"
+  [[ $# -eq 0 ]] || die "--upgrade takes no extra flags (other than --no-ui, which is pre-parsed)"
 
   [[ -x "$BIN_DIR/5dive" ]] || die "no existing 5dive at $BIN_DIR/5dive — run install without --upgrade first"
 
   say "Upgrading 5dive CLI (skipping apt / nvm / bun / state setup)"
   refresh_managed_files
+
+  # --upgrade refreshes the UI too unless it was opted out at install time.
+  # We can't reliably detect "was UI installed last time" from disk (someone
+  # could have rm -rf'd ui/) so the rule is: --no-ui on upgrade skips UI;
+  # otherwise refresh. If $UI_DIR doesn't exist this becomes a first-time UI
+  # install, which is what someone running `--upgrade` after originally
+  # installing with --no-ui would want.
+  if (( INSTALL_UI )); then
+    install_ui
+  else
+    say "Skipping UI refresh (--no-ui)"
+  fi
 
   echo
   echo "5dive upgraded."
@@ -226,6 +347,18 @@ ok "directories ready"
 say "Installing CLI binaries, systemd unit, hooks, and skills"
 refresh_managed_files
 
+# Install the local dashboard. Default-on because `5dive ui` is one of the
+# marquee features for self-hosters; opt out with --no-ui for headless boxes
+# or to shave ~30s + a few hundred MB of node_modules off the install.
+# 5dive-api's customer provisioning intentionally never runs this script, so
+# managed Hetzner boxes don't get the local UI (those customers use
+# app.5dive.com instead).
+if (( INSTALL_UI )); then
+  install_ui
+else
+  say "Skipping UI install (--no-ui)"
+fi
+
 echo
 echo "5dive installed successfully."
 echo
@@ -242,6 +375,10 @@ echo "Next steps:"
 echo "  5dive agent list                          # list agents"
 echo "  5dive doctor --repair                     # auto-install agent type binaries"
 echo "  5dive agent create my-agent --type=claude # create your first agent"
+if (( INSTALL_UI )); then
+  echo "  5dive ui setup                            # set a password (required for non-loopback bind)"
+  echo "  5dive ui                                  # open the local dashboard on http://localhost:5175"
+fi
 echo
 echo "To upgrade later: curl -fsSL $REPO/install.sh | sudo bash -s -- --upgrade"
 echo "Docs: https://github.com/5dive-com/5dive"
