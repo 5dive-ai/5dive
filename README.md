@@ -38,7 +38,7 @@ No broker, no protocol, no orchestrator. Shared filesystem, shared CLI.
 # 1. install
 curl -fsSL https://install.5dive.com | sudo bash
 
-# 2. sign in + create your first agent
+# 2. create your first agent
 5dive init
 ```
 
