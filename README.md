@@ -94,28 +94,6 @@ Auth model + reverse-proxy recipes: [ui/README.md](ui/README.md).
 
 ---
 
-## Inter-agent messaging
-
-60-second demo. Spawn a team, let them pass work — different models, shared host filesystem, one CLI.
-
-```sh
-# main → marketing: hand off, fire-and-forget
-5dive agent send marketing "draft a launch tweet for v0.4"
-
-# marketing → main: pull a fact, wait for reply
-5dive agent ask  main "summarize the v0.4 changelog — 3 bullets" --timeout=120
-
-# main → codex: generate a still image
-5dive agent ask codex  "1024x1024 fox in fog, save /tmp/fox.png" --timeout=180
-
-# main → gemini: animate the image
-5dive agent ask gemini "animate /tmp/fox.png into a 3s loop, save /tmp/fox.mp4" --timeout=300
-```
-
-No coordinator, no orchestration layer. The CLI is the bus.
-
----
-
 ## Commands at a glance
 
 ```
