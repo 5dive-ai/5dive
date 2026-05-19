@@ -16,13 +16,13 @@ tool=$(printf "%s" "$payload" | jq -r ".tool_name // empty" 2>/dev/null)
 
 case "$tool" in
   AskUserQuestion|ExitPlanMode)
-    jq -n --arg t "$tool" ‘{
+    jq -n --arg t "$tool" '{
       hookSpecificOutput: {
         hookEventName: "PreToolUse",
         permissionDecision: "deny",
         permissionDecisionReason: ("\($t) is blocked in this Telegram-paired session: its picker UI renders only in the local terminal, so the Telegram user cannot see or respond to it and the session will hang.\n\nInstead, send your question (or plan) as a regular Telegram message via mcp__plugin_telegram_telegram__reply, with options written as numbered lines. Then wait for the user’s next telegram message — that reply is the answer.")
       }
-    }’
+    }'
     ;;
 esac
 
