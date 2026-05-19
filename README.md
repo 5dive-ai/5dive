@@ -191,7 +191,7 @@ If you already use Claude Code / Codex / Gemini / opencode, paste this prompt �
 Install 5dive on this Linux host so I can use you to manage 5dive agents.
 
 1. Run the installer (idempotent — safe to rerun):
-   curl -fsSL https://raw.githubusercontent.com/5dive-com/5dive/main/install.sh | sudo bash
+   curl -fsSL https://install.5dive.com | sudo bash
 2. Confirm: `5dive --version` prints "5dive 0.1.x".
 3. Install the 5dive-cli skill — replace <runtime> with one of
    claude-code, codex, gemini-cli, hermes-agent, openclaw, opencode:
