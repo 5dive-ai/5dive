@@ -644,10 +644,12 @@ JSON
         hooks: {
           Stop: [{hooks: [{type: "command", command: $stopreply, timeout: 10}]}],
           StopFailure: [{hooks: [{type: "command", command: $hook, timeout: 10}]}],
-          PreToolUse: [{matcher: "AskUserQuestion|ExitPlanMode", hooks: [{type: "command", command: $pretool, timeout: 5}]}],
-          PostToolUse: [
-            {hooks: [{type: "command", command: $posttool, timeout: 10}]},
+          PreToolUse: [
+            {matcher: "AskUserQuestion|ExitPlanMode", hooks: [{type: "command", command: $pretool, timeout: 5}]},
             {matcher: "Bash", hooks: [{type: "command", command: $mirror, timeout: 5}]}
+          ],
+          PostToolUse: [
+            {hooks: [{type: "command", command: $posttool, timeout: 10}]}
           ]
         }
       }

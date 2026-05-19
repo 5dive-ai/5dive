@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# PostToolUse hook (matcher: Bash): mirror outbound inter-agent traffic to a
+# PreToolUse hook (matcher: Bash): mirror outbound inter-agent traffic to a
 # shared Telegram group so the human operator can watch agent-to-agent
 # conversations alongside their own DMs.
 #
@@ -8,11 +8,26 @@
 # (same-user, no cross-sandbox reads) and posts via the plugin's bot token
 # already exported into the systemd env as TELEGRAM_BOT_TOKEN.
 #
+# Why PreToolUse (not Post): `5dive agent ask` blocks until the receiver
+# replies. Mirroring on PostToolUse meant the question only posted AFTER
+# the answer was already mirrored (by the receiver's own send PostToolUse),
+# so the group saw reply-before-question. Mirroring on PreToolUse posts
+# the outgoing line before the underlying call runs, preserving order. The
+# only cost: if the send/ask itself fails (rare), the mirror is a false
+# positive — operator sees a line that didn't actually reach the receiver.
+# Cross-agent visibility outweighs that edge case.
+#
 # Idempotent skips (any of these → exit 0):
 #   - Tool wasn't Bash or command doesn't match `5dive agent send|ask`
 #   - No TELEGRAM_BOT_TOKEN in env (telegram plugin not provisioned)
 #   - No group/supergroup chat in access.json (DM-only agent)
 #   - Body argument couldn't be parsed
+#   - Body contains unexpanded shell substitution (`$(`, backtick, `${`).
+#     Bash runs the substitution before invoking 5dive, so the receiver
+#     gets the right body — but the hook only sees the literal command
+#     string. Rather than post garbled "$(cat <<EOF...)" text, skip this
+#     one mirror and log a breadcrumb to stderr. Agents should prefer
+#     plain quoted strings if they want every message mirrored.
 #
 # Loop prevention: relies on Telegram's default bot privacy_mode — bots
 # don't see other bots' messages in groups, so agent A's plugin never sees
@@ -79,6 +94,14 @@ for i, t in enumerate(toks):
 to=$(printf '%s' "$parsed" | head -1)
 body=$(printf '%s' "$parsed" | tail -n +2)
 [[ -n "$to" && -n "$body" ]] || exit 0
+
+# Unexpanded shell substitution → skip with a breadcrumb. Bash already
+# expanded these before invoking 5dive, so the receiver got the right
+# text; only the mirror would be garbled if we posted what we see here.
+if [[ "$body" == *'$('* || "$body" == *'`'* || "$body" == *'${'* ]]; then
+  printf '[mirror-agent-send] skip mirror: body has unexpanded shell substitution (to=%s)\n' "$to" >&2
+  exit 0
+fi
 
 # Defensive: strip any envelope the agent may have manually included.
 # The CLI auto-wraps; agents shouldn't pre-wrap, but tolerate it.
