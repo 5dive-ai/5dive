@@ -10,10 +10,11 @@
 # feel like chat. Prompt-level reminders haven't been enough; this hook is
 # the safety net.
 #
-# Decision tree (slip = had_inbound && !had_tool):
-#   slip + last_text non-empty       → curl "(auto-relay) <text>"
-#   slip + empty text, first time    → JSON {decision:"block"} (agent retries)
-#   slip + empty text, re-entry      → curl enriched diagnostic
+# Decision tree (when had_inbound this turn):
+#   unrelayed text past posttool's counter  → curl "(auto-relay) <text>"
+#   no unrelayed text, telegram tool used   → exit clean (tool answered)
+#   no unrelayed text, no tool, first time  → JSON {decision:"block"} (retry)
+#   no unrelayed text, no tool, re-entry    → curl enriched diagnostic
 #
 # Loop safety (three layers — any one is sufficient):
 #   1. payload.stop_hook_active=true set by the harness on Stop re-invocation
@@ -188,9 +189,14 @@ total_texts=$(printf '%s' "$analysis" | jq -r '.texts | length')
 chat_id=$(printf '%s' "$analysis" | jq -r '.last_chat_id // ""')
 message_id=$(printf '%s' "$analysis" | jq -r '.last_message_id // ""')
 
-# Slip conditions: inbound this turn, no tool call back, and we know which
-# chat to relay to. Any miss → exit cleanly, no relay.
-[[ "$had_inbound" == "true" && "$had_tool" == "false" ]] || exit 0
+# Proceed if there was a Telegram inbound this turn and we know which chat
+# to send to. The `had_tool=false` guard used to live here, but it swallowed
+# the case where the model called a Telegram tool early in the turn (e.g. an
+# "on it" ack via reply) then emitted more text without calling the tool
+# again. The trailing text never reached the user. Now we always check the
+# relayed counter below; `had_tool` is consulted later, only to skip the
+# block/diagnose branch when the model answered via tool with no text.
+[[ "$had_inbound" == "true" ]] || exit 0
 [[ -n "$chat_id" ]] || exit 0
 [[ -n "${TELEGRAM_BOT_TOKEN:-}" ]] || exit 0
 
@@ -233,6 +239,13 @@ fi
 # user's been kept in the loop. Skip the empty-text block path (it would
 # wrongly trigger a "no transcript text" diagnostic).
 if (( relayed > 0 )); then
+  exit 0
+fi
+
+# Model answered via Telegram tool (reply/react/edit_message) and produced
+# no transcript text — that's an intentional tool-only response (e.g. a
+# react-only ack). Don't block or diagnose.
+if [[ "$had_tool" == "true" ]]; then
   exit 0
 fi
 
