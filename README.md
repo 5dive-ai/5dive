@@ -21,7 +21,7 @@ curl -fsSL https://install.5dive.com | sudo bash
 5dive init
 ```
 
-Want it on your phone? Wire any agent to a Telegram bot ([BotFather](https://t.me/BotFather) gives you the token):
+Want it on your phone? Wire your agent to a Telegram bot ([BotFather](https://t.me/BotFather) gives you the token):
 
 ```sh
 5dive agent create my-agent --type=claude --channels=telegram --telegram-token=<token>
