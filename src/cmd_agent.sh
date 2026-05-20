@@ -1962,6 +1962,17 @@ cmd_send() {
   if [[ -n "$reply_to_chat" || -n "$reply_to_msg" ]]; then
     (( ! raw )) || fail "$E_USAGE" "--raw cannot be combined with --reply-to-chat/--reply-to-msg"
   fi
+  # --raw + --from is contradictory: --raw means "no envelope, no metadata"
+  # (for piping pre-formatted prompts), so claiming a sender identity has
+  # nowhere to land. Worse, the receiver-side stop-mirror-inter-agent.sh keys
+  # off the [5dive-msg from=X id=Y] envelope to detect inter-agent inbound; if
+  # --raw silently strips it while --from suggests "this is from me", the
+  # reply mirror skips with no warning and operators see half the conversation.
+  # Force the caller to pick one: identify yourself (and accept the envelope)
+  # or send raw (and accept anonymity).
+  if (( raw && from_set )); then
+    fail "$E_USAGE" "--raw cannot be combined with --from (raw mode strips the envelope that carries sender identity)"
+  fi
   if [[ -n "$reply_to_chat" ]]; then
     valid_telegram_chat_id "$reply_to_chat" \
       || fail "$E_VALIDATION" "invalid --reply-to-chat (expected numeric chat id, optionally negative)"

@@ -19,6 +19,12 @@ POSTTOOL_TELEGRAM_RELAY_HOOK="/usr/local/lib/5dive/posttool-telegram-relay.sh"
 # agent's access.json lists at least one group chat. Lets the human
 # operator watch agent-to-agent traffic alongside their own DMs.
 MIRROR_AGENT_SEND_HOOK="/usr/local/lib/5dive/mirror-agent-send.sh"
+# Path to the shared Stop hook that mirrors THIS agent's reply text into the
+# shared Telegram group when the inbound that triggered the turn was a 5dive
+# inter-agent message ([5dive-msg from=X id=Y]). Companion to
+# MIRROR_AGENT_SEND_HOOK — together they put both sides of agent-to-agent
+# conversations in the operator's group chat.
+STOP_MIRROR_INTERAGENT_HOOK="/usr/local/lib/5dive/stop-mirror-inter-agent.sh"
 AGENT_SKILLS_DIR="/usr/local/lib/5dive/skills"
 
 # Preseed a claude-family agent's home dir so:
@@ -88,16 +94,22 @@ JSON
       || warn "$POSTTOOL_TELEGRAM_RELAY_HOOK missing — PostToolUse hook not wired (run: curl -fsSL https://raw.githubusercontent.com/5dive-com/5dive/main/install.sh | sudo bash)"
     [[ -x "$MIRROR_AGENT_SEND_HOOK" ]] \
       || warn "$MIRROR_AGENT_SEND_HOOK missing — inter-agent mirror hook not wired (run: curl -fsSL https://raw.githubusercontent.com/5dive-com/5dive/main/install.sh | sudo bash)"
+    [[ -x "$STOP_MIRROR_INTERAGENT_HOOK" ]] \
+      || warn "$STOP_MIRROR_INTERAGENT_HOOK missing — inter-agent reply-mirror hook not wired (run: curl -fsSL https://raw.githubusercontent.com/5dive-com/5dive/main/install.sh | sudo bash)"
     settings=$(jq \
       --arg hook "$STOP_FAILURE_HOOK" \
       --arg pretool "$PRETOOL_TELEGRAM_HOOK" \
       --arg stopreply "$STOP_TELEGRAM_REPLY_HOOK" \
       --arg posttool "$POSTTOOL_TELEGRAM_RELAY_HOOK" \
-      --arg mirror "$MIRROR_AGENT_SEND_HOOK" '
+      --arg mirror "$MIRROR_AGENT_SEND_HOOK" \
+      --arg mirrorinter "$STOP_MIRROR_INTERAGENT_HOOK" '
       . + {
         enabledPlugins: {"telegram@claude-plugins-official": true},
         hooks: {
-          Stop: [{hooks: [{type: "command", command: $stopreply, timeout: 10}]}],
+          Stop: [
+            {hooks: [{type: "command", command: $stopreply, timeout: 10}]},
+            {hooks: [{type: "command", command: $mirrorinter, timeout: 10}]}
+          ],
           StopFailure: [{hooks: [{type: "command", command: $hook, timeout: 10}]}],
           PreToolUse: [
             {matcher: "AskUserQuestion|ExitPlanMode", hooks: [{type: "command", command: $pretool, timeout: 5}]},

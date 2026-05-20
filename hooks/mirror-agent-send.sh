@@ -98,7 +98,13 @@ body=$(printf '%s' "$parsed" | tail -n +2)
 # Unexpanded shell substitution → skip with a breadcrumb. Bash already
 # expanded these before invoking 5dive, so the receiver got the right
 # text; only the mirror would be garbled if we posted what we see here.
-if [[ "$body" == *'$('* || "$body" == *'`'* || "$body" == *'${'* ]]; then
+# Covers $(...), backticks, ${VAR}, AND bare $VAR — the last one was the
+# common case in practice: agents build long bodies via heredoc into a
+# shell var and pass it as `5dive agent send <to> "$BODY"`, which would
+# otherwise mirror as the literal four-letter string "$BODY". Skipping
+# loses the mirror but the receiver still gets the real text via tmux.
+if [[ "$body" == *'$('* || "$body" == *'`'* || "$body" == *'${'* \
+      || "$body" =~ \$[A-Za-z_] ]]; then
   printf '[mirror-agent-send] skip mirror: body has unexpanded shell substitution (to=%s)\n' "$to" >&2
   exit 0
 fi
@@ -107,7 +113,7 @@ fi
 # The CLI auto-wraps; agents shouldn't pre-wrap, but tolerate it.
 body=$(printf '%s' "$body" | sed -E 's/^\[5dive-msg[[:space:]]+from=[a-z0-9-]+[[:space:]]+id=[a-f0-9]+\][[:space:]]*//')
 
-max_chars="${MIRROR_MAX_BODY_CHARS:-200}"
+max_chars="${MIRROR_MAX_BODY_CHARS:-800}"
 body_trim=$(printf '%s' "$body" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
 [[ -z "$body_trim" ]] && exit 0
 if (( ${#body_trim} > max_chars )); then
