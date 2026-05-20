@@ -138,6 +138,10 @@ fi
 
 if [[ "${1:-}" == "--upgrade" ]]; then
   shift
+  # --no-ui used to gate the (since-removed) local dashboard install; the flag
+  # was dropped in 8932961 but smoke harnesses and operator scripts still pass
+  # it. Swallow it here as a deprecated no-op rather than break callers.
+  [[ "${1:-}" == "--no-ui" ]] && shift
   [[ $# -eq 0 ]] || die "--upgrade takes no extra flags"
 
   [[ -x "$BIN_DIR/5dive" ]] || die "no existing 5dive at $BIN_DIR/5dive — run install without --upgrade first"
