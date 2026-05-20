@@ -20,6 +20,7 @@ on:
       - 'systemd/**'
       - 'docker/Dockerfile'
       - 'projects-CLAUDE.md'
+      - 'telegram-agent-CLAUDE.md'
       - '.github/workflows/install-smoke.yml'
   push:
     branches: [main]
@@ -33,6 +34,7 @@ on:
       - 'systemd/**'
       - 'docker/Dockerfile'
       - 'projects-CLAUDE.md'
+      - 'telegram-agent-CLAUDE.md'
       - '.github/workflows/install-smoke.yml'
 
 jobs:
