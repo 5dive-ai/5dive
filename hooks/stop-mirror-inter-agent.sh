@@ -118,22 +118,36 @@ else
   overflow=""
 fi
 
-# Sender label: prefer @bot_username so the reply mirror line threads
-# visually with userprompt-mirror-inter-agent.sh's inbound line (both
-# @-mention the same other-party bot). Reads in the group as: agent_x_bot
-# posts "@y question", agent_y_bot posts "@x answer" — natural conversation
-# flow. Fall back to bare name if the 5dive registry lookup fails.
+# Directional mirror format: "@from → @to\nbody". Both this hook (the
+# reply) and userprompt-mirror-inter-agent.sh (the inbound) post via
+# THIS agent's bot — there's no sender-side mirror — so without an
+# explicit arrow the group sees two consecutive messages from the same
+# bot and can't tell which is incoming vs outgoing. The arrow makes
+# direction unambiguous regardless of which bot Telegram shows as the
+# poster. The group reads:
+#   @marketing_bot → @main_bot \n draft the blog post...  (inbound)
+#   @main_bot → @marketing_bot \n here are the notes...   (reply, this hook)
+# Bare-name fallback on either side if the 5dive registry lookup fails.
+lookup_bot() {
+  sudo -n 5dive --json agent list 2>/dev/null \
+    | jq -r --arg n "$1" '
+        (.data // [])[]
+        | select(.name == $n)
+        | .botUsername // empty
+      ' 2>/dev/null \
+    | head -1
+}
+
 sender_label="$sender"
-sender_bot=$(sudo -n 5dive --json agent list 2>/dev/null \
-  | jq -r --arg n "$sender" '
-      (.data // [])[]
-      | select(.name == $n)
-      | .botUsername // empty
-    ' 2>/dev/null \
-  | head -1)
+sender_bot=$(lookup_bot "$sender")
 [[ -n "$sender_bot" ]] && sender_label="@${sender_bot}"
 
-mirror_text=$(printf '%s %s%s' "$sender_label" "$body_disp" "$overflow")
+me=$(id -un 2>/dev/null | sed 's/^agent-//')
+me_label="$me"
+me_bot=$(lookup_bot "$me")
+[[ -n "$me_bot" ]] && me_label="@${me_bot}"
+
+mirror_text=$(printf '%s → %s\n%s%s' "$me_label" "$sender_label" "$body_disp" "$overflow")
 
 logger -t stop-mirror "sending mirror sender=$sender bytes=${#mirror_text} chat=${group_chat_id}" 2>/dev/null || true
 curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \

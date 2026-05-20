@@ -71,24 +71,35 @@ else
   overflow=""
 fi
 
-# Sender label: prefer @sender_bot_username so the inbound mirror line
-# threads visually with the reply that stop-mirror-inter-agent.sh will
-# post at end-of-turn (which also @-mentions the sender). The group ends
-# up reading like:
-#   agent_main_bot: @agent_marketing_bot draft the blog post...   (inbound, this hook)
-#   agent_main_bot: @agent_marketing_bot here are the notes...    (reply, stop-mirror)
-# Bare-name fallback if the 5dive registry lookup fails for any reason.
+# Directional mirror format: "@from → @to\nbody". Both the inbound (this
+# hook) and the reply (stop-mirror-inter-agent.sh) post via THIS agent's
+# bot — there's no sender-side mirror — so without an explicit arrow the
+# group sees two consecutive messages from the same bot and can't tell
+# which is incoming vs outgoing. The arrow makes direction unambiguous
+# regardless of which bot Telegram shows as the poster. The group reads:
+#   @marketing_bot → @main_bot \n draft the blog post...  (inbound, this hook)
+#   @main_bot → @marketing_bot \n here are the notes...   (reply, stop-mirror)
+# Bare-name fallback on either side if the 5dive registry lookup fails.
+lookup_bot() {
+  sudo -n 5dive --json agent list 2>/dev/null \
+    | jq -r --arg n "$1" '
+        (.data // [])[]
+        | select(.name == $n)
+        | .botUsername // empty
+      ' 2>/dev/null \
+    | head -1
+}
+
 sender_label="$sender"
-sender_bot=$(sudo -n 5dive --json agent list 2>/dev/null \
-  | jq -r --arg n "$sender" '
-      (.data // [])[]
-      | select(.name == $n)
-      | .botUsername // empty
-    ' 2>/dev/null \
-  | head -1)
+sender_bot=$(lookup_bot "$sender")
 [[ -n "$sender_bot" ]] && sender_label="@${sender_bot}"
 
-mirror_text=$(printf '%s %s%s' "$sender_label" "$body_disp" "$overflow")
+me=$(id -un 2>/dev/null | sed 's/^agent-//')
+me_label="$me"
+me_bot=$(lookup_bot "$me")
+[[ -n "$me_bot" ]] && me_label="@${me_bot}"
+
+mirror_text=$(printf '%s → %s\n%s%s' "$sender_label" "$me_label" "$body_disp" "$overflow")
 
 logger -t userprompt-mirror "sending mirror sender=$sender bytes=${#mirror_text} chat=${group_chat_id}" 2>/dev/null || true
 curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
