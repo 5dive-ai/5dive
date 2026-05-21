@@ -1921,6 +1921,70 @@ cmd_logs() {
   fi
 }
 
+# Sender-side group mirror for inter-agent traffic. Posts "@<receiver>\n<body>"
+# into the SENDER's Telegram group via the SENDER's own bot, so the operator
+# sees agent-to-agent messages under the correct sender identity — canonical
+# group "call" style (each bot addresses the @recipient).
+#
+# This lives in the CLI rather than a hook on purpose: here we have the fully
+# expanded message body. The old sender-side PreToolUse Bash mirror only saw
+# the pre-expansion command string and choked on heredoc bodies
+# (`"$(cat <<EOF…EOF)"`), which is why it was moved receiver-side. Doing it in
+# the command itself sidesteps that entirely.
+#
+# Best-effort and self-gating: returns 0 (never blocks/fails the send) when not
+# invoked by an agent, when the sender has no bot token, or when no group is
+# configured. The receiver's reply rides the same path — when the receiver
+# answers via `5dive agent send <original-sender>`, that call posts the reply
+# payload under the receiver's bot, completing the two-sided "call" view.
+mirror_interagent_outbound() {
+  local receiver="$1" body="$2"
+
+  # Only a real agent (SUDO_USER=agent-<x>) has a bot identity to post under.
+  local invoker="${SUDO_USER:-}"
+  [[ -n "$invoker" && "$invoker" == agent-* ]] || return 0
+  local invoker_name="${invoker#agent-}"
+
+  local token_file="${CONNECTORS_DIR}/telegram-${invoker_name}.env"
+  [[ -r "$token_file" ]] || return 0
+  local token
+  token=$(sed -n 's/^TELEGRAM_BOT_TOKEN=//p' "$token_file" | head -1)
+  [[ -n "$token" ]] || return 0
+
+  local access_file="/home/${invoker}/.claude/channels/telegram/access.json"
+  [[ -r "$access_file" ]] || return 0
+  local group_chat_id
+  group_chat_id=$(jq -r '(.groups // {}) | keys | .[0] // empty' "$access_file" 2>/dev/null)
+  [[ -n "$group_chat_id" ]] || return 0
+
+  local trimmed
+  trimmed=$(printf '%s' "$body" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+  [[ -n "$trimmed" ]] || return 0
+
+  # Resolve the receiver's @botUsername for a tappable mention; fall back to
+  # the bare agent name if the registry has no cached username.
+  local reg bot to_label
+  reg=$(registry_read)
+  bot=$(jq -r --arg n "$receiver" '.agents[$n].botUsername // empty' <<<"$reg" 2>/dev/null)
+  if [[ -n "$bot" ]]; then to_label="@${bot}"; else to_label="@${receiver}"; fi
+
+  local max_chars="${MIRROR_MAX_BODY_CHARS:-800}"
+  local body_disp overflow=""
+  if (( ${#trimmed} > max_chars )); then
+    body_disp="${trimmed:0:$((max_chars - 1))}…"
+    overflow=" (+$(( ${#trimmed} - max_chars )) chars)"
+  else
+    body_disp="$trimmed"
+  fi
+
+  local mirror_text
+  mirror_text=$(printf '%s\n%s%s' "$to_label" "$body_disp" "$overflow")
+  curl -s -X POST "https://api.telegram.org/bot${token}/sendMessage" \
+    --data-urlencode "chat_id=${group_chat_id}" \
+    --data-urlencode "text=${mirror_text}" \
+    -o /dev/null 2>/dev/null || true
+}
+
 # Inject a message into the agent's tmux session. Uses send-keys -l so the text
 # is literal (no tmux keybinding interpretation), followed by a separate Enter.
 # Not exposed via /agents/exec: arbitrary text won't pass the API arg regex, so
@@ -1964,13 +2028,12 @@ cmd_send() {
   fi
   # --raw + --from is contradictory: --raw means "no envelope, no metadata"
   # (for piping pre-formatted prompts), so claiming a sender identity has
-  # nowhere to land. Worse, the receiver-side inbound/reply mirrors
-  # (userprompt-mirror-inter-agent.sh + stop-mirror-inter-agent.sh) key off
-  # the [5dive-msg from=X id=Y] envelope to detect inter-agent traffic; if
-  # --raw silently strips it while --from suggests "this is from me", both
-  # mirrors skip with no warning and operators see none of the conversation.
-  # Force the caller to pick one: identify yourself (and accept the envelope)
-  # or send raw (and accept anonymity).
+  # nowhere to land. The sender-side outbound mirror also gates on (!raw) —
+  # if --raw silently strips the [5dive-msg from=X] envelope while --from
+  # suggests "this is from me", the mirror would skip with no warning and
+  # the operator would see neither side of the conversation. Force the
+  # caller to pick one: identify yourself (and accept the envelope) or send
+  # raw (and accept anonymity).
   if (( raw && from_set )); then
     fail "$E_USAGE" "--raw cannot be combined with --from (raw mode strips the envelope that carries sender identity)"
   fi
@@ -2015,6 +2078,11 @@ cmd_send() {
 
   sudo -u "agent-${name}" tmux send-keys -t "agent-${name}" -l -- "$payload"
   sudo -u "agent-${name}" tmux send-keys -t "agent-${name}" Enter
+
+  # Mirror the outbound into the sender's group chat (best-effort). Gated on a
+  # real envelope: a raw/anonymous send has no sender identity to mirror under.
+  (( raw )) || mirror_interagent_outbound "$name" "$message"
+
   ok "sent to agent '$name'." \
      '{name:$n, sent:true, bytes:($p|length), from:($s|select(length>0)), msg_id:($i|select(length>0)), reply_to_chat:($rc|select(length>0)), reply_to_msg:($rm|select(length>0))}' \
      --arg n "$name" --arg p "$payload" --arg s "$sender" --arg i "$msg_id" --arg rc "$reply_to_chat" --arg rm "$reply_to_msg"
@@ -2100,6 +2168,10 @@ cmd_ask() {
 
   sudo -u "agent-${name}" tmux send-keys -t "agent-${name}" -l -- "$payload"
   sudo -u "agent-${name}" tmux send-keys -t "agent-${name}" Enter
+
+  # Mirror the outbound into the sender's group chat (best-effort). ask always
+  # wraps, so there's always a sender identity to mirror under.
+  mirror_interagent_outbound "$name" "$message"
 
   local start now last_change reply="" prev_slice="" capture slice
   start=$(date +%s)

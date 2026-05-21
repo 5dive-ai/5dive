@@ -14,19 +14,15 @@ STOP_TELEGRAM_REPLY_HOOK="/usr/local/lib/5dive/stop-telegram-reply-check.sh"
 # texts don't get coalesced or lost when the model emits text → tool →
 # text without ever calling reply.
 POSTTOOL_TELEGRAM_RELAY_HOOK="/usr/local/lib/5dive/posttool-telegram-relay.sh"
-# Path to the shared UserPromptSubmit hook that mirrors INBOUND inter-agent
-# messages ([5dive-msg from=X id=Y] envelopes) to the shared Telegram group.
-# Receiver-side: fires when a 5dive agent message lands in this agent's
-# session. Replaced the earlier sender-side PreToolUse Bash mirror, which
-# couldn't see the body when agents built it via `"$(cat <<EOF...EOF)"`
-# (the pre-expansion command string was just the literal heredoc syntax).
-USERPROMPT_MIRROR_INTERAGENT_HOOK="/usr/local/lib/5dive/userprompt-mirror-inter-agent.sh"
-# Path to the shared Stop hook that mirrors THIS agent's reply text into the
-# shared Telegram group when the inbound that triggered the turn was a 5dive
-# inter-agent message ([5dive-msg from=X id=Y]). Companion to
-# USERPROMPT_MIRROR_INTERAGENT_HOOK — together they put both sides of
-# agent-to-agent conversations in the operator's group chat.
-STOP_MIRROR_INTERAGENT_HOOK="/usr/local/lib/5dive/stop-mirror-inter-agent.sh"
+# Inter-agent group mirror is fully sender-side now: every `5dive agent
+# send|ask` posts "@<receiver> <body>" to the SENDER's group via the sender's
+# bot (see mirror_interagent_outbound in cmd_agent.sh). Both halves of an
+# exchange — A's outbound question and B's outbound reply — therefore show up
+# under the correct sender's identity. The previous receiver-side hooks
+# (userprompt-mirror-inter-agent.sh for the inbound, stop-mirror-inter-agent.sh
+# for the reply) are retired no-ops, kept on disk only so existing agents'
+# settings.json don't error on a missing command. New-agent settings.json
+# below no longer wires either of them.
 AGENT_SKILLS_DIR="/usr/local/lib/5dive/skills"
 # CLAUDE.md fragment dropped into the per-agent $HOME/.claude/ when the
 # agent is created with --channels=telegram. Carries the per-turn reply
@@ -100,30 +96,20 @@ JSON
       || warn "$STOP_TELEGRAM_REPLY_HOOK missing — Stop hook not wired (run: curl -fsSL https://raw.githubusercontent.com/5dive-com/5dive/main/install.sh | sudo bash)"
     [[ -x "$POSTTOOL_TELEGRAM_RELAY_HOOK" ]] \
       || warn "$POSTTOOL_TELEGRAM_RELAY_HOOK missing — PostToolUse hook not wired (run: curl -fsSL https://raw.githubusercontent.com/5dive-com/5dive/main/install.sh | sudo bash)"
-    [[ -x "$USERPROMPT_MIRROR_INTERAGENT_HOOK" ]] \
-      || warn "$USERPROMPT_MIRROR_INTERAGENT_HOOK missing — inter-agent inbound-mirror hook not wired (run: curl -fsSL https://raw.githubusercontent.com/5dive-com/5dive/main/install.sh | sudo bash)"
-    [[ -x "$STOP_MIRROR_INTERAGENT_HOOK" ]] \
-      || warn "$STOP_MIRROR_INTERAGENT_HOOK missing — inter-agent reply-mirror hook not wired (run: curl -fsSL https://raw.githubusercontent.com/5dive-com/5dive/main/install.sh | sudo bash)"
     settings=$(jq \
       --arg hook "$STOP_FAILURE_HOOK" \
       --arg pretool "$PRETOOL_TELEGRAM_HOOK" \
       --arg stopreply "$STOP_TELEGRAM_REPLY_HOOK" \
-      --arg posttool "$POSTTOOL_TELEGRAM_RELAY_HOOK" \
-      --arg mirrorinbound "$USERPROMPT_MIRROR_INTERAGENT_HOOK" \
-      --arg mirrorinter "$STOP_MIRROR_INTERAGENT_HOOK" '
+      --arg posttool "$POSTTOOL_TELEGRAM_RELAY_HOOK" '
       . + {
         enabledPlugins: {"telegram@claude-plugins-official": true},
         hooks: {
           Stop: [
-            {hooks: [{type: "command", command: $stopreply, timeout: 10}]},
-            {hooks: [{type: "command", command: $mirrorinter, timeout: 10}]}
+            {hooks: [{type: "command", command: $stopreply, timeout: 10}]}
           ],
           StopFailure: [{hooks: [{type: "command", command: $hook, timeout: 10}]}],
           PreToolUse: [
             {matcher: "AskUserQuestion|ExitPlanMode", hooks: [{type: "command", command: $pretool, timeout: 5}]}
-          ],
-          UserPromptSubmit: [
-            {hooks: [{type: "command", command: $mirrorinbound, timeout: 5}]}
           ],
           PostToolUse: [
             {hooks: [{type: "command", command: $posttool, timeout: 10}]}

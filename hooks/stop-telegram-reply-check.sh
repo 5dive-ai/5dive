@@ -11,10 +11,20 @@
 # the safety net.
 #
 # Decision tree (when had_inbound this turn):
-#   unrelayed text past posttool's counter  → curl "(auto-relay) <text>"
-#   no unrelayed text, telegram tool used   → exit clean (tool answered)
-#   no unrelayed text, no tool, first time  → JSON {decision:"block"} (retry)
-#   no unrelayed text, no tool, re-entry    → curl enriched diagnostic
+#   reply/edit_message sent this turn        → exit clean (proper channel used;
+#                                              any loose transcript text is just
+#                                              narration — do NOT relay it)
+#   no send, transcript text present         → curl "(auto-relay) <text>"
+#                                              (genuine "talked to the
+#                                              transcript instead of replying")
+#   no send, no text, react-only             → exit clean (intentional ack)
+#   no send, no text, no tool, first time    → JSON {decision:"block"} (retry)
+#   no send, no text, no tool, re-entry      → curl enriched diagnostic
+#
+# A "send" is reply OR edit_message — react/download_attachment don't count,
+# since a 👍 isn't a text answer. Deciding at the turn level (did the agent
+# reach the proper channel at all?) rather than per-text-block is what stops
+# preambles and end-of-turn summaries leaking out after the real reply.
 #
 # Loop safety (three layers — any one is sufficient):
 #   1. payload.stop_hook_active=true set by the harness on Stop re-invocation
@@ -49,10 +59,6 @@ transcript_path=$(printf '%s' "$payload" | jq -r '.transcript_path // empty' 2>/
 
 lock_key=$(printf '%s' "$transcript_path" | sha1sum | cut -d' ' -f1)
 lock_file="/tmp/5dive-stopblock-${lock_key}.lock"
-# Shared state with posttool-telegram-relay.sh: "<turn_start>|<relayed_count>".
-# Tracks which assistant text blocks have already been pushed to Telegram
-# in this turn so the two hooks don't double-send.
-relay_state_file="/tmp/5dive-tg-relay-${lock_key}.state"
 
 # Stale-lock GC: a lock older than 1h is from a crashed prior run, not a
 # live re-entry. Remove so it doesn't suppress a legitimate future block.
@@ -153,6 +159,15 @@ analysis=$(jq -s --arg tg "$TG_PREFIX" '
           | select(.type == "tool_use" and (.name | startswith($tg)))
         ] | length > 0
       ),
+      had_telegram_send: (
+        [ $turn[]
+          | select(.type == "assistant")
+          | (.message.content // [])[]?
+          | select(.type == "tool_use"
+                   and ((.name == ($tg + "reply"))
+                        or (.name == ($tg + "edit_message"))))
+        ] | length > 0
+      ),
       texts: (
         [ $turn[]
           | select(.type == "assistant")
@@ -185,44 +200,35 @@ analysis=$(jq -s --arg tg "$TG_PREFIX" '
 turn_start=$(printf '%s' "$analysis" | jq -r '.turn_start // 0')
 had_inbound=$(printf '%s' "$analysis" | jq -r '.had_telegram_inbound // false')
 had_tool=$(printf '%s' "$analysis" | jq -r '.had_telegram_tool_call // false')
+had_send=$(printf '%s' "$analysis" | jq -r '.had_telegram_send // false')
 total_texts=$(printf '%s' "$analysis" | jq -r '.texts | length')
 chat_id=$(printf '%s' "$analysis" | jq -r '.last_chat_id // ""')
 message_id=$(printf '%s' "$analysis" | jq -r '.last_message_id // ""')
 
-# Proceed if there was a Telegram inbound this turn and we know which chat
-# to send to. The `had_tool=false` guard used to live here, but it swallowed
-# the case where the model called a Telegram tool early in the turn (e.g. an
-# "on it" ack via reply) then emitted more text without calling the tool
-# again. The trailing text never reached the user. Now we always check the
-# relayed counter below; `had_tool` is consulted later, only to skip the
-# block/diagnose branch when the model answered via tool with no text.
+# Proceed only if there was a Telegram inbound this turn and we know which
+# chat to send to.
 [[ "$had_inbound" == "true" ]] || exit 0
 [[ -n "$chat_id" ]] || exit 0
 [[ -n "${TELEGRAM_BOT_TOKEN:-}" ]] || exit 0
 
-# How much did posttool-telegram-relay.sh already relay for this turn?
-# Mismatched turn_start in state file = new turn = start at 0.
-relayed=0
-if [[ -f "$relay_state_file" ]]; then
-  prev_start=""
-  prev_count=""
-  IFS='|' read -r prev_start prev_count < "$relay_state_file" 2>/dev/null || true
-  if [[ "$prev_start" == "$turn_start" ]]; then
-    relayed="${prev_count:-0}"
-  fi
+# Turn-level rule (the fix for narration leaking out after the real reply):
+# if the agent delivered text through the proper channel — reply or
+# edit_message — anywhere in this turn, then every loose assistant transcript
+# block is narration (preamble, progress notes, end-of-turn summary), NOT a
+# missed answer. Suppress all auto-relay. Deciding per-turn instead of
+# per-text-block is what stops summaries arriving after the answer.
+if [[ "$had_send" == "true" ]]; then
+  exit 0
 fi
 
-# Auto-relay path: collect every text past the relayed counter, join, send.
-# Catches both the "single text + Stop" case (relayed=0, total=1) and the
-# "text + tool + text + Stop" case where posttool already pushed the first
-# block and we now need to send the trailing one.
-if (( total_texts > relayed )); then
-  new_text=$(printf '%s' "$analysis" | jq -r --argjson n "$relayed" '
-    .texts[$n:] | join("\n\n")
-  ')
+# No reply/edit_message this turn. If the agent produced transcript text, it
+# "talked to the transcript instead of replying" — relay the whole thing
+# (the genuine miss this safety net exists for).
+if (( total_texts > 0 )); then
+  new_text=$(printf '%s' "$analysis" | jq -r '.texts | join("\n\n")')
   trimmed=$(printf '%s' "$new_text" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
   if [[ -n "$trimmed" ]]; then
-    text="$trimmed"
+    text="(auto-relay) $trimmed"
     if (( ${#text} > 4000 )); then
       text="${text:0:3960}… [truncated; see journalctl on the host]"
     fi
@@ -230,21 +236,12 @@ if (( total_texts > relayed )); then
       --data-urlencode "chat_id=${chat_id}" \
       --data-urlencode "text=${text}" \
       -o /dev/null 2>/dev/null || true
-    printf '%s|%s' "$turn_start" "$total_texts" > "$relay_state_file" 2>/dev/null || true
     exit 0
   fi
 fi
 
-# Everything in this turn was already relayed by the posttool hook — the
-# user's been kept in the loop. Skip the empty-text block path (it would
-# wrongly trigger a "no transcript text" diagnostic).
-if (( relayed > 0 )); then
-  exit 0
-fi
-
-# Model answered via Telegram tool (reply/react/edit_message) and produced
-# no transcript text — that's an intentional tool-only response (e.g. a
-# react-only ack). Don't block or diagnose.
+# No text and no real send. A react-only ack (e.g. 👍 on a status ping) is an
+# intentional tool-only response — don't block or diagnose.
 if [[ "$had_tool" == "true" ]]; then
   exit 0
 fi
