@@ -9,6 +9,69 @@ release.
 
 ## [Unreleased]
 
+## [0.1.3] — 2026-05-22
+
+### Changed
+
+- Inter-agent group mirror moved to the sender side. `5dive agent send`
+  (and `agent ask`) now posts `@<receiver>\n<body>` to the **sender's**
+  group via the **sender's** bot, so both halves of an exchange show up
+  under the correct identity. The previous receiver-side hooks
+  (`userprompt-mirror-inter-agent.sh`, `stop-mirror-inter-agent.sh`) are
+  retired as no-ops — they posted via the receiver's bot, so
+  `marketing → main` showed up under `main`'s identity, and the reply
+  hook double-posted (once as the payload, once as transcript
+  narration). Files stay on disk so existing agents' `settings.json`
+  don't error; new agents wire only the sender-side path.
+- `stop-telegram-reply-check.sh` now decides at the **turn level**, not
+  per text block. If the agent called `reply` or `edit_message` anywhere
+  in the turn, all auto-relay is suppressed — every loose transcript
+  block (preamble, progress, end-of-turn summary) is narration, not a
+  missed answer. Eliminates the trailing `(auto-relay) ...` duplicates
+  that landed in the user's DM right after the real reply.
+- StopFailure Telegram alerts include the upstream API error string
+  (e.g. "API Error: 529 Overloaded") pulled from the claude pane
+  capture, instead of just naming the high-level `server_error` reason.
+- Per-agent Telegram guidance moved out of the shared
+  `projects-CLAUDE.md`. Telegram-paired claude agents now get a
+  dedicated `telegram-agent-CLAUDE.md` dropped at
+  `$HOME/.claude/CLAUDE.md` during agent setup, alongside the
+  `notify-user` skill. Non-Telegram agents (codex on single-agent hosts,
+  for instance) no longer carry the reply mandate or the bot
+  references that didn't apply to them. `projects-CLAUDE.md` is trimmed
+  to host-wide invariants only.
+- Both `projects-CLAUDE.md` and `telegram-agent-CLAUDE.md` tightened —
+  smaller token footprint on every agent's session prompt.
+
+### Removed
+
+- `posttool-telegram-relay.sh` retired as a no-op. The mid-turn relay's
+  premise (loose mid-turn text = message the user should see) was
+  wrong; preambles and progress narration are transcript text too and
+  were getting curled to the user as noise. The legitimate "talked to
+  the transcript instead of replying" miss is now caught by the
+  turn-level Stop hook above.
+- `SECURITY.md` removed. Security-reporting instructions inlined into
+  the README, with `CONTRIBUTING.md` pointing at GitHub's private
+  advisory page directly. Removes the "Security" community pill so the
+  README/Contributing/License row stops overflowing on mobile.
+
+### Fixed
+
+- `install-smoke` CI workflow now ships `telegram-agent-CLAUDE.md` in
+  the bundle. Without this, `install.sh`'s new curl for that file hit
+  a missing source and bailed (curl exit 37).
+
+### Documentation
+
+- README: "How it works" clarifies that agents share CLI binaries and
+  subscriptions, with a diagram showing two claude agents alongside one
+  codex.
+- `hooks/README.md` surfaces the three Telegram-plugin deadlocks in
+  the table.
+- README prose stripped of em-dashes (kept in the agent-type table
+  where they mark n/a entries).
+
 ## [0.1.2] — 2026-05-20
 
 ### Added
