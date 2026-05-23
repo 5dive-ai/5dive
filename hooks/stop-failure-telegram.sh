@@ -15,19 +15,24 @@ if printf '%s' "$payload" | grep -qi 'rate_limit\|usage.limit'; then
   is_rate_limit=true
 fi
 
-# Capture the rate-limit pane up front — used for parsing the reset time.
-# The pane is the most reliable source: claude prints "resets 9am (UTC)"
-# verbatim.
+# Pull the transcript path from the payload up front — used for both the
+# reset-time parse below and caller-chat narrowing further down.
+transcript_path=$(printf '%s' "$payload" | jq -r '.transcript_path // empty' 2>/dev/null)
+
+# Capture the tmux pane. Two uses:
+#   1. Scrape "API Error: 529 ..." for non-rate-limit failures (the
+#      payload only carries the high-level reason; the API status line
+#      only appears in claude's pane output).
+#   2. Last-resort fallback for the rate-limit reset time.
 #
-# Race: on rate-limit failures, claude fires the Stop event before its
-# rate-limit notice ("You've hit your session limit · resets Xpm (TZ)")
-# is rendered to the pane. If we capture immediately, the line isn't
-# there yet, parsing returns empty, and the resume helper never forks.
-# Sleep briefly to let the render settle. The hook's timeout is 10s so
-# half a second of latency is well within budget.
+# Not the primary source for rate-limit timing: when claude shows the
+# "Stop and wait" menu, the pane switches to the alternate screen and the
+# preceding "resets Xpm (TZ)" line is gone from what capture-pane sees.
+# The transcript captures that line as a structured synthetic message
+# (error="rate_limit", isApiErrorMessage=true) and is immune to tmux
+# screen state.
 pane=""
 if [[ -n "${TMUX:-}" ]]; then
-  $is_rate_limit && sleep 0.5
   pane=$(tmux capture-pane -p 2>/dev/null || true)
 fi
 
@@ -83,14 +88,31 @@ parse_reset_from_text() {
   return 0
 }
 
+# Source #2 (preferred fallback): the transcript. The most recent synthetic
+# assistant message tagged error="rate_limit" carries the exact "resets Xpm
+# (TZ)" line claude received from the 429 response. Authoritative and
+# immune to the tmux alt-screen issue that hides the pane line when the
+# "Stop and wait" menu is showing.
+if [[ -z "$reset_epoch_num" && -n "$transcript_path" && -r "$transcript_path" ]]; then
+  reset_text=$(jq -rs '
+    [ .[]
+      | select(.error == "rate_limit" and .isApiErrorMessage == true)
+      | (.message.content[]? | select(.type == "text") | .text)
+    ] | last // ""
+  ' "$transcript_path" 2>/dev/null)
+  if [[ -n "$reset_text" ]]; then
+    parse_reset_from_text "$reset_text" || true
+  fi
+fi
+
 if [[ -z "$reset_epoch_num" ]]; then
   parse_reset_from_text "$msg" || true
 fi
 
+# Last resort: scrape "resets Xpm (TZ)" from the pane. Often empty for
+# rate-limit cases (alt-screen, see capture above) but cheap to try and
+# catches the rare case where the transcript hasn't flushed yet.
 if [[ -z "$reset_epoch_num" && -n "$pane" ]]; then
-  # Pane line we're after: "You've hit your limit · resets 9am (UTC)" — narrow
-  # to the line containing "resets" so unrelated times in the pane (e.g. a
-  # status line clock) don't poison the parse.
   reset_line=$(printf '%s' "$pane" | grep -iE 'resets?[[:space:]]+[0-9]' | head -1)
   if [[ -n "$reset_line" ]]; then
     parse_reset_from_text "$reset_line" || true
@@ -151,7 +173,6 @@ fi
 # Same narrowed CSV is passed to resume-after-reset.sh below, so the
 # "agent resumed" follow-up also stays scoped to the caller.
 caller_chat_id=""
-transcript_path=$(printf '%s' "$payload" | jq -r '.transcript_path // empty' 2>/dev/null)
 if [[ -n "$transcript_path" && -r "$transcript_path" ]]; then
   caller_chat_id=$(jq -rs '
     [ .[]
