@@ -442,8 +442,8 @@ cmd_create() {
   # Don't create an agent that can't log in. When an auth-profile is named,
   # accept either the profile's combined.env (api-key path / claude OAuth, which
   # promote tokens via profile_set_var) or the per-type credential file written
-  # by the device-code flow (codex/hermes/gemini/openclaw write only auth.json /
-  # oauth_creds.json / auth-profiles.json — combined.env stays empty). Skip the
+  # by the device-code flow (codex/hermes/openclaw write only auth.json /
+  # auth-profiles.json — combined.env stays empty). Skip the
   # live probe here: a slow API blip shouldn't block `agent create`.
   # --defer-auth bypasses the gate: the caller (typically the dashboard's "Set
   # up later" wizard option) is opting to finish authentication inside the

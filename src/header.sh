@@ -26,7 +26,7 @@ esac
 
 # Bumped on every public release. `build.sh` checks this line exists; CI fails
 # the bundle-drift check if it's missing or empty.
-readonly FIVE_VERSION="0.1.3"
+readonly FIVE_VERSION="0.1.4"
 
 STATE_DIR="/var/lib/5dive"
 REGISTRY="${STATE_DIR}/agents.json"
@@ -81,7 +81,6 @@ CONNECTORS_DIR="/etc/5dive/connectors"
 declare -A TYPE_BIN=(
   [claude]="/home/claude/.local/bin/claude"
   [codex]="/home/claude/.nvm/versions/node/v24/bin/codex"
-  [gemini]="/home/claude/.nvm/versions/node/v24/bin/gemini"
   [hermes]="/home/claude/.local/bin/hermes"
   [openclaw]="/home/claude/.local/bin/openclaw"
   [opencode]="/home/claude/.local/bin/opencode"
@@ -103,7 +102,6 @@ declare -A TYPE_CHANNELS=(
   [openclaw]=1
   [hermes]=1
   [codex]=0
-  [gemini]=0
   [opencode]=0
 )
 # Auth sentinel per type. Agent users run as agent-<name> (in group `claude`)
@@ -119,7 +117,6 @@ declare -A TYPE_CHANNELS=(
 declare -A TYPE_AUTH=(
   [claude]="/etc/5dive/connectors/anthropic.env:CLAUDE_CODE_OAUTH_TOKEN"
   [codex]="/home/claude/.codex/auth.json"
-  [gemini]="/home/claude/.gemini/oauth_creds.json"
   # Apr 2026 Anthropic policy change: third-party harnesses can no longer ride
   # the user's Claude Pro/Max subscription token (suspension risk). hermes and
   # openclaw both sign in via OpenAI's /codex/device flow now. hermes writes
@@ -134,7 +131,6 @@ declare -A TYPE_AUTH=(
 declare -A TYPE_INSTALL=(
   [claude]="command -v claude >/dev/null || curl -fsSL https://claude.ai/install.sh | bash"
   [codex]="command -v codex >/dev/null || npm install -g @openai/codex"
-  [gemini]="command -v gemini >/dev/null || npm install -g @google/gemini-cli"
   # opencode.ai's installer drops the binary at ~/.opencode/bin/opencode and
   # only adds it to PATH via .bashrc — but bash -lc skips .bashrc on
   # non-interactive shells, so neither the verify check below nor the agent
@@ -165,7 +161,6 @@ declare -A TYPE_INSTALL=(
 declare -A SKILLS_AGENT_ID=(
   [claude]=claude-code
   [codex]=codex
-  [gemini]=gemini-cli
   [hermes]=hermes-agent
   [openclaw]=openclaw
   [opencode]=opencode
@@ -178,7 +173,6 @@ declare -A SKILLS_AGENT_ID=(
 declare -A SKILLS_INSTALL_DIR=(
   [claude]=".claude/skills"
   [codex]=".agents/skills"
-  [gemini]=".agents/skills"
   [hermes]=".hermes/skills"
   [openclaw]="skills"
   [opencode]=".agents/skills"
@@ -197,13 +191,11 @@ declare -A TYPE_API_FILE=(
   # anthropic.env path no longer feeds either CLI. cmd_auth_set already
   # fails gracefully when a type isn't in this map.
   [codex]="openai.env"
-  [gemini]="gemini.env"
   [opencode]="openai.env"
 )
 declare -A TYPE_API_VAR=(
   [claude]="ANTHROPIC_API_KEY"
   [codex]="OPENAI_API_KEY"
-  [gemini]="GEMINI_API_KEY"
   [opencode]="OPENAI_API_KEY"
 )
 
@@ -317,6 +309,5 @@ declare -A TYPE_PROBE=(
   [hermes]=''
   [openclaw]=''
   [codex]=''
-  [gemini]=''
   [opencode]=''
 )

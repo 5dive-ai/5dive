@@ -68,7 +68,7 @@ refresh_managed_files() {
   # picks up baseline self-management guidance (project layout, sudo, where
   # the agent's own settings live, the host CLI). Only on first install —
   # never clobber a customised file. Symlink AGENTS.md so non-claude agent
-  # types (codex, gemini, …) see the same instructions.
+  # types (codex, …) see the same instructions.
   install -d -m 755 -o claude -g claude /home/claude/projects
   if [[ ! -f /home/claude/projects/CLAUDE.md ]]; then
     curl -fsSL "$REPO/projects-CLAUDE.md" -o /home/claude/projects/CLAUDE.md
@@ -217,7 +217,7 @@ if ! id -u claude >/dev/null 2>&1; then
   ok "user 'claude' created"
 fi
 
-# nvm + node (needed for codex, gemini agent types)
+# nvm + node (needed for codex agent type)
 say "Installing nvm + Node.js"
 if [[ ! -f /home/claude/.nvm/nvm.sh ]]; then
   sudo -u claude bash -c 'curl -fsSL https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.3/install.sh | PROFILE=/dev/null bash'

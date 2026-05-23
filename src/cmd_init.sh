@@ -18,11 +18,10 @@ cmd_init() {
 WELCOME
 
   # --- Step 1: pick a type ---
-  local -a types=(claude codex gemini hermes openclaw opencode)
+  local -a types=(claude codex hermes openclaw opencode)
   local -A type_desc=(
     [claude]="Anthropic's Claude — recommended"
     [codex]="OpenAI Codex"
-    [gemini]="Google Gemini CLI"
     [hermes]="Open-source agent — bring your own provider"
     [openclaw]="Open-source agent — bring your own provider"
     [opencode]="Open-source agent — bring your own provider"
@@ -38,7 +37,7 @@ WELCOME
   while true; do
     read -r -p "  choice [1-${#types[@]}, default 1]: " choice
     choice="${choice:-1}"
-    if [[ "$choice" =~ ^[1-6]$ ]] && (( choice <= ${#types[@]} )); then
+    if [[ "$choice" =~ ^[1-5]$ ]] && (( choice <= ${#types[@]} )); then
       type="${types[$((choice-1))]}"
       break
     fi
@@ -81,7 +80,7 @@ WELCOME
           printf '%s' "$key" | 5dive agent auth set claude --api-key=- || fail "$E_AUTH_REQUIRED" "auth failed"
         fi
         ;;
-      codex|gemini|openclaw)
+      codex|openclaw)
         echo "  launching interactive login for $type…" >&2
         5dive agent auth login "$type" || fail "$E_AUTH_REQUIRED" "auth failed"
         ;;

@@ -4,7 +4,7 @@
 # auth_creds_present <type> — non-empty stdout if the default-profile credential
 # file for this type has a usable token/key. Handles both env-file format
 # (anthropic.env with CLAUDE_CODE_OAUTH_TOKEN or ANTHROPIC_API_KEY) and the
-# JSON sentinels codex/gemini/opencode write on login.
+# JSON sentinels codex/opencode write on login.
 auth_creds_present() {
   local type="$1" sentinel="${TYPE_AUTH[$1]:-}"
   [[ -n "$sentinel" ]] || return 1
@@ -29,7 +29,7 @@ auth_creds_present() {
   (( sentinel_ok )) && return 0
 
   # Fallback: types whose TYPE_AUTH sentinel is the OAuth state file
-  # (codex/gemini) won't see an api-key written by `agent auth set`, which
+  # (codex) won't see an api-key written by `agent auth set`, which
   # lands in /etc/5dive/connectors/<TYPE_API_FILE>. Recognise that file as
   # equally-valid auth — matches the policy that API-key is the preferred
   # path for 3P-harness-blocked vendors (project_google_third_party_harness_policy,
@@ -49,10 +49,10 @@ auth_creds_present() {
 #
 # The probe runs as user `claude` with a 5s cap. We source the same env files
 # systemd loads for 5dive-agent@.service so the CLI sees CLAUDE_CODE_OAUTH_TOKEN
-# / ANTHROPIC_API_KEY / OPENAI_API_KEY / GEMINI_API_KEY — otherwise `claude
-# --print ping` exits non-zero with "Not logged in" even when the stored token
-# is perfectly valid. When <profile> is set, the profile's combined.env is
-# loaded LAST so it overrides the shared defaults (same precedence systemd uses).
+# / ANTHROPIC_API_KEY / OPENAI_API_KEY — otherwise `claude --print ping` exits
+# non-zero with "Not logged in" even when the stored token is perfectly valid.
+# When <profile> is set, the profile's combined.env is loaded LAST so it
+# overrides the shared defaults (same precedence systemd uses).
 #
 # claude's `--print` exit code flips when stdout isn't a TTY, so we can't rely
 # on `$?` alone — instead we capture stdout+stderr and grep for known "not
@@ -62,7 +62,7 @@ auth_probe_one() {
   local type="$1" profile="${2:-}" probe="${TYPE_PROBE[$1]:-}"
   [[ -n "$probe" ]] || return 2
   local env_src=''
-  for f in /etc/5dive/connectors/anthropic.env /etc/5dive/connectors/openai.env /etc/5dive/connectors/gemini.env; do
+  for f in /etc/5dive/connectors/anthropic.env /etc/5dive/connectors/openai.env; do
     env_src+="[ -r $f ] && set -a && . $f && set +a; "
   done
   if [[ -n "$profile" ]]; then
@@ -187,8 +187,8 @@ cmd_install() {
 # A profile is a directory /var/lib/5dive/auth-profiles/<name>/ containing:
 #   - combined.env      — key=value pairs merged into the agent's systemd env
 #                         (CLAUDE_CODE_OAUTH_TOKEN, ANTHROPIC_API_KEY, OPENAI_API_KEY,
-#                         GEMINI_API_KEY, etc.). systemd EnvironmentFile reads it
-#                         as root before drop-priv, so mode 0600 root:root is fine.
+#                         etc.). systemd EnvironmentFile reads it as root before
+#                         drop-priv, so mode 0600 root:root is fine.
 #   - <type>/           — optional per-type CLI config dir (e.g. claude/ used as
 #                         CLAUDE_CONFIG_DIR) for profiles created via `auth login
 #                         --profile=<name>` or the device-code flow.
@@ -219,7 +219,7 @@ ensure_profile_dir() {
 # profile_type_dir <profile> <type> — per-type state dir under a profile.
 # Side effect: creates the dir mode 2750 owner=claude. Idempotent. Used as
 # the redirect target for whichever env var the type honours (CODEX_HOME,
-# HERMES_HOME, CLAUDE_CONFIG_DIR, or HOME for gemini/openclaw).
+# HERMES_HOME, CLAUDE_CONFIG_DIR, or HOME for openclaw).
 profile_type_dir() {
   local profile="$1" type="$2"
   [[ -n "$profile" ]] || fail "$E_GENERIC" "profile_type_dir: empty profile"
@@ -242,9 +242,9 @@ profile_type_env() {
     claude)            printf 'CLAUDE_CONFIG_DIR=%s' "$dir" ;;
     codex)             printf 'CODEX_HOME=%s' "$dir" ;;
     hermes)            printf 'HERMES_HOME=%s' "$dir" ;;
-    # gemini reads $HOME/.gemini directly (no GEMINI_HOME); openclaw's
-    # resolveStateDir uses $HOME/.openclaw. HOME redirect is the only handle.
-    gemini|openclaw)   printf 'HOME=%s' "$dir" ;;
+    # openclaw's resolveStateDir uses $HOME/.openclaw. HOME redirect is the
+    # only handle.
+    openclaw)          printf 'HOME=%s' "$dir" ;;
     *) return 1 ;;
   esac
 }
@@ -263,9 +263,8 @@ profile_type_auth_path() {
   case "$type" in
     codex)    echo "${dir}/auth.json" ;;
     hermes)   echo "${dir}/auth.json" ;;
-    # gemini/openclaw use HOME redirect so the credential lives at the same
-    # relative path each tool would write under a real $HOME.
-    gemini)   echo "${dir}/.gemini/oauth_creds.json" ;;
+    # openclaw uses HOME redirect so the credential lives at the same
+    # relative path the tool would write under a real $HOME.
     openclaw) echo "${dir}/.openclaw/agents/main/agent/auth-profiles.json" ;;
     # claude detection in cmd_auth_poll is log-grep-based, not file-mtime —
     # this entry is here for completeness/symmetry.
@@ -279,7 +278,7 @@ profile_type_auth_path() {
 # file, so paperclipai (which runs as user `claude`) and any other host-level
 # CLI invocation picks up the same auth as the agent does.
 #
-# Symlinks for codex/hermes/gemini/openclaw (file-based auth); env-file write
+# Symlinks for codex/hermes/openclaw (file-based auth); env-file write
 # for claude (token-via-env). Each per-type case skips when the host-default
 # already holds a real (non-symlink) credential — manual host-level logins
 # always win over the auto-seed. opencode has no auth and is a no-op.
@@ -325,35 +324,6 @@ TOML
         chmod 0600 "$cfg"
       fi
       ;;
-    gemini)
-      local gsrc="${pdir}/.gemini"
-      [[ -e "${gsrc}/oauth_creds.json" ]] || return 0
-      install -d -m 2770 -o claude -g claude /home/claude/.gemini
-      local f
-      for f in oauth_creds.json google_accounts.json projects.json; do
-        [[ -e "${gsrc}/${f}" ]] && _paperclip_link_file "${gsrc}/${f}" "/home/claude/.gemini/${f}"
-      done
-      # settings.json is NOT symlinked — paperclip filters env when spawning
-      # gemini (GEMINI_SANDBOX=false from the systemd unit doesn't reach the
-      # child), so gemini falls back to its built-in sandbox=true default and
-      # errors "GEMINI_SANDBOX is true but failed to determine command for
-      # sandbox" on every probe. Pin tools.sandbox=false in the host
-      # settings.json to override the default at the config layer (env-
-      # independent). Keep selectedType=oauth-personal to skip the auth-
-      # method picker, matching what the per-agent setup writes. rm -f
-      # first so an upgrade from the prior symlink-everything seed lands a
-      # real file (otherwise we'd write through the symlink into the
-      # profile dir and clobber the agent's settings).
-      rm -f /home/claude/.gemini/settings.json
-      cat > /home/claude/.gemini/settings.json <<'JSON'
-{
-  "security": {"auth": {"selectedType": "oauth-personal"}},
-  "tools": {"sandbox": false}
-}
-JSON
-      chown claude:claude /home/claude/.gemini/settings.json
-      chmod 0600 /home/claude/.gemini/settings.json
-      ;;
     openclaw)
       local osrc="${pdir}/.openclaw"
       local oauth="${osrc}/agents/main/agent/auth-profiles.json"
@@ -387,7 +357,7 @@ JSON
       chown root:claude "$target"
       chmod 0640 "$target"
       # Restart paperclipai so the new env var lands in its process. CLIs
-      # invoked per-call (codex/hermes/gemini/openclaw) pick up new symlinks
+      # invoked per-call (codex/hermes/openclaw) pick up new symlinks
       # without a restart, so we only restart for claude's env-var path.
       systemctl is-active --quiet paperclipai 2>/dev/null \
         && systemctl restart paperclipai >/dev/null 2>&1 || true
@@ -407,21 +377,11 @@ _paperclip_link_file() {
 }
 
 # Internal helper: keep a 5dive-managed drop-in for paperclipai.service that
-# patches PATH + bypasses gemini's sandbox/trust gates that would otherwise
-# block paperclip's hello probes:
-#   PATH                         — base unit's PATH omits /home/claude/.local/
-#                                  bin, so `claude` (lives there) isn't found.
-#   GEMINI_SANDBOX=false         — gemini defaults to true and looks for
-#                                  docker/podman; stock Linux has neither
-#                                  ("failed to determine command for sandbox").
-#   GEMINI_CLI_TRUST_WORKSPACE=true
-#                                — gemini errors "Gemini CLI is not running
-#                                  in a trusted directory" on every probe;
-#                                  agents bypass via `--skip-trust --yolo`
-#                                  flags, paperclip doesn't pass those.
-# Paperclip already runs as user `claude`; extra isolation inside the CLI
-# is redundant in this context. Idempotent: skips the daemon-reload +
-# restart when on-disk content matches what we'd write.
+# patches PATH so paperclip's hello probes can find the agent binaries:
+#   PATH — base unit's PATH omits /home/claude/.local/bin, so `claude`
+#          (lives there) isn't found.
+# Idempotent: skips the daemon-reload + restart when on-disk content matches
+# what we'd write.
 _paperclip_ensure_runtime_drop_in() {
   systemctl list-unit-files paperclipai.service >/dev/null 2>&1 || return 0
   local dir=/etc/systemd/system/paperclipai.service.d
@@ -431,8 +391,6 @@ _paperclip_ensure_runtime_drop_in() {
   desired=$(cat <<'CONF'
 [Service]
 Environment=PATH=/home/claude/.local/bin:/home/claude/.nvm/versions/node/v24/bin:/home/claude/.bun/bin:/usr/local/bin:/usr/bin
-Environment=GEMINI_SANDBOX=false
-Environment=GEMINI_CLI_TRUST_WORKSPACE=true
 CONF
 )
   if [[ -f "$conf" ]] && [[ "$(cat "$conf")" == "$desired" ]]; then
@@ -458,14 +416,14 @@ paperclip_unseed_for_profile() {
   while IFS= read -r -d '' link; do
     target=$(readlink "$link" 2>/dev/null || true)
     [[ "$target" == "$pdir/"* ]] && rm -f "$link"
-  done < <(find /home/claude/.codex /home/claude/.hermes /home/claude/.gemini /home/claude/.openclaw \
+  done < <(find /home/claude/.codex /home/claude/.hermes /home/claude/.openclaw \
               -maxdepth 6 -type l -print0 2>/dev/null)
   # Re-seed each type that just lost its source from the first remaining
   # agent of that type (registry is the source of truth).
   local reg
   reg=$(registry_read 2>/dev/null) || return 0
   local t fallback_profile
-  for t in codex hermes gemini openclaw claude; do
+  for t in codex hermes openclaw claude; do
     fallback_profile=$(jq -r --arg t "$t" '
       .agents | to_entries | map(select(.value.type == $t and (.value.authProfile // "") != ""))
       | .[0].value.authProfile // empty' <<<"$reg")
@@ -482,7 +440,7 @@ paperclip_seed_all_from_registry() {
   local reg
   reg=$(registry_read 2>/dev/null) || return 0
   local t profile
-  for t in codex hermes gemini openclaw claude; do
+  for t in codex hermes openclaw claude; do
     profile=$(jq -r --arg t "$t" '
       .agents | to_entries | map(select(.value.type == $t and (.value.authProfile // "") != ""))
       | .[0].value.authProfile // empty' <<<"$reg")
@@ -605,7 +563,7 @@ cmd_auth_set() {
     return
   fi
 
-  # Env-var-style path (claude/codex/gemini/opencode). hermes/openclaw fall
+  # Env-var-style path (claude/codex/opencode). hermes/openclaw fall
   # off the bottom because they're not in TYPE_API_FILE — by design: their
   # credentials live in native state dirs, not env files. Pass --provider
   # to route those through apply_byo_provider above.
@@ -736,21 +694,6 @@ cmd_auth_login() {
     codex)
       # CODEX_HOME (when profiled) overrides /etc/profile.d's default.
       exec sudo -u claude -i env $extra_env bash -lc 'codex login' ;;
-    gemini)
-      # gemini has no `auth login` subcommand; the OAuth flow is embedded
-      # in the interactive UI. Force `oauth-personal` in settings.json so
-      # the auth-method picker is skipped and the URL prompt appears
-      # immediately, then hand off the TTY.
-      # Profile-scoped: extra_env is HOME=<profile_dir>/gemini, so the
-      # ~ inside the inner script resolves to that dir for both the
-      # settings preseed and the gemini binary's read.
-      exec sudo -u claude -i env $extra_env bash -lc '
-        mkdir -p ~/.gemini && \
-        (jq ". + {security: ((.security // {}) + {auth: ((.security.auth // {}) + {selectedType: \"oauth-personal\"})})}" ~/.gemini/settings.json 2>/dev/null \
-          || echo "{\"security\":{\"auth\":{\"selectedType\":\"oauth-personal\"}}}") > ~/.gemini/settings.json.tmp && \
-        mv ~/.gemini/settings.json.tmp ~/.gemini/settings.json && \
-        gemini --skip-trust --yolo
-      ' ;;
     opencode) exec sudo -u claude -i bash -lc 'opencode auth login' ;;
   esac
 }
@@ -766,18 +709,17 @@ cmd_auth_login() {
 #              dashboard calls this on a timer and displays whatever fields
 #              are populated (url + optional code while awaiting_code, error on
 #              error).
-#   submit  -> claude/gemini only: feed the user-pasted callback code into
-#              the tmux session. codex/hermes/openclaw don't have a submit
+#   submit  -> claude only: feed the user-pasted callback code into the
+#              tmux session. codex/hermes/openclaw don't have a submit
 #              step — the CLI polls OpenAI itself and writes its credential
 #              file on success, which poll detects via file mtime.
 #   cancel  -> kill the tmux session.
 #
-# Wired for: claude (Anthropic setup-token, url + pasted callback code),
+# Wired for: claude (Anthropic setup-token, url + pasted callback code) and
 # codex/hermes/openclaw (OpenAI /codex/device device-auth, url + displayed
 # one-time code, no callback paste, mtime-based success detection on each
-# CLI's credential file), and gemini (Google OAuth, url + pasted callback
-# code, success via ~/.gemini/oauth_creds.json mtime). opencode still
-# falls back to TTY `auth login` or `auth set --api-key`.
+# CLI's credential file). opencode still falls back to TTY `auth login` or
+# `auth set --api-key`.
 
 require_auth_session_root() {
   require_root
@@ -864,19 +806,6 @@ extract_codex_code() {
     | head -1
 }
 
-# gemini --skip-trust --yolo prints the Google OAuth URL on a single line
-# after "Please visit the following URL to authorize the application:". The
-# URL contains URL-encoded query params but no whitespace, so a plain regex
-# scan over the script(1) log is sufficient. We strip CSI escapes first in
-# case a future gemini release color-wraps the URL.
-extract_gemini_url() {
-  local log="$1"
-  [[ -s "$log" ]] || return 1
-  sed 's/\x1b\[[0-9;]*[A-Za-z]//g; s/\r//g' "$log" \
-    | grep -oE 'https://accounts\.google\.com/o/oauth2/[A-Za-z0-9._~:/?#=&%+_-]{40,1500}' \
-    | head -1
-}
-
 cmd_auth_start() {
   local type="" profile=""
   while [[ $# -gt 0 ]]; do
@@ -890,8 +819,8 @@ cmd_auth_start() {
   [[ -n "$type" ]] || fail "$E_USAGE" "usage: 5dive agent auth start <type> [--auth-profile=<name>]"
   is_known_type "$type" || fail "$E_NOT_FOUND" "unknown type: $type"
   case "$type" in
-    claude|hermes|openclaw|codex|gemini) ;;
-    *) fail "$E_VALIDATION" "device-code flow supports claude/hermes/openclaw/codex/gemini. Use 'auth set --api-key' or 'auth login' for $type." ;;
+    claude|hermes|openclaw|codex) ;;
+    *) fail "$E_VALIDATION" "device-code flow supports claude/hermes/openclaw/codex. Use 'auth set --api-key' or 'auth login' for $type." ;;
   esac
   local bin="${TYPE_BIN[$type]}"
   [[ -x "$bin" ]] || fail "$E_NOT_INSTALLED" "$type not installed at $bin"
@@ -918,15 +847,15 @@ cmd_auth_start() {
   chown claude:claude "$log"
   chmod 640 "$log"
 
-  # For codex/gemini, the success signal is a fresh credential file
-  # (~/.codex/auth.json or ~/.gemini/oauth_creds.json) — record the file's
-  # current mtime so poll can tell a pre-existing login apart from the one
-  # this session produced. Missing file ⇒ baseline 0, which any write beats.
-  # When profile is set, the sentinel lives under the per-profile state dir
-  # (profile_type_auth_path), not the shared /home/claude/.<type>.
+  # For codex, the success signal is a fresh credential file
+  # (~/.codex/auth.json) — record the file's current mtime so poll can tell
+  # a pre-existing login apart from the one this session produced. Missing
+  # file ⇒ baseline 0, which any write beats. When profile is set, the
+  # sentinel lives under the per-profile state dir (profile_type_auth_path),
+  # not the shared /home/claude/.<type>.
   local auth_baseline=0
   case "$type" in
-    codex|gemini|hermes|openclaw)
+    codex|hermes|openclaw)
       local sentinel
       sentinel=$(profile_type_auth_path "$profile" "$type")
       if [[ -n "$sentinel" && -f "$sentinel" ]]; then
@@ -955,7 +884,7 @@ cmd_auth_start() {
   local sock="${dir}/tmux.sock"
 
   # If profile set, redirect the type's state-root env var (CLAUDE_CONFIG_DIR /
-  # CODEX_HOME / HERMES_HOME / HOME for gemini+openclaw) so the device-flow CLI
+  # CODEX_HOME / HERMES_HOME / HOME for openclaw) so the device-flow CLI
   # writes its credential file into the profile dir instead of the shared
   # /home/claude/.<type>. Two agents on different profiles can then re-auth
   # independently without overwriting each other. For claude, the extracted
@@ -967,42 +896,12 @@ cmd_auth_start() {
     extra_env=$(profile_type_env "$profile" "$type") \
       || fail "$E_GENERIC" "profile_type_env: no plumbing for type '$type'"
   fi
-  # gemini's preseed (jq-merge of selectedType into settings.json) writes via
-  # ~/.gemini, which expands against the bash -lc shell's HOME (= /home/claude
-  # because of sudo -H). For profiled gemini we redirect HOME at exec time so
-  # the binary reads the profile dir, but the preseed ran earlier and would
-  # still hit /home/claude/.gemini. Resolve the path explicitly so preseed and
-  # binary agree on where settings.json lives. Pre-create at mode 2750 so the
-  # agent user (claude group) can later traverse it when seeding from
-  # 5dive-agent-start.sh — gemini itself would otherwise create .gemini at
-  # 0700 and lock the seed-time existence test out.
-  local gem_dir='~/.gemini'
-  if [[ -n "$profile" && "$type" == "gemini" ]]; then
-    gem_dir="$(profile_type_dir "$profile" "$type")/.gemini"
-    install -d -m 2750 -o claude -g claude "$gem_dir" 2>/dev/null || true
-  fi
-
-  # The CLI invocation differs per family: claude-setup-token prints a URL and
-  # waits for a pasted callback code; codex prints a URL + one-time code and
-  # polls the OAuth endpoint itself, so there's no submit step; gemini has no
-  # dedicated `auth login` subcommand — its OAuth flow is embedded in the
-  # interactive UI, gated by ~/.gemini/settings.json's selectedType. We force
-  # `oauth-personal` so gemini skips the auth-method picker and prints the
-  # Google OAuth URL immediately, then waits for a pasted callback code.
+  # The CLI invocation differs per family: claude-setup-token prints a URL
+  # and waits for a pasted callback code; codex prints a URL + one-time code
+  # and polls the OAuth endpoint itself, so there's no submit step.
   local login_cmd preseed=""
   case "$type" in
     codex)  login_cmd="$bin login --device-auth" ;;
-    gemini)
-      login_cmd="$bin --skip-trust --yolo"
-      # jq merge so we don't clobber unrelated keys a user may have set.
-      # $gem_dir is either the literal '~/.gemini' (default profile) or an
-      # absolute path under the profile dir — both work in bash with no
-      # quoting changes.
-      preseed='mkdir -p '"$gem_dir"' && '\
-'(jq ". + {security: ((.security // {}) + {auth: ((.security.auth // {}) + {selectedType: \"oauth-personal\"})})}" '"$gem_dir"'/settings.json 2>/dev/null '\
-'|| echo "{\"security\":{\"auth\":{\"selectedType\":\"oauth-personal\"}}}") > '"$gem_dir"'/settings.json.tmp && '\
-'mv '"$gem_dir"'/settings.json.tmp '"$gem_dir"'/settings.json; '
-      ;;
     hermes)
       # hermes auth add openai-codex prints a URL + one-time code (codex-style
       # device-auth via OpenAI), polls itself, then writes ~/.hermes/auth.json
@@ -1100,18 +999,6 @@ cmd_auth_poll() {
                  > "${meta}.tmp" && mv "${meta}.tmp" "$meta"
             fi
             ;;
-          gemini)
-            # gemini prints just the Google OAuth URL and waits for a pasted
-            # callback code (same UX as claude, no displayed one-time code).
-            local url
-            url=$(extract_gemini_url "$log" || true)
-            if [[ -n "$url" ]]; then
-              state="awaiting_code"
-              jq --arg u "$url" --arg s "$state" --arg ts "$(date -Iseconds)" \
-                '.url = $u | .state = $s | .updatedAt = $ts' "$meta" > "${meta}.tmp" \
-                && mv "${meta}.tmp" "$meta"
-            fi
-            ;;
           *)
             local url
             url=$(extract_claude_url "$log" || true)
@@ -1127,10 +1014,9 @@ cmd_auth_poll() {
 
       if [[ "$state" == "awaiting_code" || "$state" == "submitted" ]]; then
         case "$type" in
-          codex|gemini|hermes|openclaw)
-            # All four signal success by writing a credential file:
+          codex|hermes|openclaw)
+            # All three signal success by writing a credential file:
             #   codex    — ~/.codex/auth.json     (CLI polls OpenAI itself)
-            #   gemini   — ~/.gemini/oauth_creds.json (writes after user paste)
             #   hermes   — ~/.hermes/auth.json    (CLI polls OpenAI itself)
             #   openclaw — ~/.openclaw/agents/main/agent/auth-profiles.json
             #              (CLI polls OpenAI itself, then upsertAuthProfile
@@ -1223,11 +1109,9 @@ cmd_auth_submit() {
   [[ -n "$sid" && -n "$code" ]] \
     || fail "$E_USAGE" "usage: 5dive agent auth submit <session_id> --code=<callback-code>"
 
-  # Callback code shape varies by provider:
-  #   claude:   URL-safe base64 (`[A-Za-z0-9_-]+`), optional `#fragment`
-  #   gemini:   Google OAuth code, often `4/0AfgeXvtP...` — adds `/`
-  # Allow `/` and `.` so both shapes pass; we still refuse spaces, quotes,
-  # backticks etc. so tmux send-keys -l never sees something wild.
+  # Callback code is URL-safe base64 (`[A-Za-z0-9_-]+`), optional `#fragment`.
+  # Allow `/` and `.` so future provider shapes pass; we still refuse spaces,
+  # quotes, backticks etc. so tmux send-keys -l never sees something wild.
   [[ "$code" =~ ^[A-Za-z0-9._/-]+#?[A-Za-z0-9._/-]*$ ]] \
     || fail "$E_VALIDATION" "callback code contains unexpected characters"
 

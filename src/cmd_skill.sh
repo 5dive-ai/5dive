@@ -2,7 +2,7 @@
 # -------- skills (per-agent, via npx skills, type-aware) --------
 #
 # Each agent user has its own per-type skills dir (.claude/skills for claude,
-# .hermes/skills for hermes, .agents/skills for codex/gemini/opencode, plain
+# .hermes/skills for hermes, .agents/skills for codex/opencode, plain
 # ./skills for openclaw). `npx skills add` with `--agent <id>` lands the skill
 # in the right place — see SKILLS_AGENT_ID / SKILLS_INSTALL_DIR at the top of
 # this file. The dashboard's Skills block calls these subcommands through

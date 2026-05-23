@@ -117,11 +117,11 @@ cmd_doctor() {
       doctor_add deps bun error "bun not on PATH for $bun_user (telegram plugin requires it)" true false
     fi
 
-    # nvm + node + npm (node-based CLIs like codex/gemini depend on these)
+    # nvm + node + npm (node-based CLIs like codex depend on these)
     if [[ -s /home/claude/.nvm/nvm.sh ]]; then
       doctor_add deps nvm ok "/home/claude/.nvm/nvm.sh present"
     else
-      doctor_add deps nvm error "/home/claude/.nvm/nvm.sh missing (codex/gemini won't run)" false false
+      doctor_add deps nvm error "/home/claude/.nvm/nvm.sh missing (codex won't run)" false false
     fi
     local node_ver npm_ver
     node_ver=$(sudo -u claude -i bash -lc 'node --version' 2>/dev/null || true)

@@ -9,6 +9,18 @@ release.
 
 ## [Unreleased]
 
+### Removed
+
+- `gemini` agent type. Google's Gemini CLI is being sunsetted by Google in
+  favor of Antigravity. Drops the `[gemini]` entries from all `TYPE_*` and
+  `SKILLS_*` lookup tables, the `gemini` branch in the init wizard,
+  `extract_gemini_url`, the gemini paperclip-seed case, the
+  `GEMINI_SANDBOX` / `GEMINI_CLI_TRUST_WORKSPACE` overrides in the
+  paperclipai drop-in, and the `gemini.env` connector path. Hermes /
+  openclaw routing to Google's Gemini-2.0-flash model via a BYO API key
+  is unchanged — that's a model id in Google's provider catalog, not a
+  5dive agent type.
+
 ## [0.1.3] — 2026-05-22
 
 ### Changed
@@ -103,7 +115,7 @@ release.
   same-machine prompt and a laptop-agent-installs-onto-remote-VM
   prompt; both end with the agent installing the `5dive-cli` skill
   so the user can keep managing 5dive through the same agent.
-- README — `codex → gemini` image-to-animation example.
+- README — `codex → hermes` image-to-animation example.
 - README OG social-preview image.
 
 ### Changed

@@ -10,7 +10,7 @@
 #   version: "1"
 #   agents:
 #     <name>:
-#       type:           claude|codex|gemini|hermes|openclaw|opencode  (required)
+#       type:           claude|codex|hermes|openclaw|opencode  (required)
 #       channels:       none|telegram|discord                          (default none)
 #       telegram_token: "<bot-token>"      # required if channels=telegram
 #       discord_token:  "<bot-token>"      # required if channels=discord

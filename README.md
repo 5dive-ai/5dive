@@ -34,7 +34,7 @@ For scripted / CI setup, see `5dive init --help`.
 
 ## How it works
 
-Each agent is its own Linux user running an official agentic AI CLI (`claude`, `codex`, `gemini`, …) as a systemd service. Multiple agents can share the same CLI binary and subscription. Agents reach each other by invoking the same `5dive` CLI — that *is* the bus. Channels like Telegram attach per agent.
+Each agent is its own Linux user running an official agentic AI CLI (`claude`, `codex`, `hermes`, …) as a systemd service. Multiple agents can share the same CLI binary and subscription. Agents reach each other by invoking the same `5dive` CLI — that *is* the bus. Channels like Telegram attach per agent.
 
 ```text
             one host
@@ -59,7 +59,7 @@ No broker, no protocol, no orchestrator. Shared filesystem, shared CLI.
 
 **Runs as a service, not a session.** Your agents stay alive when you close the terminal. Message them from Telegram any time.
 
-**Every major agentic AI CLI.** `claude`, `codex`, `gemini`, `hermes`, `openclaw`, `opencode`, all under one team.
+**Every major agentic AI CLI.** `claude`, `codex`, `hermes`, `openclaw`, `opencode`, all under one team.
 
 **A subscription that's yours.** Official `claude` CLI on your own Pro/Max. No middleman, no OAuth proxy, Anthropic-policy safe.
 
@@ -83,12 +83,11 @@ If you'd rather click than `ssh`, [5dive.com](https://5dive.com) is the managed 
 |------|-------------|------|----------|
 | `claude`   | Anthropic Claude | OAuth / API key | Telegram, Discord |
 | `codex`    | OpenAI Codex     | OAuth / API key | — |
-| `gemini`   | Google Gemini    | OAuth / API key | — |
 | `hermes`   | third-party multi-provider harness | OAuth (OpenAI) / API key | Telegram, Discord |
 | `openclaw` | third-party multi-provider harness | OAuth (OpenAI) / API key | Telegram, Discord |
 | `opencode` | OpenCode | API key | — |
 
-`hermes` and `openclaw` are community-built harnesses that can route to many providers (OpenRouter, Anthropic, Google, Moonshot, etc.). As of April 4, 2026, Anthropic and Google no longer permit routing consumer subscription OAuth (Claude Pro/Max, Gemini) through third-party harnesses. For that work, use the official `claude` or `gemini` types with your own API key. Background: [We Ditched OpenClaw for Claude →](https://blog.5dive.com/blog/we-ditched-openclaw-for-claude/).
+`hermes` and `openclaw` are community-built harnesses that can route to many providers (OpenRouter, Anthropic, Google, Moonshot, etc.). As of April 4, 2026, Anthropic no longer permits routing consumer Claude Pro/Max OAuth through third-party harnesses. For that work, use the official `claude` type with your own API key. Background: [We Ditched OpenClaw for Claude →](https://blog.5dive.com/blog/we-ditched-openclaw-for-claude/).
 
 ---
 
@@ -185,7 +184,7 @@ Claude-runtime agents keep project memory under `~/.claude/projects/<dir>/memory
 
 ## For your AI agent
 
-If you already use Claude Code / Codex / Gemini / opencode, paste this prompt. Your agent installs 5dive, learns the skill, then keeps managing agents through chat:
+If you already use Claude Code / Codex / opencode, paste this prompt. Your agent installs 5dive, learns the skill, then keeps managing agents through chat:
 
 ```
 Install 5dive on this Linux host so I can use you to manage 5dive agents.
@@ -194,7 +193,7 @@ Install 5dive on this Linux host so I can use you to manage 5dive agents.
    curl -fsSL https://install.5dive.com | sudo bash
 2. Confirm: `5dive --version` prints "5dive 0.1.x".
 3. Install the 5dive-cli skill. Replace <runtime> with one of
-   claude-code, codex, gemini-cli, hermes-agent, openclaw, opencode:
+   claude-code, codex, hermes-agent, openclaw, opencode:
    npx -y skills add https://github.com/5dive-com/skills --skill 5dive-cli --agent <runtime> --yes
 4. Tell me to restart so the skill loads, then ask which agent to create first.
 ```

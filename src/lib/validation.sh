@@ -85,8 +85,8 @@ valid_profile_name() {
 }
 
 # Any printable non-space run >=10 chars. We don't pin to a specific provider
-# format (Anthropic keys start with sk-ant-, OpenAI with sk-, Gemini is
-# opaque, etc.) — the live probe (if configured) is the real validation.
+# format (Anthropic keys start with sk-ant-, OpenAI with sk-, others vary) —
+# the live probe (if configured) is the real validation.
 valid_api_key() {
   [[ "$1" =~ ^[[:graph:]]{10,}$ ]]
 }
