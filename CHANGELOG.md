@@ -9,6 +9,8 @@ release.
 
 ## [Unreleased]
 
+## [0.1.4] — 2026-05-23
+
 ### Fixed
 
 - `antigravity` auth sentinel path. The scaffold's first ship guessed
@@ -18,6 +20,16 @@ release.
   successful OAuth landing and reported `error: antigravity exited without
   writing ...`. Confirmed empirically via the live-VM pair-test. Patches
   TYPE_AUTH + profile_type_auth_path + the comment block in cmd_auth_poll.
+- Usage-limit Telegram pings narrowed to the calling chat. When an agent
+  is paired with multiple chats (personal DM + team group), hitting the
+  Claude usage limit was fanning the "Usage limit hit — resumes in …"
+  alert (and its later "agent resumed" follow-up) to every chat in
+  `access.json`. `stop-failure-telegram.sh` now scans the StopFailure
+  payload's transcript for the most-recent telegram inbound and pings
+  only that chat — same idiom `stop-telegram-reply-check.sh` already
+  uses. Falls back to the full access.json list when no inbound is
+  found (autonomous/cron-triggered sessions) so the alert isn't
+  silenced.
 
 ### Added
 
