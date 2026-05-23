@@ -18,11 +18,12 @@ cmd_init() {
 WELCOME
 
   # --- Step 1: pick a type ---
-  local -a types=(claude codex antigravity hermes openclaw opencode)
+  local -a types=(claude codex antigravity grok hermes openclaw opencode)
   local -A type_desc=(
     [claude]="Anthropic's Claude — recommended"
     [codex]="OpenAI Codex"
     [antigravity]="Google Antigravity CLI"
+    [grok]="xAI Grok CLI"
     [hermes]="Open-source agent — bring your own provider"
     [openclaw]="Open-source agent — bring your own provider"
     [opencode]="Open-source agent — bring your own provider"
@@ -38,7 +39,7 @@ WELCOME
   while true; do
     read -r -p "  choice [1-${#types[@]}, default 1]: " choice
     choice="${choice:-1}"
-    if [[ "$choice" =~ ^[1-6]$ ]] && (( choice <= ${#types[@]} )); then
+    if [[ "$choice" =~ ^[1-7]$ ]] && (( choice <= ${#types[@]} )); then
       type="${types[$((choice-1))]}"
       break
     fi
@@ -81,7 +82,7 @@ WELCOME
           printf '%s' "$key" | 5dive agent auth set claude --api-key=- || fail "$E_AUTH_REQUIRED" "auth failed"
         fi
         ;;
-      codex|openclaw|antigravity)
+      codex|openclaw|antigravity|grok)
         echo "  launching interactive login for $type…" >&2
         5dive agent auth login "$type" || fail "$E_AUTH_REQUIRED" "auth failed"
         ;;

@@ -26,7 +26,7 @@ esac
 
 # Bumped on every public release. `build.sh` checks this line exists; CI fails
 # the bundle-drift check if it's missing or empty.
-readonly FIVE_VERSION="0.1.5"
+readonly FIVE_VERSION="0.1.6"
 
 STATE_DIR="/var/lib/5dive"
 REGISTRY="${STATE_DIR}/agents.json"
@@ -90,6 +90,10 @@ declare -A TYPE_BIN=(
   # ~/.gemini parent — see launch log in the antigravity scaffold landed
   # in 5dive@<post-removal>).
   [antigravity]="/home/claude/.local/bin/agy"
+  # grok is xAI's CLI. Installer drops the binary at ~/.grok/bin/grok and
+  # symlinks ~/.local/bin/grok — we point TYPE_BIN at the symlink to match
+  # the convention of the other types.
+  [grok]="/home/claude/.local/bin/grok"
 )
 # Which types accept --channels=telegram|discord. Each type wires the channel
 # differently (see install_channel_for_<type>_agent below):
@@ -110,6 +114,7 @@ declare -A TYPE_CHANNELS=(
   [codex]=0
   [opencode]=0
   [antigravity]=0
+  [grok]=0
 )
 # Auth sentinel per type. Agent users run as agent-<name> (in group `claude`)
 # and cannot read /home/claude/.claude/settings.json (mode 0600), so for
@@ -136,6 +141,10 @@ declare -A TYPE_AUTH=(
   # without DBus, so the file path is what we sentinel-check. Exact name
   # confirmed once the OAuth round-trip lands (post-lodar test).
   [antigravity]="/home/claude/.gemini/antigravity-cli/credentials.json"
+  # grok writes ~/.grok/auth.json on successful `grok login --device-auth`.
+  # Verified empirically — auth.json.lock pre-exists the actual auth.json
+  # file (created on first device-auth attempt for the locking mechanism).
+  [grok]="/home/claude/.grok/auth.json"
 )
 # Installer recipe per type. Run as `claude` user via `sudo -u claude -i bash -lc <recipe>`
 # so $HOME/.nvm and PATH resolve correctly. Empty string => no automated installer
@@ -168,6 +177,11 @@ declare -A TYPE_INSTALL=(
   # and self-updates in the background on each run, so no daily-cron
   # equivalent of @google/gemini-cli's npm update is needed.
   [antigravity]="command -v agy >/dev/null || curl -fsSL https://antigravity.google/cli/install.sh | bash"
+  # grok's installer drops the binary at ~/.grok/bin/grok and symlinks
+  # ~/.local/bin/grok. It also drops an ~/.local/bin/agent symlink which
+  # we do NOT want shadowing future tooling, so rm it after install. The
+  # binary self-updates on subsequent launches; no daily-cron entry needed.
+  [grok]="command -v grok >/dev/null || { curl -fsSL https://x.ai/cli/install.sh | bash && rm -f /home/claude/.local/bin/agent; }"
 )
 
 # vercel-labs/skills CLI agent ID per 5dive type. `npx skills add --agent <id>`
@@ -184,6 +198,7 @@ declare -A SKILLS_AGENT_ID=(
   # through so the skills CLI lands SKILL.md at the generic ./skills/<id>
   # path (same fallback as openclaw).
   [antigravity]=antigravity
+  [grok]=grok
 )
 # Where the skills CLI lands SKILL.md inside the agent user's $HOME, per type.
 # Used for post-install verification, the cmd_skill_list dir-scan fallback,
@@ -197,6 +212,7 @@ declare -A SKILLS_INSTALL_DIR=(
   [openclaw]="skills"
   [opencode]=".agents/skills"
   [antigravity]=".gemini/antigravity-cli/skills"
+  [grok]=".grok/skills"
 )
 
 # api-key target per type: the env file (in /etc/5dive/connectors for the
@@ -213,11 +229,13 @@ declare -A TYPE_API_FILE=(
   # fails gracefully when a type isn't in this map.
   [codex]="openai.env"
   [opencode]="openai.env"
+  [grok]="xai.env"
 )
 declare -A TYPE_API_VAR=(
   [claude]="ANTHROPIC_API_KEY"
   [codex]="OPENAI_API_KEY"
   [opencode]="OPENAI_API_KEY"
+  [grok]="XAI_API_KEY"
 )
 
 # BYO provider catalog for hermes/openclaw. The dashboard's new-agent
@@ -335,4 +353,8 @@ declare -A TYPE_PROBE=(
   # tell stale-creds from rate-limit from a healthy box. File-presence is
   # the cheaper signal — fall through to TYPE_AUTH's sentinel.
   [antigravity]=''
+  # `grok -p ping` would block on stdin via the inline UI; the `agent`
+  # subcommand is meant for headless but takes longer to spin up than
+  # we want for a 5s probe. Stick with file-presence.
+  [grok]=''
 )

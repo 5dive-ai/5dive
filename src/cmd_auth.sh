@@ -243,9 +243,9 @@ profile_type_env() {
     codex)             printf 'CODEX_HOME=%s' "$dir" ;;
     hermes)            printf 'HERMES_HOME=%s' "$dir" ;;
     # openclaw's resolveStateDir uses $HOME/.openclaw. HOME redirect is the
-    # only handle. antigravity is the same shape — it writes everything
-    # under $HOME/.gemini/antigravity-cli/, no GEMINI_HOME equivalent.
-    openclaw|antigravity) printf 'HOME=%s' "$dir" ;;
+    # only handle. antigravity (writes ~/.gemini/antigravity-cli/) and grok
+    # (writes ~/.grok/) are the same shape — no per-tool *_HOME var to use.
+    openclaw|antigravity|grok) printf 'HOME=%s' "$dir" ;;
     *) return 1 ;;
   esac
 }
@@ -264,10 +264,11 @@ profile_type_auth_path() {
   case "$type" in
     codex)    echo "${dir}/auth.json" ;;
     hermes)   echo "${dir}/auth.json" ;;
-    # openclaw/antigravity use HOME redirect so the credential lives at the
-    # same relative path each tool would write under a real $HOME.
+    # openclaw/antigravity/grok use HOME redirect so the credential lives
+    # at the same relative path each tool would write under a real $HOME.
     openclaw)    echo "${dir}/.openclaw/agents/main/agent/auth-profiles.json" ;;
     antigravity) echo "${dir}/.gemini/antigravity-cli/credentials.json" ;;
+    grok)        echo "${dir}/.grok/auth.json" ;;
     # claude detection in cmd_auth_poll is log-grep-based, not file-mtime —
     # this entry is here for completeness/symmetry.
     claude)   echo "${dir}/.credentials.json" ;;
@@ -702,6 +703,13 @@ cmd_auth_login() {
       # one-shot that triggers it; the binary prints the Google OAuth URL,
       # then waits 30s for either an OAuth callback OR a pasted code.
       exec sudo -u claude -i env $extra_env bash -lc 'agy --print ping' ;;
+    grok)
+      # grok has both an interactive UI OAuth (localhost callback, no good
+      # for headless VMs) and a dedicated --device-auth flag (URL + 4-dash-4
+      # user code, CLI polls). Use --device-auth so the same flow works
+      # whether we're invoked from a real TTY or via the tmux+script(1)
+      # bridge that powers the dashboard's device-code flow.
+      exec sudo -u claude -i env $extra_env bash -lc 'grok login --device-auth' ;;
     opencode) exec sudo -u claude -i bash -lc 'opencode auth login' ;;
   esac
 }
@@ -792,6 +800,29 @@ extract_claude_token() {
     | tail -1 | sed 's/Store$//'
 }
 
+# grok login --device-auth prints `https://accounts.x.ai/oauth2/device?user_code=
+# <4-dash-4>` as the device URL plus a separately-displayed user code in the
+# same `<4-dash-4>` format (e.g. `XJ9P-ZW8T`). Strip CSI escapes first since
+# grok renders the code in a colored block. The URL is the canonical anchor;
+# code is a friendly fallback for users who want to type instead of click.
+extract_grok_url() {
+  local log="$1"
+  [[ -s "$log" ]] || return 1
+  sed 's/\x1b\[[0-9;]*[A-Za-z]//g; s/\r//g' "$log" \
+    | grep -oE 'https://accounts\.x\.ai/oauth2/device\?[A-Za-z0-9._~:/?#=&%+_-]+' \
+    | head -1
+}
+
+extract_grok_code() {
+  local log="$1"
+  [[ -s "$log" ]] || return 1
+  # 4-dash-4 uppercase-alphanumeric. Codex uses 4-dash-5, so we can't share
+  # extract_codex_code — different anchor lengths reject the wrong shape.
+  sed 's/\x1b\[[0-9;]*[A-Za-z]//g; s/\r//g' "$log" \
+    | grep -oE '\b[0-9A-Z]{4}-[0-9A-Z]{4}\b' \
+    | head -1
+}
+
 # antigravity prints `Authentication required. Please visit the URL to log in:`
 # followed by a Google OAuth URL with redirect_uri=antigravity.google/oauth-
 # callback on a single (possibly wrapped) line, then a "Or, paste the
@@ -840,8 +871,8 @@ cmd_auth_start() {
   [[ -n "$type" ]] || fail "$E_USAGE" "usage: 5dive agent auth start <type> [--auth-profile=<name>]"
   is_known_type "$type" || fail "$E_NOT_FOUND" "unknown type: $type"
   case "$type" in
-    claude|hermes|openclaw|codex|antigravity) ;;
-    *) fail "$E_VALIDATION" "device-code flow supports claude/hermes/openclaw/codex/antigravity. Use 'auth set --api-key' or 'auth login' for $type." ;;
+    claude|hermes|openclaw|codex|antigravity|grok) ;;
+    *) fail "$E_VALIDATION" "device-code flow supports claude/hermes/openclaw/codex/antigravity/grok. Use 'auth set --api-key' or 'auth login' for $type." ;;
   esac
   local bin="${TYPE_BIN[$type]}"
   [[ -x "$bin" ]] || fail "$E_NOT_INSTALLED" "$type not installed at $bin"
@@ -876,7 +907,7 @@ cmd_auth_start() {
   # not the shared /home/claude/.<type>.
   local auth_baseline=0
   case "$type" in
-    codex|hermes|openclaw|antigravity)
+    codex|hermes|openclaw|antigravity|grok)
       local sentinel
       sentinel=$(profile_type_auth_path "$profile" "$type")
       if [[ -n "$sentinel" && -f "$sentinel" ]]; then
@@ -931,6 +962,12 @@ cmd_auth_start() {
       # Same UX shape as gemini was; the URL pattern is identical except
       # for the redirect_uri (antigravity.google/oauth-callback).
       login_cmd="$bin --print ping" ;;
+    grok)
+      # `grok login --device-auth` prints accounts.x.ai/oauth2/device + a
+      # 4-dash-4 user code, polls the device-auth endpoint itself, and
+      # writes ~/.grok/auth.json on success. Same UX shape as codex's
+      # --device-auth (URL + displayed code, no callback paste).
+      login_cmd="$bin login --device-auth" ;;
     hermes)
       # hermes auth add openai-codex prints a URL + one-time code (codex-style
       # device-auth via OpenAI), polls itself, then writes ~/.hermes/auth.json
@@ -1040,6 +1077,21 @@ cmd_auth_poll() {
                 && mv "${meta}.tmp" "$meta"
             fi
             ;;
+          grok)
+            # codex-style: URL + displayed code, CLI polls. Advance once
+            # both have appeared so the dashboard never renders one without
+            # the other.
+            local url code_display
+            url=$(extract_grok_url "$log" || true)
+            code_display=$(extract_grok_code "$log" || true)
+            if [[ -n "$url" && -n "$code_display" ]]; then
+              state="awaiting_code"
+              jq --arg u "$url" --arg c "$code_display" --arg s "$state" \
+                 --arg ts "$(date -Iseconds)" \
+                 '.url = $u | .code = $c | .state = $s | .updatedAt = $ts' "$meta" \
+                 > "${meta}.tmp" && mv "${meta}.tmp" "$meta"
+            fi
+            ;;
           *)
             local url
             url=$(extract_claude_url "$log" || true)
@@ -1055,8 +1107,8 @@ cmd_auth_poll() {
 
       if [[ "$state" == "awaiting_code" || "$state" == "submitted" ]]; then
         case "$type" in
-          codex|hermes|openclaw|antigravity)
-            # All four signal success by writing a credential file:
+          codex|hermes|openclaw|antigravity|grok)
+            # All five signal success by writing a credential file:
             #   codex       — ~/.codex/auth.json     (CLI polls OpenAI itself)
             #   hermes      — ~/.hermes/auth.json    (CLI polls OpenAI itself)
             #   openclaw    — ~/.openclaw/agents/main/agent/auth-profiles.json
@@ -1065,6 +1117,9 @@ cmd_auth_poll() {
             #   antigravity — ~/.gemini/antigravity-cli/credentials.json
             #                 (Google OAuth callback or pasted code; mtime
             #                 bumps once token_storage's file fallback writes)
+            #   grok        — ~/.grok/auth.json
+            #                 (CLI polls xAI's device-auth endpoint, writes
+            #                 auth.json on token receipt)
             # When this session is profile-scoped, the credential lands under
             # the per-profile state dir (profile_type_auth_path) instead of
             # the shared ~/.<type>. We mtime the sentinel against the
@@ -1168,13 +1223,13 @@ cmd_auth_submit() {
   local state type
   state=$(jq -r '.state' "$meta")
   type=$(jq -r '.type' "$meta")
-  # codex and hermes never ask for a pasted callback — the CLI polls the
+  # codex/hermes/grok never ask for a pasted callback — the CLI polls the
   # OAuth endpoint on its own and writes auth.json. Submitting here would
   # wedge keystrokes into a prompt that doesn't exist. antigravity DOES
   # accept a pasted code at its "Or, paste the authorization code here"
   # prompt, so the submit step IS valid for it.
   case "$type" in
-    codex|hermes) fail "$E_VALIDATION" "$type device-auth has no submit step — keep polling until state=ok or state=error" ;;
+    codex|hermes|grok) fail "$E_VALIDATION" "$type device-auth has no submit step — keep polling until state=ok or state=error" ;;
   esac
   case "$state" in
     awaiting_code|submitted) ;;   # submitted -> retry after a rejected code

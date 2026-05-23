@@ -11,6 +11,17 @@ release.
 
 ### Added
 
+- `grok` agent type. xAI's CLI. Binary lands at `~/.local/bin/grok`
+  (symlinked from `~/.grok/bin/grok`); state under `~/.grok/`. OAuth uses
+  the xAI device-auth flow (`grok login --device-auth` → URL
+  `accounts.x.ai/oauth2/device` + a 4-dash-4 user code like `XJ9P-ZW8T`;
+  CLI polls the endpoint itself and writes `~/.grok/auth.json`). Same UX
+  shape as codex's device-auth — no callback paste. Also supports BYO API
+  key via `XAI_API_KEY`. Run flag: `--permission-mode bypassPermissions`.
+  Installer drops a competing `agent` symlink alongside `grok`; the
+  TYPE_INSTALL recipe removes it post-install so future tooling isn't
+  shadowed.
+
 - `antigravity` agent type. Google's native-Go successor to gemini-cli.
   Installer lands `agy` at `~/.local/bin/agy` (no Node/nvm dependency).
   Run flag: `--dangerously-skip-permissions` (mirrors the claude family
