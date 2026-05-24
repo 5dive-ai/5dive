@@ -57,15 +57,23 @@ esac
 
 [[ -x "$BIN" ]] || { echo "binary not installed: $BIN" >&2; exit 3; }
 
-# Only claude flows through the claude-plugins-official marketplace plugins
+# Only claude flows through marketplace plugins for its channel surface
 # (the dashboard install_channel_for_agent step set the bot token there).
 # openclaw consumed CHANNELS in the type-dispatch above; hermes' gateway
 # reads ~/.hermes/.env directly, so neither needs a runtime --channels arg.
+#
+# AGENT_CHANNEL_MARKETPLACE is set per-agent in /var/lib/5dive/agents.d/<name>.env
+# (see write_agent_env in cmd_agent.sh). New telegram agents get
+# `5dive-plugins` (our fork). Existing agents without the var fall back to
+# `claude-plugins-official` so they keep loading whichever plugin they
+# were originally provisioned with. Discord stays upstream — we haven't
+# forked it yet.
+CM="${AGENT_CHANNEL_MARKETPLACE:-claude-plugins-official}"
 case "$CHANNELS" in
   none|"") : ;;
   telegram)
     case "$TYPE" in
-      claude) ARGS+=(--channels plugin:telegram@claude-plugins-official) ;;
+      claude) ARGS+=(--channels "plugin:telegram@${CM}") ;;
     esac ;;
   discord)
     case "$TYPE" in

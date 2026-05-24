@@ -81,6 +81,12 @@ write_agent_env() {
     [[ -n "$workdir" ]] && printf 'AGENT_WORKDIR=%s\n' "$workdir"
     [[ -n "$profile" ]] && printf 'AGENT_AUTH_PROFILE=%s\n' "$profile"
     printf 'AGENT_ISOLATION=%s\n' "$isolation"
+    # New telegram agents flow through our 5dive-plugins fork (bundled
+    # hooks, richer slash commands). 5dive-agent-start reads this var to
+    # build the runtime --channels arg, defaulting to claude-plugins-official
+    # when unset — so existing agents created before this change keep
+    # routing to the upstream plugin until manually migrated.
+    [[ "$channels" == "telegram" ]] && printf 'AGENT_CHANNEL_MARKETPLACE=5dive-plugins\n'
   } > "$env_file"
   chown root:claude "$env_file"
   chmod 640 "$env_file"

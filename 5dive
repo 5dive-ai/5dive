@@ -670,36 +670,27 @@ JSON
     extraKnownMarketplaces: {
       "claude-plugins-official": {
         source: {source: "github", repo: "anthropics/claude-plugins-official"}
+      },
+      "5dive-plugins": {
+        source: {source: "github", repo: "5dive-com/5dive-plugins"}
       }
     }
   }')
   if [[ "$channels" == "telegram" ]]; then
+    # 5dive-plugins/telegram (our fork) bundles PreToolUse / Stop /
+    # PostToolUse hooks via its own hooks.json, so we no longer wire the
+    # standalone /usr/local/lib/5dive/ copies into settings.json for
+    # telegram agents — that would double-fire. StopFailure stays: the
+    # rate-limit detection + transcript scrape are 5dive-specific with
+    # no plugin equivalent yet.
     [[ -x "$STOP_FAILURE_HOOK" ]] \
       || warn "$STOP_FAILURE_HOOK missing — StopFailure hook not wired (run: curl -fsSL https://raw.githubusercontent.com/5dive-com/5dive/main/install.sh | sudo bash)"
-    [[ -x "$PRETOOL_TELEGRAM_HOOK" ]] \
-      || warn "$PRETOOL_TELEGRAM_HOOK missing — PreToolUse hook not wired (run: curl -fsSL https://raw.githubusercontent.com/5dive-com/5dive/main/install.sh | sudo bash)"
-    [[ -x "$STOP_TELEGRAM_REPLY_HOOK" ]] \
-      || warn "$STOP_TELEGRAM_REPLY_HOOK missing — Stop hook not wired (run: curl -fsSL https://raw.githubusercontent.com/5dive-com/5dive/main/install.sh | sudo bash)"
-    [[ -x "$POSTTOOL_TELEGRAM_RELAY_HOOK" ]] \
-      || warn "$POSTTOOL_TELEGRAM_RELAY_HOOK missing — PostToolUse hook not wired (run: curl -fsSL https://raw.githubusercontent.com/5dive-com/5dive/main/install.sh | sudo bash)"
     settings=$(jq \
-      --arg hook "$STOP_FAILURE_HOOK" \
-      --arg pretool "$PRETOOL_TELEGRAM_HOOK" \
-      --arg stopreply "$STOP_TELEGRAM_REPLY_HOOK" \
-      --arg posttool "$POSTTOOL_TELEGRAM_RELAY_HOOK" '
+      --arg hook "$STOP_FAILURE_HOOK" '
       . + {
-        enabledPlugins: {"telegram@claude-plugins-official": true},
+        enabledPlugins: {"telegram@5dive-plugins": true},
         hooks: {
-          Stop: [
-            {hooks: [{type: "command", command: $stopreply, timeout: 10}]}
-          ],
-          StopFailure: [{hooks: [{type: "command", command: $hook, timeout: 10}]}],
-          PreToolUse: [
-            {matcher: "AskUserQuestion|ExitPlanMode", hooks: [{type: "command", command: $pretool, timeout: 5}]}
-          ],
-          PostToolUse: [
-            {hooks: [{type: "command", command: $posttool, timeout: 10}]}
-          ]
+          StopFailure: [{hooks: [{type: "command", command: $hook, timeout: 10}]}]
         }
       }
     ' <<<"$settings")
@@ -792,7 +783,17 @@ install_channel_plugin_for_agent() {
       "bun not on PATH for $user (required by $plugin plugin). Run: sudo 5dive doctor --repair"
   fi
 
-  step "Installing $plugin plugin for $user"
+  # Pick the marketplace per plugin. Telegram lives on our 5dive-plugins
+  # fork (bundled hooks + richer commands); discord stays upstream until
+  # we fork it too. Other plugins default to upstream.
+  local marketplace="claude-plugins-official"
+  local mkt_repo="anthropics/claude-plugins-official"
+  if [[ "$plugin" == "telegram" ]]; then
+    marketplace="5dive-plugins"
+    mkt_repo="5dive-com/5dive-plugins"
+  fi
+
+  step "Installing $plugin plugin for $user (from $marketplace)"
   # Deliberately NOT a login shell: /etc/profile.d/5dive-shared-configs.sh
   # exports CLAUDE_CONFIG_DIR=/home/claude/.claude, which would cause
   # `claude plugin install` to land the plugin in the wrong home. Mirror
@@ -801,7 +802,7 @@ install_channel_plugin_for_agent() {
   # set -e + pipefail: without pipefail, `npm install | tail -5` masked
   # npm's exit code with tail's zero-exit and the agent would ship with
   # half-installed deps; surface the failure so the frontend can show it.
-  if ! sudo -u "$user" -H env PLUGIN="$plugin" bash -s >&2 <<'AGENT_PLUGIN_INSTALL'
+  if ! sudo -u "$user" -H env PLUGIN="$plugin" MARKETPLACE="$marketplace" MKT_REPO="$mkt_repo" bash -s >&2 <<'AGENT_PLUGIN_INSTALL'
 set -euo pipefail
 unset CLAUDE_CONFIG_DIR
 export NVM_DIR="/home/claude/.nvm"
@@ -810,17 +811,18 @@ export NVM_DIR="/home/claude/.nvm"
 export PATH="/home/claude/.local/bin:$PATH"
 CLAUDE=/home/claude/.local/bin/claude
 
-"$CLAUDE" plugin marketplace update claude-plugins-official 2>/dev/null \
-  || "$CLAUDE" plugin marketplace add anthropics/claude-plugins-official
+"$CLAUDE" plugin marketplace update "$MARKETPLACE" 2>/dev/null \
+  || "$CLAUDE" plugin marketplace add "$MKT_REPO"
 
-yes | "$CLAUDE" plugin install "${PLUGIN}@claude-plugins-official" >/dev/null || true
+yes | "$CLAUDE" plugin install "${PLUGIN}@${MARKETPLACE}" >/dev/null || true
 
-PLUGIN_DIR=$(PLUGIN="$PLUGIN" python3 -c '
+PLUGIN_DIR=$(PLUGIN="$PLUGIN" MARKETPLACE="$MARKETPLACE" python3 -c '
 import json, os
 try:
     plugin = os.environ["PLUGIN"]
+    marketplace = os.environ["MARKETPLACE"]
     d = json.load(open(os.path.expanduser("~/.claude/plugins/installed_plugins.json")))
-    p = d.get("plugins", {}).get(plugin + "@claude-plugins-official", [])
+    p = d.get("plugins", {}).get(f"{plugin}@{marketplace}", [])
     print(p[0]["installPath"] if p else "")
 except Exception:
     print("")
@@ -3037,6 +3039,12 @@ write_agent_env() {
     [[ -n "$workdir" ]] && printf 'AGENT_WORKDIR=%s\n' "$workdir"
     [[ -n "$profile" ]] && printf 'AGENT_AUTH_PROFILE=%s\n' "$profile"
     printf 'AGENT_ISOLATION=%s\n' "$isolation"
+    # New telegram agents flow through our 5dive-plugins fork (bundled
+    # hooks, richer slash commands). 5dive-agent-start reads this var to
+    # build the runtime --channels arg, defaulting to claude-plugins-official
+    # when unset — so existing agents created before this change keep
+    # routing to the upstream plugin until manually migrated.
+    [[ "$channels" == "telegram" ]] && printf 'AGENT_CHANNEL_MARKETPLACE=5dive-plugins\n'
   } > "$env_file"
   chown root:claude "$env_file"
   chmod 640 "$env_file"

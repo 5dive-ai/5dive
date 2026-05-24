@@ -64,6 +64,33 @@ refresh_managed_files() {
   chmod 644 "$LIB_DIR/telegram-agent-CLAUDE.md"
   ok "telegram-agent-CLAUDE.md"
 
+  # /etc/claude-code/managed-settings.json — channel-plugin allowlist.
+  # Claude reads a default Anthropic-blessed ledger when this file is
+  # absent, which permits telegram@claude-plugins-official but NOT our
+  # fork. The moment a custom allowlist exists, claude ignores the
+  # default ledger entirely — so we list BOTH the 5dive fork and the
+  # upstream entry, plus discord upstream. Existing agents pinned to
+  # claude-plugins-official keep working; new agents on 5dive-plugins
+  # are now allowlisted. Use install -m to preserve the file mode and
+  # never clobber a customised entry: skip if the operator already
+  # wrote one (e.g. with extra plugins of their own).
+  install -d -m 755 /etc/claude-code
+  if [[ ! -f /etc/claude-code/managed-settings.json ]]; then
+    cat > /etc/claude-code/managed-settings.json <<'MANAGED'
+{
+  "allowedChannelPlugins": [
+    {"plugin": "telegram", "marketplace": "5dive-plugins"},
+    {"plugin": "telegram", "marketplace": "claude-plugins-official"},
+    {"plugin": "discord", "marketplace": "claude-plugins-official"}
+  ]
+}
+MANAGED
+    chmod 644 /etc/claude-code/managed-settings.json
+    ok "/etc/claude-code/managed-settings.json (new)"
+  else
+    ok "/etc/claude-code/managed-settings.json (kept existing)"
+  fi
+
   # Drop a slim projects-level CLAUDE.md so every agent spawned on this host
   # picks up baseline self-management guidance (project layout, sudo, where
   # the agent's own settings live, the host CLI). Only on first install —
