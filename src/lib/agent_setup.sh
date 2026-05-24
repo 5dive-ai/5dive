@@ -201,10 +201,15 @@ install_channel_plugin_for_agent() {
   # fork (bundled hooks + richer commands); discord stays upstream until
   # we fork it too. Other plugins default to upstream.
   local marketplace="claude-plugins-official"
-  local mkt_repo="anthropics/claude-plugins-official"
+  # Full HTTPS URL — `claude plugin marketplace add` resolves the
+  # GitHub shorthand `owner/repo` to git@github.com (SSH) on at least
+  # some claude versions, which fails on agent-<name> users with no
+  # SSH key configured. Explicit https URL sidesteps the shorthand
+  # resolver entirely.
+  local mkt_repo="https://github.com/anthropics/claude-plugins-official.git"
   if [[ "$plugin" == "telegram" ]]; then
     marketplace="5dive-plugins"
-    mkt_repo="5dive-com/5dive-plugins"
+    mkt_repo="https://github.com/5dive-com/5dive-plugins.git"
   fi
 
   step "Installing $plugin plugin for $user (from $marketplace)"
