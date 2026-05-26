@@ -229,6 +229,20 @@ Finish Telegram pairing:
 TG
   fi
 
+  # Heads-up for Teams-org accounts: remote managed-settings can silently
+  # override the local channel allowlist (Console-controlled). The check
+  # runs as part of `5dive doctor --category=channels` after the agent boots.
+  if [[ "$channels" == "telegram" ]]; then
+    cat >&2 <<TEAMS
+Anthropic Teams accounts:
+  if your bot stays silent on incoming DMs, your org admin may need to
+  allowlist this plugin in the Anthropic Console. Diagnose with:
+    sudo 5dive doctor --category=channels
+  Setup snippet: https://github.com/5dive-com/5dive-plugins#anthropic-teams-accounts
+
+TEAMS
+  fi
+
   cat >&2 <<MANAGE
 Manage:
   5dive agent list

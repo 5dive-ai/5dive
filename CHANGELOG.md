@@ -9,6 +9,19 @@ release.
 
 ## [Unreleased]
 
+### Added
+
+- `5dive doctor` gained a `channels` category that verifies
+  `/etc/claude-code/managed-settings.json` carries `channelsEnabled: true`
+  + a `telegram@5dive-plugins` entry, and reads each agent's latest
+  telegram-plugin MCP log to confirm whether claude's channel
+  subscription is `registered` vs `skipped`. A `skipped` result is
+  flagged as a likely Anthropic Teams org override and points the
+  operator at the README setup snippet.
+- `5dive init` prints a Teams-org heads-up after the Telegram pairing
+  step pointing at `sudo 5dive doctor --category=channels` and the
+  Anthropic Console setup snippet.
+
 ## [0.1.6] — 2026-05-25
 
 ### Changed

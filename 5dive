@@ -5763,6 +5763,20 @@ Finish Telegram pairing:
 TG
   fi
 
+  # Heads-up for Teams-org accounts: remote managed-settings can silently
+  # override the local channel allowlist (Console-controlled). The check
+  # runs as part of `5dive doctor --category=channels` after the agent boots.
+  if [[ "$channels" == "telegram" ]]; then
+    cat >&2 <<TEAMS
+Anthropic Teams accounts:
+  if your bot stays silent on incoming DMs, your org admin may need to
+  allowlist this plugin in the Anthropic Console. Diagnose with:
+    sudo 5dive doctor --category=channels
+  Setup snippet: https://github.com/5dive-com/5dive-plugins#anthropic-teams-accounts
+
+TEAMS
+  fi
+
   cat >&2 <<MANAGE
 Manage:
   5dive agent list
@@ -5842,16 +5856,17 @@ cmd_doctor() {
     shift
   done
   case "$filter" in
-    ""|deps|types|auth|registry|shelld) ;;
-    *) fail "$E_USAGE" "unknown --category (deps|types|auth|registry|shelld)" ;;
+    ""|deps|types|auth|registry|shelld|channels) ;;
+    *) fail "$E_USAGE" "unknown --category (deps|types|auth|registry|shelld|channels)" ;;
   esac
 
-  local run_deps=0 run_types=0 run_auth=0 run_registry=0 run_shelld=0
+  local run_deps=0 run_types=0 run_auth=0 run_registry=0 run_shelld=0 run_channels=0
   [[ -z "$filter" || "$filter" == "deps"     ]] && run_deps=1
   [[ -z "$filter" || "$filter" == "types"    ]] && run_types=1
   [[ -z "$filter" || "$filter" == "auth"     ]] && run_auth=1
   [[ -z "$filter" || "$filter" == "registry" ]] && run_registry=1
   [[ -z "$filter" || "$filter" == "shelld"   ]] && run_shelld=1
+  [[ -z "$filter" || "$filter" == "channels" ]] && run_channels=1
 
   # --- deps ---
   if (( run_deps )); then
@@ -6035,6 +6050,74 @@ cmd_doctor() {
           fi
         else
           doctor_add registry "agent:$name" ok "entry + user + env file all present"
+        fi
+      done
+    fi
+  fi
+
+  # --- channels: managed-settings allowlist + per-agent registration health ---
+  #
+  # Two failure modes we surface here:
+  #   1. /etc/claude-code/managed-settings.json missing or missing the
+  #      telegram@5dive-plugins entry — the local self-hosted case. Install.sh
+  #      writes this on first install; flag if it's been hand-edited away.
+  #   2. Claude logs "Channel notifications skipped: plugin telegram@5dive-plugins
+  #      is not on the approved channels allowlist" — strong signal the agent
+  #      is on a Teams org whose admin hasn't allowlisted us via remote
+  #      managed-settings (remote overrides local). Linked from README.
+  if (( run_channels )); then
+    local ms=/etc/claude-code/managed-settings.json
+    if [[ ! -f "$ms" ]]; then
+      doctor_add channels managed-settings warn \
+        "$ms missing — rerun install.sh, or expect channel-skipped errors" false false
+    elif ! jq -e '.channelsEnabled == true' "$ms" >/dev/null 2>&1; then
+      doctor_add channels managed-settings error \
+        "$ms missing channelsEnabled:true (Claude Code 2.1.150+ requires this; allowlist is otherwise inert)" false false
+    elif ! jq -e '.allowedChannelPlugins | any(.plugin == "telegram" and .marketplace == "5dive-plugins")' "$ms" >/dev/null 2>&1; then
+      doctor_add channels managed-settings warn \
+        "$ms doesn't list telegram@5dive-plugins — local channel allowlist won't permit the fork" false false
+    else
+      doctor_add channels managed-settings ok "$ms has channelsEnabled + telegram@5dive-plugins allowlisted"
+    fi
+
+    # Per-agent: read the MOST RECENT MCP log for the telegram plugin and
+    # check whether the last channel-registration event was "registered" or
+    # "skipped". The log path is per-user, per-cwd (slashes → dashes):
+    #   ~/.cache/claude-cli-nodejs/<cwd-dashed>/mcp-logs-plugin-telegram-*/*.jsonl
+    # We glob the plugin dir to stay tolerant of marketplace name changes.
+    # "Skipped" almost always means a Teams-org remote managed-settings is
+    # overriding the local allowlist — admin action required; we link docs.
+    if [[ -f "$REGISTRY" ]]; then
+      local reg name channels
+      reg=$(registry_read 2>/dev/null || echo '{"agents":{}}')
+      for name in $(jq -r '.agents | keys[]' <<<"$reg" 2>/dev/null); do
+        channels=$(jq -r --arg n "$name" '.agents[$n].channels // ""' <<<"$reg")
+        [[ "$channels" == *telegram* ]] || continue
+        local user="agent-${name}"
+        id -u "$user" &>/dev/null || continue
+        # Latest jsonl across any telegram-plugin mcp-logs dir for this user.
+        local latest
+        latest=$(sudo -u "$user" bash -lc \
+          'ls -1t "$HOME"/.cache/claude-cli-nodejs/*/mcp-logs-plugin-telegram-*/*.jsonl 2>/dev/null | head -1' \
+          2>/dev/null)
+        if [[ -z "$latest" ]]; then
+          doctor_add channels "agent:$name" warn \
+            "no telegram MCP logs found for $user (agent never started? channel not actually attached?)" false false
+          continue
+        fi
+        # Look at the LAST occurrence of either event — agents may have
+        # registered earlier then been told to skip, or vice versa.
+        local last_event
+        last_event=$(sudo -u "$user" grep -E 'Channel notifications (registered|skipped|.*not on the approved channels allowlist)' "$latest" 2>/dev/null | tail -1)
+        if [[ "$last_event" == *"not on the approved channels allowlist"* ]]; then
+          doctor_add channels "agent:$name" error \
+            "claude logged 'Channel notifications skipped' — likely on an Anthropic Teams org. Org admin must allowlist telegram@5dive-plugins via console. See: https://github.com/5dive-com/5dive-plugins#anthropic-teams-accounts" \
+            false false
+        elif [[ "$last_event" == *"registered"* ]]; then
+          doctor_add channels "agent:$name" ok "channel registered (latest MCP log: $(basename "$latest"))"
+        else
+          doctor_add channels "agent:$name" warn \
+            "no channel-registration event found in latest MCP log $(basename "$latest") — restart the agent to refresh" false false
         fi
       done
     fi
