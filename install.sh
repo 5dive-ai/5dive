@@ -35,6 +35,13 @@ refresh_managed_files() {
   chmod 755 "$BIN_DIR/5dive-agent-start"
   ok "5dive-agent-start → $BIN_DIR/5dive-agent-start"
 
+  # Refresh helper — plugin updates are SHA-pinned in installed_plugins.json,
+  # so a claude restart alone won't pick up new plugin versions. The daily
+  # update cron calls this script before restarting agents.
+  curl -fsSL "$REPO/5dive-refresh-plugins.sh" -o "$BIN_DIR/5dive-refresh-plugins.sh"
+  chmod 755 "$BIN_DIR/5dive-refresh-plugins.sh"
+  ok "5dive-refresh-plugins.sh → $BIN_DIR/5dive-refresh-plugins.sh"
+
   curl -fsSL "$REPO/systemd/5dive-agent%40.service" -o "$SYSTEMD_DIR/5dive-agent@.service"
   systemctl daemon-reload
   ok "systemd template installed"
@@ -211,6 +218,14 @@ if [[ "${1:-}" == "--upgrade" ]]; then
 
   say "Upgrading 5dive CLI (skipping apt / nvm / bun / state setup)"
   refresh_managed_files
+
+  # Plugins are SHA-pinned per-user in installed_plugins.json, so CLI
+  # upgrade alone doesn't refresh them. Run the helper best-effort: if
+  # no agents are registered yet (fresh box) it's a no-op; if claude
+  # is missing it self-skips. Failures here shouldn't block the upgrade.
+  if [[ -x "$BIN_DIR/5dive-refresh-plugins.sh" ]]; then
+    "$BIN_DIR/5dive-refresh-plugins.sh" 2>&1 | tail -20 || true
+  fi
 
   echo
   echo "5dive upgraded."
