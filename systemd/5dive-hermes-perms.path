@@ -1,0 +1,21 @@
+[Unit]
+Description=Watch /home/claude/.hermes for permission regression
+Documentation=https://github.com/5dive/5dive
+After=local-fs.target
+# hermes writes auth.json/config.yaml multiple times in rapid succession
+# (token refresh + chmod-back). The default systemd rate limit drops the
+# watcher into 'failed' after a burst, which is exactly what we don't
+# want — once it stops watching, /home/claude/.hermes stays at 0700 and
+# every agent's gateway can't exec the binary. Disable the rate limit.
+StartLimitIntervalSec=0
+
+[Path]
+# Hermes rewrites auth.json/config.yaml on every run, then chmods the parent
+# dir back to 0700 — which blocks agent-<name> users (in the `claude` group)
+# from traversing to venv/bin/hermes. Fire on every file write inside the
+# dir; the oneshot's chmod 0775 runs after hermes's chmod-back wins the race.
+PathChanged=/home/claude/.hermes
+Unit=5dive-hermes-perms.service
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,15 @@
+[Unit]
+Description=Restore /home/claude/.hermes traverse perms after hermes regression
+Documentation=https://github.com/5dive/5dive
+# Paired with the .path watcher; same rationale for disabling the rate
+# limit — a burst of writes from hermes can trip the service into
+# 'start-limit-hit' and leave the dir stuck at 0700.
+StartLimitIntervalSec=0
+
+[Service]
+# Mirrors the post-auth repair in 5dive-cli.sh (where it runs at agent-create
+# time). Pairs with 5dive-hermes-perms.path, which fires this on every write
+# inside the dir — covering the hermes auth.json/config.yaml chmod-back path
+# that's documented at 5dive-cli.sh:2759.
+Type=oneshot
+ExecStart=/bin/chmod 0775 /home/claude/.hermes

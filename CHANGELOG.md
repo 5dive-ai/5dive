@@ -11,6 +11,19 @@ release.
 
 ### Added
 
+- `install.sh` now installs the `5dive-hermes-perms.{path,service}` systemd
+  units alongside the agent template. Hermes regresses
+  `/home/claude/.hermes` to 0700 on every auth.json/config.yaml write,
+  blocking `agent-<name>` users (in the `claude` group) from traversing
+  to `venv/bin/hermes`. The path-unit watches the dir and the oneshot
+  chmods it back to 0775. These units used to live only in the
+  5dive-managed-cloud installer; moving them into OSS removes the last
+  drift point between the customer-VM provisioner and the OSS source.
+- `install.sh` now also pre-creates `/var/lib/5dive/agents.json` at mode
+  640 root:claude (was lazy-created on first `5dive agent create`) and
+  sets setgid 2750 on the state dirs so any file the root-only CLI
+  writes inherits the `claude` group, letting `agent-<name>` users read
+  their own per-agent env files.
 - `5dive doctor` gained a `channels` category that verifies
   `/etc/claude-code/managed-settings.json` carries `channelsEnabled: true`
   + a `telegram@5dive-plugins` entry, and reads each agent's latest

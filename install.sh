@@ -43,8 +43,28 @@ refresh_managed_files() {
   ok "5dive-refresh-plugins.sh → $BIN_DIR/5dive-refresh-plugins.sh"
 
   curl -fsSL "$REPO/systemd/5dive-agent%40.service" -o "$SYSTEMD_DIR/5dive-agent@.service"
-  systemctl daemon-reload
   ok "systemd template installed"
+
+  # hermes-perms watchdog — hermes resets /home/claude/.hermes to 0700 on
+  # every auth.json/config.yaml write, blocking agent-<name> users (in the
+  # `claude` group) from traversing to venv/bin/hermes. The .path unit
+  # watches the dir; the .service oneshot chmods it back to 0775.
+  curl -fsSL "$REPO/systemd/5dive-hermes-perms.path"    -o "$SYSTEMD_DIR/5dive-hermes-perms.path"
+  curl -fsSL "$REPO/systemd/5dive-hermes-perms.service" -o "$SYSTEMD_DIR/5dive-hermes-perms.service"
+  ok "hermes-perms units installed"
+
+  systemctl daemon-reload
+  # Pre-create the watched dir if it's missing so enabling the path unit
+  # doesn't immediately fail. The /home/claude user is created earlier in
+  # this script's install path; on --upgrade re-runs the dir is already
+  # there. Fail-soft: if /home/claude doesn't exist (atypical), skip.
+  if [[ -d /home/claude ]]; then
+    # setgid 2770: new files inherit the `claude` group, so agent-<name> users
+    # (in that group) can read auth state hermes writes — mirroring the perms
+    # established at host-install time in scripts/install/users.sh.
+    install -d -m 2770 -o claude -g claude /home/claude/.hermes
+    systemctl enable --now 5dive-hermes-perms.path >/dev/null 2>&1 || true
+  fi
 
   install -d -m 755 "$LIB_DIR" "$LIB_DIR/skills/notify-user"
   # Remove the deprecated sender-side PreToolUse mirror: it read the
@@ -160,12 +180,17 @@ if [[ "${1:-}" == "--uninstall" ]]; then
     fi
   fi
 
-  # 2. systemd template + reload
+  # 2. systemd units + reload
+  if [[ -f "$SYSTEMD_DIR/5dive-hermes-perms.path" ]]; then
+    systemctl disable --now 5dive-hermes-perms.path >/dev/null 2>&1 || true
+    rm -f "$SYSTEMD_DIR/5dive-hermes-perms.path" "$SYSTEMD_DIR/5dive-hermes-perms.service"
+    ok "removed hermes-perms units"
+  fi
   if [[ -f "$SYSTEMD_DIR/5dive-agent@.service" ]]; then
     rm -f "$SYSTEMD_DIR/5dive-agent@.service"
-    systemctl daemon-reload || true
     ok "removed systemd template"
   fi
+  systemctl daemon-reload || true
 
   # 3. Binaries + shared libs
   rm -f "$BIN_DIR/5dive" "$BIN_DIR/5dive-agent-start"
@@ -294,11 +319,22 @@ fi
 
 # Create directories
 say "Setting up 5dive directories"
-install -d -m 755 "$STATE_DIR"
-install -d -m 755 "$STATE_DIR/agents.d"
-install -d -m 755 "$CONNECTORS_DIR"
+# setgid 2750: agent-<name> users (in the claude group) need to traverse the
+# tree to read their own *.env, but no one outside the group should see the
+# registry. setgid keeps the group on any file written here by the root-only
+# CLI (registry rewrites, per-agent envs).
+install -d -m 2750 "$STATE_DIR"
+install -d -m 2750 "$STATE_DIR/agents.d"
+install -d -m 750  "$CONNECTORS_DIR"
 chown root:claude "$STATE_DIR" "$STATE_DIR/agents.d" "$CONNECTORS_DIR"
-chmod 750 "$CONNECTORS_DIR"
+# Pre-create an empty registry so the first `5dive agent create` doesn't race
+# the lazy-init path. Mode 640 root:claude — readable by the group, only root
+# can write.
+if [[ ! -f "$STATE_DIR/agents.json" ]]; then
+  echo '{"agents":{}}' > "$STATE_DIR/agents.json"
+  chown root:claude "$STATE_DIR/agents.json"
+  chmod 640 "$STATE_DIR/agents.json"
+fi
 ok "directories ready"
 
 # Install / refresh CLI binaries, systemd unit, hooks, and skills.
