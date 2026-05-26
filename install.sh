@@ -74,10 +74,15 @@ refresh_managed_files() {
   # are now allowlisted. Use install -m to preserve the file mode and
   # never clobber a customised entry: skip if the operator already
   # wrote one (e.g. with extra plugins of their own).
+  # channelsEnabled: claude code 2.1.150+ requires this flag for any
+  # allowedChannelPlugins entry to actually take effect. Without it,
+  # the allowlist is silently inert and inbound channel messages
+  # don't reach the session.
   install -d -m 755 /etc/claude-code
   if [[ ! -f /etc/claude-code/managed-settings.json ]]; then
     cat > /etc/claude-code/managed-settings.json <<'MANAGED'
 {
+  "channelsEnabled": true,
   "allowedChannelPlugins": [
     {"plugin": "telegram", "marketplace": "5dive-plugins"},
     {"plugin": "telegram", "marketplace": "claude-plugins-official"},
