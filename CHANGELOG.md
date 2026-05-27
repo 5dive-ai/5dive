@@ -9,6 +9,16 @@ release.
 
 ## [Unreleased]
 
+### Added
+
+- `install.sh` now stages the **5dive-cli skill** under
+  `/usr/local/lib/5dive/skills/5dive-cli/` (whole-directory: `SKILL.md` plus
+  `references/`). Pulled via tarball from `5dive-com/skills`, mirroring how
+  notify-user is staged. Pairs with the 5dive-api update.sh change that
+  refreshes every agent's installed copy from this stage on the daily 03:00
+  cron — so docs improvements (e.g. the new `task`/`org` reference sections)
+  reach existing agents instead of being frozen at agent-create time.
+
 ### Fixed
 
 - `5dive-agent-start` now dispatches `grok` and `antigravity`, fixing a

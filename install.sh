@@ -83,6 +83,29 @@ refresh_managed_files() {
   chmod 644 "$LIB_DIR/skills/notify-user/SKILL.md"
   ok "notify-user skill"
 
+  # Stage 5dive-cli skill (from 5dive-com/skills — separate repo from this
+  # CLI's source). Unlike notify-user which is a single SKILL.md, this one
+  # ships SKILL.md plus a references/ subdir, so we tarball the whole subdir
+  # in one shot. update.sh's per-agent refresh loop syncs from here, so an
+  # existing agent's 5dive-cli skill picks up upstream changes on the daily
+  # 03:00 cron instead of being frozen at agent-create time.
+  SKILLS_REPO_TARBALL="${SKILLS_REPO_TARBALL:-https://github.com/5dive-com/skills/archive/refs/heads/main.tar.gz}"
+  install -d -m 755 "$LIB_DIR/skills/5dive-cli"
+  _skill_tmp=$(mktemp -d)
+  if curl -fsSL "$SKILLS_REPO_TARBALL" \
+      | tar -xz -C "$_skill_tmp" --strip-components=1 'skills-main/5dive-cli' 2>/dev/null \
+      && [ -f "$_skill_tmp/5dive-cli/SKILL.md" ]; then
+    # cp -a preserves the source's references/ dir layout; --no-target-directory
+    # would clobber, so use the trailing slash + dot to copy contents.
+    cp -a "$_skill_tmp/5dive-cli/." "$LIB_DIR/skills/5dive-cli/"
+    find "$LIB_DIR/skills/5dive-cli" -type f -exec chmod 644 {} +
+    find "$LIB_DIR/skills/5dive-cli" -type d -exec chmod 755 {} +
+    ok "5dive-cli skill"
+  else
+    echo "warn: failed to stage 5dive-cli skill from $SKILLS_REPO_TARBALL — existing agents won't see updates until next try" >&2
+  fi
+  rm -rf "$_skill_tmp"
+
   # CLAUDE.md fragment that preseed_claude_agent drops into a telegram-paired
   # agent's $HOME/.claude/ so the per-turn reply mandate + AskUserQuestion /
   # ExitPlanMode warning ride with the agents that actually need them — not
