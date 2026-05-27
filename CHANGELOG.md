@@ -9,6 +9,30 @@ release.
 
 ## [Unreleased]
 
+## [0.1.8] — 2026-05-27
+
+### Added
+
+- **codex agents now support `--channels=telegram`.** `5dive agent create
+  --type=codex --channels=telegram --telegram-token=…
+  [--telegram-allowed-users=…]` wires the full telegram-codex bridge the same
+  one-flag way claude does: it writes the bot token to
+  `~/.codex/channels/telegram/.env`, seeds `access.json` from the allowlist,
+  and at first boot appends the `[mcp_servers.telegram]` block plus the
+  `Stop` / `PreToolUse` / `Notification` / `PermissionRequest` lifecycle hooks
+  to the agent's `config.toml`. codex's first-run "Hooks need review" TUI
+  prompt is auto-accepted once on first boot — codex then persists the trust to
+  `[hooks.state]` so restarts never re-prompt. (codex's
+  `--dangerously-bypass-hook-trust` flag only suppresses the gate for
+  non-interactive `codex exec`, not the TUI, so it isn't used.) The plugin is a
+  single shared checkout — resolved from `$TELEGRAM_CODEX_PLUGIN_DIR`,
+  `/usr/local/lib/5dive/telegram-codex`, or the `5dive-plugins` checkout, in
+  that order — and `server.ts` resolves each agent's own state dir from `$HOME`,
+  so one copy serves every codex agent. telegram only; no discord build for
+  codex yet. Note: customer VMs need the telegram-codex plugin deployed to
+  `/usr/local/lib/5dive/telegram-codex` (install.sh staging is a follow-up); on
+  the control-plane host the `5dive-plugins` checkout satisfies the resolver.
+
 ### Added
 
 - `install.sh` now stages the **5dive-cli skill** under

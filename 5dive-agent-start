@@ -82,6 +82,12 @@ case "$CHANNELS" in
   telegram)
     case "$TYPE" in
       claude) ARGS+=(--channels "plugin:telegram@${CM}") ;;
+      # codex wires the telegram MCP server + lifecycle hooks via config.toml
+      # (written below). codex's first-run "Hooks need review" TUI prompt is
+      # auto-accepted after launch (see the trust-accepter near the end of this
+      # script) — the --dangerously-bypass-hook-trust flag does NOT suppress
+      # that interactive gate (it only affects non-interactive `codex exec`).
+      codex)  : ;;
     esac ;;
   discord)
     case "$TYPE" in
@@ -148,6 +154,69 @@ check_for_update_on_startup = false
 trust_level = "trusted"
 TOML
     chmod 600 "$AGENT_CODEX_HOME/config.toml"
+  fi
+  # Wire the telegram-codex MCP server + lifecycle hooks into config.toml when
+  # this agent has the telegram channel. We append complete [sections] only
+  # when [mcp_servers.telegram] isn't already present — appending whole tables
+  # is TOML-safe (unlike bare keys after a table header, see note above), and
+  # the guard makes this idempotent across restarts and safe for the
+  # post-create channel-attach path (config.toml already exists from an earlier
+  # boot). Hook trust is handled by --dangerously-bypass-hook-trust (added to
+  # ARGS in the channels switch), so no [hooks.state] hashes are needed. The
+  # plugin is a single shared checkout; server.ts + the hooks resolve this
+  # agent's own ~/.codex/channels/telegram state via homedir(), so one copy
+  # serves every codex agent. Resolver kept in sync with codex_plugin_dir() in
+  # src/lib/agent_setup.sh.
+  if [[ "$CHANNELS" == "telegram" ]] \
+     && ! grep -q '^\[mcp_servers\.telegram\]' "$AGENT_CODEX_HOME/config.toml" 2>/dev/null; then
+    CODEX_PLUGIN_DIR=""
+    for _c in "${TELEGRAM_CODEX_PLUGIN_DIR:-}" \
+              /usr/local/lib/5dive/telegram-codex \
+              /home/claude/projects/5dive/5dive-plugins/plugins/telegram-codex; do
+      [[ -n "$_c" && -f "$_c/server.ts" ]] && { CODEX_PLUGIN_DIR="$_c"; break; }
+    done
+    if [[ -n "$CODEX_PLUGIN_DIR" ]]; then
+      cat >> "$AGENT_CODEX_HOME/config.toml" <<TOML
+
+[mcp_servers.telegram]
+command = "bun"
+args = ["${CODEX_PLUGIN_DIR}/server.ts"]
+
+[features]
+hooks = true
+
+[[hooks.Stop]]
+
+[[hooks.Stop.hooks]]
+type = "command"
+command = "bun ${CODEX_PLUGIN_DIR}/hooks/notify-stop.ts"
+async = false
+
+[[hooks.PreToolUse]]
+
+[[hooks.PreToolUse.hooks]]
+type = "command"
+command = "bun ${CODEX_PLUGIN_DIR}/hooks/silence-watchdog.ts"
+async = false
+
+[[hooks.Notification]]
+
+[[hooks.Notification.hooks]]
+type = "command"
+command = "bun ${CODEX_PLUGIN_DIR}/hooks/notification-relay.ts"
+async = false
+
+[[hooks.PermissionRequest]]
+
+[[hooks.PermissionRequest.hooks]]
+type = "command"
+command = "bun ${CODEX_PLUGIN_DIR}/hooks/request-permission.ts"
+timeout = 180
+async = false
+TOML
+    else
+      echo "warn: telegram channel set for codex agent '$NAME' but telegram-codex plugin not found (TELEGRAM_CODEX_PLUGIN_DIR / /usr/local/lib/5dive/telegram-codex / 5dive-plugins checkout) — MCP + hooks not wired" >&2
+    fi
   fi
   CODEX_OVERRIDE="export CODEX_HOME=$(printf %q "$AGENT_CODEX_HOME"); "
 fi
@@ -441,6 +510,32 @@ INNER="unset CLAUDE_CONFIG_DIR ${UNSET_CREDS}; ${CODEX_OVERRIDE}${PRELUDE}${LOOP
 
 /usr/bin/tmux new-session -d -s "$SESSION" -c "$WORKDIR" \
   "bash --login -c $(printf %q "$INNER")"
+
+# Auto-accept codex's first-run "Hooks need review" TUI prompt for telegram
+# codex agents. The prompt blocks an unattended agent until dismissed, and
+# codex's --dangerously-bypass-hook-trust flag doesn't suppress it (interactive
+# only). We can't pre-seed [hooks.state] because codex's trusted_hash is opaque
+# — so we let codex compute + persist it by selecting "Trust all and continue"
+# (Down, then Enter), exactly as a human would. Once persisted, codex never
+# prompts again, so we skip this entirely when [hooks.state] already exists.
+# Backgrounded so it never delays the session-watch below; bounded to the boot
+# window. Runs once per systemd start (codex respawns inside the tmux loop read
+# the persisted trust, so they never re-prompt).
+if [[ "$TYPE" == "codex" && "$CHANNELS" == "telegram" ]] \
+   && ! grep -q '^\[hooks\.state\]' "$AGENT_CODEX_HOME/config.toml" 2>/dev/null; then
+  (
+    for _ in $(seq 1 24); do
+      sleep 2
+      _pane="$(/usr/bin/tmux capture-pane -t "$SESSION" -p -S -60 2>/dev/null)" || break
+      if printf '%s' "$_pane" | grep -q "Hooks need review"; then
+        /usr/bin/tmux send-keys -t "$SESSION" Down
+        sleep 1
+        /usr/bin/tmux send-keys -t "$SESSION" Enter
+        break
+      fi
+    done
+  ) &
+fi
 
 # Block so systemd keeps the unit "active" as long as the session lives.
 while /usr/bin/tmux has-session -t "$SESSION" 2>/dev/null; do

@@ -326,7 +326,11 @@ cmd_create() {
   fi
 
   if [[ "$channels" != "none" ]] && [[ "${TYPE_CHANNELS[$type]}" != "1" ]]; then
-    fail "$E_VALIDATION" "type '$type' does not support channels (only: claude, openclaw, hermes)"
+    fail "$E_VALIDATION" "type '$type' does not support channels (only: claude, codex, openclaw, hermes)"
+  fi
+  # codex ships a telegram MCP bridge only — no discord build yet.
+  if [[ "$type" == "codex" && "$channels" == "discord" ]]; then
+    fail "$E_VALIDATION" "type 'codex' supports --channels=telegram only (no discord build)"
   fi
 
   # BYO API-key path for hermes/openclaw (--provider=<canonical> + --api-key=<key|->).

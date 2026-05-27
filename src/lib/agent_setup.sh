@@ -553,6 +553,123 @@ HERMES_BYO_ENV
   fi
 }
 
+# Resolve the telegram-codex plugin checkout. Ordered candidates so this works
+# on the 5dive control-plane host (the 5dive-plugins repo checkout) today and
+# on customer VMs once install.sh deploys the plugin into /usr/local/lib/5dive.
+# Override with TELEGRAM_CODEX_PLUGIN_DIR for offline / test installs. Prints
+# the dir on success; returns 1 if none has a server.ts. Kept in sync with the
+# identical resolver in 5dive-agent-start (the boot script is standalone, not
+# part of this bundle).
+codex_plugin_dir() {
+  local c
+  for c in "${TELEGRAM_CODEX_PLUGIN_DIR:-}" \
+           /usr/local/lib/5dive/telegram-codex \
+           /home/claude/projects/5dive/5dive-plugins/plugins/telegram-codex; do
+    [[ -n "$c" && -f "$c/server.ts" ]] && { printf '%s\n' "$c"; return 0; }
+  done
+  return 1
+}
+
+# Configure the telegram channel for a codex agent. Codex has no plugin
+# marketplace, so unlike claude there's nothing to install per-agent — a single
+# shared plugin checkout serves every codex agent (server.ts resolves its state
+# dir from the agent's own $HOME via homedir(), so per-agent isolation is
+# automatic). Here we just (1) write the bot token into the agent's
+# ~/.codex/channels/telegram/.env (the path the MCP server + pair.ts read) and
+# (2) seed access.json so the bot answers the operator on the first DM. The MCP
+# server + lifecycle hooks are wired into config.toml at boot by
+# 5dive-agent-start, which also launches codex with --dangerously-bypass-hook-trust.
+install_channel_for_codex_agent() {
+  local plugin="$1" name="$2" token="$3" allowed_users="${4:-}"
+  local user="agent-${name}"
+  id -u "$user" &>/dev/null || fail "$E_GENERIC" "agent user missing: $user"
+  [[ "$plugin" == "telegram" ]] \
+    || fail "$E_VALIDATION" "codex channel plugin unsupported: $plugin (telegram only)"
+  [[ -n "$token" ]] || fail "$E_VALIDATION" "codex telegram channel requires a bot token"
+  if [[ -n "$allowed_users" ]]; then
+    valid_telegram_chat_id_list "$allowed_users" \
+      || fail "$E_VALIDATION" "invalid allowed_users (comma-separated numeric ids)"
+  fi
+
+  # Fail fast at create time if the plugin isn't deployed — otherwise
+  # 5dive-agent-start would boot the agent with no telegram bridge wired and
+  # the failure would only surface in journalctl.
+  codex_plugin_dir >/dev/null \
+    || fail "$E_NOT_INSTALLED" \
+       "telegram-codex plugin not found (looked in /usr/local/lib/5dive/telegram-codex and the 5dive-plugins checkout). Set TELEGRAM_CODEX_PLUGIN_DIR or deploy the plugin."
+
+  # bun runs server.ts + the hooks; fail fast like the claude installer does so
+  # the frontend can show a clear message instead of a crash loop.
+  if ! sudo -u "$user" -i bash -lc 'command -v bun' >/dev/null 2>&1; then
+    fail "$E_NOT_INSTALLED" \
+      "bun not on PATH for $user (required by telegram-codex). Run: sudo 5dive doctor --repair"
+  fi
+
+  # Write the bot token into ~/.codex/channels/telegram/.env. Strip-then-append
+  # the TELEGRAM_BOT_TOKEN line so a rotated token doesn't leave a stale value;
+  # tmpfile + mv so a crash mid-write can't blank the file.
+  step "Writing telegram token into ~/.codex/channels/telegram/.env for $user"
+  if ! sudo -u "$user" -H env TOKEN="$token" bash -s >&2 <<'CODEX_ENV'
+set -euo pipefail
+mkdir -p "$HOME/.codex/channels/telegram"
+chmod 700 "$HOME/.codex" "$HOME/.codex/channels" "$HOME/.codex/channels/telegram" 2>/dev/null || true
+ENV_FILE="$HOME/.codex/channels/telegram/.env"
+touch "$ENV_FILE"; chmod 600 "$ENV_FILE"
+TMP=$(mktemp --tmpdir="$HOME/.codex/channels/telegram" .env.XXXXXX); chmod 600 "$TMP"
+grep -v '^TELEGRAM_BOT_TOKEN=' "$ENV_FILE" > "$TMP" || true
+printf 'TELEGRAM_BOT_TOKEN=%s\n' "$TOKEN" >> "$TMP"
+mv "$TMP" "$ENV_FILE"
+CODEX_ENV
+  then
+    fail "$E_GENERIC" "codex telegram .env write failed for agent '$name'"
+  fi
+
+  # Seed the allowlist so the operator's DMs reach codex on the first message.
+  if [[ -n "$allowed_users" ]]; then
+    seed_codex_telegram_access "$name" "$allowed_users"
+  fi
+}
+
+# Write ~/.codex/channels/telegram/access.json for agent-<name> with allowFrom
+# seeded from a CSV of user ids. Idempotent — merges into an existing file so
+# re-running only adds new ids. Matches the {allowFrom, groups} schema the codex
+# server + pair.ts use (allowFrom is an array of string ids).
+seed_codex_telegram_access() {
+  local name="$1" allowed_users="$2"
+  local user="agent-${name}"
+  step "Pre-seeding codex telegram allowlist for $user (${allowed_users})"
+  if ! sudo -u "$user" env CSV="$allowed_users" python3 - <<'PY' >&2; then
+import json, os, tempfile
+
+state = os.path.join(os.path.expanduser('~'), '.codex', 'channels', 'telegram')
+os.makedirs(state, mode=0o700, exist_ok=True)
+access_path = os.path.join(state, 'access.json')
+ids = [s.strip() for s in os.environ['CSV'].split(',') if s.strip()]
+
+try:
+    with open(access_path) as f:
+        data = json.load(f)
+except FileNotFoundError:
+    data = {"allowFrom": [], "groups": {}}
+
+allow = list(data.get('allowFrom') or [])
+for s in ids:
+    if s not in allow:
+        allow.append(s)
+data['allowFrom'] = allow
+data.setdefault('groups', {})
+
+fd, tmp = tempfile.mkstemp(dir=state, prefix='.access.', suffix='.tmp')
+with os.fdopen(fd, 'w') as f:
+    json.dump(data, f, indent=2)
+os.chmod(tmp, 0o600)
+os.replace(tmp, access_path)
+print(f"Seeded allowFrom={allow} into {access_path}")
+PY
+    fail "$E_GENERIC" "codex telegram access.json pre-seed failed for agent '$name'"
+  fi
+}
+
 # Single dispatch point used by cmd_create. Routes a (type, plugin) pair to
 # the right install helper above, so the create flow stays type-agnostic.
 # home_channel/allowed_users are hermes-telegram extras (ignored by other
@@ -561,6 +678,7 @@ install_channel_for_agent() {
   local type="$1" plugin="$2" name="$3" token="$4" home_channel="${5:-}" allowed_users="${6:-}"
   case "$type" in
     claude)   install_channel_plugin_for_agent "$plugin" "$name" "$allowed_users" ;;
+    codex)    install_channel_for_codex_agent "$plugin" "$name" "$token" "$allowed_users" ;;
     openclaw) install_channel_for_openclaw_agent "$plugin" "$name" "$token" "$home_channel" "$allowed_users" ;;
     hermes)   install_channel_for_hermes_agent "$plugin" "$name" "$token" "$home_channel" "$allowed_users" ;;
     *) fail "$E_VALIDATION" "type '$type' does not support channels" ;;

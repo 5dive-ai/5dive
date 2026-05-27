@@ -26,7 +26,7 @@ esac
 
 # Bumped on every public release. `build.sh` checks this line exists; CI fails
 # the bundle-drift check if it's missing or empty.
-readonly FIVE_VERSION="0.1.7"
+readonly FIVE_VERSION="0.1.8"
 
 STATE_DIR="/var/lib/5dive"
 REGISTRY="${STATE_DIR}/agents.json"
@@ -106,12 +106,17 @@ declare -A TYPE_BIN=(
 #              `pairing` subcommand handles inbound user approvals separately.
 #   hermes   — writes TELEGRAM_BOT_TOKEN / DISCORD_BOT_TOKEN to the agent
 #              user's ~/.hermes/.env; hermes' gateway picks it up at startup.
+#   codex    — writes the bot token + access.json into the agent user's
+#              ~/.codex/channels/telegram/; 5dive-agent-start wires the
+#              telegram-codex MCP server + lifecycle hooks into config.toml
+#              and launches codex with --dangerously-bypass-hook-trust.
+#              telegram only (no discord build for codex yet).
 # Only claude needs the pair-code roundtrip — see cmd_pair's dispatch.
 declare -A TYPE_CHANNELS=(
   [claude]=1
   [openclaw]=1
   [hermes]=1
-  [codex]=0
+  [codex]=1
   [opencode]=0
   [antigravity]=0
   [grok]=0
