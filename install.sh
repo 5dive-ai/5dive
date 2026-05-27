@@ -106,6 +106,43 @@ refresh_managed_files() {
   fi
   rm -rf "$_skill_tmp"
 
+  # Stage the telegram-codex plugin (from 5dive-com/5dive-plugins). Codex has
+  # no plugin marketplace, so unlike claude there's nothing to install per
+  # agent — its MCP server + lifecycle hooks run from this one shared checkout.
+  # 5dive-agent-start points each codex+telegram agent's config.toml at
+  # $LIB_DIR/telegram-codex/{server.ts,hooks/*.ts}, and server.ts resolves each
+  # agent's own state dir from $HOME, so a single staged copy serves every
+  # codex agent. Whole-subdir tarball (like 5dive-cli above), then `bun install`
+  # the runtime deps (grammy) so the hooks/server actually run. cp -a overlays
+  # the source onto any existing copy so node_modules survives across --upgrade
+  # refreshes; bun reconciles deps against the (possibly updated) lockfile.
+  CODEX_PLUGIN_TARBALL="${CODEX_PLUGIN_TARBALL:-https://github.com/5dive-com/5dive-plugins/archive/refs/heads/main.tar.gz}"
+  _cdx_tmp=$(mktemp -d)
+  if curl -fsSL "$CODEX_PLUGIN_TARBALL" \
+      | tar -xz -C "$_cdx_tmp" --strip-components=1 '5dive-plugins-main/plugins/telegram-codex' 2>/dev/null \
+      && [ -f "$_cdx_tmp/plugins/telegram-codex/server.ts" ]; then
+    install -d -m 755 "$LIB_DIR/telegram-codex"
+    cp -a "$_cdx_tmp/plugins/telegram-codex/." "$LIB_DIR/telegram-codex/"
+    # bun lives in claude's home; install deps as claude (needs write on the
+    # staged dir), then make the tree world-readable+traversable so every
+    # agent-<name> user (incl. ones outside the claude group) can run
+    # server.ts + the hooks.
+    if id -u claude >/dev/null 2>&1; then
+      chown -R claude:claude "$LIB_DIR/telegram-codex"
+      if sudo -u claude -H bash -lc "cd $(printf %q "$LIB_DIR/telegram-codex") && bun install --production --ignore-scripts --no-progress --no-summary" >/dev/null 2>&1; then
+        chmod -R a+rX "$LIB_DIR/telegram-codex"
+        ok "telegram-codex plugin"
+      else
+        echo "warn: bun install for telegram-codex failed — codex+telegram agents won't have the bridge until the next successful refresh" >&2
+      fi
+    else
+      echo "warn: no claude user — skipping telegram-codex bun install" >&2
+    fi
+  else
+    echo "warn: failed to stage telegram-codex from $CODEX_PLUGIN_TARBALL — codex+telegram won't be available until the next successful refresh" >&2
+  fi
+  rm -rf "$_cdx_tmp"
+
   # CLAUDE.md fragment that preseed_claude_agent drops into a telegram-paired
   # agent's $HOME/.claude/ so the per-turn reply mandate + AskUserQuestion /
   # ExitPlanMode warning ride with the agents that actually need them — not

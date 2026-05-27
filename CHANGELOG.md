@@ -9,6 +9,25 @@ release.
 
 ## [Unreleased]
 
+## [0.1.9] — 2026-05-27
+
+### Added
+
+- `install.sh` now stages the **telegram-codex plugin** into
+  `/usr/local/lib/5dive/telegram-codex` — a whole-subdir tarball from
+  `5dive-com/5dive-plugins` plus `bun install --production` of its runtime deps
+  (grammy). This is what makes codex `--channels=telegram` (shipped in 0.1.8)
+  work on customer VMs and not just hosts with a `5dive-plugins` checkout:
+  codex has no plugin marketplace, so its MCP server + lifecycle hooks run from
+  this one shared copy, and `5dive-agent-start` already resolves
+  `/usr/local/lib/5dive/telegram-codex` ahead of the dev checkout. `server.ts`
+  resolves each agent's own state dir from `$HOME`, so a single staged copy
+  serves every codex agent. Staging lives in `refresh_managed_files`, so the
+  daily `update.sh` → `install.sh --upgrade` cron stages/refreshes it on
+  existing VMs too (no separate update.sh change needed). Override the source
+  with `CODEX_PLUGIN_TARBALL`; fail-soft (warns, doesn't abort the install) if
+  the fetch or `bun install` fails.
+
 ## [0.1.8] — 2026-05-27
 
 ### Added
