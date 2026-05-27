@@ -369,6 +369,24 @@ case "$TYPE" in
     UNSET_CREDS="" ;;
 esac
 
+# One-shot session resume (claude only): the telegram plugin's /resume writes
+# the checkpointed session id to $HOME/.claude/channels/telegram/resume-next
+# and triggers this unit restart. We add `--resume <id>` to the FIRST claude
+# launch of this run, then start fresh on any later loop respawn — so a crash
+# or normal exit returns to a clean session rather than re-loading the old one.
+# The marker is consumed (deleted) regardless of validity so a stuck file can't
+# wedge the agent into permanent resume. The id is validated to a UUID shape
+# before it ever reaches the claude argv.
+RESUME_ID=""
+if [[ "$TYPE" == "claude" ]]; then
+  RESUME_MARKER="$HOME/.claude/channels/telegram/resume-next"
+  if [[ -s "$RESUME_MARKER" ]]; then
+    _cand="$(head -n1 "$RESUME_MARKER" | tr -d '[:space:]')"
+    [[ "$_cand" =~ ^[0-9a-fA-F-]{36}$ ]] && RESUME_ID="$_cand"
+    rm -f "$RESUME_MARKER"
+  fi
+fi
+
 CMD_STR=$(printf '%q ' "$BIN" "${ARGS[@]}")
 
 # First-attach onboarding for openclaw with no channel: openclaw chat is the
@@ -384,7 +402,17 @@ if [[ "$TYPE" == "openclaw" ]] && [[ "$CHANNELS" == "none" || -z "$CHANNELS" ]];
   PRELUDE="[[ -e ${SENTINEL_Q} ]] || { mkdir -p $(printf %q "$HOME/.openclaw"); ${BIN_Q} configure; touch ${SENTINEL_Q}; }; "
 fi
 
-INNER="unset CLAUDE_CONFIG_DIR ${UNSET_CREDS}; ${CODEX_OVERRIDE}${PRELUDE}while true; do ${CMD_STR}; sleep 2; done"
+# When a resume id is armed, the first loop iteration launches with
+# `--resume <id>`; subsequent respawns fall back to the plain CMD_STR. No
+# resume id → byte-identical to the original simple loop.
+if [[ -n "$RESUME_ID" ]]; then
+  CMD_STR_FIRST=$(printf '%q ' "$BIN" --resume "$RESUME_ID" "${ARGS[@]}")
+  LOOP="__first=1; while true; do if [[ \$__first == 1 ]]; then ${CMD_STR_FIRST}; __first=0; else ${CMD_STR}; fi; sleep 2; done"
+else
+  LOOP="while true; do ${CMD_STR}; sleep 2; done"
+fi
+
+INNER="unset CLAUDE_CONFIG_DIR ${UNSET_CREDS}; ${CODEX_OVERRIDE}${PRELUDE}${LOOP}"
 [[ -n "$PROFILE" ]] && echo "[5dive] agent=${NAME} using auth-profile=${PROFILE}" >&2
 
 /usr/bin/tmux new-session -d -s "$SESSION" -c "$WORKDIR" \
