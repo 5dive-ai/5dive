@@ -9,6 +9,22 @@ release.
 
 ## [Unreleased]
 
+### Added
+
+- Inter-agent mirror can post into a forum topic: when the group entry in
+  `access.json` carries a `message_thread_id`, mirrored `agent send`/`ask`
+  traffic lands in that thread (e.g. a dedicated "#5dive" topic) instead of
+  the supergroup's General channel.
+
+### Fixed
+
+- Inter-agent mirror now survives a group→supergroup migration. Upgrading a
+  paired group to a supergroup (also how it gains forum topics) changes its
+  chat id, and Telegram rejects sends to the old id with
+  `migrate_to_chat_id`. The mirror now follows that, rewrites the stored group
+  id in `access.json` (preserving owner/mode + the thread id), and retries —
+  instead of silently posting nothing.
+
 ## [0.1.7] — 2026-05-27
 
 ### Added

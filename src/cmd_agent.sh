@@ -1970,6 +1970,12 @@ mirror_interagent_outbound() {
   group_chat_id=$(jq -r '(.groups // {}) | keys | .[0] // empty' "$access_file" 2>/dev/null)
   [[ -n "$group_chat_id" ]] || return 0
 
+  # Optional forum-topic routing: if the group entry carries a
+  # message_thread_id, post into that topic (e.g. a dedicated "#5dive" thread)
+  # instead of the supergroup's General channel.
+  local thread_id
+  thread_id=$(jq -r --arg g "$group_chat_id" '.groups[$g].message_thread_id // empty' "$access_file" 2>/dev/null)
+
   local trimmed
   trimmed=$(printf '%s' "$body" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
   [[ -n "$trimmed" ]] || return 0
@@ -1992,10 +1998,60 @@ mirror_interagent_outbound() {
 
   local mirror_text
   mirror_text=$(printf '%s\n%s%s' "$to_label" "$body_disp" "$overflow")
-  curl -s -X POST "https://api.telegram.org/bot${token}/sendMessage" \
-    --data-urlencode "chat_id=${group_chat_id}" \
-    --data-urlencode "text=${mirror_text}" \
-    -o /dev/null 2>/dev/null || true
+  _mirror_post "$token" "$group_chat_id" "$thread_id" "$mirror_text" "$access_file"
+}
+
+# POST a mirror message, threading into message_thread_id when set. Auto-follows
+# a group→supergroup migration: once a group is upgraded (which is also how it
+# gains forum topics), Telegram rejects sends to the old basic-group id with
+# parameters.migrate_to_chat_id. On that error we rewrite the stored group id
+# and retry once against the new supergroup id, so the mirror self-heals instead
+# of silently dying. Best-effort throughout — a mirror post is never load-bearing.
+_mirror_post() {
+  local token="$1" chat="$2" thread="$3" text="$4" access_file="$5"
+  local resp
+  resp=$(_mirror_send "$token" "$chat" "$thread" "$text")
+  [[ -n "$resp" ]] || return 0
+  [[ "$(jq -r '.ok // false' <<<"$resp" 2>/dev/null)" == "true" ]] && return 0
+
+  local new_chat
+  new_chat=$(jq -r '.parameters.migrate_to_chat_id // empty' <<<"$resp" 2>/dev/null)
+  if [[ -n "$new_chat" && "$new_chat" != "$chat" ]]; then
+    _mirror_follow_migration "$access_file" "$chat" "$new_chat"
+    _mirror_send "$token" "$new_chat" "$thread" "$text" >/dev/null 2>&1 || true
+  fi
+}
+
+_mirror_send() {
+  local token="$1" chat="$2" thread="$3" text="$4"
+  if [[ -n "$thread" ]]; then
+    curl -s -X POST "https://api.telegram.org/bot${token}/sendMessage" \
+      --data-urlencode "chat_id=${chat}" \
+      --data-urlencode "message_thread_id=${thread}" \
+      --data-urlencode "text=${text}" 2>/dev/null
+  else
+    curl -s -X POST "https://api.telegram.org/bot${token}/sendMessage" \
+      --data-urlencode "chat_id=${chat}" \
+      --data-urlencode "text=${text}" 2>/dev/null
+  fi
+}
+
+# Rename a migrated group's key (old→new) in access.json, preserving the policy
+# value (incl. message_thread_id) and the file's owner/mode. Runs as root (the
+# mirror only fires under sudo), so chowning back to the agent owner is required
+# — otherwise the plugin, running as the agent user, could no longer write it.
+_mirror_follow_migration() {
+  local access_file="$1" old="$2" new="$3"
+  local tmp="${access_file}.migrate.$$" owner
+  owner=$(stat -c '%U:%G' "$access_file" 2>/dev/null)
+  jq --arg o "$old" --arg n "$new" '
+    if (.groups // {}) | has($o)
+    then (.groups[$n] = .groups[$o]) | del(.groups[$o])
+    else . end
+  ' "$access_file" > "$tmp" 2>/dev/null || { rm -f "$tmp"; return 0; }
+  [[ -n "$owner" ]] && chown "$owner" "$tmp" 2>/dev/null
+  chmod 600 "$tmp" 2>/dev/null
+  mv "$tmp" "$access_file" 2>/dev/null || rm -f "$tmp" 2>/dev/null
 }
 
 # Inject a message into the agent's tmux session. Uses send-keys -l so the text
