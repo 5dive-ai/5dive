@@ -26,7 +26,7 @@ esac
 
 # Bumped on every public release. `build.sh` checks this line exists; CI fails
 # the bundle-drift check if it's missing or empty.
-readonly FIVE_VERSION="0.1.10"
+readonly FIVE_VERSION="0.1.11"
 
 STATE_DIR="/var/lib/5dive"
 REGISTRY="${STATE_DIR}/agents.json"
@@ -111,15 +111,20 @@ declare -A TYPE_BIN=(
 #              telegram-codex MCP server + lifecycle hooks into config.toml
 #              and launches codex with --dangerously-bypass-hook-trust.
 #              telegram only (no discord build for codex yet).
+#   grok     — same shape as codex: writes ~/.grok/channels/telegram/{.env,
+#              access.json}; 5dive-agent-start writes [mcp_servers.telegram]
+#              + [[hooks.*]] into ~/.grok/config.toml. grok runs with
+#              --always-approve (set in 5dive-agent-start), which also
+#              auto-trusts plugin/MCP commands. telegram only.
 # Only claude needs the pair-code roundtrip — see cmd_pair's dispatch.
 declare -A TYPE_CHANNELS=(
   [claude]=1
   [openclaw]=1
   [hermes]=1
   [codex]=1
+  [grok]=1
   [opencode]=0
   [antigravity]=0
-  [grok]=0
 )
 # Auth sentinel per type. Agent users run as agent-<name> (in group `claude`)
 # and cannot read /home/claude/.claude/settings.json (mode 0600), so for

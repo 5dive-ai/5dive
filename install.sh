@@ -143,6 +143,34 @@ refresh_managed_files() {
   fi
   rm -rf "$_cdx_tmp"
 
+  # Stage the telegram-grok plugin — same shape as telegram-codex above. grok
+  # also has no plugin marketplace; its MCP server + lifecycle hooks run from
+  # this one shared checkout via absolute paths written into ~/.grok/config.toml
+  # by 5dive-agent-start. Override the tarball with GROK_PLUGIN_TARBALL for
+  # offline / test installs.
+  GROK_PLUGIN_TARBALL="${GROK_PLUGIN_TARBALL:-https://github.com/5dive-com/5dive-plugins/archive/refs/heads/main.tar.gz}"
+  _grk_tmp=$(mktemp -d)
+  if curl -fsSL "$GROK_PLUGIN_TARBALL" \
+      | tar -xz -C "$_grk_tmp" --strip-components=1 '5dive-plugins-main/plugins/telegram-grok' 2>/dev/null \
+      && [ -f "$_grk_tmp/plugins/telegram-grok/server.ts" ]; then
+    install -d -m 755 "$LIB_DIR/telegram-grok"
+    cp -a "$_grk_tmp/plugins/telegram-grok/." "$LIB_DIR/telegram-grok/"
+    if id -u claude >/dev/null 2>&1; then
+      chown -R claude:claude "$LIB_DIR/telegram-grok"
+      if sudo -u claude -H bash -lc "cd $(printf %q "$LIB_DIR/telegram-grok") && bun install --production --ignore-scripts --no-progress --no-summary" >/dev/null 2>&1; then
+        chmod -R a+rX "$LIB_DIR/telegram-grok"
+        ok "telegram-grok plugin"
+      else
+        echo "warn: bun install for telegram-grok failed — grok+telegram agents won't have the bridge until the next successful refresh" >&2
+      fi
+    else
+      echo "warn: no claude user — skipping telegram-grok bun install" >&2
+    fi
+  else
+    echo "warn: failed to stage telegram-grok from $GROK_PLUGIN_TARBALL — grok+telegram won't be available until the next successful refresh" >&2
+  fi
+  rm -rf "$_grk_tmp"
+
   # CLAUDE.md fragment that preseed_claude_agent drops into a telegram-paired
   # agent's $HOME/.claude/ so the per-turn reply mandate + AskUserQuestion /
   # ExitPlanMode warning ride with the agents that actually need them — not

@@ -9,6 +9,24 @@ release.
 
 ## [Unreleased]
 
+## [0.1.11] — 2026-05-28
+
+### Added
+
+- `grok --channels=telegram`. New `install_channel_for_grok_agent` writes
+  the bot token + access.json into `~/.grok/channels/telegram/`, and
+  `5dive-agent-start` now wires the telegram-grok MCP server +
+  Stop/PreToolUse/Notification hooks into `~/.grok/config.toml` (absolute
+  paths — `${GROK_PLUGIN_ROOT}` isn't documented for MCP command/args in
+  grok 0.1.x, so we expand at boot). Mirrors the codex provisioning
+  pattern (0.1.8) end-to-end. The launcher's existing `--always-approve`
+  flag auto-trusts MCP/hook commands, so no separate trust-bypass step is
+  needed.
+- `install.sh` stages the telegram-grok plugin into
+  `/usr/local/lib/5dive/telegram-grok` for customer VMs (same shape as
+  the codex staging shipped in 0.1.9 — `5dive-agent-start`'s plugin
+  resolver checks that path first).
+
 ## [0.1.10] — 2026-05-28
 
 ### Fixed

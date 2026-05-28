@@ -223,6 +223,86 @@ TOML
   CODEX_OVERRIDE="export CODEX_HOME=$(printf %q "$AGENT_CODEX_HOME"); "
 fi
 
+# Wire the telegram-grok MCP server + lifecycle hooks for this grok agent
+# when channels=telegram. Same shape as the codex block above: a single shared
+# plugin checkout serves every grok agent (server.ts + hooks resolve state
+# from $HOME via homedir()). grok's --always-approve flag (set in ARGS above)
+# auto-trusts plugin/MCP commands so no separate trust-bypass step is needed.
+#
+# Two files because grok splits the surface:
+#   1. ~/.grok/config.toml  → [mcp_servers.telegram] only. ${GROK_PLUGIN_ROOT}
+#      isn't expanded in MCP command/args in grok 0.1.x, so we write absolute
+#      paths at boot. Idempotent: skipped when the [mcp_servers.telegram]
+#      header is already present.
+#   2. ~/.grok/hooks/5dive-telegram.json → lifecycle hooks. Grok ignores
+#      [[hooks.*]] inside config.toml and only loads ~/.grok/hooks/*.json
+#      (verified via `grok inspect` — hooks defined in config.toml never show
+#      up in the merged set). Atomic mv-into-place so we can re-render on
+#      every boot to pick up plugin-dir changes without leaving a partial
+#      file under a crash.
+if [[ "$TYPE" == "grok" ]] && [[ "$CHANNELS" == "telegram" ]]; then
+  AGENT_GROK_HOME="$HOME/.grok"
+  install -d -m 700 "$AGENT_GROK_HOME"
+  GROK_PLUGIN_DIR=""
+  for _c in "${TELEGRAM_GROK_PLUGIN_DIR:-}" \
+            /usr/local/lib/5dive/telegram-grok \
+            /home/claude/projects/5dive/5dive-plugins/plugins/telegram-grok; do
+    [[ -n "$_c" && -f "$_c/server.ts" ]] && { GROK_PLUGIN_DIR="$_c"; break; }
+  done
+  if [[ -n "$GROK_PLUGIN_DIR" ]]; then
+    if [[ ! -f "$AGENT_GROK_HOME/config.toml" ]]; then
+      : > "$AGENT_GROK_HOME/config.toml"
+      chmod 600 "$AGENT_GROK_HOME/config.toml"
+    fi
+    if ! grep -q '^\[mcp_servers\.telegram\]' "$AGENT_GROK_HOME/config.toml" 2>/dev/null; then
+      # tool_timeouts.wait_for_message: server.ts caps wait at 50s by default;
+      # grok's tool_timeout_sec defaults to 60. Bump to 60s so an idle poll
+      # near the boundary doesn't get killed by the outer timeout.
+      cat >> "$AGENT_GROK_HOME/config.toml" <<TOML
+
+[mcp_servers.telegram]
+command = "bun"
+args = ["${GROK_PLUGIN_DIR}/server.ts"]
+tool_timeouts = { wait_for_message = 60 }
+TOML
+    fi
+
+    install -d -m 700 "$AGENT_GROK_HOME/hooks"
+    HOOKS_TMP=$(mktemp -p "$AGENT_GROK_HOME/hooks" .5dive-telegram.json.XXXXXX)
+    cat > "$HOOKS_TMP" <<HOOKS_JSON
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "hooks": [
+          { "type": "command", "command": "bun ${GROK_PLUGIN_DIR}/hooks/silence-watchdog.ts", "timeout": 5 }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          { "type": "command", "command": "bun ${GROK_PLUGIN_DIR}/hooks/notify-stop.ts", "timeout": 10 }
+        ]
+      }
+    ],
+    "Notification": [
+      {
+        "hooks": [
+          { "type": "command", "command": "bun ${GROK_PLUGIN_DIR}/hooks/notification-relay.ts", "timeout": 10 }
+        ]
+      }
+    ]
+  }
+}
+HOOKS_JSON
+    chmod 600 "$HOOKS_TMP"
+    mv "$HOOKS_TMP" "$AGENT_GROK_HOME/hooks/5dive-telegram.json"
+  else
+    echo "warn: telegram channel set for grok agent '$NAME' but telegram-grok plugin not found (TELEGRAM_GROK_PLUGIN_DIR / /usr/local/lib/5dive/telegram-grok / 5dive-plugins checkout) — MCP + hooks not wired" >&2
+  fi
+fi
+
 # Same shared/0600 problem as codex: hermes writes ~/.hermes/auth.json with
 # mode 0600 after `hermes auth add openai-codex`. agent-<name> can't read a
 # 0600 file owned by `claude` even though it's in the claude group. Seed the

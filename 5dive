@@ -26,7 +26,7 @@ esac
 
 # Bumped on every public release. `build.sh` checks this line exists; CI fails
 # the bundle-drift check if it's missing or empty.
-readonly FIVE_VERSION="0.1.10"
+readonly FIVE_VERSION="0.1.11"
 
 STATE_DIR="/var/lib/5dive"
 REGISTRY="${STATE_DIR}/agents.json"
@@ -111,15 +111,20 @@ declare -A TYPE_BIN=(
 #              telegram-codex MCP server + lifecycle hooks into config.toml
 #              and launches codex with --dangerously-bypass-hook-trust.
 #              telegram only (no discord build for codex yet).
+#   grok     — same shape as codex: writes ~/.grok/channels/telegram/{.env,
+#              access.json}; 5dive-agent-start writes [mcp_servers.telegram]
+#              + [[hooks.*]] into ~/.grok/config.toml. grok runs with
+#              --always-approve (set in 5dive-agent-start), which also
+#              auto-trusts plugin/MCP commands. telegram only.
 # Only claude needs the pair-code roundtrip — see cmd_pair's dispatch.
 declare -A TYPE_CHANNELS=(
   [claude]=1
   [openclaw]=1
   [hermes]=1
   [codex]=1
+  [grok]=1
   [opencode]=0
   [antigravity]=0
-  [grok]=0
 )
 # Auth sentinel per type. Agent users run as agent-<name> (in group `claude`)
 # and cannot read /home/claude/.claude/settings.json (mode 0600), so for
@@ -1261,6 +1266,110 @@ PY
   fi
 }
 
+# Resolve the telegram-grok plugin checkout. Same shape as codex_plugin_dir
+# above — control-plane host uses the 5dive-plugins repo checkout, customer
+# VMs use /usr/local/lib/5dive once install.sh deploys it. Override with
+# TELEGRAM_GROK_PLUGIN_DIR for offline / test installs. The matching resolver
+# in 5dive-agent-start is intentionally duplicated (the boot script is
+# standalone).
+grok_plugin_dir() {
+  local c
+  for c in "${TELEGRAM_GROK_PLUGIN_DIR:-}" \
+           /usr/local/lib/5dive/telegram-grok \
+           /home/claude/projects/5dive/5dive-plugins/plugins/telegram-grok; do
+    [[ -n "$c" && -f "$c/server.ts" ]] && { printf '%s\n' "$c"; return 0; }
+  done
+  return 1
+}
+
+# Configure the telegram channel for a grok agent. Structurally identical to
+# install_channel_for_codex_agent — grok has no plugin marketplace, so a single
+# shared plugin checkout serves every grok agent (server.ts resolves its state
+# dir from the agent's own $HOME via homedir()). We (1) write the bot token
+# into ~/.grok/channels/telegram/.env and (2) seed access.json. The MCP server
+# + lifecycle hooks are wired into ~/.grok/config.toml at boot by
+# 5dive-agent-start. grok runs with --always-approve, which also auto-trusts
+# plugin/MCP commands — no separate trust-bypass flag needed.
+install_channel_for_grok_agent() {
+  local plugin="$1" name="$2" token="$3" allowed_users="${4:-}"
+  local user="agent-${name}"
+  id -u "$user" &>/dev/null || fail "$E_GENERIC" "agent user missing: $user"
+  [[ "$plugin" == "telegram" ]] \
+    || fail "$E_VALIDATION" "grok channel plugin unsupported: $plugin (telegram only)"
+  [[ -n "$token" ]] || fail "$E_VALIDATION" "grok telegram channel requires a bot token"
+  if [[ -n "$allowed_users" ]]; then
+    valid_telegram_chat_id_list "$allowed_users" \
+      || fail "$E_VALIDATION" "invalid allowed_users (comma-separated numeric ids)"
+  fi
+
+  grok_plugin_dir >/dev/null \
+    || fail "$E_NOT_INSTALLED" \
+       "telegram-grok plugin not found (looked in /usr/local/lib/5dive/telegram-grok and the 5dive-plugins checkout). Set TELEGRAM_GROK_PLUGIN_DIR or deploy the plugin."
+
+  if ! sudo -u "$user" -i bash -lc 'command -v bun' >/dev/null 2>&1; then
+    fail "$E_NOT_INSTALLED" \
+      "bun not on PATH for $user (required by telegram-grok). Run: sudo 5dive doctor --repair"
+  fi
+
+  step "Writing telegram token into ~/.grok/channels/telegram/.env for $user"
+  if ! sudo -u "$user" -H env TOKEN="$token" bash -s >&2 <<'GROK_ENV'
+set -euo pipefail
+mkdir -p "$HOME/.grok/channels/telegram"
+chmod 700 "$HOME/.grok" "$HOME/.grok/channels" "$HOME/.grok/channels/telegram" 2>/dev/null || true
+ENV_FILE="$HOME/.grok/channels/telegram/.env"
+touch "$ENV_FILE"; chmod 600 "$ENV_FILE"
+TMP=$(mktemp --tmpdir="$HOME/.grok/channels/telegram" .env.XXXXXX); chmod 600 "$TMP"
+grep -v '^TELEGRAM_BOT_TOKEN=' "$ENV_FILE" > "$TMP" || true
+printf 'TELEGRAM_BOT_TOKEN=%s\n' "$TOKEN" >> "$TMP"
+mv "$TMP" "$ENV_FILE"
+GROK_ENV
+  then
+    fail "$E_GENERIC" "grok telegram .env write failed for agent '$name'"
+  fi
+
+  if [[ -n "$allowed_users" ]]; then
+    seed_grok_telegram_access "$name" "$allowed_users"
+  fi
+}
+
+# Write ~/.grok/channels/telegram/access.json for agent-<name> with allowFrom
+# seeded from a CSV of user ids. Idempotent — mirrors seed_codex_telegram_access.
+seed_grok_telegram_access() {
+  local name="$1" allowed_users="$2"
+  local user="agent-${name}"
+  step "Pre-seeding grok telegram allowlist for $user (${allowed_users})"
+  if ! sudo -u "$user" env CSV="$allowed_users" python3 - <<'PY' >&2; then
+import json, os, tempfile
+
+state = os.path.join(os.path.expanduser('~'), '.grok', 'channels', 'telegram')
+os.makedirs(state, mode=0o700, exist_ok=True)
+access_path = os.path.join(state, 'access.json')
+ids = [s.strip() for s in os.environ['CSV'].split(',') if s.strip()]
+
+try:
+    with open(access_path) as f:
+        data = json.load(f)
+except FileNotFoundError:
+    data = {"allowFrom": [], "groups": {}}
+
+allow = list(data.get('allowFrom') or [])
+for s in ids:
+    if s not in allow:
+        allow.append(s)
+data['allowFrom'] = allow
+data.setdefault('groups', {})
+
+fd, tmp = tempfile.mkstemp(dir=state, prefix='.access.', suffix='.tmp')
+with os.fdopen(fd, 'w') as f:
+    json.dump(data, f, indent=2)
+os.chmod(tmp, 0o600)
+os.replace(tmp, access_path)
+print(f"Seeded allowFrom={allow} into {access_path}")
+PY
+    fail "$E_GENERIC" "grok telegram access.json pre-seed failed for agent '$name'"
+  fi
+}
+
 # Single dispatch point used by cmd_create. Routes a (type, plugin) pair to
 # the right install helper above, so the create flow stays type-agnostic.
 # home_channel/allowed_users are hermes-telegram extras (ignored by other
@@ -1270,6 +1379,7 @@ install_channel_for_agent() {
   case "$type" in
     claude)   install_channel_plugin_for_agent "$plugin" "$name" "$allowed_users" ;;
     codex)    install_channel_for_codex_agent "$plugin" "$name" "$token" "$allowed_users" ;;
+    grok)     install_channel_for_grok_agent "$plugin" "$name" "$token" "$allowed_users" ;;
     openclaw) install_channel_for_openclaw_agent "$plugin" "$name" "$token" "$home_channel" "$allowed_users" ;;
     hermes)   install_channel_for_hermes_agent "$plugin" "$name" "$token" "$home_channel" "$allowed_users" ;;
     *) fail "$E_VALIDATION" "type '$type' does not support channels" ;;
@@ -3609,11 +3719,11 @@ cmd_create() {
   fi
 
   if [[ "$channels" != "none" ]] && [[ "${TYPE_CHANNELS[$type]}" != "1" ]]; then
-    fail "$E_VALIDATION" "type '$type' does not support channels (only: claude, codex, openclaw, hermes)"
+    fail "$E_VALIDATION" "type '$type' does not support channels (only: claude, codex, grok, openclaw, hermes)"
   fi
-  # codex ships a telegram MCP bridge only — no discord build yet.
-  if [[ "$type" == "codex" && "$channels" == "discord" ]]; then
-    fail "$E_VALIDATION" "type 'codex' supports --channels=telegram only (no discord build)"
+  # codex + grok ship a telegram MCP bridge only — no discord build yet.
+  if [[ ( "$type" == "codex" || "$type" == "grok" ) && "$channels" == "discord" ]]; then
+    fail "$E_VALIDATION" "type '$type' supports --channels=telegram only (no discord build)"
   fi
 
   # BYO API-key path for hermes/openclaw (--provider=<canonical> + --api-key=<key|->).
