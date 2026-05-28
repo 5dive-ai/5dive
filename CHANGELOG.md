@@ -9,6 +9,19 @@ release.
 
 ## [Unreleased]
 
+## [0.1.14] — 2026-05-28
+
+### Fixed
+
+- `install_channel_for_codex_agent` now seeds `notify-user/SKILL.md` into
+  `~/.agents/skills/notify-user/` and installs `find-skills` + `5dive-cli`
+  via `npx skills add --agent codex`. Mirrors the grok 0.1.13 block — same
+  class of bug (telegram-channel agent boots with no comms-loop skill,
+  goes silent on first DM). Surfaced when `draft-codex` had an empty
+  `.agents/skills/` despite being a codex+telegram agent. Unlike grok,
+  codex is in the upstream `npx skills` registry, so the default skills
+  go through the normal path rather than the manual-install fallback.
+
 ## [0.1.13] — 2026-05-28
 
 ### Fixed

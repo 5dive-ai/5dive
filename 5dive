@@ -26,7 +26,7 @@ esac
 
 # Bumped on every public release. `build.sh` checks this line exists; CI fails
 # the bundle-drift check if it's missing or empty.
-readonly FIVE_VERSION="0.1.13"
+readonly FIVE_VERSION="0.1.14"
 
 STATE_DIR="/var/lib/5dive"
 REGISTRY="${STATE_DIR}/agents.json"
@@ -1265,6 +1265,25 @@ CODEX_ENV
   if [[ -n "$allowed_users" ]]; then
     seed_codex_telegram_access "$name" "$allowed_users"
   fi
+
+  # Seed the notify-user skill into ~/.codex/.agents/skills so the agent
+  # self-starts its comms loop on the first DM. Mirrors the grok 0.1.13 block
+  # below — codex has no plugin marketplace either, but it reads SKILL.md
+  # from its per-type skills dir natively. Without this, new codex+telegram
+  # agents go dark on first contact until the operator manually copies SKILL.md
+  # (or waits for update.sh's 03:00 type-aware refresh to heal them).
+  if [[ -f "$AGENT_SKILLS_DIR/notify-user/SKILL.md" ]]; then
+    sudo -u "$user" mkdir -p "/home/${user}/.agents/skills/notify-user"
+    sudo -u "$user" cp "$AGENT_SKILLS_DIR/notify-user/SKILL.md" \
+      "/home/${user}/.agents/skills/notify-user/SKILL.md"
+  fi
+
+  # Default skills, best-effort: match preseed_claude_agent + the grok
+  # installer so codex+telegram agents get find-skills + 5dive-cli too.
+  # Upstream `npx skills add --agent codex` IS supported (see SKILLS_AGENT_ID),
+  # so these route through the normal path, not the manual-install fallback.
+  install_default_skill_for_agent "$name" codex vercel-labs/skills find-skills || true
+  install_default_skill_for_agent "$name" codex 5dive-com/skills 5dive-cli || true
 }
 
 # Write ~/.codex/channels/telegram/access.json for agent-<name> with allowFrom
