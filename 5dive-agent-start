@@ -537,6 +537,30 @@ if [[ "$TYPE" == "antigravity" ]]; then
       echo "warn: could not seed antigravity oauth token from $SHARED_AGY_AUTH" >&2
     fi
   fi
+
+  # Pre-complete agy's first-run onboarding so a freshly-created agent drops
+  # straight into the chat instead of the interactive color-scheme / ToS /
+  # folder-trust wizard (mirrors gemini's settings.json pinning). Empirically
+  # (agy 1.0.3) onboarding is gated by three files; seed all create-if-missing
+  # so we never fight the user's later edits:
+  #   cache/onboarding.json → marks the color-scheme + ToS steps done
+  #   settings.json:enableTelemetry=false → skips the data-collection consent
+  #     (and opts out by default — privacy-safe; the user can flip it in-app)
+  #   settings.json:trustedWorkspaces=[WORKDIR] → skips the per-folder "Do you
+  #     trust this project?" gate for the agent's own workspace (agy keys trust
+  #     by the cwd it launches in, which is $WORKDIR via tmux new-session -c)
+  install -d -m 700 "$AGENT_AGY_DIR/cache"
+  AGY_ONBOARD="$AGENT_AGY_DIR/cache/onboarding.json"
+  if [[ ! -f "$AGY_ONBOARD" ]]; then
+    printf '%s\n' '{"consumerOnboardingComplete":true,"enterpriseOnboardingComplete":false,"onboardingComplete":true}' > "$AGY_ONBOARD"
+    chmod 600 "$AGY_ONBOARD"
+  fi
+  AGY_SETTINGS="$AGENT_AGY_DIR/settings.json"
+  if [[ ! -f "$AGY_SETTINGS" ]]; then
+    jq -n --arg ws "$WORKDIR" '{enableTelemetry:false, trustedWorkspaces:[$ws]}' > "$AGY_SETTINGS" 2>/dev/null \
+      || printf '{"enableTelemetry":false,"trustedWorkspaces":["%s"]}\n' "$WORKDIR" > "$AGY_SETTINGS"
+    chmod 600 "$AGY_SETTINGS"
+  fi
 fi
 
 SESSION="agent-${NAME}"
