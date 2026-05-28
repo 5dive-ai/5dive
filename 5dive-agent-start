@@ -501,6 +501,44 @@ if [[ "$TYPE" == "gemini" ]]; then
   chmod 600 "$SETTINGS"
 fi
 
+# Same shared/0600 problem as gemini: antigravity (`agy`) stores its OAuth
+# token at ~/.gemini/antigravity-cli/antigravity-oauth-token (mode 0600). It
+# tries the OS keyring first but falls back to this file when dbus-launch is
+# absent — which it always is on our headless boxes (verified in agy's cli.log:
+# "Failed to load token from keyring, falling back to file"). There's no env to
+# redirect the path; agy reads $HOME/.gemini directly. So seed the agent's own
+# copy from the shared/profile token via sudo (re-seeding only when the shared
+# copy is newer, e.g. after a fresh `5dive auth login antigravity`).
+#
+# Profile-scoped login lands at
+# $PROFILE_STATE_DIR/.gemini/antigravity-cli/antigravity-oauth-token (the path
+# cmd_auth_start created via the HOME=$PROFILE_STATE_DIR redirect). Default
+# profile keeps the legacy shared /home/claude/.gemini layout. The profile dir
+# is mode 0700 owner=claude, so route the existence + staleness checks through
+# `sudo -n test` (same as hermes/openclaw) — a plain `[[ -e ]]` returns false
+# on an untraversable dir and the seed silently no-ops, leaving the agent
+# unauthenticated and agy stuck on its login prompt.
+if [[ "$TYPE" == "antigravity" ]]; then
+  AGENT_AGY_DIR="$HOME/.gemini/antigravity-cli"
+  install -d -m 700 "$HOME/.gemini"
+  install -d -m 700 "$AGENT_AGY_DIR"
+  SHARED_AGY_AUTH="${PROFILE_STATE_DIR:+$PROFILE_STATE_DIR/.gemini/antigravity-cli/antigravity-oauth-token}"
+  SHARED_AGY_AUTH="${SHARED_AGY_AUTH:-/home/claude/.gemini/antigravity-cli/antigravity-oauth-token}"
+  LOCAL_AGY_AUTH="$AGENT_AGY_DIR/antigravity-oauth-token"
+  if sudo -n test -e "$SHARED_AGY_AUTH" \
+      && { [[ ! -f "$LOCAL_AGY_AUTH" ]] \
+           || sudo -n test "$SHARED_AGY_AUTH" -nt "$LOCAL_AGY_AUTH"; }; then
+    TMP="$(mktemp -p "$AGENT_AGY_DIR" .oauth.XXXXXX)"
+    if sudo -n cat "$SHARED_AGY_AUTH" > "$TMP" 2>/dev/null; then
+      chmod 600 "$TMP"
+      mv "$TMP" "$LOCAL_AGY_AUTH"
+    else
+      rm -f "$TMP"
+      echo "warn: could not seed antigravity oauth token from $SHARED_AGY_AUTH" >&2
+    fi
+  fi
+fi
+
 SESSION="agent-${NAME}"
 
 # Reset any stale session from a previous unit run.
