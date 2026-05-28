@@ -26,6 +26,7 @@ cmd_list() {
     authProfile: (.value.authProfile // null),
     botUsername: (.value.botUsername // null),
     isolation: (.value.isolation // "admin"),
+    heartbeat: (.value.heartbeat // null),
     createdAt: .value.createdAt,
     active: ($live[.key].active // "unknown"),
     enabled: ($live[.key].enabled // "unknown")

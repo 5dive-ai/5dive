@@ -147,6 +147,13 @@ Org chart (who reports to whom):
   5dive org tree | show <agent> | ls | rm <agent>
   # full surface: 5dive org --help
 
+Heartbeat (wake an agent only when it has queued tasks, one per tick):
+  5dive heartbeat on  <name> [--every=<dur>] [--no-fresh]   # enrol (default 30m, /clear before each task)
+  5dive heartbeat off <name>
+  5dive heartbeat ls                                        # enrolled agents + next-wake + queued count
+  5dive heartbeat tick                                      # cron driver (root); wakes due agents that have work
+  # full surface: 5dive heartbeat --help
+
 Health:
   5dive doctor [--repair] [--category=deps|types|auth|registry|shelld]
     Walks deps (tmux/jq/bun/python3/nvm/node/npm), type bins, live auth
@@ -355,6 +362,12 @@ main() {
     org)
       # Agent org chart (sqlite, same store as tasks). Read/write, no audit/lock.
       cmd_org "$@" ;;
+    heartbeat)
+      # Wake-on-work scheduler. on/off mutate the registry (lock taken inside
+      # cmd_heartbeat); tick is the root cron driver; ls is read-only. No audit
+      # — tick fires every few minutes and would flood the log; the wakes it
+      # triggers are visible via each agent's own transcript.
+      cmd_heartbeat "$@" ;;
     init)
       # Interactive first-run wizard: pick a type → install → auth → create
       # → "send hello". Calls back into the same CLI for each step.
