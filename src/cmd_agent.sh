@@ -37,7 +37,7 @@ cmd_list() {
     echo "$merged" | jq -r '
       if length == 0 then "no agents" else
         (["NAME","TYPE","CHANNELS","PROFILE","ACTIVE","ENABLED"] | @tsv),
-        (.[] | [.name, .type, .channels, (.authProfile // "-"), .active, .enabled] | @tsv)
+        (.[] | [(.name + (if (.heartbeat.enabled // false) then " ∿" + ((.heartbeat.everyMin // 30)|tostring) + "m" else "" end)), .type, .channels, (.authProfile // "-"), .active, .enabled] | @tsv)
       end' | column -t -s $'\t'
   fi
 }

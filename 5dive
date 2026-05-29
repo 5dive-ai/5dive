@@ -26,7 +26,7 @@ esac
 
 # Bumped on every public release. `build.sh` checks this line exists; CI fails
 # the bundle-drift check if it's missing or empty.
-readonly FIVE_VERSION="0.1.20"
+readonly FIVE_VERSION="0.1.21"
 
 STATE_DIR="/var/lib/5dive"
 REGISTRY="${STATE_DIR}/agents.json"
@@ -3554,7 +3554,7 @@ cmd_list() {
     echo "$merged" | jq -r '
       if length == 0 then "no agents" else
         (["NAME","TYPE","CHANNELS","PROFILE","ACTIVE","ENABLED"] | @tsv),
-        (.[] | [.name, .type, .channels, (.authProfile // "-"), .active, .enabled] | @tsv)
+        (.[] | [(.name + (if (.heartbeat.enabled // false) then " ∿" + ((.heartbeat.everyMin // 30)|tostring) + "m" else "" end)), .type, .channels, (.authProfile // "-"), .active, .enabled] | @tsv)
       end' | column -t -s $'\t'
   fi
 }
