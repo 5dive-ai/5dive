@@ -26,7 +26,7 @@ esac
 
 # Bumped on every public release. `build.sh` checks this line exists; CI fails
 # the bundle-drift check if it's missing or empty.
-readonly FIVE_VERSION="0.1.19"
+readonly FIVE_VERSION="0.1.20"
 
 STATE_DIR="/var/lib/5dive"
 REGISTRY="${STATE_DIR}/agents.json"
@@ -196,11 +196,15 @@ declare -A TYPE_INSTALL=(
   # and self-updates in the background on each run, so no daily-cron
   # equivalent of @google/gemini-cli's npm update is needed.
   [antigravity]="command -v agy >/dev/null || curl -fsSL https://antigravity.google/cli/install.sh | bash"
-  # grok's installer drops the binary at ~/.grok/bin/grok and symlinks
-  # ~/.local/bin/grok. It also drops an ~/.local/bin/agent symlink which
-  # we do NOT want shadowing future tooling, so rm it after install. The
-  # binary self-updates on subsequent launches; no daily-cron entry needed.
-  [grok]="command -v grok >/dev/null || { curl -fsSL https://x.ai/cli/install.sh | bash && rm -f /home/claude/.local/bin/agent; }"
+  # grok's installer drops the binary at ~/.grok/bin/grok but only creates the
+  # ~/.local/bin/grok symlink *opportunistically* (its line 328 requires
+  # ~/.local/bin already on PATH and ~/.grok/bin not on PATH). On a fresh VM
+  # those conditions often don't hold, so it just appends ~/.grok/bin to
+  # .bashrc and never makes the symlink TYPE_BIN expects — hence we create the
+  # symlink ourselves here rather than trusting the installer. We also drop the
+  # installer's ~/.local/bin/agent symlink so it can't shadow future tooling.
+  # The binary self-updates on launch; no daily-cron entry needed.
+  [grok]="command -v grok >/dev/null 2>&1 || curl -fsSL https://x.ai/cli/install.sh | bash; mkdir -p /home/claude/.local/bin; [ -e /home/claude/.grok/bin/grok ] && ln -sf /home/claude/.grok/bin/grok /home/claude/.local/bin/grok; rm -f /home/claude/.local/bin/agent"
 )
 
 # vercel-labs/skills CLI agent ID per 5dive type. `npx skills add --agent <id>`
