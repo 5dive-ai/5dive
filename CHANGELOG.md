@@ -9,6 +9,27 @@ release.
 
 ## [Unreleased]
 
+## [0.1.21] — 2026-05-29
+
+### Changed
+- heartbeat: the wake nudge now issues a Claude Code `/goal` scoped to one
+  concrete task id (the agent's highest-priority todo) instead of freeform
+  prose. The agent loops turns until that task shows `done`/`cancelled` on the
+  board, so it can no longer "do the work but forget to update status" and get
+  re-nudged into the same task every tick.
+
+### Added
+- heartbeat: deterministic stale-`in_progress` reaper. Every tick (not gated by
+  `everyMin`), any task left `in_progress` longer than `everyMin * 3` minutes
+  (floored at 45m) is force-closed — `/goal clear` to stop a runaway loop, then
+  auto-`cancel` with a result noting the timeout. This is the real hard cap:
+  `/goal`'s own "stop after N turns" is model-judged and was observed to
+  overrun, so cron enforces termination. No schema change (uses `started_at`).
+
+### Note
+- Rolls up the previously-unreleased 0.1.20 work (grok `~/.local/bin/grok`
+  symlink fix) and the `agent list` heartbeat-cadence display.
+
 ## [0.1.15] — 2026-05-28
 
 ### Fixed

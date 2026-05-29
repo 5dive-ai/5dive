@@ -27,6 +27,13 @@
 # though the cron fires more often.
 
 _HB_DEFAULT_EVERY=30
+# Deterministic hard cap for the /goal loop. A task left in_progress longer than
+# everyMin * _HB_STALE_MULT minutes is force-closed by the tick (see the reaper
+# in cmd_heartbeat_tick): /goal clear to stop any runaway loop, then auto-cancel.
+# This is the real backstop — /goal's own "stop after N turns" is model-judged
+# and was observed to overrun (see _hb_wake). Min floor keeps short everyMin sane.
+_HB_STALE_MULT=3
+_HB_STALE_MIN_MINUTES=45
 
 _hb_log() { printf '%s [heartbeat] %s\n' "$(date -u +%FT%TZ)" "$*" >&2; }
 
@@ -188,11 +195,41 @@ _hb_send_line() {
   sudo -u "agent-${name}" tmux send-keys -t "agent-${name}" Enter 2>/dev/null || return 1
 }
 
+# Deterministic hard cap. Force-close any of this agent's tasks that have sat
+# in_progress past its time budget: clear any runaway /goal loop, then cancel the
+# task with an auto-result so the board (and creator) see it terminated rather
+# than silently stuck. Echoes the number reaped. everyMin sets the budget so a
+# slow-cadence agent gets proportionally more rope; _HB_STALE_MIN_MINUTES floors
+# it. Uses started_at (falls back to created_at) — no schema change, no counter.
+_hb_reap_stale() {
+  local name="$1" everyMin="$2"
+  local budget=$(( everyMin * _HB_STALE_MULT ))
+  (( budget < _HB_STALE_MIN_MINUTES )) && budget=$_HB_STALE_MIN_MINUTES
+  local ids id reaped=0
+  ids=$(db "SELECT id FROM tasks
+            WHERE assignee=$(sqlq "$name") AND status='in_progress'
+              AND COALESCE(started_at, created_at) <= datetime('now', '-${budget} minutes');" 2>/dev/null || true)
+  for id in $ids; do
+    # Stop a runaway loop first (best-effort; harmless if the session is down or
+    # has no active goal), then flip the task to cancelled.
+    _hb_send_line "$name" "/goal clear" || true
+    db "UPDATE tasks SET status='cancelled', done_at=datetime('now'),
+          result='auto-cancelled by heartbeat: in_progress exceeded ${budget}m time budget'
+        WHERE id=${id} AND status='in_progress';" 2>/dev/null || true
+    _hb_log "[$name] reaped stale in_progress DIVE-${id} (>${budget}m)"
+    reaped=$((reaped + 1))
+  done
+  printf '%s' "$reaped"
+}
+
 # Wake one agent: ensure it's running, optionally clear context, send the nudge.
+# $3 is the concrete DIVE id (highest-priority todo) the tick picked for this
+# agent — scoping the /goal to one known id makes its completion check reliable
+# (a freeform "your tasks" condition is ambiguous to the goal evaluator).
 # Returns 0 on a delivered nudge, nonzero on any failure (so the caller skips
 # marking lastRunAt and retries next tick).
 _hb_wake() {
-  local name="$1" fresh="$2" todo="$3"
+  local name="$1" fresh="$2" task_id="$3"
   if ! systemctl is-active --quiet "5dive-agent@${name}.service"; then
     systemctl start "5dive-agent@${name}.service" 2>/dev/null \
       || { _hb_log "[$name] systemctl start failed"; return 1; }
@@ -210,7 +247,11 @@ _hb_wake() {
     sleep 4
   fi
 
-  local nudge="Heartbeat tick. You have ${todo} open task(s) assigned to you on the shared 5dive board. Do exactly ONE now: run '5dive task ls --mine' to list them, pick the single highest-priority todo, claim it with '5dive task start <id>', do the work, then close it with '5dive task done <id> --result=\"<one or two sentences summarising what you produced — any output the creator needs to see>\"'. The --result text is what the dashboard and the task creator read — make it self-contained. Handle only ONE task this turn — when it's done, stop and wait; the heartbeat wakes you again for the next one. If a task is blocked or unclear, close it with '5dive task cancel <id> --result=\"<why>\"' (or mark blocked via 5dive task block) and move on without starting more."
+  # Issue a /goal scoped to the one task: Claude Code loops turns until the goal
+  # evaluator sees the condition met, then auto-clears. "stop after N turns" is a
+  # soft, model-judged guard — it does NOT reliably halt a runaway loop, so the
+  # real hard cap is the deterministic stale-in_progress reaper in the tick.
+  local nudge="/goal Task DIVE-${task_id} shows status done or cancelled on the 5dive board (verify ONLY by running: 5dive task show DIVE-${task_id}). To achieve it: claim it with '5dive task start DIVE-${task_id}', do the work, then close it with '5dive task done DIVE-${task_id} --result=\"<one or two self-contained sentences — any output the creator needs to see; the dashboard and creator read this>\"'. If the task is blocked or unclear, instead run '5dive task cancel DIVE-${task_id} --result=\"<why>\"'. Work ONLY this one task — do not start any other. Stop after 6 turns."
   _hb_send_line "$name" "$nudge" || { _hb_log "[$name] nudge send failed"; return 1; }
   return 0
 }
@@ -219,7 +260,7 @@ cmd_heartbeat_tick() {
   require_root "heartbeat tick"
   tasks_db_init
   local reg now; reg=$(registry_read); now=$(date +%s)
-  local checked=0 woke=0 sk_notdue=0 sk_busy=0 sk_nowork=0 sk_fail=0
+  local checked=0 woke=0 reaped=0 sk_notdue=0 sk_busy=0 sk_nowork=0 sk_fail=0
   local name
   while IFS= read -r name; do
     [[ -n "$name" ]] || continue
@@ -229,6 +270,12 @@ cmd_heartbeat_tick() {
     lastRun=$(jq -r --arg n "$name"  '.agents[$n].heartbeat.lastRunAt // 0' <<<"$reg")
     fresh=$(jq -r --arg n "$name"    '.agents[$n].heartbeat.fresh // true' <<<"$reg")
 
+    # Hard cap first, every tick (NOT gated by everyMin): a stuck or runaway
+    # in_progress task must be reaped promptly regardless of the wake throttle.
+    local n_reaped
+    n_reaped=$(_hb_reap_stale "$name" "$everyMin")
+    reaped=$((reaped + n_reaped))
+
     if (( now - lastRun < everyMin * 60 )); then
       sk_notdue=$((sk_notdue + 1)); _hb_log "[$name] not due ($(( (lastRun + everyMin*60 - now + 59) / 60 ))m left)"; continue
     fi
@@ -237,23 +284,27 @@ cmd_heartbeat_tick() {
     if [[ "${inprog:-0}" != "0" ]]; then
       sk_busy=$((sk_busy + 1)); _hb_log "[$name] busy — $inprog in_progress, skip"; continue
     fi
-    local todo
-    todo=$(db "SELECT COUNT(*) FROM tasks WHERE assignee=$(sqlq "$name") AND status='todo';" 2>/dev/null || echo 0)
-    if [[ "${todo:-0}" == "0" ]]; then
+    # Pick the single highest-priority todo and wake the agent against that exact
+    # id — the /goal condition needs a concrete DIVE-N to evaluate reliably.
+    local task_id
+    task_id=$(db "SELECT id FROM tasks WHERE assignee=$(sqlq "$name") AND status='todo'
+                  ORDER BY CASE priority WHEN 'urgent' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2 ELSE 3 END, id
+                  LIMIT 1;" 2>/dev/null || echo "")
+    if [[ -z "$task_id" ]]; then
       sk_nowork=$((sk_nowork + 1)); _hb_log "[$name] no todo — stay idle"; continue
     fi
 
-    _hb_log "[$name] due + ${todo} todo — waking (fresh=${fresh})"
-    if _hb_wake "$name" "$fresh" "$todo"; then
+    _hb_log "[$name] due + todo DIVE-${task_id} — waking (fresh=${fresh})"
+    if _hb_wake "$name" "$fresh" "$task_id"; then
       with_registry_lock _hb_mark_run "$name" "$now"
-      woke=$((woke + 1)); _hb_log "[$name] nudged"
+      woke=$((woke + 1)); _hb_log "[$name] nudged (/goal DIVE-${task_id})"
     else
       sk_fail=$((sk_fail + 1)); _hb_log "[$name] wake failed — will retry next tick"
     fi
   done < <(jq -r '.agents | to_entries[] | select(.value.heartbeat.enabled == true) | .key' <<<"$reg")
 
-  ok "heartbeat tick: woke ${woke} / checked ${checked}" \
-     '{checked:($c|tonumber), woke:($w|tonumber),
+  ok "heartbeat tick: woke ${woke} / reaped ${reaped} / checked ${checked}" \
+     '{checked:($c|tonumber), woke:($w|tonumber), reaped:($r|tonumber),
        skipped:{notDue:($nd|tonumber), busy:($b|tonumber), noWork:($nw|tonumber), failed:($sf|tonumber)}}' \
-     --arg c "$checked" --arg w "$woke" --arg nd "$sk_notdue" --arg b "$sk_busy" --arg nw "$sk_nowork" --arg sf "$sk_fail"
+     --arg c "$checked" --arg w "$woke" --arg r "$reaped" --arg nd "$sk_notdue" --arg b "$sk_busy" --arg nw "$sk_nowork" --arg sf "$sk_fail"
 }
