@@ -1688,7 +1688,7 @@ print(f"Auto-paired user {sender} (chat {chat})")
 PY
 
     if [[ "$channels" == "telegram" ]]; then
-      send_welcome_message "$chat_id" "$bot_token" "$name"
+      send_welcome_message "$chat_id" "$bot_token" "$name" "$type"
     fi
     ok "agent '$name' paired with chat $chat_id." \
        '{name:$n, channels:$ch, chatId:$c, paired:true}' \
@@ -1822,18 +1822,14 @@ PY
      --arg n "$name" --arg ch "$channels" --arg c "$chat_id"
 }
 
-# One-shot "it works" DM after a successful pairing — labelled with the
-# agent name so users running many bots can tell them apart. Token goes via
-# URL-encoded POST body (not argv) so it doesn't show up in `ps`.
+# One-shot "it works" DM after a successful pairing — labelled with the agent
+# name + type so users running many bots can tell them apart. Token goes via
+# URL-encoded POST body (not argv) so it doesn't show up in `ps`. Copy is
+# per-type: claude surfaces its model/effort + voice (Claude-plugin features);
+# codex/grok drop those lines since they're Claude-specific (and reading
+# claude's settings.local.json would render wrong values for them).
 send_welcome_message() {
-  local chat_id="$1" bot_token="$2" agent_name="${3:-}" model effort text
-  local project_settings="/home/claude/projects/.claude/settings.local.json"
-  if [[ -r "$project_settings" ]]; then
-    model=$(jq -r '.model // "default"' "$project_settings" 2>/dev/null || echo default)
-    effort=$(jq -r '.effortLevel // "default"' "$project_settings" 2>/dev/null || echo default)
-  else
-    model="default"; effort="default"
-  fi
+  local chat_id="$1" bot_token="$2" agent_name="${3:-}" agent_type="${4:-claude}" text
 
   # FIVE_DOMAIN is the host's public subdomain (e.g. agent.example.com),
   # set during provisioning. Folded into the message only when present so
@@ -1842,25 +1838,50 @@ send_welcome_message() {
   if [[ -r /etc/5dive/provisioning.env ]]; then
     domain=$(sed -n 's/^FIVE_DOMAIN=//p' /etc/5dive/provisioning.env 2>/dev/null | head -1)
   fi
-
-  local label="Claude"
-  [[ -n "$agent_name" ]] && label="Claude agent '$agent_name'"
-
   local live_line=""
   if [[ -n "$domain" ]]; then
     live_line=" Anything you build goes live at https://${domain} ready to share, or ask me to add your own domain."
   fi
 
-  text=$(cat <<EOF
-👋 Hi! I'm ${label}. We're connected.
+  # "'<name>', " when we know the agent name, else "" → "I'm your X agent."
+  local name_q=""
+  [[ -n "$agent_name" ]] && name_q="'${agent_name}', "
 
-Using ${model} (${effort} effort) — ask me anytime to restart for fresh context or to switch to a different model.
+  case "$agent_type" in
+    codex|grok)
+      local kind
+      if [[ "$agent_type" == "codex" ]]; then kind="Codex agent (OpenAI Codex)"
+      else kind="Grok agent (xAI Grok)"; fi
+      text=$(cat <<EOF
+👋 We're connected! I'm ${name_q}your ${kind}.
 
-I'm here 24/7 with memory, so we can pick up where we left off. Send text, photos, or files — or ask me to turn on voice.
+Here 24/7 — we can pick up where we left off. Send text, photos, or files.
 
-Tell me what you'd like to build — an app, a site, a bot, a report, a campaign — and I'll ship it.${live_line} Need more hands? I can spin up siblings to work in parallel.
+Tell me what to build — app, site, bot, report, campaign — consider it shipped.${live_line} Need more hands? Siblings on demand, working in parallel.
 EOF
 )
+      ;;
+    *)
+      local model effort
+      local project_settings="/home/claude/projects/.claude/settings.local.json"
+      if [[ -r "$project_settings" ]]; then
+        model=$(jq -r '.model // "default"' "$project_settings" 2>/dev/null || echo default)
+        effort=$(jq -r '.effortLevel // "default"' "$project_settings" 2>/dev/null || echo default)
+      else
+        model="default"; effort="default"
+      fi
+      text=$(cat <<EOF
+👋 We're connected! I'm ${name_q}your Claude agent.
+
+${model} · ${effort} effort — switchable anytime, just ask.
+
+Here 24/7 with memory. Send text, photos, or files; ask for voice if you'd rather talk.
+
+Tell me what to build — app, site, bot, report, campaign — consider it shipped.${live_line} Need more hands? Siblings on demand, working in parallel.
+EOF
+)
+      ;;
+  esac
 
   curl -sS -o /dev/null \
     --data-urlencode "chat_id=${chat_id}" \

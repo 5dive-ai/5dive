@@ -9,6 +9,17 @@ release.
 
 ## [Unreleased]
 
+## [0.1.23] — 2026-05-29
+
+### Changed
+- Post-pairing welcome DM is now per agent type. Previously every type got the
+  Claude welcome — codex/grok bots greeted the user as "Claude agent" and
+  advertised a model/effort (read from claude's `settings.local.json`) + voice
+  that don't apply to them. Now `send_welcome_message` takes the agent type
+  (threaded from `pair`) and branches: claude keeps its model/effort + voice
+  line; codex/grok say "Codex agent (OpenAI Codex)" / "Grok agent (xAI Grok)"
+  and drop the Claude-specific lines. Copy also refreshed across all three.
+
 ## [0.1.22] — 2026-05-29
 
 ### Changed
