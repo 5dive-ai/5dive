@@ -9,6 +9,26 @@ release.
 
 ## [Unreleased]
 
+## [0.1.22] — 2026-05-29
+
+### Changed
+- Telegram access/pairing commands now work for **codex** and **grok** agents,
+  not just claude (DIVE-4). All three share the same access.json schema
+  (`{dmPolicy, allowFrom, groups}`) and path layout
+  (`~/.<type>/channels/telegram/access.json`), so the fix is per-type path
+  resolution rather than new logic. Affected commands:
+  - `agent telegram-access get`/`set` — resolve the path by agent type via a
+    new `_tg_access_state_dir` helper.
+  - `agent pair` — code-roundtrip pairing now accepts codex/grok (path resolved
+    as `~/.<type>/channels/<channel>/access.json`); openclaw/hermes stay
+    token-only.
+  - `agent telegram-pending-ignore` and `agent telegram-resolve-handle` — accept
+    codex/grok instead of hard-failing "only applies to claude agents".
+  - Inter-agent group mirror (`mirror_interagent_outbound`) resolves the sending
+    agent's access.json by type, so codex/grok agents mirror to the group too.
+  Previously all of these hard-failed for non-claude agents, forcing manual
+  access.json edits to manage codex/grok bot allowlists.
+
 ## [0.1.21] — 2026-05-29
 
 ### Changed

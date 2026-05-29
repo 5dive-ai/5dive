@@ -1201,6 +1201,20 @@ _persist_bot_username() {
 # groups / dmPolicy. Returns the parsed JSON in `data`. If the file doesn't
 # exist yet (plugin hasn't persisted state), returns the same defaults the
 # plugin would write on first run.
+# Resolve the telegram-plugin state dir (where access.json lives) for an agent
+# by type. claude, codex and grok each store it under ~/.<type>/channels/telegram/
+# — the home subdir name matches the agent type, and all three use the same
+# access.json schema {dmPolicy, allowFrom, groups}. Echoes the dir on success;
+# returns nonzero for types that have no telegram access.json (openclaw/hermes
+# manage approvals through their own tooling, not this file).
+_tg_access_state_dir() {
+  local user="$1" type="$2"
+  case "$type" in
+    claude|codex|grok) printf '/home/%s/.%s/channels/telegram' "$user" "$type" ;;
+    *) return 1 ;;
+  esac
+}
+
 cmd_telegram_access_get() {
   local name=""
   while [[ $# -gt 0 ]]; do
@@ -1218,13 +1232,14 @@ cmd_telegram_access_get() {
     || fail "$E_NOT_FOUND" "no agent named '$name'"
   type=$(jq -r --arg n "$name" '.agents[$n].type' <<<"$reg")
   channels=$(jq -r --arg n "$name" '.agents[$n].channels' <<<"$reg")
-  [[ "$type" == "claude" ]] \
-    || fail "$E_VALIDATION" "telegram-access only applies to claude agents (got type=$type)"
   [[ "$channels" == "telegram" ]] \
     || fail "$E_VALIDATION" "agent '$name' has channels=$channels — telegram-access only applies to telegram"
 
   local user="agent-${name}"
-  local access="/home/${user}/.claude/channels/telegram/access.json"
+  local state_dir
+  state_dir=$(_tg_access_state_dir "$user" "$type") \
+    || fail "$E_VALIDATION" "telegram-access supports claude, codex and grok agents (got type=$type)"
+  local access="${state_dir}/access.json"
   local raw
   raw=$(sudo -u "$user" cat "$access" 2>/dev/null || true)
   if [[ -z "$raw" ]] || ! jq -e . >/dev/null 2>&1 <<<"$raw"; then
@@ -1235,7 +1250,8 @@ cmd_telegram_access_get() {
      --arg u "$(jq -r --arg n "$name" '.agents[$n].botUsername // ""' <<<"$reg")"
 }
 
-# Write ~/.claude/channels/telegram/access.json for a claude-type agent.
+# Write the telegram access.json for a claude/codex/grok agent (path resolved
+# by type via _tg_access_state_dir — all three share the same schema).
 # The new JSON body comes in on stdin (the dashboard sends it via the
 # `stdin` field on /server/agents/exec so it never lands in argv).
 #
@@ -1263,10 +1279,12 @@ cmd_telegram_access_set() {
     || fail "$E_NOT_FOUND" "no agent named '$name'"
   type=$(jq -r --arg n "$name" '.agents[$n].type' <<<"$reg")
   channels=$(jq -r --arg n "$name" '.agents[$n].channels' <<<"$reg")
-  [[ "$type" == "claude" ]] \
-    || fail "$E_VALIDATION" "telegram-access only applies to claude agents (got type=$type)"
   [[ "$channels" == "telegram" ]] \
     || fail "$E_VALIDATION" "agent '$name' has channels=$channels — telegram-access only applies to telegram"
+  local user="agent-${name}"
+  local state_dir
+  state_dir=$(_tg_access_state_dir "$user" "$type") \
+    || fail "$E_VALIDATION" "telegram-access supports claude, codex and grok agents (got type=$type)"
 
   local body
   body=$(cat)
@@ -1274,8 +1292,6 @@ cmd_telegram_access_set() {
   jq -e . >/dev/null 2>&1 <<<"$body" \
     || fail "$E_VALIDATION" "stdin is not valid JSON"
 
-  local user="agent-${name}"
-  local state_dir="/home/${user}/.claude/channels/telegram"
   step "Updating telegram access for agent '$name'"
   # Validation + atomic write live in the same python step so a bad shape
   # exits non-zero before we touch the file. STATE is the agent's plugin
@@ -1375,13 +1391,14 @@ cmd_telegram_pending_ignore() {
     || fail "$E_NOT_FOUND" "no agent named '$name'"
   type=$(jq -r --arg n "$name" '.agents[$n].type' <<<"$reg")
   channels=$(jq -r --arg n "$name" '.agents[$n].channels' <<<"$reg")
-  [[ "$type" == "claude" ]] \
-    || fail "$E_VALIDATION" "telegram-pending-ignore only applies to claude agents (got type=$type)"
   [[ "$channels" == "telegram" ]] \
     || fail "$E_VALIDATION" "agent '$name' has channels=$channels — telegram-pending-ignore only applies to telegram"
 
   local user="agent-${name}"
-  local access="/home/${user}/.claude/channels/telegram/access.json"
+  local state_dir
+  state_dir=$(_tg_access_state_dir "$user" "$type") \
+    || fail "$E_VALIDATION" "telegram-pending-ignore supports claude, codex and grok agents (got type=$type)"
+  local access="${state_dir}/access.json"
   local err
   err=$(sudo -u "$user" env ACCESS="$access" CODE="$code" python3 - <<'PY' 2>&1 >/dev/null
 import json, os, sys, tempfile
@@ -1461,8 +1478,10 @@ cmd_telegram_resolve_handle() {
     || fail "$E_NOT_FOUND" "no agent named '$name'"
   type=$(jq -r --arg n "$name" '.agents[$n].type' <<<"$reg")
   channels=$(jq -r --arg n "$name" '.agents[$n].channels' <<<"$reg")
-  [[ "$type" == "claude" ]] \
-    || fail "$E_VALIDATION" "telegram-resolve-handle only applies to claude agents (got type=$type)"
+  case "$type" in
+    claude|codex|grok) ;;
+    *) fail "$E_VALIDATION" "telegram-resolve-handle supports claude, codex and grok agents (got type=$type)" ;;
+  esac
   [[ "$channels" == "telegram" ]] \
     || fail "$E_VALIDATION" "agent '$name' has channels=$channels — telegram-resolve-handle only applies to telegram"
 
@@ -1595,22 +1614,23 @@ cmd_pair() {
     telegram|discord) ;;
     *) fail "$E_VALIDATION" "agent '$name' has channels=$channels — pairing only applies to telegram or discord" ;;
   esac
-  # cmd_pair only applies to claude — its claude-plugins-official telegram /
-  # discord plugin uses a code-roundtrip (user DMs bot, bot replies with a
-  # code, dashboard pastes the code back to seed access.json). openclaw and
-  # hermes are token-only: the bot token alone is enough to authorise the
+  # cmd_pair applies to claude, codex and grok — their telegram/discord
+  # plugins use a code-roundtrip (user DMs bot, bot replies with a code,
+  # dashboard pastes the code back to seed access.json) and share the same
+  # access.json schema + path layout (~/.<type>/channels/<channel>/). openclaw
+  # and hermes are token-only: the bot token alone is enough to authorise the
   # agent, and inbound user approvals flow through openclaw's own `pairing`
   # subcommand rather than this code path.
   case "$type" in
-    claude) ;;
+    claude|codex|grok) ;;
     openclaw|hermes)
       fail "$E_VALIDATION" "type=$type doesn't use pair codes — the bot token configured at create time is sufficient. To approve specific Telegram/Discord users for an openclaw agent, run: sudo -u agent-${name} openclaw pairing list" ;;
     *)
-      fail "$E_VALIDATION" "pairing only applies to claude agents (got type=$type)" ;;
+      fail "$E_VALIDATION" "pairing only applies to claude, codex and grok agents (got type=$type)" ;;
   esac
 
   local user="agent-${name}"
-  local access="/home/${user}/.claude/channels/${channels}/access.json"
+  local access="/home/${user}/.${type}/channels/${channels}/access.json"
   local token_env token_var
   case "$channels" in
     telegram) token_env="${CONNECTORS_DIR}/telegram-${name}.env"; token_var="TELEGRAM_BOT_TOKEN" ;;
@@ -1632,7 +1652,7 @@ cmd_pair() {
   # code-roundtrip path, no race with a pending entry.
   if [[ -n "$preuser" ]]; then
     local chat_id="$prechat"
-    local state_dir="/home/${user}/.claude/channels/${channels}"
+    local state_dir="/home/${user}/.${type}/channels/${channels}"
     sudo -u "$user" env SENDER="$preuser" CHAT="$chat_id" STATE="$state_dir" python3 - <<'PY' >&2 \
       || fail "$E_PAIRING" "auto-pair seed failed"
 import json, os, tempfile
@@ -1976,7 +1996,16 @@ mirror_interagent_outbound() {
   token=$(sed -n 's/^TELEGRAM_BOT_TOKEN=//p' "$token_file" | head -1)
   [[ -n "$token" ]] || return 0
 
-  local access_file="/home/${invoker}/.claude/channels/telegram/access.json"
+  # access.json lives under ~/.<type>/channels/telegram/ — resolve the
+  # invoker's type so codex/grok agents mirror too, not just claude. Bail
+  # quietly for token-only types (openclaw/hermes) with no access.json.
+  local reg
+  reg=$(registry_read)
+  local invoker_type
+  invoker_type=$(jq -r --arg n "$invoker_name" '.agents[$n].type // empty' <<<"$reg" 2>/dev/null)
+  local access_dir
+  access_dir=$(_tg_access_state_dir "$invoker" "$invoker_type") || return 0
+  local access_file="${access_dir}/access.json"
   [[ -r "$access_file" ]] || return 0
   local group_chat_id
   group_chat_id=$(jq -r '(.groups // {}) | keys | .[0] // empty' "$access_file" 2>/dev/null)
@@ -1994,8 +2023,7 @@ mirror_interagent_outbound() {
 
   # Resolve the receiver's @botUsername for a tappable mention; fall back to
   # the bare agent name if the registry has no cached username.
-  local reg bot to_label
-  reg=$(registry_read)
+  local bot to_label
   bot=$(jq -r --arg n "$receiver" '.agents[$n].botUsername // empty' <<<"$reg" 2>/dev/null)
   if [[ -n "$bot" ]]; then to_label="@${bot}"; else to_label="@${receiver}"; fi
 
