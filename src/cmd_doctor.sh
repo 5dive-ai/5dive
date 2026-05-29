@@ -143,16 +143,12 @@ cmd_doctor() {
         doctor_add deps "$(basename "$f")" error "$f missing or not executable (rerun install.sh)" false false
       fi
     done
-    if [[ -x "$STOP_FAILURE_HOOK" ]]; then
-      doctor_add deps stop-failure-hook ok "$STOP_FAILURE_HOOK present"
-    else
-      doctor_add deps stop-failure-hook warn "$STOP_FAILURE_HOOK missing — telegram agents won't DM on rate-limit" false false
-    fi
-    if [[ -x "$PRETOOL_TELEGRAM_HOOK" ]]; then
-      doctor_add deps pretool-telegram-hook ok "$PRETOOL_TELEGRAM_HOOK present"
-    else
-      doctor_add deps pretool-telegram-hook warn "$PRETOOL_TELEGRAM_HOOK missing — telegram agents will hang on AskUserQuestion/ExitPlanMode" false false
-    fi
+    # The StopFailure (rate-limit DM) and PreToolUse (AskUserQuestion/ExitPlanMode)
+    # hooks used to be standalone scripts under /usr/local/lib/5dive checked here
+    # via $STOP_FAILURE_HOOK / $PRETOOL_TELEGRAM_HOOK. They now ship bundled inside
+    # the telegram plugin (per-agent, no fixed path), so those vars were removed —
+    # the stale checks were left referencing them and crashed `doctor --json` with
+    # an unbound-variable error under `set -u`. Dropped; nothing standalone to probe.
     local resume_helper="/usr/local/lib/5dive/resume-after-reset.sh"
     if [[ -x "$resume_helper" ]]; then
       doctor_add deps resume-after-reset ok "$resume_helper present"

@@ -713,6 +713,34 @@ if [[ "$TYPE" == "codex" && "$CHANNELS" == "telegram" ]] \
   ) &
 fi
 
+# grok cold-start kickoff (telegram only). Unlike codex (whose MCP server boots
+# with the process), grok lazy-loads its telegram MCP server only once a chat
+# session starts — until then it sits at the home-screen launcher (New worktree
+# / Resume session / Quit) and never receives Telegram messages. On the nightly
+# unit restart this left grok dead until a human typed into it. So we mirror the
+# codex trust-accepter above: watch the pane during the boot window, and once the
+# launcher is showing, type a one-line kickoff to start a session. That loads the
+# telegram-grok MCP server, whose in-process re-arm watchdog then owns the
+# wait_for_message loop. 'Resume session' is launcher-only (never appears in
+# in-session chrome), so it's a safe marker. Two-step send (literal text, then
+# Enter) because the TUI occasionally drops a folded Enter. Single-fire (break on
+# first match) — the server-side watchdog handles every subsequent re-arm.
+if [[ "$TYPE" == "grok" && "$CHANNELS" == "telegram" ]]; then
+  (
+    _kick='Resume your Telegram listen loop: call wait_for_message now and keep looping (on each message reply, then call wait_for_message again; on timeout call it again immediately). This is an automated re-arm; do not send a Telegram reply about it.'
+    for _ in $(seq 1 24); do
+      sleep 2
+      _pane="$(/usr/bin/tmux capture-pane -t "$SESSION" -p -S -40 2>/dev/null)" || break
+      if printf '%s' "$_pane" | grep -q 'Resume session'; then
+        /usr/bin/tmux send-keys -t "$SESSION" -l "$_kick"
+        sleep 1
+        /usr/bin/tmux send-keys -t "$SESSION" Enter
+        break
+      fi
+    done
+  ) &
+fi
+
 # Block so systemd keeps the unit "active" as long as the session lives.
 while /usr/bin/tmux has-session -t "$SESSION" 2>/dev/null; do
   sleep 5
