@@ -712,9 +712,24 @@ SESSION="agent-${NAME}"
 # then routes requests to Anthropic, the exact third-party-harness pattern
 # Anthropic flagged for suspension in April 2026. Drop cross-type creds
 # before exec so each agent only sees env vars for its own provider.
+# STAGE_GUARD: env exports prepended to the launch loop (default empty). Used by
+# claude to suppress its native per-user self-stage (see the claude case below).
+STAGE_GUARD=""
 case "$TYPE" in
   claude)
-    UNSET_CREDS="OPENAI_API_KEY GEMINI_API_KEY GOOGLE_API_KEY" ;;
+    UNSET_CREDS="OPENAI_API_KEY GEMINI_API_KEY GOOGLE_API_KEY"
+    # Claude Code's native binary self-stages a full ~230M per-user copy into
+    # $HOME/.local/share/claude on first launch — even when invoked by absolute
+    # path from the shared /home/claude install, and even with autoUpdates:false
+    # in settings.json. Every agent-<name> user thus duplicated the 230M ELF for
+    # zero benefit: the systemd unit always execs the shared
+    # /home/claude/.local/bin/claude (TYPE_BIN[claude]), never the per-user copy.
+    # These two env vars suppress the on-launch stage so all claude agents share
+    # the single binary, codex-style. Only the `claude` user — which owns the
+    # shared install and refreshes it via the 03:00 soft-update — keeps updating;
+    # agents never need to. Verified on a live box: with both set, the per-user
+    # copy never regenerates and the agent runs normally.
+    STAGE_GUARD="export DISABLE_UPDATES=1 DISABLE_AUTOUPDATER=1; " ;;
   codex|opencode)
     UNSET_CREDS="CLAUDE_CODE_OAUTH_TOKEN ANTHROPIC_API_KEY GEMINI_API_KEY GOOGLE_API_KEY" ;;
   gemini)
@@ -773,7 +788,7 @@ else
   LOOP="while true; do ${CMD_STR}; sleep 2; done"
 fi
 
-INNER="unset CLAUDE_CONFIG_DIR ${UNSET_CREDS}; ${CODEX_OVERRIDE}${PRELUDE}${LOOP}"
+INNER="unset CLAUDE_CONFIG_DIR ${UNSET_CREDS}; ${STAGE_GUARD}${CODEX_OVERRIDE}${PRELUDE}${LOOP}"
 [[ -n "$PROFILE" ]] && echo "[5dive] agent=${NAME} using auth-profile=${PROFILE}" >&2
 
 /usr/bin/tmux new-session -d -s "$SESSION" -c "$WORKDIR" \
