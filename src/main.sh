@@ -119,6 +119,7 @@ Default workdir: ${DEFAULT_WORKDIR}
 Accounts (a named auth profile — group sign-ins so multiple agents share one login):
   5dive account list                                   # name, types signed in, # agents bound
   5dive account show <name>                            # detail incl. env keys present
+  5dive account usage                                  # per-account 5h/7d limit usage (dashboard dots + /usage)
   5dive account add <name>                             # create empty account; sign in next
   5dive account login <name> --type=<type>             # interactive TTY login into an account
   5dive account rename <old> <new>                     # repoints all bound agents + restarts them
@@ -313,11 +314,12 @@ main() {
           fi ;;
       esac ;;
     account)
-      [[ $# -gt 0 ]] || fail "$E_USAGE" "usage: 5dive account list|show|add|rename|remove|login|set-active-provider"
+      [[ $# -gt 0 ]] || fail "$E_USAGE" "usage: 5dive account list|show|usage|add|rename|remove|login|set-active-provider"
       local acctcmd="$1"; shift
       case "$acctcmd" in
         list)   cmd_account_list "$@" ;;
         show)   cmd_account_show "$@" ;;
+        usage)  cmd_account_usage "$@" ;;
         add)
           AUDIT_CMD="account add"; AUDIT_ARGS=("$@")
           with_registry_lock cmd_account_add "$@" ;;

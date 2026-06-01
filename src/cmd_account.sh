@@ -175,6 +175,95 @@ cmd_account_list() {
   fi
 }
 
+# usage_agent_home <agent> — resolve the agent user's home dir (where its
+# statusline cache lives) from passwd, falling back to /home/agent-<name>.
+usage_agent_home() {
+  local agent="$1" home
+  home=$(getent passwd "agent-${agent}" 2>/dev/null | cut -d: -f6)
+  [[ -n "$home" ]] && { printf '%s\n' "$home"; return; }
+  printf '/home/agent-%s\n' "$agent"
+}
+
+# usage_read_ratelimits <agent> — emit a compact JSON object
+#   {asOf, fiveHourPct, fiveResetsAt, sevenDayPct, sevenResetsAt}
+# from the agent's statusline cache (the JSON Claude Code hands its
+# statusline, mirrored to ~/.claude/statusline-last.json by statusline.sh).
+# asOf is the cache file's mtime (epoch) — the cache carries no own timestamp,
+# and mtime is when the live limits were last observed. Emits nothing when
+# there's no readable cache or no rate_limits block: an agent that hasn't
+# rendered its statusline since boot, or a non-claude type whose CLI doesn't
+# surface Anthropic 5h/7d limits.
+usage_read_ratelimits() {
+  local agent="$1" cache mtime
+  cache="$(usage_agent_home "$agent")/.claude/statusline-last.json"
+  [[ -s "$cache" ]] || return 0
+  mtime=$(stat -c %Y "$cache" 2>/dev/null) || return 0
+  jq -c --argjson at "$mtime" '
+    (.rate_limits // {}) as $r
+    | ($r.five_hour // {}) as $f
+    | ($r.seven_day // {}) as $s
+    | if ($f.used_percentage == null and $s.used_percentage == null)
+      then empty
+      else {
+        asOf: $at,
+        fiveHourPct:   ($f.used_percentage // null),
+        fiveResetsAt:  ($f.resets_at // null),
+        sevenDayPct:   ($s.used_percentage // null),
+        sevenResetsAt: ($s.resets_at // null)
+      } end' "$cache" 2>/dev/null
+}
+
+# `account usage` — per-account snapshot of Anthropic 5h / 7d limit usage,
+# backing the dashboard Switch-account modal dots and Telegram /account +
+# /usage. For each account we read the FRESHEST statusline cache across its
+# bound agents (an account is shared by several agents; whichever rendered
+# most recently carries the truest live numbers). usage is null when no
+# bound agent has a readable cache. Needs root to read sibling agents' 0750
+# home dirs — dashboard and telegram both call via `sudo -n 5dive account usage`.
+cmd_account_usage() {
+  ensure_state
+  [[ $# -eq 0 ]] || fail "$E_USAGE" "usage: 5dive account usage"
+  require_root
+  local rows="[]" name agents agent rl at best best_at src usage
+  while IFS= read -r name; do
+    [[ -n "$name" ]] || continue
+    agents=$(account_agents_bound "$name")
+    best=""; best_at=-1; src=""
+    while IFS= read -r agent; do
+      [[ -n "$agent" ]] || continue
+      rl=$(usage_read_ratelimits "$agent") || continue
+      [[ -n "$rl" ]] || continue
+      at=$(jq -r '.asOf // -1' <<<"$rl")
+      if [[ "$at" =~ ^[0-9]+$ ]] && (( at > best_at )); then
+        best_at=$at; best="$rl"; src="$agent"
+      fi
+    done < <(jq -r '.[]' <<<"$agents")
+    if [[ -n "$best" ]]; then
+      usage=$(jq -c --arg src "$src" '{
+        fiveHour: (if .fiveHourPct == null then null
+                   else {pct: .fiveHourPct, resetsAt: .fiveResetsAt} end),
+        sevenDay: (if .sevenDayPct == null then null
+                   else {pct: .sevenDayPct, resetsAt: .sevenResetsAt} end),
+        asOf: .asOf, source: $src}' <<<"$best")
+    else
+      usage="null"
+    fi
+    rows=$(jq -c --arg n "$name" --argjson a "$agents" --argjson u "$usage" \
+      '. + [{name:$n, agents:$a, usage:$u}]' <<<"$rows")
+  done < <(account_each)
+  if (( JSON_MODE )); then
+    echo "$rows" | jq -c '{ok:true, data: .}'
+  else
+    echo "$rows" | jq -r '
+      def p(x): if x == null then "-" else ((x.pct | floor | tostring) + "%") end;
+      if length == 0 then "no accounts" else
+        (["ACCOUNT","5H","7D","SOURCE"] | @tsv),
+        (.[] | [.name, p(.usage.fiveHour), p(.usage.sevenDay),
+                (.usage.source // "-")] | @tsv)
+      end' | column -t -s $'\t'
+  fi
+}
+
 cmd_account_show() {
   local name="${1:-}"
   [[ -n "$name" ]] || fail "$E_USAGE" "usage: 5dive account show <name>"
