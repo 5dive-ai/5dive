@@ -15,6 +15,7 @@ Maintenance:
   5dive self-update                                  # update the CLI + plugins, then restart agents
                                                      # (alias: 5dive update). On-demand upgrade for
                                                      # self-hosted boxes; managed boxes update nightly.
+  5dive update --check                               # read-only: is the CLI behind/stale? (no root)
   5dive uninstall [--purge] [--yes]                  # remove 5dive (--purge also wipes state + user)
 
 Live view:
@@ -408,12 +409,21 @@ main() {
         fail "$E_NOT_FOUND" "curl is required for 5dive uninstall"
       fi ;;
     self-update|self_update|update)
-      # On-demand "update everything + reload" for OSS self-hosters with no
-      # scheduler: runs install.sh --upgrade (CLI + plugins) then restarts
-      # running agents so the changes load. Mirrors the managed nightly.
-      [[ $EUID -eq 0 ]] || fail "$E_PERMISSION" "self-update must run as root (sudo 5dive self-update)"
-      AUDIT_CMD="self-update"; AUDIT_ARGS=("$@")
-      cmd_self_update "$@" ;;
+      # `--check` is a read-only version probe (no root, no mutation): compares
+      # the installed CLI to the published release so the dashboard maintenance
+      # tile can show a "your CLI is behind — update now" prompt. Everything
+      # else in this branch mutates the box, so it stays root-gated.
+      if [[ "${1:-}" == "--check" ]]; then
+        shift
+        cmd_update_check "$@"
+      else
+        # On-demand "update everything + reload" for OSS self-hosters with no
+        # scheduler: runs install.sh --upgrade (CLI + plugins) then restarts
+        # running agents so the changes load. Mirrors the managed nightly.
+        [[ $EUID -eq 0 ]] || fail "$E_PERMISSION" "self-update must run as root (sudo 5dive self-update)"
+        AUDIT_CMD="self-update"; AUDIT_ARGS=("$@")
+        cmd_self_update "$@"
+      fi ;;
     -h|--help|help) usage ;;
     *) fail "$E_USAGE" "unknown command: $top" ;;
   esac

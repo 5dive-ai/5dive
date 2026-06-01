@@ -9,6 +9,18 @@ release.
 
 ## [Unreleased]
 
+## [0.1.34] — 2026-06-01
+
+### Added
+- `5dive update --check` — read-only version probe (no root, no mutation):
+  compares the installed CLI to the published release and reads the last
+  managed nightly soft-update result, reporting `{current, latest, behind,
+  stale, lastUpdateOk, lastUpdateAt}`. `stale` is true only when the box is
+  behind **and** the auto-update isn't closing the gap (failed, never ran on
+  record, or overdue past ~36h) — so it doesn't flag a box that's merely a
+  release behind with a healthy nightly that'll catch up. Powers the dashboard
+  maintenance "your CLI is out of date — update now" banner.
+
 ## [0.1.33] — 2026-06-01
 
 ### Added

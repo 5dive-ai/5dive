@@ -77,3 +77,81 @@ cmd_self_update() {
      '{restarted:$r, restarted_count:($r|length), failed:$f}' \
      --argjson r "$r" --argjson f "$f"
 }
+
+# version_lt A B — true when semver A is strictly older than B (sort -V).
+version_lt() {
+  [[ "$1" != "$2" && "$(printf '%s\n%s\n' "$1" "$2" | sort -V | head -n1)" == "$1" ]]
+}
+
+# How long the dashboard waits after a release before treating a still-behind
+# box as "stale". One nightly soft-update (every 24h) should close the gap, so
+# anything past ~1.5 days means the auto-update isn't keeping up.
+readonly UPDATE_STALE_AFTER_SECS=$((36 * 3600))
+
+# cmd_update_check — read-only (no root, no mutation) version probe for the
+# dashboard maintenance tile. Compares the installed CLI to the published
+# release and reads the last nightly soft-update result, then reports whether
+# the box is GENUINELY stale (behind AND the auto-update isn't catching up) vs
+# merely a release or two behind with a healthy nightly that'll close the gap.
+cmd_update_check() {
+  [[ $# -eq 0 ]] || fail "$E_USAGE" "update --check takes no arguments"
+  command -v curl >/dev/null 2>&1 || fail "$E_NOT_FOUND" "curl is required for update --check"
+
+  local current="$FIVE_VERSION" latest
+  latest=$(curl -fsSL "https://raw.githubusercontent.com/5dive-com/5dive/main/5dive" 2>/dev/null \
+    | grep -m1 -oP '(?<=^readonly FIVE_VERSION=")[^"]+') \
+    || true
+  [[ -n "$latest" ]] || fail "$E_GENERIC" "could not determine the latest published version"
+
+  local behind=false
+  version_lt "$current" "$latest" && behind=true
+
+  # Inspect the last managed nightly soft-update run (managed boxes log to
+  # /tmp/claude-soft-updates.log). Best-effort: absent log → unknown.
+  local log="/tmp/claude-soft-updates.log"
+  local last_ok_json="null" last_at_json="null" last_epoch=""
+  if [[ -r "$log" ]]; then
+    local start_line
+    start_line=$(grep -n "soft updates start" "$log" | tail -1 | cut -d: -f1)
+    if [[ -n "$start_line" ]]; then
+      if tail -n "+${start_line}" "$log" | grep -q "CLI upgrade via install.5dive.com failed"; then
+        last_ok_json="false"
+      else
+        last_ok_json="true"
+      fi
+    fi
+    local last_at
+    last_at=$(grep -oE "[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:+-]+ soft updates done" "$log" \
+      | tail -1 | grep -oE "^[^ ]+")
+    if [[ -n "$last_at" ]]; then
+      last_at_json="\"$last_at\""
+      last_epoch=$(date -d "$last_at" +%s 2>/dev/null || echo "")
+    fi
+  fi
+
+  # "stale" = behind AND the nightly auto-update isn't closing the gap: it
+  # failed, never ran on record, or hasn't run inside the staleness window.
+  local stale=false now
+  now=$(date +%s)
+  if [[ "$behind" == true ]]; then
+    if [[ "$last_ok_json" == "false" || -z "$last_epoch" ]]; then
+      stale=true
+    elif (( now - last_epoch > UPDATE_STALE_AFTER_SECS )); then
+      stale=true
+    fi
+  fi
+
+  local prose
+  if [[ "$behind" == true ]]; then
+    prose="CLI $current is behind (latest $latest)"
+    [[ "$stale" == true ]] && prose+=" — stale, update recommended"
+  else
+    prose="CLI $current is up to date"
+  fi
+
+  ok "$prose" \
+     '{current:$cur, latest:$lat, behind:$beh, stale:$stl, lastUpdateOk:$luo, lastUpdateAt:$lua}' \
+     --arg cur "$current" --arg lat "$latest" \
+     --argjson beh "$behind" --argjson stl "$stale" \
+     --argjson luo "$last_ok_json" --argjson lua "$last_at_json"
+}
