@@ -836,8 +836,14 @@ fi
 if [[ -n "$RESUME_ID" ]]; then
   # A trailing positional prompt seeds the first interactive turn (no --print →
   # stays interactive). Only added when the marker carried a valid line-2 prompt.
+  # The prompt MUST be separated from "${ARGS[@]}" by a literal `--`: claude's
+  # `--channels` is a variadic option, so a bare trailing positional gets
+  # swallowed as an extra channel name ("--channels … continue" → claude errors
+  # "entries must be tagged: continue" and exits, dropping the auto-resume to a
+  # plain idle respawn). `--` ends option parsing so the prompt is read as the
+  # positional first turn regardless of which variadic flags precede it.
   if [[ -n "$RESUME_PROMPT" ]]; then
-    CMD_STR_FIRST=$(printf '%q ' "$BIN" --resume "$RESUME_ID" "${ARGS[@]}" "$RESUME_PROMPT")
+    CMD_STR_FIRST=$(printf '%q ' "$BIN" --resume "$RESUME_ID" "${ARGS[@]}" -- "$RESUME_PROMPT")
   else
     CMD_STR_FIRST=$(printf '%q ' "$BIN" --resume "$RESUME_ID" "${ARGS[@]}")
   fi

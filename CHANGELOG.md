@@ -9,6 +9,20 @@ release.
 
 ## [Unreleased]
 
+## [0.1.41] — 2026-06-02
+
+### Fixed
+- Account-rotation auto-continue now actually resumes the in-flight turn on the
+  new account. `5dive-agent-start` seeded the resume prompt as a bare trailing
+  positional (`claude --resume <id> … --channels plugin:telegram@… continue`),
+  but `--channels` is a **variadic** flag — it swallowed `continue` as a second
+  channel name, claude rejected it (`entries must be tagged`) and exited code 1,
+  and the supervisor loop respawned a plain, idle, context-less claude. The new
+  account then sat at the prompt until the user re-pinged. Fix: separate the
+  prompt from the args with a literal `--` so option parsing ends before the
+  positional turn (`claude --resume <id> … --channels … -- continue`). Manual
+  `/resume` (no line-2 prompt) was unaffected and stays unchanged.
+
 ## [0.1.34] — 2026-06-01
 
 ### Added
