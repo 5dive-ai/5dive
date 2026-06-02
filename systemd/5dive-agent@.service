@@ -21,7 +21,14 @@ ExecStart=/usr/local/bin/5dive-agent-start %i
 ExecStop=/bin/bash -c '/usr/bin/tmux kill-session -t agent-%i 2>/dev/null || true'
 Restart=on-failure
 RestartSec=3
-TimeoutStopSec=60
+# Default KillMode=control-group: on stop, systemd SIGTERMs every process in
+# the cgroup (incl. the codex/grok/agy telegram bridge `bun`), letting bun's
+# graceful handler abort its Telegram long-poll so the next poller doesn't 409.
+# 15s (not 60s) is the SIGKILL backstop: a clean bun exits in ~70ms, so this
+# only bites a hung/regressed bridge — and then it frees the agent slot in 15s
+# instead of stalling a restart for a full minute (see codex bun SIGTERM bug,
+# fixed plugin-side grok 0.1.25 / codex 0.2.26 / agy 0.1.15).
+TimeoutStopSec=15
 
 [Install]
 WantedBy=multi-user.target
