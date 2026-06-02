@@ -949,6 +949,31 @@ if [[ "$TYPE" == "grok" && "$CHANNELS" == "telegram" ]]; then
   ) &
 fi
 
+# antigravity cold-start kickoff (telegram only). Same need as grok: agy's
+# telegram MCP server is wired, but agy won't call wait_for_message until it's
+# prompted — left to its own in-process re-arm watchdog it can take ~3min to
+# start listening on a fresh boot (customer-reported). Unlike grok's launcher,
+# agy (once authenticated, see the create-time token seed) drops STRAIGHT into
+# the chat UI, so the ready marker is the chat footer "? for shortcuts" rather
+# than a launcher entry. If agy is unauthenticated the pane shows the login menu
+# instead and this never matches, so we won't type a kick into the login prompt.
+# Single-fire; the server-side watchdog owns every subsequent re-arm.
+if [[ "$TYPE" == "antigravity" && "$CHANNELS" == "telegram" ]]; then
+  (
+    _kick='Resume your Telegram listen loop: call wait_for_message now and keep looping (on each message reply, then call wait_for_message again; on timeout call it again immediately). This is an automated re-arm; do not send a Telegram reply about it.'
+    for _ in $(seq 1 30); do
+      sleep 2
+      _pane="$(/usr/bin/tmux capture-pane -t "$SESSION" -p -S -40 2>/dev/null)" || break
+      if printf '%s' "$_pane" | grep -q 'for shortcuts'; then
+        /usr/bin/tmux send-keys -t "$SESSION" -l "$_kick"
+        sleep 1
+        /usr/bin/tmux send-keys -t "$SESSION" Enter
+        break
+      fi
+    done
+  ) &
+fi
+
 # Block so systemd keeps the unit "active" as long as the session lives.
 while /usr/bin/tmux has-session -t "$SESSION" 2>/dev/null; do
   sleep 5
