@@ -464,6 +464,7 @@ cmd_agent_rotation_get() {
     jq -cn --arg a "$active" --argjson r "$rot" '{ok:true, data:{
       active:$a,
       enabled:($r.enabled // false),
+      allAccounts:($r.allAccounts // false),
       accounts:($r.accounts // []),
       cooldowns:($r.cooldowns // {})
     }}'
@@ -472,7 +473,13 @@ cmd_agent_rotation_get() {
     echo "agent:    $name"
     echo "active:   ${active:--}"
     echo "rotation: $(jq -r '.enabled // false' <<<"$rot")"
-    echo "accounts: $(jq -r '(.accounts // []) | if length==0 then "-" else join(", ") end' <<<"$rot")"
+    # allAccounts is the "use every eligible profile" sentinel — show it as the
+    # pool rather than the (empty) explicit list.
+    if [[ "$(jq -r '.allAccounts // false' <<<"$rot")" == "true" ]]; then
+      echo "accounts: all (every eligible profile)"
+    else
+      echo "accounts: $(jq -r '(.accounts // []) | if length==0 then "-" else join(", ") end' <<<"$rot")"
+    fi
     # only surface still-active cooldowns; expired ones are noise.
     jq -r --argjson now "$now" '(.cooldowns // {}) | to_entries[]
       | select(.value > $now) | "  cooling: \(.key) until \(.value)"' <<<"$rot" 2>/dev/null || true
@@ -501,11 +508,17 @@ cmd_agent_rotation_set() {
   if [[ -n "$set_enabled" ]]; then
     case "$set_enabled" in true|false) ;; *) fail "$E_VALIDATION" "--enabled must be true or false" ;; esac
   fi
-  # Parse + validate the ordered account list (dedup, preserve order). Each
-  # must be a configured profile AND carry a credential for THIS agent's type
-  # — rotating to an account the agent can't authenticate as is a footgun.
-  local accounts_json="[]"
-  if (( accounts_provided )) && [[ -n "$set_accounts" ]]; then
+  # Parse the account spec. `--accounts=all` is the sentinel for "use every
+  # eligible (same-type) profile, auto-including ones added later" — we store an
+  # allAccounts flag and an EMPTY explicit list, then resolve the live pool at
+  # rotate-time (see cmd_agent_rotation_rotate). Otherwise it's an ordered list
+  # (dedup, preserve order); each entry must be a configured profile that
+  # carries a credential for THIS agent's type — rotating to an account the
+  # agent can't authenticate as is a footgun.
+  local accounts_json="[]" all_accounts="false"
+  if (( accounts_provided )) && [[ "${set_accounts,,}" == "all" ]]; then
+    all_accounts="true"
+  elif (( accounts_provided )) && [[ -n "$set_accounts" ]]; then
     local -a arr=(); IFS=',' read -ra arr <<<"$set_accounts"
     local acct seen=""
     for acct in "${arr[@]}"; do
@@ -530,21 +543,42 @@ cmd_agent_rotation_set() {
     reg=$(jq --arg n "$name" --argjson e "$set_enabled" '.agents[$n].rotation.enabled = $e' <<<"$reg")
   fi
   if (( accounts_provided )); then
-    reg=$(jq --arg n "$name" --argjson a "$accounts_json" '.agents[$n].rotation.accounts = $a' <<<"$reg")
-    # Drop cooldowns for accounts no longer in the list.
-    reg=$(jq --arg n "$name" '
-      (.agents[$n].rotation.cooldowns // {}) as $c
-      | (.agents[$n].rotation.accounts // []) as $acc
-      | .agents[$n].rotation.cooldowns =
-          reduce $acc[] as $k ({}; if $c[$k] != null then .[$k] = $c[$k] else . end)' <<<"$reg")
+    reg=$(jq --arg n "$name" --argjson a "$accounts_json" --argjson all "$all_accounts" \
+      '.agents[$n].rotation.accounts = $a | .agents[$n].rotation.allAccounts = $all' <<<"$reg")
+    # Cooldown pruning only applies to an explicit list — drop cooldowns for
+    # accounts no longer in it. Under allAccounts the pool is dynamic (resolved
+    # at rotate-time), so we keep every cooldown; expired ones are ignored then.
+    if [[ "$all_accounts" != "true" ]]; then
+      reg=$(jq --arg n "$name" '
+        (.agents[$n].rotation.cooldowns // {}) as $c
+        | (.agents[$n].rotation.accounts // []) as $acc
+        | .agents[$n].rotation.cooldowns =
+            reduce $acc[] as $k ({}; if $c[$k] != null then .[$k] = $c[$k] else . end)' <<<"$reg")
+    fi
   fi
   echo "$reg" | registry_write
-  local out_enabled out_accounts
+  local out_enabled out_accounts out_all
   out_enabled=$(jq -c --arg n "$name" '.agents[$n].rotation.enabled' <<<"$reg")
   out_accounts=$(jq -c --arg n "$name" '.agents[$n].rotation.accounts' <<<"$reg")
+  out_all=$(jq -c --arg n "$name" '.agents[$n].rotation.allAccounts // false' <<<"$reg")
   ok "rotation config updated for '$name'" \
-     '{name:$n, enabled:$e, accounts:$a}' \
-     --arg n "$name" --argjson e "$out_enabled" --argjson a "$out_accounts"
+     '{name:$n, enabled:$e, allAccounts:$all, accounts:$a}' \
+     --arg n "$name" --argjson e "$out_enabled" --argjson all "$out_all" --argjson a "$out_accounts"
+}
+
+# rotation_eligible_accounts <type> — JSON array of every configured profile
+# that carries a credential for <type>, in account_each (alphabetical) order.
+# Resolves the live pool for an allAccounts rotation, so profiles added after
+# the agent was configured automatically join the rotation.
+rotation_eligible_accounts() {
+  local type="$1" out="[]" acct
+  while IFS= read -r acct; do
+    [[ -n "$acct" ]] || continue
+    jq -e --arg t "$type" 'index($t) != null' \
+      <<<"$(account_types_authed "$acct")" >/dev/null 2>&1 \
+      && out=$(jq -c --arg a "$acct" '. + [$a]' <<<"$out")
+  done < <(account_each)
+  printf '%s' "$out"
 }
 
 cmd_agent_rotation_rotate() {
@@ -577,14 +611,25 @@ cmd_agent_rotation_rotate() {
       | .agents[$n].rotation.cooldowns[$c] = $u' <<<"$reg")
     echo "$reg" | registry_write
   fi
-  # Pick the first account in the ordered list that isn't the current one and
-  # isn't still cooling. Order == preference.
-  local now target; now=$(date +%s)
-  target=$(jq -r --arg n "$name" --arg cur "$current" --argjson now "$now" '
-    (.agents[$n].rotation.accounts // []) as $acc
-    | (.agents[$n].rotation.cooldowns // {}) as $cd
-    | ([ $acc[] | select(. != $cur) | select(($cd[.] // 0) <= $now) ] | first) // ""
-  ' <<<"$reg")
+  # Resolve the pool: under allAccounts it's every eligible same-type profile
+  # (computed live so newly-added accounts join automatically), otherwise the
+  # stored ordered list. Then pick the first entry that isn't the current
+  # account and isn't still cooling. Order == preference.
+  local allflag type pool now target
+  allflag=$(jq -r --arg n "$name" '.agents[$n].rotation.allAccounts // false' <<<"$reg")
+  if [[ "$allflag" == "true" ]]; then
+    type=$(jq -r --arg n "$name" '.agents[$n].type' <<<"$reg")
+    pool=$(rotation_eligible_accounts "$type")
+  else
+    pool=$(jq -c --arg n "$name" '.agents[$n].rotation.accounts // []' <<<"$reg")
+  fi
+  now=$(date +%s)
+  # -n (null input): everything is passed via --arg/--argjson, so the program
+  # must run once on null input rather than waiting on (empty) stdin.
+  target=$(jq -rn --arg cur "$current" --argjson now "$now" --argjson acc "$pool" \
+    --argjson cd "$(jq -c --arg n "$name" '.agents[$n].rotation.cooldowns // {}' <<<"$reg")" '
+    ([ $acc[] | select(. != $cur) | select(($cd[.] // 0) <= $now) ] | first) // ""
+  ')
   if [[ -z "$target" ]]; then
     if (( JSON_MODE )); then
       ok "" '{rotated:false, from:$f, to:null, reason:"no eligible account (all cooling or none configured)"}' \
