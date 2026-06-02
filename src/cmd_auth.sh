@@ -699,10 +699,13 @@ cmd_auth_login() {
       exec sudo -u claude -i env $extra_env bash -lc 'codex login' ;;
     antigravity)
       # agy has no `auth login` subcommand — OAuth fires automatically the
-      # first time the binary needs a token. `--print ping` is a minimal
-      # one-shot that triggers it; the binary prints the Google OAuth URL,
-      # then waits 30s for either an OAuth callback OR a pasted code.
-      exec sudo -u claude -i env $extra_env bash -lc 'agy --print ping' ;;
+      # first time the binary needs a token. Use the interactive TUI
+      # (`--prompt-interactive ping`) rather than `--print ping`: print mode
+      # caps the OAuth wait at 30s, but the interactive TUI waits indefinitely
+      # for the pasted code. Run directly at the terminal here, the user picks
+      # "Google OAuth", opens the printed URL, and pastes the authorization
+      # code — no 30s race.
+      exec sudo -u claude -i env $extra_env bash -lc 'agy --prompt-interactive ping' ;;
     grok)
       # grok has both an interactive UI OAuth (localhost callback, no good
       # for headless VMs) and a dedicated --device-auth flag (URL + 4-dash-4
@@ -955,13 +958,18 @@ cmd_auth_start() {
   case "$type" in
     codex)  login_cmd="$bin login --device-auth" ;;
     antigravity)
-      # `agy --print ping` is the minimal command that exercises the auth
-      # path: the binary attempts silent auth from keyring/file, fails on
-      # a fresh agent user (no DBus session), prints the Google OAuth URL,
-      # and waits 30s for either an OAuth callback poll or a pasted code.
-      # Same UX shape as gemini was; the URL pattern is identical except
-      # for the redirect_uri (antigravity.google/oauth-callback).
-      login_cmd="$bin --print ping" ;;
+      # agy's print mode (`--print ping`) hard-caps the interactive OAuth wait
+      # at 30s ("Print mode: auth timed out") — far too short for a human to
+      # finish Google sign-in and paste the code back through the dashboard.
+      # The session dies, no antigravity-oauth-token is written, and
+      # `agent create` then correctly rejects the empty profile. So drive auth
+      # through the INTERACTIVE TUI instead (`--prompt-interactive ping`),
+      # which waits indefinitely for the pasted authorization code. The TUI
+      # first shows a login-method menu (Google OAuth pre-selected) and renders
+      # the OAuth URL inside the TUI rather than the script log — cmd_auth_poll
+      # presses Enter to pick the method and scrapes the URL from the pane (see
+      # the antigravity branch there + the wide pane in the spawn below).
+      login_cmd="$bin --prompt-interactive ping" ;;
     grok)
       # `grok login --device-auth` prints accounts.x.ai/oauth2/device + a
       # 4-dash-4 user code, polls the device-auth endpoint itself, and
@@ -1007,9 +1015,17 @@ cmd_auth_start() {
   # bash -lc (login shell) sources /etc/profile.d/5dive-shared-configs.sh, so
   # CODEX_HOME points at /home/claude/.codex and the auth.json lands in the
   # shared location every agent-<name> login shell already reads.
+  #
+  # antigravity renders its OAuth URL inside the interactive TUI (alt-screen),
+  # so cmd_auth_poll scrapes it via `tmux capture-pane` rather than $log. The
+  # URL is ~650 chars; a normal-width pane hard-wraps it and the scrape would
+  # truncate. Give agy a very wide pane so the whole URL stays on one logical
+  # line. Other types print the URL to $log, where pane width is irrelevant.
+  local pane_width=200
+  [[ "$type" == "antigravity" ]] && pane_width=700
   sudo -u claude -H bash -lc "
     ${preseed}
-    tmux -S '$sock' new-session -d -s '$session' -x 200 -y 50 \
+    tmux -S '$sock' new-session -d -s '$session' -x $pane_width -y 50 \
       'env $extra_env script -q -f -c \"$login_cmd\" $log'
   " >&2 || fail "$E_GENERIC" "failed to spawn tmux session"
 
@@ -1066,10 +1082,26 @@ cmd_auth_poll() {
             fi
             ;;
           antigravity)
-            # agy prints just the Google OAuth URL and waits for either a
-            # callback poll or a pasted code (same UX as gemini was).
+            # agy runs as an interactive TUI (no 30s print-mode cap). It first
+            # shows a login-method menu with "Google OAuth" pre-selected, then
+            # — once that's chosen — renders the OAuth URL + a "paste the
+            # authorization code" prompt INSIDE the TUI (not $log). So scrape
+            # the live pane: press Enter once to dismiss the menu, then pull the
+            # URL out. The pane is spawned wide (cmd_auth_start) so the
+            # ~650-char URL isn't wrapped/truncated. capture-pane -J rejoins
+            # soft-wrapped lines; -S -400 includes scrollback in case the menu
+            # has scrolled the URL up.
+            local pane="${dir}/pane.txt"
+            sudo -u claude tmux -S "$sock" capture-pane -p -J -S -400 \
+              -t "$session" > "$pane" 2>/dev/null || true
+            # Select "Google OAuth" exactly once, only while the menu is shown.
+            if [[ ! -e "${dir}/.oauth_selected" ]] \
+               && grep -qiE 'select login method|google oauth' "$pane"; then
+              sudo -u claude tmux -S "$sock" send-keys -t "$session" Enter 2>/dev/null || true
+              : > "${dir}/.oauth_selected"
+            fi
             local url
-            url=$(extract_antigravity_url "$log" || true)
+            url=$(extract_antigravity_url "$pane" || true)
             if [[ -n "$url" ]]; then
               state="awaiting_code"
               jq --arg u "$url" --arg s "$state" --arg ts "$(date -Iseconds)" \
