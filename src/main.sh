@@ -282,6 +282,25 @@ main() {
         set-account)
           AUDIT_CMD="agent set-account"; AUDIT_ARGS=("$@")
           with_registry_lock cmd_agent_set_account "$@" ;;
+        rotation)
+          [[ $# -gt 0 ]] || fail "$E_USAGE" "usage: 5dive agent rotation get|set|rotate|cooldown|clear-cooldown <agent> [...]"
+          local rotcmd="$1"; shift
+          case "$rotcmd" in
+            get) cmd_agent_rotation_get "$@" ;;  # read-only, no lock/audit
+            set)
+              AUDIT_CMD="agent rotation set"; AUDIT_ARGS=("$@")
+              with_registry_lock cmd_agent_rotation_set "$@" ;;
+            rotate)
+              AUDIT_CMD="agent rotation rotate"; AUDIT_ARGS=("$@")
+              with_registry_lock cmd_agent_rotation_rotate "$@" ;;
+            cooldown)
+              AUDIT_CMD="agent rotation cooldown"; AUDIT_ARGS=("$@")
+              with_registry_lock cmd_agent_rotation_cooldown "$@" ;;
+            clear-cooldown)
+              AUDIT_CMD="agent rotation clear-cooldown"; AUDIT_ARGS=("$@")
+              with_registry_lock cmd_agent_rotation_clear_cooldown "$@" ;;
+            *) fail "$E_USAGE" "unknown rotation command: $rotcmd (get|set|rotate|cooldown|clear-cooldown)" ;;
+          esac ;;
         skill)
           AUDIT_CMD="agent skill"; AUDIT_ARGS=("$@")
           cmd_skill "$@" ;;     # add/list/rm operate on the agent type's skills dir

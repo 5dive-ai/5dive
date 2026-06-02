@@ -26,7 +26,7 @@ esac
 
 # Bumped on every public release. `build.sh` checks this line exists; CI fails
 # the bundle-drift check if it's missing or empty.
-readonly FIVE_VERSION="0.1.34"
+readonly FIVE_VERSION="0.1.35"
 
 STATE_DIR="/var/lib/5dive"
 REGISTRY="${STATE_DIR}/agents.json"
@@ -3676,6 +3676,236 @@ cmd_agent_set_account() {
   [[ -n "$agent" && -n "$account" ]] \
     || fail "$E_USAGE" "usage: 5dive agent set-account <agent> <account|default>"
   cmd_config "$agent" set "auth-profile=${account}"
+}
+
+# ---------------------------------------------------------------------------
+# `agent rotation` — opt-in multi-account auto-rotation.
+#
+# Lets an agent be bound to an ORDERED list of accounts and auto-swap to the
+# next eligible one when it hits a usage limit (driven by the rate-limit
+# recovery path — see Phase 2). Default OFF; never rotates into a cooling
+# account; if none are eligible the caller falls back to wait-for-reset.
+#
+# State lives in the registry under .agents[<name>].rotation:
+#   { enabled: bool, accounts: [ordered profile names], cooldowns: {profile: epoch} }
+# The agent's ACTIVE account stays .agents[<name>].authProfile (single source
+# of truth). `rotate` just selects the next eligible profile and re-points it
+# through cmd_config, reusing the exact set-account plumbing (env rewrite,
+# auth-symlink re-point, deferred restart).
+#
+# Mutating subcommands run under the registry lock; `get` is read-only. The
+# get/set/rotate/cooldown/clear-cooldown routing lives in main.sh's `agent`
+# dispatcher (mirrors how `auth` and `telegram-access` are routed inline).
+
+# rotation_require_agent <name> — emit the registry JSON, failing if the agent
+# is unknown. Caller captures stdout.
+rotation_require_agent() {
+  local name="$1" reg
+  reg=$(registry_read)
+  jq -e --arg n "$name" '.agents[$n] != null' <<<"$reg" >/dev/null \
+    || fail "$E_NOT_FOUND" "no agent named '$name'"
+  printf '%s' "$reg"
+}
+
+cmd_agent_rotation_get() {
+  local name="${1:-}"
+  [[ -n "$name" ]] || fail "$E_USAGE" "usage: 5dive agent rotation get <agent>"
+  ensure_state
+  local reg active rot
+  reg=$(rotation_require_agent "$name")
+  active=$(jq -r --arg n "$name" '.agents[$n].authProfile // ""' <<<"$reg")
+  rot=$(jq -c --arg n "$name" \
+    '.agents[$n].rotation // {enabled:false, accounts:[], cooldowns:{}}' <<<"$reg")
+  if (( JSON_MODE )); then
+    jq -cn --arg a "$active" --argjson r "$rot" '{ok:true, data:{
+      active:$a,
+      enabled:($r.enabled // false),
+      accounts:($r.accounts // []),
+      cooldowns:($r.cooldowns // {})
+    }}'
+  else
+    local now; now=$(date +%s)
+    echo "agent:    $name"
+    echo "active:   ${active:--}"
+    echo "rotation: $(jq -r '.enabled // false' <<<"$rot")"
+    echo "accounts: $(jq -r '(.accounts // []) | if length==0 then "-" else join(", ") end' <<<"$rot")"
+    # only surface still-active cooldowns; expired ones are noise.
+    jq -r --argjson now "$now" '(.cooldowns // {}) | to_entries[]
+      | select(.value > $now) | "  cooling: \(.key) until \(.value)"' <<<"$rot" 2>/dev/null || true
+  fi
+}
+
+cmd_agent_rotation_set() {
+  local name="${1:-}"; shift || true
+  [[ -n "$name" ]] \
+    || fail "$E_USAGE" "usage: 5dive agent rotation set <agent> [--enabled=true|false] [--accounts=a,b,c]"
+  require_root
+  ensure_state
+  local set_enabled="" set_accounts="" accounts_provided=0 a
+  for a in "$@"; do
+    case "$a" in
+      --enabled=*)  set_enabled="${a#--enabled=}" ;;
+      --accounts=*) set_accounts="${a#--accounts=}"; accounts_provided=1 ;;
+      *) fail "$E_USAGE" "unknown flag: $a" ;;
+    esac
+  done
+  [[ -n "$set_enabled" || $accounts_provided -eq 1 ]] \
+    || fail "$E_USAGE" "nothing to set — pass --enabled= and/or --accounts="
+  local reg type
+  reg=$(rotation_require_agent "$name")
+  type=$(jq -r --arg n "$name" '.agents[$n].type' <<<"$reg")
+  if [[ -n "$set_enabled" ]]; then
+    case "$set_enabled" in true|false) ;; *) fail "$E_VALIDATION" "--enabled must be true or false" ;; esac
+  fi
+  # Parse + validate the ordered account list (dedup, preserve order). Each
+  # must be a configured profile AND carry a credential for THIS agent's type
+  # — rotating to an account the agent can't authenticate as is a footgun.
+  local accounts_json="[]"
+  if (( accounts_provided )) && [[ -n "$set_accounts" ]]; then
+    local -a arr=(); IFS=',' read -ra arr <<<"$set_accounts"
+    local acct seen=""
+    for acct in "${arr[@]}"; do
+      acct="${acct//[[:space:]]/}"
+      [[ -n "$acct" ]] || continue
+      valid_profile_name "$acct" \
+        || fail "$E_VALIDATION" "invalid account name in --accounts: '$acct'"
+      [[ -f "${AUTH_PROFILES_DIR}/${acct}/combined.env" ]] \
+        || fail "$E_NOT_FOUND" "account '$acct' not configured"
+      jq -e --arg t "$type" 'index($t) != null' \
+        <<<"$(account_types_authed "$acct")" >/dev/null \
+        || fail "$E_VALIDATION" "account '$acct' has no $type credential — rotation needs same-type accounts"
+      case ",$seen," in *",$acct,"*) continue ;; esac
+      seen="${seen:+$seen,}$acct"
+      accounts_json=$(jq -c --arg a "$acct" '. + [$a]' <<<"$accounts_json")
+    done
+  fi
+  # Ensure the rotation object exists, then apply the requested fields.
+  reg=$(jq --arg n "$name" \
+    '.agents[$n].rotation = (.agents[$n].rotation // {enabled:false, accounts:[], cooldowns:{}})' <<<"$reg")
+  if [[ -n "$set_enabled" ]]; then
+    reg=$(jq --arg n "$name" --argjson e "$set_enabled" '.agents[$n].rotation.enabled = $e' <<<"$reg")
+  fi
+  if (( accounts_provided )); then
+    reg=$(jq --arg n "$name" --argjson a "$accounts_json" '.agents[$n].rotation.accounts = $a' <<<"$reg")
+    # Drop cooldowns for accounts no longer in the list.
+    reg=$(jq --arg n "$name" '
+      (.agents[$n].rotation.cooldowns // {}) as $c
+      | (.agents[$n].rotation.accounts // []) as $acc
+      | .agents[$n].rotation.cooldowns =
+          reduce $acc[] as $k ({}; if $c[$k] != null then .[$k] = $c[$k] else . end)' <<<"$reg")
+  fi
+  echo "$reg" | registry_write
+  local out_enabled out_accounts
+  out_enabled=$(jq -c --arg n "$name" '.agents[$n].rotation.enabled' <<<"$reg")
+  out_accounts=$(jq -c --arg n "$name" '.agents[$n].rotation.accounts' <<<"$reg")
+  ok "rotation config updated for '$name'" \
+     '{name:$n, enabled:$e, accounts:$a}' \
+     --arg n "$name" --argjson e "$out_enabled" --argjson a "$out_accounts"
+}
+
+cmd_agent_rotation_rotate() {
+  local name="${1:-}"; shift || true
+  [[ -n "$name" ]] \
+    || fail "$E_USAGE" "usage: 5dive agent rotation rotate <agent> [--cooldown-current=<epoch>]"
+  require_root
+  ensure_state
+  local cooldown_current="" a
+  for a in "$@"; do
+    case "$a" in
+      --cooldown-current=*) cooldown_current="${a#--cooldown-current=}" ;;
+      *) fail "$E_USAGE" "unknown flag: $a" ;;
+    esac
+  done
+  local reg enabled current
+  reg=$(rotation_require_agent "$name")
+  enabled=$(jq -r --arg n "$name" '.agents[$n].rotation.enabled // false' <<<"$reg")
+  current=$(jq -r --arg n "$name" '.agents[$n].authProfile // ""' <<<"$reg")
+  [[ "$enabled" == "true" ]] \
+    || fail "$E_VALIDATION" "rotation not enabled for '$name' (enable: 5dive agent rotation set $name --enabled=true)"
+  # Cool down the account we're leaving (the one that just hit its limit), so
+  # we don't bounce straight back to it. Persist immediately — even if no
+  # eligible target exists, the cooldown should stick for the next attempt.
+  if [[ -n "$cooldown_current" && -n "$current" ]]; then
+    [[ "$cooldown_current" =~ ^[0-9]+$ ]] \
+      || fail "$E_VALIDATION" "--cooldown-current must be an epoch (seconds)"
+    reg=$(jq --arg n "$name" --arg c "$current" --argjson u "$cooldown_current" '
+      .agents[$n].rotation = (.agents[$n].rotation // {enabled:false, accounts:[], cooldowns:{}})
+      | .agents[$n].rotation.cooldowns[$c] = $u' <<<"$reg")
+    echo "$reg" | registry_write
+  fi
+  # Pick the first account in the ordered list that isn't the current one and
+  # isn't still cooling. Order == preference.
+  local now target; now=$(date +%s)
+  target=$(jq -r --arg n "$name" --arg cur "$current" --argjson now "$now" '
+    (.agents[$n].rotation.accounts // []) as $acc
+    | (.agents[$n].rotation.cooldowns // {}) as $cd
+    | ([ $acc[] | select(. != $cur) | select(($cd[.] // 0) <= $now) ] | first) // ""
+  ' <<<"$reg")
+  if [[ -z "$target" ]]; then
+    if (( JSON_MODE )); then
+      ok "" '{rotated:false, from:$f, to:null, reason:"no eligible account (all cooling or none configured)"}' \
+         --arg f "$current"
+    else
+      echo "OK — no eligible account to rotate to (all cooling / none configured)"
+    fi
+    return 0
+  fi
+  # Re-point via the existing set-account plumbing. We already hold the
+  # registry lock and cmd_config reads/writes the registry directly (safe
+  # under the lock); it also fires the deferred restart. Silence its own
+  # stdout so we emit a single clean envelope.
+  cmd_config "$name" set "auth-profile=${target}" >/dev/null
+  ok "rotated '$name': ${current:--} -> ${target}" \
+     '{rotated:true, from:$f, to:$t}' --arg f "$current" --arg t "$target"
+}
+
+cmd_agent_rotation_cooldown() {
+  local name="${1:-}" account="${2:-}"
+  [[ -n "$name" && -n "$account" ]] \
+    || fail "$E_USAGE" "usage: 5dive agent rotation cooldown <agent> <account> --until=<epoch>"
+  shift 2
+  require_root
+  ensure_state
+  local until="" a
+  for a in "$@"; do
+    case "$a" in
+      --until=*) until="${a#--until=}" ;;
+      *) fail "$E_USAGE" "unknown flag: $a" ;;
+    esac
+  done
+  [[ "$until" =~ ^[0-9]+$ ]] || fail "$E_VALIDATION" "--until=<epoch seconds> required"
+  valid_profile_name "$account" || fail "$E_VALIDATION" "invalid account name"
+  local reg
+  reg=$(rotation_require_agent "$name")
+  reg=$(jq --arg n "$name" --arg a "$account" --argjson u "$until" '
+    .agents[$n].rotation = (.agents[$n].rotation // {enabled:false, accounts:[], cooldowns:{}})
+    | .agents[$n].rotation.cooldowns[$a] = $u' <<<"$reg")
+  echo "$reg" | registry_write
+  ok "cooldown set: '$account' until $until" \
+     '{name:$n, account:$a, until:$u}' --arg n "$name" --arg a "$account" --argjson u "$until"
+}
+
+cmd_agent_rotation_clear_cooldown() {
+  local name="${1:-}" account="${2:-}"
+  [[ -n "$name" ]] \
+    || fail "$E_USAGE" "usage: 5dive agent rotation clear-cooldown <agent> [<account>]"
+  require_root
+  ensure_state
+  local reg
+  reg=$(rotation_require_agent "$name")
+  if [[ -n "$account" ]]; then
+    valid_profile_name "$account" || fail "$E_VALIDATION" "invalid account name"
+    reg=$(jq --arg n "$name" --arg a "$account" '
+      if .agents[$n].rotation.cooldowns then
+        .agents[$n].rotation.cooldowns |= del(.[$a])
+      else . end' <<<"$reg")
+  else
+    reg=$(jq --arg n "$name" '
+      if .agents[$n].rotation then .agents[$n].rotation.cooldowns = {} else . end' <<<"$reg")
+  fi
+  echo "$reg" | registry_write
+  ok "cooldown cleared for '$name'${account:+ ($account)}" \
+     '{name:$n, account:$a}' --arg n "$name" --arg a "${account:-}"
 }
 
 # `account set-active-provider <profile> <type> <provider>` — flip which
@@ -9257,6 +9487,25 @@ main() {
         set-account)
           AUDIT_CMD="agent set-account"; AUDIT_ARGS=("$@")
           with_registry_lock cmd_agent_set_account "$@" ;;
+        rotation)
+          [[ $# -gt 0 ]] || fail "$E_USAGE" "usage: 5dive agent rotation get|set|rotate|cooldown|clear-cooldown <agent> [...]"
+          local rotcmd="$1"; shift
+          case "$rotcmd" in
+            get) cmd_agent_rotation_get "$@" ;;  # read-only, no lock/audit
+            set)
+              AUDIT_CMD="agent rotation set"; AUDIT_ARGS=("$@")
+              with_registry_lock cmd_agent_rotation_set "$@" ;;
+            rotate)
+              AUDIT_CMD="agent rotation rotate"; AUDIT_ARGS=("$@")
+              with_registry_lock cmd_agent_rotation_rotate "$@" ;;
+            cooldown)
+              AUDIT_CMD="agent rotation cooldown"; AUDIT_ARGS=("$@")
+              with_registry_lock cmd_agent_rotation_cooldown "$@" ;;
+            clear-cooldown)
+              AUDIT_CMD="agent rotation clear-cooldown"; AUDIT_ARGS=("$@")
+              with_registry_lock cmd_agent_rotation_clear_cooldown "$@" ;;
+            *) fail "$E_USAGE" "unknown rotation command: $rotcmd (get|set|rotate|cooldown|clear-cooldown)" ;;
+          esac ;;
         skill)
           AUDIT_CMD="agent skill"; AUDIT_ARGS=("$@")
           cmd_skill "$@" ;;     # add/list/rm operate on the agent type's skills dir
