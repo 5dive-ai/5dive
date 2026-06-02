@@ -26,7 +26,7 @@ esac
 
 # Bumped on every public release. `build.sh` checks this line exists; CI fails
 # the bundle-drift check if it's missing or empty.
-readonly FIVE_VERSION="0.1.35"
+readonly FIVE_VERSION="0.1.36"
 
 STATE_DIR="/var/lib/5dive"
 REGISTRY="${STATE_DIR}/agents.json"
@@ -123,7 +123,12 @@ declare -A TYPE_CHANNELS=(
   [hermes]=1
   [codex]=1
   [grok]=1
-  [opencode]=0
+  # opencode ships a telegram bridge too, but as a STANDALONE RELAY (not an MCP
+  # server): telegram-opencode/server.ts IS the agent's main process and spawns
+  # `opencode serve` over loopback HTTP. 5dive-agent-start launches `bun run
+  # --cwd <plugin> start` instead of the opencode TUI; install writes the token
+  # + access.json into ~/.opencode/channels/telegram. telegram only.
+  [opencode]=1
   # antigravity (agy) ships the same telegram MCP bridge as grok/codex —
   # ~/.gemini/channels/telegram/{.env,access.json} + a shared plugin checkout
   # whose MCP server + lifecycle hooks 5dive-agent-start writes into the

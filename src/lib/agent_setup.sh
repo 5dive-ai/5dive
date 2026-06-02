@@ -984,6 +984,132 @@ PY
   fi
 }
 
+# Resolve the telegram-opencode plugin checkout. Same shape as grok_plugin_dir
+# above — control-plane host uses the 5dive-plugins repo checkout, customer VMs
+# use /usr/local/lib/5dive once install.sh deploys it. Override with
+# TELEGRAM_OPENCODE_PLUGIN_DIR for offline / test installs. The matching
+# resolver in 5dive-agent-start is intentionally duplicated (the boot script is
+# standalone).
+opencode_plugin_dir() {
+  local c
+  for c in "${TELEGRAM_OPENCODE_PLUGIN_DIR:-}" \
+           /usr/local/lib/5dive/telegram-opencode \
+           /home/claude/projects/5dive/5dive-plugins/plugins/telegram-opencode; do
+    [[ -n "$c" && -f "$c/server.ts" ]] && { printf '%s\n' "$c"; return 0; }
+  done
+  return 1
+}
+
+# Configure the telegram channel for an opencode agent. Unlike codex/grok/agy
+# (MCP servers wired into the runtime's config), opencode is a STANDALONE RELAY:
+# the bridge (telegram-opencode/server.ts) IS the agent's main process and
+# itself spawns `opencode serve` over loopback HTTP — 5dive-agent-start launches
+# `bun server.ts` instead of the opencode TUI for channels=telegram. So there's
+# no config.toml/MCP wiring here; the installer just (1) writes the bot token
+# into ~/.opencode/channels/telegram/.env (the path the relay reads its token
+# from) and (2) seeds access.json. A single shared plugin checkout serves every
+# opencode agent (the relay resolves its state dir from the agent's own $HOME).
+install_channel_for_opencode_agent() {
+  local plugin="$1" name="$2" token="$3" allowed_users="${4:-}"
+  local user="agent-${name}"
+  id -u "$user" &>/dev/null || fail "$E_GENERIC" "agent user missing: $user"
+  [[ "$plugin" == "telegram" ]] \
+    || fail "$E_VALIDATION" "opencode channel plugin unsupported: $plugin (telegram only)"
+  [[ -n "$token" ]] || fail "$E_VALIDATION" "opencode telegram channel requires a bot token"
+  if [[ -n "$allowed_users" ]]; then
+    valid_telegram_chat_id_list "$allowed_users" \
+      || fail "$E_VALIDATION" "invalid allowed_users (comma-separated numeric ids)"
+  fi
+
+  opencode_plugin_dir >/dev/null \
+    || fail "$E_NOT_INSTALLED" \
+       "telegram-opencode plugin not found (looked in /usr/local/lib/5dive/telegram-opencode and the 5dive-plugins checkout). Set TELEGRAM_OPENCODE_PLUGIN_DIR or deploy the plugin."
+
+  # bun runs the relay (server.ts) — it IS the agent process, so a missing bun
+  # would crash-loop the unit. Fail fast at create time like the other bridges.
+  if ! sudo -u "$user" -i bash -lc 'command -v bun' >/dev/null 2>&1; then
+    fail "$E_NOT_INSTALLED" \
+      "bun not on PATH for $user (required by telegram-opencode). Run: sudo 5dive doctor --repair"
+  fi
+
+  step "Writing telegram token into ~/.opencode/channels/telegram/.env for $user"
+  if ! sudo -u "$user" -H env TOKEN="$token" bash -s >&2 <<'OPENCODE_ENV'
+set -euo pipefail
+mkdir -p "$HOME/.opencode/channels/telegram"
+chmod 700 "$HOME/.opencode" "$HOME/.opencode/channels" "$HOME/.opencode/channels/telegram" 2>/dev/null || true
+ENV_FILE="$HOME/.opencode/channels/telegram/.env"
+touch "$ENV_FILE"; chmod 600 "$ENV_FILE"
+TMP=$(mktemp --tmpdir="$HOME/.opencode/channels/telegram" .env.XXXXXX); chmod 600 "$TMP"
+grep -v '^TELEGRAM_BOT_TOKEN=' "$ENV_FILE" > "$TMP" || true
+printf 'TELEGRAM_BOT_TOKEN=%s\n' "$TOKEN" >> "$TMP"
+mv "$TMP" "$ENV_FILE"
+OPENCODE_ENV
+  then
+    fail "$E_GENERIC" "opencode telegram .env write failed for agent '$name'"
+  fi
+
+  if [[ -n "$allowed_users" ]]; then
+    seed_opencode_telegram_access "$name" "$allowed_users"
+  fi
+
+  # Seed the notify-user skill so the agent self-starts its comms loop on first
+  # DM. opencode reads skills from $HOME/.agents/skills/<name>/SKILL.md
+  # (SKILLS_INSTALL_DIR[opencode]).
+  if [[ -f "$AGENT_SKILLS_DIR/notify-user/SKILL.md" ]]; then
+    sudo -u "$user" mkdir -p "/home/${user}/.agents/skills/notify-user"
+    sudo -u "$user" cp "$AGENT_SKILLS_DIR/notify-user/SKILL.md" \
+      "/home/${user}/.agents/skills/notify-user/SKILL.md"
+  fi
+
+  # Default skills, best-effort: match the grok/agy installers. opencode IS in
+  # the upstream skills registry (SKILLS_AGENT_ID[opencode]=opencode), so these
+  # route through the normal `npx skills add` path.
+  install_default_skill_for_agent "$name" opencode vercel-labs/skills find-skills || true
+  install_default_skill_for_agent "$name" opencode 5dive-com/skills 5dive-cli || true
+}
+
+# Write ~/.opencode/channels/telegram/access.json for agent-<name> with allowFrom
+# seeded from a CSV of user ids. Idempotent — mirrors seed_grok_telegram_access,
+# but the opencode bridge's access schema also carries dmPolicy + pending (see
+# the telegram-opencode PROVISIONING-CONTRACT §3), so we default those too.
+seed_opencode_telegram_access() {
+  local name="$1" allowed_users="$2"
+  local user="agent-${name}"
+  step "Pre-seeding opencode telegram allowlist for $user (${allowed_users})"
+  if ! sudo -u "$user" env CSV="$allowed_users" python3 - <<'PY' >&2; then
+import json, os, tempfile
+
+state = os.path.join(os.path.expanduser('~'), '.opencode', 'channels', 'telegram')
+os.makedirs(state, mode=0o700, exist_ok=True)
+access_path = os.path.join(state, 'access.json')
+ids = [s.strip() for s in os.environ['CSV'].split(',') if s.strip()]
+
+try:
+    with open(access_path) as f:
+        data = json.load(f)
+except FileNotFoundError:
+    data = {"allowFrom": [], "groups": {}, "dmPolicy": "allowlist", "pending": {}}
+
+allow = list(data.get('allowFrom') or [])
+for s in ids:
+    if s not in allow:
+        allow.append(s)
+data['allowFrom'] = allow
+data.setdefault('groups', {})
+data.setdefault('dmPolicy', 'allowlist')
+data.setdefault('pending', {})
+
+fd, tmp = tempfile.mkstemp(dir=state, prefix='.access.', suffix='.tmp')
+with os.fdopen(fd, 'w') as f:
+    json.dump(data, f, indent=2)
+os.chmod(tmp, 0o600)
+os.replace(tmp, access_path)
+print(f"Seeded allowFrom={allow} into {access_path}")
+PY
+    fail "$E_GENERIC" "opencode telegram access.json pre-seed failed for agent '$name'"
+  fi
+}
+
 # Single dispatch point used by cmd_create. Routes a (type, plugin) pair to
 # the right install helper above, so the create flow stays type-agnostic.
 # home_channel/allowed_users are hermes-telegram extras (ignored by other
@@ -995,6 +1121,7 @@ install_channel_for_agent() {
     codex)       install_channel_for_codex_agent "$plugin" "$name" "$token" "$allowed_users" ;;
     grok)        install_channel_for_grok_agent "$plugin" "$name" "$token" "$allowed_users" ;;
     antigravity) install_channel_for_antigravity_agent "$plugin" "$name" "$token" "$allowed_users" ;;
+    opencode)    install_channel_for_opencode_agent "$plugin" "$name" "$token" "$allowed_users" ;;
     openclaw)    install_channel_for_openclaw_agent "$plugin" "$name" "$token" "$home_channel" "$allowed_users" ;;
     hermes)      install_channel_for_hermes_agent "$plugin" "$name" "$token" "$home_channel" "$allowed_users" ;;
     *) fail "$E_VALIDATION" "type '$type' does not support channels" ;;

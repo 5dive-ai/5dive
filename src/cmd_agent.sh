@@ -504,10 +504,10 @@ cmd_create() {
   fi
 
   if [[ "$channels" != "none" ]] && [[ "${TYPE_CHANNELS[$type]}" != "1" ]]; then
-    fail "$E_VALIDATION" "type '$type' does not support channels (only: claude, codex, grok, antigravity, openclaw, hermes)"
+    fail "$E_VALIDATION" "type '$type' does not support channels (only: claude, codex, grok, antigravity, opencode, openclaw, hermes)"
   fi
-  # codex + grok + antigravity ship a telegram MCP bridge only — no discord build yet.
-  if [[ ( "$type" == "codex" || "$type" == "grok" || "$type" == "antigravity" ) && "$channels" == "discord" ]]; then
+  # codex + grok + antigravity + opencode ship a telegram bridge only — no discord build yet.
+  if [[ ( "$type" == "codex" || "$type" == "grok" || "$type" == "antigravity" || "$type" == "opencode" ) && "$channels" == "discord" ]]; then
     fail "$E_VALIDATION" "type '$type' supports --channels=telegram only (no discord build)"
   fi
 

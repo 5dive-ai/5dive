@@ -51,7 +51,32 @@ case "$TYPE" in
     esac ;;
   codex)    BIN="/home/claude/.nvm/versions/node/v24/bin/codex"; ARGS=() ;;
   gemini)   BIN="/home/claude/.nvm/versions/node/v24/bin/gemini"; ARGS=(--skip-trust --yolo) ;;
-  opencode) BIN="/home/claude/.local/bin/opencode"; ARGS=() ;;
+  opencode)
+    # opencode's telegram bridge is a STANDALONE RELAY (telegram-opencode/
+    # server.ts) — a THIRD run-model distinct from claude (--channels flag) and
+    # codex/grok/agy (MCP server wired into the runtime's config). The relay IS
+    # the agent's main process and itself spawns `opencode serve` over loopback
+    # HTTP, so for channels=telegram we launch it via bun (same `bun run --cwd
+    # <plugin> ... start` shape agy uses for its MCP server) instead of the
+    # opencode TUI. The bridge auto-picks a free serve port (v0.1.2), so we
+    # intentionally do NOT set OPENCODE_SERVE_PORT — multiple opencode agents on
+    # one box never collide. OPENCODE_BIN + OPENCODE_PROJECT_DIR are exported via
+    # OPENCODE_OVERRIDE below. Resolver kept in sync with opencode_plugin_dir()
+    # in agent_setup.sh (the boot script is standalone, so it's duplicated).
+    if [[ "$CHANNELS" == "telegram" ]]; then
+      OPENCODE_PLUGIN_DIR=""
+      for _c in "${TELEGRAM_OPENCODE_PLUGIN_DIR:-}" \
+                /usr/local/lib/5dive/telegram-opencode \
+                /home/claude/projects/5dive/5dive-plugins/plugins/telegram-opencode; do
+        [[ -n "$_c" && -f "$_c/server.ts" ]] && { OPENCODE_PLUGIN_DIR="$_c"; break; }
+      done
+      [[ -n "$OPENCODE_PLUGIN_DIR" ]] \
+        || { echo "telegram-opencode plugin not found (set TELEGRAM_OPENCODE_PLUGIN_DIR or deploy it)" >&2; exit 3; }
+      BIN="/home/claude/.local/bin/bun"
+      ARGS=(run --cwd "$OPENCODE_PLUGIN_DIR" --shell=bun --silent start)
+    else
+      BIN="/home/claude/.local/bin/opencode"; ARGS=()
+    fi ;;
   # antigravity ships as `agy` (Google's native-Go gemini-cli successor). The
   # type id stays "antigravity" everywhere (agents.d/<name>.env, TYPE_BIN,
   # auth dispatch); only the on-disk binary is named agy.
@@ -92,6 +117,10 @@ case "$CHANNELS" in
       # script) — the --dangerously-bypass-hook-trust flag does NOT suppress
       # that interactive gate (it only affects non-interactive `codex exec`).
       codex)  : ;;
+      # opencode's relay (launched via bun in the type-dispatch above) reads its
+      # channel + token from ~/.opencode/channels/telegram state, not argv — so
+      # no --channels flag is appended here.
+      opencode) : ;;
     esac ;;
   discord)
     case "$TYPE" in
@@ -120,6 +149,17 @@ fi
 # codex` on the host). With a profile, the shared source is the per-profile
 # auth.json under $PROFILE_STATE_DIR instead of /home/claude/.codex.
 CODEX_OVERRIDE=""
+# opencode+telegram relay env (see the opencode case in the type-dispatch). The
+# relay reads its bot token from ~/.opencode/channels/telegram/.env, but the
+# `opencode serve` it spawns needs OPENCODE_BIN (abs path — agent users skip
+# .bashrc, so the bare `opencode` default wouldn't resolve) and should treat the
+# agent's WORKDIR as its project dir (else it defaults to the plugin dir, which
+# is the bun --cwd). OPENCODE_SERVE_PORT is deliberately unset → the bridge
+# auto-picks a free port so concurrent opencode agents don't collide.
+OPENCODE_OVERRIDE=""
+if [[ "$TYPE" == "opencode" && "$CHANNELS" == "telegram" ]]; then
+  OPENCODE_OVERRIDE="export OPENCODE_BIN=$(printf %q "/home/claude/.local/bin/opencode") OPENCODE_PROJECT_DIR=$(printf %q "$WORKDIR"); "
+fi
 if [[ "$TYPE" == "codex" ]]; then
   AGENT_CODEX_HOME="$HOME/.codex"
   install -d -m 700 "$AGENT_CODEX_HOME"
@@ -788,7 +828,7 @@ else
   LOOP="while true; do ${CMD_STR}; sleep 2; done"
 fi
 
-INNER="unset CLAUDE_CONFIG_DIR ${UNSET_CREDS}; ${STAGE_GUARD}${CODEX_OVERRIDE}${PRELUDE}${LOOP}"
+INNER="unset CLAUDE_CONFIG_DIR ${UNSET_CREDS}; ${STAGE_GUARD}${CODEX_OVERRIDE}${OPENCODE_OVERRIDE}${PRELUDE}${LOOP}"
 [[ -n "$PROFILE" ]] && echo "[5dive] agent=${NAME} using auth-profile=${PROFILE}" >&2
 
 /usr/bin/tmux new-session -d -s "$SESSION" -c "$WORKDIR" \
