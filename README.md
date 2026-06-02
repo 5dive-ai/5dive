@@ -82,12 +82,12 @@ If you'd rather click than `ssh`, [5dive.com](https://5dive.com) is the managed 
 | Type | Model family | Auth | Channels |
 |------|-------------|------|----------|
 | `claude`      | Anthropic Claude       | OAuth / API key | Telegram, Discord |
-| `codex`       | OpenAI Codex           | OAuth / API key | — |
-| `antigravity` | Google Antigravity     | Google OAuth | — |
-| `grok`        | xAI Grok               | OAuth (xAI) / API key | — |
+| `codex`       | OpenAI Codex           | OAuth / API key | Telegram |
+| `antigravity` | Google Antigravity     | Google OAuth | Telegram |
+| `grok`        | xAI Grok               | OAuth (xAI) / API key | Telegram |
 | `hermes`      | third-party multi-provider harness | OAuth (OpenAI) / API key | Telegram, Discord |
 | `openclaw`    | third-party multi-provider harness | OAuth (OpenAI) / API key | Telegram, Discord |
-| `opencode`    | OpenCode               | API key | — |
+| `opencode`    | OpenCode               | API key | Telegram |
 
 `hermes` and `openclaw` are community-built harnesses that can route to many providers (OpenRouter, Anthropic, Google, Moonshot, etc.). As of April 4, 2026, Anthropic no longer permits routing consumer Claude Pro/Max OAuth through third-party harnesses. For that work, use the official `claude` type with your own API key. Background: [We Ditched OpenClaw for Claude →](https://blog.5dive.com/blog/we-ditched-openclaw-for-claude/).
 
