@@ -834,19 +834,21 @@ fi
 # `--resume <id>`; subsequent respawns fall back to the plain CMD_STR. No
 # resume id → byte-identical to the original simple loop.
 if [[ -n "$RESUME_ID" ]]; then
-  # A trailing positional prompt seeds the first interactive turn (no --print →
-  # stays interactive). Only added when the marker carried a valid line-2 prompt.
-  # The prompt MUST be separated from "${ARGS[@]}" by a literal `--`: claude's
-  # `--channels` is a variadic option, so a bare trailing positional gets
-  # swallowed as an extra channel name ("--channels … continue" → claude errors
-  # "entries must be tagged: continue" and exits, dropping the auto-resume to a
-  # plain idle respawn). `--` ends option parsing so the prompt is read as the
-  # positional first turn regardless of which variadic flags precede it.
-  if [[ -n "$RESUME_PROMPT" ]]; then
-    CMD_STR_FIRST=$(printf '%q ' "$BIN" --resume "$RESUME_ID" "${ARGS[@]}" -- "$RESUME_PROMPT")
-  else
-    CMD_STR_FIRST=$(printf '%q ' "$BIN" --resume "$RESUME_ID" "${ARGS[@]}")
-  fi
+  # First loop iteration resumes the checkpointed session; later respawns fall
+  # back to the plain CMD_STR. We launch a BARE `--resume <id>` (no trailing
+  # positional prompt) even when the marker carried a line-2 prompt. Two reasons
+  # NOT to pass the prompt as a startup positional:
+  #   1. MCP race — a startup positional turn is constructed before claude's MCP
+  #      servers finish connecting (~200-500ms), so that first turn's tool list
+  #      lacks the telegram reply tool; the agent then concludes "MCP
+  #      disconnected" and never answers the user (observed on rotation resume).
+  #   2. `--channels` is variadic, so an unseparated trailing positional gets
+  #      swallowed as a bogus channel name and claude exits.
+  # Instead, when a prompt is armed we TYPE it into the session after claude is
+  # ready AND its MCP is up — see the resume-prompt watcher just below the
+  # tmux new-session call. Bare resume (no line-2 prompt, e.g. manual /resume)
+  # stays idle-on-resume, unchanged.
+  CMD_STR_FIRST=$(printf '%q ' "$BIN" --resume "$RESUME_ID" "${ARGS[@]}")
   LOOP="__first=1; while true; do if [[ \$__first == 1 ]]; then ${CMD_STR_FIRST}; __first=0; else ${CMD_STR}; fi; sleep 2; done"
 else
   LOOP="while true; do ${CMD_STR}; sleep 2; done"
@@ -857,6 +859,29 @@ INNER="unset CLAUDE_CONFIG_DIR ${UNSET_CREDS}; ${STAGE_GUARD}${CODEX_OVERRIDE}${
 
 /usr/bin/tmux new-session -d -s "$SESSION" -c "$WORKDIR" \
   "bash --login -c $(printf %q "$INNER")"
+
+# Resume auto-prompt (claude). When the resume marker carried a line-2 prompt
+# (rotation arms "continue and reply to the latest message"), TYPE it into the
+# session once claude is ready — deferred, not a startup positional. A startup
+# positional turn is built before the telegram MCP server connects, so that
+# turn has no reply tool and the agent reports "MCP disconnected" and can't
+# answer. We wait for claude's input prompt (❯) to appear, add a short settle
+# buffer so the MCP server (connects within ~0.5s of launch) is registered,
+# then send the prompt + Enter. One-shot, bounded to the boot window; targets
+# the session by name so it survives the first respawn. `-l --` sends the text
+# literally and protects a prompt that begins with '-'.
+if [[ "$TYPE" == "claude" && -n "$RESUME_ID" && -n "$RESUME_PROMPT" ]]; then
+  (
+    for _ in $(seq 1 60); do
+      _pane="$(/usr/bin/tmux capture-pane -t "$SESSION" -p 2>/dev/null)" || break
+      printf '%s' "$_pane" | grep -q '❯' && break
+      sleep 0.5
+    done
+    sleep 3
+    /usr/bin/tmux send-keys -t "$SESSION" -l -- "$RESUME_PROMPT"
+    /usr/bin/tmux send-keys -t "$SESSION" Enter
+  ) &
+fi
 
 # Auto-accept codex's first-run "Hooks need review" TUI prompt for telegram
 # codex agents. The prompt blocks an unattended agent until dismissed, and

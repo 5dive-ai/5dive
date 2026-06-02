@@ -9,6 +9,22 @@ release.
 
 ## [Unreleased]
 
+## [0.1.42] — 2026-06-02
+
+### Fixed
+- Rotation auto-resume now reliably **replies** on the new account. The fix in
+  0.1.41 made the resume prompt parse, but it was still injected as a startup
+  positional — which claude processes ~200ms *before* its telegram MCP server
+  finishes connecting. That first turn's tool list therefore lacked the reply
+  tool, so the resumed agent reported "MCP disconnected" and went silent
+  (verified: prompt queued at T+0.147s, MCP connected at T+0.343s). Fix:
+  `5dive-agent-start` no longer passes the prompt as an arg. It launches a bare
+  `claude --resume <id>` and a deferred watcher types the prompt into the
+  session only after claude's input prompt is ready + a short MCP-settle buffer
+  — so the turn has the reply tool. Bare resume (manual `/resume`, no line-2
+  prompt) is unchanged. Pairs with telegram plugin 0.4.51, which broadened the
+  prompt to `continue and reply to the latest message`.
+
 ## [0.1.41] — 2026-06-02
 
 ### Fixed
