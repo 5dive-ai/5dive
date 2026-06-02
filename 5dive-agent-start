@@ -640,14 +640,16 @@ fi
 # Wire the telegram-agy MCP server + lifecycle hooks for this antigravity agent
 # (telegram channel only). Like grok, a single shared plugin checkout serves
 # every agy agent (server.ts + hooks resolve state from $HOME via homedir() →
-# ~/.gemini/channels/telegram). Unlike claude, agy's runtime plugin discovery
+# ~/.gemini/channels/telegram). The MCP server is launched as `bun <server.ts>`
+# directly (NOT `bun run ... start`) so it works from the root-owned shared dir —
+# see the EEXIST note below. Unlike claude, agy's runtime plugin discovery
 # only auto-wires skills + agents — NOT mcp servers or hooks (verified agy 1.0.3,
 # per telegram-agy/TODO.md). So both surfaces go into agy's GLOBAL flat config:
 #   1. ~/.gemini/config/mcp_config.json → {"mcpServers":{"telegram":{...}}}.
 #      Ships empty (0 bytes) → agy logs "unexpected end of JSON input" and MCP
-#      discovery breaks until written. We point command=bun with an absolute
-#      --cwd at the installed plugin (${AGY_PLUGIN_DIR}); ${CLAUDE_PLUGIN_ROOT}
-#      in the plugin's own mcp_config.json isn't expanded for a globally-wired
+#      discovery breaks until written. We point command=bun at the absolute
+#      server.ts path (${AGY_PLUGIN_DIR}/server.ts); ${CLAUDE_PLUGIN_ROOT} in
+#      the plugin's own mcp_config.json isn't expanded for a globally-wired
 #      server, so we write the absolute path here.
 #   2. ~/.gemini/config/hooks.json → PreToolUse/Stop/Notification hooks with
 #      absolute `bun <plugin>/hooks/*.ts` commands (same absolute-path lesson as
@@ -664,14 +666,24 @@ if [[ "$TYPE" == "antigravity" ]] && [[ "$CHANNELS" == "telegram" ]]; then
     [[ -n "$_c" && -f "$_c/server.ts" ]] && { AGY_PLUGIN_DIR="$_c"; break; }
   done
   if [[ -n "$AGY_PLUGIN_DIR" ]]; then
+    # Launch bun on server.ts DIRECTLY (`bun <file>`), exactly like codex/grok —
+    # NOT `bun run --cwd <dir> start`. `bun run` relinks node_modules/.bin
+    # entries (e.g. `which`) on every invocation, which fails with "Failed to
+    # link which: EEXIST" when the plugin lives in the root-owned shared staging
+    # dir (/usr/local/lib/5dive/telegram-agy) the agent user can't write to —
+    # the MCP server then dies on launch and the bot stays silent (hit on a
+    # customer agy create 2026-06-02). Direct file execution does no relinking,
+    # so it runs fine from the shared staged dir with no per-agent copy.
+    AGY_SERVER="$AGY_PLUGIN_DIR/server.ts"
     AGY_MCP="$AGY_CONFIG_DIR/mcp_config.json"
-    # (Re)write when the file is missing, empty (ships 0 bytes), or doesn't yet
-    # hold our telegram server. jq merges into any existing mcpServers map so a
+    # (Re)write when missing, empty (ships 0 bytes), or still using the old
+    # `bun run start` form (heals agents provisioned before this fix — those
+    # configs lack server.ts). jq merges into any existing mcpServers map so a
     # user's other servers survive; falls back to a plain overwrite if jq fails.
-    if [[ ! -s "$AGY_MCP" ]] || ! grep -q '"telegram"' "$AGY_MCP" 2>/dev/null; then
+    if [[ ! -s "$AGY_MCP" ]] || ! grep -q 'server.ts' "$AGY_MCP" 2>/dev/null; then
       MCP_TMP=$(mktemp -p "$AGY_CONFIG_DIR" .mcp_config.json.XXXXXX)
-      if jq -n --arg cwd "$AGY_PLUGIN_DIR" \
-        '{mcpServers:{telegram:{command:"bun",args:["run","--cwd",$cwd,"--shell=bun","--silent","start"]}}}' \
+      if jq -n --arg srv "$AGY_SERVER" \
+        '{mcpServers:{telegram:{command:"bun",args:[$srv]}}}' \
         > "$MCP_TMP" 2>/dev/null; then
         chmod 600 "$MCP_TMP"; mv "$MCP_TMP" "$AGY_MCP"
       else
@@ -681,7 +693,7 @@ if [[ "$TYPE" == "antigravity" ]] && [[ "$CHANNELS" == "telegram" ]]; then
   "mcpServers": {
     "telegram": {
       "command": "bun",
-      "args": ["run", "--cwd", "${AGY_PLUGIN_DIR}", "--shell=bun", "--silent", "start"]
+      "args": ["${AGY_SERVER}"]
     }
   }
 }
