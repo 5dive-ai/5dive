@@ -686,6 +686,27 @@ cmd_create() {
     # is harmless.
     step "Preseeding antigravity default skills for agent-${name}"
     preseed_antigravity_agent "$name"
+
+    # Seed the agy OAuth token into the agent user's runtime $HOME as root.
+    # 5dive-agent-start also seeds at boot, but that path uses the agent's own
+    # `sudo -n` to read the 0700 auth-profile dir — which only admin agents have
+    # (standard/sandboxed get no NOPASSWD sudoers). Without seeding here a
+    # non-admin agy agent boots unauthenticated and sits at the "select login
+    # method" screen → the telegram bridge runs but the bot is silent (hit on a
+    # customer standard-isolation create 2026-06-02). `agent create` runs as
+    # root, so copy the token directly; agy is the only type whose credential is
+    # a plain file (codex/grok land env/auth.json the agent can already read).
+    local _agy_src _agy_home
+    _agy_src=$(profile_type_auth_path "$profile" "$type" 2>/dev/null) || true
+    if [[ -n "$_agy_src" ]] && [[ -s "$_agy_src" ]]; then
+      _agy_home="/home/agent-${name}/.gemini/antigravity-cli"
+      install -d -m 700 -o "agent-${name}" -g "agent-${name}" \
+        "/home/agent-${name}/.gemini" "$_agy_home"
+      if install -m 600 -o "agent-${name}" -g "agent-${name}" \
+           "$_agy_src" "${_agy_home}/antigravity-oauth-token"; then
+        step "Seeded agy OAuth token into agent-${name} runtime"
+      fi
+    fi
   fi
 
   # Channel registration is type-aware (see install_channel_for_agent's
