@@ -18,7 +18,15 @@ EnvironmentFile=-/var/lib/5dive/agents.d/%i.env
 # above, letting two same-type agents run against different accounts.
 EnvironmentFile=-/var/lib/5dive/agents.d/%i-auth.env
 ExecStart=/usr/local/bin/5dive-agent-start %i
-ExecStop=/bin/bash -c '/usr/bin/tmux kill-session -t agent-%i 2>/dev/null || true'
+# Stop: tear down the tmux session, then SIGHUP the antigravity CLI binary
+# specifically. agy (the Go `agy` binary) IGNORES SIGTERM but dies on SIGHUP —
+# without this it survives the cgroup SIGTERM and stalls every restart until the
+# TimeoutStopSec SIGKILL (was 60s, now 15s). `pkill -x agy` is a no-op for every
+# other agent type, so codex/grok/claude are unaffected and their bridges still
+# get the graceful cgroup SIGTERM. agy's bun bridge (a child of agy) is orphaned
+# when agy exits and then also gets the graceful cgroup SIGTERM, so its poll is
+# still aborted cleanly. Stop drops from 15s to ~0.05s for agy.
+ExecStop=/bin/bash -c '/usr/bin/tmux kill-session -t agent-%i 2>/dev/null; /usr/bin/pkill -HUP -u agent-%i -x agy 2>/dev/null; true'
 Restart=on-failure
 RestartSec=3
 # Default KillMode=control-group: on stop, systemd SIGTERMs every process in
