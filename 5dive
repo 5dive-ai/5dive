@@ -6491,6 +6491,27 @@ _mirror_follow_migration() {
   mv "$tmp" "$access_file" 2>/dev/null || rm -f "$tmp" 2>/dev/null
 }
 
+# Wait until the agent's TUI has rendered its input prompt and can actually
+# receive keystrokes. A freshly (re)started agent takes ~15-30s to boot Claude
+# + its plugins/MCP servers; a send-keys before the input box exists is
+# silently dropped and the message is LOST (the recurring "my ping never
+# arrived after a restart" bug). We poll the pane for the prompt marker "❯",
+# which Claude renders once the input box is up (present whether idle OR
+# mid-generation — Claude queues typed input — so we don't needlessly block on
+# a busy agent). Best-effort + bounded: returns 0 as soon as it's ready, 1 on
+# timeout (caller still sends — better to try than to hang forever, and TUIs
+# that never draw "❯" shouldn't wedge inter-agent sends).
+wait_agent_input_ready() {
+  local name="$1" timeout="${2:-45}"
+  local user="agent-${name}" waited=0 pane
+  while (( waited < timeout )); do
+    pane=$(sudo -u "$user" tmux capture-pane -p -t "agent-${name}" 2>/dev/null || true)
+    grep -q '❯' <<<"$pane" && return 0
+    sleep 1; waited=$((waited+1))
+  done
+  return 1
+}
+
 # Inject a message into the agent's tmux session. Uses send-keys -l so the text
 # is literal (no tmux keybinding interpretation), followed by a separate Enter.
 # Not exposed via /agents/exec: arbitrary text won't pass the API arg regex, so
@@ -6582,6 +6603,13 @@ cmd_send() {
     fi
   fi
 
+  # Don't fire keystrokes into a still-booting TUI — they'd be dropped and the
+  # message lost. Wait for the input prompt to render (fast no-op when already
+  # up). On timeout we still send best-effort and warn, rather than hang.
+  if ! wait_agent_input_ready "$name"; then
+    step "agent '$name' input prompt not detected after 45s — sending best-effort (may be lost if still booting)"
+  fi
+
   sudo -u "agent-${name}" tmux send-keys -t "agent-${name}" -l -- "$payload"
   sudo -u "agent-${name}" tmux send-keys -t "agent-${name}" Enter
 
@@ -6671,6 +6699,12 @@ cmd_ask() {
   [[ -n "$reply_to_msg" ]] && header+=" reply-to-msg=${reply_to_msg}"
   header+="]"
   local payload="${header} ${message}"
+
+  # Same boot-race guard as cmd_send: wait for the input prompt before sending
+  # so a freshly-(re)started target doesn't silently drop the question.
+  if ! wait_agent_input_ready "$name"; then
+    step "agent '$name' input prompt not detected after 45s — sending best-effort (may be lost if still booting)"
+  fi
 
   sudo -u "agent-${name}" tmux send-keys -t "agent-${name}" -l -- "$payload"
   sudo -u "agent-${name}" tmux send-keys -t "agent-${name}" Enter
