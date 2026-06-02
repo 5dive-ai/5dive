@@ -26,7 +26,7 @@ esac
 
 # Bumped on every public release. `build.sh` checks this line exists; CI fails
 # the bundle-drift check if it's missing or empty.
-readonly FIVE_VERSION="0.1.39"
+readonly FIVE_VERSION="0.1.40"
 
 STATE_DIR="/var/lib/5dive"
 REGISTRY="${STATE_DIR}/agents.json"
@@ -7789,6 +7789,53 @@ cmd_doctor() {
         else
           doctor_add channels "agent:$name" warn \
             "no channel-registration event found in latest MCP log $(basename "$latest") — restart the agent to refresh" false false
+        fi
+
+        # Plugin-version drift: Claude loads plugins once at launch, so an
+        # agent that's been running since before the last `plugin update` is
+        # still executing the OLD telegram plugin in memory (and its old hooks)
+        # even though the on-disk cache is newer. This is the recurring
+        # "/account mis-gated, /status missing the 5dive line, stale stop-hook"
+        # class of bug. We detect it WITHOUT introspecting process memory: if
+        # installed_plugins.json was modified AFTER the agent's claude process
+        # started, the running code predates the update. --repair restarts the
+        # agent (deferred) to load the fresh version.
+        local manifest_f="/home/${user}/.claude/plugins/installed_plugins.json"
+        if [[ -f "$manifest_f" ]]; then
+          local ondisk_ver plug_mtime cpid
+          ondisk_ver=$(jq -r '.plugins["telegram@5dive-plugins"][0].version // empty' "$manifest_f" 2>/dev/null)
+          plug_mtime=$(stat -c %Y "$manifest_f" 2>/dev/null || echo 0)
+          # Oldest (longest-running) claude process for this user = the
+          # persistent session, not a transient hook subprocess. Pick max
+          # elapsed-time among matches.
+          cpid=$(pgrep -u "$user" -f 'claude' 2>/dev/null \
+                 | while read -r p; do echo "$(ps -o etimes= -p "$p" 2>/dev/null | tr -d ' ') $p"; done \
+                 | sort -rn | awk 'NR==1{print $2}')
+          if [[ -n "$cpid" && -n "$ondisk_ver" ]]; then
+            local etimes start_epoch now_epoch
+            etimes=$(ps -o etimes= -p "$cpid" 2>/dev/null | tr -d ' ')
+            now_epoch=$(date +%s)
+            if [[ "$etimes" =~ ^[0-9]+$ ]]; then
+              start_epoch=$((now_epoch - etimes))
+              if [[ "$plug_mtime" -gt "$start_epoch" ]]; then
+                if (( DOCTOR_REPAIR )); then
+                  if systemd-run --on-active=1 --collect \
+                       /bin/systemctl restart "5dive-agent@${name}.service" >/dev/null 2>&1; then
+                    doctor_add channels "agent:$name plugin-version" warn \
+                      "was running a stale telegram plugin (on-disk $ondisk_ver, loaded before last update) — restart scheduled to load it" true true
+                  else
+                    doctor_add channels "agent:$name plugin-version" warn \
+                      "running a stale telegram plugin (on-disk $ondisk_ver) — auto-restart failed; run: systemctl restart 5dive-agent@${name}.service" true false
+                  fi
+                else
+                  doctor_add channels "agent:$name plugin-version" warn \
+                    "running a stale telegram plugin — on-disk is $ondisk_ver but the agent loaded an older build at launch. Restart to apply: systemctl restart 5dive-agent@${name}.service (or 5dive doctor --repair)" true false
+                fi
+              else
+                doctor_add channels "agent:$name plugin-version" ok "telegram plugin $ondisk_ver loaded (running matches on-disk)"
+              fi
+            fi
+          fi
         fi
       done
     fi
