@@ -200,6 +200,37 @@ refresh_managed_files() {
   rm -rf "$_agy_tmp"
   rm -rf "$_grk_tmp"
 
+  # Stage the telegram-opencode plugin — same shape as telegram-agy above.
+  # opencode has no plugin marketplace; its telegram bridge is a standalone
+  # long-running relay (server.ts over `opencode serve`) launched by
+  # 5dive-agent-start from this one shared checkout via absolute paths. Without
+  # this, opencode+telegram agents can't be provisioned (install_channel_for_
+  # opencode_agent's plugin-dir check fails) — i.e. opencode telegram is a
+  # no-op on customer boxes until staged. Override with OPENCODE_PLUGIN_TARBALL
+  # for offline / pinned installs.
+  OPENCODE_PLUGIN_TARBALL="${OPENCODE_PLUGIN_TARBALL:-https://github.com/5dive-com/5dive-plugins/archive/refs/heads/main.tar.gz}"
+  _ocode_tmp="$(mktemp -d)"
+  if curl -fsSL "$OPENCODE_PLUGIN_TARBALL" \
+      | tar -xz -C "$_ocode_tmp" --strip-components=1 '5dive-plugins-main/plugins/telegram-opencode' 2>/dev/null \
+      && [ -f "$_ocode_tmp/plugins/telegram-opencode/server.ts" ]; then
+    install -d -m 755 "$LIB_DIR/telegram-opencode"
+    cp -a "$_ocode_tmp/plugins/telegram-opencode/." "$LIB_DIR/telegram-opencode/"
+    if id -u claude >/dev/null 2>&1; then
+      chown -R claude:claude "$LIB_DIR/telegram-opencode"
+      if sudo -u claude -H bash -lc "cd $(printf %q "$LIB_DIR/telegram-opencode") && bun install --production --ignore-scripts --no-progress --no-summary" >/dev/null 2>&1; then
+        chmod -R a+rX "$LIB_DIR/telegram-opencode"
+        ok "telegram-opencode plugin"
+      else
+        echo "warn: bun install for telegram-opencode failed — opencode+telegram agents won't have the bridge until the next successful refresh" >&2
+      fi
+    else
+      echo "warn: no claude user — skipping telegram-opencode bun install" >&2
+    fi
+  else
+    echo "warn: failed to stage telegram-opencode from $OPENCODE_PLUGIN_TARBALL — opencode+telegram won't be available until the next successful refresh" >&2
+  fi
+  rm -rf "$_ocode_tmp"
+
   # CLAUDE.md fragment that preseed_claude_agent drops into a telegram-paired
   # agent's $HOME/.claude/ so the per-turn reply mandate + AskUserQuestion /
   # ExitPlanMode warning ride with the agents that actually need them — not
