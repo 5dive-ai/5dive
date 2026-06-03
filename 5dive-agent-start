@@ -4,6 +4,18 @@
 # Reads /var/lib/5dive/agents.d/<name>.env for AGENT_TYPE, AGENT_CHANNELS, AGENT_WORKDIR.
 set -euo pipefail
 
+# Self-heal /dev/null before anything touches it. Agents run with sudo (admin
+# isolation), so one agent can clobber this shared device node — e.g.
+# `tmux -S /dev/null` treats it as a socket path and unlinks it, leaving a
+# missing or regular-file /dev/null. That then EACCES/ENOENTs every write to it
+# (nvm.sh, this script, the agent CLI) and crash-loops EVERY agent on the box
+# (seen on teal-fox 2026-06-03). Recreate the proper char device as root via
+# sudo -n. No /dev/null redirects in here — it may be broken right now.
+if [[ ! -c /dev/null ]]; then
+  echo "[5dive] /dev/null is not a character device — recreating" >&2
+  sudo -n sh -c 'rm -f /dev/null && mknod /dev/null c 1 3 && chmod 666 /dev/null && chown root:root /dev/null' >&2 || true
+fi
+
 NAME="${1:-${AGENT_NAME:-}}"
 [[ -n "$NAME" ]] || { echo "usage: 5dive-agent-start <name>" >&2; exit 2; }
 

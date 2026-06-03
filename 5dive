@@ -26,7 +26,7 @@ esac
 
 # Bumped on every public release. `build.sh` checks this line exists; CI fails
 # the bundle-drift check if it's missing or empty.
-readonly FIVE_VERSION="0.1.47"
+readonly FIVE_VERSION="0.1.48"
 
 STATE_DIR="/var/lib/5dive"
 REGISTRY="${STATE_DIR}/agents.json"
@@ -7712,6 +7712,25 @@ cmd_doctor() {
 
   # --- deps ---
   if (( run_deps )); then
+    # /dev/null must be the character device. An agent with sudo (admin
+    # isolation) can clobber it — e.g. `tmux -S /dev/null` unlinks it — which
+    # crash-loops EVERY agent on the box (teal-fox 2026-06-03). Checked first
+    # so --repair fixes it before other checks that redirect to /dev/null run.
+    # 5dive-agent-start also self-heals this on each start.
+    if [[ -c /dev/null ]]; then
+      doctor_add deps devnull ok "/dev/null is a character device"
+    elif (( DOCTOR_REPAIR )); then
+      step "Recreating /dev/null device node"
+      if sudo sh -c 'rm -f /dev/null && mknod /dev/null c 1 3 && chmod 666 /dev/null && chown root:root /dev/null' \
+         && [[ -c /dev/null ]]; then
+        doctor_add deps devnull ok "/dev/null recreated as character device" true true
+      else
+        doctor_add deps devnull error "/dev/null not a char device and repair failed (run: sudo mknod /dev/null c 1 3 && sudo chmod 666 /dev/null)" true false
+      fi
+    else
+      doctor_add deps devnull error "/dev/null is not a character device — every agent crash-loops (fix: sudo 5dive doctor --repair)" true false
+    fi
+
     doctor_check_cmd tmux      tmux      tmux
     doctor_check_cmd jq        jq        jq
     doctor_check_cmd python3   python3   python3
