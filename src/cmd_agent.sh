@@ -314,8 +314,40 @@ apply_byo_provider() {
   case "$type" in
     hermes)   _apply_byo_hermes "$native" "$canonical" "$api_key" "$profile" ;;
     openclaw) _apply_byo_openclaw "$native" "$canonical" "$api_key" "$profile" ;;
-    *) fail "$E_VALIDATION" "BYO provider not supported for type '$type' (only: hermes, openclaw)" ;;
+    claude)   _apply_byo_claude "$canonical" "$api_key" "$profile" ;;
+    *) fail "$E_VALIDATION" "BYO provider not supported for type '$type' (only: hermes, openclaw, claude)" ;;
   esac
+}
+
+# Claude (Claude Code) BYO custom-provider path. Unlike hermes/openclaw — which
+# write native auth.json/auth-profiles.json — the claude harness reads its
+# credentials and endpoint from the environment, so we upsert the override env
+# vars into the auth-profile's combined.env. systemd loads that as
+# EnvironmentFile=%i-auth.env *after* the shared anthropic.env (last-wins), so
+# these override any default-account OAuth token that template otherwise leaks
+# in. profile_set_var takes the value on stdin (keeps secrets out of argv).
+_apply_byo_claude() {
+  local canonical="$1" api_key="$2" profile="${3:-}"
+  [[ -n "$profile" ]] \
+    || fail "$E_USAGE" "claude BYO provider requires --auth-profile (custom-provider creds are profile-scoped)"
+  local base_url="${CLAUDE_PROVIDER_BASEURL[$canonical]:-}"
+  [[ -n "$base_url" ]] \
+    || fail "$E_VALIDATION" "claude does not support provider '$canonical' (${BYO_PROVIDER_LABEL[$canonical]:-unknown}: no Anthropic-compatible endpoint)"
+  step "Configuring claude BYO provider '$canonical' → ${base_url} (profile=$profile)"
+  printf '%s' "$base_url"  | profile_set_var "$profile" ANTHROPIC_BASE_URL
+  printf '%s' "$api_key"   | profile_set_var "$profile" ANTHROPIC_AUTH_TOKEN
+  printf '%s' "${CLAUDE_PROVIDER_OPUS_MODEL[$canonical]}"   | profile_set_var "$profile" ANTHROPIC_DEFAULT_OPUS_MODEL
+  printf '%s' "${CLAUDE_PROVIDER_SONNET_MODEL[$canonical]}" | profile_set_var "$profile" ANTHROPIC_DEFAULT_SONNET_MODEL
+  printf '%s' "${CLAUDE_PROVIDER_HAIKU_MODEL[$canonical]}"  | profile_set_var "$profile" ANTHROPIC_DEFAULT_HAIKU_MODEL
+  # Custom endpoints (esp. z.ai during peak hours) can be slow; raise the
+  # client-side request timeout so long tool turns don't get cut off.
+  printf '%s' "3000000" | profile_set_var "$profile" API_TIMEOUT_MS
+  # Neutralize any shared-account creds the template's unconditional
+  # anthropic.env EnvironmentFile= would inject ahead of our override —
+  # combined.env loads last so empty values win, forcing the harness onto
+  # ANTHROPIC_AUTH_TOKEN + ANTHROPIC_BASE_URL instead of OAuth-to-Anthropic.
+  printf '%s' "" | profile_set_var "$profile" CLAUDE_CODE_OAUTH_TOKEN
+  printf '%s' "" | profile_set_var "$profile" ANTHROPIC_API_KEY
 }
 
 _apply_byo_hermes() {
@@ -516,8 +548,15 @@ cmd_create() {
   # later", not an add-on. The key sentinel "-" reads from stdin so the value
   # never appears in argv (and thus never in `ps`).
   if [[ -n "$byo_provider" || -n "$byo_api_key" ]]; then
-    [[ "$type" == "hermes" || "$type" == "openclaw" ]] \
-      || fail "$E_VALIDATION" "--provider/--api-key only supported for hermes/openclaw (got: $type)"
+    [[ "$type" == "hermes" || "$type" == "openclaw" || "$type" == "claude" ]] \
+      || fail "$E_VALIDATION" "--provider/--api-key only supported for hermes/openclaw/claude (got: $type)"
+    # claude BYO points the harness at an Anthropic-compatible third-party
+    # endpoint and stores the override env vars in the auth-profile's
+    # combined.env — so it requires a profile to scope the creds to this agent
+    # (otherwise the override would have to live in the shared default
+    # connector and bleed into every other claude agent).
+    [[ "$type" == "claude" && -z "$profile" ]] \
+      && fail "$E_USAGE" "claude BYO (--provider) requires --auth-profile=<name> (custom-provider creds are profile-scoped)"
     [[ -n "$byo_provider" && -n "$byo_api_key" ]] \
       || fail "$E_USAGE" "--provider and --api-key must be passed together"
     (( defer_auth )) \

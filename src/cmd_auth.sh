@@ -527,14 +527,20 @@ cmd_auth_set() {
   # agent CLI's native state dir (hermes auth.json / openclaw auth-profiles.json)
   # rather than the env-var-style anthropic.env path the claude family uses.
   if [[ -n "$byo_provider" ]]; then
-    [[ "$type" == "hermes" || "$type" == "openclaw" ]] \
-      || fail "$E_VALIDATION" "--provider only supported for hermes/openclaw (got: $type — drop --provider for env-var-style types)"
+    [[ "$type" == "hermes" || "$type" == "openclaw" || "$type" == "claude" ]] \
+      || fail "$E_VALIDATION" "--provider only supported for hermes/openclaw/claude (got: $type — drop --provider for env-var-style types)"
+    # claude BYO writes the endpoint+model overrides into the profile's
+    # combined.env, so it needs a profile (see _apply_byo_claude).
+    [[ "$type" == "claude" && -z "$profile" ]] \
+      && fail "$E_USAGE" "claude BYO (--provider) requires --auth-profile=<name> (custom-provider creds are profile-scoped)"
     require_root
     if [[ -n "$profile" ]]; then
       valid_profile_name "$profile" \
         || fail "$E_VALIDATION" "invalid --auth-profile (lowercase letters/digits/_-, start letter, <=32 chars)"
       ensure_profile_dir "$profile" >/dev/null
-      profile_type_dir "$profile" "$type" >/dev/null
+      # hermes/openclaw seed a per-type credential dir; claude stores its
+      # override env vars directly in combined.env, so skip that step for it.
+      [[ "$type" == "claude" ]] || profile_type_dir "$profile" "$type" >/dev/null
     fi
     apply_byo_provider "$type" "$byo_provider" "$api_key" "$profile"
 

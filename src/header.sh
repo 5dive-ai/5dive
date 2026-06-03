@@ -26,7 +26,7 @@ esac
 
 # Bumped on every public release. `build.sh` checks this line exists; CI fails
 # the bundle-drift check if it's missing or empty.
-readonly FIVE_VERSION="0.1.46"
+readonly FIVE_VERSION="0.1.47"
 
 STATE_DIR="/var/lib/5dive"
 REGISTRY="${STATE_DIR}/agents.json"
@@ -361,6 +361,39 @@ declare -A BYO_PROVIDER_LABEL=(
 valid_byo_provider() {
   [[ -n "${BYO_PROVIDER_LABEL[$1]:-}" ]]
 }
+
+# --- Claude (Claude Code) harness BYO custom-provider catalog -----------------
+# The claude harness can be pointed at any third-party provider that ships an
+# Anthropic Messages-API-compatible endpoint by overriding ANTHROPIC_BASE_URL +
+# ANTHROPIC_AUTH_TOKEN and the per-tier model ids (the modern Claude Code knobs
+# ANTHROPIC_DEFAULT_{OPUS,SONNET,HAIKU}_MODEL — so whichever tier the agent
+# selects, and the background haiku tasks, map to a model the provider actually
+# serves instead of 404-ing on "claude-…"). Only providers with a documented
+# anthropic-compat endpoint are listed; the rest of BYO_PROVIDER_LABEL is
+# intentionally absent here (no compat path → would break the harness). Model
+# ids drift upstream — operators can override per agent via the model picker, or
+# we bump these. Values verified against vendor Claude-Code docs 2026-06-03.
+declare -A CLAUDE_PROVIDER_BASEURL=(
+  [deepseek]="https://api.deepseek.com/anthropic"
+  [moonshot]="https://api.moonshot.ai/anthropic"
+  [zai]="https://api.z.ai/api/anthropic"
+)
+declare -A CLAUDE_PROVIDER_OPUS_MODEL=(
+  [deepseek]="deepseek-v4-pro"
+  [moonshot]="kimi-k2.5"
+  [zai]="glm-5.1"
+)
+declare -A CLAUDE_PROVIDER_SONNET_MODEL=(
+  [deepseek]="deepseek-v4-pro"
+  [moonshot]="kimi-k2.5"
+  [zai]="glm-5-turbo"
+)
+declare -A CLAUDE_PROVIDER_HAIKU_MODEL=(
+  [deepseek]="deepseek-v4-flash"
+  [moonshot]="kimi-k2.5"
+  [zai]="glm-4.5-air"
+)
+
 # Resolve a canonical UI id to the agent CLI's native provider id. Empty
 # result means the type doesn't support that vendor and the caller should
 # fail with a clear error.
@@ -369,6 +402,9 @@ resolve_native_provider() {
   case "$type" in
     hermes)   echo "${HERMES_PROVIDER_ID[$canonical]:-}" ;;
     openclaw) echo "${OPENCLAW_PROVIDER_ID[$canonical]:-}" ;;
+    # claude maps a supported provider to itself (the env-var override path in
+    # _apply_byo_claude keys off the canonical id, not a renamed native id).
+    claude)   [[ -n "${CLAUDE_PROVIDER_BASEURL[$canonical]:-}" ]] && echo "$canonical" ;;
     *)        echo "" ;;
   esac
 }
