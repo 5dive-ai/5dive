@@ -26,7 +26,7 @@ esac
 
 # Bumped on every public release. `build.sh` checks this line exists; CI fails
 # the bundle-drift check if it's missing or empty.
-readonly FIVE_VERSION="0.1.48"
+readonly FIVE_VERSION="0.1.49"
 
 STATE_DIR="/var/lib/5dive"
 REGISTRY="${STATE_DIR}/agents.json"
@@ -3692,6 +3692,48 @@ usage_read_ratelimits() {
       } end' "$cache" 2>/dev/null
 }
 
+# account_best_ratelimits <account> — freshest statusline rate-limit JSON across
+# the account's bound agents (same selection cmd_account_usage uses), or empty
+# when no bound agent has a readable cache. Emits the usage_read_ratelimits shape
+# ({asOf, fiveHourPct, ...}). Caller must be root to read sibling agent homes.
+account_best_ratelimits() {
+  local account="$1" agents agent rl at best best_at=-1
+  agents=$(account_agents_bound "$account")
+  while IFS= read -r agent; do
+    [[ -n "$agent" ]] || continue
+    rl=$(usage_read_ratelimits "$agent") || continue
+    [[ -n "$rl" ]] || continue
+    at=$(jq -r '.asOf // -1' <<<"$rl")
+    if [[ "$at" =~ ^[0-9]+$ ]] && (( at > best_at )); then
+      best_at=$at; best="$rl"
+    fi
+  done < <(jq -r '.[]' <<<"$agents")
+  printf '%s' "${best:-}"
+}
+
+# account_has_live_headroom <account> — exit 0 when the account's FRESHEST cache
+# was rendered recently (within HEADROOM_FRESH_SECS) AND both observed windows
+# are below HEADROOM_MAX_PCT. Used by rotation to override a STALE cooldown: if
+# an agent on that account rendered a low-usage statusline minutes ago, the
+# account genuinely has capacity regardless of a leftover cooldown epoch. A
+# missing/old/high cache → non-zero (don't override — fail safe to the cooldown).
+HEADROOM_FRESH_SECS="${HEADROOM_FRESH_SECS:-600}"   # 10 min
+HEADROOM_MAX_PCT="${HEADROOM_MAX_PCT:-90}"
+account_has_live_headroom() {
+  local account="$1" rl now
+  rl=$(account_best_ratelimits "$account")
+  [[ -n "$rl" ]] || return 1
+  now=$(date +%s)
+  jq -e --argjson now "$now" --argjson fresh "$HEADROOM_FRESH_SECS" \
+        --argjson max "$HEADROOM_MAX_PCT" '
+    # Fresh: cache mtime within the window. 5h must be present and under max;
+    # 7d may be null (not always surfaced) but if present must also be under max.
+    (.asOf != null and ($now - .asOf) <= $fresh)
+    and (.fiveHourPct != null and .fiveHourPct < $max)
+    and (.sevenDayPct == null or .sevenDayPct < $max)
+  ' <<<"$rl" >/dev/null 2>&1
+}
+
 # `account usage` — per-account snapshot of Anthropic 5h / 7d limit usage,
 # backing the dashboard Switch-account modal dots and Telegram /account +
 # /usage. For each account we read the FRESHEST statusline cache across its
@@ -4094,7 +4136,7 @@ cmd_agent_rotation_rotate() {
   # (computed live so newly-added accounts join automatically), otherwise the
   # stored ordered list. Then pick the first entry that isn't the current
   # account and isn't still cooling. Order == preference.
-  local allflag type pool now target
+  local allflag type pool now cd candidates target tier cooling_target=0
   allflag=$(jq -r --arg n "$name" '.agents[$n].rotation.allAccounts // false' <<<"$reg")
   if [[ "$allflag" == "true" ]]; then
     type=$(jq -r --arg n "$name" '.agents[$n].type' <<<"$reg")
@@ -4103,28 +4145,75 @@ cmd_agent_rotation_rotate() {
     pool=$(jq -c --arg n "$name" '.agents[$n].rotation.accounts // []' <<<"$reg")
   fi
   now=$(date +%s)
-  # -n (null input): everything is passed via --arg/--argjson, so the program
-  # must run once on null input rather than waiting on (empty) stdin.
-  target=$(jq -rn --arg cur "$current" --argjson now "$now" --argjson acc "$pool" \
-    --argjson cd "$(jq -c --arg n "$name" '.agents[$n].rotation.cooldowns // {}' <<<"$reg")" '
-    ([ $acc[] | select(. != $cur) | select(($cd[.] // 0) <= $now) ] | first) // ""
-  ')
+  cd=$(jq -c --arg n "$name" '.agents[$n].rotation.cooldowns // {}' <<<"$reg")
+  # Candidate accounts = the pool minus the one we're leaving, in preference order.
+  candidates=$(jq -c --arg cur "$current" --argjson acc "$pool" '[ $acc[] | select(. != $cur) ]')
+
+  # Tier 1 — a candidate that isn't cooling. The common case; preference order wins.
+  target=$(jq -rn --argjson now "$now" --argjson c "$candidates" --argjson cd "$cd" \
+    '([ $c[] | select(($cd[.] // 0) <= $now) ] | first) // ""')
+  tier=1
+
+  # Tier 2 — STALE-COOLDOWN RECOVERY (DIVE-55). Every candidate looks like it's
+  # cooling, but a cooldown is just a scraped reset epoch and can be wrong (set
+  # too late, or the account's window already reset). If an agent on a candidate
+  # rendered a low-usage statusline in the last few minutes, that account really
+  # has capacity — so override the stale cooldown and rotate there. We clear its
+  # cooldown so the resume doesn't then sit waiting on the bogus epoch.
+  if [[ -z "$target" ]]; then
+    local cand
+    while IFS= read -r cand; do
+      [[ -n "$cand" ]] || continue
+      if account_has_live_headroom "$cand"; then
+        target="$cand"; tier=2
+        reg=$(jq --arg n "$name" --arg a "$cand" 'del(.agents[$n].rotation.cooldowns[$a])' <<<"$reg")
+        echo "$reg" | registry_write
+        break
+      fi
+    done < <(jq -r '.[]' <<<"$candidates")
+  fi
+
+  # Tier 3 — SOONEST-FREEING (DIVE-55). All candidates are genuinely cooling.
+  # Rather than park on the account we just left (which we cooled to the LATEST
+  # reset), jump to whichever candidate frees first — but ONLY if it frees sooner
+  # than staying put would. current_cd is what we just cooled the leaving account
+  # to (or its stored cooldown); rotating to something that frees later would be
+  # strictly worse and could thrash, so we decline and let the resume wait here.
+  if [[ -z "$target" ]]; then
+    local current_cd soonest soonest_cd
+    if [[ "$cooldown_current" =~ ^[0-9]+$ ]]; then
+      current_cd="$cooldown_current"
+    else
+      current_cd=$(jq -rn --arg cur "$current" --argjson cd "$cd" '($cd[$cur] // 0)')
+    fi
+    soonest=$(jq -rn --argjson c "$candidates" --argjson cd "$cd" \
+      '([ $c[] | {a:., u:($cd[.] // 0)} ] | sort_by(.u) | first | .a) // ""')
+    soonest_cd=$(jq -rn --arg a "$soonest" --argjson cd "$cd" '($cd[$a] // 0)')
+    if [[ -n "$soonest" ]] && (( soonest_cd < current_cd )); then
+      target="$soonest"; tier=3; cooling_target=1
+    fi
+  fi
+
   if [[ -z "$target" ]]; then
     if (( JSON_MODE )); then
-      ok "" '{rotated:false, from:$f, to:null, reason:"no eligible account (all cooling or none configured)"}' \
+      ok "" '{rotated:false, from:$f, to:null, reason:"no eligible account (all cooling later than current, or none configured)"}' \
          --arg f "$current"
     else
-      echo "OK — no eligible account to rotate to (all cooling / none configured)"
+      echo "OK — no eligible account to rotate to (all cooling later than current / none configured)"
     fi
     return 0
   fi
   # Re-point via the existing set-account plumbing. We already hold the
   # registry lock and cmd_config reads/writes the registry directly (safe
   # under the lock); it also fires the deferred restart. Silence its own
-  # stdout so we emit a single clean envelope.
+  # stdout so we emit a single clean envelope. `tier`/`coolingTarget` are
+  # surfaced for observability (3 + coolingTarget=true means we rotated to a
+  # still-cooling-but-sooner account; the resume waits on its reset).
   cmd_config "$name" set "auth-profile=${target}" >/dev/null
   ok "rotated '$name': ${current:--} -> ${target}" \
-     '{rotated:true, from:$f, to:$t}' --arg f "$current" --arg t "$target"
+     '{rotated:true, from:$f, to:$t, tier:$tier, coolingTarget:$ct}' \
+     --arg f "$current" --arg t "$target" --argjson tier "$tier" \
+     --argjson ct "$( ((cooling_target)) && echo true || echo false )"
 }
 
 cmd_agent_rotation_cooldown() {
