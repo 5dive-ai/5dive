@@ -2123,29 +2123,43 @@ send_welcome_message() {
       text=$(cat <<EOF
 👋 We're connected! I'm ${name_q}your ${kind}.
 
-Here 24/7 — we can pick up where we left off. Send text, photos, or files.
+Here 24/7, ready to pick up where we left off. Send text, photos, or files.
 
-Tell me what to build — app, site, bot, report, campaign — consider it shipped.${live_line} Need more hands? Siblings on demand, working in parallel.
+Tell me what to build: app, site, bot, report, campaign. Consider it shipped.${live_line} Need more hands? Siblings on demand, working in parallel.
 EOF
 )
       ;;
     *)
-      local model effort
-      local project_settings="/home/claude/projects/.claude/settings.local.json"
-      if [[ -r "$project_settings" ]]; then
-        model=$(jq -r '.model // "default"' "$project_settings" 2>/dev/null || echo default)
-        effort=$(jq -r '.effortLevel // "default"' "$project_settings" 2>/dev/null || echo default)
-      else
-        model="default"; effort="default"
+      # Read the agent's REAL model/effort from its own settings.json (where the
+      # per-agent default — opus — is seeded). Fall back to the base claude user
+      # and the legacy shared projects file. Never surface a raw "default"
+      # placeholder: if we can't read a concrete model, show a generic line.
+      local model="" effort="" f
+      local candidates=()
+      [[ -n "$agent_name" ]] && candidates+=("/home/agent-${agent_name}/.claude/settings.json")
+      candidates+=("/home/claude/.claude/settings.json" "/home/claude/projects/.claude/settings.local.json")
+      for f in "${candidates[@]}"; do
+        [[ -r "$f" ]] || continue
+        model=$(jq -r '.model // empty' "$f" 2>/dev/null)
+        effort=$(jq -r '.effortLevel // empty' "$f" 2>/dev/null)
+        [[ -n "$model" ]] && break
+      done
+      local model_line="Model and effort are switchable anytime, just ask."
+      if [[ -n "$model" && "$model" != "default" ]]; then
+        if [[ -n "$effort" && "$effort" != "default" ]]; then
+          model_line="Running ${model} at ${effort} effort. Switchable anytime, just ask."
+        else
+          model_line="Running ${model}. Switchable anytime, just ask."
+        fi
       fi
       text=$(cat <<EOF
 👋 We're connected! I'm ${name_q}your Claude agent.
 
-${model} · ${effort} effort — switchable anytime, just ask.
+${model_line}
 
-Here 24/7 with memory. Send text, photos, or files; ask for voice if you'd rather talk.
+Here 24/7 with memory. Send text, photos, or files, or ask for voice if you'd rather talk.
 
-Tell me what to build — app, site, bot, report, campaign — consider it shipped.${live_line} Need more hands? Siblings on demand, working in parallel.
+Tell me what to build: app, site, bot, report, campaign. Consider it shipped.${live_line} Need more hands? Siblings on demand, working in parallel.
 EOF
 )
       ;;
