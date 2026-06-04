@@ -668,7 +668,12 @@ cmd_agent_rotation_rotate() {
   now=$(date +%s)
   cd=$(jq -c --arg n "$name" '.agents[$n].rotation.cooldowns // {}' <<<"$reg")
   # Candidate accounts = the pool minus the one we're leaving, in preference order.
-  candidates=$(jq -c --arg cur "$current" --argjson acc "$pool" '[ $acc[] | select(. != $cur) ]')
+  # -n (null input) is REQUIRED: this filter reads only from --argjson, never stdin.
+  # Without it jq blocks on / consumes stdin — and when the rotate runs from the
+  # StopFailure hook (empty stdin) it processes zero inputs and emits an empty
+  # string, which then crashes Tier-1's `--argjson c ""` with "invalid JSON text".
+  # That abort left the agent parked on the just-cooled account = no rotation.
+  candidates=$(jq -cn --arg cur "$current" --argjson acc "$pool" '[ $acc[] | select(. != $cur) ]')
 
   # Tier 1 — a candidate that isn't cooling. The common case; preference order wins.
   target=$(jq -rn --argjson now "$now" --argjson c "$candidates" --argjson cd "$cd" \

@@ -9,6 +9,22 @@ release.
 
 ## [Unreleased]
 
+## [0.1.50] — 2026-06-04
+
+### Fixed
+
+- **Account rotation silently failed to switch accounts** (also hit team
+  accounts that repeatedly trip a usage/spend limit). `agent rotation rotate`
+  builds the candidate list with `jq` using only `--argjson` args and no input;
+  the call was missing `-n`, so when invoked from the StopFailure hook (empty
+  stdin) jq processed zero inputs and returned an empty string. That empty
+  string then crashed the next jq (`--argjson c ""` → "invalid JSON text"),
+  aborting the rotate *after* it had already written the leaving account's
+  cooldown. Net effect: the agent cooled the account it was on but never moved
+  off it, so it sat parked on the limited account until a human re-logged in.
+  Fixed by adding `-n` (`jq -c` → `jq -cn`). Rotation now reaches Tier-1/2/3
+  selection as designed.
+
 ## [0.1.42] — 2026-06-02
 
 ### Fixed
