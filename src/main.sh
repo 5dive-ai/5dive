@@ -60,6 +60,10 @@ Agents:
   5dive agent config <name> set channels=<none|telegram|discord>
   5dive agent config <name> set workdir=<path>       # tmux cwd; "default" clears override
   5dive agent config <name> set auth-profile=<name>  # swap profile; "default" clears override
+  5dive agent config <name> set model=<id>           # runtime model (claude/codex/grok/antigravity)
+  5dive agent config <name> set effort=<low|medium|high|xhigh|max>
+                                                     # claude only — reasoning effort (effortLevel);
+                                                     # xhigh/max are Opus-tier (Sonnet caps at high)
   5dive agent config <name> set telegram.token=<bot-token>
                                                      # combine with channels=telegram to attach a Telegram bot
                                                      # post-create (also runs install_channel_for_agent so the

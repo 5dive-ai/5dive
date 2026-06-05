@@ -26,7 +26,7 @@ esac
 
 # Bumped on every public release. `build.sh` checks this line exists; CI fails
 # the bundle-drift check if it's missing or empty.
-readonly FIVE_VERSION="0.1.51"
+readonly FIVE_VERSION="0.1.52"
 
 STATE_DIR="/var/lib/5dive"
 REGISTRY="${STATE_DIR}/agents.json"
@@ -4414,6 +4414,19 @@ resolve_agent_model() {
   esac
 }
 
+# Resolve the reasoning effort an agent is configured with — claude-only
+# (`effortLevel` in settings.json). Best-effort: returns "" for non-claude types
+# or when unset (Claude Code then uses its built-in default), so callers render
+# "—"/null rather than treat empty as an error.
+resolve_agent_effort() {
+  local type="$1" name="$2"
+  case "$type" in
+    claude)
+      sudo jq -r '.effortLevel // empty' "/home/agent-${name}/.claude/settings.json" 2>/dev/null ;;
+    *) printf '' ;;
+  esac
+}
+
 # Write the selected model into the per-type runtime config the CLI loads, so
 # `config set model=` is the single uniform path the forks' /model shells out to
 # (replacing each plugin's own per-runtime config write). TOML (codex/grok) and
@@ -4478,6 +4491,40 @@ PY
   mv -f "$tmp" "$file"
 }
 
+# Write the reasoning effort into claude's settings.json (`effortLevel`) — the
+# same key Claude Code reads and the telegram plugin's /effort writes. Claude-only
+# (other types have no effort knob). Same atomic merge-write contract as
+# write_runtime_model: refuse to create a missing file, preserve owner:group + 600.
+write_runtime_effort() {
+  local name="$1" effort="$2"
+  local file="/home/agent-${name}/.claude/settings.json"
+  [[ -f "$file" ]] \
+    || fail "$E_NOT_FOUND" "no claude runtime config at $file yet — start agent '$name' once before setting effort"
+  local dir own tmp
+  dir=$(dirname "$file")
+  own=$(stat -c '%U:%G' "$file")
+  tmp=$(mktemp -p "$dir" .effort.XXXXXX) || fail "$E_GENERIC" "mktemp failed in $dir"
+  if ! EFFORT_VAL="$effort" EFFORT_SRC="$file" python3 - "$tmp" <<'PY'
+import os, sys, json
+val, src, tmp = os.environ["EFFORT_VAL"], os.environ["EFFORT_SRC"], sys.argv[1]
+with open(src) as f: orig = f.read()
+try:
+    data = json.loads(orig) if orig.strip() else {}
+except ValueError:
+    sys.stderr.write("existing %s is not valid JSON\n" % src); sys.exit(3)
+if not isinstance(data, dict):
+    sys.stderr.write("existing %s is not a JSON object\n" % src); sys.exit(3)
+data["effortLevel"] = val
+with open(tmp, "w") as f: f.write(json.dumps(data, indent=2) + "\n")
+PY
+  then
+    rm -f "$tmp"; fail "$E_GENERIC" "failed to write effortLevel into $file"
+  fi
+  chown "$own" "$tmp" 2>/dev/null || true
+  chmod 600 "$tmp"
+  mv -f "$tmp" "$file"
+}
+
 # Single-agent detail: registry identity/config + live systemd state, plus the
 # resolved coding-CLI version and selected model. Added so each fork's /status
 # reads one uniform source (cliName/cliVersion/model) instead of shelling each
@@ -4507,9 +4554,10 @@ cmd_info() {
   local type
   type=$(jq -r --arg n "$name" '.agents[$n].type' <<<"$reg")
 
-  local cli_version model
+  local cli_version model effort
   cli_version=$(resolve_cli_version "$type")
   model=$(resolve_agent_model "$type" "$name")
+  effort=$(resolve_agent_effort "$type" "$name")
 
   local obj
   obj=$(jq -c \
@@ -4520,6 +4568,7 @@ cmd_info() {
     --arg cliName "$type" \
     --arg cliVersion "$cli_version" \
     --arg model "$model" \
+    --arg effort "$effort" \
     '.agents[$n] as $a | {
       name: $n,
       type: $a.type,
@@ -4534,7 +4583,8 @@ cmd_info() {
       enabled: $enabled,
       cliName: $cliName,
       cliVersion: (if $cliVersion == "" then null else $cliVersion end),
-      model: (if $model == "" then null else $model end)
+      model: (if $model == "" then null else $model end),
+      effort: (if $effort == "" then null else $effort end)
     }' <<<"$reg")
 
   if (( JSON_MODE )); then
@@ -4544,7 +4594,7 @@ cmd_info() {
       "name:        \(.name)",
       "type:        \(.type)",
       "cli:         \(.cliName) \(.cliVersion // "unknown")",
-      "model:       \(.model // "—")",
+      "model:       \(.model // "—")\(if .effort then " · effort \(.effort)" else "" end)",
       "channels:    \(.channels)\(if .botUsername then " (@\(.botUsername))" else "" end)",
       "profile:     \(.authProfile // "-")",
       "workdir:     \(.workdir)",
@@ -5337,6 +5387,7 @@ cmd_config() {
   local new_home_channel=""
   local new_allowed_users=""
   local new_model=""
+  local new_effort=""
   # applied_keys: names of keys that were actually changed, for the JSON payload.
   local -a applied_keys=()
   for kv in "$@"; do
@@ -5409,6 +5460,22 @@ cmd_config() {
         esac
         new_model="$v"
         applied_keys+=("model")
+        ;;
+      effort|effortLevel)
+        # Reasoning-effort switch — claude-only (Claude Code's settings.json
+        # effortLevel). Mirrors the telegram plugin's /effort: writes effortLevel
+        # then restarts (deferred below). Not registry-stored — `agent info`
+        # reads the live settings.json so an effort changed in-TUI stays truth.
+        # Levels match the plugin's EFFORT_LEVELS; xhigh/max are Opus-only at the
+        # model level but we don't gate by model here (same as the plugin picker).
+        [[ "$type" == "claude" ]] \
+          || fail "$E_VALIDATION" "type '$type' does not support 'effort' config (claude only)"
+        case "$v" in
+          low|medium|high|xhigh|max) ;;
+          *) fail "$E_VALIDATION" "invalid effort '$v' (allowed: low, medium, high, xhigh, max)" ;;
+        esac
+        new_effort="$v"
+        applied_keys+=("effort")
         ;;
       auth-profile|auth.profile)
         if [[ -z "$v" || "$v" == "default" ]]; then
@@ -5527,6 +5594,10 @@ cmd_config() {
   if [[ -n "$new_model" ]]; then
     step "Writing model=$new_model into $type runtime config"
     write_runtime_model "$type" "$name" "$new_model"
+  fi
+  if [[ -n "$new_effort" ]]; then
+    step "Writing effortLevel=$new_effort into claude runtime config"
+    write_runtime_effort "$name" "$new_effort"
   fi
   # Defer the restart so the calling process (often `sudo -n 5dive agent
   # set-account` invoked from inside the agent's own bot) gets to return
@@ -9801,6 +9872,10 @@ Agents:
   5dive agent config <name> set channels=<none|telegram|discord>
   5dive agent config <name> set workdir=<path>       # tmux cwd; "default" clears override
   5dive agent config <name> set auth-profile=<name>  # swap profile; "default" clears override
+  5dive agent config <name> set model=<id>           # runtime model (claude/codex/grok/antigravity)
+  5dive agent config <name> set effort=<low|medium|high|xhigh|max>
+                                                     # claude only — reasoning effort (effortLevel);
+                                                     # xhigh/max are Opus-tier (Sonnet caps at high)
   5dive agent config <name> set telegram.token=<bot-token>
                                                      # combine with channels=telegram to attach a Telegram bot
                                                      # post-create (also runs install_channel_for_agent so the

@@ -9,6 +9,28 @@ release.
 
 ## [Unreleased]
 
+## [0.1.52] — 2026-06-05
+
+### Added
+
+- **`5dive agent config <name> set effort=<low|medium|high|xhigh|max>`** —
+  closes the parity gap with `set model=`. Reasoning effort is claude-only
+  (writes `effortLevel` into the agent's `settings.json`, the same key the
+  telegram plugin's `/effort` writes), validated against the five levels, and
+  errors clearly for non-claude types. Applied via the existing deferred
+  ~1s restart, like the model setter. `xhigh`/`max` are Opus-tier (Sonnet caps
+  at `high`) — not gated by model here, matching the plugin picker.
+- **`5dive agent info` now surfaces effort** — `effortLevel` is read alongside
+  the model (`resolve_agent_effort`); rendered as `model · effort <level>` in
+  text and as a new `effort` field (null when unset / non-claude) in `--json`.
+
+## [0.1.51] — 2026-06-04
+
+### Changed
+
+- Agent welcome message: dropped em-dashes, reads the real configured model, and
+  no longer prints a raw "default" placeholder.
+
 ## [0.1.50] — 2026-06-04
 
 ### Fixed
