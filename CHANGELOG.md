@@ -9,6 +9,22 @@ release.
 
 ## [Unreleased]
 
+## [0.1.58] — 2026-06-06
+
+### Changed
+
+- `heartbeat tick`: spread agents that share an Anthropic account so they never
+  start together. Two same-account agents waking on one tick burst the shared
+  account and trip a 429; the tick now requires an even slice of the cadence
+  between same-account wakes (`gap = everyMin / agents-on-account`, e.g. 2 agents
+  @ 60m → 30m apart, 3 → 20m) and self-heals as agents join. The account's last
+  wake is derived from existing `lastRunAt` values plus an in-tick guard (no new
+  state); deferred agents stay due and slide later until they clear the gap, so
+  phases converge to even spacing on their own. Single-account agents and agents
+  with no `authProfile` are never deferred. The tick also now processes
+  oldest-waiting agents first so a fresher sibling can't starve an older one of
+  the shared slot. Surfaced as `spread` in the tick's skipped counters.
+
 ## [0.1.55] — 2026-06-06
 
 ### Added

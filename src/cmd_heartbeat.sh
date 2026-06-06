@@ -285,8 +285,16 @@ cmd_heartbeat_tick() {
   require_root "heartbeat tick"
   tasks_db_init
   local reg now; reg=$(registry_read); now=$(date +%s)
-  local checked=0 woke=0 reaped=0 starved=0 sk_notdue=0 sk_busy=0 sk_nowork=0 sk_fail=0
+  local checked=0 woke=0 reaped=0 starved=0 sk_notdue=0 sk_busy=0 sk_nowork=0 sk_fail=0 sk_spread=0
+  # Accounts already woken during THIS tick. The $reg snapshot is read once up
+  # front, so a wake we do mid-loop isn't visible to later iterations via the
+  # registry — this map carries that within-tick fact so two same-account agents
+  # can't both wake on one tick.
+  local -A in_tick_woke=()
   local name
+  # Process oldest-waiting first (smallest lastRunAt). When two same-account
+  # agents contend for the one wake slot, the one that has waited longest wins,
+  # so neither can be starved by a fresher sibling repeatedly taking the slot.
   while IFS= read -r name; do
     [[ -n "$name" ]] || continue
     checked=$((checked + 1))
@@ -319,8 +327,46 @@ cmd_heartbeat_tick() {
       sk_nowork=$((sk_nowork + 1)); _hb_log "[$name] no todo — stay idle"; continue
     fi
 
+    # --- Same-account spread ---------------------------------------------------
+    # Never start two agents that share an Anthropic account close together: a
+    # simultaneous session start bursts the shared account and trips a 429. The
+    # account's most-recent wake is derived from existing lastRunAt values (plus
+    # any wake done earlier this tick) — no extra state. Require an even slice of
+    # the cadence between same-account wakes: gap = everyMin / agents-on-account
+    # (2 agents @ 60m -> 30m apart, 3 -> 20m), and it self-heals as agents join.
+    # Single-agent accounts are never deferred. A deferred agent is left due and
+    # retried next tick, sliding later until it clears the gap, so the phases
+    # converge to even spacing on their own. Agents with no authProfile get a
+    # per-name sentinel account, so they never contend with anyone.
+    local acct acct_count
+    acct=$(jq -r --arg n "$name" '.agents[$n].authProfile // ("@self:" + $n)' <<<"$reg")
+    acct_count=$(jq -r --arg a "$acct" '
+      [.agents | to_entries[]
+       | select(.value.heartbeat.enabled == true)
+       | (.value.authProfile // ("@self:" + .key))
+       | select(. == $a)] | length' <<<"$reg")
+    if (( acct_count > 1 )); then
+      local acct_last gap
+      acct_last=$(jq -r --arg a "$acct" --arg n "$name" '
+        [.agents | to_entries[]
+         | select(.value.heartbeat.enabled == true)
+         | select(.key != $n)
+         | select((.value.authProfile // ("@self:" + .key)) == $a)
+         | (.value.heartbeat.lastRunAt // 0)] | max // 0' <<<"$reg")
+      if [[ -n "${in_tick_woke[$acct]:-}" ]] && (( in_tick_woke[$acct] > acct_last )); then
+        acct_last=${in_tick_woke[$acct]}
+      fi
+      gap=$(( everyMin * 60 / acct_count ))
+      if (( now - acct_last < gap )); then
+        sk_spread=$((sk_spread + 1))
+        _hb_log "[$name] spread-defer — account '$acct' (${acct_count} agents) last woke $(( (now - acct_last) / 60 ))m ago, need a $(( gap / 60 ))m gap; retry next tick"
+        continue
+      fi
+    fi
+
     _hb_log "[$name] due + todo DIVE-${task_id} — waking (fresh=${fresh})"
     if _hb_wake "$name" "$fresh" "$task_id"; then
+      in_tick_woke[$acct]=$now   # claim the account's slot for the rest of this tick
       local nudge_n
       nudge_n=$(with_registry_lock _hb_mark_run "$name" "$now" "$task_id")
       woke=$((woke + 1)); _hb_log "[$name] nudged (/goal DIVE-${task_id}, nudge #${nudge_n:-?})"
@@ -334,10 +380,13 @@ cmd_heartbeat_tick() {
     else
       sk_fail=$((sk_fail + 1)); _hb_log "[$name] wake failed — will retry next tick"
     fi
-  done < <(jq -r '.agents | to_entries[] | select(.value.heartbeat.enabled == true) | .key' <<<"$reg")
+  done < <(jq -r '.agents | to_entries
+                  | map(select(.value.heartbeat.enabled == true))
+                  | sort_by(.value.heartbeat.lastRunAt // 0)
+                  | .[].key' <<<"$reg")
 
-  ok "heartbeat tick: woke ${woke} / reaped ${reaped} / starved ${starved} / checked ${checked}" \
+  ok "heartbeat tick: woke ${woke} / reaped ${reaped} / starved ${starved} / spread-deferred ${sk_spread} / checked ${checked}" \
      '{checked:($c|tonumber), woke:($w|tonumber), reaped:($r|tonumber), starved:($st|tonumber),
-       skipped:{notDue:($nd|tonumber), busy:($b|tonumber), noWork:($nw|tonumber), failed:($sf|tonumber)}}' \
-     --arg c "$checked" --arg w "$woke" --arg r "$reaped" --arg st "$starved" --arg nd "$sk_notdue" --arg b "$sk_busy" --arg nw "$sk_nowork" --arg sf "$sk_fail"
+       skipped:{notDue:($nd|tonumber), busy:($b|tonumber), noWork:($nw|tonumber), spread:($sp|tonumber), failed:($sf|tonumber)}}' \
+     --arg c "$checked" --arg w "$woke" --arg r "$reaped" --arg st "$starved" --arg nd "$sk_notdue" --arg b "$sk_busy" --arg nw "$sk_nowork" --arg sp "$sk_spread" --arg sf "$sk_fail"
 }
