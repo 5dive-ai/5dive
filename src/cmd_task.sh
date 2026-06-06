@@ -19,6 +19,12 @@ _task_usage() {
   5dive task unblock <id|DIVE-N> [--by=<id|DIVE-N>]  # drop edge(s); back to todo if clear
   5dive task rm <id|DIVE-N>                          # delete (cascades subtasks + edges)
 
+  # Human Task Inbox — park a task on a human and clear it
+  5dive task need <id|DIVE-N> --type=decision|secret|approval|manual --ask="..." [--options=A|B]
+                                                     # -> blocked, awaiting a human (decision/secret/approval/manual)
+  5dive task inbox                                   # list ONLY human-gated tasks, priority-ordered
+  5dive task answer <id|DIVE-N> --value="..."        # record the human's answer, unblock, ping the owning agent
+
   status: todo | in_progress | blocked | done | cancelled
   Any agent (group claude) can run these without sudo. Add --json for machine output.
 USAGE
@@ -38,6 +44,9 @@ cmd_task() {
     cancel)          cmd_task_cancel "$@" ;;
     block)           cmd_task_block "$@" ;;
     unblock)         cmd_task_unblock "$@" ;;
+    need)            cmd_task_need "$@" ;;
+    inbox)           cmd_task_inbox "$@" ;;
+    answer)          cmd_task_answer "$@" ;;
     rm|delete)       cmd_task_rm "$@" ;;
     -h|--help|help)  _task_usage ;;
     *) fail "$E_USAGE" "unknown task command: $sub (try: 5dive task --help)" ;;
@@ -112,7 +121,7 @@ cmd_task_ls() {
   local order="ORDER BY CASE priority WHEN 'urgent' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2 ELSE 3 END, created_at"
   if (( JSON_MODE )); then
     local rows
-    rows=$(dbfmt -json "SELECT id, ident, title, status, priority, assignee, created_by, parent_id, created_at, done_at, body, result FROM tasks WHERE ${where} ${order};")
+    rows=$(dbfmt -json "SELECT id, ident, title, status, priority, assignee, created_by, parent_id, created_at, done_at, body, result, need_type, ask, need_options, need_answer, need_answered_at FROM tasks WHERE ${where} ${order};")
     [[ -n "$rows" ]] || rows="[]"
     jq -cn --argjson r "$rows" '{ok:true, data:{tasks:$r}}'
   else
@@ -135,6 +144,17 @@ cmd_task_show() {
       '{ok:true, data:{task:($t[0]), subtasks:$s, blocked_by:$b}}'
   else
     dbfmt -line "SELECT ident, title, status, priority, assignee, created_by, parent_id, created_at, started_at, done_at, body, result FROM tasks WHERE id=${id};"
+    # Human gate (only when set) — mirrors the conditional subtasks/blockers
+    # blocks below so an ordinary task's `show` stays clean.
+    local gate
+    gate=$(db "SELECT 'type: '||need_type||
+                      CASE WHEN need_options IS NOT NULL THEN '  options: '||need_options ELSE '' END||x'0a'||
+                      'ask:  '||COALESCE(ask,'')||
+                      CASE WHEN need_answered_at IS NOT NULL
+                           THEN x'0a'||'answer: '||CASE WHEN need_type='secret' THEN '(provided — loaded out-of-band)' ELSE COALESCE(need_answer,'') END||'  ('||need_answered_at||')'
+                           ELSE x'0a'||'answer: — pending' END
+               FROM tasks WHERE id=${id} AND need_type IS NOT NULL;")
+    [[ -n "$gate" ]] && { echo; echo "human gate:"; printf '%s\n' "$gate" | indent2; }
     local subs
     subs=$(db "SELECT ident||'  ['||status||']  '||title FROM tasks WHERE parent_id=${id} ORDER BY id;")
     [[ -n "$subs" ]] && { echo; echo "subtasks:"; printf '%s\n' "$subs" | indent2; }
@@ -224,6 +244,153 @@ cmd_task_unblock() {
       WHERE id=${tid} AND status='blocked'
         AND NOT EXISTS (SELECT 1 FROM task_deps WHERE task_id=${tid});"
   ok "DIVE-$tid unblocked" '{task:($t|tonumber)}' --arg t "$tid"
+}
+
+# --- Human Task Inbox (DIVE-103; parent feature DIVE-102) ----------------
+# `need` parks a task on a human; `inbox` lists what's waiting; `answer`
+# records the human's reply, unblocks, and pings the agent that hit the gate.
+
+cmd_task_need() {
+  tasks_db_init
+  local type="" ask="" options="" from=""
+  local -a positional=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --type=*)    type="${1#*=}" ;;
+      --ask=*)     ask="${1#*=}" ;;
+      --options=*) options="${1#*=}" ;;
+      --from=*)    from="${1#*=}" ;;
+      --)          shift; positional+=("$@"); break ;;
+      -*)          fail "$E_USAGE" "unknown flag: $1" ;;
+      *)           positional+=("$1") ;;
+    esac
+    shift
+  done
+  [[ ${#positional[@]} -gt 0 ]] || fail "$E_USAGE" "usage: 5dive task need <id|DIVE-N> --type=decision|secret|approval|manual --ask=\"...\" [--options=A|B]"
+  resolve_task_id "${positional[0]}"; local id="$RESOLVED_TASK_ID"
+  valid_need_type "$type" || fail "$E_VALIDATION" "bad --type '$type' (decision|secret|approval|manual)"
+  [[ -n "$ask" ]] || fail "$E_USAGE" "--ask is required (what does the human need to provide?)"
+  # Options are the choice list for a decision; reject them on the other types
+  # so the gate shape stays honest for the dashboard.
+  if [[ -n "$options" && "$type" != "decision" ]]; then
+    fail "$E_VALIDATION" "--options only applies to --type=decision"
+  fi
+  local cur; cur=$(db "SELECT status FROM tasks WHERE id=${id};")
+  [[ "$cur" == "done" || "$cur" == "cancelled" ]] \
+    && fail "$E_CONFLICT" "DIVE-$id is $cur — reopen it before gating on a human"
+  # assignee=actor: the agent hitting the gate becomes the owner-of-record, so
+  # `task answer` knows who to ping to resume. The inbox is defined by the gate
+  # (need_type set), not by assignee, so it still surfaces to the human.
+  local actor; actor=$(task_actor "$from")
+  db "UPDATE tasks
+        SET status='blocked', assignee=$(sqlq "$actor"),
+            need_type=$(sqlq "$type"), ask=$(sqlq "$ask"),
+            need_options=$(sqlq_or_null "$options"),
+            need_answer=NULL, need_answered_at=NULL
+      WHERE id=${id};"
+  ok "DIVE-$id needs a human ($type) — $ask" \
+     '{id:($i|tonumber), ident:("DIVE-"+$i), status:"blocked", need_type:$ty, ask:$ak, need_options:(($op|select(length>0)) // null), assignee:$ac}' \
+     --arg i "$id" --arg ty "$type" --arg ak "$ask" --arg op "$options" --arg ac "$actor"
+}
+
+cmd_task_inbox() {
+  tasks_db_init
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -*) fail "$E_USAGE" "unknown flag: $1" ;;
+      *)  fail "$E_USAGE" "unexpected arg: $1 (inbox takes no positional args)" ;;
+    esac
+  done
+  # A pending gate, decoupled from the overloaded `status` (a task can be both
+  # human-gated and blocked-by another task): need set, not yet answered.
+  local where="need_type IS NOT NULL AND need_answered_at IS NULL"
+  local order="ORDER BY CASE priority WHEN 'urgent' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2 ELSE 3 END, created_at"
+  if (( JSON_MODE )); then
+    local rows
+    rows=$(dbfmt -json "SELECT id, ident, title, status, priority, assignee, created_by, parent_id, created_at, need_type, ask, need_options, need_answer, need_answered_at FROM tasks WHERE ${where} ${order};")
+    [[ -n "$rows" ]] || rows="[]"
+    jq -cn --argjson r "$rows" '{ok:true, data:{inbox:$r}}'
+  else
+    local cnt; cnt=$(db "SELECT COUNT(*) FROM tasks WHERE ${where};")
+    if [[ "$cnt" == "0" ]]; then
+      echo "inbox empty — nothing waiting on a human."
+    else
+      dbfmt -box "SELECT ident, priority, need_type, COALESCE(assignee,'-') AS owner, ask FROM tasks WHERE ${where} ${order};"
+    fi
+  fi
+}
+
+cmd_task_answer() {
+  tasks_db_init
+  local value="" value_set=0 from=""
+  local -a positional=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --value=*) value="${1#*=}"; value_set=1 ;;
+      --from=*)  from="${1#*=}" ;;
+      --)        shift; positional+=("$@"); break ;;
+      -*)        fail "$E_USAGE" "unknown flag: $1" ;;
+      *)         positional+=("$1") ;;
+    esac
+    shift
+  done
+  [[ ${#positional[@]} -gt 0 ]] || fail "$E_USAGE" "usage: 5dive task answer <id|DIVE-N> --value=\"...\"  (omit --value for a secret gate)"
+  resolve_task_id "${positional[0]}"; local id="$RESOLVED_TASK_ID"
+  # Must have a pending (unanswered) gate to answer.
+  local nt
+  nt=$(db "SELECT CASE WHEN need_type IS NOT NULL AND need_answered_at IS NULL THEN need_type ELSE '' END FROM tasks WHERE id=${id};")
+  [[ -n "$nt" ]] || fail "$E_CONFLICT" "DIVE-$id has no pending human gate (nothing to answer)"
+  # Who resumes: the agent that hit the gate (assignee), else the creator.
+  local owner; owner=$(db "SELECT COALESCE(NULLIF(assignee,''), NULLIF(created_by,''), '') FROM tasks WHERE id=${id};")
+
+  # Record the answer. A `secret` gate NEVER stores its value — writing a raw
+  # key into this group-claude-readable db is a plaintext-secret-at-rest leak.
+  # We only stamp need_answered_at (the "provided" signal); the agent loads the
+  # key out-of-band. decision/approval/manual store the value in need_answer.
+  if [[ "$nt" == "secret" ]]; then
+    (( value_set )) && fail "$E_USAGE" "DIVE-$id is a secret gate — do not pass --value; the key must not be stored in the shared db. Run: 5dive task answer DIVE-$id  (records it as provided + pings the agent to load it from where you placed it)"
+    db "UPDATE tasks SET need_answered_at=datetime('now') WHERE id=${id};"
+  else
+    (( value_set )) || fail "$E_USAGE" "--value is required (the human's answer)"
+    db "UPDATE tasks SET need_answer=$(sqlq "$value"), need_answered_at=datetime('now') WHERE id=${id};"
+  fi
+
+  # Clearing the gate ≠ unblocking. `status='blocked'` is overloaded (human
+  # gate AND task-task `block` edges), so RECOMPUTE rather than hardcode todo:
+  # flip to todo only if no block edges remain — same edge-check `unblock` does
+  # — else stay blocked (still waiting on another task). Answered-ness lives in
+  # need_answered_at, so the task already left the inbox regardless of status.
+  db "UPDATE tasks SET status='todo'
+      WHERE id=${id} AND status='blocked'
+        AND NOT EXISTS (SELECT 1 FROM task_deps WHERE task_id=${id});"
+  local newstatus; newstatus=$(db "SELECT status FROM tasks WHERE id=${id};")
+
+  # Best-effort resume ping over the existing agent-send path. We deliberately
+  # do NOT embed the answer value: cmd_send mirrors the outbound into the group
+  # chat, so a `secret` answer would leak. The agent reads need_answer itself
+  # via `task show` (its own pane only). A stopped or non-agent owner just
+  # yields pinged:false — it never fails the answer.
+  local pinged=0
+  if [[ -n "$owner" ]]; then
+    local pingmsg
+    if [[ "$nt" == "secret" ]]; then
+      pingmsg="DIVE-${id} secret gate marked provided — resume the task and load the key from where it was placed (its .env / your own channel), NOT from the task."
+    else
+      pingmsg="DIVE-${id} gate cleared — your '${nt}' ask was answered. Resume the task; run \`5dive task show DIVE-${id}\` for the value."
+    fi
+    local actor; actor=$(task_actor "$from")
+    if valid_sender_label "$actor"; then
+      ( cmd_send "$owner" --from="$actor" --message="$pingmsg" ) >/dev/null 2>&1 && pinged=1 || true
+    else
+      ( cmd_send "$owner" --message="$pingmsg" ) >/dev/null 2>&1 && pinged=1 || true
+    fi
+  fi
+
+  local note=""
+  [[ $pinged -eq 1 ]] && note=" + pinged $owner"
+  ok "DIVE-$id answered ($nt) — now ${newstatus}${note}" \
+     '{id:($i|tonumber), status:$st, need_type:$nt, provided:true, need_answer:(if $nt=="secret" then null else $v end), owner:(($o|select(length>0)) // null), pinged:($p=="1")}' \
+     --arg i "$id" --arg st "$newstatus" --arg nt "$nt" --arg v "$value" --arg o "$owner" --arg p "$pinged"
 }
 
 cmd_task_rm() {

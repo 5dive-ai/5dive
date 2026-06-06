@@ -9,6 +9,26 @@ release.
 
 ## [Unreleased]
 
+## [0.1.53] — 2026-06-06
+
+### Added
+
+- **Human Task Inbox — `5dive task need` / `task inbox` / `task answer`**
+  (DIVE-103, the CLI data layer behind the dashboard inbox feature DIVE-102).
+  `task need <id> --type=decision|secret|approval|manual --ask="…" [--options=A|B]`
+  parks a task on a human (status `blocked`; assignee set to the gating agent
+  as owner-of-record). `task inbox` lists the still-pending gates,
+  priority-ordered. `task answer <id> [--value=…]` records the answer,
+  recomputes status (back to `todo` only if no task-blocker edges remain — the
+  human gate and `block` edges share the `blocked` status), and best-effort
+  pings the owning agent to resume via the existing agent-send path. Five
+  additive, NULL-default columns on `tasks` (`need_type`, `ask`, `need_options`,
+  `need_answer`, `need_answered_at`), surfaced in the `task ls` / `inbox` /
+  `show` `--json` shape for the app to mirror. A `secret` gate never stores its
+  value in the group-readable db (records only that it was provided; the agent
+  loads the key out-of-band), and the resume ping never embeds the answer
+  (avoids the group-chat outbound mirror leak).
+
 ## [0.1.52] — 2026-06-05
 
 ### Added

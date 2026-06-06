@@ -62,7 +62,25 @@ CREATE TABLE IF NOT EXISTS tasks (
   -- Lets dashboard + creators read what the assignee produced without
   -- scraping the tmux pane. NULL for open tasks + legacy rows closed before
   -- the column existed.
-  result      TEXT
+  result      TEXT,
+  -- Human-gate fields (Human Task Inbox, DIVE-103; parent feature DIVE-102).
+  -- A task an agent can't finish without a human (a decision, a secret, an
+  -- approval, a manual step) is parked with `5dive task need`: status=blocked
+  -- + need_type set. The inbox is the still-pending gates — see the canonical
+  -- definition just below (need_type IS NOT NULL AND need_answered_at IS NULL).
+  -- All NULL for ordinary tasks. need_options is pipe-delimited (decision
+  -- choices). need_answered_at is the single "answered" signal — set by
+  -- `task answer` for EVERY gate type, so the inbox (need_type IS NOT NULL AND
+  -- need_answered_at IS NULL) is decoupled from the overloaded `status` column
+  -- (a task can be both human-gated AND blocked-by another task). need_answer
+  -- holds the value for decision/approval/manual; for `secret` it stays NULL —
+  -- a raw key must NEVER land in this group-readable db (answer records only
+  -- that it was provided, and the agent loads the key out-of-band).
+  need_type        TEXT,
+  ask              TEXT,
+  need_options     TEXT,
+  need_answer      TEXT,
+  need_answered_at TEXT
 );
 
 CREATE TABLE IF NOT EXISTS task_deps (
@@ -152,10 +170,16 @@ _tasks_db_migrate() {
   local cols
   cols=$(sqlite3 -cmd ".timeout 5000" "$TASKS_DB" \
          "SELECT name FROM pragma_table_info('tasks');" 2>/dev/null)
-  if ! printf '%s\n' "$cols" | grep -qx 'result'; then
-    sqlite3 -cmd ".timeout 5000" "$TASKS_DB" \
-      "ALTER TABLE tasks ADD COLUMN result TEXT;" >/dev/null 2>&1 || true
-  fi
+  local c
+  # Each entry: "<column> <type>". Add new additive columns here; existing
+  # rows backfill to NULL. Pure expand (no contract), so old queries/rows are
+  # untouched and a downgrade still reads/writes the table fine.
+  for c in 'result TEXT' 'need_type TEXT' 'ask TEXT' 'need_options TEXT' 'need_answer TEXT' 'need_answered_at TEXT'; do
+    if ! printf '%s\n' "$cols" | grep -qx "${c%% *}"; then
+      sqlite3 -cmd ".timeout 5000" "$TASKS_DB" \
+        "ALTER TABLE tasks ADD COLUMN ${c};" >/dev/null 2>&1 || true
+    fi
+  done
 }
 
 # Per-connection setup, passed via -cmd / .timeout so it produces NO output
@@ -209,6 +233,7 @@ task_actor() {
 
 valid_task_status()   { [[ "$1" =~ ^(todo|in_progress|blocked|done|cancelled)$ ]]; }
 valid_task_priority() { [[ "$1" =~ ^(low|medium|high|urgent)$ ]]; }
+valid_need_type()     { [[ "$1" =~ ^(decision|secret|approval|manual)$ ]]; }
 
 # Indent every line of stdin by two spaces. Used for the nested lists in
 # `task show` / `org show`; a plain `printf '  %s\n' "$var"` only indents the
