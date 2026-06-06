@@ -9,7 +9,23 @@ release.
 
 ## [Unreleased]
 
-## [0.1.53] — 2026-06-06
+## [0.1.54] — 2026-06-06
+
+### Added
+
+- **Instant Telegram ping on `5dive task need`** (DIVE-105, the Human Task
+  Inbox notifier). The moment an agent files a human gate, the paired human
+  gets one DM — `🙋 [DIVE-N] needs you: <ask>` (with an `Options:` line for a
+  decision), leading with the dashboard CTA and a `task answer` tail for
+  power-use — so a gate doesn't sit unseen until someone opens the dashboard.
+  Fires from the single `task need` chokepoint (no cron) and reuses the
+  existing Telegram send path (`_mirror_post`). Targets the human DM allowlist
+  (`allowFrom`), falling back to the agent's bound forum topic when no DM is
+  paired, so the ask is never silently lost. Fully best-effort and self-gating
+  in the shape of `mirror_interagent_outbound`: a missing token / access.json
+  or a dead Telegram call returns 0 and never blocks or fails the gate write.
+  The daily "still waiting" digest + >48h nudge are deferred to v1.1 (they need
+  a per-box cron).
 
 ### Added
 

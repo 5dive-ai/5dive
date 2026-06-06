@@ -288,9 +288,92 @@ cmd_task_need() {
             need_options=$(sqlq_or_null "$options"),
             need_answer=NULL, need_answered_at=NULL
       WHERE id=${id};"
+  # DIVE-105: DM the paired human right now so the gate doesn't sit unseen.
+  # `|| true` + the helper's own self-gating make this fully best-effort — a
+  # failed DM must never fail the gate write that just committed above.
+  task_need_notify "DIVE-$id" "$type" "$ask" "$options" || true
   ok "DIVE-$id needs a human ($type) — $ask" \
      '{id:($i|tonumber), ident:("DIVE-"+$i), status:"blocked", need_type:$ty, ask:$ak, need_options:(($op|select(length>0)) // null), assignee:$ac}' \
      --arg i "$id" --arg ty "$type" --arg ak "$ask" --arg op "$options" --arg ac "$actor"
+}
+
+# task_need_notify — DIVE-105: the instant a human gate is filed, DM the paired
+# human ONE alert so it doesn't sit unseen until someone opens the dashboard.
+# Best-effort + self-gating in the shape of mirror_interagent_outbound, and
+# reusing its _mirror_post send path (migration self-heal included). EVERY exit
+# path returns 0: a missing token / access.json / dead Telegram call must NEVER
+# block or fail the gate write (the DB UPDATE already committed before we run).
+# The caller also invokes us as `... || true`, so set -e can't trip on anything
+# inside either.
+#
+# Works whether `task need` is run directly as agent-<name> (the common path —
+# task verbs need no sudo) OR via sudo: the agent is resolved the same way
+# task_actor does; the token comes from the group-claude-readable connector
+# file (or an inherited env var); and access.json is found by probing the
+# per-type channel dirs (own file when direct, root-readable when sudo).
+task_need_notify() {
+  local ident="$1" need_type="$2" ask="$3" options="$4"
+
+  # Resolve the filing agent: SUDO_USER when sudo'd, else $USER as agent-<x>.
+  local name="" s
+  s=$(auto_sender_from_sudo)
+  if [[ -n "$s" ]]; then
+    name="$s"
+  else
+    local u="${USER:-$(id -un 2>/dev/null)}"
+    [[ "$u" == agent-* ]] && name="${u#agent-}"
+  fi
+  [[ -n "$name" ]] || return 0
+
+  # Bot token: connector file is root:claude 640, so any agent (group claude)
+  # reads it directly; fall back to an inherited env token.
+  local token="" token_file="${CONNECTORS_DIR}/telegram-${name}.env"
+  [[ -r "$token_file" ]] && token=$(sed -n 's/^TELEGRAM_BOT_TOKEN=//p' "$token_file" | head -1)
+  [[ -z "$token" ]] && token="${TELEGRAM_BOT_TOKEN:-}"
+  [[ -n "$token" ]] || return 0
+
+  # access.json: probe the per-type channel dirs via _tg_access_state_dir (so we
+  # follow its mapping if it changes). First readable file wins.
+  local access_file="" t d
+  for t in claude codex grok antigravity; do
+    d=$(_tg_access_state_dir "agent-${name}" "$t") || continue
+    if [[ -r "${d}/access.json" ]]; then access_file="${d}/access.json"; break; fi
+  done
+  [[ -n "$access_file" ]] || return 0
+
+  # One message. Dashboard is the primary CTA (DIVE-104 live); CLI is a power
+  # tail. Options line only for a decision that actually carries choices.
+  local text="🙋 [${ident}] needs you: ${ask}"
+  if [[ "$need_type" == "decision" && -n "$options" ]]; then
+    text+=$'\n'"Options: ${options//|/ | }"
+  fi
+  text+=$'\n'"Answer in the dashboard (Needs you), or: 5dive task answer ${ident} --value=…"
+
+  # Targets: human DMs first (allowFrom — exactly the users who /started the
+  # bot, so a bot-initiated DM is permitted). If none, fall back to the agent's
+  # bound forum topic(s) so the ask isn't silently lost.
+  local dms sent=0 chat
+  dms=$(jq -r '(.allowFrom // [])[]' "$access_file" 2>/dev/null) || dms=""
+  if [[ -n "$dms" ]]; then
+    while IFS= read -r chat; do
+      [[ -n "$chat" ]] || continue
+      _mirror_post "$token" "$chat" "" "$text" "$access_file"
+      sent=1
+    done <<<"$dms"
+  fi
+  if (( ! sent )); then
+    local groups n i g_chat g_thread
+    groups=$(jq -c '(.groups // {}) | to_entries' "$access_file" 2>/dev/null) || groups="[]"
+    n=$(jq 'length' <<<"$groups" 2>/dev/null) || n=0
+    n=${n:-0}
+    for (( i=0; i<n; i++ )); do
+      g_chat=$(jq -r ".[$i].key" <<<"$groups" 2>/dev/null) || continue
+      g_thread=$(jq -r ".[$i].value.message_thread_id // \"\"" <<<"$groups" 2>/dev/null) || g_thread=""
+      [[ -n "$g_chat" ]] || continue
+      _mirror_post "$token" "$g_chat" "$g_thread" "$text" "$access_file"
+    done
+  fi
+  return 0
 }
 
 cmd_task_inbox() {
