@@ -224,4 +224,14 @@ if $is_rate_limit && [[ -n "$reset_epoch_num" && -n "${TMUX:-}" ]]; then
   fi
 fi
 
+# DIVE-72: tee a native mobile push alongside the Telegram relay. Only genuine
+# failures (rate-limit pauses auto-resume via the helper above, so they don't
+# push). Fully isolated: backgrounded, output discarded, and a no-op on boxes
+# without a connectord token — can never block or fail this hook.
+push_helper="/usr/local/lib/5dive/push-notify.sh"
+if ! $is_rate_limit && [[ -x "$push_helper" ]]; then
+  "$push_helper" error "$msg" >/dev/null 2>&1 &
+  disown 2>/dev/null || true
+fi
+
 exit 0
