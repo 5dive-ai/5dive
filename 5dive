@@ -26,7 +26,7 @@ esac
 
 # Bumped on every public release. `build.sh` checks this line exists; CI fails
 # the bundle-drift check if it's missing or empty.
-readonly FIVE_VERSION="0.1.55"
+readonly FIVE_VERSION="0.1.56"
 
 STATE_DIR="/var/lib/5dive"
 REGISTRY="${STATE_DIR}/agents.json"
@@ -9107,7 +9107,15 @@ cmd_task_assign() {
   [[ $# -ge 2 ]] || fail "$E_USAGE" "usage: 5dive task assign <id|DIVE-N> <agent>"
   resolve_task_id "$1"; local id="$RESOLVED_TASK_ID"
   local who="$2"
-  db "UPDATE tasks SET assignee=$(sqlq "$who") WHERE id=${id};"
+  # Handing a task to a NEW owner resets its in_progress clock: SQLite evaluates
+  # SET column refs against the pre-update row, so `assignee IS NOT <who>` is the
+  # OLD assignee. Without this, an inherited in_progress task keeps the prior
+  # owner's started_at, and the heartbeat stale-reaper (_hb_reap_stale) can
+  # cancel it on the new owner's very first tick before they touch it.
+  db "UPDATE tasks SET assignee=$(sqlq "$who"),
+        started_at=CASE WHEN status='in_progress' AND assignee IS NOT $(sqlq "$who")
+                        THEN datetime('now') ELSE started_at END
+      WHERE id=${id};"
   ok "DIVE-$id assigned to $who" '{id:($i|tonumber), assignee:$a}' --arg i "$id" --arg a "$who"
 }
 
