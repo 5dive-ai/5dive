@@ -26,7 +26,7 @@ esac
 
 # Bumped on every public release. `build.sh` checks this line exists; CI fails
 # the bundle-drift check if it's missing or empty.
-readonly FIVE_VERSION="0.1.54"
+readonly FIVE_VERSION="0.1.55"
 
 STATE_DIR="/var/lib/5dive"
 REGISTRY="${STATE_DIR}/agents.json"
@@ -6783,9 +6783,9 @@ mirror_interagent_outbound() {
 # and retry once against the new supergroup id, so the mirror self-heals instead
 # of silently dying. Best-effort throughout — a mirror post is never load-bearing.
 _mirror_post() {
-  local token="$1" chat="$2" thread="$3" text="$4" access_file="$5"
+  local token="$1" chat="$2" thread="$3" text="$4" access_file="$5" reply_markup="${6:-}"
   local resp
-  resp=$(_mirror_send "$token" "$chat" "$thread" "$text")
+  resp=$(_mirror_send "$token" "$chat" "$thread" "$text" "$reply_markup")
   [[ -n "$resp" ]] || return 0
   [[ "$(jq -r '.ok // false' <<<"$resp" 2>/dev/null)" == "true" ]] && return 0
 
@@ -6793,22 +6793,30 @@ _mirror_post() {
   new_chat=$(jq -r '.parameters.migrate_to_chat_id // empty' <<<"$resp" 2>/dev/null)
   if [[ -n "$new_chat" && "$new_chat" != "$chat" ]]; then
     _mirror_follow_migration "$access_file" "$chat" "$new_chat"
-    _mirror_send "$token" "$new_chat" "$thread" "$text" >/dev/null 2>&1 || true
+    _mirror_send "$token" "$new_chat" "$thread" "$text" "$reply_markup" >/dev/null 2>&1 || true
+    return 0
+  fi
+
+  # DIVE-117: the send failed for a non-migration reason. A button-bearing send
+  # can be rejected for the keyboard alone (a reply_markup Telegram dislikes)
+  # while the plain text would deliver. The text alert is load-bearing
+  # (DIVE-105), so retry once WITHOUT the keyboard — the ping must never be lost
+  # to a button problem.
+  if [[ -n "$reply_markup" ]]; then
+    _mirror_send "$token" "$chat" "$thread" "$text" "" >/dev/null 2>&1 || true
   fi
 }
 
+# Optional 5th arg reply_markup: a Telegram inline_keyboard JSON string. When
+# present it's attached so the message carries tap buttons (DIVE-117). Empty =
+# a plain text send (unchanged). Built as an arg array so thread + reply_markup
+# compose without duplicating the curl call.
 _mirror_send() {
-  local token="$1" chat="$2" thread="$3" text="$4"
-  if [[ -n "$thread" ]]; then
-    curl -s -X POST "https://api.telegram.org/bot${token}/sendMessage" \
-      --data-urlencode "chat_id=${chat}" \
-      --data-urlencode "message_thread_id=${thread}" \
-      --data-urlencode "text=${text}" 2>/dev/null
-  else
-    curl -s -X POST "https://api.telegram.org/bot${token}/sendMessage" \
-      --data-urlencode "chat_id=${chat}" \
-      --data-urlencode "text=${text}" 2>/dev/null
-  fi
+  local token="$1" chat="$2" thread="$3" text="$4" reply_markup="${5:-}"
+  local args=(--data-urlencode "chat_id=${chat}" --data-urlencode "text=${text}")
+  [[ -n "$thread" ]] && args+=(--data-urlencode "message_thread_id=${thread}")
+  [[ -n "$reply_markup" ]] && args+=(--data-urlencode "reply_markup=${reply_markup}")
+  curl -s -X POST "https://api.telegram.org/bot${token}/sendMessage" "${args[@]}" 2>/dev/null
 }
 
 # Rename a migrated group's key (old→new) in access.json, preserving the policy
@@ -9264,6 +9272,7 @@ task_need_notify() {
 
   # access.json: probe the per-type channel dirs via _tg_access_state_dir (so we
   # follow its mapping if it changes). First readable file wins.
+  # `t` (the matched type) is captured below for the button gate.
   local access_file="" t d
   for t in claude codex grok antigravity; do
     d=$(_tg_access_state_dir "agent-${name}" "$t") || continue
@@ -9279,6 +9288,33 @@ task_need_notify() {
   fi
   text+=$'\n'"Answer in the dashboard (Needs you), or: 5dive task answer ${ident} --value=…"
 
+  # DIVE-117 tap-to-answer buttons. GATED to type=claude — only the claude
+  # plugin has the `tna:` callback_query handler today, so emitting buttons for
+  # codex/grok/antigravity would give those users dead taps. Parity (DIVE-118)
+  # flips the others on when their handlers land. Only finite-option gates get
+  # buttons: decision-with-options (index into need_options) and approval
+  # (approved/denied). callback_data is `tna:<numericId>:<idx|approved|denied>`
+  # — numeric id + index keeps it under Telegram's 64-byte cap; the value is
+  # re-resolved from the DB on tap, never trusted from the payload.
+  # The option-split rule here MUST be byte-identical to the plugin's `tna:`
+  # handler (split '|', trim, drop empties) or a tapped index resolves the wrong
+  # option. Filtering empties also avoids an empty-text button (Telegram rejects
+  # it, which would 400 the whole message — see the text-fallback in
+  # _mirror_post). If nothing survives the filter, emit no keyboard (plain text).
+  local reply_markup="" numid="${ident#DIVE-}"
+  if [[ "$t" == claude ]]; then
+    if [[ "$need_type" == "decision" && -n "$options" ]]; then
+      reply_markup=$(printf '%s' "$options" | jq -Rc --arg id "$numid" '
+        [ split("|")[] | gsub("^\\s+|\\s+$"; "") | select(length > 0) ] as $o
+        | if ($o | length) > 0
+          then {inline_keyboard: [[ $o | to_entries[]
+                 | {text: .value, callback_data: ("tna:" + $id + ":" + (.key|tostring))} ]]}
+          else empty end' 2>/dev/null) || reply_markup=""
+    elif [[ "$need_type" == "approval" ]]; then
+      reply_markup='{"inline_keyboard":[[{"text":"✅ Approve","callback_data":"tna:'"${numid}"':approved"},{"text":"🚫 Deny","callback_data":"tna:'"${numid}"':denied"}]]}'
+    fi
+  fi
+
   # Targets: human DMs first (allowFrom — exactly the users who /started the
   # bot, so a bot-initiated DM is permitted). If none, fall back to the agent's
   # bound forum topic(s) so the ask isn't silently lost.
@@ -9287,7 +9323,7 @@ task_need_notify() {
   if [[ -n "$dms" ]]; then
     while IFS= read -r chat; do
       [[ -n "$chat" ]] || continue
-      _mirror_post "$token" "$chat" "" "$text" "$access_file"
+      _mirror_post "$token" "$chat" "" "$text" "$access_file" "$reply_markup"
       sent=1
     done <<<"$dms"
   fi
@@ -9300,7 +9336,7 @@ task_need_notify() {
       g_chat=$(jq -r ".[$i].key" <<<"$groups" 2>/dev/null) || continue
       g_thread=$(jq -r ".[$i].value.message_thread_id // \"\"" <<<"$groups" 2>/dev/null) || g_thread=""
       [[ -n "$g_chat" ]] || continue
-      _mirror_post "$token" "$g_chat" "$g_thread" "$text" "$access_file"
+      _mirror_post "$token" "$g_chat" "$g_thread" "$text" "$access_file" "$reply_markup"
     done
   fi
   return 0

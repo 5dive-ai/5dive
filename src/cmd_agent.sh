@@ -2422,9 +2422,9 @@ mirror_interagent_outbound() {
 # and retry once against the new supergroup id, so the mirror self-heals instead
 # of silently dying. Best-effort throughout — a mirror post is never load-bearing.
 _mirror_post() {
-  local token="$1" chat="$2" thread="$3" text="$4" access_file="$5"
+  local token="$1" chat="$2" thread="$3" text="$4" access_file="$5" reply_markup="${6:-}"
   local resp
-  resp=$(_mirror_send "$token" "$chat" "$thread" "$text")
+  resp=$(_mirror_send "$token" "$chat" "$thread" "$text" "$reply_markup")
   [[ -n "$resp" ]] || return 0
   [[ "$(jq -r '.ok // false' <<<"$resp" 2>/dev/null)" == "true" ]] && return 0
 
@@ -2432,22 +2432,30 @@ _mirror_post() {
   new_chat=$(jq -r '.parameters.migrate_to_chat_id // empty' <<<"$resp" 2>/dev/null)
   if [[ -n "$new_chat" && "$new_chat" != "$chat" ]]; then
     _mirror_follow_migration "$access_file" "$chat" "$new_chat"
-    _mirror_send "$token" "$new_chat" "$thread" "$text" >/dev/null 2>&1 || true
+    _mirror_send "$token" "$new_chat" "$thread" "$text" "$reply_markup" >/dev/null 2>&1 || true
+    return 0
+  fi
+
+  # DIVE-117: the send failed for a non-migration reason. A button-bearing send
+  # can be rejected for the keyboard alone (a reply_markup Telegram dislikes)
+  # while the plain text would deliver. The text alert is load-bearing
+  # (DIVE-105), so retry once WITHOUT the keyboard — the ping must never be lost
+  # to a button problem.
+  if [[ -n "$reply_markup" ]]; then
+    _mirror_send "$token" "$chat" "$thread" "$text" "" >/dev/null 2>&1 || true
   fi
 }
 
+# Optional 5th arg reply_markup: a Telegram inline_keyboard JSON string. When
+# present it's attached so the message carries tap buttons (DIVE-117). Empty =
+# a plain text send (unchanged). Built as an arg array so thread + reply_markup
+# compose without duplicating the curl call.
 _mirror_send() {
-  local token="$1" chat="$2" thread="$3" text="$4"
-  if [[ -n "$thread" ]]; then
-    curl -s -X POST "https://api.telegram.org/bot${token}/sendMessage" \
-      --data-urlencode "chat_id=${chat}" \
-      --data-urlencode "message_thread_id=${thread}" \
-      --data-urlencode "text=${text}" 2>/dev/null
-  else
-    curl -s -X POST "https://api.telegram.org/bot${token}/sendMessage" \
-      --data-urlencode "chat_id=${chat}" \
-      --data-urlencode "text=${text}" 2>/dev/null
-  fi
+  local token="$1" chat="$2" thread="$3" text="$4" reply_markup="${5:-}"
+  local args=(--data-urlencode "chat_id=${chat}" --data-urlencode "text=${text}")
+  [[ -n "$thread" ]] && args+=(--data-urlencode "message_thread_id=${thread}")
+  [[ -n "$reply_markup" ]] && args+=(--data-urlencode "reply_markup=${reply_markup}")
+  curl -s -X POST "https://api.telegram.org/bot${token}/sendMessage" "${args[@]}" 2>/dev/null
 }
 
 # Rename a migrated group's key (old→new) in access.json, preserving the policy

@@ -334,6 +334,7 @@ task_need_notify() {
 
   # access.json: probe the per-type channel dirs via _tg_access_state_dir (so we
   # follow its mapping if it changes). First readable file wins.
+  # `t` (the matched type) is captured below for the button gate.
   local access_file="" t d
   for t in claude codex grok antigravity; do
     d=$(_tg_access_state_dir "agent-${name}" "$t") || continue
@@ -349,6 +350,33 @@ task_need_notify() {
   fi
   text+=$'\n'"Answer in the dashboard (Needs you), or: 5dive task answer ${ident} --value=…"
 
+  # DIVE-117 tap-to-answer buttons. GATED to type=claude — only the claude
+  # plugin has the `tna:` callback_query handler today, so emitting buttons for
+  # codex/grok/antigravity would give those users dead taps. Parity (DIVE-118)
+  # flips the others on when their handlers land. Only finite-option gates get
+  # buttons: decision-with-options (index into need_options) and approval
+  # (approved/denied). callback_data is `tna:<numericId>:<idx|approved|denied>`
+  # — numeric id + index keeps it under Telegram's 64-byte cap; the value is
+  # re-resolved from the DB on tap, never trusted from the payload.
+  # The option-split rule here MUST be byte-identical to the plugin's `tna:`
+  # handler (split '|', trim, drop empties) or a tapped index resolves the wrong
+  # option. Filtering empties also avoids an empty-text button (Telegram rejects
+  # it, which would 400 the whole message — see the text-fallback in
+  # _mirror_post). If nothing survives the filter, emit no keyboard (plain text).
+  local reply_markup="" numid="${ident#DIVE-}"
+  if [[ "$t" == claude ]]; then
+    if [[ "$need_type" == "decision" && -n "$options" ]]; then
+      reply_markup=$(printf '%s' "$options" | jq -Rc --arg id "$numid" '
+        [ split("|")[] | gsub("^\\s+|\\s+$"; "") | select(length > 0) ] as $o
+        | if ($o | length) > 0
+          then {inline_keyboard: [[ $o | to_entries[]
+                 | {text: .value, callback_data: ("tna:" + $id + ":" + (.key|tostring))} ]]}
+          else empty end' 2>/dev/null) || reply_markup=""
+    elif [[ "$need_type" == "approval" ]]; then
+      reply_markup='{"inline_keyboard":[[{"text":"✅ Approve","callback_data":"tna:'"${numid}"':approved"},{"text":"🚫 Deny","callback_data":"tna:'"${numid}"':denied"}]]}'
+    fi
+  fi
+
   # Targets: human DMs first (allowFrom — exactly the users who /started the
   # bot, so a bot-initiated DM is permitted). If none, fall back to the agent's
   # bound forum topic(s) so the ask isn't silently lost.
@@ -357,7 +385,7 @@ task_need_notify() {
   if [[ -n "$dms" ]]; then
     while IFS= read -r chat; do
       [[ -n "$chat" ]] || continue
-      _mirror_post "$token" "$chat" "" "$text" "$access_file"
+      _mirror_post "$token" "$chat" "" "$text" "$access_file" "$reply_markup"
       sent=1
     done <<<"$dms"
   fi
@@ -370,7 +398,7 @@ task_need_notify() {
       g_chat=$(jq -r ".[$i].key" <<<"$groups" 2>/dev/null) || continue
       g_thread=$(jq -r ".[$i].value.message_thread_id // \"\"" <<<"$groups" 2>/dev/null) || g_thread=""
       [[ -n "$g_chat" ]] || continue
-      _mirror_post "$token" "$g_chat" "$g_thread" "$text" "$access_file"
+      _mirror_post "$token" "$g_chat" "$g_thread" "$text" "$access_file" "$reply_markup"
     done
   fi
   return 0

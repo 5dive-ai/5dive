@@ -9,6 +9,22 @@ release.
 
 ## [Unreleased]
 
+## [0.1.55] — 2026-06-06
+
+### Added
+
+- **Tap-to-answer inline buttons on the `task need` ping** (DIVE-117, Part 1).
+  The DIVE-105 Telegram alert now carries Telegram inline buttons for the
+  finite-option gates — a decision's `--options` (one button each) and an
+  approval (Approve / Deny) — so the human answers with a tap. callback_data is
+  `tna:<numericId>:<idx|approved|denied>` (numeric id + option index, under
+  Telegram's 64-byte cap; the value is re-resolved from the DB on tap, never
+  trusted from the payload). **Gated to `type=claude`** agents — only the claude
+  telegram plugin (0.4.59+) has the `tna:` callback handler today; codex / grok
+  / antigravity keep the plain text ping until their handlers land (DIVE-118).
+  Free-text / secret / manual gates are unchanged (nothing to button).
+  `_mirror_send`/`_mirror_post` gain an optional `reply_markup` arg.
+
 ## [0.1.54] — 2026-06-06
 
 ### Added
