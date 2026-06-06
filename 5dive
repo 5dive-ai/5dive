@@ -26,7 +26,7 @@ esac
 
 # Bumped on every public release. `build.sh` checks this line exists; CI fails
 # the bundle-drift check if it's missing or empty.
-readonly FIVE_VERSION="0.1.56"
+readonly FIVE_VERSION="0.1.57"
 
 STATE_DIR="/var/lib/5dive"
 REGISTRY="${STATE_DIR}/agents.json"
@@ -9359,8 +9359,10 @@ cmd_task_inbox() {
     esac
   done
   # A pending gate, decoupled from the overloaded `status` (a task can be both
-  # human-gated and blocked-by another task): need set, not yet answered.
-  local where="need_type IS NOT NULL AND need_answered_at IS NULL"
+  # human-gated and blocked-by another task): need set, not yet answered. We
+  # still exclude TERMINAL statuses (done/cancelled) — a closed task waits on
+  # no one, so a lingering unanswered gate must not leak into the human inbox.
+  local where="need_type IS NOT NULL AND need_answered_at IS NULL AND status NOT IN ('done','cancelled')"
   local order="ORDER BY CASE priority WHEN 'urgent' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2 ELSE 3 END, created_at"
   if (( JSON_MODE )); then
     local rows

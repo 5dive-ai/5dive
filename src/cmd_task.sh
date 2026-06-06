@@ -169,7 +169,15 @@ cmd_task_assign() {
   [[ $# -ge 2 ]] || fail "$E_USAGE" "usage: 5dive task assign <id|DIVE-N> <agent>"
   resolve_task_id "$1"; local id="$RESOLVED_TASK_ID"
   local who="$2"
-  db "UPDATE tasks SET assignee=$(sqlq "$who") WHERE id=${id};"
+  # Handing a task to a NEW owner resets its in_progress clock: SQLite evaluates
+  # SET column refs against the pre-update row, so `assignee IS NOT <who>` is the
+  # OLD assignee. Without this, an inherited in_progress task keeps the prior
+  # owner's started_at, and the heartbeat stale-reaper (_hb_reap_stale) can
+  # cancel it on the new owner's very first tick before they touch it.
+  db "UPDATE tasks SET assignee=$(sqlq "$who"),
+        started_at=CASE WHEN status='in_progress' AND assignee IS NOT $(sqlq "$who")
+                        THEN datetime('now') ELSE started_at END
+      WHERE id=${id};"
   ok "DIVE-$id assigned to $who" '{id:($i|tonumber), assignee:$a}' --arg i "$id" --arg a "$who"
 }
 
@@ -413,8 +421,10 @@ cmd_task_inbox() {
     esac
   done
   # A pending gate, decoupled from the overloaded `status` (a task can be both
-  # human-gated and blocked-by another task): need set, not yet answered.
-  local where="need_type IS NOT NULL AND need_answered_at IS NULL"
+  # human-gated and blocked-by another task): need set, not yet answered. We
+  # still exclude TERMINAL statuses (done/cancelled) — a closed task waits on
+  # no one, so a lingering unanswered gate must not leak into the human inbox.
+  local where="need_type IS NOT NULL AND need_answered_at IS NULL AND status NOT IN ('done','cancelled')"
   local order="ORDER BY CASE priority WHEN 'urgent' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2 ELSE 3 END, created_at"
   if (( JSON_MODE )); then
     local rows
