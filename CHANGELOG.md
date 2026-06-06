@@ -9,6 +9,28 @@ release.
 
 ## [Unreleased]
 
+## [0.1.59] — 2026-06-06
+
+### Changed
+
+- `heartbeat tick`: an agent is no longer wedged for hours by a single stuck
+  `in_progress` task. The old reaper only force-cancelled after `everyMin × 3`;
+  the tick now unwedges via three escalating rules — (a) **orphan-by-restart →
+  todo**: if the agent's live claude process started *after* the task did, the
+  session that claimed it is gone (rotation/restart/crash/context-reset), so the
+  task is reclaimed instantly; (b) **idle-stall → todo**: same process, but the
+  task has sat past a 20m grace and the agent is idle now (claimed then walked
+  away); (c) **hard cap → cancel**: the existing runaway backstop. (a)/(b)
+  reclaim (work still needs doing); only (c) cancels. New `reclaimed` counter.
+- `heartbeat tick`: **no-clobber wake gate** — never `/clear`+nudge an agent
+  that's mid-turn or in a live conversation (the busy-guard only saw an open
+  *task*, not interactive/working state). Uses a dumb, CLI-agnostic idle probe
+  (pane byte-identical across a short sample + input prompt present). New
+  `active` skipped counter.
+- `heartbeat tick`: **wake-on-enqueue** — an `urgent`/`high` task that lands
+  since the agent's last wake triggers an early wake on the next tick instead of
+  waiting out the full cadence (still gated by busy/spread/idle).
+
 ## [0.1.58] — 2026-06-06
 
 ### Changed

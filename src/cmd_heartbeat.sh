@@ -42,6 +42,24 @@ _HB_STALE_MIN_MINUTES=45
 # instead of re-nudging forever. Per-task nudge counts live in the registry under
 # .agents[<name>].heartbeat.nudges and are pruned once a task leaves todo.
 _HB_STARVE_AFTER=3
+# Orphan reclaim. An in_progress task whose claiming claude session is GONE — the
+# agent's claude process started AFTER the task did (rotation, service restart,
+# crash, a context reset that exited the process) — is reclaimed to 'todo'
+# immediately rather than waiting out the _HB_STALE_MULT hard cap: nobody is
+# working it, and the work still needs doing. _HB_PROC_SKEW_SEC absorbs the small
+# gap between a process starting and the `task start` it then runs.
+_HB_PROC_SKEW_SEC=20
+# Backstop for the same-process abandon case (agent claimed a task, then went
+# idle without closing it — its claiming process is unchanged, so the restart
+# rule above can't see it). Reclaim to 'todo' once the task has sat in_progress
+# past this grace AND the agent is idle right now.
+_HB_STALL_MIN_MINUTES=20
+# Idle probe window. An agent whose pane is byte-identical across this gap (and
+# still shows its input prompt) is at rest; a working agent streams output or
+# animates a spinner, so its pane changes between two samples. Deliberately dumb
+# and CLI-agnostic — see _hb_agent_idle. Used to (a) never /clear+nudge an agent
+# mid-turn/conversation and (b) gate idle-stall reclaim.
+_HB_IDLE_SAMPLE_SEC=3
 
 _hb_log() { printf '%s [heartbeat] %s\n' "$(date -u +%FT%TZ)" "$*" >&2; }
 
@@ -220,31 +238,103 @@ _hb_send_line() {
   sudo -u "agent-${name}" tmux send-keys -t "agent-${name}" Enter 2>/dev/null || return 1
 }
 
-# Deterministic hard cap. Force-close any of this agent's tasks that have sat
-# in_progress past its time budget: clear any runaway /goal loop, then cancel the
-# task with an auto-result so the board (and creator) see it terminated rather
-# than silently stuck. Echoes the number reaped. everyMin sets the budget so a
-# slow-cadence agent gets proportionally more rope; _HB_STALE_MIN_MINUTES floors
-# it. Uses started_at (falls back to created_at) — no schema change, no counter.
-_hb_reap_stale() {
+# Epoch when this agent's live claude process started, or empty if not found.
+# This is the inner `claude` the `while true; do claude; ...` wrapper respawns —
+# its start time is the agent's "session identity": a rotation, restart, crash,
+# or context reset that exits the process gives the replacement a newer start
+# time than any task its predecessor had already claimed. The bash wrapper and
+# tmux lines also contain the claude argv, so exclude them (they carry
+# 'while true' / 'tmux'). Non-claude agents (codex/grok/agy/opencode) won't
+# match → empty → the restart-reclaim rule simply doesn't apply to them.
+_hb_claude_started() {
+  local name="$1" pid lstart
+  pid=$(ps -u "agent-${name}" -o pid=,args= 2>/dev/null \
+        | awk '/\/claude .*--dangerously-skip-permissions/ && !/while +true/ && !/tmux/ {print $1; exit}')
+  [[ -n "$pid" ]] || return 1
+  lstart=$(ps -o lstart= -p "$pid" 2>/dev/null) || return 1
+  [[ -n "$lstart" ]] || return 1
+  date -d "$lstart" +%s 2>/dev/null || return 1
+}
+
+# Is the agent at rest right now? Sample its pane twice across a short gap: an
+# idle agent's pane is byte-identical and shows its input prompt; a working one
+# streams output / animates, so the two samples differ. Deliberately CLI-dumb
+# (no per-CLI spinner parsing). Exit: 0 = idle, 1 = working/active, 2 = unknown
+# (no pane / capture failed). Callers that must not clobber live work defer only
+# on a confident 1; reclaim-on-idle acts only on a confident 0.
+_hb_agent_idle() {
+  local name="$1" gap="${2:-$_HB_IDLE_SAMPLE_SEC}"
+  local user="agent-${name}" a b
+  a=$(sudo -u "$user" tmux capture-pane -p -t "agent-${name}" 2>/dev/null) || return 2
+  [[ -n "$a" ]] || return 2
+  sleep "$gap"
+  b=$(sudo -u "$user" tmux capture-pane -p -t "agent-${name}" 2>/dev/null) || return 2
+  [[ "$a" == "$b" ]] || return 1
+  grep -q '❯' <<<"$b" || return 1
+  return 0
+}
+
+# Flip one in_progress task back to todo. Clears started_at so its age and the
+# per-task nudge counter both restart cleanly, and stamps updated_at. Best-effort
+# (a dead db or already-moved task is harmless). Logs why.
+_hb_reclaim_to_todo() {
+  local name="$1" id="$2" why="$3"
+  db "UPDATE tasks SET status='todo', started_at=NULL, updated_at=datetime('now')
+      WHERE id=${id} AND status='in_progress';" 2>/dev/null || true
+  _hb_log "[$name] reclaimed DIVE-${id} -> todo ($why)"
+}
+
+# Unwedge this agent's stuck in_progress tasks. Three escalating rules, cheapest
+# first, so a single stalled task can't block an agent's whole queue for hours:
+#
+#   (a) orphan-by-restart  -> todo. The claude process that would be doing the
+#       work started AFTER the task did, so the session that claimed it is gone
+#       (rotation/restart/crash/context-reset). Deterministic, instant — this is
+#       the common case and needs no idle guessing.
+#   (b) idle stall         -> todo. Same process still running, but the task has
+#       sat in_progress past _HB_STALL_MIN_MINUTES AND the agent is idle now:
+#       it claimed the task then walked away. Gated on a confident idle reading
+#       so we never reclaim work that's actively in flight.
+#   (c) hard cap           -> cancel. in_progress past everyMin*_HB_STALE_MULT
+#       (floored): the deterministic runaway backstop. /goal clear then cancel
+#       with an auto-result so the board shows it terminated, not silently stuck.
+#
+# (a)/(b) reclaim (the work still needs doing); only (c) cancels. Echoes
+# "<reclaimed> <cancelled>". Uses started_at (falls back to created_at).
+_hb_reclaim() {
   local name="$1" everyMin="$2"
   local budget=$(( everyMin * _HB_STALE_MULT ))
   (( budget < _HB_STALE_MIN_MINUTES )) && budget=$_HB_STALE_MIN_MINUTES
-  local ids id reaped=0
-  ids=$(db "SELECT id FROM tasks
-            WHERE assignee=$(sqlq "$name") AND status='in_progress'
-              AND COALESCE(started_at, created_at) <= datetime('now', '-${budget} minutes');" 2>/dev/null || true)
-  for id in $ids; do
-    # Stop a runaway loop first (best-effort; harmless if the session is down or
-    # has no active goal), then flip the task to cancelled.
-    _hb_send_line "$name" "/goal clear" || true
-    db "UPDATE tasks SET status='cancelled', done_at=datetime('now'),
-          result='auto-cancelled by heartbeat: in_progress exceeded ${budget}m time budget'
-        WHERE id=${id} AND status='in_progress';" 2>/dev/null || true
-    _hb_log "[$name] reaped stale in_progress DIVE-${id} (>${budget}m)"
-    reaped=$((reaped + 1))
-  done
-  printf '%s' "$reaped"
+  local proc_start; proc_start=$(_hb_claude_started "$name" 2>/dev/null || true)
+  local reclaimed=0 cancelled=0 id started_epoch age_min
+  while IFS='|' read -r id started_epoch age_min; do
+    [[ -n "$id" ]] || continue
+    # (a) the claiming session is gone — process is newer than the claim.
+    if [[ -n "$proc_start" && -n "$started_epoch" ]] \
+       && (( proc_start > started_epoch + _HB_PROC_SKEW_SEC )); then
+      _hb_reclaim_to_todo "$name" "$id" "claiming session gone (claude restarted $(( (proc_start - started_epoch) / 60 ))m after the claim)"
+      reclaimed=$((reclaimed + 1)); continue
+    fi
+    # (c) hard cap before stall: a very old task is cancelled, not re-queued.
+    if (( age_min >= budget )); then
+      _hb_send_line "$name" "/goal clear" || true
+      db "UPDATE tasks SET status='cancelled', done_at=datetime('now'),
+            result='auto-cancelled by heartbeat: in_progress exceeded ${budget}m time budget'
+          WHERE id=${id} AND status='in_progress';" 2>/dev/null || true
+      _hb_log "[$name] reaped stale in_progress DIVE-${id} (>${budget}m)"
+      cancelled=$((cancelled + 1)); continue
+    fi
+    # (b) idle stall — only if past grace AND a confident idle reading (rc 0).
+    if (( age_min >= _HB_STALL_MIN_MINUTES )) && _hb_agent_idle "$name"; then
+      _hb_reclaim_to_todo "$name" "$id" "idle ${age_min}m with the task still open (claimed then went idle)"
+      reclaimed=$((reclaimed + 1)); continue
+    fi
+  done < <(db "SELECT id || '|' ||
+                 strftime('%s', COALESCE(started_at, created_at)) || '|' ||
+                 CAST((julianday('now') - julianday(COALESCE(started_at, created_at))) * 1440 AS INTEGER)
+               FROM tasks
+               WHERE assignee=$(sqlq "$name") AND status='in_progress';" 2>/dev/null || true)
+  printf '%s %s' "$reclaimed" "$cancelled"
 }
 
 # Wake one agent: ensure it's running, optionally clear context, send the nudge.
@@ -285,7 +375,7 @@ cmd_heartbeat_tick() {
   require_root "heartbeat tick"
   tasks_db_init
   local reg now; reg=$(registry_read); now=$(date +%s)
-  local checked=0 woke=0 reaped=0 starved=0 sk_notdue=0 sk_busy=0 sk_nowork=0 sk_fail=0 sk_spread=0
+  local checked=0 woke=0 reaped=0 reclaimed=0 starved=0 sk_notdue=0 sk_busy=0 sk_nowork=0 sk_fail=0 sk_spread=0 sk_active=0
   # Accounts already woken during THIS tick. The $reg snapshot is read once up
   # front, so a wake we do mid-loop isn't visible to later iterations via the
   # registry — this map carries that within-tick fact so two same-account agents
@@ -303,14 +393,28 @@ cmd_heartbeat_tick() {
     lastRun=$(jq -r --arg n "$name"  '.agents[$n].heartbeat.lastRunAt // 0' <<<"$reg")
     fresh=$(jq -r --arg n "$name"    '.agents[$n].heartbeat.fresh // true' <<<"$reg")
 
-    # Hard cap first, every tick (NOT gated by everyMin): a stuck or runaway
-    # in_progress task must be reaped promptly regardless of the wake throttle.
-    local n_reaped
-    n_reaped=$(_hb_reap_stale "$name" "$everyMin")
-    reaped=$((reaped + n_reaped))
+    # Unwedge stuck in_progress first, every tick (NOT gated by everyMin): an
+    # orphaned/stalled/runaway task must clear promptly regardless of the wake
+    # throttle, or it blocks the agent's whole queue (the busy-guard below).
+    local n_reclaimed n_cancelled
+    read -r n_reclaimed n_cancelled < <(_hb_reclaim "$name" "$everyMin")
+    reclaimed=$((reclaimed + ${n_reclaimed:-0})); reaped=$((reaped + ${n_cancelled:-0}))
 
     if (( now - lastRun < everyMin * 60 )); then
-      sk_notdue=$((sk_notdue + 1)); _hb_log "[$name] not due ($(( (lastRun + everyMin*60 - now + 59) / 60 ))m left)"; continue
+      # Wake-on-enqueue: don't make an urgent/high task wait out the full cadence.
+      # If one landed in this agent's queue since its last wake, allow an early
+      # wake this tick (still gated by busy/spread/idle below). created_at is UTC
+      # text; strftime('%s') makes it an epoch comparable to lastRun.
+      local hot
+      hot=$(db "SELECT COUNT(*) FROM tasks
+                WHERE assignee=$(sqlq "$name") AND status='todo'
+                  AND priority IN ('urgent','high')
+                  AND CAST(strftime('%s', created_at) AS INTEGER) > ${lastRun};" 2>/dev/null || echo 0)
+      if [[ "${hot:-0}" != "0" ]]; then
+        _hb_log "[$name] early wake — ${hot} urgent/high task(s) queued since last wake"
+      else
+        sk_notdue=$((sk_notdue + 1)); _hb_log "[$name] not due ($(( (lastRun + everyMin*60 - now + 59) / 60 ))m left)"; continue
+      fi
     fi
     local inprog
     inprog=$(db "SELECT COUNT(*) FROM tasks WHERE assignee=$(sqlq "$name") AND status='in_progress';" 2>/dev/null || echo 0)
@@ -364,6 +468,17 @@ cmd_heartbeat_tick() {
       fi
     fi
 
+    # No-clobber: never /clear + nudge an agent that's mid-turn or in a live
+    # conversation (e.g. the orchestrator talking to a human). The busy-guard
+    # above only catches an open *task*; this catches working/interactive state
+    # with no task — a fresh nudge would /clear it out from under the work.
+    # Defer only on a confident "active" (rc 1); unknown (rc 2 — no pane) falls
+    # through so the wake can still (re)start a stopped session.
+    local idle_rc=0; _hb_agent_idle "$name" || idle_rc=$?
+    if (( idle_rc == 1 )); then
+      sk_active=$((sk_active + 1)); _hb_log "[$name] active (mid-turn/conversation) — defer nudge this tick"; continue
+    fi
+
     _hb_log "[$name] due + todo DIVE-${task_id} — waking (fresh=${fresh})"
     if _hb_wake "$name" "$fresh" "$task_id"; then
       in_tick_woke[$acct]=$now   # claim the account's slot for the rest of this tick
@@ -385,8 +500,8 @@ cmd_heartbeat_tick() {
                   | sort_by(.value.heartbeat.lastRunAt // 0)
                   | .[].key' <<<"$reg")
 
-  ok "heartbeat tick: woke ${woke} / reaped ${reaped} / starved ${starved} / spread-deferred ${sk_spread} / checked ${checked}" \
-     '{checked:($c|tonumber), woke:($w|tonumber), reaped:($r|tonumber), starved:($st|tonumber),
-       skipped:{notDue:($nd|tonumber), busy:($b|tonumber), noWork:($nw|tonumber), spread:($sp|tonumber), failed:($sf|tonumber)}}' \
-     --arg c "$checked" --arg w "$woke" --arg r "$reaped" --arg st "$starved" --arg nd "$sk_notdue" --arg b "$sk_busy" --arg nw "$sk_nowork" --arg sp "$sk_spread" --arg sf "$sk_fail"
+  ok "heartbeat tick: woke ${woke} / reclaimed ${reclaimed} / reaped ${reaped} / starved ${starved} / spread-deferred ${sk_spread} / active-deferred ${sk_active} / checked ${checked}" \
+     '{checked:($c|tonumber), woke:($w|tonumber), reclaimed:($rc|tonumber), reaped:($r|tonumber), starved:($st|tonumber),
+       skipped:{notDue:($nd|tonumber), busy:($b|tonumber), noWork:($nw|tonumber), spread:($sp|tonumber), active:($ac|tonumber), failed:($sf|tonumber)}}' \
+     --arg c "$checked" --arg w "$woke" --arg rc "$reclaimed" --arg r "$reaped" --arg st "$starved" --arg nd "$sk_notdue" --arg b "$sk_busy" --arg nw "$sk_nowork" --arg sp "$sk_spread" --arg ac "$sk_active" --arg sf "$sk_fail"
 }
