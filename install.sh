@@ -253,11 +253,19 @@ refresh_managed_files() {
   # allowedChannelPlugins entry to actually take effect. Without it,
   # the allowlist is silently inert and inbound channel messages
   # don't reach the session.
+  # requiredMinimumVersion (DIVE-133): a known-good CC floor. CC 2.1.163+ refuses
+  # to start below it; older CC ignores the key, so it can never brick a box.
+  # Pure downgrade guardrail (botched rollback / accidental pin-back) — every box
+  # runs latest >= floor. NO requiredMaximumVersion: our installer chases latest
+  # (apps.sh + nightly soft-updates.sh), so a ceiling would brick boxes once
+  # upstream passes it, not hold them at a version. Release-safety from a bad
+  # upstream CC belongs in installer-pinning, not a managed-settings ceiling.
   install -d -m 755 /etc/claude-code
   if [[ ! -f /etc/claude-code/managed-settings.json ]]; then
     cat > /etc/claude-code/managed-settings.json <<'MANAGED'
 {
   "channelsEnabled": true,
+  "requiredMinimumVersion": "2.1.163",
   "allowedChannelPlugins": [
     {"plugin": "telegram", "marketplace": "5dive-plugins"},
     {"plugin": "telegram", "marketplace": "claude-plugins-official"},
