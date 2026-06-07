@@ -2455,7 +2455,11 @@ _mirror_send() {
   local args=(--data-urlencode "chat_id=${chat}" --data-urlencode "text=${text}")
   [[ -n "$thread" ]] && args+=(--data-urlencode "message_thread_id=${thread}")
   [[ -n "$reply_markup" ]] && args+=(--data-urlencode "reply_markup=${reply_markup}")
-  curl -s -X POST "https://api.telegram.org/bot${token}/sendMessage" "${args[@]}" 2>/dev/null
+  # Bounded so a hung/slow Telegram API can't wedge the FOREGROUND callers
+  # (task_need_notify runs this after the gate UPDATE has already committed;
+  # mirror_interagent_outbound likewise). --connect-timeout caps the TCP/TLS
+  # handshake, --max-time the whole request (DIVE-115).
+  curl -s --connect-timeout 5 --max-time 10 -X POST "https://api.telegram.org/bot${token}/sendMessage" "${args[@]}" 2>/dev/null
 }
 
 # Rename a migrated group's key (old→new) in access.json, preserving the policy

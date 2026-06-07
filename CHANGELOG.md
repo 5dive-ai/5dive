@@ -9,6 +9,25 @@ release.
 
 ## [Unreleased]
 
+## [0.1.64] — 2026-06-07
+
+### Changed
+
+- `rotation set` now stamps `.rotation.lastSet` (`{by, at, fromEnabled,
+  toEnabled}`) onto the registry, and `rotation get` surfaces it in both
+  `--json` (a `lastSet` field) and human output (`last set: <to> (was <from>)
+  by <who> at <ts>`). Writer precedence matches the audit log
+  (`FIVEDIVE_AUDIT_USER` → `SUDO_USER` → `USER`). A concurrent-toggle war is now
+  diagnosable from live state, not just the audit log. Legacy registries with no
+  `lastSet` read back as empty, no error. (DIVE-126)
+
+### Fixed
+
+- `_mirror_send` Telegram posts are now time-bounded (`--connect-timeout 5
+  --max-time 10`) so a hung or slow Telegram API can't wedge the foreground
+  callers that run it after a DB write has already committed (`task need`
+  notify, inter-agent outbound mirror). (DIVE-115)
+
 ## [0.1.63] — 2026-06-07
 
 ### Changed

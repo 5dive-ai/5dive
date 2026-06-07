@@ -508,7 +508,8 @@ cmd_agent_rotation_get() {
       enabled:($r.enabled // false),
       allAccounts:($r.allAccounts // false),
       accounts:($r.accounts // []),
-      cooldowns:($r.cooldowns // {})
+      cooldowns:($r.cooldowns // {}),
+      lastSet:($r.lastSet // null)
     }}'
   else
     local now; now=$(date +%s)
@@ -525,6 +526,9 @@ cmd_agent_rotation_get() {
     # only surface still-active cooldowns; expired ones are noise.
     jq -r --argjson now "$now" '(.cooldowns // {}) | to_entries[]
       | select(.value > $now) | "  cooling: \(.key) until \(.value)"' <<<"$rot" 2>/dev/null || true
+    # Last toggle provenance (DIVE-126) — helps diagnose a concurrent-toggle war.
+    jq -r '(.lastSet // empty)
+      | "last set: \(.toEnabled) (was \(.fromEnabled)) by \(.by) at \(.at)"' <<<"$rot" 2>/dev/null || true
   fi
 }
 
@@ -547,6 +551,14 @@ cmd_agent_rotation_set() {
   local reg type
   reg=$(rotation_require_agent "$name")
   type=$(jq -r --arg n "$name" '.agents[$n].type' <<<"$reg")
+  # DIVE-126: capture the prior enabled-state + the writer BEFORE applying, so a
+  # concurrent-toggle war (two agents/dashboards flipping enabled, last-write-
+  # wins under the registry lock) is self-diagnosing — `rotation get` then shows
+  # who last set it and the transition. Writer precedence mirrors audit_log.
+  local rot_prior_enabled rot_writer rot_set_ts
+  rot_prior_enabled=$(jq -c --arg n "$name" '.agents[$n].rotation.enabled // false' <<<"$reg")
+  rot_writer="${FIVEDIVE_AUDIT_USER:-${SUDO_USER:-${USER:-unknown}}}"
+  rot_set_ts=$(date -Iseconds)
   if [[ -n "$set_enabled" ]]; then
     case "$set_enabled" in true|false) ;; *) fail "$E_VALIDATION" "--enabled must be true or false" ;; esac
   fi
@@ -598,6 +610,16 @@ cmd_agent_rotation_set() {
             reduce $acc[] as $k ({}; if $c[$k] != null then .[$k] = $c[$k] else . end)' <<<"$reg")
     fi
   fi
+  # Stamp the last-writer + enabled transition onto the rotation object so the
+  # next reader can see who toggled it and from what (DIVE-126). toEnabled is
+  # read from the just-applied state above.
+  reg=$(jq --arg n "$name" --arg by "$rot_writer" --arg at "$rot_set_ts" \
+    --argjson from "$rot_prior_enabled" \
+    '.agents[$n].rotation.lastSet = {
+       by: $by, at: $at,
+       fromEnabled: $from,
+       toEnabled: (.agents[$n].rotation.enabled // false)
+     }' <<<"$reg")
   echo "$reg" | registry_write
   local out_enabled out_accounts out_all
   out_enabled=$(jq -c --arg n "$name" '.agents[$n].rotation.enabled' <<<"$reg")
