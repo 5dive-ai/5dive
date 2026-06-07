@@ -9,6 +9,17 @@ release.
 
 ## [Unreleased]
 
+## [0.1.63] — 2026-06-07
+
+### Changed
+
+- "Needs you" Telegram message drops the footer entirely (was the
+  `5dive task answer <id> --value=…` CLI hint, then a dashboard pointer). Both
+  were noise in a message the *user* receives: tap buttons cover
+  decision/approval, and button-less gates (secret/manual) still surface on the
+  dashboard "Needs you" card. The message is now just the header, the ask, and
+  (for decisions) the numbered options + buttons.
+
 ## [0.1.62] — 2026-06-07
 
 ### Fixed
