@@ -90,7 +90,16 @@ CREATE TABLE IF NOT EXISTS tasks (
   -- schedule + last_fired_at NULL.
   kind             TEXT NOT NULL DEFAULT 'standard',
   schedule         TEXT,
-  last_fired_at    TEXT
+  last_fired_at    TEXT,
+  -- DIVE-138 step 2. A materialized instance links back to the recurring
+  -- template it was cloned from via from_template_id (NULL for templates and
+  -- ordinary tasks); the materializer's skip-if-open dedup keys on it. NOT a FK
+  -- with cascade — deleting a template must not nuke its already-materialized
+  -- instances' history. `fresh` (1/0/NULL) is the per-template clean-session
+  -- pref copied onto each instance: when 1 the heartbeat sends /clear before
+  -- working it regardless of the agent-level fresh setting.
+  from_template_id INTEGER,
+  fresh            INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS task_deps (
@@ -185,7 +194,8 @@ _tasks_db_migrate() {
   # rows backfill to NULL. Pure expand (no contract), so old queries/rows are
   # untouched and a downgrade still reads/writes the table fine.
   for c in 'result TEXT' 'need_type TEXT' 'ask TEXT' 'need_options TEXT' 'need_answer TEXT' 'need_answered_at TEXT' \
-           "kind TEXT NOT NULL DEFAULT 'standard'" 'schedule TEXT' 'last_fired_at TEXT'; do
+           "kind TEXT NOT NULL DEFAULT 'standard'" 'schedule TEXT' 'last_fired_at TEXT' \
+           'from_template_id INTEGER' 'fresh INTEGER'; do
     if ! printf '%s\n' "$cols" | grep -qx "${c%% *}"; then
       sqlite3 -cmd ".timeout 5000" "$TASKS_DB" \
         "ALTER TABLE tasks ADD COLUMN ${c};" >/dev/null 2>&1 || true
@@ -260,6 +270,73 @@ valid_cron_expr() {
   for f in "${_cf[@]}"; do
     [[ "$f" =~ ^[0-9*,/-]+$ ]] || return 1
   done
+  return 0
+}
+
+# Does a single cron field match an integer value? Supports the cron grammar the
+# DIVE-138 materializer needs: '*', int, list a,b,c, range a-b, step */n and
+# a-b/n. <value> is a date component (already an int). Returns 0 on match. Uses
+# `read -ra` (not `for x in $field`) to split on commas WITHOUT triggering
+# pathname expansion on the '*' wildcard. All numbers forced base-10 (10#) so a
+# zero-padded date component like "08"/"09" isn't read as bad octal.
+_cron_field_match() {
+  local field="$1" val="$2" part lo hi step
+  val=$((10#$val))
+  local -a parts; IFS=',' read -ra parts <<<"$field"
+  for part in "${parts[@]}"; do
+    step=1
+    if [[ "$part" == */* ]]; then
+      step="${part##*/}"; part="${part%%/*}"
+      [[ "$step" =~ ^[0-9]+$ ]] && (( step > 0 )) || continue
+    fi
+    if [[ "$part" == "*" ]]; then
+      (( step == 1 )) && return 0          # bare '*' — everything matches
+      (( val % step == 0 )) && return 0    # '*/n' — every nth from 0
+      continue
+    fi
+    if [[ "$part" == *-* ]]; then
+      [[ "${part%%-*}" =~ ^[0-9]+$ && "${part##*-}" =~ ^[0-9]+$ ]] || continue
+      lo=$((10#${part%%-*})); hi=$((10#${part##*-}))
+    elif [[ "$part" =~ ^[0-9]+$ ]]; then
+      lo=$((10#$part)); hi=$lo
+    else
+      continue
+    fi
+    (( val < lo || val > hi )) && continue
+    (( (val - lo) % step == 0 )) && return 0
+  done
+  return 1
+}
+
+# Day-of-week match with Sunday=0=7 (cron allows both). %w gives 0-6 (0=Sun).
+_cron_dow_match() {
+  local field="$1" v="$2"
+  _cron_field_match "$field" "$v" && return 0
+  (( v == 0 )) && _cron_field_match "$field" 7 && return 0
+  return 1
+}
+
+# Does 5-field cron <expr> fire at <epoch> (unix seconds)? Implements standard
+# cron semantics incl. the dom/dow OR-rule: when BOTH day-of-month and
+# day-of-week are restricted (neither is '*'), the row fires if EITHER matches;
+# otherwise every field ANDs. Backs the DIVE-138 heartbeat materializer.
+# Returns 0 if due at that minute, 1 otherwise.
+_cron_matches() {
+  local expr="$1" epoch="$2"
+  local -a cm; read -r -a cm <<<"$expr"
+  [[ ${#cm[@]} -eq 5 ]] || return 1
+  local emin ehour edom emon edow
+  read -r emin ehour edom emon edow < <(date -u -d "@${epoch}" +'%M %H %d %m %w' 2>/dev/null)
+  [[ -n "$edow" ]] || return 1
+  _cron_field_match "${cm[0]}" "$emin"  || return 1
+  _cron_field_match "${cm[1]}" "$ehour" || return 1
+  _cron_field_match "${cm[3]}" "$emon"  || return 1
+  if [[ "${cm[2]}" != "*" && "${cm[4]}" != "*" ]]; then
+    _cron_field_match "${cm[2]}" "$edom" || _cron_dow_match "${cm[4]}" "$edow" || return 1
+  else
+    _cron_field_match "${cm[2]}" "$edom" || return 1
+    _cron_dow_match  "${cm[4]}" "$edow" || return 1
+  fi
   return 0
 }
 

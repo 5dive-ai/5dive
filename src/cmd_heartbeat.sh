@@ -371,11 +371,61 @@ _hb_wake() {
   return 0
 }
 
+# DIVE-138 step 2: materialize due recurring TEMPLATES into standard todos. Runs
+# as its own pass at the TOP of the tick (before the wake loop) so a freshly
+# cloned todo is eligible to be picked up in the SAME tick. The caller isolates
+# it (|| log) so a materializer failure can NEVER abort the wake loop — the
+# heartbeat-never-woke bug class.
+#
+# For each kind='recurring' template: fire when its cron matches `now` AND it
+# hasn't already fired THIS minute (last_fired_at guard — stops a double-fire if
+# two ticks land in the same matching minute). DEDUP (skip-if-open): don't
+# materialize if an unfinished instance from this template already exists, so
+# dailies don't pile up when the assignee is behind. On fire: clone
+# title/body/priority/assignee/created_by/fresh into a kind='standard' todo
+# stamped with from_template_id, then stamp the template's last_fired_at.
+#
+# V1 LIMITATION: no catch-up for ticks the host missed — if the box was down over
+# a scheduled minute, that occurrence is skipped, not backfilled. Acceptable for
+# coarse (daily/hourly) recurring jobs; minute granularity finer than the tick
+# interval can also be missed. Both documented in the CHANGELOG.
+_hb_materialize_recurring() {
+  local now="$1" minute_start tid sched last_fired open n_made=0
+  minute_start=$(date -u -d "@${now}" +'%Y-%m-%d %H:%M:00')
+  while IFS=$'\t' read -r tid sched last_fired; do
+    [[ -n "$tid" ]] || continue
+    _cron_matches "$sched" "$now" || continue
+    # Already fired this minute? (string compare on ISO 'YYYY-MM-DD HH:MM:SS';
+    # last_fired >= minute_start means a tick already materialized it this minute.)
+    if [[ -n "$last_fired" ]] && ! [[ "$last_fired" < "$minute_start" ]]; then
+      continue
+    fi
+    open=$(db "SELECT COUNT(*) FROM tasks WHERE from_template_id=${tid} AND status NOT IN ('done','cancelled');" 2>/dev/null || echo 1)
+    if [[ "${open:-1}" != "0" ]]; then
+      _hb_log "[materializer] DIVE-${tid} due but an open instance exists — skip"
+      continue
+    fi
+    if db "INSERT INTO tasks (title, body, priority, assignee, created_by, kind, from_template_id, fresh)
+           SELECT title, body, priority, assignee, created_by, 'standard', id, fresh FROM tasks WHERE id=${tid};
+           UPDATE tasks SET last_fired_at=datetime('now') WHERE id=${tid};" >/dev/null 2>&1; then
+      n_made=$((n_made + 1)); _hb_log "[materializer] DIVE-${tid} fired -> new standard todo"
+    else
+      _hb_log "[materializer] DIVE-${tid} insert failed"
+    fi
+  done < <(db "SELECT id, schedule, COALESCE(last_fired_at,'') FROM tasks WHERE kind='recurring' AND schedule IS NOT NULL;" 2>/dev/null | tr '|' '\t')
+  _hb_log "[materializer] pass done — ${n_made} materialized"
+  return 0
+}
+
 cmd_heartbeat_tick() {
   require_root "heartbeat tick"
   tasks_db_init
   local reg now; reg=$(registry_read); now=$(date +%s)
   local checked=0 woke=0 reaped=0 reclaimed=0 starved=0 sk_notdue=0 sk_busy=0 sk_nowork=0 sk_fail=0 sk_spread=0 sk_active=0
+  # DIVE-138: materialize due recurring templates FIRST so a freshly-cloned todo
+  # is eligible for the wake loop below this same tick. Isolated — a failure here
+  # must never abort the wake loop.
+  _hb_materialize_recurring "$now" || _hb_log "[materializer] pass errored (non-fatal)"
   # Accounts already woken during THIS tick. The $reg snapshot is read once up
   # front, so a wake we do mid-loop isn't visible to later iterations via the
   # registry — this map carries that within-tick fact so two same-account agents
@@ -479,8 +529,14 @@ cmd_heartbeat_tick() {
       sk_active=$((sk_active + 1)); _hb_log "[$name] active (mid-turn/conversation) — defer nudge this tick"; continue
     fi
 
-    _hb_log "[$name] due + todo DIVE-${task_id} — waking (fresh=${fresh})"
-    if _hb_wake "$name" "$fresh" "$task_id"; then
+    # Per-task fresh override (DIVE-138): a materialized recurring instance can
+    # carry fresh=1 to force a clean /clear before its turn, regardless of the
+    # agent-level heartbeat fresh setting. NULL/0 falls back to the agent default.
+    local eff_fresh="$fresh" task_fresh
+    task_fresh=$(db "SELECT COALESCE(fresh,'') FROM tasks WHERE id=${task_id};" 2>/dev/null || echo "")
+    [[ "$task_fresh" == "1" ]] && eff_fresh="true"
+    _hb_log "[$name] due + todo DIVE-${task_id} — waking (fresh=${eff_fresh})"
+    if _hb_wake "$name" "$eff_fresh" "$task_id"; then
       in_tick_woke[$acct]=$now   # claim the account's slot for the rest of this tick
       local nudge_n
       nudge_n=$(with_registry_lock _hb_mark_run "$name" "$now" "$task_id")

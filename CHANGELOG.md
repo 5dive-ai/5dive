@@ -9,6 +9,27 @@ release.
 
 ## [Unreleased]
 
+## [0.1.66] — 2026-06-07
+
+### Added
+
+- Recurring tasks step 2 (DIVE-138): the heartbeat tick now **materializes** due
+  recurring templates into standard todos. A new `_cron_matches` evaluator
+  (supports `*`, ints, lists, ranges, `*/n`, `a-b/n`, the day-of-month/day-of-week
+  OR-rule, and Sunday as both 0 and 7) runs a materializer pass at the top of the
+  tick — before the wake loop, and failure-isolated so it can never abort the
+  wake — that clones each due template into a `kind='standard'` todo (copying
+  title/body/priority/assignee/created_by). New columns `from_template_id`
+  (instance → template link, used for the **skip-if-open** dedup so dailies don't
+  pile up) and `fresh` (per-template clean-session pref, default on for recurring
+  templates via `task add --recurring`, with `--fresh`/`--no-fresh` to override).
+  The materialized instance carries `fresh` and the heartbeat `/clear`s before
+  working it regardless of the agent-level fresh setting. A `last_fired_at` guard
+  prevents a double-fire when two ticks land in the same matching minute.
+  - **v1 limitation:** no catch-up for missed ticks — if the host is down over a
+    scheduled minute (or the schedule is finer than the ~5m tick interval), that
+    occurrence is skipped, not backfilled. Fine for coarse (daily/hourly) jobs.
+
 ## [0.1.65] — 2026-06-07
 
 ### Fixed

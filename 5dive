@@ -26,7 +26,7 @@ esac
 
 # Bumped on every public release. `build.sh` checks this line exists; CI fails
 # the bundle-drift check if it's missing or empty.
-readonly FIVE_VERSION="0.1.65"
+readonly FIVE_VERSION="0.1.66"
 
 STATE_DIR="/var/lib/5dive"
 REGISTRY="${STATE_DIR}/agents.json"
@@ -2038,7 +2038,16 @@ CREATE TABLE IF NOT EXISTS tasks (
   -- schedule + last_fired_at NULL.
   kind             TEXT NOT NULL DEFAULT 'standard',
   schedule         TEXT,
-  last_fired_at    TEXT
+  last_fired_at    TEXT,
+  -- DIVE-138 step 2. A materialized instance links back to the recurring
+  -- template it was cloned from via from_template_id (NULL for templates and
+  -- ordinary tasks); the materializer's skip-if-open dedup keys on it. NOT a FK
+  -- with cascade — deleting a template must not nuke its already-materialized
+  -- instances' history. `fresh` (1/0/NULL) is the per-template clean-session
+  -- pref copied onto each instance: when 1 the heartbeat sends /clear before
+  -- working it regardless of the agent-level fresh setting.
+  from_template_id INTEGER,
+  fresh            INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS task_deps (
@@ -2133,7 +2142,8 @@ _tasks_db_migrate() {
   # rows backfill to NULL. Pure expand (no contract), so old queries/rows are
   # untouched and a downgrade still reads/writes the table fine.
   for c in 'result TEXT' 'need_type TEXT' 'ask TEXT' 'need_options TEXT' 'need_answer TEXT' 'need_answered_at TEXT' \
-           "kind TEXT NOT NULL DEFAULT 'standard'" 'schedule TEXT' 'last_fired_at TEXT'; do
+           "kind TEXT NOT NULL DEFAULT 'standard'" 'schedule TEXT' 'last_fired_at TEXT' \
+           'from_template_id INTEGER' 'fresh INTEGER'; do
     if ! printf '%s\n' "$cols" | grep -qx "${c%% *}"; then
       sqlite3 -cmd ".timeout 5000" "$TASKS_DB" \
         "ALTER TABLE tasks ADD COLUMN ${c};" >/dev/null 2>&1 || true
@@ -2208,6 +2218,73 @@ valid_cron_expr() {
   for f in "${_cf[@]}"; do
     [[ "$f" =~ ^[0-9*,/-]+$ ]] || return 1
   done
+  return 0
+}
+
+# Does a single cron field match an integer value? Supports the cron grammar the
+# DIVE-138 materializer needs: '*', int, list a,b,c, range a-b, step */n and
+# a-b/n. <value> is a date component (already an int). Returns 0 on match. Uses
+# `read -ra` (not `for x in $field`) to split on commas WITHOUT triggering
+# pathname expansion on the '*' wildcard. All numbers forced base-10 (10#) so a
+# zero-padded date component like "08"/"09" isn't read as bad octal.
+_cron_field_match() {
+  local field="$1" val="$2" part lo hi step
+  val=$((10#$val))
+  local -a parts; IFS=',' read -ra parts <<<"$field"
+  for part in "${parts[@]}"; do
+    step=1
+    if [[ "$part" == */* ]]; then
+      step="${part##*/}"; part="${part%%/*}"
+      [[ "$step" =~ ^[0-9]+$ ]] && (( step > 0 )) || continue
+    fi
+    if [[ "$part" == "*" ]]; then
+      (( step == 1 )) && return 0          # bare '*' — everything matches
+      (( val % step == 0 )) && return 0    # '*/n' — every nth from 0
+      continue
+    fi
+    if [[ "$part" == *-* ]]; then
+      [[ "${part%%-*}" =~ ^[0-9]+$ && "${part##*-}" =~ ^[0-9]+$ ]] || continue
+      lo=$((10#${part%%-*})); hi=$((10#${part##*-}))
+    elif [[ "$part" =~ ^[0-9]+$ ]]; then
+      lo=$((10#$part)); hi=$lo
+    else
+      continue
+    fi
+    (( val < lo || val > hi )) && continue
+    (( (val - lo) % step == 0 )) && return 0
+  done
+  return 1
+}
+
+# Day-of-week match with Sunday=0=7 (cron allows both). %w gives 0-6 (0=Sun).
+_cron_dow_match() {
+  local field="$1" v="$2"
+  _cron_field_match "$field" "$v" && return 0
+  (( v == 0 )) && _cron_field_match "$field" 7 && return 0
+  return 1
+}
+
+# Does 5-field cron <expr> fire at <epoch> (unix seconds)? Implements standard
+# cron semantics incl. the dom/dow OR-rule: when BOTH day-of-month and
+# day-of-week are restricted (neither is '*'), the row fires if EITHER matches;
+# otherwise every field ANDs. Backs the DIVE-138 heartbeat materializer.
+# Returns 0 if due at that minute, 1 otherwise.
+_cron_matches() {
+  local expr="$1" epoch="$2"
+  local -a cm; read -r -a cm <<<"$expr"
+  [[ ${#cm[@]} -eq 5 ]] || return 1
+  local emin ehour edom emon edow
+  read -r emin ehour edom emon edow < <(date -u -d "@${epoch}" +'%M %H %d %m %w' 2>/dev/null)
+  [[ -n "$edow" ]] || return 1
+  _cron_field_match "${cm[0]}" "$emin"  || return 1
+  _cron_field_match "${cm[1]}" "$ehour" || return 1
+  _cron_field_match "${cm[3]}" "$emon"  || return 1
+  if [[ "${cm[2]}" != "*" && "${cm[4]}" != "*" ]]; then
+    _cron_field_match "${cm[2]}" "$edom" || _cron_dow_match "${cm[4]}" "$edow" || return 1
+  else
+    _cron_field_match "${cm[2]}" "$edom" || return 1
+    _cron_dow_match  "${cm[4]}" "$edow" || return 1
+  fi
   return 0
 }
 
@@ -9088,7 +9165,7 @@ cmd_task_init() {
 
 cmd_task_add() {
   tasks_db_init
-  local body="" priority="medium" assignee="" parent="" from="" recurring=""
+  local body="" priority="medium" assignee="" parent="" from="" recurring="" fresh=""
   local -a words=()
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -9099,6 +9176,8 @@ cmd_task_add() {
       --from=*)      from="${1#*=}" ;;
       --recurring=*) recurring="${1#*=}" ;;
       --schedule=*)  recurring="${1#*=}" ;;
+      --fresh)       fresh="1" ;;
+      --no-fresh)    fresh="0" ;;
       --)            shift; words+=("$@"); break ;;
       -*)            fail "$E_USAGE" "unknown flag: $1" ;;
       *)             words+=("$1") ;;
@@ -9122,17 +9201,25 @@ cmd_task_add() {
   if [[ -n "$parent" ]]; then
     resolve_task_id "$parent"; parent_sql="$RESOLVED_TASK_ID"
   fi
+  # fresh: per-task clean-session pref (DIVE-138). Recurring templates default to
+  # fresh=1 (clean each run — Mark's decision for the community/marketing jobs)
+  # and carry it onto every materialized instance; an explicit --fresh/--no-fresh
+  # overrides. Standard tasks leave it NULL (fall back to the agent-level
+  # heartbeat fresh setting at wake).
+  local fresh_sql="NULL"
+  if [[ -n "$fresh" ]]; then fresh_sql="$fresh"
+  elif [[ "$kind" == "recurring" ]]; then fresh_sql="1"; fi
   local creator; creator=$(task_actor "$from")
   local id
-  id=$(db "INSERT INTO tasks (title, body, priority, assignee, created_by, parent_id, kind, schedule)
+  id=$(db "INSERT INTO tasks (title, body, priority, assignee, created_by, parent_id, kind, schedule, fresh)
            VALUES ($(sqlq "$title"), $(sqlq_or_null "$body"), $(sqlq "$priority"),
                    $(sqlq_or_null "$assignee"), $(sqlq "$creator"), ${parent_sql},
-                   $(sqlq "$kind"), ${schedule_sql});
+                   $(sqlq "$kind"), ${schedule_sql}, ${fresh_sql});
            SELECT last_insert_rowid();")
   if [[ "$kind" == "recurring" ]]; then
-    ok "created recurring DIVE-$id (${recurring}) — $title" \
-       '{id:($i|tonumber), ident:("DIVE-"+$i), title:$t, priority:$p, assignee:$a, created_by:$c, kind:"recurring", schedule:$s}' \
-       --arg i "$id" --arg t "$title" --arg p "$priority" --arg a "${assignee:-}" --arg c "$creator" --arg s "$recurring"
+    ok "created recurring DIVE-$id (${recurring}, fresh=$([[ "$fresh_sql" == "1" ]] && echo on || echo off)) — $title" \
+       '{id:($i|tonumber), ident:("DIVE-"+$i), title:$t, priority:$p, assignee:$a, created_by:$c, kind:"recurring", schedule:$s, fresh:($f=="1")}' \
+       --arg i "$id" --arg t "$title" --arg p "$priority" --arg a "${assignee:-}" --arg c "$creator" --arg s "$recurring" --arg f "$fresh_sql"
   else
     ok "created DIVE-$id — $title" \
        '{id:($i|tonumber), ident:("DIVE-"+$i), title:$t, priority:$p, assignee:$a, created_by:$c, kind:"standard"}' \
@@ -10187,11 +10274,61 @@ _hb_wake() {
   return 0
 }
 
+# DIVE-138 step 2: materialize due recurring TEMPLATES into standard todos. Runs
+# as its own pass at the TOP of the tick (before the wake loop) so a freshly
+# cloned todo is eligible to be picked up in the SAME tick. The caller isolates
+# it (|| log) so a materializer failure can NEVER abort the wake loop — the
+# heartbeat-never-woke bug class.
+#
+# For each kind='recurring' template: fire when its cron matches `now` AND it
+# hasn't already fired THIS minute (last_fired_at guard — stops a double-fire if
+# two ticks land in the same matching minute). DEDUP (skip-if-open): don't
+# materialize if an unfinished instance from this template already exists, so
+# dailies don't pile up when the assignee is behind. On fire: clone
+# title/body/priority/assignee/created_by/fresh into a kind='standard' todo
+# stamped with from_template_id, then stamp the template's last_fired_at.
+#
+# V1 LIMITATION: no catch-up for ticks the host missed — if the box was down over
+# a scheduled minute, that occurrence is skipped, not backfilled. Acceptable for
+# coarse (daily/hourly) recurring jobs; minute granularity finer than the tick
+# interval can also be missed. Both documented in the CHANGELOG.
+_hb_materialize_recurring() {
+  local now="$1" minute_start tid sched last_fired open n_made=0
+  minute_start=$(date -u -d "@${now}" +'%Y-%m-%d %H:%M:00')
+  while IFS=$'\t' read -r tid sched last_fired; do
+    [[ -n "$tid" ]] || continue
+    _cron_matches "$sched" "$now" || continue
+    # Already fired this minute? (string compare on ISO 'YYYY-MM-DD HH:MM:SS';
+    # last_fired >= minute_start means a tick already materialized it this minute.)
+    if [[ -n "$last_fired" ]] && ! [[ "$last_fired" < "$minute_start" ]]; then
+      continue
+    fi
+    open=$(db "SELECT COUNT(*) FROM tasks WHERE from_template_id=${tid} AND status NOT IN ('done','cancelled');" 2>/dev/null || echo 1)
+    if [[ "${open:-1}" != "0" ]]; then
+      _hb_log "[materializer] DIVE-${tid} due but an open instance exists — skip"
+      continue
+    fi
+    if db "INSERT INTO tasks (title, body, priority, assignee, created_by, kind, from_template_id, fresh)
+           SELECT title, body, priority, assignee, created_by, 'standard', id, fresh FROM tasks WHERE id=${tid};
+           UPDATE tasks SET last_fired_at=datetime('now') WHERE id=${tid};" >/dev/null 2>&1; then
+      n_made=$((n_made + 1)); _hb_log "[materializer] DIVE-${tid} fired -> new standard todo"
+    else
+      _hb_log "[materializer] DIVE-${tid} insert failed"
+    fi
+  done < <(db "SELECT id, schedule, COALESCE(last_fired_at,'') FROM tasks WHERE kind='recurring' AND schedule IS NOT NULL;" 2>/dev/null | tr '|' '\t')
+  _hb_log "[materializer] pass done — ${n_made} materialized"
+  return 0
+}
+
 cmd_heartbeat_tick() {
   require_root "heartbeat tick"
   tasks_db_init
   local reg now; reg=$(registry_read); now=$(date +%s)
   local checked=0 woke=0 reaped=0 reclaimed=0 starved=0 sk_notdue=0 sk_busy=0 sk_nowork=0 sk_fail=0 sk_spread=0 sk_active=0
+  # DIVE-138: materialize due recurring templates FIRST so a freshly-cloned todo
+  # is eligible for the wake loop below this same tick. Isolated — a failure here
+  # must never abort the wake loop.
+  _hb_materialize_recurring "$now" || _hb_log "[materializer] pass errored (non-fatal)"
   # Accounts already woken during THIS tick. The $reg snapshot is read once up
   # front, so a wake we do mid-loop isn't visible to later iterations via the
   # registry — this map carries that within-tick fact so two same-account agents
@@ -10295,8 +10432,14 @@ cmd_heartbeat_tick() {
       sk_active=$((sk_active + 1)); _hb_log "[$name] active (mid-turn/conversation) — defer nudge this tick"; continue
     fi
 
-    _hb_log "[$name] due + todo DIVE-${task_id} — waking (fresh=${fresh})"
-    if _hb_wake "$name" "$fresh" "$task_id"; then
+    # Per-task fresh override (DIVE-138): a materialized recurring instance can
+    # carry fresh=1 to force a clean /clear before its turn, regardless of the
+    # agent-level heartbeat fresh setting. NULL/0 falls back to the agent default.
+    local eff_fresh="$fresh" task_fresh
+    task_fresh=$(db "SELECT COALESCE(fresh,'') FROM tasks WHERE id=${task_id};" 2>/dev/null || echo "")
+    [[ "$task_fresh" == "1" ]] && eff_fresh="true"
+    _hb_log "[$name] due + todo DIVE-${task_id} — waking (fresh=${eff_fresh})"
+    if _hb_wake "$name" "$eff_fresh" "$task_id"; then
       in_tick_woke[$acct]=$now   # claim the account's slot for the rest of this tick
       local nudge_n
       nudge_n=$(with_registry_lock _hb_mark_run "$name" "$now" "$task_id")

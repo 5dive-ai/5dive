@@ -62,7 +62,7 @@ cmd_task_init() {
 
 cmd_task_add() {
   tasks_db_init
-  local body="" priority="medium" assignee="" parent="" from="" recurring=""
+  local body="" priority="medium" assignee="" parent="" from="" recurring="" fresh=""
   local -a words=()
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -73,6 +73,8 @@ cmd_task_add() {
       --from=*)      from="${1#*=}" ;;
       --recurring=*) recurring="${1#*=}" ;;
       --schedule=*)  recurring="${1#*=}" ;;
+      --fresh)       fresh="1" ;;
+      --no-fresh)    fresh="0" ;;
       --)            shift; words+=("$@"); break ;;
       -*)            fail "$E_USAGE" "unknown flag: $1" ;;
       *)             words+=("$1") ;;
@@ -96,17 +98,25 @@ cmd_task_add() {
   if [[ -n "$parent" ]]; then
     resolve_task_id "$parent"; parent_sql="$RESOLVED_TASK_ID"
   fi
+  # fresh: per-task clean-session pref (DIVE-138). Recurring templates default to
+  # fresh=1 (clean each run — Mark's decision for the community/marketing jobs)
+  # and carry it onto every materialized instance; an explicit --fresh/--no-fresh
+  # overrides. Standard tasks leave it NULL (fall back to the agent-level
+  # heartbeat fresh setting at wake).
+  local fresh_sql="NULL"
+  if [[ -n "$fresh" ]]; then fresh_sql="$fresh"
+  elif [[ "$kind" == "recurring" ]]; then fresh_sql="1"; fi
   local creator; creator=$(task_actor "$from")
   local id
-  id=$(db "INSERT INTO tasks (title, body, priority, assignee, created_by, parent_id, kind, schedule)
+  id=$(db "INSERT INTO tasks (title, body, priority, assignee, created_by, parent_id, kind, schedule, fresh)
            VALUES ($(sqlq "$title"), $(sqlq_or_null "$body"), $(sqlq "$priority"),
                    $(sqlq_or_null "$assignee"), $(sqlq "$creator"), ${parent_sql},
-                   $(sqlq "$kind"), ${schedule_sql});
+                   $(sqlq "$kind"), ${schedule_sql}, ${fresh_sql});
            SELECT last_insert_rowid();")
   if [[ "$kind" == "recurring" ]]; then
-    ok "created recurring DIVE-$id (${recurring}) — $title" \
-       '{id:($i|tonumber), ident:("DIVE-"+$i), title:$t, priority:$p, assignee:$a, created_by:$c, kind:"recurring", schedule:$s}' \
-       --arg i "$id" --arg t "$title" --arg p "$priority" --arg a "${assignee:-}" --arg c "$creator" --arg s "$recurring"
+    ok "created recurring DIVE-$id (${recurring}, fresh=$([[ "$fresh_sql" == "1" ]] && echo on || echo off)) — $title" \
+       '{id:($i|tonumber), ident:("DIVE-"+$i), title:$t, priority:$p, assignee:$a, created_by:$c, kind:"recurring", schedule:$s, fresh:($f=="1")}' \
+       --arg i "$id" --arg t "$title" --arg p "$priority" --arg a "${assignee:-}" --arg c "$creator" --arg s "$recurring" --arg f "$fresh_sql"
   else
     ok "created DIVE-$id — $title" \
        '{id:($i|tonumber), ident:("DIVE-"+$i), title:$t, priority:$p, assignee:$a, created_by:$c, kind:"standard"}' \
