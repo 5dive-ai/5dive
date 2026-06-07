@@ -26,7 +26,7 @@ esac
 
 # Bumped on every public release. `build.sh` checks this line exists; CI fails
 # the bundle-drift check if it's missing or empty.
-readonly FIVE_VERSION="0.1.68"
+readonly FIVE_VERSION="0.1.69"
 
 STATE_DIR="/var/lib/5dive"
 REGISTRY="${STATE_DIR}/agents.json"
@@ -8824,6 +8824,14 @@ _compose_default_file() {
 }
 
 # YAML → JSON via python3 + PyYAML, with strict ${VAR} env expansion.
+#
+# v1 just normalised the agents map. v2 additionally:
+#   - merges a top-level defaults{} into every agent (agent-level keys win),
+#   - validates reports_to (targets must resolve to agent names, no self-edge,
+#     no cycles) and the instructions / instructions_file XOR,
+#   - warns (does not fail) on unknown per-agent keys for forward-compat.
+# Output JSON keeps the same {..., agents:{<name>:{merged spec}}} shape so the
+# v1 create path is untouched; team{}/defaults{}/version pass through for export.
 _compose_parse() {
   local file="$1"
   python3 - "$file" <<'PY'
@@ -8837,6 +8845,64 @@ except OSError as e:
     print(f"error: cannot open {sys.argv[1]}: {e}", file=sys.stderr); sys.exit(4)
 if not isinstance(data, dict) or "agents" not in data or not isinstance(data["agents"], dict):
     print("error: spec must have a top-level 'agents:' map", file=sys.stderr); sys.exit(3)
+
+defaults = data.get("defaults") or {}
+if not isinstance(defaults, dict):
+    print("error: 'defaults:' must be a map", file=sys.stderr); sys.exit(3)
+
+# Known per-agent keys (v1 + v2). Unknown → warn, not fail (forward-compat).
+KNOWN = {
+    "type","channels","telegram_token","discord_token","workdir","skills",
+    "no_skills","defer_auth","isolation","auth_profile","provider","api_key",
+    "role","instructions","instructions_file","model","effort","reports_to","goals",
+}
+
+agents = data["agents"]
+# Merge defaults under each agent (agent keys win). None spec → empty map.
+merged = {}
+for name, spec in agents.items():
+    spec = spec or {}
+    if not isinstance(spec, dict):
+        print(f"error: agent '{name}' must be a map", file=sys.stderr); sys.exit(3)
+    m = dict(defaults); m.update(spec)
+    merged[name] = m
+    if m.get("instructions") and m.get("instructions_file"):
+        print(f"error: agent '{name}': instructions and instructions_file are mutually exclusive", file=sys.stderr); sys.exit(3)
+    for k in spec:
+        if k not in KNOWN:
+            print(f"warning: agent '{name}': unknown key '{k}' (ignored)", file=sys.stderr)
+data["agents"] = merged
+
+# reports_to: normalise to a list, validate targets resolve + no self-edge.
+names = set(merged)
+edges = {}
+def rt_list(v):
+    if v is None or v == "": return []
+    return v if isinstance(v, list) else [v]
+for name, m in merged.items():
+    mgrs = rt_list(m.get("reports_to"))
+    for mgr in mgrs:
+        if mgr not in names:
+            print(f"error: agent '{name}': reports_to '{mgr}' is not a declared agent", file=sys.stderr); sys.exit(3)
+        if mgr == name:
+            print(f"error: agent '{name}': cannot report to itself", file=sys.stderr); sys.exit(3)
+    edges[name] = mgrs
+# Reject cycles in the reporting graph (DFS, colour-marking).
+WHITE, GREY, BLACK = 0, 1, 2
+colour = {n: WHITE for n in names}
+def visit(n, stack):
+    colour[n] = GREY
+    for mgr in edges.get(n, []):
+        if colour[mgr] == GREY:
+            cyc = " -> ".join(stack + [n, mgr])
+            print(f"error: reporting cycle detected: {cyc}", file=sys.stderr); sys.exit(3)
+        if colour[mgr] == WHITE:
+            visit(mgr, stack + [n])
+    colour[n] = BLACK
+for n in names:
+    if colour[n] == WHITE:
+        visit(n, [])
+
 env_re = re.compile(r"\$\{([A-Z_][A-Z0-9_]*)\}")
 def expand(v):
     if isinstance(v, str):
@@ -8909,6 +8975,121 @@ _compose_create_args() {
   [[ "$defer_auth" == "true" ]] && printf '%s\n' "--defer-auth"
 }
 
+# Build the "## Role" + "## Reporting" markdown for one agent and append it to
+# the agent's $HOME/.claude/CLAUDE.md — BELOW the shared telegram fragment that
+# cmd_create already dropped (telegram agents) or as a fresh file (others). This
+# is the v1 gap: every telegram agent used to get only the shared mandate; now a
+# CEO vs DevOps carry distinct role instructions + a real delegation map.
+#
+# Reporting lines are generated from reports_to so delegation is executable, not
+# decorative: each manager / direct report comes with the exact `5dive agent
+# send` invocation. Runs on CREATE only (see cmd_compose_up), so re-running `up`
+# never double-appends.
+_compose_write_role_md() {
+  local spec="$1" name="$2" spec_dir="$3"
+  local agent role instructions ifile
+  agent=$(jq -c --arg n "$name" '.agents[$n]' <<<"$spec")
+  role=$(jq         -r '.role              // empty' <<<"$agent")
+  instructions=$(jq -r '.instructions      // empty' <<<"$agent")
+  ifile=$(jq        -r '.instructions_file // empty' <<<"$agent")
+
+  # Resolve instructions_file against the spec dir (parser already enforced XOR).
+  if [[ -z "$instructions" && -n "$ifile" ]]; then
+    local ipath
+    ipath=$(_compose_resolve_path "$ifile" "$spec_dir")
+    if [[ -f "$ipath" ]]; then
+      instructions=$(cat "$ipath")
+    else
+      warn "[$name] instructions_file not found: $ipath"
+    fi
+  fi
+
+  # Managers (reports_to) and direct reports (who lists $name as a manager).
+  local -a mgrs reports
+  mapfile -t mgrs    < <(jq -r --arg n "$name" '.agents[$n].reports_to // empty | if type=="array" then .[] else . end' <<<"$spec")
+  mapfile -t reports < <(jq -r --arg n "$name" '.agents | to_entries[] | select((.value.reports_to // empty) | if type=="array" then any(. == $n) else . == $n end) | .key' <<<"$spec")
+
+  # Nothing role-specific → leave the agent's CLAUDE.md exactly as cmd_create
+  # left it (keeps plain v1 specs byte-identical to before).
+  [[ -n "$role" || -n "$instructions" || ${#mgrs[@]} -gt 0 || ${#reports[@]} -gt 0 ]] || return 0
+
+  local block=$'\n\n'
+  if [[ -n "$role" ]]; then block+="## Role: ${role}"$'\n\n'; else block+="## Role"$'\n\n'; fi
+  [[ -n "$instructions" ]] && block+="${instructions}"$'\n\n'
+  block+="## Reporting"$'\n'
+  if [[ ${#mgrs[@]} -gt 0 ]]; then
+    local m
+    for m in "${mgrs[@]}"; do
+      block+="- You report to **${m}**. Escalate or sync: \`5dive agent send ${m} '<message>'\`."$'\n'
+    done
+  else
+    block+="- You sit at the top of this org; you answer to the human owner."$'\n'
+  fi
+  if [[ ${#reports[@]} -gt 0 ]]; then
+    local r
+    for r in "${reports[@]}"; do
+      block+="- Direct report **${r}**. Delegate: \`5dive agent send ${r} '<task>'\`."$'\n'
+    done
+  fi
+
+  local user="agent-${name}" home="/home/agent-${name}" md
+  md="$home/.claude/CLAUDE.md"
+  sudo -u "$user" mkdir -p "$home/.claude" 2>/dev/null || true
+  if printf '%s' "$block" | sudo -u "$user" tee -a "$md" >/dev/null 2>&1; then
+    sudo chmod 644 "$md" 2>/dev/null || true
+  else
+    warn "[$name] could not write role instructions to $md"
+  fi
+}
+
+# Apply the v2 role wiring for one freshly-created agent: model, effort, org
+# edge (reports_to), role instructions + reporting block, and seed goals into
+# the task queue. Every step is best-effort and process-isolated (shelled out
+# or subshell-guarded) so one failure can't abort the whole bring-up.
+_compose_wire_role() {
+  local spec="$1" name="$2" spec_dir="$3" self="$4"
+  local agent type model effort role primary_mgr
+  agent=$(jq -c --arg n "$name" '.agents[$n]' <<<"$spec")
+  type=$(jq   -r '.type   // "claude"' <<<"$agent")
+  model=$(jq  -r '.model  // empty'    <<<"$agent")
+  effort=$(jq -r '.effort // empty'    <<<"$agent")
+  role=$(jq   -r '.role   // empty'    <<<"$agent")
+  primary_mgr=$(jq -r '.reports_to // empty | if type=="array" then (.[0] // "") else . end' <<<"$agent")
+
+  # model / effort via the public config path (process-isolated; warns if the
+  # runtime config isn't written yet — model just stays at its default).
+  if [[ -n "$model" ]]; then
+    bash "$self" agent config "$name" set "model=$model" >/dev/null 2>&1 \
+      || warn "[$name] set model=$model failed (apply later: 5dive agent config $name set model=$model)"
+  fi
+  if [[ -n "$effort" ]]; then
+    bash "$self" agent config "$name" set "effort=$effort" >/dev/null 2>&1 \
+      || warn "[$name] set effort=$effort failed (apply later: 5dive agent config $name set effort=$effort)"
+  fi
+
+  # Org edge + title. org set carries one manager; the Reporting block lists all.
+  if [[ -n "$role" || -n "$primary_mgr" ]]; then
+    local -a oargs=(org set "$name")
+    [[ -n "$role"        ]] && oargs+=("--role=$role")
+    [[ -n "$primary_mgr" ]] && oargs+=("--manager=$primary_mgr")
+    bash "$self" "${oargs[@]}" >/dev/null 2>&1 || warn "[$name] org set failed"
+  fi
+
+  # Role instructions + reporting block → agent CLAUDE.md.
+  _compose_write_role_md "$spec" "$name" "$spec_dir"
+
+  # Seed goals into the shared task queue, assigned to the role, from its manager.
+  local -a goals
+  mapfile -t goals < <(jq -r '(.goals // [])[]' <<<"$agent")
+  local g
+  for g in "${goals[@]}"; do
+    [[ -n "$g" ]] || continue
+    local -a targs=(task add "$g" "--assignee=$name")
+    [[ -n "$primary_mgr" ]] && targs+=("--from=$primary_mgr")
+    bash "$self" "${targs[@]}" >/dev/null 2>&1 || warn "[$name] seed goal failed: $g"
+  done
+}
+
 # Re-exec self via bash so we work whether the script was installed (+x) or
 # invoked from a source checkout (no +x).
 _compose_self() { realpath "${BASH_SOURCE[0]}"; }
@@ -8979,6 +9160,9 @@ HELP
     mapfile -t args < <(_compose_create_args "$agent_spec" "$name" "$spec_dir")
     if bash "$self" agent create "${args[@]}"; then
       ((created++)) || true
+      # v2 role wiring (model/effort/org/instructions/goals). Best-effort: a
+      # wiring hiccup must not fail the create that already succeeded.
+      _compose_wire_role "$spec" "$name" "$spec_dir" "$self" || true
     else
       warn "[$name] create failed"
       ((errors++)) || true
@@ -9051,6 +9235,143 @@ HELP
     echo "OK — torn down $file: removed=$removed missing=$missing errors=$errors"
   fi
   (( errors == 0 )) || return "$E_GENERIC"
+}
+
+# 5dive export — round-trip the live fleet back to a v2 5dive.yaml, so a running
+# org can be saved, versioned, and forked into a template. Dumps the structural
+# spec (type/channels/workdir/auth_profile + model/effort + role/reports_to from
+# the org graph). Role INSTRUCTIONS are not round-tripped: an agent's CLAUDE.md
+# interleaves the shared telegram fragment with the role block, so re-deriving
+# clean source is unsafe — a `# instructions: ...` reminder is emitted instead.
+cmd_compose_export() {
+  local out=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -o|--output) out="$2"; shift ;;
+      --output=*)  out="${1#--output=}" ;;
+      -h|--help)
+        cat >&2 <<HELP
+usage: 5dive export [-o team.yaml]
+  Dump the running fleet to a v2 5dive.yaml (stdout if no -o). Captures
+  type/channels/workdir/auth_profile, model/effort, and role/reports_to.
+HELP
+        return 0 ;;
+      *) fail "$E_USAGE" "unknown flag: $1" ;;
+    esac
+    shift
+  done
+  ensure_state
+  local reg
+  reg=$(registry_read)
+
+  local names agents="{}"
+  mapfile -t names < <(jq -r '.agents | keys[]' <<<"$reg")
+  local name
+  for name in "${names[@]}"; do
+    local type channels workdir profile model effort role mgr
+    type=$(jq    -r --arg n "$name" '.agents[$n].type        // "claude"' <<<"$reg")
+    channels=$(jq -r --arg n "$name" '.agents[$n].channels    // empty'    <<<"$reg")
+    workdir=$(jq -r --arg n "$name" '.agents[$n].workdir      // empty'    <<<"$reg")
+    profile=$(jq -r --arg n "$name" '.agents[$n].authProfile  // empty'    <<<"$reg")
+    model=$(resolve_agent_model  "$type" "$name")
+    effort=$(resolve_agent_effort "$type" "$name")
+    role=$(db "SELECT COALESCE(role,'')       FROM agents_org WHERE name=$(sqlq "$name");" 2>/dev/null | head -1)
+    mgr=$(db  "SELECT COALESCE(reports_to,'') FROM agents_org WHERE name=$(sqlq "$name");" 2>/dev/null | head -1)
+    # Assemble one agent object, dropping empty fields.
+    local obj
+    obj=$(jq -n \
+      --arg type "$type" --arg channels "$channels" --arg workdir "$workdir" \
+      --arg profile "$profile" --arg model "$model" --arg effort "$effort" \
+      --arg role "$role" --arg mgr "$mgr" '
+      {type:$type}
+      | (if $channels != "" then .channels = $channels else . end)
+      | (if $workdir  != "" then .workdir  = $workdir  else . end)
+      | (if $profile  != "" then .auth_profile = $profile else . end)
+      | (if $model    != "" then .model    = $model    else . end)
+      | (if $effort   != "" then .effort   = $effort   else . end)
+      | (if $role     != "" then .role     = $role     else . end)
+      | (if $mgr      != "" then .reports_to = $mgr    else . end)')
+    agents=$(jq -c --arg n "$name" --argjson o "$obj" '. + {($n): $o}' <<<"$agents")
+  done
+
+  local doc
+  doc=$(jq -n --argjson agents "$agents" '{version:"2", agents:$agents}')
+  local yaml
+  yaml=$(printf '%s' "$doc" | python3 -c 'import sys,yaml,json; print("# 5dive.yaml v2 — exported fleet\n# note: role instructions are not round-tripped; re-add per role as needed.\n" + yaml.safe_dump(json.load(sys.stdin), sort_keys=False, default_flow_style=False))') \
+    || fail "$E_GENERIC" "yaml serialisation failed"
+  if [[ -n "$out" ]]; then
+    printf '%s' "$yaml" > "$out" || fail "$E_GENERIC" "cannot write $out"
+    ok "exported ${#names[@]} agents to $out" '{file:$f, agents:($n|tonumber)}' --arg f "$out" --arg n "${#names[@]}"
+  else
+    printf '%s' "$yaml"
+  fi
+}
+
+# Where curated team templates live. Installed alongside the other shared
+# plugin assets; falls back to a repo-local team-templates/ for source checkouts.
+_team_templates_dir() {
+  if   [[ -d /usr/local/lib/5dive/team-templates ]]; then printf '%s' /usr/local/lib/5dive/team-templates
+  elif [[ -d "$(dirname "$(_compose_self)")/../team-templates" ]]; then
+    realpath "$(dirname "$(_compose_self)")/../team-templates"
+  else return 1
+  fi
+}
+
+# 5dive team import <slug|path> — resolve a curated/bundled template (or a path)
+# and bring the whole org up via the existing compose engine. A thin, honest
+# wrapper over `up`: the heavy lifting (idempotent create + v2 wiring) is shared.
+cmd_team() {
+  local sub="${1:-}"; shift || true
+  case "$sub" in
+    import) : ;;
+    ls|list)
+      local dir; dir=$(_team_templates_dir) || fail "$E_NOT_FOUND" "no team-templates dir found"
+      echo "Available templates ($dir):"
+      local f
+      for f in "$dir"/*.5dive.yaml "$dir"/*.5dive.yml; do
+        [[ -f "$f" ]] || continue
+        local slug; slug=$(basename "$f"); slug="${slug%%.5dive.*}"
+        printf '  %-16s %s\n' "$slug" "$f"
+      done
+      return 0 ;;
+    -h|--help|"" )
+      cat >&2 <<HELP
+usage: 5dive team import <slug|path> [--auth-profile=<name>]
+       5dive team ls
+  Provision a whole company-structure template in one call (wraps 5dive up).
+  <slug> resolves to a bundled template; a path is used as-is.
+HELP
+      return 0 ;;
+    *) fail "$E_USAGE" "unknown team subcommand: $sub (try: import, ls)" ;;
+  esac
+
+  local ref="" profile=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --auth-profile=*) profile="${1#--auth-profile=}" ;;
+      --auth-profile)   profile="$2"; shift ;;
+      -*) fail "$E_USAGE" "unknown flag: $1" ;;
+      *)  [[ -z "$ref" ]] && ref="$1" || fail "$E_USAGE" "extra arg: $1" ;;
+    esac
+    shift
+  done
+  [[ -n "$ref" ]] || fail "$E_USAGE" "usage: 5dive team import <slug|path>"
+
+  local file=""
+  if [[ -f "$ref" ]]; then
+    file="$ref"
+  else
+    local dir; dir=$(_team_templates_dir) || fail "$E_NOT_FOUND" "no team-templates dir — pass a path"
+    if   [[ -f "$dir/${ref}.5dive.yaml" ]]; then file="$dir/${ref}.5dive.yaml"
+    elif [[ -f "$dir/${ref}.5dive.yml"  ]]; then file="$dir/${ref}.5dive.yml"
+    else fail "$E_NOT_FOUND" "no template '$ref' in $dir (try: 5dive team ls)"
+    fi
+  fi
+
+  # --auth-profile overrides the template's ${TEAM_AUTH_PROFILE} default.
+  [[ -n "$profile" ]] && export TEAM_AUTH_PROFILE="$profile"
+  step "importing team from $file"
+  cmd_compose_up -f "$file"
 }
 
 cmd_compose_ps() {
@@ -10768,6 +11089,9 @@ Compose (declarative agents via 5dive.yaml):
   5dive up   [-f file]                               # bring up agents declared in spec (idempotent)
   5dive down [-f file]                               # tear down declared agents
   5dive ps   [-f file]                               # show declared agents' state
+  5dive export [-o file]                             # dump the live fleet to a v2 5dive.yaml
+  5dive team import <slug|path> [--auth-profile=]    # provision a whole company template in one call
+  5dive team ls                                      # list bundled team templates
   # Default file: 5dive.yaml or 5dive.yml in cwd.
   # Schema (v1) — see 'agents' map keys: type, channels, telegram_token,
   # discord_token, workdir, skills, no_skills, defer_auth, isolation,
@@ -11158,6 +11482,14 @@ main() {
     ps)
       # Read-only — no audit, no lock.
       cmd_compose_ps "$@" ;;
+    export)
+      # Read-only — dump the live fleet to a v2 5dive.yaml.
+      cmd_compose_export "$@" ;;
+    team)
+      # Provision a whole company-structure template (wraps `up`); the per-agent
+      # create calls take the lock + audit themselves.
+      AUDIT_CMD="team"; AUDIT_ARGS=("$@")
+      cmd_team "$@" ;;
     uninstall)
       # Thin wrapper: fetch install.sh and exec --uninstall. Keeps a single
       # source of truth for what gets removed (install.sh) and dodges the

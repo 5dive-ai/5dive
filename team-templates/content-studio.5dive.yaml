@@ -1,0 +1,89 @@
+# Content studio — 5-role content team (template, DIVE-97/98)
+# Import:  5dive team import content-studio --auth-profile=<account>
+# Or:      5dive up -f content-studio.5dive.yaml
+#
+# Per-role telegram bot tokens come from the env (${...}); set them before import.
+# One shared account by default; split across accounts later to avoid the
+# shared-account burst rate-limit (see reference_false_rotation_shared_account_burst).
+version: "2"
+
+team:
+  name: "Content studio"
+  description: "Editor-in-Chief + Writer + SEO + Designer + Distributor"
+  slug: content-studio
+
+defaults:
+  type: claude
+  channels: telegram
+  isolation: standard
+  auth_profile: "${TEAM_AUTH_PROFILE}"
+
+agents:
+  editor:
+    role: "Editor-in-Chief"
+    model: opus
+    effort: high
+    telegram_token: "${EDITOR_TG_TOKEN}"
+    skills: [5dive-cli]
+    instructions: |
+      You are the Editor-in-Chief. You own the editorial calendar, quality bar, and
+      brand voice. You don't write every piece yourself: you commission and direct the
+      Writer, SEO, Designer, and Distributor via `5dive agent send <name>`, track pieces
+      in the task queue (`5dive task`), and give the final yes/no before anything ships.
+    goals:
+      - "Set this month's editorial calendar and assign each piece an owner."
+
+  writer:
+    role: "Writer"
+    model: sonnet
+    effort: high
+    telegram_token: "${WRITER_TG_TOKEN}"
+    reports_to: editor
+    skills: [5dive-cli, deep-research]
+    instructions: |
+      You are the Writer. You draft articles and posts the Editor commissions, grounded in
+      real research (bias to primary sources). Hand drafts to SEO and Designer; revise to
+      the Editor's notes. Ship clear, on-voice copy, not filler.
+    goals:
+      - "Draft the first cornerstone article from the calendar."
+
+  seo:
+    role: "SEO"
+    model: sonnet
+    effort: medium
+    telegram_token: "${SEO_TG_TOKEN}"
+    reports_to: editor
+    skills: [5dive-cli, deep-research]
+    instructions: |
+      You are SEO. You pick target keywords, brief the Writer on intent + structure, and
+      optimize drafts (titles, meta, internal links, headers). Track ranking opportunities
+      and report what's worth writing next to the Editor.
+    goals:
+      - "Produce a keyword + topic-cluster plan for the calendar."
+
+  designer:
+    role: "Designer"
+    model: sonnet
+    effort: medium
+    telegram_token: "${DESIGNER_TG_TOKEN}"
+    reports_to: editor
+    skills: [5dive-cli, frontend-design]
+    instructions: |
+      You are the Designer. You create hero images, diagrams, and post art for each piece
+      the Editor approves. Match the brand kit; ship polished, on-message visuals fast.
+    goals:
+      - "Build the brand kit + hero art for the first article."
+
+  distributor:
+    role: "Distributor"
+    model: sonnet
+    effort: medium
+    telegram_token: "${DISTRIBUTOR_TG_TOKEN}"
+    reports_to: editor
+    skills: [5dive-cli]
+    instructions: |
+      You are the Distributor. Once a piece ships you turn it into channel-native posts
+      (social, newsletter, communities), schedule them, and report engagement back to the
+      Editor so the studio learns what lands. Never fabricate metrics.
+    goals:
+      - "Draft the launch distribution plan + first week of posts."

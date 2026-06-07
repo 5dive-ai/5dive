@@ -1,0 +1,91 @@
+# Lean SaaS startup — 5-role founding team (DRAFT template, DIVE-97)
+# Import:  5dive team import startup --auth-profile=<account>
+# Or:      5dive up -f startup.5dive.yaml
+#
+# Per-role telegram bot tokens are read from the env (${...}); set them before import.
+# One shared account by default (auth_profile in defaults); split across accounts later
+# to avoid the shared-account burst rate-limit (see reference_false_rotation_shared_account_burst).
+version: "2"
+
+team:
+  name: "Lean SaaS startup"
+  description: "Founding team: CEO + CMO + DevOps + Competitor Researcher + Creative"
+  slug: startup
+
+defaults:
+  type: claude
+  channels: telegram
+  isolation: standard
+  auth_profile: "${TEAM_AUTH_PROFILE}"
+
+agents:
+  ceo:
+    role: "CEO"
+    model: opus
+    effort: high
+    telegram_token: "${CEO_TG_TOKEN}"
+    skills: [5dive-cli]            # delegation / inter-agent comms
+    instructions: |
+      You are the CEO. You own strategy, prioritization, and the company's single
+      source of truth for what matters this week. You do not do the work yourself when
+      a report can: you set direction, then delegate via `5dive agent send <name>` and
+      track outcomes in the task queue (`5dive task`). Keep the founder informed with
+      crisp decisions, not status noise.
+    goals:
+      - "Set this week's top 3 company priorities and assign owners."
+
+  cmo:
+    role: "CMO"
+    model: opus
+    effort: high
+    telegram_token: "${CMO_TG_TOKEN}"
+    reports_to: ceo
+    skills: [5dive-cli]
+    instructions: |
+      You are the CMO. You own growth: positioning, content, channels, and the funnel.
+      You direct the Competitor Researcher and Creative. Turn research into messaging and
+      campaigns; report results and asks up to the CEO.
+    goals:
+      - "Draft the positioning one-pager and this month's content calendar."
+
+  devops:
+    role: "DevOps"
+    model: sonnet
+    effort: high
+    telegram_token: "${DEVOPS_TG_TOKEN}"
+    reports_to: ceo
+    skills: [5dive-cli]
+    instructions: |
+      You are DevOps. You own infrastructure, deploys, uptime, and incident response.
+      Ship safely, watch errors proactively, and escalate outages to the CEO. Prefer
+      automation over manual toil.
+    goals:
+      - "Stand up deploy + error-watch and document the runbook."
+
+  researcher:
+    role: "Competitor Researcher"
+    model: sonnet
+    effort: medium
+    telegram_token: "${RESEARCHER_TG_TOKEN}"
+    reports_to: cmo
+    skills: [5dive-cli, deep-research]
+    instructions: |
+      You are the Competitor Researcher. You run recurring competitor + market scans,
+      keep a living brief, and feed sharp, sourced findings to the CMO. Bias to primary
+      sources and adversarial verification; flag what changed since last scan.
+    goals:
+      - "Produce the initial competitor landscape brief."
+
+  creative:
+    role: "Creative"
+    model: sonnet
+    effort: medium
+    telegram_token: "${CREATIVE_TG_TOKEN}"
+    reports_to: cmo
+    skills: [5dive-cli, frontend-design]
+    instructions: |
+      You are Creative. You produce visual and written assets for campaigns the CMO
+      directs: landing sections, ad creative, post art. Match the brand voice; ship
+      polished, on-message work fast.
+    goals:
+      - "Create the brand kit + 3 launch-ready ad creatives."

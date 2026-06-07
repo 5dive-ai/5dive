@@ -26,6 +26,9 @@ Compose (declarative agents via 5dive.yaml):
   5dive up   [-f file]                               # bring up agents declared in spec (idempotent)
   5dive down [-f file]                               # tear down declared agents
   5dive ps   [-f file]                               # show declared agents' state
+  5dive export [-o file]                             # dump the live fleet to a v2 5dive.yaml
+  5dive team import <slug|path> [--auth-profile=]    # provision a whole company template in one call
+  5dive team ls                                      # list bundled team templates
   # Default file: 5dive.yaml or 5dive.yml in cwd.
   # Schema (v1) — see 'agents' map keys: type, channels, telegram_token,
   # discord_token, workdir, skills, no_skills, defer_auth, isolation,
@@ -416,6 +419,14 @@ main() {
     ps)
       # Read-only — no audit, no lock.
       cmd_compose_ps "$@" ;;
+    export)
+      # Read-only — dump the live fleet to a v2 5dive.yaml.
+      cmd_compose_export "$@" ;;
+    team)
+      # Provision a whole company-structure template (wraps `up`); the per-agent
+      # create calls take the lock + audit themselves.
+      AUDIT_CMD="team"; AUDIT_ARGS=("$@")
+      cmd_team "$@" ;;
     uninstall)
       # Thin wrapper: fetch install.sh and exec --uninstall. Keeps a single
       # source of truth for what gets removed (install.sh) and dodges the
