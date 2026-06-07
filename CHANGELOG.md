@@ -9,6 +9,37 @@ release.
 
 ## [Unreleased]
 
+## [0.1.60] — 2026-06-07
+
+### Fixed
+
+- `heartbeat tick` **never woke an agent**. `_hb_reclaim` printed its
+  `reclaimed cancelled` counts with no trailing newline, so the caller's
+  `read -r ... < <(_hb_reclaim ...)` returned non-zero (EOF before delimiter)
+  and, under `set -euo pipefail`, aborted the whole tick right after the first
+  enrolled agent's reclaim step — before any wake could happen. Tell-tale: every
+  tick logged `checked 0` (the summary only printed when *no* agents were
+  enrolled, so the loop body never ran) and a manual `heartbeat tick` exited 1
+  with no output. Fixed by emitting the newline and guarding the caller `read`.
+- `heartbeat`: `--no-fresh` was silently ignored. Both the `ls` display and the
+  tick's wake path read `.heartbeat.fresh // true`, and in jq `false // true`
+  evaluates to `true` (the `//` operator treats `false` like `null`), so a
+  stored `fresh=false` was coerced back to fresh-on (the agent still got
+  `/clear`). Now read with an explicit `has("fresh")` check.
+
+### Added
+
+- `task done` / `task cancel` accept `--notify`: DM the paired human a one-line
+  `✅ [DIVE-N] done: <result>` / `⚠️ [DIVE-N] cancelled: <result>` summary,
+  reusing the same best-effort Telegram poster as `task need`. The heartbeat
+  nudge passes `--notify` so autonomous queue work surfaces a finish line
+  without streaming full progress.
+- `heartbeat` nudge now routes a task that needs a human decision/approval/
+  secret/manual step to `task need` (files a "needs you" gate that pings the
+  owner) instead of silently cancelling it; cancel is reserved for genuinely
+  irrelevant/impossible tasks. The `/goal` terminal condition accepts a
+  blocked-with-gate task as satisfied.
+
 ## [0.1.59] — 2026-06-06
 
 ### Changed

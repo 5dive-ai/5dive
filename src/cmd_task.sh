@@ -184,24 +184,31 @@ cmd_task_assign() {
 _task_status_cmd() {
   local newstatus="$1" extra="$2" verb="$3"; shift 3
   tasks_db_init
-  local result="" want_result=0
+  local result="" want_result=0 notify=0
   local -a positional=()
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --result=*) result="${1#*=}"; want_result=1 ;;
+      --notify)   notify=1 ;;
       --)         shift; positional+=("$@"); break ;;
       -*)         fail "$E_USAGE" "unknown flag: $1" ;;
       *)          positional+=("$1") ;;
     esac
     shift
   done
-  [[ ${#positional[@]} -gt 0 ]] || fail "$E_USAGE" "usage: 5dive task $verb <id|DIVE-N> [--result=<text>]"
+  [[ ${#positional[@]} -gt 0 ]] || fail "$E_USAGE" "usage: 5dive task $verb <id|DIVE-N> [--result=<text>] [--notify]"
   resolve_task_id "${positional[0]}"; local id="$RESOLVED_TASK_ID"
   local set_result=""
   if (( want_result )); then
     set_result=", result=$(sqlq_or_null "$result")"
   fi
   db "UPDATE tasks SET status=$(sqlq "$newstatus")${extra}${set_result} WHERE id=${id};"
+  # --notify (done/cancel only): DM the paired human a one-line ✅/⚠️ summary so
+  # autonomous queue work surfaces a finish line. Best-effort; never fails the
+  # status write above.
+  if (( notify )) && [[ "$verb" == "done" || "$verb" == "cancel" ]]; then
+    _task_close_notify "DIVE-$id" "$verb" "$result" || true
+  fi
   ok "DIVE-$id $verb" '{id:($i|tonumber), status:$s}' --arg i "$id" --arg s "$newstatus"
 }
 
@@ -305,6 +312,91 @@ cmd_task_need() {
      --arg i "$id" --arg ty "$type" --arg ak "$ask" --arg op "$options" --arg ac "$actor"
 }
 
+# _task_owner_channel — resolve the filing agent's bot token + the per-type
+# access.json that holds the paired human's DM/group targets. Sets globals
+# TASK_CH_TOKEN / TASK_CH_ACCESS / TASK_CH_TYPE and returns 0 on success, 1 if
+# anything is missing (so callers `_task_owner_channel || return 0` to stay
+# best-effort — a missing channel must never fail a committed DB write). Works
+# whether run directly as agent-<name> (common — task verbs need no sudo) or via
+# sudo (resolved like task_actor; token from the group-claude-readable connector
+# file or an inherited env var). Shared by task_need_notify + _task_close_notify.
+TASK_CH_TOKEN="" TASK_CH_ACCESS="" TASK_CH_TYPE=""
+_task_owner_channel() {
+  TASK_CH_TOKEN="" TASK_CH_ACCESS="" TASK_CH_TYPE=""
+  local name="" s
+  s=$(auto_sender_from_sudo)
+  if [[ -n "$s" ]]; then
+    name="$s"
+  else
+    local u="${USER:-$(id -un 2>/dev/null)}"
+    [[ "$u" == agent-* ]] && name="${u#agent-}"
+  fi
+  [[ -n "$name" ]] || return 1
+  local token="" token_file="${CONNECTORS_DIR}/telegram-${name}.env"
+  [[ -r "$token_file" ]] && token=$(sed -n 's/^TELEGRAM_BOT_TOKEN=//p' "$token_file" | head -1)
+  [[ -z "$token" ]] && token="${TELEGRAM_BOT_TOKEN:-}"
+  [[ -n "$token" ]] || return 1
+  local t d
+  for t in claude codex grok antigravity; do
+    d=$(_tg_access_state_dir "agent-${name}" "$t") || continue
+    if [[ -r "${d}/access.json" ]]; then
+      TASK_CH_TOKEN="$token" TASK_CH_ACCESS="${d}/access.json" TASK_CH_TYPE="$t"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# _task_send_owner — send ONE message ($1, optional reply_markup $2) to the
+# paired human, using the channel resolved by _task_owner_channel. Human DMs
+# first (allowFrom — exactly the users who /started the bot); if none, fall back
+# to the agent's bound forum topic(s) so the message isn't silently lost. Always
+# returns 0 (best-effort, mirrors task_need_notify's original send tail).
+_task_send_owner() {
+  local text="$1" reply_markup="${2:-}"
+  local token="$TASK_CH_TOKEN" access_file="$TASK_CH_ACCESS"
+  local dms sent=0 chat
+  dms=$(jq -r '(.allowFrom // [])[]' "$access_file" 2>/dev/null) || dms=""
+  if [[ -n "$dms" ]]; then
+    while IFS= read -r chat; do
+      [[ -n "$chat" ]] || continue
+      _mirror_post "$token" "$chat" "" "$text" "$access_file" "$reply_markup"
+      sent=1
+    done <<<"$dms"
+  fi
+  if (( ! sent )); then
+    local groups n i g_chat g_thread
+    groups=$(jq -c '(.groups // {}) | to_entries' "$access_file" 2>/dev/null) || groups="[]"
+    n=$(jq 'length' <<<"$groups" 2>/dev/null) || n=0
+    n=${n:-0}
+    for (( i=0; i<n; i++ )); do
+      g_chat=$(jq -r ".[$i].key" <<<"$groups" 2>/dev/null) || continue
+      g_thread=$(jq -r ".[$i].value.message_thread_id // \"\"" <<<"$groups" 2>/dev/null) || g_thread=""
+      [[ -n "$g_chat" ]] || continue
+      _mirror_post "$token" "$g_chat" "$g_thread" "$text" "$access_file" "$reply_markup"
+    done
+  fi
+  return 0
+}
+
+# _task_close_notify — DM the paired human a one-line ✅/⚠️ summary when a task
+# is closed with --notify (used by the heartbeat nudge so autonomous queue work
+# surfaces a finish line without full progress streaming). Best-effort: every
+# miss returns 0 so it can't fail the status write the caller just committed.
+_task_close_notify() {
+  local ident="$1" verb="$2" result="$3"
+  _task_owner_channel || return 0
+  local text
+  if [[ "$verb" == "cancel" ]]; then
+    text="⚠️ [${ident}] cancelled"
+  else
+    text="✅ [${ident}] done"
+  fi
+  [[ -n "$result" ]] && text+=": ${result}"
+  _task_send_owner "$text" ""
+  return 0
+}
+
 # task_need_notify — DIVE-105: the instant a human gate is filed, DM the paired
 # human ONE alert so it doesn't sit unseen until someone opens the dashboard.
 # Best-effort + self-gating in the shape of mirror_interagent_outbound, and
@@ -322,33 +414,9 @@ cmd_task_need() {
 task_need_notify() {
   local ident="$1" need_type="$2" ask="$3" options="$4"
 
-  # Resolve the filing agent: SUDO_USER when sudo'd, else $USER as agent-<x>.
-  local name="" s
-  s=$(auto_sender_from_sudo)
-  if [[ -n "$s" ]]; then
-    name="$s"
-  else
-    local u="${USER:-$(id -un 2>/dev/null)}"
-    [[ "$u" == agent-* ]] && name="${u#agent-}"
-  fi
-  [[ -n "$name" ]] || return 0
-
-  # Bot token: connector file is root:claude 640, so any agent (group claude)
-  # reads it directly; fall back to an inherited env token.
-  local token="" token_file="${CONNECTORS_DIR}/telegram-${name}.env"
-  [[ -r "$token_file" ]] && token=$(sed -n 's/^TELEGRAM_BOT_TOKEN=//p' "$token_file" | head -1)
-  [[ -z "$token" ]] && token="${TELEGRAM_BOT_TOKEN:-}"
-  [[ -n "$token" ]] || return 0
-
-  # access.json: probe the per-type channel dirs via _tg_access_state_dir (so we
-  # follow its mapping if it changes). First readable file wins.
-  # `t` (the matched type) is captured below for the button gate.
-  local access_file="" t d
-  for t in claude codex grok antigravity; do
-    d=$(_tg_access_state_dir "agent-${name}" "$t") || continue
-    if [[ -r "${d}/access.json" ]]; then access_file="${d}/access.json"; break; fi
-  done
-  [[ -n "$access_file" ]] || return 0
+  # Resolve bot token + the human's DM/group targets (TASK_CH_* globals). The
+  # matched access type (TASK_CH_TYPE) gates the tap-to-answer buttons below.
+  _task_owner_channel || return 0
 
   # One message. Dashboard is the primary CTA (DIVE-104 live); CLI is a power
   # tail. Options line only for a decision that actually carries choices.
@@ -372,7 +440,7 @@ task_need_notify() {
   # it, which would 400 the whole message — see the text-fallback in
   # _mirror_post). If nothing survives the filter, emit no keyboard (plain text).
   local reply_markup="" numid="${ident#DIVE-}"
-  if [[ "$t" == claude ]]; then
+  if [[ "$TASK_CH_TYPE" == claude ]]; then
     if [[ "$need_type" == "decision" && -n "$options" ]]; then
       reply_markup=$(printf '%s' "$options" | jq -Rc --arg id "$numid" '
         [ split("|")[] | gsub("^\\s+|\\s+$"; "") | select(length > 0) ] as $o
@@ -385,30 +453,7 @@ task_need_notify() {
     fi
   fi
 
-  # Targets: human DMs first (allowFrom — exactly the users who /started the
-  # bot, so a bot-initiated DM is permitted). If none, fall back to the agent's
-  # bound forum topic(s) so the ask isn't silently lost.
-  local dms sent=0 chat
-  dms=$(jq -r '(.allowFrom // [])[]' "$access_file" 2>/dev/null) || dms=""
-  if [[ -n "$dms" ]]; then
-    while IFS= read -r chat; do
-      [[ -n "$chat" ]] || continue
-      _mirror_post "$token" "$chat" "" "$text" "$access_file" "$reply_markup"
-      sent=1
-    done <<<"$dms"
-  fi
-  if (( ! sent )); then
-    local groups n i g_chat g_thread
-    groups=$(jq -c '(.groups // {}) | to_entries' "$access_file" 2>/dev/null) || groups="[]"
-    n=$(jq 'length' <<<"$groups" 2>/dev/null) || n=0
-    n=${n:-0}
-    for (( i=0; i<n; i++ )); do
-      g_chat=$(jq -r ".[$i].key" <<<"$groups" 2>/dev/null) || continue
-      g_thread=$(jq -r ".[$i].value.message_thread_id // \"\"" <<<"$groups" 2>/dev/null) || g_thread=""
-      [[ -n "$g_chat" ]] || continue
-      _mirror_post "$token" "$g_chat" "$g_thread" "$text" "$access_file" "$reply_markup"
-    done
-  fi
+  _task_send_owner "$text" "$reply_markup"
   return 0
 }
 

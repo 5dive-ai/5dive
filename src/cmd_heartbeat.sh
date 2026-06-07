@@ -169,7 +169,7 @@ cmd_heartbeat_ls() {
     local enabled everyMin fresh lastRun running todo nextIn
     enabled=$(jq -r --arg n "$name"  '.agents[$n].heartbeat.enabled  // false' <<<"$reg")
     everyMin=$(jq -r --arg n "$name" '.agents[$n].heartbeat.everyMin // '"$_HB_DEFAULT_EVERY" <<<"$reg")
-    fresh=$(jq -r --arg n "$name"    '.agents[$n].heartbeat.fresh    // true' <<<"$reg")
+    fresh=$(jq -r --arg n "$name"    '(.agents[$n].heartbeat | if has("fresh") then .fresh else true end)' <<<"$reg")
     lastRun=$(jq -r --arg n "$name"  '.agents[$n].heartbeat.lastRunAt // 0' <<<"$reg")
     # is-active prints the state word AND exits nonzero for non-active units, so
     # capture its stdout directly — a `|| echo` here would append a second word.
@@ -334,7 +334,7 @@ _hb_reclaim() {
                  CAST((julianday('now') - julianday(COALESCE(started_at, created_at))) * 1440 AS INTEGER)
                FROM tasks
                WHERE assignee=$(sqlq "$name") AND status='in_progress';" 2>/dev/null || true)
-  printf '%s %s' "$reclaimed" "$cancelled"
+  printf '%s %s\n' "$reclaimed" "$cancelled"
 }
 
 # Wake one agent: ensure it's running, optionally clear context, send the nudge.
@@ -366,7 +366,7 @@ _hb_wake() {
   # evaluator sees the condition met, then auto-clears. "stop after N turns" is a
   # soft, model-judged guard — it does NOT reliably halt a runaway loop, so the
   # real hard cap is the deterministic stale-in_progress reaper in the tick.
-  local nudge="/goal Task DIVE-${task_id} shows status done or cancelled on the 5dive board (verify ONLY by running: 5dive task show DIVE-${task_id}). To achieve it: claim it with '5dive task start DIVE-${task_id}', do the work, then close it with '5dive task done DIVE-${task_id} --result=\"<one or two self-contained sentences — any output the creator needs to see; the dashboard and creator read this>\"'. If the task is blocked or unclear, instead run '5dive task cancel DIVE-${task_id} --result=\"<why>\"'. Work ONLY this one task — do not start any other. Stop after 6 turns."
+  local nudge="/goal Task DIVE-${task_id} shows status done or cancelled, or is blocked with a human gate filed, on the 5dive board (verify ONLY by running: 5dive task show DIVE-${task_id}). To achieve it: claim it with '5dive task start DIVE-${task_id}', do the work, then close it with '5dive task done DIVE-${task_id} --result=\"<one or two self-contained sentences — any output the creator needs to see; the dashboard and creator read this>\" --notify'. If it needs a human decision, approval, a secret, or a manual step only a person can do, do NOT cancel — file a gate that pings the owner: '5dive task need DIVE-${task_id} --type=decision --ask=\"<what you need from them>\"' (use --type=approval|secret|manual as fits). Only if the task is genuinely irrelevant or impossible, run '5dive task cancel DIVE-${task_id} --result=\"<why>\" --notify'. Work ONLY this one task — do not start any other. Stop after 6 turns."
   _hb_send_line "$name" "$nudge" || { _hb_log "[$name] nudge send failed"; return 1; }
   return 0
 }
@@ -391,13 +391,13 @@ cmd_heartbeat_tick() {
     local everyMin lastRun fresh
     everyMin=$(jq -r --arg n "$name" '.agents[$n].heartbeat.everyMin // '"$_HB_DEFAULT_EVERY" <<<"$reg")
     lastRun=$(jq -r --arg n "$name"  '.agents[$n].heartbeat.lastRunAt // 0' <<<"$reg")
-    fresh=$(jq -r --arg n "$name"    '.agents[$n].heartbeat.fresh // true' <<<"$reg")
+    fresh=$(jq -r --arg n "$name"    '(.agents[$n].heartbeat | if has("fresh") then .fresh else true end)' <<<"$reg")
 
     # Unwedge stuck in_progress first, every tick (NOT gated by everyMin): an
     # orphaned/stalled/runaway task must clear promptly regardless of the wake
     # throttle, or it blocks the agent's whole queue (the busy-guard below).
     local n_reclaimed n_cancelled
-    read -r n_reclaimed n_cancelled < <(_hb_reclaim "$name" "$everyMin")
+    read -r n_reclaimed n_cancelled < <(_hb_reclaim "$name" "$everyMin") || true
     reclaimed=$((reclaimed + ${n_reclaimed:-0})); reaped=$((reaped + ${n_cancelled:-0}))
 
     if (( now - lastRun < everyMin * 60 )); then
