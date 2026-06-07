@@ -79,6 +79,12 @@ CREATE TABLE IF NOT EXISTS tasks (
   need_type        TEXT,
   ask              TEXT,
   need_options     TEXT,
+  -- DIVE-148. recommend is the option text the filing agent advises (strongly
+  -- encouraged for decision/approval). When set it leads the human alert as
+  -- '✅ Recommended: <X>' and that option's tap button sorts first (⭐). For a
+  -- decision it must match one of need_options; for approval it's free text
+  -- (typically 'approved'/'denied'). NULL when the agent gave no recommendation.
+  recommend        TEXT,
   need_answer      TEXT,
   need_answered_at TEXT,
   -- Recurring task templates (DIVE step 1). kind='recurring' marks a row as a
@@ -193,7 +199,7 @@ _tasks_db_migrate() {
   # Each entry: "<column> <type>". Add new additive columns here; existing
   # rows backfill to NULL. Pure expand (no contract), so old queries/rows are
   # untouched and a downgrade still reads/writes the table fine.
-  for c in 'result TEXT' 'need_type TEXT' 'ask TEXT' 'need_options TEXT' 'need_answer TEXT' 'need_answered_at TEXT' \
+  for c in 'result TEXT' 'need_type TEXT' 'ask TEXT' 'need_options TEXT' 'recommend TEXT' 'need_answer TEXT' 'need_answered_at TEXT' \
            "kind TEXT NOT NULL DEFAULT 'standard'" 'schedule TEXT' 'last_fired_at TEXT' \
            'from_template_id INTEGER' 'fresh INTEGER'; do
     if ! printf '%s\n' "$cols" | grep -qx "${c%% *}"; then

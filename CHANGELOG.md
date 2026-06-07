@@ -9,6 +9,28 @@ release.
 
 ## [Unreleased]
 
+## [0.1.68] — 2026-06-07
+
+### Added
+
+- `task need --recommend="<option>"` (DIVE-148): the filing agent's advised
+  choice. The human alert now leads with `✅ Recommended: <X>` before the ask,
+  ⭐-marks that option in the numbered list, and sorts/⭐-prefixes its tap button
+  first — so the owner sees the advised answer first instead of hunting for it.
+  For a `decision` it must match one of `--options`; for `approval` it's free
+  text (approved/denied); rejected for secret/manual. Button `callback_data`
+  keeps the ORIGINAL option index, so the display reorder never renumbers the
+  `tna:` payload. New additive `recommend` column; surfaced in `task show` +
+  `task inbox`. The heartbeat nudge + notify-user skill now tell agents to keep
+  the ask to one crisp question (detail in the body) and always pass a
+  recommendation.
+
+### Changed
+
+- `task done`/`cancel` `--notify` ping shows only the result's FIRST line
+  (`${result%%$'\n'*}`); the full result still lives on the record (`task show`).
+  Keeps the owner's phone ping to a glanceable one-liner. (DIVE-150 follow-up)
+
 ## [0.1.67] — 2026-06-07
 
 ### Changed

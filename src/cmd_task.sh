@@ -21,7 +21,9 @@ _task_usage() {
   5dive task rm <id|DIVE-N>                          # delete (cascades subtasks + edges)
 
   # Human Task Inbox — park a task on a human and clear it
-  5dive task need <id|DIVE-N> --type=decision|secret|approval|manual --ask="..." [--options=A|B]
+  5dive task need <id|DIVE-N> --type=decision|secret|approval|manual --ask="..." [--options=A|B] [--recommend="A"]
+    --ask: ONE crisp question + ~1 line essential context, recommendation up front. Heavy detail goes in the task BODY, not the ask.
+    --recommend: your advised choice (strongly encouraged for decision/approval). Leads the alert as '✅ Recommended: <X>' and ⭐-marks its button. For a decision it must match one of --options.
                                                      # -> blocked, awaiting a human (decision/secret/approval/manual)
   5dive task inbox                                   # list ONLY human-gated tasks, priority-ordered
   5dive task answer <id|DIVE-N> --value="..."        # record the human's answer, unblock, ping the owning agent
@@ -190,7 +192,8 @@ cmd_task_show() {
     # blocks below so an ordinary task's `show` stays clean.
     local gate
     gate=$(db "SELECT 'type: '||need_type||
-                      CASE WHEN need_options IS NOT NULL THEN '  options: '||need_options ELSE '' END||x'0a'||
+                      CASE WHEN need_options IS NOT NULL THEN '  options: '||need_options ELSE '' END||
+                      CASE WHEN recommend IS NOT NULL THEN x'0a'||'recommend: '||recommend ELSE '' END||x'0a'||
                       'ask:  '||COALESCE(ask,'')||
                       CASE WHEN need_answered_at IS NOT NULL
                            THEN x'0a'||'answer: '||CASE WHEN need_type='secret' THEN '(provided — loaded out-of-band)' ELSE COALESCE(need_answer,'') END||'  ('||need_answered_at||')'
@@ -309,21 +312,22 @@ cmd_task_unblock() {
 
 cmd_task_need() {
   tasks_db_init
-  local type="" ask="" options="" from=""
+  local type="" ask="" options="" recommend="" from=""
   local -a positional=()
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      --type=*)    type="${1#*=}" ;;
-      --ask=*)     ask="${1#*=}" ;;
-      --options=*) options="${1#*=}" ;;
-      --from=*)    from="${1#*=}" ;;
+      --type=*)      type="${1#*=}" ;;
+      --ask=*)       ask="${1#*=}" ;;
+      --options=*)   options="${1#*=}" ;;
+      --recommend=*) recommend="${1#*=}" ;;
+      --from=*)      from="${1#*=}" ;;
       --)          shift; positional+=("$@"); break ;;
       -*)          fail "$E_USAGE" "unknown flag: $1" ;;
       *)           positional+=("$1") ;;
     esac
     shift
   done
-  [[ ${#positional[@]} -gt 0 ]] || fail "$E_USAGE" "usage: 5dive task need <id|DIVE-N> --type=decision|secret|approval|manual --ask=\"...\" [--options=A|B]"
+  [[ ${#positional[@]} -gt 0 ]] || fail "$E_USAGE" "usage: 5dive task need <id|DIVE-N> --type=decision|secret|approval|manual --ask=\"...\" [--options=A|B] [--recommend=\"A\"]"
   resolve_task_id "${positional[0]}"; local id="$RESOLVED_TASK_ID"
   valid_need_type "$type" || fail "$E_VALIDATION" "bad --type '$type' (decision|secret|approval|manual)"
   [[ -n "$ask" ]] || fail "$E_USAGE" "--ask is required (what does the human need to provide?)"
@@ -331,6 +335,26 @@ cmd_task_need() {
   # so the gate shape stays honest for the dashboard.
   if [[ -n "$options" && "$type" != "decision" ]]; then
     fail "$E_VALIDATION" "--options only applies to --type=decision"
+  fi
+  # DIVE-148: --recommend surfaces the agent's advised choice first in the human
+  # alert (and ⭐-marks its button). Only meaningful for the two finite-choice
+  # gate types; reject it elsewhere so the gate shape stays honest. For a
+  # decision it MUST be one of --options (same split rule as the buttons:
+  # split '|', trim, drop empties) or a tapped/displayed recommend wouldn't
+  # match any real option. For approval it's free text (e.g. approved/denied).
+  if [[ -n "$recommend" ]]; then
+    case "$type" in
+      decision)
+        [[ -n "$options" ]] || fail "$E_VALIDATION" "--recommend on a decision needs --options to match against"
+        local _match
+        _match=$(printf '%s' "$options" | jq -Rr --arg r "$recommend" '
+          [ split("|")[] | gsub("^\\s+|\\s+$"; "") | select(length > 0) ]
+          | (($r | gsub("^\\s+|\\s+$"; "")) as $rr | any(.[]; . == $rr)) | tostring' 2>/dev/null) || _match="false"
+        [[ "$_match" == "true" ]] || fail "$E_VALIDATION" "--recommend \"$recommend\" must match one of --options ($options)"
+        ;;
+      approval) : ;;
+      *) fail "$E_VALIDATION" "--recommend only applies to --type=decision or --type=approval" ;;
+    esac
   fi
   local cur; cur=$(db "SELECT status FROM tasks WHERE id=${id};")
   [[ "$cur" == "done" || "$cur" == "cancelled" ]] \
@@ -343,15 +367,16 @@ cmd_task_need() {
         SET status='blocked', assignee=$(sqlq "$actor"),
             need_type=$(sqlq "$type"), ask=$(sqlq "$ask"),
             need_options=$(sqlq_or_null "$options"),
+            recommend=$(sqlq_or_null "$recommend"),
             need_answer=NULL, need_answered_at=NULL
       WHERE id=${id};"
   # DIVE-105: DM the paired human right now so the gate doesn't sit unseen.
   # `|| true` + the helper's own self-gating make this fully best-effort — a
   # failed DM must never fail the gate write that just committed above.
-  task_need_notify "DIVE-$id" "$type" "$ask" "$options" || true
+  task_need_notify "DIVE-$id" "$type" "$ask" "$options" "$recommend" || true
   ok "DIVE-$id needs a human ($type) — $ask" \
-     '{id:($i|tonumber), ident:("DIVE-"+$i), status:"blocked", need_type:$ty, ask:$ak, need_options:(($op|select(length>0)) // null), assignee:$ac}' \
-     --arg i "$id" --arg ty "$type" --arg ak "$ask" --arg op "$options" --arg ac "$actor"
+     '{id:($i|tonumber), ident:("DIVE-"+$i), status:"blocked", need_type:$ty, ask:$ak, need_options:(($op|select(length>0)) // null), recommend:(($rc|select(length>0)) // null), assignee:$ac}' \
+     --arg i "$id" --arg ty "$type" --arg ak "$ask" --arg op "$options" --arg rc "$recommend" --arg ac "$actor"
 }
 
 # _task_owner_channel — resolve the filing agent's bot token + the per-type
@@ -434,7 +459,10 @@ _task_close_notify() {
   else
     text="✅ [${ident}] done"
   fi
-  [[ -n "$result" ]] && text+=": ${result}"
+  # Ping shows only the result's FIRST line — done-results lead with a one-line
+  # summary; a full paragraph is too noisy on the owner's phone. The complete
+  # result stays on the record (`task show` renders all of it).
+  [[ -n "$result" ]] && text+=": ${result%%$'\n'*}"
   _task_send_owner "$text" ""
   return 0
 }
@@ -454,7 +482,7 @@ _task_close_notify() {
 # file (or an inherited env var); and access.json is found by probing the
 # per-type channel dirs (own file when direct, root-readable when sudo).
 task_need_notify() {
-  local ident="$1" need_type="$2" ask="$3" options="$4"
+  local ident="$1" need_type="$2" ask="$3" options="$4" recommend="${5:-}"
 
   # Resolve bot token + the human's DM/group targets (TASK_CH_* globals). The
   # matched access type (TASK_CH_TYPE) gates the tap-to-answer buttons below.
@@ -466,12 +494,20 @@ task_need_notify() {
   # the dashboard "Needs you" card — a redirect line is just noise in chat.
   # Options are listed one per line (numbered to match the tap buttons) so long
   # labels stay readable even when Telegram crops the button text.
-  local text="🙋 [${ident}] needs you"$'\n\n'"${ask}"
+  # DIVE-148: lead with the agent's recommendation (✅ Recommended: <X>) before
+  # the ask, so the human sees the advised choice first instead of hunting for
+  # it. Applies to decision + approval gates; NULL/empty recommend = no line.
+  local text="🙋 [${ident}] needs you"
+  [[ -n "$recommend" ]] && text+=$'\n\n'"✅ Recommended: ${recommend}"
+  text+=$'\n\n'"${ask}"
   if [[ "$need_type" == "decision" && -n "$options" ]]; then
     local opts_list
-    opts_list=$(printf '%s' "$options" | jq -Rr '
-      [ split("|")[] | gsub("^\\s+|\\s+$"; "") | select(length > 0) ]
-      | to_entries | map("  \(.key + 1). \(.value)") | join("\n")' 2>/dev/null) || opts_list=""
+    # ⭐-mark the recommended option in the numbered list (numbering stays the
+    # original option order so it still maps to need_options on the dashboard).
+    opts_list=$(printf '%s' "$options" | jq -Rr --arg r "$recommend" '
+      ($r | gsub("^\\s+|\\s+$"; "")) as $rr
+      | [ split("|")[] | gsub("^\\s+|\\s+$"; "") | select(length > 0) ]
+      | to_entries | map("  \(.key + 1). \(.value)\(if .value == $rr and ($rr|length)>0 then " ⭐" else "" end)") | join("\n")' 2>/dev/null) || opts_list=""
     [[ -n "$opts_list" ]] && text+=$'\n\n'"Options:"$'\n'"${opts_list}"
   fi
 
@@ -496,12 +532,18 @@ task_need_notify() {
       # breaks onto its own full-width row instead of being cropped. A single
       # over-budget label still lands alone (we always seat the first button of
       # an empty row). Index (to_entries .key) is the tna: payload, unchanged.
-      reply_markup=$(printf '%s' "$options" | jq -Rc --arg id "$numid" '
-        [ split("|")[] | gsub("^\\s+|\\s+$"; "") | select(length > 0) ] as $o
+      # DIVE-148: ⭐-prefix the recommended option's button and sort it first so
+      # the human's eye lands on it. callback_data keeps the ORIGINAL option
+      # index (.key) — the tna: handler resolves the value by that index into
+      # need_options, so reordering the display must not renumber the payload.
+      reply_markup=$(printf '%s' "$options" | jq -Rc --arg id "$numid" --arg r "$recommend" '
+        ($r | gsub("^\\s+|\\s+$"; "")) as $rr
+        | [ split("|")[] | gsub("^\\s+|\\s+$"; "") | select(length > 0) ] as $o
         | ($o | to_entries
+           | sort_by(.value == $rr and ($rr|length)>0 | not)
            | reduce .[] as $e ({rows: [], cur: [], w: 0};
-               ($e.value | length) as $len
-               | {text: $e.value, callback_data: ("tna:" + $id + ":" + ($e.key | tostring))} as $btn
+               (($e.value | length) + (if $e.value == $rr and ($rr|length)>0 then 2 else 0 end)) as $len
+               | {text: (if $e.value == $rr and ($rr|length)>0 then "⭐ " + $e.value else $e.value end), callback_data: ("tna:" + $id + ":" + ($e.key | tostring))} as $btn
                | if (.cur | length) > 0 and ((.cur | length) >= 3 or (.w + $len + 2) > 24)
                  then {rows: (.rows + [.cur]), cur: [$btn], w: $len}
                  else {rows: .rows, cur: (.cur + [$btn]), w: (.w + $len + 2)}
@@ -509,7 +551,18 @@ task_need_notify() {
            | .rows + (if (.cur | length) > 0 then [.cur] else [] end)) as $kb
         | if ($kb | length) > 0 then {inline_keyboard: $kb} else empty end' 2>/dev/null) || reply_markup=""
     elif [[ "$need_type" == "approval" ]]; then
-      reply_markup='{"inline_keyboard":[[{"text":"✅ Approve","callback_data":"tna:'"${numid}"':approved"},{"text":"🚫 Deny","callback_data":"tna:'"${numid}"':denied"}]]}'
+      # DIVE-148: ⭐-mark whichever button the agent recommended (approved/denied)
+      # and seat it first. Default order (Approve, Deny) when no recommendation.
+      local _rl; _rl=$(printf '%s' "$recommend" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')
+      local _appr='{"text":"✅ Approve","callback_data":"tna:'"${numid}"':approved"}'
+      local _deny='{"text":"🚫 Deny","callback_data":"tna:'"${numid}"':denied"}'
+      case "$_rl" in
+        approve|approved) _appr='{"text":"⭐ ✅ Approve","callback_data":"tna:'"${numid}"':approved"}'
+                          reply_markup='{"inline_keyboard":[['"$_appr"','"$_deny"']]}' ;;
+        deny|denied)      _deny='{"text":"⭐ 🚫 Deny","callback_data":"tna:'"${numid}"':denied"}'
+                          reply_markup='{"inline_keyboard":[['"$_deny"','"$_appr"']]}' ;;
+        *)                reply_markup='{"inline_keyboard":[['"$_appr"','"$_deny"']]}' ;;
+      esac
     fi
   fi
 
@@ -533,7 +586,7 @@ cmd_task_inbox() {
   local order="ORDER BY CASE priority WHEN 'urgent' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2 ELSE 3 END, created_at"
   if (( JSON_MODE )); then
     local rows
-    rows=$(dbfmt -json "SELECT id, ident, title, status, priority, assignee, created_by, parent_id, created_at, need_type, ask, need_options, need_answer, need_answered_at FROM tasks WHERE ${where} ${order};")
+    rows=$(dbfmt -json "SELECT id, ident, title, status, priority, assignee, created_by, parent_id, created_at, need_type, ask, need_options, recommend, need_answer, need_answered_at FROM tasks WHERE ${where} ${order};")
     [[ -n "$rows" ]] || rows="[]"
     jq -cn --argjson r "$rows" '{ok:true, data:{inbox:$r}}'
   else
@@ -541,7 +594,7 @@ cmd_task_inbox() {
     if [[ "$cnt" == "0" ]]; then
       echo "inbox empty — nothing waiting on a human."
     else
-      dbfmt -box "SELECT ident, priority, need_type, COALESCE(assignee,'-') AS owner, ask FROM tasks WHERE ${where} ${order};"
+      dbfmt -box "SELECT ident, priority, need_type, COALESCE(assignee,'-') AS owner, COALESCE(recommend,'-') AS recommend, ask FROM tasks WHERE ${where} ${order};"
     fi
   fi
 }
