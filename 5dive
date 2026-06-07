@@ -26,7 +26,7 @@ esac
 
 # Bumped on every public release. `build.sh` checks this line exists; CI fails
 # the bundle-drift check if it's missing or empty.
-readonly FIVE_VERSION="0.1.66"
+readonly FIVE_VERSION="0.1.67"
 
 STATE_DIR="/var/lib/5dive"
 REGISTRY="${STATE_DIR}/agents.json"
@@ -10141,32 +10141,86 @@ _hb_send_line() {
   sudo -u "agent-${name}" tmux send-keys -t "agent-${name}" Enter 2>/dev/null || return 1
 }
 
-# Epoch when this agent's live claude process started, or empty if not found.
-# This is the inner `claude` the `while true; do claude; ...` wrapper respawns —
-# its start time is the agent's "session identity": a rotation, restart, crash,
-# or context reset that exits the process gives the replacement a newer start
-# time than any task its predecessor had already claimed. The bash wrapper and
-# tmux lines also contain the claude argv, so exclude them (they carry
-# 'while true' / 'tmux'). Non-claude agents (codex/grok/agy/opencode) won't
-# match → empty → the restart-reclaim rule simply doesn't apply to them.
+# PID of this agent's live inner `claude` process, or empty if not found. This is
+# the `claude` the `while true; do claude; ...` wrapper respawns. The bash wrapper
+# and tmux lines also contain the claude argv, so exclude them (they carry
+# 'while true' / 'tmux'). Non-claude agents (codex/grok/agy/opencode) won't match
+# → empty, so both the restart-reclaim rule and the native idle probe simply
+# don't apply to them (callers fall back).
+_hb_claude_pid() {
+  local name="$1"
+  ps -u "agent-${name}" -o pid=,args= 2>/dev/null \
+    | awk '/\/claude .*--dangerously-skip-permissions/ && !/while +true/ && !/tmux/ {print $1; exit}'
+}
+
+# Epoch when this agent's live claude process started, or empty if not found. Its
+# start time is the agent's "session identity": a rotation, restart, crash, or
+# context reset that exits the process gives the replacement a newer start time
+# than any task its predecessor had already claimed.
 _hb_claude_started() {
   local name="$1" pid lstart
-  pid=$(ps -u "agent-${name}" -o pid=,args= 2>/dev/null \
-        | awk '/\/claude .*--dangerously-skip-permissions/ && !/while +true/ && !/tmux/ {print $1; exit}')
+  pid=$(_hb_claude_pid "$name")
   [[ -n "$pid" ]] || return 1
   lstart=$(ps -o lstart= -p "$pid" 2>/dev/null) || return 1
   [[ -n "$lstart" ]] || return 1
   date -d "$lstart" +%s 2>/dev/null || return 1
 }
 
-# Is the agent at rest right now? Sample its pane twice across a short gap: an
-# idle agent's pane is byte-identical and shows its input prompt; a working one
-# streams output / animates, so the two samples differ. Deliberately CLI-dumb
-# (no per-CLI spinner parsing). Exit: 0 = idle, 1 = working/active, 2 = unknown
-# (no pane / capture failed). Callers that must not clobber live work defer only
-# on a confident 1; reclaim-on-idle acts only on a confident 0.
+# Native run-state for a claude agent via `claude agents --json` (CC ≥2.1.162).
+# Far more reliable than scraping the tmux pane, and it distinguishes a genuine
+# block (a permission prompt / dialog / input-needed) from working vs idle — a
+# distinction the pane-scrape can't make. We match the JSON entry by the agent's
+# inner-claude PID so dispatched background sub-agents in the same list are
+# ignored, and read that one session's status:
+#   idle    -> "idle"            (at rest, no turn in flight)
+#   busy    -> "busy"            (a turn is actively running)
+#   waiting -> "blocked:<reason>" (waiting on a permission prompt / worker
+#              request / sandbox request / dialog / input — surface, don't reclaim)
+# Echoes that word and returns 0 on a definite reading; returns 1 (echoes
+# nothing) when the signal is unavailable — non-claude CLI, claude not running,
+# the binary is missing, or no matching session — so callers fall back to the
+# pane-scrape probe. Runs as the agent's own user (its sessions live under that
+# user's ~/.claude); the heartbeat tick runs as root, so the sudo is non-interactive.
+_hb_agent_native_state() {
+  local name="$1" pid bin out st wf
+  pid=$(_hb_claude_pid "$name"); [[ -n "$pid" ]] || return 1
+  bin="/home/agent-${name}/.local/bin/claude"
+  [[ -x "$bin" ]] || return 1
+  out=$(sudo -n -u "agent-${name}" "$bin" agents --json 2>/dev/null) || return 1
+  [[ -n "$out" ]] || return 1
+  st=$(jq -r --argjson p "$pid" '.[] | select(.pid==$p) | .status // empty' <<<"$out" 2>/dev/null) || return 1
+  [[ -n "$st" ]] || return 1
+  if [[ "$st" == "waiting" ]]; then
+    wf=$(jq -r --argjson p "$pid" '.[] | select(.pid==$p) | .waitingFor // "input needed"' <<<"$out" 2>/dev/null)
+    printf 'blocked:%s' "${wf:-input needed}"; return 0
+  fi
+  printf '%s' "$st"; return 0
+}
+
+# Is the agent at rest right now? Prefer the native `claude agents --json` signal
+# (reliable, and it can tell a *blocked* agent apart from a working one); fall
+# back to the dumb pane-scrape for non-claude CLIs or when the native signal is
+# unavailable. Pane-scrape: sample the pane twice across a short gap — an idle
+# agent's pane is byte-identical and shows its input prompt; a working one streams
+# output / animates, so the two samples differ.
+#
+# Exit: 0 = idle, 1 = working/active, 2 = unknown (no signal), 3 = blocked
+# (waiting on a permission prompt / dialog / input — native-only). When it
+# returns 3 it also sets _HB_IDLE_REASON to the block reason for the caller to
+# surface. Callers that must not clobber live work defer on 1 OR 3; reclaim-on-idle
+# acts only on a confident 0 (a blocked agent is not idle, so it is never reclaimed).
+_HB_IDLE_REASON=""
 _hb_agent_idle() {
   local name="$1" gap="${2:-$_HB_IDLE_SAMPLE_SEC}"
+  _HB_IDLE_REASON=""
+  # Native signal first — when present it is authoritative and needs no sampling.
+  local native; native=$(_hb_agent_native_state "$name") || native=""
+  case "$native" in
+    idle)       return 0 ;;
+    busy)       return 1 ;;
+    blocked:*)  _HB_IDLE_REASON="${native#blocked:}"; return 3 ;;
+  esac
+  # Fallback: pane-scrape (codex/grok/agy/opencode, or native unavailable).
   local user="agent-${name}" a b
   a=$(sudo -u "$user" tmux capture-pane -p -t "agent-${name}" 2>/dev/null) || return 2
   [[ -n "$a" ]] || return 2
@@ -10421,13 +10475,19 @@ cmd_heartbeat_tick() {
       fi
     fi
 
-    # No-clobber: never /clear + nudge an agent that's mid-turn or in a live
-    # conversation (e.g. the orchestrator talking to a human). The busy-guard
-    # above only catches an open *task*; this catches working/interactive state
-    # with no task — a fresh nudge would /clear it out from under the work.
-    # Defer only on a confident "active" (rc 1); unknown (rc 2 — no pane) falls
-    # through so the wake can still (re)start a stopped session.
+    # No-clobber: never /clear + nudge an agent that's mid-turn, in a live
+    # conversation (e.g. the orchestrator talking to a human), or blocked on a
+    # prompt. The busy-guard above only catches an open *task*; this catches
+    # working/interactive/blocked state with no task — a fresh nudge would /clear
+    # it out from under the work or bury a pending permission prompt. Defer on a
+    # confident "active" (rc 1) or "blocked" (rc 3); unknown (rc 2 — no signal)
+    # falls through so the wake can still (re)start a stopped session.
     local idle_rc=0; _hb_agent_idle "$name" || idle_rc=$?
+    if (( idle_rc == 3 )); then
+      sk_active=$((sk_active + 1))
+      _hb_log "[$name] WARN: blocked (${_HB_IDLE_REASON:-input needed}) — surfacing, defer nudge this tick (needs attention, not reclaim)"
+      continue
+    fi
     if (( idle_rc == 1 )); then
       sk_active=$((sk_active + 1)); _hb_log "[$name] active (mid-turn/conversation) — defer nudge this tick"; continue
     fi

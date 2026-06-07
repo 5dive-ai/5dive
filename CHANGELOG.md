@@ -9,6 +9,28 @@ release.
 
 ## [Unreleased]
 
+## [0.1.67] — 2026-06-07
+
+### Changed
+
+- Heartbeat idle/blocked detection now uses the native `claude agents --json`
+  signal (CC ≥2.1.162) instead of only scraping the tmux pane (DIVE-132).
+  `_hb_agent_idle` consults `claude agents --json` first — matching the agent's
+  inner-claude PID so dispatched background sub-agents are ignored — and reads
+  that session's `status`: `idle` → idle, `busy` → working, `waiting` →
+  **blocked** (with the `waitingFor` reason: permission prompt / worker request /
+  sandbox request / dialog / input needed). This is more reliable than the
+  byte-identical-pane heuristic and, crucially, distinguishes an agent **blocked
+  on a prompt** (which should be surfaced/unblocked, not reclaimed) from one
+  genuinely working from one idle. The pane-scrape remains as the fallback for
+  non-claude CLIs (codex/grok/agy/opencode) and whenever the native signal is
+  unavailable (claude not running, binary missing, no matching session). The
+  no-clobber gate in the tick now defers on a blocked reading too and logs a WARN
+  surfacing the block reason, so a wedged permission prompt is visible in the
+  heartbeat log rather than silently deferred. New exit code `3` (blocked) and
+  `_HB_IDLE_REASON` carry the distinction; idle-stall reclaim still fires only on
+  a confident idle (rc 0), so a blocked agent is never reclaimed.
+
 ## [0.1.66] — 2026-06-07
 
 ### Added
