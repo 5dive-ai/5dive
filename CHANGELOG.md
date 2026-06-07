@@ -9,6 +9,23 @@ release.
 
 ## [Unreleased]
 
+## [0.1.61] — 2026-06-07
+
+### Added
+
+- Recurring tasks, step 1 (data model + create path). Tasks gain a `kind`
+  column (`'standard'` default | `'recurring'`) plus `schedule` (a 5-field cron
+  expression) and `last_fired_at`. A `kind='recurring'` row is a **template**,
+  not work: it's excluded from `task ls`, the heartbeat TODO count + wake, and
+  the human inbox, so it's never picked up directly.
+  - `task add --recurring="<cron>"` (alias `--schedule=`) creates a template;
+    the cron expression is shape-validated and `--recurring` + `--parent` is
+    rejected.
+  - `task ls --recurring` lists templates with their schedule + last-fired.
+  - Migration is additive (existing rows backfill to `'standard'`), zero risk.
+  - Not yet wired: the materializer that clones a template into a todo on
+    schedule (step 2) and dashboard CRUD (step 3).
+
 ## [0.1.60] — 2026-06-07
 
 ### Fixed

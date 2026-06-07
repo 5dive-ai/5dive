@@ -80,7 +80,17 @@ CREATE TABLE IF NOT EXISTS tasks (
   ask              TEXT,
   need_options     TEXT,
   need_answer      TEXT,
-  need_answered_at TEXT
+  need_answered_at TEXT,
+  -- Recurring task templates (DIVE step 1). kind='recurring' marks a row as a
+  -- TEMPLATE, not work: it's excluded from the work board, the heartbeat TODO
+  -- count + wake, and the human inbox, so it's never picked up directly.
+  -- `schedule` is a 5-field cron expression; the step-2 materializer clones the
+  -- template into a fresh kind='standard' todo when due and stamps
+  -- last_fired_at. Ordinary tasks are kind='standard' (the default) with both
+  -- schedule + last_fired_at NULL.
+  kind             TEXT NOT NULL DEFAULT 'standard',
+  schedule         TEXT,
+  last_fired_at    TEXT
 );
 
 CREATE TABLE IF NOT EXISTS task_deps (
@@ -120,7 +130,7 @@ CREATE VIEW IF NOT EXISTS task_board AS
   SELECT ident, status, priority, COALESCE(assignee,'-') AS assignee,
          title, COALESCE(created_by,'-') AS created_by, created_at, id
   FROM tasks
-  WHERE status NOT IN ('done','cancelled')
+  WHERE status NOT IN ('done','cancelled') AND kind = 'standard'
   ORDER BY CASE priority
              WHEN 'urgent' THEN 0 WHEN 'high' THEN 1
              WHEN 'medium' THEN 2 ELSE 3 END,
@@ -174,7 +184,8 @@ _tasks_db_migrate() {
   # Each entry: "<column> <type>". Add new additive columns here; existing
   # rows backfill to NULL. Pure expand (no contract), so old queries/rows are
   # untouched and a downgrade still reads/writes the table fine.
-  for c in 'result TEXT' 'need_type TEXT' 'ask TEXT' 'need_options TEXT' 'need_answer TEXT' 'need_answered_at TEXT'; do
+  for c in 'result TEXT' 'need_type TEXT' 'ask TEXT' 'need_options TEXT' 'need_answer TEXT' 'need_answered_at TEXT' \
+           "kind TEXT NOT NULL DEFAULT 'standard'" 'schedule TEXT' 'last_fired_at TEXT'; do
     if ! printf '%s\n' "$cols" | grep -qx "${c%% *}"; then
       sqlite3 -cmd ".timeout 5000" "$TASKS_DB" \
         "ALTER TABLE tasks ADD COLUMN ${c};" >/dev/null 2>&1 || true
@@ -234,6 +245,23 @@ task_actor() {
 valid_task_status()   { [[ "$1" =~ ^(todo|in_progress|blocked|done|cancelled)$ ]]; }
 valid_task_priority() { [[ "$1" =~ ^(low|medium|high|urgent)$ ]]; }
 valid_need_type()     { [[ "$1" =~ ^(decision|secret|approval|manual)$ ]]; }
+
+# Shape-check a 5-field cron expression (minute hour dom month dow). This is a
+# lightweight gate at create time — exactly five whitespace-separated fields,
+# each built only from cron field chars ([0-9*,/-]). It does NOT validate ranges
+# (e.g. minute 0-59); the step-2 materializer / system cron is the authority on
+# semantics. Rejects obvious garbage so a typo can't silently store a never-
+# firing template.
+valid_cron_expr() {
+  local expr="$1"
+  read -r -a _cf <<<"$expr"
+  [[ ${#_cf[@]} -eq 5 ]] || return 1
+  local f
+  for f in "${_cf[@]}"; do
+    [[ "$f" =~ ^[0-9*,/-]+$ ]] || return 1
+  done
+  return 0
+}
 
 # Indent every line of stdin by two spaces. Used for the nested lists in
 # `task show` / `org show`; a plain `printf '  %s\n' "$var"` only indents the

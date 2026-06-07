@@ -175,7 +175,7 @@ cmd_heartbeat_ls() {
     # capture its stdout directly — a `|| echo` here would append a second word.
     running=$(systemctl is-active "5dive-agent@${name}.service" 2>/dev/null || true)
     [[ -n "$running" ]] || running="unknown"
-    todo=$(db "SELECT COUNT(*) FROM tasks WHERE assignee=$(sqlq "$name") AND status='todo';" 2>/dev/null || echo 0)
+    todo=$(db "SELECT COUNT(*) FROM tasks WHERE assignee=$(sqlq "$name") AND status='todo' AND kind='standard';" 2>/dev/null || echo 0)
     # seconds until next eligible wake (0 = due now)
     nextIn=$(( lastRun + everyMin * 60 - now ))
     (( nextIn < 0 )) && nextIn=0
@@ -216,7 +216,7 @@ _hb_mark_run() {
   local reg; reg=$(registry_read)
   # Current todo ids for this agent, as a JSON number array, to prune the map.
   local todo_ids
-  todo_ids=$(db "SELECT id FROM tasks WHERE assignee=$(sqlq "$name") AND status='todo';" 2>/dev/null \
+  todo_ids=$(db "SELECT id FROM tasks WHERE assignee=$(sqlq "$name") AND status='todo' AND kind='standard';" 2>/dev/null \
              | jq -R 'select(length>0)|tonumber' | jq -cs '.' 2>/dev/null) || todo_ids=""
   [[ -n "$todo_ids" ]] || todo_ids="[]"
   reg=$(echo "$reg" | jq --arg n "$name" --argjson t "$now" --arg tid "$task_id" --argjson todo "$todo_ids" '
@@ -407,7 +407,7 @@ cmd_heartbeat_tick() {
       # text; strftime('%s') makes it an epoch comparable to lastRun.
       local hot
       hot=$(db "SELECT COUNT(*) FROM tasks
-                WHERE assignee=$(sqlq "$name") AND status='todo'
+                WHERE assignee=$(sqlq "$name") AND status='todo' AND kind='standard'
                   AND priority IN ('urgent','high')
                   AND CAST(strftime('%s', created_at) AS INTEGER) > ${lastRun};" 2>/dev/null || echo 0)
       if [[ "${hot:-0}" != "0" ]]; then
@@ -424,7 +424,7 @@ cmd_heartbeat_tick() {
     # Pick the single highest-priority todo and wake the agent against that exact
     # id — the /goal condition needs a concrete DIVE-N to evaluate reliably.
     local task_id
-    task_id=$(db "SELECT id FROM tasks WHERE assignee=$(sqlq "$name") AND status='todo'
+    task_id=$(db "SELECT id FROM tasks WHERE assignee=$(sqlq "$name") AND status='todo' AND kind='standard'
                   ORDER BY CASE priority WHEN 'urgent' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2 ELSE 3 END, id
                   LIMIT 1;" 2>/dev/null || echo "")
     if [[ -z "$task_id" ]]; then

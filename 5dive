@@ -26,7 +26,7 @@ esac
 
 # Bumped on every public release. `build.sh` checks this line exists; CI fails
 # the bundle-drift check if it's missing or empty.
-readonly FIVE_VERSION="0.1.60"
+readonly FIVE_VERSION="0.1.61"
 
 STATE_DIR="/var/lib/5dive"
 REGISTRY="${STATE_DIR}/agents.json"
@@ -2028,7 +2028,17 @@ CREATE TABLE IF NOT EXISTS tasks (
   ask              TEXT,
   need_options     TEXT,
   need_answer      TEXT,
-  need_answered_at TEXT
+  need_answered_at TEXT,
+  -- Recurring task templates (DIVE step 1). kind='recurring' marks a row as a
+  -- TEMPLATE, not work: it's excluded from the work board, the heartbeat TODO
+  -- count + wake, and the human inbox, so it's never picked up directly.
+  -- `schedule` is a 5-field cron expression; the step-2 materializer clones the
+  -- template into a fresh kind='standard' todo when due and stamps
+  -- last_fired_at. Ordinary tasks are kind='standard' (the default) with both
+  -- schedule + last_fired_at NULL.
+  kind             TEXT NOT NULL DEFAULT 'standard',
+  schedule         TEXT,
+  last_fired_at    TEXT
 );
 
 CREATE TABLE IF NOT EXISTS task_deps (
@@ -2068,7 +2078,7 @@ CREATE VIEW IF NOT EXISTS task_board AS
   SELECT ident, status, priority, COALESCE(assignee,'-') AS assignee,
          title, COALESCE(created_by,'-') AS created_by, created_at, id
   FROM tasks
-  WHERE status NOT IN ('done','cancelled')
+  WHERE status NOT IN ('done','cancelled') AND kind = 'standard'
   ORDER BY CASE priority
              WHEN 'urgent' THEN 0 WHEN 'high' THEN 1
              WHEN 'medium' THEN 2 ELSE 3 END,
@@ -2122,7 +2132,8 @@ _tasks_db_migrate() {
   # Each entry: "<column> <type>". Add new additive columns here; existing
   # rows backfill to NULL. Pure expand (no contract), so old queries/rows are
   # untouched and a downgrade still reads/writes the table fine.
-  for c in 'result TEXT' 'need_type TEXT' 'ask TEXT' 'need_options TEXT' 'need_answer TEXT' 'need_answered_at TEXT'; do
+  for c in 'result TEXT' 'need_type TEXT' 'ask TEXT' 'need_options TEXT' 'need_answer TEXT' 'need_answered_at TEXT' \
+           "kind TEXT NOT NULL DEFAULT 'standard'" 'schedule TEXT' 'last_fired_at TEXT'; do
     if ! printf '%s\n' "$cols" | grep -qx "${c%% *}"; then
       sqlite3 -cmd ".timeout 5000" "$TASKS_DB" \
         "ALTER TABLE tasks ADD COLUMN ${c};" >/dev/null 2>&1 || true
@@ -2182,6 +2193,23 @@ task_actor() {
 valid_task_status()   { [[ "$1" =~ ^(todo|in_progress|blocked|done|cancelled)$ ]]; }
 valid_task_priority() { [[ "$1" =~ ^(low|medium|high|urgent)$ ]]; }
 valid_need_type()     { [[ "$1" =~ ^(decision|secret|approval|manual)$ ]]; }
+
+# Shape-check a 5-field cron expression (minute hour dom month dow). This is a
+# lightweight gate at create time — exactly five whitespace-separated fields,
+# each built only from cron field chars ([0-9*,/-]). It does NOT validate ranges
+# (e.g. minute 0-59); the step-2 materializer / system cron is the authority on
+# semantics. Rejects obvious garbage so a typo can't silently store a never-
+# firing template.
+valid_cron_expr() {
+  local expr="$1"
+  read -r -a _cf <<<"$expr"
+  [[ ${#_cf[@]} -eq 5 ]] || return 1
+  local f
+  for f in "${_cf[@]}"; do
+    [[ "$f" =~ ^[0-9*,/-]+$ ]] || return 1
+  done
+  return 0
+}
 
 # Indent every line of stdin by two spaces. Used for the nested lists in
 # `task show` / `org show`; a plain `printf '  %s\n' "$var"` only indents the
@@ -8946,8 +8974,9 @@ _task_usage() {
   5dive task init                                    # one-time root bootstrap of the store
   5dive task add <title...> [--body=<text>] [--priority=low|medium|high|urgent]
                             [--assignee=<agent>] [--parent=<id|DIVE-N>] [--from=<who>]
-  5dive task ls [--status=<s>] [--assignee=<agent>] [--mine] [--all]
-                                                     # default: open tasks, priority-ordered
+                            [--recurring="<cron>"]  # recurring=template (5-field cron, e.g. "0 2 * * *")
+  5dive task ls [--status=<s>] [--assignee=<agent>] [--mine] [--all] [--recurring]
+                                                     # default: open tasks, priority-ordered; --recurring: templates
   5dive task show <id|DIVE-N>                        # full detail + subtasks + blockers
   5dive task assign <id|DIVE-N> <agent>
   5dive task start  <id|DIVE-N>                      # -> in_progress
@@ -8999,48 +9028,68 @@ cmd_task_init() {
 
 cmd_task_add() {
   tasks_db_init
-  local body="" priority="medium" assignee="" parent="" from=""
+  local body="" priority="medium" assignee="" parent="" from="" recurring=""
   local -a words=()
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      --body=*)     body="${1#*=}" ;;
-      --priority=*) priority="${1#*=}" ;;
-      --assignee=*) assignee="${1#*=}" ;;
-      --parent=*)   parent="${1#*=}" ;;
-      --from=*)     from="${1#*=}" ;;
-      --)           shift; words+=("$@"); break ;;
-      -*)           fail "$E_USAGE" "unknown flag: $1" ;;
-      *)            words+=("$1") ;;
+      --body=*)      body="${1#*=}" ;;
+      --priority=*)  priority="${1#*=}" ;;
+      --assignee=*)  assignee="${1#*=}" ;;
+      --parent=*)    parent="${1#*=}" ;;
+      --from=*)      from="${1#*=}" ;;
+      --recurring=*) recurring="${1#*=}" ;;
+      --schedule=*)  recurring="${1#*=}" ;;
+      --)            shift; words+=("$@"); break ;;
+      -*)            fail "$E_USAGE" "unknown flag: $1" ;;
+      *)             words+=("$1") ;;
     esac
     shift
   done
   local title="${words[*]:-}"
-  [[ -n "$title" ]] || fail "$E_USAGE" "usage: 5dive task add <title...> [--body=] [--priority=] [--assignee=] [--parent=]"
+  [[ -n "$title" ]] || fail "$E_USAGE" "usage: 5dive task add <title...> [--body=] [--priority=] [--assignee=] [--parent=] [--recurring=\"<cron>\"]"
   valid_task_priority "$priority" || fail "$E_VALIDATION" "bad priority '$priority' (low|medium|high|urgent)"
+  # --recurring=<cron> makes this a TEMPLATE (kind='recurring'), not a worked
+  # task — the step-2 materializer clones it into a standard todo on schedule.
+  # A template + an explicit --parent is nonsensical (instances are top-level),
+  # so reject the combo rather than store a confusing row.
+  local kind="standard" schedule_sql="NULL"
+  if [[ -n "$recurring" ]]; then
+    valid_cron_expr "$recurring" || fail "$E_VALIDATION" "bad --recurring '$recurring' (need a 5-field cron expr, e.g. \"0 2 * * *\")"
+    [[ -z "$parent" ]] || fail "$E_VALIDATION" "--recurring can't be combined with --parent (a template has no parent)"
+    kind="recurring"; schedule_sql=$(sqlq "$recurring")
+  fi
   local parent_sql="NULL"
   if [[ -n "$parent" ]]; then
     resolve_task_id "$parent"; parent_sql="$RESOLVED_TASK_ID"
   fi
   local creator; creator=$(task_actor "$from")
   local id
-  id=$(db "INSERT INTO tasks (title, body, priority, assignee, created_by, parent_id)
+  id=$(db "INSERT INTO tasks (title, body, priority, assignee, created_by, parent_id, kind, schedule)
            VALUES ($(sqlq "$title"), $(sqlq_or_null "$body"), $(sqlq "$priority"),
-                   $(sqlq_or_null "$assignee"), $(sqlq "$creator"), ${parent_sql});
+                   $(sqlq_or_null "$assignee"), $(sqlq "$creator"), ${parent_sql},
+                   $(sqlq "$kind"), ${schedule_sql});
            SELECT last_insert_rowid();")
-  ok "created DIVE-$id — $title" \
-     '{id:($i|tonumber), ident:("DIVE-"+$i), title:$t, priority:$p, assignee:$a, created_by:$c}' \
-     --arg i "$id" --arg t "$title" --arg p "$priority" --arg a "${assignee:-}" --arg c "$creator"
+  if [[ "$kind" == "recurring" ]]; then
+    ok "created recurring DIVE-$id (${recurring}) — $title" \
+       '{id:($i|tonumber), ident:("DIVE-"+$i), title:$t, priority:$p, assignee:$a, created_by:$c, kind:"recurring", schedule:$s}' \
+       --arg i "$id" --arg t "$title" --arg p "$priority" --arg a "${assignee:-}" --arg c "$creator" --arg s "$recurring"
+  else
+    ok "created DIVE-$id — $title" \
+       '{id:($i|tonumber), ident:("DIVE-"+$i), title:$t, priority:$p, assignee:$a, created_by:$c, kind:"standard"}' \
+       --arg i "$id" --arg t "$title" --arg p "$priority" --arg a "${assignee:-}" --arg c "$creator"
+  fi
 }
 
 cmd_task_ls() {
   tasks_db_init
-  local status="" assignee="" mine=0 all=0 from=""
+  local status="" assignee="" mine=0 all=0 from="" recurring=0
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --status=*)   status="${1#*=}" ;;
       --assignee=*) assignee="${1#*=}" ;;
       --mine)       mine=1 ;;
       --all)        all=1 ;;
+      --recurring)  recurring=1 ;;
       --from=*)     from="${1#*=}" ;;
       -*)           fail "$E_USAGE" "unknown flag: $1" ;;
       *)            fail "$E_USAGE" "unexpected arg: $1" ;;
@@ -9048,20 +9097,31 @@ cmd_task_ls() {
     shift
   done
   [[ $mine -eq 1 ]] && assignee=$(task_actor "$from")
-  local where="1=1"
-  if [[ -n "$status" ]]; then
-    valid_task_status "$status" || fail "$E_VALIDATION" "bad status '$status' (todo|in_progress|blocked|done|cancelled)"
-    where+=" AND status=$(sqlq "$status")"
-  elif [[ $all -ne 1 ]]; then
-    where+=" AND status NOT IN ('done','cancelled')"
+  # --recurring lists the TEMPLATES (kind='recurring') with their schedule;
+  # otherwise we list real work and always exclude templates (they're never
+  # worked directly, so they'd be noise in the board).
+  local where="1=1" order
+  if (( recurring )); then
+    where+=" AND kind='recurring'"
+    order="ORDER BY id"
+  else
+    where+=" AND kind='standard'"
+    if [[ -n "$status" ]]; then
+      valid_task_status "$status" || fail "$E_VALIDATION" "bad status '$status' (todo|in_progress|blocked|done|cancelled)"
+      where+=" AND status=$(sqlq "$status")"
+    elif [[ $all -ne 1 ]]; then
+      where+=" AND status NOT IN ('done','cancelled')"
+    fi
+    order="ORDER BY CASE priority WHEN 'urgent' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2 ELSE 3 END, created_at"
   fi
   [[ -n "$assignee" ]] && where+=" AND assignee=$(sqlq "$assignee")"
-  local order="ORDER BY CASE priority WHEN 'urgent' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2 ELSE 3 END, created_at"
   if (( JSON_MODE )); then
     local rows
-    rows=$(dbfmt -json "SELECT id, ident, title, status, priority, assignee, created_by, parent_id, created_at, done_at, body, result, need_type, ask, need_options, need_answer, need_answered_at FROM tasks WHERE ${where} ${order};")
+    rows=$(dbfmt -json "SELECT id, ident, title, status, priority, assignee, created_by, parent_id, created_at, done_at, body, result, need_type, ask, need_options, need_answer, need_answered_at, kind, schedule, last_fired_at FROM tasks WHERE ${where} ${order};")
     [[ -n "$rows" ]] || rows="[]"
     jq -cn --argjson r "$rows" '{ok:true, data:{tasks:$r}}'
+  elif (( recurring )); then
+    dbfmt -box "SELECT ident, schedule, COALESCE(assignee,'-') AS assignee, COALESCE(last_fired_at,'never') AS last_fired, title FROM tasks WHERE ${where} ${order};"
   else
     dbfmt -box "SELECT ident, status, priority, COALESCE(assignee,'-') AS assignee, title FROM tasks WHERE ${where} ${order};"
   fi
@@ -9853,7 +9913,7 @@ cmd_heartbeat_ls() {
     # capture its stdout directly — a `|| echo` here would append a second word.
     running=$(systemctl is-active "5dive-agent@${name}.service" 2>/dev/null || true)
     [[ -n "$running" ]] || running="unknown"
-    todo=$(db "SELECT COUNT(*) FROM tasks WHERE assignee=$(sqlq "$name") AND status='todo';" 2>/dev/null || echo 0)
+    todo=$(db "SELECT COUNT(*) FROM tasks WHERE assignee=$(sqlq "$name") AND status='todo' AND kind='standard';" 2>/dev/null || echo 0)
     # seconds until next eligible wake (0 = due now)
     nextIn=$(( lastRun + everyMin * 60 - now ))
     (( nextIn < 0 )) && nextIn=0
@@ -9894,7 +9954,7 @@ _hb_mark_run() {
   local reg; reg=$(registry_read)
   # Current todo ids for this agent, as a JSON number array, to prune the map.
   local todo_ids
-  todo_ids=$(db "SELECT id FROM tasks WHERE assignee=$(sqlq "$name") AND status='todo';" 2>/dev/null \
+  todo_ids=$(db "SELECT id FROM tasks WHERE assignee=$(sqlq "$name") AND status='todo' AND kind='standard';" 2>/dev/null \
              | jq -R 'select(length>0)|tonumber' | jq -cs '.' 2>/dev/null) || todo_ids=""
   [[ -n "$todo_ids" ]] || todo_ids="[]"
   reg=$(echo "$reg" | jq --arg n "$name" --argjson t "$now" --arg tid "$task_id" --argjson todo "$todo_ids" '
@@ -10085,7 +10145,7 @@ cmd_heartbeat_tick() {
       # text; strftime('%s') makes it an epoch comparable to lastRun.
       local hot
       hot=$(db "SELECT COUNT(*) FROM tasks
-                WHERE assignee=$(sqlq "$name") AND status='todo'
+                WHERE assignee=$(sqlq "$name") AND status='todo' AND kind='standard'
                   AND priority IN ('urgent','high')
                   AND CAST(strftime('%s', created_at) AS INTEGER) > ${lastRun};" 2>/dev/null || echo 0)
       if [[ "${hot:-0}" != "0" ]]; then
@@ -10102,7 +10162,7 @@ cmd_heartbeat_tick() {
     # Pick the single highest-priority todo and wake the agent against that exact
     # id — the /goal condition needs a concrete DIVE-N to evaluate reliably.
     local task_id
-    task_id=$(db "SELECT id FROM tasks WHERE assignee=$(sqlq "$name") AND status='todo'
+    task_id=$(db "SELECT id FROM tasks WHERE assignee=$(sqlq "$name") AND status='todo' AND kind='standard'
                   ORDER BY CASE priority WHEN 'urgent' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2 ELSE 3 END, id
                   LIMIT 1;" 2>/dev/null || echo "")
     if [[ -z "$task_id" ]]; then
