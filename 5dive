@@ -26,7 +26,7 @@ esac
 
 # Bumped on every public release. `build.sh` checks this line exists; CI fails
 # the bundle-drift check if it's missing or empty.
-readonly FIVE_VERSION="0.1.61"
+readonly FIVE_VERSION="0.1.62"
 
 STATE_DIR="/var/lib/5dive"
 REGISTRY="${STATE_DIR}/agents.json"
@@ -9416,13 +9416,20 @@ task_need_notify() {
   # matched access type (TASK_CH_TYPE) gates the tap-to-answer buttons below.
   _task_owner_channel || return 0
 
-  # One message. Dashboard is the primary CTA (DIVE-104 live); CLI is a power
-  # tail. Options line only for a decision that actually carries choices.
-  local text="🙋 [${ident}] needs you: ${ask}"
+  # One message. Blank lines separate the header / ask / options / footer so a
+  # long ask doesn't render as an unreadable wall on mobile. Dashboard is the
+  # primary CTA (DIVE-104 live); CLI is a power tail. Options are listed one per
+  # line (numbered to match the tap buttons) so long labels stay readable even
+  # when Telegram crops the button text.
+  local text="🙋 [${ident}] needs you"$'\n\n'"${ask}"
   if [[ "$need_type" == "decision" && -n "$options" ]]; then
-    text+=$'\n'"Options: ${options//|/ | }"
+    local opts_list
+    opts_list=$(printf '%s' "$options" | jq -Rr '
+      [ split("|")[] | gsub("^\\s+|\\s+$"; "") | select(length > 0) ]
+      | to_entries | map("  \(.key + 1). \(.value)") | join("\n")' 2>/dev/null) || opts_list=""
+    [[ -n "$opts_list" ]] && text+=$'\n\n'"Options:"$'\n'"${opts_list}"
   fi
-  text+=$'\n'"Answer in the dashboard (Needs you), or: 5dive task answer ${ident} --value=…"
+  text+=$'\n\n'"Answer in the dashboard (Needs you), or: 5dive task answer ${ident} --value=…"
 
   # DIVE-117 tap-to-answer buttons. GATED to type=claude — only the claude
   # plugin has the `tna:` callback_query handler today, so emitting buttons for
@@ -9440,12 +9447,23 @@ task_need_notify() {
   local reply_markup="" numid="${ident#DIVE-}"
   if [[ "$TASK_CH_TYPE" == claude ]]; then
     if [[ "$need_type" == "decision" && -n "$options" ]]; then
+      # Adaptive layout: greedily pack buttons onto a row up to a ~24-char width
+      # budget (max 3 per row), so SHORT options share a row while a LONG label
+      # breaks onto its own full-width row instead of being cropped. A single
+      # over-budget label still lands alone (we always seat the first button of
+      # an empty row). Index (to_entries .key) is the tna: payload, unchanged.
       reply_markup=$(printf '%s' "$options" | jq -Rc --arg id "$numid" '
         [ split("|")[] | gsub("^\\s+|\\s+$"; "") | select(length > 0) ] as $o
-        | if ($o | length) > 0
-          then {inline_keyboard: [[ $o | to_entries[]
-                 | {text: .value, callback_data: ("tna:" + $id + ":" + (.key|tostring))} ]]}
-          else empty end' 2>/dev/null) || reply_markup=""
+        | ($o | to_entries
+           | reduce .[] as $e ({rows: [], cur: [], w: 0};
+               ($e.value | length) as $len
+               | {text: $e.value, callback_data: ("tna:" + $id + ":" + ($e.key | tostring))} as $btn
+               | if (.cur | length) > 0 and ((.cur | length) >= 3 or (.w + $len + 2) > 24)
+                 then {rows: (.rows + [.cur]), cur: [$btn], w: $len}
+                 else {rows: .rows, cur: (.cur + [$btn]), w: (.w + $len + 2)}
+                 end)
+           | .rows + (if (.cur | length) > 0 then [.cur] else [] end)) as $kb
+        | if ($kb | length) > 0 then {inline_keyboard: $kb} else empty end' 2>/dev/null) || reply_markup=""
     elif [[ "$need_type" == "approval" ]]; then
       reply_markup='{"inline_keyboard":[[{"text":"✅ Approve","callback_data":"tna:'"${numid}"':approved"},{"text":"🚫 Deny","callback_data":"tna:'"${numid}"':denied"}]]}'
     fi

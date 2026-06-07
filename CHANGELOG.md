@@ -9,6 +9,19 @@ release.
 
 ## [Unreleased]
 
+## [0.1.62] — 2026-06-07
+
+### Fixed
+
+- "Needs you" Telegram message was hard to read and its tap buttons cropped.
+  Now: the message separates header / ask / options / footer with blank lines
+  (a long `ask` no longer renders as a wall), options are listed one per line
+  and numbered to match the buttons, and the tap buttons use an adaptive layout
+  — greedily packed up to a ~24-char width budget (max 3 per row) so short
+  options share a row while a long label breaks onto its own full-width row
+  instead of being truncated. Button index → `tna:` payload is unchanged, so
+  the plugin's tap-to-answer handler still resolves correctly.
+
 ## [0.1.61] — 2026-06-07
 
 ### Added
