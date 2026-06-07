@@ -26,7 +26,7 @@ esac
 
 # Bumped on every public release. `build.sh` checks this line exists; CI fails
 # the bundle-drift check if it's missing or empty.
-readonly FIVE_VERSION="0.1.64"
+readonly FIVE_VERSION="0.1.65"
 
 STATE_DIR="/var/lib/5dive"
 REGISTRY="${STATE_DIR}/agents.json"
@@ -6912,8 +6912,40 @@ wait_agent_input_ready() {
   return 1
 }
 
-# Inject a message into the agent's tmux session. Uses send-keys -l so the text
-# is literal (no tmux keybinding interpretation), followed by a separate Enter.
+# Inject a payload into the agent's tmux pane and SUBMIT it, robust against the
+# TUI's bracketed-paste handling (DIVE-147). A large/multiline `send-keys -l` is
+# absorbed by the TUI as a bracketed PASTE — the prompt shows
+# "❯ [Pasted text #N +M lines]" — and a single trailing Enter races into / is
+# swallowed by the paste, so the turn never starts and the message is SILENTLY
+# DROPPED (small single-paragraph nudges usually submit, which is why the bug is
+# size/linecount-correlated and intermittent). Strategy: type the body, pause so
+# the paste commits, send Enter, then CONFIRM the pane left the pasted-but-unsent
+# state — retrying the Enter a few times before giving up. Best-effort + bounded:
+# returns 0 once submission is confirmed (or there was no paste buffer to begin
+# with — small msgs / non-Claude TUIs that don't show the placeholder), 1 if it
+# still looks unsubmitted after retries. The "[Pasted text #" marker is Claude's
+# input-buffer rendering; other runtimes just fall through the fast path.
+inject_and_submit() {
+  local name="$1" payload="$2" user="agent-${name}" tries=0 pane
+  sudo -u "$user" tmux send-keys -t "agent-${name}" -l -- "$payload"
+  # Let the TUI finish ingesting the (possibly bracketed-paste) payload before the
+  # Enter, so the newline isn't bundled into the paste sequence.
+  sleep 0.3
+  while (( tries < 5 )); do
+    sudo -u "$user" tmux send-keys -t "agent-${name}" Enter
+    sleep 0.4
+    pane=$(sudo -u "$user" tmux capture-pane -p -t "agent-${name}" 2>/dev/null || true)
+    # Submitted once the unsubmitted-paste placeholder clears from the prompt.
+    # (We only re-send Enter while it's still showing, so a message that already
+    # submitted never gets stray extra Enters.)
+    grep -q '\[Pasted text #[0-9]' <<<"$pane" || return 0
+    tries=$((tries+1))
+  done
+  return 1
+}
+
+# Inject a message into the agent's tmux session. Uses inject_and_submit so the
+# text is delivered literally AND actually submitted (bracketed-paste safe).
 # Not exposed via /agents/exec: arbitrary text won't pass the API arg regex, so
 # this is CLI + direct-shelld only.
 cmd_send() {
@@ -7010,8 +7042,9 @@ cmd_send() {
     step "agent '$name' input prompt not detected after 45s — sending best-effort (may be lost if still booting)"
   fi
 
-  sudo -u "agent-${name}" tmux send-keys -t "agent-${name}" -l -- "$payload"
-  sudo -u "agent-${name}" tmux send-keys -t "agent-${name}" Enter
+  if ! inject_and_submit "$name" "$payload"; then
+    step "agent '$name': payload may not have submitted — pane still shows an unsent paste buffer after retries (large-paste submit race, DIVE-147)"
+  fi
 
   # Mirror the outbound into the sender's group chat (best-effort). Gated on a
   # real envelope: a raw/anonymous send has no sender identity to mirror under.
@@ -7106,8 +7139,9 @@ cmd_ask() {
     step "agent '$name' input prompt not detected after 45s — sending best-effort (may be lost if still booting)"
   fi
 
-  sudo -u "agent-${name}" tmux send-keys -t "agent-${name}" -l -- "$payload"
-  sudo -u "agent-${name}" tmux send-keys -t "agent-${name}" Enter
+  if ! inject_and_submit "$name" "$payload"; then
+    step "agent '$name': question may not have submitted — pane still shows an unsent paste buffer after retries (large-paste submit race, DIVE-147)"
+  fi
 
   # Mirror the outbound into the sender's group chat (best-effort). ask always
   # wraps, so there's always a sender identity to mirror under.

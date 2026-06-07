@@ -9,6 +9,20 @@ release.
 
 ## [Unreleased]
 
+## [0.1.65] — 2026-06-07
+
+### Fixed
+
+- `5dive agent send` / `agent ask` no longer silently drop large multi-line
+  payloads. A big `send-keys -l` is absorbed by the TUI as a bracketed paste
+  (`❯ [Pasted text #N]`) and a single trailing Enter raced into / was swallowed
+  by the paste, so the turn never started and the message vanished — intermittent
+  and size-correlated. New `inject_and_submit()` helper types the body, pauses so
+  the paste commits, sends Enter, then confirms the pane left the unsent-paste
+  state, retrying Enter up to 5x; if still unsubmitted it warns (`step`) instead
+  of falsely reporting success. Both `send` and `ask` route through it.
+  Live-proven on a throwaway agent (50-line paste submitted first Enter). (DIVE-147)
+
 ## [0.1.64] — 2026-06-07
 
 ### Changed
