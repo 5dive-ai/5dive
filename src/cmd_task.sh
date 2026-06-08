@@ -514,10 +514,13 @@ task_need_notify() {
     [[ -n "$opts_list" ]] && text+=$'\n\n'"Options:"$'\n'"${opts_list}"
   fi
 
-  # DIVE-117 tap-to-answer buttons. GATED to type=claude — only the claude
-  # plugin has the `tna:` callback_query handler today, so emitting buttons for
-  # codex/grok/antigravity would give those users dead taps. Parity (DIVE-118)
-  # flips the others on when their handlers land. Only finite-option gates get
+  # DIVE-117/118 tap-to-answer buttons. GATED to the plugin types whose `tna:`
+  # callback_query handler exists AND splits options byte-identically to this
+  # emit: claude, codex, grok, antigravity (DIVE-118 — parity verified against
+  # the actual handlers). opencode has no `tna:` handler yet, so it stays
+  # excluded to avoid dead taps; add it here when its handler lands. Explicit
+  # allowlist (not != "") so a future new plugin type never auto-emits dead
+  # taps. Only finite-option gates get
   # buttons: decision-with-options (index into need_options) and approval
   # (approved/denied). callback_data is `tna:<numericId>:<idx|approved|denied>`
   # — numeric id + index keeps it under Telegram's 64-byte cap; the value is
@@ -528,7 +531,7 @@ task_need_notify() {
   # it, which would 400 the whole message — see the text-fallback in
   # _mirror_post). If nothing survives the filter, emit no keyboard (plain text).
   local reply_markup="" numid="${ident#DIVE-}"
-  if [[ "$TASK_CH_TYPE" == claude ]]; then
+  if [[ "$TASK_CH_TYPE" =~ ^(claude|codex|grok|antigravity)$ ]]; then
     if [[ "$need_type" == "decision" && -n "$options" ]]; then
       # Adaptive layout: greedily pack buttons onto a row up to a ~24-char width
       # budget (max 3 per row), so SHORT options share a row while a LONG label
