@@ -300,8 +300,11 @@ cmd_task_unblock() {
   else
     db "DELETE FROM task_deps WHERE task_id=${tid};"
   fi
+  # Don't flip a still-pending human gate back to todo (DIVE-109): a task parked
+  # on a human has need_type set and need_answered_at NULL. Only edge-blocks clear here.
   db "UPDATE tasks SET status='todo'
       WHERE id=${tid} AND status='blocked'
+        AND (need_type IS NULL OR need_answered_at IS NOT NULL)
         AND NOT EXISTS (SELECT 1 FROM task_deps WHERE task_id=${tid});"
   ok "DIVE-$tid unblocked" '{task:($t|tonumber)}' --arg t "$tid"
 }
