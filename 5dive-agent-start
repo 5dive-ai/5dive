@@ -34,7 +34,7 @@ if [[ ! -d "$WORKDIR" ]] || ! test -r "$WORKDIR"; then
   WORKDIR="$DEFAULT_WORKDIR"
 fi
 
-# Pull in nvm so `codex` / `gemini` / other npm-global tools are on PATH.
+# Pull in nvm so `codex` / other npm-global tools are on PATH.
 # Agents run as agent-<name> but shared configs point to /home/claude, so we
 # source claude's nvm.sh (the agent user has no nvm of its own).
 export NVM_DIR="/home/claude/.nvm"
@@ -62,7 +62,6 @@ case "$TYPE" in
       *)       ARGS=(gateway run) ;;
     esac ;;
   codex)    BIN="/home/claude/.nvm/versions/node/v24/bin/codex"; ARGS=() ;;
-  gemini)   BIN="/home/claude/.nvm/versions/node/v24/bin/gemini"; ARGS=(--skip-trust --yolo) ;;
   opencode)
     # opencode's telegram bridge is a STANDALONE RELAY (telegram-opencode/
     # server.ts) — a THIRD run-model distinct from claude (--channels flag) and
@@ -553,41 +552,7 @@ elif isinstance(m, str):
   fi
 fi
 
-# Same shared/0600 problem as codex: gemini stores OAuth tokens in
-# ~/.gemini/oauth_creds.json (mode 0600), and there's no GEMINI_HOME env to
-# redirect — gemini reads $HOME/.gemini directly. So seed the agent's own
-# ~/.gemini/oauth_creds.json from the shared file via sudo (re-seeding only
-# when the shared copy is newer, e.g. after `5dive auth login gemini`).
-# We also pin settings.json's selectedType to "oauth-personal" so gemini
-# skips the auth-method picker on launch, matching the auth-login preseed.
-if [[ "$TYPE" == "gemini" ]]; then
-  AGENT_GEMINI_HOME="$HOME/.gemini"
-  install -d -m 700 "$AGENT_GEMINI_HOME"
-  # Profile-scoped login lands at $PROFILE_STATE_DIR/.gemini/oauth_creds.json
-  # — that's the path cmd_auth_start created via HOME=$PROFILE_STATE_DIR
-  # redirect (gemini reads $HOME/.gemini, no GEMINI_HOME). Default profile
-  # keeps the legacy shared /home/claude/.gemini layout.
-  SHARED_GEMINI_AUTH="${PROFILE_STATE_DIR:+$PROFILE_STATE_DIR/.gemini/oauth_creds.json}"
-  SHARED_GEMINI_AUTH="${SHARED_GEMINI_AUTH:-/home/claude/.gemini/oauth_creds.json}"
-  LOCAL_GEMINI_AUTH="$AGENT_GEMINI_HOME/oauth_creds.json"
-  if [[ -e "$SHARED_GEMINI_AUTH" ]] && { [[ ! -f "$LOCAL_GEMINI_AUTH" ]] || [[ "$SHARED_GEMINI_AUTH" -nt "$LOCAL_GEMINI_AUTH" ]]; }; then
-    TMP="$(mktemp -p "$AGENT_GEMINI_HOME" .creds.XXXXXX)"
-    if sudo -n cat "$SHARED_GEMINI_AUTH" > "$TMP" 2>/dev/null; then
-      chmod 600 "$TMP"
-      mv "$TMP" "$LOCAL_GEMINI_AUTH"
-    else
-      rm -f "$TMP"
-      echo "warn: could not seed gemini oauth_creds.json from $SHARED_GEMINI_AUTH" >&2
-    fi
-  fi
-  SETTINGS="$AGENT_GEMINI_HOME/settings.json"
-  (jq '. + {security: ((.security // {}) + {auth: ((.security.auth // {}) + {selectedType: "oauth-personal"})})}' "$SETTINGS" 2>/dev/null \
-    || echo '{"security":{"auth":{"selectedType":"oauth-personal"}}}') > "$SETTINGS.tmp" \
-    && mv "$SETTINGS.tmp" "$SETTINGS"
-  chmod 600 "$SETTINGS"
-fi
-
-# Same shared/0600 problem as gemini: antigravity (`agy`) stores its OAuth
+# Same shared/0600 problem as codex: antigravity (`agy`) stores its OAuth
 # token at ~/.gemini/antigravity-cli/antigravity-oauth-token (mode 0600). It
 # tries the OS keyring first but falls back to this file when dbus-launch is
 # absent — which it always is on our headless boxes (verified in agy's cli.log:
@@ -796,8 +761,6 @@ case "$TYPE" in
     STAGE_GUARD="export DISABLE_UPDATES=1 DISABLE_AUTOUPDATER=1; " ;;
   codex|opencode)
     UNSET_CREDS="CLAUDE_CODE_OAUTH_TOKEN ANTHROPIC_API_KEY GEMINI_API_KEY GOOGLE_API_KEY" ;;
-  gemini)
-    UNSET_CREDS="CLAUDE_CODE_OAUTH_TOKEN ANTHROPIC_API_KEY OPENAI_API_KEY" ;;
   hermes|openclaw)
     # OAuth via auth.json — no provider env vars belong here.
     UNSET_CREDS="CLAUDE_CODE_OAUTH_TOKEN ANTHROPIC_API_KEY OPENAI_API_KEY GEMINI_API_KEY GOOGLE_API_KEY" ;;
