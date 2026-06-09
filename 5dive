@@ -26,7 +26,7 @@ esac
 
 # Bumped on every public release. `build.sh` checks this line exists; CI fails
 # the bundle-drift check if it's missing or empty.
-readonly FIVE_VERSION="0.1.75"
+readonly FIVE_VERSION="0.1.76"
 
 STATE_DIR="/var/lib/5dive"
 REGISTRY="${STATE_DIR}/agents.json"
@@ -7903,6 +7903,13 @@ mirror_interagent_outbound() {
   local bot to_label
   bot=$(jq -r --arg n "$receiver" '.agents[$n].botUsername // empty' <<<"$reg" 2>/dev/null)
   if [[ -n "$bot" ]]; then to_label="@${bot}"; else to_label="@${receiver}"; fi
+
+  # DIVE-195: shared-bot (send-only) agents all post under ONE bot identity, so
+  # the intercom can't tell who sent it. Prepend the sender's name for those.
+  # Personal-bot agents post under their own bot (name + avatar), so leave clean.
+  if grep -q '^TELEGRAM_SEND_ONLY=1' "$token_file" 2>/dev/null; then
+    to_label="${invoker_name} to ${to_label}"
+  fi
 
   local max_chars="${MIRROR_MAX_BODY_CHARS:-800}"
   local body_disp overflow=""

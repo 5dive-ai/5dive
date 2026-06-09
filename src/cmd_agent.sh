@@ -3410,6 +3410,13 @@ mirror_interagent_outbound() {
   bot=$(jq -r --arg n "$receiver" '.agents[$n].botUsername // empty' <<<"$reg" 2>/dev/null)
   if [[ -n "$bot" ]]; then to_label="@${bot}"; else to_label="@${receiver}"; fi
 
+  # DIVE-195: shared-bot (send-only) agents all post under ONE bot identity, so
+  # the intercom can't tell who sent it. Prepend the sender's name for those.
+  # Personal-bot agents post under their own bot (name + avatar), so leave clean.
+  if grep -q '^TELEGRAM_SEND_ONLY=1' "$token_file" 2>/dev/null; then
+    to_label="${invoker_name} to ${to_label}"
+  fi
+
   local max_chars="${MIRROR_MAX_BODY_CHARS:-800}"
   local body_disp overflow=""
   if (( ${#trimmed} > max_chars )); then
