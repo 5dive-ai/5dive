@@ -26,7 +26,7 @@ esac
 
 # Bumped on every public release. `build.sh` checks this line exists; CI fails
 # the bundle-drift check if it's missing or empty.
-readonly FIVE_VERSION="0.1.74"
+readonly FIVE_VERSION="0.1.75"
 
 STATE_DIR="/var/lib/5dive"
 REGISTRY="${STATE_DIR}/agents.json"
@@ -7880,14 +7880,17 @@ mirror_interagent_outbound() {
   local thread_id
   thread_id=$(jq -r --arg g "$group_chat_id" '.groups[$g].message_thread_id // empty' "$access_file" 2>/dev/null)
 
-  # DIVE-195 intercom: if a fleet-level intercom topic is configured for this
-  # group, consolidate inter-agent chatter THERE instead of scattering it across
-  # each sender's own per-agent topic. Single source of truth = registry
-  # .intercomTopic {threadId, chatId}, written by `team-bot intercom`.
+  # DIVE-195 intercom: if a fleet intercom topic is set and this agent belongs to
+  # that group, consolidate inter-agent chatter into the intercom topic —
+  # overriding the first-sorted group picked above (an agent can be in several
+  # groups, including stale ones, so don't rely on keys[0] matching). Single
+  # source of truth = registry .intercomTopic {threadId, chatId}.
   local intercom_chat intercom_thread
   intercom_chat=$(jq -r '.intercomTopic.chatId // empty' <<<"$reg" 2>/dev/null)
   intercom_thread=$(jq -r '.intercomTopic.threadId // empty' <<<"$reg" 2>/dev/null)
-  if [[ -n "$intercom_thread" && "$intercom_chat" == "$group_chat_id" ]]; then
+  if [[ -n "$intercom_thread" ]] && \
+     jq -e --arg g "$intercom_chat" '(.groups // {}) | has($g)' "$access_file" >/dev/null 2>&1; then
+    group_chat_id="$intercom_chat"
     thread_id="$intercom_thread"
   fi
 
