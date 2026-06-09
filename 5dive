@@ -26,7 +26,7 @@ esac
 
 # Bumped on every public release. `build.sh` checks this line exists; CI fails
 # the bundle-drift check if it's missing or empty.
-readonly FIVE_VERSION="0.1.72"
+readonly FIVE_VERSION="0.1.73"
 
 STATE_DIR="/var/lib/5dive"
 REGISTRY="${STATE_DIR}/agents.json"
@@ -4508,8 +4508,20 @@ cmd_list() {
     local active sub
     active=$(systemctl is-active "$svc" 2>/dev/null || true)
     sub=$(systemctl is-enabled "$svc" 2>/dev/null || true)
-    enriched=$(jq -c --arg n "$name" --arg a "$active" --arg e "$sub" \
-      '.[$n] = {active: $a, enabled: $e}' <<<"$enriched")
+    # Surface bot-to-bot status (DIVE-161) so the dashboard can flag which agents
+    # can message bots outside the team — without N per-agent access fetches.
+    # It lives in the agent's access.json, not the registry; read it here (root).
+    local b2b="false" ltype lchan lsd
+    ltype=$(jq -r --arg n "$name" '.agents[$n].type' <<<"$reg")
+    lchan=$(jq -r --arg n "$name" '.agents[$n].channels' <<<"$reg")
+    if [[ "$lchan" == "telegram" ]]; then
+      lsd=$(_tg_access_state_dir "agent-${name}" "$ltype" 2>/dev/null || echo "")
+      if [[ -n "$lsd" && -f "$lsd/access.json" ]]; then
+        b2b=$(jq -r '.botToBot.enabled // false' "$lsd/access.json" 2>/dev/null || echo "false")
+      fi
+    fi
+    enriched=$(jq -c --arg n "$name" --arg a "$active" --arg e "$sub" --argjson b2b "$b2b" \
+      '.[$n] = {active: $a, enabled: $e, botToBotEnabled: $b2b}' <<<"$enriched")
   done
   local merged
   merged=$(jq -c --arg default_wd "$DEFAULT_WORKDIR" --argjson live "$enriched" '.agents | to_entries | map({
@@ -4523,7 +4535,8 @@ cmd_list() {
     heartbeat: (.value.heartbeat // null),
     createdAt: .value.createdAt,
     active: ($live[.key].active // "unknown"),
-    enabled: ($live[.key].enabled // "unknown")
+    enabled: ($live[.key].enabled // "unknown"),
+    botToBotEnabled: ($live[.key].botToBotEnabled // false)
   })' <<<"$reg")
   if (( JSON_MODE )); then
     echo "$merged" | jq -c '{ok:true, data: .}'
@@ -6952,9 +6965,10 @@ cmd_telegram_access_set() {
   # Validation + atomic write live in the same python step so a bad shape
   # exits non-zero before we touch the file. STATE is the agent's plugin
   # state dir; PATCH is the dashboard's proposed {dmPolicy, allowFrom,
-  # groups} blob. Unknown keys in the existing file (pending,
+  # groups, botToBot?} blob. Unknown keys in the existing file (pending,
   # mentionPatterns, replyToMode, textChunkLimit, chunkMode, ackReaction)
-  # survive the merge — only the three dashboard-owned keys are replaced.
+  # survive the merge — only the dashboard-owned keys are replaced, and
+  # botToBot (DIVE-161) only when the patch includes it.
   local script
   script=$(cat <<'PY'
 import json, os, re, sys, tempfile
@@ -6991,6 +7005,25 @@ for gid, gcfg in groups.items():
         if not isinstance(gallow, list) or not all(isinstance(s, str) and ID_RE.match(s) for s in gallow):
             bad(f"group '{gid}'.allowFrom must be an array of numeric-string ids")
 
+# botToBot (DIVE-161) is OPTIONAL — present only when the dashboard's bot-to-bot
+# section is in play. Shape mirrors the plugin's BotToBotConfig (botguard.ts):
+# {enabled:bool, allowFrom?:[bot username/id strings], maxPerMin?:int>0,
+# dedupeWindowMs?:int>=0}. Omitting the key leaves any existing config untouched.
+b2b = patch.get('botToBot')
+if b2b is not None:
+    if not isinstance(b2b, dict):
+        bad("botToBot must be an object")
+    if not isinstance(b2b.get('enabled'), bool):
+        bad("botToBot.enabled must be a boolean")
+    if 'allowFrom' in b2b:
+        ba = b2b['allowFrom']
+        if not isinstance(ba, list) or not all(isinstance(s, str) and s for s in ba):
+            bad("botToBot.allowFrom must be an array of non-empty strings (bot @usernames or ids)")
+    if 'maxPerMin' in b2b and not (isinstance(b2b['maxPerMin'], int) and not isinstance(b2b['maxPerMin'], bool) and b2b['maxPerMin'] > 0):
+        bad("botToBot.maxPerMin must be a positive integer")
+    if 'dedupeWindowMs' in b2b and not (isinstance(b2b['dedupeWindowMs'], int) and not isinstance(b2b['dedupeWindowMs'], bool) and b2b['dedupeWindowMs'] >= 0):
+        bad("botToBot.dedupeWindowMs must be a non-negative integer")
+
 os.makedirs(state, mode=0o700, exist_ok=True)
 path = os.path.join(state, 'access.json')
 
@@ -7003,6 +7036,8 @@ except FileNotFoundError:
 merged = dict(existing)
 for k in ('dmPolicy', 'allowFrom', 'groups'):
     merged[k] = patch[k]
+if b2b is not None:
+    merged['botToBot'] = b2b
 
 fd, tmp = tempfile.mkstemp(dir=state, prefix='.access.', suffix='.tmp')
 with os.fdopen(fd, 'w') as f:
