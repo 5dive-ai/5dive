@@ -283,6 +283,24 @@ main() {
           # Read-only getChat lookup against Telegram. Bot token stays
           # server-side; skip audit so handle probes don't spam the log.
           cmd_telegram_resolve_handle "$@" ;;
+        topic)
+          # DIVE-159 team-bot: get/set the agent's forum-topic mapping in the
+          # registry. get is read-only; set takes the registry lock internally.
+          [[ $# -gt 0 ]] || fail "$E_USAGE" "usage: 5dive agent topic get|set <name> [--thread-id=N --chat-id=N]"
+          local topiccmd="$1"; shift
+          case "$topiccmd" in
+            get) cmd_agent_topic_get "$@" ;;  # read-only, no audit
+            set)
+              AUDIT_CMD="agent topic set"; AUDIT_ARGS=("$@")
+              with_registry_lock cmd_agent_topic_set "$@" ;;
+            *) fail "$E_USAGE" "unknown topic command: $topiccmd" ;;
+          esac ;;
+        team-bot)
+          # DIVE-159: provision/inspect the customer's team group (personal-bot
+          # model — a forum topic per agent). status is read-only; provision
+          # writes access.json + registry teamTopic (registry lock taken inside).
+          AUDIT_CMD="agent team-bot"; AUDIT_ARGS=("$@")
+          cmd_agent_team_bot "$@" ;;
         install)
           AUDIT_CMD="agent install"; AUDIT_ARGS=("$@")
           cmd_install "$@" ;;   # no registry mutation; auditable install recipe

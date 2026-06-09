@@ -1531,6 +1531,295 @@ _persist_bot_username() {
     '.agents[$n].botUsername = $u' <<<"$reg" | registry_write
 }
 
+# DIVE-159 team-bot (decision A): the agent's forum topic in the shared team
+# supergroup. teamTopic.threadId is the Telegram message_thread_id; teamTopic.chatId
+# is the team supergroup id. Single source of truth — the provision createForumTopic
+# hook writes it; the single listener reads it to route inbound thread->agent.
+cmd_agent_topic_set() {
+  local name="" thread_id="" chat_id=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --thread-id=*) thread_id="${1#--thread-id=}" ;;
+      --chat-id=*)   chat_id="${1#--chat-id=}" ;;
+      -*) fail "$E_USAGE" "unknown flag: $1" ;;
+      *)  [[ -z "$name" ]] && name="$1" || fail "$E_USAGE" "extra arg: $1" ;;
+    esac
+    shift
+  done
+  [[ -n "$name" ]] || fail "$E_USAGE" "usage: 5dive agent topic set <name> --thread-id=N --chat-id=N"
+  [[ "$thread_id" =~ ^[0-9]+$ ]]  || fail "$E_VALIDATION" "--thread-id must be a positive integer"
+  [[ "$chat_id"   =~ ^-?[0-9]+$ ]] || fail "$E_VALIDATION" "--chat-id must be an integer (supergroup ids are negative)"
+  ensure_state
+  local reg
+  reg=$(registry_read)
+  jq -e --arg n "$name" '.agents[$n] != null' <<<"$reg" >/dev/null \
+    || fail "$E_NOT_FOUND" "no agent named '$name'"
+  jq --arg n "$name" --argjson th "$thread_id" --argjson ch "$chat_id" \
+    '.agents[$n].teamTopic = {threadId: $th, chatId: $ch}' <<<"$reg" | registry_write
+  ok "team topic set for $name (thread $thread_id in chat $chat_id)" \
+     '{agent:$n, threadId:$th, chatId:$ch}' \
+     --arg n "$name" --argjson th "$thread_id" --argjson ch "$chat_id"
+}
+
+cmd_agent_topic_get() {
+  local name=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -*) fail "$E_USAGE" "unknown flag: $1" ;;
+      *)  [[ -z "$name" ]] && name="$1" || fail "$E_USAGE" "extra arg: $1" ;;
+    esac
+    shift
+  done
+  [[ -n "$name" ]] || fail "$E_USAGE" "usage: 5dive agent topic get <name>"
+  ensure_state
+  local reg tt
+  reg=$(registry_read)
+  jq -e --arg n "$name" '.agents[$n] != null' <<<"$reg" >/dev/null \
+    || fail "$E_NOT_FOUND" "no agent named '$name'"
+  tt=$(jq -c --arg n "$name" '.agents[$n].teamTopic // null' <<<"$reg")
+  if (( JSON_MODE )); then
+    jq -cn --argjson d "$tt" '{ok:true, data:$d}'
+  else
+    [[ "$tt" == "null" ]] && echo "no team topic for $name" || echo "$tt"
+  fi
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# DIVE-159 — Team group setup (personal-bot model). Each telegram agent keeps
+# its OWN bot. The customer makes one Telegram group (Topics on) and adds each
+# agent's bot as admin. This command creates a forum topic per agent and binds
+# each agent's access.json so it replies ONLY in its own topic (no @mention),
+# while its private DM bot keeps working unchanged. No central listener.
+#
+#   5dive agent team-bot status    --group=<chat_id>             (read-only probe)
+#   5dive agent team-bot provision --group=<chat_id> [--owner=<user_id>]
+#
+# Per-agent status:
+#   ready       — bot is admin in the group and bound to its topic
+#   needs_add   — bot is not in the group yet (customer must add it)
+#   needs_admin — bot is in the group but not an admin (can't read messages)
+#   no_token    — no telegram bot token on file for the agent
+#   error       — a Telegram call failed (detail in `error`)
+# provision is idempotent: re-running re-uses an agent's existing topic.
+cmd_agent_team_bot() {
+  local sub="" group="" owner="" agents_filter=""
+  [[ $# -gt 0 ]] || fail "$E_USAGE" "usage: 5dive agent team-bot status|provision --group=<chat_id> [--owner=<user_id>]"
+  sub="$1"; shift
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --group=*) group="${1#--group=}" ;;
+      --owner=*) owner="${1#--owner=}" ;;
+      --agents=*) agents_filter="${1#--agents=}" ;;
+      -*) fail "$E_USAGE" "unknown flag: $1" ;;
+      *)  fail "$E_USAGE" "extra arg: $1" ;;
+    esac
+    shift
+  done
+  case "$sub" in status|provision) ;; *) fail "$E_USAGE" "unknown team-bot command: $sub (status|provision)" ;; esac
+  [[ "$group" =~ ^-?[0-9]+$ ]] || fail "$E_VALIDATION" "--group must be a Telegram chat id (negative for supergroups)"
+  [[ -z "$owner" || "$owner" =~ ^[0-9]+$ ]] || fail "$E_VALIDATION" "--owner must be a numeric Telegram user id"
+  ensure_state
+
+  # Build {agent: {token, type, stateDir, threadId}} for every eligible telegram
+  # agent. Token + state-dir resolution stays server-side; the dashboard only
+  # ever sees the resulting status, never a bot token.
+  local reg; reg=$(registry_read)
+  local agents_json="{}"
+  local name type token state_dir tt
+  while IFS= read -r name; do
+    [[ -n "$name" ]] || continue
+    if [[ -n "$agents_filter" ]] && [[ ",${agents_filter}," != *",${name},"* ]]; then continue; fi
+    type=$(jq -r --arg n "$name" '.agents[$n].type' <<<"$reg")
+    token=$(_team_bot_token "$name")
+    state_dir=$(_tg_access_state_dir "agent-${name}" "$type" 2>/dev/null || echo "")
+    tt=$(jq -c --arg n "$name" '.agents[$n].teamTopic // null' <<<"$reg")
+    agents_json=$(jq -c --arg n "$name" --arg tok "$token" --arg ty "$type" --arg sd "$state_dir" --argjson tt "$tt" \
+      '.[$n] = {token:$tok, type:$ty, stateDir:$sd, teamTopic:$tt}' <<<"$agents_json")
+  done < <(_team_bot_agent_list)
+
+  [[ "$agents_json" != "{}" ]] || fail "$E_NOT_FOUND" "no telegram agents to add to a team group"
+
+  # Heavy lifting in Python: Telegram getMe/getChatMember/createForumTopic +
+  # atomic access.json merge (root writes then chowns to agent-<name>). Emits a
+  # results JSON array on stdout. teamTopic registry updates come back as a side
+  # channel (RESULTS_FILE) so we can persist them under the registry lock.
+  local team_token=""; [[ -r /etc/5dive/team-bot.token ]] && team_token=$(cat /etc/5dive/team-bot.token 2>/dev/null)
+  local reg_updates_file; reg_updates_file=$(mktemp)
+  local results
+  results=$(MODE="$sub" GROUP="$group" OWNER="$owner" AGENTS="$agents_json" TEAM_BOT_TOKEN="$team_token" REG_UPDATES_FILE="$reg_updates_file" python3 - <<'PY'
+import json, os, re, tempfile, pwd, urllib.parse, urllib.request
+
+MODE  = os.environ['MODE']
+GROUP = os.environ['GROUP']
+OWNER = os.environ.get('OWNER') or ''
+TEAM  = os.environ.get('TEAM_BOT_TOKEN') or ''
+AGENTS = json.loads(os.environ['AGENTS'])
+
+def tg(token, method, **params):
+    url = f"https://api.telegram.org/bot{token}/{method}"
+    data = urllib.parse.urlencode(params).encode()
+    try:
+        with urllib.request.urlopen(urllib.request.Request(url, data=data), timeout=15) as r:
+            return json.load(r)
+    except urllib.error.HTTPError as e:
+        try:
+            return json.load(e)
+        except Exception:
+            return {"ok": False, "description": f"HTTP {e.code}"}
+    except Exception as e:
+        return {"ok": False, "description": str(e)}
+
+# First pass: identify each bot + its membership; find a topic-manager bot.
+info = {}
+manager_token = None
+for name, a in AGENTS.items():
+    rec = {"agent": name, "status": "error", "botUsername": None, "threadId": None}
+    info[name] = rec
+    token = a.get("token") or ""
+    if not token:
+        rec["status"] = "no_token"; continue
+    me = tg(token, "getMe")
+    if not me.get("ok"):
+        rec["error"] = me.get("description", "getMe failed"); continue
+    bot_id = me["result"]["id"]
+    rec["botUsername"] = me["result"].get("username")
+    rec["_token"] = token
+    rec["_botId"] = bot_id
+    m = tg(token, "getChatMember", chat_id=GROUP, user_id=bot_id)
+    if not m.get("ok"):
+        # Not a member → Telegram returns ok:false ("user not found" / "chat not found").
+        rec["status"] = "needs_add"; continue
+    st = m["result"].get("status")
+    if st in ("administrator", "creator"):
+        rec["status"] = "admin_ok"  # provisional; topic binding decided below
+        # Only a bot that can actually manage topics qualifies as the topic
+        # creator (creators implicitly can, even without the flag set).
+        if (m["result"].get("can_manage_topics") or st == "creator") and manager_token is None:
+            manager_token = token
+    elif st in ("member", "restricted"):
+        rec["status"] = "needs_admin"
+    else:  # left / kicked
+        rec["status"] = "needs_add"
+
+# Fleet fallback: the shared team bot is the group's topic janitor (customers
+# have no such file — they rely on an agent bot with Manage Topics instead).
+if manager_token is None and TEAM:
+    me = tg(TEAM, "getMe")
+    if me.get("ok"):
+        mm = tg(TEAM, "getChatMember", chat_id=GROUP, user_id=me["result"]["id"])
+        if mm.get("ok") and mm["result"].get("status") in ("administrator", "creator") and mm["result"].get("can_manage_topics"):
+            manager_token = TEAM
+
+results = []
+reg_updates = {}  # name -> {threadId, chatId}
+for name, rec in info.items():
+    out = {"agent": rec["agent"], "botUsername": rec.get("botUsername"),
+           "status": rec["status"], "threadId": rec.get("threadId")}
+    if rec.get("error"): out["error"] = rec["error"]
+
+    if rec["status"] != "admin_ok":
+        # not bound; surface as-is (needs_add / needs_admin / no_token / error)
+        out["status"] = rec["status"] if rec["status"] != "admin_ok" else "ready"
+        results.append(out); continue
+
+    a = AGENTS[name]
+    existing = a.get("teamTopic") or {}
+    thread = existing.get("threadId") if existing.get("chatId") == int(GROUP) else None
+
+    if MODE == "status":
+        out["status"] = "ready" if thread else "needs_topic"
+        out["threadId"] = thread
+        results.append(out); continue
+
+    # provision: create the topic if missing, then wire access.json.
+    if not thread:
+        if not manager_token:
+            out["status"] = "error"; out["error"] = "no admin bot can manage topics"
+            results.append(out); continue
+        cf = tg(manager_token, "createForumTopic", chat_id=GROUP, name=name)
+        if not cf.get("ok"):
+            out["status"] = "error"; out["error"] = cf.get("description", "createForumTopic failed")
+            results.append(out); continue
+        thread = cf["result"]["message_thread_id"]
+
+    # Merge the group entry into the agent's access.json (root writes + chowns).
+    sd = a.get("stateDir") or ""
+    if sd:
+        path = os.path.join(sd, "access.json")
+        try:
+            acc = json.load(open(path)) if os.path.exists(path) else {}
+        except Exception:
+            acc = {}
+        acc.setdefault("dmPolicy", "pairing")
+        acc.setdefault("allowFrom", [])
+        acc.setdefault("groups", {})
+        acc.setdefault("pending", {})
+        entry = {"requireMention": False,
+                 "allowFrom": [OWNER] if OWNER else [],
+                 "message_thread_id": int(thread)}
+        acc["groups"][GROUP] = entry
+        os.makedirs(sd, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=sd)
+        with os.fdopen(fd, "w") as f:
+            json.dump(acc, f, indent=2)
+        try:
+            u = pwd.getpwnam("agent-" + name)
+            os.chown(tmp, u.pw_uid, u.pw_gid); os.chmod(tmp, 0o600)
+            os.replace(tmp, path); os.chown(path, u.pw_uid, u.pw_gid)
+        except KeyError:
+            os.replace(tmp, path)
+
+    reg_updates[name] = {"threadId": int(thread), "chatId": int(GROUP)}
+    out["status"] = "ready"; out["threadId"] = int(thread)
+    if rec.get("botUsername"):
+        out["topicLink"] = f"https://t.me/{rec['botUsername']}"  # opens the bot; topic deep-links are client-built
+    results.append(out)
+
+with open(os.environ.get("REG_UPDATES_FILE", "/dev/null"), "w") as f:
+    json.dump(reg_updates, f)
+
+print(json.dumps(results))
+PY
+)
+  local rc=$?
+  [[ $rc -eq 0 && -n "$results" ]] || fail "$E_GENERIC" "team-bot $sub failed"
+
+  # Persist teamTopic registry updates under the lock (provision only).
+  if [[ "$sub" == "provision" && -s "$reg_updates_file" ]]; then
+    with_registry_lock _team_bot_persist_topics "$reg_updates_file"
+  fi
+  rm -f "$reg_updates_file"
+
+  local ready total
+  ready=$(jq '[.[] | select(.status=="ready")] | length' <<<"$results")
+  total=$(jq 'length' <<<"$results")
+  ok "team-bot $sub: $ready/$total agents ready in group $group" \
+     '{group:$g, agents:$a}' --arg g "$group" --argjson a "$results"
+}
+
+# Helpers for cmd_agent_team_bot (kept module-local).
+_team_bot_agent_list() {
+  jq -r '.agents | to_entries[]
+    | select(.value.channels=="telegram")
+    | select(.value.type=="claude" or .value.type=="codex" or .value.type=="grok" or .value.type=="antigravity")
+    | .key' <<<"$(registry_read)"
+}
+_team_bot_token() {
+  sed -n 's/^TELEGRAM_BOT_TOKEN=//p' "${CONNECTORS_DIR}/telegram-${1}.env" 2>/dev/null | head -1
+}
+_team_bot_persist_topics() {
+  local updates_file="$1" reg
+  reg=$(registry_read)
+  reg=$(jq --slurpfile u "$updates_file" '
+    .agents as $a
+    | reduce ($u[0] | to_entries[]) as $e (.;
+        if .agents[$e.key] != null
+        then .agents[$e.key].teamTopic = $e.value
+        else . end)
+  ' <<<"$reg")
+  registry_write <<<"$reg"
+}
+
 # Read ~/.claude/channels/telegram/access.json for a claude-type agent. Used
 # by the dashboard's access-control modal to render the current allowlist /
 # groups / dmPolicy. Returns the parsed JSON in `data`. If the file doesn't
