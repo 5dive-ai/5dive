@@ -1602,23 +1602,33 @@ cmd_agent_topic_get() {
 #   error       — a Telegram call failed (detail in `error`)
 # provision is idempotent: re-running re-uses an agent's existing topic.
 cmd_agent_team_bot() {
-  local sub="" group="" owner="" agents_filter=""
-  [[ $# -gt 0 ]] || fail "$E_USAGE" "usage: 5dive agent team-bot status|provision --group=<chat_id> [--owner=<user_id>]"
+  local sub="" group="" owner="" agents_filter="" token=""
+  [[ $# -gt 0 ]] || fail "$E_USAGE" "usage: 5dive agent team-bot status|provision|shared --group=<chat_id> [--owner=<user_id>]"
   sub="$1"; shift
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --group=*) group="${1#--group=}" ;;
       --owner=*) owner="${1#--owner=}" ;;
       --agents=*) agents_filter="${1#--agents=}" ;;
+      --token=*) token="${1#--token=}" ;;
       -*) fail "$E_USAGE" "unknown flag: $1" ;;
       *)  fail "$E_USAGE" "extra arg: $1" ;;
     esac
     shift
   done
-  case "$sub" in status|provision) ;; *) fail "$E_USAGE" "unknown team-bot command: $sub (status|provision)" ;; esac
+  case "$sub" in status|provision|shared) ;; *) fail "$E_USAGE" "unknown team-bot command: $sub (status|provision|shared)" ;; esac
   [[ "$group" =~ ^-?[0-9]+$ ]] || fail "$E_VALIDATION" "--group must be a Telegram chat id (negative for supergroups)"
   [[ -z "$owner" || "$owner" =~ ^[0-9]+$ ]] || fail "$E_VALIDATION" "--owner must be a numeric Telegram user id"
   ensure_state
+
+  # `shared` = the shared-team-bot path for agents WITHOUT their own bot. The
+  # customer pastes ONE bot token; each selected no-bot agent gets a forum topic
+  # and runs the telegram plugin in send-only mode against that token, while a
+  # single listener routes inbound topic->agent. Self-contained handler.
+  if [[ "$sub" == "shared" ]]; then
+    _team_bot_do_shared "$group" "$owner" "$agents_filter" "$token"
+    return
+  fi
 
   # Build {agent: {token, type, stateDir, threadId}} for every eligible telegram
   # agent. Token + state-dir resolution stays server-side; the dashboard only
@@ -1629,6 +1639,9 @@ cmd_agent_team_bot() {
   while IFS= read -r name; do
     [[ -n "$name" ]] || continue
     if [[ -n "$agents_filter" ]] && [[ ",${agents_filter}," != *",${name},"* ]]; then continue; fi
+    # Skip agents wired send-only on the shared team bot — they're relayed, not
+    # personal-bot members, and surface in the `relay` list below instead.
+    if grep -q '^TELEGRAM_SEND_ONLY=1' "${CONNECTORS_DIR}/telegram-${name}.env" 2>/dev/null; then continue; fi
     type=$(jq -r --arg n "$name" '.agents[$n].type' <<<"$reg")
     token=$(_team_bot_token "$name")
     state_dir=$(_tg_access_state_dir "agent-${name}" "$type" 2>/dev/null || echo "")
@@ -1637,7 +1650,16 @@ cmd_agent_team_bot() {
       '.[$n] = {token:$tok, type:$ty, stateDir:$sd, teamTopic:$tt}' <<<"$agents_json")
   done < <(_team_bot_agent_list)
 
-  [[ "$agents_json" != "{}" ]] || fail "$E_NOT_FOUND" "no telegram agents to add to a team group"
+  # Relay list = agents WITHOUT a personal bot (or already wired send-only on the
+  # shared team bot). Computed from local state only (no Telegram calls) so the
+  # card can render the shared-bot section. status/provision both report it.
+  local relay; relay=$(_team_bot_relay_status "$group")
+
+  # Only error when there's nothing at all to show — no personal-bot agents AND
+  # no relay candidates. (A customer may have only no-bot agents.)
+  if [[ "$agents_json" == "{}" && "$relay" == "[]" ]]; then
+    fail "$E_NOT_FOUND" "no telegram agents to add to a team group"
+  fi
 
   # Heavy lifting in Python: Telegram getMe/getChatMember/createForumTopic +
   # atomic access.json merge (root writes then chowns to agent-<name>). Emits a
@@ -1794,7 +1816,7 @@ PY
   ready=$(jq '[.[] | select(.status=="ready")] | length' <<<"$results")
   total=$(jq 'length' <<<"$results")
   ok "team-bot $sub: $ready/$total agents ready in group $group" \
-     '{group:$g, agents:$a}' --arg g "$group" --argjson a "$results"
+     '{group:$g, agents:$a, relay:$r}' --arg g "$group" --argjson a "$results" --argjson r "$relay"
 }
 
 # Helpers for cmd_agent_team_bot (kept module-local).
@@ -1818,6 +1840,505 @@ _team_bot_persist_topics() {
         else . end)
   ' <<<"$reg")
   registry_write <<<"$reg"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# DIVE-159 — shared-team-bot path (agents WITHOUT their own bot).
+#
+# An agent with no personal Telegram bot can still live in the team group by
+# routing through ONE shared bot: the agent runs the telegram plugin in
+# send-only mode against the shared token (never polls — Telegram allows a
+# single getUpdates consumer per token), and a single listener daemon maps each
+# inbound topic message back to the right agent's relay-in/. This is the hybrid
+# completion of the personal-bot card: personal-bot agents join with their own
+# bot; no-bot agents route through the shared bot. The two never overlap.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Relay candidates = plugin-capable agents that either have NO personal bot
+# (channels != telegram) or are already wired send-only on the shared bot.
+# Echoes one agent name per line.
+_team_bot_relay_agent_list() {
+  local reg name ch
+  reg=$(registry_read)
+  while IFS= read -r name; do
+    [[ -n "$name" ]] || continue
+    if grep -q '^TELEGRAM_SEND_ONLY=1' "${CONNECTORS_DIR}/telegram-${name}.env" 2>/dev/null; then
+      echo "$name"; continue
+    fi
+    ch=$(jq -r --arg n "$name" '.agents[$n].channels // "none"' <<<"$reg")
+    [[ "$ch" != "telegram" ]] && echo "$name"
+  done < <(jq -r '.agents | to_entries[]
+    | select(.value.type=="claude" or .value.type=="codex" or .value.type=="grok" or .value.type=="antigravity")
+    | .key' <<<"$reg")
+}
+
+# Relay status array for the dashboard — local state only, no Telegram calls.
+# Per agent: "relayed" (wired send-only + topic bound to this group) or
+# "no_bot" (eligible, not yet relayed).
+_team_bot_relay_status() {
+  local group="$1" reg out name tt sendonly ttchat ttthread status threadId
+  reg=$(registry_read)
+  out="[]"
+  while IFS= read -r name; do
+    [[ -n "$name" ]] || continue
+    tt=$(jq -c --arg n "$name" '.agents[$n].teamTopic // null' <<<"$reg")
+    sendonly=0
+    grep -q '^TELEGRAM_SEND_ONLY=1' "${CONNECTORS_DIR}/telegram-${name}.env" 2>/dev/null && sendonly=1
+    status="no_bot"; threadId="null"
+    if [[ "$tt" != "null" ]]; then
+      ttchat=$(jq -r '.chatId' <<<"$tt")
+      ttthread=$(jq -r '.threadId' <<<"$tt")
+      if [[ "$ttchat" == "$group" && "$sendonly" == "1" ]]; then
+        status="relayed"; threadId="$ttthread"
+      fi
+    fi
+    out=$(jq -c --arg n "$name" --arg s "$status" --argjson th "$threadId" \
+      '. + [{agent:$n, status:$s, threadId:$th}]' <<<"$out")
+  done < <(_team_bot_relay_agent_list)
+  printf '%s' "$out"
+}
+
+# Force a relay agent's connector env to the shared token + send-only, preserving
+# any unrelated keys. root:claude 640 (same as install_channel writes).
+_team_bot_write_sendonly_env() {
+  local name="$1" token="$2" ef="${CONNECTORS_DIR}/telegram-${name}.env" tmp
+  mkdir -p "$CONNECTORS_DIR"
+  tmp=$(mktemp)
+  { printf 'TELEGRAM_BOT_TOKEN=%s\n' "$token"
+    printf 'TELEGRAM_SEND_ONLY=1\n'
+    [[ -f "$ef" ]] && grep -vE '^(TELEGRAM_BOT_TOKEN|TELEGRAM_SEND_ONLY)=' "$ef" 2>/dev/null
+  } > "$tmp"
+  chown root:claude "$tmp" 2>/dev/null || true
+  chmod 640 "$tmp"
+  mv "$tmp" "$ef"
+}
+
+# Persist channels=telegram + teamTopic for each relayed agent (under reg lock).
+_team_bot_persist_shared() {
+  local updates_file="$1" reg
+  reg=$(registry_read)
+  reg=$(jq --slurpfile u "$updates_file" '
+    .agents as $a
+    | reduce ($u[0] | to_entries[]) as $e (.;
+        if .agents[$e.key] != null
+        then .agents[$e.key].teamTopic = $e.value
+           | .agents[$e.key].channels = "telegram"
+        else . end)
+  ' <<<"$reg")
+  registry_write <<<"$reg"
+}
+
+# Resolve a bun binary usable by a root-run systemd unit. The listener has no
+# deps (raw fetch) so any bun works; prefer the system one, fall back to the
+# claude user's nvm/bun install.
+_team_bot_resolve_bun() {
+  local c
+  for c in /usr/local/bin/bun /home/claude/.bun/bin/bun; do
+    [[ -x "$c" ]] && { printf '%s' "$c"; return 0; }
+  done
+  c=$(sudo -u claude -i bash -lc 'command -v bun' 2>/dev/null | tail -1)
+  [[ -x "$c" ]] && { printf '%s' "$c"; return 0; }
+  printf '/usr/local/bin/bun'
+}
+
+# Install (idempotently) the single getUpdates consumer of the shared team bot.
+# The listener source is embedded so the CLI is self-contained on any box.
+_team_bot_install_listener() {
+  mkdir -p /opt/5dive
+  cat > /opt/5dive/team-bot-listener.ts <<'LISTENER_TS'
+#!/usr/bin/env bun
+/**
+ * 5dive team-bot listener (DIVE-159).
+ *
+ * The SINGLE getUpdates consumer of the shared team-bot token. Telegram allows
+ * exactly one getUpdates consumer per token — a second poller = 409 = dead
+ * channel for the whole fleet — so this runs as ONE systemd unit (Restart=on-
+ * failure, single instance) which structurally enforces the singleton.
+ *
+ * Flow: long-poll getUpdates -> for each message in a forum topic, map
+ * message_thread_id -> agent via the registry's teamTopic.threadId -> atomically
+ * drop a JSON inbound file into that agent's relay-in/. The agent's telegram
+ * plugin (TELEGRAM_SEND_ONLY=1) watches relay-in/, emits the normal channel
+ * notification, and replies into the topic via the shared token.
+ *
+ * No external deps (raw fetch) to keep this a tiny, self-contained unit.
+ */
+import { readFileSync, writeFileSync, mkdirSync, renameSync, chownSync } from 'fs'
+import { join } from 'path'
+import { execFileSync } from 'child_process'
+
+const TOKEN_FILE = process.env.TEAM_BOT_TOKEN_FILE ?? '/etc/5dive/team-bot.token'
+const REGISTRY = process.env.FIVE_REGISTRY ?? '/var/lib/5dive/agents.json'
+const OFFSET_FILE = process.env.TEAM_BOT_OFFSET_FILE ?? '/var/lib/5dive/team-bot.offset'
+const HOME_ROOT = process.env.AGENT_HOME_ROOT ?? '/home'
+const POLL_TIMEOUT = 30 // getUpdates long-poll seconds
+// Loop/abuse guard: cap inbound drops per agent within a sliding window.
+const RATE_MAX = 30
+const RATE_WINDOW_MS = 10_000
+
+const token = readFileSync(TOKEN_FILE, 'utf8').trim()
+if (!token) {
+  process.stderr.write('team-bot-listener: empty token at ' + TOKEN_FILE + '\n')
+  process.exit(1)
+}
+const API = `https://api.telegram.org/bot${token}`
+
+// Persisted update offset — a restart must never re-deliver. offset = last+1.
+function loadOffset(): number {
+  try {
+    return parseInt(readFileSync(OFFSET_FILE, 'utf8').trim(), 10) || 0
+  } catch {
+    return 0
+  }
+}
+function saveOffset(o: number): void {
+  const tmp = `${OFFSET_FILE}.tmp`
+  writeFileSync(tmp, String(o))
+  renameSync(tmp, OFFSET_FILE) // atomic
+}
+
+// thread_id -> agent name, rebuilt each poll from the registry (tiny file, cheap).
+function threadMap(): Map<number, string> {
+  const m = new Map<number, string>()
+  try {
+    const reg = JSON.parse(readFileSync(REGISTRY, 'utf8'))
+    for (const [name, a] of Object.entries<any>(reg.agents ?? {})) {
+      const t = a?.teamTopic?.threadId
+      if (typeof t === 'number') m.set(t, name)
+    }
+  } catch (e) {
+    process.stderr.write(`team-bot-listener: registry read failed: ${e}\n`)
+  }
+  return m
+}
+
+// Cache agent-<name> uid/gid so dropped files are owned by the agent (which runs
+// the plugin as agent-<name> and must read + delete them). Listener runs as root.
+const idCache = new Map<string, { uid: number; gid: number } | null>()
+function agentIds(agent: string): { uid: number; gid: number } | null {
+  if (idCache.has(agent)) return idCache.get(agent)!
+  let ids: { uid: number; gid: number } | null = null
+  try {
+    const user = `agent-${agent}`
+    const uid = parseInt(execFileSync('id', ['-u', user]).toString().trim(), 10)
+    const gid = parseInt(execFileSync('id', ['-g', user]).toString().trim(), 10)
+    if (uid > 0 && gid > 0) ids = { uid, gid }
+  } catch {}
+  idCache.set(agent, ids)
+  return ids
+}
+
+function relayInDir(agent: string): string {
+  return join(HOME_ROOT, `agent-${agent}`, '.claude', 'channels', 'telegram', 'relay-in')
+}
+
+// Sliding-window rate limit per agent.
+const hits = new Map<string, number[]>()
+function rateOk(agent: string, now: number): boolean {
+  const arr = (hits.get(agent) ?? []).filter(t => now - t < RATE_WINDOW_MS)
+  if (arr.length >= RATE_MAX) {
+    hits.set(agent, arr)
+    return false
+  }
+  arr.push(now)
+  hits.set(agent, arr)
+  return true
+}
+
+let dropSeq = 0
+function drop(agent: string, payload: Record<string, unknown>, now: number): void {
+  const dir = relayInDir(agent)
+  const ids = agentIds(agent)
+  try {
+    mkdirSync(dir, { recursive: true })
+    if (ids) chownSync(dir, ids.uid, ids.gid)
+  } catch {}
+  const id = `${now}-${process.pid}-${dropSeq++}`
+  const tmp = join(dir, `.${id}.tmp`)
+  const fin = join(dir, `${id}.json`)
+  // temp -> rename so the plugin watcher (reads only *.json) never sees a partial.
+  writeFileSync(tmp, JSON.stringify({ id, ...payload }))
+  try {
+    if (ids) chownSync(tmp, ids.uid, ids.gid)
+  } catch {}
+  renameSync(tmp, fin)
+}
+
+async function tg(method: string, params: Record<string, unknown>): Promise<any> {
+  const res = await fetch(`${API}/${method}`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(params),
+  })
+  return res.json()
+}
+
+let offset = loadOffset()
+process.stderr.write(`team-bot-listener: starting (offset=${offset})\n`)
+
+let shuttingDown = false
+for (const sig of ['SIGTERM', 'SIGINT'] as const) {
+  process.on(sig, () => {
+    shuttingDown = true
+    process.stderr.write('team-bot-listener: shutting down\n')
+    process.exit(0)
+  })
+}
+
+while (!shuttingDown) {
+  let data: any
+  try {
+    data = await tg('getUpdates', {
+      offset,
+      timeout: POLL_TIMEOUT,
+      allowed_updates: ['message'],
+    })
+  } catch (e) {
+    process.stderr.write(`team-bot-listener: getUpdates failed: ${e}\n`)
+    await new Promise(r => setTimeout(r, 3000))
+    continue
+  }
+  if (!data?.ok) {
+    process.stderr.write(`team-bot-listener: getUpdates not ok: ${JSON.stringify(data)}\n`)
+    await new Promise(r => setTimeout(r, 3000))
+    continue
+  }
+
+  const updates: any[] = data.result ?? []
+  if (updates.length === 0) continue
+
+  const map = threadMap()
+  const now = Date.now()
+  for (const u of updates) {
+    offset = Math.max(offset, u.update_id + 1)
+    const msg = u.message
+    if (!msg) continue
+    if (msg.from?.is_bot) continue
+    const threadId = msg.message_thread_id
+    if (threadId == null) continue
+    const agent = map.get(threadId)
+    if (!agent) continue
+    if (!rateOk(agent, now)) {
+      process.stderr.write(`team-bot-listener: rate-limited ${agent} (thread ${threadId})\n`)
+      continue
+    }
+    const text = msg.text ?? msg.caption ?? ''
+    drop(
+      agent,
+      {
+        chat_id: String(msg.chat.id),
+        message_thread_id: String(threadId),
+        message_id: String(msg.message_id),
+        content: text,
+        user: msg.from?.username ?? String(msg.from?.id ?? 'team'),
+        user_id: String(msg.from?.id ?? ''),
+        ts: new Date((msg.date ?? 0) * 1000).toISOString(),
+      },
+      now,
+    )
+  }
+  saveOffset(offset)
+}
+LISTENER_TS
+  chown root:root /opt/5dive/team-bot-listener.ts
+  chmod 644 /opt/5dive/team-bot-listener.ts
+
+  local bun_bin; bun_bin=$(_team_bot_resolve_bun)
+  cat > /etc/systemd/system/5dive-team-bot-listener.service <<UNIT
+[Unit]
+Description=5dive team-bot listener (DIVE-159 — single getUpdates consumer of the shared team bot)
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=root
+Group=root
+ExecStart=${bun_bin} /opt/5dive/team-bot-listener.ts
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+  systemctl daemon-reload >&2 2>/dev/null || true
+  systemctl enable 5dive-team-bot-listener.service >&2 2>/dev/null || true
+  # Restart picks up the (possibly updated) token + source. Singleton by unit.
+  systemctl restart 5dive-team-bot-listener.service >&2 2>/dev/null || true
+}
+
+# `5dive agent team-bot shared --group --token --agents [--owner]`
+# Relay the listed no-bot agents through one shared bot. Idempotent: re-running
+# reuses each agent's existing topic.
+_team_bot_do_shared() {
+  local group="$1" owner="$2" agents_filter="$3" token="$4"
+  [[ -n "$token" ]] || fail "$E_USAGE" "team-bot shared requires --token=<shared bot token>"
+  [[ "$token" =~ ^[0-9]+:[A-Za-z0-9_-]+$ ]] || fail "$E_VALIDATION" "--token does not look like a Telegram bot token"
+  [[ -n "$agents_filter" ]] || fail "$E_USAGE" "team-bot shared requires --agents=<name[,name...]>"
+
+  local reg; reg=$(registry_read)
+  local candidates; candidates=$(_team_bot_relay_agent_list)
+
+  # Resolve requested names against relay candidates — never touch a personal-bot
+  # agent or an unknown/unsupported one.
+  local targets_json="{}" name type sd tt
+  local -a req
+  IFS=',' read -ra req <<<"$agents_filter"
+  for name in "${req[@]}"; do
+    name="${name// /}"
+    [[ -n "$name" ]] || continue
+    grep -qxF "$name" <<<"$candidates" \
+      || fail "$E_VALIDATION" "agent '$name' is not a no-bot relay candidate (already has its own bot, unknown, or its type has no telegram plugin)"
+    type=$(jq -r --arg n "$name" '.agents[$n].type' <<<"$reg")
+    sd=$(_tg_access_state_dir "agent-${name}" "$type" 2>/dev/null || echo "")
+    tt=$(jq -c --arg n "$name" '.agents[$n].teamTopic // null' <<<"$reg")
+    targets_json=$(jq -c --arg n "$name" --arg ty "$type" --arg sd "$sd" --argjson tt "$tt" \
+      '.[$n]={type:$ty, stateDir:$sd, teamTopic:$tt}' <<<"$targets_json")
+  done
+  [[ "$targets_json" != "{}" ]] || fail "$E_NOT_FOUND" "no relay-eligible agents in --agents"
+
+  # 1) Persist the shared token (root-only) — the listener reads it from here.
+  mkdir -p /etc/5dive
+  ( umask 077; printf '%s\n' "$token" > /etc/5dive/team-bot.token )
+  chown root:root /etc/5dive/team-bot.token
+  chmod 600 /etc/5dive/team-bot.token
+
+  # 2) Telegram: verify the shared bot can manage topics, create a topic per
+  #    agent (reusing an existing one), and wire each access.json.
+  local reg_updates_file; reg_updates_file=$(mktemp)
+  local results
+  results=$(GROUP="$group" OWNER="$owner" TOKEN="$token" AGENTS="$targets_json" REG_UPDATES_FILE="$reg_updates_file" python3 - <<'PY'
+import json, os, tempfile, pwd, urllib.parse, urllib.request, urllib.error
+
+GROUP  = os.environ['GROUP']
+OWNER  = os.environ.get('OWNER') or ''
+TOKEN  = os.environ['TOKEN']
+AGENTS = json.loads(os.environ['AGENTS'])
+
+def tg(method, **params):
+    url = f"https://api.telegram.org/bot{TOKEN}/{method}"
+    data = urllib.parse.urlencode(params).encode()
+    try:
+        with urllib.request.urlopen(urllib.request.Request(url, data=data), timeout=15) as r:
+            return json.load(r)
+    except urllib.error.HTTPError as e:
+        try:
+            return json.load(e)
+        except Exception:
+            return {"ok": False, "description": f"HTTP {e.code}"}
+    except Exception as e:
+        return {"ok": False, "description": str(e)}
+
+def bail(status, **extra):
+    out = [dict(agent=n, status=status, threadId=None, **extra) for n in AGENTS]
+    with open(os.environ.get("REG_UPDATES_FILE", "/dev/null"), "w") as f:
+        f.write("{}")
+    print(json.dumps(out))
+    raise SystemExit(0)
+
+me = tg("getMe")
+if not me.get("ok"):
+    bail("error", error=me.get("description", "shared bot token invalid"))
+bot_id = me["result"]["id"]
+
+mm = tg("getChatMember", chat_id=GROUP, user_id=bot_id)
+ok_admin = (mm.get("ok") and mm["result"].get("status") in ("administrator", "creator")
+            and (mm["result"].get("can_manage_topics") or mm["result"].get("status") == "creator"))
+if not ok_admin:
+    bail("needs_shared_admin")
+
+results = []
+reg_updates = {}
+for name, a in AGENTS.items():
+    out = {"agent": name, "status": "error", "threadId": None}
+    existing = a.get("teamTopic") or {}
+    thread = existing.get("threadId") if existing.get("chatId") == int(GROUP) else None
+    if not thread:
+        cf = tg("createForumTopic", chat_id=GROUP, name=name)
+        if not cf.get("ok"):
+            out["error"] = cf.get("description", "createForumTopic failed")
+            results.append(out); continue
+        thread = cf["result"]["message_thread_id"]
+
+    sd = a.get("stateDir") or ""
+    if sd:
+        path = os.path.join(sd, "access.json")
+        try:
+            acc = json.load(open(path)) if os.path.exists(path) else {}
+        except Exception:
+            acc = {}
+        acc.setdefault("dmPolicy", "pairing")
+        acc.setdefault("allowFrom", [])
+        acc.setdefault("groups", {})
+        acc.setdefault("pending", {})
+        acc["groups"][GROUP] = {"requireMention": False,
+                                "allowFrom": [OWNER] if OWNER else [],
+                                "message_thread_id": int(thread)}
+        os.makedirs(sd, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=sd)
+        with os.fdopen(fd, "w") as f:
+            json.dump(acc, f, indent=2)
+        try:
+            u = pwd.getpwnam("agent-" + name)
+            os.chown(tmp, u.pw_uid, u.pw_gid); os.chmod(tmp, 0o600)
+            os.replace(tmp, path); os.chown(path, u.pw_uid, u.pw_gid)
+        except KeyError:
+            os.replace(tmp, path)
+
+    reg_updates[name] = {"threadId": int(thread), "chatId": int(GROUP)}
+    out["status"] = "relayed"; out["threadId"] = int(thread)
+    results.append(out)
+
+with open(os.environ.get("REG_UPDATES_FILE", "/dev/null"), "w") as f:
+    json.dump(reg_updates, f)
+print(json.dumps(results))
+PY
+)
+  local rc=$?
+  if [[ $rc -ne 0 || -z "$results" ]]; then rm -f "$reg_updates_file"; fail "$E_GENERIC" "team-bot shared failed"; fi
+
+  # 3) For each agent that got a topic: enable the telegram plugin (send-only)
+  #    + regenerate its systemd env with channels=telegram.
+  local -a wired
+  while IFS= read -r name; do [[ -n "$name" ]] && wired+=("$name"); done \
+    < <(jq -r '.[] | select(.status=="relayed") | .agent' <<<"$results")
+
+  local ef wd pf iso
+  for name in "${wired[@]}"; do
+    type=$(jq -r --arg n "$name" '.agents[$n].type' <<<"$reg")
+    step "Enabling telegram (send-only) for $name"
+    install_channel_for_agent "$type" telegram "$name" "$token" "" "" || true
+    _team_bot_write_sendonly_env "$name" "$token"
+    ef="${ENV_DIR}/${name}.env"
+    wd=$(sed -n 's/^AGENT_WORKDIR=//p' "$ef" 2>/dev/null | head -1)
+    pf=$(sed -n 's/^AGENT_AUTH_PROFILE=//p' "$ef" 2>/dev/null | head -1)
+    iso=$(sed -n 's/^AGENT_ISOLATION=//p' "$ef" 2>/dev/null | head -1); iso="${iso:-admin}"
+    write_agent_env "$name" "$type" telegram "$wd" "$pf" "$iso"
+  done
+
+  # 4) Persist channels=telegram + teamTopic (under the registry lock).
+  if [[ -s "$reg_updates_file" ]]; then
+    with_registry_lock _team_bot_persist_shared "$reg_updates_file"
+  fi
+  rm -f "$reg_updates_file"
+
+  # 5) Install + (re)start the single listener.
+  if [[ ${#wired[@]} -gt 0 ]]; then
+    _team_bot_install_listener
+  fi
+
+  # 6) Restart each wired agent so it loads the send-only plugin.
+  for name in "${wired[@]}"; do
+    step "Restarting 5dive-agent@${name}"
+    systemctl restart "5dive-agent@${name}.service" >&2 2>/dev/null || true
+  done
+
+  local ready total
+  ready=$(jq '[.[] | select(.status=="relayed")] | length' <<<"$results")
+  total=$(jq 'length' <<<"$results")
+  ok "team-bot shared: $ready/$total agents relayed in group $group" \
+     '{group:$g, relay:$a}' --arg g "$group" --argjson a "$results"
 }
 
 # Read ~/.claude/channels/telegram/access.json for a claude-type agent. Used
