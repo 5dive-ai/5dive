@@ -251,8 +251,20 @@ _task_status_cmd() {
   # --notify (done/cancel only): DM the paired human a one-line ✅/⚠️ summary so
   # autonomous queue work surfaces a finish line. Best-effort; never fails the
   # status write above.
+  #
+  # Suppress the DM for auto-materialized recurring tasks (from_template_id set):
+  # those are agent housekeeping the user never asked for per-occurrence — the
+  # daily recap, nightly sweeps, weekly cleanups — and pinging on every fire is
+  # the noise Mark flagged. Their result still lands on the record + the daily
+  # recap; only the redundant live ping is dropped. Manual/delegated closes
+  # (no template parent) still notify. Cheap single-column read, fail-open to
+  # "notify" so a DB hiccup never silently swallows a real finish line.
   if (( notify )) && [[ "$verb" == "done" || "$verb" == "cancel" ]]; then
-    _task_close_notify "DIVE-$id" "$verb" "$result" || true
+    local from_tmpl
+    from_tmpl=$(db "SELECT COALESCE(from_template_id,'') FROM tasks WHERE id=${id};" 2>/dev/null || echo "")
+    if [[ -z "$from_tmpl" ]]; then
+      _task_close_notify "DIVE-$id" "$verb" "$result" || true
+    fi
   fi
   ok "DIVE-$id $verb" '{id:($i|tonumber), status:$s}' --arg i "$id" --arg s "$newstatus"
 }
