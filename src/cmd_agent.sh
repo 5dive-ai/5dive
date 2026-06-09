@@ -3849,15 +3849,38 @@ cmd_clone() {
 }
 
 cmd_stats() {
-  local name=""
+  local name="" all=0
   while [[ $# -gt 0 ]]; do
     case "$1" in
+      --all) all=1 ;;
       -*) fail "$E_USAGE" "unknown flag: $1" ;;
       *)  [[ -z "$name" ]] && name="$1" || fail "$E_USAGE" "extra arg: $1" ;;
     esac
     shift
   done
-  [[ -n "$name" ]] || fail "$E_USAGE" "usage: 5dive agent stats <name> [--json]"
+
+  # Batched form: `stats --all` emits every agent's stats object in ONE
+  # invocation so the dashboard/mobile collapse N per-agent box execs into a
+  # single one (the box shell rate-limit is shared across all of a user's exec
+  # traffic, so N calls every few seconds trip it). Reuses the single-agent path
+  # per agent (no duplicated gather), JSON-only since it's a machine endpoint.
+  # (DIVE-206)
+  if (( all )); then
+    [[ -z "$name" ]] || fail "$E_USAGE" "stats --all takes no name"
+    local _reg _names _arr="[]" _n _d
+    _reg=$(registry_read)
+    _names=$(jq -r '.agents | keys[]' <<<"$_reg" 2>/dev/null || true)
+    for _n in $_names; do
+      # Subshell isolates the forced JSON_MODE; unwrap the single-agent `.data`.
+      _d=$(JSON_MODE=1; cmd_stats "$_n" 2>/dev/null | jq -c '.data' 2>/dev/null) || continue
+      [[ -n "$_d" && "$_d" != "null" ]] || continue
+      _arr=$(jq -c --argjson d "$_d" '. + [$d]' <<<"$_arr")
+    done
+    printf '{"ok":true,"data":%s}\n' "$_arr"
+    return 0
+  fi
+
+  [[ -n "$name" ]] || fail "$E_USAGE" "usage: 5dive agent stats <name> [--json] | stats --all --json"
   require_agent "$name"
 
   local reg

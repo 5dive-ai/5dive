@@ -26,7 +26,7 @@ esac
 
 # Bumped on every public release. `build.sh` checks this line exists; CI fails
 # the bundle-drift check if it's missing or empty.
-readonly FIVE_VERSION="0.1.76"
+readonly FIVE_VERSION="0.1.77"
 
 STATE_DIR="/var/lib/5dive"
 REGISTRY="${STATE_DIR}/agents.json"
@@ -333,7 +333,7 @@ declare -A OPENCLAW_PROVIDER_ID=(
 declare -A HERMES_PROVIDER_MODEL=(
   [anthropic]="claude-sonnet-4-5"
   [google]="gemini-2.0-flash"
-  [deepseek]="deepseek-chat"
+  [deepseek]="deepseek-v4-pro"
   [moonshot]="kimi-k2-turbo-preview"
   [openrouter]="openrouter/auto"
 )
@@ -341,7 +341,7 @@ declare -A OPENCLAW_PROVIDER_MODEL=(
   [openai]="openai/gpt-4o"
   [anthropic]="anthropic/claude-sonnet-4-5"
   [google]="google/gemini-2.0-flash"
-  [deepseek]="deepseek/deepseek-chat"
+  [deepseek]="deepseek/deepseek-v4-pro"
   [moonshot]="moonshot/kimi-k2-instruct"
   [openrouter]="openrouter/auto"
 )
