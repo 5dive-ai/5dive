@@ -1615,8 +1615,8 @@ cmd_agent_topic_get() {
 #   error       — a Telegram call failed (detail in `error`)
 # provision is idempotent: re-running re-uses an agent's existing topic.
 cmd_agent_team_bot() {
-  local sub="" group="" owner="" agents_filter="" token=""
-  [[ $# -gt 0 ]] || fail "$E_USAGE" "usage: 5dive agent team-bot status|provision|shared --group=<chat_id> [--owner=<user_id>]"
+  local sub="" group="" owner="" agents_filter="" token="" off=""
+  [[ $# -gt 0 ]] || fail "$E_USAGE" "usage: 5dive agent team-bot status|provision|shared|intercom --group=<chat_id> [--owner=<user_id>]"
   sub="$1"; shift
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -1624,12 +1624,13 @@ cmd_agent_team_bot() {
       --owner=*) owner="${1#--owner=}" ;;
       --agents=*) agents_filter="${1#--agents=}" ;;
       --token=*) token="${1#--token=}" ;;
+      --off) off=1 ;;
       -*) fail "$E_USAGE" "unknown flag: $1" ;;
       *)  fail "$E_USAGE" "extra arg: $1" ;;
     esac
     shift
   done
-  case "$sub" in status|provision|shared) ;; *) fail "$E_USAGE" "unknown team-bot command: $sub (status|provision|shared)" ;; esac
+  case "$sub" in status|provision|shared|intercom) ;; *) fail "$E_USAGE" "unknown team-bot command: $sub (status|provision|shared|intercom)" ;; esac
   [[ "$group" =~ ^-?[0-9]+$ ]] || fail "$E_VALIDATION" "--group must be a Telegram chat id (negative for supergroups)"
   [[ -z "$owner" || "$owner" =~ ^[0-9]+$ ]] || fail "$E_VALIDATION" "--owner must be a numeric Telegram user id"
   ensure_state
@@ -1640,6 +1641,15 @@ cmd_agent_team_bot() {
   # single listener routes inbound topic->agent. Self-contained handler.
   if [[ "$sub" == "shared" ]]; then
     _team_bot_do_shared "$group" "$owner" "$agents_filter" "$token"
+    return
+  fi
+
+  # `intercom` (DIVE-195) = one dedicated topic in the team group where all
+  # inter-agent chatter is mirrored (consolidated, not scattered per-agent).
+  # Creates the topic + records it; the mirror (mirror_interagent_outbound)
+  # then routes there. --off removes it.
+  if [[ "$sub" == "intercom" ]]; then
+    _team_bot_do_intercom "$group" "$off"
     return
   fi
 
@@ -1828,8 +1838,13 @@ PY
   local ready total
   ready=$(jq '[.[] | select(.status=="ready")] | length' <<<"$results")
   total=$(jq 'length' <<<"$results")
+  # Intercom topic (DIVE-195) for this group, if configured — so the card can
+  # show "intercom on" + a link.
+  local intercom
+  intercom=$(jq -c --arg g "$group" 'if (.intercomTopic.chatId|tostring) == $g then .intercomTopic else null end' <<<"$(registry_read)")
   ok "team-bot $sub: $ready/$total agents ready in group $group" \
-     '{group:$g, agents:$a, relay:$r}' --arg g "$group" --argjson a "$results" --argjson r "$relay"
+     '{group:$g, agents:$a, relay:$r, intercom:$ic}' \
+     --arg g "$group" --argjson a "$results" --argjson r "$relay" --argjson ic "$intercom"
 }
 
 # Helpers for cmd_agent_team_bot (kept module-local).
@@ -1938,6 +1953,127 @@ _team_bot_persist_shared() {
            | .agents[$e.key].channels = "telegram"
         else . end)
   ' <<<"$reg")
+  registry_write <<<"$reg"
+}
+
+# `5dive agent team-bot intercom --group=<id> [--off]` (DIVE-195)
+# Create (idempotent) one dedicated "intercom" topic in the team group + record
+# it fleet-wide in the registry as .intercomTopic, so mirror_interagent_outbound
+# consolidates all inter-agent chatter there. --off removes it.
+_team_bot_do_intercom() {
+  local group="$1" off="$2"
+  local reg; reg=$(registry_read)
+
+  if [[ "$off" == "1" ]]; then
+    local tt; tt=$(jq -c '.intercomTopic // null' <<<"$reg")
+    with_registry_lock _team_bot_clear_intercom
+    if [[ "$tt" != "null" ]]; then
+      local th tc team_token=""
+      th=$(jq -r '.threadId' <<<"$tt"); tc=$(jq -r '.chatId' <<<"$tt")
+      [[ -r /etc/5dive/team-bot.token ]] && team_token=$(cat /etc/5dive/team-bot.token 2>/dev/null)
+      [[ -n "$team_token" && -n "$th" ]] && \
+        curl -s "https://api.telegram.org/bot${team_token}/deleteForumTopic" \
+          -d chat_id="$tc" -d message_thread_id="$th" >/dev/null 2>&1 || true
+    fi
+    ok "intercom topic removed for group $group" '{group:$g, intercom:null}' --arg g "$group"
+    return
+  fi
+
+  # Idempotent: reuse an existing intercom topic already bound to THIS group.
+  local existing_chat existing_thread
+  existing_chat=$(jq -r '.intercomTopic.chatId // empty' <<<"$reg")
+  existing_thread=$(jq -r '.intercomTopic.threadId // empty' <<<"$reg")
+  if [[ -n "$existing_thread" && "$existing_chat" == "$group" ]]; then
+    ok "intercom topic already set (thread $existing_thread)" \
+       '{group:$g, intercom:{threadId:$th, chatId:($g|tonumber)}}' \
+       --arg g "$group" --argjson th "$existing_thread"
+    return
+  fi
+
+  # Find a topic-manager bot (an agent bot that is admin w/ can_manage_topics,
+  # or the team-bot fallback) and create the topic. Token resolution stays
+  # server-side; the dashboard only sees the resulting thread id.
+  local agents_json="{}" name tok
+  while IFS= read -r name; do
+    [[ -n "$name" ]] || continue
+    tok=$(_team_bot_token "$name")
+    [[ -n "$tok" ]] && agents_json=$(jq -c --arg n "$name" --arg t "$tok" '.[$n]=$t' <<<"$agents_json")
+  done < <(_team_bot_agent_list)
+  local team_token=""; [[ -r /etc/5dive/team-bot.token ]] && team_token=$(cat /etc/5dive/team-bot.token 2>/dev/null)
+
+  local reg_updates_file; reg_updates_file=$(mktemp)
+  local result
+  result=$(GROUP="$group" AGENTS="$agents_json" TEAM_BOT_TOKEN="$team_token" REG_UPDATES_FILE="$reg_updates_file" python3 - <<'PY'
+import json, os, urllib.parse, urllib.request, urllib.error
+
+GROUP = os.environ['GROUP']
+TEAM  = os.environ.get('TEAM_BOT_TOKEN') or ''
+AGENTS = json.loads(os.environ['AGENTS'])
+
+def tg(token, method, **p):
+    url = f"https://api.telegram.org/bot{token}/{method}"
+    data = urllib.parse.urlencode(p).encode()
+    try:
+        with urllib.request.urlopen(urllib.request.Request(url, data=data), timeout=15) as r:
+            return json.load(r)
+    except urllib.error.HTTPError as e:
+        try:
+            return json.load(e)
+        except Exception:
+            return {"ok": False, "description": f"HTTP {e.code}"}
+    except Exception as e:
+        return {"ok": False, "description": str(e)}
+
+def can_manage(tok):
+    me = tg(tok, "getMe")
+    if not me.get("ok"):
+        return False
+    m = tg(tok, "getChatMember", chat_id=GROUP, user_id=me["result"]["id"])
+    return (m.get("ok") and m["result"].get("status") in ("administrator", "creator")
+            and (m["result"].get("can_manage_topics") or m["result"].get("status") == "creator"))
+
+manager = None
+for name, tok in AGENTS.items():
+    if can_manage(tok):
+        manager = tok; break
+if manager is None and TEAM and can_manage(TEAM):
+    manager = TEAM
+if not manager:
+    print(json.dumps({"ok": False, "error": "no admin bot can manage topics in this group"})); raise SystemExit(0)
+
+cf = tg(manager, "createForumTopic", chat_id=GROUP, name="intercom")
+if not cf.get("ok"):
+    print(json.dumps({"ok": False, "error": cf.get("description", "createForumTopic failed")})); raise SystemExit(0)
+thread = cf["result"]["message_thread_id"]
+with open(os.environ.get("REG_UPDATES_FILE", "/dev/null"), "w") as f:
+    json.dump({"threadId": int(thread), "chatId": int(GROUP)}, f)
+print(json.dumps({"ok": True, "threadId": int(thread)}))
+PY
+)
+  local rc=$?
+  if [[ $rc -ne 0 || -z "$result" ]]; then rm -f "$reg_updates_file"; fail "$E_GENERIC" "team-bot intercom failed"; fi
+  if [[ "$(jq -r '.ok // false' <<<"$result")" != "true" ]]; then
+    local err; err=$(jq -r '.error // "intercom failed"' <<<"$result"); rm -f "$reg_updates_file"
+    fail "$E_GENERIC" "$err"
+  fi
+  with_registry_lock _team_bot_persist_intercom "$reg_updates_file"
+  rm -f "$reg_updates_file"
+  local thread; thread=$(jq -r '.threadId' <<<"$result")
+  ok "intercom topic created (thread $thread) in group $group" \
+     '{group:$g, intercom:{threadId:$th, chatId:($g|tonumber)}}' \
+     --arg g "$group" --argjson th "$thread"
+}
+
+_team_bot_persist_intercom() {
+  local updates_file="$1" reg upd
+  reg=$(registry_read)
+  upd=$(cat "$updates_file")
+  reg=$(jq --argjson u "$upd" '.intercomTopic = $u' <<<"$reg")
+  registry_write <<<"$reg"
+}
+_team_bot_clear_intercom() {
+  local reg; reg=$(registry_read)
+  reg=$(jq 'del(.intercomTopic)' <<<"$reg")
   registry_write <<<"$reg"
 }
 
@@ -3249,6 +3385,17 @@ mirror_interagent_outbound() {
   # instead of the supergroup's General channel.
   local thread_id
   thread_id=$(jq -r --arg g "$group_chat_id" '.groups[$g].message_thread_id // empty' "$access_file" 2>/dev/null)
+
+  # DIVE-195 intercom: if a fleet-level intercom topic is configured for this
+  # group, consolidate inter-agent chatter THERE instead of scattering it across
+  # each sender's own per-agent topic. Single source of truth = registry
+  # .intercomTopic {threadId, chatId}, written by `team-bot intercom`.
+  local intercom_chat intercom_thread
+  intercom_chat=$(jq -r '.intercomTopic.chatId // empty' <<<"$reg" 2>/dev/null)
+  intercom_thread=$(jq -r '.intercomTopic.threadId // empty' <<<"$reg" 2>/dev/null)
+  if [[ -n "$intercom_thread" && "$intercom_chat" == "$group_chat_id" ]]; then
+    thread_id="$intercom_thread"
+  fi
 
   local trimmed
   trimmed=$(printf '%s' "$body" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
