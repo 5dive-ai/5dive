@@ -2279,12 +2279,26 @@ for name, a in AGENTS.items():
         fd, tmp = tempfile.mkstemp(dir=sd)
         with os.fdopen(fd, "w") as f:
             json.dump(acc, f, indent=2)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+        # The plugin runs as the agent and must OWN its telegram state dir +
+        # create relay-in/ for the SEND_ONLY inbound watcher. os.makedirs above
+        # created any missing parents as root (no-bot agents have no prior
+        # telegram dir), so chown the tree + pre-make relay-in — otherwise the
+        # watcher trips on a root-owned dir at mkdirSync and never registers.
         try:
             u = pwd.getpwnam("agent-" + name)
-            os.chown(tmp, u.pw_uid, u.pw_gid); os.chmod(tmp, 0o600)
-            os.replace(tmp, path); os.chown(path, u.pw_uid, u.pw_gid)
+            relay_in = os.path.join(sd, "relay-in")
+            os.makedirs(relay_in, exist_ok=True)
+            for d in (os.path.dirname(sd), sd, relay_in):
+                try:
+                    os.chown(d, u.pw_uid, u.pw_gid)
+                except OSError:
+                    pass
+            os.chmod(relay_in, 0o700)
+            os.chown(path, u.pw_uid, u.pw_gid)
         except KeyError:
-            os.replace(tmp, path)
+            pass
 
     reg_updates[name] = {"threadId": int(thread), "chatId": int(GROUP)}
     out["status"] = "relayed"; out["threadId"] = int(thread)
