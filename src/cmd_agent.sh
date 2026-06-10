@@ -567,7 +567,7 @@ cmd_create() {
   local telegram_home_channel="" telegram_allowed_users=""
   local byo_provider="" byo_api_key=""
   local skills_arg="" skills_set=0 no_skills=0 defer_auth=0
-  local isolation="admin"
+  local isolation="admin" no_team_bot=0
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --type=*)                    type="${1#--type=}" ;;
@@ -582,6 +582,7 @@ cmd_create() {
       --api-key=*)                 byo_api_key="${1#--api-key=}" ;;
       --with-skills=*)             skills_arg="${1#--with-skills=}"; skills_set=1 ;;
       --no-skills)                 no_skills=1 ;;
+      --no-team-bot)               no_team_bot=1 ;;
       --defer-auth)                defer_auth=1 ;;
       --isolation=*)               isolation="${1#--isolation=}" ;;
       -*)                          fail "$E_USAGE" "unknown flag: $1" ;;
@@ -589,7 +590,7 @@ cmd_create() {
     esac
     shift
   done
-  [[ -n "$name" ]] || fail "$E_USAGE" "usage: 5dive agent create <name> --type=<type> [--channels=none|telegram|discord] [--telegram-token=<token>] [--telegram-home-channel=<id>] [--telegram-allowed-users=<csv>] [--workdir=<path>] [--auth-profile=<name>] [--provider=<id> --api-key=<key|->] [--with-skills=<spec>[,...]] [--no-skills] [--defer-auth] [--isolation=admin|standard|sandboxed]"
+  [[ -n "$name" ]] || fail "$E_USAGE" "usage: 5dive agent create <name> --type=<type> [--channels=none|telegram|discord] [--telegram-token=<token>] [--telegram-home-channel=<id>] [--telegram-allowed-users=<csv>] [--workdir=<path>] [--auth-profile=<name>] [--provider=<id> --api-key=<key|->] [--with-skills=<spec>[,...]] [--no-skills] [--no-team-bot] [--defer-auth] [--isolation=admin|standard|sandboxed]"
   [[ -n "$type" ]] || fail "$E_USAGE" "--type is required"
   valid_name "$name" || fail "$E_VALIDATION" "invalid name (lowercase letters/digits/hyphens, start letter, <=16 chars)"
   is_known_type "$type" || fail "$E_NOT_FOUND" "unknown type: $type (known: ${!TYPE_BIN[*]})"
@@ -992,6 +993,42 @@ cmd_create() {
     JSON_MODE="$prev_json"
   fi
 
+  # DIVE-248 — auto-attach to the shared team bot. When this box has a team
+  # bot configured (token + group persisted by `team-bot shared`), every new
+  # relay-eligible agent (no personal bot, plugin-capable type) joins the team
+  # group by default: own forum topic, send-only on the shared token, group
+  # allowlisted. Opt out with --no-team-bot. Best-effort — a Telegram hiccup
+  # must not roll back an otherwise healthy create.
+  # Only channel-less creates qualify: the shared-attach path flips the agent
+  # to channels=telegram (send-only), which would clobber a personal telegram
+  # or discord setup requested in this very create.
+  local team_bot_status="off"
+  if (( ! no_team_bot )) && [[ "$channels" == "none" ]] \
+      && [[ -r /etc/5dive/team-bot.token && -r /etc/5dive/team-bot.json ]]; then
+    local tb_token tb_group tb_owner
+    tb_token=$(cat /etc/5dive/team-bot.token 2>/dev/null)
+    tb_group=$(jq -r '.group // empty' /etc/5dive/team-bot.json 2>/dev/null)
+    tb_owner=$(jq -r '.owner // empty' /etc/5dive/team-bot.json 2>/dev/null)
+    if [[ -z "$tb_token" || -z "$tb_group" ]]; then
+      team_bot_status="off"
+    elif _team_bot_relay_agent_list | grep -qxF "$name"; then
+      step "Attaching $name to the shared team bot (group $tb_group)"
+      local tb_prev_json="$JSON_MODE"
+      JSON_MODE=0
+      if ( _team_bot_do_shared "$tb_group" "$tb_owner" "$name" "$tb_token" ) >/dev/null; then
+        team_bot_status="attached"
+      else
+        team_bot_status="failed"
+        warn "team-bot auto-attach failed — agent is up; retry: sudo 5dive agent team-bot shared --group=$tb_group --agents=$name --token=<shared bot token>"
+      fi
+      JSON_MODE="$tb_prev_json"
+    else
+      # Team bot configured but this agent isn't a relay candidate (it has its
+      # own personal bot, or its type ships no telegram plugin).
+      team_bot_status="skipped"
+    fi
+  fi
+
   # Wire paperclipai (running as user `claude`) to the new agent's auth so
   # its inner CLI-connection check stops reporting "not logged in" for this
   # type. No-op when the host-default credential location already holds a
@@ -1000,9 +1037,9 @@ cmd_create() {
 
   local effective_workdir="${workdir:-$DEFAULT_WORKDIR}"
   ok "agent '$name' (type=$type, channels=$channels${profile:+, profile=$profile}) is running." \
-     '{name:$n, type:$t, channels:$c, workdir:$w, authProfile:$p, created:true, skills:{installed:$inst, failed:$fail}}' \
+     '{name:$n, type:$t, channels:$c, workdir:$w, authProfile:$p, created:true, skills:{installed:$inst, failed:$fail}, teamBot:$tb}' \
      --arg n "$name" --arg t "$type" --arg c "$channels" --arg w "$effective_workdir" --arg p "${profile:-}" \
-     --argjson inst "$installed_skills_json" --argjson fail "$failed_skills_json"
+     --argjson inst "$installed_skills_json" --argjson fail "$failed_skills_json" --arg tb "$team_bot_status"
 }
 
 cmd_restart() {
@@ -2498,6 +2535,12 @@ _team_bot_do_shared() {
   ( umask 077; printf '%s\n' "$token" > /etc/5dive/team-bot.token )
   chown root:root /etc/5dive/team-bot.token
   chmod 600 /etc/5dive/team-bot.token
+  # Also persist the team group (+owner) so `agent create` can auto-attach
+  # future no-bot agents to this group without re-asking (DIVE-248).
+  ( umask 077; jq -n --arg g "$group" --arg o "$owner" \
+      '{group:$g, owner:(if $o=="" then null else $o end)}' > /etc/5dive/team-bot.json )
+  chown root:root /etc/5dive/team-bot.json
+  chmod 600 /etc/5dive/team-bot.json
 
   # 2) Telegram: verify the shared bot can manage topics, create a topic per
   #    agent (reusing an existing one), and wire each access.json.

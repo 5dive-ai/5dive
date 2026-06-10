@@ -44,7 +44,11 @@ Agents:
                             [--workdir=<path>] [--auth-profile=<name>]
                             [--provider=<id> --api-key=<key|->]
                             [--with-skills=<spec>[,<spec>...]] [--no-skills]
-                            [--defer-auth]
+                            [--no-team-bot] [--defer-auth]
+                            # When the box has a shared team bot configured
+                            # (team-bot shared persists it), new no-bot agents
+                            # auto-attach: own forum topic, send-only on the
+                            # shared token. --no-team-bot opts the agent out.
                             # spec: <id> (defaults to ${DEFAULT_SKILL_SOURCE}) or <owner/repo>:<id>
                             # provider: hermes/openclaw only — BYO API key for one of
                             # ${!BYO_PROVIDER_LABEL[*]}. Mutually exclusive with --defer-auth.
