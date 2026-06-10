@@ -28,7 +28,7 @@ audit_log() {
   local a
   for a in "$@"; do
     case "$a" in
-      --api-key=*|--telegram-token=*|--discord-token=*|--code=*)
+      --api-key=*|--telegram-token=*|--discord-token=*|--code=*|--token=*)
         sanitized+=("${a%%=*}=<redacted>") ;;
       *)
         sanitized+=("$a") ;;

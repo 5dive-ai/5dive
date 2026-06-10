@@ -1642,7 +1642,7 @@ cmd_agent_topic_get() {
 # provision is idempotent: re-running re-uses an agent's existing topic.
 cmd_agent_team_bot() {
   local sub="" group="" owner="" agents_filter="" token="" off=""
-  [[ $# -gt 0 ]] || fail "$E_USAGE" "usage: 5dive agent team-bot status|provision|shared|intercom --group=<chat_id> [--owner=<user_id>]"
+  [[ $# -gt 0 ]] || fail "$E_USAGE" "usage: 5dive agent team-bot status|provision|shared|intercom|discover --group=<chat_id> [--owner=<user_id>]"
   sub="$1"; shift
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -1656,7 +1656,17 @@ cmd_agent_team_bot() {
     esac
     shift
   done
-  case "$sub" in status|provision|shared|intercom) ;; *) fail "$E_USAGE" "unknown team-bot command: $sub (status|provision|shared|intercom)" ;; esac
+  case "$sub" in status|provision|shared|intercom|discover) ;; *) fail "$E_USAGE" "unknown team-bot command: $sub (status|provision|shared|intercom|discover)" ;; esac
+
+  # `discover` (DIVE-247) = find the team group with the bot itself — no
+  # --group needed (that id is exactly what it returns). Handled before the
+  # --group validation below.
+  if [[ "$sub" == "discover" ]]; then
+    ensure_state
+    _team_bot_do_discover "$token"
+    return
+  fi
+
   [[ "$group" =~ ^-?[0-9]+$ ]] || fail "$E_VALIDATION" "--group must be a Telegram chat id (negative for supergroups)"
   [[ -z "$owner" || "$owner" =~ ^[0-9]+$ ]] || fail "$E_VALIDATION" "--owner must be a numeric Telegram user id"
   ensure_state
@@ -2346,6 +2356,116 @@ UNIT
 # `5dive agent team-bot shared --group --token --agents [--owner]`
 # Relay the listed no-bot agents through one shared bot. Idempotent: re-running
 # reuses each agent's existing topic.
+# DIVE-247 — find the team group without the manual id hunt. Telegram's UI
+# never shows a group's chat id, and the Bot API can't create groups or add
+# bots to them — a human does that once. But the moment a human adds the bot,
+# its pending updates (my_chat_member / messages) carry the chat id. Read them
+# WITHOUT acking an offset so nothing is consumed (the listener still sees
+# them later). getUpdates 409s only against another poller on the SAME token,
+# so skip the poll when our listener is live on this token and fall back to
+# groups already recorded in the registry (teamTopic/intercom chat ids).
+# Enriches each candidate with getChat + getChatMember so the dashboard can
+# show exactly what's missing (forum off / not admin / no Manage Topics).
+_team_bot_do_discover() {
+  local token="$1"
+  [[ -n "$token" ]] || fail "$E_USAGE" "team-bot discover requires --token=<shared bot token>"
+  [[ "$token" =~ ^[0-9]+:[A-Za-z0-9_-]+$ ]] || fail "$E_VALIDATION" "--token does not look like a Telegram bot token"
+
+  local saved_token="" listener_live=0
+  [[ -r /etc/5dive/team-bot.token ]] && saved_token=$(cat /etc/5dive/team-bot.token 2>/dev/null)
+  if [[ -n "$saved_token" && "$saved_token" == "$token" ]] \
+     && systemctl is-active --quiet 5dive-team-bot-listener.service 2>/dev/null; then
+    listener_live=1
+  fi
+
+  local reg known
+  reg=$(registry_read)
+  known=$(jq -c '[(.agents | to_entries[] | .value.teamTopic.chatId // empty), (.intercomTopic.chatId // empty)] | unique' <<<"$reg")
+
+  local result
+  result=$(TOKEN="$token" LISTENER_LIVE="$listener_live" KNOWN="$known" python3 - <<'PY'
+import json, os, urllib.parse, urllib.request, urllib.error
+
+TOKEN = os.environ['TOKEN']
+LIVE  = os.environ.get('LISTENER_LIVE') == '1'
+KNOWN = json.loads(os.environ.get('KNOWN') or '[]')
+
+def tg(method, **p):
+    url = f"https://api.telegram.org/bot{TOKEN}/{method}"
+    data = urllib.parse.urlencode(p).encode()
+    try:
+        with urllib.request.urlopen(urllib.request.Request(url, data=data), timeout=15) as r:
+            return json.load(r)
+    except urllib.error.HTTPError as e:
+        try:
+            return json.load(e)
+        except Exception:
+            return {"ok": False, "description": f"HTTP {e.code}"}
+    except Exception as e:
+        return {"ok": False, "description": str(e)}
+
+me = tg("getMe")
+if not me.get("ok"):
+    print(json.dumps({"ok": False, "error": me.get("description", "bot token invalid")}))
+    raise SystemExit(0)
+bot_id = me["result"]["id"]
+bot_username = me["result"].get("username")
+
+chat_ids = []
+def add(cid):
+    if cid not in chat_ids:
+        chat_ids.append(cid)
+
+if not LIVE:
+    # No offset param = peek, not consume: Telegram only discards updates once
+    # a HIGHER offset is acked, so the listener still gets everything.
+    up = tg("getUpdates", timeout=0,
+            allowed_updates='["my_chat_member","message","chat_member"]')
+    if up.get("ok"):
+        for u in up.get("result", []):
+            for k in ("my_chat_member", "message", "chat_member"):
+                c = (u.get(k) or {}).get("chat") or {}
+                if c.get("type") in ("group", "supergroup"):
+                    add(int(c["id"]))
+for cid in KNOWN:
+    add(int(cid))
+
+groups = []
+for cid in chat_ids:
+    g = tg("getChat", chat_id=cid)
+    if not g.get("ok"):
+        continue  # kicked since, or the id migrated — not usable, skip
+    info = g["result"]
+    mm = tg("getChatMember", chat_id=cid, user_id=bot_id)
+    st = (mm.get("result") or {}).get("status", "left") if mm.get("ok") else "left"
+    if st in ("left", "kicked"):
+        continue
+    can_topics = bool((mm.get("result") or {}).get("can_manage_topics")) or st == "creator"
+    is_admin = st in ("administrator", "creator")
+    groups.append({
+        "id": str(info["id"]),
+        "title": info.get("title") or str(info["id"]),
+        "isForum": bool(info.get("is_forum")),
+        "isAdmin": is_admin,
+        "canManageTopics": can_topics,
+        "ready": bool(info.get("is_forum")) and is_admin and can_topics,
+    })
+
+print(json.dumps({"ok": True, "botUsername": bot_username, "groups": groups}))
+PY
+)
+  [[ -n "$result" ]] || fail "$E_GENERIC" "team-bot discover failed"
+  if [[ "$(jq -r '.ok // false' <<<"$result")" != "true" ]]; then
+    fail "$E_GENERIC" "$(jq -r '.error // "discover failed"' <<<"$result")"
+  fi
+  local n bot_username groups
+  n=$(jq '.groups | length' <<<"$result")
+  bot_username=$(jq -r '.botUsername // ""' <<<"$result")
+  groups=$(jq -c '.groups' <<<"$result")
+  ok "team-bot discover: $n group(s) found" '{botUsername:$b, groups:$g}' \
+     --arg b "$bot_username" --argjson g "$groups"
+}
+
 _team_bot_do_shared() {
   local group="$1" owner="$2" agents_filter="$3" token="$4"
   [[ -n "$token" ]] || fail "$E_USAGE" "team-bot shared requires --token=<shared bot token>"
