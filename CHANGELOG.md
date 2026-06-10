@@ -11,6 +11,16 @@ release.
 
 ### Fixed
 
+- `agent config set channels=telegram` (and `channels=discord`) now stages the
+  channel plugin synchronously before the deferred restart (DIVE-250). A bare
+  `channels=<plugin>` with the token already on disk used to skip the install
+  dispatch entirely, so the restarted session could boot with
+  `--channels plugin:…` but no staged plugin — no channel tool, and the agent
+  improvises (raw Bot-API curl, seen live on the demo box 2026-06-10). The
+  dispatch now runs on every channel attach (the install helpers are
+  idempotent), and a fail-closed gate refuses the restart with a clear error
+  if the claude plugin cache dir is still missing after a short poll.
+
 - `agent list` / `agent info` no longer abort when an agent's per-type runtime
   config is absent. The DIVE-211 model/effort enrichment reads each agent's
   config via `resolve_agent_model`/`resolve_agent_effort`; for `antigravity`

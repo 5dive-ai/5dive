@@ -26,7 +26,7 @@ esac
 
 # Bumped on every public release. `build.sh` checks this line exists; CI fails
 # the bundle-drift check if it's missing or empty.
-readonly FIVE_VERSION="0.1.82"
+readonly FIVE_VERSION="0.1.83"
 
 STATE_DIR="/var/lib/5dive"
 REGISTRY="${STATE_DIR}/agents.json"
@@ -5813,10 +5813,17 @@ cmd_config() {
   # helper (install_channel_plugin_for_agent for claude — installs the
   # plugin if missing + seeds access.json with allowed_users; openclaw
   # channels add for openclaw; ~/.hermes/.env write for hermes).
+  #
+  # A bare channels=telegram (token already on disk from a prior call) must
+  # ALSO dispatch: the deferred restart below boots the session with
+  # `--channels plugin:telegram@…`, and if the plugin was never staged for
+  # this user the session comes up with no telegram tool and the agent
+  # improvises (raw Bot-API curl — seen live on the demo box, DIVE-250).
+  # The install helpers are idempotent, so re-running on an already-staged
+  # agent is a cheap no-op.
   local effective_channels
   effective_channels=$(jq -r --arg n "$name" '.agents[$n].channels // "none"' <<<"$reg")
-  if [[ -n "$new_telegram_token" ]] || \
-     ( [[ "$channels_changed_to" == "telegram" ]] && [[ -n "$new_allowed_users$new_home_channel" ]] ); then
+  if [[ -n "$new_telegram_token" || "$channels_changed_to" == "telegram" ]]; then
     [[ "$effective_channels" == "telegram" ]] \
       || fail "$E_VALIDATION" "telegram.* keys require channels=telegram (current: $effective_channels)"
     local token_for_install="$new_telegram_token"
@@ -5859,14 +5866,26 @@ cmd_config() {
         '.agents[$n].botUsername = $u' <<<"$reg" | registry_write
     fi
   fi
-  if [[ -n "$new_discord_token" ]]; then
+  if [[ -n "$new_discord_token" || "$channels_changed_to" == "discord" ]]; then
     [[ "$effective_channels" == "discord" ]] \
       || fail "$E_VALIDATION" "discord.token requires channels=discord (current: $effective_channels)"
-    step "Writing ${CONNECTORS_DIR}/discord-${name}.env"
-    write_channel_secret discord "$name" DISCORD_BOT_TOKEN "$new_discord_token"
+    # Same bare-attach rule as telegram above (DIVE-250): channels=discord
+    # without a token in this call falls back to the stored connector secret
+    # (the pre-flight above guarantees one exists).
+    local discord_token_for_install="$new_discord_token"
+    if [[ -z "$discord_token_for_install" ]]; then
+      discord_token_for_install=$(grep -E '^DISCORD_BOT_TOKEN=' "${CONNECTORS_DIR}/discord-${name}.env" 2>/dev/null \
+        | head -1 | cut -d= -f2-)
+      [[ -n "$discord_token_for_install" ]] \
+        || fail "$E_NOT_FOUND" "no stored discord token for agent '$name' — include discord.token=<token>"
+    fi
+    if [[ -n "$new_discord_token" ]]; then
+      step "Writing ${CONNECTORS_DIR}/discord-${name}.env"
+      write_channel_secret discord "$name" DISCORD_BOT_TOKEN "$new_discord_token"
+    fi
     step "Installing discord channel for agent '$name' (type=$type)"
     install_channel_for_agent "$type" discord "$name" \
-      "$new_discord_token" "$new_home_channel" "$new_allowed_users"
+      "$discord_token_for_install" "$new_home_channel" "$new_allowed_users"
     if [[ "$type" == "hermes" ]]; then
       ensure_hermes_gateway "$name"
     fi
@@ -5878,6 +5897,27 @@ cmd_config() {
   if [[ -n "$new_effort" ]]; then
     step "Writing effortLevel=$new_effort into claude runtime config"
     write_runtime_effort "$name" "$new_effort"
+  fi
+  # Fail-closed gate (DIVE-250): when this call attached a channel to a
+  # claude agent, the restarted session boots with `--channels
+  # plugin:<ch>@<marketplace>` (see 5dive-agent-start) and comes up with NO
+  # channel tool if the plugin cache isn't staged yet. The dispatch above is
+  # synchronous so the cache dir should already exist; poll briefly to absorb
+  # any in-flight stager, then refuse to restart into a known-deaf session
+  # rather than let the agent improvise. Scoped to channels_changed_to (not
+  # every config call) so e.g. `model=` on a legacy claude-plugins-official
+  # telegram agent can't trip a spurious marketplace mismatch.
+  if [[ "$type" == "claude" ]] \
+     && [[ "$channels_changed_to" == "telegram" || "$channels_changed_to" == "discord" ]]; then
+    local gate_marketplace="claude-plugins-official"
+    [[ "$channels_changed_to" == "telegram" ]] && gate_marketplace="5dive-plugins"
+    local gate_dir="/home/agent-${name}/.claude/plugins/cache/${gate_marketplace}/${channels_changed_to}"
+    local gate_waited=0
+    while [[ ! -d "$gate_dir" ]] && (( gate_waited < 15 )); do
+      sleep 1; gate_waited=$((gate_waited + 1))
+    done
+    [[ -d "$gate_dir" ]] || fail "$E_GENERIC" \
+      "$channels_changed_to plugin not staged for agent '$name' ($gate_dir missing) — refusing to restart into a session with no $channels_changed_to tool. Re-run: sudo 5dive agent config $name set channels=$channels_changed_to"
   fi
   # Defer the restart so the calling process (often `sudo -n 5dive agent
   # set-account` invoked from inside the agent's own bot) gets to return
