@@ -116,7 +116,7 @@ cmd_org_tree() {
   if (( JSON_MODE )); then
     local rows; rows=$(dbfmt -json "${cte} SELECT name, reports_to, role, title, depth FROM tree ORDER BY path;")
     [[ -n "$rows" ]] || rows="[]"
-    jq -cn --argjson r "$rows" '{ok:true, data:{tree:$r}}'
+    printf '%s' "$rows" | jq -c '{ok:true, data:{tree:.}}'  # stdin, not --argjson (DIVE-222)
   else
     # Default list mode: no header, one column -> one indented line per row.
     db "${cte}
@@ -154,7 +154,7 @@ cmd_org_ls() {
   if (( JSON_MODE )); then
     local rows; rows=$(dbfmt -json "SELECT name, reports_to, role, title FROM agents_org ORDER BY name;")
     [[ -n "$rows" ]] || rows="[]"
-    jq -cn --argjson r "$rows" '{ok:true, data:{agents:$r}}'
+    printf '%s' "$rows" | jq -c '{ok:true, data:{agents:.}}'  # stdin, not --argjson (DIVE-222)
   else
     dbfmt -box "SELECT name, COALESCE(reports_to,'-') AS reports_to, COALESCE(role,'-') AS role, COALESCE(title,'-') AS title FROM agents_org ORDER BY name;"
   fi

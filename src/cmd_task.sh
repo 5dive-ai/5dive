@@ -165,7 +165,10 @@ cmd_task_ls() {
     local rows
     rows=$(dbfmt -json "SELECT id, ident, title, status, priority, assignee, created_by, parent_id, created_at, done_at, body, result, need_type, ask, need_options, need_answer, need_answered_at, kind, schedule, last_fired_at FROM tasks WHERE ${where} ${order};")
     [[ -n "$rows" ]] || rows="[]"
-    jq -cn --argjson r "$rows" '{ok:true, data:{tasks:$r}}'
+    # Feed rows via stdin, not --argjson: a big board (179+ tasks w/ bodies)
+    # blows past MAX_ARG_STRLEN (128K per argv string) -> execve E2BIG
+    # ("Argument list too long"). stdin has no such cap. (DIVE-222)
+    printf '%s' "$rows" | jq -c '{ok:true, data:{tasks:.}}'
   elif (( recurring )); then
     dbfmt -box "SELECT ident, schedule, COALESCE(assignee,'-') AS assignee, COALESCE(last_fired_at,'never') AS last_fired, title FROM tasks WHERE ${where} ${order};"
   else
@@ -606,7 +609,8 @@ cmd_task_inbox() {
     local rows
     rows=$(dbfmt -json "SELECT id, ident, title, status, priority, assignee, created_by, parent_id, created_at, need_type, ask, need_options, recommend, need_answer, need_answered_at FROM tasks WHERE ${where} ${order};")
     [[ -n "$rows" ]] || rows="[]"
-    jq -cn --argjson r "$rows" '{ok:true, data:{inbox:$r}}'
+    # stdin, not --argjson — same ARG_MAX guard as `task ls`. (DIVE-222)
+    printf '%s' "$rows" | jq -c '{ok:true, data:{inbox:.}}'
   else
     local cnt; cnt=$(db "SELECT COUNT(*) FROM tasks WHERE ${where};")
     if [[ "$cnt" == "0" ]]; then

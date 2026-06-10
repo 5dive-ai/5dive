@@ -185,7 +185,7 @@ cmd_heartbeat_ls() {
       '. + [{name:$n, enabled:$en, everyMin:$ev, fresh:$fr, running:$run, todo:$td, nextInSec:$ni}]' <<<"$rows")
   done
   if (( JSON_MODE )); then
-    jq -cn --argjson r "$rows" '{ok:true, data:{agents:$r}}'
+    printf '%s' "$rows" | jq -c '{ok:true, data:{agents:.}}'  # stdin, not --argjson (DIVE-222)
   else
     echo "$rows" | jq -r '
       if length == 0 then "no agents enrolled in heartbeat (5dive heartbeat on <name>)" else

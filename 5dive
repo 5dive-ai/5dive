@@ -26,7 +26,7 @@ esac
 
 # Bumped on every public release. `build.sh` checks this line exists; CI fails
 # the bundle-drift check if it's missing or empty.
-readonly FIVE_VERSION="0.1.78"
+readonly FIVE_VERSION="0.1.79"
 
 STATE_DIR="/var/lib/5dive"
 REGISTRY="${STATE_DIR}/agents.json"
@@ -10647,7 +10647,10 @@ cmd_task_ls() {
     local rows
     rows=$(dbfmt -json "SELECT id, ident, title, status, priority, assignee, created_by, parent_id, created_at, done_at, body, result, need_type, ask, need_options, need_answer, need_answered_at, kind, schedule, last_fired_at FROM tasks WHERE ${where} ${order};")
     [[ -n "$rows" ]] || rows="[]"
-    jq -cn --argjson r "$rows" '{ok:true, data:{tasks:$r}}'
+    # Feed rows via stdin, not --argjson: a big board (179+ tasks w/ bodies)
+    # blows past MAX_ARG_STRLEN (128K per argv string) -> execve E2BIG
+    # ("Argument list too long"). stdin has no such cap. (DIVE-222)
+    printf '%s' "$rows" | jq -c '{ok:true, data:{tasks:.}}'
   elif (( recurring )); then
     dbfmt -box "SELECT ident, schedule, COALESCE(assignee,'-') AS assignee, COALESCE(last_fired_at,'never') AS last_fired, title FROM tasks WHERE ${where} ${order};"
   else
@@ -11088,7 +11091,8 @@ cmd_task_inbox() {
     local rows
     rows=$(dbfmt -json "SELECT id, ident, title, status, priority, assignee, created_by, parent_id, created_at, need_type, ask, need_options, recommend, need_answer, need_answered_at FROM tasks WHERE ${where} ${order};")
     [[ -n "$rows" ]] || rows="[]"
-    jq -cn --argjson r "$rows" '{ok:true, data:{inbox:$r}}'
+    # stdin, not --argjson — same ARG_MAX guard as `task ls`. (DIVE-222)
+    printf '%s' "$rows" | jq -c '{ok:true, data:{inbox:.}}'
   else
     local cnt; cnt=$(db "SELECT COUNT(*) FROM tasks WHERE ${where};")
     if [[ "$cnt" == "0" ]]; then
@@ -11297,7 +11301,7 @@ cmd_org_tree() {
   if (( JSON_MODE )); then
     local rows; rows=$(dbfmt -json "${cte} SELECT name, reports_to, role, title, depth FROM tree ORDER BY path;")
     [[ -n "$rows" ]] || rows="[]"
-    jq -cn --argjson r "$rows" '{ok:true, data:{tree:$r}}'
+    printf '%s' "$rows" | jq -c '{ok:true, data:{tree:.}}'  # stdin, not --argjson (DIVE-222)
   else
     # Default list mode: no header, one column -> one indented line per row.
     db "${cte}
@@ -11335,7 +11339,7 @@ cmd_org_ls() {
   if (( JSON_MODE )); then
     local rows; rows=$(dbfmt -json "SELECT name, reports_to, role, title FROM agents_org ORDER BY name;")
     [[ -n "$rows" ]] || rows="[]"
-    jq -cn --argjson r "$rows" '{ok:true, data:{agents:$r}}'
+    printf '%s' "$rows" | jq -c '{ok:true, data:{agents:.}}'  # stdin, not --argjson (DIVE-222)
   else
     dbfmt -box "SELECT name, COALESCE(reports_to,'-') AS reports_to, COALESCE(role,'-') AS role, COALESCE(title,'-') AS title FROM agents_org ORDER BY name;"
   fi
@@ -11538,7 +11542,7 @@ cmd_heartbeat_ls() {
       '. + [{name:$n, enabled:$en, everyMin:$ev, fresh:$fr, running:$run, todo:$td, nextInSec:$ni}]' <<<"$rows")
   done
   if (( JSON_MODE )); then
-    jq -cn --argjson r "$rows" '{ok:true, data:{agents:$r}}'
+    printf '%s' "$rows" | jq -c '{ok:true, data:{agents:.}}'  # stdin, not --argjson (DIVE-222)
   else
     echo "$rows" | jq -r '
       if length == 0 then "no agents enrolled in heartbeat (5dive heartbeat on <name>)" else
