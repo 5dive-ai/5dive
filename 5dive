@@ -26,7 +26,7 @@ esac
 
 # Bumped on every public release. `build.sh` checks this line exists; CI fails
 # the bundle-drift check if it's missing or empty.
-readonly FIVE_VERSION="0.1.79"
+readonly FIVE_VERSION="0.1.80"
 
 STATE_DIR="/var/lib/5dive"
 REGISTRY="${STATE_DIR}/agents.json"
@@ -4526,8 +4526,11 @@ cmd_list() {
     # effort). Two extra per-agent file reads, in line with the systemctl + b2b
     # reads this loop already does.
     local amodel aeffort
-    amodel=$(resolve_agent_model "$ltype" "$name")
-    aeffort=$(resolve_agent_effort "$ltype" "$name")
+    # `|| true`: belt-and-suspenders with the resolvers' own exit-0 contract so a
+    # best-effort per-agent config read can never abort the whole list under
+    # `set -e` (DIVE-230).
+    amodel=$(resolve_agent_model "$ltype" "$name" || true)
+    aeffort=$(resolve_agent_effort "$ltype" "$name" || true)
     enriched=$(jq -c --arg n "$name" --arg a "$active" --arg e "$sub" --argjson b2b "$b2b" \
       --arg model "$amodel" --arg effort "$aeffort" \
       '.[$n] = {active: $a, enabled: $e, botToBotEnabled: $b2b,
@@ -4582,18 +4585,26 @@ resolve_cli_version() {
 resolve_agent_model() {
   local type="$1" name="$2"
   local home="/home/agent-${name}"
+  # MUST stay exit-0 on a missing/unreadable config: the caller assigns this in
+  # `amodel=$(resolve_agent_model …)`, and under the bundle's `set -e` a non-zero
+  # here aborts the whole command. A `--defer-auth` antigravity agent has no
+  # settings.json until its first boot writes it, so the jq below exits non-zero
+  # and (DIVE-230) crashed `agent list`/`info` mid-build → empty output → callers
+  # read it as "agent missing". The `|| true` on every file read keeps the
+  # contract: absent value → "" → exit 0. (sed|head needs it too: under
+  # `pipefail` a missing config.toml propagates sed's non-zero status.)
   case "$type" in
     claude)
-      sudo jq -r '.model // empty' "$home/.claude/settings.json" 2>/dev/null ;;
+      sudo jq -r '.model // empty' "$home/.claude/settings.json" 2>/dev/null || true ;;
     codex)
-      sudo sed -nE 's/^[[:space:]]*model[[:space:]]*=[[:space:]]*"?([^"#]*[^"# ])"?.*/\1/p' \
-        "$home/.codex/config.toml" 2>/dev/null | head -1 ;;
+      { sudo sed -nE 's/^[[:space:]]*model[[:space:]]*=[[:space:]]*"?([^"#]*[^"# ])"?.*/\1/p' \
+        "$home/.codex/config.toml" 2>/dev/null | head -1; } || true ;;
     grok)
-      sudo sed -nE 's/^[[:space:]]*model[[:space:]]*=[[:space:]]*"?([^"#]*[^"# ])"?.*/\1/p' \
-        "$home/.grok/config.toml" 2>/dev/null | head -1 ;;
+      { sudo sed -nE 's/^[[:space:]]*model[[:space:]]*=[[:space:]]*"?([^"#]*[^"# ])"?.*/\1/p' \
+        "$home/.grok/config.toml" 2>/dev/null | head -1; } || true ;;
     antigravity)
       sudo jq -r '.model // .selectedModel // empty' \
-        "$home/.gemini/antigravity-cli/settings.json" 2>/dev/null ;;
+        "$home/.gemini/antigravity-cli/settings.json" 2>/dev/null || true ;;
     *) printf '' ;;
   esac
 }
@@ -4606,7 +4617,7 @@ resolve_agent_effort() {
   local type="$1" name="$2"
   case "$type" in
     claude)
-      sudo jq -r '.effortLevel // empty' "/home/agent-${name}/.claude/settings.json" 2>/dev/null ;;
+      sudo jq -r '.effortLevel // empty' "/home/agent-${name}/.claude/settings.json" 2>/dev/null || true ;;
     *) printf '' ;;
   esac
 }
@@ -4740,8 +4751,10 @@ cmd_info() {
 
   local cli_version model effort
   cli_version=$(resolve_cli_version "$type")
-  model=$(resolve_agent_model "$type" "$name")
-  effort=$(resolve_agent_effort "$type" "$name")
+  # `|| true`: a best-effort per-agent config read must never abort `info` under
+  # `set -e` when the file is absent (e.g. --defer-auth agy pre-boot — DIVE-230).
+  model=$(resolve_agent_model "$type" "$name" || true)
+  effort=$(resolve_agent_effort "$type" "$name" || true)
 
   local obj
   obj=$(jq -c \

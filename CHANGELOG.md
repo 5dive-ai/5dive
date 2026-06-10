@@ -9,6 +9,20 @@ release.
 
 ## [Unreleased]
 
+### Fixed
+
+- `agent list` / `agent info` no longer abort when an agent's per-type runtime
+  config is absent. The DIVE-211 model/effort enrichment reads each agent's
+  config via `resolve_agent_model`/`resolve_agent_effort`; for `antigravity`
+  those `jq` against `~/.gemini/antigravity-cli/settings.json`, which a
+  `--defer-auth` agy agent does not have until its first boot writes it. The
+  resolvers returned non-zero, and the unguarded `model=$(…)` assignment tripped
+  the bundle's `set -e`, killing the command mid-build → empty output. Callers
+  (and the smoke harness) read that as "agent not in registry" even though the
+  agent was registered fine. The resolvers are now exit-0 on a missing/unreadable
+  config (their documented best-effort contract), with `|| true` belt-and-
+  suspenders at the call sites (DIVE-230).
+
 ### Added
 
 - `agent list --json` now carries each agent's `model` and `effort` (DIVE-211),
