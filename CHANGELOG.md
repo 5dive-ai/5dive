@@ -9,6 +9,13 @@ release.
 
 ## [Unreleased]
 
+### Added
+
+- `agent list --json` now carries each agent's `model` and `effort` (DIVE-211),
+  read the same best-effort way `agent info` already resolves them (empty →
+  `null`; effort is claude-only). Lets the dashboard render a per-row model
+  badge + model/effort picker without an N×`agent info` fan-out.
+
 ## [0.1.68] — 2026-06-07
 
 ### Added

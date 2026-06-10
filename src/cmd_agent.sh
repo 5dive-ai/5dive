@@ -26,8 +26,19 @@ cmd_list() {
         b2b=$(jq -r '.botToBot.enabled // false' "$lsd/access.json" 2>/dev/null || echo "false")
       fi
     fi
+    # Surface the configured model + reasoning effort (DIVE-211) so the dashboard
+    # can render a per-row model badge + picker without an N×`agent info` fan-out.
+    # Same best-effort reads `info` uses; empty -> null (model unset / non-claude
+    # effort). Two extra per-agent file reads, in line with the systemctl + b2b
+    # reads this loop already does.
+    local amodel aeffort
+    amodel=$(resolve_agent_model "$ltype" "$name")
+    aeffort=$(resolve_agent_effort "$ltype" "$name")
     enriched=$(jq -c --arg n "$name" --arg a "$active" --arg e "$sub" --argjson b2b "$b2b" \
-      '.[$n] = {active: $a, enabled: $e, botToBotEnabled: $b2b}' <<<"$enriched")
+      --arg model "$amodel" --arg effort "$aeffort" \
+      '.[$n] = {active: $a, enabled: $e, botToBotEnabled: $b2b,
+                model: (if $model == "" then null else $model end),
+                effort: (if $effort == "" then null else $effort end)}' <<<"$enriched")
   done
   local merged
   merged=$(jq -c --arg default_wd "$DEFAULT_WORKDIR" --argjson live "$enriched" '.agents | to_entries | map({
@@ -42,7 +53,9 @@ cmd_list() {
     createdAt: .value.createdAt,
     active: ($live[.key].active // "unknown"),
     enabled: ($live[.key].enabled // "unknown"),
-    botToBotEnabled: ($live[.key].botToBotEnabled // false)
+    botToBotEnabled: ($live[.key].botToBotEnabled // false),
+    model: ($live[.key].model // null),
+    effort: ($live[.key].effort // null)
   })' <<<"$reg")
   if (( JSON_MODE )); then
     echo "$merged" | jq -c '{ok:true, data: .}'
