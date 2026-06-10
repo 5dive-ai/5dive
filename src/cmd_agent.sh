@@ -960,6 +960,57 @@ cmd_create() {
     ensure_hermes_gateway "$name"
   fi
 
+  # DIVE-248 — auto-attach to the shared team bot. When this box has a team
+  # bot configured (token + group persisted by `team-bot shared`), every new
+  # relay-eligible agent (no personal bot, plugin-capable type) joins the team
+  # group by default: own forum topic, send-only on the shared token, group
+  # allowlisted. Opt out with --no-team-bot. Best-effort — a Telegram hiccup
+  # must not roll back an otherwise healthy create.
+  # Only channel-less creates qualify: the shared-attach path flips the agent
+  # to channels=telegram (send-only), which would clobber a personal telegram
+  # or discord setup requested in this very create.
+  # MUST run before the service's first boot: the booting session races the
+  # marketplace git clone inside the plugin install (ERR_STREAM_PREMATURE_CLOSE),
+  # and the session should come up with the plugin already staged anyway.
+  # _team_bot_do_shared's own restart at the end doubles as the first start.
+  local team_bot_status="off"
+  if (( ! no_team_bot )) && [[ "$channels" == "none" ]] \
+      && [[ -r /etc/5dive/team-bot.token && -r /etc/5dive/team-bot.json ]]; then
+    local tb_token tb_group tb_owner
+    tb_token=$(cat /etc/5dive/team-bot.token 2>/dev/null)
+    tb_group=$(jq -r '.group // empty' /etc/5dive/team-bot.json 2>/dev/null)
+    tb_owner=$(jq -r '.owner // empty' /etc/5dive/team-bot.json 2>/dev/null)
+    if [[ -z "$tb_token" || -z "$tb_group" ]]; then
+      team_bot_status="off"
+    elif _team_bot_relay_agent_list | grep -qxF "$name"; then
+      step "Attaching $name to the shared team bot (group $tb_group)"
+      local tb_prev_json="$JSON_MODE"
+      JSON_MODE=0
+      # Two attempts: on a never-booted agent, claude's first `plugin
+      # marketplace add` reports a spurious ERR_STREAM_PREMATURE_CLOSE while
+      # still completing the clone in the background (~5s) — the retry's
+      # `marketplace update` then finds it and the install goes through.
+      local tb_attached=0 tb_try
+      for tb_try in 1 2; do
+        if ( _team_bot_do_shared "$tb_group" "$tb_owner" "$name" "$tb_token" ) >/dev/null; then
+          tb_attached=1; break
+        fi
+        (( tb_try == 1 )) && sleep 10
+      done
+      if (( tb_attached )); then
+        team_bot_status="attached"
+      else
+        team_bot_status="failed"
+        warn "team-bot auto-attach failed — agent is up; retry: sudo 5dive agent team-bot shared --group=$tb_group --agents=$name --token=<shared bot token>"
+      fi
+      JSON_MODE="$tb_prev_json"
+    else
+      # Team bot configured but this agent isn't a relay candidate (it has its
+      # own personal bot, or its type ships no telegram plugin).
+      team_bot_status="skipped"
+    fi
+  fi
+
   step "Enabling 5dive-agent@${name}.service"
   systemctl daemon-reload
   systemctl enable --now "5dive-agent@${name}.service" >&2
@@ -991,42 +1042,6 @@ cmd_create() {
       fi
     done
     JSON_MODE="$prev_json"
-  fi
-
-  # DIVE-248 — auto-attach to the shared team bot. When this box has a team
-  # bot configured (token + group persisted by `team-bot shared`), every new
-  # relay-eligible agent (no personal bot, plugin-capable type) joins the team
-  # group by default: own forum topic, send-only on the shared token, group
-  # allowlisted. Opt out with --no-team-bot. Best-effort — a Telegram hiccup
-  # must not roll back an otherwise healthy create.
-  # Only channel-less creates qualify: the shared-attach path flips the agent
-  # to channels=telegram (send-only), which would clobber a personal telegram
-  # or discord setup requested in this very create.
-  local team_bot_status="off"
-  if (( ! no_team_bot )) && [[ "$channels" == "none" ]] \
-      && [[ -r /etc/5dive/team-bot.token && -r /etc/5dive/team-bot.json ]]; then
-    local tb_token tb_group tb_owner
-    tb_token=$(cat /etc/5dive/team-bot.token 2>/dev/null)
-    tb_group=$(jq -r '.group // empty' /etc/5dive/team-bot.json 2>/dev/null)
-    tb_owner=$(jq -r '.owner // empty' /etc/5dive/team-bot.json 2>/dev/null)
-    if [[ -z "$tb_token" || -z "$tb_group" ]]; then
-      team_bot_status="off"
-    elif _team_bot_relay_agent_list | grep -qxF "$name"; then
-      step "Attaching $name to the shared team bot (group $tb_group)"
-      local tb_prev_json="$JSON_MODE"
-      JSON_MODE=0
-      if ( _team_bot_do_shared "$tb_group" "$tb_owner" "$name" "$tb_token" ) >/dev/null; then
-        team_bot_status="attached"
-      else
-        team_bot_status="failed"
-        warn "team-bot auto-attach failed — agent is up; retry: sudo 5dive agent team-bot shared --group=$tb_group --agents=$name --token=<shared bot token>"
-      fi
-      JSON_MODE="$tb_prev_json"
-    else
-      # Team bot configured but this agent isn't a relay candidate (it has its
-      # own personal bot, or its type ships no telegram plugin).
-      team_bot_status="skipped"
-    fi
   fi
 
   # Wire paperclipai (running as user `claude`) to the new agent's auth so

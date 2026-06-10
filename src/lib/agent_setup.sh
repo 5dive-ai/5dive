@@ -275,6 +275,37 @@ export NVM_DIR="/home/claude/.nvm"
 export PATH="/home/claude/.local/bin:$PATH"
 CLAUDE=/home/claude/.local/bin/claude
 
+# `claude plugin marketplace add` crashes headless for a user that has never
+# run a claude session (ERR_STREAM_PREMATURE_CLOSE before git even spawns —
+# verified on CC 2.1.169 and 2.1.170, DIVE-248). `marketplace update` works
+# headless but needs the marketplace registered. So pre-register it ourselves
+# (clone + known_marketplaces.json entry) and let `update` take it from there;
+# `add` stays only as the fallback for an unforeseen registration shape.
+MKT_DIR="$HOME/.claude/plugins/marketplaces/$MARKETPLACE"
+if [ ! -d "$MKT_DIR/.git" ]; then
+  mkdir -p "$HOME/.claude/plugins/marketplaces"
+  rm -rf "$MKT_DIR"
+  git clone -q --depth 1 "$MKT_REPO" "$MKT_DIR"
+fi
+MKT_SLUG=$(printf '%s' "$MKT_REPO" | sed -e 's#^https://github.com/##' -e 's#\.git$##')
+KM_FILE="$HOME/.claude/plugins/known_marketplaces.json" \
+  MKT_NAME="$MARKETPLACE" MKT_SLUG="$MKT_SLUG" MKT_DIR="$MKT_DIR" python3 <<'PREREG'
+import json, os, datetime
+km = os.environ["KM_FILE"]
+d = {}
+if os.path.exists(km):
+    try:
+        d = json.load(open(km))
+    except Exception:
+        d = {}
+d.setdefault(os.environ["MKT_NAME"], {
+    "source": {"source": "github", "repo": os.environ["MKT_SLUG"]},
+    "installLocation": os.environ["MKT_DIR"],
+    "lastUpdated": datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S.000Z"),
+})
+json.dump(d, open(km, "w"), indent=2)
+PREREG
+
 "$CLAUDE" plugin marketplace update "$MARKETPLACE" 2>/dev/null \
   || "$CLAUDE" plugin marketplace add "$MKT_REPO"
 
