@@ -10,8 +10,8 @@ docker build -f docker/Dockerfile -t 5dive .
 ```
 
 Build from the **repo root**, not from inside `docker/` — the Dockerfile
-`COPY`s `5dive`, `install.sh`, `hooks/`, `skills/`, and `systemd/` from the
-working tree.
+`COPY`s the CLI bundle (`5dive`, `5dive-agent-start`, `install.sh`, …) plus
+`hooks/`, `skills/`, and `systemd/` from the working tree.
 
 ## Run
 
@@ -25,7 +25,7 @@ and start agent units. Inside the shell, use `5dive` as you would on a host:
 
 ```sh
 5dive doctor
-5dive agent auth set claude --api-key sk-ant-...
+5dive agent auth set claude --api-key=sk-ant-...
 5dive agent create my-agent --type=claude
 5dive agent send my-agent "hello"
 ```
@@ -48,4 +48,4 @@ The image (and any auth credentials added inside the container) goes with it.
   `/var/lib/5dive` and `/etc/5dive/connectors`.
 - **OAuth flows are awkward.** Device-code flows work; browser-based flows
   inside a headless container don't. Prefer `5dive agent auth set <type>
-  --api-key <key>` when trying the container.
+  --api-key=<key>` when trying the container.
