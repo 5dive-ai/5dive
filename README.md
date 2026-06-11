@@ -73,7 +73,7 @@ No broker, no protocol, no orchestrator. Shared filesystem, shared CLI.
 
 The CLI is the OSS surface. Every verb here, every agent, every host, all driven from `/usr/local/bin/5dive`.
 
-If you'd rather click than `ssh`, [5dive.com](https://5dive.com) is the managed version: same CLI under the hood, but the VM, hardening, backups, and dashboard are run for you.
+If you'd rather click than `ssh`, [5dive.com](https://5dive.com) is the managed version: same CLI under the hood, but the VM, hardening, updates, and dashboard are run for you.
 
 <video src="https://cdn.jsdelivr.net/gh/5dive-com/assets@main/hero-demo.mp4" autoplay loop muted playsinline width="100%"></video>
 
