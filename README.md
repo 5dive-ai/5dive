@@ -24,8 +24,8 @@ sudo 5dive init
 Talk to an agent from your phone. Wire it to a Telegram bot ([BotFather](https://t.me/BotFather) gives you the token):
 
 ```sh
-5dive agent create my-agent --type=claude --channels=telegram --telegram-token=<token>
-5dive agent pair   my-agent --code=<pairing-code>
+sudo 5dive agent create my-agent --type=claude --channels=telegram --telegram-token=<token>
+sudo 5dive agent pair   my-agent --code=<pairing-code>
 ```
 
 For scripted / CI setup, see `5dive init --help`.
@@ -96,7 +96,7 @@ If you'd rather click than `ssh`, [5dive.com](https://5dive.com) is the managed 
 The `claude` type can also run the official Claude Code harness against a third-party Anthropic-compatible endpoint, bring your own key:
 
 ```sh
-5dive agent create cheap-coder --type=claude --provider=deepseek --api-key=<key>
+sudo 5dive agent create cheap-coder --type=claude --provider=deepseek --api-key=<key>
 # providers: deepseek (DeepSeek), moonshot (Kimi), zai (GLM)
 ```
 
@@ -135,10 +135,10 @@ Full flag reference: `5dive --help` (or `5dive <verb> --help`). Machine-readable
 One sign-in, many agents:
 
 ```sh
-5dive account add   work
-5dive account login work --type=claude
-5dive agent create agent-a --type=claude --auth-profile=work
-5dive agent create agent-b --type=claude --auth-profile=work
+sudo 5dive account add   work
+sudo 5dive account login work --type=claude
+sudo 5dive agent create agent-a --type=claude --auth-profile=work
+sudo 5dive agent create agent-b --type=claude --auth-profile=work
 ```
 
 Rename or rotate the account, every bound agent rebinds automatically. `5dive account usage` shows each account's rate-limit headroom.
@@ -151,7 +151,7 @@ Agents on a box share a task queue (sqlite, no server). File work, assign it, an
 
 ```sh
 5dive task add "triage overnight CI failures" --assignee=ops --recurring="0 7 * * *"
-5dive heartbeat on ops --every=30m
+sudo 5dive heartbeat on ops --every=30m
 ```
 
 When an agent hits something only a human can decide, it parks the task on you:
@@ -169,7 +169,7 @@ That arrives on your Telegram as tap-to-answer buttons. Tap one, and the owning 
 Per-agent bots are optional. Point one shared bot at a Telegram group (topics enabled) and every agent gets its own forum topic:
 
 ```sh
-5dive agent team-bot shared --group=<chat_id> --agents=coder,writer,pm --token=<bot-token>
+sudo 5dive agent team-bot shared --group=<chat_id> --agents=coder,writer,pm --token=<bot-token>
 ```
 
 New agents auto-attach with their own topic (opt out per agent with `--no-team-bot`). `team-bot discover` finds the group id for you, and `team-bot intercom` mirrors inter-agent chatter into a dedicated topic so you can watch the team coordinate.
