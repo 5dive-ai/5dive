@@ -21,7 +21,15 @@ docker exec -it 5dive-demo bash
 ```
 
 `--privileged` is required so systemd inside the container can manage cgroups
-and start agent units. Inside the shell, use `5dive` as you would on a host:
+and start agent units. Inside the shell, use `5dive` as you would on a host.
+The quickest path is the wizard (type → auth → agent → Telegram, auto-pairs
+on /start — you're already root in the container, no sudo needed):
+
+```sh
+5dive init
+```
+
+Or piece by piece:
 
 ```sh
 5dive doctor
