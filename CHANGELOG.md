@@ -9,6 +9,12 @@ release.
 
 ## [Unreleased]
 
+(nothing yet)
+
+## [0.1.84] — 2026-06-11
+
+Catch-up release covering 0.1.78 → 0.1.84.
+
 ### Fixed
 
 - `5dive init` / `agent create` no longer dies on a fresh OSS host with
@@ -49,6 +55,13 @@ release.
   read the same best-effort way `agent info` already resolves them (empty →
   `null`; effort is claude-only). Lets the dashboard render a per-row model
   badge + model/effort picker without an N×`agent info` fan-out.
+
+- Shared team bot quality-of-life across the span: `team-bot discover` finds
+  the group id itself (DIVE-247, 0.1.81); new agents auto-attach to the shared
+  team bot with their own forum topic, `--no-team-bot` opts out (DIVE-248,
+  0.1.82, incl. the never-booted-agent fix); task-board `jq: Argument list too
+  long` fix on big boards (DIVE-222, 0.1.79); task gate alerts follow the
+  conversation to the last human chat (DIVE-259).
 
 ## [0.1.68] — 2026-06-07
 
