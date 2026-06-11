@@ -5,6 +5,10 @@
 # command. Everything it does is also reachable via the individual commands.
 
 cmd_init() {
+  # Fail fast before any prompts: every step the wizard drives (agent install /
+  # create, channel wiring) is root-only — without this guard an unprivileged
+  # user answers the whole questionnaire and dies mid-create instead.
+  [[ $EUID -eq 0 ]] || fail "$E_PERMISSION" "init must run as root (sudo 5dive init)"
   if [[ ! -t 0 ]]; then
     fail "$E_USAGE" "5dive init is interactive — run it in a real terminal (not a pipe)"
   fi
