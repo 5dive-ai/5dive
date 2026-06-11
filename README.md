@@ -17,18 +17,19 @@ spawn and manage AI agents that talk to each other.
 # 1. install
 curl -fsSL https://install.5dive.com | sudo bash
 
-# 2. create your first agent (optional interactive wizard)
+# 2. create your first agent — the wizard wires Telegram too:
+#    paste a bot token (BotFather gives you one), send the bot /start,
+#    and it pairs itself. No codes.
 sudo 5dive init
 ```
 
-Talk to an agent from your phone. Wire it to a Telegram bot ([BotFather](https://t.me/BotFather) gives you the token):
+Scripting it instead (CI, provisioning)? The non-interactive path needs one
+extra step — the bot replies to your first DM with a pairing code:
 
 ```sh
 sudo 5dive agent create my-agent --type=claude --channels=telegram --telegram-token=<token>
 sudo 5dive agent pair   my-agent --code=<pairing-code>
 ```
-
-For scripted / CI setup, see `5dive init --help`.
 
 ---
 
