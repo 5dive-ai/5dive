@@ -30,6 +30,17 @@ and start agent units. Inside the shell, use `5dive` as you would on a host:
 5dive agent send my-agent "hello"
 ```
 
+Have a Claude Pro/Max subscription instead of an API key? OAuth works in the
+container too — there's just no browser inside, so it's copy-out/paste-in:
+
+```sh
+5dive account add me
+5dive account login me --type=claude
+# prints an authorize URL — open it in any browser (laptop, phone),
+# approve, then paste the callback code back into this prompt
+5dive agent create my-agent --type=claude --auth-profile=me
+```
+
 ## Teardown
 
 ```sh
