@@ -11177,13 +11177,37 @@ _task_owner_channel() {
 }
 
 # _task_send_owner — send ONE message ($1, optional reply_markup $2) to the
-# paired human, using the channel resolved by _task_owner_channel. Human DMs
-# first (allowFrom — exactly the users who /started the bot); if none, fall back
-# to the agent's bound forum topic(s) so the message isn't silently lost. Always
-# returns 0 (best-effort, mirrors task_need_notify's original send tail).
+# paired human, using the channel resolved by _task_owner_channel. Routing
+# (DIVE-259, Mark): follow the conversation — if the telegram plugin recorded
+# where the human last talked to this agent (last-human-chat.json beside
+# access.json), the alert and its tap buttons go THERE, but only when that
+# chat is still allowlisted in access.json (a stale or hand-edited pointer
+# must never widen the audience). No pointer (plugin predates the feature) =
+# legacy flow: human DMs first (allowFrom — exactly the users who /started
+# the bot), then the agent's bound forum topic(s) so nothing is silently
+# lost. Always returns 0 (best-effort).
 _task_send_owner() {
   local text="$1" reply_markup="${2:-}"
   local token="$TASK_CH_TOKEN" access_file="$TASK_CH_ACCESS"
+
+  local ptr_file="${access_file%/*}/last-human-chat.json"
+  if [[ -r "$ptr_file" ]]; then
+    local p_chat p_thread
+    p_chat=$(jq -r '.chatId // empty' "$ptr_file" 2>/dev/null) || p_chat=""
+    p_thread=$(jq -r '.messageThreadId // empty' "$ptr_file" 2>/dev/null) || p_thread=""
+    if [[ -n "$p_chat" ]]; then
+      if jq -e --arg c "$p_chat" '(.allowFrom // []) | index($c) != null' "$access_file" >/dev/null 2>&1; then
+        _mirror_post "$token" "$p_chat" "" "$text" "$access_file" "$reply_markup"
+        return 0
+      fi
+      if jq -e --arg c "$p_chat" '(.groups // {}) | has($c)' "$access_file" >/dev/null 2>&1; then
+        _mirror_post "$token" "$p_chat" "$p_thread" "$text" "$access_file" "$reply_markup"
+        return 0
+      fi
+      # Pointer references a chat that is no longer allowed — ignore it.
+    fi
+  fi
+
   local dms sent=0 chat
   dms=$(jq -r '(.allowFrom // [])[]' "$access_file" 2>/dev/null) || dms=""
   if [[ -n "$dms" ]]; then
