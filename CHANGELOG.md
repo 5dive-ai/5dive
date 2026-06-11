@@ -11,6 +11,16 @@ release.
 
 ### Fixed
 
+- `5dive init` / `agent create` no longer dies on a fresh OSS host with
+  "bun not on PATH" (DIVE-265). install.sh deliberately never installs bun,
+  and managed boxes get it from provisioning — so the first telegram agent on
+  a clean self-hosted box hit a hard fail and pointed at `doctor --repair`.
+  All five channel-plugin prechecks (claude/codex/grok/antigravity/opencode)
+  now self-heal: when the agent user can't see bun, the CLI installs it
+  system-wide (`BUN_INSTALL=/usr/local`, root-owned, visible to every agent
+  user with no PATH wiring) and only fails if that install itself fails.
+  Caught by lodar testing `5dive init` pre-HN, 2026-06-11.
+
 - `agent config set channels=telegram` (and `channels=discord`) now stages the
   channel plugin synchronously before the deferred restart (DIVE-250). A bare
   `channels=<plugin>` with the token already on disk used to skip the install
