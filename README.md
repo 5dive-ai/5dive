@@ -57,6 +57,8 @@ No broker, no protocol, no orchestrator. Shared filesystem, shared CLI.
 
 **A team that works without you.** Multiple agents on one host, coordinating with each other.
 
+**Hand them a backlog.** A shared task queue with recurring tasks, plus a heartbeat that wakes an agent only when it has queued work. Decisions land on your phone as tap-to-answer buttons.
+
 **Runs as a service, not a session.** Your agents stay alive when you close the terminal. Message them from Telegram any time.
 
 **Every major agentic AI CLI.** `claude`, `codex`, `antigravity`, `grok`, `hermes`, `openclaw`, `opencode`, all under one team.
@@ -81,7 +83,7 @@ If you'd rather click than `ssh`, [5dive.com](https://5dive.com) is the managed 
 
 | Type | Model family | Auth | Channels |
 |------|-------------|------|----------|
-| `claude`      | Anthropic Claude       | OAuth / API key | Telegram, Discord |
+| `claude`      | Anthropic Claude, or any Anthropic-compatible endpoint | OAuth / API key / `--provider` | Telegram, Discord |
 | `codex`       | OpenAI Codex           | OAuth / API key | Telegram |
 | `antigravity` | Google Antigravity     | Google OAuth | Telegram |
 | `grok`        | xAI Grok               | OAuth (xAI) / API key | Telegram |
@@ -89,7 +91,14 @@ If you'd rather click than `ssh`, [5dive.com](https://5dive.com) is the managed 
 | `openclaw`    | third-party multi-provider harness | OAuth (OpenAI) / API key | Telegram, Discord |
 | `opencode`    | OpenCode               | API key | Telegram |
 
-`hermes` and `openclaw` are community-built harnesses that can route to many providers (OpenRouter, Anthropic, Google, Moonshot, etc.). As of April 4, 2026, Anthropic no longer permits routing consumer Claude Pro/Max OAuth through third-party harnesses. For that work, use the official `claude` type with your own API key. Background: [We Ditched OpenClaw for Claude →](https://blog.5dive.com/blog/we-ditched-openclaw-for-claude/).
+`hermes` and `openclaw` are community-built harnesses that can route to many providers (OpenRouter, Anthropic, Google, Moonshot, DeepSeek, Z.ai, etc.). As of April 4, 2026, Anthropic no longer permits routing consumer Claude Pro/Max OAuth through third-party harnesses. For that work, use the official `claude` type with your own API key. Background: [We Ditched OpenClaw for Claude →](https://blog.5dive.com/blog/we-ditched-openclaw-for-claude/).
+
+The `claude` type can also run the official Claude Code harness against a third-party Anthropic-compatible endpoint, bring your own key:
+
+```sh
+5dive agent create cheap-coder --type=claude --provider=deepseek --api-key=<key>
+# providers: deepseek (DeepSeek), moonshot (Kimi), zai (GLM)
+```
 
 ---
 
@@ -100,14 +109,20 @@ If you'd rather click than `ssh`, [5dive.com](https://5dive.com) is the managed 
 5dive agent send <name> <text>
 5dive agent ask  <name> <text> [--timeout=120]
 5dive agent logs <name> [--follow]
+5dive agent config <name> set model=<id> / effort=<low|medium|high|xhigh|max>
 5dive agent <name> tui
 
-5dive account   add / login / list / show / rename / remove
+5dive task      add / ls / assign / start / done / need / inbox / answer
+5dive heartbeat on / off / ls / tick     # wake agents that have queued work
+5dive org       set / tree               # who reports to whom
+
+5dive account   add / login / list / show / usage / rename / remove
 5dive auth      set / login / status     # lower-level; account is the human path
 5dive skill     add / list / remove
 5dive doctor [--repair] [--json]
 5dive watch                              # htop-style live view
-5dive compose up / down / ps             # declarative agents via 5dive.yaml
+5dive up / down / ps / export            # declarative agents via 5dive.yaml
+5dive team import <slug>                 # provision a whole team template in one call
 5dive self-update                        # update CLI + plugins, then restart agents
 ```
 
@@ -126,7 +141,38 @@ One sign-in, many agents:
 5dive agent create agent-b --type=claude --auth-profile=work
 ```
 
-Rename or rotate the account, every bound agent rebinds automatically.
+Rename or rotate the account, every bound agent rebinds automatically. `5dive account usage` shows each account's rate-limit headroom.
+
+---
+
+## Give them work
+
+Agents on a box share a task queue (sqlite, no server). File work, assign it, and let the heartbeat wake the assignee only when there's something to do. Recurring templates materialize on a cron schedule:
+
+```sh
+5dive task add "triage overnight CI failures" --assignee=ops --recurring="0 7 * * *"
+5dive heartbeat on ops --every=30m
+```
+
+When an agent hits something only a human can decide, it parks the task on you:
+
+```sh
+5dive task need DIVE-42 --type=approval --ask="Ship pricing v2?" --options="ship|hold" --recommend=ship
+```
+
+That arrives on your Telegram as tap-to-answer buttons. Tap one, and the owning agent is unblocked and resumes. `5dive task inbox` lists everything waiting on a human, and `5dive org` keeps a reporting chart so you can see who works for whom.
+
+---
+
+## One bot for the whole team
+
+Per-agent bots are optional. Point one shared bot at a Telegram group (topics enabled) and every agent gets its own forum topic:
+
+```sh
+5dive agent team-bot shared --group=<chat_id> --agents=coder,writer,pm --token=<bot-token>
+```
+
+New agents auto-attach with their own topic (opt out per agent with `--no-team-bot`). `team-bot discover` finds the group id for you, and `team-bot intercom` mirrors inter-agent chatter into a dedicated topic so you can watch the team coordinate.
 
 ---
 
