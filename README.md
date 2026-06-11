@@ -185,7 +185,7 @@ New agents auto-attach with their own topic (opt out per agent with `--no-team-b
 | `sandboxed` | own home only, no sudo, systemd resource limits |
 
 ```sh
-5dive agent create my-agent --type=claude --isolation=sandboxed
+sudo 5dive agent create my-agent --type=claude --isolation=sandboxed
 ```
 
 ---
