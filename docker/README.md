@@ -41,6 +41,23 @@ container too — there's just no browser inside, so it's copy-out/paste-in:
 5dive agent create my-agent --type=claude --auth-profile=me
 ```
 
+Talk to the agent from your phone — Telegram works from inside the container
+(the bot long-polls outbound, no inbound ports needed). Get a token from
+[BotFather](https://t.me/BotFather):
+
+```sh
+5dive agent create my-agent --type=claude --channels=telegram --telegram-token=<token>
+5dive agent pair   my-agent --code=<pairing-code>
+```
+
+Or run the official Claude Code harness against an Anthropic-compatible
+third-party endpoint, bring your own key:
+
+```sh
+5dive agent create cheap-coder --type=claude --provider=deepseek --api-key=<key>
+# providers: deepseek (DeepSeek), moonshot (Kimi), zai (GLM)
+```
+
 ## Teardown
 
 ```sh
