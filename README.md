@@ -1,13 +1,15 @@
-# 5dive
+# 5dive — your team of AI agents, on your own server
 
 [![install-smoke](https://github.com/5dive-com/5dive/actions/workflows/install-smoke.yml/badge.svg)](https://github.com/5dive-com/5dive/actions/workflows/install-smoke.yml)
 [![bundle-drift](https://github.com/5dive-com/5dive/actions/workflows/bundle-drift.yml/badge.svg)](https://github.com/5dive-com/5dive/actions/workflows/bundle-drift.yml)
 [![Latest release](https://img.shields.io/github/v/release/5dive-com/5dive)](https://github.com/5dive-com/5dive/releases)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-spawn and manage AI agents that talk to each other.
+**Spawn agents that talk to each other, message you on Telegram, and keep working after you close the laptop. Works with claude, codex, grok, antigravity.**
 
-> MIT. The same binary that runs every agent on [5dive.com](https://5dive.com). No open-core split. Skip the ops with the managed VM, or run your own.
+![34 seconds: install to a Claude agent answering on Telegram](docs/quickstart.gif)
+
+> MIT. The same binary that runs every agent on [5dive.com](https://5dive.com). No open-core split. We run 5dive on 5dive — the agents this repo spawns are the ones who ship it. Skip the ops with the managed VM, or run your own.
 
 ---
 
