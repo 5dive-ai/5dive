@@ -680,10 +680,12 @@ cmd_auth_login() {
       exec sudo -u claude -i env $extra_env "$bin" auth add openai-codex ;;
     openclaw)
       # openclaw runs the same OpenAI /codex/device flow as hermes, but it
-      # routes through `models auth login`. Pass --provider + --method to
-      # skip the @clack/prompts wizard's two pickers (auth.ts:185-188 short-
-      # circuits when both resolve), and --set-default to apply the
-      # provider's defaultModel (openai-codex/gpt-5.5) so no follow-on
+      # routes through `models auth login`. openclaw 2026.6.6 renamed the
+      # flags (DIVE-297): provider id is now `openai` (was `openai-codex`)
+      # and the device method is the boolean `--device-code` (was `--method
+      # device-code`); the old form fails "No provider plugins found" before
+      # any prompt. --provider + --device-code skip the @clack/prompts pickers,
+      # and --set-default applies the provider's default model so no follow-on
       # `models set` is needed. DISPLAY=:0 forces isRemote=false in
       # infra/remote-env.ts so the user-code prints inline (else openclaw
       # redacts it as "[shown on the local device only]").
@@ -699,7 +701,7 @@ cmd_auth_login() {
           "${oc_home}/.openclaw/agents/main/agent" 2>/dev/null || true
       fi
       exec sudo -u claude -i env DISPLAY=:0 $extra_env "$bin" \
-        models auth login --provider openai-codex --method device-code --set-default ;;
+        models auth login --provider openai --device-code --set-default ;;
     codex)
       # CODEX_HOME (when profiled) overrides /etc/profile.d's default.
       exec sudo -u claude -i env $extra_env bash -lc 'codex login' ;;
@@ -989,10 +991,12 @@ cmd_auth_start() {
       login_cmd="$bin auth add openai-codex" ;;
     openclaw)
       # openclaw routes the same OpenAI /codex/device flow through
-      # `models auth login`. --provider + --method short-circuit the
-      # @clack/prompts pickers in auth.ts:185-188 so no interactive prompts
-      # appear before the URL+code print. --set-default applies the
-      # provider's defaultModel (openai-codex/gpt-5.5). DISPLAY=:0 forces
+      # `models auth login`. 2026.6.6 flag rename (DIVE-297): --provider openai
+      # (was openai-codex) + --device-code (was --method device-code), else it
+      # fails "No provider plugins found" before any prompt. --provider +
+      # --device-code short-circuit the @clack/prompts pickers so no
+      # interactive prompts appear before the URL+code print. --set-default
+      # applies the provider's default model. DISPLAY=:0 forces
       # isRemoteEnvironment() to return false so the user-code is logged
       # inline (otherwise infra/remote-env.ts treats headless Linux as
       # remote and openclaw redacts the code as "[shown on the local
@@ -1011,7 +1015,7 @@ cmd_auth_start() {
           "${oc_home}/.openclaw/agents/main" \
           "${oc_home}/.openclaw/agents/main/agent" 2>/dev/null || true
       fi
-      login_cmd="$bin models auth login --provider openai-codex --method device-code --set-default" ;;
+      login_cmd="$bin models auth login --provider openai --device-code --set-default" ;;
     *)      login_cmd="$bin setup-token" ;;
   esac
 
