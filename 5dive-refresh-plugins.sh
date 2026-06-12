@@ -40,6 +40,43 @@ CLAUDE_BIN="${CLAUDE_BIN:-/home/claude/.local/bin/claude}"
 # only the active version (old behavior); 0 disables pruning.
 KEEP_PLUGIN_VERSIONS="${KEEP_PLUGIN_VERSIONS:-2}"
 
+# GitHub org migration (5dive-com -> 5dive-ai, 2026-06): existing agents
+# persist the marketplace source in known_marketplaces.json AND in the
+# marketplace clone's origin remote. Both break once the old org name is
+# parked, so rewrite them as soon as the new org is live. Probe once per
+# run; no-op until the rename happens. GH_ORG env overrides the probe.
+GH_ORG="${GH_ORG:-}"
+if [[ -z "$GH_ORG" ]]; then
+  if curl -fsI --max-time 8 "https://raw.githubusercontent.com/5dive-ai/5dive/main/install.sh" >/dev/null 2>&1; then
+    GH_ORG="5dive-ai"
+  else
+    GH_ORG="5dive-com"
+  fi
+fi
+
+migrate_marketplace_org() {
+  local user="$1" home="$2"
+  [[ "$GH_ORG" == "5dive-com" ]] && return 0
+  local km="$home/.claude/plugins/known_marketplaces.json"
+  if [[ -f "$km" ]] && grep -q '5dive-com/' "$km"; then
+    # sudo -u (not plain sed -i) so the rewritten file keeps the agent's
+    # ownership — sed -i replaces via rename and would leave it root-owned.
+    sudo -u "$user" -H sed -i "s#github.com/5dive-com/#github.com/$GH_ORG/#g; s#\"5dive-com/#\"$GH_ORG/#g" "$km" \
+      && echo "    migrated known_marketplaces.json -> $GH_ORG"
+  fi
+  local mpdir url
+  for mpdir in "$home"/.claude/plugins/marketplaces/*/; do
+    [[ -d "$mpdir/.git" ]] || continue
+    url=$(sudo -u "$user" -H git -C "$mpdir" remote get-url origin 2>/dev/null || true)
+    case "$url" in
+      *github.com/5dive-com/*)
+        sudo -u "$user" -H git -C "$mpdir" remote set-url origin "${url//5dive-com/$GH_ORG}" \
+          && echo "    migrated $(basename "$mpdir") clone remote -> $GH_ORG" ;;
+    esac
+  done
+  return 0
+}
+
 RESTART_CHANGED=0
 agents=""
 for arg in "$@"; do
@@ -154,6 +191,8 @@ refresh_agent() {
     echo "  $user: before:"
     while IFS= read -r line; do echo "    $line"; done <<<"$before"
   fi
+
+  migrate_marketplace_org "$user" "$home"
 
   local marketplaces
   marketplaces=$(printf '%s\n' "$all_keys" | awk -F@ '{print $NF}' | sort -u)

@@ -11,6 +11,18 @@ release.
 
 (nothing yet)
 
+## [0.1.88] — 2026-06-12
+
+### Added
+
+- Org-rename migration for EXISTING agents (follow-up to 0.1.87, gap caught
+  by dev): each agent's persisted marketplace state — the source URL in
+  `known_marketplaces.json` and the marketplace clone's git origin remote —
+  still pointed at `5dive-com`. `5dive-refresh-plugins.sh` now rewrites both
+  to the live org (same probe + `GH_ORG` override) at the top of each agent's
+  refresh, before `plugin marketplace update` runs. No-op until the rename
+  lands; idempotent after.
+
 ## [0.1.87] — 2026-06-12
 
 GitHub org rename prep: `5dive-com` → `5dive-ai`.
