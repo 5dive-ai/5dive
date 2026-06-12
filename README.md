@@ -25,11 +25,6 @@ curl -fsSL https://install.5dive.com | sudo bash
 sudo 5dive init
 ```
 
-The whole thing, uncut, on a fresh box — install to a Claude agent answering
-on Telegram (idle time compressed):
-
-[![5dive quickstart: fresh box to a Claude agent answering on Telegram](https://asciinema.org/a/obScxshVIyR0mlK1.svg)](https://asciinema.org/a/obScxshVIyR0mlK1)
-
 Scripting it instead (CI, provisioning)? The non-interactive path needs one
 extra step — the bot replies to your first DM with a pairing code:
 
