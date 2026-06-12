@@ -26,7 +26,7 @@ esac
 
 # Bumped on every public release. `build.sh` checks this line exists; CI fails
 # the bundle-drift check if it's missing or empty.
-readonly FIVE_VERSION="0.1.85"
+readonly FIVE_VERSION="0.1.86"
 
 STATE_DIR="/var/lib/5dive"
 REGISTRY="${STATE_DIR}/agents.json"
@@ -2357,14 +2357,25 @@ indent2() { while IFS= read -r _l; do printf '  %s\n' "$_l"; done; }
 
 # -------- auth status (per type, default profile) --------
 
-# auth_creds_present <type> — non-empty stdout if the default-profile credential
+# auth_creds_present <type> [profile] — non-empty stdout if the credential
 # file for this type has a usable token/key. Handles both env-file format
 # (anthropic.env with CLAUDE_CODE_OAUTH_TOKEN or ANTHROPIC_API_KEY) and the
-# JSON sentinels codex/opencode write on login.
+# JSON sentinels codex/opencode write on login. With <profile> set, checks the
+# PROFILE's credential dir instead of the default home (DIVE-296: the wizard
+# creates profile-scoped agents, so a default-home check wrongly reported
+# "needs_login" and re-ran the whole OAuth flow even when the profile already
+# had a credential).
 auth_creds_present() {
-  local type="$1" sentinel="${TYPE_AUTH[$1]:-}"
+  local type="$1" profile="${2:-}" sentinel="${TYPE_AUTH[$1]:-}"
   [[ -n "$sentinel" ]] || return 1
   local path="${sentinel%%:*}" key="${sentinel##*:}"
+  # Profile-scoped: swap the default credential path for the profile's. The
+  # jq key (for OAuth json sentinels) is unchanged.
+  if [[ -n "$profile" ]]; then
+    local ppath
+    ppath=$(profile_type_auth_path "$profile" "$type") || ppath=""
+    [[ -n "$ppath" ]] && path="$ppath"
+  fi
   local sentinel_ok=0
   if [[ "$path" == "$key" ]]; then
     [[ -s "$path" ]] && sentinel_ok=1
@@ -2390,9 +2401,16 @@ auth_creds_present() {
   # equally-valid auth — matches the policy that API-key is the preferred
   # path for 3P-harness-blocked vendors (project_google_third_party_harness_policy,
   # project_anthropic_third_party_harness_policy).
-  local api_file="${TYPE_API_FILE[$type]:-}"
-  [[ -n "$api_file" ]] || return 1
-  local api_path="${CONNECTORS_DIR}/${api_file}"
+  # Profile-scoped api keys live in the profile's combined.env, not the shared
+  # connectors dir; check there when a profile is set.
+  local api_path
+  if [[ -n "$profile" ]]; then
+    api_path="${AUTH_PROFILES_DIR}/${profile}/combined.env"
+  else
+    local api_file="${TYPE_API_FILE[$type]:-}"
+    [[ -n "$api_file" ]] || return 1
+    api_path="${CONNECTORS_DIR}/${api_file}"
+  fi
   [[ -f "$api_path" ]] || return 1
   local api_val
   api_val=$(grep -Ev '^\s*#' "$api_path" 2>/dev/null | grep -E '^[A-Z_]+=.+' | head -n1 || true)
@@ -2448,20 +2466,21 @@ auth_probe_one() {
 # Pass --no-probe for callers that only want a cheap file check (e.g. the
 # bulk cmd_auth_status loop, which runs before the dashboard renders and
 # shouldn't block for N*5s). Set FIVEDIVE_AUTH_PROBE=1 to force a probe.
+# auth_status_one <type> [--no-probe] [profile]
 auth_status_one() {
-  local type="$1" probe_flag="${2:-}"
+  local type="$1" probe_flag="${2:-}" profile="${3:-}"
   is_known_type "$type" || { echo "unknown"; return; }
   [[ -x "${TYPE_BIN[$type]}" ]] || { echo "not_installed"; return; }
   # No sentinel configured = type doesn't require external auth (opencode ships
   # with free models). Report "ok" so the connect flow skips straight to create.
   [[ -n "${TYPE_AUTH[$type]:-}" ]] || { echo "ok"; return; }
-  if ! auth_creds_present "$type"; then
+  if ! auth_creds_present "$type" "$profile"; then
     echo "needs_login"; return
   fi
   if [[ "$probe_flag" == "--no-probe" ]]; then
     echo "ok"; return
   fi
-  auth_probe_one "$type"
+  auth_probe_one "$type" "$profile"
   case "$?" in
     0) echo "ok" ;;
     1) echo "stale" ;;
@@ -2476,16 +2495,22 @@ cmd_auth_status() {
   # lets the API layer opt in once without parsing cli args.
   local probe_flag="--no-probe"
   local t=""
+  local profile=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      --probe)       probe_flag="" ;;
-      --no-probe)    probe_flag="--no-probe" ;;
-      --type=*)      t="${1#--type=}" ;;
-      -*)            fail "$E_USAGE" "unknown flag: $1" ;;
-      *)             [[ -z "$t" ]] && t="$1" || fail "$E_USAGE" "extra arg: $1" ;;
+      --probe)         probe_flag="" ;;
+      --no-probe)      probe_flag="--no-probe" ;;
+      --type=*)        t="${1#--type=}" ;;
+      --auth-profile=*) profile="${1#--auth-profile=}" ;;
+      -*)              fail "$E_USAGE" "unknown flag: $1" ;;
+      *)               [[ -z "$t" ]] && t="$1" || fail "$E_USAGE" "extra arg: $1" ;;
     esac
     shift
   done
+  # DIVE-296: --auth-profile scopes the check to one profile, so it only makes
+  # sense for a single type. Guard rather than silently checking the default.
+  [[ -n "$profile" && -z "$t" ]] \
+    && fail "$E_USAGE" "--auth-profile requires --type=<type>"
   [[ -z "$probe_flag" && "${FIVEDIVE_AUTH_PROBE:-}" == "0" ]] && probe_flag="--no-probe"
   [[ "$probe_flag" == "--no-probe" && "${FIVEDIVE_AUTH_PROBE:-}" == "1" ]] && probe_flag=""
 
@@ -2501,7 +2526,7 @@ cmd_auth_status() {
   local first=1
   for type in "${types[@]}"; do
     local s
-    s=$(auth_status_one "$type" "$probe_flag")
+    s=$(auth_status_one "$type" "$probe_flag" "$profile")
     if (( first )); then first=0; else out+=","; fi
     out+="\"$type\":\"$s\""
   done
