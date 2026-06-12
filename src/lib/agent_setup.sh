@@ -40,6 +40,16 @@ preseed_claude_agent() {
 
   sudo -u "$user" mkdir -p "$home/.claude"
 
+  # ~/.local/bin/claude shim: agents launch via the SHARED binary
+  # (/home/claude/.local/bin/claude in 5dive-agent-start), so the agent user
+  # has no claude on its own PATH. CC >= 2.1.174 surfaces that as a /doctor
+  # "claude command missing or broken" setup warning in every session
+  # (DIVE-283). A per-agent symlink satisfies the check AND makes plain
+  # `claude` work in agent subshells. Nightly soft-updates backfills
+  # existing agents with the same shim.
+  sudo -u "$user" mkdir -p "$home/.local/bin"
+  sudo -u "$user" ln -sfn /home/claude/.local/bin/claude "$home/.local/bin/claude"
+
   # .claude.json: theme + onboarding + trust for /home/claude/projects
   sudo -u "$user" tee "$home/.claude.json" >/dev/null <<JSON
 {
