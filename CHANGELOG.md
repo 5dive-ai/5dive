@@ -11,6 +11,21 @@ release.
 
 (nothing yet)
 
+## [0.1.87] — 2026-06-12
+
+GitHub org rename prep: `5dive-com` → `5dive-ai`.
+
+### Changed
+
+- All GitHub fetch sites (self-update, installer `REPO`, plugin/skill
+  tarballs, marketplace registration, doc links) now resolve the org at
+  runtime via a new `gh_org()` helper: probe `5dive-ai` once per process,
+  fall back to `5dive-com`, `GH_ORG` env overrides. Installs and updates
+  work identically on either side of the rename, so the old org can be
+  parked immediately after renaming with no redirect window to squat.
+- install.sh header now documents the canonical `install.5dive.com` alias
+  instead of a raw GitHub URL.
+
 ## [0.1.84] — 2026-06-11
 
 Catch-up release covering 0.1.78 → 0.1.84.
@@ -1019,8 +1034,8 @@ New `preseed_antigravity_agent` in `agent_setup.sh`, dispatched alongside
   - Three follow-up fixes against the inter-agent mirror after first
     live use against `agent-marketing`.
 
-[Unreleased]: https://github.com/5dive-com/5dive/compare/v0.1.2...HEAD
-[0.1.2]: https://github.com/5dive-com/5dive/releases/tag/v0.1.2
+[Unreleased]: https://github.com/5dive-ai/5dive/compare/v0.1.2...HEAD
+[0.1.2]: https://github.com/5dive-ai/5dive/releases/tag/v0.1.2
 
 ## [0.1.1] — 2026-05-16
 
@@ -1094,5 +1109,5 @@ First public release.
 - `bundle-drift` workflow — fails any push where the committed `5dive`
   bundle disagrees with `./build.sh` output from `src/`.
 
-[0.1.1]: https://github.com/5dive-com/5dive/releases/tag/v0.1.1
-[0.1.0]: https://github.com/5dive-com/5dive/releases/tag/v0.1.0
+[0.1.1]: https://github.com/5dive-ai/5dive/releases/tag/v0.1.1
+[0.1.0]: https://github.com/5dive-ai/5dive/releases/tag/v0.1.0

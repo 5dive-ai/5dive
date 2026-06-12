@@ -43,7 +43,7 @@ cmd_self_update() {
   trap "rm -f '$installer'" RETURN
 
   step "Fetching installer"
-  curl -fsSL "https://raw.githubusercontent.com/5dive-com/5dive/main/install.sh" -o "$installer" \
+  curl -fsSL "https://raw.githubusercontent.com/$(gh_org)/5dive/main/install.sh" -o "$installer" \
     || fail "$E_GENERIC" "failed to fetch installer"
 
   step "Upgrading 5dive CLI + plugins"
@@ -98,7 +98,7 @@ cmd_update_check() {
   command -v curl >/dev/null 2>&1 || fail "$E_NOT_FOUND" "curl is required for update --check"
 
   local current="$FIVE_VERSION" latest
-  latest=$(curl -fsSL "https://raw.githubusercontent.com/5dive-com/5dive/main/5dive" 2>/dev/null \
+  latest=$(curl -fsSL "https://raw.githubusercontent.com/$(gh_org)/5dive/main/5dive" 2>/dev/null \
     | grep -m1 -oP '(?<=^readonly FIVE_VERSION=")[^"]+') \
     || true
   [[ -n "$latest" ]] || fail "$E_GENERIC" "could not determine the latest published version"

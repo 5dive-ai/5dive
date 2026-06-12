@@ -242,7 +242,7 @@ Anthropic Teams accounts:
   if your bot stays silent on incoming DMs, your org admin may need to
   allowlist this plugin in the Anthropic Console. Diagnose with:
     sudo 5dive doctor --category=channels
-  Setup snippet: https://github.com/5dive-com/5dive-plugins#anthropic-teams-accounts
+  Setup snippet: https://github.com/$(gh_org)/5dive-plugins#anthropic-teams-accounts
 
 TEAMS
   fi

@@ -28,7 +28,7 @@ Requirements:
 Clone and build the CLI bundle:
 
 ```bash
-git clone https://github.com/5dive-com/5dive.git
+git clone https://github.com/5dive-ai/5dive.git
 cd 5dive
 ./build.sh        # concatenates src/ into the single-file `5dive` bundle
 bash -n 5dive     # syntax-check the bundle
@@ -103,7 +103,7 @@ caught.
 ## Reporting bugs / requesting features
 
 Open a GitHub issue. For security issues, use [GitHub's private vulnerability
-reporting](https://github.com/5dive-com/5dive/security/advisories/new) —
+reporting](https://github.com/5dive-ai/5dive/security/advisories/new) —
 **do not** open a public issue for a vulnerability.
 
 ## License

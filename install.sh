@@ -1,14 +1,27 @@
 #!/usr/bin/env bash
 # 5dive CLI installer / uninstaller
-# Install:   curl -fsSL https://raw.githubusercontent.com/5dive-com/5dive/main/install.sh | sudo bash
-# Upgrade:   curl -fsSL https://raw.githubusercontent.com/5dive-com/5dive/main/install.sh | sudo bash -s -- --upgrade
-# Uninstall: curl -fsSL https://raw.githubusercontent.com/5dive-com/5dive/main/install.sh | sudo bash -s -- --uninstall
+# Install:   curl -fsSL https://install.5dive.com | sudo bash
+# Upgrade:   curl -fsSL https://install.5dive.com | sudo bash -s -- --upgrade
+# Uninstall: curl -fsSL https://install.5dive.com | sudo bash -s -- --uninstall
 set -euo pipefail
+
+# GitHub org our repos live under. The org is being renamed
+# 5dive-com -> 5dive-ai (2026-06); installs must work on either side of the
+# rename, so probe the new org once and fall back to the old name. GH_ORG
+# env overrides the probe (CI, forks, air-gapped mirrors). Standalone copy
+# of the bundle's gh_org() — this script runs before the bundle exists.
+if [[ -z "${GH_ORG:-}" ]]; then
+  if curl -fsI --max-time 8 "https://raw.githubusercontent.com/5dive-ai/5dive/main/install.sh" >/dev/null 2>&1; then
+    GH_ORG="5dive-ai"
+  else
+    GH_ORG="5dive-com"
+  fi
+fi
 
 # Source for binaries / hooks / skills. Overridable for offline installs,
 # enterprise mirrors, and pre-publish smoke tests (which point this at a
 # `file://` bundle of the working tree).
-REPO="${REPO:-https://raw.githubusercontent.com/5dive-com/5dive/main}"
+REPO="${REPO:-https://raw.githubusercontent.com/$GH_ORG/5dive/main}"
 BIN_DIR="/usr/local/bin"
 STATE_DIR="/var/lib/5dive"
 CONNECTORS_DIR="/etc/5dive/connectors"
@@ -83,13 +96,13 @@ refresh_managed_files() {
   chmod 644 "$LIB_DIR/skills/notify-user/SKILL.md"
   ok "notify-user skill"
 
-  # Stage 5dive-cli skill (from 5dive-com/skills — separate repo from this
+  # Stage 5dive-cli skill (from the skills repo — separate repo from this
   # CLI's source). Unlike notify-user which is a single SKILL.md, this one
   # ships SKILL.md plus a references/ subdir, so we tarball the whole subdir
   # in one shot. update.sh's per-agent refresh loop syncs from here, so an
   # existing agent's 5dive-cli skill picks up upstream changes on the daily
   # 03:00 cron instead of being frozen at agent-create time.
-  SKILLS_REPO_TARBALL="${SKILLS_REPO_TARBALL:-https://github.com/5dive-com/skills/archive/refs/heads/main.tar.gz}"
+  SKILLS_REPO_TARBALL="${SKILLS_REPO_TARBALL:-https://github.com/$GH_ORG/skills/archive/refs/heads/main.tar.gz}"
   install -d -m 755 "$LIB_DIR/skills/5dive-cli"
   _skill_tmp=$(mktemp -d)
   if curl -fsSL "$SKILLS_REPO_TARBALL" \
@@ -106,7 +119,7 @@ refresh_managed_files() {
   fi
   rm -rf "$_skill_tmp"
 
-  # Stage the telegram-codex plugin (from 5dive-com/5dive-plugins). Codex has
+  # Stage the telegram-codex plugin (from the 5dive-plugins repo). Codex has
   # no plugin marketplace, so unlike claude there's nothing to install per
   # agent — its MCP server + lifecycle hooks run from this one shared checkout.
   # 5dive-agent-start points each codex+telegram agent's config.toml at
@@ -116,7 +129,7 @@ refresh_managed_files() {
   # the runtime deps (grammy) so the hooks/server actually run. cp -a overlays
   # the source onto any existing copy so node_modules survives across --upgrade
   # refreshes; bun reconciles deps against the (possibly updated) lockfile.
-  CODEX_PLUGIN_TARBALL="${CODEX_PLUGIN_TARBALL:-https://github.com/5dive-com/5dive-plugins/archive/refs/heads/main.tar.gz}"
+  CODEX_PLUGIN_TARBALL="${CODEX_PLUGIN_TARBALL:-https://github.com/$GH_ORG/5dive-plugins/archive/refs/heads/main.tar.gz}"
   _cdx_tmp=$(mktemp -d)
   if curl -fsSL "$CODEX_PLUGIN_TARBALL" \
       | tar -xz -C "$_cdx_tmp" --strip-components=1 '5dive-plugins-main/plugins/telegram-codex' 2>/dev/null \
@@ -148,7 +161,7 @@ refresh_managed_files() {
   # this one shared checkout via absolute paths written into ~/.grok/config.toml
   # by 5dive-agent-start. Override the tarball with GROK_PLUGIN_TARBALL for
   # offline / test installs.
-  GROK_PLUGIN_TARBALL="${GROK_PLUGIN_TARBALL:-https://github.com/5dive-com/5dive-plugins/archive/refs/heads/main.tar.gz}"
+  GROK_PLUGIN_TARBALL="${GROK_PLUGIN_TARBALL:-https://github.com/$GH_ORG/5dive-plugins/archive/refs/heads/main.tar.gz}"
   _grk_tmp=$(mktemp -d)
   if curl -fsSL "$GROK_PLUGIN_TARBALL" \
       | tar -xz -C "$_grk_tmp" --strip-components=1 '5dive-plugins-main/plugins/telegram-grok' 2>/dev/null \
@@ -176,7 +189,7 @@ refresh_managed_files() {
   # ~/.gemini/config/{mcp_config.json,hooks.json} by 5dive-agent-start (agy
   # doesn't auto-load a plugin's mcp_config/hooks — only skills/agents).
   # Override the tarball with AGY_PLUGIN_TARBALL for offline / pinned installs.
-  AGY_PLUGIN_TARBALL="${AGY_PLUGIN_TARBALL:-https://github.com/5dive-com/5dive-plugins/archive/refs/heads/main.tar.gz}"
+  AGY_PLUGIN_TARBALL="${AGY_PLUGIN_TARBALL:-https://github.com/$GH_ORG/5dive-plugins/archive/refs/heads/main.tar.gz}"
   _agy_tmp="$(mktemp -d)"
   if curl -fsSL "$AGY_PLUGIN_TARBALL" \
       | tar -xz -C "$_agy_tmp" --strip-components=1 '5dive-plugins-main/plugins/telegram-agy' 2>/dev/null \
@@ -208,7 +221,7 @@ refresh_managed_files() {
   # opencode_agent's plugin-dir check fails) — i.e. opencode telegram is a
   # no-op on customer boxes until staged. Override with OPENCODE_PLUGIN_TARBALL
   # for offline / pinned installs.
-  OPENCODE_PLUGIN_TARBALL="${OPENCODE_PLUGIN_TARBALL:-https://github.com/5dive-com/5dive-plugins/archive/refs/heads/main.tar.gz}"
+  OPENCODE_PLUGIN_TARBALL="${OPENCODE_PLUGIN_TARBALL:-https://github.com/$GH_ORG/5dive-plugins/archive/refs/heads/main.tar.gz}"
   _ocode_tmp="$(mktemp -d)"
   if curl -fsSL "$OPENCODE_PLUGIN_TARBALL" \
       | tar -xz -C "$_ocode_tmp" --strip-components=1 '5dive-plugins-main/plugins/telegram-opencode' 2>/dev/null \
@@ -533,4 +546,4 @@ echo "  5dive doctor --repair                     # auto-install agent type bina
 echo "  5dive agent create my-agent --type=claude # create your first agent"
 echo
 echo "To upgrade later: curl -fsSL $REPO/install.sh | sudo bash -s -- --upgrade"
-echo "Docs: https://github.com/5dive-com/5dive"
+echo "Docs: https://github.com/$GH_ORG/5dive"

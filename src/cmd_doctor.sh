@@ -340,7 +340,7 @@ cmd_doctor() {
         last_event=$(sudo -u "$user" grep -E 'Channel notifications (registered|skipped|.*not on the approved channels allowlist)' "$latest" 2>/dev/null | tail -1)
         if [[ "$last_event" == *"not on the approved channels allowlist"* ]]; then
           doctor_add channels "agent:$name" error \
-            "claude logged 'Channel notifications skipped' — likely on an Anthropic Teams org. Org admin must allowlist telegram@5dive-plugins via console. See: https://github.com/5dive-com/5dive-plugins#anthropic-teams-accounts" \
+            "claude logged 'Channel notifications skipped' — likely on an Anthropic Teams org. Org admin must allowlist telegram@5dive-plugins via console. See: https://github.com/$(gh_org)/5dive-plugins#anthropic-teams-accounts" \
             false false
         elif [[ "$last_event" == *"registered"* ]]; then
           doctor_add channels "agent:$name" ok "channel registered (latest MCP log: $(basename "$latest"))"

@@ -26,7 +26,24 @@ esac
 
 # Bumped on every public release. `build.sh` checks this line exists; CI fails
 # the bundle-drift check if it's missing or empty.
-readonly FIVE_VERSION="0.1.86"
+readonly FIVE_VERSION="0.1.87"
+
+# GitHub org our repos live under. The org is being renamed
+# 5dive-com -> 5dive-ai (2026-06); fetches must work on either side of the
+# rename, so probe the new org once per process and fall back to the old
+# name. GH_ORG env overrides the probe (CI, forks, air-gapped mirrors).
+gh_org() {
+  if [[ -z "${_GH_ORG_RESOLVED:-}" ]]; then
+    if [[ -n "${GH_ORG:-}" ]]; then
+      _GH_ORG_RESOLVED="$GH_ORG"
+    elif curl -fsI --max-time 8 "https://raw.githubusercontent.com/5dive-ai/5dive/main/install.sh" >/dev/null 2>&1; then
+      _GH_ORG_RESOLVED="5dive-ai"
+    else
+      _GH_ORG_RESOLVED="5dive-com"
+    fi
+  fi
+  printf '%s' "$_GH_ORG_RESOLVED"
+}
 
 STATE_DIR="/var/lib/5dive"
 REGISTRY="${STATE_DIR}/agents.json"
@@ -756,7 +773,7 @@ JSON
     status_line_obj='{statusLine: {type: "command", command: "bash /usr/local/lib/5dive/statusline.sh"}}'
   fi
   local settings
-  settings=$(jq -n --argjson sl "$(jq -n "$status_line_obj")" '{
+  settings=$(jq -n --argjson sl "$(jq -n "$status_line_obj")" --arg ghorg "$(gh_org)" '{
     model: "opus",
     permissions: {
       defaultMode: "bypassPermissions",
@@ -769,7 +786,7 @@ JSON
         source: {source: "github", repo: "anthropics/claude-plugins-official"}
       },
       "5dive-plugins": {
-        source: {source: "github", repo: "5dive-com/5dive-plugins"}
+        source: {source: "github", repo: "\($ghorg)/5dive-plugins"}
       }
     }
   } + $sl')
@@ -806,7 +823,7 @@ JSON
       sudo -u "$user" cp "$TELEGRAM_AGENT_CLAUDE_MD" "$home/.claude/CLAUDE.md"
       chmod 644 "$home/.claude/CLAUDE.md"
     else
-      warn "$TELEGRAM_AGENT_CLAUDE_MD missing — per-agent telegram CLAUDE.md not wired (run: curl -fsSL https://raw.githubusercontent.com/5dive-com/5dive/main/install.sh | sudo bash)"
+      warn "$TELEGRAM_AGENT_CLAUDE_MD missing — per-agent telegram CLAUDE.md not wired (run: curl -fsSL https://raw.githubusercontent.com/$(gh_org)/5dive/main/install.sh | sudo bash)"
     fi
   fi
 
@@ -815,7 +832,7 @@ JSON
   #   find-skills — search skills.sh and self-install additional skills on demand
   #   5dive-cli   — spawn sub-agents on this VM via the local 5dive CLI
   install_default_skill_for_agent "$name" claude vercel-labs/skills find-skills || true
-  install_default_skill_for_agent "$name" claude 5dive-com/skills 5dive-cli || true
+  install_default_skill_for_agent "$name" claude "$(gh_org)/skills" 5dive-cli || true
 }
 
 # Preseed default skills for an antigravity agent. Unlike claude/codex/grok,
@@ -830,7 +847,7 @@ preseed_antigravity_agent() {
   local home="/home/agent-${name}"
   [[ -d "$home" ]] || fail "$E_GENERIC" "agent home missing: $home"
   install_default_skill_for_agent "$name" antigravity vercel-labs/skills find-skills || true
-  install_default_skill_for_agent "$name" antigravity 5dive-com/skills 5dive-cli || true
+  install_default_skill_for_agent "$name" antigravity "$(gh_org)/skills" 5dive-cli || true
 }
 
 # Types that `npx skills add --agent <id>` doesn't recognize. The upstream
@@ -946,7 +963,7 @@ install_channel_plugin_for_agent() {
   local mkt_repo="https://github.com/anthropics/claude-plugins-official.git"
   if [[ "$plugin" == "telegram" ]]; then
     marketplace="5dive-plugins"
-    mkt_repo="https://github.com/5dive-com/5dive-plugins.git"
+    mkt_repo="https://github.com/$(gh_org)/5dive-plugins.git"
   fi
 
   step "Installing $plugin plugin for $user (from $marketplace)"
@@ -1420,7 +1437,7 @@ CODEX_ENV
   # Upstream `npx skills add --agent codex` IS supported (see SKILLS_AGENT_ID),
   # so these route through the normal path, not the manual-install fallback.
   install_default_skill_for_agent "$name" codex vercel-labs/skills find-skills || true
-  install_default_skill_for_agent "$name" codex 5dive-com/skills 5dive-cli || true
+  install_default_skill_for_agent "$name" codex "$(gh_org)/skills" 5dive-cli || true
 }
 
 # Write ~/.codex/channels/telegram/access.json for agent-<name> with allowFrom
@@ -1544,7 +1561,7 @@ GROK_ENV
   # Upstream `npx skills add` doesn't recognize --agent grok, so these
   # route through the manual-install fallback in install_default_skill_for_agent.
   install_default_skill_for_agent "$name" grok vercel-labs/skills find-skills || true
-  install_default_skill_for_agent "$name" grok 5dive-com/skills 5dive-cli || true
+  install_default_skill_for_agent "$name" grok "$(gh_org)/skills" 5dive-cli || true
 }
 
 # Write ~/.grok/channels/telegram/access.json for agent-<name> with allowFrom
@@ -1666,7 +1683,7 @@ AGY_ENV
   # from cmd_create; repeating here keeps channel-attach self-contained and the
   # installs are idempotent.)
   install_default_skill_for_agent "$name" antigravity vercel-labs/skills find-skills || true
-  install_default_skill_for_agent "$name" antigravity 5dive-com/skills 5dive-cli || true
+  install_default_skill_for_agent "$name" antigravity "$(gh_org)/skills" 5dive-cli || true
 }
 
 # Write ~/.gemini/channels/telegram/access.json for agent-<name> with allowFrom
@@ -1793,7 +1810,7 @@ OPENCODE_ENV
   # the upstream skills registry (SKILLS_AGENT_ID[opencode]=opencode), so these
   # route through the normal `npx skills add` path.
   install_default_skill_for_agent "$name" opencode vercel-labs/skills find-skills || true
-  install_default_skill_for_agent "$name" opencode 5dive-com/skills 5dive-cli || true
+  install_default_skill_for_agent "$name" opencode "$(gh_org)/skills" 5dive-cli || true
 }
 
 # Write ~/.opencode/channels/telegram/access.json for agent-<name>. Idempotent —
@@ -8806,20 +8823,19 @@ valid_skill_source() {
   [[ "$1" =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$ ]]
 }
 
-# Default GitHub source applied to bare skill ids in --with-skills (e.g.
-# `5dive-cli` → `5dive-com/skills:5dive-cli`). Keeps the common path short
-# while leaving the door open for third-party skill repos.
-DEFAULT_SKILL_SOURCE="5dive-com/skills"
+# Bare skill ids in --with-skills default to the 5dive skills repo (e.g.
+# `5dive-cli` → `<org>/skills:5dive-cli`, org resolved by gh_org). Keeps the
+# common path short while leaving the door open for third-party skill repos.
 
 # parse_skill_spec <spec> -> "<source> <skill>"
-# Accepts either bare `<id>` (uses DEFAULT_SKILL_SOURCE) or `<owner/repo>:<id>`.
+# Accepts either bare `<id>` (defaults to the skills repo) or `<owner/repo>:<id>`.
 # Caller splits the result on space.
 parse_skill_spec() {
   local spec="$1"
   if [[ "$spec" == *:* ]]; then
     printf '%s %s\n' "${spec%%:*}" "${spec#*:}"
   else
-    printf '%s %s\n' "$DEFAULT_SKILL_SOURCE" "$spec"
+    printf '%s %s\n' "$(gh_org)/skills" "$spec"
   fi
 }
 
@@ -9369,7 +9385,7 @@ Anthropic Teams accounts:
   if your bot stays silent on incoming DMs, your org admin may need to
   allowlist this plugin in the Anthropic Console. Diagnose with:
     sudo 5dive doctor --category=channels
-  Setup snippet: https://github.com/5dive-com/5dive-plugins#anthropic-teams-accounts
+  Setup snippet: https://github.com/$(gh_org)/5dive-plugins#anthropic-teams-accounts
 
 TEAMS
   fi
@@ -9724,7 +9740,7 @@ cmd_doctor() {
         last_event=$(sudo -u "$user" grep -E 'Channel notifications (registered|skipped|.*not on the approved channels allowlist)' "$latest" 2>/dev/null | tail -1)
         if [[ "$last_event" == *"not on the approved channels allowlist"* ]]; then
           doctor_add channels "agent:$name" error \
-            "claude logged 'Channel notifications skipped' — likely on an Anthropic Teams org. Org admin must allowlist telegram@5dive-plugins via console. See: https://github.com/5dive-com/5dive-plugins#anthropic-teams-accounts" \
+            "claude logged 'Channel notifications skipped' — likely on an Anthropic Teams org. Org admin must allowlist telegram@5dive-plugins via console. See: https://github.com/$(gh_org)/5dive-plugins#anthropic-teams-accounts" \
             false false
         elif [[ "$last_event" == *"registered"* ]]; then
           doctor_add channels "agent:$name" ok "channel registered (latest MCP log: $(basename "$latest"))"
@@ -12367,7 +12383,7 @@ cmd_self_update() {
   trap "rm -f '$installer'" RETURN
 
   step "Fetching installer"
-  curl -fsSL "https://raw.githubusercontent.com/5dive-com/5dive/main/install.sh" -o "$installer" \
+  curl -fsSL "https://raw.githubusercontent.com/$(gh_org)/5dive/main/install.sh" -o "$installer" \
     || fail "$E_GENERIC" "failed to fetch installer"
 
   step "Upgrading 5dive CLI + plugins"
@@ -12422,7 +12438,7 @@ cmd_update_check() {
   command -v curl >/dev/null 2>&1 || fail "$E_NOT_FOUND" "curl is required for update --check"
 
   local current="$FIVE_VERSION" latest
-  latest=$(curl -fsSL "https://raw.githubusercontent.com/5dive-com/5dive/main/5dive" 2>/dev/null \
+  latest=$(curl -fsSL "https://raw.githubusercontent.com/$(gh_org)/5dive/main/5dive" 2>/dev/null \
     | grep -m1 -oP '(?<=^readonly FIVE_VERSION=")[^"]+') \
     || true
   [[ -n "$latest" ]] || fail "$E_GENERIC" "could not determine the latest published version"
@@ -12530,7 +12546,7 @@ Agents:
                             # (team-bot shared persists it), new no-bot agents
                             # auto-attach: own forum topic, send-only on the
                             # shared token. --no-team-bot opts the agent out.
-                            # spec: <id> (defaults to ${DEFAULT_SKILL_SOURCE}) or <owner/repo>:<id>
+                            # spec: <id> (defaults to the 5dive skills repo) or <owner/repo>:<id>
                             # provider: hermes/openclaw only — BYO API key for one of
                             # ${!BYO_PROVIDER_LABEL[*]}. Mutually exclusive with --defer-auth.
                             # When called by another agent on a claude-typed agent,
@@ -12938,7 +12954,7 @@ main() {
       local installer
       if command -v curl >/dev/null 2>&1; then
         installer=$(mktemp)
-        curl -fsSL "https://raw.githubusercontent.com/5dive-com/5dive/main/install.sh" -o "$installer" \
+        curl -fsSL "https://raw.githubusercontent.com/$(gh_org)/5dive/main/install.sh" -o "$installer" \
           || fail "$E_GENERIC" "failed to fetch installer"
         chmod +x "$installer"
         exec bash "$installer" --uninstall "$@"

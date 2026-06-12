@@ -49,7 +49,7 @@ Agents:
                             # (team-bot shared persists it), new no-bot agents
                             # auto-attach: own forum topic, send-only on the
                             # shared token. --no-team-bot opts the agent out.
-                            # spec: <id> (defaults to ${DEFAULT_SKILL_SOURCE}) or <owner/repo>:<id>
+                            # spec: <id> (defaults to the 5dive skills repo) or <owner/repo>:<id>
                             # provider: hermes/openclaw only — BYO API key for one of
                             # ${!BYO_PROVIDER_LABEL[*]}. Mutually exclusive with --defer-auth.
                             # When called by another agent on a claude-typed agent,
@@ -457,7 +457,7 @@ main() {
       local installer
       if command -v curl >/dev/null 2>&1; then
         installer=$(mktemp)
-        curl -fsSL "https://raw.githubusercontent.com/5dive-com/5dive/main/install.sh" -o "$installer" \
+        curl -fsSL "https://raw.githubusercontent.com/$(gh_org)/5dive/main/install.sh" -o "$installer" \
           || fail "$E_GENERIC" "failed to fetch installer"
         chmod +x "$installer"
         exec bash "$installer" --uninstall "$@"

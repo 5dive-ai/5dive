@@ -89,7 +89,7 @@ JSON
     status_line_obj='{statusLine: {type: "command", command: "bash /usr/local/lib/5dive/statusline.sh"}}'
   fi
   local settings
-  settings=$(jq -n --argjson sl "$(jq -n "$status_line_obj")" '{
+  settings=$(jq -n --argjson sl "$(jq -n "$status_line_obj")" --arg ghorg "$(gh_org)" '{
     model: "opus",
     permissions: {
       defaultMode: "bypassPermissions",
@@ -102,7 +102,7 @@ JSON
         source: {source: "github", repo: "anthropics/claude-plugins-official"}
       },
       "5dive-plugins": {
-        source: {source: "github", repo: "5dive-com/5dive-plugins"}
+        source: {source: "github", repo: "\($ghorg)/5dive-plugins"}
       }
     }
   } + $sl')
@@ -139,7 +139,7 @@ JSON
       sudo -u "$user" cp "$TELEGRAM_AGENT_CLAUDE_MD" "$home/.claude/CLAUDE.md"
       chmod 644 "$home/.claude/CLAUDE.md"
     else
-      warn "$TELEGRAM_AGENT_CLAUDE_MD missing — per-agent telegram CLAUDE.md not wired (run: curl -fsSL https://raw.githubusercontent.com/5dive-com/5dive/main/install.sh | sudo bash)"
+      warn "$TELEGRAM_AGENT_CLAUDE_MD missing — per-agent telegram CLAUDE.md not wired (run: curl -fsSL https://raw.githubusercontent.com/$(gh_org)/5dive/main/install.sh | sudo bash)"
     fi
   fi
 
@@ -148,7 +148,7 @@ JSON
   #   find-skills — search skills.sh and self-install additional skills on demand
   #   5dive-cli   — spawn sub-agents on this VM via the local 5dive CLI
   install_default_skill_for_agent "$name" claude vercel-labs/skills find-skills || true
-  install_default_skill_for_agent "$name" claude 5dive-com/skills 5dive-cli || true
+  install_default_skill_for_agent "$name" claude "$(gh_org)/skills" 5dive-cli || true
 }
 
 # Preseed default skills for an antigravity agent. Unlike claude/codex/grok,
@@ -163,7 +163,7 @@ preseed_antigravity_agent() {
   local home="/home/agent-${name}"
   [[ -d "$home" ]] || fail "$E_GENERIC" "agent home missing: $home"
   install_default_skill_for_agent "$name" antigravity vercel-labs/skills find-skills || true
-  install_default_skill_for_agent "$name" antigravity 5dive-com/skills 5dive-cli || true
+  install_default_skill_for_agent "$name" antigravity "$(gh_org)/skills" 5dive-cli || true
 }
 
 # Types that `npx skills add --agent <id>` doesn't recognize. The upstream
@@ -279,7 +279,7 @@ install_channel_plugin_for_agent() {
   local mkt_repo="https://github.com/anthropics/claude-plugins-official.git"
   if [[ "$plugin" == "telegram" ]]; then
     marketplace="5dive-plugins"
-    mkt_repo="https://github.com/5dive-com/5dive-plugins.git"
+    mkt_repo="https://github.com/$(gh_org)/5dive-plugins.git"
   fi
 
   step "Installing $plugin plugin for $user (from $marketplace)"
@@ -753,7 +753,7 @@ CODEX_ENV
   # Upstream `npx skills add --agent codex` IS supported (see SKILLS_AGENT_ID),
   # so these route through the normal path, not the manual-install fallback.
   install_default_skill_for_agent "$name" codex vercel-labs/skills find-skills || true
-  install_default_skill_for_agent "$name" codex 5dive-com/skills 5dive-cli || true
+  install_default_skill_for_agent "$name" codex "$(gh_org)/skills" 5dive-cli || true
 }
 
 # Write ~/.codex/channels/telegram/access.json for agent-<name> with allowFrom
@@ -877,7 +877,7 @@ GROK_ENV
   # Upstream `npx skills add` doesn't recognize --agent grok, so these
   # route through the manual-install fallback in install_default_skill_for_agent.
   install_default_skill_for_agent "$name" grok vercel-labs/skills find-skills || true
-  install_default_skill_for_agent "$name" grok 5dive-com/skills 5dive-cli || true
+  install_default_skill_for_agent "$name" grok "$(gh_org)/skills" 5dive-cli || true
 }
 
 # Write ~/.grok/channels/telegram/access.json for agent-<name> with allowFrom
@@ -999,7 +999,7 @@ AGY_ENV
   # from cmd_create; repeating here keeps channel-attach self-contained and the
   # installs are idempotent.)
   install_default_skill_for_agent "$name" antigravity vercel-labs/skills find-skills || true
-  install_default_skill_for_agent "$name" antigravity 5dive-com/skills 5dive-cli || true
+  install_default_skill_for_agent "$name" antigravity "$(gh_org)/skills" 5dive-cli || true
 }
 
 # Write ~/.gemini/channels/telegram/access.json for agent-<name> with allowFrom
@@ -1126,7 +1126,7 @@ OPENCODE_ENV
   # the upstream skills registry (SKILLS_AGENT_ID[opencode]=opencode), so these
   # route through the normal `npx skills add` path.
   install_default_skill_for_agent "$name" opencode vercel-labs/skills find-skills || true
-  install_default_skill_for_agent "$name" opencode 5dive-com/skills 5dive-cli || true
+  install_default_skill_for_agent "$name" opencode "$(gh_org)/skills" 5dive-cli || true
 }
 
 # Write ~/.opencode/channels/telegram/access.json for agent-<name>. Idempotent —

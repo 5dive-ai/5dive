@@ -16,20 +16,19 @@ valid_skill_source() {
   [[ "$1" =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$ ]]
 }
 
-# Default GitHub source applied to bare skill ids in --with-skills (e.g.
-# `5dive-cli` → `5dive-com/skills:5dive-cli`). Keeps the common path short
-# while leaving the door open for third-party skill repos.
-DEFAULT_SKILL_SOURCE="5dive-com/skills"
+# Bare skill ids in --with-skills default to the 5dive skills repo (e.g.
+# `5dive-cli` → `<org>/skills:5dive-cli`, org resolved by gh_org). Keeps the
+# common path short while leaving the door open for third-party skill repos.
 
 # parse_skill_spec <spec> -> "<source> <skill>"
-# Accepts either bare `<id>` (uses DEFAULT_SKILL_SOURCE) or `<owner/repo>:<id>`.
+# Accepts either bare `<id>` (defaults to the skills repo) or `<owner/repo>:<id>`.
 # Caller splits the result on space.
 parse_skill_spec() {
   local spec="$1"
   if [[ "$spec" == *:* ]]; then
     printf '%s %s\n' "${spec%%:*}" "${spec#*:}"
   else
-    printf '%s %s\n' "$DEFAULT_SKILL_SOURCE" "$spec"
+    printf '%s %s\n' "$(gh_org)/skills" "$spec"
   fi
 }
 
