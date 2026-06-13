@@ -26,7 +26,7 @@ esac
 
 # Bumped on every public release. `build.sh` checks this line exists; CI fails
 # the bundle-drift check if it's missing or empty.
-readonly FIVE_VERSION="0.2.3"
+readonly FIVE_VERSION="0.2.4"
 
 # GitHub org our repos live under. The org is being renamed
 # 5dive-com -> 5dive-ai (2026-06); fetches must work on either side of the
@@ -11440,6 +11440,25 @@ cmd_task_init() {
   ok "tasks store ready at $TASKS_DB" '{path:$p}' --arg p "$TASKS_DB"
 }
 
+# Resolve the task-queue coordinator (DIVE-333): the agent who owns unassigned
+# tasks so they don't stall (the heartbeat only wakes an assignee). Org-agnostic,
+# resolved live from the org chart — never a hardcoded agent:
+#   1. an agent explicitly tagged `--role=coordinator` (reuses the existing org
+#      role field; the disambiguator a multi-root org sets), when exactly one holds it
+#   2. else the lone org root (the single-CEO case — zero config)
+#   3. else empty — ambiguous (multi-root, none tagged) or empty org chart; we
+#      leave the task unassigned exactly as before rather than guess wrong.
+# Prints the coordinator name (or nothing). Safe on an empty/missing org table.
+_task_resolve_coordinator() {
+  if [[ "$(db "SELECT COUNT(*) FROM agents_org WHERE role='coordinator';")" == "1" ]]; then
+    db "SELECT name FROM agents_org WHERE role='coordinator' LIMIT 1;"
+    return
+  fi
+  if [[ "$(db "SELECT COUNT(*) FROM agents_org WHERE reports_to IS NULL OR reports_to NOT IN (SELECT name FROM agents_org);")" == "1" ]]; then
+    db "SELECT name FROM agents_org WHERE reports_to IS NULL OR reports_to NOT IN (SELECT name FROM agents_org) LIMIT 1;"
+  fi
+}
+
 cmd_task_add() {
   tasks_db_init
   local body="" priority="medium" assignee="" parent="" from="" recurring="" fresh=""
@@ -11486,6 +11505,15 @@ cmd_task_add() {
   local fresh_sql="NULL"
   if [[ -n "$fresh" ]]; then fresh_sql="$fresh"
   elif [[ "$kind" == "recurring" ]]; then fresh_sql="1"; fi
+  # DIVE-333: an unassigned STANDARD task stalls — the heartbeat only wakes an
+  # assignee. Default it to the org's coordinator so it always has an owner.
+  # Recurring TEMPLATES stay unassigned (they're inert until materialized; the
+  # instance gets coordinated when it's cloned as a standard task).
+  local auto_coordinated=0
+  if [[ -z "$assignee" && "$kind" == "standard" ]]; then
+    assignee=$(_task_resolve_coordinator)
+    [[ -n "$assignee" ]] && auto_coordinated=1
+  fi
   local creator; creator=$(task_actor "$from")
   local id
   id=$(db "INSERT INTO tasks (title, body, priority, assignee, created_by, parent_id, kind, schedule, fresh)
@@ -11498,9 +11526,11 @@ cmd_task_add() {
        '{id:($i|tonumber), ident:("DIVE-"+$i), title:$t, priority:$p, assignee:$a, created_by:$c, kind:"recurring", schedule:$s, fresh:($f=="1")}' \
        --arg i "$id" --arg t "$title" --arg p "$priority" --arg a "${assignee:-}" --arg c "$creator" --arg s "$recurring" --arg f "$fresh_sql"
   else
-    ok "created DIVE-$id — $title" \
-       '{id:($i|tonumber), ident:("DIVE-"+$i), title:$t, priority:$p, assignee:$a, created_by:$c, kind:"standard"}' \
-       --arg i "$id" --arg t "$title" --arg p "$priority" --arg a "${assignee:-}" --arg c "$creator"
+    local coord_note=""
+    (( auto_coordinated )) && coord_note=" → coordinator: $assignee"
+    ok "created DIVE-$id — $title${coord_note}" \
+       '{id:($i|tonumber), ident:("DIVE-"+$i), title:$t, priority:$p, assignee:$a, created_by:$c, kind:"standard", autoCoordinated:($ac=="1")}' \
+       --arg i "$id" --arg t "$title" --arg p "$priority" --arg a "${assignee:-}" --arg c "$creator" --arg ac "$auto_coordinated"
   fi
 }
 
