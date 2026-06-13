@@ -1,15 +1,15 @@
-# 5dive — your team of AI agents, on your own server
+# 5dive — build your own team of AI agents
 
-[![install-smoke](https://github.com/5dive-com/5dive/actions/workflows/install-smoke.yml/badge.svg)](https://github.com/5dive-com/5dive/actions/workflows/install-smoke.yml)
-[![bundle-drift](https://github.com/5dive-com/5dive/actions/workflows/bundle-drift.yml/badge.svg)](https://github.com/5dive-com/5dive/actions/workflows/bundle-drift.yml)
-[![Latest release](https://img.shields.io/github/v/release/5dive-com/5dive)](https://github.com/5dive-com/5dive/releases)
+[![install-smoke](https://github.com/5dive-ai/5dive/actions/workflows/install-smoke.yml/badge.svg)](https://github.com/5dive-ai/5dive/actions/workflows/install-smoke.yml)
+[![bundle-drift](https://github.com/5dive-ai/5dive/actions/workflows/bundle-drift.yml/badge.svg)](https://github.com/5dive-ai/5dive/actions/workflows/bundle-drift.yml)
+[![Latest release](https://img.shields.io/github/v/release/5dive-ai/5dive)](https://github.com/5dive-ai/5dive/releases)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-**Spawn agents that talk to each other, message you on Telegram, and keep working after you close the laptop. Works with claude, codex, grok, antigravity.**
+**Spin up named agents (each with its own model, memory, and personality), pair over Telegram, and let them run tasks and coordinate with each other on a server you own, while you sleep. Works with claude, codex, grok, antigravity.**
 
 ![34 seconds: install to a Claude agent answering on Telegram](docs/quickstart.gif)
 
-> MIT. The same binary that runs every agent on [5dive.com](https://5dive.com). No open-core split. We run 5dive on 5dive — the agents this repo spawns are the ones who ship it. Skip the ops with the managed VM, or run your own.
+> We run our own startup on a team of AI agents. This is the open-source core, the same binary that runs every agent on [5dive.com](https://5dive.com). MIT, no open-core split. Skip the ops with the managed VM, or run your own.
 
 ---
 
@@ -78,7 +78,7 @@ The CLI is the OSS surface. Every verb here, every agent, every host, all driven
 
 If you'd rather click than `ssh`, [5dive.com](https://5dive.com) is the managed version: same CLI under the hood, but the VM, hardening, updates, and dashboard are run for you.
 
-<video src="https://cdn.jsdelivr.net/gh/5dive-com/assets@main/hero-demo.mp4" autoplay loop muted playsinline width="100%"></video>
+<video src="https://cdn.jsdelivr.net/gh/5dive-ai/assets@main/hero-demo.mp4" autoplay loop muted playsinline width="100%"></video>
 
 ---
 
@@ -251,7 +251,7 @@ Install 5dive on this Linux host so I can use you to manage 5dive agents.
 2. Confirm: `5dive --version` prints "5dive 0.1.x".
 3. Install the 5dive-cli skill. Replace <runtime> with one of
    claude-code, codex, antigravity, grok, hermes-agent, openclaw, opencode:
-   npx -y skills add https://github.com/5dive-com/skills --skill 5dive-cli --agent <runtime> --yes
+   npx -y skills add https://github.com/5dive-ai/skills --skill 5dive-cli --agent <runtime> --yes
 4. Tell me to restart so the skill loads, then ask which agent to create first.
 ```
 
@@ -285,7 +285,7 @@ See [CONTRIBUTING.md](CONTRIBUTING.md). The `5dive` bundle at the repo root is b
 
 ## Reporting a vulnerability
 
-Use GitHub's private reporting: **[Report a vulnerability →](https://github.com/5dive-com/5dive/security/advisories/new)**. Don't open a public issue. We acknowledge within 3 business days. Scope is the `5dive` CLI, `install.sh`, shipped systemd units, and `5dive-com/*` workflows; upstream coding CLIs (`claude`, `codex`, ...) and apt/Node go to their respective maintainers.
+Use GitHub's private reporting: **[Report a vulnerability →](https://github.com/5dive-ai/5dive/security/advisories/new)**. Don't open a public issue. We acknowledge within 3 business days. Scope is the `5dive` CLI, `install.sh`, shipped systemd units, and `5dive-ai/*` workflows; upstream coding CLIs (`claude`, `codex`, ...) and apt/Node go to their respective maintainers.
 
 ---
 
