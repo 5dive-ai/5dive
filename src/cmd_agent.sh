@@ -564,7 +564,7 @@ _apply_byo_openclaw() {
 
 cmd_create() {
   local name="" type="" channels="none" telegram_token="" discord_token="" workdir="" profile=""
-  local telegram_home_channel="" telegram_allowed_users=""
+  local telegram_home_channel="" telegram_allowed_users="" telegram_cos="" telegram_cos_avatar=""
   local byo_provider="" byo_api_key=""
   local skills_arg="" skills_set=0 no_skills=0 defer_auth=0
   local isolation="admin" no_team_bot=0
@@ -575,6 +575,8 @@ cmd_create() {
       --telegram-token=*)          telegram_token="${1#--telegram-token=}" ;;
       --telegram-home-channel=*)   telegram_home_channel="${1#--telegram-home-channel=}" ;;
       --telegram-allowed-users=*)  telegram_allowed_users="${1#--telegram-allowed-users=}" ;;
+      --telegram-cos=*)            telegram_cos="${1#--telegram-cos=}" ;;
+      --telegram-cos-avatar=*)     telegram_cos_avatar="${1#--telegram-cos-avatar=}" ;;
       --discord-token=*)           discord_token="${1#--discord-token=}" ;;
       --workdir=*)                 workdir="${1#--workdir=}" ;;
       --auth-profile=*)            profile="${1#--auth-profile=}" ;;
@@ -590,7 +592,7 @@ cmd_create() {
     esac
     shift
   done
-  [[ -n "$name" ]] || fail "$E_USAGE" "usage: 5dive agent create <name> --type=<type> [--channels=none|telegram|discord] [--telegram-token=<token>] [--telegram-home-channel=<id>] [--telegram-allowed-users=<csv>] [--workdir=<path>] [--auth-profile=<name>] [--provider=<id> --api-key=<key|->] [--with-skills=<spec>[,...]] [--no-skills] [--no-team-bot] [--defer-auth] [--isolation=admin|standard|sandboxed]"
+  [[ -n "$name" ]] || fail "$E_USAGE" "usage: 5dive agent create <name> --type=<type> [--channels=none|telegram|discord] [--telegram-token=<token>] [--telegram-cos=<child-username>] [--telegram-cos-avatar=<png>] [--telegram-home-channel=<id>] [--telegram-allowed-users=<csv>] [--workdir=<path>] [--auth-profile=<name>] [--provider=<id> --api-key=<key|->] [--with-skills=<spec>[,...]] [--no-skills] [--no-team-bot] [--defer-auth] [--isolation=admin|standard|sandboxed]"
   [[ -n "$type" ]] || fail "$E_USAGE" "--type is required"
   valid_name "$name" || fail "$E_VALIDATION" "invalid name (lowercase letters/digits/hyphens, start letter, <=16 chars)"
   is_known_type "$type" || fail "$E_NOT_FOUND" "unknown type: $type (known: ${!TYPE_BIN[*]})"
@@ -705,9 +707,52 @@ cmd_create() {
   # share a bot (both would call getUpdates and race each other). Require the
   # token at create time so the plugin doesn't spin up with empty creds.
   if [[ "$channels" == "telegram" ]]; then
+    # DIVE-320: --telegram-cos=<child-username> claims a CoS-minted child bot
+    # token instead of pasting one. The customer's Chief-of-Staff bot must
+    # already be set (`5dive agent cos set`) and the child bot must already be
+    # created via the one-tap deep link (`cos mint-link`). The minted bot's
+    # managed_bot update waits in the CoS getUpdates queue; `cos claim` fetches
+    # the token + auto-configures name/description/avatar. Mutually exclusive
+    # with an explicit --telegram-token; the paste path stays the fallback.
+    if [[ -n "$telegram_cos" ]]; then
+      [[ -z "$telegram_token" ]] \
+        || fail "$E_USAGE" "--telegram-cos and --telegram-token are mutually exclusive (cos mints the token)"
+      valid_telegram_bot_username "$telegram_cos" \
+        || fail "$E_VALIDATION" "--telegram-cos must be the child bot's username (5-32 chars, ends in 'bot')"
+      if [[ -n "$telegram_cos_avatar" ]]; then
+        [[ -r "$telegram_cos_avatar" ]] \
+          || fail "$E_NOT_FOUND" "--telegram-cos-avatar not readable: $telegram_cos_avatar"
+      fi
+      step "Claiming CoS-minted bot token for @$telegram_cos"
+      local _cos_json _cos_rc=0 _cos_reason _cos_avatar_arg=()
+      [[ -n "$telegram_cos_avatar" ]] && _cos_avatar_arg=(--avatar="$telegram_cos_avatar")
+      # `|| _cos_rc=$?` so a non-zero claim doesn't trip errexit (set -e) before
+      # we can map the failure — the same idiom used by every other fallible
+      # command substitution in this file. A bare `_cos_json=$(...); rc=$?`
+      # would abort the whole create at the assignment line on any failure.
+      _cos_json=$(cmd_agent_cos claim --suggested="$telegram_cos" --name="$name" \
+        --timeout-ms=120000 "${_cos_avatar_arg[@]+"${_cos_avatar_arg[@]}"}") || _cos_rc=$?
+      if (( _cos_rc != 0 )); then
+        # Map the failure to a precise exit class so the dashboard can give an
+        # actionable message: a claim timeout (the user hasn't tapped the deep
+        # link / created the bot yet) -> E_TIMEOUT; a missing CoS token (no
+        # cos.env on the box) keeps the inner E_NOT_FOUND; anything else is
+        # generic. The runner reports the cause in JSON `.reason`.
+        _cos_reason=$(jq -r '.reason // empty' <<<"$_cos_json" 2>/dev/null)
+        if [[ "$_cos_reason" == "timeout" ]]; then
+          fail "$E_TIMEOUT" "no bot @$telegram_cos appeared within the claim window — tap the create link in Telegram to create it, then retry"
+        elif (( _cos_rc == E_NOT_FOUND )); then
+          fail "$E_NOT_FOUND" "no Chief-of-Staff bot configured — run: 5dive agent cos set --token=<token>"
+        fi
+        fail "$E_GENERIC" "cos claim failed: ${_cos_json:-rc=$_cos_rc} (is the CoS bot set and the child bot created via the deep link?)"
+      fi
+      telegram_token=$(jq -r 'if .ok then .token else empty end' <<<"$_cos_json" 2>/dev/null)
+      [[ -n "$telegram_token" ]] \
+        || fail "$E_GENERIC" "cos claim returned no token: $_cos_json"
+    fi
     if [[ -z "$telegram_token" ]]; then
       telegram_token=$(prompt_secret "Telegram bot token for agent '$name'") \
-        || fail "$E_USAGE" "--channels=telegram requires --telegram-token=<token> (or run interactively to be prompted)"
+        || fail "$E_USAGE" "--channels=telegram requires --telegram-token=<token> or --telegram-cos=<child-username> (or run interactively to be prompted)"
     fi
     valid_telegram_token "$telegram_token" \
       || fail "$E_VALIDATION" "telegram token format looks wrong (expected <digits>:<20+ chars>)"

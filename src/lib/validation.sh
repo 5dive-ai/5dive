@@ -60,6 +60,14 @@ valid_telegram_token() {
   [[ "$1" =~ ^[0-9]{5,}:[A-Za-z0-9_-]{20,}$ ]]
 }
 
+# Telegram bot username (for the CoS one-tap deep link / `cos claim --suggested`).
+# Telegram requires 5-32 chars, letters/digits/underscores, and a "bot" suffix
+# (case-insensitive). We match that so a typo'd username fails before we poll the
+# CoS queue for a child that can never appear.
+valid_telegram_bot_username() {
+  [[ "$1" =~ ^[A-Za-z][A-Za-z0-9_]{1,28}[Bb][Oo][Tt]$ ]]
+}
+
 # Telegram chat/user ids: numeric, optionally negative (for groups/channels).
 # Bot API ids are 64-bit signed; cap at 20 chars to fence absurd input.
 valid_telegram_chat_id() {
