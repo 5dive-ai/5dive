@@ -287,7 +287,16 @@ cmd_agent_cos() {
   if [[ "$sub" == "set" ]]; then
     local tok="" a
     for a in "$@"; do case "$a" in --token=*) tok="${a#--token=}" ;; esac; done
-    [[ -n "$tok" ]] || fail "$E_USAGE" "usage: 5dive agent cos set --token=<cos bot token>"
+    # `--token=-` reads the token from stdin so the secret never enters argv
+    # (and thus never lands in /proc/<pid>/cmdline, shelld's audit log, or
+    # server access logs). This is the path the dashboard's exec tunnel uses —
+    # same pattern as `auth set --api-key=-`. A TTY with `-` is a usage error.
+    if [[ "$tok" == "-" ]]; then
+      [[ -t 0 ]] && fail "$E_USAGE" "--token=- expects the CoS bot token on stdin"
+      tok=$(cat)
+      tok="${tok//[$'\r\n\t ']/}"
+    fi
+    [[ -n "$tok" ]] || fail "$E_USAGE" "usage: 5dive agent cos set --token=<cos bot token>  (or --token=- to read from stdin)"
     local res; res=$(COS_TOKEN_OVERRIDE="$tok" "$bun" "$COS_RUN_DIR/cos-runner.ts" verify)
     if [[ "$res" == *'"ok":true'* ]]; then
       mkdir -p "$(dirname "$cos_env")"
