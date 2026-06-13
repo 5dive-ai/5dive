@@ -297,7 +297,14 @@ cmd_agent_cos() {
       tok="${tok//[$'\r\n\t ']/}"
     fi
     [[ -n "$tok" ]] || fail "$E_USAGE" "usage: 5dive agent cos set --token=<cos bot token>  (or --token=- to read from stdin)"
-    local res; res=$(COS_TOKEN_OVERRIDE="$tok" "$bun" "$COS_RUN_DIR/cos-runner.ts" verify)
+    # `|| true`: the runner exits 1 when the token can't be verified (bad token,
+    # Bot-Management-Mode off, network) and prints its {ok:false,reason,detail}
+    # JSON on stdout. Without the guard, `set -e` aborts on the non-zero command
+    # substitution BEFORE we can inspect/echo $res, so the dashboard's exec
+    # tunnel got an empty body and could never show the not_manager hint. We
+    # branch on the JSON content below, not the exit code, so swallowing it here
+    # is correct.
+    local res; res=$(COS_TOKEN_OVERRIDE="$tok" "$bun" "$COS_RUN_DIR/cos-runner.ts" verify) || true
     if [[ "$res" == *'"ok":true'* ]]; then
       mkdir -p "$(dirname "$cos_env")"
       ( umask 077; printf 'TEST_TG_COS_BOT_TOKEN=%s\n' "$tok" > "$cos_env" )
