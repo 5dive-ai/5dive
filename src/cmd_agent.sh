@@ -1159,6 +1159,60 @@ cmd_rm() {
      '{name:$n, removed:true}' --arg n "$name"
 }
 
+# DIVE-345: move a path aside as <path>.disabled-<ts> (reversible) if present.
+_td_move_aside() {
+  local p="$1" ts="$2"
+  [[ -e "$p" ]] || return 0
+  if mv "$p" "${p}.disabled-${ts}" 2>/dev/null; then
+    step "disabled stale telegram wiring: $(basename "$p") -> $(basename "$p").disabled-${ts}"
+  else
+    warn "teardown: couldn't move $p aside (best-effort)"
+  fi
+}
+
+# DIVE-345: strip the per-type telegram wiring left on disk when an agent's
+# channel is removed (`config set channels=none`). 5dive-agent-start only ever
+# ADDED telegram wiring (gated on CHANNELS=telegram) and never removed it, so a
+# stale MCP tool cache / channel-state dir survived and the agent re-entered the
+# telegram wait_for_message loop on the next boot despite channels=none (agy,
+# 2026-06-13). We kill any running relay and move the wiring aside (reversible),
+# but KEEP the connector secret (telegram-<name>.env) so re-enabling is a
+# one-flag `config set channels=telegram`. `agent rm` still removes the secret
+# for full teardown. Removing the per-type channel STATE dir (token/access) is
+# what actually breaks the loop — a leftover codex/grok config.toml
+# [mcp_servers.telegram] block is then inert (its server can't auth without the
+# state), so we avoid fragile in-place TOML edits here.
+teardown_telegram_wiring() {
+  local name="$1" type="$2"
+  local home="/home/agent-${name}"   # separate line: same-`local` ${name} would be empty
+  [[ -d "$home" ]] || return 0
+  local ts pidf p
+  ts=$(date +%Y%m%d%H%M%S)
+  # Kill any running telegram relay/bot process (bot.pid in the per-type dir).
+  for pidf in \
+    "$home/.gemini/channels/telegram/bot.pid" \
+    "$home/.codex/channels/telegram/bot.pid" \
+    "$home/.grok/channels/telegram/bot.pid" \
+    "$home/.claude/channels/telegram/bot.pid" \
+    "$home/.opencode/channels/telegram/bot.pid"; do
+    [[ -r "$pidf" ]] || continue
+    p=$(tr -dc '0-9' < "$pidf" 2>/dev/null)
+    [[ -n "$p" ]] && kill "$p" 2>/dev/null || true
+  done
+  case "$type" in
+    antigravity)
+      # antigravity re-exposes telegram tools from its MCP tool cache dir even
+      # with no live server, so the agent keeps calling wait_for_message.
+      _td_move_aside "$home/.gemini/antigravity-cli/mcp/telegram" "$ts"
+      _td_move_aside "$home/.gemini/channels/telegram" "$ts" ;;
+    codex)    _td_move_aside "$home/.codex/channels/telegram" "$ts" ;;
+    grok)     _td_move_aside "$home/.grok/channels/telegram" "$ts" ;;
+    claude)   _td_move_aside "$home/.claude/channels/telegram" "$ts" ;;
+    opencode) _td_move_aside "$home/.opencode/channels/telegram" "$ts" ;;
+  esac
+  return 0
+}
+
 cmd_config() {
   # Usage: 5dive agent config <name> set <key>=<value> [<key>=<value>...]
   #   keys:
@@ -1346,6 +1400,15 @@ cmd_config() {
       step "Re-pointing ${ENV_DIR}/${name}-auth.env"
       link_agent_profile "$name" "$new_profile"
     fi
+  fi
+  # DIVE-345: removing the channel must strip the stale telegram wiring left on
+  # disk, else the agent re-enters the telegram wait_for_message loop on next
+  # boot despite channels=none (agy, 2026-06-13). Reversible (moves to
+  # .disabled-<ts>); the connector token is kept for one-flag re-enable.
+  if [[ "$channels_changed_to" == "none" ]]; then
+    local _td_type
+    _td_type=$(jq -r --arg n "$name" '.agents[$n].type // empty' <<<"$reg")
+    teardown_telegram_wiring "$name" "$_td_type"
   fi
   # Channel attach / rotate: when this call touched telegram.* or discord.*
   # we need to push the new values into each type's native state dir, the
