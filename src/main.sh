@@ -172,11 +172,13 @@ Heartbeat (wake an agent only when it has queued tasks, one per tick):
   # full surface: 5dive heartbeat --help
 
 Health:
-  5dive doctor [--repair] [--category=deps|types|auth|registry|shelld]
+  5dive doctor [--repair] [--category=deps|types|auth|creds|registry|shelld|channels]
     Walks deps (tmux/jq/bun/python3/nvm/node/npm), type bins, live auth
-    probes, registry integrity, and shelld reachability. --repair attempts
-    reversible fixes (apt installs, type installer recipes, bun, shelld
-    restart, registry reseed). Output envelope always {ok:true,data:{...}};
+    probes, stale shadow-credential heal (creds), registry integrity, and
+    shelld reachability. --repair attempts reversible fixes (apt installs,
+    type installer recipes, bun, shelld restart, registry reseed, rename a
+    stale ~/.claude/.credentials.json that shadows an env-token). Output
+    envelope always {ok:true,data:{...}};
     branch on data.summary.errors in CI.
 
 Types: ${!TYPE_BIN[*]}

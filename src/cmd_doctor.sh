@@ -69,14 +69,15 @@ cmd_doctor() {
     shift
   done
   case "$filter" in
-    ""|deps|types|auth|registry|shelld|channels) ;;
-    *) fail "$E_USAGE" "unknown --category (deps|types|auth|registry|shelld|channels)" ;;
+    ""|deps|types|auth|creds|registry|shelld|channels) ;;
+    *) fail "$E_USAGE" "unknown --category (deps|types|auth|creds|registry|shelld|channels)" ;;
   esac
 
-  local run_deps=0 run_types=0 run_auth=0 run_registry=0 run_shelld=0 run_channels=0
+  local run_deps=0 run_types=0 run_auth=0 run_creds=0 run_registry=0 run_shelld=0 run_channels=0
   [[ -z "$filter" || "$filter" == "deps"     ]] && run_deps=1
   [[ -z "$filter" || "$filter" == "types"    ]] && run_types=1
   [[ -z "$filter" || "$filter" == "auth"     ]] && run_auth=1
+  [[ -z "$filter" || "$filter" == "creds"    ]] && run_creds=1
   [[ -z "$filter" || "$filter" == "registry" ]] && run_registry=1
   [[ -z "$filter" || "$filter" == "shelld"   ]] && run_shelld=1
   [[ -z "$filter" || "$filter" == "channels" ]] && run_channels=1
@@ -220,6 +221,43 @@ cmd_doctor() {
           doctor_add auth "$type" warn "status=$status" false false ;;
       esac
     done
+  fi
+
+  # --- claude shadow-credential heal (DIVE-329) ---
+  #
+  # A leftover ~/.claude/.credentials.json in an agent's config dir takes
+  # precedence over the CLAUDE_CODE_OAUTH_TOKEN that systemd injects. Once that
+  # file's OAuth token expires and can't refresh, Claude Code 401s on the dead
+  # file even though the env-token is valid (teal-fox class). heal_claude_shadow_creds
+  # (cmd_auth.sh) renames a stale shadow file to .stale-<ts> so CC falls back to
+  # the env-token — but ONLY for agents that carry a verified env-token, so it
+  # can never strand an agent. --repair renames; otherwise we just warn. This is
+  # file-only (no network), so it's safe to run on every soft-update tick.
+  if (( run_creds )); then
+    local heal_out
+    heal_out=$(heal_claude_shadow_creds "$DOCTOR_REPAIR")
+    if [[ -z "$heal_out" ]]; then
+      doctor_add creds shadow-credentials ok "no stale ~/.claude/.credentials.json shadowing an env-token"
+    else
+      local hline verb nm bak
+      while IFS= read -r hline; do
+        [[ -n "$hline" ]] || continue
+        verb=$(awk '{print $1}' <<<"$hline")
+        nm=$(awk '{print $2}'   <<<"$hline")
+        case "$verb" in
+          healed)
+            bak=$(awk '{print $4}' <<<"$hline")
+            doctor_add creds "agent:$nm" ok \
+              "renamed stale shadow creds -> $(basename "$bak"); CC now falls back to the env-token" true true ;;
+          stale)
+            doctor_add creds "agent:$nm" warn \
+              "stale ~/.claude/.credentials.json shadows the env-token (expired/unrenewable) — will 401 as it ages; run with --repair to neutralize it" true false ;;
+          error)
+            doctor_add creds "agent:$nm" error \
+              "stale shadow creds present but rename failed (check perms on /home/agent-$nm/.claude)" true false ;;
+        esac
+      done <<<"$heal_out"
+    fi
   fi
 
   # --- registry + per-agent state ---

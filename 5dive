@@ -26,7 +26,7 @@ esac
 
 # Bumped on every public release. `build.sh` checks this line exists; CI fails
 # the bundle-drift check if it's missing or empty.
-readonly FIVE_VERSION="0.2.2"
+readonly FIVE_VERSION="0.2.3"
 
 # GitHub org our repos live under. The org is being renamed
 # 5dive-com -> 5dive-ai (2026-06); fetches must work on either side of the
@@ -2540,6 +2540,100 @@ auth_status_one() {
     1) echo "stale" ;;
     *) echo "ok" ;;
   esac
+}
+
+# -------- shadow-credential heal (DIVE-329) --------
+#
+# Bug: an agent user's ~/.claude/.credentials.json (written by an interactive
+# `claude` login) takes PRECEDENCE over the CLAUDE_CODE_OAUTH_TOKEN that
+# 5dive-agent@.service injects via EnvironmentFile. When that creds file's
+# OAuth token expires AND its refresh token can't renew (revoked, or the
+# subscription behind it was torn down), Claude Code keeps trying the dead
+# creds file and 401s — even though the env-token is perfectly valid. This is
+# the teal-fox failure class. The fix: for agents that DO carry an env-token,
+# rename a stale/expired shadow creds file to .stale-<ts> so CC falls back to
+# the env-token. Reversible (rename, not delete).
+#
+# Safety: we only ever touch an agent that has a VERIFIED non-empty env-token
+# to fall back to, so the rename can never strand an agent on no auth. Scope is
+# claude-type agents only — they're the only type that both reads
+# ~/.claude/.credentials.json and authenticates via CLAUDE_CODE_OAUTH_TOKEN.
+# The host `claude` Linux user is deliberately NOT in scope: it carries no
+# env-token and authenticates via its own (auto-refreshing) interactive login,
+# so its credentials file is load-bearing, not shadow cruft.
+#
+# Only a STALE file is renamed (expired / missing-expiry / unparseable). A
+# still-valid creds file is left in place — it'll be healed once it expires,
+# and renaming a live one would be a needless surprise. (A valid env-token
+# makes renaming any shadow file safe, so widening the trigger later is a
+# one-line change if we want to close the expiry window entirely.)
+#
+# Emits one line per affected agent on stdout (machine-readable for doctor):
+#   stale  <name> <path>            (repair=0: would heal)
+#   healed <name> <path> <bak>      (repair=1: renamed)
+#   error  <name> <path> mv-failed  (repair=1: rename failed)
+# Always returns 0; callers branch on the emitted lines.
+heal_claude_shadow_creds() {
+  local repair="${1:-0}"
+  [[ -f "$REGISTRY" ]] || return 0
+  local reg now_ms
+  reg=$(registry_read 2>/dev/null) || return 0
+  now_ms=$(( $(date +%s) * 1000 ))
+  local name
+  for name in $(jq -r '.agents | keys[]' <<<"$reg" 2>/dev/null); do
+    local type profile user home creds
+    type=$(jq -r --arg n "$name" '.agents[$n].type // empty' <<<"$reg")
+    [[ "$type" == "claude" ]] || continue
+    user="agent-${name}"
+    home="/home/${user}"
+    id -u "$user" &>/dev/null || continue
+    creds="${home}/.claude/.credentials.json"
+    [[ -f "$creds" ]] || continue
+
+    # Verify this agent actually has an env-token to fall back to before we
+    # touch its creds file. Token lives in the profile's combined.env (when an
+    # authProfile is set) else the shared connectors/anthropic.env; also accept
+    # one written straight into the per-agent / per-agent-auth env file.
+    profile=$(jq -r --arg n "$name" '.agents[$n].authProfile // empty' <<<"$reg")
+    local -a envfiles=()
+    if [[ -n "$profile" ]]; then
+      envfiles+=("${AUTH_PROFILES_DIR}/${profile}/combined.env")
+    else
+      envfiles+=("${CONNECTORS_DIR}/anthropic.env")
+    fi
+    envfiles+=("${ENV_DIR}/${name}.env" "${ENV_DIR}/${name}-auth.env")
+    local has_token=0 f
+    for f in "${envfiles[@]}"; do
+      [[ -r "$f" ]] || continue
+      if grep -qE '^(CLAUDE_CODE_OAUTH_TOKEN|ANTHROPIC_API_KEY)=.+' "$f" 2>/dev/null; then
+        has_token=1; break
+      fi
+    done
+    (( has_token )) || continue   # no fallback → leave the creds file alone
+
+    # Stale? expiresAt is epoch milliseconds. Treat expired / missing field /
+    # unparseable as stale.
+    local exp stale=0
+    exp=$(jq -r '(.claudeAiOauth.expiresAt // .expiresAt // empty)' "$creds" 2>/dev/null || true)
+    if [[ -z "$exp" || ! "$exp" =~ ^[0-9]+$ ]]; then
+      stale=1
+    elif (( exp < now_ms )); then
+      stale=1
+    fi
+    (( stale )) || continue
+
+    if (( repair )); then
+      local bak="${creds}.stale-$(date +%Y%m%d%H%M%S)"
+      if mv "$creds" "$bak" 2>/dev/null; then
+        echo "healed ${name} ${creds} ${bak}"
+      else
+        echo "error ${name} ${creds} mv-failed"
+      fi
+    else
+      echo "stale ${name} ${creds}"
+    fi
+  done
+  return 0
 }
 
 cmd_auth_status() {
@@ -9897,14 +9991,15 @@ cmd_doctor() {
     shift
   done
   case "$filter" in
-    ""|deps|types|auth|registry|shelld|channels) ;;
-    *) fail "$E_USAGE" "unknown --category (deps|types|auth|registry|shelld|channels)" ;;
+    ""|deps|types|auth|creds|registry|shelld|channels) ;;
+    *) fail "$E_USAGE" "unknown --category (deps|types|auth|creds|registry|shelld|channels)" ;;
   esac
 
-  local run_deps=0 run_types=0 run_auth=0 run_registry=0 run_shelld=0 run_channels=0
+  local run_deps=0 run_types=0 run_auth=0 run_creds=0 run_registry=0 run_shelld=0 run_channels=0
   [[ -z "$filter" || "$filter" == "deps"     ]] && run_deps=1
   [[ -z "$filter" || "$filter" == "types"    ]] && run_types=1
   [[ -z "$filter" || "$filter" == "auth"     ]] && run_auth=1
+  [[ -z "$filter" || "$filter" == "creds"    ]] && run_creds=1
   [[ -z "$filter" || "$filter" == "registry" ]] && run_registry=1
   [[ -z "$filter" || "$filter" == "shelld"   ]] && run_shelld=1
   [[ -z "$filter" || "$filter" == "channels" ]] && run_channels=1
@@ -10048,6 +10143,43 @@ cmd_doctor() {
           doctor_add auth "$type" warn "status=$status" false false ;;
       esac
     done
+  fi
+
+  # --- claude shadow-credential heal (DIVE-329) ---
+  #
+  # A leftover ~/.claude/.credentials.json in an agent's config dir takes
+  # precedence over the CLAUDE_CODE_OAUTH_TOKEN that systemd injects. Once that
+  # file's OAuth token expires and can't refresh, Claude Code 401s on the dead
+  # file even though the env-token is valid (teal-fox class). heal_claude_shadow_creds
+  # (cmd_auth.sh) renames a stale shadow file to .stale-<ts> so CC falls back to
+  # the env-token — but ONLY for agents that carry a verified env-token, so it
+  # can never strand an agent. --repair renames; otherwise we just warn. This is
+  # file-only (no network), so it's safe to run on every soft-update tick.
+  if (( run_creds )); then
+    local heal_out
+    heal_out=$(heal_claude_shadow_creds "$DOCTOR_REPAIR")
+    if [[ -z "$heal_out" ]]; then
+      doctor_add creds shadow-credentials ok "no stale ~/.claude/.credentials.json shadowing an env-token"
+    else
+      local hline verb nm bak
+      while IFS= read -r hline; do
+        [[ -n "$hline" ]] || continue
+        verb=$(awk '{print $1}' <<<"$hline")
+        nm=$(awk '{print $2}'   <<<"$hline")
+        case "$verb" in
+          healed)
+            bak=$(awk '{print $4}' <<<"$hline")
+            doctor_add creds "agent:$nm" ok \
+              "renamed stale shadow creds -> $(basename "$bak"); CC now falls back to the env-token" true true ;;
+          stale)
+            doctor_add creds "agent:$nm" warn \
+              "stale ~/.claude/.credentials.json shadows the env-token (expired/unrenewable) — will 401 as it ages; run with --repair to neutralize it" true false ;;
+          error)
+            doctor_add creds "agent:$nm" error \
+              "stale shadow creds present but rename failed (check perms on /home/agent-$nm/.claude)" true false ;;
+        esac
+      done <<<"$heal_out"
+    fi
   fi
 
   # --- registry + per-agent state ---
@@ -13097,11 +13229,13 @@ Heartbeat (wake an agent only when it has queued tasks, one per tick):
   # full surface: 5dive heartbeat --help
 
 Health:
-  5dive doctor [--repair] [--category=deps|types|auth|registry|shelld]
+  5dive doctor [--repair] [--category=deps|types|auth|creds|registry|shelld|channels]
     Walks deps (tmux/jq/bun/python3/nvm/node/npm), type bins, live auth
-    probes, registry integrity, and shelld reachability. --repair attempts
-    reversible fixes (apt installs, type installer recipes, bun, shelld
-    restart, registry reseed). Output envelope always {ok:true,data:{...}};
+    probes, stale shadow-credential heal (creds), registry integrity, and
+    shelld reachability. --repair attempts reversible fixes (apt installs,
+    type installer recipes, bun, shelld restart, registry reseed, rename a
+    stale ~/.claude/.credentials.json that shadows an env-token). Output
+    envelope always {ok:true,data:{...}};
     branch on data.summary.errors in CI.
 
 Types: ${!TYPE_BIN[*]}

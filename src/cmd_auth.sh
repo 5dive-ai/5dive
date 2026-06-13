@@ -132,6 +132,100 @@ auth_status_one() {
   esac
 }
 
+# -------- shadow-credential heal (DIVE-329) --------
+#
+# Bug: an agent user's ~/.claude/.credentials.json (written by an interactive
+# `claude` login) takes PRECEDENCE over the CLAUDE_CODE_OAUTH_TOKEN that
+# 5dive-agent@.service injects via EnvironmentFile. When that creds file's
+# OAuth token expires AND its refresh token can't renew (revoked, or the
+# subscription behind it was torn down), Claude Code keeps trying the dead
+# creds file and 401s — even though the env-token is perfectly valid. This is
+# the teal-fox failure class. The fix: for agents that DO carry an env-token,
+# rename a stale/expired shadow creds file to .stale-<ts> so CC falls back to
+# the env-token. Reversible (rename, not delete).
+#
+# Safety: we only ever touch an agent that has a VERIFIED non-empty env-token
+# to fall back to, so the rename can never strand an agent on no auth. Scope is
+# claude-type agents only — they're the only type that both reads
+# ~/.claude/.credentials.json and authenticates via CLAUDE_CODE_OAUTH_TOKEN.
+# The host `claude` Linux user is deliberately NOT in scope: it carries no
+# env-token and authenticates via its own (auto-refreshing) interactive login,
+# so its credentials file is load-bearing, not shadow cruft.
+#
+# Only a STALE file is renamed (expired / missing-expiry / unparseable). A
+# still-valid creds file is left in place — it'll be healed once it expires,
+# and renaming a live one would be a needless surprise. (A valid env-token
+# makes renaming any shadow file safe, so widening the trigger later is a
+# one-line change if we want to close the expiry window entirely.)
+#
+# Emits one line per affected agent on stdout (machine-readable for doctor):
+#   stale  <name> <path>            (repair=0: would heal)
+#   healed <name> <path> <bak>      (repair=1: renamed)
+#   error  <name> <path> mv-failed  (repair=1: rename failed)
+# Always returns 0; callers branch on the emitted lines.
+heal_claude_shadow_creds() {
+  local repair="${1:-0}"
+  [[ -f "$REGISTRY" ]] || return 0
+  local reg now_ms
+  reg=$(registry_read 2>/dev/null) || return 0
+  now_ms=$(( $(date +%s) * 1000 ))
+  local name
+  for name in $(jq -r '.agents | keys[]' <<<"$reg" 2>/dev/null); do
+    local type profile user home creds
+    type=$(jq -r --arg n "$name" '.agents[$n].type // empty' <<<"$reg")
+    [[ "$type" == "claude" ]] || continue
+    user="agent-${name}"
+    home="/home/${user}"
+    id -u "$user" &>/dev/null || continue
+    creds="${home}/.claude/.credentials.json"
+    [[ -f "$creds" ]] || continue
+
+    # Verify this agent actually has an env-token to fall back to before we
+    # touch its creds file. Token lives in the profile's combined.env (when an
+    # authProfile is set) else the shared connectors/anthropic.env; also accept
+    # one written straight into the per-agent / per-agent-auth env file.
+    profile=$(jq -r --arg n "$name" '.agents[$n].authProfile // empty' <<<"$reg")
+    local -a envfiles=()
+    if [[ -n "$profile" ]]; then
+      envfiles+=("${AUTH_PROFILES_DIR}/${profile}/combined.env")
+    else
+      envfiles+=("${CONNECTORS_DIR}/anthropic.env")
+    fi
+    envfiles+=("${ENV_DIR}/${name}.env" "${ENV_DIR}/${name}-auth.env")
+    local has_token=0 f
+    for f in "${envfiles[@]}"; do
+      [[ -r "$f" ]] || continue
+      if grep -qE '^(CLAUDE_CODE_OAUTH_TOKEN|ANTHROPIC_API_KEY)=.+' "$f" 2>/dev/null; then
+        has_token=1; break
+      fi
+    done
+    (( has_token )) || continue   # no fallback → leave the creds file alone
+
+    # Stale? expiresAt is epoch milliseconds. Treat expired / missing field /
+    # unparseable as stale.
+    local exp stale=0
+    exp=$(jq -r '(.claudeAiOauth.expiresAt // .expiresAt // empty)' "$creds" 2>/dev/null || true)
+    if [[ -z "$exp" || ! "$exp" =~ ^[0-9]+$ ]]; then
+      stale=1
+    elif (( exp < now_ms )); then
+      stale=1
+    fi
+    (( stale )) || continue
+
+    if (( repair )); then
+      local bak="${creds}.stale-$(date +%Y%m%d%H%M%S)"
+      if mv "$creds" "$bak" 2>/dev/null; then
+        echo "healed ${name} ${creds} ${bak}"
+      else
+        echo "error ${name} ${creds} mv-failed"
+      fi
+    else
+      echo "stale ${name} ${creds}"
+    fi
+  done
+  return 0
+}
+
 cmd_auth_status() {
   # Default: skip the live probe so the bulk status call stays fast (<100ms).
   # --probe runs a real `<cli> --print ping` for each installed type and
