@@ -305,6 +305,13 @@ main() {
           # writes access.json + registry teamTopic (registry lock taken inside).
           AUDIT_CMD="agent team-bot"; AUDIT_ARGS=("$@")
           cmd_agent_team_bot "$@" ;;
+        cos)
+          # DIVE-320: Chief of Staff managed-bot provisioning. verify/mint-link
+          # are read-only probes; claim/rotate fetch+configure a child token via
+          # the customer's CoS (no registry mutation here — the caller wires the
+          # returned token into `agent create`).
+          AUDIT_CMD="agent cos"; AUDIT_ARGS=("$@")
+          cmd_agent_cos "$@" ;;
         install)
           AUDIT_CMD="agent install"; AUDIT_ARGS=("$@")
           cmd_install "$@" ;;   # no registry mutation; auditable install recipe
