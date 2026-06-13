@@ -749,6 +749,10 @@ cmd_create() {
       telegram_token=$(jq -r 'if .ok then .token else empty end' <<<"$_cos_json" 2>/dev/null)
       [[ -n "$telegram_token" ]] \
         || fail "$E_GENERIC" "cos claim returned no token: $_cos_json"
+      # Learn the operator id from the mint event (the user who created the bot)
+      # into the shared box-level allowlist — the common seed below auto-pairs
+      # this agent (and every future one) to it.
+      _operator_record "$(jq -r '.ownerId // empty' <<<"$_cos_json" 2>/dev/null)"
     fi
     if [[ -z "$telegram_token" ]]; then
       telegram_token=$(prompt_secret "Telegram bot token for agent '$name'") \
@@ -759,6 +763,15 @@ cmd_create() {
     if [[ -n "$telegram_home_channel" ]]; then
       valid_telegram_chat_id "$telegram_home_channel" \
         || fail "$E_VALIDATION" "invalid --telegram-home-channel (numeric chat id, optionally negative)"
+    fi
+    # Auto-pair: with no explicit allowlist, inherit the box's shared operator
+    # id(s) (learned from prior pairings / a CoS mint) so the bot accepts the
+    # operator's DMs immediately — no manual pairing step. Per-agent override
+    # stays available via `telegram-access set`.
+    if [[ -z "$telegram_allowed_users" ]]; then
+      telegram_allowed_users=$(_operator_ids)
+      [[ -n "$telegram_allowed_users" ]] \
+        && step "Auto-pairing '$name' to known operator(s): $telegram_allowed_users"
     fi
     if [[ -n "$telegram_allowed_users" ]]; then
       valid_telegram_chat_id_list "$telegram_allowed_users" \
@@ -1096,9 +1109,16 @@ cmd_create() {
   paperclip_seed_for_type "$type" "$profile" 2>/dev/null || true
 
   local effective_workdir="${workdir:-$DEFAULT_WORKDIR}"
+  # autoPaired: telegram agent whose allowFrom was seeded at create (explicit
+  # --telegram-allowed-users or the shared operator store), so it accepts the
+  # operator's DMs immediately — the dashboard uses this to safely skip the
+  # pairing step only when pairing genuinely already happened.
+  local auto_paired="false"
+  [[ "$channels" == "telegram" && -n "$telegram_allowed_users" ]] && auto_paired="true"
   ok "agent '$name' (type=$type, channels=$channels${profile:+, profile=$profile}) is running." \
-     '{name:$n, type:$t, channels:$c, workdir:$w, authProfile:$p, created:true, skills:{installed:$inst, failed:$fail}, teamBot:$tb}' \
+     '{name:$n, type:$t, channels:$c, workdir:$w, authProfile:$p, created:true, autoPaired:$ap, skills:{installed:$inst, failed:$fail}, teamBot:$tb}' \
      --arg n "$name" --arg t "$type" --arg c "$channels" --arg w "$effective_workdir" --arg p "${profile:-}" \
+     --argjson ap "$auto_paired" \
      --argjson inst "$installed_skills_json" --argjson fail "$failed_skills_json" --arg tb "$team_bot_status"
 }
 
@@ -3309,6 +3329,9 @@ os.replace(tmp, path)
 print(f"Auto-paired user {sender} (chat {chat})")
 PY
 
+    # Remember this operator id box-wide so future agents auto-pair to it
+    # (shared operator allowlist — DIVE-320/325).
+    _operator_record "$preuser"
     if [[ "$channels" == "telegram" ]]; then
       send_welcome_message "$chat_id" "$bot_token" "$name" "$type"
     fi

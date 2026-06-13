@@ -33,6 +33,35 @@ TELEGRAM_AGENT_CLAUDE_MD="/usr/local/lib/5dive/telegram-agent-CLAUDE.md"
 # /home/claude/.claude/settings.json (mode 0600), so 5dive-agent-start.sh
 # unsets CLAUDE_CONFIG_DIR before launching claude, making $HOME/.claude
 # (i.e. the preseed below) the effective config dir.
+# --- Shared operator allowlist (DIVE-320/325) ---
+# A customer's Telegram operator id(s) are the SAME person across their whole
+# fleet, so we learn them ONCE (any pairing, or a CoS mint event) and auto-seed
+# every new telegram agent's allowFrom — no per-agent pairing step. Per-agent
+# customization still happens later via `telegram-access set`. Stored as a JSON
+# array of string ids. Best-effort: writes need root (the CLI runs under sudo
+# via shelld), and a failure never blocks create/pair.
+OPERATOR_STORE="${OPERATOR_STORE:-$STATE_DIR/operator-allow.json}"
+
+_operator_record() {
+  local id="${1:-}"
+  [[ -n "$id" && "$id" != "0" ]] || return 0
+  valid_telegram_chat_id "$id" || return 0
+  local cur="[]"
+  [[ -r "$OPERATOR_STORE" ]] && cur=$(cat "$OPERATOR_STORE" 2>/dev/null || printf '[]')
+  printf '%s' "$cur" | jq -e 'type=="array"' >/dev/null 2>&1 || cur="[]"
+  local next
+  next=$(jq -c --arg id "$id" '(. + [$id]) | unique' <<<"$cur" 2>/dev/null) || return 0
+  ( umask 027; printf '%s\n' "$next" > "$OPERATOR_STORE" ) 2>/dev/null || return 0
+  chmod 640 "$OPERATOR_STORE" 2>/dev/null || true
+  return 0
+}
+
+_operator_ids() {
+  [[ -r "$OPERATOR_STORE" ]] || return 0
+  jq -r 'if type=="array" and length>0 then map(tostring) | join(",") else empty end' \
+    "$OPERATOR_STORE" 2>/dev/null || true
+}
+
 preseed_claude_agent() {
   local name="$1" channels="$2"
   local user="agent-${name}" home="/home/agent-${name}"

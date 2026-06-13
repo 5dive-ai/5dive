@@ -241,7 +241,10 @@ try {
       shortDescription: "5dive agent",
       avatarPng: avatarPath ? new Uint8Array(readFileSync(avatarPath)) : undefined,
     });
-    out({ ok: true, token: t.token, botId: minted.child.botId, username: minted.child.username });
+    // ownerId = the Telegram user who created the child via the deep link
+    // (ManagedBotUpdated.user.id). The create path seeds it as the allowed
+    // user so the bot auto-pairs — no "message the bot, paste a code" step.
+    out({ ok: true, token: t.token, botId: minted.child.botId, username: minted.child.username, ownerId: minted.child.ownerId });
   }
 
   if (sub === "rotate") {
