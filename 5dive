@@ -26,7 +26,7 @@ esac
 
 # Bumped on every public release. `build.sh` checks this line exists; CI fails
 # the bundle-drift check if it's missing or empty.
-readonly FIVE_VERSION="0.2.6"
+readonly FIVE_VERSION="0.2.7"
 
 # GitHub org our repos live under. The org is being renamed
 # 5dive-com -> 5dive-ai (2026-06); fetches must work on either side of the
@@ -8607,13 +8607,23 @@ _mirror_follow_migration() {
 # mid-generation — Claude queues typed input — so we don't needlessly block on
 # a busy agent). Best-effort + bounded: returns 0 as soon as it's ready, 1 on
 # timeout (caller still sends — better to try than to hang forever, and TUIs
-# that never draw "❯" shouldn't wedge inter-agent sends).
+# that never draw the marker shouldn't wedge inter-agent sends).
+#
+# DIVE-348: "❯" is CLAUDE's marker. antigravity (agy) never renders it, so the
+# old grep always timed out for agy → a needless 45s wait per send AND a false
+# "input prompt not detected — best-effort (may be lost)" warning, even though
+# the send actually landed (marketing hit this). antigravity's input box shows
+# "? for shortcuts" (idle) or "esc to cancel" (mid-turn) in its footer — both
+# appear ONLY once the box is rendered, so they're safe ready-signals. The
+# markers are TUI-specific and don't collide (claude never shows the antigravity
+# footer; antigravity never shows ❯), so OR-ing them needs no type plumbing and
+# can't false-positive across types.
 wait_agent_input_ready() {
   local name="$1" timeout="${2:-45}"
   local user="agent-${name}" waited=0 pane
   while (( waited < timeout )); do
     pane=$(sudo -u "$user" tmux capture-pane -p -t "agent-${name}" 2>/dev/null || true)
-    grep -q '❯' <<<"$pane" && return 0
+    grep -qE '❯|\? for shortcuts|esc to cancel' <<<"$pane" && return 0
     sleep 1; waited=$((waited+1))
   done
   return 1
