@@ -207,10 +207,14 @@ const sub = process.argv[2];
 try {
   const token = cosToken();
 
+  // verify + mint-link wrap their result in the standard CLI envelope
+  // {ok:true,data:{...}} so the dashboard's execAgent (which extracts `.data`)
+  // reads them like any other command. (claim/rotate stay bare — they're
+  // parsed by the create-path bash via `.token`/`.reason`, not the dashboard.)
   if (sub === "verify") {
     const v = await verifyCos(token);
     if (!v.ok) out({ ok: false, reason: v.reason, detail: v.detail });
-    out({ ok: true, username: v.cos.username, id: v.cos.id });
+    out({ ok: true, data: { username: v.cos.username, id: v.cos.id } });
   }
 
   if (sub === "mint-link") {
@@ -218,7 +222,7 @@ try {
     if (!suggested) out({ ok: false, detail: "--suggested=<username> required" });
     const v = await verifyCos(token);
     if (!v.ok) out({ ok: false, reason: v.reason, detail: v.detail });
-    out({ ok: true, deepLink: mintDeepLink(v.cos.username, suggested!), suggested });
+    out({ ok: true, data: { deepLink: mintDeepLink(v.cos.username, suggested!), suggested } });
   }
 
   if (sub === "claim") {
@@ -248,7 +252,18 @@ try {
     out({ ok: true, token: r.token });
   }
 
-  out({ ok: false, detail: `unknown cos subcommand: ${sub} (verify|mint-link|claim|rotate)` });
+  if (sub === "set-avatar") {
+    // The caller passes the AGENT's OWN bot token via COS_TOKEN_OVERRIDE (a
+    // bot sets its own profile photo — no CoS token needed). Reuses the proven
+    // InputProfilePhoto attach:// path in configureChild.
+    const avatar = arg("avatar");
+    if (!avatar) out({ ok: false, detail: "--avatar=<png path> required" });
+    const res = await configureChild(token, { avatarPng: new Uint8Array(readFileSync(avatar!)) });
+    if (!res.ok) out({ ok: false, detail: `setMyProfilePhoto failed: ${res.failed.join(", ")}` });
+    out({ ok: true });
+  }
+
+  out({ ok: false, detail: `unknown cos subcommand: ${sub} (verify|mint-link|claim|rotate|set-avatar)` });
 } catch (e) {
   out({ ok: false, detail: (e as Error).message });
 }
@@ -258,8 +273,8 @@ COS_RUNNER_TS
 
 cmd_agent_cos() {
   local sub="${1:-}"; shift || true
-  case "$sub" in set|verify|mint-link|claim|rotate) ;; *)
-    fail "$E_USAGE" "usage: 5dive agent cos set|verify|mint-link|claim|rotate [--token=<tok>] [--suggested=<uname>] [--name=<agent>] [--avatar=<png>] [--bot-id=<id>]" ;;
+  case "$sub" in set|verify|mint-link|claim|rotate|set-avatar) ;; *)
+    fail "$E_USAGE" "usage: 5dive agent cos set|verify|mint-link|claim|rotate|set-avatar [--token=<tok>] [--suggested=<uname>] [--name=<agent>] [--agent=<name>] [--avatar=<png>] [--bot-id=<id>]" ;;
   esac
   local cos_env="${COS_ENV_FILE:-$COS_ENV_DEFAULT}"
   _cos_install_runner
@@ -279,6 +294,24 @@ cmd_agent_cos() {
       return 0
     fi
     printf '%s\n' "$res"; return 1
+  fi
+
+  # `set-avatar` sets a SPECIFIC agent's bot profile photo. A bot sets its own
+  # photo with its OWN token, so this needs the agent's token (not the CoS one)
+  # — works for any telegram agent, cos-minted or pasted. Resolve the agent's
+  # stored TELEGRAM_BOT_TOKEN and hand it to the runner via COS_TOKEN_OVERRIDE.
+  if [[ "$sub" == "set-avatar" ]]; then
+    local agent="" avatar="" a
+    for a in "$@"; do case "$a" in --agent=*) agent="${a#--agent=}" ;; --avatar=*) avatar="${a#--avatar=}" ;; esac; done
+    [[ -n "$agent" && -n "$avatar" ]] || fail "$E_USAGE" "usage: 5dive agent cos set-avatar --agent=<name> --avatar=<png path>"
+    valid_name "$agent" || fail "$E_VALIDATION" "invalid --agent (lowercase letters/digits/hyphens, start letter, <=16 chars)"
+    [[ -r "$avatar" ]] || fail "$E_NOT_FOUND" "--avatar not readable: $avatar"
+    local tok_env="$(dirname "$cos_env")/telegram-${agent}.env" atok
+    [[ -r "$tok_env" ]] || fail "$E_NOT_FOUND" "no telegram token for agent '$agent' at $tok_env (is it a telegram agent?)"
+    atok=$(sudo grep -m1 -oP '(?<=^TELEGRAM_BOT_TOKEN=).*' "$tok_env" 2>/dev/null | tr -d '"'"'"'' | tr -d '[:space:]')
+    [[ -n "$atok" ]] || fail "$E_NOT_FOUND" "TELEGRAM_BOT_TOKEN empty/missing in $tok_env"
+    COS_TOKEN_OVERRIDE="$atok" "$bun" "$COS_RUN_DIR/cos-runner.ts" set-avatar --avatar="$avatar"
+    return $?
   fi
 
   # All other subcommands read the persisted token.
