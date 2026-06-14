@@ -239,6 +239,13 @@ main() {
         clone)
           AUDIT_CMD="agent clone"; AUDIT_ARGS=("$@")
           with_registry_lock cmd_clone "$@" ;;
+        export)
+          # DIVE-39: write a portable pack (read-only on the source agent).
+          AUDIT_CMD="agent export"; AUDIT_ARGS=("$@")
+          cmd_export "$@" ;;
+        import)
+          AUDIT_CMD="agent import"; AUDIT_ARGS=("$@")
+          with_registry_lock cmd_import "$@" ;;
         start)
           AUDIT_CMD="agent start"; AUDIT_ARGS=("$@")
           with_registry_lock cmd_start "$@" ;;
