@@ -433,6 +433,12 @@ main() {
       # — tick fires every few minutes and would flood the log; the wakes it
       # triggers are visible via each agent's own transcript.
       cmd_heartbeat "$@" ;;
+    fleet)
+      # DIVE-204 v0.2: multi-box control plane. Phase 1 = the fleet registry
+      # (add/ls/show/rm of peer boxes — host/user/port + key PATH, never key
+      # material). add/rm take root + write fleet.json; ls/show are read-only.
+      # Fan-out read/command land in later phases.
+      cmd_fleet "$@" ;;
     init)
       # Interactive first-run wizard: pick a type → install → auth → create
       # → "send hello". Calls back into the same CLI for each step.
