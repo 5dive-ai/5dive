@@ -26,7 +26,7 @@ esac
 
 # Bumped on every public release. `build.sh` checks this line exists; CI fails
 # the bundle-drift check if it's missing or empty.
-readonly FIVE_VERSION="0.3.5"
+readonly FIVE_VERSION="0.3.6"
 
 # GitHub org our repos live under. The org is being renamed
 # 5dive-com -> 5dive-ai (2026-06); fetches must work on either side of the
@@ -2637,6 +2637,72 @@ heal_claude_shadow_creds() {
   return 0
 }
 
+# -------- post-reauth agent restart (DIVE-383) --------
+#
+# The OAuth token a re-auth writes into combined.env (profile) /
+# connectors/anthropic.env (default), and the per-type credential files the
+# device-flow CLIs write under the profile dir, are only read by
+# 5dive-agent@.service at BOOT — combined.env via EnvironmentFile, the
+# credential files via 5dive-agent-start.sh's seed step. A RUNNING agent keeps
+# its stale (usually expired) token until it restarts, so re-login "doesn't
+# help" and the 401 persists — it looks like re-auth handed back the same dead
+# cred. This is the recurring boot-cred trap (DIVE-383), the same lesson as
+# DIVE-380's restart-after-auth. So after any successful token write we:
+#   1. heal a stale shadow ~/.claude/.credentials.json that would otherwise
+#      take precedence over the fresh env token (DIVE-329), then
+#   2. restart every agent bound to the affected profile so the fresh
+#      credential is actually picked up.
+#
+# <profile> empty => agents on the DEFAULT profile (registry .authProfile
+# unset/empty), which read the shared connectors/anthropic.env. When no agent
+# is bound yet (e.g. re-auth during `agent create`), this is a quiet no-op.
+#
+# Requires root (systemctl). Callers in the auth-finalize paths already run as
+# root (require_root / the API invokes the CLI as root). Always returns 0 so a
+# restart hiccup never fails an otherwise-successful login.
+restart_profile_agents() {
+  local profile="${1:-}"
+  [[ -f "$REGISTRY" ]] || return 0
+  local reg
+  reg=$(registry_read 2>/dev/null) || return 0
+
+  # Heal stale shadow creds first so the just-written env token is honored the
+  # instant the agent comes back up. Gated + reversible (rename, not delete).
+  local heal line
+  heal=$(heal_claude_shadow_creds 1 2>/dev/null || true)
+  if [[ -n "$heal" ]]; then
+    while IFS= read -r line; do
+      case "$line" in
+        healed*) step "Healed stale shadow creds: ${line#healed }" ;;
+        error*)  warn "shadow-creds heal failed: ${line#error }" ;;
+      esac
+    done <<<"$heal"
+  fi
+
+  local sel
+  if [[ -n "$profile" ]]; then
+    sel='[.agents | to_entries[] | select(.value.authProfile == $p) | .key]'
+  else
+    sel='[.agents | to_entries[] | select((.value.authProfile // "") == "") | .key]'
+  fi
+  local agents n
+  agents=$(jq -c --arg p "$profile" "$sel" <<<"$reg")
+  n=$(jq -r 'length' <<<"$agents" 2>/dev/null || echo 0)
+  if (( n == 0 )); then
+    step "No running agent bound${profile:+ to account '$profile'} — skipping restart"
+    return 0
+  fi
+
+  step "Restarting $n agent(s) to load the fresh token (DIVE-383)"
+  local agent
+  while IFS= read -r agent; do
+    [[ -n "$agent" ]] || continue
+    systemctl restart "5dive-agent@${agent}.service" >&2 2>&1 \
+      || warn "restart of agent '$agent' failed — check journalctl -u 5dive-agent@${agent}"
+  done < <(jq -r '.[]' <<<"$agents")
+  return 0
+}
+
 cmd_auth_status() {
   # Default: skip the live probe so the bulk status call stays fast (<100ms).
   # --probe runs a real `<cli> --print ping` for each installed type and
@@ -3200,6 +3266,8 @@ cmd_auth_login() {
         step "Writing CLAUDE_CODE_OAUTH_TOKEN to /etc/5dive/connectors/anthropic.env"
         printf '%s' "$tok" | write_default_connector "anthropic.env" "CLAUDE_CODE_OAUTH_TOKEN"
       fi
+      # DIVE-383: a fresh token only reaches a running agent on restart.
+      restart_profile_agents "$profile"
       ok "claude OAuth token stored${profile:+ (profile=$profile)}" \
          '{type:$t, var:$v, profile:$p}' \
          --arg t "claude" --arg v "CLAUDE_CODE_OAUTH_TOKEN" --arg p "${profile:-}"
@@ -3711,6 +3779,9 @@ cmd_auth_poll() {
               jq --arg s "$state" --arg ts "$(date -Iseconds)" \
                 '.state = $s | .updatedAt = $ts' "$meta" > "${meta}.tmp" \
                 && mv "${meta}.tmp" "$meta"
+              # DIVE-383: the fresh credential file is seeded into the agent's
+              # $HOME at boot, so a running agent needs a restart to load it.
+              restart_profile_agents "$profile"
             elif (( ! alive )); then
               # CLI quit without producing a fresh credential file — the user
               # cancelled, the OAuth window expired, or the CLI errored out
@@ -3738,6 +3809,8 @@ cmd_auth_poll() {
               jq --arg s "$state" --arg ts "$(date -Iseconds)" \
                 '.state = $s | .updatedAt = $ts' "$meta" > "${meta}.tmp" \
                 && mv "${meta}.tmp" "$meta"
+              # DIVE-383: a fresh token only reaches a running agent on restart.
+              restart_profile_agents "$profile"
             elif (( ! alive )); then
               # tmux session died before we saw a token — usually means the user
               # pasted a bad code and claude exited non-zero.
