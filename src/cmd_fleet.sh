@@ -33,12 +33,15 @@ _fleet_usage() {
   5dive fleet rm <name>                   # remove a box from the registry
   5dive fleet status [--timeout=<s>]      # per-box reachability + agent counts (parallel SSH)
   5dive fleet agents [--timeout=<s>]      # every agent across the fleet, one view
+  5dive fleet send <agent>@<box> <text>   # send a message to one agent on a box
+  5dive fleet restart <agent>@<box>       # restart one agent on a box
 
   add/rm need root (writes ${STATE_DIR}/fleet.json, 0640 root:claude); ls/show/status/agents
   are read-only. --key takes a PATH to an existing private key (never key material); omit it
   to use the default fleet key at connect time. status/agents fan out over SSH in parallel and
-  degrade gracefully — one unreachable box never fails the whole view. Add --json for machine
-  output. Fan-out COMMAND (fleet send/restart) lands in the next phase.
+  degrade gracefully — one unreachable box never fails the whole view. send/restart target a
+  single agent@box (message text is base64-transported so it is never re-evaluated as shell).
+  Add --json for machine output.
 USAGE
 }
 
@@ -66,6 +69,8 @@ cmd_fleet() {
     rm|delete)      cmd_fleet_rm "$@" ;;
     status)         cmd_fleet_status "$@" ;;
     agents)         cmd_fleet_agents "$@" ;;
+    send)           cmd_fleet_send "$@" ;;
+    restart)        cmd_fleet_restart "$@" ;;
     -h|--help|help) _fleet_usage ;;
     *) fail "$E_USAGE" "unknown fleet command: $sub (try: 5dive fleet --help)" ;;
   esac
@@ -325,4 +330,96 @@ cmd_fleet_agents() {
   done < <(jq -r '.boxes[].name' <<<"$agg")
   echo "---"
   jq -r '"\(.totals.reachable)/\(.totals.boxes) boxes reachable · \(.totals.agents) agents (\(.totals.active) active)"' <<<"$agg"
+}
+
+# ---- phase 3: fan-out COMMAND (DIVE-204) ---------------------------------
+#
+# `fleet send <agent>@<box> <text>` and `fleet restart <agent>@<box>` run a
+# mutating op on ONE agent on ONE box over SSH. Scope is deliberately the two
+# recoverable verbs (message + restart); destructive ops (rm) are NOT exposed
+# over the fleet. Message text is base64-transported and decoded into a remote
+# shell VARIABLE, so backticks/$() in the body are never re-evaluated (the
+# `agent send` shell-injection hazard) on either side.
+
+# Split "<agent>@<box>" -> sets _FT_AGENT / _FT_BOX, validates both, resolves
+# the box from the registry. Fails with a clear message otherwise.
+_fleet_split_target() {
+  local target="$1"
+  [[ "$target" == *"@"* ]] || fail "$E_USAGE" "target must be <agent>@<box> (e.g. ceo@swallow)"
+  _FT_AGENT="${target%@*}"
+  _FT_BOX="${target##*@}"
+  [[ -n "$_FT_AGENT" && -n "$_FT_BOX" ]] || fail "$E_USAGE" "target must be <agent>@<box>"
+  valid_sender_label "$_FT_AGENT" || fail "$E_VALIDATION" "bad agent name '$_FT_AGENT'"
+  valid_sender_label "$_FT_BOX"   || fail "$E_VALIDATION" "bad box name '$_FT_BOX'"
+  local reg; reg=$(fleet_read)
+  jq -e --arg b "$_FT_BOX" '.boxes[$b]' <<<"$reg" >/dev/null 2>&1 \
+    || fail "$E_NOT_FOUND" "no box '$_FT_BOX' in the fleet (see: 5dive fleet ls)"
+  _FT_HOST=$(jq -r --arg b "$_FT_BOX" '.boxes[$b].host' <<<"$reg")
+  _FT_USER=$(jq -r --arg b "$_FT_BOX" '.boxes[$b].user' <<<"$reg")
+  _FT_PORT=$(jq -r --arg b "$_FT_BOX" '.boxes[$b].port' <<<"$reg")
+  local key; key=$(jq -r --arg b "$_FT_BOX" '.boxes[$b].key // ""' <<<"$reg")
+  _FT_KEYPATH=$(_fleet_key_for "$key")
+}
+
+# Run a remote command on the resolved box.
+_fleet_ssh_exec() {
+  local tmo="$1" remote_cmd="$2"
+  local keyarg=()
+  [[ -n "$_FT_KEYPATH" ]] && keyarg=(-i "$_FT_KEYPATH")
+  timeout "$tmo" ssh -p "$_FT_PORT" "${keyarg[@]}" \
+    -o BatchMode=yes -o ConnectTimeout=8 -o StrictHostKeyChecking=accept-new \
+    -o LogLevel=ERROR \
+    "${_FT_USER}@${_FT_HOST}" "$remote_cmd"
+}
+
+cmd_fleet_send() {
+  local target="" text="" tmo=20
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --timeout=*) tmo="${1#*=}" ;;
+      --) shift; text="$*"; break ;;
+      -*) fail "$E_USAGE" "unknown flag: $1" ;;
+      *)
+        if [[ -z "$target" ]]; then target="$1"; else text="$*"; break; fi ;;
+    esac
+    shift
+  done
+  [[ -n "$target" && -n "$text" ]] || fail "$E_USAGE" "usage: 5dive fleet send <agent>@<box> <text...>"
+  [[ "$tmo" =~ ^[0-9]+$ ]] && (( tmo >= 1 && tmo <= 120 )) || fail "$E_VALIDATION" "bad --timeout '$tmo'"
+  _fleet_split_target "$target"
+  # base64 the message and decode it into a remote variable so neither the
+  # local nor the remote shell ever evaluates its contents. The remote passes
+  # "$msg" (double-quoted) as a single arg to `agent send`.
+  local b64; b64=$(printf '%s' "$text" | base64 -w0 2>/dev/null || printf '%s' "$text" | base64)
+  local remote="msg=\$(printf %s '$b64' | base64 -d); sudo -n /usr/local/bin/5dive agent send $(printf %q "$_FT_AGENT") \"\$msg\""
+  local out rc
+  out=$(_fleet_ssh_exec "$tmo" "$remote" 2>&1); rc=$?
+  if (( rc != 0 )); then
+    local reason="ssh/exec failed (rc=$rc)"; (( rc == 124 )) && reason="timed out after ${tmo}s"
+    fail "$E_GENERIC" "fleet send to $_FT_AGENT@$_FT_BOX failed: $reason${out:+ — ${out}}"
+  fi
+  ok "sent to $_FT_AGENT@$_FT_BOX" '{agent:$a, box:$b, sent:true}' --arg a "$_FT_AGENT" --arg b "$_FT_BOX"
+}
+
+cmd_fleet_restart() {
+  local target="" tmo=30
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --timeout=*) tmo="${1#*=}" ;;
+      -*) fail "$E_USAGE" "unknown flag: $1" ;;
+      *)  [[ -z "$target" ]] && target="$1" || fail "$E_USAGE" "unexpected arg: $1" ;;
+    esac
+    shift
+  done
+  [[ -n "$target" ]] || fail "$E_USAGE" "usage: 5dive fleet restart <agent>@<box>"
+  [[ "$tmo" =~ ^[0-9]+$ ]] && (( tmo >= 1 && tmo <= 120 )) || fail "$E_VALIDATION" "bad --timeout '$tmo'"
+  _fleet_split_target "$target"
+  local remote; remote="sudo -n /usr/local/bin/5dive agent restart $(printf %q "$_FT_AGENT")"
+  local out rc
+  out=$(_fleet_ssh_exec "$tmo" "$remote" 2>&1); rc=$?
+  if (( rc != 0 )); then
+    local reason="ssh/exec failed (rc=$rc)"; (( rc == 124 )) && reason="timed out after ${tmo}s"
+    fail "$E_GENERIC" "fleet restart of $_FT_AGENT@$_FT_BOX failed: $reason${out:+ — ${out}}"
+  fi
+  ok "restarted $_FT_AGENT@$_FT_BOX" '{agent:$a, box:$b, restarted:true}' --arg a "$_FT_AGENT" --arg b "$_FT_BOX"
 }
