@@ -120,6 +120,7 @@ JSON
   local settings
   settings=$(jq -n --argjson sl "$(jq -n "$status_line_obj")" --arg ghorg "$(gh_org)" '{
     model: "opus",
+    effortLevel: "high",
     permissions: {
       defaultMode: "bypassPermissions",
       allow: ["Bash(5dive-transcribe:*)"]

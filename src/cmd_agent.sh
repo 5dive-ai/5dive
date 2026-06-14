@@ -596,6 +596,7 @@ _apply_byo_openclaw() {
 cmd_create() {
   local name="" type="" channels="none" telegram_token="" discord_token="" workdir="" profile=""
   local telegram_home_channel="" telegram_allowed_users="" telegram_cos="" telegram_cos_avatar=""
+  local cos_owner_id=""
   local byo_provider="" byo_api_key=""
   local skills_arg="" skills_set=0 no_skills=0 defer_auth=0
   local isolation="admin" no_team_bot=0
@@ -788,8 +789,11 @@ cmd_create() {
         || fail "$E_GENERIC" "cos claim returned no token: $_cos_json"
       # Learn the operator id from the mint event (the user who created the bot)
       # into the shared box-level allowlist — the common seed below auto-pairs
-      # this agent (and every future one) to it.
-      _operator_record "$(jq -r '.ownerId // empty' <<<"$_cos_json" 2>/dev/null)"
+      # this agent (and every future one) to it. Keep the id around so we can
+      # DM that owner a welcome message after auto-pair (the CoS path bypasses
+      # cmd_pair, where the welcome normally fires).
+      cos_owner_id=$(jq -r '.ownerId // empty' <<<"$_cos_json" 2>/dev/null)
+      _operator_record "$cos_owner_id"
     fi
     if [[ -z "$telegram_token" ]]; then
       telegram_token=$(prompt_secret "Telegram bot token for agent '$name'") \
@@ -961,6 +965,15 @@ cmd_create() {
   if [[ -n "$telegram_token" ]]; then
     step "Writing telegram bot token (${CONNECTORS_DIR}/telegram-${name}.env)"
     write_channel_secret telegram "$name" TELEGRAM_BOT_TOKEN "$telegram_token"
+  fi
+  # CoS-create welcome DM: --telegram-cos auto-pairs the minting owner into
+  # access.json at create time, which bypasses cmd_pair (where the welcome
+  # message normally fires on a code-roundtrip pairing). Send it here so a
+  # CoS-created bot greets its owner immediately. Best-effort — a send hiccup
+  # must not fail an otherwise-successful create, so never abort on it.
+  if [[ -n "$cos_owner_id" && "$channels" == "telegram" && -n "$telegram_token" ]]; then
+    step "Sending welcome DM to CoS owner ($cos_owner_id)"
+    send_welcome_message "$cos_owner_id" "$telegram_token" "$name" "$type" || true
   fi
   if [[ -n "$discord_token" ]]; then
     step "Writing discord token (${CONNECTORS_DIR}/discord-${name}.env)"
