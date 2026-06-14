@@ -26,7 +26,7 @@ esac
 
 # Bumped on every public release. `build.sh` checks this line exists; CI fails
 # the bundle-drift check if it's missing or empty.
-readonly FIVE_VERSION="0.3.4"
+readonly FIVE_VERSION="0.3.5"
 
 # GitHub org our repos live under. The org is being renamed
 # 5dive-com -> 5dive-ai (2026-06); fetches must work on either side of the
@@ -12118,6 +12118,15 @@ task_need_notify() {
     [[ -n "$opts_list" ]] && text+=$'\n\n'"Options:"$'\n'"${opts_list}"
   fi
 
+  # DIVE-356: secret/manual gates used to carry NO instruction on how to clear
+  # them — the core of Mark's "a needs-you that needs no obvious action is
+  # confusing" complaint. Add a type-specific CTA telling the human exactly what
+  # to do + tap (the matching ✅ button is emitted below for plugin types).
+  case "$need_type" in
+    secret) text+=$'\n\n'"🔑 Put the key where I expect it (my .env / our channel), then tap ✅ Provided below. Don't paste the key here." ;;
+    manual) text+=$'\n\n'"✋ Tap ✅ Done below once it's handled." ;;
+  esac
+
   # DIVE-117/118 tap-to-answer buttons. GATED to the plugin types whose `tna:`
   # callback_query handler exists AND splits options byte-identically to this
   # emit: claude, codex, grok, antigravity (DIVE-118 — parity verified against
@@ -12173,6 +12182,14 @@ task_need_notify() {
                           reply_markup='{"inline_keyboard":[['"$_deny"','"$_appr"']]}' ;;
         *)                reply_markup='{"inline_keyboard":[['"$_appr"','"$_deny"']]}' ;;
       esac
+    elif [[ "$need_type" == "secret" ]]; then
+      # DIVE-356: one-tap "Provided" — the plugin handler runs `task answer <id>`
+      # with NO value (the CLI rejects a value for a secret gate). Matches dev's
+      # tna:<numid>:provided contract.
+      reply_markup='{"inline_keyboard":[[{"text":"✅ Provided","callback_data":"tna:'"${numid}"':provided"}]]}'
+    elif [[ "$need_type" == "manual" ]]; then
+      # DIVE-356: one-tap "Done" — handler runs `task answer <id> --value=done`.
+      reply_markup='{"inline_keyboard":[[{"text":"✅ Done","callback_data":"tna:'"${numid}"':done"}]]}'
     fi
   fi
 
