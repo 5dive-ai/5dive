@@ -740,7 +740,13 @@ cmd_create() {
         # generic. The runner reports the cause in JSON `.reason`.
         _cos_reason=$(jq -r '.reason // empty' <<<"$_cos_json" 2>/dev/null)
         if [[ "$_cos_reason" == "timeout" ]]; then
-          fail "$E_TIMEOUT" "no bot @$telegram_cos appeared within the claim window — tap the create link in Telegram to create it, then retry"
+          # A timeout has two likely causes and Telegram gives us no way to tell
+          # them apart (a cap rejection silently produces no managed_bot update,
+          # same as the user never tapping): either the Create link was not
+          # tapped yet, OR the Chief-of-Staff account is at its managed-bot cap
+          # (20 free / 40 with Telegram Premium). Name both so a whale is not
+          # left guessing. (DIVE-323)
+          fail "$E_TIMEOUT" "no bot @$telegram_cos appeared within the claim window — either you have not tapped the Create link in Telegram yet, or your Chief of Staff has hit its managed-bot limit (20 free, 40 with Telegram Premium). Tap the link to create it, or free a slot / upgrade to Premium, then retry"
         elif (( _cos_rc == E_NOT_FOUND )); then
           fail "$E_NOT_FOUND" "no Chief-of-Staff bot configured — run: 5dive agent cos set --token=<token>"
         fi
