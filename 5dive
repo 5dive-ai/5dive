@@ -4737,11 +4737,42 @@ cmd_list() {
   local out
   out=$(echo "$reg" | jq -c '.agents')
   local enriched="{}"
+  # DIVE-352: collapse the per-agent systemd probe — was 2 systemctl spawns per
+  # agent (is-active + is-enabled), i.e. 2N process spawns per `agent list`, which
+  # the dashboard polls every 30s — into ONE `systemctl show` over every unit.
+  # Keeps `agent list` a single cheap shell-out at any fleet size. Missing units
+  # fall through to the "// unknown" default in the merge below.
+  local -A _active_map=() _enabled_map=()
+  local _svc_args=() _an
+  for _an in $(echo "$out" | jq -r 'keys[]' 2>/dev/null); do
+    _svc_args+=("5dive-agent@${_an}.service")
+  done
+  if (( ${#_svc_args[@]} )); then
+    local _show _line _id="" _as="" _ufs="" _n
+    _show=$(systemctl show --property=Id,ActiveState,UnitFileState --no-page "${_svc_args[@]}" 2>/dev/null || true)
+    while IFS= read -r _line; do
+      case "$_line" in
+        Id=*)            _id="${_line#Id=}" ;;
+        ActiveState=*)   _as="${_line#ActiveState=}" ;;
+        UnitFileState=*) _ufs="${_line#UnitFileState=}" ;;
+        "")              if [[ "$_id" == 5dive-agent@*.service ]]; then
+                           _n="${_id#5dive-agent@}"; _n="${_n%.service}"
+                           _active_map["$_n"]="$_as"; _enabled_map["$_n"]="$_ufs"
+                         fi
+                         _id=""; _as=""; _ufs="" ;;
+      esac
+    done <<< "$_show"
+    # systemctl show emits no trailing blank line, so flush the final block.
+    if [[ "$_id" == 5dive-agent@*.service ]]; then
+      _n="${_id#5dive-agent@}"; _n="${_n%.service}"
+      _active_map["$_n"]="$_as"; _enabled_map["$_n"]="$_ufs"
+    fi
+  fi
   for name in $(echo "$out" | jq -r 'keys[]' 2>/dev/null); do
     local svc="5dive-agent@${name}"
     local active sub
-    active=$(systemctl is-active "$svc" 2>/dev/null || true)
-    sub=$(systemctl is-enabled "$svc" 2>/dev/null || true)
+    active="${_active_map[$name]:-unknown}"
+    sub="${_enabled_map[$name]:-unknown}"
     # Surface bot-to-bot status (DIVE-161) so the dashboard can flag which agents
     # can message bots outside the team — without N per-agent access fetches.
     # It lives in the agent's access.json, not the registry; read it here (root).
@@ -13555,8 +13586,14 @@ _pack_usage() {
 
   5dive agent export <name> [--with-memory] [--out=<path>]
                                   # write a shareable pack (.tar.gz). Default = config only.
-  5dive agent import <pack> --as=<name> [--channels=...] [--telegram-token=...]
-                                  # recreate an agent from a pack (coming in the import slice)
+  5dive agent import <pack> --as=<name> [--channels=none|telegram|discord]
+                            [--telegram-token=<tok>] [--discord-token=<tok>]
+                            [--auth-profile=<name>] [--workdir=<path>]
+                                  # recreate an agent from a pack into a FRESH name.
+                                  # Packs carry no secrets: supply the new agent's own
+                                  # token/auth-profile here. Skills are re-added from their
+                                  # recorded refs (skills not in a published repo are skipped
+                                  # + reported). Memory is never in a config pack.
 
   A pack carries an agent's portable identity (instructions, skills, settings subset),
   NEVER secrets (tokens/keys/sessions/transcripts are hard-excluded). --with-memory adds
@@ -13670,10 +13707,153 @@ cmd_export() {
 }
 
 cmd_import() {
-  # The import slice (recreate from manifest + re-add skills + template into a
-  # fresh project dir) is the next build; refuse clearly until then rather than
-  # half-create an agent.
-  fail "$E_USAGE" "agent import is not built yet (DIVE-39 import slice next). Export side is live: 5dive agent export <name>."
+  require_root
+  local pack="" as="" channels="" tg_token="" dc_token="" profile="" workdir=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --as=*)              as="${1#--as=}" ;;
+      --channels=*)        channels="${1#--channels=}" ;;
+      --telegram-token=*)  tg_token="${1#--telegram-token=}" ;;
+      --discord-token=*)   dc_token="${1#--discord-token=}" ;;
+      --auth-profile=*)    profile="${1#--auth-profile=}" ;;
+      --workdir=*)         workdir="${1#--workdir=}" ;;
+      -*)                  fail "$E_USAGE" "unknown flag: $1" ;;
+      *)                   [[ -z "$pack" ]] && pack="$1" || fail "$E_USAGE" "extra arg: $1" ;;
+    esac
+    shift
+  done
+  [[ -n "$pack" ]] || fail "$E_USAGE" "usage: 5dive agent import <pack> --as=<name> [--channels=...] [--telegram-token=...] [--discord-token=...] [--auth-profile=...] [--workdir=...]"
+  [[ -n "$as" ]]   || fail "$E_USAGE" "--as=<name> is required (the new agent's name)"
+  [[ -f "$pack" ]] || fail "$E_NOT_FOUND" "pack not found: $pack"
+
+  # Reject an existing target up front — import recreates, it never overlays.
+  local reg; reg=$(registry_read)
+  jq -e --arg n "$as" '.agents[$n]' <<<"$reg" >/dev/null 2>&1 \
+    && fail "$E_VALIDATION" "agent '$as' already exists — pick a fresh --as=<name> (import never overlays an existing agent)"
+
+  # Unpack into an isolated stage and validate the manifest before touching anything.
+  local stage; stage=$(mktemp -d)
+  tar -xzf "$pack" -C "$stage" 2>/dev/null \
+    || { rm -rf "$stage"; fail "$E_GENERIC" "could not read pack (expected a .tar.gz from 'agent export')"; }
+  [[ -f "$stage/manifest.json" ]] \
+    || { rm -rf "$stage"; fail "$E_VALIDATION" "pack has no manifest.json — not a 5dive agent pack"; }
+
+  local pf; pf=$(jq -r '.packFormat // empty' "$stage/manifest.json" 2>/dev/null)
+  [[ "$pf" =~ ^[0-9]+$ ]] \
+    || { rm -rf "$stage"; fail "$E_VALIDATION" "pack manifest missing packFormat"; }
+  (( pf <= PACK_FORMAT_VERSION )) \
+    || { rm -rf "$stage"; fail "$E_VALIDATION" "pack format v$pf is newer than this CLI supports (v$PACK_FORMAT_VERSION) — upgrade 5dive"; }
+
+  # v1 imports config only. A with-memory pack must pass the export-side redaction
+  # + review gate (not built yet), so one can never reach here; guard regardless.
+  if [[ "$(jq -r '.includes.memory // false' "$stage/manifest.json")" == "true" ]]; then
+    rm -rf "$stage"; fail "$E_USAGE" "this pack claims to carry memory; the with-memory import path isn't built yet (DIVE-39 v2)"
+  fi
+
+  # Derive create inputs from the manifest; explicit flags win.
+  local type isolation m_workdir m_profile model effort
+  type=$(jq -r '.config.type // empty'         "$stage/manifest.json")
+  isolation=$(jq -r '.config.isolation // empty' "$stage/manifest.json")
+  m_workdir=$(jq -r '.config.workdir // empty'    "$stage/manifest.json")
+  m_profile=$(jq -r '.config.authProfile // empty' "$stage/manifest.json")
+  model=$(jq -r '.config.model // empty'         "$stage/manifest.json")
+  effort=$(jq -r '.config.effort // empty'       "$stage/manifest.json")
+  [[ -n "$type" ]] || { rm -rf "$stage"; fail "$E_VALIDATION" "manifest has no agent type"; }
+  [[ -n "$workdir" ]] || workdir="$m_workdir"
+  [[ -n "$profile" ]] || profile="$m_profile"
+
+  # Build the create argv. Skills are re-added afterwards (best-effort) so one
+  # unresolvable ref can't abort the import. Channels default to none unless the
+  # importer supplies a token (a pack never carries secrets).
+  local -a cargs=("$as" "--type=$type" "--no-skills")
+  [[ -n "$isolation" ]] && cargs+=("--isolation=$isolation")
+  [[ -n "$workdir" ]]   && cargs+=("--workdir=$workdir")
+  if [[ -n "$profile" ]]; then
+    cargs+=("--auth-profile=$profile")
+  else
+    cargs+=("--defer-auth")   # no profile on this host → first-run UI signs in
+  fi
+  if [[ -n "$channels" ]]; then
+    cargs+=("--channels=$channels")
+  elif [[ -n "$tg_token" ]]; then
+    cargs+=("--channels=telegram")
+  elif [[ -n "$dc_token" ]]; then
+    cargs+=("--channels=discord")
+  else
+    cargs+=("--channels=none")
+  fi
+  [[ -n "$tg_token" ]] && cargs+=("--telegram-token=$tg_token")
+  [[ -n "$dc_token" ]] && cargs+=("--discord-token=$dc_token")
+
+  # Recreate via the canonical create path (its ok-envelope suppressed so import
+  # emits a single envelope). The registry lock is reentrant, so this is safe.
+  step "Recreating agent '$as' from pack (type=$type)"
+  ( cmd_create "${cargs[@]}" ) >/dev/null \
+    || { rm -rf "$stage"; fail "$E_GENERIC" "create step failed while importing '$as'"; }
+
+  local cdir="/home/agent-${as}/.claude"
+
+  # Layer the identity doc.
+  if [[ -f "$stage/CLAUDE.md" ]]; then
+    install -o "agent-${as}" -g "agent-${as}" -m 644 "$stage/CLAUDE.md" "$cdir/CLAUDE.md" 2>/dev/null || true
+  fi
+
+  # Layer model/effort/hooks/plugins into settings.json (claude-only keys; others
+  # ignore them). settings.json may not exist until first boot.
+  if [[ "$type" == "claude" ]]; then
+    local sfile="$cdir/settings.json" hooks plugins cur
+    hooks=$(jq -c '.hooks // {}'     "$stage/manifest.json")
+    plugins=$(jq -c '.plugins // []' "$stage/manifest.json")
+    cur=$( [[ -f "$sfile" ]] && cat "$sfile" || echo '{}' )
+    if jq -n --argjson cur "$cur" \
+          --arg model "$model" --arg effort "$effort" \
+          --argjson hooks "$hooks" --argjson plugins "$plugins" \
+      '$cur
+       + (if $model  != "" then {model:$model}        else {} end)
+       + (if $effort != "" then {effortLevel:$effort} else {} end)
+       + (if ($hooks   | length) > 0 then {hooks:$hooks}            else {} end)
+       + (if ($plugins | length) > 0 then {enabledPlugins:$plugins} else {} end)' \
+      > "$sfile.imp.$$" 2>/dev/null; then
+      install -o "agent-${as}" -g "agent-${as}" -m 600 "$sfile.imp.$$" "$sfile" 2>/dev/null || true
+    fi
+    rm -f "$sfile.imp.$$"
+  fi
+
+  # Optional template/ bootstrap → a FRESH project dir only (never overlay).
+  local templated="none"
+  if [[ -d "$stage/template" && -n "$workdir" ]]; then
+    if [[ ! -e "$workdir" ]]; then
+      install -d -o "agent-${as}" -g "agent-${as}" "$workdir"
+      cp -a "$stage/template/." "$workdir/" 2>/dev/null && chown -R "agent-${as}:agent-${as}" "$workdir"
+      templated="$workdir"
+    else
+      templated="skipped (workdir exists — never overlay)"
+    fi
+  fi
+
+  # Re-add skills best-effort. Config packs record refs, not bodies, so skills not
+  # in a published repo can't be reinstalled cross-user — report what we skipped.
+  local -a added=() skipped=()
+  local sk pair src id
+  while IFS= read -r sk; do
+    [[ -z "$sk" ]] && continue
+    pair=$(parse_skill_spec "$sk" 2>/dev/null) || { skipped+=("$sk"); continue; }
+    src="${pair% *}"; id="${pair#* }"
+    if ( cmd_skill_add "$as" --source="$src" --skill="$id" ) >/dev/null 2>&1; then
+      added+=("$id")
+    else
+      skipped+=("$sk")
+    fi
+  done < <(jq -r '.skills[]? // empty' "$stage/manifest.json")
+
+  rm -rf "$stage"
+
+  local added_j skipped_j
+  added_j=$(printf '%s\n'   "${added[@]+"${added[@]}"}"   | jq -R . | jq -cs 'map(select(. != ""))')
+  skipped_j=$(printf '%s\n' "${skipped[@]+"${skipped[@]}"}" | jq -R . | jq -cs 'map(select(. != ""))')
+  ok "imported '$as' from pack (config only, no memory). Skills added: ${#added[@]}, skipped: ${#skipped[@]}; template: $templated." \
+     '{name:$n, type:$t, skillsAdded:$a, skillsSkipped:$s, template:$tpl}' \
+     --arg n "$as" --arg t "$type" --argjson a "$added_j" --argjson s "$skipped_j" --arg tpl "$templated"
 }
 
 # -------- self-update (fetch installer + --upgrade, then restart agents) --------

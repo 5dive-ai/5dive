@@ -9,11 +9,42 @@ cmd_list() {
   local out
   out=$(echo "$reg" | jq -c '.agents')
   local enriched="{}"
+  # DIVE-352: collapse the per-agent systemd probe — was 2 systemctl spawns per
+  # agent (is-active + is-enabled), i.e. 2N process spawns per `agent list`, which
+  # the dashboard polls every 30s — into ONE `systemctl show` over every unit.
+  # Keeps `agent list` a single cheap shell-out at any fleet size. Missing units
+  # fall through to the "// unknown" default in the merge below.
+  local -A _active_map=() _enabled_map=()
+  local _svc_args=() _an
+  for _an in $(echo "$out" | jq -r 'keys[]' 2>/dev/null); do
+    _svc_args+=("5dive-agent@${_an}.service")
+  done
+  if (( ${#_svc_args[@]} )); then
+    local _show _line _id="" _as="" _ufs="" _n
+    _show=$(systemctl show --property=Id,ActiveState,UnitFileState --no-page "${_svc_args[@]}" 2>/dev/null || true)
+    while IFS= read -r _line; do
+      case "$_line" in
+        Id=*)            _id="${_line#Id=}" ;;
+        ActiveState=*)   _as="${_line#ActiveState=}" ;;
+        UnitFileState=*) _ufs="${_line#UnitFileState=}" ;;
+        "")              if [[ "$_id" == 5dive-agent@*.service ]]; then
+                           _n="${_id#5dive-agent@}"; _n="${_n%.service}"
+                           _active_map["$_n"]="$_as"; _enabled_map["$_n"]="$_ufs"
+                         fi
+                         _id=""; _as=""; _ufs="" ;;
+      esac
+    done <<< "$_show"
+    # systemctl show emits no trailing blank line, so flush the final block.
+    if [[ "$_id" == 5dive-agent@*.service ]]; then
+      _n="${_id#5dive-agent@}"; _n="${_n%.service}"
+      _active_map["$_n"]="$_as"; _enabled_map["$_n"]="$_ufs"
+    fi
+  fi
   for name in $(echo "$out" | jq -r 'keys[]' 2>/dev/null); do
     local svc="5dive-agent@${name}"
     local active sub
-    active=$(systemctl is-active "$svc" 2>/dev/null || true)
-    sub=$(systemctl is-enabled "$svc" 2>/dev/null || true)
+    active="${_active_map[$name]:-unknown}"
+    sub="${_enabled_map[$name]:-unknown}"
     # Surface bot-to-bot status (DIVE-161) so the dashboard can flag which agents
     # can message bots outside the team — without N per-agent access fetches.
     # It lives in the agent's access.json, not the registry; read it here (root).
