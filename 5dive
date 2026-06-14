@@ -26,7 +26,7 @@ esac
 
 # Bumped on every public release. `build.sh` checks this line exists; CI fails
 # the bundle-drift check if it's missing or empty.
-readonly FIVE_VERSION="0.2.8"
+readonly FIVE_VERSION="0.2.9"
 
 # GitHub org our repos live under. The org is being renamed
 # 5dive-com -> 5dive-ai (2026-06); fetches must work on either side of the
@@ -8961,15 +8961,28 @@ cmd_clone() {
 }
 
 cmd_stats() {
-  local name="" all=0
+  local name="" all=0 want_health=-1   # want_health: -1=unset (default by mode)
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --all) all=1 ;;
+      --health) want_health=1 ;;
+      --no-health) want_health=0 ;;
       -*) fail "$E_USAGE" "unknown flag: $1" ;;
       *)  [[ -z "$name" ]] && name="$1" || fail "$E_USAGE" "extra arg: $1" ;;
     esac
     shift
   done
+
+  # The stall-health probe scrapes each agent's live tmux pane (one
+  # `capture-pane` per agent) — the dominant, non-scaling cost when the
+  # dashboard polls `stats --all` every 30s (N captures + N systemctl on a
+  # 2-CPU box pegs CPU and blows the exec timeout). So it's OPT-IN: single
+  # `stats <name>` keeps it (the detail screen wants the stall banner), but
+  # `stats --all` skips it by default. Force a fleet sweep with `--all
+  # --health`; suppress on a single agent with `--no-health`. (DIVE-326)
+  if (( want_health == -1 )); then
+    if (( all )); then want_health=0; else want_health=1; fi
+  fi
 
   # Batched form: `stats --all` emits every agent's stats object in ONE
   # invocation so the dashboard/mobile collapse N per-agent box execs into a
@@ -8982,9 +8995,12 @@ cmd_stats() {
     local _reg _names _arr="[]" _n _d
     _reg=$(registry_read)
     _names=$(jq -r '.agents | keys[]' <<<"$_reg" 2>/dev/null || true)
+    local _hflag="--no-health"; (( want_health )) && _hflag="--health"
     for _n in $_names; do
       # Subshell isolates the forced JSON_MODE; unwrap the single-agent `.data`.
-      _d=$(JSON_MODE=1; cmd_stats "$_n" 2>/dev/null | jq -c '.data' 2>/dev/null) || continue
+      # Pass the resolved health pref so the per-agent gather honors --all's
+      # default (no pane scrape) unless the caller asked for --all --health.
+      _d=$(JSON_MODE=1; cmd_stats "$_n" "$_hflag" 2>/dev/null | jq -c '.data' 2>/dev/null) || continue
       [[ -n "$_d" && "$_d" != "null" ]] || continue
       _arr=$(jq -c --argjson d "$_d" '. + [$d]' <<<"$_arr")
     done
@@ -8992,7 +9008,7 @@ cmd_stats() {
     return 0
   fi
 
-  [[ -n "$name" ]] || fail "$E_USAGE" "usage: 5dive agent stats <name> [--json] | stats --all --json"
+  [[ -n "$name" ]] || fail "$E_USAGE" "usage: 5dive agent stats <name> [--json] [--no-health] | stats --all [--health] --json"
   require_agent "$name"
 
   local reg
@@ -9027,7 +9043,7 @@ cmd_stats() {
   # via Telegram. Empty/`null` when running clean or when we can't read the
   # pane (e.g. not root). Only meaningful while active.
   local health="null"
-  if [[ "$active" == "active" ]]; then
+  if (( want_health )) && [[ "$active" == "active" ]]; then
     local pane
     pane=$(sudo -u "agent-${name}" tmux capture-pane -t "agent-${name}" -p -S -40 2>/dev/null | tail -c 4000 || true)
     if [[ -n "$pane" ]]; then
