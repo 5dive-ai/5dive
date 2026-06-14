@@ -26,7 +26,7 @@ esac
 
 # Bumped on every public release. `build.sh` checks this line exists; CI fails
 # the bundle-drift check if it's missing or empty.
-readonly FIVE_VERSION="0.3.3"
+readonly FIVE_VERSION="0.3.4"
 
 # GitHub org our repos live under. The org is being renamed
 # 5dive-com -> 5dive-ai (2026-06); fetches must work on either side of the
@@ -2259,7 +2259,8 @@ _tasks_db_migrate() {
   # untouched and a downgrade still reads/writes the table fine.
   for c in 'result TEXT' 'need_type TEXT' 'ask TEXT' 'need_options TEXT' 'recommend TEXT' 'need_answer TEXT' 'need_answered_at TEXT' \
            "kind TEXT NOT NULL DEFAULT 'standard'" 'schedule TEXT' 'last_fired_at TEXT' \
-           'from_template_id INTEGER' 'fresh INTEGER'; do
+           'from_template_id INTEGER' 'fresh INTEGER' \
+           'parked_at TEXT' 'park_reason TEXT'; do
     if ! printf '%s\n' "$cols" | grep -qx "${c%% *}"; then
       sqlite3 -cmd ".timeout 5000" "$TASKS_DB" \
         "ALTER TABLE tasks ADD COLUMN ${c};" >/dev/null 2>&1 || true
@@ -11536,6 +11537,8 @@ cmd_task() {
     cancel)          cmd_task_cancel "$@" ;;
     block)           cmd_task_block "$@" ;;
     unblock)         cmd_task_unblock "$@" ;;
+    park)            cmd_task_park "$@" ;;
+    unpark)          cmd_task_unpark "$@" ;;
     need)            cmd_task_need "$@" ;;
     inbox)           cmd_task_inbox "$@" ;;
     answer)          cmd_task_answer "$@" ;;
@@ -11682,7 +11685,7 @@ cmd_task_ls() {
   [[ -n "$assignee" ]] && where+=" AND assignee=$(sqlq "$assignee")"
   if (( JSON_MODE )); then
     local rows
-    rows=$(dbfmt -json "SELECT id, ident, title, status, priority, assignee, created_by, parent_id, created_at, done_at, body, result, need_type, ask, need_options, need_answer, need_answered_at, kind, schedule, last_fired_at FROM tasks WHERE ${where} ${order};")
+    rows=$(dbfmt -json "SELECT id, ident, title, status, priority, assignee, created_by, parent_id, created_at, done_at, body, result, need_type, ask, need_options, need_answer, need_answered_at, kind, schedule, last_fired_at, parked_at, park_reason FROM tasks WHERE ${where} ${order};")
     [[ -n "$rows" ]] || rows="[]"
     # Feed rows via stdin, not --argjson: a big board (179+ tasks w/ bodies)
     # blows past MAX_ARG_STRLEN (128K per argv string) -> execve E2BIG
@@ -11841,6 +11844,49 @@ cmd_task_unblock() {
         AND (need_type IS NULL OR need_answered_at IS NOT NULL)
         AND NOT EXISTS (SELECT 1 FROM task_deps WHERE task_id=${tid});"
   ok "DIVE-$tid unblocked" '{task:($t|tonumber)}' --arg t "$tid"
+}
+
+# DIVE-356: `park` is the QUIET counterpart to `need`. A parked task is waiting
+# on an external/time event the human need not act on — so it must NOT fire a
+# CTA ping the way `need` does, and must NOT show in the human inbox. We set
+# status=blocked + parked_at + park_reason and CLEAR any pending gate fields so
+# the state is unambiguously "parked, no action" (inbox is need_type IS NOT
+# NULL, so clearing need_type also drops it from the inbox). No notify.
+# Dashboard reads: status='blocked' AND parked_at IS NOT NULL.
+cmd_task_park() {
+  tasks_db_init
+  local task="" reason=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --reason=*) reason="${1#*=}" ;;
+      -*)         fail "$E_USAGE" "unknown flag: $1" ;;
+      *)          [[ -z "$task" ]] && task="$1" || fail "$E_USAGE" "unexpected arg: $1" ;;
+    esac
+    shift
+  done
+  [[ -n "$task" ]] || fail "$E_USAGE" "usage: 5dive task park <id|DIVE-N> --reason=<why / what unblocks it>"
+  resolve_task_id "$task"; local tid="$RESOLVED_TASK_ID"
+  db "UPDATE tasks
+        SET status='blocked', parked_at=datetime('now'), park_reason=$(sqlq "$reason"),
+            need_type=NULL, ask=NULL, need_options=NULL, recommend=NULL,
+            need_answer=NULL, need_answered_at=NULL
+      WHERE id=${tid} AND status NOT IN ('done','cancelled');"
+  ok "DIVE-$tid parked (no action needed)${reason:+ — $reason}" \
+     '{task:($t|tonumber), parked:true, reason:$r}' --arg t "$tid" --arg r "$reason"
+}
+
+# Clear a park -> back to todo (unless real dependency edges still block it).
+cmd_task_unpark() {
+  tasks_db_init
+  local task="${1:-}"
+  [[ -n "$task" ]] || fail "$E_USAGE" "usage: 5dive task unpark <id|DIVE-N>"
+  resolve_task_id "$task"; local tid="$RESOLVED_TASK_ID"
+  db "UPDATE tasks SET parked_at=NULL, park_reason=NULL,
+        status=CASE WHEN status='blocked'
+                     AND NOT EXISTS (SELECT 1 FROM task_deps WHERE task_id=${tid})
+                    THEN 'todo' ELSE status END
+      WHERE id=${tid} AND status NOT IN ('done','cancelled');"
+  ok "DIVE-$tid unparked" '{task:($t|tonumber)}' --arg t "$tid"
 }
 
 # --- Human Task Inbox (DIVE-103; parent feature DIVE-102) ----------------
