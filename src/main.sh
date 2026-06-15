@@ -171,6 +171,12 @@ Heartbeat (wake an agent only when it has queued tasks, one per tick):
   5dive heartbeat tick                                      # cron driver (root); wakes due agents that have work
   # full surface: 5dive heartbeat --help
 
+Usage (per-agent / per-task token burn — subscription tokens, no dollars):
+  5dive usage [--7d]                                 # board: top agents + top tasks by tokens (24h default)
+  5dive usage <agent> [--7d]                         # one agent: per-model + per-task breakdown
+  5dive usage budget set <agent> --daily=<tokens>    # soft 24h cap → ⚠ on the board (no throttle)
+  5dive usage budget ls | clear <agent>
+
 Health:
   5dive doctor [--repair] [--category=deps|types|auth|creds|registry|shelld|channels]
     Walks deps (tmux/jq/bun/python3/nvm/node/npm), type bins, live auth
@@ -440,6 +446,12 @@ main() {
       # — tick fires every few minutes and would flood the log; the wakes it
       # triggers are visible via each agent's own transcript.
       cmd_heartbeat "$@" ;;
+    usage)
+      # Per-agent / per-task token visibility for subscription agents. Read-only
+      # (scans sibling transcripts + the task DB); the `budget` subcommand writes
+      # a small soft-cap store. No registry mutation/lock; budget writes take root
+      # inside cmd_usage. No audit — pure reporting + a visibility-only cap.
+      cmd_usage "$@" ;;
     fleet)
       # DIVE-204 v0.2: multi-box control plane. Phase 1 = the fleet registry
       # (add/ls/show/rm of peer boxes — host/user/port + key PATH, never key
