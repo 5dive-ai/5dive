@@ -616,7 +616,12 @@ task_need_notify() {
   # it. Applies to decision + approval gates; NULL/empty recommend = no line.
   local text="🙋 [${ident}] needs you"
   [[ -n "$recommend" ]] && text+=$'\n\n'"✅ Recommended: ${recommend}"
-  text+=$'\n\n'"${ask}"
+  # DIVE-390: append a bare, tappable /task_<id> link inline at the end of the
+  # description sentence, before the options (Mark 2026-06-15). Telegram
+  # auto-linkifies bare /commands, so tapping it fires the plugin's
+  # ^/task_(\d+)$ handler -> `5dive task show <id>` (the full detail card). No
+  # "details" label, numeric id only. A plain-text host shows an inert link.
+  text+=$'\n\n'"${ask} /task_${ident#DIVE-}"
   if [[ "$need_type" == "decision" && -n "$options" ]]; then
     local opts_list
     # ⭐-mark the recommended option in the numbered list (numbering stays the
