@@ -87,6 +87,12 @@ CREATE TABLE IF NOT EXISTS tasks (
   recommend        TEXT,
   need_answer      TEXT,
   need_answered_at TEXT,
+  -- DIVE-394: provenance of the answer. Records WHO cleared the gate (actor
+  -- label, prefixed `human:` when answered through a verified human path that
+  -- passed --human). Hard-line gates (approval/secret) are root-gated in
+  -- cmd_task_answer so a plain agent can't clear them; this column is the audit
+  -- trail for every answer regardless of type.
+  need_answered_by TEXT,
   -- Recurring task templates (DIVE step 1). kind='recurring' marks a row as a
   -- TEMPLATE, not work: it's excluded from the work board, the heartbeat TODO
   -- count + wake, and the human inbox, so it's never picked up directly.
@@ -202,7 +208,7 @@ _tasks_db_migrate() {
   for c in 'result TEXT' 'need_type TEXT' 'ask TEXT' 'need_options TEXT' 'recommend TEXT' 'need_answer TEXT' 'need_answered_at TEXT' \
            "kind TEXT NOT NULL DEFAULT 'standard'" 'schedule TEXT' 'last_fired_at TEXT' \
            'from_template_id INTEGER' 'fresh INTEGER' \
-           'parked_at TEXT' 'park_reason TEXT'; do
+           'parked_at TEXT' 'park_reason TEXT' 'need_answered_by TEXT'; do
     if ! printf '%s\n' "$cols" | grep -qx "${c%% *}"; then
       sqlite3 -cmd ".timeout 5000" "$TASKS_DB" \
         "ALTER TABLE tasks ADD COLUMN ${c};" >/dev/null 2>&1 || true

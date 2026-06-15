@@ -26,7 +26,7 @@ esac
 
 # Bumped on every public release. `build.sh` checks this line exists; CI fails
 # the bundle-drift check if it's missing or empty.
-readonly FIVE_VERSION="0.3.8"
+readonly FIVE_VERSION="0.3.9"
 
 # GitHub org our repos live under. The org is being renamed
 # 5dive-com -> 5dive-ai (2026-06); fetches must work on either side of the
@@ -2146,6 +2146,12 @@ CREATE TABLE IF NOT EXISTS tasks (
   recommend        TEXT,
   need_answer      TEXT,
   need_answered_at TEXT,
+  -- DIVE-394: provenance of the answer. Records WHO cleared the gate (actor
+  -- label, prefixed `human:` when answered through a verified human path that
+  -- passed --human). Hard-line gates (approval/secret) are root-gated in
+  -- cmd_task_answer so a plain agent can't clear them; this column is the audit
+  -- trail for every answer regardless of type.
+  need_answered_by TEXT,
   -- Recurring task templates (DIVE step 1). kind='recurring' marks a row as a
   -- TEMPLATE, not work: it's excluded from the work board, the heartbeat TODO
   -- count + wake, and the human inbox, so it's never picked up directly.
@@ -2261,7 +2267,7 @@ _tasks_db_migrate() {
   for c in 'result TEXT' 'need_type TEXT' 'ask TEXT' 'need_options TEXT' 'recommend TEXT' 'need_answer TEXT' 'need_answered_at TEXT' \
            "kind TEXT NOT NULL DEFAULT 'standard'" 'schedule TEXT' 'last_fired_at TEXT' \
            'from_template_id INTEGER' 'fresh INTEGER' \
-           'parked_at TEXT' 'park_reason TEXT'; do
+           'parked_at TEXT' 'park_reason TEXT' 'need_answered_by TEXT'; do
     if ! printf '%s\n' "$cols" | grep -qx "${c%% *}"; then
       sqlite3 -cmd ".timeout 5000" "$TASKS_DB" \
         "ALTER TABLE tasks ADD COLUMN ${c};" >/dev/null 2>&1 || true
@@ -12352,12 +12358,17 @@ cmd_task_inbox() {
 
 cmd_task_answer() {
   tasks_db_init
-  local value="" value_set=0 from=""
+  local value="" value_set=0 from="" human=0
   local -a positional=()
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --value=*) value="${1#*=}"; value_set=1 ;;
       --from=*)  from="${1#*=}" ;;
+      # DIVE-394: trusted human paths (the Telegram tap handler, the dashboard/API
+      # exec) pass --human to mark the answer as human-sourced. Recorded as
+      # provenance in need_answered_by; the enforced boundary for hard-line gates
+      # is still root (below), so an agent passing --human gains nothing.
+      --human)   human=1 ;;
       --)        shift; positional+=("$@"); break ;;
       -*)        fail "$E_USAGE" "unknown flag: $1" ;;
       *)         positional+=("$1") ;;
@@ -12370,8 +12381,39 @@ cmd_task_answer() {
   local nt
   nt=$(db "SELECT CASE WHEN need_type IS NOT NULL AND need_answered_at IS NULL THEN need_type ELSE '' END FROM tasks WHERE id=${id};")
   [[ -n "$nt" ]] || fail "$E_CONFLICT" "DIVE-$id has no pending human gate (nothing to answer)"
+
+  # DIVE-394: approval/secret are HUMAN-ONLY gates. Reject answers that come from
+  # an agent acting as itself — that's the DIVE-391 incident, where an Olivia
+  # endorsement (running as agent-<name>) silently cleared a human approval gate.
+  # The boundary is the CALLER's unix identity, because the legitimate human
+  # paths run as privileged, non-agent users while an agent runs as `agent-<name>`:
+  #   - Telegram tap  -> plugin shells `sudo -n 5dive task answer` -> root
+  #   - dashboard     -> API exec tunnel -> shelld runs as `claude` (non-root)
+  #   - human on box  -> their own (non-agent) login
+  #   - agent itself  -> `agent-<name>`  <- the only case we block
+  # So: block when the caller is an `agent-*` user. This closes the reported
+  # incident WITHOUT breaking either live path (root tap OR claude dashboard),
+  # and needs no coordinated plugin/API deploy. decision/manual stay open: agents
+  # legitimately resolve those. Residual: an agent that runs `sudo 5dive task
+  # answer` becomes root and passes — closing that (require a --human secret the
+  # trusted paths inject) is the documented fast-follow; the --human flag is
+  # already parsed + recorded as provenance to stage it.
+  if [[ "$nt" == "approval" || "$nt" == "secret" ]]; then
+    local _caller; _caller=$(id -un 2>/dev/null || echo '?')
+    if [[ "$_caller" == agent-* ]]; then
+      # No audit_log here: the blocked caller is an agent user that can't write
+      # the root-owned audit log anyway (it would only leak a perms error to
+      # stderr). The fail + non-zero exit is the record.
+      fail "$E_AUTH_REQUIRED" "DIVE-$id is a '$nt' gate — only a human can clear it. Answer it from Telegram (tap the button) or the dashboard; an agent can't self-answer an approval/secret gate."
+    fi
+  fi
+
   # Who resumes: the agent that hit the gate (assignee), else the creator.
   local owner; owner=$(db "SELECT COALESCE(NULLIF(assignee,''), NULLIF(created_by,''), '') FROM tasks WHERE id=${id};")
+  # DIVE-394 provenance: record WHO answered. `human:` prefix when a trusted path
+  # passed --human; otherwise the resolved actor label.
+  local answered_by; answered_by=$(task_actor "$from")
+  (( human )) && answered_by="human:${answered_by}"
 
   # Record the answer. A `secret` gate NEVER stores its value — writing a raw
   # key into this group-claude-readable db is a plaintext-secret-at-rest leak.
@@ -12379,10 +12421,10 @@ cmd_task_answer() {
   # key out-of-band. decision/approval/manual store the value in need_answer.
   if [[ "$nt" == "secret" ]]; then
     (( value_set )) && fail "$E_USAGE" "DIVE-$id is a secret gate — do not pass --value; the key must not be stored in the shared db. Run: 5dive task answer DIVE-$id  (records it as provided + pings the agent to load it from where you placed it)"
-    db "UPDATE tasks SET need_answered_at=datetime('now') WHERE id=${id};"
+    db "UPDATE tasks SET need_answered_at=datetime('now'), need_answered_by=$(sqlq "$answered_by") WHERE id=${id};"
   else
     (( value_set )) || fail "$E_USAGE" "--value is required (the human's answer)"
-    db "UPDATE tasks SET need_answer=$(sqlq "$value"), need_answered_at=datetime('now') WHERE id=${id};"
+    db "UPDATE tasks SET need_answer=$(sqlq "$value"), need_answered_at=datetime('now'), need_answered_by=$(sqlq "$answered_by") WHERE id=${id};"
   fi
 
   # Clearing the gate ≠ unblocking. `status='blocked'` is overloaded (human
