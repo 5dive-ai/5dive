@@ -369,9 +369,21 @@ delete_agent_user() {
   rm -f "/etc/sudoers.d/${user}"
 }
 
+# DIVE-499: accepted autonomy modes. 'son-of-anton' is a yolo synonym (a Silicon
+# Valley nod); the runtime (5dive-agent-start) maps both to the same directive.
+valid_autonomy() { [[ "$1" =~ ^(standard|yolo|son-of-anton)$ ]]; }
+
 write_agent_env() {
   local name="$1" type="$2" channels="$3" workdir="${4:-}" profile="${5:-}" isolation="${6:-admin}"
   local env_file="${ENV_DIR}/${name}.env"
+  # DIVE-499: per-agent autonomy mode (standard|yolo, alias son-of-anton). The
+  # caller sets _AUTONOMY_OVERRIDE to change it (create --yolo / `set autonomy=`);
+  # otherwise we PRESERVE whatever is already in the file, so an unrelated rewrite
+  # (channels/workdir/auth set) never silently drops it. 'standard' = no line.
+  local autonomy="${_AUTONOMY_OVERRIDE:-}"
+  if [[ -z "$autonomy" && -r "$env_file" ]]; then
+    autonomy=$(sed -n 's/^AGENT_AUTONOMY=//p' "$env_file" | head -1)
+  fi
   {
     printf 'AGENT_NAME=%s\n' "$name"
     printf 'AGENT_TYPE=%s\n' "$type"
@@ -379,6 +391,7 @@ write_agent_env() {
     [[ -n "$workdir" ]] && printf 'AGENT_WORKDIR=%s\n' "$workdir"
     [[ -n "$profile" ]] && printf 'AGENT_AUTH_PROFILE=%s\n' "$profile"
     printf 'AGENT_ISOLATION=%s\n' "$isolation"
+    [[ -n "$autonomy" && "$autonomy" != "standard" ]] && printf 'AGENT_AUTONOMY=%s\n' "$autonomy"
     # New telegram agents flow through our 5dive-plugins fork (bundled
     # hooks, richer slash commands). 5dive-agent-start reads this var to
     # build the runtime --channels arg, defaulting to claude-plugins-official
@@ -600,9 +613,12 @@ cmd_create() {
   local byo_provider="" byo_api_key=""
   local skills_arg="" skills_set=0 no_skills=0 defer_auth=0
   local isolation="admin" no_team_bot=0
+  local autonomy="standard"   # DIVE-499
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --type=*)                    type="${1#--type=}" ;;
+      --yolo)                      autonomy="yolo" ;;
+      --autonomy=*)                autonomy="${1#--autonomy=}" ;;
       --channels=*)                channels="${1#--channels=}" ;;
       --telegram-token=*)          telegram_token="${1#--telegram-token=}" ;;
       --telegram-home-channel=*)   telegram_home_channel="${1#--telegram-home-channel=}" ;;
@@ -630,6 +646,7 @@ cmd_create() {
   is_known_type "$type" || fail "$E_NOT_FOUND" "unknown type: $type (known: ${!TYPE_BIN[*]})"
   valid_channel "$channels" || fail "$E_VALIDATION" "invalid channels: $channels (none|telegram|discord)"
   valid_isolation "$isolation" || fail "$E_VALIDATION" "invalid --isolation (admin|standard|sandboxed)"
+  valid_autonomy "$autonomy" || fail "$E_VALIDATION" "invalid --autonomy '$autonomy' (standard|yolo|son-of-anton)"
   if [[ -n "$workdir" ]]; then
     valid_workdir "$workdir" \
       || fail "$E_VALIDATION" "invalid --workdir (absolute path, allowed chars: letters/digits/._-/)"
@@ -987,7 +1004,10 @@ cmd_create() {
   fi
 
   step "Writing agent env"
-  write_agent_env "$name" "$type" "$channels" "$workdir" "$profile" "$isolation"
+  # DIVE-499: stamp the autonomy mode into the env file (yolo/son-of-anton add the
+  # approved directive at launch; standard = nothing).
+  _AUTONOMY_OVERRIDE="$autonomy" \
+    write_agent_env "$name" "$type" "$channels" "$workdir" "$profile" "$isolation"
   link_agent_profile "$name" "$profile"
 
   # Resolve bot @username via Telegram getMe so the dashboard's agent list
@@ -1278,6 +1298,10 @@ cmd_config() {
   #     telegram.allowed-users    (csv of numeric ids allowed to DM the bot;
   #                                seeds access.json/openclaw.allowFrom/hermes env)
   #     discord.token             (bot/app token for this agent's discord plugin)
+  #     autonomy                  (claude only — standard|yolo; yolo appends the
+  #                                approved "act on your recs, still honor hard
+  #                                gates" directive to the system prompt so it
+  #                                survives /clear. 'son-of-anton' == yolo. DIVE-499)
   #
   # When channels=<plugin> is being set (or a <plugin>.token is being rotated),
   # the matching install_channel_for_agent dispatch is also re-run so each
@@ -1312,6 +1336,10 @@ cmd_config() {
   local new_allowed_users=""
   local new_model=""
   local new_effort=""
+  # DIVE-499: when set, write_agent_env stamps this as AGENT_AUTONOMY; left empty
+  # it preserves the file's current value (so a non-autonomy set won't drop it).
+  local _AUTONOMY_OVERRIDE=""
+  local autonomy_changed=0
   # applied_keys: names of keys that were actually changed, for the JSON payload.
   local -a applied_keys=()
   for kv in "$@"; do
@@ -1414,6 +1442,18 @@ cmd_config() {
         env_dirty=1
         profile_dirty=1
         applied_keys+=("auth-profile")
+        ;;
+      autonomy|--autonomy)
+        # DIVE-499: per-agent autonomy mode. claude-only (the directive uses
+        # --append-system-prompt); other types have no equivalent yet.
+        [[ "$type" == "claude" ]] \
+          || fail "$E_VALIDATION" "type '$type' does not support 'autonomy' (claude only)"
+        valid_autonomy "$v" \
+          || fail "$E_VALIDATION" "invalid autonomy '$v' (standard|yolo|son-of-anton)"
+        _AUTONOMY_OVERRIDE="$v"
+        autonomy_changed=1
+        env_dirty=1
+        applied_keys+=("autonomy")
         ;;
       *) fail "$E_USAGE" "unknown config key: $k" ;;
     esac

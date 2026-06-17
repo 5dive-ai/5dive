@@ -802,6 +802,25 @@ if [[ "$TYPE" == "claude" ]]; then
   fi
 fi
 
+# DIVE-499: per-agent autonomy mode. AGENT_AUTONOMY is sourced from the agent's
+# env file above; 'yolo' (alias 'son-of-anton', a Silicon Valley nod) appends an
+# approved directive to claude's SYSTEM prompt so it survives /clear and context
+# resets — the whole point vs a memory/convention that gets cleared. 'standard'
+# (or unset) injects nothing = current behavior. Claude-only for now: the flag is
+# --append-system-prompt; other harnesses get no-op + a note (revisit per type).
+AUTONOMY="${AGENT_AUTONOMY:-standard}"
+case "${AUTONOMY,,}" in
+  yolo|son-of-anton)
+    if [[ "$TYPE" == "claude" ]]; then
+      YOLO_DIRECTIVE="AUTONOMY MODE: yolo — Act on your own recommendation by default. When you've reasoned to a clear best option, execute it; don't pause for routine approval or a \"should I?\" check. You MUST still get a human's explicit go before crossing a HARD GATE: schema/data migrations · billing or spend · public or customer-facing comms · secrets/credentials · destructive or irreversible actions · fleet changes (create/remove/repurpose agents). \"Follow your recs\" never means \"skip a hard gate.\" This mode is set per-agent and persists across context resets."
+      ARGS+=(--append-system-prompt "$YOLO_DIRECTIVE")
+    else
+      echo "[5dive] autonomy=$AUTONOMY ignored for type '$TYPE' (claude-only for now)" >&2
+    fi ;;
+  standard|"") : ;;  # no directive — default behavior
+  *) echo "[5dive] unknown AGENT_AUTONOMY='$AUTONOMY' — treating as standard" >&2 ;;
+esac
+
 CMD_STR=$(printf '%q ' "$BIN" "${ARGS[@]}")
 
 # First-attach onboarding for openclaw with no channel: openclaw chat is the
