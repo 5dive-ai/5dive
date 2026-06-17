@@ -2008,6 +2008,20 @@ cmd_agent_team_bot() {
     # already reads the token); absent on boxes that never ran --use-cos =>
     # claim's original direct-getUpdates path (main's backward-compat).
     [[ -n "$use_cos" ]] && _cos_set_claim_spool
+    if [[ -n "$use_cos" ]]; then
+      # DIVE-195 + DIVE-453: the CoS team group also gets a shared intercom
+      # topic so inter-agent comms mirror there automatically (the mirror
+      # already handles send-only shared-bot agents). Capture shared's result,
+      # create the intercom topic best-effort (output suppressed so we still
+      # emit a single JSON envelope — the per-agent relay is the real success),
+      # then print shared's result. No per-agent wiring needed: the mirror reads
+      # each agent's group from access.json, which _team_bot_do_shared just set.
+      local _shared_out _shared_rc=0
+      _shared_out=$(_team_bot_do_shared "$group" "$owner" "$agents_filter" "$token") || _shared_rc=$?
+      (( _shared_rc == 0 )) && { _team_bot_do_intercom "$group" "" >/dev/null 2>&1 || true; }
+      printf '%s\n' "$_shared_out"
+      return "$_shared_rc"
+    fi
     _team_bot_do_shared "$group" "$owner" "$agents_filter" "$token"
     return
   fi
