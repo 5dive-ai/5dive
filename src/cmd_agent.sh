@@ -1923,6 +1923,23 @@ _cos_token_resolve() {
   printf '%s\n' "${line#*=}" | sed -E 's/^[[:space:]]*//'
 }
 
+# DIVE-453 — record the claim<->listener handshake: once the fleet rides the CoS
+# bot (`team-group shared --use-cos`), the always-on CoS-token listener is the
+# sole getUpdates consumer, so `cos claim` must read minted children from the
+# spool instead of its own getUpdates (which would 409 the listener). Persist
+# COS_CLAIM_SPOOL_DIR in cos.env (idempotent) — the same file claim reads the
+# token from. Absent on boxes that never ran --use-cos => claim's original path.
+_cos_set_claim_spool() {
+  local env_file="${COS_ENV_FILE:-/etc/5dive/connectors/cos.env}"
+  local spool="${COS_CLAIM_SPOOL_DIR_DEFAULT:-/var/lib/5dive/cos-claims}"
+  [[ -w "$env_file" || -w "$(dirname "$env_file")" ]] || return 0
+  if grep -q '^COS_CLAIM_SPOOL_DIR=' "$env_file" 2>/dev/null; then
+    sed -i -E "s#^COS_CLAIM_SPOOL_DIR=.*#COS_CLAIM_SPOOL_DIR=${spool}#" "$env_file"
+  else
+    printf 'COS_CLAIM_SPOOL_DIR=%s\n' "$spool" >> "$env_file"
+  fi
+}
+
 # DIVE-453 — `5dive agent team-group <discover|provision|shared|status> …`: the
 # slim CoS-native team group. Identical to `team-bot` but rides the connected
 # Chief-of-Staff bot (token resolved server-side) — the customer adds ONE bot
@@ -1983,6 +2000,14 @@ cmd_agent_team_bot() {
   # and runs the telegram plugin in send-only mode against that token, while a
   # single listener routes inbound topic->agent. Self-contained handler.
   if [[ "$sub" == "shared" ]]; then
+    # DIVE-453: with --use-cos this is the moment the fleet starts riding the
+    # CoS bot, so the CoS-token listener becomes the SOLE getUpdates consumer.
+    # Persist the claim-spool handshake BEFORE the listener restart inside
+    # _team_bot_do_shared, so `cos claim` (which reads cos.env) never races a
+    # CoS-owned listener with no spool set. Written to cos.env (where claim
+    # already reads the token); absent on boxes that never ran --use-cos =>
+    # claim's original direct-getUpdates path (main's backward-compat).
+    [[ -n "$use_cos" ]] && _cos_set_claim_spool
     _team_bot_do_shared "$group" "$owner" "$agents_filter" "$token"
     return
   fi
