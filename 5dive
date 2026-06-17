@@ -26,7 +26,7 @@ esac
 
 # Bumped on every public release. `build.sh` checks this line exists; CI fails
 # the bundle-drift check if it's missing or empty.
-readonly FIVE_VERSION="0.3.13"
+readonly FIVE_VERSION="0.3.14"
 
 # GitHub org our repos live under. The org is being renamed
 # 5dive-com -> 5dive-ai (2026-06); fetches must work on either side of the
@@ -14374,8 +14374,14 @@ _pack_usage() {
   cat <<USAGE
 5dive agent export / import — portable agent packs (DIVE-39)
 
-  5dive agent export <name> [--with-memory] [--out=<path>]
+  5dive agent export <name> [--with-memory] [--approve-memory=<dir>] [--out=<path>]
                                   # write a shareable pack (.tar.gz). Default = config only.
+                                  # --with-memory is a TWO-PHASE deny-by-default flow:
+                                  #   1) export <name> --with-memory  -> writes a scoped persona
+                                  #      DRAFT (only reference/project knowledge facts; private
+                                  #      user/feedback facts excluded) for you to review + edit.
+                                  #   2) export <name> --approve-memory=<draft dir>  -> seals the
+                                  #      reviewed memory into the pack. Nothing is packed unreviewed.
   5dive agent import <pack> --as=<name> [--channels=none|telegram|discord]
                             [--telegram-token=<tok>] [--discord-token=<tok>]
                             [--auth-profile=<name>] [--workdir=<path>]
@@ -14406,28 +14412,139 @@ _pack_agent_config() {
   }' <<<"$reg"
 }
 
+# Secret tripwire — refuse if any staged file looks like it holds a token/key.
+# Returns 0 (clean) or 1 (hit); on hit, prints the offending paths to stderr.
+# Belt + braces: the real safety is the allowlist + type-scoping, this catches
+# a regression that widens either.
+_pack_secret_tripwire() {
+  local dir="$1" hits
+  hits=$(grep -rilE 'BOT_TOKEN|API_KEY|-----BEGIN|credentials|sk-[A-Za-z0-9]|[0-9]{8,}:[A-Za-z0-9_-]{30,}' "$dir" 2>/dev/null || true)
+  if [[ -n "$hits" ]]; then
+    printf '%s\n' "$hits" >&2
+    return 1
+  fi
+  return 0
+}
+
+# Locate an agent's persona-memory dir. Memory is keyed by project slug
+# (~/.claude/projects/<slug>/memory/); a customer agent normally has one. If
+# several exist we take the largest (the agent's primary working project).
+_pack_memory_dir() {
+  local name="$1" base="/home/agent-${name}/.claude/projects"
+  [[ -d "$base" ]] || return 1
+  find "$base" -maxdepth 2 -type d -name memory 2>/dev/null \
+    | while read -r d; do printf '%s\t%s\n' "$(find "$d" -maxdepth 1 -name '*.md' 2>/dev/null | wc -l)" "$d"; done \
+    | sort -rn | head -1 | cut -f2-
+}
+
+# DENY-BY-DEFAULT memory scoping (L1). Copies into <outdir> ONLY facts that are
+# safe-by-construction to share: frontmatter metadata.type in {reference,project}
+# (a character's KNOWLEDGE), never {user,feedback} (who the human is / how to work
+# with them — private by definition). Honors an explicit opt-out
+# (export:false / private:true / share:false) on any fact. Regenerates a clean
+# MEMORY.md index from what survived; the source MEMORY.md is never copied (it
+# indexes private facts too). Echoes "<kept> <excluded>" counts.
+_pack_scope_memory() {
+  local memdir="$1" outdir="$2" kept=0 excluded=0 f base type optout
+  mkdir -p "$outdir"
+  while IFS= read -r f; do
+    base=$(basename "$f")
+    [[ "$base" == "MEMORY.md" ]] && continue
+    # Frontmatter type lives nested under metadata: (….type: <t>). Read the first
+    # `type:` inside the leading frontmatter block.
+    type=$(awk '/^---[[:space:]]*$/{n++; next} n==1 && /^[[:space:]]*type:[[:space:]]*/{sub(/^[[:space:]]*type:[[:space:]]*/,""); gsub(/[[:space:]]+$/,""); print; exit}' "$f")
+    optout=$(awk '/^---[[:space:]]*$/{n++; next} n==1 && /^[[:space:]]*(export|share):[[:space:]]*false/{print "1"; exit} n==1 && /^[[:space:]]*private:[[:space:]]*true/{print "1"; exit}' "$f")
+    if [[ "$type" == "reference" || "$type" == "project" ]] && [[ -z "$optout" ]]; then
+      cp "$f" "$outdir/$base"; kept=$((kept+1))
+    else
+      excluded=$((excluded+1))
+    fi
+  done < <(find "$memdir" -maxdepth 1 -name '*.md' 2>/dev/null | sort)
+  # Clean index over only what we kept.
+  {
+    echo "# Memory Index (distilled persona pack)"
+    echo
+    for f in "$outdir"/*.md; do
+      [[ -e "$f" ]] || continue
+      [[ "$(basename "$f")" == "MEMORY.md" ]] && continue
+      local nm desc
+      nm=$(awk '/^---[[:space:]]*$/{n++; next} n==1 && /^name:[[:space:]]*/{sub(/^name:[[:space:]]*/,""); print; exit}' "$f")
+      desc=$(awk '/^---[[:space:]]*$/{n++; next} n==1 && /^description:[[:space:]]*/{sub(/^description:[[:space:]]*/,""); gsub(/^"|"$/,""); print; exit}' "$f")
+      [[ -n "$nm" ]] && echo "- [$nm]($(basename "$f")) — ${desc}"
+    done
+  } > "$outdir/MEMORY.md"
+  printf '%s %s\n' "$kept" "$excluded"
+}
+
 cmd_export() {
   require_root
-  local name="" with_memory=0 out=""
+  local name="" with_memory=0 out="" approve_memory=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      --with-memory) with_memory=1 ;;
-      --out=*)       out="${1#--out=}" ;;
-      -*)            fail "$E_USAGE" "unknown flag: $1" ;;
-      *)             [[ -z "$name" ]] && name="$1" || fail "$E_USAGE" "extra arg: $1" ;;
+      --with-memory)      with_memory=1 ;;
+      --approve-memory=*) approve_memory="${1#--approve-memory=}"; with_memory=1 ;;
+      --out=*)            out="${1#--out=}" ;;
+      -*)                 fail "$E_USAGE" "unknown flag: $1" ;;
+      *)                  [[ -z "$name" ]] && name="$1" || fail "$E_USAGE" "extra arg: $1" ;;
     esac
     shift
   done
-  [[ -n "$name" ]] || fail "$E_USAGE" "usage: 5dive agent export <name> [--with-memory] [--out=<path>]"
+  [[ -n "$name" ]] || fail "$E_USAGE" "usage: 5dive agent export <name> [--with-memory] [--approve-memory=<dir>] [--out=<path>]"
   require_agent "$name"
   local user="agent-${name}" cdir="/home/agent-${name}/.claude"
 
-  # The with-memory path is the public-leak surface: it must run opt-in tagging
-  # + LLM redaction + a mandatory human review-and-approve gate before any
-  # persona memory enters a pack. That pipeline is the next slice; until it
-  # lands we refuse rather than ship un-reviewed memory. (DIVE-39 v2)
+  # The with-memory path is the public-leak surface. Architecture = DISTILL-TO-
+  # PERSONA, deny-by-default (DIVE-472): a pack never carries raw memory. The
+  # privacy guarantee is DETERMINISTIC — only {reference,project} KNOWLEDGE facts
+  # are eligible, private {user,feedback} facts are excluded at source — plus a
+  # MANDATORY two-phase human approve-gate. It is NOT entrusted to an LLM's
+  # redaction judgement. Phase 1 (no --approve-memory) writes a scoped draft and
+  # stops; phase 2 (--approve-memory=<reviewed dir>) seals the reviewed dir in.
+  local mem_src="" mem_tmp=""   # SEAL phase: scoped temp dir of approved memory to pack
   if (( with_memory )); then
-    fail "$E_USAGE" "--with-memory needs the redaction + review gate (DIVE-39 v2, not built yet). Export the config pack now by dropping --with-memory."
+    if [[ -z "$approve_memory" ]]; then
+      # --- DRAFT phase: scope (L1) + tripwire (L3), write a review draft, STOP.
+      local memdir; memdir=$(_pack_memory_dir "$name")
+      [[ -n "$memdir" ]] || fail "$E_NOT_FOUND" "agent '$name' has no persona memory to export"
+      local draft="/home/agent-${name}/.claude/pack-staging/memory-draft"
+      rm -rf "$draft"; mkdir -p "$draft"
+      local counts kept excluded
+      counts=$(_pack_scope_memory "$memdir" "$draft")
+      kept="${counts%% *}"; excluded="${counts##* }"
+      if (( kept == 0 )); then
+        rm -rf "$draft"
+        fail "$E_GENERIC" "nothing shareable: 0 reference/project knowledge facts ($excluded private user/feedback or opted-out facts excluded). Nothing written."
+      fi
+      if ! _pack_secret_tripwire "$draft"; then
+        rm -rf "$draft"
+        fail "$E_GENERIC" "a scoped fact tripped the secret tripwire (paths above) — refusing. Tag it 'private: true' or remove the secret, then retry."
+      fi
+      chown -R "agent-${name}:agent-${name}" "/home/agent-${name}/.claude/pack-staging" 2>/dev/null || true
+      ok "memory DRAFT ready for review — kept $kept knowledge fact(s), excluded $excluded private/opted-out (deny-by-default). REVIEW + EDIT: $draft — then SEAL: 5dive agent export $name --approve-memory=$draft. Nothing is packed until you approve." \
+         '{name:$n, phase:"draft", draft:$d, kept:$k, excluded:$e}' \
+         --arg n "$name" --arg d "$draft" --argjson k "$kept" --argjson e "$excluded"
+      return 0
+    else
+      # --- SEAL phase: the human reviewed/edited this dir; re-validate + pack it.
+      # CRITICAL: re-apply deny-by-default scoping here too, so the type-gate holds
+      # no matter what dir is passed — even the agent's RAW memory dir, or a draft
+      # the human re-added a private fact to. Human review edits CONTENT; the tool
+      # always re-enforces the {reference,project}-only filter + secret tripwire.
+      [[ -d "$approve_memory" ]] || fail "$E_NOT_FOUND" "--approve-memory dir not found: $approve_memory"
+      find "$approve_memory" -maxdepth 1 -name '*.md' 2>/dev/null | grep -q . \
+        || fail "$E_VALIDATION" "--approve-memory has no .md facts: $approve_memory"
+      mem_tmp=$(mktemp -d)
+      local scounts skept sexcl
+      scounts=$(_pack_scope_memory "$approve_memory" "$mem_tmp")
+      skept="${scounts%% *}"; sexcl="${scounts##* }"
+      (( skept > 0 )) || { rm -rf "$mem_tmp"; fail "$E_GENERIC" "approved dir has 0 shareable knowledge facts after scoping ($sexcl excluded). Nothing sealed."; }
+      if ! _pack_secret_tripwire "$mem_tmp"; then
+        rm -rf "$mem_tmp"
+        fail "$E_GENERIC" "approved memory tripped the secret tripwire (paths above) — refusing to seal. Remove/tag the secret and retry."
+      fi
+      (( sexcl > 0 )) && warn "seal dropped $sexcl non-shareable fact(s) from the approved dir (type-gate re-enforced)"
+      mem_src="$mem_tmp"
+    fi
   fi
 
   # Stage an allowlist of identity files — NEVER a blanket copy (that would risk
@@ -14457,6 +14574,15 @@ cmd_export() {
   # settings, which by convention holds no tokens).
   local hooks; hooks=$(jq -c '.hooks // {}' "$cdir/settings.json" 2>/dev/null || echo '{}')
 
+  # Stage approved persona memory (SEAL phase only). Deny-by-default already
+  # filtered it; copy the human-approved facts under memory/.
+  local mem_inc="false"
+  if [[ -n "$mem_src" ]]; then
+    mkdir -p "$stage/memory"
+    cp "$mem_src"/*.md "$stage/memory/" 2>/dev/null || true
+    mem_inc="distilled"
+  fi
+
   # Build the manifest.
   jq -n \
     --argjson fmt "$PACK_FORMAT_VERSION" \
@@ -14465,11 +14591,12 @@ cmd_export() {
     --argjson cfg "$cfg" \
     --arg model "$model" --arg effort "$effort" \
     --argjson plugins "$plugins" --argjson skills "$skills" --argjson hooks "$hooks" \
+    --arg mem "$mem_inc" \
     '{
       packFormat: $fmt,
       agentName: $name,
       createdWith: $ver,
-      includes: { memory: false },
+      includes: { memory: (if $mem=="false" then false else $mem end) },
       config: ($cfg + {
         model: (if $model=="" then null else $model end),
         effort: (if $effort=="" then null else $effort end)
@@ -14479,21 +14606,28 @@ cmd_export() {
       hooks: $hooks
     }' > "$stage/manifest.json"
 
-  # A pack NEVER contains a token/key/credential — assert before we tar so a
-  # future change that widens the allowlist can't silently leak. (Belt + braces.)
-  if grep -rilE 'BOT_TOKEN|API_KEY|-----BEGIN|credentials|sk-[A-Za-z0-9]|[0-9]{8,}:[A-Za-z0-9_-]{30,}' "$stage" 2>/dev/null | grep -q .; then
-    rm -rf "$stage"
+  # A pack NEVER contains a token/key/credential — assert over the WHOLE stage
+  # (incl. any memory/) before we tar so a future change can't silently leak.
+  if ! _pack_secret_tripwire "$stage"; then
+    rm -rf "$stage" "$mem_tmp"
     fail "$E_GENERIC" "refusing to export: a staged file looks like it contains a secret (safety tripwire). Nothing written."
   fi
 
   [[ -n "$out" ]] || out="/tmp/${name}-pack-v${PACK_FORMAT_VERSION}.tar.gz"
-  tar -czf "$out" -C "$stage" . 2>/dev/null || { rm -rf "$stage"; fail "$E_GENERIC" "failed to write pack tarball"; }
+  tar -czf "$out" -C "$stage" . 2>/dev/null || { rm -rf "$stage" "$mem_tmp"; fail "$E_GENERIC" "failed to write pack tarball"; }
   chmod 644 "$out"
   rm -rf "$stage"
+  [[ -n "$mem_tmp" ]] && rm -rf "$mem_tmp"
 
-  ok "exported '$name' (config pack, no memory) -> $out" \
-     '{name:$n, pack:$o, withMemory:false, skills:$s}' \
-     --arg n "$name" --arg o "$out" --argjson s "$skills"
+  if [[ "$mem_inc" == "distilled" ]]; then
+    ok "exported '$name' (with distilled persona memory) -> $out" \
+       '{name:$n, pack:$o, withMemory:true, memory:"distilled", skills:$s}' \
+       --arg n "$name" --arg o "$out" --argjson s "$skills"
+  else
+    ok "exported '$name' (config pack, no memory) -> $out" \
+       '{name:$n, pack:$o, withMemory:false, skills:$s}' \
+       --arg n "$name" --arg o "$out" --argjson s "$skills"
+  fi
 }
 
 cmd_import() {
@@ -14534,10 +14668,11 @@ cmd_import() {
   (( pf <= PACK_FORMAT_VERSION )) \
     || { rm -rf "$stage"; fail "$E_VALIDATION" "pack format v$pf is newer than this CLI supports (v$PACK_FORMAT_VERSION) — upgrade 5dive"; }
 
-  # v1 imports config only. A with-memory pack must pass the export-side redaction
-  # + review gate (not built yet), so one can never reach here; guard regardless.
-  if [[ "$(jq -r '.includes.memory // false' "$stage/manifest.json")" == "true" ]]; then
-    rm -rf "$stage"; fail "$E_USAGE" "this pack claims to carry memory; the with-memory import path isn't built yet (DIVE-39 v2)"
+  # Memory mode: false (config pack) or "distilled" (DIVE-472 — human-approved
+  # knowledge facts under memory/, seeded after create). Reject anything else.
+  local mem_inc; mem_inc=$(jq -r '.includes.memory // false' "$stage/manifest.json")
+  if [[ "$mem_inc" != "false" && "$mem_inc" != "distilled" ]]; then
+    rm -rf "$stage"; fail "$E_VALIDATION" "pack declares unsupported memory mode '$mem_inc'"
   fi
 
   # Derive create inputs from the manifest; explicit flags win.
@@ -14621,6 +14756,25 @@ cmd_import() {
     fi
   fi
 
+  # Seed distilled persona memory into the new agent's project memory dir. Memory
+  # is keyed by project slug (the encoded workdir), so we can only place it when a
+  # workdir is known; otherwise report it skipped rather than drop it somewhere
+  # the agent won't read.
+  local mem_seeded="none"
+  if [[ "$mem_inc" == "distilled" && -d "$stage/memory" ]]; then
+    if [[ -n "$workdir" ]]; then
+      local slug mdir
+      slug=$(printf '%s' "$workdir" | sed 's#/#-#g')
+      mdir="$cdir/projects/${slug}/memory"
+      install -d -o "agent-${as}" -g "agent-${as}" "$mdir" 2>/dev/null || true
+      cp "$stage"/memory/*.md "$mdir/" 2>/dev/null || true
+      chown -R "agent-${as}:agent-${as}" "$cdir/projects" 2>/dev/null || true
+      mem_seeded="$mdir"
+    else
+      mem_seeded="skipped (no workdir to resolve the memory slug)"
+    fi
+  fi
+
   # Re-add skills best-effort. Config packs record refs, not bodies, so skills not
   # in a published repo can't be reinstalled cross-user — report what we skipped.
   local -a added=() skipped=()
@@ -14641,9 +14795,11 @@ cmd_import() {
   local added_j skipped_j
   added_j=$(printf '%s\n'   "${added[@]+"${added[@]}"}"   | jq -R . | jq -cs 'map(select(. != ""))')
   skipped_j=$(printf '%s\n' "${skipped[@]+"${skipped[@]}"}" | jq -R . | jq -cs 'map(select(. != ""))')
-  ok "imported '$as' from pack (config only, no memory). Skills added: ${#added[@]}, skipped: ${#skipped[@]}; template: $templated." \
-     '{name:$n, type:$t, skillsAdded:$a, skillsSkipped:$s, template:$tpl}' \
-     --arg n "$as" --arg t "$type" --argjson a "$added_j" --argjson s "$skipped_j" --arg tpl "$templated"
+  local mem_note="no memory"
+  [[ "$mem_inc" == "distilled" ]] && mem_note="distilled memory -> $mem_seeded"
+  ok "imported '$as' from pack ($mem_note). Skills added: ${#added[@]}, skipped: ${#skipped[@]}; template: $templated." \
+     '{name:$n, type:$t, memory:$mem, memorySeeded:$ms, skillsAdded:$a, skillsSkipped:$s, template:$tpl}' \
+     --arg n "$as" --arg t "$type" --arg mem "$mem_inc" --arg ms "$mem_seeded" --argjson a "$added_j" --argjson s "$skipped_j" --arg tpl "$templated"
 }
 
 # -------- self-update (fetch installer + --upgrade, then restart agents) --------
