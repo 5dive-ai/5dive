@@ -15,6 +15,9 @@ _task_usage() {
   5dive task assign <id|DIVE-N> <agent>
   5dive task start  <id|DIVE-N>                      # -> in_progress
   5dive task done   <id|DIVE-N> [--result=<text>]    # -> done; --result captures the agent's response
+  5dive task verify <id|DIVE-N> --cmd="<command>" [--no-done] [--timeout=<s>]
+                                                     # run a check; exit 0 => proven-done (flips to done,
+                                                     # captures output tail). Verb exits 0/1 = the verdict.
   5dive task cancel <id|DIVE-N> [--result=<text>]    # -> cancelled; --result captures why
   5dive task block   <id|DIVE-N> --by=<id|DIVE-N>    # add a blocks edge, mark blocked
   5dive task unblock <id|DIVE-N> [--by=<id|DIVE-N>]  # drop edge(s); back to todo if clear
@@ -45,6 +48,7 @@ cmd_task() {
     assign)          cmd_task_assign "$@" ;;
     start)           cmd_task_start "$@" ;;
     done|close)      cmd_task_done "$@" ;;
+    verify)          cmd_task_verify "$@" ;;
     cancel)          cmd_task_cancel "$@" ;;
     block)           cmd_task_block "$@" ;;
     unblock)         cmd_task_unblock "$@" ;;
@@ -309,6 +313,78 @@ _task_status_cmd() {
 cmd_task_start()  { _task_status_cmd in_progress ", started_at=COALESCE(started_at, datetime('now'))" start "$@"; }
 cmd_task_done()   { _task_status_cmd done ", done_at=datetime('now')" done "$@"; }
 cmd_task_cancel() { _task_status_cmd cancelled ", done_at=datetime('now')" cancel "$@"; }
+
+# DIVE-475: deterministic verify-runner — proven-done, not claimed-done. Run a
+# command; its EXIT CODE is the real stop condition. On pass (exit 0) flip the
+# task to done with the command + output tail captured in result; on fail leave
+# status untouched (just record the failing attempt). The verb itself exits 0 on
+# pass / 1 on fail so it can BE a stop condition (heartbeat /goal, scripts) — the
+# maker no longer grades itself by asserting status=done (writer != verifier).
+# --no-done (alias --check) runs the check and records it WITHOUT flipping.
+cmd_task_verify() {
+  tasks_db_init
+  local task="" cmd="" no_done=0 timeout_s=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --cmd=*)      cmd="${1#*=}" ;;
+      --no-done|--check) no_done=1 ;;
+      --timeout=*)  timeout_s="${1#*=}" ;;
+      -*)           fail "$E_USAGE" "unknown flag: $1" ;;
+      *)            [[ -z "$task" ]] && task="$1" || fail "$E_USAGE" "unexpected arg: $1" ;;
+    esac
+    shift
+  done
+  [[ -n "$task" && -n "$cmd" ]] \
+    || fail "$E_USAGE" "usage: 5dive task verify <id|DIVE-N> --cmd=\"<command>\" [--no-done] [--timeout=<seconds>]"
+  [[ -z "$timeout_s" || "$timeout_s" =~ ^[1-9][0-9]*$ ]] \
+    || fail "$E_VALIDATION" "--timeout must be a positive integer (seconds)"
+  resolve_task_id "$task"; local id="$RESOLVED_TASK_ID"
+
+  # Run it. Combined stdout+stderr. The `if` wrapper captures the exit code
+  # WITHOUT tripping `set -e` (a failing $() in a bare assignment would abort).
+  local out rc
+  if [[ -n "$timeout_s" ]]; then
+    if out=$(timeout "${timeout_s}" bash -c "$cmd" 2>&1); then rc=0; else rc=$?; fi
+    (( rc == 124 )) && out="${out}"$'\n'"[timed out after ${timeout_s}s]"
+  else
+    if out=$(bash -c "$cmd" 2>&1); then rc=0; else rc=$?; fi
+  fi
+  # Tail the output so a chatty command can't bloat the result row.
+  local tail_out; tail_out=$(printf '%s\n' "$out" | tail -n 25)
+
+  local verdict result_txt
+  if (( rc == 0 )); then
+    verdict="pass"
+    result_txt="✅ verify PASS (exit 0): ${cmd}"$'\n'"--- output tail ---"$'\n'"${tail_out}"
+  else
+    verdict="fail"
+    result_txt="❌ verify FAIL (exit ${rc}): ${cmd}"$'\n'"--- output tail ---"$'\n'"${tail_out}"
+  fi
+
+  local flipped=0
+  if (( rc == 0 )) && (( ! no_done )); then
+    db "UPDATE tasks SET status='done', done_at=datetime('now'), result=$(sqlq "$result_txt") WHERE id=${id};"
+    flipped=1
+  else
+    db "UPDATE tasks SET result=$(sqlq "$result_txt") WHERE id=${id};"
+  fi
+
+  if (( JSON_MODE )); then
+    printf '%s' "$result_txt" | jq -R -s \
+      --arg i "$id" --arg v "$verdict" --argjson rc "$rc" \
+      --argjson flipped "$([[ $flipped -eq 1 ]] && echo true || echo false)" \
+      '{ok:true, data:{id:($i|tonumber), verdict:$v, exit:$rc, flippedToDone:$flipped, output:.}}'
+  else
+    printf '%s\n' "$result_txt" >&2
+    if (( rc == 0 )); then
+      (( flipped )) && ok "DIVE-$id verify PASS — marked done" \
+                    || ok "DIVE-$id verify PASS (status unchanged, --no-done)"
+    else
+      warn "DIVE-$id verify FAIL (exit $rc) — status unchanged"
+    fi
+  fi
+  return $(( rc == 0 ? 0 : 1 ))
+}
 
 cmd_task_block() {
   tasks_db_init
