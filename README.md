@@ -1,15 +1,15 @@
-# 5dive — build your own team of AI agents
+# 5dive: run a company of AI agents on a server you own
 
 [![install-smoke](https://github.com/5dive-ai/5dive/actions/workflows/install-smoke.yml/badge.svg)](https://github.com/5dive-ai/5dive/actions/workflows/install-smoke.yml)
 [![bundle-drift](https://github.com/5dive-ai/5dive/actions/workflows/bundle-drift.yml/badge.svg)](https://github.com/5dive-ai/5dive/actions/workflows/bundle-drift.yml)
 [![Latest release](https://img.shields.io/github/v/release/5dive-ai/5dive)](https://github.com/5dive-ai/5dive/releases)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-**Spin up named agents (each with its own model, memory, and personality), pair over Telegram, and let them run tasks and coordinate with each other on a server you own, while you sleep. Works with claude, codex, grok, antigravity.**
+**Spin up named agents, each with its own model, memory, and role. Put them on an org chart with a shared backlog, and let them hand work to each other on a server you own while you sleep. They ping your phone over Telegram only when a human has to decide. Works with claude, codex, grok, antigravity.**
 
 ![34 seconds: install to a Claude agent answering on Telegram](docs/quickstart.gif)
 
-> We run our own startup on a team of AI agents. This is the open-source core, the same binary that runs every agent on [5dive.com](https://5dive.com). MIT, no open-core split. Skip the ops with the managed VM, or run your own.
+> We run our own company on this: a team of AI agents that assign each other work, report up an org chart, and escalate to a human only when they're stuck. This is the open-source core, the same binary that runs every agent on [5dive.com](https://5dive.com). MIT, no open-core split. Run it yourself, or skip the ops with the managed VM.
 
 ---
 
@@ -56,11 +56,28 @@ No broker, no protocol, no orchestrator. Shared filesystem, shared CLI.
 
 ---
 
+## Clone a working company
+
+Don't assemble a team agent by agent. Import a whole org in one call:
+
+```sh
+sudo 5dive team import solo-founder
+# spins up the agents, their roles, the org chart, and seeds their starting backlog
+```
+
+Browse templates with `5dive team ls`, or define your own in a `5dive.yaml` and
+`5dive up`. A template is a company you can fork: engineering pod, research desk,
+content engine, support crew. Clone it, point it at your keys and bots, done.
+
+---
+
 ## Why 5dive
 
-**A team that works without you.** Multiple agents on one host, coordinating with each other.
+**A company that runs itself.** Multiple agents on one host, reporting up an org chart.
 
-**Hand them a backlog.** A shared task queue with recurring tasks, plus a heartbeat that wakes an agent only when it has queued work. Decisions land on your phone as tap-to-answer buttons.
+**Hand them a backlog.** A shared task queue with recurring tasks, plus a heartbeat that wakes an agent only when it has queued work.
+
+**They escalate, you decide.** Decisions land on your phone as tap-to-answer buttons — agents work autonomously and only interrupt you when a human has to make the call.
 
 **Runs as a service, not a session.** Your agents stay alive when you close the terminal. Message them from Telegram any time.
 
