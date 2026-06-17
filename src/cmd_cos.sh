@@ -178,9 +178,52 @@ COS_LIB_TS
 //   rotate     --bot-id=<id>                 -> {ok, token}
 
 import { verifyCos, mintDeepLink, awaitMintedChild, getChildToken, rotateChildToken, configureChild } from "./cos-lib.ts";
-import { readFileSync } from "node:fs";
+import { readFileSync, readdirSync, unlinkSync, existsSync } from "node:fs";
 
 const COS_ENV = process.env.COS_ENV_FILE || "/etc/5dive/connectors/cos.env";
+
+// DIVE-453: when an always-on CoS listener owns getUpdates on this token (the
+// team-group relay rides the CoS bot), `claim` must NOT poll getUpdates itself
+// (two consumers = 409). The listener spools each minted child to this dir;
+// claim reads + consumes it instead. The marker is PERSISTED in cos.env (the
+// same file the CoS token comes from), written by `team-group shared --use-cos`
+// when it wires the fleet onto the CoS listener — a transient env export can't
+// reach a later claim process. Absent => no listener => direct getUpdates (the
+// original DIVE-320 path, byte-identical for boxes that never ran --use-cos).
+function claimSpoolDir(): string | undefined {
+  if (process.env.COS_CLAIM_SPOOL_DIR) return process.env.COS_CLAIM_SPOOL_DIR.trim();
+  try {
+    const m = readFileSync(COS_ENV, "utf8").match(/^\s*COS_CLAIM_SPOOL_DIR\s*=\s*(.+?)\s*$/m);
+    if (m) return m[1].replace(/^["']|["']$/g, "").trim();
+  } catch {}
+  return undefined;
+}
+const CLAIM_SPOOL_DIR = claimSpoolDir();
+
+// Poll the listener's spool for a minted child, consuming (deleting) the match.
+async function awaitMintedChildFromSpool(
+  spoolDir: string,
+  opts: { targetUsername?: string; timeoutMs?: number } = {},
+): Promise<{ ok: true; child: { botId: number; username: string; ownerId: number } } | { ok: false; reason: "timeout" }> {
+  const deadline = Date.now() + (opts.timeoutMs ?? 120_000);
+  while (Date.now() < deadline) {
+    try {
+      if (existsSync(spoolDir)) {
+        for (const f of readdirSync(spoolDir).filter((n) => n.endsWith(".json"))) {
+          if (opts.targetUsername && f !== `${opts.targetUsername}.json`) continue;
+          const p = `${spoolDir}/${f}`;
+          try {
+            const c = JSON.parse(readFileSync(p, "utf8"));
+            unlinkSync(p);
+            if (c?.botId) return { ok: true, child: { botId: c.botId, username: c.username, ownerId: c.ownerId ?? 0 } };
+          } catch {}
+        }
+      }
+    } catch {}
+    await new Promise((r) => setTimeout(r, 500));
+  }
+  return { ok: false, reason: "timeout" };
+}
 
 function cosToken(): string {
   // A pasted token (pre-persist verify, used by the dashboard) takes precedence.
@@ -229,8 +272,11 @@ try {
     const suggested = arg("suggested");
     const name = arg("name");
     if (!suggested || !name) out({ ok: false, detail: "--suggested and --name required" });
-    const minted = await awaitMintedChild(token, { targetUsername: suggested, timeoutMs: Number(arg("timeout-ms") ?? 15_000) });
-    if (!minted.ok) out({ ok: false, reason: minted.reason, detail: minted.detail });
+    const timeoutMs = Number(arg("timeout-ms") ?? 15_000);
+    const minted = CLAIM_SPOOL_DIR
+      ? await awaitMintedChildFromSpool(CLAIM_SPOOL_DIR, { targetUsername: suggested, timeoutMs })
+      : await awaitMintedChild(token, { targetUsername: suggested, timeoutMs });
+    if (!minted.ok) out({ ok: false, reason: minted.reason, detail: (minted as any).detail });
     const t = await getChildToken(token, minted.child.botId);
     if (!t.ok) out({ ok: false, detail: t.detail });
     const avatarPath = arg("avatar");

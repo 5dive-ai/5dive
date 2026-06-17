@@ -2471,6 +2471,11 @@ const POLL_TIMEOUT = 30 // getUpdates long-poll seconds
 // Loop/abuse guard: cap inbound drops per agent within a sliding window.
 const RATE_MAX = 30
 const RATE_WINDOW_MS = 10_000
+// DIVE-453: when this listener owns the CoS (manager) bot token it is ALSO the
+// sole consumer of managed_bot updates — so `cos claim` can no longer getUpdates
+// on the same token (a second poller = 409). We spool each minted-child event to
+// a file keyed by username; cos-claim reads + consumes it instead of polling.
+const CLAIM_SPOOL_DIR = process.env.COS_CLAIM_SPOOL_DIR ?? '/var/lib/5dive/cos-claims'
 
 const token = readFileSync(TOKEN_FILE, 'utf8').trim()
 if (!token) {
@@ -2560,6 +2565,21 @@ function drop(agent: string, payload: Record<string, unknown>, now: number): voi
   renameSync(tmp, fin)
 }
 
+// Spool a minted-child managed_bot event for `cos claim` to consume. Atomic
+// temp -> rename, keyed by username so claim can match its target. Runs as root;
+// claim reads as root (create path) or via the dashboard's sudo, then deletes.
+function spoolClaim(child: { botId: number; username: string; ownerId: number }): void {
+  try {
+    mkdirSync(CLAIM_SPOOL_DIR, { recursive: true })
+    const fin = join(CLAIM_SPOOL_DIR, `${child.username}.json`)
+    const tmp = join(CLAIM_SPOOL_DIR, `.${child.username}.${process.pid}.tmp`)
+    writeFileSync(tmp, JSON.stringify({ ...child, ts: Date.now() }))
+    renameSync(tmp, fin)
+  } catch (e) {
+    process.stderr.write(`team-bot-listener: spoolClaim failed: ${e}\n`)
+  }
+}
+
 async function tg(method: string, params: Record<string, unknown>): Promise<any> {
   const res = await fetch(`${API}/${method}`, {
     method: 'POST',
@@ -2587,7 +2607,7 @@ while (!shuttingDown) {
     data = await tg('getUpdates', {
       offset,
       timeout: POLL_TIMEOUT,
-      allowed_updates: ['message'],
+      allowed_updates: ['message', 'managed_bot'],
     })
   } catch (e) {
     process.stderr.write(`team-bot-listener: getUpdates failed: ${e}\n`)
@@ -2607,6 +2627,16 @@ while (!shuttingDown) {
   const now = Date.now()
   for (const u of updates) {
     offset = Math.max(offset, u.update_id + 1)
+    // managed_bot: a child the CoS minted via deep link. Spool it for `cos claim`.
+    const mb = u.managed_bot ?? u.message?.managed_bot_created
+    if (mb?.bot?.id) {
+      spoolClaim({
+        botId: mb.bot.id,
+        username: mb.bot.username,
+        ownerId: (mb.user ?? u.message?.from)?.id ?? 0,
+      })
+      continue
+    }
     const msg = u.message
     if (!msg) continue
     if (msg.from?.is_bot) continue
