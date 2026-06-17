@@ -208,7 +208,8 @@ _tasks_db_migrate() {
   for c in 'result TEXT' 'need_type TEXT' 'ask TEXT' 'need_options TEXT' 'recommend TEXT' 'need_answer TEXT' 'need_answered_at TEXT' \
            "kind TEXT NOT NULL DEFAULT 'standard'" 'schedule TEXT' 'last_fired_at TEXT' \
            'from_template_id INTEGER' 'fresh INTEGER' \
-           'parked_at TEXT' 'park_reason TEXT' 'need_answered_by TEXT'; do
+           'parked_at TEXT' 'park_reason TEXT' 'need_answered_by TEXT' \
+           'escalated_at TEXT' 'escalated_by TEXT'; do
     if ! printf '%s\n' "$cols" | grep -qx "${c%% *}"; then
       sqlite3 -cmd ".timeout 5000" "$TASKS_DB" \
         "ALTER TABLE tasks ADD COLUMN ${c};" >/dev/null 2>&1 || true

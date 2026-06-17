@@ -9,7 +9,13 @@ release.
 
 ## [Unreleased]
 
-(nothing yet)
+### Added
+
+- `5dive task escalate <id>` (DIVE-449): "flag for attention" — bumps the task's
+  priority up one tier (capped at urgent), stamps `escalated_at`/`escalated_by`
+  for audit, and best-effort pings both the owning agent and the paired human.
+  Backs the new Escalate button on the Telegram `/task_<id>` detail view. Does
+  not file a human gate (`task need`) or reassign (`task assign`).
 
 ## [0.1.88] — 2026-06-12
 

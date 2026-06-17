@@ -26,7 +26,7 @@ esac
 
 # Bumped on every public release. `build.sh` checks this line exists; CI fails
 # the bundle-drift check if it's missing or empty.
-readonly FIVE_VERSION="0.3.9"
+readonly FIVE_VERSION="0.3.10"
 
 # GitHub org our repos live under. The org is being renamed
 # 5dive-com -> 5dive-ai (2026-06); fetches must work on either side of the
@@ -2267,7 +2267,8 @@ _tasks_db_migrate() {
   for c in 'result TEXT' 'need_type TEXT' 'ask TEXT' 'need_options TEXT' 'recommend TEXT' 'need_answer TEXT' 'need_answered_at TEXT' \
            "kind TEXT NOT NULL DEFAULT 'standard'" 'schedule TEXT' 'last_fired_at TEXT' \
            'from_template_id INTEGER' 'fresh INTEGER' \
-           'parked_at TEXT' 'park_reason TEXT' 'need_answered_by TEXT'; do
+           'parked_at TEXT' 'park_reason TEXT' 'need_answered_by TEXT' \
+           'escalated_at TEXT' 'escalated_by TEXT'; do
     if ! printf '%s\n' "$cols" | grep -qx "${c%% *}"; then
       sqlite3 -cmd ".timeout 5000" "$TASKS_DB" \
         "ALTER TABLE tasks ADD COLUMN ${c};" >/dev/null 2>&1 || true
@@ -11633,6 +11634,7 @@ _task_usage() {
   5dive task block   <id|DIVE-N> --by=<id|DIVE-N>    # add a blocks edge, mark blocked
   5dive task unblock <id|DIVE-N> [--by=<id|DIVE-N>]  # drop edge(s); back to todo if clear
   5dive task rm <id|DIVE-N>                          # delete (cascades subtasks + edges)
+  5dive task escalate <id|DIVE-N> [--from=<who>]     # flag for attention: bump priority a tier (cap urgent) + ping owning agent & paired human
 
   # Human Task Inbox — park a task on a human and clear it
   5dive task need <id|DIVE-N> --type=decision|secret|approval|manual --ask="..." [--options=A|B] [--recommend="A"]
@@ -11663,6 +11665,7 @@ cmd_task() {
     unblock)         cmd_task_unblock "$@" ;;
     park)            cmd_task_park "$@" ;;
     unpark)          cmd_task_unpark "$@" ;;
+    escalate)        cmd_task_escalate "$@" ;;
     need)            cmd_task_need "$@" ;;
     inbox)           cmd_task_inbox "$@" ;;
     answer)          cmd_task_answer "$@" ;;
@@ -12463,6 +12466,83 @@ cmd_task_answer() {
   ok "DIVE-$id answered ($nt) — now ${newstatus}${note}" \
      '{id:($i|tonumber), status:$st, need_type:$nt, provided:true, need_answer:(if $nt=="secret" then null else $v end), owner:(($o|select(length>0)) // null), pinged:($p=="1")}' \
      --arg i "$id" --arg st "$newstatus" --arg nt "$nt" --arg v "$value" --arg o "$owner" --arg p "$pinged"
+}
+
+# cmd_task_escalate — DIVE-449: the /task_<id> Telegram "Escalate" button (and a
+# plain CLI verb). Semantics A (Mark's call 2026-06-17): "flag for attention" —
+# bump the task's priority up ONE tier (capped at urgent) AND ping both the
+# owning agent ("get eyes on it / I'm stuck") and the paired human, so a stuck
+# task can't sit unseen at its old priority. Does NOT file a human gate (that's
+# `task need`) or reassign (that's `task assign`). The bump + escalated_at/by
+# audit stamp persist; the two pings are best-effort and never fail the verb.
+cmd_task_escalate() {
+  tasks_db_init
+  local from=""
+  local -a positional=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --from=*) from="${1#*=}" ;;
+      --)       shift; positional+=("$@"); break ;;
+      -*)       fail "$E_USAGE" "unknown flag: $1" ;;
+      *)        positional+=("$1") ;;
+    esac
+    shift
+  done
+  [[ ${#positional[@]} -gt 0 ]] || fail "$E_USAGE" "usage: 5dive task escalate <id|DIVE-N>"
+  resolve_task_id "${positional[0]}"; local id="$RESOLVED_TASK_ID"
+
+  # Don't escalate a finished task — there's nothing to get eyes on.
+  local status; status=$(db "SELECT status FROM tasks WHERE id=${id};")
+  [[ "$status" == "done" || "$status" == "cancelled" ]] && \
+    fail "$E_CONFLICT" "DIVE-$id is $status — nothing to escalate."
+
+  local old_pri title assignee created_by
+  old_pri=$(db "SELECT COALESCE(priority,'medium') FROM tasks WHERE id=${id};")
+  title=$(db "SELECT title FROM tasks WHERE id=${id};")
+  # Who to get eyes on it: the assignee, else the creator.
+  local owner; owner=$(db "SELECT COALESCE(NULLIF(assignee,''), NULLIF(created_by,''), '') FROM tasks WHERE id=${id};")
+
+  # Bump up one tier, capped at urgent. low/medium -> high keeps the common
+  # "this is stuck" tap meaningful; a second tap on a high task reaches urgent.
+  local new_pri
+  case "$old_pri" in
+    low|medium) new_pri="high" ;;
+    high)       new_pri="urgent" ;;
+    urgent)     new_pri="urgent" ;;
+    *)          new_pri="high" ;;
+  esac
+
+  local actor; actor=$(task_actor "$from")
+  db "UPDATE tasks SET priority=$(sqlq "$new_pri"), escalated_at=datetime('now'), escalated_by=$(sqlq "$actor") WHERE id=${id};"
+
+  local pri_note="$old_pri → $new_pri"
+  [[ "$old_pri" == "$new_pri" ]] && pri_note="$new_pri (already top tier)"
+
+  # Ping the owning agent over the existing agent-send path — but never ping the
+  # actor about its own task (an agent escalating its own work already knows).
+  local pinged=0
+  if [[ -n "$owner" && "$owner" != "$actor" ]]; then
+    local pingmsg="🔺 DIVE-${id} escalated by ${actor} — flagged as needing attention (priority ${pri_note}). Get eyes on it; run \`5dive task show DIVE-${id}\`."
+    if valid_sender_label "$actor"; then
+      ( cmd_send "$owner" --from="$actor" --message="$pingmsg" ) >/dev/null 2>&1 && pinged=1 || true
+    else
+      ( cmd_send "$owner" --message="$pingmsg" ) >/dev/null 2>&1 && pinged=1 || true
+    fi
+  fi
+
+  # Ping the paired human so an escalation surfaces on their phone (best-effort,
+  # mirrors task_need_notify's owner-channel resolution + send path).
+  local notified_human=0
+  if _task_owner_channel; then
+    local htext="🔺 [DIVE-${id}] escalated by ${actor} — needs attention"$'\n\n'"${title}"$'\n\n'"priority ${pri_note}"
+    _task_send_owner "$htext" "" && notified_human=1 || true
+  fi
+
+  local note=""
+  [[ $pinged -eq 1 ]] && note=" + pinged $owner"
+  ok "DIVE-$id escalated — priority ${pri_note}${note}" \
+     '{id:($i|tonumber), priority:$np, was:$op, owner:(($o|select(length>0)) // null), pinged:($p=="1"), human_notified:($h=="1")}' \
+     --arg i "$id" --arg np "$new_pri" --arg op "$old_pri" --arg o "$owner" --arg p "$pinged" --arg h "$notified_human"
 }
 
 cmd_task_rm() {
