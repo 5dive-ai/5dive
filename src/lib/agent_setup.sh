@@ -179,6 +179,7 @@ JSON
   #   5dive-cli   — spawn sub-agents on this VM via the local 5dive CLI
   install_default_skill_for_agent "$name" claude vercel-labs/skills find-skills || true
   install_default_skill_for_agent "$name" claude "$(gh_org)/skills" 5dive-cli || true
+  install_default_skill_for_agent "$name" claude "$(gh_org)/skills" compile-knowledge || true
 }
 
 # Preseed default skills for an antigravity agent. Unlike claude/codex/grok,
@@ -194,6 +195,7 @@ preseed_antigravity_agent() {
   [[ -d "$home" ]] || fail "$E_GENERIC" "agent home missing: $home"
   install_default_skill_for_agent "$name" antigravity vercel-labs/skills find-skills || true
   install_default_skill_for_agent "$name" antigravity "$(gh_org)/skills" 5dive-cli || true
+  install_default_skill_for_agent "$name" antigravity "$(gh_org)/skills" compile-knowledge || true
 }
 
 # Types that `npx skills add --agent <id>` doesn't recognize. The upstream
@@ -784,6 +786,7 @@ CODEX_ENV
   # so these route through the normal path, not the manual-install fallback.
   install_default_skill_for_agent "$name" codex vercel-labs/skills find-skills || true
   install_default_skill_for_agent "$name" codex "$(gh_org)/skills" 5dive-cli || true
+  install_default_skill_for_agent "$name" codex "$(gh_org)/skills" compile-knowledge || true
 }
 
 # Write ~/.codex/channels/telegram/access.json for agent-<name> with allowFrom
@@ -908,6 +911,7 @@ GROK_ENV
   # route through the manual-install fallback in install_default_skill_for_agent.
   install_default_skill_for_agent "$name" grok vercel-labs/skills find-skills || true
   install_default_skill_for_agent "$name" grok "$(gh_org)/skills" 5dive-cli || true
+  install_default_skill_for_agent "$name" grok "$(gh_org)/skills" compile-knowledge || true
 }
 
 # Write ~/.grok/channels/telegram/access.json for agent-<name> with allowFrom
@@ -1030,6 +1034,7 @@ AGY_ENV
   # installs are idempotent.)
   install_default_skill_for_agent "$name" antigravity vercel-labs/skills find-skills || true
   install_default_skill_for_agent "$name" antigravity "$(gh_org)/skills" 5dive-cli || true
+  install_default_skill_for_agent "$name" antigravity "$(gh_org)/skills" compile-knowledge || true
 }
 
 # Write ~/.gemini/channels/telegram/access.json for agent-<name> with allowFrom
@@ -1157,6 +1162,7 @@ OPENCODE_ENV
   # route through the normal `npx skills add` path.
   install_default_skill_for_agent "$name" opencode vercel-labs/skills find-skills || true
   install_default_skill_for_agent "$name" opencode "$(gh_org)/skills" 5dive-cli || true
+  install_default_skill_for_agent "$name" opencode "$(gh_org)/skills" compile-knowledge || true
 }
 
 # Write ~/.opencode/channels/telegram/access.json for agent-<name>. Idempotent —

@@ -9,3 +9,6 @@ see must go through `mcp__plugin_telegram_telegram__reply`.
   blocks them (their pickers are tmux-only; the Telegram user can't see
   them and the agent would hang). Inline questions and plans as numbered
   lines in a reply instead.
+- Compile durable, non-obvious knowledge into your memory so it survives
+  restarts (use the `compile-knowledge` skill) — and into a shared `wiki/`
+  if you work as a team. Skip filler; most tasks produce nothing durable.
