@@ -44,43 +44,9 @@ _tasks_schema() {
 PRAGMA journal_mode=WAL;
 PRAGMA foreign_keys=ON;
 
--- Projects (DIVE-484). A project is BOTH an ident namespace (prefix + its own
--- counter -> FROG-1, FROG-2 …, numbering scheme B) AND a lightweight workspace
--- (name/description/goal/folder/coordinator). Modeled on paperclipai/paperclip:
--- they keep the ident counter on the namespace row (companies.issue_prefix +
--- issue_counter); we merge that with their projects fields onto one row.
---   key       slug, the stable handle used on the CLI (e.g. 'dive', 'frog')
---   prefix    ident prefix, UNIQUE (e.g. 'DIVE', 'FROG')
---   counter   per-project monotone task counter; the ident trigger bumps it
---   lead_agent the project's coordinator (auto-assignee for its tasks; cf DIVE-333)
---   folder     working dir the project's tasks/agents default into (advisory)
--- The default project key='dive' prefix='DIVE' is seeded below so every existing
--- DIVE-<n> ident is preserved (back-compat — see _tasks_db_migrate's dive backfill).
-CREATE TABLE IF NOT EXISTS projects (
-  key         TEXT PRIMARY KEY,
-  prefix      TEXT NOT NULL UNIQUE,
-  counter     INTEGER NOT NULL DEFAULT 0,
-  name        TEXT,
-  description TEXT,
-  goal        TEXT,
-  folder      TEXT,
-  lead_agent  TEXT,
-  status      TEXT NOT NULL DEFAULT 'active',
-  archived_at TEXT,
-  created_at  TEXT NOT NULL DEFAULT (datetime('now'))
-);
-INSERT OR IGNORE INTO projects (key, prefix, name, description)
-  VALUES ('dive', 'DIVE', 'Dive', 'Default project (the original DIVE-N queue)');
-
 CREATE TABLE IF NOT EXISTS tasks (
   id          INTEGER PRIMARY KEY AUTOINCREMENT,
   ident       TEXT UNIQUE,
-  -- DIVE-484: which project this task belongs to + its per-project number.
-  -- project_key defaults to 'dive' so legacy inserts and old call sites keep
-  -- working; issue_number is the prefix-local sequence (DIVE keeps issue_number
-  -- = the global id for back-compat, new projects count 1,2,3…).
-  project_key  TEXT NOT NULL DEFAULT 'dive' REFERENCES projects(key),
-  issue_number INTEGER,
   title       TEXT NOT NULL,
   body        TEXT,
   status      TEXT NOT NULL DEFAULT 'todo',
@@ -165,24 +131,11 @@ CREATE TABLE IF NOT EXISTS agents_org (
 CREATE INDEX IF NOT EXISTS tasks_status_idx   ON tasks(status);
 CREATE INDEX IF NOT EXISTS tasks_assignee_idx ON tasks(assignee, status);
 CREATE INDEX IF NOT EXISTS tasks_parent_idx   ON tasks(parent_id);
-CREATE INDEX IF NOT EXISTS tasks_project_idx  ON tasks(project_key);
 
--- DIVE-484: derive ident from the task's PROJECT (numbering scheme B). On insert
--- we bump that project's counter and stamp issue_number + ident=<prefix>-<n>. All
--- three statements run in the insert's implicit transaction, and tasks.db is a
--- single-writer store (busy_timeout serializes agents), so the counter can't race.
--- The tasks.ident UNIQUE index is the backstop. For the seeded 'dive' project the
--- counter starts at MAX(existing id) (see migration) so new DIVE-N continue the
--- historical sequence with no renumbering of existing rows.
 CREATE TRIGGER IF NOT EXISTS tasks_ident_ai AFTER INSERT ON tasks
 WHEN NEW.ident IS NULL
 BEGIN
-  UPDATE projects SET counter = counter + 1 WHERE key = NEW.project_key;
-  UPDATE tasks
-     SET issue_number = (SELECT counter FROM projects WHERE key = NEW.project_key),
-         ident = (SELECT prefix FROM projects WHERE key = NEW.project_key)
-                 || '-' || (SELECT counter FROM projects WHERE key = NEW.project_key)
-   WHERE id = NEW.id;
+  UPDATE tasks SET ident='DIVE-'||NEW.id WHERE id=NEW.id;
 END;
 
 -- Touch updated_at on change. The WHEN guard stops the trigger recursing on
@@ -252,72 +205,16 @@ _tasks_db_migrate() {
   # Each entry: "<column> <type>". Add new additive columns here; existing
   # rows backfill to NULL. Pure expand (no contract), so old queries/rows are
   # untouched and a downgrade still reads/writes the table fine.
-  # NB project_key uses a constant DEFAULT (no REFERENCES) — sqlite forbids
-  # ADD COLUMN with a foreign key unless the default is NULL. The FK is declared
-  # in _tasks_schema for fresh boxes; on migrated stores the project_key→projects
-  # link is enforced at the app layer (project add/resolve), same as parent_id's
-  # behavior pre-FK. issue_number is the per-project sequence (DIVE-484).
   for c in 'result TEXT' 'need_type TEXT' 'ask TEXT' 'need_options TEXT' 'recommend TEXT' 'need_answer TEXT' 'need_answered_at TEXT' \
            "kind TEXT NOT NULL DEFAULT 'standard'" 'schedule TEXT' 'last_fired_at TEXT' \
            'from_template_id INTEGER' 'fresh INTEGER' \
            'parked_at TEXT' 'park_reason TEXT' 'need_answered_by TEXT' \
-           'escalated_at TEXT' 'escalated_by TEXT' \
-           "project_key TEXT NOT NULL DEFAULT 'dive'" 'issue_number INTEGER'; do
+           'escalated_at TEXT' 'escalated_by TEXT'; do
     if ! printf '%s\n' "$cols" | grep -qx "${c%% *}"; then
       sqlite3 -cmd ".timeout 5000" "$TASKS_DB" \
         "ALTER TABLE tasks ADD COLUMN ${c};" >/dev/null 2>&1 || true
     fi
   done
-
-  # DIVE-484 projects migration — ONE-SHOT, gated on the projects table's absence
-  # so it doesn't take a write lock on every command. Runs after the column loop
-  # above guarantees project_key + issue_number exist. Single transaction:
-  #   * create + seed the default 'dive' project (prefix DIVE, preserving history)
-  #   * backfill legacy rows: issue_number = the existing global id (NO renumber,
-  #     so every current DIVE-<n> ident stays byte-identical)
-  #   * sync dive.counter to MAX so new DIVE-N continue the historical sequence
-  #   * swap the old DIVE-hardcoded ident trigger for the project-aware one
-  local has_projects
-  has_projects=$(sqlite3 -cmd ".timeout 5000" "$TASKS_DB" \
-    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='projects' LIMIT 1;" 2>/dev/null)
-  if [[ "$has_projects" != "1" ]]; then
-    sqlite3 -cmd ".timeout 5000" "$TASKS_DB" <<'MIG' >/dev/null 2>&1 || true
-BEGIN IMMEDIATE;
-CREATE TABLE IF NOT EXISTS projects (
-  key         TEXT PRIMARY KEY,
-  prefix      TEXT NOT NULL UNIQUE,
-  counter     INTEGER NOT NULL DEFAULT 0,
-  name        TEXT,
-  description TEXT,
-  goal        TEXT,
-  folder      TEXT,
-  lead_agent  TEXT,
-  status      TEXT NOT NULL DEFAULT 'active',
-  archived_at TEXT,
-  created_at  TEXT NOT NULL DEFAULT (datetime('now'))
-);
-INSERT OR IGNORE INTO projects (key, prefix, name, description)
-  VALUES ('dive', 'DIVE', 'Dive', 'Default project (the original DIVE-N queue)');
-UPDATE tasks SET project_key='dive' WHERE project_key IS NULL OR project_key='';
-UPDATE tasks SET issue_number = id WHERE issue_number IS NULL;
-UPDATE projects
-   SET counter = (SELECT COALESCE(MAX(issue_number),0) FROM tasks WHERE project_key='dive')
- WHERE key='dive';
-DROP TRIGGER IF EXISTS tasks_ident_ai;
-CREATE TRIGGER tasks_ident_ai AFTER INSERT ON tasks
-WHEN NEW.ident IS NULL
-BEGIN
-  UPDATE projects SET counter = counter + 1 WHERE key = NEW.project_key;
-  UPDATE tasks
-     SET issue_number = (SELECT counter FROM projects WHERE key = NEW.project_key),
-         ident = (SELECT prefix FROM projects WHERE key = NEW.project_key)
-                 || '-' || (SELECT counter FROM projects WHERE key = NEW.project_key)
-   WHERE id = NEW.id;
-END;
-CREATE INDEX IF NOT EXISTS tasks_project_idx ON tasks(project_key);
-COMMIT;
-MIG
-  fi
 }
 
 # Per-connection setup, passed via -cmd / .timeout so it produces NO output
@@ -343,22 +240,18 @@ dbfmt() {
 # validated before anything touches SQL.
 RESOLVED_TASK_ID=""
 resolve_task_id() {
-  local ref="$1" found
+  local ref="$1" id
   if [[ "$ref" =~ ^[0-9]+$ ]]; then
-    # Bare number = the global row id (unchanged from before).
-    found=$(db "SELECT id FROM tasks WHERE id=${ref};")
-  elif [[ "$ref" =~ ^[A-Za-z]+-[0-9]+$ ]]; then
-    # DIVE-484: any <PREFIX>-<n> ident. Resolve by the ident string (case-
-    # normalized to the stored UPPER prefix) — for non-dive projects the number
-    # is the per-project issue_number, NOT the global id, so a numeric shortcut
-    # would resolve the wrong row.
-    local up="${ref^^}"
-    found=$(db "SELECT id FROM tasks WHERE ident=$(sqlq "$up");")
+    id="$ref"
+  elif [[ "$ref" =~ ^[Dd][Ii][Vv][Ee]-([0-9]+)$ ]]; then
+    id="${BASH_REMATCH[1]}"
   else
-    fail "$E_VALIDATION" "bad task ref '$ref' (expected <number> or <PREFIX>-<number>, e.g. DIVE-42)"
+    fail "$E_VALIDATION" "bad task ref '$ref' (expected <number> or DIVE-<number>)"
   fi
+  local found
+  found=$(db "SELECT id FROM tasks WHERE id=${id};")
   [[ -n "$found" ]] || fail "$E_NOT_FOUND" "no such task: $ref"
-  RESOLVED_TASK_ID="$found"
+  RESOLVED_TASK_ID="$id"
 }
 
 # Who is acting: --from wins, else infer from SUDO_USER (sudo path) or $USER

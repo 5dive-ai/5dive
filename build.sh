@@ -40,7 +40,6 @@ cat \
   src/cmd_compose.sh \
   src/cmd_task.sh \
   src/cmd_org.sh \
-  src/cmd_project.sh \
   src/cmd_heartbeat.sh \
   src/cmd_fleet.sh \
   src/cmd_usage.sh \
