@@ -1910,8 +1910,32 @@ cmd_agent_topic_get() {
 #   no_token    — no telegram bot token on file for the agent
 #   error       — a Telegram call failed (detail in `error`)
 # provision is idempotent: re-running re-uses an agent's existing topic.
+# DIVE-453 — resolve the on-box Chief-of-Staff bot token (set by `agent cos set`,
+# stored in connectors/cos.env) so the CoS-native team-group flow never pastes a
+# separate token. Mirrors cmd_cos.sh's resolver (TEST_TG_COS_BOT_TOKEN or
+# COS_BOT_TOKEN). Prints the token to stdout; non-zero exit if none configured.
+_cos_token_resolve() {
+  local env_file="${COS_ENV_FILE:-/etc/5dive/connectors/cos.env}"
+  [[ -r "$env_file" ]] || return 1
+  local line
+  line=$(grep -m1 -oE '^[[:space:]]*(TEST_TG_COS_BOT_TOKEN|COS_BOT_TOKEN)[[:space:]]*=[[:space:]]*[^[:space:]]+' "$env_file" 2>/dev/null) || return 1
+  [[ -n "$line" ]] || return 1
+  printf '%s\n' "${line#*=}" | sed -E 's/^[[:space:]]*//'
+}
+
+# DIVE-453 — `5dive agent team-group <discover|provision|shared|status> …`: the
+# slim CoS-native team group. Identical to `team-bot` but rides the connected
+# Chief-of-Staff bot (token resolved server-side) — the customer adds ONE bot
+# (their CoS) to a Topics group as admin and every agent gets a topic, with no
+# separate team-bot token to paste. Thin wrapper: inject --use-cos.
+cmd_agent_team_group() {
+  [[ $# -gt 0 ]] || fail "$E_USAGE" "usage: 5dive agent team-group discover|provision|shared|status [--group=<chat_id>] [--agents=<csv>] [--owner=<user_id>]"
+  local sub="$1"; shift
+  cmd_agent_team_bot "$sub" --use-cos "$@"
+}
+
 cmd_agent_team_bot() {
-  local sub="" group="" owner="" agents_filter="" token="" off=""
+  local sub="" group="" owner="" agents_filter="" token="" off="" use_cos="" cos_token=""
   [[ $# -gt 0 ]] || fail "$E_USAGE" "usage: 5dive agent team-bot status|provision|shared|intercom|discover --group=<chat_id> [--owner=<user_id>]"
   sub="$1"; shift
   while [[ $# -gt 0 ]]; do
@@ -1920,6 +1944,7 @@ cmd_agent_team_bot() {
       --owner=*) owner="${1#--owner=}" ;;
       --agents=*) agents_filter="${1#--agents=}" ;;
       --token=*) token="${1#--token=}" ;;
+      --use-cos) use_cos=1 ;;
       --off) off=1 ;;
       -*) fail "$E_USAGE" "unknown flag: $1" ;;
       *)  fail "$E_USAGE" "extra arg: $1" ;;
@@ -1927,6 +1952,18 @@ cmd_agent_team_bot() {
     shift
   done
   case "$sub" in status|provision|shared|intercom|discover) ;; *) fail "$E_USAGE" "unknown team-bot command: $sub (status|provision|shared|intercom|discover)" ;; esac
+
+  # DIVE-453 — CoS-native team group (`5dive agent team-group …`). Instead of a
+  # separately-pasted shared bot token, ride the already-connected Chief-of-Staff
+  # bot: resolve its token server-side from connectors/cos.env (set by `agent cos
+  # set`) and feed it into the same discover/provision/shared machinery. The token
+  # never leaves the box — the slim dashboard surface only ever sends `--use-cos`.
+  if [[ -n "$use_cos" ]]; then
+    cos_token=$(_cos_token_resolve) || true
+    [[ -n "$cos_token" ]] || fail "$E_NOT_FOUND" "no Chief of Staff connected on this box — connect one first (agent cos set), then set up the team group"
+    # discover + shared route through $token; provision picks up $cos_token below.
+    token="$cos_token"
+  fi
 
   # `discover` (DIVE-247) = find the team group with the bot itself — no
   # --group needed (that id is exactly what it returns). Handled before the
@@ -1994,7 +2031,11 @@ cmd_agent_team_bot() {
   # atomic access.json merge (root writes then chowns to agent-<name>). Emits a
   # results JSON array on stdout. teamTopic registry updates come back as a side
   # channel (RESULTS_FILE) so we can persist them under the registry lock.
-  local team_token=""; [[ -r /etc/5dive/team-bot.token ]] && team_token=$(cat /etc/5dive/team-bot.token 2>/dev/null)
+  # DIVE-453: with --use-cos, provision creates topics through the Chief-of-Staff
+  # bot (resolved above) instead of the separate shared team-bot token.
+  local team_token=""
+  if [[ -n "$cos_token" ]]; then team_token="$cos_token"
+  elif [[ -r /etc/5dive/team-bot.token ]]; then team_token=$(cat /etc/5dive/team-bot.token 2>/dev/null); fi
   local reg_updates_file; reg_updates_file=$(mktemp)
   local results
   results=$(MODE="$sub" GROUP="$group" OWNER="$owner" AGENTS="$agents_json" TEAM_BOT_TOKEN="$team_token" REG_UPDATES_FILE="$reg_updates_file" python3 - <<'PY'

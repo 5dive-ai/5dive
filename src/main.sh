@@ -320,6 +320,12 @@ main() {
           # writes access.json + registry teamTopic (registry lock taken inside).
           AUDIT_CMD="agent team-bot"; AUDIT_ARGS=("$@")
           cmd_agent_team_bot "$@" ;;
+        team-group)
+          # DIVE-453: CoS-native team group — same machinery as team-bot but rides
+          # the connected Chief-of-Staff bot (token resolved server-side from
+          # cos.env), so no separate team-bot token is ever pasted/sent.
+          AUDIT_CMD="agent team-group"; AUDIT_ARGS=("$@")
+          cmd_agent_team_group "$@" ;;
         cos)
           # DIVE-320: Chief of Staff managed-bot provisioning. verify/mint-link
           # are read-only probes; claim/rotate fetch+configure a child token via
