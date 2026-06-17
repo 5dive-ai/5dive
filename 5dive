@@ -26,7 +26,7 @@ esac
 
 # Bumped on every public release. `build.sh` checks this line exists; CI fails
 # the bundle-drift check if it's missing or empty.
-readonly FIVE_VERSION="0.3.11"
+readonly FIVE_VERSION="0.3.12"
 
 # GitHub org our repos live under. The org is being renamed
 # 5dive-com -> 5dive-ai (2026-06); fetches must work on either side of the
@@ -9700,6 +9700,42 @@ cmd_agent_cos() {
     [[ -n "$atok" ]] || fail "$E_NOT_FOUND" "TELEGRAM_BOT_TOKEN empty/missing in $tok_env"
     COS_TOKEN_OVERRIDE="$atok" "$bun" "$COS_RUN_DIR/cos-runner.ts" set-avatar --avatar="$avatar"
     return $?
+  fi
+
+  # `rotate --agent=<name>` (DIVE-324): rotate a CoS-minted child bot token AND
+  # apply it to the agent. Rotating only at Telegram's end (the bare
+  # `rotate --bot-id` runner call) would strand the agent on a now-dead token —
+  # so resolve the agent's current bot-id from its stored token (the "<botId>:"
+  # prefix), rotate via the runner, write the new token back, and restart so the
+  # plugin reloads it. `rotate --bot-id=<id>` (raw, no apply) still falls through
+  # to the runner below for advanced/manual use.
+  if [[ "$sub" == "rotate" ]]; then
+    local r_agent="" a
+    for a in "$@"; do case "$a" in --agent=*) r_agent="${a#--agent=}" ;; esac; done
+    if [[ -n "$r_agent" ]]; then
+      for a in "$@"; do case "$a" in --bot-id=*) fail "$E_USAGE" "--agent and --bot-id are mutually exclusive (--agent resolves the bot-id from the agent's stored token)" ;; esac; done
+      valid_name "$r_agent" || fail "$E_VALIDATION" "invalid --agent (lowercase letters/digits/hyphens, start letter, <=16 chars)"
+      [[ -r "$cos_env" ]] || fail "$E_NOT_FOUND" "no CoS token at $cos_env — run: 5dive agent cos set --token=<token>"
+      local tok_env="$(dirname "$cos_env")/telegram-${r_agent}.env" atok
+      [[ -r "$tok_env" ]] || fail "$E_NOT_FOUND" "no telegram token for agent '$r_agent' at $tok_env (is it a telegram agent?)"
+      atok=$(sudo grep -m1 -oP '(?<=^TELEGRAM_BOT_TOKEN=).*' "$tok_env" 2>/dev/null | tr -d '"'"'"'' | tr -d '[:space:]')
+      [[ -n "$atok" ]] || fail "$E_NOT_FOUND" "TELEGRAM_BOT_TOKEN empty/missing in $tok_env"
+      local botid="${atok%%:*}"
+      [[ "$botid" =~ ^[0-9]+$ ]] || fail "$E_VALIDATION" "could not derive a bot-id from agent '$r_agent' token (is it a CoS-minted bot?)"
+      # Rotate at the CoS end (replaceManagedBotToken). `|| true` so we can branch
+      # on the JSON, not errexit (same idiom as `set` above).
+      local res; res=$(COS_ENV_FILE="$cos_env" "$bun" "$COS_RUN_DIR/cos-runner.ts" rotate --bot-id="$botid") || true
+      [[ "$res" == *'"ok":true'* ]] || { printf '%s\n' "$res"; return 1; }
+      local newtok; newtok=$(jq -r '.token // empty' <<<"$res" 2>/dev/null)
+      [[ -n "$newtok" ]] || fail "$E_GENERIC" "rotate returned no token: $res"
+      # Apply: persist the new token + restart so the running plugin reloads it.
+      # The old token is already dead at Telegram, so this must not be skipped.
+      write_channel_secret telegram "$r_agent" TELEGRAM_BOT_TOKEN "$newtok"
+      systemctl restart "5dive-agent@${r_agent}.service" >&2 2>/dev/null || true
+      ok "rotated + applied bot token for agent '$r_agent' (bot $botid) — old token invalidated, agent restarted" \
+         '{agent:$a, botId:($b|tonumber), applied:true}' --arg a "$r_agent" --arg b "$botid"
+      return 0
+    fi
   fi
 
   # All other subcommands read the persisted token.
