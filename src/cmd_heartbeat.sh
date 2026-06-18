@@ -42,6 +42,13 @@ _HB_STALE_MIN_MINUTES=45
 # instead of re-nudging forever. Per-task nudge counts live in the registry under
 # .agents[<name>].heartbeat.nudges and are pruned once a task leaves todo.
 _HB_STARVE_AFTER=3
+
+# A reaped task (in_progress past the budget) is requeued to todo, never
+# cancelled — silently losing real mid-flight work is worse than a re-run
+# (DIVE-482/200). But a task that keeps overrunning even after a clean requeue
+# is genuinely stuck: after this many reaps it's blocked + escalated (pings the
+# owner & paired human) so it surfaces instead of churning. Still never cancelled.
+_HB_REAP_ESCALATE_AFTER=2
 # Orphan reclaim. An in_progress task whose claiming claude session is GONE — the
 # agent's claude process started AFTER the task did (rotation, service restart,
 # crash, a context reset that exited the process) — is reclaimed to 'todo'
@@ -230,6 +237,26 @@ _hb_mark_run() {
   jq -r --arg n "$name" --arg tid "$task_id" '.agents[$n].heartbeat.nudges[$tid] // 0' <<<"$reg"
 }
 
+# Increment + return this task's consecutive-reap count, stored in the registry
+# under .agents[<name>].heartbeat.reaps (parallel to .nudges). Pruned to the
+# agent's still-open tasks, so a task that completes (or a relisted id) starts
+# fresh. Must run under with_registry_lock, like _hb_mark_run.
+_hb_mark_reap() {
+  local name="$1" task_id="$2"
+  local reg; reg=$(registry_read)
+  local open_ids
+  open_ids=$(db "SELECT id FROM tasks WHERE assignee=$(sqlq "$name") AND status IN ('todo','in_progress','blocked') AND kind='standard';" 2>/dev/null              | jq -R 'select(length>0)|tonumber' | jq -cs '.' 2>/dev/null) || open_ids=""
+  [[ -n "$open_ids" ]] || open_ids="[]"
+  reg=$(echo "$reg" | jq --arg n "$name" --arg tid "$task_id" --argjson open "$open_ids" '
+    .agents[$n].heartbeat.reaps = (
+      ((.agents[$n].heartbeat.reaps // {})
+        | with_entries(select((.key|tonumber) as $k | $open | index($k) != null)))
+      | .[$tid] = ((.[$tid] // 0) + 1)
+    )')
+  echo "$reg" | registry_write
+  jq -r --arg n "$name" --arg tid "$task_id" '.agents[$n].heartbeat.reaps[$tid] // 0' <<<"$reg"
+}
+
 # Inject one literal line + Enter into an agent's tmux pane. Returns nonzero
 # (never exits) so a single dead pane can't abort the whole tick.
 _hb_send_line() {
@@ -349,18 +376,23 @@ _hb_reclaim_to_todo() {
 #       sat in_progress past _HB_STALL_MIN_MINUTES AND the agent is idle now:
 #       it claimed the task then walked away. Gated on a confident idle reading
 #       so we never reclaim work that's actively in flight.
-#   (c) hard cap           -> cancel. in_progress past everyMin*_HB_STALE_MULT
-#       (floored): the deterministic runaway backstop. /goal clear then cancel
-#       with an auto-result so the board shows it terminated, not silently stuck.
+#   (c) hard cap           -> requeue, then escalate on repeat. in_progress past
+#       everyMin*_HB_STALE_MULT (floored): the runaway backstop. /goal clear to
+#       stop any loop, then reclaim to todo — NEVER cancel, since that silently
+#       loses real mid-flight work (DIVE-482/200). A task that keeps overrunning
+#       even after a clean requeue is genuinely stuck: on the
+#       _HB_REAP_ESCALATE_AFTER'th reap, block it + escalate (ping owner & human)
+#       so it's visible, not churning — still never auto-cancelled.
 #
-# (a)/(b) reclaim (the work still needs doing); only (c) cancels. Echoes
-# "<reclaimed> <cancelled>". Uses started_at (falls back to created_at).
+# (a)/(b)/(c) all reclaim the work (it still needs doing); (c) additionally
+# escalates a repeat offender. Nothing is ever cancelled here. Echoes
+# "<reclaimed> <escalated>". Uses started_at (falls back to created_at).
 _hb_reclaim() {
   local name="$1" everyMin="$2"
   local budget=$(( everyMin * _HB_STALE_MULT ))
   (( budget < _HB_STALE_MIN_MINUTES )) && budget=$_HB_STALE_MIN_MINUTES
   local proc_start; proc_start=$(_hb_claude_started "$name" 2>/dev/null || true)
-  local reclaimed=0 cancelled=0 id started_epoch age_min
+  local reclaimed=0 escalated=0 id started_epoch age_min
   while IFS='|' read -r id started_epoch age_min; do
     [[ -n "$id" ]] || continue
     # (a) the claiming session is gone — process is newer than the claim.
@@ -369,14 +401,30 @@ _hb_reclaim() {
       _hb_reclaim_to_todo "$name" "$id" "claiming session gone (claude restarted $(( (proc_start - started_epoch) / 60 ))m after the claim)"
       reclaimed=$((reclaimed + 1)); continue
     fi
-    # (c) hard cap before stall: a very old task is cancelled, not re-queued.
+    # (c) hard cap before stall: in_progress past the budget but rule (a) didn't
+    # fire (the claiming process did NOT restart — e.g. an in-process /clear or
+    # context reset ended the working session without a new pid) and rule (b)
+    # got no confident idle reading. This used to CANCEL, silently losing real
+    # mid-flight work (DIVE-482, DIVE-200). Never cancel: stop any runaway, then
+    # requeue to a clean slate. A task that keeps overrunning even after a fresh
+    # requeue is genuinely stuck → on the _HB_REAP_ESCALATE_AFTER'th reap, block
+    # it + escalate (pings owner & paired human) so a person decides its fate.
     if (( age_min >= budget )); then
       _hb_send_line "$name" "/goal clear" || true
-      db "UPDATE tasks SET status='cancelled', done_at=datetime('now'),
-            result='auto-cancelled by heartbeat: in_progress exceeded ${budget}m time budget'
-          WHERE id=${id} AND status='in_progress';" 2>/dev/null || true
-      _hb_log "[$name] reaped stale in_progress DIVE-${id} (>${budget}m)"
-      cancelled=$((cancelled + 1)); continue
+      local reap_n
+      reap_n=$(with_registry_lock _hb_mark_reap "$name" "$id")
+      if [[ "${reap_n:-0}" =~ ^[0-9]+$ ]] && (( reap_n >= _HB_REAP_ESCALATE_AFTER )); then
+        db "UPDATE tasks SET status='blocked', updated_at=datetime('now'),
+              result='auto-paused by heartbeat: overran the ${budget}m in_progress budget ${reap_n}x even after a clean requeue — needs a human to requeue or close. NEVER auto-cancelled.'
+            WHERE id=${id} AND status='in_progress';" 2>/dev/null || true
+        # Subshell-wrap: cmd_task_escalate may fail->exit on an edge case; a bare
+        # call would kill the whole tick. It bumps priority + pings owner & human.
+        ( cmd_task_escalate "$id" --from=heartbeat ) >/dev/null 2>&1 || true
+        _hb_log "[$name] DIVE-${id} overran ${budget}m ${reap_n}x — blocked + escalated (NEVER cancelled)"
+        escalated=$((escalated + 1)); continue
+      fi
+      _hb_reclaim_to_todo "$name" "$id" "overran ${budget}m budget (reap #${reap_n}) — requeued from a clean slate, NOT cancelled"
+      reclaimed=$((reclaimed + 1)); continue
     fi
     # (b) idle stall — only if past grace AND a confident idle reading (rc 0).
     if (( age_min >= _HB_STALL_MIN_MINUTES )) && _hb_agent_idle "$name"; then
@@ -388,7 +436,7 @@ _hb_reclaim() {
                  CAST((julianday('now') - julianday(COALESCE(started_at, created_at))) * 1440 AS INTEGER)
                FROM tasks
                WHERE assignee=$(sqlq "$name") AND status='in_progress';" 2>/dev/null || true)
-  printf '%s %s\n' "$reclaimed" "$cancelled"
+  printf '%s %s\n' "$reclaimed" "$escalated"
 }
 
 # Wake one agent: ensure it's running, optionally clear context, send the nudge.
