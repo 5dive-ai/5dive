@@ -91,7 +91,7 @@ _task_resolve_coordinator() {
 
 cmd_task_add() {
   tasks_db_init
-  local body="" priority="medium" assignee="" parent="" from="" recurring="" fresh=""
+  local body="" priority="medium" assignee="" parent="" from="" recurring="" fresh="" project="dive"
   local -a words=()
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -99,6 +99,7 @@ cmd_task_add() {
       --priority=*)  priority="${1#*=}" ;;
       --assignee=*)  assignee="${1#*=}" ;;
       --parent=*)    parent="${1#*=}" ;;
+      --project=*)   project="${1#*=}" ;;
       --from=*)      from="${1#*=}" ;;
       --recurring=*) recurring="${1#*=}" ;;
       --schedule=*)  recurring="${1#*=}" ;;
@@ -111,7 +112,7 @@ cmd_task_add() {
     shift
   done
   local title="${words[*]:-}"
-  [[ -n "$title" ]] || fail "$E_USAGE" "usage: 5dive task add <title...> [--body=] [--priority=] [--assignee=] [--parent=] [--recurring=\"<cron>\"]"
+  [[ -n "$title" ]] || fail "$E_USAGE" "usage: 5dive task add <title...> [--body=] [--priority=] [--assignee=] [--parent=] [--project=<key>] [--recurring=\"<cron>\"]"
   valid_task_priority "$priority" || fail "$E_VALIDATION" "bad priority '$priority' (low|medium|high|urgent)"
   # --recurring=<cron> makes this a TEMPLATE (kind='recurring'), not a worked
   # task — the step-2 materializer clones it into a standard todo on schedule.
@@ -122,6 +123,15 @@ cmd_task_add() {
     valid_cron_expr "$recurring" || fail "$E_VALIDATION" "bad --recurring '$recurring' (need a 5-field cron expr, e.g. \"0 2 * * *\")"
     [[ -z "$parent" ]] || fail "$E_VALIDATION" "--recurring can't be combined with --parent (a template has no parent)"
     kind="recurring"; schedule_sql=$(sqlq "$recurring")
+  fi
+  # DIVE-484: resolve the target project (default 'dive'). Accept the key
+  # case-insensitively; the row must exist (create one with `5dive project add`).
+  project="${project,,}"
+  local proj_lead
+  proj_lead=$(db "SELECT COALESCE(lead_agent,'') FROM projects WHERE key=$(sqlq "$project") AND status='active';")
+  if [[ -z "$proj_lead" ]]; then
+    db "SELECT 1 FROM projects WHERE key=$(sqlq "$project") AND status='active';" | grep -q 1 \
+      || fail "$E_NOT_FOUND" "no active project '$project' (see: 5dive project ls; create: 5dive project add)"
   fi
   local parent_sql="NULL"
   if [[ -n "$parent" ]]; then
@@ -139,38 +149,46 @@ cmd_task_add() {
   # assignee. Default it to the org's coordinator so it always has an owner.
   # Recurring TEMPLATES stay unassigned (they're inert until materialized; the
   # instance gets coordinated when it's cloned as a standard task).
+  # DIVE-333 + DIVE-484: default an unassigned standard task to a coordinator so
+  # the heartbeat can wake an owner. Prefer the PROJECT's own lead_agent; fall
+  # back to the org-wide coordinator when the project has none.
   local auto_coordinated=0
   if [[ -z "$assignee" && "$kind" == "standard" ]]; then
-    assignee=$(_task_resolve_coordinator)
+    assignee="$proj_lead"
+    [[ -z "$assignee" ]] && assignee=$(_task_resolve_coordinator)
     [[ -n "$assignee" ]] && auto_coordinated=1
   fi
   local creator; creator=$(task_actor "$from")
   local id
-  id=$(db "INSERT INTO tasks (title, body, priority, assignee, created_by, parent_id, kind, schedule, fresh)
+  id=$(db "INSERT INTO tasks (title, body, priority, assignee, created_by, parent_id, project_key, kind, schedule, fresh)
            VALUES ($(sqlq "$title"), $(sqlq_or_null "$body"), $(sqlq "$priority"),
-                   $(sqlq_or_null "$assignee"), $(sqlq "$creator"), ${parent_sql},
+                   $(sqlq_or_null "$assignee"), $(sqlq "$creator"), ${parent_sql}, $(sqlq "$project"),
                    $(sqlq "$kind"), ${schedule_sql}, ${fresh_sql});
            SELECT last_insert_rowid();")
+  # Ident is stamped by the AFTER INSERT trigger from the project's counter, so
+  # read it back rather than assuming the DIVE- prefix (DIVE-484).
+  local ident; ident=$(db "SELECT ident FROM tasks WHERE id=${id};")
   if [[ "$kind" == "recurring" ]]; then
-    ok "created recurring DIVE-$id (${recurring}, fresh=$([[ "$fresh_sql" == "1" ]] && echo on || echo off)) — $title" \
-       '{id:($i|tonumber), ident:("DIVE-"+$i), title:$t, priority:$p, assignee:$a, created_by:$c, kind:"recurring", schedule:$s, fresh:($f=="1")}' \
-       --arg i "$id" --arg t "$title" --arg p "$priority" --arg a "${assignee:-}" --arg c "$creator" --arg s "$recurring" --arg f "$fresh_sql"
+    ok "created recurring ${ident} (${recurring}, fresh=$([[ "$fresh_sql" == "1" ]] && echo on || echo off)) — $title" \
+       '{id:($i|tonumber), ident:$id, project:$pr, title:$t, priority:$p, assignee:$a, created_by:$c, kind:"recurring", schedule:$s, fresh:($f=="1")}' \
+       --arg i "$id" --arg id "$ident" --arg pr "$project" --arg t "$title" --arg p "$priority" --arg a "${assignee:-}" --arg c "$creator" --arg s "$recurring" --arg f "$fresh_sql"
   else
     local coord_note=""
     (( auto_coordinated )) && coord_note=" → coordinator: $assignee"
-    ok "created DIVE-$id — $title${coord_note}" \
-       '{id:($i|tonumber), ident:("DIVE-"+$i), title:$t, priority:$p, assignee:$a, created_by:$c, kind:"standard", autoCoordinated:($ac=="1")}' \
-       --arg i "$id" --arg t "$title" --arg p "$priority" --arg a "${assignee:-}" --arg c "$creator" --arg ac "$auto_coordinated"
+    ok "created ${ident} — $title${coord_note}" \
+       '{id:($i|tonumber), ident:$id, project:$pr, title:$t, priority:$p, assignee:$a, created_by:$c, kind:"standard", autoCoordinated:($ac=="1")}' \
+       --arg i "$id" --arg id "$ident" --arg pr "$project" --arg t "$title" --arg p "$priority" --arg a "${assignee:-}" --arg c "$creator" --arg ac "$auto_coordinated"
   fi
 }
 
 cmd_task_ls() {
   tasks_db_init
-  local status="" assignee="" mine=0 all=0 from="" recurring=0
+  local status="" assignee="" mine=0 all=0 from="" recurring=0 project=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --status=*)   status="${1#*=}" ;;
       --assignee=*) assignee="${1#*=}" ;;
+      --project=*)  project="${1#*=}" ;;
       --mine)       mine=1 ;;
       --all)        all=1 ;;
       --recurring)  recurring=1 ;;
@@ -199,6 +217,8 @@ cmd_task_ls() {
     order="ORDER BY CASE priority WHEN 'urgent' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2 ELSE 3 END, created_at"
   fi
   [[ -n "$assignee" ]] && where+=" AND assignee=$(sqlq "$assignee")"
+  # DIVE-484: scope to one project by key (case-insensitive).
+  [[ -n "$project" ]] && where+=" AND project_key=$(sqlq "${project,,}")"
   if (( JSON_MODE )); then
     local rows
     rows=$(dbfmt -json "SELECT id, ident, title, status, priority, assignee, created_by, parent_id, created_at, done_at, body, result, need_type, ask, need_options, need_answer, need_answered_at, kind, schedule, last_fired_at, parked_at, park_reason FROM tasks WHERE ${where} ${order};")

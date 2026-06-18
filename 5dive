@@ -26,7 +26,7 @@ esac
 
 # Bumped on every public release. `build.sh` checks this line exists; CI fails
 # the bundle-drift check if it's missing or empty.
-readonly FIVE_VERSION="0.3.17"
+readonly FIVE_VERSION="0.3.18"
 
 # GitHub org our repos live under. The org is being renamed
 # 5dive-com -> 5dive-ai (2026-06); fetches must work on either side of the
@@ -2114,9 +2114,43 @@ _tasks_schema() {
 PRAGMA journal_mode=WAL;
 PRAGMA foreign_keys=ON;
 
+-- Projects (DIVE-484). A project is BOTH an ident namespace (prefix + its own
+-- counter -> FROG-1, FROG-2 …, numbering scheme B) AND a lightweight workspace
+-- (name/description/goal/folder/coordinator). Modeled on paperclipai/paperclip:
+-- they keep the ident counter on the namespace row (companies.issue_prefix +
+-- issue_counter); we merge that with their projects fields onto one row.
+--   key       slug, the stable handle used on the CLI (e.g. 'dive', 'frog')
+--   prefix    ident prefix, UNIQUE (e.g. 'DIVE', 'FROG')
+--   counter   per-project monotone task counter; the ident trigger bumps it
+--   lead_agent the project's coordinator (auto-assignee for its tasks; cf DIVE-333)
+--   folder     working dir the project's tasks/agents default into (advisory)
+-- The default project key='dive' prefix='DIVE' is seeded below so every existing
+-- DIVE-<n> ident is preserved (back-compat — see _tasks_db_migrate's dive backfill).
+CREATE TABLE IF NOT EXISTS projects (
+  key         TEXT PRIMARY KEY,
+  prefix      TEXT NOT NULL UNIQUE,
+  counter     INTEGER NOT NULL DEFAULT 0,
+  name        TEXT,
+  description TEXT,
+  goal        TEXT,
+  folder      TEXT,
+  lead_agent  TEXT,
+  status      TEXT NOT NULL DEFAULT 'active',
+  archived_at TEXT,
+  created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+);
+INSERT OR IGNORE INTO projects (key, prefix, name, description)
+  VALUES ('dive', 'DIVE', 'Dive', 'Default project (the original DIVE-N queue)');
+
 CREATE TABLE IF NOT EXISTS tasks (
   id          INTEGER PRIMARY KEY AUTOINCREMENT,
   ident       TEXT UNIQUE,
+  -- DIVE-484: which project this task belongs to + its per-project number.
+  -- project_key defaults to 'dive' so legacy inserts and old call sites keep
+  -- working; issue_number is the prefix-local sequence (DIVE keeps issue_number
+  -- = the global id for back-compat, new projects count 1,2,3…).
+  project_key  TEXT NOT NULL DEFAULT 'dive' REFERENCES projects(key),
+  issue_number INTEGER,
   title       TEXT NOT NULL,
   body        TEXT,
   status      TEXT NOT NULL DEFAULT 'todo',
@@ -2201,11 +2235,24 @@ CREATE TABLE IF NOT EXISTS agents_org (
 CREATE INDEX IF NOT EXISTS tasks_status_idx   ON tasks(status);
 CREATE INDEX IF NOT EXISTS tasks_assignee_idx ON tasks(assignee, status);
 CREATE INDEX IF NOT EXISTS tasks_parent_idx   ON tasks(parent_id);
+CREATE INDEX IF NOT EXISTS tasks_project_idx  ON tasks(project_key);
 
+-- DIVE-484: derive ident from the task's PROJECT (numbering scheme B). On insert
+-- we bump that project's counter and stamp issue_number + ident=<prefix>-<n>. All
+-- three statements run in the insert's implicit transaction, and tasks.db is a
+-- single-writer store (busy_timeout serializes agents), so the counter can't race.
+-- The tasks.ident UNIQUE index is the backstop. For the seeded 'dive' project the
+-- counter starts at MAX(existing id) (see migration) so new DIVE-N continue the
+-- historical sequence with no renumbering of existing rows.
 CREATE TRIGGER IF NOT EXISTS tasks_ident_ai AFTER INSERT ON tasks
 WHEN NEW.ident IS NULL
 BEGIN
-  UPDATE tasks SET ident='DIVE-'||NEW.id WHERE id=NEW.id;
+  UPDATE projects SET counter = counter + 1 WHERE key = NEW.project_key;
+  UPDATE tasks
+     SET issue_number = (SELECT counter FROM projects WHERE key = NEW.project_key),
+         ident = (SELECT prefix FROM projects WHERE key = NEW.project_key)
+                 || '-' || (SELECT counter FROM projects WHERE key = NEW.project_key)
+   WHERE id = NEW.id;
 END;
 
 -- Touch updated_at on change. The WHEN guard stops the trigger recursing on
@@ -2275,16 +2322,72 @@ _tasks_db_migrate() {
   # Each entry: "<column> <type>". Add new additive columns here; existing
   # rows backfill to NULL. Pure expand (no contract), so old queries/rows are
   # untouched and a downgrade still reads/writes the table fine.
+  # NB project_key uses a constant DEFAULT (no REFERENCES) — sqlite forbids
+  # ADD COLUMN with a foreign key unless the default is NULL. The FK is declared
+  # in _tasks_schema for fresh boxes; on migrated stores the project_key→projects
+  # link is enforced at the app layer (project add/resolve), same as parent_id's
+  # behavior pre-FK. issue_number is the per-project sequence (DIVE-484).
   for c in 'result TEXT' 'need_type TEXT' 'ask TEXT' 'need_options TEXT' 'recommend TEXT' 'need_answer TEXT' 'need_answered_at TEXT' \
            "kind TEXT NOT NULL DEFAULT 'standard'" 'schedule TEXT' 'last_fired_at TEXT' \
            'from_template_id INTEGER' 'fresh INTEGER' \
            'parked_at TEXT' 'park_reason TEXT' 'need_answered_by TEXT' \
-           'escalated_at TEXT' 'escalated_by TEXT'; do
+           'escalated_at TEXT' 'escalated_by TEXT' \
+           "project_key TEXT NOT NULL DEFAULT 'dive'" 'issue_number INTEGER'; do
     if ! printf '%s\n' "$cols" | grep -qx "${c%% *}"; then
       sqlite3 -cmd ".timeout 5000" "$TASKS_DB" \
         "ALTER TABLE tasks ADD COLUMN ${c};" >/dev/null 2>&1 || true
     fi
   done
+
+  # DIVE-484 projects migration — ONE-SHOT, gated on the projects table's absence
+  # so it doesn't take a write lock on every command. Runs after the column loop
+  # above guarantees project_key + issue_number exist. Single transaction:
+  #   * create + seed the default 'dive' project (prefix DIVE, preserving history)
+  #   * backfill legacy rows: issue_number = the existing global id (NO renumber,
+  #     so every current DIVE-<n> ident stays byte-identical)
+  #   * sync dive.counter to MAX so new DIVE-N continue the historical sequence
+  #   * swap the old DIVE-hardcoded ident trigger for the project-aware one
+  local has_projects
+  has_projects=$(sqlite3 -cmd ".timeout 5000" "$TASKS_DB" \
+    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='projects' LIMIT 1;" 2>/dev/null)
+  if [[ "$has_projects" != "1" ]]; then
+    sqlite3 -cmd ".timeout 5000" "$TASKS_DB" <<'MIG' >/dev/null 2>&1 || true
+BEGIN IMMEDIATE;
+CREATE TABLE IF NOT EXISTS projects (
+  key         TEXT PRIMARY KEY,
+  prefix      TEXT NOT NULL UNIQUE,
+  counter     INTEGER NOT NULL DEFAULT 0,
+  name        TEXT,
+  description TEXT,
+  goal        TEXT,
+  folder      TEXT,
+  lead_agent  TEXT,
+  status      TEXT NOT NULL DEFAULT 'active',
+  archived_at TEXT,
+  created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+);
+INSERT OR IGNORE INTO projects (key, prefix, name, description)
+  VALUES ('dive', 'DIVE', 'Dive', 'Default project (the original DIVE-N queue)');
+UPDATE tasks SET project_key='dive' WHERE project_key IS NULL OR project_key='';
+UPDATE tasks SET issue_number = id WHERE issue_number IS NULL;
+UPDATE projects
+   SET counter = (SELECT COALESCE(MAX(issue_number),0) FROM tasks WHERE project_key='dive')
+ WHERE key='dive';
+DROP TRIGGER IF EXISTS tasks_ident_ai;
+CREATE TRIGGER tasks_ident_ai AFTER INSERT ON tasks
+WHEN NEW.ident IS NULL
+BEGIN
+  UPDATE projects SET counter = counter + 1 WHERE key = NEW.project_key;
+  UPDATE tasks
+     SET issue_number = (SELECT counter FROM projects WHERE key = NEW.project_key),
+         ident = (SELECT prefix FROM projects WHERE key = NEW.project_key)
+                 || '-' || (SELECT counter FROM projects WHERE key = NEW.project_key)
+   WHERE id = NEW.id;
+END;
+CREATE INDEX IF NOT EXISTS tasks_project_idx ON tasks(project_key);
+COMMIT;
+MIG
+  fi
 }
 
 # Per-connection setup, passed via -cmd / .timeout so it produces NO output
@@ -2310,18 +2413,22 @@ dbfmt() {
 # validated before anything touches SQL.
 RESOLVED_TASK_ID=""
 resolve_task_id() {
-  local ref="$1" id
+  local ref="$1" found
   if [[ "$ref" =~ ^[0-9]+$ ]]; then
-    id="$ref"
-  elif [[ "$ref" =~ ^[Dd][Ii][Vv][Ee]-([0-9]+)$ ]]; then
-    id="${BASH_REMATCH[1]}"
+    # Bare number = the global row id (unchanged from before).
+    found=$(db "SELECT id FROM tasks WHERE id=${ref};")
+  elif [[ "$ref" =~ ^[A-Za-z]+-[0-9]+$ ]]; then
+    # DIVE-484: any <PREFIX>-<n> ident. Resolve by the ident string (case-
+    # normalized to the stored UPPER prefix) — for non-dive projects the number
+    # is the per-project issue_number, NOT the global id, so a numeric shortcut
+    # would resolve the wrong row.
+    local up="${ref^^}"
+    found=$(db "SELECT id FROM tasks WHERE ident=$(sqlq "$up");")
   else
-    fail "$E_VALIDATION" "bad task ref '$ref' (expected <number> or DIVE-<number>)"
+    fail "$E_VALIDATION" "bad task ref '$ref' (expected <number> or <PREFIX>-<number>, e.g. DIVE-42)"
   fi
-  local found
-  found=$(db "SELECT id FROM tasks WHERE id=${id};")
   [[ -n "$found" ]] || fail "$E_NOT_FOUND" "no such task: $ref"
-  RESOLVED_TASK_ID="$id"
+  RESOLVED_TASK_ID="$found"
 }
 
 # Who is acting: --from wins, else infer from SUDO_USER (sudo path) or $USER
@@ -11996,7 +12103,7 @@ _task_resolve_coordinator() {
 
 cmd_task_add() {
   tasks_db_init
-  local body="" priority="medium" assignee="" parent="" from="" recurring="" fresh=""
+  local body="" priority="medium" assignee="" parent="" from="" recurring="" fresh="" project="dive"
   local -a words=()
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -12004,6 +12111,7 @@ cmd_task_add() {
       --priority=*)  priority="${1#*=}" ;;
       --assignee=*)  assignee="${1#*=}" ;;
       --parent=*)    parent="${1#*=}" ;;
+      --project=*)   project="${1#*=}" ;;
       --from=*)      from="${1#*=}" ;;
       --recurring=*) recurring="${1#*=}" ;;
       --schedule=*)  recurring="${1#*=}" ;;
@@ -12016,7 +12124,7 @@ cmd_task_add() {
     shift
   done
   local title="${words[*]:-}"
-  [[ -n "$title" ]] || fail "$E_USAGE" "usage: 5dive task add <title...> [--body=] [--priority=] [--assignee=] [--parent=] [--recurring=\"<cron>\"]"
+  [[ -n "$title" ]] || fail "$E_USAGE" "usage: 5dive task add <title...> [--body=] [--priority=] [--assignee=] [--parent=] [--project=<key>] [--recurring=\"<cron>\"]"
   valid_task_priority "$priority" || fail "$E_VALIDATION" "bad priority '$priority' (low|medium|high|urgent)"
   # --recurring=<cron> makes this a TEMPLATE (kind='recurring'), not a worked
   # task — the step-2 materializer clones it into a standard todo on schedule.
@@ -12027,6 +12135,15 @@ cmd_task_add() {
     valid_cron_expr "$recurring" || fail "$E_VALIDATION" "bad --recurring '$recurring' (need a 5-field cron expr, e.g. \"0 2 * * *\")"
     [[ -z "$parent" ]] || fail "$E_VALIDATION" "--recurring can't be combined with --parent (a template has no parent)"
     kind="recurring"; schedule_sql=$(sqlq "$recurring")
+  fi
+  # DIVE-484: resolve the target project (default 'dive'). Accept the key
+  # case-insensitively; the row must exist (create one with `5dive project add`).
+  project="${project,,}"
+  local proj_lead
+  proj_lead=$(db "SELECT COALESCE(lead_agent,'') FROM projects WHERE key=$(sqlq "$project") AND status='active';")
+  if [[ -z "$proj_lead" ]]; then
+    db "SELECT 1 FROM projects WHERE key=$(sqlq "$project") AND status='active';" | grep -q 1 \
+      || fail "$E_NOT_FOUND" "no active project '$project' (see: 5dive project ls; create: 5dive project add)"
   fi
   local parent_sql="NULL"
   if [[ -n "$parent" ]]; then
@@ -12044,38 +12161,46 @@ cmd_task_add() {
   # assignee. Default it to the org's coordinator so it always has an owner.
   # Recurring TEMPLATES stay unassigned (they're inert until materialized; the
   # instance gets coordinated when it's cloned as a standard task).
+  # DIVE-333 + DIVE-484: default an unassigned standard task to a coordinator so
+  # the heartbeat can wake an owner. Prefer the PROJECT's own lead_agent; fall
+  # back to the org-wide coordinator when the project has none.
   local auto_coordinated=0
   if [[ -z "$assignee" && "$kind" == "standard" ]]; then
-    assignee=$(_task_resolve_coordinator)
+    assignee="$proj_lead"
+    [[ -z "$assignee" ]] && assignee=$(_task_resolve_coordinator)
     [[ -n "$assignee" ]] && auto_coordinated=1
   fi
   local creator; creator=$(task_actor "$from")
   local id
-  id=$(db "INSERT INTO tasks (title, body, priority, assignee, created_by, parent_id, kind, schedule, fresh)
+  id=$(db "INSERT INTO tasks (title, body, priority, assignee, created_by, parent_id, project_key, kind, schedule, fresh)
            VALUES ($(sqlq "$title"), $(sqlq_or_null "$body"), $(sqlq "$priority"),
-                   $(sqlq_or_null "$assignee"), $(sqlq "$creator"), ${parent_sql},
+                   $(sqlq_or_null "$assignee"), $(sqlq "$creator"), ${parent_sql}, $(sqlq "$project"),
                    $(sqlq "$kind"), ${schedule_sql}, ${fresh_sql});
            SELECT last_insert_rowid();")
+  # Ident is stamped by the AFTER INSERT trigger from the project's counter, so
+  # read it back rather than assuming the DIVE- prefix (DIVE-484).
+  local ident; ident=$(db "SELECT ident FROM tasks WHERE id=${id};")
   if [[ "$kind" == "recurring" ]]; then
-    ok "created recurring DIVE-$id (${recurring}, fresh=$([[ "$fresh_sql" == "1" ]] && echo on || echo off)) — $title" \
-       '{id:($i|tonumber), ident:("DIVE-"+$i), title:$t, priority:$p, assignee:$a, created_by:$c, kind:"recurring", schedule:$s, fresh:($f=="1")}' \
-       --arg i "$id" --arg t "$title" --arg p "$priority" --arg a "${assignee:-}" --arg c "$creator" --arg s "$recurring" --arg f "$fresh_sql"
+    ok "created recurring ${ident} (${recurring}, fresh=$([[ "$fresh_sql" == "1" ]] && echo on || echo off)) — $title" \
+       '{id:($i|tonumber), ident:$id, project:$pr, title:$t, priority:$p, assignee:$a, created_by:$c, kind:"recurring", schedule:$s, fresh:($f=="1")}' \
+       --arg i "$id" --arg id "$ident" --arg pr "$project" --arg t "$title" --arg p "$priority" --arg a "${assignee:-}" --arg c "$creator" --arg s "$recurring" --arg f "$fresh_sql"
   else
     local coord_note=""
     (( auto_coordinated )) && coord_note=" → coordinator: $assignee"
-    ok "created DIVE-$id — $title${coord_note}" \
-       '{id:($i|tonumber), ident:("DIVE-"+$i), title:$t, priority:$p, assignee:$a, created_by:$c, kind:"standard", autoCoordinated:($ac=="1")}' \
-       --arg i "$id" --arg t "$title" --arg p "$priority" --arg a "${assignee:-}" --arg c "$creator" --arg ac "$auto_coordinated"
+    ok "created ${ident} — $title${coord_note}" \
+       '{id:($i|tonumber), ident:$id, project:$pr, title:$t, priority:$p, assignee:$a, created_by:$c, kind:"standard", autoCoordinated:($ac=="1")}' \
+       --arg i "$id" --arg id "$ident" --arg pr "$project" --arg t "$title" --arg p "$priority" --arg a "${assignee:-}" --arg c "$creator" --arg ac "$auto_coordinated"
   fi
 }
 
 cmd_task_ls() {
   tasks_db_init
-  local status="" assignee="" mine=0 all=0 from="" recurring=0
+  local status="" assignee="" mine=0 all=0 from="" recurring=0 project=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --status=*)   status="${1#*=}" ;;
       --assignee=*) assignee="${1#*=}" ;;
+      --project=*)  project="${1#*=}" ;;
       --mine)       mine=1 ;;
       --all)        all=1 ;;
       --recurring)  recurring=1 ;;
@@ -12104,6 +12229,8 @@ cmd_task_ls() {
     order="ORDER BY CASE priority WHEN 'urgent' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2 ELSE 3 END, created_at"
   fi
   [[ -n "$assignee" ]] && where+=" AND assignee=$(sqlq "$assignee")"
+  # DIVE-484: scope to one project by key (case-insensitive).
+  [[ -n "$project" ]] && where+=" AND project_key=$(sqlq "${project,,}")"
   if (( JSON_MODE )); then
     local rows
     rows=$(dbfmt -json "SELECT id, ident, title, status, priority, assignee, created_by, parent_id, created_at, done_at, body, result, need_type, ask, need_options, need_answer, need_answered_at, kind, schedule, last_fired_at, parked_at, park_reason FROM tasks WHERE ${where} ${order};")
@@ -13089,6 +13216,103 @@ cmd_org_rm() {
   [[ -n "$exists" ]] || fail "$E_NOT_FOUND" "agent '$name' is not placed in the org chart"
   db "DELETE FROM agents_org WHERE name=$(sqlq "$name");"
   ok "$name removed from org chart" '{name:$n, removed:true}' --arg n "$name"
+}
+
+# -------- projects (DIVE-484) --------
+#
+# A project groups tasks under its own ident namespace (prefix + per-project
+# counter -> FROG-1, FROG-2 …) and carries lightweight workspace metadata
+# (name/description/goal/folder/lead_agent). The default project is 'dive'
+# (prefix DIVE), seeded by the schema so the original DIVE-N queue is unchanged.
+# Storage lives in the same group-writable tasks.db; see lib/tasks_db.sh.
+
+cmd_project() {
+  local sub="${1:-ls}"; shift || true
+  case "$sub" in
+    add|new)     cmd_project_add "$@" ;;
+    ls|list)     cmd_project_ls "$@" ;;
+    show|view)   cmd_project_show "$@" ;;
+    *)           fail "$E_USAGE" "unknown project command: $sub (add|ls|show)" ;;
+  esac
+}
+
+# slug rule for a project key: lowercase letters, digits, dashes.
+valid_project_key()    { [[ "$1" =~ ^[a-z][a-z0-9-]*$ ]]; }
+# prefix rule: uppercase letters only (the part before '-' in an ident).
+valid_project_prefix() { [[ "$1" =~ ^[A-Z]+$ ]]; }
+
+cmd_project_add() {
+  tasks_db_init
+  local key="" prefix="" name="" description="" goal="" folder="" lead=""
+  local -a words=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --prefix=*)      prefix="${1#*=}" ;;
+      --name=*)        name="${1#*=}" ;;
+      --description=*) description="${1#*=}" ;;
+      --goal=*)        goal="${1#*=}" ;;
+      --folder=*)      folder="${1#*=}" ;;
+      --lead-agent=*)  lead="${1#*=}" ;;
+      -*)              fail "$E_USAGE" "unknown flag: $1" ;;
+      *)               words+=("$1") ;;
+    esac
+    shift
+  done
+  key="${words[0]:-}"
+  [[ -n "$key" ]] || fail "$E_USAGE" "usage: 5dive project add <key> --prefix=FROG [--name=] [--description=] [--goal=] [--folder=] [--lead-agent=]"
+  key="${key,,}"
+  valid_project_key "$key" || fail "$E_VALIDATION" "bad key '$key' (lowercase slug: [a-z][a-z0-9-]*)"
+  # Default the prefix to the upper-cased key when not given (frog -> FROG).
+  [[ -z "$prefix" ]] && prefix="${key^^}"
+  prefix="${prefix^^}"
+  valid_project_prefix "$prefix" || fail "$E_VALIDATION" "bad --prefix '$prefix' (UPPERCASE letters only, e.g. FROG)"
+
+  # Uniqueness: both key and prefix must be free (prefix collisions would make
+  # idents ambiguous across projects).
+  [[ "$(db "SELECT 1 FROM projects WHERE key=$(sqlq "$key");")" == "1" ]] \
+    && fail "$E_VALIDATION" "project key '$key' already exists"
+  [[ "$(db "SELECT 1 FROM projects WHERE prefix=$(sqlq "$prefix");")" == "1" ]] \
+    && fail "$E_VALIDATION" "prefix '$prefix' already in use by another project"
+
+  db "INSERT INTO projects (key, prefix, name, description, goal, folder, lead_agent)
+      VALUES ($(sqlq "$key"), $(sqlq "$prefix"), $(sqlq_or_null "$name"),
+              $(sqlq_or_null "$description"), $(sqlq_or_null "$goal"),
+              $(sqlq_or_null "$folder"), $(sqlq_or_null "$lead"));"
+  ok "created project '$key' (prefix ${prefix}-) — new tasks: 5dive task add --project=$key …" \
+     '{key:$k, prefix:$pr, name:$n, lead_agent:$l}' \
+     --arg k "$key" --arg pr "$prefix" --arg n "${name:-}" --arg l "${lead:-}"
+}
+
+cmd_project_ls() {
+  tasks_db_init
+  if (( JSON_MODE )); then
+    local rows
+    rows=$(dbfmt -json "SELECT key, prefix, counter, name, description, goal, folder, lead_agent, status, created_at FROM projects ORDER BY created_at;")
+    [[ -n "$rows" ]] || rows="[]"
+    printf '%s' "$rows" | jq -c '{ok:true, data:{projects:.}}'
+    return
+  fi
+  dbfmt -box "SELECT key, prefix||'-' AS prefix, counter AS tasks,
+                     COALESCE(name,'') AS name, COALESCE(lead_agent,'-') AS lead,
+                     status
+              FROM projects ORDER BY created_at;"
+}
+
+cmd_project_show() {
+  tasks_db_init
+  local key="${1:-}"
+  [[ -n "$key" ]] || fail "$E_USAGE" "usage: 5dive project show <key>"
+  key="${key,,}"
+  [[ "$(db "SELECT 1 FROM projects WHERE key=$(sqlq "$key");")" == "1" ]] \
+    || fail "$E_NOT_FOUND" "no such project: $key"
+  if (( JSON_MODE )); then
+    dbfmt -json "SELECT * FROM projects WHERE key=$(sqlq "$key");" | jq -c '{ok:true, data:{project:.[0]}}'
+    return
+  fi
+  dbfmt -line "SELECT key, prefix, counter, name, description, goal, folder, lead_agent, status, archived_at, created_at
+               FROM projects WHERE key=$(sqlq "$key");"
+  local n; n=$(db "SELECT COUNT(*) FROM tasks WHERE project_key=$(sqlq "$key") AND kind='standard';")
+  printf '\n%s task(s) in this project. List: 5dive task ls --project=%s\n' "$n" "$key"
 }
 
 # -------- 5dive heartbeat — wake agents that have queued work --------
@@ -15334,12 +15558,17 @@ Auth (lower-level; the dashboard uses these — prefer 'account' for human-drive
   5dive agent auth cancel <session_id>
 
 Tasks (shared queue, sqlite — any agent, no sudo):
-  5dive task add <title...> [--priority=low|medium|high|urgent] [--assignee=<agent>] [--parent=<id>]
-  5dive task ls [--mine] [--status=<s>] [--all]      # open work, priority-ordered
-  5dive task show|start|done|cancel|rm <id|DIVE-N>
-  5dive task assign <id|DIVE-N> <agent>
-  5dive task block <id|DIVE-N> --by=<id|DIVE-N>
+  5dive task add <title...> [--priority=low|medium|high|urgent] [--assignee=<agent>] [--parent=<id>] [--project=<key>]
+  5dive task ls [--mine] [--status=<s>] [--all] [--project=<key>]   # open work, priority-ordered
+  5dive task show|start|done|cancel|rm <id|PREFIX-N>
+  5dive task assign <id|PREFIX-N> <agent>
+  5dive task block <id|PREFIX-N> --by=<id|PREFIX-N>
   # full surface: 5dive task --help
+
+Projects (ident namespaces for the queue; default 'dive' = DIVE-N):
+  5dive project add <key> --prefix=FROG [--name=] [--goal=] [--folder=] [--lead-agent=<agent>]
+  5dive project ls | show <key>
+  # tasks then number per project: FROG-1, FROG-2 …
 
 Org chart (who reports to whom):
   5dive org set <agent> --manager=<agent> [--role=<text>] [--title=<text>]
@@ -15628,6 +15857,10 @@ main() {
     org)
       # Agent org chart (sqlite, same store as tasks). Read/write, no audit/lock.
       cmd_org "$@" ;;
+    project|projects)
+      # Project namespaces for the task queue (DIVE-484). Same group-writable
+      # store as tasks; read/write, no root/lock.
+      cmd_project "$@" ;;
     heartbeat)
       # Wake-on-work scheduler. on/off mutate the registry (lock taken inside
       # cmd_heartbeat); tick is the root cron driver; ls is read-only. No audit

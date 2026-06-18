@@ -152,12 +152,17 @@ Auth (lower-level; the dashboard uses these — prefer 'account' for human-drive
   5dive agent auth cancel <session_id>
 
 Tasks (shared queue, sqlite — any agent, no sudo):
-  5dive task add <title...> [--priority=low|medium|high|urgent] [--assignee=<agent>] [--parent=<id>]
-  5dive task ls [--mine] [--status=<s>] [--all]      # open work, priority-ordered
-  5dive task show|start|done|cancel|rm <id|DIVE-N>
-  5dive task assign <id|DIVE-N> <agent>
-  5dive task block <id|DIVE-N> --by=<id|DIVE-N>
+  5dive task add <title...> [--priority=low|medium|high|urgent] [--assignee=<agent>] [--parent=<id>] [--project=<key>]
+  5dive task ls [--mine] [--status=<s>] [--all] [--project=<key>]   # open work, priority-ordered
+  5dive task show|start|done|cancel|rm <id|PREFIX-N>
+  5dive task assign <id|PREFIX-N> <agent>
+  5dive task block <id|PREFIX-N> --by=<id|PREFIX-N>
   # full surface: 5dive task --help
+
+Projects (ident namespaces for the queue; default 'dive' = DIVE-N):
+  5dive project add <key> --prefix=FROG [--name=] [--goal=] [--folder=] [--lead-agent=<agent>]
+  5dive project ls | show <key>
+  # tasks then number per project: FROG-1, FROG-2 …
 
 Org chart (who reports to whom):
   5dive org set <agent> --manager=<agent> [--role=<text>] [--title=<text>]
@@ -446,6 +451,10 @@ main() {
     org)
       # Agent org chart (sqlite, same store as tasks). Read/write, no audit/lock.
       cmd_org "$@" ;;
+    project|projects)
+      # Project namespaces for the task queue (DIVE-484). Same group-writable
+      # store as tasks; read/write, no root/lock.
+      cmd_project "$@" ;;
     heartbeat)
       # Wake-on-work scheduler. on/off mutate the registry (lock taken inside
       # cmd_heartbeat); tick is the root cron driver; ls is read-only. No audit
