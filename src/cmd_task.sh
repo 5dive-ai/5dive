@@ -42,6 +42,9 @@ _task_usage() {
                                                      # -> blocked, awaiting a human (decision/secret/approval/manual)
   5dive task inbox                                   # list ONLY human-gated tasks, priority-ordered
   5dive task answer <id|DIVE-N> --value="..."        # record the human's answer, unblock, ping the owning agent
+                                                     # approval/secret gates are human-only: blocked for agent-* callers,
+                                                     # and (DIVE-519) require --proof=<token from `5dive gate-proof`> once
+                                                     # `5dive gate-proof enforce on` is set. Trusted paths attach it automatically.
 
   status: todo | in_progress | blocked | done | cancelled
 
@@ -1049,9 +1052,49 @@ cmd_task_inbox() {
   fi
 }
 
+# DIVE-519: `5dive gate-proof <id|DIVE-N> <approval|secret>` — root-only. Mints a
+# human-origin proof token (RAW on stdout, never a --json envelope) that the
+# trusted answer paths attach as --proof to clear an approval/secret gate: the
+# Telegram plugin tap (mintGateProof shells here), the dashboard/shelld injector,
+# and a human on the box (`task answer DIVE-N --proof=$(sudo 5dive gate-proof N approval)`).
+# Subcommand `enforce on|off|status` toggles whether a missing/invalid proof is
+# REJECTED (default off = audit-only) — see _gate_proof_enforced.
+cmd_gate_proof() {
+  if [[ "${1:-}" == "enforce" ]]; then
+    require_root "gate-proof enforce"
+    case "${2:-status}" in
+      on)  : > "$GATE_PROOF_ENFORCE"; chmod 0644 "$GATE_PROOF_ENFORCE" 2>/dev/null || true
+           ok "gate-proof enforcement ON — approval/secret answers now require a valid --proof" ;;
+      off) rm -f "$GATE_PROOF_ENFORCE"
+           ok "gate-proof enforcement OFF — audit-only; approval/secret answers allowed without --proof" ;;
+      status)
+           local _e _k
+           _gate_proof_enforced && _e=on || _e=off
+           [[ -s "$GATE_PROOF_KEY" ]] && _k=present || _k=absent
+           if (( JSON_MODE )); then
+             ok "gate-proof: enforce=$_e key=$_k" '{enforce:$e, key:$k}' --arg e "$_e" --arg k "$_k"
+           else
+             echo "enforce: $_e"; echo "key: $_k"
+           fi ;;
+      *) fail "$E_USAGE" "usage: 5dive gate-proof enforce on|off|status" ;;
+    esac
+    return
+  fi
+  require_root "gate-proof"
+  tasks_db_init
+  local ref="${1:-}" type="${2:-}"
+  [[ -n "$ref" && -n "$type" ]] || fail "$E_USAGE" "usage: 5dive gate-proof <id|DIVE-N> <approval|secret>"
+  [[ "$type" == "approval" || "$type" == "secret" ]] || fail "$E_VALIDATION" "gate-proof type must be approval|secret"
+  _gate_proof_ensure_key || fail "$E_GENERIC" "cannot provision gate-proof key (need root)"
+  resolve_task_id "$ref"; local id="$RESOLVED_TASK_ID"
+  local token; token=$(_gate_proof_mint "$id" "$type") || fail "$E_GENERIC" "failed to mint proof token"
+  audit_log "gate-proof mint" "ok" 0 -- "task=DIVE-$id" "type=$type"
+  printf '%s\n' "$token"   # RAW — consumers (plugin mint, human-on-box) read stdout verbatim
+}
+
 cmd_task_answer() {
   tasks_db_init
-  local value="" value_set=0 from="" human=0
+  local value="" value_set=0 from="" human=0 proof=""
   local -a positional=()
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -1062,6 +1105,9 @@ cmd_task_answer() {
       # provenance in need_answered_by; the enforced boundary for hard-line gates
       # is still root (below), so an agent passing --human gains nothing.
       --human)   human=1 ;;
+      # DIVE-519: human-origin proof token (minted by `5dive gate-proof`) that the
+      # trusted paths attach to clear an approval/secret gate. Verified below.
+      --proof=*) proof="${1#*=}" ;;
       --)        shift; positional+=("$@"); break ;;
       -*)        fail "$E_USAGE" "unknown flag: $1" ;;
       *)         positional+=("$1") ;;
@@ -1098,6 +1144,27 @@ cmd_task_answer() {
       # the root-owned audit log anyway (it would only leak a perms error to
       # stderr). The fail + non-zero exit is the record.
       fail "$E_AUTH_REQUIRED" "DIVE-$id is a '$nt' gate — only a human can clear it. Answer it from Telegram (tap the button) or the dashboard; an agent can't self-answer an approval/secret gate."
+    fi
+  fi
+
+  # DIVE-519: human-origin PROOF — the SECOND line for approval/secret, catching
+  # the agent->sudo->root bypass the agent-* check above can't see. The trusted
+  # paths attach --proof minted from the root-only 0400 key (plugin tap,
+  # dashboard/shelld, human-on-box via `5dive gate-proof`). We ALWAYS audit the
+  # attempt; we only REJECT a missing/invalid proof once enforcement is flipped on
+  # (`gate-proof enforce on`), so this ships DORMANT until the plugin mint is
+  # confirmed live on the box (else live taps that can't mint yet fail closed).
+  # Bar-raise, not airtight: a sudo-agent could mint its own proof, but only via a
+  # loud, audited `sudo 5dive gate-proof` — never a silent one-liner.
+  if [[ "$nt" == "approval" || "$nt" == "secret" ]]; then
+    local _pv=0
+    [[ -n "$proof" ]] && _gate_proof_verify "$id" "$nt" "$proof" && _pv=1
+    local _caller2; _caller2=$(id -un 2>/dev/null || echo '?')
+    audit_log "task answer gate" "$([[ $_pv -eq 1 ]] && echo ok || echo error)" 0 -- \
+      "task=DIVE-$id" "type=$nt" "proof=$([[ -n "$proof" ]] && echo present || echo absent)" \
+      "valid=$_pv" "caller=$_caller2" "sudo_user=${SUDO_USER:-}" "enforce=$(_gate_proof_enforced && echo on || echo off)"
+    if _gate_proof_enforced && (( ! _pv )); then
+      fail "$E_AUTH_REQUIRED" "DIVE-$id ($nt) requires a valid human-proof token. Answer via Telegram tap or the dashboard; a human on the box: 5dive task answer DIVE-$id --proof=\$(sudo 5dive gate-proof $id $nt)"
     fi
   fi
 

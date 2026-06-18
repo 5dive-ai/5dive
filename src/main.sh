@@ -452,6 +452,10 @@ main() {
       # no audit — these are high-frequency, low-risk ops any agent runs. SQLite
       # serializes its own writes (busy_timeout) so with_registry_lock isn't needed.
       cmd_task "$@" ;;
+    gate-proof)
+      # DIVE-519: mint a human-origin proof token for an approval/secret gate (or
+      # toggle enforcement). Root-only (reads the 0400 key); audits its own mint.
+      cmd_gate_proof "$@" ;;
     org)
       # Agent org chart (sqlite, same store as tasks). Read/write, no audit/lock.
       cmd_org "$@" ;;

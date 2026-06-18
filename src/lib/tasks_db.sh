@@ -487,3 +487,84 @@ _cron_matches() {
 # `task show` / `org show`; a plain `printf '  %s\n' "$var"` only indents the
 # first line, and unquoting splits values that contain spaces (task titles).
 indent2() { while IFS= read -r _l; do printf '  %s\n' "$_l"; done; }
+
+# -------- gate-proof: human-origin proof for approval/secret gates (DIVE-519) --------
+#
+# BAR-RAISE + AUDIT, NOT airtight. An agent with sudo is root-equivalent — it can
+# read the key or write the db directly — so this CANNOT stop a determined
+# malicious root agent. What it DOES stop is the real reported failure mode: an
+# over-eager / prompt-injected agent self-clearing an approval/secret gate with a
+# silent one-liner `sudo 5dive task answer` (the DIVE-515/516 incident). To clear
+# such a gate the caller must now present a --proof token minted from a root-only
+# 0400 key, so a bypass requires an explicit, AUDITED `sudo 5dive gate-proof`
+# (loud) instead of a silent answer. Mint + verify share _gate_proof_hmac so they
+# can never drift. The agent-* uid check in cmd_task_answer stays the first line;
+# this is the second, catching the agent->sudo->root bypass.
+#
+# Token: v1:<nonce>:<exp_unix>:<base64url HMAC-SHA256(key, "taskid:needtype:nonce:exp")>
+# Bound to the canonical task id + gate type; TTL <=120s; replay is bounded by the
+# gate's own one-shot need_answered_at (an answered gate can't be re-answered).
+GATE_PROOF_KEY="${STATE_DIR}/gate-proof.key"
+GATE_PROOF_ENFORCE="${STATE_DIR}/gate-proof.enforce"
+GATE_PROOF_TTL=120
+
+# Provision the 0400 root:root key on first use (root only). Group-claude must NOT
+# read it (unlike the group-readable task db) or the bar-raise is moot.
+_gate_proof_ensure_key() {
+  [[ -s "$GATE_PROOF_KEY" ]] && return 0
+  [[ $EUID -eq 0 ]] || return 1
+  ( umask 077; openssl rand -hex 32 > "$GATE_PROOF_KEY" ) 2>/dev/null || return 1
+  chown root:root "$GATE_PROOF_KEY" 2>/dev/null || true
+  chmod 0400 "$GATE_PROOF_KEY" 2>/dev/null || true
+  [[ -s "$GATE_PROOF_KEY" ]]
+}
+
+# HMAC-SHA256(key, payload) -> base64url (unpadded). hexkey avoids binary-in-argv.
+_gate_proof_hmac() {
+  local payload="$1" key
+  key=$(cat "$GATE_PROOF_KEY" 2>/dev/null) || return 1
+  [[ -n "$key" ]] || return 1
+  printf '%s' "$payload" \
+    | openssl dgst -sha256 -mac HMAC -macopt "hexkey:$key" -binary 2>/dev/null \
+    | openssl base64 -A 2>/dev/null | tr '+/' '-_' | tr -d '='
+}
+
+# Constant-time compare: full-length scan, no early exit. Length isn't secret (the
+# mac is fixed-width base64url).
+_gate_proof_ct_equal() {
+  local a="$1" b="$2" i res=0
+  [[ ${#a} -eq ${#b} ]] || return 1
+  for ((i=0; i<${#a}; i++)); do
+    [[ "${a:i:1}" == "${b:i:1}" ]] || res=1
+  done
+  return $res
+}
+
+# Mint a token for <canonical_id> <type>. Returns the RAW token on stdout.
+_gate_proof_mint() {
+  local id="$1" type="$2" nonce exp mac
+  nonce=$(openssl rand -hex 8 2>/dev/null) || return 1
+  exp=$(( $(date +%s) + GATE_PROOF_TTL ))
+  mac=$(_gate_proof_hmac "${id}:${type}:${nonce}:${exp}") || return 1
+  [[ -n "$mac" ]] || return 1
+  printf 'v1:%s:%s:%s' "$nonce" "$exp" "$mac"
+}
+
+# Verify <canonical_id> <type> <token>. 0 = structurally valid, unexpired, matches.
+_gate_proof_verify() {
+  local id="$1" type="$2" token="$3"
+  [[ "$token" == v1:*:*:* ]] || return 1
+  local body="${token#v1:}"
+  local nonce="${body%%:*}"; body="${body#*:}"
+  local exp="${body%%:*}";   local mac="${body#*:}"
+  [[ "$nonce" =~ ^[0-9a-f]+$ && "$exp" =~ ^[0-9]+$ && -n "$mac" ]] || return 1
+  (( exp >= $(date +%s) )) || return 1
+  local expect; expect=$(_gate_proof_hmac "${id}:${type}:${nonce}:${exp}") || return 1
+  [[ -n "$expect" ]] || return 1
+  _gate_proof_ct_equal "$mac" "$expect"
+}
+
+# Enforcement is OFF until the sentinel exists. DIVE-519 ships DORMANT (audit-only):
+# flip on only after the plugin mint is confirmed live on the box, else live taps
+# that can't mint yet would fail closed. Root toggles it.
+_gate_proof_enforced() { [[ -f "$GATE_PROOF_ENFORCE" ]]; }

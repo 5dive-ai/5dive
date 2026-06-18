@@ -26,7 +26,7 @@ esac
 
 # Bumped on every public release. `build.sh` checks this line exists; CI fails
 # the bundle-drift check if it's missing or empty.
-readonly FIVE_VERSION="0.3.22"
+readonly FIVE_VERSION="0.3.23"
 
 # GitHub org our repos live under. The org is being renamed
 # 5dive-com -> 5dive-ai (2026-06); fetches must work on either side of the
@@ -2557,6 +2557,87 @@ _cron_matches() {
 # `task show` / `org show`; a plain `printf '  %s\n' "$var"` only indents the
 # first line, and unquoting splits values that contain spaces (task titles).
 indent2() { while IFS= read -r _l; do printf '  %s\n' "$_l"; done; }
+
+# -------- gate-proof: human-origin proof for approval/secret gates (DIVE-519) --------
+#
+# BAR-RAISE + AUDIT, NOT airtight. An agent with sudo is root-equivalent — it can
+# read the key or write the db directly — so this CANNOT stop a determined
+# malicious root agent. What it DOES stop is the real reported failure mode: an
+# over-eager / prompt-injected agent self-clearing an approval/secret gate with a
+# silent one-liner `sudo 5dive task answer` (the DIVE-515/516 incident). To clear
+# such a gate the caller must now present a --proof token minted from a root-only
+# 0400 key, so a bypass requires an explicit, AUDITED `sudo 5dive gate-proof`
+# (loud) instead of a silent answer. Mint + verify share _gate_proof_hmac so they
+# can never drift. The agent-* uid check in cmd_task_answer stays the first line;
+# this is the second, catching the agent->sudo->root bypass.
+#
+# Token: v1:<nonce>:<exp_unix>:<base64url HMAC-SHA256(key, "taskid:needtype:nonce:exp")>
+# Bound to the canonical task id + gate type; TTL <=120s; replay is bounded by the
+# gate's own one-shot need_answered_at (an answered gate can't be re-answered).
+GATE_PROOF_KEY="${STATE_DIR}/gate-proof.key"
+GATE_PROOF_ENFORCE="${STATE_DIR}/gate-proof.enforce"
+GATE_PROOF_TTL=120
+
+# Provision the 0400 root:root key on first use (root only). Group-claude must NOT
+# read it (unlike the group-readable task db) or the bar-raise is moot.
+_gate_proof_ensure_key() {
+  [[ -s "$GATE_PROOF_KEY" ]] && return 0
+  [[ $EUID -eq 0 ]] || return 1
+  ( umask 077; openssl rand -hex 32 > "$GATE_PROOF_KEY" ) 2>/dev/null || return 1
+  chown root:root "$GATE_PROOF_KEY" 2>/dev/null || true
+  chmod 0400 "$GATE_PROOF_KEY" 2>/dev/null || true
+  [[ -s "$GATE_PROOF_KEY" ]]
+}
+
+# HMAC-SHA256(key, payload) -> base64url (unpadded). hexkey avoids binary-in-argv.
+_gate_proof_hmac() {
+  local payload="$1" key
+  key=$(cat "$GATE_PROOF_KEY" 2>/dev/null) || return 1
+  [[ -n "$key" ]] || return 1
+  printf '%s' "$payload" \
+    | openssl dgst -sha256 -mac HMAC -macopt "hexkey:$key" -binary 2>/dev/null \
+    | openssl base64 -A 2>/dev/null | tr '+/' '-_' | tr -d '='
+}
+
+# Constant-time compare: full-length scan, no early exit. Length isn't secret (the
+# mac is fixed-width base64url).
+_gate_proof_ct_equal() {
+  local a="$1" b="$2" i res=0
+  [[ ${#a} -eq ${#b} ]] || return 1
+  for ((i=0; i<${#a}; i++)); do
+    [[ "${a:i:1}" == "${b:i:1}" ]] || res=1
+  done
+  return $res
+}
+
+# Mint a token for <canonical_id> <type>. Returns the RAW token on stdout.
+_gate_proof_mint() {
+  local id="$1" type="$2" nonce exp mac
+  nonce=$(openssl rand -hex 8 2>/dev/null) || return 1
+  exp=$(( $(date +%s) + GATE_PROOF_TTL ))
+  mac=$(_gate_proof_hmac "${id}:${type}:${nonce}:${exp}") || return 1
+  [[ -n "$mac" ]] || return 1
+  printf 'v1:%s:%s:%s' "$nonce" "$exp" "$mac"
+}
+
+# Verify <canonical_id> <type> <token>. 0 = structurally valid, unexpired, matches.
+_gate_proof_verify() {
+  local id="$1" type="$2" token="$3"
+  [[ "$token" == v1:*:*:* ]] || return 1
+  local body="${token#v1:}"
+  local nonce="${body%%:*}"; body="${body#*:}"
+  local exp="${body%%:*}";   local mac="${body#*:}"
+  [[ "$nonce" =~ ^[0-9a-f]+$ && "$exp" =~ ^[0-9]+$ && -n "$mac" ]] || return 1
+  (( exp >= $(date +%s) )) || return 1
+  local expect; expect=$(_gate_proof_hmac "${id}:${type}:${nonce}:${exp}") || return 1
+  [[ -n "$expect" ]] || return 1
+  _gate_proof_ct_equal "$mac" "$expect"
+}
+
+# Enforcement is OFF until the sentinel exists. DIVE-519 ships DORMANT (audit-only):
+# flip on only after the plugin mint is confirmed live on the box, else live taps
+# that can't mint yet would fail closed. Root toggles it.
+_gate_proof_enforced() { [[ -f "$GATE_PROOF_ENFORCE" ]]; }
 
 # -------- auth status (per type, default profile) --------
 
@@ -12076,6 +12157,9 @@ _task_usage() {
                                                      # -> blocked, awaiting a human (decision/secret/approval/manual)
   5dive task inbox                                   # list ONLY human-gated tasks, priority-ordered
   5dive task answer <id|DIVE-N> --value="..."        # record the human's answer, unblock, ping the owning agent
+                                                     # approval/secret gates are human-only: blocked for agent-* callers,
+                                                     # and (DIVE-519) require --proof=<token from `5dive gate-proof`> once
+                                                     # `5dive gate-proof enforce on` is set. Trusted paths attach it automatically.
 
   status: todo | in_progress | blocked | done | cancelled
 
@@ -13083,9 +13167,49 @@ cmd_task_inbox() {
   fi
 }
 
+# DIVE-519: `5dive gate-proof <id|DIVE-N> <approval|secret>` — root-only. Mints a
+# human-origin proof token (RAW on stdout, never a --json envelope) that the
+# trusted answer paths attach as --proof to clear an approval/secret gate: the
+# Telegram plugin tap (mintGateProof shells here), the dashboard/shelld injector,
+# and a human on the box (`task answer DIVE-N --proof=$(sudo 5dive gate-proof N approval)`).
+# Subcommand `enforce on|off|status` toggles whether a missing/invalid proof is
+# REJECTED (default off = audit-only) — see _gate_proof_enforced.
+cmd_gate_proof() {
+  if [[ "${1:-}" == "enforce" ]]; then
+    require_root "gate-proof enforce"
+    case "${2:-status}" in
+      on)  : > "$GATE_PROOF_ENFORCE"; chmod 0644 "$GATE_PROOF_ENFORCE" 2>/dev/null || true
+           ok "gate-proof enforcement ON — approval/secret answers now require a valid --proof" ;;
+      off) rm -f "$GATE_PROOF_ENFORCE"
+           ok "gate-proof enforcement OFF — audit-only; approval/secret answers allowed without --proof" ;;
+      status)
+           local _e _k
+           _gate_proof_enforced && _e=on || _e=off
+           [[ -s "$GATE_PROOF_KEY" ]] && _k=present || _k=absent
+           if (( JSON_MODE )); then
+             ok "gate-proof: enforce=$_e key=$_k" '{enforce:$e, key:$k}' --arg e "$_e" --arg k "$_k"
+           else
+             echo "enforce: $_e"; echo "key: $_k"
+           fi ;;
+      *) fail "$E_USAGE" "usage: 5dive gate-proof enforce on|off|status" ;;
+    esac
+    return
+  fi
+  require_root "gate-proof"
+  tasks_db_init
+  local ref="${1:-}" type="${2:-}"
+  [[ -n "$ref" && -n "$type" ]] || fail "$E_USAGE" "usage: 5dive gate-proof <id|DIVE-N> <approval|secret>"
+  [[ "$type" == "approval" || "$type" == "secret" ]] || fail "$E_VALIDATION" "gate-proof type must be approval|secret"
+  _gate_proof_ensure_key || fail "$E_GENERIC" "cannot provision gate-proof key (need root)"
+  resolve_task_id "$ref"; local id="$RESOLVED_TASK_ID"
+  local token; token=$(_gate_proof_mint "$id" "$type") || fail "$E_GENERIC" "failed to mint proof token"
+  audit_log "gate-proof mint" "ok" 0 -- "task=DIVE-$id" "type=$type"
+  printf '%s\n' "$token"   # RAW — consumers (plugin mint, human-on-box) read stdout verbatim
+}
+
 cmd_task_answer() {
   tasks_db_init
-  local value="" value_set=0 from="" human=0
+  local value="" value_set=0 from="" human=0 proof=""
   local -a positional=()
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -13096,6 +13220,9 @@ cmd_task_answer() {
       # provenance in need_answered_by; the enforced boundary for hard-line gates
       # is still root (below), so an agent passing --human gains nothing.
       --human)   human=1 ;;
+      # DIVE-519: human-origin proof token (minted by `5dive gate-proof`) that the
+      # trusted paths attach to clear an approval/secret gate. Verified below.
+      --proof=*) proof="${1#*=}" ;;
       --)        shift; positional+=("$@"); break ;;
       -*)        fail "$E_USAGE" "unknown flag: $1" ;;
       *)         positional+=("$1") ;;
@@ -13132,6 +13259,27 @@ cmd_task_answer() {
       # the root-owned audit log anyway (it would only leak a perms error to
       # stderr). The fail + non-zero exit is the record.
       fail "$E_AUTH_REQUIRED" "DIVE-$id is a '$nt' gate — only a human can clear it. Answer it from Telegram (tap the button) or the dashboard; an agent can't self-answer an approval/secret gate."
+    fi
+  fi
+
+  # DIVE-519: human-origin PROOF — the SECOND line for approval/secret, catching
+  # the agent->sudo->root bypass the agent-* check above can't see. The trusted
+  # paths attach --proof minted from the root-only 0400 key (plugin tap,
+  # dashboard/shelld, human-on-box via `5dive gate-proof`). We ALWAYS audit the
+  # attempt; we only REJECT a missing/invalid proof once enforcement is flipped on
+  # (`gate-proof enforce on`), so this ships DORMANT until the plugin mint is
+  # confirmed live on the box (else live taps that can't mint yet fail closed).
+  # Bar-raise, not airtight: a sudo-agent could mint its own proof, but only via a
+  # loud, audited `sudo 5dive gate-proof` — never a silent one-liner.
+  if [[ "$nt" == "approval" || "$nt" == "secret" ]]; then
+    local _pv=0
+    [[ -n "$proof" ]] && _gate_proof_verify "$id" "$nt" "$proof" && _pv=1
+    local _caller2; _caller2=$(id -un 2>/dev/null || echo '?')
+    audit_log "task answer gate" "$([[ $_pv -eq 1 ]] && echo ok || echo error)" 0 -- \
+      "task=DIVE-$id" "type=$nt" "proof=$([[ -n "$proof" ]] && echo present || echo absent)" \
+      "valid=$_pv" "caller=$_caller2" "sudo_user=${SUDO_USER:-}" "enforce=$(_gate_proof_enforced && echo on || echo off)"
+    if _gate_proof_enforced && (( ! _pv )); then
+      fail "$E_AUTH_REQUIRED" "DIVE-$id ($nt) requires a valid human-proof token. Answer via Telegram tap or the dashboard; a human on the box: 5dive task answer DIVE-$id --proof=\$(sudo 5dive gate-proof $id $nt)"
     fi
   fi
 
@@ -16199,6 +16347,10 @@ main() {
       # no audit — these are high-frequency, low-risk ops any agent runs. SQLite
       # serializes its own writes (busy_timeout) so with_registry_lock isn't needed.
       cmd_task "$@" ;;
+    gate-proof)
+      # DIVE-519: mint a human-origin proof token for an approval/secret gate (or
+      # toggle enforcement). Root-only (reads the 0400 key); audits its own mint.
+      cmd_gate_proof "$@" ;;
     org)
       # Agent org chart (sqlite, same store as tasks). Read/write, no audit/lock.
       cmd_org "$@" ;;
