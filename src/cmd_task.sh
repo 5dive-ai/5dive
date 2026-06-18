@@ -22,6 +22,9 @@ _task_usage() {
                                                      # run a check; exit 0 => proven-done (flips to done,
                                                      # captures output tail). Verb exits 0/1 = the verdict.
                                                      # --cmd optional: falls back to the task's stored --verify command.
+  5dive task reject <id|DIVE-N> [--feedback="<what to fix>"]
+                                                     # verifier's FAIL verdict (DIVE-477): bounce back to the maker
+                                                     # for another pass, or escalate to a human at max_iterations.
   5dive task cancel <id|DIVE-N> [--result=<text>]    # -> cancelled; --result captures why
   5dive task block   <id|DIVE-N> --by=<id|DIVE-N>    # add a blocks edge, mark blocked
   5dive task unblock <id|DIVE-N> [--by=<id|DIVE-N>]  # drop edge(s); back to todo if clear
@@ -37,6 +40,14 @@ _task_usage() {
   5dive task answer <id|DIVE-N> --value="..."        # record the human's answer, unblock, ping the owning agent
 
   status: todo | in_progress | blocked | done | cancelled
+
+  Maker→verifier loop (DIVE-477): give a task a --verifier (≠ its assignee) and the
+  maker's 'task done' does NOT close it — it hands off to the verifier (re-queued as
+  their todo; the heartbeat wakes them). The verifier grades against acceptance_criteria
+  / runs 'task verify', then closes it ('task done', which closes for real since
+  verifier==assignee) on PASS or 'task reject --feedback=' on FAIL (bounce back to the
+  maker, or escalate to a human at max_iterations). Writer never grades itself.
+
   Any agent (group claude) can run these without sudo. Add --json for machine output.
 USAGE
 }
@@ -53,6 +64,7 @@ cmd_task() {
     start)           cmd_task_start "$@" ;;
     done|close)      cmd_task_done "$@" ;;
     verify)          cmd_task_verify "$@" ;;
+    reject)          cmd_task_reject "$@" ;;
     cancel)          cmd_task_cancel "$@" ;;
     block)           cmd_task_block "$@" ;;
     unblock)         cmd_task_unblock "$@" ;;
@@ -284,10 +296,13 @@ cmd_task_show() {
         CASE WHEN acceptance_criteria IS NOT NULL THEN 'acceptance_criteria: '||acceptance_criteria||x'0a' ELSE '' END||
         CASE WHEN verify_command      IS NOT NULL THEN 'verify_command: '||verify_command||x'0a' ELSE '' END||
         CASE WHEN max_iterations      IS NOT NULL THEN 'max_iterations: '||max_iterations||x'0a' ELSE '' END||
-        CASE WHEN verifier            IS NOT NULL THEN 'verifier: '||verifier ELSE '' END
+        CASE WHEN verifier            IS NOT NULL THEN 'verifier: '||verifier||x'0a' ELSE '' END||
+        CASE WHEN maker_agent         IS NOT NULL THEN 'maker: '||maker_agent||x'0a' ELSE '' END||
+        CASE WHEN iteration           IS NOT NULL THEN 'iteration: '||iteration ELSE '' END
       FROM tasks WHERE id=${id}
         AND (acceptance_criteria IS NOT NULL OR verify_command IS NOT NULL
-             OR max_iterations IS NOT NULL OR verifier IS NOT NULL);")
+             OR max_iterations IS NOT NULL OR verifier IS NOT NULL
+             OR maker_agent IS NOT NULL OR iteration IS NOT NULL);")
     [[ -n "$loopspec" ]] && { echo; echo "loop spec:"; printf '%s\n' "$loopspec" | sed -e 's/[[:space:]]*$//' | indent2; }
     local subs
     subs=$(db "SELECT ident||'  ['||status||']  '||title FROM tasks WHERE parent_id=${id} ORDER BY id;")
@@ -332,6 +347,23 @@ _task_status_cmd() {
   done
   [[ ${#positional[@]} -gt 0 ]] || fail "$E_USAGE" "usage: 5dive task $verb <id|DIVE-N> [--result=<text>] [--notify]"
   resolve_task_id "${positional[0]}"; local id="$RESOLVED_TASK_ID"
+  # DIVE-477: maker→verifier routing. A `task done` on a task that carries a
+  # `verifier` distinct from its current assignee is NOT a close — it's a handoff.
+  # The maker is claiming the work is ready; the verifier must grade it before the
+  # task can close (writer != grader). Route it to the verifier and let the
+  # heartbeat wake them on the next tick; the verifier closes it for real (its own
+  # `task done`, where verifier==assignee, falls through to a normal close) or
+  # rejects it (`task reject` → bounce back to the maker). Opt-in: ordinary tasks
+  # (verifier NULL) and the verifier's own close are untouched.
+  if [[ "$verb" == "done" ]]; then
+    local _vfier _asignee
+    _vfier=$(db "SELECT COALESCE(verifier,'')  FROM tasks WHERE id=${id};")
+    _asignee=$(db "SELECT COALESCE(assignee,'') FROM tasks WHERE id=${id};")
+    if [[ -n "$_vfier" && "$_vfier" != "$_asignee" ]]; then
+      _task_route_to_verifier "$id" "$_vfier" "$_asignee" "$result" "$want_result"
+      return
+    fi
+  fi
   local set_result=""
   if (( want_result )); then
     set_result=", result=$(sqlq_or_null "$result")"
@@ -361,6 +393,72 @@ _task_status_cmd() {
 cmd_task_start()  { _task_status_cmd in_progress ", started_at=COALESCE(started_at, datetime('now'))" start "$@"; }
 cmd_task_done()   { _task_status_cmd done ", done_at=datetime('now')" done "$@"; }
 cmd_task_cancel() { _task_status_cmd cancelled ", done_at=datetime('now')" cancel "$@"; }
+
+# DIVE-477: hand a maker-completed task to its verifier instead of closing it.
+# Stash the original maker (first writer wins, so it survives re-routes) so a
+# verify FAIL can bounce straight back, bump the iteration counter, keep the
+# maker's result, and re-queue the task to the verifier as a fresh todo — the
+# heartbeat picks it up on the verifier's next tick exactly like any other todo
+# in their queue (no heartbeat change needed). No status='done' is written: the
+# work is not closed until the verifier signs off.
+_task_route_to_verifier() {
+  local id="$1" vfier="$2" maker="$3" result="$4" want_result="$5"
+  local set_result=""
+  (( want_result )) && set_result=", result=$(sqlq_or_null "$result")"
+  db "UPDATE tasks
+        SET status='todo', assignee=$(sqlq "$vfier"),
+            maker_agent=COALESCE(maker_agent, $(sqlq_or_null "$maker")),
+            iteration=COALESCE(iteration,0)+1,
+            started_at=NULL${set_result}
+      WHERE id=${id};"
+  local iter; iter=$(db "SELECT iteration FROM tasks WHERE id=${id};")
+  ok "DIVE-$id ready for review — routed to verifier '$vfier' (iteration $iter)" \
+     '{id:($i|tonumber), status:"todo", routedTo:$v, role:"verifier", iteration:($n|tonumber)}' \
+     --arg i "$id" --arg v "$vfier" --arg n "$iter"
+}
+
+# DIVE-477: the verifier's FAIL verdict. The maker's work missed the bar, so
+# bounce the task back to the maker with feedback for another pass — UNLESS we've
+# reached max_iterations, where the loop is stuck and we park it on a human
+# (`task need`) rather than ping-pong forever. Only meaningful mid-loop
+# (maker_agent set); a plain task has no maker to bounce to.
+cmd_task_reject() {
+  tasks_db_init
+  local task="" feedback=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --feedback=*) feedback="${1#*=}" ;;
+      --reason=*)   feedback="${1#*=}" ;;
+      -*)           fail "$E_USAGE" "unknown flag: $1" ;;
+      *)            [[ -z "$task" ]] && task="$1" || fail "$E_USAGE" "unexpected arg: $1" ;;
+    esac
+    shift
+  done
+  [[ -n "$task" ]] || fail "$E_USAGE" "usage: 5dive task reject <id|DIVE-N> [--feedback=\"<what to fix>\"]"
+  resolve_task_id "$task"; local id="$RESOLVED_TASK_ID"
+  local maker iter maxi vfier
+  maker=$(db "SELECT COALESCE(maker_agent,'')    FROM tasks WHERE id=${id};")
+  iter=$(db  "SELECT COALESCE(iteration,0)       FROM tasks WHERE id=${id};")
+  maxi=$(db  "SELECT COALESCE(max_iterations,0)  FROM tasks WHERE id=${id};")
+  vfier=$(db "SELECT COALESCE(verifier,'')       FROM tasks WHERE id=${id};")
+  [[ -n "$maker" ]] || fail "$E_VALIDATION" \
+    "DIVE-$id is not in a maker→verifier loop (no maker to bounce to) — use 'task need'/'task block' for a plain rejection"
+  local fb_txt="❌ verifier '${vfier:-?}' rejected (iteration ${iter}): ${feedback:-no feedback given}"
+  # max_iterations reached -> stop bouncing, park it on a human to decide.
+  if (( maxi > 0 && iter >= maxi )); then
+    db "UPDATE tasks SET result=$(sqlq "$fb_txt") WHERE id=${id};"
+    warn "DIVE-$id hit max_iterations ($maxi) — escalating to human review"
+    cmd_task_need "$id" --type=manual --from="${vfier:-verifier}" \
+      --ask="Maker→verifier loop stuck: DIVE-$id failed verification ${iter}× (max ${maxi}). Last feedback: ${feedback:-none}. Review + decide."
+    return
+  fi
+  # Otherwise bounce back to the maker for another pass.
+  db "UPDATE tasks SET status='todo', assignee=$(sqlq "$maker"), started_at=NULL,
+        result=$(sqlq "$fb_txt") WHERE id=${id};"
+  ok "DIVE-$id rejected — bounced back to maker '$maker' (iteration $iter${maxi:+/$maxi})" \
+     '{id:($i|tonumber), status:"todo", bouncedTo:$m, role:"maker", iteration:($n|tonumber)}' \
+     --arg i "$id" --arg m "$maker" --arg n "$iter"
+}
 
 # DIVE-475: deterministic verify-runner — proven-done, not claimed-done. Run a
 # command; its EXIT CODE is the real stop condition. On pass (exit 0) flip the

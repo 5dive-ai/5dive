@@ -157,7 +157,15 @@ CREATE TABLE IF NOT EXISTS tasks (
   acceptance_criteria TEXT,
   verify_command      TEXT,
   max_iterations      INTEGER,
-  verifier            TEXT
+  verifier            TEXT,
+  -- DIVE-477: maker→verifier loop state. iteration = how many times the maker has
+  -- handed off to the verifier (bumped on each `task done` that routes, not on
+  -- bounce-back). maker_agent = the original maker, stashed at first handoff so a
+  -- verify FAIL (`task reject`) can bounce the task straight back to them; it
+  -- survives re-routes (COALESCE keeps the first writer). Both NULL until a task
+  -- enters a loop (verifier set + maker hands off).
+  iteration           INTEGER,
+  maker_agent         TEXT
 );
 
 CREATE TABLE IF NOT EXISTS task_deps (
@@ -275,7 +283,8 @@ _tasks_db_migrate() {
            'parked_at TEXT' 'park_reason TEXT' 'need_answered_by TEXT' \
            'escalated_at TEXT' 'escalated_by TEXT' \
            "project_key TEXT NOT NULL DEFAULT 'dive'" 'issue_number INTEGER' \
-           'acceptance_criteria TEXT' 'verify_command TEXT' 'max_iterations INTEGER' 'verifier TEXT'; do
+           'acceptance_criteria TEXT' 'verify_command TEXT' 'max_iterations INTEGER' 'verifier TEXT' \
+           'iteration INTEGER' 'maker_agent TEXT'; do
     if ! printf '%s\n' "$cols" | grep -qx "${c%% *}"; then
       sqlite3 -cmd ".timeout 5000" "$TASKS_DB" \
         "ALTER TABLE tasks ADD COLUMN ${c};" >/dev/null 2>&1 || true
