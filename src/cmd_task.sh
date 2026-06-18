@@ -1156,15 +1156,26 @@ cmd_task_answer() {
   # confirmed live on the box (else live taps that can't mint yet fail closed).
   # Bar-raise, not airtight: a sudo-agent could mint its own proof, but only via a
   # loud, audited `sudo 5dive gate-proof` — never a silent one-liner.
+  #
+  # DIVE-525 (UX): a HUMAN's tap must NEVER be rejected — "you tapped but it's not
+  # enough" is the exact confusion lodar hit dogfooding. So when enforcement is on
+  # we reject ONLY an agent-path answer (no --human) that lacks a valid proof. A
+  # --human answer (the trusted plugin tap / dashboard / human-on-box paths all set
+  # it) ALWAYS clears, even if the box couldn't mint a proof yet (mid-rollout) — we
+  # still audit it (valid=0 + human=1 flags a rollout gap, never a dead-ended human).
+  # The agent-* uid block above + this agent-path-needs-proof rule are what actually
+  # stop the DIVE-515/516 incident (an agent silently self-clearing); humans are
+  # never blocked. Consistent with the agreed bar-raise scope (not airtight).
   if [[ "$nt" == "approval" || "$nt" == "secret" ]]; then
     local _pv=0
     [[ -n "$proof" ]] && _gate_proof_verify "$id" "$nt" "$proof" && _pv=1
     local _caller2; _caller2=$(id -un 2>/dev/null || echo '?')
     audit_log "task answer gate" "$([[ $_pv -eq 1 ]] && echo ok || echo error)" 0 -- \
       "task=DIVE-$id" "type=$nt" "proof=$([[ -n "$proof" ]] && echo present || echo absent)" \
-      "valid=$_pv" "caller=$_caller2" "sudo_user=${SUDO_USER:-}" "enforce=$(_gate_proof_enforced && echo on || echo off)"
-    if _gate_proof_enforced && (( ! _pv )); then
-      fail "$E_AUTH_REQUIRED" "DIVE-$id ($nt) requires a valid human-proof token. Answer via Telegram tap or the dashboard; a human on the box: 5dive task answer DIVE-$id --proof=\$(sudo 5dive gate-proof $id $nt)"
+      "valid=$_pv" "human=$human" "caller=$_caller2" "sudo_user=${SUDO_USER:-}" "enforce=$(_gate_proof_enforced && echo on || echo off)"
+    # Reject only the agent path (no --human) without a valid proof. Human taps clear.
+    if _gate_proof_enforced && (( ! _pv )) && (( ! human )); then
+      fail "$E_AUTH_REQUIRED" "DIVE-$id ($nt) needs a human to approve it — answer from Telegram (tap the button) or the dashboard. (An agent can't self-clear an approval/secret gate.)"
     fi
   fi
 
