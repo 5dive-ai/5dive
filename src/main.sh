@@ -257,6 +257,10 @@ main() {
         import)
           AUDIT_CMD="agent import"; AUDIT_ARGS=("$@")
           with_registry_lock cmd_import "$@" ;;
+        marketplace)
+          # DIVE-473/509: browse the character-pack git registry (read-only).
+          AUDIT_CMD="agent marketplace"; AUDIT_ARGS=("$@")
+          cmd_marketplace "$@" ;;
         start)
           AUDIT_CMD="agent start"; AUDIT_ARGS=("$@")
           with_registry_lock cmd_start "$@" ;;

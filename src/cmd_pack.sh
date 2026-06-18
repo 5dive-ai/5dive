@@ -20,6 +20,84 @@
 
 PACK_FORMAT_VERSION=1
 
+# -------- character-pack git registry (DIVE-473/509) -----------------------
+# The marketplace is a curated GitHub repo (<org>/character-packs) that the CLI
+# reads directly — no api.5dive.com dependency, same pattern as <org>/skills.
+# A bare slug to `agent import` resolves here; `agent marketplace ls` browses it.
+
+_marketplace_base() { echo "https://raw.githubusercontent.com/$(gh_org)/character-packs/main"; }
+
+_marketplace_index() { curl -fsSL --max-time 20 "$(_marketplace_base)/index.json" 2>/dev/null; }
+
+# Resolve registry pack <slug> → a local .tar.gz (same shape `agent export` writes,
+# so cmd_import's existing flow is unchanged). Echoes the path; returns 1 if absent.
+_marketplace_fetch_pack() {
+  local slug="$1" base idx entry path
+  base=$(_marketplace_base)
+  idx=$(_marketplace_index) || return 1
+  entry=$(jq -e --arg s "$slug" '.packs[] | select(.slug==$s)' <<<"$idx" 2>/dev/null) || return 1
+  path=$(jq -r '.path // empty' <<<"$entry"); [[ -n "$path" ]] || return 1
+  local dl; dl=$(mktemp -d)
+  curl -fsSL --max-time 20 "$base/$path/manifest.json" -o "$dl/manifest.json" 2>/dev/null \
+    || { rm -rf "$dl"; return 1; }
+  local f
+  for f in CLAUDE.md card.md avatar.png; do
+    curl -fsSL --max-time 20 "$base/$path/$f" -o "$dl/$f" 2>/dev/null || true
+  done
+  # Bundled skill bodies (manifest.skills[] names → skills/<id>/SKILL.md), so a
+  # pack imports self-contained even if a skill isn't in a published repo.
+  local id
+  while IFS= read -r id; do
+    [[ -z "$id" ]] && continue
+    id="${id##*#}"; id="${id##*/}"
+    [[ "$id" =~ ^[A-Za-z0-9._-]+$ ]] || continue
+    if curl -fsSL --max-time 20 "$base/$path/skills/$id/SKILL.md" -o "$dl/.probe" 2>/dev/null; then
+      mkdir -p "$dl/skills/$id"; mv "$dl/.probe" "$dl/skills/$id/SKILL.md"
+    fi
+  done < <(jq -r '.skills[]? // empty' "$dl/manifest.json" 2>/dev/null)
+  rm -f "$dl/.probe"
+  local out; out=$(mktemp --suffix=.tar.gz)
+  tar -czf "$out" -C "$dl" . 2>/dev/null || { rm -rf "$dl" "$out"; return 1; }
+  rm -rf "$dl"; echo "$out"
+}
+
+# Install a bundled skill (a local <dir>/SKILL.md) directly into the agent's
+# skills dir — used on import when the pack carries the skill body.
+_install_bundled_skill() {
+  local name="$1" id="$2" srcdir="$3"
+  [[ -f "$srcdir/SKILL.md" ]] || return 1
+  local user="agent-${name}" home="/home/agent-${name}" type install_dir
+  type=$(agent_type "$name"); [[ -n "$type" ]] || return 1
+  install_dir="${SKILLS_INSTALL_DIR[$type]:-.claude/skills}"
+  local dest="$home/$install_dir/$id"
+  rm -rf "$dest"; mkdir -p "$home/$install_dir" || return 1
+  cp -r "$srcdir" "$dest" || return 1
+  chown -R "${user}:${user}" "$dest" 2>/dev/null || true
+  return 0
+}
+
+# `5dive agent marketplace [ls]` — browse the character-pack registry.
+cmd_marketplace() {
+  local sub="${1:-ls}"; [[ $# -gt 0 ]] && shift
+  case "$sub" in
+    ls|list|browse)
+      local idx; idx=$(_marketplace_index) \
+        || fail "$E_GENERIC" "could not reach the character-pack registry ($(_marketplace_base))"
+      jq -e '.packs' >/dev/null 2>&1 <<<"$idx" \
+        || fail "$E_GENERIC" "registry index is malformed"
+      if (( JSON_MODE )); then
+        ok "" '{registry:($org+"/character-packs"), packs:($idx.packs)}' \
+           --arg org "$(gh_org)" --argjson idx "$idx"
+      else
+        echo "Character packs — import any with: 5dive agent import <slug> --as=<name>"
+        echo
+        jq -r '.packs[] | "  \(.slug)\t\(.name) — \(.tagline)"' <<<"$idx" | column -t -s $'\t'
+      fi
+      ;;
+    *) fail "$E_USAGE" "usage: 5dive agent marketplace [ls]" ;;
+  esac
+}
+
 _pack_usage() {
   cat <<USAGE
 5dive agent export / import — portable agent packs (DIVE-39)
@@ -32,10 +110,13 @@ _pack_usage() {
                                   #      user/feedback facts excluded) for you to review + edit.
                                   #   2) export <name> --approve-memory=<draft dir>  -> seals the
                                   #      reviewed memory into the pack. Nothing is packed unreviewed.
-  5dive agent import <pack> --as=<name> [--channels=none|telegram|discord]
+  5dive agent marketplace [ls]    # browse the character-pack registry (<org>/character-packs)
+  5dive agent import <pack|slug> --as=<name> [--channels=none|telegram|discord]
                             [--telegram-token=<tok>] [--discord-token=<tok>]
                             [--auth-profile=<name>] [--workdir=<path>]
                                   # recreate an agent from a pack into a FRESH name.
+                                  # <pack> = a .tar.gz file OR a bare registry slug
+                                  # (e.g. `import lilbro --as=...`) pulled from the git registry.
                                   # Packs carry no secrets: supply the new agent's own
                                   # token/auth-profile here. Skills are re-added from their
                                   # recorded refs (skills not in a published repo are skipped
@@ -298,7 +379,19 @@ cmd_import() {
   done
   [[ -n "$pack" ]] || fail "$E_USAGE" "usage: 5dive agent import <pack> --as=<name> [--channels=...] [--telegram-token=...] [--discord-token=...] [--auth-profile=...] [--workdir=...]"
   [[ -n "$as" ]]   || fail "$E_USAGE" "--as=<name> is required (the new agent's name)"
-  [[ -f "$pack" ]] || fail "$E_NOT_FOUND" "pack not found: $pack"
+
+  # A bare slug (not a local file) → resolve from the character-pack git registry.
+  local resolved_tmp=""
+  if [[ ! -f "$pack" ]]; then
+    if [[ "$pack" =~ ^[a-z0-9][a-z0-9_-]*$ ]]; then
+      step "Resolving '$pack' from the character-pack registry"
+      resolved_tmp=$(_marketplace_fetch_pack "$pack") \
+        || fail "$E_NOT_FOUND" "no pack '$pack' in the registry (browse: 5dive agent marketplace ls)"
+      pack="$resolved_tmp"
+    else
+      fail "$E_NOT_FOUND" "pack not found: $pack"
+    fi
+  fi
 
   # Reject an existing target up front — import recreates, it never overlays.
   local reg; reg=$(registry_read)
@@ -308,7 +401,8 @@ cmd_import() {
   # Unpack into an isolated stage and validate the manifest before touching anything.
   local stage; stage=$(mktemp -d)
   tar -xzf "$pack" -C "$stage" 2>/dev/null \
-    || { rm -rf "$stage"; fail "$E_GENERIC" "could not read pack (expected a .tar.gz from 'agent export')"; }
+    || { rm -rf "$stage" "$resolved_tmp"; fail "$E_GENERIC" "could not read pack (expected a .tar.gz from 'agent export')"; }
+  [[ -n "$resolved_tmp" ]] && rm -f "$resolved_tmp"
   [[ -f "$stage/manifest.json" ]] \
     || { rm -rf "$stage"; fail "$E_VALIDATION" "pack has no manifest.json — not a 5dive agent pack"; }
 
@@ -373,6 +467,14 @@ cmd_import() {
     install -o "agent-${as}" -g "agent-${as}" -m 644 "$stage/CLAUDE.md" "$cdir/CLAUDE.md" 2>/dev/null || true
   fi
 
+  # Stash the character avatar so the onboarding/Telegram flow (DIVE-494) can set
+  # it as the agent's profile photo. We only preserve it here; we never set it.
+  local avatar_note="none"
+  if [[ -f "$stage/avatar.png" ]]; then
+    install -o "agent-${as}" -g "agent-${as}" -m 644 "$stage/avatar.png" "$cdir/avatar.png" 2>/dev/null \
+      && avatar_note="$cdir/avatar.png"
+  fi
+
   # Layer model/effort/hooks/plugins into settings.json (claude-only keys; others
   # ignore them). settings.json may not exist until first boot.
   if [[ "$type" == "claude" ]]; then
@@ -433,7 +535,11 @@ cmd_import() {
     [[ -z "$sk" ]] && continue
     pair=$(parse_skill_spec "$sk" 2>/dev/null) || { skipped+=("$sk"); continue; }
     src="${pair% *}"; id="${pair#* }"
-    if ( cmd_skill_add "$as" --source="$src" --skill="$id" ) >/dev/null 2>&1; then
+    # Prefer a skill body bundled in the pack (self-contained); fall back to the
+    # recorded source ref (resolved from a published repo).
+    if [[ -f "$stage/skills/$id/SKILL.md" ]] && _install_bundled_skill "$as" "$id" "$stage/skills/$id"; then
+      added+=("$id")
+    elif ( cmd_skill_add "$as" --source="$src" --skill="$id" ) >/dev/null 2>&1; then
       added+=("$id")
     else
       skipped+=("$sk")
@@ -447,7 +553,7 @@ cmd_import() {
   skipped_j=$(printf '%s\n' "${skipped[@]+"${skipped[@]}"}" | jq -R . | jq -cs 'map(select(. != ""))')
   local mem_note="no memory"
   [[ "$mem_inc" == "distilled" ]] && mem_note="distilled memory -> $mem_seeded"
-  ok "imported '$as' from pack ($mem_note). Skills added: ${#added[@]}, skipped: ${#skipped[@]}; template: $templated." \
-     '{name:$n, type:$t, memory:$mem, memorySeeded:$ms, skillsAdded:$a, skillsSkipped:$s, template:$tpl}' \
-     --arg n "$as" --arg t "$type" --arg mem "$mem_inc" --arg ms "$mem_seeded" --argjson a "$added_j" --argjson s "$skipped_j" --arg tpl "$templated"
+  ok "imported '$as' from pack ($mem_note). Skills added: ${#added[@]}, skipped: ${#skipped[@]}; template: $templated; avatar: $avatar_note." \
+     '{name:$n, type:$t, memory:$mem, memorySeeded:$ms, skillsAdded:$a, skillsSkipped:$s, template:$tpl, avatar:$av}' \
+     --arg n "$as" --arg t "$type" --arg mem "$mem_inc" --arg ms "$mem_seeded" --argjson a "$added_j" --argjson s "$skipped_j" --arg tpl "$templated" --arg av "$avatar_note"
 }
