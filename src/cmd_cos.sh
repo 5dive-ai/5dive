@@ -58,12 +58,31 @@ async function call<T = unknown>(token: string, method: string, params: Record<s
 
 export type CosIdentity = { id: number; username: string; canManageBots: boolean };
 
+/** A Telegram failure that means the TOKEN itself is dead — the bot was deleted
+ *  and recreated (Telegram issues a new token and deactivates the old one we
+ *  cached), revoked, or otherwise invalid. Distinct from a transient/transport
+ *  error so callers can give actionable "re-set the token" guidance instead of
+ *  leaking the raw "Forbidden: user is deactivated". (DIVE-482) */
+export function isStaleToken(r: { error_code?: number; description?: string }): boolean {
+  const code = r.error_code;
+  const d = (r.description ?? "").toLowerCase();
+  return code === 401 || code === 403
+    || d.includes("deactivated") || d.includes("unauthorized")
+    || d.includes("bot was blocked") || d.includes("token is invalid");
+}
+
 /** Verify a token is a usable CoS: reachable AND has Bot Management Mode on. */
 export async function verifyCos(cosToken: string): Promise<
-  { ok: true; cos: CosIdentity } | { ok: false; reason: "unreachable" | "not_manager"; detail?: string }
+  { ok: true; cos: CosIdentity } | { ok: false; reason: "stale_token" | "unreachable" | "not_manager"; detail?: string }
 > {
   const me = await call<{ id: number; username: string; can_manage_bots?: boolean }>(cosToken, "getMe");
-  if (!me.ok) return { ok: false, reason: "unreachable", detail: me.description };
+  if (!me.ok) {
+    // DIVE-482: a dead token (deleted+recreated CoS, revoked, …) is not the same
+    // as "Telegram unreachable" — flag it so claim can tell the customer to
+    // re-set the token rather than failing with a cryptic Telegram error.
+    if (isStaleToken(me)) return { ok: false, reason: "stale_token", detail: me.description };
+    return { ok: false, reason: "unreachable", detail: me.description };
+  }
   if (!me.result.can_manage_bots)
     return { ok: false, reason: "not_manager", detail: "Bot Management Mode is off (BotFather → Bot Settings → Bot Management Mode → ON)" };
   return { ok: true, cos: { id: me.result.id, username: me.result.username, canManageBots: true } };
@@ -109,10 +128,11 @@ export async function awaitMintedChild(
   return { ok: false, reason: "timeout" };
 }
 
-/** Fetch the bot token of a child the CoS manages. */
-export async function getChildToken(cosToken: string, childBotId: number): Promise<{ ok: true; token: string } | { ok: false; detail?: string }> {
+/** Fetch the bot token of a child the CoS manages. `stale` marks a dead-token
+ *  failure (DIVE-482) so the caller can self-heal/re-mint instead of bailing. */
+export async function getChildToken(cosToken: string, childBotId: number): Promise<{ ok: true; token: string } | { ok: false; detail?: string; stale?: boolean }> {
   const r = await call<string | { token: string }>(cosToken, "getManagedBotToken", { user_id: childBotId });
-  if (!r.ok) return { ok: false, detail: r.description };
+  if (!r.ok) return { ok: false, detail: r.description, stale: isStaleToken(r) };
   const token = typeof r.result === "string" ? r.result : r.result.token;
   return { ok: true, token };
 }
@@ -272,12 +292,31 @@ try {
     const suggested = arg("suggested");
     const name = arg("name");
     if (!suggested || !name) out({ ok: false, detail: "--suggested and --name required" });
+    // DIVE-482: fail fast + clearly if the CoS token itself is dead (the customer
+    // deleted+recreated the CoS bot → Telegram issued a new token and deactivated
+    // the one we cached). No manager sits above a per-customer CoS, so we cannot
+    // auto-refetch it — tell them exactly how to fix it instead of surfacing a
+    // cryptic "Forbidden: user is deactivated" from a downstream call. (getMe is
+    // not getUpdates, so this never 409s against an always-on listener.)
+    const cosCheck = await verifyCos(token);
+    if (!cosCheck.ok && cosCheck.reason === "stale_token")
+      out({ ok: false, reason: "cos_token_stale", detail: "Your Chief-of-Staff bot token is no longer valid — the bot looks deleted/recreated (Telegram issues a NEW token and deactivates the old one). Re-run `5dive agent cos set --token=<new token from BotFather>`. Tip: don't delete & recreate a bot with the same name — make a new one, or rotate the token in BotFather." });
+    if (!cosCheck.ok && cosCheck.reason === "not_manager")
+      out({ ok: false, reason: "not_manager", detail: cosCheck.detail });
+    if (!cosCheck.ok)
+      out({ ok: false, reason: "error", detail: cosCheck.detail });
     const timeoutMs = Number(arg("timeout-ms") ?? 15_000);
     const minted = CLAIM_SPOOL_DIR
       ? await awaitMintedChildFromSpool(CLAIM_SPOOL_DIR, { targetUsername: suggested, timeoutMs })
       : await awaitMintedChild(token, { targetUsername: suggested, timeoutMs });
     if (!minted.ok) out({ ok: false, reason: minted.reason, detail: (minted as any).detail });
     const t = await getChildToken(token, minted.child.botId);
+    if (!t.ok && t.stale)
+      // DIVE-482: CoS is alive (verified above) but the just-minted child token is
+      // already dead — the child username was deleted+recreated, so the mint event
+      // we read points at a now-deactivated bot. Re-mint it cleanly (don't reuse a
+      // deleted bot's name) rather than failing cryptically.
+      out({ ok: false, reason: "child_token_stale", detail: `The bot @${minted.child.username} was just minted but its token is already invalid — it was likely deleted & recreated under the same name. Delete it in your CoS and create a fresh one (a new name avoids Telegram's deactivated-token reuse).` });
     if (!t.ok) out({ ok: false, detail: t.detail });
     const avatarPath = arg("avatar");
     const display = name!.charAt(0).toUpperCase() + name!.slice(1);

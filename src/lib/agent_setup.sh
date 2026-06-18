@@ -117,9 +117,14 @@ JSON
   if [[ -x /usr/local/lib/5dive/statusline.sh ]]; then
     status_line_obj='{statusLine: {type: "command", command: "bash /usr/local/lib/5dive/statusline.sh"}}'
   fi
+  # model: the FULL resolved id, NOT the bare "opus" alias. CC v2.1.181 ships a
+  # one-time startup migration (migrationVersion 13, fires on ANY launch — not
+  # just /config) that STRIPS a bare alias model:"opus" from a FRESH config dir,
+  # so a new agent would lose its pin on first boot and fall back to the default
+  # model. Valid ids (claude-opus-4-8) are left untouched. See DIVE-506.
   local settings
   settings=$(jq -n --argjson sl "$(jq -n "$status_line_obj")" --arg ghorg "$(gh_org)" '{
-    model: "opus",
+    model: "claude-opus-4-8",
     effortLevel: "high",
     permissions: {
       defaultMode: "bypassPermissions",

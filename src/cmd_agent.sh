@@ -796,6 +796,14 @@ cmd_create() {
           # (20 free / 40 with Telegram Premium). Name both so a whale is not
           # left guessing. (DIVE-323)
           fail "$E_TIMEOUT" "no bot @$telegram_cos appeared within the claim window — either you have not tapped the Create link in Telegram yet, or your Chief of Staff has hit its managed-bot limit (20 free, 40 with Telegram Premium). Tap the link to create it, or free a slot / upgrade to Premium, then retry"
+        elif [[ "$_cos_reason" == "cos_token_stale" || "$_cos_reason" == "child_token_stale" ]]; then
+          # DIVE-482: the CoS (or the just-minted child) token is dead — the bot
+          # was deleted+recreated, so Telegram issued a new token and deactivated
+          # the one we cached. Surface the runner's actionable detail as a
+          # validation error (not a generic JSON blob) so the dashboard can route
+          # the user to re-paste / rotate the token instead of a cryptic failure.
+          local _cos_detail; _cos_detail=$(jq -r '.detail // empty' <<<"$_cos_json" 2>/dev/null)
+          fail "$E_VALIDATION" "${_cos_detail:-Your Chief-of-Staff bot token is no longer valid — rotate it in BotFather and re-run: 5dive agent cos set --token=<new token>}"
         elif (( _cos_rc == E_NOT_FOUND )); then
           fail "$E_NOT_FOUND" "no Chief-of-Staff bot configured — run: 5dive agent cos set --token=<token>"
         fi
