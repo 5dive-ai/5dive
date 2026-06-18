@@ -26,7 +26,7 @@ esac
 
 # Bumped on every public release. `build.sh` checks this line exists; CI fails
 # the bundle-drift check if it's missing or empty.
-readonly FIVE_VERSION="0.3.21"
+readonly FIVE_VERSION="0.3.22"
 
 # GitHub org our repos live under. The org is being renamed
 # 5dive-com -> 5dive-ai (2026-06); fetches must work on either side of the
@@ -12059,6 +12059,10 @@ _task_usage() {
   5dive task reject <id|DIVE-N> [--feedback="<what to fix>"]
                                                      # verifier's FAIL verdict (DIVE-477): bounce back to the maker
                                                      # for another pass, or escalate to a human at max_iterations.
+  5dive task loops [--stuck] [--all] [--escalate-stuck]
+                                                     # observability (DIVE-478): board of maker→verifier loops with
+                                                     # iteration/cap + ⚠ stuck flag. --escalate-stuck pings agent+human.
+                                                     # Tokens/cost per loop: see `5dive usage` (same task ids).
   5dive task cancel <id|DIVE-N> [--result=<text>]    # -> cancelled; --result captures why
   5dive task block   <id|DIVE-N> --by=<id|DIVE-N>    # add a blocks edge, mark blocked
   5dive task unblock <id|DIVE-N> [--by=<id|DIVE-N>]  # drop edge(s); back to todo if clear
@@ -12099,6 +12103,7 @@ cmd_task() {
     done|close)      cmd_task_done "$@" ;;
     verify)          cmd_task_verify "$@" ;;
     reject)          cmd_task_reject "$@" ;;
+    loops)           cmd_task_loops "$@" ;;
     cancel)          cmd_task_cancel "$@" ;;
     block)           cmd_task_block "$@" ;;
     unblock)         cmd_task_unblock "$@" ;;
@@ -12492,6 +12497,77 @@ cmd_task_reject() {
   ok "DIVE-$id rejected — bounced back to maker '$maker' (iteration $iter${maxi:+/$maxi})" \
      '{id:($i|tonumber), status:"todo", bouncedTo:$m, role:"maker", iteration:($n|tonumber)}' \
      --arg i "$id" --arg m "$maker" --arg n "$iter"
+}
+
+# DIVE-478: loop observability. The org-wide board of maker→verifier loops (any
+# task with a verifier), grouped by task id, showing where each loop sits — the
+# maker/verifier pair, who currently holds it, iteration vs its cap, and a ⚠ STUCK
+# flag when a loop has burned its whole max_iterations budget but still isn't
+# closed (it should have escalated via `task reject` at the cap; this surfaces any
+# that slipped through, e.g. a maker that kept re-routing without a clean reject).
+# Pairs with `5dive usage`, which attributes tokens/turns/cost to the same task
+# ids — so loops here + usage there give iterations AND cost per loop.
+#   --stuck            only the stuck loops
+#   --all              include closed loops (default: open only)
+#   --escalate-stuck   run `task escalate` on every stuck open loop (reuses the
+#                      standard escalate path: bump priority + ping agent & human)
+cmd_task_loops() {
+  tasks_db_init
+  local only_stuck=0 show_all=0 escalate=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --stuck)          only_stuck=1 ;;
+      --all)            show_all=1 ;;
+      --escalate-stuck) escalate=1; only_stuck=1 ;;
+      -*)               fail "$E_USAGE" "unknown flag: $1" ;;
+      *)                fail "$E_USAGE" "unexpected arg: $1" ;;
+    esac
+    shift
+  done
+  # A loop is "stuck" once it has a cap, has reached it, and still isn't closed.
+  local stuck_pred="(verifier IS NOT NULL AND max_iterations IS NOT NULL
+                     AND COALESCE(iteration,0) >= max_iterations
+                     AND status NOT IN ('done','cancelled'))"
+  local where="verifier IS NOT NULL"
+  (( show_all )) || where+=" AND status NOT IN ('done','cancelled')"
+  (( only_stuck )) && where+=" AND ${stuck_pred}"
+
+  # --escalate-stuck: reuse the standard escalate path on every stuck open loop.
+  if (( escalate )); then
+    local ids; ids=$(db "SELECT id FROM tasks WHERE ${stuck_pred} ORDER BY id;")
+    if [[ -z "$ids" ]]; then
+      ok "no stuck loops to escalate" '{escalated:[]}'
+      return
+    fi
+    local eid
+    for eid in $ids; do cmd_task_escalate "$eid" --from=loop-watch || true; done
+    return
+  fi
+
+  # COALESCE(maker_agent, assignee): before the first handoff maker_agent is NULL
+  # and the assignee IS the maker; after handoff maker_agent holds the maker and
+  # the assignee is the verifier. Either way this resolves to the maker.
+  if (( JSON_MODE )); then
+    local rows
+    rows=$(dbfmt -json "SELECT ident, status,
+             COALESCE(maker_agent, assignee) AS maker, verifier,
+             COALESCE(iteration,0) AS iteration, max_iterations,
+             COALESCE(assignee,'') AS holder,
+             CASE WHEN ${stuck_pred} THEN 1 ELSE 0 END AS stuck, title
+           FROM tasks WHERE ${where}
+           ORDER BY (CASE WHEN ${stuck_pred} THEN 1 ELSE 0 END) DESC, COALESCE(iteration,0) DESC, id;")
+    [[ -n "$rows" ]] || rows="[]"
+    printf '%s' "$rows" | jq -c '{ok:true, data:{loops:.}}'
+  else
+    dbfmt -box "SELECT ident, status,
+             COALESCE(maker_agent, COALESCE(assignee,'-')) AS maker,
+             COALESCE(verifier,'-') AS verifier,
+             COALESCE(iteration,0)||'/'||COALESCE(CAST(max_iterations AS TEXT),'∞') AS iter,
+             CASE WHEN ${stuck_pred} THEN '⚠' ELSE '' END AS stuck,
+             title
+           FROM tasks WHERE ${where}
+           ORDER BY (CASE WHEN ${stuck_pred} THEN 1 ELSE 0 END) DESC, COALESCE(iteration,0) DESC, ident;"
+  fi
 }
 
 # DIVE-475: deterministic verify-runner — proven-done, not claimed-done. Run a
@@ -14714,7 +14790,7 @@ try:
     con = sqlite3.connect(task_db)
     con.row_factory = sqlite3.Row
     rows = con.execute(
-        "SELECT ident,title,assignee,started_at,done_at FROM tasks "
+        "SELECT ident,title,assignee,started_at,done_at,iteration FROM tasks "
         "WHERE started_at IS NOT NULL AND assignee IS NOT NULL"
     ).fetchall()
     con.close()
@@ -14733,6 +14809,7 @@ for r in rows:
     wins.setdefault(a, []).append({
         "ident": r["ident"], "title": r["title"] or "",
         "start": s, "end": e, "total": 0, "output": 0, "turns": 0,
+        "iteration": r["iteration"],   # DIVE-478: maker→verifier loop round (NULL if not a loop)
     })
 for a in wins:
     wins[a].sort(key=lambda w: w["start"], reverse=True)
@@ -14755,7 +14832,8 @@ for a in wins:
     for w in wins[a]:
         if w["turns"]:
             tasks.append({"ident":w["ident"],"title":w["title"],"assignee":a,
-                          "total":w["total"],"output":w["output"],"turns":w["turns"]})
+                          "total":w["total"],"output":w["output"],"turns":w["turns"],
+                          "iteration":w["iteration"]})
 
 print(json.dumps({
     "window": {"since": since, "now": now},
@@ -14845,9 +14923,11 @@ usage_render_board() {
   jq -r "$USAGE_JQ_HELPERS"'
     if (.tasks | length) == 0 then "  (no task-attributed turns in window)"
     else
-      (["TASK","AGENT","OUTPUT","TOTAL","TITLE"] | @tsv),
+      (["TASK","AGENT","ITER","OUTPUT","TOTAL","TITLE"] | @tsv),
       (.tasks | sort_by(-.total)[:12][] |
-        [ .ident, .assignee, (.output|htok), (.total|htok),
+        [ .ident, .assignee,
+          (if (.iteration // 0) > 0 then (.iteration|tostring) else "-" end),
+          (.output|htok), (.total|htok),
           (.title | if length > 42 then .[:41] + "…" else . end) ] | @tsv)
     end' <<<"$data" | column -t -s $'\t' | sed 's/^/  /'
 

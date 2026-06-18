@@ -147,7 +147,7 @@ try:
     con = sqlite3.connect(task_db)
     con.row_factory = sqlite3.Row
     rows = con.execute(
-        "SELECT ident,title,assignee,started_at,done_at FROM tasks "
+        "SELECT ident,title,assignee,started_at,done_at,iteration FROM tasks "
         "WHERE started_at IS NOT NULL AND assignee IS NOT NULL"
     ).fetchall()
     con.close()
@@ -166,6 +166,7 @@ for r in rows:
     wins.setdefault(a, []).append({
         "ident": r["ident"], "title": r["title"] or "",
         "start": s, "end": e, "total": 0, "output": 0, "turns": 0,
+        "iteration": r["iteration"],   # DIVE-478: maker→verifier loop round (NULL if not a loop)
     })
 for a in wins:
     wins[a].sort(key=lambda w: w["start"], reverse=True)
@@ -188,7 +189,8 @@ for a in wins:
     for w in wins[a]:
         if w["turns"]:
             tasks.append({"ident":w["ident"],"title":w["title"],"assignee":a,
-                          "total":w["total"],"output":w["output"],"turns":w["turns"]})
+                          "total":w["total"],"output":w["output"],"turns":w["turns"],
+                          "iteration":w["iteration"]})
 
 print(json.dumps({
     "window": {"since": since, "now": now},
@@ -278,9 +280,11 @@ usage_render_board() {
   jq -r "$USAGE_JQ_HELPERS"'
     if (.tasks | length) == 0 then "  (no task-attributed turns in window)"
     else
-      (["TASK","AGENT","OUTPUT","TOTAL","TITLE"] | @tsv),
+      (["TASK","AGENT","ITER","OUTPUT","TOTAL","TITLE"] | @tsv),
       (.tasks | sort_by(-.total)[:12][] |
-        [ .ident, .assignee, (.output|htok), (.total|htok),
+        [ .ident, .assignee,
+          (if (.iteration // 0) > 0 then (.iteration|tostring) else "-" end),
+          (.output|htok), (.total|htok),
           (.title | if length > 42 then .[:41] + "…" else . end) ] | @tsv)
     end' <<<"$data" | column -t -s $'\t' | sed 's/^/  /'
 
