@@ -145,7 +145,19 @@ CREATE TABLE IF NOT EXISTS tasks (
   -- pref copied onto each instance: when 1 the heartbeat sends /clear before
   -- working it regardless of the agent-level fresh setting.
   from_template_id INTEGER,
-  fresh            INTEGER
+  fresh            INTEGER,
+  -- DIVE-476: loop-spec columns — make a task's verify loop declarative + durable
+  -- so the (c) deterministic verify-runner (DIVE-475) reads its inputs off the row
+  -- instead of every caller re-passing them. acceptance_criteria = the human-
+  -- readable done definition the verifier grades against; verify_command = the
+  -- shell command `task verify` runs when --cmd is omitted (its exit code is the
+  -- stop condition); max_iterations = the maker→verifier loop cap before
+  -- stuck→escalate (DIVE-478); verifier = the agent that grades, separate from the
+  -- maker (writer != grader, DIVE-477). All NULL for ordinary tasks.
+  acceptance_criteria TEXT,
+  verify_command      TEXT,
+  max_iterations      INTEGER,
+  verifier            TEXT
 );
 
 CREATE TABLE IF NOT EXISTS task_deps (
@@ -262,7 +274,8 @@ _tasks_db_migrate() {
            'from_template_id INTEGER' 'fresh INTEGER' \
            'parked_at TEXT' 'park_reason TEXT' 'need_answered_by TEXT' \
            'escalated_at TEXT' 'escalated_by TEXT' \
-           "project_key TEXT NOT NULL DEFAULT 'dive'" 'issue_number INTEGER'; do
+           "project_key TEXT NOT NULL DEFAULT 'dive'" 'issue_number INTEGER' \
+           'acceptance_criteria TEXT' 'verify_command TEXT' 'max_iterations INTEGER' 'verifier TEXT'; do
     if ! printf '%s\n' "$cols" | grep -qx "${c%% *}"; then
       sqlite3 -cmd ".timeout 5000" "$TASKS_DB" \
         "ALTER TABLE tasks ADD COLUMN ${c};" >/dev/null 2>&1 || true

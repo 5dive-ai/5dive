@@ -26,7 +26,7 @@ esac
 
 # Bumped on every public release. `build.sh` checks this line exists; CI fails
 # the bundle-drift check if it's missing or empty.
-readonly FIVE_VERSION="0.3.19"
+readonly FIVE_VERSION="0.3.20"
 
 # GitHub org our repos live under. The org is being renamed
 # 5dive-com -> 5dive-ai (2026-06); fetches must work on either side of the
@@ -2215,7 +2215,19 @@ CREATE TABLE IF NOT EXISTS tasks (
   -- pref copied onto each instance: when 1 the heartbeat sends /clear before
   -- working it regardless of the agent-level fresh setting.
   from_template_id INTEGER,
-  fresh            INTEGER
+  fresh            INTEGER,
+  -- DIVE-476: loop-spec columns — make a task's verify loop declarative + durable
+  -- so the (c) deterministic verify-runner (DIVE-475) reads its inputs off the row
+  -- instead of every caller re-passing them. acceptance_criteria = the human-
+  -- readable done definition the verifier grades against; verify_command = the
+  -- shell command `task verify` runs when --cmd is omitted (its exit code is the
+  -- stop condition); max_iterations = the maker→verifier loop cap before
+  -- stuck→escalate (DIVE-478); verifier = the agent that grades, separate from the
+  -- maker (writer != grader, DIVE-477). All NULL for ordinary tasks.
+  acceptance_criteria TEXT,
+  verify_command      TEXT,
+  max_iterations      INTEGER,
+  verifier            TEXT
 );
 
 CREATE TABLE IF NOT EXISTS task_deps (
@@ -2332,7 +2344,8 @@ _tasks_db_migrate() {
            'from_template_id INTEGER' 'fresh INTEGER' \
            'parked_at TEXT' 'park_reason TEXT' 'need_answered_by TEXT' \
            'escalated_at TEXT' 'escalated_by TEXT' \
-           "project_key TEXT NOT NULL DEFAULT 'dive'" 'issue_number INTEGER'; do
+           "project_key TEXT NOT NULL DEFAULT 'dive'" 'issue_number INTEGER' \
+           'acceptance_criteria TEXT' 'verify_command TEXT' 'max_iterations INTEGER' 'verifier TEXT'; do
     if ! printf '%s\n' "$cols" | grep -qx "${c%% *}"; then
       sqlite3 -cmd ".timeout 5000" "$TASKS_DB" \
         "ALTER TABLE tasks ADD COLUMN ${c};" >/dev/null 2>&1 || true
@@ -12021,15 +12034,19 @@ _task_usage() {
   5dive task add <title...> [--body=<text>] [--priority=low|medium|high|urgent]
                             [--assignee=<agent>] [--parent=<id|DIVE-N>] [--from=<who>]
                             [--recurring="<cron>"]  # recurring=template (5-field cron, e.g. "0 2 * * *")
+                            [--accept=<criteria>] [--verify=<cmd>] [--max-iters=<n>] [--verifier=<agent>]
+                                                     # loop spec: declarative verify loop (DIVE-476). --verify is
+                                                     # the default cmd for `task verify`; --verifier grades (writer!=grader)
   5dive task ls [--status=<s>] [--assignee=<agent>] [--mine] [--all] [--recurring]
                                                      # default: open tasks, priority-ordered; --recurring: templates
   5dive task show <id|DIVE-N>                        # full detail + subtasks + blockers
   5dive task assign <id|DIVE-N> <agent>
   5dive task start  <id|DIVE-N>                      # -> in_progress
   5dive task done   <id|DIVE-N> [--result=<text>]    # -> done; --result captures the agent's response
-  5dive task verify <id|DIVE-N> --cmd="<command>" [--no-done] [--timeout=<s>]
+  5dive task verify <id|DIVE-N> [--cmd="<command>"] [--no-done] [--timeout=<s>]
                                                      # run a check; exit 0 => proven-done (flips to done,
                                                      # captures output tail). Verb exits 0/1 = the verdict.
+                                                     # --cmd optional: falls back to the task's stored --verify command.
   5dive task cancel <id|DIVE-N> [--result=<text>]    # -> cancelled; --result captures why
   5dive task block   <id|DIVE-N> --by=<id|DIVE-N>    # add a blocks edge, mark blocked
   5dive task unblock <id|DIVE-N> [--by=<id|DIVE-N>]  # drop edge(s); back to todo if clear
@@ -12104,6 +12121,7 @@ _task_resolve_coordinator() {
 cmd_task_add() {
   tasks_db_init
   local body="" priority="medium" assignee="" parent="" from="" recurring="" fresh="" project="dive"
+  local accept="" verify_cmd="" max_iters="" verifier=""
   local -a words=()
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -12117,6 +12135,12 @@ cmd_task_add() {
       --schedule=*)  recurring="${1#*=}" ;;
       --fresh)       fresh="1" ;;
       --no-fresh)    fresh="0" ;;
+      # DIVE-476: loop-spec — declarative verify loop persisted on the row so the
+      # (c) verify-runner reads its inputs off the task instead of re-passing them.
+      --accept=*)    accept="${1#*=}" ;;
+      --verify=*)    verify_cmd="${1#*=}" ;;
+      --max-iters=*) max_iters="${1#*=}" ;;
+      --verifier=*)  verifier="${1#*=}" ;;
       --)            shift; words+=("$@"); break ;;
       -*)            fail "$E_USAGE" "unknown flag: $1" ;;
       *)             words+=("$1") ;;
@@ -12126,6 +12150,9 @@ cmd_task_add() {
   local title="${words[*]:-}"
   [[ -n "$title" ]] || fail "$E_USAGE" "usage: 5dive task add <title...> [--body=] [--priority=] [--assignee=] [--parent=] [--project=<key>] [--recurring=\"<cron>\"]"
   valid_task_priority "$priority" || fail "$E_VALIDATION" "bad priority '$priority' (low|medium|high|urgent)"
+  # DIVE-476: --max-iters is the maker→verifier loop cap; must be a positive int.
+  [[ -z "$max_iters" || "$max_iters" =~ ^[1-9][0-9]*$ ]] \
+    || fail "$E_VALIDATION" "--max-iters must be a positive integer"
   # --recurring=<cron> makes this a TEMPLATE (kind='recurring'), not a worked
   # task — the step-2 materializer clones it into a standard todo on schedule.
   # A template + an explicit --parent is nonsensical (instances are top-level),
@@ -12172,10 +12199,12 @@ cmd_task_add() {
   fi
   local creator; creator=$(task_actor "$from")
   local id
-  id=$(db "INSERT INTO tasks (title, body, priority, assignee, created_by, parent_id, project_key, kind, schedule, fresh)
+  id=$(db "INSERT INTO tasks (title, body, priority, assignee, created_by, parent_id, project_key, kind, schedule, fresh,
+                              acceptance_criteria, verify_command, max_iterations, verifier)
            VALUES ($(sqlq "$title"), $(sqlq_or_null "$body"), $(sqlq "$priority"),
                    $(sqlq_or_null "$assignee"), $(sqlq "$creator"), ${parent_sql}, $(sqlq "$project"),
-                   $(sqlq "$kind"), ${schedule_sql}, ${fresh_sql});
+                   $(sqlq "$kind"), ${schedule_sql}, ${fresh_sql},
+                   $(sqlq_or_null "$accept"), $(sqlq_or_null "$verify_cmd"), ${max_iters:-NULL}, $(sqlq_or_null "$verifier"));
            SELECT last_insert_rowid();")
   # Ident is stamped by the AFTER INSERT trigger from the project's counter, so
   # read it back rather than assuming the DIVE- prefix (DIVE-484).
@@ -12273,6 +12302,18 @@ cmd_task_show() {
                            ELSE x'0a'||'answer: — pending' END
                FROM tasks WHERE id=${id} AND need_type IS NOT NULL;")
     [[ -n "$gate" ]] && { echo; echo "human gate:"; printf '%s\n' "$gate" | indent2; }
+    # DIVE-476: loop spec (only when any field is set) — the declarative verify
+    # loop the (c) runner executes. Mirrors the conditional human-gate block.
+    local loopspec
+    loopspec=$(db "SELECT
+        CASE WHEN acceptance_criteria IS NOT NULL THEN 'acceptance_criteria: '||acceptance_criteria||x'0a' ELSE '' END||
+        CASE WHEN verify_command      IS NOT NULL THEN 'verify_command: '||verify_command||x'0a' ELSE '' END||
+        CASE WHEN max_iterations      IS NOT NULL THEN 'max_iterations: '||max_iterations||x'0a' ELSE '' END||
+        CASE WHEN verifier            IS NOT NULL THEN 'verifier: '||verifier ELSE '' END
+      FROM tasks WHERE id=${id}
+        AND (acceptance_criteria IS NOT NULL OR verify_command IS NOT NULL
+             OR max_iterations IS NOT NULL OR verifier IS NOT NULL);")
+    [[ -n "$loopspec" ]] && { echo; echo "loop spec:"; printf '%s\n' "$loopspec" | sed -e 's/[[:space:]]*$//' | indent2; }
     local subs
     subs=$(db "SELECT ident||'  ['||status||']  '||title FROM tasks WHERE parent_id=${id} ORDER BY id;")
     [[ -n "$subs" ]] && { echo; echo "subtasks:"; printf '%s\n' "$subs" | indent2; }
@@ -12366,11 +12407,18 @@ cmd_task_verify() {
     esac
     shift
   done
-  [[ -n "$task" && -n "$cmd" ]] \
-    || fail "$E_USAGE" "usage: 5dive task verify <id|DIVE-N> --cmd=\"<command>\" [--no-done] [--timeout=<seconds>]"
+  [[ -n "$task" ]] \
+    || fail "$E_USAGE" "usage: 5dive task verify <id|DIVE-N> [--cmd=\"<command>\"] [--no-done] [--timeout=<seconds>]"
   [[ -z "$timeout_s" || "$timeout_s" =~ ^[1-9][0-9]*$ ]] \
     || fail "$E_VALIDATION" "--timeout must be a positive integer (seconds)"
   resolve_task_id "$task"; local id="$RESOLVED_TASK_ID"
+  # DIVE-476: --cmd is now optional — when omitted, fall back to the task's stored
+  # verify_command (the declarative loop spec). Persisted input, no re-passing.
+  if [[ -z "$cmd" ]]; then
+    cmd=$(db "SELECT COALESCE(verify_command,'') FROM tasks WHERE id=${id};")
+    [[ -n "$cmd" ]] \
+      || fail "$E_USAGE" "no --cmd given and task has no stored verify_command (set one: 5dive task add … --verify=\"<cmd>\")"
+  fi
 
   # Run it. Combined stdout+stderr. The `if` wrapper captures the exit code
   # WITHOUT tripping `set -e` (a failing $() in a bare assignment would abort).
