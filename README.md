@@ -71,6 +71,25 @@ content engine, support crew. Clone it, point it at your keys and bots, done.
 
 ---
 
+## Import a character
+
+A template gives you roles. A **character pack** gives you a personality — a
+ready-made persona with its own voice, model, effort, and bundled skills. Browse
+the registry and import one under whatever name you like:
+
+```sh
+sudo 5dive agent marketplace ls            # browse the character-pack registry
+sudo 5dive agent import olivia --as=ceo    # spin up a named agent from a pack
+```
+
+`--as` is the agent's name on your box; the pack supplies the persona, model,
+and skills (and renames itself to match). Add `--channels=telegram` to wire a bot
+at import time. Packs live in the [`5dive-ai/character-packs`](https://github.com/5dive-ai/character-packs)
+registry — and a `5dive.yaml` can reference one with `pack: <slug>` so a whole
+company comes up in character.
+
+---
+
 ## Why 5dive
 
 **A company that runs itself.** Multiple agents on one host, reporting up an org chart.
