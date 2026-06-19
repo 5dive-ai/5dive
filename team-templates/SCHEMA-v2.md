@@ -71,3 +71,12 @@ agents:
 - v1 (DIVE-98): schema v2 keys + `5dive export` + `5dive team import` wrapper + 2-3 curated templates here.
 - v2: LLM generator (business description → generated spec).
 - v3: visual org composer on the dashboard + community template marketplace.
+
+## `pack:` — import a character pack (DIVE-536)
+
+An agent may set `pack: <slug>` instead of `type:`/`instructions:`. The seat is
+brought up via `5dive agent import <slug>`, inheriting the pack's persona, skills,
+and model/effort from the `5dive-ai/character-packs` registry. `reports_to`,
+`role`, `goals`, and an explicit `model`/`effort` override still apply on top.
+`channels`, `telegram_token`, `auth_profile`, `workdir`, `defer_auth` pass through.
+See the `5dive-team` template for a full company built this way.

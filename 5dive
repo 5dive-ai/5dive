@@ -26,7 +26,7 @@ esac
 
 # Bumped on every public release. `build.sh` checks this line exists; CI fails
 # the bundle-drift check if it's missing or empty.
-readonly FIVE_VERSION="0.3.24"
+readonly FIVE_VERSION="0.3.25"
 
 # GitHub org our repos live under. The org is being renamed
 # 5dive-com -> 5dive-ai (2026-06); fetches must work on either side of the
@@ -11495,6 +11495,9 @@ HELP
 #       auth_profile:   <named-account>
 #       provider:       <byo-id>           # hermes/openclaw only
 #       api_key:        "<key>"            # hermes/openclaw only
+#       pack:           <slug>             # import a character pack instead of a
+#                                          # bare create — supplies persona+skills
+#                                          # +model/effort (5dive agent import)
 #
 # Env vars: any "${VAR}" in a string value is expanded from the process env.
 # Missing/empty vars fail loudly so a misconfigured shell can't silently
@@ -11540,6 +11543,8 @@ KNOWN = {
     "type","channels","telegram_token","discord_token","workdir","skills",
     "no_skills","defer_auth","isolation","auth_profile","provider","api_key",
     "role","instructions","instructions_file","model","effort","reports_to","goals",
+    "pack",  # DIVE-536: import a character pack (5dive agent import <slug>) instead
+             # of a bare create — the pack supplies persona+skills+model/effort.
 }
 
 agents = data["agents"]
@@ -11660,6 +11665,30 @@ _compose_create_args() {
   [[ "$defer_auth" == "true" ]] && printf '%s\n' "--defer-auth"
 }
 
+# DIVE-536: build argv for `5dive agent import <pack> --as=<name> ...` when an
+# agent spec carries `pack:`. The pack manifest supplies type/persona/skills/
+# model/effort; here we only thread the runtime wiring (channels/auth/workdir).
+# Echoed one arg per line for mapfile-slurp, same contract as _compose_create_args.
+_compose_import_args() {
+  local spec="$1" name="$2" pack="$3" spec_dir="$4"
+  printf '%s\n' "$pack"
+  printf '%s\n' "--as=${name}"
+  local channels tg_token dc_token profile workdir
+  channels=$(jq -r '.channels       // empty' <<<"$spec")
+  tg_token=$(jq -r '.telegram_token // empty' <<<"$spec")
+  dc_token=$(jq -r '.discord_token  // empty' <<<"$spec")
+  profile=$(jq  -r '.auth_profile   // empty' <<<"$spec")
+  workdir=$(jq  -r '.workdir        // empty' <<<"$spec")
+  [[ -n "$channels" ]] && printf '%s\n' "--channels=${channels}"
+  [[ -n "$tg_token" ]] && printf '%s\n' "--telegram-token=${tg_token}"
+  [[ -n "$dc_token" ]] && printf '%s\n' "--discord-token=${dc_token}"
+  [[ -n "$profile"  ]] && printf '%s\n' "--auth-profile=${profile}"
+  if [[ -n "$workdir" ]]; then
+    local wd_abs; wd_abs=$(_compose_resolve_path "$workdir" "$spec_dir")
+    printf '%s\n' "--workdir=${wd_abs}"
+  fi
+}
+
 # Build the "## Role" + "## Reporting" markdown for one agent and append it to
 # the agent's $HOME/.claude/CLAUDE.md — BELOW the shared telegram fragment that
 # cmd_create already dropped (telegram agents) or as a fresh file (others). This
@@ -11740,6 +11769,15 @@ _compose_wire_role() {
   effort=$(jq -r '.effort // empty'    <<<"$agent")
   role=$(jq   -r '.role   // empty'    <<<"$agent")
   primary_mgr=$(jq -r '.reports_to // empty | if type=="array" then (.[0] // "") else . end' <<<"$agent")
+
+  # DIVE-536/506: CC 2.1.181+ STRIPS a bare model alias ("opus") from a fresh
+  # config dir, so a template that says `model: opus` silently loses it. Normalise
+  # the alias to the full resolved id the runtime keeps; full ids pass untouched.
+  case "$model" in
+    opus)   model="claude-opus-4-8" ;;
+    sonnet) model="claude-sonnet-4-6" ;;
+    haiku)  model="claude-haiku-4-5-20251001" ;;
+  esac
 
   # model / effort via the public config path (process-isolated; warns if the
   # runtime config isn't written yet — model just stays at its default).
@@ -11838,18 +11876,29 @@ HELP
       fi
       continue
     fi
-    step "[$name] creating"
-    local agent_spec
+    local agent_spec pack_slug
     agent_spec=$(jq -c --arg n "$name" '.agents[$n]' <<<"$spec")
-    local -a args=()
-    mapfile -t args < <(_compose_create_args "$agent_spec" "$name" "$spec_dir")
-    if bash "$self" agent create "${args[@]}"; then
+    pack_slug=$(jq -r '.pack // empty' <<<"$agent_spec")
+    local -a args=(); local brought_up=1 verb=create
+    if [[ -n "$pack_slug" ]]; then
+      # DIVE-536: spec references a character pack → import it (pack supplies
+      # persona+skills+model/effort); wiring below still applies org/goals/overrides.
+      verb=import
+      step "[$name] importing character pack '$pack_slug'"
+      mapfile -t args < <(_compose_import_args "$agent_spec" "$name" "$pack_slug" "$spec_dir")
+      bash "$self" agent import "${args[@]}" || brought_up=0
+    else
+      step "[$name] creating"
+      mapfile -t args < <(_compose_create_args "$agent_spec" "$name" "$spec_dir")
+      bash "$self" agent create "${args[@]}" || brought_up=0
+    fi
+    if (( brought_up )); then
       ((created++)) || true
       # v2 role wiring (model/effort/org/instructions/goals). Best-effort: a
-      # wiring hiccup must not fail the create that already succeeded.
+      # wiring hiccup must not fail the create/import that already succeeded.
       _compose_wire_role "$spec" "$name" "$spec_dir" "$self" || true
     else
-      warn "[$name] create failed"
+      warn "[$name] $verb failed"
       ((errors++)) || true
     fi
   done

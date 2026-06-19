@@ -1,0 +1,40 @@
+# The 5dive team — a whole company of AI agents, brought up from character packs.
+#
+#   5dive team import 5dive-team
+#
+# Each seat references a curated character pack (5dive-ai/character-packs) via the
+# `pack:` field (DIVE-536): the pack supplies the persona, skills, and model/effort
+# so the spec only declares the org structure. Channels are left off — wire each
+# agent to Telegram afterwards (or add telegram_token: per agent). No memory.
+version: "2"
+team:
+  name: "5dive (AI-run company)"
+
+defaults:
+  channels: none
+  defer_auth: true        # bring the org up first; sign each agent in after
+
+agents:
+  olivia:
+    pack: olivia          # CEO — composed visionary, sets direction
+    reports_to: []
+
+  marcus:
+    pack: marcus          # Founding Engineer — built the core
+    reports_to: [olivia]
+
+  dario:
+    pack: dario           # Engineer — heads-down builder
+    reports_to: [marcus]
+
+  theo:
+    pack: theo            # Marketing — dry, specific, never sells
+    reports_to: [olivia]
+
+  dude:
+    pack: dude            # Community & Intel — Lebowski-calm signal-spotter
+    reports_to: [theo]
+
+  lilbro:
+    pack: lilbro          # Creative — zoomer, meme-fluent, stops the scroll
+    reports_to: [theo]
