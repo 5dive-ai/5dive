@@ -1,0 +1,84 @@
+{
+  "registryFormat": 1,
+  "name": "5dive company templates",
+  "description": "Pre-wired multi-agent companies. Spin one up with: 5dive team import <slug>.",
+  "updated": "2026-06-19",
+  "companies": [
+    {
+      "slug": "startup",
+      "name": "Lean SaaS startup",
+      "description": "Founding team: CEO + CMO + DevOps + Competitor Researcher + Creative",
+      "size": 5,
+      "roster": [
+        {
+          "key": "ceo",
+          "role": "CEO",
+          "model": "opus",
+          "reports_to": null
+        },
+        {
+          "key": "cmo",
+          "role": "CMO",
+          "model": "opus",
+          "reports_to": "ceo"
+        },
+        {
+          "key": "devops",
+          "role": "DevOps",
+          "model": "sonnet",
+          "reports_to": "ceo"
+        },
+        {
+          "key": "researcher",
+          "role": "Competitor Researcher",
+          "model": "sonnet",
+          "reports_to": "cmo"
+        },
+        {
+          "key": "creative",
+          "role": "Creative",
+          "model": "sonnet",
+          "reports_to": "cmo"
+        }
+      ]
+    },
+    {
+      "slug": "content-studio",
+      "name": "Content studio",
+      "description": "Editor-in-Chief + Writer + SEO + Designer + Distributor",
+      "size": 5,
+      "roster": [
+        {
+          "key": "editor",
+          "role": "Editor-in-Chief",
+          "model": "opus",
+          "reports_to": null
+        },
+        {
+          "key": "writer",
+          "role": "Writer",
+          "model": "sonnet",
+          "reports_to": "editor"
+        },
+        {
+          "key": "seo",
+          "role": "SEO",
+          "model": "sonnet",
+          "reports_to": "editor"
+        },
+        {
+          "key": "designer",
+          "role": "Designer",
+          "model": "sonnet",
+          "reports_to": "editor"
+        },
+        {
+          "key": "distributor",
+          "role": "Distributor",
+          "model": "sonnet",
+          "reports_to": "editor"
+        }
+      ]
+    }
+  ]
+}
