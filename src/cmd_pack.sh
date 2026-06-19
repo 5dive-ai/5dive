@@ -56,6 +56,19 @@ _marketplace_fetch_pack() {
     fi
   done < <(jq -r '.skills[]? // empty' "$dl/manifest.json" 2>/dev/null)
   rm -f "$dl/.probe"
+  # DIVE-472 distilled memory: curl can't list a dir, so the manifest names its
+  # memory files (memoryFiles[]). Fetch them + the MEMORY.md index when the pack
+  # declares distilled memory, so cmd_import seeds them into the new agent.
+  if [[ "$(jq -r '.includes.memory // "false"' "$dl/manifest.json" 2>/dev/null)" == "distilled" ]]; then
+    mkdir -p "$dl/memory"
+    curl -fsSL --max-time 20 "$base/$path/memory/MEMORY.md" -o "$dl/memory/MEMORY.md" 2>/dev/null || true
+    local mf
+    while IFS= read -r mf; do
+      mf="${mf##*/}"   # basename only — no path traversal
+      [[ "$mf" =~ ^[A-Za-z0-9._-]+\.md$ ]] || continue
+      curl -fsSL --max-time 20 "$base/$path/memory/$mf" -o "$dl/memory/$mf" 2>/dev/null || true
+    done < <(jq -r '.memoryFiles[]? // empty' "$dl/manifest.json" 2>/dev/null)
+  fi
   local out; out=$(mktemp --suffix=.tar.gz)
   tar -czf "$out" -C "$dl" . 2>/dev/null || { rm -rf "$dl" "$out"; return 1; }
   rm -rf "$dl"; echo "$out"
