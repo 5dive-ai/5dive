@@ -89,6 +89,24 @@ _install_bundled_skill() {
   return 0
 }
 
+# When the importer renames a pack (--as differs from the pack's own name), the
+# persona files still call the agent by the pack's name (e.g. import dario
+# --as=cris leaves "You are Dario" in CLAUDE.md). Rewrite the persona name across
+# the identity + memory docs so the imported agent owns its chosen name. Both the
+# Capitalized display form (Dario) and the lowercase slug form (dario) are
+# replaced; word-boundary anchored so we don't mangle substrings.
+_pack_rename_persona() {
+  local dir="$1" old="$2" new="$3"
+  local old_l="${old,,}" new_l="${new,,}"
+  local old_c="${old_l^}" new_c="${new_l^}"
+  [[ -n "$old_l" && "$old_l" != "$new_l" ]] || return 0
+  local f
+  for f in "$dir/CLAUDE.md" "$dir/card.md" "$dir"/memory/*.md; do
+    [[ -f "$f" ]] || continue
+    sed -i -E "s/\\b${old_c}\\b/${new_c}/g; s/\\b${old_l}\\b/${new_l}/g" "$f" 2>/dev/null || true
+  done
+}
+
 # `5dive agent marketplace [ls]` — browse the character-pack registry.
 cmd_marketplace() {
   local sub="${1:-ls}"; [[ $# -gt 0 ]] && shift
@@ -431,6 +449,11 @@ cmd_import() {
   if [[ "$mem_inc" != "false" && "$mem_inc" != "distilled" ]]; then
     rm -rf "$stage"; fail "$E_VALIDATION" "pack declares unsupported memory mode '$mem_inc'"
   fi
+
+  # Rename the persona to the chosen --as name (CLAUDE.md + card + seed memory) so
+  # an imported agent doesn't keep introducing itself by the pack's original name.
+  local orig_name; orig_name=$(jq -r '.agentName // empty' "$stage/manifest.json")
+  [[ -n "$orig_name" ]] && _pack_rename_persona "$stage" "$orig_name" "$as"
 
   # Derive create inputs from the manifest; explicit flags win.
   local type isolation m_workdir m_profile model effort
