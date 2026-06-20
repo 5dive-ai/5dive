@@ -702,7 +702,7 @@ ${_LOOP_MARK}:run]]"
       first="$sid"
     fi
     prev="$sid"
-    (( i++ ))
+    i=$((i+1))
   done
 
   # Kick off step 1 — ping its agent (heartbeat would wake it anyway).
@@ -1428,6 +1428,32 @@ cmd_task_answer() {
       WHERE id=${id} AND status='blocked'
         AND NOT EXISTS (SELECT 1 FROM task_deps WHERE task_id=${id});"
   local newstatus; newstatus=$(db "SELECT status FROM tasks WHERE id=${id};")
+
+  # DIVE-552: a loop GATE step was just answered → advance the relay. Approve
+  # (decision "Approve →", or any manual answer) closes the gate step and frees
+  # the next step; "Do better ↩" bounces to the previous step to redo (re-blocks
+  # the gate by it; when that step re-completes the gate re-fires fresh). Reuses
+  # _task_loop_advance + the block edges. Best-effort; never fails the answer.
+  case "$(_loop_kind "$id")" in
+    gate:*)
+      local _lv; _lv=$(printf '%s' "${value:-}" | tr '[:upper:]' '[:lower:]')
+      if [[ "$_lv" == *"better"* || "$_lv" == *"reject"* || "$_lv" == *"deny"* ]]; then
+        local _run _prev
+        _run=$(db "SELECT COALESCE(parent_id,'') FROM tasks WHERE id=${id};")
+        _prev=$(db "SELECT id FROM tasks WHERE parent_id=${_run:-0} AND id<${id} AND body LIKE '%${_LOOP_MARK}:%' ORDER BY id DESC LIMIT 1;")
+        if [[ -n "$_prev" ]]; then
+          db "INSERT OR IGNORE INTO task_deps (task_id, blocked_by) VALUES (${id}, ${_prev});
+              UPDATE tasks SET status='blocked' WHERE id=${id};
+              UPDATE tasks SET status='todo', started_at=NULL WHERE id=${_prev};"
+          local _pw _pl; _pw=$(db "SELECT COALESCE(assignee,'') FROM tasks WHERE id=${_prev};"); _pl=$(db "SELECT title FROM tasks WHERE id=${_prev};")
+          [[ -n "$_pw" ]] && ( cmd_send "$_pw" --from="loop" --message="↩ Loop bounced back — redo: ${_pl}" ) >/dev/null 2>&1 || true
+        fi
+      else
+        db "UPDATE tasks SET status='done', done_at=datetime('now') WHERE id=${id};"
+        _task_loop_advance "$id" || true
+      fi
+      ;;
+  esac
 
   # Best-effort resume ping over the existing agent-send path. We deliberately
   # do NOT embed the answer value: cmd_send mirrors the outbound into the group
