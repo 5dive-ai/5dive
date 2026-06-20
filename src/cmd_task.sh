@@ -373,6 +373,21 @@ _task_status_cmd() {
       return
     fi
   fi
+  # DIVE-555 gate enforcement (DIVE-393/394 class): a `task done` must NOT close
+  # a task that still has an UNANSWERED human gate — that's how DIVE-535's
+  # public-publish approval got bypassed (the task was marked done while its
+  # approval gate sat 'pending', so the public ship happened with no recorded
+  # sign-off). Block the close: the gate must be answered (`task answer`) or the
+  # task abandoned (`task cancel`, which legitimately closes a gated task).
+  # Verifier routing already returned above; only a real `done` reaches here.
+  if [[ "$verb" == "done" ]]; then
+    local _gt _ga
+    _gt=$(db "SELECT COALESCE(need_type,'')        FROM tasks WHERE id=${id};")
+    _ga=$(db "SELECT COALESCE(need_answered_at,'') FROM tasks WHERE id=${id};")
+    if [[ -n "$_gt" && -z "$_ga" ]]; then
+      fail "$E_CONFLICT" "DIVE-$id has a pending '${_gt}' gate awaiting a human — answer it (5dive task answer DIVE-$id ...) or abandon the task (5dive task cancel DIVE-$id) instead of marking done. A gated/public ship must not close ahead of its gate (DIVE-555)."
+    fi
+  fi
   local set_result=""
   if (( want_result )); then
     set_result=", result=$(sqlq_or_null "$result")"
