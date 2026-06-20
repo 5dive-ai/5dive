@@ -72,6 +72,7 @@ cmd_task() {
     done|close)      cmd_task_done "$@" ;;
     verify)          cmd_task_verify "$@" ;;
     reject)          cmd_task_reject "$@" ;;
+    loop)            cmd_task_loop "$@" ;;
     loops)           cmd_task_loops "$@" ;;
     cancel)          cmd_task_cancel "$@" ;;
     block)           cmd_task_block "$@" ;;
@@ -377,6 +378,16 @@ _task_status_cmd() {
     set_result=", result=$(sqlq_or_null "$result")"
   fi
   db "UPDATE tasks SET status=$(sqlq "$newstatus")${extra}${set_result} WHERE id=${id};"
+  # DIVE-552: if this close finished a LOOP STEP, advance the relay — free the
+  # next step (a freed agent step the heartbeat wakes; a freed gate fires its
+  # human tap) and close the run when the last step lands. Only on a real `done`
+  # of a work step; gate steps advance via their answer, not here. Best-effort:
+  # an advance hiccup never fails the close that already committed above.
+  if [[ "$verb" == "done" ]]; then
+    case "$(_loop_kind "$id")" in
+      work) _task_loop_advance "$id" || true ;;
+    esac
+  fi
   # --notify (done/cancel only): DM the paired human a one-line ✅/⚠️ summary so
   # autonomous queue work surfaces a finish line. Best-effort; never fails the
   # status write above.
@@ -537,6 +548,216 @@ cmd_task_loops() {
            FROM tasks WHERE ${where}
            ORDER BY (CASE WHEN ${stuck_pred} THEN 1 ELSE 0 END) DESC, COALESCE(iteration,0) DESC, ident;"
   fi
+}
+
+# ───────────────────────── DIVE-552 loop engine ─────────────────────────
+# A "loop" is an N-step agent relay — the general case of the maker→verifier
+# 2-step chain (DIVE-477). It is composed ENTIRELY from existing primitives, so
+# NO schema migration: a loop RUN is a parent task; each STEP is a subtask
+# (assignee = the step's agent), ordered by block edges (step N+1 blocked_by
+# step N). When a step's `task done` fires, the close path advances the loop:
+# drop the edge to the next step, which the existing unblock-flip turns into a
+# todo the heartbeat wakes. A HUMAN-GATE step is the existing `task need`
+# decision gate (Approve →/Do better ↩), fired the moment the loop reaches it.
+#
+# Loop membership is marked in the task body with an ASCII sentinel (no new
+# column): the run carries `[[5dive-loop:run]]`, a step carries
+# `[[5dive-loop:work]]` or `[[5dive-loop:gate:approval]]` / `:gate:manual`.
+_LOOP_MARK="[[5dive-loop"
+_LOOP_GATE_OPTS="Approve →|Do better ↩"
+
+# Echo a task's loop-step kind from its body marker: work | gate:approval |
+# gate:manual | run, or "" when the task is not part of a loop.
+_loop_kind() {
+  local id="$1" body
+  body=$(db "SELECT COALESCE(body,'') FROM tasks WHERE id=${id};")
+  case "$body" in
+    *"${_LOOP_MARK}:"*) ;;
+    *) return ;;
+  esac
+  printf '%s' "$body" | sed -n 's/.*\[\[5dive-loop:\([^]]*\)\]\].*/\1/p' | head -1
+}
+
+# Advance a loop past a just-finished step `sid`. Drop each edge where a sibling
+# was blocked_by sid; a freed AGENT step becomes a todo (the unblock-flip the
+# existing `task block`/answer paths use) and we best-effort ping its assignee;
+# a freed GATE step fires its human tap right when it's reached. When sid has no
+# downstream step, the relay is over — close the parent run.
+_task_loop_advance() {
+  local sid="$1"
+  local run; run=$(db "SELECT COALESCE(parent_id,'') FROM tasks WHERE id=${sid};")
+  local nexts; nexts=$(db "SELECT task_id FROM task_deps WHERE blocked_by=${sid};")
+  if [[ -z "$nexts" ]]; then
+    # last step done — close the run (if it's still open) and tell its owner.
+    if [[ -n "$run" ]]; then
+      local rstatus; rstatus=$(db "SELECT status FROM tasks WHERE id=${run};")
+      if [[ "$rstatus" != "done" && "$rstatus" != "cancelled" ]]; then
+        db "UPDATE tasks SET status='done', done_at=datetime('now') WHERE id=${run};"
+        local owner; owner=$(db "SELECT COALESCE(assignee,created_by) FROM tasks WHERE id=${run};")
+        local rident; rident=$(db "SELECT ident FROM tasks WHERE id=${run};")
+        [[ -n "$owner" ]] && ( cmd_send "$owner" --from="loop" \
+            --message="✅ Loop complete: ${rident} — all steps done." ) >/dev/null 2>&1 || true
+      fi
+    fi
+    return
+  fi
+  local nid
+  while IFS= read -r nid; do
+    [[ -n "$nid" ]] || continue
+    db "DELETE FROM task_deps WHERE task_id=${nid} AND blocked_by=${sid};"
+    # still blocked by another step? leave it.
+    [[ "$(db "SELECT COUNT(*) FROM task_deps WHERE task_id=${nid};")" == "0" ]] || continue
+    local kind; kind=$(_loop_kind "$nid")
+    case "$kind" in
+      gate:*)
+        local gtype="${kind#gate:}" gask
+        gask=$(db "SELECT COALESCE(NULLIF(title,''),'Approve this step?') FROM tasks WHERE id=${nid};")
+        if [[ "$gtype" == "manual" ]]; then
+          cmd_task_need "$nid" --type=manual --from="loop" --ask="$gask"
+        else
+          cmd_task_need "$nid" --type=decision --from="loop" \
+            --ask="$gask" --options="$_LOOP_GATE_OPTS" --recommend="Approve →"
+        fi
+        ;;
+      *)
+        # agent step: the unblock-flip turns it todo; wake its owner.
+        db "UPDATE tasks SET status='todo'
+            WHERE id=${nid} AND status='blocked'
+              AND (need_type IS NULL OR need_answered_at IS NOT NULL);"
+        local who lbl rident
+        who=$(db "SELECT COALESCE(assignee,'') FROM tasks WHERE id=${nid};")
+        lbl=$(db "SELECT title FROM tasks WHERE id=${nid};")
+        rident=$(db "SELECT COALESCE((SELECT ident FROM tasks WHERE id=${run}),'') FROM tasks LIMIT 1;")
+        [[ -n "$who" ]] && ( cmd_send "$who" --from="loop" \
+            --message="🔁 Your turn in loop ${rident}: ${lbl}" ) >/dev/null 2>&1 || true
+        ;;
+    esac
+  done <<< "$nexts"
+}
+
+# `5dive task loop start --title=<name> --steps=<json> [--project=] [--owner=] [--from=]`
+# steps JSON = ordered array; each item is either an agent step
+#   {"agent":"marcus","label":"Draft it","handoff":"submits for review"}
+# or a human gate
+#   {"gate":"approval"|"manual","label":"You approve before publish"}
+# Materializes the run + chained step subtasks and starts step 1.
+cmd_task_loop_start() {
+  tasks_db_init
+  local title="" steps="" project="dive" owner="" from=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --title=*)   title="${1#*=}" ;;
+      --steps=*)   steps="${1#*=}" ;;
+      --project=*) project="${1#*=}" ;;
+      --owner=*)   owner="${1#*=}" ;;
+      --from=*)    from="${1#*=}" ;;
+      -*)          fail "$E_USAGE" "unknown flag: $1" ;;
+      *)           fail "$E_USAGE" "unexpected arg: $1" ;;
+    esac
+    shift
+  done
+  [[ -n "$title" ]] || fail "$E_USAGE" "usage: 5dive task loop start --title=<name> --steps=<json>"
+  [[ -n "$steps" ]] || fail "$E_USAGE" "--steps=<json array> is required"
+  printf '%s' "$steps" | jq -e 'type=="array" and length>0' >/dev/null 2>&1 \
+    || fail "$E_VALIDATION" "--steps must be a non-empty JSON array"
+  local creator; creator=$(task_actor "$from")
+  [[ -n "$owner" ]] || owner=$(_task_resolve_coordinator)
+
+  # Run parent — marked, assigned to the owner so it always has a home.
+  local run_body="Loop run.
+${_LOOP_MARK}:run]]"
+  local run
+  run=$(db "INSERT INTO tasks (title, body, priority, assignee, created_by, project_key, kind)
+            VALUES ($(sqlq "$title"), $(sqlq "$run_body"), 'medium',
+                    $(sqlq_or_null "$owner"), $(sqlq "$creator"), $(sqlq "${project,,}"), 'standard');
+            SELECT last_insert_rowid();")
+  local run_ident; run_ident=$(db "SELECT ident FROM tasks WHERE id=${run};")
+
+  # Walk the steps, creating one subtask each and chaining N+1 blocked_by N.
+  local n; n=$(printf '%s' "$steps" | jq 'length')
+  local prev="" i=0 first=""
+  while (( i < n )); do
+    local item; item=$(printf '%s' "$steps" | jq -c ".[$i]")
+    local gate; gate=$(printf '%s' "$item" | jq -r '.gate // empty')
+    local label; label=$(printf '%s' "$item" | jq -r '.label // "Step"')
+    local kind sassignee
+    if [[ -n "$gate" ]]; then
+      [[ "$gate" == "approval" || "$gate" == "manual" ]] || gate="approval"
+      kind="gate:$gate"; sassignee="$owner"   # human answers; owner-agent holds it
+    else
+      sassignee=$(printf '%s' "$item" | jq -r '.agent // empty')
+      [[ -n "$sassignee" ]] || fail "$E_VALIDATION" "step $i needs an \"agent\" or a \"gate\""
+      kind="work"
+    fi
+    local sbody="${_LOOP_MARK}:${kind}]]"
+    local sid
+    sid=$(db "INSERT INTO tasks (title, body, priority, assignee, created_by, parent_id, project_key, kind)
+              VALUES ($(sqlq "$label"), $(sqlq "$sbody"), 'medium',
+                      $(sqlq_or_null "$sassignee"), $(sqlq "$creator"), ${run}, $(sqlq "${project,,}"), 'standard');
+              SELECT last_insert_rowid();")
+    if [[ -n "$prev" ]]; then
+      db "INSERT OR IGNORE INTO task_deps (task_id, blocked_by) VALUES (${sid}, ${prev});
+          UPDATE tasks SET status='blocked' WHERE id=${sid};"
+    else
+      first="$sid"
+    fi
+    prev="$sid"
+    (( i++ ))
+  done
+
+  # Kick off step 1 — ping its agent (heartbeat would wake it anyway).
+  local who1; who1=$(db "SELECT COALESCE(assignee,'') FROM tasks WHERE id=${first};")
+  local lbl1; lbl1=$(db "SELECT title FROM tasks WHERE id=${first};")
+  [[ -n "$who1" ]] && ( cmd_send "$who1" --from="loop" \
+      --message="🔁 Loop ${run_ident} started — your step: ${lbl1}" ) >/dev/null 2>&1 || true
+
+  ok "loop ${run_ident} started — ${n} steps, first: ${who1:-?}" \
+     '{run:$r, ident:$id, steps:($n|tonumber), first_assignee:$w}' \
+     --arg r "$run" --arg id "$run_ident" --arg n "$n" --arg w "${who1:-}"
+}
+
+# `5dive task loop ls` — the board of loop runs (parent tasks marked :run]]),
+# with how many of their steps are done.
+cmd_task_loop_ls() {
+  tasks_db_init
+  local show_all=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --all) show_all=1 ;;
+      -*)    fail "$E_USAGE" "unknown flag: $1" ;;
+      *)     fail "$E_USAGE" "unexpected arg: $1" ;;
+    esac
+    shift
+  done
+  local run_pred="body LIKE '%${_LOOP_MARK}:run]]%'"
+  local status_pred="status NOT IN ('done','cancelled')"
+  (( show_all )) && status_pred="1=1"
+  if (( JSON_MODE )); then
+    local rows
+    rows=$(dbfmt -json "SELECT id, ident, title, status, assignee,
+             (SELECT COUNT(*) FROM tasks s WHERE s.parent_id=tasks.id) AS steps,
+             (SELECT COUNT(*) FROM tasks s WHERE s.parent_id=tasks.id AND s.status='done') AS done_steps
+           FROM tasks WHERE ${run_pred} AND ${status_pred} ORDER BY id DESC;")
+    [[ -n "$rows" ]] || rows="[]"
+    printf '%s' "$rows" | jq -c '{ok:true, data:{loops:.}}'
+  else
+    dbfmt -box "SELECT ident, status, COALESCE(assignee,'-') AS owner,
+             (SELECT COUNT(*) FROM tasks s WHERE s.parent_id=tasks.id AND s.status='done')||'/'||
+             (SELECT COUNT(*) FROM tasks s WHERE s.parent_id=tasks.id) AS progress,
+             title
+           FROM tasks WHERE ${run_pred} AND ${status_pred} ORDER BY id DESC;"
+  fi
+}
+
+cmd_task_loop() {
+  [[ $# -gt 0 ]] || fail "$E_USAGE" "usage: 5dive task loop <start|ls> ..."
+  local sub="$1"; shift
+  case "$sub" in
+    start)          cmd_task_loop_start "$@" ;;
+    ls|list)        cmd_task_loop_ls "$@" ;;
+    -h|--help|help) echo "5dive task loop start --title=<name> --steps=<json>   |   loop ls [--all]" ;;
+    *) fail "$E_USAGE" "unknown loop command: $sub (try: start|ls)" ;;
+  esac
 }
 
 # DIVE-475: deterministic verify-runner — proven-done, not claimed-done. Run a
