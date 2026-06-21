@@ -579,7 +579,6 @@ cmd_task_loops() {
 # column): the run carries `[[5dive-loop:run]]`, a step carries
 # `[[5dive-loop:work]]` or `[[5dive-loop:gate:approval]]` / `:gate:manual`.
 _LOOP_MARK="[[5dive-loop"
-_LOOP_GATE_OPTS="Approve →|Do better ↩"
 
 # Echo a task's loop-step kind from its body marker: work | gate:approval |
 # gate:manual | run, or "" when the task is not part of a loop.
@@ -630,8 +629,15 @@ _task_loop_advance() {
         if [[ "$gtype" == "manual" ]]; then
           cmd_task_need "$nid" --type=manual --from="loop" --ask="$gask"
         else
-          cmd_task_need "$nid" --type=decision --from="loop" \
-            --ask="$gask" --options="$_LOOP_GATE_OPTS" --recommend="Approve →"
+          # DIVE-560: a loop approval gate fires as --type=approval, which is
+          # HUMAN-enforced (agent-uid block + gate-proof). It used to fire as
+          # --type=decision purely for the Approve/Do-better buttons, but a
+          # decision gate is agent-clearable — silently undercutting the public
+          # "you get the final say at the gate" claim. The standard approval
+          # Approve/Deny buttons cover it with no plugin change: a "denied" tap
+          # drives the loop's bounce-back-and-redo (see the answer path below).
+          cmd_task_need "$nid" --type=approval --from="loop" \
+            --ask="$gask" --recommend="approved"
         fi
         ;;
       *)
@@ -971,7 +977,9 @@ cmd_task_need() {
   valid_need_type "$type" || fail "$E_VALIDATION" "bad --type '$type' (decision|secret|approval|manual)"
   [[ -n "$ask" ]] || fail "$E_USAGE" "--ask is required (what does the human need to provide?)"
   # Options are the choice list for a decision; reject them on the other types
-  # so the gate shape stays honest for the dashboard.
+  # so the gate shape stays honest for the dashboard. (An approval gate is
+  # deliberately approved/denied only — the plugin tap handler resolves no
+  # option index for it; see DIVE-560 note in _task_loop_advance.)
   if [[ -n "$options" && "$type" != "decision" ]]; then
     fail "$E_VALIDATION" "--options only applies to --type=decision"
   fi
@@ -1449,10 +1457,31 @@ cmd_task_answer() {
   # the next step; "Do better ↩" bounces to the previous step to redo (re-blocks
   # the gate by it; when that step re-completes the gate re-fires fresh). Reuses
   # _task_loop_advance + the block edges. Best-effort; never fails the answer.
-  case "$(_loop_kind "$id")" in
+  local _lk; _lk=$(_loop_kind "$id")
+  # DIVE-560: a loop APPROVAL gate only advances on a HUMAN-cleared answer
+  # (need_answered_by=human:*). The answer path above already blocks an agent
+  # self-answering an approval gate; this makes the loop's "the final say is
+  # yours" guarantee explicit and regression-proof — if a non-human path ever
+  # clears it (e.g. a future regression, or the audited sudo-bypass), the relay
+  # simply doesn't advance. manual gates stay agent-answerable (agents
+  # legitimately resolve those), so they're exempt. Falling through here without
+  # advancing still records the answer + emits the success output below.
+  local _gate_may_advance=1
+  if [[ "$_lk" == "gate:approval" ]]; then
+    local _ab; _ab=$(db "SELECT COALESCE(need_answered_by,'') FROM tasks WHERE id=${id};")
+    case "$_ab" in human:*) : ;; *) _gate_may_advance=0 ;; esac
+  fi
+  case "$_lk" in
     gate:*)
+      if (( _gate_may_advance )); then
+      # Bounce (redo the previous step) vs advance. Match the reject vocabulary
+      # of BOTH gate styles: the old decision options ("Do better ↩") and the
+      # approval buttons ("denied" — DIVE-560). NB "denied" does NOT contain the
+      # substring "deny", so it must be matched explicitly; missing it would let a
+      # human's DENY silently ADVANCE the loop. Anything else (approve/approved)
+      # advances.
       local _lv; _lv=$(printf '%s' "${value:-}" | tr '[:upper:]' '[:lower:]')
-      if [[ "$_lv" == *"better"* || "$_lv" == *"reject"* || "$_lv" == *"deny"* ]]; then
+      if [[ "$_lv" == *"better"* || "$_lv" == *"reject"* || "$_lv" == *"deny"* || "$_lv" == *"denied"* || "$_lv" == *"declin"* ]]; then
         local _run _prev
         _run=$(db "SELECT COALESCE(parent_id,'') FROM tasks WHERE id=${id};")
         _prev=$(db "SELECT id FROM tasks WHERE parent_id=${_run:-0} AND id<${id} AND body LIKE '%${_LOOP_MARK}:%' ORDER BY id DESC LIMIT 1;")
@@ -1466,6 +1495,7 @@ cmd_task_answer() {
       else
         db "UPDATE tasks SET status='done', done_at=datetime('now') WHERE id=${id};"
         _task_loop_advance "$id" || true
+      fi
       fi
       ;;
   esac

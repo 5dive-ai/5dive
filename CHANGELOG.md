@@ -11,6 +11,19 @@ release.
 
 ### Fixed
 
+- Loop human-gates are now actually human-enforced (0.3.31, DIVE-560). A loop
+  `gate:approval` step fired as `--type=decision` (purely to get the
+  Approve/Do-better buttons), but a decision gate is agent-clearable — an agent
+  could self-answer it (`need_answered_by=<agent>`), silently undercutting the
+  public "you get the final say at the gate" claim. The gate now fires as
+  `--type=approval`, which is human-enforced (the DIVE-394/519 agent-uid block +
+  gate-proof); the standard Approve/Deny buttons cover it with no plugin change
+  (a "denied" tap drives the loop's bounce-back-and-redo). Belt-and-suspenders:
+  a loop approval gate only advances on a `need_answered_by=human:*` answer, so
+  even an audited `sudo` clear can't progress the relay. Also fixed the
+  bounce-match vocabulary — the approval reject value `denied` does not contain
+  the substring `deny`, so without this a human's DENY would have wrongly
+  advanced the loop.
 - Heartbeat nudged the wrong task id (0.3.30). The wake `/goal` and every
   heartbeat log built the `DIVE-N` from a task's raw `id` column, but with the
   projects primitive (DIVE-484) the global row id and the per-project display
