@@ -8808,6 +8808,45 @@ Tell me what to build: app, site, bot, report, campaign. Consider it shipped.${l
 EOF
 )
       ;;
+    hermes|openclaw)
+      # Hermes/OpenClaw are multi-provider runtimes — NEVER call them "Claude"
+      # or read the base claude user's model (that's the DIVE bug a customer hit:
+      # a Hermes+DeepSeek agent greeted as "Claude agent. Running opus."). Read
+      # the REAL provider/model the agent actually signed in with.
+      local kind
+      [[ "$agent_type" == "hermes" ]] && kind="Hermes agent" || kind="OpenClaw agent"
+      local detail provider model plabel
+      detail=$(account_signin_detail "$agent_name" "$agent_type" 2>/dev/null || echo '{}')
+      provider=$(jq -r '.provider // empty' <<<"$detail" 2>/dev/null || true)
+      model=$(jq -r '.model // empty' <<<"$detail" 2>/dev/null || true)
+      case "$provider" in
+        deepseek)   plabel="DeepSeek" ;;
+        anthropic)  plabel="Anthropic" ;;
+        openai)     plabel="OpenAI" ;;
+        openrouter) plabel="OpenRouter" ;;
+        google)     plabel="Google" ;;
+        "")         plabel="" ;;
+        *)          plabel="${provider^}" ;;
+      esac
+      local model_line="Model and provider are switchable anytime, just ask."
+      if [[ -n "$plabel" ]]; then
+        if [[ -n "$model" ]]; then
+          model_line="Running ${plabel} (${model}). Switchable anytime, just ask."
+        else
+          model_line="Running ${plabel}. Switchable anytime, just ask."
+        fi
+      fi
+      text=$(cat <<EOF
+👋 We're connected! I'm ${name_q}your ${kind}.
+
+${model_line}
+
+Here 24/7 with memory. Send text, photos, or files.
+
+Tell me what to build: app, site, bot, report, campaign. Consider it shipped.${live_line} Need more hands? Siblings on demand, working in parallel.
+EOF
+)
+      ;;
     *)
       # Read the agent's REAL model/effort from its own settings.json (where the
       # per-agent default — opus — is seeded). Fall back to the base claude user
