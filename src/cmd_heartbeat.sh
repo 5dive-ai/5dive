@@ -355,6 +355,19 @@ _hb_agent_idle() {
   return 0
 }
 
+# Resolve a task's DISPLAY ident (e.g. DIVE-560) from its numeric row id. With
+# the projects primitive (DIVE-484) the global row id and the per-project display
+# number diverge once any non-default project consumes ids, so a goal/nudge built
+# from the raw id points at a phantom (e.g. row 570 is really DIVE-560). Every
+# agent-facing or logged DIVE-N MUST go through here; the numeric id stays the DB
+# and registry key. Falls back to DIVE-<id> if the row vanished, so logs never
+# print empty.
+_hb_ident() {
+  local id="$1" ident
+  ident=$(db "SELECT ident FROM tasks WHERE id=${id};" 2>/dev/null) || ident=""
+  echo "${ident:-DIVE-${id}}"
+}
+
 # Flip one in_progress task back to todo. Clears started_at so its age and the
 # per-task nudge counter both restart cleanly, and stamps updated_at. Best-effort
 # (a dead db or already-moved task is harmless). Logs why.
@@ -362,7 +375,7 @@ _hb_reclaim_to_todo() {
   local name="$1" id="$2" why="$3"
   db "UPDATE tasks SET status='todo', started_at=NULL, updated_at=datetime('now')
       WHERE id=${id} AND status='in_progress';" 2>/dev/null || true
-  _hb_log "[$name] reclaimed DIVE-${id} -> todo ($why)"
+  _hb_log "[$name] reclaimed $(_hb_ident "$id") -> todo ($why)"
 }
 
 # Unwedge this agent's stuck in_progress tasks. Three escalating rules, cheapest
@@ -420,7 +433,7 @@ _hb_reclaim() {
         # Subshell-wrap: cmd_task_escalate may fail->exit on an edge case; a bare
         # call would kill the whole tick. It bumps priority + pings owner & human.
         ( cmd_task_escalate "$id" --from=heartbeat ) >/dev/null 2>&1 || true
-        _hb_log "[$name] DIVE-${id} overran ${budget}m ${reap_n}x — blocked + escalated (NEVER cancelled)"
+        _hb_log "[$name] $(_hb_ident "$id") overran ${budget}m ${reap_n}x — blocked + escalated (NEVER cancelled)"
         escalated=$((escalated + 1)); continue
       fi
       _hb_reclaim_to_todo "$name" "$id" "overran ${budget}m budget (reap #${reap_n}) — requeued from a clean slate, NOT cancelled"
@@ -446,7 +459,7 @@ _hb_reclaim() {
 # Returns 0 on a delivered nudge, nonzero on any failure (so the caller skips
 # marking lastRunAt and retries next tick).
 _hb_wake() {
-  local name="$1" fresh="$2" task_id="$3"
+  local name="$1" fresh="$2" task_id="$3" task_ident="${4:-DIVE-$3}"
   if ! systemctl is-active --quiet "5dive-agent@${name}.service"; then
     systemctl start "5dive-agent@${name}.service" 2>/dev/null \
       || { _hb_log "[$name] systemctl start failed"; return 1; }
@@ -468,7 +481,7 @@ _hb_wake() {
   # evaluator sees the condition met, then auto-clears. "stop after N turns" is a
   # soft, model-judged guard — it does NOT reliably halt a runaway loop, so the
   # real hard cap is the deterministic stale-in_progress reaper in the tick.
-  local nudge="/goal Task DIVE-${task_id} shows status done or cancelled, or is blocked with a human gate filed, on the 5dive board (verify ONLY by running: 5dive task show DIVE-${task_id}). To achieve it: claim it with '5dive task start DIVE-${task_id}', do the work, then close it with '5dive task done DIVE-${task_id} --result=\"<one or two self-contained sentences — any output the creator needs to see; the dashboard and creator read this>\"'. If it needs a human decision, approval, a secret, or a manual step only a person can do, do NOT cancel — file a gate that pings the owner: '5dive task need DIVE-${task_id} --type=decision --ask=\"<what you need from them>\"' (use --type=approval|secret|manual as fits). Keep the ask to ONE crisp question + ~1 line of essential context — put heavy detail in the task BODY, not the ask — and ALWAYS surface your recommended choice with --recommend=\"<option>\" (and --options=A|B for a decision) so the owner sees the advised answer first. Only if the task is genuinely irrelevant or impossible, run '5dive task cancel DIVE-${task_id} --result=\"<why>\"'. Work ONLY this one task — do not start any other. Stop after 6 turns."
+  local nudge="/goal Task ${task_ident} shows status done or cancelled, or is blocked with a human gate filed, on the 5dive board (verify ONLY by running: 5dive task show ${task_ident}). To achieve it: claim it with '5dive task start ${task_ident}', do the work, then close it with '5dive task done ${task_ident} --result=\"<one or two self-contained sentences — any output the creator needs to see; the dashboard and creator read this>\"'. If it needs a human decision, approval, a secret, or a manual step only a person can do, do NOT cancel — file a gate that pings the owner: '5dive task need ${task_ident} --type=decision --ask=\"<what you need from them>\"' (use --type=approval|secret|manual as fits). Keep the ask to ONE crisp question + ~1 line of essential context — put heavy detail in the task BODY, not the ask — and ALWAYS surface your recommended choice with --recommend=\"<option>\" (and --options=A|B for a decision) so the owner sees the advised answer first. Only if the task is genuinely irrelevant or impossible, run '5dive task cancel ${task_ident} --result=\"<why>\"'. Work ONLY this one task — do not start any other. Stop after 6 turns."
   _hb_send_line "$name" "$nudge" || { _hb_log "[$name] nudge send failed"; return 1; }
   return 0
 }
@@ -504,15 +517,15 @@ _hb_materialize_recurring() {
     fi
     open=$(db "SELECT COUNT(*) FROM tasks WHERE from_template_id=${tid} AND status NOT IN ('done','cancelled');" 2>/dev/null || echo 1)
     if [[ "${open:-1}" != "0" ]]; then
-      _hb_log "[materializer] DIVE-${tid} due but an open instance exists — skip"
+      _hb_log "[materializer] $(_hb_ident "$tid") due but an open instance exists — skip"
       continue
     fi
     if db "INSERT INTO tasks (title, body, priority, assignee, created_by, kind, from_template_id, fresh)
            SELECT title, body, priority, assignee, created_by, 'standard', id, fresh FROM tasks WHERE id=${tid};
            UPDATE tasks SET last_fired_at=datetime('now') WHERE id=${tid};" >/dev/null 2>&1; then
-      n_made=$((n_made + 1)); _hb_log "[materializer] DIVE-${tid} fired -> new standard todo"
+      n_made=$((n_made + 1)); _hb_log "[materializer] $(_hb_ident "$tid") fired -> new standard todo"
     else
-      _hb_log "[materializer] DIVE-${tid} insert failed"
+      _hb_log "[materializer] $(_hb_ident "$tid") insert failed"
     fi
   done < <(db "SELECT id, schedule, COALESCE(last_fired_at,'') FROM tasks WHERE kind='recurring' AND schedule IS NOT NULL;" 2>/dev/null | tr '|' '\t')
   _hb_log "[materializer] pass done — ${n_made} materialized"
@@ -582,6 +595,9 @@ cmd_heartbeat_tick() {
     if [[ -z "$task_id" ]]; then
       sk_nowork=$((sk_nowork + 1)); _hb_log "[$name] no todo — stay idle"; continue
     fi
+    # The /goal + every log below must name the task by its DISPLAY ident, not the
+    # raw row id — they diverge once a non-default project exists (DIVE-484).
+    local task_ident; task_ident=$(_hb_ident "$task_id")
 
     # --- Same-account spread ---------------------------------------------------
     # Never start two agents that share an Anthropic account close together: a
@@ -643,18 +659,18 @@ cmd_heartbeat_tick() {
     local eff_fresh="$fresh" task_fresh
     task_fresh=$(db "SELECT COALESCE(fresh,'') FROM tasks WHERE id=${task_id};" 2>/dev/null || echo "")
     [[ "$task_fresh" == "1" ]] && eff_fresh="true"
-    _hb_log "[$name] due + todo DIVE-${task_id} — waking (fresh=${eff_fresh})"
-    if _hb_wake "$name" "$eff_fresh" "$task_id"; then
+    _hb_log "[$name] due + todo ${task_ident} — waking (fresh=${eff_fresh})"
+    if _hb_wake "$name" "$eff_fresh" "$task_id" "$task_ident"; then
       in_tick_woke[$acct]=$now   # claim the account's slot for the rest of this tick
       local nudge_n
       nudge_n=$(with_registry_lock _hb_mark_run "$name" "$now" "$task_id")
-      woke=$((woke + 1)); _hb_log "[$name] nudged (/goal DIVE-${task_id}, nudge #${nudge_n:-?})"
+      woke=$((woke + 1)); _hb_log "[$name] nudged (/goal ${task_ident}, nudge #${nudge_n:-?})"
       # Nudged repeatedly but the task never left todo → it's being starved
       # (e.g. listen-loop watchdog yanking the agent before `task start` runs).
       # Surface it instead of silently re-nudging every tick forever.
       if [[ "${nudge_n:-0}" =~ ^[0-9]+$ ]] && (( nudge_n >= _HB_STARVE_AFTER )); then
         starved=$((starved + 1))
-        _hb_log "[$name] WARN: DIVE-${task_id} nudged ${nudge_n}x but still todo (never started) — possible listen-loop starvation; check the agent's task-claim path"
+        _hb_log "[$name] WARN: ${task_ident} nudged ${nudge_n}x but still todo (never started) — possible listen-loop starvation; check the agent's task-claim path"
       fi
     else
       sk_fail=$((sk_fail + 1)); _hb_log "[$name] wake failed — will retry next tick"

@@ -9,6 +9,20 @@ release.
 
 ## [Unreleased]
 
+### Fixed
+
+- Heartbeat nudged the wrong task id (0.3.30). The wake `/goal` and every
+  heartbeat log built the `DIVE-N` from a task's raw `id` column, but with the
+  projects primitive (DIVE-484) the global row id and the per-project display
+  number diverge as soon as a non-default project consumes ids — e.g. the 10
+  `POST-*` rows pushed row 570's display ident down to `DIVE-560`. The agent was
+  then told to complete a phantom `DIVE-570` it could never find/claim, so the
+  nudge re-fired every tick and the starvation WARN fired. New `_hb_ident`
+  resolves the true display ident from the row id; the numeric id stays the DB
+  and registry key. Nudge text, the stale-task reaper logs, the materializer
+  logs, and the tick wake/nudge/starve logs all now name tasks by their real
+  ident.
+
 ### Added
 
 - `5dive task escalate <id>` (DIVE-449): "flag for attention" — bumps the task's
