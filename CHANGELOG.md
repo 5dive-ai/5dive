@@ -11,6 +11,16 @@ release.
 
 ### Fixed
 
+- `agent config <name> set telegram.allowed-users=<csv>` now actually writes the
+  allowlist when set on its own (0.3.32). The dispatch that seeds `access.json`
+  (`install_channel_for_agent` → `seed_telegram_access_allowlist`) was gated
+  behind a token rotation or a `channels=telegram` change in the same call, so a
+  standalone allowlist update validated, reported success in `applied_keys`, and
+  silently no-op'd — leaving the file unchanged (e.g. a second id never landed).
+  The guard now also fires when `telegram.allowed-users` is present, falling back
+  to the stored connector token. Seeding remains additive (appends ids); use
+  `agent telegram-access set` to remove an id or rewrite the list wholesale.
+
 - Loop human-gates are now actually human-enforced (0.3.31, DIVE-560). A loop
   `gate:approval` step fired as `--type=decision` (purely to get the
   Approve/Do-better buttons), but a decision gate is agent-clearable — an agent

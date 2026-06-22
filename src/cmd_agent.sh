@@ -1524,7 +1524,15 @@ cmd_config() {
   # agent is a cheap no-op.
   local effective_channels
   effective_channels=$(jq -r --arg n "$name" '.agents[$n].channels // "none"' <<<"$reg")
-  if [[ -n "$new_telegram_token" || "$channels_changed_to" == "telegram" ]]; then
+  # `-n "$new_allowed_users"`: a bare `telegram.allowed-users=` set (no token
+  # rotation, no channels= change) must still re-run the dispatch — that's the
+  # ONLY path that seeds access.json (via install_channel_for_agent ->
+  # seed_telegram_access_allowlist). Without this the key validated, reported
+  # success in applied_keys, and silently no-op'd the allowlist write. The
+  # token falls back to the stored connector secret below, so no token is
+  # required in the call. (Seeding is additive — it appends new ids; removing
+  # an id still goes through `telegram-access set`.)
+  if [[ -n "$new_telegram_token" || "$channels_changed_to" == "telegram" || -n "$new_allowed_users" ]]; then
     [[ "$effective_channels" == "telegram" ]] \
       || fail "$E_VALIDATION" "telegram.* keys require channels=telegram (current: $effective_channels)"
     local token_for_install="$new_telegram_token"
