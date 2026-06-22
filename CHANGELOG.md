@@ -9,6 +9,15 @@ release.
 
 ## [Unreleased]
 
+### Added
+
+- `5dive hire <name> [--type=claude] [--role=… --title=…]` (0.3.33, DIVE-603) —
+  ergonomic alias for `agent create` so demos/docs can say "hire a CTO" and have
+  the real command match the story. Thin sugar: defaults `--type=claude`,
+  forwards every other flag straight to `agent create` (inherits the full create
+  surface), and peels off `--role`/`--title` to apply via `org set` once the
+  agent exists. `agent create` stays canonical.
+
 ### Fixed
 
 - `agent config <name> set telegram.allowed-users=<csv>` now actually writes the
