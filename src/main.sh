@@ -165,6 +165,8 @@ Projects (ident namespaces for the queue; default 'dive' = DIVE-N):
   5dive project ls | show <key>
   # tasks then number per project: FROG-1, FROG-2 …
 
+  5dive loop spawn --role=<r> --agent=<a> --prompt="…" [--ceiling=<tok>] [--wait[=<sec>]]  # LOOP-7 orchestration (JSON in/out)
+
 Org chart (who reports to whom):
   5dive org set <agent> --manager=<agent> [--role=<text>] [--title=<text>]
   5dive org tree | show <agent> | ls | rm <agent>
@@ -470,6 +472,10 @@ main() {
       # Project namespaces for the task queue (DIVE-484). Same group-writable
       # store as tasks; read/write, no root/lock.
       cmd_project "$@" ;;
+    loop)
+      # LOOP-7: agent-native multi-agent orchestration over the task queue +
+      # loop_runs table. JSON in/out; same group-writable store, no root/lock.
+      cmd_loop "$@" ;;
     heartbeat)
       # Wake-on-work scheduler. on/off mutate the registry (lock taken inside
       # cmd_heartbeat); tick is the root cron driver; ls is read-only. No audit

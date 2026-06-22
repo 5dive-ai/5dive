@@ -25,9 +25,11 @@ _task_usage() {
   5dive task reject <id|DIVE-N> [--feedback="<what to fix>"]
                                                      # verifier's FAIL verdict (DIVE-477): bounce back to the maker
                                                      # for another pass, or escalate to a human at max_iterations.
-  5dive task loops [--stuck] [--all] [--escalate-stuck]
-                                                     # observability (DIVE-478): board of maker→verifier loops with
-                                                     # iteration/cap + ⚠ stuck flag. --escalate-stuck pings agent+human.
+  5dive task loops [--stuck] [--all] [--escalate-stuck] [--runs] [--watch[=secs]] [--kill <loopId>]
+                                                     # observability (DIVE-478/597): maker→verifier board + LOOP-7
+                                                     # loop_runs control window (topology/stage/iter/tokens-ceiling/
+                                                     # status/⚠stuck). --runs=only loop_runs; --watch repaints;
+                                                     # --kill flips kill_requested (deferred-safe). Cost: `usage loops`.
                                                      # Tokens/cost per loop: see `5dive usage` (same task ids).
   5dive task cancel <id|DIVE-N> [--result=<text>]    # -> cancelled; --result captures why
   5dive task block   <id|DIVE-N> --by=<id|DIVE-N>    # add a blocks edge, mark blocked
@@ -258,7 +260,10 @@ cmd_task_ls() {
   [[ -n "$project" ]] && where+=" AND project_key=$(sqlq "${project,,}")"
   if (( JSON_MODE )); then
     local rows
-    rows=$(dbfmt -json "SELECT id, ident, title, status, priority, assignee, created_by, parent_id, created_at, done_at, body, result, need_type, ask, need_options, need_answer, need_answered_at, kind, schedule, last_fired_at, parked_at, park_reason FROM tasks WHERE ${where} ${order};")
+    # DIVE-583: emit project_key natively so the dashboard keys off a real field
+    # (join name/prefix/lead from `project ls`) instead of deriving project from
+    # the ident prefix client-side (fragile; couples to naming + the id≠ident bug).
+    rows=$(dbfmt -json "SELECT id, ident, title, status, priority, assignee, created_by, parent_id, created_at, done_at, body, result, need_type, ask, need_options, need_answer, need_answered_at, kind, schedule, last_fired_at, parked_at, park_reason, project_key FROM tasks WHERE ${where} ${order};")
     [[ -n "$rows" ]] || rows="[]"
     # Feed rows via stdin, not --argjson: a big board (179+ tasks w/ bodies)
     # blows past MAX_ARG_STRLEN (128K per argv string) -> execve E2BIG
@@ -325,7 +330,7 @@ cmd_task_show() {
 cmd_task_assign() {
   tasks_db_init
   [[ $# -ge 2 ]] || fail "$E_USAGE" "usage: 5dive task assign <id|DIVE-N> <agent>"
-  resolve_task_id "$1"; local id="$RESOLVED_TASK_ID"
+  resolve_task_id "$1"; local id="$RESOLVED_TASK_ID" ident="$RESOLVED_TASK_IDENT"
   local who="$2"
   # Handing a task to a NEW owner resets its in_progress clock: SQLite evaluates
   # SET column refs against the pre-update row, so `assignee IS NOT <who>` is the
@@ -336,7 +341,7 @@ cmd_task_assign() {
         started_at=CASE WHEN status='in_progress' AND assignee IS NOT $(sqlq "$who")
                         THEN datetime('now') ELSE started_at END
       WHERE id=${id};"
-  ok "DIVE-$id assigned to $who" '{id:($i|tonumber), assignee:$a}' --arg i "$id" --arg a "$who"
+  ok "$ident assigned to $who" '{id:($i|tonumber), ident:$id, assignee:$a}' --arg i "$id" --arg id "$ident" --arg a "$who"
 }
 
 _task_status_cmd() {
@@ -355,7 +360,7 @@ _task_status_cmd() {
     shift
   done
   [[ ${#positional[@]} -gt 0 ]] || fail "$E_USAGE" "usage: 5dive task $verb <id|DIVE-N> [--result=<text>] [--notify]"
-  resolve_task_id "${positional[0]}"; local id="$RESOLVED_TASK_ID"
+  resolve_task_id "${positional[0]}"; local id="$RESOLVED_TASK_ID" ident="$RESOLVED_TASK_IDENT"
   # DIVE-477: maker→verifier routing. A `task done` on a task that carries a
   # `verifier` distinct from its current assignee is NOT a close — it's a handoff.
   # The maker is claiming the work is ready; the verifier must grade it before the
@@ -385,7 +390,7 @@ _task_status_cmd() {
     _gt=$(db "SELECT COALESCE(need_type,'')        FROM tasks WHERE id=${id};")
     _ga=$(db "SELECT COALESCE(need_answered_at,'') FROM tasks WHERE id=${id};")
     if [[ -n "$_gt" && -z "$_ga" ]]; then
-      fail "$E_CONFLICT" "DIVE-$id has a pending '${_gt}' gate awaiting a human — answer it (5dive task answer DIVE-$id ...) or abandon the task (5dive task cancel DIVE-$id) instead of marking done. A gated/public ship must not close ahead of its gate (DIVE-555)."
+      fail "$E_CONFLICT" "$ident has a pending '${_gt}' gate awaiting a human — answer it (5dive task answer $ident ...) or abandon the task (5dive task cancel $ident) instead of marking done. A gated/public ship must not close ahead of its gate (DIVE-555)."
     fi
   fi
   local set_result=""
@@ -418,10 +423,10 @@ _task_status_cmd() {
     local from_tmpl
     from_tmpl=$(db "SELECT COALESCE(from_template_id,'') FROM tasks WHERE id=${id};" 2>/dev/null || echo "")
     if [[ -z "$from_tmpl" ]]; then
-      _task_close_notify "DIVE-$id" "$verb" "$result" || true
+      _task_close_notify "$ident" "$verb" "$result" || true
     fi
   fi
-  ok "DIVE-$id $verb" '{id:($i|tonumber), status:$s}' --arg i "$id" --arg s "$newstatus"
+  ok "$ident $verb" '{id:($i|tonumber), ident:$id, status:$s}' --arg i "$id" --arg id "$ident" --arg s "$newstatus"
 }
 
 cmd_task_start()  { _task_status_cmd in_progress ", started_at=COALESCE(started_at, datetime('now'))" start "$@"; }
@@ -446,9 +451,10 @@ _task_route_to_verifier() {
             started_at=NULL${set_result}
       WHERE id=${id};"
   local iter; iter=$(db "SELECT iteration FROM tasks WHERE id=${id};")
-  ok "DIVE-$id ready for review — routed to verifier '$vfier' (iteration $iter)" \
-     '{id:($i|tonumber), status:"todo", routedTo:$v, role:"verifier", iteration:($n|tonumber)}' \
-     --arg i "$id" --arg v "$vfier" --arg n "$iter"
+  local ident; ident=$(ident_of "$id")
+  ok "$ident ready for review — routed to verifier '$vfier' (iteration $iter)" \
+     '{id:($i|tonumber), ident:$id, status:"todo", routedTo:$v, role:"verifier", iteration:($n|tonumber)}' \
+     --arg i "$id" --arg id "$ident" --arg v "$vfier" --arg n "$iter"
 }
 
 # DIVE-477: the verifier's FAIL verdict. The maker's work missed the bar, so
@@ -469,29 +475,29 @@ cmd_task_reject() {
     shift
   done
   [[ -n "$task" ]] || fail "$E_USAGE" "usage: 5dive task reject <id|DIVE-N> [--feedback=\"<what to fix>\"]"
-  resolve_task_id "$task"; local id="$RESOLVED_TASK_ID"
+  resolve_task_id "$task"; local id="$RESOLVED_TASK_ID" ident="$RESOLVED_TASK_IDENT"
   local maker iter maxi vfier
   maker=$(db "SELECT COALESCE(maker_agent,'')    FROM tasks WHERE id=${id};")
   iter=$(db  "SELECT COALESCE(iteration,0)       FROM tasks WHERE id=${id};")
   maxi=$(db  "SELECT COALESCE(max_iterations,0)  FROM tasks WHERE id=${id};")
   vfier=$(db "SELECT COALESCE(verifier,'')       FROM tasks WHERE id=${id};")
   [[ -n "$maker" ]] || fail "$E_VALIDATION" \
-    "DIVE-$id is not in a maker→verifier loop (no maker to bounce to) — use 'task need'/'task block' for a plain rejection"
+    "$ident is not in a maker→verifier loop (no maker to bounce to) — use 'task need'/'task block' for a plain rejection"
   local fb_txt="❌ verifier '${vfier:-?}' rejected (iteration ${iter}): ${feedback:-no feedback given}"
   # max_iterations reached -> stop bouncing, park it on a human to decide.
   if (( maxi > 0 && iter >= maxi )); then
     db "UPDATE tasks SET result=$(sqlq "$fb_txt") WHERE id=${id};"
-    warn "DIVE-$id hit max_iterations ($maxi) — escalating to human review"
+    warn "$ident hit max_iterations ($maxi) — escalating to human review"
     cmd_task_need "$id" --type=manual --from="${vfier:-verifier}" \
-      --ask="Maker→verifier loop stuck: DIVE-$id failed verification ${iter}× (max ${maxi}). Last feedback: ${feedback:-none}. Review + decide."
+      --ask="Maker→verifier loop stuck: $ident failed verification ${iter}× (max ${maxi}). Last feedback: ${feedback:-none}. Review + decide."
     return
   fi
   # Otherwise bounce back to the maker for another pass.
   db "UPDATE tasks SET status='todo', assignee=$(sqlq "$maker"), started_at=NULL,
         result=$(sqlq "$fb_txt") WHERE id=${id};"
-  ok "DIVE-$id rejected — bounced back to maker '$maker' (iteration $iter${maxi:+/$maxi})" \
-     '{id:($i|tonumber), status:"todo", bouncedTo:$m, role:"maker", iteration:($n|tonumber)}' \
-     --arg i "$id" --arg m "$maker" --arg n "$iter"
+  ok "$ident rejected — bounced back to maker '$maker' (iteration $iter${maxi:+/$maxi})" \
+     '{id:($i|tonumber), ident:$id, status:"todo", bouncedTo:$m, role:"maker", iteration:($n|tonumber)}' \
+     --arg i "$id" --arg id "$ident" --arg m "$maker" --arg n "$iter"
 }
 
 # DIVE-478: loop observability. The org-wide board of maker→verifier loops (any
@@ -508,17 +514,36 @@ cmd_task_reject() {
 #                      standard escalate path: bump priority + ping agent & human)
 cmd_task_loops() {
   tasks_db_init
-  local only_stuck=0 show_all=0 escalate=0
+  local only_stuck=0 show_all=0 escalate=0 kill_id="" watch=0 watch_secs=3 runs_only=0
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --stuck)          only_stuck=1 ;;
       --all)            show_all=1 ;;
       --escalate-stuck) escalate=1; only_stuck=1 ;;
+      --runs)           runs_only=1 ;;
+      --kill=*)         kill_id="${1#--kill=}" ;;
+      --kill)           shift; kill_id="${1:-}" ;;
+      --watch)          watch=1 ;;
+      --watch=*)        watch=1; watch_secs="${1#--watch=}" ;;
       -*)               fail "$E_USAGE" "unknown flag: $1" ;;
       *)                fail "$E_USAGE" "unexpected arg: $1" ;;
     esac
     shift
   done
+
+  # --kill <loopId>: deferred-safe stop for a LOOP-7 run. Flips kill_requested;
+  # the running verb checks it between stages and halts + escalates-with-proof.
+  # The control window never authors work — this only sets a flag (design §2/§4).
+  if [[ -n "$kill_id" ]]; then
+    local exists; exists=$(db "SELECT 1 FROM loop_runs WHERE loop_id=$(sqlq "$kill_id") LIMIT 1;")
+    [[ "$exists" == "1" ]] || fail "$E_NOT_FOUND" "no loop run with id '$kill_id'"
+    db "UPDATE loop_runs SET kill_requested=1, updated_at=$(date +%s) WHERE loop_id=$(sqlq "$kill_id");"
+    ok "kill requested for loop ${kill_id} (deferred — halts at its next stage check)" \
+       '{loopId:$l, killRequested:true}' --arg l "$kill_id"
+    return
+  fi
+
+  [[ "$watch_secs" =~ ^[1-9][0-9]*$ ]] || fail "$E_VALIDATION" "--watch=<seconds> must be a positive integer"
   # A loop is "stuck" once it has a cap, has reached it, and still isn't closed.
   local stuck_pred="(verifier IS NOT NULL AND max_iterations IS NOT NULL
                      AND COALESCE(iteration,0) >= max_iterations
@@ -539,30 +564,66 @@ cmd_task_loops() {
     return
   fi
 
-  # COALESCE(maker_agent, assignee): before the first handoff maker_agent is NULL
-  # and the assignee IS the maker; after handoff maker_agent holds the maker and
-  # the assignee is the verifier. Either way this resolves to the maker.
-  if (( JSON_MODE )); then
-    local rows
-    rows=$(dbfmt -json "SELECT ident, status,
-             COALESCE(maker_agent, assignee) AS maker, verifier,
-             COALESCE(iteration,0) AS iteration, max_iterations,
-             COALESCE(assignee,'') AS holder,
-             CASE WHEN ${stuck_pred} THEN 1 ELSE 0 END AS stuck, title
-           FROM tasks WHERE ${where}
-           ORDER BY (CASE WHEN ${stuck_pred} THEN 1 ELSE 0 END) DESC, COALESCE(iteration,0) DESC, id;")
-    [[ -n "$rows" ]] || rows="[]"
-    printf '%s' "$rows" | jq -c '{ok:true, data:{loops:.}}'
-  else
-    dbfmt -box "SELECT ident, status,
-             COALESCE(maker_agent, COALESCE(assignee,'-')) AS maker,
-             COALESCE(verifier,'-') AS verifier,
-             COALESCE(iteration,0)||'/'||COALESCE(CAST(max_iterations AS TEXT),'∞') AS iter,
-             CASE WHEN ${stuck_pred} THEN '⚠' ELSE '' END AS stuck,
-             title
-           FROM tasks WHERE ${where}
-           ORDER BY (CASE WHEN ${stuck_pred} THEN 1 ELSE 0 END) DESC, COALESCE(iteration,0) DESC, ident;"
+  # loop_runs (LOOP-7) control-window predicate: open = status 'running'.
+  local runs_where="status='running'"; (( show_all )) && runs_where="1=1"
+
+  # One repaint of the board(s). JSON mode emits {loops, runs}; text prints the
+  # maker→verifier board (DIVE-478) then the LOOP-7 loop_runs board below it.
+  # --runs shows only the loop_runs board. Read-only — never authors work.
+  _task_loops_paint() {
+    if (( JSON_MODE )); then
+      local tloops="[]" runs="[]"
+      (( runs_only )) || tloops=$(dbfmt -json "SELECT ident, status,
+               COALESCE(maker_agent, assignee) AS maker, verifier,
+               COALESCE(iteration,0) AS iteration, max_iterations,
+               COALESCE(assignee,'') AS holder,
+               CASE WHEN ${stuck_pred} THEN 1 ELSE 0 END AS stuck, title
+             FROM tasks WHERE ${where}
+             ORDER BY (CASE WHEN ${stuck_pred} THEN 1 ELSE 0 END) DESC, COALESCE(iteration,0) DESC, id;")
+      [[ -n "$tloops" ]] || tloops="[]"
+      runs=$(dbfmt -json "SELECT loop_id, topology, COALESCE(stage,'') AS stage,
+               COALESCE(iteration,0) AS iteration, COALESCE(tokens_spent,0) AS tokens_spent,
+               ceiling, status, COALESCE(spawned_by_agent,'') AS by,
+               kill_requested, stuck
+             FROM loop_runs WHERE ${runs_where}
+             ORDER BY (status='running') DESC, started_at DESC;")
+      [[ -n "$runs" ]] || runs="[]"
+      jq -cn --argjson l "$tloops" --argjson r "$runs" '{ok:true, data:{loops:$l, runs:$r}}'
+    else
+      if (( ! runs_only )); then
+        dbfmt -box "SELECT ident, status,
+                 COALESCE(maker_agent, COALESCE(assignee,'-')) AS maker,
+                 COALESCE(verifier,'-') AS verifier,
+                 COALESCE(iteration,0)||'/'||COALESCE(CAST(max_iterations AS TEXT),'∞') AS iter,
+                 CASE WHEN ${stuck_pred} THEN '⚠' ELSE '' END AS stuck,
+                 title
+               FROM tasks WHERE ${where}
+               ORDER BY (CASE WHEN ${stuck_pred} THEN 1 ELSE 0 END) DESC, COALESCE(iteration,0) DESC, ident;"
+        printf '\nLOOP-7 runs:\n'
+      fi
+      dbfmt -box "SELECT loop_id, topology, COALESCE(NULLIF(stage,''),'-') AS stage,
+               COALESCE(iteration,0) AS iter,
+               COALESCE(tokens_spent,0)||'/'||COALESCE(CAST(ceiling AS TEXT),'∞') AS tokens,
+               status,
+               CASE WHEN kill_requested=1 THEN '✗kill' ELSE '' END AS kill,
+               CASE WHEN stuck=1 THEN '⚠' ELSE '' END AS stuck,
+               COALESCE(spawned_by_agent,'-') AS by
+             FROM loop_runs WHERE ${runs_where}
+             ORDER BY (status='running') DESC, started_at DESC;"
+    fi
+  }
+
+  # --watch: repaint on an interval (text only; JSON callers poll themselves).
+  if (( watch )) && (( ! JSON_MODE )); then
+    while :; do
+      printf '\033[2J\033[H'   # clear + home
+      printf '5dive loop control — refresh %ss (Ctrl-C to exit)\n\n' "$watch_secs"
+      _task_loops_paint
+      sleep "$watch_secs"
+    done
+    return
   fi
+  _task_loops_paint
 }
 
 # ───────────────────────── DIVE-552 loop engine ─────────────────────────
@@ -805,7 +866,7 @@ cmd_task_verify() {
     || fail "$E_USAGE" "usage: 5dive task verify <id|DIVE-N> [--cmd=\"<command>\"] [--no-done] [--timeout=<seconds>]"
   [[ -z "$timeout_s" || "$timeout_s" =~ ^[1-9][0-9]*$ ]] \
     || fail "$E_VALIDATION" "--timeout must be a positive integer (seconds)"
-  resolve_task_id "$task"; local id="$RESOLVED_TASK_ID"
+  resolve_task_id "$task"; local id="$RESOLVED_TASK_ID" ident="$RESOLVED_TASK_IDENT"
   # DIVE-476: --cmd is now optional — when omitted, fall back to the task's stored
   # verify_command (the declarative loop spec). Persisted input, no re-passing.
   if [[ -z "$cmd" ]]; then
@@ -845,16 +906,16 @@ cmd_task_verify() {
 
   if (( JSON_MODE )); then
     printf '%s' "$result_txt" | jq -R -s \
-      --arg i "$id" --arg v "$verdict" --argjson rc "$rc" \
+      --arg i "$id" --arg id "$ident" --arg v "$verdict" --argjson rc "$rc" \
       --argjson flipped "$([[ $flipped -eq 1 ]] && echo true || echo false)" \
-      '{ok:true, data:{id:($i|tonumber), verdict:$v, exit:$rc, flippedToDone:$flipped, output:.}}'
+      '{ok:true, data:{id:($i|tonumber), ident:$id, verdict:$v, exit:$rc, flippedToDone:$flipped, output:.}}'
   else
     printf '%s\n' "$result_txt" >&2
     if (( rc == 0 )); then
-      (( flipped )) && ok "DIVE-$id verify PASS — marked done" \
-                    || ok "DIVE-$id verify PASS (status unchanged, --no-done)"
+      (( flipped )) && ok "$ident verify PASS — marked done" \
+                    || ok "$ident verify PASS (status unchanged, --no-done)"
     else
-      warn "DIVE-$id verify FAIL (exit $rc) — status unchanged"
+      warn "$ident verify FAIL (exit $rc) — status unchanged"
     fi
   fi
   return $(( rc == 0 ? 0 : 1 ))
@@ -872,12 +933,12 @@ cmd_task_block() {
     shift
   done
   [[ -n "$task" && -n "$by" ]] || fail "$E_USAGE" "usage: 5dive task block <id|DIVE-N> --by=<id|DIVE-N>"
-  resolve_task_id "$task"; local tid="$RESOLVED_TASK_ID"
-  resolve_task_id "$by";   local bid="$RESOLVED_TASK_ID"
+  resolve_task_id "$task"; local tid="$RESOLVED_TASK_ID" tident="$RESOLVED_TASK_IDENT"
+  resolve_task_id "$by";   local bid="$RESOLVED_TASK_ID" bident="$RESOLVED_TASK_IDENT"
   [[ "$tid" != "$bid" ]] || fail "$E_VALIDATION" "a task can't block itself"
   db "INSERT OR IGNORE INTO task_deps (task_id, blocked_by) VALUES (${tid}, ${bid});
       UPDATE tasks SET status='blocked' WHERE id=${tid} AND status NOT IN ('done','cancelled');"
-  ok "DIVE-$tid blocked by DIVE-$bid" '{task:($t|tonumber), blocked_by:($b|tonumber)}' --arg t "$tid" --arg b "$bid"
+  ok "$tident blocked by $bident" '{task:($t|tonumber), task_ident:$ti, blocked_by:($b|tonumber), blocked_by_ident:$bi}' --arg t "$tid" --arg ti "$tident" --arg b "$bid" --arg bi "$bident"
 }
 
 cmd_task_unblock() {
@@ -892,7 +953,7 @@ cmd_task_unblock() {
     shift
   done
   [[ -n "$task" ]] || fail "$E_USAGE" "usage: 5dive task unblock <id|DIVE-N> [--by=<id|DIVE-N>]"
-  resolve_task_id "$task"; local tid="$RESOLVED_TASK_ID"
+  resolve_task_id "$task"; local tid="$RESOLVED_TASK_ID" tident="$RESOLVED_TASK_IDENT"
   if [[ -n "$by" ]]; then
     resolve_task_id "$by"; local bid="$RESOLVED_TASK_ID"
     db "DELETE FROM task_deps WHERE task_id=${tid} AND blocked_by=${bid};"
@@ -905,7 +966,7 @@ cmd_task_unblock() {
       WHERE id=${tid} AND status='blocked'
         AND (need_type IS NULL OR need_answered_at IS NOT NULL)
         AND NOT EXISTS (SELECT 1 FROM task_deps WHERE task_id=${tid});"
-  ok "DIVE-$tid unblocked" '{task:($t|tonumber)}' --arg t "$tid"
+  ok "$tident unblocked" '{task:($t|tonumber), task_ident:$ti}' --arg t "$tid" --arg ti "$tident"
 }
 
 # DIVE-356: `park` is the QUIET counterpart to `need`. A parked task is waiting
@@ -927,14 +988,14 @@ cmd_task_park() {
     shift
   done
   [[ -n "$task" ]] || fail "$E_USAGE" "usage: 5dive task park <id|DIVE-N> --reason=<why / what unblocks it>"
-  resolve_task_id "$task"; local tid="$RESOLVED_TASK_ID"
+  resolve_task_id "$task"; local tid="$RESOLVED_TASK_ID" tident="$RESOLVED_TASK_IDENT"
   db "UPDATE tasks
         SET status='blocked', parked_at=datetime('now'), park_reason=$(sqlq "$reason"),
             need_type=NULL, ask=NULL, need_options=NULL, recommend=NULL,
             need_answer=NULL, need_answered_at=NULL
       WHERE id=${tid} AND status NOT IN ('done','cancelled');"
-  ok "DIVE-$tid parked (no action needed)${reason:+ — $reason}" \
-     '{task:($t|tonumber), parked:true, reason:$r}' --arg t "$tid" --arg r "$reason"
+  ok "$tident parked (no action needed)${reason:+ — $reason}" \
+     '{task:($t|tonumber), task_ident:$ti, parked:true, reason:$r}' --arg t "$tid" --arg ti "$tident" --arg r "$reason"
 }
 
 # Clear a park -> back to todo (unless real dependency edges still block it).
@@ -942,13 +1003,13 @@ cmd_task_unpark() {
   tasks_db_init
   local task="${1:-}"
   [[ -n "$task" ]] || fail "$E_USAGE" "usage: 5dive task unpark <id|DIVE-N>"
-  resolve_task_id "$task"; local tid="$RESOLVED_TASK_ID"
+  resolve_task_id "$task"; local tid="$RESOLVED_TASK_ID" tident="$RESOLVED_TASK_IDENT"
   db "UPDATE tasks SET parked_at=NULL, park_reason=NULL,
         status=CASE WHEN status='blocked'
                      AND NOT EXISTS (SELECT 1 FROM task_deps WHERE task_id=${tid})
                     THEN 'todo' ELSE status END
       WHERE id=${tid} AND status NOT IN ('done','cancelled');"
-  ok "DIVE-$tid unparked" '{task:($t|tonumber)}' --arg t "$tid"
+  ok "$tident unparked" '{task:($t|tonumber), task_ident:$ti}' --arg t "$tid" --arg ti "$tident"
 }
 
 # --- Human Task Inbox (DIVE-103; parent feature DIVE-102) ----------------
@@ -973,7 +1034,7 @@ cmd_task_need() {
     shift
   done
   [[ ${#positional[@]} -gt 0 ]] || fail "$E_USAGE" "usage: 5dive task need <id|DIVE-N> --type=decision|secret|approval|manual --ask=\"...\" [--options=A|B] [--recommend=\"A\"]"
-  resolve_task_id "${positional[0]}"; local id="$RESOLVED_TASK_ID"
+  resolve_task_id "${positional[0]}"; local id="$RESOLVED_TASK_ID" ident="$RESOLVED_TASK_IDENT"
   valid_need_type "$type" || fail "$E_VALIDATION" "bad --type '$type' (decision|secret|approval|manual)"
   [[ -n "$ask" ]] || fail "$E_USAGE" "--ask is required (what does the human need to provide?)"
   # Options are the choice list for a decision; reject them on the other types
@@ -1005,7 +1066,7 @@ cmd_task_need() {
   fi
   local cur; cur=$(db "SELECT status FROM tasks WHERE id=${id};")
   [[ "$cur" == "done" || "$cur" == "cancelled" ]] \
-    && fail "$E_CONFLICT" "DIVE-$id is $cur — reopen it before gating on a human"
+    && fail "$E_CONFLICT" "$ident is $cur — reopen it before gating on a human"
   # assignee=actor: the agent hitting the gate becomes the owner-of-record, so
   # `task answer` knows who to ping to resume. The inbox is defined by the gate
   # (need_type set), not by assignee, so it still surfaces to the human.
@@ -1020,10 +1081,10 @@ cmd_task_need() {
   # DIVE-105: DM the paired human right now so the gate doesn't sit unseen.
   # `|| true` + the helper's own self-gating make this fully best-effort — a
   # failed DM must never fail the gate write that just committed above.
-  task_need_notify "DIVE-$id" "$type" "$ask" "$options" "$recommend" || true
-  ok "DIVE-$id needs a human ($type) — $ask" \
-     '{id:($i|tonumber), ident:("DIVE-"+$i), status:"blocked", need_type:$ty, ask:$ak, need_options:(($op|select(length>0)) // null), recommend:(($rc|select(length>0)) // null), assignee:$ac}' \
-     --arg i "$id" --arg ty "$type" --arg ak "$ask" --arg op "$options" --arg rc "$recommend" --arg ac "$actor"
+  task_need_notify "$ident" "$type" "$ask" "$options" "$recommend" || true
+  ok "$ident needs a human ($type) — $ask" \
+     '{id:($i|tonumber), ident:$id, status:"blocked", need_type:$ty, ask:$ak, need_options:(($op|select(length>0)) // null), recommend:(($rc|select(length>0)) // null), assignee:$ac}' \
+     --arg i "$id" --arg id "$ident" --arg ty "$type" --arg ak "$ask" --arg op "$options" --arg rc "$recommend" --arg ac "$actor"
 }
 
 # _task_owner_channel — resolve the filing agent's bot token + the per-type
@@ -1159,6 +1220,15 @@ task_need_notify() {
   # matched access type (TASK_CH_TYPE) gates the tap-to-answer buttons below.
   _task_owner_channel || return 0
 
+  # The /task_<n> deep link and tna:<n>:… callback both carry a BARE NUMBER that
+  # the plugin re-resolves via `5dive task show/answer <n>` — and a bare number
+  # resolves by the GLOBAL ROW ID, not the per-project issue number. Derive it
+  # from the row id, never from the ident: `${ident#DIVE-}` yields the issue
+  # number, which diverges from the row id once a non-default project consumes
+  # global ids (DIVE-484/DIVE-561), and for a non-DIVE prefix wouldn't strip at
+  # all — either way the tap would resolve the WRONG row (DIVE-561).
+  local numid; numid=$(db "SELECT id FROM tasks WHERE ident=$(sqlq "$ident");")
+
   # One message. Blank lines separate the header / ask / options so a long ask
   # doesn't render as an unreadable wall on mobile. No footer: tap buttons cover
   # decision/approval, and button-less gates (secret/manual) still surface on
@@ -1175,7 +1245,7 @@ task_need_notify() {
   # auto-linkifies bare /commands, so tapping it fires the plugin's
   # ^/task_(\d+)$ handler -> `5dive task show <id>` (the full detail card). No
   # "details" label, numeric id only. A plain-text host shows an inert link.
-  text+=$'\n\n'"${ask} /task_${ident#DIVE-}"
+  text+=$'\n\n'"${ask} /task_${numid}"
   if [[ "$need_type" == "decision" && -n "$options" ]]; then
     local opts_list
     # ⭐-mark the recommended option in the numbered list (numbering stays the
@@ -1212,7 +1282,7 @@ task_need_notify() {
   # option. Filtering empties also avoids an empty-text button (Telegram rejects
   # it, which would 400 the whole message — see the text-fallback in
   # _mirror_post). If nothing survives the filter, emit no keyboard (plain text).
-  local reply_markup="" numid="${ident#DIVE-}"
+  local reply_markup=""
   if [[ "$TASK_CH_TYPE" =~ ^(claude|codex|grok|antigravity)$ ]]; then
     if [[ "$need_type" == "decision" && -n "$options" ]]; then
       # Adaptive layout: greedily pack buttons onto a row up to a ~24-char width
@@ -1330,9 +1400,9 @@ cmd_gate_proof() {
   [[ -n "$ref" && -n "$type" ]] || fail "$E_USAGE" "usage: 5dive gate-proof <id|DIVE-N> <approval|secret>"
   [[ "$type" == "approval" || "$type" == "secret" ]] || fail "$E_VALIDATION" "gate-proof type must be approval|secret"
   _gate_proof_ensure_key || fail "$E_GENERIC" "cannot provision gate-proof key (need root)"
-  resolve_task_id "$ref"; local id="$RESOLVED_TASK_ID"
+  resolve_task_id "$ref"; local id="$RESOLVED_TASK_ID" ident="$RESOLVED_TASK_IDENT"
   local token; token=$(_gate_proof_mint "$id" "$type") || fail "$E_GENERIC" "failed to mint proof token"
-  audit_log "gate-proof mint" "ok" 0 -- "task=DIVE-$id" "type=$type"
+  audit_log "gate-proof mint" "ok" 0 -- "task=$ident" "type=$type"
   printf '%s\n' "$token"   # RAW — consumers (plugin mint, human-on-box) read stdout verbatim
 }
 
@@ -1359,11 +1429,11 @@ cmd_task_answer() {
     shift
   done
   [[ ${#positional[@]} -gt 0 ]] || fail "$E_USAGE" "usage: 5dive task answer <id|DIVE-N> --value=\"...\"  (omit --value for a secret gate)"
-  resolve_task_id "${positional[0]}"; local id="$RESOLVED_TASK_ID"
+  resolve_task_id "${positional[0]}"; local id="$RESOLVED_TASK_ID" ident="$RESOLVED_TASK_IDENT"
   # Must have a pending (unanswered) gate to answer.
   local nt
   nt=$(db "SELECT CASE WHEN need_type IS NOT NULL AND need_answered_at IS NULL THEN need_type ELSE '' END FROM tasks WHERE id=${id};")
-  [[ -n "$nt" ]] || fail "$E_CONFLICT" "DIVE-$id has no pending human gate (nothing to answer)"
+  [[ -n "$nt" ]] || fail "$E_CONFLICT" "$ident has no pending human gate (nothing to answer)"
 
   # DIVE-394: approval/secret are HUMAN-ONLY gates. Reject answers that come from
   # an agent acting as itself — that's the DIVE-391 incident, where an Olivia
@@ -1387,7 +1457,7 @@ cmd_task_answer() {
       # No audit_log here: the blocked caller is an agent user that can't write
       # the root-owned audit log anyway (it would only leak a perms error to
       # stderr). The fail + non-zero exit is the record.
-      fail "$E_AUTH_REQUIRED" "DIVE-$id is a '$nt' gate — only a human can clear it. Answer it from Telegram (tap the button) or the dashboard; an agent can't self-answer an approval/secret gate."
+      fail "$E_AUTH_REQUIRED" "$ident is a '$nt' gate — only a human can clear it. Answer it from Telegram (tap the button) or the dashboard; an agent can't self-answer an approval/secret gate."
     fi
   fi
 
@@ -1415,11 +1485,11 @@ cmd_task_answer() {
     [[ -n "$proof" ]] && _gate_proof_verify "$id" "$nt" "$proof" && _pv=1
     local _caller2; _caller2=$(id -un 2>/dev/null || echo '?')
     audit_log "task answer gate" "$([[ $_pv -eq 1 ]] && echo ok || echo error)" 0 -- \
-      "task=DIVE-$id" "type=$nt" "proof=$([[ -n "$proof" ]] && echo present || echo absent)" \
+      "task=$ident" "type=$nt" "proof=$([[ -n "$proof" ]] && echo present || echo absent)" \
       "valid=$_pv" "human=$human" "caller=$_caller2" "sudo_user=${SUDO_USER:-}" "enforce=$(_gate_proof_enforced && echo on || echo off)"
     # Reject only the agent path (no --human) without a valid proof. Human taps clear.
     if _gate_proof_enforced && (( ! _pv )) && (( ! human )); then
-      fail "$E_AUTH_REQUIRED" "DIVE-$id ($nt) needs a human to approve it — answer from Telegram (tap the button) or the dashboard. (An agent can't self-clear an approval/secret gate.)"
+      fail "$E_AUTH_REQUIRED" "$ident ($nt) needs a human to approve it — answer from Telegram (tap the button) or the dashboard. (An agent can't self-clear an approval/secret gate.)"
     fi
   fi
 
@@ -1435,7 +1505,7 @@ cmd_task_answer() {
   # We only stamp need_answered_at (the "provided" signal); the agent loads the
   # key out-of-band. decision/approval/manual store the value in need_answer.
   if [[ "$nt" == "secret" ]]; then
-    (( value_set )) && fail "$E_USAGE" "DIVE-$id is a secret gate — do not pass --value; the key must not be stored in the shared db. Run: 5dive task answer DIVE-$id  (records it as provided + pings the agent to load it from where you placed it)"
+    (( value_set )) && fail "$E_USAGE" "$ident is a secret gate — do not pass --value; the key must not be stored in the shared db. Run: 5dive task answer $ident  (records it as provided + pings the agent to load it from where you placed it)"
     db "UPDATE tasks SET need_answered_at=datetime('now'), need_answered_by=$(sqlq "$answered_by") WHERE id=${id};"
   else
     (( value_set )) || fail "$E_USAGE" "--value is required (the human's answer)"
@@ -1509,9 +1579,9 @@ cmd_task_answer() {
   if [[ -n "$owner" ]]; then
     local pingmsg
     if [[ "$nt" == "secret" ]]; then
-      pingmsg="DIVE-${id} secret gate marked provided — resume the task and load the key from where it was placed (its .env / your own channel), NOT from the task."
+      pingmsg="${ident} secret gate marked provided — resume the task and load the key from where it was placed (its .env / your own channel), NOT from the task."
     else
-      pingmsg="DIVE-${id} gate cleared — your '${nt}' ask was answered. Resume the task; run \`5dive task show DIVE-${id}\` for the value."
+      pingmsg="${ident} gate cleared — your '${nt}' ask was answered. Resume the task; run \`5dive task show ${ident}\` for the value."
     fi
     local actor; actor=$(task_actor "$from")
     if valid_sender_label "$actor"; then
@@ -1523,7 +1593,7 @@ cmd_task_answer() {
 
   local note=""
   [[ $pinged -eq 1 ]] && note=" + pinged $owner"
-  ok "DIVE-$id answered ($nt) — now ${newstatus}${note}" \
+  ok "$ident answered ($nt) — now ${newstatus}${note}" \
      '{id:($i|tonumber), status:$st, need_type:$nt, provided:true, need_answer:(if $nt=="secret" then null else $v end), owner:(($o|select(length>0)) // null), pinged:($p=="1")}' \
      --arg i "$id" --arg st "$newstatus" --arg nt "$nt" --arg v "$value" --arg o "$owner" --arg p "$pinged"
 }
@@ -1549,12 +1619,12 @@ cmd_task_escalate() {
     shift
   done
   [[ ${#positional[@]} -gt 0 ]] || fail "$E_USAGE" "usage: 5dive task escalate <id|DIVE-N>"
-  resolve_task_id "${positional[0]}"; local id="$RESOLVED_TASK_ID"
+  resolve_task_id "${positional[0]}"; local id="$RESOLVED_TASK_ID" ident="$RESOLVED_TASK_IDENT"
 
   # Don't escalate a finished task — there's nothing to get eyes on.
   local status; status=$(db "SELECT status FROM tasks WHERE id=${id};")
   [[ "$status" == "done" || "$status" == "cancelled" ]] && \
-    fail "$E_CONFLICT" "DIVE-$id is $status — nothing to escalate."
+    fail "$E_CONFLICT" "$ident is $status — nothing to escalate."
 
   local old_pri title assignee created_by
   old_pri=$(db "SELECT COALESCE(priority,'medium') FROM tasks WHERE id=${id};")
@@ -1582,7 +1652,7 @@ cmd_task_escalate() {
   # actor about its own task (an agent escalating its own work already knows).
   local pinged=0
   if [[ -n "$owner" && "$owner" != "$actor" ]]; then
-    local pingmsg="🔺 DIVE-${id} escalated by ${actor} — flagged as needing attention (priority ${pri_note}). Get eyes on it; run \`5dive task show DIVE-${id}\`."
+    local pingmsg="🔺 ${ident} escalated by ${actor} — flagged as needing attention (priority ${pri_note}). Get eyes on it; run \`5dive task show ${ident}\`."
     if valid_sender_label "$actor"; then
       ( cmd_send "$owner" --from="$actor" --message="$pingmsg" ) >/dev/null 2>&1 && pinged=1 || true
     else
@@ -1594,13 +1664,13 @@ cmd_task_escalate() {
   # mirrors task_need_notify's owner-channel resolution + send path).
   local notified_human=0
   if _task_owner_channel; then
-    local htext="🔺 [DIVE-${id}] escalated by ${actor} — needs attention"$'\n\n'"${title}"$'\n\n'"priority ${pri_note}"
+    local htext="🔺 [${ident}] escalated by ${actor} — needs attention"$'\n\n'"${title}"$'\n\n'"priority ${pri_note}"
     _task_send_owner "$htext" "" && notified_human=1 || true
   fi
 
   local note=""
   [[ $pinged -eq 1 ]] && note=" + pinged $owner"
-  ok "DIVE-$id escalated — priority ${pri_note}${note}" \
+  ok "$ident escalated — priority ${pri_note}${note}" \
      '{id:($i|tonumber), priority:$np, was:$op, owner:(($o|select(length>0)) // null), pinged:($p=="1"), human_notified:($h=="1")}' \
      --arg i "$id" --arg np "$new_pri" --arg op "$old_pri" --arg o "$owner" --arg p "$pinged" --arg h "$notified_human"
 }
@@ -1608,7 +1678,7 @@ cmd_task_escalate() {
 cmd_task_rm() {
   tasks_db_init
   [[ $# -gt 0 ]] || fail "$E_USAGE" "usage: 5dive task rm <id|DIVE-N>"
-  resolve_task_id "$1"; local id="$RESOLVED_TASK_ID"
+  resolve_task_id "$1"; local id="$RESOLVED_TASK_ID" ident="$RESOLVED_TASK_IDENT"
   db "DELETE FROM tasks WHERE id=${id};"
-  ok "DIVE-$id deleted" '{id:($i|tonumber), deleted:true}' --arg i "$id"
+  ok "$ident deleted" '{id:($i|tonumber), deleted:true}' --arg i "$id"
 }

@@ -223,6 +223,30 @@ CREATE VIEW IF NOT EXISTS task_board AS
              WHEN 'urgent' THEN 0 WHEN 'high' THEN 1
              WHEN 'medium' THEN 2 ELSE 3 END,
            created_at;
+
+-- LOOP-7: one row per loop run. The control/kill window (`task loops`) reads
+-- this live; `5dive usage` aggregates tokens_spent. loop_id is a handle, NOT a
+-- task ident (loops orchestrate over backing tasks, whose ids live in
+-- child_task_ids). Fully additive — never referenced by tasks/projects, so it
+-- can't affect the existing queue. See loop-cli-impl-design.md §2.
+CREATE TABLE IF NOT EXISTS loop_runs (
+  loop_id          TEXT PRIMARY KEY,
+  topology         TEXT NOT NULL,
+  spawned_by_agent TEXT,
+  spawned_by_task  INTEGER,
+  stage            TEXT,
+  iteration        INTEGER NOT NULL DEFAULT 0,
+  tokens_spent     INTEGER NOT NULL DEFAULT 0,
+  ceiling          INTEGER,
+  status           TEXT NOT NULL DEFAULT 'running',
+  stuck            INTEGER NOT NULL DEFAULT 0,
+  kill_requested   INTEGER NOT NULL DEFAULT 0,
+  child_task_ids   TEXT,
+  result_json      TEXT,
+  started_at       INTEGER NOT NULL,
+  updated_at       INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS loop_runs_status_idx ON loop_runs(status);
 SQL
 }
 
@@ -340,6 +364,36 @@ CREATE INDEX IF NOT EXISTS tasks_project_idx ON tasks(project_key);
 COMMIT;
 MIG
   fi
+
+  # LOOP-7 loop_runs table — additive, gated on absence so it takes no write lock
+  # on every command. Brand-new table, never referenced by tasks/projects, so
+  # creating it cannot touch the existing queue (proven non-destructive on a copy
+  # of the live db before ship). See loop-cli-impl-design.md §2.
+  local has_loop_runs
+  has_loop_runs=$(sqlite3 -cmd ".timeout 5000" "$TASKS_DB" \
+    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='loop_runs' LIMIT 1;" 2>/dev/null)
+  if [[ "$has_loop_runs" != "1" ]]; then
+    sqlite3 -cmd ".timeout 5000" "$TASKS_DB" <<'MIG' >/dev/null 2>&1 || true
+CREATE TABLE IF NOT EXISTS loop_runs (
+  loop_id          TEXT PRIMARY KEY,
+  topology         TEXT NOT NULL,
+  spawned_by_agent TEXT,
+  spawned_by_task  INTEGER,
+  stage            TEXT,
+  iteration        INTEGER NOT NULL DEFAULT 0,
+  tokens_spent     INTEGER NOT NULL DEFAULT 0,
+  ceiling          INTEGER,
+  status           TEXT NOT NULL DEFAULT 'running',
+  stuck            INTEGER NOT NULL DEFAULT 0,
+  kill_requested   INTEGER NOT NULL DEFAULT 0,
+  child_task_ids   TEXT,
+  result_json      TEXT,
+  started_at       INTEGER NOT NULL,
+  updated_at       INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS loop_runs_status_idx ON loop_runs(status);
+MIG
+  fi
 }
 
 # Per-connection setup, passed via -cmd / .timeout so it produces NO output
@@ -364,6 +418,10 @@ dbfmt() {
 # would be captured into the caller's var instead of reaching stdout. Shape is
 # validated before anything touches SQL.
 RESOLVED_TASK_ID=""
+# Also exposes the row's true display ident (DIVE-561) so callers never render
+# "DIVE-${id}" from the raw row id — those diverge once a non-default project
+# consumes global ids (DIVE-484), e.g. row 571 carries ident DIVE-561 (DIVE-561).
+RESOLVED_TASK_IDENT=""
 resolve_task_id() {
   local ref="$1" found
   if [[ "$ref" =~ ^[0-9]+$ ]]; then
@@ -381,6 +439,14 @@ resolve_task_id() {
   fi
   [[ -n "$found" ]] || fail "$E_NOT_FOUND" "no such task: $ref"
   RESOLVED_TASK_ID="$found"
+  RESOLVED_TASK_IDENT=$(db "SELECT ident FROM tasks WHERE id=${found};")
+}
+
+# Resolve a known numeric row id to its display ident (DIVE-484). Used by call
+# sites that already hold the numeric id (params, subqueries) and must render a
+# user-facing label without assuming the DIVE-<id> shortcut.
+ident_of() {
+  db "SELECT ident FROM tasks WHERE id=${1};"
 }
 
 # Who is acting: --from wins, else infer from SUDO_USER (sudo path) or $USER

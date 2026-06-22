@@ -214,6 +214,16 @@ USAGE_JQ_HELPERS='
 # cmd_usage — entry point. Dispatches budget subcommand, else renders the board
 # (no agent arg) or a single-agent detail view.
 cmd_usage() {
+  # loops subcommand (DIVE-597): token spend aggregated over the LOOP-7
+  # loop_runs table — the cost side of the loop control window. Read-only over
+  # the shared (group-readable) tasks.db like `task loops`, so NO root needed —
+  # handled before ensure_state's require_root.
+  if [[ "${1:-}" == "loops" ]]; then
+    shift
+    cmd_usage_loops "$@"
+    return
+  fi
+
   ensure_state
 
   # budget subcommand is handled separately (its own store + writes).
@@ -331,6 +341,56 @@ usage_render_agent() {
     else (.tasks | map(select(.assignee==$n)) | sort_by(-.total)[] |
       "    " + .ident + "  " + (.total|htok) + "  " + .title) end
     ' --arg n "$agent" <<<"$data"
+}
+
+# --- loop token aggregation (DIVE-597) ---------------------------------------
+# Read-only roll-up of loop_runs.tokens_spent — the cost side of the LOOP-7
+# control window (pairs with `task loops`, which shows iteration/status/kill).
+# Default: per-topology summary (loops, total tokens, ceiling sum) + a grand
+# total. --by-loop: one row per loop run. --all includes finished loops
+# (default: running only). JSON: {ok, data:{scope, total, byTopology|loops}}.
+cmd_usage_loops() {
+  tasks_db_init
+  local by_loop=0 show_all=0
+  local a
+  for a in "$@"; do
+    case "$a" in
+      --by-loop) by_loop=1 ;;
+      --all)     show_all=1 ;;
+      *)         fail "$E_USAGE" "unknown flag: $a (usage loops [--by-loop] [--all])" ;;
+    esac
+  done
+  local w="status='running'"; (( show_all )) && w="1=1"
+  local total; total=$(db "SELECT COALESCE(SUM(tokens_spent),0) FROM loop_runs WHERE ${w};")
+
+  if (( by_loop )); then
+    if (( JSON_MODE )); then
+      local rows; rows=$(dbfmt -json "SELECT loop_id, topology, status,
+               COALESCE(tokens_spent,0) AS tokens, ceiling
+             FROM loop_runs WHERE ${w} ORDER BY tokens_spent DESC, started_at DESC;")
+      [[ -n "$rows" ]] || rows="[]"
+      jq -cn --argjson r "$rows" --argjson t "${total:-0}" '{ok:true, data:{scope:"by-loop", total:$t, loops:$r}}'
+    else
+      dbfmt -box "SELECT loop_id, topology, status,
+               COALESCE(tokens_spent,0)||'/'||COALESCE(CAST(ceiling AS TEXT),'∞') AS tokens
+             FROM loop_runs WHERE ${w} ORDER BY tokens_spent DESC, started_at DESC;"
+      printf 'total: %s tokens\n' "${total:-0}"
+    fi
+    return
+  fi
+
+  if (( JSON_MODE )); then
+    local rows; rows=$(dbfmt -json "SELECT topology, COUNT(*) AS loops,
+               COALESCE(SUM(tokens_spent),0) AS tokens, COALESCE(SUM(ceiling),0) AS ceiling
+             FROM loop_runs WHERE ${w} GROUP BY topology ORDER BY tokens DESC;")
+    [[ -n "$rows" ]] || rows="[]"
+    jq -cn --argjson r "$rows" --argjson t "${total:-0}" '{ok:true, data:{scope:"by-topology", total:$t, byTopology:$r}}'
+  else
+    dbfmt -box "SELECT topology, COUNT(*) AS loops,
+               COALESCE(SUM(tokens_spent),0) AS tokens, COALESCE(SUM(ceiling),0) AS ceiling
+             FROM loop_runs WHERE ${w} GROUP BY topology ORDER BY tokens DESC;"
+    printf 'total: %s tokens\n' "${total:-0}"
+  fi
 }
 
 # --- soft per-agent token budgets (visibility-only; no hard throttle) ---------

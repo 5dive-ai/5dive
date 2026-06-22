@@ -11,6 +11,18 @@ release.
 
 ### Added
 
+- `5dive loop` — agent-native multi-agent orchestration (0.3.34, LOOP-7). Six
+  machine verbs over the existing fleet primitives, all honoring a per-loop
+  token `--ceiling` (self-halt + escalate-with-proof, never a surprise bill):
+  `spawn` (the atom — backing task + heartbeat), `verify` (maker→verifier
+  wrapper, DIVE-474), `panel` (N diverse-lens graders + quorum vote, cost-dial
+  default N=3/quorum=2), `map` (index-aligned fan-out, null-on-fail, bounded
+  concurrency), `until-dry` (K-empty-round discovery with seen-set dedup),
+  `collect` (barrier gather). Plus the human control window: `task loops` now
+  shows a live `loop_runs` board with `--runs`/`--watch`/`--kill <loopId>`
+  (deferred-safe; read-only otherwise), and `usage loops` rolls up token spend
+  per topology / per loop. New additive `loop_runs` table. 59 unit tests across
+  tests/loop_*_unit.sh.
 - `5dive hire <name> [--type=claude] [--role=… --title=…]` (0.3.33, DIVE-603) —
   ergonomic alias for `agent create` so demos/docs can say "hire a CTO" and have
   the real command match the story. Thin sugar: defaults `--type=claude`,
