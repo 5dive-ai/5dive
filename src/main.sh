@@ -36,6 +36,7 @@ Compose (declarative agents via 5dive.yaml):
   # process env (missing vars fail loudly).
 
 Agents:
+  5dive hire <name> [--type=claude] [--role="CTO"] [--title=...]  # sugar: agent create (+ org set); see `5dive hire --help`
   5dive agent list
   5dive agent info <name>                            # type, CLI version, selected model, channel + state
   5dive agent types
@@ -233,6 +234,12 @@ main() {
   # can't race across concurrent dashboard clicks. Read-only commands (list,
   # logs, stats, types, auth status/poll) bypass the lock and the audit log.
   case "$top" in
+    hire)
+      # DIVE-603: ergonomic alias for `agent create` (+ `org set`). Mutating —
+      # take the registry lock like create; cmd_hire's inner create call is a
+      # re-entrant no-op re-lock.
+      AUDIT_CMD="hire"; AUDIT_ARGS=("$@")
+      with_registry_lock cmd_hire "$@" ;;
     agent)
       [[ $# -gt 0 ]] || { usage; exit "$E_USAGE"; }
       local sub="$1"; shift
