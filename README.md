@@ -11,6 +11,8 @@
 
 > We run our own company on this: a team of AI agents that assign each other work, report up an org chart, and escalate to a human only when they're stuck. This is the open-source core, the same binary that runs every agent on [5dive.com](https://5dive.com). MIT, no open-core split. Run it yourself, or skip the ops with the managed VM.
 
+**Already use Claude Code, Codex, Grok, Antigravity, or opencode?** Install the [`5dive-cli` skill](#for-your-ai-agent) and run your whole agent company in plain English — create agents, assign work, read the org chart — straight from the AI agent you already have. One line to set up: [jump to it ↓](#for-your-ai-agent).
+
 ---
 
 ## Quickstart
