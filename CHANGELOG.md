@@ -9,6 +9,8 @@ release.
 
 ## [Unreleased]
 
+## [0.4.1] — 2026-06-23
+
 ### Added
 
 - `5dive digest` (DIVE-544 Tier 1) — deterministic per-fleet standup digest built
