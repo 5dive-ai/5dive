@@ -15,34 +15,87 @@
 #   5dive digest --json     # structured { window, done, inProgress, blocked, usage, health }
 #   5dive digest --7d       # widen the window to 7 days
 
-# _digest_tick — daily cron driver (run as root from /etc/cron.d/5dive-digest).
-# Delivers ONE per-fleet digest to the box's primary paired chat: it walks the
-# registry, finds the first telegram-enabled agent (a connector token exists),
-# and re-execs `digest --send` AS that agent so the existing owner-channel
-# resolution applies. Most customer boxes are solo, so "first" == the agent.
-# Best-effort: always returns 0 so a delivery miss never spams cron mail.
+# Per-box digest preference, in the shared state dir so it SURVIVES CLI updates
+# (install.sh seeds it OFF and never clobbers it). One digest per fleet → one
+# file. Shape: {"enabled":bool,"hour":0-23,"lastSent":"YYYY-MM-DD"}. DEFAULT OFF
+# (DIVE-544, Mark): customers opt in only via the telegram /digest command.
+_digest_pref_file() { echo "${STATE_DIR}/digest.json"; }
+_digest_pref_enabled() {
+  local f; f="$(_digest_pref_file)"
+  [ -r "$f" ] && [ "$(jq -r '.enabled // false' "$f" 2>/dev/null)" = "true" ]
+}
+_digest_pref_hour() { jq -r '.hour // 7' "$(_digest_pref_file)" 2>/dev/null || echo 7; }
+
+# _digest_onoff <on|off|status> [--at=HH] — write/read the per-box pref. Backs the
+# telegram /digest command (DIVE-624). `on` enables at the given (or stored, or
+# default 7) hour; `off` disables; `status` reports.
+_digest_onoff() {
+  local sub="$1"; shift || true
+  local f hour=""; f="$(_digest_pref_file)"
+  while [ $# -gt 0 ]; do case "$1" in --at=*) hour="${1#*=}" ;; *) fail "$E_USAGE" "digest $sub: unknown arg: $1" ;; esac; shift; done
+  mkdir -p "$(dirname "$f")"
+  local cur; cur="$(cat "$f" 2>/dev/null || true)"; [ -n "$cur" ] || cur='{"enabled":false,"hour":7}'
+  case "$sub" in
+    on)
+      [ -n "$hour" ] || hour="$(jq -r '.hour // 7' <<<"$cur")"
+      case "$hour" in ''|*[!0-9]*) fail "$E_USAGE" "digest on: --at must be an hour 0-23" ;; esac
+      { [ "$hour" -ge 0 ] && [ "$hour" -le 23 ]; } || fail "$E_USAGE" "digest on: --at must be 0-23"
+      jq --argjson h "$hour" '.enabled=true | .hour=$h' <<<"$cur" > "$f.tmp" && mv "$f.tmp" "$f"
+      echo "digest: ON — daily ${hour}:00 box-local"
+      ;;
+    off)
+      jq '.enabled=false' <<<"$cur" > "$f.tmp" && mv "$f.tmp" "$f"
+      echo "digest: OFF"
+      ;;
+    status)
+      if [ "${JSON_MODE:-0}" = 1 ]; then
+        jq -c '{enabled:(.enabled//false),hour:(.hour//7),lastSent:(.lastSent//null)}' <<<"$cur"
+      else
+        jq -r 'if (.enabled//false) then "digest: ON — daily \(.hour//7):00 box-local" else "digest: OFF" end' <<<"$cur"
+      fi
+      ;;
+    *) fail "$E_USAGE" "digest: unknown subcommand: $sub" ;;
+  esac
+}
+
+# _digest_tick — hourly cron driver (run as root from /etc/cron.d/5dive-digest).
+# Gates on the per-box pref: only fires when enabled, at the configured hour,
+# at most once per day. When it fires it delivers ONE per-fleet digest to the
+# box's primary paired chat — walks the registry, finds the first
+# telegram-enabled agent (a connector token exists), and re-execs `digest --send`
+# AS that agent so the owner-channel resolution applies (solo boxes: "first" ==
+# the agent). Best-effort: always returns 0 so a miss never spams cron mail.
 _digest_tick() {
+  _digest_pref_enabled || return 0                       # OFF by default
+  [ "$(date +%-H)" = "$(_digest_pref_hour)" ] || return 0  # not the configured hour
+  local f today last; f="$(_digest_pref_file)"; today="$(date +%F)"
+  last="$(jq -r '.lastSent // ""' "$f" 2>/dev/null)" || last=""
+  [ "$last" = "$today" ] && return 0                     # already sent today
+
   local self; self="$(command -v 5dive 2>/dev/null || echo "$0")"
-  local names name
+  local names name sent=0
   names=$(jq -r '.agents | keys[]' "$REGISTRY" 2>/dev/null) || names=""
-  if [ -z "$names" ]; then
-    echo "digest tick: no agents in registry" >&2
-    return 0
-  fi
   while IFS= read -r name; do
     [ -n "$name" ] || continue
     [ -r "${CONNECTORS_DIR}/telegram-${name}.env" ] || continue
     if sudo -u "agent-${name}" "$self" digest --send >/dev/null 2>&1; then
       echo "digest tick: delivered via agent ${name}" >&2
-      return 0
+      sent=1; break
     fi
   done <<<"$names"
-  echo "digest tick: no telegram-enabled agent to deliver via" >&2
+  if [ "$sent" = 1 ]; then
+    jq --arg d "$today" '.lastSent=$d' "$f" > "$f.tmp" 2>/dev/null && mv "$f.tmp" "$f"
+  else
+    echo "digest tick: enabled but no telegram-enabled agent to deliver via" >&2
+  fi
   return 0
 }
 
 cmd_digest() {
-  if [ "${1:-}" = "tick" ]; then shift; _digest_tick "$@"; return 0; fi
+  case "${1:-}" in
+    tick)          shift; _digest_tick "$@"; return 0 ;;
+    on|off|status) local _s="$1"; shift; _digest_onoff "$_s" "$@"; return 0 ;;
+  esac
   # `--json` is consumed globally by main() (sets JSON_MODE); read that flag here.
   local as_json="${JSON_MODE:-0}" window=86400 do_send=0
   while [ $# -gt 0 ]; do
@@ -52,6 +105,8 @@ cmd_digest() {
       --send)  do_send=1 ;;
       -h|--help)
         echo "usage: 5dive digest [--json] [--7d] [--send]"
+        echo "       5dive digest on [--at=<0-23>] | off | status   # per-box auto-delivery (default OFF)"
+        echo "       5dive digest tick                              # cron driver (hourly; gated on the pref)"
         echo "  --send  deliver the digest to the paired Telegram chat (text only)"
         return 0 ;;
       *) fail "$E_USAGE" "digest: unknown arg: $1" ;;

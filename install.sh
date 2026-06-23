@@ -44,16 +44,25 @@ refresh_managed_files() {
   chmod 755 "$BIN_DIR/5dive"
   ok "5dive → $BIN_DIR/5dive"
 
-  # DIVE-544: per-customer daily standup digest. One deterministic Telegram
-  # recap (shipped/in-progress/needs-you + usage + heartbeat health, zero agent
-  # tokens) at 07:00 box-local. Idempotent — rewritten on every install/update.
+  # DIVE-544: per-customer standup digest. The cron runs HOURLY but `digest tick`
+  # is gated on a per-box pref that defaults OFF — nothing is delivered until a
+  # customer runs `/digest on` (Mark: opt-in only). The cron is idempotent
+  # (rewritten every update); the PREF is seeded once and never clobbered, so an
+  # off/on choice + custom hour survives CLI updates.
   if [[ -d /etc/cron.d ]]; then
     cat > /etc/cron.d/5dive-digest <<'DIGESTCRON'
-# 5dive per-customer standup digest (DIVE-544) — daily Telegram recap, 07:00 local.
-0 7 * * * root /usr/local/bin/5dive digest tick >> /var/log/5dive-digest.log 2>&1
+# 5dive per-customer standup digest (DIVE-544) — hourly driver; gated on the
+# per-box pref (default OFF, set via the telegram /digest command).
+0 * * * * root /usr/local/bin/5dive digest tick >> /var/log/5dive-digest.log 2>&1
 DIGESTCRON
     chmod 644 /etc/cron.d/5dive-digest
-    ok "/etc/cron.d/5dive-digest (daily standup digest)"
+    ok "/etc/cron.d/5dive-digest (standup digest driver)"
+  fi
+  # Seed the pref OFF on first install only — never overwrite a customer's choice.
+  if [[ -n "${STATE_DIR:-}" && ! -f "${STATE_DIR}/digest.json" ]]; then
+    mkdir -p "${STATE_DIR}"
+    echo '{"enabled":false,"hour":7}' > "${STATE_DIR}/digest.json"
+    ok "digest pref seeded (off by default)"
   fi
 
   curl -fsSL "$REPO/5dive-agent-start" -o "$BIN_DIR/5dive-agent-start"

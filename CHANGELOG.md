@@ -9,6 +9,19 @@ release.
 
 ## [Unreleased]
 
+## [0.4.2] — 2026-06-23
+
+### Changed
+
+- `5dive digest` auto-delivery is now **opt-in, off by default** (DIVE-544, Mark).
+  The per-box cron runs hourly but `digest tick` is gated on a per-box pref that
+  defaults OFF — nothing is sent until a customer enables it. New
+  `5dive digest on [--at=<0-23>] | off | status` writes that pref (stored in the
+  state dir; `install.sh` seeds it off and never clobbers it, so the choice +
+  custom hour survive CLI updates). `status --json` → `{enabled,hour,lastSent}`.
+  Backs the telegram `/digest` command (DIVE-624). Each trial sends at most once
+  per day, at the configured hour, box-local.
+
 ## [0.4.1] — 2026-06-23
 
 ### Added
