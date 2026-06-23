@@ -488,6 +488,11 @@ main() {
       # a small soft-cap store. No registry mutation/lock; budget writes take root
       # inside cmd_usage. No audit — pure reporting + a visibility-only cap.
       cmd_usage "$@" ;;
+    digest)
+      # Deterministic per-fleet standup digest (DIVE-544 Tier 1): task queue +
+      # usage + heartbeat health, zero agent tokens. Read-only reporting; no
+      # registry mutation/lock, no audit (same posture as usage).
+      cmd_digest "$@" ;;
     fleet)
       # DIVE-204 v0.2: multi-box control plane. Phase 1 = the fleet registry
       # (add/ls/show/rm of peer boxes — host/user/port + key PATH, never key

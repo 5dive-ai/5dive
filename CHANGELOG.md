@@ -9,6 +9,16 @@ release.
 
 ## [Unreleased]
 
+### Added
+
+- `5dive digest` (DIVE-544 Tier 1) — deterministic per-fleet standup digest built
+  from data every fleet already has: the task queue (shipped in the last 24h /
+  in-progress / open human gates), `usage` (token burn + share-of-limit), and
+  heartbeat health. Zero agent reasoning, zero tokens; works on every fleet incl.
+  a solo-agent box and never depends on a CEO/coordinator agent. `--json` for
+  machines, `--7d` to widen the window. Foundation for the per-customer overnight
+  recap (auto-delivery via the Telegram connector is the follow-up rollout).
+
 ## [0.4.0] — 2026-06-23
 
 Headlined by `5dive loop` — agent-native multi-agent orchestration. Cuts the

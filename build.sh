@@ -46,6 +46,7 @@ cat \
   src/cmd_heartbeat.sh \
   src/cmd_fleet.sh \
   src/cmd_usage.sh \
+  src/cmd_digest.sh \
   src/cmd_pack.sh \
   src/cmd_selfupdate.sh \
   src/main.sh \
