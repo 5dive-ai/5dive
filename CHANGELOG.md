@@ -9,6 +9,12 @@ release.
 
 ## [Unreleased]
 
+## [0.4.0] — 2026-06-23
+
+Headlined by `5dive loop` — agent-native multi-agent orchestration. Cuts the
+accumulated 0.2.x–0.3.x rolling-fleet changes (point versions noted inline)
+into a tagged release; the major bump marks loop as the new orchestration line.
+
 ### Added
 
 - `5dive loop` — agent-native multi-agent orchestration (0.3.34, LOOP-7). Six
