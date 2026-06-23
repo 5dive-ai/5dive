@@ -276,6 +276,27 @@ restart_profile_agents() {
   fi
   local agents n
   agents=$(jq -c --arg p "$profile" "$sel" <<<"$reg")
+
+  # DIVE-620 self-heal: an imported agent broken before FIX A has NO authProfile
+  # binding and NO agents.d/<name>-auth.env symlink, so the select above (keyed on
+  # authProfile == $profile) misses it and a re-auth never restarts it. When the
+  # re-auth profile equals an agent's own NAME and that agent's registry
+  # authProfile is unset/empty, it's almost certainly such an orphaned import:
+  # create its missing symlink to the now-populated combined.env and fold it into
+  # the restart set. Scoped to name == profile so agents on other profiles are
+  # untouched.
+  if [[ -n "$profile" ]]; then
+    local orphan
+    orphan=$(jq -r --arg p "$profile" \
+      'if (.agents | has($p)) and ((.agents[$p].authProfile // "") == "") then "yes" else "no" end' \
+      <<<"$reg" 2>/dev/null)
+    if [[ "$orphan" == "yes" ]] && id "agent-${profile}" >/dev/null 2>&1; then
+      step "Self-healing imported agent '$profile' (no auth-profile binding) — linking + restarting"
+      link_agent_profile "$profile" "$profile"
+      agents=$(jq -c --arg p "$profile" '. + [$p] | unique' <<<"$agents")
+    fi
+  fi
+
   n=$(jq -r 'length' <<<"$agents" 2>/dev/null || echo 0)
   if (( n == 0 )); then
     step "No running agent bound${profile:+ to account '$profile'} — skipping restart"

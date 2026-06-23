@@ -466,6 +466,15 @@ cmd_import() {
   [[ -n "$type" ]] || { rm -rf "$stage"; fail "$E_VALIDATION" "manifest has no agent type"; }
   [[ -n "$workdir" ]] || workdir="$m_workdir"
   [[ -n "$profile" ]] || profile="$m_profile"
+  # DIVE-620: a dashboard marketplace import passes no --auth-profile and packs
+  # carry no profile, so $profile is empty here. Without a profile the agent is
+  # created with no authProfile binding AND no agents.d/<name>-auth.env symlink,
+  # so it boots with no creds AND a later dashboard re-auth (which selects agents
+  # by authProfile == <name>) matches nothing and never heals it. Default the
+  # profile to the new agent's name and still defer auth (below) — create
+  # pre-makes the empty profile dir + symlink, a harmless no-op until first
+  # sign-in, and re-auth then targets authProfile=<name> correctly.
+  [[ -n "$profile" ]] || profile="$as"
 
   # Build the create argv. Skills are re-added afterwards (best-effort) so one
   # unresolvable ref can't abort the import. Channels default to none unless the
@@ -473,11 +482,14 @@ cmd_import() {
   local -a cargs=("$as" "--type=$type" "--no-skills")
   [[ -n "$isolation" ]] && cargs+=("--isolation=$isolation")
   [[ -n "$workdir" ]]   && cargs+=("--workdir=$workdir")
-  if [[ -n "$profile" ]]; then
-    cargs+=("--auth-profile=$profile")
-  else
-    cargs+=("--defer-auth")   # no profile on this host → first-run UI signs in
-  fi
+  # DIVE-620: bind the profile AND defer auth. These are NOT mutually exclusive —
+  # cmd_create pre-creates the empty profile dir + symlink under --defer-auth
+  # (cmd_agent.sh ensure_profile_dir + link_agent_profile), so the imported agent
+  # gets authProfile=<profile> in the registry and the agents.d/<name>-auth.env
+  # symlink from creation, while first-run UI still does the actual sign-in. With
+  # FIX A above $profile is always set (defaults to $as), so the prior bare
+  # --defer-auth (no profile, no symlink) branch is gone.
+  cargs+=("--auth-profile=$profile" "--defer-auth")
   if [[ -n "$channels" ]]; then
     cargs+=("--channels=$channels")
   elif [[ -n "$tg_token" ]]; then
