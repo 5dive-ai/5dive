@@ -44,6 +44,18 @@ refresh_managed_files() {
   chmod 755 "$BIN_DIR/5dive"
   ok "5dive → $BIN_DIR/5dive"
 
+  # DIVE-544: per-customer daily standup digest. One deterministic Telegram
+  # recap (shipped/in-progress/needs-you + usage + heartbeat health, zero agent
+  # tokens) at 07:00 box-local. Idempotent — rewritten on every install/update.
+  if [[ -d /etc/cron.d ]]; then
+    cat > /etc/cron.d/5dive-digest <<'DIGESTCRON'
+# 5dive per-customer standup digest (DIVE-544) — daily Telegram recap, 07:00 local.
+0 7 * * * root /usr/local/bin/5dive digest tick >> /var/log/5dive-digest.log 2>&1
+DIGESTCRON
+    chmod 644 /etc/cron.d/5dive-digest
+    ok "/etc/cron.d/5dive-digest (daily standup digest)"
+  fi
+
   curl -fsSL "$REPO/5dive-agent-start" -o "$BIN_DIR/5dive-agent-start"
   chmod 755 "$BIN_DIR/5dive-agent-start"
   ok "5dive-agent-start → $BIN_DIR/5dive-agent-start"

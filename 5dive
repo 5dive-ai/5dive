@@ -16700,20 +16700,51 @@ cmd_usage_budget() {
 #   5dive digest --json     # structured { window, done, inProgress, blocked, usage, health }
 #   5dive digest --7d       # widen the window to 7 days
 
+# _digest_tick — daily cron driver (run as root from /etc/cron.d/5dive-digest).
+# Delivers ONE per-fleet digest to the box's primary paired chat: it walks the
+# registry, finds the first telegram-enabled agent (a connector token exists),
+# and re-execs `digest --send` AS that agent so the existing owner-channel
+# resolution applies. Most customer boxes are solo, so "first" == the agent.
+# Best-effort: always returns 0 so a delivery miss never spams cron mail.
+_digest_tick() {
+  local self; self="$(command -v 5dive 2>/dev/null || echo "$0")"
+  local names name
+  names=$(jq -r '.agents | keys[]' "$REGISTRY" 2>/dev/null) || names=""
+  if [ -z "$names" ]; then
+    echo "digest tick: no agents in registry" >&2
+    return 0
+  fi
+  while IFS= read -r name; do
+    [ -n "$name" ] || continue
+    [ -r "${CONNECTORS_DIR}/telegram-${name}.env" ] || continue
+    if sudo -u "agent-${name}" "$self" digest --send >/dev/null 2>&1; then
+      echo "digest tick: delivered via agent ${name}" >&2
+      return 0
+    fi
+  done <<<"$names"
+  echo "digest tick: no telegram-enabled agent to deliver via" >&2
+  return 0
+}
+
 cmd_digest() {
+  if [ "${1:-}" = "tick" ]; then shift; _digest_tick "$@"; return 0; fi
   # `--json` is consumed globally by main() (sets JSON_MODE); read that flag here.
-  local as_json="${JSON_MODE:-0}" window=86400
+  local as_json="${JSON_MODE:-0}" window=86400 do_send=0
   while [ $# -gt 0 ]; do
     case "$1" in
       --7d)    window=604800 ;;
       --24h|--day) window=86400 ;;
+      --send)  do_send=1 ;;
       -h|--help)
-        echo "usage: 5dive digest [--json] [--7d]"
+        echo "usage: 5dive digest [--json] [--7d] [--send]"
+        echo "  --send  deliver the digest to the paired Telegram chat (text only)"
         return 0 ;;
       *) fail "$E_USAGE" "digest: unknown arg: $1" ;;
     esac
     shift
   done
+  # Telegram delivery is always the human-readable text, never JSON.
+  [ "$do_send" = 1 ] && as_json=0
 
   # Three deterministic data sources. Invoke them as isolated subprocesses (not
   # in-process) so each gets a clean dispatch + setup and the EXIT-audit trap /
@@ -16736,7 +16767,7 @@ cmd_digest() {
   _digest_run heartbeat ls >"$tmpd/hb.txt" 2>/dev/null || : >"$tmpd/hb.txt"
 
   DIGEST_TASKS_F="$tmpd/tasks.json" DIGEST_USAGE_F="$tmpd/usage.json" DIGEST_HB_F="$tmpd/hb.txt" \
-  DIGEST_WINDOW="$window" DIGEST_JSON="$as_json" python3 - <<'PY'
+  DIGEST_WINDOW="$window" DIGEST_JSON="$as_json" python3 - >"$tmpd/out.txt" <<'PY'
 import os, json, time, datetime as dt
 
 window = int(os.environ["DIGEST_WINDOW"])
@@ -16868,6 +16899,21 @@ else:
         out.append("\U0001F49A Fleet healthy — heartbeats fresh, no rate-limit pressure")
     print("\n".join(out))
 PY
+
+  if [ "$do_send" = 1 ]; then
+    # Deliver via the same paired-chat path the gate alerts use (follows
+    # last-human-chat → allowed DMs → bound group topics). Best-effort: if no
+    # channel resolves, fall back to printing so a cron still leaves a log trail.
+    if _task_owner_channel; then
+      _task_send_owner "$(cat "$tmpd/out.txt")"
+      echo "digest: sent to paired Telegram chat" >&2
+    else
+      echo "digest --send: no Telegram channel resolved for this agent; printing instead" >&2
+      cat "$tmpd/out.txt"
+    fi
+  else
+    cat "$tmpd/out.txt"
+  fi
 }
 
 # -------- 5dive agent export / import — portable agent packs (DIVE-39) -----

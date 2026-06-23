@@ -16,8 +16,11 @@ release.
   in-progress / open human gates), `usage` (token burn + share-of-limit), and
   heartbeat health. Zero agent reasoning, zero tokens; works on every fleet incl.
   a solo-agent box and never depends on a CEO/coordinator agent. `--json` for
-  machines, `--7d` to widen the window. Foundation for the per-customer overnight
-  recap (auto-delivery via the Telegram connector is the follow-up rollout).
+  machines, `--7d` to widen the window. `--send` delivers it to the paired
+  Telegram chat (same owner-channel path as the gate alerts). `5dive digest tick`
+  is the cron driver, installed by `install.sh` as `/etc/cron.d/5dive-digest`
+  (daily 07:00 box-local) so every customer fleet auto-receives its overnight
+  recap.
 
 ## [0.4.0] — 2026-06-23
 
