@@ -116,7 +116,7 @@ _pack_rename_persona() {
   local old_c="${old_l^}" new_c="${new_l^}"
   [[ -n "$old_l" && "$old_l" != "$new_l" ]] || return 0
   local f
-  for f in "$dir/CLAUDE.md" "$dir/card.md" "$dir"/memory/*.md; do
+  for f in "$dir/CLAUDE.md" "$dir/card.md" "$dir/persona.yaml" "$dir"/memory/*.md; do
     [[ -f "$f" ]] || continue
     sed -i -E "s/\\b${old_c}\\b/${new_c}/g; s/\\b${old_l}\\b/${new_l}/g" "$f" 2>/dev/null || true
   done
@@ -136,6 +136,131 @@ _pack_rename_persona() {
 # done in python (pyyaml) since the persona is YAML; we keep the schema's
 # required-field contract as a structural gate (full validation lives in the
 # openagent CLI / skill — run it before provisioning).
+# Render an OpenAgent persona file into a CLAUDE.md identity doc. SINGLE source of
+# truth for persona -> identity rendering (DIVE-656), shared by `agent import
+# --from-persona`, the synth path above, and `agent import <pack>` when the pack
+# carries a persona.yaml. Args: <persona-file> <out-claude-md>. Non-zero on an
+# invalid/unreadable persona so callers can fall back.
+_persona_render_claudemd() {
+  local persona="$1" out="$2"
+  PERSONA_FILE="$persona" OUT_FILE="$out" python3 - <<'PY'
+import os, sys
+try:
+    import yaml
+except Exception as e:
+    sys.stderr.write("pyyaml required: %s\n" % e); sys.exit(3)
+with open(os.environ["PERSONA_FILE"]) as f:
+    try:
+        p = yaml.safe_load(f)
+    except Exception as e:
+        sys.stderr.write("persona is not valid YAML: %s\n" % e); sys.exit(2)
+if not isinstance(p, dict):
+    sys.stderr.write("persona must be a YAML mapping\n"); sys.exit(2)
+name = p.get("name"); role = p.get("role"); behavior = p.get("behavior")
+if not (name and role and behavior):
+    sys.stderr.write("persona missing required name/role/behavior\n"); sys.exit(2)
+face = p.get("face") or {}
+voice = p.get("voice") or {}
+written = voice.get("written") if isinstance(voice, dict) else None
+audio = voice.get("audio") if isinstance(voice, dict) else None
+written = written or {}; audio = audio or {}
+lines = ["# %s" % name, "", "You are **%s**, %s." % (name, role), "", str(behavior).strip(), ""]
+rules = (written.get("rules") if isinstance(written, dict) else None) or []
+if rules:
+    lines += ["## How you write"] + ["- %s" % r for r in rules] + [""]
+sample = written.get("sample") if isinstance(written, dict) else None
+if sample:
+    lines += ['Sample line in your voice: "%s"' % sample, ""]
+base = audio.get("base") if isinstance(audio, dict) else None
+if base and base != "unset":
+    style = audio.get("style")
+    lines += ["## Voice (audio)", "Base: %s%s" % (base, (" — %s" % style) if style else ""), ""]
+anchor = face.get("anchor") if isinstance(face, dict) else None
+if anchor:
+    lines += ["## Look", anchor, "Portrait: %s" % face.get("ref"), ""]
+posts = p.get("posts_about") or []
+if posts:
+    lines += ["## You speak to", ", ".join(str(x) for x in posts), ""]
+links = p.get("links") or {}
+if isinstance(links, dict) and links:
+    lines += ["## Links"] + ["- %s: %s" % (k, v) for k, v in links.items()] + [""]
+lines += ["---",
+          "Provisioned from an OpenAgent persona (id: `%s`, spec %s). "
+          "Identity standard: github.com/5dive-ai/openagent" % (p.get("id", ""), p.get("openagent", "0.1"))]
+with open(os.environ["OUT_FILE"], "w") as f:
+    f.write("\n".join(lines) + "\n")
+PY
+}
+
+# Emit a conforming OpenAgent persona.yaml from a live agent's staged identity
+# (DIVE-656). Makes every `agent export` pack spec-valid by construction and
+# feeds the gallery for free. Field values are best-effort extracted from the
+# staged CLAUDE.md, falling back to a minimal-but-valid (Common-tier) persona.
+# Args: <agent-name> <stage-dir> <has-avatar:0|1>. Non-zero only on a hard error.
+_agent_to_persona() {
+  local name="$1" stage="$2" has_avatar="$3"
+  A_NAME="$name" A_STAGE="$stage" A_AVATAR="$has_avatar" python3 - <<'PY'
+import os, re, sys
+try:
+    import yaml
+except Exception as e:
+    sys.stderr.write("pyyaml required: %s\n" % e); sys.exit(3)
+name = os.environ["A_NAME"]
+stage = os.environ["A_STAGE"]
+has_avatar = os.environ.get("A_AVATAR") == "1"
+md = ""
+cpath = os.path.join(stage, "CLAUDE.md")
+if os.path.exists(cpath):
+    with open(cpath) as f:
+        md = f.read()
+
+# id: agent slug — already kebab on 5dive; sanitize defensively to ^[a-z0-9-]+$.
+pid = re.sub(r"[^a-z0-9-]+", "-", name.lower()).strip("-") or "agent"
+
+# Display name + role: prefer a "You are **X**, <role>." line in the identity doc.
+disp = (name[:1].upper() + name[1:]) if name else "Agent"
+role = "5dive agent"
+m = re.search(r"You are \*\*([^*]+)\*\*,\s*([^.\n]+)", md)
+if m:
+    disp = m.group(1).strip(); role = m.group(2).strip()
+else:
+    m2 = re.search(r"You are \*\*([^*]+)\*\*", md)
+    if m2:
+        disp = m2.group(1).strip()
+
+# behavior: the CLAUDE.md body is the agent's operating instructions. Drop the
+# leading "# Title" line; cap length so a persona stays a card, not a doc dump.
+behavior = ""
+if md:
+    behavior = re.sub(r"^#[^\n]*\n", "", md.strip(), count=1).strip()
+if not behavior:
+    behavior = "%s is a 5dive agent. See the team conventions for how it operates." % disp
+if len(behavior) > 1200:
+    behavior = behavior[:1200].rstrip() + " …"
+
+persona = {
+    "openagent": "0.1",
+    "id": pid,
+    "name": disp,
+    "role": role,
+    "behavior": behavior,
+    "face": {
+        "ref": "avatar.png" if has_avatar else ("monogram:%s" % disp[:1].upper()),
+        "anchor": "%s, a 5dive agent." % disp,
+    },
+    "voice": {
+        "written": {
+            "rules": ["Write in %s's consistent voice." % disp,
+                      "Stay in role as %s." % role],
+            "sample": "I'm %s — %s." % (disp, role),
+        }
+    },
+}
+with open(os.path.join(stage, "persona.yaml"), "w") as f:
+    yaml.safe_dump(persona, f, sort_keys=False, allow_unicode=True, default_flow_style=False)
+PY
+}
+
 _persona_to_pack() {
   local persona="$1" type="$2" isolation="$3" model="$4" effort="$5"
   [[ -f "$persona" ]] || { echo "persona file not found: $persona" >&2; return 1; }
@@ -176,32 +301,8 @@ audio = voice.get("audio") or {}
 written = voice.get("written") or {}
 need(isinstance(voice, dict) and (audio or written), "voice needs audio and/or written")
 
-# --- CLAUDE.md identity doc, generated from the persona ---
-lines = ["# %s" % name, "", "You are **%s**, %s." % (name, role), "", str(behavior).strip(), ""]
-rules = (written.get("rules") if isinstance(written, dict) else None) or []
-if rules:
-    lines += ["## How you write"] + ["- %s" % r for r in rules] + [""]
-sample = written.get("sample") if isinstance(written, dict) else None
-if sample:
-    lines += ['Sample line in your voice: "%s"' % sample, ""]
-base = audio.get("base") if isinstance(audio, dict) else None
-if base and base != "unset":
-    style = audio.get("style")
-    lines += ["## Voice (audio)", "Base: %s%s" % (base, (" — %s" % style) if style else ""), ""]
-anchor = face.get("anchor")
-if anchor:
-    lines += ["## Look", anchor, "Portrait: %s" % face.get("ref"), ""]
-posts = p.get("posts_about") or []
-if posts:
-    lines += ["## You speak to", ", ".join(str(x) for x in posts), ""]
-links = p.get("links") or {}
-if isinstance(links, dict) and links:
-    lines += ["## Links"] + ["- %s: %s" % (k, v) for k, v in links.items()] + [""]
-lines += ["---",
-          "Provisioned from an OpenAgent persona (id: `%s`, spec %s). "
-          "Identity standard: github.com/5dive-ai/openagent" % (pid, p.get("openagent", "0.1"))]
-with open(os.path.join(stage, "CLAUDE.md"), "w") as f:
-    f.write("\n".join(lines) + "\n")
+# CLAUDE.md identity doc is rendered by _persona_render_claudemd (shared with the
+# packed-persona import path, DIVE-656) after this python block returns.
 
 # --- manifest.json: shape cmd_import consumes (packFormat 1) ---
 cfg = {"type": os.environ["P_TYPE"], "isolation": os.environ["P_ISO"]}
@@ -231,6 +332,14 @@ PY
   then
     rm -rf "$stage"; echo "could not synthesize pack from persona" >&2; return 1
   fi
+
+  # Render the identity doc from the persona (shared renderer, DIVE-656) and carry
+  # the persona itself into the pack so it round-trips and stays spec-valid by
+  # construction — cmd_import re-derives identity from it.
+  if ! _persona_render_claudemd "$persona" "$stage/CLAUDE.md"; then
+    rm -rf "$stage"; echo "could not render identity doc from persona" >&2; return 1
+  fi
+  cp "$persona" "$stage/persona.yaml" 2>/dev/null || true
 
   # Fetch the portrait into avatar.png when face.ref is a public URL (local-only
   # paths can't travel cross-user, so we skip them — the card falls back to a
@@ -470,6 +579,12 @@ cmd_export() {
   if [[ -f "$cdir/CLAUDE.md" ]]; then
     cp "$cdir/CLAUDE.md" "$stage/CLAUDE.md"
   fi
+  # Avatar (set on import/onboarding, DIVE-494) — carry it so the persona's
+  # face.ref="avatar.png" round-trips and the gallery has a portrait.
+  local has_avatar=0
+  if [[ -f "$cdir/avatar.png" ]]; then
+    cp "$cdir/avatar.png" "$stage/avatar.png" 2>/dev/null && has_avatar=1
+  fi
   # Skills as source refs (reuse the skills spec; import re-adds them) — names only.
   local skills='[]'
   if [[ -d "$cdir/skills" ]]; then
@@ -492,6 +607,14 @@ cmd_export() {
     mem_inc="distilled"
   fi
 
+  # Emit a conforming OpenAgent persona.yaml (DIVE-656) so the pack is spec-valid
+  # by construction and feeds the gallery. Derived from the staged identity doc;
+  # never fatal — a pack without a persona is still importable.
+  local has_persona="false"
+  if _agent_to_persona "$name" "$stage" "$has_avatar" 2>/dev/null && [[ -f "$stage/persona.yaml" ]]; then
+    has_persona="true"
+  fi
+
   # Build the manifest.
   jq -n \
     --argjson fmt "$PACK_FORMAT_VERSION" \
@@ -501,11 +624,12 @@ cmd_export() {
     --arg model "$model" --arg effort "$effort" \
     --argjson plugins "$plugins" --argjson skills "$skills" --argjson hooks "$hooks" \
     --arg mem "$mem_inc" \
+    --argjson persona "$has_persona" \
     '{
       packFormat: $fmt,
       agentName: $name,
       createdWith: $ver,
-      includes: { memory: (if $mem=="false" then false else $mem end) },
+      includes: { memory: (if $mem=="false" then false else $mem end), persona: $persona },
       config: ($cfg + {
         model: (if $model=="" then null else $model end),
         effort: (if $effort=="" then null else $effort end)
@@ -624,6 +748,21 @@ cmd_import() {
     rm -rf "$stage"; fail "$E_VALIDATION" "pack declares unsupported memory mode '$mem_inc'"
   fi
 
+  # DIVE-656: if the pack carries an OpenAgent persona.yaml it is the CANONICAL
+  # identity source — (re)render CLAUDE.md from it so the imported agent's identity
+  # is spec-driven, not a stale hand-edited doc. Falls back to the packed CLAUDE.md
+  # if the persona is unreadable. Runs before the rename below so the name swap
+  # still applies to the rendered doc.
+  if [[ -f "$stage/persona.yaml" ]]; then
+    if _persona_render_claudemd "$stage/persona.yaml" "$stage/CLAUDE.md.oa.$$" 2>/dev/null; then
+      mv "$stage/CLAUDE.md.oa.$$" "$stage/CLAUDE.md"
+      step "Identity sourced from the pack's OpenAgent persona.yaml"
+    else
+      rm -f "$stage/CLAUDE.md.oa.$$"
+      warn "pack's persona.yaml is not a valid OpenAgent persona — using the packed CLAUDE.md"
+    fi
+  fi
+
   # Rename the persona to the chosen --as name (CLAUDE.md + card + seed memory) so
   # an imported agent doesn't keep introducing itself by the pack's original name.
   local orig_name; orig_name=$(jq -r '.agentName // empty' "$stage/manifest.json")
@@ -687,6 +826,13 @@ cmd_import() {
   # Layer the identity doc.
   if [[ -f "$stage/CLAUDE.md" ]]; then
     install -o "agent-${as}" -g "agent-${as}" -m 644 "$stage/CLAUDE.md" "$cdir/CLAUDE.md" 2>/dev/null || true
+  fi
+
+  # Preserve the OpenAgent persona.yaml (DIVE-656) so the imported agent owns its
+  # canonical identity file — it can re-export, re-sign, or feed the gallery. The
+  # rename above already swapped the pack's name/id to the --as name.
+  if [[ -f "$stage/persona.yaml" ]]; then
+    install -o "agent-${as}" -g "agent-${as}" -m 644 "$stage/persona.yaml" "$cdir/persona.yaml" 2>/dev/null || true
   fi
 
   # Stash the character avatar so the onboarding/Telegram flow (DIVE-494) can set
