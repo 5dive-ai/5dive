@@ -49,7 +49,7 @@ RUN systemctl mask \
 # resolve to local files. Keeps install.sh as the single source of truth for
 # laying down binaries / units / hooks / skills — the Dockerfile doesn't
 # duplicate that logic.
-COPY 5dive 5dive-agent-start 5dive-refresh-plugins.sh install.sh projects-CLAUDE.md telegram-agent-CLAUDE.md /opt/5dive-bundle/
+COPY 5dive 5dive-agent-start 5dive-refresh-plugins.sh 5dive-refresh-skills.sh install.sh projects-CLAUDE.md telegram-agent-CLAUDE.md /opt/5dive-bundle/
 COPY hooks /opt/5dive-bundle/hooks/
 COPY skills /opt/5dive-bundle/skills/
 COPY systemd /opt/5dive-bundle/systemd/

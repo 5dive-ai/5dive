@@ -9,6 +9,27 @@ release.
 
 ## [Unreleased]
 
+### Added
+
+- `5dive agent import --from-persona=<file.persona.yaml>` (DIVE-658 #2, Mark) —
+  provision a **live agent from an OpenAgent persona**. The persona carries
+  identity (name, role, look, voice, behavior); runtime config comes from flags
+  (`--type` default claude, `--isolation`, `--model`, `--effort`, `--channels`,
+  …). The CLI synthesizes a v1 character pack from the persona — a generated
+  CLAUDE.md identity doc, the portrait fetched from `face.ref` as the avatar, and
+  a manifest seeding `find-skills`/`5dive-cli`/`compile-knowledge`/`openagent` —
+  then runs the normal import flow. Turns the openagent skill's self-**author**
+  into self-**provision**: an agent can mint a persona and stand up a teammate
+  from it. Structural gate mirrors the v0.1 schema's required fields.
+- Fleet rollout of the `openagent` self-author skill (DIVE-658, Mark). Every
+  agent-create path now seeds `openagent` (from `<org>/skills`) alongside
+  `find-skills`, `5dive-cli`, and `compile-knowledge`, so new agents can author
+  + validate their own OpenAgent persona out of the box. Covers all five types
+  (claude, codex, grok, antigravity, opencode). Existing boxes are backfilled by
+  `5dive-refresh-skills.sh` on the daily update cron (runs as the agent user,
+  post-first-boot, idempotent — skips agents that have never booted to dodge the
+  missing-`~/.claude` gotcha).
+
 ## [0.4.2] — 2026-06-23
 
 ### Changed

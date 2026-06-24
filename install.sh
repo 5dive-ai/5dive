@@ -76,6 +76,13 @@ DIGESTCRON
   chmod 755 "$BIN_DIR/5dive-refresh-plugins.sh"
   ok "5dive-refresh-plugins.sh → $BIN_DIR/5dive-refresh-plugins.sh"
 
+  # Skills backfill — brings existing agents up to the current default skill
+  # set (new defaults like openagent, DIVE-658). The daily update cron runs it
+  # right after the plugin refresh, before agents restart.
+  curl -fsSL "$REPO/5dive-refresh-skills.sh" -o "$BIN_DIR/5dive-refresh-skills.sh"
+  chmod 755 "$BIN_DIR/5dive-refresh-skills.sh"
+  ok "5dive-refresh-skills.sh → $BIN_DIR/5dive-refresh-skills.sh"
+
   curl -fsSL "$REPO/systemd/5dive-agent%40.service" -o "$SYSTEMD_DIR/5dive-agent@.service"
   ok "systemd template installed"
 
@@ -453,6 +460,13 @@ if [[ "${1:-}" == "--upgrade" ]]; then
   # is missing it self-skips. Failures here shouldn't block the upgrade.
   if [[ -x "$BIN_DIR/5dive-refresh-plugins.sh" ]]; then
     "$BIN_DIR/5dive-refresh-plugins.sh" 2>&1 | tail -20 || true
+  fi
+
+  # Backfill default skills onto existing agents (e.g. openagent, DIVE-658).
+  # Same best-effort contract: no-op on a fresh box, self-skips never-booted
+  # agents, failures don't block the upgrade.
+  if [[ -x "$BIN_DIR/5dive-refresh-skills.sh" ]]; then
+    "$BIN_DIR/5dive-refresh-skills.sh" 2>&1 | tail -20 || true
   fi
 
   echo

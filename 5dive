@@ -26,7 +26,7 @@ esac
 
 # Bumped on every public release. `build.sh` checks this line exists; CI fails
 # the bundle-drift check if it's missing or empty.
-readonly FIVE_VERSION="0.4.3"
+readonly FIVE_VERSION="0.4.4"
 
 # GitHub org our repos live under. The org is being renamed
 # 5dive-com -> 5dive-ai (2026-06); fetches must work on either side of the
@@ -877,6 +877,7 @@ JSON
   install_default_skill_for_agent "$name" claude vercel-labs/skills find-skills || true
   install_default_skill_for_agent "$name" claude "$(gh_org)/skills" 5dive-cli || true
   install_default_skill_for_agent "$name" claude "$(gh_org)/skills" compile-knowledge || true
+  install_default_skill_for_agent "$name" claude "$(gh_org)/skills" openagent || true
 }
 
 # Preseed default skills for an antigravity agent. Unlike claude/codex/grok,
@@ -893,6 +894,7 @@ preseed_antigravity_agent() {
   install_default_skill_for_agent "$name" antigravity vercel-labs/skills find-skills || true
   install_default_skill_for_agent "$name" antigravity "$(gh_org)/skills" 5dive-cli || true
   install_default_skill_for_agent "$name" antigravity "$(gh_org)/skills" compile-knowledge || true
+  install_default_skill_for_agent "$name" antigravity "$(gh_org)/skills" openagent || true
 }
 
 # Types that `npx skills add --agent <id>` doesn't recognize. The upstream
@@ -1484,6 +1486,7 @@ CODEX_ENV
   install_default_skill_for_agent "$name" codex vercel-labs/skills find-skills || true
   install_default_skill_for_agent "$name" codex "$(gh_org)/skills" 5dive-cli || true
   install_default_skill_for_agent "$name" codex "$(gh_org)/skills" compile-knowledge || true
+  install_default_skill_for_agent "$name" codex "$(gh_org)/skills" openagent || true
 }
 
 # Write ~/.codex/channels/telegram/access.json for agent-<name> with allowFrom
@@ -1609,6 +1612,7 @@ GROK_ENV
   install_default_skill_for_agent "$name" grok vercel-labs/skills find-skills || true
   install_default_skill_for_agent "$name" grok "$(gh_org)/skills" 5dive-cli || true
   install_default_skill_for_agent "$name" grok "$(gh_org)/skills" compile-knowledge || true
+  install_default_skill_for_agent "$name" grok "$(gh_org)/skills" openagent || true
 }
 
 # Write ~/.grok/channels/telegram/access.json for agent-<name> with allowFrom
@@ -1732,6 +1736,7 @@ AGY_ENV
   install_default_skill_for_agent "$name" antigravity vercel-labs/skills find-skills || true
   install_default_skill_for_agent "$name" antigravity "$(gh_org)/skills" 5dive-cli || true
   install_default_skill_for_agent "$name" antigravity "$(gh_org)/skills" compile-knowledge || true
+  install_default_skill_for_agent "$name" antigravity "$(gh_org)/skills" openagent || true
 }
 
 # Write ~/.gemini/channels/telegram/access.json for agent-<name> with allowFrom
@@ -1860,6 +1865,7 @@ OPENCODE_ENV
   install_default_skill_for_agent "$name" opencode vercel-labs/skills find-skills || true
   install_default_skill_for_agent "$name" opencode "$(gh_org)/skills" 5dive-cli || true
   install_default_skill_for_agent "$name" opencode "$(gh_org)/skills" compile-knowledge || true
+  install_default_skill_for_agent "$name" opencode "$(gh_org)/skills" openagent || true
 }
 
 # Write ~/.opencode/channels/telegram/access.json for agent-<name>. Idempotent —
@@ -17094,6 +17100,135 @@ _pack_rename_persona() {
   done
 }
 
+# -------- OpenAgent persona → live agent (DIVE-658 #2) ---------------------
+# Bridge the OpenAgent identity spec (github.com/5dive-ai/openagent) to actual
+# provisioning: a `<id>.persona.yaml` carries IDENTITY (name, role, look, voice,
+# behavior) but no 5dive RUNTIME config (type, model, isolation, channels), so
+# this synthesizes a v1 character pack from the persona — manifest + a CLAUDE.md
+# identity doc + the portrait as avatar.png — and hands it to the normal
+# cmd_import flow. Runtime config comes from flags (sane defaults), identity
+# from the persona. Self-author (the openagent skill) → self-PROVISION (here).
+
+# Build a pack tarball from an OpenAgent persona file. Echoes the .tar.gz path.
+# Args: <persona-file> <type> <isolation> <model> <effort>. Parsing/synthesis is
+# done in python (pyyaml) since the persona is YAML; we keep the schema's
+# required-field contract as a structural gate (full validation lives in the
+# openagent CLI / skill — run it before provisioning).
+_persona_to_pack() {
+  local persona="$1" type="$2" isolation="$3" model="$4" effort="$5"
+  [[ -f "$persona" ]] || { echo "persona file not found: $persona" >&2; return 1; }
+  local stage; stage=$(mktemp -d)
+  # Default skills every provisioned agent should carry — keep aligned with the
+  # create-path defaults plus openagent so the new agent can iterate its own card.
+  if ! PERSONA_FILE="$persona" P_TYPE="$type" P_ISO="$isolation" \
+       P_MODEL="$model" P_EFFORT="$effort" P_VERSION="$FIVE_VERSION" P_STAGE="$stage" \
+       python3 - <<'PY'
+import os, sys, json, re
+try:
+    import yaml
+except Exception as e:
+    sys.stderr.write("python3 yaml (pyyaml) is required to import a persona: %s\n" % e); sys.exit(3)
+
+stage = os.environ["P_STAGE"]
+with open(os.environ["PERSONA_FILE"]) as f:
+    try:
+        p = yaml.safe_load(f)
+    except Exception as e:
+        sys.stderr.write("persona is not valid YAML: %s\n" % e); sys.exit(2)
+if not isinstance(p, dict):
+    sys.stderr.write("persona must be a YAML mapping\n"); sys.exit(2)
+
+# Structural gate mirroring schema/persona.schema.json's required set.
+def need(cond, msg):
+    if not cond:
+        sys.stderr.write("invalid persona: %s\n" % msg); sys.exit(2)
+
+pid = p.get("id", "")
+need(isinstance(pid, str) and re.match(r"^[a-z0-9-]+$", pid or ""), "id missing or not ^[a-z0-9-]+$")
+name = p.get("name"); role = p.get("role"); behavior = p.get("behavior")
+need(name and role and behavior, "name, role, behavior are all required")
+face = p.get("face") or {}
+need(isinstance(face, dict) and face.get("ref") and face.get("anchor"), "face.ref and face.anchor are required")
+voice = p.get("voice") or {}
+audio = voice.get("audio") or {}
+written = voice.get("written") or {}
+need(isinstance(voice, dict) and (audio or written), "voice needs audio and/or written")
+
+# --- CLAUDE.md identity doc, generated from the persona ---
+lines = ["# %s" % name, "", "You are **%s**, %s." % (name, role), "", str(behavior).strip(), ""]
+rules = (written.get("rules") if isinstance(written, dict) else None) or []
+if rules:
+    lines += ["## How you write"] + ["- %s" % r for r in rules] + [""]
+sample = written.get("sample") if isinstance(written, dict) else None
+if sample:
+    lines += ['Sample line in your voice: "%s"' % sample, ""]
+base = audio.get("base") if isinstance(audio, dict) else None
+if base and base != "unset":
+    style = audio.get("style")
+    lines += ["## Voice (audio)", "Base: %s%s" % (base, (" — %s" % style) if style else ""), ""]
+anchor = face.get("anchor")
+if anchor:
+    lines += ["## Look", anchor, "Portrait: %s" % face.get("ref"), ""]
+posts = p.get("posts_about") or []
+if posts:
+    lines += ["## You speak to", ", ".join(str(x) for x in posts), ""]
+links = p.get("links") or {}
+if isinstance(links, dict) and links:
+    lines += ["## Links"] + ["- %s: %s" % (k, v) for k, v in links.items()] + [""]
+lines += ["---",
+          "Provisioned from an OpenAgent persona (id: `%s`, spec %s). "
+          "Identity standard: github.com/5dive-ai/openagent" % (pid, p.get("openagent", "0.1"))]
+with open(os.path.join(stage, "CLAUDE.md"), "w") as f:
+    f.write("\n".join(lines) + "\n")
+
+# --- manifest.json: shape cmd_import consumes (packFormat 1) ---
+cfg = {"type": os.environ["P_TYPE"], "isolation": os.environ["P_ISO"]}
+if os.environ.get("P_MODEL"):  cfg["model"]  = os.environ["P_MODEL"]
+if os.environ.get("P_EFFORT"): cfg["effort"] = os.environ["P_EFFORT"]
+manifest = {
+    "packFormat": 1,
+    "agentName": name,
+    "createdWith": os.environ["P_VERSION"],
+    "source": "openagent-persona",
+    "openagent": {"id": pid, "spec": str(p.get("openagent", "0.1"))},
+    "includes": {"memory": False},
+    "config": cfg,
+    "plugins": [],
+    # Resolved from <org>/skills by cmd_import; openagent lets the new agent
+    # re-author/iterate its own persona card.
+    "skills": ["find-skills", "5dive-cli", "compile-knowledge", "openagent"],
+    "hooks": {},
+    "avatar": None,
+}
+with open(os.path.join(stage, "manifest.json"), "w") as f:
+    json.dump(manifest, f, indent=2)
+# Sidecar for the bash side: the portrait ref, to fetch if it's a URL.
+with open(os.path.join(stage, ".faceref"), "w") as f:
+    f.write(face.get("ref", "") or "")
+PY
+  then
+    rm -rf "$stage"; echo "could not synthesize pack from persona" >&2; return 1
+  fi
+
+  # Fetch the portrait into avatar.png when face.ref is a public URL (local-only
+  # paths can't travel cross-user, so we skip them — the card falls back to a
+  # monogram, same contract as the openagent skill). The sidecar is consumed
+  # here and removed so it never lands in the pack.
+  local ref; ref=$(cat "$stage/.faceref" 2>/dev/null); rm -f "$stage/.faceref"
+  if [[ "$ref" =~ ^https?:// ]]; then
+    if curl -fsSL --max-time 20 "$ref" -o "$stage/avatar.png" 2>/dev/null; then
+      jq '.avatar="avatar.png"' "$stage/manifest.json" > "$stage/m.$$" \
+        && mv "$stage/m.$$" "$stage/manifest.json" || rm -f "$stage/m.$$"
+    else
+      rm -f "$stage/avatar.png"
+    fi
+  fi
+
+  local out; out=$(mktemp --suffix=.tar.gz)
+  tar -czf "$out" -C "$stage" . 2>/dev/null || { rm -rf "$stage" "$out"; return 1; }
+  rm -rf "$stage"; echo "$out"
+}
+
 # `5dive agent marketplace [ls]` — browse the character-pack registry.
 cmd_marketplace() {
   local sub="${1:-ls}"; [[ $# -gt 0 ]] && shift
@@ -17386,6 +17521,10 @@ cmd_import() {
   require_root
   local pack="" as="" channels="" tg_token="" dc_token="" profile="" workdir=""
   local report_import=0 import_slug=""
+  # DIVE-658 #2: provision straight from an OpenAgent persona file. The persona
+  # carries identity only; these flags supply the 5dive runtime config the pack
+  # would otherwise hold (sane defaults; only consumed in --from-persona mode).
+  local from_persona="" p_type="claude" p_iso="standard" p_model="" p_effort=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --as=*)              as="${1#--as=}" ;;
@@ -17394,6 +17533,11 @@ cmd_import() {
       --discord-token=*)   dc_token="${1#--discord-token=}" ;;
       --auth-profile=*)    profile="${1#--auth-profile=}" ;;
       --workdir=*)         workdir="${1#--workdir=}" ;;
+      --from-persona=*)    from_persona="${1#--from-persona=}" ;;
+      --type=*)            p_type="${1#--type=}" ;;
+      --isolation=*)       p_iso="${1#--isolation=}" ;;
+      --model=*)           p_model="${1#--model=}" ;;
+      --effort=*)          p_effort="${1#--effort=}" ;;
       # DIVE-644: opt-in, default-OFF import telemetry. Only meaningful for a
       # registry-slug import (a local .tar.gz has no public slug to report).
       --report-import)     report_import=1 ;;
@@ -17402,8 +17546,20 @@ cmd_import() {
     esac
     shift
   done
-  [[ -n "$pack" ]] || fail "$E_USAGE" "usage: 5dive agent import <pack> --as=<name> [--channels=...] [--telegram-token=...] [--discord-token=...] [--auth-profile=...] [--workdir=...]"
   [[ -n "$as" ]]   || fail "$E_USAGE" "--as=<name> is required (the new agent's name)"
+
+  # Persona mode: synthesize a v1 pack from the OpenAgent persona, then fall into
+  # the normal pack-import flow below (the synth tarball IS the pack).
+  local persona_tmp=""
+  if [[ -n "$from_persona" ]]; then
+    [[ -z "$pack" ]] || fail "$E_USAGE" "give a pack OR --from-persona, not both"
+    [[ -f "$from_persona" ]] || fail "$E_NOT_FOUND" "persona file not found: $from_persona"
+    step "Synthesizing pack from OpenAgent persona '$from_persona' (type=$p_type)"
+    persona_tmp=$(_persona_to_pack "$from_persona" "$p_type" "$p_iso" "$p_model" "$p_effort") \
+      || fail "$E_VALIDATION" "could not build a pack from persona '$from_persona' (is it a valid OpenAgent persona?)"
+    pack="$persona_tmp"
+  fi
+  [[ -n "$pack" ]] || fail "$E_USAGE" "usage: 5dive agent import <pack>|--from-persona=<file.persona.yaml> --as=<name> [--type=claude] [--channels=...] [--telegram-token=...] [--discord-token=...] [--auth-profile=...] [--workdir=...]"
 
   # A bare slug (not a local file) → resolve from the character-pack git registry.
   local resolved_tmp=""
@@ -17427,8 +17583,9 @@ cmd_import() {
   # Unpack into an isolated stage and validate the manifest before touching anything.
   local stage; stage=$(mktemp -d)
   tar -xzf "$pack" -C "$stage" 2>/dev/null \
-    || { rm -rf "$stage" "$resolved_tmp"; fail "$E_GENERIC" "could not read pack (expected a .tar.gz from 'agent export')"; }
+    || { rm -rf "$stage" "$resolved_tmp" "$persona_tmp"; fail "$E_GENERIC" "could not read pack (expected a .tar.gz from 'agent export')"; }
   [[ -n "$resolved_tmp" ]] && rm -f "$resolved_tmp"
+  [[ -n "$persona_tmp" ]] && rm -f "$persona_tmp"
   [[ -f "$stage/manifest.json" ]] \
     || { rm -rf "$stage"; fail "$E_VALIDATION" "pack has no manifest.json — not a 5dive agent pack"; }
 
