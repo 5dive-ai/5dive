@@ -27,6 +27,21 @@ PACK_FORMAT_VERSION=1
 
 _marketplace_base() { echo "https://raw.githubusercontent.com/$(gh_org)/character-packs/main"; }
 
+# DIVE-644: opt-in import telemetry (the ONLY api.5dive.com touchpoint on the
+# pack path, and only when the user passes `agent import <slug> --report-import`;
+# default OFF, so the marketplace stays a zero-backend git registry by default).
+# We POST just the slug to an increment-only, ZERO-PII counter so the OpenAgent
+# gallery can rank "Most-imported". Best-effort: short timeout, all errors
+# swallowed — a down/blocked endpoint must never affect the import outcome.
+_oa_api_base() { echo "${FIVE_API_BASE:-https://api.5dive.com}"; }
+_report_import() {
+  local slug="$1"
+  [[ "$slug" =~ ^[a-z0-9][a-z0-9._-]{0,63}$ ]] || return 1
+  curl -fsS --max-time 5 -X POST "$(_oa_api_base)/openagent/imports" \
+    -H "Content-Type: application/json" \
+    -d "{\"slug\":\"$slug\"}" >/dev/null 2>&1
+}
+
 _marketplace_index() { curl -fsSL --max-time 20 "$(_marketplace_base)/index.json" 2>/dev/null; }
 
 # Resolve registry pack <slug> → a local .tar.gz (same shape `agent export` writes,
@@ -144,10 +159,13 @@ _pack_usage() {
   5dive agent marketplace [ls]    # browse the character-pack registry (<org>/character-packs)
   5dive agent import <pack|slug> --as=<name> [--channels=none|telegram|discord]
                             [--telegram-token=<tok>] [--discord-token=<tok>]
-                            [--auth-profile=<name>] [--workdir=<path>]
+                            [--auth-profile=<name>] [--workdir=<path>] [--report-import]
                                   # recreate an agent from a pack into a FRESH name.
                                   # <pack> = a .tar.gz file OR a bare registry slug
                                   # (e.g. `import lilbro --as=...`) pulled from the git registry.
+                                  # --report-import (opt-in, default OFF): ping a public
+                                  # increment-only, zero-PII counter with just the pack slug
+                                  # so the gallery can rank Most-imported. Registry slugs only.
                                   # Packs carry no secrets: supply the new agent's own
                                   # token/auth-profile here. Skills are re-added from their
                                   # recorded refs (skills not in a published repo are skipped
@@ -395,6 +413,7 @@ cmd_export() {
 cmd_import() {
   require_root
   local pack="" as="" channels="" tg_token="" dc_token="" profile="" workdir=""
+  local report_import=0 import_slug=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --as=*)              as="${1#--as=}" ;;
@@ -403,6 +422,9 @@ cmd_import() {
       --discord-token=*)   dc_token="${1#--discord-token=}" ;;
       --auth-profile=*)    profile="${1#--auth-profile=}" ;;
       --workdir=*)         workdir="${1#--workdir=}" ;;
+      # DIVE-644: opt-in, default-OFF import telemetry. Only meaningful for a
+      # registry-slug import (a local .tar.gz has no public slug to report).
+      --report-import)     report_import=1 ;;
       -*)                  fail "$E_USAGE" "unknown flag: $1" ;;
       *)                   [[ -z "$pack" ]] && pack="$1" || fail "$E_USAGE" "extra arg: $1" ;;
     esac
@@ -416,6 +438,7 @@ cmd_import() {
   if [[ ! -f "$pack" ]]; then
     if [[ "$pack" =~ ^[a-z0-9][a-z0-9_-]*$ ]]; then
       step "Resolving '$pack' from the character-pack registry"
+      import_slug="$pack"   # remember the registry slug for opt-in --report-import
       resolved_tmp=$(_marketplace_fetch_pack "$pack") \
         || fail "$E_NOT_FOUND" "no pack '$pack' in the registry (browse: 5dive agent marketplace ls)"
       pack="$resolved_tmp"
@@ -596,12 +619,25 @@ cmd_import() {
 
   rm -rf "$stage"
 
+  # DIVE-644: fire opt-in import telemetry AFTER a fully successful import. Only
+  # when --report-import was passed AND we know the registry slug (file imports
+  # carry none). Best-effort and non-fatal — never let a counter hiccup taint a
+  # green import.
+  local reported="off"
+  if (( report_import )); then
+    if [[ -n "$import_slug" ]]; then
+      _report_import "$import_slug" && reported="$import_slug" || reported="failed"
+    else
+      reported="skipped (no registry slug — local pack)"
+    fi
+  fi
+
   local added_j skipped_j
   added_j=$(printf '%s\n'   "${added[@]+"${added[@]}"}"   | jq -R . | jq -cs 'map(select(. != ""))')
   skipped_j=$(printf '%s\n' "${skipped[@]+"${skipped[@]}"}" | jq -R . | jq -cs 'map(select(. != ""))')
   local mem_note="no memory"
   [[ "$mem_inc" == "distilled" ]] && mem_note="distilled memory -> $mem_seeded"
   ok "imported '$as' from pack ($mem_note). Skills added: ${#added[@]}, skipped: ${#skipped[@]}; template: $templated; avatar: $avatar_note." \
-     '{name:$n, type:$t, memory:$mem, memorySeeded:$ms, skillsAdded:$a, skillsSkipped:$s, template:$tpl, avatar:$av}' \
-     --arg n "$as" --arg t "$type" --arg mem "$mem_inc" --arg ms "$mem_seeded" --argjson a "$added_j" --argjson s "$skipped_j" --arg tpl "$templated" --arg av "$avatar_note"
+     '{name:$n, type:$t, memory:$mem, memorySeeded:$ms, skillsAdded:$a, skillsSkipped:$s, template:$tpl, avatar:$av, reported:$ri}' \
+     --arg n "$as" --arg t "$type" --arg mem "$mem_inc" --arg ms "$mem_seeded" --argjson a "$added_j" --argjson s "$skipped_j" --arg tpl "$templated" --arg av "$avatar_note" --arg ri "$reported"
 }
