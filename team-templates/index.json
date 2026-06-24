@@ -79,6 +79,20 @@
           "reports_to": "editor"
         }
       ]
+    },
+    {
+      "slug": "eng-studio",
+      "name": "Eng Studio",
+      "description": "Ship-a-product team: CEO + Eng Manager + Designer + Release Manager + Doc Engineer + QA",
+      "size": 6,
+      "roster": [
+        { "key": "ceo", "role": "CEO", "model": "opus", "reports_to": null },
+        { "key": "eng_manager", "role": "Eng Manager", "model": "opus", "reports_to": "ceo" },
+        { "key": "designer", "role": "Designer", "model": "sonnet", "reports_to": "eng_manager" },
+        { "key": "release_manager", "role": "Release Manager", "model": "sonnet", "reports_to": "eng_manager" },
+        { "key": "doc_engineer", "role": "Doc Engineer", "model": "sonnet", "reports_to": "eng_manager" },
+        { "key": "qa", "role": "QA", "model": "sonnet", "reports_to": "eng_manager" }
+      ]
     }
   ]
 }

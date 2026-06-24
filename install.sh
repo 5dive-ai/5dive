@@ -284,7 +284,7 @@ DIGESTCRON
   # resolves $LIB_DIR/team-templates first). Enumerated explicitly because $REPO
   # is a flat fetch URL with no directory listing — add a line per new template.
   mkdir -p "$LIB_DIR/team-templates"
-  for _tpl in startup.5dive.yaml content-studio.5dive.yaml SCHEMA-v2.md; do
+  for _tpl in startup.5dive.yaml content-studio.5dive.yaml eng-studio.5dive.yaml SCHEMA-v2.md; do
     if curl -fsSL "$REPO/team-templates/$_tpl" -o "$LIB_DIR/team-templates/$_tpl"; then
       chmod 644 "$LIB_DIR/team-templates/$_tpl"
     else
