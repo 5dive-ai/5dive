@@ -5,9 +5,15 @@
 # newly-added default skill (e.g. `openagent`, DIVE-658) lands on agents that
 # were created before it joined the defaults. Idempotent.
 #
-# Per agent: for each default skill, skip if it's already installed, else add
-# it via `5dive agent skill <name> add` (which resolves the agent's type,
+# Per agent: for each default skill, force re-pull it via
+# `5dive agent skill <name> add --force` (which resolves the agent's type,
 # install dir, and sandbox strategy from the registry — no duplication here).
+#
+# FORCE RE-PULL, NOT install-if-missing (DIVE-698): these are pinned/managed
+# skills, so an already-present copy may be a STALE version (e.g. an old
+# openagent from before the v0.27 pin). Skipping on presence meant the pin only
+# ever reached brand-new agents; --force drops the existing dir and re-pulls the
+# current pinned version so upgrades actually land on existing boxes too.
 #
 # NEVER-BOOTED GOTCHA: `npx skills add` writes to the agent user's ~/.claude,
 # which only exists after the agent's service has booted at least once. On a
@@ -49,7 +55,7 @@ else
 fi
 [[ -n "${agents// }" ]] || { echo "no agents to refresh"; exit 0; }
 
-added=0 skipped=0 booting=0
+refreshed=0 failed=0 booting=0
 for ag in $agents; do
   user="agent-$ag"
   home=$(getent passwd "$user" | cut -d: -f6)
@@ -62,27 +68,19 @@ for ag in $agents; do
     continue
   fi
 
-  # Snapshot installed skills once per agent (filesystem scan across the two
-  # per-type skills dirs — fast, no npx). `5dive agent skill <name> list` would
-  # also work but spawns an npx process per agent.
-  installed=""
-  for d in "$home"/.claude/skills "$home"/.agents/skills; do
-    [[ -d "$d" ]] && installed+=$' '"$(ls -1 "$d" 2>/dev/null | tr '\n' ' ')"
-  done
-
+  # Force re-pull every managed default to its current pinned version. No
+  # skip-if-present check: that's the whole point (DIVE-698) — an existing copy
+  # might be stale, and `add --force` drops it before re-pulling.
   for spec in "${DEFAULT_SKILLS[@]}"; do
     source="${spec%%:*}" skill="${spec#*:}"
-    if [[ " $installed " == *" $skill "* ]]; then
-      skipped=$((skipped+1))
-      continue
-    fi
-    echo "+ $ag — installing $skill from $source"
-    if "$FIVE_BIN" agent skill "$ag" add --source="$source" --skill="$skill" >&2; then
-      added=$((added+1))
+    echo "+ $ag — re-pulling $skill from $source"
+    if "$FIVE_BIN" agent skill "$ag" add --source="$source" --skill="$skill" --force >&2; then
+      refreshed=$((refreshed+1))
     else
-      echo "  warn: $skill install failed for $ag (continuing)" >&2
+      echo "  warn: $skill refresh failed for $ag (continuing)" >&2
+      failed=$((failed+1))
     fi
   done
 done
 
-echo "skills refresh done: $added installed, $skipped already present, $booting awaiting first boot"
+echo "skills refresh done: $refreshed re-pulled, $failed failed, $booting awaiting first boot"

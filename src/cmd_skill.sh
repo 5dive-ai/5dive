@@ -74,17 +74,18 @@ cmd_skill() {
 
 cmd_skill_add() {
   local name="$1"; shift
-  local source="" skill=""
+  local source="" skill="" force=0
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --source=*) source="${1#--source=}" ;;
       --skill=*)  skill="${1#--skill=}" ;;
+      --force)    force=1 ;;
       *) fail "$E_USAGE" "unknown flag: $1" ;;
     esac
     shift
   done
   [[ -n "$source" && -n "$skill" ]] \
-    || fail "$E_USAGE" "usage: 5dive agent skill $name add --source=<owner/repo> --skill=<id>"
+    || fail "$E_USAGE" "usage: 5dive agent skill $name add --source=<owner/repo> --skill=<id> [--force]"
   valid_skill_source "$source" \
     || fail "$E_VALIDATION" "invalid source: '$source' (expected owner/repo)"
   valid_skill_id "$skill" \
@@ -152,7 +153,7 @@ SKILL_ADD_MANUAL
 
   if [[ "$isolation" == "sandboxed" ]]; then
     if ! HOME="$home" \
-         SOURCE="$source" SKILL="$skill" AGENT_ID="$agent_id" INSTALL_DIR="$install_dir" \
+         SOURCE="$source" SKILL="$skill" AGENT_ID="$agent_id" INSTALL_DIR="$install_dir" FORCE="$force" \
          bash -s >&2 <<'SKILL_ADD_SANDBOXED'
 set -euo pipefail
 unset CLAUDE_CONFIG_DIR
@@ -161,6 +162,9 @@ export NVM_DIR="/home/claude/.nvm"
 [ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"
 export PATH="/home/claude/.local/bin:$PATH"
 cd "$HOME"
+# --force: drop the existing copy so a pinned/managed skill actually upgrades
+# rather than npx no-op'ing on an already-present dir (DIVE-698).
+[ "${FORCE:-0}" = 1 ] && rm -rf "$INSTALL_DIR/$SKILL"
 timeout 180 npx -y skills add "https://github.com/$SOURCE" --skill "$SKILL" --agent "$AGENT_ID" --yes 2>&1 | tail -25
 [ -d "$INSTALL_DIR/$SKILL" ] || { echo "ERROR: $INSTALL_DIR/$SKILL missing after install" >&2; exit 1; }
 SKILL_ADD_SANDBOXED
@@ -169,7 +173,7 @@ SKILL_ADD_SANDBOXED
     fi
     chown -R "${user}:${user}" "$home/$install_dir/$skill" 2>/dev/null || true
   else
-    if ! sudo -u "$user" -H env SOURCE="$source" SKILL="$skill" AGENT_ID="$agent_id" INSTALL_DIR="$install_dir" bash -s >&2 <<'SKILL_ADD'
+    if ! sudo -u "$user" -H env SOURCE="$source" SKILL="$skill" AGENT_ID="$agent_id" INSTALL_DIR="$install_dir" FORCE="$force" bash -s >&2 <<'SKILL_ADD'
 set -euo pipefail
 unset CLAUDE_CONFIG_DIR
 export NVM_DIR="/home/claude/.nvm"
@@ -177,6 +181,9 @@ export NVM_DIR="/home/claude/.nvm"
 [ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"
 export PATH="/home/claude/.local/bin:$PATH"
 cd "$HOME"
+# --force: drop the existing copy so a pinned/managed skill actually upgrades
+# rather than npx no-op'ing on an already-present dir (DIVE-698).
+[ "${FORCE:-0}" = 1 ] && rm -rf "$INSTALL_DIR/$SKILL"
 timeout 180 npx -y skills add "https://github.com/$SOURCE" --skill "$SKILL" --agent "$AGENT_ID" --yes 2>&1 | tail -25
 [ -d "$INSTALL_DIR/$SKILL" ] || { echo "ERROR: $INSTALL_DIR/$SKILL missing after install" >&2; exit 1; }
 SKILL_ADD

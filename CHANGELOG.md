@@ -9,6 +9,22 @@ release.
 
 ## [Unreleased]
 
+### Fixed
+
+- Pinned/managed default skills now actually reach **existing** agents
+  (DIVE-698). `5dive-refresh-skills.sh` previously skipped any skill already
+  present, so a re-pinned skill (e.g. the `openagent` v0.27 pin) only landed on
+  brand-new agents while existing boxes kept the stale copy. The refresh now
+  **force re-pulls** every skill in `DEFAULT_SKILLS` to its current pinned
+  version. Backed by a new `--force` flag on `5dive agent skill <name> add`,
+  which drops the existing skill dir before re-installing so the npx path
+  upgrades instead of no-op'ing on an already-present directory.
+
+  **Release flow:** to push a re-pinned default skill to the whole fleet, bump
+  the pin in `<org>/skills`, then either wait for the daily update cron (which
+  runs `5dive-refresh-skills.sh` via `install.sh --upgrade`) or force it now with
+  `sudo 5dive-refresh-skills.sh` (all agents) / `sudo 5dive-refresh-skills.sh <name>`.
+
 ### Added
 
 - `5dive agent import --from-persona=<file.persona.yaml>` (DIVE-658 #2, Mark) —
