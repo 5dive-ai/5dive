@@ -152,6 +152,16 @@ JSON
     settings=$(jq '. + {enabledPlugins: {"discord@claude-plugins-official": true}}' <<<"$settings")
   fi
 
+  # SessionStart resume-context hook (DIVE-726 Phase 0): on every boot, inject
+  # the agent's in-flight in_progress task(s) + the latest carryover head, so a
+  # service restart / crash / rotation never drops the thread. Core feature —
+  # applies to every channel, and no plugin hooks.json defines SessionStart, so
+  # there's no double-fire. Guarded on the shared copy existing (installed by
+  # install.sh's hook loop + refreshed by update.sh), same pattern as statusLine.
+  if [[ -x /usr/local/lib/5dive/sessionstart-resume-context.sh ]]; then
+    settings=$(jq '. + {hooks: ((.hooks // {}) + {SessionStart: [{hooks: [{type: "command", command: "/usr/local/lib/5dive/sessionstart-resume-context.sh", timeout: 10}]}]})}' <<<"$settings")
+  fi
+
   printf '%s\n' "$settings" | sudo -u "$user" tee "$home/.claude/settings.json" >/dev/null
   chmod 600 "$home/.claude/settings.json"
 

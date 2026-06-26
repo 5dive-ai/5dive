@@ -27,6 +27,19 @@ release.
 
 ### Added
 
+- **SessionStart resume-context hook** (DIVE-726 Phase 0, the v0.5 "memory moat"
+  floor). After a service restart / crash / rotation a fresh `claude` session
+  booted with no idea what the previous one was doing. The new
+  `sessionstart-resume-context.sh` hook injects, on every boot, the agent's
+  in-flight `in_progress` task(s) — read straight from the durable task queue, so
+  the thread is recovered even on an **abrupt** crash, not just a graceful stop —
+  plus the head of the latest carryover note. Output is **bounded** (a few
+  in-flight task lines + a carryover pointer/head), so per-turn cost stays flat
+  regardless of how many tasks/carryovers exist: retrieval, not injection. Wired
+  into `agent_setup.sh` for every channel (no plugin defines SessionStart, so no
+  double-fire) and shipped to `$LIB_DIR` by `install.sh`'s hook loop. Existing
+  agents are backfilled into their `settings.json` by a one-shot pass.
+
 - `5dive agent import --from-persona=<file.persona.yaml>` (DIVE-658 #2, Mark) —
   provision a **live agent from an OpenAgent persona**. The persona carries
   identity (name, role, look, voice, behavior); runtime config comes from flags

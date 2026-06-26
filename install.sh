@@ -115,7 +115,8 @@ DIGESTCRON
   for hook in stop-failure-telegram.sh resume-after-reset.sh \
               pretool-telegram-question.sh stop-telegram-reply-check.sh \
               posttool-telegram-relay.sh userprompt-mirror-inter-agent.sh \
-              stop-mirror-inter-agent.sh push-notify.sh; do
+              stop-mirror-inter-agent.sh push-notify.sh \
+              sessionstart-resume-context.sh; do
     curl -fsSL "$REPO/hooks/$hook" -o "$LIB_DIR/$hook"
     chmod 755 "$LIB_DIR/$hook"
     ok "$hook"
