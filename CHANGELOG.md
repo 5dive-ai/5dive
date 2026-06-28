@@ -9,6 +9,18 @@ release.
 
 ## [Unreleased]
 
+## [0.4.10] - 2026-06-28
+
+### Security
+
+- Gate-proof enforcement is now ON by default fleet-wide (DIVE-758, drop 2). The
+  install + `--upgrade` paths flip `gate-proof enforce on`, so once a box adopts
+  the tamper-evidence build an UNPROVEN agent-path answer to an approval/secret
+  gate is rejected. Human taps (`--human`, the Telegram path) always clear and the
+  dashboard doesn't answer gates, so live answering is unaffected — this only
+  stops an agent self-clearing a human gate. Idempotent + best-effort (never
+  blocks install). Toggle off per-box with `5dive gate-proof enforce off`.
+
 ## [0.4.9] - 2026-06-28
 
 ### Security

@@ -470,6 +470,13 @@ if [[ "${1:-}" == "--upgrade" ]]; then
     "$BIN_DIR/5dive-refresh-skills.sh" 2>&1 | tail -20 || true
   fi
 
+  # DIVE-758: turn gate-proof enforcement ON as boxes adopt the tamper-evidence
+  # build. Once enforced, an UNPROVEN agent-path answer to an approval/secret gate
+  # is rejected (human taps via --human always clear, the dashboard doesn't answer
+  # gates), so "X approved gate Y" can't be self-cleared by an agent. Idempotent +
+  # best-effort: never block an upgrade on it.
+  "$BIN_DIR/5dive" gate-proof enforce on >/dev/null 2>&1 || true
+
   echo
   echo "5dive upgraded."
   exit 0
@@ -574,6 +581,10 @@ echo
 # future regressions so a doctor crash never breaks the install.
 say "Running health check"
 5dive doctor || true
+
+# DIVE-758: secure-by-default — new boxes get gate-proof enforcement ON (same as
+# the --upgrade path flips it for existing boxes). Best-effort; never block install.
+5dive gate-proof enforce on >/dev/null 2>&1 || true
 
 echo
 echo "Next steps:"
