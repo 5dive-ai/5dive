@@ -25,8 +25,14 @@ cmd_loop() {
     until-dry) cmd_loop_until_dry "$@" ;;
     collect)   cmd_loop_collect "$@" ;;
     status)    _loop_todo status "$@" ;;
+    # DIVE-761: marketplace loop packs — install/uninstall a recurring agentic
+    # workflow (persona + skills + cadence) onto an agent. Distinct from the
+    # orchestration verbs above; shares the `loop` namespace because both are "loops".
+    install)   cmd_loop_pack install "$@" ;;
+    uninstall) cmd_loop_pack uninstall "$@" ;;
+    show)      cmd_loop_pack show "$@" ;;
     help|-h|--help) _loop_help ;;
-    *)         fail "$E_USAGE" "unknown loop command: $sub (spawn|verify|grade|panel|map|until-dry|collect|status)" ;;
+    *)         fail "$E_USAGE" "unknown loop command: $sub (spawn|verify|grade|panel|map|until-dry|collect|status|install|show)" ;;
   esac
 }
 
@@ -54,7 +60,11 @@ _loop_help() {
   loop collect --handles=<id,id,…>
   loop status  --handle=<loopId>
 
-  All verbs: JSON in / JSON out, honor --ceiling (per-loop token budget;
+  loop install <slug> --onto=<agent> [--cron="…"] [--ceiling=<tokens>] [--dry-run]
+              install a marketplace loop pack (recurring agentic workflow:
+              persona + skills + cadence) onto an agent. loop show <slug> to peek.
+
+  Orchestration verbs: JSON in / JSON out, honor --ceiling (per-loop token budget;
   self-halt + escalate-with-proof at the limit). Humans watch + kill via
   `5dive task loops [--kill <loopId>]`; they never author a loop.
 EOF
