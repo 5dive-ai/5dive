@@ -19,13 +19,14 @@ cmd_loop() {
   case "$sub" in
     spawn)     cmd_loop_spawn "$@" ;;
     verify)    cmd_loop_verify "$@" ;;
+    grade)     cmd_loop_grade "$@" ;;
     panel)     cmd_loop_panel "$@" ;;
     map)       cmd_loop_map "$@" ;;
     until-dry) cmd_loop_until_dry "$@" ;;
     collect)   cmd_loop_collect "$@" ;;
     status)    _loop_todo status "$@" ;;
     help|-h|--help) _loop_help ;;
-    *)         fail "$E_USAGE" "unknown loop command: $sub (spawn|verify|panel|map|until-dry|collect|status)" ;;
+    *)         fail "$E_USAGE" "unknown loop command: $sub (spawn|verify|grade|panel|map|until-dry|collect|status)" ;;
   esac
 }
 
@@ -46,6 +47,7 @@ _loop_help() {
   loop spawn  --role=maker|verifier|worker --agent=<type|name> --prompt="…"
               [--schema=<json>] [--ceiling=<tokens>] [--wait[=<sec>]]
   loop verify --target=<id> --verifier=<agent> [--accept="…"]
+  loop grade  --target=<id> --verifier=<agent> [--accept="…"] [--threshold=<0-100>] [--wait]
   loop panel  --n=<k> --lens="correctness,security,repro" --claim="…" --quorum=<m>
   loop map    --over=<json-array> --do=<spawn-spec> [--max-concurrency=<n>]
   loop until-dry --round=<spawn-spec> --stop-after=<K> --dedup-key="…"
@@ -314,6 +316,135 @@ cmd_loop_verify() {
      '{loopId:$l, handle:$l, status:$s, verdict:$vd, target:($t|tonumber), targetIdent:$ti, verifier:$v, ceiling:($c|tonumber), tokensSpent:($sp|tonumber), result:$res}' \
      --arg l "$loop_id" --arg s "$loop_status" --arg vd "$verdict" --arg t "$tid" --arg ti "$tident" \
      --arg v "$verifier" --arg c "$eff_ceiling" --arg sp "${spent:-0}" --arg res "$tresult"
+  return 0
+}
+
+# --- loop grade (DIVE-748: numeric scorecard against acceptance-criteria) ---
+# The quantitative analogue of `loop verify`: instead of a pass/fail prose
+# verdict, an LLM grader scores the target's WORK against each of its acceptance
+# criteria and emits a numeric scorecard {overall, criteria:[{name,score,reason}]}.
+# This is the measurable artifact DIVE-747's per-loop-run scorecard reads.
+# Reuses the `loop spawn --role=verifier --schema` grader machinery; stores the
+# parsed card in loop_runs.scorecard_json (topology='grade'). verdict = pass iff
+# overall >= threshold (default 70). writer≠grader enforced (grader ≠ assignee).
+cmd_loop_grade() {
+  tasks_db_init
+  local target="" verifier="" accept="" threshold="" ceiling="" from="" stage="" wait_flag="" wait_secs="" project="dive"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --target=*)    target="${1#*=}" ;;
+      --verifier=*)  verifier="${1#*=}" ;;
+      --accept=*)    accept="${1#*=}" ;;
+      --threshold=*) threshold="${1#*=}" ;;
+      --ceiling=*)   ceiling="${1#*=}" ;;
+      --from=*)      from="${1#*=}" ;;
+      --stage=*)     stage="${1#*=}" ;;
+      --project=*)   project="${1#*=}" ;;
+      --wait)        wait_flag=1 ;;
+      --wait=*)      wait_flag=1; wait_secs="${1#*=}" ;;
+      --)            shift; break ;;
+      -*)            fail "$E_USAGE" "unknown flag: $1" ;;
+      *)             fail "$E_USAGE" "loop grade takes only flags (unexpected: $1)" ;;
+    esac
+    shift
+  done
+  [[ -n "$target" ]]   || fail "$E_USAGE" "loop grade: --target=<id|DIVE-N> required"
+  [[ -n "$verifier" ]] || fail "$E_USAGE" "loop grade: --verifier=<agent> required"
+  [[ -z "$threshold" || "$threshold" =~ ^[0-9]+$ ]] && [[ -z "$threshold" || "$threshold" -le 100 ]] \
+    || fail "$E_VALIDATION" "--threshold must be an integer 0-100"
+  [[ -z "$ceiling"   || "$ceiling"   =~ ^[1-9][0-9]*$ ]] || fail "$E_VALIDATION" "--ceiling must be a positive integer (tokens)"
+  [[ -z "$wait_secs" || "$wait_secs" =~ ^[1-9][0-9]*$ ]] || fail "$E_VALIDATION" "--wait=<seconds> must be a positive integer"
+  local eff_threshold="${threshold:-70}"
+
+  resolve_task_id "$target"   # sets RESOLVED_TASK_ID or fails
+  local tid="$RESOLVED_TASK_ID"
+  local tassignee tident
+  tassignee=$(db "SELECT COALESCE(assignee,'') FROM tasks WHERE id=${tid};")
+  tident=$(db "SELECT ident FROM tasks WHERE id=${tid};")
+  # writer≠grader: the grader must differ from the maker (target's assignee).
+  [[ "$verifier" != "$tassignee" ]] || fail "$E_VALIDATION" "grader must differ from the target's assignee ('$tassignee') — writer≠grader"
+  # Criteria to grade against: explicit --accept, else the task's stored
+  # acceptance_criteria (DIVE-476). No criteria → nothing to score against.
+  [[ -n "$accept" ]] || accept=$(db "SELECT COALESCE(acceptance_criteria,'') FROM tasks WHERE id=${tid};")
+  [[ -n "$accept" ]] || fail "$E_VALIDATION" "no --accept and ${tident} has no acceptance_criteria — set criteria first (task add … --accept=\"…\")"
+  # The work to grade: the maker's captured result, falling back to the body.
+  local twork; twork=$(db "SELECT COALESCE(NULLIF(result,''), body, '') FROM tasks WHERE id=${tid};")
+
+  local eff_ceiling; eff_ceiling=$(_loop_eff_ceiling "$ceiling")
+  local loop_id; loop_id=$(_loop_new_id)
+
+  # Strict scoring contract → deterministic parse. Each criterion scored 0-100
+  # with a one-line reason; overall is the grader's holistic 0-100.
+  local schema='{"type":"object","required":["overall","criteria"],"properties":{"overall":{"type":"integer","minimum":0,"maximum":100},"criteria":{"type":"array","items":{"type":"object","required":["name","score"],"properties":{"name":{"type":"string"},"score":{"type":"integer","minimum":0,"maximum":100},"reason":{"type":"string"}}}}}}'
+  local gp; gp=$(printf 'Grade the WORK below against each ACCEPTANCE CRITERION. Reply with ONLY strict JSON {"overall":0-100,"criteria":[{"name":"…","score":0-100,"reason":"…"}]}. Score each criterion 0-100 (0=unmet, 100=fully met) with a one-line reason; "overall" is your holistic 0-100. Be strict: score low when evidence is missing.\n\nTASK: %s\n\nACCEPTANCE CRITERIA:\n%s\n\nWORK TO GRADE:\n%s' "$tident" "$accept" "$twork")
+
+  # Spawn ONE grader (reuses spawn accounting/heartbeat/schema plumbing).
+  local gout gtid gtident
+  gout=$(JSON_MODE=1 cmd_loop_spawn --role=verifier --agent="$verifier" --project="$project" ${from:+--from="$from"} \
+           --ceiling="$eff_ceiling" --stage="grade${stage:+:$stage}" --schema="$schema" --prompt="$gp") || return $?
+  gtid=$(printf '%s' "$gout"   | jq -r '.data.taskId')
+  gtident=$(printf '%s' "$gout" | jq -r '.data.taskIdent')
+  [[ "$gtid" =~ ^[0-9]+$ ]] || fail "$E_GENERIC" "loop grade: grader spawn failed ($gout)"
+
+  local by_task_sql="NULL"
+  [[ -n "${FIVE_TASK_ID:-}" && "${FIVE_TASK_ID}" =~ ^[0-9]+$ ]] && by_task_sql="${FIVE_TASK_ID}"
+  local by_agent; by_agent=$(task_actor "$from")
+  local now; now=$(date +%s)
+  db "INSERT INTO loop_runs (loop_id, topology, spawned_by_agent, spawned_by_task, stage,
+                             ceiling, status, child_task_ids, started_at, updated_at)
+      VALUES ($(sqlq "$loop_id"), 'grade', $(sqlq "$by_agent"), ${by_task_sql}, $(sqlq_or_null "$stage"),
+              ${eff_ceiling}, 'running', $(sqlq "[${gtid}]"), ${now}, ${now});"
+
+  # No --wait: return the handle + grader composition immediately.
+  if [[ -z "$wait_flag" ]]; then
+    ok "loop ${loop_id} grading ${tident} (grader ${verifier}, threshold ${eff_threshold})" \
+       '{loopId:$l, handle:$l, status:"grading", topology:"grade", target:($t|tonumber), targetIdent:$ti, grader:$v, graderTask:($g|tonumber), threshold:($th|tonumber), ceiling:($c|tonumber)}' \
+       --arg l "$loop_id" --arg t "$tid" --arg ti "$tident" --arg v "$verifier" --arg g "$gtid" \
+       --arg th "$eff_threshold" --arg c "$eff_ceiling"
+    return 0
+  fi
+
+  # --wait: block-poll the grader to terminal, policed by kill + ceiling.
+  local deadline poll="${LOOP_POLL_SECS:-4}"
+  if [[ -n "$wait_secs" ]]; then deadline=$(( now + wait_secs )); else deadline=$(( now + 1800 )); fi
+  local final_status="running" killed="" spent="0"
+  while :; do
+    local t; t=$(date +%s)
+    killed=$(db "SELECT kill_requested FROM loop_runs WHERE loop_id=$(sqlq "$loop_id");")
+    if [[ "$killed" == "1" ]]; then final_status="killed"; break; fi
+    spent=$(db "SELECT COALESCE(tokens_spent,0) FROM loop_runs WHERE loop_id=$(sqlq "$loop_id");")
+    if [[ "${spent:-0}" -ge "$eff_ceiling" ]]; then final_status="escalated"; break; fi
+    local gstatus; gstatus=$(db "SELECT status FROM tasks WHERE id=${gtid};")
+    case "$gstatus" in
+      done|rejected|escalated|cancelled) final_status="complete"; break ;;
+    esac
+    (( t >= deadline )) && { final_status="timeout"; break; }
+    sleep "$poll"
+  done
+
+  # Parse the grader's scorecard from its task result (strict JSON contract;
+  # unparseable/missing overall → escalate, never a silent pass).
+  local gres overall criteria_json loop_status verdict
+  gres=$(db "SELECT COALESCE(result,'') FROM tasks WHERE id=${gtid};")
+  overall=$(printf '%s' "$gres"  | jq -r 'if (.overall|type)=="number" then .overall else empty end' 2>/dev/null)
+  criteria_json=$(printf '%s' "$gres" | jq -c '.criteria // []' 2>/dev/null); [[ -n "$criteria_json" ]] || criteria_json="[]"
+  if [[ "$final_status" == "complete" && -n "$overall" ]]; then
+    if (( overall >= eff_threshold )); then verdict="pass"; else verdict="fail"; fi
+    loop_status="done"
+  else
+    verdict="escalated"; overall="${overall:-0}"
+    loop_status="escalated"; [[ "$final_status" == "killed" ]] && loop_status="killed"
+  fi
+  local now2; now2=$(date +%s)
+  local scorecard_json
+  scorecard_json=$(jq -cn --argjson o "${overall:-0}" --argjson cr "$criteria_json" --arg vd "$verdict" \
+     --argjson th "$eff_threshold" --arg ti "$tident" --arg v "$verifier" --argjson at "$now2" \
+     '{overall:$o, criteria:$cr, verdict:$vd, threshold:$th, target:$ti, grader:$v, gradedAt:$at}')
+  db "UPDATE loop_runs SET status=$(sqlq "$loop_status"), updated_at=${now2}, scorecard_json=$(sqlq "$scorecard_json") WHERE loop_id=$(sqlq "$loop_id");"
+  ok "loop ${loop_id} ${loop_status} — ${tident} scored ${overall}/100 (verdict ${verdict}, threshold ${eff_threshold})" \
+     '{loopId:$l, handle:$l, status:$s, verdict:$vd, overall:($o|tonumber), threshold:($th|tonumber), criteria:$cr, target:($t|tonumber), targetIdent:$ti, grader:$v, ceiling:($c|tonumber), tokensSpent:($sp|tonumber)}' \
+     --arg l "$loop_id" --arg s "$loop_status" --arg vd "$verdict" --arg o "${overall:-0}" --arg th "$eff_threshold" \
+     --argjson cr "$criteria_json" --arg t "$tid" --arg ti "$tident" --arg v "$verifier" --arg c "$eff_ceiling" --arg sp "${spent:-0}"
   return 0
 }
 

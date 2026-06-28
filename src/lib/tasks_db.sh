@@ -243,6 +243,7 @@ CREATE TABLE IF NOT EXISTS loop_runs (
   kill_requested   INTEGER NOT NULL DEFAULT 0,
   child_task_ids   TEXT,
   result_json      TEXT,
+  scorecard_json   TEXT,
   started_at       INTEGER NOT NULL,
   updated_at       INTEGER NOT NULL
 );
@@ -388,11 +389,26 @@ CREATE TABLE IF NOT EXISTS loop_runs (
   kill_requested   INTEGER NOT NULL DEFAULT 0,
   child_task_ids   TEXT,
   result_json      TEXT,
+  scorecard_json   TEXT,
   started_at       INTEGER NOT NULL,
   updated_at       INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS loop_runs_status_idx ON loop_runs(status);
 MIG
+  fi
+
+  # DIVE-748 — additive scorecard column on already-created loop_runs tables.
+  # The create-if-absent block above only covers fresh stores; existing loop_runs
+  # (e.g. prod) need the column added. Pure expand: NULL backfill, old rows/queries
+  # untouched. Gated on pragma so it's a no-op once present.
+  if [[ "$has_loop_runs" == "1" ]]; then
+    local lr_cols
+    lr_cols=$(sqlite3 -cmd ".timeout 5000" "$TASKS_DB" \
+              "SELECT name FROM pragma_table_info('loop_runs');" 2>/dev/null)
+    if ! printf '%s\n' "$lr_cols" | grep -qx "scorecard_json"; then
+      sqlite3 -cmd ".timeout 5000" "$TASKS_DB" \
+        "ALTER TABLE loop_runs ADD COLUMN scorecard_json TEXT;" >/dev/null 2>&1 || true
+    fi
   fi
 }
 

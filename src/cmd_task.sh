@@ -584,7 +584,7 @@ cmd_task_loops() {
       runs=$(dbfmt -json "SELECT loop_id, topology, COALESCE(stage,'') AS stage,
                COALESCE(iteration,0) AS iteration, COALESCE(tokens_spent,0) AS tokens_spent,
                ceiling, status, COALESCE(spawned_by_agent,'') AS by,
-               kill_requested, stuck
+               kill_requested, stuck, COALESCE(scorecard_json,'') AS scorecard
              FROM loop_runs WHERE ${runs_where}
              ORDER BY (status='running') DESC, started_at DESC;")
       [[ -n "$runs" ]] || runs="[]"
@@ -605,6 +605,9 @@ cmd_task_loops() {
                COALESCE(iteration,0) AS iter,
                COALESCE(tokens_spent,0)||'/'||COALESCE(CAST(ceiling AS TEXT),'∞') AS tokens,
                status,
+               CASE WHEN scorecard_json IS NOT NULL AND json_valid(scorecard_json)
+                    THEN COALESCE(CAST(json_extract(scorecard_json,'\$.overall') AS TEXT),'-')||'/100'
+                    ELSE '-' END AS score,
                CASE WHEN kill_requested=1 THEN '✗kill' ELSE '' END AS kill,
                CASE WHEN stuck=1 THEN '⚠' ELSE '' END AS stuck,
                COALESCE(spawned_by_agent,'-') AS by
