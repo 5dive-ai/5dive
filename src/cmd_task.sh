@@ -1377,6 +1377,59 @@ cmd_task_inbox() {
 # Subcommand `enforce on|off|status` toggles whether a missing/invalid proof is
 # REJECTED (default off = audit-only) — see _gate_proof_enforced.
 cmd_gate_proof() {
+  # DIVE-756: root-only signer for the non-root answer path. Reads the canonical
+  # closure payload on STDIN (so the human answer never enters argv) and prints
+  # the HMAC raw. cmd_task_answer re-execs this over `sudo -n` when it isn't root.
+  if [[ "${1:-}" == "sign" ]]; then
+    require_root "gate-proof sign"
+    tasks_db_init
+    _gate_proof_ensure_key || fail "$E_GENERIC" "cannot provision gate-proof key (need root)"
+    local _payload; _payload=$(cat)
+    local _mac; _mac=$(_gate_proof_hmac "$_payload") || fail "$E_GENERIC" "failed to sign"
+    printf '%s\n' "$_mac"
+    return
+  fi
+
+  # DIVE-756: verify a stored closure signature. Root-only (needs the key). Recom-
+  # putes the HMAC over the row's durable facts and reports signed/valid — a raw-
+  # sqlite write that bypassed cmd_task_answer shows signed=absent or valid=false.
+  # The detective half of the fix (enforcement of valid-or-reject is a later flip).
+  if [[ "${1:-}" == "verify" ]]; then
+    require_root "gate-proof verify"
+    tasks_db_init
+    local vref="${2:-}"
+    [[ -n "$vref" ]] || fail "$E_USAGE" "usage: 5dive gate-proof verify <id|DIVE-N>"
+    resolve_task_id "$vref"; local vid="$RESOLVED_TASK_ID" vident="$RESOLVED_TASK_IDENT"
+    local _row; _row=$(db "SELECT
+        COALESCE(need_type,'')||x'1f'||
+        COALESCE(need_answer,'')||x'1f'||
+        COALESCE(need_answered_by,'')||x'1f'||
+        COALESCE(need_answered_at,'')||x'1f'||
+        COALESCE(CAST(need_answered_uid AS TEXT),'')||x'1f'||
+        COALESCE(need_answer_sig,'')
+      FROM tasks WHERE id=${vid};")
+    local _nt _na _nb _nat _nuid _nsig
+    IFS=$'\x1f' read -r _nt _na _nb _nat _nuid _nsig <<<"$_row"
+    [[ -n "$_nt" && -n "$_nat" ]] || fail "$E_CONFLICT" "$vident has no answered gate to verify"
+    local _vfs=""; [[ "$_nt" != "secret" ]] && _vfs="$_na"
+    local _signed=absent _valid=false
+    if [[ -n "$_nsig" ]]; then
+      _signed=present
+      _gate_closure_verify "$vid" "$_nt" "$_vfs" "$_nb" "$_nat" "$_nuid" "$_nsig" && _valid=true
+    fi
+    audit_log "gate-proof verify" "$([[ "$_valid" == true ]] && echo ok || echo error)" 0 -- \
+      "task=$vident" "type=$_nt" "signed=$_signed" "valid=$_valid" "uid=${_nuid:-}" "by=${_nb:-}"
+    if (( JSON_MODE )); then
+      ok "gate-proof verify $vident: signed=$_signed valid=$_valid" \
+        '{ident:$i, signed:$s, valid:($v=="true"), uid:$u, by:$b}' \
+        --arg i "$vident" --arg s "$_signed" --arg v "$_valid" --arg u "${_nuid:-}" --arg b "${_nb:-}"
+    else
+      echo "ident:  $vident"; echo "signed: $_signed"; echo "valid:  $_valid"
+      echo "uid:    ${_nuid:-—}"; echo "by:     ${_nb:-—}"
+    fi
+    return
+  fi
+
   if [[ "${1:-}" == "enforce" ]]; then
     require_root "gate-proof enforce"
     case "${2:-status}" in
@@ -1503,16 +1556,39 @@ cmd_task_answer() {
   local answered_by; answered_by=$(task_actor "$from")
   (( human )) && answered_by="human:${answered_by}"
 
+  # DIVE-756: stamp the REAL invoker uid ($SUDO_UID survives `sudo -u agent-X`,
+  # unlike need_answered_by) and a tamper-evidence signature over the closure
+  # facts. We compute the timestamp in shell (not datetime('now')) so the exact
+  # same string is signed AND stored, letting `gate-proof verify` recompute it.
+  # Signing needs the root-only key: in a root context we sign in-process; from
+  # the non-root trusted path (dashboard exec as claude) we re-exec the root-only
+  # `gate-proof sign` over sudo. Best-effort — a box that can't sign just stores
+  # an empty sig (verify reports "unsigned"); the answer NEVER fails on this.
+  local _uid="${SUDO_UID:-$(id -u 2>/dev/null || echo "")}"
+  local _ts; _ts=$(date -u '+%Y-%m-%d %H:%M:%S')
+  local _vfs=""; [[ "$nt" != "secret" ]] && _vfs="$value"
+  local _sig=""
+  if [[ -n "$_uid" ]]; then
+    if [[ $EUID -eq 0 ]]; then
+      _gate_proof_ensure_key 2>/dev/null || true
+      _sig=$(_gate_closure_sign "$id" "$nt" "$_vfs" "$answered_by" "$_ts" "$_uid" 2>/dev/null || echo "")
+    else
+      _sig=$(_gate_closure_payload "$id" "$nt" "$_vfs" "$answered_by" "$_ts" "$_uid" \
+               | sudo -n 5dive gate-proof sign 2>/dev/null || echo "")
+    fi
+  fi
+  local _uidsql="NULL"; [[ -n "$_uid" ]] && _uidsql="$_uid"
+
   # Record the answer. A `secret` gate NEVER stores its value — writing a raw
   # key into this group-claude-readable db is a plaintext-secret-at-rest leak.
   # We only stamp need_answered_at (the "provided" signal); the agent loads the
   # key out-of-band. decision/approval/manual store the value in need_answer.
   if [[ "$nt" == "secret" ]]; then
     (( value_set )) && fail "$E_USAGE" "$ident is a secret gate — do not pass --value; the key must not be stored in the shared db. Run: 5dive task answer $ident  (records it as provided + pings the agent to load it from where you placed it)"
-    db "UPDATE tasks SET need_answered_at=datetime('now'), need_answered_by=$(sqlq "$answered_by") WHERE id=${id};"
+    db "UPDATE tasks SET need_answered_at=$(sqlq "$_ts"), need_answered_by=$(sqlq "$answered_by"), need_answered_uid=${_uidsql}, need_answer_sig=$(sqlq "$_sig") WHERE id=${id};"
   else
     (( value_set )) || fail "$E_USAGE" "--value is required (the human's answer)"
-    db "UPDATE tasks SET need_answer=$(sqlq "$value"), need_answered_at=datetime('now'), need_answered_by=$(sqlq "$answered_by") WHERE id=${id};"
+    db "UPDATE tasks SET need_answer=$(sqlq "$value"), need_answered_at=$(sqlq "$_ts"), need_answered_by=$(sqlq "$answered_by"), need_answered_uid=${_uidsql}, need_answer_sig=$(sqlq "$_sig") WHERE id=${id};"
   fi
 
   # Clearing the gate ≠ unblocking. `status='blocked'` is overloaded (human

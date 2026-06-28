@@ -9,6 +9,21 @@ release.
 
 ## [Unreleased]
 
+## [0.4.9] - 2026-06-28
+
+### Security
+
+- Gate closures are now tamper-evident (DIVE-756). `tasks.db` is group-writable,
+  so any claude-group agent could `sqlite3 UPDATE` a human gate answered —
+  bypassing the CLI, gate-proof, and all attribution — and the close was logged
+  as a spoofable `SUDO_USER`. `task answer` now stamps the real pre-sudo invoker
+  (`need_answered_uid` = `$SUDO_UID`) and an HMAC over the closure facts
+  (`need_answer_sig`, signed with the root-only gate-proof key). New
+  `5dive gate-proof verify <id>` recomputes it and reports `signed`/`valid`: a
+  raw-sqlite bypass shows `signed=absent`; tampering with an answer afterward
+  shows `valid=false`. Detective half — enforcement (reject on missing/invalid
+  sig) is a later flip; this ships additive with no behaviour change.
+
 ### Fixed
 
 - Pinned/managed default skills now actually reach **existing** agents

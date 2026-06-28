@@ -127,6 +127,16 @@ CREATE TABLE IF NOT EXISTS tasks (
   -- cmd_task_answer so a plain agent can't clear them; this column is the audit
   -- trail for every answer regardless of type.
   need_answered_by TEXT,
+  -- DIVE-756: tamper-evidence for gate closures. need_answered_uid is the REAL
+  -- pre-sudo invoker ($SUDO_UID, falling back to the caller uid) — unlike
+  -- need_answered_by it can't be masked by `sudo -u agent-X`. need_answer_sig is
+  -- an HMAC (root-only gate-proof key) over the canonical closure facts
+  -- (id|type|answer|by|answered_at|uid); a raw-sqlite write that bypasses
+  -- cmd_task_answer can't forge it, so `gate-proof verify <id>` flags the closure
+  -- as unsigned/invalid. Best-effort in drop 1 (signing needs a root context);
+  -- enforcement of "no valid sig ⇒ reject" is a later flip, not here.
+  need_answered_uid INTEGER,
+  need_answer_sig  TEXT,
   -- Recurring task templates (DIVE step 1). kind='recurring' marks a row as a
   -- TEMPLATE, not work: it's excluded from the work board, the heartbeat TODO
   -- count + wake, and the human inbox, so it's never picked up directly.
@@ -306,6 +316,7 @@ _tasks_db_migrate() {
            "kind TEXT NOT NULL DEFAULT 'standard'" 'schedule TEXT' 'last_fired_at TEXT' \
            'from_template_id INTEGER' 'fresh INTEGER' \
            'parked_at TEXT' 'park_reason TEXT' 'need_answered_by TEXT' \
+           'need_answered_uid INTEGER' 'need_answer_sig TEXT' \
            'escalated_at TEXT' 'escalated_by TEXT' \
            "project_key TEXT NOT NULL DEFAULT 'dive'" 'issue_number INTEGER' \
            'acceptance_criteria TEXT' 'verify_command TEXT' 'max_iterations INTEGER' 'verifier TEXT' \
@@ -650,3 +661,35 @@ _gate_proof_verify() {
 # flip on only after the plugin mint is confirmed live on the box, else live taps
 # that can't mint yet would fail closed. Root toggles it.
 _gate_proof_enforced() { [[ -f "$GATE_PROOF_ENFORCE" ]]; }
+
+# ── DIVE-756: persisted closure signature (tamper-evidence) ──────────────────
+# Unlike the short-lived answer-time --proof (bound to id:type, TTL 120s, then
+# discarded), this HMAC is STORED on the row and binds the durable closure facts,
+# so an auditor/consumer can verify long after the answer — and a raw-sqlite write
+# that never ran cmd_task_answer leaves an unsigned/invalid row that `gate-proof
+# verify` flags. Newlines/pipes in the human answer are escaped so the canonical
+# payload is unambiguous (and recomputes identically at verify time).
+_gate_closure_payload() {
+  # args: id type answer by answered_at uid
+  local id="$1" type="$2" answer="$3" by="$4" at="$5" uid="$6"
+  _gc_esc() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/|/\\p/g' -e ':a;N;$!ba;s/\n/\\n/g'; }
+  printf 'c1|%s|%s|%s|%s|%s|%s' \
+    "$id" "$type" "$(_gc_esc "$answer")" "$(_gc_esc "$by")" "$at" "$uid"
+}
+
+# Sign the canonical payload. Needs the root-only key, so this only produces a
+# value in a root context; callers treat empty as "couldn't sign" (best-effort).
+_gate_closure_sign() {
+  [[ -s "$GATE_PROOF_KEY" ]] || return 1
+  _gate_proof_hmac "$(_gate_closure_payload "$@")"
+}
+
+# Verify a stored signature against the row facts. 0 = valid, 1 = invalid/absent.
+_gate_closure_verify() {
+  # args: id type answer by answered_at uid sig
+  local sig="${7:-}"
+  [[ -n "$sig" ]] || return 1
+  local expect; expect=$(_gate_closure_sign "$1" "$2" "$3" "$4" "$5" "$6") || return 1
+  [[ -n "$expect" ]] || return 1
+  _gate_proof_ct_equal "$sig" "$expect"
+}
