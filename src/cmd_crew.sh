@@ -313,6 +313,75 @@ cmd_crew_uninstall() {
 _crew_write_helpers() {
   local dir="$1"
 
+  # Vendored OpenAgent receipt primitives (DIVE-787 fix): the PUBLISHED
+  # @5dive/openagent ships lib/provenance.js but NOT lib/receipts.js (the a2a
+  # receipt layer lives on an unpublished branch), so requiring it 404s on a real
+  # box. We vendor receipts.js verbatim (byte-identical to what ZeroHuman verifies)
+  # and point its only dependency at the published lib/provenance — proven against
+  # the live ingest. Drop this file once @5dive/openagent ships receipts itself.
+  cat > "$dir/_oa_receipts.js" <<'RECEIPTSEOF'
+"use strict";
+const crypto = require("crypto");
+const {
+  canonicalBytes,
+  toPublicKey,
+  toPrivateKey,
+  publicPemFromPrivate,
+  didKeyFromPublicKey,
+} = require("@5dive/openagent/lib/provenance");
+
+function hash(input) {
+  return crypto.createHash("sha256").update(String(input)).digest("hex");
+}
+function buildReceipt({ taskHash, resultHash, fromDid, toDid, at, title = null }) {
+  if (!taskHash || !resultHash || !fromDid || !toDid || !at) {
+    throw new Error("buildReceipt: taskHash, resultHash, fromDid, toDid, at all required");
+  }
+  const body = { v: 1, task: taskHash, result: resultHash, from: fromDid, to: toDid, at };
+  if (title) body.title = String(title);
+  return body;
+}
+function sign(receipt, privateKey) {
+  const key = publicPemFromPrivate(privateKey);
+  return {
+    by: didKeyFromPublicKey(key),
+    key,
+    sig: crypto.sign(null, canonicalBytes(receipt), toPrivateKey(privateKey)).toString("base64"),
+  };
+}
+function cosign(receipt, fromPrivateKey, toPrivateKey_) {
+  return { receipt, sigs: [sign(receipt, fromPrivateKey), sign(receipt, toPrivateKey_)] };
+}
+function verify(cosigned, { requireBoth = true } = {}) {
+  const { receipt, sigs } = cosigned || {};
+  if (!receipt || !Array.isArray(sigs) || sigs.length === 0) {
+    return { ok: false, reason: "malformed" };
+  }
+  const bytes = canonicalBytes(receipt);
+  const signers = new Set();
+  for (const s of sigs) {
+    if (!s || !s.key || !s.by || !s.sig) return { ok: false, reason: "incomplete signature" };
+    let derived;
+    try { derived = didKeyFromPublicKey(s.key); }
+    catch { return { ok: false, reason: "unparseable signer key" }; }
+    if (derived !== s.by) return { ok: false, reason: "signer did/key mismatch" };
+    let ok = false;
+    try { ok = crypto.verify(null, bytes, toPublicKey(s.key), Buffer.from(String(s.sig), "base64")); }
+    catch { ok = false; }
+    if (!ok) return { ok: false, reason: `bad signature from ${s.by}` };
+    signers.add(s.by);
+  }
+  if (requireBoth) {
+    if (receipt.from === receipt.to) return { ok: false, reason: "not an edge (self-addressed receipt)" };
+    if (!signers.has(receipt.from) || !signers.has(receipt.to)) {
+      return { ok: false, reason: "missing a party's signature" };
+    }
+  }
+  return { ok: true, signers: [...signers] };
+}
+module.exports = { hash, buildReceipt, sign, cosign, verify };
+RECEIPTSEOF
+
   cat > "$dir/.crew_runner.py" <<'PYEOF'
 import sys, json, importlib
 # argv: <module:Crew> [input-json-or-text]
@@ -347,7 +416,7 @@ const fs = require("fs");
 const crypto = require("crypto");
 const out = process.argv[2];
 if (fs.existsSync(out)) process.exit(0);
-const r = require("@5dive/openagent/lib/receipts");
+const r = require("./_oa_receipts");
 const { privateKey } = crypto.generateKeyPairSync("ed25519");
 const priv = privateKey.export({ type: "pkcs8", format: "pem" });
 // derive the did:key by signing a throwaway body and reading sig.by
@@ -361,7 +430,7 @@ JSEOF
 // as the signed x-crew extension, and POST it to the ZeroHuman ingest endpoint.
 // Flags: --crew-identity --runtime-identity --crew-name --task --result --at --ingest
 const fs = require("fs");
-const r = require("@5dive/openagent/lib/receipts");
+const r = require("./_oa_receipts");
 function arg(n){ const p=`--${n}=`; const a=process.argv.find(x=>x.startsWith(p)); return a?a.slice(p.length):""; }
 const crew = JSON.parse(fs.readFileSync(arg("crew-identity"), "utf8"));
 const rt   = JSON.parse(fs.readFileSync(arg("runtime-identity"), "utf8"));
