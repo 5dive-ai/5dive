@@ -476,6 +476,12 @@ main() {
       # LOOP-7: agent-native multi-agent orchestration over the task queue +
       # loop_runs table. JSON in/out; same group-writable store, no root/lock.
       cmd_loop "$@" ;;
+    crew)
+      # DIVE-787 (0.5.0 flagship): 5dive as the always-on runtime for CrewAI
+      # crews. install/secret/run/show/list/uninstall. Crew runs in its own venv
+      # with BYO LLM key (owner-600 secret), durable memory on the box disk
+      # (CREWAI_STORAGE_DIR), and a co-signed receipt per run → ZeroHuman feed.
+      cmd_crew "$@" ;;
     heartbeat)
       # Wake-on-work scheduler. on/off mutate the registry (lock taken inside
       # cmd_heartbeat); tick is the root cron driver; ls is read-only. No audit

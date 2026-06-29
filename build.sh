@@ -44,6 +44,7 @@ cat \
   src/cmd_project.sh \
   src/cmd_loop.sh \
   src/cmd_loop_pack.sh \
+  src/cmd_crew.sh \
   src/cmd_heartbeat.sh \
   src/cmd_fleet.sh \
   src/cmd_usage.sh \
