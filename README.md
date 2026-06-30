@@ -9,7 +9,7 @@
 
 ![34 seconds: install to a Claude agent answering on Telegram](docs/quickstart.gif)
 
-> We run our own company on this: a team of AI agents that assign each other work, report up an org chart, and escalate to a human only when they're stuck. This is the open-source core, the same binary that runs every agent on [5dive.com](https://5dive.com). MIT, no open-core split. Run it yourself, or skip the ops with the managed VM.
+> We run our own company on this: a team of AI agents that assign each other work, report up an org chart, and escalate to a human only when they're stuck. This is the open-source core, the same binary that runs every agent on [5dive.ai](https://5dive.ai). MIT, no open-core split. Run it yourself, or skip the ops with the managed VM.
 
 **Already use Claude Code, Codex, Grok, Antigravity, or opencode?** Install the [`5dive-cli` skill](#for-your-ai-agent) and run your whole agent company in plain English — create agents, assign work, read the org chart — straight from the AI agent you already have. One line to set up: [jump to it ↓](#for-your-ai-agent).
 
@@ -114,7 +114,7 @@ company comes up in character.
 
 The CLI is the OSS surface. Every verb here, every agent, every host, all driven from `/usr/local/bin/5dive`.
 
-If you'd rather click than `ssh`, [5dive.com](https://5dive.com) is the managed version: same CLI under the hood, but the VM, hardening, updates, and dashboard are run for you.
+If you'd rather click than `ssh`, [5dive.ai](https://5dive.ai) is the managed version: same CLI under the hood, but the VM, hardening, updates, and dashboard are run for you.
 
 <video src="https://cdn.jsdelivr.net/gh/5dive-ai/assets@main/hero-demo.mp4" autoplay loop muted playsinline width="100%"></video>
 
@@ -249,7 +249,7 @@ Long form: [your auth tokens don't touch us →](https://blog.5dive.com/blog/you
 - per-agent isolation tiers
 - Telegram bot allowlists
 
-Baselines: [devsec.os_hardening](https://github.com/dev-sec/ansible-collection-hardening) · [Lynis](https://github.com/CISOfy/lynis) · [fail2ban](https://www.fail2ban.org/). Or skip the checklist; [5dive.com](https://5dive.com) handles it.
+Baselines: [devsec.os_hardening](https://github.com/dev-sec/ansible-collection-hardening) · [Lynis](https://github.com/CISOfy/lynis) · [fail2ban](https://www.fail2ban.org/). Or skip the checklist; [5dive.ai](https://5dive.ai) handles it.
 
 ---
 
