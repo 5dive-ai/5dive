@@ -168,6 +168,12 @@ CREATE TABLE IF NOT EXISTS tasks (
   verify_command      TEXT,
   max_iterations      INTEGER,
   verifier            TEXT,
+  -- DIVE-824: per-run spend cap carried on the task so the on-host loop handoff
+  -- has a real budget (sibling to the verify loop's --timeout). Stored verbatim
+  -- as either a bare token count ("50000") or a dollar cost ("$1.50"); the loop
+  -- runner maps the $-form to `claude --max-budget-usd` (hard) and the token-form
+  -- to the raw Messages-API task_budget (was advisory-only on-host pre-DIVE-824).
+  task_budget         TEXT,
   -- DIVE-477: maker→verifier loop state. iteration = how many times the maker has
   -- handed off to the verifier (bumped on each `task done` that routes, not on
   -- bounce-back). maker_agent = the original maker, stashed at first handoff so a
@@ -320,7 +326,7 @@ _tasks_db_migrate() {
            'escalated_at TEXT' 'escalated_by TEXT' \
            "project_key TEXT NOT NULL DEFAULT 'dive'" 'issue_number INTEGER' \
            'acceptance_criteria TEXT' 'verify_command TEXT' 'max_iterations INTEGER' 'verifier TEXT' \
-           'iteration INTEGER' 'maker_agent TEXT'; do
+           'iteration INTEGER' 'maker_agent TEXT' 'task_budget TEXT'; do
     if ! printf '%s\n' "$cols" | grep -qx "${c%% *}"; then
       sqlite3 -cmd ".timeout 5000" "$TASKS_DB" \
         "ALTER TABLE tasks ADD COLUMN ${c};" >/dev/null 2>&1 || true

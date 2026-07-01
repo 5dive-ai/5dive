@@ -10,6 +10,7 @@ _task_usage() {
                             [--assignee=<agent>] [--parent=<id|DIVE-N>] [--from=<who>]
                             [--recurring="<cron>"]  # recurring=template (5-field cron, e.g. "0 2 * * *")
                             [--accept=<criteria>] [--verify=<cmd>] [--max-iters=<n>] [--verifier=<agent>]
+                            [--task-budget=<tokens|$cost>]  # per-run spend cap for the on-host loop (DIVE-824)
                                                      # loop spec: declarative verify loop (DIVE-476). --verify is
                                                      # the default cmd for `task verify`; --verifier grades (writer!=grader)
   5dive task ls [--status=<s>] [--assignee=<agent>] [--mine] [--all] [--recurring]
@@ -119,7 +120,7 @@ _task_resolve_coordinator() {
 cmd_task_add() {
   tasks_db_init
   local body="" priority="medium" assignee="" parent="" from="" recurring="" fresh="" project="dive"
-  local accept="" verify_cmd="" max_iters="" verifier=""
+  local accept="" verify_cmd="" max_iters="" verifier="" task_budget=""
   local -a words=()
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -139,6 +140,9 @@ cmd_task_add() {
       --verify=*)    verify_cmd="${1#*=}" ;;
       --max-iters=*) max_iters="${1#*=}" ;;
       --verifier=*)  verifier="${1#*=}" ;;
+      # DIVE-824: per-run spend cap carried on the row (sibling to verify --timeout).
+      # Value is either a bare token count or a "$cost" dollar figure.
+      --task-budget=*) task_budget="${1#*=}" ;;
       --)            shift; words+=("$@"); break ;;
       -*)            fail "$E_USAGE" "unknown flag: $1" ;;
       *)             words+=("$1") ;;
@@ -146,11 +150,16 @@ cmd_task_add() {
     shift
   done
   local title="${words[*]:-}"
-  [[ -n "$title" ]] || fail "$E_USAGE" "usage: 5dive task add <title...> [--body=] [--priority=] [--assignee=] [--parent=] [--project=<key>] [--recurring=\"<cron>\"]"
+  [[ -n "$title" ]] || fail "$E_USAGE" "usage: 5dive task add <title...> [--body=] [--priority=] [--assignee=] [--parent=] [--project=<key>] [--recurring=\"<cron>\"] [--task-budget=<tokens|\$cost>]"
   valid_task_priority "$priority" || fail "$E_VALIDATION" "bad priority '$priority' (low|medium|high|urgent)"
   # DIVE-476: --max-iters is the maker→verifier loop cap; must be a positive int.
   [[ -z "$max_iters" || "$max_iters" =~ ^[1-9][0-9]*$ ]] \
     || fail "$E_VALIDATION" "--max-iters must be a positive integer"
+  # DIVE-824: --task-budget is EITHER a bare token count ("50000") OR a dollar
+  # cost ("$1.50" / "$2"). Reject anything else so a malformed cap can't silently
+  # store as a no-op. Stored verbatim; the loop runner interprets the form.
+  [[ -z "$task_budget" || "$task_budget" =~ ^[1-9][0-9]*$ || "$task_budget" =~ ^\$[0-9]+(\.[0-9]+)?$ ]] \
+    || fail "$E_VALIDATION" "--task-budget must be a token count (e.g. 50000) or a dollar cost (e.g. \$1.50)"
   # --recurring=<cron> makes this a TEMPLATE (kind='recurring'), not a worked
   # task — the step-2 materializer clones it into a standard todo on schedule.
   # A template + an explicit --parent is nonsensical (instances are top-level),
@@ -198,11 +207,11 @@ cmd_task_add() {
   local creator; creator=$(task_actor "$from")
   local id
   id=$(db "INSERT INTO tasks (title, body, priority, assignee, created_by, parent_id, project_key, kind, schedule, fresh,
-                              acceptance_criteria, verify_command, max_iterations, verifier)
+                              acceptance_criteria, verify_command, max_iterations, verifier, task_budget)
            VALUES ($(sqlq "$title"), $(sqlq_or_null "$body"), $(sqlq "$priority"),
                    $(sqlq_or_null "$assignee"), $(sqlq "$creator"), ${parent_sql}, $(sqlq "$project"),
                    $(sqlq "$kind"), ${schedule_sql}, ${fresh_sql},
-                   $(sqlq_or_null "$accept"), $(sqlq_or_null "$verify_cmd"), ${max_iters:-NULL}, $(sqlq_or_null "$verifier"));
+                   $(sqlq_or_null "$accept"), $(sqlq_or_null "$verify_cmd"), ${max_iters:-NULL}, $(sqlq_or_null "$verifier"), $(sqlq_or_null "$task_budget"));
            SELECT last_insert_rowid();")
   # Ident is stamped by the AFTER INSERT trigger from the project's counter, so
   # read it back rather than assuming the DIVE- prefix (DIVE-484).
@@ -310,12 +319,13 @@ cmd_task_show() {
         CASE WHEN acceptance_criteria IS NOT NULL THEN 'acceptance_criteria: '||acceptance_criteria||x'0a' ELSE '' END||
         CASE WHEN verify_command      IS NOT NULL THEN 'verify_command: '||verify_command||x'0a' ELSE '' END||
         CASE WHEN max_iterations      IS NOT NULL THEN 'max_iterations: '||max_iterations||x'0a' ELSE '' END||
+        CASE WHEN task_budget         IS NOT NULL THEN 'task_budget: '||task_budget||x'0a' ELSE '' END||
         CASE WHEN verifier            IS NOT NULL THEN 'verifier: '||verifier||x'0a' ELSE '' END||
         CASE WHEN maker_agent         IS NOT NULL THEN 'maker: '||maker_agent||x'0a' ELSE '' END||
         CASE WHEN iteration           IS NOT NULL THEN 'iteration: '||iteration ELSE '' END
       FROM tasks WHERE id=${id}
         AND (acceptance_criteria IS NOT NULL OR verify_command IS NOT NULL
-             OR max_iterations IS NOT NULL OR verifier IS NOT NULL
+             OR max_iterations IS NOT NULL OR verifier IS NOT NULL OR task_budget IS NOT NULL
              OR maker_agent IS NOT NULL OR iteration IS NOT NULL);")
     [[ -n "$loopspec" ]] && { echo; echo "loop spec:"; printf '%s\n' "$loopspec" | sed -e 's/[[:space:]]*$//' | indent2; }
     local subs
