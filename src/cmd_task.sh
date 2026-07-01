@@ -10,7 +10,7 @@ _task_usage() {
                             [--assignee=<agent>] [--parent=<id|DIVE-N>] [--from=<who>]
                             [--recurring="<cron>"]  # recurring=template (5-field cron, e.g. "0 2 * * *")
                             [--accept=<criteria>] [--verify=<cmd>] [--max-iters=<n>] [--verifier=<agent>]
-                            [--task-budget=<tokens|$cost>]  # per-run spend cap for the on-host loop (DIVE-824)
+                            [--task-budget=<tokens|\$cost>]  # per-run spend cap for the on-host loop (DIVE-824)
                                                      # loop spec: declarative verify loop (DIVE-476). --verify is
                                                      # the default cmd for `task verify`; --verifier grades (writer!=grader)
   5dive task ls [--status=<s>] [--assignee=<agent>] [--mine] [--all] [--recurring]
