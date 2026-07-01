@@ -360,6 +360,54 @@ PY
   rm -rf "$stage"; echo "$out"
 }
 
+# Extract a bundled ed25519 signing key from a persona's sanctioned ext namespace
+# (ext.5dive.signing_key — vendor-namespaced; a bare ext.deploy.signing_key is
+# also accepted) into <keyfile>, and STRIP it from the persona IN PLACE so the
+# private key never lands in the pack, the rendered CLAUDE.md, or a re-rendered
+# card. Now-empty ext namespaces are pruned. Nothing is written to stdout, so the
+# key is never logged. Rarity is untouched: it derives from the PUBLIC key under
+# provenance.created_by.key (left intact), so a persona that carries only the
+# public key still keeps its rarity, sign-less. Returns 0 if a key was extracted
+# to <keyfile>; 9 if the persona carried none (file left byte-for-byte untouched).
+# (DIVE-840 — the deploy-with-key import path; keystore adoption = no re-mint.)
+_persona_strip_signing_key() {
+  local persona="$1" keyfile="$2"
+  PERSONA_FILE="$persona" KEY_OUT="$keyfile" python3 - <<'PY'
+import os, sys
+try:
+    import yaml
+except Exception as e:
+    sys.stderr.write("pyyaml required to adopt a signing key: %s\n" % e); sys.exit(3)
+with open(os.environ["PERSONA_FILE"]) as f:
+    p = yaml.safe_load(f)
+if not isinstance(p, dict):
+    sys.exit(9)
+ext = p.get("ext")
+key = None
+if isinstance(ext, dict):
+    for ns in ("5dive", "deploy"):
+        blk = ext.get(ns)
+        if isinstance(blk, dict) and isinstance(blk.get("signing_key"), str) and blk["signing_key"].strip():
+            key = blk["signing_key"].strip()
+            blk.pop("signing_key", None)
+            if not blk:            # prune a namespace we just emptied
+                ext.pop(ns, None)
+            break
+    if not ext:                    # prune ext if that was its only content
+        p.pop("ext", None)
+if key is None:
+    sys.exit(9)
+# 0600 is pre-set on KEY_OUT by the caller; write with a trailing newline.
+with open(os.environ["KEY_OUT"], "w") as f:
+    f.write(key if key.endswith("\n") else key + "\n")
+# Rewrite the sanitized persona only on the extract path (safe_dump preserves the
+# authored key order via sort_keys=False); a keyless persona is never rewritten.
+with open(os.environ["PERSONA_FILE"], "w") as f:
+    yaml.safe_dump(p, f, sort_keys=False, allow_unicode=True)
+sys.exit(0)
+PY
+}
+
 # `5dive agent marketplace [ls]` — browse the character-pack registry.
 cmd_marketplace() {
   local sub="${1:-ls}"; [[ $# -gt 0 ]] && shift
@@ -748,6 +796,31 @@ cmd_import() {
     rm -rf "$stage"; fail "$E_VALIDATION" "pack declares unsupported memory mode '$mem_inc'"
   fi
 
+  # DIVE-840: a deploy-time persona may bundle its private ed25519 signing key
+  # under the sanctioned ext namespace so an imported agent can OWN its identity
+  # (sign) instead of just carrying a public-key rarity. Extract it into a
+  # transient, agent-invisible file inside the 0700 stage dir and STRIP it from
+  # persona.yaml NOW — before the CLAUDE.md render, the persona.yaml install, and
+  # any card re-render below ever read the file, so the secret never persists in
+  # the pack. The keystore install happens after the agent user exists (below);
+  # every failure path already `rm -rf "$stage"`, which scrubs the transient key.
+  local signing_keyfile="" has_signing_key=0
+  if [[ -f "$stage/persona.yaml" ]]; then
+    signing_keyfile="$stage/.signing_key"; : >"$signing_keyfile"; chmod 600 "$signing_keyfile"
+    _persona_strip_signing_key "$stage/persona.yaml" "$signing_keyfile"; local _srk=$?
+    if (( _srk == 0 )); then
+      has_signing_key=1                                    # key extracted + stripped
+    elif (( _srk == 9 )); then
+      rm -f "$signing_keyfile"; signing_keyfile=""         # clean, no key — proceed sign-less
+    else
+      # FAIL CLOSED: the strip ERRORED (e.g. pyyaml missing, unreadable YAML), so
+      # persona.yaml may STILL contain the private key. Never fall through to the
+      # install below — abort the whole import rather than risk leaking the key.
+      rm -f "$signing_keyfile"; rm -rf "$stage"
+      fail "$E_GENERIC" "could not process the persona's signing key (rc=$_srk) — aborting import to avoid leaking a private key"
+    fi
+  fi
+
   # DIVE-656: if the pack carries an OpenAgent persona.yaml it is the CANONICAL
   # identity source — (re)render CLAUDE.md from it so the imported agent's identity
   # is spec-driven, not a stale hand-edited doc. Falls back to the packed CLAUDE.md
@@ -830,9 +903,33 @@ cmd_import() {
 
   # Preserve the OpenAgent persona.yaml (DIVE-656) so the imported agent owns its
   # canonical identity file — it can re-export, re-sign, or feed the gallery. The
-  # rename above already swapped the pack's name/id to the --as name.
+  # rename above already swapped the pack's name/id to the --as name. (The signing
+  # key, if any, was already stripped from this file above — it never persists here.)
   if [[ -f "$stage/persona.yaml" ]]; then
+    # DIVE-840 fail-closed guard: no matter how the strip above went, a persona.yaml
+    # that still mentions a signing_key must NEVER be installed. Abort if it does.
+    if grep -qF "signing_key" "$stage/persona.yaml"; then
+      rm -rf "$stage"; fail "$E_GENERIC" "refusing to install a persona.yaml that still contains a signing_key (fail-closed)"
+    fi
     install -o "agent-${as}" -g "agent-${as}" -m 644 "$stage/persona.yaml" "$cdir/persona.yaml" 2>/dev/null || true
+  fi
+
+  # DIVE-840: install the adopted signing key into the imported agent's keystore so
+  # it OWNS its identity and signs as itself (no re-mint — rarity already rides in
+  # provenance). Perms match the openagent lib/keystore contract: dir 0700, key
+  # 0600, both owned by the agent user. Then securely scrub the transient key file.
+  # If there was no bundled key the agent simply runs sign-less, rarity preserved.
+  if (( has_signing_key )) && [[ -s "$signing_keyfile" ]]; then
+    local kdir="/home/agent-${as}/.openagent"
+    install -d -o "agent-${as}" -g "agent-${as}" -m 700 "$kdir" 2>/dev/null || true
+    if install -o "agent-${as}" -g "agent-${as}" -m 600 "$signing_keyfile" "$kdir/agent.key" 2>/dev/null; then
+      step "Adopted the persona's signing key into the keystore (~/.openagent/agent.key) — agent owns its identity"
+    else
+      warn "could not install the adopted signing key; agent runs sign-less (rarity still preserved)"
+    fi
+  fi
+  if [[ -n "$signing_keyfile" && -e "$signing_keyfile" ]]; then
+    shred -u "$signing_keyfile" 2>/dev/null || rm -f "$signing_keyfile"
   fi
 
   # Stash the character avatar so the onboarding/Telegram flow (DIVE-494) can set
