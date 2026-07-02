@@ -179,6 +179,14 @@ Heartbeat (wake an agent only when it has queued tasks, one per tick):
   5dive heartbeat tick                                      # cron driver (root); wakes due agents that have work
   # full surface: 5dive heartbeat --help
 
+Supervisor (observe-only fleet health — detect + classify, ZERO auto-actions):
+  5dive supervisor                                   # per-agent board: state, classification, cause, activity
+  5dive supervisor --watch[=secs]                    # live repaint (default 5s; q quits)
+  5dive supervisor --tick                            # cron-callable observe pass (root): appends audit rows
+                                                     # to supervisor_events; no-ops unless
+                                                     # /var/lib/5dive/supervisor.enabled exists
+  # full surface: 5dive supervisor --help
+
 Usage (per-agent / per-task token burn — subscription tokens, no dollars):
   5dive usage [--7d]                                 # board: top agents + top tasks by tokens (24h default)
   5dive usage <agent> [--7d]                         # one agent: per-model + per-task breakdown
@@ -488,6 +496,13 @@ main() {
       # — tick fires every few minutes and would flood the log; the wakes it
       # triggers are visible via each agent's own transcript.
       cmd_heartbeat "$@" ;;
+    supervisor)
+      # DIVE-724 P1: observe-only fleet supervisor. Board/--watch are read-only;
+      # --tick appends rows to the supervisor_events table (tasks.db) and takes
+      # ZERO recovery actions. No audit-log wrapper — like heartbeat tick it's
+      # cron-frequency and would flood the log; its own events table IS the
+      # audit trail (root + registry lock not needed: sqlite serializes writes).
+      cmd_supervisor "$@" ;;
     usage)
       # Per-agent / per-task token visibility for subscription agents. Read-only
       # (scans sibling transcripts + the task DB); the `budget` subcommand writes

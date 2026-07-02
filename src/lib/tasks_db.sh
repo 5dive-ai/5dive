@@ -264,6 +264,25 @@ CREATE TABLE IF NOT EXISTS loop_runs (
   updated_at       INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS loop_runs_status_idx ON loop_runs(status);
+
+-- DIVE-724 P1: append-only supervisor audit trail. Written ONLY by
+-- `5dive supervisor --tick`: one event='observe' row per agent per tick when
+-- its classification != healthy, plus an event='transition' row whenever the
+-- classification changed since the agent's last recorded row (including
+-- recovery back to healthy). signals is the full per-agent JSON snapshot at
+-- that tick. Never updated or deleted — this trail is the P2 escalation
+-- evidence (design doc §7). Additive, never referenced by tasks/projects.
+CREATE TABLE IF NOT EXISTS supervisor_events (
+  id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts                  TEXT NOT NULL DEFAULT (datetime('now')),
+  agent               TEXT NOT NULL,
+  event               TEXT NOT NULL DEFAULT 'observe',
+  classification      TEXT NOT NULL,
+  cause               TEXT,
+  prev_classification TEXT,
+  signals             TEXT
+);
+CREATE INDEX IF NOT EXISTS supervisor_events_agent_idx ON supervisor_events(agent, id);
 SQL
 }
 
@@ -411,6 +430,29 @@ CREATE TABLE IF NOT EXISTS loop_runs (
   updated_at       INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS loop_runs_status_idx ON loop_runs(status);
+MIG
+  fi
+
+  # DIVE-724 supervisor_events table — additive, gated on absence like loop_runs
+  # above so it takes no write lock on every command. Brand-new append-only
+  # table, never referenced by tasks/projects, so creating it cannot touch the
+  # existing queue.
+  local has_sup_events
+  has_sup_events=$(sqlite3 -cmd ".timeout 5000" "$TASKS_DB" \
+    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='supervisor_events' LIMIT 1;" 2>/dev/null)
+  if [[ "$has_sup_events" != "1" ]]; then
+    sqlite3 -cmd ".timeout 5000" "$TASKS_DB" <<'MIG' >/dev/null 2>&1 || true
+CREATE TABLE IF NOT EXISTS supervisor_events (
+  id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts                  TEXT NOT NULL DEFAULT (datetime('now')),
+  agent               TEXT NOT NULL,
+  event               TEXT NOT NULL DEFAULT 'observe',
+  classification      TEXT NOT NULL,
+  cause               TEXT,
+  prev_classification TEXT,
+  signals             TEXT
+);
+CREATE INDEX IF NOT EXISTS supervisor_events_agent_idx ON supervisor_events(agent, id);
 MIG
   fi
 
