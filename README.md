@@ -9,7 +9,7 @@
 
 ![34 seconds: install to a Claude agent answering on Telegram](docs/quickstart.gif)
 
-> We run our own company on this: a team of AI agents that assign each other work, report up an org chart, and escalate to a human only when they're stuck. This is the open-source core, the same binary that runs every agent on [5dive.ai](https://5dive.ai). MIT, no open-core split. Run it yourself, or skip the ops with the managed VM.
+> We run our own company on this: a team of AI agents that assign each other work, report up an org chart, and escalate to a human only when they're stuck. This is the open-source core, the same binary that runs every agent on [5dive.ai](https://5dive.ai?utm_source=github&utm_medium=referral&utm_campaign=5dive-readme). MIT, no open-core split. Run it yourself, or skip the ops with the managed VM.
 
 **Already use Claude Code, Codex, Grok, Antigravity, or opencode?** Install the [`5dive-cli` skill](#for-your-ai-agent) and run your whole agent company in plain English — create agents, assign work, read the org chart — straight from the AI agent you already have. One line to set up: [jump to it ↓](#for-your-ai-agent).
 
@@ -114,7 +114,7 @@ company comes up in character.
 
 The CLI is the OSS surface. Every verb here, every agent, every host, all driven from `/usr/local/bin/5dive`.
 
-If you'd rather click than `ssh`, [5dive.ai](https://5dive.ai) is the managed version: same CLI under the hood, but the VM, hardening, updates, and dashboard are run for you.
+If you'd rather click than `ssh`, [5dive.ai](https://5dive.ai?utm_source=github&utm_medium=referral&utm_campaign=5dive-readme) is the managed version: same CLI under the hood, but the VM, hardening, updates, and dashboard are run for you.
 
 <video src="https://cdn.jsdelivr.net/gh/5dive-ai/assets@main/hero-demo.mp4" autoplay loop muted playsinline width="100%"></video>
 
@@ -132,7 +132,7 @@ If you'd rather click than `ssh`, [5dive.ai](https://5dive.ai) is the managed ve
 | `openclaw`    | third-party multi-provider harness | OAuth (OpenAI) / API key | Telegram, Discord |
 | `opencode`    | OpenCode               | API key | Telegram |
 
-`hermes` and `openclaw` are community-built harnesses that can route to many providers (OpenRouter, Anthropic, Google, Moonshot, DeepSeek, Z.ai, etc.). As of April 4, 2026, Anthropic no longer permits routing consumer Claude Pro/Max OAuth through third-party harnesses. For that work, use the official `claude` type with your own API key. Background: [We Ditched OpenClaw for Claude →](https://blog.5dive.com/blog/we-ditched-openclaw-for-claude/).
+`hermes` and `openclaw` are community-built harnesses that can route to many providers (OpenRouter, Anthropic, Google, Moonshot, DeepSeek, Z.ai, etc.). As of April 4, 2026, Anthropic no longer permits routing consumer Claude Pro/Max OAuth through third-party harnesses. For that work, use the official `claude` type with your own API key. Background: [We Ditched OpenClaw for Claude →](https://blog.5dive.ai/blog/we-ditched-openclaw-for-claude/?utm_source=github&utm_medium=referral&utm_campaign=5dive-readme).
 
 The `claude` type can also run the official Claude Code harness against a third-party Anthropic-compatible endpoint, bring your own key:
 
@@ -235,7 +235,7 @@ sudo 5dive agent create my-agent --type=claude --isolation=sandboxed
 
 5dive runs on your server. Auth tokens go to model providers directly, never to us. No telemetry, no error reporting, no usage data leaves the box. Each agent is one Linux user with its own login.
 
-Long form: [your auth tokens don't touch us →](https://blog.5dive.com/blog/your-auth-tokens-dont-touch-us/).
+Long form: [your auth tokens don't touch us →](https://blog.5dive.ai/blog/your-auth-tokens-dont-touch-us/?utm_source=github&utm_medium=referral&utm_campaign=5dive-readme).
 
 ---
 
@@ -249,7 +249,7 @@ Long form: [your auth tokens don't touch us →](https://blog.5dive.com/blog/you
 - per-agent isolation tiers
 - Telegram bot allowlists
 
-Baselines: [devsec.os_hardening](https://github.com/dev-sec/ansible-collection-hardening) · [Lynis](https://github.com/CISOfy/lynis) · [fail2ban](https://www.fail2ban.org/). Or skip the checklist; [5dive.ai](https://5dive.ai) handles it.
+Baselines: [devsec.os_hardening](https://github.com/dev-sec/ansible-collection-hardening) · [Lynis](https://github.com/CISOfy/lynis) · [fail2ban](https://www.fail2ban.org/). Or skip the checklist; [5dive.ai](https://5dive.ai?utm_source=github&utm_medium=referral&utm_campaign=5dive-readme) handles it.
 
 ---
 
