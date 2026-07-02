@@ -80,6 +80,10 @@ Agents:
                                                      # post-create (also runs install_channel_for_agent so the
                                                      # claude plugin / openclaw channels.add / hermes ~/.hermes/.env
                                                      # land in step with the registry).
+                                                     # telegram.token=- / discord.token=- read the token from
+                                                     # stdin (argv hygiene; one =- key per invocation). NOTE:
+                                                     # passing =- without piping anything blocks on stdin until
+                                                     # the caller's timeout — always send the token on stdin.
   5dive agent config <name> set discord.token=<token>
   5dive agent config <name> set telegram.home-channel=<chat-id>
                                                      # hermes only — chat id the gateway posts unsolicited
@@ -101,6 +105,9 @@ Agents:
                                                      # {found:true, userId, chatId, username, firstName};
                                                      # otherwise {found:false} — callers re-poll until found.
   5dive agent telegram-getme --token=<bot-token>     # fast getMe lookup; returns {botId, username, firstName}.
+                                                     # telegram-getme/-discover also take --token=- (token on
+                                                     # stdin, never argv); =- without piped stdin blocks until
+                                                     # the caller's timeout.
   5dive agent telegram-info <name> [--refresh]       # name-based getMe; reads token from /etc/5dive/connectors,
                                                      # caches botUsername in the registry. Used by the dashboard
                                                      # to backfill @handles for agents created before the
