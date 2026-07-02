@@ -9,6 +9,16 @@ release.
 
 ## [Unreleased]
 
+### Fixed
+
+- DIVE-894: gate alerts no longer dead-end on a box with no dashboard. The
+  secret/manual CTA lines and any button-less decision/approval alert now carry
+  the copy-pasteable on-box fallback (`sudo 5dive task answer <id> ...`, run as
+  a human login — claude/root clears approval/secret gates on the human path).
+  Companion telegram-plugin 0.5.10 change: a failed gate tap replies with the
+  same on-box line instead of "open the dashboard" (lodar hit this live on
+  DIVE-790, CLI-only box). Version 0.6.1 -> 0.6.2.
+
 ### Added
 
 - DIVE-726 Phase 1a: `5dive memory search "<query>"` — queryable team memory

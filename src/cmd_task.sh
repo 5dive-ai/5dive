@@ -1399,9 +1399,13 @@ task_need_notify() {
   # them — the core of Mark's "a needs-you that needs no obvious action is
   # confusing" complaint. Add a type-specific CTA telling the human exactly what
   # to do + tap (the matching ✅ button is emitted below for plugin types).
+  # DIVE-894: every CTA also carries the on-box CLI line. Boxes with no
+  # dashboard (CLI-only self-hosted — lodar hit this live on DIVE-790) had no
+  # recovery path when a tap fails; the answer command works on EVERY box, run
+  # as a human login (claude/root — the human path clears approval/secret gates).
   case "$need_type" in
-    secret) text+=$'\n\n'"🔑 Put the key where I expect it (my .env / our channel), then tap ✅ Provided below. Don't paste the key here." ;;
-    manual) text+=$'\n\n'"✋ Tap ✅ Done below once it's handled." ;;
+    secret) text+=$'\n\n'"🔑 Put the key where I expect it (my .env / our channel), then tap ✅ Provided below — don't paste the key here. Tap not working? On the box: sudo 5dive task answer ${ident}" ;;
+    manual) text+=$'\n\n'"✋ Tap ✅ Done below once it's handled — or on the box: sudo 5dive task answer ${ident} --value=done" ;;
   esac
 
   # DIVE-117/118 tap-to-answer buttons. GATED to the plugin types whose `tna:`
@@ -1468,6 +1472,16 @@ task_need_notify() {
       # DIVE-356: one-tap "Done" — handler runs `task answer <id> --value=done`.
       reply_markup='{"inline_keyboard":[[{"text":"✅ Done","callback_data":"tna:'"${numid}"':done"}]]}'
     fi
+  fi
+
+  # DIVE-894: no tap buttons landed (non-tna channel type, or no valid options)
+  # — a decision/approval gate would otherwise render with no way to act on a
+  # dashboard-less box. Append the copy-pasteable on-box answer line.
+  if [[ -z "$reply_markup" ]]; then
+    case "$need_type" in
+      decision) text+=$'\n\n'"Answer on the box: sudo 5dive task answer ${ident} --value=\"<option>\"" ;;
+      approval) text+=$'\n\n'"Answer on the box: sudo 5dive task answer ${ident} --value=approved (or denied)" ;;
+    esac
   fi
 
   _task_send_owner "$text" "$reply_markup"
