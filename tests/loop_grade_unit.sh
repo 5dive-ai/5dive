@@ -118,5 +118,23 @@ wait $bgpid
 kst=$(jq -r '.data.status' /tmp/loop-grade-kill.out 2>/dev/null)
 [[ "$kst" == "killed" ]] && ok_t "--wait halts on kill → killed" || bad_t "grade kill" "$(cat /tmp/loop-grade-kill.out)"
 
+# --- T7 (DIVE-860): `task loop ls --json` carries the latest grade scorecard per run
+lout=$(JSON_MODE=1 cmd_task_loop_start --title="graded loop" --owner=dev --steps='[{"agent":"dev","label":"do it"}]' 2>/dev/null)
+LID=$(printf '%s' "$lout" | jq -r '.data.ident')
+lout2=$(JSON_MODE=1 cmd_task_loop_start --title="ungraded loop" --owner=dev --steps='[{"agent":"dev","label":"other"}]' 2>/dev/null)
+LID2=$(printf '%s' "$lout2" | jq -r '.data.ident')
+[[ "$LID" =~ ^DIVE- && "$LID2" =~ ^DIVE- ]] && ok_t "seed builder loops ($LID, $LID2)" || bad_t "seed builder loops" "$lout / $lout2"
+( cmd_loop_grade --target="$LID" --verifier=main --accept="loop completes" --wait=20 >/tmp/loop-grade-ls.out 2>&1 ) &
+bgpid=$!
+sleep 1; g7=$(latest_grade_child)
+db "UPDATE tasks SET status='done', result='{\"overall\":84,\"criteria\":[{\"name\":\"loop completes\",\"score\":84,\"reason\":\"ok\"}]}' WHERE id=$g7;"
+wait $bgpid
+ls_out=$(JSON_MODE=1 cmd_task_loop_ls 2>/dev/null)
+sc7=$(printf '%s' "$ls_out" | jq -r --arg id "$LID" '.data.loops[] | select(.ident==$id) | .scorecard_json | fromjson | .overall' 2>/dev/null)
+sc7n=$(printf '%s' "$ls_out" | jq -r --arg id "$LID2" '.data.loops[] | select(.ident==$id) | .scorecard_json' 2>/dev/null)
+[[ "$sc7" == "84" && "$sc7n" == "" ]] \
+  && ok_t "loop ls --json: graded run carries scorecard_json (overall=$sc7), ungraded stays empty" \
+  || bad_t "loop ls scorecard" "$ls_out"
+
 echo "-----"; echo "PASS=$PASS FAIL=$FAIL"
 [[ $FAIL -eq 0 ]]

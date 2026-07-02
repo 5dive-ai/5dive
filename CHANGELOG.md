@@ -11,6 +11,12 @@ release.
 
 ### Added
 
+- DIVE-860: `task loop ls` surfaces the latest grade scorecard per builder
+  loop run. JSON rows gain `scorecard_json` (raw card string, `''` when
+  ungraded — same contract as the `task loops` runs board), joined from
+  `loop_runs` by the card's `target` ident; the text board gains a `score`
+  column (`84/100` style). Feeds the dashboard Loops tab score chips.
+
 - DIVE-856: claude agents are chat-capable in the web dashboard by default.
   `agent create` folds the token-free `dashboard` channel into every claude
   create on managed boxes (unset `--channels` becomes `dashboard`, explicit

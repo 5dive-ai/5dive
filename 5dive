@@ -26,7 +26,7 @@ esac
 
 # Bumped on every public release. `build.sh` checks this line exists; CI fails
 # the bundle-drift check if it's missing or empty.
-readonly FIVE_VERSION="0.5.7"
+readonly FIVE_VERSION="0.5.8"
 
 # GitHub org our repos live under. The org is being renamed
 # 5dive-com -> 5dive-ai (2026-06); fetches must work on either side of the
@@ -13370,11 +13370,20 @@ cmd_task_loop_ls() {
   local run_pred="body LIKE '%${_LOOP_MARK}:run]]%'"
   local status_pred="status NOT IN ('done','cancelled')"
   (( show_all )) && status_pred="1=1"
+  # DIVE-860: latest grade scorecard for each run, joined by the graded task's
+  # ident (loop grade stamps scorecard_json.target with it). Emitted as the raw
+  # JSON string ('' when ungraded) — same shape `task loops` uses for its runs
+  # board, so dashboard consumers parse one contract.
+  local score_sub="COALESCE((SELECT lr.scorecard_json FROM loop_runs lr
+             WHERE lr.scorecard_json IS NOT NULL AND json_valid(lr.scorecard_json)
+               AND json_extract(lr.scorecard_json,'\$.target')=tasks.ident
+             ORDER BY lr.updated_at DESC LIMIT 1),'')"
   if (( JSON_MODE )); then
     local rows
     rows=$(dbfmt -json "SELECT id, ident, title, status, assignee,
              (SELECT COUNT(*) FROM tasks s WHERE s.parent_id=tasks.id) AS steps,
-             (SELECT COUNT(*) FROM tasks s WHERE s.parent_id=tasks.id AND s.status='done') AS done_steps
+             (SELECT COUNT(*) FROM tasks s WHERE s.parent_id=tasks.id AND s.status='done') AS done_steps,
+             ${score_sub} AS scorecard_json
            FROM tasks WHERE ${run_pred} AND ${status_pred} ORDER BY id DESC;")
     [[ -n "$rows" ]] || rows="[]"
     printf '%s' "$rows" | jq -c '{ok:true, data:{loops:.}}'
@@ -13382,6 +13391,9 @@ cmd_task_loop_ls() {
     dbfmt -box "SELECT ident, status, COALESCE(assignee,'-') AS owner,
              (SELECT COUNT(*) FROM tasks s WHERE s.parent_id=tasks.id AND s.status='done')||'/'||
              (SELECT COUNT(*) FROM tasks s WHERE s.parent_id=tasks.id) AS progress,
+             CASE WHEN ${score_sub} <> ''
+                  THEN COALESCE(CAST(json_extract(${score_sub},'\$.overall') AS TEXT),'-')||'/100'
+                  ELSE '-' END AS score,
              title
            FROM tasks WHERE ${run_pred} AND ${status_pred} ORDER BY id DESC;"
   fi
