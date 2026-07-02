@@ -967,13 +967,20 @@ cmd_create() {
   # openclaw shells out to `openclaw channels add`, hermes writes
   # ~/.hermes/.env. Each runs as agent-${name} so credentials land in that
   # user's home with correct ownership.
-  case "$channels" in
-    telegram)
-      install_channel_for_agent "$type" telegram "$name" "$telegram_token" \
-        "$telegram_home_channel" "$telegram_allowed_users" ;;
-    discord)
-      install_channel_for_agent "$type" discord  "$name" "$discord_token" ;;
-  esac
+  local _ch
+  for _ch in ${channels//,/ }; do
+    case "$_ch" in
+      telegram)
+        install_channel_for_agent "$type" telegram "$name" "$telegram_token" \
+          "$telegram_home_channel" "$telegram_allowed_users" ;;
+      discord)
+        install_channel_for_agent "$type" discord  "$name" "$discord_token" ;;
+      # DIVE-841 dashboard chat: no token — the plugin reads the box's
+      # connectord token from /etc/5dive/connectord.env itself.
+      dashboard)
+        install_channel_for_agent "$type" dashboard "$name" "" ;;
+    esac
+  done
 
   # Hermes BYO Kimi/Moonshot: KIMI_API_KEY lives in the agent user's
   # ~/.hermes/.env (hermes' Kimi provider reads it directly; there is no

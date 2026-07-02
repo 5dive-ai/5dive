@@ -326,7 +326,7 @@ install_channel_plugin_for_agent() {
   # SSH key configured. Explicit https URL sidesteps the shorthand
   # resolver entirely.
   local mkt_repo="https://github.com/anthropics/claude-plugins-official.git"
-  if [[ "$plugin" == "telegram" ]]; then
+  if [[ "$plugin" == "telegram" || "$plugin" == "dashboard" ]]; then
     marketplace="5dive-plugins"
     mkt_repo="https://github.com/$(gh_org)/5dive-plugins.git"
   fi
@@ -1246,6 +1246,11 @@ PY
 # routes) — kept as positional so the call site stays uniform.
 install_channel_for_agent() {
   local type="$1" plugin="$2" name="$3" token="$4" home_channel="${5:-}" allowed_users="${6:-}"
+  # DIVE-841: the dashboard channel is a native-push claude plugin only — the
+  # poll-fork runtimes (codex/grok/agy/opencode) have no dashboard variant yet.
+  if [[ "$plugin" == "dashboard" && "$type" != "claude" ]]; then
+    fail "$E_VALIDATION" "channels=dashboard is claude-only (agent '$name' is type $type)"
+  fi
   case "$type" in
     claude)      install_channel_plugin_for_agent "$plugin" "$name" "$allowed_users" ;;
     codex)       install_channel_for_codex_agent "$plugin" "$name" "$token" "$allowed_users" ;;

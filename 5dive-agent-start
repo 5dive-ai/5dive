@@ -117,7 +117,12 @@ esac
 # were originally provisioned with. Discord stays upstream — we haven't
 # forked it yet.
 CM="${AGENT_CHANNEL_MARKETPLACE:-claude-plugins-official}"
-case "$CHANNELS" in
+# CHANNELS is a comma-separated list (DIVE-841: e.g. "telegram,dashboard" —
+# the dashboard chat channel coexists with telegram on one session, each as
+# its own MCP server; --channels is variadic so repeating the flag is fine).
+IFS=',' read -ra CHANNEL_LIST <<< "$CHANNELS"
+for CH in "${CHANNEL_LIST[@]}"; do
+case "$CH" in
   none|"") : ;;
   telegram)
     case "$TYPE" in
@@ -137,8 +142,16 @@ case "$CHANNELS" in
     case "$TYPE" in
       claude) ARGS+=(--channels plugin:discord@claude-plugins-official) ;;
     esac ;;
-  *) echo "unknown channels: $CHANNELS" >&2; exit 2 ;;
+  # DIVE-841 native dashboard chat — claude-only (native-push channel plugin;
+  # poll-fork runtimes have no equivalent yet). Always our marketplace.
+  dashboard)
+    case "$TYPE" in
+      claude) ARGS+=(--channels "plugin:dashboard@5dive-plugins") ;;
+      *) echo "channels=dashboard is claude-only (got type=$TYPE)" >&2; exit 2 ;;
+    esac ;;
+  *) echo "unknown channels: $CH" >&2; exit 2 ;;
 esac
+done
 
 # Per-profile state root for the agent's type — empty $PROFILE means the
 # legacy shared /home/claude/.<type> is the seed source (default profile,

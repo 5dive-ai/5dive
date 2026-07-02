@@ -14,7 +14,13 @@ valid_name() {
 }
 
 valid_channel() {
-  [[ "$1" =~ ^(none|telegram|discord)$ ]]
+  # Comma-separated list (DIVE-841): "telegram,dashboard" runs both channels
+  # on one session. Every entry must be a known channel; empty is invalid.
+  [[ -n "$1" ]] || return 1
+  local IFS=',' c
+  for c in $1; do
+    [[ "$c" =~ ^(none|telegram|discord|dashboard)$ ]] || return 1
+  done
 }
 
 valid_isolation() {
