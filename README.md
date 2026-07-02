@@ -286,7 +286,7 @@ Install 5dive on this Linux host so I can use you to manage 5dive agents.
 
 1. Run the installer (idempotent, safe to rerun):
    curl -fsSL https://install.5dive.com | sudo bash
-2. Confirm: `5dive --version` prints "5dive 0.1.x".
+2. Confirm: `5dive --version` prints a version string (e.g. "5dive 0.5.x").
 3. Install the 5dive-cli skill. Replace <runtime> with one of
    claude-code, codex, antigravity, grok, hermes-agent, openclaw, opencode:
    npx -y skills add https://github.com/5dive-ai/skills --skill 5dive-cli --agent <runtime> --yes

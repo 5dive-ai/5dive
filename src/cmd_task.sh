@@ -39,10 +39,17 @@ _task_usage() {
   5dive task escalate <id|DIVE-N> [--from=<who>]     # flag for attention: bump priority a tier (cap urgent) + ping owning agent & paired human
 
   # Human Task Inbox — park a task on a human and clear it
-  5dive task need <id|DIVE-N> --type=decision|secret|approval|manual --ask="..." [--options=A|B] [--recommend="A"]
+  5dive task need <id|DIVE-N> --type=decision|secret|approval|manual --ask="..." [--options=A|B] [--recommend="A"] [--tier=0|1|2]
     --ask: ONE crisp question + ~1 line essential context, recommendation up front. Heavy detail goes in the task BODY, not the ask.
     --recommend: your advised choice (strongly encouraged for decision/approval). Leads the alert as '✅ Recommended: <X>' and ⭐-marks its button. For a decision it must match one of --options.
+    --tier (DIVE-891 risk tiers): 0 = auto-clear (rec applies NOW, no ping, digest line; requires --recommend)
+             1 = agent-clearable; unanswered 48h -> the heartbeat applies the rec   2 = hard human gate (default for approval/secret/manual)
+             Money, public comms, secrets, destructive and brand asks are FLOORED to tier 2 no matter what you pass; secret is always tier 2.
                                                      # -> blocked, awaiting a human (decision/secret/approval/manual)
+  5dive task park <id|DIVE-N> --reason="..." [--wake=<YYYY-MM-DD[ HH:MM]|+Nd|+Nh>]
+                                                     # QUIET wait (no ping, not in the inbox); --wake auto-unparks
+                                                     # back to todo when the time passes (heartbeat sweep, DIVE-891)
+  5dive task unpark <id|DIVE-N>                      # clear a park early -> todo (unless task-deps still block it)
   5dive task inbox                                   # list ONLY human-gated tasks, priority-ordered
   5dive task answer <id|DIVE-N> --value="..."        # record the human's answer, unblock, ping the owning agent
                                                      # approval/secret gates are human-only: blocked for agent-* callers,
@@ -272,7 +279,7 @@ cmd_task_ls() {
     # DIVE-583: emit project_key natively so the dashboard keys off a real field
     # (join name/prefix/lead from `project ls`) instead of deriving project from
     # the ident prefix client-side (fragile; couples to naming + the id≠ident bug).
-    rows=$(dbfmt -json "SELECT id, ident, title, status, priority, assignee, created_by, parent_id, created_at, done_at, body, result, need_type, ask, need_options, need_answer, need_answered_at, kind, schedule, last_fired_at, parked_at, park_reason, project_key FROM tasks WHERE ${where} ${order};")
+    rows=$(dbfmt -json "SELECT id, ident, title, status, priority, assignee, created_by, parent_id, created_at, done_at, body, result, need_type, ask, need_options, need_answer, need_answered_at, need_answered_by, tier, kind, schedule, last_fired_at, parked_at, park_reason, wake_at, project_key FROM tasks WHERE ${where} ${order};")
     [[ -n "$rows" ]] || rows="[]"
     # Feed rows via stdin, not --argjson: a big board (179+ tasks w/ bodies)
     # blows past MAX_ARG_STRLEN (128K per argv string) -> execve E2BIG
@@ -304,6 +311,7 @@ cmd_task_show() {
     # blocks below so an ordinary task's `show` stays clean.
     local gate
     gate=$(db "SELECT 'type: '||need_type||
+                      CASE WHEN tier IS NOT NULL THEN '  (tier '||tier||')' ELSE '' END||
                       CASE WHEN need_options IS NOT NULL THEN '  options: '||need_options ELSE '' END||
                       CASE WHEN recommend IS NOT NULL THEN x'0a'||'recommend: '||recommend ELSE '' END||x'0a'||
                       'ask:  '||COALESCE(ask,'')||
@@ -1003,24 +1011,48 @@ cmd_task_unblock() {
 # Dashboard reads: status='blocked' AND parked_at IS NOT NULL.
 cmd_task_park() {
   tasks_db_init
-  local task="" reason=""
+  local task="" reason="" wake=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --reason=*) reason="${1#*=}" ;;
+      --wake=*)   wake="${1#*=}" ;;
       -*)         fail "$E_USAGE" "unknown flag: $1" ;;
       *)          [[ -z "$task" ]] && task="$1" || fail "$E_USAGE" "unexpected arg: $1" ;;
     esac
     shift
   done
-  [[ -n "$task" ]] || fail "$E_USAGE" "usage: 5dive task park <id|DIVE-N> --reason=<why / what unblocks it>"
+  [[ -n "$task" ]] || fail "$E_USAGE" "usage: 5dive task park <id|DIVE-N> --reason=<why / what unblocks it> [--wake=<YYYY-MM-DD[ HH:MM]|+Nd|+Nh>]"
   resolve_task_id "$task"; local tid="$RESOLVED_TASK_ID" tident="$RESOLVED_TASK_IDENT"
+  # DIVE-891: --wake gives a park a wake-up time — the heartbeat's TTL pass
+  # auto-unparks (back to todo) once it passes, so "revisit in a week" stops
+  # masquerading as a pending human gate. Accepts an absolute UTC timestamp or
+  # a +Nd/+Nh relative form. Stored as the same ISO text every other timestamp
+  # column uses, so plain string comparison against datetime('now') works.
+  local wake_sql="NULL"
+  if [[ -n "$wake" ]]; then
+    local wake_ts=""
+    case "$wake" in
+      +*d) local _n="${wake#+}"; _n="${_n%d}"
+           [[ "$_n" =~ ^[0-9]+$ ]] || fail "$E_VALIDATION" "bad --wake '$wake' (use +Nd, +Nh, or 'YYYY-MM-DD[ HH:MM]')"
+           wake_ts=$(db "SELECT datetime('now', '+${_n} days');") ;;
+      +*h) local _n="${wake#+}"; _n="${_n%h}"
+           [[ "$_n" =~ ^[0-9]+$ ]] || fail "$E_VALIDATION" "bad --wake '$wake' (use +Nd, +Nh, or 'YYYY-MM-DD[ HH:MM]')"
+           wake_ts=$(db "SELECT datetime('now', '+${_n} hours');") ;;
+      *)   wake_ts=$(db "SELECT datetime($(sqlq "$wake"));")
+           [[ -n "$wake_ts" ]] || fail "$E_VALIDATION" "bad --wake '$wake' (use +Nd, +Nh, or 'YYYY-MM-DD[ HH:MM]')" ;;
+    esac
+    wake_sql=$(sqlq "$wake_ts")
+  fi
   db "UPDATE tasks
         SET status='blocked', parked_at=datetime('now'), park_reason=$(sqlq "$reason"),
+            wake_at=${wake_sql},
             need_type=NULL, ask=NULL, need_options=NULL, recommend=NULL,
             need_answer=NULL, need_answered_at=NULL
       WHERE id=${tid} AND status NOT IN ('done','cancelled');"
-  ok "$tident parked (no action needed)${reason:+ — $reason}" \
-     '{task:($t|tonumber), task_ident:$ti, parked:true, reason:$r}' --arg t "$tid" --arg ti "$tident" --arg r "$reason"
+  local wake_note=""; [[ "$wake_sql" != "NULL" ]] && wake_note=" — wakes $(db "SELECT wake_at FROM tasks WHERE id=${tid};") UTC"
+  ok "$tident parked (no action needed)${reason:+ — $reason}${wake_note}" \
+     '{task:($t|tonumber), task_ident:$ti, parked:true, reason:$r, wake_at:(($w|select(length>0)) // null)}' \
+     --arg t "$tid" --arg ti "$tident" --arg r "$reason" --arg w "$([[ "$wake_sql" != "NULL" ]] && db "SELECT wake_at FROM tasks WHERE id=${tid};" || echo "")"
 }
 
 # Clear a park -> back to todo (unless real dependency edges still block it).
@@ -1029,7 +1061,7 @@ cmd_task_unpark() {
   local task="${1:-}"
   [[ -n "$task" ]] || fail "$E_USAGE" "usage: 5dive task unpark <id|DIVE-N>"
   resolve_task_id "$task"; local tid="$RESOLVED_TASK_ID" tident="$RESOLVED_TASK_IDENT"
-  db "UPDATE tasks SET parked_at=NULL, park_reason=NULL,
+  db "UPDATE tasks SET parked_at=NULL, park_reason=NULL, wake_at=NULL,
         status=CASE WHEN status='blocked'
                      AND NOT EXISTS (SELECT 1 FROM task_deps WHERE task_id=${tid})
                     THEN 'todo' ELSE status END
@@ -1041,9 +1073,25 @@ cmd_task_unpark() {
 # `need` parks a task on a human; `inbox` lists what's waiting; `answer`
 # records the human's reply, unblocks, and pings the agent that hit the gate.
 
+# DIVE-891 (adopted design DIVE-861): the T2 category floor. Money, public or
+# customer-facing comms, secrets, destructive/irreversible actions and
+# brand/strategy are ALWAYS a hard human gate, regardless of the tier the
+# filing agent asked for — the floor is enforced here, not trusted from the
+# filer. Matched case-insensitively over ask + title. The bias is deliberately
+# toward false positives: a wrongly-ELEVATED gate costs the human one tap; a
+# wrongly-lowered one would let a spend/publish call auto-apply. Bar-raise,
+# same posture as gate-proof (a determined agent can still word around it —
+# but only by loudly not-naming what it's asking for, which the ask text then
+# fails to justify).
+_GATE_T2_FLOOR_RX='spend|billing|invoice|charge|payment|refund|subscription|price|pricing|\$[0-9]|€[0-9]|publish|public post|announce|launch post|press|customer email|email customers|newsletter|blast|secret|credential|api key|token|password|delete|destroy|teardown|wipe|purge|drop table|irreversible|revoke|dns|domain transfer|brand'
+_gate_tier2_floor_hit() {
+  local text; text=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
+  [[ "$text" =~ $_GATE_T2_FLOOR_RX ]]
+}
+
 cmd_task_need() {
   tasks_db_init
-  local type="" ask="" options="" recommend="" from=""
+  local type="" ask="" options="" recommend="" from="" tier=""
   local -a positional=()
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -1051,6 +1099,7 @@ cmd_task_need() {
       --ask=*)       ask="${1#*=}" ;;
       --options=*)   options="${1#*=}" ;;
       --recommend=*) recommend="${1#*=}" ;;
+      --tier=*)      tier="${1#*=}" ;;
       --from=*)      from="${1#*=}" ;;
       --)          shift; positional+=("$@"); break ;;
       -*)          fail "$E_USAGE" "unknown flag: $1" ;;
@@ -1092,6 +1141,36 @@ cmd_task_need() {
   local cur; cur=$(db "SELECT status FROM tasks WHERE id=${id};")
   [[ "$cur" == "done" || "$cur" == "cancelled" ]] \
     && fail "$E_CONFLICT" "$ident is $cur — reopen it before gating on a human"
+
+  # DIVE-891: resolve the gate's risk tier (adopted DIVE-861 design).
+  #   0 = auto-clear: the recommendation applies immediately, no ping, digest line
+  #   1 = agent-clearable; 48h unanswered -> the heartbeat TTL sweep applies the rec
+  #   2 = hard human gate: never auto-applies, TTL only batches reminder pings
+  # Defaults by type when --tier is omitted: decision -> 1 (agents legitimately
+  # resolve these; the human blanket-cleared them in practice), approval/manual/
+  # secret -> 2 (today's behavior, unchanged). Explicit --tier can lower an
+  # approval/decision/manual gate, EXCEPT: a secret gate is always tier 2, and
+  # the T2 category floor below overrides everything.
+  if [[ -n "$tier" ]]; then
+    [[ "$tier" == "0" || "$tier" == "1" || "$tier" == "2" ]] \
+      || fail "$E_VALIDATION" "bad --tier '$tier' (0=auto-clear | 1=48h-TTL-applies-rec | 2=hard human gate)"
+  else
+    case "$type" in decision) tier=1 ;; *) tier=2 ;; esac
+  fi
+  local tier_floored=0
+  if [[ "$tier" != "2" ]]; then
+    if [[ "$type" == "secret" ]]; then
+      tier=2; tier_floored=1
+    else
+      local ttl_title; ttl_title=$(db "SELECT COALESCE(title,'') FROM tasks WHERE id=${id};")
+      if _gate_tier2_floor_hit "${ask} ${ttl_title}"; then
+        tier=2; tier_floored=1
+      fi
+    fi
+  fi
+  [[ "$tier" == "0" && -z "$recommend" ]] \
+    && fail "$E_USAGE" "--tier=0 auto-applies the recommendation, so --recommend is required"
+
   # assignee=actor: the agent hitting the gate becomes the owner-of-record, so
   # `task answer` knows who to ping to resume. The inbox is defined by the gate
   # (need_type set), not by assignee, so it still surfaces to the human.
@@ -1101,15 +1180,41 @@ cmd_task_need() {
             need_type=$(sqlq "$type"), ask=$(sqlq "$ask"),
             need_options=$(sqlq_or_null "$options"),
             recommend=$(sqlq_or_null "$recommend"),
+            tier=${tier}, need_asked_at=datetime('now'), gate_pinged_at=NULL,
             need_answer=NULL, need_answered_at=NULL
       WHERE id=${id};"
+
+  # DIVE-891 tier 0: apply the recommendation right now — the gate exists only
+  # as a signed-off record in the log/digest, never as a ping. Provenance is
+  # 'auto:t0' (never human:*, so a loop approval gate can NOT be advanced this
+  # way — _task_loop_advance requires human:*). No task_need_notify. The direct
+  # answer write here intentionally skips cmd_task_answer's human-only checks:
+  # tier 0 was validated above as outside every T2 category, which is exactly
+  # the delegation the adopted design grants.
+  if [[ "$tier" == "0" ]]; then
+    local _ts0; _ts0=$(date -u '+%Y-%m-%d %H:%M:%S')
+    db "UPDATE tasks SET need_answer=$(sqlq "$recommend"), need_answered_at=$(sqlq "$_ts0"),
+          need_answered_by='auto:t0' WHERE id=${id};
+        UPDATE tasks SET status='todo'
+          WHERE id=${id} AND status='blocked'
+            AND NOT EXISTS (SELECT 1 FROM task_deps WHERE task_id=${id});"
+    [[ $EUID -eq 0 ]] && audit_log "task need t0-auto" "ok" 0 -- "task=$ident" "type=$type" "applied=$recommend" || true
+    ok "$ident tier-0 gate auto-cleared — applied: $recommend" \
+       '{id:($i|tonumber), ident:$id, tier:0, auto_applied:$rc, need_type:$ty}' \
+       --arg i "$id" --arg id "$ident" --arg rc "$recommend" --arg ty "$type"
+    return
+  fi
+
   # DIVE-105: DM the paired human right now so the gate doesn't sit unseen.
   # `|| true` + the helper's own self-gating make this fully best-effort — a
   # failed DM must never fail the gate write that just committed above.
+  # DIVE-891: tier 1 gates still notify (they're answerable early); the 48h TTL
+  # is a backstop, not a silencer. Only tier 0 skips the ping.
   task_need_notify "$ident" "$type" "$ask" "$options" "$recommend" || true
-  ok "$ident needs a human ($type) — $ask" \
-     '{id:($i|tonumber), ident:$id, status:"blocked", need_type:$ty, ask:$ak, need_options:(($op|select(length>0)) // null), recommend:(($rc|select(length>0)) // null), assignee:$ac}' \
-     --arg i "$id" --arg id "$ident" --arg ty "$type" --arg ak "$ask" --arg op "$options" --arg rc "$recommend" --arg ac "$actor"
+  local floor_note=""; (( tier_floored )) && floor_note=" [tier forced to 2 — T2 category floor]"
+  ok "$ident needs a human ($type, tier $tier)${floor_note} — $ask" \
+     '{id:($i|tonumber), ident:$id, status:"blocked", need_type:$ty, tier:($tr|tonumber), tier_floored:($fl=="1"), ask:$ak, need_options:(($op|select(length>0)) // null), recommend:(($rc|select(length>0)) // null), assignee:$ac}' \
+     --arg i "$id" --arg id "$ident" --arg ty "$type" --arg tr "$tier" --arg fl "$tier_floored" --arg ak "$ask" --arg op "$options" --arg rc "$recommend" --arg ac "$actor"
 }
 
 # _task_owner_channel — resolve the filing agent's bot token + the per-type
@@ -1121,16 +1226,12 @@ cmd_task_need() {
 # sudo (resolved like task_actor; token from the group-claude-readable connector
 # file or an inherited env var). Shared by task_need_notify + _task_close_notify.
 TASK_CH_TOKEN="" TASK_CH_ACCESS="" TASK_CH_TYPE=""
-_task_owner_channel() {
+# DIVE-891: the by-NAME half of the resolution, split out so the heartbeat's
+# gate-TTL sweep (which runs as root from cron — no sudo chain, no agent-* USER)
+# can resolve a FILING AGENT's channel per gate row instead of from the caller.
+_task_agent_channel() {
   TASK_CH_TOKEN="" TASK_CH_ACCESS="" TASK_CH_TYPE=""
-  local name="" s
-  s=$(auto_sender_from_sudo)
-  if [[ -n "$s" ]]; then
-    name="$s"
-  else
-    local u="${USER:-$(id -un 2>/dev/null)}"
-    [[ "$u" == agent-* ]] && name="${u#agent-}"
-  fi
+  local name="$1"
   [[ -n "$name" ]] || return 1
   local token="" token_file="${CONNECTORS_DIR}/telegram-${name}.env"
   [[ -r "$token_file" ]] && token=$(sed -n 's/^TELEGRAM_BOT_TOKEN=//p' "$token_file" | head -1)
@@ -1145,6 +1246,18 @@ _task_owner_channel() {
     fi
   done
   return 1
+}
+
+_task_owner_channel() {
+  local name="" s
+  s=$(auto_sender_from_sudo)
+  if [[ -n "$s" ]]; then
+    name="$s"
+  else
+    local u="${USER:-$(id -un 2>/dev/null)}"
+    [[ "$u" == agent-* ]] && name="${u#agent-}"
+  fi
+  _task_agent_channel "$name"
 }
 
 # _task_send_owner — send ONE message ($1, optional reply_markup $2) to the

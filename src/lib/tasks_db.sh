@@ -181,7 +181,22 @@ CREATE TABLE IF NOT EXISTS tasks (
   -- survives re-routes (COALESCE keeps the first writer). Both NULL until a task
   -- enters a loop (verifier set + maker hands off).
   iteration           INTEGER,
-  maker_agent         TEXT
+  maker_agent         TEXT,
+  -- DIVE-891: risk-tiered gates (adopted design DIVE-861). tier is set when the
+  -- gate is filed: 0 = auto-clear (rec applies immediately, digest line only),
+  -- 1 = agent-clearable + 48h TTL auto-applies the recommendation, 2 = hard
+  -- human gate (never auto-applies; TTL only batches reminder pings). The T2
+  -- category floor (spend/publish/secret/destructive/brand) is enforced in
+  -- cmd_task_need, not trusted from the filer. NULL = legacy gate, treated as
+  -- tier 2 (never auto-cleared). need_asked_at stamps gate filing time — the
+  -- TTL clock (updated_at is useless for this: any row touch bumps it).
+  -- gate_pinged_at = last time a TTL reminder batch included this gate, so the
+  -- sweep re-pings weekly instead of every tick. wake_at: a parked task
+  -- (task park --wake=...) auto-unparks when the heartbeat passes this time.
+  tier                INTEGER,
+  need_asked_at       TEXT,
+  gate_pinged_at      TEXT,
+  wake_at             TEXT
 );
 
 CREATE TABLE IF NOT EXISTS task_deps (
@@ -345,7 +360,8 @@ _tasks_db_migrate() {
            'escalated_at TEXT' 'escalated_by TEXT' \
            "project_key TEXT NOT NULL DEFAULT 'dive'" 'issue_number INTEGER' \
            'acceptance_criteria TEXT' 'verify_command TEXT' 'max_iterations INTEGER' 'verifier TEXT' \
-           'iteration INTEGER' 'maker_agent TEXT' 'task_budget TEXT'; do
+           'iteration INTEGER' 'maker_agent TEXT' 'task_budget TEXT' \
+           'tier INTEGER' 'need_asked_at TEXT' 'gate_pinged_at TEXT' 'wake_at TEXT'; do
     if ! printf '%s\n' "$cols" | grep -qx "${c%% *}"; then
       sqlite3 -cmd ".timeout 5000" "$TASKS_DB" \
         "ALTER TABLE tasks ADD COLUMN ${c};" >/dev/null 2>&1 || true

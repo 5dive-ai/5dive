@@ -204,6 +204,21 @@ done_l = [line(t) for t in done]
 ip_l = [line(t) for t in in_progress]
 blk_l = [line(t) for t in blocked]
 
+# DIVE-891: gates the tier system cleared without a ping (tier-0 immediate or
+# tier-1 48h TTL — need_answered_by 'auto:t0' / 'auto:ttl') inside the window.
+# The digest line is the human's ONLY surface for these, so it names what was
+# applied — silence would read as "nothing was decided".
+auto_cleared = []
+for t in work:
+    by = t.get("need_answered_by") or ""
+    if by.startswith("auto:"):
+        ae = to_epoch(t.get("need_answered_at"))
+        if ae is not None and ae >= since:
+            auto_cleared.append(t)
+auto_l = [{"ident": t.get("ident"), "applied": (t.get("need_answer") or "").strip(),
+           "by": t.get("need_answered_by"), "assignee": t.get("assignee") or "unassigned"}
+          for t in auto_cleared]
+
 # Usage: top agents by output tokens + their share-of-limit; flag anyone hot.
 agents = usage_data.get("agents", []) or []
 agents_sorted = sorted(agents, key=lambda a: a.get("output", 0), reverse=True)
@@ -229,7 +244,7 @@ window_label = "7 days" if window >= 604800 else "24h"
 if as_json:
     print(json.dumps({
         "window": {"since": since, "now": now, "label": window_label},
-        "done": done_l, "inProgress": ip_l, "blocked": blk_l,
+        "done": done_l, "inProgress": ip_l, "blocked": blk_l, "autoCleared": auto_l,
         "usage": usage_l, "health": {"stale": stale, "hot": [h["name"] for h in hot]},
     }, indent=2))
 else:
@@ -259,6 +274,13 @@ else:
         out.append(f"  • {t['ident']} {ask} — {t['assignee']}")
     if not blk_l:
         out.append("  (nothing blocked)")
+    if auto_l:
+        out.append("")
+        out.append(f"\U0001F916 Auto-cleared gates ({len(auto_l)})")
+        for t in auto_l[:8]:
+            out.append(f"  • {t['ident']} applied: {short(t['applied'], 60)} ({t['by']})")
+        if len(auto_l) > 8:
+            out.append(f"  … +{len(auto_l) - 8} more")
     out.append("")
     if hot:
         out.append("⚠️ Rate-limit watch: " +

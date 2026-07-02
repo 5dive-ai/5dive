@@ -532,6 +532,101 @@ _hb_materialize_recurring() {
   return 0
 }
 
+# DIVE-891 (adopted design DIVE-861): the gate TTL + wake sweep. Three passes,
+# all cheap sqlite scans, run once per tick in root context:
+#   (1) WAKE — a parked task whose wake_at passed unparks back to todo, so the
+#       wake loop below can hand it to its agent THIS tick.
+#   (2) T1 TTL — a tier-1 gate unanswered for 48h gets its recommendation
+#       applied. Provenance is 'auto:ttl' + uid 0 and the closure IS signed
+#       (root context) so gate-proof verify explains it rather than flagging a
+#       raw-sqlite forgery. Deliberately NEVER: secret gates (nothing to
+#       apply), loop gate steps (a relay must not advance on a timeout — and
+#       _task_loop_advance requires human:* anyway), rows without a
+#       recommendation, or rows without a real need_asked_at stamp (legacy
+#       gates predate the column; never auto-apply on a fuzzy clock — they're
+#       tier NULL = treated as tier 2 regardless).
+#   (3) T2 REMINDER — tier-2 (or legacy NULL-tier, or rec-less tier-1) gates
+#       stale for 72h batch into ONE message per filing agent's channel,
+#       manual asks grouped as a "15 minutes" block. gate_pinged_at throttles
+#       the batch to weekly. Never auto-applies, never expires.
+# Isolated by the caller (|| log) — a sweep failure must never abort the wake
+# loop (the heartbeat-never-woke bug class).
+_hb_gate_ttl_sweep() {
+  local tid
+  # (1) wake parked
+  while IFS= read -r tid; do
+    [[ -n "$tid" ]] || continue
+    db "UPDATE tasks SET parked_at=NULL, park_reason=NULL, wake_at=NULL,
+          status=CASE WHEN status='blocked'
+                       AND NOT EXISTS (SELECT 1 FROM task_deps WHERE task_id=${tid})
+                      THEN 'todo' ELSE status END
+        WHERE id=${tid};"
+    _hb_log "[gate-ttl] $(_hb_ident "$tid") wake_at passed -> unparked"
+  done < <(db "SELECT id FROM tasks
+               WHERE parked_at IS NOT NULL AND wake_at IS NOT NULL
+                 AND wake_at <= datetime('now') AND status NOT IN ('done','cancelled');")
+
+  # (2) T1 48h TTL -> apply the recommendation
+  local grow gid gtype grec gowner gident
+  while IFS= read -r grow; do
+    [[ -n "$grow" ]] || continue
+    IFS=$'\x1f' read -r gid gtype grec gowner <<<"$grow"
+    [[ -n "$gid" && -n "$grec" ]] || continue
+    gident=$(_hb_ident "$gid")
+    local _ts; _ts=$(date -u '+%Y-%m-%d %H:%M:%S')
+    _gate_proof_ensure_key 2>/dev/null || true
+    local _sig; _sig=$(_gate_closure_sign "$gid" "$gtype" "$grec" "auto:ttl" "$_ts" "0" 2>/dev/null || echo "")
+    db "UPDATE tasks SET need_answer=$(sqlq "$grec"), need_answered_at=$(sqlq "$_ts"),
+          need_answered_by='auto:ttl', need_answered_uid=0, need_answer_sig=$(sqlq "$_sig")
+        WHERE id=${gid};
+        UPDATE tasks SET status='todo'
+          WHERE id=${gid} AND status='blocked'
+            AND NOT EXISTS (SELECT 1 FROM task_deps WHERE task_id=${gid});"
+    audit_log "gate ttl-auto" "ok" 0 -- "task=$gident" "type=$gtype" "applied=$grec" || true
+    [[ -n "$gowner" ]] && ( cmd_send "$gowner" --message="⏱ ${gident} tier-1 gate hit its 48h TTL — recommendation applied: ${grec}. Resume the task; run \`5dive task show ${gident}\`." ) >/dev/null 2>&1 || true
+    _hb_log "[gate-ttl] ${gident} T1 48h TTL -> applied rec"
+  done < <(db "SELECT id||x'1f'||need_type||x'1f'||COALESCE(recommend,'')||x'1f'||COALESCE(assignee,'')
+               FROM tasks
+               WHERE need_type IS NOT NULL AND need_answered_at IS NULL
+                 AND tier=1 AND recommend IS NOT NULL AND need_type != 'secret'
+                 AND need_asked_at IS NOT NULL AND need_asked_at <= datetime('now','-48 hours')
+                 AND (body IS NULL OR body NOT LIKE '%${_LOOP_MARK}:%')
+                 AND status NOT IN ('done','cancelled');")
+
+  # (3) T2 stale-gate reminder batches, one message per filing agent's channel.
+  # Age clock: COALESCE(need_asked_at, updated_at) — legacy gates predate
+  # need_asked_at; updated_at is a fine fuzzy clock when the worst case is a
+  # reminder. The stale filter (need_answered_at IS NULL etc.) matches the
+  # canonical inbox definition.
+  local _t2_where="need_type IS NOT NULL AND need_answered_at IS NULL
+                 AND (tier IS NULL OR tier=2 OR (tier=1 AND recommend IS NULL))
+                 AND COALESCE(need_asked_at, updated_at) <= datetime('now','-72 hours')
+                 AND (gate_pinged_at IS NULL OR gate_pinged_at <= datetime('now','-7 days'))
+                 AND status NOT IN ('done','cancelled')"
+  local aname
+  while IFS= read -r aname; do
+    [[ -n "$aname" ]] || continue
+    _task_agent_channel "$aname" || continue
+    local lines_main lines_manual
+    lines_main=$(db "SELECT '• /task_'||id||' ['||ident||'] '||need_type||', '||CAST(julianday('now')-julianday(COALESCE(need_asked_at,updated_at)) AS INT)||'d — '||substr(replace(COALESCE(ask,''), x'0a', ' '),1,90)
+                     FROM tasks WHERE ${_t2_where} AND assignee=$(sqlq "$aname") AND need_type != 'manual'
+                     ORDER BY COALESCE(need_asked_at,updated_at);")
+    lines_manual=$(db "SELECT '• /task_'||id||' ['||ident||'] '||CAST(julianday('now')-julianday(COALESCE(need_asked_at,updated_at)) AS INT)||'d — '||substr(replace(COALESCE(ask,''), x'0a', ' '),1,90)
+                       FROM tasks WHERE ${_t2_where} AND assignee=$(sqlq "$aname") AND need_type = 'manual'
+                       ORDER BY COALESCE(need_asked_at,updated_at);")
+    [[ -n "$lines_main" || -n "$lines_manual" ]] || continue
+    local text="⏳ Gate backlog — these have been waiting on you 3+ days:"
+    [[ -n "$lines_main" ]] && text+=$'\n'"$lines_main"
+    [[ -n "$lines_manual" ]] && text+=$'\n\n'"🛠 Manual steps — one ~15-min batch clears these:"$'\n'"$lines_manual"
+    text+=$'\n\n'"Answer from the original alert's buttons, the dashboard, or tap a /task link. Re-pings weekly until answered."
+    _task_send_owner "$text" "" || true
+    db "UPDATE tasks SET gate_pinged_at=datetime('now')
+        WHERE ${_t2_where} AND assignee=$(sqlq "$aname");"
+    _hb_log "[gate-ttl] stale-gate reminder batch sent for $aname"
+  done < <(db "SELECT DISTINCT COALESCE(assignee,'') FROM tasks WHERE ${_t2_where};")
+  return 0
+}
+
 cmd_heartbeat_tick() {
   require_root "heartbeat tick"
   tasks_db_init
@@ -541,6 +636,10 @@ cmd_heartbeat_tick() {
   # is eligible for the wake loop below this same tick. Isolated — a failure here
   # must never abort the wake loop.
   _hb_materialize_recurring "$now" || _hb_log "[materializer] pass errored (non-fatal)"
+  # DIVE-891: gate TTL + wake sweep, same isolation contract as the materializer
+  # — runs before the wake loop so a just-unparked/just-unblocked todo is
+  # eligible for pickup this same tick.
+  _hb_gate_ttl_sweep || _hb_log "[gate-ttl] pass errored (non-fatal)"
   # Accounts already woken during THIS tick. The $reg snapshot is read once up
   # front, so a wake we do mid-loop isn't visible to later iterations via the
   # registry — this map carries that within-tick fact so two same-account agents

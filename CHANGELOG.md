@@ -11,6 +11,22 @@ release.
 
 ### Added
 
+- DIVE-891: risk-tiered human gates + TTL (adopted design DIVE-861). `task
+  need` takes `--tier=0|1|2`: tier 0 auto-applies the recommendation
+  immediately (no ping — the daily digest's new "Auto-cleared gates" section
+  is the record); tier 1 pings normally but a new heartbeat sweep applies the
+  recommendation after 48h unanswered (provenance `auto:ttl`, closure signed,
+  owning agent pinged); tier 2 (the default for approval/secret/manual) never
+  auto-applies — stale tier-2 gates instead batch into ONE reminder per
+  paired chat after 72h, re-pinged weekly, with manual asks grouped as a
+  single "15 minutes" block. Money, public-comms, secret, destructive and
+  brand asks are floored to tier 2 in the CLI regardless of the flag; secret
+  gates are always tier 2. Loop gate steps and legacy (pre-tier) gates are
+  never auto-applied. `task park` gains `--wake=<ts|+Nd|+Nh>` — the same
+  sweep auto-unparks the task back to todo when the time passes, so
+  "revisit later" stops sitting in the human inbox. New additive tasks.db
+  columns: `tier`, `need_asked_at`, `gate_pinged_at`, `wake_at`.
+
 - DIVE-880: bot tokens can now be passed on stdin instead of argv, so they
   never land in `/proc/<pid>/cmdline`, shelld's audit log, or server access
   logs. `agent telegram-getme --token=-` and `agent telegram-discover
