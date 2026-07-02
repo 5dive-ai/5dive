@@ -23,38 +23,76 @@
 
 _memory_usage() {
   cat >&2 <<'EOF'
-5dive memory — queryable team memory (read-path)
+5dive memory — queryable team memory
 
   5dive memory search "<query>" [--limit=N] [--max-tokens=T] [--roots=a,b]
+                                [--store=all|mine|wiki] [--agent=<name>]
       Rank markdown memory snippets by relevance (BM25), newest-fleet-history
       first, capped at a token ceiling, with file+heading provenance.
+      --store  all (default): own stores + shared wiki · mine: own stores only
+               · wiki: shared wiki only
+      --agent  search ANOTHER agent's store (per-user 0600 — root only; the
+               shared path for cross-agent knowledge is the wiki)
+
+  5dive memory add --name=<kebab-slug> --description="<one-liner>"
+                   [--type=user|feedback|project|reference] [--store=mine|wiki]
+                   [--tags=a,b] [--force]   (body on stdin)
+      Compile a durable memory: writes a frontmatter markdown file into your
+      own store (default) or the shared team wiki (--store=wiki, the publish
+      path other agents can search), stamps provenance (who/when), appends the
+      store's index line, and refuses token/key-shaped content (tripwire;
+      --force does NOT bypass it). Existing file needs --force to overwrite.
 
 Searches the agent's own ~/.claude/projects/*/memory stores (+ the shared wiki
-when present) unless --roots overrides.
+when present) unless --roots/--store/--agent narrow it.
 EOF
 }
 
-# Compute the default search roots: the calling user's memory dirs + the shared
-# wiki if it exists on this box. Emits a comma-separated list (may be empty).
-_memory_default_roots() {
-  local roots=() d
-  for d in "$HOME"/.claude/projects/*/memory; do
-    [ -d "$d" ] && roots+=("$d")
-  done
-  # Shared wiki (internal fleet only; absent on customer boxes — harmless).
-  for d in "$HOME"/projects/5dive/community/wiki /home/claude/projects/5dive/community/wiki; do
-    [ -d "$d" ] && { roots+=("$d"); break; }
+# Root helpers (DIVE-897): own stores, another agent's stores, the shared wiki.
+# Each emits a comma-separated list (may be empty).
+_memory_own_roots() {
+  # $1 (optional) = an agent short name — that agent's home instead of ours.
+  # Per-user memory dirs are 0600, so another agent's store only resolves for
+  # root; a non-root caller gets an empty list (the caller errors clearly).
+  local base="$HOME" roots=() d
+  if [ -n "${1:-}" ]; then
+    base="/home/agent-$1"
+    [ -d "$base" ] || base="/home/$1"   # the main `claude` user has no agent- prefix
+  fi
+  for d in "$base"/.claude/projects/*/memory; do
+    [ -d "$d" ] && [ -r "$d" ] && roots+=("$d")
   done
   local IFS=,; echo "${roots[*]}"
 }
 
+_memory_wiki_root() {
+  # Shared wiki (internal fleet only; absent on customer boxes — harmless).
+  local d
+  for d in "$HOME"/projects/5dive/community/wiki /home/claude/projects/5dive/community/wiki; do
+    [ -d "$d" ] && { echo "$d"; return 0; }
+  done
+  echo ""
+}
+
+# Default search roots: own stores + wiki (the pre-scoping behavior).
+_memory_default_roots() {
+  local own wiki
+  own=$(_memory_own_roots)
+  wiki=$(_memory_wiki_root)
+  if [ -n "$own" ] && [ -n "$wiki" ]; then echo "$own,$wiki"
+  else echo "${own}${wiki}"
+  fi
+}
+
 _memory_search() {
-  local query="" limit=8 maxtok=1500 roots=""
+  local query="" limit=8 maxtok=1500 roots="" store="all" agent=""
   while [ $# -gt 0 ]; do
     case "$1" in
       --limit=*)      limit="${1#*=}" ;;
       --max-tokens=*) maxtok="${1#*=}" ;;
       --roots=*)      roots="${1#*=}" ;;
+      --store=*)      store="${1#*=}" ;;
+      --agent=*)      agent="${1#*=}" ;;
       -h|--help)      _memory_usage; return 0 ;;
       --*)            fail "$E_USAGE" "memory search: unknown flag: $1" ;;
       *)              [ -z "$query" ] && query="$1" || query="$query $1" ;;
@@ -63,7 +101,29 @@ _memory_search() {
   done
   [ -n "$query" ] || { _memory_usage; fail "$E_USAGE" "memory search: a query is required"; }
   command -v node >/dev/null 2>&1 || fail "$E_GENERIC" "memory search needs node on PATH"
-  [ -n "$roots" ] || roots="$(_memory_default_roots)"
+  case "$store" in all|mine|wiki) : ;; *) fail "$E_VALIDATION" "bad --store '$store' (all | mine | wiki)" ;; esac
+  if [ -n "$roots" ] && { [ "$store" != "all" ] || [ -n "$agent" ]; }; then
+    fail "$E_USAGE" "--roots overrides scoping — don't combine it with --store/--agent"
+  fi
+  # Scoping (DIVE-897): resolve roots from --store/--agent unless --roots wins.
+  # --agent reads another agent's per-user store — 0600, so root only; the
+  # sanctioned cross-agent path is the shared wiki (agents PUBLISH there via
+  # `memory add --store=wiki`; private stores stay private, deny-by-default per
+  # the DIVE-481 distillation-gate posture).
+  if [ -z "$roots" ]; then
+    local own="" wiki=""
+    if [ -n "$agent" ]; then
+      [ "$store" = "wiki" ] && fail "$E_USAGE" "--agent scopes a private store; it can't combine with --store=wiki"
+      own=$(_memory_own_roots "$agent")
+      [ -n "$own" ] || fail "$E_PERMISSION" "can't read agent '$agent''s memory store (per-user 0600 — run as root, or search the shared wiki instead)"
+      [ "$store" = "all" ] && wiki=$(_memory_wiki_root)
+    else
+      [ "$store" != "wiki" ] && own=$(_memory_own_roots)
+      [ "$store" != "mine" ] && wiki=$(_memory_wiki_root)
+      [ "$store" = "wiki" ] && [ -z "$wiki" ] && fail "$E_NOT_FOUND" "no shared wiki on this box (community/wiki)"
+    fi
+    if [ -n "$own" ] && [ -n "$wiki" ]; then roots="$own,$wiki"; else roots="${own}${wiki}"; fi
+  fi
   [ -n "$roots" ] || fail "$E_NOT_FOUND" "no memory stores found (looked in ~/.claude/projects/*/memory); pass --roots="
 
   local js; js="$(mktemp -t 5dive-memsearch.XXXXXX.mjs)" || fail "$E_GENERIC" "mktemp failed"
@@ -146,11 +206,117 @@ MEMJS
   node "$js" "$query" --limit="$limit" --max-tokens="$maxtok" --roots="$roots"
 }
 
+# memory add — the write/compile path (DIVE-897, DIVE-726 Phase 1b).
+# Deterministic half of "compile before you close": the AGENT authors the body
+# (that's LLM work, guided by the compile-knowledge skill); this command gives
+# it one mechanical, provenance-stamped, tripwired way to persist it. Writing
+# to --store=wiki is the PUBLISH path that makes a fact fleet-searchable —
+# cross-agent recall happens by publishing here, never by opening the 0600
+# per-agent stores (deny-by-default, same posture as the DIVE-481 gate).
+_memory_add() {
+  local name="" type="" desc="" store="mine" tags="" force=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --name=*)        name="${1#*=}" ;;
+      --type=*)        type="${1#*=}" ;;
+      --description=*) desc="${1#*=}" ;;
+      --store=*)       store="${1#*=}" ;;
+      --tags=*)        tags="${1#*=}" ;;
+      --force)         force=1 ;;
+      -h|--help)       _memory_usage; return 0 ;;
+      *)               fail "$E_USAGE" "memory add: unknown arg: $1" ;;
+    esac
+    shift
+  done
+  [ -n "$name" ] || fail "$E_USAGE" "memory add: --name=<kebab-slug> is required"
+  printf '%s' "$name" | grep -qE '^[a-z0-9][a-z0-9-]{0,63}$' \
+    || fail "$E_VALIDATION" "--name must be kebab-case, ≤ 64 chars"
+  [ -n "$desc" ] || fail "$E_USAGE" "memory add: --description is required (it's what recall ranks on)"
+  case "$store" in mine|wiki) : ;; *) fail "$E_VALIDATION" "bad --store '$store' (mine | wiki)" ;; esac
+  if [ "$store" = "mine" ]; then
+    [ -n "$type" ] || fail "$E_USAGE" "--type=user|feedback|project|reference is required for your own store"
+    case "$type" in user|feedback|project|reference) : ;; *) fail "$E_VALIDATION" "bad --type '$type' (user | feedback | project | reference)" ;; esac
+  fi
+  [ -t 0 ] && fail "$E_USAGE" "memory add reads the body on stdin — pipe or heredoc it"
+  local body; body=$(cat)
+  [ -n "$(printf '%s' "$body" | tr -d '[:space:]')" ] || fail "$E_USAGE" "empty body on stdin — nothing to remember"
+
+  # Secret tripwire (L3 posture, shared shape with cmd_pack's): refuse content
+  # that looks like a live token/key. High-signal patterns only — memory notes
+  # legitimately MENTION paths like .credentials.json, so the bare word is not
+  # blocked (unlike the pack exporter, which stages whole files). --force does
+  # not bypass this: a secret in a memory store outlives the session that knew
+  # why it was there.
+  if printf '%s\n%s' "$desc" "$body" | grep -qiE 'BOT_TOKEN=|API_KEY=|-----BEGIN|sk-[A-Za-z0-9]{8,}|[0-9]{8,}:[A-Za-z0-9_-]{30,}'; then
+    fail "$E_VALIDATION" "the body looks like it contains a token/key (tripwire) — memories must reference where a secret LIVES, never its value"
+  fi
+
+  # Provenance: the pre-sudo invoker (agent short name or human login) + UTC date.
+  local who="${SUDO_USER:-$(whoami)}"; who="${who#agent-}"
+  local today; today=$(date -u +%F)
+
+  local dir="" file="" index_file="" index_line=""
+  if [ "$store" = "wiki" ]; then
+    dir=$(_memory_wiki_root)
+    [ -n "$dir" ] || fail "$E_NOT_FOUND" "no shared wiki on this box (community/wiki) — use --store=mine"
+    [ -w "$dir" ] || fail "$E_PERMISSION" "wiki dir $dir is not writable by $(whoami)"
+    file="$dir/$name.md"
+    index_file="$dir/index.md"
+    index_line="- [$name]($name.md) — $desc"
+  else
+    # Own store: prefer the dir that already has a MEMORY.md index, else the
+    # first existing memory dir. No store yet = nothing bootstrapped this agent's
+    # memory — that's the harness's job, don't invent a location.
+    local d
+    for d in "$HOME"/.claude/projects/*/memory; do
+      [ -d "$d" ] || continue
+      [ -z "$dir" ] && dir="$d"
+      [ -f "$d/MEMORY.md" ] && { dir="$d"; break; }
+    done
+    [ -n "$dir" ] || fail "$E_NOT_FOUND" "no memory store found under ~/.claude/projects/*/memory"
+    file="$dir/${type}_$(printf '%s' "$name" | tr '-' '_').md"
+    index_file="$dir/MEMORY.md"
+    index_line="- [$name]($(basename "$file")) — $desc"
+  fi
+  if [ -f "$file" ] && [ "$force" -ne 1 ]; then
+    fail "$E_CONFLICT" "$(basename "$file") already exists — update it with --force, or pick a new --name"
+  fi
+  local existed=0; [ -f "$file" ] && existed=1
+
+  if [ "$store" = "wiki" ]; then
+    { printf -- '---\ntitle: %s\n' "$name"
+      [ -n "$tags" ] && printf 'tags: [%s]\n' "$tags"
+      printf 'updated: %s\ncompiled_by: %s\n---\n\n%s\n' "$today" "$who" "$body"
+    } > "$file"
+  else
+    { printf -- '---\nname: %s\ndescription: "%s"\nmetadata:\n  type: %s\n  compiled_by: %s\n  compiled_at: %s\n' \
+        "$name" "$(printf '%s' "$desc" | sed 's/"/\\"/g')" "$type" "$who" "$today"
+      [ -n "$tags" ] && printf '  tags: [%s]\n' "$tags"
+      printf -- '---\n\n%s\n' "$body"
+    } > "$file"
+  fi
+  # Index line (skip when updating in place, or when the index doesn't exist —
+  # never invent a MEMORY.md/index.md the store's owner didn't set up).
+  if [ "$existed" -eq 0 ] && [ -f "$index_file" ] && ! grep -qF "]($(basename "$file"))" "$index_file"; then
+    printf '%s\n' "$index_line" >> "$index_file"
+  fi
+
+  if (( JSON_MODE )); then
+    jq -nc --arg file "$file" --arg store "$store" --arg by "$who" --arg updated "$([ "$existed" -eq 1 ] && echo true || echo false)" \
+      '{ok:true, data:{file:$file, store:$store, compiled_by:$by, updated:($updated=="true")}}'
+  else
+    echo "✓ compiled → $file${existed:+}"
+    [ "$store" = "wiki" ] && echo "  published to the shared wiki — fleet-searchable via: 5dive memory search --store=wiki"
+  fi
+  return 0
+}
+
 # cmd_memory — dispatch for the `memory` subcommand tree.
 cmd_memory() {
   local sub="${1:-}"; shift 2>/dev/null || true
   case "$sub" in
     search)      _memory_search "$@" ;;
+    add|compile) _memory_add "$@" ;;
     ""|-h|--help) _memory_usage ;;
     *)           _memory_usage; fail "$E_USAGE" "memory: unknown subcommand: $sub" ;;
   esac

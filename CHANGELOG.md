@@ -9,6 +9,21 @@ release.
 
 ## [Unreleased]
 
+### Added
+
+- DIVE-897 (DIVE-726 Phase 1b): the memory write/compile path + search scoping.
+  `5dive memory add --name --description [--type] [--store=mine|wiki] [--tags]
+  [--force]` (body on stdin) writes a frontmatter-stamped memory file with
+  provenance (compiled_by/compiled_at), appends the store's index line, and
+  refuses token/key-shaped content (tripwire; --force never bypasses it).
+  `memory search` gains `--store=all|mine|wiki` + `--agent=<name>` scoping.
+  Cross-agent read DECISION: per-agent stores stay per-user 0600 —
+  fleet-searchable knowledge is PUBLISHED to the shared wiki via
+  `memory add --store=wiki` (deny-by-default, the DIVE-481 distillation-gate
+  posture); `--agent` therefore resolves for root only. Cached inverted index
+  deferred until stores outgrow a few thousand chunks; embeddings stay Phase 1c.
+  Version 0.6.2 -> 0.6.3.
+
 ### Fixed
 
 - DIVE-894: gate alerts no longer dead-end on a box with no dashboard. The
