@@ -1417,6 +1417,15 @@ cmd_config() {
       telegram.token)
         [[ "${TYPE_CHANNELS[$type]}" == "1" ]] \
           || fail "$E_VALIDATION" "type '$type' does not support telegram channels"
+        # `telegram.token=-` reads the token from stdin so the secret never
+        # enters argv (/proc/<pid>/cmdline, shelld's audit log, server access
+        # logs). Same sentinel as `cos set --token=-`; the dashboard's exec
+        # tunnel sends the token via its stdin field. DIVE-880.
+        if [[ "$v" == "-" ]]; then
+          [[ -t 0 ]] && fail "$E_USAGE" "telegram.token=- expects the bot token on stdin"
+          v=$(cat)
+          v="${v//[$'\r\n\t ']/}"
+        fi
         valid_telegram_token "$v" \
           || fail "$E_VALIDATION" "telegram token format looks wrong (expected <digits>:<20+ chars>)"
         new_telegram_token="$v"
@@ -1425,6 +1434,12 @@ cmd_config() {
       discord.token)
         [[ "${TYPE_CHANNELS[$type]}" == "1" ]] \
           || fail "$E_VALIDATION" "type '$type' does not support discord channels"
+        # discord.token=- — same stdin sentinel as telegram.token above.
+        if [[ "$v" == "-" ]]; then
+          [[ -t 0 ]] && fail "$E_USAGE" "discord.token=- expects the bot token on stdin"
+          v=$(cat)
+          v="${v//[$'\r\n\t ']/}"
+        fi
         [[ -n "$v" ]] || fail "$E_VALIDATION" "discord.token cannot be empty"
         new_discord_token="$v"
         applied_keys+=("discord.token")
@@ -1773,7 +1788,16 @@ cmd_telegram_discover() {
     [[ -n "$token" ]] \
       || fail "$E_NOT_FOUND" "no TELEGRAM_BOT_TOKEN in $env_file"
   fi
-  [[ -n "$token" ]] || fail "$E_USAGE" "usage: 5dive agent telegram-discover {--token=<bot-token>|--agent=<name>} [--poll-secs=N]"
+  # `--token=-` reads the token from stdin so the secret never enters argv
+  # (and thus never lands in /proc/<pid>/cmdline, shelld's audit log, or
+  # server access logs). Same sentinel as `cos set --token=-` and
+  # `auth set --api-key=-`; the dashboard's exec tunnel uses this form. DIVE-880.
+  if [[ "$token" == "-" ]]; then
+    [[ -t 0 ]] && fail "$E_USAGE" "--token=- expects the bot token on stdin"
+    token=$(cat)
+    token="${token//[$'\r\n\t ']/}"
+  fi
+  [[ -n "$token" ]] || fail "$E_USAGE" "usage: 5dive agent telegram-discover {--token=<bot-token>|--token=-|--agent=<name>} [--poll-secs=N]  (--token=- reads the token from stdin)"
   valid_telegram_token "$token" \
     || fail "$E_VALIDATION" "telegram token format looks wrong (expected <digits>:<20+ chars>)"
   [[ "$poll_secs" =~ ^[0-9]+$ ]] && (( poll_secs >= 1 && poll_secs <= 90 )) \
@@ -1862,7 +1886,14 @@ cmd_telegram_getme() {
     esac
     shift
   done
-  [[ -n "$token" ]] || fail "$E_USAGE" "usage: 5dive agent telegram-getme --token=<bot-token>"
+  # `--token=-` reads the token from stdin — same argv-hygiene sentinel as
+  # telegram-discover / `cos set --token=-`. DIVE-880.
+  if [[ "$token" == "-" ]]; then
+    [[ -t 0 ]] && fail "$E_USAGE" "--token=- expects the bot token on stdin"
+    token=$(cat)
+    token="${token//[$'\r\n\t ']/}"
+  fi
+  [[ -n "$token" ]] || fail "$E_USAGE" "usage: 5dive agent telegram-getme --token=<bot-token>  (or --token=- to read from stdin)"
   valid_telegram_token "$token" \
     || fail "$E_VALIDATION" "telegram token format looks wrong (expected <digits>:<20+ chars>)"
 

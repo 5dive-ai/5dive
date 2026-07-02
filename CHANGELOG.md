@@ -11,6 +11,16 @@ release.
 
 ### Added
 
+- DIVE-880: bot tokens can now be passed on stdin instead of argv, so they
+  never land in `/proc/<pid>/cmdline`, shelld's audit log, or server access
+  logs. `agent telegram-getme --token=-` and `agent telegram-discover
+  --token=-` read the token from stdin, and `agent config <name> set
+  telegram.token=-` / `discord.token=-` do the same — the sentinel `-` form
+  `cos set --token=-` and `auth set --api-key=-` already used. The dashboard's
+  AddChannelPanel and connect wizard switch to this form via the exec tunnel's
+  `stdin` field. Only one `=-` key can be read per invocation (stdin is
+  consumed once).
+
 - DIVE-860: `task loop ls` surfaces the latest grade scorecard per builder
   loop run. JSON rows gain `scorecard_json` (raw card string, `''` when
   ungraded — same contract as the `task loops` runs board), joined from
