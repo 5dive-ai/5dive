@@ -3966,6 +3966,11 @@ cmd_start() {
   [[ -n "$name" ]] || fail "$E_USAGE" "usage: 5dive agent start <name>"
   require_agent "$name"
   systemctl start "5dive-agent@${name}.service" >&2
+  # DIVE-857 prereq (b): record the operator's intent so the supervisor can
+  # tell a crashed unit from a deliberate stop without inference.
+  local reg; reg=$(registry_read)
+  reg=$(jq --arg n "$name" '.agents[$n].desiredState = "running"' <<<"$reg") \
+    && echo "$reg" | registry_write
   ok "agent '$name' started." \
      '{name:$n, action:"start"}' --arg n "$name"
 }
@@ -3975,6 +3980,9 @@ cmd_stop() {
   [[ -n "$name" ]] || fail "$E_USAGE" "usage: 5dive agent stop <name>"
   require_agent "$name"
   systemctl stop "5dive-agent@${name}.service" >&2
+  local reg; reg=$(registry_read)
+  reg=$(jq --arg n "$name" '.agents[$n].desiredState = "stopped"' <<<"$reg") \
+    && echo "$reg" | registry_write
   ok "agent '$name' stopped." \
      '{name:$n, action:"stop"}' --arg n "$name"
 }
