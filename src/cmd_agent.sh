@@ -396,8 +396,11 @@ write_agent_env() {
     # hooks, richer slash commands). 5dive-agent-start reads this var to
     # build the runtime --channels arg, defaulting to claude-plugins-official
     # when unset — so existing agents created before this change keep
-    # routing to the upstream plugin until manually migrated.
-    [[ "$channels" == "telegram" ]] && printf 'AGENT_CHANNEL_MARKETPLACE=5dive-plugins\n'
+    # routing to the upstream plugin until manually migrated. Membership
+    # check, not equality: "telegram,dashboard" must still get the var or
+    # the telegram plugin resolves against the wrong marketplace and the
+    # session boots with no telegram tool (DIVE-856).
+    channel_in_list telegram "$channels" && printf 'AGENT_CHANNEL_MARKETPLACE=5dive-plugins\n'
   } > "$env_file"
   chown root:claude "$env_file"
   chmod 640 "$env_file"
@@ -607,7 +610,7 @@ _apply_byo_openclaw() {
 }
 
 cmd_create() {
-  local name="" type="" channels="none" telegram_token="" discord_token="" workdir="" profile=""
+  local name="" type="" channels="none" channels_explicit=0 telegram_token="" discord_token="" workdir="" profile=""
   local telegram_home_channel="" telegram_allowed_users="" telegram_cos="" telegram_cos_avatar=""
   local cos_owner_id=""
   local byo_provider="" byo_api_key=""
@@ -619,7 +622,7 @@ cmd_create() {
       --type=*)                    type="${1#--type=}" ;;
       --yolo)                      autonomy="yolo" ;;
       --autonomy=*)                autonomy="${1#--autonomy=}" ;;
-      --channels=*)                channels="${1#--channels=}" ;;
+      --channels=*)                channels="${1#--channels=}"; channels_explicit=1 ;;
       --telegram-token=*)          telegram_token="${1#--telegram-token=}" ;;
       --telegram-home-channel=*)   telegram_home_channel="${1#--telegram-home-channel=}" ;;
       --telegram-allowed-users=*)  telegram_allowed_users="${1#--telegram-allowed-users=}" ;;
@@ -640,11 +643,25 @@ cmd_create() {
     esac
     shift
   done
-  [[ -n "$name" ]] || fail "$E_USAGE" "usage: 5dive agent create <name> --type=<type> [--channels=none|telegram|discord] [--telegram-token=<token>] [--telegram-cos=<child-username>] [--telegram-cos-avatar=<png>] [--telegram-home-channel=<id>] [--telegram-allowed-users=<csv>] [--workdir=<path>] [--auth-profile=<name>] [--provider=<id> --api-key=<key|->] [--with-skills=<spec>[,...]] [--no-skills] [--no-team-bot] [--defer-auth] [--isolation=admin|standard|sandboxed]"
+  [[ -n "$name" ]] || fail "$E_USAGE" "usage: 5dive agent create <name> --type=<type> [--channels=none|telegram|discord|dashboard[,ch...]] [--telegram-token=<token>] [--telegram-cos=<child-username>] [--telegram-cos-avatar=<png>] [--telegram-home-channel=<id>] [--telegram-allowed-users=<csv>] [--workdir=<path>] [--auth-profile=<name>] [--provider=<id> --api-key=<key|->] [--with-skills=<spec>[,...]] [--no-skills] [--no-team-bot] [--defer-auth] [--isolation=admin|standard|sandboxed]"
   [[ -n "$type" ]] || fail "$E_USAGE" "--type is required"
   valid_name "$name" || fail "$E_VALIDATION" "invalid name (lowercase letters/digits/hyphens, start letter, <=16 chars)"
   is_known_type "$type" || fail "$E_NOT_FOUND" "unknown type: $type (known: ${!TYPE_BIN[*]})"
-  valid_channel "$channels" || fail "$E_VALIDATION" "invalid channels: $channels (none|telegram|discord)"
+  valid_channel "$channels" || fail "$E_VALIDATION" "invalid channels: $channels (none|telegram|discord|dashboard, comma-separable)"
+  # DIVE-856: claude agents are chat-capable in the web dashboard by default.
+  # The dashboard channel needs no token (the plugin reads the box connectord
+  # bearer itself), so fold it into every claude create: unset --channels
+  # becomes "dashboard", and an explicit list gets ",dashboard" appended.
+  # An explicit --channels=none stays the opt-out. Gated on the connectord
+  # env existing so self-hosted boxes with no dashboard backend don't boot a
+  # plugin that can never authenticate.
+  if [[ "$type" == "claude" && -r /etc/5dive/connectord.env ]]; then
+    if [[ "$channels" == "none" ]]; then
+      (( channels_explicit )) || channels="dashboard"
+    elif ! channel_in_list dashboard "$channels"; then
+      channels="${channels},dashboard"
+    fi
+  fi
   valid_isolation "$isolation" || fail "$E_VALIDATION" "invalid --isolation (admin|standard|sandboxed)"
   valid_autonomy "$autonomy" || fail "$E_VALIDATION" "invalid --autonomy '$autonomy' (standard|yolo|son-of-anton)"
   if [[ -n "$workdir" ]]; then
@@ -680,8 +697,14 @@ cmd_create() {
     fail "$E_VALIDATION" "type '$type' does not support channels (only: claude, codex, grok, antigravity, opencode, openclaw, hermes)"
   fi
   # codex + grok + antigravity + opencode ship a telegram bridge only — no discord build yet.
-  if [[ ( "$type" == "codex" || "$type" == "grok" || "$type" == "antigravity" || "$type" == "opencode" ) && "$channels" == "discord" ]]; then
+  if [[ "$type" == "codex" || "$type" == "grok" || "$type" == "antigravity" || "$type" == "opencode" ]] \
+      && channel_in_list discord "$channels"; then
     fail "$E_VALIDATION" "type '$type' supports --channels=telegram only (no discord build)"
+  fi
+  # dashboard chat is a native-push claude plugin only (poll-fork runtimes
+  # have no dashboard variant yet) — fail before any state is written.
+  if [[ "$type" != "claude" ]] && channel_in_list dashboard "$channels"; then
+    fail "$E_VALIDATION" "channels=dashboard is claude-only (got type=$type)"
   fi
 
   # BYO API-key path for hermes/openclaw (--provider=<canonical> + --api-key=<key|->).
@@ -755,7 +778,7 @@ cmd_create() {
   # Telegram/Discord need their own bot/app token per agent — two agents can't
   # share a bot (both would call getUpdates and race each other). Require the
   # token at create time so the plugin doesn't spin up with empty creds.
-  if [[ "$channels" == "telegram" ]]; then
+  if channel_in_list telegram "$channels"; then
     # DIVE-320: --telegram-cos=<child-username> claims a CoS-minted child bot
     # token instead of pasting one. The customer's Chief-of-Staff bot must
     # already be set (`5dive agent cos set`) and the child bot must already be
@@ -844,7 +867,7 @@ cmd_create() {
         || fail "$E_VALIDATION" "invalid --telegram-allowed-users (comma-separated numeric ids)"
     fi
   fi
-  if [[ "$channels" == "discord" ]]; then
+  if channel_in_list discord "$channels"; then
     [[ -n "$discord_token" ]] \
       || fail "$E_USAGE" "--channels=discord requires --discord-token=<token>"
   fi
@@ -1003,7 +1026,7 @@ cmd_create() {
   # message normally fires on a code-roundtrip pairing). Send it here so a
   # CoS-created bot greets its owner immediately. Best-effort — a send hiccup
   # must not fail an otherwise-successful create, so never abort on it.
-  if [[ -n "$cos_owner_id" && "$channels" == "telegram" && -n "$telegram_token" ]]; then
+  if [[ -n "$cos_owner_id" && -n "$telegram_token" ]] && channel_in_list telegram "$channels"; then
     step "Sending welcome DM to CoS owner ($cos_owner_id)"
     send_welcome_message "$cos_owner_id" "$telegram_token" "$name" "$type" || true
   fi
@@ -1116,8 +1139,13 @@ cmd_create() {
   # marketplace git clone inside the plugin install (ERR_STREAM_PREMATURE_CLOSE),
   # and the session should come up with the plugin already staged anyway.
   # _team_bot_do_shared's own restart at the end doubles as the first start.
+  # "Channel-less" here means no personal bot (telegram/discord) — the
+  # DIVE-856 default dashboard channel is not a bot and must not disqualify
+  # an agent from the shared team group.
   local team_bot_status="off"
-  if (( ! no_team_bot )) && [[ "$channels" == "none" ]] \
+  if (( ! no_team_bot )) \
+      && ! channel_in_list telegram "$channels" \
+      && ! channel_in_list discord "$channels" \
       && [[ -r /etc/5dive/team-bot.token && -r /etc/5dive/team-bot.json ]]; then
     local tb_token tb_group tb_owner
     tb_token=$(cat /etc/5dive/team-bot.token 2>/dev/null)
@@ -1199,7 +1227,7 @@ cmd_create() {
   # operator's DMs immediately — the dashboard uses this to safely skip the
   # pairing step only when pairing genuinely already happened.
   local auto_paired="false"
-  [[ "$channels" == "telegram" && -n "$telegram_allowed_users" ]] && auto_paired="true"
+  [[ -n "$telegram_allowed_users" ]] && channel_in_list telegram "$channels" && auto_paired="true"
   ok "agent '$name' (type=$type, channels=$channels${profile:+, profile=$profile}) is running." \
      '{name:$n, type:$t, channels:$c, workdir:$w, authProfile:$p, created:true, autoPaired:$ap, skills:{installed:$inst, failed:$fail}, teamBot:$tb}' \
      --arg n "$name" --arg t "$type" --arg c "$channels" --arg w "$effective_workdir" --arg p "${profile:-}" \
@@ -1301,7 +1329,9 @@ teardown_telegram_wiring() {
 cmd_config() {
   # Usage: 5dive agent config <name> set <key>=<value> [<key>=<value>...]
   #   keys:
-  #     channels                  (none|telegram|discord)
+  #     channels                  (none|telegram|discord|dashboard, comma-
+  #                                separable — "telegram,dashboard" runs both;
+  #                                dashboard is claude-only and token-free)
   #     model                     (model id for the agent's CLI — claude/codex/
   #                                grok/antigravity; written into the type's
   #                                runtime config, applied on the deferred restart)
@@ -1364,6 +1394,9 @@ cmd_config() {
         valid_channel "$v" || fail "$E_VALIDATION" "invalid channels: $v"
         if [[ "$v" != "none" ]] && [[ "${TYPE_CHANNELS[$type]}" != "1" ]]; then
           fail "$E_VALIDATION" "type '$type' does not support channels"
+        fi
+        if [[ "$type" != "claude" ]] && channel_in_list dashboard "$v"; then
+          fail "$E_VALIDATION" "channels=dashboard is claude-only (agent '$name' is type $type)"
         fi
         reg=$(jq --arg n "$name" --arg v "$v" '.agents[$n].channels = $v' <<<"$reg")
         channels_changed_to="$v"
@@ -1478,20 +1511,19 @@ cmd_config() {
   # the allowlist without touching the token). Otherwise the gateway boots
   # without credentials and silently goes deaf — better to fail loudly here.
   if [[ -n "$channels_changed_to" && "$channels_changed_to" != "none" ]]; then
-    case "$channels_changed_to" in
-      telegram)
-        if [[ -z "$new_telegram_token" && ! -s "${CONNECTORS_DIR}/telegram-${name}.env" ]]; then
-          fail "$E_VALIDATION" \
-            "channels=telegram needs telegram.token=<token> in the same set call"
-        fi
-        ;;
-      discord)
-        if [[ -z "$new_discord_token" && ! -s "${CONNECTORS_DIR}/discord-${name}.env" ]]; then
-          fail "$E_VALIDATION" \
-            "channels=discord needs discord.token=<token> in the same set call"
-        fi
-        ;;
-    esac
+    # Per-entry checks — channels= is a comma-separable list (DIVE-856), so
+    # "telegram,dashboard" must run the telegram token check too. dashboard
+    # needs no token (the plugin reads the box connectord bearer itself).
+    if channel_in_list telegram "$channels_changed_to" \
+        && [[ -z "$new_telegram_token" && ! -s "${CONNECTORS_DIR}/telegram-${name}.env" ]]; then
+      fail "$E_VALIDATION" \
+        "channels=telegram needs telegram.token=<token> in the same set call"
+    fi
+    if channel_in_list discord "$channels_changed_to" \
+        && [[ -z "$new_discord_token" && ! -s "${CONNECTORS_DIR}/discord-${name}.env" ]]; then
+      fail "$E_VALIDATION" \
+        "channels=discord needs discord.token=<token> in the same set call"
+    fi
   fi
   echo "$reg" | registry_write
   if (( env_dirty )); then
@@ -1510,7 +1542,9 @@ cmd_config() {
   # disk, else the agent re-enters the telegram wait_for_message loop on next
   # boot despite channels=none (agy, 2026-06-13). Reversible (moves to
   # .disabled-<ts>); the connector token is kept for one-flag re-enable.
-  if [[ "$channels_changed_to" == "none" ]]; then
+  # List-aware (DIVE-856): any channels= value that drops telegram (none,
+  # or a list without it, e.g. "dashboard") strips the stale wiring.
+  if [[ -n "$channels_changed_to" ]] && ! channel_in_list telegram "$channels_changed_to"; then
     local _td_type
     _td_type=$(jq -r --arg n "$name" '.agents[$n].type // empty' <<<"$reg")
     teardown_telegram_wiring "$name" "$_td_type"
@@ -1539,8 +1573,9 @@ cmd_config() {
   # token falls back to the stored connector secret below, so no token is
   # required in the call. (Seeding is additive — it appends new ids; removing
   # an id still goes through `telegram-access set`.)
-  if [[ -n "$new_telegram_token" || "$channels_changed_to" == "telegram" || -n "$new_allowed_users" ]]; then
-    [[ "$effective_channels" == "telegram" ]] \
+  if [[ -n "$new_telegram_token" || -n "$new_allowed_users" ]] \
+      || { [[ -n "$channels_changed_to" ]] && channel_in_list telegram "$channels_changed_to"; }; then
+    channel_in_list telegram "$effective_channels" \
       || fail "$E_VALIDATION" "telegram.* keys require channels=telegram (current: $effective_channels)"
     local token_for_install="$new_telegram_token"
     if [[ -z "$token_for_install" ]]; then
@@ -1582,8 +1617,9 @@ cmd_config() {
         '.agents[$n].botUsername = $u' <<<"$reg" | registry_write
     fi
   fi
-  if [[ -n "$new_discord_token" || "$channels_changed_to" == "discord" ]]; then
-    [[ "$effective_channels" == "discord" ]] \
+  if [[ -n "$new_discord_token" ]] \
+      || { [[ -n "$channels_changed_to" ]] && channel_in_list discord "$channels_changed_to"; }; then
+    channel_in_list discord "$effective_channels" \
       || fail "$E_VALIDATION" "discord.token requires channels=discord (current: $effective_channels)"
     # Same bare-attach rule as telegram above (DIVE-250): channels=discord
     # without a token in this call falls back to the stored connector secret
@@ -1606,6 +1642,15 @@ cmd_config() {
       ensure_hermes_gateway "$name"
     fi
   fi
+  # DIVE-856 dashboard chat attach — the one-tap "Enable chat" path
+  # (`config set channels=<current>,dashboard` via the exec tunnel). No token
+  # or extra keys: the plugin reads the box connectord bearer itself, so the
+  # dispatch is gated purely on channels= in this call. Idempotent like the
+  # telegram/discord dispatches above.
+  if [[ -n "$channels_changed_to" ]] && channel_in_list dashboard "$channels_changed_to"; then
+    step "Installing dashboard channel for agent '$name' (type=$type)"
+    install_channel_for_agent "$type" dashboard "$name" ""
+  fi
   if [[ -n "$new_model" ]]; then
     step "Writing model=$new_model into $type runtime config"
     write_runtime_model "$type" "$name" "$new_model"
@@ -1623,17 +1668,25 @@ cmd_config() {
   # rather than let the agent improvise. Scoped to channels_changed_to (not
   # every config call) so e.g. `model=` on a legacy claude-plugins-official
   # telegram agent can't trip a spurious marketplace mismatch.
-  if [[ "$type" == "claude" ]] \
-     && [[ "$channels_changed_to" == "telegram" || "$channels_changed_to" == "discord" ]]; then
-    local gate_marketplace="claude-plugins-official"
-    [[ "$channels_changed_to" == "telegram" ]] && gate_marketplace="5dive-plugins"
-    local gate_dir="/home/agent-${name}/.claude/plugins/cache/${gate_marketplace}/${channels_changed_to}"
-    local gate_waited=0
-    while [[ ! -d "$gate_dir" ]] && (( gate_waited < 15 )); do
-      sleep 1; gate_waited=$((gate_waited + 1))
+  if [[ "$type" == "claude" && -n "$channels_changed_to" && "$channels_changed_to" != "none" ]]; then
+    # Per-entry gate (DIVE-856): every channel in the new list boots as its
+    # own `--channels plugin:<ch>@<marketplace>`, so each plugin cache must
+    # be staged before the restart — one missing plugin means a deaf session.
+    local gate_ch gate_marketplace gate_dir gate_waited
+    for gate_ch in ${channels_changed_to//,/ }; do
+      case "$gate_ch" in
+        telegram|dashboard) gate_marketplace="5dive-plugins" ;;
+        discord)            gate_marketplace="claude-plugins-official" ;;
+        *) continue ;;
+      esac
+      gate_dir="/home/agent-${name}/.claude/plugins/cache/${gate_marketplace}/${gate_ch}"
+      gate_waited=0
+      while [[ ! -d "$gate_dir" ]] && (( gate_waited < 15 )); do
+        sleep 1; gate_waited=$((gate_waited + 1))
+      done
+      [[ -d "$gate_dir" ]] || fail "$E_GENERIC" \
+        "$gate_ch plugin not staged for agent '$name' ($gate_dir missing) — refusing to restart into a session with no $gate_ch tool. Re-run: sudo 5dive agent config $name set channels=$channels_changed_to"
     done
-    [[ -d "$gate_dir" ]] || fail "$E_GENERIC" \
-      "$channels_changed_to plugin not staged for agent '$name' ($gate_dir missing) — refusing to restart into a session with no $channels_changed_to tool. Re-run: sudo 5dive agent config $name set channels=$channels_changed_to"
   fi
   # Defer the restart so the calling process (often `sudo -n 5dive agent
   # set-account` invoked from inside the agent's own bot) gets to return
@@ -2343,7 +2396,9 @@ _team_bot_relay_agent_list() {
       echo "$name"; continue
     fi
     ch=$(jq -r --arg n "$name" '.agents[$n].channels // "none"' <<<"$reg")
-    [[ "$ch" != "telegram" ]] && echo "$name"
+    # Membership check, not equality: "telegram,dashboard" is a personal bot
+    # too and must never be flipped to the shared send-only relay (DIVE-856).
+    channel_in_list telegram "$ch" || echo "$name"
   done < <(jq -r '.agents | to_entries[]
     | select(.value.type=="claude" or .value.type=="codex" or .value.type=="grok" or .value.type=="antigravity")
     | .key' <<<"$reg")
@@ -2399,7 +2454,10 @@ _team_bot_persist_shared() {
     | reduce ($u[0] | to_entries[]) as $e (.;
         if .agents[$e.key] != null
         then .agents[$e.key].teamTopic = $e.value
-           | .agents[$e.key].channels = "telegram"
+           # keep a DIVE-856 default dashboard channel alongside the relay
+           | .agents[$e.key].channels =
+               (if ((.agents[$e.key].channels // "none") | split(",") | index("dashboard"))
+                then "telegram,dashboard" else "telegram" end)
         else . end)
   ' <<<"$reg")
   registry_write <<<"$reg"
@@ -3062,7 +3120,7 @@ PY
   while IFS= read -r name; do [[ -n "$name" ]] && wired+=("$name"); done \
     < <(jq -r '.[] | select(.status=="relayed") | .agent' <<<"$results")
 
-  local ef wd pf iso
+  local ef wd pf iso cur_ch new_ch
   for name in "${wired[@]}"; do
     type=$(jq -r --arg n "$name" '.agents[$n].type' <<<"$reg")
     step "Enabling telegram (send-only) for $name"
@@ -3072,7 +3130,12 @@ PY
     wd=$(sed -n 's/^AGENT_WORKDIR=//p' "$ef" 2>/dev/null | head -1)
     pf=$(sed -n 's/^AGENT_AUTH_PROFILE=//p' "$ef" 2>/dev/null | head -1)
     iso=$(sed -n 's/^AGENT_ISOLATION=//p' "$ef" 2>/dev/null | head -1); iso="${iso:-admin}"
-    write_agent_env "$name" "$type" telegram "$wd" "$pf" "$iso"
+    # Keep a DIVE-856 default dashboard channel alongside the relay —
+    # mirrors _team_bot_persist_shared's registry merge.
+    cur_ch=$(jq -r --arg n "$name" '.agents[$n].channels // "none"' <<<"$reg")
+    new_ch="telegram"
+    channel_in_list dashboard "$cur_ch" && new_ch="telegram,dashboard"
+    write_agent_env "$name" "$type" "$new_ch" "$wd" "$pf" "$iso"
   done
 
   # 4) Persist channels=telegram + teamTopic (under the registry lock).

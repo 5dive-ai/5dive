@@ -16,11 +16,27 @@ valid_name() {
 valid_channel() {
   # Comma-separated list (DIVE-841): "telegram,dashboard" runs both channels
   # on one session. Every entry must be a known channel; empty is invalid.
+  # "none" only makes sense alone — "none,telegram" is a contradiction, so
+  # any multi-entry list containing none is rejected (DIVE-856).
   [[ -n "$1" ]] || return 1
   local IFS=',' c
   for c in $1; do
     [[ "$c" =~ ^(none|telegram|discord|dashboard)$ ]] || return 1
+    if [[ "$c" == "none" && "$1" != "none" ]]; then return 1; fi
   done
+  return 0
+}
+
+# True when <channel> appears in the comma-separated channels <list>.
+# Every consumer of AGENT_CHANNELS / registry .channels must use this instead
+# of an exact string compare — "telegram,dashboard" != "telegram" silently
+# broke exact-match sites when lists landed (DIVE-856).
+channel_in_list() {
+  local needle="$1" IFS=',' c
+  for c in $2; do
+    [[ "$c" == "$needle" ]] && return 0
+  done
+  return 1
 }
 
 valid_isolation() {

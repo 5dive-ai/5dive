@@ -40,7 +40,7 @@ Agents:
   5dive agent list
   5dive agent info <name>                            # type, CLI version, selected model, channel + state
   5dive agent types
-  5dive agent create <name> --type=<type> [--channels=none|telegram|discord]
+  5dive agent create <name> --type=<type> [--channels=none|telegram|discord|dashboard[,ch...]]
                             [--telegram-token=<bot-token>] [--discord-token=<token>]
                             [--workdir=<path>] [--auth-profile=<name>]
                             [--provider=<id> --api-key=<key|->]
@@ -65,7 +65,10 @@ Agents:
   5dive agent stop <name>
   5dive agent restart <name>
   5dive agent rm <name>
-  5dive agent config <name> set channels=<none|telegram|discord>
+  5dive agent config <name> set channels=<none|telegram|discord|dashboard[,ch...]>
+                                                     # comma-separable; dashboard (claude-only, no token)
+                                                     # enables web-dashboard chat — the one-tap Enable chat
+                                                     # path. New claude creates include it by default.
   5dive agent config <name> set workdir=<path>       # tmux cwd; "default" clears override
   5dive agent config <name> set auth-profile=<name>  # swap profile; "default" clears override
   5dive agent config <name> set model=<id>           # runtime model (claude/codex/grok/antigravity)

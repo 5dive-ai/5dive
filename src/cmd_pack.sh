@@ -443,7 +443,7 @@ _pack_usage() {
                                   #   2) export <name> --approve-memory=<draft dir>  -> seals the
                                   #      reviewed memory into the pack. Nothing is packed unreviewed.
   5dive agent marketplace [ls]    # browse the character-pack registry (<org>/character-packs)
-  5dive agent import <pack|slug> --as=<name> [--channels=none|telegram|discord]
+  5dive agent import <pack|slug> --as=<name> [--channels=none|telegram|discord|dashboard[,ch...]]
                             [--telegram-token=<tok>] [--discord-token=<tok>]
                             [--auth-profile=<name>] [--workdir=<path>] [--report-import]
                                   # recreate an agent from a pack into a FRESH name.

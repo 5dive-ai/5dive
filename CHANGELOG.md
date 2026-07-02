@@ -9,6 +9,27 @@ release.
 
 ## [Unreleased]
 
+### Added
+
+- DIVE-856: claude agents are chat-capable in the web dashboard by default.
+  `agent create` folds the token-free `dashboard` channel into every claude
+  create on managed boxes (unset `--channels` becomes `dashboard`, explicit
+  lists get `,dashboard` appended; `--channels=none` stays the opt-out).
+  `agent config <name> set channels=` is now fully comma-list aware and
+  dispatches the dashboard plugin install — the backend for the dashboard's
+  one-tap "Enable chat" on existing agents.
+
+### Fixed
+
+- Channel lists (DIVE-841) broke several exact-match consumers: a
+  `telegram,dashboard` agent lost `AGENT_CHANNEL_MARKETPLACE` (telegram
+  plugin resolved against the wrong marketplace → dead channel), was wrongly
+  counted as a team-bot relay candidate despite its personal bot, skipped the
+  CoS welcome DM / autoPaired flag, and didn't get its plugins preseeded into
+  `enabledPlugins`. All channel checks now use the `channel_in_list` helper,
+  and the team-bot shared attach preserves a dashboard channel instead of
+  clobbering `channels` to bare `telegram`.
+
 ## [0.4.10] - 2026-06-28
 
 ### Security

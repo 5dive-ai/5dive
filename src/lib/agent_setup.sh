@@ -141,15 +141,25 @@ JSON
       }
     }
   } + $sl')
-  if [[ "$channels" == "telegram" ]]; then
+  # channels is a comma-separable list (DIVE-856): build enabledPlugins from
+  # membership so "telegram,dashboard" enables both.
+  local enabled_plugins='{}'
+  if channel_in_list telegram "$channels"; then
     # 5dive-plugins/telegram (our fork) bundles every lifecycle hook —
     # PreToolUse, PostToolUse, Stop, and (as of plugin v0.4.4) StopFailure
     # too — via its own hooks.json. We don't preseed any of the standalone
     # /usr/local/lib/5dive/ copies into settings.json for new fork agents;
     # doing so would double-fire on the same event.
-    settings=$(jq '. + {enabledPlugins: {"telegram@5dive-plugins": true}}' <<<"$settings")
-  elif [[ "$channels" == "discord" ]]; then
-    settings=$(jq '. + {enabledPlugins: {"discord@claude-plugins-official": true}}' <<<"$settings")
+    enabled_plugins=$(jq '. + {"telegram@5dive-plugins": true}' <<<"$enabled_plugins")
+  fi
+  if channel_in_list discord "$channels"; then
+    enabled_plugins=$(jq '. + {"discord@claude-plugins-official": true}' <<<"$enabled_plugins")
+  fi
+  if channel_in_list dashboard "$channels"; then
+    enabled_plugins=$(jq '. + {"dashboard@5dive-plugins": true}' <<<"$enabled_plugins")
+  fi
+  if [[ "$enabled_plugins" != "{}" ]]; then
+    settings=$(jq --argjson ep "$enabled_plugins" '. + {enabledPlugins: $ep}' <<<"$settings")
   fi
 
   # SessionStart resume-context hook (DIVE-726 Phase 0): on every boot, inject
@@ -167,7 +177,7 @@ JSON
 
   # Telegram agents get the notify-user skill so claude knows how to ping the
   # paired chat with progress/completion/option-prompt messages.
-  if [[ "$channels" == "telegram" && -f "$AGENT_SKILLS_DIR/notify-user/SKILL.md" ]]; then
+  if channel_in_list telegram "$channels" && [[ -f "$AGENT_SKILLS_DIR/notify-user/SKILL.md" ]]; then
     sudo -u "$user" mkdir -p "$home/.claude/skills/notify-user"
     sudo -u "$user" cp "$AGENT_SKILLS_DIR/notify-user/SKILL.md" \
       "$home/.claude/skills/notify-user/SKILL.md"
@@ -179,7 +189,7 @@ JSON
   # the shared projects-level CLAUDE.md. Best-effort: warn (don't fail)
   # if the installer hasn't placed the source file, since the agent boots
   # fine without it.
-  if [[ "$channels" == "telegram" ]]; then
+  if channel_in_list telegram "$channels"; then
     if [[ -f "$TELEGRAM_AGENT_CLAUDE_MD" ]]; then
       sudo -u "$user" cp "$TELEGRAM_AGENT_CLAUDE_MD" "$home/.claude/CLAUDE.md"
       chmod 644 "$home/.claude/CLAUDE.md"
