@@ -50,6 +50,7 @@ cat \
   src/cmd_fleet.sh \
   src/cmd_usage.sh \
   src/cmd_digest.sh \
+  src/cmd_memory.sh \
   src/cmd_pack.sh \
   src/cmd_selfupdate.sh \
   src/main.sh \

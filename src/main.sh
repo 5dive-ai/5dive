@@ -203,6 +203,9 @@ Usage (per-agent / per-task token burn — subscription tokens, no dollars):
   5dive usage budget set <agent> --daily=<tokens>    # soft 24h cap → ⚠ on the board (no throttle)
   5dive usage budget ls | clear <agent>
 
+Memory (queryable team memory — read-path, DIVE-726):
+  5dive memory search "<query>" [--limit=N] [--max-tokens=T]  # BM25-ranked snippets from the agent's memory stores + wiki, with provenance
+
 Health:
   5dive doctor [--repair] [--category=deps|types|auth|creds|registry|shelld|channels]
     Walks deps (tmux/jq/bun/python3/nvm/node/npm), type bins, live auth
@@ -524,6 +527,11 @@ main() {
       # usage + heartbeat health, zero agent tokens. Read-only reporting; no
       # registry mutation/lock, no audit (same posture as usage).
       cmd_digest "$@" ;;
+    memory)
+      # DIVE-726 Phase 1a: queryable team memory read-path. Read-only (scans
+      # markdown memory stores + shared wiki); no registry mutation/lock/audit,
+      # same posture as usage/digest.
+      cmd_memory "$@" ;;
     fleet)
       # DIVE-204 v0.2: multi-box control plane. Phase 1 = the fleet registry
       # (add/ls/show/rm of peer boxes — host/user/port + key PATH, never key

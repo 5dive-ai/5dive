@@ -11,6 +11,11 @@ release.
 
 ### Added
 
+- DIVE-726 Phase 1a: `5dive memory search "<query>"` — queryable team memory
+  read-path. BM25-ranked snippets from the agent's markdown memory stores (+ the
+  shared wiki when present), section-chunked for provenance and capped at a token
+  ceiling. Lexical-first (no embeddings, no new dependency, nothing leaves the
+  box); read-only. Version bumped 0.6.0 → 0.6.1.
 - DIVE-891: risk-tiered human gates + TTL (adopted design DIVE-861). `task
   need` takes `--tier=0|1|2`: tier 0 auto-applies the recommendation
   immediately (no ping — the daily digest's new "Auto-cleared gates" section
