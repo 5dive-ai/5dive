@@ -38,7 +38,7 @@ PASS=0; FAIL=0
 ok_t()  { PASS=$((PASS+1)); printf 'ok   - %s\n' "$1"; }
 bad_t() { FAIL=$((FAIL+1)); printf 'FAIL - %s\n   %s\n' "$1" "${2:-}"; }
 # run a verb in a subshell so its `fail`→exit can't kill the harness
-run() { ( cmd_loop_spawn "$@" ) 2>/tmp/loop-unit.err; }
+run() { ( cmd_loop_spawn "$@" ) 2>"$TMP"/loop-unit.err; }
 
 tasks_db_init
 # sanity: default project must exist (cmd_task_add validates it)
@@ -51,7 +51,7 @@ st=$(printf '%s' "$out" | jq -r '.data.status' 2>/dev/null)
 lid=$(printf '%s' "$out" | jq -r '.data.loopId' 2>/dev/null)
 tid=$(printf '%s' "$out" | jq -r '.data.taskId' 2>/dev/null)
 [[ "$st" == "running" && "$lid" == L-* && "$tid" =~ ^[0-9]+$ ]] \
-  && ok_t "spawn returns {running, loopId, taskId}" || bad_t "spawn basic" "$out $(cat /tmp/loop-unit.err)"
+  && ok_t "spawn returns {running, loopId, taskId}" || bad_t "spawn basic" "$out $(cat "$TMP"/loop-unit.err)"
 rowtopo=$(db "SELECT topology FROM loop_runs WHERE loop_id='$lid';")
 child=$(db "SELECT child_task_ids FROM loop_runs WHERE loop_id='$lid';")
 [[ "$rowtopo" == "spawn" && "$child" == "[$tid]" ]] \
@@ -82,33 +82,33 @@ loop_by_prompt() { db "SELECT lr.loop_id FROM loop_runs lr, tasks t WHERE lr.chi
 task_by_prompt() { db "SELECT t.id FROM tasks t WHERE t.body LIKE '%$1%' ORDER BY t.id DESC LIMIT 1;"; }
 
 # --- T4: --wait halts on KILL (flip kill_requested mid-wait)
-( cmd_loop_spawn --agent=main --prompt="UNIQ_killme" --wait=20 >/tmp/loop-kill.out 2>&1 ) &
+( cmd_loop_spawn --agent=main --prompt="UNIQ_killme" --wait=20 >"$TMP"/loop-kill.out 2>&1 ) &
 bgpid=$!
 sleep 1; klid=$(loop_by_prompt UNIQ_killme)
 db "UPDATE loop_runs SET kill_requested=1 WHERE loop_id='$klid';"
 wait $bgpid
-kst=$(jq -r '.data.status' /tmp/loop-kill.out 2>/dev/null)
-[[ "$kst" == "killed" ]] && ok_t "--wait halts on kill_requested → killed" || bad_t "kill halt" "$(cat /tmp/loop-kill.out)"
+kst=$(jq -r '.data.status' "$TMP"/loop-kill.out 2>/dev/null)
+[[ "$kst" == "killed" ]] && ok_t "--wait halts on kill_requested → killed" || bad_t "kill halt" "$(cat "$TMP"/loop-kill.out)"
 
 # --- T5: --wait halts on CEILING breach
-( cmd_loop_spawn --agent=main --prompt="UNIQ_spendy" --ceiling=1000 --wait=20 >/tmp/loop-ceil.out 2>&1 ) &
+( cmd_loop_spawn --agent=main --prompt="UNIQ_spendy" --ceiling=1000 --wait=20 >"$TMP"/loop-ceil.out 2>&1 ) &
 bgpid=$!
 sleep 1; clid=$(loop_by_prompt UNIQ_spendy)
 db "UPDATE loop_runs SET tokens_spent=5000 WHERE loop_id='$clid';"
 wait $bgpid
-cst=$(jq -r '.data.status' /tmp/loop-ceil.out 2>/dev/null)
-[[ "$cst" == "escalated" ]] && ok_t "--wait halts on ceiling breach → escalated" || bad_t "ceiling halt" "$(cat /tmp/loop-ceil.out)"
+cst=$(jq -r '.data.status' "$TMP"/loop-ceil.out 2>/dev/null)
+[[ "$cst" == "escalated" ]] && ok_t "--wait halts on ceiling breach → escalated" || bad_t "ceiling halt" "$(cat "$TMP"/loop-ceil.out)"
 
 # --- T6: --wait returns clean done + result passthrough
-( cmd_loop_spawn --agent=main --prompt="UNIQ_finish" --wait=20 >/tmp/loop-done.out 2>&1 ) &
+( cmd_loop_spawn --agent=main --prompt="UNIQ_finish" --wait=20 >"$TMP"/loop-done.out 2>&1 ) &
 bgpid=$!
 sleep 1; dtid=$(task_by_prompt UNIQ_finish)
 db "UPDATE tasks SET status='done', result='shipped clean' WHERE id=$dtid;"
 wait $bgpid
-dst=$(jq -r '.data.status' /tmp/loop-done.out 2>/dev/null)
-dres=$(jq -r '.data.result' /tmp/loop-done.out 2>/dev/null)
+dst=$(jq -r '.data.status' "$TMP"/loop-done.out 2>/dev/null)
+dres=$(jq -r '.data.result' "$TMP"/loop-done.out 2>/dev/null)
 [[ "$dst" == "done" && "$dres" == "shipped clean" ]] \
-  && ok_t "--wait → done with result passthrough" || bad_t "done passthrough" "$(cat /tmp/loop-done.out)"
+  && ok_t "--wait → done with result passthrough" || bad_t "done passthrough" "$(cat "$TMP"/loop-done.out)"
 
 echo "-----"; echo "PASS=$PASS FAIL=$FAIL"
 [[ $FAIL -eq 0 ]]

@@ -35,7 +35,7 @@ set +e
 PASS=0; FAIL=0
 ok_t()  { PASS=$((PASS+1)); printf 'ok   - %s\n' "$1"; }
 bad_t() { FAIL=$((FAIL+1)); printf 'FAIL - %s\n   %s\n' "$1" "${2:-}"; }
-run() { ( cmd_loop_panel "$@" ) 2>/tmp/loop-panel.err; }
+run() { ( cmd_loop_panel "$@" ) 2>"$TMP"/loop-panel.err; }
 # grader backing tasks all carry the claim text → find them by a unique token.
 grader_tids() { db "SELECT id FROM tasks WHERE body LIKE '%$1%' ORDER BY id;"; }
 
@@ -51,7 +51,7 @@ pn=$(printf '%s' "$out" | jq -r '.data.n' 2>/dev/null)
 pq=$(printf '%s' "$out" | jq -r '.data.quorum' 2>/dev/null)
 mlen=$(printf '%s' "$out" | jq -r '.data.members | length' 2>/dev/null)
 [[ "$st" == "running" && "$lid" == L-* && "$pn" == "3" && "$pq" == "2" && "$mlen" == "3" ]] \
-  && ok_t "panel no-wait → running, N=3, quorum=2, 3 members" || bad_t "panel basic" "$out $(cat /tmp/loop-panel.err)"
+  && ok_t "panel no-wait → running, N=3, quorum=2, 3 members" || bad_t "panel basic" "$out $(cat "$TMP"/loop-panel.err)"
 topo=$(db "SELECT topology FROM loop_runs WHERE loop_id='$lid';")
 child=$(db "SELECT child_task_ids FROM loop_runs WHERE loop_id='$lid';")
 nchild=$(printf '%s' "$child" | jq 'length' 2>/dev/null)
@@ -85,47 +85,47 @@ pn=$(printf '%s' "$out" | jq -r '.data.n'); pq=$(printf '%s' "$out" | jq -r '.da
   && ok_t "LOOP_PANEL_N/QUORUM_DEFAULT applied (N=2 q=1)" || bad_t "config default" "n=$pn q=$pq"
 
 # --- T6: --wait quorum PASS (2 of 3 pass ≥ quorum 2)
-( cmd_loop_panel --agent=main --claim="UNIQ_passvote x" --n=3 --quorum=2 --wait=20 >/tmp/panel-pass.out 2>&1 ) &
+( cmd_loop_panel --agent=main --claim="UNIQ_passvote x" --n=3 --quorum=2 --wait=20 >"$TMP"/panel-pass.out 2>&1 ) &
 bgpid=$!; sleep 1
 mapfile -t tids < <(grader_tids UNIQ_passvote)
 db "UPDATE tasks SET status='done', result='{\"verdict\":\"pass\"}' WHERE id=${tids[0]};"
 db "UPDATE tasks SET status='done', result='{\"verdict\":\"pass\"}' WHERE id=${tids[1]};"
 db "UPDATE tasks SET status='done', result='{\"verdict\":\"fail\"}' WHERE id=${tids[2]};"
 wait $bgpid
-pv=$(jq -r '.data.verdict' /tmp/panel-pass.out 2>/dev/null)
-pp=$(jq -r '.data.pass' /tmp/panel-pass.out 2>/dev/null)
+pv=$(jq -r '.data.verdict' "$TMP"/panel-pass.out 2>/dev/null)
+pp=$(jq -r '.data.pass' "$TMP"/panel-pass.out 2>/dev/null)
 [[ "$pv" == "pass" && "$pp" == "2" ]] \
-  && ok_t "--wait quorum PASS (2/3 pass → pass)" || bad_t "quorum pass" "$(cat /tmp/panel-pass.out)"
+  && ok_t "--wait quorum PASS (2/3 pass → pass)" || bad_t "quorum pass" "$(cat "$TMP"/panel-pass.out)"
 
 # --- T7: --wait quorum FAIL (1 of 3 pass < quorum 2)
-( cmd_loop_panel --agent=main --claim="UNIQ_failvote x" --n=3 --quorum=2 --wait=20 >/tmp/panel-fail.out 2>&1 ) &
+( cmd_loop_panel --agent=main --claim="UNIQ_failvote x" --n=3 --quorum=2 --wait=20 >"$TMP"/panel-fail.out 2>&1 ) &
 bgpid=$!; sleep 1
 mapfile -t tids < <(grader_tids UNIQ_failvote)
 db "UPDATE tasks SET status='done', result='{\"verdict\":\"pass\"}' WHERE id=${tids[0]};"
 db "UPDATE tasks SET status='done', result='{\"verdict\":\"fail\"}' WHERE id=${tids[1]};"
 db "UPDATE tasks SET status='done', result='{\"verdict\":\"fail\"}' WHERE id=${tids[2]};"
 wait $bgpid
-fv=$(jq -r '.data.verdict' /tmp/panel-fail.out 2>/dev/null)
+fv=$(jq -r '.data.verdict' "$TMP"/panel-fail.out 2>/dev/null)
 [[ "$fv" == "fail" ]] \
-  && ok_t "--wait quorum FAIL (1/3 pass → fail)" || bad_t "quorum fail" "$(cat /tmp/panel-fail.out)"
+  && ok_t "--wait quorum FAIL (1/3 pass → fail)" || bad_t "quorum fail" "$(cat "$TMP"/panel-fail.out)"
 
 # --- T8: --wait halts on KILL
-( cmd_loop_panel --agent=main --claim="UNIQ_killpanel x" --n=2 --wait=20 >/tmp/panel-kill.out 2>&1 ) &
+( cmd_loop_panel --agent=main --claim="UNIQ_killpanel x" --n=2 --wait=20 >"$TMP"/panel-kill.out 2>&1 ) &
 bgpid=$!; sleep 1
 klid=$(db "SELECT loop_id FROM loop_runs WHERE topology='panel' AND child_task_ids LIKE '%' ORDER BY started_at DESC, rowid DESC LIMIT 1;")
 db "UPDATE loop_runs SET kill_requested=1 WHERE loop_id='$klid';"
 wait $bgpid
-kst=$(jq -r '.data.status' /tmp/panel-kill.out 2>/dev/null)
-[[ "$kst" == "killed" ]] && ok_t "--wait halts on kill_requested → killed" || bad_t "kill halt" "$(cat /tmp/panel-kill.out)"
+kst=$(jq -r '.data.status' "$TMP"/panel-kill.out 2>/dev/null)
+[[ "$kst" == "killed" ]] && ok_t "--wait halts on kill_requested → killed" || bad_t "kill halt" "$(cat "$TMP"/panel-kill.out)"
 
 # --- T9: --wait halts on CEILING breach → escalated
-( cmd_loop_panel --agent=main --claim="UNIQ_ceilpanel x" --n=2 --ceiling=1000 --wait=20 >/tmp/panel-ceil.out 2>&1 ) &
+( cmd_loop_panel --agent=main --claim="UNIQ_ceilpanel x" --n=2 --ceiling=1000 --wait=20 >"$TMP"/panel-ceil.out 2>&1 ) &
 bgpid=$!; sleep 1
 clid=$(db "SELECT loop_id FROM loop_runs WHERE topology='panel' ORDER BY started_at DESC, rowid DESC LIMIT 1;")
 db "UPDATE loop_runs SET tokens_spent=5000 WHERE loop_id='$clid';"
 wait $bgpid
-cst=$(jq -r '.data.status' /tmp/panel-ceil.out 2>/dev/null)
-[[ "$cst" == "escalated" ]] && ok_t "--wait halts on ceiling breach → escalated" || bad_t "ceiling halt" "$(cat /tmp/panel-ceil.out)"
+cst=$(jq -r '.data.status' "$TMP"/panel-ceil.out 2>/dev/null)
+[[ "$cst" == "escalated" ]] && ok_t "--wait halts on ceiling breach → escalated" || bad_t "ceiling halt" "$(cat "$TMP"/panel-ceil.out)"
 
 echo "-----"; echo "PASS=$PASS FAIL=$FAIL"
 [[ $FAIL -eq 0 ]]

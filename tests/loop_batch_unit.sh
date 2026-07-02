@@ -69,11 +69,11 @@ simulate() {
 
 # ---- T: map index-aligned + null-on-fail ----
 simulate & SIMPID=$!
-out=$(cmd_loop_map --agent=main --role=worker --do='handle ITEM={}' --over='[10,20,30]' --timeout=30 2>/tmp/map.err)
+out=$(cmd_loop_map --agent=main --role=worker --do='handle ITEM={}' --over='[10,20,30]' --timeout=30 2>"$TMP"/map.err)
 mtot=$(printf '%s' "$out" | jq -r '.data.total'); mok=$(printf '%s' "$out" | jq -r '.data.ok')
 r0=$(printf '%s' "$out" | jq -r '.data.results[0].item'); r2=$(printf '%s' "$out" | jq -r '.data.results[2].item')
 [[ "$mtot" == "3" && "$mok" == "3" && "$r0" == "10" && "$r2" == "30" ]] \
-  && ok_t "map: 3/3 ok, index-aligned (results[0]=10, results[2]=30)" || bad_t "map basic" "$out $(cat /tmp/map.err)"
+  && ok_t "map: 3/3 ok, index-aligned (results[0]=10, results[2]=30)" || bad_t "map basic" "$out $(cat "$TMP"/map.err)"
 
 # null-on-fail: middle item flagged FAILME → null, batch still completes
 out=$(cmd_loop_map --agent=main --do='x ITEM={} FAILME-IF-2' --over='[1,2,3]' --timeout=30 2>/dev/null)
@@ -93,12 +93,12 @@ cc=$(printf '%s' "$out" | jq -r '.data.concurrency'); hard=$(_loop_host_conc_cap
 # round payloads: r1 finds A,B ; r2 finds B (dup, 0 fresh) ; r3 finds nothing → 2 empty rounds → dry
 echo '{"1":[{"id":"A"},{"id":"B"}],"2":[{"id":"B"}],"3":[],"4":[]}' > "$SIM_FLAG"
 echo 1 > "$TMP/roundctr"
-out=$(cmd_loop_until_dry --agent=main --round='ROUND_FINDER sweep' --dedup-key=id --stop-after=2 --round-timeout=30 2>/tmp/ud.err)
+out=$(cmd_loop_until_dry --agent=main --round='ROUND_FINDER sweep' --dedup-key=id --stop-after=2 --round-timeout=30 2>"$TMP"/ud.err)
 er=$(printf '%s' "$out" | jq -r '.data.exitReason'); found=$(printf '%s' "$out" | jq -r '.data.found')
 rounds=$(printf '%s' "$out" | jq -r '.data.rounds')
 ids=$(printf '%s' "$out" | jq -r '[.data.items[].id]|sort|join(",")')
 [[ "$er" == "dry" && "$found" == "2" && "$ids" == "A,B" ]] \
-  && ok_t "until-dry: dedups (A,B kept once), stops dry after 2 empty rounds (rounds=$rounds)" || bad_t "until-dry dry" "$out $(cat /tmp/ud.err)"
+  && ok_t "until-dry: dedups (A,B kept once), stops dry after 2 empty rounds (rounds=$rounds)" || bad_t "until-dry dry" "$out $(cat "$TMP"/ud.err)"
 
 # max-iters cap fires before dry → escalated + partial
 echo '{"1":[{"id":"X"}],"2":[{"id":"Y"}],"3":[{"id":"Z"}]}' > "$SIM_FLAG"; echo 1 > "$TMP/roundctr"
@@ -115,11 +115,11 @@ t1=$(db "SELECT id FROM tasks WHERE body LIKE '%COLLECT_A%' ORDER BY id DESC LIM
 t2=$(db "SELECT id FROM tasks WHERE body LIKE '%COLLECT_B%' ORDER BY id DESC LIMIT 1;")
 ( sleep 1; db "UPDATE tasks SET status='done', result='{\"v\":1}' WHERE id=$t1;"
            db "UPDATE tasks SET status='escalated' WHERE id=$t2;" ) &
-out=$(cmd_loop_collect --handles="$h1,$h2" --timeout=30 2>/tmp/collect.err)
+out=$(cmd_loop_collect --handles="$h1,$h2" --timeout=30 2>"$TMP"/collect.err)
 ctot=$(printf '%s' "$out" | jq -r '.data.total'); cok=$(printf '%s' "$out" | jq -r '.data.ok')
 cv=$(printf '%s' "$out" | jq -r '.data.results[0].v'); cnull=$(printf '%s' "$out" | jq -r '.data.results[1]')
 [[ "$ctot" == "2" && "$cok" == "1" && "$cv" == "1" && "$cnull" == "null" ]] \
-  && ok_t "collect: barrier gather, done→result / non-done→null (index-aligned)" || bad_t "collect" "$out $(cat /tmp/collect.err)"
+  && ok_t "collect: barrier gather, done→result / non-done→null (index-aligned)" || bad_t "collect" "$out $(cat "$TMP"/collect.err)"
 
 echo "-----"; echo "PASS=$PASS FAIL=$FAIL"
 [[ $FAIL -eq 0 ]]

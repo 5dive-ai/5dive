@@ -33,10 +33,10 @@ mk_target() { ( JSON_MODE=1 cmd_task_add --assignee="$1" --body="$2" -- "$2" ) 2
 
 # --- T1: attach verifier + accept; returns verifying; loop_runs row; fields set
 tid=$(mk_target maker "UNIQ_target_one")
-out=$( ( cmd_loop_verify --target="$tid" --verifier=grader --accept="must compile" ) 2>/tmp/lv.err )
+out=$( ( cmd_loop_verify --target="$tid" --verifier=grader --accept="must compile" ) 2>"$TMP"/lv.err )
 st=$(printf '%s' "$out" | jq -r '.data.status' 2>/dev/null)
 lid=$(printf '%s' "$out" | jq -r '.data.loopId' 2>/dev/null)
-[[ "$st" == "verifying" && "$lid" == L-* ]] && ok_t "verify returns {verifying, loopId}" || bad_t "verify basic" "$out $(cat /tmp/lv.err)"
+[[ "$st" == "verifying" && "$lid" == L-* ]] && ok_t "verify returns {verifying, loopId}" || bad_t "verify basic" "$out $(cat "$TMP"/lv.err)"
 v=$(db "SELECT verifier FROM tasks WHERE id=$tid;"); a=$(db "SELECT acceptance_criteria FROM tasks WHERE id=$tid;")
 [[ "$v" == "grader" && "$a" == "must compile" ]] && ok_t "verifier+acceptance attached to target ($v/$a)" || bad_t "attach" "v=$v a=$a"
 topo=$(db "SELECT topology FROM loop_runs WHERE loop_id='$lid';"); child=$(db "SELECT child_task_ids FROM loop_runs WHERE loop_id='$lid';")
@@ -58,28 +58,28 @@ tid3=$(mk_target maker "UNIQ_target_three"); db "UPDATE tasks SET status='done' 
 
 # --- T5: --wait → done verdict pass (flip target done mid-wait)
 tidw=$(mk_target maker "UNIQ_target_wait")
-( cmd_loop_verify --target="$tidw" --verifier=grader --wait=20 >/tmp/lv-done.out 2>&1 ) &
+( cmd_loop_verify --target="$tidw" --verifier=grader --wait=20 >"$TMP"/lv-done.out 2>&1 ) &
 bg=$!; sleep 1; db "UPDATE tasks SET status='done', result='graded PASS' WHERE id=$tidw;"; wait $bg
-dst=$(jq -r '.data.status' /tmp/lv-done.out 2>/dev/null); dvd=$(jq -r '.data.verdict' /tmp/lv-done.out 2>/dev/null); dres=$(jq -r '.data.result' /tmp/lv-done.out 2>/dev/null)
-[[ "$dst" == "done" && "$dvd" == "pass" && "$dres" == "graded PASS" ]] && ok_t "--wait → done/pass with result" || bad_t "wait done" "$(cat /tmp/lv-done.out)"
+dst=$(jq -r '.data.status' "$TMP"/lv-done.out 2>/dev/null); dvd=$(jq -r '.data.verdict' "$TMP"/lv-done.out 2>/dev/null); dres=$(jq -r '.data.result' "$TMP"/lv-done.out 2>/dev/null)
+[[ "$dst" == "done" && "$dvd" == "pass" && "$dres" == "graded PASS" ]] && ok_t "--wait → done/pass with result" || bad_t "wait done" "$(cat "$TMP"/lv-done.out)"
 
 # --- T6: --wait halts on KILL
 tidk=$(mk_target maker "UNIQ_target_kill")
-( cmd_loop_verify --target="$tidk" --verifier=grader --wait=20 >/tmp/lv-kill.out 2>&1 ) &
+( cmd_loop_verify --target="$tidk" --verifier=grader --wait=20 >"$TMP"/lv-kill.out 2>&1 ) &
 bg=$!; sleep 1
 klid=$(db "SELECT lr.loop_id FROM loop_runs lr WHERE lr.child_task_ids='[$tidk]' ORDER BY lr.started_at DESC LIMIT 1;")
 db "UPDATE loop_runs SET kill_requested=1 WHERE loop_id='$klid';"; wait $bg
-kst=$(jq -r '.data.status' /tmp/lv-kill.out 2>/dev/null)
-[[ "$kst" == "killed" ]] && ok_t "--wait halts on kill → killed" || bad_t "kill" "$(cat /tmp/lv-kill.out)"
+kst=$(jq -r '.data.status' "$TMP"/lv-kill.out 2>/dev/null)
+[[ "$kst" == "killed" ]] && ok_t "--wait halts on kill → killed" || bad_t "kill" "$(cat "$TMP"/lv-kill.out)"
 
 # --- T7: --wait halts on CEILING
 tidc=$(mk_target maker "UNIQ_target_ceil")
-( cmd_loop_verify --target="$tidc" --verifier=grader --ceiling=1000 --wait=20 >/tmp/lv-ceil.out 2>&1 ) &
+( cmd_loop_verify --target="$tidc" --verifier=grader --ceiling=1000 --wait=20 >"$TMP"/lv-ceil.out 2>&1 ) &
 bg=$!; sleep 1
 clid=$(db "SELECT lr.loop_id FROM loop_runs lr WHERE lr.child_task_ids='[$tidc]' ORDER BY lr.started_at DESC LIMIT 1;")
 db "UPDATE loop_runs SET tokens_spent=5000 WHERE loop_id='$clid';"; wait $bg
-cst=$(jq -r '.data.status' /tmp/lv-ceil.out 2>/dev/null); cvd=$(jq -r '.data.verdict' /tmp/lv-ceil.out 2>/dev/null)
-[[ "$cst" == "escalated" && "$cvd" == "escalated" ]] && ok_t "--wait halts on ceiling → escalated" || bad_t "ceiling halt" "$(cat /tmp/lv-ceil.out)"
+cst=$(jq -r '.data.status' "$TMP"/lv-ceil.out 2>/dev/null); cvd=$(jq -r '.data.verdict' "$TMP"/lv-ceil.out 2>/dev/null)
+[[ "$cst" == "escalated" && "$cvd" == "escalated" ]] && ok_t "--wait halts on ceiling → escalated" || bad_t "ceiling halt" "$(cat "$TMP"/lv-ceil.out)"
 
 echo "-----"; echo "PASS=$PASS FAIL=$FAIL"
 [[ $FAIL -eq 0 ]]
