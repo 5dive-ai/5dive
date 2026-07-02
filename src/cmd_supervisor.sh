@@ -104,7 +104,14 @@ _sup_cli_check() {
   # Same nightly-log heuristic as cmd_update_check: a healthy recent nightly
   # means the gap closes on its own (behind-but-fine); a failed/absent/old one
   # means the box is genuinely running old code.
-  local log="/tmp/claude-soft-updates.log" stale=true
+  # No readable nightly log => UNKNOWN, never stale (day-1 audit finding,
+  # 2026-07-02): the control host has no soft-updates log, so "behind"
+  # minutes after a release cut flagged every claude agent stuck/stale-cli.
+  # Absence of evidence is not a stuck signal — same doctrine as the probe
+  # itself. A box is only STALE on positive evidence: the last nightly
+  # attempt failed, or the last successful one is older than the update
+  # window (nightly had its chance and the gap is still open).
+  local log="/tmp/claude-soft-updates.log" stale="unknown"
   if [[ -r "$log" ]]; then
     local start_line ok_last=true last_at last_epoch=""
     start_line=$(grep -n "soft updates start" "$log" | tail -1 | cut -d: -f1) || start_line=""
@@ -114,9 +121,14 @@ _sup_cli_check() {
     last_at=$(grep -oE "[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:+-]+ soft updates done" "$log" \
       | tail -1 | grep -oE "^[^ ]+") || last_at=""
     [[ -n "$last_at" ]] && last_epoch=$(date -d "$last_at" +%s 2>/dev/null) || last_epoch=""
-    if [[ "$ok_last" == true && -n "$last_epoch" ]] \
-       && (( $(date +%s) - last_epoch <= UPDATE_STALE_AFTER_SECS )); then
-      stale=false
+    if [[ "$ok_last" == false ]]; then
+      stale=true
+    elif [[ -n "$last_epoch" ]]; then
+      if (( $(date +%s) - last_epoch <= UPDATE_STALE_AFTER_SECS )); then
+        stale=false
+      else
+        stale=true
+      fi
     fi
   fi
   _SUP_CLI_STALE="$stale"
