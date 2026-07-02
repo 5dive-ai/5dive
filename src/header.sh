@@ -26,7 +26,7 @@ esac
 
 # Bumped on every public release. `build.sh` checks this line exists; CI fails
 # the bundle-drift check if it's missing or empty.
-readonly FIVE_VERSION="0.6.4"
+readonly FIVE_VERSION="0.6.5"
 
 # GitHub org our repos live under. The org is being renamed
 # 5dive-com -> 5dive-ai (2026-06); fetches must work on either side of the
@@ -222,7 +222,12 @@ declare -A TYPE_INSTALL=(
   # antigravity's installer drops the native-Go binary at ~/.local/bin/agy
   # and self-updates in the background on each run, so no daily-cron
   # equivalent of @google/gemini-cli's npm update is needed.
-  [antigravity]="command -v agy >/dev/null || curl -fsSL https://antigravity.google/cli/install.sh | bash"
+  # DIVE-901: gate and verify must agree. `command -v agy` can hit a copy
+  # outside TYPE_BIN (PATH drift, image pre-seed) — the recipe then no-ops in
+  # 0s and the -x TYPE_BIN guard fails even though agy works. Same class as
+  # grok's opportunistic-symlink gap below: ensure the TYPE_BIN symlink
+  # ourselves instead of trusting where the binary happened to land.
+  [antigravity]="command -v agy >/dev/null || curl -fsSL https://antigravity.google/cli/install.sh | bash; [ -x /home/claude/.local/bin/agy ] || { mkdir -p /home/claude/.local/bin; p=\$(command -v agy 2>/dev/null || true); [ -n \"\$p\" ] && ln -sf \"\$p\" /home/claude/.local/bin/agy; }"
   # grok's installer drops the binary at ~/.grok/bin/grok but only creates the
   # ~/.local/bin/grok symlink *opportunistically* (its line 328 requires
   # ~/.local/bin already on PATH and ~/.grok/bin not on PATH). On a fresh VM

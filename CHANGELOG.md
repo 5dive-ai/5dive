@@ -9,6 +9,17 @@ release.
 
 ## [Unreleased]
 
+### Fixed
+
+- DIVE-901: `agent install antigravity` no longer flakes with "agy still
+  missing" when the binary resolves outside `~/.local/bin` (PATH drift /
+  image pre-seed): the recipe's gate (`command -v agy`) and the success guard
+  (`-x TYPE_BIN`) disagreed, so the recipe no-op'd in 0s and the guard failed
+  even though agy works — the same class as grok's opportunistic-symlink gap.
+  The recipe now ensures the TYPE_BIN symlink itself, and the install guard
+  gives any type's binary a 10s grace for async/late-rename installer drops.
+  Version 0.6.4 -> 0.6.5.
+
 ### Added
 
 - DIVE-899: every claude agent's per-agent CLAUDE.md now carries the

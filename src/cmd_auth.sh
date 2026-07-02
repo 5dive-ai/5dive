@@ -379,6 +379,11 @@ cmd_install() {
   step "Installing $type (as user 'claude')"
   # -i loads claude's login env (nvm, XDG redirects, etc.)
   sudo -u claude -i bash -lc "$recipe" >&2
+  # DIVE-901: some installers finish async or drop the binary via a late
+  # rename — give the bin a short grace before declaring failure. Only sleeps
+  # on the would-have-failed path; the happy path pays nothing.
+  local _waited=0
+  while [[ ! -x "$bin" && $_waited -lt 10 ]]; do sleep 1; _waited=$((_waited + 1)); done
   if [[ -x "$bin" ]]; then
     ok "$type installed at $bin" \
        '{type:$t, bin:$b, installed:true, alreadyInstalled:false}' \
