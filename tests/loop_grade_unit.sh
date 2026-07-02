@@ -33,7 +33,7 @@ set +e
 PASS=0; FAIL=0
 ok_t()  { PASS=$((PASS+1)); printf 'ok   - %s\n' "$1"; }
 bad_t() { FAIL=$((FAIL+1)); printf 'FAIL - %s\n   %s\n' "$1" "${2:-}"; }
-run() { ( cmd_loop_grade "$@" ) 2>/tmp/loop-grade.err; }
+run() { ( cmd_loop_grade "$@" ) 2>"$TMP"/loop-grade.err; }
 
 tasks_db_init
 
@@ -46,9 +46,9 @@ has_col=$(db "SELECT 1 FROM pragma_table_info('loop_runs') WHERE name='scorecard
 [[ "$has_col" == "1" ]] && ok_t "loop_runs.scorecard_json column present" || bad_t "scorecard_json column" "missing"
 
 # A maker task with acceptance criteria, owned by 'dev' (≠ grader 'main').
-out=$(JSON_MODE=1 cmd_task_add "build the thing" --assignee=dev --accept="UNIQ_AC1 must compile; must have tests" 2>/tmp/loop-grade.err)
+out=$(JSON_MODE=1 cmd_task_add "build the thing" --assignee=dev --accept="UNIQ_AC1 must compile; must have tests" 2>"$TMP"/loop-grade.err)
 TGT=$(printf '%s' "$out" | jq -r '.data.ident // .data.id' 2>/dev/null)
-[[ -n "$TGT" && "$TGT" != "null" ]] && ok_t "seed target task ($TGT)" || bad_t "seed target" "$out $(cat /tmp/loop-grade.err)"
+[[ -n "$TGT" && "$TGT" != "null" ]] && ok_t "seed target task ($TGT)" || bad_t "seed target" "$out $(cat "$TMP"/loop-grade.err)"
 
 # --- T1: no-wait grade spawns a grader + grade loop row
 out=$(run --target="$TGT" --verifier=main)
@@ -56,7 +56,7 @@ st=$(printf '%s' "$out" | jq -r '.data.status' 2>/dev/null)
 top=$(printf '%s' "$out" | jq -r '.data.topology' 2>/dev/null)
 gtask=$(printf '%s' "$out" | jq -r '.data.graderTask' 2>/dev/null)
 [[ "$st" == "grading" && "$top" == "grade" && "$gtask" =~ ^[0-9]+$ ]] \
-  && ok_t "no-wait grade → {grading, grade, graderTask}" || bad_t "grade basic" "$out $(cat /tmp/loop-grade.err)"
+  && ok_t "no-wait grade → {grading, grade, graderTask}" || bad_t "grade basic" "$out $(cat "$TMP"/loop-grade.err)"
 gassignee=$(db "SELECT assignee FROM tasks WHERE id=$gtask;")
 [[ "$gassignee" == "main" ]] && ok_t "grader task assigned to --verifier" || bad_t "grader assignee" "$gassignee"
 
@@ -74,16 +74,16 @@ run --target="$NAC" --verifier=main >/dev/null 2>&1; [[ $? -ne 0 ]] && ok_t "no 
 latest_grade_child() { db "SELECT TRIM(child_task_ids,'[]') FROM loop_runs WHERE topology='grade' ORDER BY started_at DESC, rowid DESC LIMIT 1;"; }
 
 # --- T3: --wait, grader scores high → verdict pass, scorecard persisted
-( cmd_loop_grade --target="$TGT" --verifier=main --threshold=70 --wait=20 >/tmp/loop-grade-pass.out 2>&1 ) &
+( cmd_loop_grade --target="$TGT" --verifier=main --threshold=70 --wait=20 >"$TMP"/loop-grade-pass.out 2>&1 ) &
 bgpid=$!
 sleep 1; g3=$(latest_grade_child)
 db "UPDATE tasks SET status='done', result='{\"overall\":88,\"criteria\":[{\"name\":\"compile\",\"score\":95,\"reason\":\"ok\"},{\"name\":\"tests\",\"score\":80}]}' WHERE id=$g3;"
 wait $bgpid
-v3=$(jq -r '.data.verdict' /tmp/loop-grade-pass.out 2>/dev/null)
-o3=$(jq -r '.data.overall' /tmp/loop-grade-pass.out 2>/dev/null)
+v3=$(jq -r '.data.verdict' "$TMP"/loop-grade-pass.out 2>/dev/null)
+o3=$(jq -r '.data.overall' "$TMP"/loop-grade-pass.out 2>/dev/null)
 [[ "$v3" == "pass" && "$o3" == "88" ]] \
-  && ok_t "--wait high score → pass (overall=$o3)" || bad_t "grade pass" "$(cat /tmp/loop-grade-pass.out)"
-l3=$(jq -r '.data.loopId' /tmp/loop-grade-pass.out 2>/dev/null)
+  && ok_t "--wait high score → pass (overall=$o3)" || bad_t "grade pass" "$(cat "$TMP"/loop-grade-pass.out)"
+l3=$(jq -r '.data.loopId' "$TMP"/loop-grade-pass.out 2>/dev/null)
 sc=$(db "SELECT scorecard_json FROM loop_runs WHERE loop_id='$l3';")
 scov=$(printf '%s' "$sc" | jq -r '.overall' 2>/dev/null)
 sccrit=$(printf '%s' "$sc" | jq -r '.criteria | length' 2>/dev/null)
@@ -91,32 +91,32 @@ sccrit=$(printf '%s' "$sc" | jq -r '.criteria | length' 2>/dev/null)
   && ok_t "scorecard_json persisted (overall=$scov, ${sccrit} criteria)" || bad_t "scorecard persist" "$sc"
 
 # --- T4: --wait, grader scores low → verdict fail
-( cmd_loop_grade --target="$TGT" --verifier=main --threshold=70 --wait=20 >/tmp/loop-grade-fail.out 2>&1 ) &
+( cmd_loop_grade --target="$TGT" --verifier=main --threshold=70 --wait=20 >"$TMP"/loop-grade-fail.out 2>&1 ) &
 bgpid=$!
 sleep 1; g4=$(latest_grade_child)
 db "UPDATE tasks SET status='done', result='{\"overall\":40,\"criteria\":[{\"name\":\"compile\",\"score\":40}]}' WHERE id=$g4;"
 wait $bgpid
-v4=$(jq -r '.data.verdict' /tmp/loop-grade-fail.out 2>/dev/null)
-[[ "$v4" == "fail" ]] && ok_t "--wait low score → fail" || bad_t "grade fail" "$(cat /tmp/loop-grade-fail.out)"
+v4=$(jq -r '.data.verdict' "$TMP"/loop-grade-fail.out 2>/dev/null)
+[[ "$v4" == "fail" ]] && ok_t "--wait low score → fail" || bad_t "grade fail" "$(cat "$TMP"/loop-grade-fail.out)"
 
 # --- T5: --wait, grader returns unparseable result → escalated (never silent pass)
-( cmd_loop_grade --target="$TGT" --verifier=main --wait=20 >/tmp/loop-grade-esc.out 2>&1 ) &
+( cmd_loop_grade --target="$TGT" --verifier=main --wait=20 >"$TMP"/loop-grade-esc.out 2>&1 ) &
 bgpid=$!
 sleep 1; g5=$(latest_grade_child)
 db "UPDATE tasks SET status='done', result='not json at all' WHERE id=$g5;"
 wait $bgpid
-v5=$(jq -r '.data.verdict' /tmp/loop-grade-esc.out 2>/dev/null)
-[[ "$v5" == "escalated" ]] && ok_t "--wait unparseable → escalated" || bad_t "grade escalate" "$(cat /tmp/loop-grade-esc.out)"
+v5=$(jq -r '.data.verdict' "$TMP"/loop-grade-esc.out 2>/dev/null)
+[[ "$v5" == "escalated" ]] && ok_t "--wait unparseable → escalated" || bad_t "grade escalate" "$(cat "$TMP"/loop-grade-esc.out)"
 
 # --- T6: kill mid-wait → killed
-( cmd_loop_grade --target="$TGT" --verifier=main --wait=20 >/tmp/loop-grade-kill.out 2>&1 ) &
+( cmd_loop_grade --target="$TGT" --verifier=main --wait=20 >"$TMP"/loop-grade-kill.out 2>&1 ) &
 bgpid=$!
 sleep 1
 klid=$(db "SELECT loop_id FROM loop_runs WHERE topology='grade' AND status='running' ORDER BY started_at DESC, rowid DESC LIMIT 1;")
 db "UPDATE loop_runs SET kill_requested=1 WHERE loop_id='$klid';"
 wait $bgpid
-kst=$(jq -r '.data.status' /tmp/loop-grade-kill.out 2>/dev/null)
-[[ "$kst" == "killed" ]] && ok_t "--wait halts on kill → killed" || bad_t "grade kill" "$(cat /tmp/loop-grade-kill.out)"
+kst=$(jq -r '.data.status' "$TMP"/loop-grade-kill.out 2>/dev/null)
+[[ "$kst" == "killed" ]] && ok_t "--wait halts on kill → killed" || bad_t "grade kill" "$(cat "$TMP"/loop-grade-kill.out)"
 
 # --- T7 (DIVE-860): `task loop ls --json` carries the latest grade scorecard per run
 lout=$(JSON_MODE=1 cmd_task_loop_start --title="graded loop" --owner=dev --steps='[{"agent":"dev","label":"do it"}]' 2>/dev/null)
@@ -124,7 +124,7 @@ LID=$(printf '%s' "$lout" | jq -r '.data.ident')
 lout2=$(JSON_MODE=1 cmd_task_loop_start --title="ungraded loop" --owner=dev --steps='[{"agent":"dev","label":"other"}]' 2>/dev/null)
 LID2=$(printf '%s' "$lout2" | jq -r '.data.ident')
 [[ "$LID" =~ ^DIVE- && "$LID2" =~ ^DIVE- ]] && ok_t "seed builder loops ($LID, $LID2)" || bad_t "seed builder loops" "$lout / $lout2"
-( cmd_loop_grade --target="$LID" --verifier=main --accept="loop completes" --wait=20 >/tmp/loop-grade-ls.out 2>&1 ) &
+( cmd_loop_grade --target="$LID" --verifier=main --accept="loop completes" --wait=20 >"$TMP"/loop-grade-ls.out 2>&1 ) &
 bgpid=$!
 sleep 1; g7=$(latest_grade_child)
 db "UPDATE tasks SET status='done', result='{\"overall\":84,\"criteria\":[{\"name\":\"loop completes\",\"score\":84,\"reason\":\"ok\"}]}' WHERE id=$g7;"
