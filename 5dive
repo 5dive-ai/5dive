@@ -26,7 +26,7 @@ esac
 
 # Bumped on every public release. `build.sh` checks this line exists; CI fails
 # the bundle-drift check if it's missing or empty.
-readonly FIVE_VERSION="0.6.3"
+readonly FIVE_VERSION="0.6.4"
 
 # GitHub org our repos live under. The org is being renamed
 # 5dive-com -> 5dive-ai (2026-06); fetches must work on either side of the
@@ -737,6 +737,11 @@ AGENT_SKILLS_DIR="/usr/local/lib/5dive/skills"
 # applies to telegram-paired agents and used to live in the shared
 # projects-level CLAUDE.md, polluting every non-telegram agent's prompt.
 TELEGRAM_AGENT_CLAUDE_MD="/usr/local/lib/5dive/telegram-agent-CLAUDE.md"
+# Self-gated model-tiering default appended to EVERY claude agent's per-agent
+# CLAUDE.md (DIVE-899): Fable-as-orchestrator + explicit per-subagent model
+# choice. The fragment's own first line scopes it to Fable sessions, so it is
+# inert on every other model — safe as a universal default.
+MODEL_TIERING_CLAUDE_MD="/usr/local/lib/5dive/model-tiering-CLAUDE.md"
 
 # Preseed a claude-family agent's home dir so:
 #   - 'claude --dangerously-skip-permissions' doesn't hit the first-run
@@ -910,6 +915,16 @@ JSON
     else
       warn "$TELEGRAM_AGENT_CLAUDE_MD missing — per-agent telegram CLAUDE.md not wired (run: curl -fsSL https://raw.githubusercontent.com/$(gh_org)/5dive/main/install.sh | sudo bash)"
     fi
+  fi
+
+  # DIVE-899: append the model-tiering default to the per-agent CLAUDE.md —
+  # AFTER the telegram fragment's whole-file cp so both survive. Runs for every
+  # claude agent (telegram or not); creates the file when no fragment did.
+  # Best-effort like the telegram fragment: a missing source never fails create.
+  if [[ -f "$MODEL_TIERING_CLAUDE_MD" ]]; then
+    { [[ -s "$home/.claude/CLAUDE.md" ]] && printf '\n'; cat "$MODEL_TIERING_CLAUDE_MD"; } \
+      | sudo -u "$user" tee -a "$home/.claude/CLAUDE.md" >/dev/null
+    chmod 644 "$home/.claude/CLAUDE.md"
   fi
 
   # Default skills, best-effort: if npx isn't reachable yet (cold box, no network)

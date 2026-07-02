@@ -281,6 +281,13 @@ DIGESTCRON
   chmod 644 "$LIB_DIR/telegram-agent-CLAUDE.md"
   ok "telegram-agent-CLAUDE.md"
 
+  # CLAUDE.md fragment appended to every claude-type agent's $HOME/.claude/
+  # CLAUDE.md at create: the self-gated Fable-orchestrator + per-subagent
+  # model-tiering default (DIVE-899 — inert unless the session model is Fable).
+  curl -fsSL "$REPO/model-tiering-CLAUDE.md" -o "$LIB_DIR/model-tiering-CLAUDE.md"
+  chmod 644 "$LIB_DIR/model-tiering-CLAUDE.md"
+  ok "model-tiering-CLAUDE.md"
+
   # Curated team templates for `5dive team import <slug>` (the compose engine
   # resolves $LIB_DIR/team-templates first). Enumerated explicitly because $REPO
   # is a flat fetch URL with no directory listing — add a line per new template.

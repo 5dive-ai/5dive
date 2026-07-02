@@ -11,6 +11,17 @@ release.
 
 ### Added
 
+- DIVE-899: every claude agent's per-agent CLAUDE.md now carries the
+  self-gated model-tiering default (Fable-as-orchestrator + explicit
+  per-subagent model choice: sonnet for mechanical work, opus for
+  judgment-heavy work, haiku never). The fragment's first line scopes it to
+  Fable sessions, so it is inert on every other model. New
+  `model-tiering-CLAUDE.md` shipped to $LIB_DIR by install.sh; appended (not
+  copied) after the telegram fragment so both survive. From the DIVE-881
+  sniff-test verdict. Version 0.6.3 -> 0.6.4.
+
+### Added
+
 - DIVE-897 (DIVE-726 Phase 1b): the memory write/compile path + search scoping.
   `5dive memory add --name --description [--type] [--store=mine|wiki] [--tags]
   [--force]` (body on stdin) writes a frontmatter-stamped memory file with
