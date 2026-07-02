@@ -26,7 +26,7 @@ esac
 
 # Bumped on every public release. `build.sh` checks this line exists; CI fails
 # the bundle-drift check if it's missing or empty.
-readonly FIVE_VERSION="0.5.5"
+readonly FIVE_VERSION="0.5.6"
 
 # GitHub org our repos live under. The org is being renamed
 # 5dive-com -> 5dive-ai (2026-06); fetches must work on either side of the
@@ -9243,6 +9243,11 @@ cmd_start() {
   [[ -n "$name" ]] || fail "$E_USAGE" "usage: 5dive agent start <name>"
   require_agent "$name"
   systemctl start "5dive-agent@${name}.service" >&2
+  # DIVE-857 prereq (b): record the operator's intent so the supervisor can
+  # tell a crashed unit from a deliberate stop without inference.
+  local reg; reg=$(registry_read)
+  reg=$(jq --arg n "$name" '.agents[$n].desiredState = "running"' <<<"$reg") \
+    && echo "$reg" | registry_write
   ok "agent '$name' started." \
      '{name:$n, action:"start"}' --arg n "$name"
 }
@@ -9252,6 +9257,9 @@ cmd_stop() {
   [[ -n "$name" ]] || fail "$E_USAGE" "usage: 5dive agent stop <name>"
   require_agent "$name"
   systemctl stop "5dive-agent@${name}.service" >&2
+  local reg; reg=$(registry_read)
+  reg=$(jq --arg n "$name" '.agents[$n].desiredState = "stopped"' <<<"$reg") \
+    && echo "$reg" | registry_write
   ok "agent '$name' stopped." \
      '{name:$n, action:"stop"}' --arg n "$name"
 }
@@ -16942,6 +16950,19 @@ _SUP_POLLER_GRACE_SEC=120
 # sentinel exists. Same file-sentinel pattern as gate-proof.enforce — root
 # touches it to enable, removes it to disable; no registry churn.
 _SUP_ENABLED_FLAG="${STATE_DIR}/supervisor.enabled"
+# P2 (DIVE-857): actions have their OWN sentinel, separate from observe — ticks
+# collect audit evidence while the ladder stays dormant. Absent flag => the
+# tick records 'planned' rows (what WOULD have fired) instead of acting.
+# lodar pre-cleared enabling (gate answered 2026-07-02) conditional on a clean
+# zero-false-positive audit week; root touches this file on/after Jul 9.
+_SUP_ACTIONS_FLAG="${STATE_DIR}/supervisor.actions.enabled"
+# Ladder pacing (design §5): gap before the NEXT action on an agent is
+# base * 2^attempts (20m/40m/80m against the 10m tick); past max attempts the
+# supervisor stops acting and escalates once per window.
+_SUP_ACT_BASE_MIN="${SUPERVISOR_ACT_BASE_MIN:-20}"
+[[ "$_SUP_ACT_BASE_MIN" =~ ^[0-9]+$ ]] || _SUP_ACT_BASE_MIN=20
+_SUP_ACT_WINDOW_H=6
+_SUP_ACT_MAX_ATTEMPTS=3
 
 _sup_usage() {
   cat <<USAGE
@@ -17013,7 +17034,7 @@ _sup_cli_check() {
 # Detect + classify ONE agent -> one compact JSON record on stdout.
 # args: name type channels unit user tmux-session home now-epoch
 _sup_agent_record() {
-  local name="$1" type="$2" channels="$3" unit="$4" user="$5" sess="$6" home="$7" now="$8"
+  local name="$1" type="$2" channels="$3" unit="$4" user="$5" sess="$6" home="$7" now="$8" desired="${9:-}"
 
   # --- signal: systemd unit state + uptime (for the poller boot grace) ---
   local props active sub ts_str uptime=0
@@ -17093,9 +17114,14 @@ _sup_agent_record() {
   # `5dive agent stop` is an operator choice, and the registry has no
   # desired-state field to tell us otherwise.
   local class="healthy" cause="" detail=""
-  if (( ! svc_running )); then
-    if [[ "$active" == "failed" ]] || (( has_work )); then
-      class="stuck"; cause="service-dead"; detail="unit ${active:-unknown}"
+  # desiredState (P2, DIVE-857 prereq b): an operator's explicit stop/start
+  # beats inference. Recorded by `5dive agent stop|start`; absent on legacy
+  # agents => the P1 inference path below, unchanged.
+  if [[ "$desired" == "stopped" ]] && (( ! svc_running )) && [[ "$active" != "failed" ]]; then
+    detail="stopped (desired)"
+  elif (( ! svc_running )); then
+    if [[ "$active" == "failed" ]] || (( has_work )) || [[ "$desired" == "running" ]]; then
+      class="stuck"; cause="service-dead"; detail="unit ${active:-unknown}${desired:+ (desired: $desired)}"
     else
       detail="stopped (no active work)"
     fi
@@ -17153,8 +17179,9 @@ _sup_snapshot() {
   for name in $(jq -r '.agents | keys[]' <<<"$reg" 2>/dev/null); do
     type=$(jq     -r --arg n "$name" '.agents[$n].type // "claude"'     <<<"$reg")
     channels=$(jq -r --arg n "$name" '.agents[$n].channels // "none"'   <<<"$reg")
+    local desired; desired=$(jq -r --arg n "$name" '.agents[$n].desiredState // ""' <<<"$reg")
     rows+=$(_sup_agent_record "$name" "$type" "$channels" \
-      "5dive-agent@${name}.service" "agent-${name}" "agent-${name}" "/home/agent-${name}" "$now")
+      "5dive-agent@${name}.service" "agent-${name}" "agent-${name}" "/home/agent-${name}" "$now" "$desired")
     rows+=$'\n'
   done
   local cs_enabled cs_active
@@ -17231,6 +17258,65 @@ _sup_watch() {
 # (including recovery back to healthy, so the trail shows both edges). The
 # previous classification is derived from the agent's latest event row —
 # healthy when it has none — so the tick needs no extra state file.
+# ── P2 (DIVE-857): recovery ladder — ACT + ESCALATE (design §5–6) ───────────
+# Auto-act is deliberately narrow: claude-type agents, causes where the session
+# is alive but wedged (no-progress, loop-stuck). Everything else stuck needs
+# rung 4+ (restart/reprovision = P3/manual), so it ESCALATES: one audit row per
+# window, zero mutations. Rungs, in order: nudge -> resume -> rotate.
+
+# attempts + last-action epoch for an agent inside the rolling window, straight
+# from the audit trail (no extra state file — same principle as the tick's
+# transition detection). Echoes "attempts lastEpoch" (lastEpoch=0 when none).
+_sup_act_history() {
+  local name="$1" n last
+  n=$(db "SELECT COUNT(*) FROM supervisor_events
+          WHERE agent=$(sqlq "$name") AND event='action'
+            AND ts >= datetime('now', '-${_SUP_ACT_WINDOW_H} hours');" 2>/dev/null || echo 0)
+  last=$(db "SELECT COALESCE(strftime('%s', MAX(ts)), 0) FROM supervisor_events
+             WHERE agent=$(sqlq "$name") AND event='action'
+               AND ts >= datetime('now', '-${_SUP_ACT_WINDOW_H} hours');" 2>/dev/null || echo 0)
+  echo "${n:-0} ${last:-0}"
+}
+
+# Pure decision, no side effects: echoes "verb [reason]" where verb is one of
+# nudge|resume|rotate|escalate|defer. Attempt N picks rung N+1; the gap before
+# the next action is base * 2^attempts; ladder exhausted / unreachable rung
+# => escalate.
+_sup_act_plan() {  # <type> <cause> <attempts> <last_epoch> <now> <rotation_enabled>
+  local type="$1" cause="$2" attempts="$3" last="$4" now="$5" rot="$6"
+  case "$cause" in
+    no-progress|loop-stuck) : ;;
+    *) echo "escalate rung-4-needed"; return ;;
+  esac
+  [[ "$type" == "claude" ]] || { echo "escalate non-claude-runtime"; return; }
+  (( attempts >= _SUP_ACT_MAX_ATTEMPTS )) && { echo "escalate ladder-exhausted"; return; }
+  local gap=$(( _SUP_ACT_BASE_MIN * 60 * (1 << attempts) ))
+  if (( last > 0 && now - last < gap )); then echo "defer backoff"; return; fi
+  case "$attempts" in
+    0) echo "nudge" ;;
+    1) echo "resume" ;;
+    2) if [[ "$rot" == "true" ]]; then echo "rotate"; else echo "escalate rotation-disabled"; fi ;;
+  esac
+}
+
+# Execute one rung. Returns nonzero, never exits — one bad agent can't abort
+# the tick (rotation's fail() is contained in a subshell).
+_sup_act_exec() {  # <name> <verb> <cause>
+  local name="$1" verb="$2" cause="$3"
+  case "$verb" in
+    nudge)
+      _hb_send_line "$name" "[supervisor] You look stalled (${cause}). Pick your in-progress task back up and continue; if genuinely blocked, say why on the task." ;;
+    resume)
+      # Clear a wedged modal/prompt first, then ask for plain continuation.
+      sudo -u "agent-${name}" tmux send-keys -t "agent-${name}" Escape 2>/dev/null || return 1
+      sleep 1
+      _hb_send_line "$name" "continue" ;;
+    rotate)
+      ( with_registry_lock cmd_agent_rotation_rotate "$name" ) >/dev/null 2>&1 ;;
+    *) return 1 ;;
+  esac
+}
+
 cmd_supervisor_tick() {
   require_root "supervisor --tick"
   if [[ ! -f "$_SUP_ENABLED_FLAG" ]]; then
@@ -17261,22 +17347,79 @@ cmd_supervisor_tick() {
     fi
   done < <(jq -c '.[]' <<<"$snap")
 
-  # ── P2 GOES HERE: the recovery ladder (ACT + ESCALATE, design §5–6) ─────────
-  # nudge -> resume -> rotate -> restart, lowest rung matching the cause, with
-  # exponential backoff + max attempts + a full audit row per action, and
-  # escalate-not-act for anything irreversible (reprovision stays manual
-  # forever). P1 is observe-only BY SCOPE (owner-locked): do not add actions
-  # here without the P2 sign-off.
-  # ─────────────────────────────────────────────────────────────────────────────
+  # ── P2 (DIVE-857): ACT + ESCALATE — pre-cleared by lodar 2026-07-02, gated on
+  # $_SUP_ACTIONS_FLAG until the audit week (started 2026-07-02) is clean.
+  # Dormant mode writes 'planned' rows: the Jul 9 review reads exactly what the
+  # ladder WOULD have done all week. restart stays P3; reprovision manual.
+  local actions_on="false" acted=0 planned=0 escalated=0 now_s
+  [[ -f "$_SUP_ACTIONS_FLAG" ]] && actions_on="true"
+  now_s=$(date +%s)
+  local reg_now; reg_now=$(registry_read)
+  while IFS= read -r row; do
+    [[ -n "$row" ]] || continue
+    class=$(jq -r '.classification' <<<"$row")
+    [[ "$class" == "stuck" ]] || continue
+    name=$(jq -r '.name' <<<"$row"); cause=$(jq -r '.cause // ""' <<<"$row")
+    local atype rot attempts last plan verb reason
+    atype=$(jq -r '.type' <<<"$row")
+    rot=$(jq -r --arg n "$name" '.agents[$n].rotation.enabled // false' <<<"$reg_now")
+    read -r attempts last <<<"$(_sup_act_history "$name")"
+    plan=$(_sup_act_plan "$atype" "$cause" "$attempts" "$last" "$now_s" "$rot")
+    read -r verb reason <<<"$plan"
+    case "$verb" in
+      defer|"") continue ;;
+      escalate)
+        local esc
+        esc=$(db "SELECT COUNT(*) FROM supervisor_events
+                  WHERE agent=$(sqlq "$name") AND event='escalate'
+                    AND ts >= datetime('now', '-${_SUP_ACT_WINDOW_H} hours');" 2>/dev/null || echo 0)
+        (( esc > 0 )) && continue
+        db "INSERT INTO supervisor_events (agent, event, classification, cause, signals)
+            VALUES ($(sqlq "$name"), 'escalate', 'stuck', $(sqlq_or_null "$cause"),
+                    $(sqlq "{\"reason\":\"${reason}\",\"attempts\":${attempts}}"));" 2>/dev/null \
+          && { escalated=$((escalated + 1)); events=$((events + 1)); } \
+          || warn "supervisor: escalate insert failed for $name"
+        warn "supervisor: ESCALATE $name ($cause: $reason) — needs rung-4+/human"
+        ;;
+      nudge|resume|rotate)
+        if [[ "$actions_on" == "true" ]]; then
+          local rc=0 res="ok"
+          _sup_act_exec "$name" "$verb" "$cause" || { rc=$?; res="failed"; }
+          db "INSERT INTO supervisor_events (agent, event, classification, cause, signals)
+              VALUES ($(sqlq "$name"), 'action', 'stuck', $(sqlq_or_null "$cause"),
+                      $(sqlq "{\"rung\":\"${verb}\",\"attempt\":$((attempts + 1)),\"result\":\"${res}\"}"));" 2>/dev/null \
+            && { acted=$((acted + 1)); events=$((events + 1)); } \
+            || warn "supervisor: action insert failed for $name"
+        else
+          # One planned row per agent per window — evidence, not spam.
+          local pln
+          pln=$(db "SELECT COUNT(*) FROM supervisor_events
+                    WHERE agent=$(sqlq "$name") AND event='planned'
+                      AND ts >= datetime('now', '-${_SUP_ACT_WINDOW_H} hours');" 2>/dev/null || echo 0)
+          (( pln > 0 )) && continue
+          db "INSERT INTO supervisor_events (agent, event, classification, cause, signals)
+              VALUES ($(sqlq "$name"), 'planned', 'stuck', $(sqlq_or_null "$cause"),
+                      $(sqlq "{\"rung\":\"${verb}\",\"attempt\":$((attempts + 1)),\"dormant\":true}"));" 2>/dev/null \
+            && { planned=$((planned + 1)); events=$((events + 1)); } \
+            || warn "supervisor: planned insert failed for $name"
+        fi
+        ;;
+    esac
+  done < <(jq -c '.[]' <<<"$snap")
 
   local total healthy slow stuck
   total=$(jq 'length' <<<"$snap")
   healthy=$(jq '[.[] | select(.classification == "healthy")] | length' <<<"$snap")
   slow=$(jq  '[.[] | select(.classification == "slow")]    | length' <<<"$snap")
   stuck=$(jq '[.[] | select(.classification == "stuck")]   | length' <<<"$snap")
-  ok "supervisor tick: ${total} agents — ${healthy} healthy / ${slow} slow / ${stuck} stuck · ${events} audit row(s)" \
-     '{enabled:true, agents:($t|tonumber), healthy:($h|tonumber), slow:($sl|tonumber), stuck:($st|tonumber), auditRows:($e|tonumber)}' \
-     --arg t "$total" --arg h "$healthy" --arg sl "$slow" --arg st "$stuck" --arg e "$events"
+  local act_note=""
+  if [[ "$actions_on" == "true" ]]; then act_note=" · actions ON: ${acted} acted / ${escalated} escalated"
+  elif (( planned + escalated > 0 )); then act_note=" · dormant: ${planned} planned / ${escalated} escalated"
+  fi
+  ok "supervisor tick: ${total} agents — ${healthy} healthy / ${slow} slow / ${stuck} stuck · ${events} audit row(s)${act_note}" \
+     '{enabled:true, agents:($t|tonumber), healthy:($h|tonumber), slow:($sl|tonumber), stuck:($st|tonumber), auditRows:($e|tonumber), actionsEnabled:($ae == "true"), acted:($ac|tonumber), planned:($pl|tonumber), escalated:($es|tonumber)}' \
+     --arg t "$total" --arg h "$healthy" --arg sl "$slow" --arg st "$stuck" --arg e "$events" \
+     --arg ae "$actions_on" --arg ac "$acted" --arg pl "$planned" --arg es "$escalated"
 }
 
 cmd_supervisor() {
