@@ -1766,25 +1766,26 @@ cmd_task_answer() {
     fi
   fi
 
-  # DIVE-519: human-origin PROOF — the SECOND line for approval/secret, catching
-  # the agent->sudo->root bypass the agent-* check above can't see. The trusted
-  # paths attach --proof minted from the root-only 0400 key (plugin tap,
-  # dashboard/shelld, human-on-box via `5dive gate-proof`). We ALWAYS audit the
-  # attempt; we only REJECT a missing/invalid proof once enforcement is flipped on
-  # (`gate-proof enforce on`), so this ships DORMANT until the plugin mint is
-  # confirmed live on the box (else live taps that can't mint yet fail closed).
-  # Bar-raise, not airtight: a sudo-agent could mint its own proof, but only via a
-  # loud, audited `sudo 5dive gate-proof` — never a silent one-liner.
+  # DIVE-916/950: hard human gates (approval/secret/manual) need HUMAN evidence
+  # beyond the agent-* uid block above — that block sees `sudo`->root as non-agent,
+  # so it cannot catch the agent->sudo->root path. The trusted human paths supply
+  # ONE of two evidence forms (see below): the per-gate --human-proof nonce (the
+  # plugin tap, whose SUDO_UID is the spawning agent) or a non-agent SUDO_UID (the
+  # dashboard exec as claude, the DIVE-931 drop write, a human-on-box login). We
+  # ALWAYS audit the attempt; we only REJECT when NEITHER form is present, and only
+  # once enforcement is flipped on (`gate-proof enforce on`). Ships DORMANT until
+  # the nonce-carrying plugin is confirmed live FLEET-WIDE (else a live tap that
+  # can't supply the nonce yet would fail closed). DIVE-950 dropped the old DIVE-519
+  # --proof form: it was agent-forgeable via the require_root `gate-proof` mint.
   #
   # DIVE-525 (UX): a HUMAN's tap must NEVER be rejected — "you tapped but it's not
-  # enough" is the exact confusion lodar hit dogfooding. So when enforcement is on
-  # we reject ONLY an agent-path answer (no --human) that lacks a valid proof. A
-  # --human answer (the trusted plugin tap / dashboard / human-on-box paths all set
-  # it) ALWAYS clears, even if the box couldn't mint a proof yet (mid-rollout) — we
-  # still audit it (valid=0 + human=1 flags a rollout gap, never a dead-ended human).
-  # The agent-* uid block above + this agent-path-needs-proof rule are what actually
-  # stop the DIVE-515/516 incident (an agent silently self-clearing); humans are
-  # never blocked. Consistent with the agreed bar-raise scope (not airtight).
+  # enough" is the exact confusion lodar hit dogfooding. Under enforcement we reject
+  # ONLY when no evidence form is present (the forge: an agent's bare
+  # `sudo task answer --human`, SUDO_UID=agent, no nonce). Every trusted path
+  # supplies at least one form, so a real human is never blocked. The agent-* uid
+  # block above + this rule stop the DIVE-515/516 incident (an agent silently
+  # self-clearing). Bar-raise scope: closes the one-liner + the easy sudo-mint
+  # forge, NOT a determined root-sudo agent (separate sudo-reduction track).
   if [[ "$nt" == "approval" || "$nt" == "secret" || "$nt" == "manual" ]]; then
     # DIVE-916/950: TWO EQUIVALENT human-evidence forms — accept EITHER one, never
     # require both (double-gating a real tap violates DIVE-525):
