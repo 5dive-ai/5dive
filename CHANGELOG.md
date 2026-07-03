@@ -9,6 +9,20 @@ release.
 
 ## [Unreleased]
 
+### Changed
+
+- DIVE-906 (create-path token hygiene, part 2 of DIVE-888): `agent create`
+  now accepts `--telegram-token=-` and `--discord-token=-`, reading the bot
+  token from stdin (same `-` sentinel as `--api-key=-` / `config set
+  *.token=-`) so it never lands in argv (and thus never in `ps`). The exec
+  tunnel exposes a single stdin channel, so at most one `=-` sentinel is
+  allowed per create — a BYO `--api-key=-` combined with a channel
+  `--token=-` is rejected up front with a clear usage error rather than
+  blocking on a second `cat`. The dashboard new-agent wizard pipes the pasted
+  bot token on stdin when no BYO key is present (BYO key keeps stdin when both
+  are supplied; the channel token then stays inline as the documented
+  residual).
+
 ### Fixed
 
 - DIVE-901: `agent install antigravity` no longer flakes with "agy still

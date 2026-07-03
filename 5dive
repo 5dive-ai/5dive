@@ -26,7 +26,7 @@ esac
 
 # Bumped on every public release. `build.sh` checks this line exists; CI fails
 # the bundle-drift check if it's missing or empty.
-readonly FIVE_VERSION="0.6.5"
+readonly FIVE_VERSION="0.6.6"
 
 # GitHub org our repos live under. The org is being renamed
 # 5dive-com -> 5dive-ai (2026-06); fetches must work on either side of the
@@ -5961,7 +5961,7 @@ cmd_create() {
     esac
     shift
   done
-  [[ -n "$name" ]] || fail "$E_USAGE" "usage: 5dive agent create <name> --type=<type> [--channels=none|telegram|discord|dashboard[,ch...]] [--telegram-token=<token>] [--telegram-cos=<child-username>] [--telegram-cos-avatar=<png>] [--telegram-home-channel=<id>] [--telegram-allowed-users=<csv>] [--workdir=<path>] [--auth-profile=<name>] [--provider=<id> --api-key=<key|->] [--with-skills=<spec>[,...]] [--no-skills] [--no-team-bot] [--defer-auth] [--isolation=admin|standard|sandboxed]"
+  [[ -n "$name" ]] || fail "$E_USAGE" "usage: 5dive agent create <name> --type=<type> [--channels=none|telegram|discord|dashboard[,ch...]] [--telegram-token=<token|->] [--telegram-cos=<child-username>] [--telegram-cos-avatar=<png>] [--telegram-home-channel=<id>] [--telegram-allowed-users=<csv>] [--discord-token=<token|->] [--workdir=<path>] [--auth-profile=<name>] [--provider=<id> --api-key=<key|->] [--with-skills=<spec>[,...]] [--no-skills] [--no-team-bot] [--defer-auth] [--isolation=admin|standard|sandboxed]"
   [[ -n "$type" ]] || fail "$E_USAGE" "--type is required"
   valid_name "$name" || fail "$E_VALIDATION" "invalid name (lowercase letters/digits/hyphens, start letter, <=16 chars)"
   is_known_type "$type" || fail "$E_NOT_FOUND" "unknown type: $type (known: ${!TYPE_BIN[*]})"
@@ -6025,6 +6025,23 @@ cmd_create() {
     fail "$E_VALIDATION" "channels=dashboard is claude-only (got type=$type)"
   fi
 
+  # DIVE-906: secrets via stdin, never argv. The "-" sentinel on --api-key,
+  # --telegram-token, and --discord-token reads that value from stdin (same
+  # contract as `config set *.token=-`, DIVE-880/888) so it never appears in
+  # argv (and thus never in `ps`). The exec tunnel exposes a SINGLE stdin
+  # channel, so at most ONE `=-` sentinel can be used per create — reject the
+  # combination up front rather than blocking forever on a second `cat` that
+  # will never receive input. Counted here (before the byo cat below rewrites
+  # byo_api_key) so all three are still their raw sentinel values.
+  local _stdin_sentinels=0
+  # Pre-increment: `(( x++ ))` returns exit 1 when the pre-value is 0, which
+  # trips `set -e`; `(( ++x ))` yields the new (>=1, truthy) value.
+  [[ "$byo_api_key" == "-" ]]    && (( ++_stdin_sentinels ))
+  [[ "$telegram_token" == "-" ]] && (( ++_stdin_sentinels ))
+  [[ "$discord_token" == "-" ]]  && (( ++_stdin_sentinels ))
+  (( _stdin_sentinels <= 1 )) \
+    || fail "$E_USAGE" "only one of --api-key=- / --telegram-token=- / --discord-token=- can read from stdin per create (the exec tunnel has a single stdin channel)"
+
   # BYO API-key path for hermes/openclaw (--provider=<canonical> + --api-key=<key|->).
   # Mutually exclusive with --defer-auth: BYO is the alternative to "I'll sign in
   # later", not an add-on. The key sentinel "-" reads from stdin so the value
@@ -6055,6 +6072,20 @@ cmd_create() {
     fi
     valid_api_key "$byo_api_key" \
       || fail "$E_VALIDATION" "api key looks wrong (expected >=10 printable non-space chars)"
+  fi
+
+  # DIVE-906: drain the channel-token stdin sentinels. The guard above
+  # guarantees at most one `=-` sentinel across api-key/telegram/discord, so if
+  # the byo cat above already consumed stdin these are literal values (not "-")
+  # and neither branch fires. Format validation happens in the channel blocks
+  # below (valid_telegram_token / the discord non-empty check).
+  if [[ "$telegram_token" == "-" ]]; then
+    [[ -t 0 ]] && fail "$E_USAGE" "--telegram-token=- expects the bot token on stdin, stdin is a TTY"
+    telegram_token=$(cat)
+  fi
+  if [[ "$discord_token" == "-" ]]; then
+    [[ -t 0 ]] && fail "$E_USAGE" "--discord-token=- expects the bot token on stdin, stdin is a TTY"
+    discord_token=$(cat)
   fi
 
   # Resolve --with-skills. Default policy: when this create call is being made
