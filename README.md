@@ -1,4 +1,4 @@
-# 5dive: Multi-agent orchestrator for Claude Code agents, in 99.4% bash
+# 5dive: run a company of AI agents on a server you own
 
 [![install-smoke](https://github.com/5dive-ai/5dive/actions/workflows/install-smoke.yml/badge.svg)](https://github.com/5dive-ai/5dive/actions/workflows/install-smoke.yml)
 [![bundle-drift](https://github.com/5dive-ai/5dive/actions/workflows/bundle-drift.yml/badge.svg)](https://github.com/5dive-ai/5dive/actions/workflows/bundle-drift.yml)
