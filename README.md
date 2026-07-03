@@ -271,7 +271,9 @@ Use GitHub's private reporting: **[Report a vulnerability →](https://github.co
 </details>
 
 <details>
-<summary><b>For your AI agent</b></summary>
+<summary><b>Drive 5dive from the AI agent you already have</b></summary>
+
+### For your AI agent
 
 If you already use Claude Code / Codex / Antigravity / Grok / opencode, paste this prompt. Your agent installs 5dive, learns the skill, then keeps managing agents through chat:
 
