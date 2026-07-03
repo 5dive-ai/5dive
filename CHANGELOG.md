@@ -11,6 +11,16 @@ release.
 
 ### Changed
 
+- DIVE-909: a standalone (non-loop) **manual** human-gate answered `done` now
+  closes the task as **done** instead of flipping it back to `todo`. Previously
+  completed work parked behind a manual gate had no honest close — the agent
+  can't `task done` (blocked by its own pending gate, DIVE-555) and the only
+  agent-allowed escape was `task cancel`, which mislabels finished work as
+  cancelled (DIVE-524). The already-shipped `✅ Done` Telegram tap
+  (`tna:<id>:done` → `task answer --value=done`) now lands on this path and
+  closes cleanly across every runtime — no plugin/fork change needed. A
+  non-`done` answer still clears the gate → `todo` (the resume path), and loop
+  GATE steps are exempt (their manual answer still drives the relay advance).
 - DIVE-906 (create-path token hygiene, part 2 of DIVE-888): `agent create`
   now accepts `--telegram-token=-` and `--discord-token=-`, reading the bot
   token from stdin (same `-` sentinel as `--api-key=-` / `config set

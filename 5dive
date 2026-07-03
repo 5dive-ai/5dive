@@ -26,7 +26,7 @@ esac
 
 # Bumped on every public release. `build.sh` checks this line exists; CI fails
 # the bundle-drift check if it's missing or empty.
-readonly FIVE_VERSION="0.6.6"
+readonly FIVE_VERSION="0.6.7"
 
 # GitHub org our repos live under. The org is being renamed
 # 5dive-com -> 5dive-ai (2026-06); fetches must work on either side of the
@@ -14051,7 +14051,7 @@ task_need_notify() {
   # as a human login (claude/root — the human path clears approval/secret gates).
   case "$need_type" in
     secret) text+=$'\n\n'"🔑 Put the key where I expect it (my .env / our channel), then tap ✅ Provided below — don't paste the key here. Tap not working? On the box: sudo 5dive task answer ${ident}" ;;
-    manual) text+=$'\n\n'"✋ Tap ✅ Done below once it's handled — or on the box: sudo 5dive task answer ${ident} --value=done" ;;
+    manual) text+=$'\n\n'"✋ Tap ✅ Done below once it's handled — closes this out. Or on the box: sudo 5dive task answer ${ident} --value=done" ;;
   esac
 
   # DIVE-117/118 tap-to-answer buttons. GATED to the plugin types whose `tna:`
@@ -14386,14 +14386,37 @@ cmd_task_answer() {
     db "UPDATE tasks SET need_answer=$(sqlq "$value"), need_answered_at=$(sqlq "$_ts"), need_answered_by=$(sqlq "$answered_by"), need_answered_uid=${_uidsql}, need_answer_sig=$(sqlq "$_sig") WHERE id=${id};"
   fi
 
-  # Clearing the gate ≠ unblocking. `status='blocked'` is overloaded (human
-  # gate AND task-task `block` edges), so RECOMPUTE rather than hardcode todo:
-  # flip to todo only if no block edges remain — same edge-check `unblock` does
-  # — else stay blocked (still waiting on another task). Answered-ness lives in
-  # need_answered_at, so the task already left the inbox regardless of status.
-  db "UPDATE tasks SET status='todo'
-      WHERE id=${id} AND status='blocked'
-        AND NOT EXISTS (SELECT 1 FROM task_deps WHERE task_id=${id});"
+  # DIVE-909: a standalone MANUAL gate answered "done" is the human saying "this
+  # is handled / complete" — close the task as DONE, not back to todo. Without
+  # this a park-marker holding COMPLETED work had no honest close: the agent
+  # can't `task done` (blocked by its own pending gate, DIVE-555) and the only
+  # agent-allowed escape was `task cancel`, which mislabels finished work as
+  # cancelled (DIVE-524). The already-shipped ✅ Done tap (tna:<id>:done ->
+  # `task answer --value=done`, DIVE-356) now lands here and closes cleanly — no
+  # plugin/fork change needed. Loop GATE steps are EXEMPT (_lk=gate:*): a manual
+  # answer there drives the relay advance below, which owns that status move.
+  local _lk; _lk=$(_loop_kind "$id")
+  local _close_done=0
+  if [[ "$nt" == "manual" && "$_lk" != gate:* ]]; then
+    local _dv; _dv=$(printf '%s' "${value:-}" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')
+    [[ "$_dv" == "done" ]] && _close_done=1
+  fi
+  if (( _close_done )); then
+    # Close as done + stamp a result IF empty (never clobber real work notes) so
+    # the dashboard/creator sees why it closed rather than a blank card.
+    db "UPDATE tasks SET status='done', done_at=datetime('now'),
+           result=CASE WHEN COALESCE(result,'')='' THEN 'Closed via manual-gate tap — marked done by '||$(sqlq "$answered_by") ELSE result END
+        WHERE id=${id};"
+  else
+    # Clearing the gate ≠ unblocking. `status='blocked'` is overloaded (human
+    # gate AND task-task `block` edges), so RECOMPUTE rather than hardcode todo:
+    # flip to todo only if no block edges remain — same edge-check `unblock` does
+    # — else stay blocked (still waiting on another task). Answered-ness lives in
+    # need_answered_at, so the task already left the inbox regardless of status.
+    db "UPDATE tasks SET status='todo'
+        WHERE id=${id} AND status='blocked'
+          AND NOT EXISTS (SELECT 1 FROM task_deps WHERE task_id=${id});"
+  fi
   local newstatus; newstatus=$(db "SELECT status FROM tasks WHERE id=${id};")
 
   # DIVE-552: a loop GATE step was just answered → advance the relay. Approve
@@ -14401,7 +14424,7 @@ cmd_task_answer() {
   # the next step; "Do better ↩" bounces to the previous step to redo (re-blocks
   # the gate by it; when that step re-completes the gate re-fires fresh). Reuses
   # _task_loop_advance + the block edges. Best-effort; never fails the answer.
-  local _lk; _lk=$(_loop_kind "$id")
+  # (_lk was resolved above for the DIVE-909 close-as-done check — reuse it.)
   # DIVE-560: a loop APPROVAL gate only advances on a HUMAN-cleared answer
   # (need_answered_by=human:*). The answer path above already blocks an agent
   # self-answering an approval gate; this makes the loop's "the final say is
@@ -14450,7 +14473,10 @@ cmd_task_answer() {
   # via `task show` (its own pane only). A stopped or non-agent owner just
   # yields pinged:false — it never fails the answer.
   local pinged=0
-  if [[ -n "$owner" ]]; then
+  # DIVE-909: a close-as-done manual gate needs no "resume the task" ping — the
+  # task is finished, not waiting to resume. Skip it (the `now done` output is
+  # the signal); pinging the owner to resume a closed task is just confusing.
+  if [[ -n "$owner" ]] && (( ! _close_done )); then
     local pingmsg
     if [[ "$nt" == "secret" ]]; then
       pingmsg="${ident} secret gate marked provided — resume the task and load the key from where it was placed (its .env / your own channel), NOT from the task."
