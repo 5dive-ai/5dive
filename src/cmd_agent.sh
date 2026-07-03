@@ -1978,7 +1978,7 @@ cmd_telegram_info() {
     || fail "$E_NOT_FOUND" "no agent named '$name'"
   local channels
   channels=$(jq -r --arg n "$name" '.agents[$n].channels' <<<"$reg")
-  [[ "$channels" == "telegram" ]] \
+  [[ ",$channels," == *",telegram,"* ]] \
     || fail "$E_VALIDATION" "agent '$name' has channels=$channels — telegram-info only applies to telegram"
 
   if (( ! refresh )); then
@@ -3263,7 +3263,7 @@ cmd_telegram_access_get() {
     || fail "$E_NOT_FOUND" "no agent named '$name'"
   type=$(jq -r --arg n "$name" '.agents[$n].type' <<<"$reg")
   channels=$(jq -r --arg n "$name" '.agents[$n].channels' <<<"$reg")
-  [[ "$channels" == "telegram" ]] \
+  [[ ",$channels," == *",telegram,"* ]] \
     || fail "$E_VALIDATION" "agent '$name' has channels=$channels — telegram-access only applies to telegram"
 
   local user="agent-${name}"
@@ -3310,7 +3310,7 @@ cmd_telegram_access_set() {
     || fail "$E_NOT_FOUND" "no agent named '$name'"
   type=$(jq -r --arg n "$name" '.agents[$n].type' <<<"$reg")
   channels=$(jq -r --arg n "$name" '.agents[$n].channels' <<<"$reg")
-  [[ "$channels" == "telegram" ]] \
+  [[ ",$channels," == *",telegram,"* ]] \
     || fail "$E_VALIDATION" "agent '$name' has channels=$channels — telegram-access only applies to telegram"
   local user="agent-${name}"
   local state_dir
@@ -3444,7 +3444,7 @@ cmd_telegram_pending_ignore() {
     || fail "$E_NOT_FOUND" "no agent named '$name'"
   type=$(jq -r --arg n "$name" '.agents[$n].type' <<<"$reg")
   channels=$(jq -r --arg n "$name" '.agents[$n].channels' <<<"$reg")
-  [[ "$channels" == "telegram" ]] \
+  [[ ",$channels," == *",telegram,"* ]] \
     || fail "$E_VALIDATION" "agent '$name' has channels=$channels — telegram-pending-ignore only applies to telegram"
 
   local user="agent-${name}"
@@ -3535,7 +3535,7 @@ cmd_telegram_resolve_handle() {
     claude|codex|grok|antigravity) ;;
     *) fail "$E_VALIDATION" "telegram-resolve-handle supports claude, codex, grok and antigravity agents (got type=$type)" ;;
   esac
-  [[ "$channels" == "telegram" ]] \
+  [[ ",$channels," == *",telegram,"* ]] \
     || fail "$E_VALIDATION" "agent '$name' has channels=$channels — telegram-resolve-handle only applies to telegram"
 
   local token_env="${CONNECTORS_DIR}/telegram-${name}.env"
@@ -3743,7 +3743,7 @@ PY
     # Remember this operator id box-wide so future agents auto-pair to it
     # (shared operator allowlist — DIVE-320/325).
     _operator_record "$preuser"
-    if [[ "$channels" == "telegram" ]]; then
+    if [[ ",$channels," == *",telegram,"* ]]; then
       send_welcome_message "$chat_id" "$bot_token" "$name" "$type"
     fi
     ok "agent '$name' paired with chat $chat_id." \
@@ -3870,7 +3870,7 @@ PY
   # Discord: the plugin's channel server polls approved/<senderId> and sends
   # its own "you're in" DM through the gateway — we don't need (and don't
   # have) a simple HTTP send path here.
-  if [[ "$channels" == "telegram" ]]; then
+  if [[ ",$channels," == *",telegram,"* ]]; then
     send_welcome_message "$chat_id" "$bot_token" "$name"
   fi
   ok "agent '$name' paired with chat $chat_id." \
