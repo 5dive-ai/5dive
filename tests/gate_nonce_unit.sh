@@ -54,6 +54,19 @@ id() { if [[ "${1:-}" == -un ]]; then echo "$FAKE_CALLER"; else command id "$@";
 seed_task() { db "INSERT INTO tasks (ident, title, status, created_by) VALUES ('$1','t','todo','main');"; }
 hashof() { printf '%s' "$1" | openssl dgst -sha256 | awk '{print $NF}'; }
 
+# Resolve a REAL agent-* uid explicitly. The evidence tests need a SUDO_UID that
+# `_gate_sudo_uid_nonagent` classifies as an agent (i.e. NOT human evidence); do
+# NOT source it from the caller (`command id -u`). Running the suite the standard
+# way (`sudo -u claude ...`) would make the caller a non-agent uid and flip
+# T3-wrong / T6-FORGE / T9 into FALSE failures. Prefer this box's agent-dev, else
+# the first agent-* user in passwd.
+AGENT_UID="$(getent passwd agent-dev 2>/dev/null | cut -d: -f3)"
+[[ -n "$AGENT_UID" ]] || AGENT_UID="$(getent passwd 2>/dev/null | awk -F: '$1 ~ /^agent-/{print $3; exit}')"
+if [[ -z "$AGENT_UID" ]]; then
+  echo "gate_nonce_unit: SKIP — no agent-* user on this host to source a real agent uid"
+  exit 0
+fi
+
 # --- T1: approval/secret/manual gates mint a 64-hex human_nonce_hash ----------
 _t1n=100
 for ty in approval secret manual; do
@@ -93,12 +106,12 @@ touch "$GATE_PROOF_ENFORCE"   # enforcement ON for T3-T8
 
 # --- T3: (a) valid --human-proof nonce clears; wrong nonce rejected -----------
 seed_gate_known DIVE-301 KNOWNNONCE123
-SUDO_UID="$(command id -u)" cmd_task_answer DIVE-301 --value=approved --human --human-proof=KNOWNNONCE123 >/dev/null 2>&1
+SUDO_UID="$AGENT_UID" cmd_task_answer DIVE-301 --value=approved --human --human-proof=KNOWNNONCE123 >/dev/null 2>&1
 [[ "$(answered DIVE-301)" == "closed" ]] && ok_t "T3 valid --human-proof clears (SUDO_UID=agent)" \
   || bad_t "T3 valid --human-proof clears" "still $(answered DIVE-301)"
 
 seed_gate_known DIVE-302 KNOWNNONCE123
-out=$(SUDO_UID="$(command id -u)" cmd_task_answer DIVE-302 --value=approved --human --human-proof=WRONG 2>&1); rc=$?
+out=$(SUDO_UID="$AGENT_UID" cmd_task_answer DIVE-302 --value=approved --human --human-proof=WRONG 2>&1); rc=$?
 [[ "$(answered DIVE-302)" == "open" && $rc -ne 0 ]] && ok_t "T3 wrong --human-proof rejected" \
   || bad_t "T3 wrong --human-proof rejected" "rc=$rc state=$(answered DIVE-302)"
 
@@ -107,7 +120,7 @@ _gate_proof_ensure_key 2>/dev/null; ( umask 077; openssl rand -hex 32 > "$GATE_P
 seed_task DIVE-400; cmd_task_need DIVE-400 --type=approval --ask="approve?" >/dev/null 2>&1
 nid=$(db "SELECT id FROM tasks WHERE ident='DIVE-400';")
 tok=$(_gate_proof_mint "$nid" approval)
-SUDO_UID="$(command id -u)" cmd_task_answer DIVE-400 --value=approved --human --proof="$tok" >/dev/null 2>&1
+SUDO_UID="$AGENT_UID" cmd_task_answer DIVE-400 --value=approved --human --proof="$tok" >/dev/null 2>&1
 [[ "$(answered DIVE-400)" == "closed" ]] && ok_t "T4 valid DIVE-519 --proof clears" \
   || bad_t "T4 valid DIVE-519 --proof clears" "still $(answered DIVE-400)"
 
@@ -121,7 +134,6 @@ SUDO_UID=0 cmd_task_answer DIVE-500 --human --from=drop >/dev/null 2>&1
 # id -un=root (post-sudo, passes the DIVE-394 block) but SUDO_UID=agent uid and
 # no nonce/proof -> no evidence -> rejected under enforcement.
 seed_task DIVE-600; cmd_task_need DIVE-600 --type=approval --ask="approve?" >/dev/null 2>&1
-AGENT_UID="$(command id -u)"   # this test runs as agent-dev -> an agent uid
 out=$(SUDO_UID="$AGENT_UID" cmd_task_answer DIVE-600 --value=approved --human 2>&1); rc=$?
 [[ "$(answered DIVE-600)" == "open" && $rc -ne 0 ]] && ok_t "T6 FORGE rejected (agent SUDO_UID, bare --human, enforce on)" \
   || bad_t "T6 FORGE rejected" "rc=$rc state=$(answered DIVE-600) out=$out"
@@ -145,7 +157,7 @@ FAKE_CALLER="root"
 
 # --- T9: _gate_sudo_uid_nonagent direct logic --------------------------------
 SUDO_UID=0 _gate_sudo_uid_nonagent && ok_t "T9 SUDO_UID=root -> non-agent" || bad_t "T9 root non-agent" ""
-SUDO_UID="$(command id -u)" _gate_sudo_uid_nonagent && bad_t "T9 agent uid -> should be agent" "" || ok_t "T9 agent SUDO_UID -> agent (not evidence)"
+SUDO_UID="$AGENT_UID" _gate_sudo_uid_nonagent && bad_t "T9 agent uid -> should be agent" "" || ok_t "T9 agent SUDO_UID -> agent (not evidence)"
 
 echo "-----"
 printf 'gate_nonce_unit: %d passed, %d failed\n' "$PASS" "$FAIL"

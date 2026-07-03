@@ -1671,9 +1671,9 @@ cmd_gate_proof() {
     require_root "gate-proof enforce"
     case "${2:-status}" in
       on)  : > "$GATE_PROOF_ENFORCE"; chmod 0644 "$GATE_PROOF_ENFORCE" 2>/dev/null || true
-           ok "gate-proof enforcement ON — approval/secret answers now require a valid --proof" ;;
+           ok "gate-proof enforcement ON: approval/secret/manual answers now require human evidence (a valid --human-proof nonce, a DIVE-519 --proof, or a non-agent SUDO_UID)" ;;
       off) rm -f "$GATE_PROOF_ENFORCE"
-           ok "gate-proof enforcement OFF — audit-only; approval/secret answers allowed without --proof" ;;
+           ok "gate-proof enforcement OFF: audit-only; approval/secret/manual answers allowed without human evidence" ;;
       status)
            local _e _k
            _gate_proof_enforced && _e=on || _e=off
