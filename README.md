@@ -69,10 +69,7 @@ content engine, support crew. Clone it, point it at your keys and bots, done.
 
 ---
 
-<details>
-<summary><b>How it works &amp; running a team</b></summary>
-
-### How it works
+## How it works
 
 Each agent is its own Linux user running an official agentic AI CLI session (`claude`, `codex`, `antigravity`, `grok`, …) as a systemd service. Multiple agents can share the same CLI binary and subscription. Agents reach each other by invoking the same `5dive` CLI — that *is* the bus. Channels like Telegram attach per agent.
 
@@ -91,7 +88,9 @@ Each agent is its own Linux user running an official agentic AI CLI session (`cl
 
 No broker, no protocol, no orchestrator. Shared filesystem, shared CLI.
 
-### Give them work
+---
+
+## Give them work
 
 Agents on a box share a task queue (sqlite, no server). File work, assign it, and let the heartbeat wake the assignee only when there's something to do. Recurring templates materialize on a cron schedule:
 
@@ -108,6 +107,85 @@ When an agent hits something only a human can decide, it parks the task on you:
 
 That arrives on your Telegram as tap-to-answer buttons. Tap one, and the owning agent is unblocked and resumes. `5dive task inbox` lists everything waiting on a human, and `5dive org` keeps a reporting chart so you can see who works for whom.
 
+---
+
+## Agent types
+
+| Type | Model family | Auth | Channels |
+|------|-------------|------|----------|
+| `claude`      | Anthropic Claude, or any Anthropic-compatible endpoint | OAuth / API key / `--provider` | Telegram, Discord |
+| `codex`       | OpenAI Codex           | OAuth / API key | Telegram |
+| `antigravity` | Google Antigravity     | Google OAuth | Telegram |
+| `grok`        | xAI Grok               | OAuth (xAI) / API key | Telegram |
+| `hermes`      | third-party multi-provider harness | OAuth (OpenAI) / API key | Telegram, Discord |
+| `openclaw`    | third-party multi-provider harness | OAuth (OpenAI) / API key | Telegram, Discord |
+| `opencode`    | OpenCode               | API key | Telegram |
+
+`hermes` and `openclaw` are community-built harnesses that can route to many providers (OpenRouter, Anthropic, Google, Moonshot, DeepSeek, Z.ai, etc.). As of April 4, 2026, Anthropic no longer permits routing consumer Claude Pro/Max OAuth through third-party harnesses. For that work, use the official `claude` type with your own API key. Background: [We Ditched OpenClaw for Claude →](https://blog.5dive.ai/blog/we-ditched-openclaw-for-claude/?utm_source=github&utm_medium=referral&utm_campaign=5dive-readme).
+
+The `claude` type can also run the official Claude Code harness against a third-party Anthropic-compatible endpoint, bring your own key:
+
+```sh
+sudo 5dive agent create cheap-coder --type=claude --provider=deepseek --api-key=<key>
+# providers: deepseek (DeepSeek), moonshot (Kimi), zai (GLM)
+```
+
+---
+
+## For your AI agent
+
+If you already use Claude Code / Codex / Antigravity / Grok / opencode, paste this prompt. Your agent installs 5dive, learns the skill, then keeps managing agents through chat:
+
+```
+Install 5dive on this Linux host so I can use you to manage 5dive agents.
+
+1. Run the installer (idempotent, safe to rerun):
+   curl -fsSL https://install.5dive.com | sudo bash
+2. Confirm: `5dive --version` prints a version string (e.g. "5dive 0.5.x").
+3. Install the 5dive-cli skill. Replace <runtime> with one of
+   claude-code, codex, antigravity, grok, hermes-agent, openclaw, opencode:
+   npx -y skills add https://github.com/5dive-ai/skills --skill 5dive-cli --agent <runtime> --yes
+4. Tell me to restart so the skill loads, then ask which agent to create first.
+```
+
+**Installing onto a remote VM over SSH?** Same prompt, prefix the install line with `ssh -t <user@host>`. Install the skill on the laptop where you're issuing `ssh` from, not the remote. Use `ssh -t` for anything needing a TTY (e.g. `5dive agent auth login`).
+
+---
+
+## Security &amp; isolation
+
+Each agent is one Linux user under one of three isolation tiers:
+
+| Tier | Access |
+|------|--------|
+| `admin` (default) | full host |
+| `standard` | shared read, limited write |
+| `sandboxed` | own home only, no sudo, systemd resource limits |
+
+```sh
+sudo 5dive agent create my-agent --type=claude --isolation=sandboxed
+```
+
+**No middlemen.** 5dive runs on your server. Auth tokens go to model providers directly, never to us. No telemetry, no error reporting, no usage data leaves the box. Long form: [your auth tokens don't touch us →](https://blog.5dive.ai/blog/your-auth-tokens-dont-touch-us/?utm_source=github&utm_medium=referral&utm_campaign=5dive-readme).
+
+---
+
+<details>
+<summary><b>More team ops — accounts, a shared bot, commands, characters</b></summary>
+
+### Accounts (shared auth profiles)
+
+One sign-in, many agents:
+
+```sh
+sudo 5dive account add   work
+sudo 5dive account login work --type=claude
+sudo 5dive agent create agent-a --type=claude --auth-profile=work
+sudo 5dive agent create agent-b --type=claude --auth-profile=work
+```
+
+Rename or rotate the account, every bound agent rebinds automatically. `5dive account usage` shows each account's rate-limit headroom.
+
 ### One bot for the whole team
 
 Per-agent bots are optional. Point one shared bot at a Telegram group (topics enabled) and every agent gets its own forum topic:
@@ -117,6 +195,17 @@ sudo 5dive agent team-bot shared --group=<chat_id> --agents=coder,writer,pm --to
 ```
 
 New agents auto-attach with their own topic (opt out per agent with `--no-team-bot`). `team-bot discover` finds the group id for you, and `team-bot intercom` mirrors inter-agent chatter into a dedicated topic so you can watch the team coordinate.
+
+### Import a character
+
+A template gives you roles. A **character pack** gives you a personality — a ready-made persona with its own voice, model, effort, and bundled skills:
+
+```sh
+sudo 5dive agent marketplace ls            # browse the character-pack registry
+sudo 5dive agent import olivia --as=ceo    # spin up a named agent from a pack
+```
+
+`--as` is the agent's name on your box; the pack supplies the persona, model, and skills. Add `--channels=telegram` to wire a bot at import time. Packs live in the [`5dive-ai/character-packs`](https://github.com/5dive-ai/character-packs) registry — and a `5dive.yaml` can reference one with `pack: <slug>`.
 
 ### Commands at a glance
 
@@ -147,81 +236,7 @@ Full flag reference: `5dive --help` (or `5dive <verb> --help`). Machine-readable
 </details>
 
 <details>
-<summary><b>Agent types, providers &amp; accounts</b></summary>
-
-### Agent types
-
-| Type | Model family | Auth | Channels |
-|------|-------------|------|----------|
-| `claude`      | Anthropic Claude, or any Anthropic-compatible endpoint | OAuth / API key / `--provider` | Telegram, Discord |
-| `codex`       | OpenAI Codex           | OAuth / API key | Telegram |
-| `antigravity` | Google Antigravity     | Google OAuth | Telegram |
-| `grok`        | xAI Grok               | OAuth (xAI) / API key | Telegram |
-| `hermes`      | third-party multi-provider harness | OAuth (OpenAI) / API key | Telegram, Discord |
-| `openclaw`    | third-party multi-provider harness | OAuth (OpenAI) / API key | Telegram, Discord |
-| `opencode`    | OpenCode               | API key | Telegram |
-
-`hermes` and `openclaw` are community-built harnesses that can route to many providers (OpenRouter, Anthropic, Google, Moonshot, DeepSeek, Z.ai, etc.). As of April 4, 2026, Anthropic no longer permits routing consumer Claude Pro/Max OAuth through third-party harnesses. For that work, use the official `claude` type with your own API key. Background: [We Ditched OpenClaw for Claude →](https://blog.5dive.ai/blog/we-ditched-openclaw-for-claude/?utm_source=github&utm_medium=referral&utm_campaign=5dive-readme).
-
-The `claude` type can also run the official Claude Code harness against a third-party Anthropic-compatible endpoint, bring your own key:
-
-```sh
-sudo 5dive agent create cheap-coder --type=claude --provider=deepseek --api-key=<key>
-# providers: deepseek (DeepSeek), moonshot (Kimi), zai (GLM)
-```
-
-### Accounts (shared auth profiles)
-
-One sign-in, many agents:
-
-```sh
-sudo 5dive account add   work
-sudo 5dive account login work --type=claude
-sudo 5dive agent create agent-a --type=claude --auth-profile=work
-sudo 5dive agent create agent-b --type=claude --auth-profile=work
-```
-
-Rename or rotate the account, every bound agent rebinds automatically. `5dive account usage` shows each account's rate-limit headroom.
-
-### Import a character
-
-A template gives you roles. A **character pack** gives you a personality — a
-ready-made persona with its own voice, model, effort, and bundled skills. Browse
-the registry and import one under whatever name you like:
-
-```sh
-sudo 5dive agent marketplace ls            # browse the character-pack registry
-sudo 5dive agent import olivia --as=ceo    # spin up a named agent from a pack
-```
-
-`--as` is the agent's name on your box; the pack supplies the persona, model,
-and skills (and renames itself to match). Add `--channels=telegram` to wire a bot
-at import time. Packs live in the [`5dive-ai/character-packs`](https://github.com/5dive-ai/character-packs)
-registry — and a `5dive.yaml` can reference one with `pack: <slug>` so a whole
-company comes up in character.
-
-</details>
-
-<details>
-<summary><b>Security, isolation &amp; self-hosting</b></summary>
-
-### Isolation tiers
-
-| Tier | Access |
-|------|--------|
-| `admin` (default) | full host |
-| `standard` | shared read, limited write |
-| `sandboxed` | own home only, no sudo, systemd resource limits |
-
-```sh
-sudo 5dive agent create my-agent --type=claude --isolation=sandboxed
-```
-
-### No middlemen
-
-5dive runs on your server. Auth tokens go to model providers directly, never to us. No telemetry, no error reporting, no usage data leaves the box. Each agent is one Linux user with its own login.
-
-Long form: [your auth tokens don't touch us →](https://blog.5dive.ai/blog/your-auth-tokens-dont-touch-us/?utm_source=github&utm_medium=referral&utm_campaign=5dive-readme).
+<summary><b>Self-hosting, hardening &amp; other install paths</b></summary>
 
 ### Securing your server
 
@@ -246,11 +261,11 @@ docker exec -it 5dive-demo bash
 
 **Offline / air-gapped.** `install.sh` reads from `$REPO` (default GitHub raw). Override with `REPO=file:///path/to/local/tree` and pre-install apt deps. The fetched files are listed at the top of `install.sh`.
 
-**Updating.** 5dive doesn't auto-update — you stay in control of when code changes land. To update on demand:
+**Updating.** 5dive doesn't auto-update — you stay in control of when code changes land:
 ```sh
 sudo 5dive self-update
 ```
-This refreshes the CLI, hooks, skills, and plugins (the same `install.sh --upgrade` path), then restarts each running agent so the new versions actually load — a live agent keeps its old plugin in memory until it restarts. The agent AI CLIs (`claude`, `codex`, …) self-update via their own autoupdaters; the restart loads the latest. Want it on a schedule? Drop it in cron:
+This refreshes the CLI, hooks, skills, and plugins, then restarts each running agent so the new versions load. Want it on a schedule?
 ```cron
 0 4 * * * /usr/local/bin/5dive self-update >/dev/null 2>&1
 ```
@@ -271,27 +286,7 @@ Use GitHub's private reporting: **[Report a vulnerability →](https://github.co
 </details>
 
 <details>
-<summary><b>Drive 5dive from the AI agent you already have</b></summary>
-
-### For your AI agent
-
-If you already use Claude Code / Codex / Antigravity / Grok / opencode, paste this prompt. Your agent installs 5dive, learns the skill, then keeps managing agents through chat:
-
-```
-Install 5dive on this Linux host so I can use you to manage 5dive agents.
-
-1. Run the installer (idempotent, safe to rerun):
-   curl -fsSL https://install.5dive.com | sudo bash
-2. Confirm: `5dive --version` prints a version string (e.g. "5dive 0.5.x").
-3. Install the 5dive-cli skill. Replace <runtime> with one of
-   claude-code, codex, antigravity, grok, hermes-agent, openclaw, opencode:
-   npx -y skills add https://github.com/5dive-ai/skills --skill 5dive-cli --agent <runtime> --yes
-4. Tell me to restart so the skill loads, then ask which agent to create first.
-```
-
-**Installing onto a remote VM over SSH?** Same prompt, prefix the install line with `ssh -t <user@host>`. Install the skill on the laptop where you're issuing `ssh` from, not the remote. Use `ssh -t` for anything needing a TTY (e.g. `5dive agent auth login`).
-
-### JSON output
+<summary><b>JSON / machine-readable output</b></summary>
 
 Every command accepts `--json`. Output is `{ok:true,data:...}` on success or `{ok:false,error:{code,class,message}}` on failure. Exit code matches `error.code` so shell pipelines branch without parsing. Progress lines stay on stderr; stdout is always valid JSON.
 
@@ -303,7 +298,7 @@ Every command accepts `--json`. Output is `{ok:true,data:...}` on success or `{o
 </details>
 
 <details>
-<summary><b>Want a dashboard instead of ssh?</b></summary>
+<summary><b>Prefer a managed dashboard instead of ssh?</b></summary>
 
 The CLI is the OSS surface. Every verb here, every agent, every host, all driven from `/usr/local/bin/5dive`.
 
