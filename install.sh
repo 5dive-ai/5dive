@@ -65,6 +65,27 @@ DIGESTCRON
     ok "digest pref seeded (off by default)"
   fi
 
+  # DIVE-948: cap systemd journal growth. With no explicit limit journald drifts
+  # to the distro default (~10% of disk, up to 4G); on the small cx plans that's
+  # wasteful (boxes were reaching ~500M+/month). Idempotent drop-in, rewritten
+  # every update; applying it back-fills the existing fleet via the daily refresh.
+  # Bounds ONLY logs, never app data. 200M / 14d (tunable).
+  if [[ -d /etc/systemd ]]; then
+    mkdir -p /etc/systemd/journald.conf.d
+    cat > /etc/systemd/journald.conf.d/5dive.conf <<'JOURNALD'
+# 5dive managed (DIVE-948) — bound journal disk use. Rewritten on every update.
+[Journal]
+SystemMaxUse=200M
+MaxRetentionSec=14d
+JOURNALD
+    chmod 644 /etc/systemd/journald.conf.d/5dive.conf
+    # Apply the new SystemMaxUse and reclaim immediately (retroactive on boxes
+    # already over the cap). Both best-effort — never fail the update over logs.
+    systemctl restart systemd-journald 2>/dev/null || true
+    journalctl --vacuum-size=200M >/dev/null 2>&1 || true
+    ok "/etc/systemd/journald.conf.d/5dive.conf (journal capped 200M/14d)"
+  fi
+
   curl -fsSL "$REPO/5dive-agent-start" -o "$BIN_DIR/5dive-agent-start"
   chmod 755 "$BIN_DIR/5dive-agent-start"
   ok "5dive-agent-start → $BIN_DIR/5dive-agent-start"
