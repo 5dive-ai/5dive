@@ -115,14 +115,13 @@ out=$(SUDO_UID="$AGENT_UID" cmd_task_answer DIVE-302 --value=approved --human --
 [[ "$(answered DIVE-302)" == "open" && $rc -ne 0 ]] && ok_t "T3 wrong --human-proof rejected" \
   || bad_t "T3 wrong --human-proof rejected" "rc=$rc state=$(answered DIVE-302)"
 
-# --- T4: (b) valid DIVE-519 --proof clears ------------------------------------
-_gate_proof_ensure_key 2>/dev/null; ( umask 077; openssl rand -hex 32 > "$GATE_PROOF_KEY" )
+# --- T4: DIVE-950 — form (b) --proof is DROPPED. An agent-SUDO_UID answer that
+#     presents ONLY a --proof token (even a well-formed one) is REJECTED: the token
+#     is no longer evidence, so with no nonce + agent SUDO_UID there is none. -----
 seed_task DIVE-400; cmd_task_need DIVE-400 --type=approval --ask="approve?" >/dev/null 2>&1
-nid=$(db "SELECT id FROM tasks WHERE ident='DIVE-400';")
-tok=$(_gate_proof_mint "$nid" approval)
-SUDO_UID="$AGENT_UID" cmd_task_answer DIVE-400 --value=approved --human --proof="$tok" >/dev/null 2>&1
-[[ "$(answered DIVE-400)" == "closed" ]] && ok_t "T4 valid DIVE-519 --proof clears" \
-  || bad_t "T4 valid DIVE-519 --proof clears" "still $(answered DIVE-400)"
+out=$(SUDO_UID="$AGENT_UID" cmd_task_answer DIVE-400 --value=approved --human --proof="v1:dead:9999999999:beef" 2>&1); rc=$?
+[[ "$(answered DIVE-400)" == "open" && $rc -ne 0 ]] && ok_t "T4 DIVE-950: --proof no longer clears (form b dropped)" \
+  || bad_t "T4 --proof dropped" "rc=$rc state=$(answered DIVE-400) out=$out"
 
 # --- T5: (c) non-agent SUDO_UID clears with NO proof (drop / human-on-box) ----
 seed_task DIVE-500; cmd_task_need DIVE-500 --type=secret --ask="drop key" >/dev/null 2>&1

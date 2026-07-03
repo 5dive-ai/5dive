@@ -717,29 +717,11 @@ _gate_proof_ct_equal() {
   return $res
 }
 
-# Mint a token for <canonical_id> <type>. Returns the RAW token on stdout.
-_gate_proof_mint() {
-  local id="$1" type="$2" nonce exp mac
-  nonce=$(openssl rand -hex 8 2>/dev/null) || return 1
-  exp=$(( $(date +%s) + GATE_PROOF_TTL ))
-  mac=$(_gate_proof_hmac "${id}:${type}:${nonce}:${exp}") || return 1
-  [[ -n "$mac" ]] || return 1
-  printf 'v1:%s:%s:%s' "$nonce" "$exp" "$mac"
-}
-
-# Verify <canonical_id> <type> <token>. 0 = structurally valid, unexpired, matches.
-_gate_proof_verify() {
-  local id="$1" type="$2" token="$3"
-  [[ "$token" == v1:*:*:* ]] || return 1
-  local body="${token#v1:}"
-  local nonce="${body%%:*}"; body="${body#*:}"
-  local exp="${body%%:*}";   local mac="${body#*:}"
-  [[ "$nonce" =~ ^[0-9a-f]+$ && "$exp" =~ ^[0-9]+$ && -n "$mac" ]] || return 1
-  (( exp >= $(date +%s) )) || return 1
-  local expect; expect=$(_gate_proof_hmac "${id}:${type}:${nonce}:${exp}") || return 1
-  [[ -n "$expect" ]] || return 1
-  _gate_proof_ct_equal "$mac" "$expect"
-}
+# DIVE-950: `_gate_proof_mint` / `_gate_proof_verify` (the DIVE-519 --proof token,
+# evidence-form b) are REMOVED — the token was agent-forgeable via the require_root
+# `gate-proof` mint (no higher a bar than the sudo it already needed). `_gate_proof_hmac`
+# above is retained: DIVE-756 closure-signature tamper-evidence (`_gate_closure_sign`
+# / `_gate_closure_verify`) still uses it.
 
 # Enforcement is OFF until the sentinel exists. DIVE-519 ships DORMANT (audit-only):
 # flip on only after the plugin mint is confirmed live on the box, else live taps

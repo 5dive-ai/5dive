@@ -1671,7 +1671,7 @@ cmd_gate_proof() {
     require_root "gate-proof enforce"
     case "${2:-status}" in
       on)  : > "$GATE_PROOF_ENFORCE"; chmod 0644 "$GATE_PROOF_ENFORCE" 2>/dev/null || true
-           ok "gate-proof enforcement ON: approval/secret/manual answers now require human evidence (a valid --human-proof nonce, a DIVE-519 --proof, or a non-agent SUDO_UID)" ;;
+           ok "gate-proof enforcement ON: approval/secret/manual answers now require human evidence (a valid --human-proof nonce or a non-agent SUDO_UID)" ;;
       off) rm -f "$GATE_PROOF_ENFORCE"
            ok "gate-proof enforcement OFF: audit-only; approval/secret/manual answers allowed without human evidence" ;;
       status)
@@ -1687,21 +1687,22 @@ cmd_gate_proof() {
     esac
     return
   fi
+  # DIVE-950: the `gate-proof <id> <type>` MINT path is REMOVED. The --proof token
+  # it produced (evidence-form b) was agent-forgeable — `gate-proof` is require_root
+  # only, so any agent could `sudo`-mint a valid token and self-clear a gate, no
+  # higher a bar than the sudo it already had. Human evidence is now (a) the
+  # per-gate --human-proof nonce (plugin tap / dashboard payload) or (c) a non-agent
+  # SUDO_UID. `sign`/`verify`/`enforce` above remain (closure tamper-evidence +
+  # the enforcement toggle). A stray mint caller gets a loud, AUDITED failure here
+  # rather than a silent forge.
   require_root "gate-proof"
-  tasks_db_init
-  local ref="${1:-}" type="${2:-}"
-  [[ -n "$ref" && -n "$type" ]] || fail "$E_USAGE" "usage: 5dive gate-proof <id|DIVE-N> <approval|secret>"
-  [[ "$type" == "approval" || "$type" == "secret" ]] || fail "$E_VALIDATION" "gate-proof type must be approval|secret"
-  _gate_proof_ensure_key || fail "$E_GENERIC" "cannot provision gate-proof key (need root)"
-  resolve_task_id "$ref"; local id="$RESOLVED_TASK_ID" ident="$RESOLVED_TASK_IDENT"
-  local token; token=$(_gate_proof_mint "$id" "$type") || fail "$E_GENERIC" "failed to mint proof token"
-  audit_log "gate-proof mint" "ok" 0 -- "task=$ident" "type=$type"
-  printf '%s\n' "$token"   # RAW — consumers (plugin mint, human-on-box) read stdout verbatim
+  audit_log "gate-proof mint" "error" 1 -- "removed=DIVE-950" "args=${1:-} ${2:-}"
+  fail "$E_USAGE" "gate-proof mint is removed (DIVE-950): the --proof evidence form was agent-forgeable. Gates clear via a human tap (per-gate nonce) or a non-agent SUDO_UID. Valid subcommands: gate-proof enforce on|off|status | verify <id> | sign."
 }
 
 cmd_task_answer() {
   tasks_db_init
-  local value="" value_set=0 from="" human=0 proof="" human_proof=""
+  local value="" value_set=0 from="" human=0 human_proof=""
   local -a positional=()
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -1712,9 +1713,14 @@ cmd_task_answer() {
       # provenance in need_answered_by; the enforced boundary for hard-line gates
       # is still root (below), so an agent passing --human gains nothing.
       --human)   human=1 ;;
-      # DIVE-519: human-origin proof token (minted by `5dive gate-proof`) that the
-      # trusted paths attach to clear an approval/secret gate. Verified below.
-      --proof=*) proof="${1#*=}" ;;
+      # DIVE-950: evidence-form (b), the DIVE-519 --proof token, is DROPPED — it
+      # was agent-forgeable (`5dive gate-proof` mint is require_root only, so any
+      # agent could `sudo`-mint a valid token: the easy one-sudo forge). The flag
+      # is still PARSED but IGNORED — a rollout-safe no-op — so an in-flight caller
+      # that still sends --proof=AUTO/<token> (an old dashboard/shelld mid-deploy)
+      # does not hit "unknown flag"; it falls through to the surviving evidence
+      # forms: (a) --human-proof nonce, or (c) a non-agent SUDO_UID.
+      --proof=*) : ;;
       # DIVE-916: per-gate HUMAN nonce (from the Telegram tap callback_data /
       # dashboard payload) — the evidence form for the plugin-tap path, whose
       # SUDO_UID is the spawning agent. Verified against human_nonce_hash below.
@@ -1780,27 +1786,27 @@ cmd_task_answer() {
   # stop the DIVE-515/516 incident (an agent silently self-clearing); humans are
   # never blocked. Consistent with the agreed bar-raise scope (not airtight).
   if [[ "$nt" == "approval" || "$nt" == "secret" || "$nt" == "manual" ]]; then
-    # DIVE-916: three EQUIVALENT human-evidence forms — accept ANY one, never
-    # require two (double-gating a real tap violates DIVE-525):
+    # DIVE-916/950: TWO EQUIVALENT human-evidence forms — accept EITHER one, never
+    # require both (double-gating a real tap violates DIVE-525):
     #   (a) --human-proof=<nonce> matching this gate's stored hash — the plugin
     #       tap / dashboard payload, the one path whose SUDO_UID is the agent,
-    #   (b) a valid DIVE-519 --proof token — the already-shipped dashboard /
-    #       gate-proof path, kept so it does not regress,
-    #   (c) a non-agent SUDO_UID — a claude/root interactive login AND the
-    #       DIVE-931 secret-drop write (shelld runs it as SUDO_UID=claude, which
-    #       survives the nested non-sudo task-answer exec; verified empirically).
-    # This supersedes the DIVE-519 "proof OR bare --human" rule: a bare --human
-    # is no longer sufficient — that was the sudo→--human forge (DIVE-916 threat).
-    local _hp=0 _pv=0 _su=0
+    #   (c) a non-agent SUDO_UID — a claude/root interactive login, the dashboard
+    #       exec (shelld runs as SUDO_UID=claude), AND the DIVE-931 secret-drop
+    #       write (SUDO_UID=claude survives the nested non-sudo task-answer exec;
+    #       verified empirically).
+    # DIVE-950 dropped the former form (b), a DIVE-519 --proof token: it was
+    # agent-forgeable (`sudo 5dive gate-proof` mint is require_root only), so it
+    # raised the bar no higher than the sudo it already required. This still
+    # supersedes the DIVE-519 "proof OR bare --human" rule: a bare --human is NOT
+    # sufficient — that was the sudo→--human forge (DIVE-916 threat).
+    local _hp=0 _su=0
     [[ -n "$human_proof" ]] && _human_nonce_verify "$id" "$human_proof" && _hp=1
-    [[ -n "$proof" ]] && _gate_proof_verify "$id" "$nt" "$proof" && _pv=1
     _gate_sudo_uid_nonagent && _su=1
-    local _evid=$(( _hp || _pv || _su ))
+    local _evid=$(( _hp || _su ))
     local _caller2; _caller2=$(id -un 2>/dev/null || echo '?')
     audit_log "task answer gate" "$([[ $_evid -eq 1 ]] && echo ok || echo error)" 0 -- \
       "task=$ident" "type=$nt" \
       "human_proof=$([[ -n "$human_proof" ]] && echo present || echo absent)" "nonce_valid=$_hp" \
-      "proof=$([[ -n "$proof" ]] && echo present || echo absent)" "proof_valid=$_pv" \
       "sudo_nonagent=$_su" "human=$human" "caller=$_caller2" "sudo_uid=${SUDO_UID:-}" \
       "enforce=$(_gate_proof_enforced && echo on || echo off)"
     # DIVE-525: a real human tap is NEVER rejected — every trusted path supplies

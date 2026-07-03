@@ -16,10 +16,10 @@ release.
   (approval/secret/manual), stores only its SHA-256 (`human_nonce_hash`), and
   embeds the RAW nonce solely in the Telegram tap `callback_data` the CLI composes
   as root — the agent's LLM never sees it. `task answer` clears such a gate as
-  human iff it presents ONE of three equivalent evidence forms: a matching
+  human iff it presents ONE of two equivalent evidence forms: a matching
   `--human-proof=<nonce>` (the plugin-tap path, whose SUDO_UID is the spawning
-  agent), a valid DIVE-519 `--proof`, or a non-agent `SUDO_UID` (a claude/root
-  login and the DIVE-931 secret-drop write, which runs `SUDO_UID=claude`). A bare
+  agent) or a non-agent `SUDO_UID` (a claude/root login and the DIVE-931
+  secret-drop write, which runs `SUDO_UID=claude`). A bare
   `sudo 5dive task answer --human` from an agent session (SUDO_UID=agent-\*, no
   nonce) is rejected. `manual` joins approval/secret as an enforced human gate.
   Ships **dormant** (audit-only) behind `gate-proof enforce`; flip on once the
@@ -28,6 +28,19 @@ release.
   `sudo su - claude` path (a separate sudo-hardening track). Folds into the
   DIVE-931 secret-drop chain: the drop write clears via the non-agent-SUDO_UID
   form, no nonce-threading needed.
+
+- DIVE-950: **drop the forgeable `--proof` evidence form** (DIVE-916 hardening).
+  The DIVE-519 `--proof` token was agent-forgeable — `5dive gate-proof` mint is
+  `require_root` only, so any agent could `sudo`-mint a valid token and self-clear
+  a gate (the easy one-sudo forge). The `gate-proof <id> <type>` mint subcommand is
+  removed (returns a loud, audited error); `task answer` no longer counts `--proof`
+  as evidence (the flag is parsed-but-ignored so an in-flight caller mid-deploy
+  does not break). Gates clear via the per-gate `--human-proof` nonce or a
+  non-agent `SUDO_UID`. Honest scope: this closes the silent one-liner self-clear
+  AND the easy sudo-mint forge; it is NOT airtight against a determined agent with
+  root `sudo` (instrument-its-own-nonce / `sudo -u claude` / `sudo su - claude`) —
+  that is the separate sudo-reduction track. `gate-proof sign`/`verify`/`enforce`
+  are unchanged.
 
 ### Changed
 
