@@ -196,7 +196,16 @@ CREATE TABLE IF NOT EXISTS tasks (
   tier                INTEGER,
   need_asked_at       TEXT,
   gate_pinged_at      TEXT,
-  wake_at             TEXT
+  wake_at             TEXT,
+  -- DIVE-931 secure credential drop: a --type=secret gate can name WHERE the
+  -- value should land — secret_key is the env-var name, connector the
+  -- /etc/5dive/connectors/<connector>.env stem. When both are set, the gate
+  -- notify mints a burnable drop link (api /drop/mint) instead of the legacy
+  -- "put it where I expect it" text. NULL on non-secret gates and on secret
+  -- gates filed without a target (legacy behavior preserved). The VALUE is never
+  -- stored here — only the destination coordinates.
+  secret_key          TEXT,
+  connector           TEXT
 );
 
 CREATE TABLE IF NOT EXISTS task_deps (
@@ -361,7 +370,8 @@ _tasks_db_migrate() {
            "project_key TEXT NOT NULL DEFAULT 'dive'" 'issue_number INTEGER' \
            'acceptance_criteria TEXT' 'verify_command TEXT' 'max_iterations INTEGER' 'verifier TEXT' \
            'iteration INTEGER' 'maker_agent TEXT' 'task_budget TEXT' \
-           'tier INTEGER' 'need_asked_at TEXT' 'gate_pinged_at TEXT' 'wake_at TEXT'; do
+           'tier INTEGER' 'need_asked_at TEXT' 'gate_pinged_at TEXT' 'wake_at TEXT' \
+           'secret_key TEXT' 'connector TEXT'; do
     if ! printf '%s\n' "$cols" | grep -qx "${c%% *}"; then
       sqlite3 -cmd ".timeout 5000" "$TASKS_DB" \
         "ALTER TABLE tasks ADD COLUMN ${c};" >/dev/null 2>&1 || true

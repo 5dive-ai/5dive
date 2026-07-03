@@ -486,6 +486,12 @@ main() {
       # DIVE-519: mint a human-origin proof token for an approval/secret gate (or
       # toggle enforcement). Root-only (reads the 0400 key); audits its own mint.
       cmd_gate_proof "$@" ;;
+    secret)
+      # DIVE-930/932 secure credential drop: box-side secret-write primitive.
+      # Root-only (writes root-owned /etc/5dive/connectors). The value arrives on
+      # STDIN, so auditing argv here never captures the secret.
+      AUDIT_CMD="secret"; AUDIT_ARGS=("$@")
+      cmd_secret "$@" ;;
     org)
       # Agent org chart (sqlite, same store as tasks). Read/write, no audit/lock.
       cmd_org "$@" ;;

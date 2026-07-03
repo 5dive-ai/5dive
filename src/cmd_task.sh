@@ -1091,7 +1091,7 @@ _gate_tier2_floor_hit() {
 
 cmd_task_need() {
   tasks_db_init
-  local type="" ask="" options="" recommend="" from="" tier=""
+  local type="" ask="" options="" recommend="" from="" tier="" secret_key="" connector=""
   local -a positional=()
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -1101,6 +1101,10 @@ cmd_task_need() {
       --recommend=*) recommend="${1#*=}" ;;
       --tier=*)      tier="${1#*=}" ;;
       --from=*)      from="${1#*=}" ;;
+      # DIVE-931 secure credential drop: name WHERE a secret gate's value lands.
+      # Both together enable the burnable drop link in the gate message.
+      --secret-key=*) secret_key="${1#*=}" ;;
+      --connector=*)  connector="${1#*=}" ;;
       --)          shift; positional+=("$@"); break ;;
       -*)          fail "$E_USAGE" "unknown flag: $1" ;;
       *)           positional+=("$1") ;;
@@ -1117,6 +1121,20 @@ cmd_task_need() {
   # option index for it; see DIVE-560 note in _task_loop_advance.)
   if [[ -n "$options" && "$type" != "decision" ]]; then
     fail "$E_VALIDATION" "--options only applies to --type=decision"
+  fi
+  # DIVE-931: --secret-key / --connector name the drop target and only make sense
+  # on a secret gate. Require them together (a key with no connector has nowhere
+  # to land, and vice versa) and validate against the same charsets the box-side
+  # `secret write` + the api /drop/mint enforce, so a bad value fails here rather
+  # than at mint time. Both omitted = legacy secret gate (out-of-band delivery).
+  if [[ -n "$secret_key" || -n "$connector" ]]; then
+    [[ "$type" == "secret" ]] || fail "$E_VALIDATION" "--secret-key/--connector only apply to --type=secret"
+    [[ -n "$secret_key" && -n "$connector" ]] \
+      || fail "$E_VALIDATION" "--secret-key and --connector must be given together (both name the drop target)"
+    [[ "$secret_key" =~ ^[A-Z][A-Z0-9_]{0,63}$ ]] \
+      || fail "$E_VALIDATION" "invalid --secret-key '$secret_key' (env-var name: ^[A-Z][A-Z0-9_]{0,63}\$)"
+    [[ "$connector" =~ ^[a-z0-9][a-z0-9-]{0,63}$ ]] \
+      || fail "$E_VALIDATION" "invalid --connector '$connector' (^[a-z0-9][a-z0-9-]{0,63}\$)"
   fi
   # DIVE-148: --recommend surfaces the agent's advised choice first in the human
   # alert (and ⭐-marks its button). Only meaningful for the two finite-choice
@@ -1180,6 +1198,8 @@ cmd_task_need() {
             need_type=$(sqlq "$type"), ask=$(sqlq "$ask"),
             need_options=$(sqlq_or_null "$options"),
             recommend=$(sqlq_or_null "$recommend"),
+            secret_key=$(sqlq_or_null "$secret_key"),
+            connector=$(sqlq_or_null "$connector"),
             tier=${tier}, need_asked_at=datetime('now'), gate_pinged_at=NULL,
             need_answer=NULL, need_answered_at=NULL
       WHERE id=${id};"
@@ -1210,7 +1230,7 @@ cmd_task_need() {
   # failed DM must never fail the gate write that just committed above.
   # DIVE-891: tier 1 gates still notify (they're answerable early); the 48h TTL
   # is a backstop, not a silencer. Only tier 0 skips the ping.
-  task_need_notify "$ident" "$type" "$ask" "$options" "$recommend" || true
+  task_need_notify "$ident" "$type" "$ask" "$options" "$recommend" "$secret_key" "$connector" || true
   local floor_note=""; (( tier_floored )) && floor_note=" [tier forced to 2 — T2 category floor]"
   ok "$ident needs a human ($type, tier $tier)${floor_note} — $ask" \
      '{id:($i|tonumber), ident:$id, status:"blocked", need_type:$ty, tier:($tr|tonumber), tier_floored:($fl=="1"), ask:$ak, need_options:(($op|select(length>0)) // null), recommend:(($rc|select(length>0)) // null), assignee:$ac}' \
@@ -1351,8 +1371,39 @@ _task_close_notify() {
 # task_actor does; the token comes from the group-claude-readable connector
 # file (or an inherited env var); and access.json is found by probing the
 # per-type channel dirs (own file when direct, root-readable when sudo).
+# _task_mint_drop_link — DIVE-931. Mint a one-time secure credential drop link
+# for a secret gate (api POST /drop/mint, box-authed with the box's connectord
+# token). Echoes exactly one of:
+#   <url>|<ttlMinutes>   a live burnable link (api pushes the value to the box)
+#   ONBOX                 api holds no usable token for this box -> on-box path
+#   (empty)               mint unavailable (self-hosted / api down) -> legacy text
+# Best-effort: never fails the caller and never touches the secret VALUE (only the
+# destination coordinates). The value crosses solely via the drop page -> stdin.
+_task_mint_drop_link() {
+  local ident="$1" secret_key="$2" connector="$3"
+  local token="" env_file="/etc/5dive/connectord.env"
+  [[ -n "${CONNECTORD_TOKEN:-}" ]] && token="$CONNECTORD_TOKEN"
+  [[ -z "$token" && -r "$env_file" ]] && token=$(sed -n 's/^CONNECTORD_TOKEN=//p' "$env_file" | head -1)
+  [[ -n "$token" ]] || return 0   # no box identity (self-hosted OSS) -> legacy text
+  local api="${FIVE_API_BASE:-https://api.5dive.com}" body resp
+  body=$(jq -nc --arg t "$ident" --arg k "$secret_key" --arg c "$connector" \
+           '{taskIdent:$t, secretKey:$k, connector:$c, ttlMinutes:30}') || return 0
+  resp=$(curl -fsS --max-time 10 -X POST "${api%/}/drop/mint" \
+           -H "authorization: Bearer ${token}" -H "content-type: application/json" \
+           -d "$body" 2>/dev/null) || return 0
+  if [[ "$(printf '%s' "$resp" | jq -r '.useOnBoxPath // false' 2>/dev/null)" == "true" ]]; then
+    echo "ONBOX"; return 0
+  fi
+  local url ttl
+  url=$(printf '%s' "$resp" | jq -r '.url // empty' 2>/dev/null)
+  ttl=$(printf '%s' "$resp" | jq -r '.ttlMinutes // empty' 2>/dev/null)
+  [[ -n "$url" ]] || return 0
+  echo "${url}|${ttl:-15}"
+}
+
 task_need_notify() {
   local ident="$1" need_type="$2" ask="$3" options="$4" recommend="${5:-}"
+  local secret_key="${6:-}" connector="${7:-}"
 
   # Resolve bot token + the human's DM/group targets (TASK_CH_* globals). The
   # matched access type (TASK_CH_TYPE) gates the tap-to-answer buttons below.
@@ -1404,8 +1455,26 @@ task_need_notify() {
   # recovery path when a tap fails; the answer command works on EVERY box, run
   # as a human login (claude/root — the human path clears approval/secret gates).
   case "$need_type" in
-    secret) text+=$'\n\n'"🔑 Put the key where I expect it (my .env / our channel), then tap ✅ Provided below — don't paste the key here. Tap not working? On the box: sudo 5dive task answer ${ident}" ;;
-    manual) text+=$'\n\n'"✋ Tap ✅ Done below once it's handled — closes this out. Or on the box: sudo 5dive task answer ${ident} --value=done" ;;
+    secret)
+      # DIVE-931: when the gate names a drop target (secret_key + connector), mint
+      # a burnable single-use link so the human drops the credential straight onto
+      # the box — the VALUE never transits chat, only the link does. Falls back to
+      # the on-box `secret write` (tokenless boxes) or the legacy out-of-band text
+      # (self-hosted / api unreachable). The box-side write auto-clears this gate.
+      local _drop=""
+      if [[ -n "$secret_key" && -n "$connector" ]]; then
+        _drop=$(_task_mint_drop_link "$ident" "$secret_key" "$connector")
+      fi
+      if [[ "$_drop" == "ONBOX" ]]; then
+        text+=$'\n\n'"🔑 [${ident}] needs the ${secret_key} credential. On the box, drop it straight in (never paste it here):"$'\n'"  echo -n \"\$SECRET\" | sudo 5dive secret write ${secret_key} --connector=${connector} --task=${ident}"$'\n'"That writes it and clears this gate. Or tap ✅ Provided once it is done."
+      elif [[ -n "$_drop" ]]; then
+        local _url="${_drop%%|*}" _ttl="${_drop##*|}"
+        text+=$'\n\n'"🔑 [${ident}] needs the ${secret_key} credential. Drop it securely (single-use, expires in ${_ttl}m):"$'\n'"${_url}"$'\n'"The value goes straight onto your box and is never shown in chat. Prefer the box? echo -n \"\$SECRET\" | sudo 5dive secret write ${secret_key} --connector=${connector} --task=${ident}"
+      else
+        text+=$'\n\n'"🔑 Put the key where I expect it (my .env / our channel), then tap ✅ Provided below. Don't paste the key here. Tap not working? On the box: sudo 5dive task answer ${ident}"
+      fi
+      ;;
+    manual) text+=$'\n\n'"✋ Tap ✅ Done below once it is handled, which closes this out. Or on the box: sudo 5dive task answer ${ident} --value=done" ;;
   esac
 
   # DIVE-117/118 tap-to-answer buttons. GATED to the plugin types whose `tna:`

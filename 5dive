@@ -26,7 +26,7 @@ esac
 
 # Bumped on every public release. `build.sh` checks this line exists; CI fails
 # the bundle-drift check if it's missing or empty.
-readonly FIVE_VERSION="0.6.7"
+readonly FIVE_VERSION="0.6.8"
 
 # GitHub org our repos live under. The org is being renamed
 # 5dive-com -> 5dive-ai (2026-06); fetches must work on either side of the
@@ -2339,7 +2339,16 @@ CREATE TABLE IF NOT EXISTS tasks (
   tier                INTEGER,
   need_asked_at       TEXT,
   gate_pinged_at      TEXT,
-  wake_at             TEXT
+  wake_at             TEXT,
+  -- DIVE-931 secure credential drop: a --type=secret gate can name WHERE the
+  -- value should land — secret_key is the env-var name, connector the
+  -- /etc/5dive/connectors/<connector>.env stem. When both are set, the gate
+  -- notify mints a burnable drop link (api /drop/mint) instead of the legacy
+  -- "put it where I expect it" text. NULL on non-secret gates and on secret
+  -- gates filed without a target (legacy behavior preserved). The VALUE is never
+  -- stored here — only the destination coordinates.
+  secret_key          TEXT,
+  connector           TEXT
 );
 
 CREATE TABLE IF NOT EXISTS task_deps (
@@ -2504,7 +2513,8 @@ _tasks_db_migrate() {
            "project_key TEXT NOT NULL DEFAULT 'dive'" 'issue_number INTEGER' \
            'acceptance_criteria TEXT' 'verify_command TEXT' 'max_iterations INTEGER' 'verifier TEXT' \
            'iteration INTEGER' 'maker_agent TEXT' 'task_budget TEXT' \
-           'tier INTEGER' 'need_asked_at TEXT' 'gate_pinged_at TEXT' 'wake_at TEXT'; do
+           'tier INTEGER' 'need_asked_at TEXT' 'gate_pinged_at TEXT' 'wake_at TEXT' \
+           'secret_key TEXT' 'connector TEXT'; do
     if ! printf '%s\n' "$cols" | grep -qx "${c%% *}"; then
       sqlite3 -cmd ".timeout 5000" "$TASKS_DB" \
         "ALTER TABLE tasks ADD COLUMN ${c};" >/dev/null 2>&1 || true
@@ -13737,7 +13747,7 @@ _gate_tier2_floor_hit() {
 
 cmd_task_need() {
   tasks_db_init
-  local type="" ask="" options="" recommend="" from="" tier=""
+  local type="" ask="" options="" recommend="" from="" tier="" secret_key="" connector=""
   local -a positional=()
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -13747,6 +13757,10 @@ cmd_task_need() {
       --recommend=*) recommend="${1#*=}" ;;
       --tier=*)      tier="${1#*=}" ;;
       --from=*)      from="${1#*=}" ;;
+      # DIVE-931 secure credential drop: name WHERE a secret gate's value lands.
+      # Both together enable the burnable drop link in the gate message.
+      --secret-key=*) secret_key="${1#*=}" ;;
+      --connector=*)  connector="${1#*=}" ;;
       --)          shift; positional+=("$@"); break ;;
       -*)          fail "$E_USAGE" "unknown flag: $1" ;;
       *)           positional+=("$1") ;;
@@ -13763,6 +13777,20 @@ cmd_task_need() {
   # option index for it; see DIVE-560 note in _task_loop_advance.)
   if [[ -n "$options" && "$type" != "decision" ]]; then
     fail "$E_VALIDATION" "--options only applies to --type=decision"
+  fi
+  # DIVE-931: --secret-key / --connector name the drop target and only make sense
+  # on a secret gate. Require them together (a key with no connector has nowhere
+  # to land, and vice versa) and validate against the same charsets the box-side
+  # `secret write` + the api /drop/mint enforce, so a bad value fails here rather
+  # than at mint time. Both omitted = legacy secret gate (out-of-band delivery).
+  if [[ -n "$secret_key" || -n "$connector" ]]; then
+    [[ "$type" == "secret" ]] || fail "$E_VALIDATION" "--secret-key/--connector only apply to --type=secret"
+    [[ -n "$secret_key" && -n "$connector" ]] \
+      || fail "$E_VALIDATION" "--secret-key and --connector must be given together (both name the drop target)"
+    [[ "$secret_key" =~ ^[A-Z][A-Z0-9_]{0,63}$ ]] \
+      || fail "$E_VALIDATION" "invalid --secret-key '$secret_key' (env-var name: ^[A-Z][A-Z0-9_]{0,63}\$)"
+    [[ "$connector" =~ ^[a-z0-9][a-z0-9-]{0,63}$ ]] \
+      || fail "$E_VALIDATION" "invalid --connector '$connector' (^[a-z0-9][a-z0-9-]{0,63}\$)"
   fi
   # DIVE-148: --recommend surfaces the agent's advised choice first in the human
   # alert (and ⭐-marks its button). Only meaningful for the two finite-choice
@@ -13826,6 +13854,8 @@ cmd_task_need() {
             need_type=$(sqlq "$type"), ask=$(sqlq "$ask"),
             need_options=$(sqlq_or_null "$options"),
             recommend=$(sqlq_or_null "$recommend"),
+            secret_key=$(sqlq_or_null "$secret_key"),
+            connector=$(sqlq_or_null "$connector"),
             tier=${tier}, need_asked_at=datetime('now'), gate_pinged_at=NULL,
             need_answer=NULL, need_answered_at=NULL
       WHERE id=${id};"
@@ -13856,7 +13886,7 @@ cmd_task_need() {
   # failed DM must never fail the gate write that just committed above.
   # DIVE-891: tier 1 gates still notify (they're answerable early); the 48h TTL
   # is a backstop, not a silencer. Only tier 0 skips the ping.
-  task_need_notify "$ident" "$type" "$ask" "$options" "$recommend" || true
+  task_need_notify "$ident" "$type" "$ask" "$options" "$recommend" "$secret_key" "$connector" || true
   local floor_note=""; (( tier_floored )) && floor_note=" [tier forced to 2 — T2 category floor]"
   ok "$ident needs a human ($type, tier $tier)${floor_note} — $ask" \
      '{id:($i|tonumber), ident:$id, status:"blocked", need_type:$ty, tier:($tr|tonumber), tier_floored:($fl=="1"), ask:$ak, need_options:(($op|select(length>0)) // null), recommend:(($rc|select(length>0)) // null), assignee:$ac}' \
@@ -13997,8 +14027,39 @@ _task_close_notify() {
 # task_actor does; the token comes from the group-claude-readable connector
 # file (or an inherited env var); and access.json is found by probing the
 # per-type channel dirs (own file when direct, root-readable when sudo).
+# _task_mint_drop_link — DIVE-931. Mint a one-time secure credential drop link
+# for a secret gate (api POST /drop/mint, box-authed with the box's connectord
+# token). Echoes exactly one of:
+#   <url>|<ttlMinutes>   a live burnable link (api pushes the value to the box)
+#   ONBOX                 api holds no usable token for this box -> on-box path
+#   (empty)               mint unavailable (self-hosted / api down) -> legacy text
+# Best-effort: never fails the caller and never touches the secret VALUE (only the
+# destination coordinates). The value crosses solely via the drop page -> stdin.
+_task_mint_drop_link() {
+  local ident="$1" secret_key="$2" connector="$3"
+  local token="" env_file="/etc/5dive/connectord.env"
+  [[ -n "${CONNECTORD_TOKEN:-}" ]] && token="$CONNECTORD_TOKEN"
+  [[ -z "$token" && -r "$env_file" ]] && token=$(sed -n 's/^CONNECTORD_TOKEN=//p' "$env_file" | head -1)
+  [[ -n "$token" ]] || return 0   # no box identity (self-hosted OSS) -> legacy text
+  local api="${FIVE_API_BASE:-https://api.5dive.com}" body resp
+  body=$(jq -nc --arg t "$ident" --arg k "$secret_key" --arg c "$connector" \
+           '{taskIdent:$t, secretKey:$k, connector:$c, ttlMinutes:30}') || return 0
+  resp=$(curl -fsS --max-time 10 -X POST "${api%/}/drop/mint" \
+           -H "authorization: Bearer ${token}" -H "content-type: application/json" \
+           -d "$body" 2>/dev/null) || return 0
+  if [[ "$(printf '%s' "$resp" | jq -r '.useOnBoxPath // false' 2>/dev/null)" == "true" ]]; then
+    echo "ONBOX"; return 0
+  fi
+  local url ttl
+  url=$(printf '%s' "$resp" | jq -r '.url // empty' 2>/dev/null)
+  ttl=$(printf '%s' "$resp" | jq -r '.ttlMinutes // empty' 2>/dev/null)
+  [[ -n "$url" ]] || return 0
+  echo "${url}|${ttl:-15}"
+}
+
 task_need_notify() {
   local ident="$1" need_type="$2" ask="$3" options="$4" recommend="${5:-}"
+  local secret_key="${6:-}" connector="${7:-}"
 
   # Resolve bot token + the human's DM/group targets (TASK_CH_* globals). The
   # matched access type (TASK_CH_TYPE) gates the tap-to-answer buttons below.
@@ -14050,8 +14111,26 @@ task_need_notify() {
   # recovery path when a tap fails; the answer command works on EVERY box, run
   # as a human login (claude/root — the human path clears approval/secret gates).
   case "$need_type" in
-    secret) text+=$'\n\n'"🔑 Put the key where I expect it (my .env / our channel), then tap ✅ Provided below — don't paste the key here. Tap not working? On the box: sudo 5dive task answer ${ident}" ;;
-    manual) text+=$'\n\n'"✋ Tap ✅ Done below once it's handled — closes this out. Or on the box: sudo 5dive task answer ${ident} --value=done" ;;
+    secret)
+      # DIVE-931: when the gate names a drop target (secret_key + connector), mint
+      # a burnable single-use link so the human drops the credential straight onto
+      # the box — the VALUE never transits chat, only the link does. Falls back to
+      # the on-box `secret write` (tokenless boxes) or the legacy out-of-band text
+      # (self-hosted / api unreachable). The box-side write auto-clears this gate.
+      local _drop=""
+      if [[ -n "$secret_key" && -n "$connector" ]]; then
+        _drop=$(_task_mint_drop_link "$ident" "$secret_key" "$connector")
+      fi
+      if [[ "$_drop" == "ONBOX" ]]; then
+        text+=$'\n\n'"🔑 [${ident}] needs the ${secret_key} credential. On the box, drop it straight in (never paste it here):"$'\n'"  echo -n \"\$SECRET\" | sudo 5dive secret write ${secret_key} --connector=${connector} --task=${ident}"$'\n'"That writes it and clears this gate. Or tap ✅ Provided once it is done."
+      elif [[ -n "$_drop" ]]; then
+        local _url="${_drop%%|*}" _ttl="${_drop##*|}"
+        text+=$'\n\n'"🔑 [${ident}] needs the ${secret_key} credential. Drop it securely (single-use, expires in ${_ttl}m):"$'\n'"${_url}"$'\n'"The value goes straight onto your box and is never shown in chat. Prefer the box? echo -n \"\$SECRET\" | sudo 5dive secret write ${secret_key} --connector=${connector} --task=${ident}"
+      else
+        text+=$'\n\n'"🔑 Put the key where I expect it (my .env / our channel), then tap ✅ Provided below. Don't paste the key here. Tap not working? On the box: sudo 5dive task answer ${ident}"
+      fi
+      ;;
+    manual) text+=$'\n\n'"✋ Tap ✅ Done below once it is handled, which closes this out. Or on the box: sudo 5dive task answer ${ident} --value=done" ;;
   esac
 
   # DIVE-117/118 tap-to-answer buttons. GATED to the plugin types whose `tna:`
@@ -20380,6 +20459,144 @@ cmd_import() {
      '{name:$n, type:$t, memory:$mem, memorySeeded:$ms, skillsAdded:$a, skillsSkipped:$s, template:$tpl, avatar:$av, reported:$ri}' \
      --arg n "$as" --arg t "$type" --arg mem "$mem_inc" --arg ms "$mem_seeded" --argjson a "$added_j" --argjson s "$skipped_j" --arg tpl "$templated" --arg av "$avatar_note" --arg ri "$reported"
 }
+# cmd_secret — box-side secret-write primitive (DIVE-930/932, secure credential drop).
+#
+# The single hardened, allowlisted write-path that lands a credential in the
+# box's secret store. Shared by BOTH callers in the DIVE-919 chain:
+#   - api (DIVE-930): execOnServer(userId, ['5dive','secret','write',KEY,
+#     '--connector='..], {stdin: value})  -> the hosted /drop endpoint.
+#   - telegram plugin (DIVE-932): `sudo -n 5dive secret write ...` locally, the
+#     burn-after-read safety net for accidental plaintext.
+#
+# Hard invariants (Marcus ship-gates these hardest, spec:
+# community/wiki/secure-credential-drop-link-spec.md):
+#   - value crosses on STDIN ONLY, never argv  -> never in ps/process-table,
+#     shell history, or the audit log (main.sh audits argv, which omits value).
+#   - atomic write: temp file in the same dir + rename; no partial/torn file.
+#   - idempotent key update: replace an existing `KEY=` line in place, never
+#     blind-append a duplicate.
+#   - file perms 600, owner root:claude (connectors dir is root-owned).
+#   - value is NEVER echoed back, logged, or persisted anywhere but the target.
+#   - embedded newline in the value is REJECTED (would inject extra env lines).
+#
+# Target (gate answer DIVE-932, 2026-07-03): per-connector file
+#   /etc/5dive/connectors/<connector>.env
+# ties the secret to the connector that consumes it (matches the existing
+# anthropic.env / expo.env layout).
+
+# CONNECTORS_DIR is the hardcoded global from header.sh (/etc/5dive/connectors).
+# Intentionally NOT env-overridable — a caller must not be able to redirect where
+# a secret lands.
+SECRET_WRITE_LOCK="/run/5dive-secret-write.lock"
+
+_secret_usage() {
+  cat >&2 <<'EOF'
+5dive secret — box-side secret store (secure credential drop, DIVE-919)
+
+  5dive secret write <KEY> --connector=<name> [--task=<DIVE-N>]   (value on STDIN)
+      Write/replace KEY in /etc/5dive/connectors/<name>.env. Atomic,
+      idempotent, 600 root:claude. The value is read from stdin and never
+      appears in argv, logs, or output. Root-only. With --task, a confirmed
+      write clears that task's pending secret gate (secure-drop path).
+
+      echo -n "$TOKEN" | sudo 5dive secret write OPENAI_API_KEY --connector=openai
+EOF
+}
+
+# valid env-var name: leading letter/underscore, then upper alnum/underscore.
+# Restricting to this charset also makes it safe to interpolate into the
+# `^KEY=` grep pattern below without regex-escaping.
+_valid_env_key() { [[ "$1" =~ ^[A-Z_][A-Z0-9_]*$ ]]; }
+# connector filename stem: lower alnum + dashes; no dots/slashes -> no path
+# traversal, no hidden double-extension.
+_valid_connector() { [[ "$1" =~ ^[a-z0-9][a-z0-9-]*$ ]]; }
+
+cmd_secret() {
+  [[ $# -gt 0 ]] || { _secret_usage; exit "$E_USAGE"; }
+  local sub="$1"; shift
+  case "$sub" in
+    write) _secret_write "$@" ;;
+    -h|--help|help) _secret_usage ;;
+    *) fail "$E_USAGE" "unknown secret command: $sub (write)" ;;
+  esac
+}
+
+_secret_write() {
+  local key="" connector="" task=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --connector=*) connector="${1#*=}" ;;
+      --connector)   connector="${2:-}"; shift ;;
+      # DIVE-931: the originating secret gate. On a confirmed write we clear it
+      # (equivalent to the "Provided" tap) — a secure drop IS the human providing
+      # the credential. Optional: a plain `secret write` (no drop) omits it.
+      --task=*)      task="${1#*=}" ;;
+      --task)        task="${2:-}"; shift ;;
+      --*)           fail "$E_USAGE" "unknown flag: $1" ;;
+      *)             [[ -z "$key" ]] && key="$1" || fail "$E_USAGE" "unexpected argument: $1" ;;
+    esac
+    shift
+  done
+
+  require_root secret write
+  [[ -n "$key" ]]       || fail "$E_USAGE" "usage: 5dive secret write <KEY> --connector=<name> (value on stdin)"
+  [[ -n "$connector" ]] || fail "$E_USAGE" "--connector=<name> is required"
+  _valid_env_key "$key"       || fail "$E_USAGE" "invalid KEY '$key' (env-var name: ^[A-Z_][A-Z0-9_]*\$)"
+  _valid_connector "$connector" || fail "$E_USAGE" "invalid --connector '$connector' (^[a-z0-9][a-z0-9-]*\$)"
+
+  # Value on stdin ONLY. A tty means no value was piped -> refuse rather than
+  # block reading from the keyboard (and rather than accept an empty secret).
+  [[ -t 0 ]] && fail "$E_USAGE" "secret value must be piped on stdin (never passed as an argument)"
+  local value; value="$(cat)"
+  # Strip a single trailing CR/LF pair left by echo / heredocs; preserve any
+  # other bytes verbatim.
+  value="${value%$'\n'}"; value="${value%$'\r'}"
+  [[ -n "$value" ]] || fail "$E_USAGE" "empty secret on stdin — nothing to write"
+  # An embedded newline could smuggle additional `EVIL=...` lines into the env
+  # file. Reject outright.
+  [[ "$value" == *$'\n'* ]] && fail "$E_USAGE" "secret value must be single-line (embedded newline rejected)"
+
+  local target="${CONNECTORS_DIR}/${connector}.env"
+  mkdir -p "$CONNECTORS_DIR"; chmod 750 "$CONNECTORS_DIR" 2>/dev/null || true
+
+  # Serialize concurrent writers (two keys into the same file must not lose an
+  # update through read-modify-write interleaving). One global lock is plenty at
+  # this volume. flock releases when fd 9 closes (process exit or the exec below).
+  exec 9>"$SECRET_WRITE_LOCK" || fail "$E_GENERIC" "cannot open secret-write lock"
+  flock 9 || fail "$E_GENERIC" "cannot acquire secret-write lock"
+
+  local action="created"
+  [[ -f "$target" ]] && grep -qE "^${key}=" "$target" && action="updated"
+
+  # Temp file in the SAME dir so the final mv is a rename (atomic), never a
+  # cross-filesystem copy. mktemp is 600 by default; set it explicitly anyway so
+  # the secret is never briefly group/world-readable.
+  local tmp; tmp="$(mktemp "${target}.XXXXXX")" || fail "$E_GENERIC" "mktemp failed"
+  chmod 600 "$tmp"
+  # Carry every OTHER key forward; drop the old line for this key (idempotent
+  # replace). `|| true`: grep -v exits 1 when the result is empty (file held only
+  # this key) — not an error under set -e.
+  if [[ -f "$target" ]]; then grep -vE "^${key}=" "$target" > "$tmp" || true; fi
+  printf '%s=%s\n' "$key" "$value" >> "$tmp"
+  chown root:claude "$tmp" 2>/dev/null || true
+  chmod 600 "$tmp"
+  mv -f "$tmp" "$target"
+  exec 9>&-
+
+  # DIVE-931 gate auto-resolve: the credential is now safely on the box, so clear
+  # the originating secret gate (equivalent to the human tapping "Provided"). We
+  # are root here (require_root above) — a sanctioned human-equivalent path, so
+  # `task answer` accepts it; --human marks it human-sourced. Shelled out (not an
+  # in-process call) so its `fail`/exit on an already-answered or closed gate can
+  # NEVER abort this command: the write has succeeded and must report success.
+  if [[ -n "$task" ]]; then
+    5dive task answer "$task" --human --from=drop >/dev/null 2>&1 || true
+  fi
+
+  ok "secret $action: $key -> ${connector}.env" \
+     '{connector: $c, key: $k, action: $a, path: $p}' \
+     --arg c "$connector" --arg k "$key" --arg a "$action" --arg p "$target"
+}
 
 # -------- self-update (fetch installer + --upgrade, then restart agents) --------
 #
@@ -21025,6 +21242,12 @@ main() {
       # DIVE-519: mint a human-origin proof token for an approval/secret gate (or
       # toggle enforcement). Root-only (reads the 0400 key); audits its own mint.
       cmd_gate_proof "$@" ;;
+    secret)
+      # DIVE-930/932 secure credential drop: box-side secret-write primitive.
+      # Root-only (writes root-owned /etc/5dive/connectors). The value arrives on
+      # STDIN, so auditing argv here never captures the secret.
+      AUDIT_CMD="secret"; AUDIT_ARGS=("$@")
+      cmd_secret "$@" ;;
     org)
       # Agent org chart (sqlite, same store as tasks). Read/write, no audit/lock.
       cmd_org "$@" ;;
