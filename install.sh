@@ -284,9 +284,16 @@ DIGESTCRON
   # CLAUDE.md fragment appended to every claude-type agent's $HOME/.claude/
   # CLAUDE.md at create: the self-gated Fable-orchestrator + per-subagent
   # model-tiering default (DIVE-899 — inert unless the session model is Fable).
-  curl -fsSL "$REPO/model-tiering-CLAUDE.md" -o "$LIB_DIR/model-tiering-CLAUDE.md"
-  chmod 644 "$LIB_DIR/model-tiering-CLAUDE.md"
-  ok "model-tiering-CLAUDE.md"
+  # Fail-soft: a missing/transient-404 content fragment shouldn't hard-abort
+  # the whole install (curl -f exits 37 on a file:// bundle that omits it, which
+  # is what reddened install-smoke — DIVE-938). This mirrors the team-templates
+  # staging below. The file is inert unless the session model is Fable (DIVE-899).
+  if curl -fsSL "$REPO/model-tiering-CLAUDE.md" -o "$LIB_DIR/model-tiering-CLAUDE.md"; then
+    chmod 644 "$LIB_DIR/model-tiering-CLAUDE.md"
+    ok "model-tiering-CLAUDE.md"
+  else
+    echo "warn: failed to stage model-tiering-CLAUDE.md — Fable model-tiering default won't apply until the next refresh" >&2
+  fi
 
   # Curated team templates for `5dive team import <slug>` (the compose engine
   # resolves $LIB_DIR/team-templates first). Enumerated explicitly because $REPO
