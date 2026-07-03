@@ -1230,7 +1230,20 @@ cmd_task_need() {
   # failed DM must never fail the gate write that just committed above.
   # DIVE-891: tier 1 gates still notify (they're answerable early); the 48h TTL
   # is a backstop, not a silencer. Only tier 0 skips the ping.
-  task_need_notify "$ident" "$type" "$ask" "$options" "$recommend" "$secret_key" "$connector" || true
+  # DIVE-916: mint the per-gate HUMAN nonce for hard human gates (approval/
+  # secret/manual — the types `task answer` enforces as human-only). Store ONLY
+  # its hash; the raw nonce is handed to task_need_notify to embed in the tap
+  # callback_data. It is never printed to stdout, so the agent that filed the
+  # gate never sees it. decision gates are agent-clearable → no nonce.
+  local human_nonce=""
+  case "$type" in
+    approval|secret|manual)
+      human_nonce=$(_human_nonce_mint)
+      [[ -n "$human_nonce" ]] \
+        && db "UPDATE tasks SET human_nonce_hash=$(sqlq "$(_human_nonce_sha "$human_nonce")") WHERE id=${id};"
+      ;;
+  esac
+  task_need_notify "$ident" "$type" "$ask" "$options" "$recommend" "$secret_key" "$connector" "$human_nonce" || true
   local floor_note=""; (( tier_floored )) && floor_note=" [tier forced to 2 — T2 category floor]"
   ok "$ident needs a human ($type, tier $tier)${floor_note} — $ask" \
      '{id:($i|tonumber), ident:$id, status:"blocked", need_type:$ty, tier:($tr|tonumber), tier_floored:($fl=="1"), ask:$ak, need_options:(($op|select(length>0)) // null), recommend:(($rc|select(length>0)) // null), assignee:$ac}' \
@@ -1403,7 +1416,12 @@ _task_mint_drop_link() {
 
 task_need_notify() {
   local ident="$1" need_type="$2" ask="$3" options="$4" recommend="${5:-}"
-  local secret_key="${6:-}" connector="${7:-}"
+  local secret_key="${6:-}" connector="${7:-}" human_nonce="${8:-}"
+  # DIVE-916: callback_data suffix carrying the raw per-gate nonce for the tap
+  # paths (approval/secret/manual). Empty for decision (agent-clearable, no
+  # nonce) so its `tna:<id>:<idx>` payload is byte-unchanged. The plugin `tna:`
+  # handler treats a present 4th `:`-field as --human-proof.
+  local _np=""; [[ -n "$human_nonce" ]] && _np=":${human_nonce}"
 
   # Resolve bot token + the human's DM/group targets (TASK_CH_* globals). The
   # matched access type (TASK_CH_TYPE) gates the tap-to-answer buttons below.
@@ -1523,23 +1541,24 @@ task_need_notify() {
       # DIVE-148: ⭐-mark whichever button the agent recommended (approved/denied)
       # and seat it first. Default order (Approve, Deny) when no recommendation.
       local _rl; _rl=$(printf '%s' "$recommend" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')
-      local _appr='{"text":"✅ Approve","callback_data":"tna:'"${numid}"':approved"}'
-      local _deny='{"text":"🚫 Deny","callback_data":"tna:'"${numid}"':denied"}'
+      # DIVE-916: ${_np} appends :<nonce> so the tap carries --human-proof.
+      local _appr='{"text":"✅ Approve","callback_data":"tna:'"${numid}"':approved'"${_np}"'"}'
+      local _deny='{"text":"🚫 Deny","callback_data":"tna:'"${numid}"':denied'"${_np}"'"}'
       case "$_rl" in
-        approve|approved) _appr='{"text":"⭐ ✅ Approve","callback_data":"tna:'"${numid}"':approved"}'
+        approve|approved) _appr='{"text":"⭐ ✅ Approve","callback_data":"tna:'"${numid}"':approved'"${_np}"'"}'
                           reply_markup='{"inline_keyboard":[['"$_appr"','"$_deny"']]}' ;;
-        deny|denied)      _deny='{"text":"⭐ 🚫 Deny","callback_data":"tna:'"${numid}"':denied"}'
+        deny|denied)      _deny='{"text":"⭐ 🚫 Deny","callback_data":"tna:'"${numid}"':denied'"${_np}"'"}'
                           reply_markup='{"inline_keyboard":[['"$_deny"','"$_appr"']]}' ;;
         *)                reply_markup='{"inline_keyboard":[['"$_appr"','"$_deny"']]}' ;;
       esac
     elif [[ "$need_type" == "secret" ]]; then
       # DIVE-356: one-tap "Provided" — the plugin handler runs `task answer <id>`
       # with NO value (the CLI rejects a value for a secret gate). Matches dev's
-      # tna:<numid>:provided contract.
-      reply_markup='{"inline_keyboard":[[{"text":"✅ Provided","callback_data":"tna:'"${numid}"':provided"}]]}'
+      # tna:<numid>:provided contract. DIVE-916: ${_np} appends the nonce.
+      reply_markup='{"inline_keyboard":[[{"text":"✅ Provided","callback_data":"tna:'"${numid}"':provided'"${_np}"'"}]]}'
     elif [[ "$need_type" == "manual" ]]; then
       # DIVE-356: one-tap "Done" — handler runs `task answer <id> --value=done`.
-      reply_markup='{"inline_keyboard":[[{"text":"✅ Done","callback_data":"tna:'"${numid}"':done"}]]}'
+      reply_markup='{"inline_keyboard":[[{"text":"✅ Done","callback_data":"tna:'"${numid}"':done'"${_np}"'"}]]}'
     fi
   fi
 
@@ -1682,7 +1701,7 @@ cmd_gate_proof() {
 
 cmd_task_answer() {
   tasks_db_init
-  local value="" value_set=0 from="" human=0 proof=""
+  local value="" value_set=0 from="" human=0 proof="" human_proof=""
   local -a positional=()
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -1696,6 +1715,10 @@ cmd_task_answer() {
       # DIVE-519: human-origin proof token (minted by `5dive gate-proof`) that the
       # trusted paths attach to clear an approval/secret gate. Verified below.
       --proof=*) proof="${1#*=}" ;;
+      # DIVE-916: per-gate HUMAN nonce (from the Telegram tap callback_data /
+      # dashboard payload) — the evidence form for the plugin-tap path, whose
+      # SUDO_UID is the spawning agent. Verified against human_nonce_hash below.
+      --human-proof=*) human_proof="${1#*=}" ;;
       --)        shift; positional+=("$@"); break ;;
       -*)        fail "$E_USAGE" "unknown flag: $1" ;;
       *)         positional+=("$1") ;;
@@ -1725,13 +1748,15 @@ cmd_task_answer() {
   # answer` becomes root and passes — closing that (require a --human secret the
   # trusted paths inject) is the documented fast-follow; the --human flag is
   # already parsed + recorded as provenance to stage it.
-  if [[ "$nt" == "approval" || "$nt" == "secret" ]]; then
+  # DIVE-916: `manual` joins approval/secret as a hard human gate here — it's a
+  # step only a person can do, so an agent must not self-answer it either.
+  if [[ "$nt" == "approval" || "$nt" == "secret" || "$nt" == "manual" ]]; then
     local _caller; _caller=$(id -un 2>/dev/null || echo '?')
     if [[ "$_caller" == agent-* ]]; then
       # No audit_log here: the blocked caller is an agent user that can't write
       # the root-owned audit log anyway (it would only leak a perms error to
       # stderr). The fail + non-zero exit is the record.
-      fail "$E_AUTH_REQUIRED" "$ident is a '$nt' gate — only a human can clear it. Answer it from Telegram (tap the button) or the dashboard; an agent can't self-answer an approval/secret gate."
+      fail "$E_AUTH_REQUIRED" "$ident is a '$nt' gate — only a human can clear it. Answer it from Telegram (tap the button) or the dashboard; an agent can't self-answer an approval/secret/manual gate."
     fi
   fi
 
@@ -1754,16 +1779,39 @@ cmd_task_answer() {
   # The agent-* uid block above + this agent-path-needs-proof rule are what actually
   # stop the DIVE-515/516 incident (an agent silently self-clearing); humans are
   # never blocked. Consistent with the agreed bar-raise scope (not airtight).
-  if [[ "$nt" == "approval" || "$nt" == "secret" ]]; then
-    local _pv=0
+  if [[ "$nt" == "approval" || "$nt" == "secret" || "$nt" == "manual" ]]; then
+    # DIVE-916: three EQUIVALENT human-evidence forms — accept ANY one, never
+    # require two (double-gating a real tap violates DIVE-525):
+    #   (a) --human-proof=<nonce> matching this gate's stored hash — the plugin
+    #       tap / dashboard payload, the one path whose SUDO_UID is the agent,
+    #   (b) a valid DIVE-519 --proof token — the already-shipped dashboard /
+    #       gate-proof path, kept so it does not regress,
+    #   (c) a non-agent SUDO_UID — a claude/root interactive login AND the
+    #       DIVE-931 secret-drop write (shelld runs it as SUDO_UID=claude, which
+    #       survives the nested non-sudo task-answer exec; verified empirically).
+    # This supersedes the DIVE-519 "proof OR bare --human" rule: a bare --human
+    # is no longer sufficient — that was the sudo→--human forge (DIVE-916 threat).
+    local _hp=0 _pv=0 _su=0
+    [[ -n "$human_proof" ]] && _human_nonce_verify "$id" "$human_proof" && _hp=1
     [[ -n "$proof" ]] && _gate_proof_verify "$id" "$nt" "$proof" && _pv=1
+    _gate_sudo_uid_nonagent && _su=1
+    local _evid=$(( _hp || _pv || _su ))
     local _caller2; _caller2=$(id -un 2>/dev/null || echo '?')
-    audit_log "task answer gate" "$([[ $_pv -eq 1 ]] && echo ok || echo error)" 0 -- \
-      "task=$ident" "type=$nt" "proof=$([[ -n "$proof" ]] && echo present || echo absent)" \
-      "valid=$_pv" "human=$human" "caller=$_caller2" "sudo_user=${SUDO_USER:-}" "enforce=$(_gate_proof_enforced && echo on || echo off)"
-    # Reject only the agent path (no --human) without a valid proof. Human taps clear.
-    if _gate_proof_enforced && (( ! _pv )) && (( ! human )); then
-      fail "$E_AUTH_REQUIRED" "$ident ($nt) needs a human to approve it — answer from Telegram (tap the button) or the dashboard. (An agent can't self-clear an approval/secret gate.)"
+    audit_log "task answer gate" "$([[ $_evid -eq 1 ]] && echo ok || echo error)" 0 -- \
+      "task=$ident" "type=$nt" \
+      "human_proof=$([[ -n "$human_proof" ]] && echo present || echo absent)" "nonce_valid=$_hp" \
+      "proof=$([[ -n "$proof" ]] && echo present || echo absent)" "proof_valid=$_pv" \
+      "sudo_nonagent=$_su" "human=$human" "caller=$_caller2" "sudo_uid=${SUDO_UID:-}" \
+      "enforce=$(_gate_proof_enforced && echo on || echo off)"
+    # DIVE-525: a real human tap is NEVER rejected — every trusted path supplies
+    # at least one evidence form (plugin→nonce, dashboard→proof/SUDO_UID=claude,
+    # human-on-box→non-agent SUDO_UID, drop→SUDO_UID=claude). Under enforcement,
+    # reject only when NONE is present (the forge: an agent's bare
+    # `sudo task answer --human`). Ships DORMANT (audit-only) until the plugin
+    # --human-proof injection is confirmed live fleet-wide; root then flips
+    # `gate-proof enforce on` (Marcus ship-gates the flip).
+    if _gate_proof_enforced && (( ! _evid )); then
+      fail "$E_AUTH_REQUIRED" "$ident ($nt) needs a human to clear it — tap the button in Telegram or use the dashboard. (An agent can't self-clear an approval/secret/manual gate.)"
     fi
   fi
 
