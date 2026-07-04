@@ -124,19 +124,11 @@ ${roster}
 PROMPT
 }
 
-# ------- assignee/role resolution (DIVE-980 degrade): echoes agent or "" -------
-# role:<r> -> the unique org-chart holder of that role, else "" (unresolvable).
-# a literal name (optionally @-prefixed) is taken as-is.
-_goal_resolve_assignee() {
-  local v="${1#@}"
-  if [[ "$v" == role:* ]]; then
-    local r="${v#role:}" n
-    [[ "$(db "SELECT COUNT(*) FROM agents_org WHERE role=$(sqlq "$r");" 2>/dev/null)" == "1" ]] || { printf ''; return; }
-    db "SELECT name FROM agents_org WHERE role=$(sqlq "$r") LIMIT 1;"
-    return
-  fi
-  printf '%s' "$v"
-}
+# ------- assignee/role resolution: echoes agent or "" (unresolvable) -------
+# Shares the org-chart resolver with `task add` (DIVE-980) so the planner and a
+# direct `task add --assignee=role:<r>` route identically. role:/charter: tokens
+# resolve to their unique org holder (else ""); a literal name passes through.
+_goal_resolve_assignee() { _org_resolve_assignee "$1"; }
 
 # ------- plan validation (the core testable unit) -------
 # _goal_validate_plan <plan_json> <max_tasks> <depth_cap>

@@ -7,7 +7,8 @@ _task_usage() {
 
   5dive task init                                    # one-time root bootstrap of the store
   5dive task add <title...> [--body=<text>] [--priority=low|medium|high|urgent]
-                            [--assignee=<agent>] [--parent=<id|DIVE-N>] [--from=<who>]
+                            [--assignee=<agent|role:<r>|charter:<kw>>] [--parent=<id|DIVE-N>] [--from=<who>]
+                                                     # --assignee token routes via the org chart (DIVE-980); omit = org lead/coordinator
                             [--recurring="<cron>"]  # recurring=template (5-field cron, e.g. "0 2 * * *")
                             [--accept=<criteria>] [--verify=<cmd>] [--max-iters=<n>] [--verifier=<agent>] [--no-verify]
                                                      # DIVE-969: non-trivial tasks are verifier-graded BY DEFAULT (a grader
@@ -162,6 +163,35 @@ _task_default_verifier() {
   printf '%s' "$v"
 }
 
+# DIVE-980: shared org-chart assignee resolution. Resolve an assignee TOKEN to a
+# concrete agent via the org chart (agents_org). Prints the resolved name, or
+# NOTHING when a role/charter token has no UNIQUE holder — callers decide whether
+# that empty is a hard error (task add) or a fall-through (goal validate).
+# Deterministic + explainable: a role/charter routes ONLY on an unambiguous
+# single match; >1 holder or unknown -> empty (never guess which one).
+#   @name / bare name  -> taken as-is (explicit override; never re-routed)
+#   role:<r>           -> the lone agents_org holder whose role == <r> (ci)
+#   charter:<kw>       -> the lone holder whose title (charter) contains <kw> (ci)
+# Safe on an empty/missing org table (COUNT != 1 -> empty).
+_org_resolve_assignee() {
+  local v="${1#@}"
+  case "$v" in
+    role:*)
+      local r="${v#role:}"
+      [[ "$(db "SELECT COUNT(*) FROM agents_org WHERE role IS NOT NULL AND lower(role)=lower($(sqlq "$r"));" 2>/dev/null)" == "1" ]] || { printf ''; return; }
+      db "SELECT name FROM agents_org WHERE role IS NOT NULL AND lower(role)=lower($(sqlq "$r")) LIMIT 1;"
+      ;;
+    charter:*)
+      local kw="${v#charter:}"
+      [[ "$(db "SELECT COUNT(*) FROM agents_org WHERE title IS NOT NULL AND lower(title) LIKE '%'||lower($(sqlq "$kw"))||'%';" 2>/dev/null)" == "1" ]] || { printf ''; return; }
+      db "SELECT name FROM agents_org WHERE title IS NOT NULL AND lower(title) LIKE '%'||lower($(sqlq "$kw"))||'%' LIMIT 1;"
+      ;;
+    *)
+      printf '%s' "$v"
+      ;;
+  esac
+}
+
 cmd_task_add() {
   tasks_db_init
   local body="" priority="medium" assignee="" parent="" from="" recurring="" fresh="" project="dive"
@@ -230,6 +260,19 @@ cmd_task_add() {
   local parent_sql="NULL"
   if [[ -n "$parent" ]]; then
     resolve_task_id "$parent"; parent_sql="$RESOLVED_TASK_ID"
+  fi
+  # DIVE-980: an explicit --assignee may be a literal agent name OR an org-chart
+  # TOKEN (role:<r> / charter:<kw> / @name). Route tokens through the org chart;
+  # a literal name is trusted verbatim (explicit --assignee always wins). A token
+  # with no UNIQUE holder is a hard, EXPLAINABLE error — never a silent misroute.
+  if [[ -n "$assignee" ]]; then
+    case "$assignee" in
+      role:*|charter:*|@*)
+        local _resolved; _resolved=$(_org_resolve_assignee "$assignee")
+        [[ -n "$_resolved" ]] || fail "$E_NOT_FOUND" "--assignee='$assignee' has no unique holder in the org chart (see: 5dive org ls) — assign by explicit agent name, or place/disambiguate the role with 5dive org set"
+        assignee="$_resolved"
+        ;;
+    esac
   fi
   # fresh: per-task clean-session pref (DIVE-138). Recurring templates default to
   # fresh=1 (clean each run — Mark's decision for the community/marketing jobs)

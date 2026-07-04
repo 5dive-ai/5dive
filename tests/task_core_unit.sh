@@ -186,6 +186,49 @@ selfg=$(run add --assignee=carol --body="work" -- "carol's own task")
 [[ "$(echo "$selfg" | jf '.data.verifyDefaulted')" == "false" ]] \
   && ok_t "no self-grading when maker is the only grader" || bad_t "self-grade guard" "$(echo "$selfg" | jf '.data.verifyDefaulted')"
 
+# --- DIVE-980: org-chart assignee-token routing on `task add` --------------
+# Place a small org: eng (role=engineer, charter mentions "backend"), doc,
+# and two designers (ambiguous role) to prove deterministic single-match only.
+( cmd_org_set eng --role=engineer --title="backend platform" ) >/dev/null 2>&1
+( cmd_org_set doc --role=writer --title="docs and copy" )      >/dev/null 2>&1
+( cmd_org_set d1  --role=designer )                            >/dev/null 2>&1
+( cmd_org_set d2  --role=designer )                            >/dev/null 2>&1
+
+# role:<r> routes to the unique holder
+r1=$(run add --assignee=role:engineer --body="w" -- "route by role")
+[[ "$(echo "$r1" | jf '.data.assignee')" == "eng" ]] \
+  && ok_t "--assignee=role:engineer resolves to eng" || bad_t "role token resolve" "$(echo "$r1" | jf '.data.assignee')"
+
+# role match is case-insensitive
+r1b=$(run add --assignee=role:Engineer --body="w" -- "route by role ci")
+[[ "$(echo "$r1b" | jf '.data.assignee')" == "eng" ]] \
+  && ok_t "role token is case-insensitive" || bad_t "role ci" "$(echo "$r1b" | jf '.data.assignee')"
+
+# charter:<kw> routes to the unique holder whose title contains the keyword
+r2=$(run add --assignee=charter:backend --body="w" -- "route by charter")
+[[ "$(echo "$r2" | jf '.data.assignee')" == "eng" ]] \
+  && ok_t "--assignee=charter:backend resolves to eng" || bad_t "charter token resolve" "$(echo "$r2" | jf '.data.assignee')"
+
+# ambiguous role (two designers) is a hard, explainable error — never a guess
+run add --assignee=role:designer --body="w" -- "ambiguous role" >/dev/null 2>"$TMP"/err
+[[ $? -ne 0 && "$(cat "$TMP"/err)" == *"unique holder"* ]] \
+  && ok_t "ambiguous role token rejected (explainable)" || bad_t "ambiguous role guard" "$(cat "$TMP"/err)"
+
+# unknown role token is rejected too
+run add --assignee=role:ghost --body="w" -- "unknown role" >/dev/null 2>"$TMP"/err
+[[ $? -ne 0 ]] \
+  && ok_t "unknown role token rejected" || bad_t "unknown role guard" "resolved anyway"
+
+# explicit literal name still wins verbatim — never re-routed through the org
+r3=$(run add --assignee=eng --body="w" -- "explicit name wins")
+[[ "$(echo "$r3" | jf '.data.assignee')" == "eng" ]] \
+  && ok_t "explicit literal --assignee is trusted verbatim" || bad_t "explicit name" "$(echo "$r3" | jf '.data.assignee')"
+
+# @name form is accepted and stripped to the bare name
+r4=$(run add --assignee=@eng --body="w" -- "at-name form")
+[[ "$(echo "$r4" | jf '.data.assignee')" == "eng" ]] \
+  && ok_t "@name is stripped to bare name" || bad_t "@name" "$(echo "$r4" | jf '.data.assignee')"
+
 echo "-----"
 echo "task_core_unit: $PASS passed, $FAIL failed"
 [[ $FAIL -eq 0 ]]
