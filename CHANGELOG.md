@@ -11,6 +11,15 @@ release.
 
 ### Added
 
+- 0.7.5 (DIVE-973): stuck-lane analytics in the daily digest — MTTU
+  (mean-time-to-unstick). Sourced from the supervisor_events transition trail
+  (which folds in loop_runs.stuck onsets as cause=loop-stuck): each stuck
+  episode is a transition into classification=stuck paired with the next
+  transition out of it; MTTU is the mean of those durations for episodes that
+  recovered in the window. `digest --json` gains a `stuck` block
+  (mttuSec/episodes/openStuck/byCause); the text digest adds an "Unstick" line
+  plus a still-stuck callout. Same spirit as the zero-human KPI, zero agent
+  tokens.
 - 0.7.4 (DIVE-993): `5dive hire <role> --from-market` — one command from the
   open market to an employed teammate. Resolves <role> against the character-pack
   registry (rarity + completeness-tiered pick), provisions from that persona via

@@ -26,7 +26,7 @@ esac
 
 # Bumped on every public release. `build.sh` checks this line exists; CI fails
 # the bundle-drift check if it's missing or empty.
-readonly FIVE_VERSION="0.7.4"
+readonly FIVE_VERSION="0.7.5"
 
 # GitHub org our repos live under. The org is being renamed
 # 5dive-com -> 5dive-ai (2026-06); fetches must work on either side of the
@@ -20725,8 +20725,21 @@ cmd_digest() {
   _digest_run usage loops --by-loop --all --json >"$tmpd/loops.json" 2>/dev/null || echo '{"data":{"loops":[]}}' >"$tmpd/loops.json"
   [ -s "$tmpd/loops.json" ] || echo '{"data":{"loops":[]}}' >"$tmpd/loops.json"
 
+  # DIVE-973: mean-time-to-unstick (MTTU). Sourced from the supervisor_events
+  # transition trail (see cmd_supervisor.sh) — the single log that captures BOTH
+  # loop_runs.stuck onsets (folded in as cause='loop-stuck') and the service/
+  # tmux/poller/no-progress stuck signals. Each stuck episode = a transition INTO
+  # classification='stuck' paired with the next transition OUT of it; MTTU is the
+  # mean of those durations for episodes that RECOVERED in the window. Read the
+  # trail directly (read-only SELECT, same posture as `supervisor` board): the
+  # loop-status subcommands don't expose history. A generous lookback captures
+  # episodes whose onset predates the window but whose recovery lands inside it.
+  local _sup_lb=$(( $(date +%s) - window - 2592000 ))   # window + 30d onset lookback
+  dbfmt -json "SELECT agent, CAST(strftime('%s', ts) AS INTEGER) AS ts, classification, prev_classification, cause FROM supervisor_events WHERE event='transition' AND ts >= datetime(${_sup_lb}, 'unixepoch') ORDER BY agent, id;" >"$tmpd/sup.json" 2>/dev/null || echo '[]' >"$tmpd/sup.json"
+  [ -s "$tmpd/sup.json" ] || echo '[]' >"$tmpd/sup.json"
+
   DIGEST_TASKS_F="$tmpd/tasks.json" DIGEST_USAGE_F="$tmpd/usage.json" DIGEST_HB_F="$tmpd/hb.txt" \
-  DIGEST_LOOPS_F="$tmpd/loops.json" \
+  DIGEST_LOOPS_F="$tmpd/loops.json" DIGEST_SUP_F="$tmpd/sup.json" \
   DIGEST_WINDOW="$window" DIGEST_JSON="$as_json" python3 - >"$tmpd/out.txt" <<'PY'
 import os, json, time, datetime as dt
 
@@ -20879,6 +20892,56 @@ def _htok(n):
     if n >= 1_000: return f"{n/1_000:.1f}k"
     return str(n)
 
+# DIVE-973: MTTU (mean-time-to-unstick). Walk the supervisor_events transition
+# trail per agent in chronological order. A stuck episode opens at a transition
+# INTO classification='stuck' and closes at the next transition OUT of it (back
+# to healthy/slow/drift). We count an episode toward MTTU when it RECOVERED
+# inside the window (recovery ts >= since); its onset may predate the window.
+# An agent still stuck at read time (open onset, no recovery row) is reported as
+# an unresolved-stuck count, not folded into the mean. cause carries the stuck
+# reason ('loop-stuck' = a loop_runs.stuck onset), so we also break MTTU down by
+# cause. Transition rows only fire on a class change, so stuck onsets never
+# double-count. Empty trail => mttuSec null, zero episodes.
+sup_rows = load("DIGEST_SUP_F", [])
+by_agent = {}
+for r in sup_rows:
+    by_agent.setdefault(r.get("agent"), []).append(r)
+recovered = []          # {agent, onsetTs, recoveryTs, durSec, cause}
+open_stuck = []         # agents with an onset but no recovery row (still wedged)
+for agent, rows in by_agent.items():
+    rows = sorted(rows, key=lambda r: (r.get("ts") or 0))
+    onset_ts = None; onset_cause = None
+    for r in rows:
+        is_stuck = r.get("classification") == "stuck"
+        if is_stuck and onset_ts is None:
+            onset_ts = r.get("ts"); onset_cause = r.get("cause")
+        elif (not is_stuck) and onset_ts is not None:
+            rt = r.get("ts")
+            if rt is not None and onset_ts is not None:
+                recovered.append({"agent": agent, "onsetTs": onset_ts, "recoveryTs": rt,
+                                  "durSec": max(0, rt - onset_ts), "cause": onset_cause})
+            onset_ts = None; onset_cause = None
+    if onset_ts is not None:
+        open_stuck.append({"agent": agent, "onsetTs": onset_ts, "cause": onset_cause})
+
+in_window = [e for e in recovered if (e["recoveryTs"] or 0) >= since]
+mttu_sec = round(sum(e["durSec"] for e in in_window) / len(in_window)) if in_window else None
+mttu_by_cause = {}
+for e in in_window:
+    c = e["cause"] or "unknown"
+    mttu_by_cause.setdefault(c, []).append(e["durSec"])
+mttu_by_cause = {c: {"episodes": len(v), "mttuSec": round(sum(v) / len(v))}
+                 for c, v in mttu_by_cause.items()}
+
+def _hdur(sec):
+    sec = int(sec or 0)
+    if sec < 90: return f"{sec}s"
+    m = sec // 60
+    if m < 90: return f"{m}m"
+    h = m / 60
+    if h < 48: return f"{h:.1f}h"
+    return f"{h/24:.1f}d"
+
 window_label = "7 days" if window >= 604800 else "24h"
 
 # OSS-14: one-glance autonomy rollup — "ran N days, shipped X, asked you Y",
@@ -20918,6 +20981,8 @@ if as_json:
                              "acceptanceRate": prefill_rate},
         "usage": usage_l, "health": {"stale": stale, "hot": [h["name"] for h in hot]},
         "loops": {"total": loops_total, "capped": len(loops_capped), "byLoop": loops_burn},
+        "stuck": {"mttuSec": mttu_sec, "episodes": len(in_window),
+                  "openStuck": len(open_stuck), "byCause": mttu_by_cause},
     }, indent=2))
 else:
     def short(s, n=60):
@@ -20981,6 +21046,19 @@ else:
             out.append(f"  • {l['loopId']} [{l['topology']}] {_htok(l['tokens'])}/{ceil} — {l['status']}{flag}")
         if len(loops_burn) > 6:
             out.append(f"  … +{len(loops_burn) - 6} more")
+    if in_window or open_stuck:
+        out.append("")
+        if in_window:
+            top = sorted(mttu_by_cause.items(), key=lambda kv: kv[1]["episodes"], reverse=True)
+            cause_note = ", ".join(f"{c} {_hdur(v['mttuSec'])}" for c, v in top[:3])
+            line_s = (f"\U0001F551 Unstick — MTTU {_hdur(mttu_sec)} over "
+                      f"{len(in_window)} episode{'s' if len(in_window) != 1 else ''}")
+            if cause_note:
+                line_s += f" ({cause_note})"
+            out.append(line_s)
+        if open_stuck:
+            out.append(f"  ⛔ {len(open_stuck)} still stuck: " +
+                       ", ".join(e["agent"] for e in open_stuck[:6]))
     out.append("")
     if hot:
         out.append("⚠️ Rate-limit watch: " +
