@@ -11,6 +11,11 @@ release.
 
 ### Added
 
+- 0.7.0 (goal decomposition GA): the `5dive goal` line graduates — decompose an
+  outcome into a validated task DAG that materializes ONLY on a human-approved
+  checkpoint (DIVE-984 planner + DIVE-985 approve->materialize). Version milestone;
+  the capability shipped incrementally across 0.6.20-0.6.28.
+
 - DIVE-985: `5dive goal add --from-gate=<id>` completes the approve->materialize
   loop for a gated plan. `--yes` waives ONLY the count checkpoint, so a plan
   carrying a Tier-2 task could be proposed + gated but never built. `--from-gate`
