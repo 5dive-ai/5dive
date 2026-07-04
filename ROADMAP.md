@@ -1,7 +1,7 @@
 # Roadmap
 
 5dive's north star: **run a company of AI agents with humans only where humans are
-genuinely needed.** Agents do the work; you appear for rare, well-formed, tamper-evident
+genuinely needed.** Agents do the work; you appear for rare, well-formed, auditable
 decisions on your phone. Every item below is judged by one metric: fewer human touches
 per unit of shipped work, without losing auditability.
 
@@ -13,7 +13,7 @@ want something pulled forward; real usage reports move items up the list.
 - [x] Unit test suite runs in CI on every PR (July 2026)
 - [ ] Coverage expansion: task queue verbs, agent lifecycle
 - [ ] `CONTRIBUTING.md` + contributor docs (build flow, bundle rule, test harness pattern)
-- [ ] Internal refactors of the largest modules so contributions land on clean seams
+- [ ] Modularize core internals so contributions land on clean seams
 
 ## The company plans itself
 
