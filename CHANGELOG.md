@@ -11,6 +11,23 @@ release.
 
 ### Added
 
+- DIVE-971: multi-runtime supervisor signals — closes the three supervision
+  TODO(P2)s in `cmd_supervisor.sh`. (1) The telegram-poller liveness probe now
+  covers codex/grok/antigravity/opencode via a per-type argv pattern
+  (`_SUP_POLLER_PAT`), not just claude — each type's bridge dir (`telegram-<x>`)
+  is a stable pgrep match. (2) The last-activity/progress age now reads each
+  runtime's own transcript root (`_sup_activity_epoch`: codex
+  `~/.codex/sessions/rollout-*.jsonl`, grok `~/.grok/sessions`, opencode
+  `~/.local/share/opencode/storage`, antigravity
+  `~/.gemini/antigravity-cli/brain/**/transcript*.jsonl`), so non-claude agents
+  can be classified stuck/no-progress instead of forever-unknown. (3) New
+  `drift` classification (cause `goal-drift`): a claude agent with an active
+  `/goal` targeting a still-`todo` DIVE task while it progresses elsewhere —
+  a STRUCTURAL check (task-id vs status), not a semantic heuristic. All three
+  keep the false-negative bias (missing/ambiguous signal => never stuck), and
+  `drift` is observe-only — guarded out of the P2 act ladder so no rung, not
+  even escalate, can fire on it (no false-stuck regressions on claude agents).
+
 - DIVE-969: verifier-by-default posture (Karpathy autonomy slider). `task add`
   now engages maker->grader verification BY DEFAULT for non-trivial standard
   tasks: it derives acceptance criteria from the title and assigns a grader

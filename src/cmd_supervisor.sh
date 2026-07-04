@@ -13,13 +13,26 @@
 #   service   systemctl is-active on 5dive-agent@<name> (claude-session.service
 #             for the box's main `claude` user, when that unit is meant to run)
 #   tmux      tmux has-session -t agent-<name>, as the agent's own user
-#   poller    telegram plugin process alive (claude-type + telegram channel only)
-#   loopStuck loop_runs.stuck flag — a loop self-flagged at ceiling/no-progress
-#   activity  newest ~/.claude/projects/*/*.jsonl mtime. Chosen as the
-#             last-progress source because every assistant turn appends to the
-#             session transcript, so its mtime IS the last-token-progress
-#             timestamp — cheaper and wider-coverage than loop_runs.updated_at
-#             (loop work only) and far less flaky than pane-scraping.
+#   poller    telegram bridge process alive, per-type (DIVE-971): claude runs
+#             the forked plugin as a bun proc carrying …/5dive-plugins/telegram;
+#             codex/grok/antigravity run the telegram-<type> MCP server (bun
+#             <dir>/server.ts); opencode's telegram-opencode relay IS its main
+#             proc. One pgrep pattern per type (_SUP_POLLER_PAT) — telegram
+#             channel only; other channels/types stay "n/a".
+#   activity  newest session-transcript mtime, per-type (DIVE-971). Every
+#             assistant turn appends to the runtime's transcript, so its mtime
+#             IS the last-token-progress timestamp — cheaper and wider-coverage
+#             than loop_runs.updated_at (loop work only) and far less flaky than
+#             pane-scraping. Per-type roots+globs in _sup_activity_epoch:
+#             claude ~/.claude/projects/*.jsonl, codex ~/.codex/sessions/
+#             rollout-*.jsonl, grok ~/.grok/sessions, opencode
+#             ~/.local/share/opencode/storage, antigravity
+#             ~/.gemini/antigravity-cli/brain/**/transcript*.jsonl. A missing/
+#             empty root => age unknown => never stuck (false-negative bias).
+#   goalDrift claude-only (DIVE-971): an active /goal targets a specific DIVE
+#             task that is still untouched (status=todo) while the agent is
+#             actively progressing on something else. Structural, not semantic
+#             — no relevance heuristic. Observe-only: never feeds the act ladder.
 #   activeWork in_progress tasks assigned to the agent + its running loops
 #   cliStale  one `update --check`-shaped probe per pass (box-level, best-effort)
 
@@ -55,6 +68,89 @@ _SUP_ACT_BASE_MIN="${SUPERVISOR_ACT_BASE_MIN:-20}"
 _SUP_ACT_WINDOW_H=6
 _SUP_ACT_MAX_ATTEMPTS=3
 
+# DIVE-971: per-type telegram-bridge pgrep pattern (matched against the agent
+# user's process argv, -f). claude's forked plugin argv carries the cache path
+# …/5dive-plugins/telegram/<ver>; codex/grok/antigravity run the telegram-<x>
+# MCP server as `bun <plugin>/server.ts`; opencode launches its relay via
+# `bun run --cwd <plugin> … start` — every non-claude plugin dir is
+# telegram-<name>, so the dir name is a unique, argv-stable match. A type
+# absent here has no probeable bridge -> poller stays "n/a" (never classifies).
+declare -A _SUP_POLLER_PAT=(
+  [claude]='5dive-plugins/telegram'
+  [codex]='telegram-codex'
+  [grok]='telegram-grok'
+  [antigravity]='telegram-agy'
+  [opencode]='telegram-opencode'
+)
+
+# DIVE-971: per-type "<relroot>|<find-args>" for the last-activity probe. relroot
+# is under the agent's $HOME; find-args select the append-on-progress transcript
+# files so the newest mtime IS the last-token-progress time (see header). A type
+# absent here (or a missing/empty root) => age unknown => never stuck.
+declare -A _SUP_ACTIVITY_PROBE=(
+  [claude]=".claude/projects|-name *.jsonl"
+  [codex]=".codex/sessions|-name rollout-*.jsonl"
+  [grok]=".grok/sessions|( -name *.json -o -name *.sqlite* )"
+  [opencode]=".local/share/opencode/storage|-name *.json"
+  [antigravity]=".gemini/antigravity-cli/brain|-name transcript*.jsonl"
+)
+
+# Newest matching transcript mtime (epoch, or empty) for one agent, per type.
+# Read-only; unreadable/absent root => empty (caller treats as unknown age).
+_sup_activity_epoch() {  # <type> <home>
+  local type="$1" home="$2" probe root fargs
+  probe="${_SUP_ACTIVITY_PROBE[$type]:-}"
+  [[ -n "$probe" ]] || return 0
+  root="${probe%%|*}"; fargs="${probe#*|}"
+  [[ -d "$home/$root" ]] || return 0
+  # shellcheck disable=SC2086 -- fargs is a deliberate word-split find predicate
+  { find "$home/$root" -type f $fargs -printf '%T@\n' 2>/dev/null || true; } \
+    | sort -rn | head -1 | cut -d. -f1
+}
+
+# Goal-drift (DIVE-971): claude-only, transcript-scoped, STRUCTURAL — no
+# semantic relevance heuristic. Echoes the drifting DIVE task id when ALL hold,
+# empty otherwise (false-negative bias — any missing/ambiguous signal => empty):
+#   * the agent is actively progressing (activity within the slow window) — this
+#     is "working the wrong thing", orthogonal to no-progress/idle/stuck;
+#   * an active /goal exists (last set-marker not superseded by a later
+#     `/goal clear`) and is older than the slow window (so the set->start race
+#     right after the heartbeat arms a goal never flags);
+#   * the goal condition names a DIVE task whose status is still `todo` —
+#     untouched by ANY agent (in_progress-by-anyone or terminal => not drift).
+_sup_goal_drift() {  # <type> <home> <name> <now> <act_epoch>
+  local type="$1" home="$2" name="$3" now="$4" act_epoch="$5"
+  [[ "$type" == "claude" ]] || return 0
+  [[ "$act_epoch" =~ ^[0-9]+$ ]] || return 0
+  (( now - act_epoch < _SUP_T_SLOW_MIN * 60 )) || return 0
+  local tx
+  tx=$( { find "$home/.claude/projects" -type f -name '*.jsonl' -printf '%T@ %p\n' 2>/dev/null || true; } \
+        | sort -rn | head -1 | cut -d' ' -f2-)
+  [[ -n "$tx" && -r "$tx" ]] || return 0
+  # One JSONL record == one physical line, so a line match == a record match.
+  local set_ln clr_ln
+  set_ln=$(grep -n 'session-scoped Stop hook is now active with condition' "$tx" 2>/dev/null | tail -1 | cut -d: -f1)
+  [[ -n "$set_ln" ]] || return 0
+  # A `/goal clear` record carries the short args tag; set records carry the
+  # long condition text, so this exact string never matches a set line.
+  clr_ln=$(grep -n '<command-args>clear</command-args>' "$tx" 2>/dev/null | tail -1 | cut -d: -f1)
+  [[ -n "$clr_ln" ]] && (( clr_ln > set_ln )) && return 0
+  local setline set_ts set_epoch
+  setline=$(sed -n "${set_ln}p" "$tx")
+  set_ts=$(grep -oE '"timestamp":"[^"]+"' <<<"$setline" | head -1 | cut -d'"' -f4)
+  [[ -n "$set_ts" ]] && set_epoch=$(date -d "$set_ts" +%s 2>/dev/null) || set_epoch=""
+  [[ "$set_epoch" =~ ^[0-9]+$ ]] && (( now - set_epoch < _SUP_T_SLOW_MIN * 60 )) && return 0
+  local task
+  task=$(grep -oE 'DIVE-[0-9]+' <<<"$setline" | head -1 | grep -oE '[0-9]+')
+  [[ -n "$task" ]] || return 0
+  local st
+  st=$(db "SELECT status FROM tasks WHERE id=${task};" 2>/dev/null || echo "")
+  # Only a still-untouched (todo) target is drift; in_progress (by anyone) or
+  # any terminal/blocked state means the goal is being served or is satisfied.
+  [[ "$st" == "todo" ]] || return 0
+  echo "$task"
+}
+
 _sup_usage() {
   cat <<USAGE
 5dive supervisor — observe-only fleet health board (DIVE-724 P1)
@@ -74,7 +170,10 @@ Classification (conservative — see docs/fleet-supervisor-design.md §4):
   stuck           service/tmux/poller dead, a loop self-flagged stuck, or no progress
                   for ${_SUP_T_STUCK_MIN}m+ with active work
                   (cause: service-dead|tmux-dead|poller-dead|loop-stuck|no-progress)
+  drift           active /goal targets a still-todo DIVE task while the agent
+                  progresses elsewhere (cause: goal-drift) — recorded, NEVER acted on
 
+Poller + activity signals cover claude/codex/grok/antigravity/opencode (DIVE-971).
 P1 takes ZERO recovery actions. Add --json to any form for machine output.
 USAGE
 }
@@ -167,18 +266,15 @@ _sup_agent_record() {
     fi
   fi
 
-  # --- signal: telegram poller liveness ---
-  # claude-type agents run the forked telegram plugin as a bun process whose
-  # argv carries the plugin cache path (…/5dive-plugins/telegram/<ver>) — the
-  # same process doctor's channel checks reason about via MCP logs, but a
-  # pgrep is cheaper and answers "alive right now". Grace window right after
-  # a service start (plugin boot lag).
-  # TODO(P2): codex/grok/antigravity/opencode run per-type telegram bridges
-  # with different process shapes (see TYPE_CHANNELS in header.sh); probing
-  # them reliably needs per-type patterns — left "n/a" rather than flaky.
-  local poller="n/a"
-  if [[ "$type" == "claude" && ",${channels}," == *",telegram,"* ]]; then
-    if pgrep -u "$user" -f '5dive-plugins/telegram' >/dev/null 2>&1; then
+  # --- signal: telegram poller liveness (per-type, DIVE-971) ---
+  # Each type's telegram bridge is a bun process whose argv carries its plugin
+  # dir (_SUP_POLLER_PAT); a pgrep against the agent user is cheaper than
+  # doctor's MCP-log reasoning and answers "alive right now". Grace window right
+  # after a service start (bridge boot lag). Types with no probeable bridge, or
+  # any non-telegram channel set, stay "n/a" (never classifies).
+  local poller="n/a" poller_pat="${_SUP_POLLER_PAT[$type]:-}"
+  if [[ -n "$poller_pat" && ",${channels}," == *",telegram,"* ]]; then
+    if pgrep -u "$user" -f "$poller_pat" >/dev/null 2>&1; then
       poller="alive"
     elif (( ! svc_running )) || (( uptime > 0 && uptime < _SUP_POLLER_GRACE_SEC )); then
       poller="unknown"
@@ -198,19 +294,19 @@ _sup_agent_record() {
   local has_work=0
   (( inprog > 0 || running_loops > 0 )) && has_work=1
 
-  # --- signal: last-activity / progress timestamp (transcript mtime) ---
-  # TODO(P2): non-claude types keep session logs elsewhere (codex ~/.codex,
-  # grok ~/.grok, …) — wire per-type paths before trusting no-progress for
-  # them. Until then their age stays unknown and they can never be classified
-  # stuck/no-progress (false-negative bias).
-  # TODO(P2): goal-drift (active /goal vs recent tool calls) needs transcript
-  # introspection — deliberately NOT implemented as a flaky heuristic here.
-  local act_epoch="" act_age=-1
-  if [[ "$type" == "claude" && -d "$home/.claude/projects" ]]; then
-    act_epoch=$( { find "$home/.claude/projects" -name '*.jsonl' -printf '%T@\n' 2>/dev/null || true; } \
-                 | sort -rn | head -1 | cut -d. -f1) || act_epoch=""
-    [[ "$act_epoch" =~ ^[0-9]+$ ]] && act_age=$(( now - act_epoch ))
-  fi
+  # --- signal: last-activity / progress timestamp (per-type transcript mtime) ---
+  # DIVE-971: per-type roots+globs (_sup_activity_epoch) replace the claude-only
+  # probe — codex/grok/antigravity/opencode now get a real progress age. A type
+  # with no probe, or an empty/unreadable root, leaves age unknown and can never
+  # be classified stuck/no-progress (false-negative bias).
+  local act_epoch act_age=-1
+  act_epoch=$(_sup_activity_epoch "$type" "$home")
+  [[ "$act_epoch" =~ ^[0-9]+$ ]] && act_age=$(( now - act_epoch ))
+
+  # --- signal: goal-drift (per-type; claude-only inside the helper) ---
+  # DIVE-971: an active /goal targets a still-untouched DIVE task while the agent
+  # progresses elsewhere. Observe-only — never feeds the P2 act ladder.
+  local goal_drift_task; goal_drift_task=$(_sup_goal_drift "$type" "$home" "$name" "$now" "$act_epoch")
 
   # --- CLASSIFY (design §4) — first matching rule wins, dead-signals first.
   # Every "stuck" here is a DEFINITE reading; anything unknown/ambiguous falls
@@ -249,6 +345,12 @@ _sup_agent_record() {
     class="update-pending"; cause="stale-cli"; detail="box CLI ${FIVE_VERSION} stale behind ${_SUP_CLI_LATEST}"
   elif (( has_work )) && (( act_age >= 0 )) && (( act_age >= _SUP_T_SLOW_MIN * 60 )); then
     class="slow"; detail="active work, no transcript progress for $((act_age / 60))m"
+  elif [[ -n "$goal_drift_task" ]]; then
+    # Disjoint from slow/stuck by construction (drift needs recent activity).
+    # Observe-only: the P2 act loop is gated on class=="stuck", so this never
+    # nudges/resumes/rotates — surfaced for the audit trail and board only.
+    class="drift"; cause="goal-drift"
+    detail="active /goal targets DIVE-${goal_drift_task} (still todo); agent progressing elsewhere"
   elif (( has_work )); then
     detail="active"
   else
@@ -261,11 +363,13 @@ _sup_agent_record() {
     --arg tmux "$tmux_state" --arg poller "$poller" \
     --argjson loopStuck "$loop_stuck" --argjson runningLoops "$running_loops" \
     --argjson inProgress "$inprog" --argjson age "$act_age" --argjson uptime "$uptime" \
+    --arg goalDrift "$goal_drift_task" \
     --arg class "$class" --arg cause "$cause" --arg detail "$detail" \
     '{name:$name, type:$type, channels:$channels, unit:$unit,
       signals:{service:$service, sub:$sub, uptimeSec:$uptime, tmux:$tmux, poller:$poller,
                loopStuck:$loopStuck, runningLoops:$runningLoops, inProgress:$inProgress,
-               lastActivityAgeSec:(if $age < 0 then null else $age end)},
+               lastActivityAgeSec:(if $age < 0 then null else $age end),
+               goalDriftTask:(if $goalDrift == "" then null else ($goalDrift|tonumber) end)},
       classification:$class,
       cause:(if $cause == "" then null else $cause end),
       detail:$detail}'
@@ -327,6 +431,7 @@ _sup_summary_line() {
     "\(length) agents — " +
     "\([.[] | select(.classification == "healthy")]        | length) healthy / " +
     "\([.[] | select(.classification == "slow")]           | length) slow / " +
+    "\([.[] | select(.classification == "drift")]          | length) drift / " +
     "\([.[] | select(.classification == "update-pending")] | length) update-pending / " +
     "\([.[] | select(.classification == "stuck")]          | length) stuck" +
     (if $stale == "true" then " · CLI \($cur) STALE (latest \($lat))"
@@ -400,6 +505,10 @@ _sup_act_plan() {  # <type> <cause> <attempts> <last_epoch> <now> <rotation_enab
     # loop (gated on class=="stuck") but guard here too so no rung, including
     # escalate, can EVER fire on a stale-cli-only classification.
     stale-cli) echo "defer update-pending"; return ;;
+    # DIVE-971: goal-drift is class=="drift", not "stuck", so it never reaches
+    # this loop (gated on stuck) — guard here too so no rung, not even escalate,
+    # can EVER fire on a drift classification.
+    goal-drift) echo "defer goal-drift"; return ;;
     *) echo "escalate rung-4-needed"; return ;;
   esac
   [[ "$type" == "claude" ]] || { echo "escalate non-claude-runtime"; return; }
@@ -521,11 +630,12 @@ cmd_supervisor_tick() {
     esac
   done < <(jq -c '.[]' <<<"$snap")
 
-  local total healthy slow stuck
+  local total healthy slow stuck drift
   total=$(jq 'length' <<<"$snap")
   healthy=$(jq '[.[] | select(.classification == "healthy")] | length' <<<"$snap")
   slow=$(jq  '[.[] | select(.classification == "slow")]    | length' <<<"$snap")
   stuck=$(jq '[.[] | select(.classification == "stuck")]   | length' <<<"$snap")
+  drift=$(jq '[.[] | select(.classification == "drift")]   | length' <<<"$snap")
 
   # DIVE-975: one 'heartbeat' row per tick — the observation DENOMINATOR. The
   # transition/observe rows above are sporadic by nature (a clean fleet writes
@@ -537,16 +647,16 @@ cmd_supervisor_tick() {
   (( slow + stuck > 0 )) && fleet_class="degraded"
   db "INSERT INTO supervisor_events (agent, event, classification, signals)
       VALUES ('(fleet)', 'heartbeat', $(sqlq "$fleet_class"),
-              $(sqlq "{\"total\":${total},\"healthy\":${healthy},\"slow\":${slow},\"stuck\":${stuck},\"anomalyRows\":${events}}"));" \
+              $(sqlq "{\"total\":${total},\"healthy\":${healthy},\"slow\":${slow},\"drift\":${drift},\"stuck\":${stuck},\"anomalyRows\":${events}}"));" \
     2>/dev/null && events=$((events + 1)) || warn "supervisor: heartbeat insert failed"
 
   local act_note=""
   if [[ "$actions_on" == "true" ]]; then act_note=" · actions ON: ${acted} acted / ${escalated} escalated"
   elif (( planned + escalated > 0 )); then act_note=" · dormant: ${planned} planned / ${escalated} escalated"
   fi
-  ok "supervisor tick: ${total} agents — ${healthy} healthy / ${slow} slow / ${stuck} stuck · ${events} audit row(s)${act_note}" \
-     '{enabled:true, agents:($t|tonumber), healthy:($h|tonumber), slow:($sl|tonumber), stuck:($st|tonumber), auditRows:($e|tonumber), actionsEnabled:($ae == "true"), acted:($ac|tonumber), planned:($pl|tonumber), escalated:($es|tonumber)}' \
-     --arg t "$total" --arg h "$healthy" --arg sl "$slow" --arg st "$stuck" --arg e "$events" \
+  ok "supervisor tick: ${total} agents — ${healthy} healthy / ${slow} slow / ${drift} drift / ${stuck} stuck · ${events} audit row(s)${act_note}" \
+     '{enabled:true, agents:($t|tonumber), healthy:($h|tonumber), slow:($sl|tonumber), drift:($dr|tonumber), stuck:($st|tonumber), auditRows:($e|tonumber), actionsEnabled:($ae == "true"), acted:($ac|tonumber), planned:($pl|tonumber), escalated:($es|tonumber)}' \
+     --arg t "$total" --arg h "$healthy" --arg sl "$slow" --arg dr "$drift" --arg st "$stuck" --arg e "$events" \
      --arg ae "$actions_on" --arg ac "$acted" --arg pl "$planned" --arg es "$escalated"
 }
 
