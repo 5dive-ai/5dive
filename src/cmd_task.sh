@@ -9,7 +9,10 @@ _task_usage() {
   5dive task add <title...> [--body=<text>] [--priority=low|medium|high|urgent]
                             [--assignee=<agent>] [--parent=<id|DIVE-N>] [--from=<who>]
                             [--recurring="<cron>"]  # recurring=template (5-field cron, e.g. "0 2 * * *")
-                            [--accept=<criteria>] [--verify=<cmd>] [--max-iters=<n>] [--verifier=<agent>]
+                            [--accept=<criteria>] [--verify=<cmd>] [--max-iters=<n>] [--verifier=<agent>] [--no-verify]
+                                                     # DIVE-969: non-trivial tasks are verifier-graded BY DEFAULT (a grader
+                                                     # !=maker + derived acceptance criteria). --no-verify opts out (plain
+                                                     # 'task done' closes). Trivial/low-priority chores skip it automatically.
                             [--task-budget=<tokens|\$cost>]  # per-run spend cap for the on-host loop (DIVE-824)
                                                      # loop spec: declarative verify loop (DIVE-476). --verify is
                                                      # the default cmd for `task verify`; --verifier grades (writer!=grader)
@@ -124,10 +127,45 @@ _task_resolve_coordinator() {
   fi
 }
 
+# DIVE-969: verifier-by-default posture (Karpathy autonomy slider). Non-trivial
+# work should get graded by someone other than the maker (writer!=grader,
+# DIVE-474/477) UNLESS the creator explicitly opts out. These two helpers decide
+# WHEN the default engages and WHO grades — deliberately conservative so trivial
+# tasks stay frictionless and we never block an add.
+
+# Is this task trivial enough to skip the verifier default? Trivial = low-signal
+# work where a grading round-trip is pure overhead: low priority, OR a bodyless
+# task whose title reads as a mechanical chore (typo/bump/rename/docs/lint/…).
+# Anything with a real body or medium+ priority is treated as non-trivial.
+_task_is_trivial() {
+  local _title="$1" _body="$2" _priority="$3"
+  [[ "$_priority" == "low" ]] && return 0
+  if [[ -z "$_body" ]]; then
+    local t="${_title,,}"
+    [[ "$t" =~ (^|[^a-z])(typo|typos|bump|rename|tweak|nit|nits|lint|format|reformat|comment|comments|whitespace|changelog|readme|docs|doc|wording|copy[[:space:]]fix|version[[:space:]]bump)([^a-z]|$) ]] && return 0
+  fi
+  return 1
+}
+
+# Pick a grader distinct from the maker (assignee). Prefer the project lead, then
+# the org coordinator; both must differ from the assignee (a maker can't grade
+# itself — DIVE-474). Prints the grader name, or nothing when no distinct grader
+# exists (in which case the default silently no-ops rather than blocking the add).
+_task_default_verifier() {
+  local _assignee="$1" _proj_lead="$2" v=""
+  if [[ -n "$_proj_lead" && "$_proj_lead" != "$_assignee" ]]; then
+    v="$_proj_lead"
+  else
+    local coord; coord=$(_task_resolve_coordinator)
+    [[ -n "$coord" && "$coord" != "$_assignee" ]] && v="$coord"
+  fi
+  printf '%s' "$v"
+}
+
 cmd_task_add() {
   tasks_db_init
   local body="" priority="medium" assignee="" parent="" from="" recurring="" fresh="" project="dive"
-  local accept="" verify_cmd="" max_iters="" verifier="" task_budget=""
+  local accept="" verify_cmd="" max_iters="" verifier="" task_budget="" no_verify=""
   local -a words=()
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -147,6 +185,9 @@ cmd_task_add() {
       --verify=*)    verify_cmd="${1#*=}" ;;
       --max-iters=*) max_iters="${1#*=}" ;;
       --verifier=*)  verifier="${1#*=}" ;;
+      # DIVE-969: explicit opt-out of the verifier-by-default posture. A plain
+      # `task done` closes the resulting task directly (no maker→grader handoff).
+      --no-verify)   no_verify="1" ;;
       # DIVE-824: per-run spend cap carried on the row (sibling to verify --timeout).
       # Value is either a bare token count or a "$cost" dollar figure.
       --task-budget=*) task_budget="${1#*=}" ;;
@@ -211,6 +252,26 @@ cmd_task_add() {
     [[ -z "$assignee" ]] && assignee=$(_task_resolve_coordinator)
     [[ -n "$assignee" ]] && auto_coordinated=1
   fi
+  # DIVE-969: verifier-by-default posture. For a NON-TRIVIAL standard task where
+  # the creator neither wired the loop themselves (--accept/--verify/--verifier)
+  # nor opted out (--no-verify), engage grading by default: derive acceptance
+  # criteria from the title and assign a grader distinct from the maker. Trivial
+  # chores, recurring templates, low priority, and explicit opt-outs are left
+  # untouched so the common cheap case stays frictionless. If no distinct grader
+  # exists (e.g. a solo org, or the only coordinator IS the assignee) the default
+  # silently no-ops rather than blocking the add. Env kill-switch for the fleet:
+  # FIVE_VERIFY_DEFAULT=0.
+  local verify_defaulted=0
+  if [[ "$kind" == "standard" && -z "$no_verify" && "${FIVE_VERIFY_DEFAULT:-1}" != "0" \
+        && -z "$accept" && -z "$verify_cmd" && -z "$verifier" ]] \
+     && ! _task_is_trivial "$title" "$body" "$priority"; then
+    local _grader; _grader=$(_task_default_verifier "$assignee" "$proj_lead")
+    if [[ -n "$_grader" ]]; then
+      verifier="$_grader"
+      accept="Deliverable meets the intent of: ${title}. Maker records in the done result WHAT was built and HOW it was checked; ${_grader} confirms against this before the task closes (refine these criteria as the work firms up)."
+      verify_defaulted=1
+    fi
+  fi
   local creator; creator=$(task_actor "$from")
   local id
   id=$(db "INSERT INTO tasks (title, body, priority, assignee, created_by, parent_id, project_key, kind, schedule, fresh,
@@ -230,9 +291,11 @@ cmd_task_add() {
   else
     local coord_note=""
     (( auto_coordinated )) && coord_note=" → coordinator: $assignee"
-    ok "created ${ident} — $title${coord_note}" \
-       '{id:($i|tonumber), ident:$id, project:$pr, title:$t, priority:$p, assignee:$a, created_by:$c, kind:"standard", autoCoordinated:($ac=="1")}' \
-       --arg i "$id" --arg id "$ident" --arg pr "$project" --arg t "$title" --arg p "$priority" --arg a "${assignee:-}" --arg c "$creator" --arg ac "$auto_coordinated"
+    local verify_note=""
+    (( verify_defaulted )) && verify_note=" · verifier-graded by default → $verifier ('task done' hands off to grade; refine with --accept/--verify, or opt out with --no-verify)"
+    ok "created ${ident} — $title${coord_note}${verify_note}" \
+       '{id:($i|tonumber), ident:$id, project:$pr, title:$t, priority:$p, assignee:$a, created_by:$c, kind:"standard", autoCoordinated:($ac=="1"), verifyDefaulted:($vd=="1"), verifier:$v}' \
+       --arg i "$id" --arg id "$ident" --arg pr "$project" --arg t "$title" --arg p "$priority" --arg a "${assignee:-}" --arg c "$creator" --arg ac "$auto_coordinated" --arg vd "$verify_defaulted" --arg v "${verifier:-}"
   fi
 }
 

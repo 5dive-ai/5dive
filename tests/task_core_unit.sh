@@ -146,6 +146,46 @@ run start "$identz" >/dev/null
 [[ "$(db "SELECT status FROM tasks WHERE id=$idz;")" == "in_progress" ]] \
   && ok_t "verbs resolve DIVE-N idents ($identz)" || bad_t "ident resolve" "$(db "SELECT status FROM tasks WHERE id=$idz;")"
 
+# --- T15: DIVE-969 verifier-by-default posture
+# Stand up a coordinator so a grader distinct from the maker can be resolved.
+( cmd_org_set carol --role=coordinator ) >/dev/null 2>"$TMP"/err
+# non-trivial task (has a body) assigned to a different agent → verifier defaulted
+vd=$(run add --assignee=alice --body="real work here" -- "build the widget pipeline")
+[[ "$(echo "$vd" | jf '.data.verifyDefaulted')" == "true" && \
+   "$(echo "$vd" | jf '.data.verifier')" == "carol" ]] \
+  && ok_t "non-trivial task gets a default grader (carol != alice)" \
+  || bad_t "verify default" "vd=$(echo "$vd" | jf '.data.verifyDefaulted') v=$(echo "$vd" | jf '.data.verifier')"
+vdid=$(echo "$vd" | jf '.data.id')
+[[ -n "$(db "SELECT acceptance_criteria FROM tasks WHERE id=$vdid;")" ]] \
+  && ok_t "default engages derived acceptance_criteria" || bad_t "default accept" "empty"
+
+# --no-verify opts out: no verifier, no acceptance criteria
+nov=$(run add --assignee=alice --no-verify --body="real work" -- "another non-trivial job")
+novid=$(echo "$nov" | jf '.data.id')
+[[ "$(echo "$nov" | jf '.data.verifyDefaulted')" == "false" && \
+   -z "$(db "SELECT COALESCE(verifier,'') FROM tasks WHERE id=$novid;")" ]] \
+  && ok_t "--no-verify opts out of the default" || bad_t "no-verify" "verifier=$(db "SELECT verifier FROM tasks WHERE id=$novid;")"
+
+# trivial chore (bodyless, mechanical title) skips the default silently
+triv=$(run add --assignee=alice -- "fix typo in readme")
+[[ "$(echo "$triv" | jf '.data.verifyDefaulted')" == "false" ]] \
+  && ok_t "trivial chore skips the verifier default" || bad_t "trivial skip" "$(echo "$triv" | jf '.data.verifyDefaulted')"
+
+# low priority is trivial regardless of body
+lowp=$(run add --assignee=alice --priority=low --body="some work" -- "nice to have")
+[[ "$(echo "$lowp" | jf '.data.verifyDefaulted')" == "false" ]] \
+  && ok_t "low-priority task skips the verifier default" || bad_t "low-prio skip" "$(echo "$lowp" | jf '.data.verifyDefaulted')"
+
+# explicit --verifier is respected (not overridden) and stays engaged
+expl=$(run add --assignee=alice --verifier=dave --body="work" -- "explicit grader task")
+[[ "$(echo "$expl" | jf '.data.verifier')" == "dave" ]] \
+  && ok_t "explicit --verifier is preserved" || bad_t "explicit verifier" "$(echo "$expl" | jf '.data.verifier')"
+
+# no distinct grader available (assignee IS the only coordinator) → silent no-op
+selfg=$(run add --assignee=carol --body="work" -- "carol's own task")
+[[ "$(echo "$selfg" | jf '.data.verifyDefaulted')" == "false" ]] \
+  && ok_t "no self-grading when maker is the only grader" || bad_t "self-grade guard" "$(echo "$selfg" | jf '.data.verifyDefaulted')"
+
 echo "-----"
 echo "task_core_unit: $PASS passed, $FAIL failed"
 [[ $FAIL -eq 0 ]]

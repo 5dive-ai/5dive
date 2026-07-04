@@ -11,6 +11,16 @@ release.
 
 ### Added
 
+- DIVE-969: verifier-by-default posture (Karpathy autonomy slider). `task add`
+  now engages maker->grader verification BY DEFAULT for non-trivial standard
+  tasks: it derives acceptance criteria from the title and assigns a grader
+  distinct from the maker (project lead, else org coordinator), reusing the
+  DIVE-476/477 loop so a plain `task done` hands off to grade instead of closing.
+  Trivial chores (bodyless mechanical titles like typo/bump/docs), low-priority
+  tasks, recurring templates, and solo orgs with no distinct grader are left
+  frictionless. `--no-verify` is the explicit opt-out; `FIVE_VERIFY_DEFAULT=0` is
+  a fleet kill-switch. Add output carries `verifyDefaulted` + `verifier`.
+
 - DIVE-984: `5dive goal add "<outcome>"` — goal decomposition v1 (OSS-2). A
   planner agent (via `loop spawn --wait --schema`) turns an outcome into a
   materialized task graph: tasks + `task_deps` edges + assignees under a project.
