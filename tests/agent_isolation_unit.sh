@@ -23,10 +23,15 @@ for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh \
   # shellcheck source=/dev/null
   source "$SRC/$f"
 done
-# cmd_agent.sh defines create_agent_user/write_admin_sudoers; source just that
-# file's function defs (it has no top-level side effects at source time).
+# create_agent_user/write_admin_sudoers live in cmd_agent_create.sh and
+# cmd_restart in cmd_agent_lifecycle.sh (split out of cmd_agent.sh); source the
+# function defs (none have top-level side effects at source time).
 # shellcheck source=/dev/null
 source "$SRC/cmd_agent.sh"
+# shellcheck source=/dev/null
+source "$SRC/cmd_agent_create.sh"
+# shellcheck source=/dev/null
+source "$SRC/cmd_agent_lifecycle.sh"
 
 STATE_DIR="$TMP"
 REGISTRY="$STATE_DIR/agents.json"
@@ -93,8 +98,8 @@ SUD
     ok_t "scoped sudoers is NOT blanket ALL=(ALL) NOPASSWD: ALL"
   fi
   # DIVE-1002 (Marcus review): the three indirect root escapes must be ABSENT.
-  # Assert against the REAL generated body in src/cmd_agent.sh, not just SFILE.
-  BODY=$(sed -n '/^write_admin_sudoers()/,/^}/p' src/cmd_agent.sh)
+  # Assert against the REAL generated body in src/cmd_agent_create.sh, not just SFILE.
+  BODY=$(sed -n '/^write_admin_sudoers()/,/^}/p' src/cmd_agent_create.sh)
   for esc in 'systemd-run' 'journalctl' 'systemctl status'; do
     if grep -qF "$esc" <<<"$BODY"; then
       bad_t "admin allowlist must NOT contain '$esc' (root-escapable)" ""
@@ -116,7 +121,7 @@ grep -q 'id -u.*== *"0"' <<<"$CREW_BODY" && grep -q 'E_PERMISSION' <<<"$CREW_BOD
   || bad_t "cmd_crew root guard" "expected an EUID-0 refusal in cmd_crew"
 
 # ---- 2c. agent restart --defer runs a FIXED command, not caller-injected -----
-RESTART_BODY=$(sed -n '/^cmd_restart()/,/^}/p' src/cmd_agent.sh)
+RESTART_BODY=$(sed -n '/^cmd_restart()/,/^}/p' src/cmd_agent_lifecycle.sh)
 grep -q 'restart "5dive-agent@\${name}.service"' <<<"$RESTART_BODY" \
   && ! grep -qE '\--defer.*\$\{?[0-9]|defer.*eval' <<<"$RESTART_BODY" \
   && ok_t "restart --defer wraps a FIXED systemctl restart (no caller-injected cmd)" \
