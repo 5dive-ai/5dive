@@ -137,6 +137,16 @@ CREATE TABLE IF NOT EXISTS tasks (
   -- enforcement of "no valid sig ⇒ reject" is a later flip, not here.
   need_answered_uid INTEGER,
   need_answer_sig  TEXT,
+  -- DIVE-916: per-gate HUMAN nonce that closes the sudo->--human forge. On a
+  -- hard human gate (approval/secret/manual) `task need` mints a 16-byte nonce,
+  -- stores ONLY its SHA-256 here, and embeds the RAW nonce solely in the trusted
+  -- tap artifacts (Telegram callback_data / dashboard approve payload) — the
+  -- agent's LLM never sees it. `task answer` clears as human iff it presents ONE
+  -- of: a matching --human-proof=<nonce>, a valid DIVE-519 --proof, or a
+  -- non-agent SUDO_UID. A bare `sudo task answer --human` from an agent session
+  -- (SUDO_UID=agent-*, no nonce) is rejected under enforcement. Hash-only at
+  -- rest, so a group-readable db leak can't reconstruct the nonce.
+  human_nonce_hash TEXT,
   -- Recurring task templates (DIVE step 1). kind='recurring' marks a row as a
   -- TEMPLATE, not work: it's excluded from the work board, the heartbeat TODO
   -- count + wake, and the human inbox, so it's never picked up directly.
@@ -196,7 +206,16 @@ CREATE TABLE IF NOT EXISTS tasks (
   tier                INTEGER,
   need_asked_at       TEXT,
   gate_pinged_at      TEXT,
-  wake_at             TEXT
+  wake_at             TEXT,
+  -- DIVE-931 secure credential drop: a --type=secret gate can name WHERE the
+  -- value should land — secret_key is the env-var name, connector the
+  -- /etc/5dive/connectors/<connector>.env stem. When both are set, the gate
+  -- notify mints a burnable drop link (api /drop/mint) instead of the legacy
+  -- "put it where I expect it" text. NULL on non-secret gates and on secret
+  -- gates filed without a target (legacy behavior preserved). The VALUE is never
+  -- stored here — only the destination coordinates.
+  secret_key          TEXT,
+  connector           TEXT
 );
 
 CREATE TABLE IF NOT EXISTS task_deps (
@@ -361,7 +380,8 @@ _tasks_db_migrate() {
            "project_key TEXT NOT NULL DEFAULT 'dive'" 'issue_number INTEGER' \
            'acceptance_criteria TEXT' 'verify_command TEXT' 'max_iterations INTEGER' 'verifier TEXT' \
            'iteration INTEGER' 'maker_agent TEXT' 'task_budget TEXT' \
-           'tier INTEGER' 'need_asked_at TEXT' 'gate_pinged_at TEXT' 'wake_at TEXT'; do
+           'tier INTEGER' 'need_asked_at TEXT' 'gate_pinged_at TEXT' 'wake_at TEXT' \
+           'secret_key TEXT' 'connector TEXT' 'human_nonce_hash TEXT'; do
     if ! printf '%s\n' "$cols" | grep -qx "${c%% *}"; then
       sqlite3 -cmd ".timeout 5000" "$TASKS_DB" \
         "ALTER TABLE tasks ADD COLUMN ${c};" >/dev/null 2>&1 || true
@@ -697,34 +717,60 @@ _gate_proof_ct_equal() {
   return $res
 }
 
-# Mint a token for <canonical_id> <type>. Returns the RAW token on stdout.
-_gate_proof_mint() {
-  local id="$1" type="$2" nonce exp mac
-  nonce=$(openssl rand -hex 8 2>/dev/null) || return 1
-  exp=$(( $(date +%s) + GATE_PROOF_TTL ))
-  mac=$(_gate_proof_hmac "${id}:${type}:${nonce}:${exp}") || return 1
-  [[ -n "$mac" ]] || return 1
-  printf 'v1:%s:%s:%s' "$nonce" "$exp" "$mac"
-}
-
-# Verify <canonical_id> <type> <token>. 0 = structurally valid, unexpired, matches.
-_gate_proof_verify() {
-  local id="$1" type="$2" token="$3"
-  [[ "$token" == v1:*:*:* ]] || return 1
-  local body="${token#v1:}"
-  local nonce="${body%%:*}"; body="${body#*:}"
-  local exp="${body%%:*}";   local mac="${body#*:}"
-  [[ "$nonce" =~ ^[0-9a-f]+$ && "$exp" =~ ^[0-9]+$ && -n "$mac" ]] || return 1
-  (( exp >= $(date +%s) )) || return 1
-  local expect; expect=$(_gate_proof_hmac "${id}:${type}:${nonce}:${exp}") || return 1
-  [[ -n "$expect" ]] || return 1
-  _gate_proof_ct_equal "$mac" "$expect"
-}
+# DIVE-950: `_gate_proof_mint` / `_gate_proof_verify` (the DIVE-519 --proof token,
+# evidence-form b) are REMOVED — the token was agent-forgeable via the require_root
+# `gate-proof` mint (no higher a bar than the sudo it already needed). `_gate_proof_hmac`
+# above is retained: DIVE-756 closure-signature tamper-evidence (`_gate_closure_sign`
+# / `_gate_closure_verify`) still uses it.
 
 # Enforcement is OFF until the sentinel exists. DIVE-519 ships DORMANT (audit-only):
 # flip on only after the plugin mint is confirmed live on the box, else live taps
 # that can't mint yet would fail closed. Root toggles it.
 _gate_proof_enforced() { [[ -f "$GATE_PROOF_ENFORCE" ]]; }
+
+# ── DIVE-916: per-gate HUMAN nonce (close the sudo->--human forge) ────────────
+# Distinct from the DIVE-519 --proof token: that is a box-wide, TTL'd, HMAC proof
+# any trusted path can mint; this is a per-GATE secret bound to one task row. Its
+# job is the ONE human path the SUDO_UID key can't cover — the plugin tap, which
+# runs as SUDO_UID=agent-* (the plugin is spawned by the agent) yet is a real
+# human action. The raw nonce reaches the plugin ONLY via the Telegram
+# callback_data the CLI composes as root; the agent LLM never sees it.
+
+# SHA-256 of a value -> lowercase hex. Used for both mint (store) and verify.
+_human_nonce_sha() {
+  printf '%s' "$1" | openssl dgst -sha256 2>/dev/null | awk '{print $NF}'
+}
+
+# Mint a fresh nonce. 16 bytes = 32 hex chars: unguessable, and short enough that
+# `tna:<numid>:<action>:<nonce>` stays under Telegram's 64-byte callback cap.
+# Echoes the RAW nonce on stdout (caller stores only its hash).
+_human_nonce_mint() { openssl rand -hex 16 2>/dev/null; }
+
+# Verify a presented nonce against the stored hash for task <id>. 0 = match.
+# Fails closed on a gate with no stored hash (legacy row / non-human gate) or an
+# empty presented nonce. Constant-time compare (reuses the gate-proof helper).
+_human_nonce_verify() {
+  local id="$1" nonce="$2" stored calc
+  [[ -n "$nonce" ]] || return 1
+  stored=$(db "SELECT COALESCE(human_nonce_hash,'') FROM tasks WHERE id=${id};")
+  [[ -n "$stored" ]] || return 1
+  calc=$(_human_nonce_sha "$nonce")
+  [[ -n "$calc" ]] || return 1
+  _gate_proof_ct_equal "$calc" "$stored"
+}
+
+# Resolve the REAL pre-sudo caller and report whether it is a NON-agent uid — the
+# third human-evidence form (a claude/root interactive login or the shelld/drop
+# path, all of which carry SUDO_UID != agent-*). $SUDO_UID survives `sudo -u
+# agent-X` and a nested non-sudo exec (verified for the DIVE-931 drop chain),
+# unlike `id -un`. 0 = non-agent (human-trusted), 1 = agent (or unknown).
+_gate_sudo_uid_nonagent() {
+  local uid="${SUDO_UID:-$(id -u 2>/dev/null || echo "")}"
+  [[ -n "$uid" ]] || return 1
+  local uname; uname=$(getent passwd "$uid" 2>/dev/null | cut -d: -f1)
+  [[ -n "$uname" ]] || return 1        # unknown uid -> not trusted
+  [[ "$uname" != agent-* ]]
+}
 
 # ── DIVE-756: persisted closure signature (tamper-evidence) ──────────────────
 # Unlike the short-lived answer-time --proof (bound to id:type, TTL 120s, then

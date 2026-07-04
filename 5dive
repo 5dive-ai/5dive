@@ -26,7 +26,7 @@ esac
 
 # Bumped on every public release. `build.sh` checks this line exists; CI fails
 # the bundle-drift check if it's missing or empty.
-readonly FIVE_VERSION="0.6.8"
+readonly FIVE_VERSION="0.6.11"
 
 # GitHub org our repos live under. The org is being renamed
 # 5dive-com -> 5dive-ai (2026-06); fetches must work on either side of the
@@ -2280,6 +2280,16 @@ CREATE TABLE IF NOT EXISTS tasks (
   -- enforcement of "no valid sig ⇒ reject" is a later flip, not here.
   need_answered_uid INTEGER,
   need_answer_sig  TEXT,
+  -- DIVE-916: per-gate HUMAN nonce that closes the sudo->--human forge. On a
+  -- hard human gate (approval/secret/manual) `task need` mints a 16-byte nonce,
+  -- stores ONLY its SHA-256 here, and embeds the RAW nonce solely in the trusted
+  -- tap artifacts (Telegram callback_data / dashboard approve payload) — the
+  -- agent's LLM never sees it. `task answer` clears as human iff it presents ONE
+  -- of: a matching --human-proof=<nonce>, a valid DIVE-519 --proof, or a
+  -- non-agent SUDO_UID. A bare `sudo task answer --human` from an agent session
+  -- (SUDO_UID=agent-*, no nonce) is rejected under enforcement. Hash-only at
+  -- rest, so a group-readable db leak can't reconstruct the nonce.
+  human_nonce_hash TEXT,
   -- Recurring task templates (DIVE step 1). kind='recurring' marks a row as a
   -- TEMPLATE, not work: it's excluded from the work board, the heartbeat TODO
   -- count + wake, and the human inbox, so it's never picked up directly.
@@ -2339,7 +2349,16 @@ CREATE TABLE IF NOT EXISTS tasks (
   tier                INTEGER,
   need_asked_at       TEXT,
   gate_pinged_at      TEXT,
-  wake_at             TEXT
+  wake_at             TEXT,
+  -- DIVE-931 secure credential drop: a --type=secret gate can name WHERE the
+  -- value should land — secret_key is the env-var name, connector the
+  -- /etc/5dive/connectors/<connector>.env stem. When both are set, the gate
+  -- notify mints a burnable drop link (api /drop/mint) instead of the legacy
+  -- "put it where I expect it" text. NULL on non-secret gates and on secret
+  -- gates filed without a target (legacy behavior preserved). The VALUE is never
+  -- stored here — only the destination coordinates.
+  secret_key          TEXT,
+  connector           TEXT
 );
 
 CREATE TABLE IF NOT EXISTS task_deps (
@@ -2504,7 +2523,8 @@ _tasks_db_migrate() {
            "project_key TEXT NOT NULL DEFAULT 'dive'" 'issue_number INTEGER' \
            'acceptance_criteria TEXT' 'verify_command TEXT' 'max_iterations INTEGER' 'verifier TEXT' \
            'iteration INTEGER' 'maker_agent TEXT' 'task_budget TEXT' \
-           'tier INTEGER' 'need_asked_at TEXT' 'gate_pinged_at TEXT' 'wake_at TEXT'; do
+           'tier INTEGER' 'need_asked_at TEXT' 'gate_pinged_at TEXT' 'wake_at TEXT' \
+           'secret_key TEXT' 'connector TEXT' 'human_nonce_hash TEXT'; do
     if ! printf '%s\n' "$cols" | grep -qx "${c%% *}"; then
       sqlite3 -cmd ".timeout 5000" "$TASKS_DB" \
         "ALTER TABLE tasks ADD COLUMN ${c};" >/dev/null 2>&1 || true
@@ -2840,34 +2860,60 @@ _gate_proof_ct_equal() {
   return $res
 }
 
-# Mint a token for <canonical_id> <type>. Returns the RAW token on stdout.
-_gate_proof_mint() {
-  local id="$1" type="$2" nonce exp mac
-  nonce=$(openssl rand -hex 8 2>/dev/null) || return 1
-  exp=$(( $(date +%s) + GATE_PROOF_TTL ))
-  mac=$(_gate_proof_hmac "${id}:${type}:${nonce}:${exp}") || return 1
-  [[ -n "$mac" ]] || return 1
-  printf 'v1:%s:%s:%s' "$nonce" "$exp" "$mac"
-}
-
-# Verify <canonical_id> <type> <token>. 0 = structurally valid, unexpired, matches.
-_gate_proof_verify() {
-  local id="$1" type="$2" token="$3"
-  [[ "$token" == v1:*:*:* ]] || return 1
-  local body="${token#v1:}"
-  local nonce="${body%%:*}"; body="${body#*:}"
-  local exp="${body%%:*}";   local mac="${body#*:}"
-  [[ "$nonce" =~ ^[0-9a-f]+$ && "$exp" =~ ^[0-9]+$ && -n "$mac" ]] || return 1
-  (( exp >= $(date +%s) )) || return 1
-  local expect; expect=$(_gate_proof_hmac "${id}:${type}:${nonce}:${exp}") || return 1
-  [[ -n "$expect" ]] || return 1
-  _gate_proof_ct_equal "$mac" "$expect"
-}
+# DIVE-950: `_gate_proof_mint` / `_gate_proof_verify` (the DIVE-519 --proof token,
+# evidence-form b) are REMOVED — the token was agent-forgeable via the require_root
+# `gate-proof` mint (no higher a bar than the sudo it already needed). `_gate_proof_hmac`
+# above is retained: DIVE-756 closure-signature tamper-evidence (`_gate_closure_sign`
+# / `_gate_closure_verify`) still uses it.
 
 # Enforcement is OFF until the sentinel exists. DIVE-519 ships DORMANT (audit-only):
 # flip on only after the plugin mint is confirmed live on the box, else live taps
 # that can't mint yet would fail closed. Root toggles it.
 _gate_proof_enforced() { [[ -f "$GATE_PROOF_ENFORCE" ]]; }
+
+# ── DIVE-916: per-gate HUMAN nonce (close the sudo->--human forge) ────────────
+# Distinct from the DIVE-519 --proof token: that is a box-wide, TTL'd, HMAC proof
+# any trusted path can mint; this is a per-GATE secret bound to one task row. Its
+# job is the ONE human path the SUDO_UID key can't cover — the plugin tap, which
+# runs as SUDO_UID=agent-* (the plugin is spawned by the agent) yet is a real
+# human action. The raw nonce reaches the plugin ONLY via the Telegram
+# callback_data the CLI composes as root; the agent LLM never sees it.
+
+# SHA-256 of a value -> lowercase hex. Used for both mint (store) and verify.
+_human_nonce_sha() {
+  printf '%s' "$1" | openssl dgst -sha256 2>/dev/null | awk '{print $NF}'
+}
+
+# Mint a fresh nonce. 16 bytes = 32 hex chars: unguessable, and short enough that
+# `tna:<numid>:<action>:<nonce>` stays under Telegram's 64-byte callback cap.
+# Echoes the RAW nonce on stdout (caller stores only its hash).
+_human_nonce_mint() { openssl rand -hex 16 2>/dev/null; }
+
+# Verify a presented nonce against the stored hash for task <id>. 0 = match.
+# Fails closed on a gate with no stored hash (legacy row / non-human gate) or an
+# empty presented nonce. Constant-time compare (reuses the gate-proof helper).
+_human_nonce_verify() {
+  local id="$1" nonce="$2" stored calc
+  [[ -n "$nonce" ]] || return 1
+  stored=$(db "SELECT COALESCE(human_nonce_hash,'') FROM tasks WHERE id=${id};")
+  [[ -n "$stored" ]] || return 1
+  calc=$(_human_nonce_sha "$nonce")
+  [[ -n "$calc" ]] || return 1
+  _gate_proof_ct_equal "$calc" "$stored"
+}
+
+# Resolve the REAL pre-sudo caller and report whether it is a NON-agent uid — the
+# third human-evidence form (a claude/root interactive login or the shelld/drop
+# path, all of which carry SUDO_UID != agent-*). $SUDO_UID survives `sudo -u
+# agent-X` and a nested non-sudo exec (verified for the DIVE-931 drop chain),
+# unlike `id -un`. 0 = non-agent (human-trusted), 1 = agent (or unknown).
+_gate_sudo_uid_nonagent() {
+  local uid="${SUDO_UID:-$(id -u 2>/dev/null || echo "")}"
+  [[ -n "$uid" ]] || return 1
+  local uname; uname=$(getent passwd "$uid" 2>/dev/null | cut -d: -f1)
+  [[ -n "$uname" ]] || return 1        # unknown uid -> not trusted
+  [[ "$uname" != agent-* ]]
+}
 
 # ── DIVE-756: persisted closure signature (tamper-evidence) ──────────────────
 # Unlike the short-lived answer-time --proof (bound to id:type, TTL 120s, then
@@ -13737,7 +13783,7 @@ _gate_tier2_floor_hit() {
 
 cmd_task_need() {
   tasks_db_init
-  local type="" ask="" options="" recommend="" from="" tier=""
+  local type="" ask="" options="" recommend="" from="" tier="" secret_key="" connector=""
   local -a positional=()
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -13747,6 +13793,10 @@ cmd_task_need() {
       --recommend=*) recommend="${1#*=}" ;;
       --tier=*)      tier="${1#*=}" ;;
       --from=*)      from="${1#*=}" ;;
+      # DIVE-931 secure credential drop: name WHERE a secret gate's value lands.
+      # Both together enable the burnable drop link in the gate message.
+      --secret-key=*) secret_key="${1#*=}" ;;
+      --connector=*)  connector="${1#*=}" ;;
       --)          shift; positional+=("$@"); break ;;
       -*)          fail "$E_USAGE" "unknown flag: $1" ;;
       *)           positional+=("$1") ;;
@@ -13763,6 +13813,20 @@ cmd_task_need() {
   # option index for it; see DIVE-560 note in _task_loop_advance.)
   if [[ -n "$options" && "$type" != "decision" ]]; then
     fail "$E_VALIDATION" "--options only applies to --type=decision"
+  fi
+  # DIVE-931: --secret-key / --connector name the drop target and only make sense
+  # on a secret gate. Require them together (a key with no connector has nowhere
+  # to land, and vice versa) and validate against the same charsets the box-side
+  # `secret write` + the api /drop/mint enforce, so a bad value fails here rather
+  # than at mint time. Both omitted = legacy secret gate (out-of-band delivery).
+  if [[ -n "$secret_key" || -n "$connector" ]]; then
+    [[ "$type" == "secret" ]] || fail "$E_VALIDATION" "--secret-key/--connector only apply to --type=secret"
+    [[ -n "$secret_key" && -n "$connector" ]] \
+      || fail "$E_VALIDATION" "--secret-key and --connector must be given together (both name the drop target)"
+    [[ "$secret_key" =~ ^[A-Z][A-Z0-9_]{0,63}$ ]] \
+      || fail "$E_VALIDATION" "invalid --secret-key '$secret_key' (env-var name: ^[A-Z][A-Z0-9_]{0,63}\$)"
+    [[ "$connector" =~ ^[a-z0-9][a-z0-9-]{0,63}$ ]] \
+      || fail "$E_VALIDATION" "invalid --connector '$connector' (^[a-z0-9][a-z0-9-]{0,63}\$)"
   fi
   # DIVE-148: --recommend surfaces the agent's advised choice first in the human
   # alert (and ⭐-marks its button). Only meaningful for the two finite-choice
@@ -13826,6 +13890,8 @@ cmd_task_need() {
             need_type=$(sqlq "$type"), ask=$(sqlq "$ask"),
             need_options=$(sqlq_or_null "$options"),
             recommend=$(sqlq_or_null "$recommend"),
+            secret_key=$(sqlq_or_null "$secret_key"),
+            connector=$(sqlq_or_null "$connector"),
             tier=${tier}, need_asked_at=datetime('now'), gate_pinged_at=NULL,
             need_answer=NULL, need_answered_at=NULL
       WHERE id=${id};"
@@ -13856,7 +13922,20 @@ cmd_task_need() {
   # failed DM must never fail the gate write that just committed above.
   # DIVE-891: tier 1 gates still notify (they're answerable early); the 48h TTL
   # is a backstop, not a silencer. Only tier 0 skips the ping.
-  task_need_notify "$ident" "$type" "$ask" "$options" "$recommend" || true
+  # DIVE-916: mint the per-gate HUMAN nonce for hard human gates (approval/
+  # secret/manual — the types `task answer` enforces as human-only). Store ONLY
+  # its hash; the raw nonce is handed to task_need_notify to embed in the tap
+  # callback_data. It is never printed to stdout, so the agent that filed the
+  # gate never sees it. decision gates are agent-clearable → no nonce.
+  local human_nonce=""
+  case "$type" in
+    approval|secret|manual)
+      human_nonce=$(_human_nonce_mint)
+      [[ -n "$human_nonce" ]] \
+        && db "UPDATE tasks SET human_nonce_hash=$(sqlq "$(_human_nonce_sha "$human_nonce")") WHERE id=${id};"
+      ;;
+  esac
+  task_need_notify "$ident" "$type" "$ask" "$options" "$recommend" "$secret_key" "$connector" "$human_nonce" || true
   local floor_note=""; (( tier_floored )) && floor_note=" [tier forced to 2 — T2 category floor]"
   ok "$ident needs a human ($type, tier $tier)${floor_note} — $ask" \
      '{id:($i|tonumber), ident:$id, status:"blocked", need_type:$ty, tier:($tr|tonumber), tier_floored:($fl=="1"), ask:$ak, need_options:(($op|select(length>0)) // null), recommend:(($rc|select(length>0)) // null), assignee:$ac}' \
@@ -13997,8 +14076,44 @@ _task_close_notify() {
 # task_actor does; the token comes from the group-claude-readable connector
 # file (or an inherited env var); and access.json is found by probing the
 # per-type channel dirs (own file when direct, root-readable when sudo).
+# _task_mint_drop_link — DIVE-931. Mint a one-time secure credential drop link
+# for a secret gate (api POST /drop/mint, box-authed with the box's connectord
+# token). Echoes exactly one of:
+#   <url>|<ttlMinutes>   a live burnable link (api pushes the value to the box)
+#   ONBOX                 api holds no usable token for this box -> on-box path
+#   (empty)               mint unavailable (self-hosted / api down) -> legacy text
+# Best-effort: never fails the caller and never touches the secret VALUE (only the
+# destination coordinates). The value crosses solely via the drop page -> stdin.
+_task_mint_drop_link() {
+  local ident="$1" secret_key="$2" connector="$3"
+  local token="" env_file="/etc/5dive/connectord.env"
+  [[ -n "${CONNECTORD_TOKEN:-}" ]] && token="$CONNECTORD_TOKEN"
+  [[ -z "$token" && -r "$env_file" ]] && token=$(sed -n 's/^CONNECTORD_TOKEN=//p' "$env_file" | head -1)
+  [[ -n "$token" ]] || return 0   # no box identity (self-hosted OSS) -> legacy text
+  local api="${FIVE_API_BASE:-https://api.5dive.com}" body resp
+  body=$(jq -nc --arg t "$ident" --arg k "$secret_key" --arg c "$connector" \
+           '{taskIdent:$t, secretKey:$k, connector:$c, ttlMinutes:30}') || return 0
+  resp=$(curl -fsS --max-time 10 -X POST "${api%/}/drop/mint" \
+           -H "authorization: Bearer ${token}" -H "content-type: application/json" \
+           -d "$body" 2>/dev/null) || return 0
+  if [[ "$(printf '%s' "$resp" | jq -r '.useOnBoxPath // false' 2>/dev/null)" == "true" ]]; then
+    echo "ONBOX"; return 0
+  fi
+  local url ttl
+  url=$(printf '%s' "$resp" | jq -r '.url // empty' 2>/dev/null)
+  ttl=$(printf '%s' "$resp" | jq -r '.ttlMinutes // empty' 2>/dev/null)
+  [[ -n "$url" ]] || return 0
+  echo "${url}|${ttl:-15}"
+}
+
 task_need_notify() {
   local ident="$1" need_type="$2" ask="$3" options="$4" recommend="${5:-}"
+  local secret_key="${6:-}" connector="${7:-}" human_nonce="${8:-}"
+  # DIVE-916: callback_data suffix carrying the raw per-gate nonce for the tap
+  # paths (approval/secret/manual). Empty for decision (agent-clearable, no
+  # nonce) so its `tna:<id>:<idx>` payload is byte-unchanged. The plugin `tna:`
+  # handler treats a present 4th `:`-field as --human-proof.
+  local _np=""; [[ -n "$human_nonce" ]] && _np=":${human_nonce}"
 
   # Resolve bot token + the human's DM/group targets (TASK_CH_* globals). The
   # matched access type (TASK_CH_TYPE) gates the tap-to-answer buttons below.
@@ -14050,8 +14165,26 @@ task_need_notify() {
   # recovery path when a tap fails; the answer command works on EVERY box, run
   # as a human login (claude/root — the human path clears approval/secret gates).
   case "$need_type" in
-    secret) text+=$'\n\n'"🔑 Put the key where I expect it (my .env / our channel), then tap ✅ Provided below — don't paste the key here. Tap not working? On the box: sudo 5dive task answer ${ident}" ;;
-    manual) text+=$'\n\n'"✋ Tap ✅ Done below once it's handled — closes this out. Or on the box: sudo 5dive task answer ${ident} --value=done" ;;
+    secret)
+      # DIVE-931: when the gate names a drop target (secret_key + connector), mint
+      # a burnable single-use link so the human drops the credential straight onto
+      # the box — the VALUE never transits chat, only the link does. Falls back to
+      # the on-box `secret write` (tokenless boxes) or the legacy out-of-band text
+      # (self-hosted / api unreachable). The box-side write auto-clears this gate.
+      local _drop=""
+      if [[ -n "$secret_key" && -n "$connector" ]]; then
+        _drop=$(_task_mint_drop_link "$ident" "$secret_key" "$connector")
+      fi
+      if [[ "$_drop" == "ONBOX" ]]; then
+        text+=$'\n\n'"🔑 [${ident}] needs the ${secret_key} credential. On the box, drop it straight in (never paste it here):"$'\n'"  echo -n \"\$SECRET\" | sudo 5dive secret write ${secret_key} --connector=${connector} --task=${ident}"$'\n'"That writes it and clears this gate. Or tap ✅ Provided once it is done."
+      elif [[ -n "$_drop" ]]; then
+        local _url="${_drop%%|*}" _ttl="${_drop##*|}"
+        text+=$'\n\n'"🔑 [${ident}] needs the ${secret_key} credential. Drop it securely (single-use, expires in ${_ttl}m):"$'\n'"${_url}"$'\n'"The value goes straight onto your box and is never shown in chat. Prefer the box? echo -n \"\$SECRET\" | sudo 5dive secret write ${secret_key} --connector=${connector} --task=${ident}"
+      else
+        text+=$'\n\n'"🔑 Put the key where I expect it (my .env / our channel), then tap ✅ Provided below. Don't paste the key here. Tap not working? On the box: sudo 5dive task answer ${ident}"
+      fi
+      ;;
+    manual) text+=$'\n\n'"✋ Tap ✅ Done below once it is handled, which closes this out. Or on the box: sudo 5dive task answer ${ident} --value=done" ;;
   esac
 
   # DIVE-117/118 tap-to-answer buttons. GATED to the plugin types whose `tna:`
@@ -14100,23 +14233,24 @@ task_need_notify() {
       # DIVE-148: ⭐-mark whichever button the agent recommended (approved/denied)
       # and seat it first. Default order (Approve, Deny) when no recommendation.
       local _rl; _rl=$(printf '%s' "$recommend" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')
-      local _appr='{"text":"✅ Approve","callback_data":"tna:'"${numid}"':approved"}'
-      local _deny='{"text":"🚫 Deny","callback_data":"tna:'"${numid}"':denied"}'
+      # DIVE-916: ${_np} appends :<nonce> so the tap carries --human-proof.
+      local _appr='{"text":"✅ Approve","callback_data":"tna:'"${numid}"':approved'"${_np}"'"}'
+      local _deny='{"text":"🚫 Deny","callback_data":"tna:'"${numid}"':denied'"${_np}"'"}'
       case "$_rl" in
-        approve|approved) _appr='{"text":"⭐ ✅ Approve","callback_data":"tna:'"${numid}"':approved"}'
+        approve|approved) _appr='{"text":"⭐ ✅ Approve","callback_data":"tna:'"${numid}"':approved'"${_np}"'"}'
                           reply_markup='{"inline_keyboard":[['"$_appr"','"$_deny"']]}' ;;
-        deny|denied)      _deny='{"text":"⭐ 🚫 Deny","callback_data":"tna:'"${numid}"':denied"}'
+        deny|denied)      _deny='{"text":"⭐ 🚫 Deny","callback_data":"tna:'"${numid}"':denied'"${_np}"'"}'
                           reply_markup='{"inline_keyboard":[['"$_deny"','"$_appr"']]}' ;;
         *)                reply_markup='{"inline_keyboard":[['"$_appr"','"$_deny"']]}' ;;
       esac
     elif [[ "$need_type" == "secret" ]]; then
       # DIVE-356: one-tap "Provided" — the plugin handler runs `task answer <id>`
       # with NO value (the CLI rejects a value for a secret gate). Matches dev's
-      # tna:<numid>:provided contract.
-      reply_markup='{"inline_keyboard":[[{"text":"✅ Provided","callback_data":"tna:'"${numid}"':provided"}]]}'
+      # tna:<numid>:provided contract. DIVE-916: ${_np} appends the nonce.
+      reply_markup='{"inline_keyboard":[[{"text":"✅ Provided","callback_data":"tna:'"${numid}"':provided'"${_np}"'"}]]}'
     elif [[ "$need_type" == "manual" ]]; then
       # DIVE-356: one-tap "Done" — handler runs `task answer <id> --value=done`.
-      reply_markup='{"inline_keyboard":[[{"text":"✅ Done","callback_data":"tna:'"${numid}"':done"}]]}'
+      reply_markup='{"inline_keyboard":[[{"text":"✅ Done","callback_data":"tna:'"${numid}"':done'"${_np}"'"}]]}'
     fi
   fi
 
@@ -14229,9 +14363,9 @@ cmd_gate_proof() {
     require_root "gate-proof enforce"
     case "${2:-status}" in
       on)  : > "$GATE_PROOF_ENFORCE"; chmod 0644 "$GATE_PROOF_ENFORCE" 2>/dev/null || true
-           ok "gate-proof enforcement ON — approval/secret answers now require a valid --proof" ;;
+           ok "gate-proof enforcement ON: approval/secret/manual answers now require human evidence (a valid --human-proof nonce or a non-agent SUDO_UID)" ;;
       off) rm -f "$GATE_PROOF_ENFORCE"
-           ok "gate-proof enforcement OFF — audit-only; approval/secret answers allowed without --proof" ;;
+           ok "gate-proof enforcement OFF: audit-only; approval/secret/manual answers allowed without human evidence" ;;
       status)
            local _e _k
            _gate_proof_enforced && _e=on || _e=off
@@ -14245,21 +14379,22 @@ cmd_gate_proof() {
     esac
     return
   fi
+  # DIVE-950: the `gate-proof <id> <type>` MINT path is REMOVED. The --proof token
+  # it produced (evidence-form b) was agent-forgeable — `gate-proof` is require_root
+  # only, so any agent could `sudo`-mint a valid token and self-clear a gate, no
+  # higher a bar than the sudo it already had. Human evidence is now (a) the
+  # per-gate --human-proof nonce (plugin tap / dashboard payload) or (c) a non-agent
+  # SUDO_UID. `sign`/`verify`/`enforce` above remain (closure tamper-evidence +
+  # the enforcement toggle). A stray mint caller gets a loud, AUDITED failure here
+  # rather than a silent forge.
   require_root "gate-proof"
-  tasks_db_init
-  local ref="${1:-}" type="${2:-}"
-  [[ -n "$ref" && -n "$type" ]] || fail "$E_USAGE" "usage: 5dive gate-proof <id|DIVE-N> <approval|secret>"
-  [[ "$type" == "approval" || "$type" == "secret" ]] || fail "$E_VALIDATION" "gate-proof type must be approval|secret"
-  _gate_proof_ensure_key || fail "$E_GENERIC" "cannot provision gate-proof key (need root)"
-  resolve_task_id "$ref"; local id="$RESOLVED_TASK_ID" ident="$RESOLVED_TASK_IDENT"
-  local token; token=$(_gate_proof_mint "$id" "$type") || fail "$E_GENERIC" "failed to mint proof token"
-  audit_log "gate-proof mint" "ok" 0 -- "task=$ident" "type=$type"
-  printf '%s\n' "$token"   # RAW — consumers (plugin mint, human-on-box) read stdout verbatim
+  audit_log "gate-proof mint" "error" 1 -- "removed=DIVE-950" "args=${1:-} ${2:-}"
+  fail "$E_USAGE" "gate-proof mint is removed (DIVE-950): the --proof evidence form was agent-forgeable. Gates clear via a human tap (per-gate nonce) or a non-agent SUDO_UID. Valid subcommands: gate-proof enforce on|off|status | verify <id> | sign."
 }
 
 cmd_task_answer() {
   tasks_db_init
-  local value="" value_set=0 from="" human=0 proof=""
+  local value="" value_set=0 from="" human=0 human_proof=""
   local -a positional=()
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -14270,9 +14405,18 @@ cmd_task_answer() {
       # provenance in need_answered_by; the enforced boundary for hard-line gates
       # is still root (below), so an agent passing --human gains nothing.
       --human)   human=1 ;;
-      # DIVE-519: human-origin proof token (minted by `5dive gate-proof`) that the
-      # trusted paths attach to clear an approval/secret gate. Verified below.
-      --proof=*) proof="${1#*=}" ;;
+      # DIVE-950: evidence-form (b), the DIVE-519 --proof token, is DROPPED — it
+      # was agent-forgeable (`5dive gate-proof` mint is require_root only, so any
+      # agent could `sudo`-mint a valid token: the easy one-sudo forge). The flag
+      # is still PARSED but IGNORED — a rollout-safe no-op — so an in-flight caller
+      # that still sends --proof=AUTO/<token> (an old dashboard/shelld mid-deploy)
+      # does not hit "unknown flag"; it falls through to the surviving evidence
+      # forms: (a) --human-proof nonce, or (c) a non-agent SUDO_UID.
+      --proof=*) : ;;
+      # DIVE-916: per-gate HUMAN nonce (from the Telegram tap callback_data /
+      # dashboard payload) — the evidence form for the plugin-tap path, whose
+      # SUDO_UID is the spawning agent. Verified against human_nonce_hash below.
+      --human-proof=*) human_proof="${1#*=}" ;;
       --)        shift; positional+=("$@"); break ;;
       -*)        fail "$E_USAGE" "unknown flag: $1" ;;
       *)         positional+=("$1") ;;
@@ -14302,45 +14446,71 @@ cmd_task_answer() {
   # answer` becomes root and passes — closing that (require a --human secret the
   # trusted paths inject) is the documented fast-follow; the --human flag is
   # already parsed + recorded as provenance to stage it.
-  if [[ "$nt" == "approval" || "$nt" == "secret" ]]; then
+  # DIVE-916: `manual` joins approval/secret as a hard human gate here — it's a
+  # step only a person can do, so an agent must not self-answer it either.
+  if [[ "$nt" == "approval" || "$nt" == "secret" || "$nt" == "manual" ]]; then
     local _caller; _caller=$(id -un 2>/dev/null || echo '?')
     if [[ "$_caller" == agent-* ]]; then
       # No audit_log here: the blocked caller is an agent user that can't write
       # the root-owned audit log anyway (it would only leak a perms error to
       # stderr). The fail + non-zero exit is the record.
-      fail "$E_AUTH_REQUIRED" "$ident is a '$nt' gate — only a human can clear it. Answer it from Telegram (tap the button) or the dashboard; an agent can't self-answer an approval/secret gate."
+      fail "$E_AUTH_REQUIRED" "$ident is a '$nt' gate — only a human can clear it. Answer it from Telegram (tap the button) or the dashboard; an agent can't self-answer an approval/secret/manual gate."
     fi
   fi
 
-  # DIVE-519: human-origin PROOF — the SECOND line for approval/secret, catching
-  # the agent->sudo->root bypass the agent-* check above can't see. The trusted
-  # paths attach --proof minted from the root-only 0400 key (plugin tap,
-  # dashboard/shelld, human-on-box via `5dive gate-proof`). We ALWAYS audit the
-  # attempt; we only REJECT a missing/invalid proof once enforcement is flipped on
-  # (`gate-proof enforce on`), so this ships DORMANT until the plugin mint is
-  # confirmed live on the box (else live taps that can't mint yet fail closed).
-  # Bar-raise, not airtight: a sudo-agent could mint its own proof, but only via a
-  # loud, audited `sudo 5dive gate-proof` — never a silent one-liner.
+  # DIVE-916/950: hard human gates (approval/secret/manual) need HUMAN evidence
+  # beyond the agent-* uid block above — that block sees `sudo`->root as non-agent,
+  # so it cannot catch the agent->sudo->root path. The trusted human paths supply
+  # ONE of two evidence forms (see below): the per-gate --human-proof nonce (the
+  # plugin tap, whose SUDO_UID is the spawning agent) or a non-agent SUDO_UID (the
+  # dashboard exec as claude, the DIVE-931 drop write, a human-on-box login). We
+  # ALWAYS audit the attempt; we only REJECT when NEITHER form is present, and only
+  # once enforcement is flipped on (`gate-proof enforce on`). Ships DORMANT until
+  # the nonce-carrying plugin is confirmed live FLEET-WIDE (else a live tap that
+  # can't supply the nonce yet would fail closed). DIVE-950 dropped the old DIVE-519
+  # --proof form: it was agent-forgeable via the require_root `gate-proof` mint.
   #
   # DIVE-525 (UX): a HUMAN's tap must NEVER be rejected — "you tapped but it's not
-  # enough" is the exact confusion lodar hit dogfooding. So when enforcement is on
-  # we reject ONLY an agent-path answer (no --human) that lacks a valid proof. A
-  # --human answer (the trusted plugin tap / dashboard / human-on-box paths all set
-  # it) ALWAYS clears, even if the box couldn't mint a proof yet (mid-rollout) — we
-  # still audit it (valid=0 + human=1 flags a rollout gap, never a dead-ended human).
-  # The agent-* uid block above + this agent-path-needs-proof rule are what actually
-  # stop the DIVE-515/516 incident (an agent silently self-clearing); humans are
-  # never blocked. Consistent with the agreed bar-raise scope (not airtight).
-  if [[ "$nt" == "approval" || "$nt" == "secret" ]]; then
-    local _pv=0
-    [[ -n "$proof" ]] && _gate_proof_verify "$id" "$nt" "$proof" && _pv=1
+  # enough" is the exact confusion lodar hit dogfooding. Under enforcement we reject
+  # ONLY when no evidence form is present (the forge: an agent's bare
+  # `sudo task answer --human`, SUDO_UID=agent, no nonce). Every trusted path
+  # supplies at least one form, so a real human is never blocked. The agent-* uid
+  # block above + this rule stop the DIVE-515/516 incident (an agent silently
+  # self-clearing). Bar-raise scope: closes the one-liner + the easy sudo-mint
+  # forge, NOT a determined root-sudo agent (separate sudo-reduction track).
+  if [[ "$nt" == "approval" || "$nt" == "secret" || "$nt" == "manual" ]]; then
+    # DIVE-916/950: TWO EQUIVALENT human-evidence forms — accept EITHER one, never
+    # require both (double-gating a real tap violates DIVE-525):
+    #   (a) --human-proof=<nonce> matching this gate's stored hash — the plugin
+    #       tap / dashboard payload, the one path whose SUDO_UID is the agent,
+    #   (c) a non-agent SUDO_UID — a claude/root interactive login, the dashboard
+    #       exec (shelld runs as SUDO_UID=claude), AND the DIVE-931 secret-drop
+    #       write (SUDO_UID=claude survives the nested non-sudo task-answer exec;
+    #       verified empirically).
+    # DIVE-950 dropped the former form (b), a DIVE-519 --proof token: it was
+    # agent-forgeable (`sudo 5dive gate-proof` mint is require_root only), so it
+    # raised the bar no higher than the sudo it already required. This still
+    # supersedes the DIVE-519 "proof OR bare --human" rule: a bare --human is NOT
+    # sufficient — that was the sudo→--human forge (DIVE-916 threat).
+    local _hp=0 _su=0
+    [[ -n "$human_proof" ]] && _human_nonce_verify "$id" "$human_proof" && _hp=1
+    _gate_sudo_uid_nonagent && _su=1
+    local _evid=$(( _hp || _su ))
     local _caller2; _caller2=$(id -un 2>/dev/null || echo '?')
-    audit_log "task answer gate" "$([[ $_pv -eq 1 ]] && echo ok || echo error)" 0 -- \
-      "task=$ident" "type=$nt" "proof=$([[ -n "$proof" ]] && echo present || echo absent)" \
-      "valid=$_pv" "human=$human" "caller=$_caller2" "sudo_user=${SUDO_USER:-}" "enforce=$(_gate_proof_enforced && echo on || echo off)"
-    # Reject only the agent path (no --human) without a valid proof. Human taps clear.
-    if _gate_proof_enforced && (( ! _pv )) && (( ! human )); then
-      fail "$E_AUTH_REQUIRED" "$ident ($nt) needs a human to approve it — answer from Telegram (tap the button) or the dashboard. (An agent can't self-clear an approval/secret gate.)"
+    audit_log "task answer gate" "$([[ $_evid -eq 1 ]] && echo ok || echo error)" 0 -- \
+      "task=$ident" "type=$nt" \
+      "human_proof=$([[ -n "$human_proof" ]] && echo present || echo absent)" "nonce_valid=$_hp" \
+      "sudo_nonagent=$_su" "human=$human" "caller=$_caller2" "sudo_uid=${SUDO_UID:-}" \
+      "enforce=$(_gate_proof_enforced && echo on || echo off)"
+    # DIVE-525: a real human tap is NEVER rejected — every trusted path supplies
+    # at least one evidence form (plugin→nonce, dashboard→proof/SUDO_UID=claude,
+    # human-on-box→non-agent SUDO_UID, drop→SUDO_UID=claude). Under enforcement,
+    # reject only when NONE is present (the forge: an agent's bare
+    # `sudo task answer --human`). Ships DORMANT (audit-only) until the plugin
+    # --human-proof injection is confirmed live fleet-wide; root then flips
+    # `gate-proof enforce on` (Marcus ship-gates the flip).
+    if _gate_proof_enforced && (( ! _evid )); then
+      fail "$E_AUTH_REQUIRED" "$ident ($nt) needs a human to clear it — tap the button in Telegram or use the dashboard. (An agent can't self-clear an approval/secret/manual gate.)"
     fi
   fi
 
@@ -20380,6 +20550,144 @@ cmd_import() {
      '{name:$n, type:$t, memory:$mem, memorySeeded:$ms, skillsAdded:$a, skillsSkipped:$s, template:$tpl, avatar:$av, reported:$ri}' \
      --arg n "$as" --arg t "$type" --arg mem "$mem_inc" --arg ms "$mem_seeded" --argjson a "$added_j" --argjson s "$skipped_j" --arg tpl "$templated" --arg av "$avatar_note" --arg ri "$reported"
 }
+# cmd_secret — box-side secret-write primitive (DIVE-930/932, secure credential drop).
+#
+# The single hardened, allowlisted write-path that lands a credential in the
+# box's secret store. Shared by BOTH callers in the DIVE-919 chain:
+#   - api (DIVE-930): execOnServer(userId, ['5dive','secret','write',KEY,
+#     '--connector='..], {stdin: value})  -> the hosted /drop endpoint.
+#   - telegram plugin (DIVE-932): `sudo -n 5dive secret write ...` locally, the
+#     burn-after-read safety net for accidental plaintext.
+#
+# Hard invariants (Marcus ship-gates these hardest, spec:
+# community/wiki/secure-credential-drop-link-spec.md):
+#   - value crosses on STDIN ONLY, never argv  -> never in ps/process-table,
+#     shell history, or the audit log (main.sh audits argv, which omits value).
+#   - atomic write: temp file in the same dir + rename; no partial/torn file.
+#   - idempotent key update: replace an existing `KEY=` line in place, never
+#     blind-append a duplicate.
+#   - file perms 600, owner root:claude (connectors dir is root-owned).
+#   - value is NEVER echoed back, logged, or persisted anywhere but the target.
+#   - embedded newline in the value is REJECTED (would inject extra env lines).
+#
+# Target (gate answer DIVE-932, 2026-07-03): per-connector file
+#   /etc/5dive/connectors/<connector>.env
+# ties the secret to the connector that consumes it (matches the existing
+# anthropic.env / expo.env layout).
+
+# CONNECTORS_DIR is the hardcoded global from header.sh (/etc/5dive/connectors).
+# Intentionally NOT env-overridable — a caller must not be able to redirect where
+# a secret lands.
+SECRET_WRITE_LOCK="/run/5dive-secret-write.lock"
+
+_secret_usage() {
+  cat >&2 <<'EOF'
+5dive secret — box-side secret store (secure credential drop, DIVE-919)
+
+  5dive secret write <KEY> --connector=<name> [--task=<DIVE-N>]   (value on STDIN)
+      Write/replace KEY in /etc/5dive/connectors/<name>.env. Atomic,
+      idempotent, 600 root:claude. The value is read from stdin and never
+      appears in argv, logs, or output. Root-only. With --task, a confirmed
+      write clears that task's pending secret gate (secure-drop path).
+
+      echo -n "$TOKEN" | sudo 5dive secret write OPENAI_API_KEY --connector=openai
+EOF
+}
+
+# valid env-var name: leading letter/underscore, then upper alnum/underscore.
+# Restricting to this charset also makes it safe to interpolate into the
+# `^KEY=` grep pattern below without regex-escaping.
+_valid_env_key() { [[ "$1" =~ ^[A-Z_][A-Z0-9_]*$ ]]; }
+# connector filename stem: lower alnum + dashes; no dots/slashes -> no path
+# traversal, no hidden double-extension.
+_valid_connector() { [[ "$1" =~ ^[a-z0-9][a-z0-9-]*$ ]]; }
+
+cmd_secret() {
+  [[ $# -gt 0 ]] || { _secret_usage; exit "$E_USAGE"; }
+  local sub="$1"; shift
+  case "$sub" in
+    write) _secret_write "$@" ;;
+    -h|--help|help) _secret_usage ;;
+    *) fail "$E_USAGE" "unknown secret command: $sub (write)" ;;
+  esac
+}
+
+_secret_write() {
+  local key="" connector="" task=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --connector=*) connector="${1#*=}" ;;
+      --connector)   connector="${2:-}"; shift ;;
+      # DIVE-931: the originating secret gate. On a confirmed write we clear it
+      # (equivalent to the "Provided" tap) — a secure drop IS the human providing
+      # the credential. Optional: a plain `secret write` (no drop) omits it.
+      --task=*)      task="${1#*=}" ;;
+      --task)        task="${2:-}"; shift ;;
+      --*)           fail "$E_USAGE" "unknown flag: $1" ;;
+      *)             [[ -z "$key" ]] && key="$1" || fail "$E_USAGE" "unexpected argument: $1" ;;
+    esac
+    shift
+  done
+
+  require_root secret write
+  [[ -n "$key" ]]       || fail "$E_USAGE" "usage: 5dive secret write <KEY> --connector=<name> (value on stdin)"
+  [[ -n "$connector" ]] || fail "$E_USAGE" "--connector=<name> is required"
+  _valid_env_key "$key"       || fail "$E_USAGE" "invalid KEY '$key' (env-var name: ^[A-Z_][A-Z0-9_]*\$)"
+  _valid_connector "$connector" || fail "$E_USAGE" "invalid --connector '$connector' (^[a-z0-9][a-z0-9-]*\$)"
+
+  # Value on stdin ONLY. A tty means no value was piped -> refuse rather than
+  # block reading from the keyboard (and rather than accept an empty secret).
+  [[ -t 0 ]] && fail "$E_USAGE" "secret value must be piped on stdin (never passed as an argument)"
+  local value; value="$(cat)"
+  # Strip a single trailing CR/LF pair left by echo / heredocs; preserve any
+  # other bytes verbatim.
+  value="${value%$'\n'}"; value="${value%$'\r'}"
+  [[ -n "$value" ]] || fail "$E_USAGE" "empty secret on stdin — nothing to write"
+  # An embedded newline could smuggle additional `EVIL=...` lines into the env
+  # file. Reject outright.
+  [[ "$value" == *$'\n'* ]] && fail "$E_USAGE" "secret value must be single-line (embedded newline rejected)"
+
+  local target="${CONNECTORS_DIR}/${connector}.env"
+  mkdir -p "$CONNECTORS_DIR"; chmod 750 "$CONNECTORS_DIR" 2>/dev/null || true
+
+  # Serialize concurrent writers (two keys into the same file must not lose an
+  # update through read-modify-write interleaving). One global lock is plenty at
+  # this volume. flock releases when fd 9 closes (process exit or the exec below).
+  exec 9>"$SECRET_WRITE_LOCK" || fail "$E_GENERIC" "cannot open secret-write lock"
+  flock 9 || fail "$E_GENERIC" "cannot acquire secret-write lock"
+
+  local action="created"
+  [[ -f "$target" ]] && grep -qE "^${key}=" "$target" && action="updated"
+
+  # Temp file in the SAME dir so the final mv is a rename (atomic), never a
+  # cross-filesystem copy. mktemp is 600 by default; set it explicitly anyway so
+  # the secret is never briefly group/world-readable.
+  local tmp; tmp="$(mktemp "${target}.XXXXXX")" || fail "$E_GENERIC" "mktemp failed"
+  chmod 600 "$tmp"
+  # Carry every OTHER key forward; drop the old line for this key (idempotent
+  # replace). `|| true`: grep -v exits 1 when the result is empty (file held only
+  # this key) — not an error under set -e.
+  if [[ -f "$target" ]]; then grep -vE "^${key}=" "$target" > "$tmp" || true; fi
+  printf '%s=%s\n' "$key" "$value" >> "$tmp"
+  chown root:claude "$tmp" 2>/dev/null || true
+  chmod 600 "$tmp"
+  mv -f "$tmp" "$target"
+  exec 9>&-
+
+  # DIVE-931 gate auto-resolve: the credential is now safely on the box, so clear
+  # the originating secret gate (equivalent to the human tapping "Provided"). We
+  # are root here (require_root above) — a sanctioned human-equivalent path, so
+  # `task answer` accepts it; --human marks it human-sourced. Shelled out (not an
+  # in-process call) so its `fail`/exit on an already-answered or closed gate can
+  # NEVER abort this command: the write has succeeded and must report success.
+  if [[ -n "$task" ]]; then
+    5dive task answer "$task" --human --from=drop >/dev/null 2>&1 || true
+  fi
+
+  ok "secret $action: $key -> ${connector}.env" \
+     '{connector: $c, key: $k, action: $a, path: $p}' \
+     --arg c "$connector" --arg k "$key" --arg a "$action" --arg p "$target"
+}
 
 # -------- self-update (fetch installer + --upgrade, then restart agents) --------
 #
@@ -21025,6 +21333,12 @@ main() {
       # DIVE-519: mint a human-origin proof token for an approval/secret gate (or
       # toggle enforcement). Root-only (reads the 0400 key); audits its own mint.
       cmd_gate_proof "$@" ;;
+    secret)
+      # DIVE-930/932 secure credential drop: box-side secret-write primitive.
+      # Root-only (writes root-owned /etc/5dive/connectors). The value arrives on
+      # STDIN, so auditing argv here never captures the secret.
+      AUDIT_CMD="secret"; AUDIT_ARGS=("$@")
+      cmd_secret "$@" ;;
     org)
       # Agent org chart (sqlite, same store as tasks). Read/write, no audit/lock.
       cmd_org "$@" ;;

@@ -52,6 +52,7 @@ cat \
   src/cmd_digest.sh \
   src/cmd_memory.sh \
   src/cmd_pack.sh \
+  src/cmd_secret.sh \
   src/cmd_selfupdate.sh \
   src/main.sh \
   > "$OUT"
