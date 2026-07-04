@@ -167,6 +167,57 @@ nstd=$(db "SELECT COUNT(*) FROM tasks WHERE project_key='pay' AND kind='standard
   && ok_t "T2 plan gates even with --yes (no leaf materialized)" \
   || bad_t "T2 gate over --yes" "rc=$rc gated=$gated ngates=$ngates nstd=$nstd out=$out"
 
+# ---- (9b) the T2 gate is filed at HARD tier 2 (gap B: not agent-clearable/48h-auto) ----
+t2_tier=$(db "SELECT COALESCE(tier,'') FROM tasks WHERE project_key='pay' AND need_type IS NOT NULL ORDER BY id LIMIT 1;")
+[[ "$t2_tier" == "2" ]] \
+  && ok_t "T2 plan gate is filed at hard tier 2" \
+  || bad_t "T2 gate tier 2" "tier=$t2_tier"
+
+# ---- (10) --from-gate refuses an UNANSWERED gate ----
+pay_gate=$(db "SELECT id FROM tasks WHERE project_key='pay' AND title LIKE 'Goal:%' ORDER BY id LIMIT 1;")
+out=$(run cmd_goal_add --from-gate="$pay_gate"); rc=$?
+[[ $rc -ne 0 ]] && printf '%s' "$out" | grep -qi "not answered yet" \
+  && ok_t "--from-gate refuses an unanswered plan gate" \
+  || bad_t "from-gate unanswered" "rc=$rc out=$out"
+
+# ---- (10b) --from-gate refuses a NON-HUMAN answer (DIVE-916 human-origin) ----
+# Simulate an agent/TTL clear: answered, approve, but need_answered_by is NOT human:*.
+db "UPDATE tasks SET need_answer='approve', need_answered_at=datetime('now'), need_answered_by='auto:t1' WHERE id=${pay_gate};" >/dev/null
+out=$(run cmd_goal_add --from-gate="$pay_gate"); rc=$?
+nstd=$(db "SELECT COUNT(*) FROM tasks WHERE project_key='pay' AND kind='standard' AND title NOT LIKE 'Goal:%';")
+[[ $rc -ne 0 && "$nstd" == "0" ]] && printf '%s' "$out" | grep -qi "human" \
+  && ok_t "--from-gate refuses a non-human (auto/agent) approval" \
+  || bad_t "from-gate non-human" "rc=$rc nstd=$nstd out=$out"
+
+# ---- (10c) --from-gate refuses a human answer that is NOT 'approve' ----
+db "UPDATE tasks SET need_answer='revise', need_answered_by='human:mark' WHERE id=${pay_gate};" >/dev/null
+out=$(run cmd_goal_add --from-gate="$pay_gate"); rc=$?
+[[ $rc -ne 0 ]] && printf '%s' "$out" | grep -qi "not 'approve'" \
+  && ok_t "--from-gate refuses a human 'revise' (only 'approve' builds)" \
+  || bad_t "from-gate non-approve" "rc=$rc out=$out"
+
+# ---- (10d) --from-gate MATERIALIZES on a human 'approve' (the completed loop) ----
+db "UPDATE tasks SET need_answer='approve', need_answered_by='human:mark' WHERE id=${pay_gate};" >/dev/null
+out=$(run cmd_goal_add --from-gate="$pay_gate"); rc=$?
+mat=$(printf '%s' "$out" | jq -r '.data.materialized // false' 2>/dev/null)
+fg=$(printf '%s' "$out" | jq -r '.data.fromGate // ""' 2>/dev/null)
+nstd=$(db "SELECT COUNT(*) FROM tasks WHERE project_key='pay' AND kind='standard' AND title NOT LIKE 'Goal:%';")
+[[ $rc -eq 0 && "$mat" == "true" && "$nstd" == "1" && -n "$fg" ]] \
+  && ok_t "--from-gate materializes a T2 plan on a HUMAN approve" \
+  || bad_t "from-gate materialize" "rc=$rc mat=$mat nstd=$nstd fg=$fg out=$out"
+
+# ---- (10e) --from-gate is idempotent: refuses to re-materialize a built goal ----
+out=$(run cmd_goal_add --from-gate="$pay_gate"); rc=$?
+[[ $rc -ne 0 ]] && printf '%s' "$out" | grep -qi "already has" \
+  && ok_t "--from-gate refuses to re-materialize an already-built goal" \
+  || bad_t "from-gate dup guard" "rc=$rc out=$out"
+
+# ---- (10f) --from-gate rejects a non-goal task ----
+out=$(run cmd_goal_add --from-gate="$(db "SELECT id FROM tasks WHERE project_key='widget' AND title='Build widget';")"); rc=$?
+[[ $rc -ne 0 ]] && printf '%s' "$out" | grep -qi "not a goal plan gate" \
+  && ok_t "--from-gate rejects a non-goal task" \
+  || bad_t "from-gate non-goal" "rc=$rc out=$out"
+
 echo
 echo "goal add unit: $PASS passed, $FAIL failed"
 [[ $FAIL -eq 0 ]]

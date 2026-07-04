@@ -18,7 +18,10 @@
 #     rejected — the planner can never launder a high-tier task as low
 #   - human checkpoint: a plan over the count threshold OR carrying any T2 task
 #     files exactly ONE decision gate (carrying the dry-run plan) before any
-#     leaf task exists; below-threshold + all-low materializes with zero humans
+#     leaf task exists; below-threshold + all-low materializes with zero humans.
+#     A T2 plan gates at HARD tier 2 (never 48h-auto/agent-cleared) and is built
+#     only via `goal add --from-gate=<id>` once a HUMAN answered 'approve'
+#     (DIVE-985: --yes waives ONLY the count checkpoint, never a T2 gate)
 #   - --dry-run renders the graph and creates nothing
 #   - DAG validity: no cycles, every depends_on resolves, every task assignable
 #
@@ -59,14 +62,18 @@ _goal_usage() {
       [--ceiling=<tokens>]  # planner budget (default ${GOAL_CEILING_DEFAULT})
       [--dry-run]           # plan + render, create nothing
       [--yes]               # waive the COUNT checkpoint (a T2 plan still gates)
-      [--plan=<json>]       # supply a plan directly (skip the planner; also the
-                            #   approve->materialize path for a gated plan)
+      [--plan=<json>]       # supply a plan directly (skip the planner)
+      [--from-gate=<id>]    # materialize a gated plan AFTER a human approved it:
+                            #   recovers the plan from the anchor, requires a
+                            #   HUMAN 'approve' (DIVE-916), re-validates, builds.
+                            #   The only path that materializes a T2 plan.
       [--from=<who>]        # actor override
 
   JSON in/out (add --json). A plan is validated (DAG acyclicity, cap, depth,
   tier-floor, assignability) before anything is created. Over the checkpoint
   threshold or carrying any T2 task -> ONE decision gate carries the plan and
-  nothing is materialized until a human approves.
+  nothing is materialized until a human approves; a T2 plan gates at hard tier 2
+  and is materialized only via --from-gate=<id> on a human 'approve'.
 USAGE
 }
 
@@ -350,11 +357,68 @@ _goal_free_prefix() {
   printf '%s' "$base"
 }
 
+# ------- approve->materialize: _goal_approve_from_gate <gate_ref> <from> <max_tasks> <depth_cap> -------
+# DIVE-985 gap A: the completion of the human-checkpoint loop. --yes waives ONLY
+# the count checkpoint, so a Tier-2-carrying plan can be proposed + gated but has
+# no way to be built — this is that path. Given the anchor task that carries a
+# plan gate, verify a HUMAN answered it 'approve' (DIVE-916 human-origin rule:
+# need_answered_by must be human:*, never auto:/agent), recover the plan from the
+# anchor body, RE-VALIDATE it from scratch (never trust the stored blob), then
+# materialize. This is the ONLY route that materializes a T2 plan.
+_goal_approve_from_gate() {
+  local gate_ref="$1" from="$2" max_tasks="$3" depth_cap="$4"
+  resolve_task_id "$gate_ref"; local id="$RESOLVED_TASK_ID" ident="$RESOLVED_TASK_IDENT"
+
+  # Must be a goal plan anchor ('Goal: …'), not some unrelated gate.
+  local title pkey; title=$(db "SELECT COALESCE(title,'') FROM tasks WHERE id=${id};")
+  pkey=$(db "SELECT COALESCE(project_key,'') FROM tasks WHERE id=${id};")
+  [[ "$title" == Goal:* ]] \
+    || fail "$E_VALIDATION" "$ident is not a goal plan gate (title is not 'Goal: …') — pass the anchor task 5dive goal add filed"
+  [[ -n "$pkey" ]] || fail "$E_VALIDATION" "$ident has no project — cannot materialize"
+
+  # The gate must be ANSWERED, by a HUMAN, with 'approve' (DIVE-916 human-origin).
+  local nt nans nat nby
+  nt=$(db  "SELECT COALESCE(need_type,'')        FROM tasks WHERE id=${id};")
+  nat=$(db "SELECT COALESCE(need_answered_at,'') FROM tasks WHERE id=${id};")
+  nans=$(db "SELECT COALESCE(need_answer,'')     FROM tasks WHERE id=${id};")
+  nby=$(db "SELECT COALESCE(need_answered_by,'') FROM tasks WHERE id=${id};")
+  [[ -n "$nt" ]]  || fail "$E_CONFLICT" "$ident carries no gate to approve"
+  [[ -n "$nat" ]] || fail "$E_CONFLICT" "$ident's plan gate is not answered yet — a human must approve it first (tap the button in Telegram / dashboard), then re-run"
+  [[ "$nby" == human:* ]] \
+    || fail "$E_AUTH_REQUIRED" "$ident's plan gate was not cleared by a human (answered by '${nby:-?}') — a plan may only be materialized on a HUMAN approval (DIVE-916); an agent/TTL-cleared gate cannot build it"
+  [[ "$nans" == "approve" ]] \
+    || fail "$E_CONFLICT" "$ident's plan gate was answered '${nans}', not 'approve' — nothing materialized (revise via re-planning, DIVE-982)"
+
+  # Recover the plan JSON from the anchor body (after the marker the filer appended)
+  # and RE-VALIDATE it — caps/tier/DAG guards run again exactly as on propose.
+  local body plan
+  body=$(db "SELECT COALESCE(body,'') FROM tasks WHERE id=${id};")
+  plan=$(printf '%s' "$body" | awk 'f{print} /^--- plan json ---$/{f=1}')
+  printf '%s' "$plan" | jq -e . >/dev/null 2>&1 \
+    || fail "$E_VALIDATION" "could not recover valid plan JSON from $ident's body (expected a '--- plan json ---' section)"
+  _goal_validate_plan "$plan" "$max_tasks" "$depth_cap"   # sets GOAL_* or fails
+
+  # Dup guard: refuse to re-materialize an already-built goal (re-plan = DIVE-982).
+  local existing; existing=$(db "SELECT COUNT(*) FROM tasks WHERE project_key=$(sqlq "$pkey") AND kind='standard' AND title NOT LIKE 'Goal:%';")
+  [[ "${existing:-0}" -eq 0 ]] \
+    || fail "$E_CONFLICT" "project '$pkey' already has $existing materialized task(s) — re-planning is DIVE-982"
+
+  local pprefix; pprefix=$(db "SELECT COALESCE(prefix,'') FROM projects WHERE key=$(sqlq "$pkey");")
+  _goal_materialize "$plan" "$pkey" "$from"
+
+  if (( JSON_MODE )); then
+    ok "" '{materialized:true, fromGate:$g, project:{key:$k,prefix:$pf}, taskCount:($n|tonumber), criticalPath:($cp|tonumber), created:$c, idents:($ids|split(" ")|map(select(length>0)))}' \
+       --arg g "$ident" --arg k "$pkey" --arg pf "$pprefix" --arg n "$GOAL_TASK_COUNT" --arg cp "$GOAL_CRIT_PATH" --argjson c "$GOAL_CREATED_JSON" --arg ids "$GOAL_CREATED_IDENTS"
+  else
+    ok "goal materialized from approved gate $ident under '$pkey' — $GOAL_TASK_COUNT task(s), critical path $GOAL_CRIT_PATH: $GOAL_CREATED_IDENTS"
+  fi
+}
+
 cmd_goal_add() {
   tasks_db_init
   local project="" planner="" max_tasks="$GOAL_MAX_TASKS_DEFAULT" depth_cap="$GOAL_DEPTH_CAP_DEFAULT"
   local checkpoint="$GOAL_CHECKPOINT_DEFAULT" ceiling="$GOAL_CEILING_DEFAULT"
-  local dry_run="" yes="" plan="" from=""
+  local dry_run="" yes="" plan="" from="" from_gate=""
   local -a words=()
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -367,6 +431,7 @@ cmd_goal_add() {
       --dry-run)      dry_run=1 ;;
       --yes)          yes=1 ;;
       --plan=*)       plan="${1#*=}" ;;
+      --from-gate=*)  from_gate="${1#*=}" ;;
       --from=*)       from="${1#*=}" ;;
       --)             shift; words+=("$@"); break ;;
       -*)             fail "$E_USAGE" "unknown flag: $1" ;;
@@ -374,6 +439,17 @@ cmd_goal_add() {
     esac
     shift
   done
+
+  # DIVE-985 gap A: approve->materialize an already-proposed, human-approved plan.
+  # No outcome/planner/plan needed — everything is recovered from the anchor gate.
+  if [[ -n "$from_gate" ]]; then
+    for v in "$max_tasks" "$depth_cap"; do
+      [[ "$v" =~ ^[1-9][0-9]*$ ]] || fail "$E_VALIDATION" "--max-tasks/--depth-cap must be positive integers"
+    done
+    _goal_approve_from_gate "$from_gate" "$from" "$max_tasks" "$depth_cap"
+    return
+  fi
+
   local outcome="${words[*]:-}"
   [[ -n "$outcome" ]] || fail "$E_USAGE" "usage: 5dive goal add \"<outcome>\" [--project=] [--max-tasks=] [--dry-run] [--yes]"
   for v in "$max_tasks" "$depth_cap" "$checkpoint" "$ceiling"; do
@@ -459,9 +535,13 @@ cmd_goal_add() {
       anchor_ident=$(db "SELECT ident FROM tasks WHERE id=${anchor_id};")
     fi
     local reason="over checkpoint (${GOAL_TASK_COUNT}>${checkpoint})"
-    [[ "$GOAL_HAS_T2" == "1" ]] && reason="carries a Tier-2 task"
+    # DIVE-985 gap B: a T2-carrying plan gates as a HARD tier-2 gate (never
+    # 48h-auto-applied, never quietly agent-cleared into a materialize). A
+    # count-only checkpoint stays the default agent-clearable tier-1 decision.
+    local -a tier_arg=()
+    if [[ "$GOAL_HAS_T2" == "1" ]]; then reason="carries a Tier-2 task"; tier_arg=(--tier=2); fi
     local gate_json
-    gate_json=$(JSON_MODE=1 cmd_task_need "$anchor_id" --type=decision --options="approve|revise" --recommend="approve" ${from:+--from="$from"} \
+    gate_json=$(JSON_MODE=1 cmd_task_need "$anchor_id" --type=decision --options="approve|revise" --recommend="approve" "${tier_arg[@]}" ${from:+--from="$from"} \
                   --ask="Approve this ${GOAL_TASK_COUNT}-task plan for \"${outcome}\"? (${reason}) Full plan in the task body.") \
       || fail "$E_GENERIC" "goal: could not file the plan gate"
     if (( JSON_MODE )); then
@@ -469,7 +549,7 @@ cmd_goal_add() {
          --arg k "$pkey" --arg pf "$pprefix" --arg ai "$anchor_ident" --arg n "$GOAL_TASK_COUNT" --arg cp "$GOAL_CRIT_PATH" --arg t2 "$GOAL_HAS_T2" --arg r "$reason"
     else
       echo "Plan checkpoint: $reason. Filed ONE decision gate on $anchor_ident — nothing materialized."
-      echo "Approve, then: 5dive goal add \"$outcome\" --project=$pkey --plan='<plan>' --yes"
+      echo "After a human approves the gate, materialize with: 5dive goal add --from-gate=$anchor_ident"
     fi
     return 0
   fi

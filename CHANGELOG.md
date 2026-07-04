@@ -11,6 +11,18 @@ release.
 
 ### Added
 
+- DIVE-985: `5dive goal add --from-gate=<id>` completes the approve->materialize
+  loop for a gated plan. `--yes` waives ONLY the count checkpoint, so a plan
+  carrying a Tier-2 task could be proposed + gated but never built. `--from-gate`
+  recovers the plan from the anchor task's body, requires that a HUMAN answered
+  the gate `approve` (DIVE-916 human-origin rule: `need_answered_by` must be
+  `human:*`, never an agent/TTL clear), re-validates the plan from scratch
+  (caps/tier/DAG), then materializes it. It is the only path that materializes a
+  Tier-2 plan, is idempotent (refuses to re-build an already-materialized goal),
+  and rejects a non-goal or unanswered/non-approve gate. A Tier-2-carrying plan
+  now also files its checkpoint gate at HARD tier 2 (was a plain tier-1 decision),
+  so it can no longer be 48h-auto-applied or agent-cleared.
+
 - OSS-14: weekly autonomy report. `5dive digest` (esp. `--7d`) gains a one-glance
   "🦾 Autonomy — ran N days without needing you · shipped X · asked you Y×" line
   plus an `autonomy` JSON block (uptimeDays = days since the last human-blocking
