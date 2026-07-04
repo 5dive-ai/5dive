@@ -11,6 +11,15 @@ release.
 
 ### Added
 
+- 0.7.2 (DIVE-990): memory-as-onboarding. `agent create --inherit-memory=<scope>`
+  seeds a new hire's recall store from shared team knowledge so it boots knowing
+  the company instead of cold-starting. Scope is a comma-list of sources — `wiki`
+  (the shared team wiki), a sibling `<agent-name>` (its SHAREABLE facts only —
+  reference/project, never private user/feedback, same deny-by-default L1 scoping
+  as `agent export`), or `all`/`team` (wiki + every sibling). Copies land in the
+  agent's own store with a regenerated MEMORY.md index, so `5dive memory search`
+  returns team context from the first minute.
+
 - 0.7.1 (DIVE-989): verifier-by-default now walks a chain of DISTINCT graders
   (project lead, coordinator, maker's manager, org root, technical deputy) and
   takes the first that differs from the maker, so the default no longer silently
