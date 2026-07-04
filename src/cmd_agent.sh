@@ -340,7 +340,10 @@ cmd_info() {
 }
 
 create_agent_user() {
-  local name="$1" isolation="${2:-admin}"
+  # DIVE-1002: least-privilege by default — callers pass an explicitly resolved
+  # tier (cmd_create resolves standard-by-default + bootstrap-admin). The
+  # fallback here is 'standard', never 'admin', so no path silently grants root.
+  local name="$1" isolation="${2:-standard}"
   local user="agent-${name}"
   if ! id -u "$user" &>/dev/null; then
     adduser --disabled-password --gecos "" "$user" >/dev/null
@@ -349,12 +352,54 @@ create_agent_user() {
   local groups="systemd-journal"
   [[ "$isolation" != "sandboxed" ]] && groups="claude,systemd-journal"
   usermod -aG "$groups" "$user"
-  # Only admin gets full sudo.
+  # Admin gets sudo SCOPED to fleet-management ops (not blanket root). standard
+  # and sandboxed get no sudoers at all.
   if [[ "$isolation" == "admin" ]]; then
-    cat > "/etc/sudoers.d/${user}" <<SUDOERS
-${user} ALL=(ALL) NOPASSWD: ALL
+    write_admin_sudoers "$user"
+  else
+    rm -f "/etc/sudoers.d/${user}"
+  fi
+}
+
+# DIVE-1002: an 'admin' agent can run the company, not `rm -rf` the box. It gets
+# passwordless sudo scoped to a fleet-management allowlist: the 5dive CLI (which
+# is the sanctioned API for create/rm/provision/restart agents and box ops) plus
+# lifecycle control of the box's own 5dive systemd units and their logs. It does
+# NOT get an arbitrary-root shell (`sudo bash`, `sudo su`, `sudo -u <x> -i`,
+# editors as root, etc.), so a prompt-injected or compromised admin worker is
+# bounded to fleet ops, aligning with the sudo-reduction line (DIVE-756/916).
+# The file is validated with `visudo -c` before install so a malformed entry can
+# never lock the box out; on failure we remove it and fail loudly rather than
+# leaving a broken /etc/sudoers.d.
+write_admin_sudoers() {
+  local user="$1" f="/etc/sudoers.d/${user}" tmp
+  tmp=$(mktemp)
+  # Commands are inlined (not Cmnd_Alias) so each per-agent file is fully
+  # self-contained: sudoers alias names must be uppercase and would collide
+  # across per-agent files. Line continuations keep it readable.
+  cat > "$tmp" <<SUDOERS
+# Managed by 5dive (DIVE-1002). Fleet-management scope for admin agent ${user}.
+# Do not edit by hand; regenerated on agent create/provision.
+${user} ALL=(root) NOPASSWD: \\
+  /usr/local/bin/5dive, /usr/local/bin/5dive *, \\
+  /usr/bin/systemctl start 5dive-agent@*, /usr/bin/systemctl stop 5dive-agent@*, \\
+  /usr/bin/systemctl restart 5dive-agent@*, /usr/bin/systemctl status 5dive-agent@*, \\
+  /usr/bin/systemctl start 5dive-*.service, /usr/bin/systemctl stop 5dive-*.service, \\
+  /usr/bin/systemctl restart 5dive-*.service, /usr/bin/systemctl status 5dive-*.service, \\
+  /bin/systemctl start 5dive-agent@*, /bin/systemctl stop 5dive-agent@*, \\
+  /bin/systemctl restart 5dive-agent@*, /bin/systemctl status 5dive-agent@*, \\
+  /bin/systemctl start 5dive-*.service, /bin/systemctl stop 5dive-*.service, \\
+  /bin/systemctl restart 5dive-*.service, /bin/systemctl status 5dive-*.service, \\
+  /usr/bin/systemd-run *, /usr/bin/journalctl *, /bin/journalctl *
 SUDOERS
-    chmod 440 "/etc/sudoers.d/${user}"
+  chmod 440 "$tmp"
+  if visudo -cf "$tmp" >/dev/null 2>&1; then
+    chown root:root "$tmp"
+    mv "$tmp" "$f"
+    chmod 440 "$f"
+  else
+    rm -f "$tmp"
+    fail "$E_GENERIC" "generated sudoers for ${user} failed visudo validation; aborting (no partial install)"
   fi
 }
 
@@ -374,7 +419,7 @@ delete_agent_user() {
 valid_autonomy() { [[ "$1" =~ ^(standard|yolo|son-of-anton)$ ]]; }
 
 write_agent_env() {
-  local name="$1" type="$2" channels="$3" workdir="${4:-}" profile="${5:-}" isolation="${6:-admin}"
+  local name="$1" type="$2" channels="$3" workdir="${4:-}" profile="${5:-}" isolation="${6:-standard}"
   local env_file="${ENV_DIR}/${name}.env"
   # DIVE-499: per-agent autonomy mode (standard|yolo, alias son-of-anton). The
   # caller sets _AUTONOMY_OVERRIDE to change it (create --yolo / `set autonomy=`);
@@ -615,7 +660,7 @@ cmd_create() {
   local cos_owner_id=""
   local byo_provider="" byo_api_key=""
   local skills_arg="" skills_set=0 no_skills=0 defer_auth=0
-  local isolation="admin" no_team_bot=0
+  local isolation="" isolation_explicit=0 no_team_bot=0
   local autonomy="standard"   # DIVE-499
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -637,7 +682,7 @@ cmd_create() {
       --no-skills)                 no_skills=1 ;;
       --no-team-bot)               no_team_bot=1 ;;
       --defer-auth)                defer_auth=1 ;;
-      --isolation=*)               isolation="${1#--isolation=}" ;;
+      --isolation=*)               isolation="${1#--isolation=}"; isolation_explicit=1 ;;
       -*)                          fail "$E_USAGE" "unknown flag: $1" ;;
       *)                           [[ -z "$name" ]] && name="$1" || fail "$E_USAGE" "extra arg: $1" ;;
     esac
@@ -660,6 +705,20 @@ cmd_create() {
       (( channels_explicit )) || channels="dashboard"
     elif ! channel_in_list dashboard "$channels"; then
       channels="${channels},dashboard"
+    fi
+  fi
+  # DIVE-1002: least-privilege by default. Absent an explicit --isolation, new
+  # agents are 'standard'. Bootstrap exception: the FIRST agent on a fresh box
+  # (empty registry) is auto-granted 'admin' so the box has a fleet-manager out
+  # of the gate. We resolve the tier here and RECORD it explicitly in the
+  # registry below — admin is never re-derived from create-order (which would
+  # break if that agent is later deleted or a worker is created first). An
+  # explicit --isolation always wins in either direction.
+  if (( ! isolation_explicit )); then
+    if [[ "$(registry_read | jq -r '(.agents // {}) | length')" == "0" ]]; then
+      isolation="admin"
+    else
+      isolation="standard"
     fi
   fi
   valid_isolation "$isolation" || fail "$E_VALIDATION" "invalid --isolation (admin|standard|sandboxed)"

@@ -15,7 +15,16 @@ ensure_state() {
     if (( current < REGISTRY_SCHEMA_VERSION )); then
       local tmp
       tmp=$(mktemp "${REGISTRY}.XXXXXX")
-      jq --argjson v "$REGISTRY_SCHEMA_VERSION" '.schemaVersion = $v' "$REGISTRY" > "$tmp"
+      # v1 -> v2 (DIVE-1002): least-privilege isolation default. Pre-v2 agents
+      # had no explicit `isolation` field and were provisioned as full-sudo
+      # admins (create_agent_user's old default). Stamp them explicit-admin so
+      # the new standard-by-default logic never silently downgrades a live
+      # admin: their tier is now recorded, not inferred. Existing sudoers files
+      # are untouched — this only makes the registry honest about what they are.
+      jq --argjson v "$REGISTRY_SCHEMA_VERSION" \
+        '.schemaVersion = $v
+         | (.agents // {}) |= with_entries(.value.isolation //= "admin")' \
+        "$REGISTRY" > "$tmp"
       chown root:claude "$tmp"
       chmod 640 "$tmp"
       mv "$tmp" "$REGISTRY"
