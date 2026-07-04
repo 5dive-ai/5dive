@@ -512,6 +512,24 @@ _pack_disclosure_print() {
   echo "  ─────────────────────────────────────────────────────────────"
 }
 
+# DIVE-1010: guard tar extraction against path-traversal (zip-slip). A local
+# `.tar.gz` import (import <file>) bypasses registry signing entirely, so an
+# untrusted pack could carry members like `../../etc/...` or `/abs/path` that
+# tar would write OUTSIDE the mktemp stage. Validate every member up front and
+# refuse the pack before extracting anything. Shared by cmd_inspect + cmd_import.
+# Returns: 0 ok, 1 unreadable/not-a-gzip, 2 unsafe member (traversal).
+_pack_safe_extract() {
+  local pack="$1" stage="$2" member listing
+  listing=$(tar -tzf "$pack" 2>/dev/null) || return 1
+  while IFS= read -r member; do
+    [[ -z "$member" ]] && continue
+    case "$member" in
+      /*|..|../*|*/../*|*/..) return 2 ;;
+    esac
+  done <<<"$listing"
+  tar -xzf "$pack" -C "$stage" 2>/dev/null || return 1
+}
+
 # DIVE-995: `5dive agent inspect <pack|slug>` — read-only "look before you
 # install". Resolves a local pack OR a bare registry slug, unpacks into an
 # isolated stage, and reports its executable surface (see _pack_disclosure_json)
@@ -531,8 +549,9 @@ cmd_inspect() {
     fi
   fi
   local stage; stage=$(mktemp -d)
-  tar -xzf "$pack" -C "$stage" 2>/dev/null \
-    || { rm -rf "$stage" "$resolved_tmp"; fail "$E_GENERIC" "could not read pack (expected a .tar.gz from 'agent export')"; }
+  _pack_safe_extract "$pack" "$stage" || { local rc=$?; rm -rf "$stage" "$resolved_tmp"
+    (( rc == 2 )) && fail "$E_VALIDATION" "pack rejected: contains path-traversal members ('..' or absolute paths) — refusing to extract"
+    fail "$E_GENERIC" "could not read pack (expected a .tar.gz from 'agent export')"; }
   [[ -n "$resolved_tmp" ]] && rm -f "$resolved_tmp"
   [[ -f "$stage/manifest.json" ]] \
     || { rm -rf "$stage"; fail "$E_VALIDATION" "pack has no manifest.json — not a 5dive agent pack"; }
@@ -905,8 +924,9 @@ cmd_import() {
 
   # Unpack into an isolated stage and validate the manifest before touching anything.
   local stage; stage=$(mktemp -d)
-  tar -xzf "$pack" -C "$stage" 2>/dev/null \
-    || { rm -rf "$stage" "$resolved_tmp" "$persona_tmp"; fail "$E_GENERIC" "could not read pack (expected a .tar.gz from 'agent export')"; }
+  _pack_safe_extract "$pack" "$stage" || { local rc=$?; rm -rf "$stage" "$resolved_tmp" "$persona_tmp"
+    (( rc == 2 )) && fail "$E_VALIDATION" "pack rejected: contains path-traversal members ('..' or absolute paths) — refusing to extract"
+    fail "$E_GENERIC" "could not read pack (expected a .tar.gz from 'agent export')"; }
   [[ -n "$resolved_tmp" ]] && rm -f "$resolved_tmp"
   [[ -n "$persona_tmp" ]] && rm -f "$persona_tmp"
   [[ -f "$stage/manifest.json" ]] \

@@ -185,6 +185,35 @@ BAD="$TMP/bad"; mkdir -p "$BAD"
 _pack_disclosure_json "$BAD" >/dev/null 2>&1
 [[ $? -ne 0 ]] && ok_t "missing manifest -> non-zero (fail closed)" || bad_t "bad manifest rc"
 
+# ---- 5. DIVE-1010: tar path-traversal (zip-slip) guard ---------------------
+# A local .tar.gz import bypasses registry signing, so an untrusted pack with
+# '..' or absolute members could write OUTSIDE the mktemp stage. _pack_safe_extract
+# must refuse (rc 2) before extracting, extract a safe pack (rc 0), and reject a
+# non-gzip file (rc 1).
+TZ_DIR="$TMP/tz"; mkdir -p "$TZ_DIR/src"; echo hi > "$TZ_DIR/src/evil"
+( cd "$TZ_DIR/src"
+  tar -czf "$TZ_DIR/safe.tgz" evil 2>/dev/null
+  tar -czf "$TZ_DIR/trav.tgz" --transform 's|^evil|../evil|' evil 2>/dev/null
+  tar -Pczf "$TZ_DIR/abs.tgz" --transform 's|^evil|/etc/evil|' evil 2>/dev/null )
+printf 'not a gzip\n' > "$TZ_DIR/plain.txt"
+
+OUT="$TZ_DIR/out"; mkdir -p "$OUT"
+_pack_safe_extract "$TZ_DIR/trav.tgz" "$OUT"; rc=$?
+(( rc == 2 )) && ok_t "traversal '../' member rejected (rc 2)" || bad_t "trav rc" "got $rc"
+[[ ! -e "$TZ_DIR/evil" && ! -e "$OUT/../evil" ]] \
+  && ok_t "traversal pack wrote nothing outside the stage" || bad_t "trav escaped" ""
+
+_pack_safe_extract "$TZ_DIR/abs.tgz" "$OUT"; rc=$?
+(( rc == 2 )) && ok_t "absolute-path member rejected (rc 2)" || bad_t "abs rc" "got $rc"
+
+_pack_safe_extract "$TZ_DIR/plain.txt" "$OUT"; rc=$?
+(( rc == 1 )) && ok_t "non-gzip file rejected (rc 1)" || bad_t "plain rc" "got $rc"
+
+SAFE_OUT="$TZ_DIR/safeout"; mkdir -p "$SAFE_OUT"
+_pack_safe_extract "$TZ_DIR/safe.tgz" "$SAFE_OUT"; rc=$?
+{ (( rc == 0 )) && [[ -f "$SAFE_OUT/evil" ]]; } \
+  && ok_t "safe pack extracts normally (rc 0)" || bad_t "safe rc" "got $rc"
+
 echo
 printf 'DIVE-995 pack disclosure: %d passed, %d failed\n' "$PASS" "$FAIL"
 (( FAIL == 0 )) || exit 1

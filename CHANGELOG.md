@@ -12,6 +12,18 @@ release.
 _Nothing yet. New changes accumulate here until they're cut into a tagged
 release._
 
+## [0.7.11] - 2026-07-04
+
+### Security
+
+- DIVE-1010: **harden pack import/inspect against tar path-traversal (zip-slip).**
+  A local `.tar.gz` import (`agent import <file>`) bypasses registry signing
+  entirely, so a crafted pack with `..` or absolute-path members could have tar
+  write files OUTSIDE the mktemp stage. `cmd_import` and `cmd_inspect` now route
+  extraction through a shared `_pack_safe_extract` guard that lists members first
+  and refuses the pack (with a clear validation error) if any member is absolute
+  or contains a `..` path component, extracting nothing. Follow-up to DIVE-995.
+
 ## [0.7.10] - 2026-07-04
 
 ### Changed
