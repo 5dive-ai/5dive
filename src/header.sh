@@ -26,12 +26,14 @@ esac
 
 # Bumped on every public release. `build.sh` checks this line exists; CI fails
 # the bundle-drift check if it's missing or empty.
-readonly FIVE_VERSION="0.6.11"
+readonly FIVE_VERSION="0.6.12"
 
 # GitHub org our repos live under. The org is being renamed
 # 5dive-com -> 5dive-ai (2026-06); fetches must work on either side of the
 # rename, so probe the new org once per process and fall back to the old
 # name. GH_ORG env overrides the probe (CI, forks, air-gapped mirrors).
+# NOTE: install.sh carries a standalone copy of this probe (it runs before
+# the bundle exists) — change the two together.
 gh_org() {
   if [[ -z "${_GH_ORG_RESOLVED:-}" ]]; then
     if [[ -n "${GH_ORG:-}" ]]; then

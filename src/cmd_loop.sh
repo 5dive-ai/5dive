@@ -3,9 +3,9 @@
 #
 # Verbs: spawn · verify · panel · map · until-dry · collect, all honoring
 # --ceiling (per-loop token budget) and feeding the `task loops` control window
-# (loop_runs board + --kill) and `usage loops` (token roll-up). Design:
-# ../loop-cli-impl-design.md ; contract: ../5dive-skills/loops/SKILL.md +
-# ../loop-studio-skill-spec.md. Unit harnesses: tests/loop_*_unit.sh.
+# (loop_runs board + --kill) and `usage loops` (token roll-up). The loops
+# SKILL.md contract lives in the 5dive-ai/skills repo (loops/SKILL.md).
+# Unit harnesses: tests/loop_*_unit.sh.
 #
 # Verbs wrap the EXISTING fleet primitives (no new in-process engine):
 #   maker->verifier  = task add --verifier / task verify / task reject (DIVE-474)
@@ -39,7 +39,7 @@ cmd_loop() {
 # Honest WIP guard: unimplemented verbs fail loudly rather than no-op silently.
 _loop_todo() {
   local verb="$1"
-  fail "$E_USAGE" "5dive loop $verb — not yet implemented (LOOP-7 WIP). See loop-cli-impl-design.md §3."
+  fail "$E_USAGE" "5dive loop $verb — not yet implemented (LOOP-7 WIP)."
 }
 
 # loop_id: a loop-run handle, distinct from a task ident. (Date.now is fine in

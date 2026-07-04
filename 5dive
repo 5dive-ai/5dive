@@ -26,12 +26,14 @@ esac
 
 # Bumped on every public release. `build.sh` checks this line exists; CI fails
 # the bundle-drift check if it's missing or empty.
-readonly FIVE_VERSION="0.6.11"
+readonly FIVE_VERSION="0.6.12"
 
 # GitHub org our repos live under. The org is being renamed
 # 5dive-com -> 5dive-ai (2026-06); fetches must work on either side of the
 # rename, so probe the new org once per process and fall back to the old
 # name. GH_ORG env overrides the probe (CI, forks, air-gapped mirrors).
+# NOTE: install.sh carries a standalone copy of this probe (it runs before
+# the bundle exists) — change the two together.
 gh_org() {
   if [[ -z "${_GH_ORG_RESOLVED:-}" ]]; then
     if [[ -n "${GH_ORG:-}" ]]; then
@@ -15083,9 +15085,9 @@ cmd_project_show() {
 #
 # Verbs: spawn · verify · panel · map · until-dry · collect, all honoring
 # --ceiling (per-loop token budget) and feeding the `task loops` control window
-# (loop_runs board + --kill) and `usage loops` (token roll-up). Design:
-# ../loop-cli-impl-design.md ; contract: ../5dive-skills/loops/SKILL.md +
-# ../loop-studio-skill-spec.md. Unit harnesses: tests/loop_*_unit.sh.
+# (loop_runs board + --kill) and `usage loops` (token roll-up). The loops
+# SKILL.md contract lives in the 5dive-ai/skills repo (loops/SKILL.md).
+# Unit harnesses: tests/loop_*_unit.sh.
 #
 # Verbs wrap the EXISTING fleet primitives (no new in-process engine):
 #   maker->verifier  = task add --verifier / task verify / task reject (DIVE-474)
@@ -15119,7 +15121,7 @@ cmd_loop() {
 # Honest WIP guard: unimplemented verbs fail loudly rather than no-op silently.
 _loop_todo() {
   local verb="$1"
-  fail "$E_USAGE" "5dive loop $verb — not yet implemented (LOOP-7 WIP). See loop-cli-impl-design.md §3."
+  fail "$E_USAGE" "5dive loop $verb — not yet implemented (LOOP-7 WIP)."
 }
 
 # loop_id: a loop-run handle, distinct from a task ident. (Date.now is fine in

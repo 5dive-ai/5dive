@@ -13,7 +13,8 @@ isolation, better visibility into running agents, smoother install/upgrade)
 are in scope. Features that drift into adjacent territory — full IdP,
 package registries, monitoring stacks, GUI installers — usually aren't,
 and we'll point at upstream tools instead. If you're not sure, ask in an
-issue before building.
+issue before building. [ROADMAP.md](ROADMAP.md) shows where the project is
+headed — items there are safe bets for contributions.
 
 ## Dev setup
 
@@ -21,9 +22,9 @@ Requirements:
 
 - Linux host (Ubuntu/Debian-flavoured tested; other distros likely work
   but the installer assumes apt).
-- `bash` 4.x+, `bun` (for the UI), `git`.
-- Optional: a throwaway VM if you're touching the install path — see
-  Testing below.
+- `bash` 4.x+, `git`, `jq`, `sqlite3` (the unit tests need the last two).
+- Optional: `bun` (only if you're touching channel/plugin wiring), and a
+  throwaway VM if you're touching the install path — see Testing below.
 
 Clone and build the CLI bundle:
 
@@ -43,13 +44,21 @@ src/              # CLI source — split for readability
   cmd_*.sh        # one file per top-level subcommand
   main.sh         # usage(), main(), EXIT trap (must be last)
 5dive             # built bundle — committed, kept in sync with src/ by CI
+tests/            # unit harnesses — run by the unit-tests CI job (see Testing)
 install.sh        # one-liner installer fetched by curl
 systemd/          # unit files installed for agents
 hooks/            # shell hooks the CLI drops into the user's $HOME
 docker/           # demo container for tire-kickers
 skills/           # agent skills installed alongside the CLI
+docs/             # design notes and the quickstart assets
 .github/workflows # CI
 ```
+
+A few files sit loose at the repo root (`5dive-agent-start`, the
+`5dive-refresh-*.sh` helpers, `*-CLAUDE.md` templates, `cos-*.ts`) because
+`install.sh` and the CLI fetch them by raw URL at install/update time —
+they're install-time assets, not leftovers. Don't move them without
+updating every fetch path.
 
 See the README's **Contributing** section for the rationale behind the
 single-file bundle and `./build.sh`.
@@ -74,7 +83,16 @@ Lightweight checks (always run before opening a PR):
 ```bash
 ./build.sh        # rebuilds the bundle
 bash -n 5dive     # bundle syntax check
+for t in tests/*.sh; do bash "$t" || echo "FAILED: $t"; done   # unit harnesses
 ```
+
+The `tests/` harnesses need no root and no network: each one sources
+`src/` directly into a throwaway state dir, so the live agent registry and
+task DB are never touched. CI (`unit-tests`) runs all of them on every PR —
+if you add or change behavior in a covered area (task gates, loops,
+secret drop, supervisor), extend the matching harness in the same PR. New
+harnesses that follow the same pattern are very welcome; the biggest
+uncovered surfaces are the task core verbs and the agent lifecycle.
 
 Heavyweight smoke test: if you touched `install.sh`, `src/cmd_agent.sh`,
 `src/lib/agent_setup.sh`, or anything else on the agent-create path, a
