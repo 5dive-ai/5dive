@@ -11,6 +11,17 @@ release.
 
 ### Added
 
+- 0.7.3 (DIVE-991): memory hygiene. New `5dive memory doctor` and a `memory`
+  category in `5dive doctor` run a hygiene pass over per-agent memory stores +
+  the shared wiki: index drift (MEMORY.md/index.md vs files on disk — missing
+  targets are errors, unindexed files warnings), dangling `[[wiki-links]]`,
+  stale source refs (a cited `path/file.ts` / `file:line` no longer in the
+  codebase — only checked when a code-root is available, so no false alarms on
+  customer boxes), and near-duplicate memories (token overlap). `5dive doctor`
+  rolls findings up to one row per store; `5dive memory doctor --json` gives the
+  itemized list. Pure scanner shared by both, unit-tested in
+  tests/memory_doctor_unit.sh.
+
 - 0.7.2 (DIVE-990): memory-as-onboarding. `agent create --inherit-memory=<scope>`
   seeds a new hire's recall store from shared team knowledge so it boots knowing
   the company instead of cold-starting. Scope is a comma-list of sources — `wiki`

@@ -69,11 +69,11 @@ cmd_doctor() {
     shift
   done
   case "$filter" in
-    ""|deps|types|auth|creds|registry|shelld|channels) ;;
-    *) fail "$E_USAGE" "unknown --category (deps|types|auth|creds|registry|shelld|channels)" ;;
+    ""|deps|types|auth|creds|registry|shelld|channels|memory) ;;
+    *) fail "$E_USAGE" "unknown --category (deps|types|auth|creds|registry|shelld|channels|memory)" ;;
   esac
 
-  local run_deps=0 run_types=0 run_auth=0 run_creds=0 run_registry=0 run_shelld=0 run_channels=0
+  local run_deps=0 run_types=0 run_auth=0 run_creds=0 run_registry=0 run_shelld=0 run_channels=0 run_memory=0
   [[ -z "$filter" || "$filter" == "deps"     ]] && run_deps=1
   [[ -z "$filter" || "$filter" == "types"    ]] && run_types=1
   [[ -z "$filter" || "$filter" == "auth"     ]] && run_auth=1
@@ -81,6 +81,7 @@ cmd_doctor() {
   [[ -z "$filter" || "$filter" == "registry" ]] && run_registry=1
   [[ -z "$filter" || "$filter" == "shelld"   ]] && run_shelld=1
   [[ -z "$filter" || "$filter" == "channels" ]] && run_channels=1
+  [[ -z "$filter" || "$filter" == "memory"   ]] && run_memory=1
 
   # --- deps ---
   if (( run_deps )); then
@@ -465,6 +466,81 @@ cmd_doctor() {
         doctor_add shelld health ok "http://127.0.0.1:3101/shell/health -> 200"
       else
         doctor_add shelld health error "shelld health endpoint returned $health_code (expected 200)" false false
+      fi
+    fi
+  fi
+
+  # --- memory hygiene (DIVE-991) ---
+  # Scans every agent's per-user memory store (0600, readable here since doctor
+  # is root) plus the shared wiki for index drift, dangling [[links]], stale
+  # source refs, and near-duplicates. Findings roll up as one doctor check per
+  # store (kept coarse so a rotting store doesn't flood the dashboard with rows);
+  # `5dive memory doctor --json` gives the itemized list. Non-fatal: a scan
+  # failure (e.g. no python) degrades to a single warn, never aborts doctor.
+  if (( run_memory )); then
+    local mem_roots=() code_root=""
+    for d in /home/claude/projects/5dive /home/claude/projects; do
+      [[ -d "$d" ]] && { code_root="$d"; break; }
+    done
+    # Wiki (shared) + every agent home's memory stores.
+    local wd
+    for wd in /home/claude/projects/5dive/community/wiki; do
+      [[ -d "$wd" ]] && mem_roots+=("$wd")
+    done
+    local home
+    for home in /home/claude /home/agent-*; do
+      [[ -d "$home/.claude/projects" ]] || continue
+      local md
+      for md in "$home"/.claude/projects/*/memory; do
+        [[ -d "$md" ]] && mem_roots+=("$md")
+      done
+    done
+    if (( ${#mem_roots[@]} == 0 )); then
+      doctor_add memory stores warn "no memory stores found under /home/*/.claude/projects/*/memory"
+    elif ! command -v python3 >/dev/null 2>&1; then
+      doctor_add memory scan warn "python3 unavailable — memory hygiene scan skipped"
+    else
+      local mem_json=""
+      mem_json=$(_memory_scan_json "$code_root" "${mem_roots[@]}" 2>/dev/null) || mem_json=""
+      if [[ -z "$mem_json" ]] || ! jq -e '.stores' >/dev/null 2>&1 <<<"$mem_json"; then
+        doctor_add memory scan warn "hygiene scan produced no parseable output"
+      else
+        # One row per store: ok when clean, else severity = worst finding with a
+        # by-kind tally. The scanner's own roster is authoritative for store
+        # names (single-sourced with the finding labels), so stores with zero
+        # findings still report ok and the dashboard shows full coverage.
+        local store_lines
+        store_lines=$(jq -r '
+          (.stores | unique) as $all |
+          (.findings | group_by(.store) | map({key:.[0].store, value:.}) | from_entries) as $bys |
+          $all[] |
+          . as $s | ($bys[$s] // []) as $fs |
+          {
+            store: $s,
+            errors: ([$fs[]|select(.severity=="error")]|length),
+            warns:  ([$fs[]|select(.severity=="warn")]|length),
+            tally:  ($fs | group_by(.kind) | map("\(length) \(.[0].kind)") | join(", "))
+          } | @base64
+        ' <<<"$mem_json")
+        local line
+        while IFS= read -r line; do
+          [[ -n "$line" ]] || continue
+          local rec store errors warns tally sev msg
+          rec=$(base64 -d <<<"$line")
+          store=$(jq -r '.store' <<<"$rec")
+          errors=$(jq -r '.errors' <<<"$rec")
+          warns=$(jq -r '.warns' <<<"$rec")
+          tally=$(jq -r '.tally' <<<"$rec")
+          if (( errors > 0 )); then sev=error
+          elif (( warns > 0 )); then sev=warn
+          else sev=ok; fi
+          if [[ "$sev" == ok ]]; then
+            msg="clean"
+          else
+            msg="$tally (see: 5dive memory doctor --json)"
+          fi
+          doctor_add memory "$store" "$sev" "$msg"
+        done <<<"$store_lines"
       fi
     fi
   fi

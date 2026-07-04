@@ -43,6 +43,12 @@ _memory_usage() {
       store's index line, and refuses token/key-shaped content (tripwire;
       --force does NOT bypass it). Existing file needs --force to overwrite.
 
+  5dive memory doctor [--roots=a,b] [--agent=<name>] [--code-root=<dir>] [--json]
+      Hygiene pass over the memory store(s): index drift (MEMORY.md vs files on
+      disk), dangling [[wiki-links]], stale source refs (file:line no longer in
+      the codebase), and near-duplicate memories. Also runs inside the
+      `memory` category of `5dive doctor` for the whole box.
+
 Searches the agent's own ~/.claude/projects/*/memory stores (+ the shared wiki
 when present) unless --roots/--store/--agent narrow it.
 EOF
@@ -311,12 +317,282 @@ _memory_add() {
   return 0
 }
 
+# ---- memory hygiene (DIVE-991) ---------------------------------------------
+#
+# A runnable hygiene pass over one or more memory stores (per-agent stores +
+# the shared wiki). Surfaces four classes of rot the karpathy-method stores
+# accumulate as they grow:
+#   - index-drift : MEMORY.md/index.md points at a file that no longer exists,
+#                   OR a memory file on disk that the index never lists (a search
+#                   miss — the index is what gets read into context each session).
+#   - dangling-link : a [[wiki-link]] whose target slug matches no file in the
+#                     store. Forward-references are legal (the memory rules bless
+#                     them), so these are warnings, not errors — a nudge to write
+#                     the stub or fix a typo'd slug.
+#   - stale-ref : a memory citing a source path / file:line that no longer exists
+#                 in the codebase (agent-main's bloated MEMORY.md is the live
+#                 motivating case). Only checked when a --code-root to verify
+#                 against is available, so we never cry wolf on customer boxes.
+#   - near-dup : two memories in the same store with high token overlap — a
+#                merge candidate (the rules say update-in-place, don't duplicate).
+#
+# The scan itself is a pure function of (code-root, store dirs) and lives in
+# _memory_scan_json so both `5dive memory doctor` and `5dive doctor` (memory
+# category) share one implementation. Python (a doctor-checked dep) does the
+# parsing — bash regex over frontmatter + link graphs is a foot-gun.
+
+# _memory_scan_json <code-root|""> <store-dir> [store-dir...]
+# Emits a JSON array of {store,file,kind,severity,message} findings on stdout.
+# code-root "" (or a missing dir) skips stale-ref verification.
+_memory_scan_json() {
+  local code_root="$1"; shift
+  python3 - "$code_root" "$@" <<'PYEOF'
+import os, re, sys, json
+
+code_root = sys.argv[1]
+stores = sys.argv[2:]
+
+INDEX_NAMES = ("MEMORY.md", "index.md")
+LINK_RE  = re.compile(r'\[\[([^\]|#]+)')                 # [[slug]] / [[slug|Label]] / [[slug#h]]
+MDLINK_RE = re.compile(r'\]\(([^)\s]+\.md)\)')           # ](file.md)
+# path-ish token: optional dirs + name + code extension, optional :line
+# Extensions ordered longest-first and closed with a boundary so 'page.tsx'
+# isn't truncated to 'page.ts' (nor 'plugin.json' to 'plugin.js') by the
+# alternation matching a shorter prefix.
+PATH_RE = re.compile(
+    r'(?<![\w./@-])((?:[\w.-]+/)*[\w.-]+\.'
+    r'(?:tsx|ts|jsx|mjs|cjs|json|js|yaml|yml|sh|py|go|rs|sql|toml|conf|env))'
+    r'(?![A-Za-z0-9])(?::(\d+))?')
+WORD_RE = re.compile(r'[a-z0-9]+')
+PRUNE = {"node_modules", ".git", "dist", "build", ".next", "vendor",
+         "coverage", ".venv", "__pycache__", ".turbo"}
+
+# Prebuild a basename set from the code tree so a source ref counts as "exists"
+# if the file lives anywhere in the repo (memories cite repo-relative paths from
+# assorted cwds). Empty set => skip stale-ref checks entirely.
+basenames = set()
+if code_root and os.path.isdir(code_root):
+    seen = 0
+    for dp, dns, fns in os.walk(code_root):
+        dns[:] = [d for d in dns if d not in PRUNE]
+        for fn in fns:
+            basenames.add(fn)
+            seen += 1
+        if seen > 400000:
+            break
+
+def split_front(text):
+    """Return (name, mtype, body). name/mtype default to '' if absent."""
+    name, mtype = "", ""
+    body = text
+    if text.startswith("---"):
+        end = text.find("\n---", 3)
+        if end != -1:
+            fm = text[3:end]
+            body = text[end + 4:]
+            in_meta = False
+            for ln in fm.splitlines():
+                s = ln.strip()
+                if s.startswith("name:"):
+                    name = s[5:].strip().strip('"\'')
+                elif s.startswith("metadata:"):
+                    in_meta = True
+                elif in_meta and s.startswith("type:"):
+                    mtype = s[5:].strip().strip('"\'')
+    return name, mtype, body
+
+def slugs_of(fname, name):
+    out = {os.path.splitext(fname)[0].lower()}
+    if name:
+        out.add(name.lower())
+    return out
+
+def ref_exists(store_dir, token):
+    if os.path.isabs(token):
+        return os.path.exists(token)
+    if code_root and os.path.exists(os.path.join(code_root, token)):
+        return True
+    return os.path.basename(token) in basenames
+
+findings = []
+def add(store, f, kind, sev, msg):
+    findings.append({"store": store, "file": f, "kind": kind,
+                     "severity": sev, "message": msg})
+
+def store_name(store):
+    """Stable, agent-unique label: '<home-user>/<project-slug>' for per-user
+    stores (…/home/<user>/.claude/projects/<slug>/memory), else the parent dir
+    name. Avoids collisions when two agents share a project slug."""
+    parts = store.rstrip("/").split("/")
+    if ".claude" in parts:
+        ci = parts.index(".claude")
+        user = parts[ci - 1] if ci >= 1 else "?"
+        slug = parts[-2] if len(parts) >= 2 else parts[-1]
+        return f"{user}/{slug}"
+    return parts[-2] if len(parts) >= 2 else parts[-1]
+
+roster = []
+for store in stores:
+    if not os.path.isdir(store):
+        continue
+    sname = store_name(store)
+    roster.append(sname)
+    try:
+        entries = sorted(os.listdir(store))
+    except OSError:
+        continue
+    mem_files = [f for f in entries
+                 if f.endswith(".md") and f not in INDEX_NAMES]
+    index_file = next((n for n in INDEX_NAMES
+                       if os.path.isfile(os.path.join(store, n))), None)
+
+    all_slugs = set()
+    docs = {}   # fname -> (name, mtype, body, wordset)
+    for f in mem_files:
+        try:
+            with open(os.path.join(store, f), encoding="utf-8", errors="replace") as fh:
+                text = fh.read()
+        except OSError:
+            continue
+        name, mtype, body = split_front(text)
+        all_slugs |= slugs_of(f, name)
+        docs[f] = (name, mtype, body, set(WORD_RE.findall(body.lower())))
+
+    # --- index drift ---
+    if index_file:
+        try:
+            with open(os.path.join(store, index_file), encoding="utf-8", errors="replace") as fh:
+                idx = fh.read()
+        except OSError:
+            idx = ""
+        indexed = {os.path.basename(t) for t in MDLINK_RE.findall(idx)}
+        for t in sorted(indexed):
+            if t not in INDEX_NAMES and not os.path.isfile(os.path.join(store, t)):
+                add(sname, t, "index-drift", "error",
+                    f"{index_file} links '{t}' but the file is missing")
+        for f in mem_files:
+            if f not in indexed:
+                add(sname, f, "index-drift", "warn",
+                    f"on disk but not listed in {index_file} (won't load into context)")
+
+    # --- dangling links + stale refs ---
+    for f, (name, mtype, body, words) in docs.items():
+        for m in LINK_RE.findall(body):
+            target = m.strip().lower()
+            if target and target not in all_slugs:
+                add(sname, f, "dangling-link", "warn",
+                    f"[[{m.strip()}]] resolves to no file in this store")
+        if basenames:
+            checked = set()
+            for tok, _line in PATH_RE.findall(body):
+                if tok in checked or tok.startswith(("http", "@")):
+                    continue
+                checked.add(tok)
+                if ("/" in tok or f"{tok}:" in body) and not ref_exists(store, tok):
+                    add(sname, f, "stale-ref", "warn",
+                        f"cites '{tok}' which no longer exists in the codebase")
+
+    # --- near-duplicate (Jaccard over body word-sets, same store) ---
+    names = list(docs)
+    for i in range(len(names)):
+        wi = docs[names[i]][3]
+        if len(wi) < 12:
+            continue
+        for j in range(i + 1, len(names)):
+            wj = docs[names[j]][3]
+            if len(wj) < 12:
+                continue
+            inter = len(wi & wj)
+            if not inter:
+                continue
+            jac = inter / len(wi | wj)
+            if jac >= 0.6:
+                add(sname, names[i], "near-dup", "warn",
+                    f"{int(jac*100)}% token overlap with '{names[j]}' — merge candidate")
+
+json.dump({"stores": roster, "findings": findings}, sys.stdout)
+PYEOF
+}
+
+# _memory_doctor — `5dive memory doctor`: run the hygiene scan over the caller's
+# own stores + wiki (or --roots / --agent), printing a report or --json.
+_memory_doctor() {
+  local roots="" agent="" code_root="${MEMORY_DOCTOR_CODE_ROOT:-}"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --roots=*)     roots="${1#*=}" ;;
+      --agent=*)     agent="${1#*=}" ;;
+      --code-root=*) code_root="${1#*=}" ;;
+      -h|--help)     _memory_usage; return 0 ;;
+      *)             fail "$E_USAGE" "memory doctor: unknown arg: $1" ;;
+    esac
+    shift
+  done
+  if [ -z "$roots" ]; then
+    local own wiki
+    own=$(_memory_own_roots "$agent")
+    wiki=$(_memory_wiki_root)
+    if [ -n "$own" ] && [ -n "$wiki" ]; then roots="$own,$wiki"
+    else roots="${own}${wiki}"; fi
+  fi
+  [ -n "$roots" ] || fail "$E_NOT_FOUND" "no memory stores found (looked in ~/.claude/projects/*/memory); pass --roots="
+  # Default code-root for stale-ref checks: the 5dive monorepo if it's here.
+  if [ -z "$code_root" ]; then
+    for d in /home/claude/projects/5dive "$HOME/projects/5dive"; do
+      [ -d "$d" ] && { code_root="$d"; break; }
+    done
+  fi
+
+  local dirs=() IFS=,
+  for d in $roots; do [ -n "$d" ] && dirs+=("$d"); done
+  unset IFS
+  local scan
+  scan=$(_memory_scan_json "$code_root" "${dirs[@]}")
+  [ -n "$scan" ] || scan='{"stores":[],"findings":[]}'
+  local findings
+  findings=$(jq -c '.findings' <<<"$scan")
+
+  if (( JSON_MODE )); then
+    jq -cn --argjson f "$findings" --argjson stores "$(jq -c '.stores' <<<"$scan")" '{ok:true, data:{
+      stores_scanned: ($stores | length),
+      findings: $f,
+      summary: ($f | {
+        total: length,
+        errors: [.[]|select(.severity=="error")]|length,
+        warnings: [.[]|select(.severity=="warn")]|length,
+        by_kind: (group_by(.kind) | map({(.[0].kind): length}) | add // {})
+      })
+    }}'
+    return 0
+  fi
+
+  local n
+  n=$(jq 'length' <<<"$findings")
+  if [ "$n" -eq 0 ]; then
+    echo "✓ memory hygiene: no issues across ${#dirs[@]} store(s)"
+    return 0
+  fi
+  jq -r '
+    group_by(.store) | .[] as $g |
+    "── \($g[0].store) ──",
+    ($g | sort_by(.kind)[] | "  [\(.severity)] \(.kind)  \(.file): \(.message)"),
+    ""
+  ' <<<"$findings"
+  jq -r '{
+    total: length,
+    errors: [.[]|select(.severity=="error")]|length,
+    warnings: [.[]|select(.severity=="warn")]|length
+  } | "summary: \(.total) findings, \(.errors) error, \(.warnings) warn"' <<<"$findings"
+  return 0
+}
+
 # cmd_memory — dispatch for the `memory` subcommand tree.
 cmd_memory() {
   local sub="${1:-}"; shift 2>/dev/null || true
   case "$sub" in
     search)      _memory_search "$@" ;;
     add|compile) _memory_add "$@" ;;
+    doctor|hygiene) _memory_doctor "$@" ;;
     ""|-h|--help) _memory_usage ;;
     *)           _memory_usage; fail "$E_USAGE" "memory: unknown subcommand: $sub" ;;
   esac
