@@ -49,6 +49,13 @@ _HB_STARVE_AFTER=3
 # is genuinely stuck: after this many reaps it's blocked + escalated (pings the
 # owner & paired human) so it surfaces instead of churning. Still never cancelled.
 _HB_REAP_ESCALATE_AFTER=2
+# OSS-12: gate SLA escalation. A T2 gate unanswered for this many days doesn't
+# just keep re-pinging the same recipient — the weekly stale-gate batch ALSO
+# CCs the filing agent's org-chart parent (agents_org.reports_to), so an
+# unanswered gate walks the chain instead of stalling on one lane. NEVER
+# auto-answers a T2 gate: escalation changes WHO is pinged, not what clears.
+_HB_GATE_ESCALATE_DAYS="${HEARTBEAT_GATE_ESCALATE_DAYS:-5}"
+[[ "$_HB_GATE_ESCALATE_DAYS" =~ ^[0-9]+$ ]] || _HB_GATE_ESCALATE_DAYS=5
 # Orphan reclaim. An in_progress task whose claiming claude session is GONE — the
 # agent's claude process started AFTER the task did (rotation, service restart,
 # crash, a context reset that exited the process) — is reclaimed to 'todo'
@@ -655,6 +662,24 @@ _hb_gate_ttl_sweep() {
     [[ -n "$lines_manual" ]] && text+=$'\n\n'"🛠 Manual steps — one ~15-min batch clears these:"$'\n'"$lines_manual"
     text+=$'\n\n'"Answer from the original alert's buttons, the dashboard, or tap a /task link. Re-pings weekly until answered."
     _task_send_owner "$text" "" || true
+    # OSS-12: SLA escalation — walk the org chart. If any of this agent's stale
+    # gates has aged past _HB_GATE_ESCALATE_DAYS, also loop in its org-chart
+    # parent (agents_org.reports_to) so the gate escalates up the chain instead
+    # of stalling on one recipient. Rides this same weekly gate_pinged_at
+    # throttle (computed before the UPDATE below). One level (immediate manager);
+    # never auto-answers — a human still clears the gate.
+    local _mgr _esc_lines
+    _mgr=$(db "SELECT COALESCE(reports_to,'') FROM agents_org WHERE name=$(sqlq "$aname");")
+    if [[ -n "$_mgr" && "$_mgr" != "$aname" ]] && _task_agent_channel "$_mgr"; then
+      _esc_lines=$(db "SELECT '• ['||ident||'] '||need_type||', '||CAST(julianday('now')-julianday(COALESCE(need_asked_at,updated_at)) AS INT)||'d — '||substr(replace(COALESCE(ask,''), x'0a', ' '),1,90)
+                       FROM tasks WHERE ${_t2_where} AND assignee=$(sqlq "$aname")
+                         AND COALESCE(need_asked_at, updated_at) <= datetime('now','-${_HB_GATE_ESCALATE_DAYS} days')
+                       ORDER BY COALESCE(need_asked_at,updated_at);")
+      if [[ -n "$_esc_lines" ]]; then
+        ( cmd_send "$_mgr" --message="⏫ Gate escalation — your report ${aname} has gate(s) unanswered ${_HB_GATE_ESCALATE_DAYS}d+, still stalling their lane:"$'\n'"${_esc_lines}"$'\n\n'"Help chase the answer or re-scope. Not auto-resolved — a human still clears it." ) >/dev/null 2>&1 || true
+        _hb_log "[gate-ttl] escalated ${aname}'s stale gate(s) to org-parent ${_mgr}"
+      fi
+    fi
     db "UPDATE tasks SET gate_pinged_at=datetime('now')
         WHERE ${_t2_where} AND assignee=$(sqlq "$aname");"
     _hb_log "[gate-ttl] stale-gate reminder batch sent for $aname"

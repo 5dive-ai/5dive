@@ -11,6 +11,14 @@ release.
 
 ### Added
 
+- OSS-12: gate SLA escalation — an unanswered T2 gate walks the org chart
+  instead of stalling on one recipient. Once a gate ages past
+  `_HB_GATE_ESCALATE_DAYS` (env `HEARTBEAT_GATE_ESCALATE_DAYS`, default 5), the
+  weekly stale-gate batch in `_hb_gate_ttl_sweep` also CCs the filing agent's
+  org-chart parent (`agents_org.reports_to`), so the gate escalates up a level.
+  Reuses `gate_pinged_at` + the heartbeat tick as the driver; NEVER auto-answers
+  a T2 gate (escalation changes who is pinged, not what clears). New
+  `tests/heartbeat_gate_escalate_unit.sh` (5/5).
 - DIVE-979: dependency-aware heartbeat scheduling. The per-agent wake now picks
   the next task through `_hb_pick_task`, which (a) SKIPS any todo whose
   `task_deps` still has an open blocker (a `blocked_by` task not yet
