@@ -1,0 +1,26 @@
+name: unit-tests
+
+# Run every isolated unit harness in tests/. Each harness sources src/ directly
+# into a throwaway STATE_DIR (no root, no network, never the live tasks.db) and
+# exits non-zero on any failed assertion.
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run unit harnesses
+        run: |
+          rc=0
+          for t in tests/*.sh; do
+            echo "=== $t"
+            if ! bash "$t"; then
+              echo "FAILED: $t"
+              rc=1
+            fi
+          done
+          exit $rc
