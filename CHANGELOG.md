@@ -9,6 +9,26 @@ release.
 
 ## [Unreleased]
 
+### Security
+
+- DIVE-1002: least-privilege agent isolation. New agents now default to
+  `standard` isolation (zero sudo) instead of `admin` — a compromised or
+  prompt-injected worker can no longer reach root. Bootstrap convenience: the
+  FIRST agent on a fresh box (empty registry) is auto-granted `admin`, but the
+  resolved tier is recorded EXPLICITLY in the registry (never re-derived from
+  create-order); an explicit `--isolation` always wins. The `admin` tier is now
+  SCOPED to a `visudo`-validated allowlist — the `5dive` CLI plus non-paging
+  `systemctl start|stop|restart` of `5dive-agent@*` / `5dive-*.service` — and no
+  longer grants blanket `ALL=(ALL) NOPASSWD: ALL`. The three indirect root
+  escapes (`systemd-run *`, `journalctl *`, `systemctl status *` pager `!sh`) are
+  excluded; a new `5dive agent restart <name> --defer` runs the deferred
+  systemd-run internally (fixed command) so admins never need a raw grant, and
+  `5dive crew` now refuses EUID 0 (it execs agent-authored venv Python). Registry
+  schema v1->v2 stamps existing field-less agents as explicit `isolation:admin`
+  so no live admin is silently downgraded (their sudoers files are untouched; the
+  scoped allowlist applies to new admins/fresh boxes). New
+  `tests/agent_isolation_unit.sh` (15/15).
+
 ### Added
 
 - OSS-12: gate SLA escalation — an unanswered T2 gate walks the org chart
