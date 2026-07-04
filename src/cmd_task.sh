@@ -279,7 +279,7 @@ cmd_task_ls() {
     # DIVE-583: emit project_key natively so the dashboard keys off a real field
     # (join name/prefix/lead from `project ls`) instead of deriving project from
     # the ident prefix client-side (fragile; couples to naming + the id≠ident bug).
-    rows=$(dbfmt -json "SELECT id, ident, title, status, priority, assignee, created_by, parent_id, created_at, done_at, body, result, need_type, ask, need_options, need_answer, need_answered_at, need_answered_by, tier, kind, schedule, last_fired_at, parked_at, park_reason, wake_at, project_key FROM tasks WHERE ${where} ${order};")
+    rows=$(dbfmt -json "SELECT id, ident, title, status, priority, assignee, created_by, parent_id, created_at, done_at, body, result, need_type, ask, need_options, recommend, precedent_ref, need_answer, need_answered_at, need_answered_by, tier, kind, schedule, last_fired_at, parked_at, park_reason, wake_at, project_key FROM tasks WHERE ${where} ${order};")
     [[ -n "$rows" ]] || rows="[]"
     # Feed rows via stdin, not --argjson: a big board (179+ tasks w/ bodies)
     # blows past MAX_ARG_STRLEN (128K per argv string) -> execve E2BIG
@@ -313,7 +313,9 @@ cmd_task_show() {
     gate=$(db "SELECT 'type: '||need_type||
                       CASE WHEN tier IS NOT NULL THEN '  (tier '||tier||')' ELSE '' END||
                       CASE WHEN need_options IS NOT NULL THEN '  options: '||need_options ELSE '' END||
-                      CASE WHEN recommend IS NOT NULL THEN x'0a'||'recommend: '||recommend ELSE '' END||x'0a'||
+                      CASE WHEN recommend IS NOT NULL THEN x'0a'||'recommend: '||recommend ELSE '' END||
+                      CASE WHEN precedent_ref IS NOT NULL
+                           THEN x'0a'||'precedent: '||COALESCE((SELECT ident FROM tasks p WHERE p.id=tasks.precedent_ref),'#'||precedent_ref) ELSE '' END||x'0a'||
                       'ask:  '||COALESCE(ask,'')||
                       CASE WHEN need_answered_at IS NOT NULL
                            THEN x'0a'||'answer: '||CASE WHEN need_type='secret' THEN '(provided — loaded out-of-band)' ELSE COALESCE(need_answer,'') END||'  ('||need_answered_at||')'
@@ -1089,6 +1091,31 @@ _gate_tier2_floor_hit() {
   [[ "$text" =~ $_GATE_T2_FLOOR_RX ]]
 }
 
+# OSS-11 (DIVE-976) — _gate_ask_shape <ask>: normalize an ask into its "shape
+# key" so two gates that ask structurally the same question but about different
+# targets collapse to one key. Precedent matching uses EXACT shape-key equality
+# (no fuzzy/embedding match) to bound false positives. Volatile tokens become
+# typed placeholders; the ORDER below matters — each rule must run before any
+# later rule that could re-consume its output (dates/hosts before the bare-number
+# rule; quoted names first so their contents aren't mangled). Placeholders carry
+# no digits, hyphenated-digit runs, or dots, so no rule ever re-fires on them.
+_gate_ask_shape() {
+  printf '%s' "$1" \
+    | tr '[:upper:]' '[:lower:]' \
+    | sed -E \
+        -e 's/"[^"]*"/<name>/g' \
+        -e "s/'[^']*'/<name>/g" \
+        -e 's#https?://[^[:space:]]+#<host>#g' \
+        -e 's/[0-9]{4}-[0-9]{2}-[0-9]{2}/<date>/g' \
+        -e 's/\b(today|tomorrow|yesterday)\b/<date>/g' \
+        -e 's/([a-z0-9]([a-z0-9-]*[a-z0-9])?\.)+[a-z]{2,}/<host>/g' \
+        -e 's/\$[0-9][0-9,]*(\.[0-9]+)?[kmb]?/<amount>/g' \
+        -e 's/\b[a-z]+-[0-9]+\b/<ident>/g' \
+        -e 's/[0-9]+(\.[0-9]+)?/<num>/g' \
+        -e 's/[[:space:]]+/ /g' \
+        -e 's/^ +//; s/ +$//'
+}
+
 cmd_task_need() {
   tasks_db_init
   local type="" ask="" options="" recommend="" from="" tier="" secret_key="" connector=""
@@ -1189,6 +1216,50 @@ cmd_task_need() {
   [[ "$tier" == "0" && -z "$recommend" ]] \
     && fail "$E_USAGE" "--tier=0 auto-applies the recommendation, so --recommend is required"
 
+  # OSS-11 (DIVE-976) decision-memory precedent prefill. This runs AFTER the tier
+  # + T2 category floor are settled and the tier-0-requires-recommend check above,
+  # so precedent can NEVER satisfy that requirement or change the resolved tier —
+  # it only sources the VALUE of an advisory recommend. The DIVE-916 invariant
+  # holds by construction: no tier mutation, no touch of the clear path
+  # (cmd_task_answer / TTL / nonce), and a blank rec is filled ONLY when the tier
+  # would have surfaced/applied a rec anyway.
+  local ask_shape precedent_ref="" precedent_cite=""
+  ask_shape=$(_gate_ask_shape "$ask")
+  # Best prior ANSWERED gate: same need_type, EXACT ask_shape, from an equally- or
+  # more-scrutinized tier (COALESCE(tier,2) so legacy NULL counts as T2 — a
+  # rubber-stamped T0 can never prefill a T2 gate), answered within 90 days; most
+  # recent wins. Exclude self (id<>).
+  local _prow
+  _prow=$(db "SELECT id||x'1f'||ident||x'1f'||COALESCE(need_answer,'')||x'1f'||
+                     COALESCE(need_answered_at,'')||x'1f'||COALESCE(need_answered_by,'')
+              FROM tasks
+              WHERE need_answer IS NOT NULL AND id<>${id}
+                AND need_type=$(sqlq "$type")
+                AND ask_shape IS NOT NULL AND ask_shape=$(sqlq "$ask_shape")
+                AND COALESCE(tier,2) >= ${tier}
+                AND need_answered_at >= datetime('now','-90 day')
+              ORDER BY need_answered_at DESC LIMIT 1;")
+  if [[ -n "$_prow" ]]; then
+    local _pid _pident _pans _pat _pby
+    IFS=$'\x1f' read -r _pid _pident _pans _pat _pby <<<"$_prow"
+    precedent_ref="$_pid"
+    local _pwho="${_pby#human:}"; _pwho="${_pwho#auto:}"
+    precedent_cite="Precedent: you answered '${_pans}' on ${_pident} (${_pat%% *}${_pwho:+, $_pwho})"
+    # Prefill ONLY a blank recommend — never override an explicit filer rec. For a
+    # decision the precedent answer must ALSO be one of THIS gate's options (shapes
+    # match but option sets can differ); if it isn't, keep the citation but skip
+    # the prefill so a tapped/displayed rec always maps to a real option.
+    if [[ -z "$recommend" && -n "$_pans" ]]; then
+      local _pok=1
+      if [[ "$type" == "decision" ]]; then
+        _pok=$(printf '%s' "$options" | jq -Rr --arg r "$_pans" '
+          [ split("|")[] | gsub("^\\s+|\\s+$"; "") | select(length > 0) ]
+          | (($r | gsub("^\\s+|\\s+$"; "")) as $rr | any(.[]; . == $rr)) | if . then "1" else "0" end' 2>/dev/null) || _pok=0
+      fi
+      [[ "$_pok" == "1" ]] && recommend="$_pans"
+    fi
+  fi
+
   # assignee=actor: the agent hitting the gate becomes the owner-of-record, so
   # `task answer` knows who to ping to resume. The inbox is defined by the gate
   # (need_type set), not by assignee, so it still surfaces to the human.
@@ -1200,6 +1271,8 @@ cmd_task_need() {
             recommend=$(sqlq_or_null "$recommend"),
             secret_key=$(sqlq_or_null "$secret_key"),
             connector=$(sqlq_or_null "$connector"),
+            ask_shape=$(sqlq_or_null "$ask_shape"),
+            precedent_ref=${precedent_ref:-NULL},
             tier=${tier}, need_asked_at=datetime('now'), gate_pinged_at=NULL,
             need_answer=NULL, need_answered_at=NULL
       WHERE id=${id};"
@@ -1243,11 +1316,12 @@ cmd_task_need() {
         && db "UPDATE tasks SET human_nonce_hash=$(sqlq "$(_human_nonce_sha "$human_nonce")") WHERE id=${id};"
       ;;
   esac
-  task_need_notify "$ident" "$type" "$ask" "$options" "$recommend" "$secret_key" "$connector" "$human_nonce" || true
+  task_need_notify "$ident" "$type" "$ask" "$options" "$recommend" "$secret_key" "$connector" "$human_nonce" "$precedent_cite" || true
   local floor_note=""; (( tier_floored )) && floor_note=" [tier forced to 2 — T2 category floor]"
-  ok "$ident needs a human ($type, tier $tier)${floor_note} — $ask" \
-     '{id:($i|tonumber), ident:$id, status:"blocked", need_type:$ty, tier:($tr|tonumber), tier_floored:($fl=="1"), ask:$ak, need_options:(($op|select(length>0)) // null), recommend:(($rc|select(length>0)) // null), assignee:$ac}' \
-     --arg i "$id" --arg id "$ident" --arg ty "$type" --arg tr "$tier" --arg fl "$tier_floored" --arg ak "$ask" --arg op "$options" --arg rc "$recommend" --arg ac "$actor"
+  local prec_note=""; [[ -n "$precedent_cite" ]] && prec_note=" [${precedent_cite}]"
+  ok "$ident needs a human ($type, tier $tier)${floor_note}${prec_note} — $ask" \
+     '{id:($i|tonumber), ident:$id, status:"blocked", need_type:$ty, tier:($tr|tonumber), tier_floored:($fl=="1"), ask:$ak, need_options:(($op|select(length>0)) // null), recommend:(($rc|select(length>0)) // null), precedent_ref:(($pr|select(length>0))|tonumber? // null), assignee:$ac}' \
+     --arg i "$id" --arg id "$ident" --arg ty "$type" --arg tr "$tier" --arg fl "$tier_floored" --arg ak "$ask" --arg op "$options" --arg rc "$recommend" --arg pr "$precedent_ref" --arg ac "$actor"
 }
 
 # _task_owner_channel — resolve the filing agent's bot token + the per-type
@@ -1417,6 +1491,7 @@ _task_mint_drop_link() {
 task_need_notify() {
   local ident="$1" need_type="$2" ask="$3" options="$4" recommend="${5:-}"
   local secret_key="${6:-}" connector="${7:-}" human_nonce="${8:-}"
+  local precedent_cite="${9:-}"  # OSS-11: prior-answer citation, empty if none
   # DIVE-916: callback_data suffix carrying the raw per-gate nonce for the tap
   # paths (approval/secret/manual). Empty for decision (agent-clearable, no
   # nonce) so its `tna:<id>:<idx>` payload is byte-unchanged. The plugin `tna:`
@@ -1447,6 +1522,9 @@ task_need_notify() {
   # it. Applies to decision + approval gates; NULL/empty recommend = no line.
   local text="🙋 [${ident}] needs you"
   [[ -n "$recommend" ]] && text+=$'\n\n'"✅ Recommended: ${recommend}"
+  # OSS-11 (DIVE-976): cite the precedent that sourced the recommendation so the
+  # human sees WHY this choice is advised and can catch a wrong recall.
+  [[ -n "$precedent_cite" ]] && text+=$'\n'"↩︎ ${precedent_cite}"
   # DIVE-390: append a bare, tappable /task_<id> link inline at the end of the
   # description sentence, before the options (Mark 2026-06-15). Telegram
   # auto-linkifies bare /commands, so tapping it fires the plugin's
@@ -1592,7 +1670,7 @@ cmd_task_inbox() {
   local order="ORDER BY CASE priority WHEN 'urgent' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2 ELSE 3 END, created_at"
   if (( JSON_MODE )); then
     local rows
-    rows=$(dbfmt -json "SELECT id, ident, title, status, priority, assignee, created_by, parent_id, created_at, need_type, ask, need_options, recommend, need_answer, need_answered_at FROM tasks WHERE ${where} ${order};")
+    rows=$(dbfmt -json "SELECT id, ident, title, status, priority, assignee, created_by, parent_id, created_at, need_type, ask, need_options, recommend, precedent_ref, need_answer, need_answered_at FROM tasks WHERE ${where} ${order};")
     [[ -n "$rows" ]] || rows="[]"
     # stdin, not --argjson — same ARG_MAX guard as `task ls`. (DIVE-222)
     printf '%s' "$rows" | jq -c '{ok:true, data:{inbox:.}}'
@@ -1601,7 +1679,7 @@ cmd_task_inbox() {
     if [[ "$cnt" == "0" ]]; then
       echo "inbox empty — nothing waiting on a human."
     else
-      dbfmt -box "SELECT ident, priority, need_type, COALESCE(assignee,'-') AS owner, COALESCE(recommend,'-') AS recommend, ask FROM tasks WHERE ${where} ${order};"
+      dbfmt -box "SELECT ident, priority, need_type, COALESCE(assignee,'-') AS owner, COALESCE(recommend,'-') AS recommend, COALESCE((SELECT ident FROM tasks p WHERE p.id=tasks.precedent_ref),'-') AS precedent, ask FROM tasks WHERE ${where} ${order};"
     fi
   fi
 }

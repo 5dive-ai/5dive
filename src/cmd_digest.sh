@@ -216,8 +216,24 @@ for t in work:
         if ae is not None and ae >= since:
             auto_cleared.append(t)
 auto_l = [{"ident": t.get("ident"), "applied": (t.get("need_answer") or "").strip(),
-           "by": t.get("need_answered_by"), "assignee": t.get("assignee") or "unassigned"}
+           "by": t.get("need_answered_by"), "assignee": t.get("assignee") or "unassigned",
+           "precedent": t.get("precedent_ref")}
           for t in auto_cleared]
+
+# OSS-11 (DIVE-976): precedent-prefill acceptance rate — of gates that were
+# prefilled from a precedent AND answered in the window, how many kept the
+# prefilled recommendation (need_answer == recommend). Low acceptance ⇒ matching
+# is too loose ⇒ tighten (this metric also gates promotion to v2 auto-clear).
+def _norm(s):
+    return (s or "").strip()
+prefilled = []
+for t in work:
+    if t.get("precedent_ref") and t.get("need_answer"):
+        ae = to_epoch(t.get("need_answered_at"))
+        if ae is not None and ae >= since:
+            prefilled.append(t)
+accepted = [t for t in prefilled if _norm(t.get("need_answer")) == _norm(t.get("recommend"))]
+prefill_rate = round(100 * len(accepted) / len(prefilled)) if prefilled else None
 
 # OSS-10 zero-human KPI: gates a HUMAN answered in the window. Provenance is
 # need_answered_by = 'human:*' (the --human tap/dashboard path); bare agent
@@ -260,6 +276,8 @@ if as_json:
         "window": {"since": since, "now": now, "label": window_label},
         "done": done_l, "inProgress": ip_l, "blocked": blk_l, "autoCleared": auto_l,
         "zeroHuman": {"shipped": len(done_l), "humanTouches": len(ht_l), "gates": ht_l},
+        "precedentPrefill": {"count": len(prefilled), "accepted": len(accepted),
+                             "acceptanceRate": prefill_rate},
         "usage": usage_l, "health": {"stale": stale, "hot": [h["name"] for h in hot]},
     }, indent=2))
 else:
@@ -298,9 +316,14 @@ else:
         out.append("")
         out.append(f"\U0001F916 Auto-cleared gates ({len(auto_l)})")
         for t in auto_l[:8]:
-            out.append(f"  • {t['ident']} applied: {short(t['applied'], 60)} ({t['by']})")
+            prec = f" from precedent #{t['precedent']}" if t.get("precedent") else ""
+            out.append(f"  • {t['ident']} applied: {short(t['applied'], 60)} ({t['by']}{prec})")
         if len(auto_l) > 8:
             out.append(f"  … +{len(auto_l) - 8} more")
+    if prefilled:
+        out.append("")
+        out.append(f"\U0001F9E0 Precedent prefills ({len(prefilled)}) — "
+                   f"{prefill_rate}% kept the prefilled rec ({len(accepted)}/{len(prefilled)})")
     out.append("")
     if hot:
         out.append("⚠️ Rate-limit watch: " +

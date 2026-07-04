@@ -218,8 +218,18 @@ CREATE TABLE IF NOT EXISTS tasks (
   -- gates filed without a target (legacy behavior preserved). The VALUE is never
   -- stored here — only the destination coordinates.
   secret_key          TEXT,
-  connector           TEXT
+  connector           TEXT,
+  -- OSS-11 (DIVE-976) decision-memory precedent prefill. ask_shape is the
+  -- normalized "shape key" of the ask (idents/nums/amounts/dates/hosts/names
+  -- collapsed to typed placeholders) computed at gate-file time; precedent_ref
+  -- is the prior answered gate whose answer prefilled this one's recommend (audit
+  -- + digest provenance). Both advisory-only: they NEVER mutate tier or the clear
+  -- path — precedent sources the VALUE of a rec the tier would surface anyway,
+  -- it never widens what a gate can self-clear (the DIVE-916 invariant).
+  ask_shape           TEXT,
+  precedent_ref       INTEGER
 );
+CREATE INDEX IF NOT EXISTS idx_tasks_precedent ON tasks(need_type, ask_shape);
 
 CREATE TABLE IF NOT EXISTS task_deps (
   task_id     INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
@@ -384,12 +394,17 @@ _tasks_db_migrate() {
            'acceptance_criteria TEXT' 'verify_command TEXT' 'max_iterations INTEGER' 'verifier TEXT' \
            'iteration INTEGER' 'maker_agent TEXT' 'task_budget TEXT' \
            'tier INTEGER' 'need_asked_at TEXT' 'gate_pinged_at TEXT' 'wake_at TEXT' \
-           'secret_key TEXT' 'connector TEXT' 'human_nonce_hash TEXT'; do
+           'secret_key TEXT' 'connector TEXT' 'human_nonce_hash TEXT' \
+           'ask_shape TEXT' 'precedent_ref INTEGER'; do
     if ! printf '%s\n' "$cols" | grep -qx "${c%% *}"; then
       sqlite3 -cmd ".timeout 5000" "$TASKS_DB" \
         "ALTER TABLE tasks ADD COLUMN ${c};" >/dev/null 2>&1 || true
     fi
   done
+  # OSS-11 precedent-lookup index (idempotent; harmless if the columns just
+  # backfilled to NULL above — an all-NULL ask_shape simply never matches).
+  sqlite3 -cmd ".timeout 5000" "$TASKS_DB" \
+    "CREATE INDEX IF NOT EXISTS idx_tasks_precedent ON tasks(need_type, ask_shape);" >/dev/null 2>&1 || true
 
   # DIVE-484 projects migration — ONE-SHOT, gated on the projects table's absence
   # so it doesn't take a write lock on every command. Runs after the column loop
