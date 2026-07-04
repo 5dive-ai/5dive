@@ -56,7 +56,7 @@ SYSTEMD_UNIT="5dive-agent@"
 # can't read. ensure_state stamps this into agents.json on create + migrates
 # v0 (no version field) registries in place. Keep migrations pure-jq so they
 # run without extra deps.
-readonly REGISTRY_SCHEMA_VERSION=1
+readonly REGISTRY_SCHEMA_VERSION=2
 
 # Exclusive lock for mutating commands. Two dashboard clicks on "create" with
 # the same name used to race on adduser + registry_write; now every mutation
