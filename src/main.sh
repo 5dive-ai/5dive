@@ -289,6 +289,11 @@ main() {
         import)
           AUDIT_CMD="agent import"; AUDIT_ARGS=("$@")
           with_registry_lock cmd_import "$@" ;;
+        inspect)
+          # DIVE-995: read-only pack disclosure ("this pack runs X") — no lock,
+          # no root; the safety precondition before importing a third-party pack.
+          AUDIT_CMD="agent inspect"; AUDIT_ARGS=("$@")
+          cmd_inspect "$@" ;;
         marketplace)
           # DIVE-473/509: browse the character-pack git registry (read-only).
           AUDIT_CMD="agent marketplace"; AUDIT_ARGS=("$@")

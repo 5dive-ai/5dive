@@ -11,6 +11,19 @@ release.
 
 ### Added
 
+- 0.7.8 (DIVE-995): **pack trust layer** — the install-time "this pack runs X"
+  disclosure and the safety precondition before running any third-party pack.
+  New read-only `5dive agent inspect <pack|slug>` unpacks a pack and reports its
+  executable surface: hooks (arbitrary shell that auto-runs on the new agent's
+  tool events — the agentjacking surface), skills/plugins added, whether it
+  re-renders the system prompt, seeds recall memory, or adopts a bundled signing
+  key. `agent import` now **prints the same disclosure before recreating** and
+  is **deny-by-default on hooks**: a pack's hooks are STRIPPED on import unless
+  the importer passes `--allow-hooks`. Import result envelope gains `hooks`
+  (`none|stripped(N)|allowed(N)`) and a full `disclosure` object. Covers OSS-6
+  item 5's mandatory install disclosure; identity/receipts (item 4) + install
+  counts + a PUBLIC marketplace remain split (lodar brand/security decision).
+
 - 0.7.7 (DIVE-992): the heartbeat tick prompt now injects **memory recall** and a
   **compile nudge** from the shared `_hb_wake` seam. Recall: each `/goal` nudge
   cites the top-k memory/wiki hits most relevant to the task's title+body (BM25

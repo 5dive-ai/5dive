@@ -430,6 +430,95 @@ cmd_marketplace() {
   esac
 }
 
+# DIVE-995 pack trust layer. Enumerate the EXECUTABLE surface a pack would grant
+# the imported agent — the "this pack runs X" install-time disclosure and the
+# safety precondition before running ANY third-party pack. Pure + read-only:
+# takes an already-unpacked stage dir, emits a JSON object; callers render or
+# gate on it. Highest-risk item is `hooks` (arbitrary shell that auto-runs on the
+# new agent's tool events — the agentjacking/prompt-injection surface); the rest
+# (skills/plugins added, system-prompt render, seeded recall, adopted signing
+# key) are lower-risk but still material to an informed install decision.
+_pack_disclosure_json() {
+  local stage="$1" mf="$1/manifest.json"
+  [[ -f "$mf" ]] || { echo '{}'; return 1; }
+  # A persona.yaml is the canonical identity source, so its presence means the
+  # pack (re)renders the agent's system prompt (CLAUDE.md). Pre-strip it may also
+  # bundle a private signing key the imported agent would adopt (own its identity).
+  local renders=false adopts=false
+  if [[ -f "$stage/persona.yaml" ]]; then
+    renders=true
+    grep -qF "signing_key" "$stage/persona.yaml" && adopts=true
+  fi
+  jq -n --argjson m "$(cat "$mf")" --argjson r "$renders" --argjson a "$adopts" '
+    ($m.hooks // {}) as $h
+    | [$h | .. | objects | .command? // empty] as $cmds
+    | {
+        hooks:   { count: ($cmds | length), events: ($h | keys), commands: $cmds },
+        skills:  ($m.skills  // []),
+        plugins: ($m.plugins // []),
+        rendersSystemPrompt: $r,
+        seedsMemory: (($m.includes.memory // false) != false),
+        adoptsSigningKey: $a
+      }'
+}
+
+# Human-readable render of a disclosure JSON blob (from _pack_disclosure_json).
+_pack_disclosure_print() {
+  local d="$1" hc
+  hc=$(jq -r '.hooks.count' <<<"$d")
+  echo "  ── pack will let the new agent run ──────────────────────────"
+  if (( hc > 0 )); then
+    warn "HOOKS: $hc shell command(s) auto-run on this agent's tool events —"
+    jq -r '.hooks.commands[] | "        $ " + .' <<<"$d"
+    echo "        (arbitrary shell; NOT installed unless you pass --allow-hooks)"
+  else
+    echo "     hooks:   none"
+  fi
+  echo "     skills:  $(jq -r 'if (.skills|length)>0 then "\(.skills|length) (\(.skills|join(", ")))" else "none" end' <<<"$d")"
+  echo "     plugins: $(jq -r 'if (.plugins|length)>0 then (.plugins|join(", ")) else "none" end' <<<"$d")"
+  echo "     system prompt (CLAUDE.md) re-rendered from persona: $(jq -r '.rendersSystemPrompt' <<<"$d")"
+  echo "     seeds recall memory: $(jq -r '.seedsMemory' <<<"$d")"
+  echo "     adopts a bundled signing key (owns identity): $(jq -r '.adoptsSigningKey' <<<"$d")"
+  echo "  ─────────────────────────────────────────────────────────────"
+}
+
+# DIVE-995: `5dive agent inspect <pack|slug>` — read-only "look before you
+# install". Resolves a local pack OR a bare registry slug, unpacks into an
+# isolated stage, and reports its executable surface (see _pack_disclosure_json)
+# WITHOUT creating anything. No root needed. The safety precondition a person (or
+# an agent) runs before importing a third-party pack.
+cmd_inspect() {
+  local pack="${1:-}"
+  [[ -n "$pack" ]] || fail "$E_USAGE" "usage: 5dive agent inspect <pack.tar.gz|slug>"
+  local resolved_tmp=""
+  if [[ ! -f "$pack" ]]; then
+    if [[ "$pack" =~ ^[a-z0-9][a-z0-9_-]*$ ]]; then
+      resolved_tmp=$(_marketplace_fetch_pack "$pack") \
+        || fail "$E_NOT_FOUND" "no pack '$pack' in the registry (browse: 5dive agent marketplace ls)"
+      pack="$resolved_tmp"
+    else
+      fail "$E_NOT_FOUND" "pack not found: $pack"
+    fi
+  fi
+  local stage; stage=$(mktemp -d)
+  tar -xzf "$pack" -C "$stage" 2>/dev/null \
+    || { rm -rf "$stage" "$resolved_tmp"; fail "$E_GENERIC" "could not read pack (expected a .tar.gz from 'agent export')"; }
+  [[ -n "$resolved_tmp" ]] && rm -f "$resolved_tmp"
+  [[ -f "$stage/manifest.json" ]] \
+    || { rm -rf "$stage"; fail "$E_VALIDATION" "pack has no manifest.json — not a 5dive agent pack"; }
+  local disc; disc=$(_pack_disclosure_json "$stage") \
+    || { rm -rf "$stage"; fail "$E_VALIDATION" "could not read pack manifest"; }
+  local aname; aname=$(jq -r '.agentName // "?"' "$stage/manifest.json")
+  if (( JSON_MODE )); then
+    ok "" '{pack:$p, disclosure:$d}' --arg p "$aname" --argjson d "$disc"
+  else
+    echo "Pack '$aname' — install-time disclosure (DIVE-995)"
+    _pack_disclosure_print "$disc"
+    echo "  import with: 5dive agent import <pack> --as=<name>   (add --allow-hooks to keep hooks)"
+  fi
+  rm -rf "$stage"
+}
+
 _pack_usage() {
   cat <<USAGE
 5dive agent export / import — portable agent packs (DIVE-39)
@@ -443,9 +532,15 @@ _pack_usage() {
                                   #   2) export <name> --approve-memory=<draft dir>  -> seals the
                                   #      reviewed memory into the pack. Nothing is packed unreviewed.
   5dive agent marketplace [ls]    # browse the character-pack registry (<org>/character-packs)
+  5dive agent inspect <pack|slug> # DIVE-995: read-only "this pack runs X" disclosure —
+                                  # hooks (arbitrary shell), skills, plugins, whether it
+                                  # re-renders the system prompt, seeds memory, or adopts a
+                                  # signing key. Run this BEFORE importing a third-party pack.
   5dive agent import <pack|slug> --as=<name> [--channels=none|telegram|discord|dashboard[,ch...]]
                             [--telegram-token=<tok>] [--discord-token=<tok>]
-                            [--auth-profile=<name>] [--workdir=<path>] [--report-import]
+                            [--auth-profile=<name>] [--workdir=<path>] [--report-import] [--allow-hooks]
+                                  # --allow-hooks (default OFF): keep the pack's hooks. Without
+                                  # it, a pack's arbitrary-shell hooks are STRIPPED on import.
                                   # recreate an agent from a pack into a FRESH name.
                                   # <pack> = a .tar.gz file OR a bare registry slug
                                   # (e.g. `import lilbro --as=...`) pulled from the git registry.
@@ -714,7 +809,7 @@ cmd_export() {
 cmd_import() {
   require_root
   local pack="" as="" channels="" tg_token="" dc_token="" profile="" workdir=""
-  local report_import=0 import_slug=""
+  local report_import=0 import_slug="" allow_hooks=0
   # DIVE-658 #2: provision straight from an OpenAgent persona file. The persona
   # carries identity only; these flags supply the 5dive runtime config the pack
   # would otherwise hold (sane defaults; only consumed in --from-persona mode).
@@ -735,6 +830,10 @@ cmd_import() {
       # DIVE-644: opt-in, default-OFF import telemetry. Only meaningful for a
       # registry-slug import (a local .tar.gz has no public slug to report).
       --report-import)     report_import=1 ;;
+      # DIVE-995: hooks are arbitrary shell that auto-run on the new agent's tool
+      # events (the agentjacking surface of third-party packs). Deny-by-default:
+      # a pack's hooks are STRIPPED on import unless the importer opts in here.
+      --allow-hooks)       allow_hooks=1 ;;
       -*)                  fail "$E_USAGE" "unknown flag: $1" ;;
       *)                   [[ -z "$pack" ]] && pack="$1" || fail "$E_USAGE" "extra arg: $1" ;;
     esac
@@ -888,6 +987,15 @@ cmd_import() {
   [[ -n "$tg_token" ]] && cargs+=("--telegram-token=$tg_token")
   [[ -n "$dc_token" ]] && cargs+=("--discord-token=$dc_token")
 
+  # DIVE-995: MANDATORY install-time disclosure — surface the pack's executable
+  # surface (hooks/skills/plugins/prompt/signing-key) BEFORE we recreate anything,
+  # so an import is never a silent grant of arbitrary capability.
+  local disclosure; disclosure=$(_pack_disclosure_json "$stage" 2>/dev/null || echo '{}')
+  local disc_hooks; disc_hooks=$(jq -r '.hooks.count // 0' <<<"$disclosure" 2>/dev/null || echo 0)
+  if ! (( JSON_MODE )); then
+    _pack_disclosure_print "$disclosure"
+  fi
+
   # Recreate via the canonical create path (its ok-envelope suppressed so import
   # emits a single envelope). The registry lock is reentrant, so this is safe.
   step "Recreating agent '$as' from pack (type=$type)"
@@ -946,6 +1054,14 @@ cmd_import() {
     local sfile="$cdir/settings.json" hooks plugins cur
     hooks=$(jq -c '.hooks // {}'     "$stage/manifest.json")
     plugins=$(jq -c '.plugins // []' "$stage/manifest.json")
+    # DIVE-995: deny-by-default on the arbitrary-shell hooks surface. Unless the
+    # importer explicitly passed --allow-hooks, drop the pack's hooks so a
+    # third-party pack can't silently auto-run shell on the new agent's tool
+    # events. Disclosed above; stripping is the enforced safety default.
+    if (( ! allow_hooks )) && (( disc_hooks > 0 )); then
+      warn "stripped $disc_hooks hook command(s) from the pack (arbitrary shell) — re-import with --allow-hooks to keep them"
+      hooks='{}'
+    fi
     cur=$( [[ -f "$sfile" ]] && cat "$sfile" || echo '{}' )
     if jq -n --argjson cur "$cur" \
           --arg model "$model" --arg effort "$effort" \
@@ -1031,7 +1147,9 @@ cmd_import() {
   skipped_j=$(printf '%s\n' "${skipped[@]+"${skipped[@]}"}" | jq -R . | jq -cs 'map(select(. != ""))')
   local mem_note="no memory"
   [[ "$mem_inc" == "distilled" ]] && mem_note="distilled memory -> $mem_seeded"
-  ok "imported '$as' from pack ($mem_note). Skills added: ${#added[@]}, skipped: ${#skipped[@]}; template: $templated; avatar: $avatar_note." \
-     '{name:$n, type:$t, memory:$mem, memorySeeded:$ms, skillsAdded:$a, skillsSkipped:$s, template:$tpl, avatar:$av, reported:$ri}' \
-     --arg n "$as" --arg t "$type" --arg mem "$mem_inc" --arg ms "$mem_seeded" --argjson a "$added_j" --argjson s "$skipped_j" --arg tpl "$templated" --arg av "$avatar_note" --arg ri "$reported"
+  local hooks_note="none"
+  (( disc_hooks > 0 )) && { hooks_note="stripped($disc_hooks)"; (( allow_hooks )) && hooks_note="allowed($disc_hooks)"; }
+  ok "imported '$as' from pack ($mem_note). Skills added: ${#added[@]}, skipped: ${#skipped[@]}; template: $templated; avatar: $avatar_note; hooks: $hooks_note." \
+     '{name:$n, type:$t, memory:$mem, memorySeeded:$ms, skillsAdded:$a, skillsSkipped:$s, template:$tpl, avatar:$av, reported:$ri, hooks:$hk, disclosure:$disc}' \
+     --arg n "$as" --arg t "$type" --arg mem "$mem_inc" --arg ms "$mem_seeded" --argjson a "$added_j" --argjson s "$skipped_j" --arg tpl "$templated" --arg av "$avatar_note" --arg ri "$reported" --arg hk "$hooks_note" --argjson disc "$disclosure"
 }
