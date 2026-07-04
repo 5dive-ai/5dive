@@ -526,6 +526,20 @@ cmd_supervisor_tick() {
   healthy=$(jq '[.[] | select(.classification == "healthy")] | length' <<<"$snap")
   slow=$(jq  '[.[] | select(.classification == "slow")]    | length' <<<"$snap")
   stuck=$(jq '[.[] | select(.classification == "stuck")]   | length' <<<"$snap")
+
+  # DIVE-975: one 'heartbeat' row per tick — the observation DENOMINATOR. The
+  # transition/observe rows above are sporadic by nature (a clean fleet writes
+  # none), so an all-healthy week left supervisor_events empty and DIVE-970 had
+  # no window to measure a false-positive RATE against. This additive summary
+  # row makes the table grow on every cron tick and records the fleet snapshot;
+  # reviewers filter it out by event='heartbeat'. agent='(fleet)' is a sentinel.
+  local fleet_class="healthy"
+  (( slow + stuck > 0 )) && fleet_class="degraded"
+  db "INSERT INTO supervisor_events (agent, event, classification, signals)
+      VALUES ('(fleet)', 'heartbeat', $(sqlq "$fleet_class"),
+              $(sqlq "{\"total\":${total},\"healthy\":${healthy},\"slow\":${slow},\"stuck\":${stuck},\"anomalyRows\":${events}}"));" \
+    2>/dev/null && events=$((events + 1)) || warn "supervisor: heartbeat insert failed"
+
   local act_note=""
   if [[ "$actions_on" == "true" ]]; then act_note=" · actions ON: ${acted} acted / ${escalated} escalated"
   elif (( planned + escalated > 0 )); then act_note=" · dormant: ${planned} planned / ${escalated} escalated"
