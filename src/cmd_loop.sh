@@ -24,7 +24,7 @@ cmd_loop() {
     map)       cmd_loop_map "$@" ;;
     until-dry) cmd_loop_until_dry "$@" ;;
     collect)   cmd_loop_collect "$@" ;;
-    status)    _loop_todo status "$@" ;;
+    status)    cmd_loop_status "$@" ;;
     # DIVE-761: marketplace loop packs — install/uninstall a recurring agentic
     # workflow (persona + skills + cadence) onto an agent. Distinct from the
     # orchestration verbs above; shares the `loop` namespace because both are "loops".
@@ -34,12 +34,6 @@ cmd_loop() {
     help|-h|--help) _loop_help ;;
     *)         fail "$E_USAGE" "unknown loop command: $sub (spawn|verify|grade|panel|map|until-dry|collect|status|install|show)" ;;
   esac
-}
-
-# Honest WIP guard: unimplemented verbs fail loudly rather than no-op silently.
-_loop_todo() {
-  local verb="$1"
-  fail "$E_USAGE" "5dive loop $verb — not yet implemented (LOOP-7 WIP)."
 }
 
 # loop_id: a loop-run handle, distinct from a task ident. (Date.now is fine in
@@ -954,5 +948,121 @@ cmd_loop_collect() {
   ok "loop collect ${status_final}: ${ok_n} ok / ${fail_n} null / ${n} handles" \
      '{status:$s, total:($t|tonumber), ok:($ok|tonumber), failed:($f|tonumber), results:$res}' \
      --arg s "$status_final" --arg t "$n" --arg ok "$ok_n" --arg f "$fail_n" --argjson res "$out_arr"
+  return 0
+}
+
+# --- loop status (LOOP-7: read-only single-loop drilldown) ---
+# The read-side complement to `task loops` (the fleet-wide board): inspect ONE
+# loop run by handle. PURE read — never spawns, mutates, block-waits, or authors
+# work (unlike `loop collect`, which barriers on terminal state). Emits
+# topology/stage/iteration/tokens-vs-ceiling/status/stuck plus each backing
+# task's LIVE state, so an orchestrator can poll a handle between other work.
+# JSON in / JSON out. `stuck` = the stored supervisor flag OR a derived signal
+# (a running loop at/over its ceiling, or with no heartbeat for the stall
+# window) so a wedged loop is visible even before the next supervisor tick.
+# Terminal loops (done/killed/escalated) are never reported stuck.
+_LOOP_STALE_SECS=900
+cmd_loop_status() {
+  tasks_db_init
+  local handle=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --handle=*) handle="${1#*=}" ;;
+      --)         shift; break ;;
+      -*)         fail "$E_USAGE" "unknown flag: $1" ;;
+      *)          [[ -z "$handle" ]] && handle="$1" || fail "$E_USAGE" "loop status takes one handle (unexpected: $1)" ;;
+    esac
+    shift
+  done
+  [[ -n "$handle" ]] || fail "$E_USAGE" "loop status: --handle=<loopId> required"
+
+  local exists; exists=$(db "SELECT 1 FROM loop_runs WHERE loop_id=$(sqlq "$handle") LIMIT 1;")
+  [[ -n "$exists" ]] || fail "$E_NOT_FOUND" "no loop run with handle '$handle' (see: 5dive task loops --all)"
+
+  # The run row as one JSON object (typed columns; the *_json blobs stay raw so
+  # we can re-parse them for the caller).
+  local row
+  row=$(dbfmt -json "SELECT loop_id, topology, COALESCE(stage,'') AS stage,
+           COALESCE(iteration,0) AS iteration, COALESCE(tokens_spent,0) AS tokens_spent,
+           ceiling, status, stuck AS stuck_flag, kill_requested,
+           COALESCE(spawned_by_agent,'') AS spawned_by_agent, spawned_by_task,
+           COALESCE(child_task_ids,'[]') AS child_task_ids,
+           result_json, scorecard_json, started_at, updated_at
+         FROM loop_runs WHERE loop_id=$(sqlq "$handle") LIMIT 1;" | jq -c '.[0]')
+
+  local now; now=$(date +%s)
+  local updated_at; updated_at=$(printf '%s' "$row" | jq -r '.updated_at')
+  local age=$(( now - updated_at ))
+  local rstatus;  rstatus=$(printf '%s' "$row" | jq -r '.status')
+  local ceiling;  ceiling=$(printf '%s' "$row" | jq -r '.ceiling // empty')
+  local spent;    spent=$(printf '%s' "$row" | jq -r '.tokens_spent')
+
+  # Derived stuck (only meaningful while running).
+  local stuck=0 stuck_reason=""
+  [[ "$(printf '%s' "$row" | jq -r '.stuck_flag')" == "1" ]] && { stuck=1; stuck_reason="flagged"; }
+  if [[ "$rstatus" == "running" ]]; then
+    if [[ -n "$ceiling" && "${spent:-0}" -ge "$ceiling" ]]; then stuck=1; stuck_reason="ceiling"; fi
+    if (( age >= _LOOP_STALE_SECS )); then stuck=1; [[ -z "$stuck_reason" || "$stuck_reason" == "flagged" ]] && stuck_reason="stale"; fi
+  fi
+
+  # Resolve backing task ids → live state (index-aligned to child_task_ids).
+  local child_ids; child_ids=$(printf '%s' "$row" | jq -r '.child_task_ids')
+  local children="[]" cdone=0 copen=0 cfail=0
+  local ids; ids=$(printf '%s' "$child_ids" | jq -r '.[]? // empty')
+  local cid
+  for cid in $ids; do
+    [[ "$cid" =~ ^[0-9]+$ ]] || continue
+    local crow
+    crow=$(dbfmt -json "SELECT id, ident, status, COALESCE(assignee,'') AS assignee
+             FROM tasks WHERE id=${cid} LIMIT 1;" | jq -c '.[0] // empty')
+    [[ -n "$crow" ]] || crow=$(jq -cn --argjson id "$cid" '{id:$id, ident:null, status:"missing", assignee:""}')
+    children=$(printf '%s' "$children" | jq -c --argjson c "$crow" '. + [$c]')
+    case "$(printf '%s' "$crow" | jq -r '.status')" in
+      done)                          cdone=$((cdone+1)) ;;
+      rejected|escalated|cancelled)  cfail=$((cfail+1)) ;;
+      *)                             copen=$((copen+1)) ;;
+    esac
+  done
+
+  # Assemble the drilldown object.
+  local out
+  out=$(printf '%s' "$row" | jq -c \
+        --argjson stuck "$stuck" --arg sr "$stuck_reason" --argjson age "$age" \
+        --argjson children "$children" --argjson cd "$cdone" --argjson co "$copen" --argjson cf "$cfail" \
+        '{loopId:.loop_id, handle:.loop_id, topology:.topology, stage:.stage,
+          iteration:.iteration, tokensSpent:.tokens_spent, ceiling:.ceiling,
+          status:.status, killRequested:(.kill_requested==1),
+          stuck:($stuck==1), stuckReason:(if $sr=="" then null else $sr end),
+          spawnedBy:.spawned_by_agent, spawnedByTask:.spawned_by_task,
+          startedAt:.started_at, updatedAt:.updated_at, ageSecs:$age,
+          childCounts:{total:($children|length), done:$cd, open:$co, failed:$cf},
+          children:$children,
+          result:(.result_json | if .==null then null else (try fromjson catch .) end),
+          scorecard:(.scorecard_json | if .==null then null else (try fromjson catch .) end)}')
+
+  if (( JSON_MODE )); then
+    ok "" '$d' --argjson d "$out"
+    return 0
+  fi
+
+  # Text mode: a compact header + the backing-task board.
+  local topology stage iteration by sbtask
+  topology=$(printf '%s' "$row" | jq -r '.topology')
+  stage=$(printf '%s' "$row"    | jq -r 'if (.stage//"")=="" then "-" else .stage end')
+  iteration=$(printf '%s' "$row"| jq -r '.iteration')
+  by=$(printf '%s' "$row"       | jq -r 'if (.spawned_by_agent//"")=="" then "-" else .spawned_by_agent end')
+  sbtask=$(printf '%s' "$row"   | jq -r '.spawned_by_task // "-"')
+  printf 'loop %s  [%s]  topology=%s  stage=%s  iter=%s\n' "$handle" "$rstatus" "$topology" "$stage" "$iteration"
+  printf '  tokens %s/%s   age %ss   stuck=%s%s   kill=%s\n' \
+    "$spent" "${ceiling:-∞}" "$age" "$([[ "$stuck" == 1 ]] && echo yes || echo no)" \
+    "$([[ -n "$stuck_reason" ]] && echo " ($stuck_reason)" || true)" \
+    "$(printf '%s' "$row" | jq -r 'if .kill_requested==1 then "requested" else "no" end')"
+  printf '  by %s (task %s)   children: %s done / %s open / %s failed\n' "$by" "$sbtask" "$cdone" "$copen" "$cfail"
+  if [[ -n "$ids" ]]; then
+    local csv; csv=$(printf '%s' "$child_ids" | jq -r 'map(tostring)|join(",")')
+    printf '\nbacking tasks:\n'
+    dbfmt -box "SELECT id, ident, status, COALESCE(assignee,'-') AS assignee
+                FROM tasks WHERE id IN (${csv}) ORDER BY id;"
+  fi
   return 0
 }

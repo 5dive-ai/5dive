@@ -9,6 +9,16 @@ release.
 
 ## [Unreleased]
 
+### Added
+
+- DIVE-968: implement `5dive loop status --handle=<loopId>` — the read-only
+  single-loop drilldown that complements the fleet-wide `task loops` board.
+  Reports topology/stage/iteration/tokens-vs-ceiling/status plus each backing
+  task's live state and a derived `stuck` signal (stored supervisor flag, or a
+  running loop at/over ceiling, or with no heartbeat for the stall window).
+  Pure read (never spawns/mutates/block-waits), JSON in / JSON out. Retires the
+  last `_loop_todo` WIP stub, so no "not yet implemented" verb ships.
+
 ### Security
 
 - DIVE-916: **close the `sudo`→`--human` gate-forge** with a per-gate HUMAN nonce.
