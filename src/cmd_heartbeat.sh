@@ -627,6 +627,45 @@ _hb_gate_ttl_sweep() {
   return 0
 }
 
+# DIVE-972: loop token-ceiling enforcement sweep. The --wait poll only policed a
+# ceiling while a caller was synchronously waiting; a fire-and-forget loop (no
+# --wait, the common case) had NOTHING re-reading its spend, so its ceiling was
+# purely advisory. This sweep is the backstop: every tick it recomputes the live
+# spend of each running loop from its child tasks' transcripts and, on breach,
+# halts the loop (status=escalated + kill_requested so any live poll or future
+# round stops) and escalates-with-proof on the originating task — design §4's
+# "never ship best-so-far silently", now enforced for async loops too.
+_hb_loop_ceiling_sweep() {
+  local lrow lid ceil sby spent lident
+  while IFS= read -r lrow; do
+    [[ -n "$lrow" ]] || continue
+    IFS=$'\x1f' read -r lid ceil sby <<<"$lrow"
+    [[ -n "$lid" && "$ceil" =~ ^[0-9]+$ ]] || continue
+    spent=$(_loop_refresh_spend "$lid" 2>/dev/null || echo 0)
+    [[ "$spent" =~ ^[0-9]+$ ]] || continue
+    (( spent >= ceil )) || continue
+    db "UPDATE loop_runs SET status='escalated', kill_requested=1, updated_at=$(date +%s)
+        WHERE loop_id=$(sqlq "$lid") AND status='running';"
+    _hb_log "[loop-ceiling] ${lid} breached ceiling (~${spent}/${ceil} tok) — halted + escalated"
+    # Escalate-with-proof on the originating task (skip if it already has an open
+    # need, or isn't a live task). cmd_task_need is bundled + we run as root.
+    if [[ "$sby" =~ ^[0-9]+$ ]]; then
+      local has_need st
+      st=$(db "SELECT status FROM tasks WHERE id=${sby};" 2>/dev/null || echo "")
+      has_need=$(db "SELECT COUNT(*) FROM tasks WHERE id=${sby} AND need_type IS NOT NULL AND need_answered_at IS NULL;" 2>/dev/null || echo 0)
+      if [[ -n "$st" && "$st" != "done" && "$st" != "cancelled" && "${has_need:-0}" == "0" ]]; then
+        ( cmd_task_need "$sby" --type=approval \
+            --ask="loop ${lid} hit its token ceiling (~${spent}/${ceil} tok) and was halted before finishing. Continue with a higher --ceiling, or stop?" \
+            --recommend="stop" ) >/dev/null 2>&1 || true
+      fi
+    fi
+  done < <(db "SELECT loop_id||x'1f'||COALESCE(ceiling,'')||x'1f'||COALESCE(spawned_by_task,'')
+               FROM loop_runs
+               WHERE status='running' AND ceiling IS NOT NULL
+                 AND child_task_ids IS NOT NULL AND child_task_ids != '[]';")
+  return 0
+}
+
 cmd_heartbeat_tick() {
   require_root "heartbeat tick"
   tasks_db_init
@@ -640,6 +679,9 @@ cmd_heartbeat_tick() {
   # — runs before the wake loop so a just-unparked/just-unblocked todo is
   # eligible for pickup this same tick.
   _hb_gate_ttl_sweep || _hb_log "[gate-ttl] pass errored (non-fatal)"
+  # DIVE-972: enforce per-loop token ceilings for async (non --wait) loops. Same
+  # isolation contract — a failure here must never abort the wake loop.
+  _hb_loop_ceiling_sweep || _hb_log "[loop-ceiling] pass errored (non-fatal)"
   # Accounts already woken during THIS tick. The $reg snapshot is read once up
   # front, so a wake we do mid-loop isn't visible to later iterations via the
   # registry — this map carries that within-tick fact so two same-account agents
