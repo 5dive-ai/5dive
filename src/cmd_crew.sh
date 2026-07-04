@@ -30,6 +30,16 @@ _crew_ingest_url() { echo "${ZEROHUMAN_INGEST_URL:-https://api.5dive.com/a2a/rec
 
 cmd_crew() {
   local sub="${1:-help}"; shift || true
+  # DIVE-1002 invariant: no `sudo 5dive` subcommand may exec agent-controlled
+  # input as root. Crews install + run agent-authored Python from their own venv
+  # (cmd_crew_run) and are a per-user feature — installed and run under the
+  # invoking user's $HOME/.5dive/crews, never needing root. Refuse EUID 0 so the
+  # admin "5dive CLI as root" grant can't reach crew exec and become an
+  # admin->root escalation. Run crews as yourself, without sudo. (help is
+  # allowed as root so `sudo 5dive crew` still prints usage.)
+  if [[ "$sub" != "help" && "$sub" != "-h" && "$sub" != "--help" && "$(id -u)" == "0" ]]; then
+    fail "$E_PERMISSION" "5dive crew must run as your own user, not root — crews execute agent-authored code from their venv, so running as root would be a privilege escalation. Re-run without sudo (crews live in your \$HOME)."
+  fi
   case "$sub" in
     install)          cmd_crew_install "$@" ;;
     secret)           cmd_crew_secret "$@" ;;
