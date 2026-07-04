@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # 5dive CLI installer / uninstaller
-# Install:   curl -fsSL https://install.5dive.com | sudo bash
-# Upgrade:   curl -fsSL https://install.5dive.com | sudo bash -s -- --upgrade
-# Uninstall: curl -fsSL https://install.5dive.com | sudo bash -s -- --uninstall
+# Install:   curl -fsSL https://install.5dive.ai | sudo bash
+# Upgrade:   curl -fsSL https://install.5dive.ai | sudo bash -s -- --upgrade
+# Uninstall: curl -fsSL https://install.5dive.ai | sudo bash -s -- --uninstall
 set -euo pipefail
 
 # GitHub org our repos live under. The org is being renamed

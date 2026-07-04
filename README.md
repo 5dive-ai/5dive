@@ -20,7 +20,7 @@
 
 ```sh
 # 1. install
-curl -fsSL https://install.5dive.com | sudo bash
+curl -fsSL https://install.5dive.ai | sudo bash
 
 # 2. create your first agent — the wizard wires Telegram too:
 #    paste a bot token (BotFather gives you one), send the bot /start,
@@ -140,7 +140,7 @@ If you already use Claude Code / Codex / Antigravity / Grok / opencode, paste th
 Install 5dive on this Linux host so I can use you to manage 5dive agents.
 
 1. Run the installer (idempotent, safe to rerun):
-   curl -fsSL https://install.5dive.com | sudo bash
+   curl -fsSL https://install.5dive.ai | sudo bash
 2. Confirm: `5dive --version` prints a version string (e.g. "5dive 0.5.x").
 3. Install the 5dive-cli skill. Replace <runtime> with one of
    claude-code, codex, antigravity, grok, hermes-agent, openclaw, opencode:
