@@ -517,9 +517,17 @@ _pack_disclosure_print() {
 # untrusted pack could carry members like `../../etc/...` or `/abs/path` that
 # tar would write OUTSIDE the mktemp stage. Validate every member up front and
 # refuse the pack before extracting anything. Shared by cmd_inspect + cmd_import.
-# Returns: 0 ok, 1 unreadable/not-a-gzip, 2 unsafe member (traversal).
+#
+# DIVE-1011: the name-check above cannot cover a SYMLINK escape — a distinct
+# class. A pack ships member 1 = a symlink `link -> /etc` (name 'link' passes),
+# then member 2 = `link/file` (name also passes); on extraction tar follows the
+# on-disk symlink and writes OUTSIDE the stage (e.g. /etc/file). Same for
+# hardlinks. Modern GNU tar has its own symlink-replacement guard, so this is
+# defense-in-depth, but a name-check alone genuinely can't see it. Refuse any
+# pack that ships a link member outright — 5dive packs never contain links.
+# Returns: 0 ok, 1 unreadable/not-a-gzip, 2 unsafe member (traversal or link).
 _pack_safe_extract() {
-  local pack="$1" stage="$2" member listing
+  local pack="$1" stage="$2" member listing type_listing
   listing=$(tar -tzf "$pack" 2>/dev/null) || return 1
   while IFS= read -r member; do
     [[ -z "$member" ]] && continue
@@ -527,6 +535,15 @@ _pack_safe_extract() {
       /*|..|../*|*/../*|*/..) return 2 ;;
     esac
   done <<<"$listing"
+  # Verbose listing: the leading char of each entry is the type flag —
+  # 'l' = symlink, 'h' = hardlink. Refuse the pack if any member is a link.
+  type_listing=$(tar -tvzf "$pack" 2>/dev/null) || return 1
+  while IFS= read -r member; do
+    [[ -z "$member" ]] && continue
+    case "$member" in
+      [lh]*) return 2 ;;
+    esac
+  done <<<"$type_listing"
   tar -xzf "$pack" -C "$stage" 2>/dev/null || return 1
 }
 
@@ -550,7 +567,7 @@ cmd_inspect() {
   fi
   local stage; stage=$(mktemp -d)
   _pack_safe_extract "$pack" "$stage" || { local rc=$?; rm -rf "$stage" "$resolved_tmp"
-    (( rc == 2 )) && fail "$E_VALIDATION" "pack rejected: contains path-traversal members ('..' or absolute paths) — refusing to extract"
+    (( rc == 2 )) && fail "$E_VALIDATION" "pack rejected: contains unsafe members (path traversal, absolute paths, or sym/hardlinks), refusing to extract"
     fail "$E_GENERIC" "could not read pack (expected a .tar.gz from 'agent export')"; }
   [[ -n "$resolved_tmp" ]] && rm -f "$resolved_tmp"
   [[ -f "$stage/manifest.json" ]] \
@@ -925,7 +942,7 @@ cmd_import() {
   # Unpack into an isolated stage and validate the manifest before touching anything.
   local stage; stage=$(mktemp -d)
   _pack_safe_extract "$pack" "$stage" || { local rc=$?; rm -rf "$stage" "$resolved_tmp" "$persona_tmp"
-    (( rc == 2 )) && fail "$E_VALIDATION" "pack rejected: contains path-traversal members ('..' or absolute paths) — refusing to extract"
+    (( rc == 2 )) && fail "$E_VALIDATION" "pack rejected: contains unsafe members (path traversal, absolute paths, or sym/hardlinks), refusing to extract"
     fail "$E_GENERIC" "could not read pack (expected a .tar.gz from 'agent export')"; }
   [[ -n "$resolved_tmp" ]] && rm -f "$resolved_tmp"
   [[ -n "$persona_tmp" ]] && rm -f "$persona_tmp"

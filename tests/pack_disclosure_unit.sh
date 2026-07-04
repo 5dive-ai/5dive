@@ -214,6 +214,24 @@ _pack_safe_extract "$TZ_DIR/safe.tgz" "$SAFE_OUT"; rc=$?
 { (( rc == 0 )) && [[ -f "$SAFE_OUT/evil" ]]; } \
   && ok_t "safe pack extracts normally (rc 0)" || bad_t "safe rc" "got $rc"
 
+# ---- 5b. DIVE-1011: tar symlink-escape guard -------------------------------
+# A name-check can't see this: member 1 = symlink 'link -> <outside dir>' (name
+# 'link' passes), member 2 = 'link/pwned' (name also passes); on extraction tar
+# would follow the on-disk symlink and write OUTSIDE the stage. _pack_safe_extract
+# inspects member TYPES and must refuse (rc 2) any pack shipping a link member.
+ESC_DIR="$TZ_DIR/escape"; mkdir -p "$ESC_DIR"   # the would-be escape target
+SL_DIR="$TZ_DIR/sl"; mkdir -p "$SL_DIR"
+( cd "$SL_DIR"
+  ln -s "$ESC_DIR" link
+  echo pwned > payload )
+# Pack the symlink member (member 1) + a file that would land through it.
+tar --no-recursion -czf "$TZ_DIR/sym.tgz" -C "$SL_DIR" link payload 2>/dev/null
+
+_pack_safe_extract "$TZ_DIR/sym.tgz" "$OUT"; rc=$?
+(( rc == 2 )) && ok_t "symlink member rejected (rc 2)" || bad_t "sym rc" "got $rc"
+[[ ! -e "$ESC_DIR/payload" && ! -e "$ESC_DIR/pwned" ]] \
+  && ok_t "symlink pack wrote nothing through the link" || bad_t "sym escaped" ""
+
 echo
 printf 'DIVE-995 pack disclosure: %d passed, %d failed\n' "$PASS" "$FAIL"
 (( FAIL == 0 )) || exit 1

@@ -12,6 +12,21 @@ release.
 _Nothing yet. New changes accumulate here until they're cut into a tagged
 release._
 
+## [0.7.12] - 2026-07-04
+
+### Security
+
+- DIVE-1011: **reject symlink/hardlink members on pack import + inspect**
+  (defense-in-depth follow-up to 0.7.11). DIVE-1010's guard refuses `..` and
+  absolute member *names*, but a symlink is a distinct escape a name-check
+  can't cover: a pack ships a symlink `link -> /etc` (name passes) then a member
+  `link/file` (name passes), and on extraction tar follows the on-disk link to
+  write outside the mktemp stage. `_pack_safe_extract` now inspects member
+  *types* via `tar -tvzf` and refuses any pack shipping a link member — 5dive
+  packs never contain links. Modern GNU tar has its own symlink-replacement
+  guard, so this is hardening, not an open hole. New symlink-member fixture in
+  `pack_disclosure_unit.sh` (30/30).
+
 ## [0.7.11] - 2026-07-04
 
 ### Security
