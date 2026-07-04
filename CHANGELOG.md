@@ -11,6 +11,13 @@ release.
 
 ### Added
 
+- 0.7.6 (DIVE-981): `5dive project show` now renders the task_deps dependency
+  graph — tasks grouped into topological layers (L0, L1, …) with inline blockers
+  and a marked critical path (the longest end-to-end chain). `--json` gains a
+  `data.graph` block (nodes with layer/critical/blockers, edge count, layer
+  count, and the reconstructed `critical_path`) so a plan can be audited at a
+  glance. Covered by tests/project_show_graph_unit.sh.
+
 - 0.7.5 (DIVE-973): stuck-lane analytics in the daily digest — MTTU
   (mean-time-to-unstick). Sourced from the supervisor_events transition trail
   (which folds in loop_runs.stuck onsets as cause=loop-stuck): each stuck
