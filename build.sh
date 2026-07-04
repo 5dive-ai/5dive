@@ -32,6 +32,13 @@ cat \
   src/cmd_auth.sh \
   src/cmd_account.sh \
   src/cmd_agent.sh \
+  src/cmd_agent_create.sh \
+  src/cmd_agent_lifecycle.sh \
+  src/cmd_agent_config.sh \
+  src/cmd_agent_telegram.sh \
+  src/cmd_agent_teambot.sh \
+  src/cmd_agent_pairing.sh \
+  src/cmd_agent_runtime.sh \
   src/cmd_cos.sh \
   src/cmd_skill.sh \
   src/cmd_init.sh \
