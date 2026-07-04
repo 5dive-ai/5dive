@@ -11,6 +11,20 @@ release.
 
 ### Added
 
+- 0.7.9 (DIVE-1009): **pack trust layer — close the plugin-hook gap.** Follow-up to
+  DIVE-995, from the ship-gate security review. Two holes let a pack still auto-run
+  shell on the new agent's tool events despite deny-by-default:
+  - Plugin-carried hooks were disclosed by name but never recursed or stripped. A
+    bundled plugin registering its OWN shell-on-tool-event slipped `--allow-hooks`
+    and installed by default (an incomplete control is worse than none). `agent
+    inspect`/`import` disclosure now recurses plugin-carried hooks (`pluginHooks`)
+    and `import` scrubs any `.hooks` nested in the plugins block unless
+    `--allow-hooks` — same deny-by-default as top-level hooks.
+  - Strip now fires on any NON-EMPTY `.hooks` (not just when a `.command` field is
+    present), so a future CC hook type that executes without `.command` can't slip
+    both the disclosure and the gate. `tests/pack_disclosure_unit.sh` extended
+    (23 assertions).
+
 - 0.7.8 (DIVE-995): **pack trust layer** — the install-time "this pack runs X"
   disclosure and the safety precondition before running any third-party pack.
   New read-only `5dive agent inspect <pack|slug>` unpacks a pack and reports its

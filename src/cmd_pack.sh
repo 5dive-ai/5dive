@@ -451,9 +451,24 @@ _pack_disclosure_json() {
   fi
   jq -n --argjson m "$(cat "$mf")" --argjson r "$renders" --argjson a "$adopts" '
     ($m.hooks // {}) as $h
+    | ($m.plugins // []) as $p
     | [$h | .. | objects | .command? // empty] as $cmds
+    # DIVE-1009 (1): recurse plugin-carried hooks. A bundled plugin can register
+    # its OWN shell-on-tool-event; the top-level $m.hooks scan never sees it. Walk
+    # the plugins structure for any nested hook command AND any non-empty .hooks
+    # block a plugin ships, so a plugin hook is disclosed as an executable surface.
+    | [$p | .. | objects | .command? // empty] as $pcmds
+    | [$p | .. | objects | select(has("hooks")) | .hooks
+           | select(. != null and (. | length) > 0)] as $pHookBlocks
+    # DIVE-1009 (2): defense in depth — flag hooks as present when .hooks is
+    # NON-EMPTY, not merely when it carries a .command. A future CC hook type that
+    # executes without a .command field would otherwise slip both disclosure and
+    # the strip gate. Callers strip on nonEmpty, not just count>0.
     | {
-        hooks:   { count: ($cmds | length), events: ($h | keys), commands: $cmds },
+        hooks:   { count: ($cmds | length), events: ($h | keys),
+                   commands: $cmds, nonEmpty: (($h | length) > 0) },
+        pluginHooks: { count: ($pcmds | length), commands: $pcmds,
+                       present: (($pcmds | length) > 0 or ($pHookBlocks | length) > 0) },
         skills:  ($m.skills  // []),
         plugins: ($m.plugins // []),
         rendersSystemPrompt: $r,
@@ -474,8 +489,23 @@ _pack_disclosure_print() {
   else
     echo "     hooks:   none"
   fi
+  # DIVE-1009: plugin-carried hooks are their own executable surface — a bundled
+  # plugin can auto-run shell on tool events even when top-level hooks is empty.
+  if [[ "$(jq -r '.pluginHooks.present // false' <<<"$d")" == "true" ]]; then
+    warn "PLUGIN HOOKS: bundled plugin(s) ship shell that auto-runs on tool events —"
+    jq -r '.pluginHooks.commands[]? | "        $ " + .' <<<"$d"
+    echo "        (plugin-carried shell; NOT installed unless you pass --allow-hooks)"
+  fi
   echo "     skills:  $(jq -r 'if (.skills|length)>0 then "\(.skills|length) (\(.skills|join(", ")))" else "none" end' <<<"$d")"
-  echo "     plugins: $(jq -r 'if (.plugins|length)>0 then (.plugins|join(", ")) else "none" end' <<<"$d")"
+  # Plugins may be a name-array, an object of enabled plugins ({"p@mkt":true}), or
+  # (hostile) an array of objects carrying hooks — normalize all three to names so
+  # the render never crashes on the exact shape DIVE-1009 hardens against.
+  echo "     plugins: $(jq -r '
+      (.plugins // []) as $p
+      | (if   ($p|type)=="object" then ($p|keys)
+         elif ($p|type)=="array"  then [$p[] | if type=="object" then (.name // "plugin") else tostring end]
+         else [] end) as $names
+      | if ($names|length)>0 then ($names|join(", ")) else "none" end' <<<"$d")"
   echo "     system prompt (CLAUDE.md) re-rendered from persona: $(jq -r '.rendersSystemPrompt' <<<"$d")"
   echo "     seeds recall memory: $(jq -r '.seedsMemory' <<<"$d")"
   echo "     adopts a bundled signing key (owns identity): $(jq -r '.adoptsSigningKey' <<<"$d")"
@@ -992,6 +1022,10 @@ cmd_import() {
   # so an import is never a silent grant of arbitrary capability.
   local disclosure; disclosure=$(_pack_disclosure_json "$stage" 2>/dev/null || echo '{}')
   local disc_hooks; disc_hooks=$(jq -r '.hooks.count // 0' <<<"$disclosure" 2>/dev/null || echo 0)
+  # DIVE-1009: strip on a NON-EMPTY .hooks (not just command count) and cover
+  # plugin-carried hooks — the top-level count alone under-reports the surface.
+  local disc_hooks_nonempty; disc_hooks_nonempty=$(jq -r '.hooks.nonEmpty // false' <<<"$disclosure" 2>/dev/null || echo false)
+  local disc_plugin_hooks;   disc_plugin_hooks=$(jq -r '.pluginHooks.present // false' <<<"$disclosure" 2>/dev/null || echo false)
   if ! (( JSON_MODE )); then
     _pack_disclosure_print "$disclosure"
   fi
@@ -1058,9 +1092,17 @@ cmd_import() {
     # importer explicitly passed --allow-hooks, drop the pack's hooks so a
     # third-party pack can't silently auto-run shell on the new agent's tool
     # events. Disclosed above; stripping is the enforced safety default.
-    if (( ! allow_hooks )) && (( disc_hooks > 0 )); then
-      warn "stripped $disc_hooks hook command(s) from the pack (arbitrary shell) — re-import with --allow-hooks to keep them"
+    if (( ! allow_hooks )) && { (( disc_hooks > 0 )) || [[ "$disc_hooks_nonempty" == "true" ]]; }; then
+      warn "stripped the pack's hooks (arbitrary shell auto-run on tool events) — re-import with --allow-hooks to keep them"
       hooks='{}'
+    fi
+    # DIVE-1009: deny-by-default also covers plugin-carried hooks. A bundled plugin
+    # that ships its own shell-on-tool-event never reaches the $hooks strip above,
+    # so scrub any .hooks block nested in the plugins structure too (no-op for the
+    # common name-ref case; drops the surface for a hostile, hook-bearing plugin).
+    if (( ! allow_hooks )) && [[ "$disc_plugin_hooks" == "true" ]]; then
+      warn "stripped plugin-carried hook(s) from the pack — re-import with --allow-hooks to keep them"
+      plugins=$(jq -c 'walk(if type == "object" then del(.hooks) else . end)' <<<"$plugins" 2>/dev/null || echo "$plugins")
     fi
     cur=$( [[ -f "$sfile" ]] && cat "$sfile" || echo '{}' )
     if jq -n --argjson cur "$cur" \
@@ -1148,7 +1190,10 @@ cmd_import() {
   local mem_note="no memory"
   [[ "$mem_inc" == "distilled" ]] && mem_note="distilled memory -> $mem_seeded"
   local hooks_note="none"
-  (( disc_hooks > 0 )) && { hooks_note="stripped($disc_hooks)"; (( allow_hooks )) && hooks_note="allowed($disc_hooks)"; }
+  if (( disc_hooks > 0 )) || [[ "$disc_hooks_nonempty" == "true" || "$disc_plugin_hooks" == "true" ]]; then
+    local _pn=""; [[ "$disc_plugin_hooks" == "true" ]] && _pn="+plugin"
+    hooks_note="stripped($disc_hooks$_pn)"; (( allow_hooks )) && hooks_note="allowed($disc_hooks$_pn)"
+  fi
   ok "imported '$as' from pack ($mem_note). Skills added: ${#added[@]}, skipped: ${#skipped[@]}; template: $templated; avatar: $avatar_note; hooks: $hooks_note." \
      '{name:$n, type:$t, memory:$mem, memorySeeded:$ms, skillsAdded:$a, skillsSkipped:$s, template:$tpl, avatar:$av, reported:$ri, hooks:$hk, disclosure:$disc}' \
      --arg n "$as" --arg t "$type" --arg mem "$mem_inc" --arg ms "$mem_seeded" --argjson a "$added_j" --argjson s "$skipped_j" --arg tpl "$templated" --arg av "$avatar_note" --arg ri "$reported" --arg hk "$hooks_note" --argjson disc "$disclosure"
