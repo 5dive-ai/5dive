@@ -219,6 +219,20 @@ auto_l = [{"ident": t.get("ident"), "applied": (t.get("need_answer") or "").stri
            "by": t.get("need_answered_by"), "assignee": t.get("assignee") or "unassigned"}
           for t in auto_cleared]
 
+# OSS-10 zero-human KPI: gates a HUMAN answered in the window. Provenance is
+# need_answered_by = 'human:*' (the --human tap/dashboard path); bare agent
+# names are agent-cleared decisions and 'auto:*' is the tier system — neither
+# costs the human anything, so neither counts as a touch.
+human_touches = []
+for t in work:
+    by = t.get("need_answered_by") or ""
+    if by.startswith("human:"):
+        ae = to_epoch(t.get("need_answered_at"))
+        if ae is not None and ae >= since:
+            human_touches.append(t)
+ht_l = [{"ident": t.get("ident"), "type": t.get("need_type"),
+         "answer": (t.get("need_answer") or "").strip()} for t in human_touches]
+
 # Usage: top agents by output tokens + their share-of-limit; flag anyone hot.
 agents = usage_data.get("agents", []) or []
 agents_sorted = sorted(agents, key=lambda a: a.get("output", 0), reverse=True)
@@ -245,6 +259,7 @@ if as_json:
     print(json.dumps({
         "window": {"since": since, "now": now, "label": window_label},
         "done": done_l, "inProgress": ip_l, "blocked": blk_l, "autoCleared": auto_l,
+        "zeroHuman": {"shipped": len(done_l), "humanTouches": len(ht_l), "gates": ht_l},
         "usage": usage_l, "health": {"stale": stale, "hot": [h["name"] for h in hot]},
     }, indent=2))
 else:
@@ -253,6 +268,11 @@ else:
         return s if len(s) <= n else s[: n - 1] + "…"
     out = []
     out.append(f"\U0001F305 5dive standup — last {window_label}")
+    touches = len(ht_l)
+    kpi = f"\U0001F3AF Zero-human: {len(done_l)} shipped · {touches} human touch{'es' if touches != 1 else ''}"
+    if 0 < touches <= 4:
+        kpi += " (" + ", ".join(g["ident"] for g in ht_l) + ")"
+    out.append(kpi)
     out.append("")
     out.append(f"✅ Shipped ({len(done_l)})")
     for t in done_l[:8]:
