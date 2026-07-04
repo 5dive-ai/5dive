@@ -11,6 +11,16 @@ release.
 
 ### Added
 
+- 0.7.7 (DIVE-992): the heartbeat tick prompt now injects **memory recall** and a
+  **compile nudge** from the shared `_hb_wake` seam. Recall: each `/goal` nudge
+  cites the top-k memory/wiki hits most relevant to the task's title+body (BM25
+  over the target agent's own store + shared wiki) so the agent starts warm and
+  can expand a hit with `5dive memory search`. Compile: if the task looks
+  research/knowledge-shaped, the nudge gains a "compile before you close" line
+  (karpathy method) — making compile a runtime behavior, not just a convention.
+  Both are best-effort and flattened to a single line; a failure never blocks the
+  nudge. Covered by tests/heartbeat_recall_compile_unit.sh.
+
 - 0.7.6 (DIVE-981): `5dive project show` now renders the task_deps dependency
   graph — tasks grouped into topological layers (L0, L1, …) with inline blockers
   and a marked critical path (the longest end-to-end chain). `--json` gains a

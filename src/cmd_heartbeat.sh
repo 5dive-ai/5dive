@@ -494,6 +494,47 @@ _hb_reclaim() {
   printf '%s %s\n' "$reclaimed" "$escalated"
 }
 
+# DIVE-992 (OSS-5 item 5) — Recall. Compact, single-line citation of the memory
+# hits most relevant to the task being nudged. Search is cheap, so every tick we
+# inject the top-k "slug › heading" pointers into the /goal prompt: the agent
+# starts the task already knowing which memories to expand (with `5dive memory
+# search`) instead of rediscovering them. Best-effort by construction — any
+# failure (no node, no stores, no query, zero hits) yields the empty string and
+# NEVER blocks the nudge. Single line by construction: the nudge is one tmux
+# send-keys line, so we join hits with "; " and strip newlines.
+_hb_recall_cite() {
+  local name="$1" query="$2" k="${3:-3}"
+  [[ -n "$query" ]] || { echo ""; return 0; }
+  command -v node >/dev/null 2>&1 || { echo ""; return 0; }
+  local out=""
+  # --agent scopes the target agent's own 0600 store (we run as root here) plus
+  # the shared wiki (store=all default) — exactly the agent's own recall surface.
+  out=$(_memory_search "$query" --agent="$name" --limit="$k" --max-tokens=300 2>/dev/null) || out=""
+  [[ -n "$out" ]] || { echo ""; return 0; }
+  # Keep only the "[score] relpath › heading" provenance lines; drop the score,
+  # cap to k, one line. `|| true` so a no-match grep can't trip set -e.
+  local cites
+  cites=$(printf '%s\n' "$out" \
+            | grep -oE '^\[[0-9.]+\] .+' \
+            | sed -E 's/^\[[0-9.]+\] +//' \
+            | head -n "$k" \
+            | paste -sd '@' - 2>/dev/null) || cites=""
+  # Flatten any stray newlines and turn the join marker into "; ".
+  cites=$(printf '%s' "$cites" | tr '\n' ' ' | sed 's/@/; /g')
+  echo "$cites"
+}
+
+# DIVE-992 (OSS-5 item 2) — Compile. Does this task look research/knowledge-
+# shaped? If so, the tick nudge gains a "compile before you close" line so the
+# karpathy method becomes a RUNTIME behavior (injected into the tick) rather than
+# a convention that rots in chat. Keyword sniff over title+body — deliberately
+# broad; a false positive just adds one reminder line.
+_hb_is_knowledge_task() {
+  local text="$1"
+  printf '%s' "$text" \
+    | grep -qiE 'research|digest|competitor|market (scan|intel|research)|\bintel\b|analy[sz]|\bfindings\b|survey|benchmark|landscape|write-?up|\bwiki\b|knowledge|investigat|\brecap\b|\bstudy\b'
+}
+
 # Wake one agent: ensure it's running, optionally clear context, send the nudge.
 # $3 is the concrete DIVE id (highest-priority todo) the tick picked for this
 # agent — scoping the /goal to one known id makes its completion check reliable
@@ -524,6 +565,23 @@ _hb_wake() {
   # soft, model-judged guard — it does NOT reliably halt a runaway loop, so the
   # real hard cap is the deterministic stale-in_progress reaper in the tick.
   local nudge="/goal Task ${task_ident} shows status done or cancelled, or is blocked with a human gate filed, on the 5dive board (verify ONLY by running: 5dive task show ${task_ident}). To achieve it: claim it with '5dive task start ${task_ident}', do the work, then close it with '5dive task done ${task_ident} --result=\"<one or two self-contained sentences — any output the creator needs to see; the dashboard and creator read this>\"'. If it needs a human decision, approval, a secret, or a manual step only a person can do, do NOT cancel — file a gate that pings the owner: '5dive task need ${task_ident} --type=decision --ask=\"<what you need from them>\"' (use --type=approval|secret|manual as fits). Keep the ask to ONE crisp question + ~1 line of essential context — put heavy detail in the task BODY, not the ask — and ALWAYS surface your recommended choice with --recommend=\"<option>\" (and --options=A|B for a decision) so the owner sees the advised answer first. Only if the task is genuinely irrelevant or impossible, run '5dive task cancel ${task_ident} --result=\"<why>\"'. Work ONLY this one task — do not start any other. Stop after 6 turns."
+
+  # DIVE-992: enrich the tick prompt from the shared seam. Pull the task's
+  # title+body once, then (a) cite the most relevant memory hits so the agent
+  # starts warm, and (b) if it looks knowledge-shaped, remind it to compile
+  # before closing. Both are best-effort — a failure here must never block the
+  # nudge, so each is guarded and flattened to keep the nudge a single line.
+  local task_text="" recall="" compile_hint=""
+  task_text=$(db "SELECT COALESCE(title,'') || ' ' || COALESCE(body,'') FROM tasks WHERE id=${task_id};" 2>/dev/null | tr '\n' ' ') || task_text=""
+  if [[ -n "$task_text" ]]; then
+    recall=$(_hb_recall_cite "$name" "$task_text" 3) || recall=""
+    if _hb_is_knowledge_task "$task_text"; then
+      compile_hint=" This task looks knowledge-shaped: before you close it, COMPILE the durable, non-obvious findings to the team wiki per the karpathy method (compile-knowledge skill, or '5dive memory add --store=wiki' + an index line) — compiling is part of done, not a separate chore."
+    fi
+  fi
+  [[ -n "$recall" ]] && nudge="${nudge} Relevant memory to check first (verify before relying; re-search with '5dive memory search'): ${recall}."
+  [[ -n "$compile_hint" ]] && nudge="${nudge}${compile_hint}"
+
   _hb_send_line "$name" "$nudge" || { _hb_log "[$name] nudge send failed"; return 1; }
   return 0
 }
