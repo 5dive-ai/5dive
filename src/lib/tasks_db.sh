@@ -39,6 +39,9 @@ require_sqlite() {
 # Idempotent schema. CREATE IF NOT EXISTS throughout, so re-applying it on
 # every command is cheap and self-heals a fresh box. DIVE-N idents come from
 # a trigger off the autoincrement rowid.
+# NOTE: projects/loop_runs/supervisor_events are ALSO defined inside gated
+# one-shot migration blocks in _tasks_db_migrate() below — edit both copies
+# together; tests/schema_sync_unit.sh fails CI if they diverge.
 _tasks_schema() {
   cat <<'SQL'
 PRAGMA journal_mode=WAL;

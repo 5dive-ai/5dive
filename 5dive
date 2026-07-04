@@ -26,7 +26,7 @@ esac
 
 # Bumped on every public release. `build.sh` checks this line exists; CI fails
 # the bundle-drift check if it's missing or empty.
-readonly FIVE_VERSION="0.6.12"
+readonly FIVE_VERSION="0.6.13"
 
 # GitHub org our repos live under. The org is being renamed
 # 5dive-com -> 5dive-ai (2026-06); fetches must work on either side of the
@@ -2184,6 +2184,9 @@ require_sqlite() {
 # Idempotent schema. CREATE IF NOT EXISTS throughout, so re-applying it on
 # every command is cheap and self-heals a fresh box. DIVE-N idents come from
 # a trigger off the autoincrement rowid.
+# NOTE: projects/loop_runs/supervisor_events are ALSO defined inside gated
+# one-shot migration blocks in _tasks_db_migrate() below — edit both copies
+# together; tests/schema_sync_unit.sh fails CI if they diverge.
 _tasks_schema() {
   cat <<'SQL'
 PRAGMA journal_mode=WAL;
