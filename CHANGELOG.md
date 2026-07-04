@@ -9,9 +9,14 @@ release.
 
 ## [Unreleased]
 
+_Nothing yet. New changes accumulate here until they're cut into a tagged
+release._
+
+## [0.7.9] - 2026-07-04
+
 ### Added
 
-- 0.7.9 (DIVE-1009): **pack trust layer — close the plugin-hook gap.** Follow-up to
+- DIVE-1009: **pack trust layer — close the plugin-hook gap.** Follow-up to
   DIVE-995, from the ship-gate security review. Two holes let a pack still auto-run
   shell on the new agent's tool events despite deny-by-default:
   - Plugin-carried hooks were disclosed by name but never recursed or stripped. A
@@ -25,7 +30,11 @@ release.
     both the disclosure and the gate. `tests/pack_disclosure_unit.sh` extended
     (23 assertions).
 
-- 0.7.8 (DIVE-995): **pack trust layer** — the install-time "this pack runs X"
+## [0.7.8] - 2026-07-04
+
+### Added
+
+- DIVE-995: **pack trust layer** — the install-time "this pack runs X"
   disclosure and the safety precondition before running any third-party pack.
   New read-only `5dive agent inspect <pack|slug>` unpacks a pack and reports its
   executable surface: hooks (arbitrary shell that auto-runs on the new agent's
@@ -38,7 +47,11 @@ release.
   item 5's mandatory install disclosure; identity/receipts (item 4) + install
   counts + a PUBLIC marketplace remain split (lodar brand/security decision).
 
-- 0.7.7 (DIVE-992): the heartbeat tick prompt now injects **memory recall** and a
+## [0.7.7] - 2026-07-04
+
+### Added
+
+- DIVE-992: the heartbeat tick prompt now injects **memory recall** and a
   **compile nudge** from the shared `_hb_wake` seam. Recall: each `/goal` nudge
   cites the top-k memory/wiki hits most relevant to the task's title+body (BM25
   over the target agent's own store + shared wiki) so the agent starts warm and
@@ -48,14 +61,22 @@ release.
   Both are best-effort and flattened to a single line; a failure never blocks the
   nudge. Covered by tests/heartbeat_recall_compile_unit.sh.
 
-- 0.7.6 (DIVE-981): `5dive project show` now renders the task_deps dependency
+## [0.7.6] - 2026-07-04
+
+### Added
+
+- DIVE-981: `5dive project show` now renders the task_deps dependency
   graph — tasks grouped into topological layers (L0, L1, …) with inline blockers
   and a marked critical path (the longest end-to-end chain). `--json` gains a
   `data.graph` block (nodes with layer/critical/blockers, edge count, layer
   count, and the reconstructed `critical_path`) so a plan can be audited at a
   glance. Covered by tests/project_show_graph_unit.sh.
 
-- 0.7.5 (DIVE-973): stuck-lane analytics in the daily digest — MTTU
+## [0.7.5] - 2026-07-04
+
+### Added
+
+- DIVE-973: stuck-lane analytics in the daily digest — MTTU
   (mean-time-to-unstick). Sourced from the supervisor_events transition trail
   (which folds in loop_runs.stuck onsets as cause=loop-stuck): each stuck
   episode is a transition into classification=stuck paired with the next
@@ -64,7 +85,12 @@ release.
   (mttuSec/episodes/openStuck/byCause); the text digest adds an "Unstick" line
   plus a still-stuck callout. Same spirit as the zero-human KPI, zero agent
   tokens.
-- 0.7.4 (DIVE-993): `5dive hire <role> --from-market` — one command from the
+
+## [0.7.4] - 2026-07-04
+
+### Added
+
+- DIVE-993: `5dive hire <role> --from-market` — one command from the
   open market to an employed teammate. Resolves <role> against the character-pack
   registry (rarity + completeness-tiered pick), provisions from that persona via
   the `agent import` slug path, and slots the new hire into the org chart under
@@ -72,7 +98,11 @@ release.
   `--role`/`--title` override the org placement; other flags pass through to
   `agent import`.
 
-- 0.7.3 (DIVE-991): memory hygiene. New `5dive memory doctor` and a `memory`
+## [0.7.3] - 2026-07-04
+
+### Added
+
+- DIVE-991: memory hygiene. New `5dive memory doctor` and a `memory`
   category in `5dive doctor` run a hygiene pass over per-agent memory stores +
   the shared wiki: index drift (MEMORY.md/index.md vs files on disk — missing
   targets are errors, unindexed files warnings), dangling `[[wiki-links]]`,
@@ -83,7 +113,11 @@ release.
   itemized list. Pure scanner shared by both, unit-tested in
   tests/memory_doctor_unit.sh.
 
-- 0.7.2 (DIVE-990): memory-as-onboarding. `agent create --inherit-memory=<scope>`
+## [0.7.2] - 2026-07-04
+
+### Added
+
+- DIVE-990: memory-as-onboarding. `agent create --inherit-memory=<scope>`
   seeds a new hire's recall store from shared team knowledge so it boots knowing
   the company instead of cold-starting. Scope is a comma-list of sources — `wiki`
   (the shared team wiki), a sibling `<agent-name>` (its SHAREABLE facts only —
@@ -92,16 +126,28 @@ release.
   agent's own store with a regenerated MEMORY.md index, so `5dive memory search`
   returns team context from the first minute.
 
-- 0.7.1 (DIVE-989): verifier-by-default now walks a chain of DISTINCT graders
+## [0.7.1] - 2026-07-04
+
+### Added
+
+- DIVE-989: verifier-by-default now walks a chain of DISTINCT graders
   (project lead, coordinator, maker's manager, org root, technical deputy) and
   takes the first that differs from the maker, so the default no longer silently
   no-ops in the common maker==coordinator case (a lone-root CEO owning all
   unassigned work). Adds _task_resolve_org_root + _task_resolve_deputy.
 
-- 0.7.0 (goal decomposition GA): the `5dive goal` line graduates — decompose an
+## [0.7.0] - 2026-07-04
+
+### Added
+
+- Goal decomposition GA: the `5dive goal` line graduates — decompose an
   outcome into a validated task DAG that materializes ONLY on a human-approved
   checkpoint (DIVE-984 planner + DIVE-985 approve->materialize). Version milestone;
-  the capability shipped incrementally across 0.6.20-0.6.28.
+  the capability shipped incrementally across 0.6.19-0.6.28.
+
+## [0.6.28] - 2026-07-04
+
+### Added
 
 - DIVE-985: `5dive goal add --from-gate=<id>` completes the approve->materialize
   loop for a gated plan. `--yes` waives ONLY the count checkpoint, so a plan
@@ -115,12 +161,18 @@ release.
   now also files its checkpoint gate at HARD tier 2 (was a plain tier-1 decision),
   so it can no longer be 48h-auto-applied or agent-cleared.
 
+## [0.6.27] - 2026-07-04
+
+### Added
+
 - OSS-14: weekly autonomy report. `5dive digest` (esp. `--7d`) gains a one-glance
   "🦾 Autonomy — ran N days without needing you · shipped X · asked you Y×" line
   plus an `autonomy` JSON block (uptimeDays = days since the last human-blocking
   stall, shipped/asked for the window, priorShipped/priorAsked for the trend, and
   currentlyBlocked). Deterministic, rides the existing digest python, zero agent
   tokens — the marketing-flagship framing of the OSS-10 zero-human numbers.
+
+## [0.6.26] - 2026-07-04
 
 ### Security
 
@@ -142,6 +194,8 @@ release.
   scoped allowlist applies to new admins/fresh boxes). New
   `tests/agent_isolation_unit.sh` (15/15).
 
+## [0.6.24] - 2026-07-04
+
 ### Added
 
 - OSS-12: gate SLA escalation — an unanswered T2 gate walks the org chart
@@ -152,6 +206,11 @@ release.
   Reuses `gate_pinged_at` + the heartbeat tick as the driver; NEVER auto-answers
   a T2 gate (escalation changes who is pinged, not what clears). New
   `tests/heartbeat_gate_escalate_unit.sh` (5/5).
+
+## [0.6.23] - 2026-07-04
+
+### Added
+
 - DIVE-979: dependency-aware heartbeat scheduling. The per-agent wake now picks
   the next task through `_hb_pick_task`, which (a) SKIPS any todo whose
   `task_deps` still has an open blocker (a `blocked_by` task not yet
@@ -161,6 +220,25 @@ release.
   stays the primary key; critical-path depth is the tiebreaker, then id. The
   urgent/high early-wake probe is likewise gated on being blocker-free. New
   `tests/heartbeat_pick_unit.sh` (7/7) covers the dep graph end to end.
+
+## [0.6.22] - 2026-07-04
+
+### Added
+
+- DIVE-972: enforceable per-loop token ceilings. `task loop start`/`loop spawn`
+  now honor a per-loop token budget — a running loop that reaches its ceiling is
+  stopped and flagged instead of burning unbounded tokens, and the daily digest
+  surfaces each loop's burn against its ceiling so overspend is visible. Closes
+  the "runaway loop" gap flagged on the budget-enforcement track.
+
+### Fixed
+
+- Pre-existing shellcheck SC1072/SC1073 in `cmd_supervisor.sh` (a DIVE-971
+  artifact) cleaned up to keep the lint gate green.
+
+## [0.6.21] - 2026-07-04
+
+### Added
 
 - DIVE-971: multi-runtime supervisor signals — closes the three supervision
   TODO(P2)s in `cmd_supervisor.sh`. (1) The telegram-poller liveness probe now
@@ -179,6 +257,10 @@ release.
   `drift` is observe-only — guarded out of the P2 act ladder so no rung, not
   even escalate, can fire on it (no false-stuck regressions on claude agents).
 
+## [0.6.20] - 2026-07-04
+
+### Added
+
 - DIVE-969: verifier-by-default posture (Karpathy autonomy slider). `task add`
   now engages maker->grader verification BY DEFAULT for non-trivial standard
   tasks: it derives acceptance criteria from the title and assigns a grader
@@ -189,12 +271,20 @@ release.
   frictionless. `--no-verify` is the explicit opt-out; `FIVE_VERIFY_DEFAULT=0` is
   a fleet kill-switch. Add output carries `verifyDefaulted` + `verifier`.
 
+## [0.6.19] - 2026-07-04
+
+### Added
+
 - DIVE-984: `5dive goal add "<outcome>"` — goal decomposition v1 (OSS-2). A
   planner agent (via `loop spawn --wait --schema`) turns an outcome into a
   materialized task graph: tasks + `task_deps` edges + assignees under a project.
   Guardrails: hard task/depth cap (reject, never truncate), no tier-lowering
   (reuses the Tier-2 category-floor classifier), a one-gate human checkpoint over
   the count threshold or any Tier-2 task, and `--dry-run` that creates nothing.
+
+## [0.6.18] - 2026-07-04
+
+### Added
 
 - DIVE-976: decision-memory precedent prefill (OSS-11) — when a new gate matches
   a prior ANSWERED gate (same need_type, exact normalized ask-shape, precedent
@@ -205,6 +295,10 @@ release.
   holds by construction. Adds `ask_shape`/`precedent_ref` columns + an
   acceptance-rate digest line.
 
+## [0.6.15] - 2026-07-04
+
+### Added
+
 - DIVE-968: implement `5dive loop status --handle=<loopId>` — the read-only
   single-loop drilldown that complements the fleet-wide `task loops` board.
   Reports topology/stage/iteration/tokens-vs-ceiling/status plus each backing
@@ -212,6 +306,10 @@ release.
   running loop at/over ceiling, or with no heartbeat for the stall window).
   Pure read (never spawns/mutates/block-waits), JSON in / JSON out. Retires the
   last `_loop_todo` WIP stub, so no "not yet implemented" verb ships.
+
+## [0.6.11] - 2026-07-04
+
+_Gate-hardening line 0.6.9-0.6.11, merged as `dive-916-931-gate-nonce`._
 
 ### Security
 
@@ -258,6 +356,11 @@ release.
   closes cleanly across every runtime — no plugin/fork change needed. A
   non-`done` answer still clears the gate → `todo` (the resume path), and loop
   GATE steps are exempt (their manual answer still drives the relay advance).
+
+## [0.6.6] - 2026-07-03
+
+### Changed
+
 - DIVE-906 (create-path token hygiene, part 2 of DIVE-888): `agent create`
   now accepts `--telegram-token=-` and `--discord-token=-`, reading the bot
   token from stdin (same `-` sentinel as `--api-key=-` / `config set
@@ -270,6 +373,8 @@ release.
   are supplied; the channel token then stays inline as the documented
   residual).
 
+## [0.6.5] - 2026-07-02
+
 ### Fixed
 
 - DIVE-901: `agent install antigravity` no longer flakes with "agy still
@@ -279,7 +384,8 @@ release.
   even though agy works — the same class as grok's opportunistic-symlink gap.
   The recipe now ensures the TYPE_BIN symlink itself, and the install guard
   gives any type's binary a 10s grace for async/late-rename installer drops.
-  Version 0.6.4 -> 0.6.5.
+
+## [0.6.4] - 2026-07-02
 
 ### Added
 
@@ -290,7 +396,9 @@ release.
   Fable sessions, so it is inert on every other model. New
   `model-tiering-CLAUDE.md` shipped to $LIB_DIR by install.sh; appended (not
   copied) after the telegram fragment so both survive. From the DIVE-881
-  sniff-test verdict. Version 0.6.3 -> 0.6.4.
+  sniff-test verdict.
+
+## [0.6.3] - 2026-07-02
 
 ### Added
 
@@ -305,7 +413,8 @@ release.
   `memory add --store=wiki` (deny-by-default, the DIVE-481 distillation-gate
   posture); `--agent` therefore resolves for root only. Cached inverted index
   deferred until stores outgrow a few thousand chunks; embeddings stay Phase 1c.
-  Version 0.6.2 -> 0.6.3.
+
+## [0.6.2] - 2026-07-02
 
 ### Fixed
 
@@ -315,7 +424,9 @@ release.
   a human login — claude/root clears approval/secret gates on the human path).
   Companion telegram-plugin 0.5.10 change: a failed gate tap replies with the
   same on-box line instead of "open the dashboard" (lodar hit this live on
-  DIVE-790, CLI-only box). Version 0.6.1 -> 0.6.2.
+  DIVE-790, CLI-only box).
+
+## [0.6.1] - 2026-07-02
 
 ### Added
 
@@ -323,7 +434,12 @@ release.
   read-path. BM25-ranked snippets from the agent's markdown memory stores (+ the
   shared wiki when present), section-chunked for provenance and capped at a token
   ceiling. Lexical-first (no embeddings, no new dependency, nothing leaves the
-  box); read-only. Version bumped 0.6.0 → 0.6.1.
+  box); read-only.
+
+## [0.6.0] - 2026-07-02
+
+### Added
+
 - DIVE-891: risk-tiered human gates + TTL (adopted design DIVE-861). `task
   need` takes `--tier=0|1|2`: tier 0 auto-applies the recommendation
   immediately (no ping — the daily digest's new "Auto-cleared gates" section
@@ -340,6 +456,10 @@ release.
   "revisit later" stops sitting in the human inbox. New additive tasks.db
   columns: `tier`, `need_asked_at`, `gate_pinged_at`, `wake_at`.
 
+## [0.5.9] - 2026-07-02
+
+### Added
+
 - DIVE-880: bot tokens can now be passed on stdin instead of argv, so they
   never land in `/proc/<pid>/cmdline`, shelld's audit log, or server access
   logs. `agent telegram-getme --token=-` and `agent telegram-discover
@@ -350,11 +470,19 @@ release.
   `stdin` field. Only one `=-` key can be read per invocation (stdin is
   consumed once).
 
+## [0.5.8] - 2026-07-02
+
+### Added
+
 - DIVE-860: `task loop ls` surfaces the latest grade scorecard per builder
   loop run. JSON rows gain `scorecard_json` (raw card string, `''` when
   ungraded — same contract as the `task loops` runs board), joined from
   `loop_runs` by the card's `target` ident; the text board gains a `score`
   column (`84/100` style). Feeds the dashboard Loops tab score chips.
+
+## [0.5.5] - 2026-07-02
+
+### Added
 
 - DIVE-856: claude agents are chat-capable in the web dashboard by default.
   `agent create` folds the token-free `dashboard` channel into every claude
