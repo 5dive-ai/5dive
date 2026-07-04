@@ -297,11 +297,39 @@ def _htok(n):
 
 window_label = "7 days" if window >= 604800 else "24h"
 
+# OSS-14: one-glance autonomy rollup — "ran N days, shipped X, asked you Y",
+# with trend vs the prior window. Deterministic, from data already loaded; the
+# marketing-flagship framing of the OSS-10 zero-human numbers. Zero agent tokens.
+def _window_counts(lo, hi):
+    ship = sum(1 for t in work if t.get("status") == "done"
+               and lo <= (to_epoch(t.get("done_at")) or -1) < hi)
+    ask = sum(1 for t in work
+              if (t.get("need_answered_by") or "").startswith("human:")
+              and lo <= (to_epoch(t.get("need_answered_at")) or -1) < hi)
+    return ship, ask
+prev_ship, prev_ask = _window_counts(since - window, since)
+# uptime = days since the last human-blocking stall. An open gate right now means
+# not-autonomous this instant (0); else days since the most recent gate was filed;
+# else (never needed a human) the streak runs since the company's first task.
+if blocked:
+    uptime_days = 0
+else:
+    _asked = [x for x in (to_epoch(t.get("need_asked_at")) for t in work if t.get("need_asked_at")) if x]
+    if _asked:
+        uptime_days = max(0, (now - max(_asked)) // 86400)
+    else:
+        _born = [x for x in (to_epoch(t.get("created_at")) for t in work if t.get("created_at")) if x]
+        uptime_days = max(0, (now - min(_born)) // 86400) if _born else 0
+autonomy = {"uptimeDays": uptime_days, "currentlyBlocked": bool(blocked),
+            "shipped": len(done_l), "asked": len(ht_l),
+            "priorShipped": prev_ship, "priorAsked": prev_ask, "windowLabel": window_label}
+
 if as_json:
     print(json.dumps({
         "window": {"since": since, "now": now, "label": window_label},
         "done": done_l, "inProgress": ip_l, "blocked": blk_l, "autoCleared": auto_l,
         "zeroHuman": {"shipped": len(done_l), "humanTouches": len(ht_l), "gates": ht_l},
+        "autonomy": autonomy,
         "precedentPrefill": {"count": len(prefilled), "accepted": len(accepted),
                              "acceptanceRate": prefill_rate},
         "usage": usage_l, "health": {"stale": stale, "hot": [h["name"] for h in hot]},
@@ -318,6 +346,14 @@ else:
     if 0 < touches <= 4:
         kpi += " (" + ", ".join(g["ident"] for g in ht_l) + ")"
     out.append(kpi)
+    def _trend(cur, prev):
+        d = cur - prev
+        arrow = "↑" if d > 0 else ("↓" if d < 0 else "→")
+        return f" ({arrow}{abs(d)} vs {prev} prior {window_label})"
+    _up = ("currently waiting on you" if autonomy["currentlyBlocked"]
+           else f"ran {autonomy['uptimeDays']}d without needing you")
+    out.append(f"\U0001F9BE Autonomy — {_up} · shipped {len(done_l)}{_trend(len(done_l), prev_ship)}"
+               f" · asked you {len(ht_l)}×{_trend(len(ht_l), prev_ask)}")
     out.append("")
     out.append(f"✅ Shipped ({len(done_l)})")
     for t in done_l[:8]:

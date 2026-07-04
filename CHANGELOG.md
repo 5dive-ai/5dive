@@ -9,6 +9,15 @@ release.
 
 ## [Unreleased]
 
+### Added
+
+- OSS-14: weekly autonomy report. `5dive digest` (esp. `--7d`) gains a one-glance
+  "🦾 Autonomy — ran N days without needing you · shipped X · asked you Y×" line
+  plus an `autonomy` JSON block (uptimeDays = days since the last human-blocking
+  stall, shipped/asked for the window, priorShipped/priorAsked for the trend, and
+  currentlyBlocked). Deterministic, rides the existing digest python, zero agent
+  tokens — the marketing-flagship framing of the OSS-10 zero-human numbers.
+
 ### Security
 
 - DIVE-1002: least-privilege agent isolation. New agents now default to
