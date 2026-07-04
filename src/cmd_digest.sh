@@ -135,8 +135,14 @@ cmd_digest() {
   _digest_run usage --json >"$tmpd/usage.json" 2>/dev/null || echo '{"data":{"agents":[],"tasks":[]}}' >"$tmpd/usage.json"
   [ -s "$tmpd/usage.json" ] || echo '{"data":{"agents":[],"tasks":[]}}' >"$tmpd/usage.json"
   _digest_run heartbeat ls >"$tmpd/hb.txt" 2>/dev/null || : >"$tmpd/hb.txt"
+  # DIVE-972: per-loop token burn (cost side of the loop control window). --all
+  # so a loop that finished (done/escalated/killed) in the window still reports
+  # its final burn, not just the currently-running set.
+  _digest_run usage loops --by-loop --all --json >"$tmpd/loops.json" 2>/dev/null || echo '{"data":{"loops":[]}}' >"$tmpd/loops.json"
+  [ -s "$tmpd/loops.json" ] || echo '{"data":{"loops":[]}}' >"$tmpd/loops.json"
 
   DIGEST_TASKS_F="$tmpd/tasks.json" DIGEST_USAGE_F="$tmpd/usage.json" DIGEST_HB_F="$tmpd/hb.txt" \
+  DIGEST_LOOPS_F="$tmpd/loops.json" \
   DIGEST_WINDOW="$window" DIGEST_JSON="$as_json" python3 - >"$tmpd/out.txt" <<'PY'
 import os, json, time, datetime as dt
 
@@ -269,6 +275,26 @@ for ln in hb.splitlines()[1:]:
     if len(cols) >= 4 and cols[1] == "on" and cols[3] == "no":
         stale.append(cols[0])
 
+# DIVE-972: per-loop token burn. loops[].tokens is the live spend; a loop whose
+# spend has reached its ceiling was halted (advisory ceiling is now enforced).
+loops_data = load("DIGEST_LOOPS_F", {"loops": []})
+loops_all = loops_data.get("loops", []) if isinstance(loops_data, dict) else []
+loops_burn = sorted(
+    [{"loopId": l.get("loop_id"), "topology": l.get("topology"),
+      "status": l.get("status"), "tokens": int(l.get("tokens") or 0),
+      "ceiling": (int(l["ceiling"]) if l.get("ceiling") not in (None, "") else None),
+      "atCeiling": bool(l.get("ceiling") not in (None, "") and int(l.get("tokens") or 0) >= int(l["ceiling"]))}
+     for l in loops_all],
+    key=lambda x: x["tokens"], reverse=True)
+loops_total = sum(l["tokens"] for l in loops_burn)
+loops_capped = [l for l in loops_burn if l["atCeiling"]]
+
+def _htok(n):
+    n = n or 0
+    if n >= 1_000_000: return f"{n/1_000_000:.1f}M"
+    if n >= 1_000: return f"{n/1_000:.1f}k"
+    return str(n)
+
 window_label = "7 days" if window >= 604800 else "24h"
 
 if as_json:
@@ -279,6 +305,7 @@ if as_json:
         "precedentPrefill": {"count": len(prefilled), "accepted": len(accepted),
                              "acceptanceRate": prefill_rate},
         "usage": usage_l, "health": {"stale": stale, "hot": [h["name"] for h in hot]},
+        "loops": {"total": loops_total, "capped": len(loops_capped), "byLoop": loops_burn},
     }, indent=2))
 else:
     def short(s, n=60):
@@ -324,6 +351,16 @@ else:
         out.append("")
         out.append(f"\U0001F9E0 Precedent prefills ({len(prefilled)}) — "
                    f"{prefill_rate}% kept the prefilled rec ({len(accepted)}/{len(prefilled)})")
+    if loops_burn:
+        out.append("")
+        cap_note = f", {len(loops_capped)} hit ceiling" if loops_capped else ""
+        out.append(f"\U0001F504 Loop burn ({_htok(loops_total)} tok{cap_note})")
+        for l in loops_burn[:6]:
+            ceil = _htok(l["ceiling"]) if l["ceiling"] is not None else "∞"
+            flag = " ⛔ ceiling" if l["atCeiling"] else ""
+            out.append(f"  • {l['loopId']} [{l['topology']}] {_htok(l['tokens'])}/{ceil} — {l['status']}{flag}")
+        if len(loops_burn) > 6:
+            out.append(f"  … +{len(loops_burn) - 6} more")
     out.append("")
     if hot:
         out.append("⚠️ Rate-limit watch: " +

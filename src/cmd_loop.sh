@@ -77,6 +77,110 @@ _loop_eff_ceiling() {
   printf '%s' "$_LOOP_CEILING_BUILTIN"
 }
 
+# --- live token accounting (DIVE-972: advisory ceiling -> enforceable) --------
+# The ceiling was a no-op because nothing ever wrote loop_runs.tokens_spent — it
+# defaulted to 0 forever, so every `spent >= ceiling` test read 0 and never
+# fired. These helpers implement design §4's "re-read tokens_spent (summed via
+# the existing usage plumbing for the child tasks' agents)": we recompute the
+# real spend from the child tasks' assignees' transcripts (same limit-moving
+# metric as `5dive usage` — input+output+cache-write, cache-read excluded) and
+# persist it, turning the token ceiling from advisory into a hard stop.
+
+# _loop_refresh_spend <loop_id> — recompute + persist tokens_spent from the real
+# transcript usage of this loop's child tasks; echoes the fresh integer. Heavy
+# (scans transcripts), so callers in the hot --wait poll go through _loop_spent,
+# which throttles; the heartbeat sweep calls this directly (once per tick).
+_loop_refresh_spend() {
+  local loop_id="$1"
+  local row; row=$(db "SELECT COALESCE(child_task_ids,'[]')||'|'||COALESCE(started_at,0) FROM loop_runs WHERE loop_id=$(sqlq "$loop_id");")
+  [[ -n "$row" ]] || { printf '0'; return; }
+  local kids="${row%|*}" since="${row##*|}"
+  [[ "$kids" == "[]" || -z "$kids" ]] && { printf '%s' "$(db "SELECT COALESCE(tokens_spent,0) FROM loop_runs WHERE loop_id=$(sqlq "$loop_id");")"; return; }
+  local dbp="${TASKS_DB:-${STATE_DIR}/tasks/tasks.db}" spent
+  spent=$(REGISTRY="$REGISTRY" TASK_DB="$dbp" LOOP_KIDS="$kids" LOOP_SINCE="${since:-0}" python3 - <<'PY' 2>/dev/null || printf '0'
+import os, json, glob, time, sqlite3, datetime as dt, pwd
+since = int(os.environ.get("LOOP_SINCE") or 0)
+now = int(time.time())
+try:    kids = [int(x) for x in json.loads(os.environ.get("LOOP_KIDS") or "[]")]
+except Exception: kids = []
+if not kids:
+    print(0); raise SystemExit
+def to_epoch(s):
+    if not s: return None
+    s = s.strip()
+    try:
+        if s.endswith("Z"): s = s[:-1] + "+00:00"
+        d = dt.datetime.fromisoformat(s.replace(" ", "T", 1) if " " in s and "T" not in s else s)
+        if d.tzinfo is None: d = d.replace(tzinfo=dt.timezone.utc)
+        return int(d.timestamp())
+    except Exception: return None
+# child tasks -> assignee + window
+wins = {}
+try:
+    con = sqlite3.connect(os.environ["TASK_DB"]); con.row_factory = sqlite3.Row
+    q = "SELECT id,assignee,started_at,done_at FROM tasks WHERE id IN (%s)" % ",".join("?"*len(kids))
+    for r in con.execute(q, kids).fetchall():
+        a = r["assignee"];  s = to_epoch(r["started_at"])
+        if not a or s is None: continue
+        e = to_epoch(r["done_at"]) or now
+        wins.setdefault(a, []).append({"start": max(s, since), "end": e, "tok": 0})
+    con.close()
+except Exception: pass
+for a in wins: wins[a].sort(key=lambda w: w["start"], reverse=True)
+try:    reg = json.load(open(os.environ["REGISTRY"]))
+except Exception: reg = {"agents": {}}
+try:    _HOME_OVR = json.loads(os.environ.get("LOOP_HOME_OVERRIDE_JSON") or "{}")
+except Exception: _HOME_OVR = {}
+def home_of(name):
+    if name in _HOME_OVR: return _HOME_OVR[name]  # test hook; unset in production
+    try: return pwd.getpwnam("agent-"+name).pw_dir
+    except KeyError: return "/home/agent-"+name
+total = 0
+for name, ws in wins.items():
+    if reg.get("agents", {}).get(name, {}).get("type", "claude") != "claude": continue
+    lo = min(w["start"] for w in ws)
+    for path in glob.glob(os.path.join(home_of(name), ".claude", "projects", "*", "*.jsonl")):
+        try:
+            if os.path.getmtime(path) < lo: continue
+            f = open(path, "r", errors="ignore")
+        except OSError: continue
+        with f:
+            for line in f:
+                if '"usage"' not in line or '"assistant"' not in line: continue
+                try: o = json.loads(line)
+                except Exception: continue
+                if o.get("type") != "assistant": continue
+                ts = to_epoch(o.get("timestamp"))
+                if ts is None: continue
+                u = (o.get("message") or {}).get("usage") or {}
+                tot = int(u.get("input_tokens") or 0)+int(u.get("output_tokens") or 0)+int(u.get("cache_creation_input_tokens") or 0)
+                for w in ws:  # newest-started window wins (matches usage_collect)
+                    if w["start"] <= ts <= w["end"]:
+                        w["tok"] += tot; break
+    total += sum(w["tok"] for w in ws)
+print(int(total))
+PY
+)
+  [[ "$spent" =~ ^[0-9]+$ ]] || spent=0
+  db "UPDATE loop_runs SET tokens_spent=${spent}, updated_at=$(date +%s) WHERE loop_id=$(sqlq "$loop_id");" >/dev/null 2>&1 || true
+  printf '%s' "$spent"
+}
+
+# _loop_spent <loop_id> — throttled live spend for the --wait poll: recompute at
+# most once per LOOP_SPEND_THROTTLE (default 20s) per loop, else return the last
+# persisted value. Drop-in replacement for the old bare SELECT so every ceiling
+# check reads a real number without re-scanning transcripts every poll.
+declare -A _LOOP_SPEND_LAST 2>/dev/null || true
+_loop_spent() {
+  local loop_id="$1" throttle="${LOOP_SPEND_THROTTLE:-20}" now last
+  now=$(date +%s); last="${_LOOP_SPEND_LAST[$loop_id]:-0}"
+  if (( now - last >= throttle )); then
+    _loop_refresh_spend "$loop_id" >/dev/null
+    _LOOP_SPEND_LAST[$loop_id]=$now
+  fi
+  db "SELECT COALESCE(tokens_spent,0) FROM loop_runs WHERE loop_id=$(sqlq "$loop_id");"
+}
+
 # --- loop spawn (the atom — design §3) ---
 # Create a loop_runs row + a backing task (`task add --assignee=<agent>`
 # carrying --prompt as body); the heartbeat wakes the agent to work it. Returns
@@ -168,7 +272,7 @@ cmd_loop_spawn() {
     killed=$(db "SELECT kill_requested FROM loop_runs WHERE loop_id=$(sqlq "$loop_id");")
     if [[ "$killed" == "1" ]]; then final_status="killed"; break; fi
     # ceiling check
-    spent=$(db "SELECT COALESCE(tokens_spent,0) FROM loop_runs WHERE loop_id=$(sqlq "$loop_id");")
+    spent=$(_loop_spent "$loop_id")
     if [[ "${spent:-0}" -ge "$eff_ceiling" ]]; then final_status="escalated"; break; fi
     # terminal-state check on the backing task
     tstatus=$(db "SELECT status FROM tasks WHERE id=${task_id};")
@@ -290,7 +394,7 @@ cmd_loop_verify() {
     local t; t=$(date +%s)
     killed=$(db "SELECT kill_requested FROM loop_runs WHERE loop_id=$(sqlq "$loop_id");")
     if [[ "$killed" == "1" ]]; then final_status="killed"; break; fi
-    spent=$(db "SELECT COALESCE(tokens_spent,0) FROM loop_runs WHERE loop_id=$(sqlq "$loop_id");")
+    spent=$(_loop_spent "$loop_id")
     if [[ "${spent:-0}" -ge "$eff_ceiling" ]]; then final_status="escalated"; break; fi
     tstatus=$(db "SELECT status FROM tasks WHERE id=${tid};")
     case "$tstatus" in
@@ -416,7 +520,7 @@ cmd_loop_grade() {
     local t; t=$(date +%s)
     killed=$(db "SELECT kill_requested FROM loop_runs WHERE loop_id=$(sqlq "$loop_id");")
     if [[ "$killed" == "1" ]]; then final_status="killed"; break; fi
-    spent=$(db "SELECT COALESCE(tokens_spent,0) FROM loop_runs WHERE loop_id=$(sqlq "$loop_id");")
+    spent=$(_loop_spent "$loop_id")
     if [[ "${spent:-0}" -ge "$eff_ceiling" ]]; then final_status="escalated"; break; fi
     local gstatus; gstatus=$(db "SELECT status FROM tasks WHERE id=${gtid};")
     case "$gstatus" in
@@ -570,7 +674,7 @@ cmd_loop_panel() {
     local t; t=$(date +%s)
     killed=$(db "SELECT kill_requested FROM loop_runs WHERE loop_id=$(sqlq "$loop_id");")
     if [[ "$killed" == "1" ]]; then final_status="killed"; break; fi
-    spent=$(db "SELECT COALESCE(tokens_spent,0) FROM loop_runs WHERE loop_id=$(sqlq "$loop_id");")
+    spent=$(_loop_spent "$loop_id")
     if [[ "${spent:-0}" -ge "$eff_ceiling" ]]; then final_status="escalated"; break; fi
     local pending; pending=$(db "SELECT COUNT(*) FROM tasks WHERE id IN (${ids_csv}) AND status NOT IN ('done','rejected','escalated','cancelled');")
     if [[ "${pending:-1}" == "0" ]]; then final_status="complete"; break; fi
@@ -701,7 +805,7 @@ cmd_loop_map() {
   while (( completed < n )); do
     local nowt; nowt=$(date +%s)
     [[ "$(db "SELECT kill_requested FROM loop_runs WHERE loop_id=$(sqlq "$loop_id");")" == "1" ]] && { halt="killed"; break; }
-    spent=$(db "SELECT COALESCE(tokens_spent,0) FROM loop_runs WHERE loop_id=$(sqlq "$loop_id");")
+    spent=$(_loop_spent "$loop_id")
     (( ${spent:-0} >= eff_ceiling )) && { halt="escalated"; break; }
     # dispatch up to the concurrency cap
     while (( live < eff_conc && next < n )); do
@@ -822,7 +926,7 @@ cmd_loop_until_dry() {
     local elapsed=$(( $(date +%s) - now ))
     [[ -n "$max_runtime" ]] && (( elapsed >= max_runtime )) && { exit_reason="max-runtime"; break; }
     [[ "$(db "SELECT kill_requested FROM loop_runs WHERE loop_id=$(sqlq "$loop_id");")" == "1" ]] && { exit_reason="killed"; break; }
-    spent=$(db "SELECT COALESCE(tokens_spent,0) FROM loop_runs WHERE loop_id=$(sqlq "$loop_id");")
+    spent=$(_loop_spent "$loop_id")
     (( ${spent:-0} >= eff_ceiling )) && { exit_reason="ceiling"; break; }
 
     round_no=$((round_no+1))
