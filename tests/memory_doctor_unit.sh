@@ -51,7 +51,8 @@ description: alpha
 metadata:
   type: project
 ---
-Alpha links to [[beta]] (exists) and [[no-such-slug]] (dangling).
+Alpha links to [[beta]] (exists), [[betaa]] (typo of beta -> warn), and
+[[future-idea-not-written-yet]] (intentional forward-ref -> quiet).
 Cites src/real.ts and header.sh (both real). Also src/real.tsx and a.json
 must NOT be truncated. Cites made/up/gone.ts which is stale.
 EOF
@@ -100,14 +101,19 @@ KINDS="$(jq -r '.findings[].kind' <<<"$SCAN" | sort -u | tr '\n' ' ')"
   && ok_t "unindexed file -> warn" \
   || bad_t "unindexed file -> warn" "$SCAN"
 
-# 4. dangling-link fires for the unknown slug...
+# 4. dangling-link fires ONLY for the typo-suspect ([[betaa]] ~ beta), not the
+#    intentional forward-ref ([[future-idea-not-written-yet]], no near match)
 [ "$(jq -r '[.findings[]|select(.kind=="dangling-link" and .file=="alpha.md")]|length' <<<"$SCAN")" = "1" ] \
-  && ok_t "one dangling-link (only the unknown slug)" \
-  || bad_t "one dangling-link (only the unknown slug)" "$SCAN"
-# ...and NOT for [[beta]] which resolves
-[ -z "$(jq -r '.findings[]|select(.kind=="dangling-link")|.message' <<<"$SCAN" | grep -i 'beta')" ] \
-  && ok_t "[[beta]] (real target) is not dangling" \
-  || bad_t "[[beta]] (real target) is not dangling" "$SCAN"
+  && ok_t "one dangling-link (only the typo-suspect)" \
+  || bad_t "one dangling-link (only the typo-suspect)" "$SCAN"
+# ...the warning points at the suspected real target
+[ -n "$(jq -r '.findings[]|select(.kind=="dangling-link")|.message' <<<"$SCAN" | grep -i 'did you mean.*\[\[beta\]\]')" ] \
+  && ok_t "typo dangling-link suggests [[beta]]" \
+  || bad_t "typo dangling-link suggests [[beta]]" "$SCAN"
+# ...and the forward-ref stub stays quiet (no false noise)
+[ -z "$(jq -r '.findings[]|select(.kind=="dangling-link")|.message' <<<"$SCAN" | grep -i 'future-idea')" ] \
+  && ok_t "intentional forward-ref is not flagged" \
+  || bad_t "intentional forward-ref is not flagged" "$SCAN"
 
 # 5. stale-ref fires ONLY for the gone path, never for real paths / .tsx / .json
 STALE="$(jq -r '.findings[]|select(.kind=="stale-ref")|.message' <<<"$SCAN")"

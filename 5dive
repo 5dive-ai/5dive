@@ -26,7 +26,7 @@ esac
 
 # Bumped on every public release. `build.sh` checks this line exists; CI fails
 # the bundle-drift check if it's missing or empty.
-readonly FIVE_VERSION="0.7.9"
+readonly FIVE_VERSION="0.7.10"
 
 # GitHub org our repos live under. The org is being renamed
 # 5dive-com -> 5dive-ai (2026-06); fetches must work on either side of the
@@ -21667,6 +21667,37 @@ def slugs_of(fname, name):
         out.add(name.lower())
     return out
 
+def _lev(a, b):
+    """Levenshtein distance, capped short-circuit not needed at these sizes."""
+    if a == b:
+        return 0
+    la, lb = len(a), len(b)
+    if abs(la - lb) > 2:      # caller only cares about dist <= 2
+        return 3
+    prev = list(range(lb + 1))
+    for i, ca in enumerate(a, 1):
+        cur = [i]
+        for j, cb in enumerate(b, 1):
+            cur.append(min(prev[j] + 1, cur[j - 1] + 1,
+                           prev[j - 1] + (ca != cb)))
+        prev = cur
+    return prev[lb]
+
+def typo_suspect(target, slugs):
+    """Return the nearest existing slug if `target` looks like a typo of it
+    (small edit distance), else None. A dangling link with no near match is
+    treated as an intentional forward-reference (the memory rules bless
+    [[name]] with no file yet), so it stays quiet."""
+    thresh = 2 if len(target) >= 5 else 1
+    best, best_d = None, thresh + 1
+    for s in slugs:
+        d = _lev(target, s)
+        if d < best_d:
+            best, best_d = s, d
+            if d == 1:
+                break
+    return best if best_d <= thresh else None
+
 def ref_exists(store_dir, token):
     if os.path.isabs(token):
         return os.path.exists(token)
@@ -21740,8 +21771,14 @@ for store in stores:
         for m in LINK_RE.findall(body):
             target = m.strip().lower()
             if target and target not in all_slugs:
-                add(sname, f, "dangling-link", "warn",
-                    f"[[{m.strip()}]] resolves to no file in this store")
+                # Only warn on likely typos (a near-match to an existing file).
+                # A link with no near match is an intentional forward-ref
+                # (marks something to write later) — stay quiet, not noise.
+                near = typo_suspect(target, all_slugs)
+                if near:
+                    add(sname, f, "dangling-link", "warn",
+                        f"[[{m.strip()}]] resolves to no file — did you mean "
+                        f"[[{near}]]?")
         if basenames:
             checked = set()
             for tok, _line in PATH_RE.findall(body):

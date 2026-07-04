@@ -12,6 +12,20 @@ release.
 _Nothing yet. New changes accumulate here until they're cut into a tagged
 release._
 
+## [0.7.10] - 2026-07-04
+
+### Changed
+
+- DIVE-1006: **quiet dangling-link noise for intentional forward-refs.** Follow-up
+  to DIVE-991. The memory rules bless a `[[name]]` with no file yet as an
+  intentional forward-reference (marks something to write later), but the doctor's
+  dangling-link check warned on every one — heavy linkers got a noisy report
+  (Marcus: 55/55 warned). `_memory_scan_json` now only warns when the target slug
+  is a close edit-distance match to an existing file (a likely typo'd/broken link)
+  and names the suspected target ("did you mean [[beta]]?"); links with no near
+  match go quiet as intended forward-refs. Actionable typo-suspects stay `warn`;
+  intentional stubs no longer pollute the report.
+
 ## [0.7.9] - 2026-07-04
 
 ### Added
