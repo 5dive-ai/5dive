@@ -11,6 +11,21 @@ release.
 
 ### Added
 
+- DIVE-984 (OSS-2): `5dive goal add "<outcome>"` — goal decomposition v1. A
+  planner agent (invoked via `loop spawn --wait --schema`) turns an outcome into
+  a validated task graph filed under a project (tasks + task_deps + leaf
+  acceptance/verify/verifier), then the fleet executes it via the existing
+  heartbeat + loops. Orchestrates existing primitives (project/task/block); the
+  new code is glue + the safety spine: hard `--max-tasks` cap and dep-DAG
+  `--depth-cap` (reject, never silent-truncate); a no-tier-lowering guard (a
+  task labeled `risk=low` whose text hits the T2 category floor is rejected,
+  reusing `cmd_task_need`'s classifier); a one-gate human checkpoint when a plan
+  is over the `--checkpoint` count OR carries any Tier-2 task (`--yes` waives
+  only the count, never a T2); `--dry-run` renders and creates nothing; cycle /
+  unknown-dep / unresolvable-assignee rejection. Degrades without the soft-dep
+  siblings (DIVE-979/980/981): `role:<x>` resolves through the org chart when
+  unambiguous, dry-run renders a plain list. `--plan=<json>` supplies a plan
+  directly (test seam + the approve->materialize path for a gated plan).
 - DIVE-968: implement `5dive loop status --handle=<loopId>` — the read-only
   single-loop drilldown that complements the fleet-wide `task loops` board.
   Reports topology/stage/iteration/tokens-vs-ceiling/status plus each backing
