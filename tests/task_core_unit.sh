@@ -186,6 +186,23 @@ selfg=$(run add --assignee=carol --body="work" -- "carol's own task")
 [[ "$(echo "$selfg" | jf '.data.verifyDefaulted')" == "false" ]] \
   && ok_t "no self-grading when maker is the only grader" || bad_t "self-grade guard" "$(echo "$selfg" | jf '.data.verifyDefaulted')"
 
+# --- DIVE-989: maker==coordinator no longer silently no-ops.
+# The lone-root coordinator (carol) owns every auto-coordinated task, so
+# maker==coordinator constantly. Give the org a designated technical deputy and
+# carol's OWN work grades to that deputy instead of getting no grader at all.
+( cmd_org_set zoe --manager=carol --title="Zoe · CTO" ) >/dev/null 2>"$TMP"/err
+zg=$(run add --assignee=carol --body="coordinator's own work" -- "carol builds it")
+[[ "$(echo "$zg" | jf '.data.verifyDefaulted')" == "true" && \
+   "$(echo "$zg" | jf '.data.verifier')" == "zoe" ]] \
+  && ok_t "DIVE-989: maker==coordinator grades to the designated deputy (zoe)" \
+  || bad_t "989 coord fallback" "vd=$(echo "$zg" | jf '.data.verifyDefaulted') v=$(echo "$zg" | jf '.data.verifier')"
+
+# A mid-chart maker grades UP the chain (coordinator/manager), never to itself.
+mgr=$(run add --assignee=zoe --body="zoe's real work" -- "zoe builds it")
+[[ "$(echo "$mgr" | jf '.data.verifier')" == "carol" ]] \
+  && ok_t "DIVE-989: mid-chart maker gets a distinct up-chain grader (carol)" \
+  || bad_t "989 up-chain" "verifier=$(echo "$mgr" | jf '.data.verifier')"
+
 # --- DIVE-980: org-chart assignee-token routing on `task add` --------------
 # Place a small org: eng (role=engineer, charter mentions "backend"), doc,
 # and two designers (ambiguous role) to prove deterministic single-match only.

@@ -11,6 +11,12 @@ release.
 
 ### Added
 
+- 0.7.1 (DIVE-989): verifier-by-default now walks a chain of DISTINCT graders
+  (project lead, coordinator, maker's manager, org root, technical deputy) and
+  takes the first that differs from the maker, so the default no longer silently
+  no-ops in the common maker==coordinator case (a lone-root CEO owning all
+  unassigned work). Adds _task_resolve_org_root + _task_resolve_deputy.
+
 - 0.7.0 (goal decomposition GA): the `5dive goal` line graduates — decompose an
   outcome into a validated task DAG that materializes ONLY on a human-approved
   checkpoint (DIVE-984 planner + DIVE-985 approve->materialize). Version milestone;

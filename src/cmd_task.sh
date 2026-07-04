@@ -148,19 +148,62 @@ _task_is_trivial() {
   return 1
 }
 
-# Pick a grader distinct from the maker (assignee). Prefer the project lead, then
-# the org coordinator; both must differ from the assignee (a maker can't grade
-# itself — DIVE-474). Prints the grader name, or nothing when no distinct grader
-# exists (in which case the default silently no-ops rather than blocking the add).
+# Resolve the lone org root (the single top of the chart — reports_to NULL or a
+# dangling manager). Prints the name, or nothing when the org is empty or has
+# more than one root (ambiguous — never guess). Mirrors the coordinator's
+# lone-root fallback but is exposed on its own so the grader chain can try it
+# even in an org that DOES tag a distinct role='coordinator'.
+_task_resolve_org_root() {
+  [[ "$(db "SELECT COUNT(*) FROM agents_org WHERE reports_to IS NULL OR reports_to NOT IN (SELECT name FROM agents_org);")" == "1" ]] || return
+  db "SELECT name FROM agents_org WHERE reports_to IS NULL OR reports_to NOT IN (SELECT name FROM agents_org) LIMIT 1;"
+}
+
+# Resolve the org's designated technical deputy — the lone agent whose role or
+# title marks them as a CTO / chief-technology / deputy — excluding $1 (the
+# maker). This is the grader of last resort for the root/CEO's OWN work: when a
+# task auto-coordinates to the lone-root coordinator, the maker IS the top of
+# the chart with no manager above, so the chain would otherwise give up. The
+# match is a leading-space-anchored keyword scan (so "CTO" matches but "factory"
+# does not) and must be UNIQUE — >1 candidate is ambiguous and yields nothing.
+_task_resolve_deputy() {
+  local _skip="$1"
+  local _pred="( lower(' '||COALESCE(role,'')||' '||COALESCE(title,'')) LIKE '% cto%'
+                 OR lower(' '||COALESCE(role,'')||' '||COALESCE(title,'')) LIKE '% chief technolog%'
+                 OR lower(' '||COALESCE(role,'')||' '||COALESCE(title,'')) LIKE '% deputy%' )
+               AND name <> $(sqlq "$_skip")"
+  [[ "$(db "SELECT COUNT(*) FROM agents_org WHERE ${_pred};")" == "1" ]] || return
+  db "SELECT name FROM agents_org WHERE ${_pred} LIMIT 1;"
+}
+
+# Pick a grader distinct from the maker (assignee) — a maker can't grade itself
+# (DIVE-474). DIVE-969 established the verifier-by-default posture; DIVE-989
+# widens WHO can grade so the default no longer silently no-ops when a task
+# auto-coordinates TO the coordinator (maker==coordinator — the common
+# default-project case where the lone-root CEO owns all unassigned work). We
+# walk an ordered chain of DISTINCT candidates and take the FIRST that exists
+# and differs from the maker:
+#   1. project lead   — the task's own project owner
+#   2. coordinator    — the queue owner (role=coordinator, else the lone root)
+#   3. maker's manager — reports_to: the maker's natural up-reviewer
+#   4. org root        — the lone top of the chart
+#   5. technical deputy — the org's designated CTO/deputy, so the root/CEO's own
+#                         work still gets a distinct grader
+# The silent no-op survives ONLY when none of these yields a distinct agent (a
+# genuinely solo org, or nobody but the maker anywhere). Prints the grader name.
 _task_default_verifier() {
-  local _assignee="$1" _proj_lead="$2" v=""
-  if [[ -n "$_proj_lead" && "$_proj_lead" != "$_assignee" ]]; then
-    v="$_proj_lead"
-  else
-    local coord; coord=$(_task_resolve_coordinator)
-    [[ -n "$coord" && "$coord" != "$_assignee" ]] && v="$coord"
-  fi
-  printf '%s' "$v"
+  local _assignee="$1" _proj_lead="$2" c=""
+  local -a cands=(
+    "$_proj_lead"
+    "$(_task_resolve_coordinator)"
+    "$(db "SELECT COALESCE(reports_to,'') FROM agents_org WHERE name=$(sqlq "$_assignee") LIMIT 1;")"
+    "$(_task_resolve_org_root)"
+    "$(_task_resolve_deputy "$_assignee")"
+  )
+  for c in "${cands[@]}"; do
+    if [[ -n "$c" && "$c" != "$_assignee" ]]; then
+      printf '%s' "$c"; return
+    fi
+  done
 }
 
 # DIVE-980: shared org-chart assignee resolution. Resolve an assignee TOKEN to a
