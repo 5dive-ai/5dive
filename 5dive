@@ -18464,7 +18464,8 @@ _sup_activity_epoch() {  # <type> <home>
   [[ -n "$probe" ]] || return 0
   root="${probe%%|*}"; fargs="${probe#*|}"
   [[ -d "$home/$root" ]] || return 0
-  # shellcheck disable=SC2086 -- fargs is a deliberate word-split find predicate
+  # fargs is a deliberate word-split find predicate (multiple -name/-o tokens).
+  # shellcheck disable=SC2086
   { find "$home/$root" -type f $fargs -printf '%T@\n' 2>/dev/null || true; } \
     | sort -rn | head -1 | cut -d. -f1
 }
