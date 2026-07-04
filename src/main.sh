@@ -176,6 +176,7 @@ Projects (ident namespaces for the queue; default 'dive' = DIVE-N):
   # tasks then number per project: FROG-1, FROG-2 …
 
   5dive loop spawn --role=<r> --agent=<a> --prompt="…" [--ceiling=<tok>] [--wait[=<sec>]]  # LOOP-7 orchestration (JSON in/out)
+  5dive goal add "<outcome>" [--dry-run] [--max-tasks=N] [--yes]   # outcome -> validated, guardrailed task graph (DIVE-984)
 
 Org chart (who reports to whom):
   5dive org set <agent> --manager=<agent> [--role=<text>] [--title=<text>]
@@ -503,6 +504,12 @@ main() {
       # LOOP-7: agent-native multi-agent orchestration over the task queue +
       # loop_runs table. JSON in/out; same group-writable store, no root/lock.
       cmd_loop "$@" ;;
+    goal)
+      # DIVE-984 (OSS-2): outcome -> validated, guardrailed task graph. A planner
+      # agent (via loop spawn) decomposes an outcome into tasks + deps under a
+      # project; goal add validates + gates before materializing. Same group-
+      # writable store, no root/lock.
+      cmd_goal "$@" ;;
     crew)
       # DIVE-787 (0.5.0 flagship): 5dive as the always-on runtime for CrewAI
       # crews. install/secret/run/show/list/uninstall. Crew runs in its own venv

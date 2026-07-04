@@ -11,6 +11,13 @@ release.
 
 ### Added
 
+- DIVE-984: `5dive goal add "<outcome>"` — goal decomposition v1 (OSS-2). A
+  planner agent (via `loop spawn --wait --schema`) turns an outcome into a
+  materialized task graph: tasks + `task_deps` edges + assignees under a project.
+  Guardrails: hard task/depth cap (reject, never truncate), no tier-lowering
+  (reuses the Tier-2 category-floor classifier), a one-gate human checkpoint over
+  the count threshold or any Tier-2 task, and `--dry-run` that creates nothing.
+
 - DIVE-976: decision-memory precedent prefill (OSS-11) — when a new gate matches
   a prior ANSWERED gate (same need_type, exact normalized ask-shape, precedent
   tier >= new tier, within 90 days), prefill a BLANK recommendation with the prior
