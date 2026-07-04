@@ -11,6 +11,15 @@ release.
 
 ### Added
 
+- DIVE-976: decision-memory precedent prefill (OSS-11) — when a new gate matches
+  a prior ANSWERED gate (same need_type, exact normalized ask-shape, precedent
+  tier >= new tier, within 90 days), prefill a BLANK recommendation with the prior
+  answer and cite it (Telegram ping + `task show`/inbox). Pure advisory: never
+  mutates tier or the clear path, fill-blank-only never overrides a filer rec, and
+  a decision precedent must be one of this gate's options — the DIVE-916 invariant
+  holds by construction. Adds `ask_shape`/`precedent_ref` columns + an
+  acceptance-rate digest line.
+
 - DIVE-968: implement `5dive loop status --handle=<loopId>` — the read-only
   single-loop drilldown that complements the fleet-wide `task loops` board.
   Reports topology/stage/iteration/tokens-vs-ceiling/status plus each backing
