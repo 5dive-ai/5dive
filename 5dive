@@ -26,7 +26,7 @@ esac
 
 # Bumped on every public release. `build.sh` checks this line exists; CI fails
 # the bundle-drift check if it's missing or empty.
-readonly FIVE_VERSION="0.6.15"
+readonly FIVE_VERSION="0.6.16"
 
 # GitHub org our repos live under. The org is being renamed
 # 5dive-com -> 5dive-ai (2026-06); fetches must work on either side of the
@@ -17628,11 +17628,13 @@ _sup_usage() {
                                    # No-ops unless ${_SUP_ENABLED_FLAG} exists.
 
 Classification (conservative — see docs/fleet-supervisor-design.md §4):
-  healthy  running + progressing, or legitimately idle/stopped with no active work
-  slow     active work but no transcript progress for ${_SUP_T_SLOW_MIN}m+ — recorded, never acted on
-  stuck    service/tmux/poller dead, a loop self-flagged stuck, no progress for
-           ${_SUP_T_STUCK_MIN}m+ with active work, or the box CLI is stale
-           (cause: service-dead|tmux-dead|poller-dead|loop-stuck|no-progress|stale-cli)
+  healthy         running + progressing, or legitimately idle/stopped with no active work
+  slow            active work but no transcript progress for ${_SUP_T_SLOW_MIN}m+ — recorded, never acted on
+  update-pending  box CLI is behind the published release — an update signal, NOT
+                  a wedged agent (cause: stale-cli); recorded, NEVER acted on (DIVE-974)
+  stuck           service/tmux/poller dead, a loop self-flagged stuck, or no progress
+                  for ${_SUP_T_STUCK_MIN}m+ with active work
+                  (cause: service-dead|tmux-dead|poller-dead|loop-stuck|no-progress)
 
 P1 takes ZERO recovery actions. Add --json to any form for machine output.
 USAGE
@@ -17800,8 +17802,12 @@ _sup_agent_record() {
   elif [[ "$_SUP_CLI_STALE" == "true" ]]; then
     # Box-level: the shared CLI is behind AND the nightly isn't catching up
     # (the /tmp-clobber class) — every agent is executing old code. Requires a
-    # confirmed probe; "unknown" never lands here.
-    class="stuck"; cause="stale-cli"; detail="box CLI ${FIVE_VERSION} stale behind ${_SUP_CLI_LATEST}"
+    # confirmed probe; "unknown" never lands here. This is an UPDATE-PENDING
+    # signal, NOT a wedged agent (DIVE-974): the agents are healthy, just one
+    # release behind, so it MUST NOT classify as stuck — the P2 act loop only
+    # touches class=="stuck", and a stale-cli tick right after every release cut
+    # would otherwise nudge/resume/rotate/escalate the entire healthy fleet.
+    class="update-pending"; cause="stale-cli"; detail="box CLI ${FIVE_VERSION} stale behind ${_SUP_CLI_LATEST}"
   elif (( has_work )) && (( act_age >= 0 )) && (( act_age >= _SUP_T_SLOW_MIN * 60 )); then
     class="slow"; detail="active work, no transcript progress for $((act_age / 60))m"
   elif (( has_work )); then
@@ -17880,9 +17886,10 @@ _sup_summary_line() {
   local snap="$1"
   jq -r --arg stale "$_SUP_CLI_STALE" --arg cur "$FIVE_VERSION" --arg lat "$_SUP_CLI_LATEST" '
     "\(length) agents — " +
-    "\([.[] | select(.classification == "healthy")] | length) healthy / " +
-    "\([.[] | select(.classification == "slow")]    | length) slow / " +
-    "\([.[] | select(.classification == "stuck")]   | length) stuck" +
+    "\([.[] | select(.classification == "healthy")]        | length) healthy / " +
+    "\([.[] | select(.classification == "slow")]           | length) slow / " +
+    "\([.[] | select(.classification == "update-pending")] | length) update-pending / " +
+    "\([.[] | select(.classification == "stuck")]          | length) stuck" +
     (if $stale == "true" then " · CLI \($cur) STALE (latest \($lat))"
      elif $stale == "unknown" then " · CLI staleness unknown (probe unavailable)"
      else " · CLI \($cur) ok" end)' <<<"$snap"
@@ -17950,6 +17957,10 @@ _sup_act_plan() {  # <type> <cause> <attempts> <last_epoch> <now> <rotation_enab
   local type="$1" cause="$2" attempts="$3" last="$4" now="$5" rot="$6"
   case "$cause" in
     no-progress|loop-stuck) : ;;
+    # DIVE-974: stale-cli is update-pending, not stuck — it never reaches this
+    # loop (gated on class=="stuck") but guard here too so no rung, including
+    # escalate, can EVER fire on a stale-cli-only classification.
+    stale-cli) echo "defer update-pending"; return ;;
     *) echo "escalate rung-4-needed"; return ;;
   esac
   [[ "$type" == "claude" ]] || { echo "escalate non-claude-runtime"; return; }

@@ -44,8 +44,10 @@ t "service-dead escalates (rung 4 is P3)" \
   "escalate rung-4-needed" "$(_sup_act_plan claude service-dead 0 0 $NOW false)"
 t "tmux-dead escalates" \
   "escalate rung-4-needed" "$(_sup_act_plan claude tmux-dead 0 0 $NOW true)"
-t "stale-cli escalates" \
-  "escalate rung-4-needed" "$(_sup_act_plan claude stale-cli 1 0 $NOW true)"
+# DIVE-974: stale-cli is update-pending (not stuck) so it never reaches the act
+# loop; the plan guards it too, so no rung — not even escalate — can ever fire.
+t "stale-cli defers (update-pending, never a ladder action)" \
+  "defer update-pending" "$(_sup_act_plan claude stale-cli 1 0 $NOW true)"
 
 # --- runtime guard ----------------------------------------------------------
 t "non-claude runtime escalates even on actionable cause" \
