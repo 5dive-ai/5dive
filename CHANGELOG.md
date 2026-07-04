@@ -11,6 +11,16 @@ release.
 
 ### Added
 
+- DIVE-979: dependency-aware heartbeat scheduling. The per-agent wake now picks
+  the next task through `_hb_pick_task`, which (a) SKIPS any todo whose
+  `task_deps` still has an open blocker (a `blocked_by` task not yet
+  done/cancelled) so no unstartable work is ever handed out, and (b) within a
+  priority tier PREFERS the critical path — the todo whose downstream dependent
+  chain is longest, via a depth-capped recursive CTE over `task_deps`. Priority
+  stays the primary key; critical-path depth is the tiebreaker, then id. The
+  urgent/high early-wake probe is likewise gated on being blocker-free. New
+  `tests/heartbeat_pick_unit.sh` (7/7) covers the dep graph end to end.
+
 - DIVE-971: multi-runtime supervisor signals — closes the three supervision
   TODO(P2)s in `cmd_supervisor.sh`. (1) The telegram-poller liveness probe now
   covers codex/grok/antigravity/opencode via a per-type argv pattern

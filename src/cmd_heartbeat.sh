@@ -257,6 +257,41 @@ _hb_mark_reap() {
   jq -r --arg n "$name" --arg tid "$task_id" '.agents[$n].heartbeat.reaps[$tid] // 0' <<<"$reg"
 }
 
+# DIVE-979 — dependency-aware task pick for one agent. Echoes the single DIVE row
+# id the heartbeat should wake this agent against, or empty when nothing is
+# actionable. Two rules layered on top of the plain priority order:
+#   (a) SKIP any todo whose task_deps carries an OPEN blocker — a blocked_by task
+#       that is not yet done/cancelled — so we never hand out work that can't start.
+#   (b) Within a priority tier, PREFER the critical path: the todo whose downstream
+#       dependent chain is longest, so the longest remaining chain starts soonest.
+# The recursive CTE walks task_deps forward (blocked_by -> task_id, i.e. toward
+# dependents) and is depth-capped at 64 so a pathological/cyclic graph can't spin.
+# Priority stays the primary key (an urgent task never waits behind a medium
+# critical-path task); critical-path depth is the tiebreaker, then id for stability.
+_hb_pick_task() {
+  local name="$1"
+  db "WITH RECURSIVE
+        cp(root, node, depth) AS (
+          SELECT id, id, 0 FROM tasks
+            WHERE assignee=$(sqlq "$name") AND status='todo' AND kind='standard'
+          UNION ALL
+          SELECT cp.root, d.task_id, cp.depth+1
+            FROM cp JOIN task_deps d ON d.blocked_by = cp.node
+            WHERE cp.depth < 64
+        ),
+        crit(root, cp) AS (SELECT root, MAX(depth) AS cp FROM cp GROUP BY root)
+      SELECT t.id
+        FROM tasks t LEFT JOIN crit c ON c.root = t.id
+        WHERE t.assignee=$(sqlq "$name") AND t.status='todo' AND t.kind='standard'
+          AND NOT EXISTS (
+            SELECT 1 FROM task_deps dd JOIN tasks b ON b.id = dd.blocked_by
+             WHERE dd.task_id = t.id AND b.status NOT IN ('done','cancelled'))
+        ORDER BY CASE t.priority WHEN 'urgent' THEN 0 WHEN 'high' THEN 1
+                                 WHEN 'medium' THEN 2 ELSE 3 END,
+                 COALESCE(c.cp,0) DESC, t.id
+        LIMIT 1;" 2>/dev/null || echo ""
+}
+
 # Inject one literal line + Enter into an agent's tmux pane. Returns nonzero
 # (never exits) so a single dead pane can't abort the whole tick.
 _hb_send_line() {
@@ -712,10 +747,15 @@ cmd_heartbeat_tick() {
       # wake this tick (still gated by busy/spread/idle below). created_at is UTC
       # text; strftime('%s') makes it an epoch comparable to lastRun.
       local hot
-      hot=$(db "SELECT COUNT(*) FROM tasks
-                WHERE assignee=$(sqlq "$name") AND status='todo' AND kind='standard'
-                  AND priority IN ('urgent','high')
-                  AND CAST(strftime('%s', created_at) AS INTEGER) > ${lastRun};" 2>/dev/null || echo 0)
+      # DIVE-979: only an ACTIONABLE (no open blocker) urgent/high task earns an
+      # early wake — a hot task stuck behind a dep would just idle the tick.
+      hot=$(db "SELECT COUNT(*) FROM tasks t
+                WHERE t.assignee=$(sqlq "$name") AND t.status='todo' AND t.kind='standard'
+                  AND t.priority IN ('urgent','high')
+                  AND CAST(strftime('%s', t.created_at) AS INTEGER) > ${lastRun}
+                  AND NOT EXISTS (
+                    SELECT 1 FROM task_deps dd JOIN tasks b ON b.id = dd.blocked_by
+                     WHERE dd.task_id = t.id AND b.status NOT IN ('done','cancelled'));" 2>/dev/null || echo 0)
       if [[ "${hot:-0}" != "0" ]]; then
         _hb_log "[$name] early wake — ${hot} urgent/high task(s) queued since last wake"
       else
@@ -730,9 +770,7 @@ cmd_heartbeat_tick() {
     # Pick the single highest-priority todo and wake the agent against that exact
     # id — the /goal condition needs a concrete DIVE-N to evaluate reliably.
     local task_id
-    task_id=$(db "SELECT id FROM tasks WHERE assignee=$(sqlq "$name") AND status='todo' AND kind='standard'
-                  ORDER BY CASE priority WHEN 'urgent' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2 ELSE 3 END, id
-                  LIMIT 1;" 2>/dev/null || echo "")
+    task_id=$(_hb_pick_task "$name")
     if [[ -z "$task_id" ]]; then
       sk_nowork=$((sk_nowork + 1)); _hb_log "[$name] no todo — stay idle"; continue
     fi
