@@ -75,8 +75,9 @@ if command -v visudo >/dev/null 2>&1; then
   cat > "$SFILE" <<SUD
 ${user} ALL=(root) NOPASSWD: \\
   /usr/local/bin/5dive, /usr/local/bin/5dive *, \\
-  /usr/bin/systemctl restart 5dive-agent@*, /bin/systemctl restart 5dive-agent@*, \\
-  /usr/bin/systemd-run *, /usr/bin/journalctl *, /bin/journalctl *
+  /usr/bin/systemctl start 5dive-agent@*, /usr/bin/systemctl stop 5dive-agent@*, \\
+  /usr/bin/systemctl restart 5dive-agent@*, \\
+  /bin/systemctl restart 5dive-*.service
 SUD
   if visudo -cf "$SFILE" >/dev/null 2>&1; then
     ok_t "scoped admin sudoers passes visudo -c"
@@ -91,9 +92,35 @@ SUD
   else
     ok_t "scoped sudoers is NOT blanket ALL=(ALL) NOPASSWD: ALL"
   fi
+  # DIVE-1002 (Marcus review): the three indirect root escapes must be ABSENT.
+  # Assert against the REAL generated body in src/cmd_agent.sh, not just SFILE.
+  BODY=$(sed -n '/^write_admin_sudoers()/,/^}/p' src/cmd_agent.sh)
+  for esc in 'systemd-run' 'journalctl' 'systemctl status'; do
+    if grep -qF "$esc" <<<"$BODY"; then
+      bad_t "admin allowlist must NOT contain '$esc' (root-escapable)" ""
+    else
+      ok_t "admin allowlist excludes '$esc'"
+    fi
+  done
+  grep -qF '/usr/local/bin/5dive' <<<"$BODY" \
+    && ok_t "real write_admin_sudoers still grants the 5dive CLI" \
+    || bad_t "real write_admin_sudoers grants 5dive" ""
 else
   echo "# visudo not present; skipping sudoers shape asserts"
 fi
+
+# ---- 2b. crew refuses root (invariant: no sudo 5dive subcmd execs as root) ---
+CREW_BODY=$(sed -n '/^cmd_crew()/,/^  case/p' src/cmd_crew.sh)
+grep -q 'id -u.*== *"0"' <<<"$CREW_BODY" && grep -q 'E_PERMISSION' <<<"$CREW_BODY" \
+  && ok_t "cmd_crew refuses to run as root (blocks admin->root via crew exec)" \
+  || bad_t "cmd_crew root guard" "expected an EUID-0 refusal in cmd_crew"
+
+# ---- 2c. agent restart --defer runs a FIXED command, not caller-injected -----
+RESTART_BODY=$(sed -n '/^cmd_restart()/,/^}/p' src/cmd_agent.sh)
+grep -q 'restart "5dive-agent@\${name}.service"' <<<"$RESTART_BODY" \
+  && ! grep -qE '\--defer.*\$\{?[0-9]|defer.*eval' <<<"$RESTART_BODY" \
+  && ok_t "restart --defer wraps a FIXED systemctl restart (no caller-injected cmd)" \
+  || bad_t "restart --defer fixed command" "deferred command must not be caller-templated"
 
 # ---- 3. v1 -> v2 migration stamps explicit isolation ------------------------
 LEGACY='{"schemaVersion":1,"agents":{"old1":{"type":"claude"},"old2":{"type":"claude","isolation":"standard"}}}'

@@ -361,16 +361,28 @@ create_agent_user() {
   fi
 }
 
-# DIVE-1002: an 'admin' agent can run the company, not `rm -rf` the box. It gets
-# passwordless sudo scoped to a fleet-management allowlist: the 5dive CLI (which
-# is the sanctioned API for create/rm/provision/restart agents and box ops) plus
-# lifecycle control of the box's own 5dive systemd units and their logs. It does
-# NOT get an arbitrary-root shell (`sudo bash`, `sudo su`, `sudo -u <x> -i`,
-# editors as root, etc.), so a prompt-injected or compromised admin worker is
-# bounded to fleet ops, aligning with the sudo-reduction line (DIVE-756/916).
-# The file is validated with `visudo -c` before install so a malformed entry can
-# never lock the box out; on failure we remove it and fail loudly rather than
-# leaving a broken /etc/sudoers.d.
+# DIVE-1002: an 'admin' agent can run the company, not `rm -rf` the box. Its sudo
+# is scoped to a single mediated surface — the 5dive CLI (the sanctioned API for
+# create/rm/provision/restart agents and box ops) — plus start|stop|restart of
+# the box's own 5dive systemd units. That's it.
+#
+# What is deliberately NOT granted, and why (all are one-line root escapes):
+#   - `systemd-run *`    runs ANY command as root (`systemd-run --pty bash`) —
+#                        a wildcard on it == NOPASSWD: ALL. Agents that need a
+#                        deferred self-restart use `5dive agent restart --defer`,
+#                        which runs systemd-run internally under the already-root
+#                        CLI, so no raw grant is required.
+#   - `journalctl *`     pages through less by default -> `!sh` GTFOBins escape.
+#                        Logs go through `5dive agent logs` (--no-pager path).
+#   - `systemctl status` also pages by default -> same `!sh` escape. Only the
+#                        non-paging start|stop|restart verbs are granted.
+#   - `sudo bash|su|-u <x> -i` — direct root/other-user shells.
+# Granting the whole `5dive` CLI as root makes it a standing invariant that NO
+# 5dive subcommand may exec agent-controlled input as root (else it becomes an
+# admin->root vector). See DIVE-756/916 (sudo reduction), DIVE-950 (forge).
+#
+# The file is `visudo -c` validated before install so a malformed entry can never
+# lock the box out; on failure we remove it and fail loudly.
 write_admin_sudoers() {
   local user="$1" f="/etc/sudoers.d/${user}" tmp
   tmp=$(mktemp)
@@ -383,14 +395,13 @@ write_admin_sudoers() {
 ${user} ALL=(root) NOPASSWD: \\
   /usr/local/bin/5dive, /usr/local/bin/5dive *, \\
   /usr/bin/systemctl start 5dive-agent@*, /usr/bin/systemctl stop 5dive-agent@*, \\
-  /usr/bin/systemctl restart 5dive-agent@*, /usr/bin/systemctl status 5dive-agent@*, \\
+  /usr/bin/systemctl restart 5dive-agent@*, \\
   /usr/bin/systemctl start 5dive-*.service, /usr/bin/systemctl stop 5dive-*.service, \\
-  /usr/bin/systemctl restart 5dive-*.service, /usr/bin/systemctl status 5dive-*.service, \\
+  /usr/bin/systemctl restart 5dive-*.service, \\
   /bin/systemctl start 5dive-agent@*, /bin/systemctl stop 5dive-agent@*, \\
-  /bin/systemctl restart 5dive-agent@*, /bin/systemctl status 5dive-agent@*, \\
+  /bin/systemctl restart 5dive-agent@*, \\
   /bin/systemctl start 5dive-*.service, /bin/systemctl stop 5dive-*.service, \\
-  /bin/systemctl restart 5dive-*.service, /bin/systemctl status 5dive-*.service, \\
-  /usr/bin/systemd-run *, /usr/bin/journalctl *, /bin/journalctl *
+  /bin/systemctl restart 5dive-*.service
 SUDOERS
   chmod 440 "$tmp"
   if visudo -cf "$tmp" >/dev/null 2>&1; then
@@ -1326,12 +1337,34 @@ cmd_create() {
 }
 
 cmd_restart() {
-  local name="${1:-}"
-  [[ -n "$name" ]] || fail "$E_USAGE" "usage: 5dive agent restart <name>"
+  local name="" defer=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --defer) defer=1 ;;
+      -*)      fail "$E_USAGE" "unknown flag: $1" ;;
+      *)       [[ -z "$name" ]] && name="$1" || fail "$E_USAGE" "extra arg: $1" ;;
+    esac
+    shift
+  done
+  [[ -n "$name" ]] || fail "$E_USAGE" "usage: 5dive agent restart <name> [--defer]"
   require_agent "$name"
-  systemctl restart "5dive-agent@${name}.service" >&2
-  ok "agent '$name' restarted." \
-     '{name:$n, action:"restart"}' --arg n "$name"
+  if (( defer )); then
+    # DIVE-1002: CLI-mediated deferred restart. `sudo 5dive` already runs as
+    # root, so the CLI fires systemd-run internally — an (scoped-)admin agent
+    # can restart itself via `sudo 5dive agent restart <self> --defer` and never
+    # needs a raw `sudo systemd-run` grant (which is arbitrary root). The ~1s
+    # transient unit survives the caller's own session teardown, so an agent
+    # restarting itself (e.g. after editing model/effort) doesn't SIGTERM the
+    # restart mid-flight.
+    systemd-run --on-active=1 --collect \
+      /bin/systemctl restart "5dive-agent@${name}.service" >&2
+    ok "agent '$name' restart scheduled (deferred ~1s)." \
+       '{name:$n, action:"restart", deferred:true}' --arg n "$name"
+  else
+    systemctl restart "5dive-agent@${name}.service" >&2
+    ok "agent '$name' restarted." \
+       '{name:$n, action:"restart"}' --arg n "$name"
+  fi
 }
 
 cmd_rm() {
