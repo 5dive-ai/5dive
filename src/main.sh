@@ -36,7 +36,8 @@ Compose (declarative agents via 5dive.yaml):
   # process env (missing vars fail loudly).
 
 Agents:
-  5dive hire <name> [--type=claude] [--role="CTO"] [--title=...]  # sugar: agent create (+ org set); see `5dive hire --help`
+  5dive hire <name> [--role="CTO"]  # sugar: agent create (+ org set)
+  5dive hire <role> --from-market [--as=<name>]  # hire from the open market; see `5dive hire --help`
   5dive agent list
   5dive agent info <name>                            # type, CLI version, selected model, channel + state
   5dive agent types

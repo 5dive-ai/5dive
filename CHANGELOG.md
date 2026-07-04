@@ -11,6 +11,14 @@ release.
 
 ### Added
 
+- 0.7.4 (DIVE-993): `5dive hire <role> --from-market` — one command from the
+  open market to an employed teammate. Resolves <role> against the character-pack
+  registry (rarity + completeness-tiered pick), provisions from that persona via
+  the `agent import` slug path, and slots the new hire into the org chart under
+  the pack's role. `--as=<name>` picks the local name (defaults to the slug);
+  `--role`/`--title` override the org placement; other flags pass through to
+  `agent import`.
+
 - 0.7.3 (DIVE-991): memory hygiene. New `5dive memory doctor` and a `memory`
   category in `5dive doctor` run a hygiene pass over per-agent memory stores +
   the shared wiki: index drift (MEMORY.md/index.md vs files on disk — missing
