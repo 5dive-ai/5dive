@@ -263,8 +263,19 @@ main() {
       # DIVE-603: ergonomic alias for `agent create` (+ `org set`). Mutating —
       # take the registry lock like create; cmd_hire's inner create call is a
       # re-entrant no-op re-lock.
-      AUDIT_CMD="hire"; AUDIT_ARGS=("$@")
-      with_registry_lock cmd_hire "$@" ;;
+      # DIVE-1013: `hire <role> --from-market --dry-run` is a read-only preview
+      # (resolve + DIVE-995 disclosure, creates nothing) — run it OUTSIDE the
+      # lock so it needs no root, exactly like `agent inspect`.
+      local _hire_market=0 _hire_dry=0 _ha
+      for _ha in "$@"; do
+        case "$_ha" in --from-market|--market) _hire_market=1 ;; --dry-run) _hire_dry=1 ;; esac
+      done
+      if (( _hire_market && _hire_dry )); then
+        cmd_hire "$@"
+      else
+        AUDIT_CMD="hire"; AUDIT_ARGS=("$@")
+        with_registry_lock cmd_hire "$@"
+      fi ;;
     agent)
       [[ $# -gt 0 ]] || { usage; exit "$E_USAGE"; }
       local sub="$1"; shift

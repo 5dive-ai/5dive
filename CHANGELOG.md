@@ -12,6 +12,20 @@ release.
 _Nothing yet. New changes accumulate here until they're cut into a tagged
 release._
 
+## [0.7.13] - 2026-07-05
+
+### Changed
+
+- DIVE-1013: **`hire --from-market` now gates before provisioning.** It used to
+  resolve the pack, print the DIVE-995 "this pack will run X" disclosure, then
+  create a real teammate IMMEDIATELY, so a docs/blog reader or an agent copying
+  an example could stand one up unintentionally. Now:
+  - `--dry-run` resolves the pack and prints the disclosure but creates NOTHING
+    (read-only, runs outside the registry lock — no root, like `agent inspect`).
+  - In a TTY it prints the disclosure and requires an interactive `y/N` confirm.
+  - Non-interactively it requires an explicit `--yes`, else it aborts after
+    showing the disclosure. The resolve/disclosure output is unchanged.
+
 ## [0.7.12] - 2026-07-04
 
 ### Security

@@ -73,7 +73,7 @@ cmd_hire() {
       -h|--help)
         cat <<'EOF'
 usage: 5dive hire <name> [--type=claude] [--role=<text>] [--title=<text>] [+ any 'agent create' flag]
-       5dive hire <role> --from-market [--as=<name>] [--role=<text>] [--title=<text>] [+ any 'agent import' flag]
+       5dive hire <role> --from-market [--as=<name>] [--dry-run] [--yes] [--role=<text>] [--title=<text>] [+ any 'agent import' flag]
 
 FRESH  — sugar for `agent create` (+ `org set` when --role/--title given):
   5dive hire cto --role="CTO" --title="Chief Technology Officer"
@@ -82,8 +82,13 @@ FRESH  — sugar for `agent create` (+ `org set` when --role/--title given):
 MARKET — hire from the open market: resolve <role> against the character-pack
 registry (rarest, most-complete match), provision from that persona, slot into
 the org chart under the pack's role:
-  5dive hire ceo --from-market                    # -> imports the top CEO pack
-  5dive hire engineer --from-market --as=nova     # into a fresh name 'nova'
+  5dive hire ceo --from-market --dry-run          # resolve + show disclosure, create NOTHING
+  5dive hire ceo --from-market                    # -> confirm at the prompt, then import top CEO pack
+  5dive hire engineer --from-market --as=nova --yes  # non-interactive: skip the confirm gate
+
+MARKET provisions a REAL teammate. It shows the pack's DIVE-995 "this pack will
+run X" disclosure, then requires an interactive y/N confirm (TTY) or an explicit
+--yes (non-interactive) before creating anything. --dry-run previews only.
 
 Defaults --type=claude. Other flags pass through to `agent create` (fresh) or
 `agent import` (market).
@@ -114,6 +119,7 @@ EOF
 # ---- MARKET mode (DIVE-993): registry -> provision -> org --------------------
 cmd_hire_market() {
   local role_query="" as="" role_override="" title="" role_set=0 title_set=0
+  local dry_run="" yes=""
   local import_args=()
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -121,13 +127,15 @@ cmd_hire_market() {
       --as=*)     as="${1#--as=}" ;;
       --role=*)   role_override="${1#--role=}"; role_set=1 ;;
       --title=*)  title="${1#--title=}";       title_set=1 ;;
+      --dry-run)  dry_run=1 ;;                          # DIVE-1013: resolve+disclose, create NOTHING
+      --yes|-y)   yes=1 ;;                              # DIVE-1013: skip the confirm gate
       -h|--help)  cmd_hire --help; return 0 ;;
       -*)         import_args+=("$1") ;;                # forwarded to agent import
       *)          [[ -z "$role_query" ]] && role_query="$1" || import_args+=("$1") ;;
     esac
     shift
   done
-  [[ -n "$role_query" ]] || fail "$E_USAGE" "usage: 5dive hire <role> --from-market [--as=<name>]  (e.g. 5dive hire ceo --from-market)"
+  [[ -n "$role_query" ]] || fail "$E_USAGE" "usage: 5dive hire <role> --from-market [--as=<name>] [--dry-run] [--yes]  (e.g. 5dive hire ceo --from-market)"
 
   # 1) Resolve the role against the open market (rarity/completeness-tiered pick).
   step "Scanning the character-pack registry for a '$role_query'"
@@ -140,10 +148,45 @@ cmd_hire_market() {
   local slug pack_role rarity
   IFS=$'\t' read -r slug pack_role rarity <<<"$pick"
   step "Matched '$slug' ($rarity) — $pack_role"
+  local name="${as:-$slug}"
+
+  # 1b) DIVE-1013: gate before provisioning. `hire --from-market` used to run the
+  #     DIVE-995 "this pack will let the new agent run X" disclosure and then
+  #     provision IMMEDIATELY — a docs/blog reader (or an agent following an
+  #     example) could stand up a real teammate unintentionally. Now:
+  #       --dry-run  -> resolve + print the disclosure, create NOTHING;
+  #       TTY        -> print the disclosure, require an interactive y/N confirm;
+  #       non-TTY    -> require an explicit --yes, else abort with the disclosure.
+  #     cmd_inspect (DIVE-995) is the read-only "look before you install" path.
+  if [[ -n "$dry_run" ]]; then
+    if (( JSON_MODE )); then
+      local disc_j; disc_j=$(cmd_inspect "$slug" | jq -c '.data.disclosure // {}' 2>/dev/null || true)
+      [[ -n "$disc_j" ]] || disc_j='{}'
+      ok "" '{dryRun:true, slug:$s, as:$a, role:$r, rarity:$rt, disclosure:$d}' \
+         --arg s "$slug" --arg a "$name" --arg r "$pack_role" --arg rt "$rarity" --argjson d "$disc_j"
+    else
+      cmd_inspect "$slug"
+      step "DRY RUN — nothing created. To hire '$name' as $pack_role: re-run without --dry-run (confirm at the prompt), or add --yes for a non-interactive shell."
+    fi
+    return 0
+  fi
+
+  if [[ -z "$yes" ]]; then
+    if (( JSON_MODE )) || [[ ! -t 0 ]]; then
+      (( JSON_MODE )) || cmd_inspect "$slug"   # text: show the disclosure we're gating on
+      fail "$E_USAGE" "refusing to hire '$slug' without confirmation in a non-interactive shell — re-run with --yes to proceed, or --dry-run to preview (nothing created)"
+    fi
+    cmd_inspect "$slug"
+    printf 'Hire %s as %s from pack %s (%s)? [y/N] ' "$name" "$pack_role" "$slug" "$rarity" >&2
+    local reply=""; read -r reply || reply=""
+    case "$reply" in
+      y|Y|yes|Yes|YES) ;;
+      *) fail "$E_GENERIC" "aborted — nothing created" ;;
+    esac
+  fi
 
   # 2) Provision from the persona: the registry-slug path of `agent import`
   #    fetches the pack (synthesized from the OpenAgent persona) and recreates it.
-  local name="${as:-$slug}"
   cmd_import "$slug" --as="$name" "${import_args[@]}"
 
   # 3) Slot the new hire into the org chart under the pack's role (or an override).
