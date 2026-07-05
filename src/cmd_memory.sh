@@ -36,12 +36,19 @@ _memory_usage() {
 
   5dive memory add --name=<kebab-slug> --description="<one-liner>"
                    [--type=user|feedback|project|reference] [--store=mine|wiki]
-                   [--tags=a,b] [--force]   (body on stdin)
+                   [--tags=a,b] [--valid-to=YYYY-MM-DD] [--supersedes=<slug>]
+                   [--confidence=high|medium|low] [--provenance="<source>"]
+                   [--force]   (body on stdin)
       Compile a durable memory: writes a frontmatter markdown file into your
       own store (default) or the shared team wiki (--store=wiki, the publish
       path other agents can search), stamps provenance (who/when), appends the
       store's index line, and refuses token/key-shaped content (tripwire;
       --force does NOT bypass it). Existing file needs --force to overwrite.
+      Lifecycle envelope (DIVE-1024, all optional): --valid-to = date the fact
+      expires / needs recheck; --supersedes = slug of the memory this replaces
+      (that one is then demoted in recall instead of silently lingering);
+      --confidence = how sure; --provenance = where the fact came from. Recall
+      demotes + flags expired / superseded / low-confidence facts (never hides).
 
   5dive memory doctor [--roots=a,b] [--agent=<name>] [--code-root=<dir>] [--json]
       Hygiene pass over the memory store(s): index drift (MEMORY.md vs files on
@@ -147,6 +154,7 @@ const opt = (k, d) => { const h = argv.find((a) => a.startsWith(`--${k}=`)); ret
 const LIMIT = Number(opt("limit", 8));
 const MAX_TOKENS = Number(opt("max-tokens", 1500));
 const ROOTS = String(opt("roots", "")).split(",").filter(Boolean);
+const TODAY = new Date().toISOString().slice(0, 10);   // DIVE-1024: expiry compare
 const estTokens = (s) => Math.ceil(s.length / 4);
 const STOP = new Set("a an and are as at be but by for from has have if in into is it its of on or that the their then there these this to was were will with you your our we".split(" "));
 const tokenize = (s) => s.toLowerCase().replace(/`[^`]*`/g, " ").replace(/[^a-z0-9]+/g, " ").split(" ").filter((t) => t.length > 1 && !STOP.has(t));
@@ -158,11 +166,24 @@ function mdFiles(root) {
   };
   walk(root); return out;
 }
+// DIVE-1024: pull a single scalar field out of a YAML frontmatter block.
+function fmField(fm, k) { const m = new RegExp(`^\\s*${k}:\\s*["']?(.+?)["']?\\s*$`, "m").exec(fm); return m ? m[1].trim() : ""; }
 function chunk(file) {
   let text; try { text = fs.readFileSync(file, "utf-8"); } catch { return []; }
   const fm = /^---\n([\s\S]*?)\n---\n?/.exec(text);
   let front = "";
-  if (fm) { const desc = /^description:\s*["']?(.+?)["']?\s*$/m.exec(fm[1]); if (desc) front = desc[1].replace(/^>\s*/, "").trim(); text = text.slice(fm[0].length); }
+  // DIVE-1024 lifecycle envelope, parsed once per file and carried on each chunk.
+  let meta = { name: path.basename(file).replace(/\.md$/, ""), validTo: "", confidence: "", supersedes: "" };
+  if (fm) {
+    const desc = /^description:\s*["']?(.+?)["']?\s*$/m.exec(fm[1]); if (desc) front = desc[1].replace(/^>\s*/, "").trim();
+    meta = {
+      name: fmField(fm[1], "name") || fmField(fm[1], "title") || meta.name,
+      validTo: fmField(fm[1], "valid_to"),
+      confidence: fmField(fm[1], "confidence").toLowerCase(),
+      supersedes: fmField(fm[1], "supersedes"),
+    };
+    text = text.slice(fm[0].length);
+  }
   const lines = text.split("\n");
   const chunks = [];
   let cur = { heading: path.basename(file), body: [] };
@@ -172,10 +193,23 @@ function chunk(file) {
     else cur.body.push(line);
   }
   if (cur.body.join("").trim()) chunks.push(cur);
-  return chunks.map((c, i) => { let t = c.body.join("\n").trim(); if (i === 0 && front) t = `${front}\n\n${t}`; return { file, heading: c.heading, text: t }; }).filter((c) => c.text.length > 0);
+  return chunks.map((c, i) => { let t = c.body.join("\n").trim(); if (i === 0 && front) t = `${front}\n\n${t}`; return { file, heading: c.heading, text: t, m: meta }; }).filter((c) => c.text.length > 0);
 }
 const docs = [];
 for (const root of ROOTS) for (const f of mdFiles(root)) docs.push(...chunk(f));
+// DIVE-1024: any slug named in some fact's `supersedes` is stale → demote it.
+const superseded = new Set(docs.map((d) => d.m && d.m.supersedes).filter(Boolean));
+const CONF_MULT = { low: 0.5, medium: 0.85, high: 1, "": 1 };
+// Multiplicative demotion (never removal): expired/superseded/low-confidence
+// facts still surface, ranked lower, with a visible flag. Absent fields = 1x.
+function lifecycle(m) {
+  let mult = 1; const flags = [];
+  if (!m) return { mult, flags };
+  if (m.validTo && m.validTo < TODAY) { mult *= 0.3; flags.push(`⚠ expired ${m.validTo}`); }
+  if (superseded.has(m.name)) { mult *= 0.2; flags.push("⤴ superseded"); }
+  const cm = CONF_MULT[m.confidence] ?? 1; if (cm < 1) { mult *= cm; flags.push(`confidence:${m.confidence}`); }
+  return { mult, flags };
+}
 if (!query) { console.error('usage: memory search "<query>"'); process.exit(2); }
 if (docs.length === 0) { console.log("(no markdown found in the given roots)"); process.exit(0); }
 const k1 = 1.5, b = 0.75;
@@ -191,7 +225,8 @@ const scored = docs.map((d, i) => {
   for (const t of toks) tf.set(t, (tf.get(t) ?? 0) + 1);
   let score = 0;
   for (const qt of qToks) { const f = tf.get(qt) ?? 0; if (!f) continue; score += idf(qt) * (f * (k1 + 1)) / (f + k1 * (1 - b + b * (toks.length / avgdl))); }
-  return { ...d, score };
+  const lc = lifecycle(d.m);
+  return { ...d, score: score * lc.mult, flags: lc.flags };
 }).filter((d) => d.score > 0).sort((a, b) => b.score - a.score);
 const home = process.env.HOME || "";
 const rel = (f) => f.replace(`${home}/.claude/projects/`, "").replace(/^-home[^/]*\/memory\//, "memory/").replace(`${home}/projects/5dive/`, "").replace("/home/claude/projects/5dive/", "");
@@ -203,7 +238,7 @@ for (const d of scored) {
   const cost = estTokens(snippet);
   if (used + cost > MAX_TOKENS && shown > 0) break;
   used += cost; shown++;
-  console.log(`[${d.score.toFixed(2)}] ${rel(d.file)}  ›  ${d.heading}`);
+  console.log(`[${d.score.toFixed(2)}] ${rel(d.file)}  ›  ${d.heading}${d.flags && d.flags.length ? "  [" + d.flags.join(" · ") + "]" : ""}`);
   console.log(snippet.split("\n").map((l) => "    " + l).join("\n"));
   console.log("");
 }
@@ -221,6 +256,7 @@ MEMJS
 # per-agent stores (deny-by-default, same posture as the DIVE-481 gate).
 _memory_add() {
   local name="" type="" desc="" store="mine" tags="" force=0
+  local valid_to="" supersedes="" confidence="" provenance=""
   while [ $# -gt 0 ]; do
     case "$1" in
       --name=*)        name="${1#*=}" ;;
@@ -228,6 +264,10 @@ _memory_add() {
       --description=*) desc="${1#*=}" ;;
       --store=*)       store="${1#*=}" ;;
       --tags=*)        tags="${1#*=}" ;;
+      --valid-to=*)    valid_to="${1#*=}" ;;
+      --supersedes=*)  supersedes="${1#*=}" ;;
+      --confidence=*)  confidence="${1#*=}" ;;
+      --provenance=*)  provenance="${1#*=}" ;;
       --force)         force=1 ;;
       -h|--help)       _memory_usage; return 0 ;;
       *)               fail "$E_USAGE" "memory add: unknown arg: $1" ;;
@@ -243,6 +283,12 @@ _memory_add() {
     [ -n "$type" ] || fail "$E_USAGE" "--type=user|feedback|project|reference is required for your own store"
     case "$type" in user|feedback|project|reference) : ;; *) fail "$E_VALIDATION" "bad --type '$type' (user | feedback | project | reference)" ;; esac
   fi
+  # DIVE-1024 lifecycle envelope (all optional; absent = pre-1024 behavior).
+  if [ -n "$valid_to" ]; then printf '%s' "$valid_to" | grep -qE '^[0-9]{4}-[0-9]{2}-[0-9]{2}$' \
+      || fail "$E_VALIDATION" "--valid-to must be an ISO date (YYYY-MM-DD)"; fi
+  if [ -n "$confidence" ]; then case "$confidence" in high|medium|low) : ;; *) fail "$E_VALIDATION" "--confidence must be high|medium|low" ;; esac; fi
+  if [ -n "$supersedes" ]; then printf '%s' "$supersedes" | grep -qE '^[a-z0-9][a-z0-9_-]{0,63}$' \
+      || fail "$E_VALIDATION" "--supersedes must be the slug of the memory it replaces"; fi
   [ -t 0 ] && fail "$E_USAGE" "memory add reads the body on stdin — pipe or heredoc it"
   local body; body=$(cat)
   [ -n "$(printf '%s' "$body" | tr -d '[:space:]')" ] || fail "$E_USAGE" "empty body on stdin — nothing to remember"
@@ -291,13 +337,21 @@ _memory_add() {
 
   if [ "$store" = "wiki" ]; then
     { printf -- '---\ntitle: %s\n' "$name"
-      [ -n "$tags" ] && printf 'tags: [%s]\n' "$tags"
+      [ -n "$tags" ]       && printf 'tags: [%s]\n' "$tags"
+      [ -n "$confidence" ] && printf 'confidence: %s\n' "$confidence"
+      [ -n "$valid_to" ]   && printf 'valid_to: %s\n' "$valid_to"
+      [ -n "$supersedes" ] && printf 'supersedes: %s\n' "$supersedes"
+      [ -n "$provenance" ] && printf 'provenance: "%s"\n' "$(printf '%s' "$provenance" | sed 's/"/\\"/g')"
       printf 'updated: %s\ncompiled_by: %s\n---\n\n%s\n' "$today" "$who" "$body"
     } > "$file"
   else
     { printf -- '---\nname: %s\ndescription: "%s"\nmetadata:\n  type: %s\n  compiled_by: %s\n  compiled_at: %s\n' \
         "$name" "$(printf '%s' "$desc" | sed 's/"/\\"/g')" "$type" "$who" "$today"
-      [ -n "$tags" ] && printf '  tags: [%s]\n' "$tags"
+      [ -n "$tags" ]       && printf '  tags: [%s]\n' "$tags"
+      [ -n "$confidence" ] && printf '  confidence: %s\n' "$confidence"
+      [ -n "$valid_to" ]   && printf '  valid_to: %s\n' "$valid_to"
+      [ -n "$supersedes" ] && printf '  supersedes: %s\n' "$supersedes"
+      [ -n "$provenance" ] && printf '  provenance: "%s"\n' "$(printf '%s' "$provenance" | sed 's/"/\\"/g')"
       printf -- '---\n\n%s\n' "$body"
     } > "$file"
   fi
