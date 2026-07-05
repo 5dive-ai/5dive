@@ -694,3 +694,193 @@ cmd_cost() {
   echo
   echo "  set a budget:  5dive usage budget set <agent> --daily=<tok> [--ceiling=<tok>] [--hard-stop]"
 }
+
+# --- activity log (DIVE-1022): "what your agent actually did" -----------------
+# The trust surface the persistent-VM model can show and a resetting cloud agent
+# can't: a structured per-run trail of FILES TOUCHED (Edit/Write/MultiEdit/
+# NotebookEdit), COMMANDS RUN (Bash), and COST (tokens) — reconstructed from the
+# same Claude Code session transcripts `usage` reads (each assistant turn logs
+# message.content[] tool_use blocks + message.usage + a timestamp). Read-only;
+# scoped to one agent, optionally to one task's start/done window.
+
+# activity_collect <agent> <since_epoch> <task_start|-> <task_end|-> — emit one
+# JSON object: {agent,window,files[],commands[],reads[],counts,tokens}. Bounded
+# to the window by file mtime + per-turn timestamp; task window (if given as
+# epochs) further clips which turns count.
+activity_collect() {
+  local agent="$1" since="$2" tstart="$3" tend="$4"
+  A_AGENT="$agent" A_SINCE="$since" A_TSTART="$tstart" A_TEND="$tend" python3 - <<'PY'
+import os, json, glob, time, pwd, datetime as dt
+
+agent = os.environ["A_AGENT"]
+since = int(os.environ["A_SINCE"])
+now   = int(time.time())
+def _opt(k):
+    v = os.environ.get(k, "-")
+    return int(v) if v not in ("-", "") else None
+tstart = _opt("A_TSTART"); tend = _opt("A_TEND")
+
+def to_epoch(s):
+    if not s: return None
+    s = s.strip()
+    try:
+        if s.endswith("Z"): s = s[:-1] + "+00:00"
+        d = dt.datetime.fromisoformat(s.replace(" ", "T", 1) if " " in s and "T" not in s else s)
+        if d.tzinfo is None: d = d.replace(tzinfo=dt.timezone.utc)
+        return int(d.timestamp())
+    except Exception:
+        return None
+
+try:
+    home = pwd.getpwnam("agent-" + agent).pw_dir
+except KeyError:
+    home = "/home/agent-" + agent
+
+files = {}      # mutated path -> {"edits":n, "last":ts}
+reads = {}      # read path -> count
+commands = []   # {"ts","cmd","desc"}
+counts = {"edit":0,"write":0,"multiedit":0,"notebook":0,"bash":0,"read":0,"turns":0}
+tot = out = 0
+lo = since if tstart is None else max(since, tstart)
+hi = now   if tend   is None else tend
+
+pat = os.path.join(home, ".claude", "projects", "*", "*.jsonl")
+for path in glob.glob(pat):
+    try:
+        if os.path.getmtime(path) < lo:  # whole file predates window
+            continue
+    except OSError:
+        continue
+    try:
+        f = open(path, "r", errors="ignore")
+    except OSError:
+        continue
+    with f:
+        for line in f:
+            if '"tool_use"' not in line and '"usage"' not in line:
+                continue
+            try:
+                o = json.loads(line)
+            except Exception:
+                continue
+            if o.get("type") != "assistant":
+                continue
+            ts = to_epoch(o.get("timestamp"))
+            if ts is None or ts < lo or ts > hi:
+                continue
+            msg = o.get("message") or {}
+            u = msg.get("usage") or {}
+            tot += int(u.get("input_tokens") or 0) + int(u.get("output_tokens") or 0) + int(u.get("cache_creation_input_tokens") or 0)
+            out += int(u.get("output_tokens") or 0)
+            content = msg.get("content") or []
+            if not isinstance(content, list):
+                continue
+            saw_tool = False
+            for b in content:
+                if not isinstance(b, dict) or b.get("type") != "tool_use":
+                    continue
+                saw_tool = True
+                nm = b.get("name") or ""
+                inp = b.get("input") or {}
+                if nm == "Bash":
+                    cmd = (inp.get("command") or "").strip()
+                    commands.append({"ts": ts, "cmd": cmd, "desc": (inp.get("description") or "").strip()})
+                    counts["bash"] += 1
+                elif nm in ("Edit", "Write", "MultiEdit", "NotebookEdit"):
+                    p = inp.get("file_path") or inp.get("notebook_path") or "?"
+                    e = files.setdefault(p, {"edits": 0, "last": ts})
+                    e["edits"] += 1; e["last"] = max(e["last"], ts)
+                    counts[{"Edit":"edit","Write":"write","MultiEdit":"multiedit","NotebookEdit":"notebook"}[nm]] += 1
+                elif nm == "Read":
+                    p = inp.get("file_path") or "?"
+                    reads[p] = reads.get(p, 0) + 1
+                    counts["read"] += 1
+            if saw_tool:
+                counts["turns"] += 1
+
+file_rows = sorted(({"path": p, "edits": v["edits"], "last": v["last"]} for p, v in files.items()),
+                   key=lambda r: (-r["edits"], -r["last"]))
+read_rows = sorted(({"path": p, "count": c} for p, c in reads.items()), key=lambda r: -r["count"])
+commands.sort(key=lambda c: c["ts"])
+
+print(json.dumps({
+    "agent": agent,
+    "window": {"since": lo, "now": hi},
+    "files": file_rows, "reads": read_rows, "commands": commands,
+    "counts": counts, "tokens": {"total": tot, "output": out},
+}))
+PY
+}
+
+# cmd_activity — `5dive activity <agent> [--7d] [--task=DIVE-N] [--limit=N] [--json]`
+cmd_activity() {
+  ensure_state
+  local agent="" win_flag="24h" task="" limit=25 a
+  local args=()
+  for a in "$@"; do
+    case "$a" in
+      --7d|7d|--week)  win_flag="7d" ;;
+      --24h|24h|--day) win_flag="24h" ;;
+      --task=*)        task="${a#--task=}" ;;
+      --limit=*)       limit="${a#--limit=}" ;;
+      --*)             fail "$E_USAGE" "unknown flag: $a (usage: 5dive activity <agent> [--7d] [--task=DIVE-N] [--limit=N])" ;;
+      *)               args+=("$a") ;;
+    esac
+  done
+  [[ ${#args[@]} -eq 1 ]] || fail "$E_USAGE" "usage: 5dive activity <agent> [--7d] [--task=DIVE-N] [--limit=N] [--json]"
+  agent="${args[0]}"
+  [[ "$limit" =~ ^[0-9]+$ ]] || fail "$E_VALIDATION" "--limit must be an integer"
+  require_root
+
+  # resolve the window: a --task clips to that task's started/done span (and
+  # widens the mtime floor to the task start), else the rolling 24h/7d window.
+  local since tstart="-" tend="-" twin_label=""
+  since=$(( $(date +%s) - $(usage_window_secs "$win_flag") ))
+  if [[ -n "$task" ]]; then
+    tasks_db_init
+    local trow; trow=$(db "SELECT COALESCE(strftime('%s',started_at),'')||'|'||COALESCE(strftime('%s',done_at),'')||'|'||COALESCE(assignee,'')||'|'||COALESCE(title,'')
+                          FROM tasks WHERE ident=$(sqlq "$task");" 2>/dev/null || echo "")
+    [[ -n "$trow" ]] || fail "$E_NOT_FOUND" "no task $task"
+    local ts_start ts_done t_assignee t_title
+    IFS='|' read -r ts_start ts_done t_assignee t_title <<<"$trow"
+    [[ -n "$ts_start" ]] || fail "$E_GENERIC" "$task hasn't started (no started_at) — nothing to attribute"
+    tstart="$ts_start"; tend="${ts_done:-$(date +%s)}"
+    since="$ts_start"
+    twin_label="$task — ${t_title}"
+    # default the agent arg to the task's assignee if the two disagree, but honor
+    # an explicit agent (a task may have been worked by its assignee only).
+  fi
+
+  local data; data=$(activity_collect "$agent" "$since" "$tstart" "$tend") \
+    || fail "$E_GENERIC" "failed to read activity for '$agent'"
+
+  if (( JSON_MODE )); then
+    jq -c --arg win "$win_flag" --arg task "$task" \
+      '{ok:true, data: (. + {windowLabel:$win, task:($task|select(length>0))})}' <<<"$data"
+    return
+  fi
+
+  local label; [[ "$win_flag" == "7d" ]] && label="last 7d" || label="last 24h"
+  [[ -n "$task" ]] && label="$twin_label"
+  echo "ACTIVITY — ${agent}  (${label})"
+  jq -r "$USAGE_JQ_HELPERS"'
+    ((.counts.edit + .counts.write + .counts.multiedit + .counts.notebook)) as $ops |
+    "  files touched: " + ((.files|length)|tostring) + " (" + ($ops|tostring) + " edits)"
+    + "   commands: " + (.counts.bash|tostring)
+    + "   reads: "    + (.counts.read|tostring)
+    + "   turns: "    + (.counts.turns|tostring)
+    + "   cost: "     + (.tokens.total|htok)' <<<"$data"
+  echo
+  echo "  FILES TOUCHED"
+  jq -r --argjson lim "$limit" '
+    if (.files|length)==0 then "    (none)"
+    else ((.files[:$lim][] | "    \(.edits)×  \(.path)"),
+          (if (.files|length) > $lim then "    (+\((.files|length)-$lim) more — raise --limit)" else empty end)) end' <<<"$data"
+  echo
+  echo "  COMMANDS RUN (most recent ${limit})"
+  jq -r --argjson lim "$limit" '
+    if (.commands|length)==0 then "    (none)"
+    else (.commands | reverse | .[:$lim] | .[] |
+      "    " + (.ts|gmtime|strftime("%m-%d %H:%M")) + "  " +
+      (if (.desc|length)>0 then .desc else (.cmd|gsub("\n";" ")|.[:80]) end)) end' <<<"$data"
+}

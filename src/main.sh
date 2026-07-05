@@ -204,6 +204,7 @@ Usage (per-agent / per-task token burn — subscription tokens, no dollars):
   5dive usage [--7d]                                 # board: top agents + top tasks by tokens (24h default)
   5dive usage <agent> [--7d]                         # one agent: per-model + per-task breakdown
   5dive cost [--7d]                                  # budget-focused: per-agent 24h burn vs soft/ceiling + state
+  5dive activity <agent> [--7d] [--task=DIVE-N]      # what the agent actually did: files touched, commands run, cost
   5dive usage budget set <agent> --daily=<tok> [--ceiling=<tok>] [--hard-stop]  # soft warn + optional hard-stop ceiling
   5dive usage budget ls | clear <agent>              # hard-stop is OFF by default (warn-only); check runs on the heartbeat
 
@@ -573,6 +574,11 @@ main() {
       # + the enforcement subcommands. Same read-only/root posture as `usage`;
       # `cost budget ...` proxies to the same store writes (root inside).
       cmd_cost "$@" ;;
+    activity)
+      # DIVE-1022: "what your agent actually did" — per-run/per-task trail of
+      # files touched + commands run + cost, from the session transcripts. Same
+      # read-only posture as `usage` (root to read sibling homes; no lock/audit).
+      cmd_activity "$@" ;;
     digest)
       # Deterministic per-fleet standup digest (DIVE-544 Tier 1): task queue +
       # usage + heartbeat health, zero agent tokens. Read-only reporting; no
