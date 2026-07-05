@@ -56,24 +56,30 @@ doctor_check_cmd() {
 
 cmd_doctor() {
   require_root
-  local filter=""
+  local filter="" want_fix=0 dry=0
   DOCTOR_REPAIR=0
   DOCTOR_CHECKS='[]'
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      --repair)     DOCTOR_REPAIR=1 ;;
-      --category=*) filter="${1#--category=}" ;;
-      -*)           fail "$E_USAGE" "unknown flag: $1" ;;
-      *)            fail "$E_USAGE" "extra arg: $1" ;;
+      # --fix is the discoverable alias for the older --repair (both apply the
+      # reversible auto-heals). --dry-run forces a preview: report what --fix
+      # WOULD do without touching anything. (A bare `doctor` with no --fix is
+      # already a preview — every fixable check says "run with --fix".)
+      --fix|--repair) want_fix=1 ;;
+      --dry-run)      dry=1 ;;
+      --category=*)   filter="${1#--category=}" ;;
+      -*)             fail "$E_USAGE" "unknown flag: $1" ;;
+      *)              fail "$E_USAGE" "extra arg: $1" ;;
     esac
     shift
   done
+  (( want_fix && ! dry )) && DOCTOR_REPAIR=1
   case "$filter" in
-    ""|deps|types|auth|creds|registry|shelld|channels|memory) ;;
-    *) fail "$E_USAGE" "unknown --category (deps|types|auth|creds|registry|shelld|channels|memory)" ;;
+    ""|deps|types|auth|creds|registry|shelld|channels|host|memory) ;;
+    *) fail "$E_USAGE" "unknown --category (deps|types|auth|creds|registry|shelld|channels|host|memory)" ;;
   esac
 
-  local run_deps=0 run_types=0 run_auth=0 run_creds=0 run_registry=0 run_shelld=0 run_channels=0 run_memory=0
+  local run_deps=0 run_types=0 run_auth=0 run_creds=0 run_registry=0 run_shelld=0 run_channels=0 run_host=0 run_memory=0
   [[ -z "$filter" || "$filter" == "deps"     ]] && run_deps=1
   [[ -z "$filter" || "$filter" == "types"    ]] && run_types=1
   [[ -z "$filter" || "$filter" == "auth"     ]] && run_auth=1
@@ -81,6 +87,7 @@ cmd_doctor() {
   [[ -z "$filter" || "$filter" == "registry" ]] && run_registry=1
   [[ -z "$filter" || "$filter" == "shelld"   ]] && run_shelld=1
   [[ -z "$filter" || "$filter" == "channels" ]] && run_channels=1
+  [[ -z "$filter" || "$filter" == "host"     ]] && run_host=1
   [[ -z "$filter" || "$filter" == "memory"   ]] && run_memory=1
 
   # --- deps ---
@@ -388,6 +395,62 @@ cmd_doctor() {
             "no channel-registration event found in latest MCP log $(basename "$latest") — restart the agent to refresh" false false
         fi
 
+        # Dead inbound poller (reference_telegram_plugin_poller_dead_after_restart):
+        # the plugin's `bun ... start` child is BOTH the getUpdates poller AND the
+        # MCP send/edit host. A service restart can leave it un-respawned — outbound
+        # replies (direct curl) still work, so inbound breaks SILENTLY (the user's
+        # DMs queue at Telegram). Only meaningful when the service is active and the
+        # session has been up long enough to have spawned it (don't flag an agent
+        # mid-restart). If the poller process is gone we confirm with a getWebhookInfo
+        # probe before any disruptive restart: queued updates => auto-heal; none =>
+        # warn only (could just be idle), never a false-positive bounce.
+        local svc="5dive-agent@${name}.service"
+        if [[ "$(systemctl is-active "$svc" 2>/dev/null)" == "active" ]]; then
+          local cpid2 etimes2
+          # `|| true` on each: a bare `x=$(pipeline)` assignment inherits the
+          # pipeline's status, and under `set -euo pipefail` a non-zero one (pgrep
+          # no-match, ps bad-pid) would abort the whole doctor run before the
+          # envelope prints. Keep them non-fatal.
+          cpid2=$(pgrep -u "$user" -f 'claude' 2>/dev/null \
+                  | while read -r p; do echo "$(ps -o etimes= -p "$p" 2>/dev/null | tr -d ' ') $p"; done \
+                  | sort -rn | awk 'NR==1{print $2}' || true)
+          etimes2=$(ps -o etimes= -p "${cpid2:-0}" 2>/dev/null | tr -d ' ' || true)
+          if [[ "$etimes2" =~ ^[0-9]+$ ]] && (( etimes2 > 90 )); then
+            # The poller is `bun run --cwd .../plugins/cache/5dive-plugins/telegram/<ver>
+            # --shell=bun --silent start` — other args sit between the version and
+            # `start`, so match on the cache path + start with `.*` (spans spaces).
+            # The claude parent carries `telegram@5dive-plugins` (reversed), never
+            # `5dive-plugins/telegram/`, so this can't false-match it.
+            if pgrep -u "$user" -f 'plugins/cache/5dive-plugins/telegram/.*start' >/dev/null 2>&1; then
+              doctor_add channels "agent:$name poller" ok "telegram inbound poller alive"
+            else
+              local tok="" pend=0 wh=""
+              tok=$(grep -oE '^TELEGRAM_BOT_TOKEN=.*' "${ENV_DIR}/${name}.env" 2>/dev/null \
+                    | head -1 | cut -d= -f2- | tr -d '"'"'"'"' | tr -d ' ' || true)
+              if [[ -n "$tok" ]]; then
+                wh=$(curl -fsS --max-time 4 "https://api.telegram.org/bot${tok}/getWebhookInfo" 2>/dev/null || echo '')
+                pend=$(jq -r '.result.pending_update_count // 0' <<<"$wh" 2>/dev/null || echo 0)
+                [[ "$pend" =~ ^[0-9]+$ ]] || pend=0
+              fi
+              if (( pend > 0 )) && (( DOCTOR_REPAIR )); then
+                if systemd-run --on-active=1 --collect /bin/systemctl restart "$svc" >/dev/null 2>&1; then
+                  doctor_add channels "agent:$name poller" warn \
+                    "inbound telegram poller was dead ($pend update(s) queued, nobody polling) — restart scheduled to respawn the plugin server + drain the backlog" true true
+                else
+                  doctor_add channels "agent:$name poller" error \
+                    "inbound telegram poller dead ($pend queued); auto-restart failed — run: systemctl restart $svc" true false
+                fi
+              elif (( pend > 0 )); then
+                doctor_add channels "agent:$name poller" error \
+                  "inbound telegram poller dead — $pend update(s) queued at Telegram, nobody polling; DMs silently lost. Fix: 5dive doctor --fix (or systemctl restart $svc)" true false
+              else
+                doctor_add channels "agent:$name poller" warn \
+                  "telegram plugin poller process not found (no queued updates — may be idle); if inbound is dead, restart to respawn it: systemctl restart $svc" true false
+              fi
+            fi
+          fi
+        fi
+
         # Plugin-version drift: Claude loads plugins once at launch, so an
         # agent that's been running since before the last `plugin update` is
         # still executing the OLD telegram plugin in memory (and its old hooks)
@@ -435,6 +498,45 @@ cmd_doctor() {
           fi
         fi
       done
+    fi
+  fi
+
+  # --- host: needrestart auto-restart cascade (reference_needrestart_autorestart_cascade) ---
+  #
+  # unattended-upgrades patching a shared lib triggers needrestart, which under
+  # no-tty falls back to auto mode 'a' and bounces EVERY service linking the lib
+  # in one cascade — once SIGTERM'd every agent mid-turn plus a ~3s postgres
+  # outage. Fix: force list-only ($nrconf{restart}='l') so security patches still
+  # apply but services are only LISTED; controlled restarts run on the host/nightly
+  # cron. Idempotent conf.d drop-in, same shape harden.sh ships to customer VMs.
+  if (( run_host )); then
+    if ! command -v needrestart >/dev/null 2>&1 && [[ ! -d /etc/needrestart ]]; then
+      doctor_add host needrestart ok "needrestart not installed — no auto-restart cascade risk"
+    else
+      local nr_listonly=0 nrf
+      for nrf in /etc/needrestart/needrestart.conf /etc/needrestart/conf.d/*.conf; do
+        [[ -f "$nrf" ]] || continue
+        if grep -qE "^[[:space:]]*\\\$nrconf\{restart\}[[:space:]]*=[[:space:]]*'l'" "$nrf" 2>/dev/null; then
+          nr_listonly=1; break
+        fi
+      done
+      if (( nr_listonly )); then
+        doctor_add host needrestart ok "needrestart is list-only (\$nrconf{restart}='l') — no auto-bounce cascade"
+      elif (( DOCTOR_REPAIR )); then
+        local nrdrop=/etc/needrestart/conf.d/99-5dive-overrides.conf
+        if mkdir -p /etc/needrestart/conf.d 2>/dev/null && printf '%s\n' \
+             "# 5dive: LIST services needing restart, never auto-bounce them on a" \
+             "# library upgrade. An unattended-upgrades + needrestart cascade once" \
+             "# SIGTERM'd every agent mid-turn (ref: needrestart-autorestart-cascade)." \
+             "# Controlled restarts run on the host/nightly cron instead." \
+             "\$nrconf{restart} = 'l';" > "$nrdrop" 2>/dev/null; then
+          doctor_add host needrestart ok "wrote $nrdrop (list-only) — auto-restart cascade neutralized" true true
+        else
+          doctor_add host needrestart error "failed to write needrestart list-only drop-in (check perms on /etc/needrestart)" true false
+        fi
+      else
+        doctor_add host needrestart warn "needrestart may auto-restart services on library upgrades — a mass agent-bounce cascade risk; fix: 5dive doctor --fix" true false
+      fi
     fi
   fi
 

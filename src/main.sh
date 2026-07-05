@@ -209,14 +209,19 @@ Memory (queryable team memory — read-path, DIVE-726):
   5dive memory search "<query>" [--limit=N] [--max-tokens=T]  # BM25-ranked snippets from the agent's memory stores + wiki, with provenance
 
 Health:
-  5dive doctor [--repair] [--category=deps|types|auth|creds|registry|shelld|channels]
+  5dive doctor [--fix] [--dry-run] [--category=deps|types|auth|creds|registry|shelld|channels|host|memory]
     Walks deps (tmux/jq/bun/python3/nvm/node/npm), type bins, live auth
-    probes, stale shadow-credential heal (creds), registry integrity, and
-    shelld reachability. --repair attempts reversible fixes (apt installs,
-    type installer recipes, bun, shelld restart, registry reseed, rename a
-    stale ~/.claude/.credentials.json that shadows an env-token). Output
-    envelope always {ok:true,data:{...}};
-    branch on data.summary.errors in CI.
+    probes, stale shadow-credential heal (creds), registry integrity, channel
+    health (allowlist + dead inbound telegram poller), host safety (needrestart
+    auto-restart cascade), shelld reachability, and memory hygiene. --fix
+    (alias: --repair) attempts reversible self-heals: apt installs, type
+    installer recipes, bun, shelld restart, registry reseed, rename a stale
+    ~/.claude/.credentials.json that shadows an env-token, restart an agent
+    whose telegram poller died (silently drops inbound DMs), and force
+    needrestart to list-only so a library upgrade can't bounce the whole fleet.
+    A bare `doctor` (no --fix) is a preview — every fixable check tells you so;
+    --dry-run previews even alongside --fix. Output envelope always
+    {ok:true,data:{...}}; branch on data.summary.errors in CI.
 
 Types: ${!TYPE_BIN[*]}
 
@@ -477,13 +482,16 @@ main() {
         *) fail "$E_USAGE" "unknown account command: $acctcmd" ;;
       esac ;;
     doctor)
-      # Only audit when --repair is set (read-only runs would spam the log).
+      # Only audit when a mutating run is requested (--fix/--repair); read-only
+      # runs (and --dry-run previews) would spam the log.
       for a in "$@"; do
-        if [[ "$a" == "--repair" ]]; then
+        if [[ "$a" == "--repair" || "$a" == "--fix" ]]; then
           AUDIT_CMD="doctor"; AUDIT_ARGS=("$@")
           break
         fi
       done
+      # --dry-run cancels the mutation, so don't audit it as one.
+      for a in "$@"; do [[ "$a" == "--dry-run" ]] && AUDIT_CMD=""; done
       cmd_doctor "$@" ;;
     paperclip-seed)
       # Internal: backfill /home/claude/.<type>/ symlinks from registered
