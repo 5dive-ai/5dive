@@ -37,6 +37,7 @@ Compose (declarative agents via 5dive.yaml):
 
 Agents:
   5dive hire <name> [--role="CTO"]  # sugar: agent create (+ org set)
+  5dive market [<keyword>] [--role=<r>] [--rarity=<t>]  # browse/search the agent market; preview: 5dive market show <slug>
   5dive hire <role> --from-market [--as=<name>]  # hire from the open market; see `5dive hire --help`
   5dive agent list
   5dive agent info <name>                            # type, CLI version, selected model, channel + state
@@ -265,6 +266,12 @@ main() {
   # can't race across concurrent dashboard clicks. Read-only commands (list,
   # logs, stats, types, auth status/poll) bypass the lock and the audit log.
   case "$top" in
+    market)
+      # DIVE-1020: front door to the agent market — browse/search the
+      # character-pack registry + preview a persona before hiring. Read-only
+      # (curls the public index), so no lock, no root, no audit — same posture
+      # as `agent marketplace`, which it supersedes as the top-level surface.
+      cmd_market "$@" ;;
     hire)
       # DIVE-603: ergonomic alias for `agent create` (+ `org set`). Mutating —
       # take the registry lock like create; cmd_hire's inner create call is a

@@ -430,6 +430,164 @@ cmd_marketplace() {
   esac
 }
 
+# `5dive market` (DIVE-1020) — the front door to the agent market: browse/search
+# the character-pack registry (rarity-first) and preview a persona before hiring.
+# Read-only (curls the public index; no root/lock/audit — same posture as
+# `agent marketplace`). Pairs with `hire <role> --from-market` (which provisions)
+# and the OpenAgent registry (each pack carries a did:key identity).
+#
+#   5dive market [<keyword>] [--role=<r>] [--rarity=<t>] [--seasoned] [--json]
+#   5dive market search <keyword>          # alias for the above
+#   5dive market show <slug>               # preview one persona (tier, skills, card, DID)
+_market_usage() {
+  cat <<'USAGE'
+5dive market — browse & search the agent market before you hire (DIVE-1020)
+
+  5dive market                          # browse every pack, rarity-first
+  5dive market <keyword>                # search slug/name/tagline/role/tags/skills
+  5dive market search <keyword>         #   (explicit alias)
+  5dive market --role=<r>               # filter by role/character (e.g. engineer, ceo)
+  5dive market --rarity=<tier>          # filter by tier (mythical|legendary|epic|rare)
+  5dive market --seasoned               # only packs that ship pre-trained memory
+  5dive market show <slug>              # preview a persona: tier, model, skills, card, DID
+  --json                                # machine-readable (dashboard/agent feed)
+
+  Then: 5dive hire <role> --from-market --dry-run   (preview a real hire, provisions nothing)
+        5dive agent inspect <slug>                  (full install-time disclosure)
+        5dive agent import <slug> --as=<name>       (clone this exact persona)
+USAGE
+}
+
+# jq helper text shared by the market renderers: rarity ranking, base-skill set
+# (baseline skills every agent gets — filtered from the "distinctive" count so a
+# pack isn't credited for them), and a 0-100 completeness score.
+_MARKET_JQ='
+  def rank: {"mythical":0,"legendary":1,"epic":2,"rare":3}[(.//"")] // 4;
+  def base: ["notify-user","find-skills","compile-knowledge","5dive-cli"];
+  def distinct: ((.skills // []) - base);
+  def complete:
+    ( (if ((.tagline // "")|length) > 0 then 1 else 0 end)
+    + (if (distinct|length) > 0        then 1 else 0 end)
+    + (if .includesMemory              then 1 else 0 end)
+    + (if ((.avatar  // "")|length) > 0 then 1 else 0 end)
+    + (if ((.did     // "")|length) > 0 then 1 else 0 end) ) * 20;
+  def shortmodel: (. // "-" | sub("^claude-";"") | sub("-20[0-9]+$";""));
+'
+
+cmd_market() {
+  local sub="${1:-ls}"
+  case "$sub" in
+    -h|--help)          _market_usage; return 0 ;;
+    show|info|preview)  shift || true; cmd_market_show "$@"; return ;;
+    ls|list|browse)     [[ $# -gt 0 ]] && shift || true ;;
+    search|find)        shift || true ;;   # explicit search alias; keyword(s) follow
+  esac
+
+  local kw="" role="" rarity="" seasoned=0 a
+  for a in "$@"; do
+    case "$a" in
+      --role=*)             role="${a#--role=}" ;;
+      --rarity=*)           rarity="${a#--rarity=}" ;;
+      --tier=*)             rarity="${a#--tier=}" ;;
+      --seasoned|--memory)  seasoned=1 ;;
+      --*)                  fail "$E_USAGE" "unknown flag: $a (see: 5dive market --help)" ;;
+      *)                    [[ -z "$kw" ]] && kw="$a" || kw="$kw $a" ;;
+    esac
+  done
+
+  local idx; idx=$(_marketplace_index) \
+    || fail "$E_GENERIC" "could not reach the agent market ($(_marketplace_base))"
+  jq -e '.packs' >/dev/null 2>&1 <<<"$idx" || fail "$E_GENERIC" "market index is malformed"
+
+  local filtered
+  filtered=$(jq -c \
+    --arg kw   "$(printf '%s' "$kw"     | tr '[:upper:]' '[:lower:]')" \
+    --arg role "$(printf '%s' "$role"   | tr '[:upper:]' '[:lower:]')" \
+    --arg rar  "$(printf '%s' "$rarity" | tr '[:upper:]' '[:lower:]')" \
+    --argjson seasoned "$seasoned" '
+    def L(x): (x // "" | ascii_downcase);
+    .packs | map(select(
+        ($kw=="" or (
+           (L(.slug)|contains($kw)) or (L(.name)|contains($kw)) or (L(.tagline)|contains($kw))
+           or (L(.character)|contains($kw))
+           or (((.tags//[])   + (.skills//[])) | any(ascii_downcase|contains($kw)))
+        ))
+        and ($role=="" or (L(.character)|contains($role)) or ((.tags//[])|any(ascii_downcase|contains($role))))
+        and ($rar=="" or (L(.rarity)==$rar))
+        and ($seasoned==0 or (.includesMemory==true))
+    ))' <<<"$idx")
+
+  local n total; n=$(jq 'length' <<<"$filtered"); total=$(jq '.packs|length' <<<"$idx")
+
+  if (( JSON_MODE )); then
+    ok "" '{registry:($org+"/character-packs"), query:{keyword:$kw,role:$role,rarity:$rar,seasoned:($s==1)}, total:$t, count:$n, packs:$p}' \
+       --arg org "$(gh_org)" --arg kw "$kw" --arg role "$role" --arg rar "$rarity" \
+       --argjson s "$seasoned" --argjson t "$total" --argjson n "$n" --argjson p "$filtered"
+    return
+  fi
+
+  if (( n == 0 )); then
+    local q=""; [[ -n "$kw" ]] && q+=" '$kw'"; [[ -n "$role" ]] && q+=" role=$role"; [[ -n "$rarity" ]] && q+=" rarity=$rarity"
+    echo "No agents match${q} in the market ($(gh_org)/character-packs)."
+    echo "Browse all: 5dive market"
+    return
+  fi
+  local hdr="AGENT MARKET — $(gh_org)/character-packs  ($n"
+  [[ "$n" != "$total" ]] && hdr+=" of $total, filtered"
+  echo "${hdr} packs)"
+  echo
+  jq -r "$_MARKET_JQ"'
+    sort_by([(.rarity|rank), -(distinct|length), (if .includesMemory then 0 else 1 end)])
+    | (["SLUG","NAME","TIER","ROLE","MODEL","SKILLS","MEMORY","COMPLETE"]|@tsv),
+      (.[] |
+        [ .slug, .name, (.rarity // "-"), (.character // "-"),
+          (.model|shortmodel), (distinct|length|tostring),
+          (if .includesMemory then "seasoned" else "persona" end),
+          ((complete|tostring) + "%") ]|@tsv)' <<<"$filtered" \
+    | column -t -s $'\t' | sed 's/^/  /'
+  echo
+  echo "  preview: 5dive market show <slug>    ·    hire: 5dive hire <role> --from-market --dry-run"
+}
+
+# `5dive market show <slug>` — preview a single persona without downloading the
+# pack tarball: metadata from the index + the human `card.md` blurb + its
+# OpenAgent DID. For the full executable disclosure, `agent inspect <slug>`.
+cmd_market_show() {
+  local slug="${1:-}"
+  [[ -n "$slug" ]] || fail "$E_USAGE" "usage: 5dive market show <slug>"
+  local idx; idx=$(_marketplace_index) \
+    || fail "$E_GENERIC" "could not reach the agent market ($(_marketplace_base))"
+  local pack; pack=$(jq -c --arg s "$slug" '.packs[] | select(.slug==$s)' <<<"$idx")
+  [[ -n "$pack" && "$pack" != "null" ]] \
+    || fail "$E_NOT_FOUND" "no agent '$slug' in the market (browse: 5dive market)"
+
+  local base card path
+  base=$(_marketplace_base); path=$(jq -r '.path' <<<"$pack")
+  card=$(curl -fsSL --max-time 15 "${base}/${path}/card.md" 2>/dev/null || true)
+
+  if (( JSON_MODE )); then
+    ok "" '{pack:$p, card:$c}' --argjson p "$pack" --arg c "$card"
+    return
+  fi
+  jq -r "$_MARKET_JQ"'
+    "\(.name)  —  \(.rarity // "unranked") · \(.character // "agent")   ·   completeness \(complete)%",
+    "  \(.tagline // "")",
+    "",
+    "  model:   \(.model // "-")    effort: \(.effort // "-")",
+    "  memory:  " + (if .includesMemory then "seasoned — ships pre-trained (distilled lessons)" else "persona-only (no seeded memory)" end),
+    "  skills:  " + (distinct | if length==0 then "(baseline only)" else join(", ") end),
+    "  identity: \(.did // "-")"' <<<"$pack"
+  if [[ -n "$card" ]]; then
+    echo
+    echo "  ── persona preview (card.md) ──"
+    printf '%s\n' "$card" | head -40 | sed 's/^/  /'
+  fi
+  echo
+  echo "  full disclosure:  5dive agent inspect ${slug}"
+  echo "  clone this one:   5dive agent import ${slug} --as=<name>"
+  echo "  hire by role:     5dive hire <role> --from-market --dry-run"
+}
+
 # DIVE-995 pack trust layer. Enumerate the EXECUTABLE surface a pack would grant
 # the imported agent — the "this pack runs X" install-time disclosure and the
 # safety precondition before running ANY third-party pack. Pure + read-only:
