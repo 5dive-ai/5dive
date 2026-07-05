@@ -202,8 +202,9 @@ Supervisor (observe-only fleet health — detect + classify, ZERO auto-actions):
 Usage (per-agent / per-task token burn — subscription tokens, no dollars):
   5dive usage [--7d]                                 # board: top agents + top tasks by tokens (24h default)
   5dive usage <agent> [--7d]                         # one agent: per-model + per-task breakdown
-  5dive usage budget set <agent> --daily=<tokens>    # soft 24h cap → ⚠ on the board (no throttle)
-  5dive usage budget ls | clear <agent>
+  5dive cost [--7d]                                  # budget-focused: per-agent 24h burn vs soft/ceiling + state
+  5dive usage budget set <agent> --daily=<tok> [--ceiling=<tok>] [--hard-stop]  # soft warn + optional hard-stop ceiling
+  5dive usage budget ls | clear <agent>              # hard-stop is OFF by default (warn-only); check runs on the heartbeat
 
 Memory (queryable team memory — read-path, DIVE-726):
   5dive memory search "<query>" [--limit=N] [--max-tokens=T]  # BM25-ranked snippets from the agent's memory stores + wiki, with provenance
@@ -560,6 +561,11 @@ main() {
       # a small soft-cap store. No registry mutation/lock; budget writes take root
       # inside cmd_usage. No audit — pure reporting + a visibility-only cap.
       cmd_usage "$@" ;;
+    cost)
+      # DIVE-1019: budget-focused burn view (per-agent 24h tokens vs soft/ceiling)
+      # + the enforcement subcommands. Same read-only/root posture as `usage`;
+      # `cost budget ...` proxies to the same store writes (root inside).
+      cmd_cost "$@" ;;
     digest)
       # Deterministic per-fleet standup digest (DIVE-544 Tier 1): task queue +
       # usage + heartbeat health, zero agent tokens. Read-only reporting; no

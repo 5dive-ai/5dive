@@ -298,13 +298,17 @@ usage_render_board() {
           (.title | if length > 42 then .[:41] + "…" else . end) ] | @tsv)
     end' <<<"$data" | column -t -s $'\t' | sed 's/^/  /'
 
-  # over-budget callout (soft, visibility-only — no throttle).
+  # over-budget callout: ⚠ at the soft cap, ⛔ at the ceiling (see `5dive cost`).
   local over
-  over=$(jq -r --argjson b "$budgets" '
+  over=$(jq -r "$USAGE_BNORM"'
     (reduce .agents[] as $a ({}; .[$a.name] = $a.total)) as $tot
-    | [ $b | to_entries[] | select(($tot[.key] // 0) > .value)
-        | "  ⚠ " + .key + " over budget: " + (($tot[.key]//0)|tostring) + " > " + (.value|tostring) + " tok" ]
-    | .[]' <<<"$data" 2>/dev/null)
+    | [ $b | to_entries[] | .key as $k | (.value|bnorm) as $v | ($tot[$k] // 0) as $t
+        | if   ($v.hard!=null and $t>=$v.hard)
+            then "  ⛔ " + $k + " at ceiling: " + ($t|tostring) + " >= " + ($v.hard|tostring) + " tok"
+          elif ($v.soft!=null and $t>=$v.soft)
+            then "  ⚠ " + $k + " over soft cap: " + ($t|tostring) + " >= " + ($v.soft|tostring) + " tok"
+          else empty end ]
+    | .[]' --argjson b "$budgets" <<<"$data" 2>/dev/null)
   [[ -n "$over" ]] && { echo; echo "$over"; }
 }
 
@@ -393,15 +397,51 @@ cmd_usage_loops() {
   fi
 }
 
-# --- soft per-agent token budgets (visibility-only; no hard throttle) ---------
-# Store: ${STATE_DIR}/usage-budgets.json = {"<agent>": <daily_token_limit>}.
-# A budget is a 24h token ceiling. We surface an over-budget ⚠ on the board;
-# we never pause or rate-limit an agent (matches the "soft cap" intent — a hard
-# kill on a working agent is the wrong kind of insurance).
+# --- per-agent token budget guardrails (DIVE-1019) ----------------------------
+# Store: ${STATE_DIR}/usage-budgets.json — one entry per agent:
+#   {"<agent>": {"soft":<tok>|null, "hard":<tok>|null, "hardStop":<bool>,
+#                "notified":{"soft":<epoch>,"hard":<epoch>}, "stopped":<bool>}}
+# Back-compat: a bare integer is read as a soft-only budget (the pre-DIVE-1019
+# shape written by `budget set --daily`). `bnorm` normalizes on read.
+#
+# A budget is a rolling-24h token ceiling. Two levels:
+#   soft (--daily)  → warn: alert the owner once per window, ⚠ on the board.
+#   hard (--ceiling)→ stop: alert the owner AND — ONLY if hard-stop is opted in
+#                     (--hard-stop, OFF by default) — turn the agent off
+#                     (heartbeat off + stop). Default stays warn-only, because a
+#                     silent kill on a working agent is the wrong insurance
+#                     (per lodar); the hard-stop is an explicit, reversible choice.
+# `budget check` is the enforcement engine (idempotent; run by the heartbeat).
 USAGE_BUDGETS_FILE="${STATE_DIR}/usage-budgets.json"
+USAGE_BUDGET_STATE_FILE="${STATE_DIR}/usage-budget-state.json"
+
+# jq snippet: normalize a stored budget value (int | object) → canonical object.
+USAGE_BNORM='
+  def bnorm: if type=="number" then {soft:., hard:null, hardStop:false, notified:{}, stopped:false}
+             elif type=="object" then {soft:(.soft//null), hard:(.hard//null),
+                    hardStop:(.hardStop//false), notified:(.notified//{}), stopped:(.stopped//false)}
+             else {soft:null, hard:null, hardStop:false, notified:{}, stopped:false} end;
+'
 
 usage_budget_load() {
   [[ -s "$USAGE_BUDGETS_FILE" ]] && cat "$USAGE_BUDGETS_FILE" 2>/dev/null || echo '{}'
+}
+
+usage_budget_save() {
+  printf '%s\n' "$1" > "$USAGE_BUDGETS_FILE"
+  chmod 0664 "$USAGE_BUDGETS_FILE" 2>/dev/null || true
+}
+
+# Resolve SOME agent's Telegram channel so budget alerts can reach the paired
+# human via _task_send_owner. Mirrors the heartbeat gate-TTL sweep: try the
+# invoking owner first, else the first claude agent that yields a channel.
+usage_resolve_owner_channel() {
+  _task_owner_channel 2>/dev/null && [[ -n "$TASK_CH_TOKEN" ]] && return 0
+  local reg n; reg=$(registry_read 2>/dev/null || echo '{"agents":{}}')
+  for n in $(jq -r '.agents | to_entries[] | select((.value.type//"claude")=="claude") | .key' <<<"$reg" 2>/dev/null); do
+    _task_agent_channel "$n" 2>/dev/null && [[ -n "$TASK_CH_TOKEN" ]] && return 0
+  done
+  return 1
 }
 
 cmd_usage_budget() {
@@ -409,30 +449,49 @@ cmd_usage_budget() {
   case "$sub" in
     ls|list)
       local b; b=$(usage_budget_load)
-      if (( JSON_MODE )); then jq -c '{ok:true,data:.}' <<<"$b"; return; fi
-      jq -r 'if length==0 then "no budgets set (5dive usage budget set <agent> --daily=<tokens>)"
-             else (["AGENT","DAILY_TOKEN_BUDGET"]|@tsv),
-                  (to_entries[]|[.key,(.value|tostring)]|@tsv) end' <<<"$b" \
+      if (( JSON_MODE )); then jq -c "$USAGE_BNORM"'{ok:true,data:(with_entries(.value|=bnorm))}' <<<"$b"; return; fi
+      jq -r "$USAGE_BNORM"'
+        if length==0 then "no budgets set (5dive usage budget set <agent> --daily=<tok> [--ceiling=<tok>] [--hard-stop])"
+        else (["AGENT","SOFT(warn)","CEILING(hard)","HARD-STOP"]|@tsv),
+             (to_entries[] | .value as $v | (.value|bnorm) as $n |
+               [.key, ($n.soft|if .==null then "-" else tostring end),
+                      ($n.hard|if .==null then "-" else tostring end),
+                      (if $n.hardStop then "on" else "off" end)]|@tsv) end' <<<"$b" \
         | column -t -s $'\t'
       ;;
     set)
       require_root
-      local agent="" daily=""
+      local agent="" daily="" ceiling="" hardstop=""
       for a in "$@"; do
         case "$a" in
-          --daily=*) daily="${a#--daily=}" ;;
+          --daily=*)     daily="${a#--daily=}" ;;
+          --ceiling=*)   ceiling="${a#--ceiling=}" ;;
+          --hard-stop)   hardstop="true" ;;
+          --no-hard-stop) hardstop="false" ;;
           --*) fail "$E_USAGE" "unknown flag: $a" ;;
           *) agent="$a" ;;
         esac
       done
-      [[ -n "$agent" ]] || fail "$E_USAGE" "usage: 5dive usage budget set <agent> --daily=<tokens>"
-      [[ "$daily" =~ ^[0-9]+$ ]] || fail "$E_USAGE" "--daily must be an integer token count"
-      local b; b=$(usage_budget_load)
-      b=$(jq -c --arg n "$agent" --argjson v "$daily" '.[$n]=$v' <<<"$b") \
+      [[ -n "$agent" ]] || fail "$E_USAGE" "usage: 5dive usage budget set <agent> [--daily=<tok>] [--ceiling=<tok>] [--hard-stop]"
+      [[ -z "$daily"   || "$daily"   =~ ^[0-9]+$ ]] || fail "$E_USAGE" "--daily must be an integer token count"
+      [[ -z "$ceiling" || "$ceiling" =~ ^[0-9]+$ ]] || fail "$E_USAGE" "--ceiling must be an integer token count"
+      [[ -n "$daily" || -n "$ceiling" || -n "$hardstop" ]] \
+        || fail "$E_USAGE" "nothing to set — pass --daily, --ceiling, and/or --hard-stop"
+      if [[ -n "$daily" && -n "$ceiling" ]] && (( ceiling < daily )); then
+        fail "$E_VALIDATION" "--ceiling ($ceiling) must be >= --daily ($daily)"
+      fi
+      local b cur; b=$(usage_budget_load)
+      cur=$(jq -c "$USAGE_BNORM"'(.[$n] // 0)|bnorm' --arg n "$agent" <<<"$b")
+      [[ -n "$daily"    ]] && cur=$(jq -c --argjson v "$daily"   '.soft=$v'     <<<"$cur")
+      [[ -n "$ceiling"  ]] && cur=$(jq -c --argjson v "$ceiling" '.hard=$v'     <<<"$cur")
+      [[ -n "$hardstop" ]] && cur=$(jq -c --argjson v "$hardstop" '.hardStop=$v' <<<"$cur")
+      # a change of limits re-arms alerting for the new thresholds
+      cur=$(jq -c '.notified={}' <<<"$cur")
+      b=$(jq -c --arg n "$agent" --argjson v "$cur" '.[$n]=$v' <<<"$b") \
         || fail "$E_GENERIC" "failed to update budget"
-      printf '%s\n' "$b" > "$USAGE_BUDGETS_FILE"
-      chmod 0664 "$USAGE_BUDGETS_FILE" 2>/dev/null || true
-      ok "budget set: $agent = $daily tok/24h" "$(jq -c --arg n "$agent" --argjson v "$daily" '{agent:$n,daily:$v}' <<<'{}')"
+      usage_budget_save "$b"
+      ok "budget set: $agent soft=$(jq -r '.soft//"-"' <<<"$cur") ceiling=$(jq -r '.hard//"-"' <<<"$cur") hard-stop=$(jq -r '.hardStop' <<<"$cur")" \
+        "$(jq -c --arg n "$agent" '{agent:$n}+.' <<<"$cur")"
       ;;
     clear|rm|unset)
       require_root
@@ -440,9 +499,198 @@ cmd_usage_budget() {
       [[ -n "$agent" ]] || fail "$E_USAGE" "usage: 5dive usage budget clear <agent>"
       local b; b=$(usage_budget_load)
       b=$(jq -c --arg n "$agent" 'del(.[$n])' <<<"$b")
-      printf '%s\n' "$b" > "$USAGE_BUDGETS_FILE"
+      usage_budget_save "$b"
       ok "budget cleared: $agent" "$(jq -c --arg n "$agent" '{agent:$n,cleared:true}' <<<'{}')"
       ;;
-    *) fail "$E_USAGE" "unknown budget command: $sub (set|ls|clear)" ;;
+    check)
+      cmd_usage_budget_check "$@"
+      ;;
+    *) fail "$E_USAGE" "unknown budget command: $sub (set|ls|clear|check)" ;;
   esac
+}
+
+# cmd_usage_budget_check — the enforcement engine. Idempotent; safe to call
+# every heartbeat tick. Computes each budgeted agent's rolling-24h burn, decides
+# state (ok|soft|hard), alerts the owner ONCE per window per level (deduped via
+# stored `notified` epochs), optionally hard-stops at the ceiling, and writes a
+# cheap state cache (${USAGE_BUDGET_STATE_FILE}) that `watch` reads without
+# rescanning transcripts. --dry-run computes + caches but neither alerts nor
+# stops (used by tests and a safe first wiring).
+cmd_usage_budget_check() {
+  require_root
+  local dry=0 a
+  for a in "$@"; do
+    case "$a" in
+      --dry-run|--dry) dry=1 ;;
+      --*) fail "$E_USAGE" "unknown flag: $a (usage budget check [--dry-run])" ;;
+      *) fail "$E_USAGE" "unknown arg: $a" ;;
+    esac
+  done
+
+  local b; b=$(usage_budget_load)
+  local since now; now=$(date +%s); since=$(( now - 86400 ))
+  # empty store → clear the cache and return quietly.
+  if [[ "$(jq -r 'length' <<<"$b")" == "0" ]]; then
+    printf '%s\n' "$(jq -cn --argjson t "$now" '{updatedAt:$t,agents:{}}')" > "$USAGE_BUDGET_STATE_FILE"
+    chmod 0664 "$USAGE_BUDGET_STATE_FILE" 2>/dev/null || true
+    if (( JSON_MODE )); then jq -cn '{ok:true,data:{checked:0,soft:0,hard:0,stopped:0}}'; else echo "no budgets set — nothing to check"; fi
+    return 0
+  fi
+
+  local data; data=$(usage_collect "$since") || fail "$E_GENERIC" "failed to collect usage"
+  # per-agent 24h burn map {agent: total}
+  local burns; burns=$(jq -c '[.agents[]|{key:.name,value:.total}]|from_entries' <<<"$data")
+
+  # Evaluate each budgeted agent → decisions[] with what alerts/stops to fire,
+  # plus the updated store and the state cache. jq does the classification; bash
+  # executes the side effects (send/stop) it can't.
+  local plan
+  plan=$(jq -cn "$USAGE_BNORM"'
+    ($budgets) as $B | ($burns) as $U | ($since) as $since | ($now) as $now
+    | reduce ($B|keys[]) as $name (
+        {store:{}, state:{}, acts:[]};
+        ($B[$name]|bnorm) as $v
+        | (($U[$name]) // 0) as $burn
+        | (if   ($v.hard != null and $burn >= $v.hard) then "hard"
+           elif ($v.soft != null and $burn >= $v.soft) then "soft"
+           else "ok" end) as $st
+        # re-alert only if we have not already alerted for this level within the
+        # current 24h window (notified epoch older than `since`, or absent).
+        | (($v.notified.soft // 0) < $since) as $softDue
+        | (($v.notified.hard // 0) < $since) as $hardDue
+        | ($v.notified) as $noti
+        | (if $st=="hard" and $hardDue then ($noti + {hard:$now, soft:$now})
+           elif $st=="soft" and $softDue then ($noti + {soft:$now})
+           elif $st=="ok" then {}
+           else $noti end) as $noti2
+        | (if $st=="hard" and $hardDue then [{name:$name,level:"hard",burn:$burn,
+                 limit:$v.hard,hardStop:$v.hardStop}]
+           elif $st=="soft" and $softDue then [{name:$name,level:"soft",burn:$burn,limit:$v.soft}]
+           else [] end) as $act
+        | .store[$name]  = ($v + {notified:$noti2})
+        | .state[$name]  = {burn:$burn, soft:$v.soft, hard:$v.hard, hardStop:$v.hardStop,
+                            state:$st, stopped:$v.stopped}
+        | .acts         += $act
+      )' \
+    --argjson budgets "$b" --argjson burns "$burns" --argjson since "$since" --argjson now "$now")
+
+  local new_store; new_store=$(jq -c '.store' <<<"$plan")
+  local acts;      acts=$(jq -c '.acts' <<<"$plan")
+  # Counts reflect what fires THIS run (deduped inside the plan) — reported for
+  # both live and --dry-run (dry-run previews without executing).
+  local n_soft n_hard n_stop
+  n_soft=$(jq -r '[.[]|select(.level=="soft")]|length' <<<"$acts")
+  n_hard=$(jq -r '[.[]|select(.level=="hard")]|length' <<<"$acts")
+  n_stop=$(jq -r '[.[]|select(.level=="hard" and (.hardStop==true))]|length' <<<"$acts")
+
+  # Fire side effects (unless dry-run).
+  local chan_ok=0
+  if (( ! dry )) && [[ "$(jq -r 'length' <<<"$acts")" != "0" ]]; then
+    usage_resolve_owner_channel && chan_ok=1 || true
+    local i cnt; cnt=$(jq -r 'length' <<<"$acts")
+    for (( i=0; i<cnt; i++ )); do
+      local an al ab alim ahs
+      an=$(jq -r ".[$i].name"     <<<"$acts")
+      al=$(jq -r ".[$i].level"    <<<"$acts")
+      ab=$(jq -r ".[$i].burn"     <<<"$acts")
+      alim=$(jq -r ".[$i].limit"  <<<"$acts")
+      ahs=$(jq -r ".[$i].hardStop // false" <<<"$acts")
+      local btxt ltxt msg
+      btxt=$(jq -rn --argjson v "$ab"   "$USAGE_JQ_HELPERS"'$v|htok')
+      ltxt=$(jq -rn --argjson v "$alim" "$USAGE_JQ_HELPERS"'$v|htok')
+      if [[ "$al" == "hard" ]]; then
+        if [[ "$ahs" == "true" ]]; then
+          # turn the agent OFF (heartbeat off THEN stop — stop alone revives).
+          ( with_registry_lock cmd_heartbeat_off "$an" ) >/dev/null 2>&1 || true
+          systemctl stop "5dive-agent@${an}.service" >/dev/null 2>&1 || true
+          new_store=$(jq -c --arg n "$an" '.[$n].stopped=true' <<<"$new_store")
+          msg="⛔ 5dive budget: ${an} hit its token CEILING (${btxt} / ${ltxt} in 24h) — agent turned OFF (heartbeat off + stopped). Re-enable with: 5dive heartbeat on ${an} && 5dive agent start ${an}"
+        else
+          msg="⛔ 5dive budget: ${an} hit its token CEILING (${btxt} / ${ltxt} in 24h). Hard-stop is OFF, so it keeps running — review with: 5dive cost"
+        fi
+      else
+        msg="⚠ 5dive budget: ${an} crossed its soft cap (${btxt} / ${ltxt} in 24h). Review with: 5dive cost"
+      fi
+      if (( chan_ok )); then _task_send_owner "$msg" "" >/dev/null 2>&1 || true; fi
+    done
+  fi
+
+  # Persist store (dry-run leaves notified/stopped untouched) + state cache.
+  (( ! dry )) && usage_budget_save "$new_store"
+  printf '%s\n' "$(jq -c --argjson t "$now" '{updatedAt:$t, agents:.state}' <<<"$plan")" > "$USAGE_BUDGET_STATE_FILE"
+  chmod 0664 "$USAGE_BUDGET_STATE_FILE" 2>/dev/null || true
+
+  local checked; checked=$(jq -r 'length' <<<"$b")
+  if (( JSON_MODE )); then
+    jq -cn --argjson c "$checked" --argjson s "$n_soft" --argjson h "$n_hard" --argjson st "$n_stop" --argjson dry "$dry" \
+      '{ok:true,data:{checked:$c,soft:$s,hard:$h,stopped:$st,dryRun:($dry==1)}}'
+  else
+    echo "budget check: ${checked} agent(s) — ${n_soft} soft, ${n_hard} at ceiling, ${n_stop} stopped$( ((dry)) && echo ' (dry-run)')"
+  fi
+}
+
+# cmd_cost — DIVE-1019 budget-focused burn view. Reuses the usage plumbing: one
+# row per claude agent showing rolling-24h burn against its soft/ceiling budget
+# with a state glyph. `5dive cost budget ...` proxies to the budget subcommand.
+cmd_cost() {
+  if [[ "${1:-}" == "budget" ]]; then shift; ensure_state; cmd_usage_budget "$@"; return; fi
+  ensure_state
+  require_root
+  local win_flag="24h" a
+  for a in "$@"; do
+    case "$a" in
+      --7d|7d|--week)  win_flag="7d" ;;
+      --24h|24h|--day) win_flag="24h" ;;
+      --*)             fail "$E_USAGE" "unknown flag: $a (usage: 5dive cost [--7d] [--json])" ;;
+      *)               fail "$E_USAGE" "unknown arg: $a" ;;
+    esac
+  done
+  local since data budgets
+  since=$(( $(date +%s) - $(usage_window_secs "$win_flag") ))
+  data=$(usage_collect "$since") || fail "$E_GENERIC" "failed to collect usage"
+  budgets=$(usage_budget_load)
+
+  # join burn ⋈ budget → rows with a computed state.
+  local rows
+  rows=$(jq -c "$USAGE_BNORM"'
+    (reduce .agents[] as $a ({}; .[$a.name]=$a.total)) as $burn
+    | [ ( ($budgets|keys) + ($burn|keys) ) | unique[] as $n
+        | ($budgets[$n] // null) as $raw
+        | (if $raw==null then null else ($raw|bnorm) end) as $b
+        | ($burn[$n] // 0) as $t
+        | { name:$n, burn:$t,
+            soft:(if $b==null then null else $b.soft end),
+            hard:(if $b==null then null else $b.hard end),
+            hardStop:(if $b==null then false else $b.hardStop end),
+            state:(if $b==null then "-"
+                   elif ($b.hard!=null and $t>=$b.hard) then "hard"
+                   elif ($b.soft!=null and $t>=$b.soft) then "soft"
+                   else "ok" end) } ]
+    | sort_by(-.burn)' --argjson budgets "$budgets" <<<"$data")
+
+  if (( JSON_MODE )); then
+    jq -cn --argjson r "$rows" --arg win "$win_flag" '{ok:true,data:{windowLabel:$win,agents:$r}}'
+    return
+  fi
+  local label; [[ "$win_flag" == "7d" ]] && label="last 7d" || label="last 24h"
+  echo "COST — $label  (subscription tokens; no \$ — agents run on the plan)"
+  jq -r "$USAGE_JQ_HELPERS"'
+    if (.|length)==0 then "  (no claude-agent transcripts in window)"
+    else
+      (["","AGENT","BURN","SOFT","CEILING","HARD-STOP","STATE"]|@tsv),
+      (.[] |
+        (if   .state=="hard" then "⛔"
+         elif .state=="soft" then "⚠"
+         elif .state=="ok"   then "●"
+         else " " end) as $g |
+        [ $g, .name, (.burn|htok),
+          (.soft|htok), (.hard|htok),
+          (if .soft==null and .hard==null then "-" elif .hardStop then "on" else "off" end),
+          (if   .state=="hard" then "OVER CEILING"
+           elif .state=="soft" then "over soft cap"
+           elif .state=="ok"   then "ok"
+           else "no budget" end) ]|@tsv)
+    end' <<<"$rows" | column -t -s $'\t' | sed 's/^/  /'
+  echo
+  echo "  set a budget:  5dive usage budget set <agent> --daily=<tok> [--ceiling=<tok>] [--hard-stop]"
 }

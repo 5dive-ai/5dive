@@ -126,6 +126,30 @@ _watch_truncate() {
   printf '%s…' "${s:0:w-1}"
 }
 
+# Budget-pressure line (DIVE-1019). Reads the cheap state cache the heartbeat's
+# budget sweep refreshes — NO transcript scan on the 2s frame. Empty string when
+# no agent is over its soft cap / ceiling. Colored ⛔ (ceiling) / ⚠ (soft cap).
+_watch_budget_line() {
+  local f="${STATE_DIR}/usage-budget-state.json"
+  [[ -s "$f" ]] || return 0
+  local parts
+  parts=$(jq -r '
+    (.agents // {}) | to_entries
+    | map(select(.value.state=="hard" or .value.state=="soft"))
+    | sort_by(if .value.state=="hard" then 0 else 1 end)
+    | .[] | (if .value.state=="hard" then "HARD " else "SOFT " end) + .key' \
+    "$f" 2>/dev/null) || return 0
+  [[ -n "$parts" ]] || return 0
+  local out="" line
+  while IFS= read -r line; do
+    [[ -n "$line" ]] || continue
+    local nm="${line#* }"
+    if [[ "$line" == HARD* ]]; then out+="${WATCH_RED}⛔ ${nm}${WATCH_RESET}  "
+    else                            out+="${WATCH_YELLOW}⚠ ${nm}${WATCH_RESET}  "; fi
+  done <<<"$parts"
+  printf '%s' "${WATCH_DIM}budget:${WATCH_RESET} ${out}"
+}
+
 # Render one frame to stdout. Cursor-home + clear-eol per line + clear-down
 # at the end → no flicker.
 _watch_render() {
@@ -156,6 +180,11 @@ _watch_render() {
   pad=$((cols - title_len - ts_len))
   (( pad < 1 )) && pad=1
   out+="${title}$(printf '%*s' "$pad" '')${WATCH_DIM}${now_str}${WATCH_RESET}${WATCH_CLR_EOL}"$'\n'
+  local budget_line
+  budget_line=$(_watch_budget_line)
+  if [[ -n "$budget_line" ]]; then
+    out+="${budget_line}${WATCH_CLR_EOL}"$'\n'
+  fi
   out+="${WATCH_CLR_EOL}"$'\n'
 
   out+="${WATCH_DIM}    NAME              TYPE     CHANNEL                  UPTIME    RESTART    MEMORY${WATCH_RESET}${WATCH_CLR_EOL}"$'\n'

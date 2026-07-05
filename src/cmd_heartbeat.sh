@@ -784,6 +784,17 @@ _hb_loop_ceiling_sweep() {
   return 0
 }
 
+# DIVE-1019: run the per-agent token-budget engine once per tick. Idempotent —
+# alerts/hard-stops are deduped inside cmd_usage_budget_check, which also
+# refreshes the state cache that `watch` reads. Capture stdout so its summary
+# never leaks into the tick's own output; mirror it into the heartbeat log.
+_hb_budget_sweep() {
+  local out
+  out=$(cmd_usage_budget_check 2>/dev/null) || return 1
+  [[ -n "$out" && "$out" != "no budgets set"* ]] && _hb_log "[budget] ${out}"
+  return 0
+}
+
 cmd_heartbeat_tick() {
   require_root "heartbeat tick"
   tasks_db_init
@@ -800,6 +811,10 @@ cmd_heartbeat_tick() {
   # DIVE-972: enforce per-loop token ceilings for async (non --wait) loops. Same
   # isolation contract — a failure here must never abort the wake loop.
   _hb_loop_ceiling_sweep || _hb_log "[loop-ceiling] pass errored (non-fatal)"
+  # DIVE-1019: per-agent token budget guardrails — alert the owner at the soft
+  # cap and (only if hard-stop is opted in) turn an agent off at the ceiling, and
+  # refresh the state cache `watch` reads. Same isolation contract as above.
+  _hb_budget_sweep || _hb_log "[budget] pass errored (non-fatal)"
   # Accounts already woken during THIS tick. The $reg snapshot is read once up
   # front, so a wake we do mid-loop isn't visible to later iterations via the
   # registry — this map carries that within-tick fact so two same-account agents
