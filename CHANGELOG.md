@@ -9,6 +9,23 @@ release.
 
 ## [Unreleased]
 
+### Added
+- **Crash-loop detection in the supervised restart loop (DIVE-1029).** The
+  respawn loop that keeps an agent alive now distinguishes a genuine
+  usage-limit park (claude ran healthy, then exited) from a crash-loop (claude
+  dying within seconds, repeatedly, e.g. the stale plugin-marketplace git
+  remote after the org rename that crash-looped 19/21 agents). New
+  `hooks/run-loop.sh` helper, wired in by `5dive-agent-start`: on a crash-loop
+  it backs off exponentially (2s to 300s) instead of hammering a 2s respawn,
+  surfaces the REAL error once (exit code plus the last pane output carrying
+  claude's actual stderr) to the paired chats instead of a misleading usage
+  banner, and drops a crash-loop flag. `stop-failure-telegram.sh` and
+  `resume-after-reset.sh` read that flag to SUPPRESS the false "Usage limit
+  reset, agent resumed" banner while the agent is actually just dying. A
+  healthy run (>=45s) clears the flag and sends a single "recovered" note.
+  Falls back to the original inline loop on boxes that predate the helper.
+  Builds on DIVE-902 (DM dedup + single-winner resume-lock).
+
 ### Fixed
 - **Sandboxed isolation now works for claude agents (DIVE-1033).** Sandboxed
   agents aren't in the `claude` group, so `/home/claude` (0750) — where the

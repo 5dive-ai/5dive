@@ -15,6 +15,19 @@ if printf '%s' "$payload" | grep -qi 'rate_limit\|usage.limit'; then
   is_rate_limit=true
 fi
 
+# DIVE-1029: if the supervised run-loop is currently flagging a crash-loop, this
+# is a dying agent, not a usage-limit park — even if the payload/transcript
+# still carries a stale "usage limit" line. Force the error branch so we surface
+# the REAL failure and DON'T fork another resume helper that would post a false
+# "agent resumed" banner. Flag older than 5m is treated as stale.
+crashloop_flag="${CRASHLOOP_FLAG:-$HOME/.cache/5dive/crashloop.active}"
+if $is_rate_limit && [[ -f "$crashloop_flag" ]]; then
+  flag_age=$(( $(date +%s) - $(stat -c %Y "$crashloop_flag" 2>/dev/null || echo 0) ))
+  if (( flag_age >= 0 && flag_age < 300 )); then
+    is_rate_limit=false
+  fi
+fi
+
 # Pull the transcript path from the payload up front — used for both the
 # reset-time parse below and caller-chat narrowing further down.
 transcript_path=$(printf '%s' "$payload" | jq -r '.transcript_path // empty' 2>/dev/null)

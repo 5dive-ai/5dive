@@ -71,6 +71,22 @@ if [[ -n "$socket" && -n "$target" ]]; then
 fi
 
 # Phase 4 — Telegram ping. Multiple chats supported (DM + group).
+#
+# DIVE-1029: suppress the "resumed" banner when the agent is actually
+# crash-looping rather than genuinely back from a usage-limit reset. The
+# supervised run-loop drops a fresh crash-loop flag while claude keeps dying;
+# if it's present and recent, our "continue" keystroke landed on a dying agent,
+# not a recovered one — posting "agent resumed" would be a lie (this is exactly
+# the false banner storm that motivated this task). Treat a flag older than 5m
+# as stale (the loop refreshes its mtime every crash round).
+crashloop_flag="${CRASHLOOP_FLAG:-$HOME/.cache/5dive/crashloop.active}"
+if [[ -f "$crashloop_flag" ]]; then
+  flag_age=$(( $(date +%s) - $(stat -c %Y "$crashloop_flag" 2>/dev/null || echo 0) ))
+  if (( flag_age >= 0 && flag_age < 300 )); then
+    log "phase4 suppressed resume banner — agent is crash-looping (flag age ${flag_age}s)"
+    exit 0
+  fi
+fi
 if [[ -n "${TELEGRAM_BOT_TOKEN:-}" && -n "$chat_ids_csv" ]]; then
   IFS=',' read -ra cids <<< "$chat_ids_csv"
   for cid in "${cids[@]}"; do

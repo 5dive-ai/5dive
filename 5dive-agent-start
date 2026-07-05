@@ -852,6 +852,7 @@ fi
 # When a resume id is armed, the first loop iteration launches with
 # `--resume <id>`; subsequent respawns fall back to the plain CMD_STR. No
 # resume id → byte-identical to the original simple loop.
+CMD_STR_FIRST=""
 if [[ -n "$RESUME_ID" ]]; then
   # First loop iteration resumes the checkpointed session; later respawns fall
   # back to the plain CMD_STR. We launch a BARE `--resume <id>` (no trailing
@@ -868,6 +869,25 @@ if [[ -n "$RESUME_ID" ]]; then
   # tmux new-session call. Bare resume (no line-2 prompt, e.g. manual /resume)
   # stays idle-on-resume, unchanged.
   CMD_STR_FIRST=$(printf '%q ' "$BIN" --resume "$RESUME_ID" "${ARGS[@]}")
+fi
+
+# DIVE-1029: hand the respawn loop to the supervised run-loop helper. It
+# distinguishes a crash-loop (claude dying within seconds, repeatedly — e.g. a
+# broken plugin marketplace after an org rename) from a genuine usage-limit
+# park, backs off exponentially instead of hammering a 2s respawn, surfaces the
+# REAL error (exit code + last pane output) to the paired chats, and drops a
+# crash-loop flag that suppresses the misleading "usage limit resumed" banner.
+# Falls back to the original inline loop when the helper isn't installed (older
+# boxes that haven't run this install.sh yet).
+RUN_LOOP_HELPER="/usr/local/lib/5dive/run-loop.sh"
+if [[ -r "$RUN_LOOP_HELPER" ]]; then
+  # claude is the only type whose usage-limit/resume banners exist, but the
+  # crash-loop backoff + error surfacing help every type; the access file is
+  # only used for the best-effort alert, so default to claude's path.
+  CRASH_ACCESS="$HOME/.claude/channels/telegram/access.json"
+  LOOP=$(printf 'RUN_CMD=%q RUN_CMD_FIRST=%q AGENT_NAME=%q CRASH_ACCESS_FILE=%q source %q' \
+    "$CMD_STR" "$CMD_STR_FIRST" "$NAME" "$CRASH_ACCESS" "$RUN_LOOP_HELPER")
+elif [[ -n "$CMD_STR_FIRST" ]]; then
   LOOP="__first=1; while true; do if [[ \$__first == 1 ]]; then ${CMD_STR_FIRST}; __first=0; else ${CMD_STR}; fi; sleep 2; done"
 else
   LOOP="while true; do ${CMD_STR}; sleep 2; done"
