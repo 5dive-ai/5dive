@@ -47,5 +47,20 @@ ensure_state() {
   audit_init
 }
 
+# Read-only counterpart to ensure_state for pure-read commands (e.g.
+# `account list`). ensure_state requires root because it mkdir/chown/chmods
+# the state tree — overkill for a command that only reads the registry and
+# auth-profile metadata, all of which is already group-`claude` readable
+# (agents.json 640, auth-profiles 2750, combined.env 640). So a non-root
+# agent that hit `account list` failed at ensure_state's require_root even
+# though it could read everything (DIVE-1035: ceo /account "Failed to list
+# accounts"). When the registry already exists we simply return — no root,
+# no mutation. Only when state was never initialized do we fall back to the
+# root-requiring path, since creating it is genuinely an admin action.
+ensure_state_ro() {
+  [[ -r "$REGISTRY" ]] && return 0
+  ensure_state
+}
+
 # Initialise the append-only audit log. Readable by group `claude` so the
 # dashboard process (which runs as `claude`) can `tail` it without sudo.

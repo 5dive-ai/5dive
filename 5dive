@@ -26,7 +26,7 @@ esac
 
 # Bumped on every public release. `build.sh` checks this line exists; CI fails
 # the bundle-drift check if it's missing or empty.
-readonly FIVE_VERSION="0.7.22"
+readonly FIVE_VERSION="0.7.23"
 
 # GitHub org our repos live under. The org is being renamed
 # 5dive-com -> 5dive-ai (2026-06); fetches must work on either side of the
@@ -2055,6 +2055,21 @@ ensure_state() {
   chown root:claude "$TASKS_DIR"
   chmod 2770 "$TASKS_DIR"
   audit_init
+}
+
+# Read-only counterpart to ensure_state for pure-read commands (e.g.
+# `account list`). ensure_state requires root because it mkdir/chown/chmods
+# the state tree — overkill for a command that only reads the registry and
+# auth-profile metadata, all of which is already group-`claude` readable
+# (agents.json 640, auth-profiles 2750, combined.env 640). So a non-root
+# agent that hit `account list` failed at ensure_state's require_root even
+# though it could read everything (DIVE-1035: ceo /account "Failed to list
+# accounts"). When the registry already exists we simply return — no root,
+# no mutation. Only when state was never initialized do we fall back to the
+# root-requiring path, since creating it is genuinely an admin action.
+ensure_state_ro() {
+  [[ -r "$REGISTRY" ]] && return 0
+  ensure_state
 }
 
 # Initialise the append-only audit log. Readable by group `claude` so the
@@ -4528,7 +4543,7 @@ cmd_auth_cancel() {
 # show, rename (to recover affected agents) and remove (refusal payload).
 account_agents_bound() {
   local name="$1"
-  ensure_state
+  ensure_state_ro
   registry_read | jq -c --arg p "$name" \
     '[.agents | to_entries[] | select(.value.authProfile == $p) | .key]'
 }
@@ -4657,7 +4672,7 @@ account_each() {
 }
 
 cmd_account_list() {
-  ensure_state
+  ensure_state_ro
   [[ $# -eq 0 ]] || fail "$E_USAGE" "usage: 5dive account list"
   local rows="[]" name types agents signins t detail
   while IFS= read -r name; do

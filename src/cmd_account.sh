@@ -14,7 +14,7 @@
 # show, rename (to recover affected agents) and remove (refusal payload).
 account_agents_bound() {
   local name="$1"
-  ensure_state
+  ensure_state_ro
   registry_read | jq -c --arg p "$name" \
     '[.agents | to_entries[] | select(.value.authProfile == $p) | .key]'
 }
@@ -143,7 +143,7 @@ account_each() {
 }
 
 cmd_account_list() {
-  ensure_state
+  ensure_state_ro
   [[ $# -eq 0 ]] || fail "$E_USAGE" "usage: 5dive account list"
   local rows="[]" name types agents signins t detail
   while IFS= read -r name; do
