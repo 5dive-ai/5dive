@@ -26,7 +26,7 @@ esac
 
 # Bumped on every public release. `build.sh` checks this line exists; CI fails
 # the bundle-drift check if it's missing or empty.
-readonly FIVE_VERSION="0.7.19"
+readonly FIVE_VERSION="0.7.20"
 
 # GitHub org our repos live under. The org is being renamed
 # 5dive-com -> 5dive-ai (2026-06); fetches must work on either side of the
@@ -21237,6 +21237,7 @@ except KeyError:
 files = {}      # mutated path -> {"edits":n, "last":ts}
 reads = {}      # read path -> count
 commands = []   # {"ts","cmd","desc"}
+skills = {}     # DIVE-1026: skill name -> {"fires":n, "cold":n} (cold = fired, no follow-on tool)
 counts = {"edit":0,"write":0,"multiedit":0,"notebook":0,"bash":0,"read":0,"turns":0}
 tot = out = 0
 lo = since if tstart is None else max(since, tstart)
@@ -21253,6 +21254,7 @@ for path in glob.glob(pat):
         f = open(path, "r", errors="ignore")
     except OSError:
         continue
+    pending_cold = []   # DIVE-1026: skill fires in THIS session awaiting a follow-on tool
     with f:
         for line in f:
             if '"tool_use"' not in line and '"usage"' not in line:
@@ -21280,6 +21282,13 @@ for path in glob.glob(pat):
                 saw_tool = True
                 nm = b.get("name") or ""
                 inp = b.get("input") or {}
+                if nm == "Skill":
+                    sn = ((inp.get("skill") or inp.get("command") or "?").strip()) or "?"
+                    skills.setdefault(sn, {"fires": 0, "cold": 0})["fires"] += 1
+                    pending_cold.append(sn)      # cold until a later tool acts on it
+                    continue
+                # any NON-Skill tool = follow-on work → pending skill fires were used
+                pending_cold = []
                 if nm == "Bash":
                     cmd = (inp.get("command") or "").strip()
                     commands.append({"ts": ts, "cmd": cmd, "desc": (inp.get("description") or "").strip()})
@@ -21295,16 +21304,21 @@ for path in glob.glob(pat):
                     counts["read"] += 1
             if saw_tool:
                 counts["turns"] += 1
+        # DIVE-1026: end of session — any skill fire with no follow-on tool is "cold"
+        for sn in pending_cold:
+            skills[sn]["cold"] += 1
 
 file_rows = sorted(({"path": p, "edits": v["edits"], "last": v["last"]} for p, v in files.items()),
                    key=lambda r: (-r["edits"], -r["last"]))
 read_rows = sorted(({"path": p, "count": c} for p, c in reads.items()), key=lambda r: -r["count"])
+skill_rows = sorted(({"name": n, "fires": v["fires"], "cold": v["cold"]} for n, v in skills.items()),
+                    key=lambda r: (-r["fires"], r["name"]))
 commands.sort(key=lambda c: c["ts"])
 
 print(json.dumps({
     "agent": agent,
     "window": {"since": lo, "now": hi},
-    "files": file_rows, "reads": read_rows, "commands": commands,
+    "files": file_rows, "reads": read_rows, "commands": commands, "skills": skill_rows,
     "counts": counts, "tokens": {"total": tot, "output": out},
 }))
 PY
@@ -21366,6 +21380,7 @@ cmd_activity() {
     "  files touched: " + ((.files|length)|tostring) + " (" + ($ops|tostring) + " edits)"
     + "   commands: " + (.counts.bash|tostring)
     + "   reads: "    + (.counts.read|tostring)
+    + "   skills: "   + ((.skills|length)|tostring)
     + "   turns: "    + (.counts.turns|tostring)
     + "   cost: "     + (.tokens.total|htok)' <<<"$data"
   echo
@@ -21374,6 +21389,11 @@ cmd_activity() {
     if (.files|length)==0 then "    (none)"
     else ((.files[:$lim][] | "    \(.edits)×  \(.path)"),
           (if (.files|length) > $lim then "    (+\((.files|length)-$lim) more — raise --limit)" else empty end)) end' <<<"$data"
+  echo
+  echo "  SKILLS FIRED  (cold = fired, no follow-on tool action → a used-vs-fired signal)"
+  jq -r '
+    if (.skills|length)==0 then "    (none)"
+    else (.skills[] | "    \(.fires)×  \(.name)" + (if .cold > 0 then "   — \(.cold) cold" else "" end)) end' <<<"$data"
   echo
   echo "  COMMANDS RUN (most recent ${limit})"
   jq -r --argjson lim "$limit" '
