@@ -11,6 +11,21 @@ create_agent_user() {
   local groups="systemd-journal"
   [[ "$isolation" != "sandboxed" ]] && groups="claude,systemd-journal"
   usermod -aG "$groups" "$user"
+  # DIVE-1033: sandboxed agents are NOT in the claude group, so /home/claude
+  # (0750) is unreachable — but the shared runtime lives there (claude at
+  # ~/.local/bin, node at ~/.nvm). Without traverse access both the plugin
+  # install (install_channel_plugin_for_agent runs as the agent user) and
+  # 5dive-agent-start fail to exec claude ("Permission denied"). Grant
+  # traverse-ONLY (--x: no read, no directory listing) on /home/claude so the
+  # agent can exec binaries by their known path while still being unable to
+  # enumerate or read claude's home; secrets stay behind their own 0600/0700
+  # perms, unreachable. bun lives in /usr/local/bin (world-rx) so needs no grant.
+  # The real fix (relocate the runtime out of /home/claude) is DIVE-1034.
+  if [[ "$isolation" == "sandboxed" ]]; then
+    if ! setfacl -m "u:${user}:--x" /home/claude 2>/dev/null; then
+      warn "setfacl failed granting ${user} traverse on /home/claude (is the 'acl' package installed?); the sandboxed agent will not reach the shared runtime — plugin install and startup will fail (DIVE-1033)"
+    fi
+  fi
   # Admin gets sudo SCOPED to fleet-management ops (not blanket root). standard
   # and sandboxed get no sudoers at all.
   if [[ "$isolation" == "admin" ]]; then
@@ -77,6 +92,10 @@ delete_agent_user() {
   local name="$1"
   local user="agent-${name}"
   id -u "$user" &>/dev/null || return 0
+  # DIVE-1033: drop any traverse ACL we granted a sandboxed agent on
+  # /home/claude BEFORE deluser, while the name still resolves — afterwards the
+  # entry would linger as a bare numeric uid. No-op (harmless) for admin/standard.
+  setfacl -x "u:${user}" /home/claude 2>/dev/null || true
   # deluser removes the home dir; skip --remove-home to keep any per-agent
   # state the user may have in their $HOME. Home is minimal anyway since
   # configs live under /home/claude.
