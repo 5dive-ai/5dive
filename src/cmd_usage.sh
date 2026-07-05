@@ -856,7 +856,7 @@ cmd_activity() {
 
   if (( JSON_MODE )); then
     jq -c --arg win "$win_flag" --arg task "$task" \
-      '{ok:true, data: (. + {windowLabel:$win, task:($task|select(length>0))})}' <<<"$data"
+      '{ok:true, data: (. + {windowLabel:$win} + (if ($task|length)>0 then {task:$task} else {} end))}' <<<"$data"
     return
   fi
 
