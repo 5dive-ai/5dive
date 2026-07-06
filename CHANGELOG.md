@@ -9,6 +9,19 @@ release.
 
 ## [Unreleased]
 
+### Fixed
+- **Sandboxed isolation now works for claude agents (DIVE-1033).** Sandboxed
+  agents aren't in the `claude` group, so `/home/claude` (0750) — where the
+  shared runtime (`claude`, node/nvm) lives — was unreachable, failing both the
+  channel-plugin install and `5dive-agent-start` with "Permission denied".
+  `create_agent_user` now grants the sandboxed agent a traverse-only ACL
+  (`setfacl -m u:agent-<name>:--x /home/claude`): it can exec the binaries by
+  known path but cannot list or read claude's home (secrets stay behind their
+  own 0600/0700 perms). Cleaned up in `delete_agent_user`. The proper fix
+  (relocating the runtime out of `/home/claude`) is tracked as DIVE-1034.
+
+## [0.7.24] - 2026-07-06
+
 ### Added
 - **Crash-loop detection in the supervised restart loop (DIVE-1029).** The
   respawn loop that keeps an agent alive now distinguishes a genuine
@@ -25,17 +38,6 @@ release.
   healthy run (>=45s) clears the flag and sends a single "recovered" note.
   Falls back to the original inline loop on boxes that predate the helper.
   Builds on DIVE-902 (DM dedup + single-winner resume-lock).
-
-### Fixed
-- **Sandboxed isolation now works for claude agents (DIVE-1033).** Sandboxed
-  agents aren't in the `claude` group, so `/home/claude` (0750) — where the
-  shared runtime (`claude`, node/nvm) lives — was unreachable, failing both the
-  channel-plugin install and `5dive-agent-start` with "Permission denied".
-  `create_agent_user` now grants the sandboxed agent a traverse-only ACL
-  (`setfacl -m u:agent-<name>:--x /home/claude`): it can exec the binaries by
-  known path but cannot list or read claude's home (secrets stay behind their
-  own 0600/0700 perms). Cleaned up in `delete_agent_user`. The proper fix
-  (relocating the runtime out of `/home/claude`) is tracked as DIVE-1034.
 
 ## [0.7.13] - 2026-07-05
 
