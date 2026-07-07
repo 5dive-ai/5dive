@@ -27,9 +27,13 @@ create_agent_user() {
     fi
   fi
   # Admin gets sudo SCOPED to fleet-management ops (not blanket root). standard
-  # and sandboxed get no sudoers at all.
+  # gets a NARROW grant for real-time inter-agent send (DIVE-1065: ONLY the
+  # hardened `5dive agent _deliver` subcommand, nothing else). sandboxed gets no
+  # sudoers at all. All branches keep the visudo-validated discipline.
   if [[ "$isolation" == "admin" ]]; then
     write_admin_sudoers "$user"
+  elif [[ "$isolation" == "standard" ]]; then
+    write_standard_sudoers "$user"
   else
     rm -f "/etc/sudoers.d/${user}"
   fi
@@ -76,6 +80,45 @@ ${user} ALL=(root) NOPASSWD: \\
   /bin/systemctl restart 5dive-agent@*, \\
   /bin/systemctl start 5dive-*.service, /bin/systemctl stop 5dive-*.service, \\
   /bin/systemctl restart 5dive-*.service
+SUDOERS
+  chmod 440 "$tmp"
+  if visudo -cf "$tmp" >/dev/null 2>&1; then
+    chown root:root "$tmp"
+    mv "$tmp" "$f"
+    chmod 440 "$f"
+  else
+    rm -f "$tmp"
+    fail "$E_GENERIC" "generated sudoers for ${user} failed visudo validation; aborting (no partial install)"
+  fi
+}
+
+# DIVE-1065: scoped inter-agent-send grant for a 'standard'-isolation agent. A
+# standard agent has NO broad sudo, so it can't run the `sudo -u agent-X tmux`
+# inject that `5dive agent send` uses (that path needs root). This grants EXACTLY
+# one thing: the hidden `5dive agent _deliver` subcommand, as root, NOPASSWD.
+#
+# Why this is safe (same invariant as write_admin_sudoers above): `_deliver` is a
+# single-purpose primitive that does ONLY a LITERAL tmux inject (send-keys -l --)
+# of a provenance-wrapped message into a validated, registered target's pane. It
+# NEVER execs caller-controlled input (no eval / sh -c / printf-format), so the
+# `*` wildcard on its arguments cannot become an agent->root vector: the worst a
+# standard agent can do with this grant is inject text into a peer's pane — which
+# is precisely the sanctioned capability this feature exists to give it.
+#
+# Crucially this does NOT grant the whole `5dive` CLI as root — that stays
+# admin-only. Only the one hardened subcommand is reachable, upholding the
+# write_admin_sudoers standing invariant that no 5dive subcommand execs
+# agent-controlled input as root (DIVE-756/916/950).
+#
+# visudo -c validated before install so a malformed entry can never lock the box
+# out; on failure we remove it and fail loudly.
+write_standard_sudoers() {
+  local user="$1" f="/etc/sudoers.d/${user}" tmp
+  tmp=$(mktemp)
+  cat > "$tmp" <<SUDOERS
+# Managed by 5dive (DIVE-1065). Scoped inter-agent-send grant for standard agent ${user}.
+# Do not edit by hand; regenerated on agent create/provision.
+${user} ALL=(root) NOPASSWD: /usr/local/bin/5dive agent _deliver *
 SUDOERS
   chmod 440 "$tmp"
   if visudo -cf "$tmp" >/dev/null 2>&1; then

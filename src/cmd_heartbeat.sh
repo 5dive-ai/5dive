@@ -299,6 +299,17 @@ _hb_pick_task() {
         LIMIT 1;" 2>/dev/null || echo ""
 }
 
+# DIVE-1065: privilege ordering for the auto-wake tier guard. admin > standard >
+# sandboxed; 0 for unknown/human — an unknown creator never blocks a wake.
+_hb_tier_rank() {
+  case "$1" in
+    admin)     echo 3 ;;
+    standard)  echo 2 ;;
+    sandboxed) echo 1 ;;
+    *)         echo 0 ;;
+  esac
+}
+
 # Inject one literal line + Enter into an agent's tmux pane. Returns nonzero
 # (never exits) so a single dead pane can't abort the whole tick.
 _hb_send_line() {
@@ -875,6 +886,28 @@ cmd_heartbeat_tick() {
     # The /goal + every log below must name the task by its DISPLAY ident, not the
     # raw row id — they diverge once a non-default project exists (DIVE-484).
     local task_ident; task_ident=$(_hb_ident "$task_id")
+
+    # --- DIVE-1065 tier guard --------------------------------------------------
+    # Refuse to AUTO-DRIVE a higher-tier agent from a lower-tier creator's task.
+    # A standard/sandboxed agent can enqueue work onto an admin agent; without
+    # this, the heartbeat would auto-run it (privilege-escalation-by-queue). If
+    # the task's creator is strictly LOWER-privileged than its assignee, HOLD the
+    # task (don't auto-wake) — a human or the assignee can still run it manually.
+    # Isolated + best-effort: any lookup miss falls through to the normal wake and
+    # never aborts the tick (a self-assigned task, human/unknown creator, or an
+    # equal/higher-tier creator is unaffected).
+    local _cby _ctier _atier
+    _cby=$(db "SELECT COALESCE(created_by,'') FROM tasks WHERE id=${task_id};" 2>/dev/null || echo "")
+    if [[ -n "$_cby" && "$_cby" != "$name" ]]; then
+      _ctier=$(jq -r --arg n "$_cby"  '.agents[$n].isolation // empty' <<<"$reg" 2>/dev/null)
+      _atier=$(jq -r --arg n "$name"  '.agents[$n].isolation // empty' <<<"$reg" 2>/dev/null)
+      local _cr _ar
+      _cr=$(_hb_tier_rank "${_ctier:-}"); _ar=$(_hb_tier_rank "${_atier:-}")
+      if (( _cr > 0 && _ar > 0 && _cr < _ar )); then
+        _hb_log "[$name] task ${task_ident} created by lower-tier ${_cby}(${_ctier}) < assignee(${_atier}) — holding, not auto-running"
+        continue
+      fi
+    fi
 
     # --- Same-account spread ---------------------------------------------------
     # Never start two agents that share an Anthropic account close together: a

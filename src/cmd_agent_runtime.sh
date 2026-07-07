@@ -324,6 +324,63 @@ inject_and_submit() {
   return 1
 }
 
+# DIVE-1065: privileged inter-agent delivery primitive. Hidden subcommand
+# (`5dive agent _deliver <target> <message>`) run as ROOT via a per-agent scoped
+# sudoers grant (write_standard_sudoers) so a standard-isolation agent can talk
+# to peers in real time WITHOUT broad root. `cmd_send` re-execs into it for a
+# non-root agent caller.
+#
+# This is the ONE 5dive subcommand a standard agent may run as root, so it MUST
+# uphold the write_admin_sudoers invariant: it NEVER execs caller-controlled
+# input. It does exactly one thing — a LITERAL tmux inject (via inject_and_submit,
+# i.e. `send-keys -l --`) of a provenance-wrapped message into a validated,
+# registered target's pane. No eval / sh -c / printf-format ever touches the
+# message, so the `*` wildcard the sudoers grant places on its arguments cannot
+# become an agent->root vector: the worst a caller can do is inject text into a
+# peer's pane, which is precisely the sanctioned capability. Sender + tier are
+# derived from the REAL sudo caller (SUDO_USER), never a spoofable flag.
+cmd_deliver() {
+  require_root "agent _deliver"
+  local target="${1:-}"; shift || true
+  local message="$*"
+  [[ -n "$target" ]]  || fail "$E_USAGE" "usage: 5dive agent _deliver <target> <message>"
+  [[ -n "$message" ]] || fail "$E_USAGE" "message is empty"
+  # Target must be a well-formed agent label AND a registered agent — no path to
+  # inject into an arbitrary or unmanaged tmux session.
+  [[ "$target" =~ ^[a-z][a-z0-9-]{0,31}$ ]] \
+    || fail "$E_VALIDATION" "invalid target '$target' (lowercase letter start, [a-z0-9-], <=32 chars)"
+  require_agent "$target"
+  sudo -u "agent-${target}" tmux has-session -t "agent-${target}" 2>/dev/null \
+    || fail "$E_NOT_RUNNING" "tmux session 'agent-${target}' not found (is the agent running?)"
+
+  # Sender + tier from the real sudo caller (agent-X -> X). A non-agent caller
+  # (direct root / human) records as "human"; tier is empty unless the sender is
+  # a registered agent. Mirrors auto_sender_from_sudo + the DIVE-1064 tier stamp.
+  local s="${SUDO_USER#agent-}"
+  [[ "${SUDO_USER:-}" == agent-* ]] || s="human"
+  local tier=""
+  tier="$(registry_read | jq -r --arg n "$s" '.agents[$n].isolation // empty' 2>/dev/null)"
+
+  # Provenance envelope, mirroring cmd_send's [5dive-msg ...] header format.
+  local header="[5dive-msg from=${s}"
+  [[ -n "$tier" ]] && header+=" tier=${tier}"
+  header+="]"
+  local payload="${header} ${message}"
+
+  # Same boot-race guard as cmd_send, then deliver by REUSING the literal-inject
+  # primitive. The message is passed to send-keys with `-l --` (literal) and is
+  # never interpreted as a command.
+  if ! wait_agent_input_ready "$target"; then
+    step "agent '$target' input prompt not detected after 45s — sending best-effort (may be lost if still booting)"
+  fi
+  if ! inject_and_submit "$target" "$payload"; then
+    step "agent '$target': payload may not have submitted — pane still shows an unsent paste buffer after retries (large-paste submit race, DIVE-147)"
+  fi
+  ok "delivered to agent '$target'." \
+     '{name:$n, delivered:true, from:$s, tier:($t|select(length>0))}' \
+     --arg n "$target" --arg s "$s" --arg t "$tier"
+}
+
 # Inject a message into the agent's tmux session. Uses inject_and_submit so the
 # text is delivered literally AND actually submitted (bracketed-paste safe).
 # Not exposed via /agents/exec: arbitrary text won't pass the API arg regex, so
@@ -354,6 +411,28 @@ cmd_send() {
     message="${positional[*]}"
   fi
   [[ -n "$message" ]] || fail "$E_USAGE" "message is empty"
+
+  # DIVE-1065: a standard-isolation agent has no broad sudo, so it cannot run the
+  # direct `sudo -u agent-X tmux` inject this function uses below. Route a
+  # non-root agent caller through the privileged, tightly-scoped `_deliver`
+  # primitive instead (granted by write_standard_sudoers: NOPASSWD on exactly
+  # `/usr/local/bin/5dive agent _deliver *`). Admins/root fall through to the
+  # direct-inject path unchanged. We hand off ONLY the resolved target + message:
+  # `_deliver` derives sender/tier from the real sudo caller and deliberately
+  # does not carry --from/--reply-to-chat (a standard send is peer-to-peer, with
+  # no channel plumbing). Absolute path so it matches the sudoers rule exactly.
+  # DIVE-1065: route ONLY a standard-tier agent's send through the scoped
+  # _deliver grant. Admin/root/internal callers keep the direct path below (and
+  # their --from/--reply-to-chat plumbing). sudo -n = fail-closed, never prompts.
+  if [[ $EUID -ne 0 ]]; then
+    local _caller="${SUDO_USER:-${USER:-}}"; _caller="${_caller#agent-}"
+    local _ctier=""
+    [[ -n "$_caller" ]] && _ctier="$(registry_read | jq -r --arg n "$_caller" '.agents[$n].isolation // empty' 2>/dev/null)"
+    if [[ "$_ctier" == "standard" ]]; then
+      exec sudo -n /usr/local/bin/5dive agent _deliver "$name" "$message"
+    fi
+  fi
+
   require_agent "$name"
   sudo -u "agent-${name}" tmux has-session -t "agent-${name}" 2>/dev/null \
     || fail "$E_NOT_RUNNING" "tmux session 'agent-${name}' not found (is the agent running?)"
@@ -497,6 +576,12 @@ cmd_ask() {
       || fail "$E_VALIDATION" "invalid --reply-to-msg (expected positive integer)"
   fi
 
+  # DIVE-1065 TODO: ask is NOT yet available to standard-isolation agents. Unlike
+  # `send`, `ask` must read the receiver's reply back via `sudo -u agent-X tmux
+  # capture-pane`, which the scoped `_deliver` grant does NOT cover (it only
+  # injects). Wiring ask for standard agents needs a separate read-capable
+  # primitive; until then a standard caller falls through to the direct path
+  # below and fails at the first `sudo -u` (no broad sudo) — same as before 1065.
   require_agent "$name"
   sudo -u "agent-${name}" tmux has-session -t "agent-${name}" 2>/dev/null \
     || fail "$E_NOT_RUNNING" "tmux session 'agent-${name}' not found (is the agent running?)"

@@ -300,6 +300,10 @@ main() {
         logs)    cmd_logs "$@" ;;
         send)    cmd_send "$@" ;;
         ask)     cmd_ask "$@" ;;
+        # DIVE-1065: hidden privileged delivery primitive. Only reachable via the
+        # scoped-sudoers grant a standard agent gets (write_standard_sudoers);
+        # `cmd_send` re-execs into it for non-root agent callers. Not advertised.
+        _deliver) cmd_deliver "$@" ;;
         stats)   cmd_stats "$@" ;;
         create)
           AUDIT_CMD="agent create"; AUDIT_ARGS=("$@")
