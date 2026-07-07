@@ -55,7 +55,7 @@ sudo 5dive agent pair   my-agent --code=<pairing-code>
 
 **Runs as a service, not a session.** Agents stay alive when you close the terminal. Message them from Telegram any time.
 
-**Every major agent CLI.** `claude`, `codex`, `antigravity`, `grok`, and more, all under one team.
+**Every major agent CLI.** `claude`, `codex`, `antigravity`, `grok`, `openclaw`, `hermes`, `opencode`, all under one team.
 
 **Safe by default.** Each agent is its own Linux user under one of three isolation tiers. MIT, no open-core split.
 
