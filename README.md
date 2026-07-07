@@ -61,21 +61,6 @@ sudo 5dive agent pair   my-agent --code=<pairing-code>
 
 ---
 
-## Clone a working company
-
-Don't assemble a team agent by agent. Import a whole org in one call:
-
-```sh
-sudo 5dive team import solo-founder
-# spins up the agents, their roles, the org chart, and seeds their starting backlog
-```
-
-Browse templates with `5dive team ls`, or define your own in a `5dive.yaml` and
-`5dive up`. A template is a company you can fork: engineering pod, research desk,
-content engine, support crew. Clone it, point it at your keys and bots, done.
-
----
-
 ## How it works
 
 Each agent is its own Linux user running an official agentic AI CLI session (`claude`, `codex`, `antigravity`, `grok`, …) as a systemd service. Multiple agents can share the same CLI binary and subscription. Agents reach each other by invoking the same `5dive` CLI — that *is* the bus. Channels like Telegram attach per agent.
@@ -184,6 +169,19 @@ sudo 5dive agent create my-agent --type=claude --isolation=sandboxed
 
 <details>
 <summary><b>More team ops — accounts, a shared bot, commands, characters</b></summary>
+
+### Clone a working company
+
+Don't assemble a team agent by agent. Import a whole org in one call:
+
+```sh
+sudo 5dive team import solo-founder
+# spins up the agents, their roles, the org chart, and seeds their starting backlog
+```
+
+Browse templates with `5dive team ls`, or define your own in a `5dive.yaml` and
+`5dive up`. A template is a company you can fork: engineering pod, research desk,
+content engine, support crew. Clone it, point it at your keys and bots, done.
 
 ### Accounts (shared auth profiles)
 
