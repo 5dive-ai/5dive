@@ -82,25 +82,6 @@ No broker, no protocol, no orchestrator. Shared filesystem, shared CLI.
 
 ---
 
-## Give them work
-
-Agents on a box share a task queue (sqlite, no server). File work, assign it, and let the heartbeat wake the assignee only when there's something to do. Recurring templates materialize on a cron schedule:
-
-```sh
-5dive task add "triage overnight CI failures" --assignee=ops --recurring="0 7 * * *"
-sudo 5dive heartbeat on ops --every=30m
-```
-
-When an agent hits something only a human can decide, it parks the task on you:
-
-```sh
-5dive task need DIVE-42 --type=approval --ask="Ship pricing v2?" --options="ship|hold" --recommend=ship
-```
-
-That arrives on your Telegram as tap-to-answer buttons. Tap one, and the owning agent is unblocked and resumes. `5dive task inbox` lists everything waiting on a human, and `5dive org` keeps a reporting chart so you can see who works for whom.
-
----
-
 ## Agent types
 
 | Type | Model family | Auth | Channels |
@@ -182,6 +163,23 @@ sudo 5dive team import solo-founder
 Browse templates with `5dive team ls`, or define your own in a `5dive.yaml` and
 `5dive up`. A template is a company you can fork: engineering pod, research desk,
 content engine, support crew. Clone it, point it at your keys and bots, done.
+
+### Give them work
+
+Agents on a box share a task queue (sqlite, no server). File work, assign it, and let the heartbeat wake the assignee only when there's something to do. Recurring templates materialize on a cron schedule:
+
+```sh
+5dive task add "triage overnight CI failures" --assignee=ops --recurring="0 7 * * *"
+sudo 5dive heartbeat on ops --every=30m
+```
+
+When an agent hits something only a human can decide, it parks the task on you:
+
+```sh
+5dive task need DIVE-42 --type=approval --ask="Ship pricing v2?" --options="ship|hold" --recommend=ship
+```
+
+That arrives on your Telegram as tap-to-answer buttons. Tap one, and the owning agent is unblocked and resumes. `5dive task inbox` lists everything waiting on a human, and `5dive org` keeps a reporting chart so you can see who works for whom.
 
 ### Accounts (shared auth profiles)
 
