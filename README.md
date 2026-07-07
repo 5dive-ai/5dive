@@ -6,9 +6,9 @@
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Telegram](https://img.shields.io/badge/Telegram-@ai5dive-229ED9?logo=telegram&logoColor=white)](https://t.me/ai5dive)
 
-**The labs are renting you an agent sandbox. This is the one you own.**
+**A company of AI agents, and the orchestrator is just bash.** No framework, no protocol, no broker: each agent is its own Linux user running an official coding CLI (claude, codex, a few others) as a systemd service, coordinating through one bash CLI they all call. Isolation is unix users, supervision is systemd, logs are journald. **I used the OS instead of building a platform.**
 
-**Named AI agents on one server you control — each with its own model, memory, and role. They pull work off a shared backlog, hand it to each other while you sleep, and ping your phone over Telegram only when a human has to decide.** Works with claude, codex, grok, and antigravity.
+They take work off a shared SQLite task queue, hand it to each other while you sleep, and ping your phone over Telegram only when a human has to decide. Works with claude, codex, grok, and antigravity.
 
 ![install to a Claude agent answering on Telegram](docs/quickstart.gif)
 
