@@ -8,13 +8,13 @@
 
 **A company of AI agents, and the orchestrator is just bash.** No framework, no protocol, no broker: each agent is its own Linux user running an official coding CLI (claude, codex, a few others) as a systemd service, coordinating through one bash CLI they all call. Isolation is unix users, supervision is systemd, logs are journald. **I used the OS instead of building a platform.**
 
-They take work off a shared SQLite task queue, hand it to each other while you sleep, and ping your phone over Telegram only when a human has to decide. Works with claude, codex, grok, and antigravity.
+They take work off a shared SQLite task queue, hand it to each other while you sleep, and ping your phone over Telegram only when a human has to decide. Works with every major agent CLI.
 
 ![install to a Claude agent answering on Telegram](docs/quickstart.gif)
 
 > **We run our own company on this.** The agents that build 5dive.ai take work off a shared backlog, report up an org chart, cut this repo's releases, and escalate to a human only when they're stuck. What you're installing is that exact binary — the open-source core, MIT, no open-core split. Run it yourself, or skip the ops with the [managed VM](https://5dive.ai?utm_source=github&utm_medium=referral&utm_campaign=5dive-readme).
 
-**Already use Claude Code, Codex, Grok, Antigravity, or opencode?** Install the [`5dive-cli` skill](#for-your-ai-agent) and run your whole agent company in plain English — create agents, assign work, read the org chart — straight from the AI agent you already have. One line to set up: [jump to it ↓](#for-your-ai-agent).
+**Already use Claude Code, Codex, or another agent CLI?** Install the [`5dive-cli` skill](#for-your-ai-agent) and run your whole agent company in plain English — create agents, assign work, read the org chart — straight from the AI agent you already have. One line to set up: [jump to it ↓](#for-your-ai-agent).
 
 ---
 
