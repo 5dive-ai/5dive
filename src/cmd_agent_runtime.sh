@@ -407,7 +407,15 @@ cmd_send() {
       valid_sender_label "$sender" \
         || fail "$E_VALIDATION" "invalid --from label '$sender' (lowercase letter start, [a-z0-9-], <=32 chars)"
       msg_id="$(gen_msg_id)"
+      # DIVE-1064: stamp the sender's isolation tier so a receiver can down-trust
+      # a lower-privilege peer. Derived from the REAL sudo caller (not the
+      # spoofable --from label), so it holds even if from= is forged. Omitted
+      # when there's no agent caller (human/root) or no recorded tier.
+      local _caller _tier=""
+      _caller="$(auto_sender_from_sudo)"
+      [[ -n "$_caller" ]] && _tier="$(registry_read | jq -r --arg n "$_caller" '.agents[$n].isolation // empty' 2>/dev/null)"
       local header="[5dive-msg from=${sender} id=${msg_id}"
+      [[ -n "$_tier" ]] && header+=" tier=${_tier}"
       [[ -n "$reply_to_chat" ]] && header+=" reply-to-chat=${reply_to_chat}"
       [[ -n "$reply_to_msg" ]] && header+=" reply-to-msg=${reply_to_msg}"
       header+="]"

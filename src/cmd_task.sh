@@ -456,6 +456,14 @@ cmd_task_show() {
       '{ok:true, data:{task:($t[0]), subtasks:$s, blocked_by:$b}}'
   else
     dbfmt -line "SELECT ident, title, status, priority, assignee, created_by, parent_id, created_at, started_at, done_at, body, result FROM tasks WHERE id=${id};"
+    # DIVE-1064: surface the creator's isolation tier (read-time from the
+    # registry, no schema change) so a reader/agent can down-trust a task filed
+    # by a lower-privilege peer. Shown only when the creator is a known agent.
+    local _cb _ctier=""
+    _cb=$(db "SELECT COALESCE(created_by,'') FROM tasks WHERE id=${id};")
+    [[ -n "$_cb" ]] && _ctier="$(registry_read | jq -r --arg n "$_cb" '.agents[$n].isolation // empty' 2>/dev/null)"
+    [[ -n "$_ctier" ]] && printf 'created_by_tier = %s
+' "$_ctier"
     # Human gate (only when set) — mirrors the conditional subtasks/blockers
     # blocks below so an ordinary task's `show` stays clean.
     local gate
