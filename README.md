@@ -61,18 +61,6 @@ sudo 5dive agent pair   my-agent --code=<pairing-code>
 
 ---
 
-## What you can build
-
-Not primitives — outcomes. A few teams people stand up on day one:
-
-- **On-call ops.** An agent triages your CI failures at 7am and pings you only if it can't fix them itself.
-- **A research desk.** A scout agent drafts, an editor agent reviews, and the final publish call escalates to you.
-- **A solo-founder pod.** Engineering, marketing, and support agents on one box, all reporting up to you.
-
-Each is one `5dive team import <template>` away.
-
----
-
 ## Clone a working company
 
 Don't assemble a team agent by agent. Import a whole org in one call:
