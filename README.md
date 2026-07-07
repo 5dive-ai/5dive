@@ -6,11 +6,13 @@
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Telegram](https://img.shields.io/badge/Telegram-@ai5dive-229ED9?logo=telegram&logoColor=white)](https://t.me/ai5dive)
 
-**Spin up named agents, each with its own model, memory, and role. Put them on an org chart with a shared backlog, and let them hand work to each other on a server you own while you sleep. They ping your phone over Telegram only when a human has to decide. Works with claude, codex, grok, antigravity.**
+**The labs are renting you an agent sandbox. This is the one you own.**
+
+**Named AI agents on one server you control — each with its own model, memory, and role. They pull work off a shared backlog, hand it to each other while you sleep, and ping your phone over Telegram only when a human has to decide.** Works with claude, codex, grok, and antigravity.
 
 ![install to a Claude agent answering on Telegram](docs/quickstart.gif)
 
-> We run our own company on this: a team of AI agents that assign each other work, report up an org chart, and escalate to a human only when they're stuck. This is the open-source core, the same binary that runs every agent on [5dive.ai](https://5dive.ai?utm_source=github&utm_medium=referral&utm_campaign=5dive-readme). MIT, no open-core split. Run it yourself, or skip the ops with the managed VM.
+> **We run our own company on this.** The agents that build 5dive.ai take work off a shared backlog, report up an org chart, cut this repo's releases, and escalate to a human only when they're stuck. What you're installing is that exact binary — the open-source core, MIT, no open-core split. Run it yourself, or skip the ops with the [managed VM](https://5dive.ai?utm_source=github&utm_medium=referral&utm_campaign=5dive-readme).
 
 **Already use Claude Code, Codex, Grok, Antigravity, or opencode?** Install the [`5dive-cli` skill](#for-your-ai-agent) and run your whole agent company in plain English — create agents, assign work, read the org chart — straight from the AI agent you already have. One line to set up: [jump to it ↓](#for-your-ai-agent).
 
@@ -36,6 +38,11 @@ sudo 5dive agent create my-agent --type=claude --channels=telegram --telegram-to
 sudo 5dive agent pair   my-agent --code=<pairing-code>
 ```
 
+
+**Requirements:** a Linux box with `systemd` and your own agent-CLI subscription or API key (Claude Pro/Max, OpenAI, …) — no account with us.
+
+> **“`curl | sudo bash`, and agents with `sudo`?”** Fair question. The installer only apt-installs deps and drops the CLI + systemd units (every file it fetches is listed at the top of [`install.sh`](install.sh)). Each agent is then its own Linux user, and you choose its blast radius — a `sandboxed` agent gets its own home, no sudo, and resource limits. Details: [Security & isolation ↓](#security--isolation).
+
 ---
 
 ## Why 5dive
@@ -51,6 +58,18 @@ sudo 5dive agent pair   my-agent --code=<pairing-code>
 **Every major agent CLI.** `claude`, `codex`, `antigravity`, `grok`, and more, all under one team.
 
 **Safe by default.** Each agent is its own Linux user under one of three isolation tiers. MIT, no open-core split.
+
+---
+
+## What you can build
+
+Not primitives — outcomes. A few teams people stand up on day one:
+
+- **On-call ops.** An agent triages your CI failures at 7am and pings you only if it can't fix them itself.
+- **A research desk.** A scout agent drafts, an editor agent reviews, and the final publish call escalates to you.
+- **A solo-founder pod.** Engineering, marketing, and support agents on one box, all reporting up to you.
+
+Each is one `5dive team import <template>` away.
 
 ---
 
@@ -121,7 +140,12 @@ That arrives on your Telegram as tap-to-answer buttons. Tap one, and the owning 
 | `openclaw`    | third-party multi-provider harness | OAuth (OpenAI) / API key | Telegram, Discord |
 | `opencode`    | OpenCode               | API key | Telegram |
 
+<details>
+<summary><b>About <code>hermes</code> / <code>openclaw</code> (third-party multi-provider harnesses)</b></summary>
+
 `hermes` and `openclaw` are community-built harnesses that can route to many providers (OpenRouter, Anthropic, Google, Moonshot, DeepSeek, Z.ai, etc.). As of April 4, 2026, Anthropic no longer permits routing consumer Claude Pro/Max OAuth through third-party harnesses. For that work, use the official `claude` type with your own API key. Background: [We Ditched OpenClaw for Claude →](https://blog.5dive.ai/blog/we-ditched-openclaw-for-claude/?utm_source=github&utm_medium=referral&utm_campaign=5dive-readme).
+
+</details>
 
 The `claude` type can also run the official Claude Code harness against a third-party Anthropic-compatible endpoint, bring your own key:
 
