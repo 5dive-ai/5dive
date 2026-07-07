@@ -136,8 +136,8 @@ Each agent is one Linux user under one of three isolation tiers:
 
 | Tier | Access |
 |------|--------|
-| `admin` (default) | full host |
-| `standard` | shared read, limited write |
+| `standard` (default) | shared read, limited write |
+| `admin` | full host; auto-granted to the first agent on a fresh box |
 | `sandboxed` | own home only, no sudo, systemd resource limits |
 
 ```sh
