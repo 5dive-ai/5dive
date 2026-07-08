@@ -341,10 +341,28 @@ inject_and_submit() {
 # derived from the REAL sudo caller (SUDO_USER), never a spoofable flag.
 cmd_deliver() {
   require_root "agent _deliver"
-  local target="${1:-}"; shift || true
-  local message="$*"
-  [[ -n "$target" ]]  || fail "$E_USAGE" "usage: 5dive agent _deliver <target> <message>"
+  local msgid=""
+  local -a _pos=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --id=*) msgid="${1#--id=}" ;;
+      --)     shift; _pos+=("$@"); break ;;
+      *)      _pos+=("$1") ;;
+    esac
+    shift
+  done
+  local target="${_pos[0]:-}"
+  local message=""
+  (( ${#_pos[@]} > 1 )) && message="${_pos[*]:1}"
+  [[ -n "$target" ]]  || fail "$E_USAGE" "usage: 5dive agent _deliver [--id=<id>] <target> <message>"
   [[ -n "$message" ]] || fail "$E_USAGE" "message is empty"
+  # DIVE-1074: optional marker id (passed by `ask`) so the caller can later slice
+  # its reply window via `_capture --after-id`. Validated literal ([A-Za-z0-9]),
+  # same no-exec invariant as the message — it only lands in the injected header.
+  if [[ -n "$msgid" ]]; then
+    [[ "$msgid" =~ ^[A-Za-z0-9]{1,32}$ ]] \
+      || fail "$E_VALIDATION" "invalid --id (expected [A-Za-z0-9], <=32 chars)"
+  fi
   # Target must be a well-formed agent label AND a registered agent — no path to
   # inject into an arbitrary or unmanaged tmux session.
   [[ "$target" =~ ^[a-z][a-z0-9-]{0,31}$ ]] \
@@ -362,7 +380,9 @@ cmd_deliver() {
   tier="$(registry_read | jq -r --arg n "$s" '.agents[$n].isolation // empty' 2>/dev/null)"
 
   # Provenance envelope, mirroring cmd_send's [5dive-msg ...] header format.
+  # Field order matches cmd_send: from, id, tier.
   local header="[5dive-msg from=${s}"
+  [[ -n "$msgid" ]] && header+=" id=${msgid}"
   [[ -n "$tier" ]] && header+=" tier=${tier}"
   header+="]"
   local payload="${header} ${message}"
@@ -379,6 +399,61 @@ cmd_deliver() {
   ok "delivered to agent '$target'." \
      '{name:$n, delivered:true, from:$s, tier:($t|select(length>0))}' \
      --arg n "$target" --arg s "$s" --arg t "$tier"
+}
+
+# DIVE-1074: privileged inter-agent READ primitive — the read half of `ask` for a
+# standard-isolation agent (which has no broad sudo, so it cannot run the
+# `sudo -u agent-X tmux capture-pane` that `ask`'s reply-read needs). Hidden
+# subcommand run as ROOT via a per-agent scoped sudoers grant (write_standard_sudoers),
+# the sibling of `_deliver`. Same standing invariant: single-purpose, NEVER execs
+# caller-controlled input (all args are validated literals; no eval/sh -c).
+#
+# It emits ONLY the reply window for ONE question: the pane lines AFTER the line
+# carrying `id=<after-id>` and strictly BEFORE the next `[5dive-msg` marker line
+# (or end of pane). Bounding to the next marker is a deliberate hardening over a
+# naive "everything after the marker": an unbounded read would let a standard
+# caller pass an OLD marker id and read a peer's LATER pane activity (its replies
+# to other agents, its work output, secrets). With the bound, a caller reads at
+# most one reply window per marker; and since `ask` mints fresh 4-byte-urandom
+# ids (gen_msg_id), a caller can only realistically target replies to questions
+# it actually asked. It can NEVER read content before its marker.
+cmd_capture() {
+  require_root "agent _capture"
+  local after_id="" buf_lines=2000
+  local -a _pos=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --after-id=*)     after_id="${1#--after-id=}" ;;
+      --buffer-lines=*) buf_lines="${1#--buffer-lines=}" ;;
+      --)               shift; _pos+=("$@"); break ;;
+      *)                _pos+=("$1") ;;
+    esac
+    shift
+  done
+  local target="${_pos[0]:-}"
+  [[ -n "$target" ]]   || fail "$E_USAGE" "usage: 5dive agent _capture <target> --after-id=<id> [--buffer-lines=N]"
+  [[ -n "$after_id" ]] || fail "$E_USAGE" "--after-id is required"
+  [[ "$target" =~ ^[a-z][a-z0-9-]{0,31}$ ]] \
+    || fail "$E_VALIDATION" "invalid target '$target' (lowercase letter start, [a-z0-9-], <=32 chars)"
+  [[ "$after_id" =~ ^[A-Za-z0-9]{1,32}$ ]] \
+    || fail "$E_VALIDATION" "invalid --after-id (expected [A-Za-z0-9], <=32 chars)"
+  [[ "$buf_lines" =~ ^[0-9]{1,6}$ ]] \
+    || fail "$E_VALIDATION" "--buffer-lines must be a positive integer"
+  require_agent "$target"
+  sudo -u "agent-${target}" tmux has-session -t "agent-${target}" 2>/dev/null \
+    || fail "$E_NOT_RUNNING" "tmux session 'agent-${target}' not found (is the agent running?)"
+
+  local capture
+  capture=$(sudo -u "agent-${target}" tmux capture-pane -t "agent-${target}" -p -S "-${buf_lines}" 2>/dev/null) || true
+  # Slice: lines AFTER the first line containing id=<after-id>, stopping BEFORE
+  # the next [5dive-msg marker (bounds the read to a single reply window). Empty
+  # output if the marker isn't present yet — the caller (`ask`) polls until the
+  # reply appears and stabilises.
+  awk -v id="id=${after_id}" '
+    found && index($0, "[5dive-msg") { exit }
+    found                           { print }
+    index($0, id)                   { found=1 }
+  ' <<<"$capture"
 }
 
 # Inject a message into the agent's tmux session. Uses inject_and_submit so the
@@ -576,20 +651,23 @@ cmd_ask() {
       || fail "$E_VALIDATION" "invalid --reply-to-msg (expected positive integer)"
   fi
 
-  # DIVE-1065 TODO: ask is NOT yet available to standard-isolation agents. Unlike
-  # `send`, `ask` must read the receiver's reply back via `sudo -u agent-X tmux
-  # capture-pane`, which the scoped `_deliver` grant does NOT cover (it only
-  # injects). Wiring ask for standard agents needs a separate read-capable
-  # primitive; until then a standard caller falls through to the direct path
-  # below and fails at the first `sudo -u` (no broad sudo) — same as before 1065.
-  require_agent "$name"
-  sudo -u "agent-${name}" tmux has-session -t "agent-${name}" 2>/dev/null \
-    || fail "$E_NOT_RUNNING" "tmux session 'agent-${name}' not found (is the agent running?)"
+  # DIVE-1074: a standard-isolation agent has no broad sudo, so it can't run the
+  # direct `sudo -u agent-X tmux` inject+capture that `ask` uses below. Route a
+  # non-root standard-tier caller through the scoped primitives instead:
+  # `_deliver --id` (inject carrying a marker) + `_capture --after-id` (bounded
+  # reply read). Same gate as cmd_send. Admin/root keep the direct path unchanged.
+  local use_scoped=0
+  if [[ $EUID -ne 0 ]]; then
+    local _caller="${SUDO_USER:-${USER:-}}"; _caller="${_caller#agent-}"
+    local _ctier=""
+    [[ -n "$_caller" ]] && _ctier="$(registry_read | jq -r --arg n "$_caller" '.agents[$n].isolation // empty' 2>/dev/null)"
+    [[ "$_ctier" == "standard" ]] && use_scoped=1
+  fi
 
-  # Resolve sender — ask always wraps because we need a marker to slice the
-  # reply window. Fall back to a literal "ask" if neither --from nor SUDO_USER
-  # gives us anything; at worst the receiver sees from=ask, which is
-  # informative ("a script asked me, not a peer agent").
+  # Resolve sender — ask always wraps because we need a marker to slice the reply
+  # window. On the scoped path `_deliver` re-derives the sender + tier from the
+  # real sudo caller, so this local `sender` is only for this command's JSON
+  # summary. Fall back to a literal "ask" if we can't infer one.
   local sender msg_id
   if (( from_set )); then
     sender="$from"
@@ -600,24 +678,37 @@ cmd_ask() {
   valid_sender_label "$sender" \
     || fail "$E_VALIDATION" "invalid --from label '$sender' (lowercase letter start, [a-z0-9-], <=32 chars)"
   msg_id="$(gen_msg_id)"
-  local header="[5dive-msg from=${sender} id=${msg_id}"
-  [[ -n "$reply_to_chat" ]] && header+=" reply-to-chat=${reply_to_chat}"
-  [[ -n "$reply_to_msg" ]] && header+=" reply-to-msg=${reply_to_msg}"
-  header+="]"
-  local payload="${header} ${message}"
 
-  # Same boot-race guard as cmd_send: wait for the input prompt before sending
-  # so a freshly-(re)started target doesn't silently drop the question.
-  if ! wait_agent_input_ready "$name"; then
-    step "agent '$name' input prompt not detected after 45s — sending best-effort (may be lost if still booting)"
+  if (( use_scoped )); then
+    # Inject via the scoped delivery grant, carrying our fresh marker id.
+    # _deliver validates the target + running session and builds the provenance
+    # header (from=<caller> id=<msg_id> tier=standard). sudo -n = fail-closed.
+    # A standard ask is peer-to-peer, so (like send) it carries no --reply-to
+    # channel plumbing.
+    if ! sudo -n /usr/local/bin/5dive agent _deliver --id="$msg_id" "$name" "$message"; then
+      fail "$E_GENERIC" "scoped delivery to '$name' failed (missing _deliver grant? re-provision the agent)"
+    fi
+  else
+    require_agent "$name"
+    sudo -u "agent-${name}" tmux has-session -t "agent-${name}" 2>/dev/null \
+      || fail "$E_NOT_RUNNING" "tmux session 'agent-${name}' not found (is the agent running?)"
+    local header="[5dive-msg from=${sender} id=${msg_id}"
+    [[ -n "$reply_to_chat" ]] && header+=" reply-to-chat=${reply_to_chat}"
+    [[ -n "$reply_to_msg" ]] && header+=" reply-to-msg=${reply_to_msg}"
+    header+="]"
+    local payload="${header} ${message}"
+    # Same boot-race guard as cmd_send: wait for the input prompt before sending
+    # so a freshly-(re)started target doesn't silently drop the question.
+    if ! wait_agent_input_ready "$name"; then
+      step "agent '$name' input prompt not detected after 45s — sending best-effort (may be lost if still booting)"
+    fi
+    if ! inject_and_submit "$name" "$payload"; then
+      step "agent '$name': question may not have submitted — pane still shows an unsent paste buffer after retries (large-paste submit race, DIVE-147)"
+    fi
   fi
 
-  if ! inject_and_submit "$name" "$payload"; then
-    step "agent '$name': question may not have submitted — pane still shows an unsent paste buffer after retries (large-paste submit race, DIVE-147)"
-  fi
-
-  # Mirror the outbound into the sender's group chat (best-effort). ask always
-  # wraps, so there's always a sender identity to mirror under.
+  # Mirror the outbound into the sender's group chat (best-effort). Unprivileged
+  # (runs as the caller), so it's safe on both paths.
   mirror_interagent_outbound "$name" "$message"
 
   local start now last_change reply="" prev_slice="" capture slice
@@ -626,11 +717,17 @@ cmd_ask() {
   while :; do
     sleep "$poll"
     now=$(date +%s)
-    capture=$(sudo -u "agent-${name}" tmux capture-pane -t "agent-${name}" -p -S "-${buf_lines}" 2>/dev/null) || true
-    # Everything after the first line containing our marker. The receiver's
-    # CLI typically echoes the user input once, so the slice begins right
-    # after that echo and grows as the receiver responds.
-    slice=$(awk -v id="id=${msg_id}" 'found {print} index($0, id) {found=1}' <<<"$capture")
+    if (( use_scoped )); then
+      # Scoped bounded read: _capture returns ONLY our reply window, already
+      # sliced (after our marker, up to the next marker). sudo -n = fail-closed.
+      slice=$(sudo -n /usr/local/bin/5dive agent _capture "$name" --after-id="$msg_id" --buffer-lines="$buf_lines" 2>/dev/null) || true
+    else
+      capture=$(sudo -u "agent-${name}" tmux capture-pane -t "agent-${name}" -p -S "-${buf_lines}" 2>/dev/null) || true
+      # Everything after the first line containing our marker. The receiver's
+      # CLI typically echoes the user input once, so the slice begins right
+      # after that echo and grows as the receiver responds.
+      slice=$(awk -v id="id=${msg_id}" 'found {print} index($0, id) {found=1}' <<<"$capture")
+    fi
 
     if [[ "$slice" != "$prev_slice" ]]; then
       last_change=$now

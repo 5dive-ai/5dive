@@ -304,6 +304,10 @@ main() {
         # scoped-sudoers grant a standard agent gets (write_standard_sudoers);
         # `cmd_send` re-execs into it for non-root agent callers. Not advertised.
         _deliver) cmd_deliver "$@" ;;
+        # DIVE-1074: hidden privileged READ primitive (bounded reply-window read),
+        # the sibling of _deliver. `cmd_ask` re-execs into it for a standard-tier
+        # non-root caller to read back the reply. Scoped-sudoers only, not advertised.
+        _capture) cmd_capture "$@" ;;
         stats)   cmd_stats "$@" ;;
         create)
           AUDIT_CMD="agent create"; AUDIT_ARGS=("$@")

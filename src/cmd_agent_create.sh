@@ -92,18 +92,23 @@ SUDOERS
   fi
 }
 
-# DIVE-1065: scoped inter-agent-send grant for a 'standard'-isolation agent. A
-# standard agent has NO broad sudo, so it can't run the `sudo -u agent-X tmux`
-# inject that `5dive agent send` uses (that path needs root). This grants EXACTLY
-# one thing: the hidden `5dive agent _deliver` subcommand, as root, NOPASSWD.
+# DIVE-1065/1074: scoped inter-agent a2a grants for a 'standard'-isolation agent.
+# A standard agent has NO broad sudo, so it can't run the `sudo -u agent-X tmux`
+# inject/capture that `5dive agent send`/`ask` use (those need root). This grants
+# EXACTLY two hidden, single-purpose subcommands as root, NOPASSWD:
+#   * `5dive agent _deliver` (DIVE-1065) — the send/ask INJECT half.
+#   * `5dive agent _capture` (DIVE-1074) — the ask reply-READ half.
 #
-# Why this is safe (same invariant as write_admin_sudoers above): `_deliver` is a
-# single-purpose primitive that does ONLY a LITERAL tmux inject (send-keys -l --)
-# of a provenance-wrapped message into a validated, registered target's pane. It
-# NEVER execs caller-controlled input (no eval / sh -c / printf-format), so the
-# `*` wildcard on its arguments cannot become an agent->root vector: the worst a
-# standard agent can do with this grant is inject text into a peer's pane — which
-# is precisely the sanctioned capability this feature exists to give it.
+# Why this is safe (same invariant as write_admin_sudoers above): both are
+# single-purpose primitives that NEVER exec caller-controlled input (no eval /
+# sh -c / printf-format), so the `*` wildcard on their args cannot become an
+# agent->root vector. `_deliver` does ONLY a LITERAL tmux inject (send-keys -l --)
+# of a provenance-wrapped message into a validated, registered target. `_capture`
+# does ONLY a read-back of that target's pane, server-side-sliced to the caller's
+# OWN reply window (lines after its marker id, up to the next marker) — it cannot
+# read a peer's pre-existing pane or unbounded later activity. The worst a standard
+# agent can do is inject text into a peer's pane and read the reply to its own
+# question — precisely the sanctioned a2a capability this feature exists to give.
 #
 # Crucially this does NOT grant the whole `5dive` CLI as root — that stays
 # admin-only. Only the one hardened subcommand is reachable, upholding the
@@ -116,9 +121,10 @@ write_standard_sudoers() {
   local user="$1" f="/etc/sudoers.d/${user}" tmp
   tmp=$(mktemp)
   cat > "$tmp" <<SUDOERS
-# Managed by 5dive (DIVE-1065). Scoped inter-agent-send grant for standard agent ${user}.
+# Managed by 5dive (DIVE-1065/1074). Scoped inter-agent a2a grants for standard agent ${user}.
 # Do not edit by hand; regenerated on agent create/provision.
 ${user} ALL=(root) NOPASSWD: /usr/local/bin/5dive agent _deliver *
+${user} ALL=(root) NOPASSWD: /usr/local/bin/5dive agent _capture *
 SUDOERS
   chmod 440 "$tmp"
   if visudo -cf "$tmp" >/dev/null 2>&1; then

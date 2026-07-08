@@ -2,7 +2,11 @@
 # -------- agent CRUD --------
 
 cmd_list() {
-  ensure_state
+  # DIVE-1074: rootless read (mirrors account list / DIVE-1035). `agent list` is
+  # pure-read, and a standard-isolation agent (group claude, so it can read the
+  # registry) needs it to DISCOVER peers before it can send/ask them. ensure_state_ro
+  # skips require_root when the registry already exists.
+  ensure_state_ro
   local reg
   reg=$(registry_read)
   # Enrich with live systemd state.
