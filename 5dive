@@ -5025,7 +5025,7 @@ rotation_require_agent() {
 cmd_agent_rotation_get() {
   local name="${1:-}"
   [[ -n "$name" ]] || fail "$E_USAGE" "usage: 5dive agent rotation get <agent>"
-  ensure_state
+  ensure_state_ro   # read-only: rotation status must work for non-root agents
   local reg active rot
   reg=$(rotation_require_agent "$name")
   active=$(jq -r --arg n "$name" '.agents[$n].authProfile // ""' <<<"$reg")
@@ -5675,7 +5675,7 @@ PY
 # runtime's config itself — the version/model live in different files per type
 # and the binaries aren't on the agent user's PATH.
 cmd_info() {
-  ensure_state
+  ensure_state_ro   # read-only: agent info must work for non-root / standard-isolation agents
   local name=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -7686,7 +7686,7 @@ cmd_telegram_info() {
     shift
   done
   [[ -n "$name" ]] || fail "$E_USAGE" "usage: 5dive agent telegram-info <name> [--refresh]"
-  ensure_state
+  ensure_state_ro   # read-only: telegram-info must work for non-root agents
   local reg
   reg=$(registry_read)
   jq -e --arg n "$name" '.agents[$n] != null' <<<"$reg" >/dev/null \
@@ -7718,7 +7718,7 @@ cmd_telegram_info() {
     || fail "$E_GENERIC" "telegram getMe failed (network or invalid token)"
 
   # Cache to registry so the next list/info call avoids the Telegram round-trip.
-  with_registry_lock _persist_bot_username "$name" "$username"
+  with_registry_lock _persist_bot_username "$name" "$username" || true   # cache writeback best-effort: non-root callers can't take the registry lock (telegram-info is read-mostly)
 
   ok "bot @$username" \
      '{username:$un, cached:false}' \
@@ -7773,7 +7773,7 @@ cmd_agent_topic_get() {
     shift
   done
   [[ -n "$name" ]] || fail "$E_USAGE" "usage: 5dive agent topic get <name>"
-  ensure_state
+  ensure_state_ro   # read-only: topic lookup must work for non-root agents
   local reg tt
   reg=$(registry_read)
   jq -e --arg n "$name" '.agents[$n] != null' <<<"$reg" >/dev/null \
@@ -9723,7 +9723,7 @@ EOF
 # presence checks in the lifecycle commands below.
 require_agent() {
   local name="$1"
-  ensure_state
+  ensure_state_ro   # presence check is read-only; must work for non-root agents
   local reg
   reg=$(registry_read)
   jq -e --arg n "$name" '.agents[$n] != null' <<<"$reg" >/dev/null \
@@ -13272,7 +13272,7 @@ HELP
     esac
     shift
   done
-  ensure_state
+  ensure_state_ro   # read-only: fleet export must work for non-root agents
   local reg
   reg=$(registry_read)
 
@@ -13407,7 +13407,7 @@ HELP
       || fail "$E_NOT_FOUND" "no 5dive.yaml or 5dive.yml in $(pwd) — pass -f <file>"
   fi
   [[ -f "$file" ]] || fail "$E_NOT_FOUND" "spec file not found: $file"
-  ensure_state
+  ensure_state_ro   # read-only: compose ps must work for non-root agents
 
   local spec
   spec=$(_compose_parse "$file") || fail "$E_VALIDATION" "spec parse failed"

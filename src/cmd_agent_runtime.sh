@@ -2,7 +2,7 @@
 # presence checks in the lifecycle commands below.
 require_agent() {
   local name="$1"
-  ensure_state
+  ensure_state_ro   # presence check is read-only; must work for non-root agents
   local reg
   reg=$(registry_read)
   jq -e --arg n "$name" '.agents[$n] != null' <<<"$reg" >/dev/null \

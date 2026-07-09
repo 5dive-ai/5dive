@@ -496,7 +496,7 @@ rotation_require_agent() {
 cmd_agent_rotation_get() {
   local name="${1:-}"
   [[ -n "$name" ]] || fail "$E_USAGE" "usage: 5dive agent rotation get <agent>"
-  ensure_state
+  ensure_state_ro   # read-only: rotation status must work for non-root agents
   local reg active rot
   reg=$(rotation_require_agent "$name")
   active=$(jq -r --arg n "$name" '.agents[$n].authProfile // ""' <<<"$reg")

@@ -267,7 +267,7 @@ PY
 # runtime's config itself — the version/model live in different files per type
 # and the binaries aren't on the agent user's PATH.
 cmd_info() {
-  ensure_state
+  ensure_state_ro   # read-only: agent info must work for non-root / standard-isolation agents
   local name=""
   while [[ $# -gt 0 ]]; do
     case "$1" in

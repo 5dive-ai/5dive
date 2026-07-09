@@ -184,7 +184,7 @@ cmd_telegram_info() {
     shift
   done
   [[ -n "$name" ]] || fail "$E_USAGE" "usage: 5dive agent telegram-info <name> [--refresh]"
-  ensure_state
+  ensure_state_ro   # read-only: telegram-info must work for non-root agents
   local reg
   reg=$(registry_read)
   jq -e --arg n "$name" '.agents[$n] != null' <<<"$reg" >/dev/null \
@@ -216,7 +216,7 @@ cmd_telegram_info() {
     || fail "$E_GENERIC" "telegram getMe failed (network or invalid token)"
 
   # Cache to registry so the next list/info call avoids the Telegram round-trip.
-  with_registry_lock _persist_bot_username "$name" "$username"
+  with_registry_lock _persist_bot_username "$name" "$username" || true   # cache writeback best-effort: non-root callers can't take the registry lock (telegram-info is read-mostly)
 
   ok "bot @$username" \
      '{username:$un, cached:false}' \
@@ -271,7 +271,7 @@ cmd_agent_topic_get() {
     shift
   done
   [[ -n "$name" ]] || fail "$E_USAGE" "usage: 5dive agent topic get <name>"
-  ensure_state
+  ensure_state_ro   # read-only: topic lookup must work for non-root agents
   local reg tt
   reg=$(registry_read)
   jq -e --arg n "$name" '.agents[$n] != null' <<<"$reg" >/dev/null \

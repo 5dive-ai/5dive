@@ -521,7 +521,7 @@ HELP
     esac
     shift
   done
-  ensure_state
+  ensure_state_ro   # read-only: fleet export must work for non-root agents
   local reg
   reg=$(registry_read)
 
@@ -656,7 +656,7 @@ HELP
       || fail "$E_NOT_FOUND" "no 5dive.yaml or 5dive.yml in $(pwd) — pass -f <file>"
   fi
   [[ -f "$file" ]] || fail "$E_NOT_FOUND" "spec file not found: $file"
-  ensure_state
+  ensure_state_ro   # read-only: compose ps must work for non-root agents
 
   local spec
   spec=$(_compose_parse "$file") || fail "$E_VALIDATION" "spec parse failed"
