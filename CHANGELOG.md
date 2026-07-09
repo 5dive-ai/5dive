@@ -10,6 +10,19 @@ release.
 ## [Unreleased]
 
 ### Fixed
+- **Shared team-bot members no longer fight the listener over getUpdates (DIVE-1087).**
+  With `5dive agent team-bot shared` + poll-fork agents (codex/grok/opencode/agy),
+  every per-agent bridge long-polled `getUpdates` in addition to the single
+  `5dive-team-bot-listener`. Telegram allows one consumer per token, so N agents +
+  the listener 409'd each other and inline approval-button callbacks were silently
+  lost (unanswerable `task need --type=approval` gates). `team-bot shared` sets
+  `TELEGRAM_SEND_ONLY=1` in the connector env, but codex/grok/opencode/agy spawn
+  their MCP bridge with a minimal env and read their own `channels/telegram/.env`,
+  which the flag never reached. `5dive-agent-start` now propagates
+  `TELEGRAM_SEND_ONLY` into each bridge's `.env` on every boot (and removes it when
+  toggled off), and the bridges honor it by structurally skipping the poll loop
+  (`acquireSlot`/`bot.start` never run) while keeping the MCP send tools live — so
+  the shared listener is the sole poller and approval taps survive.
 - **`5dive agent create` (admin isolation) now works on Ubuntu 26.04 (DIVE-1088).**
   sudo-rs (`visudo-rs`, the default sudo on Ubuntu 26.04) rejects wildcards
   *inside* a command argument, so the admin sudoers' `systemctl <verb>

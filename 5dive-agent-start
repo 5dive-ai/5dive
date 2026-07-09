@@ -834,6 +834,44 @@ case "${AUTONOMY,,}" in
   *) echo "[5dive] unknown AGENT_AUTONOMY='$AUTONOMY' — treating as standard" >&2 ;;
 esac
 
+# DIVE-1087: propagate TELEGRAM_SEND_ONLY into the poll-fork bridges' OWN env file.
+# A shared team bot (`5dive agent team-bot shared`) writes TELEGRAM_SEND_ONLY=1 into
+# /etc/5dive/connectors/telegram-<name>.env (loaded into THIS script's env by systemd
+# via the EnvironmentFile= line) so a per-agent bridge SKIPS polling — otherwise N
+# agents plus the team-bot listener all long-poll getUpdates on one token, Telegram
+# 409s every consumer but one, and inline approval-button callbacks are silently lost
+# (unanswerable `task need --type=approval` gates). But codex/grok/opencode/agy spawn
+# their MCP bridge with a minimal (~7-var) env and the bridge reads TELEGRAM_BOT_TOKEN
+# — and now this flag — from its OWN channels/telegram/.env, which the connector env
+# never reaches. So mirror the flag into that .env on EVERY boot (idempotent), and
+# REMOVE it when the connector no longer sets it, so toggling send-only on/off then
+# restarting takes effect. claude reads the flag from its plugin env directly, so this
+# is poll-fork-only. The bridge is spawned later (by the agent launched below), so the
+# .env is in place before it reads it.
+if [[ "$CHANNELS" == *telegram* && "$TYPE" != "claude" ]]; then
+  _tg_state=""
+  case "$TYPE" in
+    codex)       _tg_state="$HOME/.codex/channels/telegram" ;;
+    grok)        _tg_state="$HOME/.grok/channels/telegram" ;;
+    opencode)    _tg_state="$HOME/.opencode/channels/telegram" ;;
+    antigravity) _tg_state="$HOME/.gemini/channels/telegram" ;;
+  esac
+  _tg_env="${_tg_state:+$_tg_state/.env}"
+  # Only touch a bridge that already has a seeded .env, OR when we must set the flag.
+  if [[ -n "$_tg_env" ]] && { [[ -f "$_tg_env" ]] || [[ "${TELEGRAM_SEND_ONLY:-}" == "1" ]]; }; then
+    install -d -m 700 "$_tg_state"
+    _tg_tmp="$(mktemp -p "$_tg_state" .env.XXXXXX)"
+    # Preserve every other line (esp. TELEGRAM_BOT_TOKEN); drop any stale flag line.
+    grep -v '^TELEGRAM_SEND_ONLY=' "$_tg_env" 2>/dev/null > "$_tg_tmp" || :
+    if [[ "${TELEGRAM_SEND_ONLY:-}" == "1" ]]; then
+      printf 'TELEGRAM_SEND_ONLY=1\n' >> "$_tg_tmp"
+    fi
+    chmod 600 "$_tg_tmp"
+    mv "$_tg_tmp" "$_tg_env"
+  fi
+  unset _tg_state _tg_env _tg_tmp 2>/dev/null || :
+fi
+
 CMD_STR=$(printf '%q ' "$BIN" "${ARGS[@]}")
 
 # First-attach onboarding for openclaw with no channel: openclaw chat is the
