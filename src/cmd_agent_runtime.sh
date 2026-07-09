@@ -457,6 +457,37 @@ cmd_capture() {
   ' <<<"$capture"
 }
 
+# DIVE-1088: hidden privileged service-lifecycle primitive — the sanctioned
+# replacement for a raw `sudo systemctl <verb> 5dive-<unit>` grant. sudo-rs (the
+# default sudo on Ubuntu 26.04) rejects wildcards inside command arguments, so the
+# old admin sudoers `systemctl restart 5dive-agent@*` / `5dive-*.service` lines
+# broke `agent create` there. This helper carries the SAME scope those lines had
+# (start|stop|restart of a 5dive-owned unit ONLY) but enforces it in code, and is
+# reached via the admin's existing whole-CLI grant (`/usr/local/bin/5dive *`) — no
+# new sudoers wildcard. Standing invariant (mirrors _deliver/_capture): single-
+# purpose, runs a FIXED `systemctl --no-pager <verb> <validated-unit>`, and NEVER
+# execs caller-controlled input (no eval / sh -c / pager) — so it cannot become an
+# agent->root escape. Not advertised (underscore prefix).
+cmd_svc() {
+  require_root "agent _svc"
+  local action="${1:-}" unit="${2:-}"
+  case "$action" in
+    start|stop|restart) ;;
+    *) fail "$E_USAGE" "usage: 5dive agent _svc <start|stop|restart> <5dive-unit>" ;;
+  esac
+  [[ -n "$unit" ]] || fail "$E_USAGE" "unit is required"
+  # 5dive-owned units only: a templated agent unit (5dive-agent@<name>) or a plain
+  # 5dive-<name> service, optional .service suffix. No slash, space, or shell
+  # metacharacter can pass, and it must start with the literal `5dive-` prefix so
+  # it can neither escape the 5dive scope nor be read as a systemctl option/flag.
+  # This exactly matches the scope of the retired `5dive-agent@*` / `5dive-*.service`
+  # sudoers lines. The unit is passed to systemctl as a single argv (no shell).
+  [[ "$unit" =~ ^5dive-(agent@)?[A-Za-z0-9_.-]+(\.service)?$ ]] \
+    || fail "$E_VALIDATION" "refusing non-5dive or malformed unit '$unit' (expected 5dive-agent@<name> or 5dive-<name>[.service])"
+  systemctl --no-pager "$action" "$unit" >&2
+  ok "service '$unit' ${action}ed." '{unit:$u, action:$a}' --arg u "$unit" --arg a "$action"
+}
+
 # Inject a message into the agent's tmux session. Uses inject_and_submit so the
 # text is delivered literally AND actually submitted (bracketed-paste safe).
 # Not exposed via /agents/exec: arbitrary text won't pass the API arg regex, so

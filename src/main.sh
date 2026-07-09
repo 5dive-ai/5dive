@@ -308,6 +308,11 @@ main() {
         # the sibling of _deliver. `cmd_ask` re-execs into it for a standard-tier
         # non-root caller to read back the reply. Scoped-sudoers only, not advertised.
         _capture) cmd_capture "$@" ;;
+        # DIVE-1088: hidden privileged service-lifecycle primitive (start|stop|restart
+        # of a 5dive-owned unit only). Replaces the raw `systemctl 5dive-agent@*` /
+        # `5dive-*.service` sudoers lines that sudo-rs (Ubuntu 26.04) rejected. Reached
+        # via the admin whole-CLI grant; enforces its 5dive-only scope in code.
+        _svc)    cmd_svc "$@" ;;
         stats)   cmd_stats "$@" ;;
         create)
           AUDIT_CMD="agent create"; AUDIT_ARGS=("$@")

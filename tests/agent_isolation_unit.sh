@@ -77,17 +77,38 @@ if command -v visudo >/dev/null 2>&1; then
   # Mirror write_admin_sudoers' inlined body (the real fn writes to a root-only
   # /etc/sudoers.d path); assert the generated shape is visudo-valid + scoped.
   user="agent-testadmin"
+  # DIVE-1088: only bare-trailing-`*` (any-args) forms — sudo-rs (Ubuntu 26.04's
+  # default) rejects wildcards INSIDE a command argument, so the old raw
+  # `systemctl ... 5dive-agent@*` / `5dive-*.service` lines broke `agent create`
+  # there. Mirror the retired shape too so we can assert visudo-rs rejects it.
   cat > "$SFILE" <<SUD
-${user} ALL=(root) NOPASSWD: \\
-  /usr/local/bin/5dive, /usr/local/bin/5dive *, \\
-  /usr/bin/systemctl start 5dive-agent@*, /usr/bin/systemctl stop 5dive-agent@*, \\
-  /usr/bin/systemctl restart 5dive-agent@*, \\
-  /bin/systemctl restart 5dive-*.service
+${user} ALL=(root) NOPASSWD: /usr/local/bin/5dive, /usr/local/bin/5dive *
 SUD
   if visudo -cf "$SFILE" >/dev/null 2>&1; then
     ok_t "scoped admin sudoers passes visudo -c"
   else
     bad_t "scoped admin sudoers visudo" "$(visudo -cf "$SFILE" 2>&1)"
+  fi
+  # DIVE-1088: the generated file must also pass sudo-rs's visudo-rs when present
+  # (Ubuntu 26.04). The retired embedded-wildcard shape must FAIL it — that was
+  # the bug. Skipped where visudo-rs is unavailable (e.g. Ubuntu <=24.04).
+  if command -v visudo-rs >/dev/null 2>&1; then
+    if visudo-rs -cf "$SFILE" >/dev/null 2>&1; then
+      ok_t "scoped admin sudoers passes visudo-rs (sudo-rs / Ubuntu 26.04)"
+    else
+      bad_t "scoped admin sudoers visudo-rs" "$(visudo-rs -cf "$SFILE" 2>&1 | tail -2)"
+    fi
+    OLDF="$TMP/sudoers-old"
+    printf '%s ALL=(root) NOPASSWD: /usr/bin/systemctl restart 5dive-agent@*\n' "$user" > "$OLDF"
+    if visudo-rs -cf "$OLDF" >/dev/null 2>&1; then
+      # 0.2.x (24.04) is permissive; 0.2.13 (26.04) rejects. Don't fail the suite
+      # on the permissive build — just note it so the guard's intent is on record.
+      echo "# note: this visudo-rs build accepts embedded arg-wildcards (pre-0.2.13); the 26.04 build rejects them"
+    else
+      ok_t "visudo-rs REJECTS the retired embedded-wildcard systemctl grant (reproduces DIVE-1088)"
+    fi
+  else
+    echo "# visudo-rs not present; skipping sudo-rs (Ubuntu 26.04) shape asserts"
   fi
   grep -q '/usr/local/bin/5dive' "$SFILE" \
     && ok_t "scoped sudoers grants the 5dive fleet CLI" \
@@ -110,6 +131,18 @@ SUD
   grep -qF '/usr/local/bin/5dive' <<<"$BODY" \
     && ok_t "real write_admin_sudoers still grants the 5dive CLI" \
     || bad_t "real write_admin_sudoers grants 5dive" ""
+  # DIVE-1088: no raw systemctl grant, and NO wildcard inside a command argument
+  # (the exact construct sudo-rs rejects). Service lifecycle goes through the CLI.
+  if grep -q 'systemctl' <<<"$BODY"; then
+    bad_t "admin sudoers must NOT grant raw systemctl (DIVE-1088 sudo-rs compat)" ""
+  else
+    ok_t "admin sudoers grants no raw systemctl (routes via 5dive CLI / _svc)"
+  fi
+  if grep -qE '@\*|\*\.service' <<<"$BODY"; then
+    bad_t "admin sudoers must have NO embedded-argument wildcard (sudo-rs rejects)" ""
+  else
+    ok_t "admin sudoers has no embedded-argument wildcard (sudo-rs valid)"
+  fi
 else
   echo "# visudo not present; skipping sudoers shape asserts"
 fi
@@ -126,6 +159,36 @@ grep -q 'restart "5dive-agent@\${name}.service"' <<<"$RESTART_BODY" \
   && ! grep -qE '\--defer.*\$\{?[0-9]|defer.*eval' <<<"$RESTART_BODY" \
   && ok_t "restart --defer wraps a FIXED systemctl restart (no caller-injected cmd)" \
   || bad_t "restart --defer fixed command" "deferred command must not be caller-templated"
+
+# ---- 2d. cmd_svc: 5dive-only unit scope + no-exec invariant (DIVE-1088) -------
+# The hardened replacement for the retired raw `systemctl 5dive-*` sudoers grant.
+# It runs a FIXED systemctl and must never exec caller-controlled input.
+SVC_BODY=$(sed -n '/^cmd_svc()/,/^}/p' src/cmd_agent_runtime.sh)
+grep -q 'require_root' <<<"$SVC_BODY" \
+  && ok_t "cmd_svc requires root" || bad_t "cmd_svc require_root" "must gate on root"
+grep -q -- '--no-pager' <<<"$SVC_BODY" \
+  && ok_t "cmd_svc runs systemctl --no-pager (no pager -> !sh escape)" \
+  || bad_t "cmd_svc --no-pager" "must pass --no-pager"
+if grep -qE '\beval\b|sh -c|\$\(' <<<"$SVC_BODY"; then
+  bad_t "cmd_svc must NOT exec caller-controlled input" "found eval/sh -c/command-subst"
+else
+  ok_t "cmd_svc never execs caller-controlled input"
+fi
+# Functional: mirror cmd_svc's action + unit gates (keep in sync with the source).
+svc_action_ok() { case "$1" in start|stop|restart) return 0;; *) return 1;; esac; }
+UNIT_RE='^5dive-(agent@)?[A-Za-z0-9_.-]+(\.service)?$'
+for good in '5dive-agent@dev' '5dive-agent@dev.service' '5dive-team-bot-listener.service' '5dive-warm-pool.service'; do
+  [[ "$good" =~ $UNIT_RE ]] && ok_t "cmd_svc accepts 5dive unit '$good'" \
+    || bad_t "cmd_svc accepts '$good'" "should match"
+done
+for bad in 'sshd' 'nginx.service' '5dive-agent@dev; rm -rf /' '../../etc/x' '-H' '5dive foo' 'systemd-run'; do
+  [[ "$bad" =~ $UNIT_RE ]] && bad_t "cmd_svc must REJECT '$bad'" "matched but should not" \
+    || ok_t "cmd_svc rejects non-5dive/malformed unit '$bad'"
+done
+for act in edit mask 'restart;bash' status; do
+  svc_action_ok "$act" && bad_t "cmd_svc must REJECT action '$act'" "only start|stop|restart" \
+    || ok_t "cmd_svc rejects non-lifecycle action '$act'"
+done
 
 # ---- 3. v1 -> v2 migration stamps explicit isolation ------------------------
 LEGACY='{"schemaVersion":1,"agents":{"old1":{"type":"claude"},"old2":{"type":"claude","isolation":"standard"}}}'

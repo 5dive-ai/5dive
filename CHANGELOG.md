@@ -10,6 +10,19 @@ release.
 ## [Unreleased]
 
 ### Fixed
+- **`5dive agent create` (admin isolation) now works on Ubuntu 26.04 (DIVE-1088).**
+  sudo-rs (`visudo-rs`, the default sudo on Ubuntu 26.04) rejects wildcards
+  *inside* a command argument, so the admin sudoers' `systemctl <verb>
+  5dive-agent@*` / `5dive-*.service` lines failed validation and aborted the
+  default first-agent (admin) create with no partial install — the error was
+  `wildcards are not allowed in command arguments`. `--isolation=standard` was
+  unaffected because its grants use a bare trailing `*` (any-args), which
+  sudo-rs accepts. Fix: dropped the raw `systemctl` lines (redundant — an admin
+  already holds the whole `5dive` CLI as root, which runs `systemctl`
+  internally, plus `5dive agent restart|start|stop`) and added a hardened,
+  5dive-unit-only `5dive agent _svc <start|stop|restart> <unit>` primitive as
+  the scoped replacement for manual service lifecycle. The admin sudoers now
+  uses only sudo-rs-valid bare-`*` forms and its privilege scope shrinks.
 - **Sandboxed isolation now works for claude agents (DIVE-1033).** Sandboxed
   agents aren't in the `claude` group, so `/home/claude` (0750) — where the
   shared runtime (`claude`, node/nvm) lives — was unreachable, failing both the

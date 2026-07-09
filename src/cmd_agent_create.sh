@@ -41,8 +41,20 @@ create_agent_user() {
 
 # DIVE-1002: an 'admin' agent can run the company, not `rm -rf` the box. Its sudo
 # is scoped to a single mediated surface — the 5dive CLI (the sanctioned API for
-# create/rm/provision/restart agents and box ops) — plus start|stop|restart of
-# the box's own 5dive systemd units. That's it.
+# create/rm/provision/restart agents and box ops). Service lifecycle (start|stop|
+# restart of the box's 5dive systemd units) is done THROUGH the CLI, which is
+# already root under this grant, so no raw `systemctl` entry is required.
+#
+# DIVE-1088: the previous version also granted raw `systemctl <verb> 5dive-agent@*`
+# / `5dive-*.service`. sudo-rs (visudo-rs, the DEFAULT sudo on Ubuntu 26.04) REJECTS
+# wildcards INSIDE a command argument ("wildcards are not allowed in command
+# arguments"), so those lines made `5dive agent create` (default admin isolation)
+# fail on 26.04 with no partial install. A bare trailing `*` (any-args, e.g.
+# `/usr/local/bin/5dive *`) IS accepted by sudo-rs — that's why standard isolation
+# worked. Fix: drop the raw systemctl lines (redundant — the CLI runs systemctl
+# internally as root via `5dive *`, and `5dive agent restart|start|stop` +
+# `5dive agent _svc <verb> <5dive-unit>` cover every case the raw grant did),
+# leaving only sudo-rs-valid bare-`*` forms.
 #
 # What is deliberately NOT granted, and why (all are one-line root escapes):
 #   - `systemd-run *`    runs ANY command as root (`systemd-run --pty bash`) —
@@ -52,8 +64,8 @@ create_agent_user() {
 #                        CLI, so no raw grant is required.
 #   - `journalctl *`     pages through less by default -> `!sh` GTFOBins escape.
 #                        Logs go through `5dive agent logs` (--no-pager path).
-#   - `systemctl status` also pages by default -> same `!sh` escape. Only the
-#                        non-paging start|stop|restart verbs are granted.
+#   - `systemctl status` also pages by default -> same `!sh` escape. Service
+#                        lifecycle goes through the non-paging `5dive agent _svc`.
 #   - `sudo bash|su|-u <x> -i` — direct root/other-user shells.
 # Granting the whole `5dive` CLI as root makes it a standing invariant that NO
 # 5dive subcommand may exec agent-controlled input as root (else it becomes an
@@ -64,22 +76,12 @@ create_agent_user() {
 write_admin_sudoers() {
   local user="$1" f="/etc/sudoers.d/${user}" tmp
   tmp=$(mktemp)
-  # Commands are inlined (not Cmnd_Alias) so each per-agent file is fully
-  # self-contained: sudoers alias names must be uppercase and would collide
-  # across per-agent files. Line continuations keep it readable.
+  # Only bare-trailing-`*` (any-args) forms — the single wildcard shape sudo-rs
+  # accepts (DIVE-1088). The CLI-as-root grant covers all fleet + service ops.
   cat > "$tmp" <<SUDOERS
-# Managed by 5dive (DIVE-1002). Fleet-management scope for admin agent ${user}.
+# Managed by 5dive (DIVE-1002/1088). Fleet-management scope for admin agent ${user}.
 # Do not edit by hand; regenerated on agent create/provision.
-${user} ALL=(root) NOPASSWD: \\
-  /usr/local/bin/5dive, /usr/local/bin/5dive *, \\
-  /usr/bin/systemctl start 5dive-agent@*, /usr/bin/systemctl stop 5dive-agent@*, \\
-  /usr/bin/systemctl restart 5dive-agent@*, \\
-  /usr/bin/systemctl start 5dive-*.service, /usr/bin/systemctl stop 5dive-*.service, \\
-  /usr/bin/systemctl restart 5dive-*.service, \\
-  /bin/systemctl start 5dive-agent@*, /bin/systemctl stop 5dive-agent@*, \\
-  /bin/systemctl restart 5dive-agent@*, \\
-  /bin/systemctl start 5dive-*.service, /bin/systemctl stop 5dive-*.service, \\
-  /bin/systemctl restart 5dive-*.service
+${user} ALL=(root) NOPASSWD: /usr/local/bin/5dive, /usr/local/bin/5dive *
 SUDOERS
   chmod 440 "$tmp"
   if visudo -cf "$tmp" >/dev/null 2>&1; then
