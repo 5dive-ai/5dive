@@ -306,7 +306,8 @@ wait_agent_input_ready() {
 # still looks unsubmitted after retries. The "[Pasted text #" marker is Claude's
 # input-buffer rendering; other runtimes just fall through the fast path.
 inject_and_submit() {
-  local name="$1" payload="$2" user="agent-${name}" tries=0 pane
+  local name="$1" payload="$2" tries=0 pane
+  local user="agent-${name}"   # separate stmt: ${name} in the same line aborts under set -u (silent msg drop)
   sudo -u "$user" tmux send-keys -t "agent-${name}" -l -- "$payload"
   # Let the TUI finish ingesting the (possibly bracketed-paste) payload before the
   # Enter, so the newline isn't bundled into the paste sequence.

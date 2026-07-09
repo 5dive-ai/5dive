@@ -422,7 +422,8 @@ _team_bot_relay_status() {
 # Force a relay agent's connector env to the shared token + send-only, preserving
 # any unrelated keys. root:claude 640 (same as install_channel writes).
 _team_bot_write_sendonly_env() {
-  local name="$1" token="$2" ef="${CONNECTORS_DIR}/telegram-${name}.env" tmp
+  local name="$1" token="$2" tmp
+  local ef="${CONNECTORS_DIR}/telegram-${name}.env"   # separate stmt: ${name} aborts under set -u if same line
   mkdir -p "$CONNECTORS_DIR"
   tmp=$(mktemp)
   { printf 'TELEGRAM_BOT_TOKEN=%s\n' "$token"

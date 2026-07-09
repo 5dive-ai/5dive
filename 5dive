@@ -26,7 +26,7 @@ esac
 
 # Bumped on every public release. `build.sh` checks this line exists; CI fails
 # the bundle-drift check if it's missing or empty.
-readonly FIVE_VERSION="0.7.28"
+readonly FIVE_VERSION="0.7.29"
 
 # GitHub org our repos live under. The org is being renamed
 # 5dive-com -> 5dive-ai (2026-06); fetches must work on either side of the
@@ -8210,7 +8210,8 @@ _team_bot_relay_status() {
 # Force a relay agent's connector env to the shared token + send-only, preserving
 # any unrelated keys. root:claude 640 (same as install_channel writes).
 _team_bot_write_sendonly_env() {
-  local name="$1" token="$2" ef="${CONNECTORS_DIR}/telegram-${name}.env" tmp
+  local name="$1" token="$2" tmp
+  local ef="${CONNECTORS_DIR}/telegram-${name}.env"   # separate stmt: ${name} aborts under set -u if same line
   mkdir -p "$CONNECTORS_DIR"
   tmp=$(mktemp)
   { printf 'TELEGRAM_BOT_TOKEN=%s\n' "$token"
@@ -10026,7 +10027,8 @@ wait_agent_input_ready() {
 # still looks unsubmitted after retries. The "[Pasted text #" marker is Claude's
 # input-buffer rendering; other runtimes just fall through the fast path.
 inject_and_submit() {
-  local name="$1" payload="$2" user="agent-${name}" tries=0 pane
+  local name="$1" payload="$2" tries=0 pane
+  local user="agent-${name}"   # separate stmt: ${name} in the same line aborts under set -u (silent msg drop)
   sudo -u "$user" tmux send-keys -t "agent-${name}" -l -- "$payload"
   # Let the TUI finish ingesting the (possibly bracketed-paste) payload before the
   # Enter, so the newline isn't bundled into the paste sequence.
@@ -23730,7 +23732,8 @@ _pack_secret_tripwire() {
 # (~/.claude/projects/<slug>/memory/); a customer agent normally has one. If
 # several exist we take the largest (the agent's primary working project).
 _pack_memory_dir() {
-  local name="$1" base="/home/agent-${name}/.claude/projects"
+  local name="$1"
+  local base="/home/agent-${name}/.claude/projects"   # separate stmt: ${name} aborts under set -u if same line
   [[ -d "$base" ]] || return 1
   find "$base" -maxdepth 2 -type d -name memory 2>/dev/null \
     | while read -r d; do printf '%s\t%s\n' "$(find "$d" -maxdepth 1 -name '*.md' 2>/dev/null | wc -l)" "$d"; done \

@@ -19,6 +19,16 @@ release.
   known path but cannot list or read claude's home (secrets stay behind their
   own 0600/0700 perms). Cleaned up in `delete_agent_user`. The proper fix
   (relocating the runtime out of `/home/claude`) is tracked as DIVE-1034.
+- **Inter-agent delivery no longer silently drops messages (`set -u`
+  self-reference).** `inject_and_submit` declared
+  `local name="$1" payload="$2" user="agent-${name}" …`, self-referencing `name`
+  in the same `local` statement. Under global `set -euo pipefail`, bash aborts the
+  function at the declaration before the `tmux send-keys` inject runs, so
+  `agent send`/`ask`/`_deliver` never delivered anything — every standard-
+  isolation agent on a host was affected. Split the declaration so `name` binds
+  first (mirroring `wait_agent_input_ready`). The same latent antipattern was
+  fixed in `_team_bot_write_sendonly_env` and `_pack_memory_dir`. Reported by
+  agent-triniti.
 
 ## [0.7.24] - 2026-07-06
 

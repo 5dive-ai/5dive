@@ -815,7 +815,8 @@ _pack_secret_tripwire() {
 # (~/.claude/projects/<slug>/memory/); a customer agent normally has one. If
 # several exist we take the largest (the agent's primary working project).
 _pack_memory_dir() {
-  local name="$1" base="/home/agent-${name}/.claude/projects"
+  local name="$1"
+  local base="/home/agent-${name}/.claude/projects"   # separate stmt: ${name} aborts under set -u if same line
   [[ -d "$base" ]] || return 1
   find "$base" -maxdepth 2 -type d -name memory 2>/dev/null \
     | while read -r d; do printf '%s\t%s\n' "$(find "$d" -maxdepth 1 -name '*.md' 2>/dev/null | wc -l)" "$d"; done \
