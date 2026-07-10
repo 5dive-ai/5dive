@@ -9,6 +9,20 @@ release.
 
 ## [Unreleased]
 
+### Added
+- **OpenRouter is now a first-class BYO provider for the CLAUDE (Claude Code) runtime (DIVE-1100).**
+  OpenRouter ships a native Anthropic-skin endpoint (`https://openrouter.ai/api`,
+  Claude Code appends `/v1/messages`), so the harness talks to it directly with no
+  translation proxy. `5dive agent create --type=claude --provider=openrouter
+  --api-key=- --auth-profile=<p>` now wires `ANTHROPIC_BASE_URL` +
+  `ANTHROPIC_AUTH_TOKEN` (the `sk-or-` key) into the profile's `combined.env` via
+  the existing `_apply_byo_claude` path. Because the Anthropic-skin endpoint only
+  serves Anthropic first-party models (Claude Code is built around Anthropic
+  request semantics, so `openrouter/auto` does NOT work here), the per-tier
+  defaults pin concrete `anthropic/*` slugs (`claude-opus-4.8` / `claude-sonnet-5`
+  / `claude-haiku-4.5`); operators can override in the model picker. Dashboard
+  new-agent wizard now offers OpenRouter for claude-type agents (DIVE-1101).
+
 ### Fixed
 - **Approval taps now clear gates in shared team-bot mode (DIVE-1093, GH #13 part 3).**
   DIVE-1087 made every per-agent bridge `TELEGRAM_SEND_ONLY` so the single

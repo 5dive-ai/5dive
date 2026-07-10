@@ -53,8 +53,11 @@ Agents:
                             # auto-attach: own forum topic, send-only on the
                             # shared token. --no-team-bot opts the agent out.
                             # spec: <id> (defaults to the 5dive skills repo) or <owner/repo>:<id>
-                            # provider: hermes/openclaw only — BYO API key for one of
-                            # ${!BYO_PROVIDER_LABEL[*]}. Mutually exclusive with --defer-auth.
+                            # provider: BYO API key for one of ${!BYO_PROVIDER_LABEL[*]}.
+                            # hermes/openclaw take any of them; claude (Claude Code)
+                            # takes the Anthropic-skin subset (deepseek moonshot
+                            # openrouter zai) and requires --auth-profile. Mutually
+                            # exclusive with --defer-auth.
                             # When called by another agent on a claude-typed agent,
                             # defaults to --with-skills=5dive-cli so the new agent
                             # inherits inter-agent comms knowledge. Use --no-skills

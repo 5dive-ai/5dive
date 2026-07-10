@@ -20,8 +20,8 @@
 #       defer_auth:     true               # create without auth gate
 #       isolation:      admin|standard|sandboxed
 #       auth_profile:   <named-account>
-#       provider:       <byo-id>           # hermes/openclaw only
-#       api_key:        "<key>"            # hermes/openclaw only
+#       provider:       <byo-id>           # hermes/openclaw (any), claude (anthropic-skin: deepseek moonshot openrouter zai)
+#       api_key:        "<key>"            # paired with provider; claude also needs auth_profile
 #       pack:           <slug>             # import a character pack instead of a
 #                                          # bare create — supplies persona+skills
 #                                          # +model/effort (5dive agent import)

@@ -26,7 +26,7 @@ esac
 
 # Bumped on every public release. `build.sh` checks this line exists; CI fails
 # the bundle-drift check if it's missing or empty.
-readonly FIVE_VERSION="0.7.33"
+readonly FIVE_VERSION="0.7.34"
 
 # GitHub org our repos live under. The org is being renamed
 # 5dive-com -> 5dive-ai (2026-06); fetches must work on either side of the
@@ -397,24 +397,38 @@ valid_byo_provider() {
 # intentionally absent here (no compat path → would break the harness). Model
 # ids drift upstream — operators can override per agent via the model picker, or
 # we bump these. Values verified against vendor Claude-Code docs 2026-06-03.
+# OpenRouter (DIVE-1100): OpenRouter ships a NATIVE Anthropic-skin endpoint at
+# https://openrouter.ai/api (Claude Code appends /v1/messages), so the harness
+# talks to it directly — no translation proxy. The OpenRouter key rides
+# ANTHROPIC_AUTH_TOKEN (sk-or-…) and ANTHROPIC_API_KEY must be empty; both are
+# already handled by _apply_byo_claude. IMPORTANT: the Anthropic-skin endpoint
+# only serves Anthropic first-party models — Claude Code is built around
+# Anthropic request semantics, so the "openrouter/auto" default used for
+# hermes/openclaw (OpenAI-format endpoint) would NOT work here. We therefore
+# pin concrete anthropic/* slugs per tier (operators can override in the model
+# picker). Slugs verified against openrouter.ai/anthropic 2026-07-10.
 declare -A CLAUDE_PROVIDER_BASEURL=(
   [deepseek]="https://api.deepseek.com/anthropic"
   [moonshot]="https://api.moonshot.ai/anthropic"
+  [openrouter]="https://openrouter.ai/api"
   [zai]="https://api.z.ai/api/anthropic"
 )
 declare -A CLAUDE_PROVIDER_OPUS_MODEL=(
   [deepseek]="deepseek-v4-pro"
   [moonshot]="kimi-k2.5"
+  [openrouter]="anthropic/claude-opus-4.8"
   [zai]="glm-5.2"
 )
 declare -A CLAUDE_PROVIDER_SONNET_MODEL=(
   [deepseek]="deepseek-v4-pro"
   [moonshot]="kimi-k2.5"
+  [openrouter]="anthropic/claude-sonnet-5"
   [zai]="glm-5-turbo"
 )
 declare -A CLAUDE_PROVIDER_HAIKU_MODEL=(
   [deepseek]="deepseek-v4-flash"
   [moonshot]="kimi-k2.5"
+  [openrouter]="anthropic/claude-haiku-4.5"
   [zai]="glm-4.5-air"
 )
 
