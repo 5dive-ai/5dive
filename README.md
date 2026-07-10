@@ -1,16 +1,20 @@
-# 5dive: run a company of AI agents on a server you own
+<div align="center">
 
-[![install-smoke](https://github.com/5dive-ai/5dive/actions/workflows/install-smoke.yml/badge.svg)](https://github.com/5dive-ai/5dive/actions/workflows/install-smoke.yml)
-[![bundle-drift](https://github.com/5dive-ai/5dive/actions/workflows/bundle-drift.yml/badge.svg)](https://github.com/5dive-ai/5dive/actions/workflows/bundle-drift.yml)
-[![Latest release](https://img.shields.io/github/v/release/5dive-ai/5dive)](https://github.com/5dive-ai/5dive/releases)
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Telegram](https://img.shields.io/badge/Telegram-@ai5dive-229ED9?logo=telegram&logoColor=white)](https://t.me/ai5dive)
+<h1>5dive</h1>
 
-**A company of AI agents, and the orchestrator is just bash.** No framework, no protocol, no broker: each agent is its own Linux user running an official coding CLI (claude, codex, a few others) as a systemd service, coordinating through one bash CLI they all call. Isolation is unix users, supervision is systemd, logs are journald. **I used the OS instead of building a platform.**
+**English** ｜ [简体中文](README.zh-CN.md)
 
-They take work off a shared SQLite task queue, hand it to each other while you sleep, and ping your phone over Telegram only when a human has to decide. Works with every major agent CLI.
+### Run a company of AI agents on a server you own.
 
-![install to a Claude agent answering on Telegram](docs/quickstart.gif)
+**The orchestrator is just bash.** No framework, no protocol, no broker — each agent is its own Linux user running an official coding CLI (`claude`, `codex`, and more) as a systemd service, coordinating through one bash CLI they all call. They take work off a shared queue, hand it to each other while you sleep, and ping your phone over Telegram only when a human has to decide.
+
+[![Latest release](https://img.shields.io/github/v/release/5dive-ai/5dive)](https://github.com/5dive-ai/5dive/releases) [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE) [![install-smoke](https://github.com/5dive-ai/5dive/actions/workflows/install-smoke.yml/badge.svg)](https://github.com/5dive-ai/5dive/actions/workflows/install-smoke.yml) [![GitHub stars](https://img.shields.io/github/stars/5dive-ai/5dive?style=flat&logo=github)](https://github.com/5dive-ai/5dive/stargazers) [![Telegram](https://img.shields.io/badge/Telegram-@ai5dive-229ED9?logo=telegram&logoColor=white)](https://t.me/ai5dive)
+
+**[5dive.ai](https://5dive.ai?utm_source=github&utm_medium=referral&utm_campaign=5dive-readme)** · [Quickstart](#quickstart) · [Why 5dive](#why-5dive) · [For your AI agent](#for-your-ai-agent) · [Security](#security--isolation)
+
+![5dive — install a Claude agent that answers on Telegram](docs/quickstart.gif)
+
+</div>
 
 > **We run our own company on this.** The agents that build 5dive.ai take work off a shared backlog, report up an org chart, cut this repo's releases, and escalate to a human only when they're stuck. What you're installing is that exact binary — the open-source core, MIT, no open-core split. Run it yourself, or skip the ops with the [managed VM](https://5dive.ai?utm_source=github&utm_medium=referral&utm_campaign=5dive-readme).
 
