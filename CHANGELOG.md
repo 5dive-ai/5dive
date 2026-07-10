@@ -10,6 +10,20 @@ release.
 ## [Unreleased]
 
 ### Fixed
+- **Approval taps now clear gates in shared team-bot mode (DIVE-1093, GH #13 part 3).**
+  DIVE-1087 made every per-agent bridge `TELEGRAM_SEND_ONLY` so the single
+  `5dive-team-bot-listener` is the sole `getUpdates` consumer — but the listener
+  subscribed only to `['message','managed_bot']` and handled only `u.message`, so
+  the inline `tna:` approval-button taps were fetched by nobody and human gates
+  (`task need --type=approval|secret|manual`) stayed unanswerable from Telegram in
+  team-bot mode (the reporter's headline symptom). The listener now subscribes to
+  `callback_query` and answers the gate itself: it re-reads the LIVE gate (never
+  trusts the tapped payload), resolves the token via the same matrix as
+  `plugins/telegram/tna.ts`, then runs `5dive task answer`. As a root daemon its
+  `SUDO_UID` is non-agent (satisfies the DIVE-916/950 hard-gate human-evidence
+  check) and it also forwards the per-gate `--human-proof` nonce when the tap
+  carried one. Fully fail-soft: any stale/deleted task or CLI error just acks the
+  tap so Telegram clears the spinner.
 - **Shared team-bot members no longer fight the listener over getUpdates (DIVE-1087).**
   With `5dive agent team-bot shared` + poll-fork agents (codex/grok/opencode/agy),
   every per-agent bridge long-polled `getUpdates` in addition to the single

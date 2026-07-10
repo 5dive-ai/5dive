@@ -26,7 +26,7 @@ esac
 
 # Bumped on every public release. `build.sh` checks this line exists; CI fails
 # the bundle-drift check if it's missing or empty.
-readonly FIVE_VERSION="0.7.32"
+readonly FIVE_VERSION="0.7.33"
 
 # GitHub org our repos live under. The org is being renamed
 # 5dive-com -> 5dive-ai (2026-06); fetches must work on either side of the
@@ -8529,6 +8529,98 @@ async function tg(method: string, params: Record<string, unknown>): Promise<any>
   return res.json()
 }
 
+// DIVE-1093: tap-to-answer for a human gate, in shared team-bot mode. The `tna:`
+// inline button lands as `tna:<taskId>:<token>[:<nonce>]` (see plugins/telegram/
+// tna.ts — the source-of-truth the per-agent bridges use). Because every bridge
+// is TELEGRAM_SEND_ONLY (no poller), THIS root listener is the only consumer of
+// the tap, so it must answer the gate itself — otherwise approval/secret/manual
+// gates are unanswerable from Telegram (GH 5dive#13 part 3).
+const TNA_RE = /^tna:(\d+):([^:]+)(?::([0-9a-f]{32}))?$/
+
+// Inlined twin of resolveTnaAnswer() from plugins/telegram/tna.ts — the small,
+// stable gate-type decision matrix (keep in sync with that source-of-truth). The
+// answer VALUE is always resolved from the LIVE gate, never the tapped payload.
+function resolveTnaAnswer(task: any, token: string): any {
+  if (!task || !task.need_type) return { kind: 'nogate' }
+  if (task.need_answered_at) {
+    const prior = task.need_type === 'secret' ? '(provided)' : (task.need_answer ?? '—')
+    return { kind: 'already', prior }
+  }
+  if (task.need_type === 'decision') {
+    const opts = String(task.need_options ?? '').split('|').map((s: string) => s.trim()).filter(Boolean)
+    const value = opts[Number(token)]
+    if (value !== undefined) return { kind: 'answer', answerArgs: [`--value=${value}`], ack: value }
+  } else if (task.need_type === 'approval') {
+    if (token === 'approved' || token === 'denied') return { kind: 'answer', answerArgs: [`--value=${token}`], ack: token }
+  } else if (task.need_type === 'secret') {
+    if (token === 'provided') return { kind: 'answer', answerArgs: [], ack: 'provided' }
+  } else if (task.need_type === 'manual') {
+    if (token === 'done') return { kind: 'answer', answerArgs: ['--value=done'], ack: 'done' }
+  }
+  return { kind: 'invalid' }
+}
+
+// Run the 5dive CLI. Via `sudo -n` so SUDO_UID is root (a non-agent uid) — that
+// alone satisfies the hard-gate human-evidence check (DIVE-916/950 form c); we
+// ALSO forward the per-gate --human-proof nonce (form a) when the tap carried
+// one. Returns the parsed --json object, or {ok:false} on any failure.
+function five(args: string[]): any {
+  try {
+    const out = execFileSync('sudo', ['-n', '5dive', '--json', ...args], { timeout: 8000 }).toString()
+    return JSON.parse(out)
+  } catch {
+    return { ok: false }
+  }
+}
+
+async function ackCallback(id: string, text: string): Promise<void> {
+  try {
+    await tg('answerCallbackQuery', { callback_query_id: id, text })
+  } catch {}
+}
+
+// Fully fail-soft, mirroring the bridge's `tna:` handler: any stale/deleted task
+// or CLI error just acks the tap (clears Telegram's spinner) and never throws.
+async function handleCallback(cq: any): Promise<void> {
+  const cbId = String(cq.id)
+  const m = TNA_RE.exec(String(cq.data ?? ''))
+  if (!m) {
+    await ackCallback(cbId, '')
+    return
+  }
+  const taskId = m[1]!
+  const token = m[2]!
+  const humanProof = m[3]
+  // Re-read the LIVE gate: a dashboard/CLI answer or a double-tap between ping
+  // and tap must not double-answer.
+  const task = five(['task', 'show', taskId])?.data?.task
+  const r = resolveTnaAnswer(task, token)
+  if (r.kind === 'nogate') {
+    await ackCallback(cbId, 'This task no longer has a gate.')
+    return
+  }
+  if (r.kind === 'already') {
+    await ackCallback(cbId, `Already answered: ${r.prior}`)
+    return
+  }
+  if (r.kind === 'invalid') {
+    await ackCallback(cbId, 'That option is no longer valid.')
+    return
+  }
+  const extra: string[] = []
+  if (task?.need_type === 'approval' || task?.need_type === 'secret' || task?.need_type === 'manual') {
+    extra.push('--human')
+    if (humanProof) extra.push(`--human-proof=${humanProof}`)
+  }
+  const ans = five(['task', 'answer', taskId, ...r.answerArgs, ...extra])
+  if (ans?.ok) {
+    await ackCallback(cbId, `Answered: ${r.ack}`)
+  } else {
+    await ackCallback(cbId, "Couldn't apply — answer from the dashboard or on-box.")
+    process.stderr.write(`team-bot-listener: tna answer failed for task ${taskId} (${token})\n`)
+  }
+}
+
 let offset = loadOffset()
 process.stderr.write(`team-bot-listener: starting (offset=${offset})\n`)
 
@@ -8547,7 +8639,12 @@ while (!shuttingDown) {
     data = await tg('getUpdates', {
       offset,
       timeout: POLL_TIMEOUT,
-      allowed_updates: ['message', 'managed_bot'],
+      // DIVE-1093: subscribe to callback_query too. As the SOLE getUpdates
+      // consumer of the shared token, if we don't fetch tap callbacks nobody
+      // does (per-agent bridges are TELEGRAM_SEND_ONLY = no poller) — so the
+      // `tna:` approval-button taps were silently dropped and human gates were
+      // unanswerable from Telegram in team-bot mode (GH 5dive#13 part 3).
+      allowed_updates: ['message', 'managed_bot', 'callback_query'],
     })
   } catch (e) {
     process.stderr.write(`team-bot-listener: getUpdates failed: ${e}\n`)
@@ -8575,6 +8672,12 @@ while (!shuttingDown) {
         username: mb.bot.username,
         ownerId: (mb.user ?? u.message?.from)?.id ?? 0,
       })
+      continue
+    }
+    // DIVE-1093: a tapped inline button (human-gate answer). We're the sole
+    // poller, so no per-agent bridge will pick it up. Skip taps from bots.
+    if (u.callback_query) {
+      if (!u.callback_query.from?.is_bot) await handleCallback(u.callback_query)
       continue
     }
     const msg = u.message
