@@ -105,8 +105,21 @@ The `claude` type can also run the official Claude Code harness against a third-
 
 ```sh
 sudo 5dive agent create cheap-coder --type=claude --provider=deepseek --api-key=<key>
-# providers: deepseek (DeepSeek), moonshot (Kimi), zai (GLM)
+# providers: openrouter (any model), deepseek (DeepSeek), moonshot (Kimi), zai (GLM)
+
+# Pick the model too. --model overrides the primary tiers with any slug the
+# provider serves (OpenRouter translates every family); the background model
+# stays on the provider's cheap default. Omit it to use the per-provider default.
+sudo 5dive agent create glm-coder --type=claude --provider=openrouter --api-key=<key> --model=z-ai/glm-4.6
 ```
+
+Switch the model on a running agent (persists across restarts):
+
+```sh
+sudo 5dive agent config set glm-coder model=z-ai/glm-4.6
+```
+
+In-session, Claude Code's built-in `/model <slug>` also accepts any custom slug live (session-scoped).
 
 ---
 

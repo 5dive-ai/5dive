@@ -222,7 +222,7 @@ link_agent_profile() {
 # to the profile so the seed loop in 5dive-agent-start.sh picks up the
 # new files and bounces the hermes/openclaw gateway daemon.
 apply_byo_provider() {
-  local type="$1" canonical="$2" api_key="$3" profile="${4:-}"
+  local type="$1" canonical="$2" api_key="$3" profile="${4:-}" model="${5:-}"
   valid_byo_provider "$canonical" \
     || fail "$E_VALIDATION" "unknown provider '$canonical' (known: ${!BYO_PROVIDER_LABEL[*]})"
   valid_api_key "$api_key" \
@@ -235,7 +235,7 @@ apply_byo_provider() {
   case "$type" in
     hermes)   _apply_byo_hermes "$native" "$canonical" "$api_key" "$profile" ;;
     openclaw) _apply_byo_openclaw "$native" "$canonical" "$api_key" "$profile" ;;
-    claude)   _apply_byo_claude "$canonical" "$api_key" "$profile" ;;
+    claude)   _apply_byo_claude "$canonical" "$api_key" "$profile" "$model" ;;
     *) fail "$E_VALIDATION" "BYO provider not supported for type '$type' (only: hermes, openclaw, claude)" ;;
   esac
 }
@@ -248,7 +248,7 @@ apply_byo_provider() {
 # these override any default-account OAuth token that template otherwise leaks
 # in. profile_set_var takes the value on stdin (keeps secrets out of argv).
 _apply_byo_claude() {
-  local canonical="$1" api_key="$2" profile="${3:-}"
+  local canonical="$1" api_key="$2" profile="${3:-}" override_model="${4:-}"
   [[ -n "$profile" ]] \
     || fail "$E_USAGE" "claude BYO provider requires --auth-profile (custom-provider creds are profile-scoped)"
   local base_url="${CLAUDE_PROVIDER_BASEURL[$canonical]:-}"
@@ -257,8 +257,15 @@ _apply_byo_claude() {
   step "Configuring claude BYO provider '$canonical' → ${base_url} (profile=$profile)"
   printf '%s' "$base_url"  | profile_set_var "$profile" ANTHROPIC_BASE_URL
   printf '%s' "$api_key"   | profile_set_var "$profile" ANTHROPIC_AUTH_TOKEN
-  printf '%s' "${CLAUDE_PROVIDER_OPUS_MODEL[$canonical]}"   | profile_set_var "$profile" ANTHROPIC_DEFAULT_OPUS_MODEL
-  printf '%s' "${CLAUDE_PROVIDER_SONNET_MODEL[$canonical]}" | profile_set_var "$profile" ANTHROPIC_DEFAULT_SONNET_MODEL
+  # DIVE-1103: an operator-supplied --model overrides the primary (opus+sonnet)
+  # tiers with any slug the provider serves (OpenRouter translates every family;
+  # the Chinese providers serve their own). The background/fast HAIKU slot stays
+  # on the catalogue's caching-capable default so background turns stay cheap.
+  local opus_model="${CLAUDE_PROVIDER_OPUS_MODEL[$canonical]}"
+  local sonnet_model="${CLAUDE_PROVIDER_SONNET_MODEL[$canonical]}"
+  if [[ -n "$override_model" ]]; then opus_model="$override_model"; sonnet_model="$override_model"; fi
+  printf '%s' "$opus_model"   | profile_set_var "$profile" ANTHROPIC_DEFAULT_OPUS_MODEL
+  printf '%s' "$sonnet_model" | profile_set_var "$profile" ANTHROPIC_DEFAULT_SONNET_MODEL
   printf '%s' "${CLAUDE_PROVIDER_HAIKU_MODEL[$canonical]}"  | profile_set_var "$profile" ANTHROPIC_DEFAULT_HAIKU_MODEL
   # Custom endpoints (esp. z.ai during peak hours) can be slow; raise the
   # client-side request timeout so long tool turns don't get cut off.
@@ -516,7 +523,7 @@ cmd_create() {
   local name="" type="" channels="none" channels_explicit=0 telegram_token="" discord_token="" workdir="" profile=""
   local telegram_home_channel="" telegram_allowed_users="" telegram_cos="" telegram_cos_avatar=""
   local cos_owner_id=""
-  local byo_provider="" byo_api_key=""
+  local byo_provider="" byo_api_key="" byo_model=""
   local skills_arg="" skills_set=0 no_skills=0 defer_auth=0
   local isolation="" isolation_explicit=0 no_team_bot=0
   local autonomy="standard"   # DIVE-499
@@ -537,6 +544,7 @@ cmd_create() {
       --auth-profile=*)            profile="${1#--auth-profile=}" ;;
       --provider=*)                byo_provider="${1#--provider=}" ;;
       --api-key=*)                 byo_api_key="${1#--api-key=}" ;;
+      --model=*)                   byo_model="${1#--model=}" ;;
       --with-skills=*)             skills_arg="${1#--with-skills=}"; skills_set=1 ;;
       --no-skills)                 no_skills=1 ;;
       --no-team-bot)               no_team_bot=1 ;;
@@ -548,7 +556,7 @@ cmd_create() {
     esac
     shift
   done
-  [[ -n "$name" ]] || fail "$E_USAGE" "usage: 5dive agent create <name> --type=<type> [--channels=none|telegram|discord|dashboard[,ch...]] [--telegram-token=<token|->] [--telegram-cos=<child-username>] [--telegram-cos-avatar=<png>] [--telegram-home-channel=<id>] [--telegram-allowed-users=<csv>] [--discord-token=<token|->] [--workdir=<path>] [--auth-profile=<name>] [--provider=<id> --api-key=<key|->] [--with-skills=<spec>[,...]] [--no-skills] [--no-team-bot] [--defer-auth] [--isolation=admin|standard|sandboxed] [--inherit-memory=wiki|all|team|<agent>[,...]]"
+  [[ -n "$name" ]] || fail "$E_USAGE" "usage: 5dive agent create <name> --type=<type> [--channels=none|telegram|discord|dashboard[,ch...]] [--telegram-token=<token|->] [--telegram-cos=<child-username>] [--telegram-cos-avatar=<png>] [--telegram-home-channel=<id>] [--telegram-allowed-users=<csv>] [--discord-token=<token|->] [--workdir=<path>] [--auth-profile=<name>] [--provider=<id> --api-key=<key|->] [--model=<slug>] [--with-skills=<spec>[,...]] [--no-skills] [--no-team-bot] [--defer-auth] [--isolation=admin|standard|sandboxed] [--inherit-memory=wiki|all|team|<agent>[,...]]"
   [[ -n "$type" ]] || fail "$E_USAGE" "--type is required"
   valid_name "$name" || fail "$E_VALIDATION" "invalid name (lowercase letters/digits/hyphens, start letter, <=16 chars)"
   is_known_type "$type" || fail "$E_NOT_FOUND" "unknown type: $type (known: ${!TYPE_BIN[*]})"
@@ -672,6 +680,10 @@ cmd_create() {
       && fail "$E_USAGE" "--defer-auth and --provider/--api-key are mutually exclusive"
     valid_byo_provider "$byo_provider" \
       || fail "$E_VALIDATION" "unknown provider '$byo_provider' (known: ${!BYO_PROVIDER_LABEL[*]})"
+    if [[ -n "$byo_model" ]]; then
+      valid_model "$byo_model" \
+        || fail "$E_VALIDATION" "invalid --model '$byo_model' (allowed chars: letters/digits/._:/-)"
+    fi
     local _native
     _native=$(resolve_native_provider "$type" "$byo_provider")
     [[ -n "$_native" ]] \
@@ -859,7 +871,7 @@ cmd_create() {
   # Must come after the install-on-demand block so the agent CLI exists
   # when apply_byo_provider shells out to `hermes auth add`.
   if [[ -n "$byo_provider" ]]; then
-    apply_byo_provider "$type" "$byo_provider" "$byo_api_key" "$profile"
+    apply_byo_provider "$type" "$byo_provider" "$byo_api_key" "$profile" "$byo_model"
   fi
 
   # Don't create an agent that can't log in. When an auth-profile is named,

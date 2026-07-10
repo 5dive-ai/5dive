@@ -26,7 +26,7 @@ esac
 
 # Bumped on every public release. `build.sh` checks this line exists; CI fails
 # the bundle-drift check if it's missing or empty.
-readonly FIVE_VERSION="0.8.0"
+readonly FIVE_VERSION="0.8.1"
 
 # GitHub org our repos live under. The org is being renamed
 # 5dive-com -> 5dive-ai (2026-06); fetches must work on either side of the
@@ -401,12 +401,15 @@ valid_byo_provider() {
 # https://openrouter.ai/api (Claude Code appends /v1/messages), so the harness
 # talks to it directly — no translation proxy. The OpenRouter key rides
 # ANTHROPIC_AUTH_TOKEN (sk-or-…) and ANTHROPIC_API_KEY must be empty; both are
-# already handled by _apply_byo_claude. IMPORTANT: the Anthropic-skin endpoint
-# only serves Anthropic first-party models — Claude Code is built around
-# Anthropic request semantics, so the "openrouter/auto" default used for
-# hermes/openclaw (OpenAI-format endpoint) would NOT work here. We therefore
-# pin concrete anthropic/* slugs per tier (operators can override in the model
-# picker). Slugs verified against openrouter.ai/anthropic 2026-07-10.
+# already handled by _apply_byo_claude. NOTE: OpenRouter's Anthropic endpoint
+# TRANSLATES — it accepts any OpenRouter model slug (openai/*, google/*, z-ai/*,
+# deepseek/*, meta-llama/*) in Anthropic wire format and converts it, verified
+# 2026-07-10 including a real headless Claude Code turn on z-ai/glm-4.6. The
+# "openrouter/auto" alias does NOT resolve here (it's an OpenAI-format router
+# convenience, not a real model), so we pin concrete per-tier defaults to
+# anthropic/* as a SAFE DEFAULT — operators override any tier via
+# `agent create --model=<slug>` or `agent config set model=<slug>` (DIVE-1103).
+# Slugs verified against openrouter.ai 2026-07-10.
 declare -A CLAUDE_PROVIDER_BASEURL=(
   [deepseek]="https://api.deepseek.com/anthropic"
   [moonshot]="https://api.moonshot.ai/anthropic"
