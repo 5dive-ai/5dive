@@ -2,6 +2,8 @@
 
 <div align="center">
 
+<img src="docs/5dive-logo.png" alt="5dive" width="84" height="84">
+
 <h1>5dive</h1>
 
 [English](README.md) ｜ **简体中文**
@@ -14,7 +16,9 @@
 
 **[5dive.ai](https://5dive.ai?utm_source=github&utm_medium=referral&utm_campaign=5dive-readme-zh)** · [快速开始](#快速开始) · [为什么适合中国开发者](#为什么适合中国开发者) · [为什么选 5dive](#为什么选-5dive) · [许可协议](#许可协议)
 
-![5dive 演示：安装一个在 Telegram 上回话的 Claude 智能体](docs/quickstart.gif)
+<br>
+
+<img src="docs/quickstart.gif" alt="5dive 演示：从 curl 安装到一个在 Telegram 上回话的智能体" width="760">
 
 </div>
 

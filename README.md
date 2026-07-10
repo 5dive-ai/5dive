@@ -1,5 +1,7 @@
 <div align="center">
 
+<img src="docs/5dive-logo.png" alt="5dive" width="84" height="84">
+
 <h1>5dive</h1>
 
 **English** ｜ [简体中文](README.zh-CN.md)
@@ -12,7 +14,9 @@
 
 **[5dive.ai](https://5dive.ai?utm_source=github&utm_medium=referral&utm_campaign=5dive-readme)** · [Quickstart](#quickstart) · [Why 5dive](#why-5dive) · [For your AI agent](#for-your-ai-agent) · [Security](#security--isolation)
 
-![5dive — install a Claude agent that answers on Telegram](docs/quickstart.gif)
+<br>
+
+<img src="docs/quickstart.gif" alt="Install a Claude agent that answers on Telegram — from curl to a live agent" width="760">
 
 </div>
 
