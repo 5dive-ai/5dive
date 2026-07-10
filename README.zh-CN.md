@@ -28,10 +28,12 @@
 
 ```sh
 sudo 5dive agent create cheap-coder --type=claude --provider=deepseek --api-key=<key>
-# 可选 provider：deepseek（DeepSeek）、moonshot（Kimi）、zai（智谱 GLM）
+# 可选 provider：deepseek（DeepSeek）、moonshot（Kimi）、zai（智谱 GLM）、openrouter（OpenRouter 网关）
 ```
 
 也就是说：用你已经在付费的国产大模型（DeepSeek、Kimi、智谱 GLM、通义千问等），在你自己掌控的服务器上，跑一支 7×24 小时不间断的智能体团队。不依赖境外模型的可用性，数据和密钥都不出你的机器。
+
+**想一个 Key 用遍所有模型？** 用 `--provider=openrouter` 接 [OpenRouter](https://openrouter.ai)——一个 Key 直连上百个模型（DeepSeek、智谱 GLM、Kimi、通义千问，也含 Claude、GPT），之后用 `5dive agent config <name> set model=<slug>` 随时切换，先试后定。
 
 ## 快速开始
 
@@ -94,7 +96,7 @@ sudo 5dive team import solo-founder
 
 **支持所有主流智能体 CLI。** `claude`、`codex`、`antigravity`、`grok`、`hermes`、`openclaw`、`opencode`，统统纳入一支团队。
 
-**接你自己的国产模型。** 通过 `--provider` 接 DeepSeek、Kimi、智谱 GLM 等 Anthropic 兼容接口，用你自己的 Key，无中间商、无 OAuth 代理。
+**接你自己的国产模型。** 通过 `--provider` 接 DeepSeek、Kimi、智谱 GLM，或 OpenRouter 网关（一个 Key 通所有）等 Anthropic 兼容接口，用你自己的 Key，无中间商、无 OAuth 代理。
 
 **默认安全。** 每个智能体都是独立的 Linux 用户，分三档隔离级别。把一个智能体沙箱化后，它读不到你的 home 目录、也 sudo 不了你的机器。
 
