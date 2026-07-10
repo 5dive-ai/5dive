@@ -9,6 +9,17 @@ release.
 
 ## [Unreleased]
 
+### Fixed
+- **Listener-only fixes now self-deploy on update (DIVE-1095).** The shared
+  team-bot listener runs from a materialized `/opt/5dive/team-bot-listener.ts`
+  that was rewritten ONLY by `team-bot shared`, so a listener-only fix (e.g.
+  DIVE-1093's `callback_query`/`tna:` tap handling) shipped in the binary but
+  stayed dormant on auto-updating boxes until an operator re-ran that command.
+  New idempotent `5dive agent team-bot refresh-listener` re-materializes the TS
+  from the current bundle and restarts the service (guarded on the unit file →
+  no-op where there is no shared team-bot); `self-update` and the nightly
+  `5dive-host-updates.sh` both call it after installing the fresh binary.
+
 ## [0.8.0] - 2026-07-10
 
 ### Added

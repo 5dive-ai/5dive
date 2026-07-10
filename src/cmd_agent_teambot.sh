@@ -73,7 +73,24 @@ cmd_agent_team_bot() {
     esac
     shift
   done
-  case "$sub" in status|provision|shared|intercom|discover) ;; *) fail "$E_USAGE" "unknown team-bot command: $sub (status|provision|shared|intercom|discover)" ;; esac
+  case "$sub" in status|provision|shared|intercom|discover|refresh-listener) ;; *) fail "$E_USAGE" "unknown team-bot command: $sub (status|provision|shared|intercom|discover|refresh-listener)" ;; esac
+
+  # DIVE-1095 — `refresh-listener`: re-materialize /opt/5dive/team-bot-listener.ts
+  # from the current bundle and restart the service, so listener-only fixes (e.g.
+  # DIVE-1093's tap handling) self-deploy on nightly host-updates — which install
+  # the fresh binary + restart agents but never rewrote the listener TS. No args,
+  # no token, guarded on the unit file => a clean no-op on boxes with no shared
+  # team-bot. Called by 5dive-host-updates.sh (nightly) and reused for on-demand.
+  if [[ "$sub" == "refresh-listener" ]]; then
+    ensure_state
+    if [[ -f /etc/systemd/system/5dive-team-bot-listener.service ]]; then
+      _team_bot_install_listener
+      ok "shared team-bot listener refreshed" '{listener_refreshed:true}'
+    else
+      ok "no shared team-bot listener on this box — nothing to refresh" '{listener_refreshed:false}'
+    fi
+    return
+  fi
 
   # DIVE-453 — CoS-native team group (`5dive agent team-group …`). Instead of a
   # separately-pasted shared bot token, ride the already-connected Chief-of-Staff

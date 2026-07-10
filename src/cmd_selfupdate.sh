@@ -68,14 +68,32 @@ cmd_self_update() {
     done < <(systemctl list-units '5dive-agent@*' --state=running --no-legend --plain 2>/dev/null | awk '{print $1}')
   fi
 
+  # DIVE-1095: refresh the materialized shared team-bot listener. It lives at
+  # /opt/5dive/team-bot-listener.ts and is (re)written ONLY by `team-bot shared`,
+  # so listener-only fixes (e.g. DIVE-1093's tap handling) otherwise ship in the
+  # bundle but stay DORMANT on auto-updating boxes until an operator re-runs that
+  # command. Re-materialize the listener from the freshly-installed bundle and
+  # restart its service. Guarded on the unit file so it's a no-op on boxes with
+  # no shared team-bot; best-effort so a listener hiccup never fails self-update.
+  local listener_refreshed=false
+  if [[ -f /etc/systemd/system/5dive-team-bot-listener.service ]]; then
+    if _team_bot_install_listener >&2; then
+      step "refreshed shared team-bot listener"
+      listener_refreshed=true
+    else
+      warn "team-bot listener refresh failed (prior listener left running)"
+    fi
+  fi
+
   local r f prose
   r=$(json_array "${restarted[@]}")
   f=$(json_array "${failed[@]}")
   prose="self-update complete — ${#restarted[@]} agent(s) restarted"
   (( ${#failed[@]} )) && prose+=", ${#failed[@]} failed to restart"
+  [[ "$listener_refreshed" == "true" ]] && prose+=", team-bot listener refreshed"
   ok "$prose" \
-     '{restarted:$r, restarted_count:($r|length), failed:$f}' \
-     --argjson r "$r" --argjson f "$f"
+     '{restarted:$r, restarted_count:($r|length), failed:$f, listener_refreshed:$lr}' \
+     --argjson r "$r" --argjson f "$f" --argjson lr "$listener_refreshed"
 }
 
 # version_lt A B — true when semver A is strictly older than B (sort -V).
