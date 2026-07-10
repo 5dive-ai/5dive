@@ -9,6 +9,15 @@ release.
 
 ## [Unreleased]
 
+### Added
+- **Custom providers in the `5dive init` wizard for Claude.** The claude auth
+  step now offers a third option — "Custom provider" — to run Claude Code
+  against a BYO Anthropic-compatible endpoint (OpenRouter, z.ai, DeepSeek,
+  Moonshot), mirroring the provider picker hermes already had. It prompts for
+  the provider + API key and wires `--provider`/`--auth-profile` at create
+  time, so a BYO-provider Claude agent no longer needs hand-crafted
+  `agent create` flags.
+
 ### Fixed
 - **Listener-only fixes now self-deploy on update (DIVE-1095).** The shared
   team-bot listener runs from a materialized `/opt/5dive/team-bot-listener.ts`
