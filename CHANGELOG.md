@@ -9,6 +9,8 @@ release.
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-07-10
+
 ### Added
 - **OpenRouter is now a first-class BYO provider for the CLAUDE (Claude Code) runtime (DIVE-1100).**
   OpenRouter ships a native Anthropic-skin endpoint (`https://openrouter.ai/api`,
