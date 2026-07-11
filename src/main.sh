@@ -69,7 +69,7 @@ Agents:
   5dive agent start <name>
   5dive agent stop <name>
   5dive agent restart <name>
-  5dive agent rm <name>
+  5dive agent rm <name>                              # aliases: 5dive agent fire <name>  /  5dive fire <name>
   5dive agent config <name> set channels=<none|telegram|discord|dashboard[,ch...]>
                                                      # comma-separable; dashboard (claude-only, no token)
                                                      # enables web-dashboard chat — the one-tap Enable chat
@@ -348,7 +348,7 @@ main() {
         restart)
           AUDIT_CMD="agent restart"; AUDIT_ARGS=("$@")
           with_registry_lock cmd_restart "$@" ;;
-        rm)
+        rm|fire)
           AUDIT_CMD="agent rm"; AUDIT_ARGS=("$@")
           with_registry_lock cmd_rm "$@" ;;
         config)
@@ -480,6 +480,10 @@ main() {
             fail "$E_USAGE" "unknown agent command: $sub"
           fi ;;
       esac ;;
+    fire)
+      # `5dive fire <name>` — top-level synonym for `agent rm` (fire an agent).
+      AUDIT_CMD="agent rm"; AUDIT_ARGS=("$@")
+      with_registry_lock cmd_rm "$@" ;;
     account)
       [[ $# -gt 0 ]] || fail "$E_USAGE" "usage: 5dive account list|show|usage|add|rename|remove|login|set-active-provider"
       local acctcmd="$1"; shift

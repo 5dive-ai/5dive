@@ -10,6 +10,9 @@ release.
 ## [Unreleased]
 
 ### Added
+- **`5dive fire` — synonym for removing an agent.** `5dive fire <name>` and
+  `5dive agent fire <name>` are aliases for `5dive agent rm <name>` (fire an
+  agent from the team). Same guarded teardown path; purely additive.
 - **Custom providers in the `5dive init` wizard for Claude.** The claude auth
   step now offers a third option — "Custom provider" — to run Claude Code
   against a BYO Anthropic-compatible endpoint (OpenRouter, z.ai, DeepSeek,
