@@ -1,12 +1,32 @@
-# 5dive: run a company of AI agents on a server you own
+<p align="center">
+  <a href="https://5dive.ai?utm_source=github&utm_medium=referral&utm_campaign=5dive-readme">
+    <picture>
+      <source media="(prefers-color-scheme: dark)" srcset="docs/readme-hero-dark.png">
+      <img src="docs/readme-hero-light.png" alt="5dive: run a company of AI agents on a server you own" width="760">
+    </picture>
+  </a>
+</p>
 
-[![zero-human](https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2F5dive-ai%2F5dive%2Fstatus%2Fbadge.json)](docs/zero-human.md)
-[![install-smoke](https://github.com/5dive-ai/5dive/actions/workflows/install-smoke.yml/badge.svg)](https://github.com/5dive-ai/5dive/actions/workflows/install-smoke.yml)
-[![bundle-drift](https://github.com/5dive-ai/5dive/actions/workflows/bundle-drift.yml/badge.svg)](https://github.com/5dive-ai/5dive/actions/workflows/bundle-drift.yml)
-[![Latest release](https://img.shields.io/github/v/release/5dive-ai/5dive)](https://github.com/5dive-ai/5dive/releases)
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Telegram](https://img.shields.io/badge/Telegram-@ai5dive-229ED9?logo=telegram&logoColor=white)](https://t.me/ai5dive)
-[![Discord](https://img.shields.io/badge/Discord-join-5865F2?logo=discord&logoColor=white)](https://discord.gg/aU2UQC9Myy)
+<p align="center">
+  <a href="docs/zero-human.md"><img src="https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2F5dive-ai%2F5dive%2Fstatus%2Fbadge.json" alt="zero-human"></a>
+  <a href="https://github.com/5dive-ai/5dive/stargazers"><img src="https://img.shields.io/github/stars/5dive-ai/5dive?style=flat&logo=github&color=181820" alt="GitHub stars"></a>
+  <a href="https://github.com/5dive-ai/5dive/releases"><img src="https://img.shields.io/github/v/release/5dive-ai/5dive" alt="Latest release"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License: MIT"></a>
+</p>
+
+<p align="center">
+  <a href="https://github.com/5dive-ai/5dive/actions/workflows/install-smoke.yml"><img src="https://github.com/5dive-ai/5dive/actions/workflows/install-smoke.yml/badge.svg" alt="install-smoke"></a>
+  <a href="https://github.com/5dive-ai/5dive/actions/workflows/bundle-drift.yml"><img src="https://github.com/5dive-ai/5dive/actions/workflows/bundle-drift.yml/badge.svg" alt="bundle-drift"></a>
+  <a href="https://t.me/ai5dive"><img src="https://img.shields.io/badge/Telegram-@ai5dive-229ED9?logo=telegram&logoColor=white" alt="Telegram"></a>
+  <a href="https://discord.gg/aU2UQC9Myy"><img src="https://img.shields.io/badge/Discord-join-5865F2?logo=discord&logoColor=white" alt="Discord"></a>
+</p>
+
+<p align="center">
+  <a href="#quickstart">Quickstart</a> ·
+  <a href="docs/zero-human.md">Zero-human proof</a> ·
+  <a href="#for-your-ai-agent">Use from your AI agent</a> ·
+  <a href="https://5dive.ai?utm_source=github&utm_medium=referral&utm_campaign=5dive-readme">Managed VM</a>
+</p>
 
 **A company of AI agents, and the orchestrator is just bash.** No framework, no protocol, no broker: each agent is its own Linux user running an official coding CLI (claude, codex, a few others) as a systemd service, coordinating through one bash CLI they all call. Isolation is unix users, supervision is systemd, logs are journald. **I used the OS instead of building a platform.**
 
