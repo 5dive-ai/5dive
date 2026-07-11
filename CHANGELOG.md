@@ -9,6 +9,27 @@ release.
 
 ## [Unreleased]
 
+### Fixed
+- **Tier-2 gates now refuse a non-human answer regardless of need_type
+  (DIVE-1117, companion to DIVE-1115 / defense in depth).** The human-only and
+  gate-proof evidence blocks in `task answer` keyed on need_type
+  (approval/secret/manual), so a `decision` gate FLOORED to tier 2 by the T2
+  category heuristic (e.g. OSS-16/OSS-25, keyword-floored by "secrets") slipped
+  past and accepted a bare-agent answer (`need_answered_by=main`) even with
+  `gate-proof enforce` ON. Added a tier-2 provenance floor: under enforcement,
+  `task answer` on any tier-2 gate refuses a non-human answer (an answer is
+  human-sourced only when a trusted path passed `--human`, recorded `human:*`).
+  The floor is provenance-only, not evidence-based: a tier-2 `decision` gate
+  mints no per-gate nonce and its Telegram tap runs as `SUDO_UID=agent`, so
+  demanding evidence would reject a real human decision tap (DIVE-525). Every
+  trusted human path (Telegram tap, dashboard/API exec) passes `--human`, so a
+  genuine human answer is never blocked. No downgrade path from the answer side:
+  an over-fired T2 waits for a human by design. New unit suite
+  `tests/gate_tier2_floor_unit.sh` (9 cases). Residual follow-up: the sudo→`--human`
+  human:* forge on a tier-2 *decision* (no nonce evidence layer), and the
+  phrasing-sensitive T2 heuristic should key on structured category, not ask-text
+  keywords.
+
 ### Added
 - **Tier-1 gates auto-clear from proven human precedent (OSS-21).** Behind a new
   fleet pref `5dive task precedent on|off` (default **OFF**). When ON, at gate

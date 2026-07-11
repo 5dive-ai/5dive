@@ -2149,6 +2149,13 @@ cmd_task_answer() {
   nt=$(db "SELECT CASE WHEN need_type IS NOT NULL AND need_answered_at IS NULL THEN need_type ELSE '' END FROM tasks WHERE id=${id};")
   [[ -n "$nt" ]] || fail "$E_CONFLICT" "$ident has no pending human gate (nothing to answer)"
 
+  # DIVE-1117: resolve the gate's stored risk tier now — the human-only + evidence
+  # blocks below key on need_type (approval/secret/manual), but tier 2 is the true
+  # hard-human floor. A `decision` gate can be FLOORED to tier 2 by the T2 category
+  # heuristic (cmd_task_need), yet decision is agent-clearable BY TYPE, so those
+  # blocks let it through. The tier-2 provenance floor further down uses this.
+  local gtier; gtier=$(db "SELECT COALESCE(tier,'') FROM tasks WHERE id=${id};")
+
   # DIVE-394: approval/secret are HUMAN-ONLY gates. Reject answers that come from
   # an agent acting as itself — that's the DIVE-391 incident, where an Olivia
   # endorsement (running as agent-<name>) silently cleared a human approval gate.
@@ -2231,6 +2238,34 @@ cmd_task_answer() {
     if _gate_proof_enforced && (( ! _evid )); then
       fail "$E_AUTH_REQUIRED" "$ident ($nt) needs a human to clear it — tap the button in Telegram or use the dashboard. (An agent can't self-clear an approval/secret/manual gate.)"
     fi
+  fi
+
+  # DIVE-1117 (companion to DIVE-1115, CLI side / defense in depth): tier 2 is the
+  # HARD human floor and NEVER auto-applies, so `task answer` must refuse a
+  # NON-HUMAN answer on a tier-2 gate regardless of need_type. The blocks above
+  # only fire for the approval/secret/manual types; a `decision` gate floored to
+  # tier 2 by the T2 category heuristic (OSS-16, keyword-floored by "secrets")
+  # slipped past and accepted a bare-agent answer (need_answered_by=main) with
+  # `gate-proof enforce` ON. The floor is provenance: an answer is human-sourced
+  # only when a trusted path passed --human (recorded human:* below). Every real
+  # human path — the Telegram tap, the dashboard/API exec — passes --human, so a
+  # genuine human answer is NEVER rejected here (DIVE-525). We gate this on
+  # `gate-proof enforce` for the SAME rollout envelope as the evidence block
+  # above; enforce is ON fleet-wide (DIVE-950). We deliberately do NOT require the
+  # evidence forms here: a tier-2 `decision` gate mints no per-gate nonce and its
+  # tap runs as SUDO_UID=agent, so demanding evidence would reject a real human
+  # decision tap — provenance is the correct, tap-safe floor. Residual (an agent
+  # sudo->--human-forging human:* on a tier-2 *decision*, which has no nonce
+  # evidence layer) is the forged-human threat DIVE-916/DIVE-1115 own; tracked as
+  # follow-up. NO downgrade path from the answer side by design: an over-fired T2
+  # (the heuristic can over-match) waits for a human — the conservative correct
+  # default for a hard floor; re-file at a lower --tier if the floor misfired.
+  if [[ "$gtier" == "2" ]] && (( ! human )) && _gate_proof_enforced; then
+    local _caller3; _caller3=$(id -un 2>/dev/null || echo '?')
+    audit_log "task answer gate" error 0 -- \
+      "task=$ident" "type=$nt" "tier=$gtier" "reason=non-human answer on tier-2 floor" \
+      "human=$human" "caller=$_caller3" "sudo_uid=${SUDO_UID:-}"
+    fail "$E_AUTH_REQUIRED" "$ident is a tier-2 human gate ($nt) — only a human can clear it, so an agent answer is refused. Tap the button in Telegram or use the dashboard. (If the tier-2 floor over-fired on this gate, re-file it at a lower --tier.)"
   fi
 
   # Who resumes: the agent that hit the gate (assignee), else the creator.
