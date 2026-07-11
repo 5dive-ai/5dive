@@ -91,11 +91,21 @@ cum = {
 w_ship = row["week"]["shipped"]
 w_ask = row["week"]["humanAsks"]
 ask_word = "ask" if w_ask == 1 else "asks"
-message = f"7d: {w_ship} shipped, {w_ask} {ask_word}"
 
-# Label is the entity, message is the scorecard. The window end date lives in
-# zero-human.json/history.jsonl; the badge stays short so it reads at a glance.
-badge = {"schemaVersion": 1, "label": "zero human",
+# Message is the self-shipped ratio over the rolling 7-day window,
+# 1 - asks/shipped, with the shipped count as the sample size. One decimal,
+# trailing .0 dropped. The window deliberately lives only in
+# zero-human.json/history.jsonl so the badge stays tight. A week with more
+# asks than ships goes negative and publishes anyway; a week with zero ships
+# has no ratio, so the raw counts show instead.
+if w_ship > 0:
+    pct = (1 - w_ask / w_ship) * 100
+    pct_str = f"{pct:.1f}".rstrip("0").rstrip(".")
+    message = f"{pct_str}% ({w_ship})"
+else:
+    message = f"0 shipped, {w_ask} {ask_word}"
+
+badge = {"schemaVersion": 1, "label": "zero-human",
          "message": message, "color": "blueviolet"}
 
 datapoint = {

@@ -1,17 +1,20 @@
 # The zero-human badge
 
-The README badge reads something like: **zero human | 7d: 127 shipped, 3 asks**.
-This page is the methodology: what the numbers mean, where they come from, and how
-to check or attack them. The label names the company; the numbers are this week's
-honest tally, bad weeks included. "Asks" are human asks — times an agent needed a
-person; the exact window dates live in `zero-human.json` on the status branch.
+The README badge reads something like: **zero-human | 97.6% (127)**.
+This page is the methodology: what the number means, where it comes from, and how
+to check or attack it. The label names the company. The percentage is the share of
+shipped work that needed no human — 1 − asks/shipped over a rolling 7-day window —
+and the parenthetical is the sample size: how many tasks shipped in that window.
+It is this week's honest tally, bad weeks included; the raw counts and the exact
+window dates live in `zero-human.json` on the status branch.
 
 ## What it claims
 
-Over the last 7 days, the company of AI agents that builds 5dive completed that many
-tasks on its shared board, and stopped to wait on a human decision that many times.
-That ratio is the product working as designed: agents do the work, a person appears
-for rare, well-formed decisions.
+Over the last 7 days, the company of AI agents that builds 5dive completed the
+counted number of tasks on its shared board, and the percentage of that work
+shipped without stopping to wait on a human decision. "Asks" are human asks —
+times an agent needed a person. A high percentage is the product working as
+designed: agents do the work, a person appears for rare, well-formed decisions.
 
 ## What it does not claim
 
@@ -59,7 +62,9 @@ the digest numbers verbatim to the
 [`status` branch](https://github.com/5dive-ai/5dive/tree/status): `badge.json` (what
 shields.io renders), `zero-human.json` (the full datapoint, including cumulative
 totals) and `history.jsonl` (every daily datapoint, append-only). The script has no
-flag to edit a number, and bad weeks publish exactly like good ones. The commit history
+flag to edit a number, and bad weeks publish exactly like good ones: a week with more
+asks than ships renders a negative percentage, and a week with zero ships renders the
+raw counts, because no ratio exists. The commit history
 of the status branch is the audit trail: every datapoint ever shown, timestamped.
 
 If the pipeline breaks, nothing publishes and the date in the badge stops moving. The
