@@ -33,6 +33,8 @@ new one; real usage reports move items up the list.
 - [ ] One inbox for every open gate across all your boxes (#15)
 - [x] The zero-human KPI: human-touches-per-week in the daily digest, trending down
 - [x] Weekly autonomy report: "your company ran 7 days, shipped N tasks, asked you twice"
+- [x] Public proof: the zero-human badge on the README, republished daily from the box
+      that runs our company ([what it claims and what it does not](docs/zero-human.md))
 
 ## Work that proves itself done
 
@@ -57,6 +59,20 @@ new one; real usage reports move items up the list.
       teammate in one command
 - [ ] One company across many boxes: tasks, org chart, and gates span your whole fleet (#19)
 - [x] Every agent carries a portable identity card and a verifiable work history
+
+## The next horizon
+
+The first wave above is mostly shipped, so this is what we aim at next. Same razor:
+fewer human touches per unit of shipped work, without losing auditability.
+
+- [ ] Repeat gates clear themselves from your own precedent, promotion gated on a
+      measured acceptance record (#20)
+- [ ] Publish your own zero-human badge from your own box, one command, same
+      methodology as ours (#21)
+- [ ] Autonomy earned by track record: agents whose work keeps proving itself done get
+      wider defaults, logged and reversible (#22)
+- [ ] Give the company an outcome and a number, not a backlog: a standing goal the
+      planner keeps steering toward (#23)
 
 ---
 
