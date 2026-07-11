@@ -214,6 +214,12 @@ Usage (per-agent / per-task token burn — subscription tokens, no dollars):
 Memory (queryable team memory — read-path, DIVE-726):
   5dive memory search "<query>" [--limit=N] [--max-tokens=T]  # BM25-ranked snippets from the agent's memory stores + wiki, with provenance
 
+Zero-human proof (publish your own badge — OSS-17):
+  5dive proof publish [--dry-run] [--repo=<url>] [--branch=<b>]  # push badge/datapoint/history, computed verbatim from digest
+  5dive proof on --repo=<url> [--branch=status] [--at=<0-23>]    # save config + install daily root cron
+  5dive proof off | status [--json]                             # remove cron (config kept) | report + staleness
+  # methodology + self-publish guide: docs/zero-human.md
+
 Health:
   5dive doctor [--fix] [--dry-run] [--category=deps|types|auth|creds|registry|shelld|channels|host|memory]
     Walks deps (tmux/jq/bun/python3/nvm/node/npm), type bins, live auth
@@ -604,6 +610,12 @@ main() {
       # usage + heartbeat health, zero agent tokens. Read-only reporting; no
       # registry mutation/lock, no audit (same posture as usage).
       cmd_digest "$@" ;;
+    proof)
+      # OSS-17: publish this box's zero-human proof (badge.json/zero-human.json/
+      # history.jsonl) to a git status branch, computed verbatim from `digest`.
+      # publish/status are read-mostly; on/off manage a root cron + pref, tick is
+      # the root cron driver. No registry mutation/lock, no audit (like digest).
+      cmd_proof "$@" ;;
     memory)
       # DIVE-726 Phase 1a: queryable team memory read-path. Read-only (scans
       # markdown memory stores + shared wiki); no registry mutation/lock/audit,

@@ -56,8 +56,8 @@ zero-human block in [src/cmd_digest.sh](../src/cmd_digest.sh) (search `OSS-10` a
 
 ## How it updates
 
-A daily cron on that box runs
-[scripts/publish-zero-human.sh](../scripts/publish-zero-human.sh), which republishes
+A daily cron on that box runs `5dive proof publish` (via the back-compat shim
+[scripts/publish-zero-human.sh](../scripts/publish-zero-human.sh)), which republishes
 the digest numbers verbatim to the
 [`status` branch](https://github.com/5dive-ai/5dive/tree/status): `badge.json` (what
 shields.io renders), `zero-human.json` (the full datapoint, including cumulative
@@ -79,4 +79,24 @@ Every 5dive box computes the same metric for your own company:
 5dive digest --json --7d
 ```
 
-Publishing your own badge from your own box is on the [roadmap](../ROADMAP.md).
+## Publish your own
+
+Any 5dive box can publish its own badge from its own repo's status branch, same
+methodology, same honesty invariants. The `5dive proof` verb does it (OSS-17):
+
+```sh
+# one-shot, preview first (builds the files, shows the diff, pushes nothing):
+5dive proof publish --dry-run --repo=https://github.com/<you>/<repo>.git
+
+# turn on the daily publisher (saves config + installs a root cron):
+sudo 5dive proof on --repo=https://github.com/<you>/<repo>.git --at=9
+5dive proof status          # config, last published date, staleness
+sudo 5dive proof off        # stop publishing (config kept)
+```
+
+Push auth is the box's ambient git credentials; the verb never stores a token.
+Numbers come from `5dive digest --json` verbatim, there is deliberately no flag
+to edit a number, and re-runs are idempotent per day. On your first publish the
+verb prints the copy-paste README badge markdown pointing at YOUR status branch.
+The badge renders from your repo, links back here, and, like ours, moves only
+when the pipeline runs. Bad weeks and fresh-box zeros publish exactly the same.

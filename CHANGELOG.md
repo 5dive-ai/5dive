@@ -9,6 +9,25 @@ release.
 
 ## [Unreleased]
 
+### Added
+- **`5dive proof` — publish your own zero-human badge (OSS-17, gh 5dive#21).**
+  Generalizes the internal `scripts/publish-zero-human.sh` into a first-class
+  verb so any self-hosted box publishes its own proof to its own repo's status
+  branch, same methodology (`docs/zero-human.md`). `proof publish [--dry-run]
+  [--repo] [--branch]` computes badge.json/zero-human.json/history.jsonl from
+  `5dive digest --json` VERBATIM (no flag edits a number, by design), idempotent
+  per day (a same-day re-run exits 3). `proof on --repo=<url> [--branch=status]
+  [--at=HH]` saves config (`${STATE_DIR}/proof.json`) + installs an idempotent
+  root cron (`/etc/cron.d/5dive-proof`); `proof off` removes the cron (config
+  kept); `proof status` reports config, last-published date, and staleness.
+  First publish prints the copy-paste README badge markdown pointing at the
+  user's OWN status branch. `scripts/publish-zero-human.sh` is now a thin
+  back-compat shim calling the verb (existing crons keep working; ZH_REPO/
+  ZH_BRANCH/ZH_GIT_NAME/ZH_GIT_EMAIL still honored). Push auth is the box's
+  ambient git credentials — the verb never stores tokens. Unit-tested in
+  `tests/proof_publish_unit.sh`. Our own box's cron migration is held for
+  verify-time with main (DIVE-1115 pause).
+
 ### Fixed
 - **Tier-2 gates now refuse a non-human answer regardless of need_type
   (DIVE-1117, companion to DIVE-1115 / defense in depth).** The human-only and
