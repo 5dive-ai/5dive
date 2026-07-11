@@ -1,9 +1,10 @@
 # The zero-human badge
 
-The README badge reads something like: **zero-human company | 7d to Jul 11: 127 shipped,
-3 human asks**. This page is the methodology: what the numbers mean, where they come
-from, and how to check or attack them. The label names the company; the numbers are
-this week's honest tally, bad weeks included.
+The README badge reads something like: **zero human | 7d: 127 shipped, 3 asks**.
+This page is the methodology: what the numbers mean, where they come from, and how
+to check or attack them. The label names the company; the numbers are this week's
+honest tally, bad weeks included. "Asks" are human asks — times an agent needed a
+person; the exact window dates live in `zero-human.json` on the status branch.
 
 ## What it claims
 

@@ -90,12 +90,12 @@ cum = {
 
 w_ship = row["week"]["shipped"]
 w_ask = row["week"]["humanAsks"]
-ask_word = "human ask" if w_ask == 1 else "human asks"
-message = f"7d to {os.environ['TODAY_LABEL']}: {w_ship} shipped, {w_ask} {ask_word}"
+ask_word = "ask" if w_ask == 1 else "asks"
+message = f"7d: {w_ship} shipped, {w_ask} {ask_word}"
 
-# Label is the entity, message is the scorecard. Keeping them apart avoids the
-# badge reading "zero-human ... 3 human asks" as a self-contradiction.
-badge = {"schemaVersion": 1, "label": "zero-human company",
+# Label is the entity, message is the scorecard. The window end date lives in
+# zero-human.json/history.jsonl; the badge stays short so it reads at a glance.
+badge = {"schemaVersion": 1, "label": "zero human",
          "message": message, "color": "blueviolet"}
 
 datapoint = {
