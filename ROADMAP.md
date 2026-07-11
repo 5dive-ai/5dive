@@ -38,9 +38,9 @@ new one; real usage reports move items up the list.
 
 - [x] Verifier-graded acceptance as the default for non-trivial tasks (maker never grades
       their own work)
-- [x] Supervisor recovery: restart, nudge, or escalate stuck agents automatically, every
-      action logged
-- [ ] Supervision for every runtime, not just Claude (#16)
+- [x] Auto-recovery: stuck agents restart, nudge, or escalate on their own, every action
+      logged
+- [ ] Self-healing for every runtime, not just Claude (#16)
 - [ ] Enforceable per-loop token budgets (#17)
 
 ## Memory that compounds
