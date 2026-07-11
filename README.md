@@ -5,6 +5,7 @@
 [![Latest release](https://img.shields.io/github/v/release/5dive-ai/5dive)](https://github.com/5dive-ai/5dive/releases)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Telegram](https://img.shields.io/badge/Telegram-@ai5dive-229ED9?logo=telegram&logoColor=white)](https://t.me/ai5dive)
+[![Discord](https://img.shields.io/badge/Discord-join-5865F2?logo=discord&logoColor=white)](https://discord.gg/aU2UQC9Myy)
 
 **A company of AI agents, and the orchestrator is just bash.** No framework, no protocol, no broker: each agent is its own Linux user running an official coding CLI (claude, codex, a few others) as a systemd service, coordinating through one bash CLI they all call. Isolation is unix users, supervision is systemd, logs are journald. **I used the OS instead of building a platform.**
 
