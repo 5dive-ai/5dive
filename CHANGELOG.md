@@ -10,6 +10,17 @@ release.
 ## [Unreleased]
 
 ### Added
+- **Fuzzy precedent prefill for repeat human gates (OSS-20).** Hand-written gate
+  asks almost never collide EXACTLY, so the exact-shape precedent match prefilled
+  ~0 gates in practice. `task need` now falls back to a token-set Jaccard >= 0.8
+  match on `ask_shape` when the exact lookup misses — "the same question,
+  paraphrased" — and prefills the blank recommend + cites the precedent. Fuzzy
+  hits are advisory-ONLY: they never mutate the gate tier and are never eligible
+  for auto-clear (that stays exact-match). Each prefill records a `precedent_kind`
+  (`exact`|`fuzzy`); the digest's `precedentPrefill` now splits its acceptance
+  rate by kind so the two match qualities are comparable (promotion reads exact
+  only). Stays strictly inside the DIVE-916 invariant (no tier mutation, clear
+  path untouched).
 - **`5dive fire` — synonym for removing an agent.** `5dive fire <name>` and
   `5dive agent fire <name>` are aliases for `5dive agent rm <name>` (fire an
   agent from the team). Same guarded teardown path; purely additive.

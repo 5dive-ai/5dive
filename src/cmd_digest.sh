@@ -254,6 +254,18 @@ for t in work:
 accepted = [t for t in prefilled if _norm(t.get("need_answer")) == _norm(t.get("recommend"))]
 prefill_rate = round(100 * len(accepted) / len(prefilled)) if prefilled else None
 
+# OSS-20: split the acceptance rate by match kind (exact vs fuzzy) so the two are
+# comparable — fuzzy prefill is a paraphrase match and expected to accept lower;
+# promotion to auto-clear (OSS-21) reads the EXACT rate only. Legacy prefills with
+# no recorded kind count as 'exact' (they predate the fuzzy fallback).
+def _by_kind(kind):
+    sub = [t for t in prefilled if (t.get("precedent_kind") or "exact") == kind]
+    acc = [t for t in sub if _norm(t.get("need_answer")) == _norm(t.get("recommend"))]
+    return {"count": len(sub), "accepted": len(acc),
+            "rate": (round(100 * len(acc) / len(sub)) if sub else None)}
+prefill_exact = _by_kind("exact")
+prefill_fuzzy = _by_kind("fuzzy")
+
 # OSS-10 zero-human KPI: gates a HUMAN answered in the window. Provenance is
 # need_answered_by = 'human:*' (the --human tap/dashboard path); bare agent
 # names are agent-cleared decisions and 'auto:*' is the tier system — neither
@@ -394,7 +406,8 @@ if as_json:
         "zeroHuman": {"shipped": len(done_l), "humanTouches": len(ht_l), "gates": ht_l},
         "autonomy": autonomy,
         "precedentPrefill": {"count": len(prefilled), "accepted": len(accepted),
-                             "acceptanceRate": prefill_rate},
+                             "acceptanceRate": prefill_rate,
+                             "byKind": {"exact": prefill_exact, "fuzzy": prefill_fuzzy}},
         "usage": usage_l, "health": {"stale": stale, "hot": [h["name"] for h in hot]},
         "loops": {"total": loops_total, "capped": len(loops_capped), "byLoop": loops_burn},
         "stuck": {"mttuSec": mttu_sec, "episodes": len(in_window),
@@ -452,6 +465,15 @@ else:
         out.append("")
         out.append(f"\U0001F9E0 Precedent prefills ({len(prefilled)}) — "
                    f"{prefill_rate}% kept the prefilled rec ({len(accepted)}/{len(prefilled)})")
+        # OSS-20: break out exact vs fuzzy so the fuzzy fallback's quality is legible
+        # (only the exact rate gates promotion to auto-clear).
+        def _kind_line(label, k):
+            if not k["count"]:
+                return None
+            return f"    {label}: {k['rate']}% ({k['accepted']}/{k['count']})"
+        for _ln in (_kind_line("exact", prefill_exact), _kind_line("fuzzy", prefill_fuzzy)):
+            if _ln:
+                out.append(_ln)
     if loops_burn:
         out.append("")
         cap_note = f", {len(loops_capped)} hit ceiling" if loops_capped else ""

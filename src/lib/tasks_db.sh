@@ -226,8 +226,14 @@ CREATE TABLE IF NOT EXISTS tasks (
   -- + digest provenance). Both advisory-only: they NEVER mutate tier or the clear
   -- path — precedent sources the VALUE of a rec the tier would surface anyway,
   -- it never widens what a gate can self-clear (the DIVE-916 invariant).
+  -- OSS-20 precedent_kind: 'exact' when precedent_ref came from an EXACT ask_shape
+  -- match, 'fuzzy' when it came from the token-set Jaccard>=0.8 fallback. NULL when
+  -- no precedent sourced this gate. The digest splits acceptance by kind so the two
+  -- match qualities are comparable; only 'exact' is promotion-eligible (OSS-21
+  -- auto-clear reads exact match, never fuzzy). Advisory-only like precedent_ref.
   ask_shape           TEXT,
-  precedent_ref       INTEGER
+  precedent_ref       INTEGER,
+  precedent_kind      TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_tasks_precedent ON tasks(need_type, ask_shape);
 
@@ -395,7 +401,7 @@ _tasks_db_migrate() {
            'iteration INTEGER' 'maker_agent TEXT' 'task_budget TEXT' \
            'tier INTEGER' 'need_asked_at TEXT' 'gate_pinged_at TEXT' 'wake_at TEXT' \
            'secret_key TEXT' 'connector TEXT' 'human_nonce_hash TEXT' \
-           'ask_shape TEXT' 'precedent_ref INTEGER'; do
+           'ask_shape TEXT' 'precedent_ref INTEGER' 'precedent_kind TEXT'; do
     if ! printf '%s\n' "$cols" | grep -qx "${c%% *}"; then
       sqlite3 -cmd ".timeout 5000" "$TASKS_DB" \
         "ALTER TABLE tasks ADD COLUMN ${c};" >/dev/null 2>&1 || true

@@ -122,6 +122,61 @@ cmd_task_need DIVE-1031 --type=decision --ask="pick a region for DIVE-80" --opti
 eq_t "invariant: option-mismatch skips prefill" "$(field DIVE-1031 recommend)" "∅"
 eq_t "invariant: option-mismatch still cites"   "$(field DIVE-1031 precedent_ref)" "$(db "SELECT id FROM tasks WHERE ident='DIVE-1030';")"
 
+# EXACT match kind is recorded on the exact path (P0 gate DIVE-1001 above).
+eq_t "kind: exact match recorded"               "$(field DIVE-1001 precedent_kind)" "exact"
+
+# ======================= OSS-20 fuzzy shape fallback =====================
+# _gate_shape_jaccard(): token-set Jaccard as an integer percent.
+eq_t "jaccard: identical => 100"  "$(_gate_shape_jaccard 'a b c' 'a b c')"     "100"
+eq_t "jaccard: disjoint => 0"     "$(_gate_shape_jaccard 'a b c' 'x y z')"     "0"
+eq_t "jaccard: empty side => 0"   "$(_gate_shape_jaccard '' 'a b c')"          "0"
+eq_t "jaccard: 4/5 => 80 (thresh)" "$(_gate_shape_jaccard 'a b c d' 'a b c d e')" "80"
+eq_t "jaccard: dup-insensitive"   "$(_gate_shape_jaccard 'a a b c' 'a b c')"   "100"
+
+# F1: exact MISS but a paraphrase at Jaccard>=0.8 fuzzy-prefills + tags kind=fuzzy.
+# Precedent shape has 5 tokens; the gate adds one word (6 tokens) => 5/6 = 0.83.
+SHAPE_ARCH="$(_gate_ask_shape 'archive the stale sandbox namespaces')"
+seed_precedent DIVE-1040 decision 1 "$SHAPE_ARCH" yes
+FZ_ID="$(db "SELECT id FROM tasks WHERE ident='DIVE-1040';")"
+seed_task DIVE-1041
+NOTIFY_CITE=""
+cmd_task_need DIVE-1041 --type=decision --ask="archive the stale sandbox namespaces please" --options="yes|no" >/dev/null 2>&1
+# Guard: the paraphrase really is an EXACT miss (shapes differ) so this exercises fuzzy.
+if [[ "$(field DIVE-1041 ask_shape)" != "$SHAPE_ARCH" ]]; then ok_t "fuzzy: paraphrase is an exact-shape miss"; else bad_t "fuzzy: paraphrase is an exact-shape miss" "shapes collided"; fi
+eq_t "fuzzy: blank recommend filled from paraphrase" "$(field DIVE-1041 recommend)" "yes"
+eq_t "fuzzy: precedent_ref recorded"                 "$(field DIVE-1041 precedent_ref)" "$FZ_ID"
+eq_t "fuzzy: precedent_kind=fuzzy"                    "$(field DIVE-1041 precedent_kind)" "fuzzy"
+if [[ -n "$NOTIFY_CITE" ]]; then ok_t "fuzzy: citation handed to notifier"; else bad_t "fuzzy: citation handed to notifier" "empty"; fi
+
+# F2: fuzzy NEVER auto-answers — the clear path stays exact-only (OSS-21). A
+# tier-1 decision fuzzy hit prefills a rec but the gate stays blocked/unanswered.
+eq_t "fuzzy: does NOT auto-answer"  "$(field DIVE-1041 need_answered_at)" "∅"
+eq_t "fuzzy: gate still blocked"    "$(field DIVE-1041 status)"           "blocked"
+eq_t "fuzzy: tier not mutated"      "$(field DIVE-1041 tier)"             "1"
+
+# F3: below-threshold paraphrase (Jaccard<0.8) does NOT match — no prefill/ref/kind.
+seed_task DIVE-1042
+cmd_task_need DIVE-1042 --type=decision --ask="archive the stale sandbox namespaces now please immediately today" --options="yes|no" >/dev/null 2>&1
+eq_t "fuzzy: sub-threshold no prefill"       "$(field DIVE-1042 recommend)"      "∅"
+eq_t "fuzzy: sub-threshold no precedent_ref" "$(field DIVE-1042 precedent_ref)" "∅"
+eq_t "fuzzy: sub-threshold no kind"          "$(field DIVE-1042 precedent_kind)" "∅"
+
+# F4: fuzzy respects tier gating — a lower-tier precedent can't fuzzy-prefill up.
+SHAPE_PURGE="$(_gate_ask_shape 'purge the orphaned build artifacts')"
+seed_precedent DIVE-1050 decision 0 "$SHAPE_PURGE" yes
+seed_task DIVE-1051
+cmd_task_need DIVE-1051 --type=decision --ask="purge the orphaned build artifacts please" --options="yes|no" >/dev/null 2>&1
+eq_t "fuzzy: lower-tier precedent rejected" "$(field DIVE-1051 recommend)"      "∅"
+eq_t "fuzzy: lower-tier no kind"            "$(field DIVE-1051 precedent_kind)" "∅"
+
+# F5: fuzzy honours the decision option-check — cites but does NOT prefill a rec
+# that isn't one of THIS gate's options.
+seed_task DIVE-1052
+cmd_task_need DIVE-1052 --type=decision --ask="archive the stale sandbox namespaces asap" --options="approve|reject" >/dev/null 2>&1
+eq_t "fuzzy: option-mismatch skips prefill" "$(field DIVE-1052 recommend)"      "∅"
+eq_t "fuzzy: option-mismatch still cites"   "$(field DIVE-1052 precedent_ref)" "$FZ_ID"
+eq_t "fuzzy: option-mismatch kind=fuzzy"    "$(field DIVE-1052 precedent_kind)" "fuzzy"
+
 echo "-------------------------------------"
 echo "gate_precedent_unit: ${PASS} passed, ${FAIL} failed"
 [[ "$FAIL" -eq 0 ]]

@@ -428,7 +428,7 @@ cmd_task_ls() {
     # DIVE-583: emit project_key natively so the dashboard keys off a real field
     # (join name/prefix/lead from `project ls`) instead of deriving project from
     # the ident prefix client-side (fragile; couples to naming + the id≠ident bug).
-    rows=$(dbfmt -json "SELECT id, ident, title, status, priority, assignee, created_by, parent_id, created_at, done_at, body, result, need_type, ask, need_options, recommend, precedent_ref, need_answer, need_answered_at, need_answered_by, tier, kind, schedule, last_fired_at, parked_at, park_reason, wake_at, project_key FROM tasks WHERE ${where} ${order};")
+    rows=$(dbfmt -json "SELECT id, ident, title, status, priority, assignee, created_by, parent_id, created_at, done_at, body, result, need_type, ask, need_options, recommend, precedent_ref, precedent_kind, need_answer, need_answered_at, need_answered_by, tier, kind, schedule, last_fired_at, parked_at, park_reason, wake_at, project_key FROM tasks WHERE ${where} ${order};")
     [[ -n "$rows" ]] || rows="[]"
     # Feed rows via stdin, not --argjson: a big board (179+ tasks w/ bodies)
     # blows past MAX_ARG_STRLEN (128K per argv string) -> execve E2BIG
@@ -1273,6 +1273,24 @@ _gate_ask_shape() {
         -e 's/^ +//; s/ +$//'
 }
 
+# OSS-20 — _gate_shape_jaccard <shapeA> <shapeB>: token-set Jaccard similarity of
+# two ask_shapes, printed as an integer 0..100 (percent). Tokens are the
+# whitespace-split words of each shape (order- and duplicate-insensitive; the set
+# is what matters). Jaccard = |A∩B| / |A∪B|. Empty-vs-empty and any empty side is
+# 0 (the caller only fuzzy-matches non-empty shapes anyway). Used by the fuzzy
+# precedent fallback: two shapes at >=80 are "same question, paraphrased".
+_gate_shape_jaccard() {
+  awk -v a="$1" -v b="$2" '
+    BEGIN {
+      na = split(a, ta, /[ ]+/); for (i = 1; i <= na; i++) if (ta[i] != "") A[ta[i]] = 1
+      nb = split(b, tb, /[ ]+/); for (i = 1; i <= nb; i++) if (tb[i] != "") B[tb[i]] = 1
+      inter = 0; for (k in A) if (k in B) inter++
+      uni = 0; for (k in A) uni++; for (k in B) if (!(k in A)) uni++
+      if (uni == 0) { print 0; exit }
+      printf "%d", (inter * 100) / uni
+    }'
+}
+
 cmd_task_need() {
   tasks_db_init
   local type="" ask="" options="" recommend="" from="" tier="" secret_key="" connector=""
@@ -1380,7 +1398,7 @@ cmd_task_need() {
   # holds by construction: no tier mutation, no touch of the clear path
   # (cmd_task_answer / TTL / nonce), and a blank rec is filled ONLY when the tier
   # would have surfaced/applied a rec anyway.
-  local ask_shape precedent_ref="" precedent_cite=""
+  local ask_shape precedent_ref="" precedent_cite="" precedent_kind=""
   ask_shape=$(_gate_ask_shape "$ask")
   # Best prior ANSWERED gate: same need_type, EXACT ask_shape, from an equally- or
   # more-scrutinized tier (COALESCE(tier,2) so legacy NULL counts as T2 — a
@@ -1396,12 +1414,52 @@ cmd_task_need() {
                 AND COALESCE(tier,2) >= ${tier}
                 AND need_answered_at >= datetime('now','-90 day')
               ORDER BY need_answered_at DESC LIMIT 1;")
+  [[ -n "$_prow" ]] && precedent_kind="exact"
+
+  # OSS-20 fuzzy fallback. Hand-written asks almost never collide EXACTLY, so the
+  # exact path prefilled ~0 gates in practice. When it misses, scan the SAME
+  # candidate set (same need_type, tier>=this, answered in 90d, non-empty shape,
+  # not self) newest-first and take the most-recent whose ask_shape is token-set
+  # Jaccard >= 0.8 to this one — "the same question, paraphrased". This is
+  # advisory-ONLY and stays strictly inside the DIVE-916 invariant: it may prefill
+  # a blank recommend + cite (recorded precedent_kind='fuzzy'), but it NEVER
+  # mutates the tier and is NEVER eligible for auto-clear — OSS-21's auto-clear
+  # keys on precedent_kind='exact', so a fuzzy match can only ever advise a human.
+  if [[ -z "$_prow" && -n "$ask_shape" ]]; then
+    local _cands
+    _cands=$(db "SELECT id||x'1f'||ident||x'1f'||COALESCE(need_answer,'')||x'1f'||
+                        COALESCE(need_answered_at,'')||x'1f'||COALESCE(need_answered_by,'')||x'1f'||
+                        COALESCE(ask_shape,'')
+                 FROM tasks
+                 WHERE need_answer IS NOT NULL AND id<>${id}
+                   AND need_type=$(sqlq "$type")
+                   AND ask_shape IS NOT NULL AND ask_shape<>''
+                   AND COALESCE(tier,2) >= ${tier}
+                   AND need_answered_at >= datetime('now','-90 day')
+                 ORDER BY need_answered_at DESC;")
+    if [[ -n "$_cands" ]]; then
+      local _cid _cident _cans _cat _cby _cshape _j
+      while IFS=$'\x1f' read -r _cid _cident _cans _cat _cby _cshape; do
+        [[ -n "$_cshape" ]] || continue
+        _j=$(_gate_shape_jaccard "$ask_shape" "$_cshape")
+        if [[ "$_j" -ge 80 ]]; then
+          _prow="${_cid}"$'\x1f'"${_cident}"$'\x1f'"${_cans}"$'\x1f'"${_cat}"$'\x1f'"${_cby}"
+          precedent_kind="fuzzy"
+          break
+        fi
+      done <<<"$_cands"
+    fi
+  fi
+
   if [[ -n "$_prow" ]]; then
     local _pid _pident _pans _pat _pby
     IFS=$'\x1f' read -r _pid _pident _pans _pat _pby <<<"$_prow"
     precedent_ref="$_pid"
     local _pwho="${_pby#human:}"; _pwho="${_pwho#auto:}"
-    precedent_cite="Precedent: you answered '${_pans}' on ${_pident} (${_pat%% *}${_pwho:+, $_pwho})"
+    # A fuzzy hit is a paraphrase, not an identical gate — flag it in the citation
+    # so the human reads the prefill as advisory-by-similarity, not a rubber stamp.
+    local _sim=""; [[ "$precedent_kind" == "fuzzy" ]] && _sim=" [similar gate]"
+    precedent_cite="Precedent: you answered '${_pans}' on ${_pident} (${_pat%% *}${_pwho:+, $_pwho})${_sim}"
     # Prefill ONLY a blank recommend — never override an explicit filer rec. For a
     # decision the precedent answer must ALSO be one of THIS gate's options (shapes
     # match but option sets can differ); if it isn't, keep the citation but skip
@@ -1430,6 +1488,7 @@ cmd_task_need() {
             connector=$(sqlq_or_null "$connector"),
             ask_shape=$(sqlq_or_null "$ask_shape"),
             precedent_ref=${precedent_ref:-NULL},
+            precedent_kind=$(sqlq_or_null "$precedent_kind"),
             tier=${tier}, need_asked_at=datetime('now'), gate_pinged_at=NULL,
             need_answer=NULL, need_answered_at=NULL
       WHERE id=${id};"
