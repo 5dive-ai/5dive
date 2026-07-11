@@ -10,6 +10,22 @@ release.
 ## [Unreleased]
 
 ### Added
+- **Tier-1 gates auto-clear from proven human precedent (OSS-21).** Behind a new
+  fleet pref `5dive task precedent on|off` (default **OFF**). When ON, at gate
+  file-time — AFTER tier resolution and the T2 category floor, both unchanged — a
+  gate that resolves to **tier 1** clears itself if the ask matches proven human
+  precedent: EXACT `ask_shape` + same `need_type`, at least **2 distinct** prior
+  gates answered by a **human** (`need_answered_by LIKE 'human:%'`) with the
+  **identical** answer within 90d, **zero** contradicting human answers on that
+  shape in 90d, precedent tier ≥ 1. The clear uses the same immediate direct-write
+  path as tier-0/auto:ttl (never the human-answer path, so **no nonce is minted**),
+  stamps provenance `auto:precedent` and `precedent_ref` = the most-recent
+  qualifying gate, and surfaces in the digest's Auto-cleared section with its
+  citation. Hard exclusions: **secret** gates and **T2** never auto-clear;
+  `auto:*`-answered gates never seed a precedent (no compounding); a decision whose
+  consensus answer isn't a current option falls through to the human. `5dive
+  doctor` gains a `policy` check that flags when the switch is ON. Default OFF
+  everywhere pending the OSS-16 policy decision.
 - **Fuzzy precedent prefill for repeat human gates (OSS-20).** Hand-written gate
   asks almost never collide EXACTLY, so the exact-shape precedent match prefilled
   ~0 gates in practice. `task need` now falls back to a token-set Jaccard >= 0.8

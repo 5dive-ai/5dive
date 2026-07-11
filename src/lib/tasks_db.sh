@@ -336,6 +336,18 @@ CREATE TABLE IF NOT EXISTS supervisor_events (
   signals             TEXT
 );
 CREATE INDEX IF NOT EXISTS supervisor_events_agent_idx ON supervisor_events(agent, id);
+
+-- OSS-21: fleet-wide policy prefs as a tiny key/value store. Currently holds
+-- precedent_autoclear (on|off, default off when the row is absent) — the switch
+-- that lets a resolved tier-1 gate clear itself from proven human precedent.
+-- Additive, never referenced by tasks/projects, so it can't touch the queue.
+-- Defined identically inside _tasks_db_migrate for pre-existing stores; keep the
+-- two copies byte-identical (tests/schema_sync_unit.sh).
+CREATE TABLE IF NOT EXISTS task_prefs (
+  key        TEXT PRIMARY KEY,
+  value      TEXT NOT NULL,
+  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
 SQL
 }
 
@@ -529,6 +541,24 @@ MIG
         "ALTER TABLE loop_runs ADD COLUMN scorecard_json TEXT;" >/dev/null 2>&1 || true
     fi
   fi
+
+  # OSS-21 task_prefs table — additive, gated on absence like loop_runs above so
+  # it takes no write lock on every command. Brand-new key/value table, never
+  # referenced by tasks/projects, so creating it cannot touch the existing queue.
+  # Keep this definition byte-identical to the one in _tasks_schema above
+  # (tests/schema_sync_unit.sh).
+  local has_task_prefs
+  has_task_prefs=$(sqlite3 -cmd ".timeout 5000" "$TASKS_DB" \
+    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='task_prefs' LIMIT 1;" 2>/dev/null)
+  if [[ "$has_task_prefs" != "1" ]]; then
+    sqlite3 -cmd ".timeout 5000" "$TASKS_DB" <<'MIG' >/dev/null 2>&1 || true
+CREATE TABLE IF NOT EXISTS task_prefs (
+  key        TEXT PRIMARY KEY,
+  value      TEXT NOT NULL,
+  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+MIG
+  fi
 }
 
 # Per-connection setup, passed via -cmd / .timeout so it produces NO output
@@ -539,6 +569,18 @@ MIG
 db() {
   umask 0002
   sqlite3 -cmd ".timeout 5000" -cmd "PRAGMA foreign_keys=ON" "$TASKS_DB" "$1"
+}
+
+# OSS-21 fleet policy prefs (task_prefs KV). _task_pref_get echoes the stored
+# value or nothing when unset; callers apply their own default. _task_pref_set
+# upserts. Both assume tasks_db_init already ran (table present).
+_task_pref_get() {
+  db "SELECT value FROM task_prefs WHERE key=$(sqlq "$1");"
+}
+_task_pref_set() {
+  db "INSERT INTO task_prefs(key,value,updated_at)
+        VALUES($(sqlq "$1"),$(sqlq "$2"),datetime('now'))
+      ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=datetime('now');"
 }
 
 # Formatted read: dbfmt <sqlite-flag> "<sql>"  (e.g. -box, -json, -line).

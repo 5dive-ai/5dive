@@ -97,6 +97,7 @@ cmd_task() {
     need)            cmd_task_need "$@" ;;
     inbox)           cmd_task_inbox "$@" ;;
     answer)          cmd_task_answer "$@" ;;
+    precedent)       cmd_task_precedent "$@" ;;
     rm|delete)       cmd_task_rm "$@" ;;
     -h|--help|help)  _task_usage ;;
     *) fail "$E_USAGE" "unknown task command: $sub (try: 5dive task --help)" ;;
@@ -1232,6 +1233,38 @@ cmd_task_unpark() {
 # `need` parks a task on a human; `inbox` lists what's waiting; `answer`
 # records the human's reply, unblocks, and pings the agent that hit the gate.
 
+# OSS-21: precedent auto-clear policy switch. `5dive task precedent [on|off]`
+# (bare / `status` reports state). When ON, a resolved tier-1 gate that matches
+# proven human precedent clears itself at file-time (see cmd_task_need). Default
+# is OFF fleet-wide until the OSS-16 policy owner (lodar) flips it. Read-only
+# `status` needs no privilege; on/off is a policy write.
+cmd_task_precedent() {
+  tasks_db_init
+  local sub="${1:-status}"
+  case "$sub" in
+    status|"")
+      local v; v=$(_task_pref_get precedent_autoclear); v="${v:-off}"
+      ok "precedent auto-clear: ${v}" \
+         '{pref:"precedent_autoclear", value:$v}' --arg v "$v"
+      ;;
+    on|enable)
+      _task_pref_set precedent_autoclear on
+      [[ $EUID -eq 0 ]] && audit_log "task precedent" "on" 0 -- "pref=precedent_autoclear" || true
+      ok "precedent auto-clear: ON — resolved tier-1 gates with proven human precedent now clear at file-time" \
+         '{pref:"precedent_autoclear", value:"on"}'
+      ;;
+    off|disable)
+      _task_pref_set precedent_autoclear off
+      [[ $EUID -eq 0 ]] && audit_log "task precedent" "off" 0 -- "pref=precedent_autoclear" || true
+      ok "precedent auto-clear: OFF — tier-1 gates always surface to a human" \
+         '{pref:"precedent_autoclear", value:"off"}'
+      ;;
+    *)
+      fail "$E_USAGE" "usage: 5dive task precedent [on|off|status]"
+      ;;
+  esac
+}
+
 # DIVE-891 (adopted design DIVE-861): the T2 category floor. Money, public or
 # customer-facing comms, secrets, destructive/irreversible actions and
 # brand/strategy are ALWAYS a hard human gate, regardless of the tier the
@@ -1512,6 +1545,90 @@ cmd_task_need() {
        '{id:($i|tonumber), ident:$id, tier:0, auto_applied:$rc, need_type:$ty}' \
        --arg i "$id" --arg id "$ident" --arg rc "$recommend" --arg ty "$type"
     return
+  fi
+
+  # OSS-21: tier-1 precedent auto-clear (behind pref precedent_autoclear, default
+  # OFF). Runs AFTER tier resolution + the T2 floor (both unchanged) and AFTER the
+  # main gate write above, so it can only ever act on a gate that has ALREADY
+  # resolved to tier 1 — T0 returned above, and T2/secret are excluded by the
+  # guard. Qualify precedent = EXACT ask_shape + same need_type, >=2 DISTINCT prior
+  # gates answered by a HUMAN (need_answered_by LIKE 'human:%' — this alone
+  # excludes every auto:* seed, so no compounding) that were NOT themselves fuzzy-
+  # prefilled (precedent_kind<>'fuzzy' — OSS-20's advisory fuzzy match can never
+  # leak into the auto-clear seed set; exact human precedent only), IDENTICAL
+  # need_answer, within
+  # 90d, precedent tier >= 1, and ZERO contradicting human answers on that shape in
+  # 90d (i.e. exactly ONE distinct human answer). On qualification we clear via the
+  # SAME immediate direct-write path as tier-0/auto:ttl (never cmd_task_answer, so
+  # NO human nonce is ever minted), provenance 'auto:precedent', precedent_ref = the
+  # most-recent qualifying gate. The digest surfaces it through the auto:* Auto-
+  # cleared section with the precedent citation (DIVE-891 path). Secret gates and
+  # T2 provably never reach here; pref OFF is exact pre-OSS-21 behaviour.
+  if [[ "$tier" == "1" && "$type" != "secret" && -n "$ask_shape" ]]; then
+    local _ac; _ac=$(_task_pref_get precedent_autoclear); _ac="${_ac:-off}"
+    if [[ "$_ac" == "on" ]]; then
+      # One atomic read of the human-precedent set on this exact shape: newest
+      # qualifying gate (id + its answer), the count of DISTINCT human answers
+      # (>1 ⇒ contradiction ⇒ disqualified), and the total human-gate count.
+      local _qrow
+      _qrow=$(db "SELECT t1.id||x'1f'||COALESCE(t1.need_answer,'')||x'1f'||
+          (SELECT COUNT(DISTINCT need_answer) FROM tasks
+             WHERE need_answer IS NOT NULL AND id<>${id}
+               AND need_type=$(sqlq "$type")
+               AND ask_shape IS NOT NULL AND ask_shape=$(sqlq "$ask_shape")
+               AND need_answered_by LIKE 'human:%'
+               AND COALESCE(precedent_kind,'') <> 'fuzzy'
+               AND COALESCE(tier,2) >= 1
+               AND need_answered_at >= datetime('now','-90 day'))
+          ||x'1f'||
+          (SELECT COUNT(*) FROM tasks
+             WHERE need_answer IS NOT NULL AND id<>${id}
+               AND need_type=$(sqlq "$type")
+               AND ask_shape IS NOT NULL AND ask_shape=$(sqlq "$ask_shape")
+               AND need_answered_by LIKE 'human:%'
+               AND COALESCE(precedent_kind,'') <> 'fuzzy'
+               AND COALESCE(tier,2) >= 1
+               AND need_answered_at >= datetime('now','-90 day'))
+        FROM tasks t1
+        WHERE t1.need_answer IS NOT NULL AND t1.id<>${id}
+          AND t1.need_type=$(sqlq "$type")
+          AND t1.ask_shape IS NOT NULL AND t1.ask_shape=$(sqlq "$ask_shape")
+          AND t1.need_answered_by LIKE 'human:%'
+          AND COALESCE(t1.precedent_kind,'') <> 'fuzzy'
+          AND COALESCE(t1.tier,2) >= 1
+          AND t1.need_answered_at >= datetime('now','-90 day')
+        ORDER BY t1.need_answered_at DESC LIMIT 1;")
+      if [[ -n "$_qrow" ]]; then
+        local _qid _qans _qdistinct _qtotal
+        IFS=$'\x1f' read -r _qid _qans _qdistinct _qtotal <<<"$_qrow"
+        # Qualified: exactly one distinct human answer, backed by >=2 gates.
+        if [[ "$_qdistinct" == "1" && "$_qtotal" -ge 2 && -n "$_qans" ]]; then
+          # For a decision the consensus answer must ALSO be a current option
+          # (shapes match but option sets can drift); if it isn't, fall through
+          # to the normal human ping rather than apply an off-menu answer.
+          local _dok=1
+          if [[ "$type" == "decision" ]]; then
+            _dok=$(printf '%s' "$options" | jq -Rr --arg r "$_qans" '
+              [ split("|")[] | gsub("^\\s+|\\s+$"; "") | select(length > 0) ]
+              | (($r | gsub("^\\s+|\\s+$"; "")) as $rr | any(.[]; . == $rr)) | if . then "1" else "0" end' 2>/dev/null) || _dok=0
+          fi
+          if [[ "$_dok" == "1" ]]; then
+            local _tsp; _tsp=$(date -u '+%Y-%m-%d %H:%M:%S')
+            db "UPDATE tasks SET need_answer=$(sqlq "$_qans"), need_answered_at=$(sqlq "$_tsp"),
+                  need_answered_by='auto:precedent', precedent_ref=${_qid}, precedent_kind='exact'
+                WHERE id=${id};
+                UPDATE tasks SET status='todo'
+                  WHERE id=${id} AND status='blocked'
+                    AND NOT EXISTS (SELECT 1 FROM task_deps WHERE task_id=${id});"
+            [[ $EUID -eq 0 ]] && audit_log "task need precedent-auto" "ok" 0 -- "task=$ident" "type=$type" "applied=$_qans" "precedent=$_qid" || true
+            ok "$ident tier-1 gate auto-cleared from human precedent — applied: $_qans (precedent #$_qid)" \
+               '{id:($i|tonumber), ident:$id, tier:1, need_type:$ty, auto_applied:$rc, need_answered_by:"auto:precedent", precedent_ref:($pr|tonumber)}' \
+               --arg i "$id" --arg id "$ident" --arg ty "$type" --arg rc "$_qans" --arg pr "$_qid"
+            return
+          fi
+        fi
+      fi
+    fi
   fi
 
   # DIVE-105: DM the paired human right now so the gate doesn't sit unseen.

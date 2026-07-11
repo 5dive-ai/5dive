@@ -76,10 +76,10 @@ cmd_doctor() {
   (( want_fix && ! dry )) && DOCTOR_REPAIR=1
   case "$filter" in
     ""|deps|types|auth|creds|registry|shelld|channels|host|memory) ;;
-    *) fail "$E_USAGE" "unknown --category (deps|types|auth|creds|registry|shelld|channels|host|memory)" ;;
+    *) fail "$E_USAGE" "unknown --category (deps|types|auth|creds|registry|shelld|channels|host|memory|policy)" ;;
   esac
 
-  local run_deps=0 run_types=0 run_auth=0 run_creds=0 run_registry=0 run_shelld=0 run_channels=0 run_host=0 run_memory=0
+  local run_deps=0 run_types=0 run_auth=0 run_creds=0 run_registry=0 run_shelld=0 run_channels=0 run_host=0 run_memory=0 run_policy=0
   [[ -z "$filter" || "$filter" == "deps"     ]] && run_deps=1
   [[ -z "$filter" || "$filter" == "types"    ]] && run_types=1
   [[ -z "$filter" || "$filter" == "auth"     ]] && run_auth=1
@@ -89,6 +89,7 @@ cmd_doctor() {
   [[ -z "$filter" || "$filter" == "channels" ]] && run_channels=1
   [[ -z "$filter" || "$filter" == "host"     ]] && run_host=1
   [[ -z "$filter" || "$filter" == "memory"   ]] && run_memory=1
+  [[ -z "$filter" || "$filter" == "policy"   ]] && run_policy=1
 
   # --- deps ---
   if (( run_deps )); then
@@ -643,6 +644,26 @@ cmd_doctor() {
           fi
           doctor_add memory "$store" "$sev" "$msg"
         done <<<"$store_lines"
+      fi
+    fi
+  fi
+
+  # --- policy: gate auto-clear switches (OSS-21) ---
+  # Surface the fleet-wide precedent_autoclear pref so an operator can see, from
+  # the one health command, whether tier-1 gates are silently clearing themselves
+  # from human precedent. Reads the tasks store directly; a missing store just
+  # degrades to a warn (never aborts doctor). ON is reported as a warn severity so
+  # it stands out in the summary — it's a deliberately-flipped policy, not a fault.
+  if (( run_policy )); then
+    if [[ -z "${TASKS_DB:-}" || ! -f "${TASKS_DB:-}" ]]; then
+      doctor_add policy precedent-autoclear ok "tasks store absent — precedent auto-clear defaults OFF"
+    else
+      local _pac
+      _pac=$(_task_pref_get precedent_autoclear 2>/dev/null); _pac="${_pac:-off}"
+      if [[ "$_pac" == "on" ]]; then
+        doctor_add policy precedent-autoclear warn "precedent auto-clear is ON — resolved tier-1 gates with proven human precedent clear without a ping (5dive task precedent off to disable)"
+      else
+        doctor_add policy precedent-autoclear ok "precedent auto-clear is OFF — every tier-1 gate surfaces to a human"
       fi
     fi
   fi

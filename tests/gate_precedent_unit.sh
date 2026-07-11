@@ -177,6 +177,131 @@ eq_t "fuzzy: option-mismatch skips prefill" "$(field DIVE-1052 recommend)"      
 eq_t "fuzzy: option-mismatch still cites"   "$(field DIVE-1052 precedent_ref)" "$FZ_ID"
 eq_t "fuzzy: option-mismatch kind=fuzzy"    "$(field DIVE-1052 precedent_kind)" "fuzzy"
 
+# ============================ OSS-21 auto-clear ============================
+# Auto-clear is behind the precedent_autoclear pref (default OFF) and keys on
+# EXACT human precedent only. Seed a human precedent at a chosen age (minutes ago)
+# so "most recent qualifying gate" is deterministic; seed_prec_by sets an
+# arbitrary provenance to prove the human-only / no-compounding seed rules.
+seed_human_prec_age() { # <ident> <type> <tier> <shape> <answer> <min-ago>
+  seed_task "$1"
+  db "UPDATE tasks SET need_type='$2', tier=$3, ask_shape=$(sqlq "$4"),
+        need_answer=$(sqlq "$5"), need_answered_at=datetime('now','-$6 minute'),
+        need_answered_by='human:mark', status='todo' WHERE ident='$1';"
+}
+seed_prec_by() { # <ident> <type> <tier> <shape> <answer> <answered_by>
+  seed_task "$1"
+  db "UPDATE tasks SET need_type='$2', tier=$3, ask_shape=$(sqlq "$4"),
+        need_answer=$(sqlq "$5"), need_answered_at=datetime('now'),
+        need_answered_by=$(sqlq "$6"), status='todo' WHERE ident='$1';"
+}
+
+ASK_AC="restart the worker pool on box gamma"
+SHAPE_AC="$(_gate_ask_shape "$ASK_AC")"
+
+# A0: pref OFF (default) — 2 human precedents but the gate still surfaces (v1).
+seed_human_prec_age DIVE-1200 decision 1 "$SHAPE_AC" yes 10
+seed_human_prec_age DIVE-1201 decision 1 "$SHAPE_AC" yes 5
+seed_task DIVE-1202
+cmd_task_need DIVE-1202 --type=decision --ask="$ASK_AC" --options="yes|no" >/dev/null 2>&1
+eq_t "autoclear OFF: gate stays blocked"  "$(field DIVE-1202 status)"           "blocked"
+eq_t "autoclear OFF: not auto-answered"   "$(field DIVE-1202 need_answered_at)" "∅"
+
+# Flip the pref ON for the qualifying cases.
+cmd_task_precedent on >/dev/null 2>&1
+eq_t "pref: precedent on persists" "$(_task_pref_get precedent_autoclear)" "on"
+
+# A1: qualifying — 2 distinct human gates, identical answer => clears at file-time
+# via auto:precedent, precedent_ref = most-recent (DIVE-1201).
+ID_1201="$(db "SELECT id FROM tasks WHERE ident='DIVE-1201';")"
+seed_task DIVE-1203
+cmd_task_need DIVE-1203 --type=decision --ask="$ASK_AC" --options="yes|no" >/dev/null 2>&1
+eq_t "autoclear A1: status flipped to todo"   "$(field DIVE-1203 status)"          "todo"
+eq_t "autoclear A1: answer applied"           "$(field DIVE-1203 need_answer)"     "yes"
+eq_t "autoclear A1: provenance auto:precedent" "$(field DIVE-1203 need_answered_by)" "auto:precedent"
+eq_t "autoclear A1: precedent_ref = newest"   "$(field DIVE-1203 precedent_ref)"   "$ID_1201"
+eq_t "autoclear A1: precedent_kind exact"     "$(field DIVE-1203 precedent_kind)"  "exact"
+
+# A2: contradiction — two human gates with DIFFERENT answers => never auto-clears.
+ASK_CON="compact the analytics table nightly"; SHAPE_CON="$(_gate_ask_shape "$ASK_CON")"
+seed_human_prec_age DIVE-1210 decision 1 "$SHAPE_CON" yes 10
+seed_human_prec_age DIVE-1211 decision 1 "$SHAPE_CON" no  5
+seed_task DIVE-1212
+cmd_task_need DIVE-1212 --type=decision --ask="$ASK_CON" --options="yes|no" >/dev/null 2>&1
+eq_t "autoclear A2: contradiction blocks"     "$(field DIVE-1212 status)"           "blocked"
+eq_t "autoclear A2: contradiction unanswered" "$(field DIVE-1212 need_answered_at)" "∅"
+
+# A3: agent-answered seeds never qualify (human-only), even if unanimous.
+ASK_AG="rebuild the search index"; SHAPE_AG="$(_gate_ask_shape "$ASK_AG")"
+seed_prec_by DIVE-1220 decision 1 "$SHAPE_AG" yes "agent:dev"
+seed_prec_by DIVE-1221 decision 1 "$SHAPE_AG" yes "agent:dev"
+seed_task DIVE-1222
+cmd_task_need DIVE-1222 --type=decision --ask="$ASK_AG" --options="yes|no" >/dev/null 2>&1
+eq_t "autoclear A3: agent seed blocks"        "$(field DIVE-1222 status)"           "blocked"
+eq_t "autoclear A3: agent seed unanswered"    "$(field DIVE-1222 need_answered_at)" "∅"
+
+# A4: auto-answered seeds never qualify (no compounding).
+ASK_AU="prune expired cache entries"; SHAPE_AU="$(_gate_ask_shape "$ASK_AU")"
+seed_prec_by DIVE-1230 decision 1 "$SHAPE_AU" yes "auto:ttl"
+seed_prec_by DIVE-1231 decision 1 "$SHAPE_AU" yes "auto:precedent"
+seed_task DIVE-1232
+cmd_task_need DIVE-1232 --type=decision --ask="$ASK_AU" --options="yes|no" >/dev/null 2>&1
+eq_t "autoclear A4: auto seed blocks"         "$(field DIVE-1232 status)"           "blocked"
+eq_t "autoclear A4: auto seed unanswered"     "$(field DIVE-1232 need_answered_at)" "∅"
+
+# A5: T2 never auto-clears — an approval gate defaults tier 2, ineligible.
+ASK_T2="approve the migration runbook"; SHAPE_T2="$(_gate_ask_shape "$ASK_T2")"
+seed_prec_by DIVE-1240 approval 2 "$SHAPE_T2" approved "human:mark"
+seed_prec_by DIVE-1241 approval 2 "$SHAPE_T2" approved "human:mark"
+seed_task DIVE-1242
+cmd_task_need DIVE-1242 --type=approval --ask="$ASK_T2" >/dev/null 2>&1
+eq_t "autoclear A5: T2 tier unchanged"        "$(field DIVE-1242 tier)"             "2"
+eq_t "autoclear A5: T2 stays blocked"         "$(field DIVE-1242 status)"           "blocked"
+eq_t "autoclear A5: T2 unanswered"            "$(field DIVE-1242 need_answered_at)" "∅"
+
+# A6: secret never auto-clears (excluded by guard AND floored to T2).
+ASK_SEC="load the staging deploy key"; SHAPE_SEC="$(_gate_ask_shape "$ASK_SEC")"
+seed_prec_by DIVE-1250 secret 1 "$SHAPE_SEC" done "human:mark"
+seed_prec_by DIVE-1251 secret 1 "$SHAPE_SEC" done "human:mark"
+seed_task DIVE-1252
+cmd_task_need DIVE-1252 --type=secret --ask="$ASK_SEC" >/dev/null 2>&1
+eq_t "autoclear A6: secret stays blocked"     "$(field DIVE-1252 status)"           "blocked"
+eq_t "autoclear A6: secret unanswered"        "$(field DIVE-1252 need_answered_at)" "∅"
+
+# A7: decision consensus that isn't a current option => falls through to human.
+ASK_OPT="cordon the flaky node"; SHAPE_OPT="$(_gate_ask_shape "$ASK_OPT")"
+seed_human_prec_age DIVE-1260 decision 1 "$SHAPE_OPT" yes 10
+seed_human_prec_age DIVE-1261 decision 1 "$SHAPE_OPT" yes 5
+seed_task DIVE-1262
+cmd_task_need DIVE-1262 --type=decision --ask="$ASK_OPT" --options="approve|reject" >/dev/null 2>&1
+eq_t "autoclear A7: off-menu answer blocks"   "$(field DIVE-1262 status)"           "blocked"
+eq_t "autoclear A7: off-menu unanswered"      "$(field DIVE-1262 need_answered_at)" "∅"
+
+# A9: fuzzy-prefilled human answers never seed auto-clear (OSS-21: main's exact-only
+# rule). Two human-answered gates on the exact shape, but each was itself prefilled
+# via the OSS-20 fuzzy fallback (precedent_kind='fuzzy'). They'd otherwise qualify —
+# the fuzzy filter must keep the new gate blocked so fuzzy can't leak into auto-clear.
+seed_fuzzy_human() { # <ident> <type> <tier> <shape> <answer> <min-ago>
+  seed_task "$1"
+  db "UPDATE tasks SET need_type='$2', tier=$3, ask_shape=$(sqlq "$4"),
+        need_answer=$(sqlq "$5"), need_answered_at=datetime('now','-$6 minute'),
+        need_answered_by='human:mark', precedent_kind='fuzzy', status='todo' WHERE ident='$1';"
+}
+ASK_FZ="drain the standby replica"; SHAPE_FZ="$(_gate_ask_shape "$ASK_FZ")"
+seed_fuzzy_human DIVE-1270 decision 1 "$SHAPE_FZ" yes 10
+seed_fuzzy_human DIVE-1271 decision 1 "$SHAPE_FZ" yes 5
+seed_task DIVE-1272
+cmd_task_need DIVE-1272 --type=decision --ask="$ASK_FZ" --options="yes|no" >/dev/null 2>&1
+eq_t "autoclear A9: fuzzy seed blocks"       "$(field DIVE-1272 status)"           "blocked"
+eq_t "autoclear A9: fuzzy seed unanswered"   "$(field DIVE-1272 need_answered_at)" "∅"
+
+# A8: pref OFF again restores exact v1 behaviour on a would-qualify gate.
+cmd_task_precedent off >/dev/null 2>&1
+eq_t "pref: precedent off persists" "$(_task_pref_get precedent_autoclear)" "off"
+seed_task DIVE-1263
+cmd_task_need DIVE-1263 --type=decision --ask="$ASK_AC" --options="yes|no" >/dev/null 2>&1
+eq_t "autoclear A8: OFF re-blocks qualifier"  "$(field DIVE-1263 status)"           "blocked"
+eq_t "autoclear A8: OFF unanswered"           "$(field DIVE-1263 need_answered_at)" "∅"
+
 echo "-------------------------------------"
 echo "gate_precedent_unit: ${PASS} passed, ${FAIL} failed"
 [[ "$FAIL" -eq 0 ]]
