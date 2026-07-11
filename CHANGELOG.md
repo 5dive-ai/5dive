@@ -18,6 +18,23 @@ release.
   exists for an empty sample). Unit tests + methodology doc updated.
 
 ### Added
+- **ID/age-verification tripwire in the fleet supervisor (DIVE-1127, ToS-hedge A2).**
+  Per the Jul-11 hedge memo (D4 trigger 1), `5dive supervisor --tick` now flags
+  any `claude` session whose live tmux pane shows an ID/age-verification
+  challenge and alerts `main` + `lodar` SAME-DAY, tagging the account, so the
+  response (flip that account to the OpenRouter-Claude profile, A1 runbook) can
+  run same-day. Detection is PANE-scoped by design, not the JSONL transcript,
+  so an agent merely discussing verification (e.g. this task's own chatter)
+  never self-trips; the signature is anchored to a challenge directed at the
+  user ("verify your identity/age", "government-issued ID"), env-overridable via
+  `SUPERVISOR_VERIFY_PAT`. New classification `verify-challenge` (wins first —
+  it explains any concurrent stall and is not a wedge the P2 nudge/resume/rotate
+  ladder can clear, so it gets a dedicated alert path). Alerts dedup one per
+  account per `SUPERVISOR_ALERT_WINDOW_H` (24h) and are audited as
+  `supervisor_events` `event='alert'`. Unit-tested in
+  `tests/verify_tripwire_unit.sh` (signature true/false positives incl. the task
+  title trap, env override, dedup window). Live cron wiring + real-signature
+  validation + main/lodar delivery are main's verify-time last-mile.
 - **`5dive proof` — publish your own zero-human badge (OSS-17, gh 5dive#21).**
   Generalizes the internal `scripts/publish-zero-human.sh` into a first-class
   verb so any self-hosted box publishes its own proof to its own repo's status

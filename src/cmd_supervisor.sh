@@ -68,6 +68,32 @@ _SUP_ACT_BASE_MIN="${SUPERVISOR_ACT_BASE_MIN:-20}"
 _SUP_ACT_WINDOW_H=6
 _SUP_ACT_MAX_ATTEMPTS=3
 
+# DIVE-1127 (ToS-hedge A2): ID/age-verification tripwire. Per the Jul-11 hedge
+# memo (anthropic-tos-hedge-decision-jul11, D4 trigger 1), the biometric/ID lever
+# in Anthropic's Jul-8 privacy policy is the plausible enforcement path against
+# headless BYO. This watcher flags any claude session whose live tmux PANE shows
+# an ID/age-verification challenge and alerts main + lodar SAME-DAY, tagging the
+# account — the same-day flip to the OpenRouter-Claude profile (A1 runbook) is the
+# response. Pane-scoped ON PURPOSE (not the JSONL transcript): the challenge is a
+# harness/login interstitial rendered on the current screen, and scanning
+# transcripts would self-trigger on any agent merely DISCUSSING verification
+# (e.g. this very task's chatter). claude-only — the lever is consumer-auth.
+_SUP_VERIFY_PANE_LINES="${SUPERVISOR_VERIFY_PANE_LINES:-40}"
+[[ "$_SUP_VERIFY_PANE_LINES" =~ ^[0-9]+$ ]] || _SUP_VERIFY_PANE_LINES=40
+# Alerts are deduped one-per-account per this window (same-day intent) so a
+# challenge that persists across ticks pings main+lodar once, not every 10m.
+_SUP_ALERT_WINDOW_H="${SUPERVISOR_ALERT_WINDOW_H:-24}"
+[[ "$_SUP_ALERT_WINDOW_H" =~ ^[0-9]+$ ]] || _SUP_ALERT_WINDOW_H=24
+# Anchored, second-person/imperative signature — a bare noun phrase like
+# "age-verification" (which appears in THIS task's own title) must NOT match; a
+# challenge DIRECTED at the user ("verify your identity", "confirm your age",
+# "government-issued ID") must. Env-overridable so a new challenge phrasing can
+# be tuned per box without a release (the _SUP_* env-escape-hatch pattern). NB:
+# the default is a plain single-quoted assignment, NOT a ${:-} default — the
+# `{0,30}` interval's brace would otherwise close the parameter expansion early.
+_SUP_VERIFY_PAT="${SUPERVISOR_VERIFY_PAT:-}"
+[[ -n "$_SUP_VERIFY_PAT" ]] || _SUP_VERIFY_PAT='(verify|confirm)[[:space:]]+(your[[:space:]]+)?(identity|age)|please[[:space:]]+verify[[:space:]]+your|(to[[:space:]]+continue|you[[:space:]]+must)[^.]{0,30}verif|government[- ]?issued[[:space:]]+(photo[[:space:]]+)?id|verify[[:space:]]+that[[:space:]]+you[[:space:]]+are[[:space:]]+(over|at[[:space:]]+least)|age[[:space:]-]*restricted'
+
 # DIVE-971: per-type telegram-bridge pgrep pattern (matched against the agent
 # user's process argv, -f). claude's forked plugin argv carries the cache path
 # …/5dive-plugins/telegram/<ver>; codex/grok/antigravity run the telegram-<x>
@@ -107,6 +133,43 @@ _sup_activity_epoch() {  # <type> <home>
   # shellcheck disable=SC2086
   { find "$home/$root" -type f $fargs -printf '%T@\n' 2>/dev/null || true; } \
     | sort -rn | head -1 | cut -d. -f1
+}
+
+# DIVE-1127: pure signature match, no I/O — echoes the first pane line that looks
+# like an ID/age-verification challenge (trimmed), empty otherwise. Split out from
+# _sup_verify_challenge so the false-positive-critical regex is unit-testable
+# without a live tmux (mirrors how _sup_act_plan is the pure, tested core).
+_sup_verify_match() {  # <pane-text-on-stdin>
+  grep -iE "$_SUP_VERIFY_PAT" 2>/dev/null | head -1 \
+    | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//' | cut -c1-160
+}
+
+# DIVE-1127: does this agent's live pane show a verification challenge? claude-only
+# and root-only (the sudo tmux hop) — any other runtime, no root, or a down service
+# returns empty (false-negative bias, like every other signal here). Echoes the
+# matched pane excerpt when tripped.
+_sup_verify_challenge() {  # <type> <user> <sess> <svc_running>
+  local type="$1" user="$2" sess="$3" svc_running="$4"
+  [[ "$type" == "claude" ]] || return 0
+  (( svc_running )) && [[ $EUID -eq 0 ]] || return 0
+  local pane
+  pane=$(sudo -n -u "$user" tmux capture-pane -p -t "$sess" -S "-${_SUP_VERIFY_PANE_LINES}" 2>/dev/null) || return 0
+  [[ -n "$pane" ]] || return 0
+  printf '%s\n' "$pane" | _sup_verify_match
+}
+
+# DIVE-1127: fire the same-day alert for a tripped account. Both legs are
+# best-effort — a delivery failure must NEVER abort the tick (one wedged account
+# can't blind the watcher for the rest of the fleet). main (CTO, D4 runbook
+# co-owner) gets the agent-to-agent send; lodar (human owner) gets a pinging
+# gate. Dedup is the caller's job (one alert per account per _SUP_ALERT_WINDOW_H).
+_sup_verify_alert() {  # <name> <excerpt>
+  local name="$1" excerpt="$2"
+  local msg="[TRIPWIRE id-verification] claude account 'agent-${name}' looks STALLED on an ID/age-verification challenge (anthropic-tos-hedge D4 trigger 1). Response: flip this account to the OpenRouter-Claude profile same-day (A1 runbook). Pane signature: ${excerpt}"
+  5dive agent send main "$msg" >/dev/null 2>&1 \
+    || warn "verify-tripwire: 'agent send main' failed for $name (alert still audited)"
+  # lodar is a human, not an agent — reach them with a pinging task gate. Best-effort.
+  5dive agent send lodar "$msg" >/dev/null 2>&1 || true
 }
 
 # Goal-drift (DIVE-971): claude-only, transcript-scoped, STRUCTURAL — no
@@ -309,6 +372,9 @@ _sup_agent_record() {
   # progresses elsewhere. Observe-only — never feeds the P2 act ladder.
   local goal_drift_task; goal_drift_task=$(_sup_goal_drift "$type" "$home" "$name" "$now" "$act_epoch")
 
+  # --- signal: ID/age-verification challenge (DIVE-1127) — pane-scoped tripwire ---
+  local verify_excerpt; verify_excerpt=$(_sup_verify_challenge "$type" "$user" "$sess" "$svc_running")
+
   # --- CLASSIFY (design §4) — first matching rule wins, dead-signals first.
   # Every "stuck" here is a DEFINITE reading; anything unknown/ambiguous falls
   # through toward healthy. An intentionally-stopped agent (unit inactive, not
@@ -316,10 +382,16 @@ _sup_agent_record() {
   # `5dive agent stop` is an operator choice, and the registry has no
   # desired-state field to tell us otherwise.
   local class="healthy" cause="" detail=""
+  # DIVE-1127: the verification-challenge tripwire wins FIRST — it is the highest
+  # priority signal (same-day alert obligation) and, when present, explains any
+  # concurrent stall (a challenge freezes the session). Alerting is the tick's job.
+  if [[ -n "$verify_excerpt" ]]; then
+    class="verify-challenge"; cause="id-verification"
+    detail="pane shows an ID/age-verification challenge"
   # desiredState (P2, DIVE-857 prereq b): an operator's explicit stop/start
   # beats inference. Recorded by `5dive agent stop|start`; absent on legacy
   # agents => the P1 inference path below, unchanged.
-  if [[ "$desired" == "stopped" ]] && (( ! svc_running )) && [[ "$active" != "failed" ]]; then
+  elif [[ "$desired" == "stopped" ]] && (( ! svc_running )) && [[ "$active" != "failed" ]]; then
     detail="stopped (desired)"
   elif (( ! svc_running )); then
     if [[ "$active" == "failed" ]] || (( has_work )) || [[ "$desired" == "running" ]]; then
@@ -365,12 +437,14 @@ _sup_agent_record() {
     --argjson loopStuck "$loop_stuck" --argjson runningLoops "$running_loops" \
     --argjson inProgress "$inprog" --argjson age "$act_age" --argjson uptime "$uptime" \
     --arg goalDrift "$goal_drift_task" \
+    --arg verifyExcerpt "$verify_excerpt" \
     --arg class "$class" --arg cause "$cause" --arg detail "$detail" \
     '{name:$name, type:$type, channels:$channels, unit:$unit,
       signals:{service:$service, sub:$sub, uptimeSec:$uptime, tmux:$tmux, poller:$poller,
                loopStuck:$loopStuck, runningLoops:$runningLoops, inProgress:$inProgress,
                lastActivityAgeSec:(if $age < 0 then null else $age end),
-               goalDriftTask:(if $goalDrift == "" then null else ($goalDrift|tonumber) end)},
+               goalDriftTask:(if $goalDrift == "" then null else ($goalDrift|tonumber) end),
+               verifyChallenge:(if $verifyExcerpt == "" then null else $verifyExcerpt end)},
       classification:$class,
       cause:(if $cause == "" then null else $cause end),
       detail:$detail}'
@@ -435,6 +509,8 @@ _sup_summary_line() {
     "\([.[] | select(.classification == "drift")]          | length) drift / " +
     "\([.[] | select(.classification == "update-pending")] | length) update-pending / " +
     "\([.[] | select(.classification == "stuck")]          | length) stuck" +
+    (if ([.[] | select(.classification == "verify-challenge")] | length) > 0
+     then " · ⚠ \([.[] | select(.classification == "verify-challenge")] | length) VERIFY-CHALLENGE" else "" end) +
     (if $stale == "true" then " · CLI \($cur) STALE (latest \($lat))"
      elif $stale == "unknown" then " · CLI staleness unknown (probe unavailable)"
      else " · CLI \($cur) ok" end)' <<<"$snap"
@@ -571,6 +647,31 @@ cmd_supervisor_tick() {
     fi
   done < <(jq -c '.[]' <<<"$snap")
 
+  # ── DIVE-1127: ID/age-verification tripwire — SAME-DAY alert (not the P2 ladder).
+  # A verification challenge is not "wedged compute" you nudge/resume/rotate out of;
+  # it is an account-state event whose only response is a human/runbook flip. So it
+  # gets its own alert path, always live when the tick is enabled (no actions flag),
+  # deduped one alert per account per _SUP_ALERT_WINDOW_H, and audited as event='alert'.
+  local alerted=0
+  while IFS= read -r row; do
+    [[ -n "$row" ]] || continue
+    [[ "$(jq -r '.classification' <<<"$row")" == "verify-challenge" ]] || continue
+    name=$(jq -r '.name' <<<"$row")
+    local excerpt; excerpt=$(jq -r '.signals.verifyChallenge // ""' <<<"$row")
+    local prev_alert
+    prev_alert=$(db "SELECT COUNT(*) FROM supervisor_events
+                     WHERE agent=$(sqlq "$name") AND event='alert'
+                       AND ts >= datetime('now', '-${_SUP_ALERT_WINDOW_H} hours');" 2>/dev/null || echo 0)
+    [[ "$prev_alert" =~ ^[0-9]+$ ]] || prev_alert=0
+    (( prev_alert > 0 )) && continue
+    _sup_verify_alert "$name" "$excerpt"
+    db "INSERT INTO supervisor_events (agent, event, classification, cause, signals)
+        VALUES ($(sqlq "$name"), 'alert', 'verify-challenge', 'id-verification', $(sqlq "$row"));" 2>/dev/null \
+      && { alerted=$((alerted + 1)); events=$((events + 1)); } \
+      || warn "supervisor: verify-challenge alert insert failed for $name"
+    warn "supervisor: ALERT $name — ID/age-verification challenge; main+lodar pinged (D4 trigger 1)"
+  done < <(jq -c '.[]' <<<"$snap")
+
   # ── P2 (DIVE-857): ACT + ESCALATE — pre-cleared by lodar 2026-07-02, gated on
   # $_SUP_ACTIONS_FLAG until the audit week (started 2026-07-02) is clean.
   # Dormant mode writes 'planned' rows: the Jul 9 review reads exactly what the
@@ -631,12 +732,13 @@ cmd_supervisor_tick() {
     esac
   done < <(jq -c '.[]' <<<"$snap")
 
-  local total healthy slow stuck drift
+  local total healthy slow stuck drift vchal
   total=$(jq 'length' <<<"$snap")
   healthy=$(jq '[.[] | select(.classification == "healthy")] | length' <<<"$snap")
   slow=$(jq  '[.[] | select(.classification == "slow")]    | length' <<<"$snap")
   stuck=$(jq '[.[] | select(.classification == "stuck")]   | length' <<<"$snap")
   drift=$(jq '[.[] | select(.classification == "drift")]   | length' <<<"$snap")
+  vchal=$(jq '[.[] | select(.classification == "verify-challenge")] | length' <<<"$snap")
 
   # DIVE-975: one 'heartbeat' row per tick — the observation DENOMINATOR. The
   # transition/observe rows above are sporadic by nature (a clean fleet writes
@@ -645,7 +747,7 @@ cmd_supervisor_tick() {
   # row makes the table grow on every cron tick and records the fleet snapshot;
   # reviewers filter it out by event='heartbeat'. agent='(fleet)' is a sentinel.
   local fleet_class="healthy"
-  (( slow + stuck > 0 )) && fleet_class="degraded"
+  (( slow + stuck + vchal > 0 )) && fleet_class="degraded"
   db "INSERT INTO supervisor_events (agent, event, classification, signals)
       VALUES ('(fleet)', 'heartbeat', $(sqlq "$fleet_class"),
               $(sqlq "{\"total\":${total},\"healthy\":${healthy},\"slow\":${slow},\"drift\":${drift},\"stuck\":${stuck},\"anomalyRows\":${events}}"));" \
@@ -655,9 +757,12 @@ cmd_supervisor_tick() {
   if [[ "$actions_on" == "true" ]]; then act_note=" · actions ON: ${acted} acted / ${escalated} escalated"
   elif (( planned + escalated > 0 )); then act_note=" · dormant: ${planned} planned / ${escalated} escalated"
   fi
-  ok "supervisor tick: ${total} agents — ${healthy} healthy / ${slow} slow / ${drift} drift / ${stuck} stuck · ${events} audit row(s)${act_note}" \
-     '{enabled:true, agents:($t|tonumber), healthy:($h|tonumber), slow:($sl|tonumber), drift:($dr|tonumber), stuck:($st|tonumber), auditRows:($e|tonumber), actionsEnabled:($ae == "true"), acted:($ac|tonumber), planned:($pl|tonumber), escalated:($es|tonumber)}' \
+  local vchal_note=""
+  (( vchal > 0 )) && vchal_note=" · ⚠ ${vchal} verify-challenge (${alerted} alerted)"
+  ok "supervisor tick: ${total} agents — ${healthy} healthy / ${slow} slow / ${drift} drift / ${stuck} stuck · ${events} audit row(s)${act_note}${vchal_note}" \
+     '{enabled:true, agents:($t|tonumber), healthy:($h|tonumber), slow:($sl|tonumber), drift:($dr|tonumber), stuck:($st|tonumber), verifyChallenge:($vc|tonumber), alerted:($al|tonumber), auditRows:($e|tonumber), actionsEnabled:($ae == "true"), acted:($ac|tonumber), planned:($pl|tonumber), escalated:($es|tonumber)}' \
      --arg t "$total" --arg h "$healthy" --arg sl "$slow" --arg dr "$drift" --arg st "$stuck" --arg e "$events" \
+     --arg vc "$vchal" --arg al "$alerted" \
      --arg ae "$actions_on" --arg ac "$acted" --arg pl "$planned" --arg es "$escalated"
 }
 
