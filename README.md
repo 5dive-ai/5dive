@@ -105,19 +105,20 @@ No broker, no protocol, no orchestrator. Shared filesystem, shared CLI.
 The `claude` type can also run the official Claude Code harness against a third-party Anthropic-compatible endpoint, bring your own key:
 
 ```sh
-sudo 5dive agent create cheap-coder --type=claude --provider=deepseek --api-key=<key>
+sudo 5dive agent create cheap-coder --type=claude --provider=deepseek --api-key=<key> --auth-profile=deepseek
 # providers: openrouter (any model), deepseek (DeepSeek), moonshot (Kimi), zai (GLM)
+# claude BYO requires --auth-profile=<name> (the account the key is saved under; reuse it to share the key across agents)
 
 # Pick the model too. --model overrides the primary tiers with any slug the
 # provider serves (OpenRouter translates every family); the background model
 # stays on the provider's cheap default. Omit it to use the per-provider default.
-sudo 5dive agent create glm-coder --type=claude --provider=openrouter --api-key=<key> --model=z-ai/glm-4.6
+sudo 5dive agent create glm-coder --type=claude --provider=openrouter --api-key=<key> --auth-profile=openrouter --model=z-ai/glm-5.2
 ```
 
 Switch the model on a running agent (persists across restarts):
 
 ```sh
-sudo 5dive agent config set glm-coder model=z-ai/glm-4.6
+sudo 5dive agent config glm-coder set model=z-ai/glm-5.2
 ```
 
 In-session, Claude Code's built-in `/model <slug>` also accepts any custom slug live (session-scoped).
