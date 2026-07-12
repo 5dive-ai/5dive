@@ -32,6 +32,8 @@ release.
   invariant), so `--public` is stored for a later proof-feed passthrough. Covered
   by a new `objective_unit` (13/13).
 
+## [0.8.12] — 2026-07-12
+
 ### Changed
 - **Loop token `--ceiling` is now a hard stop, not advisory (OSS-24, gh
   5dive#17).** Driver loops (`loop map`/`until-dry`/`verify`/`grade`) already
@@ -47,6 +49,10 @@ release.
   Unblocks OSS-18 L2 budget widening (a budget that cannot halt must not be
   widened). Covered by an extended `loop_ceiling_enforce_unit` (now asserts the
   child task is parked on breach).
+
+## [0.8.11] — 2026-07-12
+
+### Changed
 - **Supervisor self-heal now covers every runtime (OSS-23, gh 5dive#16).** The
   P2 recovery ladder (nudge → resume → rotate) no longer hard-escalates
   non-`claude` agents: `codex`, `grok`, `opencode`, and `antigravity` get the
@@ -62,12 +68,8 @@ release.
   `tests/supervisor_unit.sh` extended to codex/grok/opencode/antigravity.
   Live-fleet validation of each runtime's actual resume behavior is main's
   verify-time last-mile.
-- **zero-human badge message is percent-only.** `proof publish` now renders
-  `89.9%` instead of `89.9% (99)` — the shipped-count parenthetical read as
-  noise on the badge (lodar call, 2026-07-12). The sample size still ships in
-  `zero-human.json` (`week.shipped`) and `docs/zero-human.md` says where to
-  look. Zero-ship weeks still render `0 shipped, N asks` (no honest bare `%`
-  exists for an empty sample). Unit tests + methodology doc updated.
+
+## [0.8.10] — 2026-07-12
 
 ### Added
 - **ID/age-verification tripwire in the fleet supervisor (DIVE-1127, ToS-hedge A2).**
@@ -89,6 +91,20 @@ release.
   main's paired Telegram channel (`_task_agent_channel main` +
   `_task_send_owner`), best-effort. Live root `--tick` cron wiring +
   real-signature validation remain main's verify-time last-mile.
+
+## [0.8.9] — 2026-07-12
+
+### Changed
+- **zero-human badge message is percent-only.** `proof publish` now renders
+  `89.9%` instead of `89.9% (99)` — the shipped-count parenthetical read as
+  noise on the badge (lodar call, 2026-07-12). The sample size still ships in
+  `zero-human.json` (`week.shipped`) and `docs/zero-human.md` says where to
+  look. Zero-ship weeks still render `0 shipped, N asks` (no honest bare `%`
+  exists for an empty sample). Unit tests + methodology doc updated.
+
+## [0.8.8] — 2026-07-11
+
+### Added
 - **`5dive proof` — publish your own zero-human badge (OSS-17, gh 5dive#21).**
   Generalizes the internal `scripts/publish-zero-human.sh` into a first-class
   verb so any self-hosted box publishes its own proof to its own repo's status
@@ -106,6 +122,8 @@ release.
   ambient git credentials — the verb never stores tokens. Unit-tested in
   `tests/proof_publish_unit.sh`. Our own box's cron migration is held for
   verify-time with main (DIVE-1115 pause).
+
+## [0.8.7] — 2026-07-11
 
 ### Fixed
 - **Tier-2 gates now refuse a non-human answer regardless of need_type
@@ -128,6 +146,8 @@ release.
   phrasing-sensitive T2 heuristic should key on structured category, not ask-text
   keywords.
 
+## [0.8.6] — 2026-07-11
+
 ### Added
 - **Tier-1 gates auto-clear from proven human precedent (OSS-21).** Behind a new
   fleet pref `5dive task precedent on|off` (default **OFF**). When ON, at gate
@@ -145,6 +165,10 @@ release.
   consensus answer isn't a current option falls through to the human. `5dive
   doctor` gains a `policy` check that flags when the switch is ON. Default OFF
   everywhere pending the OSS-16 policy decision.
+
+## [0.8.5] — 2026-07-11
+
+### Added
 - **Fuzzy precedent prefill for repeat human gates (OSS-20).** Hand-written gate
   asks almost never collide EXACTLY, so the exact-shape precedent match prefilled
   ~0 gates in practice. `task need` now falls back to a token-set Jaccard >= 0.8
@@ -159,6 +183,10 @@ release.
 - **`5dive fire` — synonym for removing an agent.** `5dive fire <name>` and
   `5dive agent fire <name>` are aliases for `5dive agent rm <name>` (fire an
   agent from the team). Same guarded teardown path; purely additive.
+
+## [0.8.3] — 2026-07-10
+
+### Added
 - **Custom providers in the `5dive init` wizard for Claude.** The claude auth
   step now offers a third option — "Custom provider" — to run Claude Code
   against a BYO Anthropic-compatible endpoint (OpenRouter, z.ai, DeepSeek,
@@ -166,6 +194,8 @@ release.
   the provider + API key and wires `--provider`/`--auth-profile` at create
   time, so a BYO-provider Claude agent no longer needs hand-crafted
   `agent create` flags.
+
+## [0.8.2] — 2026-07-10
 
 ### Fixed
 - **Listener-only fixes now self-deploy on update (DIVE-1095).** The shared
@@ -177,6 +207,19 @@ release.
   from the current bundle and restarts the service (guarded on the unit file →
   no-op where there is no shared team-bot); `self-update` and the nightly
   `5dive-host-updates.sh` both call it after installing the fresh binary.
+
+## [0.8.1] — 2026-07-10
+
+### Added
+- **`agent create --model=<slug>` picks the model on BYO claude providers
+  (DIVE-1103).** Overrides the primary (opus+sonnet) tiers with any slug the
+  provider serves — OpenRouter translates every family (`openai/*`, `google/*`,
+  `z-ai/*`, `deepseek/*`, `meta-llama/*`) in Anthropic wire format, and the
+  Chinese providers serve their own. The background/fast HAIKU slot stays on the
+  catalogue's caching-capable default so background turns stay cheap. Complements
+  the already-shipped `agent config set model=<slug>` (switch a running agent,
+  persists to `settings.json`) and Claude Code's built-in in-session
+  `/model <slug>`; the README documents all three.
 
 ## [0.8.0] - 2026-07-10
 
