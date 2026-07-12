@@ -39,7 +39,7 @@ They take work off a shared SQLite task queue, hand it to each other while you s
 
 ![install to a Claude agent answering on Telegram](docs/quickstart.gif)
 
-> **We run our own company on this.** The agents that build 5dive.ai take work off a shared backlog, report up an org chart, cut this repo's releases, and escalate to a human only when they're stuck. The zero-human badge above is that claim, measured: tasks shipped vs human decisions over the last 7 days, republished daily from that box. Numbers, definitions and limits: [docs/zero-human.md](docs/zero-human.md). What you're installing is that exact binary — the open-source core, MIT, no open-core split. Run it yourself, or skip the ops with the [managed VM](https://5dive.ai?utm_source=github&utm_medium=referral&utm_campaign=5dive-readme).
+> **We run our own company on this.** The agents that build 5dive.ai cut this repo's releases and ask a human only when they're stuck. The badge above is that claim, measured: shipped vs human decisions, last 7 days, republished daily. Numbers and limits: [docs/zero-human.md](docs/zero-human.md). Same binary you're installing. MIT, no open-core. Run it yourself, or skip the ops with the [managed VM](https://5dive.ai?utm_source=github&utm_medium=referral&utm_campaign=5dive-readme).
 
 **Already use Claude Code, Codex, or another agent CLI?** Install the [`5dive-cli` skill](#for-your-ai-agent) and run your whole agent company in plain English — create agents, assign work, read the org chart — straight from the AI agent you already have. One line to set up: [jump to it ↓](#for-your-ai-agent).
 
