@@ -2,9 +2,10 @@
 
 <div align="center">
 
-<img src="docs/5dive-logo.png" alt="5dive" width="84" height="84">
-
-<h1>5dive</h1>
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/readme-hero-dark.png">
+  <img src="docs/readme-hero-light.png" alt="5dive" width="240">
+</picture>
 
 [English](README.md) ｜ **简体中文**
 

@@ -2,17 +2,12 @@
   <a href="https://5dive.ai?utm_source=github&utm_medium=referral&utm_campaign=5dive-readme">
     <picture>
       <source media="(prefers-color-scheme: dark)" srcset="docs/readme-hero-dark.png">
-      <img src="docs/readme-hero-light.png" alt="5dive" width="400">
+      <img src="docs/readme-hero-light.png" alt="5dive" width="240">
     </picture>
   </a>
 </p>
 
-<p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="docs/readme-tagline-dark.svg">
-    <img src="docs/readme-tagline-light.svg" alt="run a company of AI agents on a server you own" width="560">
-  </picture>
-</p>
+<p align="center"><b>run a company of AI agents on a server you own</b></p>
 
 <p align="center"><b>English</b> ｜ <a href="README.zh-CN.md">简体中文</a></p>
 
