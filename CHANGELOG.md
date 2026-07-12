@@ -9,6 +9,8 @@ release.
 
 ## [Unreleased]
 
+## [0.8.10] - 2026-07-12
+
 ### Changed
 - **zero-human badge message is percent-only.** `proof publish` now renders
   `89.9%` instead of `89.9% (99)` — the shipped-count parenthetical read as
@@ -33,8 +35,10 @@ release.
   account per `SUPERVISOR_ALERT_WINDOW_H` (24h) and are audited as
   `supervisor_events` `event='alert'`. Unit-tested in
   `tests/verify_tripwire_unit.sh` (signature true/false positives incl. the task
-  title trap, env override, dedup window). Live cron wiring + real-signature
-  validation + main/lodar delivery are main's verify-time last-mile.
+  title trap, env override, dedup window). The `lodar` leg DMs the human through
+  main's paired Telegram channel (`_task_agent_channel main` +
+  `_task_send_owner`), best-effort. Live root `--tick` cron wiring +
+  real-signature validation remain main's verify-time last-mile.
 - **`5dive proof` — publish your own zero-human badge (OSS-17, gh 5dive#21).**
   Generalizes the internal `scripts/publish-zero-human.sh` into a first-class
   verb so any self-hosted box publishes its own proof to its own repo's status

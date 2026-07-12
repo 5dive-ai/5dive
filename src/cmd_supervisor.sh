@@ -91,6 +91,10 @@ _SUP_ALERT_WINDOW_H="${SUPERVISOR_ALERT_WINDOW_H:-24}"
 # be tuned per box without a release (the _SUP_* env-escape-hatch pattern). NB:
 # the default is a plain single-quoted assignment, NOT a ${:-} default — the
 # `{0,30}` interval's brace would otherwise close the parameter expansion early.
+# NB: this default is an UNVERIFIED best-guess — we have never seen a real
+# Anthropic ID/age-verification challenge, so the phrasing is inferred. We ship
+# alert-only and tune this (or override via SUPERVISOR_VERIFY_PAT) on the first
+# real signature (DIVE-1127 verify-time last-mile).
 _SUP_VERIFY_PAT="${SUPERVISOR_VERIFY_PAT:-}"
 [[ -n "$_SUP_VERIFY_PAT" ]] || _SUP_VERIFY_PAT='(verify|confirm)[[:space:]]+(your[[:space:]]+)?(identity|age)|please[[:space:]]+verify[[:space:]]+your|(to[[:space:]]+continue|you[[:space:]]+must)[^.]{0,30}verif|government[- ]?issued[[:space:]]+(photo[[:space:]]+)?id|verify[[:space:]]+that[[:space:]]+you[[:space:]]+are[[:space:]]+(over|at[[:space:]]+least)|age[[:space:]-]*restricted'
 
@@ -168,8 +172,14 @@ _sup_verify_alert() {  # <name> <excerpt>
   local msg="[TRIPWIRE id-verification] claude account 'agent-${name}' looks STALLED on an ID/age-verification challenge (anthropic-tos-hedge D4 trigger 1). Response: flip this account to the OpenRouter-Claude profile same-day (A1 runbook). Pane signature: ${excerpt}"
   5dive agent send main "$msg" >/dev/null 2>&1 \
     || warn "verify-tripwire: 'agent send main' failed for $name (alert still audited)"
-  # lodar is a human, not an agent — reach them with a pinging task gate. Best-effort.
-  5dive agent send lodar "$msg" >/dev/null 2>&1 || true
+  # lodar is a human, not an agent — reach them through main's paired Telegram
+  # channel (main is the human-facing bot). Resolve main's channel, then DM the
+  # owner on it. Best-effort: a miss is fine — main's agent-send leg above and
+  # the audited alert row still carry the signal. (DIVE-1127 last-mile, routing
+  # decided by main.)
+  if _task_agent_channel main; then
+    _task_send_owner "$msg" >/dev/null 2>&1 || true
+  fi
 }
 
 # Goal-drift (DIVE-971): claude-only, transcript-scoped, STRUCTURAL — no
