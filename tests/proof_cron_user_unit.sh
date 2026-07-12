@@ -47,8 +47,13 @@ REPO="https://github.com/acme/box.git"
 [ "$(cron_user)" = "root" ] && ok_t "default cron user is root" || bad_t "default user" "got '$(cron_user)'"
 [ "$(pref '.user')" = "root" ] && ok_t "default user persisted as root" || bad_t "persist default" "$(pref '.user')"
 
-# --- Case 2: --user=<current user> writes + persists that user ---------------
-ME="$(id -un)"
+# --- Case 2: --user=<a non-root user> writes + persists that user ------------
+# Deliberately a NON-root user so the Case 5 status assert (which suppresses the
+# "as root" suffix by design) stays green when the suite runs AS root (CI/Docker
+# smoke does). Pick the first existing near-universal service account.
+ME=""
+for _u in nobody daemon bin sys; do id "$_u" >/dev/null 2>&1 && { ME="$_u"; break; }; done
+[ -n "$ME" ] || ME="$(id -un)"   # last resort; only degrades Case 5 if that's root
 ( _proof_onoff on --repo="$REPO" --at=3 --user="$ME" ) >/dev/null 2>&1
 [ "$(cron_user)" = "$ME" ] && ok_t "--user writes that user into the cron line" || bad_t "user in cron" "got '$(cron_user)'"
 [ "$(pref '.user')" = "$ME" ] && ok_t "--user persisted to proof.json" || bad_t "persist user" "$(pref '.user')"
@@ -64,9 +69,16 @@ cp "$_PROOF_CRON" "$TMP/cron.before"
 [ "$RC" -eq "$E_USAGE" ] && ok_t "unknown --user rejected with E_USAGE" || bad_t "reject rc" "rc=$RC"
 [ "$(cron_user)" = "$ME" ] && ok_t "rejected --user left cron unchanged" || bad_t "cron mutated on reject" "got '$(cron_user)'"
 
-# --- Case 5: status reflects the configured non-root user -------------------
+# --- Case 5: status reflects the configured cron user -----------------------
+# "as <user>" is suppressed by design when the user is root, so only assert the
+# suffix for a non-root ME (the common path); if ME degraded to root, assert the
+# suppression instead so a root-only host still exercises the branch.
 OUT="$(_proof_onoff status 2>/dev/null)"
-echo "$OUT" | grep -q "as ${ME}" && ok_t "status shows non-root cron user" || bad_t "status user" "$OUT"
+if [ "$ME" != "root" ]; then
+  echo "$OUT" | grep -q "as ${ME}" && ok_t "status shows non-root cron user" || bad_t "status user" "$OUT"
+else
+  echo "$OUT" | grep -q " as " && bad_t "status suppresses 'as root'" "$OUT" || ok_t "status suppresses 'as root' (root-only host)"
+fi
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ] || exit 1
