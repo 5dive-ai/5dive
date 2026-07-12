@@ -7,9 +7,10 @@
   </a>
 </p>
 
+<p align="center"><b>English</b> ｜ <a href="README.zh-CN.md">简体中文</a></p>
+
 <p align="center">
   <a href="docs/zero-human.md"><img src="https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2F5dive-ai%2F5dive%2Fstatus%2Fbadge.json" alt="zero-human"></a>
-  <a href="https://github.com/5dive-ai/5dive/stargazers"><img src="https://img.shields.io/github/stars/5dive-ai/5dive?style=flat&logo=github&color=181820" alt="GitHub stars"></a>
   <a href="https://github.com/5dive-ai/5dive/releases"><img src="https://img.shields.io/github/v/release/5dive-ai/5dive" alt="Latest release"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License: MIT"></a>
 </p>
@@ -23,8 +24,10 @@
 
 <p align="center">
   <a href="#quickstart">Quickstart</a> ·
+  <a href="#why-5dive">Why 5dive</a> ·
   <a href="docs/zero-human.md">Zero-human proof</a> ·
   <a href="#for-your-ai-agent">Use from your AI agent</a> ·
+  <a href="#security--isolation">Security</a> ·
   <a href="https://5dive.ai?utm_source=github&utm_medium=referral&utm_campaign=5dive-readme">Managed VM</a>
 </p>
 
