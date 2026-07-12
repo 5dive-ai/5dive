@@ -11,11 +11,12 @@ trap 'rm -rf "$TMP"' EXIT
 # shellcheck disable=SC1090
 for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh \
          lib/agent_setup.sh lib/state.sh lib/audit.sh lib/registry.sh \
-         lib/tasks_db.sh cmd_task.sh cmd_org.sh cmd_project.sh cmd_loop.sh cmd_usage.sh; do
+         lib/tasks_db.sh cmd_task.sh cmd_org.sh cmd_project.sh cmd_loop.sh cmd_usage.sh cmd_heartbeat.sh; do
   source "$SRC/$f"
 done
 STATE_DIR="$TMP"; TASKS_DIR="$STATE_DIR/tasks"; TASKS_DB="$TASKS_DIR/tasks.db"
 JSON_MODE=1; mkdir -p "$TASKS_DIR"; set +e
+tasks_db_init; _tasks_db_migrate   # migrate adds parked_at/park_reason (prod stores are always migrated)
 PASS=0; FAIL=0
 ok_t()  { PASS=$((PASS+1)); printf 'ok   - %s\n' "$1"; }
 bad_t() { FAIL=$((FAIL+1)); printf 'FAIL - %s\n   %s\n' "$1" "${2:-}"; }
@@ -60,6 +61,18 @@ if [[ -n "$CLEAN_LINK" ]]; then
   [[ "$persisted" == "60000" ]] && ok_t "spend persisted to loop_runs.tokens_spent" || bad_t "persist" "$persisted"
   # 60000 >= ceiling 50000 → a ceiling check now fires (was 0 → advisory no-op before)
   [[ "$spent" -ge 50000 ]] && ok_t "spend over ceiling → breach now detectable (enforceable)" || bad_t "breach" "$spent"
+  # OSS-24: the heartbeat sweep must actually HALT a fire-and-forget loop, not just
+  # mark loop_runs. Run the sweep and assert the live child task gets PARKED
+  # (blocked + parked_at), so the agent stops burning tokens past the ceiling.
+  cmd_task_need() { :; }   # stub the escalate gate (no owner/channel in the harness)
+  _hb_loop_ceiling_sweep >/dev/null 2>&1
+  lstat=$(db "SELECT status FROM loop_runs WHERE loop_id='L-enf';")
+  [[ "$lstat" == "escalated" ]] && ok_t "sweep marks breached loop escalated" || bad_t "loop escalated" "got $lstat"
+  cstat=$(db "SELECT status FROM tasks WHERE id=${tid};")
+  cparked=$(db "SELECT CASE WHEN parked_at IS NOT NULL THEN 1 ELSE 0 END FROM tasks WHERE id=${tid};")
+  [[ "$cstat" == "blocked" && "$cparked" == "1" ]] \
+    && ok_t "sweep PARKS the live child task (blocked+parked) → spend actually halts (=$cstat)" \
+    || bad_t "child parked" "status=$cstat parked=$cparked"
   rm -f "$CLEAN_LINK"
 else
   printf 'skip - could not symlink /home/agent-%s (no perms); refresh path untested here\n' "$AG"

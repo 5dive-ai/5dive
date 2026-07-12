@@ -10,6 +10,20 @@ release.
 ## [Unreleased]
 
 ### Changed
+- **Loop token `--ceiling` is now a hard stop, not advisory (OSS-24, gh
+  5dive#17).** Driver loops (`loop map`/`until-dry`/`verify`/`grade`) already
+  halted on breach — their foreground driver re-checks `spent >= ceiling` before
+  each round. The gap was the fire-and-forget `loop spawn`: with no driver, a
+  ceiling breach was caught by the heartbeat sweep but only marked `loop_runs`
+  escalated + filed an escalate-with-proof gate — the agent kept burning tokens
+  on the still-`in_progress` child task. The sweep now also **parks the loop's
+  live child task(s)** (`blocked` + `parked_at` + `park_reason`, pending-gate
+  fields cleared, same shape as `task park`; never touches
+  done/cancelled/already-parked work), so the spend actually stops. This mirrors
+  the cost-budget hard stop, scoped to the loop rather than the whole agent.
+  Unblocks OSS-18 L2 budget widening (a budget that cannot halt must not be
+  widened). Covered by an extended `loop_ceiling_enforce_unit` (now asserts the
+  child task is parked on breach).
 - **Supervisor self-heal now covers every runtime (OSS-23, gh 5dive#16).** The
   P2 recovery ladder (nudge → resume → rotate) no longer hard-escalates
   non-`claude` agents: `codex`, `grok`, `opencode`, and `antigravity` get the

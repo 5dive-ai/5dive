@@ -19951,17 +19951,38 @@ _hb_gate_ttl_sweep() {
 # round stops) and escalates-with-proof on the originating task — design §4's
 # "never ship best-so-far silently", now enforced for async loops too.
 _hb_loop_ceiling_sweep() {
-  local lrow lid ceil sby spent lident
+  local lrow lid ceil sby kids spent lident
   while IFS= read -r lrow; do
     [[ -n "$lrow" ]] || continue
-    IFS=$'\x1f' read -r lid ceil sby <<<"$lrow"
+    IFS=$'\x1f' read -r lid ceil sby kids <<<"$lrow"
     [[ -n "$lid" && "$ceil" =~ ^[0-9]+$ ]] || continue
     spent=$(_loop_refresh_spend "$lid" 2>/dev/null || echo 0)
     [[ "$spent" =~ ^[0-9]+$ ]] || continue
     (( spent >= ceil )) || continue
     db "UPDATE loop_runs SET status='escalated', kill_requested=1, updated_at=$(date +%s)
         WHERE loop_id=$(sqlq "$lid") AND status='running';"
-    _hb_log "[loop-ceiling] ${lid} breached ceiling (~${spent}/${ceil} tok) — halted + escalated"
+    # OSS-24: kill_requested only stops a DRIVER loop (map/until-dry re-checks it
+    # each round). A fire-and-forget `loop spawn` has no driver, so the child task
+    # its agent is actively burning tokens on would keep running past the ceiling —
+    # leaving the ceiling advisory for exactly the common case. Mirror the
+    # cost-budget hard stop, scoped to the loop: PARK the loop's live (non-terminal)
+    # child tasks so the spend actually stops, not just the loop_runs bookkeeping.
+    # Parked = blocked + parked_at + park_reason with pending-gate fields cleared
+    # (same shape as `task park`); never touches done/cancelled/already-parked work.
+    local kid_ids
+    kid_ids=$(printf '%s' "${kids:-}" | tr -cd '0-9,' | tr ',' ' ')
+    if [[ -n "$kid_ids" ]]; then
+      local in_list; in_list=$(printf '%s' "$kid_ids" | tr ' ' ',')
+      db "UPDATE tasks
+            SET status='blocked', parked_at=datetime('now'),
+                park_reason=$(sqlq "loop ${lid} hit its token ceiling (~${spent}/${ceil} tok) — halted by heartbeat before finishing"),
+                need_type=NULL, ask=NULL, need_options=NULL, recommend=NULL,
+                need_answer=NULL, need_answered_at=NULL
+          WHERE id IN (${in_list})
+            AND status IN ('todo','in_progress')
+            AND parked_at IS NULL;"
+    fi
+    _hb_log "[loop-ceiling] ${lid} breached ceiling (~${spent}/${ceil} tok) — halted (child tasks parked) + escalated"
     # Escalate-with-proof on the originating task (skip if it already has an open
     # need, or isn't a live task). cmd_task_need is bundled + we run as root.
     if [[ "$sby" =~ ^[0-9]+$ ]]; then
@@ -19974,7 +19995,7 @@ _hb_loop_ceiling_sweep() {
             --recommend="stop" ) >/dev/null 2>&1 || true
       fi
     fi
-  done < <(db "SELECT loop_id||x'1f'||COALESCE(ceiling,'')||x'1f'||COALESCE(spawned_by_task,'')
+  done < <(db "SELECT loop_id||x'1f'||COALESCE(ceiling,'')||x'1f'||COALESCE(spawned_by_task,'')||x'1f'||COALESCE(child_task_ids,'[]')
                FROM loop_runs
                WHERE status='running' AND ceiling IS NOT NULL
                  AND child_task_ids IS NOT NULL AND child_task_ids != '[]';")
