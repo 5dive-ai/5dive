@@ -3,8 +3,8 @@
 #
 # Same isolation contract as loop_*_unit.sh: sources src/ libs directly and
 # points STATE_DIR at a throwaway temp dir so it NEVER touches the live shared
-# tasks.db. Asserts: _sup_act_plan's full decision matrix (cause map, runtime
-# guard, ladder order, backoff math, exhaustion, rotation gate) and
+# tasks.db. Asserts: _sup_act_plan's full decision matrix (cause map, all-runtime
+# coverage (OSS-23), ladder order, backoff math, exhaustion, rotation gate) and
 # _sup_act_history counting action rows from a seeded audit trail.
 # Run: bash tests/supervisor_unit.sh
 set -uo pipefail
@@ -49,9 +49,23 @@ t "tmux-dead escalates" \
 t "stale-cli defers (update-pending, never a ladder action)" \
   "defer update-pending" "$(_sup_act_plan claude stale-cli 1 0 $NOW true)"
 
-# --- runtime guard ----------------------------------------------------------
-t "non-claude runtime escalates even on actionable cause" \
-  "escalate non-claude-runtime" "$(_sup_act_plan codex no-progress 0 0 $NOW false)"
+# --- runtime coverage (OSS-23: self-heal every runtime) --------------------
+# The ladder is runtime-agnostic — every non-claude runtime gets the SAME
+# nudge/resume/rotate as claude on an actionable (session-alive-but-wedged) cause.
+t "codex no-progress -> nudge (rung 0, was escalate)" \
+  "nudge" "$(_sup_act_plan codex no-progress 0 0 $NOW false)"
+t "grok loop-stuck attempt 1 -> resume" \
+  "resume" "$(_sup_act_plan grok loop-stuck 1 0 $NOW false)"
+t "opencode attempt 2 + rotation on -> rotate" \
+  "rotate" "$(_sup_act_plan opencode no-progress 2 0 $NOW true)"
+t "antigravity attempt 2 + rotation off -> escalate (rotation gate, not runtime)" \
+  "escalate rotation-disabled" "$(_sup_act_plan antigravity no-progress 2 0 $NOW false)"
+# rung-4+ causes still escalate for EVERY runtime (restart is P3) — the axis that
+# stayed narrow. A dead service/tmux/poller is not something a nudge can fix.
+t "codex service-dead still escalates (rung 4 is P3, all runtimes)" \
+  "escalate rung-4-needed" "$(_sup_act_plan codex service-dead 0 0 $NOW false)"
+t "grok tmux-dead still escalates" \
+  "escalate rung-4-needed" "$(_sup_act_plan grok tmux-dead 0 0 $NOW true)"
 
 # --- ladder order -----------------------------------------------------------
 t "attempt 0 -> nudge"  "nudge"  "$(_sup_act_plan claude no-progress 0 0 $NOW false)"

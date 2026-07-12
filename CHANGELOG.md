@@ -10,6 +10,21 @@ release.
 ## [Unreleased]
 
 ### Changed
+- **Supervisor self-heal now covers every runtime (OSS-23, gh 5dive#16).** The
+  P2 recovery ladder (nudge → resume → rotate) no longer hard-escalates
+  non-`claude` agents: `codex`, `grok`, `opencode`, and `antigravity` get the
+  same auto-recovery on a session-alive-but-wedged cause (`no-progress`,
+  `loop-stuck`). It always could — every rung is a generic op on the
+  `agent-<name>` tmux session + registry (line injection via `_hb_send_line`, a
+  modal-clearing Escape, same-type account rotation self-gated on
+  `rotation.enabled`), with no claude-specific assumption; the old runtime gate
+  was a DIVE-857 caution, not a technical limit. Restart-class causes
+  (`service-dead`/`tmux-dead`/`poller-dead`) still escalate for every runtime
+  (rung 4 = P3). Prereq for the OSS-18 autonomy ledger, whose self-heal-recovery
+  signal would otherwise be claude-biased. Unit matrix in
+  `tests/supervisor_unit.sh` extended to codex/grok/opencode/antigravity.
+  Live-fleet validation of each runtime's actual resume behavior is main's
+  verify-time last-mile.
 - **zero-human badge message is percent-only.** `proof publish` now renders
   `89.9%` instead of `89.9% (99)` — the shipped-count parenthetical read as
   noise on the badge (lodar call, 2026-07-12). The sample size still ships in

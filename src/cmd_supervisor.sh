@@ -561,10 +561,22 @@ _sup_watch() {
 # previous classification is derived from the agent's latest event row —
 # healthy when it has none — so the tick needs no extra state file.
 # ── P2 (DIVE-857): recovery ladder — ACT + ESCALATE (design §5–6) ───────────
-# Auto-act is deliberately narrow: claude-type agents, causes where the session
-# is alive but wedged (no-progress, loop-stuck). Everything else stuck needs
-# rung 4+ (restart/reprovision = P3/manual), so it ESCALATES: one audit row per
-# window, zero mutations. Rungs, in order: nudge -> resume -> rotate.
+# Auto-act is narrow along ONE axis: causes where the session is alive but wedged
+# (no-progress, loop-stuck). Everything else stuck needs rung 4+ (restart/
+# reprovision = P3/manual), so it ESCALATES: one audit row per window, zero
+# mutations. Rungs, in order: nudge -> resume -> rotate.
+#
+# OSS-23 (self-heal every runtime): the ladder is RUNTIME-AGNOSTIC — codex, grok,
+# opencode, and antigravity get the same nudge/resume/rotate as claude, not just
+# claude. It always could be: every rung is a generic op on the agent's tmux
+# session + registry, with no claude-specific assumption. nudge/resume inject a
+# line (+ a modal-clearing Escape) into the `agent-<name>` tmux pane every runtime
+# shares (_hb_send_line); rotate cycles among SAME-TYPE accounts and is already
+# gated on per-agent rotation.enabled (a non-claude agent with no rotation pool
+# just escalates at rung 2, same as claude). The old claude-only gate was a
+# DIVE-857 caution, not a technical limit; without cross-runtime recovery the
+# OSS-18 autonomy ledger's self-heal-recovery signal would be claude-biased
+# (design: community/wiki/earned-autonomy-design-jul11.md §Sequencing #1).
 
 # attempts + last-action epoch for an agent inside the rolling window, straight
 # from the audit trail (no extra state file — same principle as the tick's
@@ -585,6 +597,11 @@ _sup_act_history() {
 # the next action is base * 2^attempts; ladder exhausted / unreachable rung
 # => escalate.
 _sup_act_plan() {  # <type> <cause> <attempts> <last_epoch> <now> <rotation_enabled>
+  # $1 (type) is retained for signature/caller stability but no longer branches:
+  # OSS-23 made the ladder runtime-agnostic (see block comment above). rung-4+
+  # causes still escalate for every runtime via the case below (restart is P3);
+  # rotate self-gates on rot regardless of type.
+  # shellcheck disable=SC2034
   local type="$1" cause="$2" attempts="$3" last="$4" now="$5" rot="$6"
   case "$cause" in
     no-progress|loop-stuck) : ;;
@@ -598,7 +615,6 @@ _sup_act_plan() {  # <type> <cause> <attempts> <last_epoch> <now> <rotation_enab
     goal-drift) echo "defer goal-drift"; return ;;
     *) echo "escalate rung-4-needed"; return ;;
   esac
-  [[ "$type" == "claude" ]] || { echo "escalate non-claude-runtime"; return; }
   (( attempts >= _SUP_ACT_MAX_ATTEMPTS )) && { echo "escalate ladder-exhausted"; return; }
   local gap=$(( _SUP_ACT_BASE_MIN * 60 * (1 << attempts) ))
   if (( last > 0 && now - last < gap )); then echo "defer backoff"; return; fi
@@ -610,14 +626,18 @@ _sup_act_plan() {  # <type> <cause> <attempts> <last_epoch> <now> <rotation_enab
 }
 
 # Execute one rung. Returns nonzero, never exits — one bad agent can't abort
-# the tick (rotation's fail() is contained in a subshell).
+# the tick (rotation's fail() is contained in a subshell). Every rung is
+# runtime-agnostic (OSS-23): the `agent-<name>` tmux session + registry are the
+# same shape for claude/codex/grok/opencode/antigravity, so no per-type branch.
 _sup_act_exec() {  # <name> <verb> <cause>
   local name="$1" verb="$2" cause="$3"
   case "$verb" in
     nudge)
       _hb_send_line "$name" "[supervisor] You look stalled (${cause}). Pick your in-progress task back up and continue; if genuinely blocked, say why on the task." ;;
     resume)
-      # Clear a wedged modal/prompt first, then ask for plain continuation.
+      # Clear a wedged modal/prompt first, then ask for plain continuation. Escape
+      # is a safe universal dismiss across the runtime TUIs; "continue" is a
+      # generic re-prompt every runtime accepts as pane input.
       sudo -u "agent-${name}" tmux send-keys -t "agent-${name}" Escape 2>/dev/null || return 1
       sleep 1
       _hb_send_line "$name" "continue" ;;
