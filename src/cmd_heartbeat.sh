@@ -56,6 +56,15 @@ _HB_REAP_ESCALATE_AFTER=2
 # auto-answers a T2 gate: escalation changes WHO is pinged, not what clears.
 _HB_GATE_ESCALATE_DAYS="${HEARTBEAT_GATE_ESCALATE_DAYS:-5}"
 [[ "$_HB_GATE_ESCALATE_DAYS" =~ ^[0-9]+$ ]] || _HB_GATE_ESCALATE_DAYS=5
+# DIVE-1140 gate-shipped sweep. Which repos' origin/main to scan for a merged
+# commit referencing an OPEN gate's ident (space- or comma-separated stems under
+# _HB_REPO_BASE). A DIVE-id can land in any of ~a dozen repos, so this is a
+# deliberate allow-list, not a guess — default just the CLI where most gate work
+# lands. Grep is on the LOCAL origin/main tracking ref (no fetch: cheap +
+# credential-free), so freshness = last time an agent pulled that repo.
+_HB_GATE_SHIPPED_REPOS="${HEARTBEAT_GATE_SHIPPED_REPOS:-5dive-cli}"
+_HB_REPO_BASE="${HEARTBEAT_REPO_BASE:-/home/claude/projects/5dive}"
+_HB_GATE_SHIPPED_REF="${HEARTBEAT_GATE_SHIPPED_REF:-origin/main}"
 # Orphan reclaim. An in_progress task whose claiming claude session is GONE — the
 # agent's claude process started AFTER the task did (rotation, service restart,
 # crash, a context reset that exited the process) — is reclaimed to 'todo'
@@ -756,6 +765,59 @@ _hb_gate_ttl_sweep() {
   return 0
 }
 
+# DIVE-1140: gate-shipped flag sweep. A human gate (approval/decision/manual)
+# does NOT auto-close when the underlying fix merges, so the overnight recap
+# (DIVE-217/1138) surfaces 'ghost' gates on already-shipped work. This sweep, per
+# tick, scans each configured repo's origin/main for a commit referencing an OPEN
+# gate's ident; on a hit it FLAGS the gate (stamp shipped_flag_at + ping the
+# owner "likely shipped, verify+close"). Flag-only for ALL tiers (lodar
+# 2026-07-12): a merge is not a human sign-off (DIVE-555) and a commit may only
+# partially fix a gate, so it NEVER auto-answers/closes — a human still clears it.
+# shipped_flag_at throttles to one flag per gate. Same isolation contract as the
+# other sweeps (caller wraps in `|| log`): a failure must never abort the wake
+# loop. Factored git lookup (_hb_repo_grep_ident) so the unit test can stub it.
+#
+# Look for <ident> on <repo>'s configured ref; echo "<repo> <sha> <subject>" on a
+# hit, nothing otherwise. Digit-boundary match so DIVE-114 doesn't match
+# DIVE-1140. Best-effort: a missing repo/ref is silently skipped.
+_hb_repo_grep_ident() {  # <repo-stem> <ident>
+  local repo="$1" ident="$2" dir="${_HB_REPO_BASE}/$1" line
+  [[ -d "$dir/.git" || -f "$dir/.git" ]] || return 1
+  line=$(git -C "$dir" log "$_HB_GATE_SHIPPED_REF" -E \
+           --grep="${ident}([^0-9]|\$)" --format='%h %s' -1 2>/dev/null) || return 1
+  [[ -n "$line" ]] || return 1
+  printf '%s %s\n' "$repo" "$line"
+}
+
+_hb_gate_shipped_sweep() {
+  local grow gid gident gtype gowner repo hit
+  # Normalize the repo allow-list: commas or spaces both separate.
+  local repos; repos="${_HB_GATE_SHIPPED_REPOS//,/ }"
+  [[ -n "${repos// }" ]] || return 0
+  while IFS= read -r grow; do
+    [[ -n "$grow" ]] || continue
+    IFS=$'\x1f' read -r gid gident gtype gowner <<<"$grow"
+    [[ -n "$gid" && -n "$gident" ]] || continue
+    hit=""
+    for repo in $repos; do
+      hit=$(_hb_repo_grep_ident "$repo" "$gident") && [[ -n "$hit" ]] && break
+      hit=""
+    done
+    [[ -n "$hit" ]] || continue
+    db "UPDATE tasks SET shipped_flag_at=datetime('now') WHERE id=${gid};"
+    audit_log "gate shipped-flag" "ok" 0 -- "task=$gident" "type=$gtype" "commit=$hit" || true
+    _hb_log "[gate-shipped] ${gident} — commit on ${_HB_GATE_SHIPPED_REF} references it: ${hit} -> flagged"
+    if [[ -n "$gowner" ]] && _task_agent_channel "$gowner"; then
+      ( cmd_send "$gowner" --message="🚢 ${gident} — a commit referencing this open ${gtype} gate landed on ${_HB_GATE_SHIPPED_REF} (${hit}). Likely shipped: verify and close with \`5dive task show ${gident}\`. Auto-flag only — a merge is not a sign-off, so it stays open until you clear it." ) >/dev/null 2>&1 || true
+    fi
+  done < <(db "SELECT id||x'1f'||COALESCE(ident,'DIVE-'||id)||x'1f'||need_type||x'1f'||COALESCE(assignee,'')
+               FROM tasks
+               WHERE need_type IS NOT NULL AND need_answered_at IS NULL
+                 AND shipped_flag_at IS NULL
+                 AND status NOT IN ('done','cancelled');")
+  return 0
+}
+
 # DIVE-972: loop token-ceiling enforcement sweep. The --wait poll only policed a
 # ceiling while a caller was synchronously waiting; a fire-and-forget loop (no
 # --wait, the common case) had NOTHING re-reading its spend, so its ceiling was
@@ -840,6 +902,9 @@ cmd_heartbeat_tick() {
   # — runs before the wake loop so a just-unparked/just-unblocked todo is
   # eligible for pickup this same tick.
   _hb_gate_ttl_sweep || _hb_log "[gate-ttl] pass errored (non-fatal)"
+  # DIVE-1140: flag open gates whose fix already merged so the overnight recap
+  # stops surfacing ghost gates. Flag-only, never auto-closes. Same isolation.
+  _hb_gate_shipped_sweep || _hb_log "[gate-shipped] pass errored (non-fatal)"
   # DIVE-972: enforce per-loop token ceilings for async (non --wait) loops. Same
   # isolation contract — a failure here must never abort the wake loop.
   _hb_loop_ceiling_sweep || _hb_log "[loop-ceiling] pass errored (non-fatal)"

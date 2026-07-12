@@ -9,6 +9,24 @@ release.
 
 ## [Unreleased]
 
+## [0.8.15] — 2026-07-12
+
+### Added
+- **Gate-shipped sweep — ghost gates flagged when their fix merges (DIVE-1140).**
+  Human gates (approval/decision/manual) don't auto-close when the underlying fix
+  merges to main, so the overnight recap (DIVE-217/1138) surfaced 'ghost' gates on
+  already-shipped work. A new heartbeat sweep (`_hb_gate_shipped_sweep`, wired into
+  `cmd_heartbeat_tick` after the TTL sweep) scans each configured repo's
+  `origin/main` for a commit referencing an OPEN gate's ident; on a hit it stamps
+  `shipped_flag_at` and pings the gate owner "likely shipped — verify and close".
+  **Flag-only for ALL tiers** (lodar decision 2026-07-12): a merge is not a human
+  sign-off (DIVE-555) and a commit may only partially fix a gate, so it NEVER
+  auto-answers or closes — a human still clears it. `shipped_flag_at` throttles to
+  one flag per gate. Repo allow-list is configurable via
+  `HEARTBEAT_GATE_SHIPPED_REPOS` (default `5dive-cli`); grep is on the local
+  `origin/main` tracking ref (no fetch, credential-free). New additive column
+  `tasks.shipped_flag_at`.
+
 ## [0.8.13] — 2026-07-12
 
 ### Added

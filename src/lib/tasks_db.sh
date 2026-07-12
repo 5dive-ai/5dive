@@ -233,7 +233,15 @@ CREATE TABLE IF NOT EXISTS tasks (
   -- auto-clear reads exact match, never fuzzy). Advisory-only like precedent_ref.
   ask_shape           TEXT,
   precedent_ref       INTEGER,
-  precedent_kind      TEXT
+  precedent_kind      TEXT,
+  -- DIVE-1140 gate-shipped sweep. Stamped (once) when the heartbeat finds a
+  -- commit referencing this OPEN gate's ident on a configured repo's origin/main
+  -- — the gate is FLAGGED "likely shipped, verify+close" to its owner. Flag-only
+  -- for ALL tiers (lodar 2026-07-12): a merge is not a human sign-off (DIVE-555)
+  -- and a commit may only partially fix a gate, so this NEVER auto-answers/closes
+  -- — it only stops the ghost-gate from re-surfacing in the overnight recap and
+  -- throttles the flag to once (re-flag only if cleared back to NULL).
+  shipped_flag_at     TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_tasks_precedent ON tasks(need_type, ask_shape);
 
@@ -459,7 +467,8 @@ _tasks_db_migrate() {
            'iteration INTEGER' 'maker_agent TEXT' 'task_budget TEXT' \
            'tier INTEGER' 'need_asked_at TEXT' 'gate_pinged_at TEXT' 'wake_at TEXT' \
            'secret_key TEXT' 'connector TEXT' 'human_nonce_hash TEXT' \
-           'ask_shape TEXT' 'precedent_ref INTEGER' 'precedent_kind TEXT'; do
+           'ask_shape TEXT' 'precedent_ref INTEGER' 'precedent_kind TEXT' \
+           'shipped_flag_at TEXT'; do
     if ! printf '%s\n' "$cols" | grep -qx "${c%% *}"; then
       sqlite3 -cmd ".timeout 5000" "$TASKS_DB" \
         "ALTER TABLE tasks ADD COLUMN ${c};" >/dev/null 2>&1 || true
