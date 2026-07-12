@@ -13913,6 +13913,7 @@ cmd_task() {
     inbox)           cmd_task_inbox "$@" ;;
     answer)          cmd_task_answer "$@" ;;
     precedent)       cmd_task_precedent "$@" ;;
+    routing)         cmd_task_routing "$@" ;;
     rm|delete)       cmd_task_rm "$@" ;;
     -h|--help|help)  _task_usage ;;
     *) fail "$E_USAGE" "unknown task command: $sub (try: 5dive task --help)" ;;
@@ -15102,6 +15103,40 @@ cmd_task_precedent() {
       ;;
     *)
       fail "$E_USAGE" "usage: 5dive task precedent [on|off|status]"
+      ;;
+  esac
+}
+
+# DIVE-1145: ship-gating routing policy switch. `5dive task routing [on|off]`
+# (bare / `status` reports state). When ON, a NON-lead agent's decision gate
+# (tier < 2) routes to the org lead first (see cmd_task_need) instead of pinging
+# the human. Default is OFF fleet-wide until the org lead (main) flips it after
+# reviewing the diff. True-human categories (tier-2-floored decisions, and every
+# approval/manual/secret gate) are never routed. Read-only `status` needs no
+# privilege; on/off is a policy write. Mirrors `task precedent` (OSS-21).
+cmd_task_routing() {
+  tasks_db_init
+  local sub="${1:-status}"
+  case "$sub" in
+    status|"")
+      local v; v=$(_task_pref_get gate_builder_routing); v="${v:-off}"
+      ok "builder-gate routing: ${v}" \
+         '{pref:"gate_builder_routing", value:$v}' --arg v "$v"
+      ;;
+    on|enable)
+      _task_pref_set gate_builder_routing on
+      [[ $EUID -eq 0 ]] && audit_log "task routing" "on" 0 -- "pref=gate_builder_routing" || true
+      ok "builder-gate routing: ON — a non-lead agent's tier<2 decision gate now routes to the org lead before pinging the human" \
+         '{pref:"gate_builder_routing", value:"on"}'
+      ;;
+    off|disable)
+      _task_pref_set gate_builder_routing off
+      [[ $EUID -eq 0 ]] && audit_log "task routing" "off" 0 -- "pref=gate_builder_routing" || true
+      ok "builder-gate routing: OFF — decision gates ping the human directly" \
+         '{pref:"gate_builder_routing", value:"off"}'
+      ;;
+    *)
+      fail "$E_USAGE" "usage: 5dive task routing [on|off|status]"
       ;;
   esac
 }

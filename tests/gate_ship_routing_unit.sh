@@ -103,5 +103,16 @@ cmd_task_need DIVE-6 --type=decision --tier=2 --ask="pick the launch date?" --op
 [[ "$HUMAN_PINGED" == "1" ]] && ok_t "route on: explicit --tier=2 decision → human (not routed)" || bad_t "explicit T2 decision → human" "HUMAN_PINGED=$HUMAN_PINGED"
 [[ ! -s "$ROUTE_FILE" ]] && ok_t "explicit --tier=2 decision: no lead route fired" || bad_t "explicit T2 no route" "sent=$(route_last)"
 
+# --- DIVE-1145 (iter-4): the `task routing` toggle sets/reads the pref --------
+# Subshell each call so a `fail` (usage) exit can't abort the harness; the pref
+# write lands in the sqlite DB so it survives the subshell.
+_task_pref_set gate_builder_routing off
+( cmd_task_routing on )  >/dev/null 2>&1
+[[ "$(_task_pref_get gate_builder_routing)" == "on" ]]  && ok_t "task routing on → pref=on"   || bad_t "task routing on"  "pref=$(_task_pref_get gate_builder_routing)"
+( cmd_task_routing off ) >/dev/null 2>&1
+[[ "$(_task_pref_get gate_builder_routing)" == "off" ]] && ok_t "task routing off → pref=off" || bad_t "task routing off" "pref=$(_task_pref_get gate_builder_routing)"
+( cmd_task_routing bogus ) >/dev/null 2>&1; rc=$?
+[[ "$rc" != "0" ]] && ok_t "task routing bogus → usage error (rc=$rc)" || bad_t "task routing bogus" "rc=$rc"
+
 echo "----"; echo "PASS=$PASS FAIL=$FAIL"
 [[ "$FAIL" == "0" ]]

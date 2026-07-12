@@ -9,6 +9,8 @@ release.
 
 ## [Unreleased]
 
+## [0.8.16] — 2026-07-12
+
 ### Added
 - **`proof on --user=<name>` (OSS-30, gh 5dive#30).** The nightly proof-publisher
   cron now runs as `--user` (default `root`, back-compatible). The cron's
@@ -28,7 +30,7 @@ release.
   never routed: tier-2-floored decisions (money/destructive/brand) and every
   non-decision type (approval/manual/secret) keep pinging the human unchanged.
   Approval/manual routing is deferred — it needs the DIVE-1117 provenance floor
-  to trust a designated reviewer. Unit-tested in `tests/gate_ship_routing_unit.sh`.
+  to trust a designated reviewer. Unit-tested in `tests/gate_ship_routing_unit.sh`. Enable/disable/inspect with `5dive task routing on|off|status` (mirrors `task precedent`).
 
 ### Fixed
 - **Ship-gating routing, verifier iter-2 fixes (DIVE-1145).** (1) The route
