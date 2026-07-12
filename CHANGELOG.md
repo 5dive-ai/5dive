@@ -9,8 +9,6 @@ release.
 
 ## [Unreleased]
 
-## [0.8.10] - 2026-07-12
-
 ### Changed
 - **zero-human badge message is percent-only.** `proof publish` now renders
   `89.9%` instead of `89.9% (99)` — the shipped-count parenthetical read as
