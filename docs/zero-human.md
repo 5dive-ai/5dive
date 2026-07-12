@@ -1,10 +1,10 @@
 # The zero-human badge
 
-The README badge reads something like: **zero-human | 97.6% (127)**.
+The README badge reads something like: **zero-human | 97.6%**.
 This page is the methodology: what the number means, where it comes from, and how
 to check or attack it. The label names the company. The percentage is the share of
 shipped work that needed no human — 1 − asks/shipped over a rolling 7-day window —
-and the parenthetical is the sample size: how many tasks shipped in that window.
+The sample size (tasks shipped in the window) lives in `zero-human.json` next to the badge.
 It is this week's honest tally, bad weeks included; the raw counts and the exact
 window dates live in `zero-human.json` on the status branch.
 

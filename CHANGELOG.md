@@ -9,6 +9,14 @@ release.
 
 ## [Unreleased]
 
+### Changed
+- **zero-human badge message is percent-only.** `proof publish` now renders
+  `89.9%` instead of `89.9% (99)` — the shipped-count parenthetical read as
+  noise on the badge (lodar call, 2026-07-12). The sample size still ships in
+  `zero-human.json` (`week.shipped`) and `docs/zero-human.md` says where to
+  look. Zero-ship weeks still render `0 shipped, N asks` (no honest bare `%`
+  exists for an empty sample). Unit tests + methodology doc updated.
+
 ### Added
 - **`5dive proof` — publish your own zero-human badge (OSS-17, gh 5dive#21).**
   Generalizes the internal `scripts/publish-zero-human.sh` into a first-class

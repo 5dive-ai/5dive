@@ -37,14 +37,14 @@ bad_t() { FAIL=$((FAIL+1)); printf 'FAIL - %s\n   %s\n' "$1" "${2:-}"; }
 jget() { python3 -c "import sys,json; d=json.load(open(sys.argv[1])); print(d$2)" "$1" 2>/dev/null; }
 
 # --- Case 1: fresh publish (no history.jsonl) --------------------------------
-# 27 shipped, 2 asks -> 1 - 2/27 = 92.59% -> "92.6% (27)".
+# 27 shipped, 2 asks -> 1 - 2/27 = 92.59% -> "92.6%".
 W1="$TMP/w1"; mkdir -p "$W1"
 OUT1="$(run_build "$W1" 5 1 27 2)"; RC1=$?
 [[ $RC1 -eq 0 ]] && ok_t "fresh publish exits 0" || bad_t "fresh exit" "rc=$RC1"
 [[ -f "$W1/badge.json" && -f "$W1/zero-human.json" && -f "$W1/history.jsonl" && -f "$W1/README.md" ]] \
   && ok_t "all four files written" || bad_t "files written"
-[[ "$(jget "$W1/badge.json" "['message']")" == "92.6% (27)" ]] \
-  && ok_t "badge message = self-shipped pct (sample size) from week digest" || bad_t "badge message" "$(cat "$W1/badge.json")"
+[[ "$(jget "$W1/badge.json" "['message']")" == "92.6%" ]] \
+  && ok_t "badge message = self-shipped pct (percent-only) from week digest" || bad_t "badge message" "$(cat "$W1/badge.json")"
 [[ "$(jget "$W1/badge.json" "['schemaVersion']")" == "1" && "$(jget "$W1/badge.json" "['label']")" == "zero-human" ]] \
   && ok_t "badge is a valid shields endpoint schema" || bad_t "badge schema"
 [[ "$(jget "$W1/zero-human.json" "['week']['shipped']")" == "27" \
@@ -69,7 +69,7 @@ OUT2="$(run_build "$W1" 9 9 99 9 2026-07-11)"; RC2=$?
 # --- Case 3a: perfect week drops the trailing .0 (100%, not 100.0%) ----------
 W3="$TMP/w3"; mkdir -p "$W3"
 run_build "$W3" 4 0 10 0 >/dev/null
-[[ "$(jget "$W3/badge.json" "['message']")" == "100% (10)" ]] \
+[[ "$(jget "$W3/badge.json" "['message']")" == "100%" ]] \
   && ok_t "zero asks -> 100% with trailing .0 dropped" || bad_t "100pct" "$(cat "$W3/badge.json")"
 
 # --- Case 3b: a week with zero ships has no ratio -> raw-count fallback -------

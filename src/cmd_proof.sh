@@ -162,7 +162,7 @@ ask_word = "ask" if w_ask == 1 else "asks"
 if w_ship > 0:
     pct = (1 - w_ask / w_ship) * 100
     pct_str = f"{pct:.1f}".rstrip("0").rstrip(".")
-    message = f"{pct_str}% ({w_ship})"
+    message = f"{pct_str}%"
 else:
     message = f"0 shipped, {w_ask} {ask_word}"
 
