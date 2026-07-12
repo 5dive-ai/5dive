@@ -17,6 +17,18 @@ release.
   otherwise-silent 03:00 push failure. Persisted in `proof.json` and sticky
   across re-`on`; unknown users are rejected; `proof status` shows a non-root
   user. Surfaced during OSS-29 live verify.
+- **Ship-gating gate routing (DIVE-1145).** Root-cause fix for builders
+  over-filing decision gates straight to the human (DIVE-1127/1142). When a
+  non-lead agent files a `decision` gate, `task need` now routes it to the org
+  lead first (resolved from the org chart — `reports_to`, else the coordinator/
+  root, never hardcoded) as an agent handoff, suppressing the human ping until
+  the lead resolves or re-escalates (a gate filed by the lead resolves to no
+  distinct reviewer, so it goes to the human — free re-escalation). Behind pref
+  `gate_builder_routing` (default **off**, ship-safe). True-human categories are
+  never routed: tier-2-floored decisions (money/destructive/brand) and every
+  non-decision type (approval/manual/secret) keep pinging the human unchanged.
+  Approval/manual routing is deferred — it needs the DIVE-1117 provenance floor
+  to trust a designated reviewer. Unit-tested in `tests/gate_ship_routing_unit.sh`.
 
 ## [0.8.15] — 2026-07-12
 

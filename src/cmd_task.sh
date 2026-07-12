@@ -207,6 +207,32 @@ _task_default_verifier() {
   done
 }
 
+# DIVE-1145: ship-gating routing. Resolve WHO a builder's gate should route to
+# for lead review before it ever pings the human. Enforces the org policy
+# "builder decision gates go through the org lead (main), not straight to the
+# human" using the org-chart primitives already present — never a hardcoded
+# agent. Prints the reviewer name, or NOTHING when the filer IS a lead (or the
+# org can't name a distinct one), in which case the gate falls through to the
+# human path unchanged. Ordered, DISTINCT-from-filer candidate chain:
+#   1. the filer's manager      — reports_to: their natural up-reviewer
+#   2. the org coordinator/root — role=coordinator, else the lone chart root
+# Excluding the filer is what makes re-escalation free: when the LEAD files (or
+# re-files) the same gate, they resolve to no distinct reviewer, so it goes to
+# the human — exactly "only escalate to the human when the lead re-escalates".
+_gate_route_reviewer() {
+  local _filer="$1" c=""
+  [[ -n "$_filer" ]] || return
+  local -a cands=(
+    "$(db "SELECT COALESCE(reports_to,'') FROM agents_org WHERE name=$(sqlq "$_filer") LIMIT 1;")"
+    "$(_task_resolve_coordinator)"
+  )
+  for c in "${cands[@]}"; do
+    if [[ -n "$c" && "$c" != "$_filer" ]]; then
+      printf '%s' "$c"; return
+    fi
+  done
+}
+
 # DIVE-980: shared org-chart assignee resolution. Resolve an assignee TOKEN to a
 # concrete agent via the org chart (agents_org). Prints the resolved name, or
 # NOTHING when a role/charter token has no UNIQUE holder — callers decide whether
@@ -1627,6 +1653,42 @@ cmd_task_need() {
             return
           fi
         fi
+      fi
+    fi
+  fi
+
+  # DIVE-1145: ship-gating routing. Root-cause fix for builders over-filing
+  # gates straight to the human (DIVE-1127/1142). Before the human ping, route a
+  # NON-true-human builder gate to the org lead first, as an agent handoff. Gated
+  # on pref `gate_builder_routing` (default OFF — same ship-safe posture as
+  # OSS-21 precedent_autoclear; the lead flips it on after reviewing this diff).
+  # Scope is deliberately DECISION-only in v1: decision gates are agent-clearable
+  # (tier 1, no human_nonce) so the lead can actually resolve them, whereas
+  # approval/manual/secret are enforced human-only by `task answer` (DIVE-1117
+  # provenance floor) — routing those to an agent-reviewer needs the floor to
+  # trust a designated reviewer, a deeper change deferred to a follow-up. We
+  # never route a tier-2-floored gate (true-human category — money/destructive/
+  # brand/secret, per _gate_tier2_floor_hit) nor one filed BY a lead
+  # (_gate_route_reviewer returns empty → falls through to the human, which is
+  # also how the lead re-escalates). Reviewer notify is best-effort + detached so
+  # the 45s tmux-inject wait never blocks or fails the already-committed gate.
+  if [[ "$type" == "decision" && "$tier_floored" == "0" ]]; then
+    local _route; _route=$(_task_pref_get gate_builder_routing); _route="${_route:-off}"
+    if [[ "$_route" == "on" ]]; then
+      local _reviewer; _reviewer=$(_gate_route_reviewer "$actor")
+      if [[ -n "$_reviewer" ]]; then
+        local _hmsg="🧭 [${ident}] routed to you for lead review (builder gate). ${ask}"
+        [[ -n "$options" ]]   && _hmsg+=" Options: ${options}."
+        [[ -n "$recommend" ]] && _hmsg+=" ${actor} recommends: ${recommend}."
+        _hmsg+=" Resolve: 5dive task answer ${ident} --value=\"<choice>\" — or re-file to escalate to the human."
+        if command -v 5dive >/dev/null 2>&1; then
+          ( 5dive agent send "$_reviewer" "$_hmsg" --from="$actor" >/dev/null 2>&1 & ) || true
+        fi
+        [[ $EUID -eq 0 ]] && audit_log "task need lead-route" "ok" 0 -- "task=$ident" "type=$type" "reviewer=$_reviewer" "filer=$actor" || true
+        ok "$ident routed to lead $_reviewer for review (decision, tier $tier) — $ask" \
+           '{id:($i|tonumber), ident:$id, status:"blocked", need_type:$ty, tier:($tr|tonumber), routed_to:$rv, ask:$ak, recommend:(($rc|select(length>0)) // null)}' \
+           --arg i "$id" --arg id "$ident" --arg ty "$type" --arg tr "$tier" --arg rv "$_reviewer" --arg ak "$ask" --arg rc "$recommend"
+        return
       fi
     fi
   fi
