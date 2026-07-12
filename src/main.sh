@@ -182,6 +182,8 @@ Projects (ident namespaces for the queue; default 'dive' = DIVE-N):
 
   5dive loop spawn --role=<r> --agent=<a> --prompt="…" [--ceiling=<tok>] [--wait[=<sec>]]  # LOOP-7 orchestration (JSON in/out)
   5dive goal add "<outcome>" [--dry-run] [--max-tasks=N] [--yes]   # outcome -> validated, guardrailed task graph (DIVE-984)
+  5dive objective add "<name>" --metric-cmd="<cmd>" --target=<n> [--direction=up|down] [--unit=%] [--public]  # standing goal bound to a read-only metric (OSS-19)
+  5dive objective ls | show <name> | tick [<name>] | pause <name> | resume <name> | rm <name>
 
 Org chart (who reports to whom):
   5dive org set <agent> --manager=<agent> [--role=<text>] [--title=<text>]
@@ -570,6 +572,12 @@ main() {
       # project; goal add validates + gates before materializing. Same group-
       # writable store, no root/lock.
       cmd_goal "$@" ;;
+    objective|objectives)
+      # OSS-19 (OSS-26 phase A1): outcome-loop objectives — a standing goal bound
+      # to a read-only metric command. add/ls/show/pause/resume/rm/tick. Same
+      # group-writable store as tasks; read/write, no root/lock. Measurement only
+      # in this build (no origination/planner cycle).
+      cmd_objective "$@" ;;
     crew)
       # DIVE-787 (0.5.0 flagship): 5dive as the always-on runtime for CrewAI
       # crews. install/secret/run/show/list/uninstall. Crew runs in its own venv

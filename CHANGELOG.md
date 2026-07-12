@@ -9,6 +9,27 @@ release.
 
 ## [Unreleased]
 
+### Added
+- **Outcome-loop objectives — `5dive objective` (OSS-19 / OSS-26, phase A1, gh
+  5dive#23).** A first-class primitive for a standing goal the company steers a
+  single number toward: `objective add "<name>" --metric-cmd="<cmd>" --target=<n>
+  [--direction=up|down] [--unit=%] [--review="<cron>"] [--planner=<a>]
+  [--project=<key>] [--max-new-per-cycle=N] [--budget=<tok>] [--public]`, plus
+  `ls`, `show`, `pause`, `resume`, `rm`, and `tick`. Storage is a new
+  `objectives` table + append-only `objective_readings` (both additive, gated
+  migrations, byte-identical schema copies per `schema_sync_unit`). The metric is
+  a **read-only command contract** (stdout → one number) run ONLY by `objective
+  tick` and the digest, **never by a planner** — the anti-Goodhart separation
+  baked in from day one. A failed/non-numeric metric records `value=NULL, rc!=0`
+  so a broken metric shows as a visible gap, never a silent skip. `5dive digest`
+  (text + `--json`) gains an `objectives` block — `{name, current, target,
+  direction, unit, trend, gap, inflight, originatedThisCycle}` — deriving `trend`
+  from the window baseline the same way `_window_counts` derives ship/ask deltas.
+  This build is **measurement only**: NO origination and NO planner cycle (that
+  is the blocked successor build); `cmd_proof.sh` is untouched (no-flag-edits
+  invariant), so `--public` is stored for a later proof-feed passthrough. Covered
+  by a new `objective_unit` (13/13).
+
 ### Changed
 - **Loop token `--ceiling` is now a hard stop, not advisory (OSS-24, gh
   5dive#17).** Driver loops (`loop map`/`until-dry`/`verify`/`grade`) already

@@ -154,8 +154,25 @@ cmd_digest() {
   dbfmt -json "SELECT agent, CAST(strftime('%s', ts) AS INTEGER) AS ts, classification, prev_classification, cause FROM supervisor_events WHERE event='transition' AND ts >= datetime(${_sup_lb}, 'unixepoch') ORDER BY agent, id;" >"$tmpd/sup.json" 2>/dev/null || echo '[]' >"$tmpd/sup.json"
   [ -s "$tmpd/sup.json" ] || echo '[]' >"$tmpd/sup.json"
 
+  # OSS-19 (OSS-26) objectives block. Per objective: current (latest reading),
+  # target, direction, unit, public, and a window baseline (the latest reading
+  # from BEFORE the window opened) so python can derive the trend the same
+  # window-delta way _window_counts derives the ship/ask deltas. inflight counts
+  # this objective's linked-project open tasks; originatedThisCycle is always 0
+  # in this measurement-only build (no origination path exists yet). Objectives
+  # are gated on the table existing so an old store just yields []. Table missing
+  # or empty => [] and the block is omitted from the standup.
+  local _obj_wstart="-${window} seconds"
+  dbfmt -json "SELECT o.name AS name, o.target AS target, o.direction AS direction,
+                      o.unit AS unit, o.public AS public, o.status AS status,
+                      (SELECT value FROM objective_readings r WHERE r.objective_id=o.id AND r.value IS NOT NULL ORDER BY r.id DESC LIMIT 1) AS current,
+                      (SELECT value FROM objective_readings r WHERE r.objective_id=o.id AND r.value IS NOT NULL AND r.ts < datetime('now', $(sqlq "$_obj_wstart")) ORDER BY r.id DESC LIMIT 1) AS baseline,
+                      (SELECT COUNT(*) FROM tasks t WHERE o.project_key IS NOT NULL AND t.project_key=o.project_key AND t.kind='standard' AND t.status NOT IN ('done','cancelled')) AS inflight
+               FROM objectives o ORDER BY o.created_at;" >"$tmpd/obj.json" 2>/dev/null || echo '[]' >"$tmpd/obj.json"
+  [ -s "$tmpd/obj.json" ] || echo '[]' >"$tmpd/obj.json"
+
   DIGEST_TASKS_F="$tmpd/tasks.json" DIGEST_USAGE_F="$tmpd/usage.json" DIGEST_HB_F="$tmpd/hb.txt" \
-  DIGEST_LOOPS_F="$tmpd/loops.json" DIGEST_SUP_F="$tmpd/sup.json" \
+  DIGEST_LOOPS_F="$tmpd/loops.json" DIGEST_SUP_F="$tmpd/sup.json" DIGEST_OBJ_F="$tmpd/obj.json" \
   DIGEST_WINDOW="$window" DIGEST_JSON="$as_json" python3 - >"$tmpd/out.txt" <<'PY'
 import os, json, time, datetime as dt
 
@@ -399,9 +416,45 @@ autonomy = {"uptimeDays": uptime_days, "currentlyBlocked": bool(blocked),
             "shipped": len(done_l), "asked": len(ht_l),
             "priorShipped": prev_ship, "priorAsked": prev_ask, "windowLabel": window_label}
 
+# OSS-19 (OSS-26) objectives: current vs target with a window trend, riding the
+# same window-delta idea as _window_counts. current/baseline come straight from
+# the readings table (metric run by the tick/digest only — never a planner). gap
+# is signed toward "better" per direction; trend is up/down/flat vs the window
+# baseline; originatedThisCycle is 0 in this measurement-only build.
+obj_rows = load("DIGEST_OBJ_F", [])
+if isinstance(obj_rows, dict):
+    obj_rows = obj_rows.get("objectives", [])
+objectives = []
+for o in obj_rows:
+    cur = o.get("current")
+    base = o.get("baseline")
+    tgt = o.get("target")
+    direction = o.get("direction") or "up"
+    if cur is None:
+        trend = "none"
+    elif base is None:
+        trend = "new"
+    elif cur > base:
+        trend = "up"
+    elif cur < base:
+        trend = "down"
+    else:
+        trend = "flat"
+    gap = None
+    if cur is not None and tgt is not None:
+        gap = round((cur - tgt) if direction == "up" else (tgt - cur), 4)
+    objectives.append({
+        "name": o.get("name"), "current": cur, "target": tgt,
+        "direction": direction, "unit": o.get("unit"),
+        "trend": trend, "gap": gap, "inflight": int(o.get("inflight") or 0),
+        "originatedThisCycle": 0, "status": o.get("status"),
+        "public": bool(o.get("public")),
+    })
+
 if as_json:
     print(json.dumps({
         "window": {"since": since, "now": now, "label": window_label},
+        "objectives": objectives,
         "done": done_l, "inProgress": ip_l, "blocked": blk_l, "autoCleared": auto_l,
         "zeroHuman": {"shipped": len(done_l), "humanTouches": len(ht_l), "gates": ht_l},
         "autonomy": autonomy,
@@ -432,6 +485,18 @@ else:
            else f"ran {autonomy['uptimeDays']}d without needing you")
     out.append(f"\U0001F9BE Autonomy — {_up} · shipped {len(done_l)}{_trend(len(done_l), prev_ship)}"
                f" · asked you {len(ht_l)}×{_trend(len(ht_l), prev_ask)}")
+    if objectives:
+        out.append("")
+        out.append(f"\U0001F9ED Objectives ({len(objectives)})")
+        _arrow = {"up": "↑", "down": "↓", "flat": "→", "new": "•", "none": "·"}
+        for o in objectives:
+            u = o["unit"] or ""
+            cur = f"{o['current']:g}{u}" if o["current"] is not None else "—"
+            tgt = f"{o['target']:g}{u}" if o["target"] is not None else "?"
+            paused = " (paused)" if o["status"] == "paused" else ""
+            inflight = f", {o['inflight']} inflight" if o["inflight"] else ""
+            out.append(f"  {_arrow.get(o['trend'], '·')} {o['name']}: {cur} / {tgt} "
+                       f"({o['direction']}{inflight}){paused}")
     out.append("")
     out.append(f"✅ Shipped ({len(done_l)})")
     for t in done_l[:8]:

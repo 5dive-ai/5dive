@@ -50,6 +50,7 @@ cat \
   src/cmd_hire.sh \
   src/cmd_project.sh \
   src/cmd_goal.sh \
+  src/cmd_objective.sh \
   src/cmd_loop.sh \
   src/cmd_loop_pack.sh \
   src/cmd_crew.sh \

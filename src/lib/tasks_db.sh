@@ -348,6 +348,52 @@ CREATE TABLE IF NOT EXISTS task_prefs (
   value      TEXT NOT NULL,
   updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
+
+-- OSS-19 (OSS-26, phase A1): outcome-loop objectives. An objective is a standing
+-- goal bound to a READ-ONLY metric command (metric_cmd: stdout -> one number).
+-- The metric is run ONLY by `objective tick` and the digest — NEVER by a planner
+-- (the anti-Goodhart separation: the planner receives readings, it can't own the
+-- number). This phase A1 build is MEASUREMENT ONLY: no origination, no planner
+-- cycle. The re-plan cycle (planner, review cron, max_new_per_cycle, budget,
+-- project_key link) is the successor build; those columns are stored now so the
+-- data model is stable, but nothing reads them for origination yet.
+--   direction  up|down — which way is "better" (target gap + trend sign)
+--   public     1 => eligible for the public proof feed (rides proof publish in a
+--              later phase; this build does not touch cmd_proof.sh)
+--   status     active|paused — paused objectives are not ticked
+-- Additive, never referenced by tasks/projects, so it can't touch the queue.
+-- Defined identically inside _tasks_db_migrate for pre-existing stores; keep the
+-- two copies byte-identical (tests/schema_sync_unit.sh).
+CREATE TABLE IF NOT EXISTS objectives (
+  id                INTEGER PRIMARY KEY AUTOINCREMENT,
+  name              TEXT NOT NULL UNIQUE,
+  metric_cmd        TEXT NOT NULL,
+  target            REAL,
+  direction         TEXT NOT NULL DEFAULT 'up',
+  unit              TEXT,
+  review            TEXT,
+  planner           TEXT,
+  project_key       TEXT,
+  max_new_per_cycle INTEGER NOT NULL DEFAULT 3,
+  budget            INTEGER,
+  public            INTEGER NOT NULL DEFAULT 0,
+  status            TEXT NOT NULL DEFAULT 'active',
+  created_by        TEXT,
+  created_at        TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at        TEXT NOT NULL DEFAULT (datetime('now'))
+);
+-- Append-only reading history — one row per tick (value=NULL + rc!=0 on a metric
+-- failure, so a broken metric-cmd shows as a visible gap, not a silent skip). This
+-- is the audit trail, same honesty pattern as the proof branch's history.jsonl.
+-- Keep byte-identical to the copy in _tasks_db_migrate (tests/schema_sync_unit.sh).
+CREATE TABLE IF NOT EXISTS objective_readings (
+  id           INTEGER PRIMARY KEY AUTOINCREMENT,
+  objective_id INTEGER NOT NULL REFERENCES objectives(id) ON DELETE CASCADE,
+  ts           TEXT NOT NULL DEFAULT (datetime('now')),
+  value        REAL,
+  rc           INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS objective_readings_idx ON objective_readings(objective_id, id);
 SQL
 }
 
@@ -557,6 +603,45 @@ CREATE TABLE IF NOT EXISTS task_prefs (
   value      TEXT NOT NULL,
   updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
+MIG
+  fi
+
+  # OSS-19 (OSS-26) objectives + objective_readings — additive, gated on the
+  # objectives table's absence so it takes no write lock on every command. Both
+  # brand-new, never referenced by tasks/projects, so creating them cannot touch
+  # the existing queue. Keep these two CREATE TABLE bodies byte-identical to the
+  # copies in _tasks_schema above (tests/schema_sync_unit.sh).
+  local has_objectives
+  has_objectives=$(sqlite3 -cmd ".timeout 5000" "$TASKS_DB" \
+    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='objectives' LIMIT 1;" 2>/dev/null)
+  if [[ "$has_objectives" != "1" ]]; then
+    sqlite3 -cmd ".timeout 5000" "$TASKS_DB" <<'MIG' >/dev/null 2>&1 || true
+CREATE TABLE IF NOT EXISTS objectives (
+  id                INTEGER PRIMARY KEY AUTOINCREMENT,
+  name              TEXT NOT NULL UNIQUE,
+  metric_cmd        TEXT NOT NULL,
+  target            REAL,
+  direction         TEXT NOT NULL DEFAULT 'up',
+  unit              TEXT,
+  review            TEXT,
+  planner           TEXT,
+  project_key       TEXT,
+  max_new_per_cycle INTEGER NOT NULL DEFAULT 3,
+  budget            INTEGER,
+  public            INTEGER NOT NULL DEFAULT 0,
+  status            TEXT NOT NULL DEFAULT 'active',
+  created_by        TEXT,
+  created_at        TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at        TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE TABLE IF NOT EXISTS objective_readings (
+  id           INTEGER PRIMARY KEY AUTOINCREMENT,
+  objective_id INTEGER NOT NULL REFERENCES objectives(id) ON DELETE CASCADE,
+  ts           TEXT NOT NULL DEFAULT (datetime('now')),
+  value        REAL,
+  rc           INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS objective_readings_idx ON objective_readings(objective_id, id);
 MIG
   fi
 }
