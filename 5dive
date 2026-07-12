@@ -23402,13 +23402,18 @@ PY
 #
 # Usage:
 #   5dive proof publish [--dry-run] [--repo=<url>] [--branch=<b>]
-#   5dive proof on --repo=<url> [--branch=status] [--at=<0-23>]
+#   5dive proof on --repo=<url> [--branch=status] [--at=<0-23>] [--user=<u>]
 #   5dive proof off
 #   5dive proof status [--json]
-#   5dive proof tick        # cron driver (root); gated on the pref
+#   5dive proof tick        # cron driver; gated on the pref
+#
+# OSS-30: the daily cron runs as --user (default root). The cron's effective
+# user must own the box's git push credentials — on boxes where root has none
+# (creds live with a service user), pass --user=<that user>.
 
 _proof_pref_file() { echo "${STATE_DIR}/proof.json"; }
-_PROOF_CRON="/etc/cron.d/5dive-proof"
+# Overridable for isolated tests; the real path needs root to write.
+_PROOF_CRON="${_PROOF_CRON:-/etc/cron.d/5dive-proof}"
 _PROOF_DEFAULT_REPO="https://github.com/5dive-ai/5dive.git"
 _PROOF_METHODOLOGY_URL="https://github.com/5dive-ai/5dive/blob/main/docs/zero-human.md"
 
@@ -23640,15 +23645,17 @@ _proof_publish() {
   return 0
 }
 
-# _proof_install_cron <hour> — idempotent root cron that runs `proof tick`
-# daily at <hour>. Rewritten (never appended) so on/off/re-on is clean.
+# _proof_install_cron <hour> [user] — idempotent cron that runs `proof tick`
+# daily at <hour> as [user] (default root). Rewritten (never appended) so
+# on/off/re-on is clean. OSS-30: the cron's effective user must own the box's
+# git push credentials — on boxes where root has none, pass --user=<name>.
 _proof_install_cron() {
-  local hour="$1"
+  local hour="$1" user="${2:-root}"
   [ -d /etc/cron.d ] || { echo "proof: /etc/cron.d absent — skipping cron install" >&2; return 0; }
   cat > "$_PROOF_CRON" <<CRON
 # 5dive zero-human proof publisher (OSS-17) — daily; gated on the per-box pref
 # (${STATE_DIR}/proof.json). Removed by \`5dive proof off\`.
-0 ${hour} * * * root /usr/local/bin/5dive proof tick >> /var/log/5dive-proof.log 2>&1
+0 ${hour} * * * ${user} /usr/local/bin/5dive proof tick >> /var/log/5dive-proof.log 2>&1
 CRON
   chmod 644 "$_PROOF_CRON"
 }
@@ -23656,12 +23663,13 @@ CRON
 # _proof_onoff <on|off|status> [--repo=] [--branch=] [--at=] — pref + cron mgmt.
 _proof_onoff() {
   local sub="$1"; shift || true
-  local repo="" branch="" hour="" f; f="$(_proof_pref_file)"
+  local repo="" branch="" hour="" user="" f; f="$(_proof_pref_file)"
   while [ $# -gt 0 ]; do
     case "$1" in
       --repo=*)   repo="${1#*=}" ;;
       --branch=*) branch="${1#*=}" ;;
       --at=*)     hour="${1#*=}" ;;
+      --user=*)   user="${1#*=}" ;;
       *) fail "$E_USAGE" "proof $sub: unknown arg: $1" ;;
     esac
     shift
@@ -23675,13 +23683,17 @@ _proof_onoff() {
       [ -n "$repo" ] || fail "$E_USAGE" "proof on: --repo=<url> is required (no repo configured yet)"
       [ -n "$branch" ] || branch="$(jq -r '.branch // "status"' <<<"$cur")"
       [ -n "$hour" ] || hour="$(jq -r '.hour // 9' <<<"$cur")"
+      # OSS-30: cron user carries git push creds; default root, persist across re-on.
+      [ -n "$user" ] || user="$(jq -r '.user // "root"' <<<"$cur")"
       case "$hour" in ''|*[!0-9]*) fail "$E_USAGE" "proof on: --at must be an hour 0-23" ;; esac
       { [ "$hour" -ge 0 ] && [ "$hour" -le 23 ]; } || fail "$E_USAGE" "proof on: --at must be 0-23"
+      id "$user" >/dev/null 2>&1 || fail "$E_USAGE" "proof on: --user=$user is not a known system user"
       mkdir -p "$(dirname "$f")"
-      jq --arg r "$repo" --arg b "$branch" --argjson h "$hour" \
-        '.enabled=true | .repo=$r | .branch=$b | .hour=$h' <<<"$cur" > "$f.tmp" && mv "$f.tmp" "$f"
-      _proof_install_cron "$hour"
-      echo "proof: ON — daily ${hour}:00 → ${repo} (${branch})"
+      jq --arg r "$repo" --arg b "$branch" --argjson h "$hour" --arg u "$user" \
+        '.enabled=true | .repo=$r | .branch=$b | .hour=$h | .user=$u' <<<"$cur" > "$f.tmp" && mv "$f.tmp" "$f"
+      _proof_install_cron "$hour" "$user"
+      local as=""; [ "$user" = "root" ] || as=" as ${user}"
+      echo "proof: ON — daily ${hour}:00 → ${repo} (${branch})${as}"
       ;;
     off)
       require_root
@@ -23694,14 +23706,16 @@ _proof_onoff() {
         jq -c '{enabled:(.enabled//false),repo:(.repo//null),branch:(.branch//"status"),hour:(.hour//9),lastPublished:(.lastPublished//null)}' <<<"$cur"
         return 0
       fi
-      local enabled repo_c branch_c hour_c last today staleness
+      local enabled repo_c branch_c hour_c user_c last today staleness as
       enabled="$(jq -r '.enabled // false' <<<"$cur")"
       repo_c="$(jq -r '.repo // ""' <<<"$cur")"
       branch_c="$(jq -r '.branch // "status"' <<<"$cur")"
       hour_c="$(jq -r '.hour // 9' <<<"$cur")"
+      user_c="$(jq -r '.user // "root"' <<<"$cur")"
+      as=""; [ "$user_c" = "root" ] || as=" as ${user_c}"
       last="$(jq -r '.lastPublished // ""' <<<"$cur")"
       if [ "$enabled" = "true" ]; then
-        echo "proof: ON — daily ${hour_c}:00 → ${repo_c} (${branch_c})"
+        echo "proof: ON — daily ${hour_c}:00 → ${repo_c} (${branch_c})${as}"
       elif [ -n "$repo_c" ]; then
         echo "proof: OFF (configured: ${repo_c} ${branch_c})"
       else
@@ -23743,15 +23757,18 @@ cmd_proof() {
     -h|--help|"")
       cat <<'HELP'
 usage: 5dive proof publish [--dry-run] [--repo=<url>] [--branch=<b>]
-       5dive proof on --repo=<url> [--branch=status] [--at=<0-23>]
+       5dive proof on --repo=<url> [--branch=status] [--at=<0-23>] [--user=<u>]
        5dive proof off
        5dive proof status [--json]
-       5dive proof tick        # cron driver (root); gated on the pref
+       5dive proof tick        # cron driver; gated on the pref
 
 Publishes this box's zero-human proof (badge.json + zero-human.json +
 history.jsonl) to a git status branch, computed VERBATIM from `5dive digest`.
 There is no flag to edit a number — the no-edit path is the point. Publish is
 idempotent per day (a re-run exits 3). See docs/zero-human.md for methodology.
+
+--user sets the cron's effective user (default root). It must own the box's
+git push credentials, or the nightly push fails silently as visible staleness.
 HELP
       ;;
     *) fail "$E_USAGE" "proof: unknown subcommand: ${1:-} (publish|on|off|status|tick)" ;;

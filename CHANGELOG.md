@@ -9,6 +9,15 @@ release.
 
 ## [Unreleased]
 
+### Added
+- **`proof on --user=<name>` (OSS-30, gh 5dive#30).** The nightly proof-publisher
+  cron now runs as `--user` (default `root`, back-compatible). The cron's
+  effective user must own the box's git push credentials; on boxes where root
+  holds none (creds live with a service user), `--user=<that user>` fixes the
+  otherwise-silent 03:00 push failure. Persisted in `proof.json` and sticky
+  across re-`on`; unknown users are rejected; `proof status` shows a non-root
+  user. Surfaced during OSS-29 live verify.
+
 ## [0.8.15] — 2026-07-12
 
 ### Added

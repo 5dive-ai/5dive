@@ -88,13 +88,24 @@ methodology, same honesty invariants. The `5dive proof` verb does it (OSS-17):
 # one-shot, preview first (builds the files, shows the diff, pushes nothing):
 5dive proof publish --dry-run --repo=https://github.com/<you>/<repo>.git
 
-# turn on the daily publisher (saves config + installs a root cron):
+# turn on the daily publisher (saves config + installs the cron):
 sudo 5dive proof on --repo=https://github.com/<you>/<repo>.git --at=9
 5dive proof status          # config, last published date, staleness
 sudo 5dive proof off        # stop publishing (config kept)
 ```
 
-Push auth is the box's ambient git credentials; the verb never stores a token.
+The cron runs as root by default. Push auth is the box's ambient git
+credentials, so the cron's effective user must be the one that holds those
+credentials. If root has no push access on your box (e.g. the token lives with
+a service user), point the cron at that user:
+
+```sh
+sudo 5dive proof on --repo=https://github.com/<you>/<repo>.git --at=9 --user=<u>
+```
+
+Otherwise the nightly push fails silently and shows up as a stale badge date.
+The chosen user is saved and sticks across re-`on`. Push auth is the box's
+ambient git credentials; the verb never stores a token.
 Numbers come from `5dive digest --json` verbatim, there is deliberately no flag
 to edit a number, and re-runs are idempotent per day. On your first publish the
 verb prints the copy-paste README badge markdown pointing at YOUR status branch.
