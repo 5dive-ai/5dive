@@ -30,6 +30,19 @@ release.
   Approval/manual routing is deferred — it needs the DIVE-1117 provenance floor
   to trust a designated reviewer. Unit-tested in `tests/gate_ship_routing_unit.sh`.
 
+### Fixed
+- **Ship-gating routing, verifier iter-2 fixes (DIVE-1145).** (1) The route
+  guard now keys on the **effective** tier (`type==decision && tier != 2`)
+  instead of `tier_floored==0`, closing a hole where an explicit
+  `--type=decision --tier=2` gate that missed the keyword floor kept
+  `tier_floored=0` and silently routed to the lead — overriding the hard-human
+  `--tier=2` contract and suppressing the human ping. (2) The unit harness now
+  stubs `5dive` with a shell function (shadows the real binary, inherited by the
+  detached `( … & )` send subshell) recording sends to a file sentinel, so the
+  suite has **zero** live side-effects on real hosts/CI (was firing phantom
+  `5dive agent send main` pings). Added coverage for explicit-`--tier=2` and a
+  no-stray-send assertion; `gate_ship_routing_unit` now 12/12.
+
 ## [0.8.15] — 2026-07-12
 
 ### Added

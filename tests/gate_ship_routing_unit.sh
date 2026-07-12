@@ -35,8 +35,23 @@ tasks_db_init
 HUMAN_PINGED=0
 task_need_notify() { HUMAN_PINGED=1; }
 audit_log() { :; }
-# _gate_route_reviewer shells `5dive agent send` in the on-route path; command -v
-# 5dive is false in the harness sandbox, so the send is skipped — no stub needed.
+# The on-route path runs `command -v 5dive` then `( 5dive agent send … & )`.
+# 5dive IS on PATH on every real host + CI, so WITHOUT a stub the suite fires a
+# live "5dive agent send main" (the phantom cross-agent pings we saw). Define a
+# `5dive` shell FUNCTION: it shadows the external binary, is inherited by the
+# detached ( … & ) subshell, keeps `command -v 5dive` true so the route branch is
+# still exercised, and records the send into a sentinel instead of hitting the
+# network — ZERO live side-effects regardless of env. ROUTE_SENT counts sends.
+# The send is dispatched detached — `( 5dive agent send … & )` — so a var set in
+# the stub never propagates back to the parent. Record into a FILE the orphaned
+# child can write, then read it back. route_reset truncates it per case;
+# route_sent polls briefly (the detached job is async) and echoes the count.
+ROUTE_FILE="$TMP/route.log"
+5dive() { if [[ "${1:-}" == "agent" && "${2:-}" == "send" ]]; then printf '%s\n' "${3:-}" >>"$ROUTE_FILE"; fi; return 0; }
+export -f 5dive 2>/dev/null || true
+route_reset() { : >"$ROUTE_FILE"; }
+route_sent()  { local i; for i in 1 2 3 4 5 6 7 8 9 10; do [[ -s "$ROUTE_FILE" ]] && break; sleep 0.05; done; grep -c . "$ROUTE_FILE" 2>/dev/null || echo 0; }
+route_last()  { tail -n1 "$ROUTE_FILE" 2>/dev/null; }
 
 # Org chart: main is the lone root (coordinator); dev reports to main.
 db "INSERT INTO agents_org(name,reports_to,role) VALUES('main',NULL,'coordinator');"
@@ -58,10 +73,11 @@ cmd_task_need DIVE-1 --type=decision --ask="ship A or B?" --options="A|B" --reco
 _task_pref_set gate_builder_routing on
 
 # --- pref ON: builder decision routes to lead, NO human ping ----------------
-seed DIVE-2; HUMAN_PINGED=0
+seed DIVE-2; HUMAN_PINGED=0; route_reset
 cmd_task_need DIVE-2 --type=decision --ask="ship A or B?" --options="A|B" --recommend="A" --from=dev >/dev/null 2>&1
 [[ "$HUMAN_PINGED" == "0" ]] && ok_t "route on: builder decision does NOT ping human" || bad_t "route suppresses human" "HUMAN_PINGED=$HUMAN_PINGED"
 [[ "$(statusof DIVE-2)" == "blocked" && "$(answered DIVE-2)" == "open" ]] && ok_t "routed gate stays blocked+open for lead" || bad_t "routed gate blocked+open" "status=$(statusof DIVE-2) ans=$(answered DIVE-2)"
+R2=$(route_sent); [[ "$R2" == "1" && "$(route_last)" == "main" ]] && ok_t "routed send hit lead (main), stubbed — no live network" || bad_t "routed send → main via stub" "sent=$R2 last='$(route_last)'"
 
 # --- pref ON: gate filed BY the lead escalates to human ----------------------
 seed DIVE-3; HUMAN_PINGED=0
@@ -74,9 +90,18 @@ cmd_task_need DIVE-4 --type=approval --ask="approve the prod push?" --from=dev >
 [[ "$HUMAN_PINGED" == "1" ]] && ok_t "route on: approval stays human-directed" || bad_t "approval → human" "HUMAN_PINGED=$HUMAN_PINGED"
 
 # --- pref ON: tier-2-floored decision (money) is NOT routed ------------------
-seed DIVE-5; HUMAN_PINGED=0
+seed DIVE-5; HUMAN_PINGED=0; route_reset
 cmd_task_need DIVE-5 --type=decision --ask="approve the \$5000 ad spend budget?" --options="yes|no" --recommend="no" --from=dev >/dev/null 2>&1
 [[ "$HUMAN_PINGED" == "1" ]] && ok_t "route on: T2-floored decision (money) → human" || bad_t "T2 floor → human" "HUMAN_PINGED=$HUMAN_PINGED"
+[[ ! -s "$ROUTE_FILE" ]] && ok_t "T2-floored decision: no lead route fired" || bad_t "T2 floor no route" "sent=$(route_last)"
+
+# --- pref ON: EXPLICIT --tier=2 decision (no floor keyword) is NOT routed ----
+# Guards the hard-human contract: 2 = never auto-applies, always pings. Before
+# the effective-tier fix this left tier_floored=0 and silently routed to the lead.
+seed DIVE-6; HUMAN_PINGED=0; route_reset
+cmd_task_need DIVE-6 --type=decision --tier=2 --ask="pick the launch date?" --options="mon|tue" --recommend="mon" --from=dev >/dev/null 2>&1
+[[ "$HUMAN_PINGED" == "1" ]] && ok_t "route on: explicit --tier=2 decision → human (not routed)" || bad_t "explicit T2 decision → human" "HUMAN_PINGED=$HUMAN_PINGED"
+[[ ! -s "$ROUTE_FILE" ]] && ok_t "explicit --tier=2 decision: no lead route fired" || bad_t "explicit T2 no route" "sent=$(route_last)"
 
 echo "----"; echo "PASS=$PASS FAIL=$FAIL"
 [[ "$FAIL" == "0" ]]

@@ -1667,12 +1667,17 @@ cmd_task_need() {
   # approval/manual/secret are enforced human-only by `task answer` (DIVE-1117
   # provenance floor) — routing those to an agent-reviewer needs the floor to
   # trust a designated reviewer, a deeper change deferred to a follow-up. We
-  # never route a tier-2-floored gate (true-human category — money/destructive/
-  # brand/secret, per _gate_tier2_floor_hit) nor one filed BY a lead
+  # never route a tier-2 gate — whether floored (true-human category: money/
+  # destructive/brand/secret, per _gate_tier2_floor_hit) OR filed with an
+  # explicit --tier=2 (the caller's hard-human contract; 2 = never auto-applies,
+  # always pings the human). Guarding on the EFFECTIVE tier (tier != 2) subsumes
+  # the floor, since a floored gate always sets tier=2, and closes the hole where
+  # `--type=decision --tier=2` with no floor keyword left tier_floored=0 and
+  # silently routed past the human. We also never route one filed BY a lead
   # (_gate_route_reviewer returns empty → falls through to the human, which is
   # also how the lead re-escalates). Reviewer notify is best-effort + detached so
   # the 45s tmux-inject wait never blocks or fails the already-committed gate.
-  if [[ "$type" == "decision" && "$tier_floored" == "0" ]]; then
+  if [[ "$type" == "decision" && "$tier" != "2" ]]; then
     local _route; _route=$(_task_pref_get gate_builder_routing); _route="${_route:-off}"
     if [[ "$_route" == "on" ]]; then
       local _reviewer; _reviewer=$(_gate_route_reviewer "$actor")
