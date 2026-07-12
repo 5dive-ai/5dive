@@ -9,6 +9,8 @@ release.
 
 ## [Unreleased]
 
+## [0.8.13] — 2026-07-12
+
 ### Added
 - **Outcome-loop objectives — `5dive objective` (OSS-19 / OSS-26, phase A1, gh
   5dive#23).** A first-class primitive for a standing goal the company steers a
