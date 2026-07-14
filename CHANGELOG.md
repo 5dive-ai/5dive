@@ -9,6 +9,17 @@ release.
 
 ## [Unreleased]
 
+### Fixed
+- **codex `auth login` uses device-code auth on headless/remote (DIVE-1178).**
+  `sudo 5dive agent auth login codex` (and `5dive init`) now runs
+  `codex login --device-auth` instead of plain `codex login`, which started an
+  interactive browser OAuth with a `localhost:1455` callback server. codex
+  itself flags this ("On a remote or headless machine? Use codex login
+  --device-auth instead."); `--device-auth` prints a URL + one-time code and the
+  CLI polls OpenAI, so SSH/headless users can auth with no local browser. Same
+  shape grok already uses and the dashboard device-code flow (`auth start`)
+  already drove.
+
 ## [0.8.16] — 2026-07-12
 
 ### Added

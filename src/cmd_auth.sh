@@ -916,8 +916,15 @@ cmd_auth_login() {
       exec sudo -u claude -i env DISPLAY=:0 $extra_env "$bin" \
         models auth login --provider openai --device-code --set-default ;;
     codex)
+      # codex's plain `login` starts an interactive browser OAuth with a
+      # localhost:1455 callback server — broken on a remote/headless box (codex
+      # itself prints "On a remote or headless machine? Use codex login
+      # --device-auth instead."). --device-auth prints a URL + one-time code and
+      # the CLI polls OpenAI itself, so the same flow works over SSH with no
+      # local browser — same shape grok/hermes use and the dashboard
+      # device-code flow already drives (cmd_auth_start). DIVE-1178.
       # CODEX_HOME (when profiled) overrides /etc/profile.d's default.
-      exec sudo -u claude -i env $extra_env bash -lc 'codex login' ;;
+      exec sudo -u claude -i env $extra_env bash -lc 'codex login --device-auth' ;;
     antigravity)
       # agy has no `auth login` subcommand — OAuth fires automatically the
       # first time the binary needs a token. Use the interactive TUI
