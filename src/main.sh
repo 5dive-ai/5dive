@@ -142,7 +142,7 @@ Agents:
                                                      # the marker line until it stops growing for
                                                      # --idle-secs, then prints the reply body.
   5dive agent stats <name>                           # state, restart count, last exit
-  5dive agent install <type>                         # install the CLI for a type if missing
+  5dive agent install <type> [--upgrade]             # install the CLI for a type if missing (--upgrade forces a reinstall)
   5dive agent set-account <agent> <account|default>  # rebind to a named account; "default" clears
 
 Default workdir: ${DEFAULT_WORKDIR}

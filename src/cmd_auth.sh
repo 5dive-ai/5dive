@@ -364,30 +364,52 @@ cmd_auth_status() {
 }
 
 cmd_install() {
-  local type="${1:-}"
-  [[ -n "$type" ]] || fail "$E_USAGE" "usage: 5dive agent install <type>"
+  local type="" upgrade=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --upgrade|--force|-u) upgrade=1 ;;
+      -*) fail "$E_USAGE" "unknown flag: $1 (usage: 5dive agent install <type> [--upgrade])" ;;
+      *) if [[ -z "$type" ]]; then type="$1"; else fail "$E_USAGE" "unexpected argument: $1"; fi ;;
+    esac
+    shift
+  done
+  [[ -n "$type" ]] || fail "$E_USAGE" "usage: 5dive agent install <type> [--upgrade]"
   is_known_type "$type" || fail "$E_NOT_FOUND" "unknown type: $type"
   local bin="${TYPE_BIN[$type]}"
-  if [[ -x "$bin" ]]; then
-    ok "$type already installed at $bin" \
-       '{type:$t, bin:$b, installed:true, alreadyInstalled:true}' \
+  if [[ -x "$bin" && $upgrade -eq 0 ]]; then
+    ok "$type already installed at $bin (pass --upgrade to force a reinstall)" \
+       '{type:$t, bin:$b, installed:true, alreadyInstalled:true, upgraded:false}' \
        --arg t "$type" --arg b "$bin"
     return 0
   fi
   local recipe="${TYPE_INSTALL[$type]:-}"
   [[ -n "$recipe" ]] || fail "$E_NOT_INSTALLED" "no installer configured for '$type' — please install $bin manually"
-  step "Installing $type (as user 'claude')"
+  local existed=0; [[ -x "$bin" ]] && existed=1
+  # DIVE-1189: --upgrade sets FORCE_INSTALL=1 so recipes that self-guard on an
+  # existing binary (e.g. codex's `-x` check) reinstall @latest in place instead
+  # of no-oping. The provisioning path (cmd_agent_create) calls us WITHOUT the
+  # flag, so FORCE_INSTALL stays unset there and install-if-missing is unchanged.
+  local prelude=""
+  if [[ $upgrade -eq 1 ]]; then
+    prelude="export FORCE_INSTALL=1; "
+    step "Upgrading $type (as user 'claude')"
+  else
+    step "Installing $type (as user 'claude')"
+  fi
   # -i loads claude's login env (nvm, XDG redirects, etc.)
-  sudo -u claude -i bash -lc "$recipe" >&2
+  sudo -u claude -i bash -lc "${prelude}${recipe}" >&2
   # DIVE-901: some installers finish async or drop the binary via a late
   # rename — give the bin a short grace before declaring failure. Only sleeps
   # on the would-have-failed path; the happy path pays nothing.
   local _waited=0
   while [[ ! -x "$bin" && $_waited -lt 10 ]]; do sleep 1; _waited=$((_waited + 1)); done
   if [[ -x "$bin" ]]; then
-    ok "$type installed at $bin" \
-       '{type:$t, bin:$b, installed:true, alreadyInstalled:false}' \
-       --arg t "$type" --arg b "$bin"
+    local verb="installed" ujson=false
+    [[ $upgrade -eq 1 ]] && ujson=true
+    [[ $existed -eq 1 && $upgrade -eq 1 ]] && verb="upgraded"
+    ok "$type $verb at $bin" \
+       '{type:$t, bin:$b, installed:true, alreadyInstalled:false, upgraded:$u}' \
+       --arg t "$type" --arg b "$bin" --argjson u "$ujson"
   else
     fail "$E_GENERIC" "$type install reported success but $bin still missing — investigate manually"
   fi

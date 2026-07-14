@@ -26,7 +26,7 @@ esac
 
 # Bumped on every public release. `build.sh` checks this line exists; CI fails
 # the bundle-drift check if it's missing or empty.
-readonly FIVE_VERSION="0.8.17"
+readonly FIVE_VERSION="0.8.18"
 
 # GitHub org our repos live under. The org is being renamed
 # 5dive-com -> 5dive-ai (2026-06); fetches must work on either side of the
@@ -198,8 +198,12 @@ declare -A TYPE_INSTALL=(
   # would short-circuit the install, leaving v24/bin/codex empty and
   # surfacing as "install reported success but bin missing". `nvm use 24`
   # forces npm install -g to land in v24's bin dir even when the default
-  # alias has drifted.
-  [codex]="[[ -x /home/claude/.nvm/versions/node/v24/bin/codex ]] || { . /home/claude/.nvm/nvm.sh && nvm use 24 >/dev/null && npm install -g @openai/codex; }"
+  # alias has drifted (same drift the nightly soft-updates hit — DIVE-1189).
+  # DIVE-1189: `5dive agent install codex --upgrade` sets FORCE_INSTALL=1 to skip
+  # the -x short-circuit and reinstall @latest in place; without it (the
+  # provisioning path) an existing v24 codex is left untouched. \$-escaped so the
+  # var expands when the recipe runs under `bash -lc`, not at array-definition time.
+  [codex]="{ [[ -z \"\${FORCE_INSTALL:-}\" ]] && [[ -x /home/claude/.nvm/versions/node/v24/bin/codex ]]; } || { . /home/claude/.nvm/nvm.sh && nvm use 24 >/dev/null && npm install -g @openai/codex@latest; }"
   # opencode.ai's installer drops the binary at ~/.opencode/bin/opencode and
   # only adds it to PATH via .bashrc — but bash -lc skips .bashrc on
   # non-interactive shells, so neither the verify check below nor the agent
