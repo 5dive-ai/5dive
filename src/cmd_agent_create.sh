@@ -204,6 +204,12 @@ link_agent_profile() {
   [[ -f "$target" ]] \
     || fail "$E_NOT_FOUND" "auth profile '$profile' not configured — run: sudo 5dive agent auth set <type> --api-key=... --auth-profile=$profile"
   ln -s "$target" "$link"
+  # DIVE-1188: a NEW agent bound to an EXISTING profile (no re-login in between)
+  # must still be able to seed codex/grok auth.json without sudo, so normalize
+  # the profile's file creds to 0640 group=claude at bind time. Guarded because
+  # this lib is also sourced in contexts without cmd_auth.sh.
+  declare -F normalize_profile_seed_perms >/dev/null 2>&1 \
+    && normalize_profile_seed_perms "$profile"
 }
 
 # Write a BYO (bring-your-own) API-key credential for hermes/openclaw into
@@ -1213,6 +1219,17 @@ cmd_create() {
   # pairing step only when pairing genuinely already happened.
   local auto_paired="false"
   [[ -n "$telegram_allowed_users" ]] && channel_in_list telegram "$channels" && auto_paired="true"
+  # DIVE-1190: a telegram agent with an empty allowlist silently drops every DM
+  # (server loadAccess -> dmPolicy=allowlist, allowFrom=[]), so the bot looks
+  # broken with zero signal. When we could NOT auto-pair (no operator id known
+  # and none passed), print the exact step that makes it reachable — otherwise
+  # the creator is deaf and thinks the plugin never fired. Goes to stderr so it
+  # never pollutes --json stdout.
+  if [[ "$auto_paired" != "true" ]] && channel_in_list telegram "$channels"; then
+    warn "telegram bot for '$name' is NOT paired yet — it will ignore every DM until you run:"
+    warn "    5dive agent pair $name --user-id=<yourTelegramUserId>"
+    warn "(DM @userinfobot for your id; chat_id == user_id for a private DM. Tip: pass --telegram-allowed-users=<id> to 'agent create' to pair in one shot next time.)"
+  fi
   ok "agent '$name' (type=$type, channels=$channels${profile:+, profile=$profile}) is running." \
      '{name:$n, type:$t, channels:$c, workdir:$w, authProfile:$p, created:true, autoPaired:$ap, skills:{installed:$inst, failed:$fail}, teamBot:$tb}' \
      --arg n "$name" --arg t "$type" --arg c "$channels" --arg w "$effective_workdir" --arg p "${profile:-}" \
