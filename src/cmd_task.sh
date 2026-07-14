@@ -1465,6 +1465,11 @@ cmd_task_need() {
   # secret -> 2 (today's behavior, unchanged). Explicit --tier can lower an
   # approval/decision/manual gate, EXCEPT: a secret gate is always tier 2, and
   # the T2 category floor below overrides everything.
+  # DIVE-1182: remember whether --tier was EXPLICIT (a caller's hard-human
+  # contract) vs. only the type default. approval/manual/secret default to tier 2,
+  # so the effective tier alone can't tell "builder ship-gate" from "caller pinned
+  # hard-human"; the routing predicate below needs the explicit signal.
+  local tier_arg="$tier"
   if [[ -n "$tier" ]]; then
     [[ "$tier" == "0" || "$tier" == "1" || "$tier" == "2" ]] \
       || fail "$E_VALIDATION" "bad --tier '$tier' (0=auto-clear | 1=48h-TTL-applies-rec | 2=hard human gate)"
@@ -1712,12 +1717,47 @@ cmd_task_need() {
   # (_gate_route_reviewer returns empty → falls through to the human, which is
   # also how the lead re-escalates). Reviewer notify is best-effort + detached so
   # the 45s tmux-inject wait never blocks or fails the already-committed gate.
-  if [[ "$type" == "decision" && "$tier" != "2" ]]; then
+  # DIVE-1182 closes the DIVE-1145 gap: a builder's ship-gate is filed as
+  # `approval` (or `manual`), NOT `decision`, so v1 left it human-only — it pinged
+  # lodar instead of being clearable by the org lead (Marcus). We now route
+  # approval/manual too, so a NON-true-human builder gate reaches the lead first.
+  # `secret` is deliberately EXCLUDED (a secret must be delivered by a human,
+  # never an agent), and tier-2 gates are never routed (guarded by tier != 2,
+  # which subsumes the true-human category floor: money/destructive/brand/secret).
+  # Unlike decision (agent-clearable by type), approval/manual are human-only in
+  # cmd_task_answer; routing them therefore PERSISTS routed_reviewer, the single
+  # basis for the designated-reviewer floor exception there — so the exception is
+  # scoped to exactly this routed gate + this reviewer, and every un-routed
+  # approval/manual gate stays hard-human (DIVE-391/515/516 boundary intact).
+  # Routability differs by type because of the tier-2 defaults:
+  #   decision — defaults to tier 1, so `tier != 2` cleanly means "not pinned/
+  #     floored hard-human" (subsumes explicit --tier=2 AND the category floor,
+  #     which already ran above for tier<2).
+  #   approval/manual — default to tier 2, so the effective tier can't discriminate.
+  #     Route them UNLESS the caller EXPLICITLY pinned --tier=2 (hard-human
+  #     contract) OR the ask/title hits the true-human category floor (money/
+  #     destructive/brand/secret) — the same floor decision that gates a decision,
+  #     re-run here because the tier==2 short-circuit above skipped it for these.
+  #   secret — never routable (must be delivered by a human).
+  local _routable=0
+  case "$type" in
+    decision) [[ "$tier" != "2" ]] && _routable=1 ;;
+    approval|manual)
+      if [[ "$tier_arg" != "2" ]]; then
+        local _rt_title; _rt_title=$(db "SELECT COALESCE(title,'') FROM tasks WHERE id=${id};")
+        _gate_tier2_floor_hit "${ask} ${_rt_title}" || _routable=1
+      fi ;;
+  esac
+  if [[ "$_routable" == "1" ]]; then
     local _route; _route=$(_task_pref_get gate_builder_routing); _route="${_route:-off}"
     if [[ "$_route" == "on" ]]; then
       local _reviewer; _reviewer=$(_gate_route_reviewer "$actor")
       if [[ -n "$_reviewer" ]]; then
-        local _hmsg="🧭 [${ident}] routed to you for lead review (builder gate). ${ask}"
+        # Persist the designated reviewer on the row. For approval/manual this is
+        # what authorizes agent-<_reviewer> to clear the gate later; for decision
+        # it is provenance only (decision is already agent-clearable by type).
+        db "UPDATE tasks SET routed_reviewer=$(sqlq "$_reviewer") WHERE id=${id};"
+        local _hmsg="🧭 [${ident}] routed to you for lead review (builder ${type} gate). ${ask}"
         [[ -n "$options" ]]   && _hmsg+=" Options: ${options}."
         [[ -n "$recommend" ]] && _hmsg+=" ${actor} recommends: ${recommend}."
         _hmsg+=" Resolve: 5dive task answer ${ident} --value=\"<choice>\" — or re-file to escalate to the human."
@@ -1725,7 +1765,7 @@ cmd_task_need() {
           ( 5dive agent send "$_reviewer" "$_hmsg" --from="$actor" >/dev/null 2>&1 & ) || true
         fi
         [[ $EUID -eq 0 ]] && audit_log "task need lead-route" "ok" 0 -- "task=$ident" "type=$type" "reviewer=$_reviewer" "filer=$actor" || true
-        ok "$ident routed to lead $_reviewer for review (decision, tier $tier) — $ask" \
+        ok "$ident routed to lead $_reviewer for review ($type, tier $tier) — $ask" \
            '{id:($i|tonumber), ident:$id, status:"blocked", need_type:$ty, tier:($tr|tonumber), routed_to:$rv, ask:$ak, recommend:(($rc|select(length>0)) // null)}' \
            --arg i "$id" --arg id "$ident" --arg ty "$type" --arg tr "$tier" --arg rv "$_reviewer" --arg ak "$ask" --arg rc "$recommend"
         return
@@ -2276,14 +2316,27 @@ cmd_task_answer() {
   # already parsed + recorded as provenance to stage it.
   # DIVE-916: `manual` joins approval/secret as a hard human gate here — it's a
   # step only a person can do, so an agent must not self-answer it either.
+  # DIVE-1182: a builder ship-gate (approval/manual) that DIVE-1145 routing sent
+  # to the org lead carries routed_reviewer. The designated lead — and ONLY that
+  # agent, on ONLY this routed gate — may clear it, closing the gap where such a
+  # gate was human-only and pinged lodar instead of Marcus. Resolve it up front so
+  # both the uid block and the evidence block below honour the exception. `secret`
+  # is never routed (routed_reviewer stays NULL), so it can never take this path.
+  local _routed_rev; _routed_rev=$(db "SELECT COALESCE(routed_reviewer,'') FROM tasks WHERE id=${id};")
+  local _lead_clear=0
+  if [[ ( "$nt" == "approval" || "$nt" == "manual" ) && -n "$_routed_rev" ]]; then
+    local _c; _c=$(id -un 2>/dev/null || echo '?')
+    [[ "$_c" == "agent-${_routed_rev}" ]] && _lead_clear=1
+  fi
   if [[ "$nt" == "approval" || "$nt" == "secret" || "$nt" == "manual" ]]; then
     local _caller; _caller=$(id -un 2>/dev/null || echo '?')
-    if [[ "$_caller" == agent-* ]]; then
+    if [[ "$_caller" == agent-* && "$_lead_clear" != "1" ]]; then
       # No audit_log here: the blocked caller is an agent user that can't write
       # the root-owned audit log anyway (it would only leak a perms error to
       # stderr). The fail + non-zero exit is the record.
       fail "$E_AUTH_REQUIRED" "$ident is a '$nt' gate — only a human can clear it. Answer it from Telegram (tap the button) or the dashboard; an agent can't self-answer an approval/secret/manual gate."
     fi
+    [[ "$_lead_clear" == "1" ]] && audit_log "task answer lead-clear" "ok" 0 -- "task=$ident" "type=$nt" "reviewer=$_routed_rev" 2>/dev/null || true
   fi
 
   # DIVE-916/950: hard human gates (approval/secret/manual) need HUMAN evidence
@@ -2323,7 +2376,12 @@ cmd_task_answer() {
     local _hp=0 _su=0
     [[ -n "$human_proof" ]] && _human_nonce_verify "$id" "$human_proof" && _hp=1
     _gate_sudo_uid_nonagent && _su=1
-    local _evid=$(( _hp || _su ))
+    # DIVE-1182: a routed builder gate cleared by its designated lead reviewer is a
+    # sanctioned agent path — count the lead-clear as evidence so enforcement (the
+    # "no human evidence ⇒ reject" rule) does not block the very exception granted
+    # by the uid block above. Scoped to approval/manual with a matching
+    # routed_reviewer (never secret), so no un-routed human gate is affected.
+    local _evid=$(( _hp || _su || _lead_clear ))
     local _caller2; _caller2=$(id -un 2>/dev/null || echo '?')
     audit_log "task answer gate" "$([[ $_evid -eq 1 ]] && echo ok || echo error)" 0 -- \
       "task=$ident" "type=$nt" \
@@ -2376,6 +2434,10 @@ cmd_task_answer() {
   # passed --human; otherwise the resolved actor label.
   local answered_by; answered_by=$(task_actor "$from")
   (( human )) && answered_by="human:${answered_by}"
+  # DIVE-1182: a routed builder gate cleared by its designated lead is recorded as
+  # lead-sourced provenance (NOT human:*) — honest that an agent lead, not a human,
+  # cleared it. Never overrides a genuine human:* answer.
+  [[ "$_lead_clear" == "1" ]] && (( ! human )) && answered_by="lead:${answered_by}"
 
   # DIVE-756: stamp the REAL invoker uid ($SUDO_UID survives `sudo -u agent-X`,
   # unlike need_answered_by) and a tamper-evidence signature over the closure

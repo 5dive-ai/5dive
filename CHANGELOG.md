@@ -9,6 +9,21 @@ release.
 
 ## [Unreleased]
 
+### Fixed
+- **Builder ship-gates are now org-lead-clearable, closing the DIVE-1145 gap
+  (DIVE-1182).** DIVE-1145 routed only `decision` gates to the org lead; a
+  builder's actual ship-gate is filed as `approval` (or `manual`), so it stayed
+  human-only and pinged lodar instead of Marcus. `task need` now routes
+  `approval`/`manual` builder gates to the lead too (pref `gate_builder_routing`
+  on), persisting `routed_reviewer` on the row. `task answer` grants exactly the
+  designated `agent-<routed_reviewer>` an exception to the approval/manual
+  human-only floor for that one routed gate, recorded as `lead:*` provenance (not
+  `human:*`). `secret` is never routed (must be human-delivered), tier-2 and
+  true-human-category (money/destructive/brand) gates still ping the human, and
+  every un-routed approval/manual gate stays hard-human — the DIVE-391/515/516
+  self-clear boundary is unchanged. New `routed_reviewer` column (base schema +
+  migration backfill). Unit: `tests/gate_ship_routing_unit.sh` (27/27).
+
 ## [0.8.17] — 2026-07-14
 
 ### Fixed

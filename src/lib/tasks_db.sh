@@ -241,7 +241,15 @@ CREATE TABLE IF NOT EXISTS tasks (
   -- and a commit may only partially fix a gate, so this NEVER auto-answers/closes
   -- — it only stops the ghost-gate from re-surfacing in the overnight recap and
   -- throttles the flag to once (re-flag only if cleared back to NULL).
-  shipped_flag_at     TEXT
+  shipped_flag_at     TEXT,
+  -- DIVE-1182: when builder-gate routing (DIVE-1145) sends a NON-true-human gate
+  -- to the org lead, the designated reviewer's name is recorded here. It is the
+  -- ONLY basis on which cmd_task_answer's approval/manual human-only floor grants
+  -- a lead agent an exception (agent-<routed_reviewer> may clear THIS routed
+  -- gate). NULL on every human-directed gate, so the DIVE-391/515/516 self-clear
+  -- boundary is unchanged for anything not explicitly routed. `secret` is never
+  -- routed (stays hard-human), and a tier-2 gate is never routed.
+  routed_reviewer     TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_tasks_precedent ON tasks(need_type, ask_shape);
 
@@ -468,7 +476,7 @@ _tasks_db_migrate() {
            'tier INTEGER' 'need_asked_at TEXT' 'gate_pinged_at TEXT' 'wake_at TEXT' \
            'secret_key TEXT' 'connector TEXT' 'human_nonce_hash TEXT' \
            'ask_shape TEXT' 'precedent_ref INTEGER' 'precedent_kind TEXT' \
-           'shipped_flag_at TEXT'; do
+           'shipped_flag_at TEXT' 'routed_reviewer TEXT'; do
     if ! printf '%s\n' "$cols" | grep -qx "${c%% *}"; then
       sqlite3 -cmd ".timeout 5000" "$TASKS_DB" \
         "ALTER TABLE tasks ADD COLUMN ${c};" >/dev/null 2>&1 || true
