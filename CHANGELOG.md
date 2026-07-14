@@ -9,6 +9,8 @@ release.
 
 ## [Unreleased]
 
+## [0.8.17] — 2026-07-14
+
 ### Fixed
 - **codex `auth login` uses device-code auth on headless/remote (DIVE-1178).**
   `sudo 5dive agent auth login codex` (and `5dive init`) now runs
