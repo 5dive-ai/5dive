@@ -413,8 +413,39 @@ _hb_agent_idle() {
   sleep "$gap"
   b=$(sudo -u "$user" tmux capture-pane -p -t "agent-${name}" 2>/dev/null) || return 2
   [[ "$a" == "$b" ]] || return 1
-  grep -q '❯' <<<"$b" || return 1
+  # DIVE-1211: the idle-prompt marker is per-runtime. "❯" is CLAUDE's composer
+  # glyph only — codex/grok/agy/opencode never render it, so the old hardcoded
+  # `grep -q ❯` read every non-claude agent as active FOREVER (byte-stable pane,
+  # no ❯ -> return 1) and the heartbeat deferred their nudge every tick, so
+  # non-claude agents were never woken to work their board tasks. Byte-stability
+  # above is a solid at-rest signal; this marker is the guard that a byte-stable
+  # pane is genuinely parked at the composer, not frozen on a permission dialog
+  # or a stalled mid-turn (same reason claude required ❯ on top of stability).
+  # For a runtime whose idle glyph we haven't verified live, we trust stability
+  # alone rather than guess a marker (a wrong marker would re-break idle for it).
+  local marker; marker=$(_hb_idle_marker "$(agent_type "$name" 2>/dev/null)")
+  [[ -z "$marker" ]] || grep -qF "$marker" <<<"$b" || return 1
   return 0
+}
+
+# DIVE-1211: a runtime's IDLE composer marker as a FIXED string (caller matches
+# with grep -F), or empty for a runtime whose at-rest glyph hasn't been verified
+# live (grok/opencode / unknown) -> callers fall back to byte-stability alone.
+# Markers are the pane's ready-for-input signal and are TUI-specific so they
+# can't collide: claude "❯", codex "›" (its "gpt-… default · <cwd>" status footer
+# accompanies the same composer), antigravity "? for shortcuts" (its idle footer;
+# "esc to cancel" is mid-turn and is deliberately NOT an idle marker). Verified
+# against live codex/andy + agy panes 2026-07-14. Mirrors wait_agent_input_ready
+# (cmd_agent_runtime.sh), but idle-only: it excludes agy's mid-turn "esc to
+# cancel" that a *readiness* probe tolerates, so a working agent can't false-read
+# as idle here.
+_hb_idle_marker() {
+  case "$1" in
+    claude)       printf '❯' ;;
+    codex)        printf '›' ;;
+    antigravity)  printf '? for shortcuts' ;;
+    *)            printf '' ;;  # grok/opencode/unknown: byte-stability alone
+  esac
 }
 
 # Resolve a task's DISPLAY ident (e.g. DIVE-560) from its numeric row id. With

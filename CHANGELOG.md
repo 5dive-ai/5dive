@@ -10,6 +10,17 @@ release.
 ## [Unreleased]
 
 ### Fixed
+- **Heartbeat idle-detection is now runtime-aware, so non-claude agents get
+  nudged for board tasks (DIVE-1211).** `_hb_agent_idle`'s pane-scrape fallback
+  hardcoded claude's `❯` composer glyph, which codex/grok/agy/opencode never
+  render, so every non-claude agent read as "active" on every tick and its nudge
+  was deferred forever, never picking up its board tasks. The at-rest check now
+  resolves a per-runtime idle marker (`_hb_idle_marker`: claude `❯`, codex `›`,
+  antigravity `? for shortcuts`; grok/opencode trust byte-stability alone until
+  their idle glyph is verified live) as the guard that a byte-stable pane is
+  genuinely parked at the composer and not frozen on a dialog. Verified live:
+  idle codex + agy now read IDLE (were stuck "active"). New unit
+  `tests/heartbeat_idle_marker_unit.sh` (14 assertions).
 - **Builder ship-gates are now org-lead-clearable, closing the DIVE-1145 gap
   (DIVE-1182).** DIVE-1145 routed only `decision` gates to the org lead; a
   builder's actual ship-gate is filed as `approval` (or `manual`), so it stayed
