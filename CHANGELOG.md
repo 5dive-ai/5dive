@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.8.22
+
+- fix(heartbeat): runtime-aware nudge submit — codex/grok/agy/opencode ingest the ~1KB /goal nudge as a paste and swallowed the single Enter, leaving it unsubmitted so the agent never executed; settle + retry-Enter for non-claude runtimes, claude path untouched (DIVE-1217).
+
 All notable changes to `5dive` are recorded here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions follow [SemVer](https://semver.org/spec/v2.0.0.html).

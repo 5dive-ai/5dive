@@ -319,12 +319,31 @@ _hb_tier_rank() {
   esac
 }
 
-# Inject one literal line + Enter into an agent's tmux pane. Returns nonzero
+# Inject one literal line + submit it in an agent's tmux pane. Returns nonzero
 # (never exits) so a single dead pane can't abort the whole tick.
+#
+# DIVE-1217: a ~1KB /goal nudge is one large burst. CLAUDE submits it on a single
+# Enter (the fleet has run on this for months) so its path is left exactly as-is.
+# But codex/grok/agy/opencode ingest the burst as a PASTE, and an immediate Enter
+# races into the still-settling buffer and is SWALLOWED — the text sits in the
+# composer UNSUBMITTED (codex shows it raw, no "[Pasted]" placeholder to key off),
+# so the nudged agent never executes. Verified live against a codex pane
+# (2026-07-14): one Enter left the nudge stuck; a settled + retried Enter submitted
+# it. For those runtimes we let the buffer settle, then submit, re-sending Enter a
+# few times. A bare Enter on an emptied composer is a no-op in these TUIs, so the
+# extra tries cannot double-submit. Runtime unknown -> treat as non-claude (the
+# retry path is safe for claude too; only claude is opted into the fast path).
 _hb_send_line() {
-  local name="$1" text="$2"
+  local name="$1" text="$2" i
   sudo -u "agent-${name}" tmux send-keys -t "agent-${name}" -l -- "$text" 2>/dev/null || return 1
-  sudo -u "agent-${name}" tmux send-keys -t "agent-${name}" Enter 2>/dev/null || return 1
+  if [[ "$(agent_type "$name" 2>/dev/null)" == "claude" ]]; then
+    sudo -u "agent-${name}" tmux send-keys -t "agent-${name}" Enter 2>/dev/null || return 1
+    return 0
+  fi
+  for i in 1 2 3; do
+    sleep 0.5
+    sudo -u "agent-${name}" tmux send-keys -t "agent-${name}" Enter 2>/dev/null || return 1
+  done
 }
 
 # PID of this agent's live inner `claude` process, or empty if not found. This is
