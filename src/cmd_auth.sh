@@ -249,8 +249,31 @@ heal_claude_shadow_creds() {
 # Requires root (systemctl). Callers in the auth-finalize paths already run as
 # root (require_root / the API invokes the CLI as root). Always returns 0 so a
 # restart hiccup never fails an otherwise-successful login.
+# DIVE-1188: make a profile's file-based seed credentials (codex/grok auth.json)
+# group-readable so `5dive-agent-start` can seed them into an agent home WITHOUT
+# sudo. Standard-isolation agents get NO passwordless-sudo rule, so the old
+# `sudo -n cat` seed silently bailed and the agent booted unauthenticated. The
+# codex/grok CLIs write these 0600 owned by claude; agents all run in the claude
+# group over a group-traversable profile path (dirs are 2750 g=claude), so a
+# 0640 g=claude file is directly readable. Mirrors the 0640 root:claude posture
+# already used for opencode connector env files. Root-only (chmod on a
+# claude-owned file); no-op when the file is absent. Does NOT widen sudo.
+normalize_profile_seed_perms() {
+  local profile="${1:-}"
+  [[ -n "$profile" ]] || return 0
+  local type path
+  for type in codex grok; do
+    path=$(profile_type_auth_path "$profile" "$type" 2>/dev/null) || continue
+    [[ -n "$path" && -f "$path" ]] || continue
+    chmod 0640 "$path" 2>/dev/null || true
+  done
+}
+
 restart_profile_agents() {
   local profile="${1:-}"
+  # DIVE-1188: normalize seed-cred perms before the agents boot so the very
+  # next start reads the fresh token without sudo.
+  normalize_profile_seed_perms "$profile"
   [[ -f "$REGISTRY" ]] || return 0
   local reg
   reg=$(registry_read 2>/dev/null) || return 0

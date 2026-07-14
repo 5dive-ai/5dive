@@ -26,7 +26,7 @@ esac
 
 # Bumped on every public release. `build.sh` checks this line exists; CI fails
 # the bundle-drift check if it's missing or empty.
-readonly FIVE_VERSION="0.8.20"
+readonly FIVE_VERSION="0.8.21"
 
 # GitHub org our repos live under. The org is being renamed
 # 5dive-com -> 5dive-ai (2026-06); fetches must work on either side of the
@@ -3412,8 +3412,31 @@ heal_claude_shadow_creds() {
 # Requires root (systemctl). Callers in the auth-finalize paths already run as
 # root (require_root / the API invokes the CLI as root). Always returns 0 so a
 # restart hiccup never fails an otherwise-successful login.
+# DIVE-1188: make a profile's file-based seed credentials (codex/grok auth.json)
+# group-readable so `5dive-agent-start` can seed them into an agent home WITHOUT
+# sudo. Standard-isolation agents get NO passwordless-sudo rule, so the old
+# `sudo -n cat` seed silently bailed and the agent booted unauthenticated. The
+# codex/grok CLIs write these 0600 owned by claude; agents all run in the claude
+# group over a group-traversable profile path (dirs are 2750 g=claude), so a
+# 0640 g=claude file is directly readable. Mirrors the 0640 root:claude posture
+# already used for opencode connector env files. Root-only (chmod on a
+# claude-owned file); no-op when the file is absent. Does NOT widen sudo.
+normalize_profile_seed_perms() {
+  local profile="${1:-}"
+  [[ -n "$profile" ]] || return 0
+  local type path
+  for type in codex grok; do
+    path=$(profile_type_auth_path "$profile" "$type" 2>/dev/null) || continue
+    [[ -n "$path" && -f "$path" ]] || continue
+    chmod 0640 "$path" 2>/dev/null || true
+  done
+}
+
 restart_profile_agents() {
   local profile="${1:-}"
+  # DIVE-1188: normalize seed-cred perms before the agents boot so the very
+  # next start reads the fresh token without sudo.
+  normalize_profile_seed_perms "$profile"
   [[ -f "$REGISTRY" ]] || return 0
   local reg
   reg=$(registry_read 2>/dev/null) || return 0
@@ -6157,6 +6180,12 @@ link_agent_profile() {
   [[ -f "$target" ]] \
     || fail "$E_NOT_FOUND" "auth profile '$profile' not configured — run: sudo 5dive agent auth set <type> --api-key=... --auth-profile=$profile"
   ln -s "$target" "$link"
+  # DIVE-1188: a NEW agent bound to an EXISTING profile (no re-login in between)
+  # must still be able to seed codex/grok auth.json without sudo, so normalize
+  # the profile's file creds to 0640 group=claude at bind time. Guarded because
+  # this lib is also sourced in contexts without cmd_auth.sh.
+  declare -F normalize_profile_seed_perms >/dev/null 2>&1 \
+    && normalize_profile_seed_perms "$profile"
 }
 
 # Write a BYO (bring-your-own) API-key credential for hermes/openclaw into
@@ -20171,8 +20200,39 @@ _hb_agent_idle() {
   sleep "$gap"
   b=$(sudo -u "$user" tmux capture-pane -p -t "agent-${name}" 2>/dev/null) || return 2
   [[ "$a" == "$b" ]] || return 1
-  grep -q '❯' <<<"$b" || return 1
+  # DIVE-1211: the idle-prompt marker is per-runtime. "❯" is CLAUDE's composer
+  # glyph only — codex/grok/agy/opencode never render it, so the old hardcoded
+  # `grep -q ❯` read every non-claude agent as active FOREVER (byte-stable pane,
+  # no ❯ -> return 1) and the heartbeat deferred their nudge every tick, so
+  # non-claude agents were never woken to work their board tasks. Byte-stability
+  # above is a solid at-rest signal; this marker is the guard that a byte-stable
+  # pane is genuinely parked at the composer, not frozen on a permission dialog
+  # or a stalled mid-turn (same reason claude required ❯ on top of stability).
+  # For a runtime whose idle glyph we haven't verified live, we trust stability
+  # alone rather than guess a marker (a wrong marker would re-break idle for it).
+  local marker; marker=$(_hb_idle_marker "$(agent_type "$name" 2>/dev/null)")
+  [[ -z "$marker" ]] || grep -qF "$marker" <<<"$b" || return 1
   return 0
+}
+
+# DIVE-1211: a runtime's IDLE composer marker as a FIXED string (caller matches
+# with grep -F), or empty for a runtime whose at-rest glyph hasn't been verified
+# live (grok/opencode / unknown) -> callers fall back to byte-stability alone.
+# Markers are the pane's ready-for-input signal and are TUI-specific so they
+# can't collide: claude "❯", codex "›" (its "gpt-… default · <cwd>" status footer
+# accompanies the same composer), antigravity "? for shortcuts" (its idle footer;
+# "esc to cancel" is mid-turn and is deliberately NOT an idle marker). Verified
+# against live codex/andy + agy panes 2026-07-14. Mirrors wait_agent_input_ready
+# (cmd_agent_runtime.sh), but idle-only: it excludes agy's mid-turn "esc to
+# cancel" that a *readiness* probe tolerates, so a working agent can't false-read
+# as idle here.
+_hb_idle_marker() {
+  case "$1" in
+    claude)       printf '❯' ;;
+    codex)        printf '›' ;;
+    antigravity)  printf '? for shortcuts' ;;
+    *)            printf '' ;;  # grok/opencode/unknown: byte-stability alone
+  esac
 }
 
 # Resolve a task's DISPLAY ident (e.g. DIVE-560) from its numeric row id. With
@@ -25814,7 +25874,7 @@ cmd_import() {
   local signing_keyfile="" has_signing_key=0
   if [[ -f "$stage/persona.yaml" ]]; then
     signing_keyfile="$stage/.signing_key"; : >"$signing_keyfile"; chmod 600 "$signing_keyfile"
-    _persona_strip_signing_key "$stage/persona.yaml" "$signing_keyfile"; local _srk=$?
+    local _srk=0; _persona_strip_signing_key "$stage/persona.yaml" "$signing_keyfile" || _srk=$?
     if (( _srk == 0 )); then
       has_signing_key=1                                    # key extracted + stripped
     elif (( _srk == 9 )); then

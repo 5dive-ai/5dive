@@ -1132,7 +1132,7 @@ cmd_import() {
   local signing_keyfile="" has_signing_key=0
   if [[ -f "$stage/persona.yaml" ]]; then
     signing_keyfile="$stage/.signing_key"; : >"$signing_keyfile"; chmod 600 "$signing_keyfile"
-    _persona_strip_signing_key "$stage/persona.yaml" "$signing_keyfile"; local _srk=$?
+    local _srk=0; _persona_strip_signing_key "$stage/persona.yaml" "$signing_keyfile" || _srk=$?
     if (( _srk == 0 )); then
       has_signing_key=1                                    # key extracted + stripped
     elif (( _srk == 9 )); then

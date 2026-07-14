@@ -192,7 +192,13 @@ if [[ "$TYPE" == "codex" ]]; then
   LOCAL_AUTH="$AGENT_CODEX_HOME/auth.json"
   if [[ -e "$SHARED_AUTH" ]] && { [[ ! -f "$LOCAL_AUTH" ]] || [[ "$SHARED_AUTH" -nt "$LOCAL_AUTH" ]]; }; then
     TMP="$(mktemp -p "$AGENT_CODEX_HOME" .auth.XXXXXX)"
-    if sudo -n cat "$SHARED_AUTH" > "$TMP" 2>/dev/null; then
+    # DIVE-1188: standard-isolation agents have NO passwordless sudo, so the old
+    # `sudo -n cat` bailed and the agent booted unauthenticated. The profile
+    # auth.json is normalized to 0640 group=claude at login/restart time (see
+    # normalize_profile_seed_perms in cmd_auth.sh), and agents run Group=claude
+    # over a group-traversable profile path, so a plain read now works. Keep the
+    # sudo path as a fallback for a not-yet-normalized 0600 file on an admin agent.
+    if { cat "$SHARED_AUTH" 2>/dev/null || sudo -n cat "$SHARED_AUTH" 2>/dev/null; } > "$TMP" && [[ -s "$TMP" ]]; then
       chmod 600 "$TMP"
       mv "$TMP" "$LOCAL_AUTH"
     else
@@ -252,6 +258,7 @@ args = ["${CODEX_PLUGIN_DIR}/server.ts"]
 
 [features]
 hooks = true
+memories = true
 
 [[hooks.Stop]]
 
@@ -308,10 +315,14 @@ if [[ "$TYPE" == "grok" ]]; then
   # Profile dirs are mode 0700 owner=claude, so a naive `[[ -e ]]` returns
   # false because agent-<name> can't traverse it. Route both checks through
   # `sudo -n test` (same fix as the hermes/openclaw seeds below).
-  if sudo -n test -e "$SHARED_GROK_AUTH" 2>/dev/null \
-     && { [[ ! -f "$LOCAL_GROK_AUTH" ]] || sudo -n test "$SHARED_GROK_AUTH" -nt "$LOCAL_GROK_AUTH"; }; then
+  # DIVE-1188: normalized to 0640 group=claude at login/restart, and the profile
+  # path is group-traversable, so plain `[[ -e ]]` / `[[ -nt ]]` / `cat` now work
+  # for standard (no-sudo) agents. sudo kept as a fallback for a stale 0600 file.
+  if { [[ -e "$SHARED_GROK_AUTH" ]] || sudo -n test -e "$SHARED_GROK_AUTH" 2>/dev/null; } \
+     && { [[ ! -f "$LOCAL_GROK_AUTH" ]] || [[ "$SHARED_GROK_AUTH" -nt "$LOCAL_GROK_AUTH" ]] \
+          || sudo -n test "$SHARED_GROK_AUTH" -nt "$LOCAL_GROK_AUTH" 2>/dev/null; }; then
     TMP="$(mktemp -p "$AGENT_GROK_HOME" .auth.XXXXXX)"
-    if sudo -n cat "$SHARED_GROK_AUTH" > "$TMP" 2>/dev/null; then
+    if { cat "$SHARED_GROK_AUTH" 2>/dev/null || sudo -n cat "$SHARED_GROK_AUTH" 2>/dev/null; } > "$TMP" && [[ -s "$TMP" ]]; then
       chmod 600 "$TMP"
       mv "$TMP" "$LOCAL_GROK_AUTH"
     else
