@@ -26,7 +26,7 @@ esac
 
 # Bumped on every public release. `build.sh` checks this line exists; CI fails
 # the bundle-drift check if it's missing or empty.
-readonly FIVE_VERSION="0.8.22"
+readonly FIVE_VERSION="0.8.23"
 
 # GitHub org our repos live under. The org is being renamed
 # 5dive-com -> 5dive-ai (2026-06); fetches must work on either side of the
@@ -6542,6 +6542,20 @@ cmd_create() {
   [[ -n "$type" ]] || fail "$E_USAGE" "--type is required"
   valid_name "$name" || fail "$E_VALIDATION" "invalid name (lowercase letters/digits/hyphens, start letter, <=16 chars)"
   is_known_type "$type" || fail "$E_NOT_FOUND" "unknown type: $type (known: ${!TYPE_BIN[*]})"
+  # DIVE-1221/1222: Grok provisioning is FROZEN. Grok Build CLI (xAI) has a
+  # disclosed codebase-exfiltration issue with no client-side fix as of its
+  # v0.2.98 changelog; xAI shipped only a revocable server-side mitigation. As a
+  # precaution we refuse grok here. Every provisioning path (agent create, hire,
+  # pack import, clone) funnels through cmd_create, so this blocks all of them.
+  # Unfreeze condition (olivia): a VERIFIED xAI client-side patch + a pinnable
+  # version, NEVER the server-side toggle alone. The override below exists ONLY
+  # for that verified-unfreeze moment; do NOT set it to work around the freeze.
+  if [[ "$type" == "grok" && "${FIVE_GROK_UNFREEZE_VERIFIED:-}" != "1" ]]; then
+    fail "$E_VALIDATION" "grok provisioning is frozen (DIVE-1221): Grok Build has an unpatched codebase-exfiltration issue and xAI has shipped only a revocable server-side mitigation. Unfreeze needs a verified xAI client-side fix + pinnable version. See DIVE-1221."
+  fi
+  if [[ "$type" == "grok" ]]; then
+    warn "FIVE_GROK_UNFREEZE_VERIFIED=1 set, bypassing the DIVE-1221 Grok exfiltration freeze. Only valid if a VERIFIED xAI client-side patch is pinned."
+  fi
   valid_channel "$channels" || fail "$E_VALIDATION" "invalid channels: $channels (none|telegram|discord|dashboard, comma-separable)"
   # DIVE-856: claude agents are chat-capable in the web dashboard by default.
   # The dashboard channel needs no token (the plugin reads the box connectord
