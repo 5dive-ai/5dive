@@ -685,8 +685,11 @@ cmd_create() {
   # later", not an add-on. The key sentinel "-" reads from stdin so the value
   # never appears in argv (and thus never in `ps`).
   if [[ -n "$byo_provider" || -n "$byo_api_key" ]]; then
-    [[ "$type" == "hermes" || "$type" == "openclaw" || "$type" == "claude" ]] \
-      || fail "$E_VALIDATION" "--provider/--api-key only supported for hermes/openclaw/claude (got: $type)"
+    # pi is API-key multi-provider (no OAuth): --provider names the vendor and
+    # the key is injected as pi's native per-provider env var (PI_PROVIDER_VAR),
+    # so it skips the hermes/openclaw/claude BYO catalog checks below. DIVE-1200.
+    [[ "$type" == "hermes" || "$type" == "openclaw" || "$type" == "claude" || "$type" == "pi" ]] \
+      || fail "$E_VALIDATION" "--provider/--api-key only supported for hermes/openclaw/claude/pi (got: $type)"
     # claude BYO points the harness at an Anthropic-compatible third-party
     # endpoint and stores the override env vars in the auth-profile's
     # combined.env — so it requires a profile to scope the creds to this agent
@@ -698,16 +701,21 @@ cmd_create() {
       || fail "$E_USAGE" "--provider and --api-key must be passed together"
     (( defer_auth )) \
       && fail "$E_USAGE" "--defer-auth and --provider/--api-key are mutually exclusive"
-    valid_byo_provider "$byo_provider" \
-      || fail "$E_VALIDATION" "unknown provider '$byo_provider' (known: ${!BYO_PROVIDER_LABEL[*]})"
+    if [[ "$type" == "pi" ]]; then
+      pi_provider_var "$byo_provider" >/dev/null \
+        || fail "$E_VALIDATION" "pi provider '$byo_provider' not supported (known: ${!PI_PROVIDER_VAR[*]})"
+    else
+      valid_byo_provider "$byo_provider" \
+        || fail "$E_VALIDATION" "unknown provider '$byo_provider' (known: ${!BYO_PROVIDER_LABEL[*]})"
+      local _native
+      _native=$(resolve_native_provider "$type" "$byo_provider")
+      [[ -n "$_native" ]] \
+        || fail "$E_VALIDATION" "$type does not support provider '$byo_provider'"
+    fi
     if [[ -n "$byo_model" ]]; then
       valid_model "$byo_model" \
         || fail "$E_VALIDATION" "invalid --model '$byo_model' (allowed chars: letters/digits/._:/-)"
     fi
-    local _native
-    _native=$(resolve_native_provider "$type" "$byo_provider")
-    [[ -n "$_native" ]] \
-      || fail "$E_VALIDATION" "$type does not support provider '$byo_provider'"
     if [[ "$byo_api_key" == "-" ]]; then
       [[ -t 0 ]] && fail "$E_USAGE" "--api-key=- expects the key on stdin, stdin is a TTY"
       byo_api_key=$(cat)
@@ -891,7 +899,14 @@ cmd_create() {
   # Must come after the install-on-demand block so the agent CLI exists
   # when apply_byo_provider shells out to `hermes auth add`.
   if [[ -n "$byo_provider" ]]; then
-    apply_byo_provider "$type" "$byo_provider" "$byo_api_key" "$profile" "$byo_model"
+    if [[ "$type" == "pi" ]]; then
+      # pi injects the key as a native env var (no auth.json / endpoint
+      # override), so it takes the env-var write path, not apply_byo_provider
+      # (which is hermes/openclaw/claude only). DIVE-1200.
+      pi_apply_provider_key "$byo_provider" "$byo_api_key" "$profile"
+    else
+      apply_byo_provider "$type" "$byo_provider" "$byo_api_key" "$profile" "$byo_model"
+    fi
   fi
 
   # Don't create an agent that can't log in. When an auth-profile is named,
@@ -974,6 +989,16 @@ cmd_create() {
         step "Seeded agy OAuth token into agent-${name} runtime"
       fi
     fi
+  elif [[ "$type" == "pi" && -n "$byo_model" ]]; then
+    # DIVE-1205: pin the pi agent's default model. pi reads defaultProvider/
+    # defaultModel from ~/.pi/agent/settings.json at startup (both the TUI and
+    # the SDK the telegram-pi relay hosts pi through), so a create-time write
+    # here makes the agent boot straight onto the chosen provider+model with no
+    # /model step. Needed because pi has no PI_MODEL env var — the api-key is
+    # env-injected (DIVE-1200) but the model selection is settings-file only.
+    # Only pi's built-in providers reach this branch (validated above via
+    # PI_PROVIDER_VAR), so pi already knows the base_url; we just name the model.
+    pi_apply_model_default "$name" "$byo_provider" "$byo_model"
   fi
 
   # DIVE-990: memory-as-onboarding. Seed the new agent's recall store from

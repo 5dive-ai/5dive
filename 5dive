@@ -26,7 +26,7 @@ esac
 
 # Bumped on every public release. `build.sh` checks this line exists; CI fails
 # the bundle-drift check if it's missing or empty.
-readonly FIVE_VERSION="0.8.23"
+readonly FIVE_VERSION="0.9.0"
 
 # GitHub org our repos live under. The org is being renamed
 # 5dive-com -> 5dive-ai (2026-06); fetches must work on either side of the
@@ -113,6 +113,12 @@ declare -A TYPE_BIN=(
   # symlinks ~/.local/bin/grok — we point TYPE_BIN at the symlink to match
   # the convention of the other types.
   [grok]="/home/claude/.local/bin/grok"
+  # pi is earendil-works' (Armin Ronacher) TypeScript/Node20 coding agent, the
+  # backbone of OpenClaw. `npm i -g @earendil-works/pi-coding-agent` drops the
+  # `pi` binary in nvm's per-version bin dir; the TYPE_INSTALL recipe symlinks
+  # it into ~/.local/bin so TYPE_BIN resolves on every box (same dance as
+  # opencode/openclaw). MIT, ~70.8k stars. Added for the v0.9 pi epic (DIVE-1196).
+  [pi]="/home/claude/.local/bin/pi"
 )
 # Which types accept --channels=telegram|discord. Each type wires the channel
 # differently (see install_channel_for_<type>_agent below):
@@ -154,6 +160,13 @@ declare -A TYPE_CHANNELS=(
   # GLOBAL ~/.gemini/config/{mcp_config.json,hooks.json} at boot (agy doesn't
   # auto-load a plugin's mcp_config/hooks — only skills/agents). telegram only.
   [antigravity]=1
+  # pi ships a telegram bridge as a native pi EXTENSION (fork of benedict2310/
+  # TelePi — pi has no MCP-server plugin model like codex/grok; it exposes an
+  # in-process extension API). The channel installer (install_channel_for_pi_agent)
+  # + telegram-pi plugin land in DIVE-1201/DIVE-1202; until then this flag only
+  # marks pi channel-capable — creating a pi agent WITH --channels will fail at
+  # install_channel_for_agent's dispatch until 1201 adds the `pi)` case. telegram only.
+  [pi]=1
 )
 # Auth sentinel per type. Agent users run as agent-<name> (in group `claude`)
 # and cannot read /home/claude/.claude/settings.json (mode 0600), so for
@@ -187,6 +200,13 @@ declare -A TYPE_AUTH=(
   # Verified empirically — auth.json.lock pre-exists the actual auth.json
   # file (created on first device-auth attempt for the locking mechanism).
   [grok]="/home/claude/.grok/auth.json"
+  # pi writes credentials to ~/.pi/agent/auth.json on `/login` (API-key provider
+  # selection or OAuth for subscription providers; tokens auto-refresh). Verified
+  # against @earendil-works/pi-coding-agent docs + benedict2310/TelePi 2026-07-14.
+  # Same file-sentinel shape as codex/grok. NOTE: pi ALSO accepts a bare
+  # ANTHROPIC_API_KEY/OPENAI_API_KEY env var (no file written) — the api-key
+  # injection path (TYPE_API_FILE/VAR + cmd_auth) is finalized in DIVE-1200.
+  [pi]="/home/claude/.pi/agent/auth.json"
 )
 # Installer recipe per type. Run as `claude` user via `sudo -u claude -i bash -lc <recipe>`
 # so $HOME/.nvm and PATH resolve correctly. Empty string => no automated installer
@@ -243,6 +263,13 @@ declare -A TYPE_INSTALL=(
   # installer's ~/.local/bin/agent symlink so it can't shadow future tooling.
   # The binary self-updates on launch; no daily-cron entry needed.
   [grok]="command -v grok >/dev/null 2>&1 || curl -fsSL https://x.ai/cli/install.sh | bash; mkdir -p /home/claude/.local/bin; [ -e /home/claude/.grok/bin/grok ] && ln -sf /home/claude/.grok/bin/grok /home/claude/.local/bin/grok; rm -f /home/claude/.local/bin/agent"
+  # pi is a plain npm package. Install-on-demand like codex (nvm use 24 so the
+  # global install lands in v24's bin dir even when the default alias drifted),
+  # then symlink into ~/.local/bin like opencode/openclaw so TYPE_BIN[pi]
+  # resolves on every box (the systemd unit uses TYPE_BIN's path directly, and
+  # bash -lc skips .bashrc so npm's bin dir isn't on PATH). Idempotent via the
+  # -x guard. \$-escaped so npm prefix expands when the recipe runs under bash -lc.
+  [pi]="[[ -x /home/claude/.local/bin/pi ]] || { . /home/claude/.nvm/nvm.sh && nvm use 24 >/dev/null && npm install -g @earendil-works/pi-coding-agent && mkdir -p /home/claude/.local/bin && ln -sf \"\$(npm prefix -g)/bin/pi\" /home/claude/.local/bin/pi; }"
 )
 
 # vercel-labs/skills CLI agent ID per 5dive type. `npx skills add --agent <id>`
@@ -296,12 +323,48 @@ declare -A TYPE_API_FILE=(
   [codex]="openai.env"
   [opencode]="openai.env"
   [grok]="xai.env"
+  # pi is multi-provider (see PI_PROVIDER_VAR): the connector file holds a
+  # per-provider *_API_KEY var chosen by `auth set pi --provider`. It's listed
+  # here (not in TYPE_API_VAR) so auth_creds_present's default-profile fallback
+  # recognizes a pi key written to this file; cmd_auth_set resolves the var
+  # itself rather than reading a single TYPE_API_VAR entry. DIVE-1200.
+  [pi]="pi.env"
 )
 declare -A TYPE_API_VAR=(
   [claude]="ANTHROPIC_API_KEY"
   [codex]="OPENAI_API_KEY"
   [opencode]="OPENAI_API_KEY"
   [grok]="XAI_API_KEY"
+  # pi is deliberately absent: it's multi-provider (no single native var).
+  # cmd_auth_set resolves pi's target var from --provider via PI_PROVIDER_VAR.
+)
+
+# pi provider -> native env var. pi is API-key multi-provider (NO OAuth): it
+# reads the standard per-provider *_API_KEY var straight from the environment
+# (verified against @earendil-works/pi-coding-agent 0.80.6 dist — it recognizes
+# ANTHROPIC_API_KEY / OPENAI_API_KEY / GEMINI_API_KEY / OPENROUTER_API_KEY /
+# DEEPSEEK_API_KEY / ZAI_API_KEY / MOONSHOT_API_KEY / XAI_API_KEY / ...). 5dive
+# injects the chosen var via the connector env file / profile combined.env the
+# same way codex/opencode/grok do their single native var. DIVE-1200 wired the
+# three core providers; DIVE-1205 adds OpenRouter + the Chinese models
+# (DeepSeek / GLM-Zhipu[=zai] / Kimi-Moonshot / Qwen). IMPORTANT: these are ALL
+# built-in pi providers — pi ships each provider's base_url in its own model
+# registry (docs/providers.md "For each provider, pi knows all available
+# models"), so 5dive does NOT need a custom base_url; injecting the right
+# *_API_KEY var is sufficient and pi resolves the endpoint itself. Qwen has no
+# standalone pi provider var, so it routes through OpenRouter. Provider ids
+# below match pi's `--provider` / auth.json-key column (docs/providers.md table)
+# so a `--model` pin resolves to the correct built-in provider. DIVE-1205.
+declare -A PI_PROVIDER_VAR=(
+  [anthropic]="ANTHROPIC_API_KEY"
+  [openai]="OPENAI_API_KEY"
+  [google]="GEMINI_API_KEY"
+  [openrouter]="OPENROUTER_API_KEY"
+  [deepseek]="DEEPSEEK_API_KEY"
+  [moonshotai]="MOONSHOT_API_KEY"
+  [kimi-coding]="KIMI_API_KEY"
+  [zai]="ZAI_API_KEY"
+  [minimax]="MINIMAX_API_KEY"
 )
 
 # BYO provider catalog for hermes/openclaw. The dashboard's new-agent
@@ -2007,6 +2070,138 @@ PY
   fi
 }
 
+pi_plugin_dir() {
+  local c
+  for c in "${TELEGRAM_PI_PLUGIN_DIR:-}" \
+           /usr/local/lib/5dive/telegram-pi \
+           /home/claude/projects/5dive/5dive-plugins/plugins/telegram-pi; do
+    [[ -n "$c" && -f "$c/server.ts" ]] && { printf '%s\n' "$c"; return 0; }
+  done
+  return 1
+}
+
+# Configure the telegram channel for a pi agent. pi (earendil-works/pi) is
+# EXTENSION-based (DIVE-1198 SPIKE): it ships no MCP/hooks config surface, so
+# the telegram bridge can't be wired like codex/grok/agy. Instead telegram-pi
+# is a STANDALONE RELAY (telegram-pi/server.ts) — the same run-model as
+# opencode: the bridge IS the agent's main process and hosts pi via pi's
+# extension API, so 5dive-agent-start launches `bun server.ts` instead of the
+# pi TUI for channels=telegram. So there's no config wiring here; the installer
+# just (1) writes the bot token into ~/.pi/channels/telegram/.env (the path the
+# relay reads its token from) and (2) seeds access.json. A single shared plugin
+# checkout serves every pi agent (the relay resolves its state dir from the
+# agent's own $HOME).
+install_channel_for_pi_agent() {
+  local plugin="$1" name="$2" token="$3" allowed_users="${4:-}"
+  local user="agent-${name}"
+  id -u "$user" &>/dev/null || fail "$E_GENERIC" "agent user missing: $user"
+  [[ "$plugin" == "telegram" ]] \
+    || fail "$E_VALIDATION" "pi channel plugin unsupported: $plugin (telegram only)"
+  [[ -n "$token" ]] || fail "$E_VALIDATION" "pi telegram channel requires a bot token"
+  if [[ -n "$allowed_users" ]]; then
+    valid_telegram_chat_id_list "$allowed_users" \
+      || fail "$E_VALIDATION" "invalid allowed_users (comma-separated numeric ids)"
+  fi
+
+  pi_plugin_dir >/dev/null \
+    || fail "$E_NOT_INSTALLED" \
+       "telegram-pi plugin not found (looked in /usr/local/lib/5dive/telegram-pi and the 5dive-plugins checkout). Set TELEGRAM_PI_PLUGIN_DIR or deploy the plugin."
+
+  # bun runs the relay (server.ts) — it IS the agent process, so a missing bun
+  # would crash-loop the unit. Fail fast at create time like the other bridges.
+  if ! ensure_bun_for_agent "$user"; then
+    fail "$E_NOT_INSTALLED" \
+      "bun unavailable for $user (required by telegram-pi) and automatic install failed. Check network access to bun.sh, or install bun to /usr/local/bin manually, then retry."
+  fi
+
+  step "Writing telegram token into ~/.pi/channels/telegram/.env for $user"
+  if ! sudo -u "$user" -H env TOKEN="$token" bash -s >&2 <<'PI_ENV'
+set -euo pipefail
+mkdir -p "$HOME/.pi/channels/telegram"
+chmod 700 "$HOME/.pi" "$HOME/.pi/channels" "$HOME/.pi/channels/telegram" 2>/dev/null || true
+ENV_FILE="$HOME/.pi/channels/telegram/.env"
+touch "$ENV_FILE"; chmod 600 "$ENV_FILE"
+TMP=$(mktemp --tmpdir="$HOME/.pi/channels/telegram" .env.XXXXXX); chmod 600 "$TMP"
+grep -v '^TELEGRAM_BOT_TOKEN=' "$ENV_FILE" > "$TMP" || true
+printf 'TELEGRAM_BOT_TOKEN=%s\n' "$TOKEN" >> "$TMP"
+mv "$TMP" "$ENV_FILE"
+PI_ENV
+  then
+    fail "$E_GENERIC" "pi telegram .env write failed for agent '$name'"
+  fi
+
+  # Always seed access.json (DIVE-45) — a missing file is a block-everything
+  # silent-DM-drop in the relay bridges. seed_* writes the file: allowlist the
+  # given ids, or default dmPolicy to 'pairing' so the first DM pairs.
+  seed_pi_telegram_access "$name" "$allowed_users"
+
+  # Seed the notify-user skill so the agent self-starts its comms loop on first
+  # DM. pi reads skills from its generic install dir (no SKILLS_AGENT_ID[pi]
+  # entry → the generic $HOME/.agents/skills path, same fallback as agy).
+  if [[ -f "$AGENT_SKILLS_DIR/notify-user/SKILL.md" ]]; then
+    sudo -u "$user" mkdir -p "/home/${user}/.agents/skills/notify-user"
+    sudo -u "$user" cp "$AGENT_SKILLS_DIR/notify-user/SKILL.md" \
+      "/home/${user}/.agents/skills/notify-user/SKILL.md"
+  fi
+
+  # Default skills, best-effort: match the grok/agy/opencode installers. pi has
+  # no upstream skills-registry id, so these route through the generic path and
+  # are best-effort (|| true — never block provisioning).
+  install_default_skill_for_agent "$name" pi vercel-labs/skills find-skills || true
+  install_default_skill_for_agent "$name" pi "$(gh_org)/skills" 5dive-cli || true
+  install_default_skill_for_agent "$name" pi "$(gh_org)/skills" compile-knowledge || true
+  install_default_skill_for_agent "$name" pi "$(gh_org)/skills" openagent || true
+}
+
+# Write ~/.pi/channels/telegram/access.json for agent-<name>. Idempotent —
+# mirrors seed_opencode_telegram_access: the pi relay shares opencode's access
+# schema (allowFrom + groups + dmPolicy + pending). allowed_users may be empty:
+# we still write the file (a missing file is a silent-DM-drop — DIVE-45),
+# defaulting dmPolicy to 'pairing' so the first DM pairs. An existing dmPolicy
+# is never overridden (re-runs / token rotation preserve the operator's choice).
+seed_pi_telegram_access() {
+  local name="$1" allowed_users="$2"
+  local user="agent-${name}"
+  if [[ -n "$allowed_users" ]]; then
+    step "Seeding pi telegram access.json for $user (allow ${allowed_users})"
+  else
+    step "Seeding pi telegram access.json for $user (dmPolicy=pairing)"
+  fi
+  if ! sudo -u "$user" env CSV="$allowed_users" python3 - <<'PY' >&2; then
+import json, os, tempfile
+
+state = os.path.join(os.path.expanduser('~'), '.pi', 'channels', 'telegram')
+os.makedirs(state, mode=0o700, exist_ok=True)
+access_path = os.path.join(state, 'access.json')
+ids = [s.strip() for s in os.environ['CSV'].split(',') if s.strip()]
+
+try:
+    with open(access_path) as f:
+        data = json.load(f)
+except FileNotFoundError:
+    data = {}
+
+allow = list(data.get('allowFrom') or [])
+for s in ids:
+    if s not in allow:
+        allow.append(s)
+data['allowFrom'] = allow
+data.setdefault('groups', {})
+data.setdefault('pending', {})
+if 'dmPolicy' not in data:
+    data['dmPolicy'] = 'allowlist' if allow else 'pairing'
+
+fd, tmp = tempfile.mkstemp(dir=state, prefix='.access.', suffix='.tmp')
+with os.fdopen(fd, 'w') as f:
+    json.dump(data, f, indent=2)
+os.chmod(tmp, 0o600)
+os.replace(tmp, access_path)
+print(f"Seeded access.json dmPolicy={data['dmPolicy']} allowFrom={allow} into {access_path}")
+PY
+    fail "$E_GENERIC" "pi telegram access.json pre-seed failed for agent '$name'"
+  fi
+}
+
 # Single dispatch point used by cmd_create. Routes a (type, plugin) pair to
 # the right install helper above, so the create flow stays type-agnostic.
 # home_channel/allowed_users are hermes-telegram extras (ignored by other
@@ -2024,6 +2219,7 @@ install_channel_for_agent() {
     grok)        install_channel_for_grok_agent "$plugin" "$name" "$token" "$allowed_users" ;;
     antigravity) install_channel_for_antigravity_agent "$plugin" "$name" "$token" "$allowed_users" ;;
     opencode)    install_channel_for_opencode_agent "$plugin" "$name" "$token" "$allowed_users" ;;
+    pi)          install_channel_for_pi_agent "$plugin" "$name" "$token" "$allowed_users" ;;
     openclaw)    install_channel_for_openclaw_agent "$plugin" "$name" "$token" "$home_channel" "$allowed_users" ;;
     hermes)      install_channel_for_hermes_agent "$plugin" "$name" "$token" "$home_channel" "$allowed_users" ;;
     *) fail "$E_VALIDATION" "type '$type' does not support channels" ;;
@@ -3908,6 +4104,70 @@ write_default_connector() {
     | _write_connector "$fname"
 }
 
+# pi_provider_var <provider> — resolve pi's native env var for a provider id
+# (default anthropic). Non-zero + empty stdout for an unknown/not-yet-wired
+# provider so callers can surface the known set. Backs both `auth set pi
+# --provider` and the create-path --provider/--api-key flow. DIVE-1200.
+pi_provider_var() {
+  local p="${1:-anthropic}"
+  local v="${PI_PROVIDER_VAR[$p]:-}"
+  [[ -n "$v" ]] || return 1
+  echo "$v"
+}
+
+# pi_apply_provider_key <provider> <api_key> [profile] — write pi's per-provider
+# API key into the profile's combined.env (isolated to agents on that profile)
+# or the shared pi.env connector (default profile). pi reads the var straight
+# from its environment, so systemd's EnvironmentFile injection is all that's
+# needed — no ~/.pi/agent/auth.json write. Requires root (connector/profile
+# writes). Shared by cmd_auth_set and cmd_agent_create. DIVE-1200.
+pi_apply_provider_key() {
+  local provider="${1:-anthropic}" api_key="$2" profile="${3:-}"
+  local var
+  var=$(pi_provider_var "$provider") \
+    || fail "$E_VALIDATION" "pi provider '$provider' not supported (known: ${!PI_PROVIDER_VAR[*]})"
+  require_root
+  if [[ -z "$profile" ]]; then
+    step "Writing ${var} to /etc/5dive/connectors/${TYPE_API_FILE[pi]}"
+    printf '%s' "$api_key" | write_default_connector "${TYPE_API_FILE[pi]}" "$var"
+  else
+    valid_profile_name "$profile" \
+      || fail "$E_VALIDATION" "invalid --auth-profile (lowercase letters/digits/_-, start letter, <=32 chars)"
+    ensure_profile_dir "$profile" >/dev/null
+    step "Writing ${var} to auth profile '${profile}'"
+    printf '%s' "$api_key" | profile_set_var "$profile" "$var"
+  fi
+}
+
+# pi_apply_model_default <agent-name> <provider> <model> — pin a pi agent's
+# default provider+model by merging {defaultProvider,defaultModel} into its
+# ~/.pi/agent/settings.json. pi reads these at startup, so the agent boots onto
+# the chosen model with no interactive /model step (pi has no PI_MODEL env var,
+# so this is the only launch-time model-pin surface). Idempotent: preserves any
+# other settings keys, overwrites only the two model fields. Runs as root at
+# create time (owns the write to the agent user's home); file ends up owned by
+# agent-<name> at 0600 like pi's own settings writes. DIVE-1205.
+pi_apply_model_default() {
+  local name="$1" provider="$2" model="$3"
+  local home="/home/agent-${name}" dir sf
+  dir="${home}/.pi/agent"; sf="${dir}/settings.json"
+  install -d -m 700 -o "agent-${name}" -g "agent-${name}" \
+    "${home}/.pi" "$dir" 2>/dev/null \
+    || { warn "pi model-pin: could not create $dir (skipping --model default)"; return 0; }
+  local cur='{}'
+  [[ -s "$sf" ]] && cur=$(cat "$sf" 2>/dev/null) && jq -e . >/dev/null 2>&1 <<<"$cur" || cur='{}'
+  local tmp
+  tmp=$(mktemp --tmpdir="$dir" settings.XXXXXX) || { warn "pi model-pin: mktemp failed"; return 0; }
+  if jq --arg p "$provider" --arg m "$model" \
+       '.defaultProvider=$p | .defaultModel=$m' <<<"$cur" >"$tmp"; then
+    chmod 600 "$tmp"; chown "agent-${name}:agent-${name}" "$tmp" 2>/dev/null || true
+    mv -f "$tmp" "$sf"
+    step "Pinned pi default model for agent-${name}: ${provider}/${model}"
+  else
+    rm -f "$tmp"; warn "pi model-pin: jq merge failed (skipping --model default)"
+  fi
+}
+
 # cmd_auth_set — API-key path that bypasses the browser/OAuth flow. Some
 # users prefer pasting a key; also the only option for ANTHROPIC_API_KEY /
 # Vertex / Bedrock style auth where there's no device-code flow.
@@ -3940,6 +4200,36 @@ cmd_auth_set() {
   fi
   valid_api_key "$api_key" \
     || fail "$E_VALIDATION" "api key looks wrong (expected >=10 printable non-space chars)"
+
+  # pi path: multi-provider, API-key only (no OAuth). --provider selects which
+  # vendor's key this is (default anthropic); the key is injected as pi's native
+  # per-provider env var. Distinct from the hermes/openclaw/claude BYO block
+  # below (which writes native auth.json/endpoint overrides) — pi just needs the
+  # env var. DIVE-1200.
+  if [[ "$type" == "pi" ]]; then
+    local pi_provider="${byo_provider:-anthropic}"
+    pi_apply_provider_key "$pi_provider" "$api_key" "$profile"
+    # Reload the key into any running agents that consume it (mirrors the BYO
+    # block's restart, and restart_profile_agents' DIVE-383 boot-cred lesson).
+    local _affected _agent
+    if [[ -n "$profile" ]]; then
+      _affected=$(registry_read | jq -r --arg p "$profile" \
+        '.agents | to_entries[] | select(.value.authProfile == $p and .value.type == "pi") | .key')
+    else
+      _affected=$(registry_read | jq -r \
+        '.agents | to_entries[] | select((.value.authProfile // "") == "" and .value.type == "pi") | .key')
+    fi
+    while IFS= read -r _agent; do
+      [[ -n "$_agent" ]] || continue
+      step "Restarting 5dive-agent@${_agent}.service"
+      systemctl restart "5dive-agent@${_agent}.service" >&2 2>&1 \
+        || warn "restart of agent '$_agent' failed — check journalctl -u 5dive-agent@${_agent}"
+    done <<<"$_affected"
+    ok "api key stored for pi/${pi_provider}${profile:+ (profile=$profile)}" \
+       '{type:$t, provider:$pr, profile:$p}' \
+       --arg t "pi" --arg pr "$pi_provider" --arg p "${profile:-}"
+    return
+  fi
 
   # BYO path for hermes/openclaw: --provider=<canonical> picks which vendor's
   # api-key this is. Routes through apply_byo_provider, which writes into the
@@ -6661,8 +6951,11 @@ cmd_create() {
   # later", not an add-on. The key sentinel "-" reads from stdin so the value
   # never appears in argv (and thus never in `ps`).
   if [[ -n "$byo_provider" || -n "$byo_api_key" ]]; then
-    [[ "$type" == "hermes" || "$type" == "openclaw" || "$type" == "claude" ]] \
-      || fail "$E_VALIDATION" "--provider/--api-key only supported for hermes/openclaw/claude (got: $type)"
+    # pi is API-key multi-provider (no OAuth): --provider names the vendor and
+    # the key is injected as pi's native per-provider env var (PI_PROVIDER_VAR),
+    # so it skips the hermes/openclaw/claude BYO catalog checks below. DIVE-1200.
+    [[ "$type" == "hermes" || "$type" == "openclaw" || "$type" == "claude" || "$type" == "pi" ]] \
+      || fail "$E_VALIDATION" "--provider/--api-key only supported for hermes/openclaw/claude/pi (got: $type)"
     # claude BYO points the harness at an Anthropic-compatible third-party
     # endpoint and stores the override env vars in the auth-profile's
     # combined.env — so it requires a profile to scope the creds to this agent
@@ -6674,16 +6967,21 @@ cmd_create() {
       || fail "$E_USAGE" "--provider and --api-key must be passed together"
     (( defer_auth )) \
       && fail "$E_USAGE" "--defer-auth and --provider/--api-key are mutually exclusive"
-    valid_byo_provider "$byo_provider" \
-      || fail "$E_VALIDATION" "unknown provider '$byo_provider' (known: ${!BYO_PROVIDER_LABEL[*]})"
+    if [[ "$type" == "pi" ]]; then
+      pi_provider_var "$byo_provider" >/dev/null \
+        || fail "$E_VALIDATION" "pi provider '$byo_provider' not supported (known: ${!PI_PROVIDER_VAR[*]})"
+    else
+      valid_byo_provider "$byo_provider" \
+        || fail "$E_VALIDATION" "unknown provider '$byo_provider' (known: ${!BYO_PROVIDER_LABEL[*]})"
+      local _native
+      _native=$(resolve_native_provider "$type" "$byo_provider")
+      [[ -n "$_native" ]] \
+        || fail "$E_VALIDATION" "$type does not support provider '$byo_provider'"
+    fi
     if [[ -n "$byo_model" ]]; then
       valid_model "$byo_model" \
         || fail "$E_VALIDATION" "invalid --model '$byo_model' (allowed chars: letters/digits/._:/-)"
     fi
-    local _native
-    _native=$(resolve_native_provider "$type" "$byo_provider")
-    [[ -n "$_native" ]] \
-      || fail "$E_VALIDATION" "$type does not support provider '$byo_provider'"
     if [[ "$byo_api_key" == "-" ]]; then
       [[ -t 0 ]] && fail "$E_USAGE" "--api-key=- expects the key on stdin, stdin is a TTY"
       byo_api_key=$(cat)
@@ -6867,7 +7165,14 @@ cmd_create() {
   # Must come after the install-on-demand block so the agent CLI exists
   # when apply_byo_provider shells out to `hermes auth add`.
   if [[ -n "$byo_provider" ]]; then
-    apply_byo_provider "$type" "$byo_provider" "$byo_api_key" "$profile" "$byo_model"
+    if [[ "$type" == "pi" ]]; then
+      # pi injects the key as a native env var (no auth.json / endpoint
+      # override), so it takes the env-var write path, not apply_byo_provider
+      # (which is hermes/openclaw/claude only). DIVE-1200.
+      pi_apply_provider_key "$byo_provider" "$byo_api_key" "$profile"
+    else
+      apply_byo_provider "$type" "$byo_provider" "$byo_api_key" "$profile" "$byo_model"
+    fi
   fi
 
   # Don't create an agent that can't log in. When an auth-profile is named,
@@ -6950,6 +7255,16 @@ cmd_create() {
         step "Seeded agy OAuth token into agent-${name} runtime"
       fi
     fi
+  elif [[ "$type" == "pi" && -n "$byo_model" ]]; then
+    # DIVE-1205: pin the pi agent's default model. pi reads defaultProvider/
+    # defaultModel from ~/.pi/agent/settings.json at startup (both the TUI and
+    # the SDK the telegram-pi relay hosts pi through), so a create-time write
+    # here makes the agent boot straight onto the chosen provider+model with no
+    # /model step. Needed because pi has no PI_MODEL env var — the api-key is
+    # env-injected (DIVE-1200) but the model selection is settings-file only.
+    # Only pi's built-in providers reach this branch (validated above via
+    # PI_PROVIDER_VAR), so pi already knows the base_url; we just name the model.
+    pi_apply_model_default "$name" "$byo_provider" "$byo_model"
   fi
 
   # DIVE-990: memory-as-onboarding. Seed the new agent's recall store from
@@ -9344,7 +9659,7 @@ PY
 _tg_access_state_dir() {
   local user="$1" type="$2"
   case "$type" in
-    claude|codex|grok) printf '/home/%s/.%s/channels/telegram' "$user" "$type" ;;
+    claude|codex|grok|pi) printf '/home/%s/.%s/channels/telegram' "$user" "$type" ;;
     antigravity)       printf '/home/%s/.gemini/channels/telegram' "$user" ;;
     *) return 1 ;;
   esac
@@ -9373,7 +9688,7 @@ cmd_telegram_access_get() {
   local user="agent-${name}"
   local state_dir
   state_dir=$(_tg_access_state_dir "$user" "$type") \
-    || fail "$E_VALIDATION" "telegram-access supports claude, codex, grok and antigravity agents (got type=$type)"
+    || fail "$E_VALIDATION" "telegram-access supports claude, codex, grok, pi and antigravity agents (got type=$type)"
   local access="${state_dir}/access.json"
   local raw
   raw=$(sudo -u "$user" cat "$access" 2>/dev/null || true)
@@ -9419,7 +9734,7 @@ cmd_telegram_access_set() {
   local user="agent-${name}"
   local state_dir
   state_dir=$(_tg_access_state_dir "$user" "$type") \
-    || fail "$E_VALIDATION" "telegram-access supports claude, codex, grok and antigravity agents (got type=$type)"
+    || fail "$E_VALIDATION" "telegram-access supports claude, codex, grok, pi and antigravity agents (got type=$type)"
 
   local body
   body=$(cat)
@@ -9554,7 +9869,7 @@ cmd_telegram_pending_ignore() {
   local user="agent-${name}"
   local state_dir
   state_dir=$(_tg_access_state_dir "$user" "$type") \
-    || fail "$E_VALIDATION" "telegram-pending-ignore supports claude, codex, grok and antigravity agents (got type=$type)"
+    || fail "$E_VALIDATION" "telegram-pending-ignore supports claude, codex, grok, pi and antigravity agents (got type=$type)"
   local access="${state_dir}/access.json"
   local err
   err=$(sudo -u "$user" env ACCESS="$access" CODE="$code" python3 - <<'PY' 2>&1 >/dev/null
@@ -9636,8 +9951,8 @@ cmd_telegram_resolve_handle() {
   type=$(jq -r --arg n "$name" '.agents[$n].type' <<<"$reg")
   channels=$(jq -r --arg n "$name" '.agents[$n].channels' <<<"$reg")
   case "$type" in
-    claude|codex|grok|antigravity) ;;
-    *) fail "$E_VALIDATION" "telegram-resolve-handle supports claude, codex, grok and antigravity agents (got type=$type)" ;;
+    claude|codex|grok|pi|antigravity) ;;
+    *) fail "$E_VALIDATION" "telegram-resolve-handle supports claude, codex, grok, pi and antigravity agents (got type=$type)" ;;
   esac
   [[ ",$channels," == *",telegram,"* ]] \
     || fail "$E_VALIDATION" "agent '$name' has channels=$channels — telegram-resolve-handle only applies to telegram"

@@ -1265,6 +1265,138 @@ PY
   fi
 }
 
+pi_plugin_dir() {
+  local c
+  for c in "${TELEGRAM_PI_PLUGIN_DIR:-}" \
+           /usr/local/lib/5dive/telegram-pi \
+           /home/claude/projects/5dive/5dive-plugins/plugins/telegram-pi; do
+    [[ -n "$c" && -f "$c/server.ts" ]] && { printf '%s\n' "$c"; return 0; }
+  done
+  return 1
+}
+
+# Configure the telegram channel for a pi agent. pi (earendil-works/pi) is
+# EXTENSION-based (DIVE-1198 SPIKE): it ships no MCP/hooks config surface, so
+# the telegram bridge can't be wired like codex/grok/agy. Instead telegram-pi
+# is a STANDALONE RELAY (telegram-pi/server.ts) — the same run-model as
+# opencode: the bridge IS the agent's main process and hosts pi via pi's
+# extension API, so 5dive-agent-start launches `bun server.ts` instead of the
+# pi TUI for channels=telegram. So there's no config wiring here; the installer
+# just (1) writes the bot token into ~/.pi/channels/telegram/.env (the path the
+# relay reads its token from) and (2) seeds access.json. A single shared plugin
+# checkout serves every pi agent (the relay resolves its state dir from the
+# agent's own $HOME).
+install_channel_for_pi_agent() {
+  local plugin="$1" name="$2" token="$3" allowed_users="${4:-}"
+  local user="agent-${name}"
+  id -u "$user" &>/dev/null || fail "$E_GENERIC" "agent user missing: $user"
+  [[ "$plugin" == "telegram" ]] \
+    || fail "$E_VALIDATION" "pi channel plugin unsupported: $plugin (telegram only)"
+  [[ -n "$token" ]] || fail "$E_VALIDATION" "pi telegram channel requires a bot token"
+  if [[ -n "$allowed_users" ]]; then
+    valid_telegram_chat_id_list "$allowed_users" \
+      || fail "$E_VALIDATION" "invalid allowed_users (comma-separated numeric ids)"
+  fi
+
+  pi_plugin_dir >/dev/null \
+    || fail "$E_NOT_INSTALLED" \
+       "telegram-pi plugin not found (looked in /usr/local/lib/5dive/telegram-pi and the 5dive-plugins checkout). Set TELEGRAM_PI_PLUGIN_DIR or deploy the plugin."
+
+  # bun runs the relay (server.ts) — it IS the agent process, so a missing bun
+  # would crash-loop the unit. Fail fast at create time like the other bridges.
+  if ! ensure_bun_for_agent "$user"; then
+    fail "$E_NOT_INSTALLED" \
+      "bun unavailable for $user (required by telegram-pi) and automatic install failed. Check network access to bun.sh, or install bun to /usr/local/bin manually, then retry."
+  fi
+
+  step "Writing telegram token into ~/.pi/channels/telegram/.env for $user"
+  if ! sudo -u "$user" -H env TOKEN="$token" bash -s >&2 <<'PI_ENV'
+set -euo pipefail
+mkdir -p "$HOME/.pi/channels/telegram"
+chmod 700 "$HOME/.pi" "$HOME/.pi/channels" "$HOME/.pi/channels/telegram" 2>/dev/null || true
+ENV_FILE="$HOME/.pi/channels/telegram/.env"
+touch "$ENV_FILE"; chmod 600 "$ENV_FILE"
+TMP=$(mktemp --tmpdir="$HOME/.pi/channels/telegram" .env.XXXXXX); chmod 600 "$TMP"
+grep -v '^TELEGRAM_BOT_TOKEN=' "$ENV_FILE" > "$TMP" || true
+printf 'TELEGRAM_BOT_TOKEN=%s\n' "$TOKEN" >> "$TMP"
+mv "$TMP" "$ENV_FILE"
+PI_ENV
+  then
+    fail "$E_GENERIC" "pi telegram .env write failed for agent '$name'"
+  fi
+
+  # Always seed access.json (DIVE-45) — a missing file is a block-everything
+  # silent-DM-drop in the relay bridges. seed_* writes the file: allowlist the
+  # given ids, or default dmPolicy to 'pairing' so the first DM pairs.
+  seed_pi_telegram_access "$name" "$allowed_users"
+
+  # Seed the notify-user skill so the agent self-starts its comms loop on first
+  # DM. pi reads skills from its generic install dir (no SKILLS_AGENT_ID[pi]
+  # entry → the generic $HOME/.agents/skills path, same fallback as agy).
+  if [[ -f "$AGENT_SKILLS_DIR/notify-user/SKILL.md" ]]; then
+    sudo -u "$user" mkdir -p "/home/${user}/.agents/skills/notify-user"
+    sudo -u "$user" cp "$AGENT_SKILLS_DIR/notify-user/SKILL.md" \
+      "/home/${user}/.agents/skills/notify-user/SKILL.md"
+  fi
+
+  # Default skills, best-effort: match the grok/agy/opencode installers. pi has
+  # no upstream skills-registry id, so these route through the generic path and
+  # are best-effort (|| true — never block provisioning).
+  install_default_skill_for_agent "$name" pi vercel-labs/skills find-skills || true
+  install_default_skill_for_agent "$name" pi "$(gh_org)/skills" 5dive-cli || true
+  install_default_skill_for_agent "$name" pi "$(gh_org)/skills" compile-knowledge || true
+  install_default_skill_for_agent "$name" pi "$(gh_org)/skills" openagent || true
+}
+
+# Write ~/.pi/channels/telegram/access.json for agent-<name>. Idempotent —
+# mirrors seed_opencode_telegram_access: the pi relay shares opencode's access
+# schema (allowFrom + groups + dmPolicy + pending). allowed_users may be empty:
+# we still write the file (a missing file is a silent-DM-drop — DIVE-45),
+# defaulting dmPolicy to 'pairing' so the first DM pairs. An existing dmPolicy
+# is never overridden (re-runs / token rotation preserve the operator's choice).
+seed_pi_telegram_access() {
+  local name="$1" allowed_users="$2"
+  local user="agent-${name}"
+  if [[ -n "$allowed_users" ]]; then
+    step "Seeding pi telegram access.json for $user (allow ${allowed_users})"
+  else
+    step "Seeding pi telegram access.json for $user (dmPolicy=pairing)"
+  fi
+  if ! sudo -u "$user" env CSV="$allowed_users" python3 - <<'PY' >&2; then
+import json, os, tempfile
+
+state = os.path.join(os.path.expanduser('~'), '.pi', 'channels', 'telegram')
+os.makedirs(state, mode=0o700, exist_ok=True)
+access_path = os.path.join(state, 'access.json')
+ids = [s.strip() for s in os.environ['CSV'].split(',') if s.strip()]
+
+try:
+    with open(access_path) as f:
+        data = json.load(f)
+except FileNotFoundError:
+    data = {}
+
+allow = list(data.get('allowFrom') or [])
+for s in ids:
+    if s not in allow:
+        allow.append(s)
+data['allowFrom'] = allow
+data.setdefault('groups', {})
+data.setdefault('pending', {})
+if 'dmPolicy' not in data:
+    data['dmPolicy'] = 'allowlist' if allow else 'pairing'
+
+fd, tmp = tempfile.mkstemp(dir=state, prefix='.access.', suffix='.tmp')
+with os.fdopen(fd, 'w') as f:
+    json.dump(data, f, indent=2)
+os.chmod(tmp, 0o600)
+os.replace(tmp, access_path)
+print(f"Seeded access.json dmPolicy={data['dmPolicy']} allowFrom={allow} into {access_path}")
+PY
+    fail "$E_GENERIC" "pi telegram access.json pre-seed failed for agent '$name'"
+  fi
+}
+
 # Single dispatch point used by cmd_create. Routes a (type, plugin) pair to
 # the right install helper above, so the create flow stays type-agnostic.
 # home_channel/allowed_users are hermes-telegram extras (ignored by other
@@ -1282,6 +1414,7 @@ install_channel_for_agent() {
     grok)        install_channel_for_grok_agent "$plugin" "$name" "$token" "$allowed_users" ;;
     antigravity) install_channel_for_antigravity_agent "$plugin" "$name" "$token" "$allowed_users" ;;
     opencode)    install_channel_for_opencode_agent "$plugin" "$name" "$token" "$allowed_users" ;;
+    pi)          install_channel_for_pi_agent "$plugin" "$name" "$token" "$allowed_users" ;;
     openclaw)    install_channel_for_openclaw_agent "$plugin" "$name" "$token" "$home_channel" "$allowed_users" ;;
     hermes)      install_channel_for_hermes_agent "$plugin" "$name" "$token" "$home_channel" "$allowed_users" ;;
     *) fail "$E_VALIDATION" "type '$type' does not support channels" ;;

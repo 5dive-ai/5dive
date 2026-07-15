@@ -26,7 +26,7 @@ esac
 
 # Bumped on every public release. `build.sh` checks this line exists; CI fails
 # the bundle-drift check if it's missing or empty.
-readonly FIVE_VERSION="0.8.23"
+readonly FIVE_VERSION="0.9.0"
 
 # GitHub org our repos live under. The org is being renamed
 # 5dive-com -> 5dive-ai (2026-06); fetches must work on either side of the
@@ -113,6 +113,12 @@ declare -A TYPE_BIN=(
   # symlinks ~/.local/bin/grok — we point TYPE_BIN at the symlink to match
   # the convention of the other types.
   [grok]="/home/claude/.local/bin/grok"
+  # pi is earendil-works' (Armin Ronacher) TypeScript/Node20 coding agent, the
+  # backbone of OpenClaw. `npm i -g @earendil-works/pi-coding-agent` drops the
+  # `pi` binary in nvm's per-version bin dir; the TYPE_INSTALL recipe symlinks
+  # it into ~/.local/bin so TYPE_BIN resolves on every box (same dance as
+  # opencode/openclaw). MIT, ~70.8k stars. Added for the v0.9 pi epic (DIVE-1196).
+  [pi]="/home/claude/.local/bin/pi"
 )
 # Which types accept --channels=telegram|discord. Each type wires the channel
 # differently (see install_channel_for_<type>_agent below):
@@ -154,6 +160,13 @@ declare -A TYPE_CHANNELS=(
   # GLOBAL ~/.gemini/config/{mcp_config.json,hooks.json} at boot (agy doesn't
   # auto-load a plugin's mcp_config/hooks — only skills/agents). telegram only.
   [antigravity]=1
+  # pi ships a telegram bridge as a native pi EXTENSION (fork of benedict2310/
+  # TelePi — pi has no MCP-server plugin model like codex/grok; it exposes an
+  # in-process extension API). The channel installer (install_channel_for_pi_agent)
+  # + telegram-pi plugin land in DIVE-1201/DIVE-1202; until then this flag only
+  # marks pi channel-capable — creating a pi agent WITH --channels will fail at
+  # install_channel_for_agent's dispatch until 1201 adds the `pi)` case. telegram only.
+  [pi]=1
 )
 # Auth sentinel per type. Agent users run as agent-<name> (in group `claude`)
 # and cannot read /home/claude/.claude/settings.json (mode 0600), so for
@@ -187,6 +200,13 @@ declare -A TYPE_AUTH=(
   # Verified empirically — auth.json.lock pre-exists the actual auth.json
   # file (created on first device-auth attempt for the locking mechanism).
   [grok]="/home/claude/.grok/auth.json"
+  # pi writes credentials to ~/.pi/agent/auth.json on `/login` (API-key provider
+  # selection or OAuth for subscription providers; tokens auto-refresh). Verified
+  # against @earendil-works/pi-coding-agent docs + benedict2310/TelePi 2026-07-14.
+  # Same file-sentinel shape as codex/grok. NOTE: pi ALSO accepts a bare
+  # ANTHROPIC_API_KEY/OPENAI_API_KEY env var (no file written) — the api-key
+  # injection path (TYPE_API_FILE/VAR + cmd_auth) is finalized in DIVE-1200.
+  [pi]="/home/claude/.pi/agent/auth.json"
 )
 # Installer recipe per type. Run as `claude` user via `sudo -u claude -i bash -lc <recipe>`
 # so $HOME/.nvm and PATH resolve correctly. Empty string => no automated installer
@@ -243,6 +263,13 @@ declare -A TYPE_INSTALL=(
   # installer's ~/.local/bin/agent symlink so it can't shadow future tooling.
   # The binary self-updates on launch; no daily-cron entry needed.
   [grok]="command -v grok >/dev/null 2>&1 || curl -fsSL https://x.ai/cli/install.sh | bash; mkdir -p /home/claude/.local/bin; [ -e /home/claude/.grok/bin/grok ] && ln -sf /home/claude/.grok/bin/grok /home/claude/.local/bin/grok; rm -f /home/claude/.local/bin/agent"
+  # pi is a plain npm package. Install-on-demand like codex (nvm use 24 so the
+  # global install lands in v24's bin dir even when the default alias drifted),
+  # then symlink into ~/.local/bin like opencode/openclaw so TYPE_BIN[pi]
+  # resolves on every box (the systemd unit uses TYPE_BIN's path directly, and
+  # bash -lc skips .bashrc so npm's bin dir isn't on PATH). Idempotent via the
+  # -x guard. \$-escaped so npm prefix expands when the recipe runs under bash -lc.
+  [pi]="[[ -x /home/claude/.local/bin/pi ]] || { . /home/claude/.nvm/nvm.sh && nvm use 24 >/dev/null && npm install -g @earendil-works/pi-coding-agent && mkdir -p /home/claude/.local/bin && ln -sf \"\$(npm prefix -g)/bin/pi\" /home/claude/.local/bin/pi; }"
 )
 
 # vercel-labs/skills CLI agent ID per 5dive type. `npx skills add --agent <id>`
@@ -296,12 +323,48 @@ declare -A TYPE_API_FILE=(
   [codex]="openai.env"
   [opencode]="openai.env"
   [grok]="xai.env"
+  # pi is multi-provider (see PI_PROVIDER_VAR): the connector file holds a
+  # per-provider *_API_KEY var chosen by `auth set pi --provider`. It's listed
+  # here (not in TYPE_API_VAR) so auth_creds_present's default-profile fallback
+  # recognizes a pi key written to this file; cmd_auth_set resolves the var
+  # itself rather than reading a single TYPE_API_VAR entry. DIVE-1200.
+  [pi]="pi.env"
 )
 declare -A TYPE_API_VAR=(
   [claude]="ANTHROPIC_API_KEY"
   [codex]="OPENAI_API_KEY"
   [opencode]="OPENAI_API_KEY"
   [grok]="XAI_API_KEY"
+  # pi is deliberately absent: it's multi-provider (no single native var).
+  # cmd_auth_set resolves pi's target var from --provider via PI_PROVIDER_VAR.
+)
+
+# pi provider -> native env var. pi is API-key multi-provider (NO OAuth): it
+# reads the standard per-provider *_API_KEY var straight from the environment
+# (verified against @earendil-works/pi-coding-agent 0.80.6 dist — it recognizes
+# ANTHROPIC_API_KEY / OPENAI_API_KEY / GEMINI_API_KEY / OPENROUTER_API_KEY /
+# DEEPSEEK_API_KEY / ZAI_API_KEY / MOONSHOT_API_KEY / XAI_API_KEY / ...). 5dive
+# injects the chosen var via the connector env file / profile combined.env the
+# same way codex/opencode/grok do their single native var. DIVE-1200 wired the
+# three core providers; DIVE-1205 adds OpenRouter + the Chinese models
+# (DeepSeek / GLM-Zhipu[=zai] / Kimi-Moonshot / Qwen). IMPORTANT: these are ALL
+# built-in pi providers — pi ships each provider's base_url in its own model
+# registry (docs/providers.md "For each provider, pi knows all available
+# models"), so 5dive does NOT need a custom base_url; injecting the right
+# *_API_KEY var is sufficient and pi resolves the endpoint itself. Qwen has no
+# standalone pi provider var, so it routes through OpenRouter. Provider ids
+# below match pi's `--provider` / auth.json-key column (docs/providers.md table)
+# so a `--model` pin resolves to the correct built-in provider. DIVE-1205.
+declare -A PI_PROVIDER_VAR=(
+  [anthropic]="ANTHROPIC_API_KEY"
+  [openai]="OPENAI_API_KEY"
+  [google]="GEMINI_API_KEY"
+  [openrouter]="OPENROUTER_API_KEY"
+  [deepseek]="DEEPSEEK_API_KEY"
+  [moonshotai]="MOONSHOT_API_KEY"
+  [kimi-coding]="KIMI_API_KEY"
+  [zai]="ZAI_API_KEY"
+  [minimax]="MINIMAX_API_KEY"
 )
 
 # BYO provider catalog for hermes/openclaw. The dashboard's new-agent

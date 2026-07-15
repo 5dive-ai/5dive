@@ -294,6 +294,37 @@ JOURNALD
   fi
   rm -rf "$_ocode_tmp"
 
+  # Stage the telegram-pi plugin — same shape as telegram-opencode above. pi
+  # (earendil-works/pi) is EXTENSION-based with no plugin marketplace; its
+  # telegram bridge is a standalone long-running relay (server.ts) launched by
+  # 5dive-agent-start from this one shared checkout via absolute paths. Without
+  # this, pi+telegram agents can't be provisioned (install_channel_for_pi_
+  # agent's plugin-dir check fails) — i.e. pi telegram is a no-op on customer
+  # boxes until staged. Override with PI_PLUGIN_TARBALL for offline / pinned
+  # installs.
+  PI_PLUGIN_TARBALL="${PI_PLUGIN_TARBALL:-https://github.com/$GH_ORG/5dive-plugins/archive/refs/heads/main.tar.gz}"
+  _pi_tmp="$(mktemp -d)"
+  if curl -fsSL "$PI_PLUGIN_TARBALL" \
+      | tar -xz -C "$_pi_tmp" --strip-components=1 '5dive-plugins-main/plugins/telegram-pi' 2>/dev/null \
+      && [ -f "$_pi_tmp/plugins/telegram-pi/server.ts" ]; then
+    install -d -m 755 "$LIB_DIR/telegram-pi"
+    cp -a "$_pi_tmp/plugins/telegram-pi/." "$LIB_DIR/telegram-pi/"
+    if id -u claude >/dev/null 2>&1; then
+      chown -R claude:claude "$LIB_DIR/telegram-pi"
+      if sudo -u claude -H bash -lc "cd $(printf %q "$LIB_DIR/telegram-pi") && bun install --production --ignore-scripts --no-progress --no-summary" >/dev/null 2>&1; then
+        chmod -R a+rX "$LIB_DIR/telegram-pi"
+        ok "telegram-pi plugin"
+      else
+        echo "warn: bun install for telegram-pi failed — pi+telegram agents won't have the bridge until the next successful refresh" >&2
+      fi
+    else
+      echo "warn: no claude user — skipping telegram-pi bun install" >&2
+    fi
+  else
+    echo "warn: failed to stage telegram-pi from $PI_PLUGIN_TARBALL — pi+telegram won't be available until the next successful refresh" >&2
+  fi
+  rm -rf "$_pi_tmp"
+
   # CLAUDE.md fragment that preseed_claude_agent drops into a telegram-paired
   # agent's $HOME/.claude/ so the per-turn reply mandate + AskUserQuestion /
   # ExitPlanMode warning ride with the agents that actually need them — not

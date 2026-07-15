@@ -14,7 +14,7 @@
 _tg_access_state_dir() {
   local user="$1" type="$2"
   case "$type" in
-    claude|codex|grok) printf '/home/%s/.%s/channels/telegram' "$user" "$type" ;;
+    claude|codex|grok|pi) printf '/home/%s/.%s/channels/telegram' "$user" "$type" ;;
     antigravity)       printf '/home/%s/.gemini/channels/telegram' "$user" ;;
     *) return 1 ;;
   esac
@@ -43,7 +43,7 @@ cmd_telegram_access_get() {
   local user="agent-${name}"
   local state_dir
   state_dir=$(_tg_access_state_dir "$user" "$type") \
-    || fail "$E_VALIDATION" "telegram-access supports claude, codex, grok and antigravity agents (got type=$type)"
+    || fail "$E_VALIDATION" "telegram-access supports claude, codex, grok, pi and antigravity agents (got type=$type)"
   local access="${state_dir}/access.json"
   local raw
   raw=$(sudo -u "$user" cat "$access" 2>/dev/null || true)
@@ -89,7 +89,7 @@ cmd_telegram_access_set() {
   local user="agent-${name}"
   local state_dir
   state_dir=$(_tg_access_state_dir "$user" "$type") \
-    || fail "$E_VALIDATION" "telegram-access supports claude, codex, grok and antigravity agents (got type=$type)"
+    || fail "$E_VALIDATION" "telegram-access supports claude, codex, grok, pi and antigravity agents (got type=$type)"
 
   local body
   body=$(cat)
@@ -224,7 +224,7 @@ cmd_telegram_pending_ignore() {
   local user="agent-${name}"
   local state_dir
   state_dir=$(_tg_access_state_dir "$user" "$type") \
-    || fail "$E_VALIDATION" "telegram-pending-ignore supports claude, codex, grok and antigravity agents (got type=$type)"
+    || fail "$E_VALIDATION" "telegram-pending-ignore supports claude, codex, grok, pi and antigravity agents (got type=$type)"
   local access="${state_dir}/access.json"
   local err
   err=$(sudo -u "$user" env ACCESS="$access" CODE="$code" python3 - <<'PY' 2>&1 >/dev/null
@@ -306,8 +306,8 @@ cmd_telegram_resolve_handle() {
   type=$(jq -r --arg n "$name" '.agents[$n].type' <<<"$reg")
   channels=$(jq -r --arg n "$name" '.agents[$n].channels' <<<"$reg")
   case "$type" in
-    claude|codex|grok|antigravity) ;;
-    *) fail "$E_VALIDATION" "telegram-resolve-handle supports claude, codex, grok and antigravity agents (got type=$type)" ;;
+    claude|codex|grok|pi|antigravity) ;;
+    *) fail "$E_VALIDATION" "telegram-resolve-handle supports claude, codex, grok, pi and antigravity agents (got type=$type)" ;;
   esac
   [[ ",$channels," == *",telegram,"* ]] \
     || fail "$E_VALIDATION" "agent '$name' has channels=$channels — telegram-resolve-handle only applies to telegram"

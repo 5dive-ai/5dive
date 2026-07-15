@@ -17,6 +17,14 @@ release.
 
 ## [Unreleased]
 
+### Added
+- **`pi` is now the 8th first-class agent type (Pi by earendil-works) — DIVE-1196/1199/1200/1201.**
+  Type registration in header.sh; multi-provider API-key auth (no OAuth) via `PI_PROVIDER_VAR` +
+  `--provider/--api-key` on create (cmd_auth.sh, DIVE-1200); telegram channel wiring for pi's
+  extension-based bridge (agent_setup.sh, 5dive-agent-start, DIVE-1201); install.sh stages
+  telegram-pi. New units pi_auth_provider_unit.sh (18) + pi_channel_wiring_unit.sh (13). Bumps to 0.9.0.
+
+
 ### Fixed
 - **Heartbeat idle-detection is now runtime-aware, so non-claude agents get
   nudged for board tasks (DIVE-1211).** `_hb_agent_idle`'s pane-scrape fallback

@@ -88,6 +88,30 @@ case "$TYPE" in
     else
       BIN="/home/claude/.local/bin/opencode"; ARGS=()
     fi ;;
+  pi)
+    # pi (earendil-works/pi) is EXTENSION-based (DIVE-1198 SPIKE): no MCP/hooks
+    # config surface, so its telegram bridge is a STANDALONE RELAY (telegram-pi/
+    # server.ts) — the same run-model as opencode, distinct from claude
+    # (--channels flag) and codex/grok/agy (MCP wired into config). The relay IS
+    # the agent's main process and hosts pi via pi's extension API, so for
+    # channels=telegram we launch it via bun (`bun run --cwd <plugin> ... start`)
+    # instead of the pi TUI. PI_BIN + PI_PROJECT_DIR are exported via
+    # PI_OVERRIDE below. Resolver kept in sync with pi_plugin_dir() in
+    # agent_setup.sh (the boot script is standalone, so it's duplicated).
+    if [[ "$CHANNELS" == "telegram" ]]; then
+      PI_PLUGIN_DIR=""
+      for _c in "${TELEGRAM_PI_PLUGIN_DIR:-}" \
+                /usr/local/lib/5dive/telegram-pi \
+                /home/claude/projects/5dive/5dive-plugins/plugins/telegram-pi; do
+        [[ -n "$_c" && -f "$_c/server.ts" ]] && { PI_PLUGIN_DIR="$_c"; break; }
+      done
+      [[ -n "$PI_PLUGIN_DIR" ]] \
+        || { echo "telegram-pi plugin not found (set TELEGRAM_PI_PLUGIN_DIR or deploy it)" >&2; exit 3; }
+      BIN="/home/claude/.local/bin/bun"
+      ARGS=(run --cwd "$PI_PLUGIN_DIR" --shell=bun --silent start)
+    else
+      BIN="/home/claude/.local/bin/pi"; ARGS=()
+    fi ;;
   # antigravity ships as `agy` (Google's native-Go gemini-cli successor). The
   # type id stays "antigravity" everywhere (agents.d/<name>.env, TYPE_BIN,
   # auth dispatch); only the on-disk binary is named agy.
@@ -137,6 +161,9 @@ case "$CH" in
       # channel + token from ~/.opencode/channels/telegram state, not argv — so
       # no --channels flag is appended here.
       opencode) : ;;
+      # pi's relay (launched via bun in the type-dispatch above) likewise reads
+      # its channel + token from ~/.pi/channels/telegram state, not argv.
+      pi) : ;;
     esac ;;
   discord)
     case "$TYPE" in
@@ -183,6 +210,15 @@ CODEX_OVERRIDE=""
 OPENCODE_OVERRIDE=""
 if [[ "$TYPE" == "opencode" && "$CHANNELS" == "telegram" ]]; then
   OPENCODE_OVERRIDE="export OPENCODE_BIN=$(printf %q "/home/claude/.local/bin/opencode") OPENCODE_PROJECT_DIR=$(printf %q "$WORKDIR"); "
+fi
+# pi+telegram relay env (see the pi case in the type-dispatch). The relay hosts
+# pi via its extension API and needs PI_BIN (abs path — agent users skip
+# .bashrc, so a bare `pi` wouldn't resolve) and should treat the agent's WORKDIR
+# as its project dir (else it defaults to the plugin dir, which is the bun
+# --cwd). Mirrors OPENCODE_OVERRIDE.
+PI_OVERRIDE=""
+if [[ "$TYPE" == "pi" && "$CHANNELS" == "telegram" ]]; then
+  PI_OVERRIDE="export PI_BIN=$(printf %q "/home/claude/.local/bin/pi") PI_PROJECT_DIR=$(printf %q "$WORKDIR"); "
 fi
 if [[ "$TYPE" == "codex" ]]; then
   AGENT_CODEX_HOME="$HOME/.codex"
@@ -942,7 +978,7 @@ else
   LOOP="while true; do ${CMD_STR}; sleep 2; done"
 fi
 
-INNER="unset CLAUDE_CONFIG_DIR ${UNSET_CREDS}; ${STAGE_GUARD}${CODEX_OVERRIDE}${OPENCODE_OVERRIDE}${PRELUDE}${LOOP}"
+INNER="unset CLAUDE_CONFIG_DIR ${UNSET_CREDS}; ${STAGE_GUARD}${CODEX_OVERRIDE}${OPENCODE_OVERRIDE}${PI_OVERRIDE}${PRELUDE}${LOOP}"
 [[ -n "$PROFILE" ]] && echo "[5dive] agent=${NAME} using auth-profile=${PROFILE}" >&2
 
 /usr/bin/tmux new-session -d -s "$SESSION" -c "$WORKDIR" \

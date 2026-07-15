@@ -745,6 +745,70 @@ write_default_connector() {
     | _write_connector "$fname"
 }
 
+# pi_provider_var <provider> — resolve pi's native env var for a provider id
+# (default anthropic). Non-zero + empty stdout for an unknown/not-yet-wired
+# provider so callers can surface the known set. Backs both `auth set pi
+# --provider` and the create-path --provider/--api-key flow. DIVE-1200.
+pi_provider_var() {
+  local p="${1:-anthropic}"
+  local v="${PI_PROVIDER_VAR[$p]:-}"
+  [[ -n "$v" ]] || return 1
+  echo "$v"
+}
+
+# pi_apply_provider_key <provider> <api_key> [profile] — write pi's per-provider
+# API key into the profile's combined.env (isolated to agents on that profile)
+# or the shared pi.env connector (default profile). pi reads the var straight
+# from its environment, so systemd's EnvironmentFile injection is all that's
+# needed — no ~/.pi/agent/auth.json write. Requires root (connector/profile
+# writes). Shared by cmd_auth_set and cmd_agent_create. DIVE-1200.
+pi_apply_provider_key() {
+  local provider="${1:-anthropic}" api_key="$2" profile="${3:-}"
+  local var
+  var=$(pi_provider_var "$provider") \
+    || fail "$E_VALIDATION" "pi provider '$provider' not supported (known: ${!PI_PROVIDER_VAR[*]})"
+  require_root
+  if [[ -z "$profile" ]]; then
+    step "Writing ${var} to /etc/5dive/connectors/${TYPE_API_FILE[pi]}"
+    printf '%s' "$api_key" | write_default_connector "${TYPE_API_FILE[pi]}" "$var"
+  else
+    valid_profile_name "$profile" \
+      || fail "$E_VALIDATION" "invalid --auth-profile (lowercase letters/digits/_-, start letter, <=32 chars)"
+    ensure_profile_dir "$profile" >/dev/null
+    step "Writing ${var} to auth profile '${profile}'"
+    printf '%s' "$api_key" | profile_set_var "$profile" "$var"
+  fi
+}
+
+# pi_apply_model_default <agent-name> <provider> <model> — pin a pi agent's
+# default provider+model by merging {defaultProvider,defaultModel} into its
+# ~/.pi/agent/settings.json. pi reads these at startup, so the agent boots onto
+# the chosen model with no interactive /model step (pi has no PI_MODEL env var,
+# so this is the only launch-time model-pin surface). Idempotent: preserves any
+# other settings keys, overwrites only the two model fields. Runs as root at
+# create time (owns the write to the agent user's home); file ends up owned by
+# agent-<name> at 0600 like pi's own settings writes. DIVE-1205.
+pi_apply_model_default() {
+  local name="$1" provider="$2" model="$3"
+  local home="/home/agent-${name}" dir sf
+  dir="${home}/.pi/agent"; sf="${dir}/settings.json"
+  install -d -m 700 -o "agent-${name}" -g "agent-${name}" \
+    "${home}/.pi" "$dir" 2>/dev/null \
+    || { warn "pi model-pin: could not create $dir (skipping --model default)"; return 0; }
+  local cur='{}'
+  [[ -s "$sf" ]] && cur=$(cat "$sf" 2>/dev/null) && jq -e . >/dev/null 2>&1 <<<"$cur" || cur='{}'
+  local tmp
+  tmp=$(mktemp --tmpdir="$dir" settings.XXXXXX) || { warn "pi model-pin: mktemp failed"; return 0; }
+  if jq --arg p "$provider" --arg m "$model" \
+       '.defaultProvider=$p | .defaultModel=$m' <<<"$cur" >"$tmp"; then
+    chmod 600 "$tmp"; chown "agent-${name}:agent-${name}" "$tmp" 2>/dev/null || true
+    mv -f "$tmp" "$sf"
+    step "Pinned pi default model for agent-${name}: ${provider}/${model}"
+  else
+    rm -f "$tmp"; warn "pi model-pin: jq merge failed (skipping --model default)"
+  fi
+}
+
 # cmd_auth_set — API-key path that bypasses the browser/OAuth flow. Some
 # users prefer pasting a key; also the only option for ANTHROPIC_API_KEY /
 # Vertex / Bedrock style auth where there's no device-code flow.
@@ -777,6 +841,36 @@ cmd_auth_set() {
   fi
   valid_api_key "$api_key" \
     || fail "$E_VALIDATION" "api key looks wrong (expected >=10 printable non-space chars)"
+
+  # pi path: multi-provider, API-key only (no OAuth). --provider selects which
+  # vendor's key this is (default anthropic); the key is injected as pi's native
+  # per-provider env var. Distinct from the hermes/openclaw/claude BYO block
+  # below (which writes native auth.json/endpoint overrides) — pi just needs the
+  # env var. DIVE-1200.
+  if [[ "$type" == "pi" ]]; then
+    local pi_provider="${byo_provider:-anthropic}"
+    pi_apply_provider_key "$pi_provider" "$api_key" "$profile"
+    # Reload the key into any running agents that consume it (mirrors the BYO
+    # block's restart, and restart_profile_agents' DIVE-383 boot-cred lesson).
+    local _affected _agent
+    if [[ -n "$profile" ]]; then
+      _affected=$(registry_read | jq -r --arg p "$profile" \
+        '.agents | to_entries[] | select(.value.authProfile == $p and .value.type == "pi") | .key')
+    else
+      _affected=$(registry_read | jq -r \
+        '.agents | to_entries[] | select((.value.authProfile // "") == "" and .value.type == "pi") | .key')
+    fi
+    while IFS= read -r _agent; do
+      [[ -n "$_agent" ]] || continue
+      step "Restarting 5dive-agent@${_agent}.service"
+      systemctl restart "5dive-agent@${_agent}.service" >&2 2>&1 \
+        || warn "restart of agent '$_agent' failed — check journalctl -u 5dive-agent@${_agent}"
+    done <<<"$_affected"
+    ok "api key stored for pi/${pi_provider}${profile:+ (profile=$profile)}" \
+       '{type:$t, provider:$pr, profile:$p}' \
+       --arg t "pi" --arg pr "$pi_provider" --arg p "${profile:-}"
+    return
+  fi
 
   # BYO path for hermes/openclaw: --provider=<canonical> picks which vendor's
   # api-key this is. Routes through apply_byo_provider, which writes into the
