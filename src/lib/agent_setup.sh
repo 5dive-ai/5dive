@@ -805,10 +805,13 @@ CODEX_ENV
     fail "$E_GENERIC" "codex telegram .env write failed for agent '$name'"
   fi
 
-  # Seed the allowlist so the operator's DMs reach codex on the first message.
-  if [[ -n "$allowed_users" ]]; then
-    seed_codex_telegram_access "$name" "$allowed_users"
-  fi
+  # Always seed access.json (DIVE-1244) — a missing file is a block-everything
+  # silent-DM-drop in the codex bridge, so an owner-less fork (created with no
+  # allowed_users) would drop the operator's DMs (incl. gate alerts) silently.
+  # seed_* writes the file: allowlist the given ids, or default dmPolicy=pairing
+  # so the first DM yields a pairing code instead of a silent drop. Mirrors the
+  # opencode/pi installers.
+  seed_codex_telegram_access "$name" "$allowed_users"
 
   # Seed the notify-user skill into ~/.codex/.agents/skills so the agent
   # self-starts its comms loop on the first DM. Mirrors the grok 0.1.13 block
@@ -834,12 +837,19 @@ CODEX_ENV
 
 # Write ~/.codex/channels/telegram/access.json for agent-<name> with allowFrom
 # seeded from a CSV of user ids. Idempotent — merges into an existing file so
-# re-running only adds new ids. Matches the {allowFrom, groups} schema the codex
-# server + pair.ts use (allowFrom is an array of string ids).
+# re-running only adds new ids and never overrides an existing dmPolicy. Matches
+# the {allowFrom, groups, dmPolicy, pending} schema the codex server + pair.ts
+# use (allowFrom is an array of string ids). allowed_users may be empty: we still
+# write the file, defaulting dmPolicy=pairing so the first DM pairs instead of a
+# silent block-everything drop (DIVE-1244).
 seed_codex_telegram_access() {
   local name="$1" allowed_users="$2"
   local user="agent-${name}"
-  step "Pre-seeding codex telegram allowlist for $user (${allowed_users})"
+  if [[ -n "$allowed_users" ]]; then
+    step "Seeding codex telegram access.json for $user (allow ${allowed_users})"
+  else
+    step "Seeding codex telegram access.json for $user (dmPolicy=pairing)"
+  fi
   if ! sudo -u "$user" env CSV="$allowed_users" python3 - <<'PY' >&2; then
 import json, os, tempfile
 
@@ -852,7 +862,7 @@ try:
     with open(access_path) as f:
         data = json.load(f)
 except FileNotFoundError:
-    data = {"allowFrom": [], "groups": {}}
+    data = {}
 
 allow = list(data.get('allowFrom') or [])
 for s in ids:
@@ -860,13 +870,19 @@ for s in ids:
         allow.append(s)
 data['allowFrom'] = allow
 data.setdefault('groups', {})
+data.setdefault('pending', {})
+# Never override an explicit dmPolicy (re-run / rotation keeps the operator's
+# choice). For a fresh file: allowlist when we have ids to allow, else pairing
+# so the first DM yields a pairing code instead of a silent block-drop (DIVE-1244).
+if 'dmPolicy' not in data:
+    data['dmPolicy'] = 'allowlist' if allow else 'pairing'
 
 fd, tmp = tempfile.mkstemp(dir=state, prefix='.access.', suffix='.tmp')
 with os.fdopen(fd, 'w') as f:
     json.dump(data, f, indent=2)
 os.chmod(tmp, 0o600)
 os.replace(tmp, access_path)
-print(f"Seeded allowFrom={allow} into {access_path}")
+print(f"Seeded access.json dmPolicy={data['dmPolicy']} allowFrom={allow} into {access_path}")
 PY
     fail "$E_GENERIC" "codex telegram access.json pre-seed failed for agent '$name'"
   fi
@@ -933,9 +949,11 @@ GROK_ENV
     fail "$E_GENERIC" "grok telegram .env write failed for agent '$name'"
   fi
 
-  if [[ -n "$allowed_users" ]]; then
-    seed_grok_telegram_access "$name" "$allowed_users"
-  fi
+  # Always seed access.json (DIVE-1244) — a missing file is a block-everything
+  # silent-DM-drop, so an owner-less fork drops the operator's DMs (incl. gate
+  # alerts) silently. seed_* allowlists the given ids, or defaults dmPolicy=pairing
+  # so the first DM pairs instead of being dropped. Mirrors opencode/pi.
+  seed_grok_telegram_access "$name" "$allowed_users"
 
   # Seed the notify-user skill into ~/.grok/skills so the agent self-starts
   # its comms loop on first DM. Mirrors what preseed_claude_agent does for
@@ -963,7 +981,11 @@ GROK_ENV
 seed_grok_telegram_access() {
   local name="$1" allowed_users="$2"
   local user="agent-${name}"
-  step "Pre-seeding grok telegram allowlist for $user (${allowed_users})"
+  if [[ -n "$allowed_users" ]]; then
+    step "Seeding grok telegram access.json for $user (allow ${allowed_users})"
+  else
+    step "Seeding grok telegram access.json for $user (dmPolicy=pairing)"
+  fi
   if ! sudo -u "$user" env CSV="$allowed_users" python3 - <<'PY' >&2; then
 import json, os, tempfile
 
@@ -976,7 +998,7 @@ try:
     with open(access_path) as f:
         data = json.load(f)
 except FileNotFoundError:
-    data = {"allowFrom": [], "groups": {}}
+    data = {}
 
 allow = list(data.get('allowFrom') or [])
 for s in ids:
@@ -984,13 +1006,19 @@ for s in ids:
         allow.append(s)
 data['allowFrom'] = allow
 data.setdefault('groups', {})
+data.setdefault('pending', {})
+# Never override an explicit dmPolicy; for a fresh file default to allowlist when
+# we have ids, else pairing so the first DM pairs instead of a silent block-drop
+# (DIVE-1244).
+if 'dmPolicy' not in data:
+    data['dmPolicy'] = 'allowlist' if allow else 'pairing'
 
 fd, tmp = tempfile.mkstemp(dir=state, prefix='.access.', suffix='.tmp')
 with os.fdopen(fd, 'w') as f:
     json.dump(data, f, indent=2)
 os.chmod(tmp, 0o600)
 os.replace(tmp, access_path)
-print(f"Seeded allowFrom={allow} into {access_path}")
+print(f"Seeded access.json dmPolicy={data['dmPolicy']} allowFrom={allow} into {access_path}")
 PY
     fail "$E_GENERIC" "grok telegram access.json pre-seed failed for agent '$name'"
   fi
@@ -1059,9 +1087,11 @@ AGY_ENV
     fail "$E_GENERIC" "antigravity telegram .env write failed for agent '$name'"
   fi
 
-  if [[ -n "$allowed_users" ]]; then
-    seed_antigravity_telegram_access "$name" "$allowed_users"
-  fi
+  # Always seed access.json (DIVE-1244) — a missing file is a block-everything
+  # silent-DM-drop, so an owner-less fork drops the operator's DMs (incl. gate
+  # alerts) silently. seed_* allowlists the given ids, or defaults dmPolicy=pairing
+  # so the first DM pairs instead of being dropped. Mirrors opencode/pi.
+  seed_antigravity_telegram_access "$name" "$allowed_users"
 
   # Seed the notify-user skill into agy's skills dir so the agent self-starts
   # its comms loop on first DM. Mirrors the grok path; agy reads skills from
@@ -1087,7 +1117,11 @@ AGY_ENV
 seed_antigravity_telegram_access() {
   local name="$1" allowed_users="$2"
   local user="agent-${name}"
-  step "Pre-seeding antigravity telegram allowlist for $user (${allowed_users})"
+  if [[ -n "$allowed_users" ]]; then
+    step "Seeding antigravity telegram access.json for $user (allow ${allowed_users})"
+  else
+    step "Seeding antigravity telegram access.json for $user (dmPolicy=pairing)"
+  fi
   if ! sudo -u "$user" env CSV="$allowed_users" python3 - <<'PY' >&2; then
 import json, os, tempfile
 
@@ -1100,7 +1134,7 @@ try:
     with open(access_path) as f:
         data = json.load(f)
 except FileNotFoundError:
-    data = {"allowFrom": [], "groups": {}}
+    data = {}
 
 allow = list(data.get('allowFrom') or [])
 for s in ids:
@@ -1108,13 +1142,19 @@ for s in ids:
         allow.append(s)
 data['allowFrom'] = allow
 data.setdefault('groups', {})
+data.setdefault('pending', {})
+# Never override an explicit dmPolicy; for a fresh file default to allowlist when
+# we have ids, else pairing so the first DM pairs instead of a silent block-drop
+# (DIVE-1244).
+if 'dmPolicy' not in data:
+    data['dmPolicy'] = 'allowlist' if allow else 'pairing'
 
 fd, tmp = tempfile.mkstemp(dir=state, prefix='.access.', suffix='.tmp')
 with os.fdopen(fd, 'w') as f:
     json.dump(data, f, indent=2)
 os.chmod(tmp, 0o600)
 os.replace(tmp, access_path)
-print(f"Seeded allowFrom={allow} into {access_path}")
+print(f"Seeded access.json dmPolicy={data['dmPolicy']} allowFrom={allow} into {access_path}")
 PY
     fail "$E_GENERIC" "antigravity telegram access.json pre-seed failed for agent '$name'"
   fi

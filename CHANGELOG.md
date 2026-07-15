@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.9.1
+
+- fix(agent): durable Telegram pairing for owner-less fork agents (DIVE-1244). `codex`/`grok`/`antigravity` created with no `allowed_users` previously skipped seeding `access.json` entirely, leaving a block-everything file-absent state that silently dropped the operator's DMs (incl. gate alerts) until a manual file pair. The three installers now ALWAYS seed `access.json` (mirroring `opencode`/`pi`): with ids they allowlist them, without they default `dmPolicy=pairing` so the first DM yields a pairing code instead of a silent drop. Seeds remain append-only and never override an existing `dmPolicy`, so a manual pairing survives config-set re-provisioning. `pending` is now also seeded for schema parity with the bridges.
+
 ## 0.8.23
 
 - security(agent): freeze grok provisioning behind a code-durable guard (DIVE-1222). Grok Build CLI (xAI) has a disclosed codebase-exfiltration issue with no client-side fix as of its v0.2.98 changelog, and xAI shipped only a revocable server-side mitigation; as a precaution `cmd_create` now refuses `--type=grok` pointing to DIVE-1221, which blocks every provisioning path (create, hire, pack import, clone). Unfreeze requires a VERIFIED xAI client-side patch + pinnable version, never the server-side toggle alone; an off-by-default `FIVE_GROK_UNFREEZE_VERIFIED=1` override exists solely for that moment. New unit `tests/grok_freeze_guard_unit.sh`.
