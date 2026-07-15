@@ -518,6 +518,9 @@ if [[ "${1:-}" == "--upgrade" ]]; then
 
   [[ -x "$BIN_DIR/5dive" ]] || die "no existing 5dive at $BIN_DIR/5dive — run install without --upgrade first"
 
+  # DIVE-1260: read the current version so we can report old -> new after the swap.
+  _old_ver="$(grep -m1 'readonly FIVE_VERSION=' "$BIN_DIR/5dive" 2>/dev/null | sed -E 's/.*="([^"]+)".*/\1/')"
+
   say "Upgrading 5dive CLI (skipping apt / nvm / bun / state setup)"
   refresh_managed_files
 
@@ -544,7 +547,13 @@ if [[ "${1:-}" == "--upgrade" ]]; then
   "$BIN_DIR/5dive" gate-proof enforce on >/dev/null 2>&1 || true
 
   echo
-  echo "5dive upgraded."
+  # DIVE-1260: report the version actually swapped in, read from the new bundle.
+  _new_ver="$(grep -m1 'readonly FIVE_VERSION=' "$BIN_DIR/5dive" 2>/dev/null | sed -E 's/.*="([^"]+)".*/\1/')"
+  if [[ -n "${_old_ver:-}" && "${_old_ver}" != "${_new_ver:-}" ]]; then
+    echo "5dive upgraded: ${_old_ver} -> ${_new_ver:-unknown}"
+  else
+    echo "5dive upgraded (now ${_new_ver:-unknown})"
+  fi
   exit 0
 fi
 

@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.9.6
+
+- fix(install): `curl … | sudo bash -s -- --upgrade` now reports the resolved version — `5dive upgraded: <old> -> <new>` — instead of a bare "5dive upgraded.", read directly from the swapped-in bundle so it reflects what actually landed (DIVE-1260).
+
 ## 0.9.5
 
 - feat(init): `5dive init` now prompts for the isolation tier (admin / standard / sandboxed), with a default that mirrors `agent create`'s resolution — pi -> sandboxed (extensions run arbitrary code), the first agent on a fresh box -> admin (bootstrap fleet manager), every other agent -> least-privilege standard — and forwards the choice as `--isolation`. Replaces the hardcoded pi-only sandboxed line. New unit `tests/init_isolation_picker_unit.sh`.
