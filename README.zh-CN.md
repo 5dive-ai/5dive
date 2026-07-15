@@ -107,7 +107,7 @@ sudo 5dive team import solo-founder
 
 **作为服务运行，而不是一次会话。** 关掉终端，智能体依然活着。随时从 Telegram 给它们发消息。
 
-**支持所有主流智能体 CLI。** `claude`、`codex`、`antigravity`、`grok`、`hermes`、`openclaw`、`opencode`，统统纳入一支团队。
+**支持所有主流智能体 CLI。** `claude`、`codex`、`antigravity`、`grok`、`hermes`、`openclaw`、`opencode`、`pi`，统统纳入一支团队。
 
 **接你自己的国产模型。** 通过 `--provider` 接 DeepSeek、Kimi、智谱 GLM，或 OpenRouter 网关（一个 Key 通所有）等 Anthropic 兼容接口，用你自己的 Key，无中间商、无 OAuth 代理。
 
@@ -122,6 +122,7 @@ sudo 5dive team import solo-founder
 | `antigravity` | Google Antigravity     | Google OAuth | Telegram |
 | `grok`        | xAI Grok               | OAuth (xAI) / API key | Telegram |
 | `opencode`    | OpenCode               | API key | Telegram |
+| `pi`          | 第三方多 provider 智能体（自带 Key） | API key / `--provider` | Telegram |
 
 `claude` 类型可以把官方框架指向第三方 Anthropic 兼容接口，自带 Key 即可（见上方「为什么适合中国开发者」）。
 
