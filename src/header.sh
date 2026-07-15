@@ -288,11 +288,11 @@ declare -A SKILLS_AGENT_ID=(
   # which is exactly where agy itself reads from (see SKILLS_INSTALL_DIR below).
   # So passing it through works, even though it's an "unknown" agent id.
   [antigravity]=antigravity
-  # pi has no upstream skills-registry id either, so like antigravity it takes
-  # the generic `.agents/skills/` fallback — which is one of the dirs pi's
-  # resource loader scans (~/.agents/skills, alongside ~/.pi/agent/skills).
-  # Without this entry pi fell through to claude-code → `.claude/skills`, a dir
-  # pi NEVER reads, so its default skills installed but were invisible (DIVE-1265).
+  # pi, like grok, is a manual-install type (see _skill_needs_manual_install):
+  # `npx skills add --agent pi` lands skills in ~/.pi/skills, which pi's resource
+  # loader does NOT scan, so pi is git-clone+cp'd into SKILLS_INSTALL_DIR[pi]
+  # instead. This id is retained only for the `skill list` annotation, mirroring
+  # [grok]=grok (the manual path ignores it for install) (DIVE-1265).
   [pi]=pi
   [grok]=grok
 )
@@ -312,9 +312,11 @@ declare -A SKILLS_INSTALL_DIR=(
   # .gemini/antigravity-cli/skills (matching its state dir), which was a guess
   # — wrong. Upstream npx skills fallback already lands at .agents/skills.
   [antigravity]=".agents/skills"
-  # pi's user-scope skills dir (getHomeDir()/.agents/skills in the pi resource
-  # loader). Matches the notify-user seed already copied there for pi, and the
-  # SKILLS_AGENT_ID[pi]=pi generic fallback above (DIVE-1265).
+  # pi reads user skills from ~/.pi/agent/skills AND ~/.agents/skills (per its
+  # resource-loader). We target .agents/skills — the cross-CLI shared dir agy/
+  # codex/opencode also use, and where pi's notify-user seed already lands. This
+  # is the manual git-clone+cp destination (pi is manual-install; DIVE-1265),
+  # and it drives the list/rm dir-scan — add and list now agree here.
   [pi]=".agents/skills"
   [grok]=".grok/skills"
 )

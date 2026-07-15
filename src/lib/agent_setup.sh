@@ -249,8 +249,13 @@ preseed_antigravity_agent() {
 _skill_needs_manual_install() {
   local type="$1"
   case "$type" in
-    grok) return 0 ;;
-    *)    return 1 ;;
+    # grok: upstream `npx skills add --agent grok` is rejected.
+    # pi: `npx skills add --agent pi` installs to ~/.pi/skills, which pi's
+    #   resource loader does NOT scan (it reads ~/.pi/agent/skills — note the
+    #   /agent segment — and ~/.agents/skills). So route pi through the manual
+    #   git-clone+cp into SKILLS_INSTALL_DIR[pi]=.agents/skills instead (DIVE-1265).
+    grok|pi) return 0 ;;
+    *)       return 1 ;;
   esac
 }
 
