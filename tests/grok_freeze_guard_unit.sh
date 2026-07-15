@@ -27,7 +27,16 @@ echo "== functional (built binary) =="
 # sudo dry-hit is safe and hermetic.
 SUDO=""
 [[ $EUID -eq 0 ]] || { sudo -n true 2>/dev/null && SUDO="sudo -n"; }
-if [[ -x "$BIN" && ( $EUID -eq 0 || -n "$SUDO" ) ]]; then
+# ensure_state (state init) chgrps the state tree to the `claude` group, which
+# install.sh always creates but a bare CI runner does not — without it the
+# `chown root:claude` aborts under `set -e` BEFORE the freeze guard runs, so the
+# check would see a chown error instead of the refusal. Replicate the install
+# invariant so this stays hermetic; skip (don't fail) if the group can't be made.
+if [[ $EUID -eq 0 || -n "$SUDO" ]]; then
+  getent group claude >/dev/null 2>&1 || $SUDO groupadd claude 2>/dev/null || true
+fi
+have_claude_grp=0; getent group claude >/dev/null 2>&1 && have_claude_grp=1
+if [[ -x "$BIN" && ( $EUID -eq 0 || -n "$SUDO" ) && $have_claude_grp -eq 1 ]]; then
   out="$($SUDO "$BIN" agent create grokbot --type=grok 2>&1)"; rc=$?
   if [[ $rc -ne 0 ]] && grep -qF "grok provisioning is frozen (DIVE-1221)" <<<"$out"; then
     ok "grok create refused with DIVE-1221 error"
@@ -37,7 +46,7 @@ if [[ -x "$BIN" && ( $EUID -eq 0 || -n "$SUDO" ) ]]; then
   id agent-grokbot &>/dev/null && bad "freeze leaked a user (agent-grokbot created)" \
     || ok "no user created by refused grok create"
 else
-  echo "  skip functional (need built ./5dive + root/sudo -n)"
+  echo "  skip functional (need built ./5dive + root/sudo -n + claude group)"
 fi
 
 echo
