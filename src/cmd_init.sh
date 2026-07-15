@@ -22,7 +22,7 @@ cmd_init() {
 WELCOME
 
   # --- Step 1: pick a type ---
-  local -a types=(claude codex antigravity grok hermes openclaw opencode)
+  local -a types=(claude codex antigravity grok hermes openclaw opencode pi)
   local -A type_desc=(
     [claude]="Anthropic's Claude — recommended"
     [codex]="OpenAI Codex"
@@ -31,6 +31,7 @@ WELCOME
     [hermes]="Open-source agent — bring your own provider"
     [openclaw]="Open-source agent — bring your own provider"
     [opencode]="Open-source agent — bring your own provider"
+    [pi]="Extension-based coding agent — bring your own provider"
   )
   echo "Pick an agent type:" >&2
   local i=1
@@ -43,7 +44,7 @@ WELCOME
   while true; do
     read -r -p "  choice [1-${#types[@]}, default 1]: " choice
     choice="${choice:-1}"
-    if [[ "$choice" =~ ^[1-7]$ ]] && (( choice <= ${#types[@]} )); then
+    if [[ "$choice" =~ ^[1-8]$ ]] && (( choice <= ${#types[@]} )); then
       type="${types[$((choice-1))]}"
       break
     fi
@@ -137,6 +138,20 @@ WELCOME
         printf '%s' "$key" | 5dive agent auth set opencode --api-key=- --provider="$provider" \
           || fail "$E_AUTH_REQUIRED" "auth failed"
         ;;
+      pi)
+        local providers="${!PI_PROVIDER_VAR[*]}"
+        echo "  pi needs a provider + API key. Providers: $providers" >&2
+        local provider
+        read -r -p "  provider [default anthropic]: " provider
+        provider="${provider:-anthropic}"
+        [[ -n "${PI_PROVIDER_VAR[$provider]:-}" ]] \
+          || fail "$E_VALIDATION" "unknown pi provider '$provider' (choose: $providers)"
+        local key
+        read -r -s -p "  paste $provider API key: " key; echo >&2
+        [[ -n "$key" ]] || fail "$E_VALIDATION" "empty API key"
+        printf '%s' "$key" | 5dive agent auth set pi --provider="$provider" --api-key=- \
+          || fail "$E_AUTH_REQUIRED" "auth failed"
+        ;;
     esac
     echo >&2
   fi
@@ -148,14 +163,14 @@ WELCOME
   echo >&2
 
   # --- Step 5: pick a channel (mirrors the dashboard connect-flow) ---
-  # Only claude/hermes/openclaw expose telegram via `agent create --channels=`.
+  # Only claude/hermes/openclaw/pi expose telegram via `agent create --channels=`.
   # Other types fall straight through to create with channels=none.
   local channels="none"
   local telegram_token=""
   local telegram_user_id=""
   local supports_telegram=0
   case "$type" in
-    claude|hermes|openclaw) supports_telegram=1 ;;
+    claude|hermes|openclaw|pi) supports_telegram=1 ;;
   esac
 
   if (( supports_telegram == 1 )); then
@@ -216,6 +231,9 @@ WELCOME
 
   # --- Step 6: create ---
   local -a create_args=("$name" "--type=$type")
+  # pi extensions run arbitrary code with the agent's permissions, so keep the
+  # wizard's default pi agent isolated from the shared claude-group workspace.
+  [[ "$type" == "pi" ]] && create_args+=("--isolation=sandboxed")
   if [[ "$channels" != "none" ]]; then
     create_args+=("--channels=$channels")
     [[ -n "$telegram_token" ]] && create_args+=("--telegram-token=$telegram_token")
