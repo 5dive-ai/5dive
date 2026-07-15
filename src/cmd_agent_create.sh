@@ -684,16 +684,16 @@ cmd_create() {
   (( _stdin_sentinels <= 1 )) \
     || fail "$E_USAGE" "only one of --api-key=- / --telegram-token=- / --discord-token=- can read from stdin per create (the exec tunnel has a single stdin channel)"
 
-  # BYO API-key path for hermes/openclaw (--provider=<canonical> + --api-key=<key|->).
+  # BYO API-key path (--provider=<canonical> + --api-key=<key|->).
   # Mutually exclusive with --defer-auth: BYO is the alternative to "I'll sign in
   # later", not an add-on. The key sentinel "-" reads from stdin so the value
   # never appears in argv (and thus never in `ps`).
   if [[ -n "$byo_provider" || -n "$byo_api_key" ]]; then
-    # pi is API-key multi-provider (no OAuth): --provider names the vendor and
-    # the key is injected as pi's native per-provider env var (PI_PROVIDER_VAR),
-    # so it skips the hermes/openclaw/claude BYO catalog checks below. DIVE-1200.
-    [[ "$type" == "hermes" || "$type" == "openclaw" || "$type" == "claude" || "$type" == "pi" ]] \
-      || fail "$E_VALIDATION" "--provider/--api-key only supported for hermes/openclaw/claude/pi (got: $type)"
+    # pi and opencode are API-key multi-provider types: --provider names the
+    # vendor and the key is injected as its native environment variable, so
+    # they skip the hermes/openclaw/claude BYO catalog checks below.
+    [[ "$type" == "hermes" || "$type" == "openclaw" || "$type" == "claude" || "$type" == "pi" || "$type" == "opencode" ]] \
+      || fail "$E_VALIDATION" "--provider/--api-key only supported for hermes/openclaw/claude/pi/opencode (got: $type)"
     # claude BYO points the harness at an Anthropic-compatible third-party
     # endpoint and stores the override env vars in the auth-profile's
     # combined.env — so it requires a profile to scope the creds to this agent
@@ -708,6 +708,9 @@ cmd_create() {
     if [[ "$type" == "pi" ]]; then
       pi_provider_var "$byo_provider" >/dev/null \
         || fail "$E_VALIDATION" "pi provider '$byo_provider' not supported (known: ${!PI_PROVIDER_VAR[*]})"
+    elif [[ "$type" == "opencode" ]]; then
+      opencode_provider_var "$byo_provider" >/dev/null \
+        || fail "$E_VALIDATION" "opencode provider '$byo_provider' not supported (known: ${!OPENCODE_PROVIDER_VAR[*]})"
     else
       valid_byo_provider "$byo_provider" \
         || fail "$E_VALIDATION" "unknown provider '$byo_provider' (known: ${!BYO_PROVIDER_LABEL[*]})"
@@ -908,6 +911,11 @@ cmd_create() {
       # override), so it takes the env-var write path, not apply_byo_provider
       # (which is hermes/openclaw/claude only). DIVE-1200.
       pi_apply_provider_key "$byo_provider" "$byo_api_key" "$profile"
+    elif [[ "$type" == "opencode" ]]; then
+      # OpenCode consumes the selected provider's native API-key variable.
+      # DIVE-1206: keep this on the same helper as `agent auth set` so a
+      # create-time OpenRouter key reaches OPENROUTER_API_KEY, not OPENAI_API_KEY.
+      opencode_apply_provider_key "$byo_provider" "$byo_api_key" "$profile"
     else
       apply_byo_provider "$type" "$byo_provider" "$byo_api_key" "$profile" "$byo_model"
     fi
@@ -1003,6 +1011,11 @@ cmd_create() {
     # Only pi's built-in providers reach this branch (validated above via
     # PI_PROVIDER_VAR), so pi already knows the base_url; we just name the model.
     pi_apply_model_default "$name" "$byo_provider" "$byo_model"
+  elif [[ "$type" == "opencode" && -n "$byo_model" ]]; then
+    # OpenCode's persisted model uses provider_id/model_id. This lets an
+    # OpenRouter-backed agent boot straight onto DeepSeek/GLM/Kimi/Qwen rather
+    # than falling through to an unrelated last-used/default model. DIVE-1206.
+    opencode_apply_model_default "$name" "$byo_provider" "$byo_model"
   fi
 
   # DIVE-990: memory-as-onboarding. Seed the new agent's recall store from
@@ -1340,4 +1353,3 @@ cmd_create() {
      --argjson ap "$auto_paired" \
      --argjson inst "$installed_skills_json" --argjson fail "$failed_skills_json" --arg tb "$team_bot_status"
 }
-

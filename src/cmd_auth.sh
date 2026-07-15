@@ -790,6 +790,66 @@ opencode_provider_var() {
   echo "$var"
 }
 
+# opencode_apply_provider_key <provider> <api_key> [profile] — write the
+# provider's native environment variable into the shared connector or an auth
+# profile. OpenCode consumes OPENAI_API_KEY / OPENROUTER_API_KEY directly; no
+# endpoint override or auth.json mutation is required. Shared by auth-set and
+# agent-create so both paths route a key identically. DIVE-1206.
+opencode_apply_provider_key() {
+  local provider="${1:-openai}" api_key="$2" profile="${3:-}"
+  local var
+  var=$(opencode_provider_var "$provider") \
+    || fail "$E_VALIDATION" "opencode provider '$provider' not supported (known: ${!OPENCODE_PROVIDER_VAR[*]})"
+  require_root
+  if [[ -z "$profile" ]]; then
+    step "Writing ${var} to /etc/5dive/connectors/${TYPE_API_FILE[opencode]}"
+    printf '%s' "$api_key" | write_default_connector "${TYPE_API_FILE[opencode]}" "$var"
+  else
+    valid_profile_name "$profile" \
+      || fail "$E_VALIDATION" "invalid --auth-profile (lowercase letters/digits/_-, start letter, <=32 chars)"
+    ensure_profile_dir "$profile" >/dev/null
+    step "Writing ${var} to auth profile '${profile}'"
+    printf '%s' "$api_key" | profile_set_var "$profile" "$var"
+  fi
+}
+
+# OpenCode persists its default as provider_id/model_id. Keep the small merge
+# primitive separate so the preservation contract can be unit-tested without a
+# real agent user or /home write.
+_opencode_merge_model_config() {
+  local model_id="$1"
+  jq --arg m "$model_id" '.model=$m'
+}
+
+# opencode_apply_model_default <agent-name> <provider> <model> — pin the new
+# agent's default in ~/.config/opencode/opencode.json. The create CLI accepts
+# provider and model separately, while OpenCode requires provider_id/model_id;
+# tolerate an already-prefixed model as well. Idempotent and merge-safe: only
+# the model key is overwritten. DIVE-1206.
+opencode_apply_model_default() {
+  local name="$1" provider="$2" model="$3"
+  local home="/home/agent-${name}" dir sf model_id cur='{}' tmp
+  dir="${home}/.config/opencode"; sf="${dir}/opencode.json"
+  if [[ "$model" == "$provider/"* ]]; then
+    model_id="$model"
+  else
+    model_id="${provider}/${model}"
+  fi
+  install -d -m 700 -o "agent-${name}" -g "agent-${name}" \
+    "${home}/.config" "$dir" 2>/dev/null \
+    || { warn "opencode model-pin: could not create $dir (skipping --model default)"; return 0; }
+  [[ -s "$sf" ]] && cur=$(cat "$sf" 2>/dev/null) && jq -e . >/dev/null 2>&1 <<<"$cur" || cur='{}'
+  tmp=$(mktemp --tmpdir="$dir" opencode.XXXXXX) \
+    || { warn "opencode model-pin: mktemp failed"; return 0; }
+  if _opencode_merge_model_config "$model_id" <<<"$cur" >"$tmp"; then
+    chmod 600 "$tmp"; chown "agent-${name}:agent-${name}" "$tmp" 2>/dev/null || true
+    mv -f "$tmp" "$sf"
+    step "Pinned opencode default model for agent-${name}: ${model_id}"
+  else
+    rm -f "$tmp"; warn "opencode model-pin: jq merge failed (skipping --model default)"
+  fi
+}
+
 # pi_apply_model_default <agent-name> <provider> <model> — pin a pi agent's
 # default provider+model by merging {defaultProvider,defaultModel} into its
 # ~/.pi/agent/settings.json. pi reads these at startup, so the agent boots onto
@@ -887,20 +947,7 @@ cmd_auth_set() {
   # into OPENAI_API_KEY. With no flag, retain the legacy OpenAI default.
   if [[ "$type" == "opencode" ]]; then
     local opencode_provider="${byo_provider:-openai}"
-    local opencode_var
-    opencode_var=$(opencode_provider_var "$opencode_provider") \
-      || fail "$E_VALIDATION" "opencode provider '$opencode_provider' not supported (known: ${!OPENCODE_PROVIDER_VAR[*]})"
-    require_root
-    if [[ -z "$profile" ]]; then
-      step "Writing ${opencode_var} to /etc/5dive/connectors/${TYPE_API_FILE[opencode]}"
-      printf '%s' "$api_key" | write_default_connector "${TYPE_API_FILE[opencode]}" "$opencode_var"
-    else
-      valid_profile_name "$profile" \
-        || fail "$E_VALIDATION" "invalid --auth-profile (lowercase letters/digits/_-, start letter, <=32 chars)"
-      ensure_profile_dir "$profile" >/dev/null
-      step "Writing ${opencode_var} to auth profile '${profile}'"
-      printf '%s' "$api_key" | profile_set_var "$profile" "$opencode_var"
-    fi
+    opencode_apply_provider_key "$opencode_provider" "$api_key" "$profile"
     ok "api key stored for opencode/${opencode_provider}${profile:+ (profile=$profile)}" \
        '{type:$t, provider:$pr, profile:$p}' \
        --arg t "opencode" --arg pr "$opencode_provider" --arg p "${profile:-}"
