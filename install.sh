@@ -49,7 +49,14 @@ refresh_managed_files() {
   local _bundle_tmp; _bundle_tmp="$(mktemp "${BIN_DIR}/.5dive.XXXXXX")"
   curl -fsSL "$REPO/5dive" -o "$_bundle_tmp" || { rm -f "$_bundle_tmp"; die "failed to download 5dive bundle from $REPO/5dive"; }
   local _want _got
-  _want="$(curl -fsSL "$REPO/5dive.sha256" 2>/dev/null | tr -d '[:space:]')"
+  # `|| _want=""` is load-bearing: under `set -euo pipefail` (line 6) a plain
+  # assignment whose command-substitution pipeline fails aborts the whole script
+  # BEFORE the else-branch below can treat an absent checksum as fail-soft. The
+  # offline install-smoke bundle (REPO=file:///opt/5dive-bundle) ships no
+  # 5dive.sha256, so curl exits 37 (CURLE_FILE_COULDNT_READ_FILE) and pipefail
+  # propagates it — reddening docker-install at the "Installing CLI binaries"
+  # step (DIVE-1271). Swallowing it here keeps the absent-checksum-warns contract.
+  _want="$(curl -fsSL "$REPO/5dive.sha256" 2>/dev/null | tr -d '[:space:]')" || _want=""
   if [[ -n "$_want" ]]; then
     _got="$(sha256sum "$_bundle_tmp" | awk '{print $1}')"
     if [[ "$_want" != "$_got" ]]; then
