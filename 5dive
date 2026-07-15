@@ -26,7 +26,7 @@ esac
 
 # Bumped on every public release. `build.sh` checks this line exists; CI fails
 # the bundle-drift check if it's missing or empty.
-readonly FIVE_VERSION="0.9.4"
+readonly FIVE_VERSION="0.9.5"
 
 # GitHub org our repos live under. The org is being renamed
 # 5dive-com -> 5dive-ai (2026-06); fetches must work on either side of the
@@ -12723,11 +12723,44 @@ WELCOME
     echo >&2
   fi
 
+  # --- Step 5.5: pick isolation tier ---
+  # Surface the privilege tier explicitly (mirrors `agent create` defaults):
+  # pi is sandboxed (extensions run arbitrary code); the first agent on a fresh
+  # box gets admin so the box has a fleet manager out of the gate; every other
+  # agent is least-privilege standard. Any choice can be overridden here.
+  local iso_default="standard"
+  if [[ "$type" == "pi" ]]; then
+    iso_default="sandboxed"
+  elif [[ "$(registry_read 2>/dev/null | jq -r '(.agents // {}) | length' 2>/dev/null || echo 1)" == "0" ]]; then
+    iso_default="admin"
+  fi
+  local -a iso_opts=(admin standard sandboxed)
+  local -A iso_desc=(
+    [admin]="full trust: can run the 5dive CLI + sudo (fleet managers, dev agents)"
+    [standard]="least privilege: scoped access, cannot run the 5dive CLI"
+    [sandboxed]="isolated from the shared workspace, own workdir (untrusted / extension agents)"
+  )
+  echo "Pick isolation:" >&2
+  local iso_j=1 iso_default_idx=2 iso_t
+  for iso_t in "${iso_opts[@]}"; do
+    printf '  %d) %-9s  %s\n' "$iso_j" "$iso_t" "${iso_desc[$iso_t]}" >&2
+    [[ "$iso_t" == "$iso_default" ]] && iso_default_idx=$iso_j
+    iso_j=$((iso_j+1))
+  done
+  local isolation iso_choice
+  while true; do
+    read -r -p "  choice [1-3, default ${iso_default_idx} (${iso_default})]: " iso_choice
+    iso_choice="${iso_choice:-$iso_default_idx}"
+    if [[ "$iso_choice" =~ ^[1-3]$ ]]; then
+      isolation="${iso_opts[$((iso_choice-1))]}"
+      break
+    fi
+    echo "  please choose 1, 2, or 3" >&2
+  done
+  echo >&2
+
   # --- Step 6: create ---
-  local -a create_args=("$name" "--type=$type")
-  # pi extensions run arbitrary code with the agent's permissions, so keep the
-  # wizard's default pi agent isolated from the shared claude-group workspace.
-  [[ "$type" == "pi" ]] && create_args+=("--isolation=sandboxed")
+  local -a create_args=("$name" "--type=$type" "--isolation=$isolation")
   if [[ "$channels" != "none" ]]; then
     create_args+=("--channels=$channels")
     [[ -n "$telegram_token" ]] && create_args+=("--telegram-token=$telegram_token")

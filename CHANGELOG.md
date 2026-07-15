@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.9.5
+
+- feat(init): `5dive init` now prompts for the isolation tier (admin / standard / sandboxed), with a default that mirrors `agent create`'s resolution — pi -> sandboxed (extensions run arbitrary code), the first agent on a fresh box -> admin (bootstrap fleet manager), every other agent -> least-privilege standard — and forwards the choice as `--isolation`. Replaces the hardcoded pi-only sandboxed line. New unit `tests/init_isolation_picker_unit.sh`.
+
+- fix(pi): `install_default_pi_extensions` derives the runtime bin dir from a ONE-hop symlink read instead of `readlink -f` (DIVE-1202/DIVE-1259). `readlink -f` fully dereferenced pi's two-hop symlink chain (`.local/bin/pi` -> `<npm global bin>/pi` -> `../lib/node_modules/<pkg>/cli.js`) into the package dir, which has no node/npm/pi, so `pi install` ran with a broken PATH and failed "pi: command not found" — which the fail-closed guard mislabeled as an npm-integrity mismatch, blocking EVERY pi agent-create (default `FIVE_PI_DEFAULT_EXTENSIONS=1`). One-hop resolution lands in the real `<npm global bin>` dir that holds node/npm/pi; `readlink -f` is kept only for the is-executable guard; a hard node/npm/pi presence assert now fails a future layout drift with an accurate message instead of a misleading integrity error. Uncovered by DIVE-1202's convergence smoke once the DIVE-1258 node24 fix let provisioning advance far enough to hit it.
+
 ## 0.9.4
 
 - feat(init): `5dive init` now lists `pi` as agent type option 8 (DIVE-1255). Fixes the wizard's `^[1-7]$` choice regex, adds a provider picker (default `anthropic`) that reuses the multi-provider `PI_PROVIDER_VAR` map, marks pi telegram-capable, and creates the wizard's pi agent with `--isolation=sandboxed` by default (pi extensions run arbitrary code with the agent's permissions, so keep it off the shared claude-group workspace). New unit `tests/init_pi_unit.sh`.
