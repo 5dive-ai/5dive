@@ -340,6 +340,16 @@ declare -A TYPE_API_VAR=(
   # cmd_auth_set resolves pi's target var from --provider via PI_PROVIDER_VAR.
 )
 
+# OpenCode reads provider API keys directly from standard environment variables.
+# Keep this catalog deliberately small: these are the providers the 5dive auth
+# path has explicitly verified and can inject without writing OpenCode's native
+# auth.json. OpenRouter is the broad multi-model option; OpenAI remains available
+# for backwards compatibility with the old provider-less auth-set path.
+declare -A OPENCODE_PROVIDER_VAR=(
+  [openai]="OPENAI_API_KEY"
+  [openrouter]="OPENROUTER_API_KEY"
+)
+
 # pi provider -> native env var. pi is API-key multi-provider (NO OAuth): it
 # reads the standard per-provider *_API_KEY var straight from the environment
 # (verified against @earendil-works/pi-coding-agent 0.80.6 dist — it recognizes

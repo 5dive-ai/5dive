@@ -124,10 +124,17 @@ WELCOME
           || fail "$E_AUTH_REQUIRED" "auth failed"
         ;;
       opencode)
+        local providers="${!OPENCODE_PROVIDER_VAR[*]}"
+        echo "  opencode needs a provider + API key. Providers: $providers" >&2
+        local provider
+        read -r -p "  provider [default openrouter]: " provider
+        provider="${provider:-openrouter}"
+        [[ -n "${OPENCODE_PROVIDER_VAR[$provider]:-}" ]] \
+          || fail "$E_VALIDATION" "unknown provider '$provider' (choose: $providers)"
         local key
-        read -r -s -p "  paste OpenAI API key: " key; echo >&2
+        read -r -s -p "  paste $provider API key: " key; echo >&2
         [[ -n "$key" ]] || fail "$E_VALIDATION" "empty API key"
-        printf '%s' "$key" | 5dive agent auth set opencode --api-key=- \
+        printf '%s' "$key" | 5dive agent auth set opencode --api-key=- --provider="$provider" \
           || fail "$E_AUTH_REQUIRED" "auth failed"
         ;;
     esac

@@ -780,6 +780,16 @@ pi_apply_provider_key() {
   fi
 }
 
+# opencode_provider_var <provider> — resolve an OpenCode provider to the native
+# environment variable consumed by the CLI. The default preserves the historical
+# provider-less `auth set opencode` behavior.
+opencode_provider_var() {
+  local provider="${1:-openai}"
+  local var="${OPENCODE_PROVIDER_VAR[$provider]:-}"
+  [[ -n "$var" ]] || return 1
+  echo "$var"
+}
+
 # pi_apply_model_default <agent-name> <provider> <model> — pin a pi agent's
 # default provider+model by merging {defaultProvider,defaultModel} into its
 # ~/.pi/agent/settings.json. pi reads these at startup, so the agent boots onto
@@ -869,6 +879,31 @@ cmd_auth_set() {
     ok "api key stored for pi/${pi_provider}${profile:+ (profile=$profile)}" \
        '{type:$t, provider:$pr, profile:$p}' \
        --arg t "pi" --arg pr "$pi_provider" --arg p "${profile:-}"
+    return
+  fi
+
+  # OpenCode is multi-provider. Its supported providers use native environment
+  # variables, so select the target from --provider instead of forcing every key
+  # into OPENAI_API_KEY. With no flag, retain the legacy OpenAI default.
+  if [[ "$type" == "opencode" ]]; then
+    local opencode_provider="${byo_provider:-openai}"
+    local opencode_var
+    opencode_var=$(opencode_provider_var "$opencode_provider") \
+      || fail "$E_VALIDATION" "opencode provider '$opencode_provider' not supported (known: ${!OPENCODE_PROVIDER_VAR[*]})"
+    require_root
+    if [[ -z "$profile" ]]; then
+      step "Writing ${opencode_var} to /etc/5dive/connectors/${TYPE_API_FILE[opencode]}"
+      printf '%s' "$api_key" | write_default_connector "${TYPE_API_FILE[opencode]}" "$opencode_var"
+    else
+      valid_profile_name "$profile" \
+        || fail "$E_VALIDATION" "invalid --auth-profile (lowercase letters/digits/_-, start letter, <=32 chars)"
+      ensure_profile_dir "$profile" >/dev/null
+      step "Writing ${opencode_var} to auth profile '${profile}'"
+      printf '%s' "$api_key" | profile_set_var "$profile" "$opencode_var"
+    fi
+    ok "api key stored for opencode/${opencode_provider}${profile:+ (profile=$profile)}" \
+       '{type:$t, provider:$pr, profile:$p}' \
+       --arg t "opencode" --arg pr "$opencode_provider" --arg p "${profile:-}"
     return
   fi
 
