@@ -1258,16 +1258,77 @@ cmd_create() {
   # pairing step only when pairing genuinely already happened.
   local auto_paired="false"
   [[ -n "$telegram_allowed_users" ]] && channel_in_list telegram "$channels" && auto_paired="true"
-  # DIVE-1190: a telegram agent with an empty allowlist silently drops every DM
-  # (server loadAccess -> dmPolicy=allowlist, allowFrom=[]), so the bot looks
-  # broken with zero signal. When we could NOT auto-pair (no operator id known
-  # and none passed), print the exact step that makes it reachable — otherwise
-  # the creator is deaf and thinks the plugin never fired. Goes to stderr so it
-  # never pollutes --json stdout.
-  if [[ "$auto_paired" != "true" ]] && channel_in_list telegram "$channels"; then
-    warn "telegram bot for '$name' is NOT paired yet — it will ignore every DM until you run:"
-    warn "    5dive agent pair $name --user-id=<yourTelegramUserId>"
-    warn "(DM @userinfobot for your id; chat_id == user_id for a private DM. Tip: pass --telegram-allowed-users=<id> to 'agent create' to pair in one shot next time.)"
+  # DIVE-1197: post-create self-health check — never leave a silently-deaf
+  # agent looking healthy. Supersedes the DIVE-1190 telegram-only pair hint and
+  # generalizes it: a freshly-created agent can look up-and-running yet be
+  #   deaf     — a telegram/discord channel with an empty allowlist drops every DM
+  #   mute     — the systemd unit / poller isn't actually active
+  #   blind    — telegram getMe fails (token wrong/revoked)
+  #   asleep   — no heartbeat, so it never self-acts on board work
+  #   unauthed — auth was deferred, so its first turn stalls on login
+  # We print a single PASS line when clean, or an itemized what-to-fix list with
+  # the exact one-tap command for each gap. All to stderr so --json stdout stays
+  # a clean envelope.
+  local _hc_issues=() _hc_ok=()
+  # reachability: systemd unit / poller actually running
+  if systemctl is-active --quiet "5dive-agent@${name}.service" 2>/dev/null; then
+    _hc_ok+=("poller up")
+  else
+    _hc_issues+=("service not active (agent is MUTE) — start it: sudo systemctl start 5dive-agent@${name}.service")
+  fi
+  # reachability: channel allowlist non-empty (deaf check) for each personal bot.
+  # claude-family plugins persist access.json under ~/.<type>/channels/<ch>/;
+  # a missing file or empty allowFrom means every inbound DM is refused.
+  local _ch _access _n_allow _idlabel
+  for _ch in telegram discord; do
+    channel_in_list "$_ch" "$channels" || continue
+    _access="/home/agent-${name}/.${type}/channels/${_ch}/access.json"
+    _n_allow=0
+    [[ -f "$_access" ]] && _n_allow=$(jq -r '(.allowFrom // []) | length' "$_access" 2>/dev/null || echo 0)
+    if (( _n_allow > 0 )); then
+      _hc_ok+=("$_ch paired (${_n_allow} allowed)")
+    else
+      if [[ "$_ch" == "discord" ]]; then
+        _idlabel="yourDiscordUserId (enable Developer Mode, right-click your name -> Copy User ID)"
+      else
+        _idlabel="yourTelegramUserId (DM @userinfobot for your id)"
+      fi
+      _hc_issues+=("$_ch is DEAF (allowlist empty) — pair it: 5dive agent pair $name --user-id=<$_idlabel>")
+    fi
+  done
+  # reachability: telegram getMe (the token actually resolves a live bot).
+  # bot_username is only populated above for an exact channels==telegram create,
+  # so re-probe here when telegram is present in a multi-channel set.
+  if channel_in_list telegram "$channels" && [[ -n "$telegram_token" ]]; then
+    local _bu="$bot_username"
+    [[ -z "$_bu" ]] && _bu=$(fetch_bot_username "$telegram_token" 2>/dev/null || echo "")
+    if [[ -n "$_bu" ]]; then
+      _hc_ok+=("telegram getMe ok (@$_bu)")
+    else
+      _hc_issues+=("telegram getMe FAILED (agent is BLIND) — token may be wrong/revoked; re-check: 5dive agent telegram-getme --token=<token>")
+    fi
+  fi
+  # autonomy: heartbeat enrolled so the agent self-acts on board tasks. Create
+  # never wires heartbeat, so this normally fires — that's the point (DIVE-1197
+  # gap "no heartbeat = won't self-act").
+  local _hb
+  _hb=$(jq -r --arg n "$name" '.agents[$n].heartbeat.enabled // false' <<<"$(registry_read)" 2>/dev/null || echo false)
+  if [[ "$_hb" == "true" ]]; then
+    _hc_ok+=("heartbeat on")
+  else
+    _hc_issues+=("no heartbeat (agent is ASLEEP — won't self-act on board work): sudo 5dive heartbeat on $name")
+  fi
+  # auth: deferred login still pending, so the first turn will stall.
+  if (( defer_auth )); then
+    _hc_issues+=("auth was deferred (agent is UNAUTHED — can't think until you log in): sudo 5dive agent auth login $type${profile:+ --auth-profile=$profile}")
+  fi
+  if (( ${#_hc_issues[@]} == 0 )); then
+    warn "self-check PASS for '$name' — reachable & autonomous (${_hc_ok[*]})."
+  else
+    warn "self-check for '$name': ${#_hc_issues[@]} issue(s) will make it look broken until fixed:"
+    local _hc_i
+    for _hc_i in "${_hc_issues[@]}"; do warn "  - $_hc_i"; done
+    (( ${#_hc_ok[@]} > 0 )) && warn "  (ok: ${_hc_ok[*]})"
   fi
   ok "agent '$name' (type=$type, channels=$channels${profile:+, profile=$profile}) is running." \
      '{name:$n, type:$t, channels:$c, workdir:$w, authProfile:$p, created:true, autoPaired:$ap, skills:{installed:$inst, failed:$fail}, teamBot:$tb}' \
