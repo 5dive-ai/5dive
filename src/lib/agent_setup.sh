@@ -1386,6 +1386,11 @@ PI_ENV
   install_default_skill_for_agent "$name" pi "$(gh_org)/skills" 5dive-cli || true
   install_default_skill_for_agent "$name" pi "$(gh_org)/skills" compile-knowledge || true
   install_default_skill_for_agent "$name" pi "$(gh_org)/skills" openagent || true
+
+  # DIVE-1246: wire the audited default pi extensions (web access + MCP bridge).
+  # Fail-closed on integrity drift (unlike the best-effort skills above) — a
+  # tampered/republished package must abort provisioning, not ship silently.
+  install_default_pi_extensions "$name"
 }
 
 # Write ~/.pi/channels/telegram/access.json for agent-<name>. Idempotent —
@@ -1435,6 +1440,96 @@ print(f"Seeded access.json dmPolicy={data['dmPolicy']} allowFrom={allow} into {a
 PY
     fail "$E_GENERIC" "pi telegram access.json pre-seed failed for agent '$name'"
   fi
+}
+
+# DIVE-1246: version-pinned, integrity-verified default extensions for pi agents.
+# Per community/wiki/pi-extension-default-policy.md a pi package runs with the
+# agent's FULL permissions (a supply-chain surface on EVERY pi agent), so the
+# defaults are a tiny audited allowlist — HARD version-pinned, npm-integrity
+# verified, and fail-closed on any drift. We ship exactly two: pi-web-access
+# (closes Claude Code's built-in web search/fetch gap) and pi-mcp-adapter
+# (closes the native MCP/config/OAuth gap). New/stateful packages
+# (pi-hermes-memory, @narumitw/pi-goal) are audit-first per policy — do NOT add
+# them here; they overlap 5dive's own memory/goal lifecycle.
+#
+# Safe posture rides each package's secure DEFAULTS and enables NO optional
+# dangerous resource: pi-web-access keeps browser-cookie access off; the
+# pi-mcp-adapter keeps samplingAutoApprove=false, autoAuth=false and direct tool
+# exposure off. `pi install` records the pinned spec in ~/.pi/agent/settings.json
+# and drops the npm subtree under ~/.pi/agent/npm — both read by the pi runtime.
+#
+# Opt out with FIVE_PI_DEFAULT_EXTENSIONS=0: the agent still boots, just without
+# web/MCP out of the box.
+#
+# "pkg@version|recorded-sha512"  — audited at DIVE-1234; never bump a version or
+# hash without a fresh security re-audit of the package at that exact version.
+PI_DEFAULT_EXTENSIONS=(
+  "pi-web-access@0.13.0|sha512-ny0bHisMWdobmu1hcMp/jqjaRh6pYrH7dctBK2CVyRF4ia7bP47RnOPYdG1yiks9ohtcanWir5Hl9EFap8h0zQ=="
+  "pi-mcp-adapter@2.11.0|sha512-4Y/eLbhbxnRih519dJUxMyQ5QASvPcdWyBlS8+dDXteAzaMuLnd4nMTWgoZw3JRIW+0r93KAQcz1Rbli4xCwEQ=="
+)
+
+# Install the pinned default extensions for agent-<name>, verifying each against
+# its recorded npm integrity and failing closed on any mismatch.
+install_default_pi_extensions() {
+  local name="$1" user="agent-${name}"
+
+  case "${FIVE_PI_DEFAULT_EXTENSIONS:-1}" in
+    0|no|off|false|NO|OFF|FALSE)
+      step "pi default extensions: skipped for $user (FIVE_PI_DEFAULT_EXTENSIONS opt-out)"
+      return 0 ;;
+  esac
+
+  # pi is a node CLI symlinked into claude's ~/.local/bin; agent users can exec
+  # it, but `pi install` shells to npm and so needs node+npm on PATH. Derive the
+  # runtime bin dir from the symlink target rather than pinning a node patch.
+  local pi_bin="/home/claude/.local/bin/pi" pi_real node_bin
+  pi_real="$(readlink -f "$pi_bin" 2>/dev/null || true)"
+  if [[ -z "$pi_real" || ! -x "$pi_real" ]]; then
+    fail "$E_NOT_INSTALLED" \
+      "pi binary not resolvable via $pi_bin (needed to install default extensions for $user). Provision pi first, or set FIVE_PI_DEFAULT_EXTENSIONS=0 to skip."
+  fi
+  node_bin="$(dirname "$pi_real")"
+
+  local entry spec integrity
+  for entry in "${PI_DEFAULT_EXTENSIONS[@]}"; do
+    spec="${entry%%|*}"       # pkg@version (HARD-pinned; never `latest`)
+    integrity="${entry#*|}"   # recorded sha512-...
+    step "pi extension: installing pinned $spec for $user (integrity-verified)"
+    if ! sudo -u "$user" -H env \
+           PATH="$node_bin:/usr/bin:/bin" \
+           PI_SPEC="$spec" PI_INTEGRITY="$integrity" \
+           bash -s >&2 <<'PI_EXT'
+set -euo pipefail
+# npm verifies the downloaded tarball against the registry's published integrity
+# during install (tamper-in-transit fails right here); we then assert the
+# resolved lockfile hash equals our AUDITED hash — fail-closed if it drifted.
+pi install "npm:${PI_SPEC}" >&2
+PI_LOCK="$HOME/.pi/agent/npm/package-lock.json" \
+PI_NAME="${PI_SPEC%@*}" PI_WANT="$PI_INTEGRITY" python3 - <<'PY'
+import json, os, sys
+lock, name, want = os.environ["PI_LOCK"], os.environ["PI_NAME"], os.environ["PI_WANT"]
+try:
+    pkgs = json.load(open(lock)).get("packages", {})
+except Exception as e:
+    print(f"cannot read pi lockfile {lock}: {e}", file=sys.stderr); sys.exit(3)
+key = next((k for k in pkgs if k.endswith("node_modules/" + name)), None)
+got = pkgs.get(key, {}).get("integrity") if key else None
+if got != want:
+    print(f"INTEGRITY MISMATCH for {name}: want {want} got {got}", file=sys.stderr)
+    sys.exit(4)
+print(f"integrity OK for {name}: {got}")
+PY
+PI_EXT
+    then
+      # Fail closed: install failure OR integrity mismatch. Never ship a pi agent
+      # carrying an unverified/absent audited extension. Best-effort cleanup so a
+      # retry starts from a clean settings.json.
+      sudo -u "$user" -H env PATH="$node_bin:/usr/bin:/bin" \
+        pi remove "npm:${spec}" >/dev/null 2>&1 || true
+      fail "$E_GENERIC" \
+        "pi default extension $spec failed to install or its npm integrity did not match the audited hash for $user (SECURITY: fail-closed). Check network to the npm registry, confirm $spec was not republished, or set FIVE_PI_DEFAULT_EXTENSIONS=0 to skip."
+    fi
+  done
 }
 
 # Single dispatch point used by cmd_create. Routes a (type, plugin) pair to
