@@ -30,6 +30,7 @@
   <a href="docs/zero-human.md">Zero-human proof</a> ·
   <a href="#for-your-ai-agent">Use from your AI agent</a> ·
   <a href="#security--isolation">Security</a> ·
+  <a href="https://5dive.ai/docs/5dive-cli?utm_source=github&utm_medium=referral&utm_campaign=5dive-readme">Full CLI docs</a> ·
   <a href="https://5dive.ai?utm_source=github&utm_medium=referral&utm_campaign=5dive-readme">Managed VM</a>
 </p>
 
@@ -281,7 +282,7 @@ sudo 5dive agent import olivia --as=ceo    # spin up a named agent from a pack
 5dive self-update                        # update CLI + plugins, then restart agents
 ```
 
-Full flag reference: `5dive --help` (or `5dive <verb> --help`). Machine-readable output on any command via `--json`.
+Full flag reference: `5dive --help` (or `5dive <verb> --help`), or the searchable docs at [5dive.ai/docs/5dive-cli](https://5dive.ai/docs/5dive-cli). Machine-readable output on any command via `--json`.
 
 </details>
 

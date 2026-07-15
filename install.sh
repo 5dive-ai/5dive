@@ -699,4 +699,5 @@ echo "  5dive doctor --repair                     # auto-install agent type bina
 echo "  5dive agent create my-agent --type=claude # create your first agent"
 echo
 echo "To upgrade later: curl -fsSL $REPO/install.sh | sudo bash -s -- --upgrade"
-echo "Docs: https://github.com/$GH_ORG/5dive"
+echo "Full CLI docs: https://5dive.ai/docs/5dive-cli"
+echo "Source: https://github.com/$GH_ORG/5dive"
