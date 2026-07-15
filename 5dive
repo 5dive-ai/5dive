@@ -2298,13 +2298,28 @@ install_default_pi_extensions() {
   # pi is a node CLI symlinked into claude's ~/.local/bin; agent users can exec
   # it, but `pi install` shells to npm and so needs node+npm on PATH. Derive the
   # runtime bin dir from the symlink target rather than pinning a node patch.
-  local pi_bin="/home/claude/.local/bin/pi" pi_real node_bin
+  local pi_bin="/home/claude/.local/bin/pi" pi_real pi_hop node_bin
   pi_real="$(readlink -f "$pi_bin" 2>/dev/null || true)"
   if [[ -z "$pi_real" || ! -x "$pi_real" ]]; then
     fail "$E_NOT_INSTALLED" \
       "pi binary not resolvable via $pi_bin (needed to install default extensions for $user). Provision pi first, or set FIVE_PI_DEFAULT_EXTENSIONS=0 to skip."
   fi
-  node_bin="$(dirname "$pi_real")"
+  # Derive node_bin from the FIRST symlink hop, not the fully-dereferenced target:
+  # the install recipe symlinks .local/bin/pi -> <npm global bin>/pi, and npm makes
+  # <bin>/pi a relative symlink into ../lib/node_modules/<pkg>/. `readlink -f` follows
+  # BOTH hops into the package dir (no node/npm/pi there), so dirname of pi_real would
+  # yield a bogus PATH and `pi install` fails with a misleading "command not found"
+  # that the fail-closed guard below mislabels as an integrity mismatch. One hop lands
+  # in the real runtime bin dir that holds node, npm, and pi. (DIVE-1202 smoke)
+  pi_hop="$(readlink "$pi_bin" 2>/dev/null || echo "$pi_bin")"
+  [[ "$pi_hop" != /* ]] && pi_hop="$(dirname "$pi_bin")/$pi_hop"
+  node_bin="$(cd "$(dirname "$pi_hop")" 2>/dev/null && pwd || dirname "$pi_hop")"
+  # Hard-assert the runtime trio is actually present so a future layout drift fails
+  # with an accurate message instead of masquerading as an extension integrity error.
+  if [[ ! -x "$node_bin/pi" || ! -x "$node_bin/node" || ! -e "$node_bin/npm" ]]; then
+    fail "$E_NOT_INSTALLED" \
+      "derived pi runtime bin dir '$node_bin' is missing pi/node/npm (resolved from $pi_bin); cannot install default extensions for $user. Reprovision pi, or set FIVE_PI_DEFAULT_EXTENSIONS=0 to skip."
+  fi
 
   local entry spec integrity
   for entry in "${PI_DEFAULT_EXTENSIONS[@]}"; do
