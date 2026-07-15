@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- feat(agent): `agent create --type=opencode --provider=openrouter --api-key=… --model=…` now stores the key as OpenCode's native `OPENROUTER_API_KEY` and pins the new agent's default as `openrouter/<model>` in its merge-safe `opencode.json` (DIVE-1206). This enables OpenRouter-hosted DeepSeek, GLM, Kimi, and Qwen models without an interactive `/connect` or `/models` step; the existing OpenAI provider and `agent auth set opencode` paths remain compatible.
+
 ## 0.9.13
 
 - fix(audit): non-root agent-* CLI callers now record their mutating actions (task done/answer, agent send, …) in the tamper-evident audit log via a new hidden, append-only `5dive _audit_append` primitive over NOPASSWD sudo (DIVE-1268). The log is 640 root:claude, so a non-root agent can't write it directly; rather than loosen it to a group-writable 660 (which would let any group-claude agent rewrite/truncate past entries), `_emit_audit_line` routes the non-root append through the privileged primitive, which re-stamps `.user` from `SUDO_USER` (the payload can't spoof the actor), drops non-objects, and appends only — never execs caller input (upholds the write_admin_sudoers invariant). Standard agents get a single scoped `write_standard_sudoers` grant with no trailing wildcard; admin agents are covered by the existing whole-CLI grant. Also fixes a `Permission denied` stderr leak — `_emit_audit_line` gates on writability before the append, so a caller who can't write never triggers the failing-redirect diagnostic (which bash prints before `2>/dev/null` takes effect).
