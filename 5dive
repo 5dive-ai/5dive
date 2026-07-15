@@ -6135,15 +6135,23 @@ cmd_list() {
     #            so every inbound DM is refused). Absent when the agent has no
     #            personal-bot channel.
     #   asleep — heartbeat not enabled (won't self-act on board work).
-    # Best-effort file reads, `|| echo 0/false` guarded so a missing/garbled
-    # access.json can never abort the list under `set -e`.
-    local hdeaf="false" hasleep="false" _hc_ch _hc_access _hc_nallow _hc_hb
+    # PRIVILEGED READ (DIVE-1219 iter-2): access.json is 0600 owned by
+    # agent-<name>, but the dashboard runs this CLI through the API exec tunnel
+    # as `claude` (User=claude in 5dive-api.service). A plain read EACCESes, and
+    # treating that as an empty allowlist would false-flag EVERY paired agent as
+    # deaf (verifier olivia, iter-1). Read via `sudo -n cat` (no-op cost when
+    # already root); fall back to a plain read for group-readable files. Only a
+    # POSITIVE read of an empty allowFrom marks deaf — a missing/unreadable/
+    # garbled file stays "unknown" (hdeaf untouched) and can never false-flag a
+    # paired agent nor abort the list under `set -e`.
+    local hdeaf="false" hasleep="false" _hc_ch _hc_access _hc_json _hc_nallow _hc_hb
     for _hc_ch in telegram discord; do
       case ",${lchan}," in *",${_hc_ch},"*) ;; *) continue ;; esac
       _hc_access="/home/agent-${name}/.${ltype}/channels/${_hc_ch}/access.json"
-      _hc_nallow=0
-      [[ -f "$_hc_access" ]] && _hc_nallow=$(jq -r '(.allowFrom // []) | length' "$_hc_access" 2>/dev/null || echo 0)
-      (( _hc_nallow == 0 )) && hdeaf="true"
+      _hc_json=$(sudo -n cat "$_hc_access" 2>/dev/null || cat "$_hc_access" 2>/dev/null || true)
+      [[ -z "$_hc_json" ]] && continue          # unreadable/missing -> unknown, don't flag
+      _hc_nallow=$(jq -r '(.allowFrom // []) | length' <<<"$_hc_json" 2>/dev/null || echo -1)
+      (( _hc_nallow == 0 )) && hdeaf="true"      # -1 (parse fail) -> unknown, don't flag
     done
     _hc_hb=$(jq -r --arg n "$name" '.agents[$n].heartbeat.enabled // false' <<<"$reg" 2>/dev/null || echo false)
     [[ "$_hc_hb" == "true" ]] || hasleep="true"
