@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.9.9
+
+- fix(runtime): `5dive-agent-start` resolves `bun` via a fallback chain (/usr/local/bin -> ~claude/.bun/bin -> ~claude/.local/bin -> PATH) instead of a single hardcoded `~/.local/bin/bun`, at BOTH the opencode and pi telegram-bridge launch sites (DIVE-1263). install.sh dropped bun at ~/.bun/bin while ensure_bun_for_agent used /usr/local/bin, so on a fresh install.sh box the pi/opencode telegram bridge exit-3'd and systemd crash-looped (a restart counter of 132 in the wild; opencode+telegram was latently broken the same way). install.sh now installs bun to /usr/local/bin (BUN_INSTALL=/usr/local) to match, which also puts bun on PATH for codex/grok/agy hook commands. Smoke: test-vm.sh asserts the bridge unit stays active 6s post-create (the create-path smoke passed before the bridge ever booted).
+
 ## 0.9.8
 
 - feat(init): when pi's provider is `openrouter` (a multi-model gateway), `5dive init` now prompts for the model to route to and pins it at create via `--model` (DIVE-1262). openrouter can't route without an explicit model, so the prompt is required (empty rejected); the value flows into the pi agent's `defaultModel` via the existing pi_apply_model_default path. Direct providers (anthropic/openai/etc.) are unaffected — they use pi's provider default.
