@@ -26,7 +26,7 @@ esac
 
 # Bumped on every public release. `build.sh` checks this line exists; CI fails
 # the bundle-drift check if it's missing or empty.
-readonly FIVE_VERSION="0.9.3"
+readonly FIVE_VERSION="0.9.4"
 
 # GitHub org our repos live under. The org is being renamed
 # 5dive-com -> 5dive-ai (2026-06); fetches must work on either side of the
@@ -338,6 +338,16 @@ declare -A TYPE_API_VAR=(
   [grok]="XAI_API_KEY"
   # pi is deliberately absent: it's multi-provider (no single native var).
   # cmd_auth_set resolves pi's target var from --provider via PI_PROVIDER_VAR.
+)
+
+# OpenCode reads provider API keys directly from standard environment variables.
+# Keep this catalog deliberately small: these are the providers the 5dive auth
+# path has explicitly verified and can inject without writing OpenCode's native
+# auth.json. OpenRouter is the broad multi-model option; OpenAI remains available
+# for backwards compatibility with the old provider-less auth-set path.
+declare -A OPENCODE_PROVIDER_VAR=(
+  [openai]="OPENAI_API_KEY"
+  [openrouter]="OPENROUTER_API_KEY"
 )
 
 # pi provider -> native env var. pi is API-key multi-provider (NO OAuth): it
@@ -4275,6 +4285,16 @@ pi_apply_provider_key() {
   fi
 }
 
+# opencode_provider_var <provider> — resolve an OpenCode provider to the native
+# environment variable consumed by the CLI. The default preserves the historical
+# provider-less `auth set opencode` behavior.
+opencode_provider_var() {
+  local provider="${1:-openai}"
+  local var="${OPENCODE_PROVIDER_VAR[$provider]:-}"
+  [[ -n "$var" ]] || return 1
+  echo "$var"
+}
+
 # pi_apply_model_default <agent-name> <provider> <model> — pin a pi agent's
 # default provider+model by merging {defaultProvider,defaultModel} into its
 # ~/.pi/agent/settings.json. pi reads these at startup, so the agent boots onto
@@ -4364,6 +4384,31 @@ cmd_auth_set() {
     ok "api key stored for pi/${pi_provider}${profile:+ (profile=$profile)}" \
        '{type:$t, provider:$pr, profile:$p}' \
        --arg t "pi" --arg pr "$pi_provider" --arg p "${profile:-}"
+    return
+  fi
+
+  # OpenCode is multi-provider. Its supported providers use native environment
+  # variables, so select the target from --provider instead of forcing every key
+  # into OPENAI_API_KEY. With no flag, retain the legacy OpenAI default.
+  if [[ "$type" == "opencode" ]]; then
+    local opencode_provider="${byo_provider:-openai}"
+    local opencode_var
+    opencode_var=$(opencode_provider_var "$opencode_provider") \
+      || fail "$E_VALIDATION" "opencode provider '$opencode_provider' not supported (known: ${!OPENCODE_PROVIDER_VAR[*]})"
+    require_root
+    if [[ -z "$profile" ]]; then
+      step "Writing ${opencode_var} to /etc/5dive/connectors/${TYPE_API_FILE[opencode]}"
+      printf '%s' "$api_key" | write_default_connector "${TYPE_API_FILE[opencode]}" "$opencode_var"
+    else
+      valid_profile_name "$profile" \
+        || fail "$E_VALIDATION" "invalid --auth-profile (lowercase letters/digits/_-, start letter, <=32 chars)"
+      ensure_profile_dir "$profile" >/dev/null
+      step "Writing ${opencode_var} to auth profile '${profile}'"
+      printf '%s' "$api_key" | profile_set_var "$profile" "$opencode_var"
+    fi
+    ok "api key stored for opencode/${opencode_provider}${profile:+ (profile=$profile)}" \
+       '{type:$t, provider:$pr, profile:$p}' \
+       --arg t "opencode" --arg pr "$opencode_provider" --arg p "${profile:-}"
     return
   fi
 
@@ -12456,7 +12501,7 @@ cmd_init() {
 WELCOME
 
   # --- Step 1: pick a type ---
-  local -a types=(claude codex antigravity grok hermes openclaw opencode)
+  local -a types=(claude codex antigravity grok hermes openclaw opencode pi)
   local -A type_desc=(
     [claude]="Anthropic's Claude — recommended"
     [codex]="OpenAI Codex"
@@ -12465,6 +12510,7 @@ WELCOME
     [hermes]="Open-source agent — bring your own provider"
     [openclaw]="Open-source agent — bring your own provider"
     [opencode]="Open-source agent — bring your own provider"
+    [pi]="Extension-based coding agent — bring your own provider"
   )
   echo "Pick an agent type:" >&2
   local i=1
@@ -12477,7 +12523,7 @@ WELCOME
   while true; do
     read -r -p "  choice [1-${#types[@]}, default 1]: " choice
     choice="${choice:-1}"
-    if [[ "$choice" =~ ^[1-7]$ ]] && (( choice <= ${#types[@]} )); then
+    if [[ "$choice" =~ ^[1-8]$ ]] && (( choice <= ${#types[@]} )); then
       type="${types[$((choice-1))]}"
       break
     fi
@@ -12558,10 +12604,31 @@ WELCOME
           || fail "$E_AUTH_REQUIRED" "auth failed"
         ;;
       opencode)
+        local providers="${!OPENCODE_PROVIDER_VAR[*]}"
+        echo "  opencode needs a provider + API key. Providers: $providers" >&2
+        local provider
+        read -r -p "  provider [default openrouter]: " provider
+        provider="${provider:-openrouter}"
+        [[ -n "${OPENCODE_PROVIDER_VAR[$provider]:-}" ]] \
+          || fail "$E_VALIDATION" "unknown provider '$provider' (choose: $providers)"
         local key
-        read -r -s -p "  paste OpenAI API key: " key; echo >&2
+        read -r -s -p "  paste $provider API key: " key; echo >&2
         [[ -n "$key" ]] || fail "$E_VALIDATION" "empty API key"
-        printf '%s' "$key" | 5dive agent auth set opencode --api-key=- \
+        printf '%s' "$key" | 5dive agent auth set opencode --api-key=- --provider="$provider" \
+          || fail "$E_AUTH_REQUIRED" "auth failed"
+        ;;
+      pi)
+        local providers="${!PI_PROVIDER_VAR[*]}"
+        echo "  pi needs a provider + API key. Providers: $providers" >&2
+        local provider
+        read -r -p "  provider [default anthropic]: " provider
+        provider="${provider:-anthropic}"
+        [[ -n "${PI_PROVIDER_VAR[$provider]:-}" ]] \
+          || fail "$E_VALIDATION" "unknown pi provider '$provider' (choose: $providers)"
+        local key
+        read -r -s -p "  paste $provider API key: " key; echo >&2
+        [[ -n "$key" ]] || fail "$E_VALIDATION" "empty API key"
+        printf '%s' "$key" | 5dive agent auth set pi --provider="$provider" --api-key=- \
           || fail "$E_AUTH_REQUIRED" "auth failed"
         ;;
     esac
@@ -12575,14 +12642,14 @@ WELCOME
   echo >&2
 
   # --- Step 5: pick a channel (mirrors the dashboard connect-flow) ---
-  # Only claude/hermes/openclaw expose telegram via `agent create --channels=`.
+  # Only claude/hermes/openclaw/pi expose telegram via `agent create --channels=`.
   # Other types fall straight through to create with channels=none.
   local channels="none"
   local telegram_token=""
   local telegram_user_id=""
   local supports_telegram=0
   case "$type" in
-    claude|hermes|openclaw) supports_telegram=1 ;;
+    claude|hermes|openclaw|pi) supports_telegram=1 ;;
   esac
 
   if (( supports_telegram == 1 )); then
@@ -12643,6 +12710,9 @@ WELCOME
 
   # --- Step 6: create ---
   local -a create_args=("$name" "--type=$type")
+  # pi extensions run arbitrary code with the agent's permissions, so keep the
+  # wizard's default pi agent isolated from the shared claude-group workspace.
+  [[ "$type" == "pi" ]] && create_args+=("--isolation=sandboxed")
   if [[ "$channels" != "none" ]]; then
     create_args+=("--channels=$channels")
     [[ -n "$telegram_token" ]] && create_args+=("--telegram-token=$telegram_token")

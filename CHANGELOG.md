@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.9.4
+
+- feat(init): `5dive init` now lists `pi` as agent type option 8 (DIVE-1255). Fixes the wizard's `^[1-7]$` choice regex, adds a provider picker (default `anthropic`) that reuses the multi-provider `PI_PROVIDER_VAR` map, marks pi telegram-capable, and creates the wizard's pi agent with `--isolation=sandboxed` by default (pi extensions run arbitrary code with the agent's permissions, so keep it off the shared claude-group workspace). New unit `tests/init_pi_unit.sh`.
+
+- fix(init): the `opencode` init branch now prompts for a provider instead of hardcoding "paste OpenAI API key" (DIVE-1257). `5dive init -> opencode` lists the supported providers (`openai`/`openrouter`, default `openrouter`) and forwards the choice; `5dive agent auth set opencode --provider=<p>` resolves the key into that provider's native env var via the new `OPENCODE_PROVIDER_VAR` map (no `--provider` keeps the legacy OpenAI default for back-compat). New helper `opencode_provider_var` + unit `tests/opencode_init_provider_unit.sh`.
+
 ## 0.9.3
 
 - fix(agent): `pi` install recipe provisions Node 24 with `nvm install 24` instead of `nvm use 24` (completes the DIVE-1254 sweep). On a fresh box `nvm use 24` fails with "version v24 is not yet installed", so `5dive agent create <name> --type=pi` aborted before installing pi — the identical bug fixed for `codex` in 0.9.2, present in the pi recipe added by DIVE-1199. `nvm install 24` provisions the pinned runtime and selects it so the `npm install -g @earendil-works/pi-coding-agent` lands in v24's bin dir. New unit `tests/pi_install_node24_unit.sh`. Audited all 8 install recipes: only `pi` remained (opencode/hermes/openclaw/antigravity/grok use curl installers, no nvm), so this closes out the node24 provisioning class.
