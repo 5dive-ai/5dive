@@ -630,8 +630,13 @@ ok "Node.js $NODE_VERSION"
 # bun (needed for telegram plugin)
 say "Installing bun"
 if ! sudo -u claude bash -lc 'command -v bun' >/dev/null 2>&1; then
-  sudo -u claude bash -c 'curl -fsSL https://bun.sh/install | bash' 2>/dev/null
-  ok "bun installed"
+  # DIVE-1263: install system-wide to /usr/local/bin (BUN_INSTALL=/usr/local),
+  # matching ensure_bun_for_agent. The old default install dropped bun at
+  # ~claude/.bun/bin/bun, which 5dive-agent-start's hardcode missed → pi/opencode
+  # telegram bridges crash-looped on fresh boxes. Now every install path lands
+  # bun where the runtime resolver looks first.
+  curl -fsSL https://bun.sh/install | BUN_INSTALL=/usr/local bash >/dev/null 2>&1
+  ok "bun installed (/usr/local/bin/bun)"
 else
   ok "bun already present"
 fi

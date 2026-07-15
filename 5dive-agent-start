@@ -41,6 +41,24 @@ export NVM_DIR="/home/claude/.nvm"
 # shellcheck disable=SC1091
 [[ -s "$NVM_DIR/nvm.sh" ]] && . "$NVM_DIR/nvm.sh" || true
 
+# DIVE-1263: the opencode/pi telegram bridges are launched via `bun`, but our
+# installers drop bun in DIFFERENT places depending on the path taken:
+#   /usr/local/bin/bun          — ensure_bun_for_agent (BUN_INSTALL=/usr/local; managed boxes + `doctor --repair`)
+#   /home/claude/.bun/bin/bun   — install.sh's `bun.sh/install` default (BUN_INSTALL=$HOME/.bun)
+#   /home/claude/.local/bin/bun — legacy hardcode / older provisioning
+# The old code hardcoded ONLY ~claude/.local/bin/bun, so on a fresh install.sh
+# host (bun at ~claude/.bun/bin/bun) the bridge exit-3'd → systemd crash-loop
+# (lodar saw a restart counter of 132). Resolve across all install locations,
+# falling back to whatever is on PATH.
+resolve_bun() {
+  local c
+  for c in /usr/local/bin/bun /home/claude/.bun/bin/bun /home/claude/.local/bin/bun; do
+    [[ -x "$c" ]] && { printf '%s\n' "$c"; return 0; }
+  done
+  command -v bun 2>/dev/null && return 0
+  return 1
+}
+
 
 # openclaw splits "the agent that runs and answers chat messages"
 # (`openclaw gateway run`) from "the local TUI for talking to that
@@ -83,7 +101,8 @@ case "$TYPE" in
       done
       [[ -n "$OPENCODE_PLUGIN_DIR" ]] \
         || { echo "telegram-opencode plugin not found (set TELEGRAM_OPENCODE_PLUGIN_DIR or deploy it)" >&2; exit 3; }
-      BIN="/home/claude/.local/bin/bun"
+      BIN="$(resolve_bun)" \
+        || { echo "bun not found (looked in /usr/local/bin, ~claude/.bun/bin, ~claude/.local/bin, PATH) — install bun or run '5dive doctor --repair'" >&2; exit 3; }
       ARGS=(run --cwd "$OPENCODE_PLUGIN_DIR" --shell=bun --silent start)
     else
       BIN="/home/claude/.local/bin/opencode"; ARGS=()
@@ -107,7 +126,8 @@ case "$TYPE" in
       done
       [[ -n "$PI_PLUGIN_DIR" ]] \
         || { echo "telegram-pi plugin not found (set TELEGRAM_PI_PLUGIN_DIR or deploy it)" >&2; exit 3; }
-      BIN="/home/claude/.local/bin/bun"
+      BIN="$(resolve_bun)" \
+        || { echo "bun not found (looked in /usr/local/bin, ~claude/.bun/bin, ~claude/.local/bin, PATH) — install bun or run '5dive doctor --repair'" >&2; exit 3; }
       ARGS=(run --cwd "$PI_PLUGIN_DIR" --shell=bun --silent start)
     else
       BIN="/home/claude/.local/bin/pi"; ARGS=()
