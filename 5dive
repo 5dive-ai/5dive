@@ -2534,6 +2534,33 @@ audit_init() {
   chmod 640 "$AUDIT_LOG"
 }
 
+# _emit_audit_line <ndjson-line> — append one line to the tamper-evident log
+# WITHOUT ever failing the caller or leaking to stderr.
+#
+# The log is 640 root:claude: root writes it directly, but a non-root agent-*
+# caller cannot (group `claude` is read-only — deliberately, so no group member
+# can rewrite/truncate past entries). DIVE-1268: rather than loosen perms to a
+# group-writable 660 (which would make the log tamperable by ANY group-claude
+# agent), non-root callers route the append through the privileged, append-only
+# `_audit_append` primitive over NOPASSWD sudo. That primitive re-stamps the
+# real caller server-side, so agent-initiated mutating actions (task done,
+# agent send, ...) still land in the log and can't be dropped or spoofed.
+#
+# NOTE: a bare `... >> "$AUDIT_LOG" 2>/dev/null` does NOT suppress a failed-open
+# diagnostic — bash applies redirections left-to-right, so if opening the log
+# for append fails (EACCES) the "Permission denied" message hits the still-live
+# stderr BEFORE `2>/dev/null` takes effect. We gate on writability first so the
+# failing redirect is never attempted by a caller who can't write.
+_emit_audit_line() {
+  local line="$1"
+  [[ -n "$line" ]] || return 0
+  if [[ $EUID -eq 0 || -w "$AUDIT_LOG" ]]; then
+    printf '%s\n' "$line" >> "$AUDIT_LOG" 2>/dev/null || true
+  else
+    printf '%s\n' "$line" | sudo -n /usr/local/bin/5dive _audit_append >/dev/null 2>&1 || true
+  fi
+}
+
 # audit_log <cmd> <result:ok|error> <code> -- <args...>
 # Emits one NDJSON line. Sensitive =<value> args are redacted ("--api-key=..."
 # becomes "--api-key=<redacted>"). Never fails the caller — writes are
@@ -2562,12 +2589,13 @@ audit_log() {
   local user="${FIVEDIVE_AUDIT_USER:-${SUDO_USER:-${USER:-unknown}}}"
   local ts
   ts=$(date -Iseconds)
-  jq -cn \
+  local line
+  line=$(jq -cn \
     --arg ts "$ts" --arg u "$user" --arg c "$cmd" \
     --arg r "$result" --argjson code "$code" \
     --args '{ts:$ts, user:$u, cmd:$c, result:$r, code:($code|tonumber? // 0), args:$ARGS.positional}' \
-    "${sanitized[@]+"${sanitized[@]}"}" \
-    >> "$AUDIT_LOG" 2>/dev/null || true
+    "${sanitized[@]+"${sanitized[@]}"}" 2>/dev/null) || return 0
+  _emit_audit_line "$line"
 }
 
 # Dispatcher-level audit state. main() populates these before calling the
@@ -6660,9 +6688,12 @@ SUDOERS
 # DIVE-1065/1074: scoped inter-agent a2a grants for a 'standard'-isolation agent.
 # A standard agent has NO broad sudo, so it can't run the `sudo -u agent-X tmux`
 # inject/capture that `5dive agent send`/`ask` use (those need root). This grants
-# EXACTLY two hidden, single-purpose subcommands as root, NOPASSWD:
+# EXACTLY three hidden, single-purpose subcommands as root, NOPASSWD:
 #   * `5dive agent _deliver` (DIVE-1065) — the send/ask INJECT half.
 #   * `5dive agent _capture` (DIVE-1074) — the ask reply-READ half.
+#   * `5dive _audit_append`  (DIVE-1268) — append-only audit-log write (so a
+#     non-root agent's mutating actions still land in the tamper-evident log;
+#     re-stamps the real caller, never execs input).
 #
 # Why this is safe (same invariant as write_admin_sudoers above): both are
 # single-purpose primitives that NEVER exec caller-controlled input (no eval /
@@ -6690,6 +6721,7 @@ write_standard_sudoers() {
 # Do not edit by hand; regenerated on agent create/provision.
 ${user} ALL=(root) NOPASSWD: /usr/local/bin/5dive agent _deliver *
 ${user} ALL=(root) NOPASSWD: /usr/local/bin/5dive agent _capture *
+${user} ALL=(root) NOPASSWD: /usr/local/bin/5dive _audit_append
 SUDOERS
   chmod 440 "$tmp"
   if visudo -cf "$tmp" >/dev/null 2>&1; then
@@ -27518,6 +27550,28 @@ main() {
   # can't race across concurrent dashboard clicks. Read-only commands (list,
   # logs, stats, types, auth status/poll) bypass the lock and the audit log.
   case "$top" in
+    _audit_append)
+      # DIVE-1268: hidden, privileged, APPEND-ONLY audit primitive. Reachable
+      # ONLY via NOPASSWD sudo — the admin whole-CLI grant, or the scoped
+      # write_standard_sudoers line for standard agents. It lets a non-root
+      # agent-* caller land its mutating action in the 640 root:claude
+      # tamper-evident log without loosening perms to a group-writable 660
+      # (which would let any group-claude agent rewrite/truncate past entries).
+      # Reads ONE NDJSON line from stdin, re-stamps `user` from SUDO_USER so the
+      # payload can't spoof the actor, and appends it — nothing else. Never execs
+      # caller input (upholds the write_admin_sudoers invariant), never advertised,
+      # and is not itself audited (AUDIT_CMD stays unset, so no recursion).
+      [[ $EUID -eq 0 ]] || fail "$E_PERMISSION" "_audit_append is a privileged internal primitive"
+      audit_init 2>/dev/null || true
+      local _al
+      IFS= read -r _al || true
+      [[ -n "$_al" ]] || exit 0
+      printf '%s\n' "$_al" \
+        | jq -c --arg u "${SUDO_USER:-unknown}" \
+            'if type=="object" then .user=$u else empty end' \
+        >> "$AUDIT_LOG" 2>/dev/null || true
+      exit 0
+      ;;
     market)
       # DIVE-1020: front door to the agent market — browse/search the
       # character-pack registry + preview a persona before hiring. Read-only

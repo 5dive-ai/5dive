@@ -97,9 +97,12 @@ SUDOERS
 # DIVE-1065/1074: scoped inter-agent a2a grants for a 'standard'-isolation agent.
 # A standard agent has NO broad sudo, so it can't run the `sudo -u agent-X tmux`
 # inject/capture that `5dive agent send`/`ask` use (those need root). This grants
-# EXACTLY two hidden, single-purpose subcommands as root, NOPASSWD:
+# EXACTLY three hidden, single-purpose subcommands as root, NOPASSWD:
 #   * `5dive agent _deliver` (DIVE-1065) — the send/ask INJECT half.
 #   * `5dive agent _capture` (DIVE-1074) — the ask reply-READ half.
+#   * `5dive _audit_append`  (DIVE-1268) — append-only audit-log write (so a
+#     non-root agent's mutating actions still land in the tamper-evident log;
+#     re-stamps the real caller, never execs input).
 #
 # Why this is safe (same invariant as write_admin_sudoers above): both are
 # single-purpose primitives that NEVER exec caller-controlled input (no eval /
@@ -127,6 +130,7 @@ write_standard_sudoers() {
 # Do not edit by hand; regenerated on agent create/provision.
 ${user} ALL=(root) NOPASSWD: /usr/local/bin/5dive agent _deliver *
 ${user} ALL=(root) NOPASSWD: /usr/local/bin/5dive agent _capture *
+${user} ALL=(root) NOPASSWD: /usr/local/bin/5dive _audit_append
 SUDOERS
   chmod 440 "$tmp"
   if visudo -cf "$tmp" >/dev/null 2>&1; then

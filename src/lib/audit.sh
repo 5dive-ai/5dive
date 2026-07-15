@@ -9,6 +9,33 @@ audit_init() {
   chmod 640 "$AUDIT_LOG"
 }
 
+# _emit_audit_line <ndjson-line> — append one line to the tamper-evident log
+# WITHOUT ever failing the caller or leaking to stderr.
+#
+# The log is 640 root:claude: root writes it directly, but a non-root agent-*
+# caller cannot (group `claude` is read-only — deliberately, so no group member
+# can rewrite/truncate past entries). DIVE-1268: rather than loosen perms to a
+# group-writable 660 (which would make the log tamperable by ANY group-claude
+# agent), non-root callers route the append through the privileged, append-only
+# `_audit_append` primitive over NOPASSWD sudo. That primitive re-stamps the
+# real caller server-side, so agent-initiated mutating actions (task done,
+# agent send, ...) still land in the log and can't be dropped or spoofed.
+#
+# NOTE: a bare `... >> "$AUDIT_LOG" 2>/dev/null` does NOT suppress a failed-open
+# diagnostic — bash applies redirections left-to-right, so if opening the log
+# for append fails (EACCES) the "Permission denied" message hits the still-live
+# stderr BEFORE `2>/dev/null` takes effect. We gate on writability first so the
+# failing redirect is never attempted by a caller who can't write.
+_emit_audit_line() {
+  local line="$1"
+  [[ -n "$line" ]] || return 0
+  if [[ $EUID -eq 0 || -w "$AUDIT_LOG" ]]; then
+    printf '%s\n' "$line" >> "$AUDIT_LOG" 2>/dev/null || true
+  else
+    printf '%s\n' "$line" | sudo -n /usr/local/bin/5dive _audit_append >/dev/null 2>&1 || true
+  fi
+}
+
 # audit_log <cmd> <result:ok|error> <code> -- <args...>
 # Emits one NDJSON line. Sensitive =<value> args are redacted ("--api-key=..."
 # becomes "--api-key=<redacted>"). Never fails the caller — writes are
@@ -37,12 +64,13 @@ audit_log() {
   local user="${FIVEDIVE_AUDIT_USER:-${SUDO_USER:-${USER:-unknown}}}"
   local ts
   ts=$(date -Iseconds)
-  jq -cn \
+  local line
+  line=$(jq -cn \
     --arg ts "$ts" --arg u "$user" --arg c "$cmd" \
     --arg r "$result" --argjson code "$code" \
     --args '{ts:$ts, user:$u, cmd:$c, result:$r, code:($code|tonumber? // 0), args:$ARGS.positional}' \
-    "${sanitized[@]+"${sanitized[@]}"}" \
-    >> "$AUDIT_LOG" 2>/dev/null || true
+    "${sanitized[@]+"${sanitized[@]}"}" 2>/dev/null) || return 0
+  _emit_audit_line "$line"
 }
 
 # Dispatcher-level audit state. main() populates these before calling the

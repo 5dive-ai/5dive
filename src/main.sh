@@ -278,6 +278,28 @@ main() {
   # can't race across concurrent dashboard clicks. Read-only commands (list,
   # logs, stats, types, auth status/poll) bypass the lock and the audit log.
   case "$top" in
+    _audit_append)
+      # DIVE-1268: hidden, privileged, APPEND-ONLY audit primitive. Reachable
+      # ONLY via NOPASSWD sudo — the admin whole-CLI grant, or the scoped
+      # write_standard_sudoers line for standard agents. It lets a non-root
+      # agent-* caller land its mutating action in the 640 root:claude
+      # tamper-evident log without loosening perms to a group-writable 660
+      # (which would let any group-claude agent rewrite/truncate past entries).
+      # Reads ONE NDJSON line from stdin, re-stamps `user` from SUDO_USER so the
+      # payload can't spoof the actor, and appends it — nothing else. Never execs
+      # caller input (upholds the write_admin_sudoers invariant), never advertised,
+      # and is not itself audited (AUDIT_CMD stays unset, so no recursion).
+      [[ $EUID -eq 0 ]] || fail "$E_PERMISSION" "_audit_append is a privileged internal primitive"
+      audit_init 2>/dev/null || true
+      local _al
+      IFS= read -r _al || true
+      [[ -n "$_al" ]] || exit 0
+      printf '%s\n' "$_al" \
+        | jq -c --arg u "${SUDO_USER:-unknown}" \
+            'if type=="object" then .user=$u else empty end' \
+        >> "$AUDIT_LOG" 2>/dev/null || true
+      exit 0
+      ;;
     market)
       # DIVE-1020: front door to the agent market — browse/search the
       # character-pack registry + preview a persona before hiring. Read-only
