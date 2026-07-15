@@ -23,6 +23,14 @@
 
 </div>
 
+**不是又一个多智能体框架——就是 bash + systemd。** 没有协议、没有中间层、没有黑盒编排。
+
+- 🖥️ **自托管**——跑在你自己的服务器上，token 直连模型厂商，绝不经过我们
+- 🇨🇳 **接国产模型**——DeepSeek / Kimi / 智谱 GLM / 通义千问，或用 OpenRouter 一个 Key 通所有
+- 👥 **一整支团队**——多个智能体按组织架构协作、互相派活，而不是单个 bot
+
+> 觉得有用？给个 ⭐ Star——我们靠 star 判断接下来做什么。
+
 > **我们自己的公司就跑在它上面。** 一支 AI 智能体团队，彼此分派工作、按组织架构汇报、亲手发布这个仓库的版本，只有卡住时才上报给人。你安装的就是那个二进制——开源内核，MIT 协议，没有 open-core 阉割。自己跑，或者用[托管版](https://5dive.ai?utm_source=github&utm_medium=referral&utm_campaign=5dive-readme-zh)省去运维。
 
 ---
@@ -150,3 +158,7 @@ sudo 5dive team import solo-founder
 ## 许可协议
 
 MIT。见 [LICENSE](LICENSE)。
+
+## 支持这个项目
+
+如果 5dive 对你有用，点个 ⭐ Star——这是我们判断该往哪走的最直接信号。有想法或 bug，欢迎开 [issue](https://github.com/5dive-ai/5dive/issues)，或来 [Telegram](https://t.me/ai5dive) / [Discord](https://discord.gg/aU2UQC9Myy) 找我们。
