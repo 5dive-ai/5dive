@@ -26,7 +26,7 @@ esac
 
 # Bumped on every public release. `build.sh` checks this line exists; CI fails
 # the bundle-drift check if it's missing or empty.
-readonly FIVE_VERSION="0.9.2"
+readonly FIVE_VERSION="0.9.3"
 
 # GitHub org our repos live under. The org is being renamed
 # 5dive-com -> 5dive-ai (2026-06); fetches must work on either side of the
@@ -264,13 +264,13 @@ declare -A TYPE_INSTALL=(
   # installer's ~/.local/bin/agent symlink so it can't shadow future tooling.
   # The binary self-updates on launch; no daily-cron entry needed.
   [grok]="command -v grok >/dev/null 2>&1 || curl -fsSL https://x.ai/cli/install.sh | bash; mkdir -p /home/claude/.local/bin; [ -e /home/claude/.grok/bin/grok ] && ln -sf /home/claude/.grok/bin/grok /home/claude/.local/bin/grok; rm -f /home/claude/.local/bin/agent"
-  # pi is a plain npm package. Install-on-demand like codex (nvm use 24 so the
+  # pi is a plain npm package. Install-on-demand like codex (nvm install 24 so the
   # global install lands in v24's bin dir even when the default alias drifted),
   # then symlink into ~/.local/bin like opencode/openclaw so TYPE_BIN[pi]
   # resolves on every box (the systemd unit uses TYPE_BIN's path directly, and
   # bash -lc skips .bashrc so npm's bin dir isn't on PATH). Idempotent via the
   # -x guard. \$-escaped so npm prefix expands when the recipe runs under bash -lc.
-  [pi]="[[ -x /home/claude/.local/bin/pi ]] || { . /home/claude/.nvm/nvm.sh && nvm use 24 >/dev/null && npm install -g @earendil-works/pi-coding-agent && mkdir -p /home/claude/.local/bin && ln -sf \"\$(npm prefix -g)/bin/pi\" /home/claude/.local/bin/pi; }"
+  [pi]="[[ -x /home/claude/.local/bin/pi ]] || { . /home/claude/.nvm/nvm.sh && nvm install 24 >/dev/null && npm install -g @earendil-works/pi-coding-agent && mkdir -p /home/claude/.local/bin && ln -sf \"\$(npm prefix -g)/bin/pi\" /home/claude/.local/bin/pi; }"
 )
 
 # vercel-labs/skills CLI agent ID per 5dive type. `npx skills add --agent <id>`

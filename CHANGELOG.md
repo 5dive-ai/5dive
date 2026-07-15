@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.9.3
+
+- fix(agent): `pi` install recipe provisions Node 24 with `nvm install 24` instead of `nvm use 24` (completes the DIVE-1254 sweep). On a fresh box `nvm use 24` fails with "version v24 is not yet installed", so `5dive agent create <name> --type=pi` aborted before installing pi — the identical bug fixed for `codex` in 0.9.2, present in the pi recipe added by DIVE-1199. `nvm install 24` provisions the pinned runtime and selects it so the `npm install -g @earendil-works/pi-coding-agent` lands in v24's bin dir. New unit `tests/pi_install_node24_unit.sh`. Audited all 8 install recipes: only `pi` remained (opencode/hermes/openclaw/antigravity/grok use curl installers, no nvm), so this closes out the node24 provisioning class.
+
+## 0.9.2
+
+- fix(init): `codex` install recipe provisions Node 24 with `nvm install 24` before installing Codex (DIVE-1254). `nvm use 24` failed on a fresh box where v24 wasn't yet installed, aborting `--type=codex` provisioning; `nvm install 24` provisions and selects it, forcing the `npm install -g @openai/codex@latest` into v24's bin dir even when the default alias drifted. New unit `tests/codex_install_node24_unit.sh`.
+
 ## 0.9.1
 
 - fix(agent): durable Telegram pairing for owner-less fork agents (DIVE-1244). `codex`/`grok`/`antigravity` created with no `allowed_users` previously skipped seeding `access.json` entirely, leaving a block-everything file-absent state that silently dropped the operator's DMs (incl. gate alerts) until a manual file pair. The three installers now ALWAYS seed `access.json` (mirroring `opencode`/`pi`): with ids they allowlist them, without they default `dmPolicy=pairing` so the first DM yields a pairing code instead of a silent drop. Seeds remain append-only and never override an existing `dmPolicy`, so a manual pairing survives config-set re-provisioning. `pending` is now also seeded for schema parity with the bridges.
