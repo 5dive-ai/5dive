@@ -26,7 +26,7 @@ esac
 
 # Bumped on every public release. `build.sh` checks this line exists; CI fails
 # the bundle-drift check if it's missing or empty.
-readonly FIVE_VERSION="0.9.9"
+readonly FIVE_VERSION="0.9.10"
 
 # GitHub org our repos live under. The org is being renamed
 # 5dive-com -> 5dive-ai (2026-06); fetches must work on either side of the
@@ -2186,6 +2186,10 @@ PI_ENV
   # given ids, or default dmPolicy to 'pairing' so the first DM pairs.
   seed_pi_telegram_access "$name" "$allowed_users"
 
+  # DIVE-1264: pre-seed pi project-trust so the headless relay never blocks on
+  # the interactive "Trust project folder?" gate on first run.
+  seed_pi_project_trust "$name"
+
   # Seed the notify-user skill so the agent self-starts its comms loop on first
   # DM. pi reads skills from its generic install dir (no SKILLS_AGENT_ID[pi]
   # entry → the generic $HOME/.agents/skills path, same fallback as agy).
@@ -2207,6 +2211,56 @@ PI_ENV
   # Fail-closed on integrity drift (unlike the best-effort skills above) — a
   # tampered/republished package must abort provisioning, not ship silently.
   install_default_pi_extensions "$name"
+}
+
+# DIVE-1264: pre-seed pi's project-trust store so a headless pi agent never hits
+# the interactive "Trust project folder?" gate on first run. The telegram-pi
+# relay hosts pi in-process; on reload pi resolves project trust and, when the
+# cwd carries trust-requiring resources and no saved decision exists, blocks on
+# an interactive prompt the systemd relay can't answer -> the agent hangs before
+# it ever polls. pi reads project trust from <agentDir>/trust.json (default
+# ~/.pi/agent/trust.json): a JSON map of canonicalized-absolute-path -> bool.
+# pi's lookup walks parent dirs, so trusting /home/claude/projects (the default
+# WORKDIR and parent of every per-agent workdir) covers any child cwd — the exact
+# analogue of the claude .claude.json hasTrustDialogAccepted pre-seed above.
+# Merge-safe / idempotent: preserves any existing entries, only sets our key.
+seed_pi_project_trust() {
+  local name="$1" user="agent-${name}"
+  local trusted_dir="${2:-/home/claude/projects}"
+  step "Pre-seeding pi project-trust for $trusted_dir ($user)"
+  if ! sudo -u "$user" -H env TRUSTED_DIR="$trusted_dir" python3 - >&2 <<'PY'
+import json, os
+agent_dir = os.environ.get("PI_AGENT_DIR") or os.path.join(os.environ["HOME"], ".pi", "agent")
+trust_path = os.path.join(agent_dir, "trust.json")
+# pi normalizes trust keys as realpath(resolve(path)); match it so our entry is
+# found by findNearestTrustEntry (which compares canonicalized paths).
+key = os.path.realpath(os.environ["TRUSTED_DIR"])
+os.makedirs(agent_dir, exist_ok=True)
+data = {}
+try:
+    with open(trust_path) as f:
+        parsed = json.load(f)
+    if isinstance(parsed, dict):
+        data = parsed
+except FileNotFoundError:
+    pass
+except Exception:
+    data = {}
+data[key] = True
+# pi requires every value to be true/false/null; keep only valid bool entries,
+# sorted (matches pi's own writeTrustFile so re-runs produce a stable file).
+data = {k: data[k] for k in sorted(data) if isinstance(data.get(k), bool)}
+tmp = trust_path + ".tmp"
+with open(tmp, "w") as f:
+    json.dump(data, f, indent=2)
+    f.write("\n")
+os.replace(tmp, trust_path)
+os.chmod(trust_path, 0o600)
+print(f"pi trust seeded: {key} -> true in {trust_path}")
+PY
+  then
+    fail "$E_GENERIC" "pi project-trust pre-seed failed for agent '$name'"
+  fi
 }
 
 # Write ~/.pi/channels/telegram/access.json for agent-<name>. Idempotent —

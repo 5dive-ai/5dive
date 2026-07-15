@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.9.10
+
+- fix(agent): pre-seed pi's project-trust store at provision time so a freshly-created pi (telegram-relay) agent never blocks on pi's interactive "Trust project folder?" gate on first run (DIVE-1264). The headless systemd relay can't answer the prompt, so it hung before ever polling. `agent_setup` now writes `~/.pi/agent/trust.json` (`{"/home/claude/projects": true}`) during the pi telegram channel setup — pi's trust lookup walks parent dirs, so trusting the projects root covers every per-agent workdir beneath it, exactly mirroring the claude `.claude.json` hasTrustDialogAccepted pre-seed. Merge-safe and idempotent.
+
 ## 0.9.9
 
 - fix(runtime): `5dive-agent-start` resolves `bun` via a fallback chain (/usr/local/bin -> ~claude/.bun/bin -> ~claude/.local/bin -> PATH) instead of a single hardcoded `~/.local/bin/bun`, at BOTH the opencode and pi telegram-bridge launch sites (DIVE-1263). install.sh dropped bun at ~/.bun/bin while ensure_bun_for_agent used /usr/local/bin, so on a fresh install.sh box the pi/opencode telegram bridge exit-3'd and systemd crash-looped (a restart counter of 132 in the wild; opencode+telegram was latently broken the same way). install.sh now installs bun to /usr/local/bin (BUN_INSTALL=/usr/local) to match, which also puts bun on PATH for codex/grok/agy hook commands. Smoke: test-vm.sh asserts the bridge unit stays active 6s post-create (the create-path smoke passed before the bridge ever booted).
