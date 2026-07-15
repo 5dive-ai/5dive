@@ -77,4 +77,9 @@ if ! grep -qE '^readonly FIVE_VERSION="[^"]+"' "$OUT"; then
   exit 1
 fi
 
-echo "built $OUT ($(wc -l < "$OUT") lines, $(grep -oE '^readonly FIVE_VERSION="[^"]+"' "$OUT" | cut -d'"' -f2))"
+# DIVE-1261: publish a sha256 of the bundle so the installer can verify the
+# fetched binary before swapping it in. Regenerated on every build and committed
+# alongside the bundle; CI's build+diff drift check keeps the two in sync.
+sha256sum "$OUT" | awk '{print $1}' > "$OUT.sha256"
+
+echo "built $OUT ($(wc -l < "$OUT") lines, $(grep -oE '^readonly FIVE_VERSION="[^"]+"' "$OUT" | cut -d'"' -f2)) + $OUT.sha256 ($(cut -c1-16 "$OUT.sha256")…)"

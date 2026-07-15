@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.9.7
+
+- feat(install): supply-chain integrity check for the curl|bash installer (DIVE-1261). `build.sh` now publishes `5dive.sha256` alongside the bundle, and the installer fetches the bundle to a temp file, verifies it against the published checksum, then does a same-fs atomic swap into place. A checksum MISMATCH is fatal (corrupt download or tampered mirror); an absent/unfetchable checksum only WARNS so a box can't be bricked if the `.sha256` isn't published. Covers both the default install and `--upgrade` (both flow through `refresh_managed_files`). Integrity-check v1 — guards corruption + mirror tamper, not signing-strength (a future out-of-band-key signature would close the absent-checksum downgrade path). New unit `tests/install_checksum_unit.sh`.
+
 ## 0.9.6
 
 - fix(install): `curl … | sudo bash -s -- --upgrade` now reports the resolved version — `5dive upgraded: <old> -> <new>` — instead of a bare "5dive upgraded.", read directly from the swapped-in bundle so it reflects what actually landed (DIVE-1260).

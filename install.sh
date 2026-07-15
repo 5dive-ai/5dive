@@ -40,9 +40,28 @@ say() { echo "→ $*"; }
 # the claude user, apt packages, nvm, or bun — so it's safe to rerun on a
 # populated host.
 refresh_managed_files() {
-  curl -fsSL "$REPO/5dive" -o "$BIN_DIR/5dive"
-  chmod 755 "$BIN_DIR/5dive"
-  ok "5dive → $BIN_DIR/5dive"
+  # DIVE-1261: fetch the bundle to a temp file, verify it against the published
+  # sha256, then atomically swap it in. A checksum MISMATCH is fatal (corrupt
+  # download or tampered mirror); an absent/unfetchable checksum only WARNS so a
+  # box can't be bricked if the .sha256 isn't published yet. (Integrity check v1:
+  # guards corruption + mirror tamper; not signing-strength — that needs an
+  # out-of-band key.) Temp lives in BIN_DIR so the final mv is a same-fs atomic swap.
+  local _bundle_tmp; _bundle_tmp="$(mktemp "${BIN_DIR}/.5dive.XXXXXX")"
+  curl -fsSL "$REPO/5dive" -o "$_bundle_tmp" || { rm -f "$_bundle_tmp"; die "failed to download 5dive bundle from $REPO/5dive"; }
+  local _want _got
+  _want="$(curl -fsSL "$REPO/5dive.sha256" 2>/dev/null | tr -d '[:space:]')"
+  if [[ -n "$_want" ]]; then
+    _got="$(sha256sum "$_bundle_tmp" | awk '{print $1}')"
+    if [[ "$_want" != "$_got" ]]; then
+      rm -f "$_bundle_tmp"
+      die "5dive bundle checksum mismatch (want ${_want:0:16}…, got ${_got:0:16}…) — refusing to install (corrupt download or tampered mirror)"
+    fi
+  else
+    echo "  ! no published 5dive.sha256 (or fetch failed) — skipping integrity check" >&2
+  fi
+  chmod 755 "$_bundle_tmp"
+  mv -f "$_bundle_tmp" "$BIN_DIR/5dive"
+  ok "5dive → $BIN_DIR/5dive${_want:+ (sha256 verified)}"
 
   # DIVE-544: per-customer standup digest. The cron runs HOURLY but `digest tick`
   # is gated on a per-box pref that defaults OFF — nothing is delivered until a
