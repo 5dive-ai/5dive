@@ -23,7 +23,9 @@ assert_has '[pi]="Extension-based coding agent — bring your own provider"' \
 assert_has '5dive agent auth set pi --provider="$provider" --api-key=-' \
   "pi credentials must use its provider-aware auth path"
 assert_has 'claude | hermes | openclaw | pi' "pi must expose its Telegram channel option"
-assert_has 'create_args+=("--isolation=sandboxed")' \
-  "wizard-created pi agents must default to sandboxed isolation"
+assert_has 'iso_default="sandboxed"' \
+  "wizard-created pi agents must default to sandboxed isolation (via the isolation picker)"
+assert_has '--isolation=$isolation' \
+  "create must forward the chosen isolation tier"
 
 echo "PASS: init wizard exposes and provisions pi through the guarded paths"
