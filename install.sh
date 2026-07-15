@@ -373,6 +373,22 @@ JOURNALD
     echo "warn: failed to stage model-tiering-CLAUDE.md — Fable model-tiering default won't apply until the next refresh" >&2
   fi
 
+  # DIVE-1210: project subagent that overrides the harness's built-in Explore
+  # agent, pinning it to haiku instead of inheriting the session's model. CC
+  # >=2.1.198 has Explore inherit the main conversation's model (capped at
+  # Opus) rather than always running on Haiku — and every 5dive claude agent
+  # is pinned to opus (preseed_claude_agent), so every un-overridden Explore
+  # call runs full Opus. preseed_claude_agent drops this into each new agent's
+  # $HOME/.claude/agents/explore.md at create. Fail-soft like the CLAUDE.md
+  # fragments above — a missing fragment just means Explore stays on the
+  # session's inherited model until the next refresh, not a broken agent.
+  if curl -fsSL "$REPO/explore-agent.md" -o "$LIB_DIR/explore-agent.md"; then
+    chmod 644 "$LIB_DIR/explore-agent.md"
+    ok "explore-agent.md"
+  else
+    echo "warn: failed to stage explore-agent.md — the haiku-pinned Explore override won't apply until the next refresh" >&2
+  fi
+
   # Curated team templates for `5dive team import <slug>` (the compose engine
   # resolves $LIB_DIR/team-templates first). Enumerated explicitly because $REPO
   # is a flat fetch URL with no directory listing — add a line per new template.
