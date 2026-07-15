@@ -42,7 +42,7 @@ new one; real usage reports move items up the list.
       their own work)
 - [x] Auto-recovery: stuck agents restart, nudge, or escalate on their own, every action
       logged
-- [ ] Self-healing for every runtime, not just Claude (#16)
+- [x] Self-healing for every runtime, not just Claude (#16)
 - [ ] Enforceable per-loop token budgets (#17)
 
 ## Memory that compounds
