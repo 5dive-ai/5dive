@@ -26,7 +26,7 @@ esac
 
 # Bumped on every public release. `build.sh` checks this line exists; CI fails
 # the bundle-drift check if it's missing or empty.
-readonly FIVE_VERSION="0.9.10"
+readonly FIVE_VERSION="0.9.11"
 
 # GitHub org our repos live under. The org is being renamed
 # 5dive-com -> 5dive-ai (2026-06); fetches must work on either side of the
@@ -288,6 +288,12 @@ declare -A SKILLS_AGENT_ID=(
   # which is exactly where agy itself reads from (see SKILLS_INSTALL_DIR below).
   # So passing it through works, even though it's an "unknown" agent id.
   [antigravity]=antigravity
+  # pi has no upstream skills-registry id either, so like antigravity it takes
+  # the generic `.agents/skills/` fallback — which is one of the dirs pi's
+  # resource loader scans (~/.agents/skills, alongside ~/.pi/agent/skills).
+  # Without this entry pi fell through to claude-code → `.claude/skills`, a dir
+  # pi NEVER reads, so its default skills installed but were invisible (DIVE-1265).
+  [pi]=pi
   [grok]=grok
 )
 # Where the skills CLI lands SKILL.md inside the agent user's $HOME, per type.
@@ -306,6 +312,10 @@ declare -A SKILLS_INSTALL_DIR=(
   # .gemini/antigravity-cli/skills (matching its state dir), which was a guess
   # — wrong. Upstream npx skills fallback already lands at .agents/skills.
   [antigravity]=".agents/skills"
+  # pi's user-scope skills dir (getHomeDir()/.agents/skills in the pi resource
+  # loader). Matches the notify-user seed already copied there for pi, and the
+  # SKILLS_AGENT_ID[pi]=pi generic fallback above (DIVE-1265).
+  [pi]=".agents/skills"
   [grok]=".grok/skills"
 )
 

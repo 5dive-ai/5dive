@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.9.11
+
+- fix(agent): a freshly-created pi agent now gets the full 5dive default skill set (find-skills, 5dive-cli, compile-knowledge, openagent), not just a stray openagent leaked from the shared project dir (DIVE-1265). pi had no `SKILLS_AGENT_ID`/`SKILLS_INSTALL_DIR` map entry, so its default-skill installs fell through to the claude-code default and landed in `~/.claude/skills` — a directory pi's resource loader never scans (pi reads `~/.agents/skills`, `~/.pi/agent/skills`, and the `<cwd>/.pi|.agents/skills` project dirs). Added `[pi]=pi` (generic `.agents/skills` fallback, same as antigravity) and `[pi]=".agents/skills"`, so both the create-path installer and the `5dive-refresh-skills.sh` backfill (and `5dive agent skill list/rm`) now target pi's real skills dir, matching the notify-user seed already written there.
+
 ## 0.9.10
 
 - fix(agent): pre-seed pi's project-trust store at provision time so a freshly-created pi (telegram-relay) agent never blocks on pi's interactive "Trust project folder?" gate on first run (DIVE-1264). The headless systemd relay can't answer the prompt, so it hung before ever polling. `agent_setup` now writes `~/.pi/agent/trust.json` (`{"/home/claude/projects": true}`) during the pi telegram channel setup — pi's trust lookup walks parent dirs, so trusting the projects root covers every per-agent workdir beneath it, exactly mirroring the claude `.claude.json` hasTrustDialogAccepted pre-seed. Merge-safe and idempotent.

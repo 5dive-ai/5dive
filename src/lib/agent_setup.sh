@@ -1375,8 +1375,8 @@ PI_ENV
   seed_pi_project_trust "$name"
 
   # Seed the notify-user skill so the agent self-starts its comms loop on first
-  # DM. pi reads skills from its generic install dir (no SKILLS_AGENT_ID[pi]
-  # entry → the generic $HOME/.agents/skills path, same fallback as agy).
+  # DM. pi reads skills from $HOME/.agents/skills (see SKILLS_INSTALL_DIR[pi];
+  # DIVE-1265) — the same generic fallback dir as agy.
   if [[ -f "$AGENT_SKILLS_DIR/notify-user/SKILL.md" ]]; then
     sudo -u "$user" mkdir -p "/home/${user}/.agents/skills/notify-user"
     sudo -u "$user" cp "$AGENT_SKILLS_DIR/notify-user/SKILL.md" \
