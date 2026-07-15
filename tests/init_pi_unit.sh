@@ -20,8 +20,16 @@ assert_has() {
 assert_has "opencode pi" "pi must be the eighth wizard type"
 assert_has '[pi]="Extension-based coding agent — bring your own provider"' \
   "pi must have a wizard menu description"
-assert_has '5dive agent auth set pi --provider="$provider" --api-key=-' \
-  "pi credentials must use its provider-aware auth path"
+# DIVE-1269: pi provider+key are deferred to `agent create` (NOT wired via an
+# early `auth set`) so create runs pi_apply_provider_key + pi_apply_model_default
+# and the agent boots with defaultProvider set + the key persisted.
+assert_has 'pi_provider="$provider"' "pi provider must be captured for create"
+assert_has '--provider=$pi_provider" "--api-key=-' \
+  "pi provider+key must be forwarded to create (mirrors agent create --provider path)"
+[[ "$body" != *'auth set pi'* ]] || {
+  echo "FAIL: pi must NOT use the early 'auth set' path (leaves defaultProvider empty — DIVE-1269)" >&2
+  exit 1
+}
 assert_has 'claude | hermes | openclaw | pi' "pi must expose its Telegram channel option"
 assert_has 'iso_default="sandboxed"' \
   "wizard-created pi agents must default to sandboxed isolation (via the isolation picker)"

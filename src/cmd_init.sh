@@ -62,7 +62,7 @@ WELCOME
 
   # --- Step 3: auth ---
   local auth_ok=0
-  local byo_provider="" byo_key="" pi_model=""
+  local byo_provider="" byo_key="" pi_model="" pi_provider="" pi_key=""
   # Probe current auth state — cmd_auth_status returns 0 if any creds exist.
   if 5dive agent auth status --probe --type="$type" --json 2>/dev/null | jq -e '.ok and (.data | any(.status == "ok"))' >/dev/null 2>&1; then
     echo "✓ $type already authenticated" >&2
@@ -153,11 +153,16 @@ WELCOME
           read -r -p "  model: " pi_model
           [[ -n "$pi_model" ]] || fail "$E_VALIDATION" "openrouter needs a model (none given)"
         fi
-        local key
-        read -r -s -p "  paste $provider API key: " key; echo >&2
-        [[ -n "$key" ]] || fail "$E_VALIDATION" "empty API key"
-        printf '%s' "$key" | 5dive agent auth set pi --provider="$provider" --api-key=- \
-          || fail "$E_AUTH_REQUIRED" "auth failed"
+        # Defer the key to `agent create` (below) so it takes the SAME wiring
+        # path as `agent create --provider/--api-key`: pi_apply_provider_key
+        # persists the key to the agent's connector AND pi_apply_model_default
+        # sets defaultProvider + defaultModel. The early `auth set` path wrote
+        # the key to the default connector but left the created agent with
+        # defaultProvider="" → pi errored "No API key found for the selected
+        # model" on openrouter. DIVE-1269.
+        pi_provider="$provider"
+        read -r -s -p "  paste $provider API key: " pi_key; echo >&2
+        [[ -n "$pi_key" ]] || fail "$E_VALIDATION" "empty API key"
         ;;
     esac
     echo >&2
@@ -287,6 +292,16 @@ WELCOME
     # provider. Key on stdin so it never lands in argv/history.
     create_args+=("--provider=$byo_provider" "--api-key=-" "--auth-profile=$byo_provider")
     if ! printf '%s' "$byo_key" | 5dive agent create "${create_args[@]}" >&2; then
+      fail "$E_GENERIC" "failed to create agent — see logs above"
+    fi
+  elif [[ -n "$pi_provider" ]]; then
+    # pi BYO: provider + key (+ model for gateways like openrouter, already
+    # appended above) wired at create so it runs pi_apply_provider_key AND
+    # pi_apply_model_default — same path `agent create --provider` uses, so the
+    # agent boots with defaultProvider set and the key persisted. Key on stdin
+    # so it never lands in argv/history. DIVE-1269.
+    create_args+=("--provider=$pi_provider" "--api-key=-")
+    if ! printf '%s' "$pi_key" | 5dive agent create "${create_args[@]}" >&2; then
       fail "$E_GENERIC" "failed to create agent — see logs above"
     fi
   elif ! 5dive agent create "${create_args[@]}" >&2; then
