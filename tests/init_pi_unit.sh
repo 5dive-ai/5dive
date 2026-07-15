@@ -28,4 +28,8 @@ assert_has 'iso_default="sandboxed"' \
 assert_has '--isolation=$isolation' \
   "create must forward the chosen isolation tier"
 
+assert_has 'provider" == "openrouter"' "openrouter provider must trigger a model prompt"
+assert_has 'openrouter needs a model' "openrouter model must be required (empty rejected)"
+assert_has '--model=$pi_model' "chosen pi model must be pinned at create via --model"
+
 echo "PASS: init wizard exposes and provisions pi through the guarded paths"

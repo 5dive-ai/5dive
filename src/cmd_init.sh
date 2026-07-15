@@ -62,7 +62,7 @@ WELCOME
 
   # --- Step 3: auth ---
   local auth_ok=0
-  local byo_provider="" byo_key=""
+  local byo_provider="" byo_key="" pi_model=""
   # Probe current auth state — cmd_auth_status returns 0 if any creds exist.
   if 5dive agent auth status --probe --type="$type" --json 2>/dev/null | jq -e '.ok and (.data | any(.status == "ok"))' >/dev/null 2>&1; then
     echo "✓ $type already authenticated" >&2
@@ -146,6 +146,13 @@ WELCOME
         provider="${provider:-anthropic}"
         [[ -n "${PI_PROVIDER_VAR[$provider]:-}" ]] \
           || fail "$E_VALIDATION" "unknown pi provider '$provider' (choose: $providers)"
+        # openrouter is a multi-model gateway — pi can't route without an explicit
+        # model, so require one here and pin it at create via --model.
+        if [[ "$provider" == "openrouter" ]]; then
+          echo "  openrouter is a gateway — pick the model pi should route to (e.g. anthropic/claude-3.5-sonnet, deepseek/deepseek-chat)." >&2
+          read -r -p "  model: " pi_model
+          [[ -n "$pi_model" ]] || fail "$E_VALIDATION" "openrouter needs a model (none given)"
+        fi
         local key
         read -r -s -p "  paste $provider API key: " key; echo >&2
         [[ -n "$key" ]] || fail "$E_VALIDATION" "empty API key"
@@ -267,6 +274,8 @@ WELCOME
 
   # --- Step 6: create ---
   local -a create_args=("$name" "--type=$type" "--isolation=$isolation")
+  # pi + a gateway provider (openrouter) needs its model pinned at create -> pi_apply_model_default.
+  [[ -n "$pi_model" ]] && create_args+=("--model=$pi_model")
   if [[ "$channels" != "none" ]]; then
     create_args+=("--channels=$channels")
     [[ -n "$telegram_token" ]] && create_args+=("--telegram-token=$telegram_token")

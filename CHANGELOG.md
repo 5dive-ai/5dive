@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.9.8
+
+- feat(init): when pi's provider is `openrouter` (a multi-model gateway), `5dive init` now prompts for the model to route to and pins it at create via `--model` (DIVE-1262). openrouter can't route without an explicit model, so the prompt is required (empty rejected); the value flows into the pi agent's `defaultModel` via the existing pi_apply_model_default path. Direct providers (anthropic/openai/etc.) are unaffected — they use pi's provider default.
+
 ## 0.9.7
 
 - feat(install): supply-chain integrity check for the curl|bash installer (DIVE-1261). `build.sh` now publishes `5dive.sha256` alongside the bundle, and the installer fetches the bundle to a temp file, verifies it against the published checksum, then does a same-fs atomic swap into place. A checksum MISMATCH is fatal (corrupt download or tampered mirror); an absent/unfetchable checksum only WARNS so a box can't be bricked if the `.sha256` isn't published. Covers both the default install and `--upgrade` (both flow through `refresh_managed_files`). Integrity-check v1 — guards corruption + mirror tamper, not signing-strength (a future out-of-band-key signature would close the absent-checksum downgrade path). New unit `tests/install_checksum_unit.sh`.
