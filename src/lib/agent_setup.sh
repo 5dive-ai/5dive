@@ -28,6 +28,13 @@ TELEGRAM_AGENT_CLAUDE_MD="/usr/local/lib/5dive/telegram-agent-CLAUDE.md"
 # choice. The fragment's own first line scopes it to Fable sessions, so it is
 # inert on every other model — safe as a universal default.
 MODEL_TIERING_CLAUDE_MD="/usr/local/lib/5dive/model-tiering-CLAUDE.md"
+# DIVE-1210: project-subagent override that shadows the harness's built-in
+# Explore agent and pins it to haiku. Every claude agent's settings.json pins
+# model:"claude-opus-4-8" (below), and CC >=2.1.198 has Explore inherit the
+# main conversation's model (capped at Opus) instead of always running on
+# Haiku — so without this override, every Explore delegation (the bulk of a
+# session's file/code search calls) silently runs full Opus.
+EXPLORE_AGENT_MD="/usr/local/lib/5dive/explore-agent.md"
 
 # Preseed a claude-family agent's home dir so:
 #   - 'claude --dangerously-skip-permissions' doesn't hit the first-run
@@ -186,6 +193,20 @@ JSON
     sudo -u "$user" mkdir -p "$home/.claude/skills/notify-user"
     sudo -u "$user" cp "$AGENT_SKILLS_DIR/notify-user/SKILL.md" \
       "$home/.claude/skills/notify-user/SKILL.md"
+  fi
+
+  # DIVE-1210: every claude agent (not gated on channel) gets the haiku-pinned
+  # Explore override at $HOME/.claude/agents/, scoped "all your projects" so it
+  # applies regardless of which working directory the agent is in. Best-effort
+  # like the CLAUDE.md fragments below — a missing source file just leaves
+  # Explore on its harness default (inherit, i.e. this agent's pinned opus),
+  # never a broken agent.
+  if [[ -f "$EXPLORE_AGENT_MD" ]]; then
+    sudo -u "$user" mkdir -p "$home/.claude/agents"
+    sudo -u "$user" cp "$EXPLORE_AGENT_MD" "$home/.claude/agents/explore.md"
+    chmod 644 "$home/.claude/agents/explore.md"
+  else
+    warn "$EXPLORE_AGENT_MD missing — haiku-pinned Explore override not wired (run: curl -fsSL https://raw.githubusercontent.com/$(gh_org)/5dive/main/install.sh | sudo bash)"
   fi
 
   # Telegram agents also get a per-agent CLAUDE.md fragment carrying the
