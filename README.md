@@ -82,7 +82,7 @@ sudo 5dive agent pair   my-agent --code=<pairing-code>
 
 **Runs as a service, not a session.** Agents stay alive when you close the terminal. Message them from Telegram any time.
 
-**Every major agent CLI.** `claude`, `codex`, `antigravity`, `grok`, `openclaw`, `hermes`, `opencode`, all under one team.
+**Every major agent CLI.** `claude`, `codex`, `antigravity`, `grok`, `openclaw`, `hermes`, `opencode`, `pi`, all under one team.
 
 **Safe by default.** Each agent is its own Linux user under one of three isolation tiers. MIT, no open-core split.
 
@@ -120,6 +120,7 @@ No broker, no protocol, no orchestrator. Shared filesystem, shared CLI.
 | `hermes`      | third-party multi-provider harness | OAuth (OpenAI) / API key | Telegram, Discord |
 | `openclaw`    | third-party multi-provider harness | OAuth (OpenAI) / API key | Telegram, Discord |
 | `opencode`    | OpenCode               | API key | Telegram |
+| `pi`          | third-party multi-provider harness | API key / `--provider` | Telegram |
 
 <details>
 <summary><b>About <code>hermes</code> / <code>openclaw</code> (third-party multi-provider harnesses)</b></summary>
