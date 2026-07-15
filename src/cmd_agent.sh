@@ -72,11 +72,32 @@ cmd_list() {
     # `set -e` (DIVE-230).
     amodel=$(resolve_agent_model "$ltype" "$name" || true)
     aeffort=$(resolve_agent_effort "$ltype" "$name" || true)
+    # DIVE-1219: surface reachability/autonomy health so the dashboard can badge
+    # agents that look up-and-running but are silently broken. Mirrors the
+    # DIVE-1197 create-time self-check, computed here for the live fleet:
+    #   deaf   — a telegram/discord channel with an empty allowlist (nobody paired,
+    #            so every inbound DM is refused). Absent when the agent has no
+    #            personal-bot channel.
+    #   asleep — heartbeat not enabled (won't self-act on board work).
+    # Best-effort file reads, `|| echo 0/false` guarded so a missing/garbled
+    # access.json can never abort the list under `set -e`.
+    local hdeaf="false" hasleep="false" _hc_ch _hc_access _hc_nallow _hc_hb
+    for _hc_ch in telegram discord; do
+      case ",${lchan}," in *",${_hc_ch},"*) ;; *) continue ;; esac
+      _hc_access="/home/agent-${name}/.${ltype}/channels/${_hc_ch}/access.json"
+      _hc_nallow=0
+      [[ -f "$_hc_access" ]] && _hc_nallow=$(jq -r '(.allowFrom // []) | length' "$_hc_access" 2>/dev/null || echo 0)
+      (( _hc_nallow == 0 )) && hdeaf="true"
+    done
+    _hc_hb=$(jq -r --arg n "$name" '.agents[$n].heartbeat.enabled // false' <<<"$reg" 2>/dev/null || echo false)
+    [[ "$_hc_hb" == "true" ]] || hasleep="true"
     enriched=$(jq -c --arg n "$name" --arg a "$active" --arg e "$sub" --argjson b2b "$b2b" \
       --arg model "$amodel" --arg effort "$aeffort" \
+      --argjson hdeaf "$hdeaf" --argjson hasleep "$hasleep" \
       '.[$n] = {active: $a, enabled: $e, botToBotEnabled: $b2b,
                 model: (if $model == "" then null else $model end),
-                effort: (if $effort == "" then null else $effort end)}' <<<"$enriched")
+                effort: (if $effort == "" then null else $effort end),
+                health: {deaf: $hdeaf, asleep: $hasleep}}' <<<"$enriched")
   done
   local merged
   merged=$(jq -c --arg default_wd "$DEFAULT_WORKDIR" --argjson live "$enriched" '.agents | to_entries | map({
@@ -93,7 +114,8 @@ cmd_list() {
     enabled: ($live[.key].enabled // "unknown"),
     botToBotEnabled: ($live[.key].botToBotEnabled // false),
     model: ($live[.key].model // null),
-    effort: ($live[.key].effort // null)
+    effort: ($live[.key].effort // null),
+    health: ($live[.key].health // null)
   })' <<<"$reg")
   if (( JSON_MODE )); then
     echo "$merged" | jq -c '{ok:true, data: .}'
