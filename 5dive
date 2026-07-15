@@ -27578,6 +27578,8 @@ Exit codes (also surfaced as error.code in --json mode):
   0 ok       2 usage       3 validation   4 not_found    5 conflict
   6 auth_required  7 not_installed  8 not_running  9 pairing
   10 permission  11 timeout         1 generic
+
+Full docs: https://5dive.ai/docs/5dive-cli
 USAGE
 }
 
