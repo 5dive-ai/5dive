@@ -1460,21 +1460,25 @@ cmd_task_need() {
   #   0 = auto-clear: the recommendation applies immediately, no ping, digest line
   #   1 = agent-clearable; 48h unanswered -> the heartbeat TTL sweep applies the rec
   #   2 = hard human gate: never auto-applies, TTL only batches reminder pings
-  # Defaults by type when --tier is omitted: decision -> 1 (agents legitimately
-  # resolve these; the human blanket-cleared them in practice), approval/manual/
-  # secret -> 2 (today's behavior, unchanged). Explicit --tier can lower an
-  # approval/decision/manual gate, EXCEPT: a secret gate is always tier 2, and
-  # the T2 category floor below overrides everything.
+  # Defaults by type when --tier is omitted: decision/approval -> 1 (agents
+  # legitimately resolve these; "approve this ship/close/commit" is the most
+  # common builder gate and the human blanket-cleared them in practice), manual/
+  # secret -> 2. Explicit --tier can lower an approval/decision/manual gate,
+  # EXCEPT: a secret gate is always tier 2, and the T2 category floor below
+  # overrides everything (money/public-comms/secrets/destructive/brand still
+  # route to a human regardless of this default — see _gate_tier2_floor_hit).
+  # DIVE-1284: default 'approval' to tier 1 too — the old default sent the bulk
+  # of delegatable ship/close/commit approvals straight to the paired human.
   # DIVE-1182: remember whether --tier was EXPLICIT (a caller's hard-human
-  # contract) vs. only the type default. approval/manual/secret default to tier 2,
-  # so the effective tier alone can't tell "builder ship-gate" from "caller pinned
+  # contract) vs. only the type default. manual/secret default to tier 2, so the
+  # effective tier alone can't tell "builder ship-gate" from "caller pinned
   # hard-human"; the routing predicate below needs the explicit signal.
   local tier_arg="$tier"
   if [[ -n "$tier" ]]; then
     [[ "$tier" == "0" || "$tier" == "1" || "$tier" == "2" ]] \
       || fail "$E_VALIDATION" "bad --tier '$tier' (0=auto-clear | 1=48h-TTL-applies-rec | 2=hard human gate)"
   else
-    case "$type" in decision) tier=1 ;; *) tier=2 ;; esac
+    case "$type" in decision|approval) tier=1 ;; *) tier=2 ;; esac  # DIVE-1284
   fi
   local tier_floored=0
   if [[ "$tier" != "2" ]]; then

@@ -248,12 +248,14 @@ cmd_task_need DIVE-1232 --type=decision --ask="$ASK_AU" --options="yes|no" >/dev
 eq_t "autoclear A4: auto seed blocks"         "$(field DIVE-1232 status)"           "blocked"
 eq_t "autoclear A4: auto seed unanswered"     "$(field DIVE-1232 need_answered_at)" "∅"
 
-# A5: T2 never auto-clears — an approval gate defaults tier 2, ineligible.
+# A5: T2 never auto-clears — a tier-2 approval gate is ineligible.
+# (DIVE-1284: `approval` now DEFAULTS to tier-1, so pin --tier=2 to test the T2
+# guard; a bare default-tier approval is exercised by gate_approval_routing_unit.)
 ASK_T2="approve the migration runbook"; SHAPE_T2="$(_gate_ask_shape "$ASK_T2")"
 seed_prec_by DIVE-1240 approval 2 "$SHAPE_T2" approved "human:mark"
 seed_prec_by DIVE-1241 approval 2 "$SHAPE_T2" approved "human:mark"
 seed_task DIVE-1242
-cmd_task_need DIVE-1242 --type=approval --ask="$ASK_T2" >/dev/null 2>&1
+cmd_task_need DIVE-1242 --type=approval --ask="$ASK_T2" --tier=2 >/dev/null 2>&1
 eq_t "autoclear A5: T2 tier unchanged"        "$(field DIVE-1242 tier)"             "2"
 eq_t "autoclear A5: T2 stays blocked"         "$(field DIVE-1242 status)"           "blocked"
 eq_t "autoclear A5: T2 unanswered"            "$(field DIVE-1242 need_answered_at)" "∅"
