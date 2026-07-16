@@ -1154,6 +1154,7 @@ cmd_auth_login() {
       # for the pasted code. Run directly at the terminal here, the user picks
       # "Google OAuth", opens the printed URL, and pastes the authorization
       # code — no 30s race.
+      echo "Antigravity stays open after sign-in. When authentication completes, type /exit to return to your shell." >&2
       exec sudo -u claude -i env $extra_env bash -lc 'agy --prompt-interactive ping' ;;
     grok)
       # grok has both an interactive UI OAuth (localhost callback, no good

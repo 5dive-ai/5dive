@@ -173,6 +173,89 @@ _init_review_row() {
   printf '    %-14s %s\n' "$1" "$2" >&2
 }
 
+# Drive Antigravity's existing detached auth-session API from the TTY wizard.
+# The direct `auth login antigravity` command must hand the terminal to agy's
+# interactive UI because agy's one-shot mode has a fixed, short OAuth timeout.
+# That is a poor fit for `init`: after authentication agy remains open until the
+# user discovers `/exit`, so the create flow appears stuck. The detached flow
+# already knows how to select Google OAuth, capture agy's long URL, submit the
+# callback code, and detect the credential sentinel. Reusing it here lets init
+# regain control as soon as authentication completes.
+_init_antigravity_login() {
+  local start_json poll_json sid="" state="" url="" code="" error=""
+  local attempt
+
+  start_json=$(5dive agent auth start antigravity --json) \
+    || fail "$E_AUTH_REQUIRED" "could not start Antigravity sign-in"
+  sid=$(jq -r 'if .ok then (.data.sessionId // empty) else empty end' <<<"$start_json")
+  [[ -n "$sid" ]] \
+    || fail "$E_AUTH_REQUIRED" "Antigravity sign-in did not return a session id"
+
+  _init_note "Preparing Google sign-in…"
+  for ((attempt = 0; attempt < 120; attempt++)); do
+    if ! poll_json=$(5dive agent auth poll "$sid" --json); then
+      5dive agent auth cancel "$sid" --json >/dev/null 2>&1 || true
+      fail "$E_AUTH_REQUIRED" "could not read Antigravity sign-in state"
+    fi
+    state=$(jq -r 'if .ok then (.data.state // "error") else "error" end' <<<"$poll_json")
+    case "$state" in
+      awaiting_code)
+        url=$(jq -r '.data.url // empty' <<<"$poll_json")
+        [[ -n "$url" ]] || { sleep 0.25; continue; }
+        _init_note "Open this URL in your browser:"
+        printf '  %s\n\n' "$url" >&2
+        _init_secret code "Authorization code"
+        if [[ -z "$code" ]]; then
+          5dive agent auth cancel "$sid" --json >/dev/null 2>&1 || true
+          fail "$E_VALIDATION" "empty authorization code"
+        fi
+        if ! 5dive agent auth submit "$sid" --code="$code" --json >/dev/null; then
+          5dive agent auth cancel "$sid" --json >/dev/null 2>&1 || true
+          fail "$E_AUTH_REQUIRED" "Antigravity rejected the authorization code"
+        fi
+        break
+        ;;
+      ok)
+        _init_ok "Antigravity sign-in complete"
+        return 0
+        ;;
+      error|expired)
+        error=$(jq -r '.data.error // "sign-in session ended"' <<<"$poll_json")
+        fail "$E_AUTH_REQUIRED" "Antigravity sign-in failed: $error"
+        ;;
+    esac
+    sleep 0.25
+  done
+
+  [[ -n "$code" ]] || {
+    5dive agent auth cancel "$sid" --json >/dev/null 2>&1 || true
+    fail "$E_AUTH_REQUIRED" "Antigravity did not present a Google sign-in URL"
+  }
+
+  _init_note "Finishing Antigravity sign-in…"
+  for ((attempt = 0; attempt < 240; attempt++)); do
+    if ! poll_json=$(5dive agent auth poll "$sid" --json); then
+      5dive agent auth cancel "$sid" --json >/dev/null 2>&1 || true
+      fail "$E_AUTH_REQUIRED" "could not read Antigravity sign-in state"
+    fi
+    state=$(jq -r 'if .ok then (.data.state // "error") else "error" end' <<<"$poll_json")
+    case "$state" in
+      ok)
+        _init_ok "Antigravity sign-in complete"
+        return 0
+        ;;
+      error|expired)
+        error=$(jq -r '.data.error // "sign-in session ended"' <<<"$poll_json")
+        fail "$E_AUTH_REQUIRED" "Antigravity sign-in failed: $error"
+        ;;
+    esac
+    sleep 0.25
+  done
+
+  5dive agent auth cancel "$sid" --json >/dev/null 2>&1 || true
+  fail "$E_AUTH_REQUIRED" "Antigravity sign-in did not finish in time"
+}
+
 cmd_init() {
   # Fail fast before any prompts: every step the wizard drives (agent install /
   # create, channel wiring) is root-only — without this guard an unprivileged
@@ -298,7 +381,12 @@ cmd_init() {
             ;;
         esac
         ;;
-      openclaw|antigravity|grok)
+      antigravity)
+        _init_note "Opening Antigravity's Google sign-in…"
+        _init_antigravity_login
+        auth_summary="Google sign-in"
+        ;;
+      openclaw|grok)
         _init_note "Opening ${type_label[$type]}'s interactive sign-in…"
         5dive agent auth login "$type" || fail "$E_AUTH_REQUIRED" "auth failed"
         auth_summary="Interactive sign-in"
