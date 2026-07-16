@@ -244,9 +244,34 @@ if [[ "$TYPE" == "codex" ]]; then
   AGENT_CODEX_HOME="$HOME/.codex"
   install -d -m 700 "$AGENT_CODEX_HOME"
   SHARED_AUTH="${PROFILE_STATE_DIR:+$PROFILE_STATE_DIR/auth.json}"
-  SHARED_AUTH="${SHARED_AUTH:-/home/claude/.codex/auth.json}"
+  # DIVE-1322: no bound profile → read the canonical shared codex profile
+  # (/var/lib/5dive/auth-profiles/codex/codex/auth.json) DIRECTLY rather than
+  # /home/claude/.codex/auth.json. The latter is a convenience symlink that is
+  # (re)created lazily at codex-login time, so a codex agent booting before it
+  # exists found no source, failed to seed, and codex then minted a bogus
+  # apikey auth.json from a stray OPENAI_API_KEY env var (401, silently deaf).
+  # The profile file is provisioned at host setup and is stable. Keep the
+  # symlink as a legacy fallback for a box whose canonical profile is unpopulated.
+  if [[ -z "$SHARED_AUTH" ]]; then
+    SHARED_AUTH="/var/lib/5dive/auth-profiles/codex/codex/auth.json"
+    { [[ -e "$SHARED_AUTH" ]] || sudo -n test -e "$SHARED_AUTH" 2>/dev/null; } \
+      || SHARED_AUTH="/home/claude/.codex/auth.json"
+  fi
   LOCAL_AUTH="$AGENT_CODEX_HOME/auth.json"
-  if [[ -e "$SHARED_AUTH" ]] && { [[ ! -f "$LOCAL_AUTH" ]] || [[ "$SHARED_AUTH" -nt "$LOCAL_AUTH" ]]; }; then
+  # DIVE-1322: re-seed when codex has already written a bad apikey auth.json
+  # while the shared source is a valid chatgpt-oauth credential. Without this,
+  # the mtime check below never fires (the local file isn't older), so a
+  # once-deaf agent stayed deaf across restarts — and `config set
+  # auth-profile=codex` + restart never re-seeded the credential either.
+  RESEED_BAD_LOCAL=0
+  if [[ -f "$LOCAL_AUTH" ]] \
+     && { grep -q '"auth_mode"[[:space:]]*:[[:space:]]*"apikey"' "$LOCAL_AUTH" 2>/dev/null \
+          || ! grep -q '"auth_mode"[[:space:]]*:[[:space:]]*"chatgpt"' "$LOCAL_AUTH" 2>/dev/null; } \
+     && { grep -q '"auth_mode"[[:space:]]*:[[:space:]]*"chatgpt"' "$SHARED_AUTH" 2>/dev/null \
+          || sudo -n grep -q '"auth_mode"[[:space:]]*:[[:space:]]*"chatgpt"' "$SHARED_AUTH" 2>/dev/null; }; then
+    RESEED_BAD_LOCAL=1
+  fi
+  if [[ -e "$SHARED_AUTH" ]] && { [[ ! -f "$LOCAL_AUTH" ]] || [[ "$SHARED_AUTH" -nt "$LOCAL_AUTH" ]] || (( RESEED_BAD_LOCAL )); }; then
     TMP="$(mktemp -p "$AGENT_CODEX_HOME" .auth.XXXXXX)"
     # DIVE-1188: standard-isolation agents have NO passwordless sudo, so the old
     # `sudo -n cat` bailed and the agent booted unauthenticated. The profile
