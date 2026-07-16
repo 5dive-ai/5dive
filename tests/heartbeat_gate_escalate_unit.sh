@@ -96,5 +96,46 @@ ans=$(db "SELECT COALESCE(need_answered_at,'NULL') FROM tasks WHERE id=${gid};")
   && ok_t "escalation NEVER auto-answers the T2 gate (need_answered_at still NULL)" \
   || bad_t "T2 gate was auto-answered by escalation" "need_answered_at=$ans"
 
+# --- DIVE-1298: tier-1 48h TTL applies the recommendation -------------------
+# The core "missed taps auto-resolve" contract (DIVE-891 pass 2 of the sweep):
+# a tier-1 gate with a recommendation, unanswered past 48h, is auto-closed with
+# provenance auto:ttl / uid 0 and the task is unblocked. Under 48h, or with no
+# recommendation, it must NOT auto-apply.
+mk_t1_gate() {  # <assignee> <hours_old> <recommend|-> ; echoes id
+  local rec="NULL"; [[ "$3" != "-" ]] && rec="$(sqlq "$3")"
+  db "INSERT INTO tasks (title, priority, assignee, created_by, kind, status,
+                         need_type, tier, ask, recommend, need_asked_at)
+      VALUES ('t1 gate', 'medium', $(sqlq "$1"), 'main', 'standard', 'blocked',
+              'decision', 1, 'lead call', ${rec}, datetime('now','-$2 hours'));
+      SELECT last_insert_rowid();"
+}
+
+# Case 6: tier-1 gate + rec, 60h old (>48h) → rec applied, auto:ttl, unblocked
+reset
+gid=$(mk_t1_gate worker 60 approve)
+_hb_gate_ttl_sweep
+row=$(db "SELECT COALESCE(need_answer,'x')||'|'||COALESCE(need_answered_by,'x')||'|'||COALESCE(need_answered_uid,'x')||'|'||status FROM tasks WHERE id=${gid};")
+[[ "$row" == "approve|auto:ttl|0|todo" ]] \
+  && ok_t "T1 gate >48h: rec applied via auto:ttl (uid 0) + task unblocked to todo" \
+  || bad_t "T1 48h TTL did not apply the rec as expected" "got=[$row] want=[approve|auto:ttl|0|todo]"
+
+# Case 7: tier-1 gate + rec, only 24h old (<48h) → left untouched
+reset
+gid=$(mk_t1_gate worker 24 approve)
+_hb_gate_ttl_sweep
+ans=$(db "SELECT COALESCE(need_answered_at,'NULL') FROM tasks WHERE id=${gid};")
+[[ "$ans" == "NULL" ]] \
+  && ok_t "T1 gate <48h: NOT auto-applied (still open)" \
+  || bad_t "T1 gate auto-applied before 48h" "need_answered_at=$ans"
+
+# Case 8: tier-1 gate with NO recommendation, 60h old → falls through, not applied
+reset
+gid=$(mk_t1_gate worker 60 -)
+_hb_gate_ttl_sweep
+ans=$(db "SELECT COALESCE(need_answered_at,'NULL') FROM tasks WHERE id=${gid};")
+[[ "$ans" == "NULL" ]] \
+  && ok_t "T1 gate w/o recommendation: never auto-applied (routes to T2 reminder)" \
+  || bad_t "rec-less T1 gate was auto-applied" "need_answered_at=$ans"
+
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]
