@@ -7,6 +7,16 @@ audit_init() {
   [[ -f "$AUDIT_LOG" ]] || : > "$AUDIT_LOG"
   chown root:claude "$AUDIT_LOG"
   chmod 640 "$AUDIT_LOG"
+  # DIVE-1345: a group-writable subdir for agent-filed diagnostic logs
+  # (gate-notify.log). The parent stays 2750 so the tamper-evident audit log is
+  # never exposed to group writes; only this purpose-built subdir is 2770 (setgid
+  # + group-write, same shape as TASKS_DIR) so gate notifies running AS the agent
+  # (group claude, NOT root) can create/append the log instead of silently
+  # falling back to stderr — the DIVE-1344 observability gap.
+  local notify_dir="$dir/notify"
+  [[ -d "$notify_dir" ]] || mkdir -p "$notify_dir"
+  chown root:claude "$notify_dir"
+  chmod 2770 "$notify_dir"
 }
 
 # _emit_audit_line <ndjson-line> — append one line to the tamper-evident log

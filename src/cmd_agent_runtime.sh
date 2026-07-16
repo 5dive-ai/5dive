@@ -241,9 +241,12 @@ _mirror_post() {
 # the reply_markup byte-length (the prime suspect for the 64-byte callback_data /
 # oversized-keyboard classes of rejection) and the chat/thread it targeted. Best-
 # effort and totally silent on failure: this runs on the gate-notify path AFTER
-# the DB UPDATE already committed, so it must never fail the caller. Writes to the
-# root-owned /var/log/5dive dir when writable (the mirror fires under sudo), else
-# falls back to stderr so a CLI-only / OSS box still surfaces it.
+# the DB UPDATE already committed, so it must never fail the caller.
+# DIVE-1344/1345: writes to the group-writable /var/log/5dive/notify subdir
+# (audit_init ensures it 2770). The gate mirror fires AS THE AGENT (group claude,
+# NOT root), so the old parent-dir write (2750) ALWAYS failed and the line was
+# lost to the stderr fallback — the file was never created. Falls back to stderr
+# on a CLI-only / OSS box where the dir isn't provisioned.
 _mirror_log_button_reject() {
   local chat="$1" thread="$2" reply_markup="$3" resp="$4"
   local ec desc
@@ -252,8 +255,12 @@ _mirror_log_button_reject() {
   local line
   line=$(printf 'gate-button-reject chat=%s thread=%s rm_bytes=%s error_code=%s description=%q' \
            "$chat" "${thread:-none}" "${#reply_markup}" "$ec" "$desc")
-  local logf="/var/log/5dive/gate-notify.log"
-  if { : >>"$logf"; } 2>/dev/null; then
+  local logf="/var/log/5dive/notify/gate-notify.log"
+  # umask 0002 so a freshly created file is group-writable (664) and EVERY agent
+  # (all group claude) can append, not just its creator; chmod g+w best-effort
+  # upgrades a 644 file a prior root-context write may have left behind.
+  if ( umask 0002; : >>"$logf" ) 2>/dev/null; then
+    chmod g+w "$logf" 2>/dev/null || true
     printf '%s %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || echo '?')" "$line" >>"$logf" 2>/dev/null || true
   else
     printf '[5dive] %s\n' "$line" >&2 2>/dev/null || true
