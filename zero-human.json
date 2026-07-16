@@ -1,18 +1,18 @@
 {
-  "generatedAtUtc": "2026-07-15T02:40:05Z",
-  "date": "2026-07-15",
+  "generatedAtUtc": "2026-07-16T02:40:05Z",
+  "date": "2026-07-16",
   "week": {
-    "shipped": 135,
-    "humanAsks": 18
+    "shipped": 190,
+    "humanAsks": 27
   },
   "day": {
-    "shipped": 36,
-    "humanAsks": 2
+    "shipped": 64,
+    "humanAsks": 9
   },
   "cumulative": {
-    "daysPublished": 5,
-    "shipped": 111,
-    "humanAsks": 15,
+    "daysPublished": 6,
+    "shipped": 175,
+    "humanAsks": 24,
     "since": "2026-07-11"
   },
   "cliVersion": "0.8.22",
