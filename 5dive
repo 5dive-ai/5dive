@@ -15592,7 +15592,12 @@ cmd_task_ls() {
     # DIVE-583: emit project_key natively so the dashboard keys off a real field
     # (join name/prefix/lead from `project ls`) instead of deriving project from
     # the ident prefix client-side (fragile; couples to naming + the id≠ident bug).
-    rows=$(dbfmt -json "SELECT id, ident, title, status, priority, assignee, created_by, parent_id, created_at, done_at, body, result, need_type, ask, need_options, recommend, precedent_ref, precedent_kind, need_answer, need_answered_at, need_answered_by, tier, kind, schedule, last_fired_at, parked_at, park_reason, wake_at, project_key FROM tasks WHERE ${where} ${order};")
+    # DIVE-1347: emit gate_live — the canonical "still-answerable human gate"
+    # flag, IDENTICAL to the `task inbox` predicate (need_type set, not yet
+    # answered, task still open). Consumers/dashboards MUST count/filter on this,
+    # never raw `need_type != null` (which retains a STALE type after a gate is
+    # consumed or the task is re-blocked on a dependency, over-reporting the inbox).
+    rows=$(dbfmt -json "SELECT id, ident, title, status, priority, assignee, created_by, parent_id, created_at, done_at, body, result, need_type, ask, need_options, recommend, precedent_ref, precedent_kind, need_answer, need_answered_at, need_answered_by, tier, kind, schedule, last_fired_at, parked_at, park_reason, wake_at, project_key, CASE WHEN need_type IS NOT NULL AND need_answered_at IS NULL AND status NOT IN ('done','cancelled') THEN 1 ELSE 0 END AS gate_live FROM tasks WHERE ${where} ${order};")
     [[ -n "$rows" ]] || rows="[]"
     # Feed rows via stdin, not --argjson: a big board (179+ tasks w/ bodies)
     # blows past MAX_ARG_STRLEN (128K per argv string) -> execve E2BIG
