@@ -40,9 +40,9 @@ cmd_auth_set opencode --api-key=sk-or-test-123456 --provider=openrouter
   || bad_t "auth set OpenRouter routing" "got '$(<"$capture")'"
 
 init_src=$(<src/cmd_init.sh)
-[[ "$init_src" == *'provider [default openrouter]:'* ]] \
-  && ok_t "init prompts for provider with OpenRouter default" \
-  || bad_t "missing provider prompt"
+[[ "$init_src" == *'Choose a provider for OpenCode:'* && "$init_src" == *'openrouter|OpenRouter|Broad model catalog · recommended'* ]] \
+  && ok_t "init uses the provider picker with OpenRouter first/recommended" \
+  || bad_t "missing OpenCode provider picker"
 [[ "$init_src" == *'agent auth set opencode --api-key=- --provider="$provider"'* ]] \
   && ok_t "init forwards selected provider to auth set" \
   || bad_t "provider is not forwarded"

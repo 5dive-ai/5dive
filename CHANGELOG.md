@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- feat(init): redesign the first-run wizard as a polished four-stage TTY onboarding flow with arrow-key menus, explicit Codex/Claude authentication choices, live-masked API-key and bot-token input, early agent-name validation, deterministic provider pickers, terminal-aware styling, a pre-create review/cancel checkpoint, and clearer completion guidance (DIVE-1326). `TERM=dumb` retains a numbered fallback and `NO_COLOR` disables styling.
+
 ## 0.9.14
 
 - fix(agent): `agent import <slug|pack> --type=<codex|pi|opencode|claude|…>` now honors the requested runtime instead of silently taking the pack's baked-in type, making a marketplace/persona hire harness-agnostic (DIVE-1317). Explicit `--type`/`--model`/`--effort` override the manifest for pack imports (they were previously consumed only in `--from-persona` mode), the resolved type is validated up front with a clear error, and `--from-persona` behavior is unchanged (still defaults to claude).
