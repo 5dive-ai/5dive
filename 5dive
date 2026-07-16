@@ -26,7 +26,7 @@ esac
 
 # Bumped on every public release. `build.sh` checks this line exists; CI fails
 # the bundle-drift check if it's missing or empty.
-readonly FIVE_VERSION="0.9.18"
+readonly FIVE_VERSION="0.9.19"
 
 # GitHub org our repos live under. The org is being renamed
 # 5dive-com -> 5dive-ai (2026-06); fetches must work on either side of the
@@ -11130,8 +11130,41 @@ _mirror_post() {
   # while the plain text would deliver. The text alert is load-bearing
   # (DIVE-105), so retry once WITHOUT the keyboard — the ping must never be lost
   # to a button problem.
+  # DIVE-1338: the retry above USED to swallow the error resp, so a human got a
+  # no-button ping and we never learned WHY Telegram rejected the keyboard (this
+  # is lodar's recurring DIVE-1320 no-button, systemic across every gate whose
+  # keyboard-send is rejected). Before the fallback, capture the actual rejection
+  # (error_code + description) so the reason is finally visible and STEP 2 can
+  # root-cause it. Only log when a keyboard was in play — a plain-text failure is
+  # a different (delivery) problem, not a button one.
   if [[ -n "$reply_markup" ]]; then
+    _mirror_log_button_reject "$chat" "$thread" "$reply_markup" "$resp"
     _mirror_send "$token" "$chat" "$thread" "$text" "" >/dev/null 2>&1 || true
+  fi
+}
+
+# DIVE-1338: emit ONE diagnostic line when a button-bearing gate ping is rejected
+# by Telegram, so the swallowed reply_markup rejection is finally observable. We
+# record error_code + description (the two fields Telegram returns on a 400) plus
+# the reply_markup byte-length (the prime suspect for the 64-byte callback_data /
+# oversized-keyboard classes of rejection) and the chat/thread it targeted. Best-
+# effort and totally silent on failure: this runs on the gate-notify path AFTER
+# the DB UPDATE already committed, so it must never fail the caller. Writes to the
+# root-owned /var/log/5dive dir when writable (the mirror fires under sudo), else
+# falls back to stderr so a CLI-only / OSS box still surfaces it.
+_mirror_log_button_reject() {
+  local chat="$1" thread="$2" reply_markup="$3" resp="$4"
+  local ec desc
+  ec=$(jq -r '.error_code // "?"' <<<"$resp" 2>/dev/null) || ec="?"
+  desc=$(jq -r '.description // "?"' <<<"$resp" 2>/dev/null) || desc="?"
+  local line
+  line=$(printf 'gate-button-reject chat=%s thread=%s rm_bytes=%s error_code=%s description=%q' \
+           "$chat" "${thread:-none}" "${#reply_markup}" "$ec" "$desc")
+  local logf="/var/log/5dive/gate-notify.log"
+  if { : >>"$logf"; } 2>/dev/null; then
+    printf '%s %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || echo '?')" "$line" >>"$logf" 2>/dev/null || true
+  else
+    printf '[5dive] %s\n' "$line" >&2 2>/dev/null || true
   fi
 }
 
