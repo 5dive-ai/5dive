@@ -75,7 +75,7 @@ cmd_doctor() {
   done
   (( want_fix && ! dry )) && DOCTOR_REPAIR=1
   case "$filter" in
-    ""|deps|types|auth|creds|registry|shelld|channels|host|memory) ;;
+    ""|deps|types|auth|creds|registry|shelld|channels|host|memory|policy) ;;
     *) fail "$E_USAGE" "unknown --category (deps|types|auth|creds|registry|shelld|channels|host|memory|policy)" ;;
   esac
 
