@@ -59,6 +59,24 @@ resolve_bun() {
   return 1
 }
 
+# OpenClaw is an npm launcher with `#!/usr/bin/env node`, but systemd does not
+# inherit claude's interactive nvm PATH. Prefer the stable link installed by
+# 5dive, then nvm's resolved Node 24, then any compatible on-disk Node 24. This
+# also keeps older boxes working before their next `agent install --upgrade`.
+resolve_openclaw_node() {
+  local c
+  if declare -F nvm >/dev/null 2>&1; then
+    c="$(nvm which 24 2>/dev/null || true)"
+    [[ -n "$c" && -x "$c" ]] && { printf '%s\n' "$c"; return 0; }
+  fi
+  [[ -x /home/claude/.local/bin/node ]] \
+    && { printf '%s\n' /home/claude/.local/bin/node; return 0; }
+  for c in /home/claude/.nvm/versions/node/v24.*/bin/node; do
+    [[ -x "$c" ]] && { printf '%s\n' "$c"; return 0; }
+  done
+  return 1
+}
+
 
 # openclaw splits "the agent that runs and answers chat messages"
 # (`openclaw gateway run`) from "the local TUI for talking to that
@@ -70,11 +88,19 @@ resolve_bun() {
 # the case (only `none|""` runs chat) so any future channel type added
 # via valid_channel automatically routes to the gateway without
 # requiring a parallel update here.
+OPENCLAW_PATH_OVERRIDE=""
 case "$TYPE" in
   claude)   BIN="/home/claude/.local/bin/claude"; ARGS=(--dangerously-skip-permissions) ;;
   hermes)   BIN="/home/claude/.local/bin/hermes"; ARGS=() ;;
   openclaw)
     BIN="/home/claude/.local/bin/openclaw"
+    OPENCLAW_NODE_BIN="$(resolve_openclaw_node)" \
+      || { echo "node not found for openclaw (need Node 24; run: 5dive agent install openclaw --upgrade)" >&2; exit 3; }
+    OPENCLAW_NODE_DIR="${OPENCLAW_NODE_BIN%/*}"
+    export PATH="${OPENCLAW_NODE_DIR}:/home/claude/.local/bin:${PATH}"
+    # tmux starts a fresh login shell, whose startup files may replace PATH.
+    # Re-assert the resolved Node directory inside that shell before exec.
+    OPENCLAW_PATH_OVERRIDE="export PATH=$(printf %q "$OPENCLAW_NODE_DIR"):/home/claude/.local/bin:\$PATH; "
     case "$CHANNELS" in
       none|"") ARGS=(chat) ;;
       *)       ARGS=(gateway run) ;;
@@ -974,17 +1000,17 @@ fi
 
 CMD_STR=$(printf '%q ' "$BIN" "${ARGS[@]}")
 
-# First-attach onboarding for openclaw with no channel: openclaw chat is the
-# bare TUI and never surfaces channel setup, so a non-technical user has no
-# obvious way to wire telegram/discord/etc. after agent create. Run
-# `openclaw configure` once on first attach so the user sees the channel
-# wizard, then drop into chat (and stay there on every subsequent attach).
-# Sentinel lives in $HOME/.openclaw so it's per-agent; rm it to re-run.
+# Headless first-boot for openclaw with no channel. The old prelude ran the
+# interactive `openclaw configure` wizard inside the unattended tmux session;
+# agent ask then typed into that wizard and timed out instead of reaching chat.
+# `config set` is OpenClaw's non-interactive configuration surface. Seed the
+# runtime prerequisite here and enter chat immediately. The sentinel is
+# per-agent; removing it safely re-runs this idempotent bootstrap.
 PRELUDE=""
 if [[ "$TYPE" == "openclaw" ]] && [[ "$CHANNELS" == "none" || -z "$CHANNELS" ]]; then
   SENTINEL_Q=$(printf %q "$HOME/.openclaw/.5dive-bootstrapped")
   BIN_Q=$(printf %q "$BIN")
-  PRELUDE="[[ -e ${SENTINEL_Q} ]] || { mkdir -p $(printf %q "$HOME/.openclaw"); ${BIN_Q} configure; touch ${SENTINEL_Q}; }; "
+  PRELUDE="[[ -e ${SENTINEL_Q} ]] || { mkdir -p $(printf %q "$HOME/.openclaw"); ${BIN_Q} config set gateway.mode local && touch ${SENTINEL_Q}; }; "
 fi
 
 # When a resume id is armed, the first loop iteration launches with
@@ -1031,7 +1057,7 @@ else
   LOOP="while true; do ${CMD_STR}; sleep 2; done"
 fi
 
-INNER="unset CLAUDE_CONFIG_DIR ${UNSET_CREDS}; ${STAGE_GUARD}${CODEX_OVERRIDE}${OPENCODE_OVERRIDE}${PI_OVERRIDE}${PRELUDE}${LOOP}"
+INNER="unset CLAUDE_CONFIG_DIR ${UNSET_CREDS}; ${STAGE_GUARD}${OPENCLAW_PATH_OVERRIDE}${CODEX_OVERRIDE}${OPENCODE_OVERRIDE}${PI_OVERRIDE}${PRELUDE}${LOOP}"
 [[ -n "$PROFILE" ]] && echo "[5dive] agent=${NAME} using auth-profile=${PROFILE}" >&2
 
 /usr/bin/tmux new-session -d -s "$SESSION" -c "$WORKDIR" \
