@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+## 0.9.14
+
+- fix(agent): `agent import <slug|pack> --type=<codex|pi|opencode|claude|…>` now honors the requested runtime instead of silently taking the pack's baked-in type, making a marketplace/persona hire harness-agnostic (DIVE-1317). Explicit `--type`/`--model`/`--effort` override the manifest for pack imports (they were previously consumed only in `--from-persona` mode), the resolved type is validated up front with a clear error, and `--from-persona` behavior is unchanged (still defaults to claude).
+
 - feat(agent): `agent create --type=opencode --provider=openrouter --api-key=… --model=…` now stores the key as OpenCode's native `OPENROUTER_API_KEY` and pins the new agent's default as `openrouter/<model>` in its merge-safe `opencode.json` (DIVE-1206). This enables OpenRouter-hosted DeepSeek, GLM, Kimi, and Qwen models without an interactive `/connect` or `/models` step; the existing OpenAI provider and `agent auth set opencode` paths remain compatible.
 
 ## 0.9.13

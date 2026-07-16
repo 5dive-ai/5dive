@@ -26,7 +26,7 @@ esac
 
 # Bumped on every public release. `build.sh` checks this line exists; CI fails
 # the bundle-drift check if it's missing or empty.
-readonly FIVE_VERSION="0.9.13"
+readonly FIVE_VERSION="0.9.14"
 
 # GitHub org our repos live under. The org is being renamed
 # 5dive-com -> 5dive-ai (2026-06); fetches must work on either side of the
@@ -26688,7 +26688,11 @@ cmd_import() {
   # DIVE-658 #2: provision straight from an OpenAgent persona file. The persona
   # carries identity only; these flags supply the 5dive runtime config the pack
   # would otherwise hold (sane defaults; only consumed in --from-persona mode).
-  local from_persona="" p_type="claude" p_iso="standard" p_model="" p_effort=""
+  # DIVE-1317: --type/--model/--effort must be honored for a PACK/marketplace
+  # import too, not only --from-persona. Default p_type EMPTY so we can tell
+  # "explicitly asked for <type>" apart from "took the pack's baked-in type";
+  # the from-persona synth defaults it to claude locally below.
+  local from_persona="" p_type="" p_iso="standard" p_model="" p_effort=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --as=*)              as="${1#--as=}" ;;
@@ -26722,8 +26726,9 @@ cmd_import() {
   if [[ -n "$from_persona" ]]; then
     [[ -z "$pack" ]] || fail "$E_USAGE" "give a pack OR --from-persona, not both"
     [[ -f "$from_persona" ]] || fail "$E_NOT_FOUND" "persona file not found: $from_persona"
-    step "Synthesizing pack from OpenAgent persona '$from_persona' (type=$p_type)"
-    persona_tmp=$(_persona_to_pack "$from_persona" "$p_type" "$p_iso" "$p_model" "$p_effort") \
+    local synth_type="${p_type:-claude}"
+    step "Synthesizing pack from OpenAgent persona '$from_persona' (type=$synth_type)"
+    persona_tmp=$(_persona_to_pack "$from_persona" "$synth_type" "$p_iso" "$p_model" "$p_effort") \
       || fail "$E_VALIDATION" "could not build a pack from persona '$from_persona' (is it a valid OpenAgent persona?)"
     pack="$persona_tmp"
   fi
@@ -26824,7 +26829,16 @@ cmd_import() {
   m_profile=$(jq -r '.config.authProfile // empty' "$stage/manifest.json")
   model=$(jq -r '.config.model // empty'         "$stage/manifest.json")
   effort=$(jq -r '.config.effort // empty'       "$stage/manifest.json")
+  # DIVE-1317: explicit runtime flags override the pack's baked-in config so a
+  # marketplace hire is harness-agnostic — `agent import <slug> --type=codex`
+  # provisions a codex agent instead of silently taking the pack's claude type.
+  # (from-persona already baked p_type into the manifest above, so p_type is
+  # empty there and the manifest value stands.)
+  [[ -n "$p_type" ]]   && type="$p_type"
+  [[ -n "$p_model" ]]  && model="$p_model"
+  [[ -n "$p_effort" ]] && effort="$p_effort"
   [[ -n "$type" ]] || { rm -rf "$stage"; fail "$E_VALIDATION" "manifest has no agent type"; }
+  is_known_type "$type" || { rm -rf "$stage"; fail "$E_NOT_FOUND" "unknown --type '$type' (known: ${!TYPE_BIN[*]})"; }
   [[ -n "$workdir" ]] || workdir="$m_workdir"
   [[ -n "$profile" ]] || profile="$m_profile"
   # DIVE-620: a dashboard marketplace import passes no --auth-profile and packs
