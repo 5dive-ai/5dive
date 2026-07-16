@@ -243,8 +243,8 @@ apply_byo_provider() {
     || fail "$E_VALIDATION" "$type does not support provider '$canonical' (${BYO_PROVIDER_LABEL[$canonical]})"
 
   case "$type" in
-    hermes)   _apply_byo_hermes "$native" "$canonical" "$api_key" "$profile" ;;
-    openclaw) _apply_byo_openclaw "$native" "$canonical" "$api_key" "$profile" ;;
+    hermes)   _apply_byo_hermes "$native" "$canonical" "$api_key" "$profile" "$model" ;;
+    openclaw) _apply_byo_openclaw "$native" "$canonical" "$api_key" "$profile" "$model" ;;
     claude)   _apply_byo_claude "$canonical" "$api_key" "$profile" "$model" ;;
     *) fail "$E_VALIDATION" "BYO provider not supported for type '$type' (only: hermes, openclaw, claude)" ;;
   esac
@@ -289,7 +289,10 @@ _apply_byo_claude() {
 }
 
 _apply_byo_hermes() {
-  local native="$1" canonical="$2" api_key="$3" profile="${4:-}"
+  # override_model (DIVE-1318): an operator-supplied --model wins over the
+  # per-provider catalog default (HERMES_PROVIDER_MODEL) — e.g. dashboard
+  # openrouter creates pass a concrete slug instead of "openrouter/auto".
+  local native="$1" canonical="$2" api_key="$3" profile="${4:-}" override_model="${5:-}"
   local bin="${TYPE_BIN[hermes]}"
   [[ -x "$bin" ]] || fail "$E_NOT_INSTALLED" "hermes not installed at $bin"
 
@@ -342,7 +345,7 @@ KIMI_ENV
     sudo -u claude -H env HERMES_HOME="$hermes_home" \
       "$bin" config set model.provider "$native" >&2 \
       || warn "hermes config set model.provider=$native failed (user can pick the model in TUI)"
-    local model="${HERMES_PROVIDER_MODEL[$canonical]:-}"
+    local model="${override_model:-${HERMES_PROVIDER_MODEL[$canonical]:-}}"
     if [[ -n "$model" ]]; then
       sudo -u claude -H env HERMES_HOME="$hermes_home" \
         "$bin" config set model.default "$model" >&2 \
@@ -363,7 +366,7 @@ KIMI_ENV
   # value from a prior oauth login doesn't pin the agent to chatgpt.com.
   sudo -u claude -H env HERMES_HOME="$hermes_home" \
     "$bin" config set model.base_url "" >&2 2>/dev/null || true
-  local model="${HERMES_PROVIDER_MODEL[$canonical]:-}"
+  local model="${override_model:-${HERMES_PROVIDER_MODEL[$canonical]:-}}"
   if [[ -n "$model" ]]; then
     sudo -u claude -H env HERMES_HOME="$hermes_home" \
       "$bin" config set model.default "$model" >&2 \
@@ -372,7 +375,8 @@ KIMI_ENV
 }
 
 _apply_byo_openclaw() {
-  local native="$1" canonical="$2" api_key="$3" profile="${4:-}"
+  # override_model (DIVE-1318): --model wins over OPENCLAW_PROVIDER_MODEL default.
+  local native="$1" canonical="$2" api_key="$3" profile="${4:-}" override_model="${5:-}"
   local base="/home/claude"
   if [[ -n "$profile" ]]; then
     base="$(profile_type_dir "$profile" openclaw)"
@@ -402,7 +406,7 @@ _apply_byo_openclaw() {
   # Default model lands in openclaw.json's agents.defaults.model.primary;
   # 5dive-agent-start.sh syncs it from the shared/profile copy into the
   # per-agent openclaw.json on every launch.
-  local model="${OPENCLAW_PROVIDER_MODEL[$canonical]:-}"
+  local model="${override_model:-${OPENCLAW_PROVIDER_MODEL[$canonical]:-}}"
   if [[ -n "$model" ]]; then
     local openclaw_bin="${TYPE_BIN[openclaw]}"
     sudo -u claude -H env HOME="$base" "$openclaw_bin" \
