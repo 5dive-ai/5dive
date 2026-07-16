@@ -26,7 +26,7 @@ esac
 
 # Bumped on every public release. `build.sh` checks this line exists; CI fails
 # the bundle-drift check if it's missing or empty.
-readonly FIVE_VERSION="0.9.22"
+readonly FIVE_VERSION="0.9.23"
 
 # GitHub org our repos live under. The org is being renamed
 # 5dive-com -> 5dive-ai (2026-06); fetches must work on either side of the
@@ -1268,7 +1268,7 @@ if os.path.exists(km):
 d.setdefault(os.environ["MKT_NAME"], {
     "source": {"source": "github", "repo": os.environ["MKT_SLUG"]},
     "installLocation": os.environ["MKT_DIR"],
-    "lastUpdated": datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S.000Z"),
+    "lastUpdated": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z"),
 })
 json.dump(d, open(km, "w"), indent=2)
 PREREG
@@ -12972,7 +12972,72 @@ _init_review_row() {
   printf '    %-14s %s\n' "$1" "$2" >&2
 }
 
+# Verbose vs. quiet sub-step output. `5dive init` drives noisy sub-processes —
+# the CLI install, `agent create`, the pairing call — whose raw stdout/stderr
+# (installer progress, marketplace refresh chatter, `==>` create logs, the
+# expected-pending self-check warnings) leak into the otherwise-clean wizard.
+# Default (verbose) keeps streaming them, which is useful when a first run
+# breaks. Under `--quiet`/`--demo` they are redirected to a per-run log and the
+# user sees only a spinner + a ✓/✗ line, with the log path surfaced solely on
+# failure. DIVE-1352.
+_INIT_QUIET=0
+_INIT_LOG=""
+
+# _init_run <label> <command...>
+# Owns the whole label lifecycle (leading note / spinner + trailing ✓/✗) so
+# call sites don't print their own. Inherits this function's stdin, so a caller
+# may pipe a secret in: `printf %s "$key" | _init_run "…" 5dive agent create …`.
+_init_run() {
+  local label="$1"; shift
+  local rc=0
+  if (( _INIT_QUIET == 0 )); then
+    _init_note "$label…"
+    "$@" >&2 || rc=$?
+    if (( rc == 0 )); then _init_ok "$label"; else _init_warn "$label failed"; fi
+    return "$rc"
+  fi
+  # Quiet: run in the background, animate a spinner, capture output to the log.
+  local frames='|/-\' fi=0
+  local cyan="" dim="" reset=""
+  _init_color_enabled && { cyan=$'\033[38;5;81m'; dim=$'\033[2m'; reset=$'\033[0m'; }
+  "$@" >>"$_INIT_LOG" 2>&1 &
+  local pid=$!
+  printf '\033[?25l' >&2
+  while kill -0 "$pid" 2>/dev/null; do
+    printf '\r  %s%s%s %s%s%s ' "$cyan" "${frames:fi:1}" "$reset" "$dim" "$label" "$reset" >&2
+    fi=$(( (fi + 1) % ${#frames} ))
+    sleep 0.1
+  done
+  wait "$pid" || rc=$?
+  printf '\033[?25h\033[2K\r' >&2
+  if (( rc == 0 )); then _init_ok "$label"; else _init_warn "$label failed — see $_INIT_LOG"; fi
+  return "$rc"
+}
+
 cmd_init() {
+  # --- Flags: --quiet/--demo suppress sub-process noise (see _init_run) ---
+  local _arg
+  for _arg in "$@"; do
+    case "$_arg" in
+      --quiet|--demo) _INIT_QUIET=1 ;;
+      -h|--help)
+        cat >&2 <<'USAGE'
+5dive init [--quiet]
+  Interactive first-run wizard: install a runtime, authenticate, and create
+  your first agent.
+  --quiet, --demo   Hide install/create sub-process output behind a spinner
+                    (a clean capture for demos); full logs go to
+                    /tmp/5dive-init-<ts>.log. Default streams everything.
+USAGE
+        return 0 ;;
+      *) fail "$E_USAGE" "unknown flag '$_arg' (see: 5dive init --help)" ;;
+    esac
+  done
+  if (( _INIT_QUIET == 1 )); then
+    _INIT_LOG="/tmp/5dive-init-$(date +%Y%m%d-%H%M%S)-$$.log"
+    : > "$_INIT_LOG" 2>/dev/null || _INIT_LOG="/tmp/5dive-init-$$.log"
+  fi
+
   # Fail fast before any prompts: every step the wizard drives (agent install /
   # create, channel wiring) is root-only — without this guard an unprivileged
   # user answers the whole questionnaire and dies mid-create instead.
@@ -13018,11 +13083,9 @@ cmd_init() {
   # --- Step 2: install binary if missing ---
   _init_section 2 4 "Connect ${type_label[$type]}" \
     "Use an existing sign-in, an interactive login, or your own provider key."
-  _init_note "Checking the ${type_label[$type]} CLI…"
-  if ! cmd_install "$type" >&2; then
+  if ! _init_run "Setting up the ${type_label[$type]} CLI" cmd_install "$type"; then
     fail "$E_NOT_INSTALLED" "failed to install $type — try '5dive agent install $type' manually"
   fi
-  _init_ok "${type_label[$type]} CLI is installed"
   echo >&2
 
   # --- Step 3: auth ---
@@ -13314,14 +13377,12 @@ cmd_init() {
     [[ -n "$telegram_token" ]] && create_args+=("--telegram-token=$telegram_token")
     [[ -n "$telegram_user_id" ]] && create_args+=("--telegram-allowed-users=$telegram_user_id")
   fi
-  _init_note "Creating $name…"
+  local create_rc=0
   if [[ -n "$byo_provider" ]]; then
     # BYO Claude Code: provider + key wired at create; profile named after the
     # provider. Key on stdin so it never lands in argv/history.
     create_args+=("--provider=$byo_provider" "--api-key=-" "--auth-profile=$byo_provider")
-    if ! printf '%s' "$byo_key" | 5dive agent create "${create_args[@]}" >&2; then
-      fail "$E_GENERIC" "failed to create agent — see logs above"
-    fi
+    printf '%s' "$byo_key" | _init_run "Creating $name" 5dive agent create "${create_args[@]}" || create_rc=$?
   elif [[ -n "$pi_provider" ]]; then
     # pi BYO: provider + key (+ model for gateways like openrouter, already
     # appended above) wired at create so it runs pi_apply_provider_key AND
@@ -13329,11 +13390,16 @@ cmd_init() {
     # agent boots with defaultProvider set and the key persisted. Key on stdin
     # so it never lands in argv/history. DIVE-1269.
     create_args+=("--provider=$pi_provider" "--api-key=-")
-    if ! printf '%s' "$pi_key" | 5dive agent create "${create_args[@]}" >&2; then
+    printf '%s' "$pi_key" | _init_run "Creating $name" 5dive agent create "${create_args[@]}" || create_rc=$?
+  else
+    _init_run "Creating $name" 5dive agent create "${create_args[@]}" || create_rc=$?
+  fi
+  if (( create_rc != 0 )); then
+    if (( _INIT_QUIET )); then
+      fail "$E_GENERIC" "failed to create agent — see $_INIT_LOG"
+    else
       fail "$E_GENERIC" "failed to create agent — see logs above"
     fi
-  elif ! 5dive agent create "${create_args[@]}" >&2; then
-    fail "$E_GENERIC" "failed to create agent — see logs above"
   fi
   echo >&2
 
@@ -13341,7 +13407,7 @@ cmd_init() {
   # openclaw/hermes wire the allowlist inside `agent create` itself, so the
   # extra pair call only applies to claude — same gate the dashboard uses.
   if [[ "$type" == "claude" && "$channels" == "telegram" && -n "$telegram_user_id" ]]; then
-    5dive agent pair "$name" --user-id="$telegram_user_id" >&2 || true
+    _init_run "Pairing $name with Telegram" 5dive agent pair "$name" --user-id="$telegram_user_id" || true
     echo >&2
   fi
 

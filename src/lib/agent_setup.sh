@@ -426,7 +426,7 @@ if os.path.exists(km):
 d.setdefault(os.environ["MKT_NAME"], {
     "source": {"source": "github", "repo": os.environ["MKT_SLUG"]},
     "installLocation": os.environ["MKT_DIR"],
-    "lastUpdated": datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S.000Z"),
+    "lastUpdated": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z"),
 })
 json.dump(d, open(km, "w"), indent=2)
 PREREG
