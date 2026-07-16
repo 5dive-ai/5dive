@@ -29,6 +29,12 @@ mkdir -p "$TASKS_DIR"
 set +e
 
 tasks_db_init
+# tasks_db_init only runs the ALTER migrations on the ELSE branch (store already
+# exists); a fresh store gets the base _tasks_schema CREATE TABLE, which omits
+# the additive columns (parked_at, wake_at, ...). In production init is called
+# every command so the 2nd call migrates; a one-shot harness must migrate itself
+# or pass 1 of the sweep (wake-parked) errors on a missing parked_at each tick.
+_tasks_db_migrate
 
 # --- stubs: capture escalation recipients instead of sending -----------------
 ESC_LOG="$TMP/escalated"; : >"$ESC_LOG"
@@ -136,6 +142,21 @@ ans=$(db "SELECT COALESCE(need_answered_at,'NULL') FROM tasks WHERE id=${gid};")
 [[ "$ans" == "NULL" ]] \
   && ok_t "T1 gate w/o recommendation: never auto-applied (routes to T2 reminder)" \
   || bad_t "rec-less T1 gate was auto-applied" "need_answered_at=$ans"
+
+# Case 9: pass 1 (wake-parked) — a parked, blocked task whose wake_at has passed
+# is unparked and, with no open deps, flipped back to todo. Previously this pass
+# errored non-fatally on the missing parked_at column and was never exercised.
+reset
+gid=$(db "INSERT INTO tasks (title, priority, assignee, created_by, kind, status,
+                             parked_at, park_reason, wake_at)
+          VALUES ('snoozed', 'medium', 'worker', 'main', 'standard', 'blocked',
+                  datetime('now','-2 days'), 'waiting', datetime('now','-1 hours'));
+          SELECT last_insert_rowid();")
+_hb_gate_ttl_sweep
+row=$(db "SELECT COALESCE(parked_at,'NULL')||'|'||COALESCE(wake_at,'NULL')||'|'||status FROM tasks WHERE id=${gid};")
+[[ "$row" == "NULL|NULL|todo" ]] \
+  && ok_t "wake-parked pass: due parked task unparked + unblocked to todo" \
+  || bad_t "wake-parked pass did not fire" "got=[$row] want=[NULL|NULL|todo]"
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]
