@@ -26,7 +26,7 @@ esac
 
 # Bumped on every public release. `build.sh` checks this line exists; CI fails
 # the bundle-drift check if it's missing or empty.
-readonly FIVE_VERSION="0.9.16"
+readonly FIVE_VERSION="0.9.17"
 
 # GitHub org our repos live under. The org is being renamed
 # 5dive-com -> 5dive-ai (2026-06); fetches must work on either side of the
@@ -99,7 +99,13 @@ CONNECTORS_DIR="/etc/5dive/connectors"
 # Extend here to add a new agent type.
 declare -A TYPE_BIN=(
   [claude]="/home/claude/.local/bin/claude"
-  [codex]="/home/claude/.nvm/versions/node/v24/bin/codex"
+  # codex is an npm global under nvm's per-version bin dir. Rather than hardcode
+  # a single version path (the `v24` alias lags real node upgrades — a fresh box on
+  # v24.18.0 left /home/claude/.nvm/.../v24/bin/codex stale and surfaced as
+  # not_installed, DIVE-1329), the TYPE_INSTALL recipe symlinks the freshly
+  # installed codex into ~/.local/bin (same dance as opencode/grok/pi) so
+  # TYPE_BIN resolves on every box regardless of the active node version.
+  [codex]="/home/claude/.local/bin/codex"
   [hermes]="/home/claude/.local/bin/hermes"
   [openclaw]="/home/claude/.local/bin/openclaw"
   [opencode]="/home/claude/.local/bin/opencode"
@@ -215,16 +221,24 @@ declare -A TYPE_INSTALL=(
   [claude]="command -v claude >/dev/null || curl -fsSL https://claude.ai/install.sh | bash"
   # Verify the EXACT TYPE_BIN path (not `command -v codex`): a stray
   # /usr/bin/codex from apt or a codex left over under a non-v24 nvm major
-  # would short-circuit the install, leaving v24/bin/codex empty and
-  # surfacing as "install reported success but bin missing". `nvm install 24`
-  # provisions the pinned runtime on a fresh box and selects it, forcing the
-  # npm install -g to land in v24's bin dir even when the default
-  # alias has drifted (same drift the nightly soft-updates hit — DIVE-1189).
+  # would short-circuit the install and surface as "install reported success
+  # but bin missing". `nvm install 24` provisions the pinned runtime on a fresh
+  # box and selects it, forcing the npm install -g to land in v24's real bin
+  # dir even when the `v24` alias has drifted (same drift the nightly
+  # soft-updates hit — DIVE-1189). We then one-hop-symlink the just-installed
+  # codex into ~/.local/bin (where TYPE_BIN[codex] and the agent unit's PATH
+  # look). We resolve its real path deterministically as
+  # `dirname $(nvm which 24)/codex` — NOT `command -v codex`, which can land on
+  # a stray /usr/bin/codex, and NOT the `/home/.../v24/bin` alias, which lags
+  # real node upgrades (a box on v24.18.0 left the alias pointing at v24.16.0
+  # and surfaced codex as not_installed — DIVE-1329). `npm install -g` lands the
+  # binary in exactly this dir (== `npm prefix -g`/bin), so the symlink is
+  # guaranteed to point at the codex we just installed. Mirrors opencode below.
   # DIVE-1189: `5dive agent install codex --upgrade` sets FORCE_INSTALL=1 to skip
   # the -x short-circuit and reinstall @latest in place; without it (the
-  # provisioning path) an existing v24 codex is left untouched. \$-escaped so the
+  # provisioning path) an existing codex is left untouched. \$-escaped so the
   # var expands when the recipe runs under `bash -lc`, not at array-definition time.
-  [codex]="{ [[ -z \"\${FORCE_INSTALL:-}\" ]] && [[ -x /home/claude/.nvm/versions/node/v24/bin/codex ]]; } || { . /home/claude/.nvm/nvm.sh && nvm install 24 >/dev/null && npm install -g @openai/codex@latest; }"
+  [codex]="{ [[ -z \"\${FORCE_INSTALL:-}\" ]] && [[ -x /home/claude/.local/bin/codex ]]; } || { . /home/claude/.nvm/nvm.sh && nvm install 24 >/dev/null && npm install -g @openai/codex@latest && mkdir -p /home/claude/.local/bin && ln -sfn \"\$(dirname \"\$(nvm which 24)\")/codex\" /home/claude/.local/bin/codex; }"
   # opencode.ai's installer drops the binary at ~/.opencode/bin/opencode and
   # only adds it to PATH via .bashrc — but bash -lc skips .bashrc on
   # non-interactive shells, so neither the verify check below nor the agent
