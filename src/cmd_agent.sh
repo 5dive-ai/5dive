@@ -145,7 +145,35 @@ resolve_cli_version() {
   local type="$1"
   local bin="${TYPE_BIN[$type]:-}"
   [[ -n "$bin" ]] || { printf ''; return; }
-  timeout 5 sudo -u claude bash -lc "$(printf '%q' "$bin") --version 2>/dev/null | head -1" 2>/dev/null || printf ''
+  if (( EUID == 0 )); then
+    # Root keeps the historical run-as-owner path so version probes cannot
+    # leave root-owned cache files in claude's home.
+    timeout 5 sudo -u claude bash -lc "$(printf '%q' "$bin") --version 2>/dev/null | head -1" 2>/dev/null || printf ''
+  elif [[ -x "$bin" ]]; then
+    # DIVE-1343: a scoped agent cannot `sudo -u claude`; trying anyway created
+    # a command-not-allowed audit entry on every read-only `agent info`. The
+    # binaries are deliberately executable by agent users, so probe directly.
+    { timeout 5 "$bin" --version 2>/dev/null | head -1; } || printf ''
+  else
+    printf ''
+  fi
+}
+
+# Read one value from an agent-owned runtime config without privilege
+# escalation. Root can read every agent's config directly; an agent can read
+# its own. An unreadable sibling config is simply unknown, matching the existing
+# best-effort contract without generating denied-sudo audit noise (DIVE-1343).
+read_agent_json_value() {
+  local file="$1" filter="$2"
+  [[ -r "$file" ]] || { printf ''; return 0; }
+  jq -r "$filter" "$file" 2>/dev/null || true
+}
+
+read_agent_toml_model() {
+  local file="$1"
+  [[ -r "$file" ]] || { printf ''; return 0; }
+  { sed -nE 's/^[[:space:]]*model[[:space:]]*=[[:space:]]*"?([^"#]*[^"# ])"?.*/\1/p' \
+      "$file" 2>/dev/null | head -1; } || true
 }
 
 # Resolve the model an agent is configured to use, read from the per-type
@@ -166,16 +194,14 @@ resolve_agent_model() {
   # `pipefail` a missing config.toml propagates sed's non-zero status.)
   case "$type" in
     claude)
-      sudo jq -r '.model // empty' "$home/.claude/settings.json" 2>/dev/null || true ;;
+      read_agent_json_value "$home/.claude/settings.json" '.model // empty' ;;
     codex)
-      { sudo sed -nE 's/^[[:space:]]*model[[:space:]]*=[[:space:]]*"?([^"#]*[^"# ])"?.*/\1/p' \
-        "$home/.codex/config.toml" 2>/dev/null | head -1; } || true ;;
+      read_agent_toml_model "$home/.codex/config.toml" ;;
     grok)
-      { sudo sed -nE 's/^[[:space:]]*model[[:space:]]*=[[:space:]]*"?([^"#]*[^"# ])"?.*/\1/p' \
-        "$home/.grok/config.toml" 2>/dev/null | head -1; } || true ;;
+      read_agent_toml_model "$home/.grok/config.toml" ;;
     antigravity)
-      sudo jq -r '.model // .selectedModel // empty' \
-        "$home/.gemini/antigravity-cli/settings.json" 2>/dev/null || true ;;
+      read_agent_json_value "$home/.gemini/antigravity-cli/settings.json" \
+        '.model // .selectedModel // empty' ;;
     *) printf '' ;;
   esac
 }
@@ -188,7 +214,7 @@ resolve_agent_effort() {
   local type="$1" name="$2"
   case "$type" in
     claude)
-      sudo jq -r '.effortLevel // empty' "/home/agent-${name}/.claude/settings.json" 2>/dev/null || true ;;
+      read_agent_json_value "/home/agent-${name}/.claude/settings.json" '.effortLevel // empty' ;;
     *) printf '' ;;
   esac
 }
@@ -372,4 +398,3 @@ cmd_info() {
     ' <<<"$obj"
   fi
 }
-
