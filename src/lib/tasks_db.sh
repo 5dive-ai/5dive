@@ -742,7 +742,12 @@ task_actor() {
 
 valid_task_status()   { [[ "$1" =~ ^(todo|in_progress|blocked|done|cancelled)$ ]]; }
 valid_task_priority() { [[ "$1" =~ ^(low|medium|high|urgent)$ ]]; }
-valid_need_type()     { [[ "$1" =~ ^(decision|secret|approval|manual)$ ]]; }
+# DIVE-1243: `access` is the manager-clearable class — "I'm blocked on a grant a
+# teammate/manager can give (access/resource/config), NOT a human-only call". It
+# routes manager-FIRST regardless of tier and is lead-clearable (reusing the
+# DIVE-1182 routed_reviewer path); it falls through to a human only when the T2
+# category floor fires (genuine human-territory: money/destructive/secrets/brand).
+valid_need_type()     { [[ "$1" =~ ^(decision|secret|approval|manual|access)$ ]]; }
 
 # Shape-check a 5-field cron expression (minute hour dom month dow). This is a
 # lightweight gate at create time — exactly five whitespace-separated fields,

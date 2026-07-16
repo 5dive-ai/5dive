@@ -43,7 +43,8 @@ _task_usage() {
   5dive task escalate <id|DIVE-N> [--from=<who>]     # flag for attention: bump priority a tier (cap urgent) + ping owning agent & paired human
 
   # Human Task Inbox — park a task on a human and clear it
-  5dive task need <id|DIVE-N> --type=decision|secret|approval|manual --ask="..." [--options=A|B] [--recommend="A"] [--tier=0|1|2]
+  5dive task need <id|DIVE-N> --type=decision|secret|approval|manual|access --ask="..." [--options=A|B] [--recommend="A"] [--tier=0|1|2]
+                                                     # --type=access: manager-clearable "grant me X" gate — routes to the org lead first (any tier), lead-clearable; add --probe='test -w /path' to self-check the block
     --ask: ONE crisp question + ~1 line essential context, recommendation up front. Heavy detail goes in the task BODY, not the ask.
     --recommend: your advised choice (strongly encouraged for decision/approval). Leads the alert as '✅ Recommended: <X>' and ⭐-marks its button. For a decision it must match one of --options.
     --tier (DIVE-891 risk tiers): 0 = auto-clear (rec applies NOW, no ping, digest line; requires --recommend)
@@ -56,6 +57,11 @@ _task_usage() {
   5dive task unpark <id|DIVE-N>                      # clear a park early -> todo (unless task-deps still block it)
   5dive task inbox                                   # list ONLY human-gated tasks, priority-ordered
   5dive task answer <id|DIVE-N> --value="..."        # record the human's answer, unblock, ping the owning agent
+  5dive task clear-recs --channel-proof=<chat_id> [--only=<id|DIVE-N>]
+                                                     # DIVE-1305: paired-human bulk-clear — apply each pending gate's --recommend as a HUMAN clear,
+                                                     # driven by the human's own verified DM ("go with recs"). Clears only tier<2 (agent-clearable) gates;
+                                                     # tier-2 hard gates (money/destructive/secret/brand) are SKIPPED and keep their per-gate button tap.
+                                                     # --only limits it to one named gate. Invoked by the telegram plugin, which supplies the verified chat_id.
                                                      # approval/secret gates are human-only: blocked for agent-* callers,
                                                      # and (DIVE-519) require --proof=<token from `5dive gate-proof`> once
                                                      # `5dive gate-proof enforce on` is set. Trusted paths attach it automatically.
@@ -97,6 +103,7 @@ cmd_task() {
     need)            cmd_task_need "$@" ;;
     inbox)           cmd_task_inbox "$@" ;;
     answer)          cmd_task_answer "$@" ;;
+    clear-recs)      cmd_task_clear_recs "$@" ;;
     precedent)       cmd_task_precedent "$@" ;;
     routing)         cmd_task_routing "$@" ;;
     rm|delete)       cmd_task_rm "$@" ;;
@@ -1387,7 +1394,7 @@ _gate_shape_jaccard() {
 
 cmd_task_need() {
   tasks_db_init
-  local type="" ask="" options="" recommend="" from="" tier="" secret_key="" connector=""
+  local type="" ask="" options="" recommend="" from="" tier="" secret_key="" connector="" probe=""
   local -a positional=()
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -1401,6 +1408,9 @@ cmd_task_need() {
       # Both together enable the burnable drop link in the gate message.
       --secret-key=*) secret_key="${1#*=}" ;;
       --connector=*)  connector="${1#*=}" ;;
+      # DIVE-1243: opt-in self-check for --type=access. The command MUST FAIL
+      # (non-zero) for the gate to file; if it SUCCEEDS the block isn't real.
+      --probe=*)     probe="${1#*=}" ;;
       --)          shift; positional+=("$@"); break ;;
       -*)          fail "$E_USAGE" "unknown flag: $1" ;;
       *)           positional+=("$1") ;;
@@ -1409,8 +1419,24 @@ cmd_task_need() {
   done
   [[ ${#positional[@]} -gt 0 ]] || fail "$E_USAGE" "usage: 5dive task need <id|DIVE-N> --type=decision|secret|approval|manual --ask=\"...\" [--options=A|B] [--recommend=\"A\"]"
   resolve_task_id "${positional[0]}"; local id="$RESOLVED_TASK_ID" ident="$RESOLVED_TASK_IDENT"
-  valid_need_type "$type" || fail "$E_VALIDATION" "bad --type '$type' (decision|secret|approval|manual)"
+  valid_need_type "$type" || fail "$E_VALIDATION" "bad --type '$type' (decision|secret|approval|manual|access)"
   [[ -n "$ask" ]] || fail "$E_USAGE" "--ask is required (what does the human need to provide?)"
+
+  # DIVE-1243: self-check for the manager-clearable `access` class. An access gate
+  # claims "I'm blocked on a grant a teammate can give" — but a FALSE block (codex
+  # DIVE-1234 filed 'grant me wiki write access' when it ALREADY had it) wastes a
+  # lead ping. --probe=<cmd> is an opt-in real self-check run AS the filing agent:
+  # it MUST FAIL (non-zero) for the gate to file; if it SUCCEEDS the access already
+  # works, so we refuse. With no --probe we still NUDGE (never hard-block — the
+  # probe can't be expressed for every kind of block).
+  if [[ -n "$probe" ]]; then
+    [[ "$type" == "access" ]] || fail "$E_VALIDATION" "--probe only applies to --type=access"
+    if bash -c "$probe" >/dev/null 2>&1; then
+      fail "$E_CONFLICT" "self-check passed (\`$probe\` succeeded) — you already have this access; not filing. Re-check the real blocker (see DIVE-1234)."
+    fi
+  elif [[ "$type" == "access" ]]; then
+    warn "--type=access filed without --probe — confirm you actually tested the block (e.g. --probe='test -w /path'). False blocks (DIVE-1234) waste a lead ping."
+  fi
   # Options are the choice list for a decision; reject them on the other types
   # so the gate shape stays honest for the dashboard. (An approval gate is
   # deliberately approved/denied only — the plugin tap handler resolves no
@@ -1751,10 +1777,18 @@ cmd_task_need() {
         local _rt_title; _rt_title=$(db "SELECT COALESCE(title,'') FROM tasks WHERE id=${id};")
         _gate_tier2_floor_hit "${ask} ${_rt_title}" || _routable=1
       fi ;;
+    # DIVE-1243: the manager-clearable class routes to the lead FIRST regardless
+    # of tier — that is the whole point of the type. The ONLY fall-through to the
+    # human is the T2 category floor (money/destructive/secrets/brand), which sets
+    # tier_floored=1 above. An access gate is therefore routable unless floored.
+    access) (( tier_floored )) || _routable=1 ;;
   esac
   if [[ "$_routable" == "1" ]]; then
+    # DIVE-1243: `access` routing is intrinsic to the TYPE, so it does NOT wait on
+    # the gate_builder_routing pref (which ship-gates the decision/approval/manual
+    # routing rollout). The other types still honour the pref.
     local _route; _route=$(_task_pref_get gate_builder_routing); _route="${_route:-off}"
-    if [[ "$_route" == "on" ]]; then
+    if [[ "$_route" == "on" || "$type" == "access" ]]; then
       local _reviewer; _reviewer=$(_gate_route_reviewer "$actor")
       if [[ -n "$_reviewer" ]]; then
         # Persist the designated reviewer on the row. For approval/manual this is
@@ -1787,9 +1821,14 @@ cmd_task_need() {
   # its hash; the raw nonce is handed to task_need_notify to embed in the tap
   # callback_data. It is never printed to stdout, so the agent that filed the
   # gate never sees it. decision gates are agent-clearable → no nonce.
+  # DIVE-1243: `access` mints a nonce too. It only reaches this human-ping path
+  # when it FELL THROUGH to a human — either the T2 category floor fired (genuine
+  # human-territory) or the org named no distinct lead (the filer IS the lead, who
+  # is re-escalating). Both are legitimate human clears, so it needs the same
+  # tap-safe nonce as approval/secret/manual for the Telegram tap.
   local human_nonce=""
   case "$type" in
-    approval|secret|manual)
+    approval|secret|manual|access)
       human_nonce=$(_human_nonce_mint)
       [[ -n "$human_nonce" ]] \
         && db "UPDATE tasks SET human_nonce_hash=$(sqlq "$(_human_nonce_sha "$human_nonce")") WHERE id=${id};"
@@ -1844,6 +1883,28 @@ _task_owner_channel() {
     [[ "$u" == agent-* ]] && name="${u#agent-}"
   fi
   _task_agent_channel "$name"
+}
+
+# DIVE-1305: verify a chat_id is the paired human's OWN verified DM — i.e. it is
+# listed in the bot's access.json `allowFrom` (the users who /started the bot and
+# were approved). This is the trust anchor for the "go with recs from your own
+# channel" clear: the plugin only ever passes a chat_id it already matched against
+# access.json, and we RE-verify here so the CLI never trusts the flag blindly.
+# DMs only (allowFrom) — groups (.groups, negative ids) are multi-member and a
+# weaker identity, so a group message is NOT accepted as one human's proof. The
+# caller's own bot channel is resolved via _task_owner_channel (SUDO_UID -> agent
+# -> that agent's access.json), so an agent can only ever assert ITS OWN paired
+# human, never another bot's. Returns 0 when the chat verifies. Scope guard: this
+# proof clears only tier<2 gates (enforced at the call site, cmd_task_answer).
+_gate_channel_proof_ok() {
+  local chat="$1"
+  [[ -n "$chat" ]] || return 1
+  # Numeric chat id only (a DM id is a positive integer) — rejects junk / any
+  # attempt to smuggle a jq filter or a negative group id through the flag.
+  [[ "$chat" =~ ^[0-9]+$ ]] || return 1
+  _task_owner_channel || return 1
+  [[ -n "$TASK_CH_ACCESS" && -r "$TASK_CH_ACCESS" ]] || return 1
+  jq -e --arg c "$chat" '(.allowFrom // []) | index($c) != null' "$TASK_CH_ACCESS" >/dev/null 2>&1
 }
 
 # _task_send_owner — send ONE message ($1, optional reply_markup $2) to the
@@ -1979,7 +2040,23 @@ task_need_notify() {
 
   # Resolve bot token + the human's DM/group targets (TASK_CH_* globals). The
   # matched access type (TASK_CH_TYPE) gates the tap-to-answer buttons below.
-  _task_owner_channel || return 0
+  # DIVE-1243: never DROP a gate alert silently. The filing agent being unpaired
+  # (no access.json — the codex-gate-invisible bug: its gate was filed but no one
+  # was ever pinged) used to `return 0` here and the gate sat unseen. Warn, then
+  # fall back to the org lead's channel so the alert still surfaces; if even that
+  # is missing, warn again — the gate still shows on the dashboard "Needs you"
+  # card, but we never fail silently.
+  if ! _task_owner_channel; then
+    local _self; _self=$(task_actor "")
+    warn "$ident: filing agent (${_self:-?}) has no paired channel — falling back to the org lead for the gate alert"
+    local _fb; _fb=$(_gate_route_reviewer "$_self"); [[ -z "$_fb" ]] && _fb=$(_task_resolve_coordinator)
+    if [[ -n "$_fb" ]] && _task_agent_channel "$_fb"; then
+      warn "$ident: gate alert routed to org lead ${_fb} (filing agent unpaired)"
+    else
+      warn "$ident: no lead channel either — gate recorded, visible only on the dashboard 'Needs you' card"
+      return 0
+    fi
+  fi
 
   # The /task_<n> deep link and tna:<n>:… callback both carry a BARE NUMBER that
   # the plugin re-resolves via `5dive task show/answer <n>` — and a bare number
@@ -2050,6 +2127,12 @@ task_need_notify() {
       fi
       ;;
     manual) text+=$'\n\n'"✋ Tap ✅ Done below once it is handled, which closes this out. Or on the box: sudo 5dive task answer ${ident} --value=done" ;;
+    # DIVE-1243: an `access` gate normally clears via the org lead; it only reaches
+    # a human when it's genuinely human-territory (money/secrets/destructive) or no
+    # lead was available. No tap button (the plugin `tna:` handler has no access
+    # resolution — see the DIVE-118 no-dead-taps allowlist below); give the on-box
+    # CLI line instead.
+    access) text+=$'\n\n'"🔓 This is a grant request that reached you directly (human-territory, or no lead available). Clear it on the box: sudo 5dive task answer ${ident} --value=\"granted\" (or denied)" ;;
   esac
 
   # DIVE-117/118 tap-to-answer buttons. GATED to the plugin types whose `tna:`
@@ -2257,9 +2340,86 @@ cmd_gate_proof() {
   fail "$E_USAGE" "gate-proof mint is removed (DIVE-950): the --proof evidence form was agent-forgeable. Gates clear via a human tap (per-gate nonce) or a non-agent SUDO_UID. Valid subcommands: gate-proof enforce on|off|status | verify <id> | sign."
 }
 
+# DIVE-1305: paired-human bulk-clear. When the paired human sends "go with recs"
+# (or "approve DIVE-X") in their OWN verified DM, the telegram plugin — which has
+# already matched the sender chat_id against access.json — shells this with the
+# verified chat_id. We apply each eligible pending gate's --recommend as a HUMAN
+# clear (reusing cmd_task_answer's provenance + closure-signature + loop-advance
+# path via --channel-proof), so it is byte-identical to a per-gate human tap
+# except one command clears many.
+#
+# Scope (lodar's DIVE-1305 decision, 2026-07-16): ONLY tier<2, agent-clearable
+# gates. tier-2 hard gates (money/destructive/secret/brand are floored there) are
+# SKIPPED — they keep a deliberate per-gate button tap. We also skip lead-routed
+# gates (routed_reviewer set): those clear via their designated lead, not the
+# human's blanket channel. A gate with no --recommend is skipped (nothing to
+# apply). The tier<2 + channel-proof enforcement lives in cmd_task_answer, so
+# even a hand-crafted --only=<hard gate> can never be cleared here.
+cmd_task_clear_recs() {
+  tasks_db_init
+  local channel_proof="" only="" from=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --channel-proof=*) channel_proof="${1#*=}" ;;
+      --only=*)          only="${1#*=}" ;;
+      --from=*)          from="${1#*=}" ;;
+      -*) fail "$E_USAGE" "unknown flag: $1" ;;
+      *)  fail "$E_USAGE" "usage: 5dive task clear-recs --channel-proof=<chat_id> [--only=<id|DIVE-N>]" ;;
+    esac
+    shift
+  done
+  [[ -n "$channel_proof" ]] || fail "$E_USAGE" "--channel-proof=<chat_id> is required (the paired human's verified DM chat id)"
+  # Verify the channel up front so a bad/forged chat id fails once, loudly, before
+  # we touch any gate. Same allowFrom check cmd_task_answer re-runs per gate.
+  _gate_channel_proof_ok "$channel_proof" \
+    || fail "$E_AUTH_REQUIRED" "channel-proof did not verify — the chat id is not in this bot's access.json allowFrom (paired-human DMs). A bulk clear must come from the human's own verified channel."
+
+  # Eligible pending gates: unanswered, blocked, tier<2, has a recommend, not
+  # lead-routed. --only narrows to one row (still subject to every filter, so a
+  # hard/ineligible target simply clears nothing and is reported).
+  local only_sql=""
+  if [[ -n "$only" ]]; then
+    resolve_task_id "$only"; only_sql=" AND id=${RESOLVED_TASK_ID}"
+  fi
+  local rows
+  rows=$(db "SELECT id FROM tasks
+             WHERE need_type IS NOT NULL AND need_answered_at IS NULL
+               AND status='blocked'
+               AND CAST(COALESCE(tier,'2') AS INTEGER) < 2
+               AND COALESCE(recommend,'') != ''
+               AND COALESCE(routed_reviewer,'') = ''${only_sql}
+             ORDER BY id;")
+
+  local -a cleared=() cleared_recs=()
+  local gid gident grec
+  while IFS= read -r gid; do
+    [[ -n "$gid" ]] || continue
+    grec=$(db "SELECT COALESCE(recommend,'') FROM tasks WHERE id=${gid};")
+    gident=$(db "SELECT ident FROM tasks WHERE id=${gid};")
+    # Reuse the single-gate answer path (provenance/signature/advance identical to
+    # a human tap). Suppress its per-gate ok line; a subshell isolates its fail/exit
+    # so one bad gate can't abort the batch.
+    if ( cmd_task_answer "$gid" --value="$grec" --channel-proof="$channel_proof" --from="${from:-telegram}" ) >/dev/null 2>&1; then
+      cleared+=("$gident"); cleared_recs+=("$grec")
+    fi
+  done <<<"$rows"
+
+  local n=${#cleared[@]}
+  audit_log "task clear-recs" "ok" 0 -- "cleared=$n" "only=${only:-all}" "chat=$channel_proof" "list=${cleared[*]:-none}"
+  if (( n == 0 )); then
+    ok "no eligible gates to clear (agent-clearable, tier<2, with a recommendation)$([[ -n "$only" ]] && echo " for $only")" \
+       '{cleared:0, gates:[]}'
+    return 0
+  fi
+  # Build a JSON array of cleared idents for the plugin/dashboard.
+  local gates_json; gates_json=$(printf '%s\n' "${cleared[@]}" | jq -R . | jq -sc .)
+  ok "applied recommendations to $n gate(s): ${cleared[*]}" \
+     '{cleared:($n|tonumber), gates:$g}' --arg n "$n" --argjson g "$gates_json"
+}
+
 cmd_task_answer() {
   tasks_db_init
-  local value="" value_set=0 from="" human=0 human_proof=""
+  local value="" value_set=0 from="" human=0 human_proof="" channel_proof=""
   local -a positional=()
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -2282,6 +2442,13 @@ cmd_task_answer() {
       # dashboard payload) — the evidence form for the plugin-tap path, whose
       # SUDO_UID is the spawning agent. Verified against human_nonce_hash below.
       --human-proof=*) human_proof="${1#*=}" ;;
+      # DIVE-1305: paired-human channel proof — a chat_id the trusted plugin
+      # verified as the paired human's OWN verified DM (∈ access.json allowFrom).
+      # Honored as human evidence ONLY for tier<2 gates (see below); a tier-2
+      # hard gate (money/destructive/secret/brand) NEVER accepts it and keeps its
+      # per-gate button tap. This is the "go with recs from your own channel"
+      # clear (lodar's chosen scope, DIVE-1305 decision 2026-07-16).
+      --channel-proof=*) channel_proof="${1#*=}" ;;
       --)        shift; positional+=("$@"); break ;;
       -*)        fail "$E_USAGE" "unknown flag: $1" ;;
       *)         positional+=("$1") ;;
@@ -2301,6 +2468,21 @@ cmd_task_answer() {
   # heuristic (cmd_task_need), yet decision is agent-clearable BY TYPE, so those
   # blocks let it through. The tier-2 provenance floor further down uses this.
   local gtier; gtier=$(db "SELECT COALESCE(tier,'') FROM tasks WHERE id=${id};")
+
+  # DIVE-1305: the paired-human channel proof is a valid human-evidence form, but
+  # STRICTLY for tier<2 gates. tier 2 is the hard-human floor (money/destructive/
+  # secret/brand are floored there) and lodar's chosen scope keeps those a
+  # deliberate per-gate button tap — a plain chat line must NOT clear them. So we
+  # honor --channel-proof only when the gate is tier<2 AND the chat_id verifies
+  # against the bot's own access.json allowFrom (the paired human's verified DM).
+  # When valid it marks the answer human-sourced (human=1 -> need_answered_by
+  # human:*), so provenance is honest. For a tier-2 gate _cp_ok stays 0, human is
+  # untouched, and the tier-2 provenance floor below rejects it exactly as before.
+  local _cp_ok=0
+  if [[ -n "$channel_proof" && "$gtier" != "2" ]]; then
+    _gate_channel_proof_ok "$channel_proof" && _cp_ok=1
+  fi
+  (( _cp_ok )) && human=1
 
   # DIVE-394: approval/secret are HUMAN-ONLY gates. Reject answers that come from
   # an agent acting as itself — that's the DIVE-391 incident, where an Olivia
@@ -2326,13 +2508,20 @@ cmd_task_answer() {
   # gate was human-only and pinged lodar instead of Marcus. Resolve it up front so
   # both the uid block and the evidence block below honour the exception. `secret`
   # is never routed (routed_reviewer stays NULL), so it can never take this path.
+  # DIVE-1243: `access` joins approval/manual as lead-clearable — the designated
+  # routed_reviewer (and only that agent, on only this routed gate) may clear it.
   local _routed_rev; _routed_rev=$(db "SELECT COALESCE(routed_reviewer,'') FROM tasks WHERE id=${id};")
   local _lead_clear=0
-  if [[ ( "$nt" == "approval" || "$nt" == "manual" ) && -n "$_routed_rev" ]]; then
+  if [[ ( "$nt" == "approval" || "$nt" == "manual" || "$nt" == "access" ) && -n "$_routed_rev" ]]; then
     local _c; _c=$(id -un 2>/dev/null || echo '?')
     [[ "$_c" == "agent-${_routed_rev}" ]] && _lead_clear=1
   fi
-  if [[ "$nt" == "approval" || "$nt" == "secret" || "$nt" == "manual" ]]; then
+  # DIVE-1243: `access` is NOT open-agent-clearable (unlike decision) — a random
+  # agent must not self-grant. It is gated here like the human-only types, so only
+  # the routed lead (_lead_clear above) OR a human may clear it. When access fell
+  # through to a human (T2 floor / no distinct lead), routed_reviewer is NULL, so
+  # _lead_clear=0 and a human is required — exactly the intended fall-through.
+  if [[ "$nt" == "approval" || "$nt" == "secret" || "$nt" == "manual" || "$nt" == "access" ]]; then
     local _caller; _caller=$(id -un 2>/dev/null || echo '?')
     if [[ "$_caller" == agent-* && "$_lead_clear" != "1" ]]; then
       # No audit_log here: the blocked caller is an agent user that can't write
@@ -2363,7 +2552,7 @@ cmd_task_answer() {
   # block above + this rule stop the DIVE-515/516 incident (an agent silently
   # self-clearing). Bar-raise scope: closes the one-liner + the easy sudo-mint
   # forge, NOT a determined root-sudo agent (separate sudo-reduction track).
-  if [[ "$nt" == "approval" || "$nt" == "secret" || "$nt" == "manual" ]]; then
+  if [[ "$nt" == "approval" || "$nt" == "secret" || "$nt" == "manual" || "$nt" == "access" ]]; then
     # DIVE-916/950: TWO EQUIVALENT human-evidence forms — accept EITHER one, never
     # require both (double-gating a real tap violates DIVE-525):
     #   (a) --human-proof=<nonce> matching this gate's stored hash — the plugin
@@ -2380,15 +2569,20 @@ cmd_task_answer() {
     local _hp=0 _su=0
     [[ -n "$human_proof" ]] && _human_nonce_verify "$id" "$human_proof" && _hp=1
     _gate_sudo_uid_nonagent && _su=1
+    # DIVE-1305: a verified paired-human channel proof is the fourth evidence
+    # form — but _cp_ok is already gated to tier<2 above, so it can satisfy the
+    # evidence rule only for a tier-1 approval/access gate (never a tier-2 hard
+    # gate, whose _cp_ok is 0). A tier-2 approval still requires the nonce/SUDO_UID
+    # forms + is caught by the tier-2 floor below.
     # DIVE-1182: a routed builder gate cleared by its designated lead reviewer is a
     # sanctioned agent path — count the lead-clear as evidence so enforcement (the
     # "no human evidence ⇒ reject" rule) does not block the very exception granted
     # by the uid block above. Scoped to approval/manual with a matching
     # routed_reviewer (never secret), so no un-routed human gate is affected.
-    local _evid=$(( _hp || _su || _lead_clear ))
+    local _evid=$(( _hp || _su || _lead_clear || _cp_ok ))
     local _caller2; _caller2=$(id -un 2>/dev/null || echo '?')
     audit_log "task answer gate" "$([[ $_evid -eq 1 ]] && echo ok || echo error)" 0 -- \
-      "task=$ident" "type=$nt" \
+      "task=$ident" "type=$nt" "channel_proof=$([[ -n "$channel_proof" ]] && echo present || echo absent)" "cp_ok=$_cp_ok" \
       "human_proof=$([[ -n "$human_proof" ]] && echo present || echo absent)" "nonce_valid=$_hp" \
       "sudo_nonagent=$_su" "human=$human" "caller=$_caller2" "sudo_uid=${SUDO_UID:-}" \
       "enforce=$(_gate_proof_enforced && echo on || echo off)"
