@@ -38,7 +38,7 @@ Compose (declarative agents via 5dive.yaml):
 Agents:
   5dive hire <name> [--role="CTO"]  # sugar: agent create (+ org set)
   5dive market [<keyword>] [--role=<r>] [--rarity=<t>]  # browse/search the agent market; preview: 5dive market show <slug>
-  5dive hire <role> --from-market [--as=<name>]  # hire from the open market; see `5dive hire --help`
+  5dive hire <role> --from-market [--as=<name>]  # hire from the open market; see \`5dive hire --help\`
   5dive agent list
   5dive agent info <name>                            # type, CLI version, selected model, channel + state
   5dive agent types
@@ -233,7 +233,7 @@ Health:
     ~/.claude/.credentials.json that shadows an env-token, restart an agent
     whose telegram poller died (silently drops inbound DMs), and force
     needrestart to list-only so a library upgrade can't bounce the whole fleet.
-    A bare `doctor` (no --fix) is a preview — every fixable check tells you so;
+    A bare \`doctor\` (no --fix) is a preview — every fixable check tells you so;
     --dry-run previews even alongside --fix. Output envelope always
     {ok:true,data:{...}}; branch on data.summary.errors in CI.
 

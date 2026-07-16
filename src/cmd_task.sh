@@ -16,7 +16,7 @@ _task_usage() {
                                                      # 'task done' closes). Trivial/low-priority chores skip it automatically.
                             [--task-budget=<tokens|\$cost>]  # per-run spend cap for the on-host loop (DIVE-824)
                                                      # loop spec: declarative verify loop (DIVE-476). --verify is
-                                                     # the default cmd for `task verify`; --verifier grades (writer!=grader)
+                                                     # the default cmd for \`task verify\`; --verifier grades (writer!=grader)
   5dive task ls [--status=<s>] [--assignee=<agent>] [--mine] [--all] [--recurring]
                                                      # default: open tasks, priority-ordered; --recurring: templates
   5dive task show <id|DIVE-N>                        # full detail + subtasks + blockers
@@ -34,8 +34,8 @@ _task_usage() {
                                                      # observability (DIVE-478/597): maker→verifier board + LOOP-7
                                                      # loop_runs control window (topology/stage/iter/tokens-ceiling/
                                                      # status/⚠stuck). --runs=only loop_runs; --watch repaints;
-                                                     # --kill flips kill_requested (deferred-safe). Cost: `usage loops`.
-                                                     # Tokens/cost per loop: see `5dive usage` (same task ids).
+                                                     # --kill flips kill_requested (deferred-safe). Cost: \`usage loops\`.
+                                                     # Tokens/cost per loop: see \`5dive usage\` (same task ids).
   5dive task cancel <id|DIVE-N> [--result=<text>]    # -> cancelled; --result captures why
   5dive task block   <id|DIVE-N> --by=<id|DIVE-N>    # add a blocks edge, mark blocked
   5dive task unblock <id|DIVE-N> [--by=<id|DIVE-N>]  # drop edge(s); back to todo if clear
@@ -63,8 +63,8 @@ _task_usage() {
                                                      # tier-2 hard gates (money/destructive/secret/brand) are SKIPPED and keep their per-gate button tap.
                                                      # --only limits it to one named gate. Invoked by the telegram plugin, which supplies the verified chat_id.
                                                      # approval/secret gates are human-only: blocked for agent-* callers,
-                                                     # and (DIVE-519) require --proof=<token from `5dive gate-proof`> once
-                                                     # `5dive gate-proof enforce on` is set. Trusted paths attach it automatically.
+                                                     # and (DIVE-519) require --proof=<token from \`5dive gate-proof\`> once
+                                                     # \`5dive gate-proof enforce on\` is set. Trusted paths attach it automatically.
 
   status: todo | in_progress | blocked | done | cancelled
 

@@ -767,7 +767,7 @@ _pack_usage() {
                                   # it, a pack's arbitrary-shell hooks are STRIPPED on import.
                                   # recreate an agent from a pack into a FRESH name.
                                   # <pack> = a .tar.gz file OR a bare registry slug
-                                  # (e.g. `import lilbro --as=...`) pulled from the git registry.
+                                  # (e.g. \`import lilbro --as=...\`) pulled from the git registry.
                                   # --report-import (opt-in, default OFF): ping a public
                                   # increment-only, zero-PII counter with just the pack slug
                                   # so the gallery can rank Most-imported. Registry slugs only.
@@ -778,7 +778,7 @@ _pack_usage() {
 
   A pack carries an agent's portable identity (instructions, skills, settings subset),
   NEVER secrets (tokens/keys/sessions/transcripts are hard-excluded). --with-memory adds
-  redacted persona memory through a mandatory review gate. `agent clone` (same-host
+  redacted persona memory through a mandatory review gate. \`agent clone\` (same-host
   full-fidelity copy) is the local-duplicate path; a pack is for cross-user sharing.
 USAGE
 }
