@@ -973,7 +973,14 @@ cmd_create() {
   # run prompts are handled by their own CLIs.
   if [[ "$type" == "claude" ]]; then
     step "Preseeding claude config for agent-${name}"
-    preseed_claude_agent "$name" "$channels"
+    # A create-time BYO --model is per-agent intent. The auth profile's
+    # ANTHROPIC_DEFAULT_* variables translate Claude's tier aliases, but the
+    # preseeded settings.json model is the actual startup selection and used to
+    # be hard-pinned to claude-opus-4-8, overriding that intent. Pass the model
+    # through so this agent starts on the requested OpenRouter/vendor slug.
+    local _claude_byo_model=""
+    [[ -n "$byo_provider" ]] && _claude_byo_model="$byo_model"
+    preseed_claude_agent "$name" "$channels" "$_claude_byo_model"
   elif [[ "$type" == "antigravity" ]]; then
     # antigravity needs no claude-style ~/.claude preseed (agy reads its own
     # ~/.gemini state). The default-skill seed every other type gets isn't

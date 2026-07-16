@@ -75,7 +75,7 @@ _operator_ids() {
 }
 
 preseed_claude_agent() {
-  local name="$1" channels="$2"
+  local name="$1" channels="$2" selected_model="${3:-claude-opus-4-8}"
   local user="agent-${name}" home="/home/agent-${name}"
   [[ -d "$home" ]] || fail "$E_GENERIC" "agent home missing: $home"
 
@@ -135,8 +135,8 @@ JSON
   # so a new agent would lose its pin on first boot and fall back to the default
   # model. Valid ids (claude-opus-4-8) are left untouched. See DIVE-506.
   local settings
-  settings=$(jq -n --argjson sl "$(jq -n "$status_line_obj")" --arg ghorg "$(gh_org)" '{
-    model: "claude-opus-4-8",
+  settings=$(jq -n --argjson sl "$(jq -n "$status_line_obj")" --arg ghorg "$(gh_org)" --arg model "$selected_model" '{
+    model: $model,
     effortLevel: "high",
     permissions: {
       defaultMode: "bypassPermissions",

@@ -917,7 +917,7 @@ _operator_ids() {
 }
 
 preseed_claude_agent() {
-  local name="$1" channels="$2"
+  local name="$1" channels="$2" selected_model="${3:-claude-opus-4-8}"
   local user="agent-${name}" home="/home/agent-${name}"
   [[ -d "$home" ]] || fail "$E_GENERIC" "agent home missing: $home"
 
@@ -977,8 +977,8 @@ JSON
   # so a new agent would lose its pin on first boot and fall back to the default
   # model. Valid ids (claude-opus-4-8) are left untouched. See DIVE-506.
   local settings
-  settings=$(jq -n --argjson sl "$(jq -n "$status_line_obj")" --arg ghorg "$(gh_org)" '{
-    model: "claude-opus-4-8",
+  settings=$(jq -n --argjson sl "$(jq -n "$status_line_obj")" --arg ghorg "$(gh_org)" --arg model "$selected_model" '{
+    model: $model,
     effortLevel: "high",
     permissions: {
       defaultMode: "bypassPermissions",
@@ -7721,7 +7721,14 @@ cmd_create() {
   # run prompts are handled by their own CLIs.
   if [[ "$type" == "claude" ]]; then
     step "Preseeding claude config for agent-${name}"
-    preseed_claude_agent "$name" "$channels"
+    # A create-time BYO --model is per-agent intent. The auth profile's
+    # ANTHROPIC_DEFAULT_* variables translate Claude's tier aliases, but the
+    # preseeded settings.json model is the actual startup selection and used to
+    # be hard-pinned to claude-opus-4-8, overriding that intent. Pass the model
+    # through so this agent starts on the requested OpenRouter/vendor slug.
+    local _claude_byo_model=""
+    [[ -n "$byo_provider" ]] && _claude_byo_model="$byo_model"
+    preseed_claude_agent "$name" "$channels" "$_claude_byo_model"
   elif [[ "$type" == "antigravity" ]]; then
     # antigravity needs no claude-style ~/.claude preseed (agy reads its own
     # ~/.gemini state). The default-skill seed every other type gets isn't
