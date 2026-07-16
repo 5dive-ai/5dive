@@ -259,7 +259,11 @@ declare -A TYPE_INSTALL=(
   # crash-loops with `binary not installed`. chmod back to 0775 to match
   # the live perms of /home/claude/.opencode and .local/share/claude.
   [hermes]="[[ -x /home/claude/.local/bin/hermes ]] || { curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash -s -- --skip-setup && chmod 0775 /home/claude/.hermes; }"
-  [openclaw]="[[ -x /home/claude/.local/bin/openclaw ]] || { curl -fsSL https://openclaw.ai/install.sh | bash -s -- --no-onboard && mkdir -p /home/claude/.local/bin && ln -sf \"\$(npm prefix -g)/bin/openclaw\" /home/claude/.local/bin/openclaw; }"
+  # openclaw's launcher is `#!/usr/bin/env node`, so symlinking only the CLI
+  # into ~/.local/bin leaves it unexecutable in systemd/create-time envs where
+  # nvm's per-version bin directory is absent from PATH. Install a supported
+  # Node 24 and give both executables stable one-hop links in ~/.local/bin.
+  [openclaw]="{ . /home/claude/.nvm/nvm.sh && nvm install 24 >/dev/null; } && { [[ -x /home/claude/.local/bin/openclaw ]] || curl -fsSL https://openclaw.ai/install.sh | bash -s -- --no-onboard; } && mkdir -p /home/claude/.local/bin && ln -sfn \"\$(nvm which 24)\" /home/claude/.local/bin/node && ln -sfn \"\$(npm prefix -g)/bin/openclaw\" /home/claude/.local/bin/openclaw"
   # antigravity's installer drops the native-Go binary at ~/.local/bin/agy
   # and self-updates in the background on each run, so no daily-cron
   # equivalent of @google/gemini-cli's npm update is needed.

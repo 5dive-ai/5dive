@@ -409,7 +409,17 @@ _apply_byo_openclaw() {
   local model="${override_model:-${OPENCLAW_PROVIDER_MODEL[$canonical]:-}}"
   if [[ -n "$model" ]]; then
     local openclaw_bin="${TYPE_BIN[openclaw]}"
-    sudo -u claude -H env HOME="$base" "$openclaw_bin" \
+    local openclaw_node="/home/claude/.local/bin/node"
+    # The npm launcher uses `#!/usr/bin/env node`. Do not rely on sudo/systemd's
+    # PATH to resolve that shebang during fresh create: invoke the stable Node
+    # link installed alongside OpenClaw explicitly. Keep ~/.local/bin on PATH
+    # for any subprocess OpenClaw starts while writing the config.
+    [[ -x "$openclaw_node" ]] \
+      || fail "$E_NOT_INSTALLED" "node runtime missing for openclaw (run: 5dive agent install openclaw --upgrade)"
+    sudo -u claude -H env \
+      HOME="$base" \
+      PATH="/home/claude/.local/bin:/usr/bin:/bin" \
+      "$openclaw_node" "$openclaw_bin" \
       config set agents.defaults.model.primary "$model" >&2 \
       || warn "openclaw config set agents.defaults.model.primary=$model failed"
   fi
