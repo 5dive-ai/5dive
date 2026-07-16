@@ -90,15 +90,18 @@ _hb_usage() {
   cat <<USAGE
 5dive heartbeat — wake agents only when they have queued tasks
 
-  5dive heartbeat on  <name> [--every=<dur>] [--no-fresh]
-                                          # enrol agent; default every=${_HB_DEFAULT_EVERY}m, fresh on
+  5dive heartbeat on  <name> [--every=<dur>] [--fresh]
+                                          # enrol agent; default every=${_HB_DEFAULT_EVERY}m, fresh off
   5dive heartbeat off <name>              # stop waking the agent (keeps its settings)
   5dive heartbeat ls                      # show enrolled agents + next-wake + queued count
   5dive heartbeat tick                    # cron driver: wake every due agent that has work
 
   <dur>: minutes (e.g. 30), or 45m / 2h / 1h30m.
-  fresh (default on): send /clear before each task so context starts clean;
-        --no-fresh keeps the running conversation across tasks.
+  fresh (default off, DIVE-1210): --fresh sends /clear before each task so
+        context starts clean, at the cost of a full CLAUDE.md/project re-prime
+        on every wake (up to ~48x/day on the default 30m cadence). Off keeps
+        the running conversation across tasks — cheaper, and what main/
+        marketing already ran manually before this became the default.
 
 Wire the driver into cron (root), e.g. every 5 minutes:
   */5 * * * * /usr/local/bin/5dive heartbeat tick >> /var/log/5dive-heartbeat.log 2>&1
@@ -139,7 +142,7 @@ _hb_parse_every() {
 
 cmd_heartbeat_on() {
   require_root "heartbeat on"
-  local name="" every="" fresh="true"
+  local name="" every="" fresh="false"
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --every=*)  every="${1#*=}" ;;
@@ -150,7 +153,7 @@ cmd_heartbeat_on() {
     esac
     shift
   done
-  [[ -n "$name" ]] || fail "$E_USAGE" "usage: 5dive heartbeat on <name> [--every=<dur>] [--no-fresh]"
+  [[ -n "$name" ]] || fail "$E_USAGE" "usage: 5dive heartbeat on <name> [--every=<dur>] [--fresh]"
   require_agent "$name"
   local everyMin="$_HB_DEFAULT_EVERY"
   if [[ -n "$every" ]]; then
@@ -177,7 +180,7 @@ cmd_heartbeat_off() {
   require_agent "$name"
   local reg; reg=$(registry_read)
   echo "$reg" | jq --arg n "$name" \
-    '.agents[$n].heartbeat = ((.agents[$n].heartbeat // {everyMin: '"$_HB_DEFAULT_EVERY"', fresh: true, lastRunAt: 0}) + {enabled: false})' \
+    '.agents[$n].heartbeat = ((.agents[$n].heartbeat // {everyMin: '"$_HB_DEFAULT_EVERY"', fresh: false, lastRunAt: 0}) + {enabled: false})' \
     | registry_write
   ok "heartbeat off for '$name'" '{name:$n, enabled:false}' --arg n "$name"
 }
@@ -192,7 +195,7 @@ cmd_heartbeat_ls() {
     local enabled everyMin fresh lastRun running todo nextIn
     enabled=$(jq -r --arg n "$name"  '.agents[$n].heartbeat.enabled  // false' <<<"$reg")
     everyMin=$(jq -r --arg n "$name" '.agents[$n].heartbeat.everyMin // '"$_HB_DEFAULT_EVERY" <<<"$reg")
-    fresh=$(jq -r --arg n "$name"    '(.agents[$n].heartbeat | if has("fresh") then .fresh else true end)' <<<"$reg")
+    fresh=$(jq -r --arg n "$name"    '(.agents[$n].heartbeat | if has("fresh") then .fresh else false end)' <<<"$reg")
     lastRun=$(jq -r --arg n "$name"  '.agents[$n].heartbeat.lastRunAt // 0' <<<"$reg")
     # is-active prints the state word AND exits nonzero for non-active units, so
     # capture its stdout directly — a `|| echo` here would append a second word.
@@ -978,7 +981,7 @@ cmd_heartbeat_tick() {
     local everyMin lastRun fresh
     everyMin=$(jq -r --arg n "$name" '.agents[$n].heartbeat.everyMin // '"$_HB_DEFAULT_EVERY" <<<"$reg")
     lastRun=$(jq -r --arg n "$name"  '.agents[$n].heartbeat.lastRunAt // 0' <<<"$reg")
-    fresh=$(jq -r --arg n "$name"    '(.agents[$n].heartbeat | if has("fresh") then .fresh else true end)' <<<"$reg")
+    fresh=$(jq -r --arg n "$name"    '(.agents[$n].heartbeat | if has("fresh") then .fresh else false end)' <<<"$reg")
 
     # Unwedge stuck in_progress first, every tick (NOT gated by everyMin): an
     # orphaned/stalled/runaway task must clear promptly regardless of the wake
