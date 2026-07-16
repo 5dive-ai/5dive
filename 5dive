@@ -26,7 +26,7 @@ esac
 
 # Bumped on every public release. `build.sh` checks this line exists; CI fails
 # the bundle-drift check if it's missing or empty.
-readonly FIVE_VERSION="0.9.14"
+readonly FIVE_VERSION="0.9.15"
 
 # GitHub org our repos live under. The org is being renamed
 # 5dive-com -> 5dive-ai (2026-06); fetches must work on either side of the
@@ -11199,6 +11199,19 @@ wait_agent_input_ready() {
 # with — small msgs / non-Claude TUIs that don't show the placeholder), 1 if it
 # still looks unsubmitted after retries. The "[Pasted text #" marker is Claude's
 # input-buffer rendering; other runtimes just fall through the fast path.
+#
+# DIVE-1325: the Claude fast path above relied on the "[Pasted text #N]"
+# placeholder to know an Enter still needs re-sending — but a codex/grok/agy/
+# opencode TUI renders the paste INLINE with no such placeholder, so `grep`
+# never matched and the loop returned success after a SINGLE Enter fired only
+# 0.3s after the burst. On codex that Enter races the paste-commit and is
+# swallowed (the input lands in the composer but never submits), so the send is
+# silently dropped and the agent sits deaf — the root cause behind the known
+# deaf-codex behaviour. For non-claude TUIs we now mirror _hb_send_line's
+# DIVE-1217 fix: let the paste settle, Enter, then CONFIRM the composer left
+# idle (turn actually started) via _hb_agent_idle, re-sending a few times before
+# giving up. (Enter and C-m are byte-identical `\r` to tmux, so the earlier
+# manual-C-m workaround was really the settle+confirm, not a different key.)
 inject_and_submit() {
   local name="$1" payload="$2" tries=0 pane
   local user="agent-${name}"   # separate stmt: ${name} in the same line aborts under set -u (silent msg drop)
@@ -11206,6 +11219,19 @@ inject_and_submit() {
   # Let the TUI finish ingesting the (possibly bracketed-paste) payload before the
   # Enter, so the newline isn't bundled into the paste sequence.
   sleep 0.3
+  # Non-claude TUIs: no paste placeholder to poll — confirm via idle-state instead.
+  if [[ -z "$(_hb_claude_pid "$name")" ]]; then
+    sleep 0.4
+    while (( tries < 5 )); do
+      sudo -u "$user" tmux send-keys -t "agent-${name}" Enter
+      sleep 0.5
+      # idle()==0 means the Enter did NOT take (still parked at the composer) ->
+      # retry; any other state (busy/blocked/unknown) means the turn started.
+      _hb_agent_idle "$name" 0.4 || return 0
+      tries=$((tries+1))
+    done
+    return 1
+  fi
   while (( tries < 5 )); do
     sudo -u "$user" tmux send-keys -t "agent-${name}" Enter
     sleep 0.4

@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- fix(agent): `agent send`/`_deliver` now reliably submits to codex (and other non-claude) agents. `inject_and_submit` relied on Claude's `[Pasted text #N]` placeholder to know an Enter still needed re-sending; codex renders the paste inline with no such marker, so a single Enter fired 0.3s after the burst raced the paste-commit and was swallowed, leaving the message unsent and the agent silently deaf. Non-claude TUIs now settle, submit, then confirm the turn started (via `_hb_agent_idle`), re-sending a few times before giving up — mirroring the heartbeat fix (DIVE-1217). Enter and C-m are byte-identical CR to tmux, so the prior manual-C-m workaround was really the settle+confirm (DIVE-1325).
 - feat(init): redesign the first-run wizard as a polished four-stage TTY onboarding flow with arrow-key menus, explicit Codex/Claude authentication choices, live-masked API-key and bot-token input, early agent-name validation, deterministic provider pickers, terminal-aware styling, a pre-create review/cancel checkpoint, and clearer completion guidance (DIVE-1326). `TERM=dumb` retains a numbered fallback and `NO_COLOR` disables styling.
 
 ## 0.9.14
