@@ -518,6 +518,36 @@ cmd_svc() {
 # text is delivered literally AND actually submitted (bracketed-paste safe).
 # Not exposed via /agents/exec: arbitrary text won't pass the API arg regex, so
 # this is CLI + direct-shelld only.
+# DIVE-1337: decide whether an inter-agent send/ask must self-elevate through the
+# scoped `_deliver`/`_capture` primitives instead of the direct `sudo -u agent-X
+# tmux` path. The discriminator is CAPABILITY, not the isolation tier label: the
+# direct path needs broad `sudo -u <other-user>`, which only a full-trust
+# (NOPASSWD:ALL) caller has. Scoped-sudo OSS agents cannot run `sudo -u agent-X`
+#   * `standard` — grant is exactly `5dive agent _deliver`/`_capture`;
+#   * `admin`    — grant is `/usr/local/bin/5dive *` (the whole CLI as root, but
+#                  runas root only, so NOT `sudo -u`).
+# so for them the direct path fails with "a password is required", which the
+# has-session check downstream MIS-REPORTS as "session not found". Both, however,
+# CAN reach `sudo 5dive agent _deliver` (standard via its explicit grant, admin via
+# the whole-CLI grant), so route them there.
+#
+# Previously the gate was `isolation == standard`, which left OSS `admin` agents on
+# the broken direct path — and on every fresh OSS box the bootstrap first agent is
+# `admin`, so a2a was silently dead between the two commonest agents (DIVE-1337).
+# Probing the real sudo capability auto-adapts with no tier list to maintain:
+# managed-host agents (NOPASSWD:ALL, internal-box posture) keep the direct path and
+# its --from/--reply-to channel plumbing; every scoped OSS agent self-elevates.
+# `sudo -n` never prompts (fail-closed). Root callers (EUID 0, e.g. `_deliver`
+# itself) always take the direct path.
+a2a_needs_scoped() {
+  local target="$1"
+  [[ $EUID -eq 0 ]] && return 1
+  # Can this caller `sudo -u` the target's user directly (what the direct tmux path
+  # needs)? If yes, use the direct path; if denied, self-elevate via _deliver.
+  sudo -n -u "agent-${target}" true 2>/dev/null && return 1
+  return 0
+}
+
 cmd_send() {
   local name="" message="" from="" from_set=0 raw=0
   local reply_to_chat="" reply_to_msg=""
@@ -554,16 +584,13 @@ cmd_send() {
   # `_deliver` derives sender/tier from the real sudo caller and deliberately
   # does not carry --from/--reply-to-chat (a standard send is peer-to-peer, with
   # no channel plumbing). Absolute path so it matches the sudoers rule exactly.
-  # DIVE-1065: route ONLY a standard-tier agent's send through the scoped
-  # _deliver grant. Admin/root/internal callers keep the direct path below (and
-  # their --from/--reply-to-chat plumbing). sudo -n = fail-closed, never prompts.
-  if [[ $EUID -ne 0 ]]; then
-    local _caller="${SUDO_USER:-${USER:-}}"; _caller="${_caller#agent-}"
-    local _ctier=""
-    [[ -n "$_caller" ]] && _ctier="$(registry_read | jq -r --arg n "$_caller" '.agents[$n].isolation // empty' 2>/dev/null)"
-    if [[ "$_ctier" == "standard" ]]; then
-      exec sudo -n /usr/local/bin/5dive agent _deliver "$name" "$message"
-    fi
+  # DIVE-1065/1337: route a scoped-sudo agent's send through the scoped _deliver
+  # grant (admin OR standard on OSS — see a2a_needs_scoped). Full-trust
+  # (NOPASSWD:ALL) and root/internal callers keep the direct path below (and their
+  # --from/--reply-to-chat plumbing). A scoped a2a send is peer-to-peer, so it
+  # carries no channel plumbing. sudo -n = fail-closed, never prompts.
+  if a2a_needs_scoped "$name"; then
+    exec sudo -n /usr/local/bin/5dive agent _deliver "$name" "$message"
   fi
 
   require_agent "$name"
@@ -709,18 +736,14 @@ cmd_ask() {
       || fail "$E_VALIDATION" "invalid --reply-to-msg (expected positive integer)"
   fi
 
-  # DIVE-1074: a standard-isolation agent has no broad sudo, so it can't run the
-  # direct `sudo -u agent-X tmux` inject+capture that `ask` uses below. Route a
-  # non-root standard-tier caller through the scoped primitives instead:
+  # DIVE-1074/1337: a scoped-sudo agent (OSS admin OR standard) has no broad
+  # `sudo -u`, so it can't run the direct `sudo -u agent-X tmux` inject+capture that
+  # `ask` uses below. Route it through the scoped primitives instead:
   # `_deliver --id` (inject carrying a marker) + `_capture --after-id` (bounded
-  # reply read). Same gate as cmd_send. Admin/root keep the direct path unchanged.
+  # reply read). Same capability probe as cmd_send. Full-trust/root keep the direct
+  # path unchanged.
   local use_scoped=0
-  if [[ $EUID -ne 0 ]]; then
-    local _caller="${SUDO_USER:-${USER:-}}"; _caller="${_caller#agent-}"
-    local _ctier=""
-    [[ -n "$_caller" ]] && _ctier="$(registry_read | jq -r --arg n "$_caller" '.agents[$n].isolation // empty' 2>/dev/null)"
-    [[ "$_ctier" == "standard" ]] && use_scoped=1
-  fi
+  a2a_needs_scoped "$name" && use_scoped=1
 
   # Resolve sender — ask always wraps because we need a marker to slice the reply
   # window. On the scoped path `_deliver` re-derives the sender + tier from the

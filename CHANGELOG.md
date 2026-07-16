@@ -104,6 +104,17 @@ release.
 
 
 ### Fixed
+- **`agent send`/`ask` a2a now works between scoped-sudo agents on OSS boxes
+  (DIVE-1337).** The self-elevation gate keyed on `isolation == standard`, so an
+  `admin`-tier sender (the bootstrap first agent on every fresh OSS box, sudo
+  scoped to `/usr/local/bin/5dive *` with no `sudo -u`) fell through to the direct
+  `sudo -u agent-X tmux` path, was denied, and the failure was mis-reported as
+  "session not found". Replaced the tier check with a capability probe
+  (`a2a_needs_scoped`): if the caller can't `sudo -u` the target, route through the
+  `_deliver`/`_capture` grant. Managed-host agents (NOPASSWD:ALL) keep the direct
+  path and its --from/--reply-to plumbing; every scoped OSS agent self-elevates.
+  Smoke gains an `a2a-scoped` row (5dive-api test-vm.sh) that sends AS the scoped
+  agent user. Bumps to 0.9.18.
 - **Heartbeat idle-detection is now runtime-aware, so non-claude agents get
   nudged for board tasks (DIVE-1211).** `_hb_agent_idle`'s pane-scrape fallback
   hardcoded claude's `❯` composer glyph, which codex/grok/agy/opencode never
