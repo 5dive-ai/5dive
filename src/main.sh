@@ -224,6 +224,10 @@ Zero-human proof (publish your own badge — OSS-17):
   5dive proof off | status [--json]                             # remove cron (config kept) | report + staleness
   # methodology + self-publish guide: docs/zero-human.md
 
+Delegated push (one gated bot identity — DIVE-1376):
+  5dive push <id|DIVE-N> [--branch=<b>] [--dry-run]  # push ONLY the task's branch, ONLY after its gate clears; author=lodar enforced
+  # Branch comes from --branch or a 'Branch: <name>' line in the task body. Credential is a control-plane GitHub App, never a human token.
+
 Health:
   5dive doctor [--fix] [--dry-run] [--category=deps|types|auth|creds|registry|shelld|channels|host|memory]
     Walks deps (tmux/jq/bun/python3/nvm/node/npm), type bins, live auth
@@ -304,6 +308,14 @@ main() {
         >> "$AUDIT_LOG" 2>/dev/null || true
       exit 0
       ;;
+    _push_mint_token)
+      # DIVE-1376: hidden, privileged token-mint primitive. Reachable ONLY via
+      # NOPASSWD sudo. Reads the root-600 GitHub App credential, signs a JWT and
+      # exchanges it for a short-lived (~1h) installation token, printing ONLY
+      # the token to stdout. The agent process never reads the private key. Not
+      # audited itself (the parent `push` verb is) and never advertised.
+      cmd_push_mint_token "$@"
+      exit $? ;;
     market)
       # DIVE-1020: front door to the agent market — browse/search the
       # character-pack registry + preview a persona before hiring. Read-only
@@ -647,6 +659,14 @@ main() {
       # usage + heartbeat health, zero agent tokens. Read-only reporting; no
       # registry mutation/lock, no audit (same posture as usage).
       cmd_digest "$@" ;;
+    push)
+      # DIVE-1376 (Bobby gripe #1): delegated push. Pushes ONLY the task's
+      # branch, ONLY after the task gate clears, with a fail-closed author=lodar
+      # scan, using a short-lived GitHub App installation token minted by the
+      # root-only _push_mint_token helper (the agent never holds the credential).
+      # Mutating + credential-bearing → audited (the token never lands in argv).
+      AUDIT_CMD="push"; AUDIT_ARGS=("$@")
+      cmd_push "$@" ;;
     proof)
       # OSS-17: publish this box's zero-human proof (badge.json/zero-human.json/
       # history.jsonl) to a git status branch, computed verbatim from `digest`.
