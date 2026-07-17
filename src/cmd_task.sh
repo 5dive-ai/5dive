@@ -1447,6 +1447,24 @@ _gate_tier2_floor_hit() {
   [[ "$text" =~ $_GATE_T2_FLOOR_RX ]]
 }
 
+# DIVE-1359: the ENG-SHIP gate class. An eng ship / merge / diff / deploy
+# approval is NOT a human call — it is the org lead's (Marcus) to clear. But a
+# builder can file one as a hard-human gate (default, or explicit --tier=2),
+# which (a) pings the paired human and (b) is UNCLEARABLE by the lead, since
+# tier-2 is human-only by system rule. Observed twice: dev (DIVE-1349/1314) +
+# codex (DIVE-907) escalated eng ship approvals to the human. We classify these
+# by kind and force them DOWN to a lead-routed tier-1 — the mirror of the T2
+# floor (which forces true-human categories UP to tier-2). The true-human floor
+# ALWAYS wins and is checked FIRST: an eng gate that also names money / secrets /
+# destructive / brand stays tier-2 (a "ship the pricing change" gate is still a
+# human call). Bias, like the floor, is deliberate: a wrongly-classified eng gate
+# costs the lead one clear; the floor guards the only genuinely-human direction.
+_GATE_ENG_SHIP_RX='merge|pull request|\bpr\b|\bdiff\b|ship it|ship the|ship this|deploy|redeploy|roll ?out|land the|land it|rebase|hotfix|cut a branch|cut the release|push to (main|prod|production|origin)|code review|approve the (merge|diff|change|pr|build|deploy|ship|commit)|build\.sh|smoke test|ci\b'
+_gate_eng_ship_hit() {
+  local text; text=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
+  [[ "$text" =~ $_GATE_ENG_SHIP_RX ]]
+}
+
 # OSS-11 (DIVE-976) — _gate_ask_shape <ask>: normalize an ask into its "shape
 # key" so two gates that ask structurally the same question but about different
 # targets collapse to one key. Precedent matching uses EXACT shape-key equality
@@ -1612,6 +1630,29 @@ cmd_task_need() {
       local ttl_title; ttl_title=$(db "SELECT COALESCE(title,'') FROM tasks WHERE id=${id};")
       if _gate_tier2_floor_hit "${ask} ${ttl_title}"; then
         tier=2; tier_floored=1
+      fi
+    fi
+  fi
+
+  # DIVE-1359: eng-ship downgrade. A builder cannot file a hard-human (tier-2)
+  # gate for an eng ship/merge/diff/deploy decision — that class is lead-clearable,
+  # not a human call. When a NON-lead filer's decision/approval gate hits the
+  # eng-ship kind AND did NOT trip the true-human floor above (which already ran
+  # and wins — money/secrets/destructive/brand stay tier-2), force it to a
+  # lead-routed tier-1, OVERRIDING an explicit --tier=2. `_eng_ship=1` also makes
+  # the routing predicate below send it to the lead regardless of the
+  # gate_builder_routing pref, exactly like the DIVE-1243 `access` class — the
+  # routing is intrinsic to the kind, not part of the pref's staged rollout.
+  # secret/manual are never eng-ship. Filer-is-lead ⇒ _gate_route_reviewer empty
+  # ⇒ not downgraded (a lead may legitimately pin a human gate). `actor` is not
+  # yet set here (defined further down), so resolve the filer inline.
+  local _eng_ship=0
+  if [[ "$tier_floored" == "0" && ( "$type" == "decision" || "$type" == "approval" ) ]]; then
+    local _es_title; _es_title=$(db "SELECT COALESCE(title,'') FROM tasks WHERE id=${id};")
+    if _gate_eng_ship_hit "${ask} ${_es_title}"; then
+      local _es_reviewer; _es_reviewer=$(_gate_route_reviewer "$(task_actor "$from")")
+      if [[ -n "$_es_reviewer" ]]; then
+        tier=1; _eng_ship=1
       fi
     fi
   fi
@@ -1881,12 +1922,17 @@ cmd_task_need() {
     # tier_floored=1 above. An access gate is therefore routable unless floored.
     access) (( tier_floored )) || _routable=1 ;;
   esac
+  # DIVE-1359: an eng-ship gate is lead-routed by kind (set above), so it is
+  # always routable regardless of type default / explicit --tier.
+  [[ "$_eng_ship" == "1" ]] && _routable=1
   if [[ "$_routable" == "1" ]]; then
     # DIVE-1243: `access` routing is intrinsic to the TYPE, so it does NOT wait on
     # the gate_builder_routing pref (which ship-gates the decision/approval/manual
     # routing rollout). The other types still honour the pref.
+    # DIVE-1359: eng-ship routing is likewise intrinsic to the KIND — it bypasses
+    # the pref too, so the fix is live under the default (pref OFF) posture.
     local _route; _route=$(_task_pref_get gate_builder_routing); _route="${_route:-off}"
-    if [[ "$_route" == "on" || "$type" == "access" ]]; then
+    if [[ "$_route" == "on" || "$type" == "access" || "$_eng_ship" == "1" ]]; then
       local _reviewer; _reviewer=$(_gate_route_reviewer "$actor")
       if [[ -n "$_reviewer" ]]; then
         # Persist the designated reviewer on the row. For approval/manual this is

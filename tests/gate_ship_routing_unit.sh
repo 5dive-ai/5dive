@@ -121,9 +121,34 @@ cmd_task_need DIVE-8 --type=approval --ask="approve the \$5000 ad spend budget?"
 [[ -z "$(db "SELECT COALESCE(routed_reviewer,'') FROM tasks WHERE ident='DIVE-8';")" ]] && ok_t "money approval leaves routed_reviewer NULL" || bad_t "money approval routed_reviewer NULL" "got '$(db "SELECT COALESCE(routed_reviewer,'') FROM tasks WHERE ident='DIVE-8';")'"
 
 # --- DIVE-1182: explicit --tier=2 approval is NOT routed (hard-human contract) -
+# NB: ask must NOT name an eng-ship action, else DIVE-1359 downgrades it (below).
 seed DIVE-9; HUMAN_PINGED=0; route_reset
-cmd_task_need DIVE-9 --type=approval --tier=2 --ask="approve the prod push?" --from=dev >/dev/null 2>&1
+cmd_task_need DIVE-9 --type=approval --tier=2 --ask="make the final go/no-go call on this?" --from=dev >/dev/null 2>&1
 [[ "$HUMAN_PINGED" == "1" ]] && ok_t "route on: explicit --tier=2 approval → human (not routed)" || bad_t "explicit T2 approval → human" "HUMAN_PINGED=$HUMAN_PINGED"
+
+# --- DIVE-1359: eng-ship class — a builder CANNOT hard-human-gate an eng ship/ --
+# merge/diff/deploy decision. Even an explicit --tier=2 is downgraded to a
+# lead-routed tier-1 and routed to the org lead, NOT pinged to the human. Mirror
+# of the T2 floor; routes regardless of the gate_builder_routing pref.
+seed DIVE-30; HUMAN_PINGED=0; route_reset
+cmd_task_need DIVE-30 --type=approval --tier=2 --ask="approve the prod push?" --from=dev >/dev/null 2>&1
+[[ "$HUMAN_PINGED" == "0" ]] && ok_t "DIVE-1359: eng-ship approval --tier=2 NOT pinged to human" || bad_t "eng-ship T2 → not human" "HUMAN_PINGED=$HUMAN_PINGED"
+[[ "$(db "SELECT tier FROM tasks WHERE ident='DIVE-30';")" == "1" ]] && ok_t "DIVE-1359: eng-ship --tier=2 downgraded to lead-routed tier-1" || bad_t "eng-ship downgrade to tier-1" "got tier '$(db "SELECT tier FROM tasks WHERE ident='DIVE-30';")'"
+[[ "$(db "SELECT COALESCE(routed_reviewer,'') FROM tasks WHERE ident='DIVE-30';")" == "main" ]] && ok_t "DIVE-1359: eng-ship approval routed_reviewer=main (lead-clearable)" || bad_t "eng-ship routed to lead" "got '$(db "SELECT COALESCE(routed_reviewer,'') FROM tasks WHERE ident='DIVE-30';")'"
+
+# --- DIVE-1359: eng-ship routes even with pref OFF (intrinsic to the kind) ----
+_task_pref_set gate_builder_routing off
+seed DIVE-31; HUMAN_PINGED=0; route_reset
+cmd_task_need DIVE-31 --type=approval --ask="ship the DIVE-1359 branch to main?" --from=dev >/dev/null 2>&1
+[[ "$HUMAN_PINGED" == "0" && "$(db "SELECT COALESCE(routed_reviewer,'') FROM tasks WHERE ident='DIVE-31';")" == "main" ]] && ok_t "DIVE-1359: eng-ship routes to lead even with pref OFF" || bad_t "eng-ship pref-OFF route" "human=$HUMAN_PINGED reviewer='$(db "SELECT COALESCE(routed_reviewer,'') FROM tasks WHERE ident='DIVE-31';")'"
+# a genuine money approval with pref OFF still pings the human (floor wins over eng-ship)
+seed DIVE-32; HUMAN_PINGED=0; route_reset
+cmd_task_need DIVE-32 --type=approval --ask="approve the deploy AND the \$900 vercel invoice?" --from=dev >/dev/null 2>&1
+[[ "$HUMAN_PINGED" == "1" ]] && ok_t "DIVE-1359: floor beats eng-ship (deploy+\$invoice stays human)" || bad_t "floor beats eng-ship" "HUMAN_PINGED=$HUMAN_PINGED"
+# a lead's OWN eng-ship gate is NOT downgraded (no distinct reviewer → human)
+seed DIVE-33; HUMAN_PINGED=0; route_reset
+cmd_task_need DIVE-33 --type=approval --tier=2 --ask="approve the prod push?" --from=main >/dev/null 2>&1
+[[ "$HUMAN_PINGED" == "1" && "$(db "SELECT tier FROM tasks WHERE ident='DIVE-33';")" == "2" ]] && ok_t "DIVE-1359: a lead's own eng-ship --tier=2 stays hard-human" || bad_t "lead eng-ship not downgraded" "human=$HUMAN_PINGED tier='$(db "SELECT tier FROM tasks WHERE ident='DIVE-33';")'"
 
 # --- pref ON: tier-2-floored decision (money) is NOT routed ------------------
 seed DIVE-5; HUMAN_PINGED=0; route_reset
