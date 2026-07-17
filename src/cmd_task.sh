@@ -1069,6 +1069,9 @@ _task_loop_advance() {
       local rstatus; rstatus=$(db "SELECT status FROM tasks WHERE id=${run};")
       if [[ "$rstatus" != "done" && "$rstatus" != "cancelled" ]]; then
         db "UPDATE tasks SET status='done', done_at=datetime('now') WHERE id=${run};"
+        # DIVE-1415: a closed loop RUN can itself be a blocker of other tasks —
+        # release its dependents on this terminal close too.
+        _task_cascade_unblock "$run" || true
         local owner; owner=$(db "SELECT COALESCE(assignee,created_by) FROM tasks WHERE id=${run};")
         local rident; rident=$(db "SELECT ident FROM tasks WHERE id=${run};")
         [[ -n "$owner" ]] && ( cmd_send "$owner" --from="loop" \
@@ -1313,6 +1316,13 @@ cmd_task_verify() {
   if (( rc == 0 )) && (( ! no_done )); then
     db "UPDATE tasks SET status='done', done_at=datetime('now'), result=$(sqlq "$result_txt") WHERE id=${id};"
     flipped=1
+    # DIVE-1415: `task verify` auto-done is a terminal close like `task done`, so
+    # it must release this task's dependents too. DIVE-1355 wired the cascade
+    # only into `_task_status_cmd` (the done/cancel verbs); a task closed via
+    # verify (or the gate paths below) left its dependents stuck 'blocked' with
+    # a satisfied edge — the exact stall that froze OSS-32/33 behind OSS-27
+    # overnight (OSS-27 closed via `task verify`, cascade never ran).
+    _task_cascade_unblock "$id" || true
   else
     db "UPDATE tasks SET result=$(sqlq "$result_txt") WHERE id=${id};"
   fi
@@ -3025,6 +3035,9 @@ cmd_task_answer() {
     db "UPDATE tasks SET status='done', done_at=datetime('now'),
            result=CASE WHEN COALESCE(result,'')='' THEN 'Closed via manual-gate tap — marked done by '||$(sqlq "$answered_by") ELSE result END
         WHERE id=${id};"
+    # DIVE-1415: a manual-gate answer that closes the task DONE is terminal — its
+    # dependents must release just as they would on `task done`.
+    _task_cascade_unblock "$id" || true
   else
     # Clearing the gate ≠ unblocking. `status='blocked'` is overloaded (human
     # gate AND task-task `block` edges), so RECOMPUTE rather than hardcode todo:
@@ -3080,6 +3093,10 @@ cmd_task_answer() {
       else
         db "UPDATE tasks SET status='done', done_at=datetime('now') WHERE id=${id};"
         _task_loop_advance "$id" || true
+        # DIVE-1415: _task_loop_advance only frees this gate's loop-STEP siblings;
+        # a non-loop task blocked_by this gate step is a cross-DAG dependent it
+        # never touches. Cascade so those release on the gate's terminal close.
+        _task_cascade_unblock "$id" || true
       fi
       fi
       ;;

@@ -154,6 +154,54 @@ else
   bad_t "park sweep guardrail" "P status=$(st "$p")"
 fi
 
+# =============================================================================
+# DIVE-1415: NON-`task done` terminal closes must cascade too. DIVE-1355 wired
+# the cascade only into `_task_status_cmd` (the done/cancel verbs); a task closed
+# via `task verify` (auto-done) or a gate answer that closes-as-done left its
+# dependents stuck 'blocked' with a satisfied edge. This is the exact stall that
+# froze OSS-32/33 behind OSS-27 overnight — OSS-27 closed via `task verify`.
+# =============================================================================
+
+# --- T9: `task verify` PASS (auto-done) cascades its dependent (the OSS-27 path)
+a=$(addt --assignee=dev -- "A verify-closed"); b=$(addt --assignee=bob -- "B behind verify")
+( cmd_task_block "$b" --by="$a" ) >/dev/null 2>&1
+[[ "$(st "$b")" == "blocked" && "$(edges "$b")" == "1" ]] || bad_t "T9 setup" "B not blocked"
+( cmd_task_verify "$a" --cmd="true" ) >/dev/null 2>&1
+[[ "$(st "$a")" == "done" && "$(st "$b")" == "todo" && "$(edges "$b")" == "0" ]] \
+  && ok_t "verify auto-done cascades dependent blocked->todo, edge dropped" \
+  || bad_t "verify cascade" "A=$(st "$a") B=$(st "$b") edges=$(edges "$b")"
+
+# --- T9b: `task verify` respects the same guardrail (gated dependent stays blocked)
+a=$(addt --assignee=dev -- "A verify gate"); b=$(addt --assignee=bob -- "B gated behind verify")
+( cmd_task_block "$b" --by="$a" ) >/dev/null 2>&1
+( cmd_task_need "$b" --type=decision --options="X|Y" --ask="pick" ) >/dev/null 2>&1
+( cmd_task_verify "$a" --cmd="true" ) >/dev/null 2>&1
+[[ "$(st "$b")" == "blocked" && "$(edges "$b")" == "0" ]] \
+  && ok_t "verify-close honors guardrail: gated dependent stays blocked (edge dropped)" \
+  || bad_t "verify guardrail" "B=$(st "$b") edges=$(edges "$b")"
+
+# --- T9c: `task verify --no-done` (no close) must NOT cascade
+a=$(addt --assignee=dev -- "A verify no-done"); b=$(addt --assignee=bob -- "B still blocked")
+( cmd_task_block "$b" --by="$a" ) >/dev/null 2>&1
+( cmd_task_verify "$a" --cmd="true" --no-done ) >/dev/null 2>&1
+[[ "$(st "$a")" != "done" && "$(st "$b")" == "blocked" && "$(edges "$b")" == "1" ]] \
+  && ok_t "verify --no-done leaves dependent blocked (no premature cascade)" \
+  || bad_t "verify no-done" "A=$(st "$a") B=$(st "$b") edges=$(edges "$b")"
+
+# --- T10: a MANUAL gate answered 'done' (close-as-done) cascades its dependent.
+# The answer must come from a HUMAN caller (the agent-uid guard rightly blocks an
+# agent self-answering a manual gate), so stub `id` to a non-agent identity and
+# pass --human for the scope of this case only.
+a=$(addt --assignee=dev -- "A manual-gate done"); b=$(addt --assignee=bob -- "B behind manual gate")
+( cmd_task_block "$b" --by="$a" ) >/dev/null 2>&1
+( cmd_task_need "$a" --type=manual --ask="handle it" ) >/dev/null 2>&1
+id() { case "$1" in -un) echo "lodar";; -u) echo "1000";; *) echo "lodar";; esac; }  # human caller
+( cmd_task_answer "$a" --value=done --human ) >/dev/null 2>&1
+unset -f id
+[[ "$(st "$a")" == "done" && "$(st "$b")" == "todo" && "$(edges "$b")" == "0" ]] \
+  && ok_t "manual-gate 'done' answer cascades dependent blocked->todo" \
+  || bad_t "manual-gate cascade" "A=$(st "$a") B=$(st "$b") edges=$(edges "$b")"
+
 echo "-----"
 echo "task_cascade_unblock_unit: $PASS passed, $FAIL failed"
 [[ "$FAIL" -eq 0 ]]
