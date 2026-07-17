@@ -4628,16 +4628,65 @@ opencode_apply_model_default() {
   fi
 }
 
-# pi_apply_model_default <agent-name> <provider> <model> — pin a pi agent's
-# default provider+model by merging {defaultProvider,defaultModel} into its
-# ~/.pi/agent/settings.json. pi reads these at startup, so the agent boots onto
-# the chosen model with no interactive /model step (pi has no PI_MODEL env var,
-# so this is the only launch-time model-pin surface). Idempotent: preserves any
-# other settings keys, overwrites only the two model fields. Runs as root at
-# create time (owns the write to the agent user's home); file ends up owned by
-# agent-<name> at 0600 like pi's own settings writes. DIVE-1205.
+# pi_catalog <provider> <env-var> <api-key> — emit pi's model ids for <provider>,
+# one per line, exact-matchable. pi has no `models` subcommand; `--list-models`
+# prints a whitespace table (provider / model / context / …) of the AUTHED
+# providers only, so the key must be injected. We keep the rows whose provider
+# column equals <provider> and print the model column with pi's leading "~"
+# alias marker stripped (e.g. "~google/gemini-flash-latest" -> the printed slug),
+# which naturally drops the header and the "No models available" line. The model
+# ids carry no spaces, so awk's default field split is safe. HOME is thrown away
+# so a root create can't pollute a real home. PI_BIN overrides the binary for
+# unit tests. Non-zero (and empty) when the binary is missing or enumeration
+# fails offline — the caller fails OPEN on that. DIVE-1402.
+pi_catalog() {
+  local provider="$1" var="$2" key="$3"
+  local pibin="${PI_BIN:-$(command -v pi 2>/dev/null || echo /home/claude/.local/bin/pi)}"
+  [[ -x "$pibin" ]] || return 1
+  local h; h=$(mktemp -d) || return 1
+  HOME="$h" env "${var}=${key}" "$pibin" --list-models 2>/dev/null \
+    | awk -v p="$provider" '$1==p { sub(/^~/, "", $2); print $2 }'
+  local rc=${PIPESTATUS[0]}
+  rm -rf "$h"
+  return "$rc"
+}
+
+# pi_validate_model_or_fail <provider> <model> <api-key> — reject a --model that
+# pi's registry does not carry for <provider>. DIVE-1402 (pi twin of DIVE-1395):
+# pi_apply_model_default pinned any slug into settings.json blindly, so a stale
+# or misspelled model (e.g. the reported `google/gemini-2.0-flash-lite-001`,
+# which pi lacks — it carries `google/gemini-2.5-flash-lite`) left the agent
+# booting without the intended model. Best-effort and fail-OPEN: it only bites
+# when we can actually enumerate (key present + catalog reachable + non-empty),
+# so a missing key or an offline `pi --list-models` never blocks create. pi
+# accepts a "<slug>:<thinking>" suffix, so we compare on the slug alone.
+pi_validate_model_or_fail() {
+  local provider="$1" model="$2" api_key="${3:-}"
+  [[ -n "$api_key" ]] || return 0
+  local var; var=$(pi_provider_var "$provider") || return 0
+  local slug="${model%%:*}"
+  local catalog; catalog=$(pi_catalog "$provider" "$var" "$api_key") || return 0
+  [[ -n "$catalog" ]] || return 0
+  grep -qxF "$slug" <<<"$catalog" && return 0
+  local sugg; sugg=$(grep -F "${slug%%/*}/" <<<"$catalog" | head -5 \
+    | awk 'NR>1{printf ", "}{printf "%s", $0}')
+  fail "$E_VALIDATION" "pi has no model '$slug' for provider '$provider'. A fresh agent would boot without the pinned model (no runnable default).${sugg:+ Close matches: $sugg.} Run 'pi --list-models $provider' for the full list."
+}
+
+# pi_apply_model_default <agent-name> <provider> <model> [api-key] — pin a pi
+# agent's default provider+model by merging {defaultProvider,defaultModel} into
+# its ~/.pi/agent/settings.json. pi reads these at startup, so the agent boots
+# onto the chosen model with no interactive /model step (pi has no PI_MODEL env
+# var, so this is the only launch-time model-pin surface). When the provider
+# api-key is supplied (DIVE-1402) the slug is validated against pi's live
+# registry first, so an unresolvable model fails create loudly instead of
+# pinning a dead default. Idempotent: preserves any other settings keys,
+# overwrites only the two model fields. Runs as root at create time (owns the
+# write to the agent user's home); file ends up owned by agent-<name> at 0600
+# like pi's own settings writes. DIVE-1205.
 pi_apply_model_default() {
-  local name="$1" provider="$2" model="$3"
+  local name="$1" provider="$2" model="$3" api_key="${4:-}"
+  pi_validate_model_or_fail "$provider" "$model" "$api_key"
   local home="/home/agent-${name}" dir sf
   dir="${home}/.pi/agent"; sf="${dir}/settings.json"
   install -d -m 700 -o "agent-${name}" -g "agent-${name}" \
@@ -7811,7 +7860,7 @@ cmd_create() {
     # env-injected (DIVE-1200) but the model selection is settings-file only.
     # Only pi's built-in providers reach this branch (validated above via
     # PI_PROVIDER_VAR), so pi already knows the base_url; we just name the model.
-    pi_apply_model_default "$name" "$byo_provider" "$byo_model"
+    pi_apply_model_default "$name" "$byo_provider" "$byo_model" "$byo_api_key"
   elif [[ "$type" == "opencode" && -n "$byo_model" ]]; then
     # OpenCode's persisted model uses provider_id/model_id. This lets an
     # OpenRouter-backed agent boot straight onto DeepSeek/GLM/Kimi/Qwen rather

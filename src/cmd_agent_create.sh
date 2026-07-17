@@ -1014,7 +1014,7 @@ cmd_create() {
     # env-injected (DIVE-1200) but the model selection is settings-file only.
     # Only pi's built-in providers reach this branch (validated above via
     # PI_PROVIDER_VAR), so pi already knows the base_url; we just name the model.
-    pi_apply_model_default "$name" "$byo_provider" "$byo_model"
+    pi_apply_model_default "$name" "$byo_provider" "$byo_model" "$byo_api_key"
   elif [[ "$type" == "opencode" && -n "$byo_model" ]]; then
     # OpenCode's persisted model uses provider_id/model_id. This lets an
     # OpenRouter-backed agent boot straight onto DeepSeek/GLM/Kimi/Qwen rather
