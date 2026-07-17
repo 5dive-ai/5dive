@@ -2069,19 +2069,28 @@ cmd_task_need() {
       && fail "$E_CONFLICT" "$ident is $w_status — nothing to withdraw"
     [[ -n "$w_type" ]] || fail "$E_CONFLICT" "$ident has no gate to withdraw"
     [[ -z "$w_ans" ]]  || fail "$E_CONFLICT" "$ident's gate is already answered — --withdraw only applies to a still-pending gate (need_answered_at IS NULL)"
-    # Authorize: the gate's filer (assignee), the filer's routed lead, the org
-    # coordinator, or any human caller. An agent that is none of these is refused.
-    local w_filer w_actor w_caller w_lead w_coord w_ok=0
+    # Authorize on the TRUSTED caller identity — NEVER on --from (caller-asserted;
+    # task_actor would return it verbatim, so any agent could pass --from=<filer>
+    # to impersonate) nor $USER (env-spoofable). Two UNSPOOFABLE agent sources:
+    # SUDO_USER when the caller ran under `sudo` (sudo sets it; auto_sender_from_sudo
+    # reads it), else the real `id -un` login. A genuine human is a non-agent
+    # SUDO_UID — this MIRRORS cmd_task_answer's evidence floor; `id -un != agent-*`
+    # alone is the one-sudo forge (any agent that `sudo`s becomes root, so root-by-
+    # sudo must NOT count as human). --from is retained for attribution only.
+    local w_filer w_agent w_lead w_coord w_ok=0
     w_filer=$(db "SELECT COALESCE(assignee,'') FROM tasks WHERE id=${id};")
-    w_actor=$(task_actor "$from")
-    w_caller=$(id -un 2>/dev/null || echo '?')
+    w_agent=$(auto_sender_from_sudo)                      # trusted: SUDO_USER (survives sudo)
+    if [[ -z "$w_agent" ]]; then                          # else the real unix login (never $USER)
+      local _idun; _idun=$(id -un 2>/dev/null || echo "")
+      [[ "$_idun" == agent-* ]] && w_agent="${_idun#agent-}"
+    fi
     w_lead=$(_gate_route_reviewer "$w_filer")
     w_coord=$(_task_resolve_coordinator)
-    [[ "$w_caller" != agent-* ]] && w_ok=1                                  # a human caller
-    [[ -n "$w_actor" && "$w_actor" == "$w_filer" ]] && w_ok=1              # the filer
-    [[ -n "$w_actor" && -n "$w_lead"  && "$w_actor" == "$w_lead"  ]] && w_ok=1  # filer's lead
-    [[ -n "$w_actor" && -n "$w_coord" && "$w_actor" == "$w_coord" ]] && w_ok=1  # org coordinator
-    (( w_ok )) || fail "$E_AUTH_REQUIRED" "only the gate's filer (${w_filer:-?}), their lead, or a human can withdraw $ident's gate (you: ${w_actor:-?})"
+    _gate_sudo_uid_nonagent && w_ok=1                                       # a genuine human caller
+    [[ -n "$w_agent" && "$w_agent" == "$w_filer" ]] && w_ok=1              # the filer
+    [[ -n "$w_agent" && -n "$w_lead"  && "$w_agent" == "$w_lead"  ]] && w_ok=1  # filer's lead
+    [[ -n "$w_agent" && -n "$w_coord" && "$w_agent" == "$w_coord" ]] && w_ok=1  # org coordinator
+    (( w_ok )) || fail "$E_AUTH_REQUIRED" "only the gate's filer (${w_filer:-?}), their lead, or a human can withdraw $ident's gate"
     # Clear every gate field (NEVER need_answer/need_answered_at — this is not a
     # grant) and unblock back to todo when no dependency edge still holds it.
     db "UPDATE tasks
@@ -2094,7 +2103,7 @@ cmd_task_need() {
         UPDATE tasks SET status='todo'
           WHERE id=${id} AND status='blocked'
             AND NOT EXISTS (SELECT 1 FROM task_deps WHERE task_id=${id});"
-    [[ $EUID -eq 0 ]] && audit_log "task need withdraw" "ok" 0 -- "task=$ident" "type=$w_type" "by=$w_actor" || true
+    [[ $EUID -eq 0 ]] && audit_log "task need withdraw" "ok" 0 -- "task=$ident" "type=$w_type" "by=${w_agent:-human}" "asserted_from=${from:-}" || true
     local w_new; w_new=$(db "SELECT status FROM tasks WHERE id=${id};")
     ok "$ident gate withdrawn (${w_type}) — moot request cleared, no secret/grant recorded; task now ${w_new}" \
        '{ident:$id, withdrawn:true, was_type:$wt, status:$st}' \
