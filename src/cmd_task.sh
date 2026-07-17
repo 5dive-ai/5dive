@@ -55,6 +55,7 @@ _task_usage() {
   # Human Task Inbox — park a task on a human and clear it
   5dive task need <id|DIVE-N> --type=decision|secret|approval|manual|access --ask="..." [--options=A|B] [--recommend="A"] [--tier=0|1|2]
                                                      # --type=access: manager-clearable "grant me X" gate — routes to the org lead first (any tier), lead-clearable; add --probe='test -w /path' to self-check the block
+  5dive task need <id|DIVE-N> --withdraw            # DIVE-1401: cancel a still-pending gate the team filed but that's now moot — filer or org lead, no human tap. NOT a grant (never records a secret/approval); genuine clears stay human-only.
     --ask: ONE crisp question + ~1 line essential context, recommendation up front. Heavy detail goes in the task BODY, not the ask.
     --recommend: your advised choice (strongly encouraged for decision/approval). Leads the alert as '✅ Recommended: <X>' and ⭐-marks its button. For a decision it must match one of --options.
     --tier (DIVE-891 risk tiers): 0 = auto-clear (rec applies NOW, no ping, digest line; requires --recommend)
@@ -2018,7 +2019,7 @@ _gate_shape_jaccard() {
 
 cmd_task_need() {
   tasks_db_init
-  local type="" ask="" options="" recommend="" from="" tier="" secret_key="" connector="" probe=""
+  local type="" ask="" options="" recommend="" from="" tier="" secret_key="" connector="" probe="" withdraw=""
   local -a positional=()
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -2028,6 +2029,11 @@ cmd_task_need() {
       --recommend=*) recommend="${1#*=}" ;;
       --tier=*)      tier="${1#*=}" ;;
       --from=*)      from="${1#*=}" ;;
+      # DIVE-1401: withdraw a still-pending gate the team ITSELF filed but that is
+      # now moot (e.g. a secret gate for fixtures never needed). This is NOT a
+      # grant — it never records a secret/approval as provided — so it is safe for
+      # the gate's filer or an org lead to run without a human tap. See branch below.
+      --withdraw)    withdraw=1 ;;
       # DIVE-931 secure credential drop: name WHERE a secret gate's value lands.
       # Both together enable the burnable drop link in the gate message.
       --secret-key=*) secret_key="${1#*=}" ;;
@@ -2041,8 +2047,61 @@ cmd_task_need() {
     esac
     shift
   done
-  [[ ${#positional[@]} -gt 0 ]] || fail "$E_USAGE" "usage: 5dive task need <id|DIVE-N> --type=decision|secret|approval|manual --ask=\"...\" [--options=A|B] [--recommend=\"A\"]"
+  [[ ${#positional[@]} -gt 0 ]] || fail "$E_USAGE" "usage: 5dive task need <id|DIVE-N> --type=decision|secret|approval|manual --ask=\"...\" [--options=A|B] [--recommend=\"A\"]  (or --withdraw to cancel a moot pending gate)"
   resolve_task_id "${positional[0]}"; local id="$RESOLVED_TASK_ID" ident="$RESOLVED_TASK_IDENT"
+
+  # DIVE-1401: --withdraw path. Secret/approval/manual gates are human-only to
+  # CLEAR by deliberate security scope (an agent can't fake a secret grant). But
+  # WITHDRAWING a still-pending request the team itself filed is not a grant — it
+  # cancels a moot gate and unblocks the task WITHOUT ever writing need_answer /
+  # need_answered_at, so no secret is recorded as provided. Allowed for the gate's
+  # FILER (assignee of record, set at file time), the filer's routed lead /
+  # coordinator, or a human caller (non-agent unix id). Genuine GRANT-clears stay
+  # human-only via cmd_task_answer — this branch never touches that path.
+  if [[ -n "$withdraw" ]]; then
+    [[ -z "$type$ask$options$recommend$tier$secret_key$connector$probe" ]] \
+      || fail "$E_USAGE" "--withdraw takes no other gate flags (it cancels the existing gate, not re-files one)"
+    local w_type w_ans w_status
+    w_type=$(db "SELECT COALESCE(need_type,'')        FROM tasks WHERE id=${id};")
+    w_ans=$(db  "SELECT COALESCE(need_answered_at,'') FROM tasks WHERE id=${id};")
+    w_status=$(db "SELECT status FROM tasks WHERE id=${id};")
+    [[ "$w_status" == "done" || "$w_status" == "cancelled" ]] \
+      && fail "$E_CONFLICT" "$ident is $w_status — nothing to withdraw"
+    [[ -n "$w_type" ]] || fail "$E_CONFLICT" "$ident has no gate to withdraw"
+    [[ -z "$w_ans" ]]  || fail "$E_CONFLICT" "$ident's gate is already answered — --withdraw only applies to a still-pending gate (need_answered_at IS NULL)"
+    # Authorize: the gate's filer (assignee), the filer's routed lead, the org
+    # coordinator, or any human caller. An agent that is none of these is refused.
+    local w_filer w_actor w_caller w_lead w_coord w_ok=0
+    w_filer=$(db "SELECT COALESCE(assignee,'') FROM tasks WHERE id=${id};")
+    w_actor=$(task_actor "$from")
+    w_caller=$(id -un 2>/dev/null || echo '?')
+    w_lead=$(_gate_route_reviewer "$w_filer")
+    w_coord=$(_task_resolve_coordinator)
+    [[ "$w_caller" != agent-* ]] && w_ok=1                                  # a human caller
+    [[ -n "$w_actor" && "$w_actor" == "$w_filer" ]] && w_ok=1              # the filer
+    [[ -n "$w_actor" && -n "$w_lead"  && "$w_actor" == "$w_lead"  ]] && w_ok=1  # filer's lead
+    [[ -n "$w_actor" && -n "$w_coord" && "$w_actor" == "$w_coord" ]] && w_ok=1  # org coordinator
+    (( w_ok )) || fail "$E_AUTH_REQUIRED" "only the gate's filer (${w_filer:-?}), their lead, or a human can withdraw $ident's gate (you: ${w_actor:-?})"
+    # Clear every gate field (NEVER need_answer/need_answered_at — this is not a
+    # grant) and unblock back to todo when no dependency edge still holds it.
+    db "UPDATE tasks
+          SET need_type=NULL, ask=NULL, need_options=NULL, recommend=NULL,
+              secret_key=NULL, connector=NULL, ask_shape=NULL,
+              precedent_ref=NULL, precedent_kind=NULL, routed_reviewer=NULL,
+              need_asked_at=NULL, gate_pinged_at=NULL,
+              need_answer=NULL, need_answered_at=NULL
+        WHERE id=${id};
+        UPDATE tasks SET status='todo'
+          WHERE id=${id} AND status='blocked'
+            AND NOT EXISTS (SELECT 1 FROM task_deps WHERE task_id=${id});"
+    [[ $EUID -eq 0 ]] && audit_log "task need withdraw" "ok" 0 -- "task=$ident" "type=$w_type" "by=$w_actor" || true
+    local w_new; w_new=$(db "SELECT status FROM tasks WHERE id=${id};")
+    ok "$ident gate withdrawn (${w_type}) — moot request cleared, no secret/grant recorded; task now ${w_new}" \
+       '{ident:$id, withdrawn:true, was_type:$wt, status:$st}' \
+       --arg id "$ident" --arg wt "$w_type" --arg st "$w_new"
+    return
+  fi
+
   valid_need_type "$type" || fail "$E_VALIDATION" "bad --type '$type' (decision|secret|approval|manual|access)"
   [[ -n "$ask" ]] || fail "$E_USAGE" "--ask is required (what does the human need to provide?)"
 
