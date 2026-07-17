@@ -334,6 +334,35 @@ CREATE TABLE IF NOT EXISTS loop_runs (
 );
 CREATE INDEX IF NOT EXISTS loop_runs_status_idx ON loop_runs(status);
 
+-- DIVE-1349: async goal-planner jobs. `goal add` (default, no --wait) spawns the
+-- planner loop WITHOUT blocking and records the job here, returning a job id
+-- immediately so the dashboard goals page never holds an HTTP request past the
+-- gateway timeout (the old sync wait 502'd whenever the planner was busy/slow).
+-- `goal status <job>` reads the backing planner task (task_id) and, once it lands
+-- a plan, runs the same validate -> dry-run/gate/materialize tail. result_json
+-- caches the terminal envelope so repeat polls are idempotent (a materialize
+-- happens exactly once). Additive, never referenced by tasks/projects.
+CREATE TABLE IF NOT EXISTS goal_jobs (
+  job_id      TEXT PRIMARY KEY,
+  loop_id     TEXT NOT NULL,
+  task_id     INTEGER NOT NULL,
+  outcome     TEXT NOT NULL,
+  project     TEXT,
+  planner     TEXT NOT NULL,
+  max_tasks   INTEGER NOT NULL,
+  depth_cap   INTEGER NOT NULL,
+  checkpoint  INTEGER NOT NULL,
+  ceiling     INTEGER NOT NULL,
+  dry_run     INTEGER NOT NULL DEFAULT 0,
+  yes         INTEGER NOT NULL DEFAULT 0,
+  from_actor  TEXT,
+  status      TEXT NOT NULL DEFAULT 'running',
+  result_json TEXT,
+  created_at  INTEGER NOT NULL,
+  updated_at  INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS goal_jobs_status_idx ON goal_jobs(status);
+
 -- DIVE-724 P1: append-only supervisor audit trail. Written ONLY by
 -- `5dive supervisor --tick`: one event='observe' row per agent per tick when
 -- its classification != healthy, plus an event='transition' row whenever the
@@ -565,6 +594,37 @@ CREATE TABLE IF NOT EXISTS loop_runs (
   updated_at       INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS loop_runs_status_idx ON loop_runs(status);
+MIG
+  fi
+
+  # DIVE-1349 goal_jobs table — additive, gated on absence like loop_runs above so
+  # it takes no write lock on every command. Brand-new table, never referenced by
+  # tasks/projects, so creating it cannot touch the existing queue.
+  local has_goal_jobs
+  has_goal_jobs=$(sqlite3 -cmd ".timeout 5000" "$TASKS_DB" \
+    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='goal_jobs' LIMIT 1;" 2>/dev/null)
+  if [[ "$has_goal_jobs" != "1" ]]; then
+    sqlite3 -cmd ".timeout 5000" "$TASKS_DB" <<'MIG' >/dev/null 2>&1 || true
+CREATE TABLE IF NOT EXISTS goal_jobs (
+  job_id      TEXT PRIMARY KEY,
+  loop_id     TEXT NOT NULL,
+  task_id     INTEGER NOT NULL,
+  outcome     TEXT NOT NULL,
+  project     TEXT,
+  planner     TEXT NOT NULL,
+  max_tasks   INTEGER NOT NULL,
+  depth_cap   INTEGER NOT NULL,
+  checkpoint  INTEGER NOT NULL,
+  ceiling     INTEGER NOT NULL,
+  dry_run     INTEGER NOT NULL DEFAULT 0,
+  yes         INTEGER NOT NULL DEFAULT 0,
+  from_actor  TEXT,
+  status      TEXT NOT NULL DEFAULT 'running',
+  result_json TEXT,
+  created_at  INTEGER NOT NULL,
+  updated_at  INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS goal_jobs_status_idx ON goal_jobs(status);
 MIG
   fi
 
