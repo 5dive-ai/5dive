@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.10.5 — delegated push behind a gated `5dive push` verb (2026-07-18)
+
+- feat(push): `5dive push <id|DIVE-N> [--branch=<b>] [--dry-run]` — one gated bot identity that pushes ONLY the task's branch, ONLY after its ship gate has cleared, with a fail-closed `author=lodar` pre-push scan so the Vercel team check stays green. Transport auth is a control-plane GitHub App installation token (short-lived ~1h, minted on demand by the root-only `_push_mint_token` helper over NOPASSWD sudo, never persisted, never handed to the agent) — decoupled from commit authorship. Refuses protected branches (main/master/HEAD), missing/open/rejected gates, and any commit not authored by lodar. Fully audited via the `push` dispatch. Bobby gripe #1 (DIVE-1376).
+
 ## 0.10.4 — company-view fields on objective ls (2026-07-18)
 
 - feat(objective): `objective ls --json` now carries the company-view fields the dashboard reads: `planner`, `review` (re-plan cadence cron), `max_new_per_cycle`, and `verified_total` — originated tasks a distinct verifier accepted across all cycles, the same integrity predicate as `objective status` (DIVE-1441), never the planner's self-report (DIVE-1452).
