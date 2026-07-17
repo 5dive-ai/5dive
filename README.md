@@ -93,18 +93,7 @@ sudo 5dive agent pair   my-agent --code=<pairing-code>
 
 Each agent is its own Linux user running an official agentic AI CLI session (`claude`, `codex`, `antigravity`, `grok`, …) as a systemd service. Multiple agents can share the same CLI binary and subscription. Agents reach each other by invoking the same `5dive` CLI — that *is* the bus. Channels like Telegram attach per agent.
 
-```text
-            one host
- ┌──────────────────────────────────┐
- │  coder      writer       pm      │
- │ (claude)   (codex)     (claude)  │
- │    │          │           │      │
- │    └────  5dive CLI  ─────┘      │
- │       send · ask · logs          │
- └──────────────────────────────────┘
-        ↕ Telegram / Discord
-        (attach per agent)
-```
+![the operating system is the orchestrator: coder, writer and pm agents coordinate through the 5dive CLI (the bus) on one Linux host — identity is Linux users, supervision is systemd, logs are journald, backlog is SQLite, heartbeat is cron, isolation is unix permissions; humans decide only when needed](docs/how-it-works.png)
 
 No broker, no protocol, no orchestrator. Shared filesystem, shared CLI.
 
