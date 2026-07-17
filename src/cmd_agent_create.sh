@@ -1128,6 +1128,18 @@ cmd_create() {
   # right before `systemctl enable --now`, regardless of what tightened them.
   if [[ "$type" == "hermes" ]] && [[ -d /home/claude/.hermes ]]; then
     chmod 0775 /home/claude/.hermes
+    # DIVE-1394: hermes writes config.yaml/auth.json mode 0600 owner=claude, so
+    # a standard-isolation agent (no passwordless sudo) can't read them and the
+    # boot-time seed no-op'd — leaving the agent unconfigured on the Nous setup
+    # wizard. Normalize the shared (no-profile) seed source to 0640 g=claude so
+    # the plain-read seed path works for group-member agents. The profiled path
+    # is already normalized by normalize_profile_seed_perms at bind time.
+    for _hf in config.yaml auth.json; do
+      if [[ -f "/home/claude/.hermes/${_hf}" ]]; then
+        chgrp claude "/home/claude/.hermes/${_hf}" 2>/dev/null || true
+        chmod 0640 "/home/claude/.hermes/${_hf}" 2>/dev/null || true
+      fi
+    done
   fi
 
   # Hermes onboarding finalization. The chat CLI's first-run check
