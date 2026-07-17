@@ -48,11 +48,22 @@ if grep -qF 'config set model.default openrouter/auto' "$capture"; then
 fi
 
 # Exercise the real Claude preseed function and inspect the JSON it sends to
-# settings.json. The pre-existing agent-codex home satisfies its guarded home
-# check; sudo/chmod/default-skill operations are stubbed so nothing is written.
+# settings.json. Use a deliberately absent agent home so the harness behaves
+# identically on a 5dive VM and a clean GitHub runner; the guarded missing-home
+# failure and every write/default-skill operation are stubbed locally.
+test_agent="byomodel-ci-${BASHPID}"
+expected_settings_path="/home/agent-${test_agent}/.claude/settings.json"
+E_GENERIC="${E_GENERIC:-1}"
+fail() {
+  if [[ "$*" == *"agent home missing: /home/agent-${test_agent}"* ]]; then
+    return 0
+  fi
+  printf 'unexpected fail(): %s\n' "$*" >&2
+  return 1
+}
 sudo() {
   local args="$*"
-  if [[ "$args" == *'tee /home/agent-codex/.claude/settings.json'* ]]; then
+  if [[ "$args" == *"tee ${expected_settings_path}"* ]]; then
     cat >"$captured_settings"
   elif [[ "$args" == *'tee '* ]]; then
     cat >/dev/null
@@ -61,7 +72,7 @@ sudo() {
 }
 chmod() { :; }
 install_default_skill_for_agent() { :; }
-preseed_claude_agent codex none google/gemini-2.5-pro
+preseed_claude_agent "$test_agent" none google/gemini-2.5-pro
 jq -e '.model == "google/gemini-2.5-pro"' "$captured_settings" >/dev/null
 
 create_src=$(<src/cmd_agent_create.sh)
