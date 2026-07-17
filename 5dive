@@ -26,7 +26,7 @@ esac
 
 # Bumped on every public release. `build.sh` checks this line exists; CI fails
 # the bundle-drift check if it's missing or empty.
-readonly FIVE_VERSION="0.9.26"
+readonly FIVE_VERSION="0.9.27"
 
 # GitHub org our repos live under. The org is being renamed
 # 5dive-com -> 5dive-ai (2026-06); fetches must work on either side of the
@@ -3025,6 +3025,35 @@ CREATE TABLE IF NOT EXISTS loop_runs (
 );
 CREATE INDEX IF NOT EXISTS loop_runs_status_idx ON loop_runs(status);
 
+-- DIVE-1349: async goal-planner jobs. `goal add` (default, no --wait) spawns the
+-- planner loop WITHOUT blocking and records the job here, returning a job id
+-- immediately so the dashboard goals page never holds an HTTP request past the
+-- gateway timeout (the old sync wait 502'd whenever the planner was busy/slow).
+-- `goal status <job>` reads the backing planner task (task_id) and, once it lands
+-- a plan, runs the same validate -> dry-run/gate/materialize tail. result_json
+-- caches the terminal envelope so repeat polls are idempotent (a materialize
+-- happens exactly once). Additive, never referenced by tasks/projects.
+CREATE TABLE IF NOT EXISTS goal_jobs (
+  job_id      TEXT PRIMARY KEY,
+  loop_id     TEXT NOT NULL,
+  task_id     INTEGER NOT NULL,
+  outcome     TEXT NOT NULL,
+  project     TEXT,
+  planner     TEXT NOT NULL,
+  max_tasks   INTEGER NOT NULL,
+  depth_cap   INTEGER NOT NULL,
+  checkpoint  INTEGER NOT NULL,
+  ceiling     INTEGER NOT NULL,
+  dry_run     INTEGER NOT NULL DEFAULT 0,
+  yes         INTEGER NOT NULL DEFAULT 0,
+  from_actor  TEXT,
+  status      TEXT NOT NULL DEFAULT 'running',
+  result_json TEXT,
+  created_at  INTEGER NOT NULL,
+  updated_at  INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS goal_jobs_status_idx ON goal_jobs(status);
+
 -- DIVE-724 P1: append-only supervisor audit trail. Written ONLY by
 -- `5dive supervisor --tick`: one event='observe' row per agent per tick when
 -- its classification != healthy, plus an event='transition' row whenever the
@@ -3256,6 +3285,37 @@ CREATE TABLE IF NOT EXISTS loop_runs (
   updated_at       INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS loop_runs_status_idx ON loop_runs(status);
+MIG
+  fi
+
+  # DIVE-1349 goal_jobs table — additive, gated on absence like loop_runs above so
+  # it takes no write lock on every command. Brand-new table, never referenced by
+  # tasks/projects, so creating it cannot touch the existing queue.
+  local has_goal_jobs
+  has_goal_jobs=$(sqlite3 -cmd ".timeout 5000" "$TASKS_DB" \
+    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='goal_jobs' LIMIT 1;" 2>/dev/null)
+  if [[ "$has_goal_jobs" != "1" ]]; then
+    sqlite3 -cmd ".timeout 5000" "$TASKS_DB" <<'MIG' >/dev/null 2>&1 || true
+CREATE TABLE IF NOT EXISTS goal_jobs (
+  job_id      TEXT PRIMARY KEY,
+  loop_id     TEXT NOT NULL,
+  task_id     INTEGER NOT NULL,
+  outcome     TEXT NOT NULL,
+  project     TEXT,
+  planner     TEXT NOT NULL,
+  max_tasks   INTEGER NOT NULL,
+  depth_cap   INTEGER NOT NULL,
+  checkpoint  INTEGER NOT NULL,
+  ceiling     INTEGER NOT NULL,
+  dry_run     INTEGER NOT NULL DEFAULT 0,
+  yes         INTEGER NOT NULL DEFAULT 0,
+  from_actor  TEXT,
+  status      TEXT NOT NULL DEFAULT 'running',
+  result_json TEXT,
+  created_at  INTEGER NOT NULL,
+  updated_at  INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS goal_jobs_status_idx ON goal_jobs(status);
 MIG
   fi
 
@@ -18790,6 +18850,7 @@ cmd_goal() {
   local sub="${1:-}"; shift || true
   case "$sub" in
     add|new)         cmd_goal_add "$@" ;;
+    status)          cmd_goal_status "$@" ;;
     -h|--help|help|"") _goal_usage ;;
     *)               fail "$E_USAGE" "unknown goal command: $sub (try: 5dive goal --help)" ;;
   esac
@@ -18814,12 +18875,24 @@ _goal_usage() {
                             #   HUMAN 'approve' (DIVE-916), re-validates, builds.
                             #   The only path that materializes a T2 plan.
       [--from=<who>]        # actor override
+      [--wait[=<sec>]]      # scripts only: block for the plan (bounded), legacy
+                            #   sync behaviour. DEFAULT is async (see below).
+
+  5dive goal status <job>   # poll an async goal-add job: queued | running |
+                            # done (plan/gated/materialized) | failed
 
   JSON in/out (add --json). A plan is validated (DAG acyclicity, cap, depth,
   tier-floor, assignability) before anything is created. Over the checkpoint
   threshold or carrying any T2 task -> ONE decision gate carries the plan and
   nothing is materialized until a human approves; a T2 plan gates at hard tier 2
   and is materialized only via --from-gate=<id> on a human 'approve'.
+
+  ASYNC (DIVE-1349): by default \`goal add\` returns IMMEDIATELY with a job id
+  after spawning the planner (agent-driven planning is inherently async and a
+  busy/slow planner must never hold an HTTP request to a gateway 502). Poll
+  \`goal status <job>\`. Pass --plan=<json> to skip the planner (synchronous,
+  fast) or --wait for the legacy bounded block (scripts). If the planner is
+  already idle, \`goal add\` optimistically returns the finished result inline.
 USAGE
 }
 
@@ -19170,7 +19243,7 @@ cmd_goal_add() {
   tasks_db_init
   local project="" planner="" max_tasks="$GOAL_MAX_TASKS_DEFAULT" depth_cap="$GOAL_DEPTH_CAP_DEFAULT"
   local checkpoint="$GOAL_CHECKPOINT_DEFAULT" ceiling="$GOAL_CEILING_DEFAULT"
-  local dry_run="" yes="" plan="" from="" from_gate=""
+  local dry_run="" yes="" plan="" from="" from_gate="" from_job="" wait_flag="" wait_secs=""
   local -a words=()
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -19184,13 +19257,17 @@ cmd_goal_add() {
       --yes)          yes=1 ;;
       --plan=*)       plan="${1#*=}" ;;
       --from-gate=*)  from_gate="${1#*=}" ;;
+      --from-job=*)   from_job="${1#*=}" ;;
       --from=*)       from="${1#*=}" ;;
+      --wait)         wait_flag=1 ;;
+      --wait=*)       wait_flag=1; wait_secs="${1#*=}" ;;
       --)             shift; words+=("$@"); break ;;
       -*)             fail "$E_USAGE" "unknown flag: $1" ;;
       *)              words+=("$1") ;;
     esac
     shift
   done
+  [[ -z "$wait_secs" || "$wait_secs" =~ ^[1-9][0-9]*$ ]] || fail "$E_VALIDATION" "--wait=<seconds> must be a positive integer"
 
   # DIVE-985 gap A: approve->materialize an already-proposed, human-approved plan.
   # No outcome/planner/plan needed — everything is recovered from the anchor gate.
@@ -19202,24 +19279,72 @@ cmd_goal_add() {
     return
   fi
 
+  # DIVE-1349 create-from-preview: materialize the plan an async job already
+  # computed. The dashboard previews with `goal add --dry-run` (async, cached in
+  # goal_jobs), then creates with `--from-job=<jobid>` — a small arg that reuses
+  # the EXACT previewed plan, so the plan JSON never has to ride the exec tunnel
+  # (TASK_ARG_RE caps args at 2000 chars / no newlines, which a real plan blows).
+  if [[ -n "$from_job" ]]; then
+    _goal_from_job "$from_job" "$from"
+    return
+  fi
+
   local outcome="${words[*]:-}"
   [[ -n "$outcome" ]] || fail "$E_USAGE" "usage: 5dive goal add \"<outcome>\" [--project=] [--max-tasks=] [--dry-run] [--yes]"
   for v in "$max_tasks" "$depth_cap" "$checkpoint" "$ceiling"; do
     [[ "$v" =~ ^[1-9][0-9]*$ ]] || fail "$E_VALIDATION" "--max-tasks/--depth-cap/--checkpoint/--ceiling must be positive integers"
   done
 
-  # 1. Get the plan: --plan supplies it directly (test seam + approve->materialize
-  #    path); otherwise invoke the planner agent via loop spawn.
-  if [[ -z "$plan" ]]; then
-    # Resolve the planner: explicit flag > project lead > org coordinator.
-    if [[ -z "$planner" && -n "$project" ]]; then
-      planner=$(db "SELECT COALESCE(lead_agent,'') FROM projects WHERE key=$(sqlq "${project,,}") AND status='active';")
-    fi
-    [[ -n "$planner" ]] || planner=$(_task_resolve_coordinator)
-    [[ -n "$planner" ]] || fail "$E_VALIDATION" "no --planner given and no project lead / org coordinator to fall back to"
-    step "invoking planner '$planner' (ceiling ${ceiling}tok)…"
-    plan=$(_goal_invoke_planner "$outcome" "$planner" "$ceiling" "$max_tasks") || return $?
+  # 1. Get the plan and finish.
+  #  a) --plan supplied -> synchronous finish, skip the planner (the create path:
+  #     the dashboard re-submits the previewed plan, so no planner turn is run).
+  #  b) --wait -> legacy synchronous bounded block for scripts.
+  #  c) default -> ASYNC: spawn the planner, record a job, return a job id at once
+  #     so no HTTP request is ever held to a gateway 502 (DIVE-1349).
+  if [[ -n "$plan" ]]; then
+    _goal_finish_with_plan "$plan" "$outcome" "$project" "$planner" "$max_tasks" "$depth_cap" "$checkpoint" "$yes" "$dry_run" "$from"
+    return $?
   fi
+
+  # Resolve the planner: explicit flag > project lead > org coordinator.
+  if [[ -z "$planner" && -n "$project" ]]; then
+    planner=$(db "SELECT COALESCE(lead_agent,'') FROM projects WHERE key=$(sqlq "${project,,}") AND status='active';")
+  fi
+  [[ -n "$planner" ]] || planner=$(_task_resolve_coordinator)
+  [[ -n "$planner" ]] || fail "$E_VALIDATION" "no --planner given and no project lead / org coordinator to fall back to"
+
+  if [[ -n "$wait_flag" ]]; then
+    step "invoking planner '$planner' (ceiling ${ceiling}tok)…"
+    local wplan
+    wplan=$(GOAL_PLANNER_WAIT_SECS="${wait_secs:-${GOAL_PLANNER_WAIT_SECS:-150}}" \
+              _goal_invoke_planner "$outcome" "$planner" "$ceiling" "$max_tasks") || return $?
+    _goal_finish_with_plan "$wplan" "$outcome" "$project" "$planner" "$max_tasks" "$depth_cap" "$checkpoint" "$yes" "$dry_run" "$from"
+    return $?
+  fi
+
+  _goal_spawn_async_job "$outcome" "$project" "$planner" "$max_tasks" "$depth_cap" "$checkpoint" "$ceiling" "$yes" "$dry_run" "$from"
+}
+
+# ------- finish: _goal_finish_with_plan <plan> <outcome> <project> <planner> <max_tasks> <depth_cap> <checkpoint> <yes> <dry_run> <from> -------
+# Steps 2-6: validate -> resolve project -> dry-run render / gate / materialize.
+# Emits the terminal envelope (dryRun|gated|materialized) in the caller's mode.
+# Shared by the synchronous (--plan / --wait) paths and the async `goal status`
+# poll once the planner lands a plan.
+_goal_finish_with_plan() {
+  local plan="$1" outcome="$2" project="$3" planner="$4" max_tasks="$5" depth_cap="$6" checkpoint="$7" yes="$8" dry_run="$9" from="${10}"
+
+  # DIVE-1349: real planners routinely emit project.title/description instead of
+  # the schema's name/goal (loop spawn --schema is prompt guidance, not a
+  # hard-enforced structured-output contract, so a claude planner drifts). A good
+  # plan should not be thrown away over a field-name nit, so alias title->name and
+  # description->goal (and, as a last resort, the outcome itself) BEFORE validate.
+  # A plan that already carries name/goal is left byte-untouched.
+  local norm
+  norm=$(printf '%s' "$plan" | jq -c --arg oc "$outcome" '
+    if (.project|type)=="object" then
+      .project.name = (if ((.project.name // "")=="") then ((.project.title // "") | if .=="" then $oc else . end) else .project.name end)
+      | .project.goal = (if ((.project.goal // "")=="") then ((.project.description // "") | if .=="" then $oc else . end) else .project.goal end)
+    else . end' 2>/dev/null) && [[ -n "$norm" ]] && plan="$norm"
 
   # 2. Validate (DAG/cap/depth/tier/assignability) — sets GOAL_* globals or fails.
   _goal_validate_plan "$plan" "$max_tasks" "$depth_cap"
@@ -19319,6 +19444,212 @@ cmd_goal_add() {
   else
     ok "goal materialized under '$pkey' — $GOAL_TASK_COUNT task(s), critical path $GOAL_CRIT_PATH: $GOAL_CREATED_IDENTS"
   fi
+}
+
+# ------- async: _goal_spawn_async_job <outcome> <project> <planner> <max_tasks> <depth_cap> <checkpoint> <ceiling> <yes> <dry_run> <from> -------
+# Spawn the planner loop WITHOUT blocking, record a goal_jobs row, and return a
+# job id at once. If the planner is already idle, optimistically wait a few
+# seconds and return the finished result inline; otherwise return the job handle
+# and let the caller poll `goal status`.
+_goal_spawn_async_job() {
+  local outcome="$1" project="$2" planner="$3" max_tasks="$4" depth_cap="$5" checkpoint="$6" ceiling="$7" yes="$8" dry_run="$9" from="${10}"
+  local contract; contract=$(_goal_build_contract "$outcome" "$max_tasks")
+  local schema; schema=$(_goal_plan_schema)
+  local spawn_json
+  spawn_json=$(JSON_MODE=1 cmd_loop_spawn --role=worker --agent="$planner" \
+                 --prompt="$contract" --schema="$schema" --ceiling="$ceiling") || return $?
+  local loop_id task_id task_ident
+  loop_id=$(printf '%s' "$spawn_json"   | jq -r '.data.loopId // ""')
+  task_id=$(printf '%s' "$spawn_json"   | jq -r '.data.taskId // ""')
+  task_ident=$(printf '%s' "$spawn_json" | jq -r '.data.taskIdent // ""')
+  [[ -n "$loop_id" && "$task_id" =~ ^[0-9]+$ ]] || fail "$E_GENERIC" "goal: planner spawn failed ($spawn_json)"
+
+  local now; now=$(date +%s)
+  local dr=0; [[ -n "$dry_run" ]] && dr=1
+  local yn=0; [[ -n "$yes" ]] && yn=1
+  db "INSERT INTO goal_jobs (job_id, loop_id, task_id, outcome, project, planner,
+        max_tasks, depth_cap, checkpoint, ceiling, dry_run, yes, from_actor, status, created_at, updated_at)
+      VALUES ($(sqlq "$loop_id"), $(sqlq "$loop_id"), ${task_id}, $(sqlq "$outcome"),
+        $(sqlq_or_null "$project"), $(sqlq "$planner"), ${max_tasks}, ${depth_cap}, ${checkpoint}, ${ceiling},
+        ${dr}, ${yn}, $(sqlq_or_null "$from"), 'running', ${now}, ${now});" >/dev/null \
+    || fail "$E_GENERIC" "goal: could not record async job"
+
+  # Optimistic fast-return: an idle planner likely runs the task at once, so poll
+  # briefly and return the finished result inline (nicer UX, still far under any
+  # gateway timeout). A busy planner returns the job id immediately.
+  if _hb_agent_idle "$planner" >/dev/null 2>&1; then
+    local waited=0 budget="${GOAL_ASYNC_OPTIMISTIC_SECS:-6}" ts
+    while (( waited < budget )); do
+      ts=$(db "SELECT COALESCE(status,'') FROM tasks WHERE id=${task_id};")
+      [[ "$ts" == "done" || "$ts" == "rejected" || "$ts" == "escalated" || "$ts" == "cancelled" ]] && break
+      sleep 2; waited=$(( waited + 2 ))
+    done
+    ts=$(db "SELECT COALESCE(status,'') FROM tasks WHERE id=${task_id};")
+    if [[ "$ts" == "done" ]]; then _goal_job_advance "$loop_id"; return $?; fi
+  fi
+
+  local jstat="queued"; [[ "$(db "SELECT COALESCE(status,'') FROM tasks WHERE id=${task_id};")" == "in_progress" ]] && jstat="running"
+  if (( JSON_MODE )); then
+    ok "goal planning queued → job ${loop_id} (planner ${planner})" \
+       '{job:$j, status:$s, planner:$p, taskIdent:$ti, dryRun:($dr=="1"), outcome:$o}' \
+       --arg j "$loop_id" --arg s "$jstat" --arg p "$planner" --arg ti "$task_ident" --arg dr "$dr" --arg o "$outcome"
+  else
+    echo "Planning started — job ${loop_id} (planner ${planner}, ${jstat})."
+    echo "Poll: 5dive goal status ${loop_id}"
+  fi
+}
+
+# _goal_job_field <job_id> <column> — one goal_jobs column, '' if null/absent.
+_goal_job_field() { db "SELECT COALESCE(${2},'') FROM goal_jobs WHERE job_id=$(sqlq "$1");"; }
+
+# cmd_goal_status <job> — poll an async goal-add job. Emits queued | running |
+# done (dryRun/gated/materialized) | failed.
+cmd_goal_status() {
+  tasks_db_init
+  local job=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --job=*) job="${1#*=}" ;;
+      -*)      fail "$E_USAGE" "unknown flag: $1" ;;
+      *)       job="$1" ;;
+    esac
+    shift
+  done
+  [[ -n "$job" ]] || fail "$E_USAGE" "usage: 5dive goal status <job>"
+  _goal_job_advance "$job"
+}
+
+# _goal_job_advance <job_id> — inspect the backing planner task and emit the job
+# state. Once the plan lands, run _goal_finish_with_plan ONCE, caching the
+# terminal envelope in goal_jobs.result_json so repeat polls are idempotent (a
+# materialize happens exactly once). Shared by `goal status` and the optimistic
+# fast-return path.
+_goal_job_advance() {
+  local job_id="$1"
+  local exists; exists=$(db "SELECT 1 FROM goal_jobs WHERE job_id=$(sqlq "$job_id");")
+  [[ "$exists" == "1" ]] || fail "$E_NOT_FOUND" "no goal job '$job_id' (pass the job id printed by 5dive goal add)"
+
+  local jstatus; jstatus=$(_goal_job_field "$job_id" status)
+  local planner; planner=$(_goal_job_field "$job_id" planner)
+
+  # Terminal + cached -> replay verbatim (idempotent).
+  if [[ "$jstatus" == "done" || "$jstatus" == "failed" ]]; then
+    local cached; cached=$(_goal_job_field "$job_id" result_json)
+    if [[ -n "$cached" ]]; then
+      if (( JSON_MODE )); then printf '%s\n' "$cached"; else echo "job ${job_id}: ${jstatus}"; fi
+      return 0
+    fi
+  fi
+
+  local task_id loop_id; task_id=$(_goal_job_field "$job_id" task_id); loop_id=$(_goal_job_field "$job_id" loop_id)
+  local tstatus; tstatus=$(db "SELECT COALESCE(status,'') FROM tasks WHERE id=${task_id};")
+
+  # Failure guards (mirror loop spawn --wait): kill, ceiling, or a non-done
+  # terminal backing-task state.
+  local killed ceil spent
+  killed=$(db "SELECT COALESCE(kill_requested,0) FROM loop_runs WHERE loop_id=$(sqlq "$loop_id");")
+  ceil=$(_goal_job_field "$job_id" ceiling)
+  spent=$(_loop_spent "$loop_id" 2>/dev/null || echo 0); [[ "$spent" =~ ^[0-9]+$ ]] || spent=0
+  if [[ "$killed" == "1" ]] \
+     || { [[ -n "$ceil" && "$ceil" =~ ^[0-9]+$ ]] && (( spent >= ceil )) && [[ "$tstatus" != "done" ]]; } \
+     || [[ "$tstatus" == "escalated" || "$tstatus" == "rejected" || "$tstatus" == "cancelled" ]]; then
+    local reason="planner did not return a plan (loop ${tstatus:-halted})"
+    [[ "$killed" == "1" ]] && reason="planner loop was killed"
+    { [[ -n "$ceil" && "$ceil" =~ ^[0-9]+$ ]] && (( spent >= ceil )); } && reason="planner hit its token ceiling (${spent}/${ceil}tok)"
+    local payload
+    payload=$(jq -cn --arg j "$job_id" --arg r "$reason" --arg p "$planner" '{ok:true, data:{job:$j, status:"failed", reason:$r, planner:$p}}')
+    db "UPDATE goal_jobs SET status='failed', result_json=$(sqlq "$payload"), updated_at=$(date +%s) WHERE job_id=$(sqlq "$job_id");" >/dev/null 2>&1 || true
+    db "UPDATE loop_runs SET status='escalated', updated_at=$(date +%s) WHERE loop_id=$(sqlq "$loop_id");" >/dev/null 2>&1 || true
+    if (( JSON_MODE )); then printf '%s\n' "$payload"; else echo "job ${job_id}: FAILED — ${reason}"; fi
+    return 0
+  fi
+
+  # Plan ready -> finish once.
+  if [[ "$tstatus" == "done" ]]; then
+    local plan; plan=$(db "SELECT COALESCE(result,'') FROM tasks WHERE id=${task_id};")
+    if [[ -z "$plan" ]] || ! printf '%s' "$plan" | jq -e . >/dev/null 2>&1; then
+      local payload; payload=$(jq -cn --arg j "$job_id" --arg p "$planner" '{ok:true, data:{job:$j, status:"failed", reason:"planner returned an empty or invalid plan", planner:$p}}')
+      db "UPDATE goal_jobs SET status='failed', result_json=$(sqlq "$payload"), updated_at=$(date +%s) WHERE job_id=$(sqlq "$job_id");" >/dev/null 2>&1 || true
+      if (( JSON_MODE )); then printf '%s\n' "$payload"; else echo "job ${job_id}: FAILED — empty plan"; fi
+      return 0
+    fi
+    # Claim the job so a finish that materializes runs exactly once. A prior
+    # claim that never completed (poll process crashed/killed mid-finish) would
+    # otherwise wedge the job in 'finishing' forever, so a stale claim
+    # (updated_at older than GOAL_FINISH_STALE_SECS) is reclaimable — safe because
+    # the dashboard's async path is dry-run (a pure re-render) and materialize is
+    # dup-guarded.
+    local nowc; nowc=$(date +%s)
+    local stale=$(( nowc - ${GOAL_FINISH_STALE_SECS:-45} ))
+    local claimed; claimed=$(db "UPDATE goal_jobs SET status='finishing', updated_at=${nowc} WHERE job_id=$(sqlq "$job_id") AND (status NOT IN ('done','failed','finishing') OR (status='finishing' AND updated_at <= ${stale})); SELECT changes();")
+    if [[ "$claimed" != "1" ]]; then
+      # Lost the race: another poll is finishing / has finished. Replay if cached,
+      # else report running.
+      local cached; cached=$(_goal_job_field "$job_id" result_json)
+      if [[ -n "$cached" ]]; then if (( JSON_MODE )); then printf '%s\n' "$cached"; else echo "job ${job_id}: done"; fi; return 0; fi
+      if (( JSON_MODE )); then ok "" '{job:$j, status:"running", planner:$p}' --arg j "$job_id" --arg p "$planner"; else echo "job ${job_id}: finishing…"; fi
+      return 0
+    fi
+    local outcome project yes dry_run max_tasks depth_cap checkpoint from
+    outcome=$(_goal_job_field "$job_id" outcome); project=$(_goal_job_field "$job_id" project)
+    yes=$(_goal_job_field "$job_id" yes); [[ "$yes" == "1" ]] || yes=""
+    dry_run=$(_goal_job_field "$job_id" dry_run); [[ "$dry_run" == "1" ]] || dry_run=""
+    max_tasks=$(_goal_job_field "$job_id" max_tasks); depth_cap=$(_goal_job_field "$job_id" depth_cap)
+    checkpoint=$(_goal_job_field "$job_id" checkpoint); from=$(_goal_job_field "$job_id" from_actor)
+    # NB `env=$(...)` is guarded with `|| rc=$?` because header.sh runs the binary
+    # under `set -e`: an unguarded substitution that exits non-zero would kill the
+    # whole process here, wedging the job in 'finishing'. The `||` both captures
+    # the exit code and disarms set -e.
+    local env="" rc=0
+    env=$(JSON_MODE=1 _goal_finish_with_plan "$plan" "$outcome" "$project" "$planner" "$max_tasks" "$depth_cap" "$checkpoint" "$yes" "$dry_run" "$from" 2>/dev/null) || rc=$?
+    if (( rc != 0 )) || [[ -z "$env" ]] || [[ "$(printf '%s' "$env" | jq -r '.ok // false' 2>/dev/null)" != "true" ]]; then
+      local emsg; emsg=$(printf '%s' "$env" | jq -r '.error.message // "plan finish failed"' 2>/dev/null); [[ -n "$emsg" ]] || emsg="plan finish failed"
+      local payload; payload=$(jq -cn --arg j "$job_id" --arg r "$emsg" --arg p "$planner" '{ok:true, data:{job:$j, status:"failed", reason:$r, planner:$p}}')
+      db "UPDATE goal_jobs SET status='failed', result_json=$(sqlq "$payload"), updated_at=$(date +%s) WHERE job_id=$(sqlq "$job_id");" >/dev/null 2>&1 || true
+      if (( JSON_MODE )); then printf '%s\n' "$payload"; else echo "job ${job_id}: FAILED — ${emsg}"; fi
+      return 0
+    fi
+    local payload; payload=$(printf '%s' "$env" | jq -c --arg j "$job_id" '{ok:true, data:({job:$j, status:"done"} + .data)}')
+    db "UPDATE goal_jobs SET status='done', result_json=$(sqlq "$payload"), updated_at=$(date +%s) WHERE job_id=$(sqlq "$job_id");" >/dev/null 2>&1 || true
+    db "UPDATE loop_runs SET status='done', updated_at=$(date +%s) WHERE loop_id=$(sqlq "$loop_id");" >/dev/null 2>&1 || true
+    if (( JSON_MODE )); then printf '%s\n' "$payload"
+    else echo "job ${job_id}: DONE"; printf '%s' "$env" | jq -r '.data | if .dryRun then "  planned "+(.taskCount|tostring)+" task(s)" elif .gated then "  gated on "+.anchor elif .materialized then "  materialized "+(.taskCount|tostring)+" task(s)" else "  done" end' 2>/dev/null; fi
+    return 0
+  fi
+
+  # Still working: todo -> queued, in_progress -> running.
+  local jstat="queued"; [[ "$tstatus" == "in_progress" ]] && jstat="running"
+  db "UPDATE goal_jobs SET status=$(sqlq "$jstat"), updated_at=$(date +%s) WHERE job_id=$(sqlq "$job_id") AND status NOT IN ('done','failed','finishing');" >/dev/null 2>&1 || true
+  if (( JSON_MODE )); then
+    ok "" '{job:$j, status:$s, planner:$p}' --arg j "$job_id" --arg s "$jstat" --arg p "$planner"
+  else
+    echo "job ${job_id}: ${jstat} (planner ${planner})"
+  fi
+}
+
+# ------- create-from-preview: _goal_from_job <job_id> <from> -------
+# DIVE-1349: materialize (or gate) the plan a preview job already computed. The
+# plan is recovered from the job's backing planner task, RE-VALIDATED from
+# scratch (never trust a stored blob), and finished with dry-run forced OFF using
+# the job's stored guardrail params. Same human-gate semantics as a direct
+# create: a T2 / over-checkpoint plan files ONE decision gate and materializes
+# nothing. Reuses the previewed plan so the dashboard "Create plan" button sends
+# only a small job id, not the (tunnel-oversized) plan JSON.
+_goal_from_job() {
+  local job_id="$1" from_override="$2"
+  local exists; exists=$(db "SELECT 1 FROM goal_jobs WHERE job_id=$(sqlq "$job_id");")
+  [[ "$exists" == "1" ]] || fail "$E_NOT_FOUND" "no goal job '$job_id' (pass the job id from the preview)"
+  local task_id; task_id=$(_goal_job_field "$job_id" task_id)
+  local plan; plan=$(db "SELECT COALESCE(result,'') FROM tasks WHERE id=${task_id};")
+  printf '%s' "$plan" | jq -e . >/dev/null 2>&1 \
+    || fail "$E_VALIDATION" "job '$job_id' has no plan yet — poll 5dive goal status $job_id until done, then create"
+  local outcome project yes max_tasks depth_cap checkpoint planner from
+  outcome=$(_goal_job_field "$job_id" outcome);   project=$(_goal_job_field "$job_id" project)
+  yes=$(_goal_job_field "$job_id" yes); [[ "$yes" == "1" ]] || yes=""
+  max_tasks=$(_goal_job_field "$job_id" max_tasks); depth_cap=$(_goal_job_field "$job_id" depth_cap)
+  checkpoint=$(_goal_job_field "$job_id" checkpoint); planner=$(_goal_job_field "$job_id" planner)
+  from="${from_override:-$(_goal_job_field "$job_id" from_actor)}"
+  _goal_finish_with_plan "$plan" "$outcome" "$project" "$planner" "$max_tasks" "$depth_cap" "$checkpoint" "$yes" "" "$from"
 }
 
 # -------- objectives (OSS-19 outcome loops, OSS-26 phase A1) --------
