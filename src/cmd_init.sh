@@ -361,7 +361,49 @@ USAGE
             ;;
         esac
         ;;
-      openclaw|antigravity|grok)
+      openclaw)
+        # openclaw defaults to the OpenAI /codex/device oauth, but that
+        # dead-ends when the OpenAI account is blocked for inference. The
+        # dashboard already offers a BYO provider+key escape hatch; give init
+        # parity (DIVE-1390). BYO writes via `agent auth set openclaw
+        # --api-key=- --provider=<id>` (cmd_auth.sh -> _apply_byo_openclaw).
+        local auth_choice
+        _init_pick auth_choice "How should OpenClaw authenticate?" 1 \
+          "oauth|Sign in with OpenAI|Device-code sign-in · recommended" \
+          "byo|Bring your own provider|Use your own inference provider + API key"
+        case "$auth_choice" in
+          oauth)
+            _init_note "Opening ${type_label[$type]}'s interactive sign-in…"
+            5dive agent auth login openclaw || fail "$E_AUTH_REQUIRED" "auth failed"
+            auth_summary="Interactive sign-in"
+            ;;
+          byo)
+            local provider
+            _init_pick provider "Choose a provider for OpenClaw:" 1 \
+              "openrouter|OpenRouter|Broad model catalog · recommended" \
+              "anthropic|Anthropic|Claude models" \
+              "openai|OpenAI|GPT models" \
+              "google|Google|Gemini models" \
+              "deepseek|DeepSeek|DeepSeek models" \
+              "moonshot|Moonshot|Kimi models" \
+              "qwen|Qwen|Qwen models" \
+              "minimax|MiniMax|MiniMax models" \
+              "huggingface|Hugging Face|Hosted open models" \
+              "zai|z.ai|GLM models"
+            [[ -n "${OPENCLAW_PROVIDER_ID[$provider]:-}" ]] \
+              || fail "$E_VALIDATION" "unknown provider '$provider'"
+            local key
+            _init_secret key "$provider API key"
+            [[ -n "$key" ]] || fail "$E_VALIDATION" "empty API key"
+            printf '%s' "$key" | 5dive agent auth set openclaw --api-key=- --provider="$provider" \
+              || fail "$E_AUTH_REQUIRED" "auth failed"
+            _init_ok "$provider credentials saved"
+            auth_summary="$provider API key"
+            ;;
+          *) fail "$E_VALIDATION" "invalid auth choice '$auth_choice'" ;;
+        esac
+        ;;
+      antigravity|grok)
         _init_note "Opening ${type_label[$type]}'s interactive sign-in…"
         5dive agent auth login "$type" || fail "$E_AUTH_REQUIRED" "auth failed"
         auth_summary="Interactive sign-in"
