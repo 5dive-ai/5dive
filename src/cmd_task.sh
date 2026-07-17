@@ -38,6 +38,9 @@ _task_usage() {
                                                      # Tokens/cost per loop: see `5dive usage` (same task ids).
   5dive task cancel <id|DIVE-N> [--result=<text>]    # -> cancelled; --result captures why
   5dive task block   <id|DIVE-N> --by=<id|DIVE-N>    # add a blocks edge, mark blocked
+                                                     # Attempt first — blocking is the exception you must justify. Every block MUST carry a revisit anchor:
+                                                     #   --by=<id> (dependency, auto-clears on the blocker's done), OR route a timed hold via `task park --reason --wake`, OR a human `task need`.
+                                                     # A bare reasonless/dateless block is refused (DIVE-1357).
   5dive task unblock <id|DIVE-N> [--by=<id|DIVE-N>]  # drop edge(s); back to todo if clear
   5dive task rm <id|DIVE-N>                          # delete (cascades subtasks + edges)
   5dive task escalate <id|DIVE-N> [--from=<who>]     # flag for attention: bump priority a tier (cap urgent) + ping owning agent & paired human
@@ -51,8 +54,9 @@ _task_usage() {
              1 = agent-clearable; unanswered 48h -> the heartbeat applies the rec   2 = hard human gate (default for approval/secret/manual)
              Money, public comms, secrets, destructive and brand asks are FLOORED to tier 2 no matter what you pass; secret is always tier 2.
                                                      # -> blocked, awaiting a human (decision/secret/approval/manual)
-  5dive task park <id|DIVE-N> --reason="..." [--wake=<YYYY-MM-DD[ HH:MM]|+Nd|+Nh>]
-                                                     # QUIET wait (no ping, not in the inbox); --wake auto-unparks
+  5dive task park <id|DIVE-N> --reason="..." --wake=<YYYY-MM-DD[ HH:MM]|+Nd|+Nh>
+                                                     # QUIET timed wait (no ping, not in the inbox); the heartbeat auto-unparks at --wake.
+                                                     # --reason AND --wake are REQUIRED (DIVE-1357): a park with no revisit date is the block graveyard. Unknown date? pick a re-check (+7d). Waiting on a person? use `task need`.
                                                      # back to todo when the time passes (heartbeat sweep, DIVE-891)
   5dive task unpark <id|DIVE-N>                      # clear a park early -> todo (unless task-deps still block it)
   5dive task inbox                                   # list ONLY human-gated tasks, priority-ordered
@@ -1206,18 +1210,47 @@ cmd_task_verify() {
   return $(( rc == 0 ? 0 : 1 ))
 }
 
+# DIVE-1357: a 'blocked' task is only legitimate if it carries a REVISIT anchor —
+# a dependency edge (revisits via the DIVE-1355 cascade), a human need-gate
+# (revisits on answer), or a park with a wake_at (revisits when the heartbeat
+# passes it). This predicate is the single source of truth the block-producing
+# verbs (block/need/park) all satisfy; it is what keeps the DIVE-1355 'blocked
+# with no live reason' surface set permanently empty. 0 if $1 has >=1 anchor.
+_task_has_block_anchor() {
+  local id="$1"
+  [[ "$(db "SELECT CASE WHEN
+       EXISTS (SELECT 1 FROM task_deps WHERE task_id=${id})
+         OR need_type IS NOT NULL
+         OR (parked_at IS NOT NULL AND wake_at IS NOT NULL)
+     THEN 1 ELSE 0 END FROM tasks WHERE id=${id};")" == "1" ]]
+}
+
 cmd_task_block() {
   tasks_db_init
-  local task="" by=""
+  local task="" by="" reason="" wake=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      --by=*) by="${1#*=}" ;;
-      -*)     fail "$E_USAGE" "unknown flag: $1" ;;
-      *)      [[ -z "$task" ]] && task="$1" || fail "$E_USAGE" "unexpected arg: $1" ;;
+      --by=*)     by="${1#*=}" ;;
+      --reason=*) reason="${1#*=}" ;;
+      --wake=*)   wake="${1#*=}" ;;
+      -*)         fail "$E_USAGE" "unknown flag: $1" ;;
+      *)          [[ -z "$task" ]] && task="$1" || fail "$E_USAGE" "unexpected arg: $1" ;;
     esac
     shift
   done
-  [[ -n "$task" && -n "$by" ]] || fail "$E_USAGE" "usage: 5dive task block <id|DIVE-N> --by=<id|DIVE-N>"
+  [[ -n "$task" ]] || fail "$E_USAGE" "usage: 5dive task block <id|DIVE-N> --by=<id|DIVE-N>   (or --reason=<why> --wake=<when> to hold it as a timed park)"
+  # DIVE-1357: with --by this is a dependency edge (the normal, self-revisiting
+  # block). WITHOUT --by, the only honest hold is a timed park — so route a
+  # reason+wake block through `task park`, and REFUSE a bare reasonless/dateless
+  # block outright: that unreachable state is what filled the block graveyard.
+  # Norm: attempt first — blocking is the exception you must justify with an anchor.
+  if [[ -z "$by" ]]; then
+    if [[ -n "$reason" && -n "$wake" ]]; then
+      cmd_task_park "$task" --reason="$reason" --wake="$wake"
+      return
+    fi
+    fail "$E_USAGE" "a bare 'task block $task' with no reason or revisit date is forbidden (DIVE-1357) — pick a revisit anchor: 'task block $task --by=<id>' (a dependency), 'task park $task --reason=<why> --wake=<when>' (a timed hold), or 'task need $task --type=… --ask=…' (a human gate)"
+  fi
   resolve_task_id "$task"; local tid="$RESOLVED_TASK_ID" tident="$RESOLVED_TASK_IDENT"
   resolve_task_id "$by";   local bid="$RESOLVED_TASK_ID" bident="$RESOLVED_TASK_IDENT"
   [[ "$tid" != "$bid" ]] || fail "$E_VALIDATION" "a task can't block itself"
@@ -1273,7 +1306,14 @@ cmd_task_park() {
     esac
     shift
   done
-  [[ -n "$task" ]] || fail "$E_USAGE" "usage: 5dive task park <id|DIVE-N> --reason=<why / what unblocks it> [--wake=<YYYY-MM-DD[ HH:MM]|+Nd|+Nh>]"
+  [[ -n "$task" ]] || fail "$E_USAGE" "usage: 5dive task park <id|DIVE-N> --reason=<why / what unblocks it> --wake=<YYYY-MM-DD[ HH:MM]|+Nd|+Nh>"
+  # DIVE-1357: a park is anchor #3 for a 'blocked' task, and an anchor MUST carry
+  # a revisit or it silently becomes the block graveyard DIVE-1355 has to sweep.
+  # Require BOTH a --reason (why it's held / what unblocks it) and a --wake (when
+  # to revisit). No known date? Pick a re-check date (--wake=+7d). Waiting on a
+  # person is a human gate (`task need`), not a park.
+  [[ -n "$reason" ]] || fail "$E_USAGE" "park needs --reason=<why / what unblocks it> — a reasonless hold is exactly the block graveyard DIVE-1357 forbids"
+  [[ -n "$wake" ]]   || fail "$E_USAGE" "park needs --wake=<when to revisit> (e.g. --wake=+7d, +12h, or 'YYYY-MM-DD') so it can't rot; if the date is unknown pick a re-check date, or use 'task need' if you're waiting on a person"
   resolve_task_id "$task"; local tid="$RESOLVED_TASK_ID" tident="$RESOLVED_TASK_IDENT"
   # DIVE-891: --wake gives a park a wake-up time — the heartbeat's TTL pass
   # auto-unparks (back to todo) once it passes, so "revisit in a week" stops
