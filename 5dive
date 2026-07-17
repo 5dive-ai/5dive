@@ -20157,6 +20157,7 @@ cmd_objective() {
     add|new)          cmd_objective_add "$@" ;;
     ls|list)          cmd_objective_ls "$@" ;;
     show|view)        cmd_objective_show "$@" ;;
+    status|dash|dashboard) cmd_objective_status "$@" ;;
     pause)            cmd_objective_setstatus paused "$@" ;;
     resume)           cmd_objective_setstatus active "$@" ;;
     shadow)           cmd_objective_setmode shadow "$@" ;;
@@ -20164,7 +20165,7 @@ cmd_objective() {
     rm|remove|delete) cmd_objective_rm "$@" ;;
     tick)             cmd_objective_tick "$@" ;;
     replan|cycle|re-plan) cmd_objective_replan "$@" ;;
-    *) fail "$E_USAGE" "unknown objective command: $sub (add|ls|show|pause|resume|shadow|live|rm|tick|replan)" ;;
+    *) fail "$E_USAGE" "unknown objective command: $sub (add|ls|show|status|pause|resume|shadow|live|rm|tick|replan)" ;;
   esac
 }
 
@@ -20327,6 +20328,134 @@ cmd_objective_show() {
   dbfmt -box "SELECT ts, COALESCE(printf('%g', value), '(failed)') AS value, rc
               FROM objective_readings WHERE objective_id=$OBJECTIVE_ID
               ORDER BY id DESC LIMIT 12;" 2>/dev/null || echo "  (none yet)"
+}
+
+# OSS-32 — one inspectable status surface for a running self-steering loop.
+# READ-ONLY: renders stored objective + readings + cycle + originated-task state.
+# It NEVER runs the metric-cmd and NEVER originates/mutates. The integrity point:
+# "verified this cycle" counts only originated tasks a DISTINCT verifier accepted
+# (status='done'), NEVER the planner cycle's self-described `outcome` — the
+# company cannot fake its own progress. All fields source from the OSS-26 store
+# (objectives/objective_readings) + the OSS-27 store (objective_cycles +
+# tasks.originated_by_objective/originated_cycle).
+cmd_objective_status() {
+  tasks_db_init
+  local ref="${1:-}"
+  [[ -n "$ref" ]] || fail "$E_USAGE" "usage: 5dive objective status <name>"
+  _objective_resolve "$ref"
+  local obj_id="$OBJECTIVE_ID" oname="$OBJECTIVE_NAME"
+
+  # --- objective config ---
+  local o_status o_target o_dir o_unit o_planner o_budget o_runmode
+  o_status=$(db  "SELECT status FROM objectives WHERE id=$obj_id;")
+  o_target=$(db  "SELECT COALESCE(target,'') FROM objectives WHERE id=$obj_id;")
+  o_dir=$(db     "SELECT direction FROM objectives WHERE id=$obj_id;")
+  o_unit=$(db    "SELECT COALESCE(unit,'') FROM objectives WHERE id=$obj_id;")
+  o_planner=$(db "SELECT COALESCE(planner,'') FROM objectives WHERE id=$obj_id;")
+  o_budget=$(db  "SELECT COALESCE(budget,'') FROM objectives WHERE id=$obj_id;")
+  o_runmode=$(db "SELECT COALESCE(run_mode,'live') FROM objectives WHERE id=$obj_id;")
+
+  # --- (1-3) current / trend / gap (signed by direction; <=0 means target met) ---
+  local cur prev trend gap=""
+  cur=$(db  "SELECT value FROM objective_readings WHERE objective_id=$obj_id AND value IS NOT NULL ORDER BY id DESC LIMIT 1;")
+  prev=$(db "SELECT value FROM objective_readings WHERE objective_id=$obj_id AND value IS NOT NULL ORDER BY id DESC LIMIT 1 OFFSET 1;")
+  trend=$(_objective_trend "$cur" "$prev")
+  if [[ -n "$o_target" && -n "$cur" ]]; then
+    gap=$(awk -v c="$cur" -v t="$o_target" -v d="$o_dir" 'BEGIN{ if(d=="down") printf "%g", c-t; else printf "%g", t-c }')
+  fi
+
+  # --- (5) current cycle = MAX(cycle_no) + its outcome ---
+  local cyc cyc_outcome
+  cyc=$(db "SELECT COALESCE(MAX(cycle_no),0) FROM objective_cycles WHERE objective_id=$obj_id;")
+  cyc_outcome=$(db "SELECT COALESCE(outcome,'') FROM objective_cycles WHERE objective_id=$obj_id AND cycle_no=$cyc;")
+
+  # --- (4) active roles = distinct assignee of OPEN originated tasks (+ planner) ---
+  local roles
+  roles=$(db "SELECT COALESCE(assignee,'(unassigned)') FROM tasks
+              WHERE originated_by_objective=$obj_id AND status NOT IN ('done','cancelled')
+              GROUP BY assignee ORDER BY assignee;")
+
+  # --- (6) verified outcomes THIS cycle: originated + this cycle + verifier-accepted (done) ---
+  # done => a DISTINCT verifier accepted (existing maker/verifier loop). This is
+  # the integrity-critical field — never the planner cycle's self-reported outcome.
+  local verified originated_open
+  verified=$(db "SELECT COUNT(*) FROM tasks
+                 WHERE originated_by_objective=$obj_id AND originated_cycle=$cyc AND status='done';")
+  originated_open=$(db "SELECT COUNT(*) FROM tasks
+                 WHERE originated_by_objective=$obj_id AND status NOT IN ('done','cancelled');")
+
+  # --- (7) spend vs ceiling ---
+  local spent
+  spent=$(db "SELECT COALESCE(SUM(tokens_spent),0) FROM objective_cycles WHERE objective_id=$obj_id;")
+
+  # --- (8) next gate = latest gated cycle whose anchor task is STILL a pending gate ---
+  local gate_anchor="" next_gate="none"
+  gate_anchor=$(db "SELECT gate_anchor FROM objective_cycles
+                    WHERE objective_id=$obj_id AND gated=1 AND gate_anchor IS NOT NULL
+                    ORDER BY cycle_no DESC LIMIT 1;")
+  if [[ -n "$gate_anchor" ]]; then
+    local pending
+    pending=$(db "SELECT COUNT(*) FROM tasks
+                  WHERE ident=$(sqlq "$gate_anchor")
+                    AND need_type IS NOT NULL AND need_answered_at IS NULL
+                    AND status NOT IN ('done','cancelled');")
+    [[ "$pending" == "1" ]] && next_gate="$gate_anchor"
+  fi
+  # No pending gate -> surface the stop-reason from the latest cycle outcome, so a
+  # halted loop is never a silent blank (mirrors replan's terminal outcomes).
+  local stop_reason=""
+  if [[ "$next_gate" == "none" ]]; then
+    case "$cyc_outcome" in
+      target_reached|budget_exhausted) stop_reason="$cyc_outcome" ;;
+      *) [[ "$o_status" != "active" ]] && stop_reason="$o_status" ;;
+    esac
+  fi
+
+  if (( JSON_MODE )); then
+    local roles_json; roles_json=$(printf '%s\n' "$roles" | jq -R . | jq -sc 'map(select(length>0))')
+    jq -cn \
+      --arg name "$oname" --arg status "$o_status" --arg mode "$o_runmode" \
+      --arg dir "$o_dir" --arg unit "$o_unit" --arg planner "$o_planner" \
+      --arg cur "$cur" --arg target "$o_target" --arg gap "$gap" --arg trend "$trend" \
+      --argjson cyc "${cyc:-0}" --arg cyc_outcome "$cyc_outcome" \
+      --argjson roles "$roles_json" \
+      --argjson verified "${verified:-0}" --argjson open "${originated_open:-0}" \
+      --argjson spent "${spent:-0}" --arg budget "$o_budget" --argjson ceiling "$OBJ_CEILING_DEFAULT" \
+      --arg next_gate "$next_gate" --arg stop_reason "$stop_reason" \
+      '{ok:true, data:{objective:$name, status:$status, mode:$mode,
+        target:(if $target=="" then null else ($target|tonumber) end), direction:$dir, unit:$unit,
+        current:(if $cur=="" then null else ($cur|tonumber) end),
+        gap:(if $gap=="" then null else ($gap|tonumber) end), trend:$trend,
+        planner:(if $planner=="" then null else $planner end),
+        active_roles:$roles, cycle:$cyc, cycle_outcome:(if $cyc_outcome=="" then null else $cyc_outcome end),
+        verified_this_cycle:$verified, originated_open:$open,
+        spend:$spent, budget:(if $budget=="" then null else ($budget|tonumber) end),
+        ceiling_per_cycle:$ceiling,
+        next_gate:(if $next_gate=="none" then null else $next_gate end),
+        stop_reason:(if $stop_reason=="" then null else $stop_reason end)}}'
+    return
+  fi
+
+  # ---- text dashboard ----
+  # %g normalizes REAL columns (10.0 -> 10), matching the `show`/`ls` renders.
+  local t_disp c_disp g_disp
+  t_disp=$( [[ -n "$o_target" ]] && printf '%g' "$o_target" || printf '—' )
+  c_disp=$( [[ -n "$cur" ]]      && printf '%g' "$cur"      || printf '—' )
+  g_disp=$( [[ -n "$gap" ]]      && printf '%g' "$gap"      || printf '—' )
+  local spend_of; spend_of="${o_budget:-∞}"
+  local roles_line; roles_line=$(printf '%s' "$roles" | paste -sd', ' -); [[ -n "$roles_line" ]] || roles_line="—"
+  local gate_line="$next_gate"
+  [[ "$next_gate" == "none" && -n "$stop_reason" ]] && gate_line="none (stopped: $stop_reason)"
+  printf 'objective: %s   status: %s   mode: %s\n' "$oname" "$o_status" "$o_runmode"
+  printf 'target:    %s%s (%s)\n' "$t_disp" "$o_unit" "$o_dir"
+  printf 'current:   %s%s   trend: %s   gap: %s%s\n' \
+    "$c_disp" "$( [[ -n "$cur" ]] && printf '%s' "$o_unit")" "$trend" \
+    "$g_disp" "$( [[ -n "$gap" ]] && printf '%s' "$o_unit")"
+  printf 'cycle:     #%s   outcome: %s\n' "${cyc:-0}" "${cyc_outcome:-—}"
+  printf 'roles:     %s%s\n' "$roles_line" "$( [[ -n "$o_planner" ]] && printf '   (planner: %s)' "$o_planner")"
+  printf 'verified this cycle: %s   (originated open: %s)\n' "${verified:-0}" "${originated_open:-0}"
+  printf 'spend:     %s / %s tok   (ceiling %s/cycle)\n' "${spent:-0}" "$spend_of" "$OBJ_CEILING_DEFAULT"
+  printf 'next gate: %s\n' "$gate_line"
 }
 
 # trend from the two most recent successful readings: up|down|flat|new
