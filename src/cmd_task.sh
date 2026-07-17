@@ -1589,6 +1589,38 @@ _gate_eng_ship_hit() {
   [[ "$text" =~ $_GATE_ENG_SHIP_RX ]]
 }
 
+# DIVE-1381: the CONTENT-CURATION gate class — the third downgrade kind, mirror
+# of the eng-ship class (DIVE-1359) for our early-stage content surfaces
+# (OpenAgent / character-packs / the daily persona drip). Surfaced by DIVE-1366:
+# a persona/pack QUEUE-READINESS approval is not a human call — per ship-gating,
+# OpenAgent/character-packs is an early-stage surface, safe to push, no approval
+# gate to the paired human; it is the org lead's (Marcus) to clear. But the T2
+# floor matches 'publish' in the ask/title and forces the gate hard-human
+# (tier-2 = unclearable by the lead), the exact wall DIVE-1366 hit. This class
+# marks curation/queue-readiness asks so the caller below can downgrade them to
+# a lead-routed tier-1 — BUT ONLY when the *sole* reason the floor fired was a
+# content-publish-LATER term (see _GATE_CONTENT_PUBLISH_RX): the real publish
+# happens downstream via the drip, not now. The true-human floor still wins for
+# a genuine publish-NOW / brand / press / customer-comms / money / secret /
+# destructive ask — the caller re-tests the floor with the publish-later terms
+# stripped and only downgrades if nothing else trips it. secret/manual are never
+# curation; filer-is-lead ⇒ no reviewer ⇒ not downgraded.
+# NB word-anchored where a bare substring would over-match: \bpersonas?\b (not
+# 'personal'/'personalize'), \bcurat (curate/curation/curator, not 'accurate').
+_GATE_CONTENT_CURATION_RX='\bpersonas?\b|character.?pack|char.?pack|openagent|promote.?queue|drip queue|drip schedule|queue.?readiness|ready for the (queue|drip)|ready to (queue|drip)|\bcurat|skill.?set|gallery (card|pack|entry)'
+_gate_content_curation_hit() {
+  local text; text=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
+  [[ "$text" =~ $_GATE_CONTENT_CURATION_RX ]]
+}
+# The content-publish-LATER terms — the subset of the T2 floor whose match is
+# safe to carve out for a curation-shaped ask, because for our drip the actual
+# publish is a downstream, automated step, not the thing being approved now.
+# Deliberately NARROW: 'press', 'customer email', 'newsletter', 'blast', 'brand'
+# and every money/secret/destructive term stay in the floor (they are genuine
+# human calls even in a curation context). Used to compute the residual-floor
+# test in cmd_task_need.
+_GATE_CONTENT_PUBLISH_RX='publish|public post|announce|launch post'
+
 # OSS-11 (DIVE-976) — _gate_ask_shape <ask>: normalize an ask into its "shape
 # key" so two gates that ask structurally the same question but about different
 # targets collapse to one key. Precedent matching uses EXACT shape-key equality
@@ -1754,6 +1786,36 @@ cmd_task_need() {
       local ttl_title; ttl_title=$(db "SELECT COALESCE(title,'') FROM tasks WHERE id=${id};")
       if _gate_tier2_floor_hit "${ask} ${ttl_title}"; then
         tier=2; tier_floored=1
+      fi
+    fi
+  fi
+
+  # DIVE-1381: content-curation carve-out. Mirror of the eng-ship class (DIVE-1359)
+  # for our early-stage content surfaces (OpenAgent / character-packs / the persona
+  # drip). A persona/pack QUEUE-READINESS approval is lead-clearable, not a human
+  # call — but the T2 floor matches 'publish' in the ask/title and forces it
+  # hard-human (tier-2, unclearable by the lead), the exact wall DIVE-1366 hit.
+  # Like eng-ship the routing is intrinsic to the KIND, so this fires whether or
+  # not the floor tripped: a curation-shaped decision/approval from a NON-lead is
+  # forced to a lead-routed tier-1 — downgrading tier-2 when the floor fired. The
+  # true-human floor still WINS for a genuine publish-NOW / brand / press /
+  # customer-comms / money / secret / destructive ask: we re-test the floor with
+  # only the content-publish-LATER terms stripped (_GATE_CONTENT_PUBLISH_RX — the
+  # real publish happens downstream via the drip, not now) and refuse to downgrade
+  # if anything else still trips it. Clearing tier_floored lets the routing
+  # predicate treat it as a tier-1 gate; _curation (like _eng_ship) forces
+  # lead-routing regardless of the gate_builder_routing pref. secret/manual are
+  # never curation; filer-is-lead ⇒ no reviewer ⇒ not downgraded.
+  local _curation=0
+  if [[ ( "$type" == "decision" || "$type" == "approval" ) ]]; then
+    local _cc_title; _cc_title=$(db "SELECT COALESCE(title,'') FROM tasks WHERE id=${id};")
+    local _cc_text="${ask} ${_cc_title}"
+    local _cc_residual; _cc_residual=$(printf '%s' "$_cc_text" \
+      | tr '[:upper:]' '[:lower:]' | sed -E "s/(${_GATE_CONTENT_PUBLISH_RX})//g")
+    if _gate_content_curation_hit "$_cc_text" && ! _gate_tier2_floor_hit "$_cc_residual"; then
+      local _cc_reviewer; _cc_reviewer=$(_gate_route_reviewer "$(task_actor "$from")")
+      if [[ -n "$_cc_reviewer" ]]; then
+        tier=1; tier_floored=0; _curation=1
       fi
     fi
   fi
@@ -2049,6 +2111,8 @@ cmd_task_need() {
   # DIVE-1359: an eng-ship gate is lead-routed by kind (set above), so it is
   # always routable regardless of type default / explicit --tier.
   [[ "$_eng_ship" == "1" ]] && _routable=1
+  # DIVE-1381: a content-curation gate is likewise lead-routed by kind.
+  [[ "$_curation" == "1" ]] && _routable=1
   if [[ "$_routable" == "1" ]]; then
     # DIVE-1243: `access` routing is intrinsic to the TYPE, so it does NOT wait on
     # the gate_builder_routing pref (which ship-gates the decision/approval/manual
@@ -2056,7 +2120,7 @@ cmd_task_need() {
     # DIVE-1359: eng-ship routing is likewise intrinsic to the KIND — it bypasses
     # the pref too, so the fix is live under the default (pref OFF) posture.
     local _route; _route=$(_task_pref_get gate_builder_routing); _route="${_route:-off}"
-    if [[ "$_route" == "on" || "$type" == "access" || "$_eng_ship" == "1" ]]; then
+    if [[ "$_route" == "on" || "$type" == "access" || "$_eng_ship" == "1" || "$_curation" == "1" ]]; then
       local _reviewer; _reviewer=$(_gate_route_reviewer "$actor")
       if [[ -n "$_reviewer" ]]; then
         # Persist the designated reviewer on the row. For approval/manual this is

@@ -150,6 +150,57 @@ seed DIVE-33; HUMAN_PINGED=0; route_reset
 cmd_task_need DIVE-33 --type=approval --tier=2 --ask="approve the prod push?" --from=main >/dev/null 2>&1
 [[ "$HUMAN_PINGED" == "1" && "$(db "SELECT tier FROM tasks WHERE ident='DIVE-33';")" == "2" ]] && ok_t "DIVE-1359: a lead's own eng-ship --tier=2 stays hard-human" || bad_t "lead eng-ship not downgraded" "human=$HUMAN_PINGED tier='$(db "SELECT tier FROM tasks WHERE ident='DIVE-33';")'"
 
+# --- DIVE-1381: content-curation class — a persona/pack QUEUE-READINESS approval --
+# on our early-stage content surfaces is lead-clearable, NOT a human call. The T2
+# floor matches 'publish' and would force it hard-human (the DIVE-1366 wall); the
+# carve-out downgrades it to a lead-routed tier-1. Mirror of eng-ship; routes
+# regardless of pref. pref stays OFF here (set above) to prove the routing is
+# intrinsic to the kind.
+seed DIVE-40; HUMAN_PINGED=0; route_reset
+cmd_task_need DIVE-40 --type=approval --ask="approve persona 'doc' as ready to publish to the character-pack drip queue?" --from=dev >/dev/null 2>&1
+[[ "$HUMAN_PINGED" == "0" ]] && ok_t "DIVE-1381: curation 'publish' approval NOT pinged to human" || bad_t "curation → not human" "HUMAN_PINGED=$HUMAN_PINGED"
+[[ "$(db "SELECT tier FROM tasks WHERE ident='DIVE-40';")" == "1" ]] && ok_t "DIVE-1381: curation gate downgraded from T2-floor to lead-routed tier-1" || bad_t "curation downgrade to tier-1" "got tier '$(db "SELECT tier FROM tasks WHERE ident='DIVE-40';")'"
+[[ "$(db "SELECT COALESCE(routed_reviewer,'') FROM tasks WHERE ident='DIVE-40';")" == "main" ]] && ok_t "DIVE-1381: curation approval routed_reviewer=main (lead-clearable), pref OFF" || bad_t "curation routed to lead" "got '$(db "SELECT COALESCE(routed_reviewer,'') FROM tasks WHERE ident='DIVE-40';")'"
+
+# curation-shaped WITHOUT a floor word is still intrinsically lead-routed (pref OFF)
+seed DIVE-41; HUMAN_PINGED=0; route_reset
+cmd_task_need DIVE-41 --type=approval --ask="approve the persona skill-set for 'doc' before it enters the drip queue?" --from=dev >/dev/null 2>&1
+[[ "$HUMAN_PINGED" == "0" && "$(db "SELECT COALESCE(routed_reviewer,'') FROM tasks WHERE ident='DIVE-41';")" == "main" ]] && ok_t "DIVE-1381: curation (no floor word) routes to lead, pref OFF" || bad_t "curation no-floor route" "human=$HUMAN_PINGED reviewer='$(db "SELECT COALESCE(routed_reviewer,'') FROM tasks WHERE ident='DIVE-41';")'"
+
+# floor WINS over curation: a genuine BRAND/press action stays hard-human even when
+# the ask also names a persona (brand is NOT a content-publish-later term).
+seed DIVE-42; HUMAN_PINGED=0; route_reset
+cmd_task_need DIVE-42 --type=approval --ask="approve the brand launch announcement for the persona pack rollout?" --from=dev >/dev/null 2>&1
+[[ "$HUMAN_PINGED" == "1" ]] && ok_t "DIVE-1381: floor beats curation (brand persona announce → human)" || bad_t "brand beats curation" "HUMAN_PINGED=$HUMAN_PINGED"
+
+# floor WINS over curation: MONEY in a curation ask stays hard-human.
+seed DIVE-43; HUMAN_PINGED=0; route_reset
+cmd_task_need DIVE-43 --type=approval --ask="approve the \$200 spend to publish the persona pack?" --from=dev >/dev/null 2>&1
+[[ "$HUMAN_PINGED" == "1" ]] && ok_t "DIVE-1381: floor beats curation (\$spend to publish persona → human)" || bad_t "money beats curation" "HUMAN_PINGED=$HUMAN_PINGED"
+
+# floor WINS over curation: customer-comms (newsletter) stays hard-human.
+seed DIVE-44; HUMAN_PINGED=0; route_reset
+cmd_task_need DIVE-44 --type=approval --ask="approve the persona pack newsletter blast to customers?" --from=dev >/dev/null 2>&1
+[[ "$HUMAN_PINGED" == "1" ]] && ok_t "DIVE-1381: floor beats curation (persona newsletter blast → human)" || bad_t "newsletter beats curation" "HUMAN_PINGED=$HUMAN_PINGED"
+
+# a lead's OWN curation gate is NOT downgraded (no distinct reviewer → human)
+seed DIVE-45; HUMAN_PINGED=0; route_reset
+cmd_task_need DIVE-45 --type=approval --tier=2 --ask="approve persona 'doc' ready to publish to the drip queue?" --from=main >/dev/null 2>&1
+[[ "$HUMAN_PINGED" == "1" && "$(db "SELECT tier FROM tasks WHERE ident='DIVE-45';")" == "2" ]] && ok_t "DIVE-1381: a lead's own curation --tier=2 stays hard-human" || bad_t "lead curation not downgraded" "human=$HUMAN_PINGED tier='$(db "SELECT tier FROM tasks WHERE ident='DIVE-45';")'"
+
+# substring guard: 'accurate' / 'personalize' must NOT trip the curation class, so
+# a non-curation ask that merely contains those substrings + 'publish' still floors.
+seed DIVE-47; HUMAN_PINGED=0; route_reset
+cmd_task_need DIVE-47 --type=approval --ask="approve the accurate personalized copy before we publish it?" --from=dev >/dev/null 2>&1
+[[ "$HUMAN_PINGED" == "1" ]] && ok_t "DIVE-1381: 'accurate'/'personalized'+publish does NOT match curation (still floors)" || bad_t "substring guard" "HUMAN_PINGED=$HUMAN_PINGED"
+
+# a NON-curation 'publish' ask still floors to the human — proves the carve-out is
+# scoped to the curation KIND, not to any ask that merely names 'publish'. (No
+# other floor word here: 'publish' is the ONLY trigger, and it must still floor.)
+seed DIVE-46; HUMAN_PINGED=0; route_reset
+cmd_task_need DIVE-46 --type=approval --ask="approve the publish of the homepage hero copy?" --from=dev >/dev/null 2>&1
+[[ "$HUMAN_PINGED" == "1" ]] && ok_t "DIVE-1381: non-curation 'publish' still floors (carve-out scoped)" || bad_t "non-curation publish floors" "HUMAN_PINGED=$HUMAN_PINGED"
+
 # --- pref ON: tier-2-floored decision (money) is NOT routed ------------------
 seed DIVE-5; HUMAN_PINGED=0; route_reset
 cmd_task_need DIVE-5 --type=decision --ask="approve the \$5000 ad spend budget?" --options="yes|no" --recommend="no" --from=dev >/dev/null 2>&1
