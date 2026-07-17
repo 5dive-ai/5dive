@@ -183,8 +183,8 @@ Projects (ident namespaces for the queue; default 'dive' = DIVE-N):
   5dive loop spawn --role=<r> --agent=<a> --prompt="…" [--ceiling=<tok>] [--wait[=<sec>]]  # LOOP-7 orchestration (JSON in/out)
   5dive goal add "<outcome>" [--dry-run] [--max-tasks=N] [--yes]   # outcome -> validated, guardrailed task graph (DIVE-984)
   5dive objective add "<name>" --metric-cmd="<cmd>" --target=<n> [--direction=up|down] [--unit=%] [--public]  # standing goal bound to a read-only metric (OSS-19)
-  5dive objective ls | show <name> | tick [<name>] | pause <name> | resume <name> | rm <name>
-  5dive objective replan <name> [--max-new-per-cycle=N] [--dry-run] [--yes] [--from-gate=<id>]  # re-plan cycle: metric -> guardrailed diff -> gate -> apply (OSS-27)
+  5dive objective ls | show <name> | tick [<name>] | pause <name> | resume <name> [--force] | rm <name>  # resume preflights the planner role (OSS-33)
+  5dive objective replan <name> [--max-new-per-cycle=N] [--no-progress-limit=N] [--dry-run] [--yes] [--force] [--from-gate=<id>]  # re-plan cycle: preflight -> metric -> guardrailed diff -> gate -> apply; explicit stops (OSS-27/OSS-33)
 
 Org chart (who reports to whom):
   5dive org set <agent> --manager=<agent> [--role=<text>] [--title=<text>]

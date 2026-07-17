@@ -206,11 +206,34 @@ _objective_trend() {
 cmd_objective_setstatus() {
   local status="$1"; shift
   tasks_db_init
-  local ref="${1:-}"
-  [[ -n "$ref" ]] || fail "$E_USAGE" "usage: 5dive objective ${status/active/resume} <name>"
+  local ref="" force=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --force) force=1 ;;
+      -*)      fail "$E_USAGE" "unknown flag: $1" ;;
+      *)       [[ -z "$ref" ]] && ref="$1" || fail "$E_USAGE" "unexpected arg: $1" ;;
+    esac
+    shift
+  done
+  [[ -n "$ref" ]] || fail "$E_USAGE" "usage: 5dive objective ${status/active/resume} <name> [--force]"
   _objective_resolve "$ref"
+  # OSS-33 PREFLIGHT: refuse to RESUME (status->active) a loop whose planner role
+  # cannot do the work — an explicit, reasoned refusal (never a silent no-op start).
+  # --force overrides for a deliberate human who knows the gap (e.g. wiring an org
+  # up next). Pausing is always allowed.
+  if [[ "$status" == "active" && -z "$force" ]]; then
+    if ! _objective_preflight "$OBJECTIVE_ID" "$OBJECTIVE_NAME"; then
+      if (( JSON_MODE )); then
+        fail "$E_CONFLICT" "preflight failed (${PREFLIGHT_REASON}): ${PREFLIGHT_DETAIL} — fix it or resume --force"
+      else
+        fail "$E_CONFLICT" "objective '$OBJECTIVE_NAME' preflight failed [${PREFLIGHT_REASON}]: ${PREFLIGHT_DETAIL}
+  fix the gap, or force it (deliberate): 5dive objective resume \"$OBJECTIVE_NAME\" --force"
+      fi
+    fi
+  fi
   db "UPDATE objectives SET status=$(sqlq "$status"), updated_at=datetime('now') WHERE id=$OBJECTIVE_ID;"
-  ok "objective '$OBJECTIVE_NAME' -> $status" '{name:$n, status:$s}' --arg n "$OBJECTIVE_NAME" --arg s "$status"
+  local note=""; [[ "$status" == "active" && -n "$PREFLIGHT_DETAIL" && -z "$PREFLIGHT_REASON" ]] && note=" (${PREFLIGHT_DETAIL})"
+  ok "objective '$OBJECTIVE_NAME' -> ${status}${note}" '{name:$n, status:$s}' --arg n "$OBJECTIVE_NAME" --arg s "$status"
 }
 
 # OSS-27/OSS-35 shadow-first: flip an objective's run mode. shadow => every
@@ -344,6 +367,140 @@ _objective_owns_open() {
 # target met? up => cur>=target; down => cur<=target.
 _objective_target_met() {
   awk -v c="$1" -v t="$2" -v d="$3" 'BEGIN{ if (d=="down") exit !(c<=t); else exit !(c>=t) }'
+}
+
+# ============ OSS-33: preflight + explicit stop-conditions (OSS-31 MVP 4 & 5) ============
+#
+# A self-steering loop must never START or RESUME against a role that cannot do
+# the work, and must never STOP without a stated reason. OSS-27 already closes the
+# cycle and records the terminal reasons paused / target_reached / budget_exhausted;
+# OSS-33 adds the missing guards: a PREFLIGHT that refuses resume/drive when the
+# planner role is unassigned / not-in-org / asleep / over-budget / has no distinct
+# verifier, and two more explicit stops — a pending Tier-2 HARD GATE (wait, don't
+# re-plan on top of it) and NO-PROGRESS after N cycles (pause + explain, never a
+# silent spin). Every guard carries a machine reason + a human detail.
+#
+# Preflight is deliberately CONSERVATIVE: a bare box with no org chart and no
+# configured planner is "not yet org-wired" (single-operator / manual), not a
+# misconfig, so it PASSES with an advisory. Preflight only REFUSES when it can
+# positively see a broken role — it never false-fails an unconfigured objective.
+OBJ_NOPROGRESS_DEFAULT=3   # consecutive no-improvement cycles before the loop stops (0=off)
+
+PREFLIGHT_REASON="" PREFLIGHT_DETAIL="" PREFLIGHT_PLANNER=""
+# _objective_preflight <obj_id> <oname> -> 0 ok (PREFLIGHT_PLANNER set) / 1 refuse
+# (PREFLIGHT_REASON machine slug + PREFLIGHT_DETAIL human line set). Never silent.
+_objective_preflight() {
+  local obj_id="$1" oname="$2"
+  PREFLIGHT_REASON="" PREFLIGHT_DETAIL="" PREFLIGHT_PLANNER=""
+  local planner budget spent orgn
+  planner=$(db "SELECT COALESCE(planner,'') FROM objectives WHERE id=$obj_id;")
+  [[ -n "$planner" ]] || planner=$(_task_resolve_coordinator)
+  orgn=$(db "SELECT COUNT(*) FROM agents_org;")
+
+  # over-budget: checkable with no org — a spent-out objective can't drive at all.
+  budget=$(db "SELECT COALESCE(budget,'') FROM objectives WHERE id=$obj_id;")
+  spent=$(db "SELECT COALESCE(SUM(tokens_spent),0) FROM objective_cycles WHERE objective_id=$obj_id;")
+  if [[ -n "$budget" ]] && awk -v s="$spent" -v b="$budget" 'BEGIN{exit !(s>=b)}'; then
+    PREFLIGHT_REASON="over_budget"
+    PREFLIGHT_DETAIL="spent ${spent} >= budget ${budget} tokens — raise --budget before driving again"
+    return 1
+  fi
+
+  # Bare box (no org chart AND no derivable planner): not yet org-wired, nothing to
+  # assert -> PASS with an advisory. Single-operator / manual case; never false-fail.
+  if [[ "$orgn" == "0" && -z "$planner" ]]; then
+    PREFLIGHT_PLANNER=""
+    PREFLIGHT_DETAIL="no org chart or planner configured — running unconfigured (no role to preflight)"
+    return 0
+  fi
+
+  # A planner is expected now (org exists or one is configured) but none resolved.
+  if [[ -z "$planner" ]]; then
+    PREFLIGHT_REASON="role_unassigned"
+    PREFLIGHT_DETAIL="no planner set and no org coordinator to plan with — set one (objective ... --planner=<agent>) or assign a coordinator (5dive org)"
+    return 1
+  fi
+  PREFLIGHT_PLANNER="$planner"
+
+  if [[ "$orgn" -gt 0 ]]; then
+    # Distinct verifier: a non-trivial originated task closes only on a grader who
+    # is NOT the maker. If the whole org is just the planner, nothing this loop
+    # builds could ever be verified -> refuse.
+    local others; others=$(db "SELECT COUNT(*) FROM agents_org WHERE name<>$(sqlq "$planner");")
+    if [[ "$others" -lt 1 ]]; then
+      PREFLIGHT_REASON="missing_verifier"
+      PREFLIGHT_DETAIL="planner '$planner' is the only agent in the org — a distinct verifier is required to grade originated work (add a teammate: 5dive org add)"
+      return 1
+    fi
+    # Planner must actually be assigned in the org, not a dangling name.
+    if [[ "$(db "SELECT COUNT(*) FROM agents_org WHERE name=$(sqlq "$planner");")" == "0" ]]; then
+      PREFLIGHT_REASON="role_unreachable"
+      PREFLIGHT_DETAIL="planner '$planner' is not in the org chart — assign it (5dive org add '$planner') or point --planner at a listed agent"
+      return 1
+    fi
+  fi
+
+  # Best-effort liveness from the agent registry (root-owned; may be unreadable to
+  # a group agent -> we DEGRADE to a pass rather than false-fail). A deliberately
+  # stopped unit (desiredState=stopped) reads as ASLEEP.
+  local reg; reg=$(registry_read 2>/dev/null || echo '{"agents":{}}')
+  if [[ -n "$(jq -r --arg n "$planner" '.agents[$n] // empty' <<<"$reg" 2>/dev/null)" ]]; then
+    local dstate; dstate=$(jq -r --arg n "$planner" '.agents[$n].desiredState // ""' <<<"$reg" 2>/dev/null)
+    if [[ "$dstate" == "stopped" ]]; then
+      PREFLIGHT_REASON="role_asleep"
+      PREFLIGHT_DETAIL="planner '$planner' is stopped (desiredState=stopped) — start it: 5dive agent start '$planner'"
+      return 1
+    fi
+    # Unauthenticated: the registry entry exists but carries NO auth profile and NO
+    # rotation accounts to draw from -> the planner runtime can't make a model call.
+    # Conservative: fires only when BOTH are clearly empty (a BYO/self-authed agent
+    # that keeps creds out of band still has an authProfile or rotation entry).
+    local authp nrot
+    authp=$(jq -r  --arg n "$planner" '.agents[$n].authProfile // ""' <<<"$reg" 2>/dev/null)
+    nrot=$(jq -r   --arg n "$planner" '(.agents[$n].rotation.accounts // [])|length' <<<"$reg" 2>/dev/null)
+    if [[ -z "$authp" && "${nrot:-0}" == "0" ]]; then
+      PREFLIGHT_REASON="role_unauthenticated"
+      PREFLIGHT_DETAIL="planner '$planner' has no auth profile or rotation account — authenticate it (5dive account) before it can plan"
+      return 1
+    fi
+  fi
+  return 0
+}
+
+# no-progress stop: the metric has not moved favorably across the last N cycles.
+# _objective_no_progress <obj_id> <direction> <limit> -> 0 STOP (no progress) /
+# 1 keep going (progress, or not enough history yet, or disabled). Compares the
+# newest cycle reading to the reading N cycles earlier over cycles that recorded a
+# numeric reading — a flat/adverse window means the loop is spending without
+# steering the number and should pause for a human, not spin silently.
+_objective_no_progress() {
+  local obj_id="$1" dir="$2" lim="$3"
+  [[ "$lim" =~ ^[0-9]+$ && "$lim" -gt 0 ]] || return 1
+  local vals n
+  vals=$(db "SELECT reading_value FROM objective_cycles WHERE objective_id=$obj_id AND reading_value IS NOT NULL ORDER BY id DESC LIMIT $lim;")
+  n=$(printf '%s\n' "$vals" | grep -c .)
+  [[ "$n" -ge "$lim" ]] || return 1         # need at least lim recorded readings to judge
+  local newest oldest stop
+  newest=$(printf '%s\n' "$vals" | head -n1)
+  oldest=$(printf '%s\n' "$vals" | sed -n "${lim}p")
+  stop=$(awk -v a="$oldest" -v b="$newest" -v d="$dir" 'BEGIN{ imp=(d=="down")?(b<a):(b>a); print (imp?0:1) }')
+  [[ "$stop" == "1" ]]
+}
+
+# Is there a still-pending approval gate this objective already filed in a prior
+# cycle? Echoes "<ident>|<tier>" (empty if none). ANY unresolved own-gate — a
+# Tier-2 HARD gate awaiting a human, OR a Tier-1 count-checkpoint awaiting a
+# lead/precedent clear — means the loop must WAIT: planning again would stack a
+# fresh proposal on top of one still awaiting a decision. (Tier is reported so the
+# caller can name a hard gate specifically; the gate's filed tier is decided by
+# cmd_task_need's own risk classifier, so detection must not hinge on it.)
+_objective_pending_gate() {
+  local obj_id="$1"
+  db "SELECT c.gate_anchor||'|'||COALESCE(t.tier,0) FROM objective_cycles c JOIN tasks t ON t.ident=c.gate_anchor
+      WHERE c.objective_id=$obj_id AND c.gate_anchor IS NOT NULL
+        AND t.need_type IS NOT NULL AND t.need_answered_at IS NULL
+        AND t.status NOT IN ('done','cancelled')
+      ORDER BY c.id DESC LIMIT 1;"
 }
 
 # Derive + create a project for an objective that has none, and link it. Echoes
@@ -566,7 +723,8 @@ cmd_objective_replan() {
   tasks_db_init
   local ref="" planner="" max_new="" checkpoint="$OBJ_CHECKPOINT_DEFAULT" depth_cap="$OBJ_DEPTH_CAP_DEFAULT"
   local ceiling="$OBJ_CEILING_DEFAULT" wait_secs="$OBJ_PLANNER_WAIT_DEFAULT"
-  local dry_run="" yes="" diff="" from="" from_gate="" propose_only=""
+  local dry_run="" yes="" diff="" from="" from_gate="" propose_only="" force=""
+  local no_prog_limit="$OBJ_NOPROGRESS_DEFAULT"
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --planner=*)           planner="${1#*=}" ;;
@@ -575,8 +733,10 @@ cmd_objective_replan() {
       --depth-cap=*)         depth_cap="${1#*=}" ;;
       --ceiling=*)           ceiling="${1#*=}" ;;
       --wait=*)              wait_secs="${1#*=}" ;;
+      --no-progress-limit=*) no_prog_limit="${1#*=}" ;;   # OSS-33 stop: N flat cycles (0=off)
       --dry-run)             dry_run=1 ;;
       --yes)                 yes=1 ;;
+      --force)               force=1 ;;                    # OSS-33: bypass preflight refusal
       --propose-only|--shadow) propose_only=1 ;;   # OSS-27/OSS-35 shadow-first
       --diff=*)              diff="${1#*=}" ;;
       --from-gate=*)         from_gate="${1#*=}" ;;
@@ -586,7 +746,7 @@ cmd_objective_replan() {
     esac
     shift
   done
-  [[ -n "$ref" ]] || fail "$E_USAGE" 'usage: 5dive objective replan <name> [--max-new-per-cycle=N] [--dry-run] [--yes] [--diff=<json>] [--from-gate=<id>] [--planner=<a>]'
+  [[ -n "$ref" ]] || fail "$E_USAGE" 'usage: 5dive objective replan <name> [--max-new-per-cycle=N] [--no-progress-limit=N] [--dry-run] [--yes] [--force] [--diff=<json>] [--from-gate=<id>] [--planner=<a>]'
   _objective_resolve "$ref"
   local obj_id="$OBJECTIVE_ID" oname="$OBJECTIVE_NAME"
 
@@ -640,7 +800,42 @@ cmd_objective_replan() {
 
   [[ -n "$o_project" ]] || o_project=$(_objective_ensure_project "$obj_id" "$oname" "$planner")
 
+  # OSS-33 loop stop-conditions + preflight, on the AUTONOMOUS path only (a live
+  # planner is about to be invoked). A manual --diff / --from-gate is an operator
+  # override that legitimately bypasses these loop guards. Each guard records a
+  # cycle row with an explicit outcome and returns — the loop never stalls silently.
   if [[ -z "$diff" ]]; then
+    [[ "$no_prog_limit" =~ ^[0-9]+$ ]] || fail "$E_VALIDATION" "--no-progress-limit must be a non-negative integer"
+
+    # (a) PREFLIGHT: a required role can't do the work -> refuse, with a reason.
+    if [[ -z "$force" ]] && ! _objective_preflight "$obj_id" "$oname"; then
+      _objective_record_cycle "$obj_id" "$cycle_no" "$cur" 0 0 0 0 0 "" 0 "blocked_${PREFLIGHT_REASON}"
+      _objective_terminal_out "$oname" "$cycle_no" "blocked_${PREFLIGHT_REASON}" "preflight: ${PREFLIGHT_DETAIL} — nothing originated (fix it, or replan --force)"
+      return
+    fi
+
+    # (b) GATE in flight: a prior cycle filed a gate still awaiting a decision.
+    # Wait; do not stack a fresh proposal on top of one not yet approved. A Tier-2
+    # gate needs a human; a Tier-1 checkpoint needs a lead/precedent clear.
+    local pend_row pend_gate pend_tier
+    pend_row=$(_objective_pending_gate "$obj_id")
+    if [[ -n "$pend_row" ]]; then
+      pend_gate="${pend_row%%|*}"; pend_tier="${pend_row#*|}"
+      _objective_record_cycle "$obj_id" "$cycle_no" "$cur" 0 0 0 0 0 "$pend_gate" 0 "gate_pending"
+      local how="approval"; [[ "${pend_tier:-0}" -ge 2 ]] && how="Tier-2 hard-gate human approval"
+      _objective_terminal_out "$oname" "$cycle_no" "gate_pending" "waiting on the ${how} of ${pend_gate} — apply it once approved (objective replan \"$oname\" --from-gate=${pend_gate}); nothing new proposed"
+      return
+    fi
+
+    # (c) NO PROGRESS: the metric has not moved favorably across N cycles -> PAUSE
+    # (a genuine terminal state so the heartbeat stops respinning) and explain.
+    if _objective_no_progress "$obj_id" "$o_dir" "$no_prog_limit"; then
+      _objective_record_cycle "$obj_id" "$cycle_no" "$cur" 0 0 0 0 0 "" 0 "no_progress"
+      db "UPDATE objectives SET status='paused', updated_at=datetime('now') WHERE id=$obj_id;"
+      _objective_terminal_out "$oname" "$cycle_no" "no_progress" "metric flat/adverse for ${no_prog_limit} cycles (now ${cur:-none}${o_unit}) — objective PAUSED; a human should adjust the plan then resume (5dive objective resume \"$oname\")"
+      return
+    fi
+
     [[ -n "$planner" ]] || planner=$(_task_resolve_coordinator)
     [[ -n "$planner" ]] || fail "$E_VALIDATION" "no --planner, objective planner, or org coordinator to plan with"
     local contract; contract=$(_objective_build_contract "$oname" "$obj_id" "$cur" "$prev" "$trend" "$o_target" "$o_dir" "$o_unit" "$max_new")
