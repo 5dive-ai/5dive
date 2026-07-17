@@ -568,12 +568,13 @@ cmd_task_assign() {
 _task_status_cmd() {
   local newstatus="$1" extra="$2" verb="$3"; shift 3
   tasks_db_init
-  local result="" want_result=0 notify=0
+  local result="" want_result=0 notify=0 no_preflight=0
   local -a positional=()
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      --result=*) result="${1#*=}"; want_result=1 ;;
-      --notify)   notify=1 ;;
+      --result=*)     result="${1#*=}"; want_result=1 ;;
+      --notify)       notify=1 ;;
+      --no-preflight) no_preflight=1 ;;
       --)         shift; positional+=("$@"); break ;;
       -*)         fail "$E_USAGE" "unknown flag: $1" ;;
       *)          positional+=("$1") ;;
@@ -582,6 +583,12 @@ _task_status_cmd() {
   done
   [[ ${#positional[@]} -gt 0 ]] || fail "$E_USAGE" "usage: 5dive task $verb <id|DIVE-N> [--result=<text>] [--notify]"
   resolve_task_id "${positional[0]}"; local id="$RESOLVED_TASK_ID" ident="$RESOLVED_TASK_IDENT"
+  # DIVE-1375: fail-loud preflight — surface identity/auth/repo gaps at `start`
+  # BEFORE the agent burns a turn discovering them mid-task. Advisory only
+  # (never blocks the start); runs from the caller's cwd.
+  if [[ "$verb" == "start" && $no_preflight -eq 0 ]]; then
+    _task_start_preflight "$id" "$ident" "$(task_actor)" || true
+  fi
   # DIVE-477: maker→verifier routing. A `task done` on a task that carries a
   # `verifier` distinct from its current assignee is NOT a close — it's a handoff.
   # The maker is claiming the work is ready; the verifier must grade it before the
@@ -655,6 +662,78 @@ _task_status_cmd() {
     fi
   fi
   ok "$ident $verb" '{id:($i|tonumber), ident:$id, status:$s}' --arg i "$id" --arg id "$ident" --arg s "$newstatus"
+}
+
+# DIVE-1375: fail-loud preflight at `task start` (Bobby gripe #3). Surface the
+# identity/auth/repo gaps that otherwise get discovered mid-task — Marcus hit
+# the git dubious-ownership wall on DIVE-1356. Every check is best-effort and
+# ADVISORY: it prints heads-up warnings to stderr and NEVER blocks the start
+# (fail-open). Repo checks run against the caller's cwd, so run `task start`
+# from inside the repo you'll work in to get them. Suppress with --no-preflight.
+_task_start_preflight() {
+  local id="$1" ident="$2" actor="$3"
+  local n=0
+  _pf() { warn "preflight: $*"; n=$((n+1)); }
+
+  # --- task-level: is the DONE path even reachable by THIS actor? ---
+  # Assignee mismatch: the heartbeat only wakes the assignee, so a start by
+  # someone else is legit but easy to do by accident — flag the mis-claim now.
+  local asignee; asignee=$(db "SELECT COALESCE(assignee,'') FROM tasks WHERE id=${id};" 2>/dev/null || echo "")
+  if [[ -n "$asignee" && -n "$actor" && "$actor" != "cli" && "$asignee" != "$actor" ]]; then
+    _pf "assigned to '${asignee}', but you are '${actor}' — confirm you mean to take this over (the heartbeat wakes '${asignee}', not you)."
+  fi
+  # Pending human gate: this task cannot close via `task done` until the gate is
+  # answered (DIVE-555). Cheaper to learn that before doing the work than after.
+  local gt ga
+  gt=$(db "SELECT COALESCE(need_type,'')        FROM tasks WHERE id=${id};" 2>/dev/null || echo "")
+  ga=$(db "SELECT COALESCE(need_answered_at,'') FROM tasks WHERE id=${id};" 2>/dev/null || echo "")
+  if [[ -n "$gt" && -z "$ga" ]]; then
+    _pf "an unanswered '${gt}' gate is open on this task — 'task done' will be REFUSED until a human answers it (5dive task answer ${ident} ...)."
+  fi
+
+  # --- repo-level: only meaningful when cwd is (or should be) a git repo ---
+  local gerr
+  gerr=$(git -C . rev-parse --is-inside-work-tree 2>&1 >/dev/null)
+  if [[ -n "$gerr" ]]; then
+    # git refused to even look. The classic case is dubious ownership — EXACTLY
+    # the wall Marcus hit on DIVE-1356 — so hand over the one-line fix.
+    if printf '%s' "$gerr" | grep -qi 'dubious ownership'; then
+      _pf "git refuses this repo (dubious ownership). Fix: git config --global --add safe.directory \"\$(pwd)\" — then retry your git commands."
+    fi
+    # Otherwise cwd just isn't a git repo → no repo checks apply; stay quiet.
+  else
+    # Real work tree — run the hygiene/auth checks.
+    # Dirty worktree: pre-existing uncommitted changes get swept into your
+    # commit on a shared checkout — a repeat gotcha across this fleet.
+    local dirty; dirty=$(git -C . status --porcelain 2>/dev/null | wc -l | tr -d ' ')
+    if [[ "${dirty:-0}" -gt 0 ]]; then
+      _pf "worktree is DIRTY (${dirty} uncommitted path(s)) — a commit here may sweep sibling WIP; branch from origin/main or use a fresh worktree."
+    fi
+    # Git identity: an unset committer silently uses a default author that trips
+    # remote author checks (e.g. the Vercel team gate on this project).
+    local gemail; gemail=$(git -C . config user.email 2>/dev/null || echo "")
+    [[ -z "$gemail" ]] && _pf "git user.email is unset here — commits will use a default identity that may be rejected by the remote's author check."
+    # Push reachability: if there's an origin, sanity-check that SOME push
+    # credential is on hand. Offline heuristic — no network probe.
+    local remote; remote=$(git -C . remote get-url origin 2>/dev/null || echo "")
+    if [[ -n "$remote" ]]; then
+      case "$remote" in
+        git@*|ssh://*)
+          if ! ls "$HOME"/.ssh/id_* >/dev/null 2>&1 && [[ ! -e /home/claude/.ssh/id_ed25519 ]]; then
+            _pf "origin is an SSH remote but no SSH key found under ~/.ssh — a push will fail; stage the key before you plan to push."
+          fi ;;
+        https://*)
+          if ! command -v gh >/dev/null 2>&1 || ! gh auth status >/dev/null 2>&1; then
+            _pf "origin is an HTTPS remote but 'gh auth' isn't logged in — a push will prompt/fail; authenticate before you plan to push."
+          fi ;;
+      esac
+    fi
+  fi
+
+  unset -f _pf
+  _TASK_PREFLIGHT_WARNINGS="$n"
+  (( n > 0 )) && step "task ${ident}: ${n} preflight heads-up above — resolve before the work needs them (advisory; start proceeded)."
+  return 0
 }
 
 cmd_task_start()  { _task_status_cmd in_progress ", started_at=COALESCE(started_at, datetime('now'))" start "$@"; }
