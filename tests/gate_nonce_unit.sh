@@ -51,6 +51,14 @@ audit_log() { :; }
 FAKE_CALLER="root"
 id() { if [[ "${1:-}" == -un ]]; then echo "$FAKE_CALLER"; else command id "$@"; fi; }
 
+# DIVE-1413: every SUDO_UID-driven case below models a POST-SUDO / root context
+# (T5 human-on-box, T6 agent-sudo->root, the drop's require_root nested answer) —
+# `_gate_sudo_uid_nonagent` now honors $SUDO_UID ONLY at EUID 0, so seam root here
+# (the suite itself runs non-root as claude). The non-root forge — where a plain
+# $SUDO_UID must be IGNORED in favor of the real uid — is covered end-to-end by
+# tests/gate_sudo_uid_forge_unit.sh.
+_gate_is_root() { return 0; }
+
 seed_task() { db "INSERT INTO tasks (ident, title, status, created_by) VALUES ('$1','t','todo','main');"; }
 hashof() { printf '%s' "$1" | openssl dgst -sha256 | awk '{print $NF}'; }
 
