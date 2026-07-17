@@ -1019,7 +1019,7 @@ cmd_create() {
     # OpenCode's persisted model uses provider_id/model_id. This lets an
     # OpenRouter-backed agent boot straight onto DeepSeek/GLM/Kimi/Qwen rather
     # than falling through to an unrelated last-used/default model. DIVE-1206.
-    opencode_apply_model_default "$name" "$byo_provider" "$byo_model"
+    opencode_apply_model_default "$name" "$byo_provider" "$byo_model" "$byo_api_key"
   fi
 
   # DIVE-990: memory-as-onboarding. Seed the new agent's recall store from

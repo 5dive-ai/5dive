@@ -63,5 +63,50 @@ for model in deepseek/deepseek-chat z-ai/glm-4.6 moonshotai/kimi-k2 qwen/qwen3-c
     || bad_t "OpenRouter model slug: $model"
 done
 
+# DIVE-1395: create-time catalog validation. A stub `opencode models` stands in
+# for the real binary (no network/key), so the reject/accept/skip decisions of
+# opencode_validate_model_or_fail run deterministically.
+FAKE=$(mktemp -d)
+cat >"$FAKE/opencode" <<'STUB'
+#!/usr/bin/env bash
+[[ "$1" == models ]] || exit 0
+printf '%s\n' \
+  "openrouter/google/gemini-2.5-flash-lite" \
+  "openrouter/google/gemini-3.1-flash-lite" \
+  "openrouter/deepseek/deepseek-chat"
+STUB
+chmod +x "$FAKE/opencode"
+
+# The exact QA slug is absent from the catalog and must be rejected (fail exits).
+( OPENCODE_BIN="$FAKE/opencode" opencode_validate_model_or_fail \
+    openrouter openrouter/google/gemini-2.0-flash-lite-001 KEY ) >/dev/null 2>&1
+(( $? != 0 )) \
+  && ok_t "unknown pinned slug is rejected at create" \
+  || bad_t "unknown slug should be rejected" "gemini-2.0-flash-lite-001 absent from stub catalog"
+
+# The rejection surfaces same-family suggestions.
+msg=$( OPENCODE_BIN="$FAKE/opencode" opencode_validate_model_or_fail \
+    openrouter openrouter/google/gemini-2.0-flash-lite-001 KEY 2>&1 )
+has "$msg" "gemini-2.5-flash-lite" "reject message lists close catalog matches"
+
+# A real catalog slug passes cleanly.
+( OPENCODE_BIN="$FAKE/opencode" opencode_validate_model_or_fail \
+    openrouter openrouter/google/gemini-2.5-flash-lite KEY ) >/dev/null 2>&1 \
+  && ok_t "known catalog slug passes validation" \
+  || bad_t "known slug should pass" "gemini-2.5-flash-lite is in stub catalog"
+
+# Fail-OPEN: no key => cannot enumerate => skip so create is never blocked.
+( opencode_validate_model_or_fail openrouter openrouter/anything/at-all "" ) >/dev/null 2>&1 \
+  && ok_t "empty key skips validation (fail-open)" \
+  || bad_t "empty key must skip, not fail" "validation blocked create with no key"
+
+# Fail-OPEN: empty catalog (offline) => skip even for a bogus slug.
+EMPTY=$(mktemp -d); printf '#!/usr/bin/env bash\nexit 0\n' >"$EMPTY/opencode"; chmod +x "$EMPTY/opencode"
+( OPENCODE_BIN="$EMPTY/opencode" opencode_validate_model_or_fail \
+    openrouter openrouter/bogus/model KEY ) >/dev/null 2>&1 \
+  && ok_t "empty catalog skips validation (fail-open)" \
+  || bad_t "empty catalog must skip, not fail" "offline enumeration blocked create"
+rm -rf "$FAKE" "$EMPTY"
+
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 (( FAIL == 0 ))

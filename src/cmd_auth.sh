@@ -821,13 +821,55 @@ _opencode_merge_model_config() {
   jq --arg m "$model_id" '.model=$m'
 }
 
-# opencode_apply_model_default <agent-name> <provider> <model> — pin the new
-# agent's default in ~/.config/opencode/opencode.json. The create CLI accepts
-# provider and model separately, while OpenCode requires provider_id/model_id;
-# tolerate an already-prefixed model as well. Idempotent and merge-safe: only
-# the model key is overwritten. DIVE-1206.
+# opencode_catalog <provider-var> <api-key> — list the models OpenCode can
+# actually resolve for the authenticated provider (openrouter/openai), one
+# `provider/model_id` per line. OpenCode only enumerates providers whose
+# credential is present in the environment, so the key must be injected; the
+# catalog itself comes from models.dev (no completion is charged — this is a
+# metadata read). HOME is thrown away so a root create can't pollute a real
+# home. OPENCODE_BIN overrides the binary for unit tests. Returns non-zero (and
+# emits nothing) when the binary is missing or enumeration fails offline.
+opencode_catalog() {
+  local var="$1" key="$2"
+  local ocbin="${OPENCODE_BIN:-$(command -v opencode 2>/dev/null || echo /home/claude/.local/bin/opencode)}"
+  [[ -x "$ocbin" ]] || return 1
+  local h; h=$(mktemp -d) || return 1
+  HOME="$h" env "${var}=${key}" "$ocbin" models 2>/dev/null; local rc=$?
+  rm -rf "$h"
+  return "$rc"
+}
+
+# opencode_validate_model_or_fail <provider> <model_id> <api-key> — reject a
+# --model that OpenCode's catalog does not carry. DIVE-1395: OpenCode silently
+# ignores an unresolvable pinned model and falls back to an unrelated default
+# (e.g. an image model that returns "No endpoints found that support tool use"),
+# so a create-time typo/stale-slug produced an agent that could not run tools.
+# Best-effort and fail-OPEN: validation only bites when we can actually
+# enumerate (key present + catalog reachable + non-empty). A models.dev outage,
+# a missing key, or catalog lag skips the check so create is never blocked on a
+# transient — we only hard-fail on a slug we positively know is absent.
+opencode_validate_model_or_fail() {
+  local provider="$1" model_id="$2" api_key="${3:-}"
+  [[ -n "$api_key" ]] || return 0
+  local var; var=$(opencode_provider_var "$provider") || return 0
+  local catalog; catalog=$(opencode_catalog "$var" "$api_key") || return 0
+  [[ -n "$catalog" ]] || return 0
+  grep -qxF "$model_id" <<<"$catalog" && return 0
+  local sugg; sugg=$(grep -F "${model_id%/*}/" <<<"$catalog" | head -5 \
+    | awk 'NR>1{printf ", "}{printf "%s", $0}')
+  fail "$E_VALIDATION" "opencode has no model '$model_id' for provider '$provider'. A fresh agent would silently fall back to an unrelated default that may not support tool use.${sugg:+ Close matches: $sugg.} Run 'opencode models' for the full list."
+}
+
+# opencode_apply_model_default <agent-name> <provider> <model> [api-key] — pin
+# the new agent's default in ~/.config/opencode/opencode.json. The create CLI
+# accepts provider and model separately, while OpenCode requires
+# provider_id/model_id; tolerate an already-prefixed model as well. When the
+# provider api-key is supplied (DIVE-1395) the slug is validated against
+# OpenCode's live catalog first, so an unresolvable model fails create loudly
+# instead of degrading the agent to a non-tool default. Idempotent and
+# merge-safe: only the model key is overwritten. DIVE-1206.
 opencode_apply_model_default() {
-  local name="$1" provider="$2" model="$3"
+  local name="$1" provider="$2" model="$3" api_key="${4:-}"
   local home="/home/agent-${name}" dir sf model_id cur='{}' tmp
   dir="${home}/.config/opencode"; sf="${dir}/opencode.json"
   if [[ "$model" == "$provider/"* ]]; then
@@ -835,6 +877,7 @@ opencode_apply_model_default() {
   else
     model_id="${provider}/${model}"
   fi
+  opencode_validate_model_or_fail "$provider" "$model_id" "$api_key"
   install -d -m 700 -o "agent-${name}" -g "agent-${name}" \
     "${home}/.config" "$dir" 2>/dev/null \
     || { warn "opencode model-pin: could not create $dir (skipping --model default)"; return 0; }
