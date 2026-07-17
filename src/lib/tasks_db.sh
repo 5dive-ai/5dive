@@ -195,6 +195,12 @@ CREATE TABLE IF NOT EXISTS tasks (
   -- enters a loop (verifier set + maker hands off).
   iteration           INTEGER,
   maker_agent         TEXT,
+  -- DIVE-1378: one real receiver ACK for maker→verifier handoffs. NULL means
+  -- the work was delivered to the verifier but they have not acknowledged
+  -- beginning review; set only when that assigned verifier runs `task start`.
+  -- The public handoff state is derived as delivered|reviewing so we do not grow
+  -- a second task-status FSM or let a sender claim that review has begun.
+  handoff_ack_at      TEXT,
   -- DIVE-891: risk-tiered gates (adopted design DIVE-861). tier is set when the
   -- gate is filed: 0 = auto-clear (rec applies immediately, digest line only),
   -- 1 = agent-clearable + 48h TTL auto-applies the recommendation, 2 = hard
@@ -501,7 +507,7 @@ _tasks_db_migrate() {
            'escalated_at TEXT' 'escalated_by TEXT' \
            "project_key TEXT NOT NULL DEFAULT 'dive'" 'issue_number INTEGER' \
            'acceptance_criteria TEXT' 'verify_command TEXT' 'max_iterations INTEGER' 'verifier TEXT' \
-           'iteration INTEGER' 'maker_agent TEXT' 'task_budget TEXT' \
+           'iteration INTEGER' 'maker_agent TEXT' 'handoff_ack_at TEXT' 'task_budget TEXT' \
            'tier INTEGER' 'need_asked_at TEXT' 'gate_pinged_at TEXT' 'wake_at TEXT' \
            'secret_key TEXT' 'connector TEXT' 'human_nonce_hash TEXT' \
            'ask_shape TEXT' 'precedent_ref INTEGER' 'precedent_kind TEXT' \
