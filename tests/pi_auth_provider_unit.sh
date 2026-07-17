@@ -69,6 +69,16 @@ rm -f "$_tmp_sf"
 [[ "${TYPE_API_FILE[pi]:-}" == 'pi.env' ]] && ok_t "TYPE_API_FILE[pi] = pi.env" || bad_t "TYPE_API_FILE[pi]" "got '${TYPE_API_FILE[pi]:-<unset>}'"
 [[ -z "${TYPE_API_VAR[pi]:-}" ]] && ok_t "TYPE_API_VAR[pi] unset (multi-provider)" || bad_t "TYPE_API_VAR[pi] should be unset" "got '${TYPE_API_VAR[pi]:-}'"
 
+# --- DIVE-1396: the systemd template MUST load the pi connector -----------------
+# TYPE_API_FILE[pi] is inert unless 5dive-agent@.service injects it into the
+# agent env. Without this EnvironmentFile the OPENROUTER_API_KEY written by
+# `agent create --type=pi --provider=openrouter` never reaches pi and the TUI
+# boots to "No models available". Assert the wiring stays in lockstep.
+_unit=systemd/5dive-agent@.service
+grep -qxF "EnvironmentFile=-/etc/5dive/connectors/${TYPE_API_FILE[pi]}" "$_unit" \
+  && ok_t "5dive-agent@.service loads /etc/5dive/connectors/${TYPE_API_FILE[pi]}" \
+  || bad_t "systemd unit missing pi connector EnvironmentFile" "expected EnvironmentFile=-/etc/5dive/connectors/${TYPE_API_FILE[pi]} in $_unit"
+
 # --- pi is a known type with a file-sentinel + channels enabled ---------------
 [[ "${TYPE_AUTH[pi]:-}" == '/home/claude/.pi/agent/auth.json' ]] && ok_t "TYPE_AUTH[pi] sentinel present" || bad_t "TYPE_AUTH[pi]" "got '${TYPE_AUTH[pi]:-<unset>}'"
 

@@ -9,6 +9,13 @@ Group=claude
 EnvironmentFile=-/etc/5dive/connectors/anthropic.env
 EnvironmentFile=-/etc/5dive/connectors/openai.env
 EnvironmentFile=-/etc/5dive/connectors/gemini.env
+# pi is multi-provider: `agent create --type=pi --provider=<vendor> --api-key`
+# writes the chosen *_API_KEY (OPENROUTER_API_KEY, DEEPSEEK_API_KEY, ...) into
+# this single connector (TYPE_API_FILE[pi]=pi.env). Without loading it here the
+# key never reaches the pi process, so pi's model registry finds no authed
+# provider and the TUI boots to "No models available" (DIVE-1396 regression:
+# the pi connector was added in DIVE-1200 but this template was never updated).
+EnvironmentFile=-/etc/5dive/connectors/pi.env
 EnvironmentFile=-/etc/5dive/connectors/telegram-%i.env
 EnvironmentFile=-/etc/5dive/connectors/discord-%i.env
 EnvironmentFile=-/var/lib/5dive/agents.d/%i.env
