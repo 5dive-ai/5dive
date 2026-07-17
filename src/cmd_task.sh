@@ -308,6 +308,35 @@ _gate_route_reviewer() {
   done
 }
 
+# DIVE-1401 (olivia review, iter 2): the TRUSTED caller identity for gate-withdraw
+# AUTHORIZATION. This is deliberately NOT task_actor: --from is caller-asserted and
+# SUDO_USER/SUDO_UID are plain env vars a NON-root process can forge with no real
+# sudo (`SUDO_USER=agent-<filer> 5dive task need <id> --withdraw`). Trust rule:
+#   - EUID==0 (real sudo / root): sudo set SUDO_* truthfully AND reaching EUID 0
+#     required actually sudo-ing, so a non-root agent cannot forge in. Read the
+#     agent id from SUDO_USER (auto_sender_from_sudo) and the human signal from a
+#     non-agent SUDO_UID (_gate_sudo_uid_nonagent), mirroring cmd_task_answer.
+#   - non-root: SUDO_* are UNTRUSTED (forgeable) — ignore them entirely and judge
+#     by the real `id -un` unix login, which a process cannot spoof.
+# Prints one of: "agent <name>" | "human" | "none". Never reads --from ($from stays
+# ATTRIBUTION-only) nor $USER (also env-spoofable). The determined root-sudo residual
+# (an agent that truly sudo's then forges) is shared with the whole gate system and
+# out of scope here — same boundary cmd_task_answer draws. _gate_is_root is a seam so
+# the unit harness can exercise BOTH branches with the REAL resolver (not stubbed).
+_gate_is_root() { [[ $EUID -eq 0 ]]; }
+_gate_withdraw_actor() {
+  if _gate_is_root; then
+    local a; a=$(auto_sender_from_sudo)
+    [[ -n "$a" ]] && { printf 'agent %s' "$a"; return; }
+    _gate_sudo_uid_nonagent && { printf 'human'; return; }
+    printf 'none'; return
+  fi
+  local idun; idun=$(id -un 2>/dev/null || echo "")
+  if [[ "$idun" == agent-* ]]; then printf 'agent %s' "${idun#agent-}"
+  elif [[ -n "$idun" ]]; then printf 'human'
+  else printf 'none'; fi
+}
+
 # DIVE-980: shared org-chart assignee resolution. Resolve an assignee TOKEN to a
 # concrete agent via the org chart (agents_org). Prints the resolved name, or
 # NOTHING when a role/charter token has no UNIQUE holder — callers decide whether
@@ -2069,27 +2098,21 @@ cmd_task_need() {
       && fail "$E_CONFLICT" "$ident is $w_status — nothing to withdraw"
     [[ -n "$w_type" ]] || fail "$E_CONFLICT" "$ident has no gate to withdraw"
     [[ -z "$w_ans" ]]  || fail "$E_CONFLICT" "$ident's gate is already answered — --withdraw only applies to a still-pending gate (need_answered_at IS NULL)"
-    # Authorize on the TRUSTED caller identity — NEVER on --from (caller-asserted;
-    # task_actor would return it verbatim, so any agent could pass --from=<filer>
-    # to impersonate) nor $USER (env-spoofable). Two UNSPOOFABLE agent sources:
-    # SUDO_USER when the caller ran under `sudo` (sudo sets it; auto_sender_from_sudo
-    # reads it), else the real `id -un` login. A genuine human is a non-agent
-    # SUDO_UID — this MIRRORS cmd_task_answer's evidence floor; `id -un != agent-*`
-    # alone is the one-sudo forge (any agent that `sudo`s becomes root, so root-by-
-    # sudo must NOT count as human). --from is retained for attribution only.
-    local w_filer w_agent w_lead w_coord w_ok=0
+    # Authorize on the TRUSTED caller identity from _gate_withdraw_actor (EUID-gated
+    # SUDO_* or the real id -un — see its comment), NEVER on --from. The gate's filer
+    # is its assignee of record; the filer's routed lead / org coordinator may also
+    # withdraw, as may a genuine human. An agent that is none of these is refused.
+    local w_filer w_id w_kind w_name="" w_lead w_coord w_ok=0
     w_filer=$(db "SELECT COALESCE(assignee,'') FROM tasks WHERE id=${id};")
-    w_agent=$(auto_sender_from_sudo)                      # trusted: SUDO_USER (survives sudo)
-    if [[ -z "$w_agent" ]]; then                          # else the real unix login (never $USER)
-      local _idun; _idun=$(id -un 2>/dev/null || echo "")
-      [[ "$_idun" == agent-* ]] && w_agent="${_idun#agent-}"
-    fi
+    w_id=$(_gate_withdraw_actor)                          # "agent <name>" | "human" | "none"
+    w_kind="${w_id%% *}"
+    [[ "$w_kind" == "agent" ]] && w_name="${w_id#agent }"
     w_lead=$(_gate_route_reviewer "$w_filer")
     w_coord=$(_task_resolve_coordinator)
-    _gate_sudo_uid_nonagent && w_ok=1                                       # a genuine human caller
-    [[ -n "$w_agent" && "$w_agent" == "$w_filer" ]] && w_ok=1              # the filer
-    [[ -n "$w_agent" && -n "$w_lead"  && "$w_agent" == "$w_lead"  ]] && w_ok=1  # filer's lead
-    [[ -n "$w_agent" && -n "$w_coord" && "$w_agent" == "$w_coord" ]] && w_ok=1  # org coordinator
+    [[ "$w_kind" == "human" ]] && w_ok=1                                    # a genuine human caller
+    [[ -n "$w_name" && "$w_name" == "$w_filer" ]] && w_ok=1                # the filer
+    [[ -n "$w_name" && -n "$w_lead"  && "$w_name" == "$w_lead"  ]] && w_ok=1  # filer's lead
+    [[ -n "$w_name" && -n "$w_coord" && "$w_name" == "$w_coord" ]] && w_ok=1  # org coordinator
     (( w_ok )) || fail "$E_AUTH_REQUIRED" "only the gate's filer (${w_filer:-?}), their lead, or a human can withdraw $ident's gate"
     # Clear every gate field (NEVER need_answer/need_answered_at — this is not a
     # grant) and unblock back to todo when no dependency edge still holds it.
@@ -2103,7 +2126,7 @@ cmd_task_need() {
         UPDATE tasks SET status='todo'
           WHERE id=${id} AND status='blocked'
             AND NOT EXISTS (SELECT 1 FROM task_deps WHERE task_id=${id});"
-    [[ $EUID -eq 0 ]] && audit_log "task need withdraw" "ok" 0 -- "task=$ident" "type=$w_type" "by=${w_agent:-human}" "asserted_from=${from:-}" || true
+    [[ $EUID -eq 0 ]] && audit_log "task need withdraw" "ok" 0 -- "task=$ident" "type=$w_type" "by=${w_name:-$w_kind}" "asserted_from=${from:-}" || true
     local w_new; w_new=$(db "SELECT status FROM tasks WHERE id=${id};")
     ok "$ident gate withdrawn (${w_type}) — moot request cleared, no secret/grant recorded; task now ${w_new}" \
        '{ident:$id, withdrawn:true, was_type:$wt, status:$st}' \

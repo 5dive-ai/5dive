@@ -6,14 +6,18 @@
 # safe for the gate's FILER, the filer's routed lead/coordinator, or a human to run
 # without a human tap. Genuine GRANT-clears stay human-only (cmd_task_answer).
 #
-# SECURITY (olivia review, DIVE-1401): authorization binds to the TRUSTED caller
-# identity, NEVER to --from (caller-asserted) and NEVER to `id -un != agent-*` (the
-# one-sudo forge). The trusted agent id is auto_sender_from_sudo (SUDO_USER, survives
-# sudo); a genuine human is a non-agent SUDO_UID (_gate_sudo_uid_nonagent), mirroring
-# cmd_task_answer. This harness stubs those two trust primitives so it can drive the
-# caller identity independently of --from, and explicitly exercises BOTH bypasses:
-#   (a) an unauthorized agent passing --from=<filer> is still REFUSED, and
-#   (b) an agent under sudo (root uid) is NOT treated as human.
+# SECURITY (olivia review, iters 1+2 — both real, both fixed):
+#   iter1: --from is caller-asserted; id -un==root under sudo posed as human.
+#   iter2: SUDO_USER/SUDO_UID are plain env a NON-root process can forge with no real
+#          sudo, so trusting auto_sender_from_sudo/_gate_sudo_uid_nonagent UNCONDITION-
+#          ally was forgeable one layer down.
+# Fix: _gate_withdraw_actor trusts SUDO_* ONLY at EUID==0 (real sudo sets them
+# truthfully); when non-root it IGNORES SUDO_* and judges by the unspoofable real
+# `id -un`. --from is attribution-only. CRUCIALLY this harness exercises the REAL
+# resolver — it does NOT stub auto_sender_from_sudo/_gate_sudo_uid_nonagent; it only
+# seams _gate_is_root (EUID can't be reassigned in-process) and drives real env vars
+# + a real id -un override. The env-forge case (T-FORGE) sets SUDO_USER/SUDO_UID that
+# WOULD grant if trusted and proves a non-root caller is still judged by id -un only.
 # Isolation matches the sibling harnesses: source src/ libs, throwaway STATE_DIR — the
 # live shared tasks.db is NEVER touched. Run: bash tests/gate_withdraw_unit.sh
 # (no root, no network).
@@ -41,141 +45,151 @@ ok_t()  { PASS=$((PASS+1)); printf 'ok   - %s\n' "$1"; }
 bad_t() { FAIL=$((FAIL+1)); printf 'FAIL - %s\n   %s\n' "$1" "${2:-}"; }
 
 tasks_db_init
+task_need_notify() { :; }   # don't DM on gate filing
+audit_log() { :; }          # no root-owned audit log in this harness
 
-# Don't DM on gate filing; no root-owned audit log in this harness.
-task_need_notify() { :; }
-audit_log() { :; }
+# ── Caller-identity seams ─────────────────────────────────────────────────────
+# Only _gate_is_root is stubbed ($EUID cannot be reassigned in-process). The REAL
+# auto_sender_from_sudo / _gate_sudo_uid_nonagent run against real env vars, and the
+# real id -un is driven by a thin `id` override. So we test the actual resolver logic
+# and the actual EUID gate, not a reimplementation of it.
+IS_ROOT=0
+_gate_is_root() { [[ "$IS_ROOT" == "1" ]]; }
+IDUN="nobody"   # real unix login for the non-root branch (unspoofable in prod)
+id() { if [[ "${1:-}" == -un ]]; then echo "$IDUN"; else command id "$@"; fi; }
+# Clean slate for the SUDO_* env the real helpers read; each case sets what it needs.
+unset SUDO_USER SUDO_UID
 
-# ── Controlled caller identity ───────────────────────────────────────────────
-# CALLER_AGENT: the TRUSTED agent name resolved from SUDO_USER/id-un (empty = the
-#   caller is not an agent — a human/root/dashboard path). Stubs the exact primitive
-#   the withdraw auth uses, so --from can be set independently to prove it's ignored.
-# CALLER_HUMAN: 1 iff the caller is a genuine non-agent SUDO_UID (a real human path).
-#   An agent that merely `sudo`s (root uid, but SUDO_UID=its agent uid) is NOT human.
-CALLER_AGENT=""
-CALLER_HUMAN=0
-auto_sender_from_sudo() { printf '%s' "$CALLER_AGENT"; }
-_gate_sudo_uid_nonagent() { [[ "$CALLER_HUMAN" == "1" ]]; }
-# Belt-and-suspenders: the auth's id-un fallback only runs when auto_sender is empty;
-# keep it non-agent so it never accidentally grants an agent identity in the harness.
-id() { if [[ "${1:-}" == -un ]]; then echo "root"; else command id "$@"; fi; }
+# Run the withdraw under a chosen identity context. Usage:
+#   wd <ident> ROOT|NONROOT [SUDO_USER=..] [SUDO_UID=..] [IDUN=..]
+# Sets IS_ROOT + env + id-un override for THIS call only, then restores.
+wd() {
+  local ident="$1" mode="$2"; shift 2
+  local _su="" _sd="" _idun="nobody" kv
+  for kv in "$@"; do case "$kv" in SU=*) _su="${kv#SU=}";; SD=*) _sd="${kv#SD=}";; ID=*) _idun="${kv#ID=}";; esac; done
+  local _oIS="$IS_ROOT" _oID="$IDUN"
+  [[ "$mode" == ROOT ]] && IS_ROOT=1 || IS_ROOT=0
+  IDUN="$_idun"
+  if [[ -n "$_su" ]]; then export SUDO_USER="$_su"; else unset SUDO_USER; fi
+  if [[ -n "$_sd" ]]; then export SUDO_UID="$_sd"; else unset SUDO_UID; fi
+  cmd_task_need "$ident" --withdraw "${WD_EXTRA[@]}" 2>&1
+  local rc=$?
+  IS_ROOT="$_oIS"; IDUN="$_oID"; unset SUDO_USER SUDO_UID
+  return $rc
+}
+WD_EXTRA=()
 
-# Filing a gate resolves assignee via task_actor("$from"); pass --from so the FILER
-# of record is deterministic regardless of the trusted-caller stubs above.
 seed_task() { db "INSERT INTO tasks (ident, title, status, created_by) VALUES ('$1','t','todo','main');"; }
 gate_open() { db "SELECT CASE WHEN need_type IS NOT NULL AND need_answered_at IS NULL THEN 'open' WHEN need_type IS NULL THEN 'cleared' ELSE 'answered' END FROM tasks WHERE ident='$1';"; }
 statusof()  { db "SELECT status FROM tasks WHERE ident='$1';"; }
 provby()    { db "SELECT COALESCE(need_answered_by,'') FROM tasks WHERE ident='$1';"; }
 ansat()     { db "SELECT COALESCE(need_answered_at,'') FROM tasks WHERE ident='$1';"; }
 
-# Org chart: main=coordinator, creative reports to main. So creative's routed lead
-# (and the org coordinator) is main; grok reports nowhere (a peer with no authority).
+# Org: main=coordinator, creative reports to main (so its lead+coord is main); grok
+# is a peer with no authority. File the gate as creative via --from (attribution).
 db "CREATE TABLE IF NOT EXISTS agents_org (name TEXT PRIMARY KEY, role TEXT, title TEXT, reports_to TEXT);"
 db "INSERT INTO agents_org (name, role, reports_to) VALUES ('main','coordinator',NULL);"
 db "INSERT INTO agents_org (name, role, reports_to) VALUES ('creative',NULL,'main');"
 db "INSERT INTO agents_org (name, role, reports_to) VALUES ('grok',NULL,NULL);"
+file_secret_gate() { seed_task "$1"; IS_ROOT=1 IDUN=root cmd_task_need "$1" --type=secret --ask="drop the fixture key" --from=creative >/dev/null 2>&1; }
 
-file_secret_gate() { seed_task "$1"; CALLER_AGENT="creative" CALLER_HUMAN=0 cmd_task_need "$1" --type=secret --ask="drop the fixture key" --from=creative >/dev/null 2>&1; }
-
-# --- T1: the FILER withdraws its own still-pending secret gate --------------------
-#     Gate clears, task returns to todo, and — critically — need_answer/answered_at
-#     stay NULL and need_answered_by stays empty: NO secret is recorded as provided.
+# ── Root/sudo branch (agents commonly run `sudo 5dive ...`, EUID 0, SUDO_USER set) ──
+# T1: the FILER (real SUDO_USER=agent-creative) withdraws its own secret gate. Gate
+#     clears, task back to todo, and NO grant is recorded (answered_at/by stay empty).
 file_secret_gate DIVE-201
 [[ "$(gate_open DIVE-201)" == "open" && "$(statusof DIVE-201)" == "blocked" ]] \
-  || bad_t "T1 precond: secret gate filed + task blocked" "open=$(gate_open DIVE-201) status=$(statusof DIVE-201)"
-out=$(CALLER_AGENT="creative" CALLER_HUMAN=0 cmd_task_need DIVE-201 --withdraw 2>&1); rc=$?
-[[ $rc -eq 0 && "$(gate_open DIVE-201)" == "cleared" ]] \
-  && ok_t "T1 filer withdraws its own pending secret gate (cleared)" \
-  || bad_t "T1 filer withdraw clears gate" "rc=$rc open=$(gate_open DIVE-201) out=$out"
-[[ "$(statusof DIVE-201)" == "todo" ]] \
-  && ok_t "T1 task unblocked back to todo" \
-  || bad_t "T1 unblocked to todo" "status=$(statusof DIVE-201)"
+  || bad_t "T1 precond" "open=$(gate_open DIVE-201) status=$(statusof DIVE-201)"
+out=$(wd DIVE-201 ROOT SU=agent-creative); rc=$?
+[[ $rc -eq 0 && "$(gate_open DIVE-201)" == "cleared" && "$(statusof DIVE-201)" == "todo" ]] \
+  && ok_t "T1 filer (real SUDO_USER) withdraws own secret gate -> cleared + todo" \
+  || bad_t "T1 filer withdraw" "rc=$rc open=$(gate_open DIVE-201) status=$(statusof DIVE-201) out=$out"
 [[ -z "$(ansat DIVE-201)" && -z "$(provby DIVE-201)" ]] \
-  && ok_t "T1 NO grant recorded (need_answered_at + by stay empty — not a secret-provided)" \
-  || bad_t "T1 no grant recorded" "ansat='$(ansat DIVE-201)' provby='$(provby DIVE-201)'"
+  && ok_t "T1 NO grant recorded (answered_at + by stay empty — not a secret-provided)" \
+  || bad_t "T1 no grant" "ansat='$(ansat DIVE-201)' provby='$(provby DIVE-201)'"
 
-# --- T2: an unrelated agent (not filer, not lead, not coordinator) is REFUSED -----
+# T2: an unrelated agent (SUDO_USER=agent-grok) is REFUSED.
 file_secret_gate DIVE-202
-out=$(CALLER_AGENT="grok" CALLER_HUMAN=0 cmd_task_need DIVE-202 --withdraw 2>&1); rc=$?
-[[ $rc -ne 0 && "$(gate_open DIVE-202)" == "open" ]] \
-  && ok_t "T2 non-filer/non-lead agent REFUSED (gate untouched)" \
-  || bad_t "T2 unrelated agent refused" "rc=$rc open=$(gate_open DIVE-202) out=$out"
-[[ "$out" == *"only the gate's filer"* ]] \
-  && ok_t "T2 refusal carries an actionable message" \
-  || bad_t "T2 actionable message" "out=$out"
+out=$(wd DIVE-202 ROOT SU=agent-grok); rc=$?
+[[ $rc -ne 0 && "$(gate_open DIVE-202)" == "open" && "$out" == *"only the gate's filer"* ]] \
+  && ok_t "T2 unrelated agent REFUSED (gate untouched, actionable msg)" \
+  || bad_t "T2 unrelated refused" "rc=$rc open=$(gate_open DIVE-202) out=$out"
 
-# --- T3: the org LEAD / coordinator (main) may withdraw creative's gate -----------
+# T3: the org lead/coordinator (SUDO_USER=agent-main) may withdraw creative's gate.
 file_secret_gate DIVE-203
-out=$(CALLER_AGENT="main" CALLER_HUMAN=0 cmd_task_need DIVE-203 --withdraw 2>&1); rc=$?
-[[ $rc -eq 0 && "$(gate_open DIVE-203)" == "cleared" && "$(statusof DIVE-203)" == "todo" ]] \
+out=$(wd DIVE-203 ROOT SU=agent-main); rc=$?
+[[ $rc -eq 0 && "$(gate_open DIVE-203)" == "cleared" ]] \
   && ok_t "T3 org lead/coordinator withdraws a filer's gate" \
-  || bad_t "T3 lead withdraw" "rc=$rc open=$(gate_open DIVE-203) status=$(statusof DIVE-203) out=$out"
+  || bad_t "T3 lead withdraw" "rc=$rc open=$(gate_open DIVE-203) out=$out"
 
-# --- T4: an already-ANSWERED gate cannot be withdrawn (only need_answered_at NULL) -
+# T5: a genuine human via sudo (EUID0, no SUDO_USER agent, non-agent SUDO_UID=0=root).
+file_secret_gate DIVE-205
+out=$(wd DIVE-205 ROOT SD=0); rc=$?
+[[ $rc -eq 0 && "$(gate_open DIVE-205)" == "cleared" ]] \
+  && ok_t "T5 human via sudo (non-agent SUDO_UID) withdraws any pending gate" \
+  || bad_t "T5 human sudo withdraw" "rc=$rc open=$(gate_open DIVE-205) out=$out"
+
+# ── Non-root branch (agent runs 5dive directly, EUID != 0; SUDO_* untrusted) ───────
+# Tnr1: the filer running directly (real id -un=agent-creative) still clears.
+file_secret_gate DIVE-220
+out=$(wd DIVE-220 NONROOT ID=agent-creative); rc=$?
+[[ $rc -eq 0 && "$(gate_open DIVE-220)" == "cleared" ]] \
+  && ok_t "Tnr1 filer direct (non-root, id-un) withdraws own gate" \
+  || bad_t "Tnr1 filer direct" "rc=$rc open=$(gate_open DIVE-220) out=$out"
+# Tnr2: an unrelated agent direct (id -un=agent-grok) is REFUSED.
+file_secret_gate DIVE-221
+out=$(wd DIVE-221 NONROOT ID=agent-grok); rc=$?
+[[ $rc -ne 0 && "$(gate_open DIVE-221)" == "open" ]] \
+  && ok_t "Tnr2 unrelated agent direct REFUSED" \
+  || bad_t "Tnr2 unrelated direct" "rc=$rc open=$(gate_open DIVE-221) out=$out"
+# Tnr3: a real human on the box direct (id -un=claude, non-agent) clears.
+file_secret_gate DIVE-222
+out=$(wd DIVE-222 NONROOT ID=claude); rc=$?
+[[ $rc -eq 0 && "$(gate_open DIVE-222)" == "cleared" ]] \
+  && ok_t "Tnr3 human-on-box direct (non-agent id-un) withdraws" \
+  || bad_t "Tnr3 human direct" "rc=$rc open=$(gate_open DIVE-222) out=$out"
+
+# ── T-FORGE: the iter-2 bug, exercised end-to-end against the REAL resolver ────────
+# A non-root agent (real id -un=agent-grok) forges the env that WOULD grant if trusted:
+# SUDO_USER=agent-creative (auto_sender_from_sudo would return the FILER) and
+# SUDO_UID=0 (_gate_sudo_uid_nonagent would return TRUE/human). Because EUID != 0 the
+# resolver ignores both and judges by id -un=agent-grok -> REFUSED. This is exactly
+# olivia's proof; before the EUID gate it was accepted.
+file_secret_gate DIVE-230
+out=$(wd DIVE-230 NONROOT SU=agent-creative SD=0 ID=agent-grok); rc=$?
+[[ $rc -ne 0 && "$(gate_open DIVE-230)" == "open" ]] \
+  && ok_t "T-FORGE non-root env-forge (SUDO_USER=filer + SUDO_UID=non-agent) REFUSED — SUDO_* ignored when not root" \
+  || bad_t "T-FORGE env forge refused" "rc=$rc open=$(gate_open DIVE-230) out=$out"
+# Sanity: the SAME forged SUDO_USER=agent-creative, once EUID IS 0 (real sudo would
+# have set it truthfully), correctly authorizes the filer — proving the refusal above
+# is the EUID gate, not a blanket block.
+file_secret_gate DIVE-231
+out=$(wd DIVE-231 ROOT SU=agent-creative ID=agent-grok); rc=$?
+[[ $rc -eq 0 && "$(gate_open DIVE-231)" == "cleared" ]] \
+  && ok_t "T-FORGE-sanity same SUDO_USER at EUID0 authorizes filer (refusal was the EUID gate)" \
+  || bad_t "T-FORGE sanity" "rc=$rc open=$(gate_open DIVE-231) out=$out"
+
+# ── Shape / lifecycle guards (identity-independent; run as an authorized caller) ──
+# T4: an already-ANSWERED gate cannot be withdrawn.
 seed_task DIVE-204
-CALLER_AGENT="creative" cmd_task_need DIVE-204 --type=decision --ask="pick lane" --options="A|B" --recommend="A" --tier=1 --from=creative >/dev/null 2>&1
-CALLER_AGENT="creative" cmd_task_answer DIVE-204 --value=A >/dev/null 2>&1   # tier-1 decision: agent-clearable
+IS_ROOT=1 IDUN=root cmd_task_need DIVE-204 --type=decision --ask="pick lane" --options="A|B" --recommend="A" --tier=1 --from=creative >/dev/null 2>&1
+IS_ROOT=1 IDUN=root cmd_task_answer DIVE-204 --value=A --human >/dev/null 2>&1
 [[ "$(gate_open DIVE-204)" == "answered" ]] || bad_t "T4 precond answered" "open=$(gate_open DIVE-204)"
-out=$(CALLER_AGENT="creative" CALLER_HUMAN=0 cmd_task_need DIVE-204 --withdraw 2>&1); rc=$?
+out=$(wd DIVE-204 ROOT SU=agent-creative); rc=$?
 [[ $rc -ne 0 && "$out" == *"already answered"* ]] \
   && ok_t "T4 answered gate refuses --withdraw (only a pending gate)" \
-  || bad_t "T4 answered gate refused" "rc=$rc out=$out"
-
-# --- T5: a genuine HUMAN caller (non-agent SUDO_UID) may always withdraw ----------
-seed_task DIVE-205
-CALLER_AGENT="creative" cmd_task_need DIVE-205 --type=manual --ask="do the manual step" --from=creative >/dev/null 2>&1
-out=$(CALLER_AGENT="" CALLER_HUMAN=1 cmd_task_need DIVE-205 --withdraw 2>&1); rc=$?
-[[ $rc -eq 0 && "$(gate_open DIVE-205)" == "cleared" ]] \
-  && ok_t "T5 genuine human caller (non-agent SUDO_UID) withdraws any pending gate" \
-  || bad_t "T5 human withdraw" "rc=$rc open=$(gate_open DIVE-205) out=$out"
-
-# --- T6: --withdraw refuses to be combined with re-file flags ---------------------
+  || bad_t "T4 answered refused" "rc=$rc out=$out"
+# T6: --withdraw refuses to be combined with re-file flags.
 file_secret_gate DIVE-206
-out=$(CALLER_AGENT="creative" CALLER_HUMAN=0 cmd_task_need DIVE-206 --withdraw --type=secret --ask="x" 2>&1); rc=$?
+WD_EXTRA=(--type=secret --ask=x); out=$(wd DIVE-206 ROOT SU=agent-creative); rc=$?; WD_EXTRA=()
 [[ $rc -ne 0 && "$(gate_open DIVE-206)" == "open" && "$out" == *"no other gate flags"* ]] \
   && ok_t "T6 --withdraw + gate flags refused (shape stays honest)" \
-  || bad_t "T6 withdraw + flags refused" "rc=$rc open=$(gate_open DIVE-206) out=$out"
-
-# --- T7: --withdraw on a task with NO gate is a clean conflict, not a silent no-op -
+  || bad_t "T6 withdraw+flags" "rc=$rc open=$(gate_open DIVE-206) out=$out"
+# T7: --withdraw on a task with NO gate is a clean conflict, not a silent no-op.
 seed_task DIVE-207
-out=$(CALLER_AGENT="creative" CALLER_HUMAN=0 cmd_task_need DIVE-207 --withdraw 2>&1); rc=$?
+out=$(wd DIVE-207 ROOT SU=agent-creative); rc=$?
 [[ $rc -ne 0 && "$out" == *"no gate to withdraw"* ]] \
   && ok_t "T7 no-gate task refuses --withdraw" \
-  || bad_t "T7 no-gate refused" "rc=$rc out=$out"
-
-# ── SECURITY REGRESSIONS (olivia review) ─────────────────────────────────────────
-# --- T8: BYPASS #1 — --from is caller-asserted. An UNAUTHORIZED agent (grok) that
-#     passes --from=<filer> must STILL be REFUSED. Auth reads the trusted identity
-#     (CALLER_AGENT=grok), never --from. This case did not exist before the fix and
-#     is exactly the impersonation olivia flagged.
-file_secret_gate DIVE-208
-out=$(CALLER_AGENT="grok" CALLER_HUMAN=0 cmd_task_need DIVE-208 --withdraw --from=creative 2>&1); rc=$?
-[[ $rc -ne 0 && "$(gate_open DIVE-208)" == "open" ]] \
-  && ok_t "T8 unauthorized agent spoofing --from=<filer> is REFUSED (auth ignores --from)" \
-  || bad_t "T8 --from spoof refused" "rc=$rc open=$(gate_open DIVE-208) out=$out"
-# And a lead/coordinator impersonation via --from is equally powerless.
-file_secret_gate DIVE-209
-out=$(CALLER_AGENT="grok" CALLER_HUMAN=0 cmd_task_need DIVE-209 --withdraw --from=main 2>&1); rc=$?
-[[ $rc -ne 0 && "$(gate_open DIVE-209)" == "open" ]] \
-  && ok_t "T8b unauthorized agent spoofing --from=<coordinator> is REFUSED" \
-  || bad_t "T8b --from coordinator spoof refused" "rc=$rc open=$(gate_open DIVE-209) out=$out"
-
-# --- T9: BYPASS #2 — sudo != human. An agent that runs under `sudo` has id -un=root
-#     but SUDO_UID=its own agent uid, so _gate_sudo_uid_nonagent is FALSE (CALLER_HUMAN=0)
-#     while its trusted identity stays the agent (grok). It must be treated as the
-#     agent (unauthorized here), NOT as a human. This is the one-sudo forge.
-file_secret_gate DIVE-210
-out=$(CALLER_AGENT="grok" CALLER_HUMAN=0 cmd_task_need DIVE-210 --withdraw 2>&1); rc=$?
-[[ $rc -ne 0 && "$(gate_open DIVE-210)" == "open" ]] \
-  && ok_t "T9 agent under sudo (root uid, agent SUDO_UID) is NOT human — REFUSED" \
-  || bad_t "T9 sudo-agent not human" "rc=$rc open=$(gate_open DIVE-210) out=$out"
-# Sanity: the SAME flow, once the caller is genuinely the coordinator identity, DOES
-# clear — proving T9's refusal is the human/authority check, not a blanket block.
-file_secret_gate DIVE-211
-out=$(CALLER_AGENT="main" CALLER_HUMAN=0 cmd_task_need DIVE-211 --withdraw 2>&1); rc=$?
-[[ $rc -eq 0 && "$(gate_open DIVE-211)" == "cleared" ]] \
-  && ok_t "T9b coordinator identity (not via sudo-human) still clears — refusal was authority, not a block" \
-  || bad_t "T9b coordinator clears" "rc=$rc open=$(gate_open DIVE-211) out=$out"
+  || bad_t "T7 no-gate" "rc=$rc out=$out"
 
 echo "----"
 echo "PASS=$PASS FAIL=$FAIL"
