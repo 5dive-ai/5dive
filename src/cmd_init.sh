@@ -60,7 +60,7 @@ _init_pick() {
   local -a options=("$@")
   local count="${#options[@]}" selected=$((default_idx - 1))
   (( selected >= 0 && selected < count )) || selected=0
-  local spec value label description i key tail choice
+  local spec value label description i key tail choice _init_discard
 
   printf '  %s\n' "$title" >&2
   if [[ "${TERM:-dumb}" == "dumb" || ! -t 0 || ! -t 2 ]]; then
@@ -121,7 +121,16 @@ _init_pick() {
         k|K) selected=$(((selected - 1 + count) % count)) ;;
         j|J) selected=$(((selected + 1) % count)) ;;
         [1-9])
-          if (( key <= count )); then selected=$((key - 1)); break; fi
+          if (( key <= count )); then
+            selected=$((key - 1))
+            # A typed shortcut like "2⏎" leaves its terminating Enter in the tty
+            # buffer; without draining it, the next prompt (e.g. the model text
+            # field) reads that stray newline as an empty submission and aborts.
+            # The tiny timeout only consumes input already buffered — it never
+            # blocks waiting on the user. DIVE-1398.
+            IFS= read -r -s -t 0.05 _init_discard || true
+            break
+          fi
           ;;
       esac
     done
