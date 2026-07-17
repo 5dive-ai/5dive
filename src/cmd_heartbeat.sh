@@ -843,6 +843,76 @@ _hb_repo_grep_ident() {  # <repo-stem> <ident>
   printf '%s %s\n' "$repo" "$line"
 }
 
+# DIVE-1355 — the safety half of the self-dispatch fix. Two passes, both cheap
+# sqlite scans, isolated by the caller (|| log) like every other tick sweep:
+#
+#  (a) AUTO-RECOVER: a task still 'blocked' whose EVERY blocking edge points to a
+#      done/cancelled task. The live cascade (_task_cascade_unblock) handles this
+#      the moment a blocker closes; this pass repairs anything it missed — most
+#      importantly PRE-EXISTING rot (OSS-27 blocked_by an OSS-26 that finished
+#      before the cascade existed). Drop the satisfied edges + flip blocked->todo,
+#      subject to the SAME guardrail: never a parked task, never an unanswered
+#      human need-gate. Ping each freed assignee + one batched line to main.
+#
+#  (b) SURFACE (never auto-unblock): a task 'blocked' with NO live reason at all —
+#      no dependency edge, no unanswered need-gate, no park. Tonight's audit found
+#      most of ~56 blocked tasks are exactly this: manually blocked + forgotten.
+#      The guardrail is "only dependency edges auto-clear", so these are only
+#      FLAGGED to main (throttled to once/24h so it's not tick-spam), never flipped.
+_hb_blocked_sweep() {
+  local tid
+  # (a) auto-recover: blocked, not parked, no pending human gate, HAS edges, and
+  #     no edge points to a still-open blocker (=> every blocker done/cancelled).
+  local -a rec=()
+  while IFS= read -r tid; do
+    [[ -n "$tid" ]] || continue
+    db "DELETE FROM task_deps WHERE task_id=${tid};
+        UPDATE tasks SET status='todo'
+          WHERE id=${tid} AND status='blocked' AND parked_at IS NULL
+            AND (need_type IS NULL OR need_answered_at IS NOT NULL);"
+    [[ "$(db "SELECT status FROM tasks WHERE id=${tid};")" == "todo" ]] && rec+=("$tid")
+  done < <(db "SELECT t.id FROM tasks t
+               WHERE t.status='blocked' AND t.parked_at IS NULL
+                 AND (t.need_type IS NULL OR t.need_answered_at IS NOT NULL)
+                 AND EXISTS (SELECT 1 FROM task_deps d WHERE d.task_id=t.id)
+                 AND NOT EXISTS (SELECT 1 FROM task_deps d JOIN tasks b ON b.id=d.blocked_by
+                                 WHERE d.task_id=t.id AND b.status NOT IN ('done','cancelled'))
+               ORDER BY t.id;")
+  if [[ ${#rec[@]} -gt 0 ]]; then
+    local idlist="" who dident
+    for tid in "${rec[@]}"; do
+      who=$(db    "SELECT COALESCE(assignee,'') FROM tasks WHERE id=${tid};")
+      dident=$(db "SELECT ident FROM tasks WHERE id=${tid};")
+      idlist+="${dident} "
+      [[ -n "$who" ]] && ( cmd_send "$who" --from="task-engine" \
+          --message="▶️ Unblocked: ${dident} — all blockers done, now on your queue." ) >/dev/null 2>&1 || true
+    done
+    _hb_log "[blocked-sweep] auto-recovered: ${idlist}"
+    ( cmd_send "main" --from="task-engine" \
+        --message="🔧 Auto-recovered ${#rec[@]} stale-blocked task(s) whose blockers were all done: ${idlist}" ) >/dev/null 2>&1 || true
+  fi
+
+  # (b) surface no-live-reason blocks (never auto-unblock). Throttle to once/24h.
+  local orphan; orphan=$(db "SELECT t.ident FROM tasks t
+               WHERE t.status='blocked' AND t.parked_at IS NULL
+                 AND (t.need_type IS NULL OR t.need_answered_at IS NOT NULL)
+                 AND NOT EXISTS (SELECT 1 FROM task_deps d WHERE d.task_id=t.id)
+               ORDER BY t.id;" | tr '\n' ' ')
+  if [[ -n "${orphan// }" ]]; then
+    local last cutoff
+    last=$(db "SELECT value FROM task_prefs WHERE key='blocked_sweep_pinged_at';" 2>/dev/null)
+    cutoff=$(date -u -d '24 hours ago' '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo "")
+    if [[ -z "$last" || ( -n "$cutoff" && "$last" < "$cutoff" ) ]]; then
+      ( cmd_send "main" --from="task-engine" \
+          --message="⚠️ Blocked with no live reason (no open dependency, no human gate, no park) — likely manually blocked + forgotten. Unblock (5dive task unblock <id>) or cancel if dead: ${orphan}" ) >/dev/null 2>&1 || true
+      db "INSERT INTO task_prefs (key,value) VALUES ('blocked_sweep_pinged_at', datetime('now'))
+          ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=datetime('now');"
+      _hb_log "[blocked-sweep] surfaced no-reason blocked: ${orphan}"
+    fi
+  fi
+  return 0
+}
+
 _hb_gate_shipped_sweep() {
   local grow gid gident gtype gowner repo hit
   # Normalize the repo allow-list: commas or spaces both separate.
@@ -956,6 +1026,13 @@ cmd_heartbeat_tick() {
   # — runs before the wake loop so a just-unparked/just-unblocked todo is
   # eligible for pickup this same tick.
   _hb_gate_ttl_sweep || _hb_log "[gate-ttl] pass errored (non-fatal)"
+  # DIVE-1355: the belt-and-suspenders half of the self-dispatch fix. Auto-recover
+  # any task still stuck 'blocked' whose every blocking edge is a done/cancelled
+  # task (repairs pre-existing rot like OSS-27 + any live cascade miss), and
+  # SURFACE (never auto-unblock) tasks blocked with no live reason at all. Runs
+  # before the wake loop so a just-recovered todo is eligible this same tick. Same
+  # isolation contract — a failure here must never abort the wake loop.
+  _hb_blocked_sweep || _hb_log "[blocked-sweep] pass errored (non-fatal)"
   # DIVE-1140: flag open gates whose fix already merged so the overnight recap
   # stops surfacing ghost gates. Flag-only, never auto-closes. Same isolation.
   _hb_gate_shipped_sweep || _hb_log "[gate-shipped] pass errored (non-fatal)"

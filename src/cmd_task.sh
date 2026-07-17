@@ -625,6 +625,13 @@ _task_status_cmd() {
       work) _task_loop_advance "$id" || true ;;
     esac
   fi
+  # DIVE-1355: on any close (done/cancel), cascade-unblock dependents whose last
+  # blocking edge this close satisfies. Additive to and idempotent with the loop
+  # advance above (that path already dropped a loop step's edges, so this finds
+  # none left for those). Best-effort — never fails the committed close.
+  if [[ "$verb" == "done" || "$verb" == "cancel" ]]; then
+    _task_cascade_unblock "$id" || true
+  fi
   # --notify (done/cancel only): DM the paired human a one-line ✅/⚠️ summary so
   # autonomous queue work surfaces a finish line. Best-effort; never fails the
   # status write above.
@@ -871,6 +878,52 @@ _loop_kind() {
     *) return ;;
   esac
   printf '%s' "$body" | sed -n 's/.*\[\[5dive-loop:\([^]]*\)\]\].*/\1/p' | head -1
+}
+
+# DIVE-1355 — the task-engine self-dispatch fix. When a task CLOSES (done or
+# cancelled), free any dependent this close finished off: drop the now-satisfied
+# blocking edge, and if the dependent has NO blocking edges left, flip it
+# blocked->todo and ping its assignee so it dispatches now instead of rotting.
+# This is the same unblock-flip `task unblock`, the relay advance, and the
+# park-wake sweep all use (a task with no task_deps edge is, by convention,
+# unblocked). It is what makes a finished blocker actually release its dependents
+# — the OSS-26 -> OSS-27 rot that idled the whole builder queue overnight
+# (dependents stayed status=blocked forever because NOTHING cleared their edge).
+#
+# GUARDRAIL (lodar/main): ONLY dependency edges auto-clear. A dependent is left
+# blocked (not flipped) when it has another live hold — an unanswered human
+# need-gate (need_type set, need_answered_at NULL) or a park (parked_at set: a
+# deliberate hold / future wake the park-wake sweep owns). The satisfied edge is
+# still dropped (the blocker really is done), so once the gate is answered / the
+# park wakes, the existing NOT-EXISTS-edge flip releases it correctly.
+#
+# Best-effort + isolated by the caller (|| true): a cascade hiccup must never
+# fail the close that already committed. Runs on done AND cancel — a cancelled
+# blocker is as "cleared" as a done one for its dependents.
+_task_cascade_unblock() {
+  local closed_id="$1" dep
+  while IFS= read -r dep; do
+    [[ -n "$dep" ]] || continue
+    # This blocker is now done/cancelled — drop its (satisfied) edge.
+    db "DELETE FROM task_deps WHERE task_id=${dep} AND blocked_by=${closed_id};"
+    # Still blocked by another unfinished edge? leave it.
+    [[ "$(db "SELECT COUNT(*) FROM task_deps WHERE task_id=${dep};")" == "0" ]] || continue
+    # Flip blocked->todo ONLY when no non-dependency hold remains (guardrail).
+    db "UPDATE tasks SET status='todo'
+        WHERE id=${dep} AND status='blocked'
+          AND parked_at IS NULL
+          AND (need_type IS NULL OR need_answered_at IS NOT NULL);"
+    [[ "$(db "SELECT status FROM tasks WHERE id=${dep};")" == "todo" ]] || continue
+    # Ping the freed dependent's assignee (best-effort; subshell contains cmd_send's
+    # fail-closed exit + scoped-send exec exactly like _task_loop_advance).
+    local who dident dtitle
+    who=$(db    "SELECT COALESCE(assignee,'') FROM tasks WHERE id=${dep};")
+    dident=$(db "SELECT ident FROM tasks WHERE id=${dep};")
+    dtitle=$(db "SELECT COALESCE(title,'') FROM tasks WHERE id=${dep};")
+    [[ -n "$who" ]] && ( cmd_send "$who" --from="task-engine" \
+        --message="▶️ Unblocked: ${dident} — all its blockers are done. It's on your queue now: ${dtitle}" ) >/dev/null 2>&1 || true
+  done < <(db "SELECT task_id FROM task_deps WHERE blocked_by=${closed_id};")
+  return 0
 }
 
 # Advance a loop past a just-finished step `sid`. Drop each edge where a sibling
