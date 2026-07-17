@@ -522,23 +522,31 @@ if [[ "$TYPE" == "hermes" ]]; then
   # silently lose the user's BYO provider choice. The profile dir's
   # config.yaml is authoritative for model/provider; any drift in LOCAL just
   # means hermes wrote a fresh default that needs to be overridden.
+  # DIVE-1394: standard-isolation agents have NO passwordless sudo, so the
+  # old sudo-only test/cmp/cat bailed for every default (non-admin) hermes
+  # agent — the seed silently no-op'd and the agent booted with no provider,
+  # dropping straight into the Nous "hermes setup" wizard. Mirror the codex/
+  # grok DIVE-1188 fix: try a plain read first (the shared file is normalized
+  # 0640 g=claude and every agent is in group claude, so a group read works
+  # over the 2750/0775 g=claude dir) and only fall back to `sudo -n` for a
+  # not-yet-normalized 0600 file on an admin agent.
   seed_one() {
     local f="$1" mode="$2"  # mode: mtime | content
     local SHARED="$SHARED_HERMES_DIR/$f"
     local LOCAL="$AGENT_HERMES_HOME/$f"
-    sudo -n test -e "$SHARED" || return 0
+    { [[ -e "$SHARED" ]] || sudo -n test -e "$SHARED" 2>/dev/null; } || return 0
     local stale=0
     if [[ ! -f "$LOCAL" ]]; then
       stale=1
     elif [[ "$mode" == "content" ]]; then
-      sudo -n cmp -s "$SHARED" "$LOCAL" 2>/dev/null || stale=1
+      { cmp -s "$SHARED" "$LOCAL" 2>/dev/null || sudo -n cmp -s "$SHARED" "$LOCAL" 2>/dev/null; } || stale=1
     else
-      sudo -n test "$SHARED" -nt "$LOCAL" && stale=1
+      { [[ "$SHARED" -nt "$LOCAL" ]] 2>/dev/null || sudo -n test "$SHARED" -nt "$LOCAL" 2>/dev/null; } && stale=1
     fi
     (( stale )) || return 0
     local TMP
     TMP="$(mktemp -p "$AGENT_HERMES_HOME" ".${f}.XXXXXX")"
-    if sudo -n cat "$SHARED" > "$TMP" 2>/dev/null; then
+    if { cat "$SHARED" 2>/dev/null || sudo -n cat "$SHARED" 2>/dev/null; } > "$TMP" && [[ -s "$TMP" ]]; then
       chmod 600 "$TMP"
       mv "$TMP" "$LOCAL"
       hermes_seeded=1
