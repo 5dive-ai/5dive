@@ -184,6 +184,7 @@ Projects (ident namespaces for the queue; default 'dive' = DIVE-N):
   5dive goal add "<outcome>" [--dry-run] [--max-tasks=N] [--yes]   # outcome -> validated, guardrailed task graph (DIVE-984)
   5dive objective add "<name>" --metric-cmd="<cmd>" --target=<n> [--direction=up|down] [--unit=%] [--public]  # standing goal bound to a read-only metric (OSS-19)
   5dive objective ls | show <name> | tick [<name>] | pause <name> | resume <name> | rm <name>
+  5dive objective replan <name> [--max-new-per-cycle=N] [--dry-run] [--yes] [--from-gate=<id>]  # re-plan cycle: metric -> guardrailed diff -> gate -> apply (OSS-27)
 
 Org chart (who reports to whom):
   5dive org set <agent> --manager=<agent> [--role=<text>] [--title=<text>]
@@ -599,8 +600,11 @@ main() {
     objective|objectives)
       # OSS-19 (OSS-26 phase A1): outcome-loop objectives — a standing goal bound
       # to a read-only metric command. add/ls/show/pause/resume/rm/tick. Same
-      # group-writable store as tasks; read/write, no root/lock. Measurement only
-      # in this build (no origination/planner cycle).
+      # group-writable store as tasks; read/write, no root/lock. OSS-27 adds the
+      # re-plan cycle (`objective replan`): the planner reads the metric + its own
+      # originated work and emits a guardrailed diff (create/reprioritize/cancel)
+      # through the goal materialize path — origination rides ONE count-checkpoint
+      # gate, T2 creates gate hard, and it can only touch its own originated tasks.
       cmd_objective "$@" ;;
     crew)
       # DIVE-787 (0.5.0 flagship): 5dive as the always-on runtime for CrewAI

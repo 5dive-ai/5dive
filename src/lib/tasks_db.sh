@@ -255,9 +255,20 @@ CREATE TABLE IF NOT EXISTS tasks (
   -- gate). NULL on every human-directed gate, so the DIVE-391/515/516 self-clear
   -- boundary is unchanged for anything not explicitly routed. `secret` is never
   -- routed (stays hard-human), and a tier-2 gate is never routed.
-  routed_reviewer     TEXT
+  routed_reviewer     TEXT,
+  -- OSS-27 (OSS-19 re-plan cycle): provenance for a task ORIGINATED by an
+  -- objective's planner cycle. originated_by_objective = objectives.id that
+  -- filed it; originated_cycle = the objective_cycles.cycle_no it was filed in.
+  -- Both NULL for every human/goal/recurring/relay task. The re-plan cycle keys
+  -- its "own originated tasks" scope on originated_by_objective: a planner may
+  -- propose-cancel or reprioritize ONLY rows it originated — touching any
+  -- human-created (or other-objective) task is impossible in code, never merely
+  -- discouraged. Additive expand, NULL backfill.
+  originated_by_objective INTEGER,
+  originated_cycle        INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_tasks_precedent ON tasks(need_type, ask_shape);
+CREATE INDEX IF NOT EXISTS idx_tasks_originated ON tasks(originated_by_objective);
 
 CREATE TABLE IF NOT EXISTS task_deps (
   task_id     INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
@@ -429,6 +440,12 @@ CREATE TABLE IF NOT EXISTS objectives (
   budget            INTEGER,
   public            INTEGER NOT NULL DEFAULT 0,
   status            TEXT NOT NULL DEFAULT 'active',
+  -- OSS-27 shadow-first run mode (OSS-35): 'live' (default) applies a re-plan
+  -- cycle's non-origination changes within the objective's own-task autonomy,
+  -- 'shadow' forces PROPOSE-ONLY -- the entire diff rides ONE gate a human
+  -- confirms, nothing auto-applies, and --yes cannot waive it. Fail-safe lever
+  -- so a dogfood run (OSS-35) never touches the live company until approved.
+  run_mode          TEXT NOT NULL DEFAULT 'live',
   created_by        TEXT,
   created_at        TEXT NOT NULL DEFAULT (datetime('now')),
   updated_at        TEXT NOT NULL DEFAULT (datetime('now'))
@@ -445,6 +462,30 @@ CREATE TABLE IF NOT EXISTS objective_readings (
   rc           INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS objective_readings_idx ON objective_readings(objective_id, id);
+-- OSS-27 (OSS-19 re-plan cycle): one append-only row per objective PLANNER CYCLE
+-- (`objective replan`). The honesty/audit trail for origination — same pattern as
+-- objective_readings. cycle_no is the monotone per-objective cycle index. outcome
+-- records what the cycle did: applied | gated | target_reached | budget_exhausted
+-- | noop. reading_value is the metric reading the planner saw. tokens_spent is the
+-- planner's spend that cycle (fed into the per-objective budget stop-condition).
+-- gate_anchor is the ident of the ONE count-checkpoint decision gate a gated cycle
+-- filed (NULL otherwise). Keep byte-identical to the copy in _tasks_db_migrate.
+CREATE TABLE IF NOT EXISTS objective_cycles (
+  id            INTEGER PRIMARY KEY AUTOINCREMENT,
+  objective_id  INTEGER NOT NULL REFERENCES objectives(id) ON DELETE CASCADE,
+  cycle_no      INTEGER NOT NULL,
+  ts            TEXT NOT NULL DEFAULT (datetime('now')),
+  reading_value REAL,
+  proposed      INTEGER NOT NULL DEFAULT 0,
+  applied       INTEGER NOT NULL DEFAULT 0,
+  reprioritized INTEGER NOT NULL DEFAULT 0,
+  cancelled     INTEGER NOT NULL DEFAULT 0,
+  gated         INTEGER NOT NULL DEFAULT 0,
+  gate_anchor   TEXT,
+  tokens_spent  INTEGER NOT NULL DEFAULT 0,
+  outcome       TEXT NOT NULL DEFAULT 'noop'
+);
+CREATE INDEX IF NOT EXISTS objective_cycles_idx ON objective_cycles(objective_id, cycle_no);
 SQL
 }
 
@@ -511,7 +552,8 @@ _tasks_db_migrate() {
            'tier INTEGER' 'need_asked_at TEXT' 'gate_pinged_at TEXT' 'wake_at TEXT' \
            'secret_key TEXT' 'connector TEXT' 'human_nonce_hash TEXT' \
            'ask_shape TEXT' 'precedent_ref INTEGER' 'precedent_kind TEXT' \
-           'shipped_flag_at TEXT' 'routed_reviewer TEXT'; do
+           'shipped_flag_at TEXT' 'routed_reviewer TEXT' \
+           'originated_by_objective INTEGER' 'originated_cycle INTEGER'; do
     if ! printf '%s\n' "$cols" | grep -qx "${c%% *}"; then
       sqlite3 -cmd ".timeout 5000" "$TASKS_DB" \
         "ALTER TABLE tasks ADD COLUMN ${c};" >/dev/null 2>&1 || true
@@ -713,6 +755,12 @@ CREATE TABLE IF NOT EXISTS objectives (
   budget            INTEGER,
   public            INTEGER NOT NULL DEFAULT 0,
   status            TEXT NOT NULL DEFAULT 'active',
+  -- OSS-27 shadow-first run mode (OSS-35): 'live' (default) applies a re-plan
+  -- cycle's non-origination changes within the objective's own-task autonomy,
+  -- 'shadow' forces PROPOSE-ONLY -- the entire diff rides ONE gate a human
+  -- confirms, nothing auto-applies, and --yes cannot waive it. Fail-safe lever
+  -- so a dogfood run (OSS-35) never touches the live company until approved.
+  run_mode          TEXT NOT NULL DEFAULT 'live',
   created_by        TEXT,
   created_at        TEXT NOT NULL DEFAULT (datetime('now')),
   updated_at        TEXT NOT NULL DEFAULT (datetime('now'))
@@ -726,6 +774,53 @@ CREATE TABLE IF NOT EXISTS objective_readings (
 );
 CREATE INDEX IF NOT EXISTS objective_readings_idx ON objective_readings(objective_id, id);
 MIG
+  fi
+
+  # OSS-27 objective_cycles — additive, gated on its OWN absence (not objectives',
+  # so a store that already has objectives from OSS-26 still gets the cycles table).
+  # Brand-new, never referenced by tasks/projects. Keep this CREATE body
+  # byte-identical to the copy in _tasks_schema above (tests/schema_sync_unit.sh).
+  local has_obj_cycles
+  has_obj_cycles=$(sqlite3 -cmd ".timeout 5000" "$TASKS_DB" \
+    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='objective_cycles' LIMIT 1;" 2>/dev/null)
+  if [[ "$has_obj_cycles" != "1" ]]; then
+    sqlite3 -cmd ".timeout 5000" "$TASKS_DB" <<'MIG' >/dev/null 2>&1 || true
+CREATE TABLE IF NOT EXISTS objective_cycles (
+  id            INTEGER PRIMARY KEY AUTOINCREMENT,
+  objective_id  INTEGER NOT NULL REFERENCES objectives(id) ON DELETE CASCADE,
+  cycle_no      INTEGER NOT NULL,
+  ts            TEXT NOT NULL DEFAULT (datetime('now')),
+  reading_value REAL,
+  proposed      INTEGER NOT NULL DEFAULT 0,
+  applied       INTEGER NOT NULL DEFAULT 0,
+  reprioritized INTEGER NOT NULL DEFAULT 0,
+  cancelled     INTEGER NOT NULL DEFAULT 0,
+  gated         INTEGER NOT NULL DEFAULT 0,
+  gate_anchor   TEXT,
+  tokens_spent  INTEGER NOT NULL DEFAULT 0,
+  outcome       TEXT NOT NULL DEFAULT 'noop'
+);
+CREATE INDEX IF NOT EXISTS objective_cycles_idx ON objective_cycles(objective_id, cycle_no);
+MIG
+  fi
+
+  # OSS-27 tasks.originated index for migrated stores (the columns backfill via the
+  # ALTER loop above; harmless if they're all-NULL — the index just never matches).
+  sqlite3 -cmd ".timeout 5000" "$TASKS_DB" \
+    "CREATE INDEX IF NOT EXISTS idx_tasks_originated ON tasks(originated_by_objective);" >/dev/null 2>&1 || true
+
+  # OSS-27 shadow-first: objectives.run_mode for stores whose objectives table
+  # predates it (created by OSS-26). Pure expand, NOT-NULL DEFAULT 'live' so old
+  # objectives keep applying own-task changes directly; a dogfood objective is
+  # flipped to 'shadow' explicitly (5dive objective shadow <name>).
+  if [[ "$has_objectives" == "1" ]]; then
+    local obj_cols
+    obj_cols=$(sqlite3 -cmd ".timeout 5000" "$TASKS_DB" \
+              "SELECT name FROM pragma_table_info('objectives');" 2>/dev/null)
+    if ! printf '%s\n' "$obj_cols" | grep -qx "run_mode"; then
+      sqlite3 -cmd ".timeout 5000" "$TASKS_DB" \
+        "ALTER TABLE objectives ADD COLUMN run_mode TEXT NOT NULL DEFAULT 'live';" >/dev/null 2>&1 || true
+    fi
   fi
 }
 
