@@ -331,9 +331,15 @@ _goal_invoke_planner() {
   local outcome="$1" planner="$2" ceiling="$3" max_tasks="$4"
   local contract; contract=$(_goal_build_contract "$outcome" "$max_tasks")
   local schema; schema=$(_goal_plan_schema)
+  # DIVE-1349: bound the wait explicitly. This path is usually driven behind a
+  # single HTTP request (the dashboard goals page, ~180s client budget), so ask
+  # for GOAL_PLANNER_WAIT_SECS (150s) — enough for a woken planner to return a
+  # plan, but comfortably in-window so a slow plan yields a clean timeout the page
+  # renders, never a gateway 502. The spawn also wakes the planner immediately.
   local spawn_json
   spawn_json=$(JSON_MODE=1 cmd_loop_spawn --role=worker --agent="$planner" \
-                 --prompt="$contract" --schema="$schema" --ceiling="$ceiling" --wait) || return $?
+                 --prompt="$contract" --schema="$schema" --ceiling="$ceiling" \
+                 --wait="${GOAL_PLANNER_WAIT_SECS:-150}") || return $?
   local status result
   status=$(printf '%s' "$spawn_json" | jq -r '.data.status // ""')
   result=$(printf '%s' "$spawn_json" | jq -r '.data.result // ""')

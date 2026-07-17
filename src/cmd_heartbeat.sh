@@ -118,9 +118,25 @@ cmd_heartbeat() {
     off|disable)     with_registry_lock cmd_heartbeat_off "$@" ;;
     ls|list|status)  cmd_heartbeat_ls "$@" ;;
     tick)            cmd_heartbeat_tick "$@" ;;
+    wake-task)       cmd_heartbeat_wake_task "$@" ;;
     -h|--help|help)  _hb_usage ;;
     *) fail "$E_USAGE" "unknown heartbeat command: $sub (try: 5dive heartbeat --help)" ;;
   esac
+}
+
+# DIVE-1349 wake-on-spawn helper (internal plumbing, not in _hb_usage). Nudges
+# ONE agent to start a specific just-spawned task now instead of on its next
+# tick. Root-gated because it drives systemd + the agent's tmux session; invoked
+# by `loop spawn` — directly when already root, else via `sudo -n 5dive heartbeat
+# wake-task …` from the claude-owned shelld exec context. Reuses the exact tick
+# nudge (_hb_wake, fresh=false: pick the task up in the running context, no
+# /clear). Best-effort by contract: _hb_wake's own failures are non-fatal here.
+cmd_heartbeat_wake_task() {
+  require_root
+  local name="${1:-}" task_id="${2:-}" task_ident="${3:-DIVE-${2:-}}"
+  [[ -n "$name" && "$task_id" =~ ^[0-9]+$ ]] \
+    || fail "$E_USAGE" "usage: 5dive heartbeat wake-task <agent> <task_id> [<task_ident>]"
+  _hb_wake "$name" "false" "$task_id" "$task_ident" || true
 }
 
 # Parse a duration into whole minutes. Accepts a bare integer (minutes),

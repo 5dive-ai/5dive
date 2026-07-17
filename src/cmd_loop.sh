@@ -181,6 +181,38 @@ _loop_spent() {
   db "SELECT COALESCE(tokens_spent,0) FROM loop_runs WHERE loop_id=$(sqlq "$loop_id");"
 }
 
+# DIVE-1349 wake-on-spawn: nudge a freshly loop-spawned task's assignee to START
+# it NOW rather than waiting for its next heartbeat tick. Without this a
+# `loop spawn --wait` caller — notably the dashboard goal planner, which runs
+# `goal add` behind a single HTTP request — holds its socket idle until the tick
+# fires, which is what 502s the goals page (see goal-planner-sync-wait-502).
+#
+# STRICTLY best-effort and side-effect-free on failure: it only ever wakes a real
+# ENROLLED agent (a bare loop role/type token like "worker" has no box session),
+# skips an agent that is actively working a turn (don't interleave — its own
+# heartbeat will queue this task), and swallows every error so a wake that can't
+# happen degrades to exactly the old behaviour (heartbeat pickup). Runs the
+# privileged wake directly when already root, else re-execs it through `sudo -n`
+# from the claude-owned shelld exec context (claude has NOPASSWD). Backgrounded so
+# it never delays the spawn's return or the --wait poll.
+_loop_wake_agent() {
+  local name="$1" task_id="$2" task_ident="$3"
+  [[ -n "$name" && -n "$task_id" ]] || return 0
+  id -u "agent-${name}" >/dev/null 2>&1 || return 0     # a real box agent, not a type token
+  command -v systemctl >/dev/null 2>&1 || return 0
+  # Don't interleave a busy agent's live turn — only SKIP on an explicit busy read
+  # (rc 1); idle/unknown/blocked all fall through to a wake (best-effort).
+  if systemctl is-active --quiet "5dive-agent@${name}.service" 2>/dev/null; then
+    _hb_agent_idle "$name" >/dev/null 2>&1; [[ $? -eq 1 ]] && return 0
+  fi
+  if [[ $EUID -eq 0 ]]; then
+    _hb_wake "$name" "false" "$task_id" "$task_ident" >/dev/null 2>&1 || true
+  else
+    sudo -n 5dive heartbeat wake-task "$name" "$task_id" "$task_ident" >/dev/null 2>&1 || true
+  fi
+  return 0
+}
+
 # --- loop spawn (the atom — design §3) ---
 # Create a loop_runs row + a backing task (`task add --assignee=<agent>`
 # carrying --prompt as body); the heartbeat wakes the agent to work it. Returns
@@ -253,6 +285,12 @@ cmd_loop_spawn() {
       VALUES ($(sqlq "$loop_id"), 'spawn', $(sqlq "$by_agent"), ${by_task_sql}, $(sqlq_or_null "$stage"),
               ${eff_ceiling}, 'running', $(sqlq "[${task_id}]"), ${now}, ${now});"
 
+  # DIVE-1349: wake the assignee to start this task now (best-effort, backgrounded
+  # so it never delays the return below or the --wait poll). Fixes the goal-planner
+  # -behind-HTTP hang: the planner agent begins its turn in seconds instead of on
+  # the next heartbeat tick.
+  _loop_wake_agent "$agent" "$task_id" "$task_ident" >/dev/null 2>&1 &
+
   # No --wait: return the handle immediately (true async fleet semantics).
   if [[ -z "$wait_flag" ]]; then
     ok "loop ${loop_id} spawned → task ${task_ident} (assignee ${agent})" \
@@ -262,9 +300,14 @@ cmd_loop_spawn() {
   fi
 
   # --wait: block-poll the backing task to terminal, bounded by --wait=<sec>
-  # (default derived from ceiling, hard-capped) and policed by kill + ceiling.
+  # and policed by kill + ceiling. DIVE-1349: the bare-`--wait` default was 1800s
+  # (30 min) — far past any gateway/exec timeout, so a `goal add` behind an HTTP
+  # request (the dashboard goals page) held the socket until the gateway 502'd.
+  # Bounded to LOOP_SPAWN_WAIT_DEFAULT (120s) so a slow plan returns a clean
+  # timeout the caller can render, never a 502. Callers needing longer pass an
+  # explicit --wait=<sec> (e.g. the goal planner asks for 150s, still in-window).
   local deadline poll="${LOOP_POLL_SECS:-4}"
-  if [[ -n "$wait_secs" ]]; then deadline=$(( now + wait_secs )); else deadline=$(( now + 1800 )); fi
+  if [[ -n "$wait_secs" ]]; then deadline=$(( now + wait_secs )); else deadline=$(( now + ${LOOP_SPAWN_WAIT_DEFAULT:-120} )); fi
   local final_status="running" tstatus="" tresult="" killed="" spent="0"
   while :; do
     local t; t=$(date +%s)
