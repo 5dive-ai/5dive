@@ -2886,6 +2886,12 @@ CREATE TABLE IF NOT EXISTS tasks (
   -- enters a loop (verifier set + maker hands off).
   iteration           INTEGER,
   maker_agent         TEXT,
+  -- DIVE-1378: one real receiver ACK for maker→verifier handoffs. NULL means
+  -- the work was delivered to the verifier but they have not acknowledged
+  -- beginning review; set only when that assigned verifier runs `task start`.
+  -- The public handoff state is derived as delivered|reviewing so we do not grow
+  -- a second task-status FSM or let a sender claim that review has begun.
+  handoff_ack_at      TEXT,
   -- DIVE-891: risk-tiered gates (adopted design DIVE-861). tier is set when the
   -- gate is filed: 0 = auto-clear (rec applies immediately, digest line only),
   -- 1 = agent-clearable + 48h TTL auto-applies the recommendation, 2 = hard
@@ -3192,7 +3198,7 @@ _tasks_db_migrate() {
            'escalated_at TEXT' 'escalated_by TEXT' \
            "project_key TEXT NOT NULL DEFAULT 'dive'" 'issue_number INTEGER' \
            'acceptance_criteria TEXT' 'verify_command TEXT' 'max_iterations INTEGER' 'verifier TEXT' \
-           'iteration INTEGER' 'maker_agent TEXT' 'task_budget TEXT' \
+           'iteration INTEGER' 'maker_agent TEXT' 'handoff_ack_at TEXT' 'task_budget TEXT' \
            'tier INTEGER' 'need_asked_at TEXT' 'gate_pinged_at TEXT' 'wake_at TEXT' \
            'secret_key TEXT' 'connector TEXT' 'human_nonce_hash TEXT' \
            'ask_shape TEXT' 'precedent_ref INTEGER' 'precedent_kind TEXT' \
@@ -15727,7 +15733,13 @@ cmd_task_ls() {
     # answered, task still open). Consumers/dashboards MUST count/filter on this,
     # never raw `need_type != null` (which retains a STALE type after a gate is
     # consumed or the task is re-blocked on a dependency, over-reporting the inbox).
-    rows=$(dbfmt -json "SELECT id, ident, title, status, priority, assignee, created_by, parent_id, created_at, done_at, body, result, need_type, ask, need_options, recommend, precedent_ref, precedent_kind, need_answer, need_answered_at, need_answered_by, tier, kind, schedule, last_fired_at, parked_at, park_reason, wake_at, project_key, CASE WHEN need_type IS NOT NULL AND need_answered_at IS NULL AND status NOT IN ('done','cancelled') THEN 1 ELSE 0 END AS gate_live FROM tasks WHERE ${where} ${order};")
+    rows=$(dbfmt -json "SELECT id, ident, title, status, priority, assignee, created_by, parent_id, created_at, done_at, body, result, need_type, ask, need_options, recommend, precedent_ref, precedent_kind, need_answer, need_answered_at, need_answered_by, tier, kind, schedule, last_fired_at, parked_at, park_reason, wake_at, project_key,
+             CASE WHEN maker_agent IS NOT NULL AND assignee=verifier AND status NOT IN ('done','cancelled')
+                  THEN CASE WHEN handoff_ack_at IS NOT NULL THEN 'reviewing' ELSE 'delivered' END
+                  ELSE NULL END AS handoff_state,
+             handoff_ack_at,
+             CASE WHEN need_type IS NOT NULL AND need_answered_at IS NULL AND status NOT IN ('done','cancelled') THEN 1 ELSE 0 END AS gate_live
+           FROM tasks WHERE ${where} ${order};")
     [[ -n "$rows" ]] || rows="[]"
     # Feed rows via stdin, not --argjson: a big board (179+ tasks w/ bodies)
     # blows past MAX_ARG_STRLEN (128K per argv string) -> execve E2BIG
@@ -15788,11 +15800,16 @@ cmd_task_show() {
         CASE WHEN task_budget         IS NOT NULL THEN 'task_budget: '||task_budget||x'0a' ELSE '' END||
         CASE WHEN verifier            IS NOT NULL THEN 'verifier: '||verifier||x'0a' ELSE '' END||
         CASE WHEN maker_agent         IS NOT NULL THEN 'maker: '||maker_agent||x'0a' ELSE '' END||
+        CASE WHEN maker_agent IS NOT NULL AND assignee=verifier AND status NOT IN ('done','cancelled')
+             THEN 'handoff: '||CASE WHEN handoff_ack_at IS NOT NULL
+                                    THEN 'reviewing (ACK '||handoff_ack_at||')'
+                                    ELSE 'delivered (awaiting verifier ACK)' END||x'0a'
+             ELSE '' END||
         CASE WHEN iteration           IS NOT NULL THEN 'iteration: '||iteration ELSE '' END
       FROM tasks WHERE id=${id}
         AND (acceptance_criteria IS NOT NULL OR verify_command IS NOT NULL
              OR max_iterations IS NOT NULL OR verifier IS NOT NULL OR task_budget IS NOT NULL
-             OR maker_agent IS NOT NULL OR iteration IS NOT NULL);")
+             OR maker_agent IS NOT NULL OR iteration IS NOT NULL OR handoff_ack_at IS NOT NULL);")
     [[ -n "$loopspec" ]] && { echo; echo "loop spec:"; printf '%s\n' "$loopspec" | sed -e 's/[[:space:]]*$//' | indent2; }
     local subs
     subs=$(db "SELECT ident||'  ['||status||']  '||title FROM tasks WHERE parent_id=${id} ORDER BY id;")
@@ -15813,7 +15830,9 @@ cmd_task_assign() {
   # OLD assignee. Without this, an inherited in_progress task keeps the prior
   # owner's started_at, and the heartbeat stale-reaper (_hb_reap_stale) can
   # cancel it on the new owner's very first tick before they touch it.
-  db "UPDATE tasks SET assignee=$(sqlq "$who"),
+  db "UPDATE tasks SET
+        handoff_ack_at=CASE WHEN assignee IS NOT $(sqlq "$who") THEN NULL ELSE handoff_ack_at END,
+        assignee=$(sqlq "$who"),
         started_at=CASE WHEN status='in_progress' AND assignee IS NOT $(sqlq "$who")
                         THEN datetime('now') ELSE started_at END
       WHERE id=${id};"
@@ -15843,6 +15862,23 @@ _task_status_cmd() {
   # (never blocks the start); runs from the caller's cwd.
   if [[ "$verb" == "start" && $no_preflight -eq 0 ]]; then
     _task_start_preflight "$id" "$ident" "$(task_actor)" || true
+  fi
+  # DIVE-1378: `task start` is the receiver-emitted ACK for a verifier handoff.
+  # Record it only when the ACTOR is the currently assigned verifier. Delivery
+  # alone, or a third party forcing status=in_progress, must never claim that
+  # review is running. COALESCE makes repeat starts idempotent.
+  local handoff_ack="" handoff_ack_at=""
+  if [[ "$verb" == "start" ]]; then
+    local _start_actor; _start_actor=$(task_actor)
+    if [[ "$(db "SELECT CASE WHEN maker_agent IS NOT NULL
+                                  AND assignee=verifier
+                                  AND assignee=$(sqlq "$_start_actor")
+                                  AND handoff_ack_at IS NULL
+                               THEN 1 ELSE 0 END
+                         FROM tasks WHERE id=${id};")" == "1" ]]; then
+      handoff_ack="reviewing"
+      extra+=", handoff_ack_at=COALESCE(handoff_ack_at, datetime('now'))"
+    fi
   fi
   # DIVE-477: maker→verifier routing. A `task done` on a task that carries a
   # `verifier` distinct from its current assignee is NOT a close — it's a handoff.
@@ -15881,6 +15917,7 @@ _task_status_cmd() {
     set_result=", result=$(sqlq_or_null "$result")"
   fi
   db "UPDATE tasks SET status=$(sqlq "$newstatus")${extra}${set_result} WHERE id=${id};"
+  [[ -n "$handoff_ack" ]] && handoff_ack_at=$(db "SELECT handoff_ack_at FROM tasks WHERE id=${id};")
   # DIVE-552: if this close finished a LOOP STEP, advance the relay — free the
   # next step (a freed agent step the heartbeat wakes; a freed gate fires its
   # human tap) and close the run when the last step lands. Only on a real `done`
@@ -15916,7 +15953,14 @@ _task_status_cmd() {
       _task_close_notify "$ident" "$verb" "$result" || true
     fi
   fi
-  ok "$ident $verb" '{id:($i|tonumber), ident:$id, status:$s}' --arg i "$id" --arg id "$ident" --arg s "$newstatus"
+  local ok_msg="$ident $verb"
+  [[ -n "$handoff_ack" ]] && ok_msg+=" — verifier ACK: reviewing"
+  ok "$ok_msg" \
+     '{id:($i|tonumber), ident:$id, status:$s,
+       handoff:(if $h=="" then null else $h end),
+       handoffAckAt:(if $ha=="" then null else $ha end)}' \
+     --arg i "$id" --arg id "$ident" --arg s "$newstatus" \
+     --arg h "$handoff_ack" --arg ha "$handoff_ack_at"
 }
 
 # DIVE-1375: fail-loud preflight at `task start` (Bobby gripe #3). Surface the
@@ -16010,12 +16054,12 @@ _task_route_to_verifier() {
         SET status='todo', assignee=$(sqlq "$vfier"),
             maker_agent=COALESCE(maker_agent, $(sqlq_or_null "$maker")),
             iteration=COALESCE(iteration,0)+1,
-            started_at=NULL${set_result}
+            started_at=NULL, handoff_ack_at=NULL${set_result}
       WHERE id=${id};"
   local iter; iter=$(db "SELECT iteration FROM tasks WHERE id=${id};")
   local ident; ident=$(ident_of "$id")
-  ok "$ident ready for review — routed to verifier '$vfier' (iteration $iter)" \
-     '{id:($i|tonumber), ident:$id, status:"todo", routedTo:$v, role:"verifier", iteration:($n|tonumber)}' \
+  ok "$ident ready for review — delivered to verifier '$vfier' (iteration $iter; awaiting ACK)" \
+     '{id:($i|tonumber), ident:$id, status:"todo", routedTo:$v, role:"verifier", handoff:"delivered", acknowledged:false, iteration:($n|tonumber)}' \
      --arg i "$id" --arg id "$ident" --arg v "$vfier" --arg n "$iter"
 }
 
@@ -16055,7 +16099,7 @@ cmd_task_reject() {
     return
   fi
   # Otherwise bounce back to the maker for another pass.
-  db "UPDATE tasks SET status='todo', assignee=$(sqlq "$maker"), started_at=NULL,
+  db "UPDATE tasks SET status='todo', assignee=$(sqlq "$maker"), started_at=NULL, handoff_ack_at=NULL,
         result=$(sqlq "$fb_txt") WHERE id=${id};"
   ok "$ident rejected — bounced back to maker '$maker' (iteration $iter${maxi:+/$maxi})" \
      '{id:($i|tonumber), ident:$id, status:"todo", bouncedTo:$m, role:"maker", iteration:($n|tonumber)}' \
@@ -16139,6 +16183,10 @@ cmd_task_loops() {
                COALESCE(maker_agent, assignee) AS maker, verifier,
                COALESCE(iteration,0) AS iteration, max_iterations,
                COALESCE(assignee,'') AS holder,
+               CASE WHEN maker_agent IS NOT NULL AND assignee=verifier AND status NOT IN ('done','cancelled')
+                    THEN CASE WHEN handoff_ack_at IS NOT NULL THEN 'reviewing' ELSE 'delivered' END
+                    ELSE NULL END AS handoff_state,
+               handoff_ack_at,
                CASE WHEN ${stuck_pred} THEN 1 ELSE 0 END AS stuck, title
              FROM tasks WHERE ${where}
              ORDER BY (CASE WHEN ${stuck_pred} THEN 1 ELSE 0 END) DESC, COALESCE(iteration,0) DESC, id;")
@@ -16154,6 +16202,9 @@ cmd_task_loops() {
     else
       if (( ! runs_only )); then
         dbfmt -box "SELECT ident, status,
+                 CASE WHEN maker_agent IS NOT NULL AND assignee=verifier AND status NOT IN ('done','cancelled')
+                      THEN CASE WHEN handoff_ack_at IS NOT NULL THEN 'reviewing' ELSE 'delivered' END
+                      ELSE '-' END AS handoff,
                  COALESCE(maker_agent, COALESCE(assignee,'-')) AS maker,
                  COALESCE(verifier,'-') AS verifier,
                  COALESCE(iteration,0)||'/'||COALESCE(CAST(max_iterations AS TEXT),'∞') AS iter,
