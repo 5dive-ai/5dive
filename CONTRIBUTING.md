@@ -94,6 +94,31 @@ secret drop, supervisor), extend the matching harness in the same PR. New
 harnesses that follow the same pattern are very welcome; the biggest
 uncovered surfaces are the task core verbs and the agent lifecycle.
 
+### Built-binary mutation smokes
+
+Unlike sourced unit harnesses, the built `./5dive` binary deliberately ignores
+a bare `STATE_DIR` environment variable. Production agents must always converge
+on `/var/lib/5dive`; silently honoring an inherited override would let one agent
+split off onto a rogue store.
+
+When a smoke must exercise a **store-backed mutating command through the built
+binary**, opt in explicitly with both the test sentinel and global flag:
+
+```bash
+smoke_state=$(mktemp -d)
+FIVE_ALLOW_STATE_OVERRIDE=1 ./5dive \
+  --state-dir="$smoke_state" task add "isolated smoke row" --no-verify --json
+FIVE_ALLOW_STATE_OVERRIDE=1 ./5dive \
+  --state-dir="$smoke_state" task ls --all --json
+```
+
+The flag requires a non-production absolute path, bootstraps a caller-owned
+task store without root, redirects state-derived audit data, and disables task
+channel notifications. It isolates 5dive's data store; it does **not** sandbox
+operating-system effects, network calls, or arbitrary metric/verify commands, so
+use it only with store-backed verbs in a disposable harness. Without
+`FIVE_ALLOW_STATE_OVERRIDE=1`, `--state-dir` fails before dispatch.
+
 Heavyweight smoke test: if you touched `install.sh`, `src/cmd_agent.sh`,
 `src/lib/agent_setup.sh`, or anything else on the agent-create path, a
 maintainer will run a full-VM smoke (provisions a real cloud box, runs the

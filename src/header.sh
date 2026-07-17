@@ -47,7 +47,60 @@ gh_org() {
   printf '%s' "$_GH_ORG_RESOLVED"
 }
 
+# The production state path is intentionally NOT configurable via a bare
+# STATE_DIR environment variable: every real agent on a host must share the
+# same group-writable store. Built-binary mutation smokes can opt into an
+# isolated store, but only through BOTH an explicit CLI flag and a test-only
+# sentinel. Resolve it here (before the derived paths below are declared); main
+# later strips the global flag and emits any validation error through the normal
+# JSON/text output contract.
+STATE_DIR_OVERRIDE_ACTIVE=0
+STATE_DIR_OVERRIDE_ERROR=""
+_five_state_dir_request=""
+_five_state_dir_seen=0
+for _five_arg in "$@"; do
+  case "$_five_arg" in
+    --state-dir=*)
+      if (( _five_state_dir_seen )); then
+        STATE_DIR_OVERRIDE_ERROR="--state-dir may be specified only once"
+      else
+        _five_state_dir_request="${_five_arg#*=}"
+        _five_state_dir_seen=1
+      fi
+      ;;
+    --state-dir)
+      STATE_DIR_OVERRIDE_ERROR="--state-dir requires an =<absolute-path> value"
+      _five_state_dir_seen=1
+      ;;
+  esac
+done
+
 STATE_DIR="/var/lib/5dive"
+if (( _five_state_dir_seen )) && [[ -z "$STATE_DIR_OVERRIDE_ERROR" ]]; then
+  if [[ "${FIVE_ALLOW_STATE_OVERRIDE:-}" != "1" ]]; then
+    STATE_DIR_OVERRIDE_ERROR="--state-dir is test-only; set FIVE_ALLOW_STATE_OVERRIDE=1 explicitly"
+  elif [[ -z "$_five_state_dir_request" || "$_five_state_dir_request" != /* ]]; then
+    STATE_DIR_OVERRIDE_ERROR="--state-dir requires a non-empty absolute path"
+  elif ! command -v realpath >/dev/null 2>&1; then
+    STATE_DIR_OVERRIDE_ERROR="--state-dir requires realpath for safe path resolution"
+  else
+    _five_state_dir_resolved=$(realpath -m -- "$_five_state_dir_request" 2>/dev/null) \
+      || STATE_DIR_OVERRIDE_ERROR="could not resolve --state-dir path"
+    if [[ -z "$STATE_DIR_OVERRIDE_ERROR" ]]; then
+      case "$_five_state_dir_resolved" in
+        /|/var|/var/lib|/var/lib/5dive|/var/lib/5dive/*)
+          STATE_DIR_OVERRIDE_ERROR="--state-dir must not resolve to or contain the production store"
+          ;;
+        *)
+          STATE_DIR="$_five_state_dir_resolved"
+          STATE_DIR_OVERRIDE_ACTIVE=1
+          ;;
+      esac
+    fi
+  fi
+fi
+unset _five_arg _five_state_dir_request _five_state_dir_seen _five_state_dir_resolved
+
 REGISTRY="${STATE_DIR}/agents.json"
 ENV_DIR="${STATE_DIR}/agents.d"
 SYSTEMD_UNIT="5dive-agent@"
@@ -68,7 +121,11 @@ REGISTRY_LOCK="${STATE_DIR}/registry.lock"
 # tokens, callback codes) are redacted before write. The HTTP/exec path can
 # pass the Clerk user via FIVEDIVE_AUDIT_USER; otherwise we fall back to
 # SUDO_USER / USER.
-AUDIT_LOG="/var/log/5dive/agent-audit.log"
+if (( STATE_DIR_OVERRIDE_ACTIVE )); then
+  AUDIT_LOG="${STATE_DIR}/agent-audit.log"
+else
+  AUDIT_LOG="/var/log/5dive/agent-audit.log"
+fi
 
 # Named auth profiles let two agents of the same type authenticate against
 # different accounts/keys. Each profile is a directory of env files (one per

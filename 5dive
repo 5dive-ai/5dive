@@ -47,7 +47,60 @@ gh_org() {
   printf '%s' "$_GH_ORG_RESOLVED"
 }
 
+# The production state path is intentionally NOT configurable via a bare
+# STATE_DIR environment variable: every real agent on a host must share the
+# same group-writable store. Built-binary mutation smokes can opt into an
+# isolated store, but only through BOTH an explicit CLI flag and a test-only
+# sentinel. Resolve it here (before the derived paths below are declared); main
+# later strips the global flag and emits any validation error through the normal
+# JSON/text output contract.
+STATE_DIR_OVERRIDE_ACTIVE=0
+STATE_DIR_OVERRIDE_ERROR=""
+_five_state_dir_request=""
+_five_state_dir_seen=0
+for _five_arg in "$@"; do
+  case "$_five_arg" in
+    --state-dir=*)
+      if (( _five_state_dir_seen )); then
+        STATE_DIR_OVERRIDE_ERROR="--state-dir may be specified only once"
+      else
+        _five_state_dir_request="${_five_arg#*=}"
+        _five_state_dir_seen=1
+      fi
+      ;;
+    --state-dir)
+      STATE_DIR_OVERRIDE_ERROR="--state-dir requires an =<absolute-path> value"
+      _five_state_dir_seen=1
+      ;;
+  esac
+done
+
 STATE_DIR="/var/lib/5dive"
+if (( _five_state_dir_seen )) && [[ -z "$STATE_DIR_OVERRIDE_ERROR" ]]; then
+  if [[ "${FIVE_ALLOW_STATE_OVERRIDE:-}" != "1" ]]; then
+    STATE_DIR_OVERRIDE_ERROR="--state-dir is test-only; set FIVE_ALLOW_STATE_OVERRIDE=1 explicitly"
+  elif [[ -z "$_five_state_dir_request" || "$_five_state_dir_request" != /* ]]; then
+    STATE_DIR_OVERRIDE_ERROR="--state-dir requires a non-empty absolute path"
+  elif ! command -v realpath >/dev/null 2>&1; then
+    STATE_DIR_OVERRIDE_ERROR="--state-dir requires realpath for safe path resolution"
+  else
+    _five_state_dir_resolved=$(realpath -m -- "$_five_state_dir_request" 2>/dev/null) \
+      || STATE_DIR_OVERRIDE_ERROR="could not resolve --state-dir path"
+    if [[ -z "$STATE_DIR_OVERRIDE_ERROR" ]]; then
+      case "$_five_state_dir_resolved" in
+        /|/var|/var/lib|/var/lib/5dive|/var/lib/5dive/*)
+          STATE_DIR_OVERRIDE_ERROR="--state-dir must not resolve to or contain the production store"
+          ;;
+        *)
+          STATE_DIR="$_five_state_dir_resolved"
+          STATE_DIR_OVERRIDE_ACTIVE=1
+          ;;
+      esac
+    fi
+  fi
+fi
+unset _five_arg _five_state_dir_request _five_state_dir_seen _five_state_dir_resolved
+
 REGISTRY="${STATE_DIR}/agents.json"
 ENV_DIR="${STATE_DIR}/agents.d"
 SYSTEMD_UNIT="5dive-agent@"
@@ -68,7 +121,11 @@ REGISTRY_LOCK="${STATE_DIR}/registry.lock"
 # tokens, callback codes) are redacted before write. The HTTP/exec path can
 # pass the Clerk user via FIVEDIVE_AUDIT_USER; otherwise we fall back to
 # SUDO_USER / USER.
-AUDIT_LOG="/var/log/5dive/agent-audit.log"
+if (( STATE_DIR_OVERRIDE_ACTIVE )); then
+  AUDIT_LOG="${STATE_DIR}/agent-audit.log"
+else
+  AUDIT_LOG="/var/log/5dive/agent-audit.log"
+fi
 
 # Named auth profiles let two agents of the same type authenticate against
 # different accounts/keys. Each profile is a directory of env files (one per
@@ -3140,8 +3197,25 @@ SQL
 tasks_db_init() {
   require_sqlite
   umask 0002
+  if (( STATE_DIR_OVERRIDE_ACTIVE )); then
+    # Do not let a reused smoke directory smuggle the task store back out via
+    # `tasks -> /var/lib/5dive/tasks` (or any other symlink). header.sh resolves
+    # the state root; validate the derived store again at the point of use.
+    local resolved_tasks
+    resolved_tasks=$(realpath -m -- "$TASKS_DIR" 2>/dev/null) \
+      || fail "$E_VALIDATION" "could not resolve isolated tasks store path"
+    [[ "$resolved_tasks" == "${STATE_DIR}/tasks" ]] \
+      || fail "$E_VALIDATION" "isolated tasks store escapes --state-dir (refusing: $resolved_tasks)"
+  fi
   if [[ ! -d "$TASKS_DIR" ]]; then
-    if [[ $EUID -eq 0 ]]; then
+    if (( STATE_DIR_OVERRIDE_ACTIVE )); then
+      # A sanctioned smoke store is caller-owned and deliberately lives away
+      # from /var/lib/5dive, so it must be bootstrappable without root. Keep the
+      # setgid/group-write shape used by production without chowning away from
+      # the harness user.
+      mkdir -p "$TASKS_DIR"
+      chmod 2770 "$TASKS_DIR"
+    elif [[ $EUID -eq 0 ]]; then
       mkdir -p "$TASKS_DIR"
       chown root:claude "$TASKS_DIR"
       chmod 2770 "$TASKS_DIR"
@@ -17334,6 +17408,10 @@ TASK_CH_TOKEN="" TASK_CH_ACCESS="" TASK_CH_TYPE=""
 # can resolve a FILING AGENT's channel per gate row instead of from the caller.
 _task_agent_channel() {
   TASK_CH_TOKEN="" TASK_CH_ACCESS="" TASK_CH_TYPE=""
+  # Built-binary smokes using the sanctioned isolated store must never ping a
+  # real paired human. The DB and audit paths are isolated already; this guard
+  # closes the remaining external side-effect path for task need/close alerts.
+  (( STATE_DIR_OVERRIDE_ACTIVE )) && return 1
   local name="$1"
   [[ -n "$name" ]] || return 1
   local token="" token_file="${CONNECTORS_DIR}/telegram-${name}.env"
@@ -28689,6 +28767,9 @@ Global flags:
   --json                              Emit machine-readable output on stdout
                                       ({ok:true,data:...} | {ok:false,error:{...}}).
                                       Works on any subcommand below.
+  --state-dir=<absolute-path>         Test/smoke-only isolated state store; requires
+                                      FIVE_ALLOW_STATE_OVERRIDE=1. A bare STATE_DIR
+                                      environment variable is always ignored.
 
 Maintenance:
   5dive --version                                    # print version
@@ -28930,18 +29011,22 @@ USAGE
 }
 
 main() {
-  # Global --json: strip every occurrence before dispatch so each subcommand
-  # gets the same arg shape regardless of where the flag was placed.
+  # Global flags: strip every occurrence before dispatch so each subcommand gets
+  # the same arg shape regardless of where a flag was placed. --state-dir was
+  # resolved in header.sh because all other global paths derive from it.
   local -a rest=()
   local a
   for a in "$@"; do
-    if [[ "$a" == "--json" ]]; then
-      JSON_MODE=1
-      continue
-    fi
-    rest+=("$a")
+    case "$a" in
+      --json) JSON_MODE=1 ;;
+      --state-dir|--state-dir=*) ;;
+      *) rest+=("$a") ;;
+    esac
   done
   set -- "${rest[@]+"${rest[@]}"}"
+
+  [[ -z "$STATE_DIR_OVERRIDE_ERROR" ]] \
+    || fail "$E_USAGE" "$STATE_DIR_OVERRIDE_ERROR"
 
   [[ $# -gt 0 ]] || { usage; exit "$E_USAGE"; }
   local top="$1"; shift

@@ -449,8 +449,25 @@ SQL
 tasks_db_init() {
   require_sqlite
   umask 0002
+  if (( STATE_DIR_OVERRIDE_ACTIVE )); then
+    # Do not let a reused smoke directory smuggle the task store back out via
+    # `tasks -> /var/lib/5dive/tasks` (or any other symlink). header.sh resolves
+    # the state root; validate the derived store again at the point of use.
+    local resolved_tasks
+    resolved_tasks=$(realpath -m -- "$TASKS_DIR" 2>/dev/null) \
+      || fail "$E_VALIDATION" "could not resolve isolated tasks store path"
+    [[ "$resolved_tasks" == "${STATE_DIR}/tasks" ]] \
+      || fail "$E_VALIDATION" "isolated tasks store escapes --state-dir (refusing: $resolved_tasks)"
+  fi
   if [[ ! -d "$TASKS_DIR" ]]; then
-    if [[ $EUID -eq 0 ]]; then
+    if (( STATE_DIR_OVERRIDE_ACTIVE )); then
+      # A sanctioned smoke store is caller-owned and deliberately lives away
+      # from /var/lib/5dive, so it must be bootstrappable without root. Keep the
+      # setgid/group-write shape used by production without chowning away from
+      # the harness user.
+      mkdir -p "$TASKS_DIR"
+      chmod 2770 "$TASKS_DIR"
+    elif [[ $EUID -eq 0 ]]; then
       mkdir -p "$TASKS_DIR"
       chown root:claude "$TASKS_DIR"
       chmod 2770 "$TASKS_DIR"

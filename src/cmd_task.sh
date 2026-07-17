@@ -2079,6 +2079,10 @@ TASK_CH_TOKEN="" TASK_CH_ACCESS="" TASK_CH_TYPE=""
 # can resolve a FILING AGENT's channel per gate row instead of from the caller.
 _task_agent_channel() {
   TASK_CH_TOKEN="" TASK_CH_ACCESS="" TASK_CH_TYPE=""
+  # Built-binary smokes using the sanctioned isolated store must never ping a
+  # real paired human. The DB and audit paths are isolated already; this guard
+  # closes the remaining external side-effect path for task need/close alerts.
+  (( STATE_DIR_OVERRIDE_ACTIVE )) && return 1
   local name="$1"
   [[ -n "$name" ]] || return 1
   local token="" token_file="${CONNECTORS_DIR}/telegram-${name}.env"

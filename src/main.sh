@@ -8,6 +8,9 @@ Global flags:
   --json                              Emit machine-readable output on stdout
                                       ({ok:true,data:...} | {ok:false,error:{...}}).
                                       Works on any subcommand below.
+  --state-dir=<absolute-path>         Test/smoke-only isolated state store; requires
+                                      FIVE_ALLOW_STATE_OVERRIDE=1. A bare STATE_DIR
+                                      environment variable is always ignored.
 
 Maintenance:
   5dive --version                                    # print version
@@ -249,18 +252,22 @@ USAGE
 }
 
 main() {
-  # Global --json: strip every occurrence before dispatch so each subcommand
-  # gets the same arg shape regardless of where the flag was placed.
+  # Global flags: strip every occurrence before dispatch so each subcommand gets
+  # the same arg shape regardless of where a flag was placed. --state-dir was
+  # resolved in header.sh because all other global paths derive from it.
   local -a rest=()
   local a
   for a in "$@"; do
-    if [[ "$a" == "--json" ]]; then
-      JSON_MODE=1
-      continue
-    fi
-    rest+=("$a")
+    case "$a" in
+      --json) JSON_MODE=1 ;;
+      --state-dir|--state-dir=*) ;;
+      *) rest+=("$a") ;;
+    esac
   done
   set -- "${rest[@]+"${rest[@]}"}"
+
+  [[ -z "$STATE_DIR_OVERRIDE_ERROR" ]] \
+    || fail "$E_USAGE" "$STATE_DIR_OVERRIDE_ERROR"
 
   [[ $# -gt 0 ]] || { usage; exit "$E_USAGE"; }
   local top="$1"; shift
