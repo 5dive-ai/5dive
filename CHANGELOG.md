@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.10.6 — hardened delegated push + fleet grant (2026-07-18)
+
+- feat(push): `5dive push` now performs the privileged work ATOMICALLY inside a single root-only helper (`_push_do`) — gate re-verify, `author=lodar` scan, token mint, and the one-branch push all happen as root, so the agent process NEVER holds a token it could exfil and reuse (DIVE-1460). The installation token is minted SCOPED to just the target repo (`repositories:[<repo>]` + `permissions:{contents:write}`), dropping a captured token's blast radius from the whole org install to one repo. The helper reads its params over STDIN (never argv), so the fleet NOPASSWD grant is an exact command path (`/usr/local/bin/5dive _push_do`, no trailing-`*`) — identical under classic sudo and sudo-rs. Agent-supplied branch/url/repo-path are validated against flag/refspec/traversal injection before reaching git. Standard agents created via `agent create` get the grant so `5dive push` works fleet-wide. (DIVE-1376/1460)
+
 ## 0.10.5 — delegated push behind a gated `5dive push` verb (2026-07-18)
 
 - feat(push): `5dive push <id|DIVE-N> [--branch=<b>] [--dry-run]` — one gated bot identity that pushes ONLY the task's branch, ONLY after its ship gate has cleared, with a fail-closed `author=lodar` pre-push scan so the Vercel team check stays green. Transport auth is a control-plane GitHub App installation token (short-lived ~1h, minted on demand by the root-only `_push_mint_token` helper over NOPASSWD sudo, never persisted, never handed to the agent) — decoupled from commit authorship. Refuses protected branches (main/master/HEAD), missing/open/rejected gates, and any commit not authored by lodar. Fully audited via the `push` dispatch. Bobby gripe #1 (DIVE-1376).

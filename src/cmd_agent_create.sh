@@ -131,6 +131,7 @@ write_standard_sudoers() {
 ${user} ALL=(root) NOPASSWD: /usr/local/bin/5dive agent _deliver *
 ${user} ALL=(root) NOPASSWD: /usr/local/bin/5dive agent _capture *
 ${user} ALL=(root) NOPASSWD: /usr/local/bin/5dive _audit_append
+${user} ALL=(root) NOPASSWD: /usr/local/bin/5dive _push_do
 SUDOERS
   chmod 440 "$tmp"
   if visudo -cf "$tmp" >/dev/null 2>&1; then

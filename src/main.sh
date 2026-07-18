@@ -308,13 +308,15 @@ main() {
         >> "$AUDIT_LOG" 2>/dev/null || true
       exit 0
       ;;
-    _push_mint_token)
-      # DIVE-1376: hidden, privileged token-mint primitive. Reachable ONLY via
-      # NOPASSWD sudo. Reads the root-600 GitHub App credential, signs a JWT and
-      # exchanges it for a short-lived (~1h) installation token, printing ONLY
-      # the token to stdout. The agent process never reads the private key. Not
-      # audited itself (the parent `push` verb is) and never advertised.
-      cmd_push_mint_token "$@"
+    _push_do)
+      # DIVE-1376/1460: hidden, privileged, ATOMIC delegated push. Reachable ONLY
+      # via NOPASSWD sudo. Reads <ident> <repo-path> <branch> <repo-url> on STDIN
+      # (never argv, so the grant stays exact-path / sudo-rs safe), re-verifies the
+      # human gate + author scan authoritatively, mints a repo-SCOPED installation
+      # token, pushes the one branch, and discards the token — all as root. The
+      # agent process never holds a token. Not audited itself (the parent `push`
+      # verb is) and never advertised.
+      cmd_push_do "$@"
       exit $? ;;
     market)
       # DIVE-1020: front door to the agent market — browse/search the
@@ -660,11 +662,11 @@ main() {
       # registry mutation/lock, no audit (same posture as usage).
       cmd_digest "$@" ;;
     push)
-      # DIVE-1376 (Bobby gripe #1): delegated push. Pushes ONLY the task's
+      # DIVE-1376/1460 (Bobby gripe #1): delegated push. Pushes ONLY the task's
       # branch, ONLY after the task gate clears, with a fail-closed author=lodar
-      # scan, using a short-lived GitHub App installation token minted by the
-      # root-only _push_mint_token helper (the agent never holds the credential).
-      # Mutating + credential-bearing → audited (the token never lands in argv).
+      # scan. The privileged gate+author+mint+push runs atomically in the root-only
+      # _push_do helper (repo-scoped token, agent never holds a credential).
+      # Mutating + credential-bearing → audited (no token ever lands in argv).
       AUDIT_CMD="push"; AUDIT_ARGS=("$@")
       cmd_push "$@" ;;
     proof)
