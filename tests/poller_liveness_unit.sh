@@ -54,5 +54,15 @@ check "codex runtime skipped" "" "$(verdict codex 0 1)"
 # 7. Non-claude runtime (grok) even with a stale beacon -> skip.
 check "grok runtime skipped" "" "$(verdict grok $((NOW-999)) 1)"
 
+# 8. Operator-stopped / inactive-unit paired claude agent (supposed=0) with a
+#    stale beacon -> skip. A stopped agent's beacon is stale by definition; that's
+#    the supervisor's stuck class, not a dead transport. (Amendment: no alarm.)
+check "stopped/inactive agent skipped" "" "$(_hb_poller_verdict claude $((NOW-999)) "$NOW" 1 "$THRESH" 0)"
+
+# 9. Same agent but supposed=1 (desired-running + unit active) -> still DEAD, so
+#    the skip is scoped to the stopped case only and doesn't mask a real death.
+r=$(_hb_poller_verdict claude $((NOW-999)) "$NOW" 1 "$THRESH" 1); [[ -n "$r" ]] && r=DEAD || r=OK
+check "running agent still flagged dead" "DEAD" "$r"
+
 printf '\npoller-liveness unit: %d passed, %d failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]

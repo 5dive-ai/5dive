@@ -1214,9 +1214,15 @@ _hb_budget_sweep() {
 # wait_for_message loop with their own liveness, so they are skipped. Only PAIRED
 # agents matter — an unpaired bot has no human whose taps could be dropped.
 _hb_poller_verdict() {
-  local type="$1" mtime="$2" now="$3" allowfrom="$4" thresh="$5"
+  local type="$1" mtime="$2" now="$3" allowfrom="$4" thresh="$5" supposed="${6:-1}"
   [[ "$type" == "claude" ]] || return 0            # non-poller runtime — skip
   [[ "${allowfrom:-0}" -ge 1 ]] || return 0        # unpaired — no human to deafen
+  # An operator-stopped agent (desiredState=stopped) or a unit that isn't active
+  # has a stale beacon BY DEFINITION — that's not a dead transport. A
+  # dead-but-desired-running unit is the supervisor's stuck class (it alarms
+  # there), not ours; alarming here too would just fuel alarm-blindness. Caller
+  # passes supposed=0 for either condition.
+  [[ "${supposed}" == "1" ]] || return 0
   if [[ -z "$mtime" || "$mtime" == "0" ]]; then
     echo "no beacon (poller never started)"; return 0
   fi
@@ -1240,7 +1246,15 @@ _hb_poller_liveness_sweep() {
     allowfrom=$(jq -r '(.allowFrom // []) | length' "$TASK_CH_ACCESS" 2>/dev/null || echo 0)
     beacon="${TASK_CH_ACCESS%/*}/bot.heartbeat"
     mtime=0; [[ -f "$beacon" ]] && mtime=$(stat -c %Y "$beacon" 2>/dev/null || echo 0)
-    verdict=$(_hb_poller_verdict "$type" "$mtime" "$now" "$allowfrom" "$thresh")
+    # supposed=1 only when this agent is BOTH desired-running and its unit is
+    # actually active — otherwise a stale beacon is expected, not a dead poller.
+    local desired supposed=1
+    if [[ "$type" == "claude" ]]; then
+      desired=$(jq -r --arg n "$name" '.agents[$n].desiredState // "running"' <<<"$reg")
+      [[ "$desired" == "stopped" ]] && supposed=0
+      (( supposed )) && ! systemctl is-active --quiet "5dive-agent@${name}.service" 2>/dev/null && supposed=0
+    fi
+    verdict=$(_hb_poller_verdict "$type" "$mtime" "$now" "$allowfrom" "$thresh" "$supposed")
     [[ -n "$verdict" ]] && dead+=("${name}: ${verdict}")
   done < <(jq -r '.agents | keys[]?' <<<"$reg")
 
