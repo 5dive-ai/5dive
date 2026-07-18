@@ -26,7 +26,7 @@ esac
 
 # Bumped on every public release. `build.sh` checks this line exists; CI fails
 # the bundle-drift check if it's missing or empty.
-readonly FIVE_VERSION="0.10.2"
+readonly FIVE_VERSION="0.10.3"
 
 # GitHub org our repos live under. The org is being renamed
 # 5dive-com -> 5dive-ai (2026-06); fetches must work on either side of the
@@ -16969,6 +16969,20 @@ cmd_task_park() {
   [[ -n "$reason" ]] || fail "$E_USAGE" "park needs --reason=<why / what unblocks it> — a reasonless hold is exactly the block graveyard DIVE-1357 forbids"
   [[ -n "$wake" ]]   || fail "$E_USAGE" "park needs --wake=<when to revisit> (e.g. --wake=+7d, +12h, or 'YYYY-MM-DD') so it can't rot; if the date is unknown pick a re-check date, or use 'task need' if you're waiting on a person"
   resolve_task_id "$task"; local tid="$RESOLVED_TASK_ID" tident="$RESOLVED_TASK_IDENT"
+  # DIVE-1453: park and a human gate share `status='blocked'` plus overlapping
+  # need_* columns, so the UPDATE below would NULL an OPEN, UNANSWERED gate's
+  # fields — silently destroying it (no answer, no audit row; the heartbeat wake
+  # then unparks it to todo as if a human had cleared it). REFUSE to park over a
+  # live gate: the task is already `blocked` on the human, so answer it first.
+  # Predicate matches the gate_live flag used by inbox/show: need_type set, not
+  # yet answered, task still open.
+  local _live_gate; _live_gate=$(db "SELECT CASE WHEN need_type IS NOT NULL
+        AND need_answered_at IS NULL AND status NOT IN ('done','cancelled')
+      THEN 1 ELSE 0 END FROM tasks WHERE id=${tid};")
+  if [[ "$_live_gate" == "1" ]]; then
+    local _gt; _gt=$(db "SELECT COALESCE(need_type,'gate') FROM tasks WHERE id=${tid};")
+    fail "$E_USAGE" "$tident has an open ${_gt} gate awaiting a human — parking would silently destroy it (DIVE-1453). It is already blocked on the human, so no park is needed; resolve the gate first ('5dive task answer $tident …') if it's moot, then park."
+  fi
   # DIVE-891: --wake gives a park a wake-up time — the heartbeat's TTL pass
   # auto-unparks (back to todo) once it passes, so "revisit in a week" stops
   # masquerading as a pending human gate. Accepts an absolute UTC timestamp or
