@@ -122,6 +122,74 @@ out=$(run_push DIVE-908 --branch=feature-ok --dry-run); rc=$?
 { [[ $rc -eq 0 ]] && grep -qi "would push feature-ok" <<<"$out"; } \
   && ok_t "--branch overrides body line" || bad_t "--branch overrides body line" "rc=$rc :: $out"
 
+# --- DIVE-1460: the shared cleared-gate predicate. cmd_push AND the root-only
+# token mint (cmd_push_mint_token) both call _push_gate_check, so a direct
+# `sudo 5dive _push_mint_token <task>` re-verifies the SAME human gate and can't
+# be a bypass door. Assert the predicate here (the mint's root/credential steps
+# run only as root with the App key, so its gate branch is covered via this).
+gate_check() { # <ident> -> combined output; rc via subshell (fail exits it)
+  local i; i=$(db "SELECT id FROM tasks WHERE ident=$(sqlq "$1");")
+  ( _push_gate_check "$i" "$1" ) 2>&1
+}
+
+# cleared gate (DIVE-907 seeded above: answered approval "yes ship it") -> ok
+out=$(gate_check DIVE-907); rc=$?
+[[ $rc -eq 0 ]] && ok_t "gate predicate: cleared -> pass" || bad_t "gate predicate: cleared -> pass" "rc=$rc :: $out"
+
+# no gate (DIVE-903) -> refuse
+out=$(gate_check DIVE-903); rc=$?
+{ [[ $rc -ne 0 ]] && grep -qi "no gate" <<<"$out"; } \
+  && ok_t "gate predicate: no gate -> refuse" || bad_t "gate predicate: no gate -> refuse" "rc=$rc :: $out"
+
+# open gate (DIVE-904) -> refuse
+out=$(gate_check DIVE-904); rc=$?
+{ [[ $rc -ne 0 ]] && grep -qiE "OPEN|unanswered" <<<"$out"; } \
+  && ok_t "gate predicate: open -> refuse" || bad_t "gate predicate: open -> refuse" "rc=$rc :: $out"
+
+# rejected gate (DIVE-905) -> refuse
+out=$(gate_check DIVE-905); rc=$?
+{ [[ $rc -ne 0 ]] && grep -qi "REJECTED" <<<"$out"; } \
+  && ok_t "gate predicate: rejected -> refuse" || bad_t "gate predicate: rejected -> refuse" "rc=$rc :: $out"
+
+# cmd_push hands the real push to the root helper over STDIN (the privileged work
+# — gate/author/mint/push — is authoritative there; agent never holds a token).
+grep -Eq 'sudo -n /usr/local/bin/5dive _push_do' "$SRC/cmd_push.sh" \
+  && ok_t "cmd_push delegates to root _push_do" \
+  || bad_t "cmd_push delegates to root _push_do" "no _push_do handoff in cmd_push"
+grep -Eq 'printf .* "\$ident" "\$repopath" "\$branch" "\$repo"' "$SRC/cmd_push.sh" \
+  && ok_t "cmd_push passes params over stdin (not argv)" \
+  || bad_t "cmd_push passes params over stdin" "params not piped to _push_do"
+
+# --- DIVE-1460 input hardening: _push_do runs as ROOT on agent-controlled
+# branch/url/repo-path. _push_validate_inputs must reject flag/refspec/traversal
+# injection before any of them reaches git. (REPO from the scratch tree above.)
+vin() { ( _push_validate_inputs "$1" "$2" "$3" ) 2>&1; }   # subshell: fail exits it
+GHURL="https://github.com/5dive-ai/5dive.git"
+# valid inputs -> pass, echoes canonical repo-path
+out=$(vin "feature-ok" "$GHURL" "$REPO"); rc=$?
+{ [[ $rc -eq 0 ]] && [[ "$out" == /* ]]; } \
+  && ok_t "validate: clean inputs -> pass" || bad_t "validate: clean inputs -> pass" "rc=$rc :: $out"
+# flag-like branch -> refuse
+out=$(vin "--upload-pack=x" "$GHURL" "$REPO"); rc=$?
+{ [[ $rc -ne 0 ]] && grep -qi "unsafe branch" <<<"$out"; } \
+  && ok_t "validate: flag-like branch -> refuse" || bad_t "validate: flag-like branch -> refuse" "rc=$rc :: $out"
+# '..' rev-range branch -> refuse
+out=$(vin "a..b" "$GHURL" "$REPO"); rc=$?
+{ [[ $rc -ne 0 ]] && grep -qi "'\.\.'" <<<"$out"; } \
+  && ok_t "validate: '..' branch -> refuse" || bad_t "validate: '..' branch -> refuse" "rc=$rc :: $out"
+# non-github / ssh url -> refuse
+out=$(vin "feature-ok" "git@github.com:5dive-ai/5dive.git" "$REPO"); rc=$?
+{ [[ $rc -ne 0 ]] && grep -qi "repo url must be" <<<"$out"; } \
+  && ok_t "validate: ssh url -> refuse" || bad_t "validate: ssh url -> refuse" "rc=$rc :: $out"
+# non-github host -> refuse
+out=$(vin "feature-ok" "https://evil.example/5dive-ai/5dive.git" "$REPO"); rc=$?
+{ [[ $rc -ne 0 ]] && grep -qi "repo url must be" <<<"$out"; } \
+  && ok_t "validate: non-github host -> refuse" || bad_t "validate: non-github host -> refuse" "rc=$rc :: $out"
+# non-existent repo-path -> refuse
+out=$(vin "feature-ok" "$GHURL" "/no/such/path/xyz"); rc=$?
+{ [[ $rc -ne 0 ]] && grep -qi "does not resolve" <<<"$out"; } \
+  && ok_t "validate: bad repo-path -> refuse" || bad_t "validate: bad repo-path -> refuse" "rc=$rc :: $out"
+
 echo "-----"
 printf 'push_unit: %d passed, %d failed\n' "$PASS" "$FAIL"
 [[ $FAIL -eq 0 ]]
