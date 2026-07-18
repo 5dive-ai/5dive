@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.10.2 — company onboarding wizard (2026-07-18)
+
+- feat(company): `5dive company` — an onboarding wizard that stands up a self-steering company in a few guided steps: a project namespace, one objective (the number you steer, bound to a read-only metric), a planner, and a re-plan cadence, with an optional first goal. Pure sugar shipped LAST per the v0.10 plan: a thin macro over `project add` + `objective add` + `goal add` (no new state or engine). Run it bare for the prompt-driven wizard, or pass flags + `--yes` for a scripted stand-up (OSS-34).
+
 ## 0.10.1 — objective status truth surface (2026-07-18)
 
 - fix(task): a T2-floor-refused ROUTED approval/manual gate now ESCALATES to the human with a tap button (fresh nonce, lead un-routed, ping re-armed) instead of dead-ending between an un-clearable lead and a button-less human — the DIVE-1429 stall class (DIVE-1437).

@@ -11,7 +11,8 @@ Global flags:
 
 Maintenance:
   5dive --version                                    # print version
-  5dive init                                         # interactive first-run wizard
+  5dive init                                         # interactive first-run wizard (one agent)
+  5dive company [--yes]                              # onboarding wizard: stand up a self-steering company (project + objective + planner)
   5dive self-update                                  # update the CLI + plugins, then restart agents
                                                      # (alias: 5dive update). On-demand upgrade for
                                                      # self-hosted boxes; managed boxes update nightly.
@@ -668,6 +669,12 @@ main() {
       # → "send hello". Calls back into the same CLI for each step.
       AUDIT_CMD="init"; AUDIT_ARGS=("$@")
       cmd_init "$@" ;;
+    company)
+      # OSS-34: onboarding-wizard sugar for a self-steering company. Thin macro
+      # over project + objective (+ goal) — shells back into those commands; no
+      # new state or engine. Same group-writable store as tasks; no root/lock
+      # (the sub-commands it calls own their own writes).
+      cmd_company "$@" ;;
     up)
       # Compose-style: bring up agents declared in 5dive.yaml. Mutating but
       # the per-agent `agent create` calls take the registry lock + audit
