@@ -20350,13 +20350,19 @@ cmd_objective_add() {
 cmd_objective_ls() {
   tasks_db_init
   if (( JSON_MODE )); then
-    # Attach the latest reading (value + ts) per objective.
+    # Attach the latest reading (value + ts) per objective, plus the company-view
+    # fields (DIVE-1452): planner, replan cadence (review cron), per-cycle cap, and
+    # verified_total — originated tasks a DISTINCT verifier accepted across ALL
+    # cycles (status='done'), the same integrity rule as `status`'s per-cycle count
+    # but unbounded by cycle. Never the planner's self-reported cycle outcome.
     local rows
     rows=$(dbfmt -json "
       SELECT o.id, o.name, o.metric_cmd, o.target, o.direction, o.unit, o.public,
-             o.status, o.project_key, o.created_at,
+             o.status, o.project_key, o.planner, o.review, o.max_new_per_cycle,
+             o.created_at,
              (SELECT value FROM objective_readings r WHERE r.objective_id=o.id ORDER BY r.id DESC LIMIT 1) AS current,
-             (SELECT ts    FROM objective_readings r WHERE r.objective_id=o.id ORDER BY r.id DESC LIMIT 1) AS current_ts
+             (SELECT ts    FROM objective_readings r WHERE r.objective_id=o.id ORDER BY r.id DESC LIMIT 1) AS current_ts,
+             (SELECT COUNT(*) FROM tasks t WHERE t.originated_by_objective=o.id AND t.status='done') AS verified_total
       FROM objectives o ORDER BY o.created_at;")
     [[ -n "$rows" ]] || rows="[]"
     printf '%s' "$rows" | jq -c '{ok:true, data:{objectives:(map(.public=(.public==1)))}}'
