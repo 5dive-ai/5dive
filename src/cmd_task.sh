@@ -2968,6 +2968,44 @@ cmd_task_answer() {
   # default for a hard floor; re-file at a lower --tier if the floor misfired.
   if [[ "$gtier" == "2" ]] && (( ! human )) && _gate_proof_enforced; then
     local _caller3; _caller3=$(id -un 2>/dev/null || echo '?')
+    # DIVE-1437: a tier-2 gate that was LEAD-ROUTED (routed_reviewer set) but is an
+    # approval/manual builder gate is the DIVE-1429 stall — the DIVE-1145/1182
+    # routing sent it to the org lead, but the T2 hard-human floor here refuses the
+    # lead's non-human answer, AND cmd_task_need RETURNED before task_need_notify
+    # so the human never got a tap button. The lead then hand-asks the human in
+    # plain chat with no button to tap. Instead of dead-ending here, ESCALATE to
+    # the human via the normal ping path so task_need_notify fires WITH the tap
+    # keyboard, and take the lead out of the loop (clear routed_reviewer). We mint
+    # a FRESH per-gate human nonce (approval/manual are hard human gates), so
+    # anti-forge is preserved: only a real human tap/nonce or non-agent SUDO_UID
+    # can clear the escalated gate — the escalation itself grants no clearance.
+    # Scoped to approval/manual routed gates (the DIVE-1429 case): `access` is
+    # DELIBERATELY lead-clearable by DIVE-1243, `secret` is never routed, and a
+    # non-routed tier-2 gate already got its human button at filing — those keep
+    # the original refuse. eng_ship/curation are forced tier-1 at filing, so they
+    # never reach this block. Ties to DIVE-1330/1243 handoff patterns.
+    if [[ -n "$_routed_rev" ]] && [[ "$nt" == "approval" || "$nt" == "manual" ]]; then
+      local _esc_ask _esc_opts _esc_rec _esc_sk _esc_conn
+      _esc_ask=$(db "SELECT COALESCE(ask,'') FROM tasks WHERE id=${id};")
+      _esc_opts=$(db "SELECT COALESCE(need_options,'') FROM tasks WHERE id=${id};")
+      _esc_rec=$(db "SELECT COALESCE(recommend,'') FROM tasks WHERE id=${id};")
+      _esc_sk=$(db "SELECT COALESCE(secret_key,'') FROM tasks WHERE id=${id};")
+      _esc_conn=$(db "SELECT COALESCE(connector,'') FROM tasks WHERE id=${id};")
+      # Mint a fresh human nonce so the escalated tap can clear it (mirrors the
+      # cmd_task_need mint for approval/manual). Take the lead out (routed_reviewer
+      # NULL) and re-arm the ping (gate_pinged_at NULL) so task_need_notify fires
+      # fresh with the tap keyboard.
+      local _esc_nonce=""; _esc_nonce=$(_human_nonce_mint)
+      db "UPDATE tasks SET routed_reviewer=NULL, gate_pinged_at=NULL$([[ -n "$_esc_nonce" ]] && echo ", human_nonce_hash=$(sqlq "$(_human_nonce_sha "$_esc_nonce")")") WHERE id=${id};"
+      audit_log "task answer escalate-to-human" ok 0 -- \
+        "task=$ident" "type=$nt" "tier=$gtier" "reason=T2-floor refused routed gate — escalated to human with buttons" \
+        "was_routed_to=$_routed_rev" "caller=$_caller3" "sudo_uid=${SUDO_UID:-}" 2>/dev/null || true
+      task_need_notify "$ident" "$nt" "$_esc_ask" "$_esc_opts" "$_esc_rec" "$_esc_sk" "$_esc_conn" "$_esc_nonce" "" || true
+      ok "$ident is a tier-2 human gate ($nt) — the org lead can't clear it, so it was ESCALATED to the human with a tap button. Awaiting their answer." \
+         '{id:($i|tonumber), ident:$id, status:"blocked", need_type:$ty, tier:2, escalated_to_human:true, was_routed_to:$rv, ask:$ak}' \
+         --arg i "$id" --arg id "$ident" --arg ty "$nt" --arg rv "$_routed_rev" --arg ak "$_esc_ask"
+      return 0
+    fi
     audit_log "task answer gate" error 0 -- \
       "task=$ident" "type=$nt" "tier=$gtier" "reason=non-human answer on tier-2 floor" \
       "human=$human" "caller=$_caller3" "sudo_uid=${SUDO_UID:-}"
