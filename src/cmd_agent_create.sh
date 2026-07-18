@@ -2,7 +2,7 @@ create_agent_user() {
   # DIVE-1002: least-privilege by default — callers pass an explicitly resolved
   # tier (cmd_create resolves standard-by-default + bootstrap-admin). The
   # fallback here is 'standard', never 'admin', so no path silently grants root.
-  local name="$1" isolation="${2:-standard}"
+  local name="$1" isolation="${2:-standard}" can_push="${3:-0}"
   local user="agent-${name}"
   if ! id -u "$user" &>/dev/null; then
     adduser --disabled-password --gecos "" "$user" >/dev/null
@@ -33,7 +33,7 @@ create_agent_user() {
   if [[ "$isolation" == "admin" ]]; then
     write_admin_sudoers "$user"
   elif [[ "$isolation" == "standard" ]]; then
-    write_standard_sudoers "$user"
+    write_standard_sudoers "$user" "$can_push"
   else
     rm -f "/etc/sudoers.d/${user}"
   fi
@@ -122,17 +122,38 @@ SUDOERS
 #
 # visudo -c validated before install so a malformed entry can never lock the box
 # out; on failure we remove it and fail loudly.
-write_standard_sudoers() {
-  local user="$1" f="/etc/sudoers.d/${user}" tmp
-  tmp=$(mktemp)
-  cat > "$tmp" <<SUDOERS
+# render_standard_sudoers <user> <can_push> — emit (to stdout) the sudoers policy
+# for a standard-isolation agent. The a2a + audit grants are UNCONDITIONAL. The
+# delegated-push grant (`_push_do`) is added ONLY when can_push=1 — i.e. a BUILDER
+# agent explicitly given the push capability (`agent create --can-push`), NOT
+# every standard agent (DIVE-1462/STEER-4: a QA or art-director standard agent
+# must not be able to ship). Exact command path with params over stdin (no arg
+# wildcard) so the grant holds identically under classic sudo and sudo-rs. Kept
+# pure (no root, no I/O) so it's unit-testable without a box; the writer below
+# visudo-validates + installs it.
+render_standard_sudoers() {
+  local user="$1" can_push="${2:-0}"
+  cat <<SUDOERS
 # Managed by 5dive (DIVE-1065/1074). Scoped inter-agent a2a grants for standard agent ${user}.
 # Do not edit by hand; regenerated on agent create/provision.
 ${user} ALL=(root) NOPASSWD: /usr/local/bin/5dive agent _deliver *
 ${user} ALL=(root) NOPASSWD: /usr/local/bin/5dive agent _capture *
 ${user} ALL=(root) NOPASSWD: /usr/local/bin/5dive _audit_append
+SUDOERS
+  if [[ "$can_push" == "1" ]]; then
+    cat <<SUDOERS
+# DIVE-1462/STEER-4: delegated-push capability (builder agent). Exact command
+# path; params travel over stdin (never argv), so no arg wildcard is needed and
+# the grant is sudo-rs-safe. Gates re-verified authoritatively inside _push_do.
 ${user} ALL=(root) NOPASSWD: /usr/local/bin/5dive _push_do
 SUDOERS
+  fi
+}
+
+write_standard_sudoers() {
+  local user="$1" can_push="${2:-0}" f="/etc/sudoers.d/${user}" tmp
+  tmp=$(mktemp)
+  render_standard_sudoers "$user" "$can_push" > "$tmp"
   chmod 440 "$tmp"
   if visudo -cf "$tmp" >/dev/null 2>&1; then
     chown root:root "$tmp"
@@ -174,6 +195,16 @@ write_agent_env() {
   if [[ -z "$autonomy" && -r "$env_file" ]]; then
     autonomy=$(sed -n 's/^AGENT_AUTONOMY=//p' "$env_file" | head -1)
   fi
+  # DIVE-1462/STEER-4: delegated-push capability, same PRESERVE-unless-overridden
+  # discipline as autonomy. The caller sets _CAN_PUSH_OVERRIDE (create --can-push)
+  # to change it; otherwise keep the file's current value so an unrelated rewrite
+  # doesn't silently drop the builder capability. '1' = builder; anything else = no
+  # line. Informational/audit record + future re-provision source (the sudoers
+  # grant itself is written authoritatively by create_agent_user at create time).
+  local can_push="${_CAN_PUSH_OVERRIDE:-}"
+  if [[ -z "$can_push" && -r "$env_file" ]]; then
+    can_push=$(sed -n 's/^AGENT_CAN_PUSH=//p' "$env_file" | head -1)
+  fi
   {
     printf 'AGENT_NAME=%s\n' "$name"
     printf 'AGENT_TYPE=%s\n' "$type"
@@ -182,6 +213,7 @@ write_agent_env() {
     [[ -n "$profile" ]] && printf 'AGENT_AUTH_PROFILE=%s\n' "$profile"
     printf 'AGENT_ISOLATION=%s\n' "$isolation"
     [[ -n "$autonomy" && "$autonomy" != "standard" ]] && printf 'AGENT_AUTONOMY=%s\n' "$autonomy"
+    [[ "$can_push" == "1" ]] && printf 'AGENT_CAN_PUSH=1\n'
     # New telegram agents flow through our 5dive-plugins fork (bundled
     # hooks, richer slash commands). 5dive-agent-start reads this var to
     # build the runtime --channels arg, defaulting to claude-plugins-official
@@ -542,6 +574,7 @@ cmd_create() {
   local skills_arg="" skills_set=0 no_skills=0 defer_auth=0
   local isolation="" isolation_explicit=0 no_team_bot=0
   local autonomy="standard"   # DIVE-499
+  local can_push=0            # DIVE-1462/STEER-4: delegated-push (builder) capability
   local inherit_memory=""     # DIVE-990 memory-as-onboarding
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -566,12 +599,13 @@ cmd_create() {
       --defer-auth)                defer_auth=1 ;;
       --isolation=*)               isolation="${1#--isolation=}"; isolation_explicit=1 ;;
       --inherit-memory=*)          inherit_memory="${1#--inherit-memory=}" ;;
+      --can-push)                  can_push=1 ;;
       -*)                          fail "$E_USAGE" "unknown flag: $1" ;;
       *)                           [[ -z "$name" ]] && name="$1" || fail "$E_USAGE" "extra arg: $1" ;;
     esac
     shift
   done
-  [[ -n "$name" ]] || fail "$E_USAGE" "usage: 5dive agent create <name> --type=<type> [--channels=none|telegram|discord|dashboard[,ch...]] [--telegram-token=<token|->] [--telegram-cos=<child-username>] [--telegram-cos-avatar=<png>] [--telegram-home-channel=<id>] [--telegram-allowed-users=<csv>] [--discord-token=<token|->] [--workdir=<path>] [--auth-profile=<name>] [--provider=<id> --api-key=<key|->] [--model=<slug>] [--with-skills=<spec>[,...]] [--no-skills] [--no-team-bot] [--defer-auth] [--isolation=admin|standard|sandboxed] [--inherit-memory=wiki|all|team|<agent>[,...]]"
+  [[ -n "$name" ]] || fail "$E_USAGE" "usage: 5dive agent create <name> --type=<type> [--channels=none|telegram|discord|dashboard[,ch...]] [--telegram-token=<token|->] [--telegram-cos=<child-username>] [--telegram-cos-avatar=<png>] [--telegram-home-channel=<id>] [--telegram-allowed-users=<csv>] [--discord-token=<token|->] [--workdir=<path>] [--auth-profile=<name>] [--provider=<id> --api-key=<key|->] [--model=<slug>] [--with-skills=<spec>[,...]] [--no-skills] [--no-team-bot] [--defer-auth] [--isolation=admin|standard|sandboxed] [--can-push] [--inherit-memory=wiki|all|team|<agent>[,...]]"
   [[ -n "$type" ]] || fail "$E_USAGE" "--type is required"
   valid_name "$name" || fail "$E_VALIDATION" "invalid name (lowercase letters/digits/hyphens, start letter, <=16 chars)"
   is_known_type "$type" || fail "$E_NOT_FOUND" "unknown type: $type (known: ${!TYPE_BIN[*]})"
@@ -620,6 +654,17 @@ cmd_create() {
   fi
   valid_isolation "$isolation" || fail "$E_VALIDATION" "invalid --isolation (admin|standard|sandboxed)"
   valid_autonomy "$autonomy" || fail "$E_VALIDATION" "invalid --autonomy '$autonomy' (standard|yolo|son-of-anton)"
+  # DIVE-1462/STEER-4: --can-push grants the delegated-push (builder) capability.
+  # It is a STANDARD-isolation refinement: admin agents already reach `_push_do`
+  # through their broad sudo (so the flag is a redundant no-op there — accept it,
+  # just don't write a second grant), and sandboxed agents get no sudoers at all
+  # so the capability is impossible. Refuse only the sandboxed contradiction.
+  if (( can_push )); then
+    case "$isolation" in
+      sandboxed) fail "$E_VALIDATION" "--can-push is incompatible with --isolation=sandboxed (a sandboxed agent gets no sudoers, so it cannot be granted delegated push)." ;;
+      admin)     can_push=0; warn "--can-push is redundant for an admin agent (admin sudo already permits '5dive _push_do'); ignoring." ;;
+    esac
+  fi
   # DIVE-990: validate every inherit-memory scope token (wiki|all|team|<agent-name>).
   if [[ -n "$inherit_memory" ]]; then
     local _imt _imifs="$IFS"; IFS=,
@@ -957,7 +1002,7 @@ cmd_create() {
   fi
 
   step "Creating user agent-${name}"
-  create_agent_user "$name" "$isolation"
+  create_agent_user "$name" "$isolation" "$can_push"
 
   if [[ "$isolation" == "sandboxed" ]]; then
     step "Applying sandbox resource limits for agent-${name}"
@@ -1096,7 +1141,7 @@ cmd_create() {
   step "Writing agent env"
   # DIVE-499: stamp the autonomy mode into the env file (yolo/son-of-anton add the
   # approved directive at launch; standard = nothing).
-  _AUTONOMY_OVERRIDE="$autonomy" \
+  _AUTONOMY_OVERRIDE="$autonomy" _CAN_PUSH_OVERRIDE="$can_push" \
     write_agent_env "$name" "$type" "$channels" "$workdir" "$profile" "$isolation"
   link_agent_profile "$name" "$profile"
 

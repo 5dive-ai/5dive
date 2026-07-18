@@ -83,6 +83,35 @@ _push_gate_check() {
   fi
 }
 
+# _push_task_branch <id> — the branch a task AUTHORITATIVELY declares via a
+# "Branch: <name>" line in its body. Empty if the task names none. This is the
+# server-side value a cleared gate binds to (DIVE-1462), read fresh from the DB.
+_push_task_branch() {
+  local id="$1" body
+  body=$(db "SELECT COALESCE(body,'') FROM tasks WHERE id=${id};")
+  _push_branch_from_body "$body"
+}
+
+# _push_bind_branch <id> <ident> <branch> — DIVE-1462 (STEER-4). Bind the cleared
+# gate to a SPECIFIC branch. A cleared gate authorizes shipping exactly the task
+# it sits on, and that task declares its branch (a "Branch: <name>" line in its
+# body). Without this, a granted agent could cite ANY cleared-gate task's ident
+# but push an arbitrary feature branch — the gate would clear while an unrelated
+# branch shipped. So the branch actually being pushed MUST equal the branch the
+# task itself declares; anything else is refused. Called by BOTH the cmd_push
+# pre-flight (friendly) AND the root-only `_push_do` (authoritative), the same
+# belt-and-braces posture as _push_gate_check.
+_push_bind_branch() {
+  local id="$1" ident="$2" branch="$3" task_branch
+  task_branch=$(_push_task_branch "$id")
+  if [[ -z "$task_branch" ]]; then
+    fail "$E_VALIDATION" "task ${ident} declares no branch — add a 'Branch: <name>' line to its body so the cleared gate binds to a specific branch (delegated push refuses an unbound branch)."
+  fi
+  if [[ "$branch" != "$task_branch" ]]; then
+    fail "$E_VALIDATION" "branch '${branch}' is not the branch bound to ${ident}'s cleared gate ('${task_branch}') — a cleared gate authorizes only its task's own declared branch. Push refused (DIVE-1462)."
+  fi
+}
+
 # _push_author_scan <repo-path> <repo-url> <branch> <author> — fail-closed author
 # scan. If <author> is EMPTY, the deployment configured no committer, so there is
 # NO restriction and the scan is a no-op (DIVE-1461 config-only behavior). When
@@ -177,6 +206,12 @@ cmd_push() {
   # --- GATE pre-flight (re-verified authoritatively in _push_do).
   _push_gate_check "$id" "$ident"
 
+  # --- BRANCH BINDING pre-flight (DIVE-1462, re-verified authoritatively in
+  # _push_do). The cleared gate authorizes only the branch the task itself
+  # declares, so a --branch override that disagrees with the task body — or a
+  # task that names no branch at all — is refused here with a friendly error.
+  _push_bind_branch "$id" "$ident" "$branch"
+
   # --- repo + work-tree sanity.
   repo="${repo:-$_PUSH_DEFAULT_REPO}"
   local repopath
@@ -254,6 +289,12 @@ cmd_push_do() {
   resolve_task_id "$ident"
   local id="$RESOLVED_TASK_ID"; ident="$RESOLVED_TASK_IDENT"
   _push_gate_check "$id" "$ident"
+
+  # Authoritative branch binding (DIVE-1462) — the caller-supplied branch must be
+  # the branch the cited task itself declares, so a granted agent can't reuse one
+  # task's cleared gate to fast-forward an unrelated branch. Read FRESH from the
+  # DB (never trust the branch alone; it's bound to the task, not the caller).
+  _push_bind_branch "$id" "$ident" "$branch"
 
   case "$branch" in
     main|master|HEAD) fail "$E_VALIDATION" "refusing protected branch '${branch}'." ;;

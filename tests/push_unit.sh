@@ -24,7 +24,7 @@ trap 'rm -rf "$TMP"' EXIT
 # shellcheck disable=SC1090
 for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh \
          lib/agent_setup.sh lib/state.sh lib/audit.sh lib/registry.sh \
-         lib/tasks_db.sh cmd_task.sh cmd_push.sh; do
+         lib/tasks_db.sh cmd_task.sh cmd_push.sh cmd_agent_create.sh; do
   # shellcheck source=/dev/null
   source "$SRC/$f"
 done
@@ -125,11 +125,27 @@ out=$(run_push DIVE-907 --dry-run); rc=$?
 { [[ $rc -eq 0 ]] && grep -qi "dry-run: would push" <<<"$out"; } \
   && ok_t "happy dry-run -> ok" || bad_t "happy dry-run -> ok" "rc=$rc :: $out"
 
-# 8) branch from --branch overrides a body line
+# 8) DIVE-1462 branch binding: a --branch that DISAGREES with the task's declared
+# branch is refused — the cleared gate binds to the task's own branch, so an agent
+# can't cite one task's gate to push a different branch. (Was "override" pre-1462.)
 seed_task DIVE-908 "Branch: feature-badauthor" approval "2026-07-18 00:00:00" "yes"
 out=$(run_push DIVE-908 --branch=feature-ok --dry-run); rc=$?
+{ [[ $rc -ne 0 ]] && grep -qi "not the branch bound" <<<"$out"; } \
+  && ok_t "branch binding: --branch != task branch -> refuse" || bad_t "branch binding: --branch != task branch -> refuse" "rc=$rc :: $out"
+
+# 8b) DIVE-1462: --branch that MATCHES the task's declared branch is allowed
+# (redundant but consistent) — binding is equality, not a ban on the flag.
+seed_task DIVE-909 "Branch: feature-ok" approval "2026-07-18 00:00:00" "yes"
+out=$(run_push DIVE-909 --branch=feature-ok --dry-run); rc=$?
 { [[ $rc -eq 0 ]] && grep -qi "would push feature-ok" <<<"$out"; } \
-  && ok_t "--branch overrides body line" || bad_t "--branch overrides body line" "rc=$rc :: $out"
+  && ok_t "branch binding: --branch == task branch -> pass" || bad_t "branch binding: --branch == task branch -> pass" "rc=$rc :: $out"
+
+# 8c) DIVE-1462: a task with a cleared gate but NO declared branch cannot be
+# pushed even with an explicit --branch — the gate has nothing to bind to.
+seed_task DIVE-910 "no branch line here" approval "2026-07-18 00:00:00" "yes"
+out=$(run_push DIVE-910 --branch=feature-ok --dry-run); rc=$?
+{ [[ $rc -ne 0 ]] && grep -qi "declares no branch" <<<"$out"; } \
+  && ok_t "branch binding: cleared gate, no declared branch -> refuse" || bad_t "branch binding: cleared gate, no declared branch -> refuse" "rc=$rc :: $out"
 
 # 9) DIVE-1461 config-only: with a committer CONFIGURED (via GITHUB_APP_COMMIT_AUTHOR,
 # as _push_do sees it after sourcing the App env), a MATCHING-author branch passes...
@@ -211,6 +227,56 @@ out=$(vin "feature-ok" "https://evil.example/5dive-ai/5dive.git" "$REPO"); rc=$?
 out=$(vin "feature-ok" "$GHURL" "/no/such/path/xyz"); rc=$?
 { [[ $rc -ne 0 ]] && grep -qi "does not resolve" <<<"$out"; } \
   && ok_t "validate: bad repo-path -> refuse" || bad_t "validate: bad repo-path -> refuse" "rc=$rc :: $out"
+
+# --- DIVE-1462 branch binding predicate: _push_bind_branch is the shared check
+# called by BOTH cmd_push pre-flight and the root-only _push_do. Assert it
+# directly (subshell: `fail` exits it).
+bind() { # <ident> <branch> -> combined output; rc via subshell
+  local i; i=$(db "SELECT id FROM tasks WHERE ident=$(sqlq "$1");")
+  ( _push_bind_branch "$i" "$1" "$2" ) 2>&1
+}
+# matching branch (DIVE-907 declares feature-ok) -> pass
+out=$(bind DIVE-907 feature-ok); rc=$?
+[[ $rc -eq 0 ]] && ok_t "bind predicate: matching branch -> pass" || bad_t "bind predicate: matching branch -> pass" "rc=$rc :: $out"
+# mismatching branch -> refuse
+out=$(bind DIVE-907 some-other-branch); rc=$?
+{ [[ $rc -ne 0 ]] && grep -qi "not the branch bound" <<<"$out"; } \
+  && ok_t "bind predicate: mismatch -> refuse" || bad_t "bind predicate: mismatch -> refuse" "rc=$rc :: $out"
+# task with no declared branch (DIVE-901 body 'no branch here') -> refuse
+out=$(bind DIVE-901 feature-ok); rc=$?
+{ [[ $rc -ne 0 ]] && grep -qi "declares no branch" <<<"$out"; } \
+  && ok_t "bind predicate: no declared branch -> refuse" || bad_t "bind predicate: no declared branch -> refuse" "rc=$rc :: $out"
+
+# --- DIVE-1462/STEER-4 builder-scoped sudoers: render_standard_sudoers emits the
+# _push_do grant ONLY for a builder (can_push=1), never for a plain standard
+# agent, and the builder form is exact-path (no arg wildcard) so it's sudo-rs
+# safe. Also visudo-validate both renderings when visudo is available.
+NOBUILD=$(render_standard_sudoers agent-qa 0)
+grep -q '_push_do' <<<"$NOBUILD" \
+  && bad_t "render: standard (can_push=0) omits _push_do" "unexpected _push_do in non-builder grant" \
+  || ok_t "render: standard (can_push=0) omits _push_do"
+grep -q 'agent _deliver' <<<"$NOBUILD" \
+  && ok_t "render: standard keeps a2a grant" || bad_t "render: standard keeps a2a grant" "no _deliver line"
+
+BUILD=$(render_standard_sudoers agent-bob 1)
+grep -Eq '^agent-bob ALL=\(root\) NOPASSWD: /usr/local/bin/5dive _push_do$' <<<"$BUILD" \
+  && ok_t "render: builder (can_push=1) adds exact-path _push_do" \
+  || bad_t "render: builder (can_push=1) adds exact-path _push_do" "$BUILD"
+# no trailing arg wildcard on the _push_do line (sudo-rs rejects arg wildcards)
+grep -E '_push_do' <<<"$BUILD" | grep -q '\*' \
+  && bad_t "render: builder _push_do has no arg wildcard" "wildcard present -> not sudo-rs safe" \
+  || ok_t "render: builder _push_do has no arg wildcard"
+if command -v visudo >/dev/null 2>&1; then
+  for cp in 0 1; do
+    tf=$(mktemp); render_standard_sudoers agent-vv "$cp" > "$tf"
+    visudo -cf "$tf" >/dev/null 2>&1 \
+      && ok_t "render: can_push=$cp passes visudo -c" \
+      || bad_t "render: can_push=$cp passes visudo -c" "visudo rejected the rendering"
+    rm -f "$tf"
+  done
+else
+  printf 'skip - visudo not available (rendering syntax not machine-validated here)\n'
+fi
 
 echo "-----"
 printf 'push_unit: %d passed, %d failed\n' "$PASS" "$FAIL"

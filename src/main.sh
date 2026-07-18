@@ -48,7 +48,12 @@ Agents:
                             [--workdir=<path>] [--auth-profile=<name>]
                             [--provider=<id> --api-key=<key|->]
                             [--with-skills=<spec>[,<spec>...]] [--no-skills]
-                            [--no-team-bot] [--defer-auth]
+                            [--no-team-bot] [--defer-auth] [--can-push]
+                            # --can-push grants a STANDARD (builder) agent the
+                            # delegated-push capability: a scoped NOPASSWD sudoers
+                            # grant for `5dive push` (exact-path _push_do). Off by
+                            # default; admin agents already have it, sandboxed
+                            # can't. See docs/delegated-push.md.
                             # When the box has a shared team bot configured
                             # (team-bot shared persists it), new no-bot agents
                             # auto-attach: own forum topic, send-only on the
