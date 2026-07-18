@@ -268,6 +268,7 @@ sudo 5dive agent import olivia --as=ceo    # spin up a named agent from a pack
 5dive watch                              # htop-style live view
 5dive up / down / ps / export            # declarative agents via 5dive.yaml
 5dive team import <slug>                 # provision a whole team template in one call
+5dive push <task> [--branch=<b>]         # delegated git push via your own GitHub App (see below)
 5dive self-update                        # update CLI + plugins, then restart agents
 ```
 
@@ -289,6 +290,25 @@ Full flag reference: `5dive --help` (or `5dive <verb> --help`), or the searchabl
 - Telegram bot allowlists
 
 Baselines: [devsec.os_hardening](https://github.com/dev-sec/ansible-collection-hardening) · [Lynis](https://github.com/CISOfy/lynis) · [fail2ban](https://www.fail2ban.org/). Or skip the checklist; [5dive.ai](https://5dive.ai?utm_source=github&utm_medium=owned&utm_campaign=5dive-readme) handles it.
+
+### Delegated git push (bring your own GitHub App)
+
+Agents can read and edit a repo, but shouldn't hold a Git credential they could exfiltrate. `5dive push` gives a team ONE scoped push identity — your own GitHub App — that the control plane holds and lends for a single gated push, never handing the agent a token.
+
+```sh
+sudo 5dive push setup                              # scaffold + verify the credential
+5dive push <task> --branch=<feature-branch>        # push, once the task's gate clears
+```
+
+How it works, and why it's safe to give an agent:
+
+- **Your GitHub App, your key.** You create a GitHub App in your org (`contents:write`), install it on the repos you ship, and drop its key at `/etc/5dive/connectors/github-app.{pem,env}` (root-600). The code is generic — point it at any App. No per-agent seats, no long-lived PAT.
+- **Gate-gated.** A push runs only after the task carries a ship gate that a human has answered and not rejected. No gate, open gate, or rejected gate → refused.
+- **One branch only.** It pushes exactly the branch named in the task (`--branch` or a `Branch: <name>` line in the body); protected branches (`main`/`master`) are refused.
+- **Author stays yours.** A fail-closed pre-push scan requires every pushed commit to carry your configured commit author, so provider team-checks (e.g. Vercel) stay green — the App is transport auth only, decoupled from commit authorship.
+- **The agent never holds a token.** Gate re-verify, author scan, a repo-scoped short-lived token mint, the push, and token discard all happen atomically in a root-only helper. The token is scoped to just the one target repo, so even a captured token can't reach the rest of your org. Every push is audit-logged.
+
+Full walkthrough (create the App, install it, drop the credential, wire the grant, first push): **[docs/delegated-push.md](docs/delegated-push.md)**.
 
 ### Other paths
 

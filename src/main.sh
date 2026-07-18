@@ -224,9 +224,12 @@ Zero-human proof (publish your own badge — OSS-17):
   5dive proof off | status [--json]                             # remove cron (config kept) | report + staleness
   # methodology + self-publish guide: docs/zero-human.md
 
-Delegated push (one gated bot identity — DIVE-1376):
-  5dive push <id|DIVE-N> [--branch=<b>] [--dry-run]  # push ONLY the task's branch, ONLY after its gate clears; author=lodar enforced
-  # Branch comes from --branch or a 'Branch: <name>' line in the task body. Credential is a control-plane GitHub App, never a human token.
+Delegated push (bring your own GitHub App — DIVE-1376):
+  5dive push <id|DIVE-N> [--branch=<b>] [--dry-run]  # push ONLY the task's branch, ONLY after its gate clears; author enforced
+  5dive push setup                                   # scaffold + check the GitHub App credential (bring-your-own; root)
+  # Branch comes from --branch or a 'Branch: <name>' line in the task body. The credential is YOUR GitHub App
+  # (contents:write, installed on your ship repos), held root-side in /etc/5dive/connectors — never a human token.
+  # Full setup walkthrough: docs/delegated-push.md
 
 Health:
   5dive doctor [--fix] [--dry-run] [--category=deps|types|auth|creds|registry|shelld|channels|host|memory]
@@ -667,8 +670,16 @@ main() {
       # scan. The privileged gate+author+mint+push runs atomically in the root-only
       # _push_do helper (repo-scoped token, agent never holds a credential).
       # Mutating + credential-bearing → audited (no token ever lands in argv).
-      AUDIT_CMD="push"; AUDIT_ARGS=("$@")
-      cmd_push "$@" ;;
+      # `push setup` (DIVE-1461) is the BYO-GitHub-App onboarding sub-verb —
+      # intercepted before cmd_push so "setup" isn't parsed as a task id.
+      if [[ "${1:-}" == "setup" ]]; then
+        shift
+        AUDIT_CMD="push setup"; AUDIT_ARGS=("$@")
+        cmd_push_setup "$@"
+      else
+        AUDIT_CMD="push"; AUDIT_ARGS=("$@")
+        cmd_push "$@"
+      fi ;;
     proof)
       # OSS-17: publish this box's zero-human proof (badge.json/zero-human.json/
       # history.jsonl) to a git status branch, computed verbatim from `digest`.

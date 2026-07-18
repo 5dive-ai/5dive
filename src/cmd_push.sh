@@ -289,3 +289,99 @@ cmd_push_do() {
      "$(jq -n --arg t "$ident" --arg b "$branch" --arg s "$sha" --arg r "$slug" \
            '{task:$t,branch:$b,sha:$s,repo:$r,pushed:true,scoped:true}')"
 }
+
+# cmd_push_setup — DIVE-1461: bring-your-own-GitHub-App onboarding for delegated
+# push. Streamlines the credential drop + verifies the grant so an OSS self-hoster
+# can stand up `5dive push` against THEIR OWN GitHub App. It scaffolds the env
+# template, checks the private key + env presence/permissions, reports whether the
+# root-only `_push_do` NOPASSWD grant is in place, and prints the remaining manual
+# steps. It NEVER accepts a secret on argv (nothing lands in shell history): the
+# human pastes the .pem file and fills the .env by hand. Root-only (writes under
+# /etc/5dive/connectors). See docs/delegated-push.md for the full walkthrough.
+cmd_push_setup() {
+  require_root push setup
+  local dir="/etc/5dive/connectors"
+  local envf="${dir}/github-app.env" pem="${dir}/github-app.pem"
+
+  local dir_state="present"
+  if [[ ! -d "$dir" ]]; then mkdir -p "$dir"; chmod 755 "$dir"; dir_state="created"; fi
+
+  # Scaffold the env template (never overwrite a filled-in one).
+  local env_state
+  if [[ ! -e "$envf" ]]; then
+    ( umask 077; cat > "$envf" <<'ENVT'
+# 5dive delegated push — GitHub App credential (DIVE-1376 / DIVE-1461).
+# Fill these from YOUR GitHub App: github.com → Settings → Developer settings →
+# GitHub Apps → your app. INSTALLATION_ID is in the install URL
+# (…/installations/<ID>). Place the App private key alongside this file as
+# github-app.pem (root-600). See docs/delegated-push.md.
+GITHUB_APP_ID=
+GITHUB_APP_INSTALLATION_ID=
+GITHUB_APP_PRIVATE_KEY_FILE=/etc/5dive/connectors/github-app.pem
+ENVT
+    )
+    chmod 600 "$envf"; chown root:root "$envf" 2>/dev/null || true
+    env_state="scaffolded"
+  else
+    chmod 600 "$envf" 2>/dev/null || true
+    env_state="present"
+  fi
+
+  # Inspect what's configured (read the env in a subshell; never echo the key).
+  local app_id="" inst="" env_ok=0
+  if [[ -r "$envf" ]]; then
+    app_id=$( . "$envf" 2>/dev/null; printf '%s' "${GITHUB_APP_ID:-}" )
+    inst=$(   . "$envf" 2>/dev/null; printf '%s' "${GITHUB_APP_INSTALLATION_ID:-}" )
+    [[ -n "$app_id" && -n "$inst" ]] && env_ok=1
+  fi
+  local pem_ok=0; [[ -r "$pem" ]] && pem_ok=1
+  # The grant is per standard-agent user (written by `agent create`); admins run
+  # NOPASSWD ALL and need no explicit line. Informational, never fatal.
+  # `|| true` inside the pipe: grep exits 1 when nothing matches, which would
+  # otherwise trip `set -euo pipefail` in this command substitution.
+  local grant_n=0
+  grant_n=$( { grep -rlsF "/usr/local/bin/5dive _push_do" /etc/sudoers.d/ 2>/dev/null || true; } | wc -l | tr -d ' ')
+  local ready=0; [[ $env_ok -eq 1 && $pem_ok -eq 1 ]] && ready=1
+
+  if (( JSON_MODE )); then
+    ok "push setup" "$(jq -n \
+        --arg dir "$dir" --arg dirst "$dir_state" --arg envst "$env_state" \
+        --arg appid "$app_id" --arg inst "$inst" \
+        --argjson envok $env_ok --argjson pemok $pem_ok \
+        --argjson grants "${grant_n:-0}" --argjson ready $ready \
+        '{dir:$dir,dirState:$dirst,envState:$envst,appIdSet:($appid|length>0),
+          installationIdSet:($inst|length>0),privateKeyPresent:($pemok==1),
+          grantFiles:$grants,ready:($ready==1)}')"
+    return 0
+  fi
+
+  echo "5dive delegated push — setup (bring your own GitHub App)"
+  echo
+  printf '  connector dir : %-38s [%s]\n' "$dir" "$dir_state"
+  if [[ $env_ok -eq 1 ]]; then
+    printf '  env           : %-38s [configured: app=%s install=%s]\n' "github-app.env" "$app_id" "$inst"
+  else
+    printf '  env           : %-38s [%s — fill GITHUB_APP_ID + GITHUB_APP_INSTALLATION_ID]\n' "github-app.env" "$env_state"
+  fi
+  if [[ $pem_ok -eq 1 ]]; then
+    printf '  private key   : %-38s [present]\n' "github-app.pem"
+  else
+    printf '  private key   : %-38s [MISSING — drop your App .pem here, chmod 600]\n' "github-app.pem"
+  fi
+  if [[ "${grant_n:-0}" -gt 0 ]]; then
+    printf '  fleet grant   : %-38s [present in %s sudoers file(s)]\n' "_push_do NOPASSWD" "$grant_n"
+  else
+    printf '  fleet grant   : %-38s [none found — admins use NOPASSWD ALL; standard agents get it on `agent create`]\n' "_push_do NOPASSWD"
+  fi
+  echo
+  if [[ $ready -eq 1 ]]; then
+    echo "Ready. Try a dry run from inside a repo work tree:"
+    echo "  5dive push <task> --branch=<feature-branch> --dry-run"
+    echo "A real push runs only after the task's ship gate clears, and only pushes commits by your configured commit author."
+  else
+    echo "Remaining manual steps (a human must do these — no secret is ever passed on the CLI):"
+    [[ $pem_ok -ne 1 ]] && echo "  1. Create a GitHub App (contents:write), install it on your ship repos, download its private key → ${pem} (chmod 600)."
+    [[ $env_ok -ne 1 ]] && echo "  2. Edit ${envf}: set GITHUB_APP_ID and GITHUB_APP_INSTALLATION_ID."
+    echo "  Then re-run: sudo 5dive push setup   (full guide: docs/delegated-push.md)"
+  fi
+}
