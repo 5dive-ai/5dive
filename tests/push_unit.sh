@@ -10,8 +10,9 @@
 #   - no gate on the task -> refuse
 #   - open (unanswered) gate -> refuse
 #   - rejected gate answer -> refuse
-#   - author scan fail-closed (a non-lodar commit on the branch) -> refuse
-#   - happy dry-run (gate cleared + author=lodar) -> ok, prints dryRun:true
+#   - config-only author scan: unset committer -> any author passes; a configured
+#     committer passes a matching-author branch and refuses a mismatching one
+#   - happy dry-run (gate cleared) -> ok, prints dryRun:true
 # Run: bash tests/push_unit.sh  (no root, no network — token mint never runs).
 set -uo pipefail
 cd "$(dirname "$0")/.."
@@ -32,6 +33,11 @@ STATE_DIR="$TMP"
 TASKS_DIR="$STATE_DIR/tasks"
 TASKS_DB="$TASKS_DIR/tasks.db"
 JSON_MODE=0
+# Hermetic: point the App env at an absent path so the pre-flight never reads the
+# box's real /etc/5dive/connectors/github-app.env. The committer to enforce is
+# config-only (DIVE-1461): supplied per-test via GITHUB_APP_COMMIT_AUTHOR.
+export GITHUB_APP_ENV="$TMP/no-app-env"
+unset GITHUB_APP_COMMIT_AUTHOR
 mkdir -p "$TASKS_DIR"
 set +e
 
@@ -41,7 +47,9 @@ PASS=0; FAIL=0
 ok_t()  { PASS=$((PASS+1)); printf 'ok   - %s\n' "$1"; }
 bad_t() { FAIL=$((FAIL+1)); printf 'FAIL - %s\n   %s\n' "$1" "${2:-}"; }
 
-LODAR='lodar <markounik@gmail.com>'
+# Neutral test identities — the public test source carries no real personal email.
+AUTHOR='Ada Lovelace <ada@example.test>'   # the "configured" committer to enforce
+OTHER='Bob Byte <bob@example.test>'        # a non-matching author
 
 # Seed a task with an optional body + gate state.
 # seed_task <ident> <body> <need_type> <need_answered_at> <need_answer>
@@ -56,13 +64,13 @@ seed_task() {
 REPO="$TMP/repo"; mkdir -p "$REPO"
 ( cd "$REPO"
   git init -q
-  git config user.name lodar; git config user.email markounik@gmail.com
-  git commit -q --allow-empty -m "base (lodar)" --author="$LODAR"
+  git config user.name test; git config user.email test@example.test
+  git commit -q --allow-empty -m "base" --author="$AUTHOR"
   git branch -q feature-ok
   git checkout -q feature-ok
-  git commit -q --allow-empty -m "work (lodar)" --author="$LODAR"
+  git commit -q --allow-empty -m "work" --author="$AUTHOR"
   git checkout -q -b feature-badauthor
-  git commit -q --allow-empty -m "sneaky" --author="Bobby <bob@evil.test>"
+  git commit -q --allow-empty -m "other-author" --author="$OTHER"
   git checkout -q master 2>/dev/null || git checkout -q main 2>/dev/null || true
 ) >/dev/null 2>&1
 
@@ -104,11 +112,12 @@ out=$(run_push DIVE-905 --dry-run); rc=$?
 { [[ $rc -ne 0 ]] && grep -qi "REJECTED" <<<"$out"; } \
   && ok_t "rejected gate -> refuse" || bad_t "rejected gate -> refuse" "rc=$rc :: $out"
 
-# 6) author scan fail-closed (non-lodar commit on branch) -> refuse
+# 6) DIVE-1461 config-only: with NO committer configured, the author scan is a
+# no-op — even a mismatched-author branch pushes (no restriction).
 seed_task DIVE-906 "Branch: feature-badauthor" approval "2026-07-18 00:00:00" "yes"
 out=$(run_push DIVE-906 --dry-run); rc=$?
-{ [[ $rc -ne 0 ]] && grep -qi "author check FAILED" <<<"$out"; } \
-  && ok_t "non-lodar author -> refuse" || bad_t "non-lodar author -> refuse" "rc=$rc :: $out"
+{ [[ $rc -eq 0 ]] && grep -qi "would push" <<<"$out"; } \
+  && ok_t "unset committer -> any author passes" || bad_t "unset committer -> any author passes" "rc=$rc :: $out"
 
 # 7) happy dry-run (gate cleared + author=lodar) -> ok, no token mint
 seed_task DIVE-907 "Branch: feature-ok" approval "2026-07-18 00:00:00" "yes ship it"
@@ -121,6 +130,19 @@ seed_task DIVE-908 "Branch: feature-badauthor" approval "2026-07-18 00:00:00" "y
 out=$(run_push DIVE-908 --branch=feature-ok --dry-run); rc=$?
 { [[ $rc -eq 0 ]] && grep -qi "would push feature-ok" <<<"$out"; } \
   && ok_t "--branch overrides body line" || bad_t "--branch overrides body line" "rc=$rc :: $out"
+
+# 9) DIVE-1461 config-only: with a committer CONFIGURED (via GITHUB_APP_COMMIT_AUTHOR,
+# as _push_do sees it after sourcing the App env), a MATCHING-author branch passes...
+seed_task DIVE-921 "Branch: feature-ok" approval "2026-07-18 00:00:00" "yes"
+out=$( export GITHUB_APP_COMMIT_AUTHOR="$AUTHOR"; run_push DIVE-921 --dry-run ); rc=$?
+{ [[ $rc -eq 0 ]] && grep -qi "would push" <<<"$out"; } \
+  && ok_t "set committer: matching author -> pass" || bad_t "set committer: matching author -> pass" "rc=$rc :: $out"
+
+# 10) ...and a NON-matching-author branch is refused fail-closed.
+seed_task DIVE-922 "Branch: feature-badauthor" approval "2026-07-18 00:00:00" "yes"
+out=$( export GITHUB_APP_COMMIT_AUTHOR="$AUTHOR"; run_push DIVE-922 --dry-run ); rc=$?
+{ [[ $rc -ne 0 ]] && grep -qi "author check FAILED" <<<"$out"; } \
+  && ok_t "set committer: non-matching author -> refuse" || bad_t "set committer: non-matching author -> refuse" "rc=$rc :: $out"
 
 # --- DIVE-1460: the shared cleared-gate predicate. cmd_push AND the root-only
 # token mint (cmd_push_mint_token) both call _push_gate_check, so a direct

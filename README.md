@@ -305,7 +305,7 @@ How it works, and why it's safe to give an agent:
 - **Your GitHub App, your key.** You create a GitHub App in your org (`contents:write`), install it on the repos you ship, and drop its key at `/etc/5dive/connectors/github-app.{pem,env}` (root-600). The code is generic — point it at any App. No per-agent seats, no long-lived PAT.
 - **Gate-gated.** A push runs only after the task carries a ship gate that a human has answered and not rejected. No gate, open gate, or rejected gate → refused.
 - **One branch only.** It pushes exactly the branch named in the task (`--branch` or a `Branch: <name>` line in the body); protected branches (`main`/`master`) are refused.
-- **Author stays yours.** A fail-closed pre-push scan requires every pushed commit to carry your configured commit author, so provider team-checks (e.g. Vercel) stay green — the App is transport auth only, decoupled from commit authorship.
+- **Author stays yours (optional).** Configure a committer (`GITHUB_APP_COMMIT_AUTHOR`) and a fail-closed scan requires every pushed commit to match it, so provider team-checks (e.g. Vercel) stay green; leave it unset for no restriction. The App is transport auth only, decoupled from commit authorship.
 - **The agent never holds a token.** Gate re-verify, author scan, a repo-scoped short-lived token mint, the push, and token discard all happen atomically in a root-only helper. The token is scoped to just the one target repo, so even a captured token can't reach the rest of your org. Every push is audit-logged.
 
 Full walkthrough (create the App, install it, drop the credential, wire the grant, first push): **[docs/delegated-push.md](docs/delegated-push.md)**.

@@ -666,8 +666,8 @@ main() {
       cmd_digest "$@" ;;
     push)
       # DIVE-1376/1460 (Bobby gripe #1): delegated push. Pushes ONLY the task's
-      # branch, ONLY after the task gate clears, with a fail-closed author=lodar
-      # scan. The privileged gate+author+mint+push runs atomically in the root-only
+      # branch, ONLY after the task gate clears, with a fail-closed author scan
+      # (config-only committer). The privileged gate+author+mint+push runs atomically in the root-only
       # _push_do helper (repo-scoped token, agent never holds a credential).
       # Mutating + credential-bearing → audited (no token ever lands in argv).
       # `push setup` (DIVE-1461) is the BYO-GitHub-App onboarding sub-verb —

@@ -28043,9 +28043,12 @@ HELP
 #     NEVER a human token and NEVER handed to the agent.
 #   - `5dive push <task>` pushes ONLY the branch named in the task and ONLY
 #     after the task's gate has cleared (reuses the gate primitive).
-#   - Commit author stays lodar <markounik@gmail.com> — enforced by a fail-closed
-#     scan — so the Vercel team author check stays green. The App provides
-#     TRANSPORT auth only; it is fully decoupled from commit authorship.
+#   - Commit-author enforcement is CONFIG-ONLY: if the deployment configures a
+#     committer (GITHUB_APP_COMMIT_AUTHOR in github-app.env), a fail-closed scan
+#     requires every pushed commit to match it, so a provider author-gate (e.g.
+#     Vercel's) stays green. Unset = no author restriction. No committer identity
+#     is baked into this (public) source. The App provides TRANSPORT auth only;
+#     it is fully decoupled from commit authorship.
 #   - Fully logged (audit_log via the main.sh dispatch wrapper).
 #
 # DIVE-1460 (security hardening — the mint must not be a side door):
@@ -28062,8 +28065,16 @@ HELP
 #     and under sudo-rs, where argument wildcards are ignored.
 
 readonly _PUSH_APP_ENV_DEFAULT="/etc/5dive/connectors/github-app.env"
-readonly _PUSH_LODAR_AUTHOR="lodar <markounik@gmail.com>"
 readonly _PUSH_DEFAULT_REPO="https://github.com/5dive-ai/5dive.git"
+
+# _push_expected_author — the commit author to enforce, or EMPTY for "no
+# restriction". Config-only (DIVE-1461): the value comes from
+# GITHUB_APP_COMMIT_AUTHOR (set directly in the environment, or sourced from
+# github-app.env by the caller). Deliberately has NO hardcoded default — no
+# committer identity lives in this public source; our own on-box env carries it.
+_push_expected_author() {
+  printf '%s' "${GITHUB_APP_COMMIT_AUTHOR:-}"
+}
 
 # _push_branch_from_body <body> — pull a "Branch: <name>" line out of a task
 # body (case-insensitive, first match). Empty if absent.
@@ -28105,13 +28116,17 @@ _push_gate_check() {
   fi
 }
 
-# _push_author_scan <repo-path> <repo-url> <branch> — fail-closed author scan.
-# Every commit on <branch> not already on the remote's main must be authored by
-# lodar, or the Vercel team gate rejects the push. Runs in agent pre-flight (a
-# friendly early error) AND authoritatively inside `_push_do`. `git -C` + a
-# scoped safe.directory so it also works when root operates on the agent's tree.
+# _push_author_scan <repo-path> <repo-url> <branch> <author> — fail-closed author
+# scan. If <author> is EMPTY, the deployment configured no committer, so there is
+# NO restriction and the scan is a no-op (DIVE-1461 config-only behavior). When
+# set, every commit on <branch> not already on the remote's main must match
+# <author>, or a provider author-gate would reject the push. Runs in agent
+# pre-flight (a friendly early error, when the author is resolvable there) AND
+# authoritatively inside `_push_do`. `git -C` + a scoped safe.directory so it also
+# works when root operates on the agent's tree.
 _push_author_scan() {
-  local repopath="$1" repourl="$2" branch="$3"
+  local repopath="$1" repourl="$2" branch="$3" author="$4"
+  [[ -n "$author" ]] || return 0   # unset committer -> no author restriction
   local -a G=(git -C "$repopath" -c "safe.directory=$repopath")
   local base rangespec offenders
   "${G[@]}" fetch --quiet "$repourl" main 2>/dev/null || true
@@ -28121,11 +28136,11 @@ _push_author_scan() {
     rangespec="refs/heads/${branch}"   # no shared base (new branch) — scan all
   fi
   offenders=$("${G[@]}" log --format='%H %an <%ae>' "$rangespec" 2>/dev/null \
-              | grep -vF " ${_PUSH_LODAR_AUTHOR}" || true)
+              | grep -vF " ${author}" || true)
   if [[ -n "$offenders" ]]; then
     printf '%s\n' "$offenders" | sed 's/^/  /' >&2
     fail "$E_VALIDATION" \
-      "author check FAILED — the commit(s) above are not authored '${_PUSH_LODAR_AUTHOR}'. Re-author (git rebase --exec 'git commit --amend --author=\"${_PUSH_LODAR_AUTHOR}\" --no-edit') before pushing; Vercel would reject them."
+      "author check FAILED — the commit(s) above are not authored '${author}' (the configured GITHUB_APP_COMMIT_AUTHOR). Re-author (git rebase --exec 'git commit --amend --author=\"${author}\" --no-edit') before pushing; your git host's author gate would reject them."
   fi
 }
 
@@ -28203,16 +28218,30 @@ cmd_push() {
   git rev-parse --verify --quiet "refs/heads/${branch}" >/dev/null || fail "$E_GENERIC" \
     "local branch '${branch}' not found — check it out here before pushing."
 
-  # --- AUTHOR SCAN pre-flight (re-verified authoritatively in _push_do).
-  _push_author_scan "$repopath" "$repo" "$branch"
+  # --- AUTHOR SCAN pre-flight (re-verified authoritatively in _push_do). The
+  # enforced committer is config-only (GITHUB_APP_COMMIT_AUTHOR). We resolve it
+  # here best-effort for a friendly early error: honor a process-env value, else
+  # source github-app.env IF we can read it (single-user/admin boxes). On a
+  # hardened box the App env is root-only, so the agent can't see it — the author
+  # then reads EMPTY here and the scan is a no-op, deferring to the authoritative
+  # check inside root's `_push_do` (which sources the env). No false rejections.
+  local envf="${GITHUB_APP_ENV:-$_PUSH_APP_ENV_DEFAULT}"
+  local author=""
+  if [[ -n "${GITHUB_APP_COMMIT_AUTHOR:-}" ]]; then
+    author="$GITHUB_APP_COMMIT_AUTHOR"
+  elif [[ -r "$envf" ]]; then
+    author=$( set -a; . "$envf" 2>/dev/null; set +a; _push_expected_author )
+  fi
+  _push_author_scan "$repopath" "$repo" "$branch" "$author"
 
   local slug sha; slug=$(_push_repo_slug "$repo")
   sha=$(git rev-parse --short "refs/heads/${branch}")
+  local author_state; [[ -n "$author" ]] && author_state="ok (${author})" || author_state="deferred to push-time (not readable here)"
 
   if [[ $dry -eq 1 ]]; then
-    ok "dry-run: would push ${branch}@${sha} to ${slug} (gate cleared, author ok)" \
-       "$(jq -n --arg t "$ident" --arg b "$branch" --arg s "$sha" --arg r "$slug" \
-             '{task:$t,branch:$b,sha:$s,repo:$r,dryRun:true,gate:"cleared",author:"ok"}')"
+    ok "dry-run: would push ${branch}@${sha} to ${slug} (gate cleared, author ${author_state})" \
+       "$(jq -n --arg t "$ident" --arg b "$branch" --arg s "$sha" --arg r "$slug" --arg a "$author_state" \
+             '{task:$t,branch:$b,sha:$s,repo:$r,dryRun:true,gate:"cleared",author:$a}')"
     return 0
   fi
 
@@ -28269,9 +28298,6 @@ cmd_push_do() {
   "${G[@]}" rev-parse --verify --quiet "refs/heads/${branch}" >/dev/null \
     || fail "$E_GENERIC" "_push_do: local branch '${branch}' not found."
 
-  # Authoritative author scan (fail-closed).
-  _push_author_scan "$repopath" "$repourl" "$branch"
-
   # --- credential ---
   local envf="${GITHUB_APP_ENV:-$_PUSH_APP_ENV_DEFAULT}"
   [[ -r "$envf" ]] || fail "$E_GENERIC" "missing GitHub App credential: $envf"
@@ -28281,6 +28307,13 @@ cmd_push_do() {
   local pem="${GITHUB_APP_PRIVATE_KEY_FILE:-/etc/5dive/connectors/github-app.pem}"
   [[ -n "$app_id" && -n "$inst" && -r "$pem" ]] || \
     fail "$E_GENERIC" "GitHub App env incomplete (need GITHUB_APP_ID, GITHUB_APP_INSTALLATION_ID, readable GITHUB_APP_PRIVATE_KEY_FILE)"
+
+  # Authoritative author scan (fail-closed). The enforced committer is config-only
+  # (GITHUB_APP_COMMIT_AUTHOR, just sourced from the App env); empty = no
+  # restriction. This is the authoritative gate — the agent pre-flight is only a
+  # best-effort preview and may have deferred here.
+  local author; author=$(_push_expected_author)
+  _push_author_scan "$repopath" "$repourl" "$branch" "$author"
 
   # Build a short-lived App JWT (iat -60s for clock skew, exp +9min < 10min max).
   local now iat exp header payload unsigned sig jwt
@@ -28318,9 +28351,11 @@ cmd_push_do() {
   [[ $rc -eq 0 ]] || fail "$E_GENERIC" "push failed (branch ${branch}); see output above."
   local slug sha; slug=$(_push_repo_slug "$repourl")
   sha=$("${G[@]}" rev-parse --short "refs/heads/${branch}")
-  ok "pushed ${branch}@${sha} → ${slug} (delegated, repo-scoped token, author=lodar, gate cleared)" \
+  local author_note; [[ -n "$author" ]] && author_note="author enforced" || author_note="no author restriction"
+  ok "pushed ${branch}@${sha} → ${slug} (delegated, repo-scoped token, ${author_note}, gate cleared)" \
      "$(jq -n --arg t "$ident" --arg b "$branch" --arg s "$sha" --arg r "$slug" \
-           '{task:$t,branch:$b,sha:$s,repo:$r,pushed:true,scoped:true}')"
+           --argjson ae "$([[ -n "$author" ]] && echo true || echo false)" \
+           '{task:$t,branch:$b,sha:$s,repo:$r,pushed:true,scoped:true,authorEnforced:$ae}')"
 }
 
 # cmd_push_setup — DIVE-1461: bring-your-own-GitHub-App onboarding for delegated
@@ -28331,10 +28366,30 @@ cmd_push_do() {
 # steps. It NEVER accepts a secret on argv (nothing lands in shell history): the
 # human pastes the .pem file and fills the .env by hand. Root-only (writes under
 # /etc/5dive/connectors). See docs/delegated-push.md for the full walkthrough.
+# _push_env_set_author <envfile> <author> — upsert a shell-safe
+# GITHUB_APP_COMMIT_AUTHOR line (config, not a secret) in the App env file.
+_push_env_set_author() {
+  local f="$1" a="$2" tmp; tmp=$(mktemp)
+  { grep -v '^GITHUB_APP_COMMIT_AUTHOR=' "$f" 2>/dev/null || true; } > "$tmp"
+  printf 'GITHUB_APP_COMMIT_AUTHOR=%q\n' "$a" >> "$tmp"
+  cat "$tmp" > "$f"; rm -f "$tmp"; chmod 600 "$f"
+}
+
 cmd_push_setup() {
   require_root push setup
   local dir="/etc/5dive/connectors"
   local envf="${dir}/github-app.env" pem="${dir}/github-app.pem"
+
+  # Optional committer to enforce (config-only, DIVE-1461). Accept it on the flag
+  # for non-interactive use, else prompt when attached to a terminal. No secret.
+  local author_flag="" author_flag_set=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --author=*) author_flag="${1#*=}"; author_flag_set=1 ;;
+      *) : ;;   # setup takes no positional/other flags
+    esac
+    shift
+  done
 
   local dir_state="present"
   if [[ ! -d "$dir" ]]; then mkdir -p "$dir"; chmod 755 "$dir"; dir_state="created"; fi
@@ -28351,6 +28406,10 @@ cmd_push_setup() {
 GITHUB_APP_ID=
 GITHUB_APP_INSTALLATION_ID=
 GITHUB_APP_PRIVATE_KEY_FILE=/etc/5dive/connectors/github-app.pem
+# Optional: enforce a commit author on every pushed commit (set this if your git
+# host enforces a committer identity, e.g. a Vercel author gate). Leave blank for
+# no restriction. Format: 'Name <email>'.
+GITHUB_APP_COMMIT_AUTHOR=
 ENVT
     )
     chmod 600 "$envf"; chown root:root "$envf" 2>/dev/null || true
@@ -28358,6 +28417,19 @@ ENVT
   else
     chmod 600 "$envf" 2>/dev/null || true
     env_state="present"
+  fi
+
+  # Resolve/prompt the committer, then persist it if provided.
+  local cur_author=""
+  [[ -r "$envf" ]] && cur_author=$( . "$envf" 2>/dev/null; printf '%s' "${GITHUB_APP_COMMIT_AUTHOR:-}" )
+  if [[ $author_flag_set -eq 1 ]]; then
+    _push_env_set_author "$envf" "$author_flag"; cur_author="$author_flag"
+  elif [[ -t 0 && ! $JSON_MODE -eq 1 ]]; then
+    local prompt_default="${cur_author}"
+    printf 'Commit author to enforce on pushed commits (blank = no restriction)%s: ' \
+      "${prompt_default:+ [${prompt_default}]}"
+    local reply; IFS= read -r reply || reply=""
+    if [[ -n "$reply" ]]; then _push_env_set_author "$envf" "$reply"; cur_author="$reply"; fi
   fi
 
   # Inspect what's configured (read the env in a subshell; never echo the key).
@@ -28379,11 +28451,12 @@ ENVT
   if (( JSON_MODE )); then
     ok "push setup" "$(jq -n \
         --arg dir "$dir" --arg dirst "$dir_state" --arg envst "$env_state" \
-        --arg appid "$app_id" --arg inst "$inst" \
+        --arg appid "$app_id" --arg inst "$inst" --arg author "$cur_author" \
         --argjson envok $env_ok --argjson pemok $pem_ok \
         --argjson grants "${grant_n:-0}" --argjson ready $ready \
         '{dir:$dir,dirState:$dirst,envState:$envst,appIdSet:($appid|length>0),
           installationIdSet:($inst|length>0),privateKeyPresent:($pemok==1),
+          commitAuthor:$author,authorEnforced:($author|length>0),
           grantFiles:$grants,ready:($ready==1)}')"
     return 0
   fi
@@ -28401,6 +28474,11 @@ ENVT
   else
     printf '  private key   : %-38s [MISSING — drop your App .pem here, chmod 600]\n' "github-app.pem"
   fi
+  if [[ -n "$cur_author" ]]; then
+    printf '  commit author : %-38s [enforced]\n' "$cur_author"
+  else
+    printf '  commit author : %-38s [none — any author allowed; set with --author or when prompted]\n' "(unset)"
+  fi
   if [[ "${grant_n:-0}" -gt 0 ]]; then
     printf '  fleet grant   : %-38s [present in %s sudoers file(s)]\n' "_push_do NOPASSWD" "$grant_n"
   else
@@ -28410,7 +28488,11 @@ ENVT
   if [[ $ready -eq 1 ]]; then
     echo "Ready. Try a dry run from inside a repo work tree:"
     echo "  5dive push <task> --branch=<feature-branch> --dry-run"
-    echo "A real push runs only after the task's ship gate clears, and only pushes commits by your configured commit author."
+    if [[ -n "$cur_author" ]]; then
+      echo "A real push runs only after the task's ship gate clears, and only pushes commits authored '${cur_author}'."
+    else
+      echo "A real push runs only after the task's ship gate clears (no commit-author restriction is configured)."
+    fi
   else
     echo "Remaining manual steps (a human must do these — no secret is ever passed on the CLI):"
     [[ $pem_ok -ne 1 ]] && echo "  1. Create a GitHub App (contents:write), install it on your ship repos, download its private key → ${pem} (chmod 600)."
@@ -31499,8 +31581,8 @@ main() {
       cmd_digest "$@" ;;
     push)
       # DIVE-1376/1460 (Bobby gripe #1): delegated push. Pushes ONLY the task's
-      # branch, ONLY after the task gate clears, with a fail-closed author=lodar
-      # scan. The privileged gate+author+mint+push runs atomically in the root-only
+      # branch, ONLY after the task gate clears, with a fail-closed author scan
+      # (config-only committer). The privileged gate+author+mint+push runs atomically in the root-only
       # _push_do helper (repo-scoped token, agent never holds a credential).
       # Mutating + credential-bearing → audited (no token ever lands in argv).
       # `push setup` (DIVE-1461) is the BYO-GitHub-App onboarding sub-verb —
