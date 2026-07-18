@@ -46,6 +46,13 @@ _SUP_T_STUCK_MIN="${SUPERVISOR_T_STUCK_MIN:-30}"   # active work + no progress t
 _SUP_T_SLOW_MIN="${SUPERVISOR_T_SLOW_MIN:-10}"     # active work + no progress this long -> slow (record only)
 [[ "$_SUP_T_STUCK_MIN" =~ ^[0-9]+$ ]] || _SUP_T_STUCK_MIN=30
 [[ "$_SUP_T_SLOW_MIN"  =~ ^[0-9]+$ ]] || _SUP_T_SLOW_MIN=10
+# DIVE-1416 (gap#3): an agent with NO active work (no in_progress, no running
+# loop) but an old todo task still assigned to it — heartbeat should have woken
+# it by now (enrolled or not) — used to read as plain "healthy (idle)". This
+# window is how old a todo has to be before that idleness counts as a distinct
+# unhealthy signal instead. Same env-override escape hatch as the siblings above.
+_SUP_T_STRANDED_MIN="${SUPERVISOR_T_STRANDED_MIN:-45}"
+[[ "$_SUP_T_STRANDED_MIN" =~ ^[0-9]+$ ]] || _SUP_T_STRANDED_MIN=45
 # Ignore a missing poller right after a service start — the plugin's bun server
 # takes a moment to boot, and a false poller-dead there would flag every
 # freshly-restarted agent.
@@ -246,6 +253,12 @@ Classification (conservative — see docs/fleet-supervisor-design.md §4):
                   (cause: service-dead|tmux-dead|poller-dead|loop-stuck|no-progress)
   drift           active /goal targets a still-todo DIVE task while the agent
                   progresses elsewhere (cause: goal-drift) — recorded, NEVER acted on
+  stalled         NO active work (no in_progress, no running loop) but a todo
+                  task has sat assigned to this agent, untouched, for
+                  ${_SUP_T_STRANDED_MIN}m+ (cause: idle-stranded) — DIVE-1416 gap#3:
+                  "idle" alone used to read as healthy even while actionable
+                  work was stranded; recorded, NEVER acted on (observe-only,
+                  same as slow/drift/update-pending)
 
 Poller + activity signals cover claude/codex/grok/antigravity/opencode (DIVE-971).
 P1 takes ZERO recovery actions. Add --json to any form for machine output.
@@ -307,6 +320,77 @@ _sup_cli_check() {
     fi
   fi
   _SUP_CLI_STALE="$stale"
+}
+
+# Pure classification decision — NO I/O, directly unit-testable (mirrors the
+# _sup_act_plan factoring the P2 ladder already uses). Takes every signal
+# _sup_agent_record collects and returns "<class>\x1f<cause>\x1f<detail>" on
+# stdout so a test can assert against it without stubbing systemctl/tmux/pgrep.
+# args: desired svc_running(0/1) active sess tmux_state poller loop_stuck
+#       has_work(0/1) act_age cli_stale(true/false/unknown) goal_drift_task
+#       verify_excerpt stranded
+_sup_classify() {
+  local desired="$1" svc_running="$2" active="$3" sess="$4" tmux_state="$5" poller="$6" \
+        loop_stuck="$7" has_work="$8" act_age="$9" cli_stale="${10}" goal_drift_task="${11}" \
+        verify_excerpt="${12}" stranded="${13:-0}"
+  local class="healthy" cause="" detail=""
+  # DIVE-1127: the verification-challenge tripwire wins FIRST — it is the highest
+  # priority signal (same-day alert obligation) and, when present, explains any
+  # concurrent stall (a challenge freezes the session). Alerting is the tick's job.
+  if [[ -n "$verify_excerpt" ]]; then
+    class="verify-challenge"; cause="id-verification"
+    detail="pane shows an ID/age-verification challenge"
+  # desiredState (P2, DIVE-857 prereq b): an operator's explicit stop/start
+  # beats inference. Recorded by `5dive agent stop|start`; absent on legacy
+  # agents => the P1 inference path below, unchanged.
+  elif [[ "$desired" == "stopped" ]] && (( ! svc_running )) && [[ "$active" != "failed" ]]; then
+    detail="stopped (desired)"
+  elif (( ! svc_running )); then
+    if [[ "$active" == "failed" ]] || (( has_work )) || [[ "$desired" == "running" ]]; then
+      class="stuck"; cause="service-dead"; detail="unit ${active:-unknown}${desired:+ (desired: $desired)}"
+    else
+      detail="stopped (no active work)"
+    fi
+  elif [[ "$tmux_state" == "dead" ]]; then
+    class="stuck"; cause="tmux-dead"; detail="unit active but tmux session '${sess}' gone"
+  elif [[ "$poller" == "dead" ]]; then
+    class="stuck"; cause="poller-dead"; detail="telegram poller process not running"
+  elif (( loop_stuck > 0 )); then
+    class="stuck"; cause="loop-stuck"; detail="${loop_stuck} running loop(s) self-flagged stuck"
+  elif (( has_work )) && (( act_age >= 0 )) && (( act_age >= _SUP_T_STUCK_MIN * 60 )); then
+    class="stuck"; cause="no-progress"; detail="active work, no transcript progress for $((act_age / 60))m"
+  elif [[ "$cli_stale" == "true" ]]; then
+    # Box-level: the shared CLI is behind AND the nightly isn't catching up
+    # (the /tmp-clobber class) — every agent is executing old code. Requires a
+    # confirmed probe; "unknown" never lands here. This is an UPDATE-PENDING
+    # signal, NOT a wedged agent (DIVE-974): the agents are healthy, just one
+    # release behind, so it MUST NOT classify as stuck — the P2 act loop only
+    # touches class=="stuck", and a stale-cli tick right after every release cut
+    # would otherwise nudge/resume/rotate/escalate the entire healthy fleet.
+    class="update-pending"; cause="stale-cli"; detail="box CLI ${FIVE_VERSION} stale behind ${_SUP_CLI_LATEST}"
+  elif (( has_work )) && (( act_age >= 0 )) && (( act_age >= _SUP_T_SLOW_MIN * 60 )); then
+    class="slow"; detail="active work, no transcript progress for $((act_age / 60))m"
+  elif [[ -n "$goal_drift_task" ]]; then
+    # Disjoint from slow/stuck by construction (drift needs recent activity).
+    # Observe-only: the P2 act loop is gated on class=="stuck", so this never
+    # nudges/resumes/rotates — surfaced for the audit trail and board only.
+    class="drift"; cause="goal-drift"
+    detail="active /goal targets DIVE-${goal_drift_task} (still todo); agent progressing elsewhere"
+  elif (( has_work )); then
+    detail="active"
+  elif (( stranded > 0 )); then
+    # DIVE-1416 (gap#3): the agent has NO active work at all, yet a todo task
+    # has sat assigned to it for _SUP_T_STRANDED_MIN+ — heartbeat should have
+    # woken it by now. Plain "idle" used to read as healthy here; this is the
+    # distinct unhealthy signal the dogfood incident's board missed. Disjoint
+    # from every branch above by construction (all require has_work or a dead
+    # signal) — observe-only, same posture as slow/drift/update-pending.
+    class="stalled"; cause="idle-stranded"
+    detail="${stranded} todo task(s) sitting ${_SUP_T_STRANDED_MIN}m+ untouched, no active work"
+  else
+    detail="idle"
+  fi
+  printf '%s\x1f%s\x1f%s\n' "$class" "$cause" "$detail"
 }
 
 # Detect + classify ONE agent -> one compact JSON record on stdout.
@@ -385,60 +469,21 @@ _sup_agent_record() {
   # --- signal: ID/age-verification challenge (DIVE-1127) — pane-scoped tripwire ---
   local verify_excerpt; verify_excerpt=$(_sup_verify_challenge "$type" "$user" "$sess" "$svc_running")
 
-  # --- CLASSIFY (design §4) — first matching rule wins, dead-signals first.
-  # Every "stuck" here is a DEFINITE reading; anything unknown/ambiguous falls
-  # through toward healthy. An intentionally-stopped agent (unit inactive, not
-  # failed, nothing assigned in flight) is "healthy (stopped)", NOT stuck —
-  # `5dive agent stop` is an operator choice, and the registry has no
-  # desired-state field to tell us otherwise.
-  local class="healthy" cause="" detail=""
-  # DIVE-1127: the verification-challenge tripwire wins FIRST — it is the highest
-  # priority signal (same-day alert obligation) and, when present, explains any
-  # concurrent stall (a challenge freezes the session). Alerting is the tick's job.
-  if [[ -n "$verify_excerpt" ]]; then
-    class="verify-challenge"; cause="id-verification"
-    detail="pane shows an ID/age-verification challenge"
-  # desiredState (P2, DIVE-857 prereq b): an operator's explicit stop/start
-  # beats inference. Recorded by `5dive agent stop|start`; absent on legacy
-  # agents => the P1 inference path below, unchanged.
-  elif [[ "$desired" == "stopped" ]] && (( ! svc_running )) && [[ "$active" != "failed" ]]; then
-    detail="stopped (desired)"
-  elif (( ! svc_running )); then
-    if [[ "$active" == "failed" ]] || (( has_work )) || [[ "$desired" == "running" ]]; then
-      class="stuck"; cause="service-dead"; detail="unit ${active:-unknown}${desired:+ (desired: $desired)}"
-    else
-      detail="stopped (no active work)"
-    fi
-  elif [[ "$tmux_state" == "dead" ]]; then
-    class="stuck"; cause="tmux-dead"; detail="unit active but tmux session '${sess}' gone"
-  elif [[ "$poller" == "dead" ]]; then
-    class="stuck"; cause="poller-dead"; detail="telegram poller process not running"
-  elif (( loop_stuck > 0 )); then
-    class="stuck"; cause="loop-stuck"; detail="${loop_stuck} running loop(s) self-flagged stuck"
-  elif (( has_work )) && (( act_age >= 0 )) && (( act_age >= _SUP_T_STUCK_MIN * 60 )); then
-    class="stuck"; cause="no-progress"; detail="active work, no transcript progress for $((act_age / 60))m"
-  elif [[ "$_SUP_CLI_STALE" == "true" ]]; then
-    # Box-level: the shared CLI is behind AND the nightly isn't catching up
-    # (the /tmp-clobber class) — every agent is executing old code. Requires a
-    # confirmed probe; "unknown" never lands here. This is an UPDATE-PENDING
-    # signal, NOT a wedged agent (DIVE-974): the agents are healthy, just one
-    # release behind, so it MUST NOT classify as stuck — the P2 act loop only
-    # touches class=="stuck", and a stale-cli tick right after every release cut
-    # would otherwise nudge/resume/rotate/escalate the entire healthy fleet.
-    class="update-pending"; cause="stale-cli"; detail="box CLI ${FIVE_VERSION} stale behind ${_SUP_CLI_LATEST}"
-  elif (( has_work )) && (( act_age >= 0 )) && (( act_age >= _SUP_T_SLOW_MIN * 60 )); then
-    class="slow"; detail="active work, no transcript progress for $((act_age / 60))m"
-  elif [[ -n "$goal_drift_task" ]]; then
-    # Disjoint from slow/stuck by construction (drift needs recent activity).
-    # Observe-only: the P2 act loop is gated on class=="stuck", so this never
-    # nudges/resumes/rotates — surfaced for the audit trail and board only.
-    class="drift"; cause="goal-drift"
-    detail="active /goal targets DIVE-${goal_drift_task} (still todo); agent progressing elsewhere"
-  elif (( has_work )); then
-    detail="active"
-  else
-    detail="idle"
-  fi
+  # --- signal: stranded todo (DIVE-1416 gap#3) — a todo task assigned to this
+  # agent, sitting untouched (never started) past the stranded window. Only
+  # matters when the agent has NO active work at all (_sup_classify only
+  # consults it in that branch), so it's cheap to always compute here.
+  local stranded; stranded=$(db "SELECT COUNT(*) FROM tasks
+               WHERE assignee=$(sqlq "$name") AND status='todo' AND kind='standard'
+                 AND created_at <= datetime('now','-${_SUP_T_STRANDED_MIN} minutes');" 2>/dev/null || echo 0)
+  [[ "$stranded" =~ ^[0-9]+$ ]] || stranded=0
+
+  # --- CLASSIFY (design §4) — see _sup_classify for the decision chain itself.
+  local class cause detail crow
+  crow=$(_sup_classify "$desired" "$svc_running" "$active" "$sess" "$tmux_state" "$poller" \
+                        "$loop_stuck" "$has_work" "$act_age" "$_SUP_CLI_STALE" "$goal_drift_task" \
+                        "$verify_excerpt" "$stranded")
+  IFS=$'\x1f' read -r class cause detail <<<"$crow"
 
   jq -cn \
     --arg name "$name" --arg type "$type" --arg channels "$channels" --arg unit "$unit" \
@@ -446,6 +491,7 @@ _sup_agent_record() {
     --arg tmux "$tmux_state" --arg poller "$poller" \
     --argjson loopStuck "$loop_stuck" --argjson runningLoops "$running_loops" \
     --argjson inProgress "$inprog" --argjson age "$act_age" --argjson uptime "$uptime" \
+    --argjson stranded "$stranded" \
     --arg goalDrift "$goal_drift_task" \
     --arg verifyExcerpt "$verify_excerpt" \
     --arg class "$class" --arg cause "$cause" --arg detail "$detail" \
@@ -453,6 +499,7 @@ _sup_agent_record() {
       signals:{service:$service, sub:$sub, uptimeSec:$uptime, tmux:$tmux, poller:$poller,
                loopStuck:$loopStuck, runningLoops:$runningLoops, inProgress:$inProgress,
                lastActivityAgeSec:(if $age < 0 then null else $age end),
+               strandedTodo:$stranded,
                goalDriftTask:(if $goalDrift == "" then null else ($goalDrift|tonumber) end),
                verifyChallenge:(if $verifyExcerpt == "" then null else $verifyExcerpt end)},
       classification:$class,
@@ -518,6 +565,7 @@ _sup_summary_line() {
     "\([.[] | select(.classification == "slow")]           | length) slow / " +
     "\([.[] | select(.classification == "drift")]          | length) drift / " +
     "\([.[] | select(.classification == "update-pending")] | length) update-pending / " +
+    "\([.[] | select(.classification == "stalled")]        | length) stalled / " +
     "\([.[] | select(.classification == "stuck")]          | length) stuck" +
     (if ([.[] | select(.classification == "verify-challenge")] | length) > 0
      then " · ⚠ \([.[] | select(.classification == "verify-challenge")] | length) VERIFY-CHALLENGE" else "" end) +

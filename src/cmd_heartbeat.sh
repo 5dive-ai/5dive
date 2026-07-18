@@ -65,6 +65,16 @@ _HB_GATE_ESCALATE_DAYS="${HEARTBEAT_GATE_ESCALATE_DAYS:-5}"
 _HB_GATE_SHIPPED_REPOS="${HEARTBEAT_GATE_SHIPPED_REPOS:-5dive-cli}"
 _HB_REPO_BASE="${HEARTBEAT_REPO_BASE:-/home/claude/projects/5dive}"
 _HB_GATE_SHIPPED_REF="${HEARTBEAT_GATE_SHIPPED_REF:-origin/main}"
+# DIVE-1416 fleet-stall self-heal (gaps #2/#3 — gap #1 is _hb_blocked_sweep
+# above). How long a maker->verifier delivery may sit unacknowledged
+# (handoff_delivered_at) before the stall sweep surfaces it (gap#2); how long
+# the fleet-idle-while-actionable-work-is-open condition must persist before
+# it alarms (gap#3 core, "K min" in the design). Both env-overridable, same
+# escape-hatch pattern as _HB_GATE_ESCALATE_DAYS.
+_HB_VERIFY_STALE_MIN="${HEARTBEAT_VERIFY_STALE_MIN:-60}"
+[[ "$_HB_VERIFY_STALE_MIN" =~ ^[0-9]+$ ]] || _HB_VERIFY_STALE_MIN=60
+_HB_STALL_MIN_MINUTES="${HEARTBEAT_STALL_MIN_MINUTES:-30}"
+[[ "$_HB_STALL_MIN_MINUTES" =~ ^[0-9]+$ ]] || _HB_STALL_MIN_MINUTES=30
 # Orphan reclaim. An in_progress task whose claiming claude session is GONE — the
 # agent's claude process started AFTER the task did (rotation, service restart,
 # crash, a context reset that exited the process) — is reclaimed to 'todo'
@@ -958,6 +968,150 @@ _hb_gate_shipped_sweep() {
   return 0
 }
 
+# DIVE-1416: fleet-stall self-heal, gaps #2 and #3 (gap #1 is _hb_blocked_sweep
+# above; DIVE-1415 extended it to every terminal close, not just done/cancel).
+# DOGFOOD INCIDENT 2026-07-17: the fleet sat ~100% idle ~3h while actionable
+# v0.10 work was stranded, and NOTHING self-corrected or alarmed — supervisor
+# read "15 healthy / 0 stuck" because "idle while work sits open" wasn't a
+# signal it modeled. Three isolated, independently-throttled passes, same
+# `|| _hb_log` isolation contract as every other tick sweep:
+#
+#  (a) GAP#2 — surface a stale maker->verifier delivery. `_task_route_to_verifier`
+#      re-queues the task as the verifier's own todo, which the verifier's
+#      heartbeat wake normally picks up — but when that doesn't happen (verifier
+#      not enrolled, its everyMin hasn't elapsed yet, wake skipped, wrong
+#      channel…) the delivered work sits invisible with no independent signal.
+#      Flag once per delivery (handoff_stale_pinged_at, reset on every fresh
+#      handoff by _task_route_to_verifier) once it's sat past
+#      _HB_VERIFY_STALE_MIN unacknowledged — ping BOTH the verifier (so they can
+#      act) and main (so a human-visible trail exists even if the verifier is
+#      itself unreachable).
+#
+#  (b) GAP#3 core — fleet-idle-while-actionable-work-is-open alarm. Zero agents
+#      in_progress AND zero running loops (fleet-wide "nobody is doing
+#      anything") while >=1 todo task sits assigned to someone, or >=1 human
+#      gate sits open, is EXACTLY the incident: dead air that reads as healthy.
+#      Tracks how long the condition has persisted in task_prefs
+#      (stall_first_seen_at) and only alarms once it's held for
+#      _HB_STALL_MIN_MINUTES (the "K min" in the design) — a single idle tick
+#      between tasks is normal, not a stall. Re-alarms every
+#      _HB_STALL_MIN_MINUTES while it persists (never silent), clears its
+#      tracking the moment the fleet is busy again or the backlog clears.
+#
+#  (c) GAP#3 canary — pinger liveness. DIVE-1434: the gate-ping TTL reminder
+#      batch (the T2 pass in _hb_gate_ttl_sweep above) silently stopped writing
+#      gate_pinged_at fleet-wide and nothing noticed for days. This check is
+#      DELIBERATELY independent of that pass's own code path — a canary that
+#      shares the suspect logic can go dark with it. It recomputes, from
+#      scratch, whether any gate is eligible for a ping right now (same
+#      staleness shape the reminder pass uses, given 30m grace past the 72h
+#      mark so a brand-new eligibility isn't a false trip) and compares against
+#      the fleet-wide MAX(gate_pinged_at). Eligible gates existing while no ping
+#      has landed in over an hour means the batch looks dead — alarm main,
+#      throttled to avoid re-alarming every tick while it stays broken.
+_hb_stall_sweep() {
+  # (a) GAP#2 — surface stale maker->verifier deliveries.
+  local vrow vid vident vfier vdelivered vmins
+  while IFS= read -r vrow; do
+    [[ -n "$vrow" ]] || continue
+    IFS=$'\x1f' read -r vid vident vfier vdelivered <<<"$vrow"
+    [[ -n "$vid" && -n "$vfier" ]] || continue
+    vmins=$(( ($(date -u +%s) - $(date -u -d "$vdelivered" +%s 2>/dev/null || date -u +%s)) / 60 ))
+    ( cmd_send "$vfier" --from="task-engine" \
+        --message="📥 ${vident} was delivered to you for review ${vmins}m ago and is still unacknowledged — run \`5dive task start ${vident}\` then \`task done\`/\`task reject\` so it doesn't rot in your queue." ) >/dev/null 2>&1 || true
+    ( cmd_send "main" --from="task-engine" \
+        --message="📥 Delivered-awaiting-verifier: ${vident} handed to '${vfier}' ${vmins}m ago, still unacknowledged — surfaced so it never sits invisible (DIVE-1416 gap#2)." ) >/dev/null 2>&1 || true
+    db "UPDATE tasks SET handoff_stale_pinged_at=datetime('now') WHERE id=${vid};"
+    _hb_log "[stall-sweep] ${vident} delivered->${vfier} unacked ${vmins}m -> surfaced"
+  done < <(db "SELECT id||x'1f'||COALESCE(ident,'DIVE-'||id)||x'1f'||verifier||x'1f'||handoff_delivered_at
+               FROM tasks
+               WHERE verifier IS NOT NULL AND maker_agent IS NOT NULL
+                 AND assignee=verifier AND status NOT IN ('done','cancelled')
+                 AND handoff_ack_at IS NULL AND handoff_stale_pinged_at IS NULL
+                 AND handoff_delivered_at IS NOT NULL
+                 AND handoff_delivered_at <= datetime('now','-${_HB_VERIFY_STALE_MIN} minutes');")
+
+  # (b) GAP#3 core — fleet-idle-while-actionable-work-is-open, persisting.
+  local in_prog running_loops stranded_todo open_gates total_stranded
+  in_prog=$(db "SELECT COUNT(*) FROM tasks WHERE status='in_progress' AND kind='standard';" 2>/dev/null || echo 0)
+  running_loops=$(db "SELECT COUNT(*) FROM loop_runs WHERE status='running';" 2>/dev/null || echo 0)
+  [[ "$in_prog" =~ ^[0-9]+$ ]] || in_prog=0
+  [[ "$running_loops" =~ ^[0-9]+$ ]] || running_loops=0
+
+  total_stranded=0
+  if (( in_prog == 0 && running_loops == 0 )); then
+    stranded_todo=$(db "SELECT COUNT(*) FROM tasks
+                        WHERE status='todo' AND kind='standard'
+                          AND assignee IS NOT NULL AND assignee != '';" 2>/dev/null || echo 0)
+    open_gates=$(db "SELECT COUNT(*) FROM tasks
+                     WHERE need_type IS NOT NULL AND need_answered_at IS NULL
+                       AND status NOT IN ('done','cancelled');" 2>/dev/null || echo 0)
+    [[ "$stranded_todo" =~ ^[0-9]+$ ]] || stranded_todo=0
+    [[ "$open_gates"    =~ ^[0-9]+$ ]] || open_gates=0
+    total_stranded=$(( stranded_todo + open_gates ))
+  fi
+
+  if (( total_stranded > 0 )); then
+    local first_seen; first_seen=$(db "SELECT value FROM task_prefs WHERE key='stall_first_seen_at';" 2>/dev/null)
+    if [[ -z "$first_seen" ]]; then
+      db "INSERT INTO task_prefs (key,value) VALUES ('stall_first_seen_at', datetime('now'))
+          ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=datetime('now');"
+      first_seen=$(date -u '+%Y-%m-%d %H:%M:%S')
+    fi
+    local since_secs; since_secs=$(( $(date -u +%s) - $(date -u -d "$first_seen" +%s 2>/dev/null || date -u +%s) ))
+    if (( since_secs >= _HB_STALL_MIN_MINUTES * 60 )); then
+      local last_alert cutoff
+      last_alert=$(db "SELECT value FROM task_prefs WHERE key='stall_alerted_at';" 2>/dev/null)
+      cutoff=$(date -u -d "${_HB_STALL_MIN_MINUTES} minutes ago" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo "")
+      if [[ -z "$last_alert" || ( -n "$cutoff" && "$last_alert" < "$cutoff" ) ]]; then
+        ( cmd_send "main" --from="task-engine" \
+            --message="🛑 fleet-stall: 0 agents in_progress, 0 running loops, but ${total_stranded} stranded actionable item(s) (${stranded_todo} unclaimed todo, ${open_gates} open gate(s)) have sat idle $((since_secs / 60))m+ — nothing is self-correcting. Check \`5dive task ls\` / \`5dive task inbox\` (DIVE-1416 gap#3)." ) >/dev/null 2>&1 || true
+        db "INSERT INTO task_prefs (key,value) VALUES ('stall_alerted_at', datetime('now'))
+            ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=datetime('now');"
+        _hb_log "[stall-sweep] fleet-idle $((since_secs / 60))m with ${total_stranded} stranded item(s) -> alarmed main"
+      fi
+    fi
+  else
+    db "DELETE FROM task_prefs WHERE key='stall_first_seen_at';"
+  fi
+
+  # (c) GAP#3 canary — pinger liveness (DIVE-1434 class). Independent of
+  # _hb_gate_ttl_sweep's own predicate/throttle — a canary sharing the suspect
+  # code can go dark with it.
+  local eligible; eligible=$(db "SELECT COUNT(*) FROM tasks
+               WHERE need_type IS NOT NULL AND need_answered_at IS NULL
+                 AND (tier IS NULL OR tier=2 OR (tier=1 AND recommend IS NULL))
+                 AND COALESCE(need_asked_at, updated_at) <= datetime('now','-72 hours','-30 minutes')
+                 AND (gate_pinged_at IS NULL OR gate_pinged_at <= datetime('now','-7 days'))
+                 AND status NOT IN ('done','cancelled');" 2>/dev/null || echo 0)
+  [[ "$eligible" =~ ^[0-9]+$ ]] || eligible=0
+  if (( eligible == 0 )); then
+    db "DELETE FROM task_prefs WHERE key='pinger_canary_alerted_at';"
+  else
+    local last_ping stale=0
+    last_ping=$(db "SELECT MAX(gate_pinged_at) FROM tasks WHERE gate_pinged_at IS NOT NULL;" 2>/dev/null)
+    if [[ -z "$last_ping" ]]; then
+      stale=1
+    else
+      local last_epoch; last_epoch=$(date -u -d "$last_ping" +%s 2>/dev/null || echo 0)
+      (( $(date -u +%s) - last_epoch >= 3600 )) && stale=1
+    fi
+    if (( stale )); then
+      local last_alert cutoff
+      last_alert=$(db "SELECT value FROM task_prefs WHERE key='pinger_canary_alerted_at';" 2>/dev/null)
+      cutoff=$(date -u -d '6 hours ago' '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo "")
+      if [[ -z "$last_alert" || ( -n "$cutoff" && "$last_alert" < "$cutoff" ) ]]; then
+        ( cmd_send "main" --from="task-engine" \
+            --message="🚨 pinger-liveness canary tripped: ${eligible} human gate(s) are past their reminder window (72h+ unanswered, unpinged 7d+) but gate_pinged_at hasn't advanced fleet-wide in over an hour — the gate-ping batch looks dead (DIVE-1434 regression class). Check /var/log/5dive-heartbeat.log for batch errors." ) >/dev/null 2>&1 || true
+        db "INSERT INTO task_prefs (key,value) VALUES ('pinger_canary_alerted_at', datetime('now'))
+            ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=datetime('now');"
+        _hb_log "[pinger-canary] TRIPPED — ${eligible} eligible gate(s), last gate_pinged_at ${last_ping:-never}"
+      fi
+    fi
+  fi
+  return 0
+}
+
 # DIVE-972: loop token-ceiling enforcement sweep. The --wait poll only policed a
 # ceiling while a caller was synchronously waiting; a fire-and-forget loop (no
 # --wait, the common case) had NOTHING re-reading its spend, so its ceiling was
@@ -1052,6 +1206,12 @@ cmd_heartbeat_tick() {
   # DIVE-1140: flag open gates whose fix already merged so the overnight recap
   # stops surfacing ghost gates. Flag-only, never auto-closes. Same isolation.
   _hb_gate_shipped_sweep || _hb_log "[gate-shipped] pass errored (non-fatal)"
+  # DIVE-1416: fleet-stall self-heal gaps #2/#3 — surface stale maker->verifier
+  # deliveries, alarm on fleet-idle-while-actionable-work-is-open persisting past
+  # its threshold, and a pinger-liveness canary for the DIVE-1434 dead-batch
+  # class. Same isolation contract — a failure here must never abort the wake
+  # loop, and must never itself go silent the way the incident it targets did.
+  _hb_stall_sweep || _hb_log "[stall-sweep] pass errored (non-fatal)"
   # DIVE-972: enforce per-loop token ceilings for async (non --wait) loops. Same
   # isolation contract — a failure here must never abort the wake loop.
   _hb_loop_ceiling_sweep || _hb_log "[loop-ceiling] pass errored (non-fatal)"

@@ -201,6 +201,17 @@ CREATE TABLE IF NOT EXISTS tasks (
   -- The public handoff state is derived as delivered|reviewing so we do not grow
   -- a second task-status FSM or let a sender claim that review has begun.
   handoff_ack_at      TEXT,
+  -- DIVE-1416 (gap#2): handoff_delivered_at stamps the moment a maker's `task
+  -- done` routes the task to its verifier (_task_route_to_verifier) — a
+  -- dedicated clock, unlike updated_at, which any row touch bumps and so can't
+  -- measure "how long has this sat unacknowledged". Reset on every fresh
+  -- handoff (including a re-delivery after a reject/bounce-back cycle).
+  -- handoff_stale_pinged_at throttles the stall sweep's surface-ping to once
+  -- per delivery (shipped_flag_at pattern): stamped when the sweep flags a
+  -- delivery that's sat past its staleness window, cleared on the next fresh
+  -- handoff so a redelivered task gets a clean chance to alert again.
+  handoff_delivered_at    TEXT,
+  handoff_stale_pinged_at TEXT,
   -- DIVE-891: risk-tiered gates (adopted design DIVE-861). tier is set when the
   -- gate is filed: 0 = auto-clear (rec applies immediately, digest line only),
   -- 1 = agent-clearable + 48h TTL auto-applies the recommendation, 2 = hard
@@ -549,6 +560,7 @@ _tasks_db_migrate() {
            "project_key TEXT NOT NULL DEFAULT 'dive'" 'issue_number INTEGER' \
            'acceptance_criteria TEXT' 'verify_command TEXT' 'max_iterations INTEGER' 'verifier TEXT' \
            'iteration INTEGER' 'maker_agent TEXT' 'handoff_ack_at TEXT' 'task_budget TEXT' \
+           'handoff_delivered_at TEXT' 'handoff_stale_pinged_at TEXT' \
            'tier INTEGER' 'need_asked_at TEXT' 'gate_pinged_at TEXT' 'wake_at TEXT' \
            'secret_key TEXT' 'connector TEXT' 'human_nonce_hash TEXT' \
            'ask_shape TEXT' 'precedent_ref INTEGER' 'precedent_kind TEXT' \

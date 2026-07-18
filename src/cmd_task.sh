@@ -789,11 +789,17 @@ _task_route_to_verifier() {
   local id="$1" vfier="$2" maker="$3" result="$4" want_result="$5"
   local set_result=""
   (( want_result )) && set_result=", result=$(sqlq_or_null "$result")"
+  # DIVE-1416 (gap#2): stamp handoff_delivered_at fresh on EVERY delivery (incl.
+  # a re-delivery after a reject/bounce-back) — the dedicated clock the stall
+  # sweep uses to detect a delivery sitting unacknowledged too long. Clear any
+  # prior stale-ping flag so a redelivered task gets a clean shot at surfacing
+  # again if it goes stale a second time.
   db "UPDATE tasks
         SET status='todo', assignee=$(sqlq "$vfier"),
             maker_agent=COALESCE(maker_agent, $(sqlq_or_null "$maker")),
             iteration=COALESCE(iteration,0)+1,
-            started_at=NULL, handoff_ack_at=NULL${set_result}
+            started_at=NULL, handoff_ack_at=NULL,
+            handoff_delivered_at=datetime('now'), handoff_stale_pinged_at=NULL${set_result}
       WHERE id=${id};"
   local iter; iter=$(db "SELECT iteration FROM tasks WHERE id=${id};")
   local ident; ident=$(ident_of "$id")
