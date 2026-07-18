@@ -80,7 +80,13 @@ Then place the two files it expects (both root-owned, mode 600):
   GITHUB_APP_ID=<your App ID>
   GITHUB_APP_INSTALLATION_ID=<your Installation ID>
   GITHUB_APP_PRIVATE_KEY_FILE=/etc/5dive/connectors/github-app.pem
+  # Optional — enforce a commit author on every pushed commit. Set it if your git
+  # host enforces a committer identity (e.g. a Vercel author gate); leave blank
+  # for no restriction. Format: 'Name <email>'.
+  GITHUB_APP_COMMIT_AUTHOR=
   ```
+  `sudo 5dive push setup` also prompts for this committer (or pass
+  `--author='Name <email>'`) and writes it here for you.
 
 Re-run `sudo 5dive push setup` — it should now report **Ready**. No secret is
 ever passed on the command line; you paste the `.pem` and edit the `.env` by
@@ -144,11 +150,12 @@ instead of `--branch`. Point at a different repo with `--repo=https://github.com
 | `no gate on <task>` | File and clear a ship gate first: `5dive task need <task> --type=approval --ask=...`, then a human answers it. |
 | `gate … is OPEN` | The gate hasn't been answered yet. |
 | `gate … was REJECTED` | The human answered no. Push stays refused. |
-| `author check FAILED` | A commit isn't authored by your configured author. Re-author with `git rebase --exec 'git commit --amend --author="Name <email>" --no-edit'`. |
+| `author check FAILED` | A commit isn't authored by the configured `GITHUB_APP_COMMIT_AUTHOR`. Re-author with `git rebase --exec 'git commit --amend --author="Name <email>" --no-edit'`, or clear the setting to drop the restriction. |
 | `missing GitHub App credential` | `github-app.env`/`.pem` absent or unreadable. Re-run `sudo 5dive push setup`. |
 | `NOPASSWD grant for '_push_do' is missing` | Standard agent lacks the sudoers line (step 4). |
 | `refusing to push to protected branch` | Target a feature branch, not `main`/`master`. |
 
-> The default author enforced is the one this deployment is configured for
-> (`lodar <markounik@gmail.com>` in the reference build). Self-hosters wiring
-> their own provider team-check should set it to match their own committer.
+> The author check is config-only: it enforces `GITHUB_APP_COMMIT_AUTHOR` from
+> `github-app.env` and is skipped entirely when that is unset. No committer
+> identity is baked into the source — set it to your own committer if your git
+> host runs an author gate, otherwise leave it blank.
