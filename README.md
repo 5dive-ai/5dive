@@ -107,8 +107,8 @@ No broker, no protocol, no orchestrator. Shared filesystem, shared CLI.
 | `codex`       | OpenAI Codex           | OAuth / API key | Telegram |
 | `antigravity` | Google Antigravity     | Google OAuth | Telegram |
 | `grok`        | xAI Grok               | OAuth (xAI) / API key | Telegram |
-| `hermes`      | third-party multi-provider harness | OAuth (OpenAI) / API key | Telegram, Discord |
-| `openclaw`    | third-party multi-provider harness | OAuth (OpenAI) / API key | Telegram, Discord |
+| `hermes`      | third-party multi-provider harness | API key | Telegram, Discord |
+| `openclaw`    | third-party multi-provider harness | API key | Telegram, Discord |
 | `opencode`    | OpenCode               | API key | Telegram |
 | `pi`          | third-party multi-provider harness | API key / `--provider` | Telegram |
 

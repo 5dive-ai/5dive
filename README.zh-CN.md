@@ -125,8 +125,8 @@ sudo 5dive agent pair   my-agent --code=<pairing-code>
 | `codex`       | OpenAI Codex           | OAuth / API key | Telegram |
 | `antigravity` | Google Antigravity     | Google OAuth | Telegram |
 | `grok`        | xAI Grok               | OAuth (xAI) / API key | Telegram |
-| `hermes`      | 第三方多模型 provider 框架 | OAuth (OpenAI) / API key | Telegram、Discord |
-| `openclaw`    | 第三方多模型 provider 框架 | OAuth (OpenAI) / API key | Telegram、Discord |
+| `hermes`      | 第三方多模型 provider 框架 | API key | Telegram、Discord |
+| `openclaw`    | 第三方多模型 provider 框架 | API key | Telegram、Discord |
 | `opencode`    | OpenCode               | API key | Telegram |
 | `pi`          | 第三方多模型 provider 框架 | API key / `--provider` | Telegram |
 
