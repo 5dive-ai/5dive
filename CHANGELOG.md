@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.10.4 — company-view fields on objective ls (2026-07-18)
+
+- feat(objective): `objective ls --json` now carries the company-view fields the dashboard reads: `planner`, `review` (re-plan cadence cron), `max_new_per_cycle`, and `verified_total` — originated tasks a distinct verifier accepted across all cycles, the same integrity predicate as `objective status` (DIVE-1441), never the planner's self-report (DIVE-1452).
+
 ## 0.10.3 — park can't destroy an open gate (2026-07-18)
 
 - fix(task): `task park` now REFUSES to park a task that has an open, unanswered human gate. Park and a gate share `status='blocked'` plus the `need_*` columns, so park's UPDATE was NULLing a live gate's fields — silently destroying it (no answer, no audit row), after which the heartbeat wake unparked it to `todo` as if a human had cleared it. The task is already blocked on the human, so no park is needed; resolve the gate first, then park (DIVE-1453). Regression harness: `tests/task_park_gate_guard_unit.sh`.
