@@ -989,8 +989,13 @@ _hb_gate_shipped_sweep() {
 #
 #  (b) GAP#3 core — fleet-idle-while-actionable-work-is-open alarm. Zero agents
 #      in_progress AND zero running loops (fleet-wide "nobody is doing
-#      anything") while >=1 todo task sits assigned to someone, or >=1 human
-#      gate sits open, is EXACTLY the incident: dead air that reads as healthy.
+#      anything") while >=1 todo task sits assigned to someone, or >=1
+#      fleet-actionable human gate sits open, is EXACTLY the incident: dead air
+#      that reads as healthy. A gate only counts here if it's tier<=1 (an agent
+#      can clear it — genuinely stranded) or never surfaced to the human at all
+#      — a PINGED tier-2 gate awaiting the human overnight is legitimately
+#      idle, not stranded, and must not re-alarm every cycle (that's the
+#      idle-night alert-fatigue class this design already killed once).
 #      Tracks how long the condition has persisted in task_prefs
 #      (stall_first_seen_at) and only alarms once it's held for
 #      _HB_STALL_MIN_MINUTES (the "K min" in the design) — a single idle tick
@@ -1043,9 +1048,19 @@ _hb_stall_sweep() {
     stranded_todo=$(db "SELECT COUNT(*) FROM tasks
                         WHERE status='todo' AND kind='standard'
                           AND assignee IS NOT NULL AND assignee != '';" 2>/dev/null || echo 0)
+    # A gate is STRANDED-actionable (counts toward the alarm) only when it's
+    # fleet-actionable (tier<=1, an agent can clear it) OR it has never been
+    # surfaced to the human at all (need_asked_at AND gate_pinged_at both
+    # NULL — a legacy/malformed row, since a normally-filed gate always stamps
+    # need_asked_at at file time). A pinged tier-2 gate genuinely awaiting the
+    # human (e.g. overnight) is PARKED, not stranded — main flagged that
+    # counting it here re-alarms every _HB_STALL_MIN_MINUTES on a legitimately
+    # idle night, exactly the alert-fatigue class already killed once.
     open_gates=$(db "SELECT COUNT(*) FROM tasks
                      WHERE need_type IS NOT NULL AND need_answered_at IS NULL
-                       AND status NOT IN ('done','cancelled');" 2>/dev/null || echo 0)
+                       AND status NOT IN ('done','cancelled')
+                       AND (COALESCE(tier,2) <= 1
+                            OR (need_asked_at IS NULL AND gate_pinged_at IS NULL));" 2>/dev/null || echo 0)
     [[ "$stranded_todo" =~ ^[0-9]+$ ]] || stranded_todo=0
     [[ "$open_gates"    =~ ^[0-9]+$ ]] || open_gates=0
     total_stranded=$(( stranded_todo + open_gates ))

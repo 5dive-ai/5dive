@@ -154,14 +154,56 @@ _hb_stall_sweep >/dev/null 2>&1
 [[ -z "$(db "SELECT value FROM task_prefs WHERE key='stall_first_seen_at';")" ]] \
   && ok_t "stall clears once fleet is busy again" || bad_t "clock not cleared" ""
 
-# --- B6: open human gate (not just a stranded todo) also counts as stranded work
+# --- B6: open FLEET-ACTIONABLE gate (decision defaults tier=1) also counts as
+#     stranded work, same as an unclaimed todo
 reset_all
 gate_task=$(addt --assignee=bob -- "needs a call")
 ( cmd_task_need "$gate_task" --type=decision --options="X|Y" --ask="pick" ) >/dev/null 2>&1
 _hb_stall_sweep >/dev/null 2>&1
 [[ -n "$(db "SELECT value FROM task_prefs WHERE key='stall_first_seen_at';")" ]] \
-  && ok_t "an open human gate alone starts the stall clock" \
+  && ok_t "an open tier<=1 (fleet-actionable) gate alone starts the stall clock" \
   || bad_t "gate not counted as stranded" ""
+
+# --- B7 GUARDRAIL: a PINGED tier-2 gate genuinely awaiting the human (e.g.
+#     overnight) is PARKED, not stranded — must NOT start the stall clock, or
+#     an idle night re-alarms main every _HB_STALL_MIN_MINUTES for no reason
+#     (the alert-fatigue class this design already killed once).
+reset_all
+g=$(addt --assignee=dev -- "human's court")
+db "UPDATE tasks SET status='blocked', need_type='approval', tier=2,
+       need_asked_at=datetime('now','-2 days'), gate_pinged_at=datetime('now','-1 days')
+     WHERE id=${g};"
+_hb_stall_sweep >/dev/null 2>&1
+[[ -z "$(db "SELECT value FROM task_prefs WHERE key='stall_first_seen_at';")" ]] \
+  && ok_t "idle fleet + a PINGED tier-2 gate only -> no stall clock (parked, not stranded)" \
+  || bad_t "pinged tier-2 gate wrongly counted as stranded" ""
+
+# --- B8: an UNpinged-but-already-asked tier-2 gate is also not stranded — the
+#     initial notify already reached the human at file time (a separate
+#     transport from the reminder batch); need_asked_at being set is what
+#     distinguishes it from a truly-never-surfaced row.
+reset_all
+g=$(addt --assignee=dev -- "human's court, not yet reminder-due")
+db "UPDATE tasks SET status='blocked', need_type='approval', tier=2,
+       need_asked_at=datetime('now','-2 days'), gate_pinged_at=NULL
+     WHERE id=${g};"
+_hb_stall_sweep >/dev/null 2>&1
+[[ -z "$(db "SELECT value FROM task_prefs WHERE key='stall_first_seen_at';")" ]] \
+  && ok_t "idle fleet + an asked-but-unpinged tier-2 gate -> still no stall clock" \
+  || bad_t "asked tier-2 gate wrongly counted as stranded" ""
+
+# --- B9: a tier-2 gate that was NEVER surfaced at all (need_asked_at AND
+#     gate_pinged_at both NULL — a legacy/malformed row) DOES count: nobody
+#     was ever told, so it's genuinely stranded, not parked.
+reset_all
+g=$(addt --assignee=dev -- "legacy gate, never surfaced")
+db "UPDATE tasks SET status='blocked', need_type='approval', tier=2,
+       need_asked_at=NULL, gate_pinged_at=NULL
+     WHERE id=${g};"
+_hb_stall_sweep >/dev/null 2>&1
+[[ -n "$(db "SELECT value FROM task_prefs WHERE key='stall_first_seen_at';")" ]] \
+  && ok_t "a never-surfaced tier-2 gate (no need_asked_at, no gate_pinged_at) counts as stranded" \
+  || bad_t "never-surfaced gate not counted" ""
 
 # =============================================================================
 # (c) gap#3 canary — pinger liveness
