@@ -2,6 +2,7 @@
 
 ## 0.10.1 — objective status truth surface (2026-07-18)
 
+- fix(task): a T2-floor-refused ROUTED approval/manual gate now ESCALATES to the human with a tap button (fresh nonce, lead un-routed, ping re-armed) instead of dead-ending between an un-clearable lead and a button-less human — the DIVE-1429 stall class (DIVE-1437).
 - fix(objective): `objective status` now reports `verified_total` (cumulative distinct-verifier-accepted originated closes) alongside per-cycle `verified_this_cycle`, so a steady cycle honestly reads 0-this-cycle without hiding prior real progress. The per-cycle field keeps its anti-Goodhart reset (DIVE-1441).
 
 ## 0.10.0 — self-steering company loops (2026-07-18)
