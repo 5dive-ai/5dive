@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.10.3 — park can't destroy an open gate (2026-07-18)
+
+- fix(task): `task park` now REFUSES to park a task that has an open, unanswered human gate. Park and a gate share `status='blocked'` plus the `need_*` columns, so park's UPDATE was NULLing a live gate's fields — silently destroying it (no answer, no audit row), after which the heartbeat wake unparked it to `todo` as if a human had cleared it. The task is already blocked on the human, so no park is needed; resolve the gate first, then park (DIVE-1453). Regression harness: `tests/task_park_gate_guard_unit.sh`.
+
 ## 0.10.2 — company onboarding wizard (2026-07-18)
 
 - feat(company): `5dive company` — an onboarding wizard that stands up a self-steering company in a few guided steps: a project namespace, one objective (the number you steer, bound to a read-only metric), a planner, and a re-plan cadence, with an optional first goal. Pure sugar shipped LAST per the v0.10 plan: a thin macro over `project add` + `objective add` + `goal add` (no new state or engine). Run it bare for the prompt-driven wizard, or pass flags + `--yes` for a scripted stand-up (OSS-34).
