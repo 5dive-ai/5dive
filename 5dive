@@ -26,7 +26,7 @@ esac
 
 # Bumped on every public release. `build.sh` checks this line exists; CI fails
 # the bundle-drift check if it's missing or empty.
-readonly FIVE_VERSION="0.10.0"
+readonly FIVE_VERSION="0.10.1"
 
 # GitHub org our repos live under. The org is being renamed
 # 5dive-com -> 5dive-ai (2026-06); fetches must work on either side of the
@@ -20413,9 +20413,14 @@ cmd_objective_status() {
   # --- (6) verified outcomes THIS cycle: originated + this cycle + verifier-accepted (done) ---
   # done => a DISTINCT verifier accepted (existing maker/verifier loop). This is
   # the integrity-critical field — never the planner cycle's self-reported outcome.
-  local verified originated_open
+  # verified_this_cycle RESETS each cycle (anti-Goodhart: a steady cycle honestly
+  # reads 0); verified_total is the cumulative lifetime tally so a steady cycle is
+  # never a silent blank about prior real progress (DIVE-1441).
+  local verified verified_total originated_open
   verified=$(db "SELECT COUNT(*) FROM tasks
                  WHERE originated_by_objective=$obj_id AND originated_cycle=$cyc AND status='done';")
+  verified_total=$(db "SELECT COUNT(*) FROM tasks
+                 WHERE originated_by_objective=$obj_id AND status='done';")
   originated_open=$(db "SELECT COUNT(*) FROM tasks
                  WHERE originated_by_objective=$obj_id AND status NOT IN ('done','cancelled');")
 
@@ -20454,7 +20459,7 @@ cmd_objective_status() {
       --arg cur "$cur" --arg target "$o_target" --arg gap "$gap" --arg trend "$trend" \
       --argjson cyc "${cyc:-0}" --arg cyc_outcome "$cyc_outcome" \
       --argjson roles "$roles_json" \
-      --argjson verified "${verified:-0}" --argjson open "${originated_open:-0}" \
+      --argjson verified "${verified:-0}" --argjson verified_total "${verified_total:-0}" --argjson open "${originated_open:-0}" \
       --argjson spent "${spent:-0}" --arg budget "$o_budget" --argjson ceiling "$OBJ_CEILING_DEFAULT" \
       --arg next_gate "$next_gate" --arg stop_reason "$stop_reason" \
       '{ok:true, data:{objective:$name, status:$status, mode:$mode,
@@ -20463,7 +20468,7 @@ cmd_objective_status() {
         gap:(if $gap=="" then null else ($gap|tonumber) end), trend:$trend,
         planner:(if $planner=="" then null else $planner end),
         active_roles:$roles, cycle:$cyc, cycle_outcome:(if $cyc_outcome=="" then null else $cyc_outcome end),
-        verified_this_cycle:$verified, originated_open:$open,
+        verified_this_cycle:$verified, verified_total:$verified_total, originated_open:$open,
         spend:$spent, budget:(if $budget=="" then null else ($budget|tonumber) end),
         ceiling_per_cycle:$ceiling,
         next_gate:(if $next_gate=="none" then null else $next_gate end),
@@ -20488,7 +20493,7 @@ cmd_objective_status() {
     "$g_disp" "$( [[ -n "$gap" ]] && printf '%s' "$o_unit")"
   printf 'cycle:     #%s   outcome: %s\n' "${cyc:-0}" "${cyc_outcome:-—}"
   printf 'roles:     %s%s\n' "$roles_line" "$( [[ -n "$o_planner" ]] && printf '   (planner: %s)' "$o_planner")"
-  printf 'verified this cycle: %s   (originated open: %s)\n' "${verified:-0}" "${originated_open:-0}"
+  printf 'verified this cycle: %s   (total: %s, originated open: %s)\n' "${verified:-0}" "${verified_total:-0}" "${originated_open:-0}"
   printf 'spend:     %s / %s tok   (ceiling %s/cycle)\n' "${spent:-0}" "$spend_of" "$OBJ_CEILING_DEFAULT"
   printf 'next gate: %s\n' "$gate_line"
 }

@@ -83,6 +83,11 @@ printf '%s' "$out" | jq -e '.data.cycle==2 and .data.cycle_outcome=="gated"' >/d
 printf '%s' "$out" | jq -e '.data.verified_this_cycle==1' >/dev/null \
   && ok_t "field 6: verified THIS cycle only (prior-cycle done excluded)" || bad_t "verified this cycle" "$out"
 
+# verified_total = cumulative done originated across ALL cycles (CONV-1 cycle2 + CONV-8 cycle1),
+# so a steady cycle never hides prior real progress while verified_this_cycle stays per-cycle (DIVE-1441).
+printf '%s' "$out" | jq -e '.data.verified_total==2' >/dev/null \
+  && ok_t "field 6b: verified_total = cumulative done originated (includes prior cycle)" || bad_t "verified total" "$out"
+
 printf '%s' "$out" | jq -e '.data.originated_open==2' >/dev/null \
   && ok_t "originated_open counts only non-terminal originated tasks" || bad_t "originated_open" "$out"
 

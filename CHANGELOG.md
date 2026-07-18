@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.10.1 — objective status truth surface (2026-07-18)
+
+- fix(objective): `objective status` now reports `verified_total` (cumulative distinct-verifier-accepted originated closes) alongside per-cycle `verified_this_cycle`, so a steady cycle honestly reads 0-this-cycle without hiding prior real progress. The per-cycle field keeps its anti-Goodhart reset (DIVE-1441).
+
 ## 0.10.0 — self-steering company loops (2026-07-18)
 
 The fleet now steers itself against a real business metric: objectives with measured readings (the planner never runs the metric), schema-validated plan diffs, distinct-verifier acceptance, explicit preflight + stop-conditions (never a silent stall), one read-only status surface, and human gates on the phone. Tag was gated on dogfooding this end-to-end against our own funnel metric: a live planner cycle originated real published work, and a founder test signup proved attribution live while the metric refused to count it — the company cannot fake its own progress (OSS-31, OSS-35).
