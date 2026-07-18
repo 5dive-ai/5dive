@@ -1,5 +1,5 @@
 <p align="center">
-  <a href="https://5dive.ai?utm_source=github&utm_medium=referral&utm_campaign=5dive-readme">
+  <a href="https://5dive.ai?utm_source=github&utm_medium=owned&utm_campaign=5dive-readme">
     <picture>
       <source media="(prefers-color-scheme: dark)" srcset="docs/readme-hero-dark.png">
       <img src="docs/readme-hero-light.png" alt="5dive" width="240">
@@ -30,8 +30,8 @@
   <a href="docs/zero-human.md">Zero-human proof</a> ·
   <a href="#for-your-ai-agent">Use from your AI agent</a> ·
   <a href="#security--isolation">Security</a> ·
-  <a href="https://5dive.ai/docs/5dive-cli?utm_source=github&utm_medium=referral&utm_campaign=5dive-readme">Full CLI docs</a> ·
-  <a href="https://5dive.ai?utm_source=github&utm_medium=referral&utm_campaign=5dive-readme">Managed VM</a>
+  <a href="https://5dive.ai/docs/5dive-cli?utm_source=github&utm_medium=owned&utm_campaign=5dive-readme">Full CLI docs</a> ·
+  <a href="https://5dive.ai/sign-up?utm_source=github&utm_medium=owned&utm_campaign=5dive-readme">Managed VM</a>
 </p>
 
 **A company of AI agents, and the orchestrator is just bash.** No framework, no protocol, no broker: each agent is its own Linux user running an official coding CLI (claude, codex, a few others) as a systemd service, coordinating through one bash CLI they all call. Isolation is unix users, supervision is systemd, logs are journald. **I used the OS instead of building a platform.**
@@ -40,7 +40,7 @@ They take work off a shared SQLite task queue, hand it to each other while you s
 
 ![install to a Claude agent answering on Telegram](docs/quickstart.gif)
 
-> **We run our own company on this.** The agents that build 5dive.ai cut this repo's releases, and only ask a human when they're stuck. The badge up top is that claim, measured: releases shipped versus decisions escalated to a human, over the last 7 days, republished daily. Full numbers and limits in [docs/zero-human.md](docs/zero-human.md). Same binary you're installing. MIT, no open-core. Run it yourself, or skip the ops with the [managed VM](https://5dive.ai?utm_source=github&utm_medium=referral&utm_campaign=5dive-readme).
+> **We run our own company on this.** The agents that build 5dive.ai cut this repo's releases, and only ask a human when they're stuck. The badge up top is that claim, measured: releases shipped versus decisions escalated to a human, over the last 7 days, republished daily. Full numbers and limits in [docs/zero-human.md](docs/zero-human.md). Same binary you're installing. MIT, no open-core. Run it yourself, or skip the ops with the [managed VM](https://5dive.ai?utm_source=github&utm_medium=owned&utm_campaign=5dive-readme).
 
 **Run your whole company in plain English** — from the AI agent you already have. Add the [`5dive-cli` skill](#for-your-ai-agent): create agents, assign work, read the org chart. [One-line setup ↓](#for-your-ai-agent)
 
@@ -115,7 +115,7 @@ No broker, no protocol, no orchestrator. Shared filesystem, shared CLI.
 <details>
 <summary><b>About <code>hermes</code> / <code>openclaw</code> (third-party multi-provider harnesses)</b></summary>
 
-`hermes` and `openclaw` are community-built harnesses that can route to many providers (OpenRouter, Anthropic, Google, Moonshot, DeepSeek, Z.ai, etc.). As of April 4, 2026, Anthropic no longer permits routing consumer Claude Pro/Max OAuth through third-party harnesses. For that work, use the official `claude` type with your own API key. Background: [We Ditched OpenClaw for Claude →](https://blog.5dive.ai/blog/we-ditched-openclaw-for-claude/?utm_source=github&utm_medium=referral&utm_campaign=5dive-readme).
+`hermes` and `openclaw` are community-built harnesses that can route to many providers (OpenRouter, Anthropic, Google, Moonshot, DeepSeek, Z.ai, etc.). As of April 4, 2026, Anthropic no longer permits routing consumer Claude Pro/Max OAuth through third-party harnesses. For that work, use the official `claude` type with your own API key. Background: [We Ditched OpenClaw for Claude →](https://blog.5dive.ai/blog/we-ditched-openclaw-for-claude/?utm_source=github&utm_medium=owned&utm_campaign=5dive-readme).
 
 </details>
 
@@ -176,7 +176,7 @@ Each agent is one Linux user under one of three isolation tiers:
 sudo 5dive agent create my-agent --type=claude --isolation=sandboxed
 ```
 
-**No middlemen.** 5dive runs on your server. Auth tokens go to model providers directly, never to us. No telemetry, no error reporting, no usage data leaves the box. Long form: [your auth tokens don't touch us →](https://blog.5dive.ai/blog/your-auth-tokens-dont-touch-us/?utm_source=github&utm_medium=referral&utm_campaign=5dive-readme).
+**No middlemen.** 5dive runs on your server. Auth tokens go to model providers directly, never to us. No telemetry, no error reporting, no usage data leaves the box. Long form: [your auth tokens don't touch us →](https://blog.5dive.ai/blog/your-auth-tokens-dont-touch-us/?utm_source=github&utm_medium=owned&utm_campaign=5dive-readme).
 
 ---
 
@@ -288,7 +288,7 @@ Full flag reference: `5dive --help` (or `5dive <verb> --help`), or the searchabl
 - per-agent isolation tiers
 - Telegram bot allowlists
 
-Baselines: [devsec.os_hardening](https://github.com/dev-sec/ansible-collection-hardening) · [Lynis](https://github.com/CISOfy/lynis) · [fail2ban](https://www.fail2ban.org/). Or skip the checklist; [5dive.ai](https://5dive.ai?utm_source=github&utm_medium=referral&utm_campaign=5dive-readme) handles it.
+Baselines: [devsec.os_hardening](https://github.com/dev-sec/ansible-collection-hardening) · [Lynis](https://github.com/CISOfy/lynis) · [fail2ban](https://www.fail2ban.org/). Or skip the checklist; [5dive.ai](https://5dive.ai?utm_source=github&utm_medium=owned&utm_campaign=5dive-readme) handles it.
 
 ### Other paths
 
@@ -342,7 +342,7 @@ Every command accepts `--json`. Output is `{ok:true,data:...}` on success or `{o
 
 The CLI is the OSS surface. Every verb here, every agent, every host, all driven from `/usr/local/bin/5dive`.
 
-If you'd rather click than `ssh`, [5dive.ai](https://5dive.ai?utm_source=github&utm_medium=referral&utm_campaign=5dive-readme) is the managed version: same CLI under the hood, but the VM, hardening, updates, and dashboard are run for you.
+If you'd rather click than `ssh`, [5dive.ai](https://5dive.ai?utm_source=github&utm_medium=owned&utm_campaign=5dive-readme) is the managed version: same CLI under the hood, but the VM, hardening, updates, and dashboard are run for you.
 
 <video src="https://cdn.jsdelivr.net/gh/5dive-ai/assets@main/hero-demo.mp4" autoplay loop muted playsinline width="100%"></video>
 
