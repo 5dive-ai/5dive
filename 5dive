@@ -24244,6 +24244,73 @@ _hb_budget_sweep() {
   return 0
 }
 
+# DIVE-1434 transport-liveness canary. A claude-type agent delivers gate-ping tap
+# buttons via its OWN getUpdates poller (task_need_notify curls the button, but the
+# TAP that clears the gate arrives as a callback_query the agent's poller must
+# consume). The poller bumps its bot.heartbeat beacon every ~3s (DIVE-818); if it
+# dies — e.g. a restart left the single getUpdates slot unacquired — buttons still
+# SEND but taps never land, so a gate silently can't be cleared from the phone. The
+# original incident hid because gate_pinged_at (the stale-reminder batch) is the
+# WRONG signal; this watches the RIGHT one. dev2's DIVE-1416 gap#3c canary watches
+# the stale-reminder batch — complementary, different code path.
+#
+# _hb_poller_verdict: PURE decision for ONE agent (headless-tested). Echoes a
+# one-line reason when the poller looks DEAD, nothing when healthy or not
+# applicable. Only claude runtimes write the beacon; codex/grok/agy/pi use a
+# wait_for_message loop with their own liveness, so they are skipped. Only PAIRED
+# agents matter — an unpaired bot has no human whose taps could be dropped.
+_hb_poller_verdict() {
+  local type="$1" mtime="$2" now="$3" allowfrom="$4" thresh="$5"
+  [[ "$type" == "claude" ]] || return 0            # non-poller runtime — skip
+  [[ "${allowfrom:-0}" -ge 1 ]] || return 0        # unpaired — no human to deafen
+  if [[ -z "$mtime" || "$mtime" == "0" ]]; then
+    echo "no beacon (poller never started)"; return 0
+  fi
+  local age=$(( now - mtime ))
+  (( age > thresh )) && echo "beacon ${age}s stale (poller dead — taps won't land)"
+  return 0
+}
+
+_hb_poller_liveness_sweep() {
+  local reg; reg=$(registry_read 2>/dev/null) || return 0
+  local now; now=$(date +%s)
+  local thresh=120                                 # >> 3s beat; rides a restart/GC pause
+  local -a dead=()
+  local name type allowfrom beacon mtime verdict
+  while IFS= read -r name; do
+    [[ -n "$name" ]] || continue
+    type=$(jq -r --arg n "$name" '.agents[$n].type // "claude"' <<<"$reg")
+    # Resolve this agent's paired channel (token + access.json) the same way the
+    # gate-ttl sweep does — sets TASK_CH_ACCESS to <state_dir>/access.json.
+    _task_agent_channel "$name" || continue
+    allowfrom=$(jq -r '(.allowFrom // []) | length' "$TASK_CH_ACCESS" 2>/dev/null || echo 0)
+    beacon="${TASK_CH_ACCESS%/*}/bot.heartbeat"
+    mtime=0; [[ -f "$beacon" ]] && mtime=$(stat -c %Y "$beacon" 2>/dev/null || echo 0)
+    verdict=$(_hb_poller_verdict "$type" "$mtime" "$now" "$allowfrom" "$thresh")
+    [[ -n "$verdict" ]] && dead+=("${name}: ${verdict}")
+  done < <(jq -r '.agents | keys[]?' <<<"$reg")
+
+  local flag="${STATE_DIR}/poller-liveness.alarmed"
+  if [[ ${#dead[@]} -eq 0 ]]; then
+    # Self-clear: pollers healthy again → drop the throttle flag so the NEXT death
+    # alarms immediately instead of waiting out a stale window.
+    rm -f "$flag" 2>/dev/null || true
+    return 0
+  fi
+  # Throttle to one alarm per hour (flag mtime) so a persistent dead poller pings
+  # once, not every tick. Always log so the tick record shows it every pass.
+  _hb_log "[poller-liveness] DEAD: ${dead[*]}"
+  if [[ -f "$flag" ]] && (( now - $(stat -c %Y "$flag" 2>/dev/null || echo 0) < 3600 )); then
+    return 0
+  fi
+  : > "$flag" 2>/dev/null || true
+  local coord; coord=$(_task_resolve_coordinator 2>/dev/null)
+  if [[ -n "$coord" ]]; then
+    ( cmd_send "$coord" --message="🔴 Telegram poller DEAD on: ${dead[*]}. Gate-ping tap buttons still SEND but the human's TAP won't land (getUpdates slot not held) — those gates can't be cleared from the phone. Fix: restart the agent(s) (systemctl restart 5dive-agent@<name>.service) and check the DIVE-818 slot. (DIVE-1434 canary; re-pings hourly until healthy.)" ) >/dev/null 2>&1 || true
+  fi
+  return 0
+}
+
 cmd_heartbeat_tick() {
   require_root "heartbeat tick"
   tasks_db_init
@@ -24280,6 +24347,10 @@ cmd_heartbeat_tick() {
   # cap and (only if hard-stop is opted in) turn an agent off at the ceiling, and
   # refresh the state cache `watch` reads. Same isolation contract as above.
   _hb_budget_sweep || _hb_log "[budget] pass errored (non-fatal)"
+  # DIVE-1434: transport-liveness canary — alarm if any paired claude agent's
+  # Telegram poller died (stale beacon => gate-ping taps won't land). Same
+  # isolation contract — a failure here must never abort the wake loop.
+  _hb_poller_liveness_sweep || _hb_log "[poller-liveness] pass errored (non-fatal)"
   # Accounts already woken during THIS tick. The $reg snapshot is read once up
   # front, so a wake we do mid-loop isn't visible to later iterations via the
   # registry — this map carries that within-tick fact so two same-account agents
