@@ -87,6 +87,20 @@ _HB_PROC_SKEW_SEC=20
 # rule above can't see it). Reclaim to 'todo' once the task has sat in_progress
 # past this grace AND the agent is idle right now.
 _HB_STALL_MIN_MINUTES=20
+# DIVE-1486 active-defer reconciliation. The no-clobber guard defers a nudge on a
+# confident "active" (rc 1) reading so it never /clears an agent mid-turn. But an
+# attached-but-idle session can read "active" indefinitely (a blinking
+# cursor/spinner leaves the pane byte-unstable, or the native signal lags), so a
+# real todo sits deferred forever while the supervisor calls the same agent
+# "idle-stranded" — the two signals disagree and the self-heal never fires
+# (the live 2026-07-19 stall this task re-files). Reconcile with output progress:
+# fingerprint the pane each active-defer; if it is UNCHANGED across this many
+# consecutive deferred ticks (zero output progress) while a dispatchable todo
+# waits, the session is idle-stranded, not mid-turn — stop deferring and
+# force-nudge. A genuinely working agent streams output, so its fingerprint moves
+# and the counter resets, never reaching the ceiling. Env-overridable.
+_HB_ACTIVE_DEFER_ESCALATE="${HEARTBEAT_ACTIVE_DEFER_ESCALATE:-3}"
+[[ "$_HB_ACTIVE_DEFER_ESCALATE" =~ ^[0-9]+$ ]] || _HB_ACTIVE_DEFER_ESCALATE=3
 # Idle probe window. An agent whose pane is byte-identical across this gap (and
 # still shows its input prompt) is at rest; a working agent streams output or
 # animates a spinner, so its pane changes between two samples. Deliberately dumb
@@ -300,6 +314,55 @@ _hb_mark_reap() {
     )')
   echo "$reg" | registry_write
   jq -r --arg n "$name" --arg tid "$task_id" '.agents[$n].heartbeat.reaps[$tid] // 0' <<<"$reg"
+}
+
+# DIVE-1486 — a cheap content fingerprint of an agent's tmux pane, used to tell an
+# attached-but-idle "active" reading (pane frozen, zero output) apart from a
+# genuinely mid-turn one (pane streaming). Echoes an md5 of the current pane, or
+# empty if the pane can't be captured (dead/absent session) — callers treat empty
+# as "no progress signal" and fall back to their existing behaviour.
+_hb_pane_fingerprint() {
+  local name="$1" user="agent-$1" out
+  out=$(sudo -u "$user" tmux capture-pane -p -t "agent-${name}" 2>/dev/null) || { printf ''; return; }
+  printf '%s' "$out" | md5sum 2>/dev/null | cut -d' ' -f1
+}
+
+# DIVE-1486 — increment + return this agent's consecutive active-defer count,
+# stored in the registry under .agents[<name>].heartbeat.activeDefer = {fp,n}
+# (parallel to .nudges / .reaps). The count advances ONLY while the pane
+# fingerprint is unchanged from the prior deferred tick (zero output progress);
+# any change — real streaming output, or a wake landing — resets it to 1, so a
+# working agent never climbs to the escalation ceiling. An empty fingerprint
+# (uncapturable pane) can't prove no-progress, so it also resets to 1 rather than
+# advancing (fail-safe: never force-nudge on a missing signal). Must run under
+# with_registry_lock, like _hb_mark_run / _hb_mark_reap.
+_hb_mark_active_defer() {
+  local name="$1" fp="$2"
+  local reg; reg=$(registry_read)
+  local prev_fp prev_n n
+  prev_fp=$(jq -r --arg n "$name" '.agents[$n].heartbeat.activeDefer.fp // ""' <<<"$reg")
+  prev_n=$(jq -r --arg n "$name" '.agents[$n].heartbeat.activeDefer.n // 0' <<<"$reg")
+  [[ "$prev_n" =~ ^[0-9]+$ ]] || prev_n=0
+  if [[ -n "$fp" && "$fp" == "$prev_fp" ]]; then
+    n=$(( prev_n + 1 ))
+  else
+    n=1
+  fi
+  reg=$(echo "$reg" | jq --arg n "$name" --arg fp "$fp" --argjson c "$n" '
+    .agents[$n].heartbeat.activeDefer = {fp:$fp, n:$c}')
+  echo "$reg" | registry_write
+  printf '%s' "$n"
+}
+
+# DIVE-1486 — clear an agent's active-defer counter once it's no longer being
+# deferred (woke, went genuinely idle, or was force-nudged), so the next stall
+# episode starts counting from scratch. Best-effort; must run under
+# with_registry_lock.
+_hb_clear_active_defer() {
+  local name="$1"
+  local reg; reg=$(registry_read)
+  reg=$(echo "$reg" | jq --arg n "$name" 'if .agents[$n].heartbeat then del(.agents[$n].heartbeat.activeDefer) else . end')
+  echo "$reg" | registry_write
 }
 
 # DIVE-979 — dependency-aware task pick for one agent. Echoes the single DIVE row
@@ -1473,7 +1536,25 @@ cmd_heartbeat_tick() {
       continue
     fi
     if (( idle_rc == 1 )); then
-      sk_active=$((sk_active + 1)); _hb_log "[$name] active (mid-turn/conversation) — defer nudge this tick"; continue
+      # DIVE-1486: a confident "active" normally defers — but an attached-but-idle
+      # session reads "active" forever (blinking cursor/spinner leaves the pane
+      # byte-unstable, or the native signal lags) while ${task_ident} sits todo and
+      # the supervisor calls the same agent idle-stranded. Reconcile via output
+      # progress: fingerprint the pane; while it keeps CHANGING the agent is really
+      # working and we keep deferring, but once it's unchanged for
+      # _HB_ACTIVE_DEFER_ESCALATE consecutive deferred ticks (zero output) with a
+      # dispatchable todo waiting, it's idle-stranded — stop deferring and fall
+      # through to force the nudge instead of stalling forever.
+      local defer_fp defer_n=0
+      defer_fp=$(_hb_pane_fingerprint "$name")
+      defer_n=$(with_registry_lock _hb_mark_active_defer "$name" "$defer_fp")
+      if [[ "${defer_n:-0}" =~ ^[0-9]+$ ]] && (( defer_n >= _HB_ACTIVE_DEFER_ESCALATE )); then
+        _hb_log "[$name] active-defer escalation — pane unchanged ${defer_n} ticks (>=${_HB_ACTIVE_DEFER_ESCALATE}) with ${task_ident} todo waiting → idle-stranded, force-nudging (DIVE-1486)"
+        with_registry_lock _hb_clear_active_defer "$name" >/dev/null 2>&1 || true
+        # deliberately no `continue` — fall through to the wake below.
+      else
+        sk_active=$((sk_active + 1)); _hb_log "[$name] active (mid-turn/conversation) — defer nudge this tick (active-defer #${defer_n})"; continue
+      fi
     fi
 
     # Per-task fresh override (DIVE-138): a materialized recurring instance can
@@ -1485,6 +1566,7 @@ cmd_heartbeat_tick() {
     _hb_log "[$name] due + todo ${task_ident} — waking (fresh=${eff_fresh})"
     if _hb_wake "$name" "$eff_fresh" "$task_id" "$task_ident"; then
       in_tick_woke[$acct]=$now   # claim the account's slot for the rest of this tick
+      with_registry_lock _hb_clear_active_defer "$name" >/dev/null 2>&1 || true  # DIVE-1486: episode over
       local nudge_n
       nudge_n=$(with_registry_lock _hb_mark_run "$name" "$now" "$task_id")
       woke=$((woke + 1)); _hb_log "[$name] nudged (/goal ${task_ident}, nudge #${nudge_n:-?})"
