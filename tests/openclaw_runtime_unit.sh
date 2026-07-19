@@ -13,7 +13,10 @@ source src/header.sh
 recipe="${TYPE_INSTALL[openclaw]}"
 [[ "$recipe" == *'nvm install 24'* ]]
 [[ "$recipe" == *'ln -sfn "$(nvm which 24)" /home/claude/.local/bin/node'* ]]
-[[ "$recipe" == *'ln -sfn "$(npm prefix -g)/bin/openclaw" /home/claude/.local/bin/openclaw'* ]]
+[[ "$recipe" == *'[[ "${FORCE_INSTALL:-0}" != 1 ]] || rm -f /home/claude/.local/bin/openclaw'* ]]
+[[ "$recipe" == *'_oc_global="$(npm prefix -g)/bin/openclaw"'* ]]
+[[ "$recipe" == *'[[ ! -x "$_oc_global" ]] || ln -sfn "$_oc_global" /home/claude/.local/bin/openclaw'* ]]
+[[ "$recipe" == *'&& [[ -x /home/claude/.local/bin/openclaw ]]'* ]]
 
 create_src=$(<src/cmd_agent_create.sh)
 [[ "$create_src" == *'PATH="/home/claude/.local/bin:/usr/bin:/bin"'* ]]
