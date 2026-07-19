@@ -6,7 +6,8 @@
 import {
   guardrail, gateGuardrail, nodeGuardrail, verdictToAction, verifierVerdictToAction,
   nodeVerdictToDecision, resolveCouncil, STANDING_COUNCILS, DEFAULT_COUNCIL, DEFAULT_THRESHOLD,
-  resolveThreshold, tallyVotes, applyFounderVeto, dispositionOf, addSeat, removeSeat,
+  resolveThreshold, tallyVotes, attachVetoOffer, exerciseFounderVeto, vetoConfig,
+  buildVetoRecord, canonicalVetoRecord, VETO_DEFAULTS, dispositionOf, addSeat, removeSeat,
   THRESHOLD_POLICY, quorumSize,
   canonicalTranscript, validateAgainstSchema, makeAnthropicModelCall, runCouncil, TAKE, VOTE, NODE_VOTE,
 } from '../src/council/engine.mjs'
@@ -84,14 +85,42 @@ ok(roster.length === 6 && roster.some(s => s.id === 'dario'), 'addSeat promotes 
 ok(addSeat(roster, 'dario').length === 6, 'addSeat is idempotent (no dup)')
 ok(removeSeat(roster, 'dario').length === 5 && !removeSeat(roster, 'dario').some(s => s.id === 'dario'), 'removeSeat demotes a seat')
 
-// ---- CNCL-6: founder veto (pass -> blocked, recorded) ----
+// ---- CNCL-9: authenticated founder veto (non-blocking OFFER + two-tier authenticated EXERCISE) ----
 const passV = { recommendation: 'approve', escalated: false, tally: T(4, 1, 0), confidence: 0.9, dissent: 'none', brief: '' }
-const vetoed = applyFounderVeto(passV, { by: 'lodar', reason: 'not this sprint' })
-ok(vetoed.vetoed === true && vetoed.vetoedBy === 'lodar' && vetoed.disposition === 'blocked', 'founder veto flips a pass to blocked')
-ok(dispositionOf(vetoed) === 'blocked', 'dispositionOf(vetoed) = blocked')
-ok(dispositionOf(passV) === 'pass', 'un-vetoed pass = pass')
 const rejV = { recommendation: 'reject', escalated: false, tally: T(1, 4, 0), confidence: 0.8, dissent: 'x', brief: '' }
-ok(applyFounderVeto(rejV, { by: 'lodar' }).vetoed !== true, 'veto on a non-pass is a no-op (nothing to veto)')
+const OFFER = { principal: 'human:main', resolved: '433634012', windowSecs: 900 }
+
+// OFFER is non-blocking: a pass STAYS a pass; the offer just rides on the verdict.
+const offered = attachVetoOffer(passV, OFFER)
+ok(offered.vetoOffer && offered.vetoOffer.state === 'offered-not-exercised', 'offer recorded on a pass')
+ok(offered.recommendation === 'approve' && offered.disposition === undefined, 'offer does NOT block — pass stays a pass')
+ok(dispositionOf(offered) === 'pass', 'dispositionOf(offered pass) = pass')
+ok(attachVetoOffer(rejV, OFFER).vetoOffer === undefined, 'no offer on a non-pass (nothing to veto)')
+ok(attachVetoOffer(passV, { principal: 'x' }).vetoOffer === undefined, 'offer needs a resolved recipient (fail-closed)')
+
+// EXERCISE (authenticated tap) — HOLD tier flips to blocked, no unwind.
+const hold = exerciseFounderVeto(offered, { by: 'human:main', resolved: '433634012', reason: 'not now', tier: 'hold' })
+ok(hold.vetoed === true && hold.disposition === 'blocked' && hold.vetoTier === 'hold' && hold.unwindRequired === false, 'hold-tier tap flips pass -> blocked (no unwind)')
+ok(dispositionOf(hold) === 'blocked', 'dispositionOf(exercised) = blocked')
+// POSTHOC tier flips + requires unwind.
+const posthoc = exerciseFounderVeto(offered, { by: 'human:main', resolved: '433634012', tier: 'posthoc' })
+ok(posthoc.vetoed === true && posthoc.vetoTier === 'posthoc' && posthoc.unwindRequired === true, 'posthoc-tier tap flips + requires unwind')
+// FAIL-CLOSED: a tap from the wrong recipient, or on a verdict with no offer, is a no-op.
+ok(exerciseFounderVeto(offered, { by: 'human:main', resolved: '999', tier: 'hold' }).vetoed !== true, 'tap from wrong recipient is refused (no flip)')
+ok(exerciseFounderVeto(passV, { by: 'human:main', resolved: '433634012' }).vetoed !== true, 'exercise with no recorded offer is a no-op (fail-closed)')
+ok(exerciseFounderVeto(offered, { by: 'human:main' }).vetoed !== true, 'exercise without a resolved recipient is a no-op')
+
+// config seam (CNCL-13/14): defaults + env override, no hardcode leaks.
+ok(vetoConfig().holdSecs === VETO_DEFAULTS.holdSecs && vetoConfig().posthocSecs === VETO_DEFAULTS.posthocSecs, 'vetoConfig defaults = 15m hold / 48h posthoc')
+ok(vetoConfig({ COUNCIL_VETO_HOLD_SECS: '60' }).holdSecs === 60, 'vetoConfig honors env override')
+ok(vetoConfig({ COUNCIL_VETO_HOLD_SECS: 'bad' }).holdSecs === VETO_DEFAULTS.holdSecs, 'vetoConfig falls back on a bad value')
+
+// chained veto record references the ORIGINAL digest inside its own signed bytes.
+const vrec = buildVetoRecord({ origDigest: 'ABC', tier: 'posthoc', by: 'human:main', resolved: '433634012', reason: 'r', stampedAt: 'T', flippedVerdict: hold })
+ok(vrec.kind === 'veto' && vrec.origDigest === 'ABC' && vrec.unwindRequired === true, 'buildVetoRecord chains to orig digest + carries unwind')
+ok(canonicalVetoRecord(vrec).includes('origDigest: ABC') && canonicalVetoRecord(vrec).includes('tier: posthoc'), 'canonical veto record seals the chain link + tier')
+let threw = false; try { buildVetoRecord({ tier: 'hold', by: 'x', resolved: '1' }) } catch { threw = true }
+ok(threw, 'buildVetoRecord refuses a record with no origDigest to chain to')
 
 // ---- P3 receipt: deterministic, tamper-evident, veto INSIDE signed bytes ----
 const rec = { council: 'council', mode: 'deliberate', stampedAt: '2026-07-19T00:00:00Z', question: 'ship v0.11?',
@@ -100,8 +129,11 @@ const rec = { council: 'council', mode: 'deliberate', stampedAt: '2026-07-19T00:
 const c1 = canonicalTranscript(rec)
 ok(c1 === canonicalTranscript({ ...rec, seats: ['theo', 'codex', 'main'] }), 'canonical is order-independent (stable bytes)')
 ok(c1 !== canonicalTranscript({ ...rec, question: 'ship v0.12?' }), 'any field edit changes the bytes (tamper-evident)')
-const cVeto = canonicalTranscript({ ...rec, verdict: { ...rec.verdict, vetoed: true, vetoedBy: 'lodar', vetoReason: 'hold' } })
-ok(cVeto.includes('veto: lodar :: hold') && cVeto !== c1, 'recorded veto is INSIDE the signed bytes')
+ok(c1.includes('veto: none'), 'no-offer receipt records veto: none inside the bytes')
+const cOffer = canonicalTranscript({ ...rec, verdict: { ...rec.verdict, vetoOffer: { principal: 'human:main', resolved: '433634012', windowSecs: 900, state: 'offered-not-exercised' } } })
+ok(cOffer.includes('veto: offered human:main window 900s :: offered-not-exercised') && cOffer !== c1, 'veto OFFER is INSIDE the signed bytes')
+const cVeto = canonicalTranscript({ ...rec, verdict: { ...rec.verdict, vetoed: true, vetoTier: 'posthoc', vetoedBy: 'human:main', vetoReason: 'hold' } })
+ok(cVeto.includes('veto: exercised posthoc human:main :: hold') && cVeto !== c1, 'exercised veto (with tier) is INSIDE the signed bytes')
 
 // ---- A-with-seam adapter: schema-validate + no live key needed to construct ----
 ok(validateAgainstSchema({ seat: 'a', vote: 'approve', rationale: 'x' }, VOTE) === null, 'valid VOTE passes schema check')
@@ -129,10 +161,12 @@ ok(r1.receipt && r1.receipt.canonical.includes('council: council') && r1.receipt
 const r2 = await runCouncil({ role: 'convene', question: 'ship?' },
   { modelCall: mockModel({ main: 'approve', theo: 'approve', codex: 'reject', olivia: 'reject', lilbro: 'reject' }) })
 ok(r2.verdict.recommendation === 'reject', 'runCouncil: 2/5 approve -> reject')
-// founder veto threads through runCouncil
-const r3 = await runCouncil({ role: 'convene', question: 'ship?', veto: { by: 'lodar', reason: 'hold' } },
+// CNCL-9: a veto OFFER threads through runCouncil non-blocking — the pass stays a pass and the
+// offer rides inside the sealed receipt (the flip only ever happens later via an authenticated tap).
+const r3 = await runCouncil({ role: 'convene', question: 'ship?', vetoOffer: { principal: 'human:main', resolved: '433634012', windowSecs: 900 } },
   { modelCall: mockModel({ main: 'approve', theo: 'approve', codex: 'approve', olivia: 'approve', lilbro: 'approve' }) })
-ok(r3.verdict.vetoed === true && r3.receipt.canonical.includes('veto: lodar :: hold'), 'runCouncil: founder veto flips pass to blocked + rides the receipt')
+ok(r3.verdict.recommendation === 'approve' && r3.verdict.vetoed !== true, 'runCouncil: veto offer does NOT block the pass')
+ok(r3.verdict.vetoOffer && r3.receipt.canonical.includes('veto: offered human:main window 900s'), 'runCouncil: offer rides inside the sealed receipt')
 // hard-gate guardrail short-circuits (verifier role, tier-2) with NO model spend
 let calls = 0
 const r4 = await runCouncil({ role: 'verifier', task: { ident: 'DIVE-9', ask: 'x', accept: 'y', type: 'decision', tier: 2 } },

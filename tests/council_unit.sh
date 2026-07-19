@@ -15,4 +15,11 @@ for h in council_engine_unit.mjs council_cli_contract.mjs council_dispatch_unit.
   echo "=== tests/$h"
   if ! node "tests/$h"; then echo "FAILED: tests/$h"; rc=1; fi
 done
+
+# CNCL-9: the founder-veto WIRING e2e (real 5dive council {init,convene,veto,lineage} bundle). It
+# self-SKIPs (green) when it can't seal (no root / no passwordless sudo / missing openssl|jq), so
+# it never falsely reds CI, but GATES the veto path wherever a seal is possible.
+echo "=== tests/council_veto_e2e.sh"
+if ! bash "tests/council_veto_e2e.sh"; then echo "FAILED: tests/council_veto_e2e.sh"; rc=1; fi
+
 exit $rc
