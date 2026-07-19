@@ -502,6 +502,98 @@ CREATE INDEX IF NOT EXISTS objective_cycles_idx ON objective_cycles(objective_id
 SQL
 }
 
+# -------- DIVE-1479: silent-recreate trap guard --------
+#
+# The 2026-07-19 04:20 wipe = something unlinked tasks.db, then a routine cron
+# reader ran tasks_db_init which SILENTLY recreated it empty — the board looked
+# legitimately empty and everyone proceeded. The guard below makes that class of
+# data-loss LOUD + self-healing: a durable sentinel records that the board was
+# initialized at least once; if the tasks table is ever absent while that
+# sentinel (or a backup snapshot) exists, we DON'T silently create an empty
+# board — we alarm on stderr + an incident log and auto-restore from the newest
+# /var/lib/5dive/tasks-backups snapshot (written every 5min by
+# 5dive-tasks-backup.sh, which only snapshots a NON-empty board).
+#
+# Paths are resolved at CALL time (not sourced into constants) so the DIVE-1475
+# STATE_DIR/TASKS_DIR test-isolation overrides still redirect them to a temp tree.
+# The sentinel lives in TASKS_DIR (2770 group-writable, so any agent can write
+# it and it survives a bare `rm tasks.db`); the backups + incident log live in
+# the sibling tasks-backups dir. If the whole TASKS_DIR is wiped the sentinel
+# goes with it, but the backup snapshots in the sibling dir still trip the alarm.
+_tasks_backup_dir() { printf '%s' "${TASKS_BACKUP_DIR:-${STATE_DIR}/tasks-backups}"; }
+_tasks_sentinel()   { printf '%s' "${TASKS_SENTINEL:-${TASKS_DIR}/.board-initialized}"; }
+
+# Newest backup snapshot path (most recent first), or empty when none exist.
+_tasks_newest_backup() {
+  ls -1t "$(_tasks_backup_dir)"/tasks-*.db.gz 2>/dev/null | head -n1
+}
+
+# Has the board been initialized before? A sentinel OR any backup snapshot both
+# prove prior existence; either one turns a missing table into an incident
+# rather than a fresh-box first-run.
+_tasks_board_existed() {
+  [[ -f "$(_tasks_sentinel)" ]] && return 0
+  [[ -n "$(_tasks_newest_backup)" ]] && return 0
+  return 1
+}
+
+# Idempotent: stamp the sentinel the first time we see a healthy board. Cheap
+# once present (a single stat), best-effort on the write so a perms hiccup never
+# breaks a task command.
+_tasks_mark_initialized() {
+  local s; s="$(_tasks_sentinel)"
+  [[ -f "$s" ]] && return 0
+  { : > "$s"; } 2>/dev/null || true
+}
+
+# LOUD alarm: stderr (the durable channel a human/cron log sees) + a best-effort
+# append to a durable incident log next to the backups.
+_tasks_alarm() {
+  local ts; ts=$(date -u +%FT%TZ 2>/dev/null || echo now)
+  printf '🚨 [5dive tasks-db] %s: %s\n' "$ts" "$1" >&2
+  { printf '%s\t%s\t%s\n' "$ts" "${SUDO_USER:-$(id -un 2>/dev/null || echo ?)}" "$1" \
+      >> "$(_tasks_backup_dir)/RESTORE-INCIDENTS.log"; } 2>/dev/null || true
+}
+
+# The table is absent but the board existed before: alarm + auto-restore from the
+# newest snapshot, or fail LOUDLY (never silently recreate an empty board). Serial-
+# ized under a lock so concurrent inits don't double-restore; the winner recreates
+# the table and every follower re-checks and no-ops.
+_tasks_board_recover() {
+  _tasks_alarm "board table MISSING but previously initialized (sentinel/backup present) — refusing to silently recreate an EMPTY board."
+  local newest; newest=$(_tasks_newest_backup)
+  if [[ -z "$newest" ]]; then
+    _tasks_alarm "no backup snapshot in $(_tasks_backup_dir) — cannot auto-restore; MANUAL recovery required."
+    fail "$E_GENERIC" "tasks board vanished and no backup exists to restore — investigate before proceeding (DIVE-1479)."
+  fi
+  (
+    flock 9 2>/dev/null || true
+    local h2
+    h2=$(sqlite3 -cmd ".timeout 5000" "$TASKS_DB" \
+         "SELECT 1 FROM sqlite_master WHERE type='table' AND name='tasks' LIMIT 1;" 2>/dev/null)
+    [[ "$h2" == "1" ]] && exit 0   # another init already restored under the lock
+    local tmp="${TASKS_DB}.restore.$$"
+    if ! gunzip -c "$newest" > "$tmp" 2>/dev/null; then
+      _tasks_alarm "gunzip of $newest failed"; rm -f "$tmp"; exit 3
+    fi
+    local rows
+    rows=$(sqlite3 "$tmp" "SELECT count(*) FROM tasks;" 2>/dev/null || echo 0)
+    if [[ "${rows:-0}" -lt 1 ]]; then
+      _tasks_alarm "restore source $newest had 0 rows / no tasks table"; rm -f "$tmp"; exit 3
+    fi
+    # Drop any stale WAL/SHM from the vanished db so the restored file is authoritative.
+    rm -f "${TASKS_DB}-wal" "${TASKS_DB}-shm" 2>/dev/null || true
+    mv -f "$tmp" "$TASKS_DB" && chmod 0660 "$TASKS_DB" 2>/dev/null
+    _tasks_alarm "AUTO-RESTORED $rows rows from $(basename "$newest") — verify integrity."
+  ) 9>"${TASKS_DIR}/.recover.lock"
+  # Confirm we ended with a real table; if not, fail loudly rather than proceed empty.
+  local h3
+  h3=$(sqlite3 -cmd ".timeout 5000" "$TASKS_DB" \
+       "SELECT 1 FROM sqlite_master WHERE type='table' AND name='tasks' LIMIT 1;" 2>/dev/null)
+  [[ "$h3" == "1" ]] || fail "$E_GENERIC" \
+    "tasks board auto-restore failed — MANUAL recovery required (DIVE-1479); newest snapshot: $newest"
+}
+
 # Create the group-writable tasks dir + db and apply the schema. Safe to call
 # repeatedly; command functions call it first. If the dir is missing and we
 # aren't root we can't create it (parent /var/lib/5dive is 2750), so emit a
@@ -528,12 +620,23 @@ tasks_db_init() {
   has=$(sqlite3 -cmd ".timeout 5000" "$TASKS_DB" \
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name='tasks' LIMIT 1;" 2>/dev/null)
   if [[ "$has" != "1" ]]; then
-    sqlite3 -cmd ".timeout 5000" "$TASKS_DB" < <(_tasks_schema) >/dev/null \
-      || fail "$E_GENERIC" "failed to initialise tasks db at $TASKS_DB"
-    chmod 0660 "$TASKS_DB" 2>/dev/null || true
+    # DIVE-1479: a missing table on a board that existed before is the
+    # silent-recreate trap — alarm + auto-restore, never a silent empty create.
+    # Only a genuinely fresh box (no sentinel, no snapshot) gets a new schema.
+    if _tasks_board_existed; then
+      _tasks_board_recover
+      _tasks_db_migrate            # bring the restored snapshot up to current schema
+    else
+      sqlite3 -cmd ".timeout 5000" "$TASKS_DB" < <(_tasks_schema) >/dev/null \
+        || fail "$E_GENERIC" "failed to initialise tasks db at $TASKS_DB"
+      chmod 0660 "$TASKS_DB" 2>/dev/null || true
+    fi
   else
     _tasks_db_migrate
   fi
+  # DIVE-1479: stamp the durable "this board exists" sentinel (idempotent). On a
+  # pre-existing board this is the one-time backfill so a later wipe is caught.
+  _tasks_mark_initialized
 }
 
 # Idempotent additive migrations for already-initialised stores. sqlite has
