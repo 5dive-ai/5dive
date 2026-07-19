@@ -1,6 +1,8 @@
 # Changelog
 
-## Unreleased
+## 0.11.14 — task inbox --send: owner digest with working tier-2 tap buttons (DIVE-1499) (2026-07-19)
+
+- feat(tasks): `5dive task inbox --send [--channel-proof=<chat>]` — root-side, on-demand DM of the pending-gate inbox as ONE message with WORKING tap buttons for every gate type, including approval/secret/manual: fresh per-gate DIVE-916 nonces are minted in-process, embedded only in Telegram callback_data, and the stored hash rotates only after a confirmed send. The human-proof nonce is deliberately NOT added to `task inbox --json` — agent-readable output would make the human-proof agent-forgeable, re-opening the hole DIVE-950 closed. The telegram plugin's /inbox flow should shell this verb (passing the requesting chat as --channel-proof) instead of composing tier-2 buttons itself (unblocks DIVE-1489).
 
 - fix(council): resolve council seat PERSONA ids to real REGISTRY agents before dispatch — persona `theo` is the `marketing` agent and `lilbro` is `creative`, so the old code that passed `seat.id` verbatim to `5dive agent ask` recorded both default seats as silent ABSTAINs on every live convene (a 5-seat council degraded to 3 votes cast). Seats now carry an explicit `agent` field (built-ins) plus a persona→agent alias map, and convene FAILS CLOSED with a loud pre-flight error if any seat resolves to no known registry agent, instead of degrading silently (CNCL-16).
 
