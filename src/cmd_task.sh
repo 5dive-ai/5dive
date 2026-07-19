@@ -1651,6 +1651,37 @@ _gate_content_curation_hit() {
 # test in cmd_task_need.
 _GATE_CONTENT_PUBLISH_RX='publish|public post|announce|launch post'
 
+# DIVE-1480: the INTERNAL-OPS / RECOVERY decision class — the fourth downgrade
+# kind, mirror of eng-ship (DIVE-1359) and content-curation (DIVE-1381). Surfaced
+# by the 2026-07-19 board wipe: dev's STEER-1 "keep vs discard my work / rebuild
+# the board" decision gate (filed FOR the lead) got FORCED to hard-human tier-2
+# purely because its ask NARRATED the wipe — 'destroyed', 'wiped', 'purge' — so
+# the T2 destructive floor tripped and it landed on lodar instead of Marcus, whose
+# call it actually was. A decision about our OWN control-plane state (the task
+# board / an agent's uncommitted work / a wipe recovery) is the org lead's to
+# clear, not the paired human's. This class marks such asks so the caller
+# downgrades them to a lead-routed tier-1, BUT ONLY when the SOLE reason the floor
+# fired was an INTERNAL-destructive term (see _GATE_INTERNAL_DESTRUCTIVE_RX): a
+# genuine prod/customer/infra destructive ask (drop a prod table, teardown infra,
+# revoke a key, a dns/domain change) keeps those terms in the residual floor and
+# stays hard-human. The class regex is deliberately NARROW — task-board / dev-
+# workspace / recovery vocabulary that essentially never appears in an external
+# destructive gate — so it is the real safety gate, not the term carve-out.
+# secret/manual are never internal-ops; filer-is-lead ⇒ no reviewer ⇒ not
+# downgraded (a lead may legitimately pin a human gate).
+_GATE_INTERNAL_OPS_RX='task ?board|tasks?\.db|\btask db\b|the backlog|board (wipe|wiped|reset|reconstruct|rebuild|recovery)|(wipe|wiped|reset|lost|rebuild|reconstruct|restore).{0,20}(board|backlog)|my (uncommitted|wip|in.?flight|local|unmerged) (work|changes|edits|branch)|discard (my|the|dev.s) (work|changes|edits|wip)|keep (vs|or) discard|steer-[0-9]|the audit (trail|log)|heartbeat log'
+_gate_internal_ops_hit() {
+  local text; text=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
+  [[ "$text" =~ $_GATE_INTERNAL_OPS_RX ]]
+}
+# The internal-destructive terms — the subset of the T2 floor whose match is safe
+# to carve out for an internal-ops ask, because they NARRATE/act-on our own
+# recoverable dev state, not production. Deliberately NARROW: 'teardown', 'drop
+# table', 'revoke', 'dns', 'domain transfer' STAY in the floor (real infra / prod
+# / access, human calls even in a recovery context), as does every money / secret
+# / publish / brand term. Used to compute the residual-floor test below.
+_GATE_INTERNAL_DESTRUCTIVE_RX='destroy|wipe|purge|delete|irreversible'
+
 # OSS-11 (DIVE-976) — _gate_ask_shape <ask>: normalize an ask into its "shape
 # key" so two gates that ask structurally the same question but about different
 # targets collapse to one key. Precedent matching uses EXACT shape-key equality
@@ -1846,6 +1877,37 @@ cmd_task_need() {
       local _cc_reviewer; _cc_reviewer=$(_gate_route_reviewer "$(task_actor "$from")")
       if [[ -n "$_cc_reviewer" ]]; then
         tier=1; tier_floored=0; _curation=1
+      fi
+    fi
+  fi
+
+  # DIVE-1480: internal-ops / recovery carve-out. Same shape as content-curation
+  # above: an internal control-plane decision (task board / an agent's own work /
+  # a wipe recovery) is lead-clearable, but the T2 destructive floor over-fires on
+  # the ask NARRATING a wipe ('destroyed'/'wiped'/'purge') and forces it hard-human
+  # — the exact wall the STEER-1 keep-vs-discard gate hit (landed on lodar, not
+  # Marcus). UNLIKE eng-ship/curation this fires ONLY when the floor ACTUALLY
+  # over-fired (tier_floored==1): a precise fix for the over-escalation, leaving a
+  # non-floored internal decision's normal tier-1 routing untouched. We re-test the
+  # floor with only the INTERNAL-destructive terms stripped
+  # (_GATE_INTERNAL_DESTRUCTIVE_RX); only if the ask matches the narrow internal-ops
+  # class AND nothing else in the residual still trips the floor (a real prod/infra
+  # destructive term — teardown / drop table / revoke / dns — or any money / secret
+  # / publish / brand term wins and stays hard-human) do we downgrade to a
+  # lead-routed tier-1 so it reaches the lead, not lodar. Guarded to decision/
+  # approval with a reviewer (filer-is-lead ⇒ no downgrade); runs after curation so
+  # a curation-shaped ask keeps its own class.
+  local _internal_ops=0
+  if [[ "$tier_floored" == "1" && "$_curation" == "0" \
+        && ( "$type" == "decision" || "$type" == "approval" ) ]]; then
+    local _io_title; _io_title=$(db "SELECT COALESCE(title,'') FROM tasks WHERE id=${id};")
+    local _io_text="${ask} ${_io_title}"
+    local _io_residual; _io_residual=$(printf '%s' "$_io_text" \
+      | tr '[:upper:]' '[:lower:]' | sed -E "s/(${_GATE_INTERNAL_DESTRUCTIVE_RX})//g")
+    if _gate_internal_ops_hit "$_io_text" && ! _gate_tier2_floor_hit "$_io_residual"; then
+      local _io_reviewer; _io_reviewer=$(_gate_route_reviewer "$(task_actor "$from")")
+      if [[ -n "$_io_reviewer" ]]; then
+        tier=1; tier_floored=0; _internal_ops=1
       fi
     fi
   fi
@@ -2143,6 +2205,9 @@ cmd_task_need() {
   [[ "$_eng_ship" == "1" ]] && _routable=1
   # DIVE-1381: a content-curation gate is likewise lead-routed by kind.
   [[ "$_curation" == "1" ]] && _routable=1
+  # DIVE-1480: an internal-ops/recovery gate the destructive floor over-fired on is
+  # lead-routed by kind (set above), so the lead clears it instead of lodar.
+  [[ "$_internal_ops" == "1" ]] && _routable=1
   if [[ "$_routable" == "1" ]]; then
     # DIVE-1243: `access` routing is intrinsic to the TYPE, so it does NOT wait on
     # the gate_builder_routing pref (which ship-gates the decision/approval/manual
@@ -2150,7 +2215,7 @@ cmd_task_need() {
     # DIVE-1359: eng-ship routing is likewise intrinsic to the KIND — it bypasses
     # the pref too, so the fix is live under the default (pref OFF) posture.
     local _route; _route=$(_task_pref_get gate_builder_routing); _route="${_route:-off}"
-    if [[ "$_route" == "on" || "$type" == "access" || "$_eng_ship" == "1" || "$_curation" == "1" ]]; then
+    if [[ "$_route" == "on" || "$type" == "access" || "$_eng_ship" == "1" || "$_curation" == "1" || "$_internal_ops" == "1" ]]; then
       local _reviewer; _reviewer=$(_gate_route_reviewer "$actor")
       if [[ -n "$_reviewer" ]]; then
         # Persist the designated reviewer on the row. For approval/manual this is
