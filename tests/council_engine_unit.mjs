@@ -199,6 +199,13 @@ ok(/task need DIVE-77 .*--tier=2/.test(trRebrief.command) && /--from=council-tri
 const trApprove = triageVerdictToAction(t2gate, { recommendation: 'approve', escalated: false, tally: T(3, 0, 0), confidence: 0.9, dissent: 'none', brief: '' })
 ok(trApprove.cleared === false && !/task answer/.test(trApprove.command), 'triage: an APPROVE verdict STILL never clears a tier-2 gate (fail-closed)')
 ok(trRebrief.command.includes('--options='), 'triage: preserves the original options for the human')
+// CNCL-12 main-gate amendment: NEVER downgrade a human-only type to `decision` on re-file — a
+// stale `secret` gate re-filed as a plain decision would invite the human to paste the secret
+// onto the fleet-readable board. Both gate mappers must preserve the original type.
+const secretGate = { ident: 'DIVE-1478', ask: 'R2 creds — do NOT paste here', type: 'secret', tier: 2, recommend: '', options: '' }
+ok(/--type=secret /.test(triageVerdictToAction(secretGate, { recommendation: 'escalate', escalated: true, tally: T(0,0,3), confidence: 0.5, dissent: 'human', brief: 'still needs the human' }).command), 'triage: a secret gate re-files as type=secret (never downgraded to decision)')
+ok(/--type=secret /.test(verdictToAction(secretGate, { recommendation: 'escalate', escalated: true, tally: T(0,0,3), confidence: 0.5, dissent: 'human', brief: 'needs human' }).command), 'gate escalate: a secret gate stays type=secret (no paste-inviting downgrade)')
+for (const ht of ['approval', 'manual', 'access']) ok(new RegExp(`--type=${ht} `).test(verdictToAction({ ...secretGate, type: ht }, { recommendation: 'escalate', escalated: true, tally: T(0,0,3), confidence: 0.5, dissent: 'h', brief: 'b' }).command), `gate escalate: human-only type ${ht} preserved on re-file`)
 
 console.log(`\nCNCL-6 engine: ${pass} passed, ${fail} failed (bound to src/council/engine.mjs)`)
 process.exit(fail ? 1 : 0)

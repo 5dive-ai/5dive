@@ -22068,7 +22068,11 @@ export function verdictToAction(gate, verdict) {
     }
   }
   const brief = (verdict && (verdict.brief || verdict.dissent)) || 'Council could not clear; human decision required.'
-  const t = gate.type && HUMAN_ONLY_TYPES.indexOf(gate.type) === -1 ? gate.type : 'decision'
+  // PRESERVE the original gate type on re-file. Never coerce a human-only type (secret/approval/
+  // manual/access) down to a free-text `decision` — that would re-open a `secret` gate (whose ask
+  // may say "do NOT paste here") as a plain decision and invite the human to paste the secret onto
+  // the fleet-readable board. A human-only escalation stays human-only (CNCL-12 main-gate amendment).
+  const t = gate.type || 'decision'
   return {
     action: 'escalate',
     command: `5dive task need ${gate.ident} --type=${t} --tier=2 --ask=${shellQuote(`[council escalation] ${brief} — original ask: ${gate.ask}`)}`
@@ -22137,9 +22141,11 @@ export function nodeVerdictToDecision(node, verdict) {
 export function triageVerdictToAction(gate, verdict) {
   const brief = (verdict && (verdict.brief || verdict.dissent))
     || 'Council reviewed the stale gate; the human decision still stands and needs an answer.'
-  // Keep the gate human-only: re-file the SAME (or a still-human) type, ALWAYS tier-2, with a
-  // sharper one-paragraph brief, then re-ping the owner. Never downgrades tier, never answers.
-  const t = gate.type && HUMAN_ONLY_TYPES.indexOf(gate.type) === -1 ? gate.type : 'decision'
+  // Keep the gate human-only: re-file the SAME type, ALWAYS tier-2, with a sharper one-paragraph
+  // brief, then re-ping the owner. Never downgrades tier, never answers, and (CNCL-12 main-gate
+  // amendment) never downgrades a human-only type to `decision` — a stale `secret` gate must be
+  // re-briefed as type=secret, not re-opened as a free-text decision that invites a paste.
+  const t = gate.type || 'decision'
   return {
     action: 'triage-rebrief',
     cleared: false,
