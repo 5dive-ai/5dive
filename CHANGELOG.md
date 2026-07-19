@@ -6,6 +6,10 @@
 
 - fix(gates): remove pure brand/strategy asks from the CLI's tier-2 human-gate floor so they remain tier-1 and org-lead-clearable; money, public/customer communications, secrets, and destructive/irreversible asks continue to floor to tier 2. The goal planner's separate `brand` risk taxonomy is unchanged (DIVE-1492).
 
+## 0.11.13 — The Council: shipped seed rosters genericized to role archetypes (CNCL-20) (2026-07-19)
+
+- fix(council): the SHIPPED defaults `DEFAULT_COUNCIL` + `STANDING_COUNCILS` (ship/brand/security) now seed role ARCHETYPES (eng-lead, brand, builder, strategy, contrarian, reviewer, red-team) instead of 5dive-internal persona names — OSS installs get self-explanatory seats to map onto their own agents via the CNCL-16 fail-closed pre-flight. Genesis-seeded registries (live hosts) are untouched: these defaults only matter pre-genesis / for ad-hoc benches. CNCL-16 legacy persona aliases retained.
+
 ## 0.11.12 — The Council: per-seat Ed25519 co-signed votes (CNCL-10 core) (2026-07-19)
 
 - feat(council): SECURITY — per-seat Ed25519 co-signing engine. Every seat holds its own keypair and SIGNS its vote AT SOURCE; the convener holds no other seat's private key, so it can neither forge a vote nor edit one without breaking the signature. The signed preimage binds the CONVENE ID + QUESTION DIGEST, so a seat's signed vote from one convene fails verification in any other (replay-proof). Closes the CNCL-6 gap where the root seal proved only that the convener recorded the bytes, not that each seat cast its own vote. Rebuilt on current origin/main atop the merged CNCL-9 veto (nonce-binding sealed into the canonical, 0.11.8) — additive co-sign region, no overlap with the veto seal.
