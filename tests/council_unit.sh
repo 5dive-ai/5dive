@@ -22,4 +22,9 @@ done
 echo "=== tests/council_veto_e2e.sh"
 if ! bash "tests/council_veto_e2e.sh"; then echo "FAILED: tests/council_veto_e2e.sh"; rc=1; fi
 
+# CNCL-12: the gate-rot WIRING e2e (real 5dive council {gate-clear,rot-triage} bundle over an
+# isolated STATE_DIR + TASKS_DB). Same self-SKIP-when-can't-seal posture as the veto e2e.
+echo "=== tests/council_gate_e2e.sh"
+if ! bash "tests/council_gate_e2e.sh"; then echo "FAILED: tests/council_gate_e2e.sh"; rc=1; fi
+
 exit $rc

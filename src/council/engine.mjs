@@ -103,6 +103,29 @@ export function nodeVerdictToDecision(node, verdict) {
   }
 }
 
+// (CNCL-12) T2 ROT-TRIAGE: a tier-2 gate left unanswered 48h. The council re-briefs it
+// sharper (or, in its brief, recommends a rescope/park to the human) and re-escalates —
+// but it NEVER clears a tier-2 gate. This is the fail-closed rule: tier-2 stays human-only,
+// so this mapping has NO `task answer` branch AT ALL, not even for an `approve` verdict.
+// The load-bearing invariant (asserted in the unit test): `.cleared === false` and the
+// command never contains `task answer`, regardless of what the verdict says.
+export function triageVerdictToAction(gate, verdict) {
+  const brief = (verdict && (verdict.brief || verdict.dissent))
+    || 'Council reviewed the stale gate; the human decision still stands and needs an answer.'
+  // Keep the gate human-only: re-file the SAME (or a still-human) type, ALWAYS tier-2, with a
+  // sharper one-paragraph brief, then re-ping the owner. Never downgrades tier, never answers.
+  const t = gate.type && HUMAN_ONLY_TYPES.indexOf(gate.type) === -1 ? gate.type : 'decision'
+  return {
+    action: 'triage-rebrief',
+    cleared: false,
+    command: `5dive task need ${gate.ident} --type=${t} --tier=2 --ask=${shellQuote(`[council triage] ${brief} — original ask: ${gate.ask}`)}`
+      + (gate.recommend && gate.recommend !== '-' ? ` --recommend=${shellQuote(gate.recommend)}` : '')
+      + (gate.options ? ` --options=${shellQuote(gate.options)}` : '')
+      + ` && 5dive task escalate ${gate.ident} --from=council-triage`,
+    brief,
+  }
+}
+
 // (P3.1) STANDING / NAMED COUNCILS — the built-in defaults. The CLI layer persists an
 // editable copy (benches.json) seeded from these; resolveCouncil fails CLOSED on a miss.
 export const STANDING_COUNCILS = {

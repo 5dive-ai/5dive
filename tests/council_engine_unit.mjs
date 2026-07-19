@@ -10,7 +10,7 @@ import {
   buildVetoRecord, canonicalVetoRecord, VETO_DEFAULTS, dispositionOf, addSeat, removeSeat,
   THRESHOLD_POLICY, quorumSize,
   canonicalTranscript, validateAgainstSchema, makeAnthropicModelCall, runCouncil, TAKE, VOTE, NODE_VOTE,
-  augmentCanonicalVetoBinding, parseCanonicalVetoBinding,
+  augmentCanonicalVetoBinding, parseCanonicalVetoBinding, triageVerdictToAction,
 } from '../src/council/engine.mjs'
 
 let pass = 0, fail = 0
@@ -188,6 +188,17 @@ ok(parseCanonicalVetoBinding(_vbBase).present === false, 'seal-binding: fail-clo
 // the exercise-time re-seal will no longer match) — proving the digest is now covered by the HMAC.
 const _vbTampered = _vbAug.replace('nonceDigest=deadbeef', 'nonceDigest=cafebabe')
 ok(_vbTampered !== _vbAug && parseCanonicalVetoBinding(_vbTampered).nonceDigest === 'cafebabe', 'seal-binding: swapping the nonce digest changes the sealed canonical (re-seal will break)')
+
+// CNCL-12 T2 ROT-TRIAGE: the fail-closed rule — a tier-2 gate is NEVER cleared by triage.
+const t2gate = { ident: 'DIVE-77', ask: 'Ship the pricing change?', type: 'decision', tier: 2, recommend: 'ship', options: 'ship|hold' }
+const trRebrief = triageVerdictToAction(t2gate, { recommendation: 'escalate', escalated: true, tally: T(0, 0, 3), confidence: 0.6, dissent: 'needs a human', brief: 'Sharper: this touches live pricing — a human must sign off.' })
+ok(trRebrief.action === 'triage-rebrief' && trRebrief.cleared === false, 'triage: action=rebrief, cleared=false')
+ok(!/task answer/.test(trRebrief.command), 'triage: command NEVER contains `task answer`')
+ok(/task need DIVE-77 .*--tier=2/.test(trRebrief.command) && /--from=council-triage/.test(trRebrief.command), 'triage: re-files a SHARPER tier-2 ask + re-escalates')
+// The load-bearing invariant: EVEN an `approve` verdict on a tier-2 gate does NOT clear it.
+const trApprove = triageVerdictToAction(t2gate, { recommendation: 'approve', escalated: false, tally: T(3, 0, 0), confidence: 0.9, dissent: 'none', brief: '' })
+ok(trApprove.cleared === false && !/task answer/.test(trApprove.command), 'triage: an APPROVE verdict STILL never clears a tier-2 gate (fail-closed)')
+ok(trRebrief.command.includes('--options='), 'triage: preserves the original options for the human')
 
 console.log(`\nCNCL-6 engine: ${pass} passed, ${fail} failed (bound to src/council/engine.mjs)`)
 process.exit(fail ? 1 : 0)

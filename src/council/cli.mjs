@@ -333,13 +333,57 @@ function cmdReadBinding() {
   out(E.parseCanonicalVetoBinding(readCanonicalArg()))
 }
 
+// ---- CNCL-12: gate-map (pure guardrail + verdict->action, no side effects) -----------------
+// The auditable heart of `council gate-clear` (T1) and `council rot-triage` (T2). Bash owns
+// every side effect (task show/answer/need/escalate + the convene). This verb ONLY decides:
+//   phase 1 (no --verdict): run the escalate-only guardrail on the gate; emit whether it is
+//           council-decidable + the deliberation QUESTION to convene on (T1), or, for --triage,
+//           the triage question. A guardrail hit on a T1 gate emits the escalate command.
+//   phase 2 (--verdict=<json>): map the sealed convene verdict -> the action command.
+//           --triage forces the T2 mapping (triageVerdictToAction) which NEVER clears.
+function cmdGateMap() {
+  let gate
+  try { gate = JSON.parse(flag('gate') || '') }
+  catch { die('gate-map needs --gate=<json> (from `5dive task show <id> --json`, mapped to {ident,ask,type,tier,recommend,options})') }
+  const triage = flagBool('triage')
+  const verdictRaw = flag('verdict')
+  if (verdictRaw == null || verdictRaw === true) {
+    // Phase 1 — pre-convene guardrail. T2 rot-triage deliberately SKIPS the clearable check
+    // (a tier-2 gate is never clearable; the triage convenes anyway, only to sharpen/re-brief).
+    const guard = E.gateGuardrail(gate)
+    if (triage) {
+      out({ phase: 'guardrail', triage: true, clearable: false,
+        question: `A tier-${gate.tier} gate has sat UNANSWERED for 48h+. You CANNOT clear it (tier-2 is human-only). Ask: "${gate.ask}". Deliberate ONLY to (a) re-brief it sharper for the human, (b) propose a rescope so the work no longer needs this gate, or (c) recommend a park with a wake date. Do NOT approve/clear it.` })
+      return
+    }
+    if (guard.forceEscalate) {
+      const verdict = { recommendation: 'escalate', escalated: true, tally: { approve: 0, reject: 0, escalate: 0 }, confidence: 1,
+        dissent: 'none', brief: `Not council-clearable: ${guard.reason}.` }
+      out({ phase: 'guardrail', clearable: false, reason: guard.reason, ...E.verdictToAction(gate, verdict) })
+      return
+    }
+    out({ phase: 'guardrail', clearable: true, reason: '',
+      question: `A tier-${gate.tier} gate is on the board and needs clearing. Ask: "${gate.ask}". `
+        + (gate.recommend && gate.recommend !== '-'
+            ? `The recommended answer is "${gate.recommend}"${gate.options ? ` (options: ${gate.options})` : ''}. Should the council APPLY that recommendation (approve), reject it, or escalate to a human?`
+            : `Should the council approve, reject, or escalate to a human?`) })
+    return
+  }
+  // Phase 2 — map the verdict to the action command.
+  let verdict
+  try { verdict = JSON.parse(verdictRaw) }
+  catch { die('gate-map --verdict must be the convene verdict JSON') }
+  out({ phase: 'action', ...(triage ? E.triageVerdictToAction(gate, verdict) : E.verdictToAction(gate, verdict)) })
+}
+
 const main = async () => {
   if (sub === 'convene') return cmdConvene()
   if (sub === 'bench') return cmdBench()
   if (sub === 'init') return cmdInit()
   if (sub === 'veto') return cmdVeto()
+  if (sub === 'gate-map') return cmdGateMap()
   if (sub === 'seal-augment') return cmdSealAugment()
   if (sub === 'read-binding') return cmdReadBinding()
-  die(`unknown council subcommand: ${sub} (convene|bench|init|veto|seal-augment|read-binding)`)
+  die(`unknown council subcommand: ${sub} (convene|bench|init|veto|gate-map|seal-augment|read-binding)`)
 }
 main().catch(e => die(String(e && e.message || e), 1))

@@ -1173,6 +1173,31 @@ _hb_gate_shipped_sweep() {
   return 0
 }
 
+# CNCL-12: the recurring rot-triage scan. A tier-2 gate left unanswered 48h+ gets a council
+# convene that ONLY re-briefs it sharper for the human — it NEVER clears a tier-2 gate (the
+# fail-closed rule lives in the pure mapper + a belt-and-suspenders check in `council rot-triage`).
+# DEFAULT OFF: a live convene injects into seat sessions, so this stays gated on an explicit
+# COUNCIL_ROT_TRIAGE=on opt-in AND a seeded genesis, until main's CNCL-7 live-dispatch window.
+# Throttled to once/6h fleet-wide so the same backlog isn't re-convened every wake.
+_HB_COUNCIL_ROT="${COUNCIL_ROT_TRIAGE:-off}"
+_hb_council_rot_sweep() {
+  [[ "$_HB_COUNCIL_ROT" == "on" || "$_HB_COUNCIL_ROT" == "1" ]] || return 0
+  [[ -f "${STATE_DIR}/council/genesis.json" ]] || return 0   # no seeded council -> nothing to convene
+  command -v node >/dev/null 2>&1 || return 0
+  # Fleet-wide throttle: skip if a rot sweep ran within the last 6h.
+  local last; last="$(db "SELECT value FROM task_prefs WHERE key='council_rot_swept_at';" 2>/dev/null)"
+  if [[ -n "$last" ]]; then
+    local recent; recent="$(db "SELECT CASE WHEN $(sqlq "$last") > datetime('now','-6 hours') THEN 1 ELSE 0 END;" 2>/dev/null)"
+    [[ "$recent" == "1" ]] && return 0
+  fi
+  db "INSERT INTO task_prefs (key,value) VALUES ('council_rot_swept_at', datetime('now'))
+        ON CONFLICT(key) DO UPDATE SET value=datetime('now');" 2>/dev/null || true
+  # cmd_council owns the convene + the never-clear guarantee; JSON output kept quiet.
+  local n; n="$(JSON_MODE=1 cmd_council rot-triage --all --older-than-hours=48 2>/dev/null | jq -r '.data.count // 0' 2>/dev/null)" || n=0
+  [[ "$n" =~ ^[0-9]+$ ]] && (( n > 0 )) && _hb_log "[council-rot] re-briefed ${n} stale tier-2 gate(s) (none cleared)"
+  return 0
+}
+
 # DIVE-1416: fleet-stall self-heal, gaps #2 and #3 (gap #1 is _hb_blocked_sweep
 # above; DIVE-1415 extended it to every terminal close, not just done/cancel).
 # DOGFOOD INCIDENT 2026-07-17: the fleet sat ~100% idle ~3h while actionable
@@ -1513,6 +1538,11 @@ cmd_heartbeat_tick() {
   # DIVE-1140: flag open gates whose fix already merged so the overnight recap
   # stops surfacing ghost gates. Flag-only, never auto-closes. Same isolation.
   _hb_gate_shipped_sweep || _hb_log "[gate-shipped] pass errored (non-fatal)"
+  # CNCL-12: rot-triage stale tier-2 gates via a council convene (re-brief only,
+  # NEVER clears). Default OFF (COUNCIL_ROT_TRIAGE=on) — a live convene injects into
+  # seat sessions, so it stays gated on an explicit opt-in until main's CNCL-7 window.
+  # Same isolation contract — a failure here must never abort the wake loop.
+  _hb_council_rot_sweep || _hb_log "[council-rot] pass errored (non-fatal)"
   # DIVE-1416: fleet-stall self-heal gaps #2/#3 — surface stale maker->verifier
   # deliveries, alarm on fleet-idle-while-actionable-work-is-open persisting past
   # its threshold, and a pinger-liveness canary for the DIVE-1434 dead-batch

@@ -66,6 +66,21 @@ _council_help() {
       council, ship, brand, security — fail-closed on an unknown name; add/rm are
       privileged governance writes and need sudo).
 
+  5dive council gate-clear <task|DIVE-N> [--mode=deliberate] [--seats=a,b,c] [--dry-run]
+      (CNCL-12) Route an OPEN tier-1 gate to the council. The escalate-only guardrail
+      runs first: a tier>=2 gate or a human-only type (secret/approval/manual/access)
+      is NEVER self-cleared — it is bumped to a human with a one-paragraph brief. A genuine
+      tier-1 gate is convened (default: the primary Council), and the sealed verdict either
+      CLEARS it (`task answer` with the recommendation) or escalates it with the brief.
+      --dry-run prints the planned action without touching the gate.
+
+  5dive council rot-triage [<task|DIVE-N> | --all] [--older-than-hours=48] [--dry-run]
+      (CNCL-12) Rot-triage stale tier-2 gates: a tier-2 gate left UNANSWERED for 48h+
+      is convened ONLY to re-brief it sharper for the human (and, in that brief, propose
+      a rescope or a park+wake). It NEVER clears a tier-2 gate — tier-2 stays human-only
+      (fail-closed). --all scans every stale tier-2 gate; --dry-run lists them without
+      convening. Wired into the heartbeat behind COUNCIL_ROT_TRIAGE=on (default off).
+
   Add --json for a machine envelope. The default dispatch path needs NO model key
   (each seat uses its own harness). The --standalone seam uses COUNCIL_API_KEY
   (A-with-seam; BYO/OpenRouter via COUNCIL_BASE_URL). COUNCIL_MOCK=1 runs a
@@ -177,6 +192,29 @@ export function nodeVerdictToDecision(node, verdict) {
     command: `5dive task need ${node.ident} --type=decision --tier=2 --ask=${shellQuote(`[council node escalation] ${brief} — decision: ${node.question}`)}`
       + (node.options ? ` --options=${shellQuote(node.options)}` : '')
       + ` && 5dive task escalate ${node.ident} --from=council`,
+    brief,
+  }
+}
+
+// (CNCL-12) T2 ROT-TRIAGE: a tier-2 gate left unanswered 48h. The council re-briefs it
+// sharper (or, in its brief, recommends a rescope/park to the human) and re-escalates —
+// but it NEVER clears a tier-2 gate. This is the fail-closed rule: tier-2 stays human-only,
+// so this mapping has NO `task answer` branch AT ALL, not even for an `approve` verdict.
+// The load-bearing invariant (asserted in the unit test): `.cleared === false` and the
+// command never contains `task answer`, regardless of what the verdict says.
+export function triageVerdictToAction(gate, verdict) {
+  const brief = (verdict && (verdict.brief || verdict.dissent))
+    || 'Council reviewed the stale gate; the human decision still stands and needs an answer.'
+  // Keep the gate human-only: re-file the SAME (or a still-human) type, ALWAYS tier-2, with a
+  // sharper one-paragraph brief, then re-ping the owner. Never downgrades tier, never answers.
+  const t = gate.type && HUMAN_ONLY_TYPES.indexOf(gate.type) === -1 ? gate.type : 'decision'
+  return {
+    action: 'triage-rebrief',
+    cleared: false,
+    command: `5dive task need ${gate.ident} --type=${t} --tier=2 --ask=${shellQuote(`[council triage] ${brief} — original ask: ${gate.ask}`)}`
+      + (gate.recommend && gate.recommend !== '-' ? ` --recommend=${shellQuote(gate.recommend)}` : '')
+      + (gate.options ? ` --options=${shellQuote(gate.options)}` : '')
+      + ` && 5dive task escalate ${gate.ident} --from=council-triage`,
     brief,
   }
 }
@@ -1341,14 +1379,58 @@ function cmdReadBinding() {
   out(E.parseCanonicalVetoBinding(readCanonicalArg()))
 }
 
+// ---- CNCL-12: gate-map (pure guardrail + verdict->action, no side effects) -----------------
+// The auditable heart of `council gate-clear` (T1) and `council rot-triage` (T2). Bash owns
+// every side effect (task show/answer/need/escalate + the convene). This verb ONLY decides:
+//   phase 1 (no --verdict): run the escalate-only guardrail on the gate; emit whether it is
+//           council-decidable + the deliberation QUESTION to convene on (T1), or, for --triage,
+//           the triage question. A guardrail hit on a T1 gate emits the escalate command.
+//   phase 2 (--verdict=<json>): map the sealed convene verdict -> the action command.
+//           --triage forces the T2 mapping (triageVerdictToAction) which NEVER clears.
+function cmdGateMap() {
+  let gate
+  try { gate = JSON.parse(flag('gate') || '') }
+  catch { die('gate-map needs --gate=<json> (from `5dive task show <id> --json`, mapped to {ident,ask,type,tier,recommend,options})') }
+  const triage = flagBool('triage')
+  const verdictRaw = flag('verdict')
+  if (verdictRaw == null || verdictRaw === true) {
+    // Phase 1 — pre-convene guardrail. T2 rot-triage deliberately SKIPS the clearable check
+    // (a tier-2 gate is never clearable; the triage convenes anyway, only to sharpen/re-brief).
+    const guard = E.gateGuardrail(gate)
+    if (triage) {
+      out({ phase: 'guardrail', triage: true, clearable: false,
+        question: `A tier-${gate.tier} gate has sat UNANSWERED for 48h+. You CANNOT clear it (tier-2 is human-only). Ask: "${gate.ask}". Deliberate ONLY to (a) re-brief it sharper for the human, (b) propose a rescope so the work no longer needs this gate, or (c) recommend a park with a wake date. Do NOT approve/clear it.` })
+      return
+    }
+    if (guard.forceEscalate) {
+      const verdict = { recommendation: 'escalate', escalated: true, tally: { approve: 0, reject: 0, escalate: 0 }, confidence: 1,
+        dissent: 'none', brief: `Not council-clearable: ${guard.reason}.` }
+      out({ phase: 'guardrail', clearable: false, reason: guard.reason, ...E.verdictToAction(gate, verdict) })
+      return
+    }
+    out({ phase: 'guardrail', clearable: true, reason: '',
+      question: `A tier-${gate.tier} gate is on the board and needs clearing. Ask: "${gate.ask}". `
+        + (gate.recommend && gate.recommend !== '-'
+            ? `The recommended answer is "${gate.recommend}"${gate.options ? ` (options: ${gate.options})` : ''}. Should the council APPLY that recommendation (approve), reject it, or escalate to a human?`
+            : `Should the council approve, reject, or escalate to a human?`) })
+    return
+  }
+  // Phase 2 — map the verdict to the action command.
+  let verdict
+  try { verdict = JSON.parse(verdictRaw) }
+  catch { die('gate-map --verdict must be the convene verdict JSON') }
+  out({ phase: 'action', ...(triage ? E.triageVerdictToAction(gate, verdict) : E.verdictToAction(gate, verdict)) })
+}
+
 const main = async () => {
   if (sub === 'convene') return cmdConvene()
   if (sub === 'bench') return cmdBench()
   if (sub === 'init') return cmdInit()
   if (sub === 'veto') return cmdVeto()
+  if (sub === 'gate-map') return cmdGateMap()
   if (sub === 'seal-augment') return cmdSealAugment()
   if (sub === 'read-binding') return cmdReadBinding()
-  die(`unknown council subcommand: ${sub} (convene|bench|init|veto|seal-augment|read-binding)`)
+  die(`unknown council subcommand: ${sub} (convene|bench|init|veto|gate-map|seal-augment|read-binding)`)
 }
 main().catch(e => die(String(e && e.message || e), 1))
 COUNCIL_CLI_MJS
@@ -1662,14 +1744,157 @@ _council_init_or_lineage() {
   return 0
 }
 
+# ==================== CNCL-12: gate-rot wiring ====================
+# gate-clear (T1) + rot-triage (T2). Thin orchestrators: they read the gate from the tasks
+# DB, ask the embedded pure `gate-map` verb what to do (guardrail + verdict->action), run the
+# SAME sealed `5dive council convene` path for the deliberation, and drive real `task` verbs.
+# No new seal/persist code — the convene it shells out to owns the tamper-evident receipt.
+_council_bin() { echo "${COUNCIL_5DIVE_BIN:-5dive}"; }
+
+# Emit {ident,ask,type,tier,recommend,options,live} JSON for an OPEN gate, or empty on a miss.
+# `live` = the canonical still-answerable-gate predicate (need_type set, not answered, task open).
+_council_gate_json() {
+  local dir="$1" id="$2" row us
+  us=$'\x1f'
+  row="$(db "SELECT ident||x'1f'||COALESCE(need_type,'')||x'1f'||COALESCE(CAST(tier AS TEXT),'')||x'1f'||COALESCE(recommend,'')||x'1f'||COALESCE(need_options,'')||x'1f'||COALESCE(replace(ask,x'0a',' '),'')||x'1f'||CASE WHEN need_type IS NOT NULL AND need_answered_at IS NULL AND status NOT IN ('done','cancelled') THEN 1 ELSE 0 END FROM tasks WHERE ident=$(sqlq "$id") OR id=$(sqlq "$id") LIMIT 1;" 2>/dev/null)" || return 1
+  [[ -n "$row" ]] || return 1
+  local ident gtype gtier grec gopts gask glive
+  IFS="$us" read -r ident gtype gtier grec gopts gask glive <<<"$row"
+  # A missing tier defaults to 2 (fail-closed: unknown risk is treated as a hard human gate).
+  [[ -n "$gtier" ]] || gtier=2
+  jq -nc --arg ident "$ident" --arg ask "$gask" --arg type "$gtype" \
+         --argjson tier "$gtier" --arg recommend "$grec" --arg options "$gopts" --argjson live "${glive:-0}" \
+    '{ident:$ident, ask:$ask, type:$type, tier:$tier, recommend:$recommend, options:$options, live:$live}'
+}
+
+# Run the sealed primary-council convene on a question, return the --json envelope.
+_council_convene_json() {
+  local q="$1"; shift
+  "$(_council_bin)" council convene "$q" --json "$@" 2>/dev/null
+}
+
+_council_gate_clear() {
+  local dir="$1"; shift
+  local id="" mode="deliberate" dry=0; local -a seat_args=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --dry-run) dry=1 ;;
+      --mode=*) mode="${1#--mode=}" ;;
+      --seats=*|--bench=*|--timeout=*|--idle-secs=*|--poll-secs=*|--standalone) seat_args+=("$1") ;;
+      --*) ;;  # ignore unknown flags
+      *) id="$1" ;;
+    esac; shift
+  done
+  [[ -n "$id" ]] || fail "$E_USAGE" "gate-clear needs a task id: 5dive council gate-clear <task|DIVE-N>"
+  local gate; gate="$(_council_gate_json "$dir" "$id")" || fail "$E_NOT_FOUND" "no such task: $id"
+  [[ "$(printf '%s' "$gate" | jq -r '.live')" == "1" ]] || fail "$E_VALIDATION" "$id has no open human gate to clear (already answered, or not a gate)"
+
+  # Phase 1 — escalate-only guardrail (never convene a hard-gate class).
+  local plan1 clearable; plan1="$(node "$dir/cli.mjs" gate-map --gate="$gate")" || fail "$E_GENERIC" "gate-map failed"
+  clearable="$(printf '%s' "$plan1" | jq -r '.clearable')"
+  if [[ "$clearable" != "true" ]]; then
+    local cmd; cmd="$(printf '%s' "$plan1" | jq -r '.command')"
+    _council_emit_gate_result "$dry" "escalate" "$id" "$(printf '%s' "$plan1" | jq -r '.reason')" "$cmd"
+    return 0
+  fi
+
+  # Phase 2 — convene the primary council on the question from the guardrail, seal the receipt.
+  local q; q="$(printf '%s' "$plan1" | jq -r '.question')"
+  local env; env="$(_council_convene_json "$q" --mode="$mode" "${seat_args[@]}")" || fail "$E_GENERIC" "convene failed"
+  local verdict digest; verdict="$(printf '%s' "$env" | jq -c '.data.verdict')"; digest="$(printf '%s' "$env" | jq -r '.data.sealedDigest // empty')"
+  [[ -n "$verdict" && "$verdict" != "null" ]] || fail "$E_GENERIC" "convene returned no verdict"
+
+  # Phase 3 — map the sealed verdict to the action command and run it.
+  local plan2 action cmd; plan2="$(node "$dir/cli.mjs" gate-map --gate="$gate" --verdict="$verdict")" || fail "$E_GENERIC" "gate-map (verdict) failed"
+  action="$(printf '%s' "$plan2" | jq -r '.action')"; cmd="$(printf '%s' "$plan2" | jq -r '.command')"
+  _council_emit_gate_result "$dry" "$action" "$id" "receipt ${digest:0:16}…" "$cmd"
+}
+
+# Execute (or, on --dry-run, just print) a gate-map command. The command is a self-contained
+# `5dive task ...` string built by the pure mapper; we run it through bash -c against the CLI.
+_council_emit_gate_result() {
+  local dry="$1" action="$2" id="$3" note="$4" cmd="$5"
+  if (( dry )); then
+    if (( JSON_MODE )); then jq -nc --arg a "$action" --arg id "$id" --arg n "$note" --arg c "$cmd" '{ok:true,data:{dryRun:true,action:$a,gate:$id,note:$n,command:$c}}'
+    else echo "would $action $id ($note): $cmd"; fi
+    return 0
+  fi
+  # Route the emitted `5dive ...` verbs through our own binary (test override honored).
+  local runnable="${cmd//5dive /$(_council_bin) }"
+  bash -c "$runnable" >/dev/null 2>&1 || true
+  if (( JSON_MODE )); then jq -nc --arg a "$action" --arg id "$id" --arg n "$note" --arg c "$cmd" '{ok:true,data:{action:$a,gate:$id,note:$n,command:$c}}'
+  else echo "council $action: $id ($note)"; fi
+}
+
+_council_rot_triage() {
+  local dir="$1"; shift
+  local id="" all=0 hours=48 dry=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --all) all=1 ;;
+      --dry-run) dry=1 ;;
+      --older-than-hours=*) hours="${1#--older-than-hours=}" ;;
+      --*) ;;
+      *) id="$1" ;;
+    esac; shift
+  done
+  [[ "$hours" =~ ^[0-9]+$ ]] || hours=48
+  local -a idents=()
+  if [[ -n "$id" ]]; then
+    idents+=("$id")
+  elif (( all )); then
+    # Stale tier-2 (or legacy NULL-tier) gates, oldest first. Mirrors the heartbeat T2 predicate,
+    # but gated on the gate-file time (need_asked_at) crossing the 48h threshold.
+    local list; list="$(db "SELECT ident FROM tasks WHERE need_type IS NOT NULL AND need_answered_at IS NULL AND status NOT IN ('done','cancelled') AND (tier=2 OR tier IS NULL) AND need_asked_at IS NOT NULL AND need_asked_at <= datetime('now','-${hours} hours') ORDER BY need_asked_at ASC;" 2>/dev/null)"
+    while IFS= read -r _l; do [[ -n "$_l" ]] && idents+=("$_l"); done <<<"$list"
+  else
+    fail "$E_USAGE" "rot-triage needs a task id or --all"
+  fi
+  if [[ ${#idents[@]} -eq 0 ]]; then
+    if (( JSON_MODE )); then jq -nc '{ok:true,data:{triaged:[],count:0}}'; else echo "rot-triage: no stale tier-2 gates (>=${hours}h)"; fi
+    return 0
+  fi
+  local -a done_idents=()
+  local it
+  for it in "${idents[@]}"; do
+    local gate; gate="$(_council_gate_json "$dir" "$it")" || continue
+    [[ "$(printf '%s' "$gate" | jq -r '.live')" == "1" ]] || continue
+    # FAIL-CLOSED: only triage genuine tier>=2 gates (never a tier-1, which gate-clear handles).
+    local gtier; gtier="$(printf '%s' "$gate" | jq -r '.tier')"
+    [[ "$gtier" -ge 2 ]] 2>/dev/null || continue
+    if (( dry )); then done_idents+=("$it"); continue; fi
+    # Convene the triage question (the guardrail phase1 with --triage builds it). NEVER clears.
+    local plan1 q; plan1="$(node "$dir/cli.mjs" gate-map --gate="$gate" --triage)" || continue
+    q="$(printf '%s' "$plan1" | jq -r '.question')"
+    local env verdict; env="$(_council_convene_json "$q" --mode=adversarial)" || continue
+    verdict="$(printf '%s' "$env" | jq -c '.data.verdict')"; [[ -n "$verdict" && "$verdict" != "null" ]] || continue
+    local plan2 cmd; plan2="$(node "$dir/cli.mjs" gate-map --gate="$gate" --triage --verdict="$verdict")" || continue
+    # Belt-and-suspenders: the pure mapper never emits `task answer` for a triage, but assert it here
+    # too — a triage must NEVER clear a tier-2 gate even if the mapping ever regresses.
+    cmd="$(printf '%s' "$plan2" | jq -r '.command')"
+    if printf '%s' "$cmd" | grep -q 'task answer'; then
+      continue   # refuse: fail-closed, a tier-2 triage NEVER clears (should be unreachable)
+    fi
+    local runnable="${cmd//5dive /$(_council_bin) }"
+    bash -c "$runnable" >/dev/null 2>&1 || true
+    done_idents+=("$it")
+  done
+  if (( JSON_MODE )); then
+    printf '%s\n' "${done_idents[@]}" | jq -R . | jq -sc --argjson dry "$dry" '{ok:true,data:{triaged:map(select(length>0)),count:(map(select(length>0))|length),dryRun:($dry==1)}}'
+  else
+    local _verb="re-briefed, none cleared"; (( dry )) && _verb="to triage (dry-run)"
+    echo "rot-triage: ${#done_idents[@]} tier-2 gate(s) ${_verb}: ${done_idents[*]}"
+  fi
+}
+
 cmd_council() {
   command -v node >/dev/null 2>&1 || fail "$E_GENERIC" "5dive council needs node on PATH"
   command -v jq   >/dev/null 2>&1 || fail "$E_GENERIC" "5dive council needs jq on PATH"
   local sub="${1:-}"; [[ $# -gt 0 ]] && shift || true
   case "$sub" in
     ""|-h|--help|help) _council_help; return 0 ;;
-    convene|bench|init|lineage|veto) ;;
-    *) fail "$E_USAGE" "unknown council command: $sub (convene|bench|init|lineage|veto)" ;;
+    convene|bench|init|lineage|veto|gate-clear|rot-triage) ;;
+    *) fail "$E_USAGE" "unknown council command: $sub (convene|bench|init|lineage|veto|gate-clear|rot-triage)" ;;
   esac
 
   local dir; dir="$(mktemp -d -t 5dive-council.XXXXXX)" || fail "$E_GENERIC" "mktemp failed"
@@ -1686,6 +1911,16 @@ cmd_council() {
   # CNCL-9: authenticated founder veto exercise (the confirmed tap) ---------
   if [[ "$sub" == "veto" ]]; then
     _council_veto "$dir" "$@"
+    return $?
+  fi
+
+  # CNCL-12: gate-rot wiring — clear a tier-1 gate / rot-triage stale tier-2 gates.
+  if [[ "$sub" == "gate-clear" ]]; then
+    _council_gate_clear "$dir" "$@"
+    return $?
+  fi
+  if [[ "$sub" == "rot-triage" ]]; then
+    _council_rot_triage "$dir" "$@"
     return $?
   fi
 
