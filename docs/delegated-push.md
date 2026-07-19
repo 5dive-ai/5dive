@@ -17,7 +17,7 @@ model is summarized at the end here.
 
 A push that runs **only** when all of these hold:
 
-- the task carries a ship **gate** a human has answered and not rejected;
+- the task carries a ship **gate** cleared by a human or its designated routed reviewer;
 - the target is a **feature branch** (never `main`/`master`);
 - every commit being pushed is authored by your configured **commit author**
   (so provider team-checks like Vercel stay green).
@@ -136,7 +136,7 @@ instead of `--branch`. Point at a different repo with `--repo=https://github.com
   ~9 minutes. A captured token can't reach other repos in your org.
 - **Gate is authoritative root-side.** The cleared-gate predicate is re-read
   fresh from the task DB inside `_push_do`, not trusted from the caller — so a
-  direct `sudo 5dive _push_do` can't bypass the human gate.
+  direct `sudo 5dive _push_do` can't bypass the signed human/reviewer gate.
 - **Input hardening.** Branch, URL, and repo-path are validated against flag,
   refspec, and traversal injection before reaching `git`; parameters travel over
   stdin (never argv), which keeps the sudoers grant an exact command path.
@@ -147,9 +147,11 @@ instead of `--branch`. Point at a different repo with `--repo=https://github.com
 
 | Symptom | Cause / fix |
 | --- | --- |
-| `no gate on <task>` | File and clear a ship gate first: `5dive task need <task> --type=approval --ask=...`, then a human answers it. |
+| `no gate on <task>` | File and clear a ship gate first: `5dive task need <task> --type=approval --ask=...`; a human or the routed verifier must answer it. |
 | `gate … is OPEN` | The gate hasn't been answered yet. |
-| `gate … was REJECTED` | The human answered no. Push stays refused. |
+| `gate … was REJECTED` | The human or routed verifier answered no. Push stays refused. |
+| `unauthorized provenance` | An auto-clear or unrelated agent answered the gate. File a ship gate routed to the verifier (or have a human clear it). |
+| `no valid signed closure` | The authoritative gate record is unsigned or was changed after closure. Re-file and clear the ship gate through `5dive task answer`. |
 | `author check FAILED` | A commit isn't authored by the configured `GITHUB_APP_COMMIT_AUTHOR`. Re-author with `git rebase --exec 'git commit --amend --author="Name <email>" --no-edit'`, or clear the setting to drop the restriction. |
 | `missing GitHub App credential` | `github-app.env`/`.pem` absent or unreadable. Re-run `sudo 5dive push setup`. |
 | `NOPASSWD grant for '_push_do' is missing` | Standard agent lacks the sudoers line (step 4). |

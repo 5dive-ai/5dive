@@ -32,6 +32,8 @@ done
 STATE_DIR="$TMP"
 TASKS_DIR="$STATE_DIR/tasks"
 TASKS_DB="$TASKS_DIR/tasks.db"
+GATE_PROOF_KEY="$STATE_DIR/gate-proof.key"
+GATE_PROOF_ENFORCE="$STATE_DIR/gate-proof.enforce"
 JSON_MODE=0
 # Hermetic: point the App env at an absent path so the pre-flight never reads the
 # box's real /etc/5dive/connectors/github-app.env. The committer to enforce is
@@ -39,6 +41,7 @@ JSON_MODE=0
 export GITHUB_APP_ENV="$TMP/no-app-env"
 unset GITHUB_APP_COMMIT_AUTHOR
 mkdir -p "$TASKS_DIR"
+printf '%064d\n' 1496 > "$GATE_PROOF_KEY"
 set +e
 
 tasks_db_init
@@ -53,11 +56,21 @@ OTHER='Bob Byte <bob@example.test>'        # a non-matching author
 
 # Seed a task with an optional body + gate state.
 # seed_task <ident> <body> <need_type> <need_answered_at> <need_answer>
+#           [answered_by] [routed_reviewer] [sign=1]
 seed_task() {
+  local answered_by="${6:-human:test}" reviewer="${7:-}" sign="${8:-1}" id sig
   db "INSERT INTO tasks(ident,project_key,title,status,assignee,kind,body,
-         need_type,need_answered_at,need_answer)
+         need_type,need_answered_at,need_answer,need_answered_by,
+         need_answered_uid,routed_reviewer)
       VALUES($(sqlq "$1"),'dive',$(sqlq "t-$1"),'in_progress','dev','standard',
-             $(sqlq "$2"),$(sqlq_or_null "$3"),$(sqlq_or_null "$4"),$(sqlq_or_null "$5"));"
+             $(sqlq "$2"),$(sqlq_or_null "$3"),$(sqlq_or_null "$4"),
+             $(sqlq_or_null "$5"),$(sqlq_or_null "$answered_by"),1000,
+             $(sqlq_or_null "$reviewer"));"
+  if [[ -n "$4" && "$sign" == "1" ]]; then
+    id=$(db "SELECT id FROM tasks WHERE ident=$(sqlq "$1");")
+    sig=$(_gate_closure_sign "$id" "$3" "$5" "$answered_by" "$4" 1000)
+    db "UPDATE tasks SET need_answer_sig=$(sqlq "$sig") WHERE id=${id};"
+  fi
 }
 
 # A scratch git repo so the author-scan + branch-existence checks run for real.
@@ -169,6 +182,10 @@ gate_check() { # <ident> -> combined output; rc via subshell (fail exits it)
   local i; i=$(db "SELECT id FROM tasks WHERE ident=$(sqlq "$1");")
   ( _push_gate_check "$i" "$1" ) 2>&1
 }
+authoritative_gate_check() {
+  local i; i=$(db "SELECT id FROM tasks WHERE ident=$(sqlq "$1");")
+  ( _push_gate_check "$i" "$1" 1 ) 2>&1
+}
 
 # cleared gate (DIVE-907 seeded above: answered approval "yes ship it") -> ok
 out=$(gate_check DIVE-907); rc=$?
@@ -189,6 +206,47 @@ out=$(gate_check DIVE-905); rc=$?
 { [[ $rc -ne 0 ]] && grep -qi "REJECTED" <<<"$out"; } \
   && ok_t "gate predicate: rejected -> refuse" || bad_t "gate predicate: rejected -> refuse" "rc=$rc :: $out"
 
+# DIVE-1496: a designated routed reviewer is a valid ship-gate approver. The
+# authoritative path additionally demands the root-HMAC closure signature.
+seed_task DIVE-923 "Branch: feature-ok" approval "2026-07-18 00:00:00" \
+  "yes" "lead:main" "main"
+out=$(authoritative_gate_check DIVE-923); rc=$?
+[[ $rc -eq 0 ]] \
+  && ok_t "gate predicate: signed routed reviewer -> pass" \
+  || bad_t "gate predicate: signed routed reviewer -> pass" "rc=$rc :: $out"
+
+out=$(authoritative_gate_check DIVE-907); rc=$?
+[[ $rc -eq 0 ]] \
+  && ok_t "gate predicate: signed human -> pass" \
+  || bad_t "gate predicate: signed human -> pass" "rc=$rc :: $out"
+
+seed_task DIVE-924 "Branch: feature-ok" decision "2026-07-18 00:00:00" \
+  "yes" "auto:ttl" "main"
+out=$(authoritative_gate_check DIVE-924); rc=$?
+{ [[ $rc -ne 0 ]] && grep -qi "unauthorized provenance" <<<"$out"; } \
+  && ok_t "gate predicate: auto-clear -> refuse" \
+  || bad_t "gate predicate: auto-clear -> refuse" "rc=$rc :: $out"
+
+seed_task DIVE-925 "Branch: feature-ok" approval "2026-07-18 00:00:00" \
+  "yes" "lead:other" "main"
+out=$(authoritative_gate_check DIVE-925); rc=$?
+{ [[ $rc -ne 0 ]] && grep -qi "unauthorized provenance" <<<"$out"; } \
+  && ok_t "gate predicate: wrong reviewer -> refuse" \
+  || bad_t "gate predicate: wrong reviewer -> refuse" "rc=$rc :: $out"
+
+seed_task DIVE-926 "Branch: feature-ok" approval "2026-07-18 00:00:00" \
+  "yes" "human:test" "" 0
+out=$(authoritative_gate_check DIVE-926); rc=$?
+{ [[ $rc -ne 0 ]] && grep -qi "no valid signed closure" <<<"$out"; } \
+  && ok_t "gate predicate: unsigned human closure -> refuse" \
+  || bad_t "gate predicate: unsigned human closure -> refuse" "rc=$rc :: $out"
+
+db "UPDATE tasks SET need_answer='changed after signing' WHERE ident='DIVE-923';"
+out=$(authoritative_gate_check DIVE-923); rc=$?
+{ [[ $rc -ne 0 ]] && grep -qi "no valid signed closure" <<<"$out"; } \
+  && ok_t "gate predicate: tampered reviewer closure -> refuse" \
+  || bad_t "gate predicate: tampered reviewer closure -> refuse" "rc=$rc :: $out"
+
 # cmd_push hands the real push to the root helper over STDIN (the privileged work
 # — gate/author/mint/push — is authoritative there; agent never holds a token).
 grep -Eq 'sudo -n /usr/local/bin/5dive _push_do' "$SRC/cmd_push.sh" \
@@ -197,6 +255,9 @@ grep -Eq 'sudo -n /usr/local/bin/5dive _push_do' "$SRC/cmd_push.sh" \
 grep -Eq 'printf .* "\$ident" "\$repopath" "\$branch" "\$repo"' "$SRC/cmd_push.sh" \
   && ok_t "cmd_push passes params over stdin (not argv)" \
   || bad_t "cmd_push passes params over stdin" "params not piped to _push_do"
+grep -Fq '_push_gate_check "$id" "$ident" 1' "$SRC/cmd_push.sh" \
+  && ok_t "root push requires signed gate closure" \
+  || bad_t "root push requires signed gate closure" "authoritative flag missing"
 
 # --- DIVE-1460 input hardening: _push_do runs as ROOT on agent-controlled
 # branch/url/repo-path. _push_validate_inputs must reject flag/refspec/traversal

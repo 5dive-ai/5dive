@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.11.17 — Delegated push accepts signed verifier ship gates (DIVE-1496) (2026-07-19)
+
+- fix(push): let a builder land an approved feature branch without a lodar transport handoff when the task's ship gate was cleared by its designated routed reviewer. The root-only push path verifies the persisted HMAC closure and accepts only `human:*` or the exact `lead:<routed_reviewer>` provenance; auto-clears, bare/unrelated agent answers, unsigned rows, tampered closures, and direct `_push_do` attempts all fail closed. Protected `main`/`master`, task-to-branch binding, configured author enforcement, repo-scoped short-lived GitHub App credentials, and no-token-to-agent guarantees are unchanged.
+- docs/tests: document the reviewer-cleared ship path and cover signed human/reviewer success plus auto, provenance-mismatch, unsigned, and tampered-record refusals.
+
 ## 0.11.16 — The Council: governance surface — roster/log/verify + promote/demote motions with recusal, constitutional auto-class, hash-chained lineage (CNCL-11) (2026-07-19)
 
 - `5dive council roster` — live seats + pass threshold/quorum + founder-veto holder + sealed lineage head.

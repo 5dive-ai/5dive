@@ -26,7 +26,7 @@ esac
 
 # Bumped on every public release. `build.sh` checks this line exists; CI fails
 # the bundle-drift check if it's missing or empty.
-readonly FIVE_VERSION="0.11.16"
+readonly FIVE_VERSION="0.11.17"
 
 # GitHub org our repos live under. The org is being renamed
 # 5dive-com -> 5dive-ai (2026-06); fetches must work on either side of the
@@ -31702,25 +31702,40 @@ _push_repo_name() {
   local n="${1##*/}"; printf '%s' "${n%.git}"
 }
 
-# _push_gate_check <id> <ident> — the ONE cleared-gate predicate (DIVE-1376/1460).
-# The task must carry a gate that is ANSWERED and whose answer is not a rejection.
-# Called by BOTH the `cmd_push` pre-flight AND the root-only `_push_do` (which is
-# authoritative), so a direct `sudo 5dive _push_do` can't bypass the human gate.
-# Fails via `fail` on any miss (no gate / open / rejected); returns 0 only when
-# the gate is genuinely cleared.
+# _push_gate_check <id> <ident> [require-signature] — the ONE cleared-gate
+# predicate (DIVE-1376/1460/1496). The task must carry an answered, non-rejected
+# gate cleared by either a proven human OR the gate's designated routed reviewer.
+# A bare agent answer and every auto-clear provenance are deliberately excluded:
+# neither authorizes a git write. The friendly agent-side preflight checks the
+# persisted provenance; root `_push_do` passes require-signature=1 and also
+# verifies the root-HMAC closure, so raw DB edits cannot forge authorization.
 _push_gate_check() {
-  local id="$1" ident="$2" gtype ganswer gansweredat
+  local id="$1" ident="$2" require_sig="${3:-0}"
+  local gtype ganswer gansweredat gby guid gsig reviewer authorized=0
   gtype=$(db "SELECT COALESCE(need_type,'')          FROM tasks WHERE id=${id};")
   gansweredat=$(db "SELECT COALESCE(need_answered_at,'') FROM tasks WHERE id=${id};")
   ganswer=$(db "SELECT COALESCE(need_answer,'')       FROM tasks WHERE id=${id};")
+  gby=$(db "SELECT COALESCE(need_answered_by,'')      FROM tasks WHERE id=${id};")
+  guid=$(db "SELECT COALESCE(need_answered_uid,'')    FROM tasks WHERE id=${id};")
+  gsig=$(db "SELECT COALESCE(need_answer_sig,'')      FROM tasks WHERE id=${id};")
+  reviewer=$(db "SELECT COALESCE(routed_reviewer,'')  FROM tasks WHERE id=${id};")
   if [[ -z "$gtype" ]]; then
-    fail "$E_VALIDATION" "no gate on ${ident}: file a ship gate first (5dive task need ${ident} --type=approval --ask=...) — push only runs after a human clears it."
+    fail "$E_VALIDATION" "no gate on ${ident}: file a ship gate first (5dive task need ${ident} --type=approval --ask=...) — push only runs after a human or its routed reviewer clears it."
   fi
   if [[ -z "$gansweredat" ]]; then
     fail "$E_VALIDATION" "gate on ${ident} is OPEN (unanswered ${gtype}) — push refused until it clears (5dive task answer ${ident} ...)."
   fi
   if printf '%s' "$ganswer" | grep -qiE '^\s*(no|reject|deny|denied|block)'; then
     fail "$E_VALIDATION" "gate on ${ident} was REJECTED ('${ganswer}') — push refused."
+  fi
+  [[ "$gby" == human:* ]] && authorized=1
+  [[ -n "$reviewer" && "$gby" == "lead:${reviewer}" ]] && authorized=1
+  if (( ! authorized )); then
+    fail "$E_VALIDATION" "gate on ${ident} was cleared by unauthorized provenance '${gby:-unknown}' — delegated push requires a human or the gate's designated routed reviewer."
+  fi
+  if [[ "$require_sig" == "1" ]] \
+      && ! _gate_closure_verify "$id" "$gtype" "$ganswer" "$gby" "$gansweredat" "$guid" "$gsig"; then
+    fail "$E_VALIDATION" "gate on ${ident} has no valid signed closure — delegated push refused (the authoritative gate record may be unsigned or tampered)."
   fi
 }
 
@@ -31929,7 +31944,7 @@ cmd_push_do() {
   tasks_db_init
   resolve_task_id "$ident"
   local id="$RESOLVED_TASK_ID"; ident="$RESOLVED_TASK_IDENT"
-  _push_gate_check "$id" "$ident"
+  _push_gate_check "$id" "$ident" 1
 
   # Authoritative branch binding (DIVE-1462) — the caller-supplied branch must be
   # the branch the cited task itself declares, so a granted agent can't reuse one
