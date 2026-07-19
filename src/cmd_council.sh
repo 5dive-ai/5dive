@@ -1497,7 +1497,9 @@ _council_veto() {
   [[ -n "$presented_digest" && "$presented_digest" == "$stored_nonce_digest" ]] || { _council_veto_audit "nonce-mismatch" "$rcpt_digest" "$offer_resolved"; fail "$E_PERMISSION" "veto nonce mismatch — this tap is not the one offered to the founder principal (refused + logged)"; }
 
   # Derive the tier from the clock unless explicitly given: within the HOLD window -> hold; after it
-  # (up to veto_posthoc) -> posthoc; beyond posthoc -> refused (the veto has expired, pass is final).
+  # (up to veto_posthoc) -> posthoc; at/beyond the posthoc deadline -> refused (window expired, pass
+  # is final). Boundary is inclusive: a zero/already-past window IS expired the instant it is reached
+  # (now_e >= st_e + posthoc), so a 0s window never admits a same-second exercise — no clock race.
   local now_e ea_e st_e posthoc="${COUNCIL_VETO_POSTHOC_SECS:-172800}"
   [[ "$posthoc" =~ ^[0-9]+$ ]] || posthoc=172800
   now_e="$(date -u +%s)"
@@ -1506,7 +1508,7 @@ _council_veto() {
   if [[ -z "$tier" ]]; then
     if (( ea_e > 0 && now_e < ea_e )); then tier="hold"; else tier="posthoc"; fi
   fi
-  if [[ "$tier" == "posthoc" ]] && (( st_e > 0 && now_e > st_e + posthoc )); then
+  if [[ "$tier" == "posthoc" ]] && (( st_e > 0 && now_e >= st_e + posthoc )); then
     fail "$E_GENERIC" "veto window expired (past veto_posthoc=${posthoc}s from seal) — the pass is final, no override (fail-closed)"
   fi
 
