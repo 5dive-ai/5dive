@@ -31,4 +31,11 @@ if ! bash "tests/council_gate_e2e.sh"; then echo "FAILED: tests/council_gate_e2e
 echo "=== tests/council_cosign_e2e.sh"
 if ! bash "tests/council_cosign_e2e.sh"; then echo "FAILED: tests/council_cosign_e2e.sh"; rc=1; fi
 
+# CNCL-11: the governance-surface WIRING e2e (real 5dive council {roster,promote,demote,log,verify}
+# bundle — a promote/demote runs as a convened motion, its receipt + roster join the tamper-evident
+# lineage, recusal drops the subject, and verify goes RED on an edited/dropped/reordered record).
+# Same self-SKIP-when-can't-seal posture as the veto e2e.
+echo "=== tests/council_roster_lineage_e2e.sh"
+if ! bash "tests/council_roster_lineage_e2e.sh"; then echo "FAILED: tests/council_roster_lineage_e2e.sh"; rc=1; fi
+
 exit $rc

@@ -1,0 +1,105 @@
+#!/usr/bin/env bash
+# CNCL-11 bash e2e — the GOVERNANCE SURFACE wiring (roster / log / verify / promote / demote),
+# not just the node engine. Drives the real `5dive council {init,roster,promote,demote,log,verify}`
+# bundle against an isolated STATE_DIR + a self-provisioned gate-proof key, and asserts the
+# acceptance: a promote/demote runs as a convened motion whose receipt + resulting roster join the
+# tamper-evident lineage; roster shows the live seats + threshold + veto holder + lineage head;
+# recusal drops the subject; `verify` is green while the chain is intact and RED after a tampered,
+# dropped, or reordered record. Offline: COUNCIL_MOCK (mock all-approve votes), no network/tasks.db.
+#
+# Needs root (the gate-proof seal runs in-process against the isolated STATE_DIR). Re-execs under
+# passwordless sudo when available; SKIPs (green) otherwise — same posture as council_veto_e2e.sh.
+set -uo pipefail
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"; cd "$ROOT"
+FIVE="$ROOT/5dive"
+
+for b in node jq openssl sha256sum; do
+  command -v "$b" >/dev/null 2>&1 || { echo "SKIP: $b not on PATH (council roster/lineage e2e needs it)"; exit 0; }
+done
+[[ -x "$FIVE" ]] || { echo "SKIP: built ./5dive not found (run ./build.sh first)"; exit 0; }
+
+if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
+  if sudo -n true 2>/dev/null; then exec sudo -n env PATH="$PATH" bash "$0" "$@"; fi
+  echo "SKIP: council roster/lineage e2e needs root (in-process gate-proof seal) and passwordless sudo is unavailable"
+  exit 0
+fi
+
+TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
+export STATE_DIR="$TMP" COUNCIL_MOCK=1
+LIN="$TMP/council/lineage.jsonl"
+pass=0; fail=0
+ok(){ echo "  ok:   $1"; pass=$((pass+1)); }
+no(){ echo "  FAIL: $1"; fail=$((fail+1)); }
+
+# --- genesis: seed a 3-seat council (main chairs) ------------------------------------------------
+"$FIVE" council init --seats="main:chair,theo,olivia" --threshold="majority" --veto="tg:433634012" >/dev/null 2>&1 \
+  || { echo "FAIL: council init (cannot seal genesis — no gate-proof rail?)"; exit 1; }
+
+# --- roster: live seats + threshold + veto holder + lineage head ---------------------------------
+R="$("$FIVE" council roster --json 2>/dev/null)"
+[[ "$(printf '%s' "$R" | jq -r '.data.seatCount')" == "3" ]] && ok "roster shows 3 seeded seats" || no "roster seatCount != 3 ($R)"
+[[ "$(printf '%s' "$R" | jq -r '.data.threshold')" == "2" ]] && ok "roster threshold = majority(3)=2" || no "roster threshold wrong"
+[[ "$(printf '%s' "$R" | jq -r '.data.veto.principal')" == "tg:433634012" ]] && ok "roster shows the founder-veto principal" || no "roster veto principal wrong"
+[[ "$(printf '%s' "$R" | jq -r '.data.lineage.records')" == "1" ]] && ok "roster lineage head = 1 record (genesis)" || no "roster lineage records != 1"
+
+# --- verify: intact single-record chain is GREEN ------------------------------------------------
+"$FIVE" council verify >/dev/null 2>&1 && ok "verify GREEN on the seeded genesis" || no "verify RED on a fresh genesis"
+
+# --- PROMOTE: a convened motion that carries and seats a new member ------------------------------
+P="$("$FIVE" council promote --subject=codex --lens="codex — engineering rigor." --mode=quick --json 2>/dev/null)"
+[[ "$(printf '%s' "$P" | jq -r '.data.carried')" == "true" ]] && ok "promote carried (mock all-approve)" || no "promote did not carry ($P)"
+[[ "$(printf '%s' "$P" | jq -r '.data.motion')" == "promote" ]] && ok "motion class auto-classified: promote" || no "promote class wrong"
+R2="$("$FIVE" council roster --json 2>/dev/null)"
+[[ "$(printf '%s' "$R2" | jq -r '.data.seatCount')" == "4" ]] && ok "roster grew to 4 seats after promote" || no "roster did not grow"
+printf '%s' "$R2" | jq -e '.data.seats[] | select(.id=="codex")' >/dev/null 2>&1 && ok "codex now holds a seat" || no "codex not seated"
+[[ "$(printf '%s' "$R2" | jq -r '.data.lineage.records')" == "2" ]] && ok "promote record joined the lineage (2 records)" || no "promote not chained into lineage"
+# the motion record links back to the convene receipt that decided it
+[[ -n "$(tail -n1 "$LIN" | jq -r '.record.receiptDigest // empty')" ]] && ok "motion record carries the convene receiptDigest (receipts join the chain)" || no "motion record has no receiptDigest"
+"$FIVE" council verify >/dev/null 2>&1 && ok "verify GREEN after promote (chain intact)" || no "verify RED after a legit promote"
+
+# --- DEMOTE: subject recuses; roster shrinks -----------------------------------------------------
+D="$("$FIVE" council demote --subject=theo --mode=quick --json 2>/dev/null)"
+[[ "$(printf '%s' "$D" | jq -r '.data.carried')" == "true" ]] && ok "demote carried" || no "demote did not carry ($D)"
+[[ "$(tail -n1 "$LIN" | jq -r '.record.recused | join(",")')" == "theo" ]] && ok "recusal recorded: subject 'theo' recused from its own demotion" || no "recusal not recorded"
+R3="$("$FIVE" council roster --json 2>/dev/null)"
+[[ "$(printf '%s' "$R3" | jq -r '.data.seatCount')" == "3" ]] && ok "roster shrank to 3 after demote" || no "roster did not shrink"
+printf '%s' "$R3" | jq -e '.data.seats[] | select(.id=="theo")' >/dev/null 2>&1 && no "theo still seated after demote" || ok "theo no longer holds a seat"
+
+# --- log: past verdicts (genesis + 2 motions) ---------------------------------------------------
+L="$("$FIVE" council log --json 2>/dev/null)"
+[[ "$(printf '%s' "$L" | jq -r '.data.entries | length')" == "3" ]] && ok "log lists all 3 sealed records" || no "log count wrong"
+[[ "$(printf '%s' "$L" | jq -r '[.data.entries[] | select(.kind=="motion")] | length')" == "2" ]] && ok "log shows 2 motion verdicts" || no "log motion count wrong"
+
+# --- verify: still GREEN across the full 3-record chain -----------------------------------------
+"$FIVE" council verify >/dev/null 2>&1 && ok "verify GREEN across genesis + promote + demote" || no "verify RED on an intact 3-record chain"
+
+# --- guardrails: bad-subject motions are refused fail-closed ------------------------------------
+"$FIVE" council promote --subject=main --mode=quick >/dev/null 2>&1 && no "promote of an already-seated member was NOT refused" || ok "promote of an existing seat refused (fail-closed)"
+"$FIVE" council demote --subject=ghost --mode=quick >/dev/null 2>&1 && no "demote of a non-seat was NOT refused" || ok "demote of a non-member refused (fail-closed)"
+
+# ================= TAMPER DETECTION — verify must go RED ==========================================
+# (a) EDIT a record's canonical: re-seal no longer matches its stored digest.
+cp "$LIN" "$TMP/lin.bak"
+{ head -n1 "$TMP/lin.bak"
+  sed -n '2p' "$TMP/lin.bak" | jq -c '.canonical |= (. + "\ntampered: yes")'
+  tail -n1 "$TMP/lin.bak"
+} > "$LIN"
+"$FIVE" council verify >/dev/null 2>&1 && no "verify GREEN on an EDITED canonical (tamper missed)" || ok "verify RED on an edited record canonical (re-seal mismatch)"
+cp "$TMP/lin.bak" "$LIN"
+
+# (b) DROP the middle record: the chain link breaks.
+{ head -n1 "$TMP/lin.bak"; tail -n1 "$TMP/lin.bak"; } > "$LIN"
+"$FIVE" council verify >/dev/null 2>&1 && no "verify GREEN after a DROPPED record (chain break missed)" || ok "verify RED on a dropped record (chain break)"
+cp "$TMP/lin.bak" "$LIN"
+
+# (c) REORDER records: prevDigest link + seq monotonicity break.
+{ head -n1 "$TMP/lin.bak"; tail -n1 "$TMP/lin.bak"; sed -n '2p' "$TMP/lin.bak"; } > "$LIN"
+"$FIVE" council verify >/dev/null 2>&1 && no "verify GREEN after REORDER (missed)" || ok "verify RED on reordered records"
+cp "$TMP/lin.bak" "$LIN"
+
+# --- restored chain verifies again --------------------------------------------------------------
+"$FIVE" council verify >/dev/null 2>&1 && ok "verify GREEN again once the lineage is restored" || no "verify RED after restore"
+
+echo
+echo "CNCL-11 roster/lineage e2e: $pass passed, $fail failed"
+exit $(( fail ? 1 : 0 ))

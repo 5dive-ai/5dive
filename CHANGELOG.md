@@ -1,6 +1,12 @@
 # Changelog
 
-## 0.11.15 — notify dry-run guard: fixture runs can never DM a paired human (DIVE-1500) (2026-07-19)
+## 0.11.16 — The Council: governance surface — roster/log/verify + promote/demote motions with recusal, constitutional auto-class, hash-chained lineage (CNCL-11) (2026-07-19)
+
+- `5dive council roster` — live seats + pass threshold/quorum + founder-veto holder + sealed lineage head.
+- `5dive council log [--limit=N]` — the append-only record of past sealed verdicts (genesis + motions + vetoes).
+- `5dive council verify [<receipt>]` — whole-lineage tamper check: the prevDigest hash-chain AND a per-record ROOT re-seal; fails closed on an edited/dropped/reordered record.
+- `sudo 5dive council {promote|demote|expel} --subject=<seat>` — a membership MOTION run as a convened Council vote: the subject RECUSES, the class is auto-derived IN CODE (promote = simple majority, demote/expel = 2/3, a governance-param change forced constitutional), and on a PASS the roster is mutated + a root-sealed motion record is hash-chained onto the lineage (the deciding convene receipt is linked). Seal-first so a failed seal never splits roster from lineage.
+- Engine: `classifyMotion` (constitutional auto-class, un-downgradable), `recusalFor`, `tallyVotes` recusal, `buildMotionRecord`/`canonicalMotion`, `verifyLineageChain`. Engine unit 134/134, +25-check roster/lineage e2e wired into `council_unit.sh`.
 
 - fix(notify): SAFETY — `FIVEDIVE_NOTIFY_DRYRUN=1` (any non-`0` value) short-circuits `_mirror_send`, the single Bot API POST that every owner/gate/mirror notify funnels through: the would-be payload (never the token) is logged to stderr and to `FIVEDIVE_NOTIFY_DRYRUN_LOG` when set, and a synthetic ok receipt keeps downstream delivery-receipt/stamping logic exercisable. Closes the 2026-07-19 incident class where a DIVE-1489 render test posted fixture gate alerts to the owner's REAL DM via the live connector token — a harness with a fixture DB is now physically unable to reach a paired human, including on the paths its stubs miss (DIVE-1500).
 - feat(notify): `FIVEDIVE_CONNECTOR_DIR` env-honor on `CONNECTORS_DIR` (same fixture-override class as STATE_DIR/TASKS_DIR/TASKS_DB) so a harness can point channel resolution at fixture configs. The `$TELEGRAM_BOT_TOKEN` process-env fallback in `_task_agent_channel` remains, which is exactly why the dry-run guard above is the physical layer, not this.

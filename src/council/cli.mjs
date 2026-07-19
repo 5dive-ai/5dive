@@ -184,6 +184,16 @@ async function cmdConvene() {
   }
   const th = flag('threshold'); if (th != null && th !== true) input.threshold = Number(th)
   const tr = flag('threshold-rule'); if (tr) input.thresholdRule = tr
+  // CNCL-11: a governance MOTION convene carries the motion descriptor (so the class is
+  // auto-derived IN the engine, never trusted from --class) + the recused subject (dropped from
+  // both dispatch and the tally base). bash passes these on `council promote|demote|expel`.
+  const mkind = flag('motion-kind')
+  if (mkind && mkind !== true) {
+    input.motion = { kind: String(mkind), subject: flag('motion-subject') === true ? null : (flag('motion-subject') || null),
+      param: flag('motion-param') === true ? null : (flag('motion-param') || null), to: flag('motion-to') === true ? null : (flag('motion-to') || null) }
+    const rc = flag('recuse'); if (rc && rc !== true) input.recuse = String(rc).split(',').map(s => s.trim()).filter(Boolean)
+    delete input.decisionClass   // the motion class wins; never a caller string
+  }
   // CNCL-9 FORGE REFUSAL: a veto can NEVER be asserted from a plain CLI string. Pre-CNCL-9,
   // `--veto-by=<who>` flipped the verdict inline, so any agent could forge lodar's veto into a
   // signed receipt. convene now REFUSES it outright (bash logs the attempt). convene only ever
@@ -460,8 +470,110 @@ function cmdVerifyVotes() {
   process.exit(res.ok ? 0 : 5)
 }
 
+// ---- CNCL-11: governance surface — roster / motion (promote|demote|expel) / verify-chain -----
+// The pure engine owns classification, recusal, the motion record + its canonical bytes, and the
+// chain check. bash owns the sudo gate, the ROOT seal (gate-proof), the persisted lineage write,
+// and reading the current roster off the sealed lineage head. cli NEVER trusts a caller class.
+function readJsonFlag(name, { optional = false } = {}) {
+  const v = flag(name)
+  if (!v || v === true) { if (optional) return null; die(`needs --${name}=<json or @file>`) }
+  try { return JSON.parse(String(v).startsWith('@') ? fs.readFileSync(String(v).slice(1), 'utf-8') : v) }
+  catch (e) { die(`bad --${name} json: ${String(e && e.message || e)}`) }
+}
+function seatsToSpec(seats) {
+  return (seats || []).map(s => `${s.id}:${(s.lens || `${s.id} — council seat.`).replace(/[|:]/g, ' ')}`).join('|')
+}
+function motionFromFlags() {
+  const kind = flag('kind'); if (!['promote', 'demote', 'expel'].includes(kind)) die('needs --kind=promote|demote|expel')
+  const subject = flag('subject'); if (!subject || subject === true) die('needs --subject=<seat id>')
+  return { kind, subject: String(subject),
+    param: flag('param') === true || flag('param') == null ? null : String(flag('param')),
+    to: flag('to') === true || flag('to') == null ? null : String(flag('to')) }
+}
+
+// council roster — the current seats (from the persisted, motion-governed `council` bench) + the
+// live pass threshold. bash augments with the veto principal + lineage head (root-owned files).
+function cmdRoster() {
+  const registryPath = flag('registry')
+  const reg = loadRegistry(registryPath)
+  // Read the RAW persisted bench (not resolveCouncil, which drops genesis/threshold/seededAt).
+  const bench = { ...BUILTINS, ...reg }.council
+  if (!bench || !bench.genesis) die('the Council has no genesis roster — human-seed it first: sudo 5dive council init …', 8)
+  const seatCount = (bench.seats || []).length
+  const threshold = E.resolveThreshold(seatCount, bench.threshold || { rule: 'majority' })
+  const quorum = E.quorumSize(seatCount, bench.threshold || { rule: 'majority' })
+  out({ council: 'council', seats: bench.seats, seatCount, threshold, quorum,
+    thresholdSpec: bench.threshold || { rule: 'majority' }, seededAt: bench.seededAt || '' })
+}
+
+// council promote|demote|expel — PLAN phase (pre-convene): classify the motion IN CODE, compute
+// recusal, and emit the deliberation question + the recused voting roster for bash to convene on.
+function cmdMotionPlan() {
+  const motion = motionFromFlags()
+  const roster = readJsonFlag('seats-json')   // current roster [{id,lens,chair?}] off the lineage head
+  const cls = E.classifyMotion(motion)
+  const recuse = E.recusalFor(motion)
+  const seated = (roster || []).some(s => String(s.id) === motion.subject)
+  if ((cls === 'demote' || cls === 'expel') && !seated) die(`cannot ${cls} '${motion.subject}' — not a current council seat (fail-closed)`, 3)
+  if (cls === 'promote' && seated) die(`'${motion.subject}' already holds a council seat — nothing to promote`, 4)
+  const votingSeats = (roster || []).filter(s => !recuse.includes(String(s.id)))
+  if (!votingSeats.length) die('no eligible voting seats after recusal (fail-closed)', 3)
+  const verb = cls === 'promote' ? `SEAT '${motion.subject}' on the Council` : `${cls.toUpperCase()} '${motion.subject}' from the Council`
+  const question = `Council membership motion (${cls}): should the Council ${verb}? `
+    + `This is a ${cls} motion — the bar is ${cls === 'promote' ? 'a simple majority' : 'a 2/3 supermajority'} of the ${votingSeats.length} eligible seat(s)`
+    + `${recuse.length ? ` ('${recuse.join(', ')}' recused as the subject)` : ''}. Approve to carry the motion, reject to deny, escalate only if it genuinely needs a human.`
+  out({ class: cls, recuse, subject: motion.subject, votingSeats, votingSeatSpec: seatsToSpec(votingSeats), question })
+}
+
+// council promote|demote|expel — APPLY phase (post-convene, on a PASS only): mutate the roster,
+// build the hash-chained motion record + its canonical bytes for bash to root-seal, and persist
+// the new roster into the motion-governed `council` bench. Refuses a non-pass verdict (fail-closed).
+function cmdMotionApply() {
+  const motion = motionFromFlags()
+  const roster = readJsonFlag('seats-json')
+  const verdict = readJsonFlag('verdict')
+  if (!verdict || verdict.recommendation !== 'approve' || verdict.escalated) {
+    die(`motion did not carry (recommendation=${verdict && verdict.recommendation}) — the roster is unchanged, no lineage record written`, 5)
+  }
+  const cls = E.classifyMotion(motion)
+  let newSeats
+  if (cls === 'promote') {
+    const lens = flag('lens') === true || flag('lens') == null ? undefined : String(flag('lens'))
+    newSeats = E.addSeat(roster, { id: motion.subject, lens })
+  } else {
+    newSeats = E.removeSeat(roster, motion.subject)
+    if (!newSeats.length) die('refused: a demote/expel cannot empty the Council (fail-closed)', 7)
+  }
+  const threshold = readJsonFlag('threshold-json', { optional: true }) || { rule: 'majority' }
+  const veto = readJsonFlag('veto-json', { optional: true })
+  let rec
+  try {
+    rec = E.buildMotionRecord({ motion, verdict, seats: newSeats, threshold, veto,
+      prevDigest: flag('prev-digest') === true ? '' : (flag('prev-digest') || ''),
+      stampedAt: flag('stamped-at') === true ? '' : (flag('stamped-at') || ''),
+      seq: Number(flag('seq')) || 0, receiptDigest: flag('receipt-digest') === true ? '' : (flag('receipt-digest') || '') })
+  } catch (e) { die(String(e && e.message || e)) }
+  // Emit the record + canonical bytes + the new roster; bash root-seals FIRST, then persists the
+  // roster into the motion-governed `council` bench only on a good seal (never split roster/lineage).
+  const benchSeats = newSeats.map(s => ({ id: s.id, lens: s.lens || `${s.id} — council seat.` }))
+  out({ record: rec, canonical: E.canonicalMotion(rec), seats: newSeats.map(s => s.id), benchSeats, bench: 'council', class: cls })
+}
+
+// council verify — the structural chain check (bash re-seals each record's canonical separately;
+// both must be green). Detects an edited/dropped/reordered receipt across the WHOLE append-only log.
+function cmdVerifyChain() {
+  const entries = readJsonFlag('entries')
+  const res = E.verifyLineageChain(entries)
+  out(res)
+  process.exit(res.ok ? 0 : 5)
+}
+
 const main = async () => {
   if (sub === 'convene') return cmdConvene()
+  if (sub === 'roster') return cmdRoster()
+  if (sub === 'motion-plan') return cmdMotionPlan()
+  if (sub === 'motion-apply') return cmdMotionApply()
+  if (sub === 'verify-chain') return cmdVerifyChain()
   if (sub === 'bench') return cmdBench()
   if (sub === 'init') return cmdInit()
   if (sub === 'veto') return cmdVeto()
@@ -470,6 +582,6 @@ const main = async () => {
   if (sub === 'read-binding') return cmdReadBinding()
   if (sub === 'sign-vote') return cmdSignVote()
   if (sub === 'verify-votes') return cmdVerifyVotes()
-  die(`unknown council subcommand: ${sub} (convene|bench|init|veto|gate-map|seal-augment|read-binding|sign-vote|verify-votes)`)
+  die(`unknown council subcommand: ${sub} (convene|bench|init|veto|gate-map|seal-augment|read-binding|sign-vote|verify-votes|roster|motion-plan|motion-apply|verify-chain)`)
 }
 main().catch(e => die(String(e && e.message || e), 1))

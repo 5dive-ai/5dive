@@ -31,6 +31,27 @@ _council_help() {
       Verify the sealed genesis lineage (re-seal each record, compare digests, check the
       hash-chain) or list it. `verify` fails closed on any tamper or broken link.
 
+  5dive council roster
+      The live Council: current seats, the pass threshold + quorum, the founder-veto holder,
+      and the sealed lineage head (seq + digest) rooted at genesis.
+
+  5dive council log [--limit=N]
+      The past sealed verdicts — genesis + every promote/demote motion + any founder veto —
+      in lineage order (the append-only governance record).
+
+  5dive council verify [<receipt-digest>]
+      Verify the WHOLE governance lineage: the prevDigest hash-chain AND a per-record ROOT
+      re-seal (each canonical must re-seal to its stored digest). Fails closed on an edited,
+      dropped, or reordered record. With a receipt digest, also re-seals that sealed receipt.
+
+  sudo 5dive council {promote|demote|expel} --subject=<seat> [--lens="…"] [--mode=…] [--dry-run]
+      Run a membership MOTION as a convened Council vote (sudo-gated — it mutates the root-owned
+      roster + lineage). The subject RECUSES (does not vote on its own membership); the class is
+      auto-derived IN CODE (promote = simple majority, demote/expel = 2/3 supermajority; a motion
+      touching a governance param is forced constitutional). On a PASS the roster is mutated and a
+      root-sealed motion record is hash-chained onto the lineage; a non-pass leaves the roster
+      untouched. The convene receipt that decided it is linked from the motion record.
+
   5dive council convene "<question>" [--seats=a,b,c] [--mode=quick|deliberate|adversarial]
                                      [--bench=<name>] [--class=<decisionClass>]
                                      [--threshold=<n>]
@@ -549,14 +570,219 @@ _council_rot_triage() {
   fi
 }
 
+# ==================== CNCL-11: governance surface ====================
+# roster (live seats + threshold + veto holder + lineage head) / log (past verdicts) /
+# verify (chain + per-record re-seal) / promote|demote|expel (a convened MOTION that, on a
+# PASS, mutates the roster + writes a hash-chained, root-sealed lineage record). The convene
+# it shells out to owns the tamper-evident receipt + the founder-veto offer; motions reuse it.
+
+# Root seal of stdin canonical bytes on the gate-proof rail (empty on no key / not root).
+_council_seal_stdin() {
+  if [[ "$(id -u)" -eq 0 ]]; then cmd_gate_proof_sign_stdin 2>/dev/null; else sudo -n 5dive gate-proof sign 2>/dev/null; fi
+}
+
+# council roster — the current seats + live threshold (from the persisted council bench), the
+# founder-veto principal (from genesis), and the sealed lineage head (seq + digest).
+_council_roster() {
+  local dir="$1"
+  [[ -f "$COUNCIL_GENESIS" ]] || fail "$E_VALIDATION" "the Council has no genesis roster — human-seed it first: sudo 5dive council init --seats=<a:chair,b,c> --threshold=<spec> --veto=<principal>"
+  local raw; raw="$(node "$dir/cli.mjs" roster --registry="$COUNCIL_REGISTRY")" || return $?
+  local vprincipal vresolved head_seq head_digest hlen
+  vprincipal="$(jq -r '.veto.principal // "none"' "$COUNCIL_GENESIS" 2>/dev/null)"
+  vresolved="$(jq -r '.veto.resolved // ""' "$COUNCIL_GENESIS" 2>/dev/null)"
+  head_seq="$(tail -n1 "$COUNCIL_LINEAGE" 2>/dev/null | jq -r '.seq // 0' 2>/dev/null)"
+  head_digest="$(tail -n1 "$COUNCIL_LINEAGE" 2>/dev/null | jq -r '.digest // ""' 2>/dev/null)"
+  hlen="$(wc -l < "$COUNCIL_LINEAGE" 2>/dev/null | tr -d ' ')"; [[ "$hlen" =~ ^[0-9]+$ ]] || hlen=0
+  if (( JSON_MODE )); then
+    printf '%s' "$raw" | jq --arg vp "$vprincipal" --arg vr "$vresolved" --argjson hs "${head_seq:-0}" --arg hd "$head_digest" --argjson hl "$hlen" \
+      '{ok:true, data: (. + {veto:{principal:$vp, resolved:$vr}, lineage:{seq:$hs, headDigest:$hd, records:$hl}})}'
+  else
+    echo "council:   council ($(printf '%s' "$raw" | jq -r '.seatCount') seats)"
+    printf '%s' "$raw" | jq -r '.seats[] | "  seat \(.id)\(if .chair then " (chair)" else "" end)"'
+    echo "threshold: $(printf '%s' "$raw" | jq -r '.threshold') to pass, quorum $(printf '%s' "$raw" | jq -r '.quorum') (spec: $(printf '%s' "$raw" | jq -c '.thresholdSpec'))"
+    echo "veto:      $vprincipal"
+    echo "lineage:   seq $head_seq, ${hlen} record(s), head ${head_digest:0:16}…"
+  fi
+}
+
+# council log — the past sealed verdicts (motions + genesis + vetoes) from the lineage, newest last.
+_council_log() {
+  local dir="$1"; shift
+  local limit=0; for a in "$@"; do case "$a" in --limit=*) limit="${a#--limit=}";; esac; done
+  if [[ ! -f "$COUNCIL_LINEAGE" ]]; then
+    if (( JSON_MODE )); then printf '%s\n' '{"ok":true,"data":{"entries":[]}}'; else echo "log: (empty — council not yet initialized)"; fi
+    return 0
+  fi
+  if (( JSON_MODE )); then
+    jq -s --argjson lim "${limit:-0}" '{ok:true,data:{entries: (if $lim>0 then .[-$lim:] else . end)}}' "$COUNCIL_LINEAGE"
+  else
+    local src="$COUNCIL_LINEAGE"
+    [[ "$limit" =~ ^[0-9]+$ && "$limit" -gt 0 ]] && src="$(tail -n "$limit" "$COUNCIL_LINEAGE")"
+    printf '%s\n' "$([[ "$limit" -gt 0 ]] 2>/dev/null && printf '%s' "$src" || cat "$COUNCIL_LINEAGE")" | jq -r '
+      if .kind=="genesis" then "seq \(.seq)\tgenesis\t\(.stampedAt)\tseats=\(.record.seats|map(.id)|join(","))"
+      elif .kind=="motion" then "seq \(.seq)\tmotion:\(.record.motion.class)\t\(.stampedAt)\tsubject=\(.record.motion.subject // "-")\toutcome=\(.record.outcome)\ttally=a\(.record.tally.approve)/r\(.record.tally.reject)/e\(.record.tally.escalate)"
+      elif .kind=="veto" then "seq \(.seq)\tveto\t\(.stampedAt)\ttier=\(.tier // "-")\tblocked"
+      else "seq \(.seq)\t\(.kind)\t\(.stampedAt)" end'
+  fi
+}
+
+# council verify [<receipt-digest>] — structural chain check (cli verify-chain over the lineage
+# entries) AND a per-record ROOT re-seal (each canonical must re-seal to its stored digest). Both
+# must be green. With a receipt digest, additionally locates + re-seals that specific sealed receipt.
+_council_verify() {
+  local dir="$1"; shift
+  local target="${1:-}"
+  if [[ ! -f "$COUNCIL_LINEAGE" ]]; then fail "$E_VALIDATION" "no lineage to verify — the council is not initialized"; fi
+  # 1) structural chain (prevDigest links + seq monotonicity across the WHOLE log).
+  local entries chain_res chain_ok
+  entries="$(jq -s -c '[.[] | {seq, prevDigest: (.prevDigest // ""), digest}]' "$COUNCIL_LINEAGE")"
+  chain_res="$(node "$dir/cli.mjs" verify-chain --entries="$entries")"; chain_ok=$?
+  # 2) per-record re-seal on the ROOT rail (detects an edited canonical whose digest was faked).
+  local reseal_ok=1 line canonical stored computed n=0 bad=""
+  while IFS= read -r line; do
+    [[ -n "$line" ]] || continue; n=$((n+1))
+    stored="$(printf '%s' "$line" | jq -r '.digest')"
+    canonical="$(printf '%s' "$line" | jq -r '.canonical')"
+    computed="$(printf '%s' "$canonical" | _council_seal_stdin)"
+    if [[ -z "$computed" ]]; then reseal_ok=0; bad="seq $(printf '%s' "$line" | jq -r '.seq') (no gate-proof key / not root)"; break
+    elif [[ "$computed" != "$stored" ]]; then reseal_ok=0; bad="seq $(printf '%s' "$line" | jq -r '.seq') (canonical does not re-seal to its digest — TAMPERED)"; break; fi
+  done < "$COUNCIL_LINEAGE"
+  # 3) optional: a specific sealed receipt digest re-seals to itself.
+  local rcpt_ok="skipped" rf found=""
+  if [[ -n "$target" ]]; then
+    rcpt_ok=0
+    for rf in "$COUNCIL_RECEIPTS"/*.json; do
+      [[ -f "$rf" ]] || continue
+      [[ "$(jq -r '.sealedDigest // empty' "$rf" 2>/dev/null)" == "$target" ]] && { found="$rf"; break; }
+    done
+    if [[ -n "$found" ]]; then
+      local rc; rc="$(jq -r '.canonical // empty' "$found")"
+      [[ "$(printf '%s' "$rc" | _council_seal_stdin)" == "$target" ]] && rcpt_ok=1
+    fi
+  fi
+  local all_ok=1
+  [[ "$chain_ok" -eq 0 && "$reseal_ok" -eq 1 ]] || all_ok=0
+  [[ -n "$target" && "$rcpt_ok" != "1" ]] && all_ok=0
+  if (( JSON_MODE )); then
+    jq -nc --argjson chain "$chain_res" --argjson chainOk "$([[ $chain_ok -eq 0 ]] && echo true || echo false)" \
+      --argjson resealOk "$([[ $reseal_ok -eq 1 ]] && echo true || echo false)" --arg bad "$bad" \
+      --arg rcpt "$rcpt_ok" --argjson n "$n" --argjson allOk "$([[ $all_ok -eq 1 ]] && echo true || echo false)" \
+      '{ok:$allOk, data:{verified:$allOk, records:$n, chain:$chain, chainOk:$chainOk, resealOk:$resealOk, resealBad:$bad, receipt:$rcpt}}'
+  else
+    if (( all_ok )); then echo "council verify: OK — $n record(s), chain intact + every record re-seals${target:+ (receipt ${target:0:16}… verified)}"
+    else
+      echo "council verify: FAILED" >&2
+      [[ "$chain_ok" -ne 0 ]] && echo "  chain: $(printf '%s' "$chain_res" | jq -r '.reason')" >&2
+      [[ "$reseal_ok" -ne 1 ]] && echo "  re-seal: $bad" >&2
+      [[ -n "$target" && "$rcpt_ok" != "1" ]] && echo "  receipt: $target not found or does not re-seal" >&2
+    fi
+  fi
+  (( all_ok )) && return 0 || return "$E_GENERIC"
+}
+
+# council promote|demote|expel — the convened MOTION. Sudo-gated (mutates the root-owned roster +
+# lineage). Reads the current roster off the sealed lineage head, PLANs (classify+recuse) via cli,
+# CONVENEs the primary council (subject recused, class auto-derived, founder-veto offered), and on a
+# PASS APPLYs: mutate roster, build a hash-chained motion record, ROOT-seal it, append the lineage,
+# and persist the new roster — seal FIRST so a failed seal never splits roster from lineage.
+_council_motion() {
+  local dir="$1" kind="$2"; shift 2
+  mkdir -p "$COUNCIL_DIR" 2>/dev/null || true
+  if [[ ! -w "$COUNCIL_DIR" ]]; then
+    fail "$E_PERMISSION" "council $kind mutates the governance roster — it writes ${COUNCIL_DIR} (root-owned) and must be sudo-run: sudo 5dive council $kind $*"
+  fi
+  [[ -f "$COUNCIL_GENESIS" && -f "$COUNCIL_LINEAGE" ]] || fail "$E_VALIDATION" "the Council has no genesis roster — seed it first: sudo 5dive council init …"
+  local subject="" lens="" mode="adversarial" dry=0 a
+  for a in "$@"; do
+    case "$a" in
+      --subject=*) subject="${a#--subject=}" ;;
+      --lens=*)    lens="${a#--lens=}" ;;
+      --mode=*)    mode="${a#--mode=}" ;;
+      --dry-run)   dry=1 ;;
+    esac
+  done
+  [[ -n "$subject" ]] || fail "$E_USAGE" "council $kind needs --subject=<seat id>"
+
+  # Current roster + hash-chain head come from the SEALED lineage tail (the source of truth).
+  local head head_seats prev_digest last_seq seq
+  head="$(tail -n1 "$COUNCIL_LINEAGE" 2>/dev/null)"
+  head_seats="$(printf '%s' "$head" | jq -c '.record.seats // []' 2>/dev/null)"
+  [[ -n "$head_seats" && "$head_seats" != "null" && "$head_seats" != "[]" ]] || fail "$E_GENERIC" "cannot read the current roster from the lineage head (fail-closed)"
+  prev_digest="$(printf '%s' "$head" | jq -r '.digest // ""')"
+  last_seq="$(printf '%s' "$head" | jq -r '.seq // -1')"; [[ "$last_seq" =~ ^[0-9]+$ ]] && seq=$((last_seq+1)) || seq=0
+
+  # PLAN — classify + recuse + build the deliberation question (fail-closed on a bad subject).
+  local plan cls question recuse
+  plan="$(node "$dir/cli.mjs" motion-plan --kind="$kind" --subject="$subject" --seats-json="$head_seats")" || return $?
+  cls="$(printf '%s' "$plan" | jq -r '.class')"
+  question="$(printf '%s' "$plan" | jq -r '.question')"
+  recuse="$(printf '%s' "$plan" | jq -r '(.recuse // []) | join(",")')"
+
+  if (( dry )); then
+    if (( JSON_MODE )); then printf '%s' "$plan" | jq '{ok:true,data:(. + {dryRun:true})}'
+    else echo "would convene ($cls, recuse=${recuse:-none}): $question"; fi
+    return 0
+  fi
+
+  # CONVENE the primary council (bench=council -> genesis-gated + veto-offered), subject recused,
+  # class auto-derived in the engine from --motion-*. The sealed receipt is the audit of the vote.
+  local env verdict receipt_digest rec_out
+  env="$("$(_council_bin)" council convene "$question" --json --bench=council --mode="$mode" \
+    --motion-kind="$kind" --motion-subject="$subject" ${recuse:+--recuse="$recuse"})" || fail "$E_GENERIC" "motion convene failed"
+  verdict="$(printf '%s' "$env" | jq -c '.data.verdict')"
+  receipt_digest="$(printf '%s' "$env" | jq -r '.data.sealedDigest // empty')"
+  rec_out="$(printf '%s' "$verdict" | jq -r '.recommendation // "reject"')"
+  [[ -n "$verdict" && "$verdict" != "null" ]] || fail "$E_GENERIC" "motion convene returned no verdict"
+
+  if [[ "$rec_out" != "approve" ]]; then
+    # Motion did not carry — roster unchanged, NOTHING written to the lineage.
+    if (( JSON_MODE )); then printf '%s' "$env" | jq --arg c "$cls" '{ok:true,data:{motion:$c,carried:false,outcome:(.data.verdict.recommendation),tally:(.data.verdict.tally),receipt:(.data.sealedDigest // null)}}'
+    else echo "council $kind: NOT carried ($rec_out, tally $(printf '%s' "$verdict" | jq -r '"a\(.tally.approve)/r\(.tally.reject)/e\(.tally.escalate)"')) — roster unchanged"; fi
+    return 0
+  fi
+
+  # APPLY — build the hash-chained motion record + its canonical (roster mutated in-code), root-seal,
+  # append the lineage, THEN persist the new roster. Seal-first so a bad seal never mutates the roster.
+  local stamped threshold_json veto_json apply canonical bench_seats
+  stamped="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  threshold_json="$(jq -c '.threshold // {rule:"majority"}' "$COUNCIL_GENESIS" 2>/dev/null)"
+  veto_json="$(jq -c '.veto // null' "$COUNCIL_GENESIS" 2>/dev/null)"
+  apply="$(node "$dir/cli.mjs" motion-apply --kind="$kind" --subject="$subject" ${lens:+--lens="$lens"} \
+    --seats-json="$head_seats" --verdict="$verdict" --threshold-json="$threshold_json" --veto-json="$veto_json" \
+    --registry="$COUNCIL_REGISTRY" --prev-digest="$prev_digest" --seq="$seq" --stamped-at="$stamped" \
+    --receipt-digest="$receipt_digest")" || return $?
+  canonical="$(printf '%s' "$apply" | jq -r '.canonical')"
+  [[ -n "$canonical" ]] || fail "$E_GENERIC" "motion produced no canonical record"
+  local digest; digest="$(printf '%s' "$canonical" | _council_seal_stdin)" || digest=""
+  [[ -n "$digest" ]] || fail "$E_GENERIC" "could not seal the motion record on the gate-proof rail (need root + an enforce key) — roster NOT changed"
+
+  # Append the hash-chained lineage record.
+  printf '%s' "$apply" | jq -c --arg d "$digest" --arg p "$prev_digest" --arg s "$stamped" \
+    '{seq: .record.seq, kind: "motion", stampedAt: $s, digest: $d, prevDigest: $p, canonical: .canonical, record: .record}' \
+    >> "$COUNCIL_LINEAGE"
+  # Persist the new roster into the motion-governed council bench (only now the seal succeeded).
+  bench_seats="$(printf '%s' "$apply" | jq -c '.benchSeats')"
+  local tmpreg; tmpreg="$(mktemp)"
+  jq --argjson seats "$bench_seats" '(.council.seats)=$seats | (.council.genesis)=true' "$COUNCIL_REGISTRY" > "$tmpreg" 2>/dev/null && mv "$tmpreg" "$COUNCIL_REGISTRY" || rm -f "$tmpreg"
+
+  if (( JSON_MODE )); then
+    printf '%s' "$apply" | jq --arg d "$digest" --arg r "$receipt_digest" '{ok:true,data:{motion:.class,carried:true,subject:(.record.motion.subject),seats:.seats,sealedDigest:$d,receiptDigest:$r,seq:.record.seq}}'
+  else
+    echo "council $kind: CARRIED — '$subject' ${kind}d"
+    echo "roster:   $(printf '%s' "$apply" | jq -r '.seats | join(", ")')"
+    echo "motion:   sealed (${digest:0:16}…) + hash-chained into lineage (seq $seq)"
+    echo "receipt:  convene ${receipt_digest:0:16}…"
+  fi
+}
+
 cmd_council() {
   command -v node >/dev/null 2>&1 || fail "$E_GENERIC" "5dive council needs node on PATH"
   command -v jq   >/dev/null 2>&1 || fail "$E_GENERIC" "5dive council needs jq on PATH"
   local sub="${1:-}"; [[ $# -gt 0 ]] && shift || true
   case "$sub" in
     ""|-h|--help|help) _council_help; return 0 ;;
-    convene|bench|init|lineage|veto|gate-clear|rot-triage) ;;
-    *) fail "$E_USAGE" "unknown council command: $sub (convene|bench|init|lineage|veto|gate-clear|rot-triage)" ;;
+    convene|bench|init|lineage|veto|gate-clear|rot-triage|roster|log|verify|promote|demote|expel) ;;
+    *) fail "$E_USAGE" "unknown council command: $sub (convene|bench|init|lineage|roster|log|verify|promote|demote|expel|veto|gate-clear|rot-triage)" ;;
   esac
 
   local dir; dir="$(mktemp -d -t 5dive-council.XXXXXX)" || fail "$E_GENERIC" "mktemp failed"
@@ -584,6 +810,14 @@ cmd_council() {
   if [[ "$sub" == "rot-triage" ]]; then
     _council_rot_triage "$dir" "$@"
     return $?
+  fi
+
+  # CNCL-11: governance surface — roster / log / verify (read) + promote|demote|expel (motion).
+  if [[ "$sub" == "roster" ]]; then _council_roster "$dir" "$@"; return $?; fi
+  if [[ "$sub" == "log" ]];    then _council_log    "$dir" "$@"; return $?; fi
+  if [[ "$sub" == "verify" ]]; then _council_verify "$dir" "$@"; return $?; fi
+  if [[ "$sub" == "promote" || "$sub" == "demote" || "$sub" == "expel" ]]; then
+    _council_motion "$dir" "$sub" "$@"; return $?
   fi
 
   if [[ "$sub" == "bench" ]]; then

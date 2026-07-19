@@ -246,10 +246,17 @@ export function quorumSize(seatCount, spec = {}) {
 // opts: { decisionClass, policy, seatCount, threshold, thresholdRule } — explicit
 // threshold/thresholdRule override the class policy (for ad-hoc convenes/tests).
 export function tallyVotes(votes, opts = {}) {
+  // CNCL-11 RECUSAL: the subject of a promote/demote motion does not vote — its seat is dropped
+  // from BOTH the quorum base and the threshold base, so the vote runs over the remaining seats.
+  const recuse = new Set([].concat(opts.recuse || []).filter(Boolean).map(String))
+  const counted = (votes || []).filter(v => !recuse.has(String(v.seat)))
   const tally = { approve: 0, reject: 0, escalate: 0 }
-  for (const v of votes || []) { if (tally[v.vote] != null) tally[v.vote]++ }
-  const seatCount = opts.seatCount || (votes || []).length
-  const cls = opts.decisionClass || 'ordinary'
+  for (const v of counted) { if (tally[v.vote] != null) tally[v.vote]++ }
+  let seatCount = opts.seatCount || (votes || []).length
+  if (recuse.size) seatCount = Math.max(1, seatCount - recuse.size)
+  // CNCL-11 CONSTITUTIONAL AUTO-CLASS: a motion touching a governance param is classified in
+  // CODE, so a caller can never run a rule change under the ordinary bar by mislabelling it.
+  const cls = opts.decisionClass || (opts.motion ? classifyMotion(opts.motion) : 'ordinary')
   const policy = (opts.policy || THRESHOLD_POLICY)[cls] || THRESHOLD_POLICY.ordinary
   const spec = { ...policy }
   if (opts.threshold != null) { spec.rule = 'flat'; spec.threshold = opts.threshold }
@@ -263,7 +270,7 @@ export function tallyVotes(votes, opts = {}) {
   else if (tally.approve >= threshold) recommendation = 'approve'
   else if (tally.escalate > tally.approve && tally.escalate >= tally.reject) recommendation = 'escalate'
   else recommendation = 'reject'
-  return { recommendation, tally, threshold, seatCount, quorum, quorumMet, votesCast, decisionClass: cls, escalated: recommendation === 'escalate' }
+  return { recommendation, tally, threshold, seatCount, quorum, quorumMet, votesCast, decisionClass: cls, recused: [...recuse], escalated: recommendation === 'escalate' }
 }
 
 // (P3.1e) SELF-GOVERNANCE — pure roster mutations. The CLI gates each behind a real council
@@ -276,6 +283,130 @@ export function addSeat(seats, seat) {
 }
 export function removeSeat(seats, seatId) {
   return (seats || []).filter(x => x.id !== seatId)
+}
+
+// ============================================================================
+// CNCL-11 — GOVERNANCE SURFACE: motion classification, recusal, hash-chained
+// lineage (promote/demote/roster/log/verify). Pure engine; the CLI+bash own the
+// sudo gate, the root seal, and the persisted lineage write.
+// ============================================================================
+
+// Governance PARAMETERS — a motion that changes any of these is constitutional (the hardest
+// bar: 2/3 + full quorum + founder-veto-able) and CANNOT run as an ordinary motion.
+export const CONSTITUTIONAL_PARAMS = ['threshold', 'quorum', 'veto', 'mode', 'modes']
+
+// CNCL-11: classify a motion IN CODE (never trust a caller-supplied class). Membership motions
+// (promote/demote/expel) keep their own class; ANY motion touching a governance param is forced
+// to `constitutional` regardless of what it claims; everything else is `ordinary`.
+export function classifyMotion(motion = {}) {
+  const kind = String(motion.kind || motion.type || '').toLowerCase()
+  if (kind === 'promote') return 'promote'
+  if (kind === 'demote') return 'demote'
+  if (kind === 'expel') return 'expel'
+  const raw = motion.params || motion.changes || (motion.param != null ? [motion.param] : [])
+  const touched = Array.isArray(raw) ? raw : Object.keys(raw || {})
+  if (touched.some(p => CONSTITUTIONAL_PARAMS.includes(String(p).toLowerCase()))) return 'constitutional'
+  if (kind === 'constitutional') return 'constitutional'
+  return 'ordinary'
+}
+
+// CNCL-11: the seat that must RECUSE for a given motion — the subject of a promote/demote/expel
+// (they don't get to vote on their own membership). Returns [] for non-membership motions.
+export function recusalFor(motion = {}) {
+  const cls = classifyMotion(motion)
+  return (['promote', 'demote', 'expel'].includes(cls) && motion.subject) ? [String(motion.subject)] : []
+}
+
+// CNCL-11: a promote/demote/constitutional motion runs as a convened vote; on a PASS its outcome
+// is written as a lineage record HASH-CHAINED onto the prior lineage head (genesis or the last
+// motion) via prevDigest — so the roster's entire history is an append-only, tamper-evident chain
+// rooted at genesis. Mirrors buildGenesisRecord's discipline; bash root-seals canonicalMotion().
+export function buildMotionRecord({ motion, verdict, seats, threshold, veto, prevDigest, stampedAt, seq, receiptDigest }) {
+  const cls = classifyMotion(motion)
+  if (!['promote', 'demote', 'expel', 'constitutional'].includes(cls)) {
+    throw new Error(`buildMotionRecord: '${cls}' is not a governance motion (promote|demote|expel|constitutional)`)
+  }
+  if (!Array.isArray(seats) || !seats.length) throw new Error('motion record needs the resulting seats')
+  return {
+    kind: 'motion',
+    version: 1,
+    seq: Number(seq) || 0,
+    council: 'council',
+    motion: {
+      class: cls,
+      subject: motion.subject != null ? String(motion.subject) : null,
+      param: motion.param != null ? String(motion.param) : null,
+      to: motion.to != null ? String(motion.to) : null,
+    },
+    outcome: (verdict && verdict.recommendation) || null,
+    tally: (verdict && verdict.tally) || null,
+    recused: (verdict && verdict.recused) || recusalFor(motion),
+    seats: seats.map(s => ({ id: s.id, lens: s.lens, ...(s.chair ? { chair: true } : {}) })),
+    threshold: threshold || { rule: 'majority' },
+    veto: veto ? { principal: veto.principal, resolved: String(veto.resolved) } : null,
+    receiptDigest: receiptDigest || '',   // links the motion to the convene receipt that decided it
+    prevDigest: prevDigest || '',
+    stampedAt: stampedAt || '',
+  }
+}
+
+// Deterministic, whitespace-normalized preimage of a motion record — the bytes the ROOT rail
+// seals + hash-chains. Same discipline as canonicalGenesis: prevDigest + outcome + the resulting
+// roster INSIDE the signed bytes so none can be quietly altered without failing verify.
+export function canonicalMotion(rec) {
+  const norm = (s) => String(s == null ? '' : s).replace(/\s+/g, ' ').trim()
+  const m = rec.motion || {}
+  const t = rec.tally || {}
+  const L = []
+  L.push(`motion: ${norm(rec.council)} v${Number(rec.version) || 1} seq=${Number(rec.seq) || 0}`)
+  L.push(`class: ${norm(m.class)}`)
+  L.push(`subject: ${norm(m.subject)}`)
+  L.push(`param: ${norm(m.param)} -> ${norm(m.to)}`)
+  L.push(`outcome: ${norm(rec.outcome)}`)
+  L.push(`tally: a${Number(t.approve) || 0}/r${Number(t.reject) || 0}/e${Number(t.escalate) || 0}`)
+  L.push(`recused: ${(rec.recused || []).slice().sort().map(norm).join(',')}`)
+  L.push(`stampedAt: ${norm(rec.stampedAt)}`)
+  L.push(`prevDigest: ${norm(rec.prevDigest)}`)
+  L.push(`receiptDigest: ${norm(rec.receiptDigest)}`)
+  const seats = (rec.seats || []).slice().sort((a, b) => (norm(a.id) < norm(b.id) ? -1 : 1))
+  for (const s of seats) L.push(`seat ${norm(s.id)}${s.chair ? ' (chair)' : ''}: ${norm(s.lens)}`)
+  const th = rec.threshold || {}
+  L.push(`threshold: rule=${norm(th.rule)} value=${th.value != null ? Number(th.value) : ''} flat=${th.threshold != null ? Number(th.threshold) : ''}`)
+  L.push(`veto: ${norm(rec.veto && rec.veto.principal)} -> ${norm(rec.veto && rec.veto.resolved)}`)
+  return L.join('\n')
+}
+
+// CNCL-11: reduce a sealed lineage record to its chain entry — the fields that make the log
+// tamper-evident. `digest` is the ROOT seal of the record's canonical bytes (bash computes it).
+export function chainEntryOf(rec, digest) {
+  return { seq: Number(rec.seq) || 0, prevDigest: rec.prevDigest || '', digest: String(digest || '') }
+}
+
+// CNCL-11: verify the append-only lineage CHAIN. `entries` is the ordered log — each entry
+// { seq, prevDigest, digest }, digest = the record's root seal. Rooted at genesis (prevDigest
+// === ''). Tamper-evidence across the WHOLE log, not one record: an edited record changes its
+// digest so the NEXT entry's prevDigest link breaks; a dropped or reordered record breaks the
+// prevDigest link and/or seq monotonicity. Returns { ok, head, length } or { ok:false, reason, index }.
+export function verifyLineageChain(entries) {
+  const list = entries || []
+  if (!list.length) return { ok: false, reason: 'empty lineage — no genesis root', index: -1 }
+  let prev = ''
+  for (let i = 0; i < list.length; i++) {
+    const e = list[i]
+    if (!e || !e.digest) return { ok: false, reason: `record ${i} has no sealed digest`, index: i }
+    if (i === 0) {
+      if (e.prevDigest) return { ok: false, reason: 'genesis root must have an empty prevDigest', index: 0 }
+    } else {
+      if (String(e.prevDigest) !== String(prev)) {
+        return { ok: false, reason: `broken chain at record ${i} (seq ${e.seq}): prevDigest ${String(e.prevDigest).slice(0, 12)}… != prior digest ${String(prev).slice(0, 12)}… (edited/dropped/reordered record)`, index: i }
+      }
+      if (Number(e.seq) <= Number(list[i - 1].seq)) {
+        return { ok: false, reason: `non-monotonic seq at record ${i} (${list[i - 1].seq} -> ${e.seq}) — a reordered or dropped record`, index: i }
+      }
+    }
+    prev = e.digest
+  }
+  return { ok: true, head: prev, length: list.length }
 }
 
 // (CNCL-9) AUTHENTICATED FOUNDER VETO — non-blocking OFFER model.
@@ -861,13 +992,22 @@ REBUT: try to find the strongest objection to the leading position. Then cast yo
 // answers each seat, same blind-round-1 discipline, chair-written narrative. Founder veto threads
 // both. `deps` is forwarded only for symmetry; the resolved handles come in via `h`.
 async function runConvene(input, deps, h) {
-  const { modelCall, seatVote, verbose, role, mode, seats, question } = h
+  const { modelCall, seatVote, verbose, role, mode, question } = h
+  let { seats } = h
+  // CNCL-11: a governance MOTION runs as a convened vote with the SUBJECT recused — the recused
+  // seat is not dispatched (it doesn't vote on its own membership) and the class is derived from
+  // the motion IN CODE (never a trusted string), so seatCount = full roster minus the recused set.
+  const recuse = new Set([].concat(input.recuse || []).filter(Boolean).map(String))
+  const fullCount = seats.length
+  if (recuse.size) seats = seats.filter(s => !recuse.has(String(s.id)))
   const tallyOpts = {
-    decisionClass: input.decisionClass || (input.bench && input.bench.decisionClass) || 'ordinary',
+    decisionClass: input.motion ? undefined : (input.decisionClass || (input.bench && input.bench.decisionClass) || 'ordinary'),
+    motion: input.motion,
+    recuse: [...recuse],
     policy: input.policy,
     threshold: input.threshold != null ? input.threshold : (input.bench && input.bench.threshold),
     thresholdRule: input.thresholdRule || (input.bench && input.bench.thresholdRule),
-    seatCount: seats.length,
+    seatCount: fullCount,
   }
   let round1Votes, finalVotes, rebuttalVotes = null, verdict
   if (seatVote) {

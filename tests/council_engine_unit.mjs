@@ -11,11 +11,14 @@ import {
   THRESHOLD_POLICY, quorumSize, resolveSeatAgent, SEAT_AGENT_ALIAS,
   canonicalTranscript, validateAgainstSchema, makeAnthropicModelCall, runCouncil, TAKE, VOTE, NODE_VOTE,
   augmentCanonicalVetoBinding, parseCanonicalVetoBinding, triageVerdictToAction,
+  classifyMotion, recusalFor, CONSTITUTIONAL_PARAMS,
+  buildMotionRecord, canonicalMotion, chainEntryOf, verifyLineageChain,
 } from '../src/council/engine.mjs'
 
 let pass = 0, fail = 0
 const ok = (c, m) => { c ? pass++ : (fail++, console.error('FAIL:', m)) }
 const T = (a, r, e) => ({ approve: a, reject: r, escalate: e })
+const V = (seat, vote) => ({ seat, vote })   // CNCL-11: a cast vote (seat id + choice)
 
 // ---- escalate-only guardrail (ported P1/P2 contract) ----
 ok(guardrail({ tier: 1, type: 'decision' }).forceEscalate === false, 'tier-1 decision is council-gradable')
@@ -227,5 +230,84 @@ ok(SEAT_AGENT_ALIAS.theo === 'marketing' && SEAT_AGENT_ALIAS.lilbro === 'creativ
 // intentionally omit it because OSS defaults are role archetypes, not one org's registry mapping.
 ok(resolveSeatAgent({ id: 'brand' }) === 'brand', 'role-archetype seat resolves to its matching registry role')
 
-console.log(`\nCNCL-6 engine: ${pass} passed, ${fail} failed (bound to src/council/engine.mjs)`)
+// ============================================================================
+// ---- CNCL-11: governance surface — classification, recusal math, threshold
+//      matrix, constitutional auto-class, hash-chained lineage tamper-evidence.
+// ============================================================================
+
+// --- constitutional AUTO-CLASSIFICATION (a caller can't downgrade a rule change) ---
+ok(classifyMotion({ kind: 'promote', subject: 'x' }) === 'promote', 'classify: promote')
+ok(classifyMotion({ kind: 'demote', subject: 'x' }) === 'demote', 'classify: demote')
+ok(classifyMotion({ kind: 'expel', subject: 'x' }) === 'expel', 'classify: expel')
+ok(classifyMotion({ kind: 'ordinary', question: 'ship?' }) === 'ordinary', 'classify: plain motion is ordinary')
+ok(classifyMotion({ param: 'threshold', to: '2/3' }) === 'constitutional', 'classify: touching threshold -> constitutional')
+ok(classifyMotion({ param: 'quorum' }) === 'constitutional', 'classify: touching quorum -> constitutional')
+ok(classifyMotion({ param: 'veto' }) === 'constitutional', 'classify: touching veto -> constitutional')
+// the key guarantee: a rule change mislabelled as ordinary is STILL forced constitutional in code
+ok(classifyMotion({ kind: 'ordinary', param: 'threshold', to: '1' }) === 'constitutional', 'classify: mislabelled rule change is FORCED constitutional (cannot sneak the low bar)')
+ok(classifyMotion({ changes: { mode: 'quick' } }) === 'constitutional', 'classify: changing a mode -> constitutional')
+ok(CONSTITUTIONAL_PARAMS.includes('threshold') && CONSTITUTIONAL_PARAMS.includes('veto'), 'classify: param set covers threshold+veto')
+
+// --- RECUSAL: the subject of a membership motion does not vote ---
+ok(JSON.stringify(recusalFor({ kind: 'demote', subject: 'codex' })) === '["codex"]', 'recusal: demote subject recuses')
+ok(recusalFor({ kind: 'constitutional', param: 'threshold' }).length === 0, 'recusal: non-membership motion recuses no one')
+
+// --- THRESHOLD MATRIX over a 5-seat roster (per THRESHOLD_POLICY, nothing hardcoded) ---
+// ordinary + promote = simple majority of 5 => 3 approve
+ok(tallyVotes([V('a','approve'),V('b','approve'),V('c','approve'),V('d','reject'),V('e','reject')], { decisionClass: 'ordinary', seatCount: 5 }).recommendation === 'approve', 'matrix: ordinary 3/5 approve -> pass (majority)')
+ok(tallyVotes([V('a','approve'),V('b','approve'),V('c','reject'),V('d','reject'),V('e','reject')], { decisionClass: 'promote', seatCount: 5 }).recommendation === 'reject', 'matrix: promote 2/5 -> reject (majority bar)')
+// demote/expel = 2/3 of 5 => ceil(3.33)=4 approve
+const dem3 = tallyVotes([V('a','approve'),V('b','approve'),V('c','approve'),V('d','reject'),V('e','reject')], { decisionClass: 'demote', seatCount: 5 })
+ok(dem3.threshold === 4 && dem3.recommendation === 'reject', 'matrix: demote needs 2/3 (4 of 5) — 3 approve FAILS')
+ok(tallyVotes([V('a','approve'),V('b','approve'),V('c','approve'),V('d','approve'),V('e','reject')], { decisionClass: 'demote', seatCount: 5 }).recommendation === 'approve', 'matrix: demote 4/5 -> pass (2/3 met)')
+// constitutional = 2/3 + FULL quorum: all 5 must vote AND 4 approve
+const cAbsent = tallyVotes([V('a','approve'),V('b','approve'),V('c','approve'),V('d','approve')], { decisionClass: 'constitutional', seatCount: 5 })
+ok(cAbsent.quorum === 5 && cAbsent.recommendation === 'escalate', 'matrix: constitutional inquorate (4/5 present) -> escalate (full quorum required)')
+ok(tallyVotes([V('a','approve'),V('b','approve'),V('c','approve'),V('d','approve'),V('e','reject')], { decisionClass: 'constitutional', seatCount: 5 }).recommendation === 'approve', 'matrix: constitutional 4/5 approve + full quorum -> pass')
+
+// --- RECUSAL MATH: demote a 5-seat roster; subject recuses -> vote runs over the 4 remaining ---
+// 4 voting seats, 2/3 of 4 = ceil(2.67)=3 approve needed; subject's own (would-be) vote is ignored.
+const rec5 = tallyVotes(
+  [V('a','approve'),V('b','approve'),V('c','approve'),V('d','reject'),V('subject','approve')],
+  { decisionClass: 'demote', seatCount: 5, recuse: ['subject'] })
+ok(rec5.seatCount === 4 && rec5.recused[0] === 'subject', 'recusal math: subject dropped from the base (5 -> 4 seats)')
+ok(rec5.threshold === 3 && rec5.tally.approve === 3 && rec5.recommendation === 'approve', 'recusal math: 3/4 approve meets 2/3 (recused vote NOT counted)')
+// constitutional auto-class flows THROUGH tallyVotes via opts.motion (not a trusted class string)
+const cAuto = tallyVotes([V('a','approve'),V('b','approve'),V('c','approve'),V('d','approve')], { motion: { kind: 'ordinary', param: 'threshold', to: '1' }, seatCount: 5 })
+ok(cAuto.decisionClass === 'constitutional' && cAuto.recommendation === 'escalate', 'auto-class: mislabelled rule change tallies under the CONSTITUTIONAL bar (full quorum) -> escalate on 4/5')
+
+// --- HASH-CHAINED LINEAGE: build a motion record chained onto genesis; detect tamper ---
+const mrec = buildMotionRecord({
+  motion: { kind: 'demote', subject: 'codex' },
+  verdict: { recommendation: 'approve', tally: T(4,1,0), recused: ['codex'] },
+  seats: [{ id: 'main', chair: true }, { id: 'theo' }, { id: 'olivia' }, { id: 'lilbro' }],
+  threshold: { rule: 'fraction', value: 2/3 }, veto: { principal: 'human:main', resolved: '433634012' },
+  prevDigest: 'GENESISDIGEST', stampedAt: '2026-07-19T12:00:00Z', seq: 1, receiptDigest: 'RCPT1',
+})
+ok(mrec.kind === 'motion' && mrec.motion.class === 'demote' && mrec.prevDigest === 'GENESISDIGEST', 'motion record: chained onto the prior lineage head')
+const mcanon = canonicalMotion(mrec)
+ok(mcanon.includes('prevDigest: GENESISDIGEST') && mcanon.includes('outcome: approve') && mcanon.includes('class: demote'), 'canonicalMotion: prevDigest + outcome + class inside the signed bytes')
+ok(canonicalMotion(mrec) === mcanon, 'canonicalMotion: deterministic (byte-reproducible)')
+try { buildMotionRecord({ motion: { kind: 'ordinary' }, seats: [{ id: 'a' }] }); ok(false, 'motion record: refuses a non-governance motion') }
+catch { ok(true, 'motion record: refuses a non-governance motion (fail-closed)') }
+
+// A well-formed chain: genesis (prevDigest '') -> motion1 -> motion2, each prevDigest = prior digest.
+const chain = [
+  chainEntryOf({ seq: 0, prevDigest: '' }, 'D0'),
+  chainEntryOf({ seq: 1, prevDigest: 'D0' }, 'D1'),
+  chainEntryOf({ seq: 2, prevDigest: 'D1' }, 'D2'),
+]
+ok(verifyLineageChain(chain).ok === true && verifyLineageChain(chain).head === 'D2', 'chain: intact lineage verifies (head = last digest)')
+// EDITED record: re-sealing record 1 changes its digest D1->D1x; record 2 still points at D1 -> break.
+const edited = [chain[0], chainEntryOf({ seq: 1, prevDigest: 'D0' }, 'D1x'), chain[2]]
+ok(verifyLineageChain(edited).ok === false && verifyLineageChain(edited).index === 2, 'chain: an EDITED receipt breaks the next link (tamper detected)')
+// DROPPED record: remove motion1 -> motion2.prevDigest 'D1' != genesis digest 'D0'.
+ok(verifyLineageChain([chain[0], chain[2]]).ok === false, 'chain: a DROPPED receipt breaks the chain')
+// REORDERED: swap motion1 and motion2 -> prevDigest mismatch + non-monotonic seq.
+ok(verifyLineageChain([chain[0], chain[2], chain[1]]).ok === false, 'chain: a REORDERED receipt breaks the chain')
+// Root must be a genesis: a lineage whose first record carries a prevDigest is rejected.
+ok(verifyLineageChain([chainEntryOf({ seq: 0, prevDigest: 'X' }, 'D0')]).ok === false, 'chain: first record must be the genesis root (empty prevDigest)')
+ok(verifyLineageChain([]).ok === false, 'chain: empty lineage fails closed')
+
+console.log(`\nCNCL-6/11 engine: ${pass} passed, ${fail} failed (bound to src/council/engine.mjs)`)
 process.exit(fail ? 1 : 0)
