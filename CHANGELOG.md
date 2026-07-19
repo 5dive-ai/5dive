@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.11.8 — The Council: per-seat Ed25519 co-signed votes (CNCL-10 core) (2026-07-19)
+
+- feat(council): SECURITY — per-seat Ed25519 co-signing engine. Every seat holds its own keypair and SIGNS its vote AT SOURCE; the convener holds no other seat's private key, so it can neither forge a vote nor edit one without breaking the signature. The signed preimage binds the CONVENE ID + QUESTION DIGEST, so a seat's signed vote from one convene fails verification in any other (replay-proof). Closes the CNCL-6 gap where the root seal proved only that the convener recorded the bytes, not that each seat cast its own vote.
+- feat(council): `5dive council sign-vote` — the sign-at-source primitive a seat runs inside its OWN harness (reads its 0600 owner-only key via `--key-file`, emits the `COUNCIL-SIG:` line). `5dive council verify-votes` — the per-seat half of `council verify`: re-checks every co-signed vote against the roster pubkeys + revocation, bound to this convene; a revoked (demoted) seat's vote is rejected even with a cryptographically valid signature. Exits non-zero on any unsigned/forged/replayed/revoked vote.
+- test(council): `council_cosign_unit.mjs` (26 assertions, bound to the shipped engine) proves forge/edit/replay/revoked all fail and the honest path verifies green; `council_cosign_e2e.sh` (6 assertions) exercises the real CLI over on-disk keys and audits 0600 owner-only perms. Both wired into CI via `council_unit.sh`.
+- note: the on-disk key LIFECYCLE (issue at init/promote, revoke at demote, roster pubkey write, revocation logged in lineage) + the live dispatch sign-at-source integration (seatPrompt instruction + convener verify during a real convene) are the next slice, staged for main's gate to steer. Honest-scope deferral, same discipline as CNCL-7/8/9.
+
 ## 0.11.7 — The Council: authenticated founder veto, non-blocking two-tier (CNCL-9) (2026-07-19)
 
 - fix(council): SECURITY — `convene` now REFUSES `--veto-by`/`--veto-reason` (exit 9, logged). Pre-CNCL-9 those plain CLI strings flipped the verdict inline, so any agent could forge lodar's veto into a signed receipt. A veto can no longer be asserted from a string; it is only ever OFFERED to the genesis principal and EXERCISED by an authenticated tap. The refusal now writes a durable `veto-audit.jsonl` line (root 0600) so "refused + logged" is a real, testable artifact.
