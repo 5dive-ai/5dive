@@ -36,11 +36,14 @@ set +e
 
 tasks_db_init
 
-# A registered planner agent 'dev' so role/assignee resolution + spawn work; keep
-# it OUT of the idle probe so the optimistic fast-return never fires (we drive the
-# planner completion by hand). _hb_agent_idle returns non-zero for an unknown
-# tmux/native state, so leaving 'dev' unbacked keeps the async job pending.
-_org_resolve_assignee() { printf '%s' "dev"; }   # stub: any assignee resolves
+# Unit isolation: async goal creation uses cmd_loop_spawn, whose production path
+# forks the installed heartbeat dispatcher. That child would reload the live
+# TASKS_DB even though this shell points at TMP. Keep all planner identities
+# synthetic and stub the external wake boundary; completion is driven by DB
+# updates below.
+TEST_PLANNER="unit-goal-planner"
+_loop_wake_agent() { :; }
+_org_resolve_assignee() { printf '%s' "$TEST_PLANNER"; }   # any assignee resolves
 
 PASS=0; FAIL=0
 ok_t()  { PASS=$((PASS+1)); printf 'ok   - %s\n' "$1"; }
@@ -52,12 +55,12 @@ run() { ( set -e; "$@" ) 2>/dev/null; }
 
 PLAN_OK='{"project":{"key":"widget","name":"Ship widget","goal":"Ship the widget"},
   "tasks":[
-    {"local_id":"t1","title":"Design widget","assignee_or_role":"dev","risk":"low"},
-    {"local_id":"t2","title":"Build widget","assignee_or_role":"dev","depends_on":["t1"],
+    {"local_id":"t1","title":"Design widget","assignee_or_role":"unit-goal-worker","risk":"low"},
+    {"local_id":"t2","title":"Build widget","assignee_or_role":"unit-goal-worker","depends_on":["t1"],
      "acceptance":"tests pass","verify":"npm test","verifier":"qa","risk":"low"}]}'
 
 # ---- (1) async add returns a job id fast, creates nothing ----
-out=$(run cmd_goal_add --planner=dev --dry-run -- "Ship a widget"); rc=$?
+out=$(run cmd_goal_add --planner="$TEST_PLANNER" --dry-run -- "Ship a widget"); rc=$?
 JOB=$(printf '%s' "$out" | jq -r '.data.job // ""' 2>/dev/null)
 STATUS=$(printf '%s' "$out" | jq -r '.data.status // ""' 2>/dev/null)
 [[ $rc -eq 0 && -n "$JOB" && ( "$STATUS" == "queued" || "$STATUS" == "running" ) ]] \
@@ -93,10 +96,10 @@ NLEAF=$(db "SELECT COUNT(*) FROM tasks WHERE title NOT LIKE 'Goal:%' AND kind='s
   || bad_t "dry-run creates nothing" "leaves=$NLEAF"
 
 # ---- (4) a CREATE (non-dry-run) async job materializes exactly once ----
-out=$(run cmd_goal_add --planner=dev --project=gizmo -- "Ship a gizmo"); JOB2=$(printf '%s' "$out" | jq -r '.data.job // ""')
+out=$(run cmd_goal_add --planner="$TEST_PLANNER" --project=gizmo -- "Ship a gizmo"); JOB2=$(printf '%s' "$out" | jq -r '.data.job // ""')
 TASK2=$(db "SELECT task_id FROM goal_jobs WHERE job_id=$(sqlq "$JOB2");")
 PLAN_G='{"project":{"key":"gizmo","name":"Ship gizmo","goal":"Ship the gizmo"},
-  "tasks":[{"local_id":"g1","title":"Build gizmo","assignee_or_role":"dev","risk":"low"}]}'
+  "tasks":[{"local_id":"g1","title":"Build gizmo","assignee_or_role":"unit-goal-worker","risk":"low"}]}'
 db "UPDATE tasks SET status='done', result=$(sqlq "$PLAN_G") WHERE id=${TASK2};" >/dev/null
 out=$(run cmd_goal_status "$JOB2"); st=$(printf '%s' "$out" | jq -r '.data.status // ""'); mat=$(printf '%s' "$out" | jq -r '.data.materialized // false')
 [[ "$st" == "done" && "$mat" == "true" ]] \
@@ -111,7 +114,7 @@ BUILT2=$(db "SELECT COUNT(*) FROM tasks WHERE project_key='gizmo' AND title NOT 
   || bad_t "idempotent repeat poll" "rc=$rc built1=$BUILT1 built2=$BUILT2 out=$out"
 
 # ---- (5) planner closes with no plan -> failed, not a hang ----
-out=$(run cmd_goal_add --planner=dev --dry-run -- "Doomed goal"); JOB3=$(printf '%s' "$out" | jq -r '.data.job // ""')
+out=$(run cmd_goal_add --planner="$TEST_PLANNER" --dry-run -- "Doomed goal"); JOB3=$(printf '%s' "$out" | jq -r '.data.job // ""')
 TASK3=$(db "SELECT task_id FROM goal_jobs WHERE job_id=$(sqlq "$JOB3");")
 db "UPDATE tasks SET status='escalated', result='' WHERE id=${TASK3};" >/dev/null
 out=$(run cmd_goal_status "$JOB3"); st=$(printf '%s' "$out" | jq -r '.data.status // ""')
@@ -120,10 +123,10 @@ out=$(run cmd_goal_status "$JOB3"); st=$(printf '%s' "$out" | jq -r '.data.statu
   || bad_t "no-plan -> failed" "out=$out"
 
 # ---- (5b) create-from-preview: --from-job materializes the previewed plan ----
-out=$(run cmd_goal_add --planner=dev --project=widgetjob --dry-run -- "Preview then create"); JOB4=$(printf '%s' "$out" | jq -r '.data.job // ""')
+out=$(run cmd_goal_add --planner="$TEST_PLANNER" --project=widgetjob --dry-run -- "Preview then create"); JOB4=$(printf '%s' "$out" | jq -r '.data.job // ""')
 TASK4=$(db "SELECT task_id FROM goal_jobs WHERE job_id=$(sqlq "$JOB4");")
 PLAN_W='{"project":{"key":"widgetjob","name":"Widget job","goal":"Ship the widget job"},
-  "tasks":[{"local_id":"w1","title":"Do the widget","assignee_or_role":"dev","risk":"low"}]}'
+  "tasks":[{"local_id":"w1","title":"Do the widget","assignee_or_role":"unit-goal-worker","risk":"low"}]}'
 db "UPDATE tasks SET status='done', result=$(sqlq "$PLAN_W") WHERE id=${TASK4};" >/dev/null
 # preview (dry-run) created nothing
 PRE=$(db "SELECT COUNT(*) FROM tasks WHERE project_key='widgetjob' AND title NOT LIKE 'Goal:%' AND kind='standard';")
@@ -135,7 +138,7 @@ POST=$(db "SELECT COUNT(*) FROM tasks WHERE project_key='widgetjob' AND title NO
   || bad_t "--from-job materializes" "rc=$rc pre=$PRE post=$POST out=$out"
 
 # --from-job before the plan is ready is a clean error, not a materialize
-out=$(run cmd_goal_add --planner=dev --dry-run -- "Not ready yet"); JOB5=$(printf '%s' "$out" | jq -r '.data.job // ""')
+out=$(run cmd_goal_add --planner="$TEST_PLANNER" --dry-run -- "Not ready yet"); JOB5=$(printf '%s' "$out" | jq -r '.data.job // ""')
 out=$(run cmd_goal_add --from-job="$JOB5"); rc=$?
 [[ $rc -ne 0 ]] && printf '%s' "$out" | grep -qi "no plan yet" \
   && ok_t "--from-job before plan ready rejected cleanly" \
@@ -149,7 +152,7 @@ out=$(run cmd_goal_status "L-does-not-exist"); rc=$?
 
 # ---- (7) planner drift: project.title/description aliased to name/goal ----
 DRIFT='{"project":{"key":"drift","title":"Drifted title","description":"Drifted goal"},
-  "tasks":[{"local_id":"d1","title":"Do it","assignee_or_role":"dev","risk":"low"}]}'
+  "tasks":[{"local_id":"d1","title":"Do it","assignee_or_role":"unit-goal-worker","risk":"low"}]}'
 out=$(run cmd_goal_add --plan="$DRIFT" --dry-run -- "Some outcome"); rc=$?
 nm=$(printf '%s' "$out" | jq -r '.data.plan.project.name // ""' 2>/dev/null)
 gl=$(printf '%s' "$out" | jq -r '.data.plan.project.goal // ""' 2>/dev/null)
