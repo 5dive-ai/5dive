@@ -162,30 +162,64 @@ export const DEFAULT_COUNCIL = {
 }
 export const DEFAULT_THRESHOLD = 3   // default flat pass-threshold; overridable per bench
 
-// Resolve the numeric pass-threshold for a roster. Supports BOTH models lodar is deciding
-// between, so either drops in with no engine change: 'flat' (a fixed N, e.g. 3) or
-// 'majority'/'quorum' (scales to a majority of the CURRENT seat count). Never hardcoded.
-export function resolveThreshold(seatCount, opts = {}) {
-  const rule = opts.thresholdRule || (opts.threshold ? 'flat' : 'flat')
-  if (rule === 'majority' || rule === 'quorum') return Math.floor(Number(seatCount) / 2) + 1
-  const n = Number(opts.threshold == null ? DEFAULT_THRESHOLD : opts.threshold)
-  return Math.max(1, Math.min(n, Number(seatCount) || n))   // clamp into [1, seatCount]
+// (P3.1b2) TIERED THRESHOLD POLICY (lodar is steering toward this). Per decision-CLASS pass
+// rule + quorum, ALL config so the final numbers drop in once locked. A rule is 'flat' (fixed
+// N), 'majority' (floor(seats/2)+1), or 'fraction' (ceil(value*seats), e.g. 2/3). `quorum`
+// = how many of the CURRENT seats must actually vote for the result to count ('majority' by
+// default, a number, or 'none'). Nothing hardcodes 5 or 3 — this map is the single knob.
+export const THRESHOLD_POLICY = {
+  ordinary:       { rule: 'majority',            quorum: 'majority' },
+  promote:        { rule: 'majority',            quorum: 'majority' },
+  demote:         { rule: 'fraction', value: 2 / 3, quorum: 'majority' },
+  expel:          { rule: 'fraction', value: 2 / 3, quorum: 'majority' },
+  constitutional: { rule: 'fraction', value: 2 / 3, quorum: 'all', requireQuorum: true },
 }
 
-// (P3.1c) DETERMINISTIC tally -> verdict for the named council. Pass iff approve-count
-// reaches the resolved threshold. Not a pass is a reject, unless escalate is the plurality
-// (a genuine "needs a human" split), which routes to escalate. The chair LLM only narrates
-// dissent/brief — the PASS/FAIL itself is an auditable count over the current roster.
+// Resolve the numeric pass-threshold for a roster from a spec. 'flat' (fixed N, clamped to
+// the roster), 'majority' (floor/2+1), 'fraction' (ceil(value*seats)). Never hardcoded.
+export function resolveThreshold(seatCount, spec = {}) {
+  const n = Number(seatCount) || 0
+  const rule = spec.rule || spec.thresholdRule || (spec.threshold != null ? 'flat' : 'majority')
+  if (rule === 'fraction') return Math.max(1, Math.ceil(Number(spec.value) * n))
+  if (rule === 'flat') { const t = Number(spec.threshold == null ? DEFAULT_THRESHOLD : spec.threshold); return Math.max(1, n ? Math.min(t, n) : t) }
+  return Math.floor(n / 2) + 1   // majority / quorum
+}
+
+// How many of the current seats must actually vote for a result to count (the quorum GATE).
+export function quorumSize(seatCount, spec = {}) {
+  const n = Number(seatCount) || 0
+  const q = spec.quorum
+  if (typeof q === 'number') return q
+  if (q === 'none') return 0
+  if (q === 'all') return n   // full quorum: every current seat must vote (constitutional)
+  return Math.floor(n / 2) + 1   // default: majority participation
+}
+
+// (P3.1c) DETERMINISTIC tally -> verdict. Enforces the QUORUM gate first (an inquorate vote
+// can't decide -> escalate), then passes iff approve-count reaches the class threshold. Not a
+// pass is a reject, unless escalate is the plurality (a genuine "needs a human" split). The
+// chair LLM only narrates — the PASS/FAIL is an auditable count over the current roster.
+// opts: { decisionClass, policy, seatCount, threshold, thresholdRule } — explicit
+// threshold/thresholdRule override the class policy (for ad-hoc convenes/tests).
 export function tallyVotes(votes, opts = {}) {
   const tally = { approve: 0, reject: 0, escalate: 0 }
   for (const v of votes || []) { if (tally[v.vote] != null) tally[v.vote]++ }
   const seatCount = opts.seatCount || (votes || []).length
-  const threshold = resolveThreshold(seatCount, opts)
+  const cls = opts.decisionClass || 'ordinary'
+  const policy = (opts.policy || THRESHOLD_POLICY)[cls] || THRESHOLD_POLICY.ordinary
+  const spec = { ...policy }
+  if (opts.threshold != null) { spec.rule = 'flat'; spec.threshold = opts.threshold }
+  if (opts.thresholdRule) spec.rule = opts.thresholdRule
+  const votesCast = tally.approve + tally.reject + tally.escalate
+  const quorum = quorumSize(seatCount, spec)
+  const quorumMet = votesCast >= quorum
+  const threshold = resolveThreshold(seatCount, spec)
   let recommendation
-  if (tally.approve >= threshold) recommendation = 'approve'
+  if (!quorumMet) recommendation = 'escalate'                       // inquorate -> can't decide, surface
+  else if (tally.approve >= threshold) recommendation = 'approve'
   else if (tally.escalate > tally.approve && tally.escalate >= tally.reject) recommendation = 'escalate'
   else recommendation = 'reject'
-  return { recommendation, tally, threshold, seatCount, escalated: recommendation === 'escalate' }
+  return { recommendation, tally, threshold, seatCount, quorum, quorumMet, votesCast, decisionClass: cls, escalated: recommendation === 'escalate' }
 }
 
 // (P3.1e) SELF-GOVERNANCE — pure roster mutations. The CLI gates each behind a real council
@@ -401,6 +435,8 @@ REBUT: try to find the strongest objection to the leading position. Then cast yo
   let verdict
   if (role === 'convene' || role === 'standing') {
     const counted = tallyVotes(votes, {
+      decisionClass: input.decisionClass || (input.bench && input.bench.decisionClass) || 'ordinary',
+      policy: input.policy,
       threshold: input.threshold != null ? input.threshold : (input.bench && input.bench.threshold),
       thresholdRule: input.thresholdRule || (input.bench && input.bench.thresholdRule),
       seatCount: seats.length,

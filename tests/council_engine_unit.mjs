@@ -7,6 +7,7 @@ import {
   guardrail, gateGuardrail, nodeGuardrail, verdictToAction, verifierVerdictToAction,
   nodeVerdictToDecision, resolveCouncil, STANDING_COUNCILS, DEFAULT_COUNCIL, DEFAULT_THRESHOLD,
   resolveThreshold, tallyVotes, applyFounderVeto, dispositionOf, addSeat, removeSeat,
+  THRESHOLD_POLICY, quorumSize,
   canonicalTranscript, validateAgainstSchema, makeAnthropicModelCall, runCouncil, TAKE, VOTE, NODE_VOTE,
 } from '../src/council/engine.mjs'
 
@@ -57,6 +58,24 @@ ok(tallyVotes(v5(2, 3, 0), { threshold: 3, seatCount: 5 }).recommendation === 'r
 ok(tallyVotes(v5(2, 0, 3), { threshold: 3, seatCount: 5 }).recommendation === 'escalate', 'escalate plurality -> escalate')
 ok(tallyVotes(v5(5, 0, 0), { thresholdRule: 'majority', seatCount: 5 }).recommendation === 'approve', 'majority rule pass drops in')
 ok(tallyVotes(v5(6, 3, 0), { thresholdRule: 'majority', seatCount: 9 }).recommendation === 'approve', '6/9 majority -> PASS (unbounded seats)')
+
+// ---- CNCL-6: TIERED thresholds per decision class + quorum-validity gate ----
+ok(THRESHOLD_POLICY.ordinary.rule === 'majority' && THRESHOLD_POLICY.demote.rule === 'fraction' && THRESHOLD_POLICY.constitutional.requireQuorum === true, 'per-class policy: ordinary=majority, demote=2/3, constitutional requires quorum')
+ok(quorumSize(5, { quorum: 'majority' }) === 3, 'quorum majority of 5 = 3')
+ok(quorumSize(6, { quorum: 'all' }) === 6, 'constitutional full quorum = all seats')
+ok(quorumSize(5, { quorum: 'none' }) === 0, 'quorum none = 0')
+// quorum GATE: too few seats voted -> inquorate -> escalate (matters for async seats)
+ok(tallyVotes(v5(2, 0, 0), { decisionClass: 'ordinary', seatCount: 5 }).quorumMet === false, 'only 2 of 5 voted -> quorum NOT met')
+ok(tallyVotes(v5(2, 0, 0), { decisionClass: 'ordinary', seatCount: 5 }).recommendation === 'escalate', 'inquorate vote -> escalate (cannot decide)')
+// ordinary = majority
+ok(tallyVotes(v5(3, 2, 0), { decisionClass: 'ordinary', seatCount: 5 }).recommendation === 'approve', 'ordinary 3/5 majority -> PASS')
+// demote/expel = 2/3
+ok(tallyVotes(v5(4, 2, 0), { decisionClass: 'demote', seatCount: 6 }).recommendation === 'approve', 'demote 4/6 (>=2/3) -> PASS')
+ok(tallyVotes(v5(3, 3, 0), { decisionClass: 'demote', seatCount: 6 }).recommendation === 'reject', 'demote 3/6 (<2/3) -> fail')
+// constitutional = 2/3 + FULL quorum
+ok(tallyVotes(v5(5, 1, 0), { decisionClass: 'constitutional', seatCount: 6 }).recommendation === 'approve', 'constitutional 5/6 with full quorum (all voted, >=2/3) -> PASS')
+ok(tallyVotes(v5(5, 0, 0), { decisionClass: 'constitutional', seatCount: 6 }).quorumMet === false, 'constitutional needs FULL quorum: 5 of 6 voted -> inquorate')
+ok(tallyVotes(v5(5, 0, 0), { decisionClass: 'constitutional', seatCount: 6 }).recommendation === 'escalate', 'constitutional short of full quorum -> escalate')
 
 // ---- CNCL-6: self-governed roster (add/remove, unbounded, idempotent) ----
 let roster = DEFAULT_COUNCIL.seats
