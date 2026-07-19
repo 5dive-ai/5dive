@@ -22128,6 +22128,14 @@ export function canonicalTranscript(rec) {
   L.push(`seats: ${(rec.seats || []).map(norm).slice().sort().join(',')}`)
   const votes = (rec.votes || []).slice().sort((a, b) => (norm(a.seat) < norm(b.seat) ? -1 : 1))
   for (const v of votes) L.push(`vote ${norm(v.seat)}: ${norm(v.vote != null ? v.vote : v.choice)} :: ${norm(v.rationale)}`)
+  // CNCL-7: in adversarial mode the FINAL votes above are ROUND 2. Seal the sorted round-1
+  // history too so a between-round seat flip cannot be misrepresented without failing verify
+  // (the deliberative record is the product, not only the final tally). round1Votes is set on
+  // the rec ONLY when a rebuttal round occurred, so a single-round receipt stays byte-identical.
+  if (Array.isArray(rec.round1Votes)) {
+    const r1 = rec.round1Votes.slice().sort((a, b) => (norm(a.seat) < norm(b.seat) ? -1 : 1))
+    for (const v of r1) L.push(`round1 ${norm(v.seat)}: ${norm(v.vote != null ? v.vote : v.choice)} :: ${norm(v.rationale)}`)
+  }
   const vd = rec.verdict || {}
   const t = vd.tally || {}
   L.push(`verdict: ${norm(vd.recommendation != null ? vd.recommendation : vd.choice)} conf=${Number(vd.confidence)} tally=a${Number(t.approve) || 0}/r${Number(t.reject) || 0}/e${Number(t.escalate) || 0} escalated=${!!vd.escalated}`)
@@ -22515,6 +22523,9 @@ function finish(role, input, base) {
     const rec = {
       council: input.councilName || 'ad-hoc', mode: base.mode, stampedAt: input.stampedAt || '',
       question: base.question, seats: base.seats.map(s => s.id), votes: base.votes, verdict: base.verdict,
+      // Seal round-1 history ONLY when a rebuttal round ran (adversarial); a single-round receipt
+      // omits it and stays byte-identical to CNCL-6. Makes the between-round record tamper-evident.
+      ...(base.rebuttalVotes ? { round1Votes: base.round1Votes } : {}),
     }
     out.receipt = { canonical: canonicalTranscript(rec), ...sealCommands() }
   }

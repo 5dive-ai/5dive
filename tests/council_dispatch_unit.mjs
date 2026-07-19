@@ -3,7 +3,7 @@
 // no `5dive` exec (a mock seatVote adapter stands in for the ask rail). Exit 0 == green.
 import {
   parseVote, seatPrompt, normalizeSeatVote, synthesizeNarrative, buildConveneVerdict,
-  tallyVotes, runCouncil, VOTE_TOKENS,
+  tallyVotes, runCouncil, VOTE_TOKENS, canonicalTranscript,
 } from '../src/council/engine.mjs'
 
 let pass = 0, fail = 0
@@ -89,6 +89,20 @@ const rAdv = await runCouncil(
 ok(seenAdv.some(s => s.round === 1 && s.sawPrior === false), 'adversarial: round 1 still blind')
 ok(seenAdv.some(s => s.round === 2 && s.sawPrior === true), 'adversarial: round 2 rebuttal DOES see the round-1 votes')
 ok(Array.isArray(rAdv.round1Votes) && Array.isArray(rAdv.rebuttalVotes) && rAdv.votes === rAdv.rebuttalVotes, 'adversarial: round 1 + rebuttal recorded separately; final votes = round 2')
+
+// TAMPER-EVIDENCE of round-1 history (main's CNCL-7 gate amendment): in adversarial mode the
+// signed canonical must include the round-1 votes, so a between-round seat flip cannot be
+// misrepresented without failing verify. A single-round receipt must NOT carry round1 lines.
+ok(/\nround1 \w+: /.test(rAdv.receipt.canonical), 'adversarial receipt SEALS the round-1 history (round1 lines in the canonical)')
+ok(!/\nround1 /.test(rAll.receipt.canonical), 'single-round (non-adversarial) receipt stays round1-free (byte-identical to CNCL-6)')
+// a round-1 flip changes the sealed bytes even when the FINAL votes + verdict are identical
+const recBase = { council: 'c', mode: 'adversarial', stampedAt: 'T', question: 'q', seats: ['a', 'b'],
+  votes: [{ seat: 'a', vote: 'approve', rationale: 'x' }, { seat: 'b', vote: 'approve', rationale: 'y' }],
+  round1Votes: [{ seat: 'a', vote: 'reject', rationale: 'first no' }, { seat: 'b', vote: 'approve', rationale: 'y' }],
+  verdict: { recommendation: 'approve', tally: { approve: 2, reject: 0, escalate: 0 }, confidence: 1, dissent: 'none', escalated: false } }
+const recFlip = { ...recBase, round1Votes: [{ seat: 'a', vote: 'approve', rationale: 'first no' }, { seat: 'b', vote: 'approve', rationale: 'y' }] }
+ok(canonicalTranscript(recBase) !== canonicalTranscript(recFlip), 'a round-1 vote flip changes the sealed bytes even with identical FINAL votes (round-1 history is tamper-evident)')
+ok(canonicalTranscript({ ...recBase, seats: ['b', 'a'] }) === canonicalTranscript(recBase), 'round-1 canonical stays order-independent (stable bytes)')
 
 // ADVERSARIAL never runs a second round in a non-adversarial mode
 const seenDelib = []
