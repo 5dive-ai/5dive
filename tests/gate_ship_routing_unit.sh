@@ -167,11 +167,13 @@ seed DIVE-41; HUMAN_PINGED=0; route_reset
 cmd_task_need DIVE-41 --type=approval --ask="approve the persona skill-set for 'doc' before it enters the drip queue?" --from=dev >/dev/null 2>&1
 [[ "$HUMAN_PINGED" == "0" && "$(db "SELECT COALESCE(routed_reviewer,'') FROM tasks WHERE ident='DIVE-41';")" == "main" ]] && ok_t "DIVE-1381: curation (no floor word) routes to lead, pref OFF" || bad_t "curation no-floor route" "human=$HUMAN_PINGED reviewer='$(db "SELECT COALESCE(routed_reviewer,'') FROM tasks WHERE ident='DIVE-41';")'"
 
-# floor WINS over curation: a genuine BRAND/press action stays hard-human even when
-# the ask also names a persona (brand is NOT a content-publish-later term).
+# DIVE-1492: brand alone is no longer a hard-human floor. A brand decision that
+# also names a persona stays lead-clearable through the curation route.
 seed DIVE-42; HUMAN_PINGED=0; route_reset
-cmd_task_need DIVE-42 --type=approval --ask="approve the brand launch announcement for the persona pack rollout?" --from=dev >/dev/null 2>&1
-[[ "$HUMAN_PINGED" == "1" ]] && ok_t "DIVE-1381: floor beats curation (brand persona announce → human)" || bad_t "brand beats curation" "HUMAN_PINGED=$HUMAN_PINGED"
+cmd_task_need DIVE-42 --type=approval --ask="approve the brand palette for the persona pack?" --from=dev >/dev/null 2>&1
+[[ "$HUMAN_PINGED" == "0" && "$(db "SELECT tier FROM tasks WHERE ident='DIVE-42';")" == "1" && "$(db "SELECT COALESCE(routed_reviewer,'') FROM tasks WHERE ident='DIVE-42';")" == "main" ]] \
+  && ok_t "DIVE-1492: brand persona approval routes to lead at tier-1" \
+  || bad_t "brand persona approval should route to lead" "human=$HUMAN_PINGED tier='$(db "SELECT tier FROM tasks WHERE ident='DIVE-42';")' reviewer='$(db "SELECT COALESCE(routed_reviewer,'') FROM tasks WHERE ident='DIVE-42';")'"
 
 # floor WINS over curation: MONEY in a curation ask stays hard-human.
 seed DIVE-43; HUMAN_PINGED=0; route_reset

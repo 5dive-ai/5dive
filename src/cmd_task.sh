@@ -52,7 +52,7 @@ _task_usage() {
     --recommend: your advised choice (strongly encouraged for decision/approval). Leads the alert as '✅ Recommended: <X>' and ⭐-marks its button. For a decision it must match one of --options.
     --tier (DIVE-891 risk tiers): 0 = auto-clear (rec applies NOW, no ping, digest line; requires --recommend)
              1 = agent-clearable; unanswered 48h -> the heartbeat applies the rec   2 = hard human gate (default for approval/secret/manual)
-             Money, public comms, secrets, destructive and brand asks are FLOORED to tier 2 no matter what you pass; secret is always tier 2.
+             Money, public comms, secrets and destructive asks are FLOORED to tier 2 no matter what you pass; secret is always tier 2.
                                                      # -> blocked, awaiting a human (decision/secret/approval/manual)
   5dive task park <id|DIVE-N> --reason="..." --wake=<YYYY-MM-DD[ HH:MM]|+Nd|+Nh>
                                                      # QUIET timed wait (no ping, not in the inbox); the heartbeat auto-unparks at --wake.
@@ -64,7 +64,7 @@ _task_usage() {
   5dive task clear-recs --channel-proof=<chat_id> [--only=<id|DIVE-N>]
                                                      # DIVE-1305: paired-human bulk-clear — apply each pending gate's --recommend as a HUMAN clear,
                                                      # driven by the human's own verified DM ("go with recs"). Clears only tier<2 (agent-clearable) gates;
-                                                     # tier-2 hard gates (money/destructive/secret/brand) are SKIPPED and keep their per-gate button tap.
+                                                     # tier-2 hard gates (money/destructive/secret) are SKIPPED and keep their per-gate button tap.
                                                      # --only limits it to one named gate. Invoked by the telegram plugin, which supplies the verified chat_id.
                                                      # approval/secret gates are human-only: blocked for agent-* callers,
                                                      # and (DIVE-519) require --proof=<token from `5dive gate-proof`> once
@@ -1586,8 +1586,8 @@ cmd_task_routing() {
 }
 
 # DIVE-891 (adopted design DIVE-861): the T2 category floor. Money, public or
-# customer-facing comms, secrets, destructive/irreversible actions and
-# brand/strategy are ALWAYS a hard human gate, regardless of the tier the
+# customer-facing comms, secrets, and destructive/irreversible actions are
+# ALWAYS a hard human gate, regardless of the tier the
 # filing agent asked for — the floor is enforced here, not trusted from the
 # filer. Matched case-insensitively over ask + title. The bias is deliberately
 # toward false positives: a wrongly-ELEVATED gate costs the human one tap; a
@@ -1595,7 +1595,7 @@ cmd_task_routing() {
 # same posture as gate-proof (a determined agent can still word around it —
 # but only by loudly not-naming what it's asking for, which the ask text then
 # fails to justify).
-_GATE_T2_FLOOR_RX='spend|billing|invoice|charge|payment|refund|subscription|price|pricing|\$[0-9]|€[0-9]|publish|public post|announce|launch post|press|customer email|email customers|newsletter|blast|secret|credential|api key|token|password|delete|destroy|teardown|wipe|purge|drop[^.]{0,20}table|truncate|irreversible|revoke|dns|domain transfer|brand'
+_GATE_T2_FLOOR_RX='spend|billing|invoice|charge|payment|refund|subscription|price|pricing|\$[0-9]|€[0-9]|publish|public post|announce|launch post|press|customer email|email customers|newsletter|blast|secret|credential|api key|token|password|delete|destroy|teardown|wipe|purge|drop[^.]{0,20}table|truncate|irreversible|revoke|dns|domain transfer'
 _gate_tier2_floor_hit() {
   local text; text=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
   [[ "$text" =~ $_GATE_T2_FLOOR_RX ]]
@@ -1610,7 +1610,7 @@ _gate_tier2_floor_hit() {
 # by kind and force them DOWN to a lead-routed tier-1 — the mirror of the T2
 # floor (which forces true-human categories UP to tier-2). The true-human floor
 # ALWAYS wins and is checked FIRST: an eng gate that also names money / secrets /
-# destructive / brand stays tier-2 (a "ship the pricing change" gate is still a
+# destructive stays tier-2 (a "ship the pricing change" gate is still a
 # human call). Bias, like the floor, is deliberate: a wrongly-classified eng gate
 # costs the lead one clear; the floor guards the only genuinely-human direction.
 _GATE_ENG_SHIP_RX='merge|pull request|\bpr\b|\bdiff\b|ship it|ship the|ship this|deploy|redeploy|roll ?out|land the|land it|rebase|hotfix|cut a branch|cut the release|push to (main|prod|production|origin)|code review|approve the (merge|diff|change|pr|build|deploy|ship|commit)|build\.sh|smoke test|ci\b'
@@ -1631,7 +1631,7 @@ _gate_eng_ship_hit() {
 # a lead-routed tier-1 — BUT ONLY when the *sole* reason the floor fired was a
 # content-publish-LATER term (see _GATE_CONTENT_PUBLISH_RX): the real publish
 # happens downstream via the drip, not now. The true-human floor still wins for
-# a genuine publish-NOW / brand / press / customer-comms / money / secret /
+# a genuine publish-NOW / press / customer-comms / money / secret /
 # destructive ask — the caller re-tests the floor with the publish-later terms
 # stripped and only downgrades if nothing else trips it. secret/manual are never
 # curation; filer-is-lead ⇒ no reviewer ⇒ not downgraded.
@@ -1645,7 +1645,7 @@ _gate_content_curation_hit() {
 # The content-publish-LATER terms — the subset of the T2 floor whose match is
 # safe to carve out for a curation-shaped ask, because for our drip the actual
 # publish is a downstream, automated step, not the thing being approved now.
-# Deliberately NARROW: 'press', 'customer email', 'newsletter', 'blast', 'brand'
+# Deliberately NARROW: 'press', 'customer email', 'newsletter', and 'blast'
 # and every money/secret/destructive term stay in the floor (they are genuine
 # human calls even in a curation context). Used to compute the residual-floor
 # test in cmd_task_need.
@@ -1679,7 +1679,7 @@ _gate_internal_ops_hit() {
 # recoverable dev state, not production. Deliberately NARROW: 'teardown', 'drop
 # table', 'revoke', 'dns', 'domain transfer' STAY in the floor (real infra / prod
 # / access, human calls even in a recovery context), as does every money / secret
-# / publish / brand term. Used to compute the residual-floor test below.
+# / publish term. Used to compute the residual-floor test below.
 _GATE_INTERNAL_DESTRUCTIVE_RX='destroy|wipe|purge|delete|irreversible'
 
 # DIVE-1481: the internal-ops OBJECT vocabulary — the control-plane nouns a
@@ -1873,7 +1873,7 @@ cmd_task_need() {
   # common builder gate and the human blanket-cleared them in practice), manual/
   # secret -> 2. Explicit --tier can lower an approval/decision/manual gate,
   # EXCEPT: a secret gate is always tier 2, and the T2 category floor below
-  # overrides everything (money/public-comms/secrets/destructive/brand still
+  # overrides everything (money/public-comms/secrets/destructive still
   # route to a human regardless of this default — see _gate_tier2_floor_hit).
   # DIVE-1284: default 'approval' to tier 1 too — the old default sent the bulk
   # of delegatable ship/close/commit approvals straight to the paired human.
@@ -1908,7 +1908,7 @@ cmd_task_need() {
   # Like eng-ship the routing is intrinsic to the KIND, so this fires whether or
   # not the floor tripped: a curation-shaped decision/approval from a NON-lead is
   # forced to a lead-routed tier-1 — downgrading tier-2 when the floor fired. The
-  # true-human floor still WINS for a genuine publish-NOW / brand / press /
+  # true-human floor still WINS for a genuine publish-NOW / press /
   # customer-comms / money / secret / destructive ask: we re-test the floor with
   # only the content-publish-LATER terms stripped (_GATE_CONTENT_PUBLISH_RX — the
   # real publish happens downstream via the drip, not now) and refuse to downgrade
@@ -1942,7 +1942,7 @@ cmd_task_need() {
   # (_GATE_INTERNAL_DESTRUCTIVE_RX); only if the ask matches the narrow internal-ops
   # class AND nothing else in the residual still trips the floor (a real prod/infra
   # destructive term — teardown / drop table / revoke / dns — or any money / secret
-  # / publish / brand term wins and stays hard-human) do we downgrade to a
+  # / publish term wins and stays hard-human) do we downgrade to a
   # lead-routed tier-1 so it reaches the lead, not lodar. Guarded to decision/
   # approval with a reviewer (filer-is-lead ⇒ no downgrade); runs after curation so
   # a curation-shaped ask keeps its own class.
@@ -1967,7 +1967,7 @@ cmd_task_need() {
   # gate for an eng ship/merge/diff/deploy decision — that class is lead-clearable,
   # not a human call. When a NON-lead filer's decision/approval gate hits the
   # eng-ship kind AND did NOT trip the true-human floor above (which already ran
-  # and wins — money/secrets/destructive/brand stay tier-2), force it to a
+  # and wins — money/secrets/destructive stay tier-2), force it to a
   # lead-routed tier-1, OVERRIDING an explicit --tier=2. `_eng_ship=1` also makes
   # the routing predicate below send it to the lead regardless of the
   # gate_builder_routing pref, exactly like the DIVE-1243 `access` class — the
@@ -2206,7 +2206,7 @@ cmd_task_need() {
   # provenance floor) — routing those to an agent-reviewer needs the floor to
   # trust a designated reviewer, a deeper change deferred to a follow-up. We
   # never route a tier-2 gate — whether floored (true-human category: money/
-  # destructive/brand/secret, per _gate_tier2_floor_hit) OR filed with an
+  # destructive/secret, per _gate_tier2_floor_hit) OR filed with an
   # explicit --tier=2 (the caller's hard-human contract; 2 = never auto-applies,
   # always pings the human). Guarding on the EFFECTIVE tier (tier != 2) subsumes
   # the floor, since a floored gate always sets tier=2, and closes the hole where
@@ -2221,7 +2221,7 @@ cmd_task_need() {
   # approval/manual too, so a NON-true-human builder gate reaches the lead first.
   # `secret` is deliberately EXCLUDED (a secret must be delivered by a human,
   # never an agent), and tier-2 gates are never routed (guarded by tier != 2,
-  # which subsumes the true-human category floor: money/destructive/brand/secret).
+  # which subsumes the true-human category floor: money/destructive/secret).
   # Unlike decision (agent-clearable by type), approval/manual are human-only in
   # cmd_task_answer; routing them therefore PERSISTS routed_reviewer, the single
   # basis for the designated-reviewer floor exception there — so the exception is
@@ -2234,7 +2234,7 @@ cmd_task_need() {
   #   approval/manual — default to tier 2, so the effective tier can't discriminate.
   #     Route them UNLESS the caller EXPLICITLY pinned --tier=2 (hard-human
   #     contract) OR the ask/title hits the true-human category floor (money/
-  #     destructive/brand/secret) — the same floor decision that gates a decision,
+  #     destructive/secret) — the same floor decision that gates a decision,
   #     re-run here because the tier==2 short-circuit above skipped it for these.
   #   secret — never routable (must be delivered by a human).
   local _routable=0
@@ -2247,7 +2247,7 @@ cmd_task_need() {
       fi ;;
     # DIVE-1243: the manager-clearable class routes to the lead FIRST regardless
     # of tier — that is the whole point of the type. The ONLY fall-through to the
-    # human is the T2 category floor (money/destructive/secrets/brand), which sets
+    # human is the T2 category floor (money/destructive/secrets), which sets
     # tier_floored=1 above. An access gate is therefore routable unless floored.
     access) (( tier_floored )) || _routable=1 ;;
   esac
@@ -2898,7 +2898,7 @@ cmd_gate_proof() {
 # except one command clears many.
 #
 # Scope (lodar's DIVE-1305 decision, 2026-07-16): ONLY tier<2, agent-clearable
-# gates. tier-2 hard gates (money/destructive/secret/brand are floored there) are
+# gates. tier-2 hard gates (money/destructive/secret are floored there) are
 # SKIPPED — they keep a deliberate per-gate button tap. We also skip lead-routed
 # gates (routed_reviewer set): those clear via their designated lead, not the
 # human's blanket channel. A gate with no --recommend is skipped (nothing to
@@ -2994,7 +2994,7 @@ cmd_task_answer() {
       # DIVE-1305: paired-human channel proof — a chat_id the trusted plugin
       # verified as the paired human's OWN verified DM (∈ access.json allowFrom).
       # Honored as human evidence ONLY for tier<2 gates (see below); a tier-2
-      # hard gate (money/destructive/secret/brand) NEVER accepts it and keeps its
+      # hard gate (money/destructive/secret) NEVER accepts it and keeps its
       # per-gate button tap. This is the "go with recs from your own channel"
       # clear (lodar's chosen scope, DIVE-1305 decision 2026-07-16).
       --channel-proof=*) channel_proof="${1#*=}" ;;
@@ -3020,7 +3020,7 @@ cmd_task_answer() {
 
   # DIVE-1305: the paired-human channel proof is a valid human-evidence form, but
   # STRICTLY for tier<2 gates. tier 2 is the hard-human floor (money/destructive/
-  # secret/brand are floored there) and lodar's chosen scope keeps those a
+  # secret are floored there) and lodar's chosen scope keeps those a
   # deliberate per-gate button tap — a plain chat line must NOT clear them. So we
   # honor --channel-proof only when the gate is tier<2 AND the chat_id verifies
   # against the bot's own access.json allowFrom (the paired human's verified DM).

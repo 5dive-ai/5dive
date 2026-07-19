@@ -6,10 +6,11 @@
 # tier 1 while `approval` (the MOST common builder gate — "approve this
 # ship/close/commit") defaulted to tier 2 and routed straight to the paired human.
 # FIX: `decision|approval) tier=1`. SAFETY: the T2 category floor
-# (_gate_tier2_floor_hit — money/public-comms/secrets/destructive/brand) and the
+# (_gate_tier2_floor_hit — money/public-comms/secrets/destructive) and the
 # secret-type floor still force tier 2 regardless of this default, so genuinely-human
 # approvals are unaffected. This harness proves BOTH halves: non-floored approval
-# lands tier 1; a money/brand/secret/destructive approval still floors to tier 2.
+# lands tier 1; money/public-comms/secret/destructive approvals still floor to tier 2,
+# while a pure brand ask remains tier 1 for org-lead review (DIVE-1492).
 # Isolation matches the sibling harnesses (gate_tier2_floor_unit.sh): source src/
 # libs into a throwaway STATE_DIR — the live shared tasks.db is NEVER touched.
 # Run: bash tests/gate_approval_routing_unit.sh   (no root, no network).
@@ -75,13 +76,19 @@ cmd_task_need DIVE-204 --type=approval --ask="approve the \$500 ad spend increas
   && ok_t "A4 money approval still floors to tier 2 -> human (backstop holds)" \
   || bad_t "A4 money approval floors tier 2" "got tier '$(tierof DIVE-204)' (floor may have moved)"
 
-# --- A5: SAFETY BACKSTOP (public-comms/brand) — approval to publish an announce post
-#     still floors to tier 2. --------------------------------------------------------
+# --- A5: DIVE-1492 — a PURE brand ask is lead-clearable tier 1, not human-only. ----
 seed_task DIVE-205
-cmd_task_need DIVE-205 --type=approval --ask="approve publishing the launch announce post?" --recommend="no" >/dev/null 2>&1
-[[ "$(tierof DIVE-205)" == "2" ]] \
-  && ok_t "A5 public-comms/brand approval still floors to tier 2 -> human" \
-  || bad_t "A5 public-comms approval floors tier 2" "got tier '$(tierof DIVE-205)'"
+cmd_task_need DIVE-205 --type=approval --ask="approve the brand palette direction?" --recommend="yes" >/dev/null 2>&1
+[[ "$(tierof DIVE-205)" == "1" ]] \
+  && ok_t "A5 pure brand approval stays tier 1 -> org lead" \
+  || bad_t "A5 pure brand approval should stay tier 1" "got tier '$(tierof DIVE-205)'"
+
+# --- A5b: public/publish terms remain a hard-human backstop after brand removal. ---
+seed_task DIVE-209
+cmd_task_need DIVE-209 --type=approval --ask="approve publishing the launch announce post?" --recommend="no" >/dev/null 2>&1
+[[ "$(tierof DIVE-209)" == "2" ]] \
+  && ok_t "A5b public-comms approval still floors to tier 2 -> human" \
+  || bad_t "A5b public-comms approval floors tier 2" "got tier '$(tierof DIVE-209)'"
 
 # --- A6: SAFETY BACKSTOP (destructive) — approval to delete/teardown floors to tier 2.
 seed_task DIVE-206

@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- fix(gates): remove pure brand/strategy asks from the CLI's tier-2 human-gate floor so they remain tier-1 and org-lead-clearable; money, public/customer communications, secrets, and destructive/irreversible asks continue to floor to tier 2. The goal planner's separate `brand` risk taxonomy is unchanged (DIVE-1492).
+
 ## 0.11.6 — gate delivery receipts + 1h/24h batched re-nags (DIVE-1490) (2026-07-19)
 
 - fix(gates): gate alerts now treat Telegram's structured Bot API acknowledgement as the delivery receipt instead of treating a best-effort curl as success. A confirmed send stamps `gate_pinged_at` and records the returned `message_id`; a rejected or empty response emits a loud warning and durable delivery event, leaves the receipt unset for retry, and falls back to an allowed group topic so the alert remains visible.
