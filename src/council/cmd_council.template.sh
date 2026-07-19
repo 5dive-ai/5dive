@@ -21,9 +21,17 @@ _council_help() {
   5dive council convene "<question>" [--seats=a,b,c] [--mode=quick|deliberate|adversarial]
                                      [--bench=<name>] [--class=<decisionClass>]
                                      [--threshold=<n>] [--veto-by=<who> --veto-reason=<why>]
-      Convene a council over a question. Emits an auditable verdict (deterministic
-      tally over the current roster + a narrative-only chair + founder veto) and a
-      tamper-evident, root-signed receipt. Defaults to the 5-seat standing Council.
+                                     [--timeout=120] [--idle-secs=5] [--poll-secs=2] [--standalone]
+      Convene a council over a question. By DEFAULT (CNCL-7) it DISPATCHES the question
+      to the real seated agents — each seat votes via its OWN harness over the
+      `5dive agent ask` rail, no shared model key. A seat that times out or replies
+      without a COUNCIL-VOTE line is a recorded ABSTAIN; a convene that falls below
+      quorum returns no verdict and auto-escalates with a human brief. The first round
+      is BLIND (no seat sees another before its own vote); adversarial adds a rebuttal
+      round, recorded separately. Emits an auditable verdict (deterministic tally over
+      the current roster + founder veto) and a tamper-evident, root-signed receipt.
+      Defaults to the 5-seat standing Council. --standalone selects the deferred
+      single-key modelCall seam instead of dispatch.
 
   5dive council bench ls
   5dive council bench show <name>
@@ -33,9 +41,10 @@ _council_help() {
       council, ship, brand, security — fail-closed on an unknown name; add/rm are
       privileged governance writes and need sudo).
 
-  Add --json for a machine envelope. Model calls use COUNCIL_API_KEY (A-with-seam;
-  BYO/OpenRouter via COUNCIL_BASE_URL). COUNCIL_MOCK=1 runs a deterministic offline
-  council (no key, no network) for tests + smoke.
+  Add --json for a machine envelope. The default dispatch path needs NO model key
+  (each seat uses its own harness). The --standalone seam uses COUNCIL_API_KEY
+  (A-with-seam; BYO/OpenRouter via COUNCIL_BASE_URL). COUNCIL_MOCK=1 runs a
+  deterministic offline council (no key, no network, no agent dispatch) for tests + smoke.
 COUNCIL_HELP
 }
 

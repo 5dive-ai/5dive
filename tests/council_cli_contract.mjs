@@ -55,6 +55,16 @@ r = runCli(['convene', 'q?', '--stamped-at=T'], MOCK)
 v = JSON.parse(r.out)
 ok('default roster = 5 standing seats', v.seats.length === 5 && v.seats.includes('olivia'))
 
+// --- CNCL-7: dispatch path is the DEFAULT (real seated agents, no model key) -------------
+r = runCli(['convene', 'Ship it?', '--seats=a,b,c', '--stamped-at=T'], MOCK)
+v = JSON.parse(r.out)
+ok('convene defaults to real-agent dispatch', v.dispatch === 'real-agents')
+ok('convene surfaces per-seat votes', Array.isArray(v.votes) && v.votes.length === 3 && v.votes.every(x => x.seat && x.vote))
+// --standalone selects the deferred single-key modelCall seam (still offline under COUNCIL_MOCK)
+r = runCli(['convene', 'Ship it?', '--seats=a,b,c', '--standalone', '--stamped-at=T'], MOCK)
+v = JSON.parse(r.out)
+ok('--standalone selects the modelCall seam', v.dispatch === 'standalone-seam' && v.disposition === 'pass')
+
 // --- 3: bench registry contract ---------------------------------------------
 r = runCli(['bench', 'ls'])
 ok('bench ls lists built-ins', JSON.parse(r.out).benches.some(b => b.name === 'ship' && b.builtin))

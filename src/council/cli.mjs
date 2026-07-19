@@ -15,6 +15,7 @@
 // with no key). Otherwise the A-with-seam Anthropic adapter reads COUNCIL_API_KEY.
 import * as E from './engine.mjs'
 import fs from 'node:fs'
+import { execFileSync } from 'node:child_process'
 
 const argv = process.argv.slice(2)
 const sub = argv[0] || ''
@@ -73,6 +74,42 @@ function modelCallFor() {
   return E.makeAnthropicModelCall({})
 }
 
+// ---- CNCL-7 dispatch: convene -> real seated agents (default fleet path) ----
+// Each seat votes via its OWN harness over the `5dive agent ask` rail — no shared model key.
+// A per-seat timeout, a non-running agent, or a reply with no COUNCIL-VOTE line all resolve to
+// an ABSTAIN (the engine records it; abstains still count toward the quorum denominator).
+function dispatchSeatVote(opts) {
+  const timeout = Number(opts.timeout) || 120
+  const idle = Number(opts.idle) || 5
+  const poll = Number(opts.poll) || 2
+  const from = opts.from || 'council'
+  const bin = process.env.COUNCIL_5DIVE_BIN || '5dive'
+  return async (seat, ctx) => {
+    const prompt = E.seatPrompt(seat, ctx)
+    let reply = ''
+    try {
+      const stdout = execFileSync(bin, ['agent', 'ask', seat.id, prompt,
+        '--json', `--from=${from}`, `--timeout=${timeout}`, `--idle-secs=${idle}`, `--poll-secs=${poll}`],
+        { encoding: 'utf-8', timeout: (timeout + 30) * 1000, maxBuffer: 16 * 1024 * 1024 })
+      const env = JSON.parse(stdout)
+      reply = (env && env.data && env.data.reply) || ''
+    } catch (e) {
+      // ask timed out (E_TIMEOUT), the agent isn't running, or the exec failed -> ABSTAIN.
+      return { vote: 'abstain', rationale: `no reply from ${seat.id} (${String(e && e.message || e).replace(/\s+/g, ' ').slice(0, 140)})` }
+    }
+    return E.parseVote(reply) || { vote: 'abstain', rationale: `${seat.id} reply had no COUNCIL-VOTE line` }
+  }
+}
+// Deterministic, network-free, NO `5dive` exec — every seat approves so the full dispatch path
+// (blind round -> tally -> synthesis -> receipt) exercises offline in tests + VM smoke.
+function mockSeatVote() {
+  return async (seat) => ({ vote: 'approve', rationale: `mock: ${seat.id} sees no blocker.` })
+}
+function seatVoteFor() {
+  if (process.env.COUNCIL_MOCK) return mockSeatVote()
+  return dispatchSeatVote({ timeout: flag('timeout'), idle: flag('idle-secs'), poll: flag('poll-secs'), from: flag('from') })
+}
+
 // ---- subcommands -----------------------------------------------------------
 async function cmdConvene() {
   const question = positionals[0]
@@ -100,14 +137,25 @@ async function cmdConvene() {
   const th = flag('threshold'); if (th != null && th !== true) input.threshold = Number(th)
   const tr = flag('threshold-rule'); if (tr) input.thresholdRule = tr
   const vetoBy = flag('veto-by'); if (vetoBy) input.veto = { by: vetoBy, reason: flag('veto-reason') || '' }
+  // FLEET DEFAULT (CNCL-7): dispatch to the real seated agents (no model key). --standalone
+  // (or COUNCIL_STANDALONE) selects the deferred single-key modelCall seam instead. COUNCIL_MOCK
+  // runs either path offline. The engine records a timed-out/silent seat as an abstain.
+  const standalone = !!flag('standalone') || !!process.env.COUNCIL_STANDALONE
+  const deps = standalone
+    ? { modelCall: modelCallFor(), verbose: !!flag('verbose') }
+    : { seatVote: seatVoteFor(), verbose: !!flag('verbose') }
   let result
-  try { result = await E.runCouncil(input, { modelCall: modelCallFor(), verbose: !!flag('verbose') }) }
+  try { result = await E.runCouncil(input, deps) }
   catch (e) { die(String(e && e.message || e), 1) }
   out({
     council: input.councilName, mode: result.mode, question,
     seats: result.seats.map(s => s.id),
+    dispatch: standalone ? 'standalone-seam' : 'real-agents',
     verdict: result.verdict,
     disposition: E.dispositionOf(result.verdict),
+    votes: (result.votes || []).map(v => ({ seat: v.seat, vote: v.vote, rationale: v.rationale })),
+    round1Votes: result.round1Votes ? result.round1Votes.map(v => ({ seat: v.seat, vote: v.vote, rationale: v.rationale })) : undefined,
+    rebuttalVotes: result.rebuttalVotes ? result.rebuttalVotes.map(v => ({ seat: v.seat, vote: v.vote, rationale: v.rationale })) : undefined,
     receipt: result.receipt,   // { canonical, seal, verify } — bash seals canonical
   })
 }

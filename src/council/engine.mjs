@@ -365,6 +365,117 @@ export function makeAnthropicModelCall(config = {}) {
   }
 }
 
+// ==================== DISPATCH (CNCL-7): convene -> real seated agents ====================
+// Fleet mode: convene DISPATCHES the question to the real seated agents (the `5dive agent ask`
+// rail); each seat votes via its OWN harness + model access — NO shared council key. The engine
+// stays pure: the CLI injects a `seatVote(seat, ctx)` adapter that shells the ask rail; tests
+// inject a deterministic mock. makeAnthropicModelCall survives only as the deferred standalone
+// seam. LIVENESS: a seat that times out / replies unparseably / throws is a recorded ABSTAIN —
+// never silently dropped from the roster, so the quorum gate can fail an inquorate convene
+// (one dead agent must not turn 3-of-5 into 3-of-4). BLIND FIRST ROUND: a round-1 prompt is a
+// pure function of (seat, question) and never embeds another seat's answer.
+export const VOTE_TOKENS = ['approve', 'reject', 'escalate', 'abstain']
+
+// Parse a seat's free-text reply (pane-scraped by `agent ask`) into a structured vote. The seat
+// is instructed to END with a line `COUNCIL-VOTE: <approve|reject|escalate> :: <why>`. We take
+// the LAST such line (so a seat that reasons out loud then concludes is honored), case-insensitive.
+// No parseable line => null: the caller records an ABSTAIN (fail-safe — never a silent approve).
+export function parseVote(reply) {
+  if (!reply || typeof reply !== 'string') return null
+  const re = /council-vote:\s*(approve|reject|escalate|abstain)\b\s*(?:::\s*(.*))?$/i
+  let hit = null
+  for (const line of reply.split(/\r?\n/)) {
+    const m = line.trim().match(re)
+    if (m) hit = m
+  }
+  if (!hit) return null
+  const vote = hit[1].toLowerCase()
+  const rationale = (hit[2] || '').trim() || `(${vote}, no rationale given)`
+  return { vote, rationale }
+}
+
+// Build the per-seat dispatch prompt. BLIND-FIRST-ROUND invariant: round-1 output is a pure
+// function of (seat, question) and NEVER embeds another seat's take/vote, so no seat anchors on
+// another before its own vote is recorded. The rebuttal round (adversarial only, round 2) DOES
+// show the round-1 votes and is recorded separately.
+export function seatPrompt(seat, ctx = {}) {
+  const round = ctx.round || 1
+  const q = ctx.question || ''
+  const head = `You hold the "${seat.id}" seat on the 5dive Council. Your lens: ${seat.lens || seat.id}.`
+  const ask = `Question before the council: "${q}"`
+  const fmt = `Reply with brief reasoning, then END with EXACTLY this line and nothing after it:
+COUNCIL-VOTE: <approve|reject|escalate> :: <one-sentence rationale>
+Escalate ONLY if this genuinely needs a human (money/spend, destructive/irreversible, secrets, or a brand call on a mature product) or the council is hopelessly split.`
+  if (round >= 2 && Array.isArray(ctx.priorVotes) && ctx.priorVotes.length) {
+    const prior = ctx.priorVotes.map(v => `- ${v.seat}: ${String(v.vote).toUpperCase()} — ${v.rationale}`).join('\n')
+    return `${head}
+${ask}
+The council's first-round votes:
+${prior}
+REBUT: find the strongest objection to the leading position, then cast your FINAL vote.
+${fmt}`
+  }
+  return `${head}
+${ask}
+Give your INDEPENDENT vote BEFORE hearing any other seat.
+${fmt}`
+}
+
+// Normalize a seatVote adapter result into a recorded vote row. An unusable result becomes an
+// ABSTAIN — counted in the roster denominator (seatCount) but not in approve/reject/escalate.
+export function normalizeSeatVote(seat, res) {
+  if (!res || typeof res !== 'object' || !VOTE_TOKENS.includes(res.vote)) {
+    return { seat: seat.id, vote: 'abstain', rationale: (res && res.rationale) ? String(res.rationale) : 'abstained (no reply / unparseable)' }
+  }
+  const rationale = (res.rationale && String(res.rationale).trim()) || `(${res.vote})`
+  return { seat: seat.id, vote: res.vote, rationale }
+}
+
+// Gather one round of votes from real seats via the injected dispatch adapter, in parallel. Each
+// seat is isolated: it only ever sees seatPrompt(seat, ctx) this round. A seat adapter that
+// rejects is caught -> abstain (liveness), so one crashed seat cannot abort the whole convene.
+async function dispatchRound(seats, ctx, seatVote) {
+  return Promise.all(seats.map(async (s) => {
+    try { return normalizeSeatVote(s, await seatVote(s, ctx)) }
+    catch (e) { return { seat: s.id, vote: 'abstain', rationale: `dispatch error: ${String(e && e.message || e)}` } }
+  }))
+}
+
+// DETERMINISTIC synthesis (fleet mode, NO model key): confidence from the winning margin among
+// votes cast, dissent from the losing side's rationales, a human brief assembled on escalate.
+// Keeps the ENTIRE verdict path key-free + auditable for a real-agent convene (no LLM in the
+// tally OR the summary — the chair narrative modelCall is only used on the standalone seam).
+export function synthesizeNarrative(votes, counted) {
+  const cast = (votes || []).filter(v => v.vote !== 'abstain')
+  const abstained = (votes || []).filter(v => v.vote === 'abstain')
+  const winner = counted.recommendation
+  const withWinner = cast.filter(v => v.vote === winner)
+  const against = cast.filter(v => v.vote !== winner)
+  const confidence = cast.length ? Math.round((withWinner.length / cast.length) * 100) / 100 : 0
+  const dissent = against.length ? against.map(v => `${v.seat} (${v.vote}): ${v.rationale}`).join('; ') : 'none'
+  let brief = ''
+  if (counted.escalated) {
+    const why = !counted.quorumMet
+      ? `Inquorate: only ${counted.votesCast} of ${counted.seatCount} seats voted (quorum ${counted.quorum})${abstained.length ? `; abstained: ${abstained.map(v => v.seat).join(', ')}` : ''}.`
+      : `Council split (tally ${tallyStr(counted.tally)}); no side reached the ${counted.decisionClass} threshold and escalate carried.`
+    const takes = cast.map(v => `${v.seat}: ${v.vote} — ${v.rationale}`).join(' | ')
+    brief = `${why} Seat positions: ${takes || '(none)'}`
+  }
+  return { confidence, dissent, brief }
+}
+
+// Assemble the convene/standing verdict from the deterministic count + a narrative (synthesized
+// in fleet mode, chair-written on the seam). Carries the quorum bookkeeping onto the verdict so
+// the disposition + receipt reflect liveness.
+export function buildConveneVerdict(counted, narr) {
+  return {
+    recommendation: counted.recommendation, tally: counted.tally, threshold: counted.threshold,
+    seatCount: counted.seatCount, quorum: counted.quorum, quorumMet: counted.quorumMet, votesCast: counted.votesCast,
+    confidence: narr.confidence, dissent: narr.dissent,
+    escalated: counted.escalated, brief: counted.escalated ? narr.brief : '',
+  }
+}
+
 // ==================== deliberation engine ====================
 // Narrative-only synthesis for the named council: the chair writes confidence/dissent/
 // brief but does NOT decide the recommendation (that's the deterministic tallyVotes count).
@@ -399,6 +510,14 @@ export async function runCouncil(input, deps = {}) {
     }
   }
 
+  // ---- CNCL-7: convene/standing DISPATCH to the REAL seated agents (fleet mode) or, when no
+  // dispatch adapter is injected, the deferred standalone modelCall seam. Blind round 1,
+  // adversarial rebuttal round 2 recorded separately, timeout/unparse -> abstain, deterministic
+  // quorum-gated tally + key-free synthesis. Gate/verifier/node (P1/P2) keep the path below.
+  if (role === 'convene' || role === 'standing') {
+    return await runConvene(input, deps, { modelCall, seatVote: deps.seatVote, verbose, role, mode, seats, question })
+  }
+
   // Convene — independent opening takes.
   log(verbose, `convening ${seats.length} seats (${mode})`)
   const takes = await Promise.all(seats.map(s =>
@@ -429,29 +548,59 @@ The first-round votes:\n${voteText}
 REBUT: try to find the strongest objection to the leading position. Then cast your FINAL vote (approve | reject | escalate) with a one-to-two sentence rationale.`, VOTE)))
   }
 
-  // Verdict. Named-council (convene/standing): DETERMINISTIC tally over the current roster +
-  // a narrative-only chair + founder veto. Gate/verifier/node (P1/P2) keep their ported
-  // chair-synthesized verdict + action map.
-  let verdict
-  if (role === 'convene' || role === 'standing') {
-    const counted = tallyVotes(votes, {
-      decisionClass: input.decisionClass || (input.bench && input.bench.decisionClass) || 'ordinary',
-      policy: input.policy,
-      threshold: input.threshold != null ? input.threshold : (input.bench && input.bench.threshold),
-      thresholdRule: input.thresholdRule || (input.bench && input.bench.thresholdRule),
-      seatCount: seats.length,
-    })
-    const narr = await chairNarrative(modelCall, question, votes)
-    verdict = {
-      recommendation: counted.recommendation, tally: counted.tally, threshold: counted.threshold,
-      seatCount: counted.seatCount, confidence: narr.confidence, dissent: narr.dissent,
-      escalated: counted.escalated, brief: counted.escalated ? narr.brief : '',
-    }
-    verdict = applyFounderVeto(verdict, input.veto)
-  } else {
-    verdict = await chair(modelCall, role, input, question, votes, isNode)
-  }
+  // Verdict. Gate/verifier/node (P1/P2) keep their ported chair-synthesized verdict + action
+  // map (convene/standing returned early via runConvene above).
+  const verdict = await chair(modelCall, role, input, question, votes, isNode)
   return finish(role, input, { question, mode, seats, guardrail: guardTarget ? { forceEscalate: false, reason: '' } : null, convened: true, takes, votes, verdict })
+}
+
+// CNCL-7 convene/standing driver — split out of runCouncil. Two paths share one deterministic
+// tally + one receipt: (1) FLEET dispatch (deps.seatVote present) — each seat votes via its own
+// harness, blind round 1, adversarial rebuttal round 2 recorded separately, timeout/unparse ->
+// abstain, KEY-FREE synthesis; (2) the standalone modelCall SEAM (no seatVote) — one model
+// answers each seat, same blind-round-1 discipline, chair-written narrative. Founder veto threads
+// both. `deps` is forwarded only for symmetry; the resolved handles come in via `h`.
+async function runConvene(input, deps, h) {
+  const { modelCall, seatVote, verbose, role, mode, seats, question } = h
+  const tallyOpts = {
+    decisionClass: input.decisionClass || (input.bench && input.bench.decisionClass) || 'ordinary',
+    policy: input.policy,
+    threshold: input.threshold != null ? input.threshold : (input.bench && input.bench.threshold),
+    thresholdRule: input.thresholdRule || (input.bench && input.bench.thresholdRule),
+    seatCount: seats.length,
+  }
+  let round1Votes, finalVotes, rebuttalVotes = null, verdict
+  if (seatVote) {
+    log(verbose, `dispatching ${seats.length} real seats (blind round 1, ${mode})`)
+    round1Votes = await dispatchRound(seats, { question, role, mode, round: 1 }, seatVote)
+    finalVotes = round1Votes
+    if (mode === 'adversarial') {
+      log(verbose, `adversarial rebuttal (round 2, recorded separately)`)
+      rebuttalVotes = await dispatchRound(seats, { question, role, mode, round: 2, priorVotes: round1Votes }, seatVote)
+      finalVotes = rebuttalVotes
+    }
+    const counted = tallyVotes(finalVotes, tallyOpts)
+    verdict = buildConveneVerdict(counted, synthesizeNarrative(finalVotes, counted))
+  } else {
+    // Standalone seam: one modelCall answers each seat. Blind round 1 (seatPrompt embeds NO
+    // other seat's take), then an adversarial rebuttal that sees the round-1 votes.
+    log(verbose, `convening ${seats.length} seats via the modelCall seam (blind round 1, ${mode})`)
+    const askSeam = (s, ctx) => modelCall(seatPrompt(s, ctx), VOTE).then(v => ({ seat: v.seat || s.id, vote: v.vote, rationale: v.rationale }))
+    round1Votes = await Promise.all(seats.map(s => askSeam(s, { question, round: 1 })))
+    finalVotes = round1Votes
+    if (mode === 'adversarial') {
+      rebuttalVotes = await Promise.all(seats.map(s => askSeam(s, { question, round: 2, priorVotes: round1Votes })))
+      finalVotes = rebuttalVotes
+    }
+    const counted = tallyVotes(finalVotes, tallyOpts)
+    const narr = await chairNarrative(modelCall, question, finalVotes)
+    verdict = buildConveneVerdict(counted, narr)
+  }
+  verdict = applyFounderVeto(verdict, input.veto)
+  return finish(role, input, {
+    question, mode, seats, guardrail: null, convened: true,
+    takes: [], votes: finalVotes, round1Votes, rebuttalVotes, verdict,
+  })
 }
 
 function roleBlurb(role) {
