@@ -713,6 +713,12 @@ main() {
       # new state or engine. Same group-writable store as tasks; no root/lock
       # (the sub-commands it calls own their own writes).
       cmd_company "$@" ;;
+    council)
+      # CNCL-6 (v0.11): standalone deliberation council. Embeds a node engine
+      # materialized to a temp dir; reads are unprivileged, bench add/rm + the
+      # receipt seal (gate-proof) take root themselves. No registry lock (the
+      # persisted bench file is a plain jq write behind the sudo gate).
+      cmd_council "$@" ;;
     up)
       # Compose-style: bring up agents declared in 5dive.yaml. Mutating but
       # the per-agent `agent create` calls take the registry lock + audit
