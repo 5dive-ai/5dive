@@ -141,10 +141,13 @@ r = runCli(['bench', 'rm', 'council', `--registry=${greg}`])
 ok('raw bench rm on council refused (exit 7)', r.code === 7)
 try { fs.unlinkSync(greg) } catch {}
 
-// --- CNCL-16: seat->agent resolution + fail-closed pre-flight (REAL dispatch path) ----------
-// A fake `5dive` bin stands in for the ask rail: `agent list` returns a fixed registry, `agent
-// ask` logs the target it was reached at and returns an approve vote. NOTE: no COUNCIL_MOCK here,
-// so the real dispatchSeatVote + preflight run (COUNCIL_5DIVE_BIN points at the fake).
+// --- CNCL-16 + CNCL-18: seat->agent resolution + fail-closed pre-flight (REAL dispatch path) --
+// A fake `5dive` bin stands in for the fleet: `agent list` returns a fixed registry; the DEFAULT
+// dispatch is now the non-blocking BALLOT (CNCL-18) so `task add` logs the --assignee it minted to
+// (the reached agent) and `task show` immediately returns a CLOSED task with an approve vote (so
+// the collection loop resolves at once — never blocks on the 900s deadline). The `--ask-rail`
+// escape hatch still reaches the seat over `agent ask`, logged the same way. NOTE: no COUNCIL_MOCK
+// here, so the real dispatch adapter + preflight run (COUNCIL_5DIVE_BIN points at the fake).
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'cncl16-'))
 const askLog = path.join(tmp, 'asks.log')
 const fakeBin = path.join(tmp, 'fake-5dive')
@@ -153,7 +156,14 @@ fs.writeFileSync(fakeBin, [
   'if [ "$1" = "agent" ] && [ "$2" = "list" ]; then',
   '  echo \'{"ok":true,"data":[{"name":"marketing"},{"name":"creative"},{"name":"main"},{"name":"codex"},{"name":"olivia"}]}\'; exit 0',
   'fi',
-  'if [ "$1" = "agent" ] && [ "$2" = "ask" ]; then',
+  'if [ "$1" = "task" ] && [ "$2" = "add" ]; then',   // CNCL-18 ballot mint: log the assignee reached
+  '  for a in "$@"; do case "$a" in --assignee=*) [ -n "$ASK_LOG" ] && echo "${a#--assignee=}" >> "$ASK_LOG" ;; esac; done',
+  '  echo \'{"ok":true,"data":{"id":1,"ident":"DIVE-1"}}\'; exit 0',
+  'fi',
+  'if [ "$1" = "task" ] && [ "$2" = "show" ]; then',  // ballot already voted (closed w/ result)
+  '  echo \'{"ok":true,"data":{"task":{"status":"done","result":"COUNCIL-VOTE: approve :: fake ok"}}}\'; exit 0',
+  'fi',
+  'if [ "$1" = "agent" ] && [ "$2" = "ask" ]; then',  // --ask-rail escape hatch: log the target
   '  [ -n "$ASK_LOG" ] && echo "$3" >> "$ASK_LOG"',
   '  echo \'{"ok":true,"data":{"reply":"COUNCIL-VOTE: approve :: fake ok"}}\'; exit 0',
   'fi',
@@ -162,14 +172,30 @@ fs.writeFileSync(fakeBin, [
 fs.chmodSync(fakeBin, 0o755)
 const REAL = { COUNCIL_5DIVE_BIN: fakeBin, ASK_LOG: askLog, COUNCIL_MOCK: '' }
 
-// persona seats theo/lilbro resolve to marketing/creative and the convene REACHES them for real.
+// DEFAULT (ballot) path: persona seats theo/lilbro resolve to marketing/creative and the convene
+// MINTS the ballot task to them for real (via --assignee).
 try { fs.writeFileSync(askLog, '') } catch {}
-r = runCli(['convene', 'Ship it?', '--seats=theo,lilbro,main', '--mode=deliberate', '--stamped-at=T', '--timeout=5'], REAL)
-ok('CNCL-16 convene with persona seats exits 0 (no silent abstain)', r.code === 0)
-const asked = (() => { try { return fs.readFileSync(askLog, 'utf-8') } catch { return '' } })()
-ok('CNCL-16 dispatch REACHES marketing (persona theo resolved)', /(^|\n)marketing(\n|$)/.test(asked))
-ok('CNCL-16 dispatch REACHES creative (persona lilbro resolved)', /(^|\n)creative(\n|$)/.test(asked))
-ok('CNCL-16 dispatch never asks the bare persona id', !/(^|\n)(theo|lilbro)(\n|$)/.test(asked))
+r = runCli(['convene', 'Ship it?', '--seats=theo,lilbro,main', '--mode=deliberate', '--stamped-at=T', '--ballot-deadline=5', '--ballot-poll=1'], REAL)
+ok('CNCL-18 ballot convene with persona seats exits 0 (no silent abstain)', r.code === 0)
+ok('CNCL-18 default dispatch is real-agents (ballot)', /"dispatch":"real-agents"/.test(r.out || ''))
+let asked = (() => { try { return fs.readFileSync(askLog, 'utf-8') } catch { return '' } })()
+ok('CNCL-16 ballot REACHES marketing (persona theo resolved)', /(^|\n)marketing(\n|$)/.test(asked))
+ok('CNCL-16 ballot REACHES creative (persona lilbro resolved)', /(^|\n)creative(\n|$)/.test(asked))
+ok('CNCL-16 ballot never mints to the bare persona id', !/(^|\n)(theo|lilbro)(\n|$)/.test(asked))
+
+// --ask-rail escape hatch: the OLD `agent ask` pane-scrape still reaches the resolved agent.
+try { fs.writeFileSync(askLog, '') } catch {}
+r = runCli(['convene', 'Ship it?', '--seats=theo,lilbro,main', '--mode=deliberate', '--stamped-at=T', '--ask-rail', '--timeout=5'], REAL)
+ok('CNCL-18 --ask-rail convene exits 0', r.code === 0)
+asked = (() => { try { return fs.readFileSync(askLog, 'utf-8') } catch { return '' } })()
+ok('CNCL-18 --ask-rail REACHES marketing over agent ask', /(^|\n)marketing(\n|$)/.test(asked))
+ok('CNCL-18 --ask-rail REACHES creative over agent ask', /(^|\n)creative(\n|$)/.test(asked))
+
+// COUNCIL_ASK_RAIL=1 selects the escape hatch too (env parity with the flag).
+try { fs.writeFileSync(askLog, '') } catch {}
+r = runCli(['convene', 'Ship it?', '--seats=main', '--mode=deliberate', '--stamped-at=T', '--timeout=5'], { ...REAL, COUNCIL_ASK_RAIL: '1' })
+asked = (() => { try { return fs.readFileSync(askLog, 'utf-8') } catch { return '' } })()
+ok('CNCL-18 COUNCIL_ASK_RAIL=1 selects the ask rail', r.code === 0 && /(^|\n)main(\n|$)/.test(asked))
 
 // an unresolvable seat FAILS CLOSED at pre-flight (loud, exit 6) — not a silent abstain.
 r = runCli(['convene', 'Ship it?', '--seats=theo,ghostseat', '--mode=deliberate', '--stamped-at=T'], REAL)

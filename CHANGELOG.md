@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.11.21 — The Council: non-blocking ballots via the task queue (CNCL-18) (2026-07-20)
+
+- feat(council): `5dive council convene` now delivers each seat's ballot as a DEADLINE-STAMPED TASK in that seat's queue instead of injecting it into the seat's live session over a blocking `agent ask` pane-scrape. The seat surfaces and works the ballot at its next heartbeat boundary (a ballot is just a normal assigned task, so no heartbeat change), casts its vote by closing the task with a COUNCIL-VOTE line in the result, and the convener COLLECTS by polling `task show` until the task closes with a result or the deadline elapses. A missed deadline, an unreadable result, or an unparseable vote all resolve to an abstain. This removes the coordinated quiet window the old rail needed and stops mid-work seats timing out to abstain. Liveness/abstain, quorum, and blind-first-round semantics are unchanged (they live in the engine; the redesign touches the dispatch adapter only).
+- feat(council): new flags `--ballot-deadline=<secs>` (default 900, i.e. 15m; `--deadline` is accepted as an alias) and `--ballot-poll=<secs>` (default 5) tune the collection window. The old pane-scrape survives as an ESCAPE HATCH via `--ask-rail` or `COUNCIL_ASK_RAIL=1`. `COUNCIL_MOCK` (offline mock) and `--standalone`/`COUNCIL_STANDALONE` (single-key model seam) are unchanged; the fail-closed seat pre-flight still runs on the ballot path.
+- test(council): `council_dispatch_unit.mjs` covers the ballot adapter's pure logic (result parses to a vote, deadline-miss abstains, unparseable result abstains, blind round-1 body embeds no other seat's vote) with injected exec/clock seams (no real timers). New `council_ballot_e2e.sh` drives the BUILT `5dive` binary proving the ballot selector is the default and reachable through `cmd_council()` (ad-hoc panel + fake fleet, no root/live fleet), and that `--ask-rail`/`COUNCIL_ASK_RAIL` keep the agent-ask escape hatch. Both wired into `council_unit.sh`.
+
 ## 0.11.20 — Fail closed on invalid constitution POSIX ERE (CNCL-28) (2026-07-20)
 
 - fix(gates): compile-probe constitution `hard_gates` with Bash before using the combined POSIX ERE. A pattern rejected by Bash now emits a warning and atomically falls back to the shipped tier-2 floor instead of letting `[[ =~ ]]` return 2 and silently fail open (CNCL-28).

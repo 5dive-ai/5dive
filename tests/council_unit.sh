@@ -44,4 +44,11 @@ if ! bash "tests/council_roster_lineage_e2e.sh"; then echo "FAILED: tests/counci
 echo "=== tests/council_bashroute_e2e.sh"
 if ! bash "tests/council_bashroute_e2e.sh"; then echo "FAILED: tests/council_bashroute_e2e.sh"; rc=1; fi
 
+# CNCL-18: the non-blocking BALLOT dispatch e2e — proves the ballot selector is DEFAULT and reachable
+# through cmd_council() on the BUILT binary (ad-hoc panel + fake fleet; unsealed convene, no root),
+# and that --ask-rail / COUNCIL_ASK_RAIL keep the old agent-ask pane-scrape as an escape hatch.
+# Builds a throwaway ./5dive (BUILD_OUT) so it GATES in CI; self-SKIPs green when it cannot build.
+echo "=== tests/council_ballot_e2e.sh"
+if ! bash "tests/council_ballot_e2e.sh"; then echo "FAILED: tests/council_ballot_e2e.sh"; rc=1; fi
+
 exit $rc

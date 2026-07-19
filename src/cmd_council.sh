@@ -1612,6 +1612,7 @@ COUNCIL_ENGINE_MJS
 import * as E from './engine.mjs'
 import fs from 'node:fs'
 import { execFileSync } from 'node:child_process'
+import { pathToFileURL } from 'node:url'
 
 const argv = process.argv.slice(2)
 const sub = argv[0] || ''
@@ -1702,14 +1703,90 @@ function dispatchSeatVote(opts) {
     return E.parseVote(reply) || { vote: 'abstain', rationale: `${seat.id} reply had no COUNCIL-VOTE line` }
   }
 }
+// ---- CNCL-18 dispatch: NON-BLOCKING ballots via the task queue (default fleet path) --------
+// Instead of injecting the ballot into the seat's LIVE session (the blocking `agent ask` pane
+// scrape — disruptive, needs a quiet window, times mid-work seats out to abstain), we mint a
+// DEADLINE-STAMPED task into the seat's queue. The seat surfaces + works that ballot at its next
+// heartbeat boundary (a ballot is just a normal assigned task — NO heartbeat code change), casts
+// its vote by closing the task with a COUNCIL-VOTE line in the result, and the convener COLLECTS
+// by polling `task show` until the task closes with a result OR the deadline elapses. A missed
+// deadline / unreadable result / unparseable vote all resolve to an ABSTAIN (the engine records
+// it; abstains still count toward the quorum denominator). Blind-first-round is preserved: the
+// round-1 ballot body is E.seatPrompt(seat, ctx) which the engine guarantees carries no other
+// seat's take. Exec + clock are injectable (opts._exec/_now/_sleep) so the pure collection logic
+// is unit-testable offline with no real `5dive` exec and no real timers.
+export function dispatchBallotVote(opts = {}) {
+  const bin = process.env.COUNCIL_5DIVE_BIN || '5dive'
+  const from = opts.from || 'council'
+  const deadlineSecs = Number(opts.deadline) > 0 ? Number(opts.deadline) : 900   // 15m default
+  const pollSecs = Number(opts.poll) > 0 ? Number(opts.poll) : 5
+  const now = opts._now || (() => Date.now())
+  const sleep = opts._sleep || ((ms) => new Promise(r => setTimeout(r, ms)))
+  // Default exec shells the real CLI; a test injects a stub reader. Returns stdout as a string.
+  const exec = opts._exec || ((args) => execFileSync(bin, args,
+    { encoding: 'utf-8', timeout: 60000, maxBuffer: 16 * 1024 * 1024 }))
+  const clip = (e) => String(e && e.message || e).replace(/\s+/g, ' ').slice(0, 140)
+  return async (seat, ctx) => {
+    const prompt = E.seatPrompt(seat, ctx)   // blind in round 1 (engine-guaranteed)
+    // CNCL-16: mint into the seat's REGISTRY agent (persona 'theo' -> 'marketing', etc.). Pre-flight
+    // (preflightSeats) has already fail-closed on any unresolvable seat before we get here.
+    const target = E.resolveSeatAgent(seat)
+    const deadlineAt = now() + deadlineSecs * 1000
+    const deadlineIso = new Date(deadlineAt).toISOString()
+    const title = `Council ballot: ${String(ctx.question || '').replace(/\s+/g, ' ').slice(0, 80)} (vote by ${deadlineIso})`
+    const body = `${prompt}\n\n[council ballot] Cast your vote by CLOSING this task with your COUNCIL-VOTE line as the result: 5dive task done <id> --result="...COUNCIL-VOTE: <approve|reject|escalate> :: <why>". Deadline: ${deadlineIso}. A missed deadline counts as an abstain.`
+    // (c) mint the deadline-stamped ballot task. --no-verify keeps it a plain task that closes
+    // directly on `task done` (no maker->grader handoff that would keep the result out of reach).
+    let taskId
+    try {
+      const stdout = exec(['task', 'add', title, `--body=${body}`, `--assignee=${target}`,
+        `--from=${from}`, '--priority=high', '--no-verify', '--json'])
+      const env = JSON.parse(stdout)
+      taskId = env && env.data && (env.data.ident || env.data.id)
+      if (taskId == null) throw new Error('task add returned no id')
+    } catch (e) {
+      return { vote: 'abstain', rationale: `${seat.id} ballot: could not mint task (${clip(e)}) (deadline/no-vote)` }
+    }
+    // (d) COLLECT: poll task show until the seat closes it with a result, or the deadline elapses.
+    // The collection-loop deadline is AUTHORITATIVE regardless of any stamp in the task body.
+    while (now() < deadlineAt) {
+      let row = null
+      try {
+        const env = JSON.parse(exec(['task', 'show', String(taskId), '--json']))
+        row = env && env.data && env.data.task
+      } catch { row = null }
+      if (row && (row.status === 'done' || row.status === 'cancelled')) {
+        const result = row.result || ''
+        return E.parseVote(result) ||
+          { vote: 'abstain', rationale: `${seat.id} ballot ${taskId}: closed with no COUNCIL-VOTE line (deadline/no-vote)` }
+      }
+      await sleep(pollSecs * 1000)
+    }
+    return { vote: 'abstain', rationale: `${seat.id} ballot ${taskId}: no vote by deadline ${deadlineIso} (deadline/no-vote)` }
+  }
+}
 // Deterministic, network-free, NO `5dive` exec — every seat approves so the full dispatch path
 // (blind round -> tally -> synthesis -> receipt) exercises offline in tests + VM smoke.
 function mockSeatVote() {
   return async (seat) => ({ vote: 'approve', rationale: `mock: ${seat.id} sees no blocker.` })
 }
+// COUNCIL_MOCK -> offline mock (untouched). Otherwise the DEFAULT fleet path is the non-blocking
+// ballot (CNCL-18). The old `agent ask` pane-scrape survives as an ESCAPE HATCH, opt-in via
+// `--ask-rail` or COUNCIL_ASK_RAIL=1 (anything but "0"/empty).
+function askRailSelected() {
+  if (flagBool('ask-rail')) return true
+  const e = process.env.COUNCIL_ASK_RAIL
+  return !!e && e !== '0'
+}
 function seatVoteFor() {
   if (process.env.COUNCIL_MOCK) return mockSeatVote()
-  return dispatchSeatVote({ timeout: flag('timeout'), idle: flag('idle-secs'), poll: flag('poll-secs'), from: flag('from') })
+  if (askRailSelected()) {
+    return dispatchSeatVote({ timeout: flag('timeout'), idle: flag('idle-secs'), poll: flag('poll-secs'), from: flag('from') })
+  }
+  return dispatchBallotVote({
+    deadline: flag('ballot-deadline') !== undefined && flag('ballot-deadline') !== true ? flag('ballot-deadline') : flag('deadline'),
+    poll: flag('ballot-poll'), from: flag('from'),
+  })
 }
 // CNCL-16 pre-flight: the live set of registry agent names `5dive agent ask` can reach. Returns a
 // Set, or null if the registry could not be read (transport/exec failure) — the caller fails CLOSED
@@ -2193,7 +2270,11 @@ const main = async () => {
   if (sub === 'verify-votes') return cmdVerifyVotes()
   die(`unknown council subcommand: ${sub} (constitution|convene|bench|init|veto|gate-map|seal-augment|read-binding|sign-vote|verify-votes|roster|motion-plan|motion-apply|verify-chain)`)
 }
-main().catch(e => die(String(e && e.message || e), 1))
+// Run as the CLI entrypoint only when executed directly (node cli.mjs …). Guarded so a test can
+// `import` this module (e.g. to exercise dispatchBallotVote's pure logic) WITHOUT triggering the
+// arg-parser + process.exit. When embedded and run via `node "$dir/cli.mjs"`, argv[1] IS this file.
+const isEntrypoint = process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href
+if (isEntrypoint) main().catch(e => die(String(e && e.message || e), 1))
 COUNCIL_CLI_MJS
 }
 

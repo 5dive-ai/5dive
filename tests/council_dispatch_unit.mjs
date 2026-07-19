@@ -5,6 +5,9 @@ import {
   parseVote, seatPrompt, normalizeSeatVote, synthesizeNarrative, buildConveneVerdict,
   tallyVotes, runCouncil, VOTE_TOKENS, canonicalTranscript,
 } from '../src/council/engine.mjs'
+// CNCL-18: the non-blocking ballot ADAPTER lives in cli.mjs (guarded entrypoint so this import
+// does NOT run the arg-parser). We drive its PURE collection logic with injected exec/clock seams.
+import { dispatchBallotVote } from '../src/council/cli.mjs'
 
 let pass = 0, fail = 0
 const ok = (c, m) => { c ? pass++ : (fail++, console.error('FAIL:', m)) }
@@ -120,6 +123,73 @@ ok(synthesizeNarrative([{ seat: 'a', vote: 'approve', rationale: 'x' }], tallyVo
 // buildConveneVerdict carries the quorum bookkeeping onto the verdict
 const bv = buildConveneVerdict(counted, narr)
 ok(bv.quorum === counted.quorum && bv.votesCast === counted.votesCast && bv.quorumMet === counted.quorumMet, 'buildConveneVerdict surfaces quorum/votesCast/quorumMet for the receipt + disposition')
+
+// ---- CNCL-18: non-blocking ballot adapter (dispatchBallotVote) — PURE collection logic ----
+// A stub exec answers `task add` with a fixed id and `task show` from a queue of rows; a stateful
+// clock advances so the deadline loop terminates with NO real timers/sleeps. Mirrors the mockSeatVote
+// injection idiom above (deterministic, offline, no `5dive` exec).
+function ballotExec({ addId = 'DIVE-42', rowSeq = [], captured } = {}) {
+  let i = 0
+  return (args) => {
+    if (captured) captured.push(args)
+    if (args[0] === 'task' && args[1] === 'add') return JSON.stringify({ ok: true, data: { id: 42, ident: addId } })
+    if (args[0] === 'task' && args[1] === 'show') {
+      const row = rowSeq[Math.min(i, rowSeq.length - 1)]; i++
+      return JSON.stringify({ ok: true, data: { task: row } })
+    }
+    throw new Error('ballotExec: unexpected argv ' + args.join(' '))
+  }
+}
+const noSleep = async () => {}
+const fixedNow = () => 0                              // constant clock: never trips the deadline
+const advancingNow = (stepMs = 500) => { let t = 0; return () => { const v = t; t += stepMs; return v } }
+const bseat = { id: 'main', lens: 'CTO' }
+
+// (a) a closed task whose result carries a COUNCIL-VOTE line parses to that vote
+const rParse = await dispatchBallotVote({ deadline: 100, poll: 1, _now: fixedNow, _sleep: noSleep,
+  _exec: ballotExec({ rowSeq: [{ status: 'done', result: 'weighed it\nCOUNCIL-VOTE: approve :: no blocker' }] }) })(bseat, { question: 'ship?', round: 1 })
+ok(rParse.vote === 'approve' && /no blocker/.test(rParse.rationale), 'ballot: closed task with a COUNCIL-VOTE result parses to that vote')
+
+// a `reject` result likewise parses through (not just approve)
+const rRej = await dispatchBallotVote({ deadline: 100, poll: 1, _now: fixedNow, _sleep: noSleep,
+  _exec: ballotExec({ rowSeq: [{ status: 'done', result: 'COUNCIL-VOTE: reject :: leaks a secret' }] }) })(bseat, { question: 'ship?', round: 1 })
+ok(rRej.vote === 'reject', 'ballot: a reject result is honored')
+
+// a task still open on the FIRST poll but closed with a vote on the SECOND is collected (poll loop works)
+const rPoll = await dispatchBallotVote({ deadline: 100, poll: 1, _now: fixedNow, _sleep: noSleep,
+  _exec: ballotExec({ rowSeq: [{ status: 'in_progress' }, { status: 'done', result: 'COUNCIL-VOTE: escalate :: needs a human' }] }) })(bseat, { question: 'ship?', round: 1 })
+ok(rPoll.vote === 'escalate', 'ballot: keeps polling an open task and collects the vote once it closes')
+
+// (b) deadline elapses with NO result -> abstain (the missed-deadline contract)
+const rDead = await dispatchBallotVote({ deadline: 1, poll: 1, _now: advancingNow(600), _sleep: noSleep,
+  _exec: ballotExec({ rowSeq: [{ status: 'todo' }] }) })(bseat, { question: 'ship?', round: 1 })
+ok(rDead.vote === 'abstain' && /deadline/.test(rDead.rationale), 'ballot: deadline elapses with no vote -> ABSTAIN')
+
+// (c) a closed task with an UNPARSEABLE result -> abstain (fail-safe, never a silent approve)
+const rGarble = await dispatchBallotVote({ deadline: 100, poll: 1, _now: fixedNow, _sleep: noSleep,
+  _exec: ballotExec({ rowSeq: [{ status: 'done', result: 'I think we should ship it.' }] }) })(bseat, { question: 'ship?', round: 1 })
+ok(rGarble.vote === 'abstain', 'ballot: a closed task with no COUNCIL-VOTE line -> ABSTAIN (fail-safe)')
+
+// a task add that fails to mint (bad JSON / no id) -> abstain, never a throw that aborts the round
+const rNoMint = await dispatchBallotVote({ deadline: 100, poll: 1, _now: fixedNow, _sleep: noSleep,
+  _exec: () => 'not json' })(bseat, { question: 'ship?', round: 1 })
+ok(rNoMint.vote === 'abstain', 'ballot: an unmintable task -> ABSTAIN (a broken mint never aborts the convene)')
+
+// (d) BLIND round 1: the minted ballot body embeds NO other seat's vote/rationale
+const capBlind = []
+await dispatchBallotVote({ deadline: 100, poll: 1, _now: fixedNow, _sleep: noSleep, _exec: ballotExec({ captured: capBlind, rowSeq: [{ status: 'done', result: 'COUNCIL-VOTE: approve :: ok' }] }) })(
+  bseat, { question: 'ship v0.11?', round: 1, priorVotes: [{ seat: 'theo', vote: 'reject', rationale: 'secret leaks' }] })
+const addCall = capBlind.find(a => a[0] === 'task' && a[1] === 'add')
+const bodyArg = (addCall || []).find(a => String(a).startsWith('--body='))
+ok(!!bodyArg && !bodyArg.includes('theo') && !bodyArg.includes('secret leaks'), 'ballot: round-1 body embeds NO other seat’s vote (blind)')
+ok(!!addCall && addCall.includes('--no-verify') && addCall.some(a => a === '--assignee=main'), 'ballot: mints a --no-verify task assigned to the resolved registry agent')
+ok(!!addCall && addCall.some(a => a === '--from=council'), 'ballot: ballot task is filed --from=council')
+
+// the adapter is a drop-in for the engine: runCouncil drives it exactly like the mock adapter
+const rEngine = await runCouncil({ role: 'convene', question: 'ship?', seats: [{ id: 'main' }, { id: 'codex' }], councilName: 'council' },
+  { seatVote: dispatchBallotVote({ deadline: 100, poll: 1, _now: fixedNow, _sleep: noSleep,
+    _exec: ballotExec({ rowSeq: [{ status: 'done', result: 'COUNCIL-VOTE: approve :: fine' }] }) }) })
+ok(rEngine.votes.length === 2 && rEngine.votes.every(v => v.vote === 'approve'), 'ballot: dispatchBallotVote plugs into runCouncil as the seatVote adapter')
 
 console.log(`\nCNCL-7 dispatch: ${pass} passed, ${fail} failed (bound to src/council/engine.mjs)`)
 process.exit(fail ? 1 : 0)
