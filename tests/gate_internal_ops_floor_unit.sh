@@ -128,6 +128,52 @@ cmd_task_need DIVE-309 --type=decision --from=dev \
 [[ "$(tierof DIVE-309)" == "1" ]] && ok_t "DIVE-1481: co-referent 'wipe the board' still downgrades to tier 1" || bad_t "1481 co-referent tier 1" "got '$(tierof DIVE-309)'"
 [[ "$(routedof DIVE-309)" == "main" ]] && ok_t "DIVE-1481: co-referent wipe routed to lead (main)" || bad_t "1481 co-referent routed main" "got '$(routedof DIVE-309)'"
 
+# --- 10: DIVE-1487 — COORDINATION: one verb governs an internal AND an external
+#         object ("delete the board AND the production database"). The nearest-object
+#         strip would carve 'delete' as co-referent to 'board'; the external-target
+#         guard refuses to strip → residual keeps 'delete' → stays hard-human.
+route_reset; seed DIVE-310
+cmd_task_need DIVE-310 --type=decision --from=dev \
+  --ask="Delete the board and the production database — proceed?" \
+  --options="yes|no" --recommend="no" >/dev/null 2>&1
+[[ "$(tierof DIVE-310)" == "2" ]] && ok_t "DIVE-1487: coordinated internal+prod delete stays tier 2 (human)" || bad_t "1487 coordination tier 2" "got '$(tierof DIVE-310)'"
+[[ "$HUMAN_PINGED" == "1" ]] && ok_t "DIVE-1487: coordinated delete pings the human" || bad_t "1487 coordination pings human" "HUMAN_PINGED=$HUMAN_PINGED"
+
+# --- 11: DIVE-1487 — PASSIVE OVER-REACH: "wipe the board then delete the prod
+#         customer records" — the passive branch would strip 'delete' merely because
+#         'board' precedes it within 20 chars, though 'delete' governs prod records.
+route_reset; seed DIVE-311
+cmd_task_need DIVE-311 --type=decision --from=dev \
+  --ask="Wipe the board then delete the prod customer records — go ahead?" \
+  --options="yes|no" --recommend="no" >/dev/null 2>&1
+[[ "$(tierof DIVE-311)" == "2" ]] && ok_t "DIVE-1487: passive over-reach (prod customer records) stays tier 2 (human)" || bad_t "1487 passive tier 2" "got '$(tierof DIVE-311)'"
+
+# --- 12: DIVE-1487 — compound purge/drop: "purge the backlog and drop the customers
+#         table". Guard keeps 'purge' in the residual (→ floor); and the widened
+#         'drop[^.]{0,20}table' floor term catches 'drop the customers table' too.
+route_reset; seed DIVE-312
+cmd_task_need DIVE-312 --type=decision --from=dev \
+  --ask="Purge the backlog and drop the customers table — confirm?" \
+  --options="yes|no" --recommend="no" >/dev/null 2>&1
+[[ "$(tierof DIVE-312)" == "2" ]] && ok_t "DIVE-1487: compound purge+drop-customers-table stays tier 2 (human)" || bad_t "1487 compound tier 2" "got '$(tierof DIVE-312)'"
+
+# --- 13: DIVE-1487 — floor-vocab: a standalone 'drop the customers table' (no
+#         internal-ops vocab, no delete/purge) now trips the widened floor directly.
+route_reset; seed DIVE-313
+cmd_task_need DIVE-313 --type=decision --from=dev \
+  --ask="Drop the customers table in prod — proceed?" \
+  --options="yes|no" --recommend="no" >/dev/null 2>&1
+[[ "$(tierof DIVE-313)" == "2" ]] && ok_t "DIVE-1487: standalone drop-<x>-table trips widened floor (tier 2)" || bad_t "1487 drop-table floor" "got '$(tierof DIVE-313)'"
+
+# --- 14: DIVE-1487 — NO OVER-TIGHTEN: a purely internal co-referent wipe with NO
+#         external target still downgrades to lead-routed tier 1 (guard not tripped).
+route_reset; seed DIVE-314
+cmd_task_need DIVE-314 --type=decision --from=dev \
+  --ask="Wipe the task board and rebuild from the audit log — discard my uncommitted wip first?" \
+  --options="keep|discard" --recommend="keep" >/dev/null 2>&1
+[[ "$(tierof DIVE-314)" == "1" ]] && ok_t "DIVE-1487: purely-internal wipe still downgrades to tier 1 (no over-tighten)" || bad_t "1487 internal still tier 1" "got '$(tierof DIVE-314)'"
+[[ "$(routedof DIVE-314)" == "main" ]] && ok_t "DIVE-1487: purely-internal wipe routed to lead (main)" || bad_t "1487 internal routed main" "got '$(routedof DIVE-314)'"
+
 echo
 echo "gate internal-ops floor: $PASS passed, $FAIL failed"
 [[ $FAIL -eq 0 ]]

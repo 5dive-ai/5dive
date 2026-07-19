@@ -26,7 +26,7 @@ esac
 
 # Bumped on every public release. `build.sh` checks this line exists; CI fails
 # the bundle-drift check if it's missing or empty.
-readonly FIVE_VERSION="0.11.2"
+readonly FIVE_VERSION="0.11.3"
 
 # GitHub org our repos live under. The org is being renamed
 # 5dive-com -> 5dive-ai (2026-06); fetches must work on either side of the
@@ -17299,7 +17299,7 @@ cmd_task_routing() {
 # same posture as gate-proof (a determined agent can still word around it —
 # but only by loudly not-naming what it's asking for, which the ask text then
 # fails to justify).
-_GATE_T2_FLOOR_RX='spend|billing|invoice|charge|payment|refund|subscription|price|pricing|\$[0-9]|€[0-9]|publish|public post|announce|launch post|press|customer email|email customers|newsletter|blast|secret|credential|api key|token|password|delete|destroy|teardown|wipe|purge|drop table|irreversible|revoke|dns|domain transfer|brand'
+_GATE_T2_FLOOR_RX='spend|billing|invoice|charge|payment|refund|subscription|price|pricing|\$[0-9]|€[0-9]|publish|public post|announce|launch post|press|customer email|email customers|newsletter|blast|secret|credential|api key|token|password|delete|destroy|teardown|wipe|purge|drop[^.]{0,20}table|truncate|irreversible|revoke|dns|domain transfer|brand'
 _gate_tier2_floor_hit() {
   local text; text=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
   [[ "$text" =~ $_GATE_T2_FLOOR_RX ]]
@@ -17404,8 +17404,24 @@ _GATE_INTERNAL_OBJECT_RX='task ?board|tasks?\.db|\btask db\b|backlog|\bboard\b|\
 # residual still trips the T2 floor and the gate stays hard-human. Iterates to a
 # fixpoint so several verbs sharing one object all clear; non-/g single pass per
 # step keeps the object available for the next verb.
+# DIVE-1487: external destructive TARGETS — a prod/customer/infra object. When one
+# appears anywhere in the ask, a destructive verb may govern IT rather than (or in
+# addition to) the internal object — in a compound ("delete the board and the
+# production database"), across a coordination span, or over a passive window the
+# 20-char heuristic mis-reads ("wipe the board then delete the prod customer
+# records"). The nearest-object active/passive strip can't tell these from a purely
+# internal ask, so we REFUSE to strip any destructive verb once an external target
+# is present: the verb survives into the residual, trips the T2 floor, and the gate
+# stays hard-human. Biased to over-elevate (the safe direction); the carve-out then
+# only fires for asks whose destructive framing is PURELY internal. Narrowly
+# external (prod/customer/live/user-data) so a plain internal ask ("discard my
+# uncommitted work", "rebuild the board from the audit log") is untouched.
+_GATE_EXTERNAL_TARGET_RX='\bprod\b|production|customers?\b|user data|\bpii\b|live (data|site|db|database)|user records?|customer records?'
 _gate_internal_residual() {
   local text prev; text=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
+  # An external prod/customer target is present → a destructive verb may govern it;
+  # do not strip, so the residual keeps the verb and the T2 floor still fires.
+  [[ "$text" =~ $_GATE_EXTERNAL_TARGET_RX ]] && { printf '%s' "$text"; return; }
   local i=0
   while [[ $i -lt 8 ]]; do
     prev="$text"
