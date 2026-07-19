@@ -32,6 +32,11 @@ export LOOP_POLL_SECS
 mkdir -p "$TASKS_DIR"
 set +e
 
+# Unit isolation: never let panel members invoke the installed heartbeat
+# dispatcher, which would reopen the live task database in a subprocess.
+TEST_AGENT="unit-panel-agent"
+_loop_wake_agent() { :; }
+
 PASS=0; FAIL=0
 ok_t()  { PASS=$((PASS+1)); printf 'ok   - %s\n' "$1"; }
 bad_t() { FAIL=$((FAIL+1)); printf 'FAIL - %s\n   %s\n' "$1" "${2:-}"; }
@@ -68,7 +73,7 @@ proj=$(db "SELECT key FROM projects WHERE key='dive' AND status='active';")
 [[ "$proj" == "dive" ]] && ok_t "default 'dive' project present" || bad_t "default project" "got '$proj'"
 
 # --- T1: no-wait creates N=3 graders + panel row, default quorum 2
-out=$(run --agent=main --claim="UNIQ_basic judge this")
+out=$(run --agent="$TEST_AGENT" --claim="UNIQ_basic judge this")
 st=$(printf '%s' "$out" | jq -r '.data.status' 2>/dev/null)
 lid=$(printf '%s' "$out" | jq -r '.data.loopId' 2>/dev/null)
 pn=$(printf '%s' "$out" | jq -r '.data.n' 2>/dev/null)
@@ -84,32 +89,32 @@ nchild=$(printf '%s' "$child" | jq 'length' 2>/dev/null)
 
 # --- T2: validation
 run --claim=x >/dev/null 2>&1;  [[ $? -ne 0 ]] && ok_t "missing --agent fails"  || bad_t "missing agent" "exit 0"
-run --agent=main >/dev/null 2>&1; [[ $? -ne 0 ]] && ok_t "missing --claim fails" || bad_t "missing claim" "exit 0"
-run --agent=main --claim=x --n=abc >/dev/null 2>&1;     [[ $? -ne 0 ]] && ok_t "bad --n rejected"      || bad_t "bad n" "exit 0"
-run --agent=main --claim=x --quorum=0 >/dev/null 2>&1;  [[ $? -ne 0 ]] && ok_t "--quorum=0 rejected"   || bad_t "bad quorum" "exit 0"
+run --agent="$TEST_AGENT" >/dev/null 2>&1; [[ $? -ne 0 ]] && ok_t "missing --claim fails" || bad_t "missing claim" "exit 0"
+run --agent="$TEST_AGENT" --claim=x --n=abc >/dev/null 2>&1;     [[ $? -ne 0 ]] && ok_t "bad --n rejected"      || bad_t "bad n" "exit 0"
+run --agent="$TEST_AGENT" --claim=x --quorum=0 >/dev/null 2>&1;  [[ $? -ne 0 ]] && ok_t "--quorum=0 rejected"   || bad_t "bad quorum" "exit 0"
 
 # --- T3: --lens sets N to lens count; per-grader lens recorded
-out=$(run --agent=main --claim="UNIQ_lenses x" --lens="correctness, security, repro, perf")
+out=$(run --agent="$TEST_AGENT" --claim="UNIQ_lenses x" --lens="correctness, security, repro, perf")
 pn=$(printf '%s' "$out" | jq -r '.data.n')
 lns=$(printf '%s' "$out" | jq -r '.data.lenses | join(",")')
 [[ "$pn" == "4" && "$lns" == "correctness,security,repro,perf" ]] \
   && ok_t "--lens defines N=4 + trimmed lens list" || bad_t "lens N" "n=$pn lenses=$lns"
 
 # --- T4: --n overrides + round-robins lenses; quorum clamp to N
-out=$(run --agent=main --claim="UNIQ_clamp x" --lens="a,b" --n=3 --quorum=9)
+out=$(run --agent="$TEST_AGENT" --claim="UNIQ_clamp x" --lens="a,b" --n=3 --quorum=9)
 pn=$(printf '%s' "$out" | jq -r '.data.n'); pq=$(printf '%s' "$out" | jq -r '.data.quorum')
 lns=$(printf '%s' "$out" | jq -r '.data.lenses | join(",")')
 [[ "$pn" == "3" && "$pq" == "3" && "$lns" == "a,b,a" ]] \
   && ok_t "--n=3 round-robins 2 lenses (a,b,a) + quorum clamped 9→3" || bad_t "n override/clamp" "n=$pn q=$pq lenses=$lns"
 
 # --- T5: config defaults (cost-dial)
-out=$(LOOP_PANEL_N_DEFAULT=2 LOOP_PANEL_QUORUM_DEFAULT=1 run --agent=main --claim="UNIQ_cfg x")
+out=$(LOOP_PANEL_N_DEFAULT=2 LOOP_PANEL_QUORUM_DEFAULT=1 run --agent="$TEST_AGENT" --claim="UNIQ_cfg x")
 pn=$(printf '%s' "$out" | jq -r '.data.n'); pq=$(printf '%s' "$out" | jq -r '.data.quorum')
 [[ "$pn" == "2" && "$pq" == "1" ]] \
   && ok_t "LOOP_PANEL_N/QUORUM_DEFAULT applied (N=2 q=1)" || bad_t "config default" "n=$pn q=$pq"
 
 # --- T6: --wait quorum PASS (2 of 3 pass ≥ quorum 2)
-( cmd_loop_panel --agent=main --claim="UNIQ_passvote x" --n=3 --quorum=2 --wait=20 >"$TMP"/panel-pass.out 2>&1 ) &
+( cmd_loop_panel --agent="$TEST_AGENT" --claim="UNIQ_passvote x" --n=3 --quorum=2 --wait=20 >"$TMP"/panel-pass.out 2>&1 ) &
 bgpid=$!
 if wait_graders UNIQ_passvote 3; then
   db "UPDATE tasks SET status='done', result='{\"verdict\":\"pass\"}' WHERE id=${tids[0]};"
@@ -125,7 +130,7 @@ pp=$(jq -r '.data.pass' "$TMP"/panel-pass.out 2>/dev/null)
   && ok_t "--wait quorum PASS (2/3 pass → pass)" || bad_t "quorum pass" "$(cat "$TMP"/panel-pass.out)"
 
 # --- T7: --wait quorum FAIL (1 of 3 pass < quorum 2)
-( cmd_loop_panel --agent=main --claim="UNIQ_failvote x" --n=3 --quorum=2 --wait=20 >"$TMP"/panel-fail.out 2>&1 ) &
+( cmd_loop_panel --agent="$TEST_AGENT" --claim="UNIQ_failvote x" --n=3 --quorum=2 --wait=20 >"$TMP"/panel-fail.out 2>&1 ) &
 bgpid=$!
 if wait_graders UNIQ_failvote 3; then
   db "UPDATE tasks SET status='done', result='{\"verdict\":\"pass\"}' WHERE id=${tids[0]};"
@@ -141,7 +146,7 @@ fv=$(jq -r '.data.verdict' "$TMP"/panel-fail.out 2>/dev/null)
 
 # --- T8: --wait halts on KILL
 nruns=$(db "SELECT COUNT(*) FROM loop_runs WHERE topology='panel';")
-( cmd_loop_panel --agent=main --claim="UNIQ_killpanel x" --n=2 --wait=20 >"$TMP"/panel-kill.out 2>&1 ) &
+( cmd_loop_panel --agent="$TEST_AGENT" --claim="UNIQ_killpanel x" --n=2 --wait=20 >"$TMP"/panel-kill.out 2>&1 ) &
 bgpid=$!
 klid=$(wait_new_run "$nruns")
 db "UPDATE loop_runs SET kill_requested=1 WHERE loop_id='$klid';"
@@ -151,7 +156,7 @@ kst=$(jq -r '.data.status' "$TMP"/panel-kill.out 2>/dev/null)
 
 # --- T9: --wait halts on CEILING breach → escalated
 nruns=$(db "SELECT COUNT(*) FROM loop_runs WHERE topology='panel';")
-( cmd_loop_panel --agent=main --claim="UNIQ_ceilpanel x" --n=2 --ceiling=1000 --wait=20 >"$TMP"/panel-ceil.out 2>&1 ) &
+( cmd_loop_panel --agent="$TEST_AGENT" --claim="UNIQ_ceilpanel x" --n=2 --ceiling=1000 --wait=20 >"$TMP"/panel-ceil.out 2>&1 ) &
 bgpid=$!
 clid=$(wait_new_run "$nruns")
 db "UPDATE loop_runs SET tokens_spent=5000 WHERE loop_id='$clid';"
