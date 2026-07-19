@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.11.18 — The Council: route `sign-vote`/`verify-votes` through the bash dispatcher (CNCL-26) (2026-07-19)
+
+- fix(council): `5dive council sign-vote` / `5dive council verify-votes` now reach the mjs verbs through `cmd_council()`'s allowlist — they were fully tested + routed in `cli.mjs` but UNREACHABLE from the shell (the bash dispatcher never routed them, so `5dive council sign-vote` died E_USAGE). Since a SEAT signs at source from its OWN harness — the shell IS the product surface — the CNCL-10 co-signed-vote flow was dead on the surface it ships on. The passthrough preserves the `COUNCIL-SIG:` line / JSON-row stdout contract and the non-zero exit code (a seat harness gates on it) verbatim; no sudo/seal/lineage write (these verbs are pure). Also added to `council --help`.
+- test(council): `council_bashroute_e2e.sh` drives the BUILT `5dive` binary end-to-end (throwaway build via `BUILD_OUT`), closing the CI blind spot where every prior council test drove `node cli.mjs` directly. Wired into `council_unit.sh`.
+
 ## 0.11.17 — Delegated push accepts signed verifier ship gates (DIVE-1496) (2026-07-19)
 
 - fix(push): let a builder land an approved feature branch without a lodar transport handoff when the task's ship gate was cleared by its designated routed reviewer. The root-only push path verifies the persisted HMAC closure and accepts only `human:*` or the exact `lead:<routed_reviewer>` provenance; auto-clears, bare/unrelated agent answers, unsigned rows, tampered closures, and direct `_push_do` attempts all fail closed. Protected `main`/`master`, task-to-branch binding, configured author enforcement, repo-scoped short-lived GitHub App credentials, and no-token-to-agent guarantees are unchanged.

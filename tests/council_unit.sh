@@ -38,4 +38,10 @@ if ! bash "tests/council_cosign_e2e.sh"; then echo "FAILED: tests/council_cosign
 echo "=== tests/council_roster_lineage_e2e.sh"
 if ! bash "tests/council_roster_lineage_e2e.sh"; then echo "FAILED: tests/council_roster_lineage_e2e.sh"; rc=1; fi
 
+# CNCL-26: the bash-DISPATCHER route e2e — proves `5dive council sign-vote|verify-votes` reach the
+# mjs verbs through cmd_council()'s allowlist (not just `node cli.mjs` directly, the blind spot that
+# hid the CNCL-10 shell gap). Builds a throwaway ./5dive (BUILD_OUT) so it GATES in CI; no root/seal.
+echo "=== tests/council_bashroute_e2e.sh"
+if ! bash "tests/council_bashroute_e2e.sh"; then echo "FAILED: tests/council_bashroute_e2e.sh"; rc=1; fi
+
 exit $rc
