@@ -16,6 +16,27 @@ COUNCIL_RECEIPTS="${COUNCIL_DIR}/receipts"
 COUNCIL_GENESIS="${COUNCIL_DIR}/genesis.json"
 COUNCIL_LINEAGE="${COUNCIL_DIR}/lineage.jsonl"
 
+_council_constitution_path() {
+  printf '%s' "${FIVEDIVE_CONSTITUTION_FILE:-${STATE_DIR}/5dive.md}"
+}
+
+# Parse the machine-enforced YAML frontmatter through the same loader the tally
+# engine uses. Kept as a function (not a source-time global) so test/runtime
+# STATE_DIR overrides resolve correctly.
+_council_constitution_json() {
+  command -v node >/dev/null 2>&1 || return 1
+  local dir rc=0
+  dir="$(mktemp -d -t 5dive-constitution.XXXXXX)" || return 1
+  _council_write_runtime "$dir"
+  node "$dir/cli.mjs" constitution --path="$(_council_constitution_path)" || rc=$?
+  rm -rf "$dir"
+  return "$rc"
+}
+
+_council_hard_gate_rx() {
+  _council_constitution_json | jq -r '.hardGateRegex'
+}
+
 _council_help() {
   cat >&2 <<'COUNCIL_HELP'
 5dive council — standalone deliberation council (v0.11)
@@ -279,7 +300,13 @@ _council_veto() {
   # (up to veto_posthoc) -> posthoc; at/beyond the posthoc deadline -> refused (window expired, pass
   # is final). Boundary is inclusive: a zero/already-past window IS expired the instant it is reached
   # (now_e >= st_e + posthoc), so a 0s window never admits a same-second exercise — no clock race.
-  local now_e ea_e st_e posthoc="${COUNCIL_VETO_POSTHOC_SECS:-172800}"
+  local now_e ea_e st_e posthoc="${COUNCIL_VETO_POSTHOC_SECS:-172800}" _veto_cfg=""
+  _veto_cfg="$(_council_constitution_json 2>/dev/null || true)"
+  if [[ "$(printf '%s' "$_veto_cfg" | jq -r '.source // "defaults"' 2>/dev/null)" == "file" ]]; then
+    posthoc="$(printf '%s' "$_veto_cfg" | jq -r '.veto.posthocSecs')"
+  elif [[ "$(printf '%s' "$_veto_cfg" | jq -r '.valid // true' 2>/dev/null)" == "false" ]]; then
+    posthoc=172800
+  fi
   [[ "$posthoc" =~ ^[0-9]+$ ]] || posthoc=172800
   now_e="$(date -u +%s)"
   ea_e="$(date -u -d "$execute_after" +%s 2>/dev/null || echo 0)"
@@ -893,19 +920,39 @@ cmd_council() {
   # veto_hold constitution key; env-overridable seam until CNCL-13/14) down to the engine so the
   # offer is recorded on a pass. Ad-hoc panels (no genesis) get no offer.
   local -a veto_args=()
-  local veto_hold="${COUNCIL_VETO_HOLD_SECS:-900}"
+  local veto_hold="${COUNCIL_VETO_HOLD_SECS:-900}" constitution_json="" constitution_source="defaults" constitution_valid="true" constitution_principal=""
+  constitution_json="$(_council_constitution_json 2>/dev/null || true)"
+  if [[ -n "$constitution_json" ]]; then
+    constitution_source="$(printf '%s' "$constitution_json" | jq -r '.source // "defaults"')"
+    constitution_valid="$(printf '%s' "$constitution_json" | jq -r '.valid // true')"
+    constitution_principal="$(printf '%s' "$constitution_json" | jq -r '.veto.principal // empty')"
+    if [[ "$constitution_source" == "file" ]]; then
+      veto_hold="$(printf '%s' "$constitution_json" | jq -r '.veto.holdSecs')"
+    elif [[ "$constitution_valid" == "false" ]]; then
+      veto_hold=900
+      warn "invalid $(_council_constitution_path); council is using built-in governance defaults"
+    fi
+  fi
   [[ "$veto_hold" =~ ^[0-9]+$ ]] || veto_hold=900
   if (( genesis_exists )); then
     local g_principal g_resolved
     g_principal="$(jq -r '.veto.principal // empty' "$COUNCIL_GENESIS" 2>/dev/null)"
     g_resolved="$(jq -r '.veto.resolved // empty' "$COUNCIL_GENESIS" 2>/dev/null)"
+    if [[ "$constitution_source" == "file" && -n "$constitution_principal" ]]; then
+      if [[ "$constitution_principal" == "$g_principal" ]]; then
+        g_principal="$constitution_principal"
+      else
+        warn "constitution veto principal '$constitution_principal' has no genesis-resolved recipient; veto offer omitted fail-closed"
+        g_principal=""; g_resolved=""
+      fi
+    fi
     if [[ -n "$g_principal" && -n "$g_resolved" ]]; then
       veto_args=(--veto-principal="$g_principal" --veto-resolved="$g_resolved" --veto-window="$veto_hold")
     fi
   fi
 
   local raw
-  raw="$(node "$dir/cli.mjs" convene "$@" "${veto_args[@]}" --registry="$COUNCIL_REGISTRY" --genesis-exists="$genesis_exists" --stamped-at="$stamped")" || return $?
+  raw="$(node "$dir/cli.mjs" convene "$@" "${veto_args[@]}" --constitution-path="$(_council_constitution_path)" --registry="$COUNCIL_REGISTRY" --genesis-exists="$genesis_exists" --stamped-at="$stamped")" || return $?
 
   # Seal the receipt canonical at the root HMAC rail — a standalone engine has no
   # key, so the seal (via gate-proof) is what makes the verdict tamper-evident. The

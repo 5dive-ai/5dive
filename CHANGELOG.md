@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.11.19 — Constitution loader: governance policy from `5dive.md` (CNCL-14) (2026-07-19)
+
+- feat(council): load the ratified constitution-as-data frontmatter from `${STATE_DIR}/5dive.md`: roster/bench pointer, per-class thresholds, quorum, veto principal(s) + hold/post-hoc windows, hard-gate classes, and ship/comms policy. Council convenes pass the loaded threshold matrix into the deterministic tally; primary-bench selection and veto windows/principal consume the same normalized document.
+- feat(gates): the task tier-2 floor now compiles `hard_gates` from the loaded constitution instead of treating `_GATE_T2_FLOOR_RX` as organization law. A constitution can add/remove `brand` (or any other class) without patching source; missing or malformed files atomically fall back to the exact shipped regex/policy/windows, never partially apply. When no constitution file exists, the gate-filing hot path retains the original in-process Bash regex and never starts Node or materializes the council runtime.
+- docs/tests: document the v0 YAML-frontmatter shape and CNCL-15 integrity boundary. Loader unit tests prove default byte parity, live tally/quorum wiring, malformed fallback, roster/veto/soft-policy parsing, and brand-present versus brand-absent tiering.
+
 ## 0.11.18 — The Council: route `sign-vote`/`verify-votes` through the bash dispatcher (CNCL-26) (2026-07-19)
 
 - fix(council): `5dive council sign-vote` / `5dive council verify-votes` now reach the mjs verbs through `cmd_council()`'s allowlist — they were fully tested + routed in `cli.mjs` but UNREACHABLE from the shell (the bash dispatcher never routed them, so `5dive council sign-vote` died E_USAGE). Since a SEAT signs at source from its OWN harness — the shell IS the product surface — the CNCL-10 co-signed-vote flow was dead on the surface it ships on. The passthrough preserves the `COUNCIL-SIG:` line / JSON-row stdout contract and the non-zero exit code (a seat harness gates on it) verbatim; no sudo/seal/lineage write (these verbs are pure). Also added to `council --help`.

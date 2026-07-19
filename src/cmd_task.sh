@@ -1602,9 +1602,10 @@ cmd_task_routing() {
   esac
 }
 
-# DIVE-891 (adopted design DIVE-861): the T2 category floor. Money, public or
-# customer-facing comms, secrets, and destructive/irreversible actions are
-# ALWAYS a hard human gate, regardless of the tier the
+# DIVE-891/CNCL-14: the T2 category floor. The shipped defaults make money,
+# public/customer comms, secrets, and destructive/irreversible actions a hard
+# human gate; a valid company constitution replaces those classes as data.
+# A matched class is ALWAYS a hard human gate, regardless of the tier the
 # filing agent asked for — the floor is enforced here, not trusted from the
 # filer. Matched case-insensitively over ask + title. The bias is deliberately
 # toward false positives: a wrongly-ELEVATED gate costs the human one tap; a
@@ -1614,8 +1615,23 @@ cmd_task_routing() {
 # fails to justify).
 _GATE_T2_FLOOR_RX='spend|billing|invoice|charge|payment|refund|subscription|price|pricing|\$[0-9]|€[0-9]|publish|public post|announce|launch post|press|customer email|email customers|newsletter|blast|secret|credential|api key|token|password|delete|destroy|teardown|wipe|purge|drop[^.]{0,20}table|truncate|irreversible|revoke|dns|domain transfer'
 _gate_tier2_floor_hit() {
-  local text; text=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
-  [[ "$text" =~ $_GATE_T2_FLOOR_RX ]]
+  local text floor_rx="$_GATE_T2_FLOOR_RX" loaded_rx="" constitution_path=""
+  text=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
+  # CNCL-14: production bundles include the council loader later in the file;
+  # isolated task tests that source cmd_task alone retain the byte-identical
+  # legacy regex. The overwhelmingly common no-file path must stay in-process:
+  # do not start Node or materialize the embedded council runtime merely to
+  # rediscover the same default. A present-but-malformed file still goes through
+  # the loader and atomically resolves to the legacy regex.
+  if declare -F _council_hard_gate_rx >/dev/null 2>&1 \
+     && declare -F _council_constitution_path >/dev/null 2>&1; then
+    constitution_path="$(_council_constitution_path 2>/dev/null || true)"
+    if [[ -n "$constitution_path" && -f "$constitution_path" ]]; then
+      loaded_rx="$(_council_hard_gate_rx 2>/dev/null || true)"
+      [[ -n "$loaded_rx" ]] && floor_rx="$loaded_rx"
+    fi
+  fi
+  [[ "$text" =~ $floor_rx ]]
 }
 
 # DIVE-1359: the ENG-SHIP gate class. An eng ship / merge / diff / deploy

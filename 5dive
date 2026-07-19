@@ -26,7 +26,7 @@ esac
 
 # Bumped on every public release. `build.sh` checks this line exists; CI fails
 # the bundle-drift check if it's missing or empty.
-readonly FIVE_VERSION="0.11.18"
+readonly FIVE_VERSION="0.11.19"
 
 # GitHub org our repos live under. The org is being renamed
 # 5dive-com -> 5dive-ai (2026-06); fetches must work on either side of the
@@ -17387,9 +17387,10 @@ cmd_task_routing() {
   esac
 }
 
-# DIVE-891 (adopted design DIVE-861): the T2 category floor. Money, public or
-# customer-facing comms, secrets, and destructive/irreversible actions are
-# ALWAYS a hard human gate, regardless of the tier the
+# DIVE-891/CNCL-14: the T2 category floor. The shipped defaults make money,
+# public/customer comms, secrets, and destructive/irreversible actions a hard
+# human gate; a valid company constitution replaces those classes as data.
+# A matched class is ALWAYS a hard human gate, regardless of the tier the
 # filing agent asked for — the floor is enforced here, not trusted from the
 # filer. Matched case-insensitively over ask + title. The bias is deliberately
 # toward false positives: a wrongly-ELEVATED gate costs the human one tap; a
@@ -17399,8 +17400,23 @@ cmd_task_routing() {
 # fails to justify).
 _GATE_T2_FLOOR_RX='spend|billing|invoice|charge|payment|refund|subscription|price|pricing|\$[0-9]|€[0-9]|publish|public post|announce|launch post|press|customer email|email customers|newsletter|blast|secret|credential|api key|token|password|delete|destroy|teardown|wipe|purge|drop[^.]{0,20}table|truncate|irreversible|revoke|dns|domain transfer'
 _gate_tier2_floor_hit() {
-  local text; text=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
-  [[ "$text" =~ $_GATE_T2_FLOOR_RX ]]
+  local text floor_rx="$_GATE_T2_FLOOR_RX" loaded_rx="" constitution_path=""
+  text=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
+  # CNCL-14: production bundles include the council loader later in the file;
+  # isolated task tests that source cmd_task alone retain the byte-identical
+  # legacy regex. The overwhelmingly common no-file path must stay in-process:
+  # do not start Node or materialize the embedded council runtime merely to
+  # rediscover the same default. A present-but-malformed file still goes through
+  # the loader and atomically resolves to the legacy regex.
+  if declare -F _council_hard_gate_rx >/dev/null 2>&1 \
+     && declare -F _council_constitution_path >/dev/null 2>&1; then
+    constitution_path="$(_council_constitution_path 2>/dev/null || true)"
+    if [[ -n "$constitution_path" && -f "$constitution_path" ]]; then
+      loaded_rx="$(_council_hard_gate_rx 2>/dev/null || true)"
+      [[ -n "$loaded_rx" ]] && floor_rx="$loaded_rx"
+    fi
+  fi
+  [[ "$text" =~ $floor_rx ]]
 }
 
 # DIVE-1359: the ENG-SHIP gate class. An eng ship / merge / diff / deploy
@@ -22116,6 +22132,27 @@ COUNCIL_RECEIPTS="${COUNCIL_DIR}/receipts"
 COUNCIL_GENESIS="${COUNCIL_DIR}/genesis.json"
 COUNCIL_LINEAGE="${COUNCIL_DIR}/lineage.jsonl"
 
+_council_constitution_path() {
+  printf '%s' "${FIVEDIVE_CONSTITUTION_FILE:-${STATE_DIR}/5dive.md}"
+}
+
+# Parse the machine-enforced YAML frontmatter through the same loader the tally
+# engine uses. Kept as a function (not a source-time global) so test/runtime
+# STATE_DIR overrides resolve correctly.
+_council_constitution_json() {
+  command -v node >/dev/null 2>&1 || return 1
+  local dir rc=0
+  dir="$(mktemp -d -t 5dive-constitution.XXXXXX)" || return 1
+  _council_write_runtime "$dir"
+  node "$dir/cli.mjs" constitution --path="$(_council_constitution_path)" || rc=$?
+  rm -rf "$dir"
+  return "$rc"
+}
+
+_council_hard_gate_rx() {
+  _council_constitution_json | jq -r '.hardGateRegex'
+}
+
 _council_help() {
   cat >&2 <<'COUNCIL_HELP'
 5dive council — standalone deliberation council (v0.11)
@@ -22243,6 +22280,7 @@ _council_write_runtime() {
 // type) — it escalates, fail-closed on a missing tier.
 
 import { createHash, generateKeyPairSync, sign as edSign, verify as edVerify, createPrivateKey, createPublicKey } from 'node:crypto'
+import fs from 'node:fs'
 
 // ==================== PURE LOGIC (the ported contract — auditable, offline-testable) ====================
 export const HUMAN_ONLY_TYPES = ['secret', 'approval', 'manual', 'access']
@@ -22445,6 +22483,212 @@ export const THRESHOLD_POLICY = {
   demote:         { rule: 'fraction', value: 2 / 3, quorum: 'majority' },
   expel:          { rule: 'fraction', value: 2 / 3, quorum: 'majority' },
   constitutional: { rule: 'fraction', value: 2 / 3, quorum: 'all', requireQuorum: true },
+}
+
+// CNCL-14 — constitution-as-data. Missing or malformed files fall back to these
+// exact pre-constitution values; a valid 5dive.md may replace them per org.
+export const DEFAULT_HARD_GATE_CLASSES = {
+  spend_billing: 'spend|billing|invoice|charge|payment|refund|subscription|price|pricing|\\$[0-9]|€[0-9]',
+  public_comms: 'publish|public post|announce|launch post|press|customer email|email customers|newsletter|blast',
+  secrets: 'secret|credential|api key|token|password',
+  destructive: 'delete|destroy|teardown|wipe|purge|drop[^.]{0,20}table|truncate|irreversible|revoke|dns|domain transfer',
+}
+export const DEFAULT_HARD_GATE_RX = Object.values(DEFAULT_HARD_GATE_CLASSES).join('|')
+export const DEFAULT_CONSTITUTION = {
+  council: { bench: 'council' },
+  quorum: 'majority',
+  thresholds: THRESHOLD_POLICY,
+  veto: { principals: [], principal: '', holdSecs: 900, posthocSecs: 172800 },
+  hardGates: DEFAULT_HARD_GATE_CLASSES,
+  hardGateRegex: DEFAULT_HARD_GATE_RX,
+  ship: {},
+  comms: {},
+}
+
+function yamlScalar(raw) {
+  const s = String(raw).trim()
+  if (!s) return {}
+  if (s.startsWith('"') && s.endsWith('"')) return JSON.parse(s)
+  if (s.startsWith("'") && s.endsWith("'")) return s.slice(1, -1).replace(/''/g, "'")
+  if (s.startsWith('[') && s.endsWith(']')) {
+    const inner = s.slice(1, -1).trim()
+    return inner ? inner.split(',').map(x => yamlScalar(x.trim())) : []
+  }
+  if (/^(true|false)$/i.test(s)) return s.toLowerCase() === 'true'
+  if (/^-?[0-9]+(?:\.[0-9]+)?$/.test(s)) return Number(s)
+  if (/^(null|~)$/i.test(s)) return null
+  return s
+}
+
+function stripYamlComment(line) {
+  let single = false, double = false
+  for (let i = 0; i < line.length; i++) {
+    const c = line[i]
+    if (c === "'" && !double) single = !single
+    else if (c === '"' && !single && line[i - 1] !== '\\') double = !double
+    else if (c === '#' && !single && !double && (i === 0 || /\s/.test(line[i - 1]))) return line.slice(0, i).trimEnd()
+  }
+  return line
+}
+
+// Deliberately small YAML-frontmatter parser: mappings + scalar/inline-array
+// values are the whole enforced v0 schema. Unsupported list/object syntax fails
+// closed to defaults rather than being partially interpreted.
+export function parseConstitutionFrontmatter(text) {
+  const lines = String(text || '').replace(/\r\n/g, '\n').split('\n')
+  if (lines[0] !== '---') throw new Error('5dive.md needs YAML frontmatter')
+  const end = lines.indexOf('---', 1)
+  if (end < 0) throw new Error('5dive.md frontmatter is not closed')
+  const root = {}
+  const stack = [{ indent: -1, value: root }]
+  for (const original of lines.slice(1, end)) {
+    if (!original.trim() || original.trimStart().startsWith('#')) continue
+    if (original.includes('\t')) throw new Error('tabs are not allowed in constitution YAML')
+    const indent = original.length - original.trimStart().length
+    if (indent % 2) throw new Error('constitution YAML indentation must use two spaces')
+    const line = stripYamlComment(original.trim())
+    if (!line) continue
+    if (line.startsWith('- ')) throw new Error('use inline arrays in constitution v0')
+    const m = line.match(/^([A-Za-z_][A-Za-z0-9_-]*):(?:\s+(.*))?$/)
+    if (!m) throw new Error(`unsupported constitution YAML: ${line}`)
+    while (stack.length > 1 && stack[stack.length - 1].indent >= indent) stack.pop()
+    const parent = stack[stack.length - 1]
+    if (indent > parent.indent + 2) throw new Error('constitution YAML skipped an indentation level')
+    const key = m[1]
+    if (['__proto__', 'prototype', 'constructor'].includes(key)) throw new Error('unsafe constitution key')
+    if (Object.hasOwn(parent.value, key)) throw new Error(`duplicate constitution key: ${key}`)
+    if (m[2] == null || m[2] === '') {
+      parent.value[key] = {}
+      stack.push({ indent, value: parent.value[key] })
+    } else {
+      parent.value[key] = yamlScalar(m[2])
+    }
+  }
+  return root
+}
+
+function thresholdSpec(value, base, globalQuorum) {
+  const out = { ...base }
+  if (typeof value === 'string' || typeof value === 'number') {
+    const v = String(value).trim()
+    const frac = v.match(/^([1-9][0-9]*)\/([1-9][0-9]*)$/)
+    if (frac) { out.rule = 'fraction'; out.value = Number(frac[1]) / Number(frac[2]); delete out.threshold }
+    else if (v === 'majority') { out.rule = 'majority'; delete out.value; delete out.threshold }
+    else if (v === 'all') { out.rule = 'fraction'; out.value = 1; delete out.threshold }
+    else if (/^[1-9][0-9]*$/.test(v)) { out.rule = 'flat'; out.threshold = Number(v); delete out.value }
+    else throw new Error(`invalid threshold: ${v}`)
+  } else if (value && typeof value === 'object' && !Array.isArray(value)) {
+    const unknown = Object.keys(value).filter(k => !['rule', 'threshold', 'value', 'quorum', 'require_quorum', 'requireQuorum'].includes(k))
+    if (unknown.length) throw new Error(`unknown threshold field(s): ${unknown.join(', ')}`)
+    if (value.rule != null) {
+      const rule = String(value.rule)
+      if (!['majority', 'fraction', 'flat'].includes(rule)) throw new Error(`invalid threshold rule: ${rule}`)
+      out.rule = rule
+    }
+    if (value.threshold != null) { out.rule = 'flat'; out.threshold = Number(value.threshold); delete out.value }
+    if (value.value != null) {
+      const n = Number(value.value)
+      if (!Number.isFinite(n) || n <= 0 || n > 1) throw new Error(`invalid threshold fraction: ${value.value}`)
+      out.rule = 'fraction'; out.value = n; delete out.threshold
+    }
+    if (value.quorum != null) out.quorum = value.quorum
+    if (value.require_quorum != null) {
+      if (typeof value.require_quorum !== 'boolean') throw new Error('require_quorum must be true or false')
+      out.requireQuorum = value.require_quorum
+    }
+    if (value.requireQuorum != null) {
+      if (typeof value.requireQuorum !== 'boolean') throw new Error('requireQuorum must be true or false')
+      out.requireQuorum = value.requireQuorum
+    }
+  } else throw new Error('threshold must be a scalar or mapping')
+  if (out.quorum == null) out.quorum = globalQuorum
+  if (out.rule === 'fraction' && (!Number.isFinite(Number(out.value)) || Number(out.value) <= 0 || Number(out.value) > 1)) throw new Error('fraction threshold needs value >0 and <=1')
+  if (out.rule === 'flat' && (!Number.isInteger(Number(out.threshold)) || Number(out.threshold) < 1)) throw new Error('flat threshold needs a positive integer')
+  return out
+}
+
+function quorumSpec(value) {
+  if (typeof value === 'number' && Number.isInteger(value) && value >= 0) return value
+  const s = String(value)
+  if (['majority', 'all', 'none'].includes(s)) return s
+  if (/^[0-9]+$/.test(s)) return Number(s)
+  throw new Error(`invalid quorum: ${s}`)
+}
+
+export function normalizeConstitution(raw = {}) {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) throw new Error('constitution frontmatter must be a mapping')
+  const unknownTop = Object.keys(raw).filter(k => !['council', 'quorum', 'thresholds', 'veto', 'hard_gates', 'ship', 'comms'].includes(k))
+  if (unknownTop.length) throw new Error(`unknown constitution field(s): ${unknownTop.join(', ')}`)
+  if (raw.council != null && (typeof raw.council !== 'object' || Array.isArray(raw.council))) throw new Error('council must be a mapping')
+  const council = raw.council || {}
+  const unknownCouncil = Object.keys(council).filter(k => k !== 'bench')
+  if (unknownCouncil.length) throw new Error(`unknown council field(s): ${unknownCouncil.join(', ')}`)
+  if (council.bench != null && (typeof council.bench !== 'string' || !council.bench.trim())) throw new Error('council.bench must be a non-empty string')
+  const globalQuorum = quorumSpec(raw.quorum == null ? DEFAULT_CONSTITUTION.quorum : raw.quorum)
+  const thresholds = {}
+  if (raw.thresholds != null && (typeof raw.thresholds !== 'object' || Array.isArray(raw.thresholds))) throw new Error('thresholds must be a mapping')
+  const configured = raw.thresholds || {}
+  const unknownClasses = Object.keys(configured).filter(k => !Object.hasOwn(THRESHOLD_POLICY, k))
+  if (unknownClasses.length) throw new Error(`unknown threshold class(es): ${unknownClasses.join(', ')}`)
+  for (const cls of Object.keys(THRESHOLD_POLICY)) {
+    thresholds[cls] = thresholdSpec(Object.hasOwn(configured, cls) ? configured[cls] : THRESHOLD_POLICY[cls], THRESHOLD_POLICY[cls], globalQuorum)
+    const classValue = configured[cls]
+    const classHasQuorum = classValue && typeof classValue === 'object' && Object.hasOwn(classValue, 'quorum')
+    thresholds[cls].quorum = quorumSpec(thresholds[cls].quorum)
+    if (raw.quorum != null && cls !== 'constitutional' && !classHasQuorum) thresholds[cls].quorum = globalQuorum
+  }
+  if (raw.veto != null && (typeof raw.veto !== 'object' || Array.isArray(raw.veto))) throw new Error('veto must be a mapping')
+  const veto = raw.veto || {}
+  const unknownVeto = Object.keys(veto).filter(k => !['principal', 'principals', 'hold_secs', 'posthoc_secs'].includes(k))
+  if (unknownVeto.length) throw new Error(`unknown veto field(s): ${unknownVeto.join(', ')}`)
+  if (veto.principal != null && typeof veto.principal !== 'string') throw new Error('veto.principal must be a string')
+  if (veto.principals != null && (!Array.isArray(veto.principals) || veto.principals.some(x => typeof x !== 'string'))) throw new Error('veto.principals must be an inline string array')
+  if (veto.principal && veto.principals) throw new Error('use veto.principal or veto.principals, not both')
+  const principals = Array.isArray(veto.principals) ? veto.principals : (veto.principal ? [veto.principal] : [])
+  const seconds = (v, fallback, field) => {
+    if (v == null) return fallback
+    if (!Number.isInteger(v) || v < 0) throw new Error(`${field} must be a non-negative integer`)
+    return v
+  }
+  let hardGates = DEFAULT_CONSTITUTION.hardGates
+  let hardGateRegex = DEFAULT_HARD_GATE_RX
+  if (Object.hasOwn(raw, 'hard_gates')) {
+    if (!raw.hard_gates || typeof raw.hard_gates !== 'object' || Array.isArray(raw.hard_gates)) throw new Error('hard_gates must be a mapping')
+    hardGates = Object.fromEntries(Object.entries(raw.hard_gates).map(([k, v]) => {
+      if (typeof v !== 'string') throw new Error(`hard_gates.${k} must be a regex string`)
+      if (/\(\?|\\[bBdDsSwW]|\\[1-9]/.test(v)) throw new Error(`hard_gates.${k} uses syntax outside POSIX ERE`)
+      return [k, v]
+    }))
+    hardGateRegex = Object.values(hardGates).filter(Boolean).map(x => `(${x})`).join('|') || 'a^'
+    new RegExp(hardGateRegex, 'i')
+  }
+  for (const section of ['ship', 'comms']) {
+    if (raw[section] != null && (typeof raw[section] !== 'object' || Array.isArray(raw[section]))) throw new Error(`${section} must be a mapping`)
+  }
+  return {
+    council: { bench: String(council.bench || DEFAULT_CONSTITUTION.council.bench) },
+    quorum: globalQuorum,
+    thresholds,
+    veto: {
+      principals,
+      principal: principals[0] || '',
+      holdSecs: seconds(veto.hold_secs, DEFAULT_CONSTITUTION.veto.holdSecs, 'veto.hold_secs'),
+      posthocSecs: seconds(veto.posthoc_secs, DEFAULT_CONSTITUTION.veto.posthocSecs, 'veto.posthoc_secs'),
+    },
+    hardGates, hardGateRegex,
+    ship: raw.ship && typeof raw.ship === 'object' ? raw.ship : {},
+    comms: raw.comms && typeof raw.comms === 'object' ? raw.comms : {},
+  }
+}
+
+export function loadConstitution(path, readFile = p => fs.readFileSync(p, 'utf8')) {
+  if (!path) return { ...normalizeConstitution({}), source: 'defaults', path: '', valid: true, error: null }
+  try {
+    if (!fs.existsSync(path)) return { ...normalizeConstitution({}), source: 'defaults', path, valid: true, error: null }
+    return { ...normalizeConstitution(parseConstitutionFrontmatter(readFile(path))), source: 'file', path, valid: true, error: null }
+  } catch (e) {
+    return { ...normalizeConstitution({}), source: 'defaults', path, valid: false, error: String(e && e.message || e) }
+  }
 }
 
 // Resolve the numeric pass-threshold for a roster from a spec. 'flat' (fixed N, clamped to
@@ -23616,12 +23860,22 @@ function preflightSeats(seats) {
 }
 
 // ---- subcommands -----------------------------------------------------------
+function cmdConstitution() {
+  const p = flag('path')
+  const path = p === true || p == null ? '' : String(p)
+  out(E.loadConstitution(path))
+}
+
 async function cmdConvene() {
   const question = positionals[0]
   if (!question) die('convene needs a question: 5dive council convene "<q>" --seats=a,b,c')
   const registryPath = flag('registry')
   const reg = loadRegistry(registryPath)
-  const benchName = flag('bench')
+  const cp = flag('constitution-path')
+  const constitution = E.loadConstitution(cp === true || cp == null ? '' : String(cp))
+  if (!constitution.valid) process.stderr.write(`council: invalid 5dive.md; using built-in defaults (${constitution.error})\n`)
+  const explicitBench = flag('bench')
+  const benchName = explicitBench || ((flag('seats') == null || flag('seats') === true) ? constitution.council.bench : null)
   // CNCL-8: convening THE primary council (by name, or the default with no explicit --seats)
   // fails closed until it has been human-seeded via `council init`. An ad-hoc panel (explicit
   // --seats) or an alternate bench (ship/brand/security) is a different, non-governance thing
@@ -23648,6 +23902,7 @@ async function cmdConvene() {
     role: 'convene', question, seats, mode,
     councilName: effBench || 'ad-hoc',
     decisionClass: flag('class') || (bench && bench.decisionClass) || 'ordinary',
+    policy: constitution.thresholds,
     stampedAt: flag('stamped-at') || '',
   }
   const th = flag('threshold'); if (th != null && th !== true) input.threshold = Number(th)
@@ -23699,6 +23954,7 @@ async function cmdConvene() {
     votes: (result.votes || []).map(v => ({ seat: v.seat, vote: v.vote, rationale: v.rationale })),
     round1Votes: result.round1Votes ? result.round1Votes.map(v => ({ seat: v.seat, vote: v.vote, rationale: v.rationale })) : undefined,
     rebuttalVotes: result.rebuttalVotes ? result.rebuttalVotes.map(v => ({ seat: v.seat, vote: v.vote, rationale: v.rationale })) : undefined,
+    constitution: { source: constitution.source, valid: constitution.valid, path: constitution.path },
     receipt: result.receipt,   // { canonical, seal, verify } — bash seals canonical
   })
 }
@@ -24037,6 +24293,7 @@ function cmdVerifyChain() {
 }
 
 const main = async () => {
+  if (sub === 'constitution') return cmdConstitution()
   if (sub === 'convene') return cmdConvene()
   if (sub === 'roster') return cmdRoster()
   if (sub === 'motion-plan') return cmdMotionPlan()
@@ -24050,7 +24307,7 @@ const main = async () => {
   if (sub === 'read-binding') return cmdReadBinding()
   if (sub === 'sign-vote') return cmdSignVote()
   if (sub === 'verify-votes') return cmdVerifyVotes()
-  die(`unknown council subcommand: ${sub} (convene|bench|init|veto|gate-map|seal-augment|read-binding|sign-vote|verify-votes|roster|motion-plan|motion-apply|verify-chain)`)
+  die(`unknown council subcommand: ${sub} (constitution|convene|bench|init|veto|gate-map|seal-augment|read-binding|sign-vote|verify-votes|roster|motion-plan|motion-apply|verify-chain)`)
 }
 main().catch(e => die(String(e && e.message || e), 1))
 COUNCIL_CLI_MJS
@@ -24202,7 +24459,13 @@ _council_veto() {
   # (up to veto_posthoc) -> posthoc; at/beyond the posthoc deadline -> refused (window expired, pass
   # is final). Boundary is inclusive: a zero/already-past window IS expired the instant it is reached
   # (now_e >= st_e + posthoc), so a 0s window never admits a same-second exercise — no clock race.
-  local now_e ea_e st_e posthoc="${COUNCIL_VETO_POSTHOC_SECS:-172800}"
+  local now_e ea_e st_e posthoc="${COUNCIL_VETO_POSTHOC_SECS:-172800}" _veto_cfg=""
+  _veto_cfg="$(_council_constitution_json 2>/dev/null || true)"
+  if [[ "$(printf '%s' "$_veto_cfg" | jq -r '.source // "defaults"' 2>/dev/null)" == "file" ]]; then
+    posthoc="$(printf '%s' "$_veto_cfg" | jq -r '.veto.posthocSecs')"
+  elif [[ "$(printf '%s' "$_veto_cfg" | jq -r '.valid // true' 2>/dev/null)" == "false" ]]; then
+    posthoc=172800
+  fi
   [[ "$posthoc" =~ ^[0-9]+$ ]] || posthoc=172800
   now_e="$(date -u +%s)"
   ea_e="$(date -u -d "$execute_after" +%s 2>/dev/null || echo 0)"
@@ -24816,19 +25079,39 @@ cmd_council() {
   # veto_hold constitution key; env-overridable seam until CNCL-13/14) down to the engine so the
   # offer is recorded on a pass. Ad-hoc panels (no genesis) get no offer.
   local -a veto_args=()
-  local veto_hold="${COUNCIL_VETO_HOLD_SECS:-900}"
+  local veto_hold="${COUNCIL_VETO_HOLD_SECS:-900}" constitution_json="" constitution_source="defaults" constitution_valid="true" constitution_principal=""
+  constitution_json="$(_council_constitution_json 2>/dev/null || true)"
+  if [[ -n "$constitution_json" ]]; then
+    constitution_source="$(printf '%s' "$constitution_json" | jq -r '.source // "defaults"')"
+    constitution_valid="$(printf '%s' "$constitution_json" | jq -r '.valid // true')"
+    constitution_principal="$(printf '%s' "$constitution_json" | jq -r '.veto.principal // empty')"
+    if [[ "$constitution_source" == "file" ]]; then
+      veto_hold="$(printf '%s' "$constitution_json" | jq -r '.veto.holdSecs')"
+    elif [[ "$constitution_valid" == "false" ]]; then
+      veto_hold=900
+      warn "invalid $(_council_constitution_path); council is using built-in governance defaults"
+    fi
+  fi
   [[ "$veto_hold" =~ ^[0-9]+$ ]] || veto_hold=900
   if (( genesis_exists )); then
     local g_principal g_resolved
     g_principal="$(jq -r '.veto.principal // empty' "$COUNCIL_GENESIS" 2>/dev/null)"
     g_resolved="$(jq -r '.veto.resolved // empty' "$COUNCIL_GENESIS" 2>/dev/null)"
+    if [[ "$constitution_source" == "file" && -n "$constitution_principal" ]]; then
+      if [[ "$constitution_principal" == "$g_principal" ]]; then
+        g_principal="$constitution_principal"
+      else
+        warn "constitution veto principal '$constitution_principal' has no genesis-resolved recipient; veto offer omitted fail-closed"
+        g_principal=""; g_resolved=""
+      fi
+    fi
     if [[ -n "$g_principal" && -n "$g_resolved" ]]; then
       veto_args=(--veto-principal="$g_principal" --veto-resolved="$g_resolved" --veto-window="$veto_hold")
     fi
   fi
 
   local raw
-  raw="$(node "$dir/cli.mjs" convene "$@" "${veto_args[@]}" --registry="$COUNCIL_REGISTRY" --genesis-exists="$genesis_exists" --stamped-at="$stamped")" || return $?
+  raw="$(node "$dir/cli.mjs" convene "$@" "${veto_args[@]}" --constitution-path="$(_council_constitution_path)" --registry="$COUNCIL_REGISTRY" --genesis-exists="$genesis_exists" --stamped-at="$stamped")" || return $?
 
   # Seal the receipt canonical at the root HMAC rail — a standalone engine has no
   # key, so the seal (via gate-proof) is what makes the verdict tamper-evident. The

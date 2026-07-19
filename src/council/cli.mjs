@@ -148,12 +148,22 @@ function preflightSeats(seats) {
 }
 
 // ---- subcommands -----------------------------------------------------------
+function cmdConstitution() {
+  const p = flag('path')
+  const path = p === true || p == null ? '' : String(p)
+  out(E.loadConstitution(path))
+}
+
 async function cmdConvene() {
   const question = positionals[0]
   if (!question) die('convene needs a question: 5dive council convene "<q>" --seats=a,b,c')
   const registryPath = flag('registry')
   const reg = loadRegistry(registryPath)
-  const benchName = flag('bench')
+  const cp = flag('constitution-path')
+  const constitution = E.loadConstitution(cp === true || cp == null ? '' : String(cp))
+  if (!constitution.valid) process.stderr.write(`council: invalid 5dive.md; using built-in defaults (${constitution.error})\n`)
+  const explicitBench = flag('bench')
+  const benchName = explicitBench || ((flag('seats') == null || flag('seats') === true) ? constitution.council.bench : null)
   // CNCL-8: convening THE primary council (by name, or the default with no explicit --seats)
   // fails closed until it has been human-seeded via `council init`. An ad-hoc panel (explicit
   // --seats) or an alternate bench (ship/brand/security) is a different, non-governance thing
@@ -180,6 +190,7 @@ async function cmdConvene() {
     role: 'convene', question, seats, mode,
     councilName: effBench || 'ad-hoc',
     decisionClass: flag('class') || (bench && bench.decisionClass) || 'ordinary',
+    policy: constitution.thresholds,
     stampedAt: flag('stamped-at') || '',
   }
   const th = flag('threshold'); if (th != null && th !== true) input.threshold = Number(th)
@@ -231,6 +242,7 @@ async function cmdConvene() {
     votes: (result.votes || []).map(v => ({ seat: v.seat, vote: v.vote, rationale: v.rationale })),
     round1Votes: result.round1Votes ? result.round1Votes.map(v => ({ seat: v.seat, vote: v.vote, rationale: v.rationale })) : undefined,
     rebuttalVotes: result.rebuttalVotes ? result.rebuttalVotes.map(v => ({ seat: v.seat, vote: v.vote, rationale: v.rationale })) : undefined,
+    constitution: { source: constitution.source, valid: constitution.valid, path: constitution.path },
     receipt: result.receipt,   // { canonical, seal, verify } — bash seals canonical
   })
 }
@@ -569,6 +581,7 @@ function cmdVerifyChain() {
 }
 
 const main = async () => {
+  if (sub === 'constitution') return cmdConstitution()
   if (sub === 'convene') return cmdConvene()
   if (sub === 'roster') return cmdRoster()
   if (sub === 'motion-plan') return cmdMotionPlan()
@@ -582,6 +595,6 @@ const main = async () => {
   if (sub === 'read-binding') return cmdReadBinding()
   if (sub === 'sign-vote') return cmdSignVote()
   if (sub === 'verify-votes') return cmdVerifyVotes()
-  die(`unknown council subcommand: ${sub} (convene|bench|init|veto|gate-map|seal-augment|read-binding|sign-vote|verify-votes|roster|motion-plan|motion-apply|verify-chain)`)
+  die(`unknown council subcommand: ${sub} (constitution|convene|bench|init|veto|gate-map|seal-augment|read-binding|sign-vote|verify-votes|roster|motion-plan|motion-apply|verify-chain)`)
 }
 main().catch(e => die(String(e && e.message || e), 1))
