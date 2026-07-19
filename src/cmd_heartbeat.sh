@@ -890,7 +890,9 @@ _hb_gate_ttl_sweep() {
   while IFS= read -r aname; do
     [[ -n "$aname" ]] || continue
     _task_agent_channel "$aname" || continue
-    local lines_main lines_manual
+    local lines_main lines_manual reminder_ids
+    reminder_ids=$(db "SELECT id FROM tasks WHERE ${_t2_where} AND assignee=$(sqlq "$aname")
+                       ORDER BY COALESCE(need_asked_at,updated_at),id;" | paste -sd, -)
     lines_main=$(db "SELECT '• /task_'||id||' ['||ident||'] '||need_type||', '||CAST(julianday('now')-julianday(COALESCE(need_asked_at,updated_at)) AS INT)||'d — '||substr(replace(COALESCE(ask,''), x'0a', ' '),1,90)
                      FROM tasks WHERE ${_t2_where} AND assignee=$(sqlq "$aname") AND need_type != 'manual'
                      ORDER BY COALESCE(need_asked_at,updated_at);")
@@ -902,7 +904,7 @@ _hb_gate_ttl_sweep() {
     [[ -n "$lines_main" ]] && text+=$'\n'"$lines_main"
     [[ -n "$lines_manual" ]] && text+=$'\n\n'"🛠 Manual steps — one ~15-min batch clears these:"$'\n'"$lines_manual"
     text+=$'\n\n'"Answer from the original alert's buttons, the dashboard, or tap a /task link. Re-pings weekly until answered."
-    _task_send_owner "$text" "" || true
+    _task_send_owner "$text" "" "$reminder_ids" || true
     # OSS-12: SLA escalation — walk the org chart. If any of this agent's stale
     # gates has aged past _HB_GATE_ESCALATE_DAYS, also loop in its org-chart
     # parent (agents_org.reports_to) so the gate escalates up the chain instead
@@ -921,10 +923,130 @@ _hb_gate_ttl_sweep() {
         _hb_log "[gate-ttl] escalated ${aname}'s stale gate(s) to org-parent ${_mgr}"
       fi
     fi
-    db "UPDATE tasks SET gate_pinged_at=datetime('now')
-        WHERE ${_t2_where} AND assignee=$(sqlq "$aname");"
-    _hb_log "[gate-ttl] stale-gate reminder batch sent for $aname"
+    if [[ "${TASK_SEND_DELIVERED:-0}" == "1" ]]; then
+      _hb_log "[gate-ttl] stale-gate reminder batch delivered for $aname; message_id=${TASK_SEND_MESSAGE_IDS:-unknown}"
+    else
+      _hb_log "[gate-ttl] stale-gate reminder delivery unconfirmed for $aname; receipt left unchanged"
+    fi
   done < <(db "SELECT DISTINCT COALESCE(assignee,'') FROM tasks WHERE ${_t2_where};")
+  return 0
+}
+
+# DIVE-1490: receipt-backed gate re-nags. A freshly filed gate gets one follow-
+# up after 1h; once a follow-up has been delivered, subsequent reminders are
+# 24h apart. Migration-free: gate_pinged_at is both the delivery receipt and
+# throttle stamp. An initial receipt is identifiable because it is before
+# need_asked_at+1h; a re-nag receipt is at/after that boundary. Failed sends are
+# deliberately NOT stamped, so the next heartbeat retries instead of silently
+# dropping the gate. T2 uses the filing agent's paired-human channel; T1 routes
+# through the existing org-lead resolver. One message/keyboard is built per
+# resolved recipient, regardless of how many gates are due.
+_HB_GATE_RENAG_WHERE="need_type IS NOT NULL AND need_answered_at IS NULL
+  AND status NOT IN ('done','cancelled') AND COALESCE(tier,2) != 0
+  AND COALESCE(need_asked_at,updated_at,created_at) <= datetime('now','-1 hour')
+  AND NOT (tier=1 AND recommend IS NOT NULL
+           AND COALESCE(need_asked_at,updated_at,created_at) <= datetime('now','-48 hours'))
+  AND (gate_pinged_at IS NULL
+       OR gate_pinged_at < datetime(COALESCE(need_asked_at,updated_at,created_at),'+1 hour')
+       OR gate_pinged_at <= datetime('now','-24 hours'))"
+
+_hb_gate_renag_batch() { # <recipient_agent> <comma-separated task ids> <route_label>
+  local recipient="$1" idlist="$2" route_label="$3"
+  [[ -n "$recipient" && "$idlist" =~ ^[0-9]+(,[0-9]+)*$ ]] || return 0
+  if ! _task_agent_channel "$recipient"; then
+    warn "gate re-nag for task rows ${idlist}: recipient ${recipient} has no paired channel; will retry next heartbeat"
+    _hb_log "[gate-renag] recipient ${recipient} has no paired channel for rows ${idlist}"
+    return 0
+  fi
+
+  local text="🔁 Gate reminder — unanswered gates (${route_label}):"
+  local rows='[]' row id ident ntype options recommend ask nonce="" markup=""
+  local -a nonce_ids=() nonce_hashes=()
+  while IFS= read -r row; do
+    [[ -n "$row" ]] || continue
+    IFS=$'\x1f' read -r id ident ntype options recommend ask <<<"$row"
+    [[ -n "$id" && -n "$ident" ]] || continue
+    text+=$'\n\n'"• [${ident}] ${ntype} — ${ask} /task_${id}"
+    [[ -n "$recommend" ]] && text+=$'\n'"  ✅ Recommended: ${recommend}"
+    [[ -n "$options" ]] && text+=$'\n'"  Options: ${options}"
+
+    nonce=""
+    case "$ntype" in
+      approval|secret|manual)
+        nonce=$(_human_nonce_mint)
+        if [[ -n "$nonce" ]]; then
+          nonce_ids+=("$id")
+          nonce_hashes+=("$(_human_nonce_sha "$nonce")")
+        fi
+        ;;
+    esac
+    markup=$(_task_gate_reply_markup "$id" "$ntype" "$options" "$recommend" "$nonce" "$TASK_CH_TYPE" "$ident")
+    if [[ -n "$markup" ]]; then
+      rows=$(jq -cn --argjson a "$rows" --argjson b "$markup" '$a + ($b.inline_keyboard // [])' 2>/dev/null) || rows='[]'
+    fi
+  done < <(db "SELECT id||x'1f'||ident||x'1f'||need_type||x'1f'||COALESCE(need_options,'')||x'1f'||COALESCE(recommend,'')||x'1f'||substr(replace(COALESCE(ask,''),x'0a',' '),1,240)
+               FROM tasks WHERE id IN (${idlist}) ORDER BY COALESCE(need_asked_at,updated_at,created_at),id;")
+
+  local reply_markup=""
+  [[ "$rows" != "[]" ]] && reply_markup=$(jq -cn --argjson rows "$rows" '{inline_keyboard:$rows}' 2>/dev/null) || true
+  text+=$'\n\n'"Tap a button, open /task links, or answer from the dashboard. First reminder is after 1h; later reminders are batched every 24h until answered."
+  _task_send_owner "$text" "$reply_markup" "$idlist"
+  if [[ "${TASK_SEND_DELIVERED:-0}" == "1" ]]; then
+    # Do not invalidate the original alert's nonce until the new button-bearing
+    # message has a confirmed receipt. The tiny post-ack/update interval is far
+    # safer than rotating the hash before a send that may never land.
+    local i
+    for (( i=0; i<${#nonce_ids[@]}; i++ )); do
+      db "UPDATE tasks SET human_nonce_hash=$(sqlq "${nonce_hashes[$i]}")
+          WHERE id=${nonce_ids[$i]} AND need_answered_at IS NULL;" 2>/dev/null || true
+    done
+    _hb_log "[gate-renag] delivered ${idlist} via ${recipient}; message_id=${TASK_SEND_MESSAGE_IDS:-unknown}"
+  else
+    _hb_log "[gate-renag] delivery unconfirmed for ${idlist} via ${recipient}; receipt left unchanged"
+  fi
+  return 0
+}
+
+_hb_gate_renag_sweep() {
+  [[ "${FIVEDIVE_GATE_RENAG:-1}" != "0" ]] || return 0
+  local owner ids
+
+  # T2/legacy hard-human gates: one batch per filing agent's bot. Different bots
+  # cannot be collapsed into one Telegram request, so this is the smallest real
+  # push cardinality while preserving channel ownership.
+  while IFS= read -r owner; do
+    [[ -n "$owner" ]] || continue
+    ids=$(db "SELECT id FROM tasks WHERE ${_HB_GATE_RENAG_WHERE}
+              AND COALESCE(tier,2)=2
+              AND COALESCE(NULLIF(created_by,''),assignee,'')=$(sqlq "$owner")
+              ORDER BY COALESCE(need_asked_at,updated_at,created_at),id;" | paste -sd, -)
+    [[ -n "$ids" ]] && _hb_gate_renag_batch "$owner" "$ids" "paired human"
+  done < <(db "SELECT DISTINCT COALESCE(NULLIF(created_by,''),assignee,'') FROM tasks
+               WHERE ${_HB_GATE_RENAG_WHERE} AND COALESCE(tier,2)=2;")
+
+  # T1 gates: group by the existing routed reviewer / org-lead resolution. A
+  # lead's own T1 gate uses the coordinator/root channel instead of escalating
+  # to the paired-human lane reserved for T2.
+  local grow gid filer reviewer routed
+  declare -A lead_ids=()
+  while IFS= read -r grow; do
+    [[ -n "$grow" ]] || continue
+    IFS=$'\x1f' read -r gid filer routed <<<"$grow"
+    reviewer="$routed"
+    [[ -n "$reviewer" ]] || reviewer=$(_gate_route_reviewer "$filer")
+    [[ -n "$reviewer" ]] || reviewer=$(_task_resolve_coordinator)
+    if [[ -z "$reviewer" ]]; then
+      warn "gate re-nag for task row ${gid}: no org lead resolved; will retry next heartbeat"
+      _hb_log "[gate-renag] no org lead for T1 row ${gid} (filer=${filer:-unknown})"
+      continue
+    fi
+    lead_ids[$reviewer]+="${lead_ids[$reviewer]:+,}${gid}"
+  done < <(db "SELECT id||x'1f'||COALESCE(NULLIF(created_by,''),assignee,'')||x'1f'||COALESCE(routed_reviewer,'')
+               FROM tasks WHERE ${_HB_GATE_RENAG_WHERE} AND tier=1
+               ORDER BY COALESCE(need_asked_at,updated_at,created_at),id;")
+  for reviewer in "${!lead_ids[@]}"; do
+    _hb_gate_renag_batch "$reviewer" "${lead_ids[$reviewer]}" "org lead"
+  done
   return 0
 }
 
@@ -1371,9 +1493,15 @@ cmd_heartbeat_tick() {
   # is eligible for the wake loop below this same tick. Isolated — a failure here
   # must never abort the wake loop.
   _hb_materialize_recurring "$now" || _hb_log "[materializer] pass errored (non-fatal)"
+  # DIVE-1490: receipt-backed reminder first, so an old gate whose initial send
+  # failed gets a button-bearing + group-fallback attempt before the legacy 72h
+  # text backlog can stamp it. Isolated so notification transport never aborts
+  # the worker wake loop.
+  _hb_gate_renag_sweep || _hb_log "[gate-renag] pass errored (non-fatal)"
   # DIVE-891: gate TTL + wake sweep, same isolation contract as the materializer
   # — runs before the wake loop so a just-unparked/just-unblocked todo is
-  # eligible for pickup this same tick.
+  # eligible for pickup this same tick. The renag's confirmed gate_pinged_at
+  # stamp also preserves pass 3's existing seven-day throttle (no duplicate).
   _hb_gate_ttl_sweep || _hb_log "[gate-ttl] pass errored (non-fatal)"
   # DIVE-1355: the belt-and-suspenders half of the self-dispatch fix. Auto-recover
   # any task still stuck 'blocked' whose every blocking edge is a done/cancelled

@@ -196,6 +196,15 @@ mirror_interagent_outbound() {
   _mirror_post "$token" "$group_chat_id" "$thread_id" "$mirror_text" "$access_file"
 }
 
+# Result globals consumed by load-bearing callers such as task gate delivery.
+# _mirror_post remains best-effort/return-0 for its many historical callers, but
+# these fields make the Bot API acknowledgement observable instead of treating a
+# curl exit (or an empty response) as delivery. DIVE-1490.
+MIRROR_POST_DELIVERED=0
+MIRROR_POST_MESSAGE_ID=""
+MIRROR_POST_CHAT=""
+MIRROR_POST_ERROR=""
+
 # POST a mirror message, threading into message_thread_id when set. Auto-follows
 # a group→supergroup migration: once a group is upgraded (which is also how it
 # gains forum topics), Telegram rejects sends to the old basic-group id with
@@ -204,17 +213,43 @@ mirror_interagent_outbound() {
 # of silently dying. Best-effort throughout — a mirror post is never load-bearing.
 _mirror_post() {
   local token="$1" chat="$2" thread="$3" text="$4" access_file="$5" reply_markup="${6:-}"
-  local resp
-  resp=$(_mirror_send "$token" "$chat" "$thread" "$text" "$reply_markup")
-  [[ -n "$resp" ]] || return 0
-  [[ "$(jq -r '.ok // false' <<<"$resp" 2>/dev/null)" == "true" ]] && return 0
+  MIRROR_POST_DELIVERED=0
+  MIRROR_POST_MESSAGE_ID=""
+  MIRROR_POST_CHAT="$chat"
+  MIRROR_POST_ERROR=""
+
+  local resp ok mid
+  # A transport failure is an ordinary negative delivery receipt, not a reason
+  # to trip the caller's `set -e`. Preserve any response body curl produced,
+  # then let the structured receipt/fallback path below handle the miss.
+  resp=$(_mirror_send "$token" "$chat" "$thread" "$text" "$reply_markup") || resp="${resp:-}"
+  ok=$(jq -r '.ok // false' <<<"$resp" 2>/dev/null) || ok=false
+  if [[ "$ok" == "true" ]]; then
+    mid=$(jq -r '.result.message_id // empty' <<<"$resp" 2>/dev/null) || mid=""
+    if [[ -n "$mid" ]]; then
+      MIRROR_POST_DELIVERED=1 MIRROR_POST_MESSAGE_ID="$mid"
+      return 0
+    fi
+    ok=false
+    MIRROR_POST_ERROR="Bot API returned ok:true without message_id"
+  fi
 
   local new_chat
   new_chat=$(jq -r '.parameters.migrate_to_chat_id // empty' <<<"$resp" 2>/dev/null)
   if [[ -n "$new_chat" && "$new_chat" != "$chat" ]]; then
     _mirror_follow_migration "$access_file" "$chat" "$new_chat"
-    _mirror_send "$token" "$new_chat" "$thread" "$text" "$reply_markup" >/dev/null 2>&1 || true
-    return 0
+    chat="$new_chat" MIRROR_POST_CHAT="$new_chat"
+    resp=$(_mirror_send "$token" "$chat" "$thread" "$text" "$reply_markup") || resp="${resp:-}"
+    ok=$(jq -r '.ok // false' <<<"$resp" 2>/dev/null) || ok=false
+    if [[ "$ok" == "true" ]]; then
+      mid=$(jq -r '.result.message_id // empty' <<<"$resp" 2>/dev/null) || mid=""
+      if [[ -n "$mid" ]]; then
+        MIRROR_POST_DELIVERED=1 MIRROR_POST_MESSAGE_ID="$mid"
+        return 0
+      fi
+      ok=false
+      MIRROR_POST_ERROR="Bot API returned ok:true without message_id"
+    fi
   fi
 
   # DIVE-117: the send failed for a non-migration reason. A button-bearing send
@@ -231,8 +266,30 @@ _mirror_post() {
   # a different (delivery) problem, not a button one.
   if [[ -n "$reply_markup" ]]; then
     _mirror_log_button_reject "$chat" "$thread" "$reply_markup" "$resp"
-    _mirror_send "$token" "$chat" "$thread" "$text" "" >/dev/null 2>&1 || true
+    resp=$(_mirror_send "$token" "$chat" "$thread" "$text" "") || resp="${resp:-}"
+    ok=$(jq -r '.ok // false' <<<"$resp" 2>/dev/null) || ok=false
+    if [[ "$ok" == "true" ]]; then
+      mid=$(jq -r '.result.message_id // empty' <<<"$resp" 2>/dev/null) || mid=""
+      if [[ -n "$mid" ]]; then
+        MIRROR_POST_DELIVERED=1 MIRROR_POST_MESSAGE_ID="$mid"
+        return 0
+      fi
+      ok=false
+      MIRROR_POST_ERROR="Bot API returned ok:true without message_id"
+    fi
   fi
+
+  if [[ -n "$MIRROR_POST_ERROR" ]]; then
+    :
+  elif [[ -n "$resp" ]]; then
+    MIRROR_POST_ERROR=$(jq -r '
+      "error_code=" + ((.error_code // "?")|tostring) +
+      " description=" + ((.description // "unknown Bot API rejection")|tostring)
+    ' <<<"$resp" 2>/dev/null) || MIRROR_POST_ERROR="malformed Bot API response"
+  else
+    MIRROR_POST_ERROR="transport failure: empty Bot API response"
+  fi
+  return 0
 }
 
 # DIVE-1338: emit ONE diagnostic line when a button-bearing gate ping is rejected

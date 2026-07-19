@@ -2385,7 +2385,76 @@ _gate_channel_proof_ok() {
   jq -e --arg c "$chat" '(.allowFrom // []) | index($c) != null' "$TASK_CH_ACCESS" >/dev/null 2>&1
 }
 
-# _task_send_owner — send ONE message ($1, optional reply_markup $2) to the
+# DIVE-1490: append a queryable delivery event for a gate alert. The purpose-
+# built notify log is group-writable for agent-filed gates (DIVE-1345), while
+# audit_log provides the tamper-evident event stream. Failures are ALSO loud on
+# stderr; an unanswered gate must never look delivered merely because curl ran.
+_task_gate_delivery_log() { # <ok|error> <task_ids> <chat> <message_id> <detail>
+  local result="$1" task_ids="$2" chat="$3" message_id="$4" detail="$5"
+  local idents="$task_ids"
+  if [[ "$task_ids" =~ ^[0-9]+(,[0-9]+)*$ ]]; then
+    idents=$(db "SELECT group_concat(ident, ',') FROM tasks WHERE id IN (${task_ids});" 2>/dev/null) || idents="$task_ids"
+  fi
+  [[ -n "$idents" ]] || idents="unknown"
+  detail=${detail//$'\n'/ }
+  local line
+  line=$(printf 'gate-delivery result=%s tasks=%s chat=%s message_id=%s detail=%q' \
+    "$result" "$idents" "${chat:-none}" "${message_id:-none}" "${detail:-none}")
+  local logf="${FIVEDIVE_GATE_NOTIFY_LOG:-/var/log/5dive/notify/gate-notify.log}"
+  if ( umask 0002; : >>"$logf" ) 2>/dev/null; then
+    chmod g+w "$logf" 2>/dev/null || true
+    printf '%s %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || echo '?')" "$line" >>"$logf" 2>/dev/null || true
+  fi
+  audit_log "gate delivery" "$result" "$([[ "$result" == "ok" ]] && echo 0 || echo 1)" -- \
+    "tasks=$idents" "chat=${chat:-none}" "message_id=${message_id:-none}" "detail=${detail:-none}" || true
+  [[ "$result" == "ok" ]] || warn "$idents: gate alert delivery FAILED for chat ${chat:-none} (${detail:-unknown}); trying a visible group fallback"
+}
+
+TASK_SEND_DELIVERED=0
+TASK_SEND_MESSAGE_IDS=""
+TASK_SEND_FAILED=0
+
+_task_post_owner_target() { # <token> <chat> <thread> <text> <access> <markup> <task_ids>
+  local token="$1" chat="$2" thread="$3" text="$4" access_file="$5" reply_markup="$6" task_ids="$7"
+  _mirror_post "$token" "$chat" "$thread" "$text" "$access_file" "$reply_markup"
+  if [[ "${MIRROR_POST_DELIVERED:-0}" == "1" ]]; then
+    TASK_SEND_DELIVERED=1
+    [[ -n "${MIRROR_POST_MESSAGE_ID:-}" ]] \
+      && TASK_SEND_MESSAGE_IDS+="${TASK_SEND_MESSAGE_IDS:+,}${MIRROR_POST_MESSAGE_ID}"
+    if [[ -n "$task_ids" ]]; then
+      _task_gate_delivery_log ok "$task_ids" "${MIRROR_POST_CHAT:-$chat}" "${MIRROR_POST_MESSAGE_ID:-}" "confirmed Bot API send"
+    fi
+  else
+    TASK_SEND_FAILED=1
+    if [[ -n "$task_ids" ]]; then
+      _task_gate_delivery_log error "$task_ids" "${MIRROR_POST_CHAT:-$chat}" "" "${MIRROR_POST_ERROR:-unconfirmed Bot API send}"
+    fi
+  fi
+}
+
+_task_send_owner_groups() { # <token> <access> <text> <markup> <task_ids> [exclude_chat]
+  local token="$1" access_file="$2" text="$3" reply_markup="$4" task_ids="$5" exclude_chat="${6:-}"
+  local groups n i g_chat g_thread
+  groups=$(jq -c '(.groups // {}) | to_entries' "$access_file" 2>/dev/null) || groups="[]"
+  n=$(jq 'length' <<<"$groups" 2>/dev/null) || n=0
+  n=${n:-0}
+  for (( i=0; i<n; i++ )); do
+    g_chat=$(jq -r ".[$i].key" <<<"$groups" 2>/dev/null) || continue
+    g_thread=$(jq -r ".[$i].value.message_thread_id // \"\"" <<<"$groups" 2>/dev/null) || g_thread=""
+    [[ -n "$g_chat" && "$g_chat" != "$exclude_chat" ]] || continue
+    _task_post_owner_target "$token" "$g_chat" "$g_thread" "$text" "$access_file" "$reply_markup" "$task_ids"
+  done
+}
+
+_task_stamp_confirmed_delivery() { # <comma-separated numeric task ids>
+  local task_ids="$1"
+  [[ "${TASK_SEND_DELIVERED:-0}" == "1" && "$task_ids" =~ ^[0-9]+(,[0-9]+)*$ ]] || return 0
+  db "UPDATE tasks SET gate_pinged_at=datetime('now')
+      WHERE id IN (${task_ids}) AND need_type IS NOT NULL AND need_answered_at IS NULL;" 2>/dev/null || true
+}
+
+# _task_send_owner — send ONE message ($1, optional reply_markup $2, optional
+# comma-separated task row ids $3) to the
 # paired human, using the channel resolved by _task_owner_channel. Routing
 # (DIVE-259, Mark): follow the conversation — if the telegram plugin recorded
 # where the human last talked to this agent (last-human-chat.json beside
@@ -2394,10 +2463,13 @@ _gate_channel_proof_ok() {
 # must never widen the audience). No pointer (plugin predates the feature) =
 # legacy flow: human DMs first (allowFrom — exactly the users who /started
 # the bot), then the agent's bound forum topic(s) so nothing is silently
-# lost. Always returns 0 (best-effort).
+# lost. A Bot API {ok:true} is required before task ids are stamped delivered;
+# failures are logged loudly and retry against an allowed group topic. Always
+# returns 0 (best-effort); TASK_SEND_DELIVERED exposes the receipt to callers.
 _task_send_owner() {
-  local text="$1" reply_markup="${2:-}"
+  local text="$1" reply_markup="${2:-}" task_ids="${3:-}"
   local token="$TASK_CH_TOKEN" access_file="$TASK_CH_ACCESS"
+  TASK_SEND_DELIVERED=0 TASK_SEND_MESSAGE_IDS="" TASK_SEND_FAILED=0
 
   local ptr_file="${access_file%/*}/last-human-chat.json"
   if [[ -r "$ptr_file" ]]; then
@@ -2406,38 +2478,41 @@ _task_send_owner() {
     p_thread=$(jq -r '.messageThreadId // empty' "$ptr_file" 2>/dev/null) || p_thread=""
     if [[ -n "$p_chat" ]]; then
       if jq -e --arg c "$p_chat" '(.allowFrom // []) | index($c) != null' "$access_file" >/dev/null 2>&1; then
-        _mirror_post "$token" "$p_chat" "" "$text" "$access_file" "$reply_markup"
+        _task_post_owner_target "$token" "$p_chat" "" "$text" "$access_file" "$reply_markup" "$task_ids"
+        [[ "$TASK_SEND_DELIVERED" == "1" ]] || _task_send_owner_groups "$token" "$access_file" "$text" "$reply_markup" "$task_ids"
+        _task_stamp_confirmed_delivery "$task_ids"
         return 0
       fi
       if jq -e --arg c "$p_chat" '(.groups // {}) | has($c)' "$access_file" >/dev/null 2>&1; then
-        _mirror_post "$token" "$p_chat" "$p_thread" "$text" "$access_file" "$reply_markup"
+        _task_post_owner_target "$token" "$p_chat" "$p_thread" "$text" "$access_file" "$reply_markup" "$task_ids"
+        [[ "$TASK_SEND_DELIVERED" == "1" ]] || _task_send_owner_groups "$token" "$access_file" "$text" "$reply_markup" "$task_ids" "$p_chat"
+        _task_stamp_confirmed_delivery "$task_ids"
         return 0
       fi
       # Pointer references a chat that is no longer allowed — ignore it.
     fi
   fi
 
-  local dms sent=0 chat
+  local dms attempted=0 chat
   dms=$(jq -r '(.allowFrom // [])[]' "$access_file" 2>/dev/null) || dms=""
   if [[ -n "$dms" ]]; then
     while IFS= read -r chat; do
       [[ -n "$chat" ]] || continue
-      _mirror_post "$token" "$chat" "" "$text" "$access_file" "$reply_markup"
-      sent=1
+      _task_post_owner_target "$token" "$chat" "" "$text" "$access_file" "$reply_markup" "$task_ids"
+      attempted=1
     done <<<"$dms"
   fi
-  if (( ! sent )); then
-    local groups n i g_chat g_thread
-    groups=$(jq -c '(.groups // {}) | to_entries' "$access_file" 2>/dev/null) || groups="[]"
-    n=$(jq 'length' <<<"$groups" 2>/dev/null) || n=0
-    n=${n:-0}
-    for (( i=0; i<n; i++ )); do
-      g_chat=$(jq -r ".[$i].key" <<<"$groups" 2>/dev/null) || continue
-      g_thread=$(jq -r ".[$i].value.message_thread_id // \"\"" <<<"$groups" 2>/dev/null) || g_thread=""
-      [[ -n "$g_chat" ]] || continue
-      _mirror_post "$token" "$g_chat" "$g_thread" "$text" "$access_file" "$reply_markup"
-    done
+  # No DM target, or at least one DM rejected: post once per configured group so
+  # the alert lands somewhere visible. A partial DM failure still falls back —
+  # every allowlisted owner should have a recovery surface.
+  if (( ! attempted )) || [[ "$TASK_SEND_FAILED" == "1" ]]; then
+    _task_send_owner_groups "$token" "$access_file" "$text" "$reply_markup" "$task_ids"
   fi
+  if (( ! attempted )) && [[ "$TASK_SEND_DELIVERED" != "1" && -n "$task_ids" ]]; then
+    TASK_SEND_FAILED=1
+    _task_gate_delivery_log error "$task_ids" "" "" "no allowlisted DM or deliverable group topic"
+  fi
+  _task_stamp_confirmed_delivery "$task_ids"
   return 0
 }
 
@@ -2506,16 +2581,58 @@ _task_mint_drop_link() {
   echo "${url}|${ttl:-15}"
 }
 
+# Render the canonical tap keyboard for one gate. Kept separate from the alert
+# prose so heartbeat re-nags can combine N gates into one message without
+# drifting from the callback contract used by the initial task-need alert.
+_task_gate_reply_markup() { # <row_id> <type> <options> <recommend> <nonce> <channel_type> [label]
+  local numid="$1" need_type="$2" options="$3" recommend="$4" human_nonce="$5" channel_type="$6" label="${7:-}"
+  [[ -n "$label" ]] && label="[${label}] "
+  local np=""; [[ -n "$human_nonce" ]] && np=":${human_nonce}"
+  local reply_markup=""
+  if [[ "$channel_type" =~ ^(claude|codex|grok|antigravity)$ ]]; then
+    if [[ "$need_type" == "decision" && -n "$options" ]]; then
+      reply_markup=$(printf '%s' "$options" | jq -Rc --arg id "$numid" --arg r "$recommend" --arg p "$label" '
+        ($r | gsub("^\\s+|\\s+$"; "")) as $rr
+        | [ split("|")[] | gsub("^\\s+|\\s+$"; "") | select(length > 0) ] as $o
+        | ($o | to_entries
+           | sort_by(.value == $rr and ($rr|length)>0 | not)
+           | reduce .[] as $e ({rows: [], cur: [], w: 0};
+               (($e.value | length) + (if $e.value == $rr and ($rr|length)>0 then 2 else 0 end)) as $len
+               | {text: ($p + (if $e.value == $rr and ($rr|length)>0 then "⭐ " + $e.value else $e.value end)), callback_data: ("tna:" + $id + ":" + ($e.key | tostring))} as $btn
+               | if (.cur | length) > 0 and ((.cur | length) >= 3 or (.w + $len + 2) > 24)
+                 then {rows: (.rows + [.cur]), cur: [$btn], w: $len}
+                 else {rows: .rows, cur: (.cur + [$btn]), w: (.w + $len + 2)}
+                 end)
+           | .rows + (if (.cur | length) > 0 then [.cur] else [] end)) as $kb
+        | if ($kb | length) > 0 then {inline_keyboard: $kb} else empty end' 2>/dev/null) || reply_markup=""
+    elif [[ "$need_type" == "approval" ]]; then
+      local rl; rl=$(printf '%s' "$recommend" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')
+      local appr='{"text":"'"${label}"'✅ Approve","callback_data":"tna:'"${numid}"':approved'"${np}"'"}'
+      local deny='{"text":"'"${label}"'🚫 Deny","callback_data":"tna:'"${numid}"':denied'"${np}"'"}'
+      case "$rl" in
+        approve|approved) appr='{"text":"'"${label}"'⭐ ✅ Approve","callback_data":"tna:'"${numid}"':approved'"${np}"'"}'
+                          reply_markup='{"inline_keyboard":[['"$appr"','"$deny"']]}' ;;
+        deny|denied)      deny='{"text":"'"${label}"'⭐ 🚫 Deny","callback_data":"tna:'"${numid}"':denied'"${np}"'"}'
+                          reply_markup='{"inline_keyboard":[['"$deny"','"$appr"']]}' ;;
+        *)                reply_markup='{"inline_keyboard":[['"$appr"','"$deny"']]}' ;;
+      esac
+    elif [[ "$need_type" == "secret" ]]; then
+      reply_markup='{"inline_keyboard":[[{"text":"'"${label}"'✅ Provided","callback_data":"tna:'"${numid}"':provided'"${np}"'"}]]}'
+    elif [[ "$need_type" == "manual" ]]; then
+      reply_markup='{"inline_keyboard":[[{"text":"'"${label}"'✅ Done","callback_data":"tna:'"${numid}"':done'"${np}"'"}]]}'
+    fi
+  fi
+  printf '%s' "$reply_markup"
+}
+
 task_need_notify() {
   local ident="$1" need_type="$2" ask="$3" options="$4" recommend="${5:-}"
   local secret_key="${6:-}" connector="${7:-}" human_nonce="${8:-}"
   local precedent_cite="${9:-}"  # OSS-11: prior-answer citation, empty if none
-  # DIVE-916: callback_data suffix carrying the raw per-gate nonce for the tap
-  # paths (approval/secret/manual). Empty for decision (agent-clearable, no
-  # nonce) so its `tna:<id>:<idx>` payload is byte-unchanged. The plugin `tna:`
-  # handler treats a present 4th `:`-field as --human-proof.
-  local _np=""; [[ -n "$human_nonce" ]] && _np=":${human_nonce}"
-
+  # The delivery helper accepts numeric task row ids so it can stamp exactly the
+  # alert(s) confirmed by Telegram. Resolve before channel routing so even a
+  # total no-channel failure can be recorded against the gate.
+  local numid; numid=$(db "SELECT id FROM tasks WHERE ident=$(sqlq "$ident");")
   # Resolve bot token + the human's DM/group targets (TASK_CH_* globals). The
   # matched access type (TASK_CH_TYPE) gates the tap-to-answer buttons below.
   # DIVE-1243: never DROP a gate alert silently. The filing agent being unpaired
@@ -2532,6 +2649,7 @@ task_need_notify() {
       warn "$ident: gate alert routed to org lead ${_fb} (filing agent unpaired)"
     else
       warn "$ident: no lead channel either — gate recorded, visible only on the dashboard 'Needs you' card"
+      _task_gate_delivery_log error "$numid" "" "" "filing agent and org lead have no paired channel"
       return 0
     fi
   fi
@@ -2543,8 +2661,6 @@ task_need_notify() {
   # number, which diverges from the row id once a non-default project consumes
   # global ids (DIVE-484/DIVE-561), and for a non-DIVE prefix wouldn't strip at
   # all — either way the tap would resolve the WRONG row (DIVE-561).
-  local numid; numid=$(db "SELECT id FROM tasks WHERE ident=$(sqlq "$ident");")
-
   # One message. Blank lines separate the header / ask / options so a long ask
   # doesn't render as an unreadable wall on mobile. No footer: tap buttons cover
   # decision/approval, and button-less gates (secret/manual) still surface on
@@ -2629,56 +2745,11 @@ task_need_notify() {
   # option. Filtering empties also avoids an empty-text button (Telegram rejects
   # it, which would 400 the whole message — see the text-fallback in
   # _mirror_post). If nothing survives the filter, emit no keyboard (plain text).
-  local reply_markup=""
-  if [[ "$TASK_CH_TYPE" =~ ^(claude|codex|grok|antigravity)$ ]]; then
-    if [[ "$need_type" == "decision" && -n "$options" ]]; then
-      # Adaptive layout: greedily pack buttons onto a row up to a ~24-char width
-      # budget (max 3 per row), so SHORT options share a row while a LONG label
-      # breaks onto its own full-width row instead of being cropped. A single
-      # over-budget label still lands alone (we always seat the first button of
-      # an empty row). Index (to_entries .key) is the tna: payload, unchanged.
-      # DIVE-148: ⭐-prefix the recommended option's button and sort it first so
-      # the human's eye lands on it. callback_data keeps the ORIGINAL option
-      # index (.key) — the tna: handler resolves the value by that index into
-      # need_options, so reordering the display must not renumber the payload.
-      reply_markup=$(printf '%s' "$options" | jq -Rc --arg id "$numid" --arg r "$recommend" '
-        ($r | gsub("^\\s+|\\s+$"; "")) as $rr
-        | [ split("|")[] | gsub("^\\s+|\\s+$"; "") | select(length > 0) ] as $o
-        | ($o | to_entries
-           | sort_by(.value == $rr and ($rr|length)>0 | not)
-           | reduce .[] as $e ({rows: [], cur: [], w: 0};
-               (($e.value | length) + (if $e.value == $rr and ($rr|length)>0 then 2 else 0 end)) as $len
-               | {text: (if $e.value == $rr and ($rr|length)>0 then "⭐ " + $e.value else $e.value end), callback_data: ("tna:" + $id + ":" + ($e.key | tostring))} as $btn
-               | if (.cur | length) > 0 and ((.cur | length) >= 3 or (.w + $len + 2) > 24)
-                 then {rows: (.rows + [.cur]), cur: [$btn], w: $len}
-                 else {rows: .rows, cur: (.cur + [$btn]), w: (.w + $len + 2)}
-                 end)
-           | .rows + (if (.cur | length) > 0 then [.cur] else [] end)) as $kb
-        | if ($kb | length) > 0 then {inline_keyboard: $kb} else empty end' 2>/dev/null) || reply_markup=""
-    elif [[ "$need_type" == "approval" ]]; then
-      # DIVE-148: ⭐-mark whichever button the agent recommended (approved/denied)
-      # and seat it first. Default order (Approve, Deny) when no recommendation.
-      local _rl; _rl=$(printf '%s' "$recommend" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')
-      # DIVE-916: ${_np} appends :<nonce> so the tap carries --human-proof.
-      local _appr='{"text":"✅ Approve","callback_data":"tna:'"${numid}"':approved'"${_np}"'"}'
-      local _deny='{"text":"🚫 Deny","callback_data":"tna:'"${numid}"':denied'"${_np}"'"}'
-      case "$_rl" in
-        approve|approved) _appr='{"text":"⭐ ✅ Approve","callback_data":"tna:'"${numid}"':approved'"${_np}"'"}'
-                          reply_markup='{"inline_keyboard":[['"$_appr"','"$_deny"']]}' ;;
-        deny|denied)      _deny='{"text":"⭐ 🚫 Deny","callback_data":"tna:'"${numid}"':denied'"${_np}"'"}'
-                          reply_markup='{"inline_keyboard":[['"$_deny"','"$_appr"']]}' ;;
-        *)                reply_markup='{"inline_keyboard":[['"$_appr"','"$_deny"']]}' ;;
-      esac
-    elif [[ "$need_type" == "secret" ]]; then
-      # DIVE-356: one-tap "Provided" — the plugin handler runs `task answer <id>`
-      # with NO value (the CLI rejects a value for a secret gate). Matches dev's
-      # tna:<numid>:provided contract. DIVE-916: ${_np} appends the nonce.
-      reply_markup='{"inline_keyboard":[[{"text":"✅ Provided","callback_data":"tna:'"${numid}"':provided'"${_np}"'"}]]}'
-    elif [[ "$need_type" == "manual" ]]; then
-      # DIVE-356: one-tap "Done" — handler runs `task answer <id> --value=done`.
-      reply_markup='{"inline_keyboard":[[{"text":"✅ Done","callback_data":"tna:'"${numid}"':done'"${_np}"'"}]]}'
-    fi
-  fi
+  # DIVE-1490: the initial alert and every re-nag share this exact renderer, so
+  # option indexing, recommendation ordering, nonce handling, and the plugin
+  # allowlist cannot drift between first delivery and subsequent reminders.
+  local reply_markup
+  reply_markup=$(_task_gate_reply_markup "$numid" "$need_type" "$options" "$recommend" "$human_nonce" "$TASK_CH_TYPE")
 
   # DIVE-894: no tap buttons landed (non-tna channel type, or no valid options)
   # — a decision/approval gate would otherwise render with no way to act on a
@@ -2690,7 +2761,7 @@ task_need_notify() {
     esac
   fi
 
-  _task_send_owner "$text" "$reply_markup"
+  _task_send_owner "$text" "$reply_markup" "$numid"
   return 0
 }
 

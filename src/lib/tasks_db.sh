@@ -222,8 +222,10 @@ CREATE TABLE IF NOT EXISTS tasks (
   -- cmd_task_need, not trusted from the filer. NULL = legacy gate, treated as
   -- tier 2 (never auto-cleared). need_asked_at stamps gate filing time — the
   -- TTL clock (updated_at is useless for this: any row touch bumps it).
-  -- gate_pinged_at = last time a TTL reminder batch included this gate, so the
-  -- sweep re-pings weekly instead of every tick. wake_at: a parked task
+  -- gate_pinged_at = last CONFIRMED Bot API delivery for this gate (initial,
+  -- 1h/24h re-nag, or legacy TTL batch). It is both the queryable receipt and
+  -- migration-free throttle stamp; failed/unconfirmed sends leave it unchanged.
+  -- wake_at: a parked task
   -- (task park --wake=...) auto-unparks when the heartbeat passes this time.
   tier                INTEGER,
   need_asked_at       TEXT,
