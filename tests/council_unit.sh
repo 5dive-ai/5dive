@@ -11,7 +11,7 @@ if ! command -v node >/dev/null 2>&1; then
 fi
 
 rc=0
-for h in council_engine_unit.mjs council_cli_contract.mjs council_dispatch_unit.mjs; do
+for h in council_engine_unit.mjs council_cli_contract.mjs council_dispatch_unit.mjs council_cosign_unit.mjs; do
   echo "=== tests/$h"
   if ! node "tests/$h"; then echo "FAILED: tests/$h"; rc=1; fi
 done
@@ -26,5 +26,9 @@ if ! bash "tests/council_veto_e2e.sh"; then echo "FAILED: tests/council_veto_e2e
 # isolated STATE_DIR + TASKS_DB). Same self-SKIP-when-can't-seal posture as the veto e2e.
 echo "=== tests/council_gate_e2e.sh"
 if ! bash "tests/council_gate_e2e.sh"; then echo "FAILED: tests/council_gate_e2e.sh"; rc=1; fi
+# CNCL-10: per-seat co-signed-votes e2e over REAL on-disk Ed25519 keys (0600 owner-only perms +
+# honest verify + forge/replay/revoked all rejected). Offline, no seal/sudo needed — always gates.
+echo "=== tests/council_cosign_e2e.sh"
+if ! bash "tests/council_cosign_e2e.sh"; then echo "FAILED: tests/council_cosign_e2e.sh"; rc=1; fi
 
 exit $rc

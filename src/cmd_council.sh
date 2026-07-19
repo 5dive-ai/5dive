@@ -107,6 +107,8 @@ _council_write_runtime() {
 // invariant: a council NEVER self-clears a hard-gate class (tier>=2 or a human-only
 // type) — it escalates, fail-closed on a missing tier.
 
+import { createHash, generateKeyPairSync, sign as edSign, verify as edVerify, createPrivateKey, createPublicKey } from 'node:crypto'
+
 // ==================== PURE LOGIC (the ported contract — auditable, offline-testable) ====================
 export const HUMAN_ONLY_TYPES = ['secret', 'approval', 'manual', 'access']
 
@@ -1061,6 +1063,129 @@ function finish(role, input, base) {
   }
   return out
 }
+
+// ==================== CNCL-10: per-seat Ed25519 CO-SIGNED VOTES ====================
+//
+// The CNCL-6 receipt root-signs the WHOLE transcript with the ROOT gate-proof key — it proves
+// the convener recorded these bytes, but NOTHING proves each seat actually cast its own vote:
+// the convener assembles the vote rows and could forge or edit any of them before the seal.
+// CNCL-10 closes that: every seat holds its OWN Ed25519 keypair and SIGNS its vote AT SOURCE
+// (inside its own harness, before the vote leaves the agent). The convener holds no other
+// seat's private key, so it can neither forge a vote nor alter one without breaking the sig.
+//
+// REPLAY PROOF: the signed bytes bind the CONVENE ID + the QUESTION DIGEST, so a seat's signed
+// "approve" from an old convene fails verification in a new one (different convene id / digest).
+// The verifier recomputes the expected preimage from the CURRENT convene context + the vote's
+// own (seat, vote, rationale, stampedAt) — it never trusts a vote's self-reported convene/digest.
+//
+// KEY LIFECYCLE (bash layer owns the on-disk side): a keypair is issued at init/promote; the
+// public key + fingerprint live in the roster; the private key is 0600, owner-only (agent-<name>,
+// NOT the shared `claude` group — that group holds every agent and would leak the key). A demote
+// REVOKES the key (fingerprint + revocation stamped in the lineage); compromise = revoke+reissue.
+// A revoked seat's vote is rejected by verifyReceiptVotes even if the signature is cryptographically
+// valid, so a demoted seat can no longer sway a convene.
+//
+// The receipt bundles the co-signed vote rows; the existing ROOT HMAC seal (canonicalTranscript)
+// sits on top unchanged. `council verify` re-checks EVERY seat signature against the roster pubkeys
+// AND revocation AND the root seal — all three must pass for a green receipt.
+
+const _cnorm = (s) => String(s == null ? '' : s).replace(/\s+/g, ' ').trim()
+function _b64url(buf) { return Buffer.from(buf).toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '') }
+function _b64urlDecode(str) { const s = String(str || '').replace(/-/g, '+').replace(/_/g, '/'); return Buffer.from(s, 'base64') }
+
+// Deterministic sha256 (hex) of the normalized question — the replay-binding digest a seat signs.
+export function questionDigest(question) {
+  return createHash('sha256').update(_cnorm(question), 'utf8').digest('hex')
+}
+
+// Deterministic, whitespace-normalized preimage of ONE seat's vote — the exact bytes the seat
+// signs at source and the verifier recomputes. Binds seat + position(vote) + reasoning(rationale)
+// + ts(stampedAt) + CONVENE ID + QUESTION DIGEST. A v1 tag guards against a future format swap.
+export function canonicalVoteBytes(v) {
+  return [
+    'council-vote v1',
+    `convene: ${_cnorm(v.conveneId)}`,
+    `qdigest: ${_cnorm(v.questionDigest)}`,
+    `seat: ${_cnorm(v.seat)}`,
+    `vote: ${_cnorm(v.vote)}`,
+    `rationale: ${_cnorm(v.rationale)}`,
+    `stampedAt: ${_cnorm(v.stampedAt)}`,
+  ].join('\n')
+}
+
+// sha256(pubkey)[:16] — the short human-readable key fingerprint stored in the roster + lineage.
+export function fingerprintOf(pub) {
+  return createHash('sha256').update(String(pub || ''), 'utf8').digest('hex').slice(0, 16)
+}
+
+// Mint a fresh per-seat Ed25519 keypair. Returns the PUBLIC key (base64url SPKI-DER, roster-safe),
+// its fingerprint, and the PRIVATE key as a PKCS8 PEM string — the bash layer writes the PEM 0600
+// owner-only and stores only {pub, fingerprint} in the roster. No clock, no randomness seam needed
+// (generateKeyPairSync is the platform CSPRNG). Never log or persist the PEM anywhere world/group
+// readable.
+export function generateSeatKeypair() {
+  const { publicKey, privateKey } = generateKeyPairSync('ed25519')
+  const pub = _b64url(publicKey.export({ type: 'spki', format: 'der' }))
+  const privPem = privateKey.export({ type: 'pkcs8', format: 'pem' }).toString()
+  return { pub, privPem, fingerprint: fingerprintOf(pub) }
+}
+
+// Raw Ed25519 sign/verify over a preimage string. Sign returns a base64url signature; verify is
+// fail-closed (any malformed key/sig/bytes -> false, never a throw that could be read as "valid").
+export function signBytes(bytes, privPem) {
+  const key = createPrivateKey(privPem)
+  return _b64url(edSign(null, Buffer.from(String(bytes), 'utf8'), key))
+}
+export function verifyBytes(bytes, sigB64, pub) {
+  try {
+    const key = createPublicKey({ key: _b64urlDecode(pub), format: 'der', type: 'spki' })
+    return edVerify(null, Buffer.from(String(bytes), 'utf8'), key, _b64urlDecode(sigB64))
+  } catch { return false }
+}
+
+// SIGN-AT-SOURCE: a seat signs its own vote with its OWN private key before the vote leaves the
+// agent. `ctx` carries the convene binding {conveneId, questionDigest}; `vote` is {seat, vote,
+// rationale, stampedAt}. Returns the vote row plus {sig, sigAlg, fingerprint}. This runs inside
+// the seat's harness (via `5dive council sign-vote`), NEVER on the convener.
+export function signSeatVote(vote, ctx, privPem, fingerprint = '') {
+  const bytes = canonicalVoteBytes({
+    conveneId: ctx.conveneId, questionDigest: ctx.questionDigest,
+    seat: vote.seat, vote: vote.vote, rationale: vote.rationale, stampedAt: vote.stampedAt,
+  })
+  return { ...vote, sig: signBytes(bytes, privPem), sigAlg: 'ed25519', ...(fingerprint ? { fingerprint } : {}) }
+}
+
+// Verify ONE co-signed vote against the roster. Recomputes the preimage from the CURRENT convene
+// context (ctx.conveneId + ctx.questionDigest) so a vote signed for another convene/question fails
+// (replay). Fail-closed: no roster key, revoked key, missing sig, or a non-matching signature all
+// return ok=false with a reason. An ABSTAIN is a recorded non-vote (a dead/silent seat that never
+// signed): it is allowed unsigned but carries no weight — flagged abstain=true, ok=true.
+export function verifySeatVote(signedVote, ctx, roster = {}) {
+  const seat = signedVote && signedVote.seat
+  if (signedVote && signedVote.vote === 'abstain' && !signedVote.sig) {
+    return { seat, ok: true, abstain: true, reason: 'abstain (unsigned non-vote)' }
+  }
+  const entry = roster[seat]
+  if (!entry || !entry.pub) return { seat, ok: false, reason: `no roster key for seat "${seat}"` }
+  if (entry.revokedAt) return { seat, ok: false, reason: `seat "${seat}" key was revoked (${_cnorm(entry.revokedAt)})` }
+  if (!signedVote.sig) return { seat, ok: false, reason: `vote from "${seat}" is unsigned` }
+  const bytes = canonicalVoteBytes({
+    conveneId: ctx.conveneId, questionDigest: ctx.questionDigest,
+    seat: signedVote.seat, vote: signedVote.vote, rationale: signedVote.rationale, stampedAt: signedVote.stampedAt,
+  })
+  const ok = verifyBytes(bytes, signedVote.sig, entry.pub)
+  return { seat, ok, reason: ok ? '' : `signature does not verify for "${seat}" (forged, edited, replayed, or wrong key)` }
+}
+
+// Re-check EVERY co-signed vote in a receipt against the roster pubkeys + revocation. Returns
+// { ok, results, badSeats } — ok iff every non-abstain vote carries a valid, non-revoked signature
+// bound to THIS convene. This is the per-seat half of `council verify`; the root HMAC seal is the
+// other half (bash re-signs canonicalTranscript). Both must pass for a green receipt.
+export function verifyReceiptVotes(votes, ctx, roster = {}) {
+  const results = (votes || []).map(v => verifySeatVote(v, ctx, roster))
+  const badSeats = results.filter(r => !r.ok).map(r => r.seat)
+  return { ok: badSeats.length === 0, results, badSeats }
+}
 COUNCIL_ENGINE_MJS
   cat > "$dir/cli.mjs" <<'COUNCIL_CLI_MJS'
 #!/usr/bin/env node
@@ -1478,6 +1603,53 @@ function cmdGateMap() {
   out({ phase: 'action', ...(triage ? E.triageVerdictToAction(gate, verdict) : E.verdictToAction(gate, verdict)) })
 }
 
+// ---- CNCL-10: per-seat co-signed votes ------------------------------------
+// SIGN-AT-SOURCE: a seat runs this INSIDE its own harness to sign its vote before it leaves the
+// agent. bash resolves the seat's OWN private key (0600, owner-only) and passes --key-file; cli
+// never fetches another seat's key. The convene binding (--convene + the question digest) is in
+// the signed bytes, so the signature is replay-proof. Emits the `COUNCIL-SIG:` line the seat pastes
+// after its COUNCIL-VOTE line (--emit=line, the dispatch default) or the full JSON row (--emit=json).
+function cmdSignVote() {
+  const seat = flag('seat'); if (!seat || seat === true) die('sign-vote needs --seat=<id>')
+  const vote = flag('vote'); if (!['approve', 'reject', 'escalate', 'abstain'].includes(vote)) die('sign-vote needs --vote=<approve|reject|escalate|abstain>')
+  const conveneId = flag('convene'); if (!conveneId || conveneId === true) die('sign-vote needs --convene=<convene id> (replay binding)')
+  // The digest binds the exact question. Accept a precomputed --qdigest (bash passes it from the
+  // convene) or compute it here from --question. One is required — never sign an unbound vote.
+  let qdigest = flag('qdigest')
+  if (!qdigest || qdigest === true) { const q = flag('question'); if (!q || q === true) die('sign-vote needs --qdigest=<hex> or --question=<text>'); qdigest = E.questionDigest(q) }
+  const keyFile = flag('key-file'); if (!keyFile || keyFile === true) die('sign-vote needs --key-file=<path to the seat PKCS8 PEM> ("-" for stdin)')
+  let privPem
+  try { privPem = keyFile === '-' ? fs.readFileSync(0, 'utf-8') : fs.readFileSync(keyFile, 'utf-8') }
+  catch (e) { die(`sign-vote cannot read the seat key: ${String(e && e.message || e)}`) }
+  const row = { seat, vote, rationale: flag('rationale') === true || flag('rationale') == null ? `(${vote})` : String(flag('rationale')), stampedAt: flag('stamped-at') === true ? '' : (flag('stamped-at') || '') }
+  const fp = flag('fingerprint') === true ? '' : (flag('fingerprint') || '')
+  let signed
+  try { signed = E.signSeatVote(row, { conveneId: String(conveneId), questionDigest: String(qdigest) }, privPem, fp) }
+  catch (e) { die(`sign-vote failed to sign: ${String(e && e.message || e)}`) }
+  if (flag('emit') === 'json') { out(signed); return }
+  process.stdout.write(`COUNCIL-SIG: ${signed.sig}\n`)   // the line a seat pastes after COUNCIL-VOTE
+}
+
+// VERIFY-VOTES (the per-seat half of `council verify`): re-check EVERY co-signed vote against the
+// roster pubkeys + revocation, bound to THIS convene (replay-proof). bash re-checks the ROOT seal
+// separately; both must be green. --votes + --roster are JSON (inline or @file). Exits non-zero if
+// any non-abstain vote is unsigned/forged/replayed/revoked — so a caller can gate on the exit code.
+function cmdVerifyVotes() {
+  const readJson = (v, what) => {
+    if (!v || v === true) die(`verify-votes needs --${what}=<json or @file>`)
+    try { return JSON.parse(String(v).startsWith('@') ? fs.readFileSync(String(v).slice(1), 'utf-8') : v) }
+    catch (e) { die(`verify-votes: bad --${what} json: ${String(e && e.message || e)}`) }
+  }
+  const votes = readJson(flag('votes'), 'votes')
+  const roster = readJson(flag('roster'), 'roster')
+  const conveneId = flag('convene'); if (!conveneId || conveneId === true) die('verify-votes needs --convene=<convene id>')
+  let qdigest = flag('qdigest')
+  if (!qdigest || qdigest === true) { const q = flag('question'); if (!q || q === true) die('verify-votes needs --qdigest=<hex> or --question=<text>'); qdigest = E.questionDigest(q) }
+  const res = E.verifyReceiptVotes(votes, { conveneId: String(conveneId), questionDigest: String(qdigest) }, roster)
+  out({ ok: res.ok, badSeats: res.badSeats, results: res.results })
+  process.exit(res.ok ? 0 : 5)
+}
+
 const main = async () => {
   if (sub === 'convene') return cmdConvene()
   if (sub === 'bench') return cmdBench()
@@ -1486,7 +1658,9 @@ const main = async () => {
   if (sub === 'gate-map') return cmdGateMap()
   if (sub === 'seal-augment') return cmdSealAugment()
   if (sub === 'read-binding') return cmdReadBinding()
-  die(`unknown council subcommand: ${sub} (convene|bench|init|veto|gate-map|seal-augment|read-binding)`)
+  if (sub === 'sign-vote') return cmdSignVote()
+  if (sub === 'verify-votes') return cmdVerifyVotes()
+  die(`unknown council subcommand: ${sub} (convene|bench|init|veto|gate-map|seal-augment|read-binding|sign-vote|verify-votes)`)
 }
 main().catch(e => die(String(e && e.message || e), 1))
 COUNCIL_CLI_MJS

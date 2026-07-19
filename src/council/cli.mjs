@@ -413,6 +413,53 @@ function cmdGateMap() {
   out({ phase: 'action', ...(triage ? E.triageVerdictToAction(gate, verdict) : E.verdictToAction(gate, verdict)) })
 }
 
+// ---- CNCL-10: per-seat co-signed votes ------------------------------------
+// SIGN-AT-SOURCE: a seat runs this INSIDE its own harness to sign its vote before it leaves the
+// agent. bash resolves the seat's OWN private key (0600, owner-only) and passes --key-file; cli
+// never fetches another seat's key. The convene binding (--convene + the question digest) is in
+// the signed bytes, so the signature is replay-proof. Emits the `COUNCIL-SIG:` line the seat pastes
+// after its COUNCIL-VOTE line (--emit=line, the dispatch default) or the full JSON row (--emit=json).
+function cmdSignVote() {
+  const seat = flag('seat'); if (!seat || seat === true) die('sign-vote needs --seat=<id>')
+  const vote = flag('vote'); if (!['approve', 'reject', 'escalate', 'abstain'].includes(vote)) die('sign-vote needs --vote=<approve|reject|escalate|abstain>')
+  const conveneId = flag('convene'); if (!conveneId || conveneId === true) die('sign-vote needs --convene=<convene id> (replay binding)')
+  // The digest binds the exact question. Accept a precomputed --qdigest (bash passes it from the
+  // convene) or compute it here from --question. One is required — never sign an unbound vote.
+  let qdigest = flag('qdigest')
+  if (!qdigest || qdigest === true) { const q = flag('question'); if (!q || q === true) die('sign-vote needs --qdigest=<hex> or --question=<text>'); qdigest = E.questionDigest(q) }
+  const keyFile = flag('key-file'); if (!keyFile || keyFile === true) die('sign-vote needs --key-file=<path to the seat PKCS8 PEM> ("-" for stdin)')
+  let privPem
+  try { privPem = keyFile === '-' ? fs.readFileSync(0, 'utf-8') : fs.readFileSync(keyFile, 'utf-8') }
+  catch (e) { die(`sign-vote cannot read the seat key: ${String(e && e.message || e)}`) }
+  const row = { seat, vote, rationale: flag('rationale') === true || flag('rationale') == null ? `(${vote})` : String(flag('rationale')), stampedAt: flag('stamped-at') === true ? '' : (flag('stamped-at') || '') }
+  const fp = flag('fingerprint') === true ? '' : (flag('fingerprint') || '')
+  let signed
+  try { signed = E.signSeatVote(row, { conveneId: String(conveneId), questionDigest: String(qdigest) }, privPem, fp) }
+  catch (e) { die(`sign-vote failed to sign: ${String(e && e.message || e)}`) }
+  if (flag('emit') === 'json') { out(signed); return }
+  process.stdout.write(`COUNCIL-SIG: ${signed.sig}\n`)   // the line a seat pastes after COUNCIL-VOTE
+}
+
+// VERIFY-VOTES (the per-seat half of `council verify`): re-check EVERY co-signed vote against the
+// roster pubkeys + revocation, bound to THIS convene (replay-proof). bash re-checks the ROOT seal
+// separately; both must be green. --votes + --roster are JSON (inline or @file). Exits non-zero if
+// any non-abstain vote is unsigned/forged/replayed/revoked — so a caller can gate on the exit code.
+function cmdVerifyVotes() {
+  const readJson = (v, what) => {
+    if (!v || v === true) die(`verify-votes needs --${what}=<json or @file>`)
+    try { return JSON.parse(String(v).startsWith('@') ? fs.readFileSync(String(v).slice(1), 'utf-8') : v) }
+    catch (e) { die(`verify-votes: bad --${what} json: ${String(e && e.message || e)}`) }
+  }
+  const votes = readJson(flag('votes'), 'votes')
+  const roster = readJson(flag('roster'), 'roster')
+  const conveneId = flag('convene'); if (!conveneId || conveneId === true) die('verify-votes needs --convene=<convene id>')
+  let qdigest = flag('qdigest')
+  if (!qdigest || qdigest === true) { const q = flag('question'); if (!q || q === true) die('verify-votes needs --qdigest=<hex> or --question=<text>'); qdigest = E.questionDigest(q) }
+  const res = E.verifyReceiptVotes(votes, { conveneId: String(conveneId), questionDigest: String(qdigest) }, roster)
+  out({ ok: res.ok, badSeats: res.badSeats, results: res.results })
+  process.exit(res.ok ? 0 : 5)
+}
+
 const main = async () => {
   if (sub === 'convene') return cmdConvene()
   if (sub === 'bench') return cmdBench()
@@ -421,6 +468,8 @@ const main = async () => {
   if (sub === 'gate-map') return cmdGateMap()
   if (sub === 'seal-augment') return cmdSealAugment()
   if (sub === 'read-binding') return cmdReadBinding()
-  die(`unknown council subcommand: ${sub} (convene|bench|init|veto|gate-map|seal-augment|read-binding)`)
+  if (sub === 'sign-vote') return cmdSignVote()
+  if (sub === 'verify-votes') return cmdVerifyVotes()
+  die(`unknown council subcommand: ${sub} (convene|bench|init|veto|gate-map|seal-augment|read-binding|sign-vote|verify-votes)`)
 }
 main().catch(e => die(String(e && e.message || e), 1))
