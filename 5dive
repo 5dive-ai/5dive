@@ -16621,6 +16621,22 @@ cmd_task_reject() {
   [[ -n "$maker" ]] || fail "$E_VALIDATION" \
     "$ident is not in a maker→verifier loop (no maker to bounce to) — use 'task need'/'task block' for a plain rejection"
   local fb_txt="❌ verifier '${vfier:-?}' rejected (iteration ${iter}): ${feedback:-no feedback given}"
+  # DIVE-1495: a reject supersedes any still-open need-gate on this task. Leaving
+  # it 'pending' (need_answered_at NULL) let the DIVE-1490 re-nag ladder keep
+  # firing a question the reject already mooted (CNCL-9: lodar was re-nagged AFTER
+  # the task was rejected). Resolve it as auto:reject so the open-gate predicate
+  # (need_type set AND need_answered_at NULL) stops matching, while preserving the
+  # gate row for audit. The max_iterations branch below then files its OWN fresh
+  # manual gate to a human on purpose.
+  local _open_gate; _open_gate=$(db "SELECT CASE WHEN need_type IS NOT NULL
+        AND need_answered_at IS NULL THEN 1 ELSE 0 END FROM tasks WHERE id=${id};")
+  if [[ "$_open_gate" == "1" ]]; then
+    local _sup_ts; _sup_ts=$(date -u '+%Y-%m-%d %H:%M:%S')
+    db "UPDATE tasks SET need_answer='(superseded — task rejected, bounced to maker)',
+          need_answered_at=$(sqlq "$_sup_ts"), need_answered_by='auto:reject', gate_pinged_at=NULL
+        WHERE id=${id} AND need_answered_at IS NULL;"
+    [[ $EUID -eq 0 ]] && audit_log "task reject gate-supersede" "ok" 0 -- "task=$ident" || true
+  fi
   # max_iterations reached -> stop bouncing, park it on a human to decide.
   if (( maxi > 0 && iter >= maxi )); then
     db "UPDATE tasks SET result=$(sqlq "$fb_txt") WHERE id=${id};"
@@ -18023,6 +18039,32 @@ cmd_task_need() {
   #     destructive/secret) — the same floor decision that gates a decision,
   #     re-run here because the tier==2 short-circuit above skipped it for these.
   #   secret — never routable (must be delivered by a human).
+  #
+  # DIVE-1495: verifier-route. When the task carries a maker→verifier loop whose
+  # VERIFIER is a distinct fleet agent, a decision/approval gate the maker files
+  # is really a question FOR that verifier — not the paired human (CNCL-9: dev, as
+  # maker, filed `task need --type=decision` to ask main the verifier and it
+  # pinged lodar). Route it to the verifier's agent-send rail: they clear it via
+  # `task answer` (already allowed for a decision; for approval the routed_reviewer
+  # persisted below authorizes them, DIVE-1182). Intrinsic to the KIND, so it
+  # bypasses the gate_builder_routing pref like eng-ship/curation. Never fires when
+  # the filer IS the verifier (self-route — e.g. the max_iters escalation files
+  # its manual gate --from the verifier) or on secret/manual/access. We still guard
+  # tier!=2 so a money/brand/destructive decision stays human even inside a loop.
+  local _verifier_route=0 _route_target=""
+  if [[ ( "$type" == "decision" || "$type" == "approval" ) && "$tier" != "2" ]]; then
+    local _vf; _vf=$(db "SELECT COALESCE(verifier,'') FROM tasks WHERE id=${id};")
+    if [[ -n "$_vf" && "$_vf" != "$actor" ]]; then
+      # Confirm the verifier is a real fleet agent (a live maker→verifier loop by
+      # construction, or present in the org chart) so we never misroute to a
+      # non-agent token.
+      local _vf_is_agent; _vf_is_agent=$(db "SELECT CASE WHEN
+            (SELECT COALESCE(maker_agent,'') FROM tasks WHERE id=${id}) <> ''
+            OR EXISTS(SELECT 1 FROM agents_org WHERE name=$(sqlq "$_vf"))
+          THEN 1 ELSE 0 END;")
+      [[ "$_vf_is_agent" == "1" ]] && { _verifier_route=1; _route_target="$_vf"; }
+    fi
+  fi
   local _routable=0
   case "$type" in
     decision) [[ "$tier" != "2" ]] && _routable=1 ;;
@@ -18045,6 +18087,8 @@ cmd_task_need() {
   # DIVE-1480: an internal-ops/recovery gate the destructive floor over-fired on is
   # lead-routed by kind (set above), so the lead clears it instead of lodar.
   [[ "$_internal_ops" == "1" ]] && _routable=1
+  # DIVE-1495: a verifier-route gate is routable by kind (to the verifier agent).
+  [[ "$_verifier_route" == "1" ]] && _routable=1
   if [[ "$_routable" == "1" ]]; then
     # DIVE-1243: `access` routing is intrinsic to the TYPE, so it does NOT wait on
     # the gate_builder_routing pref (which ship-gates the decision/approval/manual
@@ -18052,14 +18096,18 @@ cmd_task_need() {
     # DIVE-1359: eng-ship routing is likewise intrinsic to the KIND — it bypasses
     # the pref too, so the fix is live under the default (pref OFF) posture.
     local _route; _route=$(_task_pref_get gate_builder_routing); _route="${_route:-off}"
-    if [[ "$_route" == "on" || "$type" == "access" || "$_eng_ship" == "1" || "$_curation" == "1" || "$_internal_ops" == "1" ]]; then
-      local _reviewer; _reviewer=$(_gate_route_reviewer "$actor")
+    if [[ "$_route" == "on" || "$type" == "access" || "$_eng_ship" == "1" || "$_curation" == "1" || "$_internal_ops" == "1" || "$_verifier_route" == "1" ]]; then
+      # DIVE-1495: a verifier-route targets the task's verifier directly; every
+      # other kind resolves the filer's lead via the org chart.
+      local _reviewer
+      if [[ "$_verifier_route" == "1" ]]; then _reviewer="$_route_target"; else _reviewer=$(_gate_route_reviewer "$actor"); fi
       if [[ -n "$_reviewer" ]]; then
         # Persist the designated reviewer on the row. For approval/manual this is
         # what authorizes agent-<_reviewer> to clear the gate later; for decision
         # it is provenance only (decision is already agent-clearable by type).
         db "UPDATE tasks SET routed_reviewer=$(sqlq "$_reviewer") WHERE id=${id};"
-        local _hmsg="🧭 [${ident}] routed to you for lead review (builder ${type} gate). ${ask}"
+        local _rrole="lead review"; [[ "$_verifier_route" == "1" ]] && _rrole="verifier review"
+        local _hmsg="🧭 [${ident}] routed to you for ${_rrole} (${type} gate). ${ask}"
         [[ -n "$options" ]]   && _hmsg+=" Options: ${options}."
         [[ -n "$recommend" ]] && _hmsg+=" ${actor} recommends: ${recommend}."
         _hmsg+=" Resolve: 5dive task answer ${ident} --value=\"<choice>\" — or re-file to escalate to the human."
@@ -18067,7 +18115,7 @@ cmd_task_need() {
           ( 5dive agent send "$_reviewer" "$_hmsg" --from="$actor" >/dev/null 2>&1 & ) || true
         fi
         [[ $EUID -eq 0 ]] && audit_log "task need lead-route" "ok" 0 -- "task=$ident" "type=$type" "reviewer=$_reviewer" "filer=$actor" || true
-        ok "$ident routed to lead $_reviewer for review ($type, tier $tier) — $ask" \
+        ok "$ident routed to $_reviewer for ${_rrole} ($type, tier $tier) — $ask" \
            '{id:($i|tonumber), ident:$id, status:"blocked", need_type:$ty, tier:($tr|tonumber), routed_to:$rv, ask:$ak, recommend:(($rc|select(length>0)) // null)}' \
            --arg i "$id" --arg id "$ident" --arg ty "$type" --arg tr "$tier" --arg rv "$_reviewer" --arg ak "$ask" --arg rc "$recommend"
         return

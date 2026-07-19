@@ -4,6 +4,7 @@
 
 - fix(push): let a builder land an approved feature branch without a lodar transport handoff when the task's ship gate was cleared by its designated routed reviewer. The root-only push path verifies the persisted HMAC closure and accepts only `human:*` or the exact `lead:<routed_reviewer>` provenance; auto-clears, bare/unrelated agent answers, unsigned rows, tampered closures, and direct `_push_do` attempts all fail closed. Protected `main`/`master`, task-to-branch binding, configured author enforcement, repo-scoped short-lived GitHub App credentials, and no-token-to-agent guarantees are unchanged.
 - docs/tests: document the reviewer-cleared ship path and cover signed human/reviewer success plus auto, provenance-mismatch, unsigned, and tampered-record refusals.
+- fix(gates): include the accepted DIVE-1495 prerequisite that was absent from the assigned CNCL-11 base: a decision/approval gate a maker files on a maker→verifier loop routes to the loop's verifier agent, not the paired human. Routing remains subordinate to the true-human tier-2 floor, never self-routes a verifier-filed gate, and `task reject` supersedes any open gate made moot by the bounce.
 
 ## 0.11.16 — The Council: governance surface — roster/log/verify + promote/demote motions with recusal, constitutional auto-class, hash-chained lineage (CNCL-11) (2026-07-19)
 
