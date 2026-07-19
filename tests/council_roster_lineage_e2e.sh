@@ -25,7 +25,10 @@ if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
 fi
 
 TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
-export STATE_DIR="$TMP" COUNCIL_MOCK=1
+# COUNCIL_5DIVE_BIN pins the nested convene (a motion shells `council convene`) to the BINARY UNDER
+# TEST, not whatever `5dive` is (or isn't) on PATH — CI has no installed 5dive, so a bare `5dive`
+# call would fail the motion convene. Same pattern as council_gate_e2e.sh.
+export STATE_DIR="$TMP" COUNCIL_MOCK=1 COUNCIL_5DIVE_BIN="$FIVE"
 LIN="$TMP/council/lineage.jsonl"
 pass=0; fail=0
 ok(){ echo "  ok:   $1"; pass=$((pass+1)); }
