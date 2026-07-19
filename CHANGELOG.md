@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- fix(council): resolve council seat PERSONA ids to real REGISTRY agents before dispatch — persona `theo` is the `marketing` agent and `lilbro` is `creative`, so the old code that passed `seat.id` verbatim to `5dive agent ask` recorded both default seats as silent ABSTAINs on every live convene (a 5-seat council degraded to 3 votes cast). Seats now carry an explicit `agent` field (built-ins) plus a persona→agent alias map, and convene FAILS CLOSED with a loud pre-flight error if any seat resolves to no known registry agent, instead of degrading silently (CNCL-16).
+
 - fix(gates): remove pure brand/strategy asks from the CLI's tier-2 human-gate floor so they remain tier-1 and org-lead-clearable; money, public/customer communications, secrets, and destructive/irreversible asks continue to floor to tier 2. The goal planner's separate `brand` risk taxonomy is unchanged (DIVE-1492).
 
 ## 0.11.10 — The Council: gate-rot wiring — clear tier-1 gates, rot-triage stale tier-2 (CNCL-12) (2026-07-19)

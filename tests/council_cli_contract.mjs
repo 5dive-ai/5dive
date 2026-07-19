@@ -141,5 +141,51 @@ r = runCli(['bench', 'rm', 'council', `--registry=${greg}`])
 ok('raw bench rm on council refused (exit 7)', r.code === 7)
 try { fs.unlinkSync(greg) } catch {}
 
+// --- CNCL-16: seat->agent resolution + fail-closed pre-flight (REAL dispatch path) ----------
+// A fake `5dive` bin stands in for the ask rail: `agent list` returns a fixed registry, `agent
+// ask` logs the target it was reached at and returns an approve vote. NOTE: no COUNCIL_MOCK here,
+// so the real dispatchSeatVote + preflight run (COUNCIL_5DIVE_BIN points at the fake).
+const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'cncl16-'))
+const askLog = path.join(tmp, 'asks.log')
+const fakeBin = path.join(tmp, 'fake-5dive')
+fs.writeFileSync(fakeBin, [
+  '#!/usr/bin/env bash',
+  'if [ "$1" = "agent" ] && [ "$2" = "list" ]; then',
+  '  echo \'{"ok":true,"data":[{"name":"marketing"},{"name":"creative"},{"name":"main"},{"name":"codex"},{"name":"olivia"}]}\'; exit 0',
+  'fi',
+  'if [ "$1" = "agent" ] && [ "$2" = "ask" ]; then',
+  '  [ -n "$ASK_LOG" ] && echo "$3" >> "$ASK_LOG"',
+  '  echo \'{"ok":true,"data":{"reply":"COUNCIL-VOTE: approve :: fake ok"}}\'; exit 0',
+  'fi',
+  'exit 1', '',
+].join('\n'))
+fs.chmodSync(fakeBin, 0o755)
+const REAL = { COUNCIL_5DIVE_BIN: fakeBin, ASK_LOG: askLog, COUNCIL_MOCK: '' }
+
+// persona seats theo/lilbro resolve to marketing/creative and the convene REACHES them for real.
+try { fs.writeFileSync(askLog, '') } catch {}
+r = runCli(['convene', 'Ship it?', '--seats=theo,lilbro,main', '--mode=deliberate', '--stamped-at=T', '--timeout=5'], REAL)
+ok('CNCL-16 convene with persona seats exits 0 (no silent abstain)', r.code === 0)
+const asked = (() => { try { return fs.readFileSync(askLog, 'utf-8') } catch { return '' } })()
+ok('CNCL-16 dispatch REACHES marketing (persona theo resolved)', /(^|\n)marketing(\n|$)/.test(asked))
+ok('CNCL-16 dispatch REACHES creative (persona lilbro resolved)', /(^|\n)creative(\n|$)/.test(asked))
+ok('CNCL-16 dispatch never asks the bare persona id', !/(^|\n)(theo|lilbro)(\n|$)/.test(asked))
+
+// an unresolvable seat FAILS CLOSED at pre-flight (loud, exit 6) — not a silent abstain.
+r = runCli(['convene', 'Ship it?', '--seats=theo,ghostseat', '--mode=deliberate', '--stamped-at=T'], REAL)
+ok('CNCL-16 unresolvable seat -> pre-flight fail closed (exit 6)', r.code === 6)
+ok('CNCL-16 pre-flight names the offending seat->agent', /ghostseat/.test(r.err || '') && /pre-flight FAILED/.test(r.err || ''))
+
+// registry unreadable (bin errors on `agent list`) also fails CLOSED, never a silent convene.
+const badBin = path.join(tmp, 'bad-5dive')
+fs.writeFileSync(badBin, '#!/usr/bin/env bash\nexit 1\n'); fs.chmodSync(badBin, 0o755)
+r = runCli(['convene', 'Ship it?', '--seats=main', '--mode=deliberate', '--stamped-at=T'], { COUNCIL_5DIVE_BIN: badBin, COUNCIL_MOCK: '' })
+ok('CNCL-16 unreadable registry -> fail closed (exit 6)', r.code === 6 && /could not read the agent registry/.test(r.err || ''))
+
+// COUNCIL_MOCK still bypasses the pre-flight (offline tests need no live registry).
+r = runCli(['convene', 'Ship it?', '--seats=theo,ghostseat', '--mode=deliberate', '--stamped-at=T'], { COUNCIL_MOCK: '1' })
+ok('CNCL-16 pre-flight is skipped under COUNCIL_MOCK (offline)', r.code === 0)
+try { fs.rmSync(tmp, { recursive: true, force: true }) } catch {}
+
 console.error(`\nCNCL-6/7/8 CLI contract: ${pass} passed, ${fail} failed`)
 process.exit(fail ? 1 : 0)

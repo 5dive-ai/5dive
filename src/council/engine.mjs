@@ -148,9 +148,9 @@ export const STANDING_COUNCILS = {
     description: 'Customer-facing / brand + messaging call on a mature surface.',
     mode: 'deliberate',
     seats: [
-      { id: 'theo', lens: 'Brand + customer read; how it lands, support load.' },
+      { id: 'theo', agent: 'marketing', lens: 'Brand + customer read; how it lands, support load.' },
       { id: 'mark', lens: 'Operational soundness + ship-worthiness.' },
-      { id: 'lilbro', lens: 'Divergent/contrarian; the take everyone is too polite to say.' },
+      { id: 'lilbro', agent: 'creative', lens: 'Divergent/contrarian; the take everyone is too polite to say.' },
     ],
   },
   security: {
@@ -183,11 +183,24 @@ export const DEFAULT_COUNCIL = {
   mode: 'deliberate', threshold: 3, thresholdRule: 'flat',
   seats: [
     { id: 'main', lens: 'Marcus — CTO / eng lead. Correctness, ship-worthiness, reversibility.' },
-    { id: 'theo', lens: 'Marketing. Brand + customer read; how it lands publicly.' },
+    { id: 'theo', agent: 'marketing', lens: 'Marketing. Brand + customer read; how it lands publicly.' },
     { id: 'codex', lens: 'Builder. Implementation soundness, edge cases, blast radius.' },
     { id: 'olivia', lens: 'CEO. Strategic fit, company priorities, risk appetite.' },
-    { id: 'lilbro', lens: 'Divergent/contrarian; the objection everyone is too polite to raise.' },
+    { id: 'lilbro', agent: 'creative', lens: 'Divergent/contrarian; the objection everyone is too polite to raise.' },
   ],
+}
+
+// (CNCL-16) SEAT ID vs REGISTRY AGENT. A seat `id` is a PERSONA (display + receipts). The agent
+// that `5dive agent ask` dispatches to is a REGISTRY NAME, which is not always the same string:
+// persona 'theo' is the 'marketing' agent, 'lilbro' is 'creative'. A seat MAY carry an explicit
+// `agent` (canonical, wins); otherwise this alias map resolves the known personas; otherwise the
+// id IS the registry name. Genesis/ad-hoc rosters that seed a bare persona id resolve via the map.
+export const SEAT_AGENT_ALIAS = { theo: 'marketing', lilbro: 'creative' }
+export function resolveSeatAgent(seat) {
+  if (!seat) return ''
+  if (typeof seat === 'string') return SEAT_AGENT_ALIAS[seat] || seat
+  if (seat.agent && typeof seat.agent === 'string') return seat.agent
+  return SEAT_AGENT_ALIAS[seat.id] || seat.id
 }
 export const DEFAULT_THRESHOLD = 3   // default flat pass-threshold; overridable per bench
 

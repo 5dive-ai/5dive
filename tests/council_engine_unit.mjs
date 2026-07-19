@@ -8,7 +8,7 @@ import {
   nodeVerdictToDecision, resolveCouncil, STANDING_COUNCILS, DEFAULT_COUNCIL, DEFAULT_THRESHOLD,
   resolveThreshold, tallyVotes, attachVetoOffer, exerciseFounderVeto, vetoConfig,
   buildVetoRecord, canonicalVetoRecord, VETO_DEFAULTS, dispositionOf, addSeat, removeSeat,
-  THRESHOLD_POLICY, quorumSize,
+  THRESHOLD_POLICY, quorumSize, resolveSeatAgent, SEAT_AGENT_ALIAS,
   canonicalTranscript, validateAgainstSchema, makeAnthropicModelCall, runCouncil, TAKE, VOTE, NODE_VOTE,
   augmentCanonicalVetoBinding, parseCanonicalVetoBinding, triageVerdictToAction,
 } from '../src/council/engine.mjs'
@@ -206,6 +206,24 @@ const secretGate = { ident: 'DIVE-1478', ask: 'R2 creds — do NOT paste here', 
 ok(/--type=secret /.test(triageVerdictToAction(secretGate, { recommendation: 'escalate', escalated: true, tally: T(0,0,3), confidence: 0.5, dissent: 'human', brief: 'still needs the human' }).command), 'triage: a secret gate re-files as type=secret (never downgraded to decision)')
 ok(/--type=secret /.test(verdictToAction(secretGate, { recommendation: 'escalate', escalated: true, tally: T(0,0,3), confidence: 0.5, dissent: 'human', brief: 'needs human' }).command), 'gate escalate: a secret gate stays type=secret (no paste-inviting downgrade)')
 for (const ht of ['approval', 'manual', 'access']) ok(new RegExp(`--type=${ht} `).test(verdictToAction({ ...secretGate, type: ht }, { recommendation: 'escalate', escalated: true, tally: T(0,0,3), confidence: 0.5, dissent: 'h', brief: 'b' }).command), `gate escalate: human-only type ${ht} preserved on re-file`)
+
+// CNCL-16: seat PERSONA id vs dispatch REGISTRY agent. A seat's `agent` (canonical) wins; else the
+// alias map resolves a known persona (theo->marketing, lilbro->creative); else the id IS the agent.
+ok(resolveSeatAgent({ id: 'theo', lens: 'x' }) === 'marketing', 'resolveSeatAgent: persona theo -> registry marketing (alias)')
+ok(resolveSeatAgent({ id: 'lilbro', lens: 'x' }) === 'creative', 'resolveSeatAgent: persona lilbro -> registry creative (alias)')
+ok(resolveSeatAgent({ id: 'main', lens: 'x' }) === 'main', 'resolveSeatAgent: an id that IS a registry name resolves to itself')
+ok(resolveSeatAgent({ id: 'theo', agent: 'someone', lens: 'x' }) === 'someone', 'resolveSeatAgent: an explicit seat.agent wins over the alias map')
+ok(resolveSeatAgent('theo') === 'marketing' && resolveSeatAgent('main') === 'main', 'resolveSeatAgent: accepts a bare string id too')
+ok(resolveSeatAgent(null) === '' && resolveSeatAgent(undefined) === '', 'resolveSeatAgent: null-safe')
+ok(SEAT_AGENT_ALIAS.theo === 'marketing' && SEAT_AGENT_ALIAS.lilbro === 'creative', 'SEAT_AGENT_ALIAS maps the known persona seats')
+// The built-in benches that seat personas carry an explicit `agent` so they dispatch to a REAL
+// registry agent (the CNCL-16 defect: theo/lilbro used to hit the ask rail verbatim -> abstain).
+const theoDefault = DEFAULT_COUNCIL.seats.find(s => s.id === 'theo')
+const lilbroDefault = DEFAULT_COUNCIL.seats.find(s => s.id === 'lilbro')
+ok(theoDefault && theoDefault.agent === 'marketing', 'DEFAULT_COUNCIL theo seat carries agent=marketing')
+ok(lilbroDefault && lilbroDefault.agent === 'creative', 'DEFAULT_COUNCIL lilbro seat carries agent=creative')
+ok(resolveSeatAgent(STANDING_COUNCILS.brand.seats.find(s => s.id === 'theo')) === 'marketing', 'brand bench theo resolves to marketing')
+ok(resolveSeatAgent(STANDING_COUNCILS.brand.seats.find(s => s.id === 'lilbro')) === 'creative', 'brand bench lilbro resolves to creative')
 
 console.log(`\nCNCL-6 engine: ${pass} passed, ${fail} failed (bound to src/council/engine.mjs)`)
 process.exit(fail ? 1 : 0)

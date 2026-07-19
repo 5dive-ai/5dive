@@ -241,9 +241,9 @@ export const STANDING_COUNCILS = {
     description: 'Customer-facing / brand + messaging call on a mature surface.',
     mode: 'deliberate',
     seats: [
-      { id: 'theo', lens: 'Brand + customer read; how it lands, support load.' },
+      { id: 'theo', agent: 'marketing', lens: 'Brand + customer read; how it lands, support load.' },
       { id: 'mark', lens: 'Operational soundness + ship-worthiness.' },
-      { id: 'lilbro', lens: 'Divergent/contrarian; the take everyone is too polite to say.' },
+      { id: 'lilbro', agent: 'creative', lens: 'Divergent/contrarian; the take everyone is too polite to say.' },
     ],
   },
   security: {
@@ -276,11 +276,24 @@ export const DEFAULT_COUNCIL = {
   mode: 'deliberate', threshold: 3, thresholdRule: 'flat',
   seats: [
     { id: 'main', lens: 'Marcus — CTO / eng lead. Correctness, ship-worthiness, reversibility.' },
-    { id: 'theo', lens: 'Marketing. Brand + customer read; how it lands publicly.' },
+    { id: 'theo', agent: 'marketing', lens: 'Marketing. Brand + customer read; how it lands publicly.' },
     { id: 'codex', lens: 'Builder. Implementation soundness, edge cases, blast radius.' },
     { id: 'olivia', lens: 'CEO. Strategic fit, company priorities, risk appetite.' },
-    { id: 'lilbro', lens: 'Divergent/contrarian; the objection everyone is too polite to raise.' },
+    { id: 'lilbro', agent: 'creative', lens: 'Divergent/contrarian; the objection everyone is too polite to raise.' },
   ],
+}
+
+// (CNCL-16) SEAT ID vs REGISTRY AGENT. A seat `id` is a PERSONA (display + receipts). The agent
+// that `5dive agent ask` dispatches to is a REGISTRY NAME, which is not always the same string:
+// persona 'theo' is the 'marketing' agent, 'lilbro' is 'creative'. A seat MAY carry an explicit
+// `agent` (canonical, wins); otherwise this alias map resolves the known personas; otherwise the
+// id IS the registry name. Genesis/ad-hoc rosters that seed a bare persona id resolve via the map.
+export const SEAT_AGENT_ALIAS = { theo: 'marketing', lilbro: 'creative' }
+export function resolveSeatAgent(seat) {
+  if (!seat) return ''
+  if (typeof seat === 'string') return SEAT_AGENT_ALIAS[seat] || seat
+  if (seat.agent && typeof seat.agent === 'string') return seat.agent
+  return SEAT_AGENT_ALIAS[seat.id] || seat.id
 }
 export const DEFAULT_THRESHOLD = 3   // default flat pass-threshold; overridable per bench
 
@@ -1141,9 +1154,12 @@ function dispatchSeatVote(opts) {
   const bin = process.env.COUNCIL_5DIVE_BIN || '5dive'
   return async (seat, ctx) => {
     const prompt = E.seatPrompt(seat, ctx)
+    // CNCL-16: dispatch to the seat's REGISTRY agent (persona 'theo' -> 'marketing', etc.), not
+    // its display id. Pre-flight (below) has already fail-closed on any unresolvable seat.
+    const target = E.resolveSeatAgent(seat)
     let reply = ''
     try {
-      const stdout = execFileSync(bin, ['agent', 'ask', seat.id, prompt,
+      const stdout = execFileSync(bin, ['agent', 'ask', target, prompt,
         '--json', `--from=${from}`, `--timeout=${timeout}`, `--idle-secs=${idle}`, `--poll-secs=${poll}`],
         { encoding: 'utf-8', timeout: (timeout + 30) * 1000, maxBuffer: 16 * 1024 * 1024 })
       const env = JSON.parse(stdout)
@@ -1163,6 +1179,37 @@ function mockSeatVote() {
 function seatVoteFor() {
   if (process.env.COUNCIL_MOCK) return mockSeatVote()
   return dispatchSeatVote({ timeout: flag('timeout'), idle: flag('idle-secs'), poll: flag('poll-secs'), from: flag('from') })
+}
+// CNCL-16 pre-flight: the live set of registry agent names `5dive agent ask` can reach. Returns a
+// Set, or null if the registry could not be read (transport/exec failure) — the caller fails CLOSED
+// on null so a broken registry can't be mistaken for "every seat resolves".
+function knownRegistryAgents() {
+  const bin = process.env.COUNCIL_5DIVE_BIN || '5dive'
+  try {
+    const stdout = execFileSync(bin, ['agent', 'list', '--json'],
+      { encoding: 'utf-8', timeout: 30000, maxBuffer: 16 * 1024 * 1024 })
+    const env = JSON.parse(stdout)
+    const arr = (env && env.data) || []
+    if (!Array.isArray(arr)) return null
+    return new Set(arr.map(a => a && a.name).filter(Boolean))
+  } catch {
+    return null
+  }
+}
+// Resolve every seat to a registry agent and FAIL CLOSED (loud pre-flight error, exit 6) if any
+// seat maps to no known agent — instead of the old behaviour where an unreachable persona seat
+// (e.g. 'theo' vs registry 'marketing') was silently recorded as an ABSTAIN on every convene.
+function preflightSeats(seats) {
+  const known = knownRegistryAgents()
+  if (known === null) {
+    die("council pre-flight FAILED: could not read the agent registry (`5dive agent list --json`) — refusing to convene rather than silently abstain unreachable seats.", 6)
+  }
+  const unresolved = seats
+    .map(s => ({ id: (s && s.id) || String(s), agent: E.resolveSeatAgent(s) }))
+    .filter(x => !known.has(x.agent))
+  if (unresolved.length) {
+    die(`council pre-flight FAILED: ${unresolved.length} seat(s) resolve to no known registry agent — ${unresolved.map(u => `${u.id}→${u.agent}`).join(', ')}. Fix the bench seat's \`agent\` field / alias or re-seed. Known agents: ${[...known].sort().join(', ')}.`, 6)
+  }
 }
 
 // ---- subcommands -----------------------------------------------------------
@@ -1221,6 +1268,9 @@ async function cmdConvene() {
   // (or COUNCIL_STANDALONE) selects the deferred single-key modelCall seam instead. COUNCIL_MOCK
   // runs either path offline. The engine records a timed-out/silent seat as an abstain.
   const standalone = !!flag('standalone') || !!process.env.COUNCIL_STANDALONE
+  // CNCL-16: on the real-agents dispatch path, fail closed at convene START if any seat resolves
+  // to no known registry agent. Skipped for the standalone seam and for COUNCIL_MOCK (offline).
+  if (!standalone && !process.env.COUNCIL_MOCK) preflightSeats(seats)
   const deps = standalone
     ? { modelCall: modelCallFor(), verbose: !!flag('verbose') }
     : { seatVote: seatVoteFor(), verbose: !!flag('verbose') }
