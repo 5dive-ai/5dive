@@ -51,6 +51,7 @@ cat \
   src/cmd_project.sh \
   src/cmd_goal.sh \
   src/cmd_objective.sh \
+  src/cmd_steer.sh \
   src/cmd_company.sh \
   src/cmd_loop.sh \
   src/cmd_loop_pack.sh \

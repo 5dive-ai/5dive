@@ -629,6 +629,14 @@ main() {
       # through the goal materialize path — origination rides ONE count-checkpoint
       # gate, T2 creates gate hard, and it can only touch its own originated tasks.
       cmd_objective "$@" ;;
+    steer)
+      # STEER-11 (STEER-5 design): the new-work generator. `steer propose` sources
+      # capped candidate work off real signal (drained active projects, ROADMAP
+      # items) and files it as review-state tasks to the project lead behind an
+      # approve|revise gate — never auto-dispatched. The heartbeat fires it when
+      # the board fully drains. Same group-writable store as tasks; read/write,
+      # no root/lock.
+      cmd_steer "$@" ;;
     crew)
       # DIVE-787 (0.5.0 flagship): 5dive as the always-on runtime for CrewAI
       # crews. install/secret/run/show/list/uninstall. Crew runs in its own venv

@@ -1299,6 +1299,73 @@ _hb_poller_liveness_sweep() {
   return 0
 }
 
+# STEER-11: the new-work generator trigger. Fires ONLY when the board is fully
+# drained (zero open standard tasks fleet-wide) for N consecutive ticks — a
+# merely-*dammed* queue (open-but-blocked work) is STEER-1's lane and is left
+# alone here. Debounce + episode-idempotency ride on durable task_prefs counters.
+# Isolation contract like every other sweep: a failure must never abort the tick.
+_hb_steer_sweep() {
+  local idle_max="${STEER_IDLE_TICKS:-2}"; [[ "$idle_max" =~ ^[0-9]+$ ]] || idle_max=2
+  local open_std
+  open_std=$(db "SELECT COUNT(*) FROM tasks WHERE kind='standard' AND status NOT IN ('done','cancelled');" 2>/dev/null || echo 0)
+  [[ "$open_std" =~ ^[0-9]+$ ]] || open_std=0
+  if (( open_std > 0 )); then
+    # Board has open work (dispatchable OR dammed OR candidates already awaiting
+    # review) -> not a drain. Reset the debounce so the counter measures only
+    # *consecutive* fully-idle ticks.
+    db "DELETE FROM task_prefs WHERE key='steer_idle_ticks';" 2>/dev/null || true
+    return 0
+  fi
+  local ticks; ticks=$(db "SELECT value FROM task_prefs WHERE key='steer_idle_ticks';" 2>/dev/null || echo 0)
+  [[ "$ticks" =~ ^[0-9]+$ ]] || ticks=0
+  ticks=$(( ticks + 1 ))
+  db "INSERT INTO task_prefs (key,value) VALUES ('steer_idle_ticks','${ticks}')
+        ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=datetime('now');" 2>/dev/null || true
+  if (( ticks < idle_max )); then
+    _hb_log "[steer] board drained, idle_ticks=${ticks}/${idle_max} (debouncing)"
+    return 0
+  fi
+  # Fire. Filing candidates makes open_std>0 next tick, which resets idle_ticks —
+  # so the same drain episode never re-fires (idempotent). Reset now too, as a
+  # belt-and-suspenders guard if filing yields nothing.
+  db "DELETE FROM task_prefs WHERE key='steer_idle_ticks';" 2>/dev/null || true
+  db "INSERT INTO task_prefs (key,value) VALUES ('steer_last_fired_at', datetime('now'))
+        ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=datetime('now');" 2>/dev/null || true
+  _hb_log "[steer] fleet drained to 0 dispatchable for ${ticks} ticks -> sourcing candidate work"
+  local out; out=$(JSON_MODE=1 cmd_steer_propose --max="${STEER_MAX_PROPOSE:-3}" --from=steer-generator 2>/dev/null) || out=""
+  local n; n=$(printf '%s' "$out" | jq -r '.data.proposed // 0' 2>/dev/null || echo 0)
+  [[ "$n" =~ ^[0-9]+$ ]] || n=0
+  _hb_log "[steer] proposed ${n} review-state candidate(s)"
+  if (( n > 0 )); then
+    ( cmd_send "main" --from="steer-generator" \
+        --message="🌱 new-work generator: the fleet drained to 0 dispatchable tasks, so I sourced ${n} candidate task(s) from real project/roadmap signal and filed them for review (\`5dive task inbox\`). Approve to dispatch, revise/decline otherwise — nothing was auto-started." ) >/dev/null 2>&1 || true
+  fi
+  return 0
+}
+
+# STEER-11: when a lead APPROVES a review-state candidate, make it dispatchable —
+# flip it out of the gate to a normal todo assigned to the intended builder. A
+# 'revise'/declined candidate is left blocked for the lead to edit. Idempotent:
+# an applied candidate is no longer status='blocked' so it can't be re-processed.
+_hb_steer_apply_sweep() {
+  local row cid cident intended
+  while IFS= read -r row; do
+    [[ -n "$row" ]] || continue
+    IFS=$'\x1f' read -r cid cident <<<"$row"
+    [[ -n "$cid" ]] || continue
+    intended=$(db "SELECT COALESCE(body,'') FROM tasks WHERE id=${cid};" 2>/dev/null | sed -n 's/^steer-intended-assignee: //p' | head -1)
+    if [[ -n "$intended" ]]; then
+      db "UPDATE tasks SET status='todo', assignee=$(sqlq "$intended"), need_type=NULL WHERE id=${cid};" 2>/dev/null || true
+    else
+      db "UPDATE tasks SET status='todo', need_type=NULL WHERE id=${cid};" 2>/dev/null || true
+    fi
+    _hb_log "[steer] approved candidate ${cident} -> dispatchable (assignee=${intended:-lead})"
+  done < <(db "SELECT id||x'1f'||COALESCE(ident,'DIVE-'||id) FROM tasks
+                WHERE ask LIKE '[steer]%' AND status='blocked'
+                  AND lower(COALESCE(need_answer,'')) LIKE 'approve%';" 2>/dev/null)
+  return 0
+}
+
 cmd_heartbeat_tick() {
   require_root "heartbeat tick"
   tasks_db_init
@@ -1339,6 +1406,13 @@ cmd_heartbeat_tick() {
   # Telegram poller died (stale beacon => gate-ping taps won't land). Same
   # isolation contract — a failure here must never abort the wake loop.
   _hb_poller_liveness_sweep || _hb_log "[poller-liveness] pass errored (non-fatal)"
+  # STEER-11: dispatch any lead-APPROVED review-state candidate BEFORE the
+  # generator + wake loop, so a just-approved candidate is dispatchable this same
+  # tick and (by making the board non-empty) also stops the generator re-firing.
+  _hb_steer_apply_sweep || _hb_log "[steer-apply] pass errored (non-fatal)"
+  # STEER-11: the new-work generator — mint capped review-state candidates when
+  # the board has been fully drained for N ticks. Same isolation contract.
+  _hb_steer_sweep || _hb_log "[steer] pass errored (non-fatal)"
   # Accounts already woken during THIS tick. The $reg snapshot is read once up
   # front, so a wake we do mid-loop isn't visible to later iterations via the
   # registry — this map carries that within-tick fact so two same-account agents
