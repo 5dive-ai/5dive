@@ -107,6 +107,27 @@ cmd_task_need DIVE-307 --type=decision --from=dev \
   --options="yes|no" --recommend="yes" >/dev/null 2>&1
 [[ "$(tierof DIVE-307)" == "2" ]] && ok_t "safety: destructive w/o internal-ops vocab stays tier 2 (human)" || bad_t "safety plain destructive" "got '$(tierof DIVE-307)'"
 
+# --- 8: DIVE-1481 — prod object in a recovery FRAMING stays hard-human. The ask
+#        matches the internal-ops class ('board recovery') but the destructive verb
+#        governs the PRODUCTION DATABASE, not the board, so 'delete' is NOT
+#        co-referent to an internal object → survives the residual → stays tier 2.
+route_reset; seed DIVE-308
+cmd_task_need DIVE-308 --type=decision --from=dev \
+  --ask="Delete the production database as part of the board recovery — proceed?" \
+  --options="yes|no" --recommend="no" >/dev/null 2>&1
+[[ "$(tierof DIVE-308)" == "2" ]] && ok_t "DIVE-1481: prod-delete in recovery framing stays tier 2 (human)" || bad_t "1481 prod-in-framing tier 2" "got '$(tierof DIVE-308)'"
+[[ "$HUMAN_PINGED" == "1" ]] && ok_t "DIVE-1481: prod-delete in recovery framing pings the human" || bad_t "1481 prod-in-framing pings human" "HUMAN_PINGED=$HUMAN_PINGED"
+
+# --- 9: DIVE-1481 — a genuine internal, CO-REFERENT wipe still downgrades (the fix
+#        must not over-tighten). 'wipe' governs 'the board', so it is carved out and
+#        the residual is clean → lead-routed tier 1.
+route_reset; seed DIVE-309
+cmd_task_need DIVE-309 --type=decision --from=dev \
+  --ask="Wipe the task board and rebuild it from the audit log — keep or discard my uncommitted wip first?" \
+  --options="keep|discard" --recommend="keep" >/dev/null 2>&1
+[[ "$(tierof DIVE-309)" == "1" ]] && ok_t "DIVE-1481: co-referent 'wipe the board' still downgrades to tier 1" || bad_t "1481 co-referent tier 1" "got '$(tierof DIVE-309)'"
+[[ "$(routedof DIVE-309)" == "main" ]] && ok_t "DIVE-1481: co-referent wipe routed to lead (main)" || bad_t "1481 co-referent routed main" "got '$(routedof DIVE-309)'"
+
 echo
 echo "gate internal-ops floor: $PASS passed, $FAIL failed"
 [[ $FAIL -eq 0 ]]

@@ -1682,6 +1682,39 @@ _gate_internal_ops_hit() {
 # / publish / brand term. Used to compute the residual-floor test below.
 _GATE_INTERNAL_DESTRUCTIVE_RX='destroy|wipe|purge|delete|irreversible'
 
+# DIVE-1481: the internal-ops OBJECT vocabulary — the control-plane nouns a
+# carved-out destructive term is allowed to act on (task board / tasks.db /
+# backlog / an agent's own wip). The residual test below strips a destructive
+# term ONLY when it is CO-REFERENT (adjacent) to one of these, never merely
+# co-present in the same ask. That closes the residual gap DIVE-1480 left open:
+# 'delete the production database as part of board recovery' matches the
+# internal-ops CLASS ('board recovery') and has its 'delete' stripped by a blanket
+# carve-out, silently downgrading a PROD-destructive action to lead review — but
+# 'delete' governs 'production database', not the board, so it must stay
+# hard-human. `\bboard\b` (not bare 'board') so 'dashboard'/'keyboard' don't match.
+_GATE_INTERNAL_OBJECT_RX='task ?board|tasks?\.db|\btask db\b|backlog|\bboard\b|\bwip\b|uncommitted|in.?flight|unmerged|audit (trail|log)|heartbeat log'
+# _gate_internal_residual <text>: lower-cases <text>, then removes each internal-
+# destructive term ONLY where an internal-ops object sits within ~20 chars on
+# either side (active 'wipe the board' OR passive 'the board was wiped'). A verb
+# whose object is external (a prod table, a customer record) is left intact so the
+# residual still trips the T2 floor and the gate stays hard-human. Iterates to a
+# fixpoint so several verbs sharing one object all clear; non-/g single pass per
+# step keeps the object available for the next verb.
+_gate_internal_residual() {
+  local text prev; text=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
+  local i=0
+  while [[ $i -lt 8 ]]; do
+    prev="$text"
+    # active: destructive verb governs a following internal object
+    text=$(printf '%s' "$text" | sed -E "s/(${_GATE_INTERNAL_DESTRUCTIVE_RX})([^.]{0,20}(${_GATE_INTERNAL_OBJECT_RX}))/ \2/")
+    # passive: internal object precedes the destructive verb
+    text=$(printf '%s' "$text" | sed -E "s/((${_GATE_INTERNAL_OBJECT_RX})[^.]{0,20})(${_GATE_INTERNAL_DESTRUCTIVE_RX})/\1 /")
+    [[ "$text" == "$prev" ]] && break
+    i=$((i+1))
+  done
+  printf '%s' "$text"
+}
+
 # OSS-11 (DIVE-976) — _gate_ask_shape <ask>: normalize an ask into its "shape
 # key" so two gates that ask structurally the same question but about different
 # targets collapse to one key. Precedent matching uses EXACT shape-key equality
@@ -1902,8 +1935,10 @@ cmd_task_need() {
         && ( "$type" == "decision" || "$type" == "approval" ) ]]; then
     local _io_title; _io_title=$(db "SELECT COALESCE(title,'') FROM tasks WHERE id=${id};")
     local _io_text="${ask} ${_io_title}"
-    local _io_residual; _io_residual=$(printf '%s' "$_io_text" \
-      | tr '[:upper:]' '[:lower:]' | sed -E "s/(${_GATE_INTERNAL_DESTRUCTIVE_RX})//g")
+    # DIVE-1481: strip a destructive term only where it is CO-REFERENT to an
+    # internal-ops object, not everywhere it appears — a prod-object verb survives
+    # into the residual and keeps the gate hard-human.
+    local _io_residual; _io_residual=$(_gate_internal_residual "$_io_text")
     if _gate_internal_ops_hit "$_io_text" && ! _gate_tier2_floor_hit "$_io_residual"; then
       local _io_reviewer; _io_reviewer=$(_gate_route_reviewer "$(task_actor "$from")")
       if [[ -n "$_io_reviewer" ]]; then
