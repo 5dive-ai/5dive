@@ -234,22 +234,124 @@ export function removeSeat(seats, seatId) {
   return (seats || []).filter(x => x.id !== seatId)
 }
 
-// (P3.1d) FOUNDER VETO: lodar can veto any pass. A veto flips a pass to blocked and is
-// RECORDED (goes into the signed receipt bytes via canonicalTranscript, so it's auditable
-// and non-forgeable). A non-pass verdict is returned unchanged (nothing to veto). Hard-gate
-// classes still surface to the founder regardless (that's the guardrail, upstream).
-export function applyFounderVeto(verdict, veto) {
-  if (!veto || !veto.by) return verdict
+// (CNCL-9) AUTHENTICATED FOUNDER VETO — non-blocking OFFER model.
+//
+// The pre-CNCL-9 design flipped the verdict inline from a plain `--veto-by` CLI STRING, so any
+// agent could forge lodar's veto straight into a signed receipt. That path is gone. Now:
+//
+//   1. convene NEVER waits for a tap and NEVER flips on a string. On a pass it records a
+//      timeboxed OFFER (attachVetoOffer) naming the resolved genesis principal + window, seals
+//      immediately, and the work proceeds. Expiry with no tap = the pass stands, and the receipt
+//      already reads `veto-offered-not-exercised` (default-proceed is the do-nothing path).
+//   2. The EXERCISE is a separate, authenticated event: only a tap confirmed on the tier-2 rail
+//      by the resolved principal (bash validates the nonce->recipient binding) calls
+//      exerciseFounderVeto, which flips the pass to BLOCKED inside a fresh record that is
+//      root-sealed and hash-chained onto the convene receipt (the original bytes are never
+//      re-sealed — post-hoc-after-seal re-seal stays deferred; the chain carries the flip).
+//   3. Veto is FINAL — no council override. Hard-gate classes escalate upstream regardless.
+
+// Non-blocking: attach a timeboxed veto OFFER to a pass. Disposition stays `pass` (the work is
+// not blocked); the offer rides inside the sealed bytes so "an offer was made" is auditable.
+// A non-pass verdict is returned unchanged (nothing to offer a veto on).
+export function attachVetoOffer(verdict, offer) {
+  if (!offer || !offer.principal || !offer.resolved) return verdict
   const passed = verdict.recommendation === 'approve' && !verdict.escalated
-  if (!passed) return verdict   // only a pass can be vetoed
+  if (!passed) return verdict
+  return {
+    ...verdict,
+    vetoOffer: {
+      principal: String(offer.principal),
+      resolved: String(offer.resolved),
+      windowSecs: Number(offer.windowSecs) || 0,
+      state: 'offered-not-exercised',
+    },
+  }
+}
+
+// Authenticated EXERCISE (the confirmed tap) — TWO-TIER (lodar-locked):
+//   tier='hold'    — the tap landed inside the 15m pre-execution hold; the work never ran.
+//   tier='posthoc' — the tap landed after execution (up to veto_posthoc/48h); the verdict is
+//                    overruled and the (reversible) work must be UNWOUND (manual unwind in v0.11).
+// `veto` MUST carry the principal the bash rail authenticated (veto.by) and the resolved recipient
+// the offer was made to (veto.resolved); bash has already proven the tap came from that recipient
+// over the tier-2 nonce rail — the engine never trusts a bare string. The flip only applies to a
+// verdict that carried the matching offer; anything else is returned unchanged (fail-closed).
+// This builds the FLIPPED verdict for a NEW record; the caller hash-chains it to the original
+// verdict digest and root-seals it. The original convene receipt is never re-signed or mutated.
+export function exerciseFounderVeto(verdict, veto) {
+  if (!veto || !veto.by || !veto.resolved) return verdict
+  const offer = verdict.vetoOffer
+  if (!offer || String(offer.resolved) !== String(veto.resolved)) return verdict
+  const passed = verdict.recommendation === 'approve' && !verdict.escalated
+  if (!passed) return verdict
+  const tier = veto.tier === 'posthoc' ? 'posthoc' : 'hold'
+  const briefHead = tier === 'posthoc'
+    ? `Post-hoc founder veto by ${veto.by}: pass (tally ${tallyStr(verdict.tally)}) overruled — reversible work must be unwound.`
+    : `Founder veto by ${veto.by}: pass (tally ${tallyStr(verdict.tally)}) held and flipped to BLOCKED before execution.`
   return {
     ...verdict,
     disposition: 'blocked',
     vetoed: true,
     vetoedBy: veto.by,
     vetoReason: veto.reason || '',
-    brief: `Founder veto by ${veto.by}: pass (tally ${tallyStr(verdict.tally)}) flipped to BLOCKED.${veto.reason ? ` Reason: ${veto.reason}` : ''}`,
+    vetoTier: tier,
+    unwindRequired: tier === 'posthoc',
+    vetoOffer: { ...offer, state: 'exercised' },
+    brief: `${briefHead}${veto.reason ? ` Reason: ${veto.reason}` : ''}`,
   }
+}
+
+// Veto window durations. lodar-locked defaults: 15m pre-execution HOLD, 48h POST-HOC override.
+// These are the seam CNCL-13/14 redirects to the `5dive.md` constitution — until then they read
+// from the environment (bash sources the constitution or falls back), NEVER inline magic numbers.
+export const VETO_DEFAULTS = { holdSecs: 15 * 60, posthocSecs: 48 * 60 * 60 }
+export function vetoConfig(env = {}) {
+  const n = (v, d) => { const x = Number(v); return Number.isFinite(x) && x > 0 ? x : d }
+  return {
+    holdSecs: n(env.COUNCIL_VETO_HOLD_SECS, VETO_DEFAULTS.holdSecs),
+    posthocSecs: n(env.COUNCIL_VETO_POSTHOC_SECS, VETO_DEFAULTS.posthocSecs),
+  }
+}
+
+// Build the chained veto RECORD emitted by an authenticated exercise. It is a distinct object from
+// the convene receipt: it references the original verdict digest (origDigest) so the whole history
+// links back without ever re-signing the original bytes. The caller root-seals `canonical` and
+// stores {digest, prevDigest: origDigest, ...} — same hash-chain discipline as the genesis lineage.
+export function buildVetoRecord({ origDigest, tier, by, resolved, reason, stampedAt, flippedVerdict }) {
+  if (!origDigest) throw new Error('veto record needs the original verdict digest to chain to')
+  if (!by || !resolved) throw new Error('veto record needs an authenticated principal (by) + resolved recipient')
+  const t = tier === 'posthoc' ? 'posthoc' : 'hold'
+  return {
+    kind: 'veto',
+    tier: t,
+    origDigest: String(origDigest),
+    by: String(by),
+    resolved: String(resolved),
+    reason: reason || '',
+    unwindRequired: t === 'posthoc',
+    stampedAt: stampedAt || '',
+    disposition: 'blocked',
+    tally: (flippedVerdict && flippedVerdict.tally) || null,
+  }
+}
+
+// Deterministic, whitespace-normalized preimage of a veto record — the origDigest link is INSIDE
+// the signed bytes so the chain cannot be re-pointed, and the tier/unwind flag cannot be stripped.
+export function canonicalVetoRecord(rec) {
+  const norm = (s) => String(s == null ? '' : s).replace(/\s+/g, ' ').trim()
+  const t = rec.tally || {}
+  return [
+    `kind: veto`,
+    `tier: ${norm(rec.tier)}`,
+    `origDigest: ${norm(rec.origDigest)}`,
+    `by: ${norm(rec.by)}`,
+    `resolved: ${norm(rec.resolved)}`,
+    `reason: ${norm(rec.reason)}`,
+    `unwindRequired: ${!!rec.unwindRequired}`,
+    `stampedAt: ${norm(rec.stampedAt)}`,
+    `disposition: blocked`,
+    `tally: a${Number(t.approve) || 0}/r${Number(t.reject) || 0}/e${Number(t.escalate) || 0}`,
+  ].join('\n')
 }
 
 // The plain-English disposition of a (possibly vetoed) verdict.
@@ -285,8 +387,18 @@ export function canonicalTranscript(rec) {
   const t = vd.tally || {}
   L.push(`verdict: ${norm(vd.recommendation != null ? vd.recommendation : vd.choice)} conf=${Number(vd.confidence)} tally=a${Number(t.approve) || 0}/r${Number(t.reject) || 0}/e${Number(t.escalate) || 0} escalated=${!!vd.escalated}`)
   L.push(`dissent: ${norm(vd.dissent)}`)
-  // Founder veto rides INSIDE the signed bytes so a recorded veto cannot be quietly stripped.
-  L.push(`veto: ${vd.vetoed ? `${norm(vd.vetoedBy)} :: ${norm(vd.vetoReason)}` : 'none'}`)
+  // CNCL-9: the veto OFFER and (if it happened) the EXERCISE both ride INSIDE the signed bytes,
+  // so neither "an offer was made" nor "it was/wasn't exercised" can be quietly stripped. The
+  // convene receipt seals with the offer's default `offered-not-exercised` state; a confirmed tap
+  // seals its `exercised` flip in the CHAINED veto record (see exerciseFounderVeto), not by
+  // re-signing these bytes.
+  if (vd.vetoed) {
+    L.push(`veto: exercised ${norm(vd.vetoTier || 'hold')} ${norm(vd.vetoedBy)} :: ${norm(vd.vetoReason)}`)
+  } else if (vd.vetoOffer) {
+    L.push(`veto: offered ${norm(vd.vetoOffer.principal)} window ${Number(vd.vetoOffer.windowSecs) || 0}s :: ${norm(vd.vetoOffer.state || 'offered-not-exercised')}`)
+  } else {
+    L.push('veto: none')
+  }
   return L.join('\n')
 }
 
@@ -702,7 +814,9 @@ async function runConvene(input, deps, h) {
     const narr = await chairNarrative(modelCall, question, finalVotes)
     verdict = buildConveneVerdict(counted, narr)
   }
-  verdict = applyFounderVeto(verdict, input.veto)
+  // CNCL-9: convene only ever OFFERS the veto (non-blocking); the flip happens later, and only
+  // via an authenticated tap on the tier-2 rail (exerciseFounderVeto). No string ever flips here.
+  verdict = attachVetoOffer(verdict, input.vetoOffer)
   return finish(role, input, {
     question, mode, seats, guardrail: null, convened: true,
     takes: [], votes: finalVotes, round1Votes, rebuttalVotes, verdict,

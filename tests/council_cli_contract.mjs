@@ -44,11 +44,27 @@ ok('convene passes with 3/3 approve', v.disposition === 'pass' && v.verdict.tall
 ok('convene receipt canonical present + veto:none inside bytes', /veto: none/.test(v.receipt.canonical))
 ok('convene receipt exposes root seal command', /gate-proof sign/.test(v.receipt.seal))
 
-// founder veto flips a pass to blocked, recorded inside the canonical bytes
+// CNCL-9 FORGE REFUSAL: convene can NEVER assert a veto from a plain string (the pre-CNCL-9 hole).
 r = runCli(['convene', 'Ship it?', '--seats=a,b,c', '--veto-by=lodar', '--veto-reason=hold', '--stamped-at=T'], MOCK)
+ok('forged --veto-by is refused (exit 9)', r.code === 9)
+ok('forge refusal is logged/explained', /refused:.*veto-by/.test(r.err || ''))
+
+// CNCL-9 NON-BLOCKING OFFER: a primary-council pass records the offer + STAYS a pass.
+r = runCli(['convene', 'Ship it?', '--seats=a,b,c', '--veto-principal=human:main', '--veto-resolved=433634012', '--veto-window=900', '--stamped-at=T'], MOCK)
 v = JSON.parse(r.out)
-ok('founder veto -> blocked', v.disposition === 'blocked' && v.verdict.vetoed === true)
-ok('veto recorded in signed bytes', /veto: lodar/.test(v.receipt.canonical))
+ok('veto offer does NOT block (pass stays pass)', v.disposition === 'pass' && v.verdict.vetoed !== true)
+ok('offer recorded inside the signed bytes', /veto: offered human:main window 900s :: offered-not-exercised/.test(v.receipt.canonical))
+
+// CNCL-9 AUTHENTICATED EXERCISE: hold-tier tap flips to blocked; wrong recipient is refused.
+const vjson = JSON.stringify(v.verdict)
+r = runCli(['veto', 'exercise', '--orig-digest=D1', '--by=human:main', '--resolved=433634012', '--tier=hold', '--reason=hold', `--verdict=${vjson}`, '--stamped-at=T'])
+let vx = JSON.parse(r.out)
+ok('hold-tier exercise -> blocked + chained record', vx.disposition === 'blocked' && vx.vetoRecord.origDigest === 'D1' && vx.vetoRecord.tier === 'hold')
+r = runCli(['veto', 'exercise', '--orig-digest=D1', '--by=human:main', '--resolved=433634012', '--tier=posthoc', `--verdict=${vjson}`, '--stamped-at=T'])
+vx = JSON.parse(r.out)
+ok('posthoc-tier exercise -> unwind required', vx.disposition === 'blocked' && vx.vetoRecord.unwindRequired === true)
+r = runCli(['veto', 'exercise', '--orig-digest=D1', '--by=human:main', '--resolved=999999', '--tier=hold', `--verdict=${vjson}`], {})
+ok('exercise from wrong recipient is refused (exit 9)', r.code === 9)
 
 // default roster when no seats given = the 5 standing seats (CNCL-8: the primary council now
 // requires a genesis roster — --genesis-exists mirrors bash finding the sealed genesis file).

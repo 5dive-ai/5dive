@@ -150,7 +150,21 @@ async function cmdConvene() {
   }
   const th = flag('threshold'); if (th != null && th !== true) input.threshold = Number(th)
   const tr = flag('threshold-rule'); if (tr) input.thresholdRule = tr
-  const vetoBy = flag('veto-by'); if (vetoBy) input.veto = { by: vetoBy, reason: flag('veto-reason') || '' }
+  // CNCL-9 FORGE REFUSAL: a veto can NEVER be asserted from a plain CLI string. Pre-CNCL-9,
+  // `--veto-by=<who>` flipped the verdict inline, so any agent could forge lodar's veto into a
+  // signed receipt. convene now REFUSES it outright (bash logs the attempt). convene only ever
+  // OFFERS the veto to the authenticated genesis principal; the flip happens later via the
+  // authenticated `council veto exercise` tap path, never here.
+  if (flag('veto-by') != null || flag('veto-reason') != null) {
+    die('refused: `--veto-by`/`--veto-reason` cannot assert a veto (a signed receipt is not forgeable from a string). The Council OFFERS the veto to the genesis principal; only an authenticated tap exercises it. This attempt is logged.', 9)
+  }
+  // Non-blocking veto OFFER: bash supplies the genesis-resolved principal + hold window on a
+  // primary-council convene. On a PASS the engine records the offer inside the sealed bytes;
+  // disposition stays `pass` (nobody waits — the ACTION waits, enforced downstream by CNCL-12).
+  const vp = flag('veto-principal'), vr = flag('veto-resolved')
+  if (vp && vp !== true && vr && vr !== true) {
+    input.vetoOffer = { principal: String(vp), resolved: String(vr), windowSecs: Number(flag('veto-window')) || 0 }
+  }
   // FLEET DEFAULT (CNCL-7): dispatch to the real seated agents (no model key). --standalone
   // (or COUNCIL_STANDALONE) selects the deferred single-key modelCall seam instead. COUNCIL_MOCK
   // runs either path offline. The engine records a timed-out/silent seat as an abstain.
@@ -264,10 +278,44 @@ function cmdInit() {
   out({ genesis: rec, canonical: E.canonicalGenesis(rec), bench: 'council', seats: rec.seats.map(s => s.id), chair: rec.chair })
 }
 
+// ---- CNCL-9: council veto exercise (authenticated tap → chained veto record) ----------------
+// Bash owns the authentication: it has already validated the tap came over the tier-2 nonce rail
+// from the recipient the veto was OFFERED to (--resolved), and it reads the sealed convene receipt
+// to supply --orig-digest + the original verdict. cli owns: reconstruct the flip, refuse a tap that
+// doesn't match the recorded offer (fail-closed), and emit the chained record + its canonical bytes
+// for bash to root-seal and hash-chain. cli NEVER trusts a --by string on its own — the resolved
+// recipient must equal the offer's resolved recipient, which only bash's nonce check can honour.
+function cmdVeto() {
+  const action = positionals[0] || ''
+  if (action !== 'exercise') die(`unknown veto action: ${action || '(none)'} (exercise)`)
+  const origDigest = flag('orig-digest')
+  if (!origDigest || origDigest === true) die('veto exercise needs --orig-digest=<sealed convene receipt digest>')
+  const by = flag('by'); if (!by || by === true) die('veto exercise needs --by=<principal>')
+  const resolved = flag('resolved'); if (!resolved || resolved === true) die('veto exercise needs --resolved=<recipient id> (the authenticated tap recipient)')
+  const tier = flag('tier') === 'posthoc' ? 'posthoc' : 'hold'
+  let verdict
+  try { verdict = JSON.parse(flag('verdict') || '') }
+  catch { die('veto exercise needs --verdict=<original verdict JSON> (bash reads it from the sealed receipt)') }
+  // The offer must be present on the original verdict AND its resolved recipient must equal the tap
+  // recipient — otherwise the tap did not come from the offered principal (fail-closed, refused).
+  const offer = verdict && verdict.vetoOffer
+  if (!offer || String(offer.resolved) !== String(resolved)) {
+    die('refused: this verdict carries no veto offer for that recipient — the tap is not from the offered principal (fail-closed).', 9)
+  }
+  const flipped = E.exerciseFounderVeto(verdict, { by: String(by), resolved: String(resolved), reason: flag('reason') || '', tier })
+  if (!flipped.vetoed) die('refused: verdict is not a vetoable pass (only an un-escalated pass with a matching offer can be vetoed).', 9)
+  const rec = E.buildVetoRecord({
+    origDigest: String(origDigest), tier, by: String(by), resolved: String(resolved),
+    reason: flag('reason') || '', stampedAt: flag('stamped-at') || '', flippedVerdict: flipped,
+  })
+  out({ vetoRecord: rec, flippedVerdict: flipped, disposition: E.dispositionOf(flipped), canonical: E.canonicalVetoRecord(rec) })
+}
+
 const main = async () => {
   if (sub === 'convene') return cmdConvene()
   if (sub === 'bench') return cmdBench()
   if (sub === 'init') return cmdInit()
-  die(`unknown council subcommand: ${sub} (convene|bench|init)`)
+  if (sub === 'veto') return cmdVeto()
+  die(`unknown council subcommand: ${sub} (convene|bench|init|veto)`)
 }
 main().catch(e => die(String(e && e.message || e), 1))

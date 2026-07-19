@@ -33,7 +33,7 @@ _council_help() {
 
   5dive council convene "<question>" [--seats=a,b,c] [--mode=quick|deliberate|adversarial]
                                      [--bench=<name>] [--class=<decisionClass>]
-                                     [--threshold=<n>] [--veto-by=<who> --veto-reason=<why>]
+                                     [--threshold=<n>]
                                      [--timeout=120] [--idle-secs=5] [--poll-secs=2] [--standalone]
       Convene a council over a question. By DEFAULT (CNCL-7) it DISPATCHES the question
       to the real seated agents — each seat votes via its OWN harness over the
@@ -42,9 +42,21 @@ _council_help() {
       quorum returns no verdict and auto-escalates with a human brief. The first round
       is BLIND (no seat sees another before its own vote); adversarial adds a rebuttal
       round, recorded separately. Emits an auditable verdict (deterministic tally over
-      the current roster + founder veto) and a tamper-evident, root-signed receipt.
-      Defaults to the 5-seat standing Council. --standalone selects the deferred
+      the current roster) and a tamper-evident, root-signed receipt. On a primary-council
+      PASS it also OFFERS the founder veto to the genesis principal (CNCL-9, non-blocking):
+      the pass stands, the receipt stamps executeAfter + a one-time tap nonce, and a ping
+      fires. Defaults to the 5-seat standing Council. --standalone selects the deferred
       single-key modelCall seam instead of dispatch.
+      (A veto can NEVER be asserted from a CLI string — `--veto-by` is refused; see below.)
+
+  5dive council veto exercise --receipt=<sealed digest> --nonce=<tap nonce>
+                              [--tier=hold|posthoc] [--reason=<why>]
+      Exercise the founder veto on a sealed pass — the authenticated tap. The one-time
+      nonce (minted at seal, bound to the offered recipient) authenticates it; `hold`
+      (within veto_hold, default 15m) flips the pass to BLOCKED before execution,
+      `posthoc` (until veto_posthoc, default 48h) flips it and flags an unwind. The flip
+      is a NEW root-sealed record hash-chained to the original verdict digest; the
+      original receipt is never mutated. Tier is auto-derived from the clock if omitted.
 
   5dive council bench ls
   5dive council bench show <name>
@@ -300,22 +312,124 @@ export function removeSeat(seats, seatId) {
   return (seats || []).filter(x => x.id !== seatId)
 }
 
-// (P3.1d) FOUNDER VETO: lodar can veto any pass. A veto flips a pass to blocked and is
-// RECORDED (goes into the signed receipt bytes via canonicalTranscript, so it's auditable
-// and non-forgeable). A non-pass verdict is returned unchanged (nothing to veto). Hard-gate
-// classes still surface to the founder regardless (that's the guardrail, upstream).
-export function applyFounderVeto(verdict, veto) {
-  if (!veto || !veto.by) return verdict
+// (CNCL-9) AUTHENTICATED FOUNDER VETO — non-blocking OFFER model.
+//
+// The pre-CNCL-9 design flipped the verdict inline from a plain `--veto-by` CLI STRING, so any
+// agent could forge lodar's veto straight into a signed receipt. That path is gone. Now:
+//
+//   1. convene NEVER waits for a tap and NEVER flips on a string. On a pass it records a
+//      timeboxed OFFER (attachVetoOffer) naming the resolved genesis principal + window, seals
+//      immediately, and the work proceeds. Expiry with no tap = the pass stands, and the receipt
+//      already reads `veto-offered-not-exercised` (default-proceed is the do-nothing path).
+//   2. The EXERCISE is a separate, authenticated event: only a tap confirmed on the tier-2 rail
+//      by the resolved principal (bash validates the nonce->recipient binding) calls
+//      exerciseFounderVeto, which flips the pass to BLOCKED inside a fresh record that is
+//      root-sealed and hash-chained onto the convene receipt (the original bytes are never
+//      re-sealed — post-hoc-after-seal re-seal stays deferred; the chain carries the flip).
+//   3. Veto is FINAL — no council override. Hard-gate classes escalate upstream regardless.
+
+// Non-blocking: attach a timeboxed veto OFFER to a pass. Disposition stays `pass` (the work is
+// not blocked); the offer rides inside the sealed bytes so "an offer was made" is auditable.
+// A non-pass verdict is returned unchanged (nothing to offer a veto on).
+export function attachVetoOffer(verdict, offer) {
+  if (!offer || !offer.principal || !offer.resolved) return verdict
   const passed = verdict.recommendation === 'approve' && !verdict.escalated
-  if (!passed) return verdict   // only a pass can be vetoed
+  if (!passed) return verdict
+  return {
+    ...verdict,
+    vetoOffer: {
+      principal: String(offer.principal),
+      resolved: String(offer.resolved),
+      windowSecs: Number(offer.windowSecs) || 0,
+      state: 'offered-not-exercised',
+    },
+  }
+}
+
+// Authenticated EXERCISE (the confirmed tap) — TWO-TIER (lodar-locked):
+//   tier='hold'    — the tap landed inside the 15m pre-execution hold; the work never ran.
+//   tier='posthoc' — the tap landed after execution (up to veto_posthoc/48h); the verdict is
+//                    overruled and the (reversible) work must be UNWOUND (manual unwind in v0.11).
+// `veto` MUST carry the principal the bash rail authenticated (veto.by) and the resolved recipient
+// the offer was made to (veto.resolved); bash has already proven the tap came from that recipient
+// over the tier-2 nonce rail — the engine never trusts a bare string. The flip only applies to a
+// verdict that carried the matching offer; anything else is returned unchanged (fail-closed).
+// This builds the FLIPPED verdict for a NEW record; the caller hash-chains it to the original
+// verdict digest and root-seals it. The original convene receipt is never re-signed or mutated.
+export function exerciseFounderVeto(verdict, veto) {
+  if (!veto || !veto.by || !veto.resolved) return verdict
+  const offer = verdict.vetoOffer
+  if (!offer || String(offer.resolved) !== String(veto.resolved)) return verdict
+  const passed = verdict.recommendation === 'approve' && !verdict.escalated
+  if (!passed) return verdict
+  const tier = veto.tier === 'posthoc' ? 'posthoc' : 'hold'
+  const briefHead = tier === 'posthoc'
+    ? `Post-hoc founder veto by ${veto.by}: pass (tally ${tallyStr(verdict.tally)}) overruled — reversible work must be unwound.`
+    : `Founder veto by ${veto.by}: pass (tally ${tallyStr(verdict.tally)}) held and flipped to BLOCKED before execution.`
   return {
     ...verdict,
     disposition: 'blocked',
     vetoed: true,
     vetoedBy: veto.by,
     vetoReason: veto.reason || '',
-    brief: `Founder veto by ${veto.by}: pass (tally ${tallyStr(verdict.tally)}) flipped to BLOCKED.${veto.reason ? ` Reason: ${veto.reason}` : ''}`,
+    vetoTier: tier,
+    unwindRequired: tier === 'posthoc',
+    vetoOffer: { ...offer, state: 'exercised' },
+    brief: `${briefHead}${veto.reason ? ` Reason: ${veto.reason}` : ''}`,
   }
+}
+
+// Veto window durations. lodar-locked defaults: 15m pre-execution HOLD, 48h POST-HOC override.
+// These are the seam CNCL-13/14 redirects to the `5dive.md` constitution — until then they read
+// from the environment (bash sources the constitution or falls back), NEVER inline magic numbers.
+export const VETO_DEFAULTS = { holdSecs: 15 * 60, posthocSecs: 48 * 60 * 60 }
+export function vetoConfig(env = {}) {
+  const n = (v, d) => { const x = Number(v); return Number.isFinite(x) && x > 0 ? x : d }
+  return {
+    holdSecs: n(env.COUNCIL_VETO_HOLD_SECS, VETO_DEFAULTS.holdSecs),
+    posthocSecs: n(env.COUNCIL_VETO_POSTHOC_SECS, VETO_DEFAULTS.posthocSecs),
+  }
+}
+
+// Build the chained veto RECORD emitted by an authenticated exercise. It is a distinct object from
+// the convene receipt: it references the original verdict digest (origDigest) so the whole history
+// links back without ever re-signing the original bytes. The caller root-seals `canonical` and
+// stores {digest, prevDigest: origDigest, ...} — same hash-chain discipline as the genesis lineage.
+export function buildVetoRecord({ origDigest, tier, by, resolved, reason, stampedAt, flippedVerdict }) {
+  if (!origDigest) throw new Error('veto record needs the original verdict digest to chain to')
+  if (!by || !resolved) throw new Error('veto record needs an authenticated principal (by) + resolved recipient')
+  const t = tier === 'posthoc' ? 'posthoc' : 'hold'
+  return {
+    kind: 'veto',
+    tier: t,
+    origDigest: String(origDigest),
+    by: String(by),
+    resolved: String(resolved),
+    reason: reason || '',
+    unwindRequired: t === 'posthoc',
+    stampedAt: stampedAt || '',
+    disposition: 'blocked',
+    tally: (flippedVerdict && flippedVerdict.tally) || null,
+  }
+}
+
+// Deterministic, whitespace-normalized preimage of a veto record — the origDigest link is INSIDE
+// the signed bytes so the chain cannot be re-pointed, and the tier/unwind flag cannot be stripped.
+export function canonicalVetoRecord(rec) {
+  const norm = (s) => String(s == null ? '' : s).replace(/\s+/g, ' ').trim()
+  const t = rec.tally || {}
+  return [
+    `kind: veto`,
+    `tier: ${norm(rec.tier)}`,
+    `origDigest: ${norm(rec.origDigest)}`,
+    `by: ${norm(rec.by)}`,
+    `resolved: ${norm(rec.resolved)}`,
+    `reason: ${norm(rec.reason)}`,
+    `unwindRequired: ${!!rec.unwindRequired}`,
+    `stampedAt: ${norm(rec.stampedAt)}`,
+    `disposition: blocked`,
+    `tally: a${Number(t.approve) || 0}/r${Number(t.reject) || 0}/e${Number(t.escalate) || 0}`,
+  ].join('\n')
 }
 
 // The plain-English disposition of a (possibly vetoed) verdict.
@@ -351,8 +465,18 @@ export function canonicalTranscript(rec) {
   const t = vd.tally || {}
   L.push(`verdict: ${norm(vd.recommendation != null ? vd.recommendation : vd.choice)} conf=${Number(vd.confidence)} tally=a${Number(t.approve) || 0}/r${Number(t.reject) || 0}/e${Number(t.escalate) || 0} escalated=${!!vd.escalated}`)
   L.push(`dissent: ${norm(vd.dissent)}`)
-  // Founder veto rides INSIDE the signed bytes so a recorded veto cannot be quietly stripped.
-  L.push(`veto: ${vd.vetoed ? `${norm(vd.vetoedBy)} :: ${norm(vd.vetoReason)}` : 'none'}`)
+  // CNCL-9: the veto OFFER and (if it happened) the EXERCISE both ride INSIDE the signed bytes,
+  // so neither "an offer was made" nor "it was/wasn't exercised" can be quietly stripped. The
+  // convene receipt seals with the offer's default `offered-not-exercised` state; a confirmed tap
+  // seals its `exercised` flip in the CHAINED veto record (see exerciseFounderVeto), not by
+  // re-signing these bytes.
+  if (vd.vetoed) {
+    L.push(`veto: exercised ${norm(vd.vetoTier || 'hold')} ${norm(vd.vetoedBy)} :: ${norm(vd.vetoReason)}`)
+  } else if (vd.vetoOffer) {
+    L.push(`veto: offered ${norm(vd.vetoOffer.principal)} window ${Number(vd.vetoOffer.windowSecs) || 0}s :: ${norm(vd.vetoOffer.state || 'offered-not-exercised')}`)
+  } else {
+    L.push('veto: none')
+  }
   return L.join('\n')
 }
 
@@ -768,7 +892,9 @@ async function runConvene(input, deps, h) {
     const narr = await chairNarrative(modelCall, question, finalVotes)
     verdict = buildConveneVerdict(counted, narr)
   }
-  verdict = applyFounderVeto(verdict, input.veto)
+  // CNCL-9: convene only ever OFFERS the veto (non-blocking); the flip happens later, and only
+  // via an authenticated tap on the tier-2 rail (exerciseFounderVeto). No string ever flips here.
+  verdict = attachVetoOffer(verdict, input.vetoOffer)
   return finish(role, input, {
     question, mode, seats, guardrail: null, convened: true,
     takes: [], votes: finalVotes, round1Votes, rebuttalVotes, verdict,
@@ -994,7 +1120,21 @@ async function cmdConvene() {
   }
   const th = flag('threshold'); if (th != null && th !== true) input.threshold = Number(th)
   const tr = flag('threshold-rule'); if (tr) input.thresholdRule = tr
-  const vetoBy = flag('veto-by'); if (vetoBy) input.veto = { by: vetoBy, reason: flag('veto-reason') || '' }
+  // CNCL-9 FORGE REFUSAL: a veto can NEVER be asserted from a plain CLI string. Pre-CNCL-9,
+  // `--veto-by=<who>` flipped the verdict inline, so any agent could forge lodar's veto into a
+  // signed receipt. convene now REFUSES it outright (bash logs the attempt). convene only ever
+  // OFFERS the veto to the authenticated genesis principal; the flip happens later via the
+  // authenticated `council veto exercise` tap path, never here.
+  if (flag('veto-by') != null || flag('veto-reason') != null) {
+    die('refused: `--veto-by`/`--veto-reason` cannot assert a veto (a signed receipt is not forgeable from a string). The Council OFFERS the veto to the genesis principal; only an authenticated tap exercises it. This attempt is logged.', 9)
+  }
+  // Non-blocking veto OFFER: bash supplies the genesis-resolved principal + hold window on a
+  // primary-council convene. On a PASS the engine records the offer inside the sealed bytes;
+  // disposition stays `pass` (nobody waits — the ACTION waits, enforced downstream by CNCL-12).
+  const vp = flag('veto-principal'), vr = flag('veto-resolved')
+  if (vp && vp !== true && vr && vr !== true) {
+    input.vetoOffer = { principal: String(vp), resolved: String(vr), windowSecs: Number(flag('veto-window')) || 0 }
+  }
   // FLEET DEFAULT (CNCL-7): dispatch to the real seated agents (no model key). --standalone
   // (or COUNCIL_STANDALONE) selects the deferred single-key modelCall seam instead. COUNCIL_MOCK
   // runs either path offline. The engine records a timed-out/silent seat as an abstain.
@@ -1108,11 +1248,45 @@ function cmdInit() {
   out({ genesis: rec, canonical: E.canonicalGenesis(rec), bench: 'council', seats: rec.seats.map(s => s.id), chair: rec.chair })
 }
 
+// ---- CNCL-9: council veto exercise (authenticated tap → chained veto record) ----------------
+// Bash owns the authentication: it has already validated the tap came over the tier-2 nonce rail
+// from the recipient the veto was OFFERED to (--resolved), and it reads the sealed convene receipt
+// to supply --orig-digest + the original verdict. cli owns: reconstruct the flip, refuse a tap that
+// doesn't match the recorded offer (fail-closed), and emit the chained record + its canonical bytes
+// for bash to root-seal and hash-chain. cli NEVER trusts a --by string on its own — the resolved
+// recipient must equal the offer's resolved recipient, which only bash's nonce check can honour.
+function cmdVeto() {
+  const action = positionals[0] || ''
+  if (action !== 'exercise') die(`unknown veto action: ${action || '(none)'} (exercise)`)
+  const origDigest = flag('orig-digest')
+  if (!origDigest || origDigest === true) die('veto exercise needs --orig-digest=<sealed convene receipt digest>')
+  const by = flag('by'); if (!by || by === true) die('veto exercise needs --by=<principal>')
+  const resolved = flag('resolved'); if (!resolved || resolved === true) die('veto exercise needs --resolved=<recipient id> (the authenticated tap recipient)')
+  const tier = flag('tier') === 'posthoc' ? 'posthoc' : 'hold'
+  let verdict
+  try { verdict = JSON.parse(flag('verdict') || '') }
+  catch { die('veto exercise needs --verdict=<original verdict JSON> (bash reads it from the sealed receipt)') }
+  // The offer must be present on the original verdict AND its resolved recipient must equal the tap
+  // recipient — otherwise the tap did not come from the offered principal (fail-closed, refused).
+  const offer = verdict && verdict.vetoOffer
+  if (!offer || String(offer.resolved) !== String(resolved)) {
+    die('refused: this verdict carries no veto offer for that recipient — the tap is not from the offered principal (fail-closed).', 9)
+  }
+  const flipped = E.exerciseFounderVeto(verdict, { by: String(by), resolved: String(resolved), reason: flag('reason') || '', tier })
+  if (!flipped.vetoed) die('refused: verdict is not a vetoable pass (only an un-escalated pass with a matching offer can be vetoed).', 9)
+  const rec = E.buildVetoRecord({
+    origDigest: String(origDigest), tier, by: String(by), resolved: String(resolved),
+    reason: flag('reason') || '', stampedAt: flag('stamped-at') || '', flippedVerdict: flipped,
+  })
+  out({ vetoRecord: rec, flippedVerdict: flipped, disposition: E.dispositionOf(flipped), canonical: E.canonicalVetoRecord(rec) })
+}
+
 const main = async () => {
   if (sub === 'convene') return cmdConvene()
   if (sub === 'bench') return cmdBench()
   if (sub === 'init') return cmdInit()
-  die(`unknown council subcommand: ${sub} (convene|bench|init)`)
+  if (sub === 'veto') return cmdVeto()
+  die(`unknown council subcommand: ${sub} (convene|bench|init|veto)`)
 }
 main().catch(e => die(String(e && e.message || e), 1))
 COUNCIL_CLI_MJS
@@ -1138,6 +1312,179 @@ _council_resolve_principal() {
       return 0 ;;
     *) [[ "$p" =~ ^[0-9]+$ ]] && printf '%s' "$p"; return 0 ;;
   esac
+}
+
+# CNCL-9: SHA-256 hex of a string (the nonce-digest primitive; seal stores the digest, exercise
+# hashes the presented nonce and compares). Empty on a missing sha256sum (fail-closed downstream).
+_council_sha256() { printf '%s' "${1:-}" | sha256sum 2>/dev/null | awk '{print $1}'; }
+
+# CNCL-9 (main gate amendment 3): durable audit trail for REFUSED veto attempts — a forged
+# `--veto-by` CLI string on convene, or a nonce/recipient mismatch on exercise. "refused + logged"
+# must mean a real line on disk a test can assert, not just an stderr message. The file is
+# attacker-triggerable, so it is root-owned 0600 (never group-readable).
+_council_veto_audit() {
+  local event="$1" ref="${2:-}" subject="${3:-}"
+  mkdir -p "$COUNCIL_DIR" 2>/dev/null || true
+  [[ -w "$COUNCIL_DIR" || -f "${COUNCIL_DIR}/veto-audit.jsonl" ]] || return 0
+  local line
+  line="$(jq -cn --arg e "$event" --arg r "$ref" --arg s "$subject" --arg u "$(id -un 2>/dev/null)" \
+    '{ts:(now|todate? // ""), event:$e, ref:$r, subject:$s, by:$u, kind:"veto-refused"}' 2>/dev/null)" || return 0
+  printf '%s\n' "$line" >> "${COUNCIL_DIR}/veto-audit.jsonl" 2>/dev/null || true
+  chmod 0600 "${COUNCIL_DIR}/veto-audit.jsonl" 2>/dev/null || true
+  [[ "$(id -u)" -eq 0 ]] && chown root:root "${COUNCIL_DIR}/veto-audit.jsonl" 2>/dev/null || true
+  return 0
+}
+
+# CNCL-9: fire the founder veto ping at seal (non-blocking, best-effort). Records a durable ping
+# entry (so "the ping fired" is observable + testable) and attempts a live notify to the resolved
+# recipient. The tappable button + its callback -> `council veto exercise` is the telegram-plugin
+# leg that pairs with a live genesis; this CLI leg guarantees the recipient is notified with the
+# receipt handle + the one-time nonce the tap must present.
+_council_veto_ping() {
+  local resolved="$1" digest="$2" execute_after="$3" nonce="$4"
+  mkdir -p "$COUNCIL_DIR" 2>/dev/null || true
+  # CNCL-9 (main gate amendment 2): the pings audit records ONLY the nonce DIGEST, never the raw
+  # bearer token. The raw nonce leaves this process solely via the founder delivery leg (_tg_send)
+  # below. The file is additionally locked 0600 root so a group-claude agent cannot read even the
+  # digest+recipient trail.
+  local nonce_digest; nonce_digest="$(_council_sha256 "$nonce")"
+  local line
+  line="$(jq -cn --arg r "$resolved" --arg d "$digest" --arg ea "$execute_after" --arg nd "$nonce_digest" \
+    '{ts:(now|todate? // ""), recipient:$r, receiptDigest:$d, executeAfter:$ea, nonceDigest:$nd, kind:"veto-offer"}' 2>/dev/null)" || line=""
+  if [[ -n "$line" && -w "$COUNCIL_DIR" ]]; then
+    printf '%s\n' "$line" >> "${COUNCIL_DIR}/veto-pings.jsonl" 2>/dev/null || true
+    chmod 0600 "${COUNCIL_DIR}/veto-pings.jsonl" 2>/dev/null || true
+    [[ "$(id -u)" -eq 0 ]] && chown root:root "${COUNCIL_DIR}/veto-pings.jsonl" 2>/dev/null || true
+  fi
+  # Founder delivery leg: the RAW one-time nonce is delivered ONLY here, to the resolved recipient.
+  # A missing rail must never fail the (already-sealed) convene. Skipped under MOCK (offline tests
+  # exercise the durable audit above without touching a live telegram rail).
+  if [[ -z "${COUNCIL_MOCK:-}" ]] && command -v _tg_send >/dev/null 2>&1; then
+    _tg_send "$resolved" "Council veto offer — a pass sealed (${digest:0:12}…). Execution holds until ${execute_after}. Tap to VETO (nonce ${nonce}), or ignore to let it proceed." >/dev/null 2>&1 || true
+  fi
+  return 0
+}
+
+# CNCL-9: authenticated founder veto EXERCISE (the confirmed tap). bash owns authentication (the
+# one-time nonce minted at seal, bound to the offered recipient); cli owns the fail-closed flip +
+# the chained record. The original convene receipt is NEVER re-sealed or mutated — the veto is a
+# NEW root-sealed record hash-chained to the original verdict digest.
+#   5dive council veto exercise --receipt=<sealed digest> --nonce=<tap nonce> [--tier=hold|posthoc]
+#                               [--reason=<why>]
+_council_veto() {
+  local dir="$1"; shift
+  [[ "${1:-}" == "exercise" ]] || fail "$E_USAGE" "unknown veto action: ${1:-} (exercise)"
+  shift
+  local rcpt_digest="" nonce="" tier="" reason=""
+  local a
+  for a in "$@"; do
+    case "$a" in
+      --receipt=*) rcpt_digest="${a#--receipt=}" ;;
+      --nonce=*)   nonce="${a#--nonce=}" ;;
+      --tier=*)    tier="${a#--tier=}" ;;
+      --reason=*)  reason="${a#--reason=}" ;;
+    esac
+  done
+  [[ -n "$rcpt_digest" ]] || fail "$E_USAGE" "veto exercise needs --receipt=<sealed convene receipt digest>"
+  [[ -n "$nonce" ]]       || fail "$E_PERMISSION" "veto exercise needs --nonce=<the one-time tap nonce> (an unauthenticated exercise is refused)"
+
+  # Locate the sealed convene receipt by its digest.
+  local rf found=""
+  if [[ -d "$COUNCIL_RECEIPTS" ]]; then
+    for rf in "$COUNCIL_RECEIPTS"/*.json; do
+      [[ -f "$rf" ]] || continue
+      [[ "$(jq -r '.sealedDigest // empty' "$rf" 2>/dev/null)" == "$rcpt_digest" ]] && { found="$rf"; break; }
+    done
+  fi
+  [[ -n "$found" ]] || fail "$E_GENERIC" "no sealed council receipt with digest ${rcpt_digest:0:16}… (fail-closed)"
+
+  # HARDENING (main gate): before trusting ANY field of the receipt (.verdict / .vetoNonceDigest /
+  # .vetoOffer), re-seal its canonical bytes on the gate-proof rail and confirm they match the
+  # stored sealedDigest. A receipt whose body was edited (swapped nonce digest, flipped verdict,
+  # widened offer) fails HERE — fail-closed — so the authenticated-tap path only ever acts on a
+  # byte-intact receipt.
+  local rcanon rseal=""
+  rcanon="$(jq -r '.canonical // empty' "$found" 2>/dev/null)"
+  [[ -n "$rcanon" ]] || fail "$E_GENERIC" "sealed receipt carries no canonical bytes to re-verify (fail-closed)"
+  if [[ "$(id -u)" -eq 0 ]]; then rseal="$(printf '%s' "$rcanon" | cmd_gate_proof_sign_stdin 2>/dev/null)" || rseal=""
+  else rseal="$(printf '%s' "$rcanon" | sudo -n 5dive gate-proof sign 2>/dev/null)" || rseal=""; fi
+  [[ -n "$rseal" ]] || fail "$E_GENERIC" "cannot re-seal the receipt canonical (need root + an enforce key) — refusing to trust an unverifiable receipt (fail-closed)"
+  [[ "$rseal" == "$rcpt_digest" ]] || { _council_veto_audit "receipt-tampered" "$rcpt_digest"; fail "$E_PERMISSION" "receipt canonical does not re-seal to its sealedDigest — the receipt was tampered (refused + logged, fail-closed)"; }
+
+  # AUTHENTICATE the tap: sha256(presented nonce) must equal the nonce DIGEST minted for THIS offer.
+  # The raw nonce is never stored server-side (only its digest rides in the receipt), so a
+  # group-readable receipt no longer leaks the bearer token (main gate amendment 2).
+  local stored_nonce_digest offer_resolved offer_principal execute_after stamped_at verdict_json
+  stored_nonce_digest="$(jq -r '.vetoNonceDigest // empty' "$found" 2>/dev/null)"
+  offer_resolved="$(jq -r '.verdict.vetoOffer.resolved // empty' "$found" 2>/dev/null)"
+  offer_principal="$(jq -r '.verdict.vetoOffer.principal // empty' "$found" 2>/dev/null)"
+  execute_after="$(jq -r '.executeAfter // empty' "$found" 2>/dev/null)"
+  stamped_at="$(jq -r '.stampedAt // empty' "$found" 2>/dev/null)"
+  [[ -n "$stored_nonce_digest" && -n "$offer_resolved" ]] || fail "$E_GENERIC" "receipt carries no veto offer to exercise (fail-closed)"
+  local presented_digest; presented_digest="$(_council_sha256 "$nonce")"
+  [[ -n "$presented_digest" && "$presented_digest" == "$stored_nonce_digest" ]] || { _council_veto_audit "nonce-mismatch" "$rcpt_digest" "$offer_resolved"; fail "$E_PERMISSION" "veto nonce mismatch — this tap is not the one offered to the founder principal (refused + logged)"; }
+
+  # Derive the tier from the clock unless explicitly given: within the HOLD window -> hold; after it
+  # (up to veto_posthoc) -> posthoc; beyond posthoc -> refused (the veto has expired, pass is final).
+  local now_e ea_e st_e posthoc="${COUNCIL_VETO_POSTHOC_SECS:-172800}"
+  [[ "$posthoc" =~ ^[0-9]+$ ]] || posthoc=172800
+  now_e="$(date -u +%s)"
+  ea_e="$(date -u -d "$execute_after" +%s 2>/dev/null || echo 0)"
+  st_e="$(date -u -d "$stamped_at" +%s 2>/dev/null || echo 0)"
+  if [[ -z "$tier" ]]; then
+    if (( ea_e > 0 && now_e < ea_e )); then tier="hold"; else tier="posthoc"; fi
+  fi
+  if [[ "$tier" == "posthoc" ]] && (( st_e > 0 && now_e > st_e + posthoc )); then
+    fail "$E_GENERIC" "veto window expired (past veto_posthoc=${posthoc}s from seal) — the pass is final, no override (fail-closed)"
+  fi
+
+  verdict_json="$(jq -c '.verdict' "$found" 2>/dev/null)"
+  local stamped; stamped="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  local vraw
+  vraw="$(node "$dir/cli.mjs" veto exercise \
+    --orig-digest="$rcpt_digest" --by="$offer_principal" --resolved="$offer_resolved" \
+    --tier="$tier" --reason="$reason" --verdict="$verdict_json" --stamped-at="$stamped")" || return $?
+
+  # Root-seal the chained veto record and hash-chain it onto the original verdict digest. Same rail
+  # + discipline as the genesis lineage; the original receipt bytes are left untouched.
+  local canonical vdigest=""
+  canonical="$(printf '%s' "$vraw" | jq -r '.canonical // empty')"
+  if [[ -n "$canonical" ]]; then
+    if [[ "$(id -u)" -eq 0 ]]; then vdigest="$(printf '%s' "$canonical" | cmd_gate_proof_sign_stdin)" || vdigest=""
+    else vdigest="$(printf '%s' "$canonical" | sudo -n 5dive gate-proof sign 2>/dev/null)" || vdigest=""; fi
+  fi
+  [[ -n "$vdigest" ]] || fail "$E_GENERIC" "could not seal the veto record on the gate-proof rail (need root + an enforce key) — veto NOT recorded"
+
+  if [[ -w "$COUNCIL_RECEIPTS" ]]; then
+    printf '%s' "$vraw" | jq --arg d "$vdigest" --arg p "$rcpt_digest" --arg s "$stamped" \
+      '{kind:"veto", stampedAt:$s, sealedDigest:$d, prevDigest:$p, tier: .vetoRecord.tier, unwindRequired: .vetoRecord.unwindRequired, record: .vetoRecord, flippedVerdict: .flippedVerdict, canonical: .canonical}' \
+      > "${COUNCIL_RECEIPTS}/veto-${stamped//:/-}.json" 2>/dev/null || true
+  fi
+  # Append to the tamper-evident lineage. CNCL-9 (main gate amendment 1): the jsonl WRAPPER must
+  # hash-chain to the LINEAGE head (prevDigest = the last lineage entry's digest, seq = last+1) so
+  # `council lineage verify` stays green after a veto. The veto->original-verdict link is NOT lost:
+  # it already rides INSIDE the signed record (record.prevDigest = the original verdict digest,
+  # sealed in the canonical bytes). We keep it in the wrapper too, as `origDigest`, for readers.
+  if [[ -f "$COUNCIL_LINEAGE" || -w "$COUNCIL_DIR" ]]; then
+    local l_prev="" l_seq=0
+    if [[ -f "$COUNCIL_LINEAGE" ]]; then
+      l_prev="$(tail -n1 "$COUNCIL_LINEAGE" 2>/dev/null | jq -r '.digest // ""' 2>/dev/null)"
+      local l_last; l_last="$(tail -n1 "$COUNCIL_LINEAGE" 2>/dev/null | jq -r '.seq // -1' 2>/dev/null)"
+      [[ "$l_last" =~ ^[0-9]+$ ]] && l_seq=$((l_last+1))
+    fi
+    printf '%s' "$vraw" | jq -c --arg d "$vdigest" --arg lp "$l_prev" --arg od "$rcpt_digest" --arg sq "$l_seq" --arg s "$stamped" \
+      '{seq: ($sq|tonumber), kind:"veto", stampedAt:$s, digest:$d, prevDigest:$lp, origDigest:$od, canonical: .canonical, record: .vetoRecord}' \
+      >> "$COUNCIL_LINEAGE" 2>/dev/null || true
+  fi
+
+  if (( JSON_MODE )); then
+    printf '%s' "$vraw" | jq --arg d "$vdigest" --arg p "$rcpt_digest" '{ok:true, data: (. + {sealedDigest:$d, prevDigest:$p})}'
+  else
+    echo "veto:         EXERCISED (${tier}) by ${offer_principal}"
+    echo "disposition:  blocked  (pass overruled; original verdict left sealed + immutable)"
+    [[ "$tier" == "posthoc" ]] && echo "unwind:       REQUIRED — reversible work must be manually unwound (v0.11)"
+    echo "chained:      veto ${vdigest:0:16}… -> verdict ${rcpt_digest:0:16}…"
+  fi
 }
 
 _council_init_or_lineage() {
@@ -1247,8 +1594,8 @@ cmd_council() {
   local sub="${1:-}"; [[ $# -gt 0 ]] && shift || true
   case "$sub" in
     ""|-h|--help|help) _council_help; return 0 ;;
-    convene|bench|init|lineage) ;;
-    *) fail "$E_USAGE" "unknown council command: $sub (convene|bench|init|lineage)" ;;
+    convene|bench|init|lineage|veto) ;;
+    *) fail "$E_USAGE" "unknown council command: $sub (convene|bench|init|lineage|veto)" ;;
   esac
 
   local dir; dir="$(mktemp -d -t 5dive-council.XXXXXX)" || fail "$E_GENERIC" "mktemp failed"
@@ -1259,6 +1606,12 @@ cmd_council() {
   # CNCL-8: council init (human-seeded genesis) + lineage verify -----------
   if [[ "$sub" == "init" || "$sub" == "lineage" ]]; then
     _council_init_or_lineage "$sub" "$dir" "$@"
+    return $?
+  fi
+
+  # CNCL-9: authenticated founder veto exercise (the confirmed tap) ---------
+  if [[ "$sub" == "veto" ]]; then
+    _council_veto "$dir" "$@"
     return $?
   fi
 
@@ -1289,8 +1642,39 @@ cmd_council() {
   # convene ------------------------------------------------------------------
   local stamped; stamped="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   local genesis_exists=0; [[ -f "$COUNCIL_GENESIS" ]] && genesis_exists=1
+
+  # CNCL-9 (main gate amendment 3): a `--veto-by` / `--veto-reason` on convene is a FORGE attempt —
+  # an agent trying to assert a veto from a plain CLI string. cli.mjs refuses it (exit 9), but the
+  # acceptance says "refused + LOGGED", so we write the durable audit line HERE before dispatch,
+  # independent of cli's ordering (the refusal message still comes from cli). A test asserts it.
+  local _fa _forge=""
+  for _fa in "$@"; do
+    case "$_fa" in
+      --veto-by=*|--veto-by|--veto-reason=*|--veto-reason)
+        _forge="${_forge:+$_forge,}${_fa%%=*}" ;;
+    esac
+  done
+  [[ -n "$_forge" ]] && _council_veto_audit "forge-attempt-veto-by" "convene" "$_forge"
+
+  # CNCL-9: on a PRIMARY-council convene we OFFER the founder veto to the genesis principal. The
+  # offer rides inside the sealed receipt; the flip only ever happens later via an authenticated
+  # tap (`council veto exercise`). We pass the genesis-resolved principal + the HOLD window (the
+  # veto_hold constitution key; env-overridable seam until CNCL-13/14) down to the engine so the
+  # offer is recorded on a pass. Ad-hoc panels (no genesis) get no offer.
+  local -a veto_args=()
+  local veto_hold="${COUNCIL_VETO_HOLD_SECS:-900}"
+  [[ "$veto_hold" =~ ^[0-9]+$ ]] || veto_hold=900
+  if (( genesis_exists )); then
+    local g_principal g_resolved
+    g_principal="$(jq -r '.veto.principal // empty' "$COUNCIL_GENESIS" 2>/dev/null)"
+    g_resolved="$(jq -r '.veto.resolved // empty' "$COUNCIL_GENESIS" 2>/dev/null)"
+    if [[ -n "$g_principal" && -n "$g_resolved" ]]; then
+      veto_args=(--veto-principal="$g_principal" --veto-resolved="$g_resolved" --veto-window="$veto_hold")
+    fi
+  fi
+
   local raw
-  raw="$(node "$dir/cli.mjs" convene "$@" --registry="$COUNCIL_REGISTRY" --genesis-exists="$genesis_exists" --stamped-at="$stamped")" || return $?
+  raw="$(node "$dir/cli.mjs" convene "$@" "${veto_args[@]}" --registry="$COUNCIL_REGISTRY" --genesis-exists="$genesis_exists" --stamped-at="$stamped")" || return $?
 
   # Seal the receipt canonical at the root HMAC rail — a standalone engine has no
   # key, so the seal (via gate-proof) is what makes the verdict tamper-evident. The
@@ -1306,9 +1690,41 @@ cmd_council() {
     if [[ -n "$digest" ]]; then
       mkdir -p "$COUNCIL_RECEIPTS" 2>/dev/null || true
       if [[ -w "$COUNCIL_RECEIPTS" ]]; then
-        printf '%s' "$raw" | jq --arg d "$digest" --arg s "$stamped" \
-          '{stampedAt:$s, sealedDigest:$d, council, question, disposition, verdict, canonical: .receipt.canonical}' \
+        # CNCL-9: if the sealed verdict carries a veto OFFER (a primary-council pass), stamp the
+        # HOLD deadline (executeAfter = sealedAt + veto_hold) and mint a one-time tap nonce bound
+        # to the offered recipient. Nobody waits synchronously — the receipt CARRIES executeAfter
+        # and the interim policy (main, operator) is that no consumer acts before it; CNCL-12 makes
+        # every consumer enforce it. The nonce is what the authenticated tap presents to exercise.
+        local offer_resolved execute_after="" veto_nonce="" veto_nonce_digest=""
+        offer_resolved="$(printf '%s' "$raw" | jq -r '.verdict.vetoOffer.resolved // empty' 2>/dev/null)"
+        if [[ -n "$offer_resolved" ]]; then
+          execute_after="$(date -u -d "$stamped + ${veto_hold} seconds" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo "")"
+          veto_nonce="$(openssl rand -hex 16 2>/dev/null || head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+          veto_nonce_digest="$(_council_sha256 "$veto_nonce")"
+        fi
+        # Offline-test capture ONLY: when MOCK is on AND a sink path is provided, drop the raw nonce
+        # so the bash e2e can present it at exercise. Double-gated on COUNCIL_MOCK (never set in a
+        # real convene) + COUNCIL_VETO_NONCE_SINK, so PRODUCTION never writes the raw nonce to disk —
+        # in prod it leaves solely via the _tg_send founder delivery leg (main gate amendment 2).
+        if [[ -n "$veto_nonce" && -n "${COUNCIL_MOCK:-}" && -n "${COUNCIL_VETO_NONCE_SINK:-}" ]]; then
+          ( umask 077; printf '%s\n' "$veto_nonce" > "$COUNCIL_VETO_NONCE_SINK" ) 2>/dev/null || true
+        fi
+        # CNCL-9 (main gate amendment 2): the receipt is the FLEET-READABLE audit artifact (verify +
+        # the DIVE-1493 dashboard render it), so it stores ONLY the nonce DIGEST. The raw nonce never
+        # touches the receipt; it is delivered solely to the founder via _council_veto_ping below.
+        # Exercise authenticates by hashing the presented nonce and comparing to this digest.
+        printf '%s' "$raw" | jq --arg d "$digest" --arg s "$stamped" --arg ea "$execute_after" --arg nd "$veto_nonce_digest" \
+          '{stampedAt:$s, sealedDigest:$d, council, question, disposition, verdict, canonical: .receipt.canonical}
+           + (if ($ea|length)>0 then {executeAfter:$ea} else {} end)
+           + (if ($nd|length)>0 then {vetoNonceDigest:$nd} else {} end)' \
           > "${COUNCIL_RECEIPTS}/${stamped//:/-}.json" 2>/dev/null || true
+        # Fire the founder ping at seal (non-blocking, best-effort). Writes the durable digest-only
+        # pings audit (0600) always; the live _tg_send notify (which carries the raw nonce) is
+        # skipped under MOCK. The tappable button + its callback -> `council veto exercise` routing
+        # is the telegram-plugin leg that pairs with a live genesis (post-seed).
+        if [[ -n "$offer_resolved" ]]; then
+          _council_veto_ping "$offer_resolved" "$digest" "$execute_after" "$veto_nonce" || true
+        fi
       fi
     fi
   fi
