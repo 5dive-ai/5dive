@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.11.6 — gate delivery receipts + 1h/24h batched re-nags (DIVE-1490) (2026-07-19)
+
+- fix(gates): gate alerts now treat Telegram's structured Bot API acknowledgement as the delivery receipt instead of treating a best-effort curl as success. A confirmed send stamps `gate_pinged_at` and records the returned `message_id`; a rejected or empty response emits a loud warning and durable delivery event, leaves the receipt unset for retry, and falls back to an allowed group topic so the alert remains visible.
+- fix(heartbeat): unanswered gates receive a first button-bearing re-nag after 1 hour and subsequent re-nags every 24 hours, batching all due gates for each resolved recipient into one message with per-gate tap rows. Tier-2 gates use the filing agent's paired-human channel, tier-1 gates retain org-lead routing, failed sends do not advance the throttle or rotate human nonces, and the existing 72-hour/7-day backlog reminder remains receipt-throttled without a migration.
+- test(gates): add isolated kill coverage for a bad DM target → loud failure + recorded, button-bearing group fallback, plus cadence coverage proving no pre-1h ping, two due gates → one batch with working decision/approval buttons, 24h re-fire, tier-1 lead routing, and failure-state idempotence.
+
 ## 0.11.5 — The Council: human-seeded genesis roster, `council init` (CNCL-8) (2026-07-19)
 
 - feat(council): new sudo-gated, one-time `5dive council init --seats=<a:chair,b,c> --threshold=<majority|all|N|a/b> --veto=<principal>` seeds the primary `council` bench from a human-supplied roster, sealing an immutable genesis record on the root gate-proof rail and hash-chaining it into `${STATE_DIR}/council/lineage.jsonl`. Enforces the governance invariant that an agent must not bootstrap its own council's membership (the write path is root-owned; a non-sudo init is refused).
