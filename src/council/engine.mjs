@@ -141,7 +141,7 @@ export const STANDING_COUNCILS = {
     description: 'Ship-worthiness of a build/diff before it goes live.',
     mode: 'deliberate',
     seats: [
-      { id: 'mark', lens: 'Review, correctness, ship-worthiness. Reversible? Tested? Any regression?' },
+      { id: 'reviewer', lens: 'Review, correctness, ship-worthiness. Reversible? Tested? Any regression?' },
       { id: 'security', lens: 'Injection, blast radius, secrets, auth boundaries.' },
       { id: 'cost', lens: 'Token + infra spend, capacity/egress, provider concentration.' },
     ],
@@ -150,9 +150,9 @@ export const STANDING_COUNCILS = {
     description: 'Customer-facing / brand + messaging call on a mature surface.',
     mode: 'deliberate',
     seats: [
-      { id: 'theo', agent: 'marketing', lens: 'Brand + customer read; how it lands, support load.' },
-      { id: 'mark', lens: 'Operational soundness + ship-worthiness.' },
-      { id: 'lilbro', agent: 'creative', lens: 'Divergent/contrarian; the take everyone is too polite to say.' },
+      { id: 'brand', lens: 'Brand + customer read; how it lands, support load.' },
+      { id: 'operator', lens: 'Operational soundness + ship-worthiness.' },
+      { id: 'contrarian', lens: 'Divergent/contrarian; the take everyone is too polite to say.' },
     ],
   },
   security: {
@@ -160,8 +160,8 @@ export const STANDING_COUNCILS = {
     mode: 'adversarial',
     seats: [
       { id: 'security', lens: 'Injection, privilege, blast radius, forgeability.' },
-      { id: 'redteam', lens: 'Actively try to REFUTE the leading option / find the bypass.' },
-      { id: 'mark', lens: 'Correctness + reversibility of the change.' },
+      { id: 'red-team', lens: 'Actively try to REFUTE the leading option / find the bypass.' },
+      { id: 'reviewer', lens: 'Correctness + reversibility of the change.' },
     ],
   },
 }
@@ -175,7 +175,7 @@ export function resolveCouncil(name, registry = STANDING_COUNCILS) {
   return { name, description: c.description, mode: c.mode, seats: c.seats }
 }
 
-// (P3.1b) THE default Council (lodar's spec): a self-governed standing body of NAMED
+// (P3.1b) THE default Council: a self-governed standing body of role-archetype
 // voting seats, one vote each. Seat count is UNBOUNDED and the roster is MUTABLE — the
 // council promotes/demotes seats by a quorum vote (addSeat/removeSeat, gated at the CLI
 // layer by a real convene). These 5 are the STARTING membership, NOT a cap or a fixed
@@ -184,11 +184,11 @@ export const DEFAULT_COUNCIL = {
   name: 'council', description: 'The 5dive Council — self-governed standing body, one vote each. Seats mutable by quorum vote.',
   mode: 'deliberate', threshold: 3, thresholdRule: 'flat',
   seats: [
-    { id: 'main', lens: 'Marcus — CTO / eng lead. Correctness, ship-worthiness, reversibility.' },
-    { id: 'theo', agent: 'marketing', lens: 'Marketing. Brand + customer read; how it lands publicly.' },
-    { id: 'codex', lens: 'Builder. Implementation soundness, edge cases, blast radius.' },
-    { id: 'olivia', lens: 'CEO. Strategic fit, company priorities, risk appetite.' },
-    { id: 'lilbro', agent: 'creative', lens: 'Divergent/contrarian; the objection everyone is too polite to raise.' },
+    { id: 'eng-lead', lens: 'Engineering lead. Correctness, ship-worthiness, reversibility.' },
+    { id: 'brand', lens: 'Brand + customer read; how it lands publicly.' },
+    { id: 'builder', lens: 'Implementation soundness, edge cases, blast radius.' },
+    { id: 'strategy', lens: 'Strategic fit, organizational priorities, risk appetite.' },
+    { id: 'contrarian', lens: 'Divergent view; the objection everyone is too polite to raise.' },
   ],
 }
 

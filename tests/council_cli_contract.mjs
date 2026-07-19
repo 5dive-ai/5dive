@@ -70,7 +70,7 @@ ok('exercise from wrong recipient is refused (exit 9)', r.code === 9)
 // requires a genesis roster — --genesis-exists mirrors bash finding the sealed genesis file).
 r = runCli(['convene', 'q?', '--genesis-exists=1', '--stamped-at=T'], MOCK)
 v = JSON.parse(r.out)
-ok('default roster = 5 standing seats', v.seats.length === 5 && v.seats.includes('olivia') && v.council === 'council')
+ok('default roster = 5 role-archetype seats', v.seats.join(',') === 'eng-lead,brand,builder,strategy,contrarian' && v.council === 'council')
 
 // --- CNCL-7: dispatch path is the DEFAULT (real seated agents, no model key) -------------
 r = runCli(['convene', 'Ship it?', '--seats=a,b,c', '--stamped-at=T'], MOCK)

@@ -46,7 +46,14 @@ ok(resolveCouncil('nope', STANDING_COUNCILS) === null, 'unknown bench -> null (f
 ok(resolveCouncil('') === null, 'empty bench name -> null')
 
 // ---- CNCL-6: default roster + threshold (NOT hardcoded) ----
-ok(DEFAULT_COUNCIL.seats.map(s => s.id).join(',') === 'main,theo,codex,olivia,lilbro', 'starting roster = the 5 named seats')
+ok(DEFAULT_COUNCIL.seats.map(s => s.id).join(',') === 'eng-lead,brand,builder,strategy,contrarian', 'starting roster = 5 role-archetype seats')
+const builtinSeats = [DEFAULT_COUNCIL, ...Object.values(STANDING_COUNCILS)].flatMap(c => c.seats)
+const privatePersonaIds = new Set(['main', 'mark', 'theo', 'codex', 'olivia', 'lilbro', 'redteam'])
+ok(builtinSeats.every(s => !privatePersonaIds.has(s.id)), 'shipped council defaults contain no private persona ids')
+ok(builtinSeats.every(s => !Object.hasOwn(s, 'agent')), 'shipped council defaults do not route to private registry agents')
+ok(STANDING_COUNCILS.ship.seats.map(s => s.id).join(',') === 'reviewer,security,cost', 'ship bench uses role archetypes')
+ok(STANDING_COUNCILS.brand.seats.map(s => s.id).join(',') === 'brand,operator,contrarian', 'brand bench uses role archetypes')
+ok(STANDING_COUNCILS.security.seats.map(s => s.id).join(',') === 'security,red-team,reviewer', 'security bench uses role archetypes')
 ok(DEFAULT_THRESHOLD === 3, 'default flat threshold = 3')
 ok(resolveThreshold(5, { threshold: 3, thresholdRule: 'flat' }) === 3, 'flat threshold resolves to 3')
 ok(resolveThreshold(5, { thresholdRule: 'majority' }) === 3, 'majority of 5 = 3')
@@ -144,9 +151,9 @@ ok(typeof makeAnthropicModelCall({ apiKey: 'x' }) === 'function', 'adapter const
 // ---- full runCouncil integration with a MOCK model (no key, deterministic) ----
 function mockModel(votesById) {
   return async (prompt, schema) => {
-    if (schema === TAKE) { const id = (prompt.match(/"(\w+)" seat/) || [])[1] || 'x'; return { seat: id, position: 'take', keyRisk: 'risk' } }
-    if (schema === VOTE) { const id = (prompt.match(/"(\w+)" seat/) || [])[1] || 'x'; return { seat: id, vote: votesById[id] || 'approve', rationale: 'r' } }
-    if (schema === NODE_VOTE) { const id = (prompt.match(/"(\w+)" seat/) || [])[1] || 'x'; return { seat: id, choice: 'hetzner', rationale: 'r' } }
+    if (schema === TAKE) { const id = (prompt.match(/"([^"]+)" seat/) || [])[1] || 'x'; return { seat: id, position: 'take', keyRisk: 'risk' } }
+    if (schema === VOTE) { const id = (prompt.match(/"([^"]+)" seat/) || [])[1] || 'x'; return { seat: id, vote: votesById[id] || 'approve', rationale: 'r' } }
+    if (schema === NODE_VOTE) { const id = (prompt.match(/"([^"]+)" seat/) || [])[1] || 'x'; return { seat: id, choice: 'hetzner', rationale: 'r' } }
     // NARRATIVE / VERDICT / NODE_VERDICT
     if (schema.required && schema.required.includes('choice')) return { choice: 'hetzner', tally: T(3, 0, 0), confidence: 0.8, dissent: 'none', escalated: false, brief: '' }
     if (schema.required && schema.required.includes('recommendation')) return { recommendation: 'approve', tally: T(3, 0, 0), confidence: 0.8, dissent: 'none', escalated: false, brief: '' }
@@ -155,17 +162,17 @@ function mockModel(votesById) {
 }
 // default council, 4 approve / 1 reject -> PASS (>=3), receipt built
 const r1 = await runCouncil({ role: 'convene', question: 'ship v0.11?', councilName: 'council' },
-  { modelCall: mockModel({ main: 'approve', theo: 'approve', codex: 'approve', olivia: 'approve', lilbro: 'reject' }) })
+  { modelCall: mockModel({ 'eng-lead': 'approve', brand: 'approve', builder: 'approve', strategy: 'approve', contrarian: 'reject' }) })
 ok(r1.verdict.recommendation === 'approve' && r1.verdict.tally.approve === 4, 'runCouncil: 4/5 approve -> PASS via deterministic tally')
 ok(r1.receipt && r1.receipt.canonical.includes('council: council') && r1.receipt.seal.includes('gate-proof sign'), 'runCouncil: receipt built with seal command')
 // 2 approve -> reject
 const r2 = await runCouncil({ role: 'convene', question: 'ship?' },
-  { modelCall: mockModel({ main: 'approve', theo: 'approve', codex: 'reject', olivia: 'reject', lilbro: 'reject' }) })
+  { modelCall: mockModel({ 'eng-lead': 'approve', brand: 'approve', builder: 'reject', strategy: 'reject', contrarian: 'reject' }) })
 ok(r2.verdict.recommendation === 'reject', 'runCouncil: 2/5 approve -> reject')
 // CNCL-9: a veto OFFER threads through runCouncil non-blocking — the pass stays a pass and the
 // offer rides inside the sealed receipt (the flip only ever happens later via an authenticated tap).
 const r3 = await runCouncil({ role: 'convene', question: 'ship?', vetoOffer: { principal: 'human:main', resolved: '433634012', windowSecs: 900 } },
-  { modelCall: mockModel({ main: 'approve', theo: 'approve', codex: 'approve', olivia: 'approve', lilbro: 'approve' }) })
+  { modelCall: mockModel({ 'eng-lead': 'approve', brand: 'approve', builder: 'approve', strategy: 'approve', contrarian: 'approve' }) })
 ok(r3.verdict.recommendation === 'approve' && r3.verdict.vetoed !== true, 'runCouncil: veto offer does NOT block the pass')
 ok(r3.verdict.vetoOffer && r3.receipt.canonical.includes('veto: offered human:main window 900s'), 'runCouncil: offer rides inside the sealed receipt')
 // hard-gate guardrail short-circuits (verifier role, tier-2) with NO model spend
@@ -216,14 +223,9 @@ ok(resolveSeatAgent({ id: 'theo', agent: 'someone', lens: 'x' }) === 'someone', 
 ok(resolveSeatAgent('theo') === 'marketing' && resolveSeatAgent('main') === 'main', 'resolveSeatAgent: accepts a bare string id too')
 ok(resolveSeatAgent(null) === '' && resolveSeatAgent(undefined) === '', 'resolveSeatAgent: null-safe')
 ok(SEAT_AGENT_ALIAS.theo === 'marketing' && SEAT_AGENT_ALIAS.lilbro === 'creative', 'SEAT_AGENT_ALIAS maps the known persona seats')
-// The built-in benches that seat personas carry an explicit `agent` so they dispatch to a REAL
-// registry agent (the CNCL-16 defect: theo/lilbro used to hit the ask rail verbatim -> abstain).
-const theoDefault = DEFAULT_COUNCIL.seats.find(s => s.id === 'theo')
-const lilbroDefault = DEFAULT_COUNCIL.seats.find(s => s.id === 'lilbro')
-ok(theoDefault && theoDefault.agent === 'marketing', 'DEFAULT_COUNCIL theo seat carries agent=marketing')
-ok(lilbroDefault && lilbroDefault.agent === 'creative', 'DEFAULT_COUNCIL lilbro seat carries agent=creative')
-ok(resolveSeatAgent(STANDING_COUNCILS.brand.seats.find(s => s.id === 'theo')) === 'marketing', 'brand bench theo resolves to marketing')
-ok(resolveSeatAgent(STANDING_COUNCILS.brand.seats.find(s => s.id === 'lilbro')) === 'creative', 'brand bench lilbro resolves to creative')
+// Explicit `agent` remains available for organization-supplied genesis/ad-hoc seats; built-ins
+// intentionally omit it because OSS defaults are role archetypes, not one org's registry mapping.
+ok(resolveSeatAgent({ id: 'brand' }) === 'brand', 'role-archetype seat resolves to its matching registry role')
 
 console.log(`\nCNCL-6 engine: ${pass} passed, ${fail} failed (bound to src/council/engine.mjs)`)
 process.exit(fail ? 1 : 0)
