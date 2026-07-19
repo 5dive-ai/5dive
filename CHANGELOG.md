@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.11.15 — notify dry-run guard: fixture runs can never DM a paired human (DIVE-1500) (2026-07-19)
+
+- fix(notify): SAFETY — `FIVEDIVE_NOTIFY_DRYRUN=1` (any non-`0` value) short-circuits `_mirror_send`, the single Bot API POST that every owner/gate/mirror notify funnels through: the would-be payload (never the token) is logged to stderr and to `FIVEDIVE_NOTIFY_DRYRUN_LOG` when set, and a synthetic ok receipt keeps downstream delivery-receipt/stamping logic exercisable. Closes the 2026-07-19 incident class where a DIVE-1489 render test posted fixture gate alerts to the owner's REAL DM via the live connector token — a harness with a fixture DB is now physically unable to reach a paired human, including on the paths its stubs miss (DIVE-1500).
+- feat(notify): `FIVEDIVE_CONNECTOR_DIR` env-honor on `CONNECTORS_DIR` (same fixture-override class as STATE_DIR/TASKS_DIR/TASKS_DB) so a harness can point channel resolution at fixture configs. The `$TELEGRAM_BOT_TOKEN` process-env fallback in `_task_agent_channel` remains, which is exactly why the dry-run guard above is the physical layer, not this.
+- test: `notify_dryrun_unit.sh` (12 assertions) exercises the REAL `_mirror_send` under a curl trap — no POST attempted under dry-run, token never logged, gate_pinged_at still stamps, and with the guard off the trap catches the real POST attempt, proving the test non-vacuous.
+
 ## 0.11.14 — task inbox --send: owner digest with working tier-2 tap buttons (DIVE-1499) (2026-07-19)
 
 - feat(tasks): `5dive task inbox --send [--channel-proof=<chat>]` — root-side, on-demand DM of the pending-gate inbox as ONE message with WORKING tap buttons for every gate type, including approval/secret/manual: fresh per-gate DIVE-916 nonces are minted in-process, embedded only in Telegram callback_data, and the stored hash rotates only after a confirmed send. The human-proof nonce is deliberately NOT added to `task inbox --json` — agent-readable output would make the human-proof agent-forgeable, re-opening the hole DIVE-950 closed. The telegram plugin's /inbox flow should shell this verb (passing the requesting chat as --channel-proof) instead of composing tier-2 buttons itself (unblocks DIVE-1489).

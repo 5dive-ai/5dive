@@ -26,7 +26,7 @@ esac
 
 # Bumped on every public release. `build.sh` checks this line exists; CI fails
 # the bundle-drift check if it's missing or empty.
-readonly FIVE_VERSION="0.11.14"
+readonly FIVE_VERSION="0.11.15"
 
 # GitHub org our repos live under. The org is being renamed
 # 5dive-com -> 5dive-ai (2026-06); fetches must work on either side of the
@@ -97,7 +97,12 @@ DEFAULT_WORKDIR="/home/claude/projects"
 # Per-agent channel secrets live here (readable by the agent user via
 # EnvironmentFile in 5dive-agent@.service). Mode 0640 root:claude is written
 # by the 5dive-write-connector helper — we call it so perms stay consistent.
-CONNECTORS_DIR="/etc/5dive/connectors"
+# DIVE-1500: FIVEDIVE_CONNECTOR_DIR lets a test harness point channel
+# resolution at fixture configs so it never picks up a real paired token
+# (same env-honor class as STATE_DIR/TASKS_DIR/TASKS_DB). Note _task_agent_channel
+# still falls back to $TELEGRAM_BOT_TOKEN from the process env, so a fixture
+# harness should ALSO set FIVEDIVE_NOTIFY_DRYRUN=1 — the physical send guard.
+CONNECTORS_DIR="${FIVEDIVE_CONNECTOR_DIR:-/etc/5dive/connectors}"
 
 # Known agent types -> (bin path, supports channels yes/no).
 # auth_file is the shared-config path that indicates the type is authenticated.

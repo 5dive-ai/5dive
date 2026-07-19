@@ -330,6 +330,23 @@ _mirror_log_button_reject() {
 # compose without duplicating the curl call.
 _mirror_send() {
   local token="$1" chat="$2" thread="$3" text="$4" reply_markup="${5:-}"
+  # DIVE-1500: physical dry-run guard. Every owner/gate/mirror notify funnels
+  # through this one POST, so honoring FIVEDIVE_NOTIFY_DRYRUN here makes a
+  # fixture harness UNABLE to reach a paired human even on paths its stubs
+  # miss (a 2026-07-19 render test DM'd the real owner through the live
+  # connector token). Logs the would-be payload (never the token) and emits a
+  # synthetic ok so delivery receipts/stamping still exercise downstream logic.
+  if [[ -n "${FIVEDIVE_NOTIFY_DRYRUN:-}" && "${FIVEDIVE_NOTIFY_DRYRUN}" != "0" ]]; then
+    local dry_line
+    dry_line=$(printf 'notify-dryrun chat=%s thread=%s markup=%s text=%q' \
+      "$chat" "${thread:-none}" "$([[ -n "$reply_markup" ]] && echo yes || echo no)" "$text")
+    if [[ -n "${FIVEDIVE_NOTIFY_DRYRUN_LOG:-}" ]]; then
+      printf '%s\n' "$dry_line" >>"$FIVEDIVE_NOTIFY_DRYRUN_LOG" 2>/dev/null || true
+    fi
+    printf '%s\n' "$dry_line" >&2 || true
+    printf '%s' '{"ok":true,"dry_run":true,"result":{"message_id":0}}'
+    return 0
+  fi
   local args=(--data-urlencode "chat_id=${chat}" --data-urlencode "text=${text}")
   [[ -n "$thread" ]] && args+=(--data-urlencode "message_thread_id=${thread}")
   [[ -n "$reply_markup" ]] && args+=(--data-urlencode "reply_markup=${reply_markup}")
