@@ -299,6 +299,104 @@ export function sealCommands() {
   }
 }
 
+// ==================== CNCL-8: human-seeded GENESIS roster ====================
+// The primary council must not bootstrap its OWN membership — it is seeded ONCE by a human
+// via `council init` (sudo-gated at the bash layer). These helpers build + canonicalize the
+// genesis record; the bash layer seals it on the ROOT gate-proof rail and hash-chains it into
+// the lineage. `council` is special in exactly one way: raw bench add/rm on it is refused (CLI
+// layer) — membership changes only via promote/demote motions once the machinery lands.
+
+// Parse a threshold SPEC string: "majority" | "all" | "3" (flat N) | "2/3" (fraction). Returns
+// a spec object consumable by resolveThreshold/quorumSize. Fails CLOSED (null) on garbage.
+export function parseThresholdSpec(str) {
+  const s = String(str == null ? '' : str).trim().toLowerCase()
+  if (!s || s === 'majority') return { rule: 'majority' }
+  if (s === 'all') return { rule: 'fraction', value: 1 }
+  const frac = s.match(/^(\d+)\s*\/\s*(\d+)$/)
+  if (frac) { const a = Number(frac[1]), b = Number(frac[2]); if (b > 0 && a > 0 && a <= b) return { rule: 'fraction', value: a / b, label: `${a}/${b}` }; return null }
+  if (/^\d+$/.test(s)) { const n = Number(s); return n > 0 ? { rule: 'flat', threshold: n } : null }
+  return null
+}
+
+// Parse a genesis seat spec: "a:chair,b,c" — a comma list of ids; a token "id:chair" marks the
+// chair (princeps senatus, breaks ties, votes last). Exactly one chair is allowed. Anything
+// else after the colon is treated as an explicit lens. Returns { seats, chair } or throws.
+export function parseGenesisSeats(spec) {
+  const parts = String(spec == null ? '' : spec).split(',').map(s => s.trim()).filter(Boolean)
+  const seats = []
+  let chair = null
+  const seen = new Set()
+  for (const p of parts) {
+    const i = p.indexOf(':')
+    const id = (i < 0 ? p : p.slice(0, i)).trim()
+    const tag = i < 0 ? '' : p.slice(i + 1).trim()
+    if (!id) throw new Error(`empty seat id in "${p}"`)
+    if (seen.has(id)) throw new Error(`duplicate seat: ${id}`)
+    seen.add(id)
+    const isChair = tag.toLowerCase() === 'chair'
+    if (isChair) { if (chair) throw new Error(`more than one chair (${chair}, ${id})`); chair = id }
+    const lens = (!tag || isChair) ? `${id} — council seat.` : tag
+    seats.push({ id, lens, ...(isChair ? { chair: true } : {}) })
+  }
+  if (!seats.length) throw new Error('genesis needs at least one seat')
+  return { seats, chair }
+}
+
+// Build the immutable genesis record. `veto` is { principal, resolved } — the resolvable human
+// principal (e.g. human:main) plus the tg user_id the bash layer resolved it to; init REFUSES
+// an unresolved principal (the record must carry a real, resolvable veto holder). prevDigest
+// hash-chains this record to the prior lineage head (empty for the very first seed). No in-engine
+// clock — caller supplies stampedAt (byte-reproducible canonical form).
+export function buildGenesisRecord({ seats, chair, threshold, veto, prevDigest, stampedAt, forced, seq }) {
+  if (!Array.isArray(seats) || !seats.length) throw new Error('genesis needs seats')
+  if (!veto || !veto.principal) throw new Error('genesis needs a veto principal')
+  if (!veto.resolved) throw new Error(`veto principal "${veto.principal}" did not resolve to a real recipient (fail-closed)`)
+  return {
+    kind: 'genesis',
+    version: 1,
+    seq: Number(seq) || 0,
+    council: 'council',
+    seats: seats.map(s => ({ id: s.id, lens: s.lens, ...(s.chair ? { chair: true } : {}) })),
+    chair: chair || null,
+    threshold: threshold || { rule: 'majority' },
+    veto: { principal: veto.principal, resolved: String(veto.resolved) },
+    forced: !!forced,
+    prevDigest: prevDigest || '',
+    stampedAt: stampedAt || '',
+  }
+}
+
+// Deterministic, whitespace-normalized preimage of a genesis record — the bytes the ROOT rail
+// seals + hash-chains. Same discipline as canonicalTranscript: order-independent seats, the veto
+// + prevDigest INSIDE the signed bytes so neither can be quietly altered without failing verify.
+export function canonicalGenesis(rec) {
+  const norm = (s) => String(s == null ? '' : s).replace(/\s+/g, ' ').trim()
+  const L = []
+  L.push(`genesis: ${norm(rec.council)} v${Number(rec.version) || 1} seq=${Number(rec.seq) || 0}`)
+  L.push(`stampedAt: ${norm(rec.stampedAt)}`)
+  L.push(`forced: ${!!rec.forced}`)
+  L.push(`prevDigest: ${norm(rec.prevDigest)}`)
+  const seats = (rec.seats || []).slice().sort((a, b) => (norm(a.id) < norm(b.id) ? -1 : 1))
+  for (const s of seats) L.push(`seat ${norm(s.id)}${s.chair ? ' (chair)' : ''}: ${norm(s.lens)}`)
+  L.push(`chair: ${norm(rec.chair)}`)
+  const th = rec.threshold || {}
+  L.push(`threshold: rule=${norm(th.rule)} value=${th.value != null ? Number(th.value) : ''} flat=${th.threshold != null ? Number(th.threshold) : ''}`)
+  L.push(`veto: ${norm(rec.veto && rec.veto.principal)} -> ${norm(rec.veto && rec.veto.resolved)}`)
+  return L.join('\n')
+}
+
+// The bench entry a genesis record seeds into the persisted registry — the primary `council`.
+export function genesisToBench(rec) {
+  return {
+    description: DEFAULT_COUNCIL.description,
+    mode: DEFAULT_COUNCIL.mode,
+    seats: rec.seats.map(s => ({ id: s.id, lens: s.lens })),
+    threshold: rec.threshold,
+    genesis: true,           // marks this bench as motion-governed (raw add/rm refused)
+    seededAt: rec.stampedAt,
+  }
+}
+
 // ==================== schemas (ported from P0/P2) ====================
 export const TAKE = { type: 'object', additionalProperties: false, required: ['seat', 'position', 'keyRisk'],
   properties: { seat: { type: 'string' }, position: { type: 'string' }, keyRisk: { type: 'string' } } }

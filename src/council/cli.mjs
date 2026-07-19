@@ -27,6 +27,9 @@ const flag = (k, d) => {
   return hit.includes('=') ? hit.slice(hit.indexOf('=') + 1) : true
 }
 const die = (msg, code = 2) => { process.stderr.write(`council: ${msg}\n`); process.exit(code) }
+// bash passes boolean flags as the STRINGS "0"/"1" — and JS `!"0"` is false, so never test a
+// flag's truthiness for these. `--genesis-exists=0` MUST read as false (fail-closed correctness).
+const flagBool = (k) => { const v = flag(k); return v === true || v === '1' || v === 'true' }
 const out = (obj) => { process.stdout.write(JSON.stringify(obj) + '\n') }
 
 // ---- persisted registry ----------------------------------------------------
@@ -117,10 +120,21 @@ async function cmdConvene() {
   const registryPath = flag('registry')
   const reg = loadRegistry(registryPath)
   const benchName = flag('bench')
+  // CNCL-8: convening THE primary council (by name, or the default with no explicit --seats)
+  // fails closed until it has been human-seeded via `council init`. An ad-hoc panel (explicit
+  // --seats) or an alternate bench (ship/brand/security) is a different, non-governance thing
+  // and stays available. bash passes --genesis-exists=1 when the sealed genesis record is present.
+  const primaryCouncil = benchName === 'council' || (!benchName && (flag('seats') == null || flag('seats') === true))
+  if (primaryCouncil && !flagBool('genesis-exists')) {
+    die('the Council has no genesis roster — it must be human-seeded first: sudo 5dive council init --seats=<a:chair,b,c> --threshold=<spec> --veto=<principal>', 8)
+  }
+  // The primary council convenes its HUMAN-SEEDED roster (the `council` bench init wrote),
+  // never the hardcoded default — so init is the single source of truth for who sits.
+  const effBench = benchName || (primaryCouncil ? 'council' : null)
   let seats, mode, bench = null
-  if (benchName) {
-    bench = resolveBench(benchName, reg)
-    if (!bench) die(`unknown bench: ${benchName} (fail-closed — see 'council bench ls')`, 3)
+  if (effBench) {
+    bench = resolveBench(effBench, reg)
+    if (!bench) die(`unknown bench: ${effBench} (fail-closed — see 'council bench ls')`, 3)
     seats = bench.seats
     mode = flag('mode', bench.mode || 'deliberate')
   } else {
@@ -130,7 +144,7 @@ async function cmdConvene() {
   }
   const input = {
     role: 'convene', question, seats, mode,
-    councilName: benchName || 'ad-hoc',
+    councilName: effBench || 'ad-hoc',
     decisionClass: flag('class') || (bench && bench.decisionClass) || 'ordinary',
     stampedAt: flag('stamped-at') || '',
   }
@@ -176,6 +190,13 @@ function cmdBench() {
     out({ name: b.name, description: b.description, mode: b.mode, seats: b.seats, builtin: name in BUILTINS, custom: name in reg })
     return
   }
+  // CNCL-8: the primary council is special in EXACTLY one way — its membership changes ONLY
+  // via promote/demote motions. A raw bench add/rm against it fails closed (otherwise a plain
+  // `sudo bench rm council` would bypass the whole governance layer). Motions land in a later
+  // wave; until then the guard is the load-bearing invariant.
+  if ((action === 'add' || action === 'rm') && positionals[1] === 'council') {
+    die("'council' is the primary governance body — its seats change ONLY via promote/demote motions, never raw bench add/rm (re-seed the whole roster with: sudo 5dive council init --force).", 7)
+  }
   if (action === 'add') {
     const name = positionals[1]; if (!name) die('bench add needs a name')
     const seats = parseSeats(flag('seats'))
@@ -203,9 +224,50 @@ function cmdBench() {
   die(`unknown bench action: ${action} (ls|show|add|rm)`)
 }
 
+// ---- CNCL-8: council init (human-seeded genesis roster) --------------------
+// Seeds the primary `council` bench ONCE from a human-supplied roster + veto principal.
+// bash owns the sudo gate, the veto-principal resolution (--veto-resolved), the ROOT seal of
+// the canonical bytes, and the hash-chained lineage write. cli owns: validate the roster,
+// enforce one-time (fail-closed unless --force), seed the registry, and emit the record +
+// canonical bytes for bash to seal. An agent can never call this to bootstrap its own council
+// because the write path (COUNCIL_DIR) is root-owned — bash refuses a non-sudo init.
+function cmdInit() {
+  const registryPath = flag('registry')
+  const genesisExists = flagBool('genesis-exists')
+  const forced = !!flag('force')
+  if (genesisExists && !forced) {
+    die('council is already initialized (one-time). Re-seed with --force (the re-seed is logged in the lineage).', 5)
+  }
+  let parsed
+  try { parsed = E.parseGenesisSeats(flag('seats')) }
+  catch (e) { die(`bad --seats: ${String(e && e.message || e)}`) }
+  const threshold = E.parseThresholdSpec(flag('threshold') || 'majority')
+  if (!threshold) die(`bad --threshold (use: majority | all | <N> | <a>/<b>, e.g. 2/3)`)
+  const principal = flag('veto')
+  if (!principal || principal === true) die('init needs --veto=<principal> (a resolvable human, e.g. human:main)')
+  const resolved = flag('veto-resolved')   // bash resolves the principal -> tg user_id
+  if (!resolved || resolved === true) die(`veto principal "${principal}" did not resolve to a real recipient — init rejects an unknown/unresolvable principal (fail-closed).`, 6)
+  let rec
+  try {
+    rec = E.buildGenesisRecord({
+      seats: parsed.seats, chair: parsed.chair, threshold,
+      veto: { principal: String(principal), resolved: String(resolved) },
+      prevDigest: flag('prev-digest') || '', stampedAt: flag('stamped-at') || '',
+      forced, seq: Number(flag('seq')) || 0,
+    })
+  } catch (e) { die(String(e && e.message || e)) }
+  // Seed / re-seat the primary council bench in the persisted registry (bench edits on it are
+  // refused elsewhere — init and, later, motions are the ONLY writers).
+  const reg = loadRegistry(registryPath)
+  reg.council = E.genesisToBench(rec)
+  saveRegistry(registryPath, reg)
+  out({ genesis: rec, canonical: E.canonicalGenesis(rec), bench: 'council', seats: rec.seats.map(s => s.id), chair: rec.chair })
+}
+
 const main = async () => {
   if (sub === 'convene') return cmdConvene()
   if (sub === 'bench') return cmdBench()
-  die(`unknown council subcommand: ${sub} (convene|bench)`)
+  if (sub === 'init') return cmdInit()
+  die(`unknown council subcommand: ${sub} (convene|bench|init)`)
 }
 main().catch(e => die(String(e && e.message || e), 1))

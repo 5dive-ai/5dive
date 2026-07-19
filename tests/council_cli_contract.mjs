@@ -50,10 +50,11 @@ v = JSON.parse(r.out)
 ok('founder veto -> blocked', v.disposition === 'blocked' && v.verdict.vetoed === true)
 ok('veto recorded in signed bytes', /veto: lodar/.test(v.receipt.canonical))
 
-// default roster when no seats given = the 5 standing seats
-r = runCli(['convene', 'q?', '--stamped-at=T'], MOCK)
+// default roster when no seats given = the 5 standing seats (CNCL-8: the primary council now
+// requires a genesis roster — --genesis-exists mirrors bash finding the sealed genesis file).
+r = runCli(['convene', 'q?', '--genesis-exists=1', '--stamped-at=T'], MOCK)
 v = JSON.parse(r.out)
-ok('default roster = 5 standing seats', v.seats.length === 5 && v.seats.includes('olivia'))
+ok('default roster = 5 standing seats', v.seats.length === 5 && v.seats.includes('olivia') && v.council === 'council')
 
 // --- CNCL-7: dispatch path is the DEFAULT (real seated agents, no model key) -------------
 r = runCli(['convene', 'Ship it?', '--seats=a,b,c', '--stamped-at=T'], MOCK)
@@ -84,5 +85,45 @@ r = runCli(['bench', 'rm', 'rel', `--registry=${reg}`])
 ok('rm custom bench', r.code === 0 && !('rel' in JSON.parse(fs.readFileSync(reg, 'utf-8'))))
 try { fs.unlinkSync(reg) } catch {}
 
-console.error(`\nCNCL-6 CLI contract: ${pass} passed, ${fail} failed`)
+// --- CNCL-8: human-seeded genesis roster + fail-closed guards ----------------
+// convene the primary council WITHOUT a genesis roster -> fail closed (exit 8).
+r = runCli(['convene', 'q?', '--genesis-exists=0', '--stamped-at=T'], MOCK)
+ok('convene primary council w/ genesis-exists=0 (string) fails closed (exit 8)', r.code === 8)
+r = runCli(['convene', 'q?', '--bench=council', '--genesis-exists=0', '--stamped-at=T'], MOCK)
+ok('convene --bench=council w/ genesis-exists=0 fails closed (exit 8)', r.code === 8)
+// an ad-hoc panel (explicit --seats) is NOT the governance body -> still allowed.
+r = runCli(['convene', 'q?', '--seats=a,b,c', '--stamped-at=T'], MOCK)
+ok('ad-hoc --seats convene NOT gated by genesis', r.code === 0)
+
+const greg = path.join(os.tmpdir(), `council-genesis-${process.pid}.json`)
+try { fs.unlinkSync(greg) } catch {}
+// init once: seeds the council bench + emits a canonical record for bash to seal.
+r = runCli(['init', '--seats=main:chair,codex,olivia', '--threshold=2/3', '--veto=human:main', '--veto-resolved=433634012', '--genesis-exists=0', `--registry=${greg}`, '--stamped-at=T'])
+ok('init once exits 0', r.code === 0)
+let g = JSON.parse(r.out)
+ok('init emits genesis record + canonical', g.genesis && g.genesis.kind === 'genesis' && typeof g.canonical === 'string')
+ok('init records the chair', g.chair === 'main' && g.genesis.seats.find(s => s.id === 'main').chair === true)
+ok('init records resolved veto principal', g.genesis.veto.principal === 'human:main' && g.genesis.veto.resolved === '433634012')
+ok('init seeds the council bench (motion-governed)', JSON.parse(fs.readFileSync(greg, 'utf-8')).council.genesis === true)
+// init TWICE (genesis already exists) -> refused, unless --force.
+r = runCli(['init', '--seats=a,b', '--veto=human:main', '--veto-resolved=1', `--registry=${greg}`, '--genesis-exists=1', '--stamped-at=T'])
+ok('init twice refused (exit 5)', r.code === 5)
+r = runCli(['init', '--seats=a,b', '--veto=human:main', '--veto-resolved=1', `--registry=${greg}`, '--genesis-exists=1', '--force', '--stamped-at=T'])
+ok('init --force re-seed allowed + flagged in record', r.code === 0 && JSON.parse(r.out).genesis.forced === true)
+// init REFUSES an unresolvable veto principal (bash passes no --veto-resolved).
+r = runCli(['init', '--seats=a,b', '--veto=human:ghost', `--registry=${greg}`, '--stamped-at=T'])
+ok('init refuses unresolvable veto principal (exit 6)', r.code === 6)
+// bad threshold / seats fail closed.
+ok('init bad threshold refused', runCli(['init', '--seats=a', '--threshold=nonsense', '--veto=human:main', '--veto-resolved=1', `--registry=${greg}`]).code === 2)
+ok('init duplicate seat refused', runCli(['init', '--seats=a,a', '--veto=human:main', '--veto-resolved=1', `--registry=${greg}`]).code === 2)
+ok('init two chairs refused', runCli(['init', '--seats=a:chair,b:chair', '--veto=human:main', '--veto-resolved=1', `--registry=${greg}`]).code === 2)
+
+// raw bench add/rm on the primary council is refused (governance bypass) -> exit 7.
+r = runCli(['bench', 'add', 'council', '--seats=x:y', `--registry=${greg}`])
+ok('raw bench add on council refused (exit 7)', r.code === 7)
+r = runCli(['bench', 'rm', 'council', `--registry=${greg}`])
+ok('raw bench rm on council refused (exit 7)', r.code === 7)
+try { fs.unlinkSync(greg) } catch {}
+
+console.error(`\nCNCL-6/7/8 CLI contract: ${pass} passed, ${fail} failed`)
 process.exit(fail ? 1 : 0)

@@ -13,10 +13,23 @@
 COUNCIL_DIR="${STATE_DIR}/council"
 COUNCIL_REGISTRY="${COUNCIL_DIR}/benches.json"
 COUNCIL_RECEIPTS="${COUNCIL_DIR}/receipts"
+COUNCIL_GENESIS="${COUNCIL_DIR}/genesis.json"
+COUNCIL_LINEAGE="${COUNCIL_DIR}/lineage.jsonl"
 
 _council_help() {
   cat >&2 <<'COUNCIL_HELP'
 5dive council — standalone deliberation council (v0.11)
+
+  5dive council init --seats=<a:chair,b,c,...> --threshold=<majority|all|N|a/b> --veto=<principal>
+      Human-seed the primary Council ONCE (sudo-gated, fail-closed if already initialized;
+      --force re-seeds and the re-seed is logged in the lineage). The veto principal must be
+      RESOLVABLE (human:<agent> -> that agent's paired human, or tg:<user_id>) or init refuses
+      it. The genesis record is sealed on the root gate-proof rail and hash-chained into
+      ${COUNCIL_LINEAGE}. Principle: an agent must not bootstrap its own governance body.
+
+  5dive council lineage [verify|ls]
+      Verify the sealed genesis lineage (re-seal each record, compare digests, check the
+      hash-chain) or list it. `verify` fails closed on any tamper or broken link.
 
   5dive council convene "<question>" [--seats=a,b,c] [--mode=quick|deliberate|adversarial]
                                      [--bench=<name>] [--class=<decisionClass>]
@@ -58,20 +71,149 @@ __CLI_MJS__
 COUNCIL_CLI_MJS
 }
 
+# CNCL-8: resolve a veto PRINCIPAL to a concrete recipient id (fail-closed: echoes
+# nothing if it can't resolve, and init then refuses). Supported forms:
+#   human:<agent>  -> that agent's paired human (access.json allowFrom[0]) — e.g.
+#                     human:main resolves to the human paired to @agent-main's bot.
+#   tg:<digits> | <digits>  -> a literal Telegram user_id.
+# An agent can only resolve principals that already exist as paired channels; it cannot
+# invent a recipient. This is the "resolvable principal" invariant from the redesign.
+_council_resolve_principal() {
+  local p="$1"
+  case "$p" in
+    tg:*) local id="${p#tg:}"; [[ "$id" =~ ^[0-9]+$ ]] && printf '%s' "$id"; return 0 ;;
+    human:*)
+      local name="${p#human:}"
+      [[ -n "$name" ]] || return 0
+      _task_agent_channel "$name" >/dev/null 2>&1 || return 0
+      [[ -n "${TASK_CH_ACCESS:-}" && -r "$TASK_CH_ACCESS" ]] || return 0
+      jq -r '(.allowFrom // [])[0] // empty' "$TASK_CH_ACCESS" 2>/dev/null
+      return 0 ;;
+    *) [[ "$p" =~ ^[0-9]+$ ]] && printf '%s' "$p"; return 0 ;;
+  esac
+}
+
+_council_init_or_lineage() {
+  local sub="$1" dir="$2"; shift 2
+  mkdir -p "$COUNCIL_DIR" 2>/dev/null || true
+
+  if [[ "$sub" == "lineage" ]]; then
+    local action="${1:-verify}"
+    if [[ ! -f "$COUNCIL_LINEAGE" ]]; then
+      if (( JSON_MODE )); then printf '%s\n' '{"ok":true,"data":{"entries":[],"chain":"empty"}}'; else echo "lineage: (empty — council not yet initialized)"; fi
+      return 0
+    fi
+    if [[ "$action" == "ls" ]]; then
+      if (( JSON_MODE )); then jq -s '{ok:true,data:{entries:.}}' "$COUNCIL_LINEAGE"
+      else jq -r '"seq \(.seq)\t\(.kind)\t\(.stampedAt)\tdigest=\(.digest[0:16])…\tprev=\((.prevDigest // "")[0:8])"' "$COUNCIL_LINEAGE"; fi
+      return 0
+    fi
+    # verify: re-seal each canonical on the ROOT rail, compare to the stored digest, and
+    # check the prevDigest hash-chain links back to genesis. Fails closed on any mismatch.
+    local ok=1 prev="" line seq canonical stored kind computed n=0
+    while IFS= read -r line; do
+      [[ -n "$line" ]] || continue
+      n=$((n+1))
+      seq="$(printf '%s' "$line" | jq -r '.seq')"
+      kind="$(printf '%s' "$line" | jq -r '.kind')"
+      stored="$(printf '%s' "$line" | jq -r '.digest')"
+      canonical="$(printf '%s' "$line" | jq -r '.canonical')"
+      local lprev; lprev="$(printf '%s' "$line" | jq -r '.prevDigest // ""')"
+      if [[ "$lprev" != "$prev" ]]; then echo "lineage: BROKEN CHAIN at seq $seq (prevDigest=$lprev, expected $prev)" >&2; ok=0; fi
+      if [[ "$(id -u)" -eq 0 ]]; then computed="$(printf '%s' "$canonical" | cmd_gate_proof_sign_stdin 2>/dev/null)"; else computed="$(printf '%s' "$canonical" | sudo -n 5dive gate-proof sign 2>/dev/null)"; fi
+      if [[ -z "$computed" ]]; then echo "lineage: cannot re-seal seq $seq (no gate-proof key / not root)" >&2; ok=0
+      elif [[ "$computed" != "$stored" ]]; then echo "lineage: TAMPERED seq $seq ($kind) — digest mismatch" >&2; ok=0; fi
+      prev="$stored"
+    done < "$COUNCIL_LINEAGE"
+    if (( ok )); then
+      if (( JSON_MODE )); then printf '%s\n' "{\"ok\":true,\"data\":{\"verified\":true,\"entries\":$n}}"; else echo "lineage: VERIFIED ($n entr$([[ $n -eq 1 ]] && echo y || echo ies), chain intact)"; fi
+      return 0
+    else
+      if (( JSON_MODE )); then printf '%s\n' '{"ok":false,"error":"lineage verification failed"}'; fi
+      return "$E_GENERIC"
+    fi
+  fi
+
+  # ---- init (sudo-gated, one-time) ----------------------------------------
+  if [[ ! -w "$COUNCIL_DIR" ]]; then
+    fail "$E_PERMISSION" "council init seeds the governance body — it writes ${COUNCIL_DIR} (root-owned) and must be human/sudo-run: sudo 5dive council init $*"
+  fi
+  # Resolve the veto principal up front so init refuses an unresolvable one BEFORE any write.
+  local principal="" a
+  local -a passthru=()
+  for a in "$@"; do
+    case "$a" in --veto=*) principal="${a#--veto=}" ;; esac
+    passthru+=("$a")
+  done
+  [[ -n "$principal" ]] || fail "$E_USAGE" "council init needs --veto=<principal> (e.g. human:main)"
+  local resolved; resolved="$(_council_resolve_principal "$principal")"
+  [[ -n "$resolved" ]] || fail "$E_USAGE" "veto principal '$principal' did not resolve to a real recipient — init rejects an unknown principal (fail-closed). Use human:<agent> (a paired agent) or tg:<user_id>."
+
+  local genesis_exists=0; [[ -f "$COUNCIL_GENESIS" ]] && genesis_exists=1
+  # hash-chain head: prevDigest + next seq come from the last lineage line.
+  local prev_digest="" seq=0
+  if [[ -f "$COUNCIL_LINEAGE" ]]; then
+    prev_digest="$(tail -n1 "$COUNCIL_LINEAGE" 2>/dev/null | jq -r '.digest // ""' 2>/dev/null)"
+    local last_seq; last_seq="$(tail -n1 "$COUNCIL_LINEAGE" 2>/dev/null | jq -r '.seq // -1' 2>/dev/null)"
+    [[ "$last_seq" =~ ^[0-9]+$ ]] && seq=$((last_seq+1))
+  fi
+  local stamped; stamped="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+  local raw
+  raw="$(node "$dir/cli.mjs" init "${passthru[@]}" \
+    --registry="$COUNCIL_REGISTRY" --veto-resolved="$resolved" \
+    --genesis-exists="$genesis_exists" --prev-digest="$prev_digest" --seq="$seq" \
+    --stamped-at="$stamped")" || return $?
+
+  # Seal the canonical genesis bytes on the ROOT rail and hash-chain into the lineage. The
+  # seal is what makes the roster non-forgeable; the chain makes the whole history verifiable.
+  local canonical digest=""
+  canonical="$(printf '%s' "$raw" | jq -r '.canonical // empty')"
+  if [[ -z "$canonical" ]]; then fail "$E_GENERIC" "init produced no canonical record"; fi
+  if [[ "$(id -u)" -eq 0 ]]; then digest="$(printf '%s' "$canonical" | cmd_gate_proof_sign_stdin 2>/dev/null)" || digest=""
+  else digest="$(printf '%s' "$canonical" | sudo -n 5dive gate-proof sign 2>/dev/null)" || digest=""; fi
+  [[ -n "$digest" ]] || fail "$E_GENERIC" "could not seal the genesis record on the gate-proof rail (need root + an enforce key) — genesis NOT written"
+
+  printf '%s' "$raw" | jq --arg d "$digest" '.genesis + {sealedDigest:$d}' > "$COUNCIL_GENESIS"
+  printf '%s' "$raw" | jq -c --arg d "$digest" --arg p "$prev_digest" \
+    '{seq: .genesis.seq, kind: "genesis", stampedAt: .genesis.stampedAt, digest: $d, prevDigest: $p, canonical: .canonical, record: .genesis}' \
+    >> "$COUNCIL_LINEAGE"
+
+  if (( JSON_MODE )); then
+    printf '%s' "$raw" | jq --arg d "$digest" '{ok:true, data: (. + {sealedDigest:$d})}'
+  else
+    local seats chair
+    seats="$(printf '%s' "$raw" | jq -r '.seats | join(", ")')"
+    chair="$(printf '%s' "$raw" | jq -r '.chair // "none"')"
+    echo "council: initialized (seq $seq)"
+    echo "seats:   $seats"
+    echo "chair:   $chair"
+    echo "veto:    $principal -> $resolved"
+    echo "genesis: sealed (${digest:0:16}…) + hash-chained into lineage"
+  fi
+  return 0
+}
+
 cmd_council() {
   command -v node >/dev/null 2>&1 || fail "$E_GENERIC" "5dive council needs node on PATH"
   command -v jq   >/dev/null 2>&1 || fail "$E_GENERIC" "5dive council needs jq on PATH"
   local sub="${1:-}"; [[ $# -gt 0 ]] && shift || true
   case "$sub" in
     ""|-h|--help|help) _council_help; return 0 ;;
-    convene|bench) ;;
-    *) fail "$E_USAGE" "unknown council command: $sub (convene|bench)" ;;
+    convene|bench|init|lineage) ;;
+    *) fail "$E_USAGE" "unknown council command: $sub (convene|bench|init|lineage)" ;;
   esac
 
   local dir; dir="$(mktemp -d -t 5dive-council.XXXXXX)" || fail "$E_GENERIC" "mktemp failed"
   # shellcheck disable=SC2064
   trap "rm -rf '$dir'" RETURN
   _council_write_runtime "$dir"
+
+  # CNCL-8: council init (human-seeded genesis) + lineage verify -----------
+  if [[ "$sub" == "init" || "$sub" == "lineage" ]]; then
+    _council_init_or_lineage "$sub" "$dir" "$@"
+    return $?
+  fi
 
   if [[ "$sub" == "bench" ]]; then
     local action="${1:-ls}"
@@ -99,8 +241,9 @@ cmd_council() {
 
   # convene ------------------------------------------------------------------
   local stamped; stamped="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  local genesis_exists=0; [[ -f "$COUNCIL_GENESIS" ]] && genesis_exists=1
   local raw
-  raw="$(node "$dir/cli.mjs" convene "$@" --registry="$COUNCIL_REGISTRY" --stamped-at="$stamped")" || return $?
+  raw="$(node "$dir/cli.mjs" convene "$@" --registry="$COUNCIL_REGISTRY" --genesis-exists="$genesis_exists" --stamped-at="$stamped")" || return $?
 
   # Seal the receipt canonical at the root HMAC rail — a standalone engine has no
   # key, so the seal (via gate-proof) is what makes the verdict tamper-evident. The
