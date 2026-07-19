@@ -263,11 +263,11 @@ declare -A TYPE_INSTALL=(
   # into ~/.local/bin leaves it unexecutable in systemd/create-time envs where
   # nvm's per-version bin directory is absent from PATH. Install a supported
   # Node 24 and give both executables stable one-hop links in ~/.local/bin.
-  # On --upgrade, remove the old cross-version launcher before invoking the
-  # installer. Otherwise switching nvm to Node 24 can make `npm prefix -g`
-  # point at an empty global tree while the old launcher's -x guard skips the
-  # install, replacing a working launcher with a dangling Node-24 symlink.
-  [openclaw]="{ . /home/claude/.nvm/nvm.sh && nvm install 24 >/dev/null; } && mkdir -p /home/claude/.local/bin && ln -sfn \"\$(nvm which 24)\" /home/claude/.local/bin/node && { [[ \"\${FORCE_INSTALL:-0}\" != 1 ]] || rm -f /home/claude/.local/bin/openclaw; } && { [[ -x /home/claude/.local/bin/openclaw ]] || curl -fsSL https://openclaw.ai/install.sh | bash -s -- --no-onboard; } && _oc_global=\"\$(npm prefix -g)/bin/openclaw\" && { [[ ! -x \"\$_oc_global\" ]] || ln -sfn \"\$_oc_global\" /home/claude/.local/bin/openclaw; } && [[ -x /home/claude/.local/bin/openclaw ]]"
+  # Install the npm package directly under the active Node 24 prefix. The
+  # upstream wrapper re-selects nvm's default Node and may attempt a privileged
+  # NodeSource upgrade, which fails in our non-interactive `sudo -u claude`
+  # installer. FORCE_INSTALL makes --upgrade refresh this exact Node-24 global.
+  [openclaw]="{ . /home/claude/.nvm/nvm.sh && nvm install 24 >/dev/null && nvm use 24 --silent; } && { [[ \"\${FORCE_INSTALL:-0}\" != 1 && -x \"\$(npm prefix -g)/bin/openclaw\" ]] || npm --loglevel=error --no-fund --no-audit install -g openclaw@latest; } && mkdir -p /home/claude/.local/bin && ln -sfn \"\$(nvm which 24)\" /home/claude/.local/bin/node && ln -sfn \"\$(npm prefix -g)/bin/openclaw\" /home/claude/.local/bin/openclaw && [[ -x /home/claude/.local/bin/openclaw ]]"
   # antigravity's installer drops the native-Go binary at ~/.local/bin/agy
   # and self-updates in the background on each run, so no daily-cron
   # equivalent of @google/gemini-cli's npm update is needed.
