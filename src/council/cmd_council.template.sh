@@ -205,12 +205,22 @@ _council_veto() {
   # AUTHENTICATE the tap: sha256(presented nonce) must equal the nonce DIGEST minted for THIS offer.
   # The raw nonce is never stored server-side (only its digest rides in the receipt), so a
   # group-readable receipt no longer leaks the bearer token (main gate amendment 2).
-  local stored_nonce_digest offer_resolved offer_principal execute_after stamped_at verdict_json
-  stored_nonce_digest="$(jq -r '.vetoNonceDigest // empty' "$found" 2>/dev/null)"
+  # CNCL-9 AMENDMENT (main gate): the nonce digest + executeAfter + stampedAt are read from the
+  # VERIFIED canonical (which just re-sealed to the stored digest above), NEVER from the raw wrapper.
+  # The wrapper's `.vetoNonceDigest`/`.executeAfter` are unsealed and forgeable; before this fix the
+  # re-seal check only covered `.canonical`, so swapping `.vetoNonceDigest` to sha256(attacker-nonce)
+  # passed the check and let an attacker exercise with a chosen nonce. Now those fields ride INSIDE
+  # `.canonical` (seal-augment folded them in at seal time), so any edit breaks the re-seal above and
+  # the values used here come from the byte-intact bytes. offer_resolved/principal stay wrapper-read:
+  # exercise still requires the sealed-digest-matching nonce (the bearer token), which only the
+  # founder holds, so a widened offer cannot help an attacker who lacks that nonce.
+  local stored_nonce_digest offer_resolved offer_principal execute_after stamped_at verdict_json binding_json
+  binding_json="$(printf '%s' "$rcanon" | node "$dir/cli.mjs" read-binding --canonical=- 2>/dev/null)" || binding_json=""
+  stored_nonce_digest="$(printf '%s' "$binding_json" | jq -r '.nonceDigest // empty' 2>/dev/null)"
+  execute_after="$(printf '%s' "$binding_json" | jq -r '.executeAfter // empty' 2>/dev/null)"
+  stamped_at="$(printf '%s' "$binding_json" | jq -r '.stampedAt // empty' 2>/dev/null)"
   offer_resolved="$(jq -r '.verdict.vetoOffer.resolved // empty' "$found" 2>/dev/null)"
   offer_principal="$(jq -r '.verdict.vetoOffer.principal // empty' "$found" 2>/dev/null)"
-  execute_after="$(jq -r '.executeAfter // empty' "$found" 2>/dev/null)"
-  stamped_at="$(jq -r '.stampedAt // empty' "$found" 2>/dev/null)"
   [[ -n "$stored_nonce_digest" && -n "$offer_resolved" ]] || fail "$E_GENERIC" "receipt carries no veto offer to exercise (fail-closed)"
   local presented_digest; presented_digest="$(_council_sha256 "$nonce")"
   [[ -n "$presented_digest" && "$presented_digest" == "$stored_nonce_digest" ]] || { _council_veto_audit "nonce-mismatch" "$rcpt_digest" "$offer_resolved"; fail "$E_PERMISSION" "veto nonce mismatch — this tap is not the one offered to the founder principal (refused + logged)"; }
@@ -470,9 +480,27 @@ cmd_council() {
   # Seal the receipt canonical at the root HMAC rail — a standalone engine has no
   # key, so the seal (via gate-proof) is what makes the verdict tamper-evident. The
   # founder veto + dissent already ride INSIDE the signed bytes (canonicalTranscript).
-  local canonical digest=""
-  canonical="$(printf '%s' "$raw" | jq -r '.receipt.canonical // empty')"
-  if [[ -n "$canonical" ]]; then
+  local base_canonical canonical digest=""
+  base_canonical="$(printf '%s' "$raw" | jq -r '.receipt.canonical // empty')"
+  if [[ -n "$base_canonical" ]]; then
+    # CNCL-9: if the sealed verdict carries a veto OFFER (a primary-council pass), stamp the HOLD
+    # deadline (executeAfter = sealedAt + veto_hold) and mint a one-time tap nonce bound to the
+    # offered recipient. AMENDMENT (main gate): mint these BEFORE sealing and FOLD their binding
+    # (nonce DIGEST + executeAfter) INTO the canonical via seal-augment, so they are covered by the
+    # same HMAC as the rest of the receipt. Pre-amendment they were stamped onto the unsealed
+    # wrapper AFTER the seal, so the exercise-time re-seal (which only re-signs `.canonical`) did
+    # not cover them and an edited `.vetoNonceDigest` slipped through. A base receipt (no offer)
+    # gets no seal-binding line and stays byte-identical to CNCL-6/8.
+    local offer_resolved execute_after="" veto_nonce="" veto_nonce_digest=""
+    offer_resolved="$(printf '%s' "$raw" | jq -r '.verdict.vetoOffer.resolved // empty' 2>/dev/null)"
+    if [[ -n "$offer_resolved" ]]; then
+      execute_after="$(date -u -d "$stamped + ${veto_hold} seconds" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo "")"
+      veto_nonce="$(openssl rand -hex 16 2>/dev/null || head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+      veto_nonce_digest="$(_council_sha256 "$veto_nonce")"
+      canonical="$(printf '%s' "$base_canonical" | node "$dir/cli.mjs" seal-augment --canonical=- --nonce-digest="$veto_nonce_digest" --execute-after="$execute_after")" || canonical="$base_canonical"
+    else
+      canonical="$base_canonical"
+    fi
     if [[ "$(id -u)" -eq 0 ]]; then
       digest="$(printf '%s' "$canonical" | cmd_gate_proof_sign_stdin)" || digest=""
     else
@@ -481,18 +509,6 @@ cmd_council() {
     if [[ -n "$digest" ]]; then
       mkdir -p "$COUNCIL_RECEIPTS" 2>/dev/null || true
       if [[ -w "$COUNCIL_RECEIPTS" ]]; then
-        # CNCL-9: if the sealed verdict carries a veto OFFER (a primary-council pass), stamp the
-        # HOLD deadline (executeAfter = sealedAt + veto_hold) and mint a one-time tap nonce bound
-        # to the offered recipient. Nobody waits synchronously — the receipt CARRIES executeAfter
-        # and the interim policy (main, operator) is that no consumer acts before it; CNCL-12 makes
-        # every consumer enforce it. The nonce is what the authenticated tap presents to exercise.
-        local offer_resolved execute_after="" veto_nonce="" veto_nonce_digest=""
-        offer_resolved="$(printf '%s' "$raw" | jq -r '.verdict.vetoOffer.resolved // empty' 2>/dev/null)"
-        if [[ -n "$offer_resolved" ]]; then
-          execute_after="$(date -u -d "$stamped + ${veto_hold} seconds" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo "")"
-          veto_nonce="$(openssl rand -hex 16 2>/dev/null || head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n')"
-          veto_nonce_digest="$(_council_sha256 "$veto_nonce")"
-        fi
         # Offline-test capture ONLY: when MOCK is on AND a sink path is provided, drop the raw nonce
         # so the bash e2e can present it at exercise. Double-gated on COUNCIL_MOCK (never set in a
         # real convene) + COUNCIL_VETO_NONCE_SINK, so PRODUCTION never writes the raw nonce to disk —
@@ -500,12 +516,12 @@ cmd_council() {
         if [[ -n "$veto_nonce" && -n "${COUNCIL_MOCK:-}" && -n "${COUNCIL_VETO_NONCE_SINK:-}" ]]; then
           ( umask 077; printf '%s\n' "$veto_nonce" > "$COUNCIL_VETO_NONCE_SINK" ) 2>/dev/null || true
         fi
-        # CNCL-9 (main gate amendment 2): the receipt is the FLEET-READABLE audit artifact (verify +
-        # the DIVE-1493 dashboard render it), so it stores ONLY the nonce DIGEST. The raw nonce never
-        # touches the receipt; it is delivered solely to the founder via _council_veto_ping below.
-        # Exercise authenticates by hashing the presented nonce and comparing to this digest.
-        printf '%s' "$raw" | jq --arg d "$digest" --arg s "$stamped" --arg ea "$execute_after" --arg nd "$veto_nonce_digest" \
-          '{stampedAt:$s, sealedDigest:$d, council, question, disposition, verdict, canonical: .receipt.canonical}
+        # The receipt stores the AUGMENTED canonical (with the sealed veto-binding line). The wrapper
+        # still surfaces executeAfter + vetoNonceDigest for display/dashboard audit, but exercise no
+        # longer TRUSTS them — it reads the binding back out of the verified canonical (fail-closed).
+        # The raw nonce never touches the receipt; it is delivered solely to the founder via the ping.
+        printf '%s' "$raw" | jq --arg d "$digest" --arg s "$stamped" --arg ea "$execute_after" --arg nd "$veto_nonce_digest" --arg canon "$canonical" \
+          '{stampedAt:$s, sealedDigest:$d, council, question, disposition, verdict, canonical: $canon}
            + (if ($ea|length)>0 then {executeAfter:$ea} else {} end)
            + (if ($nd|length)>0 then {vetoNonceDigest:$nd} else {} end)' \
           > "${COUNCIL_RECEIPTS}/${stamped//:/-}.json" 2>/dev/null || true

@@ -311,11 +311,35 @@ function cmdVeto() {
   out({ vetoRecord: rec, flippedVerdict: flipped, disposition: E.dispositionOf(flipped), canonical: E.canonicalVetoRecord(rec) })
 }
 
+// ---- CNCL-9 amendment: fold the veto seal-binding into the SEALED canonical ----------------
+// At seal time bash mints the nonce digest + executeAfter (post-convene) and calls this to APPEND
+// the deterministic seal-binding line to the canonical BEFORE sealing, so both are covered by the
+// HMAC. Reads the base canonical from --canonical or stdin ("-"); prints the augmented canonical.
+function readCanonicalArg() {
+  const c = flag('canonical')
+  if (c === '-' || c == null || c === true) { try { return fs.readFileSync(0, 'utf-8') } catch { die('seal-augment/read-binding needs the canonical on stdin or --canonical=<text>') } }
+  return String(c)
+}
+function cmdSealAugment() {
+  const canonical = readCanonicalArg()
+  const nonceDigest = flag('nonce-digest') === true ? '' : (flag('nonce-digest') || '')
+  const executeAfter = flag('execute-after') === true ? '' : (flag('execute-after') || '')
+  process.stdout.write(E.augmentCanonicalVetoBinding(canonical, { nonceDigest, executeAfter }))
+}
+// At exercise time bash re-seals `.canonical` (proving it matches the stored digest) and calls this
+// to read the nonce digest + executeAfter + stampedAt back OUT of the VERIFIED canonical — never
+// from the raw wrapper, which is unsealed and forgeable. Fail-closed: present=false on no binding.
+function cmdReadBinding() {
+  out(E.parseCanonicalVetoBinding(readCanonicalArg()))
+}
+
 const main = async () => {
   if (sub === 'convene') return cmdConvene()
   if (sub === 'bench') return cmdBench()
   if (sub === 'init') return cmdInit()
   if (sub === 'veto') return cmdVeto()
-  die(`unknown council subcommand: ${sub} (convene|bench|init|veto)`)
+  if (sub === 'seal-augment') return cmdSealAugment()
+  if (sub === 'read-binding') return cmdReadBinding()
+  die(`unknown council subcommand: ${sub} (convene|bench|init|veto|seal-augment|read-binding)`)
 }
 main().catch(e => die(String(e && e.message || e), 1))

@@ -10,6 +10,7 @@ import {
   buildVetoRecord, canonicalVetoRecord, VETO_DEFAULTS, dispositionOf, addSeat, removeSeat,
   THRESHOLD_POLICY, quorumSize,
   canonicalTranscript, validateAgainstSchema, makeAnthropicModelCall, runCouncil, TAKE, VOTE, NODE_VOTE,
+  augmentCanonicalVetoBinding, parseCanonicalVetoBinding,
 } from '../src/council/engine.mjs'
 
 let pass = 0, fail = 0
@@ -172,6 +173,21 @@ let calls = 0
 const r4 = await runCouncil({ role: 'verifier', task: { ident: 'DIVE-9', ask: 'x', accept: 'y', type: 'decision', tier: 2 } },
   { modelCall: async () => { calls++; return {} } })
 ok(r4.verdict.escalated === true && r4.convened === false && calls === 0, 'runCouncil: tier-2 guardrail escalates with zero model calls')
+
+// CNCL-9 AMENDMENT: veto seal-binding folds the nonce digest + executeAfter INTO the sealed bytes.
+const _vbBase = canonicalTranscript(rec)
+ok(augmentCanonicalVetoBinding(_vbBase, {}) === _vbBase, 'seal-binding: no digest/deadline leaves canonical byte-identical')
+const _vbAug = augmentCanonicalVetoBinding(_vbBase, { nonceDigest: 'deadbeef', executeAfter: '2026-07-19T12:15:00Z' })
+ok(_vbAug.split('\n').length === _vbBase.split('\n').length + 1, 'seal-binding: appends exactly one deterministic line')
+ok(_vbAug.startsWith(_vbBase + '\n'), 'seal-binding: appended (never interleaved) — base bytes preserved')
+const _vbP = parseCanonicalVetoBinding(_vbAug)
+ok(_vbP.present && _vbP.nonceDigest === 'deadbeef' && _vbP.executeAfter === '2026-07-19T12:15:00Z', 'seal-binding: parse round-trips nonceDigest + executeAfter')
+ok(_vbP.stampedAt === rec.stampedAt, 'seal-binding: stampedAt read from the (already-sealed) canonical line')
+ok(parseCanonicalVetoBinding(_vbBase).present === false, 'seal-binding: fail-closed present=false when no binding line')
+// The point of the amendment: an edit to the sealed nonce digest changes the canonical bytes (so
+// the exercise-time re-seal will no longer match) — proving the digest is now covered by the HMAC.
+const _vbTampered = _vbAug.replace('nonceDigest=deadbeef', 'nonceDigest=cafebabe')
+ok(_vbTampered !== _vbAug && parseCanonicalVetoBinding(_vbTampered).nonceDigest === 'cafebabe', 'seal-binding: swapping the nonce digest changes the sealed canonical (re-seal will break)')
 
 console.log(`\nCNCL-6 engine: ${pass} passed, ${fail} failed (bound to src/council/engine.mjs)`)
 process.exit(fail ? 1 : 0)

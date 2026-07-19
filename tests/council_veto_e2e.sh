@@ -115,5 +115,22 @@ else
   ok "tampered-canonical receipt refused (re-seal hardening)"
 fi
 
+# --- AMENDMENT (main gate): swapping the WRAPPER .vetoNonceDigest to sha256(attacker-nonce) must be
+# refused. Pre-amendment the nonce digest lived OUTSIDE .canonical, so this edit slipped past the
+# re-seal check and let the attacker exercise with a chosen nonce. Now exercise reads the digest
+# from the SEALED canonical (seal-augment folded it in), so the wrapper edit is ignored and the
+# attacker's nonce fails authentication. .canonical is left INTACT here (re-seal still passes) to
+# prove it is the seal-binding read — not the existing re-seal check — that closes this hole.
+COUNCIL_VETO_NONCE_SINK="$TMP/n3" "$FIVE" council convene "third convene" --seats="a:chair,b,c" --mode=quick >/dev/null 2>&1
+RCPT3="$(ls -1t "$TMP/council/receipts/"*.json | grep -v '/veto-' | head -1)"
+DIG3="$(jq -r '.sealedDigest' "$RCPT3")"
+ATT_NONCE="attackerchosennonce0000000000000"
+jq --arg nd "$(sha "$ATT_NONCE")" '.vetoNonceDigest = $nd' "$RCPT3" > "$TMP/rt3.json" && cp "$TMP/rt3.json" "$RCPT3"
+if "$FIVE" council veto exercise --receipt="$DIG3" --nonce="$ATT_NONCE" --tier=hold >/dev/null 2>&1; then
+  no "swapped wrapper .vetoNonceDigest let an attacker exercise with a chosen nonce (HOLE OPEN)"
+else
+  ok "swapped wrapper .vetoNonceDigest refused — exercise reads the digest from the sealed canonical"
+fi
+
 echo "CNCL-9 veto e2e: $pass passed, $fail failed"
 [[ "$fail" -eq 0 ]]

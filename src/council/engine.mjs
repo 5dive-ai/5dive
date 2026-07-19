@@ -402,6 +402,44 @@ export function canonicalTranscript(rec) {
   return L.join('\n')
 }
 
+// (CNCL-9 main-gate amendment) FOLD THE VETO SEAL-BINDING INTO THE SIGNED BYTES.
+//
+// The convene nonce digest + the executeAfter hold deadline are minted by the ROOT bash layer
+// AT SEAL TIME (the engine has no clock/CSPRNG), i.e. AFTER canonicalTranscript(rec) is produced.
+// Before this amendment they lived only on the UNSEALED receipt wrapper (`.vetoNonceDigest`,
+// `.executeAfter`), OUTSIDE `.canonical` — so the exercise-time re-seal check (which only re-signs
+// `.canonical`) did NOT cover them: an edit swapping `.vetoNonceDigest` to sha256(attacker-nonce)
+// left `.canonical` untouched, the re-seal still matched, and the attacker could exercise the veto
+// with a chosen nonce. FIX: bash appends this deterministic seal-binding LINE to the canonical
+// BEFORE sealing, so the digest + deadline are covered by the same HMAC; exercise reads them back
+// from the VERIFIED canonical (parseCanonicalVetoBinding), never from the raw wrapper. Any edit to
+// the digest or deadline now changes `.canonical` and breaks the re-seal (fail-closed, refused).
+//
+// The line is appended (never interleaved) so a base-only receipt (no veto offer) stays byte-
+// identical to CNCL-6/8. The format is a single stable line the parser round-trips exactly.
+export function augmentCanonicalVetoBinding(canonical, binding) {
+  const nd = String((binding && binding.nonceDigest) || '').replace(/\s+/g, '')
+  const ea = String((binding && binding.executeAfter) || '').replace(/\s+/g, '')
+  if (!nd && !ea) return String(canonical == null ? '' : canonical)   // nothing to bind — unchanged
+  return `${String(canonical == null ? '' : canonical)}\nveto-seal: nonceDigest=${nd} executeAfter=${ea}`
+}
+
+// Parse the seal-binding back OUT of a VERIFIED canonical (the bytes that re-sealed to the stored
+// digest). Returns { nonceDigest, executeAfter, stampedAt, present }. stampedAt is read from the
+// canonical's own `stampedAt: ` line (already inside the sealed bytes since CNCL-6). Fail-closed:
+// a canonical with no seal-binding line returns present=false + empty digest, so exercise refuses.
+export function parseCanonicalVetoBinding(canonical) {
+  const text = String(canonical == null ? '' : canonical)
+  const m = text.match(/^veto-seal: nonceDigest=(\S*) executeAfter=(\S*)$/m)
+  const sm = text.match(/^stampedAt: (.*)$/m)
+  return {
+    present: !!m,
+    nonceDigest: m ? m[1] : '',
+    executeAfter: m ? m[2] : '',
+    stampedAt: sm ? sm[1].trim() : '',
+  }
+}
+
 // The seal/verify run at the ROOT CLI layer (a standalone engine has no root). $RECEIPT =
 // canonicalTranscript(rec) on stdin; seal stores the base64url HMAC, verify re-signs + compares.
 export function sealCommands() {
