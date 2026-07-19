@@ -902,6 +902,9 @@ export function buildConveneVerdict(counted, narr) {
   return {
     recommendation: counted.recommendation, tally: counted.tally, threshold: counted.threshold,
     seatCount: counted.seatCount, quorum: counted.quorum, quorumMet: counted.quorumMet, votesCast: counted.votesCast,
+    // CNCL-11: surface the applied decision class + who recused so the sealed receipt's verdict is
+    // self-describing for audit. These are NOT in canonicalTranscript (additive, no seal change).
+    decisionClass: counted.decisionClass, recused: counted.recused || [],
     confidence: narr.confidence, dissent: narr.dissent,
     escalated: counted.escalated, brief: counted.escalated ? narr.brief : '',
   }
