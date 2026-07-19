@@ -26,7 +26,7 @@ esac
 
 # Bumped on every public release. `build.sh` checks this line exists; CI fails
 # the bundle-drift check if it's missing or empty.
-readonly FIVE_VERSION="0.11.13"
+readonly FIVE_VERSION="0.11.14"
 
 # GitHub org our repos live under. The org is being renamed
 # 5dive-com -> 5dive-ai (2026-06); fetches must work on either side of the
@@ -15823,6 +15823,7 @@ _task_usage() {
                                                      # back to todo when the time passes (heartbeat sweep, DIVE-891)
   5dive task unpark <id|DIVE-N>                      # clear a park early -> todo (unless task-deps still block it)
   5dive task inbox                                   # list ONLY human-gated tasks, priority-ordered
+  5dive task inbox --send [--channel-proof=<chat>]   # DM the owner ONE tap-button digest of those gates (root-side; nonce never printed)
   5dive task answer <id|DIVE-N> --value="..."        # record the human's answer, unblock, ping the owning agent
   5dive task clear-recs --channel-proof=<chat_id> [--only=<id|DIVE-N>]
                                                      # DIVE-1305: paired-human bulk-clear — apply each pending gate's --recommend as a HUMAN clear,
@@ -18530,11 +18531,15 @@ task_need_notify() {
 
 cmd_task_inbox() {
   tasks_db_init
+  local send=0 channel_proof=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
+      --send)            send=1 ;;
+      --channel-proof=*) channel_proof="${1#*=}" ;;
       -*) fail "$E_USAGE" "unknown flag: $1" ;;
       *)  fail "$E_USAGE" "unexpected arg: $1 (inbox takes no positional args)" ;;
     esac
+    shift
   done
   # A pending gate, decoupled from the overloaded `status` (a task can be both
   # human-gated and blocked-by another task): need set, not yet answered. We
@@ -18542,6 +18547,11 @@ cmd_task_inbox() {
   # no one, so a lingering unanswered gate must not leak into the human inbox.
   local where="need_type IS NOT NULL AND need_answered_at IS NULL AND status NOT IN ('done','cancelled')"
   local order="ORDER BY CASE priority WHEN 'urgent' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2 ELSE 3 END, created_at"
+  if (( send )); then
+    _task_inbox_send "$channel_proof" "$where" "$order"
+    return
+  fi
+  [[ -z "$channel_proof" ]] || fail "$E_USAGE" "--channel-proof only applies with --send"
   if (( JSON_MODE )); then
     local rows
     rows=$(dbfmt -json "SELECT id, ident, title, status, priority, assignee, created_by, parent_id, created_at, need_type, ask, need_options, recommend, precedent_ref, need_answer, need_answered_at FROM tasks WHERE ${where} ${order};")
@@ -18555,6 +18565,94 @@ cmd_task_inbox() {
     else
       dbfmt -box "SELECT ident, priority, need_type, COALESCE(assignee,'-') AS owner, COALESCE(recommend,'-') AS recommend, COALESCE((SELECT ident FROM tasks p WHERE p.id=tasks.precedent_ref),'-') AS precedent, ask FROM tasks WHERE ${where} ${order};"
     fi
+  fi
+}
+
+# DIVE-1499: on-demand owner digest of the pending-gate inbox as ONE message
+# with WORKING tap buttons for every gate type — including approval/secret/
+# manual. The per-gate DIVE-916 human nonce is deliberately NOT exposed in
+# `inbox --json`: that output is agent-readable, and a readable nonce is an
+# agent-forgeable human-proof — the exact hole DIVE-950 closed. Instead this
+# root-side path mints a FRESH nonce per hard gate, embeds it ONLY in Telegram
+# callback_data, and rotates the stored hash after a confirmed send — the same
+# contract as `task need` and the heartbeat re-nag batch. Stdout carries counts
+# and message ids, never a nonce. The telegram plugin's /inbox flow shells this
+# verb (passing the requesting chat as --channel-proof) instead of composing
+# tier-2 buttons itself.
+_task_inbox_send() {
+  local channel_proof="$1" where="$2" order="$3"
+  require_root "task inbox --send"
+  # When the plugin relays a human /inbox request it passes the requester's
+  # chat_id; verify it against access.json allowFrom before sending. Absent
+  # proof = an operator/root invocation on the box.
+  if [[ -n "$channel_proof" ]]; then
+    _gate_channel_proof_ok "$channel_proof" \
+      || fail "$E_AUTH_REQUIRED" "channel-proof did not verify — the chat id is not in this bot's access.json allowFrom (paired-human DMs)"
+  fi
+  _task_owner_channel || fail "$E_AUTH_REQUIRED" "no paired owner channel (connector token / access.json missing)"
+
+  local cap=10 total
+  total=$(db "SELECT COUNT(*) FROM tasks WHERE ${where};")
+  if [[ "${total:-0}" == "0" ]]; then
+    ok "inbox empty — nothing to send" '{sent:false, gates:0}'
+    return
+  fi
+  local shown=$(( total < cap ? total : cap ))
+
+  local text="🗂 Gate inbox — waiting on you now:"
+  local kbrows='[]' row id ident prio ntype options recommend ask nonce="" markup="" idlist=""
+  local -a nonce_ids=() nonce_hashes=()
+  while IFS= read -r row; do
+    [[ -n "$row" ]] || continue
+    IFS=$'\x1f' read -r id ident prio ntype options recommend ask <<<"$row"
+    [[ -n "$id" && -n "$ident" ]] || continue
+    idlist+="${idlist:+,}${id}"
+    text+=$'\n\n'"• [${ident}] ${ntype}, ${prio} — ${ask} /task_${id}"
+    [[ -n "$recommend" ]] && text+=$'\n'"  ✅ Recommended: ${recommend}"
+    [[ -n "$options" ]] && text+=$'\n'"  Options: ${options}"
+    nonce=""
+    case "$ntype" in
+      approval|secret|manual)
+        nonce=$(_human_nonce_mint)
+        if [[ -n "$nonce" ]]; then
+          nonce_ids+=("$id")
+          nonce_hashes+=("$(_human_nonce_sha "$nonce")")
+        fi
+        ;;
+    esac
+    markup=$(_task_gate_reply_markup "$id" "$ntype" "$options" "$recommend" "$nonce" "$TASK_CH_TYPE" "$ident")
+    if [[ -n "$markup" ]]; then
+      kbrows=$(jq -cn --argjson a "$kbrows" --argjson b "$markup" '$a + ($b.inline_keyboard // [])' 2>/dev/null) || kbrows='[]'
+    fi
+  done < <(db "SELECT id||x'1f'||ident||x'1f'||priority||x'1f'||need_type||x'1f'||COALESCE(need_options,'')||x'1f'||COALESCE(recommend,'')||x'1f'||substr(replace(COALESCE(ask,''),x'0a',' '),1,240)
+               FROM tasks WHERE ${where} ${order} LIMIT ${cap};")
+  if (( total > cap )); then
+    text+=$'\n\n'"…and $(( total - cap )) more — 5dive task inbox on the box or the dashboard."
+  fi
+  text+=$'\n\n'"Tap a button, open a /task link, or answer from the dashboard."
+
+  local reply_markup=""
+  [[ "$kbrows" != "[]" ]] && reply_markup=$(jq -cn --argjson rows "$kbrows" '{inline_keyboard:$rows}' 2>/dev/null) || true
+
+  _task_send_owner "$text" "$reply_markup" "$idlist"
+  if [[ "${TASK_SEND_DELIVERED:-0}" == "1" ]]; then
+    # Rotate hashes only after a confirmed receipt (same ordering as the
+    # heartbeat re-nag): an earlier alert's button dies only once a live
+    # replacement is in the human's chat.
+    local i
+    for (( i=0; i<${#nonce_ids[@]}; i++ )); do
+      db "UPDATE tasks SET human_nonce_hash=$(sqlq "${nonce_hashes[$i]}")
+          WHERE id=${nonce_ids[$i]} AND need_answered_at IS NULL;" 2>/dev/null || true
+    done
+    audit_log "task inbox send" "ok" 0 -- \
+      "gates=${shown}/${total}" "chat_proof=${channel_proof:-none}" "message_id=${TASK_SEND_MESSAGE_IDS:-none}"
+    ok "inbox digest sent (${shown}/${total} gates)" \
+      '{sent:true, gates:($g|tonumber), total:($t|tonumber), message_ids:$m}' \
+      --arg g "$shown" --arg t "$total" --arg m "${TASK_SEND_MESSAGE_IDS:-}"
+  else
+    audit_log "task inbox send" "error" 1 -- \
+      "gates=${shown}/${total}" "chat_proof=${channel_proof:-none}"
+    fail "$E_GENERIC" "inbox digest delivery unconfirmed — nonce hashes left unrotated, earlier alert buttons remain valid"
   fi
 }
 
