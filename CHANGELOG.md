@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.10.9 — openclaw headless node24 runtime (DIVE-1328) (2026-07-19)
+
+- fix(openclaw): fresh agents resolve a supported Node 24 runtime explicitly (stable `~/.local/bin/node` link + direct node invocation for OpenClaw's `#!/usr/bin/env node` launcher at create-time model setup and at runtime in `5dive-agent-start`), and channel-less agents use an idempotent `config set gateway.mode local` headless bootstrap instead of blocking in the interactive `openclaw configure` wizard. The managed install/upgrade path installs `openclaw@latest` directly into the active Node 24 npm prefix (`nvm use 24` + `npm install -g`) rather than the upstream `openclaw.ai/install.sh` wrapper, which re-selects nvm's default Node and can attempt a privileged NodeSource upgrade that fails in the non-interactive `sudo -u claude` installer; `FORCE_INSTALL` (set by `--upgrade`) always refreshes that Node 24 global, and node/openclaw links then point at the same active tree with a fail-closed final `-x` check. Verified on a fresh Ubuntu 24.04 smoke: install --upgrade + node link + create + runtime stability + a live `agent ask` round-trip (DIVE-1328).
+
 ## 0.10.8 — BYO model on claude create + init Enter-drain (2026-07-19)
 
 - fix(agent): `agent create --type=claude --provider=openrouter --model=<slug>` now preserves the explicit model in the new agent's `settings.json` instead of overwriting it with `claude-opus-4-8`; the existing auth-profile tier mappings remain intact (DIVE-1327).
