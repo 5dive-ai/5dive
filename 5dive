@@ -26,7 +26,7 @@ esac
 
 # Bumped on every public release. `build.sh` checks this line exists; CI fails
 # the bundle-drift check if it's missing or empty.
-readonly FIVE_VERSION="0.10.7"
+readonly FIVE_VERSION="0.10.8"
 
 # GitHub org our repos live under. The org is being renamed
 # 5dive-com -> 5dive-ai (2026-06); fetches must work on either side of the
@@ -917,7 +917,7 @@ _operator_ids() {
 }
 
 preseed_claude_agent() {
-  local name="$1" channels="$2"
+  local name="$1" channels="$2" selected_model="${3:-claude-opus-4-8}"
   local user="agent-${name}" home="/home/agent-${name}"
   [[ -d "$home" ]] || fail "$E_GENERIC" "agent home missing: $home"
 
@@ -977,8 +977,8 @@ JSON
   # so a new agent would lose its pin on first boot and fall back to the default
   # model. Valid ids (claude-opus-4-8) are left untouched. See DIVE-506.
   local settings
-  settings=$(jq -n --argjson sl "$(jq -n "$status_line_obj")" --arg ghorg "$(gh_org)" '{
-    model: "claude-opus-4-8",
+  settings=$(jq -n --argjson sl "$(jq -n "$status_line_obj")" --arg ghorg "$(gh_org)" --arg model "$selected_model" '{
+    model: $model,
     effortLevel: "high",
     permissions: {
       defaultMode: "bypassPermissions",
@@ -7972,7 +7972,14 @@ cmd_create() {
   # run prompts are handled by their own CLIs.
   if [[ "$type" == "claude" ]]; then
     step "Preseeding claude config for agent-${name}"
-    preseed_claude_agent "$name" "$channels"
+    # A create-time BYO --model is per-agent intent. The auth profile's
+    # ANTHROPIC_DEFAULT_* variables translate Claude's tier aliases, but the
+    # preseeded settings.json model is the actual startup selection and used to
+    # be hard-pinned to claude-opus-4-8, overriding that intent. Pass the model
+    # through so this agent starts on the requested OpenRouter/vendor slug.
+    local _claude_byo_model=""
+    [[ -n "$byo_provider" ]] && _claude_byo_model="$byo_model"
+    preseed_claude_agent "$name" "$channels" "$_claude_byo_model"
   elif [[ "$type" == "antigravity" ]]; then
     # antigravity needs no claude-style ~/.claude preseed (agy reads its own
     # ~/.gemini state). The default-skill seed every other type gets isn't
@@ -13182,7 +13189,7 @@ _init_pick() {
   local -a options=("$@")
   local count="${#options[@]}" selected=$((default_idx - 1))
   (( selected >= 0 && selected < count )) || selected=0
-  local spec value label description i key tail choice
+  local spec value label description i key tail choice _init_discard
 
   printf '  %s\n' "$title" >&2
   if [[ "${TERM:-dumb}" == "dumb" || ! -t 0 || ! -t 2 ]]; then
@@ -13243,7 +13250,16 @@ _init_pick() {
         k|K) selected=$(((selected - 1 + count) % count)) ;;
         j|J) selected=$(((selected + 1) % count)) ;;
         [1-9])
-          if (( key <= count )); then selected=$((key - 1)); break; fi
+          if (( key <= count )); then
+            selected=$((key - 1))
+            # A typed shortcut like "2⏎" leaves its terminating Enter in the tty
+            # buffer; without draining it, the next prompt (e.g. the model text
+            # field) reads that stray newline as an empty submission and aborts.
+            # The tiny timeout only consumes input already buffered — it never
+            # blocks waiting on the user. DIVE-1398.
+            IFS= read -r -s -t 0.05 _init_discard || true
+            break
+          fi
           ;;
       esac
     done

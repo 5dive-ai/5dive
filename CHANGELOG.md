@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.10.8 — BYO model on claude create + init Enter-drain (2026-07-19)
+
+- fix(agent): `agent create --type=claude --provider=openrouter --model=<slug>` now preserves the explicit model in the new agent's `settings.json` instead of overwriting it with `claude-opus-4-8`; the existing auth-profile tier mappings remain intact (DIVE-1327).
+- fix(init): a typed numeric menu shortcut in the `5dive init` wizard no longer leaks its terminating Enter into the next prompt (DIVE-1398, surfaced by DIVE-1368 QA on fresh Ubuntu 24.04 over `ssh -tt`). `_init_pick`'s interactive branch reads one keystroke at a time (`read -s -n1`); a fast shortcut like `2⏎` selected the option but the trailing Enter stayed buffered and was consumed by the FOLLOWING prompt — so picking OpenRouter for a pi/opencode agent then read the stray newline as an empty model submission and aborted with `openrouter needs a model (none given)`. Fix: after a `[1-9]` shortcut selection, drain a single already-buffered line (`read -s -t 0.05`) so the Enter cannot cross into the next prompt. New `tests/init_pick_drain_unit.sh` drives the real interactive PTY branch (DIVE-1398).
+
 ## 0.10.7 — builder-scoped push grant + branch-bound gates (2026-07-18)
 
 - fix(push): a cleared ship gate now binds to the task's OWN declared branch. `_push_do` (and the `5dive push` pre-flight) refuse any branch that isn't the one the cited task declares via a `Branch: <name>` line in its body — so a granted agent can no longer cite one task's cleared gate to fast-forward an unrelated feature branch. A task with a cleared gate but no declared branch is refused (the gate has nothing to bind to). Authoritative in the root-only `_push_do`, mirrored as a friendly pre-flight in `cmd_push`. (DIVE-1462 / STEER-4)
