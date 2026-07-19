@@ -26,7 +26,7 @@ esac
 
 # Bumped on every public release. `build.sh` checks this line exists; CI fails
 # the bundle-drift check if it's missing or empty.
-readonly FIVE_VERSION="0.10.9"
+readonly FIVE_VERSION="0.10.10"
 
 # GitHub org our repos live under. The org is being renamed
 # 5dive-com -> 5dive-ai (2026-06); fetches must work on either side of the
@@ -47,7 +47,12 @@ gh_org() {
   printf '%s' "$_GH_ORG_RESOLVED"
 }
 
-STATE_DIR="/var/lib/5dive"
+# DIVE-1475: honor an env-set STATE_DIR instead of unconditionally reopening the
+# LIVE store. Lets a test isolate to a temp tree that STICKS through sourcing (and
+# survives into forked subprocesses via `sudo -E`/env_keep) — the isolation-failure
+# class behind the 2026-07-19 /goal-spam AND the board wipe. Prod is unaffected:
+# with the env var unset this is exactly "/var/lib/5dive".
+STATE_DIR="${STATE_DIR:-/var/lib/5dive}"
 REGISTRY="${STATE_DIR}/agents.json"
 ENV_DIR="${STATE_DIR}/agents.d"
 SYSTEMD_UNIT="5dive-agent@"
@@ -2710,8 +2715,10 @@ registry_write() {
 # root:claude (setgid) and we run under umask 0002 so the .db plus its
 # -wal/-shm sidecars stay group-writable for the next agent's connection.
 
-TASKS_DIR="${STATE_DIR}/tasks"
-TASKS_DB="${TASKS_DIR}/tasks.db"
+# DIVE-1475: honor direct env overrides too (a test may set TASKS_DB straight),
+# same isolation rationale as STATE_DIR in header.sh. Unset -> the live defaults.
+TASKS_DIR="${TASKS_DIR:-${STATE_DIR}/tasks}"
+TASKS_DB="${TASKS_DB:-${TASKS_DIR}/tasks.db}"
 
 # Quote an arbitrary string as a SQL literal: double embedded single quotes
 # and wrap. The sqlite3 CLI has no ergonomic bind-parameter path from bash,
@@ -24066,6 +24073,26 @@ _hb_is_knowledge_task() {
 # marking lastRunAt and retries next tick).
 _hb_wake() {
   local name="$1" fresh="$2" task_id="$3" task_ident="${4:-DIVE-$3}"
+  # DIVE-1475 status guard: never inject a /goal for a task that isn't actionable.
+  # The tick's picker (_hb_pick_task) only ever hands us a live todo, but the direct
+  # `heartbeat wake-task` verb — and any buggy or looping caller (e.g. a test harness
+  # walking ascending ids against the live host) — can pass a done/cancelled/
+  # nonexistent id, and every such call would otherwise spam a bogus /goal into a
+  # real agent's pane. Refuse here, the single choke point for ALL wake paths, so a
+  # stale or fabricated id is a logged no-op instead of a live goal. A non-numeric
+  # id or an absent row yields an empty status -> skip. Returns 0 (handled, not a
+  # retriable failure); the tick never reaches this since its pick is always a live
+  # todo, so legitimate wakes are unaffected.
+  if ! [[ "$task_id" =~ ^[0-9]+$ ]]; then
+    _hb_log "[$name] wake skipped — non-numeric task id '${task_id}'; no /goal injected"
+    return 0
+  fi
+  local _wt_status
+  _wt_status=$(db "SELECT status FROM tasks WHERE id=${task_id};" 2>/dev/null || echo "")
+  if [[ -z "$_wt_status" || "$_wt_status" == "done" || "$_wt_status" == "cancelled" ]]; then
+    _hb_log "[$name] wake skipped — ${task_ident} is ${_wt_status:-nonexistent}, not actionable; no /goal injected"
+    return 0
+  fi
   if ! systemctl is-active --quiet "5dive-agent@${name}.service"; then
     systemctl start "5dive-agent@${name}.service" 2>/dev/null \
       || { _hb_log "[$name] systemctl start failed"; return 1; }

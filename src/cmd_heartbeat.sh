@@ -643,6 +643,26 @@ _hb_is_knowledge_task() {
 # marking lastRunAt and retries next tick).
 _hb_wake() {
   local name="$1" fresh="$2" task_id="$3" task_ident="${4:-DIVE-$3}"
+  # DIVE-1475 status guard: never inject a /goal for a task that isn't actionable.
+  # The tick's picker (_hb_pick_task) only ever hands us a live todo, but the direct
+  # `heartbeat wake-task` verb — and any buggy or looping caller (e.g. a test harness
+  # walking ascending ids against the live host) — can pass a done/cancelled/
+  # nonexistent id, and every such call would otherwise spam a bogus /goal into a
+  # real agent's pane. Refuse here, the single choke point for ALL wake paths, so a
+  # stale or fabricated id is a logged no-op instead of a live goal. A non-numeric
+  # id or an absent row yields an empty status -> skip. Returns 0 (handled, not a
+  # retriable failure); the tick never reaches this since its pick is always a live
+  # todo, so legitimate wakes are unaffected.
+  if ! [[ "$task_id" =~ ^[0-9]+$ ]]; then
+    _hb_log "[$name] wake skipped — non-numeric task id '${task_id}'; no /goal injected"
+    return 0
+  fi
+  local _wt_status
+  _wt_status=$(db "SELECT status FROM tasks WHERE id=${task_id};" 2>/dev/null || echo "")
+  if [[ -z "$_wt_status" || "$_wt_status" == "done" || "$_wt_status" == "cancelled" ]]; then
+    _hb_log "[$name] wake skipped — ${task_ident} is ${_wt_status:-nonexistent}, not actionable; no /goal injected"
+    return 0
+  fi
   if ! systemctl is-active --quiet "5dive-agent@${name}.service"; then
     systemctl start "5dive-agent@${name}.service" 2>/dev/null \
       || { _hb_log "[$name] systemctl start failed"; return 1; }

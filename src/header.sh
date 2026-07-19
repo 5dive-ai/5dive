@@ -26,7 +26,7 @@ esac
 
 # Bumped on every public release. `build.sh` checks this line exists; CI fails
 # the bundle-drift check if it's missing or empty.
-readonly FIVE_VERSION="0.10.9"
+readonly FIVE_VERSION="0.10.10"
 
 # GitHub org our repos live under. The org is being renamed
 # 5dive-com -> 5dive-ai (2026-06); fetches must work on either side of the
@@ -47,7 +47,12 @@ gh_org() {
   printf '%s' "$_GH_ORG_RESOLVED"
 }
 
-STATE_DIR="/var/lib/5dive"
+# DIVE-1475: honor an env-set STATE_DIR instead of unconditionally reopening the
+# LIVE store. Lets a test isolate to a temp tree that STICKS through sourcing (and
+# survives into forked subprocesses via `sudo -E`/env_keep) — the isolation-failure
+# class behind the 2026-07-19 /goal-spam AND the board wipe. Prod is unaffected:
+# with the env var unset this is exactly "/var/lib/5dive".
+STATE_DIR="${STATE_DIR:-/var/lib/5dive}"
 REGISTRY="${STATE_DIR}/agents.json"
 ENV_DIR="${STATE_DIR}/agents.d"
 SYSTEMD_UNIT="5dive-agent@"

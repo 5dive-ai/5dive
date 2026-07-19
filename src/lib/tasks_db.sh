@@ -11,8 +11,10 @@
 # root:claude (setgid) and we run under umask 0002 so the .db plus its
 # -wal/-shm sidecars stay group-writable for the next agent's connection.
 
-TASKS_DIR="${STATE_DIR}/tasks"
-TASKS_DB="${TASKS_DIR}/tasks.db"
+# DIVE-1475: honor direct env overrides too (a test may set TASKS_DB straight),
+# same isolation rationale as STATE_DIR in header.sh. Unset -> the live defaults.
+TASKS_DIR="${TASKS_DIR:-${STATE_DIR}/tasks}"
+TASKS_DB="${TASKS_DB:-${TASKS_DIR}/tasks.db}"
 
 # Quote an arbitrary string as a SQL literal: double embedded single quotes
 # and wrap. The sqlite3 CLI has no ergonomic bind-parameter path from bash,
