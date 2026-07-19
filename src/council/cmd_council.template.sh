@@ -79,6 +79,20 @@ _council_help() {
       is a NEW root-sealed record hash-chained to the original verdict digest; the
       original receipt is never mutated. Tier is auto-derived from the clock if omitted.
 
+  5dive council sign-vote --seat=<id> --vote=<approve|reject|escalate|abstain>
+                          --convene=<id> (--qdigest=<hex> | --question=<text>)
+                          --key-file=<seat PKCS8 PEM | "-"> [--rationale=…] [--emit=line|json]
+      (CNCL-10) A SEAT signs its own vote at source, from its OWN harness — sign-at-source,
+      so the shell is the surface (a seat has no node of its own). Emits the `COUNCIL-SIG:`
+      line the seat pastes after its COUNCIL-VOTE line (--emit=json for the full row). The
+      convene id + question digest are in the signed bytes, so the signature is replay-proof.
+
+  5dive council verify-votes --votes=<json|@file> --roster=<json|@file>
+                             --convene=<id> (--qdigest=<hex> | --question=<text>)
+      (CNCL-10) Re-check EVERY co-signed vote against the roster pubkeys + revocation, bound
+      to THIS convene. Exits non-zero if any non-abstain vote is unsigned/forged/replayed/
+      revoked, so a caller can gate on the exit code.
+
   5dive council bench ls
   5dive council bench show <name>
   5dive council bench add  <name> --seats=a:lens|b:lens [--mode=] [--threshold=] [--desc=]
@@ -781,8 +795,8 @@ cmd_council() {
   local sub="${1:-}"; [[ $# -gt 0 ]] && shift || true
   case "$sub" in
     ""|-h|--help|help) _council_help; return 0 ;;
-    convene|bench|init|lineage|veto|gate-clear|rot-triage|roster|log|verify|promote|demote|expel) ;;
-    *) fail "$E_USAGE" "unknown council command: $sub (convene|bench|init|lineage|roster|log|verify|promote|demote|expel|veto|gate-clear|rot-triage)" ;;
+    convene|bench|init|lineage|veto|gate-clear|rot-triage|roster|log|verify|promote|demote|expel|sign-vote|verify-votes) ;;
+    *) fail "$E_USAGE" "unknown council command: $sub (convene|bench|init|lineage|roster|log|verify|promote|demote|expel|veto|gate-clear|rot-triage|sign-vote|verify-votes)" ;;
   esac
 
   local dir; dir="$(mktemp -d -t 5dive-council.XXXXXX)" || fail "$E_GENERIC" "mktemp failed"
@@ -818,6 +832,18 @@ cmd_council() {
   if [[ "$sub" == "verify" ]]; then _council_verify "$dir" "$@"; return $?; fi
   if [[ "$sub" == "promote" || "$sub" == "demote" || "$sub" == "expel" ]]; then
     _council_motion "$dir" "$sub" "$@"; return $?
+  fi
+
+  # CNCL-10: co-signed votes — the per-seat sign-at-source (`sign-vote`) + the verifier
+  # (`verify-votes`) are pure engine verbs a SEAT invokes from its OWN harness during a
+  # dispatched convene (the shell IS the product surface here — a seat has no node runtime
+  # of its own). No sudo, no root seal, no lineage write: pass straight through to cli.mjs
+  # (like gate-map) and preserve its stdout contract (the `COUNCIL-SIG:` line / JSON row)
+  # AND its exit code (verify-votes exits non-zero on a forged/replayed/revoked vote so the
+  # seat harness can gate on it). Both take their roster/key inline (--roster / --key-file),
+  # so no --registry: pass the seat's args straight through, verbatim.
+  if [[ "$sub" == "sign-vote" || "$sub" == "verify-votes" ]]; then
+    node "$dir/cli.mjs" "$sub" "$@"; return $?
   fi
 
   if [[ "$sub" == "bench" ]]; then

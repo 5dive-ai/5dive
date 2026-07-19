@@ -17,7 +17,9 @@ set -euo pipefail
 
 cd "$(dirname "$0")"
 
-OUT="5dive"
+# Output path is overridable (BUILD_OUT) so tests can build a throwaway binary to a
+# temp dir without dirtying the tracked ./5dive artifact. Defaults to the repo ./5dive.
+OUT="${BUILD_OUT:-5dive}"
 
 cat \
   src/header.sh \

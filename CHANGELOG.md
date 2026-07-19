@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.11.17 — The Council: route `sign-vote`/`verify-votes` through the bash dispatcher (CNCL-10 shell-reachability gap) (CNCL-26) (2026-07-19)
+
+- fix(council): `5dive council sign-vote` / `5dive council verify-votes` now reach the mjs verbs through `cmd_council()`'s allowlist — they were fully tested + routed in `cli.mjs` but UNREACHABLE from the shell (the bash dispatcher never routed them, so `5dive council sign-vote` died E_USAGE). Since a SEAT signs at source from its OWN harness — the shell IS the product surface — the CNCL-10 co-signed-vote flow was dead on the surface it ships on. The passthrough preserves the `COUNCIL-SIG:` line / JSON-row stdout contract and the non-zero exit code (a seat harness gates on it) verbatim; no sudo/seal/lineage write (these verbs are pure). Also added to `council --help`.
+- test: `council_bashroute_e2e.sh` (7 assertions) drives the BUILT `5dive council sign-vote|verify-votes` end-to-end (reachability + `COUNCIL-SIG:` contract + honest/forged/replay exit codes), closing the blind spot that let 5/5 CI stay green over this gap — every prior CNCL-10 test drove `node cli.mjs` directly. It builds a throwaway binary via `BUILD_OUT` so it GATES in CI (no root/seal needed). Wired into `council_unit.sh`.
+- build: `build.sh` honours `BUILD_OUT` for a throwaway target path so tests can build without dirtying the tracked `./5dive`.
+
 ## 0.11.16 — The Council: governance surface — roster/log/verify + promote/demote motions with recusal, constitutional auto-class, hash-chained lineage (CNCL-11) (2026-07-19)
 
 - `5dive council roster` — live seats + pass threshold/quorum + founder-veto holder + sealed lineage head.
