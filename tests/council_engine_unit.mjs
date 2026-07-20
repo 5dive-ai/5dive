@@ -18,6 +18,7 @@ import {
   buildGenesisRecord, canonicalGenesis, normalizeConstitution, parseConstitutionFrontmatter,
   precedentTokens, selectPrecedents, precedentCitations, precedentCitationBrief, seatPrompt,
   subjectFromText, parseCanonicalVotes, scoreSeatVote, seatTrackRecord, seatTrackRecordBrief,
+  seatIsHuman, resolveSeatChat, humanSeatFields,
 } from '../src/council/engine.mjs'
 
 let pass = 0, fail = 0
@@ -419,6 +420,39 @@ ok(seatB.scored === 2 && seatB.correct === 1 && seatB.dissents === 2 && seatB.vi
 ok(tr.seats[0].calibration >= tr.seats[tr.seats.length - 1].calibration, 'CNCL-17: seats sort by calibration desc')
 ok(seatTrackRecordBrief('b', tr).includes('vindicated') && seatTrackRecordBrief('zzz', tr) === 'zzz: no scored record yet', 'CNCL-17: brief summarizes a seat (and a no-record seat)')
 ok(seatTrackRecord([], {}).seats.length === 0 && seatTrackRecord(null, null).scoredReceipts === 0, 'CNCL-17: empty/null inputs are safe')
+
+// ---- DIVE-1563: human-as-seat roster schema (prereq for DIVE-1548) ----
+// seatIsHuman: marker-gated, defaults false for every existing seat shape (back-compat).
+ok(seatIsHuman({ id: 'lodar', kind: 'human' }) === true, 'human: {kind:human} seat IS human')
+ok(seatIsHuman({ id: 'lodar', human: true }) === true, 'human: {human:true} seat IS human')
+ok(seatIsHuman({ id: 'eng-lead', lens: 'x' }) === false, 'human: plain {id,lens} seat is NOT human')
+ok(seatIsHuman({ id: 'brand', agent: 'marketing' }) === false, 'human: {id,agent} seat is NOT human')
+ok(seatIsHuman('eng-lead') === false, 'human: bare-string seat is NOT human')
+ok(seatIsHuman(null) === false && seatIsHuman(undefined) === false, 'human: null/undefined seat is NOT human')
+// resolveSeatChat: explicit chat wins; principal is a fallback; '' for non-human / unbound.
+ok(resolveSeatChat({ kind: 'human', chat: '12345' }) === '12345', 'human: explicit chat resolves')
+ok(resolveSeatChat({ kind: 'human', principal: 'human:main' }) === 'human:main', 'human: principal binding resolves when no chat')
+ok(resolveSeatChat({ kind: 'human', chat: ' 99 ', principal: 'human:main' }) === '99', 'human: chat wins over principal, trimmed')
+ok(resolveSeatChat({ kind: 'human' }) === '', 'human: unbound human seat resolves to "" (dispatch fails closed)')
+ok(resolveSeatChat({ id: 'eng-lead', lens: 'x' }) === '', 'human: non-human seat has no chat')
+// resolveSeatAgent: a human seat is never dispatched as a registry agent; agent seats unchanged.
+ok(resolveSeatAgent({ id: 'lodar', kind: 'human', chat: '1' }) === '', 'human: human seat resolves to NO agent')
+ok(resolveSeatAgent({ id: 'brand', agent: 'marketing' }) === 'marketing', 'human: agent seat still resolves its agent (regression)')
+ok(resolveSeatAgent('theo') === 'marketing', 'human: alias seat still resolves (regression)')
+// humanSeatFields: no-op for agent seats (byte-identical rosters); carries {kind,chat} for human seats.
+ok(JSON.stringify(humanSeatFields({ id: 'eng-lead', lens: 'x' })) === '{}', 'human: agent seat contributes NO extra record fields')
+ok(JSON.stringify(humanSeatFields({ id: 'lodar', kind: 'human', chat: '77' })) === JSON.stringify({ kind: 'human', chat: '77' }), 'human: human seat carries kind+chat into the record')
+// Round-trip through addSeat + a sealed genesis record: the marker survives; agent seats unchanged.
+const withHuman = addSeat([{ id: 'eng-lead', lens: 'x' }], { id: 'lodar', kind: 'human', chat: '77' })
+ok(seatIsHuman(withHuman[1]) === true && withHuman[1].chat === '77', 'human: addSeat preserves the human marker + chat')
+ok(seatIsHuman(withHuman[0]) === false, 'human: addSeat leaves the agent seat non-human')
+const gRecH = buildGenesisRecord({ seats: withHuman, chair: 'eng-lead', threshold: { rule: 'majority' }, veto: { principal: 'human:main', resolved: '1' }, prevDigest: '', stampedAt: 'T', seq: 0 })
+ok(seatIsHuman(gRecH.seats.find(s => s.id === 'lodar')) === true, 'human: sealed genesis record preserves the human seat marker')
+ok(seatIsHuman(genesisToBench(gRecH).seats.find(s => s.id === 'lodar')) === true, 'human: genesisToBench carries the human marker into the bench roster')
+// Seal invariant: canonicalGenesis reads only id/chair/lens, so the human marker does NOT alter sealed bytes.
+const gAgentOnly = buildGenesisRecord({ seats: [{ id: 'eng-lead', lens: 'x' }, { id: 'lodar', lens: 'lodar — council seat.' }], chair: 'eng-lead', threshold: { rule: 'majority' }, veto: { principal: 'human:main', resolved: '1' }, prevDigest: '', stampedAt: 'T', seq: 0 })
+const gHumanMarked = buildGenesisRecord({ seats: [{ id: 'eng-lead', lens: 'x' }, { id: 'lodar', lens: 'lodar — council seat.', kind: 'human', chat: '77' }], chair: 'eng-lead', threshold: { rule: 'majority' }, veto: { principal: 'human:main', resolved: '1' }, prevDigest: '', stampedAt: 'T', seq: 0 })
+ok(canonicalGenesis(gAgentOnly) === canonicalGenesis(gHumanMarked), 'human: marker is seal-invisible (identical canonical bytes -> no digest drift)')
 
 console.log(`\nCNCL-6/11/15/17/19 engine: ${pass} passed, ${fail} failed (bound to src/council/engine.mjs)`)
 process.exit(fail ? 1 : 0)
