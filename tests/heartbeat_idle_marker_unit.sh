@@ -66,6 +66,32 @@ assert_not_idle codex       "$CODEX_BUSY"    "codex mid-turn does NOT read idle"
 assert_not_idle antigravity "$AGY_MIDTURN"   "agy mid-turn (esc to cancel) does NOT read idle"
 assert_not_idle claude      "$CLAUDE_DIALOG" "claude dialog (no ❯) does NOT read idle"
 
+# --- DIVE-1528: send-path readiness must be a SUPERSET of the idle markers ------
+# The send injector uses wait_agent_input_ready -> _agent_pane_input_ready (same
+# file). It fell behind _hb_idle_marker: codex "›" was an idle marker but NOT a
+# readiness marker, so every send to an idle codex agent timed out 45s and warned
+# "input prompt not detected — best-effort (may be lost)". These assert the two
+# stay in lockstep: every runtime whose IDLE sample reads idle must ALSO read
+# input-ready, or the send path silently regresses for that TUI.
+assert_ready() { if _agent_pane_input_ready "$2"; then ok_t "$3"; else bad_t "$3 (send path would time out)"; fi; }
+assert_ready codex       "$CODEX_IDLE"  "codex idle pane reads INPUT-READY (DIVE-1528 regression)"
+assert_ready antigravity "$AGY_IDLE"    "agy idle pane reads input-ready"
+assert_ready claude      "$CLAUDE_IDLE" "claude idle pane reads input-ready"
+# lockstep: any non-empty idle marker must be inside the readiness set.
+for _t in claude codex antigravity; do
+  _m=$(_hb_idle_marker "$_t")
+  if [[ -z "$_m" ]] || _agent_pane_input_ready "$_m"; then ok_t "readiness ⊇ idle marker for $_t"
+  else bad_t "readiness ⊇ idle marker for $_t" "'$_m' is an idle marker but NOT a readiness marker (drift)"; fi
+done
+# A bare boot/blank pane (no marker at all) must NOT read ready — that's the boot
+# race the probe exists to catch (send-keys before the box renders is lost). A
+# still-generating codex ("esc to interrupt", NOT the agy "esc to cancel") also
+# doesn't read ready, so the send waits for the composer instead of racing the
+# paste into a mid-turn buffer — the reported repro was an IDLE codex, which the
+# "›" fix now detects immediately.
+if _agent_pane_input_ready $'booting…\n\n'; then bad_t "blank/booting pane must NOT read ready (would drop the send)"; else ok_t "blank/booting pane does NOT read input-ready"; fi
+if _agent_pane_input_ready "$CODEX_BUSY"; then bad_t "codex mid-gen (esc to interrupt) should not read ready (avoid racing the composer)"; else ok_t "codex mid-gen does NOT read input-ready (waits for the composer)"; fi
+
 echo "-----"
 printf 'idle-marker: %d passed, %d failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]

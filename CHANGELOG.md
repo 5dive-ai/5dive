@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.11.26 — Reliable inter-agent sends to codex agents: detect the codex composer marker (DIVE-1528) (2026-07-20)
+
+- fix(agent): `agent send`/`ask`/`_deliver` to a codex agent (e.g. andy) no longer times out 45s and prints the false "input prompt not detected — best-effort (may be lost)" warning. The send-path readiness probe (`wait_agent_input_ready`) only matched claude's `❯` and antigravity's footer; codex's composer marker `›` (U+203A) was in `_hb_idle_marker` (DIVE-1211) — whose own comment says it "Mirrors wait_agent_input_ready" — but had never been added to the send path, so every send to an idle codex agent fell through to the lossy best-effort branch. Added `›`, so codex is detected immediately and `inject_and_submit` confirms delivery like any other TUI.
+- refactor(agent): the readiness marker set now lives in one pure, tmux-free predicate (`_agent_pane_input_ready`) so it can be unit-tested and a future TUI's marker is added in exactly one place.
+- test(agent): `heartbeat_idle_marker_unit.sh` now asserts the send-path readiness set is a SUPERSET of the `_hb_idle_marker` idle table (every idle marker must also read input-ready), so the codex-style drift that caused this bug can never regress silently. A blank/booting pane and a mid-generation codex pane correctly read NOT-ready.
+- Note: the reported secondary symptom — a headless codex worker (`channels=none`) having no return channel except manually running `agent send` — is tracked separately; this change closes the reliability/false-loss half.
+
 ## 0.11.24 — Council case law: convene pre-loads relevant past receipts, verdicts cite the precedents they follow or depart from (CNCL-19) (2026-07-20)
 
 - feat(council): at `council convene`, the bash layer projects the SEALED convene receipt log into a precedent pool and hands it to the engine, which deterministically selects the top-k prior decisions relevant to the question (keyword overlap over question+brief; ties break toward the more recent), injects them into every seat ballot as fenced PRECEDENT (case law — HISTORY, clearly separated so the blind first round stays blind to CURRENT-round takes, never another seat's live vote), and requires the verdict to CITE which precedents it followed vs departed from.
