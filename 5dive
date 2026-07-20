@@ -26,7 +26,7 @@ esac
 
 # Bumped on every public release. `build.sh` checks this line exists; CI fails
 # the bundle-drift check if it's missing or empty.
-readonly FIVE_VERSION="0.11.21"
+readonly FIVE_VERSION="0.11.22"
 
 # GitHub org our repos live under. The org is being renamed
 # 5dive-com -> 5dive-ai (2026-06); fetches must work on either side of the
@@ -22164,6 +22164,29 @@ _council_hard_gate_rx() {
   _council_constitution_json | jq -r '.hardGateRegex'
 }
 
+# CNCL-15 — constitution integrity. The AUTHORITY is the digest sealed in the newest genesis/
+# amendment lineage record, NOT the on-disk 5dive.md (the file is forgeable, the chain is not).
+# Genesis/amend seal it with `sha256sum`; verify + convene recompute the on-disk digest the SAME
+# way so the two agree. Newest record carrying a non-empty constitutionDigest wins (amend > genesis).
+_council_sealed_constitution_digest() {
+  [[ -f "$COUNCIL_LINEAGE" ]] || return 0
+  jq -r 'select((.record.constitutionDigest // "") != "") | .record.constitutionDigest' "$COUNCIL_LINEAGE" 2>/dev/null | tail -n1
+}
+# sha256 of the on-disk 5dive.md ('' if missing) — the live side of the drift comparison.
+_council_live_constitution_digest() {
+  local p; p="$(_council_constitution_path)"
+  [[ -f "$p" ]] || return 0
+  sha256sum < "$p" 2>/dev/null | awk '{print $1}'
+}
+# Emit the drift JSON and RETURN non-zero (exit 7 from cli) when the live 5dive.md is out of sync
+# with the sealed digest. Fails closed: a sealed digest with a missing/edited file is drift.
+_council_constitution_drift() {
+  local dir="$1" sealed live
+  sealed="$(_council_sealed_constitution_digest)"
+  live="$(_council_live_constitution_digest)"
+  node "$dir/cli.mjs" drift-check --sealed="$sealed" --live="$live"
+}
+
 _council_help() {
   cat >&2 <<'COUNCIL_HELP'
 5dive council — standalone deliberation council (v0.11)
@@ -22187,10 +22210,18 @@ _council_help() {
       The past sealed verdicts — genesis + every promote/demote motion + any founder veto —
       in lineage order (the append-only governance record).
 
+  5dive council amend --file=<new 5dive.md> [--dry-run]
+      Amend the constitution via a constitutional-class motion (2/3 + full quorum + founder
+      veto). Validates the proposed file, convenes the amendment, and ONLY on a pass seals its
+      digest into the hash-chain then swaps the on-disk 5dive.md. A non-pass leaves it untouched.
+      The sealed digest — not the file — is the authority; hand-edits are caught by verify.
+
   5dive council verify [<receipt-digest>]
-      Verify the WHOLE governance lineage: the prevDigest hash-chain AND a per-record ROOT
-      re-seal (each canonical must re-seal to its stored digest). Fails closed on an edited,
-      dropped, or reordered record. With a receipt digest, also re-seals that sealed receipt.
+      Verify the WHOLE governance lineage: the prevDigest hash-chain, a per-record ROOT re-seal
+      (each canonical must re-seal to its stored digest), AND constitution integrity (the live
+      5dive.md must match the digest sealed in the newest genesis/amendment record). Fails closed
+      on an edited/dropped/reordered record OR a drifted constitution. With a receipt digest,
+      also re-seals that sealed receipt.
 
   sudo 5dive council {promote|demote|expel} --subject=<seat> [--lens="…"] [--mode=…] [--dry-run]
       Run a membership MOTION as a convened Council vote (sudo-gated — it mutates the root-owned
@@ -22505,6 +22536,63 @@ export const DEFAULT_HARD_GATE_CLASSES = {
   destructive: 'delete|destroy|teardown|wipe|purge|drop[^.]{0,20}table|truncate|irreversible|revoke|dns|domain transfer',
 }
 export const DEFAULT_HARD_GATE_RX = Object.values(DEFAULT_HARD_GATE_CLASSES).join('|')
+
+// CNCL-15 — the digest embedded in a sealed genesis/amendment record is a plain content hash of
+// the 5dive.md bytes. Its integrity comes from riding INSIDE the root-sealed, hash-chained record
+// (the file is forgeable, the chain is not). bash computes the on-disk digest with `sha256sum` for
+// genesis/amend/verify so every realm agrees; this JS mirror is for the unit tests + cli fallback.
+export function digestConstitution(text) {
+  return createHash('sha256').update(String(text == null ? '' : text), 'utf8').digest('hex')
+}
+
+// CNCL-15 — constitution-drift check (pure). `sealedDigest` = the digest sealed in the newest
+// genesis/amendment record ('' if the lineage predates constitution-as-data); `liveDigest` = the
+// hash of the on-disk 5dive.md ('' if the file is missing). FAILS CLOSED: a sealed digest with a
+// missing or mismatched live file is drift — a drifted constitution is NOT enforced, convene
+// escalates, and verify fails. Same digest realm on both sides (bash sha256sum, or this JS mirror).
+export function constitutionDriftCheck({ sealedDigest, liveDigest }) {
+  const sealed = String(sealedDigest || '')
+  const live = String(liveDigest || '')
+  if (!sealed) return { drifted: false, reason: 'no sealed constitution digest (pre-constitution-as-data lineage)' }
+  if (!live) return { drifted: true, reason: 'a constitution digest is sealed in the chain but 5dive.md is missing (fail-closed)' }
+  if (sealed !== live) return { drifted: true, reason: `5dive.md digest ${live.slice(0, 12)}… does not match the sealed ${sealed.slice(0, 12)}… — an unsanctioned edit (amend via a constitutional-class council motion, do not hand-edit)` }
+  return { drifted: false, reason: 'the live 5dive.md matches the sealed constitution digest' }
+}
+
+// CNCL-15 — the v0 constitution `council init` seeds. It is the HUMAN-READABLE projection of the
+// built-in DEFAULT_CONSTITUTION: round-trips back through parse+normalize to the exact defaults, so
+// its sealed digest is a meaningful baseline. Single-quoted regex values survive the frontmatter
+// parser byte-for-byte (no backslash processing). Amend it ONLY via `5dive council amend`.
+export function renderConstitutionV0() {
+  const c = DEFAULT_CONSTITUTION
+  const gates = Object.entries(c.hardGates)
+    .map(([k, v]) => `  ${k}: '${String(v).replace(/'/g, "''")}'`).join('\n')
+  return `---
+# 5dive company constitution (v0) — governance-as-DATA, not hardcode.
+# This file is the human-readable PROJECTION of the council's governance policy.
+# On its own it is forgeable (anyone with fs write); the AUTHORITY is the sealed
+# amendment hash-chain: council verify checks this file's digest against the newest
+# sealed amendment receipt and FAILS CLOSED on drift (a drifted constitution is not
+# enforced; convene escalates). Edit ONLY via a constitutional-class council motion:
+#   sudo 5dive council amend --file=<new 5dive.md>   (2/3 + full quorum + founder veto)
+council:
+  bench: ${c.council.bench}
+quorum: ${c.quorum}
+veto:
+  hold_secs: ${c.veto.holdSecs}
+  posthoc_secs: ${c.veto.posthocSecs}
+hard_gates:
+${gates}
+---
+
+# 5dive Constitution
+
+Governance policy for this organization. Vote thresholds, quorum, the founder-veto
+window, and the hard-gate classes above are DATA — another org forks this file and
+rewrites them for itself. The sealed receipt chain, not this file, is the authority.
+`
+}
+
 export const DEFAULT_CONSTITUTION = {
   council: { bench: 'council' },
   quorum: 'majority',
@@ -22789,7 +22877,8 @@ export function classifyMotion(motion = {}) {
   const raw = motion.params || motion.changes || (motion.param != null ? [motion.param] : [])
   const touched = Array.isArray(raw) ? raw : Object.keys(raw || {})
   if (touched.some(p => CONSTITUTIONAL_PARAMS.includes(String(p).toLowerCase()))) return 'constitutional'
-  if (kind === 'constitutional') return 'constitutional'
+  // CNCL-15: an `amend` motion rewrites the whole constitution — the hardest bar (constitutional).
+  if (kind === 'amend' || kind === 'constitutional') return 'constitutional'
   return 'ordinary'
 }
 
@@ -22804,12 +22893,17 @@ export function recusalFor(motion = {}) {
 // is written as a lineage record HASH-CHAINED onto the prior lineage head (genesis or the last
 // motion) via prevDigest — so the roster's entire history is an append-only, tamper-evident chain
 // rooted at genesis. Mirrors buildGenesisRecord's discipline; bash root-seals canonicalMotion().
-export function buildMotionRecord({ motion, verdict, seats, threshold, veto, prevDigest, stampedAt, seq, receiptDigest }) {
+export function buildMotionRecord({ motion, verdict, seats, threshold, veto, prevDigest, stampedAt, seq, receiptDigest, constitutionDigest }) {
   const cls = classifyMotion(motion)
   if (!['promote', 'demote', 'expel', 'constitutional'].includes(cls)) {
     throw new Error(`buildMotionRecord: '${cls}' is not a governance motion (promote|demote|expel|constitutional)`)
   }
   if (!Array.isArray(seats) || !seats.length) throw new Error('motion record needs the resulting seats')
+  // CNCL-15: a constitutional AMEND motion must carry the digest of the constitution it ratifies —
+  // that sealed digest is what `council verify` checks the live 5dive.md against. Fail closed.
+  if (cls === 'constitutional' && (motion.kind === 'amend' || motion.type === 'amend') && !constitutionDigest) {
+    throw new Error('an amend motion must carry the new constitution digest to seal into the chain (fail-closed)')
+  }
   return {
     kind: 'motion',
     version: 1,
@@ -22821,6 +22915,8 @@ export function buildMotionRecord({ motion, verdict, seats, threshold, veto, pre
       param: motion.param != null ? String(motion.param) : null,
       to: motion.to != null ? String(motion.to) : null,
     },
+    // CNCL-15: '' on a membership motion; the ratified constitution digest on an amend.
+    constitutionDigest: constitutionDigest ? String(constitutionDigest) : '',
     outcome: (verdict && verdict.recommendation) || null,
     tally: (verdict && verdict.tally) || null,
     recused: (verdict && verdict.recused) || recusalFor(motion),
@@ -22851,6 +22947,8 @@ export function canonicalMotion(rec) {
   L.push(`stampedAt: ${norm(rec.stampedAt)}`)
   L.push(`prevDigest: ${norm(rec.prevDigest)}`)
   L.push(`receiptDigest: ${norm(rec.receiptDigest)}`)
+  // CNCL-15: conditional (back-compat) — only an amend record carries + seals a constitution digest.
+  if (rec.constitutionDigest) L.push(`constitution: ${norm(rec.constitutionDigest)}`)
   const seats = (rec.seats || []).slice().sort((a, b) => (norm(a.id) < norm(b.id) ? -1 : 1))
   for (const s of seats) L.push(`seat ${norm(s.id)}${s.chair ? ' (chair)' : ''}: ${norm(s.lens)}`)
   const th = rec.threshold || {}
@@ -23155,7 +23253,7 @@ export function parseGenesisSeats(spec) {
 // an unresolved principal (the record must carry a real, resolvable veto holder). prevDigest
 // hash-chains this record to the prior lineage head (empty for the very first seed). No in-engine
 // clock — caller supplies stampedAt (byte-reproducible canonical form).
-export function buildGenesisRecord({ seats, chair, threshold, veto, prevDigest, stampedAt, forced, seq }) {
+export function buildGenesisRecord({ seats, chair, threshold, veto, prevDigest, stampedAt, forced, seq, constitutionDigest }) {
   if (!Array.isArray(seats) || !seats.length) throw new Error('genesis needs seats')
   if (!veto || !veto.principal) throw new Error('genesis needs a veto principal')
   if (!veto.resolved) throw new Error(`veto principal "${veto.principal}" did not resolve to a real recipient (fail-closed)`)
@@ -23168,6 +23266,9 @@ export function buildGenesisRecord({ seats, chair, threshold, veto, prevDigest, 
     chair: chair || null,
     threshold: threshold || { rule: 'majority' },
     veto: { principal: veto.principal, resolved: String(veto.resolved) },
+    // CNCL-15: the v0 constitution digest, sealed into genesis so `council verify` can detect a
+    // later hand-edit of 5dive.md as drift. '' on a pre-constitution-as-data seed (back-compat).
+    constitutionDigest: constitutionDigest ? String(constitutionDigest) : '',
     forced: !!forced,
     prevDigest: prevDigest || '',
     stampedAt: stampedAt || '',
@@ -23190,6 +23291,9 @@ export function canonicalGenesis(rec) {
   const th = rec.threshold || {}
   L.push(`threshold: rule=${norm(th.rule)} value=${th.value != null ? Number(th.value) : ''} flat=${th.threshold != null ? Number(th.threshold) : ''}`)
   L.push(`veto: ${norm(rec.veto && rec.veto.principal)} -> ${norm(rec.veto && rec.veto.resolved)}`)
+  // CNCL-15: seal the constitution digest INTO the genesis bytes. Conditional so a pre-CNCL-15
+  // record (no digest) canonicalizes exactly as before and its stored seal still re-verifies.
+  if (rec.constitutionDigest) L.push(`constitution: ${norm(rec.constitutionDigest)}`)
   return L.join('\n')
 }
 
@@ -23986,6 +24090,22 @@ async function cmdConvene() {
     if (!seats.length) seats = E.DEFAULT_COUNCIL.seats
     mode = flag('mode', 'deliberate')
   }
+  // CNCL-15: a PRIMARY-council convene under a DRIFTED constitution does NOT deliberate. A live
+  // 5dive.md that no longer matches the sealed digest is forged governance; we refuse to enforce
+  // it and escalate to a human (verify fails closed on the same state). bash sets the flag after
+  // comparing the sealed digest against the on-disk file. Ad-hoc panels are unaffected.
+  if (flagBool('constitution-drift') && primaryCouncil) {
+    const brief = 'Constitution drift: the live 5dive.md no longer matches the sealed constitution digest — forged governance is not enforced. This convene is escalated to a human. Restore the sealed 5dive.md, or change policy the sanctioned way: sudo 5dive council amend --file=<new 5dive.md>.'
+    out({
+      council: effBench || 'council', mode, question, seats: seats.map(s => s.id),
+      dispatch: 'drift-escalated',
+      verdict: { recommendation: 'escalate', tally: { approve: 0, reject: 0, escalate: 0 }, confidence: 0, dissent: '', escalated: true, brief },
+      disposition: 'escalate', votes: [],
+      constitution: { source: constitution.source, valid: constitution.valid, path: constitution.path, drift: true },
+      driftEscalated: true,
+    })
+    return
+  }
   const input = {
     role: 'convene', question, seats, mode,
     councilName: effBench || 'ad-hoc',
@@ -24127,6 +24247,9 @@ function cmdInit() {
       veto: { principal: String(principal), resolved: String(resolved) },
       prevDigest: flag('prev-digest') || '', stampedAt: flag('stamped-at') || '',
       forced, seq: Number(flag('seq')) || 0,
+      // CNCL-15: bash sha256sum's the seeded v0 5dive.md and passes it here so the digest is
+      // sealed into the genesis bytes (drift baseline). '' if the caller seeded no constitution.
+      constitutionDigest: flag('constitution-digest') === true ? '' : (flag('constitution-digest') || ''),
     })
   } catch (e) { die(String(e && e.message || e)) }
   // Seed / re-seat the primary council bench in the persisted registry (bench edits on it are
@@ -24134,7 +24257,67 @@ function cmdInit() {
   const reg = loadRegistry(registryPath)
   reg.council = E.genesisToBench(rec)
   saveRegistry(registryPath, reg)
-  out({ genesis: rec, canonical: E.canonicalGenesis(rec), bench: 'council', seats: rec.seats.map(s => s.id), chair: rec.chair })
+  out({ genesis: rec, canonical: E.canonicalGenesis(rec), bench: 'council', seats: rec.seats.map(s => s.id), chair: rec.chair, constitutionDigest: rec.constitutionDigest })
+}
+
+// ---- CNCL-15: constitution v0 render + drift check + amend motion --------------------------
+// `constitution-render` prints the v0 5dive.md `council init` seeds when none exists (the
+// human-readable projection of the built-in defaults). bash writes it, then sha256sum's the
+// on-disk bytes for the sealed digest — one digest realm across seed/amend/verify.
+function cmdConstitutionRender() { process.stdout.write(E.renderConstitutionV0()) }
+
+// `drift-check` — pure comparison of the sealed digest vs the live-file digest (both computed by
+// bash with sha256sum). Exits non-zero when drifted so callers can fail closed on the exit code.
+function cmdDriftCheck() {
+  const sealed = flag('sealed') === true || flag('sealed') == null ? '' : String(flag('sealed'))
+  const live = flag('live') === true || flag('live') == null ? '' : String(flag('live'))
+  const res = E.constitutionDriftCheck({ sealedDigest: sealed, liveDigest: live })
+  out(res)
+  process.exit(res.drifted ? 7 : 0)
+}
+
+// `amend-plan` — validate the PROPOSED constitution (must parse+normalize), then emit the
+// constitutional-class deliberation question over the full current roster (no recusal, full
+// quorum + 2/3 + founder veto follow from the constitutional class). Fails closed on a bad file.
+function cmdAmendPlan() {
+  const roster = readJsonFlag('seats-json')
+  if (!Array.isArray(roster) || !roster.length) die('amend-plan needs the current roster --seats-json (fail-closed)', 3)
+  const proposed = flag('constitution')
+  if (!proposed || proposed === true) die('amend-plan needs --constitution=@<file> (the proposed 5dive.md)')
+  const text = String(proposed).startsWith('@') ? fs.readFileSync(String(proposed).slice(1), 'utf-8') : String(proposed)
+  try { E.normalizeConstitution(E.parseConstitutionFrontmatter(text)) }
+  catch (e) { die(`the proposed 5dive.md is not a valid constitution — refusing to convene an amendment on it: ${String(e && e.message || e)}`, 4) }
+  const digest = flag('constitution-digest') === true || flag('constitution-digest') == null ? '' : String(flag('constitution-digest'))
+  const question = `Constitution amendment motion (constitutional): should the Council RATIFY the proposed 5dive.md `
+    + `(digest ${digest ? digest.slice(0, 12) + '…' : '?'})? This is the hardest bar — a 2/3 supermajority of ALL `
+    + `${roster.length} seat(s) with full quorum, founder-veto-able. On a pass the new constitution is sealed into the `
+    + `hash-chain and becomes the enforced governance policy. Approve to ratify, reject to keep the current constitution, escalate only if it genuinely needs a human.`
+  out({ class: 'constitutional', recuse: [], subject: null, votingSeats: roster, votingSeatSpec: seatsToSpec(roster), question, constitutionDigest: digest })
+}
+
+// `amend-apply` — on a PASS only: build the hash-chained constitutional motion record carrying the
+// ratified constitution digest + its canonical bytes for bash to root-seal. Roster is unchanged
+// (an amend rewrites policy, not membership). Refuses a non-pass verdict (fail-closed).
+function cmdAmendApply() {
+  const roster = readJsonFlag('seats-json')
+  if (!Array.isArray(roster) || !roster.length) die('amend-apply needs the current roster --seats-json (fail-closed)', 3)
+  const verdict = readJsonFlag('verdict')
+  if (!verdict || verdict.recommendation !== 'approve' || verdict.escalated) {
+    die(`amendment did not carry (recommendation=${verdict && verdict.recommendation}) — the constitution is unchanged, no lineage record written`, 5)
+  }
+  const digest = flag('constitution-digest') === true || flag('constitution-digest') == null ? '' : String(flag('constitution-digest'))
+  if (!digest) die('amend-apply needs --constitution-digest=<sha256 of the ratified 5dive.md> (fail-closed)', 4)
+  const threshold = readJsonFlag('threshold-json', { optional: true }) || { rule: 'majority' }
+  const veto = readJsonFlag('veto-json', { optional: true })
+  let rec
+  try {
+    rec = E.buildMotionRecord({ motion: { kind: 'amend' }, verdict, seats: roster, threshold, veto,
+      prevDigest: flag('prev-digest') === true ? '' : (flag('prev-digest') || ''),
+      stampedAt: flag('stamped-at') === true ? '' : (flag('stamped-at') || ''),
+      seq: Number(flag('seq')) || 0, receiptDigest: flag('receipt-digest') === true ? '' : (flag('receipt-digest') || ''),
+      constitutionDigest: digest })
+  } catch (e) { die(String(e && e.message || e)) }
+  out({ record: rec, canonical: E.canonicalMotion(rec), class: 'constitutional', constitutionDigest: digest })
 }
 
 // ---- CNCL-9: council veto exercise (authenticated tap → chained veto record) ----------------
@@ -24382,6 +24565,10 @@ function cmdVerifyChain() {
 
 const main = async () => {
   if (sub === 'constitution') return cmdConstitution()
+  if (sub === 'constitution-render') return cmdConstitutionRender()
+  if (sub === 'drift-check') return cmdDriftCheck()
+  if (sub === 'amend-plan') return cmdAmendPlan()
+  if (sub === 'amend-apply') return cmdAmendApply()
   if (sub === 'convene') return cmdConvene()
   if (sub === 'roster') return cmdRoster()
   if (sub === 'motion-plan') return cmdMotionPlan()
@@ -24684,10 +24871,29 @@ _council_init_or_lineage() {
   fi
   local stamped; stamped="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
+  # CNCL-15: seed the v0 constitution (5dive.md) if none exists, then seal its digest INTO the
+  # genesis record so a later hand-edit is detectable as drift. The file is the human-readable
+  # projection; the sealed digest is the authority. `sha256sum` is the shared digest realm with
+  # verify/convene. An operator-supplied 5dive.md already on disk is honored (its digest is sealed).
+  local cpath; cpath="$(_council_constitution_path)"
+  if [[ ! -f "$cpath" ]]; then
+    if ( umask 022; node "$dir/cli.mjs" constitution-render > "$cpath" ); then
+      echo "constitution: seeded v0 -> $cpath" >&2
+    else
+      rm -f "$cpath" 2>/dev/null || true
+      fail "$E_GENERIC" "could not seed the v0 constitution at $cpath — genesis NOT written"
+    fi
+  fi
+  # Validate the on-disk constitution parses before sealing its digest into genesis (fail-closed).
+  node "$dir/cli.mjs" constitution --path="$cpath" >/dev/null 2>&1 || fail "$E_VALIDATION" "the constitution at $cpath is not valid — refusing to seal a broken governance file into genesis (fail-closed)"
+  local constitution_digest; constitution_digest="$(sha256sum < "$cpath" 2>/dev/null | awk '{print $1}')"
+  [[ -n "$constitution_digest" ]] || fail "$E_GENERIC" "could not digest the constitution at $cpath"
+
   local raw
   raw="$(node "$dir/cli.mjs" init "${passthru[@]}" \
     --registry="$COUNCIL_REGISTRY" --veto-resolved="$resolved" \
     --genesis-exists="$genesis_exists" --prev-digest="$prev_digest" --seq="$seq" \
+    --constitution-digest="$constitution_digest" \
     --stamped-at="$stamped")" || return $?
 
   # Seal the canonical genesis bytes on the ROOT rail and hash-chain into the lineage. The
@@ -24714,6 +24920,7 @@ _council_init_or_lineage() {
     echo "seats:   $seats"
     echo "chair:   $chair"
     echo "veto:    $principal -> $resolved"
+    echo "const:   v0 sealed (${constitution_digest:0:16}…) -> $cpath"
     echo "genesis: sealed (${digest:0:16}…) + hash-chained into lineage"
   fi
   return 0
@@ -24952,20 +25159,29 @@ _council_verify() {
       [[ "$(printf '%s' "$rc" | _council_seal_stdin)" == "$target" ]] && rcpt_ok=1
     fi
   fi
+  # 4) CNCL-15 constitution DRIFT — the live 5dive.md must still match the digest sealed in the
+  # newest genesis/amendment record. A sealed digest with a missing or edited file = drift; verify
+  # FAILS CLOSED (a drifted governance file is not trusted). No sealed digest (pre-CNCL-15 lineage)
+  # = nothing to check. Reuses the same drift-check node verb + sha256sum realm as convene.
+  local drift_ok=1 drift_reason="no sealed constitution digest" drift_json
+  drift_json="$(_council_constitution_drift "$dir" 2>/dev/null)" || drift_ok=0
+  drift_reason="$(printf '%s' "$drift_json" | jq -r '.reason // "drift"' 2>/dev/null)"
   local all_ok=1
-  [[ "$chain_ok" -eq 0 && "$reseal_ok" -eq 1 ]] || all_ok=0
+  [[ "$chain_ok" -eq 0 && "$reseal_ok" -eq 1 && "$drift_ok" -eq 1 ]] || all_ok=0
   [[ -n "$target" && "$rcpt_ok" != "1" ]] && all_ok=0
   if (( JSON_MODE )); then
     jq -nc --argjson chain "$chain_res" --argjson chainOk "$([[ $chain_ok -eq 0 ]] && echo true || echo false)" \
       --argjson resealOk "$([[ $reseal_ok -eq 1 ]] && echo true || echo false)" --arg bad "$bad" \
+      --argjson driftOk "$([[ $drift_ok -eq 1 ]] && echo true || echo false)" --arg driftReason "$drift_reason" \
       --arg rcpt "$rcpt_ok" --argjson n "$n" --argjson allOk "$([[ $all_ok -eq 1 ]] && echo true || echo false)" \
-      '{ok:$allOk, data:{verified:$allOk, records:$n, chain:$chain, chainOk:$chainOk, resealOk:$resealOk, resealBad:$bad, receipt:$rcpt}}'
+      '{ok:$allOk, data:{verified:$allOk, records:$n, chain:$chain, chainOk:$chainOk, resealOk:$resealOk, resealBad:$bad, constitutionOk:$driftOk, constitution:$driftReason, receipt:$rcpt}}'
   else
-    if (( all_ok )); then echo "council verify: OK — $n record(s), chain intact + every record re-seals${target:+ (receipt ${target:0:16}… verified)}"
+    if (( all_ok )); then echo "council verify: OK — $n record(s), chain intact + every record re-seals + constitution matches its sealed digest${target:+ (receipt ${target:0:16}… verified)}"
     else
       echo "council verify: FAILED" >&2
       [[ "$chain_ok" -ne 0 ]] && echo "  chain: $(printf '%s' "$chain_res" | jq -r '.reason')" >&2
       [[ "$reseal_ok" -ne 1 ]] && echo "  re-seal: $bad" >&2
+      [[ "$drift_ok" -ne 1 ]] && echo "  constitution: $drift_reason" >&2
       [[ -n "$target" && "$rcpt_ok" != "1" ]] && echo "  receipt: $target not found or does not re-seal" >&2
     fi
   fi
@@ -25067,14 +25283,109 @@ _council_motion() {
   fi
 }
 
+# CNCL-15 — council amend: rewrite the constitution via a constitutional-class motion (2/3 + full
+# quorum + founder veto). Sudo-gated (writes the root-owned 5dive.md + lineage). Validates the
+# proposed file, convenes the amendment, and ONLY on a pass seals the new digest into the chain
+# (seal FIRST) then swaps the on-disk 5dive.md. A non-pass leaves the constitution untouched.
+_council_amend() {
+  local dir="$1"; shift
+  mkdir -p "$COUNCIL_DIR" 2>/dev/null || true
+  if [[ ! -w "$COUNCIL_DIR" ]]; then
+    fail "$E_PERMISSION" "council amend rewrites the constitution — it writes ${COUNCIL_DIR} + $(_council_constitution_path) (root-owned) and must be sudo-run: sudo 5dive council amend $*"
+  fi
+  [[ -f "$COUNCIL_GENESIS" && -f "$COUNCIL_LINEAGE" ]] || fail "$E_VALIDATION" "the Council has no genesis roster — seed it first: sudo 5dive council init …"
+  local file="" mode="deliberate" dry=0 a
+  for a in "$@"; do
+    case "$a" in
+      --file=*) file="${a#--file=}" ;;
+      --mode=*) mode="${a#--mode=}" ;;
+      --dry-run) dry=1 ;;
+    esac
+  done
+  [[ -n "$file" ]] || fail "$E_USAGE" "council amend needs --file=<path to the proposed 5dive.md>"
+  [[ -f "$file" ]] || fail "$E_NOT_FOUND" "no such file: $file"
+  # Validate the proposed constitution parses+normalizes BEFORE convening (fail-closed).
+  node "$dir/cli.mjs" constitution --path="$file" >/dev/null 2>&1 || fail "$E_VALIDATION" "the proposed $file is not a valid constitution — refusing to convene an amendment on it (fail-closed)"
+  local new_digest; new_digest="$(sha256sum < "$file" 2>/dev/null | awk '{print $1}')"
+  [[ -n "$new_digest" ]] || fail "$E_GENERIC" "could not digest the proposed constitution $file"
+
+  # Current roster + hash-chain head from the SEALED lineage tail.
+  local head head_seats prev_digest last_seq seq
+  head="$(tail -n1 "$COUNCIL_LINEAGE" 2>/dev/null)"
+  head_seats="$(printf '%s' "$head" | jq -c '.record.seats // []' 2>/dev/null)"
+  [[ -n "$head_seats" && "$head_seats" != "null" && "$head_seats" != "[]" ]] || fail "$E_GENERIC" "cannot read the current roster from the lineage head (fail-closed)"
+  prev_digest="$(printf '%s' "$head" | jq -r '.digest // ""')"
+  last_seq="$(printf '%s' "$head" | jq -r '.seq // -1')"; [[ "$last_seq" =~ ^[0-9]+$ ]] && seq=$((last_seq+1)) || seq=0
+
+  local plan question
+  plan="$(node "$dir/cli.mjs" amend-plan --seats-json="$head_seats" --constitution="@$file" --constitution-digest="$new_digest")" || return $?
+  question="$(printf '%s' "$plan" | jq -r '.question')"
+
+  if (( dry )); then
+    if (( JSON_MODE )); then printf '%s' "$plan" | jq '{ok:true,data:(. + {dryRun:true, newDigest:"'"$new_digest"'"})}'
+    else echo "would convene (constitutional amendment, digest ${new_digest:0:12}…): $question"; fi
+    return 0
+  fi
+
+  # CONVENE the primary council as a constitutional AMEND motion (2/3 + full quorum + veto offer).
+  local env verdict receipt_digest rec_out
+  env="$("$(_council_bin)" council convene "$question" --json --bench=council --mode="$mode" --motion-kind=amend)" || fail "$E_GENERIC" "amend convene failed"
+  verdict="$(printf '%s' "$env" | jq -c '.data.verdict')"
+  receipt_digest="$(printf '%s' "$env" | jq -r '.data.sealedDigest // empty')"
+  rec_out="$(printf '%s' "$verdict" | jq -r '.recommendation // "reject"')"
+  [[ -n "$verdict" && "$verdict" != "null" ]] || fail "$E_GENERIC" "amend convene returned no verdict"
+
+  if [[ "$rec_out" != "approve" ]]; then
+    if (( JSON_MODE )); then printf '%s' "$env" | jq '{ok:true,data:{motion:"constitutional",carried:false,outcome:(.data.verdict.recommendation),tally:(.data.verdict.tally),receipt:(.data.sealedDigest // null)}}'
+    else echo "council amend: NOT carried ($rec_out) — constitution unchanged"; fi
+    return 0
+  fi
+
+  # APPLY — seal FIRST (record carries the NEW digest), append the lineage, THEN swap the on-disk
+  # 5dive.md. Seal-first so a failed seal never changes the enforced constitution.
+  local stamped threshold_json veto_json apply canonical digest
+  stamped="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  threshold_json="$(jq -c '.threshold // {rule:"majority"}' "$COUNCIL_GENESIS" 2>/dev/null)"
+  veto_json="$(jq -c '.veto // null' "$COUNCIL_GENESIS" 2>/dev/null)"
+  apply="$(node "$dir/cli.mjs" amend-apply --seats-json="$head_seats" --verdict="$verdict" \
+    --threshold-json="$threshold_json" --veto-json="$veto_json" --constitution-digest="$new_digest" \
+    --prev-digest="$prev_digest" --seq="$seq" --stamped-at="$stamped" --receipt-digest="$receipt_digest")" || return $?
+  canonical="$(printf '%s' "$apply" | jq -r '.canonical')"
+  [[ -n "$canonical" ]] || fail "$E_GENERIC" "amend produced no canonical record"
+  digest="$(printf '%s' "$canonical" | _council_seal_stdin)" || digest=""
+  [[ -n "$digest" ]] || fail "$E_GENERIC" "could not seal the amendment record on the gate-proof rail (need root + an enforce key) — constitution NOT changed"
+
+  printf '%s' "$apply" | jq -c --arg d "$digest" --arg p "$prev_digest" --arg s "$stamped" \
+    '{seq: .record.seq, kind: "motion", stampedAt: $s, digest: $d, prevDigest: $p, canonical: .canonical, record: .record}' \
+    >> "$COUNCIL_LINEAGE"
+  # Swap the on-disk constitution ONLY now the digest is sealed into the chain. cp+re-digest guard:
+  # a copy that does not reproduce the sealed digest is refused (leaves the old file, verify green).
+  local cpath tmpc; cpath="$(_council_constitution_path)"; tmpc="$(mktemp)"
+  if cp "$file" "$tmpc" && [[ "$(sha256sum < "$tmpc" | awk '{print $1}')" == "$new_digest" ]]; then
+    ( umask 022; cat "$tmpc" > "$cpath" ) && rm -f "$tmpc"
+  else
+    rm -f "$tmpc"
+    warn "amendment sealed into the chain but the on-disk $cpath could not be updated — restore it from $file; verify will flag drift until then"
+  fi
+
+  if (( JSON_MODE )); then
+    printf '%s' "$apply" | jq --arg d "$digest" --arg r "$receipt_digest" --arg nd "$new_digest" '{ok:true,data:{motion:"constitutional",carried:true,constitutionDigest:$nd,sealedDigest:$d,receiptDigest:$r,seq:.record.seq}}'
+  else
+    echo "council amend: CARRIED — constitution ratified"
+    echo "const:    ${new_digest:0:16}… -> $cpath"
+    echo "motion:   sealed (${digest:0:16}…) + hash-chained into lineage (seq $seq)"
+    echo "receipt:  convene ${receipt_digest:0:16}…"
+  fi
+}
+
 cmd_council() {
   command -v node >/dev/null 2>&1 || fail "$E_GENERIC" "5dive council needs node on PATH"
   command -v jq   >/dev/null 2>&1 || fail "$E_GENERIC" "5dive council needs jq on PATH"
   local sub="${1:-}"; [[ $# -gt 0 ]] && shift || true
   case "$sub" in
     ""|-h|--help|help) _council_help; return 0 ;;
-    convene|bench|init|lineage|veto|gate-clear|rot-triage|roster|log|verify|promote|demote|expel|sign-vote|verify-votes) ;;
-    *) fail "$E_USAGE" "unknown council command: $sub (convene|bench|init|lineage|roster|log|verify|promote|demote|expel|veto|gate-clear|rot-triage|sign-vote|verify-votes)" ;;
+    convene|bench|init|lineage|veto|gate-clear|rot-triage|roster|log|verify|promote|demote|expel|amend|sign-vote|verify-votes) ;;
+    *) fail "$E_USAGE" "unknown council command: $sub (convene|bench|init|lineage|roster|log|verify|promote|demote|expel|amend|veto|gate-clear|rot-triage|sign-vote|verify-votes)" ;;
   esac
 
   local dir; dir="$(mktemp -d -t 5dive-council.XXXXXX)" || fail "$E_GENERIC" "mktemp failed"
@@ -25110,6 +25421,10 @@ cmd_council() {
   if [[ "$sub" == "verify" ]]; then _council_verify "$dir" "$@"; return $?; fi
   if [[ "$sub" == "promote" || "$sub" == "demote" || "$sub" == "expel" ]]; then
     _council_motion "$dir" "$sub" "$@"; return $?
+  fi
+
+  if [[ "$sub" == "amend" ]]; then
+    _council_amend "$dir" "$@"; return $?
   fi
 
   # CNCL-10: co-signed votes — the per-seat sign-at-source (`sign-vote`) + the verifier
@@ -25202,8 +25517,14 @@ cmd_council() {
     fi
   fi
 
+  # CNCL-15: a primary-council convene under a DRIFTED constitution must escalate, not enforce
+  # forged governance. Compare the sealed digest to the on-disk file; on drift pass the flag so
+  # node short-circuits to an escalate verdict (fail-closed — a bad drift-check also escalates).
+  local drift_flag=""
+  _council_constitution_drift "$dir" >/dev/null 2>&1 || drift_flag="--constitution-drift=1"
+
   local raw
-  raw="$(node "$dir/cli.mjs" convene "$@" "${veto_args[@]}" --constitution-path="$(_council_constitution_path)" --registry="$COUNCIL_REGISTRY" --genesis-exists="$genesis_exists" --stamped-at="$stamped")" || return $?
+  raw="$(node "$dir/cli.mjs" convene "$@" "${veto_args[@]}" ${drift_flag} --constitution-path="$(_council_constitution_path)" --registry="$COUNCIL_REGISTRY" --genesis-exists="$genesis_exists" --stamped-at="$stamped")" || return $?
 
   # Seal the receipt canonical at the root HMAC rail — a standalone engine has no
   # key, so the seal (via gate-proof) is what makes the verdict tamper-evident. The

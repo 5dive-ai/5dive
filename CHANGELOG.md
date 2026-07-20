@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.11.22 — Constitution amendments: amend-only-via-motion, sealed digest, verify fails closed on drift (CNCL-15) (2026-07-20)
+
+- feat(council): `5dive council amend --file=<new 5dive.md>` rewrites the constitution ONLY via a constitutional-class motion (2/3 + full quorum + founder veto). On a pass the new constitution's digest is hash-chained into the lineage and the on-disk `5dive.md` is swapped; a non-pass leaves it untouched. An invalid proposed constitution is refused before any convene (CNCL-15).
+- feat(council): `council init` now seeds a v0 `5dive.md` (the human-readable projection of the built-in defaults) and seals its digest into the genesis record — the drift baseline.
+- feat(council): `council verify` adds a constitution-integrity check — the live `5dive.md` must match the digest sealed in the newest genesis/amendment record. A missing or hand-edited file is drift; verify FAILS CLOSED. Authority is the sealed chain, not the forgeable file.
+- feat(council): a primary-council `convene` under a drifted constitution ESCALATES instead of enforcing forged governance. Drift is recoverable by restoring the sealed file (or amending the sanctioned way).
+
 ## 0.11.21 — The Council: non-blocking ballots via the task queue (CNCL-18) (2026-07-20)
 
 - feat(council): `5dive council convene` now delivers each seat's ballot as a DEADLINE-STAMPED TASK in that seat's queue instead of injecting it into the seat's live session over a blocking `agent ask` pane-scrape. The seat surfaces and works the ballot at its next heartbeat boundary (a ballot is just a normal assigned task, so no heartbeat change), casts its vote by closing the task with a COUNCIL-VOTE line in the result, and the convener COLLECTS by polling `task show` until the task closes with a result or the deadline elapses. A missed deadline, an unreadable result, or an unparseable vote all resolve to an abstain. This removes the coordinated quiet window the old rail needed and stops mid-work seats timing out to abstain. Liveness/abstain, quorum, and blind-first-round semantics are unchanged (they live in the engine; the redesign touches the dispatch adapter only).

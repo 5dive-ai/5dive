@@ -38,6 +38,12 @@ if ! bash "tests/council_cosign_e2e.sh"; then echo "FAILED: tests/council_cosign
 echo "=== tests/council_roster_lineage_e2e.sh"
 if ! bash "tests/council_roster_lineage_e2e.sh"; then echo "FAILED: tests/council_roster_lineage_e2e.sh"; rc=1; fi
 
+# CNCL-15: the constitution-AMENDMENTS WIRING e2e (real 5dive council {init,amend,convene,verify}
+# bundle over an isolated STATE_DIR): genesis seals the v0 digest, amend is a constitutional motion
+# that swaps + hash-chains, and drift fails closed (verify RED + convene escalate). Same self-SKIP.
+echo "=== tests/council_amend_e2e.sh"
+if ! bash "tests/council_amend_e2e.sh"; then echo "FAILED: tests/council_amend_e2e.sh"; rc=1; fi
+
 # CNCL-26: the bash-DISPATCHER route e2e — proves `5dive council sign-vote|verify-votes` reach the
 # mjs verbs through cmd_council()'s allowlist (not just `node cli.mjs` directly, the blind spot that
 # hid the CNCL-10 shell gap). Builds a throwaway ./5dive (BUILD_OUT) so it GATES in CI; no root/seal.

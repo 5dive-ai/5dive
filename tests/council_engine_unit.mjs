@@ -13,6 +13,8 @@ import {
   augmentCanonicalVetoBinding, parseCanonicalVetoBinding, triageVerdictToAction,
   classifyMotion, recusalFor, CONSTITUTIONAL_PARAMS,
   buildMotionRecord, canonicalMotion, chainEntryOf, verifyLineageChain,
+  digestConstitution, constitutionDriftCheck, renderConstitutionV0,
+  buildGenesisRecord, canonicalGenesis, normalizeConstitution, parseConstitutionFrontmatter,
 } from '../src/council/engine.mjs'
 
 let pass = 0, fail = 0
@@ -309,5 +311,32 @@ ok(verifyLineageChain([chain[0], chain[2], chain[1]]).ok === false, 'chain: a RE
 ok(verifyLineageChain([chainEntryOf({ seq: 0, prevDigest: 'X' }, 'D0')]).ok === false, 'chain: first record must be the genesis root (empty prevDigest)')
 ok(verifyLineageChain([]).ok === false, 'chain: empty lineage fails closed')
 
-console.log(`\nCNCL-6/11 engine: ${pass} passed, ${fail} failed (bound to src/council/engine.mjs)`)
+// ---- CNCL-15: constitution amendments — digest sealing + drift check --------------------------
+// The v0 render round-trips back to the built-in defaults (its sealed digest is a meaningful baseline).
+const v0 = renderConstitutionV0()
+ok(typeof v0 === 'string' && v0.startsWith('---\n'), 'CNCL-15: renderConstitutionV0 emits a frontmatter doc')
+let v0norm
+try { v0norm = normalizeConstitution(parseConstitutionFrontmatter(v0)) } catch (e) { v0norm = { err: String(e && e.message) } }
+ok(v0norm && v0norm.council && v0norm.council.bench === 'council' && v0norm.veto.holdSecs === 900, 'CNCL-15: the v0 constitution parses+normalizes to the defaults')
+ok(digestConstitution('a') === digestConstitution('a') && digestConstitution('a') !== digestConstitution('b'), 'CNCL-15: digestConstitution is deterministic + content-sensitive')
+// drift check: no sealed digest = nothing to enforce; sealed+match = clean; sealed+missing/mismatch = drift (fail closed).
+ok(constitutionDriftCheck({ sealedDigest: '', liveDigest: 'x' }).drifted === false, 'CNCL-15: no sealed digest → not drifted (pre-CNCL-15 lineage)')
+ok(constitutionDriftCheck({ sealedDigest: 'abc', liveDigest: 'abc' }).drifted === false, 'CNCL-15: matching live+sealed digest → not drifted')
+ok(constitutionDriftCheck({ sealedDigest: 'abc', liveDigest: '' }).drifted === true, 'CNCL-15: sealed digest but missing file → drift (fail-closed)')
+ok(constitutionDriftCheck({ sealedDigest: 'abc', liveDigest: 'abd' }).drifted === true, 'CNCL-15: edited file (digest mismatch) → drift (fail-closed)')
+// genesis seals the digest into the canonical bytes ONLY when present (back-compat: absent → old bytes).
+const gWith = buildGenesisRecord({ seats: [{ id: 'a' }], veto: { principal: 'human:main', resolved: '1' }, constitutionDigest: 'DEAD' })
+const gNo = buildGenesisRecord({ seats: [{ id: 'a' }], veto: { principal: 'human:main', resolved: '1' } })
+ok(gWith.constitutionDigest === 'DEAD' && canonicalGenesis(gWith).includes('constitution: DEAD'), 'CNCL-15: genesis seals the constitution digest into its canonical bytes')
+ok(gNo.constitutionDigest === '' && !canonicalGenesis(gNo).includes('constitution:'), 'CNCL-15: a genesis with no digest canonicalizes as before (back-compat)')
+// an amend motion record must carry a digest (fail closed) + seals it into the motion bytes.
+const okVerdict = { recommendation: 'approve', tally: { approve: 2, reject: 0, escalate: 0 }, escalated: false }
+let amendThrew = false
+try { buildMotionRecord({ motion: { kind: 'amend' }, verdict: okVerdict, seats: [{ id: 'a' }] }) } catch { amendThrew = true }
+ok(amendThrew === true, 'CNCL-15: an amend motion with no constitution digest is refused (fail-closed)')
+const amendRec = buildMotionRecord({ motion: { kind: 'amend' }, verdict: okVerdict, seats: [{ id: 'a' }], constitutionDigest: 'BEEF' })
+ok(classifyMotion({ kind: 'amend' }) === 'constitutional', 'CNCL-15: an amend motion classifies constitutional (hardest bar)')
+ok(amendRec.constitutionDigest === 'BEEF' && canonicalMotion(amendRec).includes('constitution: BEEF'), 'CNCL-15: an amend motion seals the new digest into its canonical bytes')
+
+console.log(`\nCNCL-6/11/15 engine: ${pass} passed, ${fail} failed (bound to src/council/engine.mjs)`)
 process.exit(fail ? 1 : 0)

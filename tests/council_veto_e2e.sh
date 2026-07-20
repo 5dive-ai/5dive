@@ -34,6 +34,22 @@ ok(){ echo "  ok:   $1"; pass=$((pass+1)); }
 no(){ echo "  FAIL: $1"; fail=$((fail+1)); }
 sha(){ printf '%s' "$1" | sha256sum | awk '{print $1}'; }
 
+# CNCL-15: init now seeds a 5dive.md and the constitution GOVERNS the veto window (posthoc_secs),
+# so the posthoc window is expressed in the constitution the council is seeded with — not via the
+# pre-constitution COUNCIL_VETO_POSTHOC_SECS env (a valid on-disk file wins over it, by design).
+# Seed a constitution with a 0s posthoc window (15m hold kept) so the window-expiry leg below fires.
+cat > "$TMP/5dive.md" <<'EOF'
+---
+council:
+  bench: council
+veto:
+  hold_secs: 900
+  posthoc_secs: 0
+---
+
+# 5dive Constitution (veto e2e — zero posthoc window)
+EOF
+
 # --- genesis + a convene that offers the founder veto --------------------------------------------
 "$FIVE" council init --seats="a:chair,b,c" --threshold="majority" --veto="tg:433634012" >/dev/null 2>&1 \
   || { echo "FAIL: council init (cannot seal genesis — no gate-proof rail?)"; exit 1; }
@@ -65,8 +81,9 @@ fi
 [[ -f "$TMP/council/veto-audit.jsonl" ]] && grep -q '"event":"nonce-mismatch"' "$TMP/council/veto-audit.jsonl" \
   && ok "nonce-mismatch written to the durable veto audit" || no "nonce-mismatch not logged"
 
-# --- leg: window-expiry refused (posthoc past a zero window) -------------------------------------
-if COUNCIL_VETO_POSTHOC_SECS=0 "$FIVE" council veto exercise --receipt="$DIGEST" --nonce="$NONCE" --tier=posthoc >/dev/null 2>&1; then
+# --- leg: window-expiry refused (posthoc past the constitution's zero window) --------------------
+# The 0s posthoc window comes from the seeded constitution (CNCL-15: the file governs it).
+if "$FIVE" council veto exercise --receipt="$DIGEST" --nonce="$NONCE" --tier=posthoc >/dev/null 2>&1; then
   no "expired-window exercise was NOT refused"
 else
   ok "window-expiry exercise refused (past posthoc window)"
