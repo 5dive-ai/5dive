@@ -114,5 +114,34 @@ grep -q "and 2 more" "$LAST_TEXT"; has_more=$?
   && ok_t "digest caps at 10 gates and notes the overflow" \
   || bad_t "cap broken" "rc=$rc n_ids=$n_ids more=$has_more"
 
+# DIVE-1505: sub-T2 gate (tier<2, blocked, has a rec, not routed) arms the bulk
+# 'Clear all recommended' button + the "go with recs" text hint.
+mk_gate_t1() { # ident options recommend  -> tier-1, agent-clearable
+  db "INSERT INTO tasks (ident,title,priority,assignee,created_by,kind,status,need_type,tier,ask,need_options,recommend,need_asked_at)
+      VALUES ($(sqlq "$1"),'gate','high','dev','dev','standard','blocked','decision',1,'choose now',$(sqlq "$2"),$(sqlq "$3"),datetime('now'));
+      SELECT last_insert_rowid();"
+}
+reset
+mk_gate_t1 DIVE-51 'A|B' A >/dev/null   # clearable
+mk_gate DIVE-52 approval '' '' >/dev/null   # tier-2 hard gate, no rec
+out=$(cmd_task_inbox --send 2>&1); rc=$?
+grep -q '"callback_data":"gclearall"' "$LAST_MARKUP"; has_btn=$?
+grep -q 'go with recs' "$LAST_TEXT"; has_hint=$?
+grep -q '1 sub-T2' "$LAST_MARKUP"; has_count=$?
+[[ "$rc" == "0" && "$has_btn" == "0" && "$has_hint" == "0" && "$has_count" == "0" ]] \
+  && ok_t "sub-T2 gate arms bulk clear button + hint (count=1)" \
+  || bad_t "bulk clear affordance missing" "rc=$rc btn=$has_btn hint=$has_hint count=$has_count"
+
+# Hard-gate-only digest: NO bulk button, NO hint (nothing agent-clearable).
+reset
+mk_gate DIVE-61 approval '' '' >/dev/null   # tier-2, no rec
+mk_gate DIVE-62 manual '' '' >/dev/null     # tier-2, no rec
+out=$(cmd_task_inbox --send 2>&1); rc=$?
+grep -q 'gclearall' "$LAST_MARKUP"; no_btn=$?
+grep -q 'go with recs' "$LAST_TEXT"; no_hint=$?
+[[ "$rc" == "0" && "$no_btn" != "0" && "$no_hint" != "0" ]] \
+  && ok_t "hard-gate-only digest suppresses bulk clear affordance" \
+  || bad_t "bulk affordance leaked onto hard-gate-only digest" "rc=$rc btn=$no_btn hint=$no_hint"
+
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 exit $(( FAIL > 0 ))

@@ -2950,6 +2950,19 @@ _task_inbox_send() {
   fi
   local shown=$(( total < cap ? total : cap ))
 
+  # DIVE-1505: count the agent-clearable subset in view using the EXACT predicate
+  # cmd_task_clear_recs applies (blocked, tier<2, has a recommend, not lead-routed).
+  # A non-zero count arms the bulk 'Clear all recommended' row + the "go with recs"
+  # text hint below; zero suppresses both so a hard-gate-only digest never dangles
+  # a button that would clear nothing.
+  local recs_clearable
+  recs_clearable=$(db "SELECT COUNT(*) FROM tasks
+                       WHERE ${where}
+                         AND status='blocked'
+                         AND CAST(COALESCE(tier,'2') AS INTEGER) < 2
+                         AND COALESCE(recommend,'') != ''
+                         AND COALESCE(routed_reviewer,'') = '';")
+
   local text="🗂 Gate inbox — waiting on you now:"
   local kbrows='[]' row id ident prio ntype options recommend ask nonce="" markup="" idlist=""
   local -a nonce_ids=() nonce_hashes=()
@@ -2979,6 +2992,16 @@ _task_inbox_send() {
                FROM tasks WHERE ${where} ${order} LIMIT ${cap};")
   if (( total > cap )); then
     text+=$'\n\n'"…and $(( total - cap )) more — 5dive task inbox on the box or the dashboard."
+  fi
+  # DIVE-1505: bulk-clear affordance for the agent-clearable (sub-T2) gates. The
+  # `gclearall` callback carries no id/nonce — a sub-T2 rec clear is not a hard
+  # human-proof — so the plugin shells `task clear-recs --channel-proof=<tapper>`
+  # over the whole eligible set, byte-identical to the per-gate ✅ Apply rec tap.
+  # The text hint mirrors it for SEND_ONLY relay chats where taps can't ride back.
+  if [[ "${recs_clearable:-0}" -gt 0 ]]; then
+    local bulkrow='[{"text":"✅ Clear all recommended ('"${recs_clearable}"' sub-T2)","callback_data":"gclearall"}]'
+    kbrows=$(jq -cn --argjson a "$kbrows" --argjson b "$bulkrow" '$a + [$b]' 2>/dev/null) || true
+    text+=$'\n\n'"Or reply \"go with recs\" to apply the ✅ recommendation on all ${recs_clearable} sub-tier-2 gate$([[ "$recs_clearable" -eq 1 ]] || echo s) at once."
   fi
   text+=$'\n\n'"Tap a button, open a /task link, or answer from the dashboard."
 

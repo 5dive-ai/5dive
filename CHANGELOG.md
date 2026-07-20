@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.11.34 — Gate inbox digest: bulk "Clear all recommended (sub-T2)" button + hint (DIVE-1505) (2026-07-20)
+
+- feat(task inbox --send): the owner gate-inbox digest now renders a bulk `✅ Clear all recommended (N sub-T2)` button row whenever at least one gate in view is agent-clearable (blocked, tier<2, has a recommendation, not lead-routed) — the exact eligibility predicate `task clear-recs` applies. The button carries a bare `gclearall` callback (no id/nonce; a sub-T2 rec clear is not a hard human-proof); the telegram plugin shells `task clear-recs --channel-proof=<tapper>` over the whole eligible set, byte-identical to the per-gate `✅ Apply rec` tap. A hard-gate-only digest shows neither the button nor the hint.
+- feat(task inbox --send): a one-line `reply "go with recs"` hint mirrors the button for SEND_ONLY relay chats where a tap can't ride back, wiring the existing DIVE-1305 channel-proof text rail into the digest for discoverability.
+- test: `task_inbox_send_unit.sh` adds two cases — a sub-T2 gate arms the button + hint (count reflected), and a hard-gate-only digest suppresses both.
+
 ## 0.11.32 — Objective/goal planner: tolerate `id` where the schema wants `local_id` (DIVE-1551) (2026-07-20)
 
 - fix(objective): a `create`-bearing replan cycle no longer crashes with `every task needs a non-empty local_id`. `loop spawn --schema` is prompt guidance, not a hard-enforced structured-output contract, so a live planner routinely emits the create key as `id` instead of the schema's `local_id`. New `_objective_normalize_diff` coerces `create[].id → local_id` (only when `local_id` is absent/blank) before validate/apply, on both the fresh-plan path and the `--from-gate` recovery path (so pre-fix gates that stored `id` still apply). A diff already carrying `local_id`, or invalid JSON, is returned byte-untouched so validation still emits its own precise error.
