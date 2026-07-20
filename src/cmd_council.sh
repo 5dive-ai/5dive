@@ -2743,6 +2743,35 @@ _council_veto_audit() {
 # recipient. The tappable button + its callback -> `council veto exercise` is the telegram-plugin
 # leg that pairs with a live genesis; this CLI leg guarantees the recipient is notified with the
 # receipt handle + the one-time nonce the tap must present.
+# DIVE-1546: the STRUCTURED founder-veto delivery seam `_council_veto_ping` prefers (rail B). It
+# renders the offer as a telegram message + a 🛑 VETO tap button whose callback_data carries the
+# one-time nonce — the ONLY place the raw nonce travels — and delivers it to the founder's DM chat.
+# The nonce is NEVER put in the message text. The button carries a UNIQUE receipt PREFIX (12 chars),
+# not the full digest, because `veto:<full base64url digest>:<32-char nonce>` would exceed Telegram's
+# 64-byte callback_data cap; `council veto exercise --receipt` resolves the prefix fail-closed. Token
+# resolution reuses the gate-notify path (per-agent connector token / $TELEGRAM_BOT_TOKEN); with no
+# telegram rail the offer simply lapses (execution proceeds after the hold — fail-safe). Delivery
+# routes through `_mirror_send`, which honors FIVEDIVE_NOTIFY_DRYRUN so a fixture can't DM a human.
+_tg_veto_offer() {
+  local resolved="$1" full_digest="$2" nonce="$3" execute_after="$4"
+  [[ -n "$resolved" && -n "$full_digest" && -n "$nonce" ]] || return 0
+  local token=""
+  if _task_owner_channel 2>/dev/null && [[ -n "${TASK_CH_TOKEN:-}" ]]; then
+    token="$TASK_CH_TOKEN"
+  else
+    token="${TELEGRAM_BOT_TOKEN:-}"
+  fi
+  [[ -n "$token" ]] || return 0   # no telegram rail → the offer lapses (fail-safe)
+  local prefix="${full_digest:0:12}"
+  local reply_markup
+  reply_markup="$(jq -cn --arg p "$prefix" --arg n "$nonce" \
+    '{inline_keyboard: [[{text: "🛑 VETO this pass", callback_data: ("veto:" + $p + ":" + $n)}]]}' 2>/dev/null)" || return 0
+  # NB: the raw nonce is ONLY in callback_data above — never in this human-readable text.
+  local text="Council veto offer — a pass sealed (${full_digest:0:12}…). Execution holds until ${execute_after}. Tap 🛑 VETO to block it, or ignore to let it proceed."
+  _mirror_send "$token" "$resolved" "" "$text" "$reply_markup" >/dev/null 2>&1 || true
+  return 0
+}
+
 _council_veto_ping() {
   local resolved="$1" digest="$2" execute_after="$3" nonce="$4"
   mkdir -p "$COUNCIL_DIR" 2>/dev/null || true
@@ -2805,15 +2834,33 @@ _council_veto() {
   [[ -n "$rcpt_digest" ]] || fail "$E_USAGE" "veto exercise needs --receipt=<sealed convene receipt digest>"
   [[ -n "$nonce" ]]       || fail "$E_PERMISSION" "veto exercise needs --nonce=<the one-time tap nonce> (an unauthenticated exercise is refused)"
 
-  # Locate the sealed convene receipt by its digest.
-  local rf found=""
+  # Locate the sealed convene receipt by its digest. DIVE-1546: accept a UNIQUE receipt PREFIX, not
+  # only the full digest — the telegram veto button carries a prefix because a full base64url digest
+  # (43) + the nonce (32) exceeds Telegram's 64-byte callback_data cap. Resolution is FAIL-CLOSED:
+  # collect every receipt whose sealedDigest EQUALS or STARTS WITH the arg and require EXACTLY one
+  # (a full digest is a prefix of itself, so exact-match callers are unchanged; zero → not found,
+  # >1 → ambiguous, both refused). The NONCE — not the prefix — is the authentication, so prefix
+  # length is not a security boundary; a wrong/short prefix that resolves still dies at the nonce
+  # check below. `sealedDigest` is base64url ([A-Za-z0-9_-]) so it carries no glob metacharacters.
+  local rf found="" full_digest="" match_count=0 _sd
   if [[ -d "$COUNCIL_RECEIPTS" ]]; then
     for rf in "$COUNCIL_RECEIPTS"/*.json; do
       [[ -f "$rf" ]] || continue
-      [[ "$(jq -r '.sealedDigest // empty' "$rf" 2>/dev/null)" == "$rcpt_digest" ]] && { found="$rf"; break; }
+      _sd="$(jq -r '.sealedDigest // empty' "$rf" 2>/dev/null)" || _sd=""
+      [[ -n "$_sd" ]] || continue
+      if [[ "$_sd" == "$rcpt_digest" || "$_sd" == "$rcpt_digest"* ]]; then
+        found="$rf"; full_digest="$_sd"; match_count=$((match_count + 1))
+      fi
     done
   fi
+  if (( match_count > 1 )); then
+    _council_veto_audit "ambiguous-prefix" "$rcpt_digest"
+    fail "$E_PERMISSION" "receipt prefix ${rcpt_digest:0:16}… is AMBIGUOUS (matches ${match_count} sealed receipts) — refusing (fail-closed)"
+  fi
   [[ -n "$found" ]] || fail "$E_GENERIC" "no sealed council receipt with digest ${rcpt_digest:0:16}… (fail-closed)"
+  # RE-ANCHOR to the found receipt's FULL sealedDigest so every downstream check — above all the
+  # re-seal hardening (main gate amendment 2) — compares against the true digest, NEVER the prefix.
+  rcpt_digest="$full_digest"
 
   # HARDENING (main gate): before trusting ANY field of the receipt (.verdict / .vetoNonceDigest /
   # .vetoOffer), re-seal its canonical bytes on the gate-proof rail and confirm they match the

@@ -108,9 +108,32 @@ else
   ok "window-expiry exercise refused (past posthoc window)"
 fi
 
-# --- leg: a REAL tap flips pass->blocked inside a sealed record ----------------------------------
-"$FIVE" council veto exercise --receipt="$DIGEST" --nonce="$NONCE" --tier=hold >/dev/null 2>&1 \
-  || no "valid veto exercise returned nonzero"
+# --- DIVE-1546: --receipt accepts a UNIQUE PREFIX (the telegram button carries a 12-char prefix,
+# not the full digest — the 64-byte callback_data cap). Resolution is fail-closed. -----------------
+# Ambiguity: two dummy receipts sharing a prefix must refuse BEFORE re-seal (match_count>1), never
+# silently pick one. (The dummies never reach re-seal; the ambiguity gate fires first.)
+printf '{"sealedDigest":"AMBIGpfx0000AAAA"}\n' > "$TMP/council/receipts/_dummy_a.json"
+printf '{"sealedDigest":"AMBIGpfx1111BBBB"}\n' > "$TMP/council/receipts/_dummy_b.json"
+if "$FIVE" council veto exercise --receipt="AMBIGpfx" --nonce="$NONCE" --tier=hold >/dev/null 2>&1; then
+  no "ambiguous receipt prefix was NOT refused"
+else
+  ok "ambiguous receipt prefix refused (fail-closed)"
+fi
+grep -q '"event":"ambiguous-prefix"' "$TMP/council/veto-audit.jsonl" 2>/dev/null \
+  && ok "ambiguous-prefix written to the durable veto audit" || no "ambiguous-prefix not logged"
+rm -f "$TMP/council/receipts/_dummy_a.json" "$TMP/council/receipts/_dummy_b.json"
+# Not-found: a prefix matching no receipt is refused (fail-closed).
+if "$FIVE" council veto exercise --receipt="ZZZZnope" --nonce="$NONCE" --tier=hold >/dev/null 2>&1; then
+  no "unknown receipt prefix was NOT refused"
+else
+  ok "unknown receipt prefix refused (fail-closed)"
+fi
+
+# --- leg: a REAL tap flips pass->blocked inside a sealed record — driven via a receipt PREFIX ------
+# (proves the whole prefix round-trip: `_tg_veto_offer` emits a 12-char prefix, exercise resolves it,
+# re-anchors to the FULL sealedDigest so the re-seal hardening below is unchanged.)
+"$FIVE" council veto exercise --receipt="${DIGEST:0:12}" --nonce="$NONCE" --tier=hold >/dev/null 2>&1 \
+  || no "valid veto exercise via receipt PREFIX returned nonzero"
 VREC="$(ls -1t "$TMP/council/receipts/"veto-*.json 2>/dev/null | head -1)"
 if [[ -f "$VREC" ]]; then
   ok "chained veto record sealed to disk"
@@ -120,6 +143,29 @@ if [[ -f "$VREC" ]]; then
     || no "sealed veto record is not vetoed/blocked"
 else
   no "no sealed veto record written"
+fi
+
+# --- DIVE-1546: _tg_veto_offer renders the nonce ONLY in the button callback_data, never in text --
+# Extract the function from the BUILT bundle and drive it with stubs for its two deps
+# (_task_owner_channel + _mirror_send), so we assert the rendered payload offline (no live rail).
+OFFER_FN="$TMP/offer_fn.sh"
+sed -n '/^_tg_veto_offer() {/,/^}/p' "$ROOT/src/cmd_council.sh" > "$OFFER_FN"
+if [[ -s "$OFFER_FN" ]]; then
+  CAP="$TMP/offer_capture.txt"
+  (
+    export TASK_CH_TOKEN="testtoken"
+    _task_owner_channel() { return 0; }
+    _mirror_send() { printf 'chat=%s\ntext=%s\nmarkup=%s\n' "$2" "$4" "$5" > "$CAP"; }
+    source "$OFFER_FN"
+    _tg_veto_offer "433634012" "dQtU1Z_iCpWuT3Ggu6RyV3TnwDkWb_YdtmS1n6qXL10" "0123456789abcdef0123456789abcdef" "2026-01-01T00:00:00Z"
+  )
+  grep -q '"callback_data":"veto:dQtU1Z_iCpWu:0123456789abcdef0123456789abcdef"' "$CAP" \
+    && ok "_tg_veto_offer button carries veto:<12prefix>:<nonce> in callback_data" || no "veto button callback_data wrong"
+  awk -F'text=' '/^text=/{print $2}' "$CAP" | grep -q '0123456789abcdef' \
+    && no "_tg_veto_offer LEAKED the raw nonce into the message text" || ok "_tg_veto_offer message text carries NO nonce (button-only)"
+  grep -q '^chat=433634012$' "$CAP" && ok "_tg_veto_offer targets the resolved founder chat" || no "_tg_veto_offer wrong chat"
+else
+  no "could not extract _tg_veto_offer from the built bundle"
 fi
 
 # --- leg: lineage verify GREEN after the veto (the chain-defect regression) ----------------------
