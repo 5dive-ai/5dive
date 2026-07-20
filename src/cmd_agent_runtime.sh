@@ -395,12 +395,31 @@ _mirror_follow_migration() {
 # markers are TUI-specific and don't collide (claude never shows the antigravity
 # footer; antigravity never shows ❯), so OR-ing them needs no type plumbing and
 # can't false-positive across types.
+#
+# DIVE-1528: CODEX's composer marker "›" (U+203A, its "gpt-… · <cwd>" status
+# footer accompanies the same box) was in _hb_idle_marker (DIVE-1211) — whose
+# comment even says it "Mirrors wait_agent_input_ready" — but was NEVER added
+# HERE, so every send to an IDLE codex agent (andy) timed out at 45s and printed
+# the false "input prompt not detected — best-effort (may be lost)" warning, and
+# inject_and_submit then ran against a pane it wrongly treated as mid-boot. Add
+# "›" so codex is detected like every other TUI. Collision-free (only codex draws
+# "›"; claude "❯"; antigravity its footer), so it stays type-agnostic. Keep this
+# set in lockstep with _hb_idle_marker (cmd_heartbeat.sh) — they must not drift.
+# The marker set lives in one PURE predicate (_agent_pane_input_ready) so it can
+# be unit-tested against real pane samples with NO tmux — and a future TUI's
+# marker is added in exactly one place. The readiness set is a SUPERSET of the
+# _hb_idle_marker table (it also tolerates the mid-turn "esc to cancel", which a
+# readiness — not idle — probe accepts); heartbeat_idle_marker_unit.sh asserts
+# every idle marker is also a readiness marker, so the two can never drift again.
+_agent_pane_input_ready() {
+  grep -qE '❯|›|\? for shortcuts|esc to cancel' <<<"${1:-}"
+}
 wait_agent_input_ready() {
   local name="$1" timeout="${2:-45}"
   local user="agent-${name}" waited=0 pane
   while (( waited < timeout )); do
     pane=$(sudo -u "$user" tmux capture-pane -p -t "agent-${name}" 2>/dev/null || true)
-    grep -qE '❯|\? for shortcuts|esc to cancel' <<<"$pane" && return 0
+    _agent_pane_input_ready "$pane" && return 0
     sleep 1; waited=$((waited+1))
   done
   return 1
