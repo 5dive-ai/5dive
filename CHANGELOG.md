@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.12.0 — First-contact control-plane welcome + terminal teaser (DIVE-1571) (2026-07-20)
+
+- feat(welcome): the first-contact DM an agent sends the moment it pairs now LEADS with the approved (lodar, 2026-07-20) control-plane pitch for **admin-isolation** agents: "hey, i'm {name}, your agent, and i'm not alone. through 5dive i can spin up a whole team, stand up a company, run a council, or turn a goal into a plan. tell me what you're building, or say 'show me what you can do'." Enriches `send_welcome_message` (`cmd_agent_pairing.sh`), the existing one-shot on-pair delivery point, so it fires exactly ONCE.
+- gate: the pitch is emitted ONLY when the agent's `AGENT_ISOLATION` (read from `${ENV_DIR}/<name>.env`) is `admin` — only admin agents can actually run `company`/`agent create`/`council`/`goal`. A standard/sandboxed agent keeps the plain per-type welcome so it never claims powers it lacks. The fallback is FAIL-SAFE: an unreadable/missing isolation defaults to `standard` (plain welcome), never admin, so a mis-seeded/edge agent can never over-claim to the user. Type-neutral (all admin types get it).
+- feat(init): `5dive init` Step 8 gains a curated control-plane teaser (`task add` / `company` / `council convene` / `market` / `--help`) as the OSS self-hoster's terminal-side secondary, mirroring the DM. (Demoted DIVE-1561 content.)
+- note: no skill change — the `5dive-cli` skill already primes agents to ACT on chat requests; the welcome just OFFERS what the skill already enables. Public copy is em-dash-free per the house rule.
+
 ## 0.11.36 — Re-embed the council engine into cmd_council.sh (fix red CI) (DIVE-1569) (2026-07-20)
 
 - fix(council): regenerate `src/cmd_council.sh` so its embedded `COUNCIL_ENGINE_MJS` heredoc byte-matches the canonical `src/council/engine.mjs`. DIVE-1563 (c19920fa) added the human-as-seat schema (`seatIsHuman`/`resolveSeatChat`/`humanSeatFields`) to `engine.mjs` but never re-ran `node src/council/gen_cmd.mjs`, so the committed bundle carried a stale engine. This is the sole, deterministic cause of the red `unit-tests` job — `council_cli_contract.mjs`'s "engine embed matches canonical" + "gen_cmd reproducible" checks failed on every run (bundle-drift.yml stayed green because the committed `5dive` was self-consistent with the stale `cmd_council.sh`).

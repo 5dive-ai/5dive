@@ -675,6 +675,20 @@ USAGE
 
 NEXT
 
+  # DIVE-1571: terminal control-plane teaser (the OSS self-hoster's secondary,
+  # since they land on the terminal at init). Curated verbs only, mirroring the
+  # first-contact DM. No em-dashes (public-copy rule). Demoted DIVE-1561 content.
+  cat >&2 <<CONTROLPLANE
+  Or drive the whole control plane from here:
+
+    5dive task add 'ship the landing page'       queue work for your team
+    5dive company 'launch my SaaS'               stand up a company from a goal
+    5dive council convene 'should we ship?'      convene a decision council
+    5dive market                                 hire a ready-made teammate
+    5dive --help                                 every verb
+
+CONTROLPLANE
+
   if [[ "$channels" == "telegram" && -n "$telegram_user_id" ]]; then
     cat >&2 <<TG
 From your phone:

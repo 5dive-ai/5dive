@@ -767,6 +767,30 @@ EOF
       ;;
   esac
 
+  # DIVE-1571: first-contact CONTROL-PLANE welcome. An admin-isolation agent can actually
+  # run `company` / `agent create` / `council` / `goal`, so it LEADS with the approved
+  # (lodar, 2026-07-20) capability pitch instead of the plain per-type welcome above. A
+  # standard/sandboxed agent keeps that per-type text — it must NOT claim powers it lacks.
+  # Isolation is read from the agent's env file (written at create/init BEFORE this pair
+  # fires). The fallback is FAIL-SAFE: an unreadable/missing isolation defaults to STANDARD
+  # (plain welcome), never admin — a mis-seeded/edge agent wrongly telling a user "i can spin
+  # up a team/company/council" is worse than an admin agent missing the pitch (main gate,
+  # DIVE-1571). No em-dashes (public-copy rule). {name}=agent name; a nameless agent drops
+  # the name clause.
+  local iso=""
+  [[ -n "$agent_name" ]] && iso=$(sed -n 's/^AGENT_ISOLATION=//p' "${ENV_DIR}/${agent_name}.env" 2>/dev/null | head -1)
+  iso="${iso:-standard}"
+  if [[ "$iso" == "admin" ]]; then
+    local intro="hey, i'm your agent, and i'm not alone."
+    [[ -n "$agent_name" ]] && intro="hey, i'm ${agent_name}, your agent, and i'm not alone."
+    text=$(cat <<EOF
+${intro} through 5dive i can spin up a whole team, stand up a company, run a council, or turn a goal into a plan. tell me what you're building, or say 'show me what you can do'.
+
+Here 24/7 with memory. Send text, photos, or files.${live_line}
+EOF
+)
+  fi
+
   curl -sS -o /dev/null \
     --data-urlencode "chat_id=${chat_id}" \
     --data-urlencode "text=${text}" \
