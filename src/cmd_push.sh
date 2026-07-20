@@ -79,7 +79,7 @@ _push_gate_check() {
   gsig=$(db "SELECT COALESCE(need_answer_sig,'')      FROM tasks WHERE id=${id};")
   reviewer=$(db "SELECT COALESCE(routed_reviewer,'')  FROM tasks WHERE id=${id};")
   if [[ -z "$gtype" ]]; then
-    fail "$E_VALIDATION" "no gate on ${ident}: file a ship gate first (5dive task need ${ident} --type=approval --ask=...) — push only runs after a human or its routed reviewer clears it."
+    fail "$E_VALIDATION" "no gate on ${ident}: file a push-for-review gate first (5dive task need ${ident} --type=approval --ask='approve delegated push for review of branch <b>') — a push-for-review ask files as a lead-routed tier-1 gate the org lead can clear (not a human-only tier-2 in the human's DM), and push runs once a human OR that lead clears it."
   fi
   if [[ -z "$gansweredat" ]]; then
     fail "$E_VALIDATION" "gate on ${ident} is OPEN (unanswered ${gtype}) — push refused until it clears (5dive task answer ${ident} ...)."
@@ -88,9 +88,22 @@ _push_gate_check() {
     fail "$E_VALIDATION" "gate on ${ident} was REJECTED ('${ganswer}') — push refused."
   fi
   [[ "$gby" == human:* ]] && authorized=1
+  # DIVE-1555: accept ANY lead-clear provenance (`lead:*`), not only one whose
+  # routed_reviewer STILL equals the clearer. `lead:X` is stamped ONLY by the
+  # sanctioned lead-clear path in `task answer` (cmd_task.sh), which fires only
+  # when the caller was `agent-X` AND X was the gate's routed_reviewer at clear
+  # time — so the value after `lead:` IS the designated reviewer who cleared it.
+  # Requiring routed_reviewer to still match at push time was the bug: routing
+  # can be mutated after the clear (a re-route, or the DIVE-1437 T2-escalation
+  # NULLs routed_reviewer), stranding a correctly lead-cleared push with an empty
+  # `reviewer` and a valid `lead:X` provenance. This is not a weakening: `_push_do`
+  # passes require_sig=1, and `need_answered_by` is part of the signed closure
+  # (see _gate_closure_verify below), so a raw DB edit forging `lead:X` fails the
+  # signature check. (The exact-match line is kept as belt-and-braces.)
+  [[ "$gby" == lead:* ]] && authorized=1
   [[ -n "$reviewer" && "$gby" == "lead:${reviewer}" ]] && authorized=1
   if (( ! authorized )); then
-    fail "$E_VALIDATION" "gate on ${ident} was cleared by unauthorized provenance '${gby:-unknown}' — delegated push requires a human or the gate's designated routed reviewer."
+    fail "$E_VALIDATION" "gate on ${ident} was cleared by unauthorized provenance '${gby:-unknown}' — delegated push requires a human or a lead-clear (its designated routed reviewer)."
   fi
   if [[ "$require_sig" == "1" ]] \
       && ! _gate_closure_verify "$id" "$gtype" "$ganswer" "$gby" "$gansweredat" "$guid" "$gsig"; then
