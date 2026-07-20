@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.11.27 — Council roster preserves the chair flag onto the persisted bench (CNCL-27) (2026-07-20)
+
+- fix(council): `genesisToBench()` mapped each genesis seat to `{id, lens}` only, dropping the per-seat `chair` flag before it reached the persisted `council` bench. As a result `council roster` (JSON + text badge) and the dashboard Council panel — both of which render the chair badge from `roster.seats[].chair` — could never show a chair on ANY genesis-seeded box; the chair survived only inside the sealed genesis convene-log record. Now preserves `chair` the same way `buildGenesisRecord`/`buildMotionRecord` already do (`...(s.chair ? { chair: true } : {})`).
+- test(council): engine unit asserts `genesisToBench` carries `chair` onto the bench (and non-chair seats stay flag-free); the roster/lineage e2e asserts the seeded `main:chair` shows up in both the roster JSON and the text `(chair)` badge, so the drop gates in CI.
+
 ## 0.11.26 — Reliable inter-agent sends to codex agents: detect the codex composer marker (DIVE-1528) (2026-07-20)
 
 - fix(agent): `agent send`/`ask`/`_deliver` to a codex agent (e.g. andy) no longer times out 45s and prints the false "input prompt not detected — best-effort (may be lost)" warning. The send-path readiness probe (`wait_agent_input_ready`) only matched claude's `❯` and antigravity's footer; codex's composer marker `›` (U+203A) was in `_hb_idle_marker` (DIVE-1211) — whose own comment says it "Mirrors wait_agent_input_ready" — but had never been added to the send path, so every send to an idle codex agent fell through to the lossy best-effort branch. Added `›`, so codex is detected immediately and `inject_and_submit` confirms delivery like any other TUI.

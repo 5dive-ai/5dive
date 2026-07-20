@@ -44,6 +44,10 @@ R="$("$FIVE" council roster --json 2>/dev/null)"
 [[ "$(printf '%s' "$R" | jq -r '.data.threshold')" == "2" ]] && ok "roster threshold = majority(3)=2" || no "roster threshold wrong"
 [[ "$(printf '%s' "$R" | jq -r '.data.veto.principal')" == "tg:433634012" ]] && ok "roster shows the founder-veto principal" || no "roster veto principal wrong"
 [[ "$(printf '%s' "$R" | jq -r '.data.lineage.records')" == "1" ]] && ok "roster lineage head = 1 record (genesis)" || no "roster lineage records != 1"
+# CNCL-27: the chair flag must survive genesis -> persisted bench -> roster (JSON + text badge)
+[[ "$(printf '%s' "$R" | jq -r '.data.seats[] | select(.id=="main") | .chair')" == "true" ]] && ok "roster JSON carries the chair flag (main)" || no "roster dropped the chair flag ($R)"
+RT="$("$FIVE" council roster 2>/dev/null)"
+printf '%s' "$RT" | grep -qE 'seat main \(chair\)' && ok "roster text renders the chair badge" || no "roster text missing (chair) badge ($RT)"
 
 # --- verify: intact single-record chain is GREEN ------------------------------------------------
 "$FIVE" council verify >/dev/null 2>&1 && ok "verify GREEN on the seeded genesis" || no "verify RED on a fresh genesis"

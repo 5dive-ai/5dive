@@ -13,6 +13,7 @@ import {
   augmentCanonicalVetoBinding, parseCanonicalVetoBinding, triageVerdictToAction,
   classifyMotion, recusalFor, CONSTITUTIONAL_PARAMS,
   buildMotionRecord, canonicalMotion, chainEntryOf, verifyLineageChain,
+  genesisToBench,
   digestConstitution, constitutionDriftCheck, renderConstitutionV0,
   buildGenesisRecord, canonicalGenesis, normalizeConstitution, parseConstitutionFrontmatter,
   precedentTokens, selectPrecedents, precedentCitations, precedentCitationBrief, seatPrompt,
@@ -278,6 +279,17 @@ ok(rec5.threshold === 3 && rec5.tally.approve === 3 && rec5.recommendation === '
 // constitutional auto-class flows THROUGH tallyVotes via opts.motion (not a trusted class string)
 const cAuto = tallyVotes([V('a','approve'),V('b','approve'),V('c','approve'),V('d','approve')], { motion: { kind: 'ordinary', param: 'threshold', to: '1' }, seatCount: 5 })
 ok(cAuto.decisionClass === 'constitutional' && cAuto.recommendation === 'escalate', 'auto-class: mislabelled rule change tallies under the CONSTITUTIONAL bar (full quorum) -> escalate on 4/5')
+
+// --- CNCL-27: the persisted bench must PRESERVE the chair flag (genesisToBench dropped it,
+// so the roster chair badge was dead on every seeded box) -----------------------------------
+const grec = buildGenesisRecord({
+  seats: [{ id: 'main', lens: 'strategy', chair: true }, { id: 'theo', lens: 'growth' }],
+  chair: 'main', threshold: { rule: 'majority' }, veto: { principal: 'human:main', resolved: '433634012' },
+  prevDigest: '', stampedAt: '2026-07-19T00:00:00Z', seq: 0,
+})
+const gbench = genesisToBench(grec)
+ok(gbench.seats.find(s => s.id === 'main')?.chair === true, 'genesisToBench: chair flag survives onto the persisted bench (roster badge lives)')
+ok(!('chair' in (gbench.seats.find(s => s.id === 'theo') || {})), 'genesisToBench: non-chair seats carry no chair flag')
 
 // --- HASH-CHAINED LINEAGE: build a motion record chained onto genesis; detect tamper ---
 const mrec = buildMotionRecord({

@@ -1186,7 +1186,7 @@ export function genesisToBench(rec) {
   return {
     description: DEFAULT_COUNCIL.description,
     mode: DEFAULT_COUNCIL.mode,
-    seats: rec.seats.map(s => ({ id: s.id, lens: s.lens })),
+    seats: rec.seats.map(s => ({ id: s.id, lens: s.lens, ...(s.chair ? { chair: true } : {}) })),
     threshold: rec.threshold,
     genesis: true,           // marks this bench as motion-governed (raw add/rm refused)
     seededAt: rec.stampedAt,
