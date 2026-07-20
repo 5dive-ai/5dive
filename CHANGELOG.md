@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.11.20 — Fail closed on invalid constitution POSIX ERE (CNCL-28) (2026-07-20)
 
 - fix(gates): compile-probe constitution `hard_gates` with Bash before using the combined POSIX ERE. A pattern rejected by Bash now emits a warning and atomically falls back to the shipped tier-2 floor instead of letting `[[ =~ ]]` return 2 and silently fail open (CNCL-28).
 
