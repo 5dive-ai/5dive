@@ -1116,8 +1116,29 @@ cmd_council() {
   local drift_flag=""
   _council_constitution_drift "$dir" >/dev/null 2>&1 || drift_flag="--constitution-drift=1"
 
+  # CNCL-19: build the case-law precedent pool from the SEALED convene receipt log and hand it to
+  # the engine. The engine deterministically selects the top-k relevant priors, injects them as
+  # HISTORY into the blind ballots (never another CURRENT seat's take), and seals the followed/
+  # departed citation into this receipt. Pure read-only projection of already-sealed receipts; a
+  # missing/empty log yields no pool (no-op, byte-identical to pre-CNCL-19).
+  local -a precedent_args=(); local _pp_tmp=""
+  if compgen -G "${COUNCIL_RECEIPTS}/*.json" >/dev/null 2>&1; then
+    _pp_tmp="${COUNCIL_DIR}/.precedent-pool.$$.json"
+    if jq -s '[.[] | select((.verdict.recommendation // "") != "")
+                | {digest:(.sealedDigest // ""), question:(.question // ""),
+                   recommendation:(.verdict.recommendation // ""),
+                   brief:(.verdict.brief // .verdict.dissent // ""), stampedAt:(.stampedAt // "")}]' \
+         "${COUNCIL_RECEIPTS}"/*.json > "$_pp_tmp" 2>/dev/null; then
+      precedent_args=(--precedent-pool="$_pp_tmp")
+    else
+      rm -f "$_pp_tmp" 2>/dev/null || true; _pp_tmp=""
+    fi
+  fi
+
   local raw
-  raw="$(node "$dir/cli.mjs" convene "$@" "${veto_args[@]}" ${drift_flag} --constitution-path="$(_council_constitution_path)" --registry="$COUNCIL_REGISTRY" --genesis-exists="$genesis_exists" --stamped-at="$stamped")" || return $?
+  raw="$(node "$dir/cli.mjs" convene "$@" "${veto_args[@]}" "${precedent_args[@]}" ${drift_flag} --constitution-path="$(_council_constitution_path)" --registry="$COUNCIL_REGISTRY" --genesis-exists="$genesis_exists" --stamped-at="$stamped")"; local _rc=$?
+  [[ -n "$_pp_tmp" ]] && rm -f "$_pp_tmp" 2>/dev/null || true
+  (( _rc == 0 )) || return $_rc
 
   # Seal the receipt canonical at the root HMAC rail — a standalone engine has no
   # key, so the seal (via gate-proof) is what makes the verdict tamper-evident. The

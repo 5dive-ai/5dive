@@ -298,6 +298,20 @@ async function cmdConvene() {
     const rc = flag('recuse'); if (rc && rc !== true) input.recuse = String(rc).split(',').map(s => s.trim()).filter(Boolean)
     delete input.decisionClass   // the motion class wins; never a caller string
   }
+  // CNCL-19: precedent (case-law) pool. The bash layer reads the SEALED receipt log, projects each
+  // past verdict to {digest,question,recommendation,brief,stampedAt}, and hands it in via
+  // --precedent-pool=<path|-> (JSON array; `-` = stdin). The engine deterministically selects the
+  // top-k relevant precedents, injects them as HISTORY into every seat ballot (blind round stays
+  // blind to CURRENT takes), and seals the followed/departed citation inside the receipt bytes.
+  const pp = flag('precedent-pool')
+  if (pp && pp !== true) {
+    try {
+      const raw = pp === '-' ? fs.readFileSync(0, 'utf8') : fs.readFileSync(String(pp), 'utf8')
+      const arr = JSON.parse(raw)
+      if (Array.isArray(arr)) input.precedentPool = arr
+    } catch (e) { process.stderr.write(`council: ignoring unreadable --precedent-pool (${String(e && e.message || e)})\n`) }
+  }
+  const pk = flag('precedent-k'); if (pk != null && pk !== true) input.precedentK = Number(pk)
   // CNCL-9 FORGE REFUSAL: a veto can NEVER be asserted from a plain CLI string. Pre-CNCL-9,
   // `--veto-by=<who>` flipped the verdict inline, so any agent could forge lodar's veto into a
   // signed receipt. convene now REFUSES it outright (bash logs the attempt). convene only ever
@@ -336,6 +350,11 @@ async function cmdConvene() {
     round1Votes: result.round1Votes ? result.round1Votes.map(v => ({ seat: v.seat, vote: v.vote, rationale: v.rationale })) : undefined,
     rebuttalVotes: result.rebuttalVotes ? result.rebuttalVotes.map(v => ({ seat: v.seat, vote: v.vote, rationale: v.rationale })) : undefined,
     constitution: { source: constitution.source, valid: constitution.valid, path: constitution.path },
+    // CNCL-19: the case-law citation (which prior decisions this verdict followed vs departed
+    // from) rides on the verdict and is sealed inside the receipt bytes; surface it for the
+    // dashboard/log. Absent (undefined) when no precedent was found — output stays back-compatible.
+    precedents: result.verdict && result.verdict.precedents ? result.verdict.precedents : undefined,
+    precedentCitation: result.verdict && result.verdict.precedentCitation ? result.verdict.precedentCitation : undefined,
     receipt: result.receipt,   // { canonical, seal, verify } — bash seals canonical
   })
 }

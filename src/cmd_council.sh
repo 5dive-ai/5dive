@@ -1016,6 +1016,17 @@ export function canonicalTranscript(rec) {
   const t = vd.tally || {}
   L.push(`verdict: ${norm(vd.recommendation != null ? vd.recommendation : vd.choice)} conf=${Number(vd.confidence)} tally=a${Number(t.approve) || 0}/r${Number(t.reject) || 0}/e${Number(t.escalate) || 0} escalated=${!!vd.escalated}`)
   L.push(`dissent: ${norm(vd.dissent)}`)
+  // CNCL-19: seal the cited precedents INSIDE the signed bytes so the case-law citation (which
+  // prior decision was followed vs departed from) cannot be quietly rewritten after the fact. The
+  // line is CONDITIONAL — emitted only when precedents were cited — so a no-precedent convene
+  // (and every pre-CNCL-19 receipt) seals byte-identically. Order is stabilized by digest so
+  // retrieval order never perturbs the seal.
+  if (Array.isArray(vd.precedents) && vd.precedents.length) {
+    const cited = vd.precedents.slice()
+      .sort((a, b) => (norm(a.digest) < norm(b.digest) ? -1 : norm(a.digest) > norm(b.digest) ? 1 : 0))
+      .map(p => `${norm(p.digest)}:${norm(p.relation)}`)
+    L.push(`precedent: ${cited.join(',')}`)
+  }
   // CNCL-9: the veto OFFER and (if it happened) the EXERCISE both ride INSIDE the signed bytes,
   // so neither "an offer was made" nor "it was/wasn't exercised" can be quietly stripped. The
   // convene receipt seals with the offer's default `offered-not-exercised` state; a confirmed tap
@@ -1285,10 +1296,85 @@ export function parseVote(reply) {
   return { vote, rationale }
 }
 
+// ==================== CNCL-19: council CASE LAW (precedent pre-loading + citation) ====================
+// At convene, the SEALED receipt log is searched for prior verdicts on related questions; the top
+// hits are injected into every seat ballot as PRECEDENT (history — NOT this round's takes, so the
+// blind-first-round invariant is untouched: a seat still never sees another CURRENT seat's vote
+// before casting its own). The verdict then CITES which precedents it followed or departed from, so
+// consistency across decisions is visible and departures are auditable.
+const PRECEDENT_STOPWORDS = new Set(('the a an and or but for nor of to in on at by with from as is are was ' +
+  'were be been being do does did should would could can will shall may might must not no we our us it its ' +
+  'this that these those i you he she they them their there here what which who whom how why when where ' +
+  'if then than so such about into over under out up down off then more most some any all each').split(/\s+/))
+
+// Tokenize a question/brief into a set of significant, lowercased terms (>=3 chars, no stopwords).
+export function precedentTokens(text) {
+  const out = new Set()
+  for (const raw of String(text == null ? '' : text).toLowerCase().split(/[^a-z0-9]+/)) {
+    if (raw.length >= 3 && !PRECEDENT_STOPWORDS.has(raw)) out.add(raw)
+  }
+  return out
+}
+
+// Select the top-k prior decisions relevant to `question` from a candidate pool (each entry:
+// {digest, question, recommendation, brief, stampedAt}). Score = count of DISTINCT query terms
+// that also appear in the candidate's (question + brief); ties break toward the more RECENT
+// decision (lexicographic stampedAt desc, which is chronological for ISO-8601). Score 0 => dropped
+// (never inject an unrelated precedent). Deterministic — no clock, no RNG — so it seals identically
+// in tests. A self-match guard drops any candidate whose digest equals `selfDigest`.
+export function selectPrecedents(question, pool, k = 3, selfDigest = '') {
+  const qt = precedentTokens(question)
+  if (!qt.size || !Array.isArray(pool) || !pool.length) return []
+  const scored = []
+  for (const p of pool) {
+    if (!p || (selfDigest && p.digest === selfDigest)) continue
+    const ct = precedentTokens(`${p.question || ''} ${p.brief || ''}`)
+    let score = 0
+    for (const t of qt) if (ct.has(t)) score++
+    if (score > 0) scored.push({
+      digest: String(p.digest || ''), question: String(p.question || ''),
+      recommendation: String(p.recommendation || ''), brief: String(p.brief || ''),
+      stampedAt: String(p.stampedAt || ''), score,
+    })
+  }
+  scored.sort((a, b) => (b.score - a.score) || (a.stampedAt < b.stampedAt ? 1 : a.stampedAt > b.stampedAt ? -1 : 0))
+  return scored.slice(0, k)
+}
+
+// Given the decided recommendation and the injected precedents, compute the citation: each
+// precedent is either FOLLOWED (same recommendation reached) or DEPARTED (a different call than
+// last time). Deterministic + key-free, so it works on the fleet dispatch path with no chair LLM.
+export function precedentCitations(recommendation, precedents) {
+  return (precedents || []).map(p => ({
+    digest: p.digest, question: p.question, priorRecommendation: p.recommendation,
+    relation: p.recommendation && p.recommendation === recommendation ? 'followed' : 'departed',
+  }))
+}
+
+// One-line human summary of the citation for the verdict brief / receipt display.
+export function precedentCitationBrief(citations) {
+  if (!citations || !citations.length) return ''
+  return 'Precedent: ' + citations.map(c =>
+    `[${(c.digest || '').slice(0, 8) || 'unsealed'}] ${c.relation}${c.priorRecommendation ? ` (was ${c.priorRecommendation})` : ''}`).join('; ')
+}
+
+// The PRECEDENT block injected into a seat ballot (both rounds — it is HISTORY, not a current
+// take). Clearly fenced + labelled so a seat weighs prior case law without it being mistaken for
+// another seat's live vote.
+function precedentBlock(precedents) {
+  if (!precedents || !precedents.length) return ''
+  const items = precedents.map(p =>
+    `- [${(p.digest || '').slice(0, 8) || 'unsealed'}] Q: "${p.question}" -> ${(p.recommendation || 'n/a').toUpperCase()}${p.brief ? ` (${p.brief})` : ''}`).join('\n')
+  return `\nPRECEDENT — prior COUNCIL decisions on related questions (case law; this is HISTORY, not another seat's take this round):
+${items}
+Weigh these. In your rationale, say briefly whether you FOLLOW or DEPART from them and why.`
+}
+
 // Build the per-seat dispatch prompt. BLIND-FIRST-ROUND invariant: round-1 output is a pure
 // function of (seat, question) and NEVER embeds another seat's take/vote, so no seat anchors on
 // another before its own vote is recorded. The rebuttal round (adversarial only, round 2) DOES
-// show the round-1 votes and is recorded separately.
+// show the round-1 votes and is recorded separately. Injected PRECEDENT (ctx.precedents) is
+// history, not a current take, so it does NOT break the blind round.
 export function seatPrompt(seat, ctx = {}) {
   const round = ctx.round || 1
   const q = ctx.question || ''
@@ -1297,17 +1383,18 @@ export function seatPrompt(seat, ctx = {}) {
   const fmt = `Reply with brief reasoning, then END with EXACTLY this line and nothing after it:
 COUNCIL-VOTE: <approve|reject|escalate> :: <one-sentence rationale>
 Escalate ONLY if this genuinely needs a human (money/spend, destructive/irreversible, secrets, or a brand call on a mature product) or the council is hopelessly split.`
+  const prec = precedentBlock(ctx.precedents)
   if (round >= 2 && Array.isArray(ctx.priorVotes) && ctx.priorVotes.length) {
     const prior = ctx.priorVotes.map(v => `- ${v.seat}: ${String(v.vote).toUpperCase()} — ${v.rationale}`).join('\n')
     return `${head}
-${ask}
+${ask}${prec}
 The council's first-round votes:
 ${prior}
 REBUT: find the strongest objection to the leading position, then cast your FINAL vote.
 ${fmt}`
   }
   return `${head}
-${ask}
+${ask}${prec}
 Give your INDEPENDENT vote BEFORE hearing any other seat.
 ${fmt}`
 }
@@ -1472,14 +1559,19 @@ async function runConvene(input, deps, h) {
     thresholdRule: input.thresholdRule || (input.bench && input.bench.thresholdRule),
     seatCount: fullCount,
   }
+  // CNCL-19: search the sealed receipt log for prior decisions on related questions and inject the
+  // top hits into every seat ballot as PRECEDENT (history, so the blind round stays blind to
+  // CURRENT takes). The verdict then cites which precedents it followed or departed from. The
+  // retrieval is deterministic + key-free; the pool is passed in by the CLI (which reads the log).
+  const precedents = selectPrecedents(question, input.precedentPool || [], input.precedentK != null ? input.precedentK : 3)
   let round1Votes, finalVotes, rebuttalVotes = null, verdict
   if (seatVote) {
-    log(verbose, `dispatching ${seats.length} real seats (blind round 1, ${mode})`)
-    round1Votes = await dispatchRound(seats, { question, role, mode, round: 1 }, seatVote)
+    log(verbose, `dispatching ${seats.length} real seats (blind round 1, ${mode})${precedents.length ? `, ${precedents.length} precedent(s)` : ''}`)
+    round1Votes = await dispatchRound(seats, { question, role, mode, round: 1, precedents }, seatVote)
     finalVotes = round1Votes
     if (mode === 'adversarial') {
       log(verbose, `adversarial rebuttal (round 2, recorded separately)`)
-      rebuttalVotes = await dispatchRound(seats, { question, role, mode, round: 2, priorVotes: round1Votes }, seatVote)
+      rebuttalVotes = await dispatchRound(seats, { question, role, mode, round: 2, priorVotes: round1Votes, precedents }, seatVote)
       finalVotes = rebuttalVotes
     }
     const counted = tallyVotes(finalVotes, tallyOpts)
@@ -1489,15 +1581,23 @@ async function runConvene(input, deps, h) {
     // other seat's take), then an adversarial rebuttal that sees the round-1 votes.
     log(verbose, `convening ${seats.length} seats via the modelCall seam (blind round 1, ${mode})`)
     const askSeam = (s, ctx) => modelCall(seatPrompt(s, ctx), VOTE).then(v => ({ seat: v.seat || s.id, vote: v.vote, rationale: v.rationale }))
-    round1Votes = await Promise.all(seats.map(s => askSeam(s, { question, round: 1 })))
+    round1Votes = await Promise.all(seats.map(s => askSeam(s, { question, round: 1, precedents })))
     finalVotes = round1Votes
     if (mode === 'adversarial') {
-      rebuttalVotes = await Promise.all(seats.map(s => askSeam(s, { question, round: 2, priorVotes: round1Votes })))
+      rebuttalVotes = await Promise.all(seats.map(s => askSeam(s, { question, round: 2, priorVotes: round1Votes, precedents })))
       finalVotes = rebuttalVotes
     }
     const counted = tallyVotes(finalVotes, tallyOpts)
     const narr = await chairNarrative(modelCall, question, finalVotes)
     verdict = buildConveneVerdict(counted, narr)
+  }
+  // CNCL-19: attach the deterministic precedent citation to the verdict (followed vs departed) so
+  // it surfaces on the receipt/dashboard. Additive on the verdict; sealed via a CONDITIONAL
+  // canonical line (present only when precedents were cited — a no-precedent convene stays
+  // byte-identical to the pre-CNCL-19 seal).
+  if (precedents.length) {
+    verdict.precedents = precedentCitations(verdict.recommendation, precedents)
+    verdict.precedentCitation = precedentCitationBrief(verdict.precedents)
   }
   // CNCL-9: convene only ever OFFERS the veto (non-blocking); the flip happens later, and only
   // via an authenticated tap on the tier-2 rail (exerciseFounderVeto). No string ever flips here.
@@ -1998,6 +2098,20 @@ async function cmdConvene() {
     const rc = flag('recuse'); if (rc && rc !== true) input.recuse = String(rc).split(',').map(s => s.trim()).filter(Boolean)
     delete input.decisionClass   // the motion class wins; never a caller string
   }
+  // CNCL-19: precedent (case-law) pool. The bash layer reads the SEALED receipt log, projects each
+  // past verdict to {digest,question,recommendation,brief,stampedAt}, and hands it in via
+  // --precedent-pool=<path|-> (JSON array; `-` = stdin). The engine deterministically selects the
+  // top-k relevant precedents, injects them as HISTORY into every seat ballot (blind round stays
+  // blind to CURRENT takes), and seals the followed/departed citation inside the receipt bytes.
+  const pp = flag('precedent-pool')
+  if (pp && pp !== true) {
+    try {
+      const raw = pp === '-' ? fs.readFileSync(0, 'utf8') : fs.readFileSync(String(pp), 'utf8')
+      const arr = JSON.parse(raw)
+      if (Array.isArray(arr)) input.precedentPool = arr
+    } catch (e) { process.stderr.write(`council: ignoring unreadable --precedent-pool (${String(e && e.message || e)})\n`) }
+  }
+  const pk = flag('precedent-k'); if (pk != null && pk !== true) input.precedentK = Number(pk)
   // CNCL-9 FORGE REFUSAL: a veto can NEVER be asserted from a plain CLI string. Pre-CNCL-9,
   // `--veto-by=<who>` flipped the verdict inline, so any agent could forge lodar's veto into a
   // signed receipt. convene now REFUSES it outright (bash logs the attempt). convene only ever
@@ -2036,6 +2150,11 @@ async function cmdConvene() {
     round1Votes: result.round1Votes ? result.round1Votes.map(v => ({ seat: v.seat, vote: v.vote, rationale: v.rationale })) : undefined,
     rebuttalVotes: result.rebuttalVotes ? result.rebuttalVotes.map(v => ({ seat: v.seat, vote: v.vote, rationale: v.rationale })) : undefined,
     constitution: { source: constitution.source, valid: constitution.valid, path: constitution.path },
+    // CNCL-19: the case-law citation (which prior decisions this verdict followed vs departed
+    // from) rides on the verdict and is sealed inside the receipt bytes; surface it for the
+    // dashboard/log. Absent (undefined) when no precedent was found — output stays back-compatible.
+    precedents: result.verdict && result.verdict.precedents ? result.verdict.precedents : undefined,
+    precedentCitation: result.verdict && result.verdict.precedentCitation ? result.verdict.precedentCitation : undefined,
     receipt: result.receipt,   // { canonical, seal, verify } — bash seals canonical
   })
 }
@@ -3396,8 +3515,29 @@ cmd_council() {
   local drift_flag=""
   _council_constitution_drift "$dir" >/dev/null 2>&1 || drift_flag="--constitution-drift=1"
 
+  # CNCL-19: build the case-law precedent pool from the SEALED convene receipt log and hand it to
+  # the engine. The engine deterministically selects the top-k relevant priors, injects them as
+  # HISTORY into the blind ballots (never another CURRENT seat's take), and seals the followed/
+  # departed citation into this receipt. Pure read-only projection of already-sealed receipts; a
+  # missing/empty log yields no pool (no-op, byte-identical to pre-CNCL-19).
+  local -a precedent_args=(); local _pp_tmp=""
+  if compgen -G "${COUNCIL_RECEIPTS}/*.json" >/dev/null 2>&1; then
+    _pp_tmp="${COUNCIL_DIR}/.precedent-pool.$$.json"
+    if jq -s '[.[] | select((.verdict.recommendation // "") != "")
+                | {digest:(.sealedDigest // ""), question:(.question // ""),
+                   recommendation:(.verdict.recommendation // ""),
+                   brief:(.verdict.brief // .verdict.dissent // ""), stampedAt:(.stampedAt // "")}]' \
+         "${COUNCIL_RECEIPTS}"/*.json > "$_pp_tmp" 2>/dev/null; then
+      precedent_args=(--precedent-pool="$_pp_tmp")
+    else
+      rm -f "$_pp_tmp" 2>/dev/null || true; _pp_tmp=""
+    fi
+  fi
+
   local raw
-  raw="$(node "$dir/cli.mjs" convene "$@" "${veto_args[@]}" ${drift_flag} --constitution-path="$(_council_constitution_path)" --registry="$COUNCIL_REGISTRY" --genesis-exists="$genesis_exists" --stamped-at="$stamped")" || return $?
+  raw="$(node "$dir/cli.mjs" convene "$@" "${veto_args[@]}" "${precedent_args[@]}" ${drift_flag} --constitution-path="$(_council_constitution_path)" --registry="$COUNCIL_REGISTRY" --genesis-exists="$genesis_exists" --stamped-at="$stamped")"; local _rc=$?
+  [[ -n "$_pp_tmp" ]] && rm -f "$_pp_tmp" 2>/dev/null || true
+  (( _rc == 0 )) || return $_rc
 
   # Seal the receipt canonical at the root HMAC rail — a standalone engine has no
   # key, so the seal (via gate-proof) is what makes the verdict tamper-evident. The

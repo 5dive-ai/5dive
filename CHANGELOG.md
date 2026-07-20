@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.11.24 — Council case law: convene pre-loads relevant past receipts, verdicts cite the precedents they follow or depart from (CNCL-19) (2026-07-20)
+
+- feat(council): at `council convene`, the bash layer projects the SEALED convene receipt log into a precedent pool and hands it to the engine, which deterministically selects the top-k prior decisions relevant to the question (keyword overlap over question+brief; ties break toward the more recent), injects them into every seat ballot as fenced PRECEDENT (case law — HISTORY, clearly separated so the blind first round stays blind to CURRENT-round takes, never another seat's live vote), and requires the verdict to CITE which precedents it followed vs departed from.
+- feat(council): the followed/departed citation rides on the verdict (`precedents` + `precedentCitation`) and is sealed INSIDE the receipt via a CONDITIONAL `precedent:` canonical line (digest-sorted) — so a citation cannot be quietly rewritten, and a no-precedent convene (plus every pre-CNCL-19 receipt) seals byte-identically. Retrieval is key-free + clock-free (works on the fleet dispatch path with no chair LLM).
+- test(council): +new engine unit coverage (retrieval scoring/tie-break/self-guard, followed-vs-departed citation, blind-round invariant with precedent injected, conditional seal line back-compat); on-box mock e2e confirms a second related convene cites the first and seals the citation. Depends on the CNCL-11 receipt hash-chain + log.
+
 ## 0.11.23 — Fail-closed fixture-send guard: a task DB that is not prod can never DM a paired human (DIVE-1506) (2026-07-20)
 
 - fix(task): a gate alert (`task need` → `task_need_notify`) or an `/inbox --send` digest now reaches the paired human ONLY from the canonical prod task DB. New fail-closed chokepoint in `_task_send_owner` (+ a clear refusal on `task inbox --send`) keyed to a POSITIVE prod-DB allowlist (`FIVEDIVE_PROD_TASKS_DB`, default `/var/lib/5dive/tasks/tasks.db`), not a fixture blocklist — a rotted blocklist is exactly how the DIVE-1500 guard missed these two legs and let `council_gate_e2e`'s `task need` DM fixture gates (dive1-4) to the paired human. Explicit `COUNCIL_MOCK`/`FIVEDIVE_NO_HUMAN_SEND`/`FIVEDIVE_E2E`/`FIVEDIVE_TEST` also force-refuse (belt-and-suspenders for harnesses that don't repoint `TASKS_DB`).
