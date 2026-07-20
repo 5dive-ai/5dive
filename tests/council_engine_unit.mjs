@@ -15,6 +15,7 @@ import {
   buildMotionRecord, canonicalMotion, chainEntryOf, verifyLineageChain,
   digestConstitution, constitutionDriftCheck, renderConstitutionV0,
   buildGenesisRecord, canonicalGenesis, normalizeConstitution, parseConstitutionFrontmatter,
+  precedentTokens, selectPrecedents, precedentCitations, precedentCitationBrief, seatPrompt,
 } from '../src/council/engine.mjs'
 
 let pass = 0, fail = 0
@@ -338,5 +339,40 @@ const amendRec = buildMotionRecord({ motion: { kind: 'amend' }, verdict: okVerdi
 ok(classifyMotion({ kind: 'amend' }) === 'constitutional', 'CNCL-15: an amend motion classifies constitutional (hardest bar)')
 ok(amendRec.constitutionDigest === 'BEEF' && canonicalMotion(amendRec).includes('constitution: BEEF'), 'CNCL-15: an amend motion seals the new digest into its canonical bytes')
 
-console.log(`\nCNCL-6/11/15 engine: ${pass} passed, ${fail} failed (bound to src/council/engine.mjs)`)
+// ---- CNCL-19: council case law — precedent retrieval, citation, blind-round invariant ----------
+// Retrieval is deterministic keyword overlap: score = distinct query terms present in a candidate's
+// (question+brief); score 0 is dropped; ties break toward the more RECENT decision.
+ok(precedentTokens('Should we SHIP the new pricing page?').has('pricing') &&
+   !precedentTokens('Should we ship it').has('the'), 'CNCL-19: precedentTokens keeps significant terms, drops stopwords')
+const POOL = [
+  { digest: 'd_pricing', question: 'Should we ship the pricing page redesign?', recommendation: 'approve', brief: 'shipped', stampedAt: '2026-07-10T00:00:00Z' },
+  { digest: 'd_pricing2', question: 'Revisit the pricing page rollout?', recommendation: 'reject', brief: 'held pricing', stampedAt: '2026-07-18T00:00:00Z' },
+  { digest: 'd_unrelated', question: 'Hire a second security auditor?', recommendation: 'approve', brief: 'headcount', stampedAt: '2026-07-19T00:00:00Z' },
+]
+const picks = selectPrecedents('Should we finalize the pricing page pricing changes?', POOL, 3)
+ok(picks.length === 2 && picks.every(p => p.digest.startsWith('d_pricing')), 'CNCL-19: selectPrecedents keeps only score>0 (drops the unrelated decision)')
+ok(picks[0].digest === 'd_pricing2', 'CNCL-19: equal-score ties break toward the MORE RECENT precedent')
+ok(selectPrecedents('anything', POOL, 3, 'd_pricing2').every(p => p.digest !== 'd_pricing2'), 'CNCL-19: selfDigest guard drops the current convene from its own pool')
+ok(selectPrecedents('', POOL, 3).length === 0 && selectPrecedents('x', [], 3).length === 0, 'CNCL-19: empty question or empty pool → no precedent (never inject noise)')
+ok(selectPrecedents('pricing', POOL, 1).length === 1, 'CNCL-19: k caps the number of injected precedents')
+// citation: followed when the same recommendation is reached, departed otherwise. Deterministic + key-free.
+const cites = precedentCitations('approve', [{ digest: 'd1', recommendation: 'approve' }, { digest: 'd2', recommendation: 'reject' }])
+ok(cites[0].relation === 'followed' && cites[1].relation === 'departed', 'CNCL-19: precedentCitations labels followed vs departed by recommendation match')
+ok(precedentCitationBrief(cites).includes('followed') && precedentCitationBrief([]) === '', 'CNCL-19: precedentCitationBrief summarizes (empty for no citation)')
+// BLIND-ROUND INVARIANT: round-1 ballot injects precedent as HISTORY but is still a pure function of
+// (seat, question) w.r.t. OTHER SEATS — it must not embed any current-round vote.
+const seat = { id: 'a' }
+const r1WithPrec = seatPrompt(seat, { question: 'ship it?', round: 1, precedents: picks })
+ok(r1WithPrec.includes('PRECEDENT') && r1WithPrec.includes('HISTORY'), 'CNCL-19: round-1 ballot carries a fenced PRECEDENT/HISTORY block')
+ok(!/COUNCIL-VOTE: (approve|reject|escalate) ::/.test(r1WithPrec.replace(/COUNCIL-VOTE: <[^>]*>[^\n]*/g, '')), 'CNCL-19: round-1 ballot embeds NO other seat\'s cast vote (blind round intact)')
+const r1NoPrec = seatPrompt(seat, { question: 'ship it?', round: 1 })
+ok(!r1NoPrec.includes('PRECEDENT'), 'CNCL-19: a convene with no precedent injects no block (byte-identical to pre-CNCL-19)')
+// SEAL: cited precedents ride INSIDE canonicalTranscript (conditional line), and a no-precedent
+// receipt seals byte-identically to before.
+const baseRec = { council: 'c', mode: 'deliberate', stampedAt: 's', question: 'q', seats: ['a'], votes: [{ seat: 'a', vote: 'approve', rationale: 'y' }], verdict: { recommendation: 'approve', confidence: 1, tally: T(1, 0, 0), dissent: '' } }
+const precRec = { ...baseRec, verdict: { ...baseRec.verdict, precedents: [{ digest: 'zz', relation: 'departed' }, { digest: 'aa', relation: 'followed' }] } }
+ok(!canonicalTranscript(baseRec).includes('precedent:'), 'CNCL-19: a no-precedent receipt seals with no precedent line (back-compat)')
+ok(canonicalTranscript(precRec).includes('precedent: aa:followed,zz:departed'), 'CNCL-19: cited precedents are sealed (digest-sorted) inside the signed bytes')
+
+console.log(`\nCNCL-6/11/15/19 engine: ${pass} passed, ${fail} failed (bound to src/council/engine.mjs)`)
 process.exit(fail ? 1 : 0)
