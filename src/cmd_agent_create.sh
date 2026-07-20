@@ -1085,6 +1085,16 @@ cmd_create() {
     opencode_apply_model_default "$name" "$byo_provider" "$byo_model" "$byo_api_key"
   fi
 
+  # DIVE-1535: give every new codex agent a return channel by default. A headless
+  # codex worker (channels=none) prints its deliverable only to its own pane and
+  # can't be polled, so seed the DIVE-1410 push-back convention into its standing
+  # instructions. Non-destructive (skips an existing curated AGENTS.md) so it's
+  # safe to run unconditionally for the type, independent of channel selection.
+  if [[ "$type" == "codex" ]]; then
+    step "Seeding a2a return-channel convention for agent-${name} (DIVE-1535)"
+    preseed_codex_return_channel "$name" || true
+  fi
+
   # DIVE-990: memory-as-onboarding. Seed the new agent's recall store from
   # shared team knowledge so it boots knowing the company. Runs after the user
   # exists (create_agent_user above) and before channels come up, so the store

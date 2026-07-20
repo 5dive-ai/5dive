@@ -1121,6 +1121,63 @@ preseed_antigravity_agent() {
   install_default_skill_for_agent "$name" antigravity "$(gh_org)/skills" openagent || true
 }
 
+# DIVE-1535: seed the a2a return-channel convention into a new codex agent's
+# standing instructions (~/.codex/AGENTS.md — codex's global personal guidance).
+# A headless codex worker prints its output only to its own tmux pane; `agent
+# send` is one-way and `agent ask` can't reliably capture a codex TUI (DIVE-1410),
+# so codex agents must PUSH results back to whoever briefed them. DIVE-1410 proved
+# this convention end-to-end but only ever wrote it into andy's file by hand — so
+# every OTHER codex worker booted with no return channel. This makes it the
+# default. Idempotent + non-destructive: if an AGENTS.md already exists (a curated
+# andy-style file), we leave it untouched so a human edit is never clobbered.
+# Pure: emit the standing-instructions AGENTS.md body for a codex agent to stdout.
+# Kept separate from the filesystem/ownership plumbing so the content (and the
+# agent-name interpolation) is unit-testable without touching sudo or a real user.
+_codex_return_channel_doc() {
+  local name="$1"
+  cat <<AGENTS_MD
+# ${name} — standing instructions
+
+## Reporting results back to whoever asked (a2a return channel)
+
+You (${name}) may have no channel of your own, so anything printed to your own
+terminal is invisible to the agent who briefed you. You must push your result
+back to them yourself.
+
+Whenever you finish work that arrived as an inbound \`[5dive-msg from=<agent>
+id=<id>] ...\` message, run — once, when the deliverable is actually ready:
+
+    5dive agent send <from> "<one-line result + absolute file path(s)>"
+
+- \`<from>\` is the sender from the inbound message header (e.g. marketing).
+- One line, plain text, NO backticks (backticks break the send injector).
+- Send it when the file is written / the job is done — not mid-render. Long jobs
+  are fine; the requester is not watching your terminal and is not polling you.
+
+Why this is the rule (DIVE-1410): \`5dive agent send\` is one-way (delivers input,
+does not return a reply) and \`5dive agent ask\` cannot reliably capture a codex
+TUI's output, so codex agents PUSH their results back rather than being polled.
+This makes the return channel automatic and independent of what any single brief
+happens to remember to append.
+AGENTS_MD
+}
+
+preseed_codex_return_channel() {
+  local name="$1"
+  local user="agent-${name}" home="/home/agent-${name}"
+  [[ -d "$home" ]] || return 0
+  id -u "$user" &>/dev/null || return 0
+  local dir="$home/.codex" file="$home/.codex/AGENTS.md"
+  # Don't overwrite an existing standing-instructions file (a curated andy-style
+  # AGENTS.md must survive) — DIVE-1535 seeds a default, it never clobbers.
+  if sudo -u "$user" test -e "$file"; then
+    return 0
+  fi
+  install -d -m 700 -o "$user" -g "$user" "$dir" 2>/dev/null || return 0
+  install -m 600 -o "$user" -g "$user" /dev/null "$file" 2>/dev/null || return 0
+  _codex_return_channel_doc "$name" | sudo -u "$user" tee "$file" >/dev/null
+}
+
 # Types that `npx skills add --agent <id>` doesn't recognize. The upstream
 # vercel-labs/skills CLI gates --agent against a hardcoded registry; passing
 # an unknown id fails with "Invalid agents: <id>" (verified for grok 0.x).
@@ -8161,6 +8218,16 @@ cmd_create() {
     # OpenRouter-backed agent boot straight onto DeepSeek/GLM/Kimi/Qwen rather
     # than falling through to an unrelated last-used/default model. DIVE-1206.
     opencode_apply_model_default "$name" "$byo_provider" "$byo_model" "$byo_api_key"
+  fi
+
+  # DIVE-1535: give every new codex agent a return channel by default. A headless
+  # codex worker (channels=none) prints its deliverable only to its own pane and
+  # can't be polled, so seed the DIVE-1410 push-back convention into its standing
+  # instructions. Non-destructive (skips an existing curated AGENTS.md) so it's
+  # safe to run unconditionally for the type, independent of channel selection.
+  if [[ "$type" == "codex" ]]; then
+    step "Seeding a2a return-channel convention for agent-${name} (DIVE-1535)"
+    preseed_codex_return_channel "$name" || true
   fi
 
   # DIVE-990: memory-as-onboarding. Seed the new agent's recall store from
