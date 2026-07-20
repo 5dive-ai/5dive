@@ -227,12 +227,38 @@ out=$(authoritative_gate_check DIVE-924); rc=$?
   && ok_t "gate predicate: auto-clear -> refuse" \
   || bad_t "gate predicate: auto-clear -> refuse" "rc=$rc :: $out"
 
+# DIVE-1555: a signed lead clear whose CURRENT routed_reviewer no longer equals
+# the clearer STILL passes. `lead:other` is stamped only when `agent-other` was the
+# routed reviewer AT CLEAR TIME (and the closure is signed over it), so the routing
+# being re-pointed to `main` afterwards must not strand the already-authorized push.
+# (Pre-1555 this refused because the guard pinned to the CURRENT routed_reviewer.)
 seed_task DIVE-925 "Branch: feature-ok" approval "2026-07-18 00:00:00" \
   "yes" "lead:other" "main"
 out=$(authoritative_gate_check DIVE-925); rc=$?
+[[ $rc -eq 0 ]] \
+  && ok_t "gate predicate: lead-clear + routing changed after clear -> pass (DIVE-1555)" \
+  || bad_t "gate predicate: lead-clear + routing changed after clear -> pass (DIVE-1555)" "rc=$rc :: $out"
+
+# DIVE-1555 (Marcus repro): a correctly lead-cleared push whose routed_reviewer is
+# now EMPTY (e.g. the DIVE-1437 T2-escalation NULLs it) is authorized on the signed
+# `lead:*` provenance alone — the exact `unauthorized provenance main`/empty-reviewer
+# failure this task fixes.
+seed_task DIVE-1555A "Branch: feature-ok" approval "2026-07-18 00:00:00" \
+  "yes" "lead:main" ""
+out=$(authoritative_gate_check DIVE-1555A); rc=$?
+[[ $rc -eq 0 ]] \
+  && ok_t "gate predicate: lead-clear with empty routed_reviewer -> pass (DIVE-1555)" \
+  || bad_t "gate predicate: lead-clear with empty routed_reviewer -> pass (DIVE-1555)" "rc=$rc :: $out"
+
+# DIVE-1555 (negative): a BARE agent provenance ('main', no `lead:` prefix) — what a
+# self-answered `decision` clear produces — is STILL refused even signed. The fix is
+# to file the push gate as a lead-ROUTED approval (Part 1), not to accept bare-agent.
+seed_task DIVE-1555B "Branch: feature-ok" decision "2026-07-18 00:00:00" \
+  "yes" "main" ""
+out=$(authoritative_gate_check DIVE-1555B); rc=$?
 { [[ $rc -ne 0 ]] && grep -qi "unauthorized provenance" <<<"$out"; } \
-  && ok_t "gate predicate: wrong reviewer -> refuse" \
-  || bad_t "gate predicate: wrong reviewer -> refuse" "rc=$rc :: $out"
+  && ok_t "gate predicate: bare-agent (decision-clear 'main') -> still refuse (DIVE-1555)" \
+  || bad_t "gate predicate: bare-agent (decision-clear 'main') -> still refuse (DIVE-1555)" "rc=$rc :: $out"
 
 seed_task DIVE-926 "Branch: feature-ok" approval "2026-07-18 00:00:00" \
   "yes" "human:test" "" 0

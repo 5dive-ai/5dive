@@ -150,6 +150,33 @@ seed DIVE-33; HUMAN_PINGED=0; route_reset
 cmd_task_need DIVE-33 --type=approval --tier=2 --ask="approve the prod push?" --from=main >/dev/null 2>&1
 [[ "$HUMAN_PINGED" == "1" && "$(db "SELECT tier FROM tasks WHERE ident='DIVE-33';")" == "2" ]] && ok_t "DIVE-1359: a lead's own eng-ship --tier=2 stays hard-human" || bad_t "lead eng-ship not downgraded" "human=$HUMAN_PINGED tier='$(db "SELECT tier FROM tasks WHERE ident='DIVE-33';")'"
 
+# --- DIVE-1555: a delegated PUSH-FOR-REVIEW (5dive push / DIVE-1376) is eng-ship. A
+# feature-branch push-for-review is NOT a `push to main`, so it used to miss the
+# classifier and file as a tier-2 human-only approval that landed in the human's DM.
+# It must now downgrade to a lead-routed tier-1 the org lead can clear. pref stays
+# OFF (set above) to prove the routing is intrinsic to the kind, not the pref.
+for _c in \
+  "DIVE-34|approve delegated push for review of branch dive-1555-x" \
+  "DIVE-35|push branch dive-1555-x for review (PR, no merge)" \
+  "DIVE-36|clear this so 5dive push can run"; do
+  _id="${_c%%|*}"; _ask="${_c#*|}"
+  seed "$_id"; HUMAN_PINGED=0; route_reset
+  cmd_task_need "$_id" --type=approval --ask="$_ask" --from=dev >/dev/null 2>&1
+  [[ "$HUMAN_PINGED" == "0" \
+     && "$(db "SELECT tier FROM tasks WHERE ident='$_id';")" == "1" \
+     && "$(db "SELECT COALESCE(routed_reviewer,'') FROM tasks WHERE ident='$_id';")" == "main" ]] \
+    && ok_t "DIVE-1555: push-for-review ask ('$_ask') → lead-routed tier-1 (not human DM)" \
+    || bad_t "DIVE-1555: push-for-review → lead-routed tier-1" "ask='$_ask' human=$HUMAN_PINGED tier='$(db "SELECT tier FROM tasks WHERE ident='$_id';")' reviewer='$(db "SELECT COALESCE(routed_reviewer,'') FROM tasks WHERE ident='$_id';")'"
+done
+
+# DIVE-1555: the true-human floor still wins — a push-for-review that ALSO names
+# money stays a tier-2 human call (not lead-routed).
+seed DIVE-37; HUMAN_PINGED=0; route_reset
+cmd_task_need DIVE-37 --type=approval --ask="approve delegated push for review AND the \$500 vercel invoice?" --from=dev >/dev/null 2>&1
+[[ "$HUMAN_PINGED" == "1" && "$(db "SELECT tier FROM tasks WHERE ident='DIVE-37';")" == "2" ]] \
+  && ok_t "DIVE-1555: money floor beats push-for-review (stays tier-2 human)" \
+  || bad_t "DIVE-1555: money floor beats push-for-review" "human=$HUMAN_PINGED tier='$(db "SELECT tier FROM tasks WHERE ident='DIVE-37';")'"
+
 # --- DIVE-1381: content-curation class — a persona/pack QUEUE-READINESS approval --
 # on our early-stage content surfaces is lead-clearable, NOT a human call. The T2
 # floor matches 'publish' and would force it hard-human (the DIVE-1366 wall); the
