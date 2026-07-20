@@ -1,6 +1,10 @@
 # Changelog
 
-## 0.11.22 — Constitution amendments: amend-only-via-motion, sealed digest, verify fails closed on drift (CNCL-15) (2026-07-20)
+## 0.11.23 — Fail-closed fixture-send guard: a task DB that is not prod can never DM a paired human (DIVE-1506) (2026-07-20)
+
+- fix(task): a gate alert (`task need` → `task_need_notify`) or an `/inbox --send` digest now reaches the paired human ONLY from the canonical prod task DB. New fail-closed chokepoint in `_task_send_owner` (+ a clear refusal on `task inbox --send`) keyed to a POSITIVE prod-DB allowlist (`FIVEDIVE_PROD_TASKS_DB`, default `/var/lib/5dive/tasks/tasks.db`), not a fixture blocklist — a rotted blocklist is exactly how the DIVE-1500 guard missed these two legs and let `council_gate_e2e`'s `task need` DM fixture gates (dive1-4) to the paired human. Explicit `COUNCIL_MOCK`/`FIVEDIVE_NO_HUMAN_SEND`/`FIVEDIVE_E2E`/`FIVEDIVE_TEST` also force-refuse (belt-and-suspenders for harnesses that don't repoint `TASKS_DB`).
+- test(task): new `task_fixture_send_guard_unit.sh` proves a fixture DB cannot reach a paired human on either leg AND that the prod DB still sends (CI globs `tests/*.sh`). Send-exercising harnesses now declare their isolated DB as prod via `FIVEDIVE_PROD_TASKS_DB`.
+- Follow-up (separate plugin PATCH lane): startup age-gate + dead-letter quarantine for stale `relay-in` files, so a pre-restart backlog is never replayed (defense-in-depth; the fixture→human leak class is already closed here).
 
 - feat(council): `5dive council amend --file=<new 5dive.md>` rewrites the constitution ONLY via a constitutional-class motion (2/3 + full quorum + founder veto). On a pass the new constitution's digest is hash-chained into the lineage and the on-disk `5dive.md` is swapped; a non-pass leaves it untouched. An invalid proposed constitution is refused before any convene (CNCL-15).
 - feat(council): `council init` now seeds a v0 `5dive.md` (the human-readable projection of the built-in defaults) and seals its digest into the genesis record — the drift baseline.

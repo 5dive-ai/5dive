@@ -2486,6 +2486,25 @@ _task_gate_delivery_log() { # <ok|error> <task_ids> <chat> <message_id> <detail>
   [[ "$result" == "ok" ]] || warn "$idents: gate alert delivery FAILED for chat ${chat:-none} (${detail:-unknown}); trying a visible group fallback"
 }
 
+# DIVE-1506 — fail-closed guard: a gate alert (task_need_notify) or an /inbox digest
+# (_task_inbox_send) may reach the PAIRED HUMAN only from the canonical PROD task DB. This is a
+# POSITIVE ALLOWLIST, not a fixture blocklist — a rotted blocklist is exactly how DIVE-1500's guard
+# missed the gate-notify + /inbox legs and let an isolated e2e's `task need` DM real fixture gates
+# (dive1-4) to lodar. Every human-facing send now refuses unless the active TASKS_DB resolves to the
+# prod path (operator-overridable via FIVEDIVE_PROD_TASKS_DB); an explicit test/e2e opt-out also
+# refuses (belt-and-suspenders for a harness that forgets to repoint TASKS_DB). Returns 0=allow,1=refuse.
+_task_prod_tasks_db() { printf '%s' "${FIVEDIVE_PROD_TASKS_DB:-/var/lib/5dive/tasks/tasks.db}"; }
+_task_human_send_allowed() {
+  # Explicit test/e2e markers force refuse regardless of path (covers COUNCIL_MOCK e2es etc.).
+  [[ -n "${FIVEDIVE_NO_HUMAN_SEND:-}" || -n "${COUNCIL_MOCK:-}" || -n "${FIVEDIVE_E2E:-}" || -n "${FIVEDIVE_TEST:-}" ]] && return 1
+  local active prod ra rp
+  active="${TASKS_DB:-${STATE_DIR:-/var/lib/5dive}/tasks/tasks.db}"
+  prod="$(_task_prod_tasks_db)"
+  ra="$(readlink -f "$active" 2>/dev/null || printf '%s' "$active")"
+  rp="$(readlink -f "$prod" 2>/dev/null || printf '%s' "$prod")"
+  [[ -n "$ra" && "$ra" == "$rp" ]]
+}
+
 TASK_SEND_DELIVERED=0
 TASK_SEND_MESSAGE_IDS=""
 TASK_SEND_FAILED=0
@@ -2546,6 +2565,16 @@ _task_send_owner() {
   local text="$1" reply_markup="${2:-}" task_ids="${3:-}"
   local token="$TASK_CH_TOKEN" access_file="$TASK_CH_ACCESS"
   TASK_SEND_DELIVERED=0 TASK_SEND_MESSAGE_IDS="" TASK_SEND_FAILED=0
+  # DIVE-1506: fail-closed chokepoint. EVERY real human-facing task send (gate-notify + /inbox
+  # digest) funnels here. Refuse unless the active task DB is the prod DB — an isolated e2e/fixture
+  # DB (council_gate_e2e's `task need`, a replayed fixture digest) must never reach a paired human.
+  # Leaves DELIVERED=0/FAILED=1 so callers' existing not-delivered fail-closed handling takes over.
+  # Stub-based unit tests override _task_send_owner, so this never fires under a mocked send.
+  if ! _task_human_send_allowed; then
+    TASK_SEND_FAILED=1
+    warn "DIVE-1506: refused a human task-send — active task DB (${TASKS_DB:-${STATE_DIR:-/var/lib/5dive}/tasks/tasks.db}) is not the prod DB (fail-closed; set FIVEDIVE_PROD_TASKS_DB if this IS prod)"
+    return 0
+  fi
 
   local ptr_file="${access_file%/*}/last-human-chat.json"
   if [[ -r "$ptr_file" ]]; then
@@ -2894,6 +2923,11 @@ cmd_task_inbox() {
 _task_inbox_send() {
   local channel_proof="$1" where="$2" order="$3"
   require_root "task inbox --send"
+  # DIVE-1506: fail closed — an /inbox digest may reach the paired human ONLY from the prod DB.
+  # A fixture/e2e DB (isolated TASKS_DB) must never DM real gates; refuse loudly, don't send.
+  # (The send itself is also guarded in _task_send_owner; this gives the command a clear message.)
+  _task_human_send_allowed \
+    || fail "$E_VALIDATION" "refused: /inbox --send blocked — the active task DB is not the prod DB (DIVE-1506 fail-closed fixture guard). Set FIVEDIVE_PROD_TASKS_DB if this IS prod."
   # When the plugin relays a human /inbox request it passes the requester's
   # chat_id; verify it against access.json allowFrom before sending. Absent
   # proof = an operator/root invocation on the box.
