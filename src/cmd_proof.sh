@@ -145,6 +145,18 @@ row = {
 }
 hist.append(row)
 
+# DIVE-1552: derive the rolling 7-day window from the append-only daily
+# datapoints (which survive a board wipe), NOT the live-board WEEK_JSON set
+# above. After the 2026-07-19 board wipe the live board lost pre-wipe history,
+# so its 7d query under-counted (badge read 51/7 vs the true ~343/53). Daily
+# datapoints are non-overlapping 24h counts (same basis as `cum`), so summing
+# the last 7 is the true rolling week — and immune to future wipes.
+_last7 = hist[-7:]
+row["week"] = {
+    "shipped": sum(h["day"]["shipped"] for h in _last7),
+    "humanAsks": sum(h["day"]["humanAsks"] for h in _last7),
+}
+
 # Cumulative totals sum the non-overlapping 24h datapoints, never the rolling
 # 7d windows (those overlap and would double-count).
 cum = {
