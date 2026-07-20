@@ -17,6 +17,7 @@ import * as E from './engine.mjs'
 import fs from 'node:fs'
 import { execFileSync } from 'node:child_process'
 import { pathToFileURL } from 'node:url'
+import { randomBytes, createHash } from 'node:crypto'
 
 const argv = process.argv.slice(2)
 const sub = argv[0] || ''
@@ -130,14 +131,84 @@ export function dispatchBallotVote(opts = {}) {
   const exec = opts._exec || ((args) => execFileSync(bin, args,
     { encoding: 'utf-8', timeout: 60000, maxBuffer: 16 * 1024 * 1024 }))
   const clip = (e) => String(e && e.message || e).replace(/\s+/g, ' ').slice(0, 140)
+  const emitBallot = opts._emitBallot || defaultEmitBallot()
+  // (d) COLLECT (shared by the agent + human branches): poll task show until the ballot task closes
+  // with a result, or the deadline elapses. The collection-loop deadline is AUTHORITATIVE regardless
+  // of any stamp in the task body. A human tap and an agent heartbeat close the task identically, so
+  // this loop is byte-identical for both — no new collection/quorum/abstain path (DIVE-1564).
+  const collect = async (seat, taskId, deadlineAt, deadlineIso, kind) => {
+    while (now() < deadlineAt) {
+      let row = null
+      try {
+        const env = JSON.parse(exec(['task', 'show', String(taskId), '--json']))
+        row = env && env.data && env.data.task
+      } catch { row = null }
+      if (row && (row.status === 'done' || row.status === 'cancelled')) {
+        const result = row.result || ''
+        return E.parseVote(result) ||
+          { vote: 'abstain', rationale: `${seat.id} ${kind} ${taskId}: closed with no COUNCIL-VOTE line (deadline/no-vote)` }
+      }
+      await sleep(pollSecs * 1000)
+    }
+    return { vote: 'abstain', rationale: `${seat.id} ${kind} ${taskId}: no vote by deadline ${deadlineIso} (deadline/no-vote)` }
+  }
   return async (seat, ctx) => {
     const prompt = E.seatPrompt(seat, ctx)   // blind in round 1 (engine-guaranteed)
+    const deadlineAt = now() + deadlineSecs * 1000
+    const deadlineIso = new Date(deadlineAt).toISOString()
+    const question80 = String(ctx.question || '').replace(/\s+/g, ' ').slice(0, 80)
+    // ---- DIVE-1564: HUMAN-AS-SEAT branch. A human seat holds no registry agent to `agent ask`; it
+    // votes by TAPPING a Telegram ballot. We still mint the SAME deadline-stamped ballot task (so the
+    // shared collect loop above is byte-identical for human + agent seats) and ALSO emit a Telegram
+    // ballot to the seat's resolved chat: the BLIND body, a shown deadline, and three inline buttons
+    // whose callback_data carries a one-time DIVE-916 nonce (never printed inline; 64B cap ->
+    // prefix-accept per DIVE-1546). A human tap closes the ballot task with a COUNCIL-VOTE line via the
+    // DIVE-1565 bridge; a no-tap by the deadline is the CNCL-18 miss==abstain path, unchanged.
+    if (E.seatIsHuman(seat)) {
+      const chat = E.resolveSeatChat(seat)
+      // Fail CLOSED on an unbound human seat: never deliver to nowhere, never silently drop the ballot.
+      if (!chat) return { vote: 'abstain', rationale: `${seat.id} human ballot: seat has no bound chat/principal — fail-closed, ballot NOT delivered (deadline/no-vote)` }
+      // One-time DIVE-916 nonce: the RAW token rides ONLY in the buttons' callback_data. The task body
+      // records only its sha256 DIGEST, so a reader of the ballot task can never forge/replay the tap.
+      const nonce = randomBytes(16).toString('hex')
+      const nonceDigest = createHash('sha256').update(nonce).digest('hex')
+      const title = `Council ballot (human tap): ${question80} (vote by ${deadlineIso})`
+      // Human seats are CLOSED by the tap bridge (DIVE-1565), never worked by an agent, so the ballot
+      // task is filed to the convener (`from`); its assignee never `agent ask`-runs it. Body is BLIND +
+      // carries the nonce DIGEST for the bridge to authenticate the tap against — NEVER the raw nonce.
+      const body = `${prompt}\n\n[council ballot :: human tap] A council seat you hold is voting. Approve / Reject / Abstain via the Telegram buttons before the deadline. Deadline: ${deadlineIso}. A missed deadline counts as an abstain.\n[council ballot-auth] nonceDigest=${nonceDigest}`
+      let taskId
+      try {
+        const stdout = exec(['task', 'add', title, `--body=${body}`, `--assignee=${from}`,
+          `--from=${from}`, '--priority=high', '--no-verify', '--json'])
+        const env = JSON.parse(stdout)
+        taskId = env && env.data && (env.data.ident || env.data.id)
+        if (taskId == null) throw new Error('task add returned no id')
+      } catch (e) {
+        return { vote: 'abstain', rationale: `${seat.id} human ballot: could not mint task (${clip(e)}) (deadline/no-vote)` }
+      }
+      // callback_data = cvote:<=12-char ballot-ref>:<a|r|e>:<nonce>. The ballot-ref is this ballot TASK
+      // id — at DISPATCH time the sealed convene digest does not exist yet, so the task id is the stable
+      // per-seat correlation the DIVE-1565 bridge PREFIX-ACCEPTS to the unique ballot task. Stays under
+      // Telegram's 64B cap: "cvote:"(6) + ref(<=12) + ":"(1) + verb(1) + ":"(1) + nonce(32) ~= 53B.
+      const ref = String(taskId).slice(0, 12)
+      const button = (label, code) => ({ text: label, callback_data: `cvote:${ref}:${code}:${nonce}` })
+      const payload = {
+        chat, taskId, deadlineIso, seat: seat.id,
+        text: `${prompt}\n\nCouncil ballot — vote by ${deadlineIso}.`,   // BLIND; the raw nonce is NEVER in the text
+        buttons: [button('Approve', 'a'), button('Reject', 'r'), button('Abstain', 'e')],
+      }
+      // Emit is an injectable, never-throws seam. The CLI cannot send an inline keyboard itself
+      // (DIVE-1546); the concrete button delivery is the telegram plugin tap handler (DIVE-1566), which
+      // consumes this exact payload. A delivery gap just leaves the task un-tapped -> abstain-on-miss.
+      try { await emitBallot(payload) } catch { /* best-effort: the missed-tap path is already an abstain */ }
+      return collect(seat, taskId, deadlineAt, deadlineIso, 'human ballot')
+    }
+    // ---- agent seat (CNCL-18, unchanged) ----
     // CNCL-16: mint into the seat's REGISTRY agent (persona 'theo' -> 'marketing', etc.). Pre-flight
     // (preflightSeats) has already fail-closed on any unresolvable seat before we get here.
     const target = E.resolveSeatAgent(seat)
-    const deadlineAt = now() + deadlineSecs * 1000
-    const deadlineIso = new Date(deadlineAt).toISOString()
-    const title = `Council ballot: ${String(ctx.question || '').replace(/\s+/g, ' ').slice(0, 80)} (vote by ${deadlineIso})`
+    const title = `Council ballot: ${question80} (vote by ${deadlineIso})`
     const body = `${prompt}\n\n[council ballot] Cast your vote by CLOSING this task with your COUNCIL-VOTE line as the result: 5dive task done <id> --result="...COUNCIL-VOTE: <approve|reject|escalate> :: <why>". Deadline: ${deadlineIso}. A missed deadline counts as an abstain.`
     // (c) mint the deadline-stamped ballot task. --no-verify keeps it a plain task that closes
     // directly on `task done` (no maker->grader handoff that would keep the result out of reach).
@@ -151,22 +222,20 @@ export function dispatchBallotVote(opts = {}) {
     } catch (e) {
       return { vote: 'abstain', rationale: `${seat.id} ballot: could not mint task (${clip(e)}) (deadline/no-vote)` }
     }
-    // (d) COLLECT: poll task show until the seat closes it with a result, or the deadline elapses.
-    // The collection-loop deadline is AUTHORITATIVE regardless of any stamp in the task body.
-    while (now() < deadlineAt) {
-      let row = null
-      try {
-        const env = JSON.parse(exec(['task', 'show', String(taskId), '--json']))
-        row = env && env.data && env.data.task
-      } catch { row = null }
-      if (row && (row.status === 'done' || row.status === 'cancelled')) {
-        const result = row.result || ''
-        return E.parseVote(result) ||
-          { vote: 'abstain', rationale: `${seat.id} ballot ${taskId}: closed with no COUNCIL-VOTE line (deadline/no-vote)` }
-      }
-      await sleep(pollSecs * 1000)
-    }
-    return { vote: 'abstain', rationale: `${seat.id} ballot ${taskId}: no vote by deadline ${deadlineIso} (deadline/no-vote)` }
+    return collect(seat, taskId, deadlineAt, deadlineIso, 'ballot')
+  }
+}
+// DIVE-1564: default human-ballot emit. The CLI has no inline-keyboard send rail of its own — the
+// three Approve/Reject/Abstain BUTTONS (with the raw nonce in callback_data) are rendered by the
+// telegram plugin tap handler (DIVE-1566), which consumes this payload. Until that lands the default
+// is a best-effort, never-throws breadcrumb: a delivery gap just leaves the ballot task un-tapped,
+// which the collect loop already resolves to an abstain. NEVER logs the raw nonce / callback_data.
+function defaultEmitBallot() {
+  return async (payload) => {
+    try {
+      process.stderr.write(`[council] human ballot ${payload.taskId} queued for chat ${payload.chat} (vote by ${payload.deadlineIso}); inline buttons delivered by the telegram plugin (DIVE-1566)\n`)
+    } catch { /* ignore */ }
+    return { delivered: false, reason: 'no CLI inline-keyboard rail; plugin (DIVE-1566) renders buttons' }
   }
 }
 // Deterministic, network-free, NO `5dive` exec — every seat approves so the full dispatch path

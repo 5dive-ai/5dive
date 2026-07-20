@@ -8,6 +8,7 @@ import {
 // CNCL-18: the non-blocking ballot ADAPTER lives in cli.mjs (guarded entrypoint so this import
 // does NOT run the arg-parser). We drive its PURE collection logic with injected exec/clock seams.
 import { dispatchBallotVote } from '../src/council/cli.mjs'
+import { createHash } from 'node:crypto'
 
 let pass = 0, fail = 0
 const ok = (c, m) => { c ? pass++ : (fail++, console.error('FAIL:', m)) }
@@ -184,6 +185,50 @@ const bodyArg = (addCall || []).find(a => String(a).startsWith('--body='))
 ok(!!bodyArg && !bodyArg.includes('theo') && !bodyArg.includes('secret leaks'), 'ballot: round-1 body embeds NO other seat’s vote (blind)')
 ok(!!addCall && addCall.includes('--no-verify') && addCall.some(a => a === '--assignee=main'), 'ballot: mints a --no-verify task assigned to the resolved registry agent')
 ok(!!addCall && addCall.some(a => a === '--from=council'), 'ballot: ballot task is filed --from=council')
+
+// ---- DIVE-1564: HUMAN-AS-SEAT ballot branch (Telegram tap closes the SAME ballot task) ----
+const hseat = { id: 'lodar', kind: 'human', chat: '433634012', lens: 'founder' }
+
+// (h1) an UNBOUND human seat -> fail-closed ABSTAIN, mints NO task and emits NO ballot (never drop silently)
+const capUnbound = []
+let emittedUnbound = 0
+const rUnbound = await dispatchBallotVote({ deadline: 100, poll: 1, _now: fixedNow, _sleep: noSleep,
+  _emitBallot: async () => { emittedUnbound++ }, _exec: ballotExec({ captured: capUnbound }) })(
+  { id: 'ghost', kind: 'human' }, { question: 'ship?', round: 1 })
+ok(rUnbound.vote === 'abstain' && /fail-closed/.test(rUnbound.rationale), 'human ballot: an unbound human seat -> fail-closed abstain')
+ok(emittedUnbound === 0 && !capUnbound.some(a => a[0] === 'task' && a[1] === 'add'), 'human ballot: unbound seat mints NO task and emits NO ballot')
+
+// (h2) a BOUND human seat mints the ballot task filed to the convener + emits a 3-button ballot; a tap collects
+const capH = []
+let emitted = null
+const rTap = await dispatchBallotVote({ deadline: 100, poll: 1, from: 'council', _now: fixedNow, _sleep: noSleep,
+  _emitBallot: async (p) => { emitted = p },
+  _exec: ballotExec({ addId: 'DIVE-1600', captured: capH, rowSeq: [{ status: 'done', result: 'COUNCIL-VOTE: approve :: tapped approve' }] }) })(
+  hseat, { question: 'ship v0.12?', round: 1, priorVotes: [{ seat: 'theo', vote: 'reject', rationale: 'secret leaks' }] })
+ok(rTap.vote === 'approve' && /tapped approve/.test(rTap.rationale), 'human ballot: a tap that closes the task with a COUNCIL-VOTE is collected like any ballot')
+const hAdd = capH.find(a => a[0] === 'task' && a[1] === 'add')
+ok(!!hAdd && hAdd.includes('--no-verify') && hAdd.some(a => a === '--assignee=council') && hAdd.some(a => a === '--from=council'), 'human ballot: mints a --no-verify task filed to the convener (never agent-ask-run)')
+const hBody = (hAdd || []).find(a => String(a).startsWith('--body='))
+ok(!!hBody && !hBody.includes('theo') && !hBody.includes('secret leaks'), 'human ballot: round-1 body is BLIND (no other seat’s vote)')
+
+// (h3) the emit payload targets the seat chat with the blind question + 3 well-formed buttons under the 64B cap
+ok(!!emitted && emitted.chat === '433634012' && /ship v0.12\?/.test(emitted.text), 'human ballot: emit payload targets the seat chat with the blind question')
+ok(!!emitted && Array.isArray(emitted.buttons) && emitted.buttons.length === 3, 'human ballot: emit carries 3 buttons')
+const codes = (emitted.buttons || []).map(b => (b.callback_data.match(/^cvote:([^:]+):([are]):([0-9a-f]+)$/) || [])[2])
+ok(codes.join(',') === 'a,r,e', 'human ballot: buttons are Approve/Reject/Abstain with a|r|e verbs')
+ok((emitted.buttons || []).every(b => b.callback_data.length <= 64), 'human ballot: callback_data fits Telegram’s 64-byte cap')
+const rawNonce = emitted.buttons[0].callback_data.split(':')[3]
+ok(/^[0-9a-f]{32}$/.test(rawNonce), 'human ballot: callback_data carries a 16-byte one-time nonce')
+
+// (h4) the RAW nonce is NEVER in the task body or the ballot text — only its sha256 DIGEST is stored
+const digest = createHash('sha256').update(rawNonce).digest('hex')
+ok(!!hBody && hBody.includes(`nonceDigest=${digest}`) && !hBody.includes(rawNonce), 'human ballot: task body records the nonce DIGEST, never the raw nonce')
+ok(!emitted.text.includes(rawNonce), 'human ballot: the ballot TEXT never prints the raw nonce (buttons carry it only)')
+
+// (h5) no tap by the deadline -> ABSTAIN (the CNCL-18 miss path, unchanged for human seats)
+const rHMiss = await dispatchBallotVote({ deadline: 1, poll: 1, from: 'council', _now: advancingNow(600), _sleep: noSleep,
+  _emitBallot: async () => {}, _exec: ballotExec({ rowSeq: [{ status: 'todo' }] }) })(hseat, { question: 'ship?', round: 1 })
+ok(rHMiss.vote === 'abstain' && /no vote by deadline/.test(rHMiss.rationale), 'human ballot: no tap by deadline -> abstain')
 
 // the adapter is a drop-in for the engine: runCouncil drives it exactly like the mock adapter
 const rEngine = await runCouncil({ role: 'convene', question: 'ship?', seats: [{ id: 'main' }, { id: 'codex' }], councilName: 'council' },
