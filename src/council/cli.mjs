@@ -350,6 +350,10 @@ async function cmdConvene() {
     round1Votes: result.round1Votes ? result.round1Votes.map(v => ({ seat: v.seat, vote: v.vote, rationale: v.rationale })) : undefined,
     rebuttalVotes: result.rebuttalVotes ? result.rebuttalVotes.map(v => ({ seat: v.seat, vote: v.vote, rationale: v.rationale })) : undefined,
     constitution: { source: constitution.source, valid: constitution.valid, path: constitution.path },
+    // CNCL-17: the SUBJECT task ident (what this convene decided) rides on the output so bash can
+    // persist it on the receipt — the going-forward link that scores seat votes against the task's
+    // eventual outcome. Absent on an ad-hoc convene (those score via question-text ident parsing).
+    subject: (flag('subject') && flag('subject') !== true) ? String(flag('subject')) : undefined,
     // CNCL-19: the case-law citation (which prior decisions this verdict followed vs departed
     // from) rides on the verdict and is sealed inside the receipt bytes; surface it for the
     // dashboard/log. Absent (undefined) when no precedent was found — output stays back-compatible.
@@ -689,8 +693,29 @@ function cmdRoster() {
   const seatCount = (bench.seats || []).length
   const threshold = E.resolveThreshold(seatCount, bench.threshold || { rule: 'majority' })
   const quorum = E.quorumSize(seatCount, bench.threshold || { rule: 'majority' })
-  out({ council: 'council', seats: bench.seats, seatCount, threshold, quorum,
-    thresholdSpec: bench.threshold || { rule: 'majority' }, seededAt: bench.seededAt || '' })
+  // CNCL-17: optionally fold each seat's TRACK RECORD (calibration vs real outcomes) into the
+  // roster so membership is read alongside performance. bash passes the computed record via
+  // --track-json (receipts scored against task outcomes); absent → roster stays as before.
+  const tr = readJsonFlag('track-json', { optional: true })
+  const seats = tr && Array.isArray(tr.seats)
+    ? (bench.seats || []).map(s => {
+        const row = tr.seats.find(r => r.seat === s.id)
+        return row ? { ...s, trackRecord: { scored: row.scored, correct: row.correct, calibration: row.calibration, vindicated: row.vindicated } } : s
+      })
+    : bench.seats
+  out({ council: 'council', seats, seatCount, threshold, quorum,
+    thresholdSpec: bench.threshold || { rule: 'majority' }, seededAt: bench.seededAt || '',
+    scoredReceipts: tr ? tr.scoredReceipts : undefined })
+}
+
+// council record — CNCL-17 seat track record. Pure: bash gathers the sealed receipts + resolves
+// each subject's eventual outcome (from the decided task's terminal status) and hands both in;
+// this scores every seat's votes against those outcomes (dissent VINDICATED when the outcome went
+// bad; approve correct when it landed good) and emits the per-seat calibration.
+function cmdRecord() {
+  const receipts = readJsonFlag('receipts', { optional: true }) || []
+  const outcomes = readJsonFlag('outcomes', { optional: true }) || {}
+  out(E.seatTrackRecord(receipts, outcomes))
 }
 
 // council promote|demote|expel — PLAN phase (pre-convene): classify the motion IN CODE, compute
@@ -763,6 +788,7 @@ const main = async () => {
   if (sub === 'amend-apply') return cmdAmendApply()
   if (sub === 'convene') return cmdConvene()
   if (sub === 'roster') return cmdRoster()
+  if (sub === 'record') return cmdRecord()
   if (sub === 'motion-plan') return cmdMotionPlan()
   if (sub === 'motion-apply') return cmdMotionApply()
   if (sub === 'verify-chain') return cmdVerifyChain()

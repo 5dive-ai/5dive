@@ -17,6 +17,7 @@ import {
   digestConstitution, constitutionDriftCheck, renderConstitutionV0,
   buildGenesisRecord, canonicalGenesis, normalizeConstitution, parseConstitutionFrontmatter,
   precedentTokens, selectPrecedents, precedentCitations, precedentCitationBrief, seatPrompt,
+  subjectFromText, parseCanonicalVotes, scoreSeatVote, seatTrackRecord, seatTrackRecordBrief,
 } from '../src/council/engine.mjs'
 
 let pass = 0, fail = 0
@@ -386,5 +387,38 @@ const precRec = { ...baseRec, verdict: { ...baseRec.verdict, precedents: [{ dige
 ok(!canonicalTranscript(baseRec).includes('precedent:'), 'CNCL-19: a no-precedent receipt seals with no precedent line (back-compat)')
 ok(canonicalTranscript(precRec).includes('precedent: aa:followed,zz:departed'), 'CNCL-19: cited precedents are sealed (digest-sorted) inside the signed bytes')
 
-console.log(`\nCNCL-6/11/15/19 engine: ${pass} passed, ${fail} failed (bound to src/council/engine.mjs)`)
+// ---- CNCL-17: seat track record — score votes vs real outcomes ---------------------------------
+ok(subjectFromText('Should we ship DIVE-1527 now?') === 'DIVE-1527' && subjectFromText('no ident here') === '', 'CNCL-17: subjectFromText pulls a task ident (empty when none)')
+ok(subjectFromText('gate CNCL-17 and OSS-32') === 'CNCL-17', 'CNCL-17: subjectFromText takes the first ident deterministically')
+// parse seat votes out of a sealed canonical (the A1 derivation — no structured array in the seal).
+const canon = canonicalTranscript({ council: 'c', mode: 'deliberate', stampedAt: 's', question: 'ship DIVE-9?', seats: ['a', 'b', 'c'],
+  votes: [{ seat: 'a', vote: 'approve', rationale: 'lgtm' }, { seat: 'b', vote: 'reject', rationale: 'risky' }, { seat: 'c', vote: 'escalate', rationale: 'human call' }],
+  verdict: { recommendation: 'approve', confidence: 0.7, tally: T(1, 1, 1), dissent: 'split' } })
+const pv = parseCanonicalVotes(canon)
+ok(pv.length === 3 && pv[0].seat === 'a' && pv[0].vote === 'approve' && pv[1].vote === 'reject', 'CNCL-17: parseCanonicalVotes recovers seat/vote/rationale from the sealed canonical')
+ok(parseCanonicalVotes('verdict: approve conf=1\ndissent: none\nprecedent: x:followed').length === 0, 'CNCL-17: non-vote canonical lines (verdict/dissent/precedent) are ignored')
+// score one vote: dissent vindicated when the outcome went bad; approve correct when good.
+ok(scoreSeatVote('approve', 'good').correct === true && scoreSeatVote('approve', 'bad').correct === false, 'CNCL-17: approve scores correct iff outcome good')
+const vind = scoreSeatVote('reject', 'bad')
+ok(vind.correct === true && vind.dissent === true && vind.vindicated === true, 'CNCL-17: a reject dissent on a BAD outcome is vindicated (correct)')
+ok(scoreSeatVote('escalate', 'good').correct === false && scoreSeatVote('escalate', 'good').vindicated === false, 'CNCL-17: an escalate dissent against a GOOD outcome is incorrect, not vindicated')
+// aggregate calibration across receipts; pending/unknown-outcome subjects are skipped.
+const RCPTS = [
+  { subject: 'DIVE-1', canonical: canonicalTranscript({ council: 'c', mode: 'q', stampedAt: 's1', question: 'DIVE-1', seats: ['a', 'b'], votes: [{ seat: 'a', vote: 'approve', rationale: 'x' }, { seat: 'b', vote: 'reject', rationale: 'y' }], verdict: { recommendation: 'approve', confidence: 1, tally: T(1, 1, 0), dissent: '' } }) },
+  { subject: 'DIVE-2', canonical: canonicalTranscript({ council: 'c', mode: 'q', stampedAt: 's2', question: 'DIVE-2', seats: ['a', 'b'], votes: [{ seat: 'a', vote: 'approve', rationale: 'x' }, { seat: 'b', vote: 'reject', rationale: 'y' }], verdict: { recommendation: 'approve', confidence: 1, tally: T(1, 1, 0), dissent: '' } }) },
+  { question: 'ship DIVE-3?', canonical: canonicalTranscript({ council: 'c', mode: 'q', stampedAt: 's3', question: 'ship DIVE-3?', seats: ['a'], votes: [{ seat: 'a', vote: 'approve', rationale: 'x' }], verdict: { recommendation: 'approve', confidence: 1, tally: T(1, 0, 0), dissent: '' } }) },
+  { subject: 'DIVE-9', canonical: 'ignored', votes: [{ seat: 'a', vote: 'approve', rationale: 'z' }] },   // pending — no outcome
+]
+const tr = seatTrackRecord(RCPTS, { 'DIVE-1': 'good', 'DIVE-2': 'bad', 'DIVE-3': 'good' })
+ok(tr.scoredReceipts === 3, 'CNCL-17: only receipts with a known outcome are scored (DIVE-9 pending is skipped)')
+const seatA = tr.seats.find(s => s.seat === 'a'), seatB = tr.seats.find(s => s.seat === 'b')
+// a: approve/good(✓) DIVE-1, approve/bad(✗) DIVE-2, approve/good(✓) DIVE-3 → 2/3
+ok(seatA.scored === 3 && seatA.correct === 2 && Math.abs(seatA.calibration - 2 / 3) < 1e-9, 'CNCL-17: seat A calibration = 2/3 across scored receipts')
+// b: reject/good(✗) DIVE-1, reject/bad(✓ vindicated) DIVE-2 → 1/2, 1 vindicated
+ok(seatB.scored === 2 && seatB.correct === 1 && seatB.dissents === 2 && seatB.vindicated === 1, 'CNCL-17: seat B has 2 dissents, 1 vindicated (the bad-outcome one)')
+ok(tr.seats[0].calibration >= tr.seats[tr.seats.length - 1].calibration, 'CNCL-17: seats sort by calibration desc')
+ok(seatTrackRecordBrief('b', tr).includes('vindicated') && seatTrackRecordBrief('zzz', tr) === 'zzz: no scored record yet', 'CNCL-17: brief summarizes a seat (and a no-record seat)')
+ok(seatTrackRecord([], {}).seats.length === 0 && seatTrackRecord(null, null).scoredReceipts === 0, 'CNCL-17: empty/null inputs are safe')
+
+console.log(`\nCNCL-6/11/15/17/19 engine: ${pass} passed, ${fail} failed (bound to src/council/engine.mjs)`)
 process.exit(fail ? 1 : 0)

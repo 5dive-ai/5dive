@@ -44,6 +44,11 @@ if ! bash "tests/council_roster_lineage_e2e.sh"; then echo "FAILED: tests/counci
 echo "=== tests/council_amend_e2e.sh"
 if ! bash "tests/council_amend_e2e.sh"; then echo "FAILED: tests/council_amend_e2e.sh"; rc=1; fi
 
+# CNCL-17: the seat TRACK RECORD wiring e2e — `5dive council record` scores sealed votes against
+# real task outcomes (done→good, cancelled→bad), vindicates dissents, skips undecided tasks.
+echo "=== tests/council_record_e2e.sh"
+if ! bash "tests/council_record_e2e.sh"; then echo "FAILED: tests/council_record_e2e.sh"; rc=1; fi
+
 # CNCL-26: the bash-DISPATCHER route e2e — proves `5dive council sign-vote|verify-votes` reach the
 # mjs verbs through cmd_council()'s allowlist (not just `node cli.mjs` directly, the blind spot that
 # hid the CNCL-10 shell gap). Builds a throwaway ./5dive (BUILD_OUT) so it GATES in CI; no root/seal.

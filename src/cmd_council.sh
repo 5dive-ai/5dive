@@ -83,6 +83,12 @@ _council_help() {
       The past sealed verdicts — genesis + every promote/demote motion + any founder veto —
       in lineage order (the append-only governance record).
 
+  5dive council record [--json]
+      Per-seat TRACK RECORD: scores each seat's sealed votes against the REAL outcome of the task
+      each convene decided (done → good, cancelled → bad; pending is not scored). A dissent is
+      credited when the outcome went bad; an approve when it landed good. Data for promote/demote
+      votes, not vibes. Votes are parsed from the sealed canonical; the tamper-evident seal is untouched.
+
   5dive council amend --file=<new 5dive.md> [--dry-run]
       Amend the constitution via a constitutional-class motion (2/3 + full quorum + founder
       veto). Validates the proposed file, convenes the amendment, and ONLY on a pass seals its
@@ -1296,6 +1302,85 @@ export function parseVote(reply) {
   return { vote, rationale }
 }
 
+// ==================== CNCL-17: seat TRACK RECORD (score votes vs real outcomes) ====================
+// Per-seat calibration: score each seat's past votes against the eventual REAL outcome of the
+// decided subject (the task the convene gated), surface in `council roster`, and attach to
+// promote/demote motion briefs so quorum votes run on data, not vibes. A1 (decided by lodar):
+// add a `subject` task-ident field to receipts + DERIVE the seat votes by PARSING the existing
+// sealed canonical `vote <seat>:` lines — NO new structured array in the seal, so the tamper-
+// evident format is untouched and historical receipts stay scoreable. All pure + deterministic.
+
+// Extract a task/subject ident (e.g. DIVE-1527, CNCL-17, OSS-32) from free text — used to link a
+// HISTORICAL receipt (minted before the `subject` field) to the task whose outcome scores it.
+export function subjectFromText(text) {
+  const m = String(text == null ? '' : text).match(/\b([A-Z][A-Z0-9]+-\d+)\b/)
+  return m ? m[1] : ''
+}
+
+// Parse the per-seat votes back OUT of a sealed canonical transcript. Votes seal as
+// `vote <seat>: <choice> :: <rationale>` lines (see canonicalTranscript). A1 derives the structured
+// votes from these lines instead of persisting a new array INTO the seal. round1/veto/precedent
+// lines are ignored (only `vote ` lines match), so adversarial round-2 receipts score their FINAL
+// votes (the sealed `vote ` lines are round 2; round1 history seals under a different prefix).
+export function parseCanonicalVotes(canonical) {
+  const out = []
+  for (const line of String(canonical == null ? '' : canonical).split('\n')) {
+    const m = line.match(/^vote\s+(\S+):\s+(approve|reject|escalate)\s+::\s+(.*)$/)
+    if (m) out.push({ seat: m[1], vote: m[2], rationale: m[3] })
+  }
+  return out
+}
+
+// Score ONE seat vote against the eventual outcome of the decided subject. outcome ∈ {good,bad}.
+//   approve + good            => correct (backed a call that landed good)
+//   approve + bad             => incorrect (backed a call that went bad)
+//   reject/escalate (dissent) + bad  => VINDICATED (the dissent was right)
+//   reject/escalate + good    => incorrect (dissented against a good call)
+export function scoreSeatVote(vote, outcome) {
+  const dissent = vote === 'reject' || vote === 'escalate'
+  const good = outcome === 'good'
+  const correct = dissent ? !good : good
+  return { correct, dissent, vindicated: dissent && !good }
+}
+
+// Per-seat calibration across receipts with a KNOWN outcome. receipts:
+// [{ subject?, question?, canonical?, votes? }]; outcomes: { [subject]: 'good'|'bad' } (subjects
+// with no/pending outcome are skipped — never scored on an undecided task). Votes come from
+// `.votes` when present, else are PARSED from `.canonical`; subject from `.subject` else parsed
+// from `.question`. Deterministic sort: calibration desc, then volume, then seat id.
+export function seatTrackRecord(receipts, outcomes = {}) {
+  const acc = new Map()
+  let scoredReceipts = 0
+  for (const r of receipts || []) {
+    if (!r) continue
+    const subject = r.subject || subjectFromText(r.question)
+    const outcome = subject ? outcomes[subject] : null
+    if (outcome !== 'good' && outcome !== 'bad') continue
+    const votes = (Array.isArray(r.votes) && r.votes.length) ? r.votes : parseCanonicalVotes(r.canonical)
+    if (!votes.length) continue
+    scoredReceipts++
+    for (const v of votes) {
+      const s = acc.get(v.seat) || { seat: v.seat, scored: 0, correct: 0, incorrect: 0, dissents: 0, vindicated: 0 }
+      const sc = scoreSeatVote(v.vote, outcome)
+      s.scored++; sc.correct ? s.correct++ : s.incorrect++
+      if (sc.dissent) s.dissents++
+      if (sc.vindicated) s.vindicated++
+      acc.set(v.seat, s)
+    }
+  }
+  const seats = [...acc.values()].map(s => ({ ...s, calibration: s.scored ? s.correct / s.scored : 0 }))
+    .sort((a, b) => (b.calibration - a.calibration) || (b.scored - a.scored) || (a.seat < b.seat ? -1 : a.seat > b.seat ? 1 : 0))
+  return { seats, scoredReceipts }
+}
+
+// One-line per-seat summary for `council roster` + motion briefs (data, not vibes).
+export function seatTrackRecordBrief(seat, tr) {
+  const row = ((tr && tr.seats) || []).find(s => s.seat === seat)
+  if (!row || !row.scored) return `${seat}: no scored record yet`
+  return `${seat}: ${Math.round(row.calibration * 100)}% calibrated (${row.correct}/${row.scored}` +
+    `${row.vindicated ? `, ${row.vindicated} vindicated dissent${row.vindicated > 1 ? 's' : ''}` : ''})`
+}
+
 // ==================== CNCL-19: council CASE LAW (precedent pre-loading + citation) ====================
 // At convene, the SEALED receipt log is searched for prior verdicts on related questions; the top
 // hits are injected into every seat ballot as PRECEDENT (history — NOT this round's takes, so the
@@ -2150,6 +2235,10 @@ async function cmdConvene() {
     round1Votes: result.round1Votes ? result.round1Votes.map(v => ({ seat: v.seat, vote: v.vote, rationale: v.rationale })) : undefined,
     rebuttalVotes: result.rebuttalVotes ? result.rebuttalVotes.map(v => ({ seat: v.seat, vote: v.vote, rationale: v.rationale })) : undefined,
     constitution: { source: constitution.source, valid: constitution.valid, path: constitution.path },
+    // CNCL-17: the SUBJECT task ident (what this convene decided) rides on the output so bash can
+    // persist it on the receipt — the going-forward link that scores seat votes against the task's
+    // eventual outcome. Absent on an ad-hoc convene (those score via question-text ident parsing).
+    subject: (flag('subject') && flag('subject') !== true) ? String(flag('subject')) : undefined,
     // CNCL-19: the case-law citation (which prior decisions this verdict followed vs departed
     // from) rides on the verdict and is sealed inside the receipt bytes; surface it for the
     // dashboard/log. Absent (undefined) when no precedent was found — output stays back-compatible.
@@ -2489,8 +2578,29 @@ function cmdRoster() {
   const seatCount = (bench.seats || []).length
   const threshold = E.resolveThreshold(seatCount, bench.threshold || { rule: 'majority' })
   const quorum = E.quorumSize(seatCount, bench.threshold || { rule: 'majority' })
-  out({ council: 'council', seats: bench.seats, seatCount, threshold, quorum,
-    thresholdSpec: bench.threshold || { rule: 'majority' }, seededAt: bench.seededAt || '' })
+  // CNCL-17: optionally fold each seat's TRACK RECORD (calibration vs real outcomes) into the
+  // roster so membership is read alongside performance. bash passes the computed record via
+  // --track-json (receipts scored against task outcomes); absent → roster stays as before.
+  const tr = readJsonFlag('track-json', { optional: true })
+  const seats = tr && Array.isArray(tr.seats)
+    ? (bench.seats || []).map(s => {
+        const row = tr.seats.find(r => r.seat === s.id)
+        return row ? { ...s, trackRecord: { scored: row.scored, correct: row.correct, calibration: row.calibration, vindicated: row.vindicated } } : s
+      })
+    : bench.seats
+  out({ council: 'council', seats, seatCount, threshold, quorum,
+    thresholdSpec: bench.threshold || { rule: 'majority' }, seededAt: bench.seededAt || '',
+    scoredReceipts: tr ? tr.scoredReceipts : undefined })
+}
+
+// council record — CNCL-17 seat track record. Pure: bash gathers the sealed receipts + resolves
+// each subject's eventual outcome (from the decided task's terminal status) and hands both in;
+// this scores every seat's votes against those outcomes (dissent VINDICATED when the outcome went
+// bad; approve correct when it landed good) and emits the per-seat calibration.
+function cmdRecord() {
+  const receipts = readJsonFlag('receipts', { optional: true }) || []
+  const outcomes = readJsonFlag('outcomes', { optional: true }) || {}
+  out(E.seatTrackRecord(receipts, outcomes))
 }
 
 // council promote|demote|expel — PLAN phase (pre-convene): classify the motion IN CODE, compute
@@ -2563,6 +2673,7 @@ const main = async () => {
   if (sub === 'amend-apply') return cmdAmendApply()
   if (sub === 'convene') return cmdConvene()
   if (sub === 'roster') return cmdRoster()
+  if (sub === 'record') return cmdRecord()
   if (sub === 'motion-plan') return cmdMotionPlan()
   if (sub === 'motion-apply') return cmdMotionApply()
   if (sub === 'verify-chain') return cmdVerifyChain()
@@ -2974,7 +3085,9 @@ _council_gate_clear() {
 
   # Phase 2 — convene the primary council on the question from the guardrail, seal the receipt.
   local q; q="$(printf '%s' "$plan1" | jq -r '.question')"
-  local env; env="$(_council_convene_json "$q" --mode="$mode" "${seat_args[@]}")" || fail "$E_GENERIC" "convene failed"
+  # CNCL-17: stamp the SUBJECT task ident on the receipt so this seat vote is later scored against
+  # the task's real outcome (a gate-clear convene decides exactly one task — its ident IS the subject).
+  local env; env="$(_council_convene_json "$q" --mode="$mode" --subject="$id" "${seat_args[@]}")" || fail "$E_GENERIC" "convene failed"
   local verdict digest; verdict="$(printf '%s' "$env" | jq -c '.data.verdict')"; digest="$(printf '%s' "$env" | jq -r '.data.sealedDigest // empty')"
   [[ -n "$verdict" && "$verdict" != "null" ]] || fail "$E_GENERIC" "convene returned no verdict"
 
@@ -3114,6 +3227,45 @@ _council_log() {
       elif .kind=="motion" then "seq \(.seq)\tmotion:\(.record.motion.class)\t\(.stampedAt)\tsubject=\(.record.motion.subject // "-")\toutcome=\(.record.outcome)\ttally=a\(.record.tally.approve)/r\(.record.tally.reject)/e\(.record.tally.escalate)"
       elif .kind=="veto" then "seq \(.seq)\tveto\t\(.stampedAt)\ttier=\(.tier // "-")\tblocked"
       else "seq \(.seq)\t\(.kind)\t\(.stampedAt)" end'
+  fi
+}
+
+# council record — CNCL-17 seat track record. Scores every seat's sealed votes against the REAL
+# outcome of the task each convene decided (subject): a dissent (reject/escalate) is VINDICATED when
+# the task went bad; an approve is correct when it landed good. Outcome is read from the decided
+# task's terminal status (done → good, cancelled → bad; pending/unknown are not scored). Seat votes
+# are PARSED from the sealed canonical (A1 — no new structured array in the tamper-evident seal), and
+# the subject is the receipt's `subject` field or, for historical receipts, the first ident parsed
+# from its question. Read-only over already-sealed receipts.
+_council_record() {
+  local dir="$1"; shift
+  if ! compgen -G "${COUNCIL_RECEIPTS}/*.json" >/dev/null 2>&1; then
+    if (( JSON_MODE )); then printf '%s\n' '{"ok":true,"data":{"seats":[],"scoredReceipts":0}}'
+    else echo "record: (no sealed convene receipts yet)"; fi
+    return 0
+  fi
+  local receipts; receipts="$(jq -s '[.[] | {subject:(.subject // ""), question:(.question // ""), canonical:(.canonical // "")}]' "${COUNCIL_RECEIPTS}"/*.json 2>/dev/null)" || receipts='[]'
+  local subjects; subjects="$(printf '%s' "$receipts" | jq -r '.[] | (if (.subject|length)>0 then .subject else ((.question|capture("(?<i>[A-Z][A-Z0-9]+-[0-9]+)")|.i) // "") end)' 2>/dev/null | grep -E '^[A-Za-z0-9]+-[0-9]+$' | sort -u)"
+  local outcomes='{}' subj st oc
+  while IFS= read -r subj; do
+    [[ -n "$subj" ]] || continue
+    st="$(db "SELECT status FROM tasks WHERE ident=$(sqlq "$subj") OR id=$(sqlq "$subj") LIMIT 1;" 2>/dev/null)"
+    case "$st" in
+      done) oc="good" ;;
+      cancelled) oc="bad" ;;
+      *) oc="" ;;   # pending / not found → not scoreable (never score an undecided task)
+    esac
+    [[ -n "$oc" ]] && outcomes="$(printf '%s' "$outcomes" | jq -c --arg s "$subj" --arg o "$oc" '. + {($s): $o}')"
+  done <<< "$subjects"
+  local res; res="$(node "$dir/cli.mjs" record --receipts="$receipts" --outcomes="$outcomes")" || fail "$E_GENERIC" "record scoring failed"
+  if (( JSON_MODE )); then
+    printf '%s' "$res" | jq '{ok:true, data: .}'
+  else
+    local n; n="$(printf '%s' "$res" | jq -r '.seats|length')"
+    if [[ "$n" == "0" ]]; then echo "record: no seat votes scored yet (no decided-task outcomes among the receipts)"; return 0; fi
+    echo "seat track record (calibration vs real task outcomes):"
+    printf '%s' "$res" | jq -r '.seats[] | "  \(.seat)\t\((.calibration*100)|floor)%\t(\(.correct)/\(.scored))\(if .vindicated>0 then "\t\(.vindicated) vindicated dissent" else "" end)"'
+    printf '%s' "$res" | jq -r '"scored \(.scoredReceipts) receipt(s) with a known outcome"'
   fi
 }
 
@@ -3376,8 +3528,8 @@ cmd_council() {
   local sub="${1:-}"; [[ $# -gt 0 ]] && shift || true
   case "$sub" in
     ""|-h|--help|help) _council_help; return 0 ;;
-    convene|bench|init|lineage|veto|gate-clear|rot-triage|roster|log|verify|promote|demote|expel|amend|sign-vote|verify-votes) ;;
-    *) fail "$E_USAGE" "unknown council command: $sub (convene|bench|init|lineage|roster|log|verify|promote|demote|expel|amend|veto|gate-clear|rot-triage|sign-vote|verify-votes)" ;;
+    convene|bench|init|lineage|veto|gate-clear|rot-triage|roster|log|record|verify|promote|demote|expel|amend|sign-vote|verify-votes) ;;
+    *) fail "$E_USAGE" "unknown council command: $sub (convene|bench|init|lineage|roster|log|record|verify|promote|demote|expel|amend|veto|gate-clear|rot-triage|sign-vote|verify-votes)" ;;
   esac
 
   local dir; dir="$(mktemp -d -t 5dive-council.XXXXXX)" || fail "$E_GENERIC" "mktemp failed"
@@ -3410,6 +3562,7 @@ cmd_council() {
   # CNCL-11: governance surface — roster / log / verify (read) + promote|demote|expel (motion).
   if [[ "$sub" == "roster" ]]; then _council_roster "$dir" "$@"; return $?; fi
   if [[ "$sub" == "log" ]];    then _council_log    "$dir" "$@"; return $?; fi
+  if [[ "$sub" == "record" ]]; then _council_record "$dir" "$@"; return $?; fi
   if [[ "$sub" == "verify" ]]; then _council_verify "$dir" "$@"; return $?; fi
   if [[ "$sub" == "promote" || "$sub" == "demote" || "$sub" == "expel" ]]; then
     _council_motion "$dir" "$sub" "$@"; return $?
@@ -3585,7 +3738,8 @@ cmd_council() {
         printf '%s' "$raw" | jq --arg d "$digest" --arg s "$stamped" --arg ea "$execute_after" --arg nd "$veto_nonce_digest" --arg canon "$canonical" \
           '{stampedAt:$s, sealedDigest:$d, council, question, disposition, verdict, canonical: $canon}
            + (if ($ea|length)>0 then {executeAfter:$ea} else {} end)
-           + (if ($nd|length)>0 then {vetoNonceDigest:$nd} else {} end)' \
+           + (if ($nd|length)>0 then {vetoNonceDigest:$nd} else {} end)
+           + (if ((.subject // "")|length)>0 then {subject:.subject} else {} end)' \
           > "${COUNCIL_RECEIPTS}/${stamped//:/-}.json" 2>/dev/null || true
         # Fire the founder ping at seal (non-blocking, best-effort). Writes the durable digest-only
         # pings audit (0600) always; the live _tg_send notify (which carries the raw nonce) is

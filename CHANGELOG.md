@@ -1,9 +1,16 @@
 # Changelog
 
+## 0.11.28 — Council seat track record: score votes against real task outcomes, feed promote/demote with data (CNCL-17) (2026-07-20)
+
+- feat(council): new `5dive council record` — scores each seat's sealed votes against the REAL outcome of the task each convene decided (the receipt `subject`): a dissent (reject/escalate) is credited VINDICATED when the task went bad, an approve is credited when it landed good. Outcome is read from the decided task's terminal status (done → good, cancelled → bad; undecided tasks are never scored). Surfaces per-seat calibration so promote/demote votes run on data, not vibes.
+- feat(council): decided per lodar's A1 gate — seat votes are DERIVED by PARSING the existing sealed canonical `vote <seat>:` lines rather than persisting a new structured array into the seal, so the tamper-evident receipt format is untouched and historical receipts stay scoreable. A new `subject` task-ident field is stamped on receipts going forward (gate-clear convenes pass it automatically); historical receipts fall back to the first ident parsed from the question. `council roster` can optionally fold each seat's track record.
+- test(council): +13 engine unit tests (ident parse, canonical-vote parse, single-vote scoring incl vindicated dissent, aggregate calibration + sort, pending-skip, empty-safety) and a new `council_record_e2e.sh` that seeds a done + a cancelled + an open task and asserts the scorer credits/vindicates/skips correctly. Depends on the CNCL-11 receipt hash-chain + log.
+
 ## 0.11.27 — Council roster preserves the chair flag onto the persisted bench (CNCL-27) (2026-07-20)
 
 - fix(council): `genesisToBench()` mapped each genesis seat to `{id, lens}` only, dropping the per-seat `chair` flag before it reached the persisted `council` bench. As a result `council roster` (JSON + text badge) and the dashboard Council panel — both of which render the chair badge from `roster.seats[].chair` — could never show a chair on ANY genesis-seeded box; the chair survived only inside the sealed genesis convene-log record. Now preserves `chair` the same way `buildGenesisRecord`/`buildMotionRecord` already do (`...(s.chair ? { chair: true } : {})`).
 - test(council): engine unit asserts `genesisToBench` carries `chair` onto the bench (and non-chair seats stay flag-free); the roster/lineage e2e asserts the seeded `main:chair` shows up in both the roster JSON and the text `(chair)` badge, so the drop gates in CI.
+
 
 ## 0.11.26 — Reliable inter-agent sends to codex agents: detect the codex composer marker (DIVE-1528) (2026-07-20)
 

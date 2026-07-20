@@ -1116,6 +1116,85 @@ export function parseVote(reply) {
   return { vote, rationale }
 }
 
+// ==================== CNCL-17: seat TRACK RECORD (score votes vs real outcomes) ====================
+// Per-seat calibration: score each seat's past votes against the eventual REAL outcome of the
+// decided subject (the task the convene gated), surface in `council roster`, and attach to
+// promote/demote motion briefs so quorum votes run on data, not vibes. A1 (decided by lodar):
+// add a `subject` task-ident field to receipts + DERIVE the seat votes by PARSING the existing
+// sealed canonical `vote <seat>:` lines — NO new structured array in the seal, so the tamper-
+// evident format is untouched and historical receipts stay scoreable. All pure + deterministic.
+
+// Extract a task/subject ident (e.g. DIVE-1527, CNCL-17, OSS-32) from free text — used to link a
+// HISTORICAL receipt (minted before the `subject` field) to the task whose outcome scores it.
+export function subjectFromText(text) {
+  const m = String(text == null ? '' : text).match(/\b([A-Z][A-Z0-9]+-\d+)\b/)
+  return m ? m[1] : ''
+}
+
+// Parse the per-seat votes back OUT of a sealed canonical transcript. Votes seal as
+// `vote <seat>: <choice> :: <rationale>` lines (see canonicalTranscript). A1 derives the structured
+// votes from these lines instead of persisting a new array INTO the seal. round1/veto/precedent
+// lines are ignored (only `vote ` lines match), so adversarial round-2 receipts score their FINAL
+// votes (the sealed `vote ` lines are round 2; round1 history seals under a different prefix).
+export function parseCanonicalVotes(canonical) {
+  const out = []
+  for (const line of String(canonical == null ? '' : canonical).split('\n')) {
+    const m = line.match(/^vote\s+(\S+):\s+(approve|reject|escalate)\s+::\s+(.*)$/)
+    if (m) out.push({ seat: m[1], vote: m[2], rationale: m[3] })
+  }
+  return out
+}
+
+// Score ONE seat vote against the eventual outcome of the decided subject. outcome ∈ {good,bad}.
+//   approve + good            => correct (backed a call that landed good)
+//   approve + bad             => incorrect (backed a call that went bad)
+//   reject/escalate (dissent) + bad  => VINDICATED (the dissent was right)
+//   reject/escalate + good    => incorrect (dissented against a good call)
+export function scoreSeatVote(vote, outcome) {
+  const dissent = vote === 'reject' || vote === 'escalate'
+  const good = outcome === 'good'
+  const correct = dissent ? !good : good
+  return { correct, dissent, vindicated: dissent && !good }
+}
+
+// Per-seat calibration across receipts with a KNOWN outcome. receipts:
+// [{ subject?, question?, canonical?, votes? }]; outcomes: { [subject]: 'good'|'bad' } (subjects
+// with no/pending outcome are skipped — never scored on an undecided task). Votes come from
+// `.votes` when present, else are PARSED from `.canonical`; subject from `.subject` else parsed
+// from `.question`. Deterministic sort: calibration desc, then volume, then seat id.
+export function seatTrackRecord(receipts, outcomes = {}) {
+  const acc = new Map()
+  let scoredReceipts = 0
+  for (const r of receipts || []) {
+    if (!r) continue
+    const subject = r.subject || subjectFromText(r.question)
+    const outcome = subject ? outcomes[subject] : null
+    if (outcome !== 'good' && outcome !== 'bad') continue
+    const votes = (Array.isArray(r.votes) && r.votes.length) ? r.votes : parseCanonicalVotes(r.canonical)
+    if (!votes.length) continue
+    scoredReceipts++
+    for (const v of votes) {
+      const s = acc.get(v.seat) || { seat: v.seat, scored: 0, correct: 0, incorrect: 0, dissents: 0, vindicated: 0 }
+      const sc = scoreSeatVote(v.vote, outcome)
+      s.scored++; sc.correct ? s.correct++ : s.incorrect++
+      if (sc.dissent) s.dissents++
+      if (sc.vindicated) s.vindicated++
+      acc.set(v.seat, s)
+    }
+  }
+  const seats = [...acc.values()].map(s => ({ ...s, calibration: s.scored ? s.correct / s.scored : 0 }))
+    .sort((a, b) => (b.calibration - a.calibration) || (b.scored - a.scored) || (a.seat < b.seat ? -1 : a.seat > b.seat ? 1 : 0))
+  return { seats, scoredReceipts }
+}
+
+// One-line per-seat summary for `council roster` + motion briefs (data, not vibes).
+export function seatTrackRecordBrief(seat, tr) {
+  const row = ((tr && tr.seats) || []).find(s => s.seat === seat)
+  if (!row || !row.scored) return `${seat}: no scored record yet`
+  return `${seat}: ${Math.round(row.calibration * 100)}% calibrated (${row.correct}/${row.scored}` +
+    `${row.vindicated ? `, ${row.vindicated} vindicated dissent${row.vindicated > 1 ? 's' : ''}` : ''})`
+}
+
 // ==================== CNCL-19: council CASE LAW (precedent pre-loading + citation) ====================
 // At convene, the SEALED receipt log is searched for prior verdicts on related questions; the top
 // hits are injected into every seat ballot as PRECEDENT (history — NOT this round's takes, so the

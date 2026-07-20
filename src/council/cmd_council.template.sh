@@ -83,6 +83,12 @@ _council_help() {
       The past sealed verdicts — genesis + every promote/demote motion + any founder veto —
       in lineage order (the append-only governance record).
 
+  5dive council record [--json]
+      Per-seat TRACK RECORD: scores each seat's sealed votes against the REAL outcome of the task
+      each convene decided (done → good, cancelled → bad; pending is not scored). A dissent is
+      credited when the outcome went bad; an approve when it landed good. Data for promote/demote
+      votes, not vibes. Votes are parsed from the sealed canonical; the tamper-evident seal is untouched.
+
   5dive council amend --file=<new 5dive.md> [--dry-run]
       Amend the constitution via a constitutional-class motion (2/3 + full quorum + founder
       veto). Validates the proposed file, convenes the amendment, and ONLY on a pass seals its
@@ -575,7 +581,9 @@ _council_gate_clear() {
 
   # Phase 2 — convene the primary council on the question from the guardrail, seal the receipt.
   local q; q="$(printf '%s' "$plan1" | jq -r '.question')"
-  local env; env="$(_council_convene_json "$q" --mode="$mode" "${seat_args[@]}")" || fail "$E_GENERIC" "convene failed"
+  # CNCL-17: stamp the SUBJECT task ident on the receipt so this seat vote is later scored against
+  # the task's real outcome (a gate-clear convene decides exactly one task — its ident IS the subject).
+  local env; env="$(_council_convene_json "$q" --mode="$mode" --subject="$id" "${seat_args[@]}")" || fail "$E_GENERIC" "convene failed"
   local verdict digest; verdict="$(printf '%s' "$env" | jq -c '.data.verdict')"; digest="$(printf '%s' "$env" | jq -r '.data.sealedDigest // empty')"
   [[ -n "$verdict" && "$verdict" != "null" ]] || fail "$E_GENERIC" "convene returned no verdict"
 
@@ -715,6 +723,45 @@ _council_log() {
       elif .kind=="motion" then "seq \(.seq)\tmotion:\(.record.motion.class)\t\(.stampedAt)\tsubject=\(.record.motion.subject // "-")\toutcome=\(.record.outcome)\ttally=a\(.record.tally.approve)/r\(.record.tally.reject)/e\(.record.tally.escalate)"
       elif .kind=="veto" then "seq \(.seq)\tveto\t\(.stampedAt)\ttier=\(.tier // "-")\tblocked"
       else "seq \(.seq)\t\(.kind)\t\(.stampedAt)" end'
+  fi
+}
+
+# council record — CNCL-17 seat track record. Scores every seat's sealed votes against the REAL
+# outcome of the task each convene decided (subject): a dissent (reject/escalate) is VINDICATED when
+# the task went bad; an approve is correct when it landed good. Outcome is read from the decided
+# task's terminal status (done → good, cancelled → bad; pending/unknown are not scored). Seat votes
+# are PARSED from the sealed canonical (A1 — no new structured array in the tamper-evident seal), and
+# the subject is the receipt's `subject` field or, for historical receipts, the first ident parsed
+# from its question. Read-only over already-sealed receipts.
+_council_record() {
+  local dir="$1"; shift
+  if ! compgen -G "${COUNCIL_RECEIPTS}/*.json" >/dev/null 2>&1; then
+    if (( JSON_MODE )); then printf '%s\n' '{"ok":true,"data":{"seats":[],"scoredReceipts":0}}'
+    else echo "record: (no sealed convene receipts yet)"; fi
+    return 0
+  fi
+  local receipts; receipts="$(jq -s '[.[] | {subject:(.subject // ""), question:(.question // ""), canonical:(.canonical // "")}]' "${COUNCIL_RECEIPTS}"/*.json 2>/dev/null)" || receipts='[]'
+  local subjects; subjects="$(printf '%s' "$receipts" | jq -r '.[] | (if (.subject|length)>0 then .subject else ((.question|capture("(?<i>[A-Z][A-Z0-9]+-[0-9]+)")|.i) // "") end)' 2>/dev/null | grep -E '^[A-Za-z0-9]+-[0-9]+$' | sort -u)"
+  local outcomes='{}' subj st oc
+  while IFS= read -r subj; do
+    [[ -n "$subj" ]] || continue
+    st="$(db "SELECT status FROM tasks WHERE ident=$(sqlq "$subj") OR id=$(sqlq "$subj") LIMIT 1;" 2>/dev/null)"
+    case "$st" in
+      done) oc="good" ;;
+      cancelled) oc="bad" ;;
+      *) oc="" ;;   # pending / not found → not scoreable (never score an undecided task)
+    esac
+    [[ -n "$oc" ]] && outcomes="$(printf '%s' "$outcomes" | jq -c --arg s "$subj" --arg o "$oc" '. + {($s): $o}')"
+  done <<< "$subjects"
+  local res; res="$(node "$dir/cli.mjs" record --receipts="$receipts" --outcomes="$outcomes")" || fail "$E_GENERIC" "record scoring failed"
+  if (( JSON_MODE )); then
+    printf '%s' "$res" | jq '{ok:true, data: .}'
+  else
+    local n; n="$(printf '%s' "$res" | jq -r '.seats|length')"
+    if [[ "$n" == "0" ]]; then echo "record: no seat votes scored yet (no decided-task outcomes among the receipts)"; return 0; fi
+    echo "seat track record (calibration vs real task outcomes):"
+    printf '%s' "$res" | jq -r '.seats[] | "  \(.seat)\t\((.calibration*100)|floor)%\t(\(.correct)/\(.scored))\(if .vindicated>0 then "\t\(.vindicated) vindicated dissent" else "" end)"'
+    printf '%s' "$res" | jq -r '"scored \(.scoredReceipts) receipt(s) with a known outcome"'
   fi
 }
 
@@ -977,8 +1024,8 @@ cmd_council() {
   local sub="${1:-}"; [[ $# -gt 0 ]] && shift || true
   case "$sub" in
     ""|-h|--help|help) _council_help; return 0 ;;
-    convene|bench|init|lineage|veto|gate-clear|rot-triage|roster|log|verify|promote|demote|expel|amend|sign-vote|verify-votes) ;;
-    *) fail "$E_USAGE" "unknown council command: $sub (convene|bench|init|lineage|roster|log|verify|promote|demote|expel|amend|veto|gate-clear|rot-triage|sign-vote|verify-votes)" ;;
+    convene|bench|init|lineage|veto|gate-clear|rot-triage|roster|log|record|verify|promote|demote|expel|amend|sign-vote|verify-votes) ;;
+    *) fail "$E_USAGE" "unknown council command: $sub (convene|bench|init|lineage|roster|log|record|verify|promote|demote|expel|amend|veto|gate-clear|rot-triage|sign-vote|verify-votes)" ;;
   esac
 
   local dir; dir="$(mktemp -d -t 5dive-council.XXXXXX)" || fail "$E_GENERIC" "mktemp failed"
@@ -1011,6 +1058,7 @@ cmd_council() {
   # CNCL-11: governance surface — roster / log / verify (read) + promote|demote|expel (motion).
   if [[ "$sub" == "roster" ]]; then _council_roster "$dir" "$@"; return $?; fi
   if [[ "$sub" == "log" ]];    then _council_log    "$dir" "$@"; return $?; fi
+  if [[ "$sub" == "record" ]]; then _council_record "$dir" "$@"; return $?; fi
   if [[ "$sub" == "verify" ]]; then _council_verify "$dir" "$@"; return $?; fi
   if [[ "$sub" == "promote" || "$sub" == "demote" || "$sub" == "expel" ]]; then
     _council_motion "$dir" "$sub" "$@"; return $?
@@ -1186,7 +1234,8 @@ cmd_council() {
         printf '%s' "$raw" | jq --arg d "$digest" --arg s "$stamped" --arg ea "$execute_after" --arg nd "$veto_nonce_digest" --arg canon "$canonical" \
           '{stampedAt:$s, sealedDigest:$d, council, question, disposition, verdict, canonical: $canon}
            + (if ($ea|length)>0 then {executeAfter:$ea} else {} end)
-           + (if ($nd|length)>0 then {vetoNonceDigest:$nd} else {} end)' \
+           + (if ($nd|length)>0 then {vetoNonceDigest:$nd} else {} end)
+           + (if ((.subject // "")|length)>0 then {subject:.subject} else {} end)' \
           > "${COUNCIL_RECEIPTS}/${stamped//:/-}.json" 2>/dev/null || true
         # Fire the founder ping at seal (non-blocking, best-effort). Writes the durable digest-only
         # pings audit (0600) always; the live _tg_send notify (which carries the raw nonce) is
