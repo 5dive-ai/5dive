@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.11.36 — Re-embed the council engine into cmd_council.sh (fix red CI) (DIVE-1569) (2026-07-20)
+
+- fix(council): regenerate `src/cmd_council.sh` so its embedded `COUNCIL_ENGINE_MJS` heredoc byte-matches the canonical `src/council/engine.mjs`. DIVE-1563 (c19920fa) added the human-as-seat schema (`seatIsHuman`/`resolveSeatChat`/`humanSeatFields`) to `engine.mjs` but never re-ran `node src/council/gen_cmd.mjs`, so the committed bundle carried a stale engine. This is the sole, deterministic cause of the red `unit-tests` job — `council_cli_contract.mjs`'s "engine embed matches canonical" + "gen_cmd reproducible" checks failed on every run (bundle-drift.yml stayed green because the committed `5dive` was self-consistent with the stale `cmd_council.sh`).
+- note: NOT env-sensitivity/flakiness — the earlier triage (DIVE-1569 body) mis-attributed the redness to claude-group/sudo-dependent harnesses; the CI log shows only `council_cli_contract.mjs` failing, deterministically. Two lower-priority observations recorded on the task: `pi_channel_wiring_unit.sh`'s "reject dir w/o server.ts" leaks an on-box `pi_plugin_dir` fallback path (fails on-box only, PASSES on the bare runner), and `task_cascade_unblock_unit.sh` has a rare ~1/16 flake (not reproduced in ~14 runs, passed in the failing CI run) — neither reds CI.
+
 ## 0.11.35 — Expose the resolved org coordinator as a read-only verb (DIVE-1568) (2026-07-20)
 
 - feat(task): new `5dive task coordinator [--json]` prints the resolved org coordinator — a thin read-only wrapper over the existing `_task_resolve_coordinator` (DIVE-333): the sole `role='coordinator'`, else the lone org root, else empty (ambiguous multi-root / no org). JSON form emits `{ok:true,data:{coordinator:"<name>"}}` (empty string when unresolved).

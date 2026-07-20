@@ -388,8 +388,43 @@ export const SEAT_AGENT_ALIAS = { theo: 'marketing', lilbro: 'creative' }
 export function resolveSeatAgent(seat) {
   if (!seat) return ''
   if (typeof seat === 'string') return SEAT_AGENT_ALIAS[seat] || seat
+  if (seatIsHuman(seat)) return ''   // (DIVE-1563) a human seat is a principal, never dispatched as a registry agent
   if (seat.agent && typeof seat.agent === 'string') return seat.agent
   return SEAT_AGENT_ALIAS[seat.id] || seat.id
+}
+
+// (DIVE-1563) HUMAN-AS-SEAT SCHEMA. A council seat MAY be a human principal rather than a registry
+// agent — marked `{ kind: 'human' }` (or `human: true`) with a chat/principal binding naming which
+// Telegram chat receives the ballot + whose allowFrom the tap is authenticated against. This is the
+// prerequisite for DIVE-1548 human-as-seat voting (design: council-human-as-seat-voting-design-dive1548):
+// dispatchBallotVote (DIVE-1564) branches on seatIsHuman to emit a Telegram ballot instead of an
+// agent-directed ask. PURELY ADDITIVE + back-compat (main steer 2026-07-20): a bare-string seat or an
+// existing {id, agent?, lens?} seat is NEVER human, needs ZERO migration, and — because canonicalGenesis/
+// canonicalMotion seal only id/chair/lens — serializes to byte-identical sealed bytes. seatIsHuman
+// defaults false when the marker is absent; resolveSeatChat only fires for a human seat.
+export function seatIsHuman(seat) {
+  return !!seat && typeof seat === 'object' && (seat.kind === 'human' || seat.human === true)
+}
+// The chat/principal a human seat's ballot is delivered to + authenticated against. An explicit
+// `chat` (a resolved tg chat/user id) wins; else a resolvable `principal` string (e.g. 'human:main')
+// the bash/plugin layer resolves via the DIVE-1546 founder resolver. Returns '' for a non-human OR an
+// unbound human seat — dispatch (DIVE-1564) must fail closed on '' and never silently drop the ballot.
+export function resolveSeatChat(seat) {
+  if (!seatIsHuman(seat)) return ''
+  if (seat.chat != null && String(seat.chat).trim()) return String(seat.chat).trim()
+  if (seat.principal && typeof seat.principal === 'string' && seat.principal.trim()) return seat.principal.trim()
+  return ''
+}
+// The extra record fields a HUMAN seat carries beyond {id,lens,chair}. Empty {} for an agent seat, so
+// spreading it into a seat projection is a no-op for all-agent rosters (seal + JSON both unchanged).
+// Applied at every seat->record projection (addSeat + genesis/motion/bench serializers) so a promoted
+// human seat keeps its marker across reloads instead of silently reverting to an agent.
+export function humanSeatFields(seat) {
+  if (!seatIsHuman(seat)) return {}
+  const f = { kind: 'human' }
+  const chat = resolveSeatChat(seat)
+  if (chat) f.chat = chat
+  return f
 }
 export const DEFAULT_THRESHOLD = 3   // default flat pass-threshold; overridable per bench
 
@@ -729,7 +764,7 @@ export function addSeat(seats, seat) {
   const s = typeof seat === 'string' ? { id: seat } : seat
   if (!s || !s.id) throw new Error('addSeat: seat needs an id')
   if ((seats || []).some(x => x.id === s.id)) return seats.slice()   // already seated (idempotent)
-  return [...(seats || []), { id: s.id, lens: s.lens || `${s.id} — council seat.` }]
+  return [...(seats || []), { id: s.id, lens: s.lens || `${s.id} — council seat.`, ...humanSeatFields(s) }]
 }
 export function removeSeat(seats, seatId) {
   return (seats || []).filter(x => x.id !== seatId)
@@ -799,7 +834,7 @@ export function buildMotionRecord({ motion, verdict, seats, threshold, veto, pre
     outcome: (verdict && verdict.recommendation) || null,
     tally: (verdict && verdict.tally) || null,
     recused: (verdict && verdict.recused) || recusalFor(motion),
-    seats: seats.map(s => ({ id: s.id, lens: s.lens, ...(s.chair ? { chair: true } : {}) })),
+    seats: seats.map(s => ({ id: s.id, lens: s.lens, ...(s.chair ? { chair: true } : {}), ...humanSeatFields(s) })),
     threshold: threshold || { rule: 'majority' },
     veto: veto ? { principal: veto.principal, resolved: String(veto.resolved) } : null,
     receiptDigest: receiptDigest || '',   // links the motion to the convene receipt that decided it
@@ -1152,7 +1187,7 @@ export function buildGenesisRecord({ seats, chair, threshold, veto, prevDigest, 
     version: 1,
     seq: Number(seq) || 0,
     council: 'council',
-    seats: seats.map(s => ({ id: s.id, lens: s.lens, ...(s.chair ? { chair: true } : {}) })),
+    seats: seats.map(s => ({ id: s.id, lens: s.lens, ...(s.chair ? { chair: true } : {}), ...humanSeatFields(s) })),
     chair: chair || null,
     threshold: threshold || { rule: 'majority' },
     veto: { principal: veto.principal, resolved: String(veto.resolved) },
@@ -1192,7 +1227,7 @@ export function genesisToBench(rec) {
   return {
     description: DEFAULT_COUNCIL.description,
     mode: DEFAULT_COUNCIL.mode,
-    seats: rec.seats.map(s => ({ id: s.id, lens: s.lens, ...(s.chair ? { chair: true } : {}) })),
+    seats: rec.seats.map(s => ({ id: s.id, lens: s.lens, ...(s.chair ? { chair: true } : {}), ...humanSeatFields(s) })),
     threshold: rec.threshold,
     genesis: true,           // marks this bench as motion-governed (raw add/rm refused)
     seededAt: rec.stampedAt,
