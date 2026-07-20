@@ -42,7 +42,7 @@ They take work off a shared SQLite task queue, hand it to each other while you s
 
 > **We run our own company on this.** The agents that build 5dive.ai cut this repo's releases, and only ask a human when they're stuck. The badge up top is that claim, measured: releases shipped versus decisions escalated to a human, over the last 7 days, republished daily. Full numbers and limits in [docs/zero-human.md](docs/zero-human.md). Same binary you're installing. MIT, no open-core. Run it yourself, or skip the ops with the [managed VM](https://5dive.ai?utm_source=github&utm_medium=owned&utm_campaign=5dive-readme).
 
-**Run your whole company in plain English** — from the AI agent you already have. Add the [`5dive-cli` skill](#for-your-ai-agent): create agents, assign work, read the org chart. [One-line setup ↓](#for-your-ai-agent)
+**Run your whole company in plain language**, from the AI agent you already have. Add the [`5dive-cli` skill](#for-your-ai-agent): create agents, assign work, read the org chart. [One-line setup ↓](#for-your-ai-agent)
 
 ---
 
@@ -52,14 +52,14 @@ They take work off a shared SQLite task queue, hand it to each other while you s
 # 1. install
 curl -fsSL https://install.5dive.ai | sudo bash
 
-# 2. create your first agent — the wizard wires Telegram too:
+# 2. create your first agent, the wizard wires Telegram too:
 #    paste a bot token (BotFather gives you one), send the bot /start,
 #    and it pairs itself. No codes.
 sudo 5dive init
 ```
 
 Scripting it instead (CI, provisioning)? The non-interactive path needs one
-extra step — the bot replies to your first DM with a pairing code:
+extra step, the bot replies to your first DM with a pairing code:
 
 ```sh
 sudo 5dive agent create my-agent --type=claude --channels=telegram --telegram-token=<token>
@@ -67,15 +67,15 @@ sudo 5dive agent pair   my-agent --code=<pairing-code>
 ```
 
 
-**Requirements:** a Linux box with `systemd` and your own agent-CLI subscription or API key (Claude Pro/Max, OpenAI, …) — no account with us.
+**Requirements:** a Linux box with `systemd` and your own agent-CLI subscription or API key (Claude Pro/Max, OpenAI, …), no account with us.
 
-> **“`curl | sudo bash`, and agents with `sudo`?”** Fair question. The installer only apt-installs deps and drops the CLI + systemd units (every file it fetches is listed at the top of [`install.sh`](install.sh)). Each agent is then its own Linux user, and you choose its blast radius — a `sandboxed` agent gets its own home, no sudo, and resource limits. Details: [Security & isolation ↓](#security--isolation).
+> **“`curl | sudo bash`, and agents with `sudo`?”** Fair question. The installer only apt-installs deps and drops the CLI + systemd units (every file it fetches is listed at the top of [`install.sh`](install.sh)). Each agent is then its own Linux user, and you choose its blast radius, a `sandboxed` agent gets its own home, no sudo, and resource limits. Details: [Security & isolation ↓](#security--isolation).
 
 ---
 
 ## Why 5dive
 
-**They escalate, you decide.** Agents work autonomously and only ping your phone, as tap-to-answer buttons, when a human has to make the call — spend, publishing, anything destructive.
+**They escalate, you decide.** Agents work autonomously and only ping your phone, as tap-to-answer buttons, when a human has to make the call: spend, publishing, anything destructive.
 
 **A company that runs itself.** Named agents on one host, reporting up an org chart, handing each other work off a shared backlog.
 
@@ -91,9 +91,9 @@ sudo 5dive agent pair   my-agent --code=<pairing-code>
 
 ## How it works
 
-Each agent is its own Linux user running an official agentic AI CLI session (`claude`, `codex`, `antigravity`, `grok`, …) as a systemd service. Multiple agents can share the same CLI binary and subscription. Agents reach each other by invoking the same `5dive` CLI — that *is* the bus. Channels like Telegram attach per agent.
+Each agent is its own Linux user running an official agentic AI CLI session (`claude`, `codex`, `antigravity`, `grok`, …) as a systemd service. Multiple agents can share the same CLI binary and subscription. Agents reach each other by invoking the same `5dive` CLI, that *is* the bus. Channels like Telegram attach per agent.
 
-![the operating system is the orchestrator: coder, writer and pm agents coordinate through the 5dive CLI (the bus) on one Linux host — identity is Linux users, supervision is systemd, logs are journald, backlog is SQLite, heartbeat is cron, isolation is unix permissions; humans decide only when needed](docs/how-it-works.png)
+![the operating system is the orchestrator: coder, writer and pm agents coordinate through the 5dive CLI (the bus) on one Linux host, identity is Linux users, supervision is systemd, logs are journald, backlog is SQLite, heartbeat is cron, isolation is unix permissions; humans decide only when needed](docs/how-it-works.png)
 
 No broker, no protocol, no orchestrator. Shared filesystem, shared CLI.
 
@@ -181,7 +181,7 @@ sudo 5dive agent create my-agent --type=claude --isolation=sandboxed
 ---
 
 <details>
-<summary><b>More team ops — accounts, a shared bot, commands, characters</b></summary>
+<summary><b>More team ops: accounts, a shared bot, commands, characters</b></summary>
 
 ### Clone a working company
 
@@ -238,14 +238,14 @@ New agents auto-attach with their own topic (opt out per agent with `--no-team-b
 
 ### Import a character
 
-A template gives you roles. A **character pack** gives you a personality — a ready-made persona with its own voice, model, effort, and bundled skills:
+A template gives you roles. A **character pack** gives you a personality, a ready-made persona with its own voice, model, effort, and bundled skills:
 
 ```sh
 sudo 5dive agent marketplace ls            # browse the character-pack registry
 sudo 5dive agent import olivia --as=ceo    # spin up a named agent from a pack
 ```
 
-`--as` is the agent's name on your box; the pack supplies the persona, model, and skills. Add `--channels=telegram` to wire a bot at import time. Packs live in the [`5dive-ai/character-packs`](https://github.com/5dive-ai/character-packs) registry — and a `5dive.yaml` can reference one with `pack: <slug>`.
+`--as` is the agent's name on your box; the pack supplies the persona, model, and skills. Add `--channels=telegram` to wire a bot at import time. Packs live in the [`5dive-ai/character-packs`](https://github.com/5dive-ai/character-packs) registry, and a `5dive.yaml` can reference one with `pack: <slug>`.
 
 ### Commands at a glance
 
@@ -293,7 +293,7 @@ Baselines: [devsec.os_hardening](https://github.com/dev-sec/ansible-collection-h
 
 ### Delegated git push (bring your own GitHub App)
 
-Agents can read and edit a repo, but shouldn't hold a Git credential they could exfiltrate. `5dive push` gives a team ONE scoped push identity — your own GitHub App — that the control plane holds and lends for a single gated push, never handing the agent a token.
+Agents can read and edit a repo, but shouldn't hold a Git credential they could exfiltrate. `5dive push` gives a team ONE scoped push identity, your own GitHub App, that the control plane holds and lends for a single gated push, never handing the agent a token.
 
 ```sh
 sudo 5dive push setup                              # scaffold + verify the credential
@@ -302,7 +302,7 @@ sudo 5dive push setup                              # scaffold + verify the crede
 
 How it works, and why it's safe to give an agent:
 
-- **Your GitHub App, your key.** You create a GitHub App in your org (`contents:write`), install it on the repos you ship, and drop its key at `/etc/5dive/connectors/github-app.{pem,env}` (root-600). The code is generic — point it at any App. No per-agent seats, no long-lived PAT.
+- **Your GitHub App, your key.** You create a GitHub App in your org (`contents:write`), install it on the repos you ship, and drop its key at `/etc/5dive/connectors/github-app.{pem,env}` (root-600). The code is generic, point it at any App. No per-agent seats, no long-lived PAT.
 - **Gate-gated.** A push runs only after the task carries a ship gate cleared by a human or its designated routed reviewer. The root path verifies the signed closure; no gate, open/rejected gate, auto-clear, unrelated-agent answer, or tampered record → refused.
 - **One branch only.** It pushes exactly the branch named in the task (`--branch` or a `Branch: <name>` line in the body); protected branches (`main`/`master`) are refused.
 - **Author stays yours (optional).** Configure a committer (`GITHUB_APP_COMMIT_AUTHOR`) and a fail-closed scan requires every pushed commit to match it, so provider team-checks (e.g. Vercel) stay green; leave it unset for no restriction. The App is transport auth only, decoupled from commit authorship.
@@ -321,7 +321,7 @@ docker exec -it 5dive-demo bash
 
 **Offline / air-gapped.** `install.sh` reads from `$REPO` (default GitHub raw). Override with `REPO=file:///path/to/local/tree` and pre-install apt deps. The fetched files are listed at the top of `install.sh`.
 
-**Updating.** 5dive doesn't auto-update — you stay in control of when code changes land:
+**Updating.** 5dive doesn't auto-update, you stay in control of when code changes land:
 ```sh
 sudo 5dive self-update
 ```
@@ -330,7 +330,7 @@ This refreshes the CLI, hooks, skills, and plugins, then restarts each running a
 0 4 * * * /usr/local/bin/5dive self-update >/dev/null 2>&1
 ```
 
-**Context rot.** Long sessions degrade — the daily `self-update` above also restarts agents, giving each a fresh session. Claude-runtime agents keep project memory under `~/.claude/projects/<dir>/memory/` across restarts. Session resets, knowledge stays.
+**Context rot.** Long sessions degrade, the daily `self-update` above also restarts agents, giving each a fresh session. Claude-runtime agents keep project memory under `~/.claude/projects/<dir>/memory/` across restarts. Session resets, knowledge stays.
 
 ### Requirements
 
