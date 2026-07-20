@@ -238,6 +238,84 @@ function defaultEmitBallot() {
     return { delivered: false, reason: 'no CLI inline-keyboard rail; plugin (DIVE-1566) renders buttons' }
   }
 }
+// ==================== DIVE-1565: human ballot TAP -> task-close BRIDGE ====================
+// The alternate ACTUATOR for a human seat's vote. A Telegram Approve/Reject/Abstain tap (routed by
+// the DIVE-1566 plugin from the `cvote:<ref>:<code>:<nonce>` callback_data DIVE-1564 minted) lands
+// here and CLOSES the SAME CNCL-18 ballot task the convener already polls — it is NOT a second write
+// path (DIVE-1548 design cut A). The convener never learns whether an agent heartbeat or a human tap
+// wrote the COUNCIL-VOTE line, so there is no new collection/quorum/abstain semantics to reconcile.
+// Fail-closed on EVERY ambiguity, and the raw nonce is NEVER logged.
+//
+//   ref   — the ballot task-id PREFIX from callback_data (DIVE-1564 mints `cvote:<taskId[:12]>:…`).
+//           Prefix-ACCEPTED to a UNIQUE OPEN council human-ballot task; 0 matches = miss, >1 =
+//           ambiguous — both fail-closed + audited (DIVE-1546 prefix-accept pattern). The one-time
+//           property falls out for free: a tapped ballot is already `done`, so it no longer appears
+//           among OPEN human ballots and a replay resolves to a miss.
+//   code  — a|r|e  ->  approve|reject|abstain (the third button is Abstain; parseVote accepts all).
+//   nonce — the DIVE-916 one-time token; its sha256 MUST equal the ballot body's stored nonceDigest
+//           (store-digest / deliver-raw split — a reader of the ballot task can never forge the tap).
+//
+// Exec is injectable (opts._exec) + audit is injectable (opts._audit) so the whole bridge is
+// unit-testable offline with a stub reader and no real `5dive` exec.
+export function ballotTap(opts = {}) {
+  const bin = opts.bin || process.env.COUNCIL_5DIVE_BIN || '5dive'
+  const exec = opts._exec || ((args) => execFileSync(bin, args,
+    { encoding: 'utf-8', timeout: 60000, maxBuffer: 16 * 1024 * 1024 }))
+  const audit = opts._audit || ((m) => { try { process.stderr.write(`[council ballot-tap] ${m}\n`) } catch { /* ignore */ } })
+  const clip = (e) => String(e && e.message || e).replace(/\s+/g, ' ').slice(0, 140)
+  const VERB = { a: 'approve', r: 'reject', e: 'abstain' }
+  // The ballot body records ONLY the sha256 DIGEST of the nonce (DIVE-1564): `nonceDigest=<64 hex>`.
+  const digestOf = (body) => { const m = /nonceDigest=([0-9a-f]{64})\b/i.exec(String(body || '')); return m ? m[1].toLowerCase() : null }
+
+  const ref = String(opts.ref || '').trim()
+  const code = String(opts.vote || '').trim().toLowerCase()
+  const nonce = String(opts.nonce || '').trim()
+  const verb = VERB[code]
+  // (0) fail-closed input validation — never touch the board on a malformed tap.
+  if (!ref) { audit('refused: empty --ref (ballot-ref prefix)'); return { ok: false, reason: 'missing ref' } }
+  if (!verb) { audit(`refused ref=${ref}: bad --vote=${code || '(empty)'} (want a|r|e)`); return { ok: false, reason: 'bad vote code' } }
+  if (!nonce) { audit(`refused ref=${ref}: empty --nonce`); return { ok: false, reason: 'missing nonce' } }
+
+  // (1) enumerate OPEN council human-ballot tasks and PREFIX-ACCEPT to a unique one. Scope to human
+  // ballots only (their body carries `nonceDigest=` — agent ballots never do), so the prefix can only
+  // ever resolve against real human ballots, never an arbitrary same-prefix task.
+  let tasks = []
+  try {
+    const env = JSON.parse(exec(['task', 'ls', '--json']))
+    tasks = (env && env.data && env.data.tasks) || []
+  } catch (e) {
+    audit(`refused ref=${ref}: could not list tasks (${clip(e)})`)
+    return { ok: false, reason: 'task ls failed' }
+  }
+  const open = (s) => s !== 'done' && s !== 'cancelled'
+  const candidates = tasks.filter(t =>
+    t && open(t.status) && digestOf(t.body) &&
+    (String(t.ident || '').startsWith(ref) || String(t.id || '').startsWith(ref)))
+  if (candidates.length === 0) { audit(`refused ref=${ref}: no OPEN council human-ballot matches (miss — already voted / expired / bad ref)`); return { ok: false, reason: 'no match' } }
+  if (candidates.length > 1) { audit(`refused ref=${ref}: AMBIGUOUS — ${candidates.length} open human-ballots match this prefix; fail-closed`); return { ok: false, reason: 'ambiguous' } }
+  const task = candidates[0]
+  const taskId = task.ident || task.id
+
+  // (2) verify the one-time nonce against the ballot body's stored DIGEST. A tap whose nonce does not
+  // hash to the stored digest is unauthenticated (only the human's chat ever held the raw nonce).
+  const want = digestOf(task.body)
+  const got = createHash('sha256').update(nonce).digest('hex')
+  if (got !== want) { audit(`refused ${taskId}: nonce digest mismatch — tap NOT authenticated`); return { ok: false, reason: 'nonce mismatch', taskId: String(taskId) } }
+
+  // (3) CLOSE the ballot task with the COUNCIL-VOTE line — the SAME ingress an agent heartbeat writes,
+  // so the convener's unchanged CNCL-18 collect loop reads it identically. `(human tap)` is the only
+  // provenance marker; the raw nonce is never written back.
+  const result = `COUNCIL-VOTE: ${verb} :: (human tap)`
+  try {
+    exec(['task', 'done', String(taskId), `--result=${result}`])
+  } catch (e) {
+    audit(`ref=${ref} ${taskId}: nonce OK but task done failed (${clip(e)})`)
+    return { ok: false, reason: 'task done failed', taskId: String(taskId), vote: verb }
+  }
+  audit(`ref=${ref} -> ${taskId}: recorded ${verb} (human tap)`)
+  return { ok: true, taskId: String(taskId), vote: verb }
+}
+
 // Deterministic, network-free, NO `5dive` exec — every seat approves so the full dispatch path
 // (blind round -> tally -> synthesis -> receipt) exercises offline in tests + VM smoke.
 function mockSeatVote() {
@@ -849,6 +927,17 @@ function cmdVerifyChain() {
   process.exit(res.ok ? 0 : 5)
 }
 
+// DIVE-1565: the tap->task-close bridge verb. The DIVE-1566 plugin parses `cvote:<ref>:<code>:<nonce>`
+// out of the tapped button's callback_data and shells this. `--ref` is canonical (the ballot task-id
+// prefix DIVE-1564 puts in callback_data); `--convene` is accepted as a compat alias for the same
+// value (the DIVE-1548 design named the flag `--convene` before DIVE-1564 fixed the ref to the task id).
+function cmdBallotTap() {
+  const s = (k) => { const v = flag(k); return (v === true || v == null) ? '' : String(v) }
+  const res = ballotTap({ ref: s('ref') || s('convene'), vote: s('vote'), nonce: s('nonce') })
+  out(res)   // never carries the raw nonce
+  process.exit(res.ok ? 0 : 5)
+}
+
 const main = async () => {
   if (sub === 'constitution') return cmdConstitution()
   if (sub === 'constitution-render') return cmdConstitutionRender()
@@ -869,7 +958,8 @@ const main = async () => {
   if (sub === 'read-binding') return cmdReadBinding()
   if (sub === 'sign-vote') return cmdSignVote()
   if (sub === 'verify-votes') return cmdVerifyVotes()
-  die(`unknown council subcommand: ${sub} (constitution|convene|bench|init|veto|gate-map|seal-augment|read-binding|sign-vote|verify-votes|roster|motion-plan|motion-apply|verify-chain)`)
+  if (sub === 'ballot-tap') return cmdBallotTap()
+  die(`unknown council subcommand: ${sub} (constitution|convene|bench|init|veto|gate-map|seal-augment|read-binding|sign-vote|verify-votes|ballot-tap|roster|motion-plan|motion-apply|verify-chain)`)
 }
 // Run as the CLI entrypoint only when executed directly (node cli.mjs …). Guarded so a test can
 // `import` this module (e.g. to exercise dispatchBallotVote's pure logic) WITHOUT triggering the

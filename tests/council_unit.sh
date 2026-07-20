@@ -67,4 +67,11 @@ if ! bash "tests/council_bashroute_e2e.sh"; then echo "FAILED: tests/council_bas
 echo "=== tests/council_ballot_e2e.sh"
 if ! bash "tests/council_ballot_e2e.sh"; then echo "FAILED: tests/council_ballot_e2e.sh"; rc=1; fi
 
+# DIVE-1565: the human ballot TAP->task-close bridge e2e — proves `5dive council ballot-tap` reaches
+# cli.mjs through cmd_council() on the BUILT binary, prefix-accepts a unique OPEN human ballot,
+# verifies the one-time nonce, and closes it with the COUNCIL-VOTE line (fake board; fail-closed on
+# wrong nonce / miss / agent-ballot). Builds a throwaway ./5dive (BUILD_OUT) so it GATES in CI.
+echo "=== tests/council_ballot_tap_e2e.sh"
+if ! bash "tests/council_ballot_tap_e2e.sh"; then echo "FAILED: tests/council_ballot_tap_e2e.sh"; rc=1; fi
+
 exit $rc

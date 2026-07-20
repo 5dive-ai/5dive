@@ -1085,8 +1085,8 @@ cmd_council() {
   local sub="${1:-}"; [[ $# -gt 0 ]] && shift || true
   case "$sub" in
     ""|-h|--help|help) _council_help; return 0 ;;
-    convene|bench|init|lineage|veto|gate-clear|rot-triage|roster|log|record|verify|promote|demote|expel|amend|sign-vote|verify-votes) ;;
-    *) fail "$E_USAGE" "unknown council command: $sub (convene|bench|init|lineage|roster|log|record|verify|promote|demote|expel|amend|veto|gate-clear|rot-triage|sign-vote|verify-votes)" ;;
+    convene|bench|init|lineage|veto|gate-clear|rot-triage|roster|log|record|verify|promote|demote|expel|amend|sign-vote|verify-votes|ballot-tap) ;;
+    *) fail "$E_USAGE" "unknown council command: $sub (convene|bench|init|lineage|roster|log|record|verify|promote|demote|expel|amend|veto|gate-clear|rot-triage|sign-vote|verify-votes|ballot-tap)" ;;
   esac
 
   local dir; dir="$(mktemp -d -t 5dive-council.XXXXXX)" || fail "$E_GENERIC" "mktemp failed"
@@ -1139,6 +1139,16 @@ cmd_council() {
   # so no --registry: pass the seat's args straight through, verbatim.
   if [[ "$sub" == "sign-vote" || "$sub" == "verify-votes" ]]; then
     node "$dir/cli.mjs" "$sub" "$@"; return $?
+  fi
+
+  # DIVE-1565: human ballot TAP -> task-close bridge. The DIVE-1566 telegram plugin parses the tapped
+  # button's `cvote:<ref>:<code>:<nonce>` callback_data and shells THIS verb. It is a pure passthrough
+  # (no sudo, no root seal, no lineage write): the verb prefix-accepts the ref to a unique OPEN human
+  # ballot, verifies the one-time nonce against the ballot body's stored digest, and CLOSES that same
+  # CNCL-18 ballot task with the `COUNCIL-VOTE: <verb> :: (human tap)` line — the SAME ingress an agent
+  # heartbeat writes, no second write path. Preserve its stdout JSON + exit code so the plugin can gate.
+  if [[ "$sub" == "ballot-tap" ]]; then
+    node "$dir/cli.mjs" ballot-tap "$@"; return $?
   fi
 
   if [[ "$sub" == "bench" ]]; then

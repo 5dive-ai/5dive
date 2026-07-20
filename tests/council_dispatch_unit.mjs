@@ -7,7 +7,7 @@ import {
 } from '../src/council/engine.mjs'
 // CNCL-18: the non-blocking ballot ADAPTER lives in cli.mjs (guarded entrypoint so this import
 // does NOT run the arg-parser). We drive its PURE collection logic with injected exec/clock seams.
-import { dispatchBallotVote } from '../src/council/cli.mjs'
+import { dispatchBallotVote, ballotTap } from '../src/council/cli.mjs'
 import { createHash } from 'node:crypto'
 
 let pass = 0, fail = 0
@@ -235,6 +235,91 @@ const rEngine = await runCouncil({ role: 'convene', question: 'ship?', seats: [{
   { seatVote: dispatchBallotVote({ deadline: 100, poll: 1, _now: fixedNow, _sleep: noSleep,
     _exec: ballotExec({ rowSeq: [{ status: 'done', result: 'COUNCIL-VOTE: approve :: fine' }] }) }) })
 ok(rEngine.votes.length === 2 && rEngine.votes.every(v => v.vote === 'approve'), 'ballot: dispatchBallotVote plugs into runCouncil as the seatVote adapter')
+
+// ==================== DIVE-1565: ballotTap tap->task-close BRIDGE (offline, stubbed exec) ====================
+// A stub `5dive` reader: `task ls --json` returns the configured task rows; `task done <id> --result=…`
+// records the close call. NEVER shells a real 5dive. Every audit line is captured (asserted nonce-free).
+const NONCE = 'a'.repeat(32)                                    // a 16-byte hex one-time nonce
+const DIGEST = createHash('sha256').update(NONCE).digest('hex') // what the ballot body stores
+const humanBallot = (over = {}) => ({ id: 1600, ident: 'DIVE-1600', status: 'todo',
+  body: `vote please\n[council ballot-auth] nonceDigest=${DIGEST}`, ...over })
+function tapExec(cfg = {}) {
+  const rows = cfg.rows || [humanBallot()]
+  return (args) => {
+    if (args[0] === 'task' && args[1] === 'ls') return JSON.stringify({ ok: true, data: { tasks: rows } })
+    if (args[0] === 'task' && args[1] === 'done') {
+      if (cfg.doneThrows) throw new Error('task done boom')
+      if (cfg.doneCalls) cfg.doneCalls.push(args)
+      return JSON.stringify({ ok: true, data: {} })
+    }
+    throw new Error('tapExec: unexpected argv ' + args.join(' '))
+  }
+}
+const auditSink = () => { const lines = []; return { audit: (m) => lines.push(m), lines } }
+
+// (t1) a valid tap prefix-accepts the unique OPEN human ballot, verifies the nonce, and CLOSES it with
+// the mapped COUNCIL-VOTE line — the SAME ingress an agent heartbeat writes.
+{
+  const done = [], a = auditSink()
+  const r = ballotTap({ ref: 'DIVE-1600', vote: 'a', nonce: NONCE, _exec: tapExec({ doneCalls: done }), _audit: a.audit })
+  ok(r.ok === true && r.vote === 'approve' && r.taskId === 'DIVE-1600', 'ballot-tap: valid approve tap resolves + records approve')
+  const doneArg = done[0] || []
+  ok(doneArg[0] === 'task' && doneArg[1] === 'done' && doneArg[2] === 'DIVE-1600', 'ballot-tap: closes the resolved ballot task via `task done`')
+  ok(doneArg.includes('--result=COUNCIL-VOTE: approve :: (human tap)'), 'ballot-tap: result carries `COUNCIL-VOTE: approve :: (human tap)`')
+  ok(a.lines.every(l => !l.includes(NONCE)), 'ballot-tap: no audit line ever prints the raw nonce')
+}
+
+// (t2) each vote code maps to the right verb; the third button (Abstain, e) is a valid vote token.
+for (const [code, verb] of [['a', 'approve'], ['r', 'reject'], ['e', 'abstain']]) {
+  const done = []
+  const r = ballotTap({ ref: 'DIVE-1600', vote: code, nonce: NONCE, _exec: tapExec({ doneCalls: done }), _audit: () => {} })
+  ok(r.ok && r.vote === verb, `ballot-tap: code ${code} -> ${verb}`)
+  ok((done[0] || []).includes(`--result=COUNCIL-VOTE: ${verb} :: (human tap)`), `ballot-tap: ${verb} written to the ballot task`)
+}
+
+// (t3) a nonce whose sha256 != the stored digest is UNAUTHENTICATED -> fail-closed, task NOT closed.
+{
+  const done = []
+  const r = ballotTap({ ref: 'DIVE-1600', vote: 'a', nonce: 'b'.repeat(32), _exec: tapExec({ doneCalls: done }), _audit: () => {} })
+  ok(r.ok === false && r.reason === 'nonce mismatch' && done.length === 0, 'ballot-tap: wrong nonce -> fail-closed, ballot never closed')
+}
+
+// (t4) a prefix that matches NO open human ballot is a MISS (also the one-time replay path: a tapped
+// ballot is `done`, so it drops out of the OPEN set and a second tap resolves to a miss).
+{
+  const r = ballotTap({ ref: 'DIVE-9999', vote: 'a', nonce: NONCE, _exec: tapExec(), _audit: () => {} })
+  ok(r.ok === false && r.reason === 'no match', 'ballot-tap: unknown/expired ref -> miss (fail-closed)')
+  const doneRow = ballotTap({ ref: 'DIVE-1600', vote: 'a', nonce: NONCE, _exec: tapExec({ rows: [humanBallot({ status: 'done' })] }), _audit: () => {} })
+  ok(doneRow.ok === false && doneRow.reason === 'no match', 'ballot-tap: a REPLAY on an already-closed ballot -> miss (one-time)')
+}
+
+// (t5) a prefix that matches MORE THAN ONE open human ballot is AMBIGUOUS -> fail-closed (never guess).
+{
+  const rows = [humanBallot({ id: 1600, ident: 'DIVE-1600' }), humanBallot({ id: 1601, ident: 'DIVE-1601' })]
+  const a = auditSink()
+  const r = ballotTap({ ref: 'DIVE-160', vote: 'a', nonce: NONCE, _exec: tapExec({ rows }), _audit: a.audit })
+  ok(r.ok === false && r.reason === 'ambiguous', 'ballot-tap: an ambiguous prefix -> fail-closed')
+  ok(a.lines.some(l => /AMBIGUOUS/.test(l)), 'ballot-tap: the ambiguity is audited')
+}
+
+// (t6) the prefix only ever resolves against HUMAN ballots — an agent ballot (no nonceDigest) with the
+// same id prefix is invisible to the bridge, so it can never be closed by a tap.
+{
+  const agentBallot = { id: 1600, ident: 'DIVE-1600', status: 'todo', body: 'Cast your vote by CLOSING this task ...' }
+  const r = ballotTap({ ref: 'DIVE-1600', vote: 'a', nonce: NONCE, _exec: tapExec({ rows: [agentBallot] }), _audit: () => {} })
+  ok(r.ok === false && r.reason === 'no match', 'ballot-tap: an agent ballot (no nonceDigest) is not tap-closable')
+}
+
+// (t7) malformed taps are refused BEFORE any board read (empty ref / bad code / empty nonce).
+ok(ballotTap({ ref: '', vote: 'a', nonce: NONCE, _exec: () => { throw new Error('should not exec') }, _audit: () => {} }).reason === 'missing ref', 'ballot-tap: empty ref refused pre-read')
+ok(ballotTap({ ref: 'DIVE-1600', vote: 'x', nonce: NONCE, _exec: () => { throw new Error('should not exec') }, _audit: () => {} }).reason === 'bad vote code', 'ballot-tap: bad vote code refused pre-read')
+ok(ballotTap({ ref: 'DIVE-1600', vote: 'a', nonce: '', _exec: () => { throw new Error('should not exec') }, _audit: () => {} }).reason === 'missing nonce', 'ballot-tap: empty nonce refused pre-read')
+
+// (t8) nonce verified but `task done` fails -> fail-closed (surface, do not swallow as success).
+{
+  const r = ballotTap({ ref: 'DIVE-1600', vote: 'a', nonce: NONCE, _exec: tapExec({ doneThrows: true }), _audit: () => {} })
+  ok(r.ok === false && r.reason === 'task done failed', 'ballot-tap: a failed close is reported, never a false success')
+}
 
 console.log(`\nCNCL-7 dispatch: ${pass} passed, ${fail} failed (bound to src/council/engine.mjs)`)
 process.exit(fail ? 1 : 0)
