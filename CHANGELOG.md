@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased — Bounded gate-alert delivery retries (DIVE-1502)
+
+- fix(gates): split confirmed delivery (`gate_pinged_at`) from attempted delivery (`gate_last_attempt_at`). Unconfirmed Bot API sends now back off exponentially at 1h→2h→4h→8h, stop after five failed attempts, and raise one durable owner/coordinator alarm instead of retrying at every heartbeat forever. A later confirmed `/inbox --send` resets the failure episode.
+- fix(gates): every reminder/initial-alert path rechecks that the gate is still unanswered and the task non-terminal; the final human-send chokepoint refuses a batch if any selected row was answered, superseded, done, or cancelled during composition. Telegram-agent steering carries the same live-state rule so stale session context cannot resurrect an already-resolved ask.
+- test(gates): focused receipt/re-nag coverage proves next-tick silence, bounded retry/cap/alarm behavior, attempt-vs-confirmed timestamps, and terminal/superseded row suppression.
+
 ## 0.11.26 — Reliable inter-agent sends to codex agents: detect the codex composer marker (DIVE-1528) (2026-07-20)
 
 - fix(agent): `agent send`/`ask`/`_deliver` to a codex agent (e.g. andy) no longer times out 45s and prints the false "input prompt not detected — best-effort (may be lost)" warning. The send-path readiness probe (`wait_agent_input_ready`) only matched claude's `❯` and antigravity's footer; codex's composer marker `›` (U+203A) was in `_hb_idle_marker` (DIVE-1211) — whose own comment says it "Mirrors wait_agent_input_ready" — but had never been added to the send path, so every send to an idle codex agent fell through to the lossy best-effort branch. Added `›`, so codex is detected immediately and `inject_and_submit` confirms delivery like any other TUI.

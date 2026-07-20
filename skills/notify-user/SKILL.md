@@ -15,6 +15,12 @@ paired chat via this agent's own bot token.
 - **Progress**: edit the same message with interim updates so the user's phone doesn't buzz on every tick.
 - **Done**: send a **new** reply with the result. New messages trigger push notifications; edits do not.
 
+## Live-state guard
+
+Before repeating a task ask or gate reminder, re-read that task's live state.
+Never message an ask whose gate is already answered/superseded or whose task is
+done/cancelled; authoritative board state wins over stale session context.
+
 ## Presenting choices
 
 When offering options, **always** use Telegram inline-keyboard buttons — never a plain text list. Each option is one button the user can tap to respond.

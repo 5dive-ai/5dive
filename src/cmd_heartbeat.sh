@@ -885,14 +885,21 @@ _hb_gate_ttl_sweep() {
                  AND (tier IS NULL OR tier=2 OR (tier=1 AND recommend IS NULL))
                  AND COALESCE(need_asked_at, updated_at) <= datetime('now','-72 hours')
                  AND (gate_pinged_at IS NULL OR gate_pinged_at <= datetime('now','-7 days'))
-                 AND status NOT IN ('done','cancelled')"
+                 AND status NOT IN ('done','cancelled')
+                 AND ${_HB_GATE_DELIVERY_RETRY_WHERE}"
   local aname
   while IFS= read -r aname; do
     [[ -n "$aname" ]] || continue
-    _task_agent_channel "$aname" || continue
     local lines_main lines_manual reminder_ids
     reminder_ids=$(db "SELECT id FROM tasks WHERE ${_t2_where} AND assignee=$(sqlq "$aname")
                        ORDER BY COALESCE(need_asked_at,updated_at),id;" | paste -sd, -)
+    [[ -n "$reminder_ids" ]] || continue
+    if ! _task_agent_channel "$aname"; then
+      _task_record_gate_delivery_result "$reminder_ids" 0
+      warn "stale-gate reminder for ${reminder_ids}: ${aname} has no paired channel; bounded retry recorded"
+      _hb_log "[gate-ttl] ${aname} has no paired channel for rows ${reminder_ids}; attempt recorded"
+      continue
+    fi
     lines_main=$(db "SELECT '• /task_'||id||' ['||ident||'] '||need_type||', '||CAST(julianday('now')-julianday(COALESCE(need_asked_at,updated_at)) AS INT)||'d — '||substr(replace(COALESCE(ask,''), x'0a', ' '),1,90)
                      FROM tasks WHERE ${_t2_where} AND assignee=$(sqlq "$aname") AND need_type != 'manual'
                      ORDER BY COALESCE(need_asked_at,updated_at);")
@@ -934,13 +941,22 @@ _hb_gate_ttl_sweep() {
 
 # DIVE-1490: receipt-backed gate re-nags. A freshly filed gate gets one follow-
 # up after 1h; once a follow-up has been delivered, subsequent reminders are
-# 24h apart. Migration-free: gate_pinged_at is both the delivery receipt and
-# throttle stamp. An initial receipt is identifiable because it is before
+# 24h apart. DIVE-1502 splits the confirmed receipt from the attempt throttle:
+# gate_pinged_at remains proof of delivery, while gate_last_attempt_at plus the
+# consecutive failure count back off unconfirmed retries at 1h/2h/4h/8h and
+# stop after five total failed attempts. An initial receipt is identifiable because it is before
 # need_asked_at+1h; a re-nag receipt is at/after that boundary. Failed sends are
-# deliberately NOT stamped, so the next heartbeat retries instead of silently
-# dropping the gate. T2 uses the filing agent's paired-human channel; T1 routes
+# never stamped as delivered, but ARE stamped as attempted so the next heartbeat
+# cannot immediately resend. T2 uses the filing agent's paired-human channel; T1 routes
 # through the existing org-lead resolver. One message/keyboard is built per
 # resolved recipient, regardless of how many gates are due.
+_HB_GATE_DELIVERY_MAX_FAILURES="${FIVEDIVE_GATE_DELIVERY_MAX_FAILURES:-5}"
+[[ "$_HB_GATE_DELIVERY_MAX_FAILURES" =~ ^[1-9][0-9]*$ ]] || _HB_GATE_DELIVERY_MAX_FAILURES=5
+_HB_GATE_DELIVERY_RETRY_WHERE="COALESCE(gate_delivery_failures,0) < ${_HB_GATE_DELIVERY_MAX_FAILURES}
+  AND (COALESCE(gate_delivery_failures,0)=0 OR gate_last_attempt_at IS NULL
+       OR gate_last_attempt_at <= datetime('now', CASE COALESCE(gate_delivery_failures,0)
+            WHEN 1 THEN '-1 hour' WHEN 2 THEN '-2 hours'
+            WHEN 3 THEN '-4 hours' ELSE '-8 hours' END))"
 _HB_GATE_RENAG_WHERE="need_type IS NOT NULL AND need_answered_at IS NULL
   AND status NOT IN ('done','cancelled') AND COALESCE(tier,2) != 0
   AND COALESCE(need_asked_at,updated_at,created_at) <= datetime('now','-1 hour')
@@ -948,14 +964,20 @@ _HB_GATE_RENAG_WHERE="need_type IS NOT NULL AND need_answered_at IS NULL
            AND COALESCE(need_asked_at,updated_at,created_at) <= datetime('now','-48 hours'))
   AND (gate_pinged_at IS NULL
        OR gate_pinged_at < datetime(COALESCE(need_asked_at,updated_at,created_at),'+1 hour')
-       OR gate_pinged_at <= datetime('now','-24 hours'))"
+       OR gate_pinged_at <= datetime('now','-24 hours'))
+  AND ${_HB_GATE_DELIVERY_RETRY_WHERE}"
 
 _hb_gate_renag_batch() { # <recipient_agent> <comma-separated task ids> <route_label>
   local recipient="$1" idlist="$2" route_label="$3"
   [[ -n "$recipient" && "$idlist" =~ ^[0-9]+(,[0-9]+)*$ ]] || return 0
+  # Re-read immediately before rendering: selection and send are separate DB
+  # moments, and a human answer/task close in between must supersede the alert.
+  idlist=$(db "SELECT id FROM tasks WHERE id IN (${idlist}) AND ${_HB_GATE_RENAG_WHERE} ORDER BY id;" 2>/dev/null | paste -sd, -)
+  [[ -n "$idlist" ]] || return 0
   if ! _task_agent_channel "$recipient"; then
-    warn "gate re-nag for task rows ${idlist}: recipient ${recipient} has no paired channel; will retry next heartbeat"
-    _hb_log "[gate-renag] recipient ${recipient} has no paired channel for rows ${idlist}"
+    _task_record_gate_delivery_result "$idlist" 0
+    warn "gate re-nag for task rows ${idlist}: recipient ${recipient} has no paired channel; bounded retry recorded"
+    _hb_log "[gate-renag] recipient ${recipient} has no paired channel for rows ${idlist}; attempt recorded"
     return 0
   fi
 
@@ -985,7 +1007,9 @@ _hb_gate_renag_batch() { # <recipient_agent> <comma-separated task ids> <route_l
       rows=$(jq -cn --argjson a "$rows" --argjson b "$markup" '$a + ($b.inline_keyboard // [])' 2>/dev/null) || rows='[]'
     fi
   done < <(db "SELECT id||x'1f'||ident||x'1f'||need_type||x'1f'||COALESCE(need_options,'')||x'1f'||COALESCE(recommend,'')||x'1f'||substr(replace(COALESCE(ask,''),x'0a',' '),1,240)
-               FROM tasks WHERE id IN (${idlist}) ORDER BY COALESCE(need_asked_at,updated_at,created_at),id;")
+               FROM tasks WHERE id IN (${idlist}) AND need_type IS NOT NULL
+                 AND need_answered_at IS NULL AND status NOT IN ('done','cancelled')
+               ORDER BY COALESCE(need_asked_at,updated_at,created_at),id;")
 
   local reply_markup=""
   [[ "$rows" != "[]" ]] && reply_markup=$(jq -cn --argjson rows "$rows" '{inline_keyboard:$rows}' 2>/dev/null) || true
@@ -1004,6 +1028,38 @@ _hb_gate_renag_batch() { # <recipient_agent> <comma-separated task ids> <route_l
   else
     _hb_log "[gate-renag] delivery unconfirmed for ${idlist} via ${recipient}; receipt left unchanged"
   fi
+  return 0
+}
+
+# Once bounded human-facing retries are exhausted, stop touching the paired
+# channel and raise one durable alarm to the task owner/coordinator. Repairing
+# the channel and explicitly sending the inbox can confirm delivery and reset
+# the episode; until then the one-shot alarm prevents both human and agent spam.
+_hb_gate_delivery_alarm_sweep() {
+  local row gid ident owner recipient failures
+  while IFS= read -r row; do
+    [[ -n "$row" ]] || continue
+    IFS=$'\x1f' read -r gid ident owner failures <<<"$row"
+    [[ -n "$gid" && -n "$ident" ]] || continue
+    recipient="$owner"
+    [[ -n "$recipient" ]] || recipient=$(_task_resolve_coordinator)
+    local msg="🚨 ${ident} gate alert delivery is persistently unconfirmed after ${failures} bounded attempts (1h→2h→4h→8h). Human reminders are now capped; repair the paired channel, then run '5dive task inbox --send' or answer/close the gate."
+    if [[ -n "$recipient" ]]; then
+      ( cmd_send "$recipient" --message="$msg" ) >/dev/null 2>&1 || true
+    fi
+    warn "$msg"
+    audit_log "gate delivery capped" error 1 -- "task=$ident" "attempts=$failures" "recipient=${recipient:-none}" || true
+    db "UPDATE tasks SET gate_delivery_alarm_at=datetime('now')
+        WHERE id=${gid} AND need_type IS NOT NULL AND need_answered_at IS NULL
+          AND status NOT IN ('done','cancelled')
+          AND COALESCE(gate_delivery_failures,0) >= ${_HB_GATE_DELIVERY_MAX_FAILURES}
+          AND gate_delivery_alarm_at IS NULL;" 2>/dev/null || true
+    _hb_log "[gate-delivery] capped ${ident} after ${failures} unconfirmed attempts; alarmed ${recipient:-logs-only}"
+  done < <(db "SELECT id||x'1f'||ident||x'1f'||COALESCE(NULLIF(created_by,''),assignee,'')||x'1f'||COALESCE(gate_delivery_failures,0)
+               FROM tasks WHERE need_type IS NOT NULL AND need_answered_at IS NULL
+                 AND status NOT IN ('done','cancelled')
+                 AND COALESCE(gate_delivery_failures,0) >= ${_HB_GATE_DELIVERY_MAX_FAILURES}
+                 AND gate_delivery_alarm_at IS NULL ORDER BY id;" 2>/dev/null)
   return 0
 }
 
@@ -1528,6 +1584,9 @@ cmd_heartbeat_tick() {
   # eligible for pickup this same tick. The renag's confirmed gate_pinged_at
   # stamp also preserves pass 3's existing seven-day throttle (no duplicate).
   _hb_gate_ttl_sweep || _hb_log "[gate-ttl] pass errored (non-fatal)"
+  # DIVE-1502: a failure that reached the retry cap in either alert pass above
+  # becomes one owner/coordinator alarm, never another paired-human reminder.
+  _hb_gate_delivery_alarm_sweep || _hb_log "[gate-delivery] alarm pass errored (non-fatal)"
   # DIVE-1355: the belt-and-suspenders half of the self-dispatch fix. Auto-recover
   # any task still stuck 'blocked' whose every blocking edge is a done/cancelled
   # task (repairs pre-existing rot like OSS-27 + any live cascade miss), and

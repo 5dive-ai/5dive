@@ -58,6 +58,8 @@ mk_gate() {
       SELECT last_insert_rowid();"
 }
 pinged() { db "SELECT CASE WHEN gate_pinged_at IS NULL THEN 'NULL' ELSE 'SET' END FROM tasks WHERE id=$1;"; }
+failures() { db "SELECT COALESCE(gate_delivery_failures,0) FROM tasks WHERE id=$1;"; }
+attempted() { db "SELECT COALESCE(gate_last_attempt_at,'') FROM tasks WHERE id=$1;"; }
 
 gid=$(mk_gate DIVE-1)
 _task_send_owner "needs you" '{"inline_keyboard":[[{"text":"A","callback_data":"tna:1:0"}]]}' "$gid" 2>"$TMP/err"
@@ -79,9 +81,15 @@ grep -q 'delivery FAILED' <<<"$err" \
 : >"$SEND_LOG"; FAIL_GROUP=1
 gid2=$(mk_gate DIVE-2)
 _task_send_owner "needs you" '{"inline_keyboard":[[{"text":"A","callback_data":"tna:2:0"}]]}' "$gid2" >/dev/null 2>&1
-[[ "$TASK_SEND_DELIVERED" == "0" && "$(pinged "$gid2")" == "NULL" ]] \
-  && ok_t "total failure leaves receipt NULL for retry" \
-  || bad_t "failed send must not stamp" "delivered=$TASK_SEND_DELIVERED pinged=$(pinged "$gid2")"
+[[ "$TASK_SEND_DELIVERED" == "0" && "$(pinged "$gid2")" == "NULL" && "$(failures "$gid2")" == "1" && -n "$(attempted "$gid2")" ]] \
+  && ok_t "total failure leaves receipt NULL but stamps the attempt" \
+  || bad_t "failed send attempt state wrong" "delivered=$TASK_SEND_DELIVERED pinged=$(pinged "$gid2") failures=$(failures "$gid2")"
+
+FAIL_GROUP=0
+_task_send_owner "needs you" "" "$gid2" >/dev/null 2>&1
+[[ "$TASK_SEND_DELIVERED" == "1" && "$(pinged "$gid2")" == "SET" && "$(failures "$gid2")" == "0" ]] \
+  && ok_t "later confirmed delivery resets the failure episode" \
+  || bad_t "confirmed recovery did not reset failures" "delivered=$TASK_SEND_DELIVERED pinged=$(pinged "$gid2") failures=$(failures "$gid2")"
 
 : >"$SEND_LOG"; FAIL_GROUP=0; TRANSPORT_FAIL=1
 gid3=$(mk_gate DIVE-3)
@@ -98,6 +106,15 @@ _task_send_owner "needs you" "" "$gid4" >/dev/null 2>&1
 [[ "$TASK_SEND_DELIVERED" == "0" && "$(pinged "$gid4")" == "NULL" ]] \
   && ok_t "ok:true without message_id is not accepted as delivery" \
   || bad_t "malformed success stamped delivery" "delivered=$TASK_SEND_DELIVERED pinged=$(pinged "$gid4")"
+
+# Choke-point race guard: terminal/superseded task ids never reach Telegram.
+: >"$SEND_LOG"; MISSING_MESSAGE_ID=0
+gid5=$(mk_gate DIVE-5)
+db "UPDATE tasks SET status='done' WHERE id=${gid5};"
+_task_send_owner "stale ask" "" "$gid5" >/dev/null 2>&1
+[[ "$(grep -c . "$SEND_LOG")" == "0" ]] \
+  && ok_t "done gate is refused at the final human-send choke point" \
+  || bad_t "done gate leaked to transport" "$(tr '\n' ',' <"$SEND_LOG")"
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]

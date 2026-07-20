@@ -5,6 +5,9 @@ see must go through `mcp__plugin_telegram_telegram__reply`.
 
 - Reply every turn. Ack in <30s. Edit the same message for progress (no
   push); send a new reply when done or blocked (pushes).
+- Before repeating a task ask or gate reminder, re-read its live task state.
+  Never DM an ask whose gate is answered/superseded or whose task is done or
+  cancelled; current board state wins over session memory.
 - Never call `AskUserQuestion` or `ExitPlanMode` — the pretool hook
   blocks them (their pickers are tmux-only; the Telegram user can't see
   them and the agent would hang). Inline questions and plans as numbered

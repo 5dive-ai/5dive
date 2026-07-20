@@ -223,13 +223,20 @@ CREATE TABLE IF NOT EXISTS tasks (
   -- tier 2 (never auto-cleared). need_asked_at stamps gate filing time — the
   -- TTL clock (updated_at is useless for this: any row touch bumps it).
   -- gate_pinged_at = last CONFIRMED Bot API delivery for this gate (initial,
-  -- 1h/24h re-nag, or legacy TTL batch). It is both the queryable receipt and
-  -- migration-free throttle stamp; failed/unconfirmed sends leave it unchanged.
+  -- 1h/24h re-nag, or legacy TTL batch). gate_last_attempt_at is stamped for
+  -- EVERY alert attempt, including unconfirmed sends; gate_delivery_failures
+  -- drives bounded exponential retry, and gate_delivery_alarm_at makes the
+  -- persistent-failure alarm one-shot. Keeping receipt and attempt clocks
+  -- separate prevents a dead channel from turning an unset receipt into an
+  -- hourly/tick-cadence spam rail (DIVE-1502).
   -- wake_at: a parked task
   -- (task park --wake=...) auto-unparks when the heartbeat passes this time.
   tier                INTEGER,
   need_asked_at       TEXT,
   gate_pinged_at      TEXT,
+  gate_last_attempt_at TEXT,
+  gate_delivery_failures INTEGER NOT NULL DEFAULT 0,
+  gate_delivery_alarm_at TEXT,
   wake_at             TEXT,
   -- DIVE-931 secure credential drop: a --type=secret gate can name WHERE the
   -- value should land — secret_key is the env-var name, connector the
@@ -668,7 +675,8 @@ _tasks_db_migrate() {
            'acceptance_criteria TEXT' 'verify_command TEXT' 'max_iterations INTEGER' 'verifier TEXT' \
            'iteration INTEGER' 'maker_agent TEXT' 'handoff_ack_at TEXT' 'task_budget TEXT' \
            'handoff_delivered_at TEXT' 'handoff_stale_pinged_at TEXT' \
-           'tier INTEGER' 'need_asked_at TEXT' 'gate_pinged_at TEXT' 'wake_at TEXT' \
+           'tier INTEGER' 'need_asked_at TEXT' 'gate_pinged_at TEXT' \
+           'gate_last_attempt_at TEXT' 'gate_delivery_failures INTEGER NOT NULL DEFAULT 0' 'gate_delivery_alarm_at TEXT' 'wake_at TEXT' \
            'secret_key TEXT' 'connector TEXT' 'human_nonce_hash TEXT' \
            'ask_shape TEXT' 'precedent_ref INTEGER' 'precedent_kind TEXT' \
            'shipped_flag_at TEXT' 'routed_reviewer TEXT' \

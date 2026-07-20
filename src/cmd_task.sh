@@ -2131,6 +2131,7 @@ cmd_task_need() {
             precedent_ref=${precedent_ref:-NULL},
             precedent_kind=$(sqlq_or_null "$precedent_kind"),
             tier=${tier}, need_asked_at=datetime('now'), gate_pinged_at=NULL,
+            gate_last_attempt_at=NULL, gate_delivery_failures=0, gate_delivery_alarm_at=NULL,
             need_answer=NULL, need_answered_at=NULL
       WHERE id=${id};"
 
@@ -2541,11 +2542,37 @@ _task_send_owner_groups() { # <token> <access> <text> <markup> <task_ids> [exclu
   done
 }
 
-_task_stamp_confirmed_delivery() { # <comma-separated numeric task ids>
+_task_open_gate_ids() { # <comma-separated numeric task ids>
   local task_ids="$1"
-  [[ "${TASK_SEND_DELIVERED:-0}" == "1" && "$task_ids" =~ ^[0-9]+(,[0-9]+)*$ ]] || return 0
-  db "UPDATE tasks SET gate_pinged_at=datetime('now')
-      WHERE id IN (${task_ids}) AND need_type IS NOT NULL AND need_answered_at IS NULL;" 2>/dev/null || true
+  [[ "$task_ids" =~ ^[0-9]+(,[0-9]+)*$ ]] || return 0
+  db "SELECT id FROM tasks WHERE id IN (${task_ids})
+        AND need_type IS NOT NULL AND need_answered_at IS NULL
+        AND status NOT IN ('done','cancelled')
+      ORDER BY instr(',${task_ids},', ','||id||',');" 2>/dev/null | paste -sd, -
+}
+
+# DIVE-1502: receipt and attempt are deliberately separate clocks. Every
+# attempted gate-alert batch records an attempt. Confirmation resets the failure
+# episode and advances gate_pinged_at; an unconfirmed attempt increments the
+# bounded-retry counter but can never masquerade as delivery.
+_task_record_gate_delivery_result() { # <comma-separated numeric task ids> <0|1 delivered>
+  local task_ids="$1" delivered="${2:-0}"
+  [[ "$task_ids" =~ ^[0-9]+(,[0-9]+)*$ ]] || return 0
+  if [[ "$delivered" == "1" ]]; then
+    db "UPDATE tasks SET gate_last_attempt_at=datetime('now'), gate_pinged_at=datetime('now'),
+          gate_delivery_failures=0, gate_delivery_alarm_at=NULL
+        WHERE id IN (${task_ids}) AND need_type IS NOT NULL AND need_answered_at IS NULL
+          AND status NOT IN ('done','cancelled');" 2>/dev/null || true
+  else
+    db "UPDATE tasks SET gate_last_attempt_at=datetime('now'),
+          gate_delivery_failures=COALESCE(gate_delivery_failures,0)+1
+        WHERE id IN (${task_ids}) AND need_type IS NOT NULL AND need_answered_at IS NULL
+          AND status NOT IN ('done','cancelled');" 2>/dev/null || true
+  fi
+}
+
+_task_stamp_confirmed_delivery() { # <comma-separated numeric task ids>
+  _task_record_gate_delivery_result "$1" "${TASK_SEND_DELIVERED:-0}"
 }
 
 # _task_send_owner — send ONE message ($1, optional reply_markup $2, optional
@@ -2565,6 +2592,19 @@ _task_send_owner() {
   local text="$1" reply_markup="${2:-}" task_ids="${3:-}"
   local token="$TASK_CH_TOKEN" access_file="$TASK_CH_ACCESS"
   TASK_SEND_DELIVERED=0 TASK_SEND_MESSAGE_IDS="" TASK_SEND_FAILED=0
+  # Final choke-point guard: if any row in a composed alert became answered,
+  # done, or cancelled after the caller selected it, refuse the entire batch.
+  # The next heartbeat rebuilds a clean active-only batch; sending mixed stale
+  # prose would re-ask a superseded question (the DIVE-1502 01:19 incident).
+  if [[ -n "$task_ids" ]]; then
+    local _live_gate_ids
+    _live_gate_ids=$(_task_open_gate_ids "$task_ids")
+    if [[ -z "$_live_gate_ids" || "$_live_gate_ids" != "$task_ids" ]]; then
+      TASK_SEND_FAILED=1
+      warn "gate alert skipped — task state changed before send (requested=${task_ids}, active=${_live_gate_ids:-none})"
+      return 0
+    fi
+  fi
   # DIVE-1506: fail-closed chokepoint. EVERY real human-facing task send (gate-notify + /inbox
   # digest) funnels here. Refuse unless the active task DB is the prod DB — an isolated e2e/fixture
   # DB (council_gate_e2e's `task need`, a replayed fixture digest) must never reach a paired human.
@@ -2573,6 +2613,7 @@ _task_send_owner() {
   if ! _task_human_send_allowed; then
     TASK_SEND_FAILED=1
     warn "DIVE-1506: refused a human task-send — active task DB (${TASKS_DB:-${STATE_DIR:-/var/lib/5dive}/tasks/tasks.db}) is not the prod DB (fail-closed; set FIVEDIVE_PROD_TASKS_DB if this IS prod)"
+    [[ -n "$task_ids" ]] && _task_record_gate_delivery_result "$task_ids" 0
     return 0
   fi
 
@@ -2737,7 +2778,13 @@ task_need_notify() {
   # The delivery helper accepts numeric task row ids so it can stamp exactly the
   # alert(s) confirmed by Telegram. Resolve before channel routing so even a
   # total no-channel failure can be recorded against the gate.
-  local numid; numid=$(db "SELECT id FROM tasks WHERE ident=$(sqlq "$ident");")
+  local numid
+  numid=$(db "SELECT id FROM tasks WHERE ident=$(sqlq "$ident")
+              AND need_type IS NOT NULL AND need_answered_at IS NULL
+              AND status NOT IN ('done','cancelled');")
+  # A concurrent answer/close can land between `task need`'s write and this
+  # best-effort notifier. It supersedes the alert: never DM stale ask text.
+  [[ -n "$numid" ]] || return 0
   # Resolve bot token + the human's DM/group targets (TASK_CH_* globals). The
   # matched access type (TASK_CH_TYPE) gates the tap-to-answer buttons below.
   # DIVE-1243: never DROP a gate alert silently. The filing agent being unpaired
@@ -2755,6 +2802,7 @@ task_need_notify() {
     else
       warn "$ident: no lead channel either — gate recorded, visible only on the dashboard 'Needs you' card"
       _task_gate_delivery_log error "$numid" "" "" "filing agent and org lead have no paired channel"
+      _task_record_gate_delivery_result "$numid" 0
       return 0
     fi
   fi
@@ -2972,6 +3020,12 @@ _task_inbox_send() {
     fi
   done < <(db "SELECT id||x'1f'||ident||x'1f'||priority||x'1f'||need_type||x'1f'||COALESCE(need_options,'')||x'1f'||COALESCE(recommend,'')||x'1f'||substr(replace(COALESCE(ask,''),x'0a',' '),1,240)
                FROM tasks WHERE ${where} ${order} LIMIT ${cap};")
+  # The inbox can drain between the initial count and the render query. Do not
+  # emit an empty/stale "waiting on you" shell if the last gate was answered.
+  if [[ -z "$idlist" ]]; then
+    ok "inbox changed while composing — nothing remains to send" '{sent:false, gates:0}'
+    return
+  fi
   if (( total > cap )); then
     text+=$'\n\n'"…and $(( total - cap )) more — 5dive task inbox on the box or the dashboard."
   fi
@@ -3404,7 +3458,8 @@ cmd_task_answer() {
       # NULL) and re-arm the ping (gate_pinged_at NULL) so task_need_notify fires
       # fresh with the tap keyboard.
       local _esc_nonce=""; _esc_nonce=$(_human_nonce_mint)
-      db "UPDATE tasks SET routed_reviewer=NULL, gate_pinged_at=NULL$([[ -n "$_esc_nonce" ]] && echo ", human_nonce_hash=$(sqlq "$(_human_nonce_sha "$_esc_nonce")")") WHERE id=${id};"
+      db "UPDATE tasks SET routed_reviewer=NULL, gate_pinged_at=NULL,
+            gate_last_attempt_at=NULL, gate_delivery_failures=0, gate_delivery_alarm_at=NULL$([[ -n "$_esc_nonce" ]] && echo ", human_nonce_hash=$(sqlq "$(_human_nonce_sha "$_esc_nonce")")") WHERE id=${id};"
       audit_log "task answer escalate-to-human" ok 0 -- \
         "task=$ident" "type=$nt" "tier=$gtier" "reason=T2-floor refused routed gate — escalated to human with buttons" \
         "was_routed_to=$_routed_rev" "caller=$_caller3" "sudo_uid=${SUDO_UID:-}" 2>/dev/null || true
