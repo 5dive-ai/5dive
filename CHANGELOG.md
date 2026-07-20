@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.11.29 — Council ⇄ Telegram: read-only convene notice + tally (DIVE-1494 feature 1) (2026-07-20)
+
+- feat(council): `council convene` now emits an opt-in, read-only NOTICE of the outcome — disposition (rec, tally aA/rR/eE, conf), the question, and the sealed receipt handle — over the same guarded-optional `_tg_send` seam the founder-veto leg already uses (the telegram plugin provides `_tg_send`; council never hard-depends on it). Opt-in via `COUNCIL_NOTIFY=<chat>`; silent when unset or when the plugin has not installed the seam. This is the first of the DIVE-1494 council/telegram v1 features (convene notice + tally); the founder-veto tap and receipt/lineage view land separately. The notice carries NO nonce and no tap — it is distinct from the founder veto ping and is read-only by construction.
+- test(council): `tests/council_notify_e2e.sh` (wired into `council_unit.sh`) asserts the notice fires with the disposition + `aA/rR/eE` tally + receipt reference, carries no raw nonce / 32-hex bearer token (read-only safety), and stays silent when `COUNCIL_NOTIFY` is unset. Offline via the double-gated `COUNCIL_MOCK` + `COUNCIL_NOTIFY_SINK` capture seam (mirrors the veto `COUNCIL_VETO_NONCE_SINK`), so PRODUCTION never writes the sink.
+
 ## 0.11.28 — Council seat track record: score votes against real task outcomes, feed promote/demote with data (CNCL-17) (2026-07-20)
 
 - feat(council): new `5dive council record` — scores each seat's sealed votes against the REAL outcome of the task each convene decided (the receipt `subject`): a dissent (reject/escalate) is credited VINDICATED when the task went bad, an approve is credited when it landed good. Outcome is read from the decided task's terminal status (done → good, cancelled → bad; undecided tasks are never scored). Surfaces per-seat calibration so promote/demote votes run on data, not vibes.

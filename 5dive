@@ -26,7 +26,7 @@ esac
 
 # Bumped on every public release. `build.sh` checks this line exists; CI fails
 # the bundle-drift check if it's missing or empty.
-readonly FIVE_VERSION="0.11.28"
+readonly FIVE_VERSION="0.11.29"
 
 # GitHub org our repos live under. The org is being renamed
 # 5dive-com -> 5dive-ai (2026-06); fetches must work on either side of the
@@ -25929,6 +25929,34 @@ cmd_council() {
           _council_veto_ping "$offer_resolved" "$digest" "$execute_after" "$veto_nonce" || true
         fi
       fi
+    fi
+  fi
+
+  # DIVE-1494 (1): read-only convene NOTICE. Broadcast the verdict summary + tally to a configured
+  # council-notify chat over the SAME guarded-optional `_tg_send` seam the veto leg uses (the plugin
+  # provides it; council never hard-depends on it). Distinct from the founder veto ping: this carries
+  # NO nonce and no tap — it is a read-only digest of the outcome. Opt-in via COUNCIL_NOTIFY (a chat
+  # id/handle); silent when unset, under MOCK, or when the plugin hasn't installed `_tg_send`.
+  # Best-effort + non-blocking so a notify failure never affects the sealed verdict.
+  if [[ -n "${COUNCIL_NOTIFY:-}" ]]; then
+    local n_council n_disp n_rec n_tally n_conf n_q n_short n_seal n_msg
+    n_council="$(printf '%s' "$raw" | jq -r '.council // "council"')"
+    n_disp="$(printf '%s' "$raw" | jq -r '.disposition // "?"')"
+    n_rec="$(printf '%s' "$raw" | jq -r '.verdict.recommendation // "?"')"
+    n_tally="$(printf '%s' "$raw" | jq -r '.verdict.tally | "a\(.approve)/r\(.reject)/e\(.escalate)"' 2>/dev/null)"
+    n_conf="$(printf '%s' "$raw" | jq -r '.verdict.confidence // "?"')"
+    n_q="$(printf '%s' "$raw" | jq -r '.question // ""')"
+    n_short="${n_q:0:80}"; [[ "${#n_q}" -gt 80 ]] && n_short="${n_short}…"
+    if [[ -n "$digest" ]]; then n_seal="receipt ${digest:0:12}… (sealed)"; else n_seal="unsealed"; fi
+    n_msg="Council ${n_council}: ${n_disp} (rec=${n_rec}, tally ${n_tally}, conf ${n_conf}) — \"${n_short}\" · ${n_seal}"
+    # Offline-test capture ONLY (double-gated on MOCK + an explicit sink, mirroring the veto
+    # COUNCIL_VETO_NONCE_SINK seam): drop the composed notice so the bash e2e can assert its content
+    # without a live telegram rail. PRODUCTION (non-MOCK) never writes the sink and delivers solely
+    # via the guarded-optional `_tg_send` seam the plugin provides.
+    if [[ -n "${COUNCIL_MOCK:-}" && -n "${COUNCIL_NOTIFY_SINK:-}" ]]; then
+      ( umask 077; printf '%s\n' "$n_msg" >> "$COUNCIL_NOTIFY_SINK" ) 2>/dev/null || true
+    elif [[ -z "${COUNCIL_MOCK:-}" ]] && command -v _tg_send >/dev/null 2>&1; then
+      _tg_send "$COUNCIL_NOTIFY" "$n_msg" >/dev/null 2>&1 || true
     fi
   fi
 
