@@ -1615,7 +1615,7 @@ cmd_task_routing() {
 # fails to justify).
 _GATE_T2_FLOOR_RX='spend|billing|invoice|charge|payment|refund|subscription|price|pricing|\$[0-9]|€[0-9]|publish|public post|announce|launch post|press|customer email|email customers|newsletter|blast|secret|credential|api key|token|password|delete|destroy|teardown|wipe|purge|drop[^.]{0,20}table|truncate|irreversible|revoke|dns|domain transfer'
 _gate_tier2_floor_hit() {
-  local text floor_rx="$_GATE_T2_FLOOR_RX" loaded_rx="" constitution_path=""
+  local text floor_rx="$_GATE_T2_FLOOR_RX" loaded_rx="" constitution_path="" ere_rc=0
   text=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
   # CNCL-14: production bundles include the council loader later in the file;
   # isolated task tests that source cmd_task alone retain the byte-identical
@@ -1628,7 +1628,18 @@ _gate_tier2_floor_hit() {
     constitution_path="$(_council_constitution_path 2>/dev/null || true)"
     if [[ -n "$constitution_path" && -f "$constitution_path" ]]; then
       loaded_rx="$(_council_hard_gate_rx 2>/dev/null || true)"
-      [[ -n "$loaded_rx" ]] && floor_rx="$loaded_rx"
+      if [[ -n "$loaded_rx" ]]; then
+        floor_rx="$loaded_rx"
+        # CNCL-28: engine.mjs can reject known JS-only syntax, but Bash is the
+        # consumer and therefore the authority on POSIX ERE validity. Bash =~
+        # returns 2 for an invalid expression; treat that as a whole-policy
+        # failure so one bad class can never silently disable the T2 floor.
+        [[ x =~ $floor_rx ]] || ere_rc=$?
+        if (( ere_rc == 2 )); then
+          warn "constitution hard_gates regex is invalid POSIX ERE; falling back to the shipped tier-2 floor (${constitution_path})"
+          floor_rx="$_GATE_T2_FLOOR_RX"
+        fi
+      fi
     fi
   fi
   [[ "$text" =~ $floor_rx ]]

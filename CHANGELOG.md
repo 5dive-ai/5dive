@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- fix(gates): compile-probe constitution `hard_gates` with Bash before using the combined POSIX ERE. A pattern rejected by Bash now emits a warning and atomically falls back to the shipped tier-2 floor instead of letting `[[ =~ ]]` return 2 and silently fail open (CNCL-28).
+
 ## 0.11.19 — Constitution loader: governance policy from `5dive.md` (CNCL-14) (2026-07-19)
 
 - feat(council): load the ratified constitution-as-data frontmatter from `${STATE_DIR}/5dive.md`: roster/bench pointer, per-class thresholds, quorum, veto principal(s) + hold/post-hoc windows, hard-gate classes, and ship/comms policy. Council convenes pass the loaded threshold matrix into the deterministic tally; primary-bench selection and veto windows/principal consume the same normalized document.

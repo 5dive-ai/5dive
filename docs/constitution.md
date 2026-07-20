@@ -47,7 +47,9 @@ Explain the company's governance choices here.
 The v0 parser accepts two-space mappings, scalar values, and inline arrays.
 `hard_gates` values are case-insensitive POSIX ERE patterns. Supplying the
 `hard_gates` map replaces the shipped class map, so an organization can add or
-remove a class without patching the CLI.
+remove a class without patching the CLI. Bash compile-probes the combined
+pattern before using it; if Bash rejects it, the entire loaded map is discarded
+and task gate tiering warns and falls back to the shipped tier-2 floor.
 
 Live consumers:
 

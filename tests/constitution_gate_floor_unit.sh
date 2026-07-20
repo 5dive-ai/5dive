@@ -51,6 +51,20 @@ else ok_t "brand-absent constitution does not floor brand"; fi
 _gate_tier2_floor_hit "approve billing" \
   && ok_t "other configured hard class remains active" || bad_t "configured money class missing"
 
+# `[^]` is accepted by JavaScript's RegExp and the constitution loader, but
+# rejected by Bash's POSIX ERE engine with rc=2. The Bash consumer must discard
+# the entire loaded policy, retain the legacy floor, and leave a loud diagnostic
+# instead of turning that rc=2 into a false "no hit" result.
+printf '%s\n' '---' 'hard_gates:' "  unsafe: '[^]'" "  public_comms: 'brand'" \
+  '---' '# JS-valid, ERE-invalid policy' > "$FIVEDIVE_CONSTITUTION_FILE"
+ere_warning="$TMP/ere-warning"
+_gate_tier2_floor_hit "approve billing" 2>"$ere_warning" \
+  && ok_t "ERE-invalid constitution regex falls back to legacy floor" || bad_t "ERE-invalid regex disabled legacy floor"
+if _gate_tier2_floor_hit "review the brand strategy" 2>/dev/null; then bad_t "ERE-invalid constitution partially applied"
+else ok_t "ERE-invalid constitution is discarded atomically"; fi
+grep -q 'invalid POSIX ERE; falling back to the shipped tier-2 floor' "$ere_warning" \
+  && ok_t "ERE-invalid constitution emits fallback warning" || bad_t "ERE-invalid fallback was silent"
+
 # Malformed frontmatter is never partially applied: conservative shipped defaults return.
 printf '%s\n' 'not yaml frontmatter' > "$FIVEDIVE_CONSTITUTION_FILE"
 [[ "$(_council_hard_gate_rx)" == "$_GATE_T2_FLOOR_RX" ]] \
