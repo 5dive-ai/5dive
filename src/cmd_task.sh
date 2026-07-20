@@ -61,6 +61,7 @@ _task_usage() {
   5dive task unpark <id|DIVE-N>                      # clear a park early -> todo (unless task-deps still block it)
   5dive task inbox                                   # list ONLY human-gated tasks, priority-ordered
   5dive task inbox --send [--channel-proof=<chat>]   # DM the owner ONE tap-button digest of those gates (root-side; nonce never printed)
+  5dive task coordinator [--json]                     # print the resolved org coordinator (DIVE-333/1568) — the one agent that fronts the pinned needs-you banner
   5dive task answer <id|DIVE-N> --value="..."        # record the human's answer, unblock, ping the owning agent
   5dive task clear-recs --channel-proof=<chat_id> [--only=<id|DIVE-N>]
                                                      # DIVE-1305: paired-human bulk-clear — apply each pending gate's --recommend as a HUMAN clear,
@@ -107,6 +108,7 @@ cmd_task() {
     escalate)        cmd_task_escalate "$@" ;;
     need)            cmd_task_need "$@" ;;
     inbox)           cmd_task_inbox "$@" ;;
+    coordinator)     cmd_task_coordinator "$@" ;;
     answer)          cmd_task_answer "$@" ;;
     clear-recs)      cmd_task_clear_recs "$@" ;;
     precedent)       cmd_task_precedent "$@" ;;
@@ -2873,6 +2875,23 @@ task_need_notify() {
 
   _task_send_owner "$text" "$reply_markup" "$numid"
   return 0
+}
+
+# DIVE-1568: expose the resolved org coordinator as a thin read-only verb so
+# surfaces that must act on exactly ONE agent (the DIVE-1503 pinned needs-you
+# banner) can gate themselves instead of every paired agent pinning the same
+# reminder into the founder's DM. Pure wrapper over _task_resolve_coordinator
+# (DIVE-333): the sole role='coordinator', else the lone org root, else empty
+# (ambiguous multi-root / no org) — callers MUST treat empty as "nobody pins".
+cmd_task_coordinator() {
+  tasks_db_init
+  [[ $# -eq 0 ]] || fail "$E_USAGE" "coordinator takes no positional args"
+  local who; who=$(_task_resolve_coordinator)
+  if (( JSON_MODE )); then
+    ok "" '{coordinator: $c}' --arg c "$who"
+  else
+    [[ -n "$who" ]] && echo "$who" || echo "(no coordinator resolved)"
+  fi
 }
 
 cmd_task_inbox() {

@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.11.35 — Expose the resolved org coordinator as a read-only verb (DIVE-1568) (2026-07-20)
+
+- feat(task): new `5dive task coordinator [--json]` prints the resolved org coordinator — a thin read-only wrapper over the existing `_task_resolve_coordinator` (DIVE-333): the sole `role='coordinator'`, else the lone org root, else empty (ambiguous multi-root / no org). JSON form emits `{ok:true,data:{coordinator:"<name>"}}` (empty string when unresolved).
+- why: the DIVE-1503/1558 pinned needs-you banner reconciles in EVERY paired agent's DM, so the founder got the same open-gate reminder pinned across N DMs. The telegram plugin now gates its banner reconcile on this verb so exactly ONE agent (the coordinator) fronts the pin; empty/ambiguous resolves to "nobody pins" (fail-quiet). Generalizes to customer boxes automatically.
+
 ## 0.11.34 — Default a2a return-channel convention for codex agents (DIVE-1535) (2026-07-20)
 
 - feat(agent-create): every new **codex** agent is now seeded with the a2a return-channel convention in its standing instructions (`~/.codex/AGENTS.md`) at create time. A headless codex worker (`channels=none`, e.g. andy) prints its deliverable only to its own tmux pane, `agent send` is one-way, and `agent ask` can't reliably capture a codex TUI — so the worker must PUSH its result back with `5dive agent send <from> "<result+path>"` when done. DIVE-1410 proved this end-to-end but only ever hand-wrote it into andy's file, so every other codex worker booted with no return channel. Follow-up to the reliability half in DIVE-1528 (#73).

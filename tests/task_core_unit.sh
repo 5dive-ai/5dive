@@ -149,6 +149,11 @@ run start "$identz" >/dev/null
 # --- T15: DIVE-969 verifier-by-default posture
 # Stand up a coordinator so a grader distinct from the maker can be resolved.
 ( cmd_org_set carol --role=coordinator ) >/dev/null 2>"$TMP"/err
+# --- DIVE-1568: `task coordinator` verb exposes the resolved coordinator so the
+# needs-you banner can pin on ONE agent only. carol holds role='coordinator'.
+[[ "$(run coordinator | jf '.data.coordinator')" == "carol" ]] \
+  && ok_t "DIVE-1568: task coordinator resolves the role='coordinator' agent" \
+  || bad_t "coordinator verb" "got=$(run coordinator | jf '.data.coordinator')"
 # non-trivial task (has a body) assigned to a different agent → verifier defaulted
 vd=$(run add --assignee=alice --body="real work here" -- "build the widget pipeline")
 [[ "$(echo "$vd" | jf '.data.verifyDefaulted')" == "true" && \
