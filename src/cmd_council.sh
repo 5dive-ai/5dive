@@ -2747,9 +2747,9 @@ _council_veto_ping() {
   local resolved="$1" digest="$2" execute_after="$3" nonce="$4"
   mkdir -p "$COUNCIL_DIR" 2>/dev/null || true
   # CNCL-9 (main gate amendment 2): the pings audit records ONLY the nonce DIGEST, never the raw
-  # bearer token. The raw nonce leaves this process solely via the founder delivery leg (_tg_send)
-  # below. The file is additionally locked 0600 root so a group-claude agent cannot read even the
-  # digest+recipient trail.
+  # bearer token. The raw nonce leaves this process solely via the structured founder delivery leg
+  # (`_tg_veto_offer`, DIVE-1546 rail B) below — never in chat text. The file is additionally locked
+  # 0600 root so a group-claude agent cannot read even the digest+recipient trail.
   local nonce_digest; nonce_digest="$(_council_sha256 "$nonce")"
   local line
   line="$(jq -cn --arg r "$resolved" --arg d "$digest" --arg ea "$execute_after" --arg nd "$nonce_digest" \
@@ -2759,11 +2759,25 @@ _council_veto_ping() {
     chmod 0600 "${COUNCIL_DIR}/veto-pings.jsonl" 2>/dev/null || true
     [[ "$(id -u)" -eq 0 ]] && chown root:root "${COUNCIL_DIR}/veto-pings.jsonl" 2>/dev/null || true
   fi
-  # Founder delivery leg: the RAW one-time nonce is delivered ONLY here, to the resolved recipient.
-  # A missing rail must never fail the (already-sealed) convene. Skipped under MOCK (offline tests
-  # exercise the durable audit above without touching a live telegram rail).
-  if [[ -z "${COUNCIL_MOCK:-}" ]] && command -v _tg_send >/dev/null 2>&1; then
-    _tg_send "$resolved" "Council veto offer — a pass sealed (${digest:0:12}…). Execution holds until ${execute_after}. Tap to VETO (nonce ${nonce}), or ignore to let it proceed." >/dev/null 2>&1 || true
+  # Founder delivery leg — DIVE-1546 rail B (main-approved): the "nonce never printed to chat"
+  # guarantee lives HERE at the source. The RAW one-time nonce leaves this process ONLY as STRUCTURED
+  # data handed to the telegram plugin's veto-offer seam (`_tg_veto_offer <recipient> <receiptDigest>
+  # <rawNonce> <executeAfter>`), which the plugin renders INSIDE a tap button's callback_data and
+  # never echoes to chat. It is never interpolated into any human-readable message text.
+  #   - Preferred: the structured `_tg_veto_offer` seam (plugin-provided) carries the raw nonce.
+  #   - Fallback: if only the plain `_tg_send` seam exists, notify the founder that a veto window is
+  #     open but carry NO nonce — a tap veto then needs the structured seam; without it the offer
+  #     simply lapses and execution proceeds after the hold (fail-safe).
+  # A missing rail must never fail the (already-sealed) convene. The live legs are skipped under MOCK.
+  if command -v _tg_veto_offer >/dev/null 2>&1 && [[ -z "${COUNCIL_MOCK:-}" ]]; then
+    _tg_veto_offer "$resolved" "$digest" "$nonce" "$execute_after" >/dev/null 2>&1 || true
+  elif [[ -n "${COUNCIL_MOCK:-}" && -n "${COUNCIL_VETO_OFFER_SINK:-}" ]]; then
+    # Offline-test capture ONLY (double-gated on MOCK + an explicit sink, mirrors COUNCIL_VETO_NONCE_SINK):
+    # record the STRUCTURED offer so the bash e2e can assert the raw nonce travels structured (and that
+    # no chat-text leg ever carries it). PRODUCTION is never MOCK and never writes this sink.
+    ( umask 077; printf '%s\t%s\t%s\t%s\n' "$resolved" "$digest" "$nonce" "$execute_after" >> "$COUNCIL_VETO_OFFER_SINK" ) 2>/dev/null || true
+  elif [[ -z "${COUNCIL_MOCK:-}" ]] && command -v _tg_send >/dev/null 2>&1; then
+    _tg_send "$resolved" "Council veto offer — a pass sealed (${digest:0:12}…). Execution holds until ${execute_after}. Open /council or the dashboard to VETO within the window, or ignore to let it proceed." >/dev/null 2>&1 || true
   fi
   return 0
 }

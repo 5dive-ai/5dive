@@ -54,13 +54,32 @@ EOF
 "$FIVE" council init --seats="a:chair,b,c" --threshold="majority" --veto="tg:433634012" >/dev/null 2>&1 \
   || { echo "FAIL: council init (cannot seal genesis — no gate-proof rail?)"; exit 1; }
 
-COUNCIL_VETO_NONCE_SINK="$SINK" "$FIVE" council convene "e2e: ship the thing?" --seats="a:chair,b,c" --mode=quick >/dev/null 2>&1 \
+OFFERSINK="$TMP/offer.sink"
+COUNCIL_VETO_NONCE_SINK="$SINK" COUNCIL_VETO_OFFER_SINK="$OFFERSINK" \
+  "$FIVE" council convene "e2e: ship the thing?" --seats="a:chair,b,c" --mode=quick >/dev/null 2>&1 \
   || { echo "FAIL: council convene"; exit 1; }
 RCPT="$(ls -1 "$TMP/council/receipts/"*.json 2>/dev/null | head -1)"
 [[ -f "$RCPT" ]] || { echo "FAIL: no sealed receipt produced"; exit 1; }
 DIGEST="$(jq -r '.sealedDigest' "$RCPT")"
 NONCE="$(cat "$SINK" 2>/dev/null)"
 [[ -n "$DIGEST" && -n "$NONCE" ]] || { echo "FAIL: could not read sealed digest / captured nonce"; exit 1; }
+
+# --- DIVE-1546 rail B: the founder delivery leg hands the raw nonce to the STRUCTURED seam only ---
+# The offer sink captures `_tg_veto_offer <recipient> <receiptDigest> <rawNonce> <executeAfter>`. The
+# raw nonce must ride ONLY here (structured), never in any chat-text leg — enforced at the source.
+[[ -s "$OFFERSINK" ]] && ok "structured veto-offer delivered (rail B seam fired)" || no "no structured veto-offer captured"
+OFFER_NONCE="$(awk -F'\t' 'NR==1{print $3}' "$OFFERSINK" 2>/dev/null)"
+OFFER_RCPT="$(awk -F'\t' 'NR==1{print $1}' "$OFFERSINK" 2>/dev/null)"
+OFFER_DIG="$(awk -F'\t' 'NR==1{print $2}' "$OFFERSINK" 2>/dev/null)"
+[[ "$OFFER_NONCE" == "$NONCE" ]] && ok "structured offer carries the RAW nonce (matches sealed offer)" || no "structured offer nonce mismatch"
+[[ "$OFFER_DIG" == "$DIGEST" ]] && ok "structured offer carries the receipt digest" || no "structured offer digest mismatch"
+[[ "$OFFER_RCPT" == "433634012" ]] && ok "structured offer targets the resolved founder recipient" || no "structured offer recipient wrong ($OFFER_RCPT)"
+# Source guarantee: the fallback chat-text leg must NEVER interpolate the raw nonce (rail B moved it
+# into the structured seam). Pin it against the built bundle so a regression re-adding it gates in CI.
+# Guard the CHAT-TEXT leg specifically: `_tg_send` (the prose message rail) must never interpolate
+# the raw nonce. The structured `_tg_veto_offer "$resolved" "$digest" "$nonce" ...` call legitimately
+# passes $nonce and is NOT matched (different function). Also pin the old leaky text literal.
+if grep -Eq '_tg_send[^;{}]*\$\{?nonce|Tap to VETO \(nonce' "$ROOT/src/cmd_council.sh"; then no "a chat-text (_tg_send) leg still prints the raw nonce (rail B violated)"; else ok "no chat-text leg interpolates the raw nonce (rail B: nonce is button-only)"; fi
 
 # --- security amendment 2: receipt stores the DIGEST, never the raw nonce; pings 0600 ------------
 [[ "$(jq -r '.vetoNonceDigest // empty' "$RCPT")" == "$(sha "$NONCE")" ]] \
