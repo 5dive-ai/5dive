@@ -1,0 +1,67 @@
+name: branch-hygiene
+
+on:
+  schedule:
+    - cron: '17 5 * * 1'
+  workflow_dispatch:
+    inputs:
+      apply:
+        description: Delete API-confirmed merged branches and run stale-PR handling
+        type: boolean
+        default: false
+
+permissions: {}
+
+concurrency:
+  group: branch-hygiene
+  cancel-in-progress: false
+
+jobs:
+  merged-branches:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Plan merged-branch cleanup
+        if: github.event_name == 'workflow_dispatch' && !inputs.apply
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BRANCH_HYGIENE_PRESERVE: ${{ vars.BRANCH_HYGIENE_PRESERVE }}
+        run: scripts/branch-hygiene.sh --dry-run
+
+      - name: Delete API-confirmed merged branches
+        if: github.event_name == 'schedule' || inputs.apply
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BRANCH_HYGIENE_PRESERVE: ${{ vars.BRANCH_HYGIENE_PRESERVE }}
+        run: scripts/branch-hygiene.sh --apply
+
+  stale-pull-requests:
+    if: github.event_name == 'schedule' || inputs.apply
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: write
+    steps:
+      - uses: actions/stale@v10
+        with:
+          repo-token: ${{ github.token }}
+          days-before-issue-stale: -1
+          days-before-issue-close: -1
+          days-before-pr-stale: 30
+          days-before-pr-close: 14
+          stale-pr-label: stale
+          stale-pr-message: >-
+            This pull request has had no activity for 30 days. It will close
+            after 14 more inactive days; comment or push to keep it open.
+          close-pr-message: >-
+            Closing after 14 days with no activity since the stale warning.
+            Reopen when the branch is ready to continue.
+          exempt-pr-labels: pinned,security,no-stale
+          operations-per-run: 100
