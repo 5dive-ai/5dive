@@ -15,6 +15,9 @@ for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh \
 done
 set +e
 STATE_DIR="$TMP"; TASKS_DIR="$TMP/tasks"; TASKS_DB="$TASKS_DIR/tasks.db"
+# DIVE-1506: this harness deliberately exercises the human-send path, so declare its
+# isolated DB as the prod DB (positive allowlist) to pass the fail-closed fixture guard.
+export FIVEDIVE_PROD_TASKS_DB="$TASKS_DB"
 mkdir -p "$TASKS_DIR"
 tasks_db_init; _tasks_db_migrate
 
