@@ -82,6 +82,17 @@ applied=$(echo "$r" | jf '.data.applied')
   || bad_t "yes apply" "applied=$applied built=$built :: $r"
 OWNED_IDENT=$(db "SELECT ident FROM tasks WHERE originated_by_objective=$OID ORDER BY id DESC LIMIT 1;")
 
+# --- T3b (DIVE-1551): a planner that emits `id` instead of `local_id` is
+# tolerated (id->local_id coercion) — the create-bearing cycle applies instead
+# of crashing with "every task needs a non-empty local_id".
+before=$(db "SELECT COUNT(*) FROM tasks WHERE originated_by_objective=$OID;")
+DIFF_IDKEY='{"create":[{"id":"t1","title":"ship a referral banner","assignee_or_role":"alice","risk":"low"}]}'
+r=$(run replan "steer-signups" --diff="$DIFF_IDKEY" --yes)
+after=$(db "SELECT COUNT(*) FROM tasks WHERE originated_by_objective=$OID;")
+[[ "$(echo "$r" | jf '.data.applied')" == "true" && "$after" -eq "$((before+1))" ]] \
+  && ok_t "DIVE-1551: create using key 'id' is coerced to local_id and applies" \
+  || bad_t "id->local_id coercion" "applied=$(echo "$r" | jf '.data.applied') before=$before after=$after :: $(cat "$TMP/err" 2>/dev/null) :: $r"
+
 # --- T4: max_new_per_cycle cap (2) rejects a 3-create batch (reject-not-truncate)
 DIFF_OVER='{"create":[{"local_id":"a","title":"one","assignee_or_role":"alice","risk":"low"},{"local_id":"b","title":"two","assignee_or_role":"alice","risk":"low"},{"local_id":"c","title":"three","assignee_or_role":"alice","risk":"low"}]}'
 r=$(run replan "steer-signups" --diff="$DIFF_OVER" --yes)

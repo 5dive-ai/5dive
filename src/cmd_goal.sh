@@ -130,7 +130,8 @@ OUTCOME: ${outcome}
 
 Return ONLY a JSON object matching the provided schema (project + tasks). Rules:
 - At most ${max_tasks} tasks. Fewer is better; do not pad.
-- Each task: a stable plan-local id ("t1","t2",…), a clear title, an optional
+- Each task: a stable plan-local id in a field named exactly "local_id"
+  ("t1","t2",… — NOT "id"), a clear title, an optional
   body, an assignee_or_role, and depends_on (ids of tasks that must finish first).
 - assignee_or_role is EITHER a literal agent name from the roster OR "role:<role>"
   (routed through the org chart). Roster:
@@ -533,12 +534,19 @@ _goal_finish_with_plan() {
   # plan should not be thrown away over a field-name nit, so alias title->name and
   # description->goal (and, as a last resort, the outcome itself) BEFORE validate.
   # A plan that already carries name/goal is left byte-untouched.
+  # DIVE-1551: same non-enforcement bites the task key — a planner emits `id`
+  # instead of the schema's `local_id`, crashing validate. Coerce id->local_id
+  # per task when local_id is absent/blank (a task already carrying local_id is
+  # left untouched).
   local norm
   norm=$(printf '%s' "$plan" | jq -c --arg oc "$outcome" '
     if (.project|type)=="object" then
       .project.name = (if ((.project.name // "")=="") then ((.project.title // "") | if .=="" then $oc else . end) else .project.name end)
       | .project.goal = (if ((.project.goal // "")=="") then ((.project.description // "") | if .=="" then $oc else . end) else .project.goal end)
-    else . end' 2>/dev/null) && [[ -n "$norm" ]] && plan="$norm"
+    else . end
+    | if (.tasks|type)=="array" then
+        .tasks |= map(if type=="object" and ((.local_id // "")=="") and ((.id // "")!="") then .local_id = .id else . end)
+      else . end' 2>/dev/null) && [[ -n "$norm" ]] && plan="$norm"
 
   # 2. Validate (DAG/cap/depth/tier/assignability) — sets GOAL_* globals or fails.
   _goal_validate_plan "$plan" "$max_tasks" "$depth_cap"

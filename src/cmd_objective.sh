@@ -498,6 +498,22 @@ _objective_diff_schema() {
 SCHEMA
 }
 
+# DIVE-1551: loop spawn --schema is prompt guidance, NOT a hard-enforced
+# structured-output contract, so a planner routinely emits the create key as `id`
+# instead of the schema's `local_id` — which then crashes _goal_validate_plan
+# ("every task needs a non-empty local_id") on EVERY create-bearing cycle. Coerce
+# id->local_id per create item when local_id is absent/blank, BEFORE validate/apply.
+# A diff already carrying local_id (or invalid JSON) is returned byte-untouched so
+# validate still emits its own precise error.
+_objective_normalize_diff() {
+  local norm
+  norm=$(printf '%s' "$1" | jq -c '
+    if (.create|type)=="array" then
+      .create |= map(if type=="object" and ((.local_id // "")=="") and ((.id // "")!="") then .local_id = .id else . end)
+    else . end' 2>/dev/null) && [[ -n "$norm" ]] && { printf '%s' "$norm"; return; }
+  printf '%s' "$1"
+}
+
 # _objective_owns_open <obj_id> <ident> -> 0 iff <ident> is an OPEN task this
 # objective originated. The ownership invariant behind reprioritize/cancel.
 _objective_owns_open() {
@@ -750,7 +766,8 @@ ${last_out}
 Return ONLY a JSON object matching the schema. All three arrays are OPTIONAL —
 an empty diff (steady) is a valid plan; fewer, higher-leverage changes are better.
 - create: up to ${max_new} NEW tasks that move the metric. Each has a plan-local
-  id ("t1","t2"), a title, an optional body, an assignee_or_role (a literal agent
+  id in a field named exactly "local_id" (e.g. "t1","t2" — NOT "id"), a title, an
+  optional body, an assignee_or_role (a literal agent
   name from the roster OR "role:<role>"), optional depends_on, and an HONEST risk
   (low|spend|publish|secret|destructive|brand). Anything touching money, public
   posts, secrets, destructive or brand actions is NOT low — you CANNOT lower a
@@ -842,6 +859,7 @@ _objective_apply_from_gate() {
   local body diff; body=$(db "SELECT COALESCE(body,'') FROM tasks WHERE id=${id};")
   diff=$(printf '%s' "$body" | awk 'f{print} /^--- objective diff json ---$/{f=1}')
   printf '%s' "$diff" | jq -e . >/dev/null 2>&1 || fail "$E_VALIDATION" "could not recover a valid diff from $ident's body"
+  diff=$(_objective_normalize_diff "$diff")   # DIVE-1551: tolerate pre-fix gates that stored `id`
   _objective_validate_diff "$diff" "$obj_id" "$oname" "$max_new" "$depth_cap"
   [[ -n "$pkey" ]] || fail "$E_VALIDATION" "objective '$oname' has no project — cannot apply"
   # Find the gated cycle this anchor filed (so we update, not duplicate).
@@ -983,6 +1001,7 @@ cmd_objective_replan() {
     diff=$(_objective_invoke_planner "$contract" "$planner" "$ceiling" "$wait_secs") || return $?
   fi
 
+  diff=$(_objective_normalize_diff "$diff")   # DIVE-1551: id->local_id tolerance
   _objective_validate_diff "$diff" "$obj_id" "$oname" "$max_new" "$depth_cap"
 
   if [[ -n "$dry_run" ]]; then

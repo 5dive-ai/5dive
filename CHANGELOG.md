@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.11.32 — Objective/goal planner: tolerate `id` where the schema wants `local_id` (DIVE-1551) (2026-07-20)
+
+- fix(objective): a `create`-bearing replan cycle no longer crashes with `every task needs a non-empty local_id`. `loop spawn --schema` is prompt guidance, not a hard-enforced structured-output contract, so a live planner routinely emits the create key as `id` instead of the schema's `local_id`. New `_objective_normalize_diff` coerces `create[].id → local_id` (only when `local_id` is absent/blank) before validate/apply, on both the fresh-plan path and the `--from-gate` recovery path (so pre-fix gates that stored `id` still apply). A diff already carrying `local_id`, or invalid JSON, is returned byte-untouched so validation still emits its own precise error.
+- fix(goal): the same `id → local_id` coercion is applied to `goal add` task plans in `_goal_finish_with_plan` (extending the existing DIVE-1349 field-alias normalization), so `goal add` has symmetric tolerance.
+- fix(prompt): both the objective-replan and goal-decomposition planner contracts now name the field explicitly — a plan-local id "in a field named exactly `local_id` … NOT `id`" — to reduce the drift at the source.
+- test: `objective_replan_unit.sh` and `goal_add_unit.sh` each add a regression asserting a `create`/task keyed `id` is coerced and materializes instead of failing validation.
+
 ## 0.11.31 — Delegated push-for-review gate: lead-clearable tier-1, and the push guard accepts the lead clear (DIVE-1555) (2026-07-20)
 
 - fix(task): a delegated push-for-review (`5dive push` / DIVE-1376) now files as a lead-routed **tier-1** gate the org lead can clear, instead of a tier-2 human-only approval that lands in the paired human's DM. The eng-ship classifier (`_GATE_ENG_SHIP_RX`) recognizes push-for-review asks (`delegated push`, `push for review`, `push ... branch/for review/for PR`, `5dive push`); a feature-branch push-for-review is no longer missed just because it isn't a `push to main`. The true-human floor (money / secrets / destructive) still wins first, so "push the pricing change" stays tier-2.

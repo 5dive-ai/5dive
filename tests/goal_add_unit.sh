@@ -127,6 +127,18 @@ leaf_verifier=$(db "SELECT COALESCE(verifier,'') FROM tasks WHERE project_key='w
   && ok_t "below-threshold plan materializes tasks + dep edge + leaf verifier" \
   || bad_t "materialize" "rc=$rc mat=$mat ntasks=$ntasks nedges=$nedges verifier=$leaf_verifier out=$out"
 
+# ---- (7a) DIVE-1551: tasks using key 'id' instead of 'local_id' are coerced ----
+PLAN_IDKEY='{"project":{"name":"idkey","goal":"g"},"tasks":[
+  {"id":"t1","title":"Alpha","assignee_or_role":"dev","risk":"low"},
+  {"id":"t2","title":"Beta","assignee_or_role":"dev","depends_on":["t1"],"risk":"low"}]}'
+out=$(run cmd_goal_add --plan="$PLAN_IDKEY" --project=idkey --yes -- "ship idkey"); rc=$?
+mat=$(printf '%s' "$out" | jq -r '.data.materialized // false' 2>/dev/null)
+ntasks=$(db "SELECT COUNT(*) FROM tasks WHERE project_key='idkey' AND kind='standard';")
+nedges=$(db "SELECT COUNT(*) FROM task_deps td JOIN tasks t ON t.id=td.task_id WHERE t.project_key='idkey';")
+[[ $rc -eq 0 && "$mat" == "true" && "$ntasks" == "2" && "$nedges" == "1" ]] \
+  && ok_t "DIVE-1551: tasks keyed 'id' coerced to local_id (materializes + dep edge)" \
+  || bad_t "id->local_id coercion" "rc=$rc mat=$mat ntasks=$ntasks nedges=$nedges out=$out"
+
 # ---- (7b) re-materialize guard (dup protection) ----
 out=$(run cmd_goal_add --plan="$PLAN_OK" --project=widget -- "ship widget"); rc=$?
 [[ $rc -ne 0 ]] && printf '%s' "$out" | grep -qi "already has" \
