@@ -48,6 +48,7 @@ cat \
   src/cmd_watch.sh \
   src/cmd_compose.sh \
   src/cmd_task.sh \
+  src/cmd_trace.sh \
   src/cmd_org.sh \
   src/cmd_hire.sh \
   src/cmd_project.sh \
