@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.12.5 — Lean `--json`: drop null keys from `dbfmt` output to cut fleet token burn (DIVE-1610) (2026-07-21)
+
+- perf(cli): every task/objective/goal/loop/council `--json` path routes through one helper, `dbfmt -json`, which emitted all ~58 columns per row including the ~70% that are null on a typical task (41/58 on `task show --json`). That bloat is injected into agent context on every heartbeat/objective/task tick, fleet-wide. `dbfmt` now strips null-valued keys on the `-json` path only (`-box`/`-line` untouched). Omitting a null key is a no-op for jq/JS consumers (a missing key reads back as null), so keys stay stable — lean, not a rename. Measured on the live board: `task show --json` 851→644 tok (58→17 keys); `task ls --json` (the top emitter) 10,541→8,306 tok, −2,235 per call. jq is already a hard CLI dependency.
+
 ## 0.12.4 — `agent rm` cascades to the org chart + clears the failed unit (DIVE-1609) (2026-07-21)
 
 - fix(agent): `5dive agent rm <name>` now fully removes an agent in one command. The `agents_org` DELETE previously lived ONLY in `5dive org rm`, so every `agent rm` orphaned the removed agent's org-chart row (it kept showing under its manager) and left the templated `5dive-agent@<name>.service` stuck in `failed` after `disable --now` (repro 2026-07-21: `agent rm agy` left agy in the org chart + a failed unit). `cmd_rm` now also runs `DELETE FROM agents_org WHERE name=<n>` (idempotent; `ON DELETE SET NULL` reparents any direct reports) and `systemctl reset-failed` on the unit. Regression added in `agent_rm_org_cascade_unit.sh`.
