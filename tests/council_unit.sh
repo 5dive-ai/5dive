@@ -74,4 +74,12 @@ if ! bash "tests/council_ballot_e2e.sh"; then echo "FAILED: tests/council_ballot
 echo "=== tests/council_ballot_tap_e2e.sh"
 if ! bash "tests/council_ballot_tap_e2e.sh"; then echo "FAILED: tests/council_ballot_tap_e2e.sh"; rc=1; fi
 
+# CNCL-23: the scheduled-convene PRODUCT e2e — proves `5dive council schedule {add,ls,show,rm,run}`
+# route through cmd_council() on the BUILT binary, that add emits (but with --no-cron never installs)
+# the managed crontab line, and that the deterministic runner parses `ACTION:` lines from a stubbed
+# (SCHED_PARSE_TEST) verdict and files up to maxActions --from=council tasks (isolated board), with
+# inquorate/failed => files nothing (CNCL-18) + exit 0. Builds a throwaway ./5dive so it GATES in CI.
+echo "=== tests/council_schedule_e2e.sh"
+if ! bash "tests/council_schedule_e2e.sh"; then echo "FAILED: tests/council_schedule_e2e.sh"; rc=1; fi
+
 exit $rc

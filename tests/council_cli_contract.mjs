@@ -211,6 +211,30 @@ ok('CNCL-16 unreadable registry -> fail closed (exit 6)', r.code === 6 && /could
 // COUNCIL_MOCK still bypasses the pre-flight (offline tests need no live registry).
 r = runCli(['convene', 'Ship it?', '--seats=theo,ghostseat', '--mode=deliberate', '--stamped-at=T'], { COUNCIL_MOCK: '1' })
 ok('CNCL-16 pre-flight is skipped under COUNCIL_MOCK (offline)', r.code === 0)
+// --- CNCL-23: schedule config CRUD + template render (pure, offline) ---------
+const SF = path.join(tmp, 'schedules.json')
+const jr = (args) => { const x = runCli(args); try { return { ...x, json: JSON.parse(x.out) } } catch { return { ...x, json: null } } }
+let s = jr(['schedule', 'add', 'standup', '--question=Daily {{date}}. Ctx:{{context}}', '--cron=20 1 * * *', '--mode=quick', '--max-actions=3', '--ballot-deadline=1500', `--schedules=${SF}`, '--stamped-at=T0'])
+ok('CNCL-23 schedule add returns the entry', s.code === 0 && s.json && s.json.added === 'standup' && s.json.entry.maxActions === 3 && s.json.entry.ballotDeadline === 1500)
+s = jr(['schedule', 'ls', `--schedules=${SF}`])
+ok('CNCL-23 schedule ls lists the added schedule (bench defaults to council)', s.json && s.json.schedules.length === 1 && s.json.schedules[0].bench === 'council' && s.json.schedules[0].cron === '20 1 * * *')
+// render substitutes {{date}}/{{context}} from --date + --context-file
+const CF = path.join(tmp, 'ctx.txt'); fs.writeFileSync(CF, 'FUNNEL 42')
+s = jr(['schedule', 'render', 'standup', `--schedules=${SF}`, '--date=2026-07-21', `--context-file=${CF}`])
+ok('CNCL-23 schedule render fills {{date}} and {{context}}', s.json && s.json.question.includes('Daily 2026-07-21.') && s.json.question.includes('Ctx:FUNNEL 42'))
+// bad cron / bad mode fail closed (exit 2); unknown show fails closed (exit 3)
+ok('CNCL-23 add rejects a bad cron (exit 2)', runCli(['schedule', 'add', 'b', '--question=x', '--cron=nope', `--schedules=${SF}`]).code === 2)
+ok('CNCL-23 add rejects a bad mode (exit 2)', runCli(['schedule', 'add', 'b', '--question=x', '--cron=* * * * *', '--mode=wild', `--schedules=${SF}`]).code === 2)
+ok('CNCL-23 add rejects a bad name (exit 2)', runCli(['schedule', 'add', 'bad name!', '--question=x', '--cron=* * * * *', `--schedules=${SF}`]).code === 2)
+ok('CNCL-23 show unknown fails closed (exit 3)', runCli(['schedule', 'show', 'ghost', `--schedules=${SF}`]).code === 3)
+// upsert preserves the original createdAt; rm removes; ls empty after
+s = jr(['schedule', 'add', 'standup', '--question=v2 {{date}}', '--cron=0 2 * * *', `--schedules=${SF}`, '--stamped-at=T9'])
+ok('CNCL-23 re-add is an upsert (replaced=true) preserving createdAt', s.json && s.json.replaced === true && s.json.entry.createdAt === 'T0')
+ok('CNCL-23 rm removes the schedule', runCli(['schedule', 'rm', 'standup', `--schedules=${SF}`]).code === 0)
+s = jr(['schedule', 'ls', `--schedules=${SF}`])
+ok('CNCL-23 ls empty after rm', s.json && s.json.schedules.length === 0)
+ok('CNCL-23 rm unknown fails closed (exit 3)', runCli(['schedule', 'rm', 'ghost', `--schedules=${SF}`]).code === 3)
+
 try { fs.rmSync(tmp, { recursive: true, force: true }) } catch {}
 
 console.error(`\nCNCL-6/7/8 CLI contract: ${pass} passed, ${fail} failed`)

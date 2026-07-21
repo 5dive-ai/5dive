@@ -576,6 +576,91 @@ function cmdBench() {
   die(`unknown bench action: ${action} (ls|show|add|rm)`)
 }
 
+// ---- CNCL-23: scheduled convenes as a product ------------------------------
+// `council schedule add|ls|show|rm|render` — the CONFIG layer for recurring convenes.
+// A schedule binds a NAMED convene template (question + bench + mode + class + action
+// cap + ballot deadline + optional context command) to a cron expression. cli owns the
+// pure, testable pieces — CRUD on the schedules.json store (a plain {name: entry} map,
+// resolved fail-closed on a miss) and rendering the question template ({{date}}/{{context}}
+// placeholders). bash owns the two side effects cli can't: installing/removing the crontab
+// line (riding the existing cron rail, NO daemon) and the deterministic `run` runner.
+const CRON_FIELD = /^(\*|\d+(-\d+)?)(\/\d+)?(,(\*|\d+(-\d+)?)(\/\d+)?)*$/
+function validCron(expr) {
+  const parts = String(expr || '').trim().split(/\s+/)
+  return parts.length === 5 && parts.every(p => CRON_FIELD.test(p))
+}
+function renderQuestion(tmpl, { date, context }) {
+  return String(tmpl == null ? '' : tmpl)
+    .replace(/\{\{\s*date\s*\}\}/g, date || '')
+    .replace(/\{\{\s*context\s*\}\}/g, context || '')
+}
+function cmdSchedule() {
+  const action = positionals[0] || 'ls'
+  const storePath = flag('schedules')
+  const store = loadRegistry(storePath)   // {name: entry}
+  const isName = (n) => /^[a-z0-9][a-z0-9_-]{0,63}$/i.test(n)
+  if (action === 'ls') {
+    const names = Object.keys(store).sort()
+    out({ schedules: names.map(n => ({ name: n, cron: store[n].cron, bench: store[n].bench || 'council', mode: store[n].mode || 'quick' })) })
+    return
+  }
+  if (action === 'show') {
+    const name = positionals[1]; if (!name) die('schedule show needs a name')
+    const e = store[name]; if (!e) die(`unknown schedule: ${name} (fail-closed)`, 3)
+    out({ name, ...e })
+    return
+  }
+  if (action === 'render') {
+    // Resolve the stored template into the concrete convene question. The RUNNER (bash) calls this
+    // after gathering context so the substitution stays in one tested place.
+    const name = positionals[1]; if (!name) die('schedule render needs a name')
+    const e = store[name]; if (!e) die(`unknown schedule: ${name} (fail-closed)`, 3)
+    let context = ''
+    const cf = flag('context-file')
+    if (cf && cf !== true) { try { context = fs.readFileSync(cf, 'utf-8') } catch { context = '' } }
+    const date = (flag('date') && flag('date') !== true) ? String(flag('date')) : ''
+    out({ question: renderQuestion(e.question, { date, context }) })
+    return
+  }
+  if (action === 'add') {
+    const name = positionals[1]; if (!name) die('schedule add needs a name')
+    if (!isName(name)) die(`bad schedule name '${name}' (use [a-z0-9_-], <=64 chars)`)
+    const question = flag('question')
+    if (!question || question === true) die('schedule add needs --question=<template> (may use {{date}} and {{context}} placeholders)')
+    const cron = flag('cron')
+    if (!cron || cron === true) die('schedule add needs --cron="<m h dom mon dow>" (5-field cron)')
+    if (!validCron(cron)) die(`bad --cron '${cron}' (need a 5-field cron expression, e.g. "20 1 * * *")`)
+    const mode = flag('mode') || 'quick'
+    if (!['quick', 'deliberate', 'adversarial'].includes(mode)) die(`bad --mode '${mode}' (quick|deliberate|adversarial)`)
+    const entry = { question: String(question), cron: String(cron).trim(), mode }
+    const bench = flag('bench'); if (bench && bench !== true) entry.bench = String(bench)
+    const cls = flag('class'); if (cls && cls !== true) entry.decisionClass = String(cls)
+    const maxA = flag('max-actions')
+    entry.maxActions = (maxA != null && maxA !== true && Number.isFinite(Number(maxA))) ? Math.max(0, Math.floor(Number(maxA))) : 3
+    const bd = flag('ballot-deadline')
+    if (bd != null && bd !== true && Number.isFinite(Number(bd))) entry.ballotDeadline = Math.max(60, Math.floor(Number(bd)))
+    const cc = flag('context-cmd'); if (cc && cc !== true) entry.contextCmd = String(cc)
+    const stamped = flag('stamped-at')
+    // Preserve the ORIGINAL createdAt on an in-place update (upsert); only stamp a brand-new schedule.
+    if (name in store && store[name].createdAt) entry.createdAt = store[name].createdAt
+    else if (stamped && stamped !== true) entry.createdAt = String(stamped)
+    const replaced = name in store
+    store[name] = entry
+    saveRegistry(storePath, store)
+    out({ added: name, replaced, entry })
+    return
+  }
+  if (action === 'rm') {
+    const name = positionals[1]; if (!name) die('schedule rm needs a name')
+    if (!(name in store)) die(`unknown schedule: ${name}`, 3)
+    delete store[name]
+    saveRegistry(storePath, store)
+    out({ removed: name })
+    return
+  }
+  die(`unknown schedule action: ${action} (add|ls|show|rm|render)`)
+}
+
 // ---- CNCL-8: council init (human-seeded genesis roster) --------------------
 // Seeds the primary `council` bench ONCE from a human-supplied roster + veto principal.
 // bash owns the sudo gate, the veto-principal resolution (--veto-resolved), the ROOT seal of
@@ -960,6 +1045,7 @@ const main = async () => {
   if (sub === 'drift-check') return cmdDriftCheck()
   if (sub === 'amend-plan') return cmdAmendPlan()
   if (sub === 'amend-apply') return cmdAmendApply()
+  if (sub === 'schedule') return cmdSchedule()
   if (sub === 'convene') return cmdConvene()
   if (sub === 'roster') return cmdRoster()
   if (sub === 'record') return cmdRecord()
@@ -975,7 +1061,7 @@ const main = async () => {
   if (sub === 'sign-vote') return cmdSignVote()
   if (sub === 'verify-votes') return cmdVerifyVotes()
   if (sub === 'ballot-tap') return cmdBallotTap()
-  die(`unknown council subcommand: ${sub} (constitution|convene|bench|init|veto|gate-map|seal-augment|read-binding|sign-vote|verify-votes|ballot-tap|roster|motion-plan|motion-apply|verify-chain)`)
+  die(`unknown council subcommand: ${sub} (constitution|convene|schedule|bench|init|veto|gate-map|seal-augment|read-binding|sign-vote|verify-votes|ballot-tap|roster|motion-plan|motion-apply|verify-chain)`)
 }
 // Run as the CLI entrypoint only when executed directly (node cli.mjs …). Guarded so a test can
 // `import` this module (e.g. to exercise dispatchBallotVote's pure logic) WITHOUT triggering the
