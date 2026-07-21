@@ -41,6 +41,10 @@ cmd_rm() {
   rm_profile=$(jq -r --arg n "$name" '.agents[$n].authProfile // empty' <<<"$reg")
   step "Stopping 5dive-agent@${name}.service"
   systemctl disable --now "5dive-agent@${name}.service" 2>/dev/null || true
+  # DIVE-1609: a crashed/oneshot unit lingers in `failed` even after disable,
+  # so `systemctl status` keeps showing it. Clear the templated unit's residual
+  # state so the removed agent leaves no ghost unit behind (idempotent).
+  systemctl reset-failed "5dive-agent@${name}.service" 2>/dev/null || true
   step "Removing systemd env + channel secrets"
   rm -f "${ENV_DIR}/${name}.env" "${ENV_DIR}/${name}-auth.env"
   remove_channel_secret telegram "$name"
@@ -49,6 +53,13 @@ cmd_rm() {
   delete_agent_user "$name"
   step "Updating registry"
   jq --arg n "$name" 'del(.agents[$n])' <<<"$reg" | registry_write
+  # DIVE-1609: cascade the org-chart placement. The agents_org DELETE used to
+  # live ONLY in `5dive org rm`, so `agent rm` orphaned the row and the agent
+  # kept showing up in the org chart. Idempotent (safe if absent); the
+  # ON DELETE SET NULL on reports_to already reparents any direct reports.
+  step "Removing org-chart placement"
+  tasks_db_init
+  db "DELETE FROM agents_org WHERE name=$(sqlq "$name");"
   # Drop any paperclip-shared symlinks pointing into this agent's profile
   # and re-seed from another agent of the same type if one remains. Best-
   # effort — never fails the remove.

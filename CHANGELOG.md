@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.12.4 — `agent rm` cascades to the org chart + clears the failed unit (DIVE-1609) (2026-07-21)
+
+- fix(agent): `5dive agent rm <name>` now fully removes an agent in one command. The `agents_org` DELETE previously lived ONLY in `5dive org rm`, so every `agent rm` orphaned the removed agent's org-chart row (it kept showing under its manager) and left the templated `5dive-agent@<name>.service` stuck in `failed` after `disable --now` (repro 2026-07-21: `agent rm agy` left agy in the org chart + a failed unit). `cmd_rm` now also runs `DELETE FROM agents_org WHERE name=<n>` (idempotent; `ON DELETE SET NULL` reparents any direct reports) and `systemctl reset-failed` on the unit. Regression added in `agent_rm_org_cascade_unit.sh`.
+
 ## 0.12.3 — Eng-ship gate matcher catches inflected verb forms (landing/pushing/shipping) (DIVE-1605) (2026-07-21)
 
 - fix(task): a builder's ship-approval gate leaked to the paired human (DIVE-1602 repro: "Approve landing the verified fix and pushing to origin" filed by dev landed on lodar's phone). The eng-ship classifier (DIVE-1359) only matched imperative forms ("land the", "ship it", "push to origin"), so the gerunds "landing"/"pushing to origin" missed it, no downgrade fired, and the gate stayed tier-2 hard-human instead of routing lead-clearable to the org lead. `_GATE_ENG_SHIP_RX` now also matches `merg(e|es|ed|ing)`, `ship(ping|ped)`, `land(ing|ed)`/`land this`, and `push(es|ed|ing)? to <target>`, all word-anchored so "leadership"/"relationship"/"landscape"/"ship A or B?" do not false-positive. Regression added to `gate_ship_routing_unit.sh` (DIVE-38).
