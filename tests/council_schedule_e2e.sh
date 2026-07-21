@@ -29,6 +29,14 @@ fi
 mkdir -p "$TMP/bin"; ln -sf "$FIVE" "$TMP/bin/5dive"
 export PATH="$TMP/bin:$PATH"
 export STATE_DIR="$TMP" TASKS_DIR="$TMP" TASKS_DB="$TMP/tasks.db"
+# CNCL-23: run artifacts are PER-USER (the runner fires from a non-root cron that cannot write the
+# root-owned ${STATE_DIR}/council). Point the override at a temp dir so the harness never writes the
+# real $HOME/.5dive, and so we can assert the run OUTPUT is decoupled from the config dir.
+export FIVEDIVE_SCHED_RUNS="$TMP/runs"
+# schedule add/rm write schedules.json into ${STATE_DIR}/council — in prod that dir is created
+# (root-owned) by `sudo council init`; here we pre-create it writable to stand in for that (a non-root
+# add against a MISSING/unwritable council dir correctly refuses with a sudo hint, tested elsewhere).
+mkdir -p "$STATE_DIR/council"
 
 P=0; F=0
 chk(){ if [ "$2" = "$3" ]; then P=$((P+1)); else F=$((F+1)); echo "FAIL: $1 (want=$2 got=$3)"; fi; }
@@ -78,6 +86,21 @@ has "task body cites the sealed receipt digest" "$(echo "$BOARD" | jq -r '.data.
 # the 3rd ACTION must NOT have been filed (over the cap)
 NOPE="$(echo "$BOARD" | jq -r '[.data.tasks[] | select(.title=="Add a healthcheck endpoint")] | length')"
 chk "over-cap ACTION not filed" "0" "$NOPE"
+
+# --- run artifacts land in the PER-USER override dir, NOT under the (root-owned in prod) config dir ---
+[ -f "$TMP/runs/standup-$(date -u +%F).json" ] && chk "run envelope written to FIVEDIVE_SCHED_RUNS" yes yes || chk "run envelope written to FIVEDIVE_SCHED_RUNS" yes no
+[ -f "$TMP/runs/standup.log" ] && chk "run log written to FIVEDIVE_SCHED_RUNS" yes yes || chk "run log written to FIVEDIVE_SCHED_RUNS" yes no
+[ ! -e "$TMP/council/schedule-runs" ] && chk "no artifacts under the config dir (decoupled)" yes yes || chk "no artifacts under the config dir (decoupled)" yes no
+
+# --- DECOUPLING PROOF: the runner fires even when the config dir is NON-writable (the prod repro:
+#     root-owned COUNCIL_DIR + a non-root cron runner). Config was already written above; make it
+#     read-only and confirm run still reads config + parses ACTIONs + writes artifacts to the
+#     per-user path. Uses --dry so it does not pollute the board count the later asserts depend on. ---
+chmod a-w "$TMP/council" 2>/dev/null
+DRY_RO="$(SCHED_PARSE_TEST="$FIX" 5dive council schedule run standup --dry 2>/dev/null)"; RC_RO=$?
+chmod u+w "$TMP/council" 2>/dev/null   # restore for trap cleanup
+chk "run fires with a NON-writable config dir (exit 0)" "0" "$RC_RO"
+has "read-only config dir: still reads config + parses ACTIONs" "$DRY_RO" "DRY: 5dive task add"
 
 # --- inquorate fixture: files NOTHING, still exits 0 (CNCL-18 signal) ---
 FIX2="$TMP/env-inq.json"
