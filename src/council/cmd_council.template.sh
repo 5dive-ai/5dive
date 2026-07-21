@@ -16,7 +16,12 @@ COUNCIL_RECEIPTS="${COUNCIL_DIR}/receipts"
 COUNCIL_GENESIS="${COUNCIL_DIR}/genesis.json"
 COUNCIL_LINEAGE="${COUNCIL_DIR}/lineage.jsonl"
 COUNCIL_SCHEDULES="${COUNCIL_DIR}/schedules.json"
-COUNCIL_SCHED_RUNS="${COUNCIL_DIR}/schedule-runs"
+# CNCL-23 run artifacts (per-run envelope + log + err) live PER-USER, not under the root-owned
+# ${COUNCIL_DIR} — the runner fires from a NON-root cron (e.g. agent-main) that cannot write
+# /var/lib/5dive/council. Matches the `${CREW_HOME:-$HOME/.5dive/...}` convention (cmd_crew.sh).
+# The schedule CONFIG stays root-owned (schedules.json, sudo-gated — closes the rig-quorum vector);
+# only the operational run output is per-user. Overridable (FIVEDIVE_SCHED_RUNS) for tests/ops.
+COUNCIL_SCHED_RUNS="${FIVEDIVE_SCHED_RUNS:-${HOME:-/tmp}/.5dive/council-schedule-runs}"
 
 _council_constitution_path() {
   printf '%s' "${FIVEDIVE_CONSTITUTION_FILE:-${STATE_DIR}/5dive.md}"
