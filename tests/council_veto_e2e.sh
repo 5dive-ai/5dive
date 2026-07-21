@@ -74,6 +74,12 @@ OFFER_DIG="$(awk -F'\t' 'NR==1{print $2}' "$OFFERSINK" 2>/dev/null)"
 [[ "$OFFER_NONCE" == "$NONCE" ]] && ok "structured offer carries the RAW nonce (matches sealed offer)" || no "structured offer nonce mismatch"
 [[ "$OFFER_DIG" == "$DIGEST" ]] && ok "structured offer carries the receipt digest" || no "structured offer digest mismatch"
 [[ "$OFFER_RCPT" == "433634012" ]] && ok "structured offer targets the resolved founder recipient" || no "structured offer recipient wrong ($OFFER_RCPT)"
+# --- DIVE-1644: the offer must be self-contained — carry WHAT carried (motion) + the vote tally so
+# the founder never vetoes a sealed digest blind. Columns 5/6 of the structured sink.
+OFFER_MOTION="$(awk -F'\t' 'NR==1{print $5}' "$OFFERSINK" 2>/dev/null)"
+OFFER_TALLY="$(awk -F'\t' 'NR==1{print $6}' "$OFFERSINK" 2>/dev/null)"
+[[ "$OFFER_MOTION" == "e2e: ship the thing?" ]] && ok "DIVE-1644: structured offer carries the decision/motion text" || no "offer missing motion text (got '$OFFER_MOTION')"
+[[ "$OFFER_TALLY" == carried*approve* ]] && ok "DIVE-1644: structured offer carries the vote tally ($OFFER_TALLY)" || no "offer missing/garbled tally (got '$OFFER_TALLY')"
 # Source guarantee: the fallback chat-text leg must NEVER interpolate the raw nonce (rail B moved it
 # into the structured seam). Pin it against the built bundle so a regression re-adding it gates in CI.
 # Guard the CHAT-TEXT leg specifically: `_tg_send` (the prose message rail) must never interpolate
