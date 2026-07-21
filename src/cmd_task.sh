@@ -1664,7 +1664,7 @@ _gate_tier2_floor_hit() {
 # it must file as a lead-routed tier-1, not a tier-2 human-only approval that
 # lands in the human's DM. `push to (main|prod|...)` deliberately does NOT match a
 # feature-branch push-for-review, so name it explicitly here.
-_GATE_ENG_SHIP_RX='merge|pull request|\bpr\b|\bdiff\b|ship it|ship the|ship this|deploy|redeploy|roll ?out|land the|land it|rebase|hotfix|cut a branch|cut the release|push to (main|prod|production|origin)|delegated push|push[- ]for[- ]review|push .*(branch|for review|for a? ?pr|for code review)|5dive push|code review|approve the (merge|diff|change|pr|build|deploy|ship|commit)|build\.sh|smoke test|ci\b'
+_GATE_ENG_SHIP_RX='\bmerg(e|es|ed|ing)\b|pull request|\bpr\b|\bdiff\b|ship it|ship the|ship this|\bship(ping|ped)\b|deploy|redeploy|roll ?out|\broll(ing|ed)? out\b|land the|land it|land this|\bland(ing|ed)\b|rebase|hotfix|cut a branch|cut the release|push(es|ed|ing)? to (main|prod|production|origin)|delegated push|push[- ]for[- ]review|push .*(branch|for review|for a? ?pr|for code review)|5dive push|code review|approve the (merge|diff|change|pr|build|deploy|ship|commit)|build\.sh|smoke test|ci\b'
 _gate_eng_ship_hit() {
   local text; text=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
   [[ "$text" =~ $_GATE_ENG_SHIP_RX ]]

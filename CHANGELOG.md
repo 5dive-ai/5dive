@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.12.3 — Eng-ship gate matcher catches inflected verb forms (landing/pushing/shipping) (DIVE-1605) (2026-07-21)
+
+- fix(task): a builder's ship-approval gate leaked to the paired human (DIVE-1602 repro: "Approve landing the verified fix and pushing to origin" filed by dev landed on lodar's phone). The eng-ship classifier (DIVE-1359) only matched imperative forms ("land the", "ship it", "push to origin"), so the gerunds "landing"/"pushing to origin" missed it, no downgrade fired, and the gate stayed tier-2 hard-human instead of routing lead-clearable to the org lead. `_GATE_ENG_SHIP_RX` now also matches `merg(e|es|ed|ing)`, `ship(ping|ped)`, `land(ing|ed)`/`land this`, and `push(es|ed|ing)? to <target>`, all word-anchored so "leadership"/"relationship"/"landscape"/"ship A or B?" do not false-positive. Regression added to `gate_ship_routing_unit.sh` (DIVE-38).
+
 ## 0.12.2 — Gate reminders render decision options in full, never mid-truncate (DIVE-1602) (2026-07-21)
 
 - fix(heartbeat): a decision gate embeds its choices ("A = …", "B = …") in the ask body, but the stale-gate reminder (90 char), org escalation (90 char), and re-nag batch (240 char) all hard-truncated the ask, so a longer ask dropped a whole option mid-word and rendered a gate that hid one of its own choices (repro: MOB-2, "B = enroll now…" chopped off). Each of the four reminder SQL sites now renders the ask in full when `need_options` is set (option-less gates keep their courtesy cap); the Telegram send is still bounded by clampList. Pairs with the plugin-side /inbox + /task deep-link fix in 5dive-plugins.

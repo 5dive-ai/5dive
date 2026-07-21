@@ -177,6 +177,19 @@ cmd_task_need DIVE-37 --type=approval --ask="approve delegated push for review A
   && ok_t "DIVE-1555: money floor beats push-for-review (stays tier-2 human)" \
   || bad_t "DIVE-1555: money floor beats push-for-review" "human=$HUMAN_PINGED tier='$(db "SELECT tier FROM tasks WHERE ident='DIVE-37';")'"
 
+# --- DIVE-1605: eng-ship matcher must catch INFLECTED verb forms ----------------
+# Regression for the 2026-07-21 leak (DIVE-1602): a builder filed
+# "Approve landing the verified fix and pushing to origin" — a textbook eng-ship
+# approval — but the gerunds "landing"/"pushing to origin" matched neither
+# "land the/it" nor "push to origin", so no downgrade fired: it stayed tier-2
+# hard-human and pinged the paired human instead of the lead. Must now downgrade
+# + route to main. (DIVE-34..37 are taken above — use DIVE-38.)
+seed DIVE-38; HUMAN_PINGED=0; route_reset
+cmd_task_need DIVE-38 --type=approval --tier=2 --ask="Approve landing the verified CLI/plugin fix and pushing to origin?" --from=dev >/dev/null 2>&1
+[[ "$HUMAN_PINGED" == "0" ]] && ok_t "DIVE-1605: 'landing...pushing' eng-ship NOT pinged to human" || bad_t "DIVE-1605 gerund eng-ship -> human" "HUMAN_PINGED=$HUMAN_PINGED"
+[[ "$(db "SELECT tier FROM tasks WHERE ident='DIVE-38';")" == "1" ]] && ok_t "DIVE-1605: 'landing...pushing' downgraded to tier-1" || bad_t "DIVE-1605 gerund downgrade" "got tier '$(db "SELECT tier FROM tasks WHERE ident='DIVE-38';")'"
+[[ "$(db "SELECT COALESCE(routed_reviewer,'') FROM tasks WHERE ident='DIVE-38';")" == "main" ]] && ok_t "DIVE-1605: 'landing...pushing' routed_reviewer=main (lead-clearable)" || bad_t "DIVE-1605 gerund route to lead" "got '$(db "SELECT COALESCE(routed_reviewer,'') FROM tasks WHERE ident='DIVE-38';")'"
+
 # --- DIVE-1381: content-curation class — a persona/pack QUEUE-READINESS approval --
 # on our early-stage content surfaces is lead-clearable, NOT a human call. The T2
 # floor matches 'publish' and would force it hard-human (the DIVE-1366 wall); the
