@@ -15,6 +15,8 @@ COUNCIL_REGISTRY="${COUNCIL_DIR}/benches.json"
 COUNCIL_RECEIPTS="${COUNCIL_DIR}/receipts"
 COUNCIL_GENESIS="${COUNCIL_DIR}/genesis.json"
 COUNCIL_LINEAGE="${COUNCIL_DIR}/lineage.jsonl"
+COUNCIL_SCHEDULES="${COUNCIL_DIR}/schedules.json"
+COUNCIL_SCHED_RUNS="${COUNCIL_DIR}/schedule-runs"
 
 _council_constitution_path() {
   printf '%s' "${FIVEDIVE_CONSTITUTION_FILE:-${STATE_DIR}/5dive.md}"
@@ -127,6 +129,20 @@ _council_help() {
       fires. Defaults to the 5-seat standing Council. --standalone selects the deferred
       single-key modelCall seam instead of dispatch.
       (A veto can NEVER be asserted from a CLI string — `--veto-by` is refused; see below.)
+
+  5dive council schedule add <name> --question="<template>" --cron="<m h dom mon dow>"
+                            [--bench=<name>] [--mode=quick|deliberate|adversarial] [--class=<c>]
+                            [--max-actions=N] [--ballot-deadline=<secs>] [--context-cmd="<sh>"] [--no-cron]
+  5dive council schedule ls | show <name> | rm <name> | run <name> [--dry]
+      Productize a recurring convene (CNCL-23). `add` binds a NAMED convene template to a cron
+      expression and installs a managed crontab line (rides the existing cron rail — NO daemon;
+      --no-cron just saves the config + prints the line). The question template may embed {{date}}
+      and {{context}}; --context-cmd is a shell snippet run at each fire whose (bounded) stdout fills
+      {{context}} (e.g. funnel numbers + open queue). `run <name>` is what cron calls: it gathers
+      context, convenes on the DEFAULT ballot rail (no pane-scrape, CNCL-18 — convene seals its own
+      receipt into the lineage), then files up to --max-actions `ACTION: <title>` items from seat
+      rationales as `--from=council` board tasks. An inquorate run is a CNCL-18 signal, never fatal.
+      `schedule add|rm` write the root-owned council dir — run under sudo. Config: schedules.json.
 
   5dive council veto exercise --receipt=<sealed digest> --nonce=<tap nonce>
                               [--tier=hold|posthoc] [--reason=<why>]
@@ -1079,14 +1095,186 @@ _council_amend() {
   fi
 }
 
+# ==================== CNCL-23: scheduled convenes as a product ====================
+# `schedule add|ls|show|rm|run`. cli.mjs owns the schedules.json CRUD + question-template
+# rendering (pure, unit-tested). bash owns the two impure side effects: (1) install/remove
+# the user crontab line that rides the EXISTING cron rail (NO daemon), and (2) the `run`
+# runner that generalizes the CNCL-21/22 ops scripts — gather context, convene on the DEFAULT
+# ballot rail (no pane-scrape, per CNCL-18), then file up to maxActions `ACTION:` items from
+# seat rationales as --from=council board tasks. convene SEALS its own receipt into the lineage
+# (the runner never seals). An inquorate/failed run is a CNCL-18 signal, never fatal (exit 0).
+_council_sched_cronline() {
+  # emit the managed crontab line for schedule <name> at cron <expr>. The marker comment lets
+  # add/rm find + replace exactly this schedule's line idempotently.
+  local name="$1" cron="$2" home
+  home="${HOME:-/home/$(id -un 2>/dev/null || echo claude)}"
+  printf '%s HOME=%s PATH=/usr/local/bin:/usr/bin:/bin 5dive council schedule run %s >> %s/%s.cron.log 2>&1 # 5dive-council-schedule:%s' \
+    "$cron" "$home" "$name" "$COUNCIL_SCHED_RUNS" "$name" "$name"
+}
+_council_sched_crontab_upsert() {
+  # idempotent: drop any existing line for this marker, append the fresh one. A missing crontab
+  # (crontab -l non-zero) degrades to an empty current set, so the first add still installs.
+  local name="$1" line="$2" marker="# 5dive-council-schedule:$1" cur next
+  cur="$(crontab -l 2>/dev/null)"
+  next="$(printf '%s\n' "$cur" | grep -vF "$marker")"
+  { [[ -n "${next//[$'\n\t ']/}" ]] && printf '%s\n' "$next"; printf '%s\n' "$line"; } | crontab - 2>/dev/null
+}
+_council_sched_crontab_remove() {
+  local marker="# 5dive-council-schedule:$1" cur
+  cur="$(crontab -l 2>/dev/null)" || return 0
+  printf '%s\n' "$cur" | grep -vF "$marker" | crontab - 2>/dev/null || true
+}
+
+# The deterministic runner cron invokes: `5dive council schedule run <name>`.
+_council_schedule_run() {
+  local dir="$1"; shift
+  local name="${1:-}"; [[ $# -gt 0 ]] && shift || true
+  [[ -n "$name" ]] || fail "$E_USAGE" "schedule run needs a name: 5dive council schedule run <name>"
+  local dry=0 a; for a in "$@"; do [[ "$a" == "--dry" ]] && dry=1; done
+
+  mkdir -p "$COUNCIL_SCHED_RUNS" 2>/dev/null || true
+  local date ts logf env_out entry
+  date="$(date -u +%F)"; ts="$(date -u +%FT%TZ)"
+  logf="$COUNCIL_SCHED_RUNS/$name.log"
+  env_out="$COUNCIL_SCHED_RUNS/$name-$date.json"
+
+  entry="$(node "$dir/cli.mjs" schedule show "$name" --schedules="$COUNCIL_SCHEDULES")" || {
+    echo "$ts schedule '$name' not found" >> "$logf" 2>/dev/null; fail "$E_USAGE" "unknown schedule: $name"; }
+  local bench mode cls maxa bd ctxcmd
+  bench="$(printf '%s' "$entry" | jq -r '.bench // ""')"
+  mode="$(printf '%s' "$entry" | jq -r '.mode // "quick"')"
+  cls="$(printf '%s' "$entry" | jq -r '.decisionClass // ""')"
+  maxa="$(printf '%s' "$entry" | jq -r '.maxActions // 3')"
+  bd="$(printf '%s' "$entry" | jq -r '.ballotDeadline // 1500')"
+  ctxcmd="$(printf '%s' "$entry" | jq -r '.contextCmd // ""')"
+
+  # (1) gather context (best-effort, bounded). A failing/empty context command degrades to an empty
+  # context — it NEVER aborts the convene. Bounded to 4KB so a runaway command can't bloat the prompt.
+  local ctxf; ctxf="$(mktemp -t 5dive-sched-ctx.XXXXXX 2>/dev/null)" || ctxf=""
+  if [[ -n "$ctxcmd" && -n "$ctxf" ]]; then
+    ( eval "$ctxcmd" ) 2>/dev/null | head -c 4000 > "$ctxf" || true
+  fi
+  # (2) render the question template ({{date}}, {{context}}) in the one tested place (cli.mjs).
+  local question
+  question="$(node "$dir/cli.mjs" schedule render "$name" --schedules="$COUNCIL_SCHEDULES" --context-file="${ctxf:-/dev/null}" --date="$date" | jq -r '.question')"
+  [[ -n "$ctxf" ]] && rm -f "$ctxf" 2>/dev/null
+
+  # (3) convene on the DEFAULT ballot rail (no pane-scrape, CNCL-18). Re-invoke the PUBLIC `5dive
+  # council convene` verb (fresh process = its own seal + lineage write + veto offer), exactly as the
+  # CNCL-21/22 ops scripts do. SCHED_PARSE_TEST=<envelope.json> skips the convene and parses a fixture
+  # (offline test hook, mirrors STANDUP_PARSE_TEST); COUNCIL_MOCK is honored by convene itself.
+  if [[ -n "${SCHED_PARSE_TEST:-}" ]]; then
+    cp "$SCHED_PARSE_TEST" "$env_out" 2>/dev/null || true
+  else
+    local -a cargs=(convene "$question" --mode="$mode" --timeout="$bd" --ballot-deadline="$bd" --json)
+    [[ -n "$bench" && "$bench" != "council" ]] && cargs+=(--bench="$bench")
+    [[ -n "$cls" ]] && cargs+=(--class="$cls")
+    5dive council "${cargs[@]}" > "$env_out" 2>"$COUNCIL_SCHED_RUNS/$name-$date.err" || true
+  fi
+
+  local ok quorate cast rec digest
+  ok="$(jq -r '.ok' "$env_out" 2>/dev/null)"
+  if [[ "$ok" != "true" ]]; then
+    echo "$ts convene FAILED (see $name-$date.err / envelope)" >> "$logf" 2>/dev/null
+    (( JSON_MODE )) && printf '{"ok":true,"data":{"schedule":"%s","convene":"failed"}}\n' "$name"
+    return 0
+  fi
+  quorate="$(jq -r '.data.verdict.quorumMet' "$env_out")"
+  cast="$(jq -r '.data.verdict.votesCast' "$env_out")"
+  rec="$(jq -r '.data.verdict.recommendation' "$env_out")"
+  digest="$(jq -r '.data.sealedDigest' "$env_out")"
+  if [[ "$quorate" != "true" ]]; then
+    echo "$ts INQUORATE cast=$cast (CNCL-18 signal — no actions filed) digest=$digest" >> "$logf" 2>/dev/null
+    (( JSON_MODE )) && printf '{"ok":true,"data":{"schedule":"%s","quorate":false,"cast":%s,"sealedDigest":"%s"}}\n' "$name" "${cast:-0}" "$digest"
+    return 0
+  fi
+
+  local filed=0 title
+  while IFS= read -r title; do
+    [[ -z "$title" ]] && continue
+    [[ "$filed" -ge "$maxa" ]] && break
+    title="$(printf '%s' "$title" | cut -c1-120)"
+    if (( dry )); then
+      echo "DRY: 5dive task add \"$title\" --from=council"
+    else
+      5dive task add "$title" --from=council --priority=medium \
+        --body="from=council scheduled convene '$name' $date (CNCL-23 rail); source receipt sealedDigest=$digest; proposed in a quorate council verdict ($rec, $cast votes cast)." \
+        >/dev/null 2>&1 || echo "$ts task add failed for: $title" >> "$logf" 2>/dev/null
+    fi
+    filed=$((filed+1))
+  done < <(jq -r '.data.votes[].rationale' "$env_out" | grep -oE 'ACTION:[^"\\]*' | sed 's/^ACTION:[[:space:]]*//' | awk '!seen[$0]++')
+
+  echo "$ts quorate cast=$cast rec=$rec actions_filed=$filed digest=$digest" >> "$logf" 2>/dev/null
+  (( JSON_MODE )) && printf '{"ok":true,"data":{"schedule":"%s","quorate":true,"cast":%s,"recommendation":"%s","actionsFiled":%s,"sealedDigest":"%s"}}\n' "$name" "${cast:-0}" "$rec" "$filed" "$digest"
+  return 0
+}
+
+_council_schedule() {
+  local dir="$1"; shift
+  local action="${1:-ls}"; [[ $# -gt 0 ]] && shift || true
+  mkdir -p "$COUNCIL_SCHED_RUNS" 2>/dev/null || true
+  if [[ "$action" == "run" ]]; then _council_schedule_run "$dir" "$@"; return $?; fi
+  case "$action" in
+    add|rm)
+      if [[ ! -w "$COUNCIL_DIR" ]]; then
+        fail "$E_PERMISSION" "editing schedules writes ${COUNCIL_SCHEDULES} (root-owned) — re-run via: sudo 5dive council schedule $action $*"
+      fi ;;
+  esac
+
+  local stamped; stamped="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  local raw; raw="$(node "$dir/cli.mjs" schedule "$action" "$@" --schedules="$COUNCIL_SCHEDULES" --stamped-at="$stamped")" || return $?
+
+  if [[ "$action" == "add" ]]; then
+    local name cron nocron=0 a line installed=false
+    name="$(printf '%s' "$raw" | jq -r '.added')"
+    cron="$(printf '%s' "$raw" | jq -r '.entry.cron')"
+    for a in "$@"; do [[ "$a" == "--no-cron" ]] && nocron=1; done
+    line="$(_council_sched_cronline "$name" "$cron")"
+    if (( ! nocron )); then
+      if command -v crontab >/dev/null 2>&1; then
+        if _council_sched_crontab_upsert "$name" "$line"; then installed=true
+        else printf 'council: schedule %s saved but crontab install failed — add this line manually:\n%s\n' "$name" "$line" >&2; fi
+      else
+        printf 'council: no crontab on PATH — schedule %s saved; add this cron line manually:\n%s\n' "$name" "$line" >&2
+      fi
+    fi
+    if (( JSON_MODE )); then
+      printf '%s' "$raw" | jq --arg cl "$line" --argjson inst "$installed" '{ok:true, data: (. + {cronLine:$cl, cronInstalled:$inst})}'
+    else
+      printf 'OK — schedule %s %s\n  cron:  %s\n  %s\n' \
+        "$([[ "$(printf '%s' "$raw" | jq -r '.replaced')" == "true" ]] && echo updated || echo added)" \
+        "$name" "$cron" "$( (( nocron )) && echo '(crontab NOT installed: --no-cron)' || ($installed && echo 'crontab line installed' || echo 'crontab NOT installed — see stderr') )"
+    fi
+    return 0
+  fi
+  if [[ "$action" == "rm" ]]; then
+    local name; name="$(printf '%s' "$raw" | jq -r '.removed')"
+    command -v crontab >/dev/null 2>&1 && _council_sched_crontab_remove "$name"
+    if (( JSON_MODE )); then printf '%s' "$raw" | jq '{ok:true, data: .}'
+    else echo "OK — schedule removed $name (crontab line dropped)"; fi
+    return 0
+  fi
+
+  # ls / show / render — read-only, format per the global text/JSON contract.
+  if (( JSON_MODE )); then printf '%s' "$raw" | jq '{ok:true, data: .}'
+  elif [[ "$action" == "ls" ]]; then
+    printf '%s' "$raw" | jq -r 'if (.schedules | length) == 0 then "  (no schedules)" else (.schedules[] | "  \(.name)\tcron=\(.cron)\tbench=\(.bench)\tmode=\(.mode)") end'
+  elif [[ "$action" == "show" ]]; then
+    printf '%s' "$raw" | jq -r '"schedule:   \(.name)\ncron:       \(.cron)\nbench:      \(.bench // "council")\nmode:       \(.mode)\nmaxActions: \(.maxActions // 3)\nballotDeadline: \(.ballotDeadline // 1500)\nquestion:\n\(.question)"'
+  else
+    printf '%s' "$raw" | jq -r '.question // .'
+  fi
+  return 0
+}
+
 cmd_council() {
   command -v node >/dev/null 2>&1 || fail "$E_GENERIC" "5dive council needs node on PATH"
   command -v jq   >/dev/null 2>&1 || fail "$E_GENERIC" "5dive council needs jq on PATH"
   local sub="${1:-}"; [[ $# -gt 0 ]] && shift || true
   case "$sub" in
     ""|-h|--help|help) _council_help; return 0 ;;
-    convene|bench|init|lineage|veto|gate-clear|rot-triage|roster|log|record|verify|promote|demote|expel|amend|sign-vote|verify-votes|ballot-tap) ;;
-    *) fail "$E_USAGE" "unknown council command: $sub (convene|bench|init|lineage|roster|log|record|verify|promote|demote|expel|amend|veto|gate-clear|rot-triage|sign-vote|verify-votes|ballot-tap)" ;;
+    convene|schedule|bench|init|lineage|veto|gate-clear|rot-triage|roster|log|record|verify|promote|demote|expel|amend|sign-vote|verify-votes|ballot-tap) ;;
+    *) fail "$E_USAGE" "unknown council command: $sub (convene|schedule|bench|init|lineage|roster|log|record|verify|promote|demote|expel|amend|veto|gate-clear|rot-triage|sign-vote|verify-votes|ballot-tap)" ;;
   esac
 
   local dir; dir="$(mktemp -d -t 5dive-council.XXXXXX)" || fail "$E_GENERIC" "mktemp failed"
@@ -1149,6 +1337,11 @@ cmd_council() {
   # heartbeat writes, no second write path. Preserve its stdout JSON + exit code so the plugin can gate.
   if [[ "$sub" == "ballot-tap" ]]; then
     node "$dir/cli.mjs" ballot-tap "$@"; return $?
+  fi
+
+  # CNCL-23: scheduled convenes — config CRUD + crontab wiring + the deterministic runner.
+  if [[ "$sub" == "schedule" ]]; then
+    _council_schedule "$dir" "$@"; return $?
   fi
 
   if [[ "$sub" == "bench" ]]; then
