@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.12.2 — Gate reminders render decision options in full, never mid-truncate (DIVE-1602) (2026-07-21)
+
+- fix(heartbeat): a decision gate embeds its choices ("A = …", "B = …") in the ask body, but the stale-gate reminder (90 char), org escalation (90 char), and re-nag batch (240 char) all hard-truncated the ask, so a longer ask dropped a whole option mid-word and rendered a gate that hid one of its own choices (repro: MOB-2, "B = enroll now…" chopped off). Each of the four reminder SQL sites now renders the ask in full when `need_options` is set (option-less gates keep their courtesy cap); the Telegram send is still bounded by clampList. Pairs with the plugin-side /inbox + /task deep-link fix in 5dive-plugins.
+
 ## 0.12.1 — Standup convene: --timeout honored on ballot path + clean seal cleanup (CNCL-29) (2026-07-21)
 
 - fix(council): the DEFAULT ballot vote path (`dispatchBallotVote`) now derives its deadline from `--ballot-deadline`, then `--deadline`, then `--timeout` (via `firstFlagValue`), so the operator-facing `--timeout` actually bounds a convene and seals a clean verdict on expiry. Previously `--timeout` was consumed ONLY on the ask-rail path; the ballot path ignored it and ran to a hidden 900s default (standup's `--timeout=300` was dead, convene ran ~15m then sealed). The ask-rail path is unchanged.

@@ -893,10 +893,10 @@ _hb_gate_ttl_sweep() {
     local lines_main lines_manual reminder_ids
     reminder_ids=$(db "SELECT id FROM tasks WHERE ${_t2_where} AND assignee=$(sqlq "$aname")
                        ORDER BY COALESCE(need_asked_at,updated_at),id;" | paste -sd, -)
-    lines_main=$(db "SELECT '• /task_'||id||' ['||ident||'] '||need_type||', '||CAST(julianday('now')-julianday(COALESCE(need_asked_at,updated_at)) AS INT)||'d — '||substr(replace(COALESCE(ask,''), x'0a', ' '),1,90)
+    lines_main=$(db "SELECT '• /task_'||id||' ['||ident||'] '||need_type||', '||CAST(julianday('now')-julianday(COALESCE(need_asked_at,updated_at)) AS INT)||'d — '||CASE WHEN COALESCE(need_options,'')='' THEN substr(replace(COALESCE(ask,''), x'0a', ' '),1,90) ELSE replace(COALESCE(ask,''), x'0a', ' ') END
                      FROM tasks WHERE ${_t2_where} AND assignee=$(sqlq "$aname") AND need_type != 'manual'
                      ORDER BY COALESCE(need_asked_at,updated_at);")
-    lines_manual=$(db "SELECT '• /task_'||id||' ['||ident||'] '||CAST(julianday('now')-julianday(COALESCE(need_asked_at,updated_at)) AS INT)||'d — '||substr(replace(COALESCE(ask,''), x'0a', ' '),1,90)
+    lines_manual=$(db "SELECT '• /task_'||id||' ['||ident||'] '||CAST(julianday('now')-julianday(COALESCE(need_asked_at,updated_at)) AS INT)||'d — '||CASE WHEN COALESCE(need_options,'')='' THEN substr(replace(COALESCE(ask,''), x'0a', ' '),1,90) ELSE replace(COALESCE(ask,''), x'0a', ' ') END
                        FROM tasks WHERE ${_t2_where} AND assignee=$(sqlq "$aname") AND need_type = 'manual'
                        ORDER BY COALESCE(need_asked_at,updated_at);")
     [[ -n "$lines_main" || -n "$lines_manual" ]] || continue
@@ -914,7 +914,7 @@ _hb_gate_ttl_sweep() {
     local _mgr _esc_lines
     _mgr=$(db "SELECT COALESCE(reports_to,'') FROM agents_org WHERE name=$(sqlq "$aname");")
     if [[ -n "$_mgr" && "$_mgr" != "$aname" ]] && _task_agent_channel "$_mgr"; then
-      _esc_lines=$(db "SELECT '• ['||ident||'] '||need_type||', '||CAST(julianday('now')-julianday(COALESCE(need_asked_at,updated_at)) AS INT)||'d — '||substr(replace(COALESCE(ask,''), x'0a', ' '),1,90)
+      _esc_lines=$(db "SELECT '• ['||ident||'] '||need_type||', '||CAST(julianday('now')-julianday(COALESCE(need_asked_at,updated_at)) AS INT)||'d — '||CASE WHEN COALESCE(need_options,'')='' THEN substr(replace(COALESCE(ask,''), x'0a', ' '),1,90) ELSE replace(COALESCE(ask,''), x'0a', ' ') END
                        FROM tasks WHERE ${_t2_where} AND assignee=$(sqlq "$aname")
                          AND COALESCE(need_asked_at, updated_at) <= datetime('now','-${_HB_GATE_ESCALATE_DAYS} days')
                        ORDER BY COALESCE(need_asked_at,updated_at);")
@@ -984,7 +984,7 @@ _hb_gate_renag_batch() { # <recipient_agent> <comma-separated task ids> <route_l
     if [[ -n "$markup" ]]; then
       rows=$(jq -cn --argjson a "$rows" --argjson b "$markup" '$a + ($b.inline_keyboard // [])' 2>/dev/null) || rows='[]'
     fi
-  done < <(db "SELECT id||x'1f'||ident||x'1f'||need_type||x'1f'||COALESCE(need_options,'')||x'1f'||COALESCE(recommend,'')||x'1f'||substr(replace(COALESCE(ask,''),x'0a',' '),1,240)
+  done < <(db "SELECT id||x'1f'||ident||x'1f'||need_type||x'1f'||COALESCE(need_options,'')||x'1f'||COALESCE(recommend,'')||x'1f'||CASE WHEN COALESCE(need_options,'')='' THEN substr(replace(COALESCE(ask,''),x'0a',' '),1,240) ELSE replace(COALESCE(ask,''),x'0a',' ') END
                FROM tasks WHERE id IN (${idlist}) ORDER BY COALESCE(need_asked_at,updated_at,created_at),id;")
 
   local reply_markup=""
