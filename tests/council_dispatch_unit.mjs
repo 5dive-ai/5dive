@@ -3,7 +3,7 @@
 // no `5dive` exec (a mock seatVote adapter stands in for the ask rail). Exit 0 == green.
 import {
   parseVote, seatPrompt, normalizeSeatVote, synthesizeNarrative, buildConveneVerdict,
-  tallyVotes, runCouncil, VOTE_TOKENS, canonicalTranscript,
+  tallyVotes, runCouncil, VOTE_TOKENS, canonicalTranscript, carryForwardVotes,
 } from '../src/council/engine.mjs'
 // CNCL-18: the non-blocking ballot ADAPTER lives in cli.mjs (guarded entrypoint so this import
 // does NOT run the arg-parser). We drive its PURE collection logic with injected exec/clock seams.
@@ -92,7 +92,45 @@ const rAdv = await runCouncil(
   { seatVote: mockSeatVote({ main: 'approve', theo: 'approve', codex: 'approve', olivia: 'approve', lilbro: 'approve' }, seenAdv) })
 ok(seenAdv.some(s => s.round === 1 && s.sawPrior === false), 'adversarial: round 1 still blind')
 ok(seenAdv.some(s => s.round === 2 && s.sawPrior === true), 'adversarial: round 2 rebuttal DOES see the round-1 votes')
-ok(Array.isArray(rAdv.round1Votes) && Array.isArray(rAdv.rebuttalVotes) && rAdv.votes === rAdv.rebuttalVotes, 'adversarial: round 1 + rebuttal recorded separately; final votes = round 2')
+// CNCL-25 (Finding 4): the final `votes` are now round-2 MERGED over round-1 (not identity-equal to
+// rebuttalVotes). When every seat re-casts (as here), the merge is VALUE-equal to round 2.
+ok(Array.isArray(rAdv.round1Votes) && Array.isArray(rAdv.rebuttalVotes) &&
+   rAdv.votes !== rAdv.rebuttalVotes &&
+   JSON.stringify(rAdv.votes.map(v => [v.seat, v.vote])) === JSON.stringify(rAdv.rebuttalVotes.map(v => [v.seat, v.vote])),
+   'adversarial: round 1 + rebuttal recorded separately; final votes = round-2 merged over round-1 (all re-cast -> equals round 2)')
+
+// ---- CNCL-25 Finding-4: carryForwardVotes (pure merge) ----------------------------------------
+{
+  const r1 = [{ seat: 'a', vote: 'reject', rationale: 'no' }, { seat: 'b', vote: 'approve', rationale: 'y' }, { seat: 'c', vote: 'abstain', rationale: 'never voted' }]
+  const r2 = [{ seat: 'a', vote: 'abstain', rationale: 'deadline/no-vote' }, { seat: 'b', vote: 'reject', rationale: 'changed my mind' }, { seat: 'c', vote: 'abstain', rationale: 'deadline/no-vote' }]
+  const m = carryForwardVotes(r1, r2)
+  ok(m.find(v => v.seat === 'a').vote === 'reject' && m.find(v => v.seat === 'a').carried === true, 'carryForward: a seat SILENT in round 2 carries its round-1 vote (marked carried)')
+  ok(/round-1 position carried forward/.test(m.find(v => v.seat === 'a').rationale), 'carryForward: the carried vote is MARKED in the rationale (auditable in the seal)')
+  ok(m.find(v => v.seat === 'b').vote === 'reject' && !m.find(v => v.seat === 'b').carried, 'carryForward: a re-cast round-2 vote WINS (a genuine revision is honored), not carried')
+  ok(m.find(v => v.seat === 'c').vote === 'abstain', 'carryForward: a seat that never cast substantively stays abstain')
+  ok(carryForwardVotes(null, null).length === 0 && carryForwardVotes([{ seat: 'a', vote: 'approve' }], []).length === 0, 'carryForward: null/empty-safe')
+}
+
+// ---- CNCL-25 Finding-4 INTEGRATION: an all-silent rebuttal no longer collapses the tally ------
+// Pre-fix repro (2026-07-20 strategy): seats cast substantively in the blind round 1, then ALL time
+// out in the tight round-2 window -> final tally taken from round 2 -> cast=0 -> inquorate, the live
+// split erased. Post-fix: round-1 votes carry, so the verdict reflects real round-1 participation.
+function roundAwareVote(spec) { // spec[seat] = [round1Vote, round2Vote]; 'TIMEOUT' throws (dead seat)
+  return async (seat, ctx) => {
+    const pair = spec[seat.id] || ['approve', 'approve']
+    const v = pair[ctx.round === 2 ? 1 : 0]
+    if (v === 'TIMEOUT') throw new Error('E_TIMEOUT: no idle reply')
+    return { vote: v, rationale: `${seat.id}:r${ctx.round}:${v}` }
+  }
+}
+const rCarry = await runCouncil(
+  { role: 'convene', question: 'ship?', seats: seats5, councilName: 'council', mode: 'adversarial' },
+  { seatVote: roundAwareVote({ main: ['reject', 'TIMEOUT'], theo: ['approve', 'TIMEOUT'], codex: ['approve', 'TIMEOUT'], olivia: ['approve', 'TIMEOUT'], lilbro: ['approve', 'TIMEOUT'] }) })
+ok(rCarry.rebuttalVotes.every(v => v.vote === 'abstain'), 'carry integration: round 2 was all-silent (every seat timed out -> abstain)')
+ok(rCarry.votes.filter(v => v.vote !== 'abstain').length === 5, 'CNCL-25: round-1 votes CARRY through an all-silent rebuttal (final cast != 0)')
+ok(rCarry.verdict.votesCast === 5 && rCarry.verdict.quorumMet === true, 'CNCL-25: an all-silent rebuttal no longer collapses a fully-participated round 1 to inquorate')
+ok(rCarry.verdict.tally.approve === 4 && rCarry.verdict.tally.reject === 1, 'CNCL-25: the live round-1 approve/reject split SURVIVES into the final tally (was erased pre-fix)')
+ok(rCarry.votes.find(v => v.seat === 'main').vote === 'reject' && rCarry.votes.find(v => v.seat === 'main').carried === true, 'CNCL-25: the dissenting round-1 reject is carried + marked, not dropped')
 
 // TAMPER-EVIDENCE of round-1 history (main's CNCL-7 gate amendment): in adversarial mode the
 // signed canonical must include the round-1 votes, so a between-round seat flip cannot be

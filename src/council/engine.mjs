@@ -1399,6 +1399,31 @@ const NARRATIVE = { type: 'object', additionalProperties: false, required: ['con
 
 function log(on, msg) { if (on) process.stderr.write(`[council] ${msg}\n`) }
 
+// CNCL-25 (red-team Finding 4): merge the rebuttal (round 2) over the blind round 1 for the FINAL
+// tally, instead of replacing round 1 wholesale. A seat's SUBSTANTIVE round-2 vote wins (it revised
+// its position after seeing the debate); but a seat that goes SILENT in round 2 (timeout / no reply
+// -> abstain) keeps its substantive round-1 vote — rebuttal silence means "position unchanged", not
+// "I withdraw my vote". Without this, a seat had to cast twice inside two tight consecutive windows
+// for its vote to survive, so partial participation collapsed the tally to cast=0 (2026-07-20
+// strategy convene: 2 real votes + a live approve/reject split ERASED by an all-abstain round 2).
+// Carried votes are MARKED in the rationale so the sealed receipt shows exactly what was carried;
+// round1Votes + rebuttalVotes stay recorded raw alongside the merged `votes`, so the full two-round
+// record is auditable. Deterministic + pure (unit-tested). A seat that never cast a substantive vote
+// in either round stays an abstain; a convene where every seat re-casts is byte-identical to before.
+export function carryForwardVotes(round1Votes, rebuttalVotes) {
+  const SUBSTANTIVE = new Set(['approve', 'reject', 'escalate'])
+  const r1By = new Map((round1Votes || []).map(v => [String(v.seat), v]))
+  return (rebuttalVotes || []).map(r2 => {
+    if (r2 && SUBSTANTIVE.has(r2.vote)) return r2                    // re-cast (possibly revised) — use round 2
+    const r1 = r1By.get(String(r2 && r2.seat))
+    if (r1 && SUBSTANTIVE.has(r1.vote)) {                            // silent in round 2 -> carry round 1 forward
+      return { seat: r2.seat, vote: r1.vote, carried: true,
+        rationale: `${r1.rationale} [round-1 position carried forward; no rebuttal re-cast]` }
+    }
+    return r2                                                        // never cast a substantive vote -> abstain stands
+  })
+}
+
 // Run a full convene -> deliberate -> chair-synthesis over `question` with `seats`.
 // `modelCall` is injected (real adapter in prod, a deterministic mock in tests).
 // mode: quick (no cross-take context) | deliberate (seats see all opening takes) |
@@ -1506,7 +1531,7 @@ async function runConvene(input, deps, h) {
     if (mode === 'adversarial') {
       log(verbose, `adversarial rebuttal (round 2, recorded separately)`)
       rebuttalVotes = await dispatchRound(seats, { question, role, mode, round: 2, priorVotes: round1Votes, precedents }, seatVote)
-      finalVotes = rebuttalVotes
+      finalVotes = carryForwardVotes(round1Votes, rebuttalVotes)
     }
     const counted = tallyVotes(finalVotes, tallyOpts)
     verdict = buildConveneVerdict(counted, synthesizeNarrative(finalVotes, counted))
@@ -1519,7 +1544,7 @@ async function runConvene(input, deps, h) {
     finalVotes = round1Votes
     if (mode === 'adversarial') {
       rebuttalVotes = await Promise.all(seats.map(s => askSeam(s, { question, round: 2, priorVotes: round1Votes, precedents })))
-      finalVotes = rebuttalVotes
+      finalVotes = carryForwardVotes(round1Votes, rebuttalVotes)
     }
     const counted = tallyVotes(finalVotes, tallyOpts)
     const narr = await chairNarrative(modelCall, question, finalVotes)
