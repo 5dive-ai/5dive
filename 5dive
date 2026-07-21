@@ -26,7 +26,7 @@ esac
 
 # Bumped on every public release. `build.sh` checks this line exists; CI fails
 # the bundle-drift check if it's missing or empty.
-readonly FIVE_VERSION="0.12.9"
+readonly FIVE_VERSION="0.12.10"
 
 # GitHub org our repos live under. The org is being renamed
 # 5dive-com -> 5dive-ai (2026-06); fetches must work on either side of the
@@ -25467,6 +25467,19 @@ _council_veto_audit() {
 # recipient. The tappable button + its callback -> `council veto exercise` is the telegram-plugin
 # leg that pairs with a live genesis; this CLI leg guarantees the recipient is notified with the
 # receipt handle + the one-time nonce the tap must present.
+# DIVE-1644: render the informed-veto header — WHAT carried (the motion/decision text) + the vote
+# tally + any dissent — so the founder can make a veto call from the notification ALONE, never on a
+# sealed digest blind. Returns empty when no motion is sourced (a base offer degrades gracefully to
+# the plain receipt line, no regression). Shared by BOTH the button rail (`_tg_veto_offer`) and the
+# `_tg_send` fallback so the two legs stay consistent.
+_council_veto_offer_header() {
+  local motion="${1:-}" tally="${2:-}" dissent="${3:-}" h=""
+  [[ -n "$motion" ]]  && h+=$'\nDecision: '"$motion"
+  [[ -n "$tally" ]]   && h+=$'\nVote: '"$tally"
+  [[ -n "$dissent" && "$dissent" != "none" ]] && h+=$'\nDissent: '"$dissent"
+  printf '%s' "$h"
+}
+
 # DIVE-1546: the STRUCTURED founder-veto delivery seam `_council_veto_ping` prefers (rail B). It
 # renders the offer as a telegram message + a 🛑 VETO tap button whose callback_data carries the
 # one-time nonce — the ONLY place the raw nonce travels — and delivers it to the founder's DM chat.
@@ -25477,7 +25490,7 @@ _council_veto_audit() {
 # telegram rail the offer simply lapses (execution proceeds after the hold — fail-safe). Delivery
 # routes through `_mirror_send`, which honors FIVEDIVE_NOTIFY_DRYRUN so a fixture can't DM a human.
 _tg_veto_offer() {
-  local resolved="$1" full_digest="$2" nonce="$3" execute_after="$4"
+  local resolved="$1" full_digest="$2" nonce="$3" execute_after="$4" motion="${5:-}" tally="${6:-}" dissent="${7:-}"
   [[ -n "$resolved" && -n "$full_digest" && -n "$nonce" ]] || return 0
   local token=""
   if _task_owner_channel 2>/dev/null && [[ -n "${TASK_CH_TOKEN:-}" ]]; then
@@ -25491,13 +25504,16 @@ _tg_veto_offer() {
   reply_markup="$(jq -cn --arg p "$prefix" --arg n "$nonce" \
     '{inline_keyboard: [[{text: "🛑 VETO this pass", callback_data: ("veto:" + $p + ":" + $n)}]]}' 2>/dev/null)" || return 0
   # NB: the raw nonce is ONLY in callback_data above — never in this human-readable text.
-  local text="Council veto offer — a pass sealed (${full_digest:0:12}…). Execution holds until ${execute_after}. Tap 🛑 VETO to block it, or ignore to let it proceed."
+  # DIVE-1644: lead with WHAT carried + the tally + any dissent so the founder can decide from the
+  # notification alone, then the sealed-receipt handle + hold deadline.
+  local header; header="$(_council_veto_offer_header "$motion" "$tally" "$dissent")"
+  local text="Council veto offer${header}"$'\n\n'"A pass sealed (${full_digest:0:12}…). Execution holds until ${execute_after}. Tap 🛑 VETO to block it, or ignore to let it proceed."
   _mirror_send "$token" "$resolved" "" "$text" "$reply_markup" >/dev/null 2>&1 || true
   return 0
 }
 
 _council_veto_ping() {
-  local resolved="$1" digest="$2" execute_after="$3" nonce="$4"
+  local resolved="$1" digest="$2" execute_after="$3" nonce="$4" motion="${5:-}" tally="${6:-}" dissent="${7:-}"
   mkdir -p "$COUNCIL_DIR" 2>/dev/null || true
   # CNCL-9 (main gate amendment 2): the pings audit records ONLY the nonce DIGEST, never the raw
   # bearer token. The raw nonce leaves this process solely via the structured founder delivery leg
@@ -25522,15 +25538,18 @@ _council_veto_ping() {
   #     open but carry NO nonce — a tap veto then needs the structured seam; without it the offer
   #     simply lapses and execution proceeds after the hold (fail-safe).
   # A missing rail must never fail the (already-sealed) convene. The live legs are skipped under MOCK.
+  # DIVE-1644: the motion/tally/dissent (sourced from the sealed verdict at the convene site) ride
+  # through to BOTH delivery legs so the founder sees WHAT carried, not just a digest.
   if command -v _tg_veto_offer >/dev/null 2>&1 && [[ -z "${COUNCIL_MOCK:-}" ]]; then
-    _tg_veto_offer "$resolved" "$digest" "$nonce" "$execute_after" >/dev/null 2>&1 || true
+    _tg_veto_offer "$resolved" "$digest" "$nonce" "$execute_after" "$motion" "$tally" "$dissent" >/dev/null 2>&1 || true
   elif [[ -n "${COUNCIL_MOCK:-}" && -n "${COUNCIL_VETO_OFFER_SINK:-}" ]]; then
     # Offline-test capture ONLY (double-gated on MOCK + an explicit sink, mirrors COUNCIL_VETO_NONCE_SINK):
     # record the STRUCTURED offer so the bash e2e can assert the raw nonce travels structured (and that
     # no chat-text leg ever carries it). PRODUCTION is never MOCK and never writes this sink.
-    ( umask 077; printf '%s\t%s\t%s\t%s\n' "$resolved" "$digest" "$nonce" "$execute_after" >> "$COUNCIL_VETO_OFFER_SINK" ) 2>/dev/null || true
+    ( umask 077; printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$resolved" "$digest" "$nonce" "$execute_after" "$motion" "$tally" >> "$COUNCIL_VETO_OFFER_SINK" ) 2>/dev/null || true
   elif [[ -z "${COUNCIL_MOCK:-}" ]] && command -v _tg_send >/dev/null 2>&1; then
-    _tg_send "$resolved" "Council veto offer — a pass sealed (${digest:0:12}…). Execution holds until ${execute_after}. Open /council or the dashboard to VETO within the window, or ignore to let it proceed." >/dev/null 2>&1 || true
+    local header; header="$(_council_veto_offer_header "$motion" "$tally" "$dissent")"
+    _tg_send "$resolved" "Council veto offer${header}"$'\n\n'"A pass sealed (${digest:0:12}…). Execution holds until ${execute_after}. Open /council or the dashboard to VETO within the window, or ignore to let it proceed." >/dev/null 2>&1 || true
   fi
   return 0
 }
@@ -26722,7 +26741,18 @@ cmd_council() {
         # skipped under MOCK. The tappable button + its callback -> `council veto exercise` routing
         # is the telegram-plugin leg that pairs with a live genesis (post-seed).
         if [[ -n "$offer_resolved" ]]; then
-          _council_veto_ping "$offer_resolved" "$digest" "$execute_after" "$veto_nonce" || true
+          # DIVE-1644: source the decision text + tally + dissent from the sealed verdict so the
+          # founder ping is self-contained (no blind veto). Tally renders "carried A/T approve"
+          # where T = approve+reject+escalate (seats voting), plus the reject/escalate split.
+          local ping_motion ping_tally ping_dissent
+          ping_motion="$(printf '%s' "$raw" | jq -r '.question // empty' 2>/dev/null)"
+          ping_tally="$(printf '%s' "$raw" | jq -r '
+            (.verdict.tally // {}) as $t
+            | (($t.approve // 0) + ($t.reject // 0) + ($t.escalate // 0)) as $tot
+            | "carried \($t.approve // 0)/\($tot) approve (\($t.reject // 0) reject, \($t.escalate // 0) escalate)"
+          ' 2>/dev/null)"
+          ping_dissent="$(printf '%s' "$raw" | jq -r '.verdict.dissent // empty' 2>/dev/null)"
+          _council_veto_ping "$offer_resolved" "$digest" "$execute_after" "$veto_nonce" "$ping_motion" "$ping_tally" "$ping_dissent" || true
         fi
       fi
     fi
