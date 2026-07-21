@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.12.1 — Standup convene: --timeout honored on ballot path + clean seal cleanup (CNCL-29) (2026-07-21)
+
+- fix(council): the DEFAULT ballot vote path (`dispatchBallotVote`) now derives its deadline from `--ballot-deadline`, then `--deadline`, then `--timeout` (via `firstFlagValue`), so the operator-facing `--timeout` actually bounds a convene and seals a clean verdict on expiry. Previously `--timeout` was consumed ONLY on the ask-rail path; the ballot path ignored it and ran to a hidden 900s default (standup's `--timeout=300` was dead, convene ran ~15m then sealed). The ask-rail path is unchanged.
+- fix(council): on a deadline miss the shared `collect` loop now auto-cancels the still-open ballot task it minted (spent == an abstain) so orphan `todo` ballots stop lingering past their deadline and re-triggering fleet-stall alerts every standup (e.g. DIVE-1579). Best-effort + race-safe: a tap at the wire or an already-closed task leaves the abstain verdict untouched.
+- fix(council): the CNCL-19 precedent pool now stages its temp file via `mktemp` in `${TMPDIR:-/tmp}` instead of the root-owned `${COUNCIL_DIR}`, restoring case-law parity for non-root/cron convenes that previously hit EPERM and silently ran with no precedents. Fixed in both `src/council/cmd_council.template.sh` and the regenerated `src/cmd_council.sh`.
+
 ## 0.12.0 — First-contact control-plane welcome + terminal teaser (DIVE-1571) (2026-07-20)
 
 - feat(welcome): the first-contact DM an agent sends the moment it pairs now LEADS with the approved (lodar, 2026-07-20) control-plane pitch for **admin-isolation** agents: "hey, i'm {name}, your agent, and i'm not alone. through 5dive i can spin up a whole team, stand up a company, run a council, or turn a goal into a plan. tell me what you're building, or say 'show me what you can do'." Enriches `send_welcome_message` (`cmd_agent_pairing.sh`), the existing one-shot on-pair delivery point, so it fires exactly ONCE.
