@@ -31,7 +31,7 @@
   <a href="#for-your-ai-agent">Use from your AI agent</a> ·
   <a href="#security--isolation">Security</a> ·
   <a href="https://5dive.ai/docs/5dive-cli?utm_source=github&utm_medium=owned&utm_campaign=5dive-readme">Full CLI docs</a> ·
-  <a href="https://5dive.ai/sign-up?utm_source=github&utm_medium=owned&utm_campaign=5dive-readme">Managed VM</a>
+  <a href="https://5dive.ai?utm_source=github&utm_medium=owned&utm_campaign=5dive-readme">Managed VM</a>
 </p>
 
 **A company of AI agents, and the orchestrator is just bash.** No framework, no protocol, no broker: each agent is its own Linux user running an official coding CLI (claude, codex, a few others) as a systemd service, coordinating through one bash CLI they all call. Isolation is unix users, supervision is systemd, logs are journald. **I used the OS instead of building a platform.**
