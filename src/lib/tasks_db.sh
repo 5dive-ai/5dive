@@ -968,6 +968,23 @@ _task_pref_set() {
 # Formatted read: dbfmt <sqlite-flag> "<sql>"  (e.g. -box, -json, -line).
 dbfmt() {
   umask 0002
+  # DIVE-1610: on the -json path, drop null-valued keys before the JSON reaches
+  # agent context. sqlite3 -json emits every selected column including the ~70%
+  # that are null on a typical task row (41/58 on `task show --json`), and that
+  # bloat multiplies across every heartbeat/objective/task tick fleet-wide.
+  # Omitting a null key is a no-op for jq/JS consumers (a missing key reads back
+  # as null), so keys stay stable — this is lean, not a rename. jq is already a
+  # hard dependency of the CLI (see the --json error envelope in output.sh).
+  # Only the -json mode is post-processed; -box/-line are untouched.
+  if [[ "$1" == "-json" ]]; then
+    local out
+    out=$(sqlite3 -cmd ".timeout 5000" -cmd "PRAGMA foreign_keys=ON" -json "$TASKS_DB" "$2")
+    # Empty result set: sqlite3 -json prints nothing. Preserve that (callers
+    # guard on empty), don't emit "[]" where they expect "".
+    [[ -z "$out" ]] && return 0
+    printf '%s' "$out" | jq -c 'if type=="array" then map(with_entries(select(.value != null))) else . end'
+    return 0
+  fi
   sqlite3 -cmd ".timeout 5000" -cmd "PRAGMA foreign_keys=ON" "$1" "$TASKS_DB" "$2"
 }
 
