@@ -28,6 +28,14 @@ TELEGRAM_AGENT_CLAUDE_MD="/usr/local/lib/5dive/telegram-agent-CLAUDE.md"
 # choice. The fragment's own first line scopes it to Fable sessions, so it is
 # inert on every other model — safe as a universal default.
 MODEL_TIERING_CLAUDE_MD="/usr/local/lib/5dive/model-tiering-CLAUDE.md"
+# DIVE-1613: terse-by-default operational-comms directive appended to EVERY
+# claude agent's per-agent CLAUDE.md. A personality-level "be concise" line in a
+# persona/pack does NOT enforce terse operational chat (it reads as craft voice),
+# so this ships a SEPARATE operational rule — lead with the answer, a few lines,
+# no preamble — universally at create time. Explicitly scoped "NOT your craft
+# voice" so a character's expressive register survives. Character packs inherit
+# it here at provision time, so pack CLAUDE.md files stay craft-voice only.
+OPERATIONAL_COMMS_CLAUDE_MD="/usr/local/lib/5dive/operational-comms-CLAUDE.md"
 # DIVE-1210: project-subagent override that shadows the harness's built-in
 # Explore agent and pins it to haiku. Every claude agent's settings.json pins
 # model:"claude-opus-4-8" (below), and CC >=2.1.198 has Explore inherit the
@@ -230,6 +238,16 @@ JSON
   # Best-effort like the telegram fragment: a missing source never fails create.
   if [[ -f "$MODEL_TIERING_CLAUDE_MD" ]]; then
     { [[ -s "$home/.claude/CLAUDE.md" ]] && printf '\n'; cat "$MODEL_TIERING_CLAUDE_MD"; } \
+      | sudo -u "$user" tee -a "$home/.claude/CLAUDE.md" >/dev/null
+    chmod 644 "$home/.claude/CLAUDE.md"
+  fi
+
+  # DIVE-1613: append the terse-by-default operational-comms rule so every
+  # provisioned claude agent starts terse in operational chat without hand-
+  # instruction — kept separate from craft/persona voice. Best-effort like the
+  # fragments above; a missing source never fails create.
+  if [[ -f "$OPERATIONAL_COMMS_CLAUDE_MD" ]]; then
+    { [[ -s "$home/.claude/CLAUDE.md" ]] && printf '\n'; cat "$OPERATIONAL_COMMS_CLAUDE_MD"; } \
       | sudo -u "$user" tee -a "$home/.claude/CLAUDE.md" >/dev/null
     chmod 644 "$home/.claude/CLAUDE.md"
   fi
