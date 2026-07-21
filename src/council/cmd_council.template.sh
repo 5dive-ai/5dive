@@ -787,7 +787,23 @@ _council_seal_stdin() {
 _council_roster() {
   local dir="$1"
   [[ -f "$COUNCIL_GENESIS" ]] || fail "$E_VALIDATION" "the Council has no genesis roster — human-seed it first: sudo 5dive council init --seats=<a:chair,b,c> --threshold=<spec> --veto=<principal>"
-  local raw; raw="$(node "$dir/cli.mjs" roster --registry="$COUNCIL_REGISTRY")" || return $?
+  # DIVE-1664: derive the roster VIEW from the ROOT-SEALED lineage — the SAME source `promote`/
+  # `demote` mutate — so `roster` can never disagree with `log`/the lineage about membership. The
+  # current roster = the LATEST lineage record that carries seats (genesis or a motion; a veto entry
+  # carries none, so we skip it and keep the last real roster). We hand those seats + threshold +
+  # seededAt to cli.mjs; it falls back to the registry bench only when there is no such record.
+  local roster_rec rseats rthreshold rstamped
+  roster_rec="$(jq -sc 'map(select(.record.seats != null and (.record.seats|length)>0)) | last // empty' "$COUNCIL_LINEAGE" 2>/dev/null)"
+  local -a roster_args=(--registry="$COUNCIL_REGISTRY")
+  if [[ -n "$roster_rec" && "$roster_rec" != "null" ]]; then
+    rseats="$(printf '%s' "$roster_rec" | jq -c '.record.seats')"
+    rthreshold="$(printf '%s' "$roster_rec" | jq -c '.record.threshold // empty')"
+    rstamped="$(printf '%s' "$roster_rec" | jq -r '.record.stampedAt // ""')"
+    roster_args+=(--seats-json="$rseats")
+    [[ -n "$rthreshold" && "$rthreshold" != "null" ]] && roster_args+=(--threshold-json="$rthreshold")
+    [[ -n "$rstamped" ]] && roster_args+=(--seeded-at="$rstamped")
+  fi
+  local raw; raw="$(node "$dir/cli.mjs" roster "${roster_args[@]}")" || return $?
   local vprincipal vresolved head_seq head_digest hlen
   vprincipal="$(jq -r '.veto.principal // "none"' "$COUNCIL_GENESIS" 2>/dev/null)"
   vresolved="$(jq -r '.veto.resolved // ""' "$COUNCIL_GENESIS" 2>/dev/null)"
