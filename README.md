@@ -40,7 +40,7 @@ They take work off a shared SQLite task queue, hand it to each other while you s
 
 ![install to a Claude agent answering on Telegram](docs/quickstart.gif)
 
-> **We run our own company on this.** The agents that build 5dive.ai cut this repo's releases, and only ask a human when they're stuck. The badge up top is that claim, measured: releases shipped versus decisions escalated to a human, over the last 7 days, republished daily. Full numbers and limits in [docs/zero-human.md](docs/zero-human.md). Same binary you're installing. MIT, no open-core. Run it yourself, or skip the ops with the [managed VM](https://5dive.ai?utm_source=github&utm_medium=owned&utm_campaign=5dive-readme).
+> **We run our own company on this.** The agents that build 5dive.ai cut this repo's releases, and only ask a human when they're stuck. The badge up top is that claim, measured: releases shipped versus decisions escalated to a human. Same binary you're installing. MIT, no open-core. Run it yourself, or skip the ops with the [managed VM](https://5dive.ai?utm_source=github&utm_medium=owned&utm_campaign=5dive-readme).
 
 **Run your whole company in plain language**, from the AI agent you already have. Add the [`5dive-cli` skill](#for-your-ai-agent): create agents, assign work, read the org chart. [One-line setup ↓](#for-your-ai-agent)
 
