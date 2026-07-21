@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.12.6 — Terse-by-default operational comms for every new claude agent (DIVE-1613) (2026-07-21)
+
+- feat(agent-create): a persona/pack "be concise" line reads as craft voice and does NOT enforce terse *operational* chat — don (VP Marketing) had "short sentences" in his craft voice yet was verbose reporting in chat, and lodar had to re-instruct him. New `operational-comms-CLAUDE.md` fragment ships a separate, universal rule (lead with the answer, a few lines, no preamble, explicitly "NOT your craft voice") appended to EVERY claude agent's `$HOME/.claude/CLAUDE.md` at create — mirroring the `model-tiering-CLAUDE.md` universal-append in `preseed_claude_agent`. Wired in `install.sh` + `docker/Dockerfile` staging. Character packs inherit it at provision time, so pack `CLAUDE.md` files stay craft-voice only (no per-pack edits, no drift).
+
 ## 0.12.5 — Lean `--json`: drop null keys from `dbfmt` output to cut fleet token burn (DIVE-1610) (2026-07-21)
 
 - perf(cli): every task/objective/goal/loop/council `--json` path routes through one helper, `dbfmt -json`, which emitted all ~58 columns per row including the ~70% that are null on a typical task (41/58 on `task show --json`). That bloat is injected into agent context on every heartbeat/objective/task tick, fleet-wide. `dbfmt` now strips null-valued keys on the `-json` path only (`-box`/`-line` untouched). Omitting a null key is a no-op for jq/JS consumers (a missing key reads back as null), so keys stay stable — lean, not a rename. Measured on the live board: `task show --json` 851→644 tok (58→17 keys); `task ls --json` (the top emitter) 10,541→8,306 tok, −2,235 per call. jq is already a hard CLI dependency.

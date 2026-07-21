@@ -373,6 +373,19 @@ JOURNALD
     echo "warn: failed to stage model-tiering-CLAUDE.md — Fable model-tiering default won't apply until the next refresh" >&2
   fi
 
+  # DIVE-1613: terse-by-default operational-comms fragment appended to every
+  # claude-type agent's $HOME/.claude/CLAUDE.md at create (preseed_claude_agent).
+  # A persona/pack "be concise" line reads as craft voice and does NOT enforce
+  # terse operational chat, so this ships a separate universal rule. Fail-soft
+  # like the fragments above — a missing fragment just means the rule applies at
+  # the next refresh, not a broken agent.
+  if curl -fsSL "$REPO/operational-comms-CLAUDE.md" -o "$LIB_DIR/operational-comms-CLAUDE.md"; then
+    chmod 644 "$LIB_DIR/operational-comms-CLAUDE.md"
+    ok "operational-comms-CLAUDE.md"
+  else
+    echo "warn: failed to stage operational-comms-CLAUDE.md — terse-comms default won't apply until the next refresh" >&2
+  fi
+
   # DIVE-1210: project subagent that overrides the harness's built-in Explore
   # agent, pinning it to haiku instead of inheriting the session's model. CC
   # >=2.1.198 has Explore inherit the main conversation's model (capped at
