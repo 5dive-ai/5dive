@@ -930,29 +930,48 @@ function motionFromFlags() {
     to: flag('to') === true || flag('to') == null ? null : String(flag('to')) }
 }
 
-// council roster — the current seats (from the persisted, motion-governed `council` bench) + the
-// live pass threshold. bash augments with the veto principal + lineage head (root-owned files).
+// council roster — the CURRENT seats + the live pass threshold. SOURCE OF TRUTH is the ROOT-SEALED
+// lineage head: bash passes it via --seats-json/--threshold-json/--seeded-at (the latest lineage
+// record that carries a roster — genesis or a motion). Deriving the VIEW from the sealed lineage,
+// NOT the editable `council` registry bench, is what keeps `roster` from ever disagreeing with
+// `log`/the lineage about membership (DIVE-1664: the two used to be independent sources and could
+// diverge — a bench that lost its genesis marker made `roster` claim "no genesis roster" while the
+// lineage still held the sealed seats). The registry bench is only a fallback for an uninitialized
+// / ad-hoc council with no lineage yet. bash also augments with the veto principal + lineage head.
 function cmdRoster() {
   const registryPath = flag('registry')
-  const reg = loadRegistry(registryPath)
-  // Read the RAW persisted bench (not resolveCouncil, which drops genesis/threshold/seededAt).
-  const bench = { ...BUILTINS, ...reg }.council
-  if (!bench || !bench.genesis) die('the Council has no genesis roster — human-seed it first: sudo 5dive council init …', 8)
-  const seatCount = (bench.seats || []).length
-  const threshold = E.resolveThreshold(seatCount, bench.threshold || { rule: 'majority' })
-  const quorum = E.quorumSize(seatCount, bench.threshold || { rule: 'majority' })
+  const lineageSeats = readJsonFlag('seats-json', { optional: true })
+  let baseSeats, thresholdSpec, seededAt
+  if (lineageSeats && lineageSeats.length) {
+    // Authoritative: the seats sealed into the lineage record (id, lens, chair).
+    baseSeats = lineageSeats
+    thresholdSpec = readJsonFlag('threshold-json', { optional: true }) || { rule: 'majority' }
+    seededAt = flag('seeded-at') === true || flag('seeded-at') == null ? '' : String(flag('seeded-at'))
+  } else {
+    // Fallback (no lineage yet): the RAW persisted bench (not resolveCouncil, which drops
+    // genesis/threshold/seededAt).
+    const reg = loadRegistry(registryPath)
+    const bench = { ...BUILTINS, ...reg }.council
+    if (!bench || !bench.genesis) die('the Council has no genesis roster — human-seed it first: sudo 5dive council init …', 8)
+    baseSeats = bench.seats
+    thresholdSpec = bench.threshold || { rule: 'majority' }
+    seededAt = bench.seededAt || ''
+  }
+  const seatCount = (baseSeats || []).length
+  const threshold = E.resolveThreshold(seatCount, thresholdSpec)
+  const quorum = E.quorumSize(seatCount, thresholdSpec)
   // CNCL-17: optionally fold each seat's TRACK RECORD (calibration vs real outcomes) into the
   // roster so membership is read alongside performance. bash passes the computed record via
   // --track-json (receipts scored against task outcomes); absent → roster stays as before.
   const tr = readJsonFlag('track-json', { optional: true })
   const seats = tr && Array.isArray(tr.seats)
-    ? (bench.seats || []).map(s => {
+    ? (baseSeats || []).map(s => {
         const row = tr.seats.find(r => r.seat === s.id)
         return row ? { ...s, trackRecord: { scored: row.scored, correct: row.correct, calibration: row.calibration, vindicated: row.vindicated } } : s
       })
-    : bench.seats
+    : baseSeats
   out({ council: 'council', seats, seatCount, threshold, quorum,
-    thresholdSpec: bench.threshold || { rule: 'majority' }, seededAt: bench.seededAt || '',
+    thresholdSpec, seededAt,
     scoredReceipts: tr ? tr.scoredReceipts : undefined })
 }
 
