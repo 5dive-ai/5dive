@@ -1242,7 +1242,11 @@ cmd_council() {
   # missing/empty log yields no pool (no-op, byte-identical to pre-CNCL-19).
   local -a precedent_args=(); local _pp_tmp=""
   if compgen -G "${COUNCIL_RECEIPTS}/*.json" >/dev/null 2>&1; then
-    _pp_tmp="${COUNCIL_DIR}/.precedent-pool.$$.json"
+    # CNCL-29: stage the pool in a writable temp dir, NOT ${COUNCIL_DIR} (root-owned; a non-root/cron
+    # caller hit EPERM there and silently ran with NO precedents — CNCL-19 case-law parity was lost on
+    # every scheduled convene). mktemp keeps it collision-safe; an empty _pp_tmp on mktemp failure just
+    # falls through to the no-pool path below (byte-identical to pre-CNCL-19).
+    _pp_tmp="$(mktemp "${TMPDIR:-/tmp}/5dive-precedent-pool.XXXXXX" 2>/dev/null || true)"
     if jq -s '[.[] | select((.verdict.recommendation // "") != "")
                 | {digest:(.sealedDigest // ""), question:(.question // ""),
                    recommendation:(.verdict.recommendation // ""),

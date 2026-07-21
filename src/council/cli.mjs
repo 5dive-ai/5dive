@@ -150,6 +150,12 @@ export function dispatchBallotVote(opts = {}) {
       }
       await sleep(pollSecs * 1000)
     }
+    // CNCL-29: the deadline elapsed with no vote — this ballot is SPENT (== an abstain) and the convene
+    // is about to seal. Cancel the still-open ballot task so it can't linger as an orphan `todo` past
+    // its deadline and re-trigger fleet-stall alerts every standup (main, 2026-07-21). Best-effort: the
+    // task may already be closed (a tap landed at the wire) or the cancel may race — either way the
+    // seat's verdict is an abstain regardless, so a cancel gap never changes the tally.
+    try { exec(['task', 'cancel', String(taskId), '--result=council ballot spent — no vote by deadline (== abstain); auto-cancelled on convene seal (CNCL-29)']) } catch { /* already closed / not cancellable — abstain stands */ }
     return { vote: 'abstain', rationale: `${seat.id} ${kind} ${taskId}: no vote by deadline ${deadlineIso} (deadline/no-vote)` }
   }
   return async (seat, ctx) => {
@@ -329,13 +335,23 @@ function askRailSelected() {
   const e = process.env.COUNCIL_ASK_RAIL
   return !!e && e !== '0'
 }
+// CNCL-29: return the first arg that carries an actual value — skipping `undefined` (flag absent) and
+// `true` (bare flag with no `=value`). Lets --ballot-deadline > --deadline > --timeout cascade cleanly.
+function firstFlagValue(...vals) {
+  for (const v of vals) if (v !== undefined && v !== true) return v
+  return undefined
+}
 function seatVoteFor() {
   if (process.env.COUNCIL_MOCK) return mockSeatVote()
   if (askRailSelected()) {
     return dispatchSeatVote({ timeout: flag('timeout'), idle: flag('idle-secs'), poll: flag('poll-secs'), from: flag('from') })
   }
   return dispatchBallotVote({
-    deadline: flag('ballot-deadline') !== undefined && flag('ballot-deadline') !== true ? flag('ballot-deadline') : flag('deadline'),
+    // CNCL-29: the ballot deadline honors --ballot-deadline, then --deadline, then --timeout — so the
+    // operator-facing --timeout is REAL on the (default) ballot path, not silently ignored while the
+    // convene runs to the hidden 900s default. First flag that carries an actual value wins; a bare
+    // flag (=== true) or an absent one (=== undefined) is skipped so it can't clobber a later value.
+    deadline: firstFlagValue(flag('ballot-deadline'), flag('deadline'), flag('timeout')),
     poll: flag('ballot-poll'), from: flag('from'),
   })
 }
