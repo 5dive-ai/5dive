@@ -220,6 +220,9 @@ Usage (per-agent / per-task token burn — subscription tokens, no dollars):
   5dive usage budget set <agent> --daily=<tok> [--ceiling=<tok>] [--hard-stop]  # soft warn + optional hard-stop ceiling
   5dive usage budget ls | clear <agent>              # hard-stop is OFF by default (warn-only); check runs on the heartbeat
 
+Trace (causal timeline for one task, goal → ship — INST-1):
+  5dive trace <id|DIVE-N> [--json] [--no-audit]      # read-only: origin (goal/parent/objective/loop) + lifecycle + gate provenance + verdict
+
 Memory (queryable team memory — read-path, DIVE-726):
   5dive memory search "<query>" [--limit=N] [--max-tokens=T]  # BM25-ranked snippets from the agent's memory stores + wiki, with provenance
 
@@ -691,6 +694,12 @@ main() {
       # publish/status are read-mostly; on/off manage a root cron + pref, tick is
       # the root cron driver. No registry mutation/lock, no audit (like digest).
       cmd_proof "$@" ;;
+    trace)
+      # INST-1: causal timeline for one task (goal → ship). Read-only view over
+      # existing data — task transition columns + project/parent/objective/loop
+      # origin + gate provenance + the audit log. No mutation/lock/audit line,
+      # same posture as usage/digest/memory.
+      cmd_trace "$@" ;;
     memory)
       # DIVE-726 Phase 1a: queryable team memory read-path. Read-only (scans
       # markdown memory stores + shared wiki); no registry mutation/lock/audit,
