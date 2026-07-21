@@ -72,7 +72,21 @@ cat \
   src/main.sh \
   > "$OUT"
 
-chmod +x "$OUT"
+# DIVE-1261: publish a sha256 of the bundle so the installer can verify the fetched binary before
+# swapping it in. Regenerated on every build and committed alongside the bundle; CI's build+diff
+# drift check keeps the two in sync.
+#
+# CNCL-23 regression: generate the sha IMMEDIATELY after writing the bundle, BEFORE any step that
+# could abort under `set -e` (the chmod below, the FIVE_VERSION check) — otherwise the bundle and
+# its committed sha can DRIFT. A `chmod: Operation not permitted` (building a claude-owned worktree
+# as another user) once aborted right before the old sha line, shipping a 0.12.7 bundle carrying
+# 0.12.6's sha (PR #95 — CI drift-gate RED, host-roll refused on the mismatch). Order now
+# guarantees: whenever $OUT exists on disk post-build, $OUT.sha256 matches it.
+sha256sum "$OUT" | awk '{print $1}' > "$OUT.sha256"
+
+# +x is a local convenience (the installer re-chmods the fetched binary); a cross-user perms
+# failure must NOT abort the build and re-open the sha-drift window above.
+chmod +x "$OUT" 2>/dev/null || true
 
 # Sanity-check the version line landed in the bundle. CI's bundle-drift check
 # already catches missing src→bundle plumbing, but this gives a tighter error
@@ -81,10 +95,5 @@ if ! grep -qE '^readonly FIVE_VERSION="[^"]+"' "$OUT"; then
   echo "error: $OUT is missing FIVE_VERSION — check src/header.sh" >&2
   exit 1
 fi
-
-# DIVE-1261: publish a sha256 of the bundle so the installer can verify the
-# fetched binary before swapping it in. Regenerated on every build and committed
-# alongside the bundle; CI's build+diff drift check keeps the two in sync.
-sha256sum "$OUT" | awk '{print $1}' > "$OUT.sha256"
 
 echo "built $OUT ($(wc -l < "$OUT") lines, $(grep -oE '^readonly FIVE_VERSION="[^"]+"' "$OUT" | cut -d'"' -f2)) + $OUT.sha256 ($(cut -c1-16 "$OUT.sha256")…)"
