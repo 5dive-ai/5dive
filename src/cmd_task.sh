@@ -389,7 +389,7 @@ cmd_task_add() {
   # exists (e.g. a solo org, or the only coordinator IS the assignee) the default
   # silently no-ops rather than blocking the add. Env kill-switch for the fleet:
   # FIVE_VERIFY_DEFAULT=0.
-  local verify_defaulted=0
+  local verify_defaulted=0 verify_unavailable=0
   if [[ "$kind" == "standard" && -z "$no_verify" && "${FIVE_VERIFY_DEFAULT:-1}" != "0" \
         && -z "$accept" && -z "$verify_cmd" && -z "$verifier" ]] \
      && ! _task_is_trivial "$title" "$body" "$priority"; then
@@ -398,16 +398,23 @@ cmd_task_add() {
       verifier="$_grader"
       accept="Deliverable meets the intent of: ${title}. Maker records in the done result WHAT was built and HOW it was checked; ${_grader} confirms against this before the task closes (refine these criteria as the work firms up)."
       verify_defaulted=1
+    else
+      # INST-2: the verifier-by-default posture WOULD engage here but no distinct
+      # grader exists (solo org, or the only candidate IS the maker). Rather than
+      # let the default silently no-op — leaving the "verifier-graded by default"
+      # claim quietly false — record it so `task show` + the dashboard can label
+      # the task "Unverified: no independent verifier available".
+      verify_unavailable=1
     fi
   fi
   local creator; creator=$(task_actor "$from")
   local id
   id=$(db "INSERT INTO tasks (title, body, priority, assignee, created_by, parent_id, project_key, kind, schedule, fresh,
-                              acceptance_criteria, verify_command, max_iterations, verifier, task_budget)
+                              acceptance_criteria, verify_command, max_iterations, verifier, task_budget, verify_unavailable)
            VALUES ($(sqlq "$title"), $(sqlq_or_null "$body"), $(sqlq "$priority"),
                    $(sqlq_or_null "$assignee"), $(sqlq "$creator"), ${parent_sql}, $(sqlq "$project"),
                    $(sqlq "$kind"), ${schedule_sql}, ${fresh_sql},
-                   $(sqlq_or_null "$accept"), $(sqlq_or_null "$verify_cmd"), ${max_iters:-NULL}, $(sqlq_or_null "$verifier"), $(sqlq_or_null "$task_budget"));
+                   $(sqlq_or_null "$accept"), $(sqlq_or_null "$verify_cmd"), ${max_iters:-NULL}, $(sqlq_or_null "$verifier"), $(sqlq_or_null "$task_budget"), $([[ $verify_unavailable == 1 ]] && echo 1 || echo NULL));
            SELECT last_insert_rowid();")
   # Ident is stamped by the AFTER INSERT trigger from the project's counter, so
   # read it back rather than assuming the DIVE- prefix (DIVE-484).
@@ -421,9 +428,11 @@ cmd_task_add() {
     (( auto_coordinated )) && coord_note=" → coordinator: $assignee"
     local verify_note=""
     (( verify_defaulted )) && verify_note=" · verifier-graded by default → $verifier ('task done' hands off to grade; refine with --accept/--verify, or opt out with --no-verify)"
+    # INST-2: name the silent no-op out loud so the default's honesty is visible.
+    (( verify_unavailable )) && verify_note=" · ⚠ Unverified: no independent verifier available (solo org — maker would grade itself; the verifier-by-default posture no-opped)"
     ok "created ${ident} — $title${coord_note}${verify_note}" \
-       '{id:($i|tonumber), ident:$id, project:$pr, title:$t, priority:$p, assignee:$a, created_by:$c, kind:"standard", autoCoordinated:($ac=="1"), verifyDefaulted:($vd=="1"), verifier:$v}' \
-       --arg i "$id" --arg id "$ident" --arg pr "$project" --arg t "$title" --arg p "$priority" --arg a "${assignee:-}" --arg c "$creator" --arg ac "$auto_coordinated" --arg vd "$verify_defaulted" --arg v "${verifier:-}"
+       '{id:($i|tonumber), ident:$id, project:$pr, title:$t, priority:$p, assignee:$a, created_by:$c, kind:"standard", autoCoordinated:($ac=="1"), verifyDefaulted:($vd=="1"), verifyUnavailable:($vu=="1"), verifier:$v}' \
+       --arg i "$id" --arg id "$ident" --arg pr "$project" --arg t "$title" --arg p "$priority" --arg a "${assignee:-}" --arg c "$creator" --arg ac "$auto_coordinated" --arg vd "$verify_defaulted" --arg vu "$verify_unavailable" --arg v "${verifier:-}"
   fi
 }
 
@@ -475,12 +484,18 @@ cmd_task_ls() {
     # answered, task still open). Consumers/dashboards MUST count/filter on this,
     # never raw `need_type != null` (which retains a STALE type after a gate is
     # consumed or the task is re-blocked on a dependency, over-reporting the inbox).
+    # INST-2: emit verify_unavailable — the canonical "no independent verifier
+    # available" flag (verifier-by-default no-opped in a solo org). True only while
+    # the mark stands AND no verifier has since been assigned; the dashboard renders
+    # it as an "Unverified" badge. NB: no inline SQL `--` comments in this string —
+    # dbfmt flattens newlines, so a `--` would comment out the rest of the query.
     rows=$(dbfmt -json "SELECT id, ident, title, status, priority, assignee, created_by, parent_id, created_at, done_at, body, result, need_type, ask, need_options, recommend, precedent_ref, precedent_kind, need_answer, need_answered_at, need_answered_by, tier, kind, schedule, last_fired_at, parked_at, park_reason, wake_at, project_key,
              CASE WHEN maker_agent IS NOT NULL AND assignee=verifier AND status NOT IN ('done','cancelled')
                   THEN CASE WHEN handoff_ack_at IS NOT NULL THEN 'reviewing' ELSE 'delivered' END
                   ELSE NULL END AS handoff_state,
              handoff_ack_at,
-             CASE WHEN need_type IS NOT NULL AND need_answered_at IS NULL AND status NOT IN ('done','cancelled') THEN 1 ELSE 0 END AS gate_live
+             CASE WHEN need_type IS NOT NULL AND need_answered_at IS NULL AND status NOT IN ('done','cancelled') THEN 1 ELSE 0 END AS gate_live,
+             CASE WHEN verify_unavailable = 1 AND verifier IS NULL AND status NOT IN ('done','cancelled') THEN 1 ELSE 0 END AS verify_unavailable
            FROM tasks WHERE ${where} ${order};")
     [[ -n "$rows" ]] || rows="[]"
     # Feed rows via stdin, not --argjson: a big board (179+ tasks w/ bodies)
@@ -547,11 +562,14 @@ cmd_task_show() {
                                     THEN 'reviewing (ACK '||handoff_ack_at||')'
                                     ELSE 'delivered (awaiting verifier ACK)' END||x'0a'
              ELSE '' END||
-        CASE WHEN iteration           IS NOT NULL THEN 'iteration: '||iteration ELSE '' END
+        CASE WHEN iteration           IS NOT NULL THEN 'iteration: '||iteration||x'0a' ELSE '' END||
+        CASE WHEN verify_unavailable = 1 AND verifier IS NULL AND status NOT IN ('done','cancelled')
+             THEN '⚠ Unverified: no independent verifier available (solo org — no distinct grader)' ELSE '' END
       FROM tasks WHERE id=${id}
         AND (acceptance_criteria IS NOT NULL OR verify_command IS NOT NULL
              OR max_iterations IS NOT NULL OR verifier IS NOT NULL OR task_budget IS NOT NULL
-             OR maker_agent IS NOT NULL OR iteration IS NOT NULL OR handoff_ack_at IS NOT NULL);")
+             OR maker_agent IS NOT NULL OR iteration IS NOT NULL OR handoff_ack_at IS NOT NULL
+             OR (verify_unavailable = 1 AND verifier IS NULL AND status NOT IN ('done','cancelled')));")
     [[ -n "$loopspec" ]] && { echo; echo "loop spec:"; printf '%s\n' "$loopspec" | sed -e 's/[[:space:]]*$//' | indent2; }
     local subs
     subs=$(db "SELECT ident||'  ['||status||']  '||title FROM tasks WHERE parent_id=${id} ORDER BY id;")

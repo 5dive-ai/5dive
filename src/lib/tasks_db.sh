@@ -280,7 +280,17 @@ CREATE TABLE IF NOT EXISTS tasks (
   -- human-created (or other-objective) task is impossible in code, never merely
   -- discouraged. Additive expand, NULL backfill.
   originated_by_objective INTEGER,
-  originated_cycle        INTEGER
+  originated_cycle        INTEGER,
+  -- INST-2: integrity label for the verifier-by-default posture (DIVE-969/989).
+  -- Set to 1 at add time ONLY when a non-trivial standard task WOULD have been
+  -- graded by default but no distinct grader existed (solo org / the only
+  -- candidate IS the maker) — the silent no-op the posture otherwise hides.
+  -- Surfaced as "Unverified: no independent verifier available" on `task show`
+  -- and the dashboard while verifier stays NULL, so the "verifier-graded by
+  -- default" claim is never quietly false. NULL/0 for every task that got a real
+  -- grader, opted out via --no-verify, or is trivial. Same integrity-invariant
+  -- spirit as the council founder-excluded badge.
+  verify_unavailable      INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_tasks_precedent ON tasks(need_type, ask_shape);
 CREATE INDEX IF NOT EXISTS idx_tasks_originated ON tasks(originated_by_objective);
@@ -672,7 +682,8 @@ _tasks_db_migrate() {
            'secret_key TEXT' 'connector TEXT' 'human_nonce_hash TEXT' \
            'ask_shape TEXT' 'precedent_ref INTEGER' 'precedent_kind TEXT' \
            'shipped_flag_at TEXT' 'routed_reviewer TEXT' \
-           'originated_by_objective INTEGER' 'originated_cycle INTEGER'; do
+           'originated_by_objective INTEGER' 'originated_cycle INTEGER' \
+           'verify_unavailable INTEGER'; do
     if ! printf '%s\n' "$cols" | grep -qx "${c%% *}"; then
       sqlite3 -cmd ".timeout 5000" "$TASKS_DB" \
         "ALTER TABLE tasks ADD COLUMN ${c};" >/dev/null 2>&1 || true
