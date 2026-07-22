@@ -70,5 +70,50 @@ printf '%s\n' 'not yaml frontmatter' > "$FIVEDIVE_CONSTITUTION_FILE"
 [[ "$(_council_hard_gate_rx)" == "$_GATE_T2_FLOOR_RX" ]] \
   && ok_t "malformed constitution falls back atomically" || bad_t "malformed policy partially applied"
 
+# DIVE-1695: the on-disk constitution is trusted for the floor ONLY when it
+# matches the digest sealed in the council lineage. All tests above ran with no
+# COUNCIL_LINEAGE (no seal) and so kept CNCL-14 behavior. Now exercise the
+# sealed paths. Seal a digest by writing a lineage record carrying it.
+export COUNCIL_LINEAGE="$TMP/lineage.jsonl"
+_seal_digest() { printf '{"record":{"constitutionDigest":"%s"}}\n' "$1" > "$COUNCIL_LINEAGE"; }
+_live_digest() { sha256sum < "$FIVEDIVE_CONSTITUTION_FILE" | awk '{print $1}'; }
+
+# In sync: a file whose digest matches the seal IS trusted — its added brand class floors.
+printf '%s\n' 'hard_gates:' "  money: 'spend|billing'" \
+  "  public_comms: 'brand|press'" '# sealed policy' > "$FIVEDIVE_CONSTITUTION_FILE"
+_seal_digest "$(_live_digest)"
+if _council_constitution_drifted; then bad_t "in-sync constitution reported as drift"
+else ok_t "constitution matching the sealed digest is not drift"; fi
+_gate_tier2_floor_hit "review the brand strategy" \
+  && ok_t "sealed+matching constitution floors its added brand class" || bad_t "sealed+matching not trusted"
+
+# Drift (the attack): the file is edited AFTER sealing to DELETE the money class
+# (weakening the human-gate floor), but the seal still holds the old digest. The
+# edited file must NOT be trusted — bill floors via the shipped default, brand does
+# not floor (the drifted file's classes are ignored), and a warning is emitted.
+sealed_before="$(_live_digest)"; _seal_digest "$sealed_before"
+printf '%s\n' 'hard_gates:' "  public_comms: 'brand'" \
+  '# tampered: money class removed after sealing' > "$FIVEDIVE_CONSTITUTION_FILE"
+if _council_constitution_drifted; then ok_t "post-seal edit detected as drift"
+else bad_t "post-seal edit not detected as drift"; fi
+drift_warning="$TMP/drift-warning"
+_gate_tier2_floor_hit "approve billing" 2>"$drift_warning" \
+  && ok_t "drifted constitution still floors billing via shipped default" \
+  || bad_t "drifted constitution let billing through (floor weakened!)"
+if _gate_tier2_floor_hit "review the brand strategy" 2>/dev/null; then bad_t "drifted constitution's classes were trusted"
+else ok_t "drifted constitution's on-disk classes are ignored"; fi
+grep -q 'drifted from the sealed digest' "$drift_warning" \
+  && ok_t "drifted constitution emits fail-closed warning" || bad_t "drift fell back silently"
+
+# Sealed but the file is deleted entirely: fail closed (drift).
+rm -f "$FIVEDIVE_CONSTITUTION_FILE"
+if _council_constitution_drifted; then ok_t "sealed digest with missing file is drift"
+else bad_t "missing file under a seal was not flagged"; fi
+_seal_digest ""  # no non-empty digest sealed -> pre-constitution lineage, never drift
+printf '%s\n' 'hard_gates:' "  money: 'spend'" '# unsealed setup file' > "$FIVEDIVE_CONSTITUTION_FILE"
+if _council_constitution_drifted; then bad_t "empty seal wrongly treated as drift"
+else ok_t "no sealed digest leaves CNCL-14 behavior unchanged"; fi
+unset COUNCIL_LINEAGE
+
 printf '%s\n' '-----' "constitution_gate_floor_unit: $PASS passed, $FAIL failed"
 [[ "$FAIL" -eq 0 ]]

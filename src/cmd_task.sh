@@ -1711,17 +1711,30 @@ _gate_tier2_floor_hit() {
      && declare -F _council_constitution_path >/dev/null 2>&1; then
     constitution_path="$(_council_constitution_path 2>/dev/null || true)"
     if [[ -n "$constitution_path" && -f "$constitution_path" ]]; then
-      loaded_rx="$(_council_hard_gate_rx 2>/dev/null || true)"
-      if [[ -n "$loaded_rx" ]]; then
-        floor_rx="$loaded_rx"
-        # CNCL-28: engine.mjs can reject known JS-only syntax, but Bash is the
-        # consumer and therefore the authority on POSIX ERE validity. Bash =~
-        # returns 2 for an invalid expression; treat that as a whole-policy
-        # failure so one bad class can never silently disable the T2 floor.
-        [[ x =~ $floor_rx ]] || ere_rc=$?
-        if (( ere_rc == 2 )); then
-          warn "constitution hard_gates regex is invalid POSIX ERE; falling back to the shipped tier-2 floor (${constitution_path})"
-          floor_rx="$_GATE_T2_FLOOR_RX"
+      # DIVE-1695: the on-disk constitution is trusted for the human-gate floor
+      # ONLY when it matches the digest SEALED into the council lineage. The
+      # sealed chain is the authority, not the forgeable file. A drifted/tampered
+      # constitution.yaml — e.g. an unsanctioned edit that DELETES a hard class to
+      # weaken the floor — must never be enforced: fail closed to the shipped
+      # defaults, the exact verdict `council verify`/`convene` reach on drift.
+      # No seal in the lineage yet (pre-constitution org) leaves CNCL-14 behavior
+      # unchanged: the present file is loaded as before.
+      if declare -F _council_constitution_drifted >/dev/null 2>&1 \
+         && _council_constitution_drifted; then
+        warn "constitution.yaml drifted from the sealed digest; enforcing the shipped tier-2 floor, not the on-disk file (amend via a constitutional-class council motion) (${constitution_path})"
+      else
+        loaded_rx="$(_council_hard_gate_rx 2>/dev/null || true)"
+        if [[ -n "$loaded_rx" ]]; then
+          floor_rx="$loaded_rx"
+          # CNCL-28: engine.mjs can reject known JS-only syntax, but Bash is the
+          # consumer and therefore the authority on POSIX ERE validity. Bash =~
+          # returns 2 for an invalid expression; treat that as a whole-policy
+          # failure so one bad class can never silently disable the T2 floor.
+          [[ x =~ $floor_rx ]] || ere_rc=$?
+          if (( ere_rc == 2 )); then
+            warn "constitution hard_gates regex is invalid POSIX ERE; falling back to the shipped tier-2 floor (${constitution_path})"
+            floor_rx="$_GATE_T2_FLOOR_RX"
+          fi
         fi
       fi
     fi
