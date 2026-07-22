@@ -191,6 +191,25 @@ selfg=$(run add --assignee=carol --body="work" -- "carol's own task")
 [[ "$(echo "$selfg" | jf '.data.verifyDefaulted')" == "false" ]] \
   && ok_t "no self-grading when maker is the only grader" || bad_t "self-grade guard" "$(echo "$selfg" | jf '.data.verifyDefaulted')"
 
+# INST-2: that silent no-op is now LABELLED, not hidden. The add output flags
+# verifyUnavailable, the column persists it, and `task show` surfaces the label.
+selfgid=$(echo "$selfg" | jf '.data.id')
+[[ "$(echo "$selfg" | jf '.data.verifyUnavailable')" == "true" && \
+   "$(db "SELECT verify_unavailable FROM tasks WHERE id=$selfgid;")" == "1" ]] \
+  && ok_t "INST-2: no-grader no-op is flagged verifyUnavailable" \
+  || bad_t "INST-2 flag" "vu=$(echo "$selfg" | jf '.data.verifyUnavailable') col=$(db "SELECT verify_unavailable FROM tasks WHERE id=$selfgid;")"
+selfg_show=$( (JSON_MODE=0 cmd_task_show "$selfgid") 2>"$TMP"/err )
+echo "$selfg_show" | grep -q "Unverified: no independent verifier available" \
+  && ok_t "INST-2: task show surfaces the 'Unverified' label" \
+  || bad_t "INST-2 show label" "$selfg_show"
+# task ls --json exposes the canonical flag for the dashboard
+selfg_ls=$(run ls --all | jq -r --argjson i "$selfgid" '.data.tasks[] | select(.id==$i) | .verify_unavailable')
+[[ "$selfg_ls" == "1" ]] \
+  && ok_t "INST-2: task ls --json exposes verify_unavailable=1" || bad_t "INST-2 ls flag" "got=$selfg_ls"
+# a task WITH a distinct grader is NOT flagged (no false positives)
+[[ "$(run ls --all | jq -r --argjson i "$vdid" '.data.tasks[] | select(.id==$i) | .verify_unavailable')" == "0" ]] \
+  && ok_t "INST-2: graded task is not flagged unverified" || bad_t "INST-2 no false-pos" "vdid flagged"
+
 # --- DIVE-989: maker==coordinator no longer silently no-ops.
 # The lone-root coordinator (carol) owns every auto-coordinated task, so
 # maker==coordinator constantly. Give the org a designated technical deputy and
