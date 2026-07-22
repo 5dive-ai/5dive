@@ -437,10 +437,12 @@ cmd_pair() {
   local type channels
   type=$(jq -r --arg n "$name" '.agents[$n].type' <<<"$reg")
   channels=$(jq -r --arg n "$name" '.agents[$n].channels' <<<"$reg")
-  case "$channels" in
-    telegram|discord) ;;
-    *) fail "$E_VALIDATION" "agent '$name' has channels=$channels — pairing only applies to telegram or discord" ;;
-  esac
+  # channels is a comma-separable list (DIVE-856) — match membership, not the
+  # whole string, so telegram+dashboard (the default claude combo) still pairs.
+  # Mirrors the ",telegram," idiom the telegram-* subcommands already use.
+  if [[ ",$channels," != *",telegram,"* && ",$channels," != *",discord,"* ]]; then
+    fail "$E_VALIDATION" "agent '$name' has channels=$channels — pairing only applies to telegram or discord"
+  fi
   # cmd_pair applies to claude, codex, grok and antigravity — their
   # telegram/discord plugins use a code-roundtrip (user DMs bot, bot replies with a code,
   # dashboard pastes the code back to seed access.json) and share the same
