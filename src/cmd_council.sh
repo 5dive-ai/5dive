@@ -67,6 +67,24 @@ _council_constitution_drift() {
   node "$dir/cli.mjs" drift-check --sealed="$sealed" --live="$live"
 }
 
+# DIVE-1695 — node-free mirror of engine.mjs constitutionDriftCheck(), for the
+# gate-floor hot path (which must not spin up the Node runtime merely to trust a
+# regex). Returns 0 (DRIFTED, fail closed) / 1 (in sync or no seal to enforce),
+# byte-for-byte the same verdict the sealed `council verify` reaches. Semantics,
+# identical to the JS: no sealed digest -> return 1 (pre-constitution lineage,
+# nothing to enforce against); sealed but the live file is missing or its digest
+# differs -> return 0 (an unsanctioned edit/drop must NOT be enforced). Both
+# sides are sha256 in the same realm (bash sha256sum), so they compare directly.
+_council_constitution_drifted() {
+  local sealed live
+  sealed="$(_council_sealed_constitution_digest 2>/dev/null || true)"
+  [[ -z "$sealed" ]] && return 1          # no sealed constitution -> nothing to drift from
+  live="$(_council_live_constitution_digest 2>/dev/null || true)"
+  [[ -z "$live" ]] && return 0            # sealed but file gone -> drift (fail closed)
+  [[ "$sealed" != "$live" ]] && return 0  # sealed but file edited -> drift (fail closed)
+  return 1                                 # live matches the sealed digest
+}
+
 _council_help() {
   cat >&2 <<'COUNCIL_HELP'
 5dive council — standalone deliberation council (v0.11)

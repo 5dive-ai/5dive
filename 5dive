@@ -26,7 +26,7 @@ esac
 
 # Bumped on every public release. `build.sh` checks this line exists; CI fails
 # the bundle-drift check if it's missing or empty.
-readonly FIVE_VERSION="0.13.3"
+readonly FIVE_VERSION="0.13.4"
 
 # GitHub org our repos live under. The org is being renamed
 # 5dive-com -> 5dive-ai (2026-06); fetches must work on either side of the
@@ -17677,17 +17677,30 @@ _gate_tier2_floor_hit() {
      && declare -F _council_constitution_path >/dev/null 2>&1; then
     constitution_path="$(_council_constitution_path 2>/dev/null || true)"
     if [[ -n "$constitution_path" && -f "$constitution_path" ]]; then
-      loaded_rx="$(_council_hard_gate_rx 2>/dev/null || true)"
-      if [[ -n "$loaded_rx" ]]; then
-        floor_rx="$loaded_rx"
-        # CNCL-28: engine.mjs can reject known JS-only syntax, but Bash is the
-        # consumer and therefore the authority on POSIX ERE validity. Bash =~
-        # returns 2 for an invalid expression; treat that as a whole-policy
-        # failure so one bad class can never silently disable the T2 floor.
-        [[ x =~ $floor_rx ]] || ere_rc=$?
-        if (( ere_rc == 2 )); then
-          warn "constitution hard_gates regex is invalid POSIX ERE; falling back to the shipped tier-2 floor (${constitution_path})"
-          floor_rx="$_GATE_T2_FLOOR_RX"
+      # DIVE-1695: the on-disk constitution is trusted for the human-gate floor
+      # ONLY when it matches the digest SEALED into the council lineage. The
+      # sealed chain is the authority, not the forgeable file. A drifted/tampered
+      # constitution.yaml — e.g. an unsanctioned edit that DELETES a hard class to
+      # weaken the floor — must never be enforced: fail closed to the shipped
+      # defaults, the exact verdict `council verify`/`convene` reach on drift.
+      # No seal in the lineage yet (pre-constitution org) leaves CNCL-14 behavior
+      # unchanged: the present file is loaded as before.
+      if declare -F _council_constitution_drifted >/dev/null 2>&1 \
+         && _council_constitution_drifted; then
+        warn "constitution.yaml drifted from the sealed digest; enforcing the shipped tier-2 floor, not the on-disk file (amend via a constitutional-class council motion) (${constitution_path})"
+      else
+        loaded_rx="$(_council_hard_gate_rx 2>/dev/null || true)"
+        if [[ -n "$loaded_rx" ]]; then
+          floor_rx="$loaded_rx"
+          # CNCL-28: engine.mjs can reject known JS-only syntax, but Bash is the
+          # consumer and therefore the authority on POSIX ERE validity. Bash =~
+          # returns 2 for an invalid expression; treat that as a whole-policy
+          # failure so one bad class can never silently disable the T2 floor.
+          [[ x =~ $floor_rx ]] || ere_rc=$?
+          if (( ere_rc == 2 )); then
+            warn "constitution hard_gates regex is invalid POSIX ERE; falling back to the shipped tier-2 floor (${constitution_path})"
+            floor_rx="$_GATE_T2_FLOOR_RX"
+          fi
         fi
       fi
     fi
@@ -22756,6 +22769,24 @@ _council_constitution_drift() {
   sealed="$(_council_sealed_constitution_digest)"
   live="$(_council_live_constitution_digest)"
   node "$dir/cli.mjs" drift-check --sealed="$sealed" --live="$live"
+}
+
+# DIVE-1695 — node-free mirror of engine.mjs constitutionDriftCheck(), for the
+# gate-floor hot path (which must not spin up the Node runtime merely to trust a
+# regex). Returns 0 (DRIFTED, fail closed) / 1 (in sync or no seal to enforce),
+# byte-for-byte the same verdict the sealed `council verify` reaches. Semantics,
+# identical to the JS: no sealed digest -> return 1 (pre-constitution lineage,
+# nothing to enforce against); sealed but the live file is missing or its digest
+# differs -> return 0 (an unsanctioned edit/drop must NOT be enforced). Both
+# sides are sha256 in the same realm (bash sha256sum), so they compare directly.
+_council_constitution_drifted() {
+  local sealed live
+  sealed="$(_council_sealed_constitution_digest 2>/dev/null || true)"
+  [[ -z "$sealed" ]] && return 1          # no sealed constitution -> nothing to drift from
+  live="$(_council_live_constitution_digest 2>/dev/null || true)"
+  [[ -z "$live" ]] && return 0            # sealed but file gone -> drift (fail closed)
+  [[ "$sealed" != "$live" ]] && return 0  # sealed but file edited -> drift (fail closed)
+  return 1                                 # live matches the sealed digest
 }
 
 _council_help() {
