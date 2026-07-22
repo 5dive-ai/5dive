@@ -199,8 +199,8 @@ selfgid=$(echo "$selfg" | jf '.data.id')
   && ok_t "INST-2: no-grader no-op is flagged verifyUnavailable" \
   || bad_t "INST-2 flag" "vu=$(echo "$selfg" | jf '.data.verifyUnavailable') col=$(db "SELECT verify_unavailable FROM tasks WHERE id=$selfgid;")"
 selfg_show=$( (JSON_MODE=0 cmd_task_show "$selfgid") 2>"$TMP"/err )
-echo "$selfg_show" | grep -q "Unverified: no independent verifier available" \
-  && ok_t "INST-2: task show surfaces the 'Unverified' label" \
+echo "$selfg_show" | grep -q "unverified: no independent verifier available" \
+  && ok_t "INST-2/DIVE-1673: task show surfaces the quiet 'unverified' detail" \
   || bad_t "INST-2 show label" "$selfg_show"
 # task ls --json exposes the canonical flag for the dashboard
 selfg_ls=$(run ls --all | jq -r --argjson i "$selfgid" '.data.tasks[] | select(.id==$i) | .verify_unavailable')

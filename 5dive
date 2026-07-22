@@ -26,7 +26,7 @@ esac
 
 # Bumped on every public release. `build.sh` checks this line exists; CI fails
 # the bundle-drift check if it's missing or empty.
-readonly FIVE_VERSION="0.12.15"
+readonly FIVE_VERSION="0.12.16"
 
 # GitHub org our repos live under. The org is being renamed
 # 5dive-com -> 5dive-ai (2026-06); fetches must work on either side of the
@@ -16394,8 +16394,9 @@ cmd_task_add() {
     (( auto_coordinated )) && coord_note=" → coordinator: $assignee"
     local verify_note=""
     (( verify_defaulted )) && verify_note=" · verifier-graded by default → $verifier ('task done' hands off to grade; refine with --accept/--verify, or opt out with --no-verify)"
-    # INST-2: name the silent no-op out loud so the default's honesty is visible.
-    (( verify_unavailable )) && verify_note=" · ⚠ Unverified: no independent verifier available (solo org — maker would grade itself; the verifier-by-default posture no-opped)"
+    # INST-2 (DIVE-1673): a quiet, lowercase tag — honest but not a nag for solo
+    # users; the full explanation lives in `task show` detail, not this line.
+    (( verify_unavailable )) && verify_note=" · unverified"
     ok "created ${ident} — $title${coord_note}${verify_note}" \
        '{id:($i|tonumber), ident:$id, project:$pr, title:$t, priority:$p, assignee:$a, created_by:$c, kind:"standard", autoCoordinated:($ac=="1"), verifyDefaulted:($vd=="1"), verifyUnavailable:($vu=="1"), verifier:$v}' \
        --arg i "$id" --arg id "$ident" --arg pr "$project" --arg t "$title" --arg p "$priority" --arg a "${assignee:-}" --arg c "$creator" --arg ac "$auto_coordinated" --arg vd "$verify_defaulted" --arg vu "$verify_unavailable" --arg v "${verifier:-}"
@@ -16530,7 +16531,7 @@ cmd_task_show() {
              ELSE '' END||
         CASE WHEN iteration           IS NOT NULL THEN 'iteration: '||iteration||x'0a' ELSE '' END||
         CASE WHEN verify_unavailable = 1 AND verifier IS NULL AND status NOT IN ('done','cancelled')
-             THEN '⚠ Unverified: no independent verifier available (solo org — no distinct grader)' ELSE '' END
+             THEN 'unverified: no independent verifier available (solo org, no distinct grader)' ELSE '' END
       FROM tasks WHERE id=${id}
         AND (acceptance_criteria IS NOT NULL OR verify_command IS NOT NULL
              OR max_iterations IS NOT NULL OR verifier IS NOT NULL OR task_budget IS NOT NULL
