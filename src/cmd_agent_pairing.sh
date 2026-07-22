@@ -443,6 +443,18 @@ cmd_pair() {
   if [[ ",$channels," != *",telegram,"* && ",$channels," != *",discord,"* ]]; then
     fail "$E_VALIDATION" "agent '$name' has channels=$channels — pairing only applies to telegram or discord"
   fi
+  # channels may be a comma-separated list (e.g. telegram,dashboard — the default
+  # claude combo). Everything below (token env/var, access.json path, welcome,
+  # INTRO copy) operates on ONE pairable channel, so pick it with the same
+  # membership idiom: telegram takes precedence, else discord. Using the raw
+  # $channels string here produced token_var unbound + a bogus
+  # channels/telegram,dashboard/ path (DIVE-1767).
+  local pair_channel
+  if [[ ",$channels," == *",telegram,"* ]]; then
+    pair_channel="telegram"
+  else
+    pair_channel="discord"
+  fi
   # cmd_pair applies to claude, codex, grok and antigravity — their
   # telegram/discord plugins use a code-roundtrip (user DMs bot, bot replies with a code,
   # dashboard pastes the code back to seed access.json) and share the same
@@ -459,9 +471,9 @@ cmd_pair() {
   esac
 
   local user="agent-${name}"
-  local access="/home/${user}/.${type}/channels/${channels}/access.json"
+  local access="/home/${user}/.${type}/channels/${pair_channel}/access.json"
   local token_env token_var
-  case "$channels" in
+  case "$pair_channel" in
     telegram) token_env="${CONNECTORS_DIR}/telegram-${name}.env"; token_var="TELEGRAM_BOT_TOKEN" ;;
     discord)  token_env="${CONNECTORS_DIR}/discord-${name}.env";  token_var="DISCORD_BOT_TOKEN"  ;;
   esac
@@ -469,7 +481,7 @@ cmd_pair() {
   local bot_token
   bot_token=$(sed -n "s/^${token_var}=//p" "$token_env" 2>/dev/null | head -1 || true)
   [[ -n "$bot_token" ]] \
-    || fail "$E_AUTH_REQUIRED" "no bot token for agent '$name' — run: sudo 5dive agent config $name set ${channels}.token=<token>"
+    || fail "$E_AUTH_REQUIRED" "no bot token for agent '$name' — run: sudo 5dive agent config $name set ${pair_channel}.token=<token>"
 
   # Auto-pair path: caller already knows the (user_id, chat_id) — typically
   # because cmd_telegram_discover surfaced them from getUpdates. Seed
@@ -481,7 +493,7 @@ cmd_pair() {
   # code-roundtrip path, no race with a pending entry.
   if [[ -n "$preuser" ]]; then
     local chat_id="$prechat"
-    local state_dir="/home/${user}/.${type}/channels/${channels}"
+    local state_dir="/home/${user}/.${type}/channels/${pair_channel}"
     sudo -u "$user" env SENDER="$preuser" CHAT="$chat_id" STATE="$state_dir" python3 - <<'PY' >&2 \
       || fail "$E_PAIRING" "auto-pair seed failed"
 import json, os, tempfile
@@ -532,7 +544,7 @@ PY
   # user DMs it, so wait for that before trying to consume the code. Cold
   # start can take ~45s on a fresh box (skill preinstalls + plugin install
   # run during agent startup), so wait 90s.
-  step "Waiting for $channels plugin on agent '$name'..."
+  step "Waiting for $pair_channel plugin on agent '$name'..."
   local waited=0
   for _ in $(seq 1 90); do
     if sudo -u "$user" test -f "$access" 2>/dev/null; then
@@ -548,7 +560,7 @@ PY
   # pass --code=<code>; the non-precode path is unreachable over the API.
   if [[ -z "$precode" && "$JSON_MODE" == "0" ]]; then
     local app_label example_code
-    case "$channels" in
+    case "$pair_channel" in
       telegram) app_label="Telegram"; example_code="d13dc3" ;;
       discord)  app_label="Discord";  example_code="a4f2b1" ;;
     esac
@@ -557,7 +569,7 @@ Open $app_label and send any message to your bot. The bot will reply with
 something like:
 
     Pairing required — run in Claude Code:
-    /${channels}:access pair ${example_code}
+    /${pair_channel}:access pair ${example_code}
 
 Paste the reply (or just the code) below.
 
