@@ -15987,6 +15987,8 @@ _task_usage() {
                                                      # default: open tasks, priority-ordered; --recurring: templates
   5dive task show <id|DIVE-N>                        # full detail + subtasks + blockers
   5dive task assign <id|DIVE-N> <agent>
+  5dive task set-branch <id|DIVE-N> <branch>         # bind the task to a git branch for delegated push (DIVE-1462/1697);
+                                                     # writes/updates a 'Branch: <name>' line in the body. Also: task add --branch=<name>
   5dive task start  <id|DIVE-N>                      # -> in_progress
   5dive task done   <id|DIVE-N> [--result=<text>]    # -> done; --result captures the agent's response
   5dive task verify <id|DIVE-N> [--cmd="<command>"] [--no-done] [--timeout=<s>]
@@ -16060,6 +16062,7 @@ cmd_task() {
     ls|list)         cmd_task_ls "$@" ;;
     show|view)       cmd_task_show "$@" ;;
     assign)          cmd_task_assign "$@" ;;
+    set-branch)      cmd_task_set_branch "$@" ;;
     start)           cmd_task_start "$@" ;;
     done|close)      cmd_task_done "$@" ;;
     verify)          cmd_task_verify "$@" ;;
@@ -16083,6 +16086,56 @@ cmd_task() {
     -h|--help|help)  _task_usage ;;
     *) fail "$E_USAGE" "unknown task command: $sub (try: 5dive task --help)" ;;
   esac
+}
+
+# DIVE-1697: delegated push (5dive push, DIVE-1462) refuses unless the task body
+# carries a 'Branch: <name>' line binding the cleared gate to a specific branch —
+# but a body is only writable at `task add`, so a maker task filed WITHOUT one hit
+# a wall (scoped-sudo makers can't sqlite the body). `set-branch` (and the sibling
+# `task add --branch`) writes that line without an admin DB edit.
+
+# _task_upsert_branch_line <body> <branch> — echo BODY with any existing
+# 'Branch: <x>' line replaced by 'Branch: <branch>' (appended if none). Matches
+# the case-insensitive, leading-whitespace-tolerant '^\s*branch:\s*\S+' parser in
+# cmd_push.sh (_push_branch_from_body), so what we write is exactly what push reads.
+_task_upsert_branch_line() {
+  local body="$1" branch="$2" stripped
+  # Drop any pre-existing Branch: line(s); `|| true` so a no-match grep can't trip
+  # `set -e` inside this command substitution.
+  stripped=$(printf '%s' "$body" | grep -ivP '^\s*branch:\s' || true)
+  if [[ -n "$stripped" ]]; then
+    printf '%s\nBranch: %s' "$stripped" "$branch"
+  else
+    printf 'Branch: %s' "$branch"
+  fi
+}
+
+# `5dive task set-branch <id|DIVE-N> <branch>` — bind a task to the branch its
+# cleared delegated-push gate authorizes. Idempotent: re-running replaces the line.
+cmd_task_set_branch() {
+  tasks_db_init
+  local -a positional=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --) shift; positional+=("$@"); break ;;
+      -*) fail "$E_USAGE" "unknown flag: $1" ;;
+      *)  positional+=("$1") ;;
+    esac
+    shift
+  done
+  [[ ${#positional[@]} -ge 2 ]] || fail "$E_USAGE" "usage: 5dive task set-branch <id|DIVE-N> <branch>"
+  local branch="${positional[1]}"
+  # No whitespace: push parses the branch as a single '\S+' token, so a space would
+  # silently truncate the binding. Keep it to plausible git ref-name characters.
+  [[ "$branch" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]*$ ]] \
+    || fail "$E_VALIDATION" "invalid branch name '$branch' (letters/digits/._/- only, no whitespace — push parses it as one token)"
+  resolve_task_id "${positional[0]}"; local id="$RESOLVED_TASK_ID" ident="$RESOLVED_TASK_IDENT"
+  local body newbody
+  body=$(db "SELECT COALESCE(body,'') FROM tasks WHERE id=${id};")
+  newbody=$(_task_upsert_branch_line "$body" "$branch")
+  db "UPDATE tasks SET body=$(sqlq "$newbody") WHERE id=${id};"
+  ok "$ident bound to branch '$branch' — delegated push (5dive push $ident) will accept this branch" \
+     '{ident:$id, branch:$b}' --arg id "$ident" --arg b "$branch"
 }
 
 cmd_task_init() {
@@ -16246,7 +16299,7 @@ _org_resolve_assignee() {
 cmd_task_add() {
   tasks_db_init
   local body="" priority="medium" assignee="" parent="" from="" recurring="" fresh="" project="dive"
-  local accept="" verify_cmd="" max_iters="" verifier="" task_budget="" no_verify=""
+  local accept="" verify_cmd="" max_iters="" verifier="" task_budget="" no_verify="" branch=""
   local -a words=()
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -16272,6 +16325,9 @@ cmd_task_add() {
       # DIVE-824: per-run spend cap carried on the row (sibling to verify --timeout).
       # Value is either a bare token count or a "$cost" dollar figure.
       --task-budget=*) task_budget="${1#*=}" ;;
+      # DIVE-1697: seed a 'Branch: <name>' line in the body so a delegated-push
+      # maker task declares its DIVE-1462 branch binding at creation.
+      --branch=*)    branch="${1#*=}" ;;
       --)            shift; words+=("$@"); break ;;
       -*)            fail "$E_USAGE" "unknown flag: $1" ;;
       *)             words+=("$1") ;;
@@ -16289,6 +16345,13 @@ cmd_task_add() {
   # store as a no-op. Stored verbatim; the loop runner interprets the form.
   [[ -z "$task_budget" || "$task_budget" =~ ^[1-9][0-9]*$ || "$task_budget" =~ ^\$[0-9]+(\.[0-9]+)?$ ]] \
     || fail "$E_VALIDATION" "--task-budget must be a token count (e.g. 50000) or a dollar cost (e.g. \$1.50)"
+  # DIVE-1697: --branch seeds the delegated-push 'Branch: <name>' binding into the
+  # body up front (same line set-branch writes/upserts later).
+  if [[ -n "$branch" ]]; then
+    [[ "$branch" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]*$ ]] \
+      || fail "$E_VALIDATION" "invalid --branch '$branch' (letters/digits/._/- only, no whitespace)"
+    body=$(_task_upsert_branch_line "$body" "$branch")
+  fi
   # --recurring=<cron> makes this a TEMPLATE (kind='recurring'), not a worked
   # task — the step-2 materializer clones it into a standard todo on schedule.
   # A template + an explicit --parent is nonsensical (instances are top-level),
