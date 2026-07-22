@@ -531,12 +531,22 @@ PY
     # Remember this operator id box-wide so future agents auto-pair to it
     # (shared operator allowlist — DIVE-320/325).
     _operator_record "$preuser"
+    local welcome_rc=0
     if [[ ",$channels," == *",telegram,"* ]]; then
-      send_welcome_message "$chat_id" "$bot_token" "$name" "$type"
+      send_welcome_message "$chat_id" "$bot_token" "$name" "$type" || welcome_rc=$?
     fi
-    ok "agent '$name' paired with chat $chat_id." \
-       '{name:$n, channels:$ch, chatId:$c, paired:true}' \
-       --arg n "$name" --arg ch "$channels" --arg c "$chat_id"
+    # rc 3 = the operator id was auto-allowlisted but has never opened the bot,
+    # so the welcome DM 403'd (DIVE-1768). Flag it in the result so the CLI +
+    # dashboard show an open-your-bot nudge instead of a clean-but-silent pair.
+    if [[ "$welcome_rc" -eq 3 ]]; then
+      ok "agent '$name' paired with chat $chat_id, but the welcome DM is pending: open the bot in Telegram and press Start." \
+         '{name:$n, channels:$ch, chatId:$c, paired:true, welcomePending:true, nudge:"Open your bot in Telegram and press Start (or send it any message) so it can DM you the welcome."}' \
+         --arg n "$name" --arg ch "$channels" --arg c "$chat_id"
+    else
+      ok "agent '$name' paired with chat $chat_id." \
+         '{name:$n, channels:$ch, chatId:$c, paired:true}' \
+         --arg n "$name" --arg ch "$channels" --arg c "$chat_id"
+    fi
     return
   fi
 
@@ -658,12 +668,19 @@ PY
   # Discord: the plugin's channel server polls approved/<senderId> and sends
   # its own "you're in" DM through the gateway — we don't need (and don't
   # have) a simple HTTP send path here.
+  local welcome_rc=0
   if [[ ",$channels," == *",telegram,"* ]]; then
-    send_welcome_message "$chat_id" "$bot_token" "$name"
+    send_welcome_message "$chat_id" "$bot_token" "$name" || welcome_rc=$?
   fi
-  ok "agent '$name' paired with chat $chat_id." \
-     '{name:$n, channels:$ch, chatId:$c, paired:true}' \
-     --arg n "$name" --arg ch "$channels" --arg c "$chat_id"
+  if [[ "$welcome_rc" -eq 3 ]]; then
+    ok "agent '$name' paired with chat $chat_id, but the welcome DM is pending: open the bot in Telegram and press Start." \
+       '{name:$n, channels:$ch, chatId:$c, paired:true, welcomePending:true, nudge:"Open your bot in Telegram and press Start (or send it any message) so it can DM you the welcome."}' \
+       --arg n "$name" --arg ch "$channels" --arg c "$chat_id"
+  else
+    ok "agent '$name' paired with chat $chat_id." \
+       '{name:$n, channels:$ch, chatId:$c, paired:true}' \
+       --arg n "$name" --arg ch "$channels" --arg c "$chat_id"
+  fi
 }
 
 # One-shot "it works" DM after a successful pairing — labelled with the agent
@@ -805,12 +822,46 @@ EOF
 )
   fi
 
-  curl -sS -o /dev/null \
+  # Send + detect the unreachable-bot case. curl exits 0 on an HTTP 403, so the
+  # old `-o /dev/null … || warn` swallowed Telegram's "bot can't initiate
+  # conversation with a user" / "chat not found" — the DIVE-1768 bug: an owner
+  # auto-paired into access.json (CoS-create / operator auto-pair) who never
+  # opened the bot got allowlisted but no welcome and no signal at all. Read the
+  # JSON body and branch on Telegram's description so we can surface an
+  # actionable open-your-bot nudge instead of a silent warn.
+  local resp
+  resp=$(curl -sS \
     --data-urlencode "chat_id=${chat_id}" \
     --data-urlencode "text=${text}" \
-    "https://api.telegram.org/bot${bot_token}/sendMessage" \
-    && echo "Sent welcome message to chat ${chat_id}" >&2 \
-    || warn "Failed to send welcome message"
+    "https://api.telegram.org/bot${bot_token}/sendMessage" 2>/dev/null)
+
+  if [[ "$(jq -r '.ok // false' <<<"$resp" 2>/dev/null)" == "true" ]]; then
+    echo "Sent welcome message to chat ${chat_id}" >&2
+    return 0
+  fi
+
+  local desc
+  desc=$(jq -r '.description // empty' <<<"$resp" 2>/dev/null)
+  case "$desc" in
+    *"initiate conversation"*|*"can't initiate"*|*"chat not found"*|*"bot was blocked"*)
+      # Reachability failure, NOT a real error: the paired chat has never opened
+      # this bot (or blocked it), so Telegram forbids the proactive DM. Name the
+      # bot precisely via getMe when we can, and tell the owner exactly how to
+      # unblock the welcome. Return 3 so callers can flag the pending nudge.
+      local bot_user who
+      bot_user=$(curl -sS "https://api.telegram.org/bot${bot_token}/getMe" 2>/dev/null \
+        | jq -r '.result.username // empty' 2>/dev/null)
+      who="your ${agent_name:-agent} bot"
+      [[ -n "$bot_user" ]] && who="@${bot_user}"
+      warn "Welcome DM not delivered: chat ${chat_id} has not opened ${who} yet (${desc})."
+      printf 'ACTION: open Telegram, find %s, and press Start (or send it any message). The welcome arrives once you open the chat.\n' "$who" >&2
+      return 3
+      ;;
+    *)
+      warn "Failed to send welcome message${desc:+: ${desc}}"
+      return 1
+      ;;
+  esac
 }
 
 # -------- lifecycle / inspection (start, stop, logs, send, clone, stats) --------

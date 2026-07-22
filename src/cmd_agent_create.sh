@@ -1152,7 +1152,14 @@ cmd_create() {
   # must not fail an otherwise-successful create, so never abort on it.
   if [[ -n "$cos_owner_id" && -n "$telegram_token" ]] && channel_in_list telegram "$channels"; then
     step "Sending welcome DM to CoS owner ($cos_owner_id)"
-    send_welcome_message "$cos_owner_id" "$telegram_token" "$name" "$type" || true
+    local cos_welcome_rc=0
+    send_welcome_message "$cos_owner_id" "$telegram_token" "$name" "$type" || cos_welcome_rc=$?
+    # rc 3 (DIVE-1768): the auto-paired owner has never opened this bot, so the
+    # proactive welcome 403'd. Don't fail the create, but make the pending state
+    # loud instead of silent so the owner knows to open the bot.
+    if [[ "$cos_welcome_rc" -eq 3 ]]; then
+      warn "Owner $cos_owner_id is allowlisted but has not opened this bot — welcome DM is pending. Open it in Telegram and press Start (or send any message) to receive it."
+    fi
   fi
   if [[ -n "$discord_token" ]]; then
     step "Writing discord token (${CONNECTORS_DIR}/discord-${name}.env)"
