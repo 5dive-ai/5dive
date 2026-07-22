@@ -4,8 +4,9 @@ import os from 'node:os'
 import path from 'node:path'
 import { execFileSync } from 'node:child_process'
 import {
-  DEFAULT_CONSTITUTION, DEFAULT_HARD_GATE_RX, THRESHOLD_POLICY,
+  DEFAULT_CONSTITUTION, DEFAULT_HARD_GATE_RX, THRESHOLD_POLICY, CONSTITUTION_SCHEMA_VERSION,
   loadConstitution, normalizeConstitution, parseConstitutionFrontmatter, resolveThreshold, tallyVotes,
+  policyDigest, digestConstitution,
 } from '../src/council/engine.mjs'
 
 let passed = 0
@@ -102,9 +103,36 @@ try {
   fs.writeFileSync(file, `---\nthresholds:\n  ordinary: 1\nhard_gate:\n  public: brand\n---\n`)
   const unknownField = loadConstitution(file)
   ok(!unknownField.valid && unknownField.thresholds.ordinary.rule === 'majority', 'unknown top-level field rejects the whole document atomically')
+
+  // DIVE-1702 — schema_version support + versioned digests -------------------------------------
+  fs.writeFileSync(file, `schema_version: 1\nthresholds:\n  ordinary: 1\n`)
+  const versioned = loadConstitution(file)
+  ok(versioned.valid && versioned.schemaVersion === 1, 'explicit schema_version: 1 loads and surfaces schemaVersion')
+  fs.writeFileSync(file, `thresholds:\n  ordinary: 1\n`)
+  ok(loadConstitution(file).schemaVersion === CONSTITUTION_SCHEMA_VERSION, 'absent schema_version defaults to the current version (back-compat)')
+  fs.writeFileSync(file, `schema_version: 2\n`)
+  const tooNew = loadConstitution(file)
+  ok(!tooNew.valid && /newer than this CLI/.test(tooNew.error), 'a schema_version newer than supported fails closed')
+  fs.writeFileSync(file, `schema_version: 1.5\n`)
+  ok(loadConstitution(file).valid === false, 'a non-integer schema_version is rejected')
+
+  // Two documents differing ONLY in comments/whitespace: source digest churns, policy digest holds.
+  fs.writeFileSync(file, `schema_version: 1\nthresholds:\n  ordinary: 2\n`)
+  const a = loadConstitution(file)
+  fs.writeFileSync(file, `schema_version: 1\nthresholds:\n  ordinary: 2   # a lone comment must not churn the policy digest\n`)
+  const b = loadConstitution(file)
+  ok(a.sourceDigest !== b.sourceDigest, 'a comment-only edit changes the SOURCE digest')
+  ok(a.policyDigest === b.policyDigest && a.policyDigest.length === 64, 'a comment-only edit leaves the canonical POLICY digest unchanged')
+  fs.writeFileSync(file, `schema_version: 1\nthresholds:\n  ordinary: 3\n`)
+  const c = loadConstitution(file)
+  ok(c.policyDigest !== a.policyDigest, 'a real threshold change DOES churn the policy digest')
+  ok(policyDigest(normalizeConstitution(parseConstitutionFrontmatter(`thresholds:\n  ordinary: 2\n`))) === a.policyDigest, 'policyDigest is reproducible from a normalized constitution')
 } finally {
   fs.rmSync(tmp, { recursive: true, force: true })
 }
 
+ok(loadConstitution('').sourceDigest === digestConstitution(''), 'defaults report the source digest of empty bytes')
+ok(loadConstitution('').policyDigest === policyDigest(normalizeConstitution({})) && loadConstitution('').policyDigest.length === 64, 'defaults expose a reproducible canonical policy digest')
+ok(DEFAULT_CONSTITUTION.schemaVersion === CONSTITUTION_SCHEMA_VERSION, 'default constitution declares the current schema version')
 ok(DEFAULT_CONSTITUTION.council.bench === 'council', 'default constitution points at the primary council')
 console.log(`-----\ncouncil_constitution_unit: ${passed} passed, 0 failed`)

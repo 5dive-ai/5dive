@@ -26,7 +26,7 @@ esac
 
 # Bumped on every public release. `build.sh` checks this line exists; CI fails
 # the bundle-drift check if it's missing or empty.
-readonly FIVE_VERSION="0.14.2"
+readonly FIVE_VERSION="0.14.3"
 
 # GitHub org our repos live under. The org is being renamed
 # 5dive-com -> 5dive-ai (2026-06); fetches must work on either side of the
@@ -24004,12 +24004,44 @@ export const DEFAULT_HARD_GATE_CLASSES = {
 }
 export const DEFAULT_HARD_GATE_RX = Object.values(DEFAULT_HARD_GATE_CLASSES).join('|')
 
+// DIVE-1702 — the constitution document schema version. `schema_version: 1` (integer) is the
+// current, and only, supported version; the field is OPTIONAL and defaults to this when absent, so
+// every existing comment-free constitution.yaml stays valid. A document declaring a HIGHER version
+// than this CLI understands is rejected (fail-closed) — that agent must upgrade before enforcing an
+// unknown schema. This is the single knob a future migration bumps.
+export const CONSTITUTION_SCHEMA_VERSION = 1
+
 // CNCL-15 — the digest embedded in a sealed genesis/amendment record is a plain content hash of
 // the constitution.yaml bytes. Its integrity comes from riding INSIDE the root-sealed, hash-chained record
 // (the file is forgeable, the chain is not). bash computes the on-disk digest with `sha256sum` for
 // genesis/amend/verify so every realm agrees; this JS mirror is for the unit tests + cli fallback.
+// This is the SOURCE digest (raw bytes) — comment/whitespace edits DO change it, which is exactly
+// what the sealed-drift check wants (any hand-edit is drift). For a digest that ignores cosmetic
+// churn, see policyDigest below.
 export function digestConstitution(text) {
   return createHash('sha256').update(String(text == null ? '' : text), 'utf8').digest('hex')
+}
+
+// DIVE-1702 — deterministic serialization for the CANONICAL-POLICY digest: sort object keys at every
+// level so key-reordering, comment-only, or whitespace edits to constitution.yaml all serialize to the
+// SAME bytes. Pure (no clock/CSPRNG). Arrays keep their order (principal lists are order-significant).
+export function canonicalPolicyJSON(v) {
+  if (v === null || v === undefined) return 'null'
+  if (Array.isArray(v)) return `[${v.map(canonicalPolicyJSON).join(',')}]`
+  if (typeof v === 'object') return `{${Object.keys(v).sort().map(k => `${JSON.stringify(k)}:${canonicalPolicyJSON(v[k])}`).join(',')}}`
+  return JSON.stringify(v)
+}
+
+// DIVE-1702 — the CANONICAL-POLICY digest: sha256 over the NORMALIZED constitution (schema version,
+// bench, thresholds, veto, hard-gate classes, ship/comms), NOT the raw file. Two documents that
+// differ only in comments, key order, or whitespace produce the same policyDigest — so an audit can
+// tell a cosmetic edit (source digest changed, policy digest unchanged) from a real policy change.
+// The derived `hardGateRegex` is dropped (it is a pure function of hardGates — including it would
+// double-count and is redundant). Accepts either a normalized object or raw frontmatter.
+export function policyDigest(normalizedOrRaw) {
+  const n = (normalizedOrRaw && Object.hasOwn(normalizedOrRaw, 'hardGates')) ? normalizedOrRaw : normalizeConstitution(normalizedOrRaw)
+  const { hardGateRegex, ...policy } = n
+  return createHash('sha256').update(canonicalPolicyJSON(policy), 'utf8').digest('hex')
 }
 
 // CNCL-15 — constitution-drift check (pure). `sealedDigest` = the digest sealed in the newest
@@ -24084,6 +24116,7 @@ veto:
 }
 
 export const DEFAULT_CONSTITUTION = {
+  schemaVersion: CONSTITUTION_SCHEMA_VERSION,
   council: { bench: 'council' },
   quorum: 'majority',
   thresholds: THRESHOLD_POLICY,
@@ -24212,8 +24245,18 @@ function quorumSpec(value) {
 
 export function normalizeConstitution(raw = {}) {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) throw new Error('constitution frontmatter must be a mapping')
-  const unknownTop = Object.keys(raw).filter(k => !['council', 'quorum', 'thresholds', 'veto', 'hard_gates', 'ship', 'comms'].includes(k))
+  const unknownTop = Object.keys(raw).filter(k => !['schema_version', 'council', 'quorum', 'thresholds', 'veto', 'hard_gates', 'ship', 'comms'].includes(k))
   if (unknownTop.length) throw new Error(`unknown constitution field(s): ${unknownTop.join(', ')}`)
+  // DIVE-1702: OPTIONAL document version. Absent -> current (back-compat with every existing file).
+  // Must be a positive integer; a version NEWER than this CLI understands is refused (fail-closed) so
+  // an out-of-date agent never enforces a schema it cannot fully parse.
+  let schemaVersion = CONSTITUTION_SCHEMA_VERSION
+  if (Object.hasOwn(raw, 'schema_version')) {
+    const sv = raw.schema_version
+    if (!Number.isInteger(sv) || sv < 1) throw new Error('schema_version must be a positive integer')
+    if (sv > CONSTITUTION_SCHEMA_VERSION) throw new Error(`constitution schema_version ${sv} is newer than this CLI supports (max ${CONSTITUTION_SCHEMA_VERSION}); upgrade 5dive to enforce it`)
+    schemaVersion = sv
+  }
   if (raw.council != null && (typeof raw.council !== 'object' || Array.isArray(raw.council))) throw new Error('council must be a mapping')
   const council = raw.council || {}
   const unknownCouncil = Object.keys(council).filter(k => k !== 'bench')
@@ -24261,6 +24304,7 @@ export function normalizeConstitution(raw = {}) {
     if (raw[section] != null && (typeof raw[section] !== 'object' || Array.isArray(raw[section]))) throw new Error(`${section} must be a mapping`)
   }
   return {
+    schemaVersion,
     council: { bench: String(council.bench || DEFAULT_CONSTITUTION.council.bench) },
     quorum: globalQuorum,
     thresholds,
@@ -24277,12 +24321,22 @@ export function normalizeConstitution(raw = {}) {
 }
 
 export function loadConstitution(path, readFile = p => fs.readFileSync(p, 'utf8')) {
-  if (!path) return { ...normalizeConstitution({}), source: 'defaults', path: '', valid: true, error: null }
+  // DIVE-1702: every result carries schemaVersion (via the normalized object) plus two digests:
+  //   sourceDigest — sha256 of the raw file bytes (cosmetic edits DO churn it; '' when on defaults)
+  //   policyDigest — sha256 of the normalized policy (cosmetic edits do NOT churn it)
+  // so a caller can tell an effective-policy change from a comment-only edit.
+  const withDigests = (normalized, text, extra) => {
+    const enforced = { ...normalized, ...extra }
+    return { ...enforced, sourceDigest: digestConstitution(text), policyDigest: policyDigest(normalized) }
+  }
+  if (!path) return withDigests(normalizeConstitution({}), '', { source: 'defaults', path: '', valid: true, error: null })
   try {
-    if (!fs.existsSync(path)) return { ...normalizeConstitution({}), source: 'defaults', path, valid: true, error: null }
-    return { ...normalizeConstitution(parseConstitutionFrontmatter(readFile(path))), source: 'file', path, valid: true, error: null }
+    if (!fs.existsSync(path)) return withDigests(normalizeConstitution({}), '', { source: 'defaults', path, valid: true, error: null })
+    const text = readFile(path)
+    return withDigests(normalizeConstitution(parseConstitutionFrontmatter(text)), text, { source: 'file', path, valid: true, error: null })
   } catch (e) {
-    return { ...normalizeConstitution({}), source: 'defaults', path, valid: false, error: String(e && e.message || e) }
+    // Fail closed to defaults; the enforced policy IS the defaults, so its digests describe defaults.
+    return withDigests(normalizeConstitution({}), '', { source: 'defaults', path, valid: false, error: String(e && e.message || e) })
   }
 }
 
