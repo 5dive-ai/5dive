@@ -35,6 +35,15 @@ cmd_constitution() {
       council has sealed), drift + council-verify status, and the amendment receipts. Read-only, no
       root. --json emits the machine envelope the dashboard consumes.
 
+  echo '{"hard_gates":{...},"ship":{"require_ci":true},"comms":{"public_requires_human":true}}' | sudo 5dive constitution set --json
+      BROWSER-callable STRUCTURED write (DIVE-1751 — the dashboard EDIT contract). Reads a JSON patch
+      of the SOLO-editable guardrail fields from STDIN, MERGES it into the CURRENT constitution, and
+      re-serializes + validates the YAML entirely in the CLI (no browser YAML: DIVE-1700). Only
+      hard_gates / ship / comms are settable — governance keys (council/quorum/veto/thresholds) are
+      unreachable here (amend those via 'council amend'). Seals via the SAME routing as 'set --file='
+      and emits the 'constitution show --json' envelope on success. A multi-seat council -> returns the
+      machine amend-route and NEVER clobbers. Runs root over the exec tunnel: sudo.
+
   sudo 5dive constitution set --file=<constitution.yaml> [--principal=<human:agent|tg:id>] [--dry-run] [--json]
       WRITE path. Validate the proposed doc via the SAME parser as `show`, then route by mode:
         · a real multi-seat COUNCIL governs  -> a constitutional amendment (council amend:
@@ -220,7 +229,26 @@ _constitution_set() {
     file="$scratch"
   fi
 
-  [[ -n "$file" ]] || fail "$E_USAGE" "constitution $verb needs --file=<proposed constitution.yaml>"
+  # DIVE-1751 — browser-callable STRUCTURED write. `constitution set --json` with NO --file reads a JSON
+  # patch of the solo-editable guardrail fields {hard_gates,ship,comms} from STDIN, MERGES it into the
+  # CURRENT constitution, and re-serializes a valid constitution.yaml — all in the CLI (the browser never
+  # authors governance YAML: DIVE-1700). It then flows through the EXACT SAME validate + seat-count route
+  # + seal path as `set --file=`. On a solo seal it emits the `constitution show --json` envelope the
+  # dashboard (DIVE-1750) consumes; on a real multi-seat council it returns the machine amend-route and
+  # NEVER clobbers. Governance keys (council/quorum/veto/thresholds) are unreachable via this path.
+  local stdin_write=0
+  if [[ "$verb" == "set" && -z "$file" ]] && (( JSON_MODE )); then
+    stdin_write=1
+    [[ ! -t 0 ]] || fail "$E_USAGE" "constitution set --json reads a structured-field JSON patch from STDIN — pipe it in (e.g. echo '{\"ship\":{\"require_ci\":true}}' | sudo 5dive constitution set --json). Use 'set --file=' for a full YAML write."
+    local cur_path merged="$dir/merged.yaml" merr
+    cur_path="$(_council_constitution_path)"
+    if ! merr="$(node "$dir/cli.mjs" constitution-merge --path="$cur_path" 2>&1 >"$merged")"; then
+      fail "$E_VALIDATION" "constitution set --json: ${merr:-could not merge the structured fields} — nothing sealed (fail-closed)"
+    fi
+    file="$merged"
+  fi
+
+  [[ -n "$file" ]] || fail "$E_USAGE" "constitution $verb needs --file=<proposed constitution.yaml> (or 'set --json' with a structured-field JSON patch on STDIN)"
   [[ -f "$file" ]] || fail "$E_NOT_FOUND" "no such file: $file"
   # ONE parser: validate the proposed doc with the SAME engine normalizer the read verb uses.
   # loadConstitution always exits 0 (it emits {valid, error} in the payload, defaulting when a file
@@ -241,6 +269,14 @@ _constitution_set() {
   fi
 
   if [[ "$seat_count" -gt 1 ]]; then
+    # DIVE-1751: the browser-callable STRUCTURED write NEVER convenes/clobbers a real council. A
+    # multi-seat council governs -> return the machine amend-route so the dashboard renders read-only
+    # and points at `council amend`. (The dashboard already gates edit-vs-readonly on seatCount>1, per
+    # DIVE-1742; this is the fail-closed server-side backstop.) No seal, no convene, nothing touched.
+    if (( stdin_write )); then
+      jq -nc --argjson n "$seat_count" '{ok:true,data:{mode:"council",seats:$n,sealed:false,route:"council amend (constitutional)",reason:"a multi-seat council governs this constitution — structured writes are refused; amend via a constitutional council motion"}}'
+      return 0
+    fi
     # ORG-with-council: hand the proposed file to `council amend`, which owns validate -> convene
     # (constitutional class) -> seal-FIRST -> swap. We only route; it does the governance.
     if (( dry )); then
@@ -281,10 +317,23 @@ _constitution_set() {
   # (init only renders the v0 default when no file exists). init then builds a single-principal
   # genesis, seals the constitution digest into it, and hash-chains the lineage — all with no convene.
   ( umask 022; cat "$file" > "$cpath" ) || fail "$E_GENERIC" "could not write the constitution to $cpath"
-  _council_init_or_lineage "init" "$dir" --seats="$seat_id:chair" --veto="$principal" $forced
+  # The structured (browser) write emits ONE envelope — the `constitution show --json` view below — so
+  # swallow the seal's own JSON_MODE genesis envelope here (it would otherwise concatenate a second JSON
+  # object onto stdout and break the dashboard's single-envelope parse). The file writes still happen.
+  if (( stdin_write )); then
+    _council_init_or_lineage "init" "$dir" --seats="$seat_id:chair" --veto="$principal" $forced >/dev/null
+  else
+    _council_init_or_lineage "init" "$dir" --seats="$seat_id:chair" --veto="$principal" $forced
+  fi
   local rc=$?
   if (( rc != 0 )); then
     fail "$E_GENERIC" "solo direct-seal failed (council init returned $rc) — constitution at $cpath may be updated but UNSEALED; re-run once the cause is fixed"
+  fi
+  # DIVE-1751: the browser-callable structured write emits the `constitution show --json` envelope the
+  # dashboard consumes directly (the freshly sealed digest + guardrails, read back through the one parser).
+  if (( stdin_write )); then
+    _constitution_show --json
+    return 0
   fi
   if (( ! JSON_MODE )); then
     echo "constitution $verb: SOLO direct-seal OK — sealed $cpath under a single-principal genesis (principal=$principal). No convene; DIVE-1695 drift + council verify now apply." >&2
