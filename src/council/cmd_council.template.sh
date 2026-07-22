@@ -24,7 +24,7 @@ COUNCIL_SCHEDULES="${COUNCIL_DIR}/schedules.json"
 COUNCIL_SCHED_RUNS="${FIVEDIVE_SCHED_RUNS:-${HOME:-/tmp}/.5dive/council-schedule-runs}"
 
 _council_constitution_path() {
-  printf '%s' "${FIVEDIVE_CONSTITUTION_FILE:-${STATE_DIR}/5dive.md}"
+  printf '%s' "${FIVEDIVE_CONSTITUTION_FILE:-${STATE_DIR}/constitution.yaml}"
 }
 
 # Parse the machine-enforced YAML frontmatter through the same loader the tally
@@ -45,20 +45,20 @@ _council_hard_gate_rx() {
 }
 
 # CNCL-15 — constitution integrity. The AUTHORITY is the digest sealed in the newest genesis/
-# amendment lineage record, NOT the on-disk 5dive.md (the file is forgeable, the chain is not).
+# amendment lineage record, NOT the on-disk constitution.yaml (the file is forgeable, the chain is not).
 # Genesis/amend seal it with `sha256sum`; verify + convene recompute the on-disk digest the SAME
 # way so the two agree. Newest record carrying a non-empty constitutionDigest wins (amend > genesis).
 _council_sealed_constitution_digest() {
   [[ -f "$COUNCIL_LINEAGE" ]] || return 0
   jq -r 'select((.record.constitutionDigest // "") != "") | .record.constitutionDigest' "$COUNCIL_LINEAGE" 2>/dev/null | tail -n1
 }
-# sha256 of the on-disk 5dive.md ('' if missing) — the live side of the drift comparison.
+# sha256 of the on-disk constitution.yaml ('' if missing) — the live side of the drift comparison.
 _council_live_constitution_digest() {
   local p; p="$(_council_constitution_path)"
   [[ -f "$p" ]] || return 0
   sha256sum < "$p" 2>/dev/null | awk '{print $1}'
 }
-# Emit the drift JSON and RETURN non-zero (exit 7 from cli) when the live 5dive.md is out of sync
+# Emit the drift JSON and RETURN non-zero (exit 7 from cli) when the live constitution.yaml is out of sync
 # with the sealed digest. Fails closed: a sealed digest with a missing/edited file is drift.
 _council_constitution_drift() {
   local dir="$1" sealed live
@@ -96,16 +96,16 @@ _council_help() {
       credited when the outcome went bad; an approve when it landed good. Data for promote/demote
       votes, not vibes. Votes are parsed from the sealed canonical; the tamper-evident seal is untouched.
 
-  5dive council amend --file=<new 5dive.md> [--dry-run]
+  5dive council amend --file=<new constitution.yaml> [--dry-run]
       Amend the constitution via a constitutional-class motion (2/3 + full quorum + founder
       veto). Validates the proposed file, convenes the amendment, and ONLY on a pass seals its
-      digest into the hash-chain then swaps the on-disk 5dive.md. A non-pass leaves it untouched.
+      digest into the hash-chain then swaps the on-disk constitution.yaml. A non-pass leaves it untouched.
       The sealed digest — not the file — is the authority; hand-edits are caught by verify.
 
   5dive council verify [<receipt-digest>]
       Verify the WHOLE governance lineage: the prevDigest hash-chain, a per-record ROOT re-seal
       (each canonical must re-seal to its stored digest), AND constitution integrity (the live
-      5dive.md must match the digest sealed in the newest genesis/amendment record). Fails closed
+      constitution.yaml must match the digest sealed in the newest genesis/amendment record). Fails closed
       on an edited/dropped/reordered record OR a drifted constitution. With a receipt digest,
       also re-seals that sealed receipt.
 
@@ -571,10 +571,10 @@ _council_init_or_lineage() {
   fi
   local stamped; stamped="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
-  # CNCL-15: seed the v0 constitution (5dive.md) if none exists, then seal its digest INTO the
+  # CNCL-15: seed the v0 constitution (constitution.yaml) if none exists, then seal its digest INTO the
   # genesis record so a later hand-edit is detectable as drift. The file is the human-readable
   # projection; the sealed digest is the authority. `sha256sum` is the shared digest realm with
-  # verify/convene. An operator-supplied 5dive.md already on disk is honored (its digest is sealed).
+  # verify/convene. An operator-supplied constitution.yaml already on disk is honored (its digest is sealed).
   local cpath; cpath="$(_council_constitution_path)"
   if [[ ! -f "$cpath" ]]; then
     if ( umask 022; node "$dir/cli.mjs" constitution-render > "$cpath" ); then
@@ -916,7 +916,7 @@ _council_verify() {
       [[ "$(printf '%s' "$rc" | _council_seal_stdin)" == "$target" ]] && rcpt_ok=1
     fi
   fi
-  # 4) CNCL-15 constitution DRIFT — the live 5dive.md must still match the digest sealed in the
+  # 4) CNCL-15 constitution DRIFT — the live constitution.yaml must still match the digest sealed in the
   # newest genesis/amendment record. A sealed digest with a missing or edited file = drift; verify
   # FAILS CLOSED (a drifted governance file is not trusted). No sealed digest (pre-CNCL-15 lineage)
   # = nothing to check. Reuses the same drift-check node verb + sha256sum realm as convene.
@@ -1041,9 +1041,9 @@ _council_motion() {
 }
 
 # CNCL-15 — council amend: rewrite the constitution via a constitutional-class motion (2/3 + full
-# quorum + founder veto). Sudo-gated (writes the root-owned 5dive.md + lineage). Validates the
+# quorum + founder veto). Sudo-gated (writes the root-owned constitution.yaml + lineage). Validates the
 # proposed file, convenes the amendment, and ONLY on a pass seals the new digest into the chain
-# (seal FIRST) then swaps the on-disk 5dive.md. A non-pass leaves the constitution untouched.
+# (seal FIRST) then swaps the on-disk constitution.yaml. A non-pass leaves the constitution untouched.
 _council_amend() {
   local dir="$1"; shift
   mkdir -p "$COUNCIL_DIR" 2>/dev/null || true
@@ -1059,7 +1059,7 @@ _council_amend() {
       --dry-run) dry=1 ;;
     esac
   done
-  [[ -n "$file" ]] || fail "$E_USAGE" "council amend needs --file=<path to the proposed 5dive.md>"
+  [[ -n "$file" ]] || fail "$E_USAGE" "council amend needs --file=<path to the proposed constitution.yaml>"
   [[ -f "$file" ]] || fail "$E_NOT_FOUND" "no such file: $file"
   # Validate the proposed constitution parses+normalizes BEFORE convening (fail-closed).
   node "$dir/cli.mjs" constitution --path="$file" >/dev/null 2>&1 || fail "$E_VALIDATION" "the proposed $file is not a valid constitution — refusing to convene an amendment on it (fail-closed)"
@@ -1099,7 +1099,7 @@ _council_amend() {
   fi
 
   # APPLY — seal FIRST (record carries the NEW digest), append the lineage, THEN swap the on-disk
-  # 5dive.md. Seal-first so a failed seal never changes the enforced constitution.
+  # constitution.yaml. Seal-first so a failed seal never changes the enforced constitution.
   local stamped threshold_json veto_json apply canonical digest
   stamped="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   threshold_json="$(jq -c '.threshold // {rule:"majority"}' "$COUNCIL_GENESIS" 2>/dev/null)"

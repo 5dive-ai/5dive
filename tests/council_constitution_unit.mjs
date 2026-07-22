@@ -15,14 +15,13 @@ const ok = (condition, name) => {
   console.log(`ok   - ${name}`)
 }
 
-const missing = loadConstitution('/definitely/no/5dive.md')
+const missing = loadConstitution('/definitely/no/constitution.yaml')
 ok(missing.source === 'defaults' && missing.valid, 'missing constitution uses valid built-in defaults')
 ok(JSON.stringify(missing.thresholds) === JSON.stringify(THRESHOLD_POLICY), 'missing thresholds byte-match the pre-constitution policy')
 ok(missing.hardGateRegex === DEFAULT_HARD_GATE_RX, 'missing hard-gate regex byte-matches pre-constitution behavior')
 ok(missing.veto.holdSecs === 900 && missing.veto.posthocSecs === 172800, 'missing veto windows match pre-constitution behavior')
 
-const doc = `---
-council:
+const doc = `council:
   bench: security
 quorum: none # ordinary-class participation rule
 thresholds:
@@ -45,9 +44,7 @@ ship:
   require_ci: true
 comms:
   public_requires_human: true
----
-# Company Constitution
-Prose is digest-covered but not parsed as policy.
+# Company Constitution: a comment is digest-covered but not parsed as policy.
 `
 const parsed = parseConstitutionFrontmatter(doc)
 const loaded = normalizeConstitution(parsed)
@@ -67,7 +64,7 @@ ok(defaultTally.threshold === 2 && defaultTally.quorum === 2 && defaultTally.rec
 
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'constitution-unit-'))
 try {
-  const file = path.join(tmp, '5dive.md')
+  const file = path.join(tmp, 'constitution.yaml')
   fs.writeFileSync(file, doc)
   const fromFile = loadConstitution(file)
   ok(fromFile.source === 'file' && fromFile.valid && fromFile.council.bench === 'security', 'valid file loads from disk')

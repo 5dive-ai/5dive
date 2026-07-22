@@ -329,7 +329,7 @@ ok(verifyLineageChain([]).ok === false, 'chain: empty lineage fails closed')
 // ---- CNCL-15: constitution amendments — digest sealing + drift check --------------------------
 // The v0 render round-trips back to the built-in defaults (its sealed digest is a meaningful baseline).
 const v0 = renderConstitutionV0()
-ok(typeof v0 === 'string' && v0.startsWith('---\n'), 'CNCL-15: renderConstitutionV0 emits a frontmatter doc')
+ok(typeof v0 === 'string' && v0.startsWith('# 5dive company constitution'), 'CNCL-15: renderConstitutionV0 emits a pure-YAML doc')
 let v0norm
 try { v0norm = normalizeConstitution(parseConstitutionFrontmatter(v0)) } catch (e) { v0norm = { err: String(e && e.message) } }
 ok(v0norm && v0norm.council && v0norm.council.bench === 'council' && v0norm.veto.holdSecs === 900, 'CNCL-15: the v0 constitution parses+normalizes to the defaults')

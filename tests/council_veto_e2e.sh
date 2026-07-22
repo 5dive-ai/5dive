@@ -34,20 +34,17 @@ ok(){ echo "  ok:   $1"; pass=$((pass+1)); }
 no(){ echo "  FAIL: $1"; fail=$((fail+1)); }
 sha(){ printf '%s' "$1" | sha256sum | awk '{print $1}'; }
 
-# CNCL-15: init now seeds a 5dive.md and the constitution GOVERNS the veto window (posthoc_secs),
+# CNCL-15: init now seeds a constitution.yaml and the constitution GOVERNS the veto window (posthoc_secs),
 # so the posthoc window is expressed in the constitution the council is seeded with — not via the
 # pre-constitution COUNCIL_VETO_POSTHOC_SECS env (a valid on-disk file wins over it, by design).
 # Seed a constitution with a 0s posthoc window (15m hold kept) so the window-expiry leg below fires.
-cat > "$TMP/5dive.md" <<'EOF'
----
+cat > "$TMP/constitution.yaml" <<'EOF'
 council:
   bench: council
 veto:
   hold_secs: 900
   posthoc_secs: 0
----
-
-# 5dive Constitution (veto e2e — zero posthoc window)
+# veto e2e: zero posthoc window
 EOF
 
 # --- genesis + a convene that offers the founder veto --------------------------------------------

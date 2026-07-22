@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# CNCL-14: task tier-floor consumer reads hard_gates from 5dive.md.
+# CNCL-14: task tier-floor consumer reads hard_gates from constitution.yaml.
 set -uo pipefail
 cd "$(dirname "$0")/.."
 
@@ -13,7 +13,7 @@ done
 TMP="$(mktemp -d /tmp/constitution-floor.XXXXXX)"
 trap 'rm -rf "$TMP"' EXIT
 STATE_DIR="$TMP"
-export FIVEDIVE_CONSTITUTION_FILE="$TMP/5dive.md"
+export FIVEDIVE_CONSTITUTION_FILE="$TMP/constitution.yaml"
 PASS=0; FAIL=0
 ok_t() { PASS=$((PASS+1)); printf 'ok   - %s\n' "$1"; }
 bad_t() { FAIL=$((FAIL+1)); printf 'FAIL - %s\n' "$1"; }
@@ -36,15 +36,15 @@ _gate_tier2_floor_hit "approve billing" >/dev/null
 eval "$original_hard_gate_fn"
 
 # A valid org constitution adds brand to the public-comms hard class.
-printf '%s\n' '---' 'council:' '  bench: council' 'hard_gates:' \
-  "  money: 'spend|billing'" "  public_comms: 'brand|press'" '---' '# policy' \
+printf '%s\n' 'council:' '  bench: council' 'hard_gates:' \
+  "  money: 'spend|billing'" "  public_comms: 'brand|press'" '# policy' \
   > "$FIVEDIVE_CONSTITUTION_FILE"
 _gate_tier2_floor_hit "review the brand strategy" \
   && ok_t "brand-present constitution floors brand" || bad_t "brand-present did not floor"
 
 # Replacing the class map without brand removes it live while retaining named classes.
-printf '%s\n' '---' 'hard_gates:' "  money: 'spend|billing'" \
-  "  public_comms: 'press|customer email'" '---' '# amended policy' \
+printf '%s\n' 'hard_gates:' "  money: 'spend|billing'" \
+  "  public_comms: 'press|customer email'" '# amended policy' \
   > "$FIVEDIVE_CONSTITUTION_FILE"
 if _gate_tier2_floor_hit "review the brand strategy"; then bad_t "brand-absent constitution still floors brand"
 else ok_t "brand-absent constitution does not floor brand"; fi
@@ -55,8 +55,8 @@ _gate_tier2_floor_hit "approve billing" \
 # rejected by Bash's POSIX ERE engine with rc=2. The Bash consumer must discard
 # the entire loaded policy, retain the legacy floor, and leave a loud diagnostic
 # instead of turning that rc=2 into a false "no hit" result.
-printf '%s\n' '---' 'hard_gates:' "  unsafe: '[^]'" "  public_comms: 'brand'" \
-  '---' '# JS-valid, ERE-invalid policy' > "$FIVEDIVE_CONSTITUTION_FILE"
+printf '%s\n' 'hard_gates:' "  unsafe: '[^]'" "  public_comms: 'brand'" \
+  '# JS-valid, ERE-invalid policy' > "$FIVEDIVE_CONSTITUTION_FILE"
 ere_warning="$TMP/ere-warning"
 _gate_tier2_floor_hit "approve billing" 2>"$ere_warning" \
   && ok_t "ERE-invalid constitution regex falls back to legacy floor" || bad_t "ERE-invalid regex disabled legacy floor"
