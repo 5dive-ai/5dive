@@ -24,7 +24,25 @@ COUNCIL_SCHEDULES="${COUNCIL_DIR}/schedules.json"
 COUNCIL_SCHED_RUNS="${FIVEDIVE_SCHED_RUNS:-${HOME:-/tmp}/.5dive/council-schedule-runs}"
 
 _council_constitution_path() {
-  printf '%s' "${FIVEDIVE_CONSTITUTION_FILE:-${STATE_DIR}/constitution.yaml}"
+  # An explicit override wins verbatim — no legacy migration on a caller-chosen path.
+  if [[ -n "${FIVEDIVE_CONSTITUTION_FILE:-}" ]]; then
+    printf '%s' "$FIVEDIVE_CONSTITUTION_FILE"; return
+  fi
+  local canonical="${STATE_DIR}/constitution.yaml" legacy="${STATE_DIR}/5dive.md"
+  # DIVE-1686 belt-and-suspenders for the DIVE-1676 rename: a box ratified BEFORE
+  # the rename holds its constitution at the legacy 5dive.md. Do a one-time rename to
+  # the canonical name so post-rename builds keep reading it — a rename is byte-preserving,
+  # so the sealed-digest drift check still matches. If the rename can't happen (e.g. a
+  # non-root reader on root-owned STATE_DIR), fall back to reading the legacy file IN PLACE
+  # this call, so the loader NEVER silently reverts to built-in defaults.
+  if [[ ! -e "$canonical" && -f "$legacy" ]]; then
+    if mv -n "$legacy" "$canonical" 2>/dev/null && [[ -e "$canonical" ]]; then
+      echo "constitution: migrated legacy $legacy -> $canonical (DIVE-1676 rename)" >&2
+    else
+      printf '%s' "$legacy"; return
+    fi
+  fi
+  printf '%s' "$canonical"
 }
 
 # Parse the machine-enforced YAML frontmatter through the same loader the tally
