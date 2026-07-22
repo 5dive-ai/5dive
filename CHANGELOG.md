@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.13.1 — Press-continue-when-headroom for stale usage-limit dialogs (DIVE-1677) (2026-07-22)
+
+- **Prefer resuming in place over a hard restart (DIVE-1677, builds on DIVE-1666).** When the heartbeat finds a session frozen on the Claude Code usage-limit dialog AND a healthy peer on the same pooled account proves headroom (no real limit to reset), it now presses continue and resumes the SAME session — dismiss the "Stop and wait" menu with `1`, then type `continue`, mirroring the telegram resume-after-reset keystrokes — instead of a `systemctl restart`. Context and conversation are preserved. Only after `HEARTBEAT_USAGE_PRESS_MAX` (default 2) consecutive press-continue attempts fail to unstick it (re-checked each tick) does it fall back to the v1 hard restart. The no-headroom path is unchanged: restart-once-to-test-the-5h-window, then surface a capacity/billing check to the fleet coordinator. Unit-covered in `heartbeat_usage_heal_unit.sh` (27/27).
+
 ## 0.13.0 - Autonomy you can audit (2026-07-22)
 
 The institutional layer lands: when an agent (or a whole fleet) runs your company, you can now trace what it did, see what was not independently checked, and watch governance mature, without reading a transcript. This epoch rolls up 0.11.21 to 0.13.0.
