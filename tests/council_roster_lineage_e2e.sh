@@ -84,6 +84,30 @@ L="$("$FIVE" council log --json 2>/dev/null)"
 "$FIVE" council promote --subject=main --mode=quick >/dev/null 2>&1 && no "promote of an already-seated member was NOT refused" || ok "promote of an existing seat refused (fail-closed)"
 "$FIVE" council demote --subject=ghost --mode=quick >/dev/null 2>&1 && no "demote of a non-seat was NOT refused" || ok "demote of a non-member refused (fail-closed)"
 
+# ================= DIVE-1667: bench genesis-marker drift resolves from the LINEAGE ================
+# Pin the exact DIVE-1664 live failure: `council roster` used to read its seats from the EDITABLE
+# registry bench (benches.json .council.{genesis,seats}); once that bench lost its genesis marker it
+# died "the Council has no genesis roster — seed it first" EVEN THOUGH the root-sealed lineage was
+# intact (roster and log had diverged). The fix derives the roster from the lineage head, with the
+# registry bench a fallback ONLY when no lineage record carries seats. Clear the bench genesis marker
+# + seats while the intact 3-record chain stays untouched, and assert roster STILL resolves the 3
+# lineage-head seats (main/olivia/codex, post-demote) and never emits the seed-it-first death.
+REG="$TMP/council/benches.json"
+cp "$REG" "$TMP/benches.bak"
+jq 'del(.council.genesis) | (.council.seats)=[]' "$REG" > "$TMP/reg.drift" && mv "$TMP/reg.drift" "$REG"
+RB="$("$FIVE" council roster --json 2>/dev/null)"
+[[ "$(printf '%s' "$RB" | jq -r '.data.seatCount')" == "3" ]] \
+  && ok "roster resolves 3 seats from the sealed lineage despite a cleared bench genesis marker (DIVE-1664)" \
+  || no "roster failed to resolve from the lineage after bench drift ($RB)"
+printf '%s' "$RB" | jq -e '.data.seats[] | select(.id=="main")' >/dev/null 2>&1 \
+  && ok "lineage-derived roster still seats main after bench drift" || no "lineage roster lost main after bench drift"
+RBT="$("$FIVE" council roster 2>&1)"
+printf '%s' "$RBT" | grep -qiE 'no genesis roster|seed it first' \
+  && no "roster hit the 'seed it first' death with an intact lineage (DIVE-1664 regression)" \
+  || ok "roster renders from the lineage with a drifted bench (no 'seed it first' death)"
+"$FIVE" council verify >/dev/null 2>&1 && ok "verify still GREEN — bench drift never touched the sealed chain" || no "verify RED after a bench-only drift"
+cp "$TMP/benches.bak" "$REG"
+
 # ================= TAMPER DETECTION — verify must go RED ==========================================
 # (a) EDIT a record's canonical: re-seal no longer matches its stored digest.
 cp "$LIN" "$TMP/lin.bak"
