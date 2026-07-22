@@ -1,16 +1,17 @@
-# Company constitution (`5dive.md`)
+# Company constitution (`constitution.yaml`)
 
-5dive can load governance policy from `${STATE_DIR}/5dive.md` (normally
-`/var/lib/5dive/5dive.md`). Set `FIVEDIVE_CONSTITUTION_FILE` to exercise a
+5dive can load governance policy from `${STATE_DIR}/constitution.yaml` (normally
+`/var/lib/5dive/constitution.yaml`). Set `FIVEDIVE_CONSTITUTION_FILE` to exercise a
 candidate in an isolated environment. If the file is absent or malformed, the
 loader atomically uses the shipped pre-constitution defaults; it never applies a
 partial document.
 
-The machine-enforced data lives in YAML frontmatter. The Markdown body is human
-rationale and soft policy:
+The whole file is parsed as YAML. There is no Markdown body and no `---`
+frontmatter fence: human rationale lives in `#` comments, which are covered by
+the sealed digest but never parsed as policy.
 
 ```yaml
----
+# Company governance policy. Comments are digest-covered but not parsed.
 council:
   bench: council
 quorum: majority
@@ -37,11 +38,7 @@ ship:
   require_ci: true
 comms:
   public_requires_human: true
----
-
-# Why these rules
-
-Explain the company's governance choices here.
+# Why these rules: explain the company's governance choices in comments like this.
 ```
 
 The v0 parser accepts two-space mappings, scalar values, and inline arrays.
