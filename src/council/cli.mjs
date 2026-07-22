@@ -871,6 +871,108 @@ function cmdInit() {
 // bytes for the sealed digest — one digest realm across seed/amend/verify.
 function cmdConstitutionRender() { process.stdout.write(E.renderConstitutionV0()) }
 
+// DIVE-1751 — browser-callable STRUCTURED-FIELD write. `constitution-merge --path=<current>` reads a
+// JSON patch of the SOLO-editable guardrail fields from STDIN, merges it into the CURRENT constitution,
+// and re-emits a valid v0 constitution.yaml on stdout. The bash layer then flows it through the EXACT
+// SAME validate + seat-count route + seal path as `set --file=`. This keeps serialize+seal colocated in
+// the CLI — the browser NEVER authors governance YAML (DIVE-1700 fraction-bug class). The patch is
+// STRICTLY whitelisted to hard_gates/ship/comms; the governance keys (council/quorum/veto/thresholds)
+// are unreachable here BY DESIGN (they change only through a `council amend` constitutional motion). The
+// emitted bytes are re-validated through the SAME normalizer before we hand them back (one parser,
+// fail-closed) — a structured write can never produce a constitution that would not parse.
+const MERGE_TOP = new Set(['hard_gates', 'ship', 'comms'])
+const MERGE_SHIP_KEYS = new Set(['require_ci'])
+const MERGE_COMMS_KEYS = new Set(['public_requires_human'])
+// Serialize a raw-parsed constitution node back to v0 frontmatter. Single-quote every string so
+// regex backslashes + special chars survive the frontmatter parser byte-for-byte (it does no escape
+// processing); numbers/booleans/null stay bare so they re-parse as themselves. Inline arrays for lists.
+function serializeConstitutionScalar(v) {
+  if (v === null) return 'null'
+  if (typeof v === 'boolean') return v ? 'true' : 'false'
+  if (typeof v === 'number' && Number.isFinite(v)) return String(v)
+  if (Array.isArray(v)) return '[' + v.map(serializeConstitutionScalar).join(', ') + ']'
+  return `'${String(v).replace(/'/g, "''")}'`
+}
+function serializeConstitutionNode(obj, indent) {
+  const pad = ' '.repeat(indent)
+  let out = ''
+  for (const [k, v] of Object.entries(obj)) {
+    if (v && typeof v === 'object' && !Array.isArray(v)) {
+      const inner = serializeConstitutionNode(v, indent + 2)
+      out += inner ? `${pad}${k}:\n${inner}` : `${pad}${k}:\n`
+    } else out += `${pad}${k}: ${serializeConstitutionScalar(v)}\n`
+  }
+  return out
+}
+function serializeConstitution(raw) {
+  // Canonical section order; only sections present in the merged doc are emitted. Governance keys
+  // (council/quorum/veto/thresholds) are re-emitted verbatim from the current doc — never touched here.
+  const order = ['hard_gates', 'ship', 'comms', 'council', 'quorum', 'veto', 'thresholds']
+  const keys = [...order.filter(k => Object.hasOwn(raw, k)), ...Object.keys(raw).filter(k => !order.includes(k))]
+  let out = '# 5dive company constitution (v0) — machine-enforced guardrails.\n'
+    + '# Written by `5dive constitution set --json` (structured guardrail write, DIVE-1751). The AUTHORITY\n'
+    + '# is the sealed digest: after this file is sealed, enforcement fails CLOSED on any drift from it.\n'
+  for (const k of keys) {
+    const v = raw[k]
+    if (v && typeof v === 'object' && !Array.isArray(v)) {
+      const inner = serializeConstitutionNode(v, 2)
+      out += inner ? `${k}:\n${inner}` : `${k}:\n`
+    } else out += `${k}: ${serializeConstitutionScalar(v)}\n`
+  }
+  return out
+}
+function cmdConstitutionMerge() {
+  const pf = flag('path')
+  const path = (pf == null || pf === true) ? '' : String(pf)
+  // Base = the CURRENT constitution's RAW frontmatter (preserve the exact governance keys the user /
+  // council authored — we touch ONLY the three guardrail sections). No file yet -> base on the v0
+  // default projection so a first structured write still yields a complete, valid file.
+  let baseText
+  if (path && fs.existsSync(path)) { try { baseText = fs.readFileSync(path, 'utf8') } catch (e) { die(`constitution-merge: cannot read the current constitution ${path} (${String(e && e.message || e)})`, 4) } }
+  else baseText = E.renderConstitutionV0()
+  let raw
+  try { raw = E.parseConstitutionFrontmatter(baseText) }
+  catch (e) { die(`constitution-merge: the current constitution does not parse (${String(e && e.message || e)}) — refusing a structured write onto an unreadable base (fail-closed)`, 4) }
+
+  // Read + STRICTLY whitelist the STDIN patch. Anything outside hard_gates/ship/comms is refused.
+  let patch
+  try { patch = JSON.parse(fs.readFileSync(0, 'utf8') || '{}') }
+  catch (e) { die(`constitution-merge: invalid JSON on stdin (${String(e && e.message || e)})`, 2) }
+  if (!patch || typeof patch !== 'object' || Array.isArray(patch)) die('constitution-merge: stdin must be a JSON object of structured fields', 2)
+  const badTop = Object.keys(patch).filter(k => !MERGE_TOP.has(k))
+  if (badTop.length) die(`constitution-merge: field(s) not settable via the structured write path: ${badTop.join(', ')} (only hard_gates/ship/comms — governance changes go through 'council amend')`, 2)
+
+  if (Object.hasOwn(patch, 'hard_gates')) {
+    const hg = patch.hard_gates
+    if (!hg || typeof hg !== 'object' || Array.isArray(hg)) die('constitution-merge: hard_gates must be an object of class -> regex string', 2)
+    const cur = (raw.hard_gates && typeof raw.hard_gates === 'object' && !Array.isArray(raw.hard_gates)) ? raw.hard_gates : {}
+    const allowed = new Set([...Object.keys(cur), ...Object.keys(E.DEFAULT_HARD_GATE_CLASSES)])
+    for (const [k, val] of Object.entries(hg)) {
+      if (!allowed.has(k)) die(`constitution-merge: unknown hard_gates class '${k}' (editable classes: ${[...allowed].sort().join(', ')})`, 2)
+      if (typeof val !== 'string' || !val.trim()) die(`constitution-merge: hard_gates.${k} must be a non-empty regex string`, 2)
+    }
+    raw.hard_gates = { ...cur, ...hg }
+  }
+  for (const [sec, keys] of [['ship', MERGE_SHIP_KEYS], ['comms', MERGE_COMMS_KEYS]]) {
+    if (!Object.hasOwn(patch, sec)) continue
+    const p = patch[sec]
+    if (!p || typeof p !== 'object' || Array.isArray(p)) die(`constitution-merge: ${sec} must be an object`, 2)
+    const cur = (raw[sec] && typeof raw[sec] === 'object' && !Array.isArray(raw[sec])) ? raw[sec] : {}
+    for (const [k, val] of Object.entries(p)) {
+      if (!keys.has(k)) die(`constitution-merge: unknown ${sec}.${k} (settable: ${[...keys].join(', ')})`, 2)
+      if (typeof val !== 'boolean') die(`constitution-merge: ${sec}.${k} must be true or false`, 2)
+    }
+    raw[sec] = { ...cur, ...p }
+  }
+
+  // Re-serialize + re-validate through the SAME normalizer BEFORE emitting (fail-closed): a structured
+  // write can never produce a constitution that would not parse under the one shared parser.
+  const text = serializeConstitution(raw)
+  try { E.normalizeConstitution(E.parseConstitutionFrontmatter(text)) }
+  catch (e) { die(`constitution-merge: the merged constitution failed validation (${String(e && e.message || e)}) — refusing to emit (fail-closed)`, 4) }
+  process.stdout.write(text)
+}
+
 // `drift-check` — pure comparison of the sealed digest vs the live-file digest (both computed by
 // bash with sha256sum). Exits non-zero when drifted so callers can fail closed on the exit code.
 function cmdDriftCheck() {
@@ -1217,6 +1319,7 @@ const main = async () => {
   if (sub === 'constitution') return cmdConstitution()
   if (sub === 'constitution-show') return cmdConstitutionShow()
   if (sub === 'constitution-render') return cmdConstitutionRender()
+  if (sub === 'constitution-merge') return cmdConstitutionMerge()
   if (sub === 'drift-check') return cmdDriftCheck()
   if (sub === 'amend-plan') return cmdAmendPlan()
   if (sub === 'amend-apply') return cmdAmendApply()
