@@ -118,6 +118,37 @@ account_signin_detail() {
       mtime=$(date -u -r "$auth_path" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)
       [[ -n "$mtime" ]] && signed_at=$(jq -cn --arg s "$mtime" '$s')
       ;;
+    claude)
+      # BYO-claude points the runtime at a custom Anthropic-compatible
+      # endpoint by writing ANTHROPIC_BASE_URL into the profile's
+      # combined.env (see _apply_byo_claude); a plain Anthropic subscription
+      # leaves it unset. Reverse-map that base url to the canonical provider
+      # id so /dashboard/agents can draw the provider sub-badge. No base url
+      # = plain subscription = provider stays null = no badge (correct).
+      # The '*)' path can't serve claude: BYO never writes the
+      # .credentials.json sentinel it keys on, so it would bail with "{}".
+      local env_file="${profile_dir}/combined.env"
+      [[ -s "$env_file" ]] || { echo "{}"; return; }
+      local base_url
+      base_url=$(grep -E '^ANTHROPIC_BASE_URL=' "$env_file" 2>/dev/null \
+        | tail -1 | cut -d= -f2-)
+      base_url="${base_url%\"}"; base_url="${base_url#\"}"
+      if [[ -n "$base_url" ]]; then
+        local cand
+        for cand in "${!CLAUDE_PROVIDER_BASEURL[@]}"; do
+          if [[ "${CLAUDE_PROVIDER_BASEURL[$cand]}" == "$base_url" ]]; then
+            provider=$(jq -cn --arg p "$cand" '$p'); break
+          fi
+        done
+      fi
+      # signedInAt: prefer the credential sentinel mtime when present, else
+      # fall back to combined.env's (BYO has no .credentials.json).
+      auth_path=$(profile_type_auth_path "$name" "$type" 2>/dev/null) || true
+      [[ -n "$auth_path" && -s "$auth_path" ]] || auth_path="$env_file"
+      local mtime
+      mtime=$(date -u -r "$auth_path" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)
+      [[ -n "$mtime" ]] && signed_at=$(jq -cn --arg s "$mtime" '$s')
+      ;;
     *)
       auth_path=$(profile_type_auth_path "$name" "$type" 2>/dev/null) || true
       [[ -n "$auth_path" && -s "$auth_path" ]] || { echo "{}"; return; }

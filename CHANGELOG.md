@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.13.14 — report claude BYO provider for the /dashboard/agents sub-badge (DIVE-1763) (2026-07-22)
+
+- **fix(account): `account_signin_detail` reports the resolved provider for a BYO-claude agent** so `account list --json` emits `signins.claude.provider=<byo id>` and the `/dashboard/agents` provider sub-badge (frontend b9f05d97) renders. New `claude)` case reverse-maps the profile's stored `ANTHROPIC_BASE_URL` (combined.env) against `CLAUDE_PROVIDER_BASEURL` (deepseek/moonshot/openrouter/zai); a plain Anthropic subscription has no base url → provider null → no badge (correct). DIVE-1763, authored by dev (PR #119), folded into this release.
+
 ## 0.13.13 — fix(agent pair): accept comma-separated channels so telegram+dashboard agents pair (DIVE-1762) (2026-07-22)
 
 - **fix(agent pair): `cmd_pair`'s channel guard now matches channel-list *membership* instead of the whole string, so an agent with `channels=telegram,dashboard` can be paired.** Regression from DIVE-856 (comma-separable channels): `cmd_pair` alone still used an exact-match `case "$channels" in telegram|discord)` while its five sibling `telegram-*` subcommands already used the `",$channels," == *",telegram,"*` membership idiom. Because new claude creates include the `dashboard` channel by default, any create where the user also picked telegram produced `channels=telegram,dashboard` and failed pairing with `pairing only applies to telegram or discord` (exit 3). Now guards with `[[ ",$channels," != *",telegram,"* && ",$channels," != *",discord,"* ]]`, matching the siblings exactly. Found by lodar stress-testing the dashboard agent-create wizard.
