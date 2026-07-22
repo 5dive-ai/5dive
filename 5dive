@@ -26,7 +26,7 @@ esac
 
 # Bumped on every public release. `build.sh` checks this line exists; CI fails
 # the bundle-drift check if it's missing or empty.
-readonly FIVE_VERSION="0.12.14"
+readonly FIVE_VERSION="0.12.15"
 
 # GitHub org our repos live under. The org is being renamed
 # 5dive-com -> 5dive-ai (2026-06); fetches must work on either side of the
@@ -28943,6 +28943,19 @@ _HB_STALL_MIN_MINUTES=20
 # and the counter resets, never reaching the ceiling. Env-overridable.
 _HB_ACTIVE_DEFER_ESCALATE="${HEARTBEAT_ACTIVE_DEFER_ESCALATE:-3}"
 [[ "$_HB_ACTIVE_DEFER_ESCALATE" =~ ^[0-9]+$ ]] || _HB_ACTIVE_DEFER_ESCALATE=3
+# DIVE-1666 usage-limit self-heal. A genuine permission/plan dialog is real
+# in-flight work, so the no-clobber guard defers its nudge (rc 3) and never
+# reclaims — correct. But the Claude Code USAGE/SPEND-LIMIT dialog ("You've hit
+# your monthly spend limit / 1. Stop and wait for limit to reset  2. Upgrade
+# your plan") is a DEAD-END: it never self-clears, so the same defer rule
+# freezes the session permanently even after the account's 5h window rolls back
+# to headroom (root cause of the 2026-07-21 ~4h fleet-stall). The heartbeat
+# CLASSIFIES the open dialog: a usage-limit match is a reclaimable frozen
+# session (agents are fresh:true → restart loses no context), throttled to this
+# many minutes between self-heal restarts of the same agent so a still-limited
+# account can't be churn-restarted every tick. Env-overridable.
+_HB_USAGE_HEAL_THROTTLE_MIN="${HEARTBEAT_USAGE_HEAL_THROTTLE_MIN:-25}"
+[[ "$_HB_USAGE_HEAL_THROTTLE_MIN" =~ ^[0-9]+$ ]] || _HB_USAGE_HEAL_THROTTLE_MIN=25
 # Idle probe window. An agent whose pane is byte-identical across this gap (and
 # still shows its input prompt) is at rest; a working agent streams output or
 # animates a spinner, so its pane changes between two samples. Deliberately dumb
@@ -29203,8 +29216,80 @@ _hb_mark_active_defer() {
 _hb_clear_active_defer() {
   local name="$1"
   local reg; reg=$(registry_read)
-  reg=$(echo "$reg" | jq --arg n "$name" 'if .agents[$n].heartbeat then del(.agents[$n].heartbeat.activeDefer) else . end')
+  reg=$(echo "$reg" | jq --arg n "$name" 'if .agents[$n].heartbeat then del(.agents[$n].heartbeat.activeDefer, .agents[$n].heartbeat.usageHeal) else . end')
   echo "$reg" | registry_write
+}
+
+# DIVE-1666 — pure matcher (unit-testable, no tmux) for the Claude Code
+# USAGE/SPEND-LIMIT dialog. Requires TWO independent signature lines so ordinary
+# output that merely mentions "limit" can't false-match: a HEADER line (hit your
+# monthly-spend / usage / 5-hour limit, or "usage limit reached") AND an ACTION
+# line ("Upgrade your plan", or "wait for … limit to reset" / "resets at|in").
+# Case-insensitive and tolerant of CC copy drift across the monthly-spend and
+# 5-hour variants. Callers reach this ONLY on a confirmed rc==3 "blocked" pane,
+# so the pane really is parked on a dialog, not mid-turn text.
+_hb_pane_is_usage_limit() {
+  local pane="$1"
+  grep -qiE 'hit your (monthly[ -]?spend|usage|5[ -]?hour) limit|usage limit reached|reached your .* limit|limit reached' <<<"$pane" || return 1
+  grep -qiE 'upgrade your plan|wait for .*limit to reset|limit will reset|resets? (at|in) ' <<<"$pane" || return 1
+  return 0
+}
+
+# DIVE-1666 — is THIS agent's session frozen on the usage-limit dialog right now?
+# Scrapes the pane and applies the pure matcher above. Returns 0 (frozen on the
+# usage dialog) / 1 (any other dialog, or pane uncapturable → fail-safe: treat as
+# a real prompt and keep deferring, never restart on a missing signal).
+_hb_usage_limit_frozen() {
+  local name="$1" pane
+  pane=$(sudo -u "agent-${name}" tmux capture-pane -p -t "agent-${name}" 2>/dev/null) || return 1
+  [[ -n "$pane" ]] || return 1
+  _hb_pane_is_usage_limit "$pane"
+}
+
+# DIVE-1666 — does this agent's auth account have PROVEN headroom right now? The
+# account is pooled, so a sibling agent sharing the same authProfile that is
+# currently healthy (native state idle or busy — i.e. NOT blocked/frozen) is
+# ground-truth proof the pool is under its limit. Returns 0 (headroom proven) /
+# 1 (no proof: solo on the account, or every peer is itself blocked/frozen). The
+# per-agent 5h% in `usage --json` is only a heuristic; a live healthy peer is the
+# real signal (a healthy peer on the same account is exactly how the 2026-07-21
+# stall was diagnosed as headroom, not a genuine limit).
+_hb_account_has_headroom() {
+  local name="$1" acct="$2" reg="$3" peer
+  while IFS= read -r peer; do
+    [[ -n "$peer" && "$peer" != "$name" ]] || continue
+    case "$(_hb_agent_native_state "$peer" 2>/dev/null)" in
+      idle|busy) return 0 ;;
+    esac
+  done < <(jq -r --arg a "$acct" '
+      .agents | to_entries
+      | map(select((.value.authProfile // ("@self:" + .key)) == $a))
+      | .[].key' <<<"$reg" 2>/dev/null)
+  return 1
+}
+
+# DIVE-1666 — record a self-heal restart of a frozen agent and return the running
+# heal count. Stored under .agents[<name>].heartbeat.usageHeal = {at,n} (parallel
+# to .activeDefer); `at` gates the restart throttle, `n` is for the log/surface
+# copy. Cleared by _hb_clear_active_defer once the agent escapes the dialog (any
+# wake / genuine-idle recovery), so a recovered agent's throttle resets. Must run
+# under with_registry_lock, like _hb_mark_run / _hb_mark_active_defer.
+_hb_mark_usage_heal() {
+  local name="$1" now="$2"
+  local reg; reg=$(registry_read)
+  local n; n=$(jq -r --arg n "$name" '.agents[$n].heartbeat.usageHeal.n // 0' <<<"$reg")
+  [[ "$n" =~ ^[0-9]+$ ]] || n=0; n=$(( n + 1 ))
+  reg=$(echo "$reg" | jq --arg n "$name" --argjson at "$now" --argjson c "$n" \
+    '.agents[$n].heartbeat.usageHeal = {at:$at, n:$c}')
+  echo "$reg" | registry_write
+  printf '%s' "$n"
+}
+
+# DIVE-1666 — epoch of this agent's last self-heal restart (0 if none). Used to
+# throttle restarts against a genuinely still-limited account.
+_hb_usage_heal_last() {
+  local name="$1" reg; reg=$(registry_read)
+  jq -r --arg n "$name" '.agents[$n].heartbeat.usageHeal.at // 0' <<<"$reg" 2>/dev/null || echo 0
 }
 
 # DIVE-979 — dependency-aware task pick for one agent. Echoes the single DIVE row
@@ -29735,10 +29820,10 @@ _hb_gate_ttl_sweep() {
     local lines_main lines_manual reminder_ids
     reminder_ids=$(db "SELECT id FROM tasks WHERE ${_t2_where} AND assignee=$(sqlq "$aname")
                        ORDER BY COALESCE(need_asked_at,updated_at),id;" | paste -sd, -)
-    lines_main=$(db "SELECT '• /task_'||id||' ['||ident||'] '||need_type||', '||CAST(julianday('now')-julianday(COALESCE(need_asked_at,updated_at)) AS INT)||'d — '||CASE WHEN COALESCE(need_options,'')='' THEN substr(replace(COALESCE(ask,''), x'0a', ' '),1,90) ELSE replace(COALESCE(ask,''), x'0a', ' ') END
+    lines_main=$(db "SELECT '• /task_'||id||' ['||ident||'] '||need_type||', '||CAST(julianday('now')-julianday(COALESCE(need_asked_at,updated_at)) AS INT)||'d — '||substr(replace(COALESCE(ask,''), x'0a', ' '),1,90)
                      FROM tasks WHERE ${_t2_where} AND assignee=$(sqlq "$aname") AND need_type != 'manual'
                      ORDER BY COALESCE(need_asked_at,updated_at);")
-    lines_manual=$(db "SELECT '• /task_'||id||' ['||ident||'] '||CAST(julianday('now')-julianday(COALESCE(need_asked_at,updated_at)) AS INT)||'d — '||CASE WHEN COALESCE(need_options,'')='' THEN substr(replace(COALESCE(ask,''), x'0a', ' '),1,90) ELSE replace(COALESCE(ask,''), x'0a', ' ') END
+    lines_manual=$(db "SELECT '• /task_'||id||' ['||ident||'] '||CAST(julianday('now')-julianday(COALESCE(need_asked_at,updated_at)) AS INT)||'d — '||substr(replace(COALESCE(ask,''), x'0a', ' '),1,90)
                        FROM tasks WHERE ${_t2_where} AND assignee=$(sqlq "$aname") AND need_type = 'manual'
                        ORDER BY COALESCE(need_asked_at,updated_at);")
     [[ -n "$lines_main" || -n "$lines_manual" ]] || continue
@@ -29756,7 +29841,7 @@ _hb_gate_ttl_sweep() {
     local _mgr _esc_lines
     _mgr=$(db "SELECT COALESCE(reports_to,'') FROM agents_org WHERE name=$(sqlq "$aname");")
     if [[ -n "$_mgr" && "$_mgr" != "$aname" ]] && _task_agent_channel "$_mgr"; then
-      _esc_lines=$(db "SELECT '• ['||ident||'] '||need_type||', '||CAST(julianday('now')-julianday(COALESCE(need_asked_at,updated_at)) AS INT)||'d — '||CASE WHEN COALESCE(need_options,'')='' THEN substr(replace(COALESCE(ask,''), x'0a', ' '),1,90) ELSE replace(COALESCE(ask,''), x'0a', ' ') END
+      _esc_lines=$(db "SELECT '• ['||ident||'] '||need_type||', '||CAST(julianday('now')-julianday(COALESCE(need_asked_at,updated_at)) AS INT)||'d — '||substr(replace(COALESCE(ask,''), x'0a', ' '),1,90)
                        FROM tasks WHERE ${_t2_where} AND assignee=$(sqlq "$aname")
                          AND COALESCE(need_asked_at, updated_at) <= datetime('now','-${_HB_GATE_ESCALATE_DAYS} days')
                        ORDER BY COALESCE(need_asked_at,updated_at);")
@@ -29826,7 +29911,7 @@ _hb_gate_renag_batch() { # <recipient_agent> <comma-separated task ids> <route_l
     if [[ -n "$markup" ]]; then
       rows=$(jq -cn --argjson a "$rows" --argjson b "$markup" '$a + ($b.inline_keyboard // [])' 2>/dev/null) || rows='[]'
     fi
-  done < <(db "SELECT id||x'1f'||ident||x'1f'||need_type||x'1f'||COALESCE(need_options,'')||x'1f'||COALESCE(recommend,'')||x'1f'||CASE WHEN COALESCE(need_options,'')='' THEN substr(replace(COALESCE(ask,''),x'0a',' '),1,240) ELSE replace(COALESCE(ask,''),x'0a',' ') END
+  done < <(db "SELECT id||x'1f'||ident||x'1f'||need_type||x'1f'||COALESCE(need_options,'')||x'1f'||COALESCE(recommend,'')||x'1f'||substr(replace(COALESCE(ask,''),x'0a',' '),1,240)
                FROM tasks WHERE id IN (${idlist}) ORDER BY COALESCE(need_asked_at,updated_at,created_at),id;")
 
   local reply_markup=""
@@ -30531,6 +30616,55 @@ cmd_heartbeat_tick() {
     # falls through so the wake can still (re)start a stopped session.
     local idle_rc=0; _hb_agent_idle "$name" || idle_rc=$?
     if (( idle_rc == 3 )); then
+      # DIVE-1666: CLASSIFY the open dialog. A genuine permission/plan prompt is
+      # real in-flight work → defer, never interrupt (the else branch, unchanged).
+      # But the Claude Code usage/spend-limit dialog is a dead-end that never
+      # self-clears, so deferring it every tick froze whole sessions permanently
+      # even after the 5h window rolled back to headroom (the 2026-07-21 stall).
+      # Self-heal: restart to clear the stale dialog (fresh:true → no context
+      # lost), throttled so a still-limited account isn't churn-restarted, and
+      # only surface to the human when NO account headroom is provable (a real
+      # capacity/billing call, not a stuck dialog).
+      if _hb_usage_limit_frozen "$name"; then
+        local heal_last heal_gap headroom=1
+        _hb_account_has_headroom "$name" "$acct" "$reg" && headroom=0
+        heal_last=$(_hb_usage_heal_last "$name")
+        [[ "$heal_last" =~ ^[0-9]+$ ]] || heal_last=0
+        heal_gap=$(( (now - heal_last) / 60 ))
+        if (( heal_last == 0 || heal_gap >= _HB_USAGE_HEAL_THROTTLE_MIN )); then
+          local hn; hn=$(with_registry_lock _hb_mark_usage_heal "$name" "$now")
+          if systemctl restart "5dive-agent@${name}.service" 2>/dev/null; then
+            reclaimed=$((reclaimed + 1))
+            if (( headroom == 0 )); then
+              _hb_log "[$name] usage-limit dialog frozen; account '$acct' has headroom (healthy peer) → restarted to self-heal (DIVE-1666 heal #${hn:-?})"
+            else
+              _hb_log "[$name] WARN: usage-limit dialog frozen; NO healthy peer on '$acct' → restarted once to test the 5h window (DIVE-1666 heal #${hn:-?}); will surface if it re-freezes"
+            fi
+          else
+            _hb_log "[$name] usage-limit dialog frozen — self-heal restart FAILED (systemctl); retry next window"
+          fi
+          continue
+        fi
+        # Throttled: we restarted within the window and it's frozen on the SAME
+        # dialog again → the account is genuinely limited right now, not a stuck
+        # dialog. When no peer proves headroom, that's a capacity/billing call →
+        # surface loudly to the fleet coordinator (throttled), then defer.
+        if (( headroom == 1 )); then
+          local ua_key="usage_limit_alert_${name}" ua_last ua_cut
+          ua_last=$(db "SELECT value FROM task_prefs WHERE key='${ua_key}';" 2>/dev/null)
+          ua_cut=$(date -u -d '60 minutes ago' '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo "")
+          if [[ -z "$ua_last" || ( -n "$ua_cut" && "$ua_last" < "$ua_cut" ) ]]; then
+            ( cmd_send "main" --from="task-engine" \
+                --message="🟠 Capacity/billing check: agent '${name}' is frozen on the Claude Code usage-limit dialog and STILL frozen ${heal_gap}m after a self-heal restart, with no healthy peer on account '${acct}' to prove headroom — account '${acct}' appears genuinely rate/spend-limited right now (not a stuck dialog). If this is a plan/spend ceiling it's a human call for lodar. (DIVE-1666)" ) >/dev/null 2>&1 || true
+            db "INSERT INTO task_prefs (key,value) VALUES ('${ua_key}', datetime('now'))
+                ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=datetime('now');" 2>/dev/null || true
+            _hb_log "[$name] usage-limit dialog frozen ${heal_gap}m post-restart, no headroom on '$acct' → surfaced capacity/billing to main (DIVE-1666)"
+          fi
+        fi
+        sk_active=$((sk_active + 1))
+        _hb_log "[$name] WARN: usage-limit dialog frozen ${heal_gap}m after self-heal restart (throttle ${_HB_USAGE_HEAL_THROTTLE_MIN}m) — deferring this tick (DIVE-1666)"
+        continue
+      fi
       sk_active=$((sk_active + 1))
       _hb_log "[$name] WARN: blocked (${_HB_IDLE_REASON:-input needed}) — surfacing, defer nudge this tick (needs attention, not reclaim)"
       continue
