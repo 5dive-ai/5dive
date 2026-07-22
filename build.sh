@@ -56,6 +56,7 @@ cat \
   src/cmd_objective.sh \
   src/cmd_company.sh \
   src/cmd_council.sh \
+  src/cmd_constitution.sh \
   src/cmd_loop.sh \
   src/cmd_loop_pack.sh \
   src/cmd_crew.sh \

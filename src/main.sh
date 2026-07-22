@@ -728,6 +728,13 @@ main() {
       # receipt seal (gate-proof) take root themselves. No registry lock (the
       # persisted bench file is a plain jq write behind the sudo gate).
       cmd_council "$@" ;;
+    constitution)
+      # DIVE-1742: top-level front door onto the machine-enforced constitution.
+      # `show` (READ) composes one JSON envelope (guardrails/thresholds/veto +
+      # seal/verify state + amendment receipts) the dashboard consumes instead
+      # of parsing constitution.yaml in-browser. Read-only; init (DIVE-1701) +
+      # set (DIVE-1743) land next. Aliases into cmd_council internals.
+      cmd_constitution "$@" ;;
     up)
       # Compose-style: bring up agents declared in 5dive.yaml. Mutating but
       # the per-agent `agent create` calls take the registry lock + audit

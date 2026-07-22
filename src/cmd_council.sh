@@ -2384,6 +2384,78 @@ function cmdConstitution() {
   out(E.loadConstitution(path))
 }
 
+// DIVE-1742: `constitution show --json` READ verb. Composes ONE envelope the dashboard (DIVE-1732)
+// and any client consume instead of parsing raw constitution.yaml in-browser (DIVE-1731 no-mutation
+// line + DIVE-1700 YAML bug class). The engine loadConstitution is the single shared parser. Digests
+// + chain-verify come from the ROOT-sealed lineage via bash (which owns the gate-proof key); this verb
+// just reads the lineage FILE for the amendment receipt list + normalizes null semantics. Fail-safe:
+// a missing/garbage lineage yields amendments:[] and null digests, never a throw.
+function readLineageRecords(lineagePath) {
+  if (!lineagePath) return []
+  let raw
+  try { raw = fs.readFileSync(lineagePath, 'utf8') } catch { return [] }
+  const out = []
+  for (const line of raw.split(/\r?\n/)) {
+    const s = line.trim(); if (!s) continue
+    try { out.push(JSON.parse(s)) } catch { /* skip a corrupt line, never abort the read */ }
+  }
+  return out
+}
+function cmdConstitutionShow() {
+  const strv = (k) => { const v = flag(k); return (v == null || v === true) ? '' : String(v) }
+  const path = strv('path')
+  const sealed = strv('sealed')
+  const live = strv('live')
+  const lineagePath = strv('lineage')
+  const verifyFile = strv('verify-file')
+  const c = E.loadConstitution(path)
+  // Per-class hard_gates: raw effective ERE strings + a default-vs-custom source flag (custom ==
+  // differs from the shipped default) so the dashboard can render "default" vs "customized".
+  const hard_gates = { ...c.hardGates }
+  const hard_gates_source = {}
+  for (const k of Object.keys(hard_gates)) {
+    hard_gates_source[k] = (hard_gates[k] === E.DEFAULT_HARD_GATE_CLASSES[k]) ? 'default' : 'custom'
+  }
+  // Amendment receipts: lineage records that carry a non-empty constitutionDigest (genesis-with-
+  // constitution + every amend). Newest last (lineage is append-ordered). Fields per DIVE-1742 lock.
+  const amendments = readLineageRecords(lineagePath)
+    .map(w => ({ w, r: (w && w.record) || {} }))
+    .filter(({ r }) => r && typeof r.constitutionDigest === 'string' && r.constitutionDigest !== '')
+    .map(({ w, r }) => ({
+      seq: Number.isInteger(r.seq) ? r.seq : (Number.isInteger(w.seq) ? w.seq : null),
+      recordDigest: (w && typeof w.digest === 'string') ? w.digest : null,
+      constitutionDigest: r.constitutionDigest,
+      at: r.stampedAt || null,
+      motion: (r.motion && r.motion.kind) || r.kind || null,
+      outcome: r.outcome || null,
+      by: r.by || (r.veto && r.veto.principal) || null,
+    }))
+  // verify passthrough (chain re-seal is root-only, computed by bash `council verify`); null if absent.
+  let verify = null
+  if (verifyFile) { try { verify = JSON.parse(fs.readFileSync(verifyFile, 'utf8')) } catch { verify = null } }
+  const drift = E.constitutionDriftCheck({ sealedDigest: sealed, liveDigest: live })
+  // genesisExists: is a council seated at all? This is the robust edit-vs-readonly signal (and the
+  // DIVE-1743 write-path branch): a box can have a council genesis but an as-yet-UNSEALED constitution
+  // (sealedDigest=null), where edits must still route through `council amend`, not a solo write. Truly
+  // solo (editable) == no genesis AND no seal. bash passes --genesis-exists (it owns the genesis path).
+  const genesisExists = String(flag('genesis-exists') || '') === '1'
+  out({
+    path: c.path, source: c.source, valid: c.valid, error: c.error,
+    hard_gates, hard_gates_source, hard_gates_defaults: E.DEFAULT_HARD_GATE_CLASSES,
+    hard_gate_regex: c.hardGateRegex,
+    thresholds: c.thresholds, quorum: c.quorum,
+    veto: c.veto, ship: c.ship, comms: c.comms, council: c.council,
+    // null (NOT '') when no council has sealed. Pair with genesisExists for the edit-vs-readonly switch:
+    // editable only when !genesisExists && sealedDigest==null (truly solo); else route via council amend.
+    sealedDigest: sealed || null,
+    liveDigest: live || null,
+    genesisExists,
+    drifted: !!drift.drifted, driftReason: drift.reason || null,
+    verify,
+    amendments,
+  })
+}
+
 async function cmdConvene() {
   const question = positionals[0]
   if (!question) die('convene needs a question: 5dive council convene "<q>" --seats=a,b,c')
@@ -3061,6 +3133,7 @@ function cmdBallotTap() {
 
 const main = async () => {
   if (sub === 'constitution') return cmdConstitution()
+  if (sub === 'constitution-show') return cmdConstitutionShow()
   if (sub === 'constitution-render') return cmdConstitutionRender()
   if (sub === 'drift-check') return cmdDriftCheck()
   if (sub === 'amend-plan') return cmdAmendPlan()
