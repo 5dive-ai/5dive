@@ -24746,11 +24746,22 @@ export function dispatchBallotVote(opts = {}) {
     { encoding: 'utf-8', timeout: 60000, maxBuffer: 16 * 1024 * 1024 }))
   const clip = (e) => String(e && e.message || e).replace(/\s+/g, ' ').slice(0, 140)
   const emitBallot = opts._emitBallot || defaultEmitBallot()
+  // DIVE-1739: mid-window retry-nudge. On a long (full-quorum) ballot, a slow-but-alive seat can sit
+  // on its queued ballot until the deadline abstains it out. Halfway through the window we send ONE
+  // best-effort wake nudge into the seat agent's pane. Injectable + never-throws; a nudge that can't
+  // land just means the seat isn't roused early — the deadline/abstain path is unchanged either way.
+  const nudge = opts._nudge || ((agent, msg) => nudgeSeatAgent(agent, msg))
+  const nudgeFrac = Number(opts.nudgeFrac) > 0 && Number(opts.nudgeFrac) < 1 ? Number(opts.nudgeFrac) : 0.5
   // (d) COLLECT (shared by the agent + human branches): poll task show until the ballot task closes
   // with a result, or the deadline elapses. The collection-loop deadline is AUTHORITATIVE regardless
   // of any stamp in the task body. A human tap and an agent heartbeat close the task identically, so
   // this loop is byte-identical for both — no new collection/quorum/abstain path (DIVE-1564).
-  const collect = async (seat, taskId, deadlineAt, deadlineIso, kind) => {
+  const collect = async (seat, taskId, deadlineAt, deadlineIso, kind, nudgeInfo) => {
+    // DIVE-1739: fire the single mid-window nudge once ~nudgeFrac of the window has elapsed with the
+    // ballot still open. nudgeInfo is null for seats that don't get a pane nudge (e.g. human seats,
+    // which vote by tap and were already delivered a Telegram ballot).
+    const nudgeAt = nudgeInfo ? deadlineAt - (deadlineAt - now()) * (1 - nudgeFrac) : Infinity
+    let nudged = false
     while (now() < deadlineAt) {
       let row = null
       try {
@@ -24761,6 +24772,10 @@ export function dispatchBallotVote(opts = {}) {
         const result = row.result || ''
         return E.parseVote(result) ||
           { vote: 'abstain', rationale: `${seat.id} ${kind} ${taskId}: closed with no COUNCIL-VOTE line (deadline/no-vote)` }
+      }
+      if (nudgeInfo && !nudged && now() >= nudgeAt) {
+        nudged = true
+        try { nudge(nudgeInfo.agent, nudgeInfo.msg) } catch { /* best-effort — abstain-on-miss unchanged */ }
       }
       await sleep(pollSecs * 1000)
     }
@@ -24842,7 +24857,10 @@ export function dispatchBallotVote(opts = {}) {
     } catch (e) {
       return { vote: 'abstain', rationale: `${seat.id} ballot: could not mint task (${clip(e)}) (deadline/no-vote)` }
     }
-    return collect(seat, taskId, deadlineAt, deadlineIso, 'ballot')
+    // DIVE-1739: agent seats get a mid-window pane nudge if they haven't voted (nudgeInfo carries the
+    // registry target + a one-line reminder). Human seats fall through with no nudgeInfo (they tap).
+    const nudgeMsg = `council ballot ${taskId} awaiting your COUNCIL-VOTE (deadline ${deadlineIso}). Close it with: 5dive task done ${taskId} --result="...COUNCIL-VOTE: <approve|reject|escalate> :: <why>".`
+    return collect(seat, taskId, deadlineAt, deadlineIso, 'ballot', { agent: target, msg: nudgeMsg })
   }
 }
 // DIVE-1564: default human-ballot emit. The CLI has no inline-keyboard send rail of its own — the
@@ -24952,7 +24970,7 @@ function firstFlagValue(...vals) {
   for (const v of vals) if (v !== undefined && v !== true) return v
   return undefined
 }
-function seatVoteFor() {
+function seatVoteFor(opts = {}) {
   if (process.env.COUNCIL_MOCK) return mockSeatVote()
   if (askRailSelected()) {
     return dispatchSeatVote({ timeout: flag('timeout'), idle: flag('idle-secs'), poll: flag('poll-secs'), from: flag('from') })
@@ -24962,8 +24980,11 @@ function seatVoteFor() {
     // operator-facing --timeout is REAL on the (default) ballot path, not silently ignored while the
     // convene runs to the hidden 900s default. First flag that carries an actual value wins; a bare
     // flag (=== true) or an absent one (=== undefined) is skipped so it can't clobber a later value.
-    deadline: firstFlagValue(flag('ballot-deadline'), flag('deadline'), flag('timeout')),
-    poll: flag('ballot-poll'), from: flag('from'),
+    // DIVE-1739: a FULL-QUORUM (constitutional) convene with no explicit deadline defaults to a longer
+    // 1h window — every seat MUST cast, so a slow-but-alive seat needs room to rouse (via the
+    // mid-window nudge) and vote before the deadline abstains it out of an all-seats quorum.
+    deadline: firstFlagValue(flag('ballot-deadline'), flag('deadline'), flag('timeout')) ?? (opts.fullQuorum ? 3600 : undefined),
+    poll: flag('ballot-poll'), from: flag('from'), fullQuorum: !!opts.fullQuorum,
   })
 }
 // CNCL-16 pre-flight: the live set of registry agent names `5dive agent ask` can reach. Returns a
@@ -24996,6 +25017,69 @@ function preflightSeats(seats) {
   if (unresolved.length) {
     die(`council pre-flight FAILED: ${unresolved.length} seat(s) resolve to no known registry agent — ${unresolved.map(u => `${u.id}→${u.agent}`).join(', ')}. Fix the bench seat's \`agent\` field / alias or re-seed. Known agents: ${[...known].sort().join(', ')}.`, 6)
   }
+}
+
+// DIVE-1739: seat LIVENESS map — registry name -> health {asleep,deaf,...} from `agent list --json`.
+// A full-quorum (constitutional) motion dispatches deadline-stamped ballots to real seated agents
+// (CNCL-18); an asleep/deaf seat misses its deadline and auto-abstains, and since abstains don't
+// count toward an `all` quorum, a SINGLE dozing seat makes 6/6 structurally unreachable (the
+// DIVE-1696 blocker). So a full-quorum convene liveness-checks its roster BEFORE dispatch.
+function seatHealthMap() {
+  const bin = process.env.COUNCIL_5DIVE_BIN || '5dive'
+  try {
+    const stdout = execFileSync(bin, ['agent', 'list', '--json'],
+      { encoding: 'utf-8', timeout: 30000, maxBuffer: 16 * 1024 * 1024 })
+    const env = JSON.parse(stdout)
+    const arr = (env && env.data) || []
+    if (!Array.isArray(arr)) return null
+    const m = new Map()
+    for (const a of arr) if (a && a.name) m.set(a.name, a.health || {})
+    return m
+  } catch {
+    return null
+  }
+}
+
+// DIVE-1739: best-effort wake NUDGE — inject a one-line message into the seat agent's pane so a dozing
+// seat rouses to work its queued ballot. Never throws (a nudge that can't send just means the operator
+// wakes the seat manually) and is never load-bearing — the REFUSE in preflightLiveness is what
+// guarantees we never dispatch a doomed full-quorum motion.
+function nudgeSeatAgent(agent, msg) {
+  const bin = process.env.COUNCIL_5DIVE_BIN || '5dive'
+  try {
+    execFileSync(bin, ['agent', 'send', String(agent), String(msg)],
+      { encoding: 'utf-8', timeout: 30000, stdio: ['ignore', 'ignore', 'ignore'] })
+    return true
+  } catch { return false }
+}
+
+// DIVE-1739 (gate answer A — preserve strict 6/6, fix reliability operationally). Before a FULL-QUORUM
+// convene dispatches, probe every AGENT seat's liveness. Human seats vote by Telegram tap (DIVE-1564),
+// not by being an awake agent, so they are exempt here (their delivery is fail-closed at dispatch). If
+// any agent seat is asleep/deaf/health-unknown: NUDGE it (prime a retry) and return the unreachable
+// list so the caller REFUSES + escalates. An absent seat DELAYS the motion, never silently passes or
+// blocks it, and legitimacy (every seat actually weighed in) is preserved — never a proxy, never
+// abstain-as-present. Returns { ok, unreachable:[{id,agent,why}] }. Health source + nudge are
+// injectable (opts._health: Map name->health, opts._nudge: (agent,msg)=>void) so the whole gate is
+// unit-testable offline with no real `agent list`/`agent send`.
+export function preflightLiveness(seats, opts = {}) {
+  const health = opts._health || seatHealthMap()
+  if (health === null) {
+    die('council liveness pre-flight FAILED: could not read seat health (`agent list --json`) — refusing to dispatch a full-quorum motion rather than gamble it into a structural inquorate.', 6)
+  }
+  const nudge = opts._nudge || nudgeSeatAgent
+  const unreachable = []
+  for (const s of seats) {
+    if (E.seatIsHuman(s)) continue
+    const agent = E.resolveSeatAgent(s)
+    const h = health.get(agent)
+    const why = !h ? 'health-unknown' : h.asleep ? 'asleep' : h.deaf ? 'deaf' : ''
+    if (why) unreachable.push({ id: (s && s.id) || String(s), agent, why })
+  }
+  for (const u of unreachable) {
+    nudge(u.agent, `council: a full-quorum (constitutional) motion needs your ballot but your seat read ${u.why}. Waking you — cast your COUNCIL-VOTE on the queued ballot so 6/6 can be reached.`)
+  }
+  return { ok: unreachable.length === 0, unreachable }
 }
 
 function cmdConstitution() {
@@ -25107,9 +25191,33 @@ async function cmdConvene() {
   // CNCL-16: on the real-agents dispatch path, fail closed at convene START if any seat resolves
   // to no known registry agent. Skipped for the standalone seam and for COUNCIL_MOCK (offline).
   if (!standalone && !process.env.COUNCIL_MOCK) preflightSeats(seats)
+  // DIVE-1739 (gate answer A): a FULL-QUORUM (constitutional) motion needs every seat to cast — one
+  // dozing seat auto-abstains and 6/6 becomes structurally unreachable. Derive whether THIS convene
+  // requires full quorum (the motion class wins when present, else the --class/bench class), and if so
+  // liveness-check the roster BEFORE dispatch: refuse + escalate (never dispatch a doomed vote) when a
+  // seat is unreachable. Skipped for the standalone seam + COUNCIL_MOCK (offline, no real fleet).
+  const effClass = input.motion ? E.classifyMotion(input.motion) : input.decisionClass
+  const clsSpec = (constitution.thresholds && constitution.thresholds[effClass]) || {}
+  const needsFullQuorum = clsSpec.quorum === 'all' || clsSpec.requireQuorum === true
+  if (needsFullQuorum && !standalone && !process.env.COUNCIL_MOCK) {
+    const live = preflightLiveness(seats)
+    if (!live.ok) {
+      const names = live.unreachable.map(u => `${u.id} (${u.why})`).join(', ')
+      const brief = `Full-quorum liveness pre-check FAILED: ${live.unreachable.length} of ${seats.length} seat(s) unreachable — ${names}. A constitutional motion needs every seat to cast (6/6); an asleep/deaf seat auto-abstains and abstains do not count toward the all-seats quorum, so this convene would inquorate-escalate regardless. Not dispatched. The unreachable seat(s) were nudged to wake — re-run once \`5dive council roster\` shows all seats awake. (DIVE-1739: an absent seat DELAYS a motion, never passes or blocks it.)`
+      out({
+        council: input.councilName, mode, question, seats: seats.map(s => s.id),
+        dispatch: 'liveness-escalated',
+        verdict: { recommendation: 'escalate', tally: { approve: 0, reject: 0, escalate: 0 }, confidence: 0, dissent: '', escalated: true, brief },
+        disposition: 'escalate', votes: [],
+        constitution: { source: constitution.source, valid: constitution.valid, path: constitution.path },
+        livenessEscalated: true, unreachableSeats: live.unreachable,
+      })
+      return
+    }
+  }
   const deps = standalone
     ? { modelCall: modelCallFor(), verbose: !!flag('verbose') }
-    : { seatVote: seatVoteFor(), verbose: !!flag('verbose') }
+    : { seatVote: seatVoteFor({ fullQuorum: needsFullQuorum }), verbose: !!flag('verbose') }
   let result
   try { result = await E.runCouncil(input, deps) }
   catch (e) { die(String(e && e.message || e), 1) }

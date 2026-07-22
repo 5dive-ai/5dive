@@ -11,7 +11,7 @@ if ! command -v node >/dev/null 2>&1; then
 fi
 
 rc=0
-for h in council_engine_unit.mjs council_cli_contract.mjs council_dispatch_unit.mjs council_cosign_unit.mjs council_constitution_unit.mjs; do
+for h in council_engine_unit.mjs council_cli_contract.mjs council_dispatch_unit.mjs council_cosign_unit.mjs council_constitution_unit.mjs council_liveness_unit.mjs; do
   echo "=== tests/$h"
   if ! node "tests/$h"; then echo "FAILED: tests/$h"; rc=1; fi
 done
