@@ -17,11 +17,10 @@ cmd_constitution() {
     show) _constitution_show "$@" ;;
     init)
       fail "$E_USAGE" "5dive constitution init is not available yet (DIVE-1701 — seeds the full default constitution.yaml). Today: 5dive constitution show [--json]." ;;
-    set|edit)
-      fail "$E_USAGE" "5dive constitution set is not available yet (DIVE-1743 — solo write, refuses to clobber a Council-sealed file). Today: 5dive constitution show [--json]. To change a sealed constitution: sudo 5dive council amend --file=<new constitution.yaml>." ;;
+    set|edit) _constitution_set "$action" "$@" ;;
     -h|--help|help)
       cat >&2 <<'CONSTITUTION_HELP'
-5dive constitution — view the machine-enforced constitution (guardrails, thresholds, veto, seal state)
+5dive constitution — view + amend the machine-enforced constitution (guardrails, thresholds, veto, seal state)
 
   5dive constitution show [--json]
       Read the enforced constitution as ONE envelope: hard_gates (per-class ERE + default/custom
@@ -29,7 +28,20 @@ cmd_constitution() {
       council has sealed), drift + council-verify status, and the amendment receipts. Read-only, no
       root. --json emits the machine envelope the dashboard consumes.
 
-  (init → DIVE-1701 · set/edit → DIVE-1743; a sealed constitution changes via `sudo 5dive council amend`)
+  sudo 5dive constitution set --file=<constitution.yaml> [--principal=<human:agent|tg:id>] [--dry-run] [--json]
+      WRITE path. Validate the proposed doc via the SAME parser as `show`, then route by mode:
+        · a real multi-seat COUNCIL governs  -> a constitutional amendment (council amend:
+          2/3 + full quorum + founder veto); sealed on pass, untouched on non-pass.
+        · SOLO (no council, or a single-principal genesis) -> direct-seal via a single-principal
+          genesis (no convene, no quorum/liveness). --principal names the solo authority the first
+          time (default human:<you>); re-seals inherit it. Root-owned write, so run under sudo.
+      Honors DIVE-1695: the sealed digest is the authority; a later hand-edit drifts + fails closed.
+
+  sudo 5dive constitution edit [--json]
+      Open the current constitution (or the v0 default) in $EDITOR, then seal the edited bytes via
+      the same routing as `set`. No-op if you exit without changes.
+
+  (init → DIVE-1701 seeds the full default; today `set`/`edit` seal a proposed file.)
 CONSTITUTION_HELP
       ;;
     *) fail "$E_USAGE" "unknown: 5dive constitution $action (want: show)" ;;
@@ -92,4 +104,121 @@ _constitution_show_human() {
     ( [ .hard_gates | to_entries[] | "    - " + .key + " (" + (.value|tostring|.[0:52]) + (if (.value|length)>52 then "…" else "" end) + ")" ] | join("\n") ) + "\n" +
     "  amendments: " + ((.amendments|length)|tostring) + " sealed record(s)"
   '
+}
+
+# DIVE-1743 — WRITE path. `constitution set --file=` / `constitution edit`. Validate the proposed
+# constitution via the SAME engine normalizer as the read verb (ONE parser, fail-closed), then route:
+#   ORG  — a real MULTI-seat council governs -> a constitutional amendment via `council amend`
+#          (2/3 + full quorum + founder veto). Sealed on pass, left untouched on a non-pass.
+#   SOLO — no genesis, or a single-principal (solo) genesis -> DIRECT-seal via `council init` with a
+#          single-principal genesis: NO convene, no quorum / DIVE-1739 liveness (no seats to poll).
+#          Reuses the exact council lineage + ROOT-seal machinery, so DIVE-1695 drift detection and
+#          `council verify` work identically. --principal names the solo authority the first time
+#          (default human:<you>); re-seals inherit it from the existing genesis.
+# Both write paths are root-owned (COUNCIL_DIR + constitution.yaml) => sudo (inherited from init/amend).
+_constitution_set() {
+  local verb="${1:-set}"; [[ $# -gt 0 ]] && shift
+  command -v node >/dev/null 2>&1 || fail "$E_NOT_INSTALLED" "constitution $verb needs node on PATH"
+  command -v jq   >/dev/null 2>&1 || fail "$E_NOT_INSTALLED" "constitution $verb needs jq on PATH"
+  local file="" principal="" dry=0 a
+  for a in "$@"; do
+    case "$a" in
+      --file=*)      file="${a#--file=}" ;;
+      --principal=*) principal="${a#--principal=}" ;;
+      --dry-run)     dry=1 ;;
+      --json)        JSON_MODE=1 ;;
+      -h|--help)     cmd_constitution --help; return 0 ;;
+      *) fail "$E_USAGE" "unknown flag for constitution $verb: $a" ;;
+    esac
+  done
+
+  local dir; dir="$(mktemp -d -t 5dive-constitution-set.XXXXXX)" || fail "$E_GENERIC" "mktemp failed"
+  # shellcheck disable=SC2064
+  trap "rm -rf '$dir'" RETURN
+  _council_write_runtime "$dir"
+
+  # `edit`: materialize the CURRENT constitution (or the v0 default when none) into a scratch file,
+  # open $EDITOR on it, then seal the edited bytes through the same routing as `set`. No-op on no change.
+  if [[ "$verb" == "edit" ]]; then
+    [[ -z "$file" ]] || fail "$E_USAGE" "constitution edit opens \$EDITOR — pass no --file (use 'set --file=' for a non-interactive write)"
+    local cur scratch before after
+    cur="$(_council_constitution_path)"; scratch="$dir/constitution.yaml"
+    if [[ -f "$cur" ]]; then cp "$cur" "$scratch"; else node "$dir/cli.mjs" constitution-render > "$scratch"; fi
+    before="$(sha256sum < "$scratch" | awk '{print $1}')"
+    "${EDITOR:-vi}" "$scratch" || fail "$E_GENERIC" "editor exited non-zero — constitution unchanged"
+    after="$(sha256sum < "$scratch" | awk '{print $1}')"
+    [[ "$before" != "$after" ]] || { echo "constitution edit: no changes — nothing to seal" >&2; return 0; }
+    file="$scratch"
+  fi
+
+  [[ -n "$file" ]] || fail "$E_USAGE" "constitution $verb needs --file=<proposed constitution.yaml>"
+  [[ -f "$file" ]] || fail "$E_NOT_FOUND" "no such file: $file"
+  # ONE parser: validate the proposed doc with the SAME engine normalizer the read verb uses.
+  # loadConstitution always exits 0 (it emits {valid, error} in the payload, defaulting when a file
+  # can't parse), so gate on the `valid` flag — not the exit code — and surface its error. Fail-closed.
+  local vout vvalid
+  vout="$(node "$dir/cli.mjs" constitution --path="$file" 2>/dev/null)"
+  vvalid="$(printf '%s' "$vout" | jq -r '.valid // false' 2>/dev/null)"
+  [[ "$vvalid" == "true" ]] \
+    || fail "$E_VALIDATION" "the proposed $file is not a valid constitution ($(printf '%s' "$vout" | jq -r '.error // "parse error"' 2>/dev/null)) — refusing to seal it (fail-closed)"
+
+  # Route by mode: a REAL council = a sealed genesis whose head roster has MORE THAN ONE seat -> org
+  # amend. No genesis, or a single-principal (solo) genesis -> direct seal. seatCount from the SEALED
+  # lineage head (the same source `council amend` reads its roster from).
+  local seat_count=0
+  if [[ -f "$COUNCIL_GENESIS" && -f "$COUNCIL_LINEAGE" ]]; then
+    seat_count="$(jq -sr 'map(select(.record.seats != null and (.record.seats|length)>0)) | (last.record.seats|length) // 0' "$COUNCIL_LINEAGE" 2>/dev/null)"
+    [[ "$seat_count" =~ ^[0-9]+$ ]] || seat_count=0
+  fi
+
+  if [[ "$seat_count" -gt 1 ]]; then
+    # ORG-with-council: hand the proposed file to `council amend`, which owns validate -> convene
+    # (constitutional class) -> seal-FIRST -> swap. We only route; it does the governance.
+    if (( dry )); then
+      if (( JSON_MODE )); then jq -nc --argjson n "$seat_count" '{ok:true,data:{mode:"council",seats:$n,dryRun:true,route:"council amend (constitutional)"}}'
+      else echo "constitution $verb: a $seat_count-seat council governs — would convene a constitutional amendment (council amend)"; fi
+      return 0
+    fi
+    _council_amend "$dir" --file="$file"
+    return $?
+  fi
+
+  # ---- SOLO direct-seal --------------------------------------------------------------------------
+  local cpath; cpath="$(_council_constitution_path)"
+  mkdir -p "$COUNCIL_DIR" 2>/dev/null || true
+  if [[ ! -w "$COUNCIL_DIR" ]]; then
+    fail "$E_PERMISSION" "constitution $verb seals the governance file — it writes ${COUNCIL_DIR} + ${cpath} (root-owned) and must be sudo-run: sudo 5dive constitution $verb --file=$file"
+  fi
+
+  # A solo genesis already present -> re-seal (init --force), inheriting its principal. Otherwise a
+  # first-time seal: --principal (or default human:<you>). init resolves + fails closed on a bad one.
+  local forced="" existing_principal=""
+  if [[ "$seat_count" -ge 1 && -f "$COUNCIL_GENESIS" ]]; then
+    forced="--force"
+    existing_principal="$(jq -r '.veto.principal // empty' "$COUNCIL_GENESIS" 2>/dev/null)"
+  fi
+  [[ -n "$principal" ]] || principal="$existing_principal"
+  [[ -n "$principal" ]] || principal="human:$(id -un 2>/dev/null || echo solo)"
+  local seat_id="${principal#*:}"; seat_id="${seat_id//[^A-Za-z0-9_-]/_}"; [[ -n "$seat_id" ]] || seat_id="solo"
+
+  if (( dry )); then
+    if (( JSON_MODE )); then jq -nc --arg p "$principal" --arg s "$seat_id" --argjson f "$([[ -n "$forced" ]] && echo true || echo false)" \
+      '{ok:true,data:{mode:"solo",dryRun:true,principal:$p,seat:$s,reseal:$f,route:"council init (direct-seal, no convene)"}}'
+    else echo "constitution $verb: would direct-seal (solo, principal=$principal, seat=$seat_id${forced:+, re-seal}) — no convene"; fi
+    return 0
+  fi
+
+  # Place the proposed constitution as the LIVE file before init so init digests + seals ITS bytes
+  # (init only renders the v0 default when no file exists). init then builds a single-principal
+  # genesis, seals the constitution digest into it, and hash-chains the lineage — all with no convene.
+  ( umask 022; cat "$file" > "$cpath" ) || fail "$E_GENERIC" "could not write the constitution to $cpath"
+  _council_init_or_lineage "init" "$dir" --seats="$seat_id:chair" --veto="$principal" $forced
+  local rc=$?
+  if (( rc != 0 )); then
+    fail "$E_GENERIC" "solo direct-seal failed (council init returned $rc) — constitution at $cpath may be updated but UNSEALED; re-run once the cause is fixed"
+  fi
+  if (( ! JSON_MODE )); then
+    echo "constitution $verb: SOLO direct-seal OK — sealed $cpath under a single-principal genesis (principal=$principal). No convene; DIVE-1695 drift + council verify now apply." >&2
+  fi
+  return 0
 }
