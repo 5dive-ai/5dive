@@ -177,6 +177,34 @@ cmd_task_need DIVE-37 --type=approval --ask="approve delegated push for review A
   && ok_t "DIVE-1555: money floor beats push-for-review (stays tier-2 human)" \
   || bad_t "DIVE-1555: money floor beats push-for-review" "human=$HUMAN_PINGED tier='$(db "SELECT tier FROM tasks WHERE ident='DIVE-37';")'"
 
+# --- DIVE-1698: a VERIFIED builder ship — "push the tested commit to GitHub + roll
+# to the fleet" (repro: DIVE-1674 telegram undefined-guard, filed as approval and
+# stuck on lodar's DM). "to GitHub" is not in the push-to-(main|prod|origin) list
+# and "rolling to the fleet" is not "roll out", so it missed the classifier and
+# stayed at the approval tier-2 default. It must now downgrade to a lead-routed
+# tier-1. pref stays OFF to prove the routing is intrinsic to the kind.
+for _c in \
+  "DIVE-43|Approve pushing the telegram undefined-guard (commit b21be34) to GitHub + rolling to the fleet? suite 319/0" \
+  "DIVE-44|push the tested commit to github then roll to the fleet" \
+  "DIVE-45|clear this fleet roll of the verified build"; do
+  _id="${_c%%|*}"; _ask="${_c#*|}"
+  seed "$_id"; HUMAN_PINGED=0; route_reset
+  cmd_task_need "$_id" --type=approval --ask="$_ask" --from=dev >/dev/null 2>&1
+  [[ "$HUMAN_PINGED" == "0" \
+     && "$(db "SELECT tier FROM tasks WHERE ident='$_id';")" == "1" \
+     && "$(db "SELECT COALESCE(routed_reviewer,'') FROM tasks WHERE ident='$_id';")" == "main" ]] \
+    && ok_t "DIVE-1698: verified push+fleet-roll ask ('$_ask') → lead-routed tier-1 (not human DM)" \
+    || bad_t "DIVE-1698: push+fleet-roll → lead-routed tier-1" "ask='$_ask' human=$HUMAN_PINGED tier='$(db "SELECT tier FROM tasks WHERE ident='$_id';")' reviewer='$(db "SELECT COALESCE(routed_reviewer,'') FROM tasks WHERE ident='$_id';")'"
+done
+
+# DIVE-1698: the true-human floor still wins — a push+fleet-roll that ALSO names a
+# secret/credential stays a tier-2 human call (not lead-routed).
+seed DIVE-46; HUMAN_PINGED=0; route_reset
+cmd_task_need DIVE-46 --type=approval --ask="push to github + roll the new api key to the fleet?" --from=dev >/dev/null 2>&1
+[[ "$HUMAN_PINGED" == "1" && "$(db "SELECT tier FROM tasks WHERE ident='DIVE-46';")" == "2" ]] \
+  && ok_t "DIVE-1698: secret floor beats push+fleet-roll (stays tier-2 human)" \
+  || bad_t "DIVE-1698: secret floor beats push+fleet-roll" "human=$HUMAN_PINGED tier='$(db "SELECT tier FROM tasks WHERE ident='DIVE-46';")'"
+
 # --- DIVE-1605: eng-ship matcher must catch INFLECTED verb forms ----------------
 # Regression for the 2026-07-21 leak (DIVE-1602): a builder filed
 # "Approve landing the verified fix and pushing to origin" — a textbook eng-ship
