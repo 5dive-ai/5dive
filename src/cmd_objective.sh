@@ -676,11 +676,14 @@ _objective_ensure_project() {
 }
 
 # Append one objective_cycles audit row.
-# _objective_record_cycle <obj_id> <cycle_no> <reading> <proposed> <applied> <reprioritized> <cancelled> <gated> <gate_anchor> <tokens> <outcome>
+# _objective_record_cycle <obj_id> <cycle_no> <reading> <proposed> <applied> <reprioritized> <cancelled> <gated> <gate_anchor> <tokens> <outcome> [planner_loop_id] [planner_task_id]
+# DIVE-1737: the trailing planner_loop_id/planner_task_id are OPTIONAL — set only
+# on an 'awaiting_planner' row so the heartbeat reconciler can find the backing
+# loop/task; every other outcome passes 11 args and stores NULL for both.
 _objective_record_cycle() {
   db "INSERT INTO objective_cycles
-        (objective_id, cycle_no, reading_value, proposed, applied, reprioritized, cancelled, gated, gate_anchor, tokens_spent, outcome)
-      VALUES (${1}, ${2}, $(sqlq_or_null "$3"), ${4}, ${5}, ${6}, ${7}, ${8}, $(sqlq_or_null "$9"), ${10}, $(sqlq "${11}"));"
+        (objective_id, cycle_no, reading_value, proposed, applied, reprioritized, cancelled, gated, gate_anchor, tokens_spent, outcome, planner_loop_id, planner_task_id)
+      VALUES (${1}, ${2}, $(sqlq_or_null "$3"), ${4}, ${5}, ${6}, ${7}, ${8}, $(sqlq_or_null "$9"), ${10}, $(sqlq "${11}"), $(sqlq_or_null "${12:-}"), $(sqlq_or_null "${13:-}"));"
 }
 
 # ---- diff validation (creates via goal guardrails; reprioritize/cancel own-only) ----
@@ -721,7 +724,15 @@ _objective_validate_diff() {
 }
 
 # ---- planner invocation (loop spawn --wait --schema; captures tokensSpent) ----
-OBJ_PLANNER_TOKENS=0
+# DIVE-1737: on a non-'done' loop (timeout/escalated past the wait window) this no
+# longer hard-fails. The backing planner task SURVIVES and typically completes
+# minutes-to-an-hour later (the real planner run far outlasts OBJ_PLANNER_WAIT_DEFAULT);
+# we expose loopId/taskId/status so the caller records an 'awaiting_planner' cycle
+# and the heartbeat reconciler pulls the late diff → the existing --diff path.
+# Results land in globals (NOT stdout) so the caller must NOT wrap this in a
+# command substitution — $(...) would run it in a subshell and the loop/task/
+# status stamps (needed to record the awaiting_planner cycle) would be lost.
+OBJ_PLANNER_TOKENS=0 OBJ_PLANNER_LOOP_ID="" OBJ_PLANNER_TASK_ID="" OBJ_PLANNER_STATUS="" OBJ_PLANNER_DIFF=""
 _objective_invoke_planner() {
   local contract="$1" planner="$2" ceiling="$3" wait_secs="$4"
   local schema; schema=$(_objective_diff_schema)
@@ -732,9 +743,15 @@ _objective_invoke_planner() {
   status=$(printf '%s' "$spawn_json" | jq -r '.data.status // ""')
   result=$(printf '%s' "$spawn_json" | jq -r '.data.result // ""')
   OBJ_PLANNER_TOKENS=$(printf '%s' "$spawn_json" | jq -r '.data.tokensSpent // 0')
-  [[ "$status" == "done" ]] || fail "$E_TIMEOUT" "planner did not return a diff (loop $status) — inspect: 5dive task loops"
+  OBJ_PLANNER_LOOP_ID=$(printf '%s' "$spawn_json" | jq -r '.data.loopId // ""')
+  OBJ_PLANNER_TASK_ID=$(printf '%s' "$spawn_json" | jq -r '.data.taskId // ""')
+  OBJ_PLANNER_STATUS="$status"
+  OBJ_PLANNER_DIFF=""
+  # Not done => planner still working; leave the diff empty and let the caller
+  # hand off to the reconciler. Only a done-but-empty result is a genuine error.
+  [[ "$status" == "done" ]] || return 0
   [[ -n "$result" ]] || fail "$E_GENERIC" "planner returned an empty diff"
-  printf '%s' "$result"
+  OBJ_PLANNER_DIFF="$result"
 }
 
 # ---- injected-context contract ----
@@ -998,7 +1015,22 @@ cmd_objective_replan() {
     [[ -n "$planner" ]] || fail "$E_VALIDATION" "no --planner, objective planner, or org coordinator to plan with"
     local contract; contract=$(_objective_build_contract "$oname" "$obj_id" "$cur" "$prev" "$trend" "$o_target" "$o_dir" "$o_unit" "$max_new")
     step "objective '$oname' cycle ${cycle_no}: invoking planner '$planner' (ceiling ${ceiling}tok)…"
-    diff=$(_objective_invoke_planner "$contract" "$planner" "$ceiling" "$wait_secs") || return $?
+    # NB: NOT $(...) — invoke_planner returns via globals (OBJ_PLANNER_DIFF +
+    # the loop/task/status stamps); a subshell would drop the stamps we need to
+    # record the awaiting_planner cycle.
+    _objective_invoke_planner "$contract" "$planner" "$ceiling" "$wait_secs" || return $?
+    diff="$OBJ_PLANNER_DIFF"
+
+    # DIVE-1737: planner loop timed out past the wait window but its backing task
+    # SURVIVES and will finish later. Record an 'awaiting_planner' cycle stamped
+    # with the loop/task ids and hand off — the heartbeat reconciler pulls the
+    # late diff and re-drives THIS same command via --diff. This replaces the old
+    # hard E_TIMEOUT that dropped the cycle (and orphaned the diff) on the floor.
+    if [[ "$OBJ_PLANNER_STATUS" != "done" ]]; then
+      _objective_record_cycle "$obj_id" "$cycle_no" "$cur" 0 0 0 0 0 "" "$OBJ_PLANNER_TOKENS" "awaiting_planner" "$OBJ_PLANNER_LOOP_ID" "$OBJ_PLANNER_TASK_ID"
+      _objective_terminal_out "$oname" "$cycle_no" "awaiting_planner" "planner loop ${OBJ_PLANNER_LOOP_ID:-?} still running past ${wait_secs}s (backing task ${OBJ_PLANNER_TASK_ID:-?}); the heartbeat reconciler will materialize its diff on completion — nothing dropped"
+      return
+    fi
   fi
 
   diff=$(_objective_normalize_diff "$diff")   # DIVE-1551: id->local_id tolerance

@@ -508,6 +508,8 @@ CREATE TABLE IF NOT EXISTS objective_cycles (
   gated         INTEGER NOT NULL DEFAULT 0,
   gate_anchor   TEXT,
   tokens_spent  INTEGER NOT NULL DEFAULT 0,
+  planner_loop_id TEXT,
+  planner_task_id INTEGER,
   outcome       TEXT NOT NULL DEFAULT 'noop'
 );
 CREATE INDEX IF NOT EXISTS objective_cycles_idx ON objective_cycles(objective_id, cycle_no);
@@ -928,10 +930,32 @@ CREATE TABLE IF NOT EXISTS objective_cycles (
   gated         INTEGER NOT NULL DEFAULT 0,
   gate_anchor   TEXT,
   tokens_spent  INTEGER NOT NULL DEFAULT 0,
+  planner_loop_id TEXT,
+  planner_task_id INTEGER,
   outcome       TEXT NOT NULL DEFAULT 'noop'
 );
 CREATE INDEX IF NOT EXISTS objective_cycles_idx ON objective_cycles(objective_id, cycle_no);
 MIG
+  fi
+
+  # DIVE-1737 — async self-heal materialize: additive planner-handle columns on
+  # already-created objective_cycles tables. When a planner loop times out past
+  # OBJ_PLANNER_WAIT_DEFAULT, replan records an 'awaiting_planner' cycle stamped
+  # with the backing loop + task id so the heartbeat reconciler can pull the late
+  # diff and materialize it (instead of the diff being orphaned). Pure expand:
+  # NULL backfill, gated on pragma so it's a no-op once present.
+  if [[ "$has_obj_cycles" == "1" ]]; then
+    local oc_cols
+    oc_cols=$(sqlite3 -cmd ".timeout 5000" "$TASKS_DB" \
+              "SELECT name FROM pragma_table_info('objective_cycles');" 2>/dev/null)
+    if ! printf '%s\n' "$oc_cols" | grep -qx "planner_loop_id"; then
+      sqlite3 -cmd ".timeout 5000" "$TASKS_DB" \
+        "ALTER TABLE objective_cycles ADD COLUMN planner_loop_id TEXT;" >/dev/null 2>&1 || true
+    fi
+    if ! printf '%s\n' "$oc_cols" | grep -qx "planner_task_id"; then
+      sqlite3 -cmd ".timeout 5000" "$TASKS_DB" \
+        "ALTER TABLE objective_cycles ADD COLUMN planner_task_id INTEGER;" >/dev/null 2>&1 || true
+    fi
   fi
 
   # OSS-27 tasks.originated index for migrated stores (the columns backfill via the
