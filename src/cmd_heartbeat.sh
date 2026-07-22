@@ -1651,6 +1651,70 @@ _hb_poller_liveness_sweep() {
   return 0
 }
 
+# DIVE-1737: async self-heal materialize sweep. An objective planner loop that
+# times out past OBJ_PLANNER_WAIT_DEFAULT records an 'awaiting_planner' cycle
+# stamped with the backing loop/task ids (see cmd_objective.sh) instead of the
+# old hard E_TIMEOUT that orphaned the late diff. This sweep pulls the diff once
+# the planner task completes and re-drives the EXISTING `objective replan --diff`
+# path (validate → gate/materialize), so a slow planner materializes on the next
+# tick instead of never. Single-threaded (the tick is one host-cron process), so
+# no claim-lock is needed; isolated by the caller (|| _hb_log) like every sweep.
+_hb_objective_reconcile() {
+  local rows; rows=$(db "SELECT oc.id||'|'||oc.objective_id||'|'||oc.cycle_no||'|'||COALESCE(oc.planner_task_id,'')||'|'||COALESCE(oc.planner_loop_id,'')||'|'||o.name||'|'||COALESCE(o.planner,'')
+                         FROM objective_cycles oc JOIN objectives o ON o.id=oc.objective_id
+                         WHERE oc.outcome='awaiting_planner';" 2>/dev/null)
+  [[ -n "$rows" ]] || return 0
+  local line
+  while IFS='|' read -r row_id obj_id cyc tid lid oname planner; do
+    [[ -n "$row_id" ]] || continue
+    # No backing task id recorded — can't reconcile; surface as failed once.
+    if [[ -z "$tid" || ! "$tid" =~ ^[0-9]+$ ]]; then
+      db "UPDATE objective_cycles SET outcome='planner_failed' WHERE id=${row_id};"
+      _hb_log "[obj-reconcile] ${oname} #${cyc}: no backing task id — marked planner_failed"
+      continue
+    fi
+    local tstatus; tstatus=$(db "SELECT status FROM tasks WHERE id=${tid};")
+    case "$tstatus" in
+      "")  # backing task vanished (purged/board-wipe) — surface, don't loop forever
+        db "UPDATE objective_cycles SET outcome='planner_failed' WHERE id=${row_id};"
+        _hb_log "[obj-reconcile] ${oname} #${cyc}: backing planner task ${tid} gone — planner_failed"
+        ;;
+      done)
+        local result; result=$(db "SELECT COALESCE(result,'') FROM tasks WHERE id=${tid};")
+        # The late close must be a diff JSON object. If it's prose (a human ACK
+        # salvage) or empty, don't guess — mark failed and let the stall/gate
+        # surfacing pick it up for manual `replan --diff`.
+        if ! printf '%s' "$result" | jq -e 'type=="object"' >/dev/null 2>&1; then
+          db "UPDATE objective_cycles SET outcome='planner_failed' WHERE id=${row_id};"
+          _hb_log "[obj-reconcile] ${oname} #${cyc}: planner task ${tid} closed non-diff (prose/empty) — planner_failed (salvage: replan --diff)"
+          local coord; coord=$(_task_resolve_coordinator 2>/dev/null)
+          [[ -n "$coord" ]] && ( cmd_send "$coord" --message="⚠️ objective '${oname}' cycle ${cyc}: planner loop ${lid:-?} finished but its close-result isn't a diff — no auto-materialize. Salvage: 5dive objective replan \"${oname}\" --diff='<json from task ${tid}>' (DIVE-1737 reconciler)." ) >/dev/null 2>&1 || true
+          continue
+        fi
+        # Parseable diff: drop the marker so `replan --diff` reuses cycle ${cyc}
+        # (MAX(cycle_no) falls back to ${cyc}-1), then re-drive the existing path.
+        db "DELETE FROM objective_cycles WHERE id=${row_id};"
+        local from_arg="$planner"; [[ -n "$from_arg" ]] || from_arg=$(_task_resolve_coordinator 2>/dev/null)
+        if ( JSON_MODE=0 cmd_objective_replan "$oname" --diff="$result" ${from_arg:+--from="$from_arg"} ) >/dev/null 2>&1; then
+          _hb_log "[obj-reconcile] ${oname} #${cyc}: materialized late planner diff (loop ${lid:-?}, task ${tid})"
+        else
+          # Diff parsed but failed deeper validation/gating — re-record so the
+          # cycle isn't silently lost, and surface for a human.
+          _objective_record_cycle "$obj_id" "$cyc" "" 0 0 0 0 0 "" 0 "planner_failed"
+          _hb_log "[obj-reconcile] ${oname} #${cyc}: late diff failed validate/apply — planner_failed"
+        fi
+        ;;
+      cancelled|rejected|escalated)
+        db "UPDATE objective_cycles SET outcome='planner_failed' WHERE id=${row_id};"
+        _hb_log "[obj-reconcile] ${oname} #${cyc}: planner task ${tid} ${tstatus} — planner_failed"
+        ;;
+      *)  # todo/in_progress/blocked — planner still working; leave it pending
+        : ;;
+    esac
+  done <<< "$rows"
+  return 0
+}
+
 cmd_heartbeat_tick() {
   require_root "heartbeat tick"
   tasks_db_init
@@ -1702,6 +1766,11 @@ cmd_heartbeat_tick() {
   # Telegram poller died (stale beacon => gate-ping taps won't land). Same
   # isolation contract — a failure here must never abort the wake loop.
   _hb_poller_liveness_sweep || _hb_log "[poller-liveness] pass errored (non-fatal)"
+  # DIVE-1737: async self-heal materialize — pull a late objective-planner diff
+  # (recorded 'awaiting_planner' when its loop timed out past the wait window) and
+  # re-drive the existing `objective replan --diff` path. Same isolation contract
+  # — a failure here must never abort the wake loop.
+  _hb_objective_reconcile || _hb_log "[obj-reconcile] pass errored (non-fatal)"
   # Accounts already woken during THIS tick. The $reg snapshot is read once up
   # front, so a wake we do mid-loop isn't visible to later iterations via the
   # registry — this map carries that within-tick fact so two same-account agents

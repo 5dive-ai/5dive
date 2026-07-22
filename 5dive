@@ -26,7 +26,7 @@ esac
 
 # Bumped on every public release. `build.sh` checks this line exists; CI fails
 # the bundle-drift check if it's missing or empty.
-readonly FIVE_VERSION="0.13.9"
+readonly FIVE_VERSION="0.13.10"
 
 # GitHub org our repos live under. The org is being renamed
 # 5dive-com -> 5dive-ai (2026-06); fetches must work on either side of the
@@ -3292,6 +3292,8 @@ CREATE TABLE IF NOT EXISTS objective_cycles (
   gated         INTEGER NOT NULL DEFAULT 0,
   gate_anchor   TEXT,
   tokens_spent  INTEGER NOT NULL DEFAULT 0,
+  planner_loop_id TEXT,
+  planner_task_id INTEGER,
   outcome       TEXT NOT NULL DEFAULT 'noop'
 );
 CREATE INDEX IF NOT EXISTS objective_cycles_idx ON objective_cycles(objective_id, cycle_no);
@@ -3712,10 +3714,32 @@ CREATE TABLE IF NOT EXISTS objective_cycles (
   gated         INTEGER NOT NULL DEFAULT 0,
   gate_anchor   TEXT,
   tokens_spent  INTEGER NOT NULL DEFAULT 0,
+  planner_loop_id TEXT,
+  planner_task_id INTEGER,
   outcome       TEXT NOT NULL DEFAULT 'noop'
 );
 CREATE INDEX IF NOT EXISTS objective_cycles_idx ON objective_cycles(objective_id, cycle_no);
 MIG
+  fi
+
+  # DIVE-1737 — async self-heal materialize: additive planner-handle columns on
+  # already-created objective_cycles tables. When a planner loop times out past
+  # OBJ_PLANNER_WAIT_DEFAULT, replan records an 'awaiting_planner' cycle stamped
+  # with the backing loop + task id so the heartbeat reconciler can pull the late
+  # diff and materialize it (instead of the diff being orphaned). Pure expand:
+  # NULL backfill, gated on pragma so it's a no-op once present.
+  if [[ "$has_obj_cycles" == "1" ]]; then
+    local oc_cols
+    oc_cols=$(sqlite3 -cmd ".timeout 5000" "$TASKS_DB" \
+              "SELECT name FROM pragma_table_info('objective_cycles');" 2>/dev/null)
+    if ! printf '%s\n' "$oc_cols" | grep -qx "planner_loop_id"; then
+      sqlite3 -cmd ".timeout 5000" "$TASKS_DB" \
+        "ALTER TABLE objective_cycles ADD COLUMN planner_loop_id TEXT;" >/dev/null 2>&1 || true
+    fi
+    if ! printf '%s\n' "$oc_cols" | grep -qx "planner_task_id"; then
+      sqlite3 -cmd ".timeout 5000" "$TASKS_DB" \
+        "ALTER TABLE objective_cycles ADD COLUMN planner_task_id INTEGER;" >/dev/null 2>&1 || true
+    fi
   fi
 
   # OSS-27 tasks.originated index for migrated stores (the columns backfill via the
@@ -22086,11 +22110,14 @@ _objective_ensure_project() {
 }
 
 # Append one objective_cycles audit row.
-# _objective_record_cycle <obj_id> <cycle_no> <reading> <proposed> <applied> <reprioritized> <cancelled> <gated> <gate_anchor> <tokens> <outcome>
+# _objective_record_cycle <obj_id> <cycle_no> <reading> <proposed> <applied> <reprioritized> <cancelled> <gated> <gate_anchor> <tokens> <outcome> [planner_loop_id] [planner_task_id]
+# DIVE-1737: the trailing planner_loop_id/planner_task_id are OPTIONAL — set only
+# on an 'awaiting_planner' row so the heartbeat reconciler can find the backing
+# loop/task; every other outcome passes 11 args and stores NULL for both.
 _objective_record_cycle() {
   db "INSERT INTO objective_cycles
-        (objective_id, cycle_no, reading_value, proposed, applied, reprioritized, cancelled, gated, gate_anchor, tokens_spent, outcome)
-      VALUES (${1}, ${2}, $(sqlq_or_null "$3"), ${4}, ${5}, ${6}, ${7}, ${8}, $(sqlq_or_null "$9"), ${10}, $(sqlq "${11}"));"
+        (objective_id, cycle_no, reading_value, proposed, applied, reprioritized, cancelled, gated, gate_anchor, tokens_spent, outcome, planner_loop_id, planner_task_id)
+      VALUES (${1}, ${2}, $(sqlq_or_null "$3"), ${4}, ${5}, ${6}, ${7}, ${8}, $(sqlq_or_null "$9"), ${10}, $(sqlq "${11}"), $(sqlq_or_null "${12:-}"), $(sqlq_or_null "${13:-}"));"
 }
 
 # ---- diff validation (creates via goal guardrails; reprioritize/cancel own-only) ----
@@ -22131,7 +22158,15 @@ _objective_validate_diff() {
 }
 
 # ---- planner invocation (loop spawn --wait --schema; captures tokensSpent) ----
-OBJ_PLANNER_TOKENS=0
+# DIVE-1737: on a non-'done' loop (timeout/escalated past the wait window) this no
+# longer hard-fails. The backing planner task SURVIVES and typically completes
+# minutes-to-an-hour later (the real planner run far outlasts OBJ_PLANNER_WAIT_DEFAULT);
+# we expose loopId/taskId/status so the caller records an 'awaiting_planner' cycle
+# and the heartbeat reconciler pulls the late diff → the existing --diff path.
+# Results land in globals (NOT stdout) so the caller must NOT wrap this in a
+# command substitution — $(...) would run it in a subshell and the loop/task/
+# status stamps (needed to record the awaiting_planner cycle) would be lost.
+OBJ_PLANNER_TOKENS=0 OBJ_PLANNER_LOOP_ID="" OBJ_PLANNER_TASK_ID="" OBJ_PLANNER_STATUS="" OBJ_PLANNER_DIFF=""
 _objective_invoke_planner() {
   local contract="$1" planner="$2" ceiling="$3" wait_secs="$4"
   local schema; schema=$(_objective_diff_schema)
@@ -22142,9 +22177,15 @@ _objective_invoke_planner() {
   status=$(printf '%s' "$spawn_json" | jq -r '.data.status // ""')
   result=$(printf '%s' "$spawn_json" | jq -r '.data.result // ""')
   OBJ_PLANNER_TOKENS=$(printf '%s' "$spawn_json" | jq -r '.data.tokensSpent // 0')
-  [[ "$status" == "done" ]] || fail "$E_TIMEOUT" "planner did not return a diff (loop $status) — inspect: 5dive task loops"
+  OBJ_PLANNER_LOOP_ID=$(printf '%s' "$spawn_json" | jq -r '.data.loopId // ""')
+  OBJ_PLANNER_TASK_ID=$(printf '%s' "$spawn_json" | jq -r '.data.taskId // ""')
+  OBJ_PLANNER_STATUS="$status"
+  OBJ_PLANNER_DIFF=""
+  # Not done => planner still working; leave the diff empty and let the caller
+  # hand off to the reconciler. Only a done-but-empty result is a genuine error.
+  [[ "$status" == "done" ]] || return 0
   [[ -n "$result" ]] || fail "$E_GENERIC" "planner returned an empty diff"
-  printf '%s' "$result"
+  OBJ_PLANNER_DIFF="$result"
 }
 
 # ---- injected-context contract ----
@@ -22408,7 +22449,22 @@ cmd_objective_replan() {
     [[ -n "$planner" ]] || fail "$E_VALIDATION" "no --planner, objective planner, or org coordinator to plan with"
     local contract; contract=$(_objective_build_contract "$oname" "$obj_id" "$cur" "$prev" "$trend" "$o_target" "$o_dir" "$o_unit" "$max_new")
     step "objective '$oname' cycle ${cycle_no}: invoking planner '$planner' (ceiling ${ceiling}tok)…"
-    diff=$(_objective_invoke_planner "$contract" "$planner" "$ceiling" "$wait_secs") || return $?
+    # NB: NOT $(...) — invoke_planner returns via globals (OBJ_PLANNER_DIFF +
+    # the loop/task/status stamps); a subshell would drop the stamps we need to
+    # record the awaiting_planner cycle.
+    _objective_invoke_planner "$contract" "$planner" "$ceiling" "$wait_secs" || return $?
+    diff="$OBJ_PLANNER_DIFF"
+
+    # DIVE-1737: planner loop timed out past the wait window but its backing task
+    # SURVIVES and will finish later. Record an 'awaiting_planner' cycle stamped
+    # with the loop/task ids and hand off — the heartbeat reconciler pulls the
+    # late diff and re-drives THIS same command via --diff. This replaces the old
+    # hard E_TIMEOUT that dropped the cycle (and orphaned the diff) on the floor.
+    if [[ "$OBJ_PLANNER_STATUS" != "done" ]]; then
+      _objective_record_cycle "$obj_id" "$cycle_no" "$cur" 0 0 0 0 0 "" "$OBJ_PLANNER_TOKENS" "awaiting_planner" "$OBJ_PLANNER_LOOP_ID" "$OBJ_PLANNER_TASK_ID"
+      _objective_terminal_out "$oname" "$cycle_no" "awaiting_planner" "planner loop ${OBJ_PLANNER_LOOP_ID:-?} still running past ${wait_secs}s (backing task ${OBJ_PLANNER_TASK_ID:-?}); the heartbeat reconciler will materialize its diff on completion — nothing dropped"
+      return
+    fi
   fi
 
   diff=$(_objective_normalize_diff "$diff")   # DIVE-1551: id->local_id tolerance
@@ -31251,6 +31307,70 @@ _hb_poller_liveness_sweep() {
   return 0
 }
 
+# DIVE-1737: async self-heal materialize sweep. An objective planner loop that
+# times out past OBJ_PLANNER_WAIT_DEFAULT records an 'awaiting_planner' cycle
+# stamped with the backing loop/task ids (see cmd_objective.sh) instead of the
+# old hard E_TIMEOUT that orphaned the late diff. This sweep pulls the diff once
+# the planner task completes and re-drives the EXISTING `objective replan --diff`
+# path (validate → gate/materialize), so a slow planner materializes on the next
+# tick instead of never. Single-threaded (the tick is one host-cron process), so
+# no claim-lock is needed; isolated by the caller (|| _hb_log) like every sweep.
+_hb_objective_reconcile() {
+  local rows; rows=$(db "SELECT oc.id||'|'||oc.objective_id||'|'||oc.cycle_no||'|'||COALESCE(oc.planner_task_id,'')||'|'||COALESCE(oc.planner_loop_id,'')||'|'||o.name||'|'||COALESCE(o.planner,'')
+                         FROM objective_cycles oc JOIN objectives o ON o.id=oc.objective_id
+                         WHERE oc.outcome='awaiting_planner';" 2>/dev/null)
+  [[ -n "$rows" ]] || return 0
+  local line
+  while IFS='|' read -r row_id obj_id cyc tid lid oname planner; do
+    [[ -n "$row_id" ]] || continue
+    # No backing task id recorded — can't reconcile; surface as failed once.
+    if [[ -z "$tid" || ! "$tid" =~ ^[0-9]+$ ]]; then
+      db "UPDATE objective_cycles SET outcome='planner_failed' WHERE id=${row_id};"
+      _hb_log "[obj-reconcile] ${oname} #${cyc}: no backing task id — marked planner_failed"
+      continue
+    fi
+    local tstatus; tstatus=$(db "SELECT status FROM tasks WHERE id=${tid};")
+    case "$tstatus" in
+      "")  # backing task vanished (purged/board-wipe) — surface, don't loop forever
+        db "UPDATE objective_cycles SET outcome='planner_failed' WHERE id=${row_id};"
+        _hb_log "[obj-reconcile] ${oname} #${cyc}: backing planner task ${tid} gone — planner_failed"
+        ;;
+      done)
+        local result; result=$(db "SELECT COALESCE(result,'') FROM tasks WHERE id=${tid};")
+        # The late close must be a diff JSON object. If it's prose (a human ACK
+        # salvage) or empty, don't guess — mark failed and let the stall/gate
+        # surfacing pick it up for manual `replan --diff`.
+        if ! printf '%s' "$result" | jq -e 'type=="object"' >/dev/null 2>&1; then
+          db "UPDATE objective_cycles SET outcome='planner_failed' WHERE id=${row_id};"
+          _hb_log "[obj-reconcile] ${oname} #${cyc}: planner task ${tid} closed non-diff (prose/empty) — planner_failed (salvage: replan --diff)"
+          local coord; coord=$(_task_resolve_coordinator 2>/dev/null)
+          [[ -n "$coord" ]] && ( cmd_send "$coord" --message="⚠️ objective '${oname}' cycle ${cyc}: planner loop ${lid:-?} finished but its close-result isn't a diff — no auto-materialize. Salvage: 5dive objective replan \"${oname}\" --diff='<json from task ${tid}>' (DIVE-1737 reconciler)." ) >/dev/null 2>&1 || true
+          continue
+        fi
+        # Parseable diff: drop the marker so `replan --diff` reuses cycle ${cyc}
+        # (MAX(cycle_no) falls back to ${cyc}-1), then re-drive the existing path.
+        db "DELETE FROM objective_cycles WHERE id=${row_id};"
+        local from_arg="$planner"; [[ -n "$from_arg" ]] || from_arg=$(_task_resolve_coordinator 2>/dev/null)
+        if ( JSON_MODE=0 cmd_objective_replan "$oname" --diff="$result" ${from_arg:+--from="$from_arg"} ) >/dev/null 2>&1; then
+          _hb_log "[obj-reconcile] ${oname} #${cyc}: materialized late planner diff (loop ${lid:-?}, task ${tid})"
+        else
+          # Diff parsed but failed deeper validation/gating — re-record so the
+          # cycle isn't silently lost, and surface for a human.
+          _objective_record_cycle "$obj_id" "$cyc" "" 0 0 0 0 0 "" 0 "planner_failed"
+          _hb_log "[obj-reconcile] ${oname} #${cyc}: late diff failed validate/apply — planner_failed"
+        fi
+        ;;
+      cancelled|rejected|escalated)
+        db "UPDATE objective_cycles SET outcome='planner_failed' WHERE id=${row_id};"
+        _hb_log "[obj-reconcile] ${oname} #${cyc}: planner task ${tid} ${tstatus} — planner_failed"
+        ;;
+      *)  # todo/in_progress/blocked — planner still working; leave it pending
+        : ;;
+    esac
+  done <<< "$rows"
+  return 0
+}
+
 cmd_heartbeat_tick() {
   require_root "heartbeat tick"
   tasks_db_init
@@ -31302,6 +31422,11 @@ cmd_heartbeat_tick() {
   # Telegram poller died (stale beacon => gate-ping taps won't land). Same
   # isolation contract — a failure here must never abort the wake loop.
   _hb_poller_liveness_sweep || _hb_log "[poller-liveness] pass errored (non-fatal)"
+  # DIVE-1737: async self-heal materialize — pull a late objective-planner diff
+  # (recorded 'awaiting_planner' when its loop timed out past the wait window) and
+  # re-drive the existing `objective replan --diff` path. Same isolation contract
+  # — a failure here must never abort the wake loop.
+  _hb_objective_reconcile || _hb_log "[obj-reconcile] pass errored (non-fatal)"
   # Accounts already woken during THIS tick. The $reg snapshot is read once up
   # front, so a wake we do mid-loop isn't visible to later iterations via the
   # registry — this map carries that within-tick fact so two same-account agents
