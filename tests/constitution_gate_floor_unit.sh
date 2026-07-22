@@ -14,6 +14,18 @@ TMP="$(mktemp -d /tmp/constitution-floor.XXXXXX)"
 trap 'rm -rf "$TMP"' EXIT
 STATE_DIR="$TMP"
 export FIVEDIVE_CONSTITUTION_FILE="$TMP/constitution.yaml"
+# DIVE-1752: hermetic council seal. cmd_council.sh (sourced above) sets
+# COUNCIL_LINEAGE="${STATE_DIR}/council/lineage.jsonl" from the SHIPPED default
+# STATE_DIR (/var/lib/5dive) at source time, and re-assigns it on every source —
+# so it froze to the BOX lineage before line 15 could redirect STATE_DIR, and an
+# inherited/env COUNCIL_DIR gets clobbered too (why external isolation looked
+# ineffective). On a box that HAS a real sealed council (agent-host / prod), the
+# pre-seal cases below then read that real seal, the DIVE-1695 drift check falsely
+# fires, and the loaded policy is discarded — failing "brand-present ..." + the
+# ERE-invalid warning locally while CI (no seal) stays green. Point the lineage at
+# the isolated $TMP *after* the source so "no seal" holds on every environment;
+# the sealed-path section below writes its fixtures to this same path.
+export COUNCIL_LINEAGE="$TMP/lineage.jsonl"
 PASS=0; FAIL=0
 ok_t() { PASS=$((PASS+1)); printf 'ok   - %s\n' "$1"; }
 bad_t() { FAIL=$((FAIL+1)); printf 'FAIL - %s\n' "$1"; }
