@@ -17,6 +17,9 @@ Maintenance:
                                                      # (alias: 5dive update). On-demand upgrade for
                                                      # self-hosted boxes; managed boxes update nightly.
   5dive update --check                               # read-only: is the CLI behind/stale? (no root)
+  5dive update --auto                                # opt-in: enroll daily auto-update (self-hosted; --no-auto to stop)
+                                                     # auto-apply is OFF by default — fresh boxes only get a new-version
+                                                     # notice. --no-notice silences that notice.
   5dive uninstall [--purge] [--yes]                  # remove 5dive (--purge also wipes state + user)
 
 Live view:
@@ -766,19 +769,23 @@ main() {
     self-update|self_update|update)
       # `--check` is a read-only version probe (no root, no mutation): compares
       # the installed CLI to the published release so the dashboard maintenance
-      # tile can show a "your CLI is behind — update now" prompt. Everything
-      # else in this branch mutates the box, so it stays root-gated.
-      if [[ "${1:-}" == "--check" ]]; then
-        shift
-        cmd_update_check "$@"
-      else
-        # On-demand "update everything + reload" for OSS self-hosters with no
-        # scheduler: runs install.sh --upgrade (CLI + plugins) then restarts
-        # running agents so the changes load. Mirrors the managed nightly.
-        [[ $EUID -eq 0 ]] || fail "$E_PERMISSION" "self-update must run as root (sudo 5dive self-update)"
-        AUDIT_CMD="self-update"; AUDIT_ARGS=("$@")
-        cmd_self_update "$@"
-      fi ;;
+      # tile can show a "your CLI is behind — update now" prompt. `--auto`/
+      # `--no-notice` (DIVE-1689) toggle the opt-in auto-APPLY cron and the
+      # passive new-version notice. Everything else mutates the box → root-gated.
+      case "${1:-}" in
+        --check)             shift; cmd_update_check "$@" ;;
+        --auto|--auto=on)    AUDIT_CMD="update-auto"; AUDIT_ARGS=(on);  cmd_update_auto on ;;
+        --auto=off|--no-auto) AUDIT_CMD="update-auto"; AUDIT_ARGS=(off); cmd_update_auto off ;;
+        --no-notice)         AUDIT_CMD="update-notice"; AUDIT_ARGS=(off); cmd_update_notice_pref off ;;
+        --notice)            AUDIT_CMD="update-notice"; AUDIT_ARGS=(on);  cmd_update_notice_pref on ;;
+        *)
+          # On-demand "update everything + reload" for OSS self-hosters with no
+          # scheduler: runs install.sh --upgrade (CLI + plugins) then restarts
+          # running agents so the changes load. Mirrors the managed nightly.
+          [[ $EUID -eq 0 ]] || fail "$E_PERMISSION" "self-update must run as root (sudo 5dive self-update)"
+          AUDIT_CMD="self-update"; AUDIT_ARGS=("$@")
+          cmd_self_update "$@" ;;
+      esac ;;
     -h|--help|help) usage ;;
     *) fail "$E_USAGE" "unknown command: $top" ;;
   esac
@@ -787,6 +794,6 @@ main() {
 # EXIT trap picks up AUDIT_CMD set by the dispatcher + real exit code and
 # appends one NDJSON line to the audit log. Installed once at script load so
 # every code path (including fail/exit) passes through it.
-trap on_exit_audit EXIT
+trap 'on_exit_audit; _update_notice' EXIT
 
 main "$@"

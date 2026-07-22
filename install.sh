@@ -727,9 +727,21 @@ echo "  5dive agent list                          # list agents"
 echo "  5dive doctor --repair                     # auto-install agent type binaries"
 echo "  5dive agent create my-agent --type=claude # create your first agent"
 echo
-echo "To upgrade later: sudo 5dive self-update"
-echo "Managed hosts already update nightly. Self-hosted opt-in (root crontab):"
-echo "  0 4 * * * /usr/local/bin/5dive self-update >> /var/log/5dive-self-update.log 2>&1"
+# DIVE-1689: colored update-model CTA. Notices are ON by default (you'll be told
+# when a new version lands); auto-APPLY is OFF until you opt in — no box mutates
+# itself unasked. Color only on a real terminal (piped `curl | bash` still has a
+# TTY on stdout).
+_c="" _b="" _d="" _r=""
+if [[ -t 1 && -z "${NO_COLOR:-}" && "${TERM:-dumb}" != "dumb" ]]; then
+  _c=$'\033[38;5;81m'; _b=$'\033[1m'; _d=$'\033[2m'; _r=$'\033[0m'
+fi
+echo
+echo "${_b}${_c}Staying up to date${_r}"
+echo "  ${_d}You'll get a one-line notice when a new version is out. Auto-apply is OFF by default.${_r}"
+echo "  ${_b}sudo 5dive self-update${_r}     update now (CLI + plugins, then reload agents)"
+echo "  ${_b}sudo 5dive update --auto${_r}   enable daily auto-update (self-hosted; ${_d}--no-auto to stop${_r})"
+echo "  ${_d}Managed hosts already update nightly. Silence notices: sudo 5dive update --no-notice${_r}"
+unset _c _b _d _r
 echo "Fallback: curl -fsSL $REPO/install.sh | sudo bash -s -- --upgrade"
 echo "Full CLI docs: https://5dive.ai/docs/5dive-cli"
 echo "Source: https://github.com/$GH_ORG/5dive"
