@@ -26,7 +26,7 @@ esac
 
 # Bumped on every public release. `build.sh` checks this line exists; CI fails
 # the bundle-drift check if it's missing or empty.
-readonly FIVE_VERSION="0.13.10"
+readonly FIVE_VERSION="0.13.11"
 
 # GitHub org our repos live under. The org is being renamed
 # 5dive-com -> 5dive-ai (2026-06); fetches must work on either side of the
@@ -18120,11 +18120,26 @@ cmd_task_need() {
   # ⇒ not downgraded (a lead may legitimately pin a human gate). `actor` is not
   # yet set here (defined further down), so resolve the filer inline.
   local _eng_ship=0
-  if [[ "$tier_floored" == "0" && ( "$type" == "decision" || "$type" == "approval" ) ]]; then
+  if [[ "$tier_floored" == "0" && ( "$type" == "decision" || "$type" == "approval" || "$type" == "manual" ) ]]; then
     local _es_title; _es_title=$(db "SELECT COALESCE(title,'') FROM tasks WHERE id=${id};")
     if _gate_eng_ship_hit "${ask} ${_es_title}"; then
       local _es_reviewer; _es_reviewer=$(_gate_route_reviewer "$(task_actor "$from")")
-      if [[ -n "$_es_reviewer" ]]; then
+      # DIVE-1738: builder ship-handoff nudge. approval/manual gates are
+      # HUMAN-ONLY (cmd_task_answer's provenance floor) UNLESS routed — they
+      # lean on routed_reviewer + the designated-reviewer exception, and manual
+      # is not even eng-ship-downgraded below, so pref-OFF a manual ship gate
+      # still pings the human. `decision` is lead-clearable by TYPE (tier-1, no
+      # human_nonce, no routing dependency), which is what a builder->lead ship/
+      # deploy handoff wants. Steer the filer to --type=decision. Fires only when
+      # a lead sits above the filer (_es_reviewer non-empty ⇒ a builder, not the
+      # lead re-escalating). Non-fatal + stderr-only: JSON stdout stays clean and
+      # routing/tiering are unchanged (the DIVE-1359 downgrade below is intact).
+      if [[ -n "$_es_reviewer" && ( "$type" == "approval" || "$type" == "manual" ) ]]; then
+        warn "this looks like an engineering ship/deploy handoff filed as --type=$type. Prefer --type=decision for a builder ship gate — it's lead-clearable by design, so $_es_reviewer can resolve it without a human ping (approval/manual are human-only unless routed to the lead)."
+      fi
+      # DIVE-1359 downgrade stays scoped to decision/approval (manual is never
+      # downgraded — the nudge above is its only treatment).
+      if [[ -n "$_es_reviewer" && ( "$type" == "decision" || "$type" == "approval" ) ]]; then
         tier=1; _eng_ship=1
       fi
     fi

@@ -313,5 +313,37 @@ id() { if [[ "${1:-}" == "-un" ]]; then echo "agent-main"; else command id "$@";
 [[ "$(db "SELECT COALESCE(need_answered_by,'') FROM tasks WHERE ident='DIVE-4';")" == lead:* ]] && ok_t "lead-clear recorded as lead:* provenance (not human:*)" || bad_t "lead:* provenance" "got '$(db "SELECT COALESCE(need_answered_by,'') FROM tasks WHERE ident='DIVE-4';")'"
 unset -f id
 
+# --- DIVE-1738: builder ship-handoff nudge to --type=decision -----------------
+# When a builder (a lead sits above them) files an eng-ship approval/manual gate
+# that did NOT trip the true-human floor, cmd_task_need emits a stderr nudge
+# steering to --type=decision (lead-clearable by type). The nudge is advisory
+# only — it never changes routing/tiering (asserted alongside). It must NOT fire
+# for: a lead's own gate, a non-eng-ship approval, or a floored (money) eng-ship.
+nudge_of() { local c; c=$(grep -c 'Prefer --type=decision' "$1" 2>/dev/null); echo "${c:-0}"; }
+# builder eng-ship approval → nudged AND still lead-routed tier-1 (behavior kept)
+seed DIVE-50; HUMAN_PINGED=0; route_reset
+cmd_task_need DIVE-50 --type=approval --ask="approve the prod push?" --from=dev >/dev/null 2>"$TMP/n50"
+[[ "$(nudge_of "$TMP/n50")" -ge 1 \
+   && "$(db "SELECT tier FROM tasks WHERE ident='DIVE-50';")" == "1" \
+   && "$(db "SELECT COALESCE(routed_reviewer,'') FROM tasks WHERE ident='DIVE-50';")" == "main" ]] \
+  && ok_t "DIVE-1738: builder eng-ship approval nudged to decision (routing unchanged)" \
+  || bad_t "DIVE-1738 approval nudge" "nudge=$(nudge_of "$TMP/n50") tier='$(db "SELECT tier FROM tasks WHERE ident='DIVE-50';")' rr='$(db "SELECT COALESCE(routed_reviewer,'') FROM tasks WHERE ident='DIVE-50';")'"
+# builder eng-ship MANUAL → nudged (manual is NOT downgraded, so this is its only treatment)
+seed DIVE-51; HUMAN_PINGED=0; route_reset
+cmd_task_need DIVE-51 --type=manual --ask="merge the dive-1738 PR and roll to the fleet?" --from=dev >/dev/null 2>"$TMP/n51"
+[[ "$(nudge_of "$TMP/n51")" -ge 1 ]] && ok_t "DIVE-1738: builder eng-ship manual is nudged to decision" || bad_t "DIVE-1738 manual nudge" "nudge=$(nudge_of "$TMP/n51")"
+# a lead's OWN eng-ship gate is NOT nudged (no reviewer above them)
+seed DIVE-52; HUMAN_PINGED=0; route_reset
+cmd_task_need DIVE-52 --type=approval --ask="approve the prod push?" --from=main >/dev/null 2>"$TMP/n52"
+[[ "$(nudge_of "$TMP/n52")" == "0" ]] && ok_t "DIVE-1738: lead's own eng-ship gate is NOT nudged" || bad_t "DIVE-1738 lead not nudged" "nudge=$(nudge_of "$TMP/n52")"
+# a plain (non-eng-ship) builder approval is NOT nudged
+seed DIVE-53; HUMAN_PINGED=0; route_reset
+cmd_task_need DIVE-53 --type=approval --ask="make the final go/no-go call on this?" --from=dev >/dev/null 2>"$TMP/n53"
+[[ "$(nudge_of "$TMP/n53")" == "0" ]] && ok_t "DIVE-1738: non-eng-ship approval is NOT nudged" || bad_t "DIVE-1738 non-eng-ship not nudged" "nudge=$(nudge_of "$TMP/n53")"
+# a floored (money) eng-ship approval is NOT nudged (floor wins → stays hard-human)
+seed DIVE-54; HUMAN_PINGED=0; route_reset
+cmd_task_need DIVE-54 --type=approval --ask="approve the deploy AND the \$900 vercel invoice?" --from=dev >/dev/null 2>"$TMP/n54"
+[[ "$(nudge_of "$TMP/n54")" == "0" && "$HUMAN_PINGED" == "1" ]] && ok_t "DIVE-1738: floored money eng-ship is NOT nudged (stays human)" || bad_t "DIVE-1738 floored not nudged" "nudge=$(nudge_of "$TMP/n54") human=$HUMAN_PINGED"
+
 echo "----"; echo "PASS=$PASS FAIL=$FAIL"
 [[ "$FAIL" == "0" ]]
