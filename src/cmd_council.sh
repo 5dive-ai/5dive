@@ -569,11 +569,20 @@ export function parseConstitutionFrontmatter(text) {
   return root
 }
 
+// Parse a fraction threshold into an exact ratio. Accepts 'a/b' (e.g. '2/3' -> 0.666…) or a
+// bare 0<x<=1 number. Exact fractions dodge the truncated-decimal footgun: 0.667 rounds up
+// (ceil(0.667*6)=5) where true 2/3 gives 4 on a 6-seat council. Returns NaN for non-fractions.
+const FRACTION_RX = /^([1-9][0-9]*)\/([1-9][0-9]*)$/
+function fractionValue(raw) {
+  const frac = String(raw).trim().match(FRACTION_RX)
+  return frac ? Number(frac[1]) / Number(frac[2]) : Number(raw)
+}
+
 function thresholdSpec(value, base, globalQuorum) {
   const out = { ...base }
   if (typeof value === 'string' || typeof value === 'number') {
     const v = String(value).trim()
-    const frac = v.match(/^([1-9][0-9]*)\/([1-9][0-9]*)$/)
+    const frac = v.match(FRACTION_RX)
     if (frac) { out.rule = 'fraction'; out.value = Number(frac[1]) / Number(frac[2]); delete out.threshold }
     else if (v === 'majority') { out.rule = 'majority'; delete out.value; delete out.threshold }
     else if (v === 'all') { out.rule = 'fraction'; out.value = 1; delete out.threshold }
@@ -589,7 +598,7 @@ function thresholdSpec(value, base, globalQuorum) {
     }
     if (value.threshold != null) { out.rule = 'flat'; out.threshold = Number(value.threshold); delete out.value }
     if (value.value != null) {
-      const n = Number(value.value)
+      const n = fractionValue(value.value)
       if (!Number.isFinite(n) || n <= 0 || n > 1) throw new Error(`invalid threshold fraction: ${value.value}`)
       out.rule = 'fraction'; out.value = n; delete out.threshold
     }
