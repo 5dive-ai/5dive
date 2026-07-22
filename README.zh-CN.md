@@ -113,7 +113,7 @@ sudo 5dive agent pair   my-agent --code=<pairing-code>
         （按智能体挂载）
 ```
 
-没有消息代理、没有协议、没有编排器。共享文件系统，共享 CLI。
+没有消息代理、没有协议、没有框架。共享文件系统，共享 CLI。
 
 ---
 

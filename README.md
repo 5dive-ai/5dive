@@ -97,7 +97,7 @@ Each agent is its own Linux user running an official agentic AI CLI session (`cl
   <img src="docs/how-it-works.png" width="560" alt="the operating system is the orchestrator: coder, writer and pm agents coordinate through the 5dive CLI (the bus) on one Linux host, identity is Linux users, supervision is systemd, logs are journald, backlog is SQLite, heartbeat is cron, isolation is unix permissions; humans decide only when needed">
 </p>
 
-No broker, no protocol, no orchestrator. Shared filesystem, shared CLI.
+No broker, no protocol, no framework. Shared filesystem, shared CLI.
 
 ---
 
