@@ -85,5 +85,43 @@ n=$(with_registry_lock _hb_mark_usage_heal dev 3000); eq_t "post-clear heal rest
 # no-heal agent reads 0 cleanly.
 at=$(_hb_usage_heal_last solo);                        eq_t "un-healed agent reads epoch 0" "$at" "0"
 
+# --- DIVE-1677 press-continue-in-place counter: mark advances, clear wipes -----
+# Prefer resuming the frozen session in place (dismiss dialog + "continue") over a
+# hard restart when a healthy peer proves headroom; the counter bounds in-place
+# attempts before we fall back to a restart.
+p=$(_hb_usage_press_count dev2);                        eq_t "no press yet reads 0" "$p" "0"
+p=$(with_registry_lock _hb_mark_usage_press dev2 1000); eq_t "1st press count = 1" "$p" "1"
+p=$(_hb_usage_press_count dev2);                        eq_t "count reads back 1" "$p" "1"
+p=$(with_registry_lock _hb_mark_usage_press dev2 2000); eq_t "2nd press count = 2" "$p" "2"
+# The press-vs-restart boundary: at _HB_USAGE_PRESS_MAX (default 2) attempts we
+# STOP pressing and fall through to the hard restart. Assert the gate the tick uses.
+(( 1 < _HB_USAGE_PRESS_MAX )) && ok_t "press #1 is below the max (keep pressing)"      || bad_t "press #1 should be below max ${_HB_USAGE_PRESS_MAX}"
+(( 2 < _HB_USAGE_PRESS_MAX )) && bad_t "press #2 should hit the max → restart, not press" || ok_t "press #2 hits the max → fall back to restart"
+# _hb_clear_active_defer (any wake/recovery) must wipe usagePress too, so a later
+# freeze starts its in-place attempts from scratch (parallel to usageHeal clear).
+_hb_clear_active_defer dev2
+p=$(_hb_usage_press_count dev2);                        eq_t "clear resets press count to 0" "$p" "0"
+p=$(with_registry_lock _hb_mark_usage_press dev2 3000); eq_t "post-clear press restarts at 1" "$p" "1"
+
+# --- DIVE-1677 _hb_press_continue delivers dismiss + resume keystrokes ----------
+# Stub the pane drivers so the test needs no tmux: record what would be sent, and
+# assert we press '1' (dismiss "Stop and wait") then type the "continue" resume.
+_SENT=""
+sudo() {  # shim: swallow `sudo -u <user> tmux ...`; capture send-keys payloads
+  local a; for a in "$@"; do :; done
+  case " $* " in
+    *" has-session "*) return 0 ;;
+    *" send-keys "*)
+      # last arg after `--` (literal text) or the keyname (Enter) is what matters
+      _SENT="${_SENT}|$*" ;;
+  esac
+  return 0
+}
+_hb_send_line() { _SENT="${_SENT}|send-line:$2"; return 0; }
+_hb_press_continue dev2 && ok_t "_hb_press_continue returns 0 on delivered keys" || bad_t "_hb_press_continue should succeed when keys deliver"
+case "$_SENT" in *"-l -- 1"*) ok_t "press-continue dismisses menu with '1'" ;; *) bad_t "press-continue must send '1' to dismiss menu" "$_SENT" ;; esac
+case "$_SENT" in *"send-line:continue"*) ok_t "press-continue resumes with 'continue'" ;; *) bad_t "press-continue must type 'continue' to resume" "$_SENT" ;; esac
+unset -f sudo _hb_send_line
+
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]

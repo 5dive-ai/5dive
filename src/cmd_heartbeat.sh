@@ -114,6 +114,14 @@ _HB_ACTIVE_DEFER_ESCALATE="${HEARTBEAT_ACTIVE_DEFER_ESCALATE:-3}"
 # account can't be churn-restarted every tick. Env-overridable.
 _HB_USAGE_HEAL_THROTTLE_MIN="${HEARTBEAT_USAGE_HEAL_THROTTLE_MIN:-25}"
 [[ "$_HB_USAGE_HEAL_THROTTLE_MIN" =~ ^[0-9]+$ ]] || _HB_USAGE_HEAL_THROTTLE_MIN=25
+# DIVE-1677 — when a healthy peer proves the account has headroom (there's no
+# real limit to reset), prefer PRESS-CONTINUE-in-place over a hard restart: the
+# stale dialog is dismissed and the SAME session resumes (no /clear, no restart
+# → conversation + context preserved). This many consecutive press-continue
+# attempts (one per tick) may fire before we give up and fall back to the v1
+# hard restart; keeps "resume in place, else restart within a couple ticks".
+_HB_USAGE_PRESS_MAX="${HEARTBEAT_USAGE_PRESS_MAX:-2}"
+[[ "$_HB_USAGE_PRESS_MAX" =~ ^[0-9]+$ ]] || _HB_USAGE_PRESS_MAX=2
 # Idle probe window. An agent whose pane is byte-identical across this gap (and
 # still shows its input prompt) is at rest; a working agent streams output or
 # animates a spinner, so its pane changes between two samples. Deliberately dumb
@@ -374,7 +382,7 @@ _hb_mark_active_defer() {
 _hb_clear_active_defer() {
   local name="$1"
   local reg; reg=$(registry_read)
-  reg=$(echo "$reg" | jq --arg n "$name" 'if .agents[$n].heartbeat then del(.agents[$n].heartbeat.activeDefer, .agents[$n].heartbeat.usageHeal) else . end')
+  reg=$(echo "$reg" | jq --arg n "$name" 'if .agents[$n].heartbeat then del(.agents[$n].heartbeat.activeDefer, .agents[$n].heartbeat.usageHeal, .agents[$n].heartbeat.usagePress) else . end')
   echo "$reg" | registry_write
 }
 
@@ -448,6 +456,55 @@ _hb_mark_usage_heal() {
 _hb_usage_heal_last() {
   local name="$1" reg; reg=$(registry_read)
   jq -r --arg n "$name" '.agents[$n].heartbeat.usageHeal.at // 0' <<<"$reg" 2>/dev/null || echo 0
+}
+
+# DIVE-1677 — record a press-continue-in-place attempt and return the running
+# count. Stored under .agents[<name>].heartbeat.usagePress = {at,n} (parallel to
+# usageHeal). `n` gates how many in-place resumes we try before falling back to a
+# hard restart; cleared by _hb_clear_active_defer once the agent escapes the
+# dialog (a resumed session is no longer rc-3 frozen), so a later freeze starts
+# fresh. Must run under with_registry_lock, like _hb_mark_usage_heal.
+_hb_mark_usage_press() {
+  local name="$1" now="$2"
+  local reg; reg=$(registry_read)
+  local n; n=$(jq -r --arg n "$name" '.agents[$n].heartbeat.usagePress.n // 0' <<<"$reg")
+  [[ "$n" =~ ^[0-9]+$ ]] || n=0; n=$(( n + 1 ))
+  reg=$(echo "$reg" | jq --arg n "$name" --argjson at "$now" --argjson c "$n" \
+    '.agents[$n].heartbeat.usagePress = {at:$at, n:$c}')
+  echo "$reg" | registry_write
+  printf '%s' "$n"
+}
+
+# DIVE-1677 — how many consecutive press-continue attempts this agent has made on
+# the current freeze (0 if none). Read before the next attempt to decide press vs
+# restart-fallback.
+_hb_usage_press_count() {
+  local name="$1" reg; reg=$(registry_read)
+  jq -r --arg n "$name" '.agents[$n].heartbeat.usagePress.n // 0' <<<"$reg" 2>/dev/null || echo 0
+}
+
+# DIVE-1677 — press CONTINUE on a stale usage-limit dialog and resume the session
+# IN PLACE (no restart, no /clear → conversation + context preserved), mirroring
+# the telegram resume-after-reset keystrokes: dismiss the "Stop and wait" menu
+# with '1'+Enter (the option that returns to the prompt without upgrading), then
+# type a bare "continue" so claude picks its interrupted work back up. Reached
+# ONLY when a healthy peer proves the pooled account has headroom — there's no
+# real limit to reset, so waking claude won't just re-hit it. Returns 0 if the
+# keystrokes were delivered, 1 if the pane was uncapturable / send failed (the
+# caller escalates to a hard restart after a couple failed ticks). Whether it
+# ACTUALLY unstuck is confirmed on the NEXT tick by re-testing _hb_usage_limit_frozen.
+_hb_press_continue() {
+  local name="$1"
+  sudo -u "agent-${name}" tmux has-session -t "agent-${name}" 2>/dev/null || return 1
+  # Dismiss the "1. Stop and wait for limit to reset" menu, same as resume-after-
+  # reset phase 1. '1' returns to the prompt without hitting "Upgrade your plan".
+  sudo -u "agent-${name}" tmux send-keys -t "agent-${name}" -l -- "1" 2>/dev/null || return 1
+  sudo -u "agent-${name}" tmux send-keys -t "agent-${name}" Enter 2>/dev/null || return 1
+  sleep 2
+  # Resume the in-place conversation with the same bare wake word resume-after-
+  # reset types; the agent's existing /goal loop picks back up (no re-nudge).
+  _hb_send_line "$name" "continue" || return 1
+  return 0
 }
 
 # DIVE-979 — dependency-aware task pick for one agent. Echoes the single DIVE row
@@ -1786,6 +1843,30 @@ cmd_heartbeat_tick() {
       if _hb_usage_limit_frozen "$name"; then
         local heal_last heal_gap headroom=1
         _hb_account_has_headroom "$name" "$acct" "$reg" && headroom=0
+        # DIVE-1677: headroom is PROVEN (a healthy peer on the pooled account), so
+        # there is no real limit to reset — prefer resuming the SAME session in
+        # place over a hard restart. Dismiss the stale dialog + type "continue"
+        # (conversation + context preserved), and only after _HB_USAGE_PRESS_MAX
+        # consecutive presses fail to unstick it (re-checked next tick via
+        # _hb_usage_limit_frozen) fall through to the v1 hard-restart path below.
+        # No headroom → skip press-continue entirely: restart-once-to-test-the-5h-
+        # window is the correct probe when the limit might be genuinely live.
+        if (( headroom == 0 )); then
+          local press_n; press_n=$(_hb_usage_press_count "$name")
+          [[ "$press_n" =~ ^[0-9]+$ ]] || press_n=0
+          if (( press_n < _HB_USAGE_PRESS_MAX )); then
+            local pn; pn=$(with_registry_lock _hb_mark_usage_press "$name" "$now")
+            if _hb_press_continue "$name"; then
+              reclaimed=$((reclaimed + 1))
+              _hb_log "[$name] usage-limit dialog frozen; account '$acct' has headroom → pressed continue to resume IN PLACE, session preserved (DIVE-1677 press #${pn}/${_HB_USAGE_PRESS_MAX})"
+            else
+              _hb_log "[$name] usage-limit dialog frozen; press-continue keystrokes FAILED to send (pane?) — retry/restart next tick (DIVE-1677 press #${pn})"
+            fi
+            sk_active=$((sk_active + 1))
+            continue
+          fi
+          _hb_log "[$name] usage-limit dialog STILL frozen after ${press_n} press-continue attempt(s) with headroom → falling back to hard restart (DIVE-1677 → DIVE-1666)"
+        fi
         heal_last=$(_hb_usage_heal_last "$name")
         [[ "$heal_last" =~ ^[0-9]+$ ]] || heal_last=0
         heal_gap=$(( (now - heal_last) / 60 ))
