@@ -1,8 +1,7 @@
 #!/usr/bin/env node
-// CNCL-6 — `5dive council` CLI entrypoint. Thin arg-parser over the deliberation
-// ENGINE (engine.mjs, written alongside this file into a temp dir by cmd_council.sh).
-// It never seals or persists directly: it emits a JSON envelope on stdout and the
-// bash layer does the root-only receipt seal (gate-proof) + registry file write.
+// CNCL-6 — `5dive council` CLI entrypoint. Thin arg-parser over the deliberation ENGINE
+// (engine.mjs). It never seals or persists directly: it emits a JSON envelope on stdout and
+// the bash layer does the root-only receipt seal (gate-proof) + registry file write.
 //
 // Contract (bash always passes --key=value form, so no positional/flag ambiguity):
 //   convene "<question>" --seats=a,b,c --mode=quick|deliberate|adversarial
@@ -34,7 +33,6 @@ const die = (msg, code = 2) => { process.stderr.write(`council: ${msg}\n`); proc
 const flagBool = (k) => { const v = flag(k); return v === true || v === '1' || v === 'true' }
 const out = (obj) => { process.stdout.write(JSON.stringify(obj) + '\n') }
 
-// ---- persisted registry ----------------------------------------------------
 // Built-ins are read-only defaults; the persisted file extends/overrides them and
 // is the only thing `bench add|rm` mutate. Resolution is fail-closed on a miss.
 const BUILTINS = { ...E.STANDING_COUNCILS, council: { ...E.DEFAULT_COUNCIL } }
@@ -60,7 +58,6 @@ function parseSeats(spec) {
   })
 }
 
-// ---- model call (A-with-seam, or deterministic mock) -----------------------
 function mockModelCall() {
   // Deterministic, network-free. Every seat approves with a canned take/vote so the
   // full convene path (takes -> votes -> chair -> tally -> veto -> receipt) exercises
@@ -79,8 +76,8 @@ function modelCallFor() {
   return E.makeAnthropicModelCall({})
 }
 
-// ---- CNCL-7 dispatch: convene -> real seated agents (default fleet path) ----
-// Each seat votes via its OWN harness over the `5dive agent ask` rail — no shared model key.
+// CNCL-7 dispatch: convene -> real seated agents (default fleet path). Each seat votes via its
+// OWN harness over the `5dive agent ask` rail — no shared model key.
 // A per-seat timeout, a non-running agent, or a reply with no COUNCIL-VOTE line all resolve to
 // an ABSTAIN (the engine records it; abstains still count toward the quorum denominator).
 function dispatchSeatVote(opts) {
@@ -108,18 +105,13 @@ function dispatchSeatVote(opts) {
     return E.parseVote(reply) || { vote: 'abstain', rationale: `${seat.id} reply had no COUNCIL-VOTE line` }
   }
 }
-// ---- CNCL-18 dispatch: NON-BLOCKING ballots via the task queue (default fleet path) --------
-// Instead of injecting the ballot into the seat's LIVE session (the blocking `agent ask` pane
-// scrape — disruptive, needs a quiet window, times mid-work seats out to abstain), we mint a
-// DEADLINE-STAMPED task into the seat's queue. The seat surfaces + works that ballot at its next
-// heartbeat boundary (a ballot is just a normal assigned task — NO heartbeat code change), casts
-// its vote by closing the task with a COUNCIL-VOTE line in the result, and the convener COLLECTS
-// by polling `task show` until the task closes with a result OR the deadline elapses. A missed
-// deadline / unreadable result / unparseable vote all resolve to an ABSTAIN (the engine records
-// it; abstains still count toward the quorum denominator). Blind-first-round is preserved: the
-// round-1 ballot body is E.seatPrompt(seat, ctx) which the engine guarantees carries no other
-// seat's take. Exec + clock are injectable (opts._exec/_now/_sleep) so the pure collection logic
-// is unit-testable offline with no real `5dive` exec and no real timers.
+// CNCL-18 dispatch: NON-BLOCKING ballots via the task queue (default fleet path). Instead of the
+// blocking `agent ask` pane-scrape (disruptive, times mid-work seats out to abstain), we mint a
+// DEADLINE-STAMPED task into the seat's queue; the seat casts its vote by closing the task with a
+// COUNCIL-VOTE line, and the convener COLLECTS by polling until it closes or the deadline elapses.
+// A missed deadline / unreadable result / unparseable vote all resolve to an ABSTAIN. Blind-first-
+// round is preserved: the ballot body is E.seatPrompt(seat, ctx), which never carries another
+// seat's take. Exec + clock are injectable so the collection logic is unit-testable offline.
 export function dispatchBallotVote(opts = {}) {
   const bin = process.env.COUNCIL_5DIVE_BIN || '5dive'
   const from = opts.from || 'council'
@@ -244,13 +236,10 @@ function defaultEmitBallot() {
     return { delivered: false, reason: 'no CLI inline-keyboard rail; plugin (DIVE-1566) renders buttons' }
   }
 }
-// ==================== DIVE-1565: human ballot TAP -> task-close BRIDGE ====================
-// The alternate ACTUATOR for a human seat's vote. A Telegram Approve/Reject/Abstain tap (routed by
-// the DIVE-1566 plugin from the `cvote:<ref>:<code>:<nonce>` callback_data DIVE-1564 minted) lands
-// here and CLOSES the SAME CNCL-18 ballot task the convener already polls — it is NOT a second write
-// path (DIVE-1548 design cut A). The convener never learns whether an agent heartbeat or a human tap
-// wrote the COUNCIL-VOTE line, so there is no new collection/quorum/abstain semantics to reconcile.
-// Fail-closed on EVERY ambiguity, and the raw nonce is NEVER logged.
+// DIVE-1565: human ballot TAP -> task-close BRIDGE. The alternate ACTUATOR for a human seat's vote.
+// A Telegram tap (routed by the DIVE-1566 plugin from the `cvote:<ref>:<code>:<nonce>` callback_data
+// DIVE-1564 minted) CLOSES the SAME CNCL-18 ballot task the convener already polls — NOT a second
+// write path (DIVE-1548 design cut A). Fail-closed on EVERY ambiguity; the raw nonce is NEVER logged.
 //
 //   ref   — the ballot task-id PREFIX from callback_data (DIVE-1564 mints `cvote:<taskId[:12]>:…`).
 //           Prefix-ACCEPTED to a UNIQUE OPEN council human-ballot task; 0 matches = miss, >1 =
@@ -387,7 +376,6 @@ function preflightSeats(seats) {
   }
 }
 
-// ---- subcommands -----------------------------------------------------------
 function cmdConstitution() {
   const p = flag('path')
   const path = p === true || p == null ? '' : String(p)
@@ -576,14 +564,10 @@ function cmdBench() {
   die(`unknown bench action: ${action} (ls|show|add|rm)`)
 }
 
-// ---- CNCL-23: scheduled convenes as a product ------------------------------
-// `council schedule add|ls|show|rm|render` — the CONFIG layer for recurring convenes.
-// A schedule binds a NAMED convene template (question + bench + mode + class + action
-// cap + ballot deadline + optional context command) to a cron expression. cli owns the
-// pure, testable pieces — CRUD on the schedules.json store (a plain {name: entry} map,
-// resolved fail-closed on a miss) and rendering the question template ({{date}}/{{context}}
-// placeholders). bash owns the two side effects cli can't: installing/removing the crontab
-// line (riding the existing cron rail, NO daemon) and the deterministic `run` runner.
+// CNCL-23: scheduled convenes as a product. `council schedule add|ls|show|rm|render` — the
+// CONFIG layer for recurring convenes, binding a NAMED template to a cron expression. cli owns
+// the pure pieces (CRUD on schedules.json, fail-closed on a miss; rendering {{date}}/{{context}}
+// placeholders); bash owns the crontab install/remove + the deterministic `run` runner.
 const CRON_FIELD = /^(\*|\d+(-\d+)?)(\/\d+)?(,(\*|\d+(-\d+)?)(\/\d+)?)*$/
 function validCron(expr) {
   const parts = String(expr || '').trim().split(/\s+/)
@@ -661,13 +645,11 @@ function cmdSchedule() {
   die(`unknown schedule action: ${action} (add|ls|show|rm|render)`)
 }
 
-// ---- CNCL-8: council init (human-seeded genesis roster) --------------------
-// Seeds the primary `council` bench ONCE from a human-supplied roster + veto principal.
-// bash owns the sudo gate, the veto-principal resolution (--veto-resolved), the ROOT seal of
-// the canonical bytes, and the hash-chained lineage write. cli owns: validate the roster,
-// enforce one-time (fail-closed unless --force), seed the registry, and emit the record +
-// canonical bytes for bash to seal. An agent can never call this to bootstrap its own council
-// because the write path (COUNCIL_DIR) is root-owned — bash refuses a non-sudo init.
+// CNCL-8: council init (human-seeded genesis roster). Seeds the primary `council` bench ONCE from
+// a human-supplied roster + veto principal. bash owns the sudo gate, veto-principal resolution,
+// the ROOT seal, and the hash-chained lineage write. cli validates the roster, enforces one-time
+// (fail-closed unless --force), and emits the record for bash to seal — an agent can never call
+// this to bootstrap its own council because the write path (COUNCIL_DIR) is root-owned.
 function cmdInit() {
   const registryPath = flag('registry')
   const genesisExists = flagBool('genesis-exists')
@@ -704,10 +686,9 @@ function cmdInit() {
   out({ genesis: rec, canonical: E.canonicalGenesis(rec), bench: 'council', seats: rec.seats.map(s => s.id), chair: rec.chair, constitutionDigest: rec.constitutionDigest })
 }
 
-// ---- CNCL-15: constitution v0 render + drift check + amend motion --------------------------
-// `constitution-render` prints the v0 5dive.md `council init` seeds when none exists (the
-// human-readable projection of the built-in defaults). bash writes it, then sha256sum's the
-// on-disk bytes for the sealed digest — one digest realm across seed/amend/verify.
+// CNCL-15: constitution v0 render + drift check + amend motion. `constitution-render` prints the
+// v0 5dive.md `council init` seeds when none exists. bash writes it, then sha256sum's the on-disk
+// bytes for the sealed digest — one digest realm across seed/amend/verify.
 function cmdConstitutionRender() { process.stdout.write(E.renderConstitutionV0()) }
 
 // `drift-check` — pure comparison of the sealed digest vs the live-file digest (both computed by
@@ -764,13 +745,12 @@ function cmdAmendApply() {
   out({ record: rec, canonical: E.canonicalMotion(rec), class: 'constitutional', constitutionDigest: digest })
 }
 
-// ---- CNCL-9: council veto exercise (authenticated tap → chained veto record) ----------------
-// Bash owns the authentication: it has already validated the tap came over the tier-2 nonce rail
-// from the recipient the veto was OFFERED to (--resolved), and it reads the sealed convene receipt
-// to supply --orig-digest + the original verdict. cli owns: reconstruct the flip, refuse a tap that
-// doesn't match the recorded offer (fail-closed), and emit the chained record + its canonical bytes
-// for bash to root-seal and hash-chain. cli NEVER trusts a --by string on its own — the resolved
-// recipient must equal the offer's resolved recipient, which only bash's nonce check can honour.
+// CNCL-9: council veto exercise (authenticated tap -> chained veto record). Bash owns the
+// authentication (tap validated over the tier-2 nonce rail from the recipient the veto was
+// OFFERED to) and supplies --orig-digest + the original verdict; cli reconstructs the flip,
+// refuses a tap that doesn't match the recorded offer (fail-closed), and emits the chained record
+// for bash to root-seal. cli NEVER trusts a --by string alone — the resolved recipient must equal
+// the offer's resolved recipient, which only bash's nonce check can honour.
 function cmdVeto() {
   const action = positionals[0] || ''
   if (action !== 'exercise') die(`unknown veto action: ${action || '(none)'} (exercise)`)
@@ -797,10 +777,9 @@ function cmdVeto() {
   out({ vetoRecord: rec, flippedVerdict: flipped, disposition: E.dispositionOf(flipped), canonical: E.canonicalVetoRecord(rec) })
 }
 
-// ---- CNCL-9 amendment: fold the veto seal-binding into the SEALED canonical ----------------
-// At seal time bash mints the nonce digest + executeAfter (post-convene) and calls this to APPEND
-// the deterministic seal-binding line to the canonical BEFORE sealing, so both are covered by the
-// HMAC. Reads the base canonical from --canonical or stdin ("-"); prints the augmented canonical.
+// CNCL-9 amendment: fold the veto seal-binding into the SEALED canonical. At seal time bash mints
+// the nonce digest + executeAfter and calls this to APPEND the deterministic seal-binding line to
+// the canonical BEFORE sealing, so both are covered by the HMAC.
 function readCanonicalArg() {
   const c = flag('canonical')
   if (c === '-' || c == null || c === true) { try { return fs.readFileSync(0, 'utf-8') } catch { die('seal-augment/read-binding needs the canonical on stdin or --canonical=<text>') } }
@@ -819,9 +798,9 @@ function cmdReadBinding() {
   out(E.parseCanonicalVetoBinding(readCanonicalArg()))
 }
 
-// ---- CNCL-12: gate-map (pure guardrail + verdict->action, no side effects) -----------------
-// The auditable heart of `council gate-clear` (T1) and `council rot-triage` (T2). Bash owns
-// every side effect (task show/answer/need/escalate + the convene). This verb ONLY decides:
+// CNCL-12: gate-map (pure guardrail + verdict->action, no side effects). The auditable heart of
+// `council gate-clear` (T1) and `council rot-triage` (T2); bash owns every side effect. This verb
+// ONLY decides:
 //   phase 1 (no --verdict): run the escalate-only guardrail on the gate; emit whether it is
 //           council-decidable + the deliberation QUESTION to convene on (T1), or, for --triage,
 //           the triage question. A guardrail hit on a T1 gate emits the escalate command.
@@ -862,12 +841,12 @@ function cmdGateMap() {
   out({ phase: 'action', ...(triage ? E.triageVerdictToAction(gate, verdict) : E.verdictToAction(gate, verdict)) })
 }
 
-// ---- CNCL-10: per-seat co-signed votes ------------------------------------
-// SIGN-AT-SOURCE: a seat runs this INSIDE its own harness to sign its vote before it leaves the
-// agent. bash resolves the seat's OWN private key (0600, owner-only) and passes --key-file; cli
-// never fetches another seat's key. The convene binding (--convene + the question digest) is in
-// the signed bytes, so the signature is replay-proof. Emits the `COUNCIL-SIG:` line the seat pastes
-// after its COUNCIL-VOTE line (--emit=line, the dispatch default) or the full JSON row (--emit=json).
+// CNCL-10: per-seat co-signed votes. SIGN-AT-SOURCE: a seat runs this inside its own harness to
+// sign its vote before it leaves the agent. bash resolves the seat's OWN private key (0600,
+// owner-only) and passes --key-file; cli never fetches another seat's key. The convene binding
+// (--convene + the question digest) is in the signed bytes, so the signature is replay-proof.
+// Emits the `COUNCIL-SIG:` line the seat pastes after its COUNCIL-VOTE line (--emit=line) or the
+// full JSON row (--emit=json).
 function cmdSignVote() {
   const seat = flag('seat'); if (!seat || seat === true) die('sign-vote needs --seat=<id>')
   const vote = flag('vote'); if (!['approve', 'reject', 'escalate', 'abstain'].includes(vote)) die('sign-vote needs --vote=<approve|reject|escalate|abstain>')
@@ -909,10 +888,9 @@ function cmdVerifyVotes() {
   process.exit(res.ok ? 0 : 5)
 }
 
-// ---- CNCL-11: governance surface — roster / motion (promote|demote|expel) / verify-chain -----
-// The pure engine owns classification, recusal, the motion record + its canonical bytes, and the
-// chain check. bash owns the sudo gate, the ROOT seal (gate-proof), the persisted lineage write,
-// and reading the current roster off the sealed lineage head. cli NEVER trusts a caller class.
+// CNCL-11: governance surface — roster / motion (promote|demote|expel) / verify-chain. The pure
+// engine owns classification, recusal, the motion record, and the chain check; bash owns the sudo
+// gate, the ROOT seal, and the persisted lineage write. cli NEVER trusts a caller class.
 function readJsonFlag(name, { optional = false } = {}) {
   const v = flag(name)
   if (!v || v === true) { if (optional) return null; die(`needs --${name}=<json or @file>`) }
@@ -931,13 +909,10 @@ function motionFromFlags() {
 }
 
 // council roster — the CURRENT seats + the live pass threshold. SOURCE OF TRUTH is the ROOT-SEALED
-// lineage head: bash passes it via --seats-json/--threshold-json/--seeded-at (the latest lineage
-// record that carries a roster — genesis or a motion). Deriving the VIEW from the sealed lineage,
-// NOT the editable `council` registry bench, is what keeps `roster` from ever disagreeing with
-// `log`/the lineage about membership (DIVE-1664: the two used to be independent sources and could
-// diverge — a bench that lost its genesis marker made `roster` claim "no genesis roster" while the
-// lineage still held the sealed seats). The registry bench is only a fallback for an uninitialized
-// / ad-hoc council with no lineage yet. bash also augments with the veto principal + lineage head.
+// lineage head (bash passes it via --seats-json/--threshold-json/--seeded-at), not the editable
+// `council` registry bench — that's what keeps `roster` from ever disagreeing with `log`/the lineage
+// about membership (DIVE-1664: the two used to be independent sources and could diverge). The
+// registry bench is only a fallback for an uninitialized/ad-hoc council with no lineage yet.
 function cmdRoster() {
   const registryPath = flag('registry')
   const lineageSeats = readJsonFlag('seats-json', { optional: true })

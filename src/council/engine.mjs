@@ -1,23 +1,12 @@
-// The Council — standalone deliberation engine (CNCL-6, v0.11).
-//
-// Reimplements the four tested Workflow-harness prototypes (council/council-*.js:
-// P0 convene, P1 gate-clear, P2 loop-verifier + goal-DAG node, P3 standing benches
-// + tamper-evident receipt) as a standalone node module callable from any shell via
-// the `5dive council` CLI. Seats call the model API DIRECTLY through the injectable
-// `modelCall` adapter (A-with-seam: Anthropic Messages shape by default, {baseUrl,
-// model,apiKey} behind config so a BYO/OpenRouter key drops in later with no engine
-// rework). No Workflow harness, no `agent()` global.
-//
-// The PURE LOGIC region below (verdict->action maps + escalate-only guardrail +
-// standing registry + receipt canonicalization) is ported VERBATIM from the
-// prototypes and sliced by the bound contract test (no drift). The one behavioural
-// invariant: a council NEVER self-clears a hard-gate class (tier>=2 or a human-only
-// type) — it escalates, fail-closed on a missing tier.
+// The Council — standalone deliberation engine (CNCL-6, v0.11). Seats call the model API
+// directly via the injectable `modelCall` adapter (Anthropic Messages shape by default, a
+// {baseUrl,model,apiKey} config seam for a BYO/OpenRouter key later). No Workflow harness,
+// no `agent()` global. Invariant: a council NEVER self-clears a hard-gate class (tier>=2 or
+// a human-only type) — it escalates, fail-closed on a missing tier.
 
 import { createHash, generateKeyPairSync, sign as edSign, verify as edVerify, createPrivateKey, createPublicKey } from 'node:crypto'
 import fs from 'node:fs'
 
-// ==================== PURE LOGIC (the ported contract — auditable, offline-testable) ====================
 export const HUMAN_ONLY_TYPES = ['secret', 'approval', 'manual', 'access']
 
 // Escalate-only guardrail, shared by the gate (P1), verifier + node (P2) roles.
@@ -34,8 +23,7 @@ export const nodeGuardrail = guardrail   // P2 name
 export function shellQuote(s) { return `'${String(s).replace(/'/g, `'\\''`)}'` }
 export function tallyStr(t) { return `a${t.approve}/r${t.reject}/e${t.escalate}` }
 
-// (P1) GATE-CLEAR: council verdict -> clear the gate (task answer) | bump to a human
-// (task need --tier=2 + task escalate) WITH the one-paragraph brief. Never self-clears.
+// (P1) GATE-CLEAR: council verdict -> clear the gate, or bump to a human. Never self-clears.
 export function verdictToAction(gate, verdict) {
   if (verdict && verdict.recommendation === 'approve' && !verdict.escalated) {
     const value = gate.recommend && gate.recommend !== '-' ? gate.recommend : 'approve'
@@ -61,8 +49,7 @@ export function verdictToAction(gate, verdict) {
   }
 }
 
-// (P2a) LOOP VERIFIER: approve -> task done | reject -> task reject --feedback (stays
-// in the loop, no human) | escalate -> task need --tier=2 + task escalate.
+// (P2a) LOOP VERIFIER: approve -> done | reject -> reject --feedback (stays in the loop) | escalate -> human.
 export function verifierVerdictToAction(task, verdict) {
   const conf = verdict.confidence, tly = tallyStr(verdict.tally)
   if (verdict.recommendation === 'approve' && !verdict.escalated) {
@@ -119,10 +106,7 @@ export function nodeVerdictToDecision(node, verdict) {
 export function triageVerdictToAction(gate, verdict) {
   const brief = (verdict && (verdict.brief || verdict.dissent))
     || 'Council reviewed the stale gate; the human decision still stands and needs an answer.'
-  // Keep the gate human-only: re-file the SAME type, ALWAYS tier-2, with a sharper one-paragraph
-  // brief, then re-ping the owner. Never downgrades tier, never answers, and (CNCL-12 main-gate
-  // amendment) never downgrades a human-only type to `decision` — a stale `secret` gate must be
-  // re-briefed as type=secret, not re-opened as a free-text decision that invites a paste.
+  // Re-file the SAME type (never downgrade a human-only type to `decision` — see the module note above).
   const t = gate.type || 'decision'
   return {
     action: 'triage-rebrief',
@@ -176,11 +160,9 @@ export function resolveCouncil(name, registry = STANDING_COUNCILS) {
   return { name, description: c.description, mode: c.mode, seats: c.seats }
 }
 
-// (P3.1b) THE default Council: a self-governed standing body of role-archetype
-// voting seats, one vote each. Seat count is UNBOUNDED and the roster is MUTABLE — the
-// council promotes/demotes seats by a quorum vote (addSeat/removeSeat, gated at the CLI
-// layer by a real convene). These 5 are the STARTING membership, NOT a cap or a fixed
-// roster. `threshold` is a CONFIG value (see resolveThreshold) — nothing hardcodes 5 or 3.
+// (P3.1b) THE default Council: a self-governed standing body, one vote each. Seat count is
+// UNBOUNDED and the roster is MUTABLE (addSeat/removeSeat, gated at the CLI layer by a real
+// convene). These 5 are the STARTING membership, not a cap or a fixed roster.
 export const DEFAULT_COUNCIL = {
   name: 'council', description: 'The 5dive Council — self-governed standing body, one vote each. Seats mutable by quorum vote.',
   mode: 'deliberate', threshold: 3, thresholdRule: 'flat',
@@ -193,11 +175,9 @@ export const DEFAULT_COUNCIL = {
   ],
 }
 
-// (CNCL-16) SEAT ID vs REGISTRY AGENT. A seat `id` is a PERSONA (display + receipts). The agent
-// that `5dive agent ask` dispatches to is a REGISTRY NAME, which is not always the same string:
-// persona 'theo' is the 'marketing' agent, 'lilbro' is 'creative'. A seat MAY carry an explicit
-// `agent` (canonical, wins); otherwise this alias map resolves the known personas; otherwise the
-// id IS the registry name. Genesis/ad-hoc rosters that seed a bare persona id resolve via the map.
+// (CNCL-16) SEAT ID vs REGISTRY AGENT. A seat `id` is a PERSONA; `5dive agent ask` dispatches to
+// a REGISTRY NAME, not always the same string (persona 'theo' is the 'marketing' agent). A seat
+// MAY carry an explicit `agent` (canonical, wins); else this alias map; else the id IS the name.
 export const SEAT_AGENT_ALIAS = { theo: 'marketing', lilbro: 'creative' }
 export function resolveSeatAgent(seat) {
   if (!seat) return ''
@@ -209,13 +189,10 @@ export function resolveSeatAgent(seat) {
 
 // (DIVE-1563) HUMAN-AS-SEAT SCHEMA. A council seat MAY be a human principal rather than a registry
 // agent — marked `{ kind: 'human' }` (or `human: true`) with a chat/principal binding naming which
-// Telegram chat receives the ballot + whose allowFrom the tap is authenticated against. This is the
-// prerequisite for DIVE-1548 human-as-seat voting (design: council-human-as-seat-voting-design-dive1548):
-// dispatchBallotVote (DIVE-1564) branches on seatIsHuman to emit a Telegram ballot instead of an
-// agent-directed ask. PURELY ADDITIVE + back-compat (main steer 2026-07-20): a bare-string seat or an
-// existing {id, agent?, lens?} seat is NEVER human, needs ZERO migration, and — because canonicalGenesis/
-// canonicalMotion seal only id/chair/lens — serializes to byte-identical sealed bytes. seatIsHuman
-// defaults false when the marker is absent; resolveSeatChat only fires for a human seat.
+// Telegram chat the ballot goes to + whose allowFrom the tap is authenticated against (DIVE-1564
+// branches on seatIsHuman to emit a ballot instead of an agent-directed ask). PURELY ADDITIVE +
+// back-compat: a bare-string or existing {id, agent?, lens?} seat is NEVER human, needs zero
+// migration, and serializes byte-identical (canonicalGenesis/canonicalMotion seal only id/chair/lens).
 export function seatIsHuman(seat) {
   return !!seat && typeof seat === 'object' && (seat.kind === 'human' || seat.human === true)
 }
@@ -242,11 +219,9 @@ export function humanSeatFields(seat) {
 }
 export const DEFAULT_THRESHOLD = 3   // default flat pass-threshold; overridable per bench
 
-// (P3.1b2) TIERED THRESHOLD POLICY (lodar is steering toward this). Per decision-CLASS pass
-// rule + quorum, ALL config so the final numbers drop in once locked. A rule is 'flat' (fixed
-// N), 'majority' (floor(seats/2)+1), or 'fraction' (ceil(value*seats), e.g. 2/3). `quorum`
-// = how many of the CURRENT seats must actually vote for the result to count ('majority' by
-// default, a number, or 'none'). Nothing hardcodes 5 or 3 — this map is the single knob.
+// (P3.1b2) TIERED THRESHOLD POLICY. Per decision-CLASS pass rule + quorum, all config. A rule is
+// 'flat' (fixed N), 'majority' (floor(seats/2)+1), or 'fraction' (ceil(value*seats), e.g. 2/3).
+// `quorum` = how many CURRENT seats must vote for the result to count. This map is the single knob.
 export const THRESHOLD_POLICY = {
   ordinary:       { rule: 'majority',            quorum: 'majority' },
   promote:        { rule: 'majority',            quorum: 'majority' },
@@ -539,11 +514,9 @@ export function quorumSize(seatCount, spec = {}) {
 }
 
 // (P3.1c) DETERMINISTIC tally -> verdict. Enforces the QUORUM gate first (an inquorate vote
-// can't decide -> escalate), then passes iff approve-count reaches the class threshold. Not a
-// pass is a reject, unless escalate is the plurality (a genuine "needs a human" split). The
-// chair LLM only narrates — the PASS/FAIL is an auditable count over the current roster.
-// opts: { decisionClass, policy, seatCount, threshold, thresholdRule } — explicit
-// threshold/thresholdRule override the class policy (for ad-hoc convenes/tests).
+// can't decide -> escalate), then passes iff approve-count reaches the class threshold; not a
+// pass is a reject unless escalate is the plurality. The chair LLM only narrates — PASS/FAIL is
+// an auditable count over the current roster. opts.threshold/thresholdRule override the class policy.
 export function tallyVotes(votes, opts = {}) {
   // CNCL-11 RECUSAL: the subject of a promote/demote motion does not vote — its seat is dropped
   // from BOTH the quorum base and the threshold base, so the vote runs over the remaining seats.
@@ -584,11 +557,9 @@ export function removeSeat(seats, seatId) {
   return (seats || []).filter(x => x.id !== seatId)
 }
 
-// ============================================================================
-// CNCL-11 — GOVERNANCE SURFACE: motion classification, recusal, hash-chained
-// lineage (promote/demote/roster/log/verify). Pure engine; the CLI+bash own the
-// sudo gate, the root seal, and the persisted lineage write.
-// ============================================================================
+// CNCL-11 — GOVERNANCE SURFACE: motion classification, recusal, hash-chained lineage
+// (promote/demote/roster/log/verify). Pure engine; the CLI+bash own the sudo gate, the root
+// seal, and the persisted lineage write.
 
 // Governance PARAMETERS — a motion that changes any of these is constitutional (the hardest
 // bar: 2/3 + full quorum + founder-veto-able) and CANNOT run as an ordinary motion.
@@ -718,21 +689,14 @@ export function verifyLineageChain(entries) {
   return { ok: true, head: prev, length: list.length }
 }
 
-// (CNCL-9) AUTHENTICATED FOUNDER VETO — non-blocking OFFER model.
-//
-// The pre-CNCL-9 design flipped the verdict inline from a plain `--veto-by` CLI STRING, so any
-// agent could forge lodar's veto straight into a signed receipt. That path is gone. Now:
-//
-//   1. convene NEVER waits for a tap and NEVER flips on a string. On a pass it records a
-//      timeboxed OFFER (attachVetoOffer) naming the resolved genesis principal + window, seals
-//      immediately, and the work proceeds. Expiry with no tap = the pass stands, and the receipt
-//      already reads `veto-offered-not-exercised` (default-proceed is the do-nothing path).
-//   2. The EXERCISE is a separate, authenticated event: only a tap confirmed on the tier-2 rail
-//      by the resolved principal (bash validates the nonce->recipient binding) calls
-//      exerciseFounderVeto, which flips the pass to BLOCKED inside a fresh record that is
-//      root-sealed and hash-chained onto the convene receipt (the original bytes are never
-//      re-sealed — post-hoc-after-seal re-seal stays deferred; the chain carries the flip).
-//   3. Veto is FINAL — no council override. Hard-gate classes escalate upstream regardless.
+// (CNCL-9) AUTHENTICATED FOUNDER VETO — non-blocking OFFER model. A plain `--veto-by` CLI string
+// is forgeable (any agent could flip a verdict straight into a signed receipt), so: (1) convene
+// never waits for a tap and never flips on a string — on a pass it records a timeboxed OFFER
+// (attachVetoOffer) and seals immediately; a no-tap expiry leaves the pass standing. (2) The
+// EXERCISE is a separate authenticated event — only a tap confirmed on the tier-2 rail (bash
+// validates the nonce->recipient binding) calls exerciseFounderVeto, which flips the pass to
+// BLOCKED in a fresh record hash-chained onto the original (never re-sealed in place). (3) Veto is
+// FINAL — no council override. Hard-gate classes escalate upstream regardless.
 
 // Non-blocking: attach a timeboxed veto OFFER to a pass. Disposition stays `pass` (the work is
 // not blocked); the offer rides inside the sealed bytes so "an offer was made" is auditable.
@@ -838,7 +802,6 @@ export function canonicalVetoRecord(rec) {
   ].join('\n')
 }
 
-// The plain-English disposition of a (possibly vetoed) verdict.
 export function dispositionOf(verdict) {
   if (verdict.vetoed) return 'blocked'
   if (verdict.escalated || verdict.recommendation === 'escalate') return 'escalate'
@@ -897,21 +860,14 @@ export function canonicalTranscript(rec) {
   return L.join('\n')
 }
 
-// (CNCL-9 main-gate amendment) FOLD THE VETO SEAL-BINDING INTO THE SIGNED BYTES.
-//
-// The convene nonce digest + the executeAfter hold deadline are minted by the ROOT bash layer
-// AT SEAL TIME (the engine has no clock/CSPRNG), i.e. AFTER canonicalTranscript(rec) is produced.
-// Before this amendment they lived only on the UNSEALED receipt wrapper (`.vetoNonceDigest`,
-// `.executeAfter`), OUTSIDE `.canonical` — so the exercise-time re-seal check (which only re-signs
-// `.canonical`) did NOT cover them: an edit swapping `.vetoNonceDigest` to sha256(attacker-nonce)
-// left `.canonical` untouched, the re-seal still matched, and the attacker could exercise the veto
-// with a chosen nonce. FIX: bash appends this deterministic seal-binding LINE to the canonical
-// BEFORE sealing, so the digest + deadline are covered by the same HMAC; exercise reads them back
-// from the VERIFIED canonical (parseCanonicalVetoBinding), never from the raw wrapper. Any edit to
-// the digest or deadline now changes `.canonical` and breaks the re-seal (fail-closed, refused).
-//
-// The line is appended (never interleaved) so a base-only receipt (no veto offer) stays byte-
-// identical to CNCL-6/8. The format is a single stable line the parser round-trips exactly.
+// (CNCL-9 main-gate amendment) FOLD THE VETO SEAL-BINDING INTO THE SIGNED BYTES. The nonce digest
+// + executeAfter deadline are minted by bash AT SEAL TIME, i.e. AFTER canonicalTranscript(rec) is
+// produced — left on the unsealed wrapper, an edit to either would go undetected by the exercise-
+// time re-seal (which only re-signs `.canonical`), letting an attacker exercise the veto with a
+// chosen nonce. FIX: append this deterministic line to canonical BEFORE sealing so both are
+// covered by the same HMAC; exercise reads them back only from the VERIFIED canonical
+// (parseCanonicalVetoBinding), never the raw wrapper. Appended (never interleaved), so a base-only
+// receipt (no veto offer) stays byte-identical to CNCL-6/8.
 export function augmentCanonicalVetoBinding(canonical, binding) {
   const nd = String((binding && binding.nonceDigest) || '').replace(/\s+/g, '')
   const ea = String((binding && binding.executeAfter) || '').replace(/\s+/g, '')
@@ -944,12 +900,10 @@ export function sealCommands() {
   }
 }
 
-// ==================== CNCL-8: human-seeded GENESIS roster ====================
-// The primary council must not bootstrap its OWN membership — it is seeded ONCE by a human
-// via `council init` (sudo-gated at the bash layer). These helpers build + canonicalize the
-// genesis record; the bash layer seals it on the ROOT gate-proof rail and hash-chains it into
-// the lineage. `council` is special in exactly one way: raw bench add/rm on it is refused (CLI
-// layer) — membership changes only via promote/demote motions once the machinery lands.
+// CNCL-8: human-seeded GENESIS roster. The primary council must not bootstrap its OWN membership —
+// it is seeded ONCE by a human via `council init` (sudo-gated at the bash layer), which seals the
+// genesis record on the ROOT gate-proof rail and hash-chains it into the lineage. Raw bench add/rm
+// on `council` is refused (CLI layer) — membership changes only via promote/demote motions.
 
 // Parse a threshold SPEC string: "majority" | "all" | "3" (flat N) | "2/3" (fraction). Returns
 // a spec object consumable by resolveThreshold/quorumSize. Fails CLOSED (null) on garbage.
@@ -1048,7 +1002,6 @@ export function genesisToBench(rec) {
   }
 }
 
-// ==================== schemas (ported from P0/P2) ====================
 export const TAKE = { type: 'object', additionalProperties: false, required: ['seat', 'position', 'keyRisk'],
   properties: { seat: { type: 'string' }, position: { type: 'string' }, keyRisk: { type: 'string' } } }
 export const VOTE = { type: 'object', additionalProperties: false, required: ['seat', 'vote', 'rationale'],
@@ -1068,7 +1021,6 @@ export const NODE_VERDICT = { type: 'object', additionalProperties: false,
     choice: { type: 'string' }, tally: TALLY,
     confidence: { type: 'number' }, dissent: { type: 'string' }, escalated: { type: 'boolean' }, brief: { type: 'string' } } }
 
-// ==================== model-call adapter (A-with-seam) ====================
 // Minimal structural validation of a model's forced-tool output against a schema — enough
 // to catch a malformed object and trigger one retry (NOT a full JSON-schema validator).
 export function validateAgainstSchema(obj, schema) {
@@ -1122,15 +1074,11 @@ export function makeAnthropicModelCall(config = {}) {
   }
 }
 
-// ==================== DISPATCH (CNCL-7): convene -> real seated agents ====================
-// Fleet mode: convene DISPATCHES the question to the real seated agents (the `5dive agent ask`
-// rail); each seat votes via its OWN harness + model access — NO shared council key. The engine
-// stays pure: the CLI injects a `seatVote(seat, ctx)` adapter that shells the ask rail; tests
-// inject a deterministic mock. makeAnthropicModelCall survives only as the deferred standalone
-// seam. LIVENESS: a seat that times out / replies unparseably / throws is a recorded ABSTAIN —
-// never silently dropped from the roster, so the quorum gate can fail an inquorate convene
-// (one dead agent must not turn 3-of-5 into 3-of-4). BLIND FIRST ROUND: a round-1 prompt is a
-// pure function of (seat, question) and never embeds another seat's answer.
+// DISPATCH (CNCL-7): convene -> real seated agents. Fleet mode: convene DISPATCHES the question
+// to the real seated agents (`5dive agent ask`); each seat votes via its OWN harness + model
+// access — no shared council key. LIVENESS: a seat that times out / replies unparseably / throws
+// is a recorded ABSTAIN, never silently dropped (one dead agent must not turn 3-of-5 into 3-of-4).
+// BLIND FIRST ROUND: a round-1 prompt is a pure function of (seat, question), never another seat's answer.
 export const VOTE_TOKENS = ['approve', 'reject', 'escalate', 'abstain']
 
 // Parse a seat's free-text reply (pane-scraped by `agent ask`) into a structured vote. The seat
@@ -1151,13 +1099,10 @@ export function parseVote(reply) {
   return { vote, rationale }
 }
 
-// ==================== CNCL-17: seat TRACK RECORD (score votes vs real outcomes) ====================
-// Per-seat calibration: score each seat's past votes against the eventual REAL outcome of the
-// decided subject (the task the convene gated), surface in `council roster`, and attach to
-// promote/demote motion briefs so quorum votes run on data, not vibes. A1 (decided by lodar):
-// add a `subject` task-ident field to receipts + DERIVE the seat votes by PARSING the existing
-// sealed canonical `vote <seat>:` lines — NO new structured array in the seal, so the tamper-
-// evident format is untouched and historical receipts stay scoreable. All pure + deterministic.
+// CNCL-17: seat TRACK RECORD. Score each seat's past votes against the eventual REAL outcome of
+// the decided subject, surface in `council roster`, and feed promote/demote briefs (data, not
+// vibes). Seat votes are DERIVED by parsing the existing sealed canonical `vote <seat>:` lines —
+// no new structured array in the seal, so the tamper-evident format is untouched.
 
 // Extract a task/subject ident (e.g. DIVE-1527, CNCL-17, OSS-32) from free text — used to link a
 // HISTORICAL receipt (minted before the `subject` field) to the task whose outcome scores it.
@@ -1230,12 +1175,10 @@ export function seatTrackRecordBrief(seat, tr) {
     `${row.vindicated ? `, ${row.vindicated} vindicated dissent${row.vindicated > 1 ? 's' : ''}` : ''})`
 }
 
-// ==================== CNCL-19: council CASE LAW (precedent pre-loading + citation) ====================
-// At convene, the SEALED receipt log is searched for prior verdicts on related questions; the top
-// hits are injected into every seat ballot as PRECEDENT (history — NOT this round's takes, so the
-// blind-first-round invariant is untouched: a seat still never sees another CURRENT seat's vote
-// before casting its own). The verdict then CITES which precedents it followed or departed from, so
-// consistency across decisions is visible and departures are auditable.
+// CNCL-19: council CASE LAW. At convene, the sealed receipt log is searched for prior verdicts on
+// related questions; the top hits are injected into every seat ballot as PRECEDENT — history, NOT
+// this round's takes, so the blind-first-round invariant is untouched. The verdict then CITES which
+// precedents it followed or departed from, so consistency across decisions is auditable.
 const PRECEDENT_STOPWORDS = new Set(('the a an and or but for nor of to in on at by with from as is are was ' +
   'were be been being do does did should would could can will shall may might must not no we our us it its ' +
   'this that these those i you he she they them their there here what which who whom how why when where ' +
@@ -1391,7 +1334,6 @@ export function buildConveneVerdict(counted, narr) {
   }
 }
 
-// ==================== deliberation engine ====================
 // Narrative-only synthesis for the named council: the chair writes confidence/dissent/
 // brief but does NOT decide the recommendation (that's the deterministic tallyVotes count).
 const NARRATIVE = { type: 'object', additionalProperties: false, required: ['confidence', 'dissent', 'brief'],
@@ -1633,30 +1575,20 @@ function finish(role, input, base) {
   return out
 }
 
-// ==================== CNCL-10: per-seat Ed25519 CO-SIGNED VOTES ====================
+// CNCL-10: per-seat Ed25519 CO-SIGNED VOTES. The CNCL-6 root seal proves the convener recorded
+// these bytes, but nothing proves each seat cast its own vote — the convener could forge/edit any
+// row before sealing. CNCL-10 closes that: every seat holds its OWN Ed25519 keypair and SIGNS its
+// vote AT SOURCE, inside its own harness, before the vote leaves the agent.
 //
-// The CNCL-6 receipt root-signs the WHOLE transcript with the ROOT gate-proof key — it proves
-// the convener recorded these bytes, but NOTHING proves each seat actually cast its own vote:
-// the convener assembles the vote rows and could forge or edit any of them before the seal.
-// CNCL-10 closes that: every seat holds its OWN Ed25519 keypair and SIGNS its vote AT SOURCE
-// (inside its own harness, before the vote leaves the agent). The convener holds no other
-// seat's private key, so it can neither forge a vote nor alter one without breaking the sig.
+// REPLAY PROOF: the signed bytes bind the CONVENE ID + QUESTION DIGEST, so a signed vote from an
+// old convene fails verification in a new one; the verifier recomputes the expected preimage from
+// the CURRENT context, never trusting a vote's self-reported convene/digest.
 //
-// REPLAY PROOF: the signed bytes bind the CONVENE ID + the QUESTION DIGEST, so a seat's signed
-// "approve" from an old convene fails verification in a new one (different convene id / digest).
-// The verifier recomputes the expected preimage from the CURRENT convene context + the vote's
-// own (seat, vote, rationale, stampedAt) — it never trusts a vote's self-reported convene/digest.
-//
-// KEY LIFECYCLE (bash layer owns the on-disk side): a keypair is issued at init/promote; the
-// public key + fingerprint live in the roster; the private key is 0600, owner-only (agent-<name>,
-// NOT the shared `claude` group — that group holds every agent and would leak the key). A demote
-// REVOKES the key (fingerprint + revocation stamped in the lineage); compromise = revoke+reissue.
-// A revoked seat's vote is rejected by verifyReceiptVotes even if the signature is cryptographically
-// valid, so a demoted seat can no longer sway a convene.
-//
-// The receipt bundles the co-signed vote rows; the existing ROOT HMAC seal (canonicalTranscript)
-// sits on top unchanged. `council verify` re-checks EVERY seat signature against the roster pubkeys
-// AND revocation AND the root seal — all three must pass for a green receipt.
+// KEY LIFECYCLE: a keypair is issued at init/promote; the private key is 0600, owner-only
+// (never the shared `claude` group, which holds every agent and would leak it). A demote REVOKES
+// the key (stamped in the lineage); a revoked seat's vote is rejected even if the signature
+// verifies. `council verify` re-checks every seat signature + revocation + the root seal — all
+// three must pass for a green receipt.
 
 const _cnorm = (s) => String(s == null ? '' : s).replace(/\s+/g, ' ').trim()
 function _b64url(buf) { return Buffer.from(buf).toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '') }
