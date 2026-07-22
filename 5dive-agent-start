@@ -998,6 +998,57 @@ if [[ "$CHANNELS" == *telegram* && "$TYPE" != "claude" ]]; then
   unset _tg_state _tg_env _tg_tmp 2>/dev/null || :
 fi
 
+# DIVE-1769: gate the FIRST claude launch on auth creds being wired. systemd
+# reads the EnvironmentFile=s (anthropic.env, then %i-auth.env last-wins) exactly
+# once, at unit activation. On a brand-new agent's very first boot the unit can
+# start BEFORE the provisioning step has written the OAuth token into those files
+# — so claude launches unauthenticated and the first thing the owner sees is an
+# alarming "Sign-in to Claude Code expired / auth_required / exit 6". It self-
+# heals on the follow-up restart once creds land, but the transient error should
+# never surface. Fix: before the first launch, wait (bounded) for this agent's
+# credential to appear on disk, then re-export the auth files into our env —
+# systemd won't re-read them, so a token that lands after unit-start is otherwise
+# invisible to the claude we exec. Re-export is unconditional (covers the race
+# where the file populates between unit-start and now) and idempotent, replaying
+# the unit's EnvironmentFile ordering (shared default first, profile override
+# last) so the profiled agent keeps its own account. On timeout we launch anyway
+# — no worse than the pre-fix self-heal-via-restart path.
+if [[ "$TYPE" == "claude" ]]; then
+  # The file that must carry THIS agent's identity: the profile combined.env when
+  # a profile is bound (its token wins), else the shared anthropic.env.
+  if [[ -n "$PROFILE" ]]; then
+    _primary_auth="/var/lib/5dive/agents.d/${NAME}-auth.env"
+  else
+    _primary_auth="/etc/5dive/connectors/anthropic.env"
+  fi
+  # A non-empty value for any of these three keys = usable claude credential
+  # (OAuth token, API key, or BYO ANTHROPIC_AUTH_TOKEN).
+  _creds_re='^(CLAUDE_CODE_OAUTH_TOKEN|ANTHROPIC_API_KEY|ANTHROPIC_AUTH_TOKEN)=.+'
+  _deadline=$(( SECONDS + ${CLAUDE_AUTH_WAIT_SECS:-45} ))
+  _waited=0
+  until grep -qE "$_creds_re" "$_primary_auth" 2>/dev/null; do
+    (( SECONDS >= _deadline )) && break
+    _waited=1
+    sleep 1
+  done
+  if grep -qE "$_creds_re" "$_primary_auth" 2>/dev/null; then
+    # Re-export from disk so the exec'd claude sees the creds systemd read too
+    # early (or not at all). Files are systemd EnvironmentFile format: literal
+    # KEY=value per line, no shell expansion, unquoted — split on the first '='.
+    for _af in "/etc/5dive/connectors/anthropic.env" "${PROFILE:+/var/lib/5dive/agents.d/${NAME}-auth.env}"; do
+      [[ -n "$_af" && -r "$_af" ]] || continue
+      while IFS= read -r _line || [[ -n "$_line" ]]; do
+        [[ "$_line" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]] || continue
+        export "${_line%%=*}=${_line#*=}"
+      done < "$_af"
+    done
+    [[ "$_waited" == 1 ]] && echo "[5dive] agent=${NAME} claude creds landed during first-boot wait — launching authenticated" >&2
+  else
+    echo "[5dive] agent=${NAME} WARN: claude creds absent after ${CLAUDE_AUTH_WAIT_SECS:-45}s wait; launching anyway (self-heals on next restart)" >&2
+  fi
+  unset _primary_auth _creds_re _deadline _waited _af _line 2>/dev/null || :
+fi
+
 CMD_STR=$(printf '%q ' "$BIN" "${ARGS[@]}")
 
 # Headless first-boot for openclaw with no channel. The old prelude ran the
