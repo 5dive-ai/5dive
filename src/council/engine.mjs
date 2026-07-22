@@ -270,25 +270,52 @@ export function renderConstitutionV0() {
   const c = DEFAULT_CONSTITUTION
   const gates = Object.entries(c.hardGates)
     .map(([k, v]) => `  ${k}: '${String(v).replace(/'/g, "''")}'`).join('\n')
+  // DIVE-1701 — single-agent-first-class ordering: the GUARDRAILS a solo user edits
+  // (hard_gates / ship / comms) come FIRST; the Council governance keys come LAST, clearly
+  // demarcated + commented as OPTIONAL and dormant so a one-agent user never feels a company
+  // is forced on them. ONE schema for both `constitution init` (unsealed seed) and `council
+  // init` (sealed genesis) — key ORDER is cosmetic to the parser, so this round-trips to the
+  // exact defaults either way.
   return `# 5dive company constitution (v0) — governance-as-DATA, not hardcode.
-# This file is the human-readable PROJECTION of the council's governance policy.
-# On its own it is forgeable (anyone with fs write); the AUTHORITY is the sealed
-# amendment hash-chain: council verify checks this file's digest against the newest
-# sealed amendment receipt and FAILS CLOSED on drift (a drifted constitution is not
-# enforced; convene escalates). Edit ONLY via a constitutional-class council motion:
-#   sudo 5dive council amend --file=<new constitution.yaml>   (2/3 + full quorum + founder veto)
+# This file is the human-readable PROJECTION of your governance policy. On its own it is
+# forgeable (anyone with fs write); the AUTHORITY is the sealed digest: once sealed, enforcement
+# checks this file's digest against the sealed baseline and FAILS CLOSED on drift (a drifted
+# constitution is not enforced). After it is sealed, edit ONLY through:
+#   · solo (no Council):  sudo 5dive constitution edit          (direct-seal, no convene)
+#   · a multi-seat Council: sudo 5dive council amend --file=…    (2/3 + full quorum + founder veto)
 #
-# Vote thresholds, quorum, the founder-veto window, and the hard-gate classes below
-# are DATA: another org forks this file and rewrites them for itself. The sealed
-# receipt chain, not this file, is the authority.
+# ===================================================================================
+# GUARDRAILS — the machine-enforced policy. This is what a solo user edits.
+# ===================================================================================
+#
+# hard_gates: named POSIX-ERE classes. Any content matching a class is forced through a human
+# gate before it can proceed. Add/rename/rewrite classes freely; the values are DATA.
+hard_gates:
+${gates}
+#
+# ship: release guardrails (e.g. require_ci: true). Empty = no extra ship gate beyond hard_gates.
+ship:
+#
+# comms: outbound-comms guardrails (e.g. public_requires_human: true). Empty = defaults.
+comms:
+#
+# ===================================================================================
+# COUNCIL — OPTIONAL, and DORMANT until you convene one.
+# ===================================================================================
+# Solo users can ignore everything below: these keys have NO effect until you run
+# \`5dive council init\` to seed a multi-agent Council. They are seeded here (not hidden) so the
+# upgrade path is visible without being forced. Vote thresholds, quorum, and the founder-veto
+# window are DATA another org forks and rewrites for itself.
 council:
   bench: ${c.council.bench}
 quorum: ${c.quorum}
 veto:
   hold_secs: ${c.veto.holdSecs}
   posthoc_secs: ${c.veto.posthocSecs}
-hard_gates:
-${gates}
+# thresholds: per-class vote rules — defaults apply when omitted. Uncomment under a real Council
+# to override, e.g.:
+#   thresholds:
+#     constitutional: { rule: fraction, value: 2/3, quorum: all, require_quorum: true }
 `
 }
 
