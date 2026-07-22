@@ -15,12 +15,19 @@ cmd_constitution() {
   [[ $# -gt 0 ]] && shift
   case "$action" in
     show) _constitution_show "$@" ;;
-    init)
-      fail "$E_USAGE" "5dive constitution init is not available yet (DIVE-1701 — seeds the full default constitution.yaml). Today: 5dive constitution show [--json]." ;;
+    init) _constitution_init "$@" ;;
     set|edit) _constitution_set "$action" "$@" ;;
     -h|--help|help)
       cat >&2 <<'CONSTITUTION_HELP'
 5dive constitution — view + amend the machine-enforced constitution (guardrails, thresholds, veto, seal state)
+
+  sudo 5dive constitution init [--force] [--json]
+      SEED path (DIVE-1701). Write the full default constitution.yaml — GUARDRAILS first
+      (hard_gates / ship / comms, what a solo user edits), then the Council keys present but
+      DORMANT and commented as optional. Creates NO council genesis/lineage: a one-agent user
+      seeds + edits guardrails with zero Council. UNSEALED — edit it, then 'constitution edit' to
+      seal. REFUSES to clobber a Council-sealed constitution (amend those via 'council amend');
+      refuses an existing unsealed file unless --force.
 
   5dive constitution show [--json]
       Read the enforced constitution as ONE envelope: hard_gates (per-class ERE + default/custom
@@ -104,6 +111,68 @@ _constitution_show_human() {
     ( [ .hard_gates | to_entries[] | "    - " + .key + " (" + (.value|tostring|.[0:52]) + (if (.value|length)>52 then "…" else "" end) + ")" ] | join("\n") ) + "\n" +
     "  amendments: " + ((.amendments|length)|tostring) + " sealed record(s)"
   '
+}
+
+# DIVE-1701 — SEED path. `constitution init` writes the full default constitution.yaml so a SOLO
+# user who never wants a Council can still seed + edit the machine-enforced guardrails (hard_gates /
+# ship / comms). It creates NO genesis/lineage: the Council governance keys are written present-but-
+# DORMANT (they only take effect once `5dive council init` seals a real Council). The file is left
+# UNSEALED — the solo user edits it, then `constitution edit`/`set` direct-seals it. Anti-clobber:
+# HARD-refuses to overwrite a Council-SEALED constitution (route to `council amend`), and refuses an
+# existing unsealed file unless --force. (v0.15 enforcement reads hard_gates independent of any
+# Council; that wiring is out of scope here — this is the seed + the guard.)
+_constitution_init() {
+  command -v node >/dev/null 2>&1 || fail "$E_NOT_INSTALLED" "constitution init needs node on PATH"
+  local force=0 a
+  for a in "$@"; do
+    case "$a" in
+      --force)   force=1 ;;
+      --json)    JSON_MODE=1 ;;
+      -h|--help) cmd_constitution --help; return 0 ;;
+      *) fail "$E_USAGE" "unknown flag for constitution init: $a" ;;
+    esac
+  done
+  local cpath; cpath="$(_council_constitution_path)"
+
+  # Anti-clobber (HARD): a Council has SEALED a constitution into the lineage. `init` must NEVER
+  # silently rewrite governed policy — route to the sanctioned amend path. --force does NOT override.
+  local sealed; sealed="$(_council_sealed_constitution_digest 2>/dev/null || true)"
+  if [[ -n "$sealed" ]]; then
+    fail "$E_VALIDATION" "a Council has SEALED this constitution (digest ${sealed:0:12}…) — 'init' will not clobber governed policy. Amend via 'sudo 5dive council amend --file=…' (org) or 'sudo 5dive constitution edit' (solo re-seal)."
+  fi
+
+  # Anti-clobber (soft): an unsealed constitution.yaml already exists — don't blow away hand edits
+  # without an explicit --force.
+  if [[ -f "$cpath" && $force -eq 0 ]]; then
+    fail "$E_VALIDATION" "$cpath already exists (unsealed) — refusing to overwrite. Pass --force to replace it with the fresh default, or edit it with 'sudo 5dive constitution edit'."
+  fi
+
+  local dir; dir="$(mktemp -d -t 5dive-constitution-init.XXXXXX)" || fail "$E_GENERIC" "mktemp failed"
+  # shellcheck disable=SC2064
+  trap "rm -rf '$dir'" RETURN
+  _council_write_runtime "$dir"
+
+  mkdir -p "$(dirname "$cpath")" 2>/dev/null || true
+  if { [[ -e "$cpath" ]] && [[ ! -w "$cpath" ]]; } || { [[ ! -e "$cpath" ]] && [[ ! -w "$(dirname "$cpath")" ]]; }; then
+    fail "$E_PERMISSION" "cannot write $cpath (need write access — re-run with sudo if it is root-owned): sudo 5dive constitution init"
+  fi
+
+  # Render the default (guardrails-first, Council keys dormant) and validate it parses BEFORE placing
+  # it (ONE parser, fail-closed) — never leave a broken governance file on disk.
+  local tmp="$dir/constitution.yaml"
+  node "$dir/cli.mjs" constitution-render > "$tmp" || fail "$E_GENERIC" "could not render the default constitution"
+  node "$dir/cli.mjs" constitution --path="$tmp" | jq -e '.valid == true' >/dev/null 2>&1 \
+    || fail "$E_VALIDATION" "the rendered default constitution did not validate — refusing to write it (fail-closed)"
+  ( umask 022; cat "$tmp" > "$cpath" ) || fail "$E_GENERIC" "could not write $cpath"
+
+  if (( JSON_MODE )); then
+    jq -nc --arg p "$cpath" '{ok:true,data:{path:$p,sealed:false,council:"dormant",wrote:true}}'
+  else
+    echo "constitution init: wrote the default guardrails to $cpath (UNSEALED, no Council)." >&2
+    echo "  Edit the hard_gates / ship / comms guardrails, then seal them with: sudo 5dive constitution edit" >&2
+    echo "  The Council keys are present but DORMANT — they only activate after: sudo 5dive council init" >&2
+  fi
+  return 0
 }
 
 # DIVE-1743 — WRITE path. `constitution set --file=` / `constitution edit`. Validate the proposed
