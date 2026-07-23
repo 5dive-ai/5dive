@@ -160,6 +160,48 @@ grep -q 'restart "5dive-agent@\${name}.service"' <<<"$RESTART_BODY" \
   && ok_t "restart --defer wraps a FIXED systemctl restart (no caller-injected cmd)" \
   || bad_t "restart --defer fixed command" "deferred command must not be caller-templated"
 
+# ---- 2d. DIVE-1813: standard agent self-restart grant + primitive ------------
+# The scoped standard sudoers must grant EXACTLY `5dive agent _self_restart`
+# (no args, no wildcard) so /model + /restart work, and the primitive must
+# derive its target from SUDO_USER (never argv) so it can only restart itself.
+if command -v visudo >/dev/null 2>&1; then
+  STDF="$TMP/standard.sudoers"
+  render_standard_sudoers "agent-foo" 0 > "$STDF"
+  visudo -cf "$STDF" >/dev/null 2>&1 \
+    && ok_t "scoped standard sudoers passes visudo -c" \
+    || bad_t "standard sudoers visudo" "$(visudo -cf "$STDF" 2>&1)"
+  grep -qF 'NOPASSWD: /usr/local/bin/5dive agent _self_restart' "$STDF" \
+    && ok_t "standard sudoers grants self-restart (fixes /model + /restart)" \
+    || bad_t "standard sudoers self-restart grant" "missing _self_restart line"
+  # The grant must be exact-path/no-arg: no wildcard, no unit target on the line.
+  if grep -E '_self_restart' "$STDF" | grep -qE '\*|5dive-agent@'; then
+    bad_t "self-restart grant must be exact (no wildcard / no unit target)" ""
+  else
+    ok_t "self-restart grant is exact-path, no wildcard, no argv target"
+  fi
+  # sudo-rs compat when available (Ubuntu 26.04 rejects embedded arg-wildcards).
+  if command -v visudo-rs >/dev/null 2>&1; then
+    visudo-rs -cf "$STDF" >/dev/null 2>&1 \
+      && ok_t "standard sudoers passes visudo-rs (sudo-rs / Ubuntu 26.04)" \
+      || bad_t "standard sudoers visudo-rs" "$(visudo-rs -cf "$STDF" 2>&1 | tail -2)"
+  fi
+fi
+# The primitive derives target from SUDO_USER (not argv) and refuses extra args.
+SELF_BODY=$(sed -n '/^cmd_self_restart()/,/^}/p' src/cmd_agent_lifecycle.sh)
+grep -q 'SUDO_USER' <<<"$SELF_BODY" \
+  && ok_t "cmd_self_restart derives target from SUDO_USER (not argv)" \
+  || bad_t "self-restart SUDO_USER derivation" "must not trust argv for the unit"
+grep -q 'takes no arguments' <<<"$SELF_BODY" \
+  && ok_t "cmd_self_restart refuses caller-supplied arguments" \
+  || bad_t "self-restart arg refusal" "must reject any argv"
+grep -q 'require_root' <<<"$SELF_BODY" \
+  && ok_t "cmd_self_restart requires root (reachable only via NOPASSWD grant)" \
+  || bad_t "self-restart require_root" ""
+# A non-agent-* / root / empty SUDO_USER must be refused (self-only guarantee).
+grep -qE 'agent-\(\[A-Za-z0-9_\.-\]\+\)|!= *"root"' <<<"$SELF_BODY" \
+  && ok_t "cmd_self_restart refuses non-agent-* / root / empty SUDO_USER" \
+  || bad_t "self-restart caller guard" "must reject non-agent-*/root/empty callers"
+
 # ---- 2d. cmd_svc: 5dive-only unit scope + no-exec invariant (DIVE-1088) -------
 # The hardened replacement for the retired raw `systemctl 5dive-*` sudoers grant.
 # It runs a FIXED systemctl and must never exec caller-controlled input.

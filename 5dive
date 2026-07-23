@@ -457,6 +457,18 @@ declare -A HERMES_PROVIDER_ID=(
   [qwen]="alibaba"
   [huggingface]="huggingface"
 )
+# Explicit BYO base_url override for hermes, keyed by canonical id. hermes
+# normally auto-resolves model.base_url from its own provider catalog, but for
+# z.ai that catalog resolves an endpoint the GLM Coding-Plan key does NOT auth
+# against, so hermes+zai fails "Provider authentication failed" even with a
+# correct key (DIVE-1819). We pin the verified anthropic-wire endpoint z.ai
+# actually serves the coding models on (same one pi and the claude anthropic-skin
+# use — CLAUDE_PROVIDER_BASEURL[zai]). Only providers with a known-good override
+# are listed; everything else falls through to hermes' catalog resolution
+# (base_url left unset, see _apply_byo_hermes).
+declare -A HERMES_PROVIDER_URL=(
+  [zai]="https://api.z.ai/api/anthropic"
+)
 declare -A OPENCLAW_PROVIDER_ID=(
   [openai]="openai"
   [anthropic]="anthropic"
@@ -469,6 +481,30 @@ declare -A OPENCLAW_PROVIDER_ID=(
   [minimax]="minimax"
   [qwen]="qwen"
   [huggingface]="huggingface"
+)
+# Explicit BYO provider base_url override for openclaw, keyed by canonical id.
+# openclaw's own provider catalog resolves each provider's endpoint, and for most
+# providers that's correct so no entry is listed here. z.ai is the exception
+# (DIVE-1826, the openclaw sibling of the DIVE-1819 hermes fix):
+#
+#   1. openclaw's zai provider speaks z.ai's OpenAI-compatible REST surface
+#      (`/paas/v4`), NOT the anthropic-wire endpoint. So — unlike hermes and pi,
+#      which pin `api.z.ai/api/anthropic` (HERMES_PROVIDER_URL / CLAUDE_PROVIDER_
+#      BASEURL) — openclaw must be pointed at the openai-compat *coding* URL
+#      `https://api.z.ai/api/coding/paas/v4`. Pinning the anthropic URL here would
+#      break openclaw (wrong wire format). The two override tables are deliberately
+#      NOT shared for this reason.
+#   2. z.ai exposes four endpoint families (zai-global / zai-cn / zai-coding-global
+#      / zai-coding-cn). openclaw's `zai-api-key` auto-detect probes the GENERAL
+#      endpoints (zai-global, zai-cn) BEFORE the Coding Plan ones, and our create
+#      path writes a bare `{provider:zai}` auth profile that never runs that probe
+#      — so a GLM Coding-Plan key (which authorizes the *coding* surface) lands on
+#      the general endpoint and 401s "authentication failed" (what lodar hit).
+#      Pinning models.providers.zai.baseUrl to the coding-global URL selects the
+#      right surface deterministically. Coding-Plan CN users override per agent
+#      (`5dive agent <name> tui`) — we default to the global coding endpoint.
+declare -A OPENCLAW_PROVIDER_URL=(
+  [zai]="https://api.z.ai/api/coding/paas/v4"
 )
 # Optional per-(type, canonical) default model. Missing entry => leave the
 # agent's own default selection logic alone. Conservative defaults: pick
@@ -4106,7 +4142,16 @@ _gate_closure_verify() {
 auth_creds_present() {
   local type="$1" profile="${2:-}" sentinel="${TYPE_AUTH[$1]:-}"
   [[ -n "$sentinel" ]] || return 1
-  local path="${sentinel%%:*}" key="${sentinel##*:}"
+  # A sentinel is either "<path>:<jsonkey>" (claude — value lives under a key in
+  # a file) or a bare "<path>" (every OAuth type — usable == the credential file
+  # is present + non-empty). Detect the plain-file case by the ABSENCE of a colon
+  # in the ORIGINAL sentinel, NOT by comparing path==key: when a profile is set
+  # `path` is swapped to the profile-scoped path while a path-shaped `key` would
+  # keep the DEFAULT path, so path==key silently broke for profile-scoped bare
+  # sentinels and mis-routed antigravity's bare-blob token into the jq branch —
+  # returning needs_login for a perfectly valid profile token (DIVE-1803).
+  local path="${sentinel%%:*}" key=""
+  [[ "$sentinel" == *:* ]] && key="${sentinel##*:}"
   # Profile-scoped: swap the default credential path for the profile's. The
   # jq key (for OAuth json sentinels) is unchanged.
   if [[ -n "$profile" ]]; then
@@ -4115,7 +4160,9 @@ auth_creds_present() {
     [[ -n "$ppath" ]] && path="$ppath"
   fi
   local sentinel_ok=0
-  if [[ "$path" == "$key" ]]; then
+  if [[ -z "$key" ]]; then
+    # Plain-file sentinel: present + non-empty on the resolved (default OR
+    # profile) path is the whole test.
     [[ -s "$path" ]] && sentinel_ok=1
   elif [[ -f "$path" ]]; then
     local val=""
@@ -5509,8 +5556,13 @@ cmd_auth_start() {
   [[ -n "$type" ]] || fail "$E_USAGE" "usage: 5dive agent auth start <type> [--auth-profile=<name>]"
   is_known_type "$type" || fail "$E_NOT_FOUND" "unknown type: $type"
   case "$type" in
-    claude|hermes|openclaw|codex|antigravity|grok) ;;
-    *) fail "$E_VALIDATION" "device-code flow supports claude/hermes/openclaw/codex/antigravity/grok. Use 'auth set --api-key' or 'auth login' for $type." ;;
+    # DIVE-1807: hermes/openclaw are API-ONLY now — their OpenAI /codex/device
+    # consumer-OAuth was dropped (ToS-gray + inference-block prone; DIVE-1391).
+    # This non-TTY/dashboard start path no longer offers it for them; they auth
+    # via `auth set --api-key --provider`. (Grandfathered agents can still
+    # re-auth over the TTY `auth login` handoff, which is left intact.)
+    claude|codex|antigravity|grok) ;;
+    *) fail "$E_VALIDATION" "device-code flow supports claude/codex/antigravity/grok. hermes/openclaw are API-key only — use 'auth set --api-key --provider=<id>' for $type." ;;
   esac
   local bin="${TYPE_BIN[$type]}"
   [[ -x "$bin" ]] || fail "$E_NOT_INSTALLED" "$type not installed at $bin"
@@ -5776,17 +5828,93 @@ cmd_auth_poll() {
 
       if [[ "$state" == "awaiting_code" || "$state" == "submitted" ]]; then
         case "$type" in
-          codex|hermes|openclaw|antigravity|grok)
-            # All five signal success by writing a credential file:
+          antigravity)
+            # DIVE-1803: the OAuth callback writes the antigravity-oauth-token,
+            # but agy then BLOCKS in its post-login first-run onboarding (colour
+            # theme + model + [Next]) INSIDE the same TUI. The old shared branch
+            # below declared ok on the sentinel's mtime bump ALONE and killed the
+            # session mid-onboarding, stranding the profile with an empty/absent
+            # token (auth status -> needs_login). Fix:
+            #   (1) never call it ok until the token file is NON-EMPTY and its
+            #       mtime has SETTLED (same value across two polls) — a usable
+            #       profile IS a non-empty antigravity-oauth-token blob (~498B);
+            #   (2) after the code is submitted, drive onboarding forward by
+            #       sending Enter (accepts the highlighted default) while the pane
+            #       shows an onboarding screen — marker-gated so we never press
+            #       Enter on the login-method menu or the code-entry prompt (a
+            #       rejected-code retry must not be disturbed);
+            #   (3) bound the wait: if onboarding never finalizes a usable token
+            #       before the deadline (or the session dies), fail honestly
+            #       instead of reporting a false ok.
+            local sentinel current baseline stable deadline now
+            sentinel=$(profile_type_auth_path "$profile" "$type")
+            baseline=$(jq -r '.authBaselineMtime // 0' "$meta")
+            current=0
+            [[ -f "$sentinel" ]] && current=$(stat -c %Y "$sentinel" 2>/dev/null || echo 0)
+
+            if [[ "$state" == "submitted" ]]; then
+              local pane="${dir}/pane.txt"
+              sudo -u claude tmux -S "$sock" capture-pane -p -J -S -200 \
+                -t "$session" > "$pane" 2>/dev/null || true
+              # Advance ONLY on an onboarding screen; never on the login-method
+              # menu or the "authorization code" entry prompt.
+              if ! grep -qiE 'authorization code|select login method' "$pane" \
+                 && grep -qiE 'colou?r|theme|select .*model|choose .*model|\[ *next *\]|press enter|get started|continue' "$pane"; then
+                sudo -u claude tmux -S "$sock" send-keys -t "$session" Enter 2>/dev/null || true
+              fi
+              # Start the finalize deadline once, on first poll after submit.
+              deadline=$(jq -r '.agyFinalizeDeadline // 0' "$meta")
+              now=$(date +%s)
+              if [[ "$deadline" == "0" ]]; then
+                deadline=$(( now + 240 ))
+                jq --argjson d "$deadline" '.agyFinalizeDeadline = $d' "$meta" \
+                  > "${meta}.tmp" && mv "${meta}.tmp" "$meta"
+              fi
+            else
+              deadline=0; now=$(date +%s)
+            fi
+
+            stable=$(jq -r '.agyTokenMtime // 0' "$meta")
+            if [[ -s "$sentinel" ]] && (( current > baseline )) && (( current == stable )); then
+              # Two consecutive polls saw the SAME non-empty token -> finalized.
+              sudo -u claude tmux -S "$sock" kill-session -t "$session" 2>/dev/null || true
+              state="ok"
+              jq --arg s "$state" --arg ts "$(date -Iseconds)" \
+                '.state = $s | .updatedAt = $ts' "$meta" > "${meta}.tmp" \
+                && mv "${meta}.tmp" "$meta"
+              # DIVE-383: fresh creds only reach a running agent on restart.
+              restart_profile_agents "$profile"
+            elif [[ -s "$sentinel" ]] && (( current > baseline )); then
+              # First sighting of a non-empty token — record its mtime and wait
+              # one more poll to confirm onboarding isn't still rewriting it.
+              jq --argjson m "$current" --arg ts "$(date -Iseconds)" \
+                '.agyTokenMtime = $m | .updatedAt = $ts' "$meta" > "${meta}.tmp" \
+                && mv "${meta}.tmp" "$meta"
+            elif (( ! alive )); then
+              state="error"
+              jq --arg s "$state" --arg e "antigravity exited before finalizing a usable token (cancelled, expired, bad code, or onboarding not completed)" \
+                 --arg ts "$(date -Iseconds)" \
+                 '.state = $s | .error = $e | .updatedAt = $ts' "$meta" > "${meta}.tmp" \
+                && mv "${meta}.tmp" "$meta"
+            elif [[ "$deadline" != "0" ]] && (( now > deadline )); then
+              sudo -u claude tmux -S "$sock" kill-session -t "$session" 2>/dev/null || true
+              state="error"
+              jq --arg s "$state" --arg e "antigravity onboarding did not finalize a usable token within 240s of code submit" \
+                 --arg ts "$(date -Iseconds)" \
+                 '.state = $s | .error = $e | .updatedAt = $ts' "$meta" > "${meta}.tmp" \
+                && mv "${meta}.tmp" "$meta"
+            fi
+            ;;
+          codex|hermes|openclaw|grok)
+            # These four signal success by writing a credential file, and — unlike
+            # antigravity (handled above, which blocks in a post-login onboarding
+            # TUI) — are usable the moment that file appears, so a bare mtime bump
+            # past the session baseline is a sound ok signal:
             #   codex       — ~/.codex/auth.json     (CLI polls OpenAI itself)
             #   hermes      — ~/.hermes/auth.json    (CLI polls OpenAI itself)
             #   openclaw    — ~/.openclaw/agents/main/agent/auth-profiles.json
             #                 (CLI polls OpenAI itself, then upsertAuthProfile
             #                 writes the file synchronously before exit)
-            #   antigravity — ~/.gemini/antigravity-cli/antigravity-oauth-token
-            #                 (Google OAuth callback or pasted code; mtime
-            #                 bumps once token_storage's file fallback writes
-            #                 the bare token blob, mode 0600)
             #   grok        — ~/.grok/auth.json
             #                 (CLI polls xAI's device-auth endpoint, writes
             #                 auth.json on token receipt)
@@ -5994,6 +6122,21 @@ account_types_authed() {
         fi
       fi
     done
+    # pi is deliberately absent from TYPE_API_VAR (multi-provider, no single
+    # native var), so the loop above never surfaces it. Detect it separately:
+    # a profile is pi-usable when combined.env carries ANY PI_PROVIDER_VAR key
+    # with a value. Without this, cmd_account_list never emits a pi signins
+    # entry, so account_signin_detail's pi provider (the dashboard corner badge)
+    # can never light up. DIVE-1821.
+    local pv
+    for pv in "${PI_PROVIDER_VAR[@]}"; do
+      if grep -qE "^${pv}=.+" "$env_file" 2>/dev/null; then
+        if ! jq -e '. as $a | "pi" | IN($a[])' <<<"$out" >/dev/null; then
+          out=$(jq -c '. + ["pi"]' <<<"$out")
+        fi
+        break
+      fi
+    done
   fi
   echo "$out"
 }
@@ -6010,9 +6153,10 @@ account_types_authed() {
 # truth, so reading `keys | first` makes the dashboard badge lie when
 # a user adds a second credential (codex stays first, badge stays
 # codex, even after model.provider flips to openrouter). openclaw:
-# first profile's provider from auth-profiles.json. Everything else
-# just gets a signedInAt mtime so the tile can at least show *when*
-# the user signed in.
+# first profile's provider from auth-profiles.json. pi: no marker of its
+# own, so reverse-map the present *_API_KEY var in the resolved env back to
+# a provider id via PI_PROVIDER_VAR (DIVE-1821). Everything else just gets a
+# signedInAt mtime so the tile can at least show *when* the user signed in.
 account_signin_detail() {
   local name="$1" type="$2"
   local profile_dir="${AUTH_PROFILES_DIR}/${name}"
@@ -6098,6 +6242,59 @@ account_signin_detail() {
       [[ -n "$auth_path" && -s "$auth_path" ]] || auth_path="$env_file"
       local mtime
       mtime=$(date -u -r "$auth_path" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)
+      [[ -n "$mtime" ]] && signed_at=$(jq -cn --arg s "$mtime" '$s')
+      ;;
+    pi)
+      # pi is API-key multi-provider with NO active-provider marker of its own
+      # (no auth.json, no config file): the "signed-in provider" is inferred from
+      # which PI_PROVIDER_VAR *_API_KEY var is present in the resolved env — the
+      # profile's combined.env (per-profile agents) or, failing that, the shared
+      # pi.env connector (default-profile agents, DIVE-1200). Reverse-map that
+      # var back to its provider id so /dashboard/agents can draw the Z.ai/etc
+      # sub-badge, mirroring the claude BYO base-url reverse-map above. DIVE-1821.
+      local env_file="${profile_dir}/combined.env" connector_file="${CONNECTORS_DIR}/${TYPE_API_FILE[pi]}"
+      local search_files=() sf
+      [[ -s "$env_file" ]] && search_files+=("$env_file")
+      [[ -s "$connector_file" ]] && search_files+=("$connector_file")
+      (( ${#search_files[@]} )) || { echo "{}"; return; }
+      # Ties (a single file carrying more than one pi *_API_KEY): prefer the
+      # provider the agent actually pinned in ~/.pi/agent/settings.json when this
+      # name resolves to a live agent (the welcome-DM path calls us with an agent
+      # name); the account-list path calls us with a profile name and has no such
+      # file, so it falls back to first-match. Iterate PI_PROVIDER_VAR in sorted
+      # order so that fallback is deterministic run-to-run (bash assoc-array order
+      # is otherwise unspecified).
+      local settings="/home/agent-${name}/.pi/agent/settings.json" pinned=""
+      [[ -s "$settings" ]] && pinned=$(jq -r '.defaultProvider // empty' "$settings" 2>/dev/null || true)
+      # Resolve WITHIN a single file: the profile's combined.env takes full
+      # precedence and we only consult the shared pi.env connector when the
+      # profile carries no pi var at all (default-profile agents). Never scan
+      # per-provider across both files, or the shared connector's keys would leak
+      # a badge onto every unrelated profile.
+      local found="" chosen_file=""
+      for sf in "${search_files[@]}"; do
+        local pv var val
+        while IFS= read -r pv; do
+          var="${PI_PROVIDER_VAR[$pv]}"
+          val=$(grep -E "^${var}=" "$sf" 2>/dev/null | tail -1 | cut -d= -f2-)
+          val="${val%\"}"; val="${val#\"}"
+          [[ -n "$val" ]] || continue
+          if [[ -n "$pinned" && "$pv" == "$pinned" ]]; then found="$pv"; break; fi
+          [[ -z "$found" ]] && found="$pv"
+        done < <(printf '%s\n' "${!PI_PROVIDER_VAR[@]}" | sort)
+        [[ -n "$found" ]] && { chosen_file="$sf"; break; }
+      done
+      [[ -n "$found" ]] || { echo "{}"; return; }
+      provider=$(jq -cn --arg p "$found" '$p')
+      # model: the pinned defaultModel, but only when this name is a live agent
+      # (settings.json is agent-scoped, not profile-scoped).
+      if [[ -s "$settings" ]]; then
+        local pinned_model
+        pinned_model=$(jq -r '.defaultModel // empty' "$settings" 2>/dev/null || true)
+        [[ -n "$pinned_model" ]] && model=$(jq -cn --arg m "$pinned_model" '$m')
+      fi
+      local mtime
+      mtime=$(date -u -r "$chosen_file" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)
       [[ -n "$mtime" ]] && signed_at=$(jq -cn --arg s "$mtime" '$s')
       ;;
     *)
@@ -7375,6 +7572,11 @@ render_standard_sudoers() {
 ${user} ALL=(root) NOPASSWD: /usr/local/bin/5dive agent _deliver *
 ${user} ALL=(root) NOPASSWD: /usr/local/bin/5dive agent _capture *
 ${user} ALL=(root) NOPASSWD: /usr/local/bin/5dive _audit_append
+# DIVE-1813: let this agent restart its OWN service (so /model + /restart work).
+# EXACT path, NO args, NO wildcard — the target unit is derived from SUDO_USER
+# inside _self_restart, never from argv, so it can restart ONLY itself, never a
+# peer. Deferred internally; needs no raw systemd-run/systemctl grant.
+${user} ALL=(root) NOPASSWD: /usr/local/bin/5dive agent _self_restart
 SUDOERS
   if [[ "$can_push" == "1" ]]; then
     cat <<SUDOERS
@@ -7624,17 +7826,44 @@ KIMI_ENV
   fi
 
   step "Writing hermes BYO credential for '$canonical' (native id: $native)"
+  # Pass the key on STDIN only, never on argv. `hermes auth add` reads the key
+  # from its secure prompt (getpass), which falls back to reading stdin when
+  # there's no tty — verified against hermes v0.19.0: the piped key lands in
+  # auth.json with no --api-key argv. Passing --api-key "$api_key" here would
+  # expose the BYO secret in /proc/<pid>/cmdline + ps for the life of the call
+  # (DIVE-1818).
   printf '%s' "$api_key" | sudo -u claude -H env HERMES_HOME="$hermes_home" \
-    "$bin" auth add "$native" --type api-key --api-key "$api_key" --label "${canonical}-byo" >&2 \
+    "$bin" auth add "$native" --type api-key --label "${canonical}-byo" >&2 \
     || fail "$E_GENERIC" "hermes auth add $native failed"
   sudo -u claude -H env HERMES_HOME="$hermes_home" \
     "$bin" config set model.provider "$native" >&2 \
     || warn "hermes config set model.provider=$native failed (rerun: sudo -u claude -H $bin config set model.provider $native)"
   # hermes auto-resolves model.base_url from its provider catalog when
-  # model.base_url is unset — explicitly unset it so a stale openai-codex
-  # value from a prior oauth login doesn't pin the agent to chatgpt.com.
-  sudo -u claude -H env HERMES_HOME="$hermes_home" \
-    "$bin" config set model.base_url "" >&2 2>/dev/null || true
+  # model.base_url is unset, and we unset any stale value so a prior openai-codex
+  # oauth base_url can't pin the agent to chatgpt.com. But for a provider whose
+  # catalog entry resolves the WRONG endpoint, the unset lets hermes hit a URL
+  # the key won't auth against. z.ai is exactly this: its coding models are served
+  # in anthropic wire format at api.z.ai/api/anthropic (what pi + the claude
+  # anthropic-skin use), but hermes' catalog resolves a different zai URL, so
+  # hermes+zai failed "Provider authentication failed" even with a correct key
+  # (DIVE-1819). When we have a verified override for this provider, pin it
+  # explicitly; otherwise fall back to the stale-value-clearing unset.
+  local hermes_base_url="${HERMES_PROVIDER_URL[$canonical]:-}"
+  if [[ -n "$hermes_base_url" ]]; then
+    sudo -u claude -H env HERMES_HOME="$hermes_home" \
+      "$bin" config set model.base_url "$hermes_base_url" >&2 2>/dev/null \
+      || warn "hermes config set model.base_url=$hermes_base_url failed"
+  else
+    sudo -u claude -H env HERMES_HOME="$hermes_home" \
+      "$bin" config set model.base_url "" >&2 2>/dev/null || true
+  fi
+  # z.ai key-TYPE hint (DIVE-1819): the anthropic endpoint we pin above is z.ai's
+  # officially-supported *coding* route, which authorizes a GLM Coding-Plan key.
+  # A standard prepaid/API-only z.ai key may 401 "Provider authentication failed"
+  # there. Surface it so an auth failure reads as key-type, not a broken config.
+  if [[ "$canonical" == "zai" ]]; then
+    step "z.ai note: use your GLM Coding-Plan key (z.ai → Coding Plan) for GLM coding models; a standard prepaid API key may fail auth on the anthropic endpoint."
+  fi
   local model="${override_model:-${HERMES_PROVIDER_MODEL[$canonical]:-}}"
   if [[ -n "$model" ]]; then
     sudo -u claude -H env HERMES_HOME="$hermes_home" \
@@ -7672,11 +7901,12 @@ _apply_byo_openclaw() {
   chmod 0600 "$tmp"
   mv "$tmp" "$auth_file"
 
-  # Default model lands in openclaw.json's agents.defaults.model.primary;
-  # 5dive-agent-start.sh syncs it from the shared/profile copy into the
-  # per-agent openclaw.json on every launch.
+  local openclaw_base_url="${OPENCLAW_PROVIDER_URL[$canonical]:-}"
   local model="${override_model:-${OPENCLAW_PROVIDER_MODEL[$canonical]:-}}"
-  if [[ -n "$model" ]]; then
+
+  # Any openclaw.json write (provider base_url pin and/or default model) goes
+  # through the same stable-node invocation — resolve the runtime once.
+  if [[ -n "$openclaw_base_url" || -n "$model" ]]; then
     local openclaw_bin="${TYPE_BIN[openclaw]}"
     local openclaw_node="/home/claude/.local/bin/node"
     # The npm launcher uses `#!/usr/bin/env node`. Do not rely on sudo/systemd's
@@ -7685,12 +7915,44 @@ _apply_byo_openclaw() {
     # for any subprocess OpenClaw starts while writing the config.
     [[ -x "$openclaw_node" ]] \
       || fail "$E_NOT_INSTALLED" "node runtime missing for openclaw (run: 5dive agent install openclaw --upgrade)"
-    sudo -u claude -H env \
-      HOME="$base" \
-      PATH="/home/claude/.local/bin:/usr/bin:/bin" \
-      "$openclaw_node" "$openclaw_bin" \
-      config set agents.defaults.model.primary "$model" >&2 \
-      || warn "openclaw config set agents.defaults.model.primary=$model failed"
+
+    # DIVE-1826: pin the provider endpoint when we have a verified override.
+    # openclaw's zai provider otherwise defaults to the GENERAL /paas/v4 surface
+    # (its zai-api-key auto-detect probes general endpoints before the Coding Plan
+    # ones, and a bare BYO auth profile never runs that probe), so a GLM
+    # Coding-Plan key 401s there. models.providers.<id>.baseUrl (a mode:merge
+    # overlay on openclaw's built-in catalog) points the provider at the correct
+    # endpoint. NOTE: for z.ai this is the openai-compat *coding* URL, NOT the
+    # api.z.ai/api/anthropic endpoint hermes/pi pin — openclaw talks
+    # openai-completions to z.ai (see OPENCLAW_PROVIDER_URL).
+    if [[ -n "$openclaw_base_url" ]]; then
+      sudo -u claude -H env \
+        HOME="$base" \
+        PATH="/home/claude/.local/bin:/usr/bin:/bin" \
+        "$openclaw_node" "$openclaw_bin" \
+        config set "models.providers.${native}.baseUrl" "$openclaw_base_url" >&2 \
+        || warn "openclaw config set models.providers.${native}.baseUrl=$openclaw_base_url failed"
+    fi
+
+    # Default model lands in openclaw.json's agents.defaults.model.primary;
+    # 5dive-agent-start.sh syncs it from the shared/profile copy into the
+    # per-agent openclaw.json on every launch.
+    if [[ -n "$model" ]]; then
+      sudo -u claude -H env \
+        HOME="$base" \
+        PATH="/home/claude/.local/bin:/usr/bin:/bin" \
+        "$openclaw_node" "$openclaw_bin" \
+        config set agents.defaults.model.primary "$model" >&2 \
+        || warn "openclaw config set agents.defaults.model.primary=$model failed"
+    fi
+  fi
+
+  # z.ai key-TYPE hint (DIVE-1826, the openclaw sibling of the DIVE-1819 hermes
+  # note): the coding endpoint we pin above authorizes a GLM Coding-Plan key. A
+  # standard prepaid / API-only z.ai key may 401 there, so surface it — an auth
+  # failure then reads as key-type, not a broken config.
+  if [[ "$canonical" == "zai" ]]; then
+    step "z.ai note: use your GLM Coding-Plan key (z.ai → Coding Plan) for GLM coding models; a standard prepaid API key may fail auth on the coding endpoint."
   fi
 }
 
@@ -8714,6 +8976,46 @@ cmd_restart() {
     ok "agent '$name' restarted." \
        '{name:$n, action:"restart"}' --arg n "$name"
   fi
+}
+
+# DIVE-1813: hidden, privileged SELF-restart primitive for a standard-isolation
+# agent. A standard agent has NO broad sudo, so it cannot run the deferred
+# `systemd-run … systemctl restart` that the telegram plugin's /restart + /model
+# use — sudo prompts for a password and the headless plugin fails with
+# "Failed to restart: sudo: a password is required" (broken on every customer
+# box). This is reachable ONLY via the scoped NOPASSWD grant a standard agent
+# gets (render_standard_sudoers: NOPASSWD on EXACTLY `/usr/local/bin/5dive agent
+# _self_restart`, no args, no wildcard).
+#
+# Why this is safe (same invariant as _deliver/_capture/_audit_append): it NEVER
+# execs caller-controlled input and takes NO caller-controlled target. The unit
+# to restart is derived ENTIRELY from the REAL sudo caller (SUDO_USER), so the
+# agent can restart ONLY its OWN service and nothing else — it cannot reach a
+# peer's unit even by passing arguments (there are none to pass; extra argv is
+# refused). The restart command handed to systemd-run is a FIXED, name-only
+# systemctl invocation (no eval / sh -c / printf-format), so the `*`-free exact
+# grant cannot become an agent->root vector (upholds the write_admin_sudoers
+# standing invariant, DIVE-756/916/950/1413). Deferred (~1s transient unit) so
+# the restart survives the caller's own session teardown — a bare non-deferred
+# restart would SIGTERM the caller mid-flight (why we don't route through
+# `_svc`, whose restart is non-deferred). Not advertised.
+cmd_self_restart() {
+  require_root "agent _self_restart"
+  [[ $# -eq 0 ]] || fail "$E_USAGE" "agent _self_restart takes no arguments (target is derived from the sudo caller)"
+  # Derive the caller's OWN unit from the real sudo user. Never trust argv.
+  local caller="${SUDO_USER:-}"
+  [[ -n "$caller" && "$caller" != "root" ]] \
+    || fail "$E_PERMISSION" "agent _self_restart must be invoked via sudo by an agent-* user"
+  [[ "$caller" =~ ^agent-([A-Za-z0-9_.-]+)$ ]] \
+    || fail "$E_PERMISSION" "refusing: caller '$caller' is not an agent-* user"
+  local name="${BASH_REMATCH[1]}"
+  require_agent "$name"
+  # Fixed, name-only command (no caller injection); the ~1s transient unit
+  # survives this caller's teardown so its own SIGTERM can't abort the restart.
+  systemd-run --on-active=1 --collect \
+    /bin/systemctl restart "5dive-agent@${name}.service" >&2
+  ok "agent '$name' self-restart scheduled (deferred ~1s)." \
+     '{name:$n, action:"restart", self:true, deferred:true}' --arg n "$name"
 }
 
 cmd_rm() {
@@ -14003,46 +14305,33 @@ USAGE
         esac
         ;;
       openclaw)
-        # openclaw defaults to the OpenAI /codex/device oauth, but that
-        # dead-ends when the OpenAI account is blocked for inference. The
-        # dashboard already offers a BYO provider+key escape hatch; give init
-        # parity (DIVE-1390). BYO writes via `agent auth set openclaw
-        # --api-key=- --provider=<id>` (cmd_auth.sh -> _apply_byo_openclaw).
-        local auth_choice
-        _init_pick auth_choice "How should OpenClaw authenticate?" 1 \
-          "oauth|Sign in with OpenAI|Device-code sign-in · recommended" \
-          "byo|Bring your own provider|Use your own inference provider + API key"
-        case "$auth_choice" in
-          oauth)
-            _init_note "Opening ${type_label[$type]}'s interactive sign-in…"
-            5dive agent auth login openclaw || fail "$E_AUTH_REQUIRED" "auth failed"
-            auth_summary="Interactive sign-in"
-            ;;
-          byo)
-            local provider
-            _init_pick provider "Choose a provider for OpenClaw:" 1 \
-              "openrouter|OpenRouter|Broad model catalog · recommended" \
-              "anthropic|Anthropic|Claude models" \
-              "openai|OpenAI|GPT models" \
-              "google|Google|Gemini models" \
-              "deepseek|DeepSeek|DeepSeek models" \
-              "moonshot|Moonshot|Kimi models" \
-              "qwen|Qwen|Qwen models" \
-              "minimax|MiniMax|MiniMax models" \
-              "huggingface|Hugging Face|Hosted open models" \
-              "zai|z.ai|GLM models"
-            [[ -n "${OPENCLAW_PROVIDER_ID[$provider]:-}" ]] \
-              || fail "$E_VALIDATION" "unknown provider '$provider'"
-            local key
-            _init_secret key "$provider API key"
-            [[ -n "$key" ]] || fail "$E_VALIDATION" "empty API key"
-            printf '%s' "$key" | 5dive agent auth set openclaw --api-key=- --provider="$provider" \
-              || fail "$E_AUTH_REQUIRED" "auth failed"
-            _init_ok "$provider credentials saved"
-            auth_summary="$provider API key"
-            ;;
-          *) fail "$E_VALIDATION" "invalid auth choice '$auth_choice'" ;;
-        esac
+        # DIVE-1807: openclaw is API-ONLY now. Its OpenAI /codex/device oauth
+        # ("Sign in with OpenAI") was dropped — that path dead-ends when the
+        # OpenAI account is blocked for inference (ToS-gray; DIVE-1391/1390), so
+        # init no longer offers it. Straight to BYO provider+key, mirroring
+        # hermes; writes via `agent auth set openclaw --api-key=- --provider=<id>`
+        # (cmd_auth.sh -> _apply_byo_openclaw).
+        local provider
+        _init_pick provider "Choose a provider for OpenClaw:" 1 \
+          "openrouter|OpenRouter|Broad model catalog · recommended" \
+          "anthropic|Anthropic|Claude models" \
+          "openai|OpenAI|GPT models" \
+          "google|Google|Gemini models" \
+          "deepseek|DeepSeek|DeepSeek models" \
+          "moonshot|Moonshot|Kimi models" \
+          "qwen|Qwen|Qwen models" \
+          "minimax|MiniMax|MiniMax models" \
+          "huggingface|Hugging Face|Hosted open models" \
+          "zai|z.ai|GLM models"
+        [[ -n "${OPENCLAW_PROVIDER_ID[$provider]:-}" ]] \
+          || fail "$E_VALIDATION" "unknown provider '$provider'"
+        local key
+        _init_secret key "$provider API key"
+        [[ -n "$key" ]] || fail "$E_VALIDATION" "empty API key"
+        printf '%s' "$key" | 5dive agent auth set openclaw --api-key=- --provider="$provider" \
+          || fail "$E_AUTH_REQUIRED" "auth failed"
+        _init_ok "$provider credentials saved"
+        auth_summary="$provider API key"
         ;;
       antigravity|grok)
         _init_note "Opening ${type_label[$type]}'s interactive sign-in…"
@@ -14712,8 +15001,14 @@ cmd_doctor() {
     elif ! jq -e '.allowedChannelPlugins | any(.plugin == "telegram" and .marketplace == "5dive-plugins")' "$ms" >/dev/null 2>&1; then
       doctor_add channels managed-settings warn \
         "$ms doesn't list telegram@5dive-plugins — local channel allowlist won't permit the fork" false false
+    elif ! jq -e '.allowedChannelPlugins | any(.plugin == "dashboard" and .marketplace == "5dive-plugins")' "$ms" >/dev/null 2>&1; then
+      # DIVE-1816: dashboard is a channel too; if it's unlisted, Claude drops
+      # dashboard-chat pings (agent silent on /dashboard/chat). Rerun install.sh
+      # to reconcile the allowlist in place.
+      doctor_add channels managed-settings warn \
+        "$ms doesn't list dashboard@5dive-plugins — dashboard-chat pings are dropped; rerun install.sh to reconcile" false false
     else
-      doctor_add channels managed-settings ok "$ms has channelsEnabled + telegram@5dive-plugins allowlisted"
+      doctor_add channels managed-settings ok "$ms has channelsEnabled + telegram/dashboard@5dive-plugins allowlisted"
     fi
 
     # Per-agent: read the MOST RECENT MCP log for the telegram plugin and
@@ -38508,6 +38803,11 @@ main() {
         # `5dive-*.service` sudoers lines that sudo-rs (Ubuntu 26.04) rejected. Reached
         # via the admin whole-CLI grant; enforces its 5dive-only scope in code.
         _svc)    cmd_svc "$@" ;;
+        # DIVE-1813: hidden privileged SELF-restart primitive (deferred restart
+        # of the CALLER'S OWN unit, derived from SUDO_USER — no argv target).
+        # Reached via the scoped render_standard_sudoers grant so a standard
+        # agent's /restart + /model work without a raw systemd-run/sudo grant.
+        _self_restart) cmd_self_restart "$@" ;;
         stats)   cmd_stats "$@" ;;
         create)
           AUDIT_CMD="agent create"; AUDIT_ARGS=("$@")

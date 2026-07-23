@@ -437,22 +437,60 @@ JOURNALD
   # upstream passes it, not hold them at a version. Release-safety from a bad
   # upstream CC belongs in installer-pinning, not a managed-settings ceiling.
   install -d -m 755 /etc/claude-code
-  if [[ ! -f /etc/claude-code/managed-settings.json ]]; then
-    cat > /etc/claude-code/managed-settings.json <<'MANAGED'
+  local msj=/etc/claude-code/managed-settings.json
+  if [[ ! -f "$msj" ]]; then
+    cat > "$msj" <<'MANAGED'
 {
   "channelsEnabled": true,
   "requiredMinimumVersion": "2.1.163",
   "allowedChannelPlugins": [
     {"plugin": "telegram", "marketplace": "5dive-plugins"},
+    {"plugin": "dashboard", "marketplace": "5dive-plugins"},
     {"plugin": "telegram", "marketplace": "claude-plugins-official"},
     {"plugin": "discord", "marketplace": "claude-plugins-official"}
   ]
 }
 MANAGED
-    chmod 644 /etc/claude-code/managed-settings.json
+    chmod 644 "$msj"
     ok "/etc/claude-code/managed-settings.json (new)"
   else
-    ok "/etc/claude-code/managed-settings.json (kept existing)"
+    # DIVE-1816: reconcile an EXISTING file. install.sh only wrote the allowlist
+    # on first install, so boxes provisioned before the dashboard channel shipped
+    # (or before any 5dive fork was listed) keep a stale list — and because ANY
+    # custom allowlist makes Claude ignore its default ledger, an unlisted channel
+    # is silently DROPPED (dashboard pings never reached personal-account agents,
+    # e.g. claude-leaf). Idempotently ensure channelsEnabled:true and that BOTH
+    # 5dive fork channels are present, WITHOUT clobbering operator additions or
+    # the upstream/official entries. On a team box the org's remote managed-
+    # settings override this local file entirely, so the merge is inert there;
+    # on a personal/self-hosted box this local file IS the self-approve allowlist.
+    # Only rewrites (via a temp + install -m, mode-preserving) when something
+    # actually changed, and skips silently if jq is unavailable or the file isn't
+    # valid JSON (never brick a hand-managed settings file).
+    if command -v jq >/dev/null 2>&1 && jq -e . "$msj" >/dev/null 2>&1; then
+      local msj_tmp
+      msj_tmp=$(mktemp)
+      if jq '
+            .channelsEnabled = true
+          | .allowedChannelPlugins = ((.allowedChannelPlugins // []) as $have
+              | $have + ([{"plugin":"telegram","marketplace":"5dive-plugins"},
+                          {"plugin":"dashboard","marketplace":"5dive-plugins"}]
+                  | map(select(. as $need
+                      | ($have | any(.plugin == $need.plugin and .marketplace == $need.marketplace)) | not))))
+          ' "$msj" > "$msj_tmp" 2>/dev/null && [[ -s "$msj_tmp" ]]; then
+        if ! jq -e --slurpfile a "$msj_tmp" '. == $a[0]' "$msj" >/dev/null 2>&1; then
+          install -m 644 "$msj_tmp" "$msj"
+          ok "/etc/claude-code/managed-settings.json (reconciled: +5dive channels / channelsEnabled)"
+        else
+          ok "/etc/claude-code/managed-settings.json (kept existing; already current)"
+        fi
+      else
+        ok "/etc/claude-code/managed-settings.json (kept existing; reconcile skipped)"
+      fi
+      rm -f "$msj_tmp"
+    else
+      ok "/etc/claude-code/managed-settings.json (kept existing; jq/JSON unavailable, no reconcile)"
+    fi
   fi
 
   # Drop a slim projects-level CLAUDE.md so every agent spawned on this host

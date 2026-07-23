@@ -43,6 +43,21 @@ account_types_authed() {
         fi
       fi
     done
+    # pi is deliberately absent from TYPE_API_VAR (multi-provider, no single
+    # native var), so the loop above never surfaces it. Detect it separately:
+    # a profile is pi-usable when combined.env carries ANY PI_PROVIDER_VAR key
+    # with a value. Without this, cmd_account_list never emits a pi signins
+    # entry, so account_signin_detail's pi provider (the dashboard corner badge)
+    # can never light up. DIVE-1821.
+    local pv
+    for pv in "${PI_PROVIDER_VAR[@]}"; do
+      if grep -qE "^${pv}=.+" "$env_file" 2>/dev/null; then
+        if ! jq -e '. as $a | "pi" | IN($a[])' <<<"$out" >/dev/null; then
+          out=$(jq -c '. + ["pi"]' <<<"$out")
+        fi
+        break
+      fi
+    done
   fi
   echo "$out"
 }
@@ -59,9 +74,10 @@ account_types_authed() {
 # truth, so reading `keys | first` makes the dashboard badge lie when
 # a user adds a second credential (codex stays first, badge stays
 # codex, even after model.provider flips to openrouter). openclaw:
-# first profile's provider from auth-profiles.json. Everything else
-# just gets a signedInAt mtime so the tile can at least show *when*
-# the user signed in.
+# first profile's provider from auth-profiles.json. pi: no marker of its
+# own, so reverse-map the present *_API_KEY var in the resolved env back to
+# a provider id via PI_PROVIDER_VAR (DIVE-1821). Everything else just gets a
+# signedInAt mtime so the tile can at least show *when* the user signed in.
 account_signin_detail() {
   local name="$1" type="$2"
   local profile_dir="${AUTH_PROFILES_DIR}/${name}"
@@ -147,6 +163,59 @@ account_signin_detail() {
       [[ -n "$auth_path" && -s "$auth_path" ]] || auth_path="$env_file"
       local mtime
       mtime=$(date -u -r "$auth_path" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)
+      [[ -n "$mtime" ]] && signed_at=$(jq -cn --arg s "$mtime" '$s')
+      ;;
+    pi)
+      # pi is API-key multi-provider with NO active-provider marker of its own
+      # (no auth.json, no config file): the "signed-in provider" is inferred from
+      # which PI_PROVIDER_VAR *_API_KEY var is present in the resolved env — the
+      # profile's combined.env (per-profile agents) or, failing that, the shared
+      # pi.env connector (default-profile agents, DIVE-1200). Reverse-map that
+      # var back to its provider id so /dashboard/agents can draw the Z.ai/etc
+      # sub-badge, mirroring the claude BYO base-url reverse-map above. DIVE-1821.
+      local env_file="${profile_dir}/combined.env" connector_file="${CONNECTORS_DIR}/${TYPE_API_FILE[pi]}"
+      local search_files=() sf
+      [[ -s "$env_file" ]] && search_files+=("$env_file")
+      [[ -s "$connector_file" ]] && search_files+=("$connector_file")
+      (( ${#search_files[@]} )) || { echo "{}"; return; }
+      # Ties (a single file carrying more than one pi *_API_KEY): prefer the
+      # provider the agent actually pinned in ~/.pi/agent/settings.json when this
+      # name resolves to a live agent (the welcome-DM path calls us with an agent
+      # name); the account-list path calls us with a profile name and has no such
+      # file, so it falls back to first-match. Iterate PI_PROVIDER_VAR in sorted
+      # order so that fallback is deterministic run-to-run (bash assoc-array order
+      # is otherwise unspecified).
+      local settings="/home/agent-${name}/.pi/agent/settings.json" pinned=""
+      [[ -s "$settings" ]] && pinned=$(jq -r '.defaultProvider // empty' "$settings" 2>/dev/null || true)
+      # Resolve WITHIN a single file: the profile's combined.env takes full
+      # precedence and we only consult the shared pi.env connector when the
+      # profile carries no pi var at all (default-profile agents). Never scan
+      # per-provider across both files, or the shared connector's keys would leak
+      # a badge onto every unrelated profile.
+      local found="" chosen_file=""
+      for sf in "${search_files[@]}"; do
+        local pv var val
+        while IFS= read -r pv; do
+          var="${PI_PROVIDER_VAR[$pv]}"
+          val=$(grep -E "^${var}=" "$sf" 2>/dev/null | tail -1 | cut -d= -f2-)
+          val="${val%\"}"; val="${val#\"}"
+          [[ -n "$val" ]] || continue
+          if [[ -n "$pinned" && "$pv" == "$pinned" ]]; then found="$pv"; break; fi
+          [[ -z "$found" ]] && found="$pv"
+        done < <(printf '%s\n' "${!PI_PROVIDER_VAR[@]}" | sort)
+        [[ -n "$found" ]] && { chosen_file="$sf"; break; }
+      done
+      [[ -n "$found" ]] || { echo "{}"; return; }
+      provider=$(jq -cn --arg p "$found" '$p')
+      # model: the pinned defaultModel, but only when this name is a live agent
+      # (settings.json is agent-scoped, not profile-scoped).
+      if [[ -s "$settings" ]]; then
+        local pinned_model
+        pinned_model=$(jq -r '.defaultModel // empty' "$settings" 2>/dev/null || true)
+        [[ -n "$pinned_model" ]] && model=$(jq -cn --arg m "$pinned_model" '$m')
+      fi
+      local mtime
+      mtime=$(date -u -r "$chosen_file" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)
       [[ -n "$mtime" ]] && signed_at=$(jq -cn --arg s "$mtime" '$s')
       ;;
     *)

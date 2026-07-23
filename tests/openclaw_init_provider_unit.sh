@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
-# DIVE-1390: openclaw init offers a BYO provider + API-key path (dashboard
-# parity), not just the OpenAI /codex/device oauth. No root/network needed.
+# DIVE-1390 + DIVE-1807: openclaw init is API-KEY ONLY — it goes straight to a
+# BYO provider + API-key picker. Its OpenAI /codex/device oauth ("Sign in with
+# OpenAI") was dropped (ToS-gray / inference-block prone), so init no longer
+# offers an oauth choice. No root/network needed.
 set -uo pipefail
 cd "$(dirname "$0")/.."
 
@@ -22,17 +24,12 @@ init_src=$(<src/cmd_init.sh)
   && ok_t "openclaw has a dedicated auth branch (not lumped oauth-only)" \
   || bad_t "openclaw still lumped in antigravity|grok oauth branch"
 
-# Both paths offered: keep the device-code oauth AND add BYO.
-[[ "$init_src" == *'How should OpenClaw authenticate?'* \
-   && "$init_src" == *'oauth|Sign in with OpenAI'* \
-   && "$init_src" == *'byo|Bring your own provider'* ]] \
-  && ok_t "init offers oauth + BYO choice for openclaw" \
-  || bad_t "missing openclaw oauth/BYO picker"
-
-# oauth path still launches the interactive login.
-[[ "$init_src" == *'5dive agent auth login openclaw'* ]] \
-  && ok_t "oauth path preserved (agent auth login openclaw)" \
-  || bad_t "oauth path lost"
+# DIVE-1807: NO oauth choice — the "Sign in with OpenAI" device-code path was
+# dropped. init must not prompt an oauth/BYO picker for openclaw and must not
+# launch the interactive oauth login from the init flow.
+[[ "$init_src" != *'oauth|Sign in with OpenAI'* ]] \
+  && ok_t "no dropped oauth choice offered for openclaw (API-only)" \
+  || bad_t "openclaw still offers the removed 'Sign in with OpenAI' oauth choice"
 
 # BYO path picks a provider and forwards it to auth set.
 [[ "$init_src" == *'Choose a provider for OpenClaw:'* \

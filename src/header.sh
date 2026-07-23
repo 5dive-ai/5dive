@@ -457,6 +457,18 @@ declare -A HERMES_PROVIDER_ID=(
   [qwen]="alibaba"
   [huggingface]="huggingface"
 )
+# Explicit BYO base_url override for hermes, keyed by canonical id. hermes
+# normally auto-resolves model.base_url from its own provider catalog, but for
+# z.ai that catalog resolves an endpoint the GLM Coding-Plan key does NOT auth
+# against, so hermes+zai fails "Provider authentication failed" even with a
+# correct key (DIVE-1819). We pin the verified anthropic-wire endpoint z.ai
+# actually serves the coding models on (same one pi and the claude anthropic-skin
+# use — CLAUDE_PROVIDER_BASEURL[zai]). Only providers with a known-good override
+# are listed; everything else falls through to hermes' catalog resolution
+# (base_url left unset, see _apply_byo_hermes).
+declare -A HERMES_PROVIDER_URL=(
+  [zai]="https://api.z.ai/api/anthropic"
+)
 declare -A OPENCLAW_PROVIDER_ID=(
   [openai]="openai"
   [anthropic]="anthropic"
@@ -469,6 +481,30 @@ declare -A OPENCLAW_PROVIDER_ID=(
   [minimax]="minimax"
   [qwen]="qwen"
   [huggingface]="huggingface"
+)
+# Explicit BYO provider base_url override for openclaw, keyed by canonical id.
+# openclaw's own provider catalog resolves each provider's endpoint, and for most
+# providers that's correct so no entry is listed here. z.ai is the exception
+# (DIVE-1826, the openclaw sibling of the DIVE-1819 hermes fix):
+#
+#   1. openclaw's zai provider speaks z.ai's OpenAI-compatible REST surface
+#      (`/paas/v4`), NOT the anthropic-wire endpoint. So — unlike hermes and pi,
+#      which pin `api.z.ai/api/anthropic` (HERMES_PROVIDER_URL / CLAUDE_PROVIDER_
+#      BASEURL) — openclaw must be pointed at the openai-compat *coding* URL
+#      `https://api.z.ai/api/coding/paas/v4`. Pinning the anthropic URL here would
+#      break openclaw (wrong wire format). The two override tables are deliberately
+#      NOT shared for this reason.
+#   2. z.ai exposes four endpoint families (zai-global / zai-cn / zai-coding-global
+#      / zai-coding-cn). openclaw's `zai-api-key` auto-detect probes the GENERAL
+#      endpoints (zai-global, zai-cn) BEFORE the Coding Plan ones, and our create
+#      path writes a bare `{provider:zai}` auth profile that never runs that probe
+#      — so a GLM Coding-Plan key (which authorizes the *coding* surface) lands on
+#      the general endpoint and 401s "authentication failed" (what lodar hit).
+#      Pinning models.providers.zai.baseUrl to the coding-global URL selects the
+#      right surface deterministically. Coding-Plan CN users override per agent
+#      (`5dive agent <name> tui`) — we default to the global coding endpoint.
+declare -A OPENCLAW_PROVIDER_URL=(
+  [zai]="https://api.z.ai/api/coding/paas/v4"
 )
 # Optional per-(type, canonical) default model. Missing entry => leave the
 # agent's own default selection logic alone. Conservative defaults: pick

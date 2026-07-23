@@ -29,6 +29,46 @@ cmd_restart() {
   fi
 }
 
+# DIVE-1813: hidden, privileged SELF-restart primitive for a standard-isolation
+# agent. A standard agent has NO broad sudo, so it cannot run the deferred
+# `systemd-run … systemctl restart` that the telegram plugin's /restart + /model
+# use — sudo prompts for a password and the headless plugin fails with
+# "Failed to restart: sudo: a password is required" (broken on every customer
+# box). This is reachable ONLY via the scoped NOPASSWD grant a standard agent
+# gets (render_standard_sudoers: NOPASSWD on EXACTLY `/usr/local/bin/5dive agent
+# _self_restart`, no args, no wildcard).
+#
+# Why this is safe (same invariant as _deliver/_capture/_audit_append): it NEVER
+# execs caller-controlled input and takes NO caller-controlled target. The unit
+# to restart is derived ENTIRELY from the REAL sudo caller (SUDO_USER), so the
+# agent can restart ONLY its OWN service and nothing else — it cannot reach a
+# peer's unit even by passing arguments (there are none to pass; extra argv is
+# refused). The restart command handed to systemd-run is a FIXED, name-only
+# systemctl invocation (no eval / sh -c / printf-format), so the `*`-free exact
+# grant cannot become an agent->root vector (upholds the write_admin_sudoers
+# standing invariant, DIVE-756/916/950/1413). Deferred (~1s transient unit) so
+# the restart survives the caller's own session teardown — a bare non-deferred
+# restart would SIGTERM the caller mid-flight (why we don't route through
+# `_svc`, whose restart is non-deferred). Not advertised.
+cmd_self_restart() {
+  require_root "agent _self_restart"
+  [[ $# -eq 0 ]] || fail "$E_USAGE" "agent _self_restart takes no arguments (target is derived from the sudo caller)"
+  # Derive the caller's OWN unit from the real sudo user. Never trust argv.
+  local caller="${SUDO_USER:-}"
+  [[ -n "$caller" && "$caller" != "root" ]] \
+    || fail "$E_PERMISSION" "agent _self_restart must be invoked via sudo by an agent-* user"
+  [[ "$caller" =~ ^agent-([A-Za-z0-9_.-]+)$ ]] \
+    || fail "$E_PERMISSION" "refusing: caller '$caller' is not an agent-* user"
+  local name="${BASH_REMATCH[1]}"
+  require_agent "$name"
+  # Fixed, name-only command (no caller injection); the ~1s transient unit
+  # survives this caller's teardown so its own SIGTERM can't abort the restart.
+  systemd-run --on-active=1 --collect \
+    /bin/systemctl restart "5dive-agent@${name}.service" >&2
+  ok "agent '$name' self-restart scheduled (deferred ~1s)." \
+     '{name:$n, action:"restart", self:true, deferred:true}' --arg n "$name"
+}
+
 cmd_rm() {
   local name="${1:-}"
   [[ -n "$name" ]] || fail "$E_USAGE" "usage: 5dive agent rm <name>"
