@@ -6,7 +6,8 @@
 #   - first fire files an APPROVAL `task need` (routed to lodar) and BLOCKS,
 #     recording the approval task ident; nothing publishes,
 #   - a pending gate keeps blocking and does NOT re-file the task,
-#   - a HUMAN-answered 'approve' flips .publishApproved=true and lets it proceed,
+#   - a nonce-backed human 'approve' flips .publishApproved=true and proceeds,
+#   - an empty-nonce human:* approve (FUNNEA-3 shape) does NOT authorize,
 #   - once approved, the gate is a no-op pass (task layer never touched),
 #   - a human REJECT blocks.
 # Run: bash tests/proof_publish_gate_unit.sh   (no root, no network).
@@ -65,8 +66,20 @@ else
 fi
 [ ! -s "$ADD_LOG" ] && ok_t "pending gate does NOT re-file the task" || bad_t "no re-file" "$(cat "$ADD_LOG")"
 
-# --- Case 3: a HUMAN-answered approve proceeds + flips the flag --------------
-GATE_REC="approve${US}human:lodar${US}"
+# --- Case 2b: an EMPTY-nonce human:* approve (FUNNEA-3 shape) must NOT flip ---
+# main 2026-07-23: a gate answered 'approve' by human:main with an empty
+# human_nonce_hash is distrust-worthy — the rail label alone is not a verifiable
+# tap. Authorizing a PUBLIC badge must require the nonce, so this BLOCKS.
+GATE_REC="approve${US}human:main${US}"   # human: provenance, NO nonce
+if ( _proof_publish_gate ) >/dev/null 2>&1; then
+  bad_t "empty-nonce human:* blocks" "gate authorized on a nonce-less human:* approve"
+else
+  ok_t "empty-nonce human:* approve BLOCKS (no verifiable tap)"
+fi
+[ "$(jq -r '.publishApproved' "$STATE_DIR/proof.json")" = "false" ] && ok_t "empty-nonce approve keeps publishApproved=false" || bad_t "empty-nonce flipped" "$(jq -r '.publishApproved' "$STATE_DIR/proof.json")"
+
+# --- Case 3: a nonce-backed human approve proceeds + flips the flag ----------
+GATE_REC="approve${US}human:lodar${US}tap_nonce_abc123"   # genuine tap: nonce present
 if ( _proof_publish_gate ) >/dev/null 2>&1; then
   ok_t "human approve -> gate PASSES (publish may proceed)"
 else
@@ -81,7 +94,7 @@ if ( _proof_publish_gate ) >/dev/null 2>&1; then ok_t "already-approved -> pass"
 
 # --- Case 5: a human REJECT blocks ------------------------------------------
 echo '{"approvalTaskIdent":"DIVE-777","publishApproved":false}' > "$STATE_DIR/proof.json"
-GATE_REC="no${US}human:lodar${US}"
+GATE_REC="no${US}human:lodar${US}tap_nonce_abc123"   # genuine tap, but a decline
 if ( _proof_publish_gate ) >/dev/null 2>&1; then
   bad_t "reject blocks" "gate returned 0 after a reject"
 else

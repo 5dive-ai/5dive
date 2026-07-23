@@ -109,10 +109,15 @@ _proof_publish_gate() {
                FROM tasks WHERE ident = $(sqlq "$ident");" 2>/dev/null || true)"
     ans="${rec%%$'\x1f'*}"; rec="${rec#*$'\x1f'}"
     by="${rec%%$'\x1f'*}"; nonce="${rec#*$'\x1f'}"
-    # HUMAN-only (DIVE-1117 provenance): a human rail or a human-tap nonce. A
-    # lead/agent clearance must NOT be able to flip the public-publish gate.
+    # AUTHORIZING a public emission demands the STRONGEST human proof: the
+    # DIVE-756/1448 human-tap nonce. A 'human:*' provenance string WITHOUT a nonce
+    # (seen live on FUNNEA-3, main 2026-07-23) is NOT enough to flip the public
+    # badge — the tap is the tamper-evident signal, the rail label alone is not.
+    # This is deliberately STRICTER than the autonomy ledger, which inclusively
+    # counts any human-answered gate (human:* OR nonce) as an ask: measuring "did
+    # a human touch it" is inclusive; authorizing "go public" is strict.
     local human=0 approve=0
-    { [[ "$by" == human:* ]] || [ -n "$nonce" ]; } && human=1
+    [ -n "$nonce" ] && human=1
     case "$(printf '%s' "$ans" | tr 'A-Z' 'a-z')" in
       approve|approved|yes|ok|go|"go ahead") approve=1 ;;
     esac
@@ -121,8 +126,14 @@ _proof_publish_gate() {
       jq '.publishApproved=true' <<<"$cur" > "$f.tmp" 2>/dev/null && mv "$f.tmp" "$f" || true
       return 0
     fi
-    if [ -n "$ans" ] && [ "$human" = 1 ]; then
+    if [ "$human" = 1 ] && [ -n "$ans" ]; then
       echo "proof publish: BLOCKED — lodar declined the public badge on ${ident} (answer: ${ans}). Nothing published." >&2
+      return 1
+    fi
+    if [ -n "$ans" ]; then
+      # Answered, but without a verifiable human-tap nonce (e.g. a human:* rail
+      # answer that never satisfied the tap — the FUNNEA-3 shape). Do NOT authorize.
+      echo "proof publish: BLOCKED — the approval on ${ident} (by=${by:-?}) has no verifiable human-tap nonce; not authorizing a public badge. Re-approve via the inline tap. Nothing published." >&2
       return 1
     fi
     echo "proof publish: BLOCKED — waiting on lodar's approval (gate on ${ident}). Nothing published." >&2
