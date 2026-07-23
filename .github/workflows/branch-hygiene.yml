@@ -57,6 +57,27 @@ jobs:
             echo 'This hosted workflow cleans remote refs only. DIVE-1527 left 2 residual ordinary directories after permission failures, 15 exact-head-merged worktree registrations, and 7 dangling metadata records for owner/root cleanup. Open-PR, dirty, detached, and non-matching worktrees remain preserved.'
           } >> "$GITHUB_STEP_SUMMARY"
 
+  stale-digest:
+    # Read-only weekly digest (DIVE-1833): flags unmerged PRs >3d and branches
+    # with no activity >14d into the run summary. Never deletes/labels/closes,
+    # so it runs on every trigger (including the dry-run dispatch) and is not
+    # coupled to the merged-branch delete path.
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Flag stale PRs and dead branches
+        env:
+          GH_TOKEN: ${{ github.token }}
+          STALE_PR_DAYS: '3'
+          DEAD_BRANCH_DAYS: '14'
+        run: scripts/branch-hygiene.sh --report >> "$GITHUB_STEP_SUMMARY"
+
   stale-pull-requests:
     if: github.event_name == 'schedule' || inputs.apply
     runs-on: ubuntu-latest
