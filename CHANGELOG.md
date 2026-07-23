@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.13.17 — PII denylist scanner as a CI gate (DIVE-1774) (2026-07-23)
+
+- feat(ci): `pii-guard` GitHub Action + `scripts/pii-scan.sh` — a HARD RULE gate that scans every PR (title, body, commit messages, added diff lines) and the release notes (`CHANGELOG.md`) against a hashed denylist (`.github/pii-denylist.txt`). A denylist hit fails the check and blocks merge/release. The denylist stores only SHA-256 hashes, never plaintext, so no real identifier is committed to this public repo; exact-hash matching keeps false positives at zero. Candidate tokens = emails plus 7-15 digit runs (raw and phone-separator-stripped).
+- docs(claude): new repo `CLAUDE.md` author rule — never put real user ids/emails/phones in public artifacts; use placeholders. Enforced by `pii-guard`.
+
 ## 0.13.16 — welcome DM: surface an open-your-bot nudge when the paired chat never opened the bot (DIVE-1768) (2026-07-22)
 
 - **fix(pairing): `send_welcome_message` no longer swallows Telegram's 403 for an unreachable bot.** `curl` exits 0 on an HTTP 403, so the old `-o /dev/null … || warn` silently dropped the "bot can't initiate conversation with a user" / "chat not found" case — an owner auto-paired into `access.json` (CoS-create or operator auto-pair) who had never opened the bot got allowlisted with no welcome and no signal at all. The send now reads the JSON body: on the unreachable-bot case it names the bot via `getMe`, prints an actionable `ACTION: open Telegram, find @<bot>, press Start` nudge, and returns 3; a real send returns 0; any other API error returns 1. Both `cmd_pair` paths and the CoS-create path flag the pending state — `agent pair --json` now emits `welcomePending:true` + a `nudge` string (dashboard-readable) and the CLI warns loudly. New `tests/welcome_403_nudge_unit.sh` (10 assertions). DIVE-1768.
