@@ -26,7 +26,7 @@ esac
 
 # Bumped on every public release. `build.sh` checks this line exists; CI fails
 # the bundle-drift check if it's missing or empty.
-readonly FIVE_VERSION="0.13.19"
+readonly FIVE_VERSION="0.13.22"
 
 # GitHub org our repos live under. The org is being renamed
 # 5dive-com -> 5dive-ai (2026-06); fetches must work on either side of the
@@ -456,6 +456,18 @@ declare -A HERMES_PROVIDER_ID=(
   [minimax]="minimax"
   [qwen]="alibaba"
   [huggingface]="huggingface"
+)
+# Explicit BYO base_url override for hermes, keyed by canonical id. hermes
+# normally auto-resolves model.base_url from its own provider catalog, but for
+# z.ai that catalog resolves an endpoint the GLM Coding-Plan key does NOT auth
+# against, so hermes+zai fails "Provider authentication failed" even with a
+# correct key (DIVE-1819). We pin the verified anthropic-wire endpoint z.ai
+# actually serves the coding models on (same one pi and the claude anthropic-skin
+# use — CLAUDE_PROVIDER_BASEURL[zai]). Only providers with a known-good override
+# are listed; everything else falls through to hermes' catalog resolution
+# (base_url left unset, see _apply_byo_hermes).
+declare -A HERMES_PROVIDER_URL=(
+  [zai]="https://api.z.ai/api/anthropic"
 )
 declare -A OPENCLAW_PROVIDER_ID=(
   [openai]="openai"
@@ -7467,6 +7479,11 @@ render_standard_sudoers() {
 ${user} ALL=(root) NOPASSWD: /usr/local/bin/5dive agent _deliver *
 ${user} ALL=(root) NOPASSWD: /usr/local/bin/5dive agent _capture *
 ${user} ALL=(root) NOPASSWD: /usr/local/bin/5dive _audit_append
+# DIVE-1813: let this agent restart its OWN service (so /model + /restart work).
+# EXACT path, NO args, NO wildcard — the target unit is derived from SUDO_USER
+# inside _self_restart, never from argv, so it can restart ONLY itself, never a
+# peer. Deferred internally; needs no raw systemd-run/systemctl grant.
+${user} ALL=(root) NOPASSWD: /usr/local/bin/5dive agent _self_restart
 SUDOERS
   if [[ "$can_push" == "1" ]]; then
     cat <<SUDOERS
@@ -7723,10 +7740,31 @@ KIMI_ENV
     "$bin" config set model.provider "$native" >&2 \
     || warn "hermes config set model.provider=$native failed (rerun: sudo -u claude -H $bin config set model.provider $native)"
   # hermes auto-resolves model.base_url from its provider catalog when
-  # model.base_url is unset — explicitly unset it so a stale openai-codex
-  # value from a prior oauth login doesn't pin the agent to chatgpt.com.
-  sudo -u claude -H env HERMES_HOME="$hermes_home" \
-    "$bin" config set model.base_url "" >&2 2>/dev/null || true
+  # model.base_url is unset, and we unset any stale value so a prior openai-codex
+  # oauth base_url can't pin the agent to chatgpt.com. But for a provider whose
+  # catalog entry resolves the WRONG endpoint, the unset lets hermes hit a URL
+  # the key won't auth against. z.ai is exactly this: its coding models are served
+  # in anthropic wire format at api.z.ai/api/anthropic (what pi + the claude
+  # anthropic-skin use), but hermes' catalog resolves a different zai URL, so
+  # hermes+zai failed "Provider authentication failed" even with a correct key
+  # (DIVE-1819). When we have a verified override for this provider, pin it
+  # explicitly; otherwise fall back to the stale-value-clearing unset.
+  local hermes_base_url="${HERMES_PROVIDER_URL[$canonical]:-}"
+  if [[ -n "$hermes_base_url" ]]; then
+    sudo -u claude -H env HERMES_HOME="$hermes_home" \
+      "$bin" config set model.base_url "$hermes_base_url" >&2 2>/dev/null \
+      || warn "hermes config set model.base_url=$hermes_base_url failed"
+  else
+    sudo -u claude -H env HERMES_HOME="$hermes_home" \
+      "$bin" config set model.base_url "" >&2 2>/dev/null || true
+  fi
+  # z.ai key-TYPE hint (DIVE-1819): the anthropic endpoint we pin above is z.ai's
+  # officially-supported *coding* route, which authorizes a GLM Coding-Plan key.
+  # A standard prepaid/API-only z.ai key may 401 "Provider authentication failed"
+  # there. Surface it so an auth failure reads as key-type, not a broken config.
+  if [[ "$canonical" == "zai" ]]; then
+    step "z.ai note: use your GLM Coding-Plan key (z.ai → Coding Plan) for GLM coding models; a standard prepaid API key may fail auth on the anthropic endpoint."
+  fi
   local model="${override_model:-${HERMES_PROVIDER_MODEL[$canonical]:-}}"
   if [[ -n "$model" ]]; then
     sudo -u claude -H env HERMES_HOME="$hermes_home" \
@@ -8806,6 +8844,46 @@ cmd_restart() {
     ok "agent '$name' restarted." \
        '{name:$n, action:"restart"}' --arg n "$name"
   fi
+}
+
+# DIVE-1813: hidden, privileged SELF-restart primitive for a standard-isolation
+# agent. A standard agent has NO broad sudo, so it cannot run the deferred
+# `systemd-run … systemctl restart` that the telegram plugin's /restart + /model
+# use — sudo prompts for a password and the headless plugin fails with
+# "Failed to restart: sudo: a password is required" (broken on every customer
+# box). This is reachable ONLY via the scoped NOPASSWD grant a standard agent
+# gets (render_standard_sudoers: NOPASSWD on EXACTLY `/usr/local/bin/5dive agent
+# _self_restart`, no args, no wildcard).
+#
+# Why this is safe (same invariant as _deliver/_capture/_audit_append): it NEVER
+# execs caller-controlled input and takes NO caller-controlled target. The unit
+# to restart is derived ENTIRELY from the REAL sudo caller (SUDO_USER), so the
+# agent can restart ONLY its OWN service and nothing else — it cannot reach a
+# peer's unit even by passing arguments (there are none to pass; extra argv is
+# refused). The restart command handed to systemd-run is a FIXED, name-only
+# systemctl invocation (no eval / sh -c / printf-format), so the `*`-free exact
+# grant cannot become an agent->root vector (upholds the write_admin_sudoers
+# standing invariant, DIVE-756/916/950/1413). Deferred (~1s transient unit) so
+# the restart survives the caller's own session teardown — a bare non-deferred
+# restart would SIGTERM the caller mid-flight (why we don't route through
+# `_svc`, whose restart is non-deferred). Not advertised.
+cmd_self_restart() {
+  require_root "agent _self_restart"
+  [[ $# -eq 0 ]] || fail "$E_USAGE" "agent _self_restart takes no arguments (target is derived from the sudo caller)"
+  # Derive the caller's OWN unit from the real sudo user. Never trust argv.
+  local caller="${SUDO_USER:-}"
+  [[ -n "$caller" && "$caller" != "root" ]] \
+    || fail "$E_PERMISSION" "agent _self_restart must be invoked via sudo by an agent-* user"
+  [[ "$caller" =~ ^agent-([A-Za-z0-9_.-]+)$ ]] \
+    || fail "$E_PERMISSION" "refusing: caller '$caller' is not an agent-* user"
+  local name="${BASH_REMATCH[1]}"
+  require_agent "$name"
+  # Fixed, name-only command (no caller injection); the ~1s transient unit
+  # survives this caller's teardown so its own SIGTERM can't abort the restart.
+  systemd-run --on-active=1 --collect \
+    /bin/systemctl restart "5dive-agent@${name}.service" >&2
+  ok "agent '$name' self-restart scheduled (deferred ~1s)." \
+     '{name:$n, action:"restart", self:true, deferred:true}' --arg n "$name"
 }
 
 cmd_rm() {
@@ -14791,8 +14869,14 @@ cmd_doctor() {
     elif ! jq -e '.allowedChannelPlugins | any(.plugin == "telegram" and .marketplace == "5dive-plugins")' "$ms" >/dev/null 2>&1; then
       doctor_add channels managed-settings warn \
         "$ms doesn't list telegram@5dive-plugins — local channel allowlist won't permit the fork" false false
+    elif ! jq -e '.allowedChannelPlugins | any(.plugin == "dashboard" and .marketplace == "5dive-plugins")' "$ms" >/dev/null 2>&1; then
+      # DIVE-1816: dashboard is a channel too; if it's unlisted, Claude drops
+      # dashboard-chat pings (agent silent on /dashboard/chat). Rerun install.sh
+      # to reconcile the allowlist in place.
+      doctor_add channels managed-settings warn \
+        "$ms doesn't list dashboard@5dive-plugins — dashboard-chat pings are dropped; rerun install.sh to reconcile" false false
     else
-      doctor_add channels managed-settings ok "$ms has channelsEnabled + telegram@5dive-plugins allowlisted"
+      doctor_add channels managed-settings ok "$ms has channelsEnabled + telegram/dashboard@5dive-plugins allowlisted"
     fi
 
     # Per-agent: read the MOST RECENT MCP log for the telegram plugin and
@@ -38442,6 +38526,11 @@ main() {
         # `5dive-*.service` sudoers lines that sudo-rs (Ubuntu 26.04) rejected. Reached
         # via the admin whole-CLI grant; enforces its 5dive-only scope in code.
         _svc)    cmd_svc "$@" ;;
+        # DIVE-1813: hidden privileged SELF-restart primitive (deferred restart
+        # of the CALLER'S OWN unit, derived from SUDO_USER — no argv target).
+        # Reached via the scoped render_standard_sudoers grant so a standard
+        # agent's /restart + /model work without a raw systemd-run/sudo grant.
+        _self_restart) cmd_self_restart "$@" ;;
         stats)   cmd_stats "$@" ;;
         create)
           AUDIT_CMD="agent create"; AUDIT_ARGS=("$@")
