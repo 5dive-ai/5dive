@@ -26,7 +26,7 @@ esac
 
 # Bumped on every public release. `build.sh` checks this line exists; CI fails
 # the bundle-drift check if it's missing or empty.
-readonly FIVE_VERSION="0.13.27"
+readonly FIVE_VERSION="0.13.28"
 
 # GitHub org our repos live under. The org is being renamed
 # 5dive-com -> 5dive-ai (2026-06); fetches must work on either side of the
@@ -17111,6 +17111,34 @@ cmd_task_assign() {
   ok "$ident assigned to $who" '{id:($i|tonumber), ident:$id, assignee:$a}' --arg i "$id" --arg id "$ident" --arg a "$who"
 }
 
+# _gate_gh_token — resolve a usable gh auth token for the DIVE-1830 merge-gate's
+# read-only PR-state queries. `task done` normally runs under sudo (EUID 0), which
+# has no gh login of its own, and the acting agent may itself be non-gh-authed
+# (e.g. agent-*); running gh in that caller env returns state=unknown and the gate
+# false-BLOCKS a legitimately-merged close (DIVE-1834). Resolution order:
+#   1. an explicit token already in the env (manual passthrough / CI),
+#   2. the REAL sudo invoker's gh login (SUDO_USER, when not root itself),
+#   3. the host's known gh-authed user `claude` (the same identity delegated push
+#      runs its git transport as) — reachable password-free from root,
+#   4. our own gh login, when we happen to be running as an authed user directly.
+# Fail-safe: empty output => the gate treats state as unknown => false-BLOCK,
+# never a false-CLOSE. Only ever used for read-only `gh pr view`/`gh pr list`.
+_gate_gh_token() {
+  local t u
+  t="${GH_TOKEN:-${GITHUB_TOKEN:-}}"
+  [[ -n "$t" ]] && { printf '%s' "$t"; return 0; }
+  u="${SUDO_USER:-}"
+  if [[ -n "$u" && "$u" != "root" ]] && command -v sudo >/dev/null 2>&1; then
+    t=$(sudo -n -u "$u" gh auth token 2>/dev/null || true)
+    [[ -n "$t" ]] && { printf '%s' "$t"; return 0; }
+  fi
+  if [[ "$(id -un 2>/dev/null)" == "root" ]] && command -v sudo >/dev/null 2>&1; then
+    t=$(sudo -n -u claude gh auth token 2>/dev/null || true)
+    [[ -n "$t" ]] && { printf '%s' "$t"; return 0; }
+  fi
+  gh auth token 2>/dev/null || true
+}
+
 _task_status_cmd() {
   local newstatus="$1" extra="$2" verb="$3"; shift 3
   tasks_db_init
@@ -17205,18 +17233,26 @@ _task_status_cmd() {
       if ! command -v gh >/dev/null 2>&1; then
         fail "$E_GENERIC" "$ident declared delivered work (${_dref:-branch $_branch}) but \`gh\` is unavailable to confirm it merged — install gh or close via the verifier on-box."
       fi
+      # DIVE-1834: run the read-only PR-state queries with an explicitly resolved
+      # token and repo so a plain `sudo task done` works without a manual
+      # GH_TOKEN. Without this, sudo/root (no gh login) and non-authed agents
+      # both got state=unknown and false-blocked. Repo is passed explicitly so
+      # the branch-path query is CWD-independent (was `gh pr list` with no --repo,
+      # which errors outside a repo checkout).
+      local _ghtok; _ghtok=$(_gate_gh_token)
       if [[ -n "$_dref" ]]; then
         local _state _merged
-        _state=$(gh pr view "$_dref" --json state,mergedAt -q '.state' 2>/dev/null || echo "")
-        _merged=$(gh pr view "$_dref" --json state,mergedAt -q '.mergedAt' 2>/dev/null || echo "")
+        _state=$(GH_TOKEN="$_ghtok" gh pr view "$_dref" --json state,mergedAt -q '.state' 2>/dev/null || echo "")
+        _merged=$(GH_TOKEN="$_ghtok" gh pr view "$_dref" --json state,mergedAt -q '.mergedAt' 2>/dev/null || echo "")
         if [[ "$_state" != "MERGED" || -z "$_merged" || "$_merged" == "null" ]]; then
           fail "$E_CONFLICT" "$ident cannot close: its delivery PR is not merged to main yet ($_dref, state=${_state:-unknown}). done=merged-to-main (DIVE-1830) — merge the PR, then run task done. Use \`task cancel\` to abandon."
         fi
       else
-        local _bmerged
-        _bmerged=$(gh pr list --head "$_branch" --state merged --json number,mergedAt -q '.[0].mergedAt' 2>/dev/null || echo "")
+        local _slug _bmerged
+        _slug=$(_push_repo_slug "$_PUSH_DEFAULT_REPO")
+        _bmerged=$(GH_TOKEN="$_ghtok" gh pr list --repo "$_slug" --head "$_branch" --state merged --json number,mergedAt -q '.[0].mergedAt' 2>/dev/null || echo "")
         if [[ -z "$_bmerged" || "$_bmerged" == "null" ]]; then
-          fail "$E_CONFLICT" "$ident cannot close: no MERGED PR found for its branch '$_branch'. done=merged-to-main (DIVE-1830) — open and merge a PR for that branch, then run task done. Use \`task cancel\` to abandon."
+          fail "$E_CONFLICT" "$ident cannot close: no MERGED PR found for its branch '$_branch' in $_slug. done=merged-to-main (DIVE-1830) — open and merge a PR for that branch, then run task done. Use \`task cancel\` to abandon."
         fi
       fi
     fi
