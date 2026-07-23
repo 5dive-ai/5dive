@@ -400,10 +400,31 @@ KIMI_ENV
     "$bin" config set model.provider "$native" >&2 \
     || warn "hermes config set model.provider=$native failed (rerun: sudo -u claude -H $bin config set model.provider $native)"
   # hermes auto-resolves model.base_url from its provider catalog when
-  # model.base_url is unset — explicitly unset it so a stale openai-codex
-  # value from a prior oauth login doesn't pin the agent to chatgpt.com.
-  sudo -u claude -H env HERMES_HOME="$hermes_home" \
-    "$bin" config set model.base_url "" >&2 2>/dev/null || true
+  # model.base_url is unset, and we unset any stale value so a prior openai-codex
+  # oauth base_url can't pin the agent to chatgpt.com. But for a provider whose
+  # catalog entry resolves the WRONG endpoint, the unset lets hermes hit a URL
+  # the key won't auth against. z.ai is exactly this: its coding models are served
+  # in anthropic wire format at api.z.ai/api/anthropic (what pi + the claude
+  # anthropic-skin use), but hermes' catalog resolves a different zai URL, so
+  # hermes+zai failed "Provider authentication failed" even with a correct key
+  # (DIVE-1819). When we have a verified override for this provider, pin it
+  # explicitly; otherwise fall back to the stale-value-clearing unset.
+  local hermes_base_url="${HERMES_PROVIDER_URL[$canonical]:-}"
+  if [[ -n "$hermes_base_url" ]]; then
+    sudo -u claude -H env HERMES_HOME="$hermes_home" \
+      "$bin" config set model.base_url "$hermes_base_url" >&2 2>/dev/null \
+      || warn "hermes config set model.base_url=$hermes_base_url failed"
+  else
+    sudo -u claude -H env HERMES_HOME="$hermes_home" \
+      "$bin" config set model.base_url "" >&2 2>/dev/null || true
+  fi
+  # z.ai key-TYPE hint (DIVE-1819): the anthropic endpoint we pin above is z.ai's
+  # officially-supported *coding* route, which authorizes a GLM Coding-Plan key.
+  # A standard prepaid/API-only z.ai key may 401 "Provider authentication failed"
+  # there. Surface it so an auth failure reads as key-type, not a broken config.
+  if [[ "$canonical" == "zai" ]]; then
+    step "z.ai note: use your GLM Coding-Plan key (z.ai → Coding Plan) for GLM coding models; a standard prepaid API key may fail auth on the anthropic endpoint."
+  fi
   local model="${override_model:-${HERMES_PROVIDER_MODEL[$canonical]:-}}"
   if [[ -n "$model" ]]; then
     sudo -u claude -H env HERMES_HOME="$hermes_home" \
