@@ -139,6 +139,11 @@ render_standard_sudoers() {
 ${user} ALL=(root) NOPASSWD: /usr/local/bin/5dive agent _deliver *
 ${user} ALL=(root) NOPASSWD: /usr/local/bin/5dive agent _capture *
 ${user} ALL=(root) NOPASSWD: /usr/local/bin/5dive _audit_append
+# DIVE-1813: let this agent restart its OWN service (so /model + /restart work).
+# EXACT path, NO args, NO wildcard — the target unit is derived from SUDO_USER
+# inside _self_restart, never from argv, so it can restart ONLY itself, never a
+# peer. Deferred internally; needs no raw systemd-run/systemctl grant.
+${user} ALL=(root) NOPASSWD: /usr/local/bin/5dive agent _self_restart
 SUDOERS
   if [[ "$can_push" == "1" ]]; then
     cat <<SUDOERS
