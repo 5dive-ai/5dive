@@ -1,0 +1,46 @@
+name: pii-guard
+
+# HARD RULE (DIVE-1774): block any PR/push/release-note that leaks a denylisted
+# real team identifier. Scans PR title + body, the PR's commit messages, the
+# added lines of the diff, and the release notes (CHANGELOG.md) against the
+# hashed denylist in .github/pii-denylist.txt. A hit fails the check.
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened]
+  push:
+    branches: [main]
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Scan for denylisted PII
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          rc=0
+          scan() { bash scripts/pii-scan.sh || rc=1; }
+
+          # 1. PR title + body
+          if [ -n "${HEAD_SHA:-}" ]; then
+            printf '%s\n%s\n' "$PR_TITLE" "$PR_BODY" | bash scripts/pii-scan.sh || rc=1
+            # 2. commit messages in the PR range
+            git log --format='%B' "$BASE_SHA..$HEAD_SHA" | bash scripts/pii-scan.sh || rc=1
+            # 3. added lines of the diff only (drop +++ file headers)
+            git diff "$BASE_SHA..$HEAD_SHA" | grep -E '^\+' | grep -vE '^\+\+\+' \
+              | sed 's/^+//' | bash scripts/pii-scan.sh || rc=1
+          else
+            # push to main: scan the head commit message
+            git log -1 --format='%B' | bash scripts/pii-scan.sh || rc=1
+          fi
+
+          # 4. release-notes gate (always)
+          bash scripts/pii-scan.sh CHANGELOG.md || rc=1
+
+          exit $rc

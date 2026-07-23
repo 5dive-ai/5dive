@@ -1,0 +1,16 @@
+# PII denylist (DIVE-1774) — SHA-256 hashes of real team identifiers that must
+# NEVER appear in public artifacts: PR titles/bodies, commit messages, diffs,
+# code, tests, and release notes (CHANGELOG.md).
+#
+# Store ONLY hashes here, never the plaintext value. Add an entry with:
+#     printf '%s' '<identifier>' | sha256sum
+# For phone numbers, hash the digits-only form (no spaces, dashes, parens, +).
+# Keep this list high-signal (zero false positives) — one hash per real value.
+#
+# OUT OF SCOPE (do NOT add): the commit author email markounik@gmail.com is
+# intentionally public for the Vercel team check.
+#
+# Format: <sha256>  # <label, no PII>
+
+2c89aaa2f109ee8f3728e096c9a0570dd0c5b9cfb9897ea24f24785a4265fce5  # telegram id — primary
+931879f120e939c1ff3a5578fbb899f1e6e6516159b350266627aa1f219b0c09  # telegram id — secondary
