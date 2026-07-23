@@ -393,8 +393,14 @@ KIMI_ENV
   fi
 
   step "Writing hermes BYO credential for '$canonical' (native id: $native)"
+  # Pass the key on STDIN only, never on argv. `hermes auth add` reads the key
+  # from its secure prompt (getpass), which falls back to reading stdin when
+  # there's no tty — verified against hermes v0.19.0: the piped key lands in
+  # auth.json with no --api-key argv. Passing --api-key "$api_key" here would
+  # expose the BYO secret in /proc/<pid>/cmdline + ps for the life of the call
+  # (DIVE-1818).
   printf '%s' "$api_key" | sudo -u claude -H env HERMES_HOME="$hermes_home" \
-    "$bin" auth add "$native" --type api-key --api-key "$api_key" --label "${canonical}-byo" >&2 \
+    "$bin" auth add "$native" --type api-key --label "${canonical}-byo" >&2 \
     || fail "$E_GENERIC" "hermes auth add $native failed"
   sudo -u claude -H env HERMES_HOME="$hermes_home" \
     "$bin" config set model.provider "$native" >&2 \
