@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.14.0 — autonomy ledger + `5dive proof` badge with a gated public publish (OSS-38, OSS-39) (2026-07-23)
+
+- **feat(proof): `5dive proof status` shows this company's autonomy badge — `1 − asks/shipped` over the lifetime ledger, materialized from EXISTING task data (OSS-38), no new capture path.** A shipped action is a done standard task; it counts as an "ask" only if it carried a gate a HUMAN answered — the DIVE-1117 provenance rail (`need_answered_by LIKE 'human:%'`) or a human-tap nonce (`human_nonce_hash`). A lead/agent clearance does not count. Note `need_answered_uid` alone does NOT mark a human (DIVE-756 captures that uid on every sudo'd answer as tamper-evidence), so keying the metric off it would over-count asks and understate autonomy; the ledger uses the human-provenance signal instead. `proof status` is read-only and local — no clone, no network — and `--json` carries the full `autonomy` object.
+- **feat(proof): load-bearing publish guardrail (OSS-39).** Emitting the badge is a public brand/comms act, so the FIRST `proof publish` files an approval `task need` to lodar and BLOCKS — no badge goes live without a human tap. Only a human-answered approve flips the stored `publishApproved` flag and lets publishing proceed; a pending gate keeps blocking without re-filing, and a decline blocks. `proof on/off` toggle the daily publisher autonomously; `proof publish --dry-run` previews locally without the gate (it pushes nothing).
+- test: `tests/proof_ledger_unit.sh` (badge math, 8 assertions) and `tests/proof_publish_gate_unit.sh` (the gate fires to lodar and blocks until a human approve, 13 assertions).
+
 ## 0.13.17 — PII denylist scanner as a CI gate (DIVE-1774) (2026-07-23)
 
 - feat(ci): `pii-guard` GitHub Action + `scripts/pii-scan.sh` — a HARD RULE gate that scans every PR (title, body, commit messages, added diff lines) and the release notes (`CHANGELOG.md`) against a hashed denylist (`.github/pii-denylist.txt`). A denylist hit fails the check and blocks merge/release. The denylist stores only SHA-256 hashes, never plaintext, so no real identifier is committed to this public repo; exact-hash matching keeps false positives at zero. Candidate tokens = emails plus 7-15 digit runs (raw and phone-separator-stripped).
