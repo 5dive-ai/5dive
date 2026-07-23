@@ -26,7 +26,7 @@ esac
 
 # Bumped on every public release. `build.sh` checks this line exists; CI fails
 # the bundle-drift check if it's missing or empty.
-readonly FIVE_VERSION="0.13.20"
+readonly FIVE_VERSION="0.13.21"
 
 # GitHub org our repos live under. The org is being renamed
 # 5dive-com -> 5dive-ai (2026-06); fetches must work on either side of the
@@ -456,6 +456,18 @@ declare -A HERMES_PROVIDER_ID=(
   [minimax]="minimax"
   [qwen]="alibaba"
   [huggingface]="huggingface"
+)
+# Explicit BYO base_url override for hermes, keyed by canonical id. hermes
+# normally auto-resolves model.base_url from its own provider catalog, but for
+# z.ai that catalog resolves an endpoint the GLM Coding-Plan key does NOT auth
+# against, so hermes+zai fails "Provider authentication failed" even with a
+# correct key (DIVE-1819). We pin the verified anthropic-wire endpoint z.ai
+# actually serves the coding models on (same one pi and the claude anthropic-skin
+# use — CLAUDE_PROVIDER_BASEURL[zai]). Only providers with a known-good override
+# are listed; everything else falls through to hermes' catalog resolution
+# (base_url left unset, see _apply_byo_hermes).
+declare -A HERMES_PROVIDER_URL=(
+  [zai]="https://api.z.ai/api/anthropic"
 )
 declare -A OPENCLAW_PROVIDER_ID=(
   [openai]="openai"
