@@ -10,7 +10,8 @@ mode="dry-run"
 case "${1:-}" in
   ""|--dry-run) ;;
   --apply) mode="apply" ;;
-  *) echo "usage: $0 [--dry-run|--apply]" >&2; exit 2 ;;
+  --report) mode="report" ;;
+  *) echo "usage: $0 [--dry-run|--apply|--report]" >&2; exit 2 ;;
 esac
 
 GH_BIN="${GH_BIN:-gh}"
@@ -36,6 +37,77 @@ owner="${repo%%/*}"
 urlencode() {
   jq -rn --arg value "$1" '$value | @uri'
 }
+
+# --report is a read-only digest pass: it FLAGS (never deletes/labels/closes)
+# unmerged PRs older than STALE_PR_DAYS and branches with no commit activity for
+# DEAD_BRANCH_DAYS, emitting Markdown on stdout for the weekly workflow to append
+# to its run summary. Kept separate from the delete path so hygiene-flagging is
+# never coupled to branch deletion (DIVE-1833, scope-2 of DIVE-1830).
+report_stale() {
+  local pr_days="${STALE_PR_DAYS:-3}"
+  local br_days="${DEAD_BRANCH_DAYS:-14}"
+  local now pr_cutoff br_cutoff default_branch
+  now=$(date -u +%s)
+  pr_cutoff=$((pr_days * 86400))
+  br_cutoff=$((br_days * 86400))
+  default_branch=$("$GH_BIN" api "repos/$repo" --jq .default_branch)
+
+  # Open PR heads are excluded from the dead-branch list: a branch with an open
+  # PR is already surfaced by the stale-PR section, so it is not "dead".
+  declare -A open_head=()
+  open_head["$default_branch"]=1
+  while IFS= read -r ref; do
+    [[ -n "$ref" ]] && open_head["$ref"]=1
+  done < <("$GH_BIN" api --paginate "repos/$repo/pulls?state=open&per_page=100" --jq '.[].head.ref')
+
+  echo "### Branch hygiene digest"
+  echo
+
+  # Stale unmerged PRs: open (hence unmerged) and older than the threshold. Age
+  # is measured from creation; updated_at is shown so a maintainer can see the
+  # last touch without opening each PR.
+  local pr_flagged=0
+  echo "#### Unmerged PRs open >${pr_days}d"
+  while IFS=$'\t' read -r num ref created updated title; do
+    [[ -n "$num" ]] || continue
+    local created_epoch age_days
+    created_epoch=$(date -u -d "$created" +%s)
+    (( now - created_epoch >= pr_cutoff )) || continue
+    age_days=$(( (now - created_epoch) / 86400 ))
+    echo "- #${num} \`${ref}\` — ${age_days}d old (updated ${updated%%T*}) — ${title}"
+    pr_flagged=$((pr_flagged + 1))
+  done < <("$GH_BIN" api --paginate "repos/$repo/pulls?state=open&per_page=100" \
+    --jq '.[] | [.number, .head.ref, .created_at, .updated_at, .title] | @tsv')
+  (( pr_flagged > 0 )) || echo "- none"
+  echo
+
+  # Dead branches: no commit activity for the threshold, excluding the default
+  # branch and any branch with an open PR. Read-only; nothing is deleted here.
+  local br_flagged=0
+  echo "#### Branches with no activity >${br_days}d"
+  while IFS=$'\t' read -r branch sha; do
+    [[ -n "$branch" ]] || continue
+    [[ -n "${open_head[$branch]:-}" ]] && continue
+    local commit_date commit_epoch age_days
+    commit_date=$("$GH_BIN" api "repos/$repo/commits/$sha" --jq .commit.committer.date 2>/dev/null || true)
+    [[ -n "$commit_date" ]] || continue
+    commit_epoch=$(date -u -d "$commit_date" +%s)
+    (( now - commit_epoch >= br_cutoff )) || continue
+    age_days=$(( (now - commit_epoch) / 86400 ))
+    echo "- \`${branch}\` — ${age_days}d since last commit (${commit_date%%T*})"
+    br_flagged=$((br_flagged + 1))
+  done < <("$GH_BIN" api --paginate "repos/$repo/branches?per_page=100" \
+    --jq '.[] | [.name, .commit.sha] | @tsv')
+  (( br_flagged > 0 )) || echo "- none"
+  echo
+
+  echo "_Flagged ${pr_flagged} stale PR(s) and ${br_flagged} dead branch(es). This is a report only; nothing was deleted, labelled, or closed._"
+}
+
+if [[ "$mode" == "report" ]]; then
+  report_stale
+  exit 0
+fi
 
 declare -A preserve=()
 while IFS= read -r branch; do
