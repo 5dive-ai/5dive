@@ -730,13 +730,14 @@ _gate_gh_token() {
 _task_status_cmd() {
   local newstatus="$1" extra="$2" verb="$3"; shift 3
   tasks_db_init
-  local result="" want_result=0 notify=0 no_preflight=0
+  local result="" want_result=0 notify=0 no_preflight=0 force_merge_gate=0
   local -a positional=()
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --result=*)     result="${1#*=}"; want_result=1 ;;
       --notify)       notify=1 ;;
       --no-preflight) no_preflight=1 ;;
+      --force-merge-gate) force_merge_gate=1 ;;  # DIVE-1835: audited escape from the mandatory auto-detect gate
       --)         shift; positional+=("$@"); break ;;
       -*)         fail "$E_USAGE" "unknown flag: $1" ;;
       *)          positional+=("$1") ;;
@@ -843,6 +844,45 @@ _task_status_cmd() {
           fail "$E_CONFLICT" "$ident cannot close: no MERGED PR found for its branch '$_branch' in $_slug. done=merged-to-main (DIVE-1830) — open and merge a PR for that branch, then run task done. Use \`task cancel\` to abandon."
         fi
       fi
+    fi
+  fi
+  # DIVE-1835 MANDATORY auto-detect merge-gate. The DIVE-1830 gate above fires
+  # only when the maker DECLARED a binding (delivery_ref / Branch: line); 8
+  # code-tasks closed with NEITHER and slipped straight through. This second
+  # gate closes that hole: it runs ONLY when no binding was declared, and
+  # detects code bound to the ident WITHOUT the maker self-declaring — an OPEN,
+  # unmerged PR whose TITLE or HEAD-BRANCH names the ident (never the PR body: a
+  # "follow-up to DIVE-N" mention would false-block; OPEN only: an abandoned /
+  # closed-unmerged PR must never make the task unclosable).
+  #   Auto-detect is FAIL-OPEN by design — the opposite of the declared path's
+  # fail-closed. It runs on EVERY no-binding close (incl. research/docs/heartbeat,
+  # which simply won't match), so a gh outage/timeout/absence must NEVER block
+  # the whole fleet from closing anything (the fleet-stall design-flaw class,
+  # DIVE-1830). Fail-open slips are the acceptable trade: the weekly
+  # branch-hygiene digest (#139, DIVE-1833) catches any unmerged PR/branch left
+  # behind. `--force-merge-gate` is the audited manual escape (a mandatory gate
+  # with no escape is a footgun) — logged, and its leftover PR is digest-flagged.
+  if [[ "$verb" == "done" && -z "$_dref" && -z "$_branch" ]]; then
+    local _auto_hit=""
+    if command -v gh >/dev/null 2>&1; then
+      local _ghtok2 _slug2
+      _ghtok2=$(_gate_gh_token)
+      _slug2=$(_push_repo_slug "$_PUSH_DEFAULT_REPO")
+      # One bounded, read-only listing; filter title/headRefName client-side so a
+      # body-only mention can't match. `timeout 5s` + `|| echo ""` => any slow/
+      # failed/absent gh yields no hit and the close proceeds (fail-open).
+      _auto_hit=$(GH_TOKEN="$_ghtok2" timeout 5s gh pr list --repo "$_slug2" \
+                    --state open --limit 200 --json number,headRefName,title \
+                    -q "[.[] | select((.title|contains(\"$ident\")) or (.headRefName|contains(\"$ident\"))) | .number] | .[0] // empty" \
+                    2>/dev/null || echo "")
+    fi
+    if [[ $force_merge_gate -eq 1 ]]; then
+      # Never a silent bypass: record the forced close (with the overridden PR #
+      # if any) to the tamper-evident audit log. The unmerged PR/branch it leaves
+      # behind is independently flagged by the weekly hygiene digest (#139).
+      audit_log "task.force-merge-gate" ok 0 -- "$ident" "override_pr=${_auto_hit:-none}"
+    elif [[ -n "$_auto_hit" ]]; then
+      fail "$E_CONFLICT" "$ident cannot close: open PR #$_auto_hit names it in its title/branch but is not merged to main. done=merged-to-main (DIVE-1835 mandatory gate) — merge it then \`task done\`, \`task cancel\` to abandon, or \`task done $ident --force-merge-gate\` to override (audited + surfaced in the weekly hygiene digest)."
     fi
   fi
   local set_result=""
