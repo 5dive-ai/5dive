@@ -473,6 +473,26 @@ MANAGED
     ln -sfn CLAUDE.md /home/claude/projects/AGENTS.md
     chown -h claude:claude /home/claude/projects/AGENTS.md
   fi
+
+  # Fleet-wide pre-push PII guard (DIVE-1797). Point any local 5dive-ai/5dive
+  # checkout on this box at its in-repo pre-push scanner (core.hooksPath). One
+  # config per clone covers every linked worktree AND every future one, so new
+  # landing boxes get the guard on install and existing ones on the daily update
+  # cron. Best-effort + idempotent; a box with no checkout is a clean no-op.
+  # WHY here and not branch protection: our landing account is the repo admin,
+  # so a required check only gates external PRs, never our own agent commits.
+  for _cli_co in /home/*/projects/*/5dive-cli /home/*/projects/5dive/5dive-cli /root/5dive-cli; do
+    [[ -e "$_cli_co/.git" ]] || continue
+    case "$(git -C "$_cli_co" config --get remote.origin.url 2>/dev/null)" in
+      *5dive-ai/5dive*) ;;
+      *) continue ;;
+    esac
+    if [[ -x "$_cli_co/scripts/install-pii-push-guard.sh" ]]; then
+      "$_cli_co/scripts/install-pii-push-guard.sh" "$_cli_co" >/dev/null 2>&1         && ok "pii-push-guard wired ($_cli_co)"
+    else
+      git -C "$_cli_co" config --local core.hooksPath scripts/git-hooks 2>/dev/null         && ok "pii-push-guard wired ($_cli_co)"
+    fi
+  done
 }
 
 # --- Subcommand dispatch ---------------------------------------------------
