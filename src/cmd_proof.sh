@@ -42,6 +42,115 @@ _proof_pref_get() {
   if [ -r "$f" ]; then jq -r "$filt // \"$def\"" "$f" 2>/dev/null || echo "$def"; else echo "$def"; fi
 }
 
+# _proof_ledger — OSS-38 autonomy ledger, MATERIALIZED from existing task data
+# (no new capture path). One shipped action = a done standard task. It "needed a
+# human" iff it carried a gate a HUMAN answered — the DIVE-1117 provenance floor:
+# need_answered_by LIKE 'human:%' (answered through a human rail) OR a
+# human_nonce_hash (a human tap token). A lead/agent clearance ('lead:*', a bare
+# agent name, 'auto:*') is NOT an ask.
+#
+# NB we deliberately DON'T key off need_answered_uid: DIVE-756 captures that REAL
+# uid on EVERY sudo'd answer (lead agents included) as tamper-evidence, so it is
+# not a human marker — counting it would over-count asks and dishonestly
+# understate autonomy (measured live: 76 uid-set vs 45 truly-human on a 312-ship
+# board → 75% vs the honest ~86%). The whole point is an honest number.
+#
+# Core metric = 1 - asks/shipped (the autonomy %). Emits ONE compact JSON object
+# on stdout; read-only, so `proof status` can call it locally. TASKS_DB is the
+# test seam (point it at a fixture db).
+_proof_ledger() {
+  local db_file="${TASKS_DB:-${TASKS_DIR:-/var/lib/5dive/tasks}/tasks.db}"
+  local shipped=0 asks=0 row=""
+  if [ -r "$db_file" ]; then
+    # Single row "shipped|asks"; COALESCE guards the all-NULL SUM on an empty set.
+    row="$(db "SELECT COUNT(*) || '|' || COALESCE(SUM(
+                 CASE WHEN need_type IS NOT NULL
+                       AND (need_answered_by LIKE 'human:%'
+                            OR (human_nonce_hash IS NOT NULL AND human_nonce_hash <> ''))
+                      THEN 1 ELSE 0 END), 0)
+               FROM tasks
+               WHERE status = 'done' AND kind = 'standard';" 2>/dev/null || true)"
+    [ -n "$row" ] && { shipped="${row%%|*}"; asks="${row##*|}"; }
+  fi
+  case "$shipped" in ''|*[!0-9]*) shipped=0 ;; esac
+  case "$asks"    in ''|*[!0-9]*) asks=0 ;; esac
+  # pct = 1 - asks/shipped, one decimal, trailing .0 dropped. Null when no ships.
+  local pct="null" pct_str=""
+  if [ "$shipped" -gt 0 ]; then
+    pct_str="$(awk -v a="$asks" -v s="$shipped" 'BEGIN{printf "%.1f", (1 - a/s)*100}')"
+    pct_str="${pct_str%.0}"
+    pct="$pct_str"
+  fi
+  jq -cn --argjson shipped "$shipped" --argjson asks "$asks" \
+     --argjson autonomous "$((shipped - asks))" --argjson pct "$pct" \
+     '{shipped:$shipped, asks:$asks, autonomous:$autonomous, autonomyPct:$pct}'
+}
+
+# _proof_publish_gate — LOAD-BEARING guardrail (OSS-39, olivia/lodar). A PUBLIC
+# badge must never fire without lodar's explicit tap. The FIRST publish files an
+# approval `task need` to lodar and BLOCKS; only a HUMAN-answered approve flips
+# proof.json .publishApproved=true and lets the publish proceed. Idempotent: it
+# reuses one approval task rather than re-filing on every attempt. Returns 0 to
+# proceed, non-zero (blocked) otherwise. Test seam: _PROOF_GATE_SKIP=1 bypasses
+# it for tests that exercise the publisher mechanics themselves.
+_proof_publish_gate() {
+  [ "${_PROOF_GATE_SKIP:-0}" = 1 ] && return 0
+  local f cur approved ident
+  f="$(_proof_pref_file)"; cur="$(cat "$f" 2>/dev/null || true)"; [ -n "$cur" ] || cur='{}'
+  approved="$(jq -r '.publishApproved // false' <<<"$cur" 2>/dev/null || echo false)"
+  [ "$approved" = "true" ] && return 0
+
+  ident="$(jq -r '.approvalTaskIdent // ""' <<<"$cur" 2>/dev/null || echo "")"
+  if [ -n "$ident" ]; then
+    # An approval task already exists — is its gate HUMAN-answered 'approve'?
+    local rec ans by nonce
+    rec="$(db "SELECT COALESCE(need_answer,'') || X'1f' || COALESCE(need_answered_by,'') || X'1f'
+                   || COALESCE(human_nonce_hash,'')
+               FROM tasks WHERE ident = $(sqlq "$ident");" 2>/dev/null || true)"
+    ans="${rec%%$'\x1f'*}"; rec="${rec#*$'\x1f'}"
+    by="${rec%%$'\x1f'*}"; nonce="${rec#*$'\x1f'}"
+    # HUMAN-only (DIVE-1117 provenance): a human rail or a human-tap nonce. A
+    # lead/agent clearance must NOT be able to flip the public-publish gate.
+    local human=0 approve=0
+    { [[ "$by" == human:* ]] || [ -n "$nonce" ]; } && human=1
+    case "$(printf '%s' "$ans" | tr 'A-Z' 'a-z')" in
+      approve|approved|yes|ok|go|"go ahead") approve=1 ;;
+    esac
+    if [ "$human" = 1 ] && [ "$approve" = 1 ]; then
+      cur="$(cat "$f" 2>/dev/null || echo '{}')"; [ -n "$cur" ] || cur='{}'
+      jq '.publishApproved=true' <<<"$cur" > "$f.tmp" 2>/dev/null && mv "$f.tmp" "$f" || true
+      return 0
+    fi
+    if [ -n "$ans" ] && [ "$human" = 1 ]; then
+      echo "proof publish: BLOCKED — lodar declined the public badge on ${ident} (answer: ${ans}). Nothing published." >&2
+      return 1
+    fi
+    echo "proof publish: BLOCKED — waiting on lodar's approval (gate on ${ident}). Nothing published." >&2
+    return 1
+  fi
+
+  # No approval task yet — create one + file an approval gate to lodar, then block.
+  local newident
+  newident="$(JSON_MODE=1 cmd_task_add "Approve public zero-human proof badge" \
+      --from=proof --priority=high \
+      --body="First public fire of the zero-human proof badge (\`5dive proof publish\`). Emitting it puts a public-facing brand/comms artifact live, so it needs lodar's explicit approval before anything publishes. Approve once you're ready for the badge to go live; publishing stays enabled afterward." \
+      2>/dev/null | jq -r '.data.ident // empty' 2>/dev/null || true)"
+  if [ -z "$newident" ]; then
+    echo "proof publish: BLOCKED — could not file the lodar approval gate; refusing to publish. Nothing published." >&2
+    return 1
+  fi
+  cmd_task_need "$newident" --type=approval --from=proof \
+    --ask="Approve publishing the PUBLIC zero-human proof badge? First public fire (brand/public-comms) — it goes live on your tap." \
+    --recommend="approve" >/dev/null 2>&1 || true
+  cur="$(cat "$f" 2>/dev/null || echo '{}')"; [ -n "$cur" ] || cur='{}'
+  mkdir -p "$(dirname "$f")" 2>/dev/null || true
+  jq --arg id "$newident" '.approvalTaskIdent=$id | .publishApproved=false' <<<"$cur" > "$f.tmp" 2>/dev/null \
+    && mv "$f.tmp" "$f" || true
+  echo "proof publish: BLOCKED — the public badge needs lodar's approval. Filed an approval gate on ${newident} to lodar." >&2
+  echo "  Nothing published. Once lodar taps approve, re-run \`5dive proof publish\` (or the daily tick) and it goes live." >&2
+  return 1
+}
+
 # _proof_repo_slug <repo-url> — OWNER/REPO from an https or ssh git URL (drops
 # the .git suffix). Empty if it doesn't look like a github-style URL.
 _proof_repo_slug() {
@@ -251,6 +360,13 @@ _proof_publish() {
   [ -n "$branch" ] || branch="$(_proof_pref_get '.branch')"
   [ -n "$branch" ] || branch="${ZH_BRANCH:-status}"
 
+  # OSS-39 LOAD-BEARING guardrail: a real publish must clear the lodar approval
+  # gate before anything public is emitted. A --dry-run builds locally and pushes
+  # nothing, so it previews without the gate.
+  if [ "$dry" -ne 1 ]; then
+    _proof_publish_gate || return 1
+  fi
+
   # first publish = the status branch doesn't exist on the remote yet.
   local first=0
   git ls-remote --exit-code --heads "$repo" "$branch" >/dev/null 2>&1 || first=1
@@ -333,9 +449,21 @@ _proof_onoff() {
       echo "proof: OFF (cron removed, config kept)"
       ;;
     status)
+      # OSS-38/39: the LOCAL autonomy badge, computed from the ledger. No clone,
+      # no publish — `proof status` is read-only and never touches the network.
+      local led; led="$(_proof_ledger)"
       if [ "${JSON_MODE:-0}" = 1 ]; then
-        jq -c '{enabled:(.enabled//false),repo:(.repo//null),branch:(.branch//"status"),hour:(.hour//9),lastPublished:(.lastPublished//null)}' <<<"$cur"
+        jq -c --argjson autonomy "$led" \
+          '{autonomy:$autonomy, enabled:(.enabled//false), publishApproved:(.publishApproved//false), repo:(.repo//null), branch:(.branch//"status"), hour:(.hour//9), lastPublished:(.lastPublished//null)}' <<<"$cur"
         return 0
+      fi
+      local _ship _ask _apct
+      _ship="$(jq -r '.shipped' <<<"$led")"; _ask="$(jq -r '.asks' <<<"$led")"
+      _apct="$(jq -r '.autonomyPct // empty' <<<"$led")"
+      if [ -n "$_apct" ]; then
+        echo "autonomy: ${_apct}% — ${_ship} shipped, ${_ask} needed a human (lifetime, 1 − asks/shipped)"
+      else
+        echo "autonomy: no shipped actions yet"
       fi
       local enabled repo_c branch_c hour_c user_c last today staleness as
       enabled="$(jq -r '.enabled // false' <<<"$cur")"
@@ -387,19 +515,25 @@ cmd_proof() {
     tick)          shift; _proof_tick "$@" ;;
     -h|--help|"")
       cat <<'HELP'
-usage: 5dive proof publish [--dry-run] [--repo=<url>] [--branch=<b>]
+usage: 5dive proof status [--json]                    # LOCAL autonomy badge + config (no network)
        5dive proof on --repo=<url> [--branch=status] [--at=<0-23>] [--user=<u>]
        5dive proof off
-       5dive proof status [--json]
+       5dive proof publish [--dry-run] [--repo=<url>] [--branch=<b>]
        5dive proof tick        # cron driver; gated on the pref
 
-Publishes this box's zero-human proof (badge.json + zero-human.json +
-history.jsonl) to a git status branch, computed VERBATIM from `5dive digest`.
-There is no flag to edit a number — the no-edit path is the point. Publish is
-idempotent per day (a re-run exits 3). See docs/zero-human.md for methodology.
+`proof status` shows this company's autonomy badge — 1 − asks/shipped over the
+lifetime ledger (OSS-38), materialized from task data: a shipped action is a
+done task; it "needed a human" only if it carried a gate a HUMAN answered (a
+lead/agent clearance does not count). Read-only, local, no publish.
 
---user sets the cron's effective user (default root). It must own the box's
-git push credentials, or the nightly push fails silently as visible staleness.
+`proof publish` writes the badge (badge.json + zero-human.json + history.jsonl)
+to a git status branch, computed VERBATIM from `5dive digest` — there is no flag
+to edit a number, the no-edit path is the point; idempotent per day (re-run
+exits 3). GUARDRAIL: publishing is a PUBLIC brand/comms act, so the FIRST fire
+files an approval gate to lodar and BLOCKS — no badge goes live without lodar's
+tap. `proof on/off` toggle the daily publisher; `--user` sets the cron's
+effective user (default root), which must own the box's git push credentials or
+the nightly push fails silently as visible staleness. See docs/zero-human.md.
 HELP
       ;;
     *) fail "$E_USAGE" "proof: unknown subcommand: ${1:-} (publish|on|off|status|tick)" ;;
