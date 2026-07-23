@@ -26,7 +26,7 @@ esac
 
 # Bumped on every public release. `build.sh` checks this line exists; CI fails
 # the bundle-drift check if it's missing or empty.
-readonly FIVE_VERSION="0.13.25"
+readonly FIVE_VERSION="0.13.26"
 
 # GitHub org our repos live under. The org is being renamed
 # 5dive-com -> 5dive-ai (2026-06); fetches must work on either side of the
@@ -3504,6 +3504,7 @@ _tasks_db_migrate() {
            'secret_key TEXT' 'connector TEXT' 'human_nonce_hash TEXT' \
            'ask_shape TEXT' 'precedent_ref INTEGER' 'precedent_kind TEXT' \
            'shipped_flag_at TEXT' 'routed_reviewer TEXT' \
+           'delivery_ref TEXT' 'delivered_at TEXT' \
            'originated_by_objective INTEGER' 'originated_cycle INTEGER' \
            'verify_unavailable INTEGER'; do
     if ! printf '%s\n' "$cols" | grep -qx "${c%% *}"; then
@@ -16413,6 +16414,11 @@ _task_usage() {
                                                      # writes/updates a 'Branch: <name>' line in the body. Also: task add --branch=<name>
   5dive task start  <id|DIVE-N>                      # -> in_progress
   5dive task done   <id|DIVE-N> [--result=<text>]    # -> done; --result captures the agent's response
+  5dive task deliver <id|DIVE-N> --pr=<url> [--result=<text>]
+                                                     # maker: record the delivery PR + hand to verifier; 'task done' stays
+                                                     # BLOCKED until the work is MERGED to main (opt-in merge-gate, DIVE-1830).
+                                                     # The gate honors EITHER binding: a delivery_ref (this PR url) OR an
+                                                     # existing 'Branch: <name>' body line (delegated-push binding, DIVE-1462).
   5dive task verify <id|DIVE-N> [--cmd="<command>"] [--no-done] [--timeout=<s>]
                                                      # run a check; exit 0 => proven-done (flips to done,
                                                      # captures output tail). Verb exits 0/1 = the verdict.
@@ -16487,6 +16493,7 @@ cmd_task() {
     set-branch)      cmd_task_set_branch "$@" ;;
     start)           cmd_task_start "$@" ;;
     done|close)      cmd_task_done "$@" ;;
+    deliver)         cmd_task_deliver "$@" ;;
     verify)          cmd_task_verify "$@" ;;
     reject)          cmd_task_reject "$@" ;;
     loop)            cmd_task_loop "$@" ;;
@@ -17124,6 +17131,43 @@ _task_status_cmd() {
       fail "$E_CONFLICT" "$ident has a pending '${_gt}' gate awaiting a human — answer it (5dive task answer $ident ...) or abandon the task (5dive task cancel $ident) instead of marking done. A gated/public ship must not close ahead of its gate (DIVE-555)."
     fi
   fi
+  # DIVE-1830 merge-gate (opt-in): a task that declared DELIVERED WORK cannot
+  # close until that work is MERGED to main — done means merged-to-main, not "PR
+  # opened". Only a REAL close reaches here (verifier routing + the DIVE-555
+  # pending-gate check both returned/failed above). Two bindings count as a
+  # declaration; the gate fires when EITHER is present, else it's untouched (a
+  # plain close with no binding is unchanged — zero regression, opt-in):
+  #   1. delivery_ref — the PR URL recorded by `task deliver --pr=`.
+  #   2. a `Branch: <name>` line in the task body — the EXISTING delegated-push
+  #      binding (DIVE-1462; resolved the same way cmd_push does). delivery_ref
+  #      wins when both are present.
+  if [[ "$verb" == "done" ]]; then
+    local _dref _branch=""
+    _dref=$(db "SELECT COALESCE(delivery_ref,'') FROM tasks WHERE id=${id};")
+    if [[ -z "$_dref" ]]; then
+      local _body; _body=$(db "SELECT COALESCE(body,'') FROM tasks WHERE id=${id};")
+      _branch=$(_push_branch_from_body "$_body")
+    fi
+    if [[ -n "$_dref" || -n "$_branch" ]]; then
+      if ! command -v gh >/dev/null 2>&1; then
+        fail "$E_GENERIC" "$ident declared delivered work (${_dref:-branch $_branch}) but \`gh\` is unavailable to confirm it merged — install gh or close via the verifier on-box."
+      fi
+      if [[ -n "$_dref" ]]; then
+        local _state _merged
+        _state=$(gh pr view "$_dref" --json state,mergedAt -q '.state' 2>/dev/null || echo "")
+        _merged=$(gh pr view "$_dref" --json state,mergedAt -q '.mergedAt' 2>/dev/null || echo "")
+        if [[ "$_state" != "MERGED" || -z "$_merged" || "$_merged" == "null" ]]; then
+          fail "$E_CONFLICT" "$ident cannot close: its delivery PR is not merged to main yet ($_dref, state=${_state:-unknown}). done=merged-to-main (DIVE-1830) — merge the PR, then run task done. Use \`task cancel\` to abandon."
+        fi
+      else
+        local _bmerged
+        _bmerged=$(gh pr list --head "$_branch" --state merged --json number,mergedAt -q '.[0].mergedAt' 2>/dev/null || echo "")
+        if [[ -z "$_bmerged" || "$_bmerged" == "null" ]]; then
+          fail "$E_CONFLICT" "$ident cannot close: no MERGED PR found for its branch '$_branch'. done=merged-to-main (DIVE-1830) — open and merge a PR for that branch, then run task done. Use \`task cancel\` to abandon."
+        fi
+      fi
+    fi
+  fi
   local set_result=""
   if (( want_result )); then
     set_result=", result=$(sqlq_or_null "$result")"
@@ -17250,6 +17294,51 @@ _task_start_preflight() {
 cmd_task_start()  { _task_status_cmd in_progress ", started_at=COALESCE(started_at, datetime('now'))" start "$@"; }
 cmd_task_done()   { _task_status_cmd done ", done_at=datetime('now')" done "$@"; }
 cmd_task_cancel() { _task_status_cmd cancelled ", done_at=datetime('now')" cancel "$@"; }
+
+# DIVE-1830: `task deliver` — the maker records the PR that delivers this task,
+# then hands off to the verifier for review. This is the OPT-IN half of the
+# merge-gate: once a task carries a delivery_ref, its `task done` will not close
+# until that PR is MERGED to main (see the gate in _task_status_cmd). Delivery
+# reuses the DIVE-477 in-review handoff — it does NOT invent a new status. When
+# there is no distinct verifier, the delivery is still recorded but the task
+# stays in_progress: a verifier must close it after the merge (done ≠ delivered).
+cmd_task_deliver() {
+  tasks_db_init
+  local task="" pr="" result="" want_result=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --pr=*)      pr="${1#*=}" ;;
+      --result=*)  result="${1#*=}"; want_result=1 ;;
+      -*)          fail "$E_USAGE" "unknown flag: $1" ;;
+      *)           [[ -z "$task" ]] && task="$1" || fail "$E_USAGE" "unexpected arg: $1" ;;
+    esac
+    shift
+  done
+  [[ -n "$task" ]] || fail "$E_USAGE" "usage: 5dive task deliver <id|DIVE-N> --pr=<url> [--result=<text>]"
+  [[ -n "$pr" ]]   || fail "$E_USAGE" "task deliver requires --pr=<url> (the PR that delivers this task; done stays blocked until it is MERGED — DIVE-1830)"
+  # Basic sanity: a delivery ref must look like a PR URL, not a bare word.
+  if [[ "$pr" != http*://* && "$pr" != *github.com* ]]; then
+    fail "$E_VALIDATION" "--pr must be a URL (e.g. https://github.com/<org>/<repo>/pull/<n>) — got '$pr'"
+  fi
+  resolve_task_id "$task"; local id="$RESOLVED_TASK_ID" ident="$RESOLVED_TASK_IDENT"
+  # Record the delivery ref + timestamp before the handoff, so the merge-gate can
+  # see it regardless of where the task lands next.
+  db "UPDATE tasks SET delivery_ref=$(sqlq "$pr"), delivered_at=datetime('now') WHERE id=${id};"
+  local _vfier _asignee
+  _vfier=$(db "SELECT COALESCE(verifier,'')  FROM tasks WHERE id=${id};")
+  _asignee=$(db "SELECT COALESCE(assignee,'') FROM tasks WHERE id=${id};")
+  if [[ -n "$_vfier" && "$_vfier" != "$_asignee" ]]; then
+    # Hand off to the verifier exactly like a maker's `task done` (DIVE-477).
+    _task_route_to_verifier "$id" "$_vfier" "$_asignee" "$result" "$want_result"
+    return
+  fi
+  # No distinct verifier: record the delivery but do NOT close — a verifier must
+  # confirm the merge and close it. Leave the task in_progress.
+  (( want_result )) && db "UPDATE tasks SET result=$(sqlq_or_null "$result") WHERE id=${id};"
+  ok "$ident delivered ($pr) — recorded; it has no distinct verifier, so have a verifier close it via 'task done' AFTER the PR is merged (done stays blocked until then — DIVE-1830)" \
+     '{id:($i|tonumber), ident:$id, deliveryRef:$p, delivered:true, routedTo:null, status:"in_progress"}' \
+     --arg i "$id" --arg id "$ident" --arg p "$pr"
+}
 
 # DIVE-477: hand a maker-completed task to its verifier instead of closing it.
 # Stash the original maker (first writer wins, so it survives re-routes) so a

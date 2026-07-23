@@ -684,6 +684,7 @@ _tasks_db_migrate() {
            'secret_key TEXT' 'connector TEXT' 'human_nonce_hash TEXT' \
            'ask_shape TEXT' 'precedent_ref INTEGER' 'precedent_kind TEXT' \
            'shipped_flag_at TEXT' 'routed_reviewer TEXT' \
+           'delivery_ref TEXT' 'delivered_at TEXT' \
            'originated_by_objective INTEGER' 'originated_cycle INTEGER' \
            'verify_unavailable INTEGER'; do
     if ! printf '%s\n' "$cols" | grep -qx "${c%% *}"; then
