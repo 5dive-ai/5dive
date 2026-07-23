@@ -375,6 +375,11 @@ main() {
         # `5dive-*.service` sudoers lines that sudo-rs (Ubuntu 26.04) rejected. Reached
         # via the admin whole-CLI grant; enforces its 5dive-only scope in code.
         _svc)    cmd_svc "$@" ;;
+        # DIVE-1813: hidden privileged SELF-restart primitive (deferred restart
+        # of the CALLER'S OWN unit, derived from SUDO_USER — no argv target).
+        # Reached via the scoped render_standard_sudoers grant so a standard
+        # agent's /restart + /model work without a raw systemd-run/sudo grant.
+        _self_restart) cmd_self_restart "$@" ;;
         stats)   cmd_stats "$@" ;;
         create)
           AUDIT_CMD="agent create"; AUDIT_ARGS=("$@")
