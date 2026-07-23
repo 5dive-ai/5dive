@@ -22,7 +22,7 @@ mkdir -p "$TASKS_DIR"
 tasks_db_init; _tasks_db_migrate
 
 ACCESS="$TMP/access.json"
-printf '{"allowFrom":["433634012"]}' >"$ACCESS"
+printf '{"allowFrom":["1234567890"]}' >"$ACCESS"
 
 SEND_LOG="$TMP/sends"; : >"$SEND_LOG"
 LAST_TEXT="$TMP/text"; LAST_MARKUP="$TMP/markup"
@@ -65,7 +65,7 @@ reset
 g1=$(mk_gate DIVE-21 decision 'A|B' A)
 g2=$(mk_gate DIVE-22 approval '' approved)
 g3=$(mk_gate DIVE-23 manual '' '')
-out=$(cmd_task_inbox --send --channel-proof=433634012 2>&1); rc=$?
+out=$(cmd_task_inbox --send --channel-proof=1234567890 2>&1); rc=$?
 approval_cb=$(jq -r --arg p "tna:${g2}:approved:" '[.inline_keyboard[][] | .callback_data | select(startswith($p))][0] // empty' "$LAST_MARKUP")
 approval_nonce=${approval_cb##*:}
 manual_cb=$(jq -r --arg p "tna:${g3}:done:" '[.inline_keyboard[][] | .callback_data | select(startswith($p))][0] // empty' "$LAST_MARKUP")

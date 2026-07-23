@@ -225,7 +225,7 @@ ok(!!addCall && addCall.includes('--no-verify') && addCall.some(a => a === '--as
 ok(!!addCall && addCall.some(a => a === '--from=council'), 'ballot: ballot task is filed --from=council')
 
 // ---- DIVE-1564: HUMAN-AS-SEAT ballot branch (Telegram tap closes the SAME ballot task) ----
-const hseat = { id: 'lodar', kind: 'human', chat: '433634012', lens: 'founder' }
+const hseat = { id: 'lodar', kind: 'human', chat: '1234567890', lens: 'founder' }
 
 // (h1) an UNBOUND human seat -> fail-closed ABSTAIN, mints NO task and emits NO ballot (never drop silently)
 const capUnbound = []
@@ -250,7 +250,7 @@ const hBody = (hAdd || []).find(a => String(a).startsWith('--body='))
 ok(!!hBody && !hBody.includes('theo') && !hBody.includes('secret leaks'), 'human ballot: round-1 body is BLIND (no other seat’s vote)')
 
 // (h3) the emit payload targets the seat chat with the blind question + 3 well-formed buttons under the 64B cap
-ok(!!emitted && emitted.chat === '433634012' && /ship v0.12\?/.test(emitted.text), 'human ballot: emit payload targets the seat chat with the blind question')
+ok(!!emitted && emitted.chat === '1234567890' && /ship v0.12\?/.test(emitted.text), 'human ballot: emit payload targets the seat chat with the blind question')
 ok(!!emitted && Array.isArray(emitted.buttons) && emitted.buttons.length === 3, 'human ballot: emit carries 3 buttons')
 const codes = (emitted.buttons || []).map(b => (b.callback_data.match(/^cvote:([^:]+):([are]):([0-9a-f]+)$/) || [])[2])
 ok(codes.join(',') === 'a,r,e', 'human ballot: buttons are Approve/Reject/Abstain with a|r|e verbs')

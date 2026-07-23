@@ -50,17 +50,17 @@ ok('forged --veto-by is refused (exit 9)', r.code === 9)
 ok('forge refusal is logged/explained', /refused:.*veto-by/.test(r.err || ''))
 
 // CNCL-9 NON-BLOCKING OFFER: a primary-council pass records the offer + STAYS a pass.
-r = runCli(['convene', 'Ship it?', '--seats=a,b,c', '--veto-principal=human:main', '--veto-resolved=433634012', '--veto-window=900', '--stamped-at=T'], MOCK)
+r = runCli(['convene', 'Ship it?', '--seats=a,b,c', '--veto-principal=human:main', '--veto-resolved=1234567890', '--veto-window=900', '--stamped-at=T'], MOCK)
 v = JSON.parse(r.out)
 ok('veto offer does NOT block (pass stays pass)', v.disposition === 'pass' && v.verdict.vetoed !== true)
 ok('offer recorded inside the signed bytes', /veto: offered human:main window 900s :: offered-not-exercised/.test(v.receipt.canonical))
 
 // CNCL-9 AUTHENTICATED EXERCISE: hold-tier tap flips to blocked; wrong recipient is refused.
 const vjson = JSON.stringify(v.verdict)
-r = runCli(['veto', 'exercise', '--orig-digest=D1', '--by=human:main', '--resolved=433634012', '--tier=hold', '--reason=hold', `--verdict=${vjson}`, '--stamped-at=T'])
+r = runCli(['veto', 'exercise', '--orig-digest=D1', '--by=human:main', '--resolved=1234567890', '--tier=hold', '--reason=hold', `--verdict=${vjson}`, '--stamped-at=T'])
 let vx = JSON.parse(r.out)
 ok('hold-tier exercise -> blocked + chained record', vx.disposition === 'blocked' && vx.vetoRecord.origDigest === 'D1' && vx.vetoRecord.tier === 'hold')
-r = runCli(['veto', 'exercise', '--orig-digest=D1', '--by=human:main', '--resolved=433634012', '--tier=posthoc', `--verdict=${vjson}`, '--stamped-at=T'])
+r = runCli(['veto', 'exercise', '--orig-digest=D1', '--by=human:main', '--resolved=1234567890', '--tier=posthoc', `--verdict=${vjson}`, '--stamped-at=T'])
 vx = JSON.parse(r.out)
 ok('posthoc-tier exercise -> unwind required', vx.disposition === 'blocked' && vx.vetoRecord.unwindRequired === true)
 r = runCli(['veto', 'exercise', '--orig-digest=D1', '--by=human:main', '--resolved=999999', '--tier=hold', `--verdict=${vjson}`], {})
@@ -114,12 +114,12 @@ ok('ad-hoc --seats convene NOT gated by genesis', r.code === 0)
 const greg = path.join(os.tmpdir(), `council-genesis-${process.pid}.json`)
 try { fs.unlinkSync(greg) } catch {}
 // init once: seeds the council bench + emits a canonical record for bash to seal.
-r = runCli(['init', '--seats=main:chair,codex,olivia', '--threshold=2/3', '--veto=human:main', '--veto-resolved=433634012', '--genesis-exists=0', `--registry=${greg}`, '--stamped-at=T'])
+r = runCli(['init', '--seats=main:chair,codex,olivia', '--threshold=2/3', '--veto=human:main', '--veto-resolved=1234567890', '--genesis-exists=0', `--registry=${greg}`, '--stamped-at=T'])
 ok('init once exits 0', r.code === 0)
 let g = JSON.parse(r.out)
 ok('init emits genesis record + canonical', g.genesis && g.genesis.kind === 'genesis' && typeof g.canonical === 'string')
 ok('init records the chair', g.chair === 'main' && g.genesis.seats.find(s => s.id === 'main').chair === true)
-ok('init records resolved veto principal', g.genesis.veto.principal === 'human:main' && g.genesis.veto.resolved === '433634012')
+ok('init records resolved veto principal', g.genesis.veto.principal === 'human:main' && g.genesis.veto.resolved === '1234567890')
 ok('init seeds the council bench (motion-governed)', JSON.parse(fs.readFileSync(greg, 'utf-8')).council.genesis === true)
 // init TWICE (genesis already exists) -> refused, unless --force.
 r = runCli(['init', '--seats=a,b', '--veto=human:main', '--veto-resolved=1', `--registry=${greg}`, '--genesis-exists=1', '--stamped-at=T'])

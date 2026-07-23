@@ -33,7 +33,7 @@ ok(){ echo "  ok:   $1"; pass=$((pass+1)); }
 no(){ echo "  FAIL: $1"; fail=$((fail+1)); }
 
 # --- (1) genesis seeds v0 + seals its digest ----------------------------------------------------
-"$FIVE" council init --seats="main:chair,theo,olivia" --threshold="majority" --veto="tg:433634012" >/dev/null 2>&1 \
+"$FIVE" council init --seats="main:chair,theo,olivia" --threshold="majority" --veto="tg:1234567890" >/dev/null 2>&1 \
   || { echo "FAIL: council init (cannot seal genesis — no gate-proof rail?)"; exit 1; }
 [[ -f "$CFILE" ]] && ok "init seeded the v0 constitution on disk" || no "init did not seed constitution.yaml"
 GEN_DIGEST="$(jq -r 'select(.kind=="genesis") | .record.constitutionDigest' "$LIN" 2>/dev/null | head -n1)"

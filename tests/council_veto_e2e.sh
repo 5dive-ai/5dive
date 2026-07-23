@@ -48,7 +48,7 @@ veto:
 EOF
 
 # --- genesis + a convene that offers the founder veto --------------------------------------------
-"$FIVE" council init --seats="a:chair,b,c" --threshold="majority" --veto="tg:433634012" >/dev/null 2>&1 \
+"$FIVE" council init --seats="a:chair,b,c" --threshold="majority" --veto="tg:1234567890" >/dev/null 2>&1 \
   || { echo "FAIL: council init (cannot seal genesis — no gate-proof rail?)"; exit 1; }
 
 OFFERSINK="$TMP/offer.sink"
@@ -70,7 +70,7 @@ OFFER_RCPT="$(awk -F'\t' 'NR==1{print $1}' "$OFFERSINK" 2>/dev/null)"
 OFFER_DIG="$(awk -F'\t' 'NR==1{print $2}' "$OFFERSINK" 2>/dev/null)"
 [[ "$OFFER_NONCE" == "$NONCE" ]] && ok "structured offer carries the RAW nonce (matches sealed offer)" || no "structured offer nonce mismatch"
 [[ "$OFFER_DIG" == "$DIGEST" ]] && ok "structured offer carries the receipt digest" || no "structured offer digest mismatch"
-[[ "$OFFER_RCPT" == "433634012" ]] && ok "structured offer targets the resolved founder recipient" || no "structured offer recipient wrong ($OFFER_RCPT)"
+[[ "$OFFER_RCPT" == "1234567890" ]] && ok "structured offer targets the resolved founder recipient" || no "structured offer recipient wrong ($OFFER_RCPT)"
 # --- DIVE-1644: the offer must be self-contained — carry WHAT carried (motion) + the vote tally so
 # the founder never vetoes a sealed digest blind. Columns 5/6 of the structured sink.
 OFFER_MOTION="$(awk -F'\t' 'NR==1{print $5}' "$OFFERSINK" 2>/dev/null)"
@@ -160,13 +160,13 @@ if [[ -s "$OFFER_FN" ]]; then
     _task_owner_channel() { return 0; }
     _mirror_send() { printf 'chat=%s\ntext=%s\nmarkup=%s\n' "$2" "$4" "$5" > "$CAP"; }
     source "$OFFER_FN"
-    _tg_veto_offer "433634012" "dQtU1Z_iCpWuT3Ggu6RyV3TnwDkWb_YdtmS1n6qXL10" "0123456789abcdef0123456789abcdef" "2026-01-01T00:00:00Z"
+    _tg_veto_offer "1234567890" "dQtU1Z_iCpWuT3Ggu6RyV3TnwDkWb_YdtmS1n6qXL10" "0123456789abcdef0123456789abcdef" "2026-01-01T00:00:00Z"
   )
   grep -q '"callback_data":"veto:dQtU1Z_iCpWu:0123456789abcdef0123456789abcdef"' "$CAP" \
     && ok "_tg_veto_offer button carries veto:<12prefix>:<nonce> in callback_data" || no "veto button callback_data wrong"
   awk -F'text=' '/^text=/{print $2}' "$CAP" | grep -q '0123456789abcdef' \
     && no "_tg_veto_offer LEAKED the raw nonce into the message text" || ok "_tg_veto_offer message text carries NO nonce (button-only)"
-  grep -q '^chat=433634012$' "$CAP" && ok "_tg_veto_offer targets the resolved founder chat" || no "_tg_veto_offer wrong chat"
+  grep -q '^chat=1234567890$' "$CAP" && ok "_tg_veto_offer targets the resolved founder chat" || no "_tg_veto_offer wrong chat"
 else
   no "could not extract _tg_veto_offer from the built bundle"
 fi

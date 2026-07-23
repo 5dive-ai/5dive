@@ -96,7 +96,7 @@ OUT3="$(echo '{}' | "$FIVE" constitution set --json 2>/dev/null)"
 O="$BASE/org"; mkdir -p "$O"
 export STATE_DIR="$O"
 OLIN="$O/council/lineage.jsonl"
-"$FIVE" council init --seats="main:chair,theo,olivia" --threshold="majority" --veto="tg:433634012" >/dev/null 2>&1 \
+"$FIVE" council init --seats="main:chair,theo,olivia" --threshold="majority" --veto="tg:1234567890" >/dev/null 2>&1 \
   || { echo "FAIL: could not seed a multi-seat council for the org route"; exit 1; }
 OB="$(echo '{"ship":{"require_ci":true}}' | "$FIVE" constitution set --json 2>/dev/null)"
 [[ "$(jq -r '.ok' <<<"$OB")" == "true" ]] && ok "org structured write returns a machine envelope" || no "org write no envelope ($OB)"

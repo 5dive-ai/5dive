@@ -35,14 +35,14 @@ ok(){ echo "  ok:   $1"; pass=$((pass+1)); }
 no(){ echo "  FAIL: $1"; fail=$((fail+1)); }
 
 # --- genesis: seed a 3-seat council (main chairs) ------------------------------------------------
-"$FIVE" council init --seats="main:chair,theo,olivia" --threshold="majority" --veto="tg:433634012" >/dev/null 2>&1 \
+"$FIVE" council init --seats="main:chair,theo,olivia" --threshold="majority" --veto="tg:1234567890" >/dev/null 2>&1 \
   || { echo "FAIL: council init (cannot seal genesis — no gate-proof rail?)"; exit 1; }
 
 # --- roster: live seats + threshold + veto holder + lineage head ---------------------------------
 R="$("$FIVE" council roster --json 2>/dev/null)"
 [[ "$(printf '%s' "$R" | jq -r '.data.seatCount')" == "3" ]] && ok "roster shows 3 seeded seats" || no "roster seatCount != 3 ($R)"
 [[ "$(printf '%s' "$R" | jq -r '.data.threshold')" == "2" ]] && ok "roster threshold = majority(3)=2" || no "roster threshold wrong"
-[[ "$(printf '%s' "$R" | jq -r '.data.veto.principal')" == "tg:433634012" ]] && ok "roster shows the founder-veto principal" || no "roster veto principal wrong"
+[[ "$(printf '%s' "$R" | jq -r '.data.veto.principal')" == "tg:1234567890" ]] && ok "roster shows the founder-veto principal" || no "roster veto principal wrong"
 [[ "$(printf '%s' "$R" | jq -r '.data.lineage.records')" == "1" ]] && ok "roster lineage head = 1 record (genesis)" || no "roster lineage records != 1"
 # CNCL-27: the chair flag must survive genesis -> persisted bench -> roster (JSON + text badge)
 [[ "$(printf '%s' "$R" | jq -r '.data.seats[] | select(.id=="main") | .chair')" == "true" ]] && ok "roster JSON carries the chair flag (main)" || no "roster dropped the chair flag ($R)"

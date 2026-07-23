@@ -47,7 +47,7 @@ mkgate() { # <title> <type> <tier> <ask> [recommend] [options]
 }
 
 # --- genesis so rot-triage's primary-council convene resolves (leg C) ----------------------------
-"$FIVE" council init --seats="a:chair,b,c" --threshold="majority" --veto="tg:433634012" >/dev/null 2>&1 \
+"$FIVE" council init --seats="a:chair,b,c" --threshold="majority" --veto="tg:1234567890" >/dev/null 2>&1 \
   || { echo "FAIL: council init (cannot seal genesis — no gate-proof rail?)"; exit 1; }
 
 # ================= LEG A: a genuine tier-1 gate is CLEARED with a sealed receipt =================

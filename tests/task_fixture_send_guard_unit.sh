@@ -22,7 +22,7 @@ mkdir -p "$TASKS_DIR"
 tasks_db_init; _tasks_db_migrate
 
 ACCESS="$TMP/access.json"
-printf '{"allowFrom":["433634012"]}' >"$ACCESS"
+printf '{"allowFrom":["1234567890"]}' >"$ACCESS"
 
 # Resolve a (fake) owner channel so the ONLY thing standing between a send and the human is the
 # guard — not a missing channel. The real _task_send_owner runs (NOT stubbed); we stub the layer
@@ -62,7 +62,7 @@ task_need_notify "$gid" decision "ship it?" "A|B" "A" >/dev/null 2>&1
   && ok "task_need_notify: fixture gate never DMs the human (the leaked leg — now closed)" \
   || no "task_need_notify leaked a fixture gate to the human (nsends=$(nsends))"
 
-out=$(_task_inbox_send "433634012" "need_type IS NOT NULL AND need_answered_at IS NULL AND status NOT IN ('done','cancelled')" "created_at" 2>&1); rc=$?
+out=$(_task_inbox_send "1234567890" "need_type IS NOT NULL AND need_answered_at IS NULL AND status NOT IN ('done','cancelled')" "created_at" 2>&1); rc=$?
 [[ "$rc" != "0" && "$out" == *"1506"* ]] \
   && ok "task inbox --send: refuses on a fixture DB with a clear DIVE-1506 message" \
   || no "inbox --send did not fail-closed on a fixture DB (rc=$rc out=$out)"

@@ -31,7 +31,7 @@ pass=0; fail=0
 ok(){ echo "  ok:   $1"; pass=$((pass+1)); }
 no(){ echo "  FAIL: $1"; fail=$((fail+1)); }
 
-"$FIVE" council init --seats="a:chair,b,c" --threshold="majority" --veto="tg:433634012" >/dev/null 2>&1 \
+"$FIVE" council init --seats="a:chair,b,c" --threshold="majority" --veto="tg:1234567890" >/dev/null 2>&1 \
   || { echo "FAIL: council init (cannot seal genesis — no gate-proof rail?)"; exit 1; }
 
 # (a) notice fires with disposition + tally when COUNCIL_NOTIFY is set

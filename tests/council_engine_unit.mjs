@@ -105,7 +105,7 @@ ok(removeSeat(roster, 'dario').length === 5 && !removeSeat(roster, 'dario').some
 // ---- CNCL-9: authenticated founder veto (non-blocking OFFER + two-tier authenticated EXERCISE) ----
 const passV = { recommendation: 'approve', escalated: false, tally: T(4, 1, 0), confidence: 0.9, dissent: 'none', brief: '' }
 const rejV = { recommendation: 'reject', escalated: false, tally: T(1, 4, 0), confidence: 0.8, dissent: 'x', brief: '' }
-const OFFER = { principal: 'human:main', resolved: '433634012', windowSecs: 900 }
+const OFFER = { principal: 'human:main', resolved: '1234567890', windowSecs: 900 }
 
 // OFFER is non-blocking: a pass STAYS a pass; the offer just rides on the verdict.
 const offered = attachVetoOffer(passV, OFFER)
@@ -116,15 +116,15 @@ ok(attachVetoOffer(rejV, OFFER).vetoOffer === undefined, 'no offer on a non-pass
 ok(attachVetoOffer(passV, { principal: 'x' }).vetoOffer === undefined, 'offer needs a resolved recipient (fail-closed)')
 
 // EXERCISE (authenticated tap) — HOLD tier flips to blocked, no unwind.
-const hold = exerciseFounderVeto(offered, { by: 'human:main', resolved: '433634012', reason: 'not now', tier: 'hold' })
+const hold = exerciseFounderVeto(offered, { by: 'human:main', resolved: '1234567890', reason: 'not now', tier: 'hold' })
 ok(hold.vetoed === true && hold.disposition === 'blocked' && hold.vetoTier === 'hold' && hold.unwindRequired === false, 'hold-tier tap flips pass -> blocked (no unwind)')
 ok(dispositionOf(hold) === 'blocked', 'dispositionOf(exercised) = blocked')
 // POSTHOC tier flips + requires unwind.
-const posthoc = exerciseFounderVeto(offered, { by: 'human:main', resolved: '433634012', tier: 'posthoc' })
+const posthoc = exerciseFounderVeto(offered, { by: 'human:main', resolved: '1234567890', tier: 'posthoc' })
 ok(posthoc.vetoed === true && posthoc.vetoTier === 'posthoc' && posthoc.unwindRequired === true, 'posthoc-tier tap flips + requires unwind')
 // FAIL-CLOSED: a tap from the wrong recipient, or on a verdict with no offer, is a no-op.
 ok(exerciseFounderVeto(offered, { by: 'human:main', resolved: '999', tier: 'hold' }).vetoed !== true, 'tap from wrong recipient is refused (no flip)')
-ok(exerciseFounderVeto(passV, { by: 'human:main', resolved: '433634012' }).vetoed !== true, 'exercise with no recorded offer is a no-op (fail-closed)')
+ok(exerciseFounderVeto(passV, { by: 'human:main', resolved: '1234567890' }).vetoed !== true, 'exercise with no recorded offer is a no-op (fail-closed)')
 ok(exerciseFounderVeto(offered, { by: 'human:main' }).vetoed !== true, 'exercise without a resolved recipient is a no-op')
 
 // config seam (CNCL-13/14): defaults + env override, no hardcode leaks.
@@ -133,7 +133,7 @@ ok(vetoConfig({ COUNCIL_VETO_HOLD_SECS: '60' }).holdSecs === 60, 'vetoConfig hon
 ok(vetoConfig({ COUNCIL_VETO_HOLD_SECS: 'bad' }).holdSecs === VETO_DEFAULTS.holdSecs, 'vetoConfig falls back on a bad value')
 
 // chained veto record references the ORIGINAL digest inside its own signed bytes.
-const vrec = buildVetoRecord({ origDigest: 'ABC', tier: 'posthoc', by: 'human:main', resolved: '433634012', reason: 'r', stampedAt: 'T', flippedVerdict: hold })
+const vrec = buildVetoRecord({ origDigest: 'ABC', tier: 'posthoc', by: 'human:main', resolved: '1234567890', reason: 'r', stampedAt: 'T', flippedVerdict: hold })
 ok(vrec.kind === 'veto' && vrec.origDigest === 'ABC' && vrec.unwindRequired === true, 'buildVetoRecord chains to orig digest + carries unwind')
 ok(canonicalVetoRecord(vrec).includes('origDigest: ABC') && canonicalVetoRecord(vrec).includes('tier: posthoc'), 'canonical veto record seals the chain link + tier')
 let threw = false; try { buildVetoRecord({ tier: 'hold', by: 'x', resolved: '1' }) } catch { threw = true }
@@ -147,7 +147,7 @@ const c1 = canonicalTranscript(rec)
 ok(c1 === canonicalTranscript({ ...rec, seats: ['theo', 'codex', 'main'] }), 'canonical is order-independent (stable bytes)')
 ok(c1 !== canonicalTranscript({ ...rec, question: 'ship v0.12?' }), 'any field edit changes the bytes (tamper-evident)')
 ok(c1.includes('veto: none'), 'no-offer receipt records veto: none inside the bytes')
-const cOffer = canonicalTranscript({ ...rec, verdict: { ...rec.verdict, vetoOffer: { principal: 'human:main', resolved: '433634012', windowSecs: 900, state: 'offered-not-exercised' } } })
+const cOffer = canonicalTranscript({ ...rec, verdict: { ...rec.verdict, vetoOffer: { principal: 'human:main', resolved: '1234567890', windowSecs: 900, state: 'offered-not-exercised' } } })
 ok(cOffer.includes('veto: offered human:main window 900s :: offered-not-exercised') && cOffer !== c1, 'veto OFFER is INSIDE the signed bytes')
 const cVeto = canonicalTranscript({ ...rec, verdict: { ...rec.verdict, vetoed: true, vetoTier: 'posthoc', vetoedBy: 'human:main', vetoReason: 'hold' } })
 ok(cVeto.includes('veto: exercised posthoc human:main :: hold') && cVeto !== c1, 'exercised veto (with tier) is INSIDE the signed bytes')
@@ -180,7 +180,7 @@ const r2 = await runCouncil({ role: 'convene', question: 'ship?' },
 ok(r2.verdict.recommendation === 'reject', 'runCouncil: 2/5 approve -> reject')
 // CNCL-9: a veto OFFER threads through runCouncil non-blocking — the pass stays a pass and the
 // offer rides inside the sealed receipt (the flip only ever happens later via an authenticated tap).
-const r3 = await runCouncil({ role: 'convene', question: 'ship?', vetoOffer: { principal: 'human:main', resolved: '433634012', windowSecs: 900 } },
+const r3 = await runCouncil({ role: 'convene', question: 'ship?', vetoOffer: { principal: 'human:main', resolved: '1234567890', windowSecs: 900 } },
   { modelCall: mockModel({ 'eng-lead': 'approve', brand: 'approve', builder: 'approve', strategy: 'approve', contrarian: 'approve' }) })
 ok(r3.verdict.recommendation === 'approve' && r3.verdict.vetoed !== true, 'runCouncil: veto offer does NOT block the pass')
 ok(r3.verdict.vetoOffer && r3.receipt.canonical.includes('veto: offered human:main window 900s'), 'runCouncil: offer rides inside the sealed receipt')
@@ -286,7 +286,7 @@ ok(cAuto.decisionClass === 'constitutional' && cAuto.recommendation === 'escalat
 // so the roster chair badge was dead on every seeded box) -----------------------------------
 const grec = buildGenesisRecord({
   seats: [{ id: 'main', lens: 'strategy', chair: true }, { id: 'theo', lens: 'growth' }],
-  chair: 'main', threshold: { rule: 'majority' }, veto: { principal: 'human:main', resolved: '433634012' },
+  chair: 'main', threshold: { rule: 'majority' }, veto: { principal: 'human:main', resolved: '1234567890' },
   prevDigest: '', stampedAt: '2026-07-19T00:00:00Z', seq: 0,
 })
 const gbench = genesisToBench(grec)
@@ -298,7 +298,7 @@ const mrec = buildMotionRecord({
   motion: { kind: 'demote', subject: 'codex' },
   verdict: { recommendation: 'approve', tally: T(4,1,0), recused: ['codex'] },
   seats: [{ id: 'main', chair: true }, { id: 'theo' }, { id: 'olivia' }, { id: 'lilbro' }],
-  threshold: { rule: 'fraction', value: 2/3 }, veto: { principal: 'human:main', resolved: '433634012' },
+  threshold: { rule: 'fraction', value: 2/3 }, veto: { principal: 'human:main', resolved: '1234567890' },
   prevDigest: 'GENESISDIGEST', stampedAt: '2026-07-19T12:00:00Z', seq: 1, receiptDigest: 'RCPT1',
 })
 ok(mrec.kind === 'motion' && mrec.motion.class === 'demote' && mrec.prevDigest === 'GENESISDIGEST', 'motion record: chained onto the prior lineage head')
