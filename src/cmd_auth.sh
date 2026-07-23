@@ -12,7 +12,16 @@
 auth_creds_present() {
   local type="$1" profile="${2:-}" sentinel="${TYPE_AUTH[$1]:-}"
   [[ -n "$sentinel" ]] || return 1
-  local path="${sentinel%%:*}" key="${sentinel##*:}"
+  # A sentinel is either "<path>:<jsonkey>" (claude — value lives under a key in
+  # a file) or a bare "<path>" (every OAuth type — usable == the credential file
+  # is present + non-empty). Detect the plain-file case by the ABSENCE of a colon
+  # in the ORIGINAL sentinel, NOT by comparing path==key: when a profile is set
+  # `path` is swapped to the profile-scoped path while a path-shaped `key` would
+  # keep the DEFAULT path, so path==key silently broke for profile-scoped bare
+  # sentinels and mis-routed antigravity's bare-blob token into the jq branch —
+  # returning needs_login for a perfectly valid profile token (DIVE-1803).
+  local path="${sentinel%%:*}" key=""
+  [[ "$sentinel" == *:* ]] && key="${sentinel##*:}"
   # Profile-scoped: swap the default credential path for the profile's. The
   # jq key (for OAuth json sentinels) is unchanged.
   if [[ -n "$profile" ]]; then
@@ -21,7 +30,9 @@ auth_creds_present() {
     [[ -n "$ppath" ]] && path="$ppath"
   fi
   local sentinel_ok=0
-  if [[ "$path" == "$key" ]]; then
+  if [[ -z "$key" ]]; then
+    # Plain-file sentinel: present + non-empty on the resolved (default OR
+    # profile) path is the whole test.
     [[ -s "$path" ]] && sentinel_ok=1
   elif [[ -f "$path" ]]; then
     local val=""
@@ -1682,17 +1693,93 @@ cmd_auth_poll() {
 
       if [[ "$state" == "awaiting_code" || "$state" == "submitted" ]]; then
         case "$type" in
-          codex|hermes|openclaw|antigravity|grok)
-            # All five signal success by writing a credential file:
+          antigravity)
+            # DIVE-1803: the OAuth callback writes the antigravity-oauth-token,
+            # but agy then BLOCKS in its post-login first-run onboarding (colour
+            # theme + model + [Next]) INSIDE the same TUI. The old shared branch
+            # below declared ok on the sentinel's mtime bump ALONE and killed the
+            # session mid-onboarding, stranding the profile with an empty/absent
+            # token (auth status -> needs_login). Fix:
+            #   (1) never call it ok until the token file is NON-EMPTY and its
+            #       mtime has SETTLED (same value across two polls) — a usable
+            #       profile IS a non-empty antigravity-oauth-token blob (~498B);
+            #   (2) after the code is submitted, drive onboarding forward by
+            #       sending Enter (accepts the highlighted default) while the pane
+            #       shows an onboarding screen — marker-gated so we never press
+            #       Enter on the login-method menu or the code-entry prompt (a
+            #       rejected-code retry must not be disturbed);
+            #   (3) bound the wait: if onboarding never finalizes a usable token
+            #       before the deadline (or the session dies), fail honestly
+            #       instead of reporting a false ok.
+            local sentinel current baseline stable deadline now
+            sentinel=$(profile_type_auth_path "$profile" "$type")
+            baseline=$(jq -r '.authBaselineMtime // 0' "$meta")
+            current=0
+            [[ -f "$sentinel" ]] && current=$(stat -c %Y "$sentinel" 2>/dev/null || echo 0)
+
+            if [[ "$state" == "submitted" ]]; then
+              local pane="${dir}/pane.txt"
+              sudo -u claude tmux -S "$sock" capture-pane -p -J -S -200 \
+                -t "$session" > "$pane" 2>/dev/null || true
+              # Advance ONLY on an onboarding screen; never on the login-method
+              # menu or the "authorization code" entry prompt.
+              if ! grep -qiE 'authorization code|select login method' "$pane" \
+                 && grep -qiE 'colou?r|theme|select .*model|choose .*model|\[ *next *\]|press enter|get started|continue' "$pane"; then
+                sudo -u claude tmux -S "$sock" send-keys -t "$session" Enter 2>/dev/null || true
+              fi
+              # Start the finalize deadline once, on first poll after submit.
+              deadline=$(jq -r '.agyFinalizeDeadline // 0' "$meta")
+              now=$(date +%s)
+              if [[ "$deadline" == "0" ]]; then
+                deadline=$(( now + 240 ))
+                jq --argjson d "$deadline" '.agyFinalizeDeadline = $d' "$meta" \
+                  > "${meta}.tmp" && mv "${meta}.tmp" "$meta"
+              fi
+            else
+              deadline=0; now=$(date +%s)
+            fi
+
+            stable=$(jq -r '.agyTokenMtime // 0' "$meta")
+            if [[ -s "$sentinel" ]] && (( current > baseline )) && (( current == stable )); then
+              # Two consecutive polls saw the SAME non-empty token -> finalized.
+              sudo -u claude tmux -S "$sock" kill-session -t "$session" 2>/dev/null || true
+              state="ok"
+              jq --arg s "$state" --arg ts "$(date -Iseconds)" \
+                '.state = $s | .updatedAt = $ts' "$meta" > "${meta}.tmp" \
+                && mv "${meta}.tmp" "$meta"
+              # DIVE-383: fresh creds only reach a running agent on restart.
+              restart_profile_agents "$profile"
+            elif [[ -s "$sentinel" ]] && (( current > baseline )); then
+              # First sighting of a non-empty token — record its mtime and wait
+              # one more poll to confirm onboarding isn't still rewriting it.
+              jq --argjson m "$current" --arg ts "$(date -Iseconds)" \
+                '.agyTokenMtime = $m | .updatedAt = $ts' "$meta" > "${meta}.tmp" \
+                && mv "${meta}.tmp" "$meta"
+            elif (( ! alive )); then
+              state="error"
+              jq --arg s "$state" --arg e "antigravity exited before finalizing a usable token (cancelled, expired, bad code, or onboarding not completed)" \
+                 --arg ts "$(date -Iseconds)" \
+                 '.state = $s | .error = $e | .updatedAt = $ts' "$meta" > "${meta}.tmp" \
+                && mv "${meta}.tmp" "$meta"
+            elif [[ "$deadline" != "0" ]] && (( now > deadline )); then
+              sudo -u claude tmux -S "$sock" kill-session -t "$session" 2>/dev/null || true
+              state="error"
+              jq --arg s "$state" --arg e "antigravity onboarding did not finalize a usable token within 240s of code submit" \
+                 --arg ts "$(date -Iseconds)" \
+                 '.state = $s | .error = $e | .updatedAt = $ts' "$meta" > "${meta}.tmp" \
+                && mv "${meta}.tmp" "$meta"
+            fi
+            ;;
+          codex|hermes|openclaw|grok)
+            # These four signal success by writing a credential file, and — unlike
+            # antigravity (handled above, which blocks in a post-login onboarding
+            # TUI) — are usable the moment that file appears, so a bare mtime bump
+            # past the session baseline is a sound ok signal:
             #   codex       — ~/.codex/auth.json     (CLI polls OpenAI itself)
             #   hermes      — ~/.hermes/auth.json    (CLI polls OpenAI itself)
             #   openclaw    — ~/.openclaw/agents/main/agent/auth-profiles.json
             #                 (CLI polls OpenAI itself, then upsertAuthProfile
             #                 writes the file synchronously before exit)
-            #   antigravity — ~/.gemini/antigravity-cli/antigravity-oauth-token
-            #                 (Google OAuth callback or pasted code; mtime
-            #                 bumps once token_storage's file fallback writes
-            #                 the bare token blob, mode 0600)
             #   grok        — ~/.grok/auth.json
             #                 (CLI polls xAI's device-auth endpoint, writes
             #                 auth.json on token receipt)
