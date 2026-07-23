@@ -1265,13 +1265,36 @@ _human_nonce_verify() {
   _gate_proof_ct_equal "$calc" "$stored"
 }
 
+# Seam so unit tests can drive the EUID-branch below — $EUID is read-only in a
+# running shell, so the forge/legit-path tests override this instead (mirrors the
+# _gate_is_root seam introduced for the DIVE-1401 withdraw fix, 547a219).
+_gate_is_root() { [[ $EUID -eq 0 ]]; }
+
 # Resolve the REAL pre-sudo caller and report whether it is a NON-agent uid — the
-# third human-evidence form (a claude/root interactive login or the shelld/drop
-# path, all of which carry SUDO_UID != agent-*). $SUDO_UID survives `sudo -u
-# agent-X` and a nested non-sudo exec (verified for the DIVE-931 drop chain),
-# unlike `id -un`. 0 = non-agent (human-trusted), 1 = agent (or unknown).
+# third human-evidence form (a claude/root interactive login, the dashboard/shelld
+# exec that runs AS claude, or the DIVE-931 secret-drop). 0 = non-agent
+# (human-trusted), 1 = agent (or unknown).
+#
+# DIVE-1413: $SUDO_UID is a PLAIN ENV VAR any non-root process sets freely — so a
+# non-root agent could forge SUDO_UID=<claude uid> to mint 'human' evidence and
+# clear an approval/secret/manual gate (same env-forge class the DIVE-1401
+# withdraw path was hardened against). Fix: trust $SUDO_UID ONLY at EUID 0, where
+# real `sudo` stamps it truthfully AND a non-root agent cannot reach root without
+# genuinely sudo-ing. Off root, $SUDO_UID is ignored and we judge by the
+# UNSPOOFABLE real uid — which is exactly what the two legit non-root paths carry
+# (the shelld/dashboard exec runs AS claude, so `id -u` is already non-agent),
+# while an agent's real `id -u` is agent-* and is rejected. The DIVE-931 drop is a
+# root path (secret write is require_root, so its nested task-answer runs at
+# EUID 0 carrying the human's SUDO_UID=claude) and still clears via the EUID-0
+# branch. The residual root-sudo forge (an agent already elevated to root) is out
+# of scope, shared with the rest of the gate system (see DIVE-1401).
 _gate_sudo_uid_nonagent() {
-  local uid="${SUDO_UID:-$(id -u 2>/dev/null || echo "")}"
+  local uid
+  if _gate_is_root; then
+    uid="${SUDO_UID:-$(id -u 2>/dev/null || echo "")}"
+  else
+    uid="$(id -u 2>/dev/null || echo "")"
+  fi
   [[ -n "$uid" ]] || return 1
   local uname; uname=$(getent passwd "$uid" 2>/dev/null | cut -d: -f1)
   [[ -n "$uname" ]] || return 1        # unknown uid -> not trusted
