@@ -1,21 +1,21 @@
 {
-  "generatedAtUtc": "2026-07-22T02:40:06Z",
-  "date": "2026-07-22",
+  "generatedAtUtc": "2026-07-23T02:40:05Z",
+  "date": "2026-07-23",
   "week": {
-    "shipped": 435,
-    "humanAsks": 64
+    "shipped": 467,
+    "humanAsks": 67
   },
   "day": {
-    "shipped": 64,
-    "humanAsks": 8
+    "shipped": 96,
+    "humanAsks": 12
   },
   "cumulative": {
-    "daysPublished": 12,
-    "shipped": 546,
-    "humanAsks": 79,
+    "daysPublished": 13,
+    "shipped": 642,
+    "humanAsks": 91,
     "since": "2026-07-11"
   },
-  "cliVersion": "0.12.14",
+  "cliVersion": "0.13.15",
   "source": "5dive digest --json [--7d]",
   "methodology": "https://github.com/5dive-ai/5dive/blob/main/docs/zero-human.md"
 }
