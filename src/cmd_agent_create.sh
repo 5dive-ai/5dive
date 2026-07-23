@@ -462,11 +462,12 @@ _apply_byo_openclaw() {
   chmod 0600 "$tmp"
   mv "$tmp" "$auth_file"
 
-  # Default model lands in openclaw.json's agents.defaults.model.primary;
-  # 5dive-agent-start.sh syncs it from the shared/profile copy into the
-  # per-agent openclaw.json on every launch.
+  local openclaw_base_url="${OPENCLAW_PROVIDER_URL[$canonical]:-}"
   local model="${override_model:-${OPENCLAW_PROVIDER_MODEL[$canonical]:-}}"
-  if [[ -n "$model" ]]; then
+
+  # Any openclaw.json write (provider base_url pin and/or default model) goes
+  # through the same stable-node invocation — resolve the runtime once.
+  if [[ -n "$openclaw_base_url" || -n "$model" ]]; then
     local openclaw_bin="${TYPE_BIN[openclaw]}"
     local openclaw_node="/home/claude/.local/bin/node"
     # The npm launcher uses `#!/usr/bin/env node`. Do not rely on sudo/systemd's
@@ -475,12 +476,44 @@ _apply_byo_openclaw() {
     # for any subprocess OpenClaw starts while writing the config.
     [[ -x "$openclaw_node" ]] \
       || fail "$E_NOT_INSTALLED" "node runtime missing for openclaw (run: 5dive agent install openclaw --upgrade)"
-    sudo -u claude -H env \
-      HOME="$base" \
-      PATH="/home/claude/.local/bin:/usr/bin:/bin" \
-      "$openclaw_node" "$openclaw_bin" \
-      config set agents.defaults.model.primary "$model" >&2 \
-      || warn "openclaw config set agents.defaults.model.primary=$model failed"
+
+    # DIVE-1826: pin the provider endpoint when we have a verified override.
+    # openclaw's zai provider otherwise defaults to the GENERAL /paas/v4 surface
+    # (its zai-api-key auto-detect probes general endpoints before the Coding Plan
+    # ones, and a bare BYO auth profile never runs that probe), so a GLM
+    # Coding-Plan key 401s there. models.providers.<id>.baseUrl (a mode:merge
+    # overlay on openclaw's built-in catalog) points the provider at the correct
+    # endpoint. NOTE: for z.ai this is the openai-compat *coding* URL, NOT the
+    # api.z.ai/api/anthropic endpoint hermes/pi pin — openclaw talks
+    # openai-completions to z.ai (see OPENCLAW_PROVIDER_URL).
+    if [[ -n "$openclaw_base_url" ]]; then
+      sudo -u claude -H env \
+        HOME="$base" \
+        PATH="/home/claude/.local/bin:/usr/bin:/bin" \
+        "$openclaw_node" "$openclaw_bin" \
+        config set "models.providers.${native}.baseUrl" "$openclaw_base_url" >&2 \
+        || warn "openclaw config set models.providers.${native}.baseUrl=$openclaw_base_url failed"
+    fi
+
+    # Default model lands in openclaw.json's agents.defaults.model.primary;
+    # 5dive-agent-start.sh syncs it from the shared/profile copy into the
+    # per-agent openclaw.json on every launch.
+    if [[ -n "$model" ]]; then
+      sudo -u claude -H env \
+        HOME="$base" \
+        PATH="/home/claude/.local/bin:/usr/bin:/bin" \
+        "$openclaw_node" "$openclaw_bin" \
+        config set agents.defaults.model.primary "$model" >&2 \
+        || warn "openclaw config set agents.defaults.model.primary=$model failed"
+    fi
+  fi
+
+  # z.ai key-TYPE hint (DIVE-1826, the openclaw sibling of the DIVE-1819 hermes
+  # note): the coding endpoint we pin above authorizes a GLM Coding-Plan key. A
+  # standard prepaid / API-only z.ai key may 401 there, so surface it — an auth
+  # failure then reads as key-type, not a broken config.
+  if [[ "$canonical" == "zai" ]]; then
+    step "z.ai note: use your GLM Coding-Plan key (z.ai → Coding Plan) for GLM coding models; a standard prepaid API key may fail auth on the coding endpoint."
   fi
 }
 
