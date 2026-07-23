@@ -1426,8 +1426,13 @@ cmd_auth_start() {
   [[ -n "$type" ]] || fail "$E_USAGE" "usage: 5dive agent auth start <type> [--auth-profile=<name>]"
   is_known_type "$type" || fail "$E_NOT_FOUND" "unknown type: $type"
   case "$type" in
-    claude|hermes|openclaw|codex|antigravity|grok) ;;
-    *) fail "$E_VALIDATION" "device-code flow supports claude/hermes/openclaw/codex/antigravity/grok. Use 'auth set --api-key' or 'auth login' for $type." ;;
+    # DIVE-1807: hermes/openclaw are API-ONLY now — their OpenAI /codex/device
+    # consumer-OAuth was dropped (ToS-gray + inference-block prone; DIVE-1391).
+    # This non-TTY/dashboard start path no longer offers it for them; they auth
+    # via `auth set --api-key --provider`. (Grandfathered agents can still
+    # re-auth over the TTY `auth login` handoff, which is left intact.)
+    claude|codex|antigravity|grok) ;;
+    *) fail "$E_VALIDATION" "device-code flow supports claude/codex/antigravity/grok. hermes/openclaw are API-key only — use 'auth set --api-key --provider=<id>' for $type." ;;
   esac
   local bin="${TYPE_BIN[$type]}"
   [[ -x "$bin" ]] || fail "$E_NOT_INSTALLED" "$type not installed at $bin"

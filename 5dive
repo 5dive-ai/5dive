@@ -26,7 +26,7 @@ esac
 
 # Bumped on every public release. `build.sh` checks this line exists; CI fails
 # the bundle-drift check if it's missing or empty.
-readonly FIVE_VERSION="0.13.21"
+readonly FIVE_VERSION="0.13.22"
 
 # GitHub org our repos live under. The org is being renamed
 # 5dive-com -> 5dive-ai (2026-06); fetches must work on either side of the
@@ -5532,8 +5532,13 @@ cmd_auth_start() {
   [[ -n "$type" ]] || fail "$E_USAGE" "usage: 5dive agent auth start <type> [--auth-profile=<name>]"
   is_known_type "$type" || fail "$E_NOT_FOUND" "unknown type: $type"
   case "$type" in
-    claude|hermes|openclaw|codex|antigravity|grok) ;;
-    *) fail "$E_VALIDATION" "device-code flow supports claude/hermes/openclaw/codex/antigravity/grok. Use 'auth set --api-key' or 'auth login' for $type." ;;
+    # DIVE-1807: hermes/openclaw are API-ONLY now — their OpenAI /codex/device
+    # consumer-OAuth was dropped (ToS-gray + inference-block prone; DIVE-1391).
+    # This non-TTY/dashboard start path no longer offers it for them; they auth
+    # via `auth set --api-key --provider`. (Grandfathered agents can still
+    # re-auth over the TTY `auth login` handoff, which is left intact.)
+    claude|codex|antigravity|grok) ;;
+    *) fail "$E_VALIDATION" "device-code flow supports claude/codex/antigravity/grok. hermes/openclaw are API-key only — use 'auth set --api-key --provider=<id>' for $type." ;;
   esac
   local bin="${TYPE_BIN[$type]}"
   [[ -x "$bin" ]] || fail "$E_NOT_INSTALLED" "$type not installed at $bin"
@@ -14168,46 +14173,33 @@ USAGE
         esac
         ;;
       openclaw)
-        # openclaw defaults to the OpenAI /codex/device oauth, but that
-        # dead-ends when the OpenAI account is blocked for inference. The
-        # dashboard already offers a BYO provider+key escape hatch; give init
-        # parity (DIVE-1390). BYO writes via `agent auth set openclaw
-        # --api-key=- --provider=<id>` (cmd_auth.sh -> _apply_byo_openclaw).
-        local auth_choice
-        _init_pick auth_choice "How should OpenClaw authenticate?" 1 \
-          "oauth|Sign in with OpenAI|Device-code sign-in · recommended" \
-          "byo|Bring your own provider|Use your own inference provider + API key"
-        case "$auth_choice" in
-          oauth)
-            _init_note "Opening ${type_label[$type]}'s interactive sign-in…"
-            5dive agent auth login openclaw || fail "$E_AUTH_REQUIRED" "auth failed"
-            auth_summary="Interactive sign-in"
-            ;;
-          byo)
-            local provider
-            _init_pick provider "Choose a provider for OpenClaw:" 1 \
-              "openrouter|OpenRouter|Broad model catalog · recommended" \
-              "anthropic|Anthropic|Claude models" \
-              "openai|OpenAI|GPT models" \
-              "google|Google|Gemini models" \
-              "deepseek|DeepSeek|DeepSeek models" \
-              "moonshot|Moonshot|Kimi models" \
-              "qwen|Qwen|Qwen models" \
-              "minimax|MiniMax|MiniMax models" \
-              "huggingface|Hugging Face|Hosted open models" \
-              "zai|z.ai|GLM models"
-            [[ -n "${OPENCLAW_PROVIDER_ID[$provider]:-}" ]] \
-              || fail "$E_VALIDATION" "unknown provider '$provider'"
-            local key
-            _init_secret key "$provider API key"
-            [[ -n "$key" ]] || fail "$E_VALIDATION" "empty API key"
-            printf '%s' "$key" | 5dive agent auth set openclaw --api-key=- --provider="$provider" \
-              || fail "$E_AUTH_REQUIRED" "auth failed"
-            _init_ok "$provider credentials saved"
-            auth_summary="$provider API key"
-            ;;
-          *) fail "$E_VALIDATION" "invalid auth choice '$auth_choice'" ;;
-        esac
+        # DIVE-1807: openclaw is API-ONLY now. Its OpenAI /codex/device oauth
+        # ("Sign in with OpenAI") was dropped — that path dead-ends when the
+        # OpenAI account is blocked for inference (ToS-gray; DIVE-1391/1390), so
+        # init no longer offers it. Straight to BYO provider+key, mirroring
+        # hermes; writes via `agent auth set openclaw --api-key=- --provider=<id>`
+        # (cmd_auth.sh -> _apply_byo_openclaw).
+        local provider
+        _init_pick provider "Choose a provider for OpenClaw:" 1 \
+          "openrouter|OpenRouter|Broad model catalog · recommended" \
+          "anthropic|Anthropic|Claude models" \
+          "openai|OpenAI|GPT models" \
+          "google|Google|Gemini models" \
+          "deepseek|DeepSeek|DeepSeek models" \
+          "moonshot|Moonshot|Kimi models" \
+          "qwen|Qwen|Qwen models" \
+          "minimax|MiniMax|MiniMax models" \
+          "huggingface|Hugging Face|Hosted open models" \
+          "zai|z.ai|GLM models"
+        [[ -n "${OPENCLAW_PROVIDER_ID[$provider]:-}" ]] \
+          || fail "$E_VALIDATION" "unknown provider '$provider'"
+        local key
+        _init_secret key "$provider API key"
+        [[ -n "$key" ]] || fail "$E_VALIDATION" "empty API key"
+        printf '%s' "$key" | 5dive agent auth set openclaw --api-key=- --provider="$provider" \
+          || fail "$E_AUTH_REQUIRED" "auth failed"
+        _init_ok "$provider credentials saved"
+        auth_summary="$provider API key"
         ;;
       antigravity|grok)
         _init_note "Opening ${type_label[$type]}'s interactive sign-in…"
