@@ -111,5 +111,25 @@ run_build "$W5" 12 2 3 0 2026-07-11 >/dev/null
   && ok_t "DIVE-1552: week sums the last 7 daily datapoints, ignores a wiped WEEK_JSON" \
   || bad_t "rolling-7 week" "$(cat "$W5/zero-human.json")"
 
+# --- Case 6 (DIVE-1864): digest passed via *_FILE handles a >128KB blob -------
+# A single env var over MAX_ARG_STRLEN (32 pages = 131072B) makes the python
+# exec die with E2BIG ("Argument list too long"). The real _proof_build routes
+# the digest JSON through DAY_JSON_FILE/WEEK_JSON_FILE so an arbitrarily large
+# blob still builds. Drive the builder directly via the file pointers with a
+# ~200KB day blob (would E2BIG as an env string) and assert it builds verbatim.
+W6="$TMP/w6"; mkdir -p "$W6"
+PAD="$(head -c 200000 /dev/zero | tr '\0' 'x')"           # 200000 chars > 128KB
+printf '{"_pad":"%s","zeroHuman":{"shipped":6,"humanTouches":0}}' "$PAD" > "$TMP/day6.json"
+printf '{"zeroHuman":{"shipped":6,"humanTouches":0}}' > "$TMP/week6.json"
+[[ "$(wc -c < "$TMP/day6.json")" -gt 131072 ]] && ok_t "day6 blob exceeds MAX_ARG_STRLEN (would E2BIG via env)" || bad_t "day6 blob size"
+OUT6="$( cd "$W6" && \
+  DAY_JSON_FILE="$TMP/day6.json" WEEK_JSON_FILE="$TMP/week6.json" \
+  TODAY="2026-07-12" TODAY_LABEL="Jul 12" NOW_ISO="2026-07-12T00:00:00Z" \
+  CLI_VERSION="0.8.8" METHODOLOGY_URL="https://example.test/zero-human.md" \
+  python3 "$TMP/proof.py" )"; RC6=$?
+[[ $RC6 -eq 0 ]] && ok_t "DIVE-1864: >128KB digest via *_FILE builds (no E2BIG)" || bad_t "big-file build" "rc=$RC6"
+[[ "$(jget "$W6/badge.json" "['message']")" == "100%" ]] \
+  && ok_t "big-file badge computes verbatim (6 shipped / 0 asks -> 100%)" || bad_t "big-file badge" "$(cat "$W6/badge.json" 2>/dev/null)"
+
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [[ $FAIL -eq 0 ]] || exit 1
