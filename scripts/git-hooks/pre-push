@@ -1,0 +1,74 @@
+#!/usr/bin/env bash
+# Fleet-wide pre-push PII guard (DIVE-1797, enforcement follow-up to DIVE-1774).
+#
+# WHY a local hook and not GitHub branch protection: our landing account is the
+# repo admin, so a required status check only gates EXTERNAL PRs, never our own
+# agent commits (the actual accidental-PII risk). This gates our own pushes at
+# source, before anything reaches the public 5dive-ai/5dive repo.
+#
+# WHAT it does: runs the SAME scanner the CI pii-guard uses (scripts/pii-scan.sh)
+# over the commit messages + added diff lines of the commits being pushed. A
+# non-zero exit from the scanner (a denylisted id/email/phone) blocks the push.
+#
+# DESIGN NOTES:
+#   - Calls scripts/pii-scan.sh DIRECTLY. No forked scan logic here, so it can
+#     never drift from the CI scanner (DIVE-1797 requirement c).
+#   - Installed fleet-wide via core.hooksPath=scripts/git-hooks, set once on the
+#     shared clone config so every linked worktree (and every future one)
+#     inherits it. See scripts/install-pii-push-guard.sh.
+#   - Threat model is ACCIDENTAL fixture/log PII, not a malicious actor. So if
+#     the scanner is absent (e.g. a stale branch predating DIVE-1774) the hook
+#     fails OPEN with a warning rather than blocking legitimate work; the CI
+#     pii-guard remains the post-hoc net for anything that slips past.
+set -uo pipefail
+
+TOP="$(git rev-parse --show-toplevel 2>/dev/null)" || exit 0
+SCAN="$TOP/scripts/pii-scan.sh"
+EMPTY_TREE=4b825dc642cb6eb9a060e54bf8d69288fbee4904
+Z40=0000000000000000000000000000000000000000
+
+if [[ ! -f "$SCAN" ]]; then
+  echo "pii-push-guard: scanner not found ($SCAN); skipping (CI pii-guard is the net)." >&2
+  exit 0
+fi
+
+rc=0
+# The scanner is the LAST stage of each pipeline below, so the pipeline's exit
+# status IS the scanner's exit — `|| rc=1` captures a hit without the pipeline
+# subshell swallowing it. The `while read` loop runs in this shell (its stdin is
+# the ref-update list), so rc set inside persists.
+while read -r local_ref local_oid remote_ref remote_oid; do
+  [[ -z "${local_oid:-}" ]] && continue
+  [[ "$local_oid" == "$Z40" ]] && continue   # branch deletion: nothing to scan
+
+  if [[ "$remote_oid" == "$Z40" ]]; then
+    # New remote branch: scan commits not already present on any remote ref.
+    commits="$(git rev-list "$local_oid" --not --remotes 2>/dev/null)"
+    oldest="$(printf '%s\n' "$commits" | awk 'NF{last=$0} END{print last}')"
+    if [[ -n "$oldest" ]]; then
+      base="$(git rev-parse "${oldest}^" 2>/dev/null)" || base="$EMPTY_TREE"
+    else
+      base="$EMPTY_TREE"
+    fi
+  else
+    commits="$(git rev-list "${remote_oid}..${local_oid}" 2>/dev/null)"
+    base="$remote_oid"
+  fi
+
+  [[ -z "${commits// }" ]] && continue   # nothing new to push on this ref
+
+  # (1) commit messages of the pushed commits
+  git log --no-color --format='%B' "$base..$local_oid" 2>/dev/null | bash "$SCAN" >/dev/null || rc=1
+  # (2) lines ADDED by the pushed commits
+  git diff --no-color "$base" "$local_oid" 2>/dev/null \
+    | grep '^+' | grep -v '^+++' | sed 's/^+//' | bash "$SCAN" >/dev/null || rc=1
+done
+
+if [[ $rc -ne 0 ]]; then
+  echo "" >&2
+  echo "pii-push-guard: BLOCKED — a denylisted identifier is in the commits you are pushing." >&2
+  echo "  Scrub the real id/email/phone (use placeholders like <user-id>, 1234567890) and re-commit." >&2
+  echo "  Emergency override (discouraged; CI pii-guard will still flag it): git push --no-verify" >&2
+  exit 1
+fi
+exit 0
