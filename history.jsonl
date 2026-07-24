@@ -11,3 +11,4 @@
 {"cliVersion": "0.12.1", "date": "2026-07-21", "day": {"humanAsks": 8, "shipped": 84}, "week": {"humanAsks": 58, "shipped": 407}}
 {"cliVersion": "0.12.14", "date": "2026-07-22", "day": {"humanAsks": 8, "shipped": 64}, "week": {"humanAsks": 64, "shipped": 435}}
 {"cliVersion": "0.13.15", "date": "2026-07-23", "day": {"humanAsks": 12, "shipped": 96}, "week": {"humanAsks": 67, "shipped": 467}}
+{"cliVersion": "0.14.0", "date": "2026-07-24", "day": {"humanAsks": 12, "shipped": 60}, "week": {"humanAsks": 65, "shipped": 462}}
