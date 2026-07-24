@@ -1725,3 +1725,41 @@ install_channel_for_agent() {
     *) fail "$E_VALIDATION" "type '$type' does not support channels" ;;
   esac
 }
+
+# DIVE-1843: reconcile /etc/claude-code/managed-settings.json IN PLACE so a box
+# that was provisioned before the dashboard channel (or any 5dive fork channel)
+# shipped self-heals WITHOUT a human rerunning install.sh. This is the exact
+# idempotent merge install.sh performs — extracted so `doctor --fix` and the
+# nightly selfupdate can call it on every existing box. Ensures channelsEnabled
+# =true and that BOTH 5dive fork channels (telegram + dashboard) are present,
+# never clobbering operator additions or the upstream/official entries. On a
+# team box the org's remote managed-settings override this local file, so the
+# merge is inert there; on a personal/self-hosted box this local file IS the
+# self-approve allowlist that gates inbound channel pings.
+#
+# Exit: 0 = a change was written, 3 = already current (no-op), 1 = could not
+# reconcile (missing file / no jq / invalid JSON — never brick a hand-managed
+# settings file). Writes via mktemp + install -m 644 (mode-preserving) and only
+# when the merged result actually differs from what's on disk.
+reconcile_managed_settings() {
+  local msj="${1:-/etc/claude-code/managed-settings.json}"
+  [[ -f "$msj" ]] || return 1
+  command -v jq >/dev/null 2>&1 || return 1
+  jq -e . "$msj" >/dev/null 2>&1 || return 1
+  local tmp
+  tmp=$(mktemp) || return 1
+  if jq '
+        .channelsEnabled = true
+      | .allowedChannelPlugins = ((.allowedChannelPlugins // []) as $have
+          | $have + ([{"plugin":"telegram","marketplace":"5dive-plugins"},
+                      {"plugin":"dashboard","marketplace":"5dive-plugins"}]
+              | map(select(. as $need
+                  | ($have | any(.plugin == $need.plugin and .marketplace == $need.marketplace)) | not))))
+      ' "$msj" > "$tmp" 2>/dev/null && [[ -s "$tmp" ]]; then
+    if jq -e --slurpfile a "$tmp" '. == $a[0]' "$msj" >/dev/null 2>&1; then
+      rm -f "$tmp"; return 3          # already current
+    fi
+    install -m 644 "$tmp" "$msj"; rm -f "$tmp"; return 0
+  fi
+  rm -f "$tmp"; return 1
+}

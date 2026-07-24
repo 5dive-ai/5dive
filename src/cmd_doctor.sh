@@ -343,23 +343,50 @@ cmd_doctor() {
   #      managed-settings (remote overrides local). Linked from README.
   if (( run_channels )); then
     local ms=/etc/claude-code/managed-settings.json
+    # DIVE-1843: the DIVE-1816 fix reconciles this allowlist on install.sh rerun
+    # only, so boxes provisioned before the dashboard channel shipped stayed
+    # broken (dashboard-chat pings silently dropped) until a human reran
+    # install.sh per box. These checks are now SELF-HEALING under --fix (and the
+    # nightly selfupdate calls the same reconcile), so an existing box repairs
+    # itself with no human action. reconcile_managed_settings ensures
+    # channelsEnabled:true + BOTH 5dive fork channels, never clobbering operator
+    # or upstream entries; exit 0=changed, 3=already-current, 1=can't reconcile.
     if [[ ! -f "$ms" ]]; then
       doctor_add channels managed-settings warn \
         "$ms missing — rerun install.sh, or expect channel-skipped errors" false false
-    elif ! jq -e '.channelsEnabled == true' "$ms" >/dev/null 2>&1; then
-      doctor_add channels managed-settings error \
-        "$ms missing channelsEnabled:true (Claude Code 2.1.150+ requires this; allowlist is otherwise inert)" false false
-    elif ! jq -e '.allowedChannelPlugins | any(.plugin == "telegram" and .marketplace == "5dive-plugins")' "$ms" >/dev/null 2>&1; then
-      doctor_add channels managed-settings warn \
-        "$ms doesn't list telegram@5dive-plugins — local channel allowlist won't permit the fork" false false
-    elif ! jq -e '.allowedChannelPlugins | any(.plugin == "dashboard" and .marketplace == "5dive-plugins")' "$ms" >/dev/null 2>&1; then
-      # DIVE-1816: dashboard is a channel too; if it's unlisted, Claude drops
-      # dashboard-chat pings (agent silent on /dashboard/chat). Rerun install.sh
-      # to reconcile the allowlist in place.
-      doctor_add channels managed-settings warn \
-        "$ms doesn't list dashboard@5dive-plugins — dashboard-chat pings are dropped; rerun install.sh to reconcile" false false
-    else
+    elif jq -e '.channelsEnabled == true
+                and (.allowedChannelPlugins | any(.plugin == "telegram" and .marketplace == "5dive-plugins"))
+                and (.allowedChannelPlugins | any(.plugin == "dashboard" and .marketplace == "5dive-plugins"))' \
+              "$ms" >/dev/null 2>&1; then
       doctor_add channels managed-settings ok "$ms has channelsEnabled + telegram/dashboard@5dive-plugins allowlisted"
+    else
+      # Stale/incomplete allowlist: channelsEnabled off, or a 5dive fork channel
+      # (esp. dashboard) unlisted → Claude drops those inbound pings. Name the
+      # specific gap so the report is precise, then auto-heal under --fix.
+      local gap=""
+      jq -e '.channelsEnabled == true' "$ms" >/dev/null 2>&1 \
+        || gap="missing channelsEnabled:true (Claude Code 2.1.150+ requires it; allowlist otherwise inert)"
+      if [[ -z "$gap" ]]; then
+        jq -e '.allowedChannelPlugins | any(.plugin == "dashboard" and .marketplace == "5dive-plugins")' "$ms" >/dev/null 2>&1 \
+          || gap="doesn't list dashboard@5dive-plugins — dashboard-chat pings are dropped"
+      fi
+      if [[ -z "$gap" ]]; then
+        gap="doesn't list telegram@5dive-plugins — local channel allowlist won't permit the fork"
+      fi
+      if (( DOCTOR_REPAIR )); then
+        reconcile_managed_settings "$ms"
+        case $? in
+          0) doctor_add channels managed-settings warn \
+               "$ms was stale ($gap) — reconciled in place (+channelsEnabled / +5dive fork channels)" true true ;;
+          3) doctor_add channels managed-settings ok \
+               "$ms already current after reconcile" ;;
+          *) doctor_add channels managed-settings error \
+               "$ms $gap; auto-reconcile failed (jq unavailable or invalid JSON) — rerun install.sh" true false ;;
+        esac
+      else
+        doctor_add channels managed-settings warn \
+          "$ms $gap; self-heal: 5dive doctor --fix (or rerun install.sh)" true false
+      fi
     fi
 
     # Per-agent: read the MOST RECENT MCP log for the telegram plugin and
