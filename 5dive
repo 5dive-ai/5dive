@@ -26,7 +26,7 @@ esac
 
 # Bumped on every public release. `build.sh` checks this line exists; CI fails
 # the bundle-drift check if it's missing or empty.
-readonly FIVE_VERSION="0.14.5"
+readonly FIVE_VERSION="0.14.6"
 
 # GitHub org our repos live under. The org is being renamed
 # 5dive-com -> 5dive-ai (2026-06); fetches must work on either side of the
@@ -30846,6 +30846,98 @@ _hb_wake_budget_inc() {
         }' <<<"$reg" | registry_write
 }
 
+# --- DIVE-1858 Phase-1 Stage 2: live auto-sleep -------------------------------
+# Stage 2 (held for main's pre-run lead review): the reactive path's second half.
+# The WAKE half already exists — _hb_wake does `systemctl start` on a stopped unit,
+# so the tick already wakes a cold agent that has a due todo (budget-gated). What
+# was missing is the SLEEP half: a cold + running agent that is confidently idle
+# with NO open work is stopped after N idle minutes, so an on-demand agent isn't
+# left burning a session between triggers. Every guard below is additive and only
+# ever touches wake_mode=cold agents:
+#   · always_on agents are never considered (default) — zero behaviour change;
+#   · protected agents (main/marketing/HEARTBEAT_WAKE_PROTECTED) are never slept
+#     even if mis-flagged cold (olivia condition 3, belt-and-suspenders);
+#   · sleep fires ONLY on a CONFIRMED idle reading (_hb_agent_idle rc 0) with no
+#     open assigned task — a busy/blocked/unknown pane disarms the timer;
+#   · the dispatcher (this tick) stays always-on + self-monitored via the shipped
+#     DIVE-1434 poller-liveness canary (olivia condition 2), so a slept agent with
+#     a later trigger is always woken by a subsequent tick.
+_HB_SLEEP_AFTER_MIN="${HEARTBEAT_SLEEP_AFTER_MIN:-15}"   # idle minutes before a cold agent sleeps
+[[ "$_HB_SLEEP_AFTER_MIN" =~ ^[0-9]+$ ]] || _HB_SLEEP_AFTER_MIN=15
+
+# Per-agent idle-before-sleep threshold (minutes); falls back to the global default.
+_hb_sleep_after_min() {
+  local name="$1" reg="${2:-$(registry_read)}" v
+  v=$(jq -r --arg n "$name" '.agents[$n].wake.sleepAfterMin // empty' <<<"$reg" 2>/dev/null)
+  if [[ "$v" =~ ^[0-9]+$ ]] && (( v > 0 )); then echo "$v"; else echo "$_HB_SLEEP_AFTER_MIN"; fi
+}
+
+# Does this agent have open work that should keep it awake? A still-open assigned
+# task (todo or in_progress) means keep the session up. Fail-closed: on any db
+# error we report "has work" (echo via return 0) so a transient error never
+# sleeps an agent mid-flight.
+_hb_agent_has_work() {
+  local name="$1" n
+  n=$(db "SELECT COUNT(*) FROM tasks WHERE assignee=$(sqlq "$name") AND status IN ('todo','in_progress') AND kind='standard';" 2>/dev/null) || return 0
+  [[ "$n" =~ ^[0-9]+$ ]] || return 0
+  (( n > 0 ))
+}
+
+# Registry mutations (run under with_registry_lock, like _hb_mark_run): arm/disarm
+# the idle timer and stamp the last sleep for observability.
+_hb_autosleep_arm()    { local name="$1" now="$2" reg; reg=$(registry_read); jq --arg n "$name" --argjson t "$now" '.agents[$n].wake.idleSince = $t' <<<"$reg" | registry_write; }
+_hb_autosleep_disarm() { local name="$1" reg; reg=$(registry_read); jq --arg n "$name" 'if .agents[$n].wake then .agents[$n].wake |= del(.idleSince) else . end' <<<"$reg" | registry_write; }
+_hb_mark_slept()       { local name="$1" now="$2" reg; reg=$(registry_read); jq --arg n "$name" --argjson t "$now" '.agents[$n].wake |= ((. // {}) + {lastSleptAt: $t}) | .agents[$n].wake |= del(.idleSince)' <<<"$reg" | registry_write; }
+
+# The auto-sleep pass. Runs once per tick (isolated by the caller — a failure here
+# must NEVER abort the wake loop). Arms an idle timer the first idle+no-work tick,
+# then `systemctl stop`s the unit once idle has persisted past the threshold.
+# Returns the count via the _HB_SLEPT/_HB_SLEEP_ARMED globals for the tick summary.
+_HB_SLEPT=0; _HB_SLEEP_ARMED=0
+_hb_autosleep_sweep() {
+  local now="$1" reg name mode since after irc
+  _HB_SLEPT=0; _HB_SLEEP_ARMED=0
+  reg=$(registry_read) || return 0
+  for name in $(jq -r '.agents | keys[]' <<<"$reg" 2>/dev/null); do
+    mode=$(_hb_wake_mode "$name" "$reg")
+    [[ "$mode" == "cold" ]] || continue
+    _hb_wake_protected "$name" && continue
+    since=$(jq -r --arg n "$name" '.agents[$n].wake.idleSince // 0' <<<"$reg" 2>/dev/null)
+    [[ "$since" =~ ^[0-9]+$ ]] || since=0
+    # A stopped unit needs no timer — clean up any stale arm and move on.
+    if ! systemctl is-active --quiet "5dive-agent@${name}.service" 2>/dev/null; then
+      (( since != 0 )) && { with_registry_lock _hb_autosleep_disarm "$name" >/dev/null 2>&1 || true; }
+      continue
+    fi
+    # Open work OR not-confidently-idle => stay awake; disarm the timer.
+    if _hb_agent_has_work "$name"; then
+      (( since != 0 )) && { with_registry_lock _hb_autosleep_disarm "$name" >/dev/null 2>&1 || true; }
+      continue
+    fi
+    _hb_agent_idle "$name" 0.4; irc=$?
+    if (( irc != 0 )); then
+      (( since != 0 )) && { with_registry_lock _hb_autosleep_disarm "$name" >/dev/null 2>&1 || true; }
+      continue
+    fi
+    after=$(_hb_sleep_after_min "$name" "$reg")
+    if (( since == 0 )); then
+      with_registry_lock _hb_autosleep_arm "$name" "$now" >/dev/null 2>&1 || true
+      _HB_SLEEP_ARMED=$((_HB_SLEEP_ARMED + 1))
+      _hb_log "[$name] cold + idle + no open work — arming auto-sleep (fires after ${after}m idle)"
+    elif (( now - since >= after * 60 )); then
+      _hb_log "[$name] cold + idle ${after}m+ with no open work — sleeping (systemctl stop)"
+      if systemctl stop "5dive-agent@${name}.service" 2>/dev/null; then
+        with_registry_lock _hb_mark_slept "$name" "$now" >/dev/null 2>&1 || true
+        _HB_SLEPT=$((_HB_SLEPT + 1))
+      else
+        _hb_log "[$name] systemctl stop failed — will retry next tick"
+      fi
+    fi
+  done
+  _hb_log "[autosleep] pass done — ${_HB_SLEPT} slept, ${_HB_SLEEP_ARMED} armed"
+  return 0
+}
+
 _hb_log() { printf '%s [heartbeat] %s\n' "$(date -u +%FT%TZ)" "$*" >&2; }
 
 _hb_usage() {
@@ -30857,17 +30949,18 @@ _hb_usage() {
   5dive heartbeat off <name>              # stop waking the agent (keeps its settings)
   5dive heartbeat ls                      # show enrolled agents + next-wake + queued count
   5dive heartbeat tick                    # cron driver: wake every due agent that has work
-  5dive heartbeat wake-mode <name> [always_on|cold] [--cap=<n>]
-                                          # DIVE-1858: opt-in reactive wake mode + wake-budget.
-                                          # no args after <name> => show current mode/budget/cost.
+  5dive heartbeat wake-mode <name> [always_on|cold] [--cap=<n>] [--sleep-after=<min>]
+                                          # DIVE-1858: opt-in reactive wake mode + wake-budget + auto-sleep.
+                                          # no args after <name> => show current mode/budget/sleep/cost.
 
   <dur>: minutes (e.g. 30), or 45m / 2h / 1h30m.
   wake-mode (DIVE-1858 Phase 1): 'cold' opts an agent into reactive
         wake-on-alert with a wakes/day budget cap (default ${_HB_WAKE_DEFAULT_CAP}) so a chatty
         trigger can't thrash it; cost-per-wake is surfaced (display only, zero
-        billing). 'always_on' (default) is unchanged. main + marketing are
-        pinned always-on and refuse 'cold'. NOTE: live auto-sleep is Phase 2,
-        held for lead review — Stage 1 only adds the flag + budget guardrail.
+        billing). A cold agent that goes idle with no open work is auto-slept
+        (systemctl stop) after --sleep-after minutes (default ${_HB_SLEEP_AFTER_MIN}m) and is
+        woken again by the next trigger. 'always_on' (default) is unchanged;
+        main + marketing are pinned always-on and refuse 'cold'.
   fresh (default off, DIVE-1210): --fresh sends /clear before each task so
         context starts clean, at the cost of a full CLAUDE.md/project re-prime
         on every wake (up to ~48x/day on the default 30m cadence). Off keeps
@@ -30979,10 +31072,11 @@ cmd_heartbeat_off() {
 # always-on agent (main/marketing — olivia condition 3). NO live sleep is wired
 # here; Stage 2 (auto-sleep smoke) is held for main's pre-run lead review.
 cmd_heartbeat_wake_mode() {
-  local name="" mode="" cap=""
+  local name="" mode="" cap="" sleep_after=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      --cap=*) cap="${1#*=}" ;;
+      --cap=*)         cap="${1#*=}" ;;
+      --sleep-after=*) sleep_after="${1#*=}" ;;
       -*)      fail "$E_USAGE" "unknown flag: $1" ;;
       *)       if [[ -z "$name" ]]; then name="$1"
                elif [[ -z "$mode" ]]; then mode="$1"
@@ -30990,25 +31084,26 @@ cmd_heartbeat_wake_mode() {
     esac
     shift
   done
-  [[ -n "$name" ]] || fail "$E_USAGE" "usage: 5dive heartbeat wake-mode <name> [always_on|cold] [--cap=<n>]"
+  [[ -n "$name" ]] || fail "$E_USAGE" "usage: 5dive heartbeat wake-mode <name> [always_on|cold] [--cap=<n>] [--sleep-after=<min>]"
   require_agent "$name"
 
-  # Read-only path: no mode + no cap => print current state, no root needed.
-  if [[ -z "$mode" && -z "$cap" ]]; then
-    local reg cur jcap jused jday
+  # Read-only path: no mode + no cap + no sleep-after => print current state, no root needed.
+  if [[ -z "$mode" && -z "$cap" && -z "$sleep_after" ]]; then
+    local reg cur jcap jused jday jslp
     reg=$(registry_read)
     cur=$(_hb_wake_mode "$name" "$reg")
     jcap=$(jq -r --arg n "$name" '.agents[$n].wake.budget.capPerDay // "-"' <<<"$reg")
     jused=$(jq -r --arg n "$name" '.agents[$n].wake.budget.wakesToday // 0' <<<"$reg")
     jday=$(jq -r --arg n "$name" '.agents[$n].wake.budget.day // "-"' <<<"$reg")
-    ok "wake mode for '$name': ${cur} (cap ${jcap}/day, used ${jused} on ${jday}; cost/wake ${_HB_WAKE_COST_EST})" \
-       '{name:$n, mode:$m, capPerDay:$c, wakesToday:($u|tonumber), day:$d, costPerWake:$cost}' \
-       --arg n "$name" --arg m "$cur" --arg c "$jcap" --arg u "$jused" --arg d "$jday" --arg cost "$_HB_WAKE_COST_EST"
+    jslp=$(_hb_sleep_after_min "$name" "$reg")
+    ok "wake mode for '$name': ${cur} (cap ${jcap}/day, used ${jused} on ${jday}; sleeps after ${jslp}m idle; cost/wake ${_HB_WAKE_COST_EST})" \
+       '{name:$n, mode:$m, capPerDay:$c, wakesToday:($u|tonumber), day:$d, sleepAfterMin:($s|tonumber), costPerWake:$cost}' \
+       --arg n "$name" --arg m "$cur" --arg c "$jcap" --arg u "$jused" --arg d "$jday" --arg s "$jslp" --arg cost "$_HB_WAKE_COST_EST"
     return 0
   fi
 
   require_root "heartbeat wake-mode"
-  [[ -z "$mode" ]] && mode="cold"   # `--cap` alone implies opting into cold
+  [[ -z "$mode" ]] && mode="cold"   # `--cap`/`--sleep-after` alone implies opting into cold
   case "$mode" in
     always_on|cold) ;;
     *) fail "$E_VALIDATION" "bad mode '$mode' (use: always_on | cold)" ;;
@@ -31017,20 +31112,26 @@ cmd_heartbeat_wake_mode() {
     fail "$E_VALIDATION" "'$name' is a protected always-on agent (customer-facing/critical; e.g. main, marketing) — refusing wake_mode=cold (olivia condition 3)"
   fi
   [[ -z "$cap" || "$cap" =~ ^[0-9]+$ ]] || fail "$E_VALIDATION" "bad --cap '$cap' (whole number of wakes/day)"
+  [[ -z "$sleep_after" || ( "$sleep_after" =~ ^[0-9]+$ && "$sleep_after" -gt 0 ) ]] || fail "$E_VALIDATION" "bad --sleep-after '$sleep_after' (whole number of idle minutes > 0)"
 
-  with_registry_lock _hb_wake_mode_write "$name" "$mode" "$cap"
+  with_registry_lock _hb_wake_mode_write "$name" "$mode" "$cap" "$sleep_after"
 }
 
 # Registry mutation for cmd_heartbeat_wake_mode (runs under the lock). Preserves
 # any existing wakesToday/day counter so flipping mode or re-capping mid-day
 # doesn't reset the budget.
 _hb_wake_mode_write() {
-  local name="$1" mode="$2" cap="$3"
+  local name="$1" mode="$2" cap="$3" sleep_after="${4:-}"
   local reg; reg=$(registry_read)
+  # Preserve an existing sleepAfterMin unless the caller passed a new one; drop it
+  # (fall back to the global default) when flipping back to always_on.
   reg=$(jq --arg n "$name" --arg m "$mode" --arg cost "$_HB_WAKE_COST_EST" \
-           --argjson cap "${cap:-null}" --argjson defcap "$_HB_WAKE_DEFAULT_CAP" '
-      ( .agents[$n].wake.budget // {} ) as $b
-      | .agents[$n].wake = {
+           --argjson cap "${cap:-null}" --argjson defcap "$_HB_WAKE_DEFAULT_CAP" \
+           --argjson slp "${sleep_after:-null}" '
+      ( .agents[$n].wake // {} ) as $w
+      | ( $w.budget // {} ) as $b
+      | ( if $slp != null then $slp elif $m == "cold" then $w.sleepAfterMin else null end ) as $eff_slp
+      | .agents[$n].wake = ({
           mode: $m,
           costPerWake: $cost,
           budget: {
@@ -31040,11 +31141,14 @@ _hb_wake_mode_write() {
             wakesToday: ($b.wakesToday // 0),
             day: ($b.day // "")
           }
-        }' <<<"$reg")
+        } + (if $eff_slp != null then {sleepAfterMin: $eff_slp} else {} end)
+          + (if $w.lastSleptAt != null then {lastSleptAt: $w.lastSleptAt} else {} end))' <<<"$reg")
   echo "$reg" | registry_write
-  local shown_cap; shown_cap=$(jq -r --arg n "$name" '.agents[$n].wake.budget.capPerDay // "-"' <<<"$reg")
-  ok "wake mode for '$name' set to '$mode' (cap ${shown_cap}/day; cost/wake ${_HB_WAKE_COST_EST}; live sleep is Phase 2, held for lead review)" \
-     '{name:$n, mode:$m, capPerDay:$c}' --arg n "$name" --arg m "$mode" --arg c "$shown_cap"
+  local shown_cap shown_slp
+  shown_cap=$(jq -r --arg n "$name" '.agents[$n].wake.budget.capPerDay // "-"' <<<"$reg")
+  shown_slp=$(_hb_sleep_after_min "$name" "$reg")
+  ok "wake mode for '$name' set to '$mode' (cap ${shown_cap}/day; sleeps after ${shown_slp}m idle; cost/wake ${_HB_WAKE_COST_EST})" \
+     '{name:$n, mode:$m, capPerDay:$c, sleepAfterMin:($s|tonumber)}' --arg n "$name" --arg m "$mode" --arg c "$shown_cap" --arg s "$shown_slp"
 }
 
 cmd_heartbeat_ls() {
@@ -32536,6 +32640,11 @@ cmd_heartbeat_tick() {
   # eligible for pickup this same tick. The renag's confirmed gate_pinged_at
   # stamp also preserves pass 3's existing seven-day throttle (no duplicate).
   _hb_gate_ttl_sweep || _hb_log "[gate-ttl] pass errored (non-fatal)"
+  # DIVE-1858 Stage 2: live auto-sleep pass. Stops cold + idle + no-open-work
+  # agents after the idle threshold. Isolated like every other sweep — a failure
+  # here must NEVER abort the wake loop (the heartbeat-never-woke bug class). No-op
+  # unless at least one agent is opt-in wake_mode=cold.
+  _hb_autosleep_sweep "$now" || _hb_log "[autosleep] pass errored (non-fatal)"
   # DIVE-1355: the belt-and-suspenders half of the self-dispatch fix. Auto-recover
   # any task still stuck 'blocked' whose every blocking edge is a done/cancelled
   # task (repairs pre-existing rot like OSS-27 + any live cascade miss), and
@@ -32842,10 +32951,10 @@ cmd_heartbeat_tick() {
                   | sort_by(.value.heartbeat.lastRunAt // 0)
                   | .[].key' <<<"$reg")
 
-  ok "heartbeat tick: woke ${woke} / reclaimed ${reclaimed} / reaped ${reaped} / starved ${starved} / spread-deferred ${sk_spread} / active-deferred ${sk_active} / budget-skipped ${sk_budget} / checked ${checked}" \
-     '{checked:($c|tonumber), woke:($w|tonumber), reclaimed:($rc|tonumber), reaped:($r|tonumber), starved:($st|tonumber),
+  ok "heartbeat tick: woke ${woke} / slept ${_HB_SLEPT} / reclaimed ${reclaimed} / reaped ${reaped} / starved ${starved} / spread-deferred ${sk_spread} / active-deferred ${sk_active} / budget-skipped ${sk_budget} / checked ${checked}" \
+     '{checked:($c|tonumber), woke:($w|tonumber), slept:($sl|tonumber), sleepArmed:($sa|tonumber), reclaimed:($rc|tonumber), reaped:($r|tonumber), starved:($st|tonumber),
        skipped:{notDue:($nd|tonumber), busy:($b|tonumber), noWork:($nw|tonumber), spread:($sp|tonumber), active:($ac|tonumber), budget:($bu|tonumber), failed:($sf|tonumber)}}' \
-     --arg c "$checked" --arg w "$woke" --arg rc "$reclaimed" --arg r "$reaped" --arg st "$starved" --arg nd "$sk_notdue" --arg b "$sk_busy" --arg nw "$sk_nowork" --arg sp "$sk_spread" --arg ac "$sk_active" --arg bu "$sk_budget" --arg sf "$sk_fail"
+     --arg c "$checked" --arg w "$woke" --arg sl "$_HB_SLEPT" --arg sa "$_HB_SLEEP_ARMED" --arg rc "$reclaimed" --arg r "$reaped" --arg st "$starved" --arg nd "$sk_notdue" --arg b "$sk_busy" --arg nw "$sk_nowork" --arg sp "$sk_spread" --arg ac "$sk_active" --arg bu "$sk_budget" --arg sf "$sk_fail"
 }
 
 # -------- 5dive supervisor — fleet health brain (DIVE-724, P1: observe-only) --------
