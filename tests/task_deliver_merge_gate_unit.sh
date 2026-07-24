@@ -18,17 +18,27 @@ trap 'rm -rf "$TMP"' EXIT
 mkdir -p "$TMP/bin"
 cat >"$TMP/bin/gh" <<'STUB'
 #!/usr/bin/env bash
-# Minimal stand-in for both merge-gate calls:
-#   gh pr view <url>  --json state,mergedAt        -q '.state' | -q '.mergedAt'
-#   gh pr list --head <b> --state merged --json ... -q '.[0].mergedAt'
-q=""
+# Minimal stand-in for all three merge-gate calls:
+#   gh pr view <url>  --json state,mergedAt              -q '.state' | -q '.mergedAt'
+#   gh pr list --head <b> --state merged --json ...      -q '.[0].mergedAt'  (DIVE-1830 branch path)
+#   gh pr list --state open --limit 200 --json ...       -q '[.[]|select(...)]...'  (DIVE-1835 auto-detect)
+argv="$*"; q=""; state=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     -q) q="$2"; shift 2 ;;
     -q*) q="${1#-q}"; shift ;;
+    --state) state="$2"; shift 2 ;;
     *)  shift ;;
   esac
 done
+# DIVE-1835 auto-detect fires on `pr list --state open`; evaluate its client-side
+# jq filter against the fixture (default [] => no match, so a plain no-binding
+# close is NOT false-blocked). The DIVE-1830 branch path (`--state merged`) and
+# `pr view` keep the field-keyed behaviour below.
+if [[ "$argv" == *"pr list"* && "$state" == "open" ]]; then
+  printf '%s' "${GH_STUB_PRLIST:-[]}" | jq -r "$q" 2>/dev/null
+  exit 0
+fi
 case "$q" in
   .state)          printf '%s\n' "${GH_STUB_STATE:-}" ;;
   .mergedAt|.\[0\].mergedAt|'.[0].mergedAt') printf '%s\n' "${GH_STUB_MERGED:-}" ;;

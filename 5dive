@@ -17283,9 +17283,13 @@ _task_status_cmd() {
       # One bounded, read-only listing; filter title/headRefName client-side so a
       # body-only mention can't match. `timeout 5s` + `|| echo ""` => any slow/
       # failed/absent gh yields no hit and the close proceeds (fail-open).
+      # The ident is matched at WORD BOUNDARIES (non-alnum on both sides), not as
+      # a bare substring — else DIVE-202 would be false-blocked by an open PR
+      # naming DIVE-2021/DIVE-2029. Case-insensitive so a lowercase branch
+      # (`dive-202-fix`) matches the uppercase ident too.
       _auto_hit=$(GH_TOKEN="$_ghtok2" timeout 5s gh pr list --repo "$_slug2" \
                     --state open --limit 200 --json number,headRefName,title \
-                    -q "[.[] | select((.title|contains(\"$ident\")) or (.headRefName|contains(\"$ident\"))) | .number] | .[0] // empty" \
+                    -q "[.[] | select((.title // \"\" | test(\"(^|[^A-Za-z0-9])${ident}([^A-Za-z0-9]|\$)\";\"i\")) or (.headRefName // \"\" | test(\"(^|[^A-Za-z0-9])${ident}([^A-Za-z0-9]|\$)\";\"i\"))) | .number] | .[0] // empty" \
                     2>/dev/null || echo "")
     fi
     if [[ $force_merge_gate -eq 1 ]]; then

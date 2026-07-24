@@ -75,6 +75,34 @@ out=$(cmd_task_done DIVE-902 2>&1); rc=$?
   && ok_t "T2 open PR naming the ident in its HEAD BRANCH blocks the close" \
   || bad_t "T2 branch match blocks" "rc=$rc status=$(statusof DIVE-902) out=$out"
 
+# --- T2b (word-boundary): a longer ident that merely PREFIX-shares does NOT
+#     block. Open PRs name DIVE-2021 + DIVE-2029; closing DIVE-202 must proceed —
+#     the ident is matched at word boundaries, not as a bare substring. ---------
+seed DIVE-202
+export GH_STUB_PRLIST='[{"number":2021,"headRefName":"feat/DIVE-2021","title":"DIVE-2021 thing"},{"number":2029,"headRefName":"feat/DIVE-2029-x","title":"DIVE-2029 other"}]'
+out=$(cmd_task_done DIVE-202 2>&1); rc=$?
+[[ $rc -eq 0 && "$(statusof DIVE-202)" == "done" ]] \
+  && ok_t "T2b DIVE-2021/2029 PRs do NOT false-block the shorter DIVE-202 close" \
+  || bad_t "T2b substring false-block" "rc=$rc status=$(statusof DIVE-202) out=$out"
+
+# --- T2c: the exact ident (adjacent to a non-alnum) STILL blocks even when a
+#     prefix-sharing sibling PR is also open — boundary match, not over-loose. --
+seed DIVE-203
+export GH_STUB_PRLIST='[{"number":2031,"headRefName":"feat/DIVE-2031","title":"DIVE-2031 sibling"},{"number":203,"headRefName":"feat/x","title":"DIVE-203 real fix"}]'
+out=$(cmd_task_done DIVE-203 2>&1); rc=$?
+[[ $rc -eq $E_CONFLICT && "$(statusof DIVE-203)" != "done" ]] \
+  && ok_t "T2c exact ident 'DIVE-203 ...' blocks despite an open DIVE-2031 sibling" \
+  || bad_t "T2c exact-ident still blocks" "rc=$rc status=$(statusof DIVE-203) out=$out"
+
+# --- T2d: a lowercase branch naming the ident blocks (real branches are
+#     lowercase; match is case-insensitive so the uppercase ident still hits). --
+seed DIVE-204
+export GH_STUB_PRLIST='[{"number":204,"headRefName":"dive-204-fix","title":"unrelated title"}]'
+out=$(cmd_task_done DIVE-204 2>&1); rc=$?
+[[ $rc -eq $E_CONFLICT && "$(statusof DIVE-204)" != "done" ]] \
+  && ok_t "T2d lowercase branch 'dive-204-fix' blocks the uppercase-ident close" \
+  || bad_t "T2d case-insensitive branch match" "rc=$rc status=$(statusof DIVE-204) out=$out"
+
 # --- T3: a PR that mentions the ident ONLY in its BODY does NOT block. ---------
 #     (the fixture has no ident in title/headRefName -> client-side filter drops it)
 seed DIVE-903
