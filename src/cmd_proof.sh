@@ -232,19 +232,36 @@ _proof_build() {
 
   # Build the three files from the digest output verbatim. The builder is the
   # honesty-critical core (unit-tested via tests/proof_publish_unit.sh, which
-  # extracts this exact python block): it reads the digest numbers from the
-  # environment and writes them out with NO edit path; exit 3 == already
-  # published today (idempotent no-op).
+  # extracts this exact python block): it reads the digest numbers from a file
+  # pointer (env fallback) and writes them out with NO edit path; exit 3 ==
+  # already published today (idempotent no-op).
   local summary rc
   set +e
-  summary="$(DAY_JSON="$day_json" WEEK_JSON="$week_json" TODAY="$today" \
+  # DIVE-1864: pass the digest JSON to python via files, not env vars. A single
+  # environment string over MAX_ARG_STRLEN (32 * page = 128KB) makes the exec
+  # fail with E2BIG ("Argument list too long"); week_json crossed 128KB as the
+  # ledger grew, silently breaking every publish. Files carry the numbers
+  # verbatim with no size limit. Written under $work (NOT cwd=$work/repo) so the
+  # later `git add -A` never commits them. The python still falls back to the
+  # inline DAY_JSON/WEEK_JSON env vars when no *_FILE is set (the unit harness).
+  printf '%s' "$day_json"  > "$work/day.json"
+  printf '%s' "$week_json" > "$work/week.json"
+  summary="$(DAY_JSON_FILE="$work/day.json" WEEK_JSON_FILE="$work/week.json" TODAY="$today" \
     TODAY_LABEL="$today_label" NOW_ISO="$now_iso" CLI_VERSION="$cli_version" \
     METHODOLOGY_URL="$_PROOF_METHODOLOGY_URL" \
     python3 <<'PROOFPY'
 import json, os, pathlib, sys
 
-day = json.loads(os.environ["DAY_JSON"])
-week = json.loads(os.environ["WEEK_JSON"])
+def _load(name):
+    """Digest JSON arrives via a *_FILE pointer (no MAX_ARG_STRLEN cap); fall
+    back to the inline env var for the unit harness / shim callers."""
+    path = os.environ.get(name + "_FILE")
+    if path:
+        return json.loads(pathlib.Path(path).read_text())
+    return json.loads(os.environ[name])
+
+day = _load("DAY_JSON")
+week = _load("WEEK_JSON")
 today = os.environ["TODAY"]
 
 hist_path = pathlib.Path("history.jsonl")
