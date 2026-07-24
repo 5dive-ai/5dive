@@ -26,7 +26,7 @@ esac
 
 # Bumped on every public release. `build.sh` checks this line exists; CI fails
 # the bundle-drift check if it's missing or empty.
-readonly FIVE_VERSION="0.14.3"
+readonly FIVE_VERSION="0.14.4"
 
 # GitHub org our repos live under. The org is being renamed
 # 5dive-com -> 5dive-ai (2026-06); fetches must work on either side of the
@@ -30618,6 +30618,72 @@ _HB_USAGE_PRESS_MAX="${HEARTBEAT_USAGE_PRESS_MAX:-2}"
 # mid-turn/conversation and (b) gate idle-stall reclaim.
 _HB_IDLE_SAMPLE_SEC=3
 
+# --- DIVE-1858 Phase-1 wake-on-alert: opt-in wake_mode + wake-budget ----------
+# Stage 1 (main 2026-07-24, staged plan A): a per-agent opt-in wake mode plus a
+# wakes/day budget cap with cost-per-wake visibility. There is NO live auto-sleep
+# here — that is Stage 2, held for main's pre-run lead review on a disposable
+# non-critical test agent. The always-on dispatcher IS cmd_heartbeat_tick, which
+# is already self-monitored (DIVE-1434 poller-liveness canary); Stage 1 only
+# teaches it to respect the flag + budget so a chatty trigger can't thrash a
+# cold agent into repeated cold-start wakes. always_on / un-capped agents are
+# wholly unaffected — every gate below is additive and defaults to the current
+# behaviour when no wake config exists.
+_HB_WAKE_DEFAULT_CAP="${HEARTBEAT_WAKE_CAP:-24}"   # default wakes/day per cold agent
+[[ "$_HB_WAKE_DEFAULT_CAP" =~ ^[0-9]+$ ]] || _HB_WAKE_DEFAULT_CAP=24
+# Cost-per-wake display estimate (cold-start cost). DISPLAY ONLY — Phase 1 carries
+# ZERO billing surface (olivia condition 4); pay-per-wake billing is a firewalled
+# future lodar-only SPEND gate.
+_HB_WAKE_COST_EST="${HEARTBEAT_WAKE_COST_EST:-cold-start (est. tokens; billing is Phase 2)}"
+
+# Agents that must NEVER go cold (olivia condition 3: customer-facing/critical
+# stay always-on). main + marketing are pinned; extend via the space-separated
+# HEARTBEAT_WAKE_PROTECTED env. Returns 0 when the agent is protected.
+_hb_wake_protected() {
+  local name="$1" p
+  for p in main marketing ${HEARTBEAT_WAKE_PROTECTED:-}; do
+    [[ "$name" == "$p" ]] && return 0
+  done
+  return 1
+}
+
+# Echo an agent's wake mode (always_on | cold); defaults always_on when unset.
+# Arg2 optional registry snapshot to avoid a re-read in hot paths.
+_hb_wake_mode() {
+  jq -r --arg n "$1" '.agents[$n].wake.mode // "always_on"' \
+    <<<"${2:-$(registry_read)}" 2>/dev/null || echo always_on
+}
+
+# Budget check: return 0 if this agent may wake now, 1 if a cold agent has spent
+# today's cap. always_on agents and cold agents with no cap set are never
+# budgeted (return 0). Arg2 = today (YYYY-MM-DD), Arg3 = optional reg snapshot.
+_hb_wake_budget_ok() {
+  local name="$1" today="$2" reg="${3:-$(registry_read)}"
+  [[ "$(_hb_wake_mode "$name" "$reg")" == "cold" ]] || return 0
+  local cap day used
+  cap=$(jq -r --arg n "$name" '.agents[$n].wake.budget.capPerDay // empty' <<<"$reg")
+  [[ "$cap" =~ ^[0-9]+$ ]] || return 0   # no numeric cap => unlimited
+  day=$(jq -r --arg n "$name" '.agents[$n].wake.budget.day // ""' <<<"$reg")
+  used=$(jq -r --arg n "$name" '.agents[$n].wake.budget.wakesToday // 0' <<<"$reg")
+  [[ "$day" == "$today" ]] || used=0     # a new day resets the counter
+  [[ "$used" =~ ^[0-9]+$ ]] || used=0
+  (( used < cap ))
+}
+
+# Record a wake against today's budget (day-rollover aware). No-op for
+# always_on agents. Call under with_registry_lock, like _hb_mark_run.
+_hb_wake_budget_inc() {
+  local name="$1" today="$2"
+  local reg; reg=$(registry_read)
+  [[ "$(_hb_wake_mode "$name" "$reg")" == "cold" ]] || return 0
+  jq --arg n "$name" --arg d "$today" --argjson defcap "$_HB_WAKE_DEFAULT_CAP" '
+      ( .agents[$n].wake.budget // {} ) as $b
+      | .agents[$n].wake.budget = {
+          capPerDay: ($b.capPerDay // $defcap),
+          day: $d,
+          wakesToday: (if ($b.day // "") == $d then (($b.wakesToday // 0) + 1) else 1 end)
+        }' <<<"$reg" | registry_write
+}
+
 _hb_log() { printf '%s [heartbeat] %s\n' "$(date -u +%FT%TZ)" "$*" >&2; }
 
 _hb_usage() {
@@ -30629,8 +30695,17 @@ _hb_usage() {
   5dive heartbeat off <name>              # stop waking the agent (keeps its settings)
   5dive heartbeat ls                      # show enrolled agents + next-wake + queued count
   5dive heartbeat tick                    # cron driver: wake every due agent that has work
+  5dive heartbeat wake-mode <name> [always_on|cold] [--cap=<n>]
+                                          # DIVE-1858: opt-in reactive wake mode + wake-budget.
+                                          # no args after <name> => show current mode/budget/cost.
 
   <dur>: minutes (e.g. 30), or 45m / 2h / 1h30m.
+  wake-mode (DIVE-1858 Phase 1): 'cold' opts an agent into reactive
+        wake-on-alert with a wakes/day budget cap (default ${_HB_WAKE_DEFAULT_CAP}) so a chatty
+        trigger can't thrash it; cost-per-wake is surfaced (display only, zero
+        billing). 'always_on' (default) is unchanged. main + marketing are
+        pinned always-on and refuse 'cold'. NOTE: live auto-sleep is Phase 2,
+        held for lead review — Stage 1 only adds the flag + budget guardrail.
   fresh (default off, DIVE-1210): --fresh sends /clear before each task so
         context starts clean, at the cost of a full CLAUDE.md/project re-prime
         on every wake (up to ~48x/day on the default 30m cadence). Off keeps
@@ -30653,6 +30728,7 @@ cmd_heartbeat() {
     ls|list|status)  cmd_heartbeat_ls "$@" ;;
     tick)            cmd_heartbeat_tick "$@" ;;
     wake-task)       cmd_heartbeat_wake_task "$@" ;;
+    wake-mode)       cmd_heartbeat_wake_mode "$@" ;;
     -h|--help|help)  _hb_usage ;;
     *) fail "$E_USAGE" "unknown heartbeat command: $sub (try: 5dive heartbeat --help)" ;;
   esac
@@ -30733,6 +30809,80 @@ cmd_heartbeat_off() {
     '.agents[$n].heartbeat = ((.agents[$n].heartbeat // {everyMin: '"$_HB_DEFAULT_EVERY"', fresh: false, lastRunAt: 0}) + {enabled: false})' \
     | registry_write
   ok "heartbeat off for '$name'" '{name:$n, enabled:false}' --arg n "$name"
+}
+
+# DIVE-1858 Stage 1: get/set an agent's wake mode + wake-budget cap. A read (no
+# mode + no --cap) is lock-free like `ls` (any group-claude agent can inspect its
+# own). A write takes root + the registry lock and refuses 'cold' on a protected
+# always-on agent (main/marketing — olivia condition 3). NO live sleep is wired
+# here; Stage 2 (auto-sleep smoke) is held for main's pre-run lead review.
+cmd_heartbeat_wake_mode() {
+  local name="" mode="" cap=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --cap=*) cap="${1#*=}" ;;
+      -*)      fail "$E_USAGE" "unknown flag: $1" ;;
+      *)       if [[ -z "$name" ]]; then name="$1"
+               elif [[ -z "$mode" ]]; then mode="$1"
+               else fail "$E_USAGE" "unexpected arg: $1"; fi ;;
+    esac
+    shift
+  done
+  [[ -n "$name" ]] || fail "$E_USAGE" "usage: 5dive heartbeat wake-mode <name> [always_on|cold] [--cap=<n>]"
+  require_agent "$name"
+
+  # Read-only path: no mode + no cap => print current state, no root needed.
+  if [[ -z "$mode" && -z "$cap" ]]; then
+    local reg cur jcap jused jday
+    reg=$(registry_read)
+    cur=$(_hb_wake_mode "$name" "$reg")
+    jcap=$(jq -r --arg n "$name" '.agents[$n].wake.budget.capPerDay // "-"' <<<"$reg")
+    jused=$(jq -r --arg n "$name" '.agents[$n].wake.budget.wakesToday // 0' <<<"$reg")
+    jday=$(jq -r --arg n "$name" '.agents[$n].wake.budget.day // "-"' <<<"$reg")
+    ok "wake mode for '$name': ${cur} (cap ${jcap}/day, used ${jused} on ${jday}; cost/wake ${_HB_WAKE_COST_EST})" \
+       '{name:$n, mode:$m, capPerDay:$c, wakesToday:($u|tonumber), day:$d, costPerWake:$cost}' \
+       --arg n "$name" --arg m "$cur" --arg c "$jcap" --arg u "$jused" --arg d "$jday" --arg cost "$_HB_WAKE_COST_EST"
+    return 0
+  fi
+
+  require_root "heartbeat wake-mode"
+  [[ -z "$mode" ]] && mode="cold"   # `--cap` alone implies opting into cold
+  case "$mode" in
+    always_on|cold) ;;
+    *) fail "$E_VALIDATION" "bad mode '$mode' (use: always_on | cold)" ;;
+  esac
+  if [[ "$mode" == "cold" ]] && _hb_wake_protected "$name"; then
+    fail "$E_VALIDATION" "'$name' is a protected always-on agent (customer-facing/critical; e.g. main, marketing) — refusing wake_mode=cold (olivia condition 3)"
+  fi
+  [[ -z "$cap" || "$cap" =~ ^[0-9]+$ ]] || fail "$E_VALIDATION" "bad --cap '$cap' (whole number of wakes/day)"
+
+  with_registry_lock _hb_wake_mode_write "$name" "$mode" "$cap"
+}
+
+# Registry mutation for cmd_heartbeat_wake_mode (runs under the lock). Preserves
+# any existing wakesToday/day counter so flipping mode or re-capping mid-day
+# doesn't reset the budget.
+_hb_wake_mode_write() {
+  local name="$1" mode="$2" cap="$3"
+  local reg; reg=$(registry_read)
+  reg=$(jq --arg n "$name" --arg m "$mode" --arg cost "$_HB_WAKE_COST_EST" \
+           --argjson cap "${cap:-null}" --argjson defcap "$_HB_WAKE_DEFAULT_CAP" '
+      ( .agents[$n].wake.budget // {} ) as $b
+      | .agents[$n].wake = {
+          mode: $m,
+          costPerWake: $cost,
+          budget: {
+            capPerDay: (if $cap != null then $cap
+                        elif $m == "cold" then ($b.capPerDay // $defcap)
+                        else $b.capPerDay end),
+            wakesToday: ($b.wakesToday // 0),
+            day: ($b.day // "")
+          }
+        }' <<<"$reg")
+  echo "$reg" | registry_write
+  local shown_cap; shown_cap=$(jq -r --arg n "$name" '.agents[$n].wake.budget.capPerDay // "-"' <<<"$reg")
+  ok "wake mode for '$name' set to '$mode' (cap ${shown_cap}/day; cost/wake ${_HB_WAKE_COST_EST}; live sleep is Phase 2, held for lead review)" \
+     '{name:$n, mode:$m, capPerDay:$c}' --arg n "$name" --arg m "$mode" --arg c "$shown_cap"
 }
 
 cmd_heartbeat_ls() {
@@ -32208,7 +32358,8 @@ cmd_heartbeat_tick() {
   require_root "heartbeat tick"
   tasks_db_init
   local reg now; reg=$(registry_read); now=$(date +%s)
-  local checked=0 woke=0 reaped=0 reclaimed=0 starved=0 sk_notdue=0 sk_busy=0 sk_nowork=0 sk_fail=0 sk_spread=0 sk_active=0
+  local checked=0 woke=0 reaped=0 reclaimed=0 starved=0 sk_notdue=0 sk_busy=0 sk_nowork=0 sk_fail=0 sk_spread=0 sk_active=0 sk_budget=0
+  local today; today=$(date +%F)   # DIVE-1858 wake-budget day key (YYYY-MM-DD)
   # DIVE-138: materialize due recurring templates FIRST so a freshly-cloned todo
   # is eligible for the wake loop below this same tick. Isolated — a failure here
   # must never abort the wake loop.
@@ -32494,9 +32645,22 @@ cmd_heartbeat_tick() {
     local eff_fresh="$fresh" task_fresh
     task_fresh=$(db "SELECT COALESCE(fresh,'') FROM tasks WHERE id=${task_id};" 2>/dev/null || echo "")
     [[ "$task_fresh" == "1" ]] && eff_fresh="true"
+
+    # DIVE-1858 Stage 1: wake-budget guardrail. A cold-mode agent that has spent
+    # today's wake cap is skipped this tick so a chatty trigger can't thrash it
+    # into repeated cold-start wakes (cost-per-wake surfaced via `wake-mode`).
+    # always_on / un-capped agents are never budgeted — pure additive gate, and
+    # the $reg snapshot's counter is close enough at day granularity. NO sleep.
+    if ! _hb_wake_budget_ok "$name" "$today" "$reg"; then
+      sk_budget=$((sk_budget + 1))
+      _hb_log "[$name] wake-budget spent for ${today} (cold-mode cap reached) — skip wake this tick"
+      continue
+    fi
+
     _hb_log "[$name] due + todo ${task_ident} — waking (fresh=${eff_fresh})"
     if _hb_wake "$name" "$eff_fresh" "$task_id" "$task_ident"; then
       in_tick_woke[$acct]=$now   # claim the account's slot for the rest of this tick
+      with_registry_lock _hb_wake_budget_inc "$name" "$today" >/dev/null 2>&1 || true  # DIVE-1858: count this wake
       with_registry_lock _hb_clear_active_defer "$name" >/dev/null 2>&1 || true  # DIVE-1486: episode over
       local nudge_n
       nudge_n=$(with_registry_lock _hb_mark_run "$name" "$now" "$task_id")
@@ -32516,10 +32680,10 @@ cmd_heartbeat_tick() {
                   | sort_by(.value.heartbeat.lastRunAt // 0)
                   | .[].key' <<<"$reg")
 
-  ok "heartbeat tick: woke ${woke} / reclaimed ${reclaimed} / reaped ${reaped} / starved ${starved} / spread-deferred ${sk_spread} / active-deferred ${sk_active} / checked ${checked}" \
+  ok "heartbeat tick: woke ${woke} / reclaimed ${reclaimed} / reaped ${reaped} / starved ${starved} / spread-deferred ${sk_spread} / active-deferred ${sk_active} / budget-skipped ${sk_budget} / checked ${checked}" \
      '{checked:($c|tonumber), woke:($w|tonumber), reclaimed:($rc|tonumber), reaped:($r|tonumber), starved:($st|tonumber),
-       skipped:{notDue:($nd|tonumber), busy:($b|tonumber), noWork:($nw|tonumber), spread:($sp|tonumber), active:($ac|tonumber), failed:($sf|tonumber)}}' \
-     --arg c "$checked" --arg w "$woke" --arg rc "$reclaimed" --arg r "$reaped" --arg st "$starved" --arg nd "$sk_notdue" --arg b "$sk_busy" --arg nw "$sk_nowork" --arg sp "$sk_spread" --arg ac "$sk_active" --arg sf "$sk_fail"
+       skipped:{notDue:($nd|tonumber), busy:($b|tonumber), noWork:($nw|tonumber), spread:($sp|tonumber), active:($ac|tonumber), budget:($bu|tonumber), failed:($sf|tonumber)}}' \
+     --arg c "$checked" --arg w "$woke" --arg rc "$reclaimed" --arg r "$reaped" --arg st "$starved" --arg nd "$sk_notdue" --arg b "$sk_busy" --arg nw "$sk_nowork" --arg sp "$sk_spread" --arg ac "$sk_active" --arg bu "$sk_budget" --arg sf "$sk_fail"
 }
 
 # -------- 5dive supervisor — fleet health brain (DIVE-724, P1: observe-only) --------
