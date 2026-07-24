@@ -107,12 +107,16 @@ _council_help() {
   cat >&2 <<'COUNCIL_HELP'
 5dive council — standalone deliberation council (v0.11)
 
-  5dive council init --seats=<a:chair,b,c,...> --threshold=<majority|all|N|a/b> --veto=<principal>
+  5dive council init [--seats=<a:chair,b,c,...>] [--threshold=<majority|all|N|a/b>] [--veto=<principal>]
       Human-seed the primary Council ONCE (sudo-gated, fail-closed if already initialized;
-      --force re-seeds and the re-seed is logged in the lineage). The veto principal must be
-      RESOLVABLE (human:<agent> -> that agent's paired human, or tg:<user_id>) or init refuses
-      it. The genesis record is sealed on the root gate-proof rail and hash-chained into
-      ${COUNCIL_LINEAGE}. Principle: an agent must not bootstrap its own governance body.
+      --force re-seeds and the re-seed is logged in the lineage). Run it bare (or with only some
+      flags) in a terminal for an interactive wizard — seats, chair, per-seat lenses, threshold,
+      veto principal, and constitution — like `5dive init` / `5dive company`. Passing all of
+      --seats/--threshold/--veto (or adding --yes) seals non-interactively with no prompts. The
+      veto principal must be RESOLVABLE (human:<agent> -> that agent's paired human, or
+      tg:<user_id>) or init refuses it. The genesis record is sealed on the root gate-proof rail
+      and hash-chained into ${COUNCIL_LINEAGE}. Principle: an agent must not bootstrap its own
+      governance body.
 
   5dive council lineage [verify|ls]
       Verify the sealed genesis lineage (re-seal each record, compare digests, check the
@@ -541,6 +545,145 @@ _council_veto() {
   fi
 }
 
+# DIVE-1861: interactive `council init` wizard. Runs when init is invoked bare/partial in a real
+# terminal (mirrors `5dive init` / `5dive company`): it prompts for seats + chair + per-seat lenses,
+# the pass threshold, the founder-veto principal, and whether to seal the default constitution or a
+# custom one, then hands the SAME `--seats/--threshold/--veto` flags to the existing seal path — no
+# second code path for the seal itself. Reuses the dependency-free `_init_*` UI helpers from
+# cmd_init.sh. On success it appends the resolved flags onto the caller-named array and returns 0;
+# any abort returns non-zero (the caller fails closed without writing genesis).
+_council_init_wizard() {
+  local dir="$1" out_var="$2" pre_seats="$3" pre_threshold="$4" pre_veto="$5" forced="$6"
+  local -a built=()
+
+  _init_color_enabled >/dev/null 2>&1 || true
+  { printf '\n'; } >&2
+  local cyan="" bold="" dim="" reset=""
+  if _init_color_enabled; then cyan=$'\033[38;5;81m'; bold=$'\033[1m'; dim=$'\033[2m'; reset=$'\033[0m'; fi
+  printf '  %s%s5dive council%s\n' "$cyan" "$bold" "$reset" >&2
+  printf '  %sSeat the governance body once: who sits, how it decides, who holds the veto.%s\n\n' "$dim" "$reset" >&2
+
+  # --- 1/4 seats + chair + lenses -------------------------------------------
+  _init_section 1 4 "Seats" "The agents (and/or humans) who hold a vote. Comma-separated ids."
+  local seat_line
+  while true; do
+    _init_text seat_line "Seats (e.g. main, olivia, dev)" "$pre_seats"
+    # normalize: split on commas, trim, drop empties
+    local -a ids=(); local raw_id
+    IFS=',' read -r -a _raw_ids <<<"$seat_line"
+    for raw_id in "${_raw_ids[@]}"; do raw_id="${raw_id#"${raw_id%%[![:space:]]*}"}"; raw_id="${raw_id%"${raw_id##*[![:space:]]}"}"; [[ -n "$raw_id" ]] && ids+=("$raw_id"); done
+    if (( ${#ids[@]} == 0 )); then _init_warn "Enter at least one seat id."; continue; fi
+    # reject duplicates early (the engine would too, but a clear message here is kinder)
+    local dup="" i j
+    for ((i=0;i<${#ids[@]};i++)); do for ((j=i+1;j<${#ids[@]};j++)); do [[ "${ids[i]}" == "${ids[j]}" ]] && dup="${ids[i]}"; done; done
+    if [[ -n "$dup" ]]; then _init_warn "Duplicate seat: $dup"; continue; fi
+    break
+  done
+
+  # chair pick (arrow-select over the seats + a "no chair" option)
+  local chair=""
+  local -a chair_opts=()
+  local sid
+  for sid in "${ids[@]}"; do chair_opts+=("$sid|$sid|holds the gavel"); done
+  chair_opts+=("__none__|(no chair)|leave the chair unfilled")
+  _init_pick chair "Who chairs the council?" 1 "${chair_opts[@]}"
+  [[ "$chair" == "__none__" ]] && chair=""
+
+  # per-seat lens (optional). The chair keeps the default lens — the flag seat spec can carry
+  # EITHER :chair OR a custom lens per seat, not both, so we mirror that here.
+  _init_section 2 4 "Lenses" "The perspective each non-chair seat argues from (blank = default)."
+  local -a specs=()
+  local lens
+  for sid in "${ids[@]}"; do
+    if [[ "$sid" == "$chair" ]]; then
+      specs+=("$sid:chair")
+      _init_note "$sid — chair (default lens)"
+      continue
+    fi
+    lens=""
+    _init_text lens "Lens for '$sid'" ""
+    if [[ -n "$lens" ]]; then
+      # a lens cannot contain the seat/lens delimiters
+      lens="${lens//,/ }"; lens="${lens//:/ }"
+      specs+=("$sid:$lens")
+    else
+      specs+=("$sid")
+    fi
+  done
+  local seats_spec; local IFS=','; seats_spec="${specs[*]}"; unset IFS
+  built+=("--seats=$seats_spec")
+
+  # --- 3/4 threshold --------------------------------------------------------
+  _init_section 3 4 "Pass threshold" "How many seats must approve for an ordinary motion to carry."
+  local threshold=""
+  local def_idx=1
+  case "$pre_threshold" in all) def_idx=2 ;; */*) def_idx=3 ;; [0-9]*) def_idx=4 ;; esac
+  _init_pick threshold "Threshold" "$def_idx" \
+    "majority|majority|more than half of the seats (default)" \
+    "all|all|full quorum — every seat must approve" \
+    "2/3|two-thirds|a 2/3 fraction of the seats" \
+    "__custom__|custom…|a fixed count (N) or a fraction (a/b)"
+  if [[ "$threshold" == "__custom__" ]]; then
+    while true; do
+      threshold=""
+      _init_text threshold "Threshold (N or a/b, e.g. 3 or 3/5)" "$pre_threshold"
+      if [[ "$threshold" =~ ^([0-9]+|[0-9]+/[0-9]+|majority|all)$ ]]; then break; fi
+      _init_warn "Use a whole number (e.g. 3), a fraction (e.g. 3/5), or majority|all."
+    done
+  fi
+  built+=("--threshold=$threshold")
+
+  # --- 4/4 founder veto -----------------------------------------------------
+  _init_section 4 4 "Founder veto" "The principal who can veto a carried motion post-hoc (48h window)."
+  local principal="" resolved=""
+  while true; do
+    principal=""
+    _init_text principal "Veto principal (human:<agent> or tg:<user_id>)" "$pre_veto"
+    if [[ -z "$principal" ]]; then _init_warn "A veto principal is required."; continue; fi
+    resolved="$(_council_resolve_principal "$principal")"
+    if [[ -n "$resolved" ]]; then _init_ok "$principal → $resolved"; break; fi
+    _init_warn "'$principal' did not resolve to a real recipient. Use human:<paired-agent> or tg:<user_id>."
+  done
+  built+=("--veto=$principal")
+
+  # --- constitution: default sealed vs a custom file already on disk --------
+  local cpath; cpath="$(_council_constitution_path)"
+  local const_choice=""
+  echo >&2
+  _init_pick const_choice "Constitution" 1 \
+    "default|default (recommended)|seal the standard v0 constitution" \
+    "custom|custom|seal a constitution.yaml you have already placed at the path below"
+  if [[ "$const_choice" == "custom" ]]; then
+    if [[ ! -f "$cpath" ]]; then
+      _init_warn "No constitution file at $cpath — place your constitution.yaml there first, then re-run."
+      return 1
+    fi
+    _init_note "Sealing your constitution at $cpath"
+  fi
+
+  (( forced )) && built+=("--force")
+
+  # --- review + confirm -----------------------------------------------------
+  echo >&2
+  printf '  %s%sReview%s\n' "$bold" "$cyan" "$reset" >&2
+  _init_review_row "Seats" "$seats_spec"
+  _init_review_row "Chair" "${chair:-(none)}"
+  _init_review_row "Threshold" "$threshold"
+  _init_review_row "Veto" "$principal → $resolved"
+  _init_review_row "Constitution" "$([[ "$const_choice" == custom ]] && echo "custom ($cpath)" || echo "default v0")"
+  echo >&2
+  local go=""
+  _init_pick go "Seal this genesis roster? (one-time, sudo-gated)" 1 \
+    "yes|seal it|write + seal the genesis roster now" \
+    "no|cancel|abort without writing anything"
+  [[ "$go" == "yes" ]] || { _init_note "Cancelled — nothing written."; return 1; }
+
+  # hand the resolved flags back to the caller's array
+  local -n _out_ref="$out_var"
+  _out_ref=("${built[@]}")
+  return 0
+}
+
 _council_init_or_lineage() {
   local sub="$1" dir="$2"; shift 2
   mkdir -p "$COUNCIL_DIR" 2>/dev/null || true
@@ -587,12 +730,31 @@ _council_init_or_lineage() {
     fail "$E_PERMISSION" "council init seeds the governance body — it writes ${COUNCIL_DIR} (root-owned) and must be human/sudo-run: sudo 5dive council init $*"
   fi
   # Resolve the veto principal up front so init refuses an unresolvable one BEFORE any write.
-  local principal="" a
+  local principal="" seats_flag="" threshold_flag="" assume_yes=0 forced=0 a
   local -a passthru=()
   for a in "$@"; do
-    case "$a" in --veto=*) principal="${a#--veto=}" ;; esac
+    case "$a" in
+      --veto=*) principal="${a#--veto=}" ;;
+      --seats=*) seats_flag="${a#--seats=}" ;;
+      --threshold=*) threshold_flag="${a#--threshold=}" ;;
+      --force) forced=1 ;;
+      -y|--yes) assume_yes=1; continue ;;   # not a flag cli.mjs understands — strip it
+    esac
     passthru+=("$a")
   done
+
+  # DIVE-1861: run bare/partial in a real terminal -> interactive wizard. The full flag form
+  # (all of --seats/--threshold/--veto present) stays a non-interactive, no-prompt seal with
+  # ZERO regression; --yes forces that path too. A non-TTY with missing essentials falls through
+  # to the same fail messages as before.
+  local have_all=0; [[ -n "$seats_flag" && -n "$threshold_flag" && -n "$principal" ]] && have_all=1
+  if (( have_all == 0 && assume_yes == 0 )) && [[ -t 0 && -t 2 ]]; then
+    local -a wiz_args=()
+    _council_init_wizard "$dir" wiz_args "$seats_flag" "$threshold_flag" "$principal" "$forced" || fail "$E_USAGE" "council init cancelled — nothing written."
+    passthru=("${wiz_args[@]}")
+    principal=""; for a in "${passthru[@]}"; do case "$a" in --veto=*) principal="${a#--veto=}" ;; esac; done
+  fi
+
   [[ -n "$principal" ]] || fail "$E_USAGE" "council init needs --veto=<principal> (e.g. human:main)"
   local resolved; resolved="$(_council_resolve_principal "$principal")"
   [[ -n "$resolved" ]] || fail "$E_USAGE" "veto principal '$principal' did not resolve to a real recipient — init rejects an unknown principal (fail-closed). Use human:<agent> (a paired agent) or tg:<user_id>."
