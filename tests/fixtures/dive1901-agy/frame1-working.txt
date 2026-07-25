@@ -1,0 +1,24 @@
+  scrolls off an alt-screen pane.
+  CONTEXT LINE 19: filler to push this ask past one screen height so any marker
+  scrolls off an alt-screen pane.
+  CONTEXT LINE 20: filler to push this ask past one screen height so any marker
+  scrolls off an alt-screen pane.
+  CONTEXT LINE 21: filler to push this ask past one screen height so any marker
+  scrolls off an alt-screen pane.
+  CONTEXT LINE 22: filler to push this ask past one screen height so any marker
+  scrolls off an alt-screen pane.
+  CONTEXT LINE 23: filler to push this ask past one screen height so any marker
+  scrolls off an alt-screen pane.
+  CONTEXT LINE 24: filler to push this ask past one screen height so any marker
+  scrolls off an alt-screen pane.
+  CONTEXT LINE 25: filler to push this ask past one screen height so any marker
+  scrolls off an alt-screen pane.
+  Reply with exactly this token and nothing else: AFTER-AGY-LONG-R2K7 [reply-
+  format] Put your answer between these two marker lines: <5dive-
+  r:5d7d77e6></5dive-r:5d7d77e6> — the opening marker alone on one line, your
+  answer next, the closing marker alone on the last line.
+⣟  Generating...
+────────────────────────────────────────────────────────────────────────────────
+>
+────────────────────────────────────────────────────────────────────────────────
+esc to cancel                                            Gemini 3.6 Flash · high
