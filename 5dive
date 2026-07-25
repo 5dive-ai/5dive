@@ -26,7 +26,7 @@ esac
 
 # Bumped on every public release. `build.sh` checks this line exists; CI fails
 # the bundle-drift check if it's missing or empty.
-readonly FIVE_VERSION="0.15.12"
+readonly FIVE_VERSION="0.15.13"
 
 # GitHub org our repos live under. The org is being renamed
 # 5dive-com -> 5dive-ai (2026-06); fetches must work on either side of the
@@ -21429,10 +21429,27 @@ task_need_notify() {
   #      the gate and fails loudly. A gate nobody can answer is worse than a
   #      refused one: the refusal is visible, the silence is not.
   TASK_NOTIFY_ESCALATED_FROM=""; TASK_NOTIFY_FAIL_REASON=""
-  if ! _task_owner_channel; then
-    # In a root sweep (heartbeat cron: no SUDO_UID, USER=root) the caller is not
-    # the filer, so the chain must start from the gate row's own filer.
-    local _self; _self="${TASK_GATE_FILER:-}"; [[ -n "$_self" ]] || _self=$(task_actor "")
+  # In a root sweep (heartbeat cron: no SUDO_UID, USER=root) the caller is not
+  # the filer, so everything below must key off the gate row's own filer.
+  local _self; _self="${TASK_GATE_FILER:-}"; [[ -n "$_self" ]] || _self=$(task_actor "")
+  # DIVE-1968: try the FILER'S OWN channel BY NAME before anything else.
+  # `_task_owner_channel` resolves the CALLER (auto_sender_from_sudo -> $SUDO_USER,
+  # else $USER, and only when either is agent-*), never the gate's filer. So it is
+  # a structural no-op in precisely the two contexts that matter — the root re-nag
+  # sweep and the privileged re-send, where the name resolves EMPTY and
+  # `_task_agent_channel ""` returns 1 immediately — and when a PEER agent drives
+  # the send it resolves that peer's channel, i.e. alerts the wrong human. The
+  # chain then walks strictly UP from the filer, so a top-of-org filer (olivia,
+  # quinn: reports_to='') comes back empty and we report "no paired channel for
+  # filer X or anyone above it" while X has a working channel sitting right there.
+  # Root CAN read a peer's 0600 access.json, which is the whole reason the
+  # privileged path exists — so by-name resolution is exactly what it was missing.
+  # This is the answer to "why did _task_owner_channel not fire for olivia": it
+  # never could. Prepending the filer is not papering over a second bug; the
+  # second bug WAS that the own-channel probe is caller-scoped.
+  if [[ -n "$_self" ]] && _task_agent_channel "$_self"; then
+    : # the filer's own channel — the alert belongs to THEIR paired human
+  elif ! _task_owner_channel; then
     warn "$ident: filing agent (${_self:-?}) has no paired channel — escalating up the org chart for the gate alert"
     local _fb=""
     _task_chain_channel "$_self" && _fb="$TASK_CH_AGENT"
