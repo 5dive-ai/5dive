@@ -1339,7 +1339,9 @@ _hb_gate_ttl_sweep() {
 # resolved recipient, regardless of how many gates are due.
 _HB_GATE_RENAG_WHERE="need_type IS NOT NULL AND need_answered_at IS NULL
   AND status NOT IN ('done','cancelled') AND COALESCE(tier,2) != 0
-  AND COALESCE(need_asked_at,updated_at,created_at) <= datetime('now','-1 hour')
+  AND (COALESCE(need_asked_at,updated_at,created_at) <= datetime('now','-1 hour')
+       OR (gate_pinged_at IS NULL
+           AND COALESCE(need_asked_at,updated_at,created_at) <= datetime('now','-15 minutes')))
   AND NOT (tier=1 AND recommend IS NOT NULL
            AND COALESCE(need_asked_at,updated_at,created_at) <= datetime('now','-48 hours'))
   AND (gate_pinged_at IS NULL
@@ -1349,13 +1351,32 @@ _HB_GATE_RENAG_WHERE="need_type IS NOT NULL AND need_answered_at IS NULL
 _hb_gate_renag_batch() { # <recipient_agent> <comma-separated task ids> <route_label>
   local recipient="$1" idlist="$2" route_label="$3"
   [[ -n "$recipient" && "$idlist" =~ ^[0-9]+(,[0-9]+)*$ ]] || return 0
+  # DIVE-1927: an unpaired recipient used to mean "retry next heartbeat" forever —
+  # the same silent hole as the file-time path. A channel-less filer's gate can
+  # NEVER become deliverable by waiting, so walk UP reports_to to the nearest
+  # paired agent instead (this sweep runs as root, so every access.json is
+  # readable) and name the original filer in the message. Only when nobody in the
+  # whole chain is paired do we log and retry.
+  local _escalated_from=""
   if ! _task_agent_channel "$recipient"; then
-    warn "gate re-nag for task rows ${idlist}: recipient ${recipient} has no paired channel; will retry next heartbeat"
-    _hb_log "[gate-renag] recipient ${recipient} has no paired channel for rows ${idlist}"
-    return 0
+    # Direct call, never $( ) — _task_chain_channel resolves TASK_CH_* into the
+    # CURRENT shell and a command substitution would discard exactly that.
+    local _up=""
+    _task_chain_channel "$recipient" && _up="$TASK_CH_AGENT"
+    if [[ -n "$_up" ]]; then
+      _escalated_from="$recipient"
+      route_label="${route_label} — escalated off unpaired ${recipient}"
+      _hb_log "[gate-renag] ${recipient} unpaired; escalated rows ${idlist} to ${_up}"
+    else
+      warn "gate re-nag for task rows ${idlist}: recipient ${recipient} has no paired channel and neither does anyone above it; will retry next heartbeat"
+      _hb_log "[gate-renag] no paired channel for ${recipient} or anyone above it for rows ${idlist}"
+      return 0
+    fi
   fi
 
   local text="🔁 Gate reminder — unanswered gates (${route_label}):"
+  [[ -n "$_escalated_from" ]] \
+    && text+=$'\n'"↑ filed by ${_escalated_from} (no channel of its own) — escalated to you"
   local rows='[]' row id ident ntype options recommend ask nonce="" markup=""
   local -a nonce_ids=() nonce_hashes=()
   while IFS= read -r row; do
