@@ -81,10 +81,32 @@ out=$(run --agent=main --prompt=y --ceiling=12345); c=$(printf '%s' "$out" | jq 
 loop_by_prompt() { db "SELECT lr.loop_id FROM loop_runs lr, tasks t WHERE lr.child_task_ids='['||t.id||']' AND t.body LIKE '%$1%' ORDER BY t.id DESC LIMIT 1;"; }
 task_by_prompt() { db "SELECT t.id FROM tasks t WHERE t.body LIKE '%$1%' ORDER BY t.id DESC LIMIT 1;"; }
 
+# Poll until a probe reports the background --wait spawn has actually landed its
+# row, instead of assuming a fixed `sleep 1` is enough. On a loaded 2-core CI
+# runner the spawn path (task insert + loop row, several sqlite/jq execs) can
+# take longer than a second: the id below then comes back EMPTY, the UPDATE that
+# is supposed to steer the waiter no-ops, and the waiter burns its full --wait
+# and reports the wrong status — a flaky red with no bug behind it (DIVE-1951).
+# Same precedent as wait_graders() in loop_panel_unit.sh. Bounded ~10s.
+poll_new() { # <prev-value> <probe...> → echo first value that is non-empty and != prev
+  local prev="$1"; shift
+  local i out=""
+  for i in $(seq 1 100); do
+    out=$("$@")
+    [[ -n "$out" && "$out" != "$prev" ]] && { printf '%s' "$out"; return 0; }
+    sleep 0.1
+  done
+  # never fail SILENTLY into an empty id: an empty return here makes the assertion
+  # below red as if the product misbehaved, when in fact the CHECK never got an
+  # answer. Say so out loud (DIVE-1951).
+  echo "poll_new: TIMED OUT after ~10s waiting for '$*' to yield a new value (prev='$prev', last='$out') — the next assertion fails on an EMPTY id, not on a product bug" >&2
+  printf '%s' "$out"; return 1
+}
+
 # --- T4: --wait halts on KILL (flip kill_requested mid-wait)
 ( cmd_loop_spawn --agent=main --prompt="UNIQ_killme" --wait=20 >"$TMP"/loop-kill.out 2>&1 ) &
 bgpid=$!
-sleep 1; klid=$(loop_by_prompt UNIQ_killme)
+klid=$(poll_new "" loop_by_prompt UNIQ_killme)
 db "UPDATE loop_runs SET kill_requested=1 WHERE loop_id='$klid';"
 wait $bgpid
 kst=$(jq -r '.data.status' "$TMP"/loop-kill.out 2>/dev/null)
@@ -93,7 +115,7 @@ kst=$(jq -r '.data.status' "$TMP"/loop-kill.out 2>/dev/null)
 # --- T5: --wait halts on CEILING breach
 ( cmd_loop_spawn --agent=main --prompt="UNIQ_spendy" --ceiling=1000 --wait=20 >"$TMP"/loop-ceil.out 2>&1 ) &
 bgpid=$!
-sleep 1; clid=$(loop_by_prompt UNIQ_spendy)
+clid=$(poll_new "" loop_by_prompt UNIQ_spendy)
 db "UPDATE loop_runs SET tokens_spent=5000 WHERE loop_id='$clid';"
 wait $bgpid
 cst=$(jq -r '.data.status' "$TMP"/loop-ceil.out 2>/dev/null)
@@ -102,7 +124,7 @@ cst=$(jq -r '.data.status' "$TMP"/loop-ceil.out 2>/dev/null)
 # --- T6: --wait returns clean done + result passthrough
 ( cmd_loop_spawn --agent=main --prompt="UNIQ_finish" --wait=20 >"$TMP"/loop-done.out 2>&1 ) &
 bgpid=$!
-sleep 1; dtid=$(task_by_prompt UNIQ_finish)
+dtid=$(poll_new "" task_by_prompt UNIQ_finish)
 db "UPDATE tasks SET status='done', result='shipped clean' WHERE id=$dtid;"
 wait $bgpid
 dst=$(jq -r '.data.status' "$TMP"/loop-done.out 2>/dev/null)

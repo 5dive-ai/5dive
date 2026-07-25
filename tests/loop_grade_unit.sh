@@ -72,11 +72,38 @@ run --target="$NAC" --verifier=main >/dev/null 2>&1; [[ $? -ne 0 ]] && ok_t "no 
 
 # helper: the grader task id for the most recent grade loop row
 latest_grade_child() { db "SELECT TRIM(child_task_ids,'[]') FROM loop_runs WHERE topology='grade' ORDER BY started_at DESC, rowid DESC LIMIT 1;"; }
+latest_grade_running() { db "SELECT loop_id FROM loop_runs WHERE topology='grade' AND status='running' ORDER BY started_at DESC, rowid DESC LIMIT 1;"; }
+
+# Poll until a probe reports the background --wait spawn has actually landed its
+# row, instead of assuming a fixed `sleep 1` is enough. On a loaded 2-core CI
+# runner the spawn path (task insert + loop row, several sqlite/jq execs) can
+# take longer than a second: the id below then comes back EMPTY, the UPDATE that
+# is supposed to steer the waiter no-ops, and the waiter burns its full --wait
+# and reports the wrong status — a flaky red with no bug behind it (DIVE-1951).
+# Same precedent as wait_graders() in loop_panel_unit.sh. Bounded ~10s.
+poll_new() { # <prev-value> <probe...> → echo first value that is non-empty and != prev
+  local prev="$1"; shift
+  local i out=""
+  for i in $(seq 1 100); do
+    out=$("$@")
+    [[ -n "$out" && "$out" != "$prev" ]] && { printf '%s' "$out"; return 0; }
+    sleep 0.1
+  done
+  # never fail SILENTLY into an empty id: an empty return here makes the assertion
+  # below red as if the product misbehaved, when in fact the CHECK never got an
+  # answer. Say so out loud (DIVE-1951).
+  echo "poll_new: TIMED OUT after ~10s waiting for '$*' to yield a new value (prev='$prev', last='$out') — the next assertion fails on an EMPTY id, not on a product bug" >&2
+  printf '%s' "$out"; return 1
+}
+# every grade case below already has EARLIER grade rows, so "non-empty" is not
+# enough to prove the new one landed — poll until the newest child differs from
+# the one captured before the spawn.
 
 # --- T3: --wait, grader scores high → verdict pass, scorecard persisted
+prev_child=$(latest_grade_child)
 ( cmd_loop_grade --target="$TGT" --verifier=main --threshold=70 --wait=20 >"$TMP"/loop-grade-pass.out 2>&1 ) &
 bgpid=$!
-sleep 1; g3=$(latest_grade_child)
+g3=$(poll_new "$prev_child" latest_grade_child)
 db "UPDATE tasks SET status='done', result='{\"overall\":88,\"criteria\":[{\"name\":\"compile\",\"score\":95,\"reason\":\"ok\"},{\"name\":\"tests\",\"score\":80}]}' WHERE id=$g3;"
 wait $bgpid
 v3=$(jq -r '.data.verdict' "$TMP"/loop-grade-pass.out 2>/dev/null)
@@ -91,28 +118,30 @@ sccrit=$(printf '%s' "$sc" | jq -r '.criteria | length' 2>/dev/null)
   && ok_t "scorecard_json persisted (overall=$scov, ${sccrit} criteria)" || bad_t "scorecard persist" "$sc"
 
 # --- T4: --wait, grader scores low → verdict fail
+prev_child=$(latest_grade_child)
 ( cmd_loop_grade --target="$TGT" --verifier=main --threshold=70 --wait=20 >"$TMP"/loop-grade-fail.out 2>&1 ) &
 bgpid=$!
-sleep 1; g4=$(latest_grade_child)
+g4=$(poll_new "$prev_child" latest_grade_child)
 db "UPDATE tasks SET status='done', result='{\"overall\":40,\"criteria\":[{\"name\":\"compile\",\"score\":40}]}' WHERE id=$g4;"
 wait $bgpid
 v4=$(jq -r '.data.verdict' "$TMP"/loop-grade-fail.out 2>/dev/null)
 [[ "$v4" == "fail" ]] && ok_t "--wait low score → fail" || bad_t "grade fail" "$(cat "$TMP"/loop-grade-fail.out)"
 
 # --- T5: --wait, grader returns unparseable result → escalated (never silent pass)
+prev_child=$(latest_grade_child)
 ( cmd_loop_grade --target="$TGT" --verifier=main --wait=20 >"$TMP"/loop-grade-esc.out 2>&1 ) &
 bgpid=$!
-sleep 1; g5=$(latest_grade_child)
+g5=$(poll_new "$prev_child" latest_grade_child)
 db "UPDATE tasks SET status='done', result='not json at all' WHERE id=$g5;"
 wait $bgpid
 v5=$(jq -r '.data.verdict' "$TMP"/loop-grade-esc.out 2>/dev/null)
 [[ "$v5" == "escalated" ]] && ok_t "--wait unparseable → escalated" || bad_t "grade escalate" "$(cat "$TMP"/loop-grade-esc.out)"
 
 # --- T6: kill mid-wait → killed
+prev_running=$(latest_grade_running)
 ( cmd_loop_grade --target="$TGT" --verifier=main --wait=20 >"$TMP"/loop-grade-kill.out 2>&1 ) &
 bgpid=$!
-sleep 1
-klid=$(db "SELECT loop_id FROM loop_runs WHERE topology='grade' AND status='running' ORDER BY started_at DESC, rowid DESC LIMIT 1;")
+klid=$(poll_new "$prev_running" latest_grade_running)
 db "UPDATE loop_runs SET kill_requested=1 WHERE loop_id='$klid';"
 wait $bgpid
 kst=$(jq -r '.data.status' "$TMP"/loop-grade-kill.out 2>/dev/null)
@@ -124,9 +153,10 @@ LID=$(printf '%s' "$lout" | jq -r '.data.ident')
 lout2=$(JSON_MODE=1 cmd_task_loop_start --title="ungraded loop" --owner=dev --steps='[{"agent":"dev","label":"other"}]' 2>/dev/null)
 LID2=$(printf '%s' "$lout2" | jq -r '.data.ident')
 [[ "$LID" =~ ^DIVE- && "$LID2" =~ ^DIVE- ]] && ok_t "seed builder loops ($LID, $LID2)" || bad_t "seed builder loops" "$lout / $lout2"
+prev_child=$(latest_grade_child)
 ( cmd_loop_grade --target="$LID" --verifier=main --accept="loop completes" --wait=20 >"$TMP"/loop-grade-ls.out 2>&1 ) &
 bgpid=$!
-sleep 1; g7=$(latest_grade_child)
+g7=$(poll_new "$prev_child" latest_grade_child)
 db "UPDATE tasks SET status='done', result='{\"overall\":84,\"criteria\":[{\"name\":\"loop completes\",\"score\":84,\"reason\":\"ok\"}]}' WHERE id=$g7;"
 wait $bgpid
 ls_out=$(JSON_MODE=1 cmd_task_loop_ls 2>/dev/null)
