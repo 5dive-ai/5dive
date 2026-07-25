@@ -24,12 +24,12 @@ PASS=0; FAIL=0
 ok_t()  { PASS=$((PASS+1)); printf 'ok   - %s\n' "$1"; }
 bad_t() { FAIL=$((FAIL+1)); printf 'FAIL - %s\n   %s\n' "$1" "${2:-}"; }
 
-# run <digest-json> <usage-json> <db_rows> <tier_rows> [as_json]
+# run <digest-json> <usage-json> <db_rows> <group_rows> [as_json] [by]
 run() {
   printf '%s' "$1" > "$TMP/d.json"
   printf '%s' "$2" > "$TMP/u.json"
-  DIGEST_FILE="$TMP/d.json" USAGE_FILE="$TMP/u.json" DB_ROWS="$3" TIER_ROWS="$4" \
-  WINDOW="7d" BY="tier" AS_JSON="${5:-1}" python3 "$TMP/score.py"
+  DIGEST_FILE="$TMP/d.json" USAGE_FILE="$TMP/u.json" DB_ROWS="$3" GROUP_ROWS="$4" \
+  WINDOW="7d" BY="${6:-tier}" AS_JSON="${5:-1}" python3 "$TMP/score.py"
 }
 
 FULL_DIGEST='{"zeroHuman":{"shipped":100,"humanTouches":10},"stuck":{"mttuSec":600,"episodes":4},"precedentPrefill":{"count":8,"accepted":4,"acceptanceRate":50}}'
@@ -85,12 +85,56 @@ jq -e '[.metrics[]|select(.value==null and (.nodata|test("DIVE-19")))]|length==2
 OUT4="$(run "$FULL_DIGEST" "$FULL_USAGE" "100|50|40|30" "0|10
 1|20
 untiered|70")"
-[[ "$(jq -r '.tierCoverage.pct == 30' <<<"$OUT4")" == "true" ]] \
-  && ok_t "tier coverage reported as a percentage of ALL shipped work (30/100)" \
-  || bad_t "coverage" "$(jq -c '.tierCoverage' <<<"$OUT4")"
-[[ "$(jq -r '.tierBreakdown[]|select(.tier=="untiered")|.shipped' <<<"$OUT4")" == "70" ]] \
+[[ "$(jq -r '.coverage.pct == 30' <<<"$OUT4")" == "true" ]] \
+  && ok_t "coverage reported as a percentage of ALL shipped work (30/100)" \
+  || bad_t "coverage" "$(jq -c '.coverage' <<<"$OUT4")"
+[[ "$(jq -r '.breakdown.rows[]|select(.key=="untiered")|.shipped' <<<"$OUT4")" == "70" ]] \
   && ok_t "untiered work appears as its own visible bucket, not dropped" \
-  || bad_t "untiered bucket" "$(jq -c '.tierBreakdown' <<<"$OUT4")"
+  || bad_t "untiered bucket" "$(jq -c '.breakdown' <<<"$OUT4")"
+
+# --- Case 4b (DIVE-1914 iteration 2, olivia): a flag value that is accepted as
+#     LEGAL must actually change what is computed. --by=class was validated and
+#     then ignored, so the output said "by":"class" beside tier rows — output
+#     asserting what the code never computed, the exact class this verb exists
+#     to prevent. Assert the LABEL and the DATA cannot disagree, for EVERY
+#     accepted value, so the next inert flag value cannot come back either.
+CLASS_ROWS="dive/high|60
+dive/low|40"
+OUT4C="$(run "$FULL_DIGEST" "$FULL_USAGE" "100|50|40|100" "$CLASS_ROWS" 1 class)"
+[[ "$(jq -r '.by' <<<"$OUT4C")" == "class" \
+   && "$(jq -r '.breakdown.by' <<<"$OUT4C")" == "class" \
+   && "$(jq -r '.coverage.dimension' <<<"$OUT4C")" == "class" ]] \
+  && ok_t "--by=class labels the breakdown AND the coverage as class (label travels with the data)" \
+  || bad_t "by=class labels" "$(jq -c '{by,b:.breakdown.by,c:.coverage.dimension}' <<<"$OUT4C")"
+[[ "$(jq -r '.breakdown.rows[0].key' <<<"$OUT4C")" == "dive/high" ]] \
+  && ok_t "--by=class actually groups the CLASS rows it was handed" \
+  || bad_t "by=class rows" "$(jq -c '.breakdown.rows' <<<"$OUT4C")"
+# THE DECISIVE ONE, and it must live at the SHELL layer. The renderer above is
+# handed GROUP_ROWS by this harness, so it will happily group whatever it is
+# given — a renderer-level check passes even when --by is completely inert
+# (verified: reintroducing the defect did NOT fail the renderer assertions).
+# The defect lives in the shell's query selection, so assert THERE: extract the
+# real `case "$by"` block from the shipped source, evaluate both branches, and
+# require that they produce DIFFERENT SQL. An inert --by value makes them equal,
+# which is exactly how this hid the first time.
+CASE_BLOCK="$(awk '/^  case "\$by" in$/{f=1} f{print} f&&/^  esac$/{exit}' src/cmd_proof.sh)"
+[[ -n "$CASE_BLOCK" ]] || bad_t "extract --by case block" "not found in src/cmd_proof.sh"
+eval_by() {  # <by> -> "<group_expr>|<known_expr>"
+  local by="$1" group_expr="" known_expr=""
+  eval "$CASE_BLOCK"
+  printf '%s|%s' "$group_expr" "$known_expr"
+}
+TIER_SQL="$(eval_by tier)"; CLASS_SQL="$(eval_by class)"
+[[ -n "$TIER_SQL" && "${TIER_SQL#|}" != "$TIER_SQL" ]] && bad_t "tier branch empty" "$TIER_SQL"
+[[ -n "$CLASS_SQL" && "$CLASS_SQL" != "|" ]] \
+  && ok_t "every accepted --by value produces a non-empty grouping expression" \
+  || bad_t "class branch inert" "class produced '$CLASS_SQL'"
+[[ "$TIER_SQL" != "$CLASS_SQL" ]] \
+  && ok_t "tier and class compute DIFFERENT SQL (a legal-but-INERT --by value would make them identical)" \
+  || bad_t "inert --by" "both branches produce the same SQL: $TIER_SQL"
+[[ "$CLASS_SQL" == *project_key* && "$CLASS_SQL" == *priority* ]] \
+  && ok_t "class groups by project_key + priority, as the spec defines class" \
+  || bad_t "class expr" "$CLASS_SQL"
 
 # --- Case 5: sample sizes ride ON the sourced numbers, not in a footnote.
 for m in "verifier first-pass rate" "median recovery time" "precedent acceptance rate"; do

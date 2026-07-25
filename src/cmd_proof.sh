@@ -777,19 +777,37 @@ _proof_scorecard() {
     usage_collect 604800 2>/dev/null > "$work/usage.json" || : > "$work/usage.json"
   fi
 
+  # DIVE-1914 iteration 2 (olivia): --by used to be VALIDATED as legal and then
+  # never used — grouping was always by tier, so `--by=class` emitted
+  # "by":"class" beside a breakdown of tier data. Output asserting what the code
+  # never computed is precisely the class this verb exists to prevent. --by now
+  # selects both the grouping expression and what "known" means for coverage,
+  # and the label ships INSIDE the breakdown object so the two cannot disagree.
+  #
+  # class = project_key + priority (the ticket's approximation). Ground-truthed
+  # 2026-07-25: both columns are non-empty on all 408 shipped tasks in the
+  # window, so class coverage is complete where tier coverage is 27%.
+  local group_expr known_expr
+  case "$by" in
+    tier)  group_expr="COALESCE(CAST(tier AS TEXT),'untiered')"
+           known_expr="tier IS NOT NULL" ;;
+    class) group_expr="COALESCE(NULLIF(project_key,''),'unknown')||'/'||COALESCE(NULLIF(priority,''),'unknown')"
+           known_expr="project_key IS NOT NULL AND project_key<>'' AND priority IS NOT NULL AND priority<>''" ;;
+  esac
+
   local rows
   rows="$(db "SELECT
       (SELECT COUNT(*) FROM tasks WHERE status='done' AND kind='standard' AND done_at>=datetime('now','-7 days')) || '|' ||
       (SELECT COUNT(*) FROM tasks WHERE status='done' AND kind='standard' AND done_at>=datetime('now','-7 days') AND verifier IS NOT NULL AND verifier<>'') || '|' ||
       (SELECT COUNT(*) FROM tasks WHERE status='done' AND kind='standard' AND done_at>=datetime('now','-7 days') AND verifier IS NOT NULL AND verifier<>'' AND COALESCE(iteration,1)<=1) || '|' ||
-      (SELECT COUNT(*) FROM tasks WHERE status='done' AND kind='standard' AND done_at>=datetime('now','-7 days') AND tier IS NOT NULL);" 2>/dev/null || true)"
+      (SELECT COUNT(*) FROM tasks WHERE status='done' AND kind='standard' AND done_at>=datetime('now','-7 days') AND ${known_expr});" 2>/dev/null || true)"
 
-  local tier_rows
-  tier_rows="$(db "SELECT COALESCE(CAST(tier AS TEXT),'untiered'), COUNT(*) FROM tasks
-                   WHERE status='done' AND kind='standard' AND done_at>=datetime('now','-7 days')
-                   GROUP BY 1 ORDER BY 1;" 2>/dev/null || true)"
+  local group_rows
+  group_rows="$(db "SELECT ${group_expr}, COUNT(*) FROM tasks
+                    WHERE status='done' AND kind='standard' AND done_at>=datetime('now','-7 days')
+                    GROUP BY 1 ORDER BY 2 DESC, 1;" 2>/dev/null || true)"
 
-  DIGEST_FILE="$work/digest.json" USAGE_FILE="$work/usage.json" DB_ROWS="$rows" TIER_ROWS="$tier_rows" \
+  DIGEST_FILE="$work/digest.json" USAGE_FILE="$work/usage.json" DB_ROWS="$rows" GROUP_ROWS="$group_rows" \
   WINDOW="$window" BY="$by" AS_JSON="$json" python3 <<'SCOREPY'
 import os, json, sys
 
@@ -876,15 +894,18 @@ metrics.append(metric("policy-blocked action attempts", None,
 metrics.append(metric("autonomous rollback rate", None,
                       nodata="nothing records a self-revert yet (DIVE-1923)"))
 
-tiers = []
-for line in (os.environ.get("TIER_ROWS") or "").strip().splitlines():
+by = os.environ["BY"]
+groups = []
+for line in (os.environ.get("GROUP_ROWS") or "").strip().splitlines():
     if "|" in line:
         k, v = line.rsplit("|", 1)
-        tiers.append({"tier": k, "shipped": int(v)})
+        groups.append({"key": k, "shipped": int(v)})
 
+# The dimension label lives INSIDE the breakdown, so the header and the rows
+# cannot describe different things (the exact defect this iteration fixes).
 coverage = None
 if shipped_db:
-    coverage = {"known": tiered, "total": shipped_db,
+    coverage = {"dimension": by, "known": tiered, "total": shipped_db,
                 "pct": round((tiered or 0) / shipped_db * 100, 1)}
 
 # The money line is a FACT worth stating, not an omission to leave silent, and
@@ -894,10 +915,12 @@ if shipped_db:
 money_note = ("no money figure exists here: this work runs on a subscription plan, "
               "so there is no per-token price and a \"$\" column would be fiction")
 
-out = {"window": os.environ["WINDOW"], "by": os.environ["BY"],
+out = {"window": os.environ["WINDOW"], "by": by,
        "headline": {"note": "the badge (1 - asks/shipped) remains the headline number",
                     "shipped": shipped, "humanAsks": asks},
-       "metrics": metrics, "tierBreakdown": tiers, "tierCoverage": coverage,
+       "metrics": metrics,
+       "breakdown": {"by": by, "rows": groups},
+       "coverage": coverage,
        "moneyNote": money_note}
 
 if as_json:
@@ -915,18 +938,19 @@ for m in metrics:
         print(f"  {m['name']:<{w}}   {m['value']}{tail}")
 print()
 print(f"  {money_note}.")
-if tiers:
+if groups:
     print()
-    print("BY RISK TIER")
+    print("BY RISK TIER" if by == "tier" else "BY TASK CLASS (project / priority)")
     # Coverage sits NEXT TO the breakdown, not under it: without this a reader
     # takes 0/1/2 as the shape of the whole, when it describes only the tiered
     # slice. The coverage number is the most actionable thing on the row — it
     # says our own tiering discipline is the gap, not the metric.
     if coverage:
-        print(f"  tier known for {coverage['pct']}% of shipped work "
+        print(f"  {by} known for {coverage['pct']}% of shipped work "
               f"({coverage['known']} of {coverage['total']})")
-    for t in tiers:
-        print(f"    {t['tier']:<10} {t['shipped']}")
+    kw = max(len(g["key"]) for g in groups)
+    for g in groups:
+        print(f"    {g['key']:<{max(kw, 10)}} {g['shipped']}")
 SCOREPY
   local _rc=$?
   rm -rf "$work"
