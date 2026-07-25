@@ -63,6 +63,12 @@ _task_usage() {
                                                      # --kill flips kill_requested (deferred-safe). Cost: `usage loops`.
                                                      # Tokens/cost per loop: see `5dive usage` (same task ids).
   5dive task cancel <id|DIVE-N> [--result=<text>]    # -> cancelled; --result captures why
+  5dive task done|cancel ... [--keep-worktree]       # DIVE-1967: a close RECLAIMS node_modules from that task's worktrees (gitignored,
+                                                     # `npm ci`-regenerable -> structurally data-loss-free). --keep-worktree opts out.
+                                                     # The worktree DIRECTORY is never deleted — it may hold unpushed commits.
+  5dive task reclaim <id|DIVE-N>|--all [--dry-run]   # reclaim node_modules from closed tasks' worktrees. --all sweeps every worktree whose
+                                                     # task is done/cancelled/absent and SKIPS in_progress/blocked. Also REPORTS which
+                                                     # worktree dirs look prunable (nothing unpushed) — pruning itself stays a human call.
   5dive task block   <id|DIVE-N> --by=<id|DIVE-N>    # add a blocks edge, mark blocked
                                                      # Attempt first — blocking is the exception you must justify. Every block MUST carry a revisit anchor:
                                                      #   --by=<id> (dependency, auto-clears on the blocker's done), OR route a timed hold via `task park --reason --wake`, OR a human `task need`.
@@ -112,6 +118,119 @@ _task_usage() {
 USAGE
 }
 
+# -------- DIVE-1967: worktree reclaim on close --------
+#
+# Worktree-per-task with a full `npm install` per worktree and NO teardown at
+# close filled this host to 100% of 75G (DIVE-1966). Teardown belongs at the
+# close because that is the moment the artifact provably stops being needed.
+#
+# Only the SAFE half is automated: node_modules inside a worktree is gitignored,
+# `npm ci`-regenerable output — no commit or branch can live there, so removing
+# it is structurally data-loss-free. The worktree DIRECTORY may hold unpushed
+# commits; `task reclaim` only ever REPORTS those, and never deletes one.
+
+# _wt_num_of <path> — the task number a worktree basename encodes.
+_wt_num_of() {
+  local base="${1##*/}"
+  [[ "$base" =~ (^|[-_])(wt|dive)[-_]?(dive)?([0-9]+) ]] && printf '%s' "${BASH_REMATCH[4]}"
+  return 0
+}
+
+# _task_reclaim_on_close <ident> <keep:0|1>
+_task_reclaim_on_close() {
+  local ident="$1" keep="${2:-0}"
+  (( keep )) && return 0
+  [[ "${FIVEDIVE_NO_WT_RECLAIM:-0}" == "1" ]] && return 0
+  local num; num=$(wt_task_num "$ident")
+  [[ -n "$num" ]] || return 0
+  local wt r a b c kb=0 removed=0 failed=0 seen=0
+  while IFS= read -r wt; do
+    [[ -n "$wt" ]] || continue
+    seen=$((seen + 1))
+    r=$(wt_reclaim_node_modules "$wt") || continue
+    read -r a b c <<<"$r"
+    kb=$((kb + ${a:-0})); removed=$((removed + ${b:-0})); failed=$((failed + ${c:-0}))
+  done < <(wt_candidates "$num" 2>/dev/null)
+  (( seen )) || return 0
+  (( removed )) && step "reclaimed $(disk_gb "$kb")G of node_modules ($removed tree(s)) from $seen worktree(s) for $ident"
+  # A worktree owned by a DIFFERENT agent (mode 0755) fails the rm. Say so — a
+  # silent skip would read as "there was nothing to reclaim", which is the
+  # empty-output-is-not-an-empty-answer defect (DIVE-1869), just in a disk sweep.
+  (( failed )) && step "warn: $failed node_modules tree(s) for $ident not removable as $(id -un) — run: sudo 5dive task reclaim $ident"
+  audit_log "task reclaim" ok 0 -- "$ident" "worktrees=$seen" "kb=$kb" "removed=$removed" "failed=$failed"
+  return 0
+}
+
+cmd_task_reclaim() {
+  tasks_db_init
+  local dry=0 all=0 target=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --all)     all=1 ;;
+      --dry-run) dry=1 ;;
+      -*)        fail "$E_USAGE" "unknown flag: $1" ;;
+      *)         target="$1" ;;
+    esac
+    shift
+  done
+  [[ -n "$target" || $all -eq 1 ]] || \
+    fail "$E_USAGE" "usage: 5dive task reclaim <id|DIVE-N>|--all [--dry-run]"
+
+  local -a wts=()
+  local w
+  if (( all )); then
+    while IFS= read -r w; do [[ -n "$w" ]] && wts+=("$w"); done < <(wt_all)
+  else
+    resolve_task_id "$target"
+    local num; num=$(wt_task_num "$RESOLVED_TASK_IDENT")
+    while IFS= read -r w; do [[ -n "$w" ]] && wts+=("$w"); done < <(wt_candidates "$num")
+  fi
+
+  local rows='[]' total_kb=0 total_rm=0 total_fail=0 skipped=0
+  local wt num st r a b c why
+  for wt in ${wts[@]+"${wts[@]}"}; do
+    num=$(_wt_num_of "$wt")
+    # A worktree name carries a NUMBER, not an ident, and the ident counter is
+    # per-project (DIVE-500, FROG-500 both exist as far as this name is
+    # concerned). So match every project's task with that suffix and let ANY
+    # live one veto the reclaim — an ambiguous name must resolve toward keeping.
+    st=""
+    [[ -n "$num" ]] && st=$(db "SELECT COALESCE(GROUP_CONCAT(status,','),'') FROM tasks WHERE ident LIKE '%-${num}';" 2>/dev/null || echo "")
+    # NEVER touch a worktree whose task is still live. An in-flight agent losing
+    # its node_modules mid-build is a real outage bought for a disk win we do
+    # not need — the dead ones are more than enough.
+    if [[ "$st" == *"in_progress"* || "$st" == *"blocked"* ]]; then
+      skipped=$((skipped + 1))
+      # NAME every skip, on the acting path and not only in --dry-run. A reclaim
+      # that silently declines to act is indistinguishable from one that found
+      # nothing to do, and the operator only learns the difference when the disk
+      # fills again (Marcus, DIVE-1967 review).
+      step "skip $wt — task DIVE-${num} is ${st} (live)"
+      rows=$(jq -c --arg w "$wt" --arg s "$st" \
+        '. + [{worktree:$w, task_status:$s, action:"skipped", reason:"task is live"}]' <<<"$rows")
+      continue
+    fi
+    if (( dry )); then r=$(wt_reclaim_node_modules "$wt" dry); else r=$(wt_reclaim_node_modules "$wt"); fi
+    read -r a b c <<<"$r"
+    total_kb=$((total_kb + ${a:-0})); total_rm=$((total_rm + ${b:-0})); total_fail=$((total_fail + ${c:-0}))
+    (( ${c:-0} )) && step "skip ${c} tree(s) in $wt — not writable as $(id -un)"
+    # The DIRECTORY verdict is REPORTED, never acted on. wt_unpushed fails
+    # closed: anything it cannot PROVE is pushed comes back with a reason.
+    why=$(wt_unpushed "$wt")
+    rows=$(jq -c --arg w "$wt" --arg s "${st:-absent}" --argjson kb "${a:-0}" \
+      --argjson n "${b:-0}" --argjson f "${c:-0}" --arg why "$why" \
+      '. + [{worktree:$w, task_status:$s, action:(if $n>0 then "reclaimed" else "nothing" end),
+             kb:$kb, trees:$n, failed:$f,
+             prunable:($why==""), prune_blocker:(if $why=="" then null else $why end)}]' <<<"$rows")
+  done
+
+  local verb="reclaimed"; (( dry )) && verb="would reclaim"
+  ok "$verb $(disk_gb "$total_kb")G of node_modules ($total_rm tree(s)) across ${#wts[@]} worktree(s); $skipped skipped as live, $total_fail not writable" \
+     '{dry_run:($d=="1"), worktrees:($w|tonumber), reclaimed_kb:($kb|tonumber), trees:($n|tonumber), skipped_live:($s|tonumber), not_writable:($f|tonumber), detail:$rows}' \
+     --arg d "$dry" --arg w "${#wts[@]}" --arg kb "$total_kb" --arg n "$total_rm" \
+     --arg s "$skipped" --arg f "$total_fail" --argjson rows "$rows"
+}
+
 cmd_task() {
   [[ $# -gt 0 ]] || { _task_usage; exit "$E_USAGE"; }
   local sub="$1"; shift
@@ -145,6 +264,7 @@ cmd_task() {
     clear-recs)      cmd_task_clear_recs "$@" ;;
     precedent)       cmd_task_precedent "$@" ;;
     routing)         cmd_task_routing "$@" ;;
+    reclaim)         cmd_task_reclaim "$@" ;;   # DIVE-1967 worktree node_modules reclaim
     rm|delete)       cmd_task_rm "$@" ;;
     -h|--help|help)  _task_usage ;;
     *) fail "$E_USAGE" "unknown task command: $sub (try: 5dive task --help)" ;;
@@ -1225,7 +1345,7 @@ _gate_pr_state() {
 _task_status_cmd() {
   local newstatus="$1" extra="$2" verb="$3"; shift 3
   tasks_db_init
-  local result="" want_result=0 notify=0 no_preflight=0 force_merge_gate=0
+  local result="" want_result=0 notify=0 no_preflight=0 force_merge_gate=0 keep_wt=0
   # DIVE-1955 (review, Marcus): every reason the merge-gate could NOT reach an answer,
   # accumulated so the close can be stamped UNVERIFIED in the DURABLE RECORD. A stderr
   # warn and an audit row are necessary and not sufficient: the task row is what a
@@ -1244,6 +1364,9 @@ _task_status_cmd() {
       --notify)       notify=1 ;;
       --no-preflight) no_preflight=1 ;;
       --force-merge-gate) force_merge_gate=1 ;;  # DIVE-1835: audited escape from the mandatory auto-detect gate
+      # DIVE-1967: opt OUT of the node_modules reclaim a close performs (you are
+      # about to reuse the worktree and do not want to pay for another npm ci).
+      --keep-worktree) keep_wt=1 ;;
       --)         shift; positional+=("$@"); break ;;
       -*)         fail "$E_USAGE" "unknown flag: $1" ;;
       *)          positional+=("$1") ;;
@@ -1623,6 +1746,13 @@ $_body"
     case "$(_loop_kind "$id")" in
       work) _task_loop_advance "$id" || true ;;
     esac
+  fi
+  # DIVE-1966/1967: a close reclaims the closed task's worktree node_modules —
+  # gitignored, `npm ci`-regenerable, so structurally data-loss-free. The
+  # worktree DIRECTORY is never touched (it may hold unpushed commits). Best
+  # effort: a reclaim hiccup never fails the status write that already committed.
+  if [[ "$verb" == "done" || "$verb" == "cancel" ]]; then
+    _task_reclaim_on_close "$ident" "$keep_wt" || true
   fi
   # DIVE-1355: on any close (done/cancel), cascade-unblock dependents whose last
   # blocking edge this close satisfies. Additive to and idempotent with the loop

@@ -29,6 +29,7 @@ cat \
   src/lib/models.sh \
   src/lib/agent_setup.sh \
   src/lib/state.sh \
+  src/lib/disk.sh \
   src/lib/audit.sh \
   src/lib/registry.sh \
   src/lib/tasks_db.sh \
