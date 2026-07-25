@@ -406,8 +406,28 @@ if w_ship > 0:
 else:
     message = f"0 shipped, {w_ask} {ask_word}"
 
+# DIVE-1908: the badge carries its OWN date. The standing design claim was that
+# a dead publisher stops the date moving and "a stale date IS the alarm" — but
+# the date lived only in zero-human.json, which no README reader ever fetches.
+# badge.json had no date at all, so it rendered a stale number as CURRENT for as
+# long as the publisher stayed dead. That is our own defect class aimed at the
+# honesty instrument: the credibility artifact misrepresenting its own freshness.
+#
+# The date is appended to BOTH message branches deliberately — a zero-ship week
+# is exactly when someone would want to know how old the number is, so the date
+# must never be the thing that drops out when the reading gets unusual.
+#
+# It reuses TODAY_LABEL, which was already computed and exported for this and
+# never read by anything. And it is derived from the same `today` that becomes
+# datapoint["date"], so the badge and zero-human.json cannot disagree about
+# which day is being described.
+#
+# NOT a publisher-set "stale" flag: a dead publisher cannot mark itself dead.
+# Freshness has to be readable from the last value the publisher wrote, never
+# from a status it would have to keep updating while broken.
 badge = {"schemaVersion": 1, "label": "zero-human",
-         "message": message, "color": "blueviolet"}
+         "message": f"{message} · {os.environ['TODAY_LABEL']}",
+         "color": "blueviolet"}
 
 datapoint = {
     "generatedAtUtc": os.environ["NOW_ISO"],
@@ -423,7 +443,10 @@ if _pub:
     datapoint["publishedBy"] = _pub
 
 hist_path.write_text("".join(json.dumps(h, sort_keys=True) + "\n" for h in hist))
-pathlib.Path("badge.json").write_text(json.dumps(badge, indent=2) + "\n")
+# ensure_ascii=False so the middot stays a middot instead of a \u00b7 escape —
+# badge.json is read by shields (which parses JSON fine either way) but also by
+# humans checking whether the badge is stale, and that is the whole point of it.
+pathlib.Path("badge.json").write_text(json.dumps(badge, indent=2, ensure_ascii=False) + "\n")
 pathlib.Path("zero-human.json").write_text(json.dumps(datapoint, indent=2) + "\n")
 pathlib.Path("README.md").write_text(
     "# status\n\n"

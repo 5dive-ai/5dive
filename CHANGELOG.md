@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.14.14 — fix(proof): the zero-human badge now carries its own date (DIVE-1908) (2026-07-25)
+
+- **fix: the badge rendered a stale number as CURRENT, indefinitely.** `badge.json` was `{schemaVersion, label, message: "85.9%", color}` — **no date**. The README renders exactly that shields endpoint and introduces it as "the claim, measured", while the date existed only in `zero-human.json`, which no README reader ever fetches. The badge message now carries the datapoint's own day: `85.9% · Jul 25`.
+- **the standing design claim was false.** The docs said "on any error nothing publishes and the badge date stops moving — a stale date IS the alarm (self-evident staleness, no watcher daemon)". That was a designer's assumption about an artifact which did not carry the signal. There was no self-evident staleness and there never was; a dead publisher was invisible to every public viewer for as long as it stayed dead. This is our own defect class aimed at the honesty instrument itself.
+- **it also revalues DIVE-1896.** That staleness monitor was framed as a watcher backing up a self-evident public signal. There was no such signal, so the monitor was — and until this change remained — the *only* staleness detection that existed, public or internal.
+- **the date is on BOTH message branches, deliberately.** A zero-shipped week (`0 shipped, 1 ask`) is exactly when a reader most wants to know how old the number is, so the date must never be the thing that drops out when the reading gets unusual.
+- **no publisher-set "stale" flag.** A dead publisher cannot mark itself dead — that is the same trap one layer down. Freshness is readable from the last value the publisher wrote, never from a status it would have to keep updating while broken.
+- **the date is derived from the same `today` that becomes `zero-human.json`'s `date`**, so the two artifacts cannot disagree about which day is being described; the test asserts that agreement rather than merely asserting a date is present. It reuses `TODAY_LABEL`, which was already computed and exported into the builder for this and read by nothing.
+- `badge.json` is serialized with `ensure_ascii=False` so the separator stays a real character instead of a `\u00b7` escape — shields parses either, but the file is also read by humans checking whether the badge is stale, which is the entire point of it. `badge.json` is shields-internal per the API contract (`zero-human.json` + `history.jsonl` are the additive-only public contract), so no consumer breaks.
+
 ## 0.14.13 — fix(auth): close the two silent gaps main flagged on the DIVE-1900 review (DIVE-1915) (2026-07-25)
 
 - **fix: a PRESENT-but-stale local token was still a silent failure.** DIVE-1900's loud error only fired when the local credential was missing or empty, so an agent holding an old token alongside a *newer, unreadable* profile token re-seeded nothing and said nothing — and no amount of re-authing would ever reach it. That is the same shape DIVE-1900 exists to kill, one case narrower. The post-seed assertion is now a single shared `assert_cred_seeded` used by both antigravity and openclaw, and it covers it.

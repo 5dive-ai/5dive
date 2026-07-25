@@ -45,10 +45,28 @@ OUT1="$(run_build "$W1" 5 1 27 2)"; RC1=$?
 [[ $RC1 -eq 0 ]] && ok_t "fresh publish exits 0" || bad_t "fresh exit" "rc=$RC1"
 [[ -f "$W1/badge.json" && -f "$W1/zero-human.json" && -f "$W1/history.jsonl" && -f "$W1/README.md" ]] \
   && ok_t "all four files written" || bad_t "files written"
-[[ "$(jget "$W1/badge.json" "['message']")" == "80%" ]] \
+[[ "$(jget "$W1/badge.json" "['message']")" == "80% · Jul 11" ]] \
   && ok_t "badge message = self-shipped pct from the last-7 daily datapoints" || bad_t "badge message" "$(cat "$W1/badge.json")"
 [[ "$(jget "$W1/badge.json" "['schemaVersion']")" == "1" && "$(jget "$W1/badge.json" "['label']")" == "zero-human" ]] \
   && ok_t "badge is a valid shields endpoint schema" || bad_t "badge schema"
+
+# DIVE-1908: the badge must carry its OWN date, and it must be the SAME day the
+# datapoint describes. Without this the badge renders a stale number as current
+# for as long as the publisher stays dead, which is the honesty instrument
+# misreporting its own freshness. Assert the badge and zero-human.json can never
+# disagree about which day is being described, rather than just that a date is
+# present somewhere.
+BADGE_MSG="$(jget "$W1/badge.json" "['message']")"
+DP_DATE="$(jget "$W1/zero-human.json" "['date']")"          # 2026-07-11
+DP_LABEL="$(date -u -d "$DP_DATE" '+%b %-d' 2>/dev/null)"   # Jul 11
+[[ -n "$DP_LABEL" && "$BADGE_MSG" == *"$DP_LABEL" ]] \
+  && ok_t "badge message ends with the DATAPOINT's own date (badge and zero-human.json agree)" \
+  || bad_t "badge date == datapoint date" "msg='$BADGE_MSG' datapoint.date='$DP_DATE' expected-suffix='$DP_LABEL'"
+# The middot must survive as a real character, not a · escape — badge.json
+# is read by humans checking staleness, not only by shields.
+grep -q 'u00b7' "$W1/badge.json" \
+  && bad_t "badge.json is human-readable" "middot was escaped to \\u00b7: $(cat "$W1/badge.json")" \
+  || ok_t "badge.json keeps the separator as a real character (no \\u00b7 escape)"
 [[ "$(jget "$W1/zero-human.json" "['week']['shipped']")" == "5" \
    && "$(jget "$W1/zero-human.json" "['week']['humanAsks']")" == "1" \
    && "$(jget "$W1/zero-human.json" "['day']['shipped']")" == "5" \
@@ -71,13 +89,13 @@ OUT2="$(run_build "$W1" 9 9 99 9 2026-07-11)"; RC2=$?
 # --- Case 3a: perfect week drops the trailing .0 (100%, not 100.0%) ----------
 W3="$TMP/w3"; mkdir -p "$W3"
 run_build "$W3" 4 0 10 0 >/dev/null
-[[ "$(jget "$W3/badge.json" "['message']")" == "100%" ]] \
+[[ "$(jget "$W3/badge.json" "['message']")" == "100% · Jul 11" ]] \
   && ok_t "zero asks -> 100% with trailing .0 dropped" || bad_t "100pct" "$(cat "$W3/badge.json")"
 
 # --- Case 3b: a week with zero ships has no ratio -> raw-count fallback -------
 W3b="$TMP/w3b"; mkdir -p "$W3b"
 run_build "$W3b" 0 1 0 1 >/dev/null
-[[ "$(jget "$W3b/badge.json" "['message']")" == "0 shipped, 1 ask" ]] \
+[[ "$(jget "$W3b/badge.json" "['message']")" == "0 shipped, 1 ask · Jul 11" ]] \
   && ok_t "zero shipped -> raw-count fallback, singular 'ask'" || bad_t "zero-ship fallback" "$(cat "$W3b/badge.json")"
 
 # --- Case 4: cumulative sums the non-overlapping 24h datapoints across days ---
@@ -128,7 +146,7 @@ OUT6="$( cd "$W6" && \
   CLI_VERSION="0.8.8" METHODOLOGY_URL="https://example.test/zero-human.md" \
   python3 "$TMP/proof.py" )"; RC6=$?
 [[ $RC6 -eq 0 ]] && ok_t "DIVE-1864: >128KB digest via *_FILE builds (no E2BIG)" || bad_t "big-file build" "rc=$RC6"
-[[ "$(jget "$W6/badge.json" "['message']")" == "100%" ]] \
+[[ "$(jget "$W6/badge.json" "['message']")" == "100% · Jul 12" ]] \
   && ok_t "big-file badge computes verbatim (6 shipped / 0 asks -> 100%)" || bad_t "big-file badge" "$(cat "$W6/badge.json" 2>/dev/null)"
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
