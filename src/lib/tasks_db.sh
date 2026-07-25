@@ -424,6 +424,25 @@ CREATE TABLE IF NOT EXISTS supervisor_events (
 );
 CREATE INDEX IF NOT EXISTS supervisor_events_agent_idx ON supervisor_events(agent, id);
 
+-- DIVE-1922: policy refusals — the capture path behind `proof scorecard`'s
+-- "policy-blocked action attempts". Until this existed the metric had NO
+-- source: we recorded gates that were ASKED and ANSWERED, never attempts a
+-- policy REFUSED before they got that far, so a rendered 0.0% would have read
+-- as "we never get blocked". Written ONLY by policy_refuse(); append-only,
+-- never updated or deleted, and never referenced by tasks/projects so it
+-- cannot touch the queue. `policy` is a stable slug (not the message text, so
+-- rewording a refusal never breaks the series); `ticket` is the rule's origin.
+CREATE TABLE IF NOT EXISTS policy_refusals (
+  id       INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts       TEXT NOT NULL DEFAULT (datetime('now')),
+  policy   TEXT NOT NULL,
+  ticket   TEXT,
+  actor    TEXT,
+  ident    TEXT,
+  detail   TEXT
+);
+CREATE INDEX IF NOT EXISTS policy_refusals_ts_idx ON policy_refusals(ts, policy);
+
 -- OSS-21: fleet-wide policy prefs as a tiny key/value store. Currently holds
 -- precedent_autoclear (on|off, default off when the row is absent) — the switch
 -- that lets a resolved tier-1 gate clear itself from proven human precedent.
@@ -829,6 +848,37 @@ CREATE TABLE IF NOT EXISTS supervisor_events (
   signals             TEXT
 );
 CREATE INDEX IF NOT EXISTS supervisor_events_agent_idx ON supervisor_events(agent, id);
+MIG
+  fi
+
+  # DIVE-1922: policy_refusals needs its OWN guard. Nesting it under the
+  # supervisor_events check meant it only ran on stores that LACKED
+  # supervisor_events — so on every existing box the table was never created and
+  # `proof scorecard` would have read NO DATA forever: a silent no-op that looks
+  # exactly like "no refusals recorded yet". Guard on the table you are creating.
+  local has_policy_refusals
+  has_policy_refusals=$(sqlite3 -cmd ".timeout 5000" "$TASKS_DB" \
+    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='policy_refusals' LIMIT 1;" 2>/dev/null)
+  if [[ "$has_policy_refusals" != "1" ]]; then
+    sqlite3 -cmd ".timeout 5000" "$TASKS_DB" <<'MIG' >/dev/null 2>&1 || true
+-- DIVE-1922: policy refusals — the capture path behind `proof scorecard`'s
+-- "policy-blocked action attempts". Until this existed the metric had NO
+-- source: we recorded gates that were ASKED and ANSWERED, never attempts a
+-- policy REFUSED before they got that far, so a rendered 0.0% would have read
+-- as "we never get blocked". Written ONLY by policy_refuse(); append-only,
+-- never updated or deleted, and never referenced by tasks/projects so it
+-- cannot touch the queue. `policy` is a stable slug (not the message text, so
+-- rewording a refusal never breaks the series); `ticket` is the rule's origin.
+CREATE TABLE IF NOT EXISTS policy_refusals (
+  id       INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts       TEXT NOT NULL DEFAULT (datetime('now')),
+  policy   TEXT NOT NULL,
+  ticket   TEXT,
+  actor    TEXT,
+  ident    TEXT,
+  detail   TEXT
+);
+CREATE INDEX IF NOT EXISTS policy_refusals_ts_idx ON policy_refusals(ts, policy);
 MIG
   fi
 
@@ -1331,4 +1381,41 @@ _gate_closure_verify() {
   local expect; expect=$(_gate_closure_sign "$1" "$2" "$3" "$4" "$5" "$6") || return 1
   [[ -n "$expect" ]] || return 1
   _gate_proof_ct_equal "$sig" "$expect"
+}
+
+# policy_refuse <exit-code> <policy-slug> <ticket> <ident> <message> — DIVE-1922.
+#
+# Record that a policy REFUSED an action, then refuse it. This is the capture
+# path behind `proof scorecard`'s "policy-blocked action attempts", which had no
+# source at all: we recorded gates that were ASKED and ANSWERED, never attempts
+# stopped before they got that far. A metric with no source renders 0.0% and
+# reads as "we never get blocked" — the succeeding-in-appearance class aimed at
+# the honesty instrument, which is why the scorecard shipped a NO DATA marker
+# rather than a zero.
+#
+# ONLY for genuine POLICY refusals — a rule stopping an actor from doing
+# something it asked to do. NOT for usage/validation errors (bad flag, missing
+# arg, malformed input): those are the caller getting the invocation wrong, not
+# policy blocking an action, and counting them would inflate the number into
+# meaninglessness. When in doubt, keep using `fail` directly; an UNDER-counted
+# metric that reports its own coverage is honest, an inflated one is not.
+#
+# The EXIT CODE is a parameter, not a constant. Instrumenting a site must be
+# behaviour-preserving: hardcoding one code silently changed three sites'
+# contracts (E_USAGE->E_CONFLICT twice, E_AUTH_REQUIRED->E_CONFLICT once) when
+# this was first written. Adding telemetry must never alter what a caller sees.
+#
+# <policy-slug> is a stable identifier, deliberately NOT the message text, so
+# rewording a refusal never breaks the series. Recording is best-effort and can
+# never prevent the refusal: if the write fails the action is still refused,
+# because a policy that stops working when its telemetry breaks is a worse
+# failure than a missing row.
+policy_refuse() {
+  local code="$1" policy="$2" ticket="$3" ident="$4"; shift 4
+  local msg="$*" actor
+  actor="${SUDO_USER:-$(id -un 2>/dev/null || echo unknown)}"
+  db "INSERT INTO policy_refusals (policy, ticket, actor, ident, detail)
+      VALUES ($(sqlq "$policy"), $(sqlq "$ticket"), $(sqlq "$actor"), $(sqlq "$ident"), $(sqlq "$msg"));" \
+    >/dev/null 2>&1 || true
+  fail "$code" "$msg"
 }

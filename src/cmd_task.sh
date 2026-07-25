@@ -922,7 +922,7 @@ _task_status_cmd() {
     _gt=$(db "SELECT COALESCE(need_type,'')        FROM tasks WHERE id=${id};")
     _ga=$(db "SELECT COALESCE(need_answered_at,'') FROM tasks WHERE id=${id};")
     if [[ -n "$_gt" && -z "$_ga" ]]; then
-      fail "$E_CONFLICT" "$ident has a pending '${_gt}' gate awaiting a human — answer it (5dive task answer $ident ...) or abandon the task (5dive task cancel $ident) instead of marking done. A gated/public ship must not close ahead of its gate (DIVE-555)."
+      policy_refuse "$E_CONFLICT" done-over-open-gate DIVE-555 "$ident" "$ident has a pending '${_gt}' gate awaiting a human — answer it (5dive task answer $ident ...) or abandon the task (5dive task cancel $ident) instead of marking done. A gated/public ship must not close ahead of its gate (DIVE-555)."
     fi
   fi
   # DIVE-1830 merge-gate (opt-in): a task that declared DELIVERED WORK cannot
@@ -958,14 +958,14 @@ _task_status_cmd() {
         _state=$(GH_TOKEN="$_ghtok" gh pr view "$_dref" --json state,mergedAt -q '.state' 2>/dev/null || echo "")
         _merged=$(GH_TOKEN="$_ghtok" gh pr view "$_dref" --json state,mergedAt -q '.mergedAt' 2>/dev/null || echo "")
         if [[ "$_state" != "MERGED" || -z "$_merged" || "$_merged" == "null" ]]; then
-          fail "$E_CONFLICT" "$ident cannot close: its delivery PR is not merged to main yet ($_dref, state=${_state:-unknown}). done=merged-to-main (DIVE-1830) — merge the PR, then run task done. Use \`task cancel\` to abandon."
+          policy_refuse "$E_CONFLICT" done-before-pr-merged DIVE-1830 "$ident" "$ident cannot close: its delivery PR is not merged to main yet ($_dref, state=${_state:-unknown}). done=merged-to-main (DIVE-1830) — merge the PR, then run task done. Use \`task cancel\` to abandon."
         fi
       else
         local _slug _bmerged
         _slug=$(_push_repo_slug "$_PUSH_DEFAULT_REPO")
         _bmerged=$(GH_TOKEN="$_ghtok" gh pr list --repo "$_slug" --head "$_branch" --state merged --json number,mergedAt -q '.[0].mergedAt' 2>/dev/null || echo "")
         if [[ -z "$_bmerged" || "$_bmerged" == "null" ]]; then
-          fail "$E_CONFLICT" "$ident cannot close: no MERGED PR found for its branch '$_branch' in $_slug. done=merged-to-main (DIVE-1830) — open and merge a PR for that branch, then run task done. Use \`task cancel\` to abandon."
+          policy_refuse "$E_CONFLICT" done-before-branch-merged DIVE-1830 "$ident" "$ident cannot close: no MERGED PR found for its branch '$_branch' in $_slug. done=merged-to-main (DIVE-1830) — open and merge a PR for that branch, then run task done. Use \`task cancel\` to abandon."
         fi
       fi
     fi
@@ -1010,7 +1010,7 @@ _task_status_cmd() {
       # behind is independently flagged by the weekly hygiene digest (#139).
       audit_log "task.force-merge-gate" ok 0 -- "$ident" "override_pr=${_auto_hit:-none}"
     elif [[ -n "$_auto_hit" ]]; then
-      fail "$E_CONFLICT" "$ident cannot close: open PR #$_auto_hit names it in its title/branch but is not merged to main. done=merged-to-main (DIVE-1835 mandatory gate) — merge it then \`task done\`, \`task cancel\` to abandon, or \`task done $ident --force-merge-gate\` to override (audited + surfaced in the weekly hygiene digest)."
+      policy_refuse "$E_CONFLICT" done-before-named-pr-merged DIVE-1835 "$ident" "$ident cannot close: open PR #$_auto_hit names it in its title/branch but is not merged to main. done=merged-to-main (DIVE-1835 mandatory gate) — merge it then \`task done\`, \`task cancel\` to abandon, or \`task done $ident --force-merge-gate\` to override (audited + surfaced in the weekly hygiene digest)."
     fi
   fi
   local set_result=""
@@ -1812,7 +1812,7 @@ cmd_task_block() {
       cmd_task_park "$task" --reason="$reason" --wake="$wake"
       return
     fi
-    fail "$E_USAGE" "a bare 'task block $task' with no reason or revisit date is forbidden (DIVE-1357) — pick a revisit anchor: 'task block $task --by=<id>' (a dependency), 'task park $task --reason=<why> --wake=<when>' (a timed hold), or 'task need $task --type=… --ask=…' (a human gate)"
+    policy_refuse "$E_USAGE" bare-block-forbidden DIVE-1357 "$task" "a bare 'task block $task' with no reason or revisit date is forbidden (DIVE-1357) — pick a revisit anchor: 'task block $task --by=<id>' (a dependency), 'task park $task --reason=<why> --wake=<when>' (a timed hold), or 'task need $task --type=… --ask=…' (a human gate)"
   fi
   resolve_task_id "$task"; local tid="$RESOLVED_TASK_ID" tident="$RESOLVED_TASK_IDENT"
   resolve_task_id "$by";   local bid="$RESOLVED_TASK_ID" bident="$RESOLVED_TASK_IDENT"
@@ -1890,7 +1890,7 @@ cmd_task_park() {
       THEN 1 ELSE 0 END FROM tasks WHERE id=${tid};")
   if [[ "$_live_gate" == "1" ]]; then
     local _gt; _gt=$(db "SELECT COALESCE(need_type,'gate') FROM tasks WHERE id=${tid};")
-    fail "$E_USAGE" "$tident has an open ${_gt} gate awaiting a human — parking would silently destroy it (DIVE-1453). It is already blocked on the human, so no park is needed; resolve the gate first ('5dive task answer $tident …') if it's moot, then park."
+    policy_refuse "$E_USAGE" park-over-open-gate DIVE-1453 "$tident" "$tident has an open ${_gt} gate awaiting a human — parking would silently destroy it (DIVE-1453). It is already blocked on the human, so no park is needed; resolve the gate first ('5dive task answer $tident …') if it's moot, then park."
   fi
   # DIVE-891: --wake gives a park a wake-up time — the heartbeat's TTL pass
   # auto-unparks (back to todo) once it passes, so "revisit in a week" stops
@@ -2317,7 +2317,7 @@ cmd_task_need() {
     [[ -n "$w_name" && "$w_name" == "$w_filer" ]] && w_ok=1                # the filer
     [[ -n "$w_name" && -n "$w_lead"  && "$w_name" == "$w_lead"  ]] && w_ok=1  # filer's lead
     [[ -n "$w_name" && -n "$w_coord" && "$w_name" == "$w_coord" ]] && w_ok=1  # org coordinator
-    (( w_ok )) || fail "$E_AUTH_REQUIRED" "only the gate's filer (${w_filer:-?}), their lead, or a human can withdraw $ident's gate"
+    (( w_ok )) || policy_refuse "$E_AUTH_REQUIRED" gate-withdraw-not-authorized DIVE-1401 "$ident" "only the gate's filer (${w_filer:-?}), their lead, or a human can withdraw $ident's gate"
     # Clear every gate field (NEVER need_answer/need_answered_at — this is not a
     # grant) and unblock back to todo when no dependency edge still holds it.
     db "UPDATE tasks

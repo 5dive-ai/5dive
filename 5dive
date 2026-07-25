@@ -26,7 +26,7 @@ esac
 
 # Bumped on every public release. `build.sh` checks this line exists; CI fails
 # the bundle-drift check if it's missing or empty.
-readonly FIVE_VERSION="0.15.3"
+readonly FIVE_VERSION="0.15.4"
 
 # GitHub org our repos live under. The org is being renamed
 # 5dive-com -> 5dive-ai (2026-06); fetches must work on either side of the
@@ -3378,6 +3378,25 @@ CREATE TABLE IF NOT EXISTS supervisor_events (
 );
 CREATE INDEX IF NOT EXISTS supervisor_events_agent_idx ON supervisor_events(agent, id);
 
+-- DIVE-1922: policy refusals — the capture path behind `proof scorecard`'s
+-- "policy-blocked action attempts". Until this existed the metric had NO
+-- source: we recorded gates that were ASKED and ANSWERED, never attempts a
+-- policy REFUSED before they got that far, so a rendered 0.0% would have read
+-- as "we never get blocked". Written ONLY by policy_refuse(); append-only,
+-- never updated or deleted, and never referenced by tasks/projects so it
+-- cannot touch the queue. `policy` is a stable slug (not the message text, so
+-- rewording a refusal never breaks the series); `ticket` is the rule's origin.
+CREATE TABLE IF NOT EXISTS policy_refusals (
+  id       INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts       TEXT NOT NULL DEFAULT (datetime('now')),
+  policy   TEXT NOT NULL,
+  ticket   TEXT,
+  actor    TEXT,
+  ident    TEXT,
+  detail   TEXT
+);
+CREATE INDEX IF NOT EXISTS policy_refusals_ts_idx ON policy_refusals(ts, policy);
+
 -- OSS-21: fleet-wide policy prefs as a tiny key/value store. Currently holds
 -- precedent_autoclear (on|off, default off when the row is absent) — the switch
 -- that lets a resolved tier-1 gate clear itself from proven human precedent.
@@ -3783,6 +3802,37 @@ CREATE TABLE IF NOT EXISTS supervisor_events (
   signals             TEXT
 );
 CREATE INDEX IF NOT EXISTS supervisor_events_agent_idx ON supervisor_events(agent, id);
+MIG
+  fi
+
+  # DIVE-1922: policy_refusals needs its OWN guard. Nesting it under the
+  # supervisor_events check meant it only ran on stores that LACKED
+  # supervisor_events — so on every existing box the table was never created and
+  # `proof scorecard` would have read NO DATA forever: a silent no-op that looks
+  # exactly like "no refusals recorded yet". Guard on the table you are creating.
+  local has_policy_refusals
+  has_policy_refusals=$(sqlite3 -cmd ".timeout 5000" "$TASKS_DB" \
+    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='policy_refusals' LIMIT 1;" 2>/dev/null)
+  if [[ "$has_policy_refusals" != "1" ]]; then
+    sqlite3 -cmd ".timeout 5000" "$TASKS_DB" <<'MIG' >/dev/null 2>&1 || true
+-- DIVE-1922: policy refusals — the capture path behind `proof scorecard`'s
+-- "policy-blocked action attempts". Until this existed the metric had NO
+-- source: we recorded gates that were ASKED and ANSWERED, never attempts a
+-- policy REFUSED before they got that far, so a rendered 0.0% would have read
+-- as "we never get blocked". Written ONLY by policy_refuse(); append-only,
+-- never updated or deleted, and never referenced by tasks/projects so it
+-- cannot touch the queue. `policy` is a stable slug (not the message text, so
+-- rewording a refusal never breaks the series); `ticket` is the rule's origin.
+CREATE TABLE IF NOT EXISTS policy_refusals (
+  id       INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts       TEXT NOT NULL DEFAULT (datetime('now')),
+  policy   TEXT NOT NULL,
+  ticket   TEXT,
+  actor    TEXT,
+  ident    TEXT,
+  detail   TEXT
+);
+CREATE INDEX IF NOT EXISTS policy_refusals_ts_idx ON policy_refusals(ts, policy);
 MIG
   fi
 
@@ -4285,6 +4335,43 @@ _gate_closure_verify() {
   local expect; expect=$(_gate_closure_sign "$1" "$2" "$3" "$4" "$5" "$6") || return 1
   [[ -n "$expect" ]] || return 1
   _gate_proof_ct_equal "$sig" "$expect"
+}
+
+# policy_refuse <exit-code> <policy-slug> <ticket> <ident> <message> — DIVE-1922.
+#
+# Record that a policy REFUSED an action, then refuse it. This is the capture
+# path behind `proof scorecard`'s "policy-blocked action attempts", which had no
+# source at all: we recorded gates that were ASKED and ANSWERED, never attempts
+# stopped before they got that far. A metric with no source renders 0.0% and
+# reads as "we never get blocked" — the succeeding-in-appearance class aimed at
+# the honesty instrument, which is why the scorecard shipped a NO DATA marker
+# rather than a zero.
+#
+# ONLY for genuine POLICY refusals — a rule stopping an actor from doing
+# something it asked to do. NOT for usage/validation errors (bad flag, missing
+# arg, malformed input): those are the caller getting the invocation wrong, not
+# policy blocking an action, and counting them would inflate the number into
+# meaninglessness. When in doubt, keep using `fail` directly; an UNDER-counted
+# metric that reports its own coverage is honest, an inflated one is not.
+#
+# The EXIT CODE is a parameter, not a constant. Instrumenting a site must be
+# behaviour-preserving: hardcoding one code silently changed three sites'
+# contracts (E_USAGE->E_CONFLICT twice, E_AUTH_REQUIRED->E_CONFLICT once) when
+# this was first written. Adding telemetry must never alter what a caller sees.
+#
+# <policy-slug> is a stable identifier, deliberately NOT the message text, so
+# rewording a refusal never breaks the series. Recording is best-effort and can
+# never prevent the refusal: if the write fails the action is still refused,
+# because a policy that stops working when its telemetry breaks is a worse
+# failure than a missing row.
+policy_refuse() {
+  local code="$1" policy="$2" ticket="$3" ident="$4"; shift 4
+  local msg="$*" actor
+  actor="${SUDO_USER:-$(id -un 2>/dev/null || echo unknown)}"
+  db "INSERT INTO policy_refusals (policy, ticket, actor, ident, detail)
+      VALUES ($(sqlq "$policy"), $(sqlq "$ticket"), $(sqlq "$actor"), $(sqlq "$ident"), $(sqlq "$msg"));" \
+    >/dev/null 2>&1 || true
+  fail "$code" "$msg"
 }
 
 # -------- auth status (per type, default profile) --------
@@ -17945,7 +18032,7 @@ _task_status_cmd() {
     _gt=$(db "SELECT COALESCE(need_type,'')        FROM tasks WHERE id=${id};")
     _ga=$(db "SELECT COALESCE(need_answered_at,'') FROM tasks WHERE id=${id};")
     if [[ -n "$_gt" && -z "$_ga" ]]; then
-      fail "$E_CONFLICT" "$ident has a pending '${_gt}' gate awaiting a human — answer it (5dive task answer $ident ...) or abandon the task (5dive task cancel $ident) instead of marking done. A gated/public ship must not close ahead of its gate (DIVE-555)."
+      policy_refuse "$E_CONFLICT" done-over-open-gate DIVE-555 "$ident" "$ident has a pending '${_gt}' gate awaiting a human — answer it (5dive task answer $ident ...) or abandon the task (5dive task cancel $ident) instead of marking done. A gated/public ship must not close ahead of its gate (DIVE-555)."
     fi
   fi
   # DIVE-1830 merge-gate (opt-in): a task that declared DELIVERED WORK cannot
@@ -17981,14 +18068,14 @@ _task_status_cmd() {
         _state=$(GH_TOKEN="$_ghtok" gh pr view "$_dref" --json state,mergedAt -q '.state' 2>/dev/null || echo "")
         _merged=$(GH_TOKEN="$_ghtok" gh pr view "$_dref" --json state,mergedAt -q '.mergedAt' 2>/dev/null || echo "")
         if [[ "$_state" != "MERGED" || -z "$_merged" || "$_merged" == "null" ]]; then
-          fail "$E_CONFLICT" "$ident cannot close: its delivery PR is not merged to main yet ($_dref, state=${_state:-unknown}). done=merged-to-main (DIVE-1830) — merge the PR, then run task done. Use \`task cancel\` to abandon."
+          policy_refuse "$E_CONFLICT" done-before-pr-merged DIVE-1830 "$ident" "$ident cannot close: its delivery PR is not merged to main yet ($_dref, state=${_state:-unknown}). done=merged-to-main (DIVE-1830) — merge the PR, then run task done. Use \`task cancel\` to abandon."
         fi
       else
         local _slug _bmerged
         _slug=$(_push_repo_slug "$_PUSH_DEFAULT_REPO")
         _bmerged=$(GH_TOKEN="$_ghtok" gh pr list --repo "$_slug" --head "$_branch" --state merged --json number,mergedAt -q '.[0].mergedAt' 2>/dev/null || echo "")
         if [[ -z "$_bmerged" || "$_bmerged" == "null" ]]; then
-          fail "$E_CONFLICT" "$ident cannot close: no MERGED PR found for its branch '$_branch' in $_slug. done=merged-to-main (DIVE-1830) — open and merge a PR for that branch, then run task done. Use \`task cancel\` to abandon."
+          policy_refuse "$E_CONFLICT" done-before-branch-merged DIVE-1830 "$ident" "$ident cannot close: no MERGED PR found for its branch '$_branch' in $_slug. done=merged-to-main (DIVE-1830) — open and merge a PR for that branch, then run task done. Use \`task cancel\` to abandon."
         fi
       fi
     fi
@@ -18033,7 +18120,7 @@ _task_status_cmd() {
       # behind is independently flagged by the weekly hygiene digest (#139).
       audit_log "task.force-merge-gate" ok 0 -- "$ident" "override_pr=${_auto_hit:-none}"
     elif [[ -n "$_auto_hit" ]]; then
-      fail "$E_CONFLICT" "$ident cannot close: open PR #$_auto_hit names it in its title/branch but is not merged to main. done=merged-to-main (DIVE-1835 mandatory gate) — merge it then \`task done\`, \`task cancel\` to abandon, or \`task done $ident --force-merge-gate\` to override (audited + surfaced in the weekly hygiene digest)."
+      policy_refuse "$E_CONFLICT" done-before-named-pr-merged DIVE-1835 "$ident" "$ident cannot close: open PR #$_auto_hit names it in its title/branch but is not merged to main. done=merged-to-main (DIVE-1835 mandatory gate) — merge it then \`task done\`, \`task cancel\` to abandon, or \`task done $ident --force-merge-gate\` to override (audited + surfaced in the weekly hygiene digest)."
     fi
   fi
   local set_result=""
@@ -18835,7 +18922,7 @@ cmd_task_block() {
       cmd_task_park "$task" --reason="$reason" --wake="$wake"
       return
     fi
-    fail "$E_USAGE" "a bare 'task block $task' with no reason or revisit date is forbidden (DIVE-1357) — pick a revisit anchor: 'task block $task --by=<id>' (a dependency), 'task park $task --reason=<why> --wake=<when>' (a timed hold), or 'task need $task --type=… --ask=…' (a human gate)"
+    policy_refuse "$E_USAGE" bare-block-forbidden DIVE-1357 "$task" "a bare 'task block $task' with no reason or revisit date is forbidden (DIVE-1357) — pick a revisit anchor: 'task block $task --by=<id>' (a dependency), 'task park $task --reason=<why> --wake=<when>' (a timed hold), or 'task need $task --type=… --ask=…' (a human gate)"
   fi
   resolve_task_id "$task"; local tid="$RESOLVED_TASK_ID" tident="$RESOLVED_TASK_IDENT"
   resolve_task_id "$by";   local bid="$RESOLVED_TASK_ID" bident="$RESOLVED_TASK_IDENT"
@@ -18913,7 +19000,7 @@ cmd_task_park() {
       THEN 1 ELSE 0 END FROM tasks WHERE id=${tid};")
   if [[ "$_live_gate" == "1" ]]; then
     local _gt; _gt=$(db "SELECT COALESCE(need_type,'gate') FROM tasks WHERE id=${tid};")
-    fail "$E_USAGE" "$tident has an open ${_gt} gate awaiting a human — parking would silently destroy it (DIVE-1453). It is already blocked on the human, so no park is needed; resolve the gate first ('5dive task answer $tident …') if it's moot, then park."
+    policy_refuse "$E_USAGE" park-over-open-gate DIVE-1453 "$tident" "$tident has an open ${_gt} gate awaiting a human — parking would silently destroy it (DIVE-1453). It is already blocked on the human, so no park is needed; resolve the gate first ('5dive task answer $tident …') if it's moot, then park."
   fi
   # DIVE-891: --wake gives a park a wake-up time — the heartbeat's TTL pass
   # auto-unparks (back to todo) once it passes, so "revisit in a week" stops
@@ -19340,7 +19427,7 @@ cmd_task_need() {
     [[ -n "$w_name" && "$w_name" == "$w_filer" ]] && w_ok=1                # the filer
     [[ -n "$w_name" && -n "$w_lead"  && "$w_name" == "$w_lead"  ]] && w_ok=1  # filer's lead
     [[ -n "$w_name" && -n "$w_coord" && "$w_name" == "$w_coord" ]] && w_ok=1  # org coordinator
-    (( w_ok )) || fail "$E_AUTH_REQUIRED" "only the gate's filer (${w_filer:-?}), their lead, or a human can withdraw $ident's gate"
+    (( w_ok )) || policy_refuse "$E_AUTH_REQUIRED" gate-withdraw-not-authorized DIVE-1401 "$ident" "only the gate's filer (${w_filer:-?}), their lead, or a human can withdraw $ident's gate"
     # Clear every gate field (NEVER need_answer/need_answered_at — this is not a
     # grant) and unblock back to todo when no dependency edge still holds it.
     db "UPDATE tasks
@@ -37317,12 +37404,41 @@ _proof_scorecard() {
       (SELECT COUNT(*) FROM tasks WHERE status='done' AND kind='standard' AND done_at>=datetime('now','-7 days') AND verifier IS NOT NULL AND verifier<>'' AND COALESCE(iteration,1)<=1) || '|' ||
       (SELECT COUNT(*) FROM tasks WHERE status='done' AND kind='standard' AND done_at>=datetime('now','-7 days') AND ${known_expr});" 2>/dev/null || true)"
 
+  # DIVE-1922: the policy-refusal source now EXISTS, so this metric stops being
+  # NO DATA. Two numbers are needed, not one. The count alone would read as
+  # "we never get blocked" when it is 0 — the same failure the marker existed to
+  # prevent — so it ships with the number of INSTRUMENTED sites beside it. An
+  # uninstrumented refusal site is invisible to this count, and the reader has to
+  # be told that. The site count is DERIVED from the shipped bundle rather than
+  # hand-maintained, because a hand-kept constant drifts and then lies.
+  local refusals="" refusal_sites=""
+  if [ "$(db "SELECT 1 FROM sqlite_master WHERE type='table' AND name='policy_refusals' LIMIT 1;" 2>/dev/null)" = "1" ]; then
+    refusals="$(db "SELECT COUNT(*) FROM policy_refusals WHERE ts>=datetime('now','-7 days');" 2>/dev/null || true)"
+    # `|| true` is LOAD-BEARING, not defensive noise. Under `set -euo pipefail` a
+    # grep that matches nothing exits 1, pipefail propagates it, and set -e kills
+    # the whole verb — printing NOTHING and exiting 1. That happens on any box
+    # whose INSTALLED bundle predates DIVE-1922 (this greps $self, the resolved
+    # `5dive` on PATH, not the tree being built), so the scorecard would have
+    # died silently on every box until the new version rolled. A silent exit is
+    # the failure mode this whole verb exists to argue against.
+    # NB $self is the 5dive resolved on PATH, which is DELIBERATE and is not the
+    # bundle you may be running from a build tree: refusals are recorded by
+    # whatever CLI the box actually runs, so that is the artifact whose coverage
+    # the denominator has to describe. The marker below therefore NAMES that path
+    # — an earlier wording said "this 5dive build", which was false whenever the
+    # two differed, and a marker whose stated reason is wrong is its own small
+    # lie in the one metric that exists to argue against those.
+    refusal_sites="$( { grep -oE 'policy_refuse "[^"]+" [a-z0-9-]+' "$self" 2>/dev/null || true; } \
+                     | awk '{print $NF}' | sort -u | wc -l | tr -d ' ')"
+  fi
+
   local group_rows
   group_rows="$(db "SELECT ${group_expr}, COUNT(*) FROM tasks
                     WHERE status='done' AND kind='standard' AND done_at>=datetime('now','-7 days')
                     GROUP BY 1 ORDER BY 2 DESC, 1;" 2>/dev/null || true)"
 
   DIGEST_FILE="$work/digest.json" USAGE_FILE="$work/usage.json" DB_ROWS="$rows" GROUP_ROWS="$group_rows" \
+  REFUSALS="$refusals" REFUSAL_SITES="$refusal_sites" SELF_PATH="$self" \
   WINDOW="$window" BY="$by" AS_JSON="$json" python3 <<'SCOREPY'
 import os, json, sys
 
@@ -37435,8 +37551,26 @@ else:
 
 # 6/7. No source exists. Rendered as an explicit marker naming the task that
 #      would build it — telling the reader WHY beats telling them THAT.
-metrics.append(metric("policy-blocked action attempts", None,
-                      nodata="nothing records a refused attempt yet (DIVE-1922)"))
+# DIVE-1922 built the source (policy_refuse -> policy_refusals). A 0 is now a
+# real measurement rather than an absence — but only across the sites that are
+# INSTRUMENTED, so the count never ships without that denominator beside it.
+# Pre-DIVE-1922 stores have no table at all, which stays honest no-data.
+_ref = os.environ.get("REFUSALS", "").strip()
+_sites = os.environ.get("REFUSAL_SITES", "").strip()
+if _ref.isdigit() and _sites.isdigit() and int(_sites) > 0:
+    metrics.append(metric("policy-blocked action attempts", int(_ref),
+                          f"across {_sites} instrumented policy sites"))
+elif _sites.isdigit() and int(_sites) == 0:
+    # The store can record refusals but the RUNNING bundle has no instrumented
+    # sites (an installed CLI older than DIVE-1922). Rendering the raw count
+    # here would imply a denominator that does not exist. Say which of the two
+    # causes it actually is — a marker whose stated reason is wrong is its own
+    # small lie, and this metric exists to argue against exactly that.
+    metrics.append(metric("policy-blocked action attempts", None,
+                          nodata=f"the 5dive on PATH ({os.environ.get('SELF_PATH') or '5dive'}) has no instrumented policy sites — upgrade it to record refusals (DIVE-1922)"))
+else:
+    metrics.append(metric("policy-blocked action attempts", None,
+                          nodata="no policy_refusals table in this store — nothing has recorded a refused attempt (DIVE-1922)"))
 metrics.append(metric("autonomous rollback rate", None,
                       nodata="nothing records a self-revert yet (DIVE-1923)"))
 
