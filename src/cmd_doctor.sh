@@ -544,6 +544,49 @@ cmd_doctor() {
   # apply but services are only LISTED; controlled restarts run on the host/nightly
   # cron. Idempotent conf.d drop-in, same shape harden.sh ships to customer VMs.
   if (( run_host )); then
+    # --- disk headroom (DIVE-1966/1967) ---
+    #
+    # A full disk never announces itself: it surfaces as a failure in whatever
+    # touched it NEXT — an agent's memory write dying with ENOSPC mid-edit, a
+    # shell losing stdout because the harness could not write its temp dir. Both
+    # read as "that tool is broken", so the wrong thing gets debugged for an
+    # hour. This check is how the host reports exhaustion AS ITSELF.
+    local _seen=" " _p _mnt _free _pct _gb
+    for _p in / "$DEFAULT_WORKDIR" "$STATE_DIR" /var; do
+      [[ -d "$_p" ]] || continue
+      _mnt=$(disk_mount "$_p"); [[ -n "$_mnt" ]] || continue
+      [[ "$_seen" == *" ${_mnt} "* ]] && continue
+      _seen+="${_mnt} "
+      _free=$(disk_free_kb "$_p"); _pct=$(disk_used_pct "$_p")
+      _gb=$(disk_gb "${_free:-0}")
+      if [[ -z "$_free" ]]; then
+        doctor_add host "disk ${_mnt}" warn "could not read free space for ${_mnt} (df failed) — UNKNOWN, not fine"
+      elif (( _free < DISK_ERROR_KB )); then
+        doctor_add host "disk ${_mnt}" error "only ${_gb}G free on ${_mnt} (${_pct}% used) — agents are about to fail with ENOSPC in ways that read as 'that tool is broken'; reclaim: 5dive task reclaim --all --dry-run"
+      elif (( _free < DISK_WARN_KB )); then
+        doctor_add host "disk ${_mnt}" warn "${_gb}G free on ${_mnt} (${_pct}% used) — one npm install is ~1G; reclaim: 5dive task reclaim --all --dry-run"
+      else
+        doctor_add host "disk ${_mnt}" ok "${_gb}G free on ${_mnt} (${_pct}% used)"
+      fi
+    done
+
+    # --- worktree residue (report only, DIVE-1967) ---
+    #
+    # Counts, never sizes: `du` across a few hundred worktrees would make the
+    # dashboard's periodic `doctor --json` take minutes. Sizes come from
+    # `5dive task reclaim --all --dry-run`, which is a deliberate ask.
+    local _wt _nm _wtn=0 _nmn=0
+    while IFS= read -r _wt; do
+      [[ -n "$_wt" ]] || continue
+      _wtn=$((_wtn + 1))
+      while IFS= read -r _nm; do [[ -n "$_nm" ]] && _nmn=$((_nmn + 1)); done < <(wt_node_modules "$_wt")
+    done < <(wt_all)
+    if (( _nmn > 20 )); then
+      doctor_add host worktrees warn "${_wtn} worktrees under $WORKTREE_ROOT carry ${_nmn} node_modules trees (~1G each) — the DIVE-1966 shape; size them with: 5dive task reclaim --all --dry-run"
+    else
+      doctor_add host worktrees ok "${_wtn} worktrees under $WORKTREE_ROOT, ${_nmn} node_modules trees"
+    fi
+
     if ! command -v needrestart >/dev/null 2>&1 && [[ ! -d /etc/needrestart ]]; then
       doctor_add host needrestart ok "needrestart not installed — no auto-restart cascade risk"
     else
