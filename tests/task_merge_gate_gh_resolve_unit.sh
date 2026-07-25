@@ -16,8 +16,16 @@ SRC=src
 TMP="$(mktemp -d /tmp/gate-gh-resolve-unit.XXXXXX)"
 trap 'rm -rf "$TMP"' EXIT
 
-# --- stub gh: records argv + the inherited GH_TOKEN per call, answers auth/pr. --
+# --- stub sudo (DIVE-1935): the resolver's last resort is
+# `sudo -n -u claude gh auth token`, and real sudo resets PATH to secure_path — so
+# without this stub the empty-token cases below reached the HOST's real gh login,
+# printed a LIVE oauth token into this suite's argv log, and asserted against a
+# credential the fleet doesn't have. Always fails: no test here wants a real one.
 mkdir -p "$TMP/bin"
+printf '#!/usr/bin/env bash\nexit 1\n' >"$TMP/bin/sudo"
+chmod +x "$TMP/bin/sudo"
+
+# --- stub gh: records argv + the inherited GH_TOKEN per call, answers auth/pr. --
 cat >"$TMP/bin/gh" <<'STUB'
 #!/usr/bin/env bash
 # Log the full invocation and the GH_TOKEN it inherited so the test can assert
