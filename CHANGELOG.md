@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.15.7 — fix(task): `task need --json` emitted ZERO BYTES for the common case (DIVE-1930) (2026-07-25)
+
+`5dive task need --json` returned nothing at all — not a smaller object, not an error, zero bytes — for any gate filed without a matching precedent, which is the overwhelming majority of them. Measured on the rolled 0.15.6 binary.
+
+- **one field killed the whole envelope.** `precedent_ref:(($pr|select(length>0))|tonumber? // null)`: with no precedent `$pr` is empty, `select` yields **empty**, and because the `// null` bound to `tonumber?` instead of to the whole expression, `empty | (tonumber? // null)` stayed empty and propagated OUT of the object constructor. jq does not build a smaller object in that situation; it builds nothing.
+- **the discriminator is where `// null` BINDS, not whether a pipe follows `select`.** `(($x|select(length>0)) // null)` is safe and `(($x|select(length>0)|tonumber?) // null)` is safe — both enclose the empty. Only `(($x|select(length>0))|tonumber? // null)` leaves it uncaught. `map(select(...))` and `[ ... | select(...) ]` are comprehensions and never at risk. The fix is one closing paren.
+- **it was a ONE-line point fix, not a 19-site sweep.** The ticket was scoped from grep hits on `select(length>0)`; enumerating the 23 sites in `src/` by GUARD SHAPE instead found six safe `// null` forms, comprehensions, two streaming into `jq -cs` where empty correctly yields `[]`, one `map(select(...))|length` false positive, and exactly one defect. Editing the other eighteen would have been eighteen chances to introduce the bug being removed.
+- **the only case that worked was the rare one, which is why it survived.** A gate WITH a precedent rendered fine. Its regression test asserts both directions, so "fix" by deleting the field fails too — and against the pre-fix line 5 of 6 assertions fail, the sole pass being that rare path.
+- **a shape guard grep** rejects the dangerous binding coming back.
+- **the goal path could never have caught it**: it captured the envelope into a `gate_json` it never read. A capture that is never inspected reads at review time like a checked result and is not one. Now discarded explicitly, matching the objective path, so the exit status is visibly the only thing that call is trusted for.
+
 ## 0.15.6 — fix(gate): a gate filed by a channel-less agent reached NOBODY, and `task need` said OK (DIVE-1927) (2026-07-25)
 
 `dev3` (CHANNELS=none) filed a manual gate correctly. It pinged no one. The board showed `blocked`, the filer was told the gate was filed, and the only reason anyone found out is that dev3 messaged its lead out of band. Measured, not inferred: every gate from an agent WITH a channel had `gate_pinged_at` stamped within a second; the one from the agent WITHOUT a channel had it NULL.
