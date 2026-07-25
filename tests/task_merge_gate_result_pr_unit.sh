@@ -100,23 +100,48 @@ bad_t() { FAIL=$((FAIL+1)); printf 'FAIL - %s\n   %s\n' "$1" "${2:-}"; }
 # run `task done` capturing stdout+stderr and the exit code.
 run_done() { OUT=$(cmd_task_done "$@" 2>&1); RC=$?; }
 
-# --- 1. the reference extractor -----------------------------------------------
-got=$(_gate_pr_refs_from_text 'Merged as PR #156 into v0.15.4, see https://github.com/5dive-ai/5dive/pull/150 and #156 again')
-[[ "$got" == "150
-156" ]] && ok_t "extractor: url + hash refs, deduped, url first" \
-         || bad_t "extractor: url + hash refs, deduped" "got [$got]"
-got=$(_gate_pr_refs_from_text '# Heading
-DIVE-1922 shipped, PR abc#12x and PR 1234567 and PR#1234567')
-[[ -z "$got" ]] && ok_t "extractor: skips heading, glued alnum either side, 7-digit id" \
-               || bad_t "extractor: skips heading/glued/long" "got [$got]"
-# the precision case the retrospective sweep found: prose numbers are NOT PR refs.
-got=$(_gate_pr_refs_from_text 'arms-length payer #4 landed; column #25 renders; see issue #12 and (#9)')
-[[ -z "$got" ]] && ok_t "extractor: a bare '#N' with no PR context is NOT a PR ref" \
-               || bad_t "extractor: bare-hash must not match" "got [$got]"
-got=$(_gate_pr_refs_from_text 'opened pull request #77 and PRs 78')
-[[ "$got" == "77
-78" ]] && ok_t "extractor: 'pull request #N' and 'PRs N' both match" \
-       || bad_t "extractor: PR-context variants" "got [$got]"
+# --- 1. the reference extractor: NAMED equivalence fixtures --------------------
+# The extractor was rewritten from PCRE to POSIX ERE to delete a silent-empty
+# dependency on `grep -P`. That rewrite gave up \K, the lookbehind AND the
+# lookahead in one move — which is precisely the machinery that kept "payer #4" and
+# a column "#25" out. The canary (_gate_pr_refs_engine_ok) only proves the parser
+# RAN; these fixtures prove it is still CORRECT, and name which case died if a
+# future edit breaks one. Every case below is one Marcus asked to see pinned.
+extractor_case() { # <name> <expected-newline-joined> <text>
+  local name="$1" want="$2" text="$3" got
+  got=$(_gate_pr_refs_from_text "$text")
+  [[ "$got" == "$want" ]] && ok_t "extractor $name" \
+                          || bad_t "extractor $name" "want [$want] got [$got]"
+}
+# POSITIVES — each must yield the PR number.
+extractor_case 'positive: "Merged as PR #156" (the real DIVE-1922 result text)' \
+  '156' 'SHIPPED and VERIFIED on the rolled binary. Merged as PR #156 into v0.15.4.'
+extractor_case 'positive: a full https pull URL' \
+  '150' 'delivery: https://github.com/5dive-ai/5dive/pull/150 landed'
+extractor_case 'positive: "PRs 156" (plural, no hash)' \
+  '156' 'both PRs 156 are in'
+extractor_case 'positive: "pull request #156"' \
+  '156' 'opened pull request #156 against main'
+# NEGATIVES — each must yield NOTHING. These are the false-positive classes the
+# retrospective sweep surfaced on the real board.
+extractor_case 'negative: "arms-length payer #4" (prose count, not a PR)' \
+  '' 'arms-length payer #4 converted this week'
+extractor_case 'negative: a column labelled "#25"' \
+  '' 'landing_path is column #25 in the sheet'
+extractor_case 'negative: a markdown heading with no digits' \
+  '' '# Heading
+## Another heading'
+extractor_case 'negative: a 7-plus digit id' \
+  '' 'telegram user PR 1234567 and PR #12345678'
+extractor_case 'negative: a number glued to alnum on either side' \
+  '' 'ref PR abc#12x and PR 12ab and xPR 55'
+# ordering + dedup (url first, then PR-context refs, each once).
+extractor_case 'ordering: url refs precede hash refs, deduped' \
+  '150
+156' 'Merged as PR #156, see https://github.com/5dive-ai/5dive/pull/150 and PR #156 again'
+# the canary itself must pass on this host, or every empty result above is vacuous.
+_gate_pr_refs_engine_ok && ok_t "canary: the ref parser demonstrably RUNS on this host" \
+                        || bad_t "canary: ref parser broken" "engine self-test failed"
 
 # --- 2. THE DIVE-1922 REGRESSION: open PR named only in the result -------------
 seed FIX-1

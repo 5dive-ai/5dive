@@ -15,7 +15,13 @@ TMP="$(mktemp -d /tmp/gate-autodetect-unit.XXXXXX)"
 trap 'rm -rf "$TMP"' EXIT
 
 # --- stub gh: answers `pr list` from env-driven fixtures, records argv. --------
+# DIVE-1935: stub sudo fail-closed. The token resolver's last resort is
+# `sudo -n -u claude gh auth token`, and real sudo resets PATH to secure_path — so
+# an unstubbed harness reaches the HOST's real gh login and asserts against a live
+# credential the fleet does not have. No test here wants a real token.
 mkdir -p "$TMP/bin"
+printf '#!/usr/bin/env bash\nexit 1\n' >"$TMP/bin/sudo"
+chmod +x "$TMP/bin/sudo"
 cat >"$TMP/bin/gh" <<'STUB'
 #!/usr/bin/env bash
 printf 'ARGS=%s\n' "$*" >>"$GH_ARGS_LOG"
