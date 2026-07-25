@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.15.30
+
+- **CORRECTION to the 0.15.27 entry.** That entry (and its commit message) stated it
+  "records the deliberate ref-resolution coverage gap in the format-contract test".
+  It did not: the scripted edit was a guarded no-op, so the note reached no artifact
+  while both records claimed it had. The note is now actually in
+  `tests/heartbeat_gate_shipped_unit.sh` case 10. The commit-message half of that
+  false claim is immutable and is left standing rather than rewriting shared history
+  (DIVE-2014).
+- tests: assert field 3 is the COMMITTER date (`%ct`), not the author date (`%at`) —
+  salvaged from the superseded PR #181. With `%at`, a commit authored long ago but
+  merged AFTER the ask reads as predating it and is wrongly skipped, which is a
+  silence of the exact class the DIVE-2001 guard exists to prevent. Our squash-merge
+  flow makes the two coincide, so this was protected by intent and not by evidence;
+  a rebase-merge would separate them. Negative control: swapping `%ct`→`%at` reds
+  this assertion and exits 1 (it passed silently before).
+
 ## 0.15.29 — fix(push/gate): a DECISION gate cleared by its own routed reviewer could never authorize a delegated push (DIVE-2004) (2026-07-25)
 
 - **the refusal blamed the reviewer who had cleared it.** `_push_gate_check` accepts `human:*` or `lead:*`, but `lead:` is minted in exactly one place (`cmd_task_answer`) and only for `approval|manual|access`. A `--type=decision` gate answered by its own designated `routed_reviewer` is therefore stamped a bare `main`, push refuses it, and the message read *"cleared by unauthorized provenance main — delegated push requires a human or a lead-clear (its designated routed reviewer)"* when the designated routed reviewer was exactly who cleared it. Two allowlists written in two places are one contract; when the consumer refuses a state only the producer can mint, the error blames the actor. Same wrong-cause shape as DIVE-1970.

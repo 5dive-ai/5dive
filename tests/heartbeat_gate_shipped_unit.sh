@@ -179,6 +179,12 @@ grep -q "reason=epoch-unparseable" "$AUDIT_LOG_CALLS" \
   || bad_t "DIVE-2003: no audit row for the drift" "audit=[$(tr '\n' ',' <"$AUDIT_LOG_CALLS")]"
 
 # --- Case 10 (DIVE-2003): hermetic FORMAT CONTRACT on the real function ------
+# COVERAGE GAP, deliberate and recorded (DIVE-2014): _HB_GATE_SHIPPED_REF=HEAD here
+# because a throwaway repo has no origin/main. The CONTRACT pinned below (field 3
+# numeric, repo stem prepended, %ct not %at) is ref-INDEPENDENT — a --format string
+# cannot drift per-ref — so the only uncovered slice is ref RESOLUTION. Its read half
+# was closed on DIVE-2001 against the real repo (field 3 = 1785006908). Do NOT buy the
+# rest with a network dependency. Do not assume ref resolution is covered here.
 # The suite stubs _hb_repo_grep_ident, so production's --format string is
 # exercised by no test at all. This pins it without network or a real repo:
 # field 3 must be a unix epoch, which is exactly what the consumer awks out.
@@ -199,6 +205,26 @@ _HB_REPO_BASE="$TMP/fmt" _HB_GATE_SHIPPED_REF=HEAD \
 [[ -z "$miss" ]] \
   && ok_t "DIVE-2003: digit-boundary grep holds — DIVE-99900 does not match DIVE-999001" \
   || bad_t "DIVE-2003: prefix ident matched" "miss=[$miss]"
+
+# --- Case 11 (DIVE-2014, salvaged from the superseded PR #181) ---------------
+# %ct (COMMITTER date) not %at (author date). With %at, a commit authored long ago
+# but merged AFTER the ask would look like it predates the ask and be wrongly
+# skipped — a silence, which is the exact failure class this guard exists to stop.
+# On our squash-merge flow the two coincide, so until now this was protected by
+# INTENT and not by evidence; a rebase-merge would separate them. This is the
+# evidence. The commit below is authored in 2001 and committed in 2026.
+CTREPO="$TMP/ct/5dive-cli"; mkdir -p "$CTREPO"
+( cd "$CTREPO" && git init -q . \
+  && GIT_AUTHOR_DATE="2001-01-01T00:00:00Z" GIT_COMMITTER_DATE="2026-01-01T00:00:00Z" \
+     git -c user.email=t@t -c user.name=t commit -q --allow-empty -m "fix: DIVE-999002 landed" ) >/dev/null 2>&1
+_HB_REPO_BASE="$TMP/ct" _HB_GATE_SHIPPED_REF=HEAD \
+  cthit=$(_hb_repo_grep_ident_REAL 5dive-cli DIVE-999002)
+ctf3=$(awk '{print $3}' <<<"$cthit")
+at_epoch=978307200    # 2001-01-01Z, the AUTHOR date
+ct_epoch=1767225600   # 2026-01-01Z, the COMMITTER date
+[[ "$ctf3" == "$ct_epoch" ]] \
+  && ok_t "DIVE-2014: field 3 is the COMMITTER date (%ct), not the author date (%at)" \
+  || bad_t "DIVE-2014: field 3 is not %ct" "got [$ctf3]; %at would be $at_epoch, %ct is $ct_epoch"
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 # DIVE-2003 (olivia's reject): this MUST be the LAST command in the file. When the
 # tally printf was moved to the end, this line was left stranded mid-file and the
