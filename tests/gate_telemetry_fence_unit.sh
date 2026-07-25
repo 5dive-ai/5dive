@@ -41,6 +41,16 @@ for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh \
          lib/tasks_db.sh cmd_push.sh cmd_agent_pairing.sh cmd_task.sh; do
   source "$SRC/$f"
 done
+# DIVE-1968 suite guard, part 1 of 2: remember how long the production telemetry
+# file is BEFORE any case runs, so the check at the bottom scans only what THIS
+# run appended. Scanning the whole file would fail forever on a historical leak —
+# including the one this fix exists to stop, and the one a mutation-test of the
+# guard necessarily writes — leaving the suite permanently red for everyone and
+# teaching people to ignore it. A guard that cannot go green is not a guard.
+PRODLOG_REAL=/var/log/5dive/notify/gate-notify.log
+PRODLOG_OFFSET=0
+[[ -r "$PRODLOG_REAL" ]] && PRODLOG_OFFSET=$(wc -c <"$PRODLOG_REAL" 2>/dev/null || echo 0)
+
 STATE_DIR="$TMP"; TASKS_DIR="$STATE_DIR/tasks"; TASKS_DB="$TASKS_DIR/tasks.db"
 JSON_MODE=0
 mkdir -p "$TASKS_DIR"
@@ -104,14 +114,39 @@ _task_gate_delivery_log error "DIVE-7" "" "" "aimed at prod" >/dev/null 2>&1
 # --- 3. ON the prod store: unchanged behaviour -------------------------------
 # The fence is worthless if it also silences the real fleet. Declare the ACTIVE
 # store to be prod and assert the row comes back.
-reset; unset FIVEDIVE_GATE_NOTIFY_LOG
+#
+# This case USED to `unset FIVEDIVE_GATE_NOTIFY_LOG` and log ident DIVE-1956 with
+# detail "real production failure". With the store declared prod and no override,
+# `logf` falls back to the HARDCODED /var/log/5dive/notify/gate-notify.log — so the
+# test that proves the fence works wrote into the very dataset the fence exists to
+# protect, using a real board ident and a detail string built to be
+# indistinguishable from a genuine failure. Two such rows landed in production
+# telemetry on 2026-07-25 (16:09:58, 16:12:10) from a routine suite run, and the
+# same string accounts for DIVE-1956's rows earlier that day.
+# The override IS honoured on the prod store (store identity decides whether the
+# row is telemetry at all; the path only decides where it goes), so keeping it set
+# preserves every assertion here — the audit call and the absence of "withheld" are
+# what this case actually tests — while sending the row to our own file. The ident
+# and detail are now unmistakably fixture-shaped, because a row that reads like a
+# real failure is a trap for whoever greps this log next, wherever it lands.
+reset; export FIVEDIVE_GATE_NOTIFY_LOG="$TMP/prodstore.log"; : >"$FIVEDIVE_GATE_NOTIFY_LOG"
 export FIVEDIVE_PROD_TASKS_DB="$TASKS_DB"
-OUT=$(_task_gate_delivery_log error "DIVE-1956" "" "" "real production failure" 2>&1)
+OUT=$(_task_gate_delivery_log error "FIXTURE-PROD-1" "" "" "fixture: on-store row must still be written" 2>&1)
 if grep -q 'gate delivery' "$AUDIT_CALLS" && [[ "$OUT" != *"telemetry withheld"* ]]; then
   ok_t 'on the prod store the audit row is written exactly as before — no coverage lost'
 else
   bad_t 'prod store must still audit' "audit=[$(cat "$AUDIT_CALLS")] out=$OUT"
 fi
+# The row is written through printf %q, so every space in the detail comes back
+# backslash-escaped ("fixture:\ on-store\ row"). A plain grep for the prose never
+# matches — which would make the suite guard at the bottom pass VACUOUSLY, the
+# failure mode this whole ticket keeps producing. So both the positive assertion
+# here and the guard below go through ONE matcher, and this case is what proves
+# the matcher actually fires on a real row.
+_suite_rows_in() { tr -d '\\' <"$1" 2>/dev/null | grep -qE 'FIXTURE-PROD-1|captured locally|aimed at prod|fixture: on-store row'; }
+_suite_rows_in "$FIVEDIVE_GATE_NOTIFY_LOG" \
+  && ok_t 'the on-store row goes to OUR capture file, never the hardcoded prod path' \
+  || bad_t 'on-store row lands in the capture file' "log=[$(cat "$FIVEDIVE_GATE_NOTIFY_LOG")]"
 
 # --- 4. the escalate audit row carries the REAL rc ---------------------------
 # It was a hardcoded `1`, so rc=2 (a channel resolved, the Bot API send was simply
@@ -191,6 +226,29 @@ shape_case 'absent-from-org' 'ghost'  'a filer with NO agents_org row at all (th
 shape_case 'top-of-org'      'boss'   'a filer who IS in the chart with no manager (real, and only 1 of 28)'
 shape_case 'no-chain'        'worker' 'in the chart WITH a manager — the shape nobody named'
 shape_case 'no-filer'        ''       'no filer at all is its own answer, not silence'
+
+# --- SUITE GUARD: this file must never reach production telemetry -------------
+# Case 3 did exactly that for one release: it unset the override on a store it had
+# just declared to be prod, so the row took the hardcoded path. The fence's own
+# test is the last place that should leak, and "we read the cases carefully" is
+# not a mechanism — so measure it. Keyed on detail strings unique to THIS suite,
+# never on a byte count: the fleet writes to that file concurrently, and a size
+# comparison would flake on other agents' real rows. Deliberately excludes the old
+# "real production failure" string, which is already in the log historically and
+# would fail this guard on data we cannot retract.
+if [[ -r "$PRODLOG_REAL" ]]; then
+  # Only the bytes THIS run appended (offset captured at the top), through the
+  # same matcher case 3 just demonstrated on a real row — see _suite_rows_in.
+  tail -c "+$((PRODLOG_OFFSET + 1))" "$PRODLOG_REAL" >"$TMP/prodlog-delta" 2>/dev/null || : >"$TMP/prodlog-delta"
+  if _suite_rows_in "$TMP/prodlog-delta"; then
+    bad_t 'this suite leaked a row into production telemetry' \
+      "$(tr -d '\\' <"$TMP/prodlog-delta" | grep -nE 'FIXTURE-PROD-1|captured locally|aimed at prod|fixture: on-store row' | tail -2)"
+  else
+    ok_t 'no row from this suite reached the production gate-notify log'
+  fi
+else
+  ok_t 'production gate-notify log not present/readable here — nothing this suite could have leaked into'
+fi
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [[ $FAIL -eq 0 ]]
