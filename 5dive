@@ -18115,6 +18115,39 @@ _gate_pr_refs_from_text() {
   _gate_pr_refs_qualified_from_text "$1" | awk -F'|' '!seen[$2]++ { print $2 }'
 }
 
+# _gate_text_names_a_ref <text> — did this close mention a pull request AT ALL?
+#
+# DIVE-1955 (review, Marcus): this is the difference between the two states the gate
+# can be in when it does not produce a verdict, and they are NOT the same thing:
+#
+#   "I LOOKED AND COULD NOT TELL"   — a ref was named and could not be confirmed
+#                                     (ambiguous, unresolvable, no token, a partial
+#                                     scan, unreadable checks). This is a real
+#                                     non-verdict and the record must say so.
+#   "THERE WAS NOTHING TO LOOK AT"  — the close named no PR, no branch, no delivery.
+#                                     Research, comms, decisions, recaps. `unverified`
+#                                     is simply the wrong word: nothing was pending
+#                                     verification.
+#
+# Stamping the second case puts a scary merge-gate warning on the majority of closes
+# in the fleet within a day, and a marker on every row is a marker nobody reads —
+# destroying the exact property the marker was added to buy. Same failure as the
+# merged-red one: a signal that cries wolf is worth less than no signal.
+# Kept as an explicit named branch rather than implied by a missing condition,
+# because the next reader will otherwise collapse the two back together.
+#
+# Deliberately NOT built on `_gate_pr_refs_from_text`: one caller is the case where
+# that parser cannot run at all, so this uses bash's own `[[ =~ ]]` and a substring
+# test — no grep, no subprocess — and stays a genuinely independent mechanism.
+# Broader than the extractor on purpose: it answers "was a PR mentioned", not "which
+# PR", so an over-match here only risks an honest UNVERIFIED note, never a verdict.
+_gate_text_names_a_ref() {
+  local t="$1"
+  [[ "$t" == *"/pull/"* ]] && return 0
+  [[ "$t" =~ (^|[^A-Za-z0-9])([Pp][Rr][Ss]?|[Pp][Uu][Ll][Ll][[:space:]]+[Rr][Ee][Qq][Uu][Ee][Ss][Tt])[[:space:]]*#?[[:space:]]*[0-9] ]] && return 0
+  return 1
+}
+
 # DIVE-1955: the repos the merge-gate knows about, one slug per line, CLI first.
 # `_PUSH_DEFAULT_REPO` used to be the whole world: every bare `#N` resolved against
 # 5dive-ai/5dive, so lodar/5dive-api (== prod) and lodar/5dive-frontend had ZERO
@@ -18276,6 +18309,10 @@ _task_status_cmd() {
   # Same rule we shipped in DIVE-1869 — a check that could not reach its answer must
   # not render as one. Blocking nothing is fine; blessing by silence is not.
   local _mg_unverified=""
+  # ...and whether the gate had ANY subject to verify in the first place. See
+  # _gate_text_names_a_ref: an unverified reason only earns a mark on the record when
+  # something was actually pending verification.
+  local _mg_had_subject=0
   local -a positional=()
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -18369,6 +18406,7 @@ _task_status_cmd() {
       _branch=$(_push_branch_from_body "$_body")
     fi
     if [[ -n "$_dref" || -n "$_branch" ]]; then
+      _mg_had_subject=1     # a declared delivery IS something to verify
       if ! command -v gh >/dev/null 2>&1; then
         fail "$E_GENERIC" "$ident declared delivered work (${_dref:-branch $_branch}) but \`gh\` is unavailable to confirm it merged — install gh or close via the verifier on-box."
       fi
@@ -18517,7 +18555,7 @@ _task_status_cmd() {
       [[ -n "$_ghtok2" && $_sc_total -gt 0 && $_sc_ok -lt $_sc_total ]] && _scan_why="partial-repo-scan-${_sc_ok}-of-${_sc_total}"
       warn "$ident: merge-gate could not query GitHub ($_scan_why) — this close is UNVERIFIED, not verified-clean (DIVE-1935)."
       audit_log "task.merge-gate-unverified" ok 0 -- "$ident" "reason=$_scan_why"
-      _mg_unverified="${_mg_unverified:+$_mg_unverified; }repo scan did not run ($_scan_why)"
+      _mg_unverified="${_mg_unverified:+$_mg_unverified; }repo scan did not complete ($_scan_why)"
     fi
     # DIVE-1935: the PR reference the maker TYPED is a declaration too. DIVE-1922
     # closed with no delivery_ref and no Branch: line, so both bindings were empty
@@ -18528,6 +18566,14 @@ _task_status_cmd() {
     # make a task unclosable, per DIVE-1835), and an unresolvable ref is a loud note
     # rather than a block, so a non-PR "#12" and an offline box both stay closable.
     local _txt_open="" _txt_open_slug="" _txt_red="" _txt_unres="" _txt_amb=""
+    # DIVE-1955 (review, Marcus): decide "was a PR mentioned at all" UNCONDITIONALLY,
+    # before the token/parser checks below, because those are exactly the paths that
+    # cannot answer it later. Without this, a no-token close cannot distinguish a
+    # research task (nothing to verify) from a task whose result names a PR nobody
+    # could confirm — and it is the second one the record has to disclose.
+    local _mg_txt="$result
+$_body"
+    _gate_text_names_a_ref "$_mg_txt" && _mg_had_subject=1
     # An empty ref list is only trustworthy if the parser can actually run. Without
     # this, a grep that cannot execute makes the text-binding gate a no-op that
     # looks exactly like a clean close (the ticket's own defect, one layer down).
@@ -18537,8 +18583,7 @@ _task_status_cmd() {
       _mg_unverified="${_mg_unverified:+$_mg_unverified; }PR-reference parser unusable on this host"
     elif [[ -z "$_auto_hit" && $force_merge_gate -eq 0 && -n "$_ghtok2" ]]; then
       local _txt _qref _n=0 _st _rslug
-      _txt="$result
-$_body"
+      _txt="$_mg_txt"
       # DIVE-1955: refs are resolved QUALIFIED. A pull URL is checked in its own
       # repo; a bare `#N` is checked in the task's declared repo, or — when that is
       # unknown — bound only by ident evidence across the known repos and otherwise
@@ -18595,9 +18640,17 @@ $_body"
   # declined to make. The marker rides the result so the record itself carries it.
   # Deliberately NOT a block and NOT a refusal: `ambiguous` means we do not know, and
   # a close is still the right outcome. It just may not LOOK verified.
+  # And it is gated on `_mg_had_subject`: a close that named no PR, no branch and no
+  # delivery had NOTHING pending verification, so `unverified` is the wrong word for
+  # it — see _gate_text_names_a_ref for why that distinction is load-bearing. Those
+  # closes still get the warn and the audit row; what they do not get is a permanent
+  # scare-mark on a record that was never in doubt. The no-PR-at-all escape (the
+  # DIVE-1690 shape: work on a branch, result cites a commit, no PR ever opened) is
+  # real, but it belongs in the `merge-audit` sweep where someone is deliberately
+  # looking — not solved by making this marker louder.
   # Appended, never substituted, so the maker's own text is untouched; and only on a
   # real `done` (a cancel was never gated, so it has nothing to disclaim).
-  if [[ -n "$_mg_unverified" && "$verb" == "done" ]]; then
+  if [[ -n "$_mg_unverified" && $_mg_had_subject -eq 1 && "$verb" == "done" ]]; then
     local _mg_base="$result"
     (( want_result )) || _mg_base=$(db "SELECT COALESCE(result,'') FROM tasks WHERE id=${id};")
     result="${_mg_base}${_mg_base:+

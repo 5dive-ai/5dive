@@ -275,7 +275,7 @@ run_done DIVE-1672 --result='done'
 clear_fx; export GH_STUB_LIST_FAIL_5dive_api=1
 : >"$AUDIT_CALLS"
 seed PART-1
-run_done PART-1 --result='done'
+run_done PART-1 --result='shipped as PR #99'
 if [[ $RC -eq 0 && "$OUT" == *UNVERIFIED* && "$OUT" == *partial-repo-scan* ]] \
    && grep -q 'merge-gate-unverified' "$AUDIT_CALLS" \
    && [[ "$(db "SELECT COALESCE(result,'') FROM tasks WHERE ident='PART-1';")" == *"merge-gate: UNVERIFIED"* ]]; then
@@ -283,6 +283,58 @@ if [[ $RC -eq 0 && "$OUT" == *UNVERIFIED* && "$OUT" == *partial-repo-scan* ]] \
 else
   bad_t 'partial scan honesty' "rc=$RC out=$OUT audit=$(cat "$AUDIT_CALLS")"
 fi
+# ...and the SAME partial scan on a close that names no PR stays unstamped. A repo we
+# could not list is only news about a task that had something in it to find.
+seed PART-2
+run_done PART-2 --result='wrote up the digest'
+[[ $RC -eq 0 && "$(db "SELECT COALESCE(result,'') FROM tasks WHERE ident='PART-2';")" == 'wrote up the digest' ]] \
+  && ok_t 'a partial scan does NOT stamp a close that named no PR — nothing was pending' \
+  || bad_t 'partial scan on no-subject close' "rc=$RC result=[$(db "SELECT COALESCE(result,'') FROM tasks WHERE ident='PART-2';")]" 
+
+# --- 10c. "could not look AT ALL" warns + audits but does NOT stamp the row ------
+# Host-level unverifiability (no gh, no token, dead parser) is uniform across every
+# close on that box, so stamping it paints every row and the marker stops meaning
+# anything. Only a PARTIAL scan — some repos searched, a specific one not — is about
+# this particular close. CI caught this: with gh absent, EVERY task_core close got a
+# banner and the lifecycle assertion on a pristine result broke.
+clear_fx; unset GH_STUB_AUTH_TOKEN
+: >"$AUDIT_CALLS"
+seed NOSUBJ-1
+run_done NOSUBJ-1 --result='all good'
+res4=$(db "SELECT COALESCE(result,'') FROM tasks WHERE ident='NOSUBJ-1';")
+if [[ $RC -eq 0 && "$res4" == 'all good' && "$OUT" == *UNVERIFIED* ]] \
+   && grep -q 'reason=no-gh-token' "$AUDIT_CALLS"; then
+  ok_t 'a close that names NO PR is not stamped — nothing was pending verification'
+else
+  bad_t 'no-subject close must not be stamped' "rc=$RC result=[$res4] out=$OUT"
+fi
+# ...but the SAME unverifiable host DOES stamp when a PR was actually named. This is
+# the pair that makes the marker mean something: same failure, different subject.
+seed SUBJ-1
+run_done SUBJ-1 --result='shipped, merged as PR #6'
+res5=$(db "SELECT COALESCE(result,'') FROM tasks WHERE ident='SUBJ-1';")
+[[ $RC -eq 0 && "$res5" == *"merge-gate: UNVERIFIED"* && "$res5" == *"no-gh-token"* ]] \
+  && ok_t 'the same no-token host DOES stamp when the result names a PR it could not confirm' \
+  || bad_t 'named-ref close must be stamped' "rc=$RC result=[$res5]"
+# A declared delivery is a subject too, even with nothing parseable in the prose.
+seed SUBJ-2 'Branch: fix/whatever'
+run_done SUBJ-2 --result='landed'
+[[ $RC -ne 0 ]] \
+  && ok_t 'a declared Branch: is a subject — still fail-CLOSED with no token, not stamped-and-closed' \
+  || bad_t 'declared binding must stay fail-closed' "rc=$RC out=$OUT"
+export GH_STUB_AUTH_TOKEN="tok"
+# The grep-free predicate must agree with reality on both sides, including when the
+# real extractor cannot run — it is the fallback for exactly that case.
+sref_case() { # <expect 0|1> <text>
+  if _gate_text_names_a_ref "$2"; then got=1; else got=0; fi
+  [[ "$got" == "$1" ]] && ok_t "names-a-ref predicate: ${3}" \
+                       || bad_t "names-a-ref predicate: ${3}" "want $1 got $got on [$2]"
+}
+sref_case 1 'merged as PR #6'                              'bare "PR #6"'
+sref_case 1 'see https://github.com/lodar/5dive-api/pull/6' 'a pull URL'
+sref_case 1 'opened pull request 14 today'                  'spelled-out pull request'
+sref_case 0 'arms-length payer #4 converted'                'prose "#4" is not a PR mention'
+sref_case 0 'wrote the docs and shipped the digest'         'an ordinary no-PR result'
 
 # --- 10b. merged-RED is the LATEST RUN PER CHECK, not any failure in the rollup ----
 # Review catch (Marcus), verified against real timestamps on lodar/5dive-api#13:
