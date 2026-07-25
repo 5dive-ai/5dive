@@ -5054,15 +5054,16 @@ cmd_gate_proof() {
 
   if [[ "${1:-}" == "enforce" ]]; then
     require_root "gate-proof enforce"
+    local _ef; _ef=$(_gate_proof_enforce_file)
     case "${2:-status}" in
-      on)  : > "$GATE_PROOF_ENFORCE"; chmod 0644 "$GATE_PROOF_ENFORCE" 2>/dev/null || true
+      on)  : > "$_ef"; chmod 0644 "$_ef" 2>/dev/null || true
            ok "gate-proof enforcement ON: approval/secret/manual answers now require human evidence (a valid --human-proof nonce or a non-agent SUDO_UID)" ;;
-      off) rm -f "$GATE_PROOF_ENFORCE"
+      off) rm -f "$_ef"
            ok "gate-proof enforcement OFF: audit-only; approval/secret/manual answers allowed without human evidence" ;;
       status)
            local _e _k
            _gate_proof_enforced && _e=on || _e=off
-           [[ -s "$GATE_PROOF_KEY" ]] && _k=present || _k=absent
+           [[ -s "$(_gate_proof_key_file)" ]] && _k=present || _k=absent
            if (( JSON_MODE )); then
              ok "gate-proof: enforce=$_e key=$_k" '{enforce:$e, key:$k}' --arg e "$_e" --arg k "$_k"
            else

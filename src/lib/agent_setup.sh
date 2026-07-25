@@ -61,26 +61,36 @@ EXPLORE_AGENT_MD="/usr/local/lib/5dive/explore-agent.md"
 # customization still happens later via `telegram-access set`. Stored as a JSON
 # array of string ids. Best-effort: writes need root (the CLI runs under sudo
 # via shelld), and a failure never blocks create/pair.
-OPERATOR_STORE="${OPERATOR_STORE:-$STATE_DIR/operator-allow.json}"
+#
+# DIVE-1950 audit: same source-time-derived-from-STATE_DIR shape as the
+# gate-proof paths in tasks_db.sh, and NOT a no-op — a majority of the
+# isolated unit harnesses that source this file re-point STATE_DIR
+# immediately after the source loop, same as the gate harnesses did. Left
+# frozen at the load-time STATE_DIR, any test exercising _operator_record /
+# _operator_ids would read/write the LIVE host's operator-allow.json instead
+# of its own isolated one. Given the same lazy-getter treatment here.
+_operator_store_file() { printf '%s\n' "${OPERATOR_STORE:-$STATE_DIR/operator-allow.json}"; }
 
 _operator_record() {
   local id="${1:-}"
   [[ -n "$id" && "$id" != "0" ]] || return 0
   valid_telegram_chat_id "$id" || return 0
+  local store; store=$(_operator_store_file)
   local cur="[]"
-  [[ -r "$OPERATOR_STORE" ]] && cur=$(cat "$OPERATOR_STORE" 2>/dev/null || printf '[]')
+  [[ -r "$store" ]] && cur=$(cat "$store" 2>/dev/null || printf '[]')
   printf '%s' "$cur" | jq -e 'type=="array"' >/dev/null 2>&1 || cur="[]"
   local next
   next=$(jq -c --arg id "$id" '(. + [$id]) | unique' <<<"$cur" 2>/dev/null) || return 0
-  ( umask 027; printf '%s\n' "$next" > "$OPERATOR_STORE" ) 2>/dev/null || return 0
-  chmod 640 "$OPERATOR_STORE" 2>/dev/null || true
+  ( umask 027; printf '%s\n' "$next" > "$store" ) 2>/dev/null || return 0
+  chmod 640 "$store" 2>/dev/null || true
   return 0
 }
 
 _operator_ids() {
-  [[ -r "$OPERATOR_STORE" ]] || return 0
+  local store; store=$(_operator_store_file)
+  [[ -r "$store" ]] || return 0
   jq -r 'if type=="array" and length>0 then map(tostring) | join(",") else empty end' \
-    "$OPERATOR_STORE" 2>/dev/null || true
+    "$store" 2>/dev/null || true
 }
 
 preseed_claude_agent() {

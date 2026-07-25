@@ -1237,25 +1237,34 @@ indent2() { while IFS= read -r _l; do printf '  %s\n' "$_l"; done; }
 # Token: v1:<nonce>:<exp_unix>:<base64url HMAC-SHA256(key, "taskid:needtype:nonce:exp")>
 # Bound to the canonical task id + gate type; TTL <=120s; replay is bounded by the
 # gate's own one-shot need_answered_at (an answered gate can't be re-answered).
-GATE_PROOF_KEY="${STATE_DIR}/gate-proof.key"
-GATE_PROOF_ENFORCE="${STATE_DIR}/gate-proof.enforce"
+# DIVE-1950: resolved LAZILY, not bound at source time. Every isolated unit
+# harness sources this file (and STATE_DIR's process-default) FIRST and
+# re-points STATE_DIR AFTER, so a plain assignment here would freeze at the
+# load-time STATE_DIR forever — reading/writing the LIVE host's key and
+# enforce sentinel from inside what the harness believes is an isolated test.
+# These getters resolve at CALL time instead; an explicit GATE_PROOF_KEY /
+# GATE_PROOF_ENFORCE env override (the harnesses that already set one
+# directly) still wins, since `:-` only supplies the default when unset.
+_gate_proof_key_file()     { printf '%s\n' "${GATE_PROOF_KEY:-${STATE_DIR}/gate-proof.key}"; }
+_gate_proof_enforce_file() { printf '%s\n' "${GATE_PROOF_ENFORCE:-${STATE_DIR}/gate-proof.enforce}"; }
 GATE_PROOF_TTL=120
 
 # Provision the 0400 root:root key on first use (root only). Group-claude must NOT
 # read it (unlike the group-readable task db) or the bar-raise is moot.
 _gate_proof_ensure_key() {
-  [[ -s "$GATE_PROOF_KEY" ]] && return 0
+  local keyfile; keyfile=$(_gate_proof_key_file)
+  [[ -s "$keyfile" ]] && return 0
   [[ $EUID -eq 0 ]] || return 1
-  ( umask 077; openssl rand -hex 32 > "$GATE_PROOF_KEY" ) 2>/dev/null || return 1
-  chown root:root "$GATE_PROOF_KEY" 2>/dev/null || true
-  chmod 0400 "$GATE_PROOF_KEY" 2>/dev/null || true
-  [[ -s "$GATE_PROOF_KEY" ]]
+  ( umask 077; openssl rand -hex 32 > "$keyfile" ) 2>/dev/null || return 1
+  chown root:root "$keyfile" 2>/dev/null || true
+  chmod 0400 "$keyfile" 2>/dev/null || true
+  [[ -s "$keyfile" ]]
 }
 
 # HMAC-SHA256(key, payload) -> base64url (unpadded). hexkey avoids binary-in-argv.
 _gate_proof_hmac() {
   local payload="$1" key
-  key=$(cat "$GATE_PROOF_KEY" 2>/dev/null) || return 1
+  key=$(cat "$(_gate_proof_key_file)" 2>/dev/null) || return 1
   [[ -n "$key" ]] || return 1
   printf '%s' "$payload" \
     | openssl dgst -sha256 -mac HMAC -macopt "hexkey:$key" -binary 2>/dev/null \
@@ -1282,7 +1291,7 @@ _gate_proof_ct_equal() {
 # Enforcement is OFF until the sentinel exists. DIVE-519 ships DORMANT (audit-only):
 # flip on only after the plugin mint is confirmed live on the box, else live taps
 # that can't mint yet would fail closed. Root toggles it.
-_gate_proof_enforced() { [[ -f "$GATE_PROOF_ENFORCE" ]]; }
+_gate_proof_enforced() { [[ -f "$(_gate_proof_enforce_file)" ]]; }
 
 # ── DIVE-916: per-gate HUMAN nonce (close the sudo->--human forge) ────────────
 # Distinct from the DIVE-519 --proof token: that is a box-wide, TTL'd, HMAC proof
@@ -1369,7 +1378,7 @@ _gate_closure_payload() {
 # Sign the canonical payload. Needs the root-only key, so this only produces a
 # value in a root context; callers treat empty as "couldn't sign" (best-effort).
 _gate_closure_sign() {
-  [[ -s "$GATE_PROOF_KEY" ]] || return 1
+  [[ -s "$(_gate_proof_key_file)" ]] || return 1
   _gate_proof_hmac "$(_gate_closure_payload "$@")"
 }
 
