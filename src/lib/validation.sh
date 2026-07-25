@@ -172,3 +172,56 @@ remove_channel_secret() {
   rm -f "${CONNECTORS_DIR}/${kind}-${name}.env"
 }
 
+
+# --- node discovery (DIVE-1869) ---------------------------------------------
+# `sudo 5dive council|constitution|memory ...` runs with root's NON-LOGIN PATH, and on a
+# 5dive host node lives under the operator's nvm (`~/.nvm/versions/node/<ver>/bin`), not in
+# /usr/local/bin. So every sudo-gated node-backed op died on a bare "needs node on PATH"
+# that named neither where node is nor how to fix it — and council is sudo-gated by design
+# (it seals root-owned records), so this bit EVERY council init/convene run that way.
+#
+# Locate node ourselves and prepend its dir to PATH. Version-ordered (`sort -V`, LAST wins)
+# because an nvm dir holds several releases side by side and a plain glob picks the OLDEST
+# — the exact trap DIVE-1882 hit. Returns 1 (no output, no exit) when nothing is found, so
+# best-effort callers can degrade quietly and hard callers can `require_node`.
+#
+# Split out so the version-ordering is unit-testable against a fake nvm tree (the ordering is the
+# part that silently rots): echo the NEWEST executable node under <home>/.nvm/versions/node, or
+# nothing. `sort -V` + `tail -1` — a plain glob is lexicographic, so v9.9.9 would beat v10.0.0.
+_nvm_newest_node() {
+  local home="$1" c cand=""
+  [[ -d "$home/.nvm/versions/node" ]] || return 1
+  while IFS= read -r c; do
+    [[ -x "$c" ]] && cand="$c"
+  done < <(printf '%s\n' "$home"/.nvm/versions/node/*/bin/node 2>/dev/null | sort -V)
+  [[ -n "$cand" ]] || return 1
+  printf '%s' "$cand"
+}
+
+ensure_node_on_path() {
+  command -v node >/dev/null 2>&1 && return 0
+  local d c cand="" home
+  for d in /usr/local/bin /usr/bin /opt/homebrew/bin /snap/bin; do
+    [[ -x "$d/node" ]] && { cand="$d"; break; }
+  done
+  if [[ -z "$cand" ]]; then
+    # The sudo caller's own nvm first (that's whose node the operator meant), then the
+    # host's primary operator, then root's.
+    for home in ${SUDO_USER:+"/home/$SUDO_USER"} /home/claude /root "${HOME:-/root}"; do
+      c="$(_nvm_newest_node "$home")" || continue
+      [[ -n "$c" ]] && { cand="$(dirname "$c")"; break; }
+    done
+  fi
+  [[ -n "$cand" ]] || return 1
+  PATH="$cand:$PATH"; export PATH
+  return 0
+}
+
+# Hard requirement: locate node or die with the EXACT remediation, never a dead end.
+require_node() {
+  ensure_node_on_path && return 0
+  local what="${1:-this command}"
+  fail "$E_NOT_INSTALLED" "$what needs node on PATH and none was found (searched /usr/local/bin, /usr/bin, and ~/.nvm/versions/node for ${SUDO_USER:-root}/claude/root). Under \`sudo\`, root's PATH does not inherit nvm. Fix it with either:
+  sudo env PATH=\"\$(dirname \"\$(readlink -f \"\$(command -v node)\")\"):\$PATH\" 5dive <cmd>   # run the inner part as the user who HAS node
+  sudo ln -s \"\$(command -v node)\" /usr/local/bin/node                                    # make it permanent for every sudo-gated op"
+}

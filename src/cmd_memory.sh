@@ -113,7 +113,7 @@ _memory_search() {
     shift
   done
   [ -n "$query" ] || { _memory_usage; fail "$E_USAGE" "memory search: a query is required"; }
-  command -v node >/dev/null 2>&1 || fail "$E_GENERIC" "memory search needs node on PATH"
+  require_node "memory search"
   case "$store" in all|mine|wiki) : ;; *) fail "$E_VALIDATION" "bad --store '$store' (all | mine | wiki)" ;; esac
   if [ -n "$roots" ] && { [ "$store" != "all" ] || [ -n "$agent" ]; }; then
     fail "$E_USAGE" "--roots overrides scoping — don't combine it with --store/--agent"

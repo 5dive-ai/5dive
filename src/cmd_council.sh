@@ -49,7 +49,7 @@ _council_constitution_path() {
 # engine uses. Kept as a function (not a source-time global) so test/runtime
 # STATE_DIR overrides resolve correctly.
 _council_constitution_json() {
-  command -v node >/dev/null 2>&1 || return 1
+  ensure_node_on_path || return 1
   local dir rc=0
   dir="$(mktemp -d -t 5dive-constitution.XXXXXX)" || return 1
   _council_write_runtime "$dir"
@@ -1160,6 +1160,18 @@ export function canonicalTranscript(rec) {
     const r1 = rec.round1Votes.slice().sort((a, b) => (norm(a.seat) < norm(b.seat) ? -1 : 1))
     for (const v of r1) L.push(`round1 ${norm(v.seat)}: ${norm(v.vote != null ? v.vote : v.choice)} :: ${norm(v.rationale)}`)
   }
+  // DIVE-1869: SEAL which seats we never REACHED. The abstain/capture-failure distinction has to
+  // survive on the DURABLE record, not just in the run — a later reader of a receipt is otherwise
+  // back to guessing whether "0 of 6 voted" was a council that said nothing or a rail that was
+  // down, which is the whole defect. Recording it only in the (unsealed) verdict JSON would leave
+  // it strippable, so it goes inside the signed bytes.
+  // CONDITIONAL line (CNCL-19 precedent): emitted only when a seat was actually unreached, so a
+  // healthy convene — and every pre-DIVE-1869 receipt — seals byte-identically. Sorted for a
+  // stable seal regardless of dispatch completion order.
+  const unreached = (rec.votes || []).filter(v => v && v.capture === false)
+  if (unreached.length) {
+    L.push(`unreached: ${unreached.map(v => `${norm(v.seat)}:${norm(v.abstainKind || 'unknown')}`).slice().sort().join(',')}`)
+  }
   const vd = rec.verdict || {}
   const t = vd.tally || {}
   L.push(`verdict: ${norm(vd.recommendation != null ? vd.recommendation : vd.choice)} conf=${Number(vd.confidence)} tally=a${Number(t.approve) || 0}/r${Number(t.reject) || 0}/e${Number(t.escalate) || 0} escalated=${!!vd.escalated}`)
@@ -1610,10 +1622,37 @@ ${fmt}`
 // ABSTAIN — counted in the roster denominator (seatCount) but not in approve/reject/escalate.
 export function normalizeSeatVote(seat, res) {
   if (!res || typeof res !== 'object' || !VOTE_TOKENS.includes(res.vote)) {
-    return { seat: seat.id, vote: 'abstain', rationale: (res && res.rationale) ? String(res.rationale) : 'abstained (no reply / unparseable)' }
+    return { seat: seat.id, vote: 'abstain', abstainKind: 'unusable', capture: false,
+             rationale: (res && res.rationale) ? String(res.rationale) : 'abstained (no reply / unparseable)' }
   }
   const rationale = (res.rationale && String(res.rationale).trim()) || `(${res.vote})`
-  return { seat: seat.id, vote: res.vote, rationale }
+  const row = { seat: seat.id, vote: res.vote, rationale }
+  // DIVE-1869: the dispatch adapters distinguish "the seat declined to vote" from "we never
+  // reached the seat" (capture === false + an abstainKind). That distinction MUST survive
+  // normalization — before this, the tag lived only inside the rationale prose, so the tally,
+  // the verdict and the sealed receipt could not tell a permissions/transport failure apart
+  // from a genuine unanimous abstention. Additive only: canonicalTranscript seals
+  // seat/vote/rationale, so a receipt stays byte-identical.
+  if (res.abstainKind != null) row.abstainKind = String(res.abstainKind)
+  if (res.capture === false) row.capture = false
+  return row
+}
+
+// DIVE-1869: split the non-votes into "the seat abstained" vs "we never heard the seat".
+// A row is a CAPTURE FAILURE when the adapter explicitly flagged capture === false (delivery
+// refused, ask exec failed, ballot could not be minted, dispatch threw). Anything else — a
+// deadline miss, an off-format reply, a seat that voted `abstain` on purpose — is a real
+// abstention. Used to refuse a verdict that is really a plumbing outage in disguise.
+export function captureAudit(votes) {
+  const rows = votes || []
+  const abstains = rows.filter(v => v.vote === 'abstain')
+  const failed = abstains.filter(v => v.capture === false)
+  return {
+    seatCount: rows.length,
+    abstains: abstains.length,
+    captureFailed: failed.length,
+    captureFailedSeats: failed.map(v => ({ seat: v.seat, kind: v.abstainKind || 'unknown', why: v.rationale })),
+  }
 }
 
 // Gather one round of votes from real seats via the injected dispatch adapter, in parallel. Each
@@ -1622,7 +1661,10 @@ export function normalizeSeatVote(seat, res) {
 async function dispatchRound(seats, ctx, seatVote) {
   return Promise.all(seats.map(async (s) => {
     try { return normalizeSeatVote(s, await seatVote(s, ctx)) }
-    catch (e) { return { seat: s.id, vote: 'abstain', rationale: `dispatch error: ${String(e && e.message || e)}` } }
+    // DIVE-1869: an adapter that THREW never reached the seat — tag it a capture failure, not a
+    // silent abstention (the whole roster throwing is exactly the missing-grant outage).
+    catch (e) { return { seat: s.id, vote: 'abstain', abstainKind: 'dispatch-error', capture: false,
+                         rationale: `CAPTURE FAILED (not an abstention) — dispatch error: ${String(e && e.message || e)}` } }
   }))
 }
 
@@ -1652,8 +1694,19 @@ export function synthesizeNarrative(votes, counted) {
 // Assemble the convene/standing verdict from the deterministic count + a narrative (synthesized
 // in fleet mode, chair-written on the seam). Carries the quorum bookkeeping onto the verdict so
 // the disposition + receipt reflect liveness.
-export function buildConveneVerdict(counted, narr) {
+export function buildConveneVerdict(counted, narr, votes) {
+  // DIVE-1869: carry the capture audit onto the verdict. `deliveryFailure` is the loud case — the
+  // convene is INQUORATE and EVERY non-vote is a transport/permissions failure, i.e. we never heard
+  // the council at all. The CLI refuses to emit/seal such a run (a normal-looking "Inquorate: 0 of N
+  // voted" receipt is indistinguishable from a legitimate unanimous abstention, which is the worst
+  // thing a governance engine can record). A convene with even ONE real vote or one genuine
+  // abstention is a real, if thin, deliberation and still seals.
+  const audit = captureAudit(votes)
+  const deliveryFailure = !counted.quorumMet && audit.captureFailed > 0 && audit.captureFailed === audit.abstains
   return {
+    captureFailed: audit.captureFailed,
+    captureFailedSeats: audit.captureFailedSeats,
+    deliveryFailure,
     recommendation: counted.recommendation, tally: counted.tally, threshold: counted.threshold,
     seatCount: counted.seatCount, quorum: counted.quorum, quorumMet: counted.quorumMet, votesCast: counted.votesCast,
     // CNCL-11: surface the applied decision class + who recused so the sealed receipt's verdict is
@@ -1806,7 +1859,7 @@ async function runConvene(input, deps, h) {
       finalVotes = carryForwardVotes(round1Votes, rebuttalVotes)
     }
     const counted = tallyVotes(finalVotes, tallyOpts)
-    verdict = buildConveneVerdict(counted, synthesizeNarrative(finalVotes, counted))
+    verdict = buildConveneVerdict(counted, synthesizeNarrative(finalVotes, counted), finalVotes)
   } else {
     // Standalone seam: one modelCall answers each seat. Blind round 1 (seatPrompt embeds NO
     // other seat's take), then an adversarial rebuttal that sees the round-1 votes.
@@ -1820,7 +1873,7 @@ async function runConvene(input, deps, h) {
     }
     const counted = tallyVotes(finalVotes, tallyOpts)
     const narr = await chairNarrative(modelCall, question, finalVotes)
-    verdict = buildConveneVerdict(counted, narr)
+    verdict = buildConveneVerdict(counted, narr, finalVotes)
   }
   // CNCL-19: attach the deterministic precedent citation to the verdict (followed vs departed) so
   // it surfaces on the receipt/dashboard. Additive on the verdict; sealed via a CONDITIONAL
@@ -2214,7 +2267,8 @@ export function dispatchBallotVote(opts = {}) {
     if (E.seatIsHuman(seat)) {
       const chat = E.resolveSeatChat(seat)
       // Fail CLOSED on an unbound human seat: never deliver to nowhere, never silently drop the ballot.
-      if (!chat) return { vote: 'abstain', rationale: `${seat.id} human ballot: seat has no bound chat/principal — fail-closed, ballot NOT delivered (deadline/no-vote)` }
+      if (!chat) return { vote: 'abstain', abstainKind: 'undeliverable', capture: false,
+                          rationale: `CAPTURE FAILED (not an abstention) — ${seat.id} human ballot: seat has no bound chat/principal — fail-closed, ballot NOT delivered` }
       // One-time DIVE-916 nonce: the RAW token rides ONLY in the buttons' callback_data. The task body
       // records only its sha256 DIGEST, so a reader of the ballot task can never forge/replay the tap.
       const nonce = randomBytes(16).toString('hex')
@@ -2232,7 +2286,8 @@ export function dispatchBallotVote(opts = {}) {
         taskId = env && env.data && (env.data.ident || env.data.id)
         if (taskId == null) throw new Error('task add returned no id')
       } catch (e) {
-        return { vote: 'abstain', rationale: `${seat.id} human ballot: could not mint task (${clip(e)}) (deadline/no-vote)` }
+        return { vote: 'abstain', abstainKind: 'ballot-mint-failed', capture: false,
+                 rationale: `CAPTURE FAILED (not an abstention) — ${seat.id} human ballot: could not mint task (${clip(e)})` }
       }
       // callback_data = cvote:<=12-char ballot-ref>:<a|r|e>:<nonce>. The ballot-ref is this ballot TASK
       // id — at DISPATCH time the sealed convene digest does not exist yet, so the task id is the stable
@@ -2267,7 +2322,11 @@ export function dispatchBallotVote(opts = {}) {
       taskId = env && env.data && (env.data.ident || env.data.id)
       if (taskId == null) throw new Error('task add returned no id')
     } catch (e) {
-      return { vote: 'abstain', rationale: `${seat.id} ballot: could not mint task (${clip(e)}) (deadline/no-vote)` }
+      // DIVE-1869: the ballot never REACHED the seat (task add refused/failed) — a delivery
+      // failure, not a seat that declined. Tagged so the verdict can refuse rather than seal a
+      // clean-looking inquorate receipt.
+      return { vote: 'abstain', abstainKind: 'ballot-mint-failed', capture: false,
+               rationale: `CAPTURE FAILED (not an abstention) — ${seat.id} ballot: could not mint task (${clip(e)})` }
     }
     // DIVE-1739: agent seats get a mid-window pane nudge if they haven't voted (nudgeInfo carries the
     // registry target + a one-line reminder). Human seats fall through with no nudgeInfo (they tap).
@@ -2429,6 +2488,28 @@ function preflightSeats(seats) {
   if (unresolved.length) {
     die(`council pre-flight FAILED: ${unresolved.length} seat(s) resolve to no known registry agent — ${unresolved.map(u => `${u.id}→${u.agent}`).join(', ')}. Fix the bench seat's \`agent\` field / alias or re-seed. Known agents: ${[...known].sort().join(', ')}.`, 6)
   }
+}
+
+// DIVE-1869 pre-flight: can this process actually DELIVER to a seat at all? The `agent ask` rail
+// injects via the root-scoped `5dive agent _deliver` grant. Run as a non-root caller that holds no
+// grant, EVERY dispatch fails instantly ("sudo: a password is required") and — before DIVE-1869 —
+// was folded into a plain ABSTAIN, so a permissions outage sealed as a normal-looking
+// "Inquorate: 0 of N voted" verdict. We now refuse BEFORE dispatching rather than after.
+// Probe, don't guess a tier: root always delivers; otherwise ask sudo whether THIS caller may run
+// the _deliver grant (`sudo -n -l <bin> agent _deliver`, never prompts, fail-closed). A full-trust
+// (NOPASSWD:ALL) caller matches too, so the probe auto-adapts with no tier list to maintain.
+function canDeliver() {
+  if (typeof process.getuid === 'function' && process.getuid() === 0) return true
+  const bin = process.env.COUNCIL_5DIVE_BIN || '/usr/local/bin/5dive'
+  try {
+    execFileSync('sudo', ['-n', '-l', bin, 'agent', '_deliver'],
+      { encoding: 'utf-8', timeout: 15000, stdio: ['ignore', 'ignore', 'ignore'] })
+    return true
+  } catch { return false }
+}
+function preflightDelivery() {
+  if (canDeliver()) return
+  die("council pre-flight FAILED: this caller cannot reach the seat-delivery rail — `5dive agent _deliver` is root-scoped and `sudo -n` is denied here, so EVERY seat ballot would fail on delivery and be recorded as an abstain (a permissions outage sealing as a unanimous abstention). Re-run the convene as root (`sudo 5dive council convene ...`), or re-provision this agent so it holds the `_deliver` grant. Refusing to convene.", 6)
 }
 
 // DIVE-1739: seat LIVENESS map — registry name -> health {asleep,deaf,...} from `agent list --json`.
@@ -2674,7 +2755,14 @@ async function cmdConvene() {
   const standalone = !!flag('standalone') || !!process.env.COUNCIL_STANDALONE
   // CNCL-16: on the real-agents dispatch path, fail closed at convene START if any seat resolves
   // to no known registry agent. Skipped for the standalone seam and for COUNCIL_MOCK (offline).
-  if (!standalone && !process.env.COUNCIL_MOCK) preflightSeats(seats)
+  if (!standalone && !process.env.COUNCIL_MOCK) {
+    preflightSeats(seats)
+    // DIVE-1869: the pane-scrape ask rail delivers through the root-scoped `_deliver` grant, so a
+    // grant-less caller cannot reach ANY seat. Refuse up front. (The default CNCL-18 ballot rail
+    // writes to the task queue instead and needs no grant — its own delivery failures are tagged
+    // capture-failed and caught by the deliveryFailure refusal below.)
+    if (askRailSelected()) preflightDelivery()
+  }
   // DIVE-1739 (gate answer A): a FULL-QUORUM (constitutional) motion needs every seat to cast — one
   // dozing seat auto-abstains and 6/6 becomes structurally unreachable. Derive whether THIS convene
   // requires full quorum (the motion class wins when present, else the --class/bench class), and if so
@@ -2705,13 +2793,44 @@ async function cmdConvene() {
   let result
   try { result = await E.runCouncil(input, deps) }
   catch (e) { die(String(e && e.message || e), 1) }
+  // DIVE-1869: the convene is inquorate AND every single non-vote was a delivery/transport failure
+  // — we never heard the council. Emitting here would seal a receipt that reads exactly like a
+  // legitimate unanimous abstention. Refuse LOUDLY, name the seats and the reason, and seal
+  // nothing: an operator must be able to tell a broken rail from a council that said nothing.
+  const vf = result.verdict || {}
+  if (vf.deliveryFailure) {
+    const who = (vf.captureFailedSeats || []).map(x => `${x.seat} [${x.kind}]`).join(', ')
+    const why = (vf.captureFailedSeats || []).map(x => x.why).filter(Boolean)[0] || 'no reply captured'
+    // DIVE-1869: a refusal that exists only as stderr is not a record — the run leaves NOTHING
+    // sealed (by design), so without this the fleet has no durable trace that a convene was
+    // attempted and could not reach anyone. Same reasoning as the DIVE-1935 merge-gate fail-open:
+    // the branch that declines to act is exactly the one that must be auditable. bash reads this
+    // sink after the non-zero exit and emits the audit row (it cannot see our stderr, and buffering
+    // stderr to capture it would break live progress on a long convene).
+    const sink = process.env.COUNCIL_REFUSAL_SINK
+    if (sink) {
+      try {
+        fs.writeFileSync(sink, JSON.stringify({
+          reason: 'delivery-failure', seatCount: vf.seatCount, captureFailed: vf.captureFailed,
+          seats: (vf.captureFailedSeats || []).map(x => x.seat),
+          kinds: [...new Set((vf.captureFailedSeats || []).map(x => x.kind))],
+          detail: String(why).slice(0, 300),
+        }))
+      } catch { /* best-effort: the loud refusal below is unaffected */ }
+    }
+    die(`council convene FAILED TO DELIVER — 0 of ${vf.seatCount} seats were reached (${vf.captureFailed} capture failure(s): ${who}). This is a TRANSPORT/PERMISSIONS outage, NOT an abstention, so no verdict was reached and NO receipt was sealed. First failure: ${why}. Fix the rail (root/_deliver grant, agent running, task queue writable) and re-convene.`, 7)
+  }
   out({
     council: input.councilName, mode: result.mode, question,
     seats: result.seats.map(s => s.id),
     dispatch: standalone ? 'standalone-seam' : 'real-agents',
     verdict: result.verdict,
     disposition: E.dispositionOf(result.verdict),
-    votes: (result.votes || []).map(v => ({ seat: v.seat, vote: v.vote, rationale: v.rationale })),
+    // DIVE-1869: abstainKind/capture ride along so a reader of the receipt/dashboard can tell a
+    // seat that abstained from a seat we never reached. Additive — canonicalTranscript seals only
+    // seat/vote/rationale, so the sealed bytes are byte-identical to a pre-DIVE-1869 receipt.
+    votes: (result.votes || []).map(v => ({ seat: v.seat, vote: v.vote, rationale: v.rationale,
+      abstainKind: v.abstainKind, capture: v.capture })),
     round1Votes: result.round1Votes ? result.round1Votes.map(v => ({ seat: v.seat, vote: v.vote, rationale: v.rationale })) : undefined,
     rebuttalVotes: result.rebuttalVotes ? result.rebuttalVotes.map(v => ({ seat: v.seat, vote: v.vote, rationale: v.rationale })) : undefined,
     constitution: { source: constitution.source, valid: constitution.valid, path: constitution.path },
@@ -3978,6 +4097,28 @@ _council_gate_json() {
     '{ident:$ident, ask:$ask, type:$type, tier:$tier, recommend:$recommend, options:$options, live:$live}'
 }
 
+# DIVE-1869: turn a convene REFUSAL into one durable audit row. A convene that could not reach its
+# seats seals NOTHING by design, so without this the attempt leaves no trace at all — stderr is not
+# a record. Same posture as the DIVE-1935 merge-gate fail-open: the branch that declines to act is
+# precisely the one that has to be auditable. Split out as a named function so the row's SHAPE is
+# testable against an isolated AUDIT_LOG, without a live convene. Never fails the caller.
+_council_audit_refusal() {
+  local sink="$1" rc="$2"
+  [[ -n "$sink" && -s "$sink" ]] || return 0
+  local reason seats kinds unreached detail
+  reason="$(jq -r '.reason // "unknown"' "$sink" 2>/dev/null || echo unknown)"
+  seats="$(jq -r '(.seats // []) | join(",")' "$sink" 2>/dev/null || echo "")"
+  kinds="$(jq -r '(.kinds // []) | join(",")' "$sink" 2>/dev/null || echo "")"
+  unreached="$(jq -r '"\(.captureFailed // 0)/\(.seatCount // 0)"' "$sink" 2>/dev/null || echo "")"
+  detail="$(jq -r '(.detail // "") | .[0:200]' "$sink" 2>/dev/null || echo "")"
+  # NOTE: audit args carry NO leading `--`. audit_log builds the row with `jq -cn … --args`, and jq
+  # rejects a positional that starts with `--` — the whole jq call then fails and `|| return 0`
+  # swallows it, so a dash-prefixed arg silently emits NO ROW AT ALL. Caught by this ticket's own
+  # test; it is the same silent-empty shape the fix is about. Every existing call site is dash-less.
+  audit_log "council convene" error "$rc" -- "refused=${reason}" "unreached=${unreached}" \
+    "seats=${seats}" "kinds=${kinds}" "detail=${detail}"
+}
+
 # Run the sealed primary-council convene on a question, return the --json envelope.
 _council_convene_json() {
   local q="$1"; shift
@@ -4637,7 +4778,9 @@ _council_schedule() {
 }
 
 cmd_council() {
-  command -v node >/dev/null 2>&1 || fail "$E_GENERIC" "5dive council needs node on PATH"
+  # DIVE-1869: council is sudo-gated (it seals root-owned records) and root has no nvm node —
+  # locate it instead of dying on a bare "needs node on PATH".
+  require_node "5dive council"
   command -v jq   >/dev/null 2>&1 || fail "$E_GENERIC" "5dive council needs jq on PATH"
   local sub="${1:-}"; [[ $# -gt 0 ]] && shift || true
   case "$sub" in
@@ -4820,10 +4963,21 @@ cmd_council() {
     fi
   fi
 
+  # DIVE-1869: a convene that could not REACH its seats refuses and seals NOTHING — so without a
+  # durable trace the attempt vanishes entirely (stderr is not a record). cli.mjs drops the refusal
+  # detail in this sink; we turn it into one audit row. Same posture as the DIVE-1935 merge-gate
+  # fail-open: the branch that declines to act is the one that must be auditable. A sink we cannot
+  # write, or a refusal for any other reason, just yields no row — never a failed convene.
+  local _refusal; _refusal="$(mktemp -t 5dive-council-refusal.XXXXXX 2>/dev/null || echo "")"
   local raw
-  raw="$(node "$dir/cli.mjs" convene "$@" "${veto_args[@]}" "${precedent_args[@]}" ${drift_flag} --constitution-path="$(_council_constitution_path)" --registry="$COUNCIL_REGISTRY" --genesis-exists="$genesis_exists" --stamped-at="$stamped")"; local _rc=$?
+  raw="$(COUNCIL_REFUSAL_SINK="$_refusal" node "$dir/cli.mjs" convene "$@" "${veto_args[@]}" "${precedent_args[@]}" ${drift_flag} --constitution-path="$(_council_constitution_path)" --registry="$COUNCIL_REGISTRY" --genesis-exists="$genesis_exists" --stamped-at="$stamped")"; local _rc=$?
   [[ -n "$_pp_tmp" ]] && rm -f "$_pp_tmp" 2>/dev/null || true
-  (( _rc == 0 )) || return $_rc
+  if (( _rc != 0 )); then
+    _council_audit_refusal "$_refusal" "$_rc"
+    rm -f "$_refusal" 2>/dev/null || true
+    return $_rc
+  fi
+  rm -f "$_refusal" 2>/dev/null || true
 
   # Seal the receipt canonical at the root HMAC rail — a standalone engine has no
   # key, so the seal (via gate-proof) is what makes the verdict tamper-evident. The

@@ -11,7 +11,7 @@ if ! command -v node >/dev/null 2>&1; then
 fi
 
 rc=0
-for h in council_engine_unit.mjs council_cli_contract.mjs council_dispatch_unit.mjs council_cosign_unit.mjs council_constitution_unit.mjs council_liveness_unit.mjs; do
+for h in council_engine_unit.mjs council_cli_contract.mjs council_dispatch_unit.mjs council_cosign_unit.mjs council_constitution_unit.mjs council_liveness_unit.mjs council_capture_unit.mjs; do
   echo "=== tests/$h"
   if ! node "tests/$h"; then echo "FAILED: tests/$h"; rc=1; fi
 done
@@ -73,6 +73,13 @@ if ! bash "tests/council_ballot_e2e.sh"; then echo "FAILED: tests/council_ballot
 # wrong nonce / miss / agent-ballot). Builds a throwaway ./5dive (BUILD_OUT) so it GATES in CI.
 echo "=== tests/council_ballot_tap_e2e.sh"
 if ! bash "tests/council_ballot_tap_e2e.sh"; then echo "FAILED: tests/council_ballot_tap_e2e.sh"; rc=1; fi
+
+# DIVE-1869: the CAPTURE-FAILURE e2e — a convene that could not REACH its seats fails LOUD (names
+# the seats, seals nothing) instead of recording an all-abstain inquorate verdict, the ask-rail
+# refuses up front without the delivery grant, and node is located under sudo. Offline (stub fleet +
+# stub sudo); builds a throwaway ./5dive so it GATES in CI.
+echo "=== tests/council_capture_e2e.sh"
+if ! bash "tests/council_capture_e2e.sh"; then echo "FAILED: tests/council_capture_e2e.sh"; rc=1; fi
 
 # CNCL-23: the scheduled-convene PRODUCT e2e — proves `5dive council schedule {add,ls,show,rm,run}`
 # route through cmd_council() on the BUILT binary, that add emits (but with --no-cron never installs)

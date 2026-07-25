@@ -1064,7 +1064,7 @@ _hb_reclaim() {
 _hb_recall_cite() {
   local name="$1" query="$2" k="${3:-3}"
   [[ -n "$query" ]] || { echo ""; return 0; }
-  command -v node >/dev/null 2>&1 || { echo ""; return 0; }
+  ensure_node_on_path || { echo ""; return 0; }
   local out=""
   # --agent scopes the target agent's own 0600 store (we run as root here) plus
   # the shared wiki (store=all default) — exactly the agent's own recall surface.
@@ -1600,7 +1600,7 @@ _HB_COUNCIL_ROT="${COUNCIL_ROT_TRIAGE:-off}"
 _hb_council_rot_sweep() {
   [[ "$_HB_COUNCIL_ROT" == "on" || "$_HB_COUNCIL_ROT" == "1" ]] || return 0
   [[ -f "${STATE_DIR}/council/genesis.json" ]] || return 0   # no seeded council -> nothing to convene
-  command -v node >/dev/null 2>&1 || return 0
+  ensure_node_on_path || return 0
   # Fleet-wide throttle: skip if a rot sweep ran within the last 6h.
   local last; last="$(db "SELECT value FROM task_prefs WHERE key='council_rot_swept_at';" 2>/dev/null)"
   if [[ -n "$last" ]]; then

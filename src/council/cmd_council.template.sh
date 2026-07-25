@@ -49,7 +49,7 @@ _council_constitution_path() {
 # engine uses. Kept as a function (not a source-time global) so test/runtime
 # STATE_DIR overrides resolve correctly.
 _council_constitution_json() {
-  command -v node >/dev/null 2>&1 || return 1
+  ensure_node_on_path || return 1
   local dir rc=0
   dir="$(mktemp -d -t 5dive-constitution.XXXXXX)" || return 1
   _council_write_runtime "$dir"
@@ -847,6 +847,28 @@ _council_gate_json() {
     '{ident:$ident, ask:$ask, type:$type, tier:$tier, recommend:$recommend, options:$options, live:$live}'
 }
 
+# DIVE-1869: turn a convene REFUSAL into one durable audit row. A convene that could not reach its
+# seats seals NOTHING by design, so without this the attempt leaves no trace at all — stderr is not
+# a record. Same posture as the DIVE-1935 merge-gate fail-open: the branch that declines to act is
+# precisely the one that has to be auditable. Split out as a named function so the row's SHAPE is
+# testable against an isolated AUDIT_LOG, without a live convene. Never fails the caller.
+_council_audit_refusal() {
+  local sink="$1" rc="$2"
+  [[ -n "$sink" && -s "$sink" ]] || return 0
+  local reason seats kinds unreached detail
+  reason="$(jq -r '.reason // "unknown"' "$sink" 2>/dev/null || echo unknown)"
+  seats="$(jq -r '(.seats // []) | join(",")' "$sink" 2>/dev/null || echo "")"
+  kinds="$(jq -r '(.kinds // []) | join(",")' "$sink" 2>/dev/null || echo "")"
+  unreached="$(jq -r '"\(.captureFailed // 0)/\(.seatCount // 0)"' "$sink" 2>/dev/null || echo "")"
+  detail="$(jq -r '(.detail // "") | .[0:200]' "$sink" 2>/dev/null || echo "")"
+  # NOTE: audit args carry NO leading `--`. audit_log builds the row with `jq -cn … --args`, and jq
+  # rejects a positional that starts with `--` — the whole jq call then fails and `|| return 0`
+  # swallows it, so a dash-prefixed arg silently emits NO ROW AT ALL. Caught by this ticket's own
+  # test; it is the same silent-empty shape the fix is about. Every existing call site is dash-less.
+  audit_log "council convene" error "$rc" -- "refused=${reason}" "unreached=${unreached}" \
+    "seats=${seats}" "kinds=${kinds}" "detail=${detail}"
+}
+
 # Run the sealed primary-council convene on a question, return the --json envelope.
 _council_convene_json() {
   local q="$1"; shift
@@ -1506,7 +1528,9 @@ _council_schedule() {
 }
 
 cmd_council() {
-  command -v node >/dev/null 2>&1 || fail "$E_GENERIC" "5dive council needs node on PATH"
+  # DIVE-1869: council is sudo-gated (it seals root-owned records) and root has no nvm node —
+  # locate it instead of dying on a bare "needs node on PATH".
+  require_node "5dive council"
   command -v jq   >/dev/null 2>&1 || fail "$E_GENERIC" "5dive council needs jq on PATH"
   local sub="${1:-}"; [[ $# -gt 0 ]] && shift || true
   case "$sub" in
@@ -1689,10 +1713,21 @@ cmd_council() {
     fi
   fi
 
+  # DIVE-1869: a convene that could not REACH its seats refuses and seals NOTHING — so without a
+  # durable trace the attempt vanishes entirely (stderr is not a record). cli.mjs drops the refusal
+  # detail in this sink; we turn it into one audit row. Same posture as the DIVE-1935 merge-gate
+  # fail-open: the branch that declines to act is the one that must be auditable. A sink we cannot
+  # write, or a refusal for any other reason, just yields no row — never a failed convene.
+  local _refusal; _refusal="$(mktemp -t 5dive-council-refusal.XXXXXX 2>/dev/null || echo "")"
   local raw
-  raw="$(node "$dir/cli.mjs" convene "$@" "${veto_args[@]}" "${precedent_args[@]}" ${drift_flag} --constitution-path="$(_council_constitution_path)" --registry="$COUNCIL_REGISTRY" --genesis-exists="$genesis_exists" --stamped-at="$stamped")"; local _rc=$?
+  raw="$(COUNCIL_REFUSAL_SINK="$_refusal" node "$dir/cli.mjs" convene "$@" "${veto_args[@]}" "${precedent_args[@]}" ${drift_flag} --constitution-path="$(_council_constitution_path)" --registry="$COUNCIL_REGISTRY" --genesis-exists="$genesis_exists" --stamped-at="$stamped")"; local _rc=$?
   [[ -n "$_pp_tmp" ]] && rm -f "$_pp_tmp" 2>/dev/null || true
-  (( _rc == 0 )) || return $_rc
+  if (( _rc != 0 )); then
+    _council_audit_refusal "$_refusal" "$_rc"
+    rm -f "$_refusal" 2>/dev/null || true
+    return $_rc
+  fi
+  rm -f "$_refusal" 2>/dev/null || true
 
   # Seal the receipt canonical at the root HMAC rail — a standalone engine has no
   # key, so the seal (via gate-proof) is what makes the verdict tamper-evident. The

@@ -68,7 +68,7 @@ CONSTITUTION_HELP
 # loadConstitution parser); bash supplies the ROOT-sealed digests + the chain-verify passthrough (it
 # owns the gate-proof key). Read-only: needs no root, never mutates.
 _constitution_show() {
-  command -v node >/dev/null 2>&1 || fail "$E_NOT_INSTALLED" "constitution show needs node on PATH"
+  require_node "constitution show"
   local a
   for a in "$@"; do
     case "$a" in
@@ -131,7 +131,7 @@ _constitution_show_human() {
 # existing unsealed file unless --force. (v0.15 enforcement reads hard_gates independent of any
 # Council; that wiring is out of scope here — this is the seed + the guard.)
 _constitution_init() {
-  command -v node >/dev/null 2>&1 || fail "$E_NOT_INSTALLED" "constitution init needs node on PATH"
+  require_node "constitution init"
   local force=0 a
   for a in "$@"; do
     case "$a" in
@@ -196,7 +196,7 @@ _constitution_init() {
 # Both write paths are root-owned (COUNCIL_DIR + constitution.yaml) => sudo (inherited from init/amend).
 _constitution_set() {
   local verb="${1:-set}"; [[ $# -gt 0 ]] && shift
-  command -v node >/dev/null 2>&1 || fail "$E_NOT_INSTALLED" "constitution $verb needs node on PATH"
+  require_node "constitution $verb"
   command -v jq   >/dev/null 2>&1 || fail "$E_NOT_INSTALLED" "constitution $verb needs jq on PATH"
   local file="" principal="" dry=0 a
   for a in "$@"; do
