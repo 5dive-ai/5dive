@@ -183,20 +183,26 @@ run_done FIX-3 --result='landed in PR #149'
   || bad_t "merged-but-red must refuse" "rc=$RC out=$OUT"
 
 # --- 5. prose safety: these must all CLOSE -----------------------------------
+# DIVE-1965 re-phrased three of these to assert a DELIVERY ("merged as", "landed
+# in"). They used to read as citations ("same defect class as PR #150", "reported in
+# PR #12"), which the gate now deliberately does not judge at all — so as written
+# they would have passed for the wrong reason and stopped covering the MERGED+green,
+# CLOSED-unmerged and unresolvable branches they exist for. The citation shapes are
+# not lost: they are the subject of tests/task_merge_gate_delivered_vs_cited_unit.sh.
 seed OK-1
-run_done OK-1 --result='Same defect class as PR #150, which is merged and green.'
+run_done OK-1 --result='Merged as PR #150, green.'
 [[ $RC -eq 0 && "$(statusof OK-1)" == "done" ]] \
   && ok_t "a MERGED+green reference closes normally" \
   || bad_t "merged reference must close" "rc=$RC status=$(statusof OK-1) out=$OUT"
 
 seed OK-2
-run_done OK-2 --result='Superseded by the rewrite; PR #148 was abandoned.'
+run_done OK-2 --result='Landed in PR #148, after the earlier attempt was abandoned.'
 [[ $RC -eq 0 && "$(statusof OK-2)" == "done" ]] \
   && ok_t "a CLOSED-unmerged reference never makes a task unclosable (DIVE-1835 rule)" \
   || bad_t "closed-unmerged reference must close" "rc=$RC status=$(statusof OK-2) out=$OUT"
 
 seed OK-3
-run_done OK-3 --result='Fixes the crash reported in PR #12.'
+run_done OK-3 --result='Landed in PR #12.'
 if [[ $RC -eq 0 && "$(statusof OK-3)" == "done" && "$OUT" == *UNVERIFIED* ]]; then
   ok_t "an unresolvable reference closes but says UNVERIFIED out loud"
 else

@@ -952,6 +952,93 @@ _gate_pr_refs_from_text() {
   _gate_pr_refs_qualified_from_text "$1" | awk -F'|' '!seen[$2]++ { print $2 }'
 }
 
+# _gate_delivery_refs_from_text <text> — of the refs this prose names, which ones
+# does it claim THIS TASK DELIVERED? Emits the qualified `<slug>|<n>` subset.
+#
+# DIVE-1965. The gate's subject used to be "a PR mentioned in the result/body", and
+# that predicate cannot tell "I shipped this" from "I am writing about this". Review,
+# triage, audit, hygiene and coordination closes cite other tasks' pull requests as a
+# matter of course. While off-repo bare refs silently failed to resolve the confusion
+# was COSMETIC — a cited PR produced a wrong marker sentence and nothing worse. Once a
+# bare `#N` resolves in the repo it actually lives in (DIVE-1963), a cited OPEN PR
+# lands on the REFUSAL path (`done-with-open-pr-in-result`), and every close that so
+# much as mentions another task's open PR becomes unclosable without
+# `--force-merge-gate`. That is a fleet-wide close blocker on exactly the task class
+# that does the most cross-referencing, so this has to land FIRST.
+#
+# This is the THIRD state, after DIVE-1955's pair:
+#   "I LOOKED AND COULD NOT TELL"  — a non-verdict about this task's delivery.
+#   "THERE WAS NOTHING TO LOOK AT" — the close named no PR at all.
+#   "I AM TALKING ABOUT SOMETHING I DID NOT SHIP" — a ref was named, and it is not
+#                                    this task's to answer for. Not a non-verdict:
+#                                    there is no question here, so no disclosure.
+#
+# Marcus's design steer, and the reason this is not just a looser mention-predicate:
+# **delivery must come from a STRUCTURED, INTENTIONAL signal, never from "a number
+# appeared in the text".** The strongest two live elsewhere and already win — a
+# `delivery_ref` and a `Branch:` line both route to the DECLARED gate above and never
+# reach this code. What is left for prose is a deliberate claim, so the DEFAULT here
+# is CITED and delivery has to be asserted:
+#
+#   1. a `Delivered:` / `Delivery:` line — the structured escape, sibling of the
+#      DIVE-1462 `Branch:` and DIVE-1955 `Repo:` lines. Everything it names is a
+#      delivery, no phrasing heuristic involved.
+#   2. a shipping verb ADJACENT to the reference: "merged as PR #6", "landed in
+#      #13", "shipped as https://.../pull/99", "PR #6 was merged". Anchored with `$`
+#      against the text immediately before the ref (and a narrow `is|was <verb>`
+#      after it) so it is adjacency, not "the word merged occurs somewhere".
+#
+# The failure modes are deliberately asymmetric. Mis-reading a citation as a delivery
+# re-creates the fleet-wide blocker this exists to prevent; mis-reading a delivery as
+# a citation costs coverage on ONE narrow shape — a close with no `delivery_ref`, no
+# `Branch:`, no open PR naming the ident (the mandatory auto-detect scan is
+# untouched and still fires), whose prose names its own merged PR with no shipping
+# verb anywhere near it. That slip is ANNOUNCED at the call site, with both escapes
+# named, rather than being silent.
+#
+# Negations are rejected explicitly ("not merged yet — PR #6", "unmerged"), and the
+# verb needs a left word boundary so "unmerged" does not read as "merged".
+# Line-scoped: a cue on the previous line does not carry, which keeps the window
+# rule stateable in one sentence. `tolower` for matching only — it preserves length,
+# so offsets still index the ORIGINAL line and a URL's owner/repo keeps its case.
+_gate_delivery_refs_from_text() {
+  printf '%s' "$1" | awk '
+    BEGIN {
+      RE   = "(https://github\\.com/[a-z0-9._-]+/[a-z0-9._-]+/pull/[0-9]+[a-z0-9]*)|((^|[^a-z0-9])(prs?|pull request)[[:space:]]*#?[[:space:]]*[0-9]+[a-z0-9]*)"
+      VERB = "(merged|shipped|landed|delivered|delivery|released|rolled)"
+      PRE  = "(^|[^a-z0-9])" VERB "([[:space:]]+(as|in|via|by|to|into|is|was))?[^[:alnum:]]*$"
+      NEG  = "(^|[^a-z0-9])(not|never|no|un)[- ]?" VERB "([[:space:]]+(as|in|via|by|to|into|is|was))?[^[:alnum:]]*$"
+      OWN  = "(^|[^a-z0-9])(my|our)[[:space:]]*$"
+      POST = "^[[:space:]]*(is|was|were|are)[[:space:]]+" VERB
+    }
+    # same normalisation as the extractor: trailing digit-run, glued alnum and
+    # 7+ digit ids rejected, a URL carries its own owner/repo, a bare ref none.
+    function refkey(m,   n, k, p) {
+      n = m; sub(/^.*[^0-9]/, "", n)
+      if (n !~ /^[0-9]{1,6}$/) return ""
+      if (tolower(m) ~ /https:\/\/github\.com\//) {
+        k = m; sub(/^.*https:\/\/github\.com\//, "", k)
+        split(k, p, "/"); return p[1] "/" p[2] "|" n
+      }
+      return "|" n
+    }
+    {
+      line = $0; low = tolower(line)
+      dline = (low ~ /^[[:space:]]*(delivered|delivery|delivers|ships?|shipped)[[:space:]]*:/)
+      pos = 1
+      while (match(substr(low, pos), RE)) {
+        st = pos + RSTART - 1; ln = RLENGTH
+        key = refkey(substr(line, st, ln))
+        if (key != "") {
+          pre = tolower(substr(line, 1, st - 1)); post = tolower(substr(line, st + ln))
+          if (dline || (pre ~ PRE && pre !~ NEG) || pre ~ OWN || post ~ POST)
+            if (!seen[key]++) print key
+        }
+        pos = st + ln
+      }
+    }'
+}
+
 # _gate_text_names_a_ref <text> — did this close mention a pull request AT ALL?
 #
 # DIVE-1955 (review, Marcus): this is the difference between the two states the gate
@@ -1402,7 +1489,7 @@ _task_status_cmd() {
     # safe: OPEN only (a "superseded by #150" mention of an abandoned PR must never
     # make a task unclosable, per DIVE-1835), and an unresolvable ref is a loud note
     # rather than a block, so a non-PR "#12" and an offline box both stay closable.
-    local _txt_open="" _txt_open_slug="" _txt_red="" _txt_unres="" _txt_amb=""
+    local _txt_open="" _txt_open_slug="" _txt_red="" _txt_unres="" _txt_amb="" _txt_cited=""
     # DIVE-1955 (review, Marcus): decide "was a PR mentioned at all" UNCONDITIONALLY,
     # before the token/parser checks below, because those are exactly the paths that
     # cannot answer it later. Without this, a no-token close cannot distinguish a
@@ -1421,6 +1508,13 @@ $_body"
     elif [[ -z "$_auto_hit" && $force_merge_gate -eq 0 && -n "$_ghtok2" ]]; then
       local _txt _qref _n=0 _st _rslug
       _txt="$_mg_txt"
+      # DIVE-1965: which of these refs does the close claim to have DELIVERED? Only
+      # those are this task's to answer for. A bare `|N` entry means the delivery was
+      # asserted on a bare "PR #N", which the extractor may have upgraded to a
+      # qualified `slug|N` via a URL elsewhere in the same text — so membership is
+      # "exact match OR same number asserted bare", never a number-only match on the
+      # cited side. Computed ONCE, outside the loop: it is a pure text pass.
+      local _deliv; _deliv=$(_gate_delivery_refs_from_text "$_txt")
       # DIVE-1955: refs are resolved QUALIFIED. A pull URL is checked in its own
       # repo; a bare `#N` is checked in the task's declared repo, or — when that is
       # unknown — bound only by ident evidence across the known repos and otherwise
@@ -1430,6 +1524,14 @@ $_body"
       # bless a bad one. Ambiguous blocks nothing and blesses nothing.
       while IFS= read -r _qref; do
         [[ -n "$_qref" ]] || continue
+        # DIVE-1965: a ref this close only REPORTS ON is not judged at all — not
+        # resolved (no API call), not refused, and not stamped. There is no question
+        # about it for the gate to answer or decline: it is another task's delivery.
+        # Skipped BEFORE the cap so five cited PRs cannot crowd out the real one.
+        if ! printf '%s\n' "$_deliv" | grep -qxF -e "$_qref" -e "|${_qref#*|}"; then
+          _txt_cited="${_txt_cited:+$_txt_cited,}${_qref#*|}"
+          continue
+        fi
         # Bounded: 5 refs max per close, and the drop is announced — a silent cap
         # would read as "all references checked" when it wasn't.
         if (( _n >= 5 )); then warn "$ident: merge-gate checked the first 5 PR references named in the result/body; later ones were NOT checked."; break; fi
@@ -1451,6 +1553,17 @@ $_body"
         warn "$ident: AMBIGUOUS PR reference(s) — $_txt_amb. A bare number does not identify a pull request across our repos and this task declares none, so the merge state is UNVERIFIED rather than guessed (DIVE-1955). Cite the full pull URL or add a \`Repo: <owner>/<repo>\` line to the body."
         audit_log "task.merge-gate-ambiguous" ok 0 -- "$ident" "refs=$_txt_amb"
         _mg_unverified="${_mg_unverified:+$_mg_unverified; }AMBIGUOUS PR reference(s) — $_txt_amb"
+      fi
+      # DIVE-1965: say which refs were set aside and WHY, with both escapes named.
+      # Deliberately a warn + audit row and NOT an UNVERIFIED stamp: the record only
+      # discloses non-verdicts about THIS task's delivery, and a cited PR was never
+      # that. Stamping here would put the marker back on every audit/triage/review
+      # close — the wallpaper failure DIVE-1955 spent a review pass deleting. It is
+      # also the guard on this ticket's one coverage cost: if the maker's own
+      # delivery landed in here, this line is where they see it.
+      if [[ -n "$_txt_cited" ]]; then
+        warn "$ident: merge-gate treated PR reference(s) #${_txt_cited//,/, #} as CITED, not delivered — nothing binds them to this task, so their merge state was NOT checked (DIVE-1965). If one of them IS this task's delivery, bind it (\`task deliver $ident --pr=<url>\`) or say so (\"merged as PR #N\", or a \`Delivered: <url>\` line)."
+        audit_log "task.merge-gate-reported-on" ok 0 -- "$ident" "refs=$_txt_cited"
       fi
     fi
     if [[ -n "$_txt_open" && $force_merge_gate -eq 0 ]]; then

@@ -238,7 +238,11 @@ clear_fx
 export GH_STUB_PR_5dive_6="$MERGED_OK"
 export GH_STUB_PR_5dive_api_6="$OPEN_RED"
 seed URL-1
-run_done URL-1 --result='see https://github.com/lodar/5dive-api/pull/6'
+# DIVE-1965: the prose says "merged as", not "see" — the gate now only judges a ref
+# the close claims to have DELIVERED, and this case is about WHICH REPO the ref binds
+# to, not about the delivered/cited split. Stated so the fixture is not read as
+# accidental. The "see <url>" phrasing is exercised on purpose in the 1965 suite.
+run_done URL-1 --result='merged as https://github.com/lodar/5dive-api/pull/6'
 [[ $RC -ne 0 && "$OUT" == *"lodar/5dive-api"* ]] \
   && ok_t 'a pull URL is judged in the repo it names, never against the default slug' \
   || bad_t 'url-qualified ref' "rc=$RC status=$(statusof URL-1) out=$OUT"
