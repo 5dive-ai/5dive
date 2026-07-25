@@ -3215,6 +3215,13 @@ cmd_task_need() {
       if [[ -n "$_es_reviewer" && "$tier_arg" == "2" \
             && ( "$type" == "decision" || "$type" == "approval" ) ]]; then
         warn "explicit --tier=2 kept this eng-ship-shaped gate hard-human, so it pings the paired human instead of $_es_reviewer. Drop --tier=2 if a lead can clear it (ship/merge/deploy calls are lead-clearable by design); keep it only for a genuine brand/money/destructive call."
+        # The warn corrects the NEXT filer; this row lets us MEASURE whether the
+        # habit is real. The standing remedy for this very bug was "pin
+        # --tier=2", so every agent carrying that advice may now escalate routine
+        # ship gates past their lead to the paired human. Audit the branch that
+        # declines to act, not just the one that acts — otherwise the only signal
+        # is the human complaining about gate spam.
+        audit_log "task.gate-tier2-pin-escalated" ok 0 -- "$ident" "filer=$(task_actor "$from")" "lead=$_es_reviewer" "type=$type"
       elif [[ -n "$_es_reviewer" && ( "$type" == "decision" || "$type" == "approval" ) ]]; then
         tier=1; _eng_ship=1
       fi

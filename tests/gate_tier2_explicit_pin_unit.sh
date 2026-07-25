@@ -214,5 +214,33 @@ OUT=$(cmd_task_need DIVE-940 --type=decision --tier=2 --from=dev \
   && ok_t "recorded JSON envelope reports tier 2 for a pinned eng-ship-TITLE gate" \
   || bad_t "envelope tier 2" "got '$(printf '%s' "$OUT" | jq -r '.data.tier // "?"')'"
 
+# =============================================================================
+# AUDIT ROW (Marcus, DIVE-1957 review) — the veto must be MEASURABLE
+# =============================================================================
+# The warn corrects the next filer; the audit row tells us whether the habit is
+# real (the standing remedy for this bug WAS "pin --tier=2", so agents carrying
+# that advice may now escalate routine ship gates past their lead). Audit the
+# branch that DECLINES to act, not just the one that acts.
+AUDIT_FILE="$TMP/audit.log"
+audit_log() { printf '%s\n' "$1" >>"$AUDIT_FILE"; }
+audit_reset() { : >"$AUDIT_FILE"; }
+
+# 16: a pinned eng-ship gate that escalates past the lead records the row.
+route_reset; audit_reset; seed DIVE-950 'LAND the dive-1957 branch: settle MERGE order'
+cmd_task_need DIVE-950 --type=decision --tier=2 --from=dev \
+  --ask="Which wording ships on the public page?" --options="A|B" --recommend="A" >/dev/null 2>&1
+grep -q '^task.gate-tier2-pin-escalated$' "$AUDIT_FILE" \
+  && ok_t "pinned eng-ship escalation records an audit row (measurable, not just a warn)" \
+  || bad_t "audit row on pinned escalation" "rows='$(tr '\n' ',' <"$AUDIT_FILE")'"
+
+# 17: the un-pinned downgrade does NOT record it — the row means "a pin escalated
+#     past a lead", so it must not fire on the normal lead-routed path.
+route_reset; audit_reset; seed DIVE-951 'LAND the dive-1957 branch: settle MERGE order'
+cmd_task_need DIVE-951 --type=decision --from=dev \
+  --ask="Which wording ships on the public page?" --options="A|B" --recommend="A" >/dev/null 2>&1
+grep -q '^task.gate-tier2-pin-escalated$' "$AUDIT_FILE" \
+  && bad_t "no audit row on the un-pinned downgrade" "rows='$(tr '\n' ',' <"$AUDIT_FILE")'" \
+  || ok_t "un-pinned eng-ship downgrade records NO pin-escalation row"
+
 printf '\n%s\n' "PASS=$PASS FAIL=$FAIL"
 [[ "$FAIL" == "0" ]]
