@@ -40,13 +40,67 @@ _emit_audit_line() {
   local line="$1"
   [[ -n "$line" ]] || return 0
   if [[ $EUID -eq 0 || -w "$AUDIT_LOG" ]]; then
-    printf '%s\n' "$line" >> "$AUDIT_LOG" 2>/dev/null || true
+    printf '%s\n' "$line" >> "$AUDIT_LOG" 2>/dev/null \
+      || _audit_note_drop "$line" "direct-append-failed"
   else
-    printf '%s\n' "$line" | sudo -n /usr/local/bin/5dive _audit_append >/dev/null 2>&1 || true
+    printf '%s\n' "$line" | sudo -n /usr/local/bin/5dive _audit_append >/dev/null 2>&1 \
+      || _audit_note_drop "$line" "privileged-fallback-failed"
   fi
+  return 0
+}
+
+# _audit_note_drop <ndjson-line> <reason> — leave a trace when an audit row is LOST.
+#
+# DIVE-1989. Both append paths above used to end in a bare `|| true`, so a failed
+# write left no evidence ANYWHERE: the row was simply absent, and "absent from the
+# audit log" became indistinguishable from "the action never happened". That is the
+# absent-vs-forbidden conflation aimed at our own evidence base — DIVE-1988 spent a
+# day unable to decide whether three DIVE-1801 rows were dropped by the privileged
+# fallback or were fixture reuse, and no amount of re-reading the audit log could
+# settle it, because a drop is exactly what the log cannot record.
+#
+# The drop marker goes to the 2770 `notify/` sibling, NOT to $AUDIT_LOG: the whole
+# reason we are here is that the caller could not write the audit log, so recording
+# the failure there would fail the same way. notify/ is group-writable by
+# construction (audit_init) precisely so agent-context diagnostics survive.
+#
+# Still never fails and never speaks to the caller — audit is best-effort by design
+# (a full disk must not block a rescue `agent rm`). The marker is for the reader of
+# the log, not for the actor.
+_audit_note_drop() {
+  local line="$1" reason="$2"
+  local drops_dir="${AUDIT_LOG%/*}/notify"
+  [[ -d "$drops_dir" ]] || return 0
+  local drops="$drops_dir/audit-drops.log"
+  local note
+  # --argjson (not --arg): the row is already valid NDJSON, so it nests as an
+  # object and a reader can re-derive the lost row verbatim. A caller that hands
+  # us non-JSON gets no marker rather than a corrupt one.
+  note=$(jq -cn --arg ts "$(date -Iseconds)" --arg reason "$reason" \
+    --arg by "${SUDO_USER:-${USER:-unknown}}" --argjson row "$line" \
+    '{ts:$ts, dropped_by:$by, reason:$reason, row:$row}' 2>/dev/null) || return 0
+  # DIVE-1888: the setgid dir hands the FILE group `claude` but not group WRITE,
+  # so whichever agent creates it would own the only writable handle and every
+  # other agent's drop would itself be dropped. chmod the file, not the dir.
+  if [[ ! -e "$drops" ]]; then
+    : >> "$drops" 2>/dev/null || return 0
+    chmod g+w "$drops" 2>/dev/null || true
+  fi
+  [[ -w "$drops" ]] || return 0
+  printf '%s\n' "$note" >> "$drops" 2>/dev/null || true
+  return 0
 }
 
 # audit_log <cmd> <result:ok|error> <code> -- <args...>
+#
+# CALL THIS UNCONDITIONALLY. Do NOT wrap it in `[[ $EUID -eq 0 ]] && ...` — that
+# pattern predates _emit_audit_line's privileged fallback and was the DIVE-1989
+# defect: nine `task`/`task need` sub-events were gated that way, so an agent
+# running the verb as itself emitted NO row while the identical command as root
+# emitted one. The gate looked honest (it skipped a write that would EACCES) but
+# it turned the audit log into a record of privileged operations only, silently,
+# and nothing said so. _emit_audit_line handles the non-root case; let it.
+#
 # Emits one NDJSON line. Sensitive =<value> args are redacted ("--api-key=..."
 # becomes "--api-key=<redacted>"). Never fails the caller — writes are
 # best-effort so a full disk can't block a rescue rm.

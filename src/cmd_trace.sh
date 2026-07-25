@@ -141,13 +141,28 @@ cmd_trace() {
   # The tamper-evident agent-audit log (640 root:claude) records mutating verbs
   # with their real caller. Lines mentioning this ident are extra provenance —
   # skipped silently if the log is unreadable or --no-audit was passed.
-  local audit_json='[]'
+  #
+  # DIVE-1989: this slice is NOT a complete record of what happened to the ident,
+  # and `trace` is where that gets misread. Two reasons, both structural:
+  #   1. Rows written before v0.15.26 systematically omit non-root agent actions —
+  #      nine `task`/`task need` sub-events were emitted only when $EUID was 0, so
+  #      an agent acting AS ITSELF produced no row. Those rows are absent forever.
+  #   2. A row whose append failed used to vanish with no trace. It now leaves a
+  #      marker in notify/audit-drops.log, surfaced below.
+  # So "absent from the audit log" is NOT evidence the action did not happen. Say
+  # so on the surface a reader actually looks at, not only in the wiki.
+  local audit_json='[]' audit_drops=0
   if [[ "$want_audit" -eq 1 && -r "$AUDIT_LOG" ]]; then
     # grep exits 1 on no-match; { …; || true; } stops that poisoning pipefail
     # and double-firing the fallback (which would concat two '[]' → invalid JSON).
     audit_json=$({ grep -F -- "$ident" "$AUDIT_LOG" 2>/dev/null || true; } | tail -20 \
       | jq -c -s 'map({ts,user,cmd,result})' 2>/dev/null)
     [[ -n "$audit_json" ]] || audit_json='[]'
+    local _drops="${AUDIT_LOG%/*}/notify/audit-drops.log"
+    if [[ -r "$_drops" ]]; then
+      audit_drops=$({ grep -F -c -- "$ident" "$_drops" 2>/dev/null || true; })
+      [[ "$audit_drops" =~ ^[0-9]+$ ]] || audit_drops=0
+    fi
   fi
 
   # ---- render ------------------------------------------------------------
@@ -159,6 +174,7 @@ cmd_trace() {
       --arg proj "$proj" --arg proj_goal "$proj_goal" --arg objective "$objective" \
       --arg loop "$loop" \
       --argjson events "$events" --argjson audit "$audit_json" \
+      --argjson audit_drops "$audit_drops" \
       --arg ancestors "$ancestors" \
       '{ok:true, data:{
          ident:$ident, title:$title, status:$status, assignee:$assignee,
@@ -172,7 +188,8 @@ cmd_trace() {
            loop:(if $loop=="" then null else $loop end)
          },
          timeline:$events,
-         audit_refs:$audit
+         audit_refs:$audit,
+         audit_drops:$audit_drops
        }}'
     return 0
   fi
@@ -202,6 +219,16 @@ cmd_trace() {
   if [[ "$(printf '%s' "$audit_json" | jq 'length')" -gt 0 ]]; then
     echo "audit-log references:"
     printf '%s' "$audit_json" | jq -r '.[] | "  \(.ts)  \(.user)  \(.cmd)  [\(.result)]"' | indent2
+    echo
+  fi
+  if (( audit_drops > 0 )); then
+    echo "audit-log DROPS: ${audit_drops} row(s) for this ident failed to reach the audit log"
+    echo "  (see /var/log/5dive/notify/audit-drops.log — the action happened, the row did not land)"
+    echo
+  fi
+  if [[ "$want_audit" -eq 1 ]]; then
+    echo "note: audit rows are incomplete by construction — rows written before v0.15.26"
+    echo "  omit actions taken by a non-root agent as itself. Absence is not evidence."
     echo
   fi
   echo "verdict: ${verdict}"

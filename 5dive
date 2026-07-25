@@ -26,7 +26,7 @@ esac
 
 # Bumped on every public release. `build.sh` checks this line exists; CI fails
 # the bundle-drift check if it's missing or empty.
-readonly FIVE_VERSION="0.15.25"
+readonly FIVE_VERSION="0.15.26"
 
 # GitHub org our repos live under. The org is being renamed
 # 5dive-com -> 5dive-ai (2026-06); fetches must work on either side of the
@@ -3075,13 +3075,67 @@ _emit_audit_line() {
   local line="$1"
   [[ -n "$line" ]] || return 0
   if [[ $EUID -eq 0 || -w "$AUDIT_LOG" ]]; then
-    printf '%s\n' "$line" >> "$AUDIT_LOG" 2>/dev/null || true
+    printf '%s\n' "$line" >> "$AUDIT_LOG" 2>/dev/null \
+      || _audit_note_drop "$line" "direct-append-failed"
   else
-    printf '%s\n' "$line" | sudo -n /usr/local/bin/5dive _audit_append >/dev/null 2>&1 || true
+    printf '%s\n' "$line" | sudo -n /usr/local/bin/5dive _audit_append >/dev/null 2>&1 \
+      || _audit_note_drop "$line" "privileged-fallback-failed"
   fi
+  return 0
+}
+
+# _audit_note_drop <ndjson-line> <reason> — leave a trace when an audit row is LOST.
+#
+# DIVE-1989. Both append paths above used to end in a bare `|| true`, so a failed
+# write left no evidence ANYWHERE: the row was simply absent, and "absent from the
+# audit log" became indistinguishable from "the action never happened". That is the
+# absent-vs-forbidden conflation aimed at our own evidence base — DIVE-1988 spent a
+# day unable to decide whether three DIVE-1801 rows were dropped by the privileged
+# fallback or were fixture reuse, and no amount of re-reading the audit log could
+# settle it, because a drop is exactly what the log cannot record.
+#
+# The drop marker goes to the 2770 `notify/` sibling, NOT to $AUDIT_LOG: the whole
+# reason we are here is that the caller could not write the audit log, so recording
+# the failure there would fail the same way. notify/ is group-writable by
+# construction (audit_init) precisely so agent-context diagnostics survive.
+#
+# Still never fails and never speaks to the caller — audit is best-effort by design
+# (a full disk must not block a rescue `agent rm`). The marker is for the reader of
+# the log, not for the actor.
+_audit_note_drop() {
+  local line="$1" reason="$2"
+  local drops_dir="${AUDIT_LOG%/*}/notify"
+  [[ -d "$drops_dir" ]] || return 0
+  local drops="$drops_dir/audit-drops.log"
+  local note
+  # --argjson (not --arg): the row is already valid NDJSON, so it nests as an
+  # object and a reader can re-derive the lost row verbatim. A caller that hands
+  # us non-JSON gets no marker rather than a corrupt one.
+  note=$(jq -cn --arg ts "$(date -Iseconds)" --arg reason "$reason" \
+    --arg by "${SUDO_USER:-${USER:-unknown}}" --argjson row "$line" \
+    '{ts:$ts, dropped_by:$by, reason:$reason, row:$row}' 2>/dev/null) || return 0
+  # DIVE-1888: the setgid dir hands the FILE group `claude` but not group WRITE,
+  # so whichever agent creates it would own the only writable handle and every
+  # other agent's drop would itself be dropped. chmod the file, not the dir.
+  if [[ ! -e "$drops" ]]; then
+    : >> "$drops" 2>/dev/null || return 0
+    chmod g+w "$drops" 2>/dev/null || true
+  fi
+  [[ -w "$drops" ]] || return 0
+  printf '%s\n' "$note" >> "$drops" 2>/dev/null || true
+  return 0
 }
 
 # audit_log <cmd> <result:ok|error> <code> -- <args...>
+#
+# CALL THIS UNCONDITIONALLY. Do NOT wrap it in `[[ $EUID -eq 0 ]] && ...` — that
+# pattern predates _emit_audit_line's privileged fallback and was the DIVE-1989
+# defect: nine `task`/`task need` sub-events were gated that way, so an agent
+# running the verb as itself emitted NO row while the identical command as root
+# emitted one. The gate looked honest (it skipped a write that would EACCES) but
+# it turned the audit log into a record of privileged operations only, silently,
+# and nothing said so. _emit_audit_line handles the non-root case; let it.
+#
 # Emits one NDJSON line. Sensitive =<value> args are redacted ("--api-key=..."
 # becomes "--api-key=<redacted>"). Never fails the caller — writes are
 # best-effort so a full disk can't block a rescue rm.
@@ -19415,7 +19469,7 @@ cmd_task_reject() {
     db "UPDATE tasks SET need_answer='(superseded — task rejected, bounced to maker)',
           need_answered_at=$(sqlq "$_sup_ts"), need_answered_by='auto:reject', gate_pinged_at=NULL
         WHERE id=${id} AND need_answered_at IS NULL;"
-    [[ $EUID -eq 0 ]] && audit_log "task reject gate-supersede" "ok" 0 -- "task=$ident" || true
+    audit_log "task reject gate-supersede" "ok" 0 -- "task=$ident" || true
   fi
   # max_iterations reached -> stop bouncing, park it on a human to decide.
   if (( maxi > 0 && iter >= maxi )); then
@@ -20117,13 +20171,13 @@ cmd_task_precedent() {
       ;;
     on|enable)
       _task_pref_set precedent_autoclear on
-      [[ $EUID -eq 0 ]] && audit_log "task precedent" "on" 0 -- "pref=precedent_autoclear" || true
+      audit_log "task precedent" "on" 0 -- "pref=precedent_autoclear" || true
       ok "precedent auto-clear: ON — resolved tier-1 gates with proven human precedent now clear at file-time" \
          '{pref:"precedent_autoclear", value:"on"}'
       ;;
     off|disable)
       _task_pref_set precedent_autoclear off
-      [[ $EUID -eq 0 ]] && audit_log "task precedent" "off" 0 -- "pref=precedent_autoclear" || true
+      audit_log "task precedent" "off" 0 -- "pref=precedent_autoclear" || true
       ok "precedent auto-clear: OFF — tier-1 gates always surface to a human" \
          '{pref:"precedent_autoclear", value:"off"}'
       ;;
@@ -20151,13 +20205,13 @@ cmd_task_routing() {
       ;;
     on|enable)
       _task_pref_set gate_builder_routing on
-      [[ $EUID -eq 0 ]] && audit_log "task routing" "on" 0 -- "pref=gate_builder_routing" || true
+      audit_log "task routing" "on" 0 -- "pref=gate_builder_routing" || true
       ok "builder-gate routing: ON — a non-lead agent's tier<2 decision gate now routes to the org lead before pinging the human" \
          '{pref:"gate_builder_routing", value:"on"}'
       ;;
     off|disable)
       _task_pref_set gate_builder_routing off
-      [[ $EUID -eq 0 ]] && audit_log "task routing" "off" 0 -- "pref=gate_builder_routing" || true
+      audit_log "task routing" "off" 0 -- "pref=gate_builder_routing" || true
       ok "builder-gate routing: OFF — decision gates ping the human directly" \
          '{pref:"gate_builder_routing", value:"off"}'
       ;;
@@ -20489,7 +20543,7 @@ cmd_task_need() {
         UPDATE tasks SET status='todo'
           WHERE id=${id} AND status='blocked'
             AND NOT EXISTS (SELECT 1 FROM task_deps WHERE task_id=${id});"
-    [[ $EUID -eq 0 ]] && audit_log "task need withdraw" "ok" 0 -- "task=$ident" "type=$w_type" "by=${w_name:-$w_kind}" "asserted_from=${from:-}" || true
+    audit_log "task need withdraw" "ok" 0 -- "task=$ident" "type=$w_type" "by=${w_name:-$w_kind}" "asserted_from=${from:-}" || true
     local w_new; w_new=$(db "SELECT status FROM tasks WHERE id=${id};")
     ok "$ident gate withdrawn (${w_type}) — moot request cleared, no secret/grant recorded; task now ${w_new}" \
        '{ident:$id, withdrawn:true, was_type:$wt, status:$st}' \
@@ -20841,7 +20895,7 @@ cmd_task_need() {
         UPDATE tasks SET status='todo'
           WHERE id=${id} AND status='blocked'
             AND NOT EXISTS (SELECT 1 FROM task_deps WHERE task_id=${id});"
-    [[ $EUID -eq 0 ]] && audit_log "task need t0-auto" "ok" 0 -- "task=$ident" "type=$type" "applied=$recommend" || true
+    audit_log "task need t0-auto" "ok" 0 -- "task=$ident" "type=$type" "applied=$recommend" || true
     ok "$ident tier-0 gate auto-cleared — applied: $recommend" \
        '{id:($i|tonumber), ident:$id, tier:0, auto_applied:$rc, need_type:$ty}' \
        --arg i "$id" --arg id "$ident" --arg rc "$recommend" --arg ty "$type"
@@ -20921,7 +20975,7 @@ cmd_task_need() {
                 UPDATE tasks SET status='todo'
                   WHERE id=${id} AND status='blocked'
                     AND NOT EXISTS (SELECT 1 FROM task_deps WHERE task_id=${id});"
-            [[ $EUID -eq 0 ]] && audit_log "task need precedent-auto" "ok" 0 -- "task=$ident" "type=$type" "applied=$_qans" "precedent=$_qid" || true
+            audit_log "task need precedent-auto" "ok" 0 -- "task=$ident" "type=$type" "applied=$_qans" "precedent=$_qid" || true
             ok "$ident tier-1 gate auto-cleared from human precedent — applied: $_qans (precedent #$_qid)" \
                '{id:($i|tonumber), ident:$id, tier:1, need_type:$ty, auto_applied:$rc, need_answered_by:"auto:precedent", precedent_ref:($pr|tonumber)}' \
                --arg i "$id" --arg id "$ident" --arg ty "$type" --arg rc "$_qans" --arg pr "$_qid"
@@ -21056,7 +21110,7 @@ cmd_task_need() {
         if command -v 5dive >/dev/null 2>&1; then
           ( 5dive agent send "$_reviewer" "$_hmsg" --from="$actor" >/dev/null 2>&1 & ) || true
         fi
-        [[ $EUID -eq 0 ]] && audit_log "task need lead-route" "ok" 0 -- "task=$ident" "type=$type" "reviewer=$_reviewer" "filer=$actor" || true
+        audit_log "task need lead-route" "ok" 0 -- "task=$ident" "type=$type" "reviewer=$_reviewer" "filer=$actor" || true
         ok "$ident routed to $_reviewer for ${_rrole} ($type, tier $tier) — $ask" \
            '{id:($i|tonumber), ident:$id, status:"blocked", need_type:$ty, tier:($tr|tonumber), routed_to:$rv, ask:$ak, recommend:(($rc|select(length>0)) // null)}' \
            --arg i "$id" --arg id "$ident" --arg ty "$type" --arg tr "$tier" --arg rv "$_reviewer" --arg ak "$ask" --arg rc "$recommend"
@@ -23038,13 +23092,28 @@ cmd_trace() {
   # The tamper-evident agent-audit log (640 root:claude) records mutating verbs
   # with their real caller. Lines mentioning this ident are extra provenance —
   # skipped silently if the log is unreadable or --no-audit was passed.
-  local audit_json='[]'
+  #
+  # DIVE-1989: this slice is NOT a complete record of what happened to the ident,
+  # and `trace` is where that gets misread. Two reasons, both structural:
+  #   1. Rows written before v0.15.26 systematically omit non-root agent actions —
+  #      nine `task`/`task need` sub-events were emitted only when $EUID was 0, so
+  #      an agent acting AS ITSELF produced no row. Those rows are absent forever.
+  #   2. A row whose append failed used to vanish with no trace. It now leaves a
+  #      marker in notify/audit-drops.log, surfaced below.
+  # So "absent from the audit log" is NOT evidence the action did not happen. Say
+  # so on the surface a reader actually looks at, not only in the wiki.
+  local audit_json='[]' audit_drops=0
   if [[ "$want_audit" -eq 1 && -r "$AUDIT_LOG" ]]; then
     # grep exits 1 on no-match; { …; || true; } stops that poisoning pipefail
     # and double-firing the fallback (which would concat two '[]' → invalid JSON).
     audit_json=$({ grep -F -- "$ident" "$AUDIT_LOG" 2>/dev/null || true; } | tail -20 \
       | jq -c -s 'map({ts,user,cmd,result})' 2>/dev/null)
     [[ -n "$audit_json" ]] || audit_json='[]'
+    local _drops="${AUDIT_LOG%/*}/notify/audit-drops.log"
+    if [[ -r "$_drops" ]]; then
+      audit_drops=$({ grep -F -c -- "$ident" "$_drops" 2>/dev/null || true; })
+      [[ "$audit_drops" =~ ^[0-9]+$ ]] || audit_drops=0
+    fi
   fi
 
   # ---- render ------------------------------------------------------------
@@ -23056,6 +23125,7 @@ cmd_trace() {
       --arg proj "$proj" --arg proj_goal "$proj_goal" --arg objective "$objective" \
       --arg loop "$loop" \
       --argjson events "$events" --argjson audit "$audit_json" \
+      --argjson audit_drops "$audit_drops" \
       --arg ancestors "$ancestors" \
       '{ok:true, data:{
          ident:$ident, title:$title, status:$status, assignee:$assignee,
@@ -23069,7 +23139,8 @@ cmd_trace() {
            loop:(if $loop=="" then null else $loop end)
          },
          timeline:$events,
-         audit_refs:$audit
+         audit_refs:$audit,
+         audit_drops:$audit_drops
        }}'
     return 0
   fi
@@ -23099,6 +23170,16 @@ cmd_trace() {
   if [[ "$(printf '%s' "$audit_json" | jq 'length')" -gt 0 ]]; then
     echo "audit-log references:"
     printf '%s' "$audit_json" | jq -r '.[] | "  \(.ts)  \(.user)  \(.cmd)  [\(.result)]"' | indent2
+    echo
+  fi
+  if (( audit_drops > 0 )); then
+    echo "audit-log DROPS: ${audit_drops} row(s) for this ident failed to reach the audit log"
+    echo "  (see /var/log/5dive/notify/audit-drops.log — the action happened, the row did not land)"
+    echo
+  fi
+  if [[ "$want_audit" -eq 1 ]]; then
+    echo "note: audit rows are incomplete by construction — rows written before v0.15.26"
+    echo "  omit actions taken by a non-root agent as itself. Absence is not evidence."
     echo
   fi
   echo "verdict: ${verdict}"

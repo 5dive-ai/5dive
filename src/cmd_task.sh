@@ -2050,7 +2050,7 @@ cmd_task_reject() {
     db "UPDATE tasks SET need_answer='(superseded — task rejected, bounced to maker)',
           need_answered_at=$(sqlq "$_sup_ts"), need_answered_by='auto:reject', gate_pinged_at=NULL
         WHERE id=${id} AND need_answered_at IS NULL;"
-    [[ $EUID -eq 0 ]] && audit_log "task reject gate-supersede" "ok" 0 -- "task=$ident" || true
+    audit_log "task reject gate-supersede" "ok" 0 -- "task=$ident" || true
   fi
   # max_iterations reached -> stop bouncing, park it on a human to decide.
   if (( maxi > 0 && iter >= maxi )); then
@@ -2752,13 +2752,13 @@ cmd_task_precedent() {
       ;;
     on|enable)
       _task_pref_set precedent_autoclear on
-      [[ $EUID -eq 0 ]] && audit_log "task precedent" "on" 0 -- "pref=precedent_autoclear" || true
+      audit_log "task precedent" "on" 0 -- "pref=precedent_autoclear" || true
       ok "precedent auto-clear: ON — resolved tier-1 gates with proven human precedent now clear at file-time" \
          '{pref:"precedent_autoclear", value:"on"}'
       ;;
     off|disable)
       _task_pref_set precedent_autoclear off
-      [[ $EUID -eq 0 ]] && audit_log "task precedent" "off" 0 -- "pref=precedent_autoclear" || true
+      audit_log "task precedent" "off" 0 -- "pref=precedent_autoclear" || true
       ok "precedent auto-clear: OFF — tier-1 gates always surface to a human" \
          '{pref:"precedent_autoclear", value:"off"}'
       ;;
@@ -2786,13 +2786,13 @@ cmd_task_routing() {
       ;;
     on|enable)
       _task_pref_set gate_builder_routing on
-      [[ $EUID -eq 0 ]] && audit_log "task routing" "on" 0 -- "pref=gate_builder_routing" || true
+      audit_log "task routing" "on" 0 -- "pref=gate_builder_routing" || true
       ok "builder-gate routing: ON — a non-lead agent's tier<2 decision gate now routes to the org lead before pinging the human" \
          '{pref:"gate_builder_routing", value:"on"}'
       ;;
     off|disable)
       _task_pref_set gate_builder_routing off
-      [[ $EUID -eq 0 ]] && audit_log "task routing" "off" 0 -- "pref=gate_builder_routing" || true
+      audit_log "task routing" "off" 0 -- "pref=gate_builder_routing" || true
       ok "builder-gate routing: OFF — decision gates ping the human directly" \
          '{pref:"gate_builder_routing", value:"off"}'
       ;;
@@ -3124,7 +3124,7 @@ cmd_task_need() {
         UPDATE tasks SET status='todo'
           WHERE id=${id} AND status='blocked'
             AND NOT EXISTS (SELECT 1 FROM task_deps WHERE task_id=${id});"
-    [[ $EUID -eq 0 ]] && audit_log "task need withdraw" "ok" 0 -- "task=$ident" "type=$w_type" "by=${w_name:-$w_kind}" "asserted_from=${from:-}" || true
+    audit_log "task need withdraw" "ok" 0 -- "task=$ident" "type=$w_type" "by=${w_name:-$w_kind}" "asserted_from=${from:-}" || true
     local w_new; w_new=$(db "SELECT status FROM tasks WHERE id=${id};")
     ok "$ident gate withdrawn (${w_type}) — moot request cleared, no secret/grant recorded; task now ${w_new}" \
        '{ident:$id, withdrawn:true, was_type:$wt, status:$st}' \
@@ -3476,7 +3476,7 @@ cmd_task_need() {
         UPDATE tasks SET status='todo'
           WHERE id=${id} AND status='blocked'
             AND NOT EXISTS (SELECT 1 FROM task_deps WHERE task_id=${id});"
-    [[ $EUID -eq 0 ]] && audit_log "task need t0-auto" "ok" 0 -- "task=$ident" "type=$type" "applied=$recommend" || true
+    audit_log "task need t0-auto" "ok" 0 -- "task=$ident" "type=$type" "applied=$recommend" || true
     ok "$ident tier-0 gate auto-cleared — applied: $recommend" \
        '{id:($i|tonumber), ident:$id, tier:0, auto_applied:$rc, need_type:$ty}' \
        --arg i "$id" --arg id "$ident" --arg rc "$recommend" --arg ty "$type"
@@ -3556,7 +3556,7 @@ cmd_task_need() {
                 UPDATE tasks SET status='todo'
                   WHERE id=${id} AND status='blocked'
                     AND NOT EXISTS (SELECT 1 FROM task_deps WHERE task_id=${id});"
-            [[ $EUID -eq 0 ]] && audit_log "task need precedent-auto" "ok" 0 -- "task=$ident" "type=$type" "applied=$_qans" "precedent=$_qid" || true
+            audit_log "task need precedent-auto" "ok" 0 -- "task=$ident" "type=$type" "applied=$_qans" "precedent=$_qid" || true
             ok "$ident tier-1 gate auto-cleared from human precedent — applied: $_qans (precedent #$_qid)" \
                '{id:($i|tonumber), ident:$id, tier:1, need_type:$ty, auto_applied:$rc, need_answered_by:"auto:precedent", precedent_ref:($pr|tonumber)}' \
                --arg i "$id" --arg id "$ident" --arg ty "$type" --arg rc "$_qans" --arg pr "$_qid"
@@ -3691,7 +3691,7 @@ cmd_task_need() {
         if command -v 5dive >/dev/null 2>&1; then
           ( 5dive agent send "$_reviewer" "$_hmsg" --from="$actor" >/dev/null 2>&1 & ) || true
         fi
-        [[ $EUID -eq 0 ]] && audit_log "task need lead-route" "ok" 0 -- "task=$ident" "type=$type" "reviewer=$_reviewer" "filer=$actor" || true
+        audit_log "task need lead-route" "ok" 0 -- "task=$ident" "type=$type" "reviewer=$_reviewer" "filer=$actor" || true
         ok "$ident routed to $_reviewer for ${_rrole} ($type, tier $tier) — $ask" \
            '{id:($i|tonumber), ident:$id, status:"blocked", need_type:$ty, tier:($tr|tonumber), routed_to:$rv, ask:$ak, recommend:(($rc|select(length>0)) // null)}' \
            --arg i "$id" --arg id "$ident" --arg ty "$type" --arg tr "$tier" --arg rv "$_reviewer" --arg ak "$ask" --arg rc "$recommend"
