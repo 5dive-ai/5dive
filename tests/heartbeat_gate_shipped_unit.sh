@@ -21,6 +21,11 @@ for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh \
   source "$SRC/$f"
 done
 
+# DIVE-2003: keep a handle on the REAL _hb_repo_grep_ident before the stub below
+# shadows it, so the format-contract case can exercise production code itself
+# rather than a reimplementation of it.
+eval "_hb_repo_grep_ident_REAL() $(declare -f _hb_repo_grep_ident | tail -n +2)"
+
 STATE_DIR="$TMP"
 TASKS_DIR="$STATE_DIR/tasks"
 TASKS_DB="$TASKS_DIR/tasks.db"
@@ -34,11 +39,16 @@ tasks_db_init
 SEND_LOG="$TMP/sent"; : >"$SEND_LOG"
 cmd_send()            { printf '%s\n' "$1" >>"$SEND_LOG"; }   # $1 = target agent
 _task_agent_channel() { return 0; }                          # everyone has a channel
-audit_log()           { return 0; }
+AUDIT_LOG_CALLS="$TMP/audit"; : >"$AUDIT_LOG_CALLS"
+audit_log()           { printf '%s\n' "$*" >>"$AUDIT_LOG_CALLS"; return 0; }
 # Stub the git lookup: the ident in $MERGED is "on main"; everything else misses.
 MERGED=""
+DRIFT=""
 _hb_repo_grep_ident() {  # <repo> <ident>
   [[ -n "$MERGED" && "$2" == "$MERGED" ]] || return 1
+  # DRIFT=1 models the PRE-DIVE-2001 format (no epoch field) — i.e. the real
+  # --format string drifting away from what the consumer's awk field 3 expects.
+  [[ -n "$DRIFT" ]] && { printf '%s abc1234 fix: %s landed\n' "$1" "$2"; return 0; }
   printf '%s abc1234 %s fix: %s landed\n' "$1" "${MERGED_EPOCH:-$(date +%s)}" "$2"
 }
 
@@ -53,7 +63,7 @@ mk_gate() {  # <tier> <need_type> -> echoes id (ident auto = DIVE-<id>)
               $(sqlq "$2"), $1, 'need a human call', datetime('now','-1 days'));
       SELECT last_insert_rowid();"
 }
-reset() { db "DELETE FROM tasks;"; : >"$SEND_LOG"; MERGED=""; MERGED_EPOCH=""; }
+reset() { db "DELETE FROM tasks;"; : >"$SEND_LOG"; : >"$AUDIT_LOG_CALLS"; MERGED=""; MERGED_EPOCH=""; DRIFT=""; }
 
 # --- Case 1: tier-1 gate whose ident merged -> flagged + owner pinged ---------
 reset
@@ -149,5 +159,45 @@ flag=$(db "SELECT COALESCE(shipped_flag_at,'NULL') FROM tasks WHERE id=${gid};")
   && ok_t "DIVE-2001 control: commit AFTER the ask still flags and pings" \
   || bad_t "post-ask commit did not flag" "shipped_flag_at=$flag sent=[$(tr '\n' ',' <"$SEND_LOG")]"
 
-printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]
+
+# --- Case 9 (DIVE-2003): a lookup format drift must be LOUD, not silent ------
+# olivia's measurement: reverting the stub to a no-epoch format and DELETING the
+# guard outright produced the IDENTICAL 8/2 signature, because the fall-through
+# logged nothing anywhere. Fail-open is still correct; invisible fail-open is not.
+reset
+gid=$(mk_gate 1 decision); MERGED="DIVE-$gid"; DRIFT=1
+out=$(_hb_gate_shipped_sweep 2>&1)
+flag=$(db "SELECT COALESCE(shipped_flag_at,'') FROM tasks WHERE id=$gid;")
+[[ -n "$flag" ]] \
+  && ok_t "DIVE-2003: fail-open preserved — a drifted lookup still flags (withholding would be its own silence)" \
+  || bad_t "DIVE-2003: drifted lookup withheld the flag" "shipped_flag_at empty"
+grep -q "UNPARSEABLE" <<<"$out" \
+  && ok_t "DIVE-2003: the drift is announced in _hb_log (guard can no longer vanish silently)" \
+  || bad_t "DIVE-2003: drift not logged" "out=[${out//$'\n'/ | }]"
+grep -q "reason=epoch-unparseable" "$AUDIT_LOG_CALLS" \
+  && ok_t "DIVE-2003: the drift leaves an audit row (degraded), not just a log line" \
+  || bad_t "DIVE-2003: no audit row for the drift" "audit=[$(tr '\n' ',' <"$AUDIT_LOG_CALLS")]"
+
+# --- Case 10 (DIVE-2003): hermetic FORMAT CONTRACT on the real function ------
+# The suite stubs _hb_repo_grep_ident, so production's --format string is
+# exercised by no test at all. This pins it without network or a real repo:
+# field 3 must be a unix epoch, which is exactly what the consumer awks out.
+RREPO="$TMP/fmt/5dive-cli"; mkdir -p "$RREPO"
+( cd "$RREPO" && git init -q . \
+  && git -c user.email=t@t -c user.name=t commit -q --allow-empty -m "fix: DIVE-999001 landed" ) >/dev/null 2>&1
+_HB_REPO_BASE="$TMP/fmt" _HB_GATE_SHIPPED_REF=HEAD \
+  hit=$(_hb_repo_grep_ident_REAL 5dive-cli DIVE-999001)
+f3=$(awk '{print $3}' <<<"$hit")
+[[ "$f3" =~ ^[0-9]+$ ]] \
+  && ok_t "DIVE-2003: REAL lookup's field 3 is a numeric epoch (format contract pinned, no stub involved)" \
+  || bad_t "DIVE-2003: field 3 of the real lookup is not an epoch" "hit=[$hit] field3=[$f3]"
+[[ "$(awk '{print $1}' <<<"$hit")" == "5dive-cli" ]] \
+  && ok_t "DIVE-2003: REAL lookup prepends the repo stem (field 3 is only correct because of this)" \
+  || bad_t "DIVE-2003: repo stem not prepended" "hit=[$hit]"
+_HB_REPO_BASE="$TMP/fmt" _HB_GATE_SHIPPED_REF=HEAD \
+  miss=$(_hb_repo_grep_ident_REAL 5dive-cli DIVE-99900 2>/dev/null)
+[[ -z "$miss" ]] \
+  && ok_t "DIVE-2003: digit-boundary grep holds — DIVE-99900 does not match DIVE-999001" \
+  || bad_t "DIVE-2003: prefix ident matched" "miss=[$miss]"
+printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"

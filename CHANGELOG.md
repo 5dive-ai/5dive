@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.15.25
+
+- heartbeat: the ship-flag epoch guard no longer fails open SILENTLY (DIVE-2003).
+  A drift in `_hb_repo_grep_ident`'s `--format` made the predates-ask comparison
+  skip with no `_hb_log` line and no audit row, so a format drift and a DELETED
+  guard produced the identical 8/2 test signature. Fail-open stays (withholding a
+  legitimate flag is its own silence) but now logs `epoch UNPARSEABLE` plus a
+  `degraded` audit row, and is kept distinct from the routine legacy-gate case of
+  a missing `need_asked_at`. Adds a hermetic format-contract assertion that runs
+  the REAL lookup against a throwaway `git init` repo, so the `%h %ct %s` field
+  index can no longer drift unseen. `_c_epoch`/`_asked` are now `local`.
+
 ## 0.15.24 — fix(install): pin the bundle and its checksum to ONE commit sha — raw's cache race read as a tampered mirror (DIVE-1977) (2026-07-25)
 
 - **a routine cache race accused us of shipping a tampered mirror.** `install.sh` fetched the bundle from `raw.githubusercontent.com/<org>/5dive/main/5dive` and validated it against `.../main/5dive.sha256`. Those are two *independent* CDN objects with independent cache generations, so for a window after every release raw can serve the **previous bundle next to the new checksum** — measured live minutes after 0.15.11 merged: bundle `FIVE_VERSION="0.15.10"`, sha256 the 0.15.11 hash. A clean clone at `main` was internally consistent the whole time; the divergence was entirely CDN-side, which is why "check the repo" proved nothing.

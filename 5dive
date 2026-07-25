@@ -26,7 +26,7 @@ esac
 
 # Bumped on every public release. `build.sh` checks this line exists; CI fails
 # the bundle-drift check if it's missing or empty.
-readonly FIVE_VERSION="0.15.24"
+readonly FIVE_VERSION="0.15.25"
 
 # GitHub org our repos live under. The org is being renamed
 # 5dive-com -> 5dive-ai (2026-06); fetches must work on either side of the
@@ -34732,7 +34732,7 @@ _hb_blocked_sweep() {
 }
 
 _hb_gate_shipped_sweep() {
-  local grow gid gident gtype gowner repo hit
+  local grow gid gident gtype gowner repo hit _c_epoch _asked
   # Normalize the repo allow-list: commas or spaces both separate.
   local repos; repos="${_HB_GATE_SHIPPED_REPOS//,/ }"
   [[ -n "${repos// }" ]] || return 0
@@ -34756,7 +34756,24 @@ _hb_gate_shipped_sweep() {
     # genuinely later merge still flags on a subsequent tick.
     _c_epoch=$(awk '{print $3}' <<<"$hit")
     _asked=$(db "SELECT COALESCE(strftime('%s', need_asked_at),'') FROM tasks WHERE id=${gid};")
-    if [[ "$_c_epoch" =~ ^[0-9]+$ && "$_asked" =~ ^[0-9]+$ ]] && (( _c_epoch < _asked )); then
+    # DIVE-2003: the epoch is field 3 of _hb_repo_grep_ident's output — git's
+    # '%h %ct %s' with the repo stem PREPENDED. That field index is a contract
+    # between two functions and the unit test STUBS the producer, so a drift in
+    # the real --format string is invisible to the suite. Measured by olivia:
+    # reverting the stub to a no-epoch format and DELETING this guard outright
+    # give the IDENTICAL 8/2 signature, and the fall-through wrote nothing to
+    # _hb_log or audit_log — so the guard could vanish leaving no trace anywhere.
+    # Fail-open remains correct (withholding a legitimate flag is itself a
+    # silence), but it must never again be silent.
+    if [[ ! "$_c_epoch" =~ ^[0-9]+$ ]]; then
+      _hb_log "[gate-shipped] ${gident} — commit epoch UNPARSEABLE from lookup (\"${hit}\"); flagging anyway, but the predates-ask guard could NOT run (lookup format drift?)"
+      audit_log "gate shipped-flag" "degraded" 0 -- "task=$gident" "reason=epoch-unparseable" "commit=$hit" || true
+    elif [[ ! "$_asked" =~ ^[0-9]+$ ]]; then
+      # Deliberately a DIFFERENT message from the drift case above: legacy gates
+      # predate need_asked_at, so this is expected and routine. Folding the two
+      # together would bury the drift signal in noise that operators learn to skip.
+      _hb_log "[gate-shipped] ${gident} — no need_asked_at stamp; predates-ask guard not applicable (legacy gate)"
+    elif (( _c_epoch < _asked )); then
       _hb_log "[gate-shipped] ${gident} — newest matching commit PREDATES the open ask ($(date -u -d @"$_c_epoch" +%FT%TZ) < $(date -u -d @"$_asked" +%FT%TZ)); NOT flagging, gate stays eligible"
       audit_log "gate shipped-flag" "skip" 0 -- "task=$gident" "reason=commit-predates-ask" "commit=$hit" || true
       continue
