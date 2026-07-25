@@ -3,10 +3,18 @@
 # THAT TEXT.
 #
 # The rail used to read a full-screen TUI pane with `capture-pane -S -2000` and
-# slice at the marker. A full-screen TUI runs in tmux's ALTERNATE SCREEN, which
-# has NO SCROLLBACK, so `-S` is inert: it reports a 2000-line window and delivers
-# a screenful, silently clamped. That produced two failures, anti-correlated by
-# message length, and BOTH exit clean:
+# slice at the marker. On the claude and codex panes measured for this ticket the
+# alternate screen carried NO scrollback, so `-S` came back clamped to a
+# screenful with no signal it had been clamped.
+#
+# CORRECTION (main, 2026-07-25): that is NOT universal, and the original writeup
+# overstated it. `-S -200` on a live ANTIGRAVITY pane returned 100 non-blank
+# lines, 50 unique, including real history. So scrollback availability is
+# per-harness and must not be assumed either way — the rail now asks for `-S`
+# (free where it works) AND accumulates frames (needed where it does not).
+#
+# That produced two failures, anti-correlated by message length, and BOTH exit
+# clean:
 #
 #   A. LONG message -> the `id=<msg_id>` echo scrolls off, the marker is
 #      unrecoverable, and the rail either times out with "no idle reply within
@@ -23,6 +31,12 @@
 # So these assert the returned STRING BY EQUALITY, and assert that no chrome
 # substring ever rides along. Non-emptiness is exactly what mode B satisfies, so
 # an exit-code / non-empty test would pass on the bug.
+#
+# ITERATION 2: the scraping fallback is now OPT-IN (--allow-unfenced). Every
+# fabrication this ticket has caught came from it and none from the fence, so by
+# default `ask` returns the fenced reply or NOTHING. The cases below that pass a
+# trailing `1` are exercising that opt-in fallback deliberately; the default-path
+# cases assert that furniture is never returned as an answer.
 #
 # The helpers are pure (stdin + temp files), so the whole frame sequence is
 # replayed offline — no tmux, no agent, no root, no network.
@@ -91,7 +105,7 @@ for pct in 44 45; do
         "> [5dive-msg from=ask id=${MID}] ping — reply with the single" \
         "  word PONG" \
         "✳ Cogitating… (${secs}s · ↑ 1.2k tokens · esc to interrupt)" \
-      | _ask_accumulate "$acc" | _ask_reply_window "$base" "$msg" "$MID")
+      | _ask_accumulate "$acc" | _ask_reply_window "$base" "$msg" "$MID" 1 1)
   assert_no_chrome "case1/poll" "$got"
   [[ -z "$got" ]] || die "case1: chrome-only frame returned a reply: [$got]"
 done
@@ -104,7 +118,7 @@ got=$(frame 45 Wed 12 \
       "> [5dive-msg from=ask id=${MID}] ping — reply with the single" \
       "  word PONG" \
       "● PONG" \
-    | _ask_accumulate "$acc" | _ask_reply_window "$base" "$msg" "$MID")
+    | _ask_accumulate "$acc" | _ask_reply_window "$base" "$msg" "$MID" 1 1)
 assert_no_chrome "case1/answer" "$got"
 [[ "$got" == "● PONG" ]] || die "case1: expected '● PONG', got: [$got]"
 ok_ "the seat's answer is returned verbatim, by equality"
@@ -123,7 +137,7 @@ got=$(frame 43 Tue 11 \
       "  else:" \
       "  COUNCIL-VOTE: aye - rail works" \
       "● COUNCIL-VOTE: aye - rail works" \
-    | _ask_accumulate "$acc" | _ask_reply_window "$base" "$msg" "$MID")
+    | _ask_accumulate "$acc" | _ask_reply_window "$base" "$msg" "$MID" 1 1)
 assert_no_chrome "case2" "$got"
 [[ "$got" == "● COUNCIL-VOTE: aye - rail works" ]] \
   || die "case2: expected the seat's line once, got: [$got]"
@@ -156,7 +170,7 @@ got=$(frame 44 Tue 11 \
       "${echoed[@]:5:7}" \
       "  Answer with one COUNCIL-VOTE line." \
       "● COUNCIL-VOTE: aye - the rail captures long ballots now" \
-    | _ask_accumulate "$acc" | _ask_reply_window "$base" "$msg" "$MID")
+    | _ask_accumulate "$acc" | _ask_reply_window "$base" "$msg" "$MID" 1 1)
 assert_no_chrome "case3" "$got"
 grep -q "id=${MID}" "$acc" || die "case3: the marker was lost from the accumulated transcript"
 [[ "$got" == "● COUNCIL-VOTE: aye - the rail captures long ballots now" ]] \
@@ -190,7 +204,7 @@ got=$(frame 43 Tue 11 \
       "● all green" \
       "> [5dive-msg from=olivia id=zz99zz99] unrelated question" \
       "● an answer that belongs to olivia" \
-    | _ask_accumulate "$acc" | _ask_reply_window "$base" "$msg" "$MID")
+    | _ask_accumulate "$acc" | _ask_reply_window "$base" "$msg" "$MID" 1 1)
 [[ "$got" == "● all green" ]] || die "case5: window was not bounded at the next marker, got: [$got]"
 ok_ "the reply window stops at the next [5dive-msg marker"
 
@@ -250,7 +264,7 @@ cat > "$base" <<'EOF'
   tokens 12.4k · press esc to interrupt · 3d 22h left
 EOF
 : > "$acc"
-got=$(cat <<EOF | _ask_accumulate "$acc" | _ask_reply_window "$base" "$msg" "$MID"
+got=$(cat <<EOF | _ask_accumulate "$acc" | _ask_reply_window "$base" "$msg" "$MID" 1 1
   antigravity · gemini-3-pro
 ▷ [5dive-msg from=ask id=${MID}] status? [reply-format] Put your answer
   between these two marker lines: <5dive-r:${MID}></5dive-r:${MID}> — the
@@ -285,7 +299,7 @@ got=$(printf '%s\n' \
       "● <5dive-r:${MID}>" \
       "  COUNCIL-VOTE: nay - scoped path" \
       "  </5dive-r:${MID}>" \
-    | _ask_accumulate "$acc" | _ask_reply_window "$base" "$msg" "$MID" 0)
+    | _ask_accumulate "$acc" | _ask_reply_window "$base" "$msg" "$MID" 0 1)
 assert_no_chrome "case8" "$got"
 [[ "$got" == "COUNCIL-VOTE: nay - scoped path" ]] \
   || die "case8: fence did not engage on the scoped path, got: [$got]"

@@ -26,7 +26,7 @@ esac
 
 # Bumped on every public release. `build.sh` checks this line exists; CI fails
 # the bundle-drift check if it's missing or empty.
-readonly FIVE_VERSION="0.15.1"
+readonly FIVE_VERSION="0.15.2"
 
 # GitHub org our repos live under. The org is being renamed
 # 5dive-com -> 5dive-ai (2026-06); fetches must work on either side of the
@@ -12774,30 +12774,69 @@ sys.stdout.write("\n".join(out))
 # What is left is what the SEAT produced. Empty output means we have not captured
 # a reply yet — never a reply.
 _ask_reply_window() {
-  local base="$1" msgf="$2" mid="$3" do_slice="${4:-1}"
+  local base="$1" msgf="$2" mid="$3" do_slice="${4:-1}" unfenced="${5:-0}"
   python3 -c '
 import sys, pathlib, re
 base_p, msg_p, mid = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2]), sys.argv[3]
 do_slice = sys.argv[4] == "1"
+allow_unfenced = sys.argv[5] == "1"
+GLYPH = re.compile(r"^[>│┊|●⏺·⎿└╰\s]+")
 lines = sys.stdin.read().split("\n")
 
 # --- 0. the FENCE: if the seat wrapped its reply in our markers, that block IS
 # the reply, and no scraping heuristic can beat it. Chrome, status lines and the
 # question echo are all outside it by construction, and it needs no per-harness
-# knowledge at all. We take the LAST complete block with a non-empty body: the
-# question echo carries both markers too, but adjacent (they are adjacent in the
-# instruction text), so its body is empty and it is skipped.
+# knowledge at all.
+#
+# The marker lines are matched EXACTLY, not by substring, and that is the whole
+# defence against the prompt echo. The reply-format instruction is part of the
+# prompt, so the echo ALWAYS carries a marker pair of its own — there are two
+# pairs in the pane on every ask, and the extractor has to reject one of them.
+#
+# The first version leaned on the two markers being ADJACENT in the instruction,
+# so an echoed pair would enclose nothing and be skipped for having an empty
+# body. That defence dies on WRAP: a composer breaking the line between them
+# isolates the opening marker on a line of its own, at which point a substring
+# test cannot tell the echo from a real reply. Measured on a live antigravity
+# seat at 2811 chars (DIVE-1901 iteration 1) — short asks passed, long ones came
+# back with the footer, because only the long ones wrap there.
+#
+# Exact matching removes the guess: a real marker line carries the marker and
+# NOTHING else (that is what the instruction asks for), while the echoed
+# instruction always has prose beside at least one of its markers. So the echo
+# can never qualify, whatever the wrap does, and this no longer depends on
+# adjacency, on wrap width, or on whether the reply happens to sit above or
+# below the composer in the pane — the live capture says it does not.
 if mid:
     op, cl = "<5dive-r:" + mid + ">", "</5dive-r:" + mid + ">"
-    opens = [i for i, l in enumerate(lines) if op in l and cl not in l]
+    def is_marker(l, m):
+        # Decide whether this line IS the marker m and nothing else. The test
+        # cannot be a glyph LIST — the first draft used one and a pane whose
+        # bullet was not in it fell straight through to the fallback, which is a
+        # per-harness signature smuggled in by the back door. So the rule is on
+        # SHAPE: a TUI prefixes and suffixes lines with punctuation, box glyphs
+        # and space, never with WORDS, while the echoed instruction always has
+        # prose beside its markers. Strip leading non-word decoration, then
+        # require the marker with nothing word-like left on either side.
+        core = re.sub(r"^[^\w<]+", "", l.strip())
+        if not core.startswith(m):
+            return False
+        return not re.search(r"\w", core[len(m):])
+    opens = [i for i, l in enumerate(lines) if is_marker(l, op)]
+    started = False
     for i in reversed(opens):
         body = []
         for l in lines[i + 1:]:
             if cl in l:
-                # Dedent by the common indent the TUI added, so relative
-                # indentation inside a multi-line reply survives.
+                # An embedded closing marker (prose on the same line) means this
+                # block is the echoed instruction, not a reply: reject the whole
+                # block rather than returning the instruction text as an answer.
                 real = [b for b in body if b.strip()]
                 if real:
+                    started = True
+                if is_marker(l, cl) and real:
+                    # Dedent by the common indent the TUI added, so relative
+                    # indentation inside a multi-line reply survives.
                     pad = min(len(b) - len(b.lstrip()) for b in real)
                     sys.stdout.write("\n".join(b[pad:].rstrip() for b in body).strip("\n"))
                     sys.exit(0)
@@ -12805,6 +12844,30 @@ if mid:
             if op in l or "[5dive-msg" in l:
                 break
             body.append(l)
+        if [b for b in body if b.strip()]:
+            started = True          # opened and produced content, but never closed
+    # FENCE-ONLY (DIVE-1901 iteration 2). Everything this ticket has ever caught
+    # fabricating came from the scraping fallback below, never from the fence:
+    # 0.14.7 returned the token PLUS the footer on antigravity and PURE BOX-DRAWING
+    # on opencode; 0.15.1 returned "Gemini 3.6 Flash - high" on a long antigravity
+    # ask. The live scrollback for that last one shows why, and it is not a parsing
+    # bug: three successive renders caught the seat MID-WRITE ("<5dive-r:" then
+    # "ing..." on the next frame), so the rail settled on a transient chrome render
+    # while the answer was still being typed, and the fence completed afterwards.
+    #
+    # No amount of chrome subtraction fixes that. A scrape cannot tell "furniture
+    # that happened to hold still" from "an answer", because at the moment it looks
+    # they are the same thing: text on a screen that is not changing. The fence
+    # CAN - an unclosed fence is unambiguously not finished.
+    #
+    # So the fallback is not a safety net, it is the fabrication path, and it is
+    # deleted rather than hardened. When a fence was asked for we return the fenced
+    # reply or NOTHING, and nothing becomes a loud timeout that says what it saw.
+    # That is this ticket own instruction: a visible error beats a false abstain.
+    # --allow-unfenced restores best-effort scraping for a caller that knowingly
+    # wants it against a seat that cannot follow the instruction.
+    if not allow_unfenced:
+        sys.exit(0)
 
 # --- 1. slice to our reply window (marker line inclusive) -------------------
 if mid and do_slice:
@@ -12825,7 +12888,7 @@ else:
 
 # --- 2. consume the question echo ------------------------------------------
 msg = re.sub(r"\s+", " ", msg_p.read_text() if msg_p.exists() else "").strip()
-GLYPH = re.compile(r"^[>│┊|●⏺·⎿└╰\s]+")
+
 pos = 0
 if mid and do_slice and win:
     head = win.pop(0)                     # the marker line: its tail is the start of the echo
@@ -12879,7 +12942,7 @@ for line in win:
         continue
     out.append(line)
 sys.stdout.write("\n".join(out))
-' "$base" "$msgf" "$mid" "$do_slice"
+' "$base" "$msgf" "$mid" "$do_slice" "$unfenced"
 }
 
 # DIVE-1065: privileged inter-agent delivery primitive. Hidden subcommand
@@ -13224,7 +13287,7 @@ cmd_send() {
 cmd_ask() {
   local name="" message="" from="" from_set=0
   local reply_to_chat="" reply_to_msg=""
-  local timeout=120 idle=5 poll=2 buf_lines=2000
+  local timeout=120 idle=5 poll=2 buf_lines=2000 allow_unfenced=0
   local -a positional=()
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -13234,6 +13297,7 @@ cmd_ask() {
       --reply-to-msg=*)   reply_to_msg="${1#--reply-to-msg=}" ;;
       --timeout=*)        timeout="${1#--timeout=}" ;;
       --idle-secs=*)      idle="${1#--idle-secs=}" ;;
+      --allow-unfenced)   allow_unfenced=1 ;;
       --poll-secs=*)      poll="${1#--poll-secs=}" ;;
       --buffer-lines=*)   buf_lines="${1#--buffer-lines=}" ;;
       --)                 shift; positional+=("$@"); break ;;
@@ -13246,7 +13310,19 @@ cmd_ask() {
     name="${positional[0]}"
     positional=("${positional[@]:1}")
   fi
-  [[ -n "$name" ]] || fail "$E_USAGE" "usage: 5dive agent ask <name> <text...> [--from=<sender>] [--reply-to-chat=<id> [--reply-to-msg=<id>]] [--timeout=120] [--idle-secs=5] [--poll-secs=2]"
+  [[ -n "$name" ]] || fail "$E_USAGE" "usage: 5dive agent ask <name> <text...> [--from=<sender>] [--reply-to-chat=<id> [--reply-to-msg=<id>]] [--timeout=120] [--idle-secs=5] [--poll-secs=2] [--allow-unfenced]"
+  # DIVE-1901: --allow-unfenced re-enables pane scraping, which is the path that
+  # has fabricated every bad reply this ticket has caught. It exists for a seat
+  # that genuinely cannot follow the reply-format instruction — never for a
+  # BALLOT. A council convene must not be able to opt back into a rail that can
+  # return furniture as a vote, and "everyone just sets the flag" is the obvious
+  # way this fix decays, so the governance path refuses it in code rather than by
+  # convention. A seat that cannot fence must surface as a loud capture failure
+  # (abstainKind=capture-failed), which convene already records distinguishably
+  # from a real abstention.
+  if (( allow_unfenced )) && [[ "$from" == council* ]]; then
+    fail "$E_VALIDATION" "--allow-unfenced is refused on a council ask: a ballot may never fall back to pane scraping (it is the path that returns furniture as a vote). A seat that cannot fence must record as a CAPTURE FAILURE, not as an abstention."
+  fi
   if [[ -z "$message" && ${#positional[@]} -gt 0 ]]; then
     message="${positional[*]}"
   fi
@@ -13370,7 +13446,7 @@ cmd_ask() {
       # Already sliced privileged-side, so re-slicing at the marker is off — but
       # the FENCE still runs (it is keyed on the msg id, not on the slice), so a
       # scoped-sudo caller gets the same chrome-proof extraction as everyone else.
-      slice=$(_ask_reply_window "$baseline_file" "$msg_file" "$msg_id" 0 <<<"$slice")
+      slice=$(_ask_reply_window "$baseline_file" "$msg_file" "$msg_id" 0 "$allow_unfenced" <<<"$slice")
     else
       # DIVE-1901: capture the VISIBLE pane and accumulate across polls.
       #
@@ -13399,9 +13475,9 @@ cmd_ask() {
       #     ballot that does not lose a vote, it FABRICATES one. _ask_reply_window
       #     subtracts the question echo and the pane's own furniture, so a slice
       #     is non-empty only once the SEAT has produced something.
-      capture=$(sudo -u "agent-${name}" tmux capture-pane -t "agent-${name}" -p 2>/dev/null) || true
+      capture=$(sudo -u "agent-${name}" tmux capture-pane -t "agent-${name}" -p -S "-${buf_lines}" 2>/dev/null) || true
       slice=$(_ask_accumulate "$acc_file" <<<"$capture")
-      slice=$(_ask_reply_window "$baseline_file" "$msg_file" "$msg_id" <<<"$slice")
+      slice=$(_ask_reply_window "$baseline_file" "$msg_file" "$msg_id" 1 "$allow_unfenced" <<<"$slice")
     fi
 
     if [[ "$slice" != "$prev_slice" ]]; then
@@ -13410,13 +13486,44 @@ cmd_ask() {
     fi
 
     if (( now - start >= timeout )); then
-      fail "$E_TIMEOUT" "no idle reply from '$name' within ${timeout}s (msg_id=${msg_id})"
+      # DIVE-1901 iteration 2: say WHAT was seen, not just that nothing settled.
+      # A timeout with the fence half-written is a different fault from a timeout
+      # with no marker at all (seat ignored the format, or never got the message),
+      # and the two need different fixes. Guessing between them cost a round trip.
+      local diag=""
+      if grep -qF "<5dive-r:${msg_id}>" "$acc_file" 2>/dev/null; then
+        diag=" — the reply fence was OPENED but never completed, so nothing was returned rather than returning the pane's furniture; the seat may still be writing, or its reply scrolled past between polls (try a smaller --poll-secs)"
+      elif grep -qF "id=${msg_id}" "$acc_file" 2>/dev/null; then
+        diag=" — the question was DELIVERED (marker seen in the pane) but the seat never emitted the reply fence; it may have ignored or reformatted the [reply-format] instruction"
+      else
+        diag=" — the question marker was never seen in the pane at all, so this is a DELIVERY failure, not a capture one (check the submit race / input-prompt warning above)"
+      fi
+      if [[ -n "${FIVE_ASK_DEBUG_DIR:-}" ]] && mkdir -p "$FIVE_ASK_DEBUG_DIR" 2>/dev/null; then
+        cp -f "$baseline_file" "${FIVE_ASK_DEBUG_DIR}/${msg_id}.baseline" 2>/dev/null || true
+        cp -f "$acc_file"      "${FIVE_ASK_DEBUG_DIR}/${msg_id}.transcript" 2>/dev/null || true
+      fi
+      fail "$E_TIMEOUT" "no idle reply from '$name' within ${timeout}s (msg_id=${msg_id})${diag}"
     fi
     if [[ -n "$slice" ]] && (( now - last_change >= idle )); then
       reply="$slice"
       break
     fi
   done
+
+  # DIVE-1901 iteration 2: an OPT-IN forensic dump. The live antigravity failure
+  # could not be reproduced from a pane dumped minutes later — an alt-screen TUI
+  # overwrites, so the frame the extractor actually settled on was already gone,
+  # and a sweep of every 24-line window in that 200-line scrollback reproduced
+  # nothing. Guessing at the missing frame is how this ticket burned an iteration.
+  # With FIVE_ASK_DEBUG_DIR set, the rail keeps exactly what it saw — the
+  # baseline, the accumulated transcript, and the slice it returned — so the next
+  # occurrence pins itself instead of needing a re-run to reconstruct.
+  if [[ -n "${FIVE_ASK_DEBUG_DIR:-}" ]] && mkdir -p "$FIVE_ASK_DEBUG_DIR" 2>/dev/null; then
+    cp -f "$baseline_file" "${FIVE_ASK_DEBUG_DIR}/${msg_id}.baseline" 2>/dev/null || true
+    cp -f "$acc_file"      "${FIVE_ASK_DEBUG_DIR}/${msg_id}.transcript" 2>/dev/null || true
+    printf '%s' "$reply"  > "${FIVE_ASK_DEBUG_DIR}/${msg_id}.reply" 2>/dev/null || true
+    step "ask: forensic dump written to ${FIVE_ASK_DEBUG_DIR}/${msg_id}.{baseline,transcript,reply}"
+  fi
 
   if (( JSON_MODE )); then
     # DIVE-1901: the omit-empty key MUST NOT be `k:($v|select(length>0))`. When $v
