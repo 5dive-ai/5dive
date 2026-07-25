@@ -1,6 +1,15 @@
 [Unit]
 Description=5dive agent %i (tmux-persistent CLI)
 After=network.target
+# Backstop for any permanent boot failure the exit code doesn't name. systemd's
+# default (5 starts / 10s) never trips here because RestartSec=3 already spaces
+# starts ~3s apart — which is why a missing binary looped 9563 times over a full
+# day, burning CPU the whole time (DIVE-1882). 10 starts inside 120s catches a
+# tight crash-loop in well under a minute while still tolerating an agent that
+# dies every ~30s from a transient fault. On trip the unit goes `failed`; clear
+# it with `systemctl reset-failed 5dive-agent@<name>` after fixing the cause.
+StartLimitIntervalSec=120
+StartLimitBurst=10
 
 [Service]
 Type=simple
@@ -36,6 +45,12 @@ ExecStart=/usr/local/bin/5dive-agent-start %i
 ExecStop=/bin/bash -c '/usr/bin/tmux kill-session -t agent-%i 2>/dev/null; /usr/bin/pkill -HUP -u agent-%i -x agy 2>/dev/null; true'
 Restart=on-failure
 RestartSec=3
+# A missing binary or an unknown agent type is a PERMANENT condition — no amount
+# of retrying installs the CLI, so the unit must fail ONCE and stay failed
+# instead of restart-looping forever (DIVE-1882). 5dive-agent-start exits 2 for
+# an unknown AGENT_TYPE and 3 for "binary/plugin not installed"; every other
+# failure (crash, OOM, network) still gets the normal on-failure restart.
+RestartPreventExitStatus=2 3
 # Default KillMode=control-group: on stop, systemd SIGTERMs every process in
 # the cgroup (incl. the codex/grok/agy telegram bridge `bun`), letting bun's
 # graceful handler abort its Telegram long-poll so the next poller doesn't 409.
