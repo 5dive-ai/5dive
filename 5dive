@@ -18167,7 +18167,15 @@ _task_status_cmd() {
         if [[ "$_state" != "MERGED" || -z "$_merged" || "$_merged" == "null" ]]; then
           policy_refuse "$E_CONFLICT" done-before-pr-merged DIVE-1830 "$ident" "$ident cannot close: its delivery PR is not merged to main yet ($_dref, state=${_state:-unknown}). done=merged-to-main (DIVE-1830) — merge the PR, then run task done. Use \`task cancel\` to abandon."
         fi
-        # DIVE-1935: MERGED is not the same as GREEN. #156 was red on its own new
+        # DIVE-1935: MERGED is not the same as GREEN.
+        # Slug pairing: this DECLARED-binding site is `done-after-red-merge`; the
+        # prose/result site below is `done-after-named-red-merge`, mirroring the
+        # existing done-before-pr-merged / done-before-named-pr-merged pair. They
+        # must NOT share a slug: policy_refusals is the series DIVE-1922 was about,
+        # and one name for two causes cannot answer WHICH binding caught a red merge
+        # — a record that preserves that something happened but not what is a smaller
+        # version of the defect this whole ticket is against. tests/policy_refusals_unit.sh
+        # asserts slug uniqueness structurally and is what caught the collision. #156 was red on its own new
         # unit test, and a red PR can still be merged (admin/bypass merge), which
         # lands work whose own test says it doesn't do what the result claims.
         # Refuse only on a POSITIVE failure signal — pending/absent checks are a
@@ -18286,7 +18294,7 @@ $(db "SELECT COALESCE(body,'') FROM tasks WHERE id=${id};")"
       policy_refuse "$E_CONFLICT" done-with-open-pr-in-result DIVE-1935 "$ident" "$ident cannot close: its result/body names PR #$_txt_open, which is OPEN in $_slug2 and not merged to main. done=merged-to-main (DIVE-1935) — merge it then \`task done\`, bind it with \`task deliver --pr=\` if it is the delivery, \`task cancel\` to abandon, or \`task done $ident --force-merge-gate\` to override (audited)."
     fi
     if [[ -n "$_txt_red" && $force_merge_gate -eq 0 ]]; then
-      policy_refuse "$E_CONFLICT" done-after-red-merge DIVE-1935 "$ident" "$ident cannot close: PR #${_txt_red//,/, #} named in its result/body is merged but its checks are RED. done=merged-AND-green (DIVE-1935) — fix main (or re-run the failed check), then task done, or \`task done $ident --force-merge-gate\` to override (audited)."
+      policy_refuse "$E_CONFLICT" done-after-named-red-merge DIVE-1935 "$ident" "$ident cannot close: PR #${_txt_red//,/, #} named in its result/body is merged but its checks are RED. done=merged-AND-green (DIVE-1935) — fix main (or re-run the failed check), then task done, or \`task done $ident --force-merge-gate\` to override (audited)."
     fi
     if [[ $force_merge_gate -eq 1 ]]; then
       # Never a silent bypass: record the forced close (with the overridden PR #

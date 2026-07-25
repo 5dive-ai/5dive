@@ -259,6 +259,31 @@ run_done DECL-3 --result='x'
   && ok_t "declared delivery_ref merged + green closes" \
   || bad_t "declared merged-green must close" "rc=$RC status=$(statusof DECL-3) out=$OUT"
 
+# --- 9b. the two red-merge causes are DISTINGUISHABLE in policy_refusals ------
+# Both sites refuse a red merge, but for different reasons: one on the PR bound as
+# delivery_ref, one on a PR merely NAMED in the result/body. A shared slug would make
+# the series unable to answer WHICH binding caught it — and policy_refusals is the
+# exact instrumentation DIVE-1922 was about, so a name preserving "something happened"
+# but not "what" is a smaller instance of this ticket's own defect. It shipped that way
+# and tests/policy_refusals_unit.sh caught it by asserting slug uniqueness STRUCTURALLY.
+# That suite proves the names differ; this one proves the right one differs, so a future
+# edit cannot satisfy uniqueness by renaming the wrong site.
+db "DELETE FROM policy_refusals;"
+seed RED-1; db "UPDATE tasks SET delivery_ref='https://github.com/5dive-ai/5dive/pull/149' WHERE ident='RED-1';"
+run_done RED-1 --result='x'
+seed RED-2
+run_done RED-2 --result='landed in PR #149'
+declared=$(db  "SELECT COUNT(*) FROM policy_refusals WHERE policy='done-after-red-merge'       AND ident='RED-1';")
+named=$(db     "SELECT COUNT(*) FROM policy_refusals WHERE policy='done-after-named-red-merge' AND ident='RED-2';")
+crosstalk=$(db "SELECT COUNT(*) FROM policy_refusals
+                  WHERE (policy='done-after-red-merge'       AND ident='RED-2')
+                     OR (policy='done-after-named-red-merge' AND ident='RED-1');")
+if [[ "$declared" == "1" && "$named" == "1" && "$crosstalk" == "0" ]]; then
+  ok_t "the delivery_ref and prose red-merge causes record DISTINCT slugs, each on its own site"
+else
+  bad_t "red-merge slugs must be distinct per cause" "declared=$declared named=$named crosstalk=$crosstalk"
+fi
+
 # --- 10. cancel is never gated ----------------------------------------------
 seed CAN-1
 out=$(cmd_task_cancel CAN-1 --result='abandoning, #156 stays open' 2>&1); rc=$?
