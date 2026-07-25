@@ -26,7 +26,7 @@ esac
 
 # Bumped on every public release. `build.sh` checks this line exists; CI fails
 # the bundle-drift check if it's missing or empty.
-readonly FIVE_VERSION="0.15.11"
+readonly FIVE_VERSION="0.15.12"
 
 # GitHub org our repos live under. The org is being renamed
 # 5dive-com -> 5dive-ai (2026-06); fetches must work on either side of the
@@ -20769,6 +20769,9 @@ TASK_NOTIFY_ESCALATED_FROM=""
 # DIVE-1927: why the alert could not be delivered, so the caller's hard failure
 # states what we actually know rather than the worst-sounding of the two causes.
 TASK_NOTIFY_FAIL_REASON=""
+# DIVE-1968: the privileged re-send's stderr, kept so the parent can name WHY it
+# failed instead of only THAT it did. Empty when it succeeded or was never run.
+TASK_GATE_ESCALATE_ERR=""
 # DIVE-891: the by-NAME half of the resolution, split out so the heartbeat's
 # gate-TTL sweep (which runs as root from cron — no sudo chain, no agent-* USER)
 # can resolve a FILING AGENT's channel per gate row instead of from the caller.
@@ -20858,6 +20861,29 @@ _task_agent_paired() {
   [[ -d "$home" && -x "$home" ]] || return 2
   (( blind )) && return 2
   return 1
+}
+
+# DIVE-1968: WHY is this filer's chain empty? Three unrelated causes produced one
+# indistinguishable message, and that is why 28 real rows sat unreadable underneath
+# ~840 fixture ones. Naming the shape in the detail is what makes the acceptance
+# criterion ("zero error rows on production-store idents") checkable at all: a row
+# that cannot say what happened cannot be triaged, only counted.
+#   absent-from-org  the filer has NO agents_org row at all. It can file gates while
+#                    being outside the structure the rail walks, and nothing
+#                    reconciles the two. Largest real shape measured: 13 of 28.
+#   top-of-org       the filer IS in the chart and has no manager. Real, and 1 of 28.
+#   no-chain         in the chart, has a manager, chain still came back empty — the
+#                    shape neither the ticket nor the diagnosis named. 13 of 28, and
+#                    it is the reason this labelling landed BEFORE any rail fix.
+_task_filer_chain_shape() {
+  local filer="${1:-}" n rt
+  [[ -n "$filer" ]] || { printf 'no-filer'; return 0; }
+  n=$(db "SELECT COUNT(*) FROM agents_org WHERE name=$(sqlq "$filer");" 2>/dev/null) || n=""
+  [[ -n "$n" ]] || { printf 'org-unreadable'; return 0; }   # a failed read is NOT an empty org
+  [[ "$n" == "0" ]] && { printf 'absent-from-org'; return 0; }
+  rt=$(db "SELECT COALESCE(reports_to,'') FROM agents_org WHERE name=$(sqlq "$filer") LIMIT 1;" 2>/dev/null) || rt=""
+  [[ -z "$rt" ]] && { printf 'top-of-org'; return 0; }
+  printf 'no-chain'
 }
 
 # DIVE-1927: emit the escalation chain for <filer> — every candidate recipient
@@ -20952,7 +20978,19 @@ _task_gate_escalate_via_sudo() {
   local cli=/usr/local/bin/5dive
   [[ -x "$cli" ]] || cli=$(command -v 5dive 2>/dev/null) || return 1
   [[ -n "$cli" ]] || return 1
-  printf '%s' "$nonce" | sudo -n "$cli" task gate-escalate "$ident" --nonce=- >/dev/null 2>&1
+  # DIVE-1968: KEEP THE CHILD'S REASON. This used to be `>/dev/null 2>&1`, so the
+  # parent could only ever report "privileged re-send FAILED" with no cause, and a
+  # whole diagnosis round went into deciding whether sudo had refused the
+  # invocation or gate-escalate had returned non-zero for its own reason — a
+  # distinction the child prints and we were throwing away. Stdout stays discarded
+  # (it is the ok/JSON envelope); stderr is captured into a global the caller names
+  # in its warn and its audit row. Truncated because it rides a log line.
+  TASK_GATE_ESCALATE_ERR=""
+  local _err _rc=0
+  _err=$(printf '%s' "$nonce" | sudo -n "$cli" task gate-escalate "$ident" --nonce=- 2>&1 >/dev/null) || _rc=$?
+  TASK_GATE_ESCALATE_ERR="${_err//$'\n'/ }"
+  TASK_GATE_ESCALATE_ERR="${TASK_GATE_ESCALATE_ERR:0:300}"
+  return $_rc
 }
 
 # DIVE-1927: `5dive task gate-escalate <ident> [--nonce=-]` — internal, root-only.
@@ -20976,7 +21014,13 @@ cmd_task_gate_escalate() {
     shift
   done
   [[ -n "$ident_arg" ]] || fail "$E_USAGE" "usage: 5dive task gate-escalate <ident>"
-  [[ $EUID -eq 0 ]] || fail "$E_PERMISSION" "task gate-escalate must run as root (it reads other agents' channel state)"
+  # DIVE-1968: through the `_gate_is_root` seam (already the convention in this file,
+  # see the DIVE-1401 withdraw path) rather than reading $EUID inline. $EUID is
+  # READONLY in bash, so an inline test makes this verb unreachable from a unit
+  # harness — and an unreachable verb is how the hardcoded audit code below survived
+  # since DIVE-1927. Same lesson as the rest of this ticket: a check nobody can
+  # exercise is a check nobody can trust.
+  _gate_is_root || fail "$E_PERMISSION" "task gate-escalate must run as root (it reads other agents' channel state)"
 
   resolve_task_id "$ident_arg"; local id="$RESOLVED_TASK_ID" ident="$RESOLVED_TASK_IDENT"
   local grow
@@ -21007,7 +21051,16 @@ cmd_task_gate_escalate() {
        '{ident:$id, escalated:true, filer:$f}' --arg id "$ident" --arg f "$filer"
     return 0
   fi
-  audit_log "task gate-escalate" "error" 1 -- "task=$ident" "type=$nt" "filer=${filer:-unknown}" || true
+  # DIVE-1968: the code was a hardcoded `1`, so the ONE durable record of this verb
+  # could not distinguish rc=2 (a channel resolved, the Bot API send was simply not
+  # confirmed) from a genuine no-recipient failure — and the message below asserts
+  # the second reading whichever happened. Record the real rc, and say which of the
+  # two it was, because "zero error rows after ship" is only checkable if the rows
+  # can say what happened.
+  audit_log "task gate-escalate" "error" "$rc" -- "task=$ident" "type=$nt" "filer=${filer:-unknown}" "rc=$rc" || true
+  if [[ "$rc" == "2" ]]; then
+    fail "$E_AUTH_REQUIRED" "$ident: a channel WAS resolved in the chain above ${filer:-the filer}, but the Bot API send was not confirmed — delivery is UNVERIFIED, not refused (DIVE-1968)."
+  fi
   fail "$E_AUTH_REQUIRED" "$ident could not be delivered — no paired channel for ${filer:-the filer} or anyone above it"
 }
 
@@ -21048,13 +21101,57 @@ _task_gate_delivery_log() { # <ok|error> <task_ids> <chat> <message_id> <detail>
   local line
   line=$(printf 'gate-delivery result=%s tasks=%s chat=%s message_id=%s detail=%q' \
     "$result" "$idents" "${chat:-none}" "${message_id:-none}" "${detail:-none}")
-  local logf="${FIVEDIVE_GATE_NOTIFY_LOG:-/var/log/5dive/notify/gate-notify.log}"
-  if ( umask 0002; : >>"$logf" ) 2>/dev/null; then
+  # DIVE-1968: FENCE THE TELEMETRY ON STORE IDENTITY. This log and the audit rows
+  # are the ONLY dataset anyone reads to judge whether the gate rail works, and
+  # until now every run wrote into them from a HARDCODED prod path regardless of
+  # which task store it was driving. A unit harness points TASKS_DB at a throwaway
+  # store whose `agents_org` is EMPTY — and an empty org table gives an EMPTY
+  # escalation chain for every filer, so each fixture gate emitted a real-looking
+  # "no paired channel for filer X or anyone above it" row into production
+  # telemetry. Measured on this box: of 36 distinct idents in the error rows, 17
+  # existed ONLY in fixture stores; the true post-DIVE-1927 production population
+  # is 28 rows on 2 tasks, not the 194 on 13 the ticket was filed on.
+  #
+  # That contamination is worse than noise, and in BOTH directions: it inflated the
+  # apparent blast radius AND it hid the real residual inside it. It also
+  # manufactured the control that made the diagnosis look decisive — "13 tasks hold
+  # 194 errors and not ONE ever recorded an ok, while the ok rows belong to 6
+  # disjoint tasks" reads as proof of a broken rail, but a fixture ident can never
+  # record an ok because it was never a real gate. Zero overlap was evidence of two
+  # POPULATIONS IN ONE FILE, not of a failure.
+  #
+  # Fenced on STORE IDENTITY (_task_human_send_allowed, the DIVE-1506 positive
+  # allowlist) rather than on an opt-out env var every harness must remember: the
+  # failure mode of a forgotten override is SILENT contamination of prod telemetry,
+  # which is precisely what we are standing in. An explicit FIVEDIVE_GATE_NOTIFY_LOG
+  # is still honoured — a harness redirecting to its OWN file is the safe case and
+  # the one we want to encourage — but it can never redirect INTO the prod default.
+  # Withholding is announced once per process, because a fence that silently drops
+  # rows is the same defect class one layer over.
+  # PRIMARY is store identity and it needs NO env at all, so a harness that sets
+  # nothing is fenced BY CONSTRUCTION — including harnesses nobody has written yet,
+  # which no opt-in can manage. SECONDARY honours DIVE-1500's existing
+  # FIVEDIVE_NOTIFY_DRYRUN quarantine so we reuse that vocabulary instead of
+  # minting a rival one. The order matters: an opt-in fence is a fence you have to
+  # REMEMBER, and "four harnesses set it, the rest do not" is the exact defect being
+  # removed here. Do not fix an opt-out failure with a different opt-in.
+  local logf="${FIVEDIVE_GATE_NOTIFY_LOG:-}" _prod_telemetry=0
+  if _task_human_send_allowed \
+     && [[ -z "${FIVEDIVE_NOTIFY_DRYRUN:-}" || "${FIVEDIVE_NOTIFY_DRYRUN}" == "0" ]]; then
+    _prod_telemetry=1
+  fi
+  [[ -n "$logf" ]] || { (( _prod_telemetry )) && logf=/var/log/5dive/notify/gate-notify.log; }
+  if [[ -n "$logf" ]] && ( umask 0002; : >>"$logf" ) 2>/dev/null; then
     chmod g+w "$logf" 2>/dev/null || true
     printf '%s %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || echo '?')" "$line" >>"$logf" 2>/dev/null || true
   fi
-  audit_log "gate delivery" "$result" "$([[ "$result" == "ok" ]] && echo 0 || echo 1)" -- \
-    "tasks=$idents" "chat=${chat:-none}" "message_id=${message_id:-none}" "detail=${detail:-none}" || true
+  if (( _prod_telemetry )); then
+    audit_log "gate delivery" "$result" "$([[ "$result" == "ok" ]] && echo 0 || echo 1)" -- \
+      "tasks=$idents" "chat=${chat:-none}" "message_id=${message_id:-none}" "detail=${detail:-none}" || true
+  elif [[ -z "${_TASK_GATE_TELEMETRY_FENCED:-}" ]]; then
+    _TASK_GATE_TELEMETRY_FENCED=1
+    warn "gate-delivery telemetry withheld: TASKS_DB is not the production store, so these rows are NOT written to the fleet log or audit (DIVE-1968). Set FIVEDIVE_GATE_NOTIFY_LOG to capture them locally."
+  fi
   [[ "$result" == "ok" ]] || warn "$idents: gate alert delivery FAILED for chat ${chat:-none} (${detail:-unknown}); trying a visible group fallback"
 }
 
@@ -21349,7 +21446,7 @@ task_need_notify() {
           warn "$ident: gate alert delivered to ${_paired} via a privileged re-send (its channel is not readable as this agent)"
           return 0
         fi
-        warn "$ident: privileged re-send to ${_paired} FAILED"
+        warn "$ident: privileged re-send to ${_paired} FAILED${TASK_GATE_ESCALATE_ERR:+ — ${TASK_GATE_ESCALATE_ERR}}"
       fi
       # DIVE-1927 review round 2 (main, off RED CI on PR #160). The first cut
       # refused the gate here, and that equated "no paired TELEGRAM channel" with
@@ -21370,7 +21467,7 @@ task_need_notify() {
         # literally the DIVE-1926 case, which the 07:10 re-nag rescued.
         TASK_NOTIFY_FAIL_REASON="the privileged re-send to ${_paired} failed, so delivery is unconfirmed"
         warn "$ident: could not hand this gate to ${_paired} from here — FILED UNNOTIFIED; the heartbeat re-nag escalates it (<=15 min). Answerable now on the dashboard or: 5dive task answer ${ident}"
-        _task_gate_delivery_log error "$numid" "" "" "privileged re-send to ${_paired} failed; gate filed unnotified, re-nag will escalate"
+        _task_gate_delivery_log error "$numid" "" "" "privileged re-send to ${_paired} failed${TASK_GATE_ESCALATE_ERR:+ (${TASK_GATE_ESCALATE_ERR})}; gate filed unnotified, re-nag will escalate"
         return 3
       fi
       # Nobody up the chain is paired. This is still NOT grounds to refuse: the
@@ -21387,9 +21484,10 @@ task_need_notify() {
       # Only the WORDING forks, because an unnotified gate is routine on a box
       # with no channels and an anomaly on one that notifies.
       if _task_deployment_has_channels; then
-        TASK_NOTIFY_FAIL_REASON="${_self:-the filer} has no paired channel and neither does anyone above it in the org chart"
-        warn "$ident: NO paired channel for ${_self:-?} or anyone above it in the org chart — gate FILED UNNOTIFIED on a deployment that notifies. Nobody was pinged; answer on the dashboard or: 5dive task answer ${ident}"
-        _task_gate_delivery_log error "$numid" "" "" "no paired channel for filer ${_self:-?} or anyone above it; gate filed unnotified on a channel-having deployment"
+        local _shape; _shape=$(_task_filer_chain_shape "${_self:-}")
+        TASK_NOTIFY_FAIL_REASON="${_self:-the filer} has no paired channel and neither does anyone above it in the org chart (${_shape})"
+        warn "$ident: NO paired channel for ${_self:-?} or anyone above it in the org chart [${_shape}] — gate FILED UNNOTIFIED on a deployment that notifies. Nobody was pinged; answer on the dashboard or: 5dive task answer ${ident}"
+        _task_gate_delivery_log error "$numid" "" "" "no paired channel for filer ${_self:-?} or anyone above it; shape=${_shape}; gate filed unnotified on a channel-having deployment"
       else
         TASK_NOTIFY_FAIL_REASON=""
         warn "$ident: no channels configured on this deployment — gate filed UNNOTIFIED. Answer it on the dashboard, or: 5dive task answer ${ident}"
