@@ -49,7 +49,7 @@ _council_constitution_path() {
 # engine uses. Kept as a function (not a source-time global) so test/runtime
 # STATE_DIR overrides resolve correctly.
 _council_constitution_json() {
-  command -v node >/dev/null 2>&1 || return 1
+  ensure_node_on_path || return 1
   local dir rc=0
   dir="$(mktemp -d -t 5dive-constitution.XXXXXX)" || return 1
   _council_write_runtime "$dir"
@@ -1506,7 +1506,9 @@ _council_schedule() {
 }
 
 cmd_council() {
-  command -v node >/dev/null 2>&1 || fail "$E_GENERIC" "5dive council needs node on PATH"
+  # DIVE-1869: council is sudo-gated (it seals root-owned records) and root has no nvm node —
+  # locate it instead of dying on a bare "needs node on PATH".
+  require_node "5dive council"
   command -v jq   >/dev/null 2>&1 || fail "$E_GENERIC" "5dive council needs jq on PATH"
   local sub="${1:-}"; [[ $# -gt 0 ]] && shift || true
   case "$sub" in

@@ -234,6 +234,9 @@ const rUnbound = await dispatchBallotVote({ deadline: 100, poll: 1, _now: fixedN
   _emitBallot: async () => { emittedUnbound++ }, _exec: ballotExec({ captured: capUnbound }) })(
   { id: 'ghost', kind: 'human' }, { question: 'ship?', round: 1 })
 ok(rUnbound.vote === 'abstain' && /fail-closed/.test(rUnbound.rationale), 'human ballot: an unbound human seat -> fail-closed abstain')
+// DIVE-1869: an undelivered ballot is a CAPTURE failure, not a seat that abstained — tagged so the
+// verdict can refuse instead of sealing a clean-looking inquorate receipt.
+ok(rUnbound.capture === false && rUnbound.abstainKind === 'undeliverable', 'human ballot: an undelivered ballot is tagged a capture failure, not an abstention')
 ok(emittedUnbound === 0 && !capUnbound.some(a => a[0] === 'task' && a[1] === 'add'), 'human ballot: unbound seat mints NO task and emits NO ballot')
 
 // (h2) a BOUND human seat mints the ballot task filed to the convener + emits a 3-button ballot; a tap collects

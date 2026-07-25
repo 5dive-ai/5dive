@@ -1363,10 +1363,37 @@ ${fmt}`
 // ABSTAIN — counted in the roster denominator (seatCount) but not in approve/reject/escalate.
 export function normalizeSeatVote(seat, res) {
   if (!res || typeof res !== 'object' || !VOTE_TOKENS.includes(res.vote)) {
-    return { seat: seat.id, vote: 'abstain', rationale: (res && res.rationale) ? String(res.rationale) : 'abstained (no reply / unparseable)' }
+    return { seat: seat.id, vote: 'abstain', abstainKind: 'unusable', capture: false,
+             rationale: (res && res.rationale) ? String(res.rationale) : 'abstained (no reply / unparseable)' }
   }
   const rationale = (res.rationale && String(res.rationale).trim()) || `(${res.vote})`
-  return { seat: seat.id, vote: res.vote, rationale }
+  const row = { seat: seat.id, vote: res.vote, rationale }
+  // DIVE-1869: the dispatch adapters distinguish "the seat declined to vote" from "we never
+  // reached the seat" (capture === false + an abstainKind). That distinction MUST survive
+  // normalization — before this, the tag lived only inside the rationale prose, so the tally,
+  // the verdict and the sealed receipt could not tell a permissions/transport failure apart
+  // from a genuine unanimous abstention. Additive only: canonicalTranscript seals
+  // seat/vote/rationale, so a receipt stays byte-identical.
+  if (res.abstainKind != null) row.abstainKind = String(res.abstainKind)
+  if (res.capture === false) row.capture = false
+  return row
+}
+
+// DIVE-1869: split the non-votes into "the seat abstained" vs "we never heard the seat".
+// A row is a CAPTURE FAILURE when the adapter explicitly flagged capture === false (delivery
+// refused, ask exec failed, ballot could not be minted, dispatch threw). Anything else — a
+// deadline miss, an off-format reply, a seat that voted `abstain` on purpose — is a real
+// abstention. Used to refuse a verdict that is really a plumbing outage in disguise.
+export function captureAudit(votes) {
+  const rows = votes || []
+  const abstains = rows.filter(v => v.vote === 'abstain')
+  const failed = abstains.filter(v => v.capture === false)
+  return {
+    seatCount: rows.length,
+    abstains: abstains.length,
+    captureFailed: failed.length,
+    captureFailedSeats: failed.map(v => ({ seat: v.seat, kind: v.abstainKind || 'unknown', why: v.rationale })),
+  }
 }
 
 // Gather one round of votes from real seats via the injected dispatch adapter, in parallel. Each
@@ -1375,7 +1402,10 @@ export function normalizeSeatVote(seat, res) {
 async function dispatchRound(seats, ctx, seatVote) {
   return Promise.all(seats.map(async (s) => {
     try { return normalizeSeatVote(s, await seatVote(s, ctx)) }
-    catch (e) { return { seat: s.id, vote: 'abstain', rationale: `dispatch error: ${String(e && e.message || e)}` } }
+    // DIVE-1869: an adapter that THREW never reached the seat — tag it a capture failure, not a
+    // silent abstention (the whole roster throwing is exactly the missing-grant outage).
+    catch (e) { return { seat: s.id, vote: 'abstain', abstainKind: 'dispatch-error', capture: false,
+                         rationale: `CAPTURE FAILED (not an abstention) — dispatch error: ${String(e && e.message || e)}` } }
   }))
 }
 
@@ -1405,8 +1435,19 @@ export function synthesizeNarrative(votes, counted) {
 // Assemble the convene/standing verdict from the deterministic count + a narrative (synthesized
 // in fleet mode, chair-written on the seam). Carries the quorum bookkeeping onto the verdict so
 // the disposition + receipt reflect liveness.
-export function buildConveneVerdict(counted, narr) {
+export function buildConveneVerdict(counted, narr, votes) {
+  // DIVE-1869: carry the capture audit onto the verdict. `deliveryFailure` is the loud case — the
+  // convene is INQUORATE and EVERY non-vote is a transport/permissions failure, i.e. we never heard
+  // the council at all. The CLI refuses to emit/seal such a run (a normal-looking "Inquorate: 0 of N
+  // voted" receipt is indistinguishable from a legitimate unanimous abstention, which is the worst
+  // thing a governance engine can record). A convene with even ONE real vote or one genuine
+  // abstention is a real, if thin, deliberation and still seals.
+  const audit = captureAudit(votes)
+  const deliveryFailure = !counted.quorumMet && audit.captureFailed > 0 && audit.captureFailed === audit.abstains
   return {
+    captureFailed: audit.captureFailed,
+    captureFailedSeats: audit.captureFailedSeats,
+    deliveryFailure,
     recommendation: counted.recommendation, tally: counted.tally, threshold: counted.threshold,
     seatCount: counted.seatCount, quorum: counted.quorum, quorumMet: counted.quorumMet, votesCast: counted.votesCast,
     // CNCL-11: surface the applied decision class + who recused so the sealed receipt's verdict is
@@ -1559,7 +1600,7 @@ async function runConvene(input, deps, h) {
       finalVotes = carryForwardVotes(round1Votes, rebuttalVotes)
     }
     const counted = tallyVotes(finalVotes, tallyOpts)
-    verdict = buildConveneVerdict(counted, synthesizeNarrative(finalVotes, counted))
+    verdict = buildConveneVerdict(counted, synthesizeNarrative(finalVotes, counted), finalVotes)
   } else {
     // Standalone seam: one modelCall answers each seat. Blind round 1 (seatPrompt embeds NO
     // other seat's take), then an adversarial rebuttal that sees the round-1 votes.
@@ -1573,7 +1614,7 @@ async function runConvene(input, deps, h) {
     }
     const counted = tallyVotes(finalVotes, tallyOpts)
     const narr = await chairNarrative(modelCall, question, finalVotes)
-    verdict = buildConveneVerdict(counted, narr)
+    verdict = buildConveneVerdict(counted, narr, finalVotes)
   }
   // CNCL-19: attach the deterministic precedent citation to the verdict (followed vs departed) so
   // it surfaces on the receipt/dashboard. Additive on the verdict; sealed via a CONDITIONAL
