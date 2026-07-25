@@ -33,7 +33,14 @@ run() {
 }
 
 FULL_DIGEST='{"zeroHuman":{"shipped":100,"humanTouches":10},"stuck":{"mttuSec":600,"episodes":4},"precedentPrefill":{"count":8,"accepted":4,"acceptanceRate":50}}'
-FULL_USAGE='{"agents":[{"name":"a","total":1000},{"name":"b","total":1000}]}'
+# DIVE-1929: a usage read now declares its own coverage, and the tokens row
+# renders a number ONLY when the read was complete. The fixture carries it.
+FULL_USAGE='{"agents":[{"name":"a","total":1000},{"name":"b","total":1000}],
+             "coverage":{"agentsExpected":2,"agentsRead":2,"unreadable":[],"complete":true}}'
+PARTIAL_USAGE='{"agents":[{"name":"a","total":1000}],
+             "coverage":{"agentsExpected":16,"agentsRead":2,"complete":false,
+             "unreadable":[{"name":"b","reason":"home not readable by this user (needs root)"}]}}'
+UNLABELLED_USAGE='{"agents":[{"name":"a","total":1000},{"name":"b","total":1000}]}'
 
 # --- Case 1: everything sourced -> real numbers, and NOTHING marked no-data
 #     except the two that genuinely have no source anywhere.
@@ -48,6 +55,33 @@ ND="$(jq -r '[.metrics[]|select(.value==null)|.name]|join(",")' <<<"$OUT")"
   && ok_t "verifier first-pass computed verbatim (40/50)" || bad_t "first-pass" "$OUT"
 [[ "$(jq -r '.metrics[]|select(.name=="tokens per accepted outcome")|.value' <<<"$OUT")" == "20" ]] \
   && ok_t "tokens per accepted outcome computed verbatim (2000/100)" || bad_t "tokens" "$OUT"
+jq -e '.metrics[]|select(.name=="tokens per accepted outcome")|.sample|test("2 of 2 agent transcript sets readable")' <<<"$OUT" >/dev/null \
+  && ok_t "a complete token read still SHIPS its coverage on the row (DIVE-1922 rule)" \
+  || bad_t "coverage on complete read" "$(jq -c '.metrics[]|select(.name|test("tokens"))' <<<"$OUT")"
+
+# --- Case 1b (DIVE-1929): THE NEGATIVE CONTROL for this row. A PARTIAL read is
+#     the dangerous state — it is the only one that emits a number that is WRONG
+#     rather than absent (root 4,670,188/outcome vs agent-olivia 220,391 for the
+#     same window, 21x low, unmarked). It must not render a number at all.
+OUT1B="$(run "$FULL_DIGEST" "$PARTIAL_USAGE" "100|50|40|30" "0|10
+untiered|90")"
+TOKV="$(jq -r '.metrics[]|select(.name=="tokens per accepted outcome")|.value' <<<"$OUT1B")"
+[[ "$TOKV" == "null" ]] \
+  && ok_t "PARTIAL token read renders NO DATA, never a confident number" \
+  || bad_t "partial read rendered a number" "got: $TOKV"
+jq -e '.metrics[]|select(.name=="tokens per accepted outcome")|.nodata|test("2 of 16")' <<<"$OUT1B" >/dev/null \
+  && ok_t "the partial-read marker names the coverage it is missing" \
+  || bad_t "partial nodata reason" "$(jq -c '.metrics[]|select(.name|test("tokens"))' <<<"$OUT1B")"
+grep -q '10,000\|"10"' <<<"$(jq -c '.metrics[]|select(.name|test("tokens"))' <<<"$OUT1B")" \
+  && bad_t "partial read leaked a computed rate into the row" || ok_t "no partial-derived rate appears anywhere on the row"
+
+# --- Case 1c (DIVE-1929): an UNLABELLED total (an older collector that reports
+#     no coverage) is indistinguishable from a partial one, so it is treated as
+#     partial. Trusting it is how the bug shipped in the first place.
+OUT1C="$(run "$FULL_DIGEST" "$UNLABELLED_USAGE" "100|50|40|30" "0|10")"
+[[ "$(jq -r '.metrics[]|select(.name=="tokens per accepted outcome")|.value' <<<"$OUT1C")" == "null" ]] \
+  && ok_t "token total with NO coverage declared is refused, not assumed complete" \
+  || bad_t "unlabelled total rendered" "$OUT1C"
 
 # --- Case 2: THE CORE ASSERTION. Sources missing/empty must yield NO DATA, and
 #     specifically must never yield 0, 0%, or 0.0%.
