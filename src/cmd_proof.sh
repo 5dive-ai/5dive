@@ -33,6 +33,8 @@
 _proof_pref_file() { echo "${STATE_DIR}/proof.json"; }
 # Overridable for isolated tests; the real path needs root to write.
 _PROOF_CRON="${_PROOF_CRON:-/etc/cron.d/5dive-proof}"
+# Where the installed cron sends the tick's output. Overridable for tests.
+_PROOF_LOG="${_PROOF_LOG:-/var/log/5dive-proof.log}"
 _PROOF_DEFAULT_REPO="https://github.com/5dive-ai/5dive.git"
 _PROOF_METHODOLOGY_URL="https://github.com/5dive-ai/5dive/blob/main/docs/zero-human.md"
 
@@ -40,6 +42,77 @@ _proof_pref_get() {
   # _proof_pref_get <jq-filter> [default] — read a field from proof.json.
   local f filt def; f="$(_proof_pref_file)"; filt="$1"; def="${2:-}"
   if [ -r "$f" ]; then jq -r "$filt // \"$def\"" "$f" 2>/dev/null || echo "$def"; else echo "$def"; fi
+}
+
+# _proof_host — the box's own name, for the publisher identity stamp (DIVE-1888).
+_proof_host() { hostname -f 2>/dev/null || hostname 2>/dev/null || echo "unknown"; }
+
+# _proof_state_writable — CAN the current user persist proof.json at all?
+# Echoes the mechanism: "dir" (writable dir → atomic tmp+rename), "file"
+# (only the file itself is writable → truncate in place), or "" (neither).
+# The "file" fallback is what lets a LOCKED-DOWN state dir still work: on a box
+# where ${STATE_DIR} is root-owned with no group write (holding agents.json,
+# auth-sessions, …), granting group-write on the single proof.json file is
+# enough, instead of opening the whole directory to every agent user.
+_proof_state_writable() {
+  local f dir; f="$(_proof_pref_file)"; dir="$(dirname "$f")"
+  if [ -d "$dir" ] && [ -w "$dir" ]; then echo dir
+  elif [ -f "$f" ] && [ -w "$f" ]; then echo file
+  else echo ""; fi
+}
+
+# _proof_pref_write <jq-args...> — persist a mutation to proof.json, LOUDLY.
+#
+# DIVE-1888: this replaces five hand-rolled `jq … > "$f.tmp" && mv … || true`
+# write sites that ALL failed for two weeks without anyone noticing, in two
+# different silent ways: the lastPublished stamp sat behind a `[ -w ]` guard
+# that SKIPPED the write with no output at all (a defensive guard that erased
+# its own evidence), and the rest let the redirection error escape to the log
+# and then returned 0 anyway via `|| true`. Root cause was a permission:
+# ${STATE_DIR} was root:<group> with no group-write while the publisher ran as
+# a non-root user. State that cannot be persisted must SAY SO and must not
+# report success — a publisher that silently forgets it ran is worse than one
+# that crashes, because staleness monitoring is built on the state it forgets.
+_proof_pref_write() {
+  local f dir cur out tmp mode
+  f="$(_proof_pref_file)"; dir="$(dirname "$f")"
+  mkdir -p "$dir" 2>/dev/null || true
+  cur="$(cat "$f" 2>/dev/null || true)"; [ -n "$cur" ] || cur='{}'
+  out="$(jq "$@" <<<"$cur" 2>/dev/null)" || out=""
+  [ -n "$out" ] || { echo "proof: refusing to write ${f} — jq produced nothing. State NOT saved." >&2; return 1; }
+
+  mode="$(_proof_state_writable)"
+  case "$mode" in
+    dir)
+      tmp="$(mktemp "${f}.tmp.XXXXXX" 2>/dev/null)" \
+        || { echo "proof: cannot create a temp file in ${dir}. State NOT saved." >&2; return 1; }
+      # Carry the existing owner/mode onto the replacement — otherwise a
+      # root-run write silently strips the group-write bit the non-root
+      # publisher depends on, re-breaking the exact bug this fixes.
+      if [ -f "$f" ]; then
+        chown --reference="$f" "$tmp" 2>/dev/null || true
+        chmod --reference="$f" "$tmp" 2>/dev/null || chmod 0644 "$tmp" 2>/dev/null || true
+      else
+        chmod 0644 "$tmp" 2>/dev/null || true
+      fi
+      if ! printf '%s\n' "$out" > "$tmp" 2>/dev/null || ! mv -f "$tmp" "$f" 2>/dev/null; then
+        rm -f "$tmp" 2>/dev/null || true
+        echo "proof: could not replace ${f} (as $(id -un)). State NOT saved." >&2
+        return 1
+      fi
+      ;;
+    file)
+      printf '%s\n' "$out" > "$f" 2>/dev/null \
+        || { echo "proof: could not write ${f} (as $(id -un)). State NOT saved." >&2; return 1; }
+      ;;
+    *)
+      echo "proof: CANNOT PERSIST STATE — ${f} is not writable by $(id -un), and neither is ${dir}." >&2
+      echo "proof: every publish will look like it worked and then forget it ran (\`proof status\` stays on 'last published: never')." >&2
+      echo "proof: fix with:  sudo chgrp $(id -gn 2>/dev/null || echo '<your-group>') ${f} && sudo chmod g+w ${f}" >&2
+      return 1
+      ;;
+  esac
+  return 0
 }
 
 # _proof_ledger — OSS-38 autonomy ledger, MATERIALIZED from existing task data
@@ -122,8 +195,10 @@ _proof_publish_gate() {
       approve|approved|yes|ok|go|"go ahead") approve=1 ;;
     esac
     if [ "$human" = 1 ] && [ "$approve" = 1 ]; then
-      cur="$(cat "$f" 2>/dev/null || echo '{}')"; [ -n "$cur" ] || cur='{}'
-      jq '.publishApproved=true' <<<"$cur" > "$f.tmp" 2>/dev/null && mv "$f.tmp" "$f" || true
+      # Not fatal if it can't persist: the approval is re-derived from $ident on
+      # every run, so publishing still proceeds. But say it out loud.
+      _proof_pref_write '.publishApproved=true' \
+        || echo "proof publish: approval NOT cached in ${f}; it will be re-read from ${ident} every run." >&2
       return 0
     fi
     if [ "$human" = 1 ] && [ -n "$ans" ]; then
@@ -153,10 +228,10 @@ _proof_publish_gate() {
   cmd_task_need "$newident" --type=approval --from=proof \
     --ask="Approve publishing the PUBLIC zero-human proof badge? First public fire (brand/public-comms) — it goes live on your tap." \
     --recommend="approve" >/dev/null 2>&1 || true
-  cur="$(cat "$f" 2>/dev/null || echo '{}')"; [ -n "$cur" ] || cur='{}'
-  mkdir -p "$(dirname "$f")" 2>/dev/null || true
-  jq --arg id "$newident" '.approvalTaskIdent=$id | .publishApproved=false' <<<"$cur" > "$f.tmp" 2>/dev/null \
-    && mv "$f.tmp" "$f" || true
+  # If THIS write is lost the verb re-files a brand-new approval task on every
+  # single run, so the failure has to be shouted, not swallowed.
+  _proof_pref_write --arg id "$newident" '.approvalTaskIdent=$id | .publishApproved=false' \
+    || echo "proof publish: ${newident} was NOT recorded in ${f} — every future run will file ANOTHER approval task. Fix the permission above first." >&2
   echo "proof publish: BLOCKED — the public badge needs lodar's approval. Filed an approval gate on ${newident} to lodar." >&2
   echo "  Nothing published. Once lodar taps approve, re-run \`5dive proof publish\` (or the daily tick) and it goes live." >&2
   return 1
@@ -248,6 +323,7 @@ _proof_build() {
   printf '%s' "$week_json" > "$work/week.json"
   summary="$(DAY_JSON_FILE="$work/day.json" WEEK_JSON_FILE="$work/week.json" TODAY="$today" \
     TODAY_LABEL="$today_label" NOW_ISO="$now_iso" CLI_VERSION="$cli_version" \
+    PUB_HOST="$(_proof_host)" PUB_USER="$(id -un)" \
     METHODOLOGY_URL="$_PROOF_METHODOLOGY_URL" \
     python3 <<'PROOFPY'
 import json, os, pathlib, sys
@@ -280,6 +356,16 @@ row = {
              "humanAsks": week["zeroHuman"]["humanTouches"]},
     "cliVersion": os.environ["CLI_VERSION"],
 }
+
+# DIVE-1888: stamp WHO published, into the append-only history as well as the
+# current datapoint. A version field DATES an artifact, it does not IDENTIFY
+# its author — reading cliVersion as identity is exactly what sent the
+# DIVE-1865 publisher hunt to a machine that did not exist. host+user is the
+# identity. Additive-only, per the zero-human.json API contract.
+_pub = {k: v for k, v in (("host", os.environ.get("PUB_HOST", "")),
+                          ("user", os.environ.get("PUB_USER", ""))) if v}
+if _pub:
+    row["publishedBy"] = _pub
 hist.append(row)
 
 # DIVE-1552: derive the rolling 7-day window from the append-only daily
@@ -333,6 +419,8 @@ datapoint = {
     "source": "5dive digest --json [--7d]",
     "methodology": os.environ["METHODOLOGY_URL"],
 }
+if _pub:
+    datapoint["publishedBy"] = _pub
 
 hist_path.write_text("".join(json.dumps(h, sort_keys=True) + "\n" for h in hist))
 pathlib.Path("badge.json").write_text(json.dumps(badge, indent=2) + "\n")
@@ -409,12 +497,16 @@ _proof_publish() {
   if [ "$first" -eq 1 ]; then
     _proof_badge_snippet "$repo" "$branch"
   fi
-  # stamp lastPublished for `proof status` staleness (real publishes only).
+  # Stamp lastPublished (+ WHO published, DIVE-1888) for `proof status`
+  # staleness. This used to be wrapped in a `[ -w ]` guard that skipped the
+  # write in total silence — the single line that hid the whole bug. It is now
+  # unguarded and FATAL: a publish that cannot record that it ran must not
+  # report success, because staleness monitoring reads exactly this field.
   if [ "$dry" -ne 1 ]; then
-    local f cur today; f="$(_proof_pref_file)"; today="$(date -u +%F)"
-    if [ -w "$(dirname "$f")" ] 2>/dev/null || [ -w "$f" ] 2>/dev/null; then
-      cur="$(cat "$f" 2>/dev/null || true)"; [ -n "$cur" ] || cur='{}'
-      jq --arg d "$today" '.lastPublished=$d' <<<"$cur" > "$f.tmp" 2>/dev/null && mv "$f.tmp" "$f" || true
+    if ! _proof_pref_write --arg d "$(date -u +%F)" --arg h "$(_proof_host)" --arg u "$(id -un)" \
+           '.lastPublished=$d | .lastPublishedBy={host:$h,user:$u}'; then
+      echo "proof publish: the push SUCCEEDED but the state write did not — \`proof status\` will keep reporting stale/never and the staleness alarm is blind. Reporting failure deliberately." >&2
+      return "$E_GENERIC"
     fi
   fi
   return 0
@@ -425,12 +517,28 @@ _proof_publish() {
 # on/off/re-on is clean. OSS-30: the cron's effective user must own the box's
 # git push credentials — on boxes where root has none, pass --user=<name>.
 _proof_install_cron() {
-  local hour="$1" user="${2:-root}"
+  local hour="$1" user="${2:-root}" log="$_PROOF_LOG"
   [ -d /etc/cron.d ] || { echo "proof: /etc/cron.d absent — skipping cron install" >&2; return 0; }
+  # DIVE-1888: the cron line redirects into $log, and the shell opens that file
+  # AS ${user} BEFORE /usr/local/bin/5dive ever runs. On this box the file was
+  # root:root 0644 while the publisher runs as a non-root user, so the whole
+  # command would have died on the redirect — before the publisher started, with
+  # cron mail as the only signal. Same shape as the DIVE-1896 monitor failure:
+  # a destination nobody proved. Prove it HERE, while we still have root, rather
+  # than discovering it at 02:40. Best-effort by design: a box without the log
+  # still gets its cron, it just gets told the output has nowhere to go.
+  if : >> "$log" 2>/dev/null \
+     || { mkdir -p "$(dirname "$log")" 2>/dev/null && : >> "$log" 2>/dev/null; }; then
+    if [ "$user" != "root" ] && ! chown "$user" "$log" 2>/dev/null; then
+      echo "proof: WARNING — could not chown ${log} to ${user}; the cron cannot open it, so its output (including publish failures) is lost." >&2
+    fi
+  else
+    echo "proof: WARNING — cannot create ${log}; the cron redirects there and will fail on the redirect before publishing anything." >&2
+  fi
   cat > "$_PROOF_CRON" <<CRON
 # 5dive zero-human proof publisher (OSS-17) — daily; gated on the per-box pref
 # (${STATE_DIR}/proof.json). Removed by \`5dive proof off\`.
-0 ${hour} * * * ${user} /usr/local/bin/5dive proof tick >> /var/log/5dive-proof.log 2>&1
+0 ${hour} * * * ${user} /usr/local/bin/5dive proof tick >> ${log} 2>&1
 CRON
   chmod 644 "$_PROOF_CRON"
 }
@@ -463,16 +571,28 @@ _proof_onoff() {
       case "$hour" in ''|*[!0-9]*) fail "$E_USAGE" "proof on: --at must be an hour 0-23" ;; esac
       { [ "$hour" -ge 0 ] && [ "$hour" -le 23 ]; } || fail "$E_USAGE" "proof on: --at must be 0-23"
       id "$user" >/dev/null 2>&1 || fail "$E_USAGE" "proof on: --user=$user is not a known system user"
-      mkdir -p "$(dirname "$f")"
-      jq --arg r "$repo" --arg b "$branch" --argjson h "$hour" --arg u "$user" \
-        '.enabled=true | .repo=$r | .branch=$b | .hour=$h | .user=$u' <<<"$cur" > "$f.tmp" && mv "$f.tmp" "$f"
+      _proof_pref_write --arg r "$repo" --arg b "$branch" --argjson h "$hour" --arg u "$user" \
+        '.enabled=true | .repo=$r | .branch=$b | .hour=$h | .user=$u' \
+        || fail "$E_GENERIC" "proof on: could not persist ${f} — nothing enabled"
       _proof_install_cron "$hour" "$user"
       local as=""; [ "$user" = "root" ] || as=" as ${user}"
       echo "proof: ON — daily ${hour}:00 → ${repo} (${branch})${as}"
+      # THE TRAP (DIVE-1888): repointing the publisher at a non-root user LOOKS
+      # like it worked even when that user cannot write the state file — this
+      # command runs as root, so it persists fine and tells you nothing. Check
+      # writability AS the configured user, here, once, loudly.
+      if [ "$user" != "root" ] && command -v runuser >/dev/null 2>&1; then
+        if ! runuser -u "$user" -- test -w "$f" 2>/dev/null \
+           && ! runuser -u "$user" -- test -w "$(dirname "$f")" 2>/dev/null; then
+          echo "proof: WARNING — ${user} cannot write ${f}, so its publishes will not persist lastPublished (they will look fine and forget they ran)." >&2
+          echo "proof: fix with:  chgrp $(id -gn "$user" 2>/dev/null || echo "$user") ${f} && chmod g+w ${f}" >&2
+        fi
+      fi
       ;;
     off)
       require_root
-      jq '.enabled=false' <<<"$cur" > "$f.tmp" 2>/dev/null && mv "$f.tmp" "$f" || true
+      _proof_pref_write '.enabled=false' \
+        || echo "proof: the cron is removed but ${f} still says enabled — the pref did not persist." >&2
       rm -f "$_PROOF_CRON"
       echo "proof: OFF (cron removed, config kept)"
       ;;
@@ -481,8 +601,8 @@ _proof_onoff() {
       # no publish — `proof status` is read-only and never touches the network.
       local led; led="$(_proof_ledger)"
       if [ "${JSON_MODE:-0}" = 1 ]; then
-        jq -c --argjson autonomy "$led" \
-          '{autonomy:$autonomy, enabled:(.enabled//false), publishApproved:(.publishApproved//false), repo:(.repo//null), branch:(.branch//"status"), hour:(.hour//9), lastPublished:(.lastPublished//null)}' <<<"$cur"
+        jq -c --argjson autonomy "$led" --arg wr "$(_proof_state_writable)" \
+          '{autonomy:$autonomy, enabled:(.enabled//false), publishApproved:(.publishApproved//false), repo:(.repo//null), branch:(.branch//"status"), hour:(.hour//9), lastPublished:(.lastPublished//null), lastPublishedBy:(.lastPublishedBy//null), stateWritable:($wr != "")}' <<<"$cur"
         return 0
       fi
       local _ship _ask _apct
@@ -515,9 +635,16 @@ _proof_onoff() {
           staleness="${d}d ago"
           [ "$enabled" = "true" ] && [ "$d" -gt 1 ] && staleness="${staleness} ⚠ STALE (pipeline may be broken)"
         fi
-        echo "last published: ${last} (${staleness})"
+        local by; by="$(jq -r 'if .lastPublishedBy then " by \(.lastPublishedBy.user // "?")@\(.lastPublishedBy.host // "?")" else "" end' <<<"$cur" 2>/dev/null || echo "")"
+        echo "last published: ${last} (${staleness})${by}"
       else
         echo "last published: never"
+      fi
+      # DIVE-1888: "never" is ambiguous — it reads identically whether nothing
+      # has ever published or every publish was unable to record that it did.
+      # Say which.
+      if [ -z "$(_proof_state_writable)" ]; then
+        echo "state: ⚠ ${f} is NOT writable by $(id -un) — publishes cannot persist, so the line above is not evidence of anything"
       fi
       [ -f "$_PROOF_CRON" ] && echo "cron: ${_PROOF_CRON} installed" || echo "cron: not installed"
       ;;
@@ -525,15 +652,32 @@ _proof_onoff() {
   esac
 }
 
-# _proof_tick — cron driver (root). Gated on the pref: only publishes when
-# enabled. The publish is itself idempotent per-day (exit 3), so a double-fire
-# is harmless. Best-effort: always returns 0 so a miss never spams cron mail.
+# _proof_tick — cron driver. Gated on the pref: only publishes when enabled.
+# The publish is itself idempotent per-day (exit 3), so a double-fire is harmless.
+#
+# NB (DIVE-1888): this verb has **no live caller on the 5dive box**. Its only
+# caller is the cron that `proof on` installs, and that cron was removed under
+# DIVE-1865; the real 02:40 publisher invokes `proof publish` directly from an
+# agent session. Anything re-wiring the publisher (DIVE-1889) should target
+# `proof publish`, or re-install the cron via `proof on` — do not assume a tick
+# is running just because this function exists.
+#
+# It no longer swallows failures. The old body was
+# `_proof_publish >/dev/null 2>&1 || true`, which discarded BOTH the message and
+# the exit code — the state-write failure this release makes fatal would have
+# died right here, which is the whole defect class. stdout stays quiet (a cron
+# should be silent on success) while stderr AND the exit code escape, so a
+# failing tick is visible to whatever runs it even if its log is unreadable.
+# The old "always return 0 so a miss never spams cron mail" trade is exactly
+# backwards: cron mail is a channel, silence is not. Exit 3 (already published
+# today) is a genuine success for a scheduled run and is mapped to 0.
 _proof_tick() {
-  local f; f="$(_proof_pref_file)"
+  local f rc=0; f="$(_proof_pref_file)"
   [ -r "$f" ] || return 0
   [ "$(jq -r '.enabled // false' "$f" 2>/dev/null)" = "true" ] || return 0
-  _proof_publish >/dev/null 2>&1 || true
-  return 0
+  _proof_publish >/dev/null || rc=$?
+  [ "$rc" -eq 3 ] && rc=0
+  return "$rc"
 }
 
 cmd_proof() {
