@@ -872,20 +872,51 @@ else:
 # 5. TOKENS per accepted outcome. The row is NAMED for what it measures —
 #    a label is a footnote, the name is the claim, and a reader scanning a
 #    scorecard reads names. Never called "cost": see the money line below.
+#
+#    DIVE-1929: this row is caller-dependent. usage_collect can only read the
+#    transcripts the CALLER can read, and an unreadable agent used to look
+#    exactly like an idle one — root saw 4,670,188/outcome, agent-olivia saw
+#    220,391 (4.7% of the truth, 21x low), agent-dev3 saw 46,253, and all three
+#    rendered as confident complete numbers with no marker. The denominator
+#    makes it worse: `shipped` is always company-wide, so a partial numerator
+#    over a whole denominator is not even a slice of a real ratio.
+#
+#    The rule is DIVE-1922's: a number never ships without its coverage. Here
+#    that means the number ships ONLY at full coverage (carrying it), and any
+#    partial read degrades to NO DATA naming what was missed. Unknown coverage
+#    counts as partial — an old collector's unlabelled total is exactly the
+#    thing that cannot be trusted.
 tok_total = None
+cov = None
 try:
     with open(os.environ["USAGE_FILE"]) as fh:
         raw = fh.read().strip()
     if raw:
-        tok_total = sum(int(a.get("total") or 0) for a in (json.loads(raw).get("agents") or []))
+        u = json.loads(raw)
+        tok_total = sum(int(a.get("total") or 0) for a in (u.get("agents") or []))
+        cov = u.get("coverage") or None
 except Exception:
-    tok_total = None
-if tok_total and shipped:
-    metrics.append(metric("tokens per accepted outcome", f"{round(tok_total / shipped):,}",
-                          f"{tok_total:,} tokens / {shipped} shipped", note="subscription tokens"))
-else:
+    tok_total, cov = None, None
+
+if not (tok_total and shipped):
     metrics.append(metric("tokens per accepted outcome", None,
                           nodata="token transcripts unreadable from here (needs root)"))
+elif not cov:
+    metrics.append(metric("tokens per accepted outcome", None,
+                          nodata="token coverage unknown — the collector did not report which "
+                                 "transcript sets it could read, and an unlabelled total cannot "
+                                 "be told apart from a partial one"))
+elif not cov.get("complete"):
+    read, exp = cov.get("agentsRead"), cov.get("agentsExpected")
+    metrics.append(metric("tokens per accepted outcome", None,
+                          nodata=f"only {read} of {exp} agent transcript sets readable from here — "
+                                 f"a partial read over company-wide outcomes understates this row "
+                                 f"(needs root)"))
+else:
+    metrics.append(metric("tokens per accepted outcome", f"{round(tok_total / shipped):,}",
+                          f"{tok_total:,} tokens / {shipped} shipped; "
+                          f"{cov.get('agentsRead')} of {cov.get('agentsExpected')} agent transcript sets readable",
+                          note="subscription tokens"))
 
 # 6/7. No source exists. Rendered as an explicit marker naming the task that
 #      would build it — telling the reader WHY beats telling them THAT.

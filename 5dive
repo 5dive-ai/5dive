@@ -26,7 +26,7 @@ esac
 
 # Bumped on every public release. `build.sh` checks this line exists; CI fails
 # the bundle-drift check if it's missing or empty.
-readonly FIVE_VERSION="0.15.1"
+readonly FIVE_VERSION="0.15.2"
 
 # GitHub org our repos live under. The org is being renamed
 # 5dive-com -> 5dive-ai (2026-06); fetches must work on either side of the
@@ -34877,7 +34877,7 @@ usage_collect() {
   local since="$1" db
   db="${TASKS_DB:-${STATE_DIR}/tasks/tasks.db}"
   REGISTRY="$REGISTRY" TASK_DB="$db" USAGE_SINCE="$since" python3 - <<'PY'
-import os, json, glob, time, sqlite3, datetime as dt
+import os, json, glob, time, sqlite3, errno, datetime as dt
 
 since = int(os.environ["USAGE_SINCE"])
 now   = int(time.time())
@@ -34907,11 +34907,58 @@ agents = {n: a for n, a in reg.get("agents", {}).items()
           if a.get("type", "claude") == "claude"}
 
 def home_of(name):
+    # USAGE_HOME_ROOT relocates the whole agent-home tree. Test seam only —
+    # a coverage test has to be able to build agent homes it can make
+    # unreadable, and it must not depend on the uid the suite runs as.
+    root = os.environ.get("USAGE_HOME_ROOT") or ""
+    if root:
+        return os.path.join(root, "agent-" + name)
     import pwd
     try:
         return pwd.getpwnam("agent-" + name).pw_dir
     except KeyError:
         return "/home/agent-" + name
+
+# DIVE-1929: an agent whose transcripts this caller cannot READ is not an agent
+# that did no work — and until now the two were indistinguishable. Every failure
+# to read (EACCES on a 700 home, a denied file) hit a bare `continue`, the agent
+# fell out of `agents`, and the sum came out confident and 21x low. Worse,
+# os.path.exists() answers False for a path under an unreadable parent, so
+# "missing" could not be trusted to mean missing either.
+#
+# So readability is now PROBED and reported. The rule: only ENOENT is treated as
+# "nothing recorded here" (a real absence). Every other OSError means we are
+# blind to this agent and must say so.
+unreadable = []
+
+def probe_readable(home, projects):
+    """-> (readable, reason). readable=True means we saw everything there was.
+
+    Probes the TRANSCRIPT DIR first, not the home. A home is commonly mode 700
+    while the transcript dir underneath it is reachable by path, and probing the
+    home first would file a readable agent as a blind spot — under-reporting
+    coverage AND dropping that agent's real tokens out of `5dive usage`.
+    """
+    try:
+        os.listdir(projects)
+        return True, None
+    except OSError as e:
+        if e.errno in (errno.EACCES, errno.EPERM):
+            return False, "transcript dir not readable by this user (needs root)"
+        if e.errno != errno.ENOENT:
+            return False, "transcript dir unreadable: %s" % (e.strerror or e.errno)
+    # ENOENT is ambiguous: a path under an unreadable parent reports "missing"
+    # too (os.path.exists lies here). Only an ENOENT we can CONFIRM from a
+    # readable home means the agent genuinely recorded nothing.
+    try:
+        os.listdir(home)
+    except OSError as e:
+        if e.errno == errno.ENOENT:
+            return True, None      # no such agent home at all: nothing to read
+        if e.errno in (errno.EACCES, errno.EPERM):
+            return False, "home not readable by this user (needs root)"
+        return False, "home unreadable: %s" % (e.strerror or e.errno)
+    return True, None              # home readable, no transcript dir: idle
 
 # --- scan transcripts: per agent per model token sums + per-turn timeline ---
 # turns[name] = list of (epoch, out_tokens, total_tokens) for task attribution.
@@ -34919,18 +34966,28 @@ agent_rows = []
 turns_by_agent = {}
 for name, meta in agents.items():
     home = home_of(name)
+    projects = os.path.join(home, ".claude", "projects")
+    readable, why = probe_readable(home, projects)
+    if not readable:
+        unreadable.append({"name": name, "reason": why})
+        continue
     models = {}
     turns = []
-    pat = os.path.join(home, ".claude", "projects", "*", "*.jsonl")
+    denied = None
+    pat = os.path.join(projects, "*", "*.jsonl")
     for path in glob.glob(pat):
         try:
             if os.path.getmtime(path) < since:   # whole file predates window
                 continue
-        except OSError:
+        except OSError as e:
+            if e.errno != errno.ENOENT:          # vanished mid-scan is fine; denied is not
+                denied = denied or "some transcript files unreadable: %s" % (e.strerror or e.errno)
             continue
         try:
             f = open(path, "r", errors="ignore")
-        except OSError:
+        except OSError as e:
+            if e.errno != errno.ENOENT:
+                denied = denied or "some transcript files unreadable: %s" % (e.strerror or e.errno)
             continue
         with f:
             for line in f:
@@ -34955,6 +35012,10 @@ for name, meta in agents.items():
                 m = models.setdefault(model, {"in":0,"out":0,"cc":0,"cr":0,"turns":0})
                 m["in"]+=i; m["out"]+=ot; m["cc"]+=cc; m["cr"]+=cr; m["turns"]+=1
                 turns.append((ts, ot, i+ot+cc))   # total excludes cache-read
+    # A partial read of ONE agent still makes the company total partial: the row
+    # is flagged even though its (understated) tokens are still reported.
+    if denied:
+        unreadable.append({"name": name, "reason": denied})
     if not models:
         continue
     # Headline "total" EXCLUDES cache reads: a cache-read token is ~0.1x weight
@@ -35037,6 +35098,15 @@ for a in wins:
 print(json.dumps({
     "window": {"since": since, "now": now},
     "agents": agent_rows, "tasks": tasks, "untracked": untracked,
+    # DIVE-1929: what this read COVERED, so a consumer can tell a company-wide
+    # total from one agent's slice. Sets READ vs sets that EXIST — the count
+    # never travels without it.
+    "coverage": {
+        "agentsExpected": len(agents),
+        "agentsRead": len(agents) - len(unreadable),
+        "unreadable": unreadable,
+        "complete": not unreadable,
+    },
 }))
 PY
 }
@@ -37210,20 +37280,51 @@ else:
 # 5. TOKENS per accepted outcome. The row is NAMED for what it measures —
 #    a label is a footnote, the name is the claim, and a reader scanning a
 #    scorecard reads names. Never called "cost": see the money line below.
+#
+#    DIVE-1929: this row is caller-dependent. usage_collect can only read the
+#    transcripts the CALLER can read, and an unreadable agent used to look
+#    exactly like an idle one — root saw 4,670,188/outcome, agent-olivia saw
+#    220,391 (4.7% of the truth, 21x low), agent-dev3 saw 46,253, and all three
+#    rendered as confident complete numbers with no marker. The denominator
+#    makes it worse: `shipped` is always company-wide, so a partial numerator
+#    over a whole denominator is not even a slice of a real ratio.
+#
+#    The rule is DIVE-1922's: a number never ships without its coverage. Here
+#    that means the number ships ONLY at full coverage (carrying it), and any
+#    partial read degrades to NO DATA naming what was missed. Unknown coverage
+#    counts as partial — an old collector's unlabelled total is exactly the
+#    thing that cannot be trusted.
 tok_total = None
+cov = None
 try:
     with open(os.environ["USAGE_FILE"]) as fh:
         raw = fh.read().strip()
     if raw:
-        tok_total = sum(int(a.get("total") or 0) for a in (json.loads(raw).get("agents") or []))
+        u = json.loads(raw)
+        tok_total = sum(int(a.get("total") or 0) for a in (u.get("agents") or []))
+        cov = u.get("coverage") or None
 except Exception:
-    tok_total = None
-if tok_total and shipped:
-    metrics.append(metric("tokens per accepted outcome", f"{round(tok_total / shipped):,}",
-                          f"{tok_total:,} tokens / {shipped} shipped", note="subscription tokens"))
-else:
+    tok_total, cov = None, None
+
+if not (tok_total and shipped):
     metrics.append(metric("tokens per accepted outcome", None,
                           nodata="token transcripts unreadable from here (needs root)"))
+elif not cov:
+    metrics.append(metric("tokens per accepted outcome", None,
+                          nodata="token coverage unknown — the collector did not report which "
+                                 "transcript sets it could read, and an unlabelled total cannot "
+                                 "be told apart from a partial one"))
+elif not cov.get("complete"):
+    read, exp = cov.get("agentsRead"), cov.get("agentsExpected")
+    metrics.append(metric("tokens per accepted outcome", None,
+                          nodata=f"only {read} of {exp} agent transcript sets readable from here — "
+                                 f"a partial read over company-wide outcomes understates this row "
+                                 f"(needs root)"))
+else:
+    metrics.append(metric("tokens per accepted outcome", f"{round(tok_total / shipped):,}",
+                          f"{tok_total:,} tokens / {shipped} shipped; "
+                          f"{cov.get('agentsRead')} of {cov.get('agentsExpected')} agent transcript sets readable",
+                          note="subscription tokens"))
 
 # 6/7. No source exists. Rendered as an explicit marker naming the task that
 #      would build it — telling the reader WHY beats telling them THAT.
