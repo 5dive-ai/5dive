@@ -51,6 +51,11 @@ _task_agent_channel() {
   [[ -n "$n" && " $READABLE " == *" $n "* ]] || return 1
   TASK_CH_TOKEN=tok TASK_CH_ACCESS="$TMP/access.json" TASK_CH_TYPE=claude; return 0
 }
+# Keep a handle on the REAL probe before stubbing it, so the absent-vs-forbidden
+# assertions below exercise the shipped function rather than the stub.
+eval "_real_task_agent_paired() $(declare -f _task_agent_paired | tail -n +2)"
+# Stub is two-valued on purpose (0/1); the three-valued undetermined case is
+# driven explicitly where it matters.
 _task_agent_paired() { local n="$1"; [[ -n "$n" && " $PAIRED " == *" $n "* ]]; }
 _task_owner_channel() { _task_agent_channel "${FILER_SELF:-}"; }
 task_actor() { printf '%s' "${FILER_SELF:-dev3}"; }
@@ -155,6 +160,55 @@ out=$( (cmd_task_need DIVE-9004 --type=decision --ask="which way?" --options="A|
 row=$(db "SELECT status||'|'||COALESCE(need_type,'-')||'|'||COALESCE(ask,'-')||'|'||COALESCE(tier,-1) FROM tasks WHERE id=${did};")
 [[ "$row" == "todo|-|-|-1" ]] && ok_t "the undeliverable gate is UNDONE (task left workable)" \
   || bad_t "gate rolled back" "row='$row'"
+
+# ---- 6. absent vs FORBIDDEN in the pairing probe (main's PR #160 review) -----
+# The probe must be three-valued. A boolean would put the very conflation this
+# ticket exists to remove back on the connector env — and with fail-closed
+# `task need`, an unreadable token would REFUSE a gate on a healthy chain.
+CONN_OK="$TMP/conn"; mkdir -p "$CONN_OK"
+CONNECTORS_DIR="$CONN_OK"
+_real_task_agent_paired nosuchagent0001; rc=$?
+[[ "$rc" == "1" ]] && ok_t "searchable connector dir + genuinely absent token => PROVABLY unpaired (1)" \
+  || bad_t "absent token is provable" "rc=$rc"
+
+# Root-proof blindness: point CONNECTORS_DIR at a regular FILE. `! -d` is true
+# for every uid including root, so this negative control cannot vacuously pass
+# in a root CI run the way a chmod-000 fixture would.
+printf 'x' >"$TMP/not-a-dir"
+CONNECTORS_DIR="$TMP/not-a-dir"
+_real_task_agent_paired nosuchagent0001; rc=$?
+[[ "$rc" == "2" ]] && ok_t "unsearchable connector dir => UNDETERMINED (2), never 'unpaired'" \
+  || bad_t "blind dir is undetermined" "rc=$rc (1 here would refuse gates on a healthy chain)"
+
+CONNECTORS_DIR="$CONN_OK"
+printf 'TELEGRAM_BOT_TOKEN=t\n' >"$CONN_OK/telegram-nosuchagent0001.env"
+if [[ $EUID -ne 0 ]]; then
+  chmod 000 "$CONN_OK/telegram-nosuchagent0001.env"
+  _real_task_agent_paired nosuchagent0001; rc=$?
+  [[ "$rc" == "2" ]] && ok_t "token file present but FORBIDDEN => UNDETERMINED (2)" \
+    || bad_t "forbidden token is undetermined" "rc=$rc"
+  chmod 644 "$CONN_OK/telegram-nosuchagent0001.env"
+else
+  printf 'SKIP - forbidden-token case needs a non-root uid (running as root); the root-proof\n       unsearchable-dir case above covers the same branch\n'
+fi
+
+# And the behaviour that actually matters: an UNDETERMINED chain must not refuse.
+_task_agent_paired() { return 2; }
+mk_gate DIVE-9005 dev3
+FILER_SELF=dev3 READABLE="" PAIRED=""
+SENT=""; SUDO_CALLS=""; SUDO_RC=0
+task_need_notify DIVE-9005 decision "pick one" "" "" "" "" "" ""; rc=$?
+[[ "$rc" == "0" && "$SUDO_CALLS" == *"DIVE-9005"* ]] \
+  && ok_t "an UNDETERMINED chain escalates to a privileged sender instead of refusing" \
+  || bad_t "undetermined chain must not refuse" "rc=$rc calls='$SUDO_CALLS'"
+
+# When that privileged hand-off fails, say what we KNOW, not the worst cause.
+SUDO_RC=1; TASK_NOTIFY_FAIL_REASON=""
+task_need_notify DIVE-9005 decision "pick one" "" "" "" "" "" ""; rc=$?
+[[ "$rc" == "2" && "$TASK_NOTIFY_FAIL_REASON" == *"re-send"* && "$TASK_NOTIFY_FAIL_REASON" != *"no paired channel"* ]] \
+  && ok_t "a failed hand-off reports the hand-off, not a false 'nobody is paired'" \
+  || bad_t "failure reason is honest" "rc=$rc reason='$TASK_NOTIFY_FAIL_REASON'"
+_task_agent_paired() { local n="$1"; [[ -n "$n" && " $PAIRED " == *" $n "* ]]; }
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]

@@ -20036,7 +20036,7 @@ cmd_task_need() {
               need_asked_at=NULL, gate_pinged_at=NULL, human_nonce_hash=NULL
         WHERE id=${id};"
     [[ $EUID -eq 0 ]] && audit_log "task need undeliverable" "error" 1 -- "task=$ident" "type=$type" "filer=$actor" || true
-    fail "$E_AUTH_REQUIRED" "$ident gate NOT filed — ${actor} has no paired channel and neither does anyone above it in the org chart, so this ask would reach no human. Pair a channel for ${actor}, or hand the ask to a paired agent: 5dive agent send <lead> \"...\". The task was left untouched."
+    fail "$E_AUTH_REQUIRED" "$ident gate NOT filed — ${TASK_NOTIFY_FAIL_REASON:-${actor} has no paired channel and neither does anyone above it in the org chart}, so this ask would reach no human. Pair a channel for ${actor}, or hand the ask to a paired agent: 5dive agent send <lead> \"...\". The task was left untouched."
   fi
   local floor_note=""; (( tier_floored )) && floor_note=" [tier forced to 2 — T2 category floor]"
   local prec_note=""; [[ -n "$precedent_cite" ]] && prec_note=" [${precedent_cite}]"
@@ -20057,6 +20057,9 @@ TASK_CH_TOKEN="" TASK_CH_ACCESS="" TASK_CH_TYPE=""
 # DIVE-1927: set by task_need_notify when the alert was escalated off an unpaired
 # filer, so the message can name whose ask the recipient is looking at.
 TASK_NOTIFY_ESCALATED_FROM=""
+# DIVE-1927: why the alert could not be delivered, so the caller's hard failure
+# states what we actually know rather than the worst-sounding of the two causes.
+TASK_NOTIFY_FAIL_REASON=""
 # DIVE-891: the by-NAME half of the resolution, split out so the heartbeat's
 # gate-TTL sweep (which runs as root from cron — no sudo chain, no agent-* USER)
 # can resolve a FILING AGENT's channel per gate row instead of from the caller.
@@ -20101,16 +20104,50 @@ _task_owner_channel() {
 # the target" (re-run the send as root). Getting that distinction wrong is exactly
 # how DIVE-1243's lead fallback degraded into a silent no-op: it probed
 # readability, read Permission-denied as "unpaired", and returned OK.
+# Three-valued ON PURPOSE: 0 = paired, 1 = PROVABLY not paired, 2 = undetermined
+# (we are blind, because something we needed to look at exists but is forbidden,
+# or sits behind a directory we may not search). Only a PROVABLE 1 may be treated
+# as "this ask can reach nobody" — an undetermined 2 must be handled like paired,
+# i.e. escalated to a privileged sender who can actually see.
+#
+# The three-valued return is the whole point. A boolean here would reintroduce the
+# absent-vs-forbidden conflation ONE LAYER OVER: the connector env is currently
+# 0640 root:claude and every agent is in group claude, so a plain `-r` works today
+# — but the day a connector file is tightened to 0600, or an agent lands outside
+# group claude, an unreadable token would read as "unpaired". Before this fix that
+# would have cost a delayed gate. WITH the fail-closed `task need` it would REFUSE
+# a gate on a chain that is perfectly fine. Absence and denial must never share an
+# answer in a probe whose false-negative refuses work. (Found by main reviewing
+# PR #160 — the second instance of the exact mechanism the fix exists to remove,
+# inside the fix. Third instance the same night: DIVE-1929, where
+# os.path.exists() answers False under a mode-700 home.)
 _task_agent_paired() {
-  local name="$1"; [[ -n "$name" ]] || return 1
-  local token="" token_file="${CONNECTORS_DIR}/telegram-${name}.env"
-  [[ -r "$token_file" ]] && token=$(sed -n 's/^TELEGRAM_BOT_TOKEN=//p' "$token_file" | head -1)
-  [[ -n "$token" ]] || return 1
+  local name="${1:-}"; [[ -n "$name" ]] || return 1
+  local blind=0 token="" token_file="${CONNECTORS_DIR}/telegram-${name}.env"
+  if [[ -r "$token_file" ]]; then
+    # Readable and genuinely tokenless is the one case that PROVES unpaired.
+    token=$(sed -n 's/^TELEGRAM_BOT_TOKEN=//p' "$token_file" | head -1)
+    [[ -n "$token" ]] || return 1
+  elif [[ -e "$token_file" ]]; then
+    blind=1                                   # exists, forbidden -> not evidence
+  elif [[ ! -d "$CONNECTORS_DIR" || ! -x "$CONNECTORS_DIR" ]]; then
+    blind=1                                   # can't even search the dir -> ditto
+  else
+    return 1                                  # dir searchable, file really absent
+  fi
+
   local t d
   for t in claude codex grok antigravity; do
     d=$(_tg_access_state_dir "agent-${name}" "$t") || continue
-    [[ -d "$d" ]] && return 0
+    [[ -d "$d" ]] || continue
+    (( blind )) && return 2
+    return 0
   done
+  # No channel dir found. Same question again: absence, or blindness? A home we
+  # may not traverse cannot tell us anything about what is inside it.
+  local home="/home/agent-${name}"
+  [[ -d "$home" && -x "$home" ]] || return 2
+  (( blind )) && return 2
   return 1
 }
 
@@ -20160,10 +20197,13 @@ _task_chain_channel() {
 # run, even though this uid can't read their access.json)? Echoes the first such
 # agent. Empty + rc 1 means the ask is genuinely undeliverable to any human.
 _task_chain_paired() {
-  local filer="$1" c
+  local filer="$1" c rc
   while IFS= read -r c; do
     [[ -n "$c" ]] || continue
-    if _task_agent_paired "$c"; then printf '%s' "$c"; return 0; fi
+    _task_agent_paired "$c"; rc=$?
+    # 0 paired, 2 undetermined — both mean "a privileged sender may well reach
+    # this agent", and only an all-1 chain licenses refusing the gate.
+    [[ "$rc" == "0" || "$rc" == "2" ]] && { printf '%s' "$c"; return 0; }
   done < <(_task_escalation_chain "$filer")
   return 1
 }
@@ -20563,7 +20603,7 @@ task_need_notify() {
   #   3. nobody up the chain is paired at all -> return 2, and the caller UNDOES
   #      the gate and fails loudly. A gate nobody can answer is worse than a
   #      refused one: the refusal is visible, the silence is not.
-  TASK_NOTIFY_ESCALATED_FROM=""
+  TASK_NOTIFY_ESCALATED_FROM=""; TASK_NOTIFY_FAIL_REASON=""
   if ! _task_owner_channel; then
     # In a root sweep (heartbeat cron: no SUDO_UID, USER=root) the caller is not
     # the filer, so the chain must start from the gate row's own filer.
@@ -20583,8 +20623,19 @@ task_need_notify() {
         fi
         warn "$ident: privileged re-send to ${_paired} FAILED"
       fi
-      warn "$ident: NO paired channel for ${_self:-?} or anyone above it in the org chart — this ask can reach no human"
-      _task_gate_delivery_log error "$numid" "" "" "no paired channel for filer ${_self:-?} or anyone above it in the org chart"
+      # Two different failures, and saying the wrong one is its own small lie.
+      # "Nobody is paired" is a claim we may only make when every agent up the
+      # chain was PROVABLY unpaired; if one was merely undetermined, what we
+      # actually know is that the privileged hand-off did not work.
+      if [[ -n "$_paired" ]]; then
+        TASK_NOTIFY_FAIL_REASON="the privileged re-send to ${_paired} failed, so delivery is unconfirmed"
+        warn "$ident: could not hand this gate to ${_paired} — delivery unconfirmed"
+        _task_gate_delivery_log error "$numid" "" "" "privileged re-send to ${_paired} failed; delivery unconfirmed"
+      else
+        TASK_NOTIFY_FAIL_REASON="${_self:-the filer} has no paired channel and neither does anyone above it in the org chart"
+        warn "$ident: NO paired channel for ${_self:-?} or anyone above it in the org chart — this ask can reach no human"
+        _task_gate_delivery_log error "$numid" "" "" "no paired channel for filer ${_self:-?} or anyone above it in the org chart"
+      fi
       return 2
     fi
   fi
