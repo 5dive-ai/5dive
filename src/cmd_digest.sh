@@ -124,6 +124,12 @@ cmd_digest() {
   self="$(command -v 5dive 2>/dev/null || true)"
   _digest_run() { if [ -n "$self" ]; then "$self" "$@"; else bash "$0" "$@"; fi; }
 
+  # The one shape allowed to stand in for an unread usage source (DIVE-1937).
+  # complete:false is what makes it degrade rather than read as an idle fleet.
+  _digest_usage_unavailable() {
+    printf '%s\n' '{"data":{"agents":[],"tasks":[],"coverage":{"agentsExpected":null,"agentsRead":0,"unreadable":[],"complete":false,"unavailable":true,"reason":"the usage collector could not be run by this caller (5dive usage needs root)"}}}'
+  }
+
   # Stage each source in a temp file (a large task queue blows past the env-var
   # size limit if passed inline). Paths — not payloads — go to python.
   local tmpd
@@ -132,8 +138,14 @@ cmd_digest() {
   trap "rm -rf '$tmpd'" RETURN
   _digest_run task ls --all --json >"$tmpd/tasks.json" 2>/dev/null || echo '{"data":{"tasks":[]}}' >"$tmpd/tasks.json"
   [ -s "$tmpd/tasks.json" ] || echo '{"data":{"tasks":[]}}' >"$tmpd/tasks.json"
-  _digest_run usage --json >"$tmpd/usage.json" 2>/dev/null || echo '{"data":{"agents":[],"tasks":[]}}' >"$tmpd/usage.json"
-  [ -s "$tmpd/usage.json" ] || echo '{"data":{"agents":[],"tasks":[]}}' >"$tmpd/usage.json"
+  # DIVE-1937: the fallback used to ERASE the failure. `usage` is root-only, so
+  # every non-root digest fell straight through to an empty agent list that
+  # renders exactly like a quiet fleet — and then the health line went on to
+  # claim "no rate-limit pressure" on the strength of a source it never read.
+  # The fallback now carries a coverage stanza saying the source was unreadable,
+  # so the standup can say UNKNOWN instead of implying zero.
+  _digest_run usage --json >"$tmpd/usage.json" 2>/dev/null || _digest_usage_unavailable >"$tmpd/usage.json"
+  [ -s "$tmpd/usage.json" ] || _digest_usage_unavailable >"$tmpd/usage.json"
   _digest_run heartbeat ls >"$tmpd/hb.txt" 2>/dev/null || : >"$tmpd/hb.txt"
   # DIVE-972: per-loop token burn (cost side of the loop control window). --all
   # so a loop that finished (done/escalated/killed) in the window still reports
@@ -298,6 +310,19 @@ ht_l = [{"ident": t.get("ident"), "type": t.get("need_type"),
          "answer": (t.get("need_answer") or "").strip()} for t in human_touches]
 
 # Usage: top agents by output tokens + their share-of-limit; flag anyone hot.
+#
+# DIVE-1937: the burn block and the health line both rest on a read that can be
+# SHORT — usage_collect only sees the transcripts its caller may read (DIVE-1929)
+# — so the coverage the collector reports travels with the numbers here too. An
+# absent coverage key is treated as partial, not as complete: an unlabelled total
+# is indistinguishable from a truncated one, which is how this shipped.
+usage_cov = usage_data.get("coverage") if isinstance(usage_data, dict) else None
+if not isinstance(usage_cov, dict):
+    usage_cov = {"agentsExpected": None, "agentsRead": None, "unreadable": [],
+                 "complete": False, "unavailable": False,
+                 "reason": "the usage collector reported no coverage — an unlabelled "
+                           "total cannot be told apart from a partial read"}
+usage_complete = bool(usage_cov.get("complete"))
 agents = usage_data.get("agents", []) or []
 agents_sorted = sorted(agents, key=lambda a: a.get("output", 0), reverse=True)
 usage_l = [{"name": a.get("name"), "output": a.get("output", 0),
@@ -461,7 +486,11 @@ if as_json:
         "precedentPrefill": {"count": len(prefilled), "accepted": len(accepted),
                              "acceptanceRate": prefill_rate,
                              "byKind": {"exact": prefill_exact, "fuzzy": prefill_fuzzy}},
-        "usage": usage_l, "health": {"stale": stale, "hot": [h["name"] for h in hot]},
+        "usage": usage_l, "usageCoverage": usage_cov,
+        "health": {"stale": stale, "hot": [h["name"] for h in hot],
+                   # DIVE-1937: `hot` is only a claim about what was READ. A
+                   # consumer must not read an empty list as "nobody is hot".
+                   "hotCoverage": "complete" if usage_complete else "partial"},
         "loops": {"total": loops_total, "capped": len(loops_capped), "byLoop": loops_burn},
         "stuck": {"mttuSec": mttu_sec, "episodes": len(in_window),
                   "openStuck": len(open_stuck), "byCause": mttu_by_cause},
@@ -566,10 +595,30 @@ else:
     if hot:
         out.append("⚠️ Rate-limit watch: " +
                    ", ".join(f"{h['name']} {h['fiveHourPct']}%/5h" for h in hot))
+    # DIVE-1937: say what the burn read COVERED before any claim that rests on it.
+    if not usage_complete:
+        if usage_cov.get("unavailable"):
+            out.append("\U0001F512 Token burn UNKNOWN — " + str(usage_cov.get("reason") or
+                       "the usage source could not be read") + ". Unknown is not zero.")
+        else:
+            u = usage_cov.get("unreadable") or []
+            named = ", ".join(x.get("name", "?") for x in u[:4])
+            more = f" +{len(u) - 4} more" if len(u) > 4 else ""
+            read, exp = usage_cov.get("agentsRead"), usage_cov.get("agentsExpected")
+            span = (f"{read} of {exp}" if read is not None and exp is not None else "an unknown share of")
+            out.append(f"\U0001F512 Token burn PARTIAL — {span} agent transcript sets readable"
+                       + (f" (missing: {named}{more})" if named else "")
+                       + ". The burn figures are a floor, not the fleet.")
     if stale:
         out.append("\U0001F634 Heartbeat stale: " + ", ".join(stale))
     if not hot and not stale:
-        out.append("\U0001F49A Fleet healthy — heartbeats fresh, no rate-limit pressure")
+        # "no rate-limit pressure" is a claim about every agent. It may only be
+        # made when every agent was actually read (DIVE-1937).
+        if usage_complete:
+            out.append("\U0001F49A Fleet healthy — heartbeats fresh, no rate-limit pressure")
+        else:
+            out.append("\U0001F49B Heartbeats fresh; rate-limit pressure UNVERIFIED — "
+                       "the burn read above was short of the fleet")
     print("\n".join(out))
 PY
 
