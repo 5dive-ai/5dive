@@ -1486,7 +1486,7 @@ _hb_repo_grep_ident() {  # <repo-stem> <ident>
   local repo="$1" ident="$2" dir="${_HB_REPO_BASE}/$1" line
   [[ -d "$dir/.git" || -f "$dir/.git" ]] || return 1
   line=$(git -C "$dir" log "$_HB_GATE_SHIPPED_REF" -E \
-           --grep="${ident}([^0-9]|\$)" --format='%h %s' -1 2>/dev/null) || return 1
+           --grep="${ident}([^0-9]|\$)" --format='%h %ct %s' -1 2>/dev/null) || return 1
   [[ -n "$line" ]] || return 1
   printf '%s %s\n' "$repo" "$line"
 }
@@ -1576,6 +1576,21 @@ _hb_gate_shipped_sweep() {
       hit=""
     done
     [[ -n "$hit" ]] || continue
+    # DIVE-2001: a merge that PREDATES the open ask cannot be evidence the ask is
+    # satisfied. The flag fired on DIVE-1968 citing a commit merged ~2h before the
+    # gate existed, telling the owner "likely shipped, verify and close" about work
+    # the open ask had nothing to do with. On a ticket that lands in pieces that
+    # nudge points the right way for the wrong reason, arrives with the authority
+    # of an automatic check, and agrees with what the assignee already wants to do.
+    # Deliberately does NOT stamp shipped_flag_at: the gate stays eligible, so a
+    # genuinely later merge still flags on a subsequent tick.
+    _c_epoch=$(awk '{print $3}' <<<"$hit")
+    _asked=$(db "SELECT COALESCE(strftime('%s', need_asked_at),'') FROM tasks WHERE id=${gid};")
+    if [[ "$_c_epoch" =~ ^[0-9]+$ && "$_asked" =~ ^[0-9]+$ ]] && (( _c_epoch < _asked )); then
+      _hb_log "[gate-shipped] ${gident} — newest matching commit PREDATES the open ask ($(date -u -d @"$_c_epoch" +%FT%TZ) < $(date -u -d @"$_asked" +%FT%TZ)); NOT flagging, gate stays eligible"
+      audit_log "gate shipped-flag" "skip" 0 -- "task=$gident" "reason=commit-predates-ask" "commit=$hit" || true
+      continue
+    fi
     db "UPDATE tasks SET shipped_flag_at=datetime('now') WHERE id=${gid};"
     audit_log "gate shipped-flag" "ok" 0 -- "task=$gident" "type=$gtype" "commit=$hit" || true
     _hb_log "[gate-shipped] ${gident} — commit on ${_HB_GATE_SHIPPED_REF} references it: ${hit} -> flagged"

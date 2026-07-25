@@ -39,7 +39,7 @@ audit_log()           { return 0; }
 MERGED=""
 _hb_repo_grep_ident() {  # <repo> <ident>
   [[ -n "$MERGED" && "$2" == "$MERGED" ]] || return 1
-  printf '%s abc1234 fix: %s landed\n' "$1" "$2"
+  printf '%s abc1234 %s fix: %s landed\n' "$1" "${MERGED_EPOCH:-$(date +%s)}" "$2"
 }
 
 PASS=0; FAIL=0
@@ -53,7 +53,7 @@ mk_gate() {  # <tier> <need_type> -> echoes id (ident auto = DIVE-<id>)
               $(sqlq "$2"), $1, 'need a human call', datetime('now','-1 days'));
       SELECT last_insert_rowid();"
 }
-reset() { db "DELETE FROM tasks;"; : >"$SEND_LOG"; MERGED=""; }
+reset() { db "DELETE FROM tasks;"; : >"$SEND_LOG"; MERGED=""; MERGED_EPOCH=""; }
 
 # --- Case 1: tier-1 gate whose ident merged -> flagged + owner pinged ---------
 reset
@@ -122,6 +122,32 @@ flag=$(db "SELECT COALESCE(shipped_flag_at,'NULL') FROM tasks WHERE id=${gid};")
 [[ "$rc" -eq 0 && "$flag" == "NULL" ]] \
   && ok_t "empty repo allow-list is a graceful no-op" \
   || bad_t "empty allow-list not handled" "rc=$rc shipped_flag_at=$flag"
+
+
+# --- DIVE-2001: a merge PREDATING the open ask is not evidence the ask is met ---
+# One fixture per direction so a future edit names which case died. mk_gate sets
+# need_asked_at to now-1day, so "before" is now-2days and "after" is now.
+reset
+gid=$(mk_gate 1 decision); MERGED="DIVE-${gid}"; MERGED_EPOCH=$(date -d '2 days ago' +%s)
+_hb_gate_shipped_sweep
+flag=$(db "SELECT COALESCE(shipped_flag_at,'NULL') FROM tasks WHERE id=${gid};")
+[[ "$flag" == "NULL" ]] \
+  && ok_t "DIVE-2001: commit PREDATING the ask does not stamp shipped_flag_at (gate stays eligible)" \
+  || bad_t "pre-ask commit flagged" "shipped_flag_at=$flag"
+[[ ! -s "$SEND_LOG" ]] \
+  && ok_t "DIVE-2001: commit predating the ask does not ping the owner to close" \
+  || bad_t "pre-ask commit pinged owner" "sent=[$(tr '\n' ',' <"$SEND_LOG")]"
+
+# NEGATIVE CONTROL: same fixture, same gate, commit AFTER the ask -> must flag.
+# Without this, the two assertions above pass just as happily on a sweep that has
+# stopped flagging anything at all.
+reset
+gid=$(mk_gate 1 decision); MERGED="DIVE-${gid}"; MERGED_EPOCH=$(date +%s)
+_hb_gate_shipped_sweep
+flag=$(db "SELECT COALESCE(shipped_flag_at,'NULL') FROM tasks WHERE id=${gid};")
+{ [[ "$flag" != "NULL" ]] && grep -qx 'dev' "$SEND_LOG"; } \
+  && ok_t "DIVE-2001 control: commit AFTER the ask still flags and pings" \
+  || bad_t "post-ask commit did not flag" "shipped_flag_at=$flag sent=[$(tr '\n' ',' <"$SEND_LOG")]"
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]
