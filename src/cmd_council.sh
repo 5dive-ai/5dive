@@ -1160,6 +1160,18 @@ export function canonicalTranscript(rec) {
     const r1 = rec.round1Votes.slice().sort((a, b) => (norm(a.seat) < norm(b.seat) ? -1 : 1))
     for (const v of r1) L.push(`round1 ${norm(v.seat)}: ${norm(v.vote != null ? v.vote : v.choice)} :: ${norm(v.rationale)}`)
   }
+  // DIVE-1869: SEAL which seats we never REACHED. The abstain/capture-failure distinction has to
+  // survive on the DURABLE record, not just in the run — a later reader of a receipt is otherwise
+  // back to guessing whether "0 of 6 voted" was a council that said nothing or a rail that was
+  // down, which is the whole defect. Recording it only in the (unsealed) verdict JSON would leave
+  // it strippable, so it goes inside the signed bytes.
+  // CONDITIONAL line (CNCL-19 precedent): emitted only when a seat was actually unreached, so a
+  // healthy convene — and every pre-DIVE-1869 receipt — seals byte-identically. Sorted for a
+  // stable seal regardless of dispatch completion order.
+  const unreached = (rec.votes || []).filter(v => v && v.capture === false)
+  if (unreached.length) {
+    L.push(`unreached: ${unreached.map(v => `${norm(v.seat)}:${norm(v.abstainKind || 'unknown')}`).slice().sort().join(',')}`)
+  }
   const vd = rec.verdict || {}
   const t = vd.tally || {}
   L.push(`verdict: ${norm(vd.recommendation != null ? vd.recommendation : vd.choice)} conf=${Number(vd.confidence)} tally=a${Number(t.approve) || 0}/r${Number(t.reject) || 0}/e${Number(t.escalate) || 0} escalated=${!!vd.escalated}`)
@@ -2789,6 +2801,23 @@ async function cmdConvene() {
   if (vf.deliveryFailure) {
     const who = (vf.captureFailedSeats || []).map(x => `${x.seat} [${x.kind}]`).join(', ')
     const why = (vf.captureFailedSeats || []).map(x => x.why).filter(Boolean)[0] || 'no reply captured'
+    // DIVE-1869: a refusal that exists only as stderr is not a record — the run leaves NOTHING
+    // sealed (by design), so without this the fleet has no durable trace that a convene was
+    // attempted and could not reach anyone. Same reasoning as the DIVE-1935 merge-gate fail-open:
+    // the branch that declines to act is exactly the one that must be auditable. bash reads this
+    // sink after the non-zero exit and emits the audit row (it cannot see our stderr, and buffering
+    // stderr to capture it would break live progress on a long convene).
+    const sink = process.env.COUNCIL_REFUSAL_SINK
+    if (sink) {
+      try {
+        fs.writeFileSync(sink, JSON.stringify({
+          reason: 'delivery-failure', seatCount: vf.seatCount, captureFailed: vf.captureFailed,
+          seats: (vf.captureFailedSeats || []).map(x => x.seat),
+          kinds: [...new Set((vf.captureFailedSeats || []).map(x => x.kind))],
+          detail: String(why).slice(0, 300),
+        }))
+      } catch { /* best-effort: the loud refusal below is unaffected */ }
+    }
     die(`council convene FAILED TO DELIVER — 0 of ${vf.seatCount} seats were reached (${vf.captureFailed} capture failure(s): ${who}). This is a TRANSPORT/PERMISSIONS outage, NOT an abstention, so no verdict was reached and NO receipt was sealed. First failure: ${why}. Fix the rail (root/_deliver grant, agent running, task queue writable) and re-convene.`, 7)
   }
   out({
@@ -4068,6 +4097,28 @@ _council_gate_json() {
     '{ident:$ident, ask:$ask, type:$type, tier:$tier, recommend:$recommend, options:$options, live:$live}'
 }
 
+# DIVE-1869: turn a convene REFUSAL into one durable audit row. A convene that could not reach its
+# seats seals NOTHING by design, so without this the attempt leaves no trace at all — stderr is not
+# a record. Same posture as the DIVE-1935 merge-gate fail-open: the branch that declines to act is
+# precisely the one that has to be auditable. Split out as a named function so the row's SHAPE is
+# testable against an isolated AUDIT_LOG, without a live convene. Never fails the caller.
+_council_audit_refusal() {
+  local sink="$1" rc="$2"
+  [[ -n "$sink" && -s "$sink" ]] || return 0
+  local reason seats kinds unreached detail
+  reason="$(jq -r '.reason // "unknown"' "$sink" 2>/dev/null || echo unknown)"
+  seats="$(jq -r '(.seats // []) | join(",")' "$sink" 2>/dev/null || echo "")"
+  kinds="$(jq -r '(.kinds // []) | join(",")' "$sink" 2>/dev/null || echo "")"
+  unreached="$(jq -r '"\(.captureFailed // 0)/\(.seatCount // 0)"' "$sink" 2>/dev/null || echo "")"
+  detail="$(jq -r '(.detail // "") | .[0:200]' "$sink" 2>/dev/null || echo "")"
+  # NOTE: audit args carry NO leading `--`. audit_log builds the row with `jq -cn … --args`, and jq
+  # rejects a positional that starts with `--` — the whole jq call then fails and `|| return 0`
+  # swallows it, so a dash-prefixed arg silently emits NO ROW AT ALL. Caught by this ticket's own
+  # test; it is the same silent-empty shape the fix is about. Every existing call site is dash-less.
+  audit_log "council convene" error "$rc" -- "refused=${reason}" "unreached=${unreached}" \
+    "seats=${seats}" "kinds=${kinds}" "detail=${detail}"
+}
+
 # Run the sealed primary-council convene on a question, return the --json envelope.
 _council_convene_json() {
   local q="$1"; shift
@@ -4912,10 +4963,21 @@ cmd_council() {
     fi
   fi
 
+  # DIVE-1869: a convene that could not REACH its seats refuses and seals NOTHING — so without a
+  # durable trace the attempt vanishes entirely (stderr is not a record). cli.mjs drops the refusal
+  # detail in this sink; we turn it into one audit row. Same posture as the DIVE-1935 merge-gate
+  # fail-open: the branch that declines to act is the one that must be auditable. A sink we cannot
+  # write, or a refusal for any other reason, just yields no row — never a failed convene.
+  local _refusal; _refusal="$(mktemp -t 5dive-council-refusal.XXXXXX 2>/dev/null || echo "")"
   local raw
-  raw="$(node "$dir/cli.mjs" convene "$@" "${veto_args[@]}" "${precedent_args[@]}" ${drift_flag} --constitution-path="$(_council_constitution_path)" --registry="$COUNCIL_REGISTRY" --genesis-exists="$genesis_exists" --stamped-at="$stamped")"; local _rc=$?
+  raw="$(COUNCIL_REFUSAL_SINK="$_refusal" node "$dir/cli.mjs" convene "$@" "${veto_args[@]}" "${precedent_args[@]}" ${drift_flag} --constitution-path="$(_council_constitution_path)" --registry="$COUNCIL_REGISTRY" --genesis-exists="$genesis_exists" --stamped-at="$stamped")"; local _rc=$?
   [[ -n "$_pp_tmp" ]] && rm -f "$_pp_tmp" 2>/dev/null || true
-  (( _rc == 0 )) || return $_rc
+  if (( _rc != 0 )); then
+    _council_audit_refusal "$_refusal" "$_rc"
+    rm -f "$_refusal" 2>/dev/null || true
+    return $_rc
+  fi
+  rm -f "$_refusal" 2>/dev/null || true
 
   # Seal the receipt canonical at the root HMAC rail — a standalone engine has no
   # key, so the seal (via gate-proof) is what makes the verdict tamper-evident. The

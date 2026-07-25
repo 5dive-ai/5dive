@@ -105,6 +105,45 @@ else
   has "$outq" "cannot reach the seat-delivery rail" && ok 1 "pre-flight must NOT refuse a caller that HAS the grant" || ok 0 "a caller with the grant passes the pre-flight"
 fi
 
+# ---- the refusal leaves a DURABLE audit row, not just loud stderr ------------------------------
+# A refused convene seals NOTHING by design, so the audit row is the ONLY trace the attempt
+# happened. Driven against an ISOLATED AUDIT_LOG (never the host's real one) by calling the same
+# named function the convene path calls, plus a STRUCTURAL assertion that the path actually calls it
+# — the shape that caught the DIVE-1935 slug collision.
+SINK="$TMP/refusal.json"
+cat > "$SINK" <<'SINKEOF'
+{"reason":"delivery-failure","seatCount":3,"captureFailed":3,"seats":["alpha","beta","gamma"],"kinds":["capture-failed"],"detail":"sudo: a password is required"}
+SINKEOF
+row="$(bash -c '
+  AUDIT_LOG="'"$TMP"'/audit/agent-audit.log"
+  mkdir -p "$(dirname "$AUDIT_LOG")"; : > "$AUDIT_LOG"
+  source src/lib/error_codes.sh; source src/lib/output.sh; source src/lib/validation.sh
+  source src/lib/state.sh; source src/lib/audit.sh
+  source <(sed -n "/^_council_audit_refusal() {/,/^}/p" src/cmd_council.sh)
+  _council_audit_refusal "'"$SINK"'" 7
+  cat "$AUDIT_LOG"' 2>/dev/null)"
+ok "$([[ -n "$row" ]] && echo 0 || echo 1)" "a refused convene emits an audit row (got: ${row:-<none>})"
+echo "$row" | jq -e '.cmd == "council convene" and .result == "error" and .code == 7' >/dev/null 2>&1   && ok 0 "the audit row records the command, an error result and the refusal exit code"   || ok 1 "audit row cmd/result/code (got: $row)"
+echo "$row" | jq -e '[.args[] | select(startswith("refused=delivery-failure"))] | length == 1' >/dev/null 2>&1   && ok 0 "the audit row names the refusal REASON (delivery-failure), not just that it failed"   || ok 1 "audit row names the reason (got: $row)"
+echo "$row" | jq -e '([.args[] | select(test("^seats=alpha,beta,gamma$"))] | length) == 1 and ([.args[] | select(test("^unreached=3/3$"))] | length) == 1' >/dev/null 2>&1   && ok 0 "the audit row names WHICH seats were unreached and how many of how many"   || ok 1 "audit row names the seats and the ratio (got: $row)"
+# An empty/absent sink must never emit a row (a refusal for some other reason is not a delivery one).
+empty="$(bash -c '
+  AUDIT_LOG="'"$TMP"'/audit2/agent-audit.log"
+  mkdir -p "$(dirname "$AUDIT_LOG")"; : > "$AUDIT_LOG"
+  source src/lib/error_codes.sh; source src/lib/output.sh; source src/lib/validation.sh
+  source src/lib/state.sh; source src/lib/audit.sh
+  source <(sed -n "/^_council_audit_refusal() {/,/^}/p" src/cmd_council.sh)
+  _council_audit_refusal "'"$TMP"'/nope.json" 3
+  wc -c < "$AUDIT_LOG"' 2>/dev/null | tr -d " ")"
+ok "$([[ "$empty" == "0" ]] && echo 0 || echo 1)" "no sink => no audit row (only a delivery refusal is recorded as one)"
+# STRUCTURAL: the convene path must actually CALL it — a correct row that nothing invokes is dead.
+grep -q '_council_audit_refusal "\$_refusal" "\$_rc"' "$ROOT/src/cmd_council.sh" \
+  && ok 0 "the convene failure path calls the refusal auditor" \
+  || ok 1 "convene failure path wires the refusal auditor"
+grep -q 'COUNCIL_REFUSAL_SINK=' "$ROOT/src/cmd_council.sh" \
+  && ok 0 "the convene path hands cli.mjs a refusal sink to write" \
+  || ok 1 "convene path sets COUNCIL_REFUSAL_SINK"
+
 # ================================================================== (2) node discovery under sudo ==
 # The bundle must LOCATE node rather than dying on "needs node on PATH", and must pick the NEWEST
 # nvm release (a plain glob is lexicographic: v9.9.9 would beat v10.0.0).

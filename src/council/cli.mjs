@@ -727,6 +727,23 @@ async function cmdConvene() {
   if (vf.deliveryFailure) {
     const who = (vf.captureFailedSeats || []).map(x => `${x.seat} [${x.kind}]`).join(', ')
     const why = (vf.captureFailedSeats || []).map(x => x.why).filter(Boolean)[0] || 'no reply captured'
+    // DIVE-1869: a refusal that exists only as stderr is not a record — the run leaves NOTHING
+    // sealed (by design), so without this the fleet has no durable trace that a convene was
+    // attempted and could not reach anyone. Same reasoning as the DIVE-1935 merge-gate fail-open:
+    // the branch that declines to act is exactly the one that must be auditable. bash reads this
+    // sink after the non-zero exit and emits the audit row (it cannot see our stderr, and buffering
+    // stderr to capture it would break live progress on a long convene).
+    const sink = process.env.COUNCIL_REFUSAL_SINK
+    if (sink) {
+      try {
+        fs.writeFileSync(sink, JSON.stringify({
+          reason: 'delivery-failure', seatCount: vf.seatCount, captureFailed: vf.captureFailed,
+          seats: (vf.captureFailedSeats || []).map(x => x.seat),
+          kinds: [...new Set((vf.captureFailedSeats || []).map(x => x.kind))],
+          detail: String(why).slice(0, 300),
+        }))
+      } catch { /* best-effort: the loud refusal below is unaffected */ }
+    }
     die(`council convene FAILED TO DELIVER — 0 of ${vf.seatCount} seats were reached (${vf.captureFailed} capture failure(s): ${who}). This is a TRANSPORT/PERMISSIONS outage, NOT an abstention, so no verdict was reached and NO receipt was sealed. First failure: ${why}. Fix the rail (root/_deliver grant, agent running, task queue writable) and re-convene.`, 7)
   }
   out({

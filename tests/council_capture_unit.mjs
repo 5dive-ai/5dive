@@ -84,12 +84,38 @@ const vQ = buildConveneVerdict(cQ, synthesizeNarrative(quorate, cQ), quorate)
 ok(vQ.quorumMet === true && vQ.deliveryFailure === false && vQ.captureFailed === 1,
   'a quorate convene still passes, with the unreached seat recorded')
 
-// ---- the seal is unchanged: tags are ADDITIVE, never in the canonical bytes ----
-const rec = { council: 'council', mode: 'quick', stampedAt: 'T', question: 'q', seats: ['a', 'b', 'c'],
-  votes: allFailed, verdict: vAllFailed }
-const recPlain = { ...rec, votes: allFailed.map(v => ({ seat: v.seat, vote: v.vote, rationale: v.rationale })) }
-ok(canonicalTranscript(rec) === canonicalTranscript(recPlain),
-  'canonicalTranscript is byte-identical with or without the tags (pre-DIVE-1869 receipts still verify)')
+// ---- the DURABLE record: which seats we never reached is SEALED, conditionally ----
+// The distinction has to outlive the run. Recording it only in the (unsealed) verdict JSON would
+// leave it strippable, so it rides inside the signed bytes as a CONDITIONAL line — present only
+// when a seat was actually unreached, so a healthy convene seals byte-identically to before.
+const strip = (vs) => vs.map(v => ({ seat: v.seat, vote: v.vote, rationale: v.rationale }))
+const recOf = (votes, verdict) => ({ council: 'council', mode: 'quick', stampedAt: 'T', question: 'q',
+  seats: ['a', 'b', 'c'], votes, verdict })
+
+// (1) a convene with NO capture failure seals byte-identically to a pre-DIVE-1869 receipt
+const cClean = tallyVotes(allAbstained, { seats: SEATS })
+const vClean = buildConveneVerdict(cClean, synthesizeNarrative(allAbstained, cClean), allAbstained)
+ok(canonicalTranscript(recOf(allAbstained, vClean)) === canonicalTranscript(recOf(strip(allAbstained), vClean)),
+  'a convene with no capture failure seals byte-identically (pre-DIVE-1869 receipts still verify)')
+ok(!/unreached:/.test(canonicalTranscript(recOf(allAbstained, vClean))),
+  'no `unreached:` line is emitted when every seat was reached')
+
+// (2) an unreached seat IS in the sealed bytes, naming the seat and the failure kind
+const canonFailed = canonicalTranscript(recOf(allFailed, vAllFailed))
+ok(/unreached: a:capture-failed,b:capture-failed,c:capture-failed/.test(canonFailed),
+  'the canonical seals WHICH seats were unreached and why')
+ok(canonFailed !== canonicalTranscript(recOf(strip(allFailed), vAllFailed)),
+  'stripping the tags CHANGES the sealed bytes — the record is tamper-evident, not decorative')
+
+// (3) the line is order-stable, so dispatch completion order never perturbs the seal
+const shuffled = [allFailed[2], allFailed[0], allFailed[1]]
+ok(canonicalTranscript(recOf(shuffled, vAllFailed)) === canonFailed,
+  'the unreached line is sorted — dispatch order cannot perturb the seal')
+
+// (4) mixed: only the UNREACHED seats are named, not the genuine abstention
+const canonSome = canonicalTranscript(recOf(someHeard, vSome))
+ok(/unreached: a:capture-failed,c:ballot-mint-failed/.test(canonSome) && !/unreached:[^\n]*b:/.test(canonSome),
+  'only unreached seats are sealed into the line; a genuine abstention is not one of them')
 
 console.log(`council capture unit: ${pass} passed, ${fail} failed`)
 process.exit(fail ? 1 : 0)

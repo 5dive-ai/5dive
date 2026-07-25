@@ -913,6 +913,18 @@ export function canonicalTranscript(rec) {
     const r1 = rec.round1Votes.slice().sort((a, b) => (norm(a.seat) < norm(b.seat) ? -1 : 1))
     for (const v of r1) L.push(`round1 ${norm(v.seat)}: ${norm(v.vote != null ? v.vote : v.choice)} :: ${norm(v.rationale)}`)
   }
+  // DIVE-1869: SEAL which seats we never REACHED. The abstain/capture-failure distinction has to
+  // survive on the DURABLE record, not just in the run — a later reader of a receipt is otherwise
+  // back to guessing whether "0 of 6 voted" was a council that said nothing or a rail that was
+  // down, which is the whole defect. Recording it only in the (unsealed) verdict JSON would leave
+  // it strippable, so it goes inside the signed bytes.
+  // CONDITIONAL line (CNCL-19 precedent): emitted only when a seat was actually unreached, so a
+  // healthy convene — and every pre-DIVE-1869 receipt — seals byte-identically. Sorted for a
+  // stable seal regardless of dispatch completion order.
+  const unreached = (rec.votes || []).filter(v => v && v.capture === false)
+  if (unreached.length) {
+    L.push(`unreached: ${unreached.map(v => `${norm(v.seat)}:${norm(v.abstainKind || 'unknown')}`).slice().sort().join(',')}`)
+  }
   const vd = rec.verdict || {}
   const t = vd.tally || {}
   L.push(`verdict: ${norm(vd.recommendation != null ? vd.recommendation : vd.choice)} conf=${Number(vd.confidence)} tally=a${Number(t.approve) || 0}/r${Number(t.reject) || 0}/e${Number(t.escalate) || 0} escalated=${!!vd.escalated}`)
