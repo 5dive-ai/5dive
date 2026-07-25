@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.15.28
+
+- tests: actually ship the `heartbeat_gate_shipped_unit.sh` exit-code fix (DIVE-2003).
+  0.15.27's entry described this fix but the code did not contain it: during mutation
+  testing a `git checkout -- tests/...` (intended to undo a mutation) reverted the
+  unstaged fix, and the reverted file was then committed. The post-merge check —
+  "harness exits 0 on a green run" — cannot distinguish fixed from broken, which is
+  the same class of non-discriminating observation this whole ticket is about.
+  Verified here by MUTATION, the only check that can tell them apart: with the guard
+  deleted the harness now exits 1 (it exited 0 on 0.15.27 and 0.15.26).
+
 ## 0.15.27
 
 - tests: `heartbeat_gate_shipped_unit.sh` exited 0 unconditionally (DIVE-2003,

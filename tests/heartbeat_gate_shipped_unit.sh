@@ -159,7 +159,6 @@ flag=$(db "SELECT COALESCE(shipped_flag_at,'NULL') FROM tasks WHERE id=${gid};")
   && ok_t "DIVE-2001 control: commit AFTER the ask still flags and pings" \
   || bad_t "post-ask commit did not flag" "shipped_flag_at=$flag sent=[$(tr '\n' ',' <"$SEND_LOG")]"
 
-[[ "$FAIL" -eq 0 ]]
 
 # --- Case 9 (DIVE-2003): a lookup format drift must be LOUD, not silent ------
 # olivia's measurement: reverting the stub to a no-epoch format and DELETING the
@@ -201,3 +200,11 @@ _HB_REPO_BASE="$TMP/fmt" _HB_GATE_SHIPPED_REF=HEAD \
   && ok_t "DIVE-2003: digit-boundary grep holds — DIVE-99900 does not match DIVE-999001" \
   || bad_t "DIVE-2003: prefix ident matched" "miss=[$miss]"
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
+# DIVE-2003 (olivia's reject): this MUST be the LAST command in the file. When the
+# tally printf was moved to the end, this line was left stranded mid-file and the
+# harness's exit status became the printf's constant 0. CI (`for t in tests/*.sh`)
+# and `5dive task verify --cmd` BOTH grade on $?, so every regression here passed
+# green. A mutation signature is a set of assertion NAMES; a VERDICT is $?. Only
+# the second one gates. Check this by MUTATING and asserting exit 1 — a green run
+# exits 0 whether or not this line is present, so a passing run proves nothing.
+[[ "$FAIL" -eq 0 ]]
