@@ -16595,8 +16595,10 @@ _task_usage() {
   5dive task assign <id|DIVE-N> <agent>
   5dive task verifier <id|DIVE-N> <agent> [--accept=<criteria>] [--max-iters=<n>]
                                                      # DIVE-1880: attach the maker→verifier rail to an ALREADY-FILED open
-                                                     # task (grader must differ from the assignee). The remedy when the
-                                                     # DIVE-969 auto-skip declined the rail at filing time.
+                                                     # task (grader must differ from the maker). The remedy when the
+                                                     # DIVE-969 auto-skip declined the rail at filing time. On a task
+                                                     # already DELIVERED to a verifier it re-points the review and moves
+                                                     # the task to the new grader. No detach: opting out is add-time only.
   5dive task set-branch <id|DIVE-N> <branch>         # bind the task to a git branch for delegated push (DIVE-1462/1697);
                                                      # writes/updates a 'Branch: <name>' line in the body. Also: task add --branch=<name>
   5dive task start  <id|DIVE-N>                      # -> in_progress
@@ -17331,12 +17333,15 @@ cmd_task_verifier() {
   [[ -z "$max_iters" || "$max_iters" =~ ^[1-9][0-9]*$ ]] \
     || fail "$E_VALIDATION" "--max-iters must be a positive integer"
   resolve_task_id "$task"; local id="$RESOLVED_TASK_ID" ident="$RESOLVED_TASK_IDENT"
-  local st kind title asignee cur_accept
+  local st kind title asignee cur_accept cur_vfier maker delivered
   st=$(db "SELECT status FROM tasks WHERE id=${id};")
   kind=$(db "SELECT COALESCE(kind,'standard') FROM tasks WHERE id=${id};")
   title=$(db "SELECT title FROM tasks WHERE id=${id};")
   asignee=$(db "SELECT COALESCE(assignee,'') FROM tasks WHERE id=${id};")
   cur_accept=$(db "SELECT COALESCE(acceptance_criteria,'') FROM tasks WHERE id=${id};")
+  cur_vfier=$(db "SELECT COALESCE(verifier,'') FROM tasks WHERE id=${id};")
+  maker=$(db "SELECT COALESCE(maker_agent,'') FROM tasks WHERE id=${id};")
+  delivered=$(db "SELECT COALESCE(handoff_delivered_at,'') FROM tasks WHERE id=${id};")
   # A CLOSED task can't be retro-graded — `done` already happened, so a verifier
   # here would be a grade that never ran. `task reject` is the real remedy: it
   # bounces a closed task back to its maker.
@@ -17344,21 +17349,48 @@ cmd_task_verifier() {
     || fail "$E_VALIDATION" "$ident is already $st — a verifier can't retro-grade a closed task (bounce it back with: 5dive task reject $ident --feedback=\"…\")"
   [[ "$kind" == "standard" ]] \
     || fail "$E_VALIDATION" "$ident is a $kind template, not a worked task — set the rail on its instances (task add … --verifier=)"
-  # writer != grader (DIVE-474): a maker grading itself is not a review.
-  [[ "$who" != "$asignee" ]] \
-    || fail "$E_VALIDATION" "'$who' is $ident's own assignee — a maker can't grade itself (reassign first, or pick a different grader)"
+  # The DELIVERED / awaiting-verifier middle state (DIVE-477 + DIVE-1416): a
+  # maker's `task done` re-queues the row as status='todo' with assignee=<the
+  # verifier>, maker_agent=<the maker> and handoff_delivered_at stamped. So mid
+  # review the ASSIGNEE is the outgoing GRADER, not the maker — re-pointing the
+  # grader here must move the queue too, or the row would claim a grader who
+  # doesn't hold the task while the old one still has it on their board.
+  local mid_handoff=0
+  [[ -n "$cur_vfier" && -n "$delivered" && "$asignee" == "$cur_vfier" ]] && mid_handoff=1
+  # writer != grader (DIVE-474): a maker grading itself is not a review. Compare
+  # against whoever the MAKER actually is in this state.
+  local _maker="$asignee"
+  (( mid_handoff )) && _maker="${maker:-$asignee}"
+  [[ "$who" != "$_maker" ]] \
+    || fail "$E_VALIDATION" "'$who' is $ident's own $( (( mid_handoff )) && echo maker || echo assignee) — a maker can't grade itself (reassign first, or pick a different grader)"
   local new_accept="$cur_accept"
   [[ -n "$accept" ]] && new_accept="$accept"
   [[ -z "$new_accept" ]] \
     && new_accept="Deliverable meets the intent of: ${title}. Maker records in the done result WHAT was built and HOW it was checked; ${who} confirms against this before the task closes (refine these criteria as the work firms up)."
+  # Re-pointing the grader MID-REVIEW hands the open review to the new one: move
+  # the queue with it and re-stamp the delivery clock (the new grader has not
+  # ACKed and the stall sweep should time THEIR review, not the old one's). The
+  # maker_agent and iteration count are untouched — the maker and the loop's
+  # history do not change just because the grader did. Pointing at the grader who
+  # already holds it is an idempotent no-op on the handoff (criteria still
+  # refine), NOT an error.
+  local move_sql="" new_owner="$asignee" repoint=0
+  if (( mid_handoff )) && [[ "$who" != "$cur_vfier" ]]; then
+    repoint=1; new_owner="$who"
+    move_sql=", assignee=$(sqlq "$who"), started_at=NULL, handoff_ack_at=NULL,
+               handoff_delivered_at=datetime('now'), handoff_stale_pinged_at=NULL"
+  fi
   db "UPDATE tasks SET verifier=$(sqlq "$who"),
         acceptance_criteria=$(sqlq "$new_accept"),
         max_iterations=$([[ -n "$max_iters" ]] && echo "$max_iters" || echo "max_iterations"),
-        verify_unavailable=NULL
+        verify_unavailable=NULL${move_sql}
       WHERE id=${id};"
-  ok "$ident is now verifier-graded → $who ('task done' hands off to grade instead of closing)" \
-     '{id:($i|tonumber), ident:$id, verifier:$v, assignee:$a, acceptanceCriteria:$ac}' \
-     --arg i "$id" --arg id "$ident" --arg v "$who" --arg a "$asignee" --arg ac "$new_accept"
+  local msg="$ident is now verifier-graded → $who ('task done' hands off to grade instead of closing)"
+  (( repoint )) && msg="$ident review re-pointed → $who (was with '$cur_vfier'; delivery re-stamped, maker '${maker:-?}' and iteration unchanged)"
+  (( mid_handoff )) && (( ! repoint )) && msg="$ident is already with verifier $who for review — criteria updated, handoff untouched"
+  ok "$msg" \
+     '{id:($i|tonumber), ident:$id, verifier:$v, assignee:$a, acceptanceCriteria:$ac, midReview:($m=="1"), repointed:($r=="1")}' \
+     --arg i "$id" --arg id "$ident" --arg v "$who" --arg a "$new_owner" --arg ac "$new_accept" --arg m "$mid_handoff" --arg r "$repoint"
 }
 
 # _gate_gh_token — resolve a usable gh auth token for the DIVE-1830 merge-gate's

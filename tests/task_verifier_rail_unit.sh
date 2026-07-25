@@ -10,7 +10,8 @@
 # explicit --verifier forces the rail ON at low priority, (c) --no-verify stays
 # quiet (already an explicit opt-out), (d) `task verifier` attaches the rail to
 # an already-filed task and `task done` then HANDS OFF instead of closing, and
-# (e) its guards (self-grading, closed task, recurring template).
+# (e) its guards (self-grading, closed task, recurring template), and (f) the
+# DELIVERED/awaiting-verifier middle state — re-pointing a review mid-flight.
 #
 # Same isolation contract as tests/task_core_unit.sh: source src/ directly and
 # point STATE_DIR at a throwaway temp dir so the live shared tasks.db is NEVER
@@ -151,6 +152,52 @@ miss_out=$(run verifier "$med_id"); miss_rc=$?
 (( miss_rc != 0 )) \
   && ok_t "T9d requires both a task and a grader" \
   || bad_t "T9d requires both a task and a grader" "rc=$miss_rc $miss_out"
+
+# --- T10: the DELIVERED / awaiting-verifier middle state ---------------------
+# After the T7 handoff the task sits status='todo' with assignee=boss (the
+# GRADER, not the maker) and maker_agent=alice. Re-pointing the grader here must
+# move the queue with it, or the row claims a grader who does not hold the task.
+mid_before_iter=$(db "SELECT iteration FROM tasks WHERE id=${low_id};")
+rp=$(run verifier "$low_id" carol)
+mid_owner=$(db "SELECT assignee FROM tasks WHERE id=${low_id};")
+mid_vf=$(db "SELECT verifier FROM tasks WHERE id=${low_id};")
+mid_maker=$(db "SELECT maker_agent FROM tasks WHERE id=${low_id};")
+mid_ack=$(db "SELECT COALESCE(handoff_ack_at,'') FROM tasks WHERE id=${low_id};")
+mid_iter=$(db "SELECT iteration FROM tasks WHERE id=${low_id};")
+[[ "$mid_owner" == "carol" && "$mid_vf" == "carol" && "$mid_maker" == "alice" \
+   && -z "$mid_ack" && "$mid_iter" == "$mid_before_iter" ]] \
+  && ok_t "T10a mid-review re-point moves the queue to the new grader (maker + iteration kept, ACK cleared)" \
+  || bad_t "T10a mid-review re-point moves the queue to the new grader (maker + iteration kept, ACK cleared)" \
+           "owner=$mid_owner vf=$mid_vf maker=$mid_maker ack=$mid_ack iter=$mid_iter/$mid_before_iter :: $rp"
+[[ "$(printf '%s' "$rp" | jf '.data.repointed')" == "true" \
+   && "$(printf '%s' "$rp" | jf '.data.midReview')" == "true" ]] \
+  && ok_t "T10b the re-point is reported as such in JSON" \
+  || bad_t "T10b the re-point is reported as such in JSON" "$rp"
+
+# Pointing at the grader who ALREADY holds it is idempotent, not an error, and
+# must not disturb the handoff clock (that clock times the review, not this call).
+del_before=$(db "SELECT handoff_delivered_at FROM tasks WHERE id=${low_id};")
+noop=$(run verifier "$low_id" carol --accept="refined bar"); noop_rc=$?
+del_after=$(db "SELECT handoff_delivered_at FROM tasks WHERE id=${low_id};")
+(( noop_rc == 0 )) && [[ "$del_before" == "$del_after" \
+   && "$(db "SELECT acceptance_criteria FROM tasks WHERE id=${low_id};")" == "refined bar" ]] \
+  && ok_t "T10c re-pointing at the SAME grader is an idempotent no-op on the handoff clock" \
+  || bad_t "T10c re-pointing at the SAME grader is an idempotent no-op on the handoff clock" \
+           "rc=$noop_rc before=$del_before after=$del_after"
+
+# Mid-review the MAKER is maker_agent — not the assignee (who is the outgoing
+# grader). Handing the review back to the maker is still self-grading.
+mk_out=$(run verifier "$low_id" alice); mk_rc=$?
+(( mk_rc != 0 )) && has "$(cat "$TMP"/err)$mk_out" "maker" \
+  && ok_t "T10d mid-review, re-pointing at the MAKER is refused as self-grading" \
+  || bad_t "T10d mid-review, re-pointing at the MAKER is refused as self-grading" "rc=$mk_rc $mk_out $(cat "$TMP"/err)"
+
+# And the new grader's own `task done` (verifier==assignee) closes it for real.
+run done "$low_id" --result="graded PASS" >/dev/null
+[[ "$(db "SELECT status FROM tasks WHERE id=${low_id};")" == "done" ]] \
+  && ok_t "T10e the re-pointed grader's own 'task done' closes the task" \
+  || bad_t "T10e the re-pointed grader's own 'task done' closes the task" \
+           "status=$(db "SELECT status FROM tasks WHERE id=${low_id};")"
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]
