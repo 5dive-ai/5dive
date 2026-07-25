@@ -13,6 +13,9 @@
 #   - config-only author scan: unset committer -> any author passes; a configured
 #     committer passes a matching-author branch and refuses a mismatching one
 #   - happy dry-run (gate cleared) -> ok, prints dryRun:true
+#   - DIVE-1970: the target repo is resolved from the WORK TREE's own origin
+#     (--repo > origin > the built-in constant), the fallback is announced, and
+#     the author refusal names the repo it checked against
 # Run: bash tests/push_unit.sh  (no root, no network — token mint never runs).
 set -uo pipefail
 cd "$(dirname "$0")/.."
@@ -333,6 +336,78 @@ out=$(bind DIVE-907 some-other-branch); rc=$?
 out=$(bind DIVE-901 feature-ok); rc=$?
 { [[ $rc -ne 0 ]] && grep -qi "declares no branch" <<<"$out"; } \
   && ok_t "bind predicate: no declared branch -> refuse" || bad_t "bind predicate: no declared branch -> refuse" "rc=$rc :: $out"
+
+# --- DIVE-1970: the target repo is resolved FROM THE WORK TREE, not defaulted to
+# the CLI repo before the tree is even looked at. Every test above passes an
+# explicit --repo, which is exactly why the bug survived: with no --repo, a push
+# from a 5dive-frontend tree targeted 5dive-ai/5dive and then blamed the AUTHOR.
+
+# _push_repo_from_worktree: normalizes the three github remote spellings, and
+# stays EMPTY (-> caller falls back + says so) for anything it cannot vouch for.
+wt_repo_case() {  # wt_repo_case <label> <origin-url-or-empty> <expected>
+  local d; d=$(mktemp -d "$TMP/wt.XXXXXX")
+  ( cd "$d"; git init -q; [[ -n "$2" ]] && git remote add origin "$2"; ) >/dev/null 2>&1
+  local got; got=$(_push_repo_from_worktree "$d")
+  [[ "$got" == "$3" ]] \
+    && ok_t "worktree origin: $1" || bad_t "worktree origin: $1" "got '$got' want '$3'"
+}
+wt_repo_case "https -> normalized"  "https://github.com/lodar/5dive-frontend.git" "https://github.com/lodar/5dive-frontend.git"
+wt_repo_case "https, no .git"       "https://github.com/lodar/5dive-api"          "https://github.com/lodar/5dive-api.git"
+wt_repo_case "scp-style git@"       "git@github.com:5dive-ai/5dive.git"           "https://github.com/5dive-ai/5dive.git"
+wt_repo_case "ssh:// url"           "ssh://git@github.com/lodar/5dive-api.git"    "https://github.com/lodar/5dive-api.git"
+wt_repo_case "non-github remote -> empty" "file:///tmp/nope"                      ""
+wt_repo_case "other forge -> empty" "https://gitlab.com/lodar/x.git"              ""
+wt_repo_case "no origin -> empty"   ""                                            ""
+
+# A second scratch repo that KNOWS which repo it belongs to (origin = frontend).
+# No committer is configured for these, so the author scan is a no-op and nothing
+# here touches the network.
+REPO2="$TMP/repo2"; mkdir -p "$REPO2"
+( cd "$REPO2"
+  git init -q
+  git config user.name test; git config user.email test@example.test
+  git commit -q --allow-empty -m "base" --author="$AUTHOR"
+  git checkout -q -b feature-fe
+  git commit -q --allow-empty -m "work" --author="$AUTHOR"
+  git remote add origin "https://github.com/lodar/5dive-frontend.git"
+) >/dev/null 2>&1
+
+# bare `5dive push` in the frontend tree -> the FRONTEND repo, not the CLI repo.
+seed_task DIVE-970 "Branch: feature-fe" approval "2026-07-18 00:00:00" "yes ship it"
+out=$( cd "$REPO2"; cmd_push DIVE-970 --dry-run 2>&1 ); rc=$?
+{ [[ $rc -eq 0 ]] && grep -q "lodar/5dive-frontend" <<<"$out" && ! grep -q "5dive-ai/5dive" <<<"$out"; } \
+  && ok_t "no --repo -> target resolved from the work tree's origin" \
+  || bad_t "no --repo -> target resolved from the work tree's origin" "rc=$rc :: $out"
+grep -q "work tree's origin" <<<"$out" \
+  && ok_t "dry-run names WHERE the target came from" \
+  || bad_t "dry-run names WHERE the target came from" "$out"
+
+# a tree with no github origin still works — via the constant, said OUT LOUD.
+seed_task DIVE-971 "Branch: feature-ok" approval "2026-07-18 00:00:00" "yes"
+out=$( cd "$REPO"; cmd_push DIVE-971 --dry-run 2>&1 ); rc=$?
+{ [[ $rc -eq 0 ]] && grep -q "5dive-ai/5dive" <<<"$out" \
+    && grep -qi "no github.com 'origin'" <<<"$out"; } \
+  && ok_t "no github origin -> constant fallback, announced" \
+  || bad_t "no github origin -> constant fallback, announced" "rc=$rc :: $out"
+
+# an explicit --repo still wins, and a cross-repo push is called out.
+seed_task DIVE-972 "Branch: feature-fe" approval "2026-07-18 00:00:00" "yes"
+out=$( cd "$REPO2"; cmd_push DIVE-972 --repo="https://github.com/5dive-ai/5dive.git" --dry-run 2>&1 ); rc=$?
+{ [[ $rc -eq 0 ]] && grep -q "would push feature-fe@[0-9a-f]* to 5dive-ai/5dive" <<<"$out"; } \
+  && ok_t "--repo still wins over the work tree" \
+  || bad_t "--repo still wins over the work tree" "rc=$rc :: $out"
+grep -qi "but this work tree's origin is lodar/5dive-frontend" <<<"$out" \
+  && ok_t "--repo disagreeing with the tree warns" \
+  || bad_t "--repo disagreeing with the tree warns" "$out"
+
+# the author-scan refusal NAMES the repo it checked against + how wide it looked.
+# That is the whole point: dev3 read ~18 unrelated commits as "my branch is dirty".
+out=$( cd "$REPO"; GITHUB_APP_COMMIT_AUTHOR="$AUTHOR" cmd_push DIVE-906 --repo="file://$REPO" --dry-run 2>&1 ); rc=$?
+{ [[ $rc -ne 0 ]] && grep -q "author check FAILED against file://$REPO" <<<"$out" \
+    && grep -qi "target resolved from --repo" <<<"$out" \
+    && grep -qi "check the TARGET REPO first" <<<"$out"; } \
+  && ok_t "author refusal names the repo it checked against" \
+  || bad_t "author refusal names the repo it checked against" "rc=$rc :: $out"
 
 # --- DIVE-1462/STEER-4 builder-scoped sudoers: render_standard_sudoers emits the
 # _push_do grant ONLY for a builder (can_push=1), never for a plain standard

@@ -140,7 +140,28 @@ _push_bind_branch() {
   fi
 }
 
-# _push_author_scan <repo-path> <repo-url> <branch> <author> — fail-closed author
+# _push_repo_from_worktree <repo-path> — DIVE-1970: the GitHub repo THIS WORK TREE
+# actually belongs to, normalized to the https form `_push_validate_inputs`
+# accepts. Empty when the tree has no `origin`, or `origin` is not a github.com
+# URL (a local path remote in a fixture, a self-hosted forge, a fork remote named
+# something else) — the caller then falls back to the constant AND says so.
+# Deliberately reads only `origin`: picking among several remotes would be the
+# same guess this ticket exists to delete.
+_push_repo_from_worktree() {
+  local repopath="$1" url slug
+  url=$(git -C "$repopath" -c "safe.directory=$repopath" remote get-url origin 2>/dev/null) || return 0
+  [[ -n "$url" ]] || return 0
+  case "$url" in
+    https://github.com/*|git@github.com:*|ssh://git@github.com/*) ;;
+    *) return 0 ;;
+  esac
+  url="${url%.git}"
+  slug="${url#*github.com}"; slug="${slug#[:/]}"
+  [[ "$slug" =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$ ]] || return 0
+  printf 'https://github.com/%s.git' "$slug"
+}
+
+# _push_author_scan <repo-path> <repo-url> <branch> <author> [repo-source] — fail-closed author
 # scan. If <author> is EMPTY, the deployment configured no committer, so there is
 # NO restriction and the scan is a no-op (DIVE-1461 config-only behavior). When
 # set, every commit on <branch> not already on the remote's main must match
@@ -149,22 +170,29 @@ _push_bind_branch() {
 # authoritatively inside `_push_do`. `git -C` + a scoped safe.directory so it also
 # works when root operates on the agent's tree.
 _push_author_scan() {
-  local repopath="$1" repourl="$2" branch="$3" author="$4"
+  local repopath="$1" repourl="$2" branch="$3" author="$4" repo_src="${5:-}"
   [[ -n "$author" ]] || return 0   # unset committer -> no author restriction
   local -a G=(git -C "$repopath" -c "safe.directory=$repopath")
-  local base rangespec offenders
+  local base rangespec offenders scope
   "${G[@]}" fetch --quiet "$repourl" main 2>/dev/null || true
   if base=$("${G[@]}" merge-base FETCH_HEAD "refs/heads/${branch}" 2>/dev/null) && [[ -n "$base" ]]; then
     rangespec="${base}..refs/heads/${branch}"
+    scope="the commits on '${branch}' not already on that repo's main"
   else
     rangespec="refs/heads/${branch}"   # no shared base (new branch) — scan all
+    scope="EVERY commit reachable from '${branch}' — that repo's main could not be reached from here, so the range is UNBOUNDED, not 'your new commits'"
   fi
   offenders=$("${G[@]}" log --format='%H %an <%ae>' "$rangespec" 2>/dev/null \
               | grep -vF " ${author}" || true)
   if [[ -n "$offenders" ]]; then
     printf '%s\n' "$offenders" | sed 's/^/  /' >&2
+    # DIVE-1970: the message must name the repo it checked AGAINST and where that
+    # target came from. Without it a wrong-repo run reads as "my commits are bad"
+    # and the maker goes off rewriting authorship on a clean branch.
+    local against; against=$(_push_repo_slug "$repourl")
+    [[ -n "$repo_src" ]] && against="${against} (target resolved from ${repo_src})"
     fail "$E_VALIDATION" \
-      "author check FAILED — the commit(s) above are not authored '${author}' (the configured GITHUB_APP_COMMIT_AUTHOR). Re-author (git rebase --exec 'git commit --amend --author=\"${author}\" --no-edit') before pushing; your git host's author gate would reject them."
+      "author check FAILED against ${against} — scanned ${scope}. The commit(s) above are not authored '${author}' (the configured GITHUB_APP_COMMIT_AUTHOR). If you do not recognise them, check the TARGET REPO first: a push aimed at the wrong repository lists that repository's unrelated history here. Otherwise re-author (git rebase --exec 'git commit --amend --author=\"${author}\" --no-edit') before pushing; your git host's author gate would reject them."
   fi
 }
 
@@ -240,11 +268,31 @@ cmd_push() {
   # task that names no branch at all — is refused here with a friendly error.
   _push_bind_branch "$id" "$ident" "$branch"
 
-  # --- repo + work-tree sanity.
-  repo="${repo:-$_PUSH_DEFAULT_REPO}"
+  # --- repo + work-tree sanity. DIVE-1970: resolve the WORK TREE FIRST, then pick
+  # the target FROM it. The old order applied the CLI-repo constant before the
+  # tree was even resolved and never consulted the tree at all, so a push from a
+  # 5dive-frontend tree silently targeted the CLI repo — and then reported an
+  # AUTHOR failure, listing that repo's unrelated history, rather than naming the
+  # wrong-repo cause. Precedence, most explicit first:
+  #   --repo=<url>  >  this work tree's own `origin`  >  the built-in constant.
   local repopath
   repopath=$(git rev-parse --show-toplevel 2>/dev/null) || fail "$E_GENERIC" \
     "run 5dive push from inside the repo work tree (current dir is not a git repo)."
+  local repo_src wt_repo
+  wt_repo=$(_push_repo_from_worktree "$repopath")
+  if [[ -n "$repo" ]]; then
+    repo_src="--repo"
+    # An explicit flag still wins, but a flag that disagrees with the tree you are
+    # standing in is the exact confusion this ticket is about — say it out loud.
+    if [[ -n "$wt_repo" && "$(_push_repo_slug "$wt_repo")" != "$(_push_repo_slug "$repo")" ]]; then
+      warn "--repo targets $(_push_repo_slug "$repo") but this work tree's origin is $(_push_repo_slug "$wt_repo") — pushing '${branch}' across repos."
+    fi
+  elif [[ -n "$wt_repo" ]]; then
+    repo="$wt_repo"; repo_src="this work tree's origin"
+  else
+    repo="$_PUSH_DEFAULT_REPO"; repo_src="the built-in default (this work tree has no github.com 'origin')"
+    warn "this work tree has no github.com 'origin' remote — falling back to $(_push_repo_slug "$_PUSH_DEFAULT_REPO"). Pass --repo=<url> if that is not the target."
+  fi
   git rev-parse --verify --quiet "refs/heads/${branch}" >/dev/null || fail "$E_GENERIC" \
     "local branch '${branch}' not found — check it out here before pushing."
 
@@ -262,16 +310,19 @@ cmd_push() {
   elif [[ -r "$envf" ]]; then
     author=$( set -a; . "$envf" 2>/dev/null; set +a; _push_expected_author )
   fi
-  _push_author_scan "$repopath" "$repo" "$branch" "$author"
+  _push_author_scan "$repopath" "$repo" "$branch" "$author" "$repo_src"
 
   local slug sha; slug=$(_push_repo_slug "$repo")
   sha=$(git rev-parse --short "refs/heads/${branch}")
   local author_state; [[ -n "$author" ]] && author_state="ok (${author})" || author_state="deferred to push-time (not readable here)"
 
   if [[ $dry -eq 1 ]]; then
-    ok "dry-run: would push ${branch}@${sha} to ${slug} (gate cleared, author ${author_state})" \
-       "$(jq -n --arg t "$ident" --arg b "$branch" --arg s "$sha" --arg r "$slug" --arg a "$author_state" \
-             '{task:$t,branch:$b,sha:$s,repo:$r,dryRun:true,gate:"cleared",author:$a}')"
+    # DIVE-1970: the dry-run names WHERE the target came from, not just what it
+    # is — "5dive-ai/5dive" alone looks equally right whether it was resolved or
+    # merely defaulted to, which is why --dry-run did not catch the wrong-repo bug.
+    ok "dry-run: would push ${branch}@${sha} to ${slug} — target from ${repo_src} (gate cleared, author ${author_state})" \
+       "$(jq -n --arg t "$ident" --arg b "$branch" --arg s "$sha" --arg r "$slug" --arg a "$author_state" --arg rs "$repo_src" \
+             '{task:$t,branch:$b,sha:$s,repo:$r,repoSource:$rs,dryRun:true,gate:"cleared",author:$a}')"
     return 0
   fi
 
@@ -349,7 +400,7 @@ cmd_push_do() {
   # restriction. This is the authoritative gate — the agent pre-flight is only a
   # best-effort preview and may have deferred here.
   local author; author=$(_push_expected_author)
-  _push_author_scan "$repopath" "$repourl" "$branch" "$author"
+  _push_author_scan "$repopath" "$repourl" "$branch" "$author" "the caller's resolved target"
 
   # Build a short-lived App JWT (iat -60s for clock skew, exp +9min < 10min max).
   local now iat exp header payload unsigned sig jwt
