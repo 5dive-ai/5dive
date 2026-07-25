@@ -26,7 +26,7 @@ esac
 
 # Bumped on every public release. `build.sh` checks this line exists; CI fails
 # the bundle-drift check if it's missing or empty.
-readonly FIVE_VERSION="0.15.14"
+readonly FIVE_VERSION="0.15.16"
 
 # GitHub org our repos live under. The org is being renamed
 # 5dive-com -> 5dive-ai (2026-06); fetches must work on either side of the
@@ -567,7 +567,12 @@ valid_byo_provider() {
 # convenience, not a real model), so we pin concrete per-tier defaults to
 # anthropic/* as a SAFE DEFAULT — operators override any tier via
 # `agent create --model=<slug>` or `agent config set model=<slug>` (DIVE-1103).
-# Slugs verified against openrouter.ai 2026-07-10.
+# Slugs verified against the LIVE openrouter.ai /api/v1/models list 2026-07-25
+# (DIVE-1897). Verified present: anthropic/claude-opus-5, anthropic/claude-sonnet-5,
+# anthropic/claude-haiku-4.5, openrouter/auto. NOTE haiku is deliberately NOT bumped:
+# there is no claude-haiku-5 on OpenRouter, 4.5 is the current haiku. NOTE the opus
+# slot was the only stale entry — its sibling sonnet was already at 5, so one tier had
+# been bumped and the other had not.
 declare -A CLAUDE_PROVIDER_BASEURL=(
   [deepseek]="https://api.deepseek.com/anthropic"
   [moonshot]="https://api.moonshot.ai/anthropic"
@@ -577,7 +582,7 @@ declare -A CLAUDE_PROVIDER_BASEURL=(
 declare -A CLAUDE_PROVIDER_OPUS_MODEL=(
   [deepseek]="deepseek-v4-pro"
   [moonshot]="kimi-k2.5"
-  [openrouter]="anthropic/claude-opus-4.8"
+  [openrouter]="anthropic/claude-opus-5"
   [zai]="glm-5.2"
 )
 declare -A CLAUDE_PROVIDER_SONNET_MODEL=(
