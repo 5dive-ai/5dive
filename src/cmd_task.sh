@@ -3117,8 +3117,12 @@ cmd_task_need() {
   # predicate treat it as a tier-1 gate; _curation (like _eng_ship) forces
   # lead-routing regardless of the gate_builder_routing pref. secret/manual are
   # never curation; filer-is-lead ⇒ no reviewer ⇒ not downgraded.
+  # DIVE-1957: an EXPLICIT --tier=2 vetoes this downgrade (tier_arg==2). Note the
+  # tier==2 short-circuit above means an explicitly-pinned gate never sets
+  # tier_floored, so without this guard curation downgraded a pinned brand/money
+  # ask that the floor would otherwise have caught.
   local _curation=0
-  if [[ ( "$type" == "decision" || "$type" == "approval" ) ]]; then
+  if [[ "$tier_arg" != "2" && ( "$type" == "decision" || "$type" == "approval" ) ]]; then
     local _cc_title; _cc_title=$(db "SELECT COALESCE(title,'') FROM tasks WHERE id=${id};")
     local _cc_text="${ask} ${_cc_title}"
     local _cc_residual; _cc_residual=$(printf '%s' "$_cc_text" \
@@ -3147,8 +3151,12 @@ cmd_task_need() {
   # lead-routed tier-1 so it reaches the lead, not lodar. Guarded to decision/
   # approval with a reviewer (filer-is-lead ⇒ no downgrade); runs after curation so
   # a curation-shaped ask keeps its own class.
+  # DIVE-1957: explicit --tier=2 vetoes this downgrade too. (Belt-and-braces: the
+  # tier==2 short-circuit above already leaves tier_floored=0 for a pinned gate,
+  # so this arm was unreachable with a pin — the guard is stated so the invariant
+  # survives any future change to where the floor is evaluated.)
   local _internal_ops=0
-  if [[ "$tier_floored" == "1" && "$_curation" == "0" \
+  if [[ "$tier_arg" != "2" && "$tier_floored" == "1" && "$_curation" == "0" \
         && ( "$type" == "decision" || "$type" == "approval" ) ]]; then
     local _io_title; _io_title=$(db "SELECT COALESCE(title,'') FROM tasks WHERE id=${id};")
     local _io_text="${ask} ${_io_title}"
@@ -3196,7 +3204,25 @@ cmd_task_need() {
       fi
       # DIVE-1359 downgrade stays scoped to decision/approval (manual is never
       # downgraded — the nudge above is its only treatment).
-      if [[ -n "$_es_reviewer" && ( "$type" == "decision" || "$type" == "approval" ) ]]; then
+      # DIVE-1957: an EXPLICIT --tier=2 vetoes the downgrade. Overriding the TYPE
+      # DEFAULT for a builder ship-gate is the point of this class and stays;
+      # overriding the caller's hard-human contract was the bug — a brand/money
+      # decision filed --tier=2 on a task merely TITLED "land/merge/ship X" was
+      # silently re-tiered to 1 and routed to an agent, and the filer could not
+      # fix it from the ask (the classifier reads ask + title). Warn instead of
+      # silently obeying, so a builder who pinned by habit sees why their ship
+      # gate went to the human rather than to their lead.
+      if [[ -n "$_es_reviewer" && "$tier_arg" == "2" \
+            && ( "$type" == "decision" || "$type" == "approval" ) ]]; then
+        warn "explicit --tier=2 kept this eng-ship-shaped gate hard-human, so it pings the paired human instead of $_es_reviewer. Drop --tier=2 if a lead can clear it (ship/merge/deploy calls are lead-clearable by design); keep it only for a genuine brand/money/destructive call."
+        # The warn corrects the NEXT filer; this row lets us MEASURE whether the
+        # habit is real. The standing remedy for this very bug was "pin
+        # --tier=2", so every agent carrying that advice may now escalate routine
+        # ship gates past their lead to the paired human. Audit the branch that
+        # declines to act, not just the one that acts — otherwise the only signal
+        # is the human complaining about gate spam.
+        audit_log "task.gate-tier2-pin-escalated" ok 0 -- "$ident" "filer=$(task_actor "$from")" "lead=$_es_reviewer" "type=$type"
+      elif [[ -n "$_es_reviewer" && ( "$type" == "decision" || "$type" == "approval" ) ]]; then
         tier=1; _eng_ship=1
       fi
     fi
@@ -3503,6 +3529,13 @@ cmd_task_need() {
   [[ "$_internal_ops" == "1" ]] && _routable=1
   # DIVE-1495: a verifier-route gate is routable by kind (to the verifier agent).
   [[ "$_verifier_route" == "1" ]] && _routable=1
+  # DIVE-1957: backstop — an EXPLICIT --tier=2 is the caller's hard-human contract
+  # and no KIND-based override may cross it, so the DIVE-1145 promise ("we never
+  # route a tier-2 gate, floored OR filed with an explicit --tier=2") holds by
+  # construction instead of per-branch. eng-ship/curation/internal-ops are already
+  # vetoed at the downgrade sites above; `access` is routable regardless of tier by
+  # DIVE-1243 and was the last path a pinned gate could still reach an agent through.
+  [[ "$tier_arg" == "2" ]] && _routable=0
   if [[ "$_routable" == "1" ]]; then
     # DIVE-1243: `access` routing is intrinsic to the TYPE, so it does NOT wait on
     # the gate_builder_routing pref (which ship-gates the decision/approval/manual
