@@ -1602,6 +1602,10 @@ _hb_gate_shipped_sweep() {
       # Deliberately a DIFFERENT message from the drift case above: legacy gates
       # predate need_asked_at, so this is expected and routine. Folding the two
       # together would bury the drift signal in noise that operators learn to skip.
+      # And deliberately a different DURABILITY: the drift branch writes an audit
+      # row, this one does not. A routine event does not belong in the audit table
+      # — filling it with the expected case is how the exceptional case stops being
+      # findable in it.
       _hb_log "[gate-shipped] ${gident} — no need_asked_at stamp; predates-ask guard not applicable (legacy gate)"
     elif (( _c_epoch < _asked )); then
       _hb_log "[gate-shipped] ${gident} — newest matching commit PREDATES the open ask ($(date -u -d @"$_c_epoch" +%FT%TZ) < $(date -u -d @"$_asked" +%FT%TZ)); NOT flagging, gate stays eligible"
