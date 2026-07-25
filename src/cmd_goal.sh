@@ -619,9 +619,13 @@ _goal_finish_with_plan() {
     # count-only checkpoint stays the default agent-clearable tier-1 decision.
     local -a tier_arg=()
     if [[ "$GOAL_HAS_T2" == "1" ]]; then reason="carries a Tier-2 task"; tier_arg=(--tier=2); fi
-    local gate_json
-    gate_json=$(JSON_MODE=1 cmd_task_need "$anchor_id" --type=decision --options="approve|revise" --recommend="approve" "${tier_arg[@]}" ${from:+--from="$from"} \
-                  --ask="Approve this ${GOAL_TASK_COUNT}-task plan for \"${outcome}\"? (${reason}) Full plan in the task body.") \
+    # DIVE-1930: this used to capture the gate envelope into `gate_json` and never
+    # read it. A capture that is never inspected reads at review time like a
+    # checked result and is not one — which is why the empty-envelope bug could
+    # not have been caught here. Discard explicitly, like the objective path does,
+    # so the exit status is visibly the only thing this call is trusted for.
+    JSON_MODE=1 cmd_task_need "$anchor_id" --type=decision --options="approve|revise" --recommend="approve" "${tier_arg[@]}" ${from:+--from="$from"} \
+      --ask="Approve this ${GOAL_TASK_COUNT}-task plan for \"${outcome}\"? (${reason}) Full plan in the task body." >/dev/null \
       || fail "$E_GENERIC" "goal: could not file the plan gate"
     if (( JSON_MODE )); then
       ok "" '{gated:true, project:{key:$k,prefix:$pf}, anchor:$ai, taskCount:($n|tonumber), criticalPath:($cp|tonumber), hasT2:($t2=="1"), reason:$r}' \
