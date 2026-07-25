@@ -77,8 +77,14 @@ awk '/reconcile_managed_settings "\$ms"/{found=1} END{exit !found}' src/cmd_doct
   && ok_t "doctor heals the live managed-settings file (\$ms) under repair" \
   || bad_t "doctor heals \$ms" ""
 if grep -q 'DOCTOR_REPAIR' src/cmd_doctor.sh; then
-  # assert the reconcile call sits inside a DOCTOR_REPAIR guard (read-only default)
-  sed -n '/managed-settings/,/allowlisted"/p' src/cmd_doctor.sh | grep -q 'DOCTOR_REPAIR' \
+  # Assert the reconcile call sits inside a DOCTOR_REPAIR guard (read-only default).
+  # DIVE-1919: anchor on the CALL, not on a sed range. The old range
+  # (/managed-settings/,/allowlisted"/) closed on the first later line ending in
+  # `allowlisted"` — which is the check's own OK message, several lines ABOVE the
+  # guard — so the range never contained DOCTOR_REPAIR and this assertion red-ed
+  # on correct code as soon as that message was worded that way. Look at the lines
+  # immediately preceding the call instead: that is the property under test.
+  grep -B 5 'reconcile_managed_settings "\$ms"' src/cmd_doctor.sh | grep -q 'DOCTOR_REPAIR' \
     && ok_t "reconcile is guarded by DOCTOR_REPAIR (bare doctor stays a preview)" \
     || bad_t "repair guard" "reconcile must only fire under --fix"
 fi

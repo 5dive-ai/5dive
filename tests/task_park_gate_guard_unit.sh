@@ -23,6 +23,17 @@ for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh \
   source "$SRC/$f"
 done
 STATE_DIR="$TMP"; TASKS_DIR="$STATE_DIR/tasks"; TASKS_DB="$TASKS_DIR/tasks.db"
+# DIVE-1919: BIND the gate-proof paths to the isolated STATE_DIR too. tasks_db.sh
+# derives them at SOURCE time (line ~1240), i.e. from the DEFAULT /var/lib/5dive,
+# so re-pointing STATE_DIR afterwards is not enough — `_gate_proof_enforced` kept
+# stat-ing the LIVE host file. On a control-plane box where root has flipped
+# enforcement on (/var/lib/5dive/gate-proof.enforce exists) T2's `task answer
+# --human` was rejected E_AUTH_REQUIRED and the harness died rc=6 mid-run; on a
+# clean CI runner the file is absent, enforcement is dormant and it passed. Same
+# two-line binding the sibling gate harnesses already do (gate_nonce_unit.sh,
+# gate_tier2_floor_unit.sh, gate_channel_proof_unit.sh, ...).
+GATE_PROOF_KEY="$STATE_DIR/gate-proof.key"
+GATE_PROOF_ENFORCE="$STATE_DIR/gate-proof.enforce"
 JSON_MODE=1
 mkdir -p "$TASKS_DIR"; set +e
 

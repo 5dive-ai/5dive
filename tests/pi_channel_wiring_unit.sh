@@ -43,9 +43,19 @@ got=$(_tg_access_state_dir "agent-foo" pi)
 # --- pi_plugin_dir() resolves from the env override ---------------------------
 _pdir=$(mktemp -d); : > "$_pdir/server.ts"
 [[ "$(TELEGRAM_PI_PLUGIN_DIR="$_pdir" pi_plugin_dir)" == "$_pdir" ]] && ok_t "pi_plugin_dir resolves TELEGRAM_PI_PLUGIN_DIR" || bad_t "pi_plugin_dir override"
-# absent server.ts -> resolver returns nonzero (fail-fast at create)
+# absent server.ts -> the override is REJECTED. DIVE-1919: assert on the property
+# under test (the bad override is not returned), NOT on a nonzero rc. The resolver
+# deliberately continues to its canonical fallbacks (/usr/local/lib/5dive/telegram-pi,
+# the 5dive-plugins checkout), so on a control-plane host where a real telegram-pi
+# IS installed the resolver correctly succeeds with the FALLBACK and an rc-based
+# assertion fails — i.e. the old assertion really tested "no telegram-pi is
+# installed anywhere on this machine", which is host state, not behaviour. Do not
+# "fix" this by making an invalid override suppress valid fallbacks.
 rm -f "$_pdir/server.ts"
-TELEGRAM_PI_PLUGIN_DIR="$_pdir" pi_plugin_dir >/dev/null 2>&1 && bad_t "pi_plugin_dir should reject dir w/o server.ts" || ok_t "pi_plugin_dir rejects dir w/o server.ts"
+_got=$(TELEGRAM_PI_PLUGIN_DIR="$_pdir" pi_plugin_dir 2>/dev/null)
+[[ "$_got" != "$_pdir" ]] \
+  && ok_t "pi_plugin_dir rejects dir w/o server.ts (falls through to canonical paths)" \
+  || bad_t "pi_plugin_dir should reject dir w/o server.ts" "resolved to the invalid override '$_got'"
 rm -rf "$_pdir"
 
 # --- the three new pi functions are defined ----------------------------------
