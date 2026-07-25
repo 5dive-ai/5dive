@@ -2629,11 +2629,6 @@ cmd_task_need() {
   # `task answer` knows who to ping to resume. The inbox is defined by the gate
   # (need_type set), not by assignee, so it still surfaces to the human.
   local actor; actor=$(task_actor "$from")
-  # DIVE-1927: snapshot the pre-gate state so an UNDELIVERABLE gate can be undone
-  # rather than left as a blocked row nobody will ever answer (see the rc==2 path
-  # after task_need_notify below).
-  local _pre_status _pre_assignee
-  IFS=$'\x1f' read -r _pre_status _pre_assignee < <(db "SELECT status||x'1f'||COALESCE(assignee,'') FROM tasks WHERE id=${id};")
   db "UPDATE tasks
         SET status='blocked', assignee=$(sqlq "$actor"),
             need_type=$(sqlq "$type"), ask=$(sqlq "$ask"),
@@ -2902,14 +2897,13 @@ cmd_task_need() {
         && db "UPDATE tasks SET human_nonce_hash=$(sqlq "$(_human_nonce_sha "$human_nonce")") WHERE id=${id};"
       ;;
   esac
-  # DIVE-1927: rc 2 = the alert reached NOBODY and nobody up the org chart could
-  # ever receive it. Reporting OK there is the bug this task exists for: the filer
-  # believes the human was asked, the human never learns the ask exists, and the
-  # row sits blocked forever with nothing anywhere reporting the miss. Undo the
-  # gate (restoring the pre-gate status, so the task stays workable) and FAIL —
-  # a refused gate is visible; a silent one is not. Every other rc stays
-  # best-effort exactly as before: a flaky Telegram send must never fail a gate
-  # that IS addressed to a reachable human.
+  # DIVE-1927: rc 3 = filed and answerable, but NOBODY was pinged. The gate always
+  # stands — the dashboard "Needs you" card, `task inbox` and `task answer` need no
+  # channel, and a headless/solo/CI box answers gates exactly that way. What must
+  # never happen is an unnotified gate reading identically to a notified one, which
+  # is the indistinguishability this whole ticket started from, so the miss is
+  # marked on the result, logged as a delivery error, left with gate_pinged_at NULL
+  # and re-driven by the 15-minute re-nag until it lands.
   # TASK_GATE_FILER pins the escalation chain to the gate's OWN filer. Without it
   # the chain starts from the ambient identity (auto_sender_from_sudo), which under
   # a `sudo -u agent-X` invocation is the INVOKER, not the filer — so the walk
@@ -2917,22 +2911,21 @@ cmd_task_need() {
   local _nrc=0
   TASK_GATE_FILER="$actor" \
     task_need_notify "$ident" "$type" "$ask" "$options" "$recommend" "$secret_key" "$connector" "$human_nonce" "$precedent_cite" || _nrc=$?
-  if [[ "$_nrc" == "2" ]]; then
-    db "UPDATE tasks
-          SET status=$(sqlq "${_pre_status:-todo}"), assignee=$(sqlq_or_null "$_pre_assignee"),
-              need_type=NULL, ask=NULL, need_options=NULL, recommend=NULL,
-              secret_key=NULL, connector=NULL, ask_shape=NULL,
-              precedent_ref=NULL, precedent_kind=NULL, tier=NULL,
-              need_asked_at=NULL, gate_pinged_at=NULL, human_nonce_hash=NULL
-        WHERE id=${id};"
-    [[ $EUID -eq 0 ]] && audit_log "task need undeliverable" "error" 1 -- "task=$ident" "type=$type" "filer=$actor" || true
-    fail "$E_AUTH_REQUIRED" "$ident gate NOT filed — ${TASK_NOTIFY_FAIL_REASON:-${actor} has no paired channel and neither does anyone above it in the org chart}, so this ask would reach no human. Pair a channel for ${actor}, or hand the ask to a paired agent: 5dive agent send <lead> \"...\". The task was left untouched."
-  fi
+  [[ "$_nrc" == "3" && $EUID -eq 0 ]] \
+    && audit_log "task need unnotified" "error" 1 -- "task=$ident" "type=$type" "filer=$actor" || true
   local floor_note=""; (( tier_floored )) && floor_note=" [tier forced to 2 — T2 category floor]"
   local prec_note=""; [[ -n "$precedent_cite" ]] && prec_note=" [${precedent_cite}]"
-  ok "$ident needs a human ($type, tier $tier)${floor_note}${prec_note} — $ask" \
-     '{id:($i|tonumber), ident:$id, status:"blocked", need_type:$ty, tier:($tr|tonumber), tier_floored:($fl=="1"), ask:$ak, need_options:(($op|select(length>0)) // null), recommend:(($rc|select(length>0)) // null), precedent_ref:(($pr|select(length>0))|tonumber? // null), assignee:$ac}' \
-     --arg i "$id" --arg id "$ident" --arg ty "$type" --arg tr "$tier" --arg fl "$tier_floored" --arg ak "$ask" --arg op "$options" --arg rc "$recommend" --arg pr "$precedent_ref" --arg ac "$actor"
+  # rc 3 = filed, answerable, but nobody was PINGED. Say so on the record instead
+  # of letting an unnotified gate read exactly like a notified one — that
+  # indistinguishability is the whole defect this ticket started from.
+  local notified=1 unnotified_note=""
+  if [[ "$_nrc" == "3" ]]; then
+    notified=0
+    unnotified_note=" [UNNOTIFIED — nobody was pinged; answer on the dashboard or: 5dive task answer ${ident}]"
+  fi
+  ok "$ident needs a human ($type, tier $tier)${floor_note}${prec_note}${unnotified_note} — $ask" \
+     '{id:($i|tonumber), ident:$id, status:"blocked", need_type:$ty, tier:($tr|tonumber), tier_floored:($fl=="1"), notified:($nf=="1"), ask:$ak, need_options:(($op|select(length>0)) // null), recommend:(($rc|select(length>0)) // null), precedent_ref:(($pr|select(length>0))|tonumber? // null), assignee:$ac}' \
+     --arg i "$id" --arg id "$ident" --arg ty "$type" --arg tr "$tier" --arg fl "$tier_floored" --arg nf "$notified" --arg ak "$ask" --arg op "$options" --arg rc "$recommend" --arg pr "$precedent_ref" --arg ac "$actor"
 }
 
 # _task_owner_channel — resolve the filing agent's bot token + the per-type
@@ -3062,6 +3055,25 @@ _task_escalation_chain() {
   local coord; coord=$(_task_resolve_coordinator)
   [[ -n "$coord" && "$coord" != "$filer" && "$seen" != *$'\n'"$coord"$'\n'* ]] && printf '%s\n' "$coord"
   return 0
+}
+
+# DIVE-1927 (review round 2): does this DEPLOYMENT deliver gates by channel at
+# all? A box with no channel anywhere — solo OSS, fresh install, CI, any headless
+# environment — answers gates on the dashboard "Needs you" card or with
+# `5dive task answer`, and there an unnotified gate is the NORMAL mode rather
+# than a failure. This is the discriminator for the hard refusal: only where
+# notification IS the delivery mechanism does "reached nobody" mean a human will
+# never see the ask.
+# Deliberately fails PERMISSIVE: an unreadable/absent connector dir answers
+# "no channels", i.e. never refuse. That is the same absent-vs-forbidden
+# ambiguity as everywhere else on this page, pointed at the safe side on purpose
+# — a probe whose false negative REFUSES work must never guess in that direction.
+_task_deployment_has_channels() {
+  local f
+  for f in "${CONNECTORS_DIR}"/telegram-*.env; do
+    [[ -e "$f" ]] && return 0
+  done
+  return 1
 }
 
 # DIVE-1927: resolve the nearest channel up the chain that THIS uid can actually
@@ -3513,20 +3525,51 @@ task_need_notify() {
         fi
         warn "$ident: privileged re-send to ${_paired} FAILED"
       fi
-      # Two different failures, and saying the wrong one is its own small lie.
-      # "Nobody is paired" is a claim we may only make when every agent up the
-      # chain was PROVABLY unpaired; if one was merely undetermined, what we
-      # actually know is that the privileged hand-off did not work.
+      # DIVE-1927 review round 2 (main, off RED CI on PR #160). The first cut
+      # refused the gate here, and that equated "no paired TELEGRAM channel" with
+      # "no human can answer" — which is false. The dashboard "Needs you" card and
+      # `5dive task answer` are real answering surfaces that need no channel at
+      # all. Refusing on this branch made a paired bot a hard dependency of the
+      # entire gate rail: CI (nothing is ever paired) went red, and with it any
+      # solo OSS user who never wired Telegram, any fresh install, any headless
+      # box — including `5dive goal`, which could no longer file its plan gate.
+      # So the hard refusal is now scoped to the one case where the gate really
+      # can reach nobody, and everything else is filed DELIVERABLE-BUT-UNNOTIFIED
+      # (rc 3): the row stands, it is answerable, gate_pinged_at stays NULL, and
+      # the 15-minute re-nag escalates it. Losing a gate is worse than delaying it.
       if [[ -n "$_paired" ]]; then
+        # Someone up the chain IS reachable; we merely could not reach them from
+        # HERE. The root re-nag walks the same chain with strictly more privilege
+        # and will deliver. Refusing would turn a delayed gate into a lost one —
+        # literally the DIVE-1926 case, which the 07:10 re-nag rescued.
         TASK_NOTIFY_FAIL_REASON="the privileged re-send to ${_paired} failed, so delivery is unconfirmed"
-        warn "$ident: could not hand this gate to ${_paired} — delivery unconfirmed"
-        _task_gate_delivery_log error "$numid" "" "" "privileged re-send to ${_paired} failed; delivery unconfirmed"
-      else
-        TASK_NOTIFY_FAIL_REASON="${_self:-the filer} has no paired channel and neither does anyone above it in the org chart"
-        warn "$ident: NO paired channel for ${_self:-?} or anyone above it in the org chart — this ask can reach no human"
-        _task_gate_delivery_log error "$numid" "" "" "no paired channel for filer ${_self:-?} or anyone above it in the org chart"
+        warn "$ident: could not hand this gate to ${_paired} from here — FILED UNNOTIFIED; the heartbeat re-nag escalates it (<=15 min). Answerable now on the dashboard or: 5dive task answer ${ident}"
+        _task_gate_delivery_log error "$numid" "" "" "privileged re-send to ${_paired} failed; gate filed unnotified, re-nag will escalate"
+        return 3
       fi
-      return 2
+      # Nobody up the chain is paired. This is still NOT grounds to refuse: the
+      # dashboard "Needs you" card, `task inbox` and `task answer` are answering
+      # surfaces that need no channel, and tests/gate_parity_smoke.sh asserts
+      # exactly that contract ("gate filed CLI-only with no Telegram present").
+      # An earlier cut refused here and then tried to scope the refusal to
+      # deployments that have channels configured — which still broke the parity
+      # smoke, because whether some OTHER agent on the box is paired says nothing
+      # about whether THIS gate can be answered. Every attempt to define
+      # "nowhere to land" kept mis-firing in an environment I did not control,
+      # which is the signal that the condition does not exist. So: always file,
+      # and make the non-notification loud, recorded and persistent instead.
+      # Only the WORDING forks, because an unnotified gate is routine on a box
+      # with no channels and an anomaly on one that notifies.
+      if _task_deployment_has_channels; then
+        TASK_NOTIFY_FAIL_REASON="${_self:-the filer} has no paired channel and neither does anyone above it in the org chart"
+        warn "$ident: NO paired channel for ${_self:-?} or anyone above it in the org chart — gate FILED UNNOTIFIED on a deployment that notifies. Nobody was pinged; answer on the dashboard or: 5dive task answer ${ident}"
+        _task_gate_delivery_log error "$numid" "" "" "no paired channel for filer ${_self:-?} or anyone above it; gate filed unnotified on a channel-having deployment"
+      else
+        TASK_NOTIFY_FAIL_REASON=""
+        warn "$ident: no channels configured on this deployment — gate filed UNNOTIFIED. Answer it on the dashboard, or: 5dive task answer ${ident}"
+        _task_gate_delivery_log error "$numid" "" "" "no channel configured on this deployment; gate filed unnotified (dashboard-answerable)"
+      fi
+      return 3
     fi
   fi
 

@@ -7,10 +7,11 @@
 #     escalated AND names the original filer.
 #   * task_need_notify — unpaired filer + a PAIRED-but-unreadable channel above
 #     it (the real fleet shape: every access.json is 0600) => privileged re-send.
-#   * task_need_notify — nobody paired anywhere up the chain => rc 2 + a logged
-#     delivery error, never a silent OK.
-#   * cmd_task_need — on rc 2 the gate is UNDONE (pre-gate status restored,
-#     need_* cleared) and the command exits non-zero.
+#   * task_need_notify — nobody paired anywhere up the chain => rc 3 (filed but
+#     UNNOTIFIED) + a logged delivery error, never a silent OK.
+#   * cmd_task_need — an unnotified gate still FILES (the dashboard/`task answer`
+#     need no channel; tests/gate_parity_smoke.sh asserts that contract) and says
+#     notified:false rather than reading identically to a notified one.
 # Isolated: source src/ libs, throwaway STATE_DIR, the live tasks.db is never
 # touched. Run: bash tests/gate_channelless_escalation_unit.sh
 set -uo pipefail
@@ -131,35 +132,41 @@ task_need_notify DIVE-9002 decision "pick one" "" "" "" "" "" ""; rc=$?
   || bad_t "privileged re-send invoked" "calls='$SUDO_CALLS'"
 [[ -z "$SENT" ]] && ok_t "the unprivileged run does not also send" || bad_t "double send" "sent: ${SENT:0:80}"
 
-# The privileged run itself must NOT re-sudo — it falls through to the loud fail.
+# The privileged run itself must NOT re-sudo — it falls through to unnotified.
 SUDO_CALLS=""; TASK_GATE_ESCALATING=1
 task_need_notify DIVE-9002 decision "pick one" "" "" "" "" "" ""; rc=$?
-[[ "$rc" == "2" && -z "$SUDO_CALLS" ]] && ok_t "the privileged run never re-sudoes itself" \
+[[ "$rc" == "3" && -z "$SUDO_CALLS" ]] && ok_t "the privileged run never re-sudoes itself" \
   || bad_t "recursion guard" "rc=$rc calls='$SUDO_CALLS'"
 unset TASK_GATE_ESCALATING
 
-# ---- 4. nobody paired anywhere => rc 2, logged, never a silent OK ------------
+# ---- 4. nobody paired anywhere => rc 3, logged, never a SILENT ok -----------
 mk_gate DIVE-9003 dev3
 FILER_SELF=dev3 READABLE="" PAIRED=""
 SENT=""; SUDO_CALLS=""; : >"$FIVEDIVE_GATE_NOTIFY_LOG"
 task_need_notify DIVE-9003 decision "pick one" "" "" "" "" "" ""; rc=$?
-[[ "$rc" == "2" ]] && ok_t "an undeliverable gate returns 2 (not a silent 0)" || bad_t "undeliverable rc" "rc=$rc"
-[[ -z "$SENT" ]] && ok_t "an undeliverable gate sends nothing" || bad_t "undeliverable sent" "${SENT:0:80}"
+[[ "$rc" == "3" ]] && ok_t "an unnotified gate returns 3 (not a silent 0, and not a refusal)" || bad_t "unnotified rc" "rc=$rc"
+[[ -z "$SENT" ]] && ok_t "an unnotified gate sends nothing" || bad_t "unnotified sent" "${SENT:0:80}"
 grep -q "result=error" "$FIVEDIVE_GATE_NOTIFY_LOG" \
   && ok_t "the miss is written to the gate-delivery log" || bad_t "delivery log" "$(cat "$FIVEDIVE_GATE_NOTIFY_LOG")"
 
-# ---- 5. cmd_task_need undoes an undeliverable gate and fails ----------------
+# ---- 5. cmd_task_need FILES an unnotified gate and marks it ------------------
+# The product contract (tests/gate_parity_smoke.sh): a gate files CLI-only with no
+# Telegram present. An earlier cut of this fix refused here, which broke CI, the
+# parity smoke, `5dive goal`'s plan gate, and every solo/headless install. What
+# must hold instead is that an UNNOTIFIED gate never reads like a notified one.
 db "INSERT INTO tasks (ident,title,priority,assignee,created_by,kind,status)
-    VALUES ('DIVE-9004','undeliverable','high','dev3','dev3','standard','todo');"
+    VALUES ('DIVE-9004','unnotified','high','dev3','dev3','standard','todo');"
 did=$(db "SELECT id FROM tasks WHERE ident='DIVE-9004';")
 FILER_SELF=dev3 READABLE="" PAIRED=""
 out=$( (cmd_task_need DIVE-9004 --type=decision --ask="which way?" --options="A|B" --recommend="A" --from=dev3) 2>&1 ); rc=$?
-[[ "$rc" != "0" ]] && ok_t "cmd_task_need EXITS non-zero when the gate can reach no human" \
-  || bad_t "cmd_task_need exits non-zero" "rc=$rc out=${out:0:200}"
-[[ "$out" == *"no paired channel"* ]] && ok_t "the failure names the cause" || bad_t "failure names the cause" "${out:0:200}"
-row=$(db "SELECT status||'|'||COALESCE(need_type,'-')||'|'||COALESCE(ask,'-')||'|'||COALESCE(tier,-1) FROM tasks WHERE id=${did};")
-[[ "$row" == "todo|-|-|-1" ]] && ok_t "the undeliverable gate is UNDONE (task left workable)" \
-  || bad_t "gate rolled back" "row='$row'"
+[[ "$rc" == "0" ]] && ok_t "cmd_task_need still FILES the gate when nobody can be pinged" \
+  || bad_t "unnotified gate still files" "rc=$rc out=${out:0:200}"
+row=$(db "SELECT status||'|'||COALESCE(need_type,'-')||'|'||COALESCE(gate_pinged_at,'NULL') FROM tasks WHERE id=${did};")
+[[ "$row" == "blocked|decision|NULL" ]] \
+  && ok_t "the gate stands, answerable, with NO delivery receipt" || bad_t "gate row after unnotified file" "row='$row'"
+[[ "$out" == *"UNNOTIFIED"* ]] \
+  && ok_t "the result SAYS nobody was pinged (never reads like a notified gate)" \
+  || bad_t "unnotified is marked" "${out:0:240}"
 
 # ---- 6. absent vs FORBIDDEN in the pairing probe (main's PR #160 review) -----
 # The probe must be three-valued. A boolean would put the very conflation this
@@ -205,7 +212,7 @@ task_need_notify DIVE-9005 decision "pick one" "" "" "" "" "" ""; rc=$?
 # When that privileged hand-off fails, say what we KNOW, not the worst cause.
 SUDO_RC=1; TASK_NOTIFY_FAIL_REASON=""
 task_need_notify DIVE-9005 decision "pick one" "" "" "" "" "" ""; rc=$?
-[[ "$rc" == "2" && "$TASK_NOTIFY_FAIL_REASON" == *"re-send"* && "$TASK_NOTIFY_FAIL_REASON" != *"no paired channel"* ]] \
+[[ "$rc" == "3" && "$TASK_NOTIFY_FAIL_REASON" == *"re-send"* && "$TASK_NOTIFY_FAIL_REASON" != *"no paired channel"* ]] \
   && ok_t "a failed hand-off reports the hand-off, not a false 'nobody is paired'" \
   || bad_t "failure reason is honest" "rc=$rc reason='$TASK_NOTIFY_FAIL_REASON'"
 _task_agent_paired() { local n="$1"; [[ -n "$n" && " $PAIRED " == *" $n "* ]]; }
