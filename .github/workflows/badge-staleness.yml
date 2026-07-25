@@ -1,0 +1,92 @@
+name: Badge staleness
+
+# DIVE-1924 — mark the public zero-human badge STALE when the publisher stops.
+#
+# The badge message carries the number only (lodar: a date on it is visual noise
+# on the one asset whose value is being instantly readable). Without a date, a
+# frozen badge.json renders a stale number as CURRENT for as long as the
+# publisher stays dead — so something has to say so, and it cannot be the
+# publisher: a dead publisher cannot mark itself dead. That rules out a
+# publisher-set flag or a self-set colour, and the rule still stands.
+#
+# THIS workflow can, for exactly one reason: it does not run on our box. It runs
+# on GitHub, so it survives the failures that take the publisher down — the host
+# dying, the cron never firing, the credential expiring, the state dir going
+# unwritable (DIVE-1888, which sat broken for two weeks). That independence is
+# also the one guarantee the DIVE-1896 host monitor cannot make, because that
+# monitor shares a host with the thing it watches. The two are complements: the
+# host monitor pages US fast, this one protects the READER.
+#
+# It never repairs the healthy badge. The publisher's next successful write does
+# that on its own, so there is exactly one writer of the good state.
+on:
+  schedule:
+    - cron: "17 * * * *"      # hourly. Cadence before threshold (DIVE-1909):
+                              # detection is the SCHEDULE, not the 26h window.
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: badge-staleness
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the status branch
+        uses: actions/checkout@v4
+        with:
+          ref: status
+          fetch-depth: 1
+
+      - name: Flip the badge to stale if the publisher has gone quiet
+        env:
+          MAX_AGE_HOURS: "26"   # daily 02:00 publish + 2h grace
+        run: |
+          set -uo pipefail
+
+          # FAIL LOUD, NEVER GUESS. An unreadable artifact is not a stale one,
+          # and writing "stale" on a read failure would be inventing a fact —
+          # the exact defect this badge exists to avoid. Any of these exits
+          # non-zero and writes NOTHING.
+          [ -f zero-human.json ] || { echo "::error::zero-human.json missing on the status branch"; exit 1; }
+          [ -f badge.json ]      || { echo "::error::badge.json missing on the status branch"; exit 1; }
+
+          stamp="$(jq -re '.generatedAtUtc' zero-human.json)" || {
+            echo "::error::zero-human.json has no readable generatedAtUtc — cannot measure staleness"; exit 1; }
+          then_s="$(date -u -d "$stamp" +%s 2>/dev/null)" || true
+          [ -n "${then_s:-}" ] || { echo "::error::generatedAtUtc is unparseable ('$stamp')"; exit 1; }
+
+          now_s="$(date -u +%s)"
+          age_h=$(( (now_s - then_s) / 3600 ))
+          echo "newest publish: $stamp (${age_h}h ago, threshold ${MAX_AGE_HOURS}h)"
+
+          if [ "$age_h" -lt "$MAX_AGE_HOURS" ]; then
+            echo "badge is fresh — nothing to do"
+            exit 0
+          fi
+
+          # Stale. Say so in the message itself, carrying the date of the last
+          # real reading: a reader must be able to tell HOW stale, and that date
+          # is a fact the artifact already holds rather than an age that decays.
+          last_day="${stamp%%T*}"
+          new_msg="stale — last published ${last_day}"
+
+          cur_msg="$(jq -r '.message // ""' badge.json)"
+          if [ "$cur_msg" = "$new_msg" ]; then
+            echo "already marked stale for ${last_day} — no commit"
+            exit 0
+          fi
+
+          jq --arg m "$new_msg" '.message = $m | .color = "lightgrey"' badge.json > badge.json.tmp
+          mv badge.json.tmp badge.json
+          echo "badge marked stale: $new_msg"
+
+          git config user.name  "lodar"
+          git config user.email "markounik@gmail.com"
+          git add badge.json
+          git commit -m "badge: mark stale — no publish since ${last_day} (DIVE-1924)"
+          git push origin status

@@ -26,7 +26,7 @@ esac
 
 # Bumped on every public release. `build.sh` checks this line exists; CI fails
 # the bundle-drift check if it's missing or empty.
-readonly FIVE_VERSION="0.14.14"
+readonly FIVE_VERSION="0.14.15"
 
 # GitHub org our repos live under. The org is being renamed
 # 5dive-com -> 5dive-ai (2026-06); fetches must work on either side of the
@@ -36455,39 +36455,34 @@ if w_ship > 0:
 else:
     message = f"0 shipped, {w_ask} {ask_word}"
 
-# DIVE-1908: the badge carries its OWN date. The standing design claim was that
-# a dead publisher stops the date moving and "a stale date IS the alarm" — but
-# the date lived only in zero-human.json, which no README reader ever fetches.
-# badge.json had no date at all, so it rendered a stale number as CURRENT for as
-# long as the publisher stayed dead. That is our own defect class aimed at the
-# honesty instrument: the credibility artifact misrepresenting its own freshness.
+# DIVE-1924: the badge message carries the NUMBER ONLY — no date, no suffix.
+# DIVE-1908 briefly appended the ISO date here, because badge.json had none and
+# so rendered a stale number as CURRENT for as long as the publisher stayed dead
+# (our own defect class aimed at the honesty instrument). lodar's call: the date
+# is visual noise on the one asset whose value is being instantly readable, and
+# he is right that the fix does not have to live in the message.
 #
-# The date is appended to BOTH message branches deliberately — a zero-ship week
-# is exactly when someone would want to know how old the number is, so the date
-# must never be the thing that drops out when the reading gets unusual.
+# WHAT REPLACES IT: .github/workflows/badge-staleness.yml, an INDEPENDENT hourly
+# watcher that reads zero-human.json's own generatedAtUtc and rewrites THIS file
+# to a visibly stale badge once the newest publish is older than 26h. The next
+# successful publish overwrites it back, so the healthy badge needs no repair.
 #
-# Full ISO date, not a "Jul 25" label. This artifact's entire job is making
-# staleness visible to a reader who has NONE of our instrumentation, and a
-# month-day label is unambiguous only inside a 12-month window — a known-wrong
-# reading on the one artifact that exists in order not to be wrong. Pointing at
-# the internal hourly monitor as mitigation would be the very move that produced
-# this bug: "a stale date IS the alarm" was internal reasoning about an external
-# artifact. Better to delete the limit than document it.
+# WHY A WATCHER IS ALLOWED TO DO WHAT THE PUBLISHER IS NOT: a dead publisher
+# cannot mark itself dead — that is why there is no publisher-set "stale" flag
+# and no self-set colour, and the rule stands. The workflow is not the publisher:
+# it runs on GitHub, not on this box, so it survives precisely the failures that
+# take the publisher down. That independence is also the one guarantee the
+# DIVE-1896 host monitor cannot make, since that monitor shares a host with the
+# thing it watches.
 #
-# It is literally `today` — the SAME string that becomes datapoint["date"] just
-# below — so the badge and zero-human.json agree by being identical, not by
-# surviving a format transformation that could drift. That is why this reads
-# `today` rather than the TODAY_LABEL the shell used to derive for it.
-#
-# A DATE, never an AGE. A date is a FACT the artifact carries; an age ("2d ago")
-# is an ASSERTION that decays the moment it stops being rewritten. A dead
-# publisher frozen at "0d ago" would be actively LYING, where a frozen date is
-# merely stale and the reader can see it. Same reason there is no publisher-set
-# "stale" flag: a dead publisher cannot mark itself dead. Freshness has to be
-# readable from the last value the publisher WROTE, never from a status it would
-# have to keep updating while broken.
+# A DATE, never an AGE — still true, and it is why zero-human.json below keeps
+# `date` and `generatedAtUtc` rather than gaining a "2d ago". A date is a FACT
+# the artifact carries; an age is an ASSERTION that decays the moment it stops
+# being rewritten, so a dead publisher frozen at "0d ago" would be actively
+# LYING where a frozen date is merely stale. The watcher reads those fields; do
+# not replace them with anything that has to keep being updated to stay true.
 badge = {"schemaVersion": 1, "label": "zero-human",
-         "message": f"{message} · {today}",
+         "message": message,
          "color": "blueviolet"}
 
 datapoint = {
