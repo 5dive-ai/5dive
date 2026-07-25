@@ -1,0 +1,160 @@
+#!/usr/bin/env bash
+# DIVE-1927 — a gate filed by a CHANNEL-LESS agent must reach a human, or the
+# filing must fail loudly. Covers:
+#   * _task_escalation_chain — multi-hop walk UP reports_to, cycle-safe, ends at
+#     the coordinator, never emits the filer itself.
+#   * task_need_notify — unpaired filer + a readable channel above it => alert is
+#     escalated AND names the original filer.
+#   * task_need_notify — unpaired filer + a PAIRED-but-unreadable channel above
+#     it (the real fleet shape: every access.json is 0600) => privileged re-send.
+#   * task_need_notify — nobody paired anywhere up the chain => rc 2 + a logged
+#     delivery error, never a silent OK.
+#   * cmd_task_need — on rc 2 the gate is UNDONE (pre-gate status restored,
+#     need_* cleared) and the command exits non-zero.
+# Isolated: source src/ libs, throwaway STATE_DIR, the live tasks.db is never
+# touched. Run: bash tests/gate_channelless_escalation_unit.sh
+set -uo pipefail
+cd "$(dirname "$0")/.."
+SRC=src
+TMP="$(mktemp -d /tmp/gate-chanless.XXXXXX)"
+trap 'rm -rf "$TMP"' EXIT
+
+# shellcheck disable=SC1090
+for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh \
+         lib/agent_setup.sh lib/state.sh lib/audit.sh lib/registry.sh \
+         lib/tasks_db.sh cmd_agent_pairing.sh cmd_agent_runtime.sh cmd_task.sh; do
+  # shellcheck source=/dev/null
+  source "$SRC/$f"
+done
+set +e
+
+STATE_DIR="$TMP"; TASKS_DIR="$TMP/tasks"; TASKS_DB="$TASKS_DIR/tasks.db"
+mkdir -p "$TASKS_DIR"
+tasks_db_init; _tasks_db_migrate
+FIVEDIVE_GATE_NOTIFY_LOG="$TMP/gate-notify.log"; : >"$FIVEDIVE_GATE_NOTIFY_LOG"
+
+PASS=0; FAIL=0
+ok_t()  { PASS=$((PASS+1)); printf 'ok   - %s\n' "$1"; }
+bad_t() { FAIL=$((FAIL+1)); printf 'FAIL - %s\n   %s\n' "$1" "${2:-}"; }
+
+# ---- fleet fixture -----------------------------------------------------------
+# dev3 -> main -> olivia; boss is the (unrelated) coordinator.
+db "INSERT INTO agents_org (name,reports_to,role) VALUES
+     ('dev3','main',NULL),('main','olivia',NULL),('olivia',NULL,'coordinator'),
+     ('lonely',NULL,NULL);"
+
+# READABLE = this uid can read that agent's access.json; PAIRED = the agent has a
+# channel at all (root could read it). The gap between the two IS the bug.
+READABLE=""; PAIRED=""
+_task_agent_channel() {
+  local n="$1"; TASK_CH_TOKEN="" TASK_CH_ACCESS="" TASK_CH_TYPE=""
+  [[ -n "$n" && " $READABLE " == *" $n "* ]] || return 1
+  TASK_CH_TOKEN=tok TASK_CH_ACCESS="$TMP/access.json" TASK_CH_TYPE=claude; return 0
+}
+_task_agent_paired() { local n="$1"; [[ -n "$n" && " $PAIRED " == *" $n "* ]]; }
+_task_owner_channel() { _task_agent_channel "${FILER_SELF:-}"; }
+task_actor() { printf '%s' "${FILER_SELF:-dev3}"; }
+audit_log() { :; }
+printf '%s\n' '{"allowFrom":["1234567890"]}' >"$TMP/access.json"
+
+# The stub records the channel state AS OF THE SEND. Asserting only on the text
+# would pass even when the resolved token/access never reached the sender — the
+# exact subshell bug the first cut of this fix shipped with (_task_chain_channel
+# called in $( ), so its TASK_CH_* died in the subshell and the "escalated" send
+# went out with an empty token to an empty access file).
+SENT=""; SENT_ACCESS="x"; SENT_AGENT="x"; SEND_RC=0
+_task_send_owner() {
+  SENT="$1"; SENT_ACCESS="$TASK_CH_ACCESS"; SENT_AGENT="$TASK_CH_AGENT"
+  TASK_SEND_DELIVERED=1; return 0
+}
+SUDO_CALLS=""; SUDO_RC=0
+_task_gate_escalate_via_sudo() { SUDO_CALLS+="$1 "; return "$SUDO_RC"; }
+
+mk_gate() { # <ident> <filer>
+  db "INSERT INTO tasks (ident,title,priority,assignee,created_by,kind,status,need_type,tier,ask,need_asked_at)
+      VALUES ($(sqlq "$1"),'t','high',$(sqlq "$2"),$(sqlq "$2"),'standard','blocked','decision',2,'pick one',datetime('now'));"
+}
+
+# ---- 1. chain walk -----------------------------------------------------------
+got=$(_task_escalation_chain dev3 | paste -sd, -)
+[[ "$got" == "main,olivia" ]] && ok_t "chain walks multi-hop dev3 -> main -> olivia" \
+  || bad_t "chain walks multi-hop" "got '$got'"
+
+got=$(_task_escalation_chain lonely | paste -sd, -)
+[[ "$got" == "olivia" ]] && ok_t "no manager falls back to the coordinator" || bad_t "coordinator fallback" "got '$got'"
+
+got=$(_task_escalation_chain olivia | paste -sd, -)
+[[ -z "$got" ]] && ok_t "the coordinator never escalates to itself" || bad_t "self-escalation" "got '$got'"
+
+db "UPDATE agents_org SET reports_to='dev3' WHERE name='olivia';"   # dev3->main->olivia->dev3
+got=$(_task_escalation_chain dev3 | paste -sd, -)
+[[ "$got" == "main,olivia" ]] && ok_t "a reports_to cycle terminates" || bad_t "cycle guard" "got '$got'"
+db "UPDATE agents_org SET reports_to=NULL WHERE name='olivia';"
+
+# ---- 2. unpaired filer, readable channel above it ----------------------------
+mk_gate DIVE-9001 dev3
+FILER_SELF=dev3 READABLE="main olivia" PAIRED="main olivia"
+SENT=""; TASK_NOTIFY_ESCALATED_FROM=""
+task_need_notify DIVE-9001 decision "pick one" "" "" "" "" "" ""; rc=$?
+[[ "$rc" == "0" ]] && ok_t "escalated gate returns 0" || bad_t "escalated gate returns 0" "rc=$rc"
+[[ "$SENT" == *"filed by dev3"* ]] && ok_t "escalated alert names the original filer" \
+  || bad_t "escalated alert names the filer" "sent: ${SENT:0:160}"
+[[ "$SENT" == *"[DIVE-9001]"* ]] && ok_t "escalated alert carries the gate ident" || bad_t "ident in alert" "${SENT:0:160}"
+[[ "$SENT_AGENT" == "main" && -n "$SENT_ACCESS" ]] \
+  && ok_t "the send actually carries the ESCALATED agent's resolved channel" \
+  || bad_t "escalated channel reaches the sender" "agent='$SENT_AGENT' access='$SENT_ACCESS'"
+
+# Guard the subshell regression directly: the resolver must mutate the CALLER's
+# TASK_CH_*, so it may never be invoked as $(_task_chain_channel ...).
+TASK_CH_ACCESS=""; TASK_CH_AGENT=""
+_task_chain_channel dev3 && got="$TASK_CH_AGENT" || got=""
+[[ "$got" == "main" && -n "$TASK_CH_ACCESS" ]] \
+  && ok_t "_task_chain_channel resolves TASK_CH_* into the caller's shell" \
+  || bad_t "chain resolver sets caller state" "agent='$got' access='$TASK_CH_ACCESS'"
+grep -q '\$(_task_chain_channel' src/*.sh 2>/dev/null \
+  && bad_t "no command-substitution call sites" "a \$(_task_chain_channel ...) call site would discard the resolved channel" \
+  || ok_t "no \$(_task_chain_channel ...) call sites exist"
+
+# ---- 3. paired but UNREADABLE above => privileged re-send --------------------
+mk_gate DIVE-9002 dev3
+FILER_SELF=dev3 READABLE="" PAIRED="main"
+SENT=""; SUDO_CALLS=""; SUDO_RC=0; TASK_NOTIFY_ESCALATED_FROM=""
+task_need_notify DIVE-9002 decision "pick one" "" "" "" "" "" ""; rc=$?
+[[ "$rc" == "0" ]] && ok_t "unreadable-but-paired manager returns 0 via the privileged re-send" \
+  || bad_t "privileged re-send rc" "rc=$rc"
+[[ "$SUDO_CALLS" == *"DIVE-9002"* ]] && ok_t "privileged re-send was actually invoked" \
+  || bad_t "privileged re-send invoked" "calls='$SUDO_CALLS'"
+[[ -z "$SENT" ]] && ok_t "the unprivileged run does not also send" || bad_t "double send" "sent: ${SENT:0:80}"
+
+# The privileged run itself must NOT re-sudo — it falls through to the loud fail.
+SUDO_CALLS=""; TASK_GATE_ESCALATING=1
+task_need_notify DIVE-9002 decision "pick one" "" "" "" "" "" ""; rc=$?
+[[ "$rc" == "2" && -z "$SUDO_CALLS" ]] && ok_t "the privileged run never re-sudoes itself" \
+  || bad_t "recursion guard" "rc=$rc calls='$SUDO_CALLS'"
+unset TASK_GATE_ESCALATING
+
+# ---- 4. nobody paired anywhere => rc 2, logged, never a silent OK ------------
+mk_gate DIVE-9003 dev3
+FILER_SELF=dev3 READABLE="" PAIRED=""
+SENT=""; SUDO_CALLS=""; : >"$FIVEDIVE_GATE_NOTIFY_LOG"
+task_need_notify DIVE-9003 decision "pick one" "" "" "" "" "" ""; rc=$?
+[[ "$rc" == "2" ]] && ok_t "an undeliverable gate returns 2 (not a silent 0)" || bad_t "undeliverable rc" "rc=$rc"
+[[ -z "$SENT" ]] && ok_t "an undeliverable gate sends nothing" || bad_t "undeliverable sent" "${SENT:0:80}"
+grep -q "result=error" "$FIVEDIVE_GATE_NOTIFY_LOG" \
+  && ok_t "the miss is written to the gate-delivery log" || bad_t "delivery log" "$(cat "$FIVEDIVE_GATE_NOTIFY_LOG")"
+
+# ---- 5. cmd_task_need undoes an undeliverable gate and fails ----------------
+db "INSERT INTO tasks (ident,title,priority,assignee,created_by,kind,status)
+    VALUES ('DIVE-9004','undeliverable','high','dev3','dev3','standard','todo');"
+did=$(db "SELECT id FROM tasks WHERE ident='DIVE-9004';")
+FILER_SELF=dev3 READABLE="" PAIRED=""
+out=$( (cmd_task_need DIVE-9004 --type=decision --ask="which way?" --options="A|B" --recommend="A" --from=dev3) 2>&1 ); rc=$?
+[[ "$rc" != "0" ]] && ok_t "cmd_task_need EXITS non-zero when the gate can reach no human" \
+  || bad_t "cmd_task_need exits non-zero" "rc=$rc out=${out:0:200}"
+[[ "$out" == *"no paired channel"* ]] && ok_t "the failure names the cause" || bad_t "failure names the cause" "${out:0:200}"
+row=$(db "SELECT status||'|'||COALESCE(need_type,'-')||'|'||COALESCE(ask,'-')||'|'||COALESCE(tier,-1) FROM tasks WHERE id=${did};")
+[[ "$row" == "todo|-|-|-1" ]] && ok_t "the undeliverable gate is UNDONE (task left workable)" \
+  || bad_t "gate rolled back" "row='$row'"
+
+printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
+[[ "$FAIL" -eq 0 ]]
