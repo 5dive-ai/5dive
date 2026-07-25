@@ -330,6 +330,43 @@ cmd_usage() {
   fi
 }
 
+# usage_coverage_note <collect_json> — the banner that turns a partial read into
+# a visible one. Emits nothing when the read was whole.
+#
+# DIVE-1937: DIVE-1929 taught usage_collect to REPORT coverage and taught one
+# consumer (proof scorecard's tokens row) to respect it. Every other presenter
+# kept rendering the same numbers with no marker, which is not a fix that has
+# shipped — it is a field that is collected and dropped, the shape that left
+# DIVE-1908's TODAY_LABEL sitting unused. `5dive usage` / `5dive cost` are the
+# verbs people actually run to check burn, so a partial read here is the same
+# 21x understatement wearing a table.
+#
+# Three states, matching the scorecard: complete (silent), partial (named), and
+# UNKNOWN — an older collector that reports no coverage at all is treated as
+# partial, because an unlabelled total is exactly the thing that cannot be told
+# apart from a short one.
+usage_coverage_note() {
+  jq -r '
+    (.coverage // null) as $c
+    | if $c == null then
+        "  ⚠ COVERAGE UNKNOWN — this collector did not report which transcript sets it could read;",
+        "    the figures below cannot be told apart from a partial read."
+      elif ($c.unavailable == true) then
+        "  ⚠ TOKEN BURN UNKNOWN — " + ($c.reason // "the usage source could not be read at all") + ".",
+        "    Nothing below is a burn figure; unknown is not zero."
+      elif ($c.complete == true) then empty
+      else
+        ($c.unreadable // []) as $u
+        | "  ⚠ PARTIAL READ — " + (($c.agentsRead // 0)|tostring) + " of "
+          + (if $c.agentsExpected == null then "?" else ($c.agentsExpected|tostring) end)
+          + " agent transcript sets readable from here. This is NOT the fleet:"
+        , ("    every figure below omits or understates " +
+           (($u[:3] | map(.name + " (" + (.reason // "unreadable") + ")") | join("; ")))
+           + (if ($u|length) > 3 then " … +" + ((($u|length)-3)|tostring) + " more" else "" end) + ".")
+        , "    Re-run as root for a company-wide view."
+      end' <<<"$1"
+}
+
 # usage_render_board — top agents + top tasks, sorted by tokens descending.
 usage_render_board() {
   local data="$1" win="$2" budgets="$3"
@@ -339,6 +376,10 @@ usage_render_board() {
     return
   fi
   local label; [[ "$win" == "7d" ]] && label="last 7d" || label="last 24h"
+  # Coverage FIRST: the tables below (agents AND tasks) come from one read, and
+  # a header read after the numbers is a footnote. See usage_coverage_note.
+  local cov_note; cov_note=$(usage_coverage_note "$data")
+  [[ -n "$cov_note" ]] && { printf '%s\n' "$cov_note"; echo; }
   echo "TOP AGENTS — $label  (subscription tokens; no \$ — these run on the plan)"
   jq -r "$USAGE_JQ_HELPERS"'
     # per-account totals → each agent gets a share of its account 7d limit.
@@ -385,15 +426,33 @@ usage_render_board() {
 # usage_render_agent — one agent: per-model breakdown + its tasks in window.
 usage_render_agent() {
   local data="$1" agent="$2" win="$3"
-  local row
+  local row blind
   row=$(jq -c --arg n "$agent" '.agents[] | select(.name == $n)' <<<"$data")
-  [[ -n "$row" ]] || fail "$E_GENERIC" "no usage for agent '$agent' in window (or not a claude agent)"
+  # DIVE-1937: this agent's own blind-spot entry, if the collector filed one.
+  # A NAMED agent is the sharpest case of the DIVE-1929 lie: "no usage for
+  # agent X" reads as "X was idle" when what actually happened is that this
+  # caller was not allowed to look at X's transcripts.
+  blind=$(jq -c --arg n "$agent" '(.coverage.unreadable // [])[] | select(.name == $n)' <<<"$data")
+  if [[ -z "$row" ]]; then
+    [[ -n "$blind" ]] && fail "$E_PERMISSION" \
+      "cannot read '$agent' transcripts: $(jq -r '.reason // "unreadable"' <<<"$blind") — this is NOT 'no usage', it is no visibility (try: sudo 5dive usage $agent)"
+    fail "$E_GENERIC" "no usage for agent '$agent' in window (or not a claude agent)"
+  fi
   if (( JSON_MODE )); then
+    # `partial` rides WITH the numbers: a consumer that reads .data.usage.total
+    # must be able to see, in the same object, that the total is a floor.
     jq -c --arg n "$agent" \
       '{ok:true, data: {agent:$n, usage:(.agents[]|select(.name==$n)),
         tasks:[.tasks[]|select(.assignee==$n)],
-        untracked:(.untracked[$n] // null)}}' <<<"$data"
+        untracked:(.untracked[$n] // null),
+        partial:(((.coverage.unreadable // [])|map(select(.name==$n))|first) // null)}}' <<<"$data"
     return
+  fi
+  if [[ -n "$blind" ]]; then
+    # Row exists AND the agent is flagged: some of its transcript FILES were
+    # denied mid-scan. The tokens shown are real but short of the truth.
+    printf '  ⚠ PARTIAL — %s. The figures below are a FLOOR for %s, not its burn.\n\n' \
+      "$(jq -r '.reason // "some transcripts unreadable"' <<<"$blind")" "$agent"
   fi
   local label; [[ "$win" == "7d" ]] && label="last 7d" || label="last 24h"
   echo "$agent — $label"
@@ -610,6 +669,12 @@ cmd_usage_budget_check() {
   local data; data=$(usage_collect "$since") || fail "$E_GENERIC" "failed to collect usage"
   # per-agent 24h burn map {agent: total}
   local burns; burns=$(jq -c '[.agents[]|{key:.name,value:.total}]|from_entries' <<<"$data")
+  # DIVE-1937: agents this read could not fully see. `// 0` below turns a blind
+  # spot into a confident zero, and a confident zero is a PASSING budget check —
+  # the check would report "ok" for an agent it never read. A partial burn is
+  # still a FLOOR, so a crossing stays a real crossing and still fires; it is
+  # only the "ok" verdict that is unearned, and that becomes "unknown".
+  local blind; blind=$(jq -c '[(.coverage.unreadable // [])[]|{key:.name,value:true}]|from_entries' <<<"$data")
 
   # Evaluate each budgeted agent → decisions[] with what alerts/stops to fire,
   # plus the updated store and the state cache. jq does the classification; bash
@@ -617,12 +682,14 @@ cmd_usage_budget_check() {
   local plan
   plan=$(jq -cn "$USAGE_BNORM"'
     ($budgets) as $B | ($burns) as $U | ($since) as $since | ($now) as $now
+    | ($blind) as $BL
     | reduce ($B|keys[]) as $name (
         {store:{}, state:{}, acts:[]};
         ($B[$name]|bnorm) as $v
         | (($U[$name]) // 0) as $burn
         | (if   ($v.hard != null and $burn >= $v.hard) then "hard"
            elif ($v.soft != null and $burn >= $v.soft) then "soft"
+           elif ($BL[$name] // false) then "unknown"
            else "ok" end) as $st
         # re-alert only if we have not already alerted for this level within the
         # current 24h window (notified epoch older than `since`, or absent).
@@ -638,11 +705,16 @@ cmd_usage_budget_check() {
            elif $st=="soft" and $softDue then [{name:$name,level:"soft",burn:$burn,limit:$v.soft}]
            else [] end) as $act
         | .store[$name]  = ($v + {notified:$noti2})
-        | .state[$name]  = {burn:$burn, soft:$v.soft, hard:$v.hard, hardStop:$v.hardStop,
-                            state:$st, stopped:$v.stopped}
+        # burn is NULL, not 0, when this caller could not read the agent — a 0 in
+        # the state cache is what every downstream reader would treat as "quiet".
+        | .state[$name]  = {burn:(if $st=="unknown" then null else $burn end),
+                            soft:$v.soft, hard:$v.hard, hardStop:$v.hardStop,
+                            state:$st, stopped:$v.stopped,
+                            readable:(($BL[$name] // false) | not)}
         | .acts         += $act
       )' \
-    --argjson budgets "$b" --argjson burns "$burns" --argjson since "$since" --argjson now "$now")
+    --argjson budgets "$b" --argjson burns "$burns" --argjson blind "$blind" \
+    --argjson since "$since" --argjson now "$now")
 
   local new_store; new_store=$(jq -c '.store' <<<"$plan")
   local acts;      acts=$(jq -c '.acts' <<<"$plan")
@@ -691,11 +763,19 @@ cmd_usage_budget_check() {
   chmod 0664 "$USAGE_BUDGET_STATE_FILE" 2>/dev/null || true
 
   local checked; checked=$(jq -r 'length' <<<"$b")
+  # DIVE-1937: budgeted agents this read could not see. Counted and NAMED — a
+  # check that silently skipped them would report the same "N agent(s), 0 soft,
+  # 0 at ceiling" line as a check that actually cleared them.
+  local n_unknown unknown_names
+  n_unknown=$(jq -r '[.state[]|select(.state=="unknown")]|length' <<<"$plan")
+  unknown_names=$(jq -r '[.state|to_entries[]|select(.value.state=="unknown")|.key]|join(", ")' <<<"$plan")
   if (( JSON_MODE )); then
-    jq -cn --argjson c "$checked" --argjson s "$n_soft" --argjson h "$n_hard" --argjson st "$n_stop" --argjson dry "$dry" \
-      '{ok:true,data:{checked:$c,soft:$s,hard:$h,stopped:$st,dryRun:($dry==1)}}'
+    jq -cn --argjson c "$checked" --argjson s "$n_soft" --argjson h "$n_hard" --argjson st "$n_stop" \
+      --argjson dry "$dry" --argjson u "$n_unknown" --argjson cov "$(jq -c '.coverage // null' <<<"$data")" \
+      '{ok:true,data:{checked:$c,soft:$s,hard:$h,stopped:$st,unknown:$u,dryRun:($dry==1),coverage:$cov}}'
   else
     echo "budget check: ${checked} agent(s) — ${n_soft} soft, ${n_hard} at ceiling, ${n_stop} stopped$( ((dry)) && echo ' (dry-run)')"
+    (( n_unknown > 0 )) && echo "  ⚠ ${n_unknown} NOT checked — transcripts unreadable from here, burn is unknown (not 0): ${unknown_names}"
   fi
 }
 
@@ -721,28 +801,41 @@ cmd_cost() {
   budgets=$(usage_budget_load)
 
   # join burn ⋈ budget → rows with a computed state.
+  # DIVE-1937: an agent this caller cannot read is its own row STATE, not a 0.
+  # Before, a blind spot either vanished from the board (no budget set) or sat
+  # there as "● 0 tok — ok", which is the exact sentence a reader checking burn
+  # is looking for and the one thing this read cannot support. `readable:false`
+  # rows keep their identity and lose their number.
   local rows
   rows=$(jq -c "$USAGE_BNORM"'
     (reduce .agents[] as $a ({}; .[$a.name]=$a.total)) as $burn
-    | [ ( ($budgets|keys) + ($burn|keys) ) | unique[] as $n
+    | ([(.coverage.unreadable // [])[]|{key:.name,value:(.reason // "unreadable")}]|from_entries) as $blind
+    | [ ( ($budgets|keys) + ($burn|keys) + ($blind|keys) ) | unique[] as $n
         | ($budgets[$n] // null) as $raw
         | (if $raw==null then null else ($raw|bnorm) end) as $b
         | ($burn[$n] // 0) as $t
-        | { name:$n, burn:$t,
+        | ($blind[$n] // null) as $why
+        | { name:$n, burn:(if $why!=null and ($burn[$n]//null)==null then null else $t end),
+            readable:($why==null), blindReason:$why,
             soft:(if $b==null then null else $b.soft end),
             hard:(if $b==null then null else $b.hard end),
             hardStop:(if $b==null then false else $b.hardStop end),
-            state:(if $b==null then "-"
+            state:(if $b==null and $why!=null then "unknown"
+                   elif $b==null then "-"
                    elif ($b.hard!=null and $t>=$b.hard) then "hard"
                    elif ($b.soft!=null and $t>=$b.soft) then "soft"
+                   elif $why!=null then "unknown"
                    else "ok" end) } ]
-    | sort_by(-.burn)' --argjson budgets "$budgets" <<<"$data")
+    | sort_by(-(.burn // -1))' --argjson budgets "$budgets" <<<"$data")
 
   if (( JSON_MODE )); then
-    jq -cn --argjson r "$rows" --arg win "$win_flag" '{ok:true,data:{windowLabel:$win,agents:$r}}'
+    jq -cn --argjson r "$rows" --arg win "$win_flag" --argjson cov "$(jq -c '.coverage // null' <<<"$data")" \
+      '{ok:true,data:{windowLabel:$win,agents:$r,coverage:$cov}}'
     return
   fi
   local label; [[ "$win_flag" == "7d" ]] && label="last 7d" || label="last 24h"
+  local cov_note; cov_note=$(usage_coverage_note "$data")
+  [[ -n "$cov_note" ]] && { printf '%s\n' "$cov_note"; echo; }
   echo "COST — $label  (subscription tokens; no \$ — agents run on the plan)"
   jq -r "$USAGE_JQ_HELPERS"'
     if (.|length)==0 then "  (no claude-agent transcripts in window)"
@@ -751,13 +844,15 @@ cmd_cost() {
       (.[] |
         (if   .state=="hard" then "⛔"
          elif .state=="soft" then "⚠"
+         elif .state=="unknown" then "?"
          elif .state=="ok"   then "●"
          else " " end) as $g |
-        [ $g, .name, (.burn|htok),
+        [ $g, .name, (if .burn==null then "?" else (.burn|htok) end),
           (.soft|htok), (.hard|htok),
           (if .soft==null and .hard==null then "-" elif .hardStop then "on" else "off" end),
           (if   .state=="hard" then "OVER CEILING"
            elif .state=="soft" then "over soft cap"
+           elif .state=="unknown" then "UNREADABLE — burn unknown"
            elif .state=="ok"   then "ok"
            else "no budget" end) ]|@tsv)
     end' <<<"$rows" | column -t -s $'\t' | sed 's/^/  /'
