@@ -127,13 +127,17 @@ cmd_task_need DIVE-9 --type=approval --tier=2 --ask="make the final go/no-go cal
 [[ "$HUMAN_PINGED" == "1" ]] && ok_t "route on: explicit --tier=2 approval → human (not routed)" || bad_t "explicit T2 approval → human" "HUMAN_PINGED=$HUMAN_PINGED"
 
 # --- DIVE-1359: eng-ship class — a builder CANNOT hard-human-gate an eng ship/ --
-# merge/diff/deploy decision. Even an explicit --tier=2 is downgraded to a
+# merge/diff/deploy decision. The type DEFAULT tier-2 (approval) is downgraded to a
 # lead-routed tier-1 and routed to the org lead, NOT pinged to the human. Mirror
 # of the T2 floor; routes regardless of the gate_builder_routing pref.
+# DIVE-1957: an EXPLICIT --tier=2 is NO LONGER downgraded (see the veto cases in
+# tests/gate_tier2_explicit_pin_unit.sh) — overriding the type default is the point
+# of this class; overriding the caller's hard-human pin was the bug. This case
+# therefore files with NO --tier flag, which is the real builder shape anyway.
 seed DIVE-30; HUMAN_PINGED=0; route_reset
-cmd_task_need DIVE-30 --type=approval --tier=2 --ask="approve the prod push?" --from=dev >/dev/null 2>&1
+cmd_task_need DIVE-30 --type=approval --ask="approve the prod push?" --from=dev >/dev/null 2>&1
 [[ "$HUMAN_PINGED" == "0" ]] && ok_t "DIVE-1359: eng-ship approval --tier=2 NOT pinged to human" || bad_t "eng-ship T2 → not human" "HUMAN_PINGED=$HUMAN_PINGED"
-[[ "$(db "SELECT tier FROM tasks WHERE ident='DIVE-30';")" == "1" ]] && ok_t "DIVE-1359: eng-ship --tier=2 downgraded to lead-routed tier-1" || bad_t "eng-ship downgrade to tier-1" "got tier '$(db "SELECT tier FROM tasks WHERE ident='DIVE-30';")'"
+[[ "$(db "SELECT tier FROM tasks WHERE ident='DIVE-30';")" == "1" ]] && ok_t "DIVE-1359: eng-ship type-default tier-2 downgraded to lead-routed tier-1" || bad_t "eng-ship downgrade to tier-1" "got tier '$(db "SELECT tier FROM tasks WHERE ident='DIVE-30';")'"
 [[ "$(db "SELECT COALESCE(routed_reviewer,'') FROM tasks WHERE ident='DIVE-30';")" == "main" ]] && ok_t "DIVE-1359: eng-ship approval routed_reviewer=main (lead-clearable)" || bad_t "eng-ship routed to lead" "got '$(db "SELECT COALESCE(routed_reviewer,'') FROM tasks WHERE ident='DIVE-30';")'"
 
 # --- DIVE-1359: eng-ship routes even with pref OFF (intrinsic to the kind) ----
@@ -212,8 +216,10 @@ cmd_task_need DIVE-46 --type=approval --ask="push to github + roll the new api k
 # "land the/it" nor "push to origin", so no downgrade fired: it stayed tier-2
 # hard-human and pinged the paired human instead of the lead. Must now downgrade
 # + route to main. (DIVE-34..37 are taken above — use DIVE-38.)
+# (DIVE-1957: filed with NO --tier — approval already DEFAULTS to tier 2, which is
+# the leak's real shape; an explicit pin is now honored and vetoes the downgrade.)
 seed DIVE-38; HUMAN_PINGED=0; route_reset
-cmd_task_need DIVE-38 --type=approval --tier=2 --ask="Approve landing the verified CLI/plugin fix and pushing to origin?" --from=dev >/dev/null 2>&1
+cmd_task_need DIVE-38 --type=approval --ask="Approve landing the verified CLI/plugin fix and pushing to origin?" --from=dev >/dev/null 2>&1
 [[ "$HUMAN_PINGED" == "0" ]] && ok_t "DIVE-1605: 'landing...pushing' eng-ship NOT pinged to human" || bad_t "DIVE-1605 gerund eng-ship -> human" "HUMAN_PINGED=$HUMAN_PINGED"
 [[ "$(db "SELECT tier FROM tasks WHERE ident='DIVE-38';")" == "1" ]] && ok_t "DIVE-1605: 'landing...pushing' downgraded to tier-1" || bad_t "DIVE-1605 gerund downgrade" "got tier '$(db "SELECT tier FROM tasks WHERE ident='DIVE-38';")'"
 [[ "$(db "SELECT COALESCE(routed_reviewer,'') FROM tasks WHERE ident='DIVE-38';")" == "main" ]] && ok_t "DIVE-1605: 'landing...pushing' routed_reviewer=main (lead-clearable)" || bad_t "DIVE-1605 gerund route to lead" "got '$(db "SELECT COALESCE(routed_reviewer,'') FROM tasks WHERE ident='DIVE-38';")'"
