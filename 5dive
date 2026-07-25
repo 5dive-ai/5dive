@@ -26,7 +26,7 @@ esac
 
 # Bumped on every public release. `build.sh` checks this line exists; CI fails
 # the bundle-drift check if it's missing or empty.
-readonly FIVE_VERSION="0.14.9"
+readonly FIVE_VERSION="0.14.10"
 
 # GitHub org our repos live under. The org is being renamed
 # 5dive-com -> 5dive-ai (2026-06); fetches must work on either side of the
@@ -16583,7 +16583,9 @@ _task_usage() {
                             [--accept=<criteria>] [--verify=<cmd>] [--max-iters=<n>] [--verifier=<agent>] [--no-verify]
                                                      # DIVE-969: non-trivial tasks are verifier-graded BY DEFAULT (a grader
                                                      # !=maker + derived acceptance criteria). --no-verify opts out (plain
-                                                     # 'task done' closes). Trivial/low-priority chores skip it automatically.
+                                                     # 'task done' closes). Trivial/low-priority chores skip it automatically
+                                                     # — the skip is ANNOUNCED on the add line (DIVE-1880), and an explicit
+                                                     # --verifier=<agent> forces the rail ON at ANY priority.
                             [--task-budget=<tokens|\$cost>]  # per-run spend cap for the on-host loop (DIVE-824)
                                                      # loop spec: declarative verify loop (DIVE-476). --verify is
                                                      # the default cmd for `task verify`; --verifier grades (writer!=grader)
@@ -16591,6 +16593,10 @@ _task_usage() {
                                                      # default: open tasks, priority-ordered; --recurring: templates
   5dive task show <id|DIVE-N>                        # full detail + subtasks + blockers
   5dive task assign <id|DIVE-N> <agent>
+  5dive task verifier <id|DIVE-N> <agent> [--accept=<criteria>] [--max-iters=<n>]
+                                                     # DIVE-1880: attach the maker→verifier rail to an ALREADY-FILED open
+                                                     # task (grader must differ from the assignee). The remedy when the
+                                                     # DIVE-969 auto-skip declined the rail at filing time.
   5dive task set-branch <id|DIVE-N> <branch>         # bind the task to a git branch for delegated push (DIVE-1462/1697);
                                                      # writes/updates a 'Branch: <name>' line in the body. Also: task add --branch=<name>
   5dive task start  <id|DIVE-N>                      # -> in_progress
@@ -16677,6 +16683,7 @@ cmd_task() {
     done|close)      cmd_task_done "$@" ;;
     deliver)         cmd_task_deliver "$@" ;;
     verify)          cmd_task_verify "$@" ;;
+    verifier)        cmd_task_verifier "$@" ;;
     reject)          cmd_task_reject "$@" ;;
     loop)            cmd_task_loop "$@" ;;
     loops)           cmd_task_loops "$@" ;;
@@ -16784,14 +16791,24 @@ _task_resolve_coordinator() {
 # work where a grading round-trip is pure overhead: low priority, OR a bodyless
 # task whose title reads as a mechanical chore (typo/bump/rename/docs/lint/…).
 # Anything with a real body or medium+ priority is treated as non-trivial.
-_task_is_trivial() {
+#
+# DIVE-1880: prints the REASON the rail is being skipped (empty = not trivial =
+# the default engages). The reason exists so the skip can be ANNOUNCED at add
+# time — a control that looks applied and is not is the defect this fixes.
+_task_verify_skip_reason() {
   local _title="$1" _body="$2" _priority="$3"
-  [[ "$_priority" == "low" ]] && return 0
+  [[ "$_priority" == "low" ]] && { printf 'low priority'; return 0; }
   if [[ -z "$_body" ]]; then
     local t="${_title,,}"
-    [[ "$t" =~ (^|[^a-z])(typo|typos|bump|rename|tweak|nit|nits|lint|format|reformat|comment|comments|whitespace|changelog|readme|docs|doc|wording|copy[[:space:]]fix|version[[:space:]]bump)([^a-z]|$) ]] && return 0
+    [[ "$t" =~ (^|[^a-z])(typo|typos|bump|rename|tweak|nit|nits|lint|format|reformat|comment|comments|whitespace|changelog|readme|docs|doc|wording|copy[[:space:]]fix|version[[:space:]]bump)([^a-z]|$) ]] \
+      && { printf 'bodyless chore title'; return 0; }
   fi
-  return 1
+  return 0
+}
+
+# Boolean form, kept for readability at the call site.
+_task_is_trivial() {
+  [[ -n "$(_task_verify_skip_reason "$1" "$2" "$3")" ]]
 }
 
 # Resolve the lone org root (the single top of the chart — reports_to NULL or a
@@ -17058,10 +17075,20 @@ cmd_task_add() {
   # exists (e.g. a solo org, or the only coordinator IS the assignee) the default
   # silently no-ops rather than blocking the add. Env kill-switch for the fleet:
   # FIVE_VERIFY_DEFAULT=0.
-  local verify_defaulted=0 verify_unavailable=0
+  # DIVE-1880: the auto-skip used to be SILENT — `task add --priority=low` printed
+  # nothing to say the rail had been declined, so the filer could not tell a
+  # railed task from an unrailed one without inspecting the row afterwards. We now
+  # capture WHY it was skipped and announce it below. Note an explicit
+  # --verifier=<agent> still forces the rail ON at any priority (it short-circuits
+  # this whole block and is stored verbatim) — the auto-skip is a DEFAULT, not a
+  # ceiling. --no-verify is an explicit, already-visible opt-out, so it stays quiet.
+  local verify_defaulted=0 verify_unavailable=0 verify_skipped=""
   if [[ "$kind" == "standard" && -z "$no_verify" && "${FIVE_VERIFY_DEFAULT:-1}" != "0" \
-        && -z "$accept" && -z "$verify_cmd" && -z "$verifier" ]] \
-     && ! _task_is_trivial "$title" "$body" "$priority"; then
+        && -z "$accept" && -z "$verify_cmd" && -z "$verifier" ]]; then
+   verify_skipped=$(_task_verify_skip_reason "$title" "$body" "$priority")
+  fi
+  if [[ "$kind" == "standard" && -z "$no_verify" && "${FIVE_VERIFY_DEFAULT:-1}" != "0" \
+        && -z "$accept" && -z "$verify_cmd" && -z "$verifier" && -z "$verify_skipped" ]]; then
     local _grader; _grader=$(_task_default_verifier "$assignee" "$proj_lead")
     if [[ -n "$_grader" ]]; then
       verifier="$_grader"
@@ -17100,9 +17127,14 @@ cmd_task_add() {
     # INST-2 (DIVE-1673): a quiet, lowercase tag — honest but not a nag for solo
     # users; the full explanation lives in `task show` detail, not this line.
     (( verify_unavailable )) && verify_note=" · unverified"
+    # DIVE-1880: mirror the positive notice when the rail was auto-DECLINED, and
+    # name the remedy — otherwise the filer reads a bare "created DIVE-N" and
+    # reasonably assumes the by-default grading they were told about applied.
+    [[ -n "$verify_skipped" ]] \
+      && verify_note=" · NOT verifier-graded ($verify_skipped) — 'task done' will close it outright; attach a grader with: 5dive task verifier $ident <agent>"
     ok "created ${ident} — $title${coord_note}${verify_note}" \
-       '{id:($i|tonumber), ident:$id, project:$pr, title:$t, priority:$p, assignee:$a, created_by:$c, kind:"standard", autoCoordinated:($ac=="1"), verifyDefaulted:($vd=="1"), verifyUnavailable:($vu=="1"), verifier:$v}' \
-       --arg i "$id" --arg id "$ident" --arg pr "$project" --arg t "$title" --arg p "$priority" --arg a "${assignee:-}" --arg c "$creator" --arg ac "$auto_coordinated" --arg vd "$verify_defaulted" --arg vu "$verify_unavailable" --arg v "${verifier:-}"
+       '{id:($i|tonumber), ident:$id, project:$pr, title:$t, priority:$p, assignee:$a, created_by:$c, kind:"standard", autoCoordinated:($ac=="1"), verifyDefaulted:($vd=="1"), verifyUnavailable:($vu=="1"), verifySkipped:($vs!=""), verifySkipReason:$vs, verifier:$v}' \
+       --arg i "$id" --arg id "$ident" --arg pr "$project" --arg t "$title" --arg p "$priority" --arg a "${assignee:-}" --arg c "$creator" --arg ac "$auto_coordinated" --arg vd "$verify_defaulted" --arg vu "$verify_unavailable" --arg vs "$verify_skipped" --arg v "${verifier:-}"
   fi
 }
 
@@ -17267,6 +17299,66 @@ cmd_task_assign() {
                         THEN datetime('now') ELSE started_at END
       WHERE id=${id};"
   ok "$ident assigned to $who" '{id:($i|tonumber), ident:$id, assignee:$a}' --arg i "$id" --arg id "$ident" --arg a "$who"
+}
+
+# DIVE-1880: attach the maker→verifier rail to an ALREADY-FILED task. `--verifier`
+# only ever existed on `task add`, so a task filed WITHOUT the rail — explicitly
+# (--no-verify) or silently (the DIVE-969 auto-skip for low priority / chore
+# titles) — could never be graded afterwards: `task done` closed it outright and
+# the only remedy was cancel-and-re-file, which loses the thread. This makes the
+# auto-skip a reversible DEFAULT rather than a one-way ceiling.
+#
+# Deliberately ONE-WAY: there is no --none/--clear to DETACH a grader. Adding a
+# control after the fact is safe; quietly removing one is exactly the failure this
+# task is about. Opting out stays an add-time decision (--no-verify).
+cmd_task_verifier() {
+  tasks_db_init
+  local task="" who="" accept="" max_iters=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --accept=*)    accept="${1#*=}" ;;
+      --max-iters=*) max_iters="${1#*=}" ;;
+      --from=*)      : ;;   # accepted for symmetry with the other verbs; unused
+      -*)            fail "$E_USAGE" "unknown flag: $1" ;;
+      *)             if [[ -z "$task" ]]; then task="$1"
+                     elif [[ -z "$who" ]]; then who="$1"
+                     else fail "$E_USAGE" "unexpected arg: $1"; fi ;;
+    esac
+    shift
+  done
+  [[ -n "$task" && -n "$who" ]] \
+    || fail "$E_USAGE" "usage: 5dive task verifier <id|DIVE-N> <agent> [--accept=<criteria>] [--max-iters=<n>]"
+  [[ -z "$max_iters" || "$max_iters" =~ ^[1-9][0-9]*$ ]] \
+    || fail "$E_VALIDATION" "--max-iters must be a positive integer"
+  resolve_task_id "$task"; local id="$RESOLVED_TASK_ID" ident="$RESOLVED_TASK_IDENT"
+  local st kind title asignee cur_accept
+  st=$(db "SELECT status FROM tasks WHERE id=${id};")
+  kind=$(db "SELECT COALESCE(kind,'standard') FROM tasks WHERE id=${id};")
+  title=$(db "SELECT title FROM tasks WHERE id=${id};")
+  asignee=$(db "SELECT COALESCE(assignee,'') FROM tasks WHERE id=${id};")
+  cur_accept=$(db "SELECT COALESCE(acceptance_criteria,'') FROM tasks WHERE id=${id};")
+  # A CLOSED task can't be retro-graded — `done` already happened, so a verifier
+  # here would be a grade that never ran. `task reject` is the real remedy: it
+  # bounces a closed task back to its maker.
+  [[ "$st" != "done" && "$st" != "cancelled" ]] \
+    || fail "$E_VALIDATION" "$ident is already $st — a verifier can't retro-grade a closed task (bounce it back with: 5dive task reject $ident --feedback=\"…\")"
+  [[ "$kind" == "standard" ]] \
+    || fail "$E_VALIDATION" "$ident is a $kind template, not a worked task — set the rail on its instances (task add … --verifier=)"
+  # writer != grader (DIVE-474): a maker grading itself is not a review.
+  [[ "$who" != "$asignee" ]] \
+    || fail "$E_VALIDATION" "'$who' is $ident's own assignee — a maker can't grade itself (reassign first, or pick a different grader)"
+  local new_accept="$cur_accept"
+  [[ -n "$accept" ]] && new_accept="$accept"
+  [[ -z "$new_accept" ]] \
+    && new_accept="Deliverable meets the intent of: ${title}. Maker records in the done result WHAT was built and HOW it was checked; ${who} confirms against this before the task closes (refine these criteria as the work firms up)."
+  db "UPDATE tasks SET verifier=$(sqlq "$who"),
+        acceptance_criteria=$(sqlq "$new_accept"),
+        max_iterations=$([[ -n "$max_iters" ]] && echo "$max_iters" || echo "max_iterations"),
+        verify_unavailable=NULL
+      WHERE id=${id};"
+  ok "$ident is now verifier-graded → $who ('task done' hands off to grade instead of closing)" \
+     '{id:($i|tonumber), ident:$id, verifier:$v, assignee:$a, acceptanceCriteria:$ac}' \
+     --arg i "$id" --arg id "$ident" --arg v "$who" --arg a "$asignee" --arg ac "$new_accept"
 }
 
 # _gate_gh_token — resolve a usable gh auth token for the DIVE-1830 merge-gate's
