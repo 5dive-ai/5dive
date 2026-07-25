@@ -45,38 +45,37 @@ OUT1="$(run_build "$W1" 5 1 27 2)"; RC1=$?
 [[ $RC1 -eq 0 ]] && ok_t "fresh publish exits 0" || bad_t "fresh exit" "rc=$RC1"
 [[ -f "$W1/badge.json" && -f "$W1/zero-human.json" && -f "$W1/history.jsonl" && -f "$W1/README.md" ]] \
   && ok_t "all four files written" || bad_t "files written"
-[[ "$(jget "$W1/badge.json" "['message']")" == "80% · 2026-07-11" ]] \
+[[ "$(jget "$W1/badge.json" "['message']")" == "80%" ]] \
   && ok_t "badge message = self-shipped pct from the last-7 daily datapoints" || bad_t "badge message" "$(cat "$W1/badge.json")"
 [[ "$(jget "$W1/badge.json" "['schemaVersion']")" == "1" && "$(jget "$W1/badge.json" "['label']")" == "zero-human" ]] \
   && ok_t "badge is a valid shields endpoint schema" || bad_t "badge schema"
 
-# DIVE-1908: the badge must carry its OWN date, and it must be the SAME day the
-# datapoint describes. Without this the badge renders a stale number as current
-# for as long as the publisher stays dead, which is the honesty instrument
-# misreporting its own freshness.
-#
-# LITERAL STRING EQUALITY, and that is the entire payoff of using ISO. A short
-# "Jul 11" label would force a transformation between the two artifacts, so the
-# check would have to parse-and-compare; ISO makes them byte-identical, so the
-# check is ==. Taking the simpler property but asserting it the old way would be
-# buying the property without verifying it. Extract the substring, compare raw,
-# no date parsing and no reformatting on either side.
-BADGE_MSG="$(jget "$W1/badge.json" "['message']")"          # 80% · 2026-07-11
-BADGE_DATE="${BADGE_MSG##* · }"                             # 2026-07-11
+# DIVE-1924: the badge message is the NUMBER ONLY — lodar's call, the date is
+# visual noise on the one asset whose value is being instantly readable. This
+# pins that: anything appended here (a date, an "updated", a separator) fails.
+# The freshness guarantee it replaces lives in .github/workflows/badge-staleness.yml,
+# an INDEPENDENT hourly watcher, because a dead publisher cannot mark itself dead.
+BADGE_MSG="$(jget "$W1/badge.json" "['message']")"          # 80%
+[[ "$BADGE_MSG" == "80%" ]] \
+  && ok_t "badge message is the number alone, nothing appended" \
+  || bad_t "badge message minimal" "expected '80%', got '$BADGE_MSG'"
+
+# The agreement property from DIVE-1908 SURVIVES — it just moved to the fields
+# that still carry a date. One clock read feeds both (cmd_proof.sh), so
+# zero-human.json's `date` must be the day part of its own generatedAtUtc,
+# byte-identical, no parsing. This is what stops the watcher above from reading
+# one field while the artifact describes another day; deleting the badge's date
+# must not silently delete the property that made the dates trustworthy.
 DP_DATE="$(jget "$W1/zero-human.json" "['date']")"          # 2026-07-11
-[[ -n "$DP_DATE" && "$BADGE_DATE" == "$DP_DATE" ]] \
-  && ok_t "badge date IS zero-human.json's date, byte-identical (string ==, no parsing)" \
-  || bad_t "badge date == datapoint date" "badge='$BADGE_DATE' datapoint.date='$DP_DATE' msg='$BADGE_MSG'"
-# ...and it must actually have been a separate field, not the whole message
-# trivially matching itself if the separator ever disappears.
-[[ "$BADGE_DATE" != "$BADGE_MSG" ]] \
-  && ok_t "the date is a distinct segment of the badge message" \
-  || bad_t "badge date segment" "no ' · ' separator in '$BADGE_MSG'"
-# The middot must survive as a real character, not a · escape — badge.json
-# is read by humans checking staleness, not only by shields.
-grep -q 'u00b7' "$W1/badge.json" \
-  && bad_t "badge.json is human-readable" "middot was escaped to \\u00b7: $(cat "$W1/badge.json")" \
-  || ok_t "badge.json keeps the separator as a real character (no \\u00b7 escape)"
+DP_STAMP="$(jget "$W1/zero-human.json" "['generatedAtUtc']")"
+[[ -n "$DP_DATE" && "${DP_STAMP%%T*}" == "$DP_DATE" ]] \
+  && ok_t "zero-human.json date IS the day of its own generatedAtUtc (string ==, one clock read)" \
+  || bad_t "datapoint date == generatedAtUtc day" "date='$DP_DATE' stamp='$DP_STAMP'"
+# ...and the stamp must really have had a time part, so the check above cannot
+# pass vacuously if the T separator ever disappears.
+[[ "${DP_STAMP%%T*}" != "$DP_STAMP" ]] \
+  && ok_t "generatedAtUtc is a full timestamp, not a bare day" \
+  || bad_t "generatedAtUtc shape" "no 'T' separator in '$DP_STAMP'"
 [[ "$(jget "$W1/zero-human.json" "['week']['shipped']")" == "5" \
    && "$(jget "$W1/zero-human.json" "['week']['humanAsks']")" == "1" \
    && "$(jget "$W1/zero-human.json" "['day']['shipped']")" == "5" \
@@ -99,13 +98,13 @@ OUT2="$(run_build "$W1" 9 9 99 9 2026-07-11)"; RC2=$?
 # --- Case 3a: perfect week drops the trailing .0 (100%, not 100.0%) ----------
 W3="$TMP/w3"; mkdir -p "$W3"
 run_build "$W3" 4 0 10 0 >/dev/null
-[[ "$(jget "$W3/badge.json" "['message']")" == "100% · 2026-07-11" ]] \
+[[ "$(jget "$W3/badge.json" "['message']")" == "100%" ]] \
   && ok_t "zero asks -> 100% with trailing .0 dropped" || bad_t "100pct" "$(cat "$W3/badge.json")"
 
 # --- Case 3b: a week with zero ships has no ratio -> raw-count fallback -------
 W3b="$TMP/w3b"; mkdir -p "$W3b"
 run_build "$W3b" 0 1 0 1 >/dev/null
-[[ "$(jget "$W3b/badge.json" "['message']")" == "0 shipped, 1 ask · 2026-07-11" ]] \
+[[ "$(jget "$W3b/badge.json" "['message']")" == "0 shipped, 1 ask" ]] \
   && ok_t "zero shipped -> raw-count fallback, singular 'ask'" || bad_t "zero-ship fallback" "$(cat "$W3b/badge.json")"
 
 # --- Case 4: cumulative sums the non-overlapping 24h datapoints across days ---
@@ -156,7 +155,7 @@ OUT6="$( cd "$W6" && \
   CLI_VERSION="0.8.8" METHODOLOGY_URL="https://example.test/zero-human.md" \
   python3 "$TMP/proof.py" )"; RC6=$?
 [[ $RC6 -eq 0 ]] && ok_t "DIVE-1864: >128KB digest via *_FILE builds (no E2BIG)" || bad_t "big-file build" "rc=$RC6"
-[[ "$(jget "$W6/badge.json" "['message']")" == "100% · 2026-07-12" ]] \
+[[ "$(jget "$W6/badge.json" "['message']")" == "100%" ]] \
   && ok_t "big-file badge computes verbatim (6 shipped / 0 asks -> 100%)" || bad_t "big-file badge" "$(cat "$W6/badge.json" 2>/dev/null)"
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
