@@ -40,7 +40,33 @@ sqlite3 "$DB" "CREATE TABLE tasks (id INTEGER PRIMARY KEY, ident TEXT);
   && ok_t "precondition: legacy store has supervisor_events but NOT policy_refusals" \
   || bad_t "precondition"
 
-TASKS_DB="$DB" "$BUNDLE" task ls >/dev/null 2>&1 || true
+# Drive the migration by calling tasks_db_init DIRECTLY on a throwaway STATE_DIR
+# (the DIVE-1475 isolation override that the sibling store suites use), NOT by
+# shelling the bundle at a bare TASKS_DB.
+#
+# THE PREVIOUS VERSION OF THESE FIVE LINES IS WHY THIS TICKET WAS REOPENED. It
+# ran `TASKS_DB=$DB $BUNDLE task ls >/dev/null 2>&1 || true`, which:
+#   * swallowed the driver's exit code AND its stderr, so a hard failure looked
+#     like a successful migration, and
+#   * depended on the AMBIENT HOST STORE. On a developer box the migration ran
+#     as a side effect of init before `task ls` died on an unrelated
+#     `no such column: status` — the assertion passed while the command it
+#     depended on was FAILING. On a clean CI runner init refuses outright
+#     ("tasks store not initialised"), nothing migrates, and the assertion fails.
+# Green locally, red in CI, and the local green was meaningless. A test that
+# needs the host to already be in the right state is not testing the code.
+export STATE_DIR="$TMP/state"
+export TASKS_DIR="$STATE_DIR/tasks"
+export TASKS_DB="$DB"
+mkdir -p "$TASKS_DIR"
+: > "$STATE_DIR/tasks/.board-initialized"   # pre-existing board (DIVE-1479 guard)
+# shellcheck disable=SC1091
+migrate_out=$( set +e; . src/lib/tasks_db.sh >/dev/null 2>&1; tasks_db_init 2>&1 ); migrate_rc=$?
+if (( migrate_rc != 0 )); then
+  bad_t "the migration driver itself FAILED (rc=$migrate_rc)" "$migrate_out"
+else
+  ok_t "tasks_db_init completes on a legacy store without error"
+fi
 
 [[ "$(sqlite3 "$DB" "SELECT COUNT(*) FROM sqlite_master WHERE name='policy_refusals';")" == "1" ]] \
   && ok_t "migration creates policy_refusals on a store that ALREADY has supervisor_events" \
@@ -123,8 +149,15 @@ DUPES="$(grep -oE 'policy_refuse "[^"]+" [a-z0-9-]+' src/cmd_task.sh | awk '{pri
 #     an unrelated environmental reason on this host, so it never reached the
 #     assertion. Compare every instrumented site against the code it had on
 #     origin/main — the only source of truth for "what it used to do".
-if git rev-parse --verify origin/main >/dev/null 2>&1; then
-  git show origin/main:src/cmd_task.sh > "$TMP/orig_task.sh" 2>/dev/null
+# Do not merely CHECK for origin/main — try to obtain it. A shallow CI checkout
+# legitimately lacks it, and the old code turned that into a silent `ok`.
+if ! git rev-parse --verify origin/main >/dev/null 2>&1; then
+  git fetch --depth=1 origin main >/dev/null 2>&1 || true
+fi
+if git rev-parse --verify origin/main >/dev/null 2>&1 || git rev-parse --verify FETCH_HEAD >/dev/null 2>&1; then
+  MAIN_REF=origin/main
+  git rev-parse --verify origin/main >/dev/null 2>&1 || MAIN_REF=FETCH_HEAD
+  git show "${MAIN_REF}:src/cmd_task.sh" > "$TMP/orig_task.sh" 2>/dev/null
   drift=0
   while read -r code slug; do
     # the message is unchanged by instrumentation, so match the site by its slug's
@@ -150,7 +183,13 @@ if git rev-parse --verify origin/main >/dev/null 2>&1; then
     && ok_t "every exit code used by an instrumented site existed at a refusal on origin/main" \
     || bad_t "invented exit code" "$unknown"
 else
-  ok_t "origin/main unavailable — skipped the behaviour-preservation comparison"
+  # NOT ok_t. This comparison is the only thing standing between "telemetry was
+  # added" and "telemetry silently changed three exit codes", which is a defect
+  # this ticket already shipped once. Counting a skip as a pass is how a suite
+  # reports green while its load-bearing assertion never ran, so it is a FAILURE
+  # here — CI always has origin/main, and a developer box that does not can fetch.
+  bad_t "origin/main unreachable — the behaviour-preservation comparison did NOT run" \
+        "a fetch was attempted and failed; this assertion is not optional"
 fi
 
 # --- Case 5: policy_refuse is reserved for POLICY refusals. If it ever spreads

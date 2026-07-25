@@ -819,6 +819,13 @@ _proof_scorecard() {
     # `5dive` on PATH, not the tree being built), so the scorecard would have
     # died silently on every box until the new version rolled. A silent exit is
     # the failure mode this whole verb exists to argue against.
+    # NB $self is the 5dive resolved on PATH, which is DELIBERATE and is not the
+    # bundle you may be running from a build tree: refusals are recorded by
+    # whatever CLI the box actually runs, so that is the artifact whose coverage
+    # the denominator has to describe. The marker below therefore NAMES that path
+    # — an earlier wording said "this 5dive build", which was false whenever the
+    # two differed, and a marker whose stated reason is wrong is its own small
+    # lie in the one metric that exists to argue against those.
     refusal_sites="$( { grep -oE 'policy_refuse "[^"]+" [a-z0-9-]+' "$self" 2>/dev/null || true; } \
                      | awk '{print $NF}' | sort -u | wc -l | tr -d ' ')"
   fi
@@ -829,7 +836,7 @@ _proof_scorecard() {
                     GROUP BY 1 ORDER BY 2 DESC, 1;" 2>/dev/null || true)"
 
   DIGEST_FILE="$work/digest.json" USAGE_FILE="$work/usage.json" DB_ROWS="$rows" GROUP_ROWS="$group_rows" \
-  REFUSALS="$refusals" REFUSAL_SITES="$refusal_sites" \
+  REFUSALS="$refusals" REFUSAL_SITES="$refusal_sites" SELF_PATH="$self" \
   WINDOW="$window" BY="$by" AS_JSON="$json" python3 <<'SCOREPY'
 import os, json, sys
 
@@ -958,7 +965,7 @@ elif _sites.isdigit() and int(_sites) == 0:
     # causes it actually is — a marker whose stated reason is wrong is its own
     # small lie, and this metric exists to argue against exactly that.
     metrics.append(metric("policy-blocked action attempts", None,
-                          nodata="this 5dive build has no instrumented policy sites — upgrade to record refusals (DIVE-1922)"))
+                          nodata=f"the 5dive on PATH ({os.environ.get('SELF_PATH') or '5dive'}) has no instrumented policy sites — upgrade it to record refusals (DIVE-1922)"))
 else:
     metrics.append(metric("policy-blocked action attempts", None,
                           nodata="no policy_refusals table in this store — nothing has recorded a refused attempt (DIVE-1922)"))
