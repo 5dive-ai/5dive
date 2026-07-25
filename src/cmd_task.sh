@@ -31,6 +31,11 @@ _task_usage() {
                                                      # the task to the new grader. No detach: opting out is add-time only.
   5dive task set-branch <id|DIVE-N> <branch>         # bind the task to a git branch for delegated push (DIVE-1462/1697);
                                                      # writes/updates a 'Branch: <name>' line in the body. Also: task add --branch=<name>
+  5dive task set-body <id|DIVE-N> <text...> [--append]
+                                                     # DIVE-1920: edit a task's body after creation (--body was add-time only).
+                                                     # Default OVERWRITES the whole body; --append tacks text on instead (the
+                                                     # common case — a finding/addendum after filing). Works on recurring
+                                                     # templates too. Refused on a closed (done/cancelled) task.
   5dive task start  <id|DIVE-N>                      # -> in_progress
   5dive task done   <id|DIVE-N> [--result=<text>]    # -> done; --result captures the agent's response
   5dive task deliver <id|DIVE-N> --pr=<url> [--result=<text>]
@@ -241,6 +246,7 @@ cmd_task() {
     show|view)       cmd_task_show "$@" ;;
     assign)          cmd_task_assign "$@" ;;
     set-branch)      cmd_task_set_branch "$@" ;;
+    set-body)        cmd_task_set_body "$@" ;;
     start)           cmd_task_start "$@" ;;
     done|close)      cmd_task_done "$@" ;;
     deliver)         cmd_task_deliver "$@" ;;
@@ -319,6 +325,53 @@ cmd_task_set_branch() {
   db "UPDATE tasks SET body=$(sqlq "$newbody") WHERE id=${id};"
   ok "$ident bound to branch '$branch' — delegated push (5dive push $ident) will accept this branch" \
      '{ident:$id, branch:$b}' --arg id "$ident" --arg b "$branch"
+}
+
+# `5dive task set-body <id|DIVE-N> <text...> [--append]` — DIVE-1920: the only
+# route to edit a body after `task add` was a direct sqlite UPDATE, which
+# scoped-sudo makers can't do and admins correctly decline to do unilaterally
+# (a finding/addendum belongs in the ticket, not relayed over chat — that's the
+# appending-is-not-compiling failure this exists to close). Default overwrites
+# the whole body; --append tacks the text on with a blank-line separator so an
+# addendum can't clobber someone else's existing context. Also works on
+# recurring TEMPLATES (kind='recurring'), the DIVE-176 case. Refuses on a
+# closed task — same "can't retro-edit a closed task" guard as `task verifier`.
+cmd_task_set_body() {
+  tasks_db_init
+  local append=0 task=""
+  local -a words=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --append)      append=1 ;;
+      --)            shift; words+=("$@"); break ;;
+      -*)            fail "$E_USAGE" "unknown flag: $1" ;;
+      *)             if [[ -z "$task" ]]; then task="$1"; else words+=("$1"); fi ;;
+    esac
+    shift
+  done
+  local text="${words[*]:-}"
+  [[ -n "$task" && -n "$text" ]] \
+    || fail "$E_USAGE" "usage: 5dive task set-body <id|DIVE-N> <text...> [--append]"
+  resolve_task_id "$task"; local id="$RESOLVED_TASK_ID" ident="$RESOLVED_TASK_IDENT"
+  local st
+  st=$(db "SELECT status FROM tasks WHERE id=${id};")
+  [[ "$st" != "done" && "$st" != "cancelled" ]] \
+    || fail "$E_VALIDATION" "$ident is already $st — its body is frozen (closed tasks don't get retro-edited; bounce it back first with: 5dive task reject $ident --feedback=\"…\")"
+  local newbody
+  if (( append )); then
+    local body
+    body=$(db "SELECT COALESCE(body,'') FROM tasks WHERE id=${id};")
+    if [[ -n "$body" ]]; then
+      newbody="${body}"$'\n\n'"${text}"
+    else
+      newbody="$text"
+    fi
+  else
+    newbody="$text"
+  fi
+  db "UPDATE tasks SET body=$(sqlq "$newbody") WHERE id=${id};"
+  local mode="replaced"; (( append )) && mode="appended"
+  ok "$ident body $mode" '{ident:$id, mode:$m}' --arg id "$ident" --arg m "$mode"
 }
 
 cmd_task_init() {
