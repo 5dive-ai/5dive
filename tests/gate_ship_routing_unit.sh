@@ -351,5 +351,34 @@ seed DIVE-54; HUMAN_PINGED=0; route_reset
 cmd_task_need DIVE-54 --type=approval --ask="approve the deploy AND the \$900 vercel invoice?" --from=dev >/dev/null 2>"$TMP/n54"
 [[ "$(nudge_of "$TMP/n54")" == "0" && "$HUMAN_PINGED" == "1" ]] && ok_t "DIVE-1738: floored money eng-ship is NOT nudged (stays human)" || bad_t "DIVE-1738 floored not nudged" "nudge=$(nudge_of "$TMP/n54") human=$HUMAN_PINGED"
 
+# --- DIVE-2004: LOUD AT FILE TIME ---------------------------------------------
+# A push-for-review ask filed as an UNROUTED `decision` is the one gate shape
+# `5dive push` cannot attribute to anybody, and before this the filer learned that
+# only later, from a refusal that read as if the ANSWERER was at fault. The warning
+# has to be narrow or it is wallpaper: eng-ship-shaped ask AND type=decision AND no
+# routed reviewer. The routed branch above `return`s, so reaching it IS unrouted.
+# NB: `grep -c` already prints 0 on no-match and exits 1 — a `|| echo 0` fallback
+# appends a SECOND line, so the count reads "0\n0" and every == "0" check fails
+# while the code under test is fine. Take the first line and no fallback.
+w2004_of() { grep -c "will REFUSE it" "$1" 2>/dev/null | head -1; }
+# filed by the lead: `_gate_route_reviewer` finds nobody above them -> unrouted.
+seed DIVE-55; HUMAN_PINGED=0; route_reset
+cmd_task_need DIVE-55 --type=decision --ask="cherry-pick, or re-file the delegated push for review after #16?" --from=main >/dev/null 2>"$TMP/n55"
+[[ "$(w2004_of "$TMP/n55")" -ge 1 ]] \
+  && ok_t "DIVE-2004: unrouted eng-ship decision warns at FILE time that push will refuse it" \
+  || bad_t "DIVE-2004 file-time warning" "warn=$(w2004_of "$TMP/n55") rr='$(db "SELECT COALESCE(routed_reviewer,'') FROM tasks WHERE ident='DIVE-55';")'"
+# the SAME ask from a builder DOES route -> push accepts it -> must stay silent.
+seed DIVE-56; HUMAN_PINGED=0; route_reset
+cmd_task_need DIVE-56 --type=decision --ask="cherry-pick, or re-file the delegated push for review after #16?" --from=dev >/dev/null 2>"$TMP/n56"
+{ [[ "$(w2004_of "$TMP/n56")" == "0" ]] && [[ -n "$(db "SELECT COALESCE(routed_reviewer,'') FROM tasks WHERE ident='DIVE-56';")" ]]; } \
+  && ok_t "DIVE-2004: a ROUTED eng-ship decision does NOT warn (push accepts it)" \
+  || bad_t "DIVE-2004 routed must not warn" "warn=$(w2004_of "$TMP/n56") rr='$(db "SELECT COALESCE(routed_reviewer,'') FROM tasks WHERE ident='DIVE-56';")'"
+# an ordinary unrouted decision is not a push ask -> silent, or the warning is noise.
+seed DIVE-57; HUMAN_PINGED=0; route_reset
+cmd_task_need DIVE-57 --type=decision --ask="which copy variant should we use on the pricing page?" --from=main >/dev/null 2>"$TMP/n57"
+[[ "$(w2004_of "$TMP/n57")" == "0" ]] \
+  && ok_t "DIVE-2004: a non-eng-ship unrouted decision does NOT warn (no wallpaper)" \
+  || bad_t "DIVE-2004 non-eng-ship must not warn" "warn=$(w2004_of "$TMP/n57")"
+
 echo "----"; echo "PASS=$PASS FAIL=$FAIL"
 [[ "$FAIL" == "0" ]]
