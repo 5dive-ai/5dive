@@ -57,11 +57,21 @@ while read -r local_ref local_oid remote_ref remote_oid; do
 
   [[ -z "${commits// }" ]] && continue   # nothing new to push on this ref
 
-  # (1) commit messages of the pushed commits
-  git log --no-color --format='%B' "$base..$local_oid" 2>/dev/null | bash "$SCAN" >/dev/null || rc=1
-  # (2) lines ADDED by the pushed commits
-  git diff --no-color "$base" "$local_oid" 2>/dev/null \
-    | grep '^+' | grep -v '^+++' | sed 's/^+//' | bash "$SCAN" >/dev/null || rc=1
+  # DIVE-1935: COLLECT first, scan second, so the SCANNER's verdict is the only
+  # thing that can set rc. Both checks used to pipe straight into the scanner under
+  # `set -o pipefail`, which made any non-zero EARLIER stage indistinguishable from
+  # a denylist hit — and `grep '^+'` exits 1 when it matches nothing. So a push
+  # whose net diff adds no lines (a message-only `commit --amend`, a pure deletion,
+  # a revert that only removes) was BLOCKED with "a denylisted identifier is in the
+  # commits you are pushing", sending the author hunting PII that was never there.
+  # A guard that misreports its own reason is worse than one that stays quiet: the
+  # stated cause is what the reader acts on. `|| true` is on the COLLECTORS only,
+  # never on the scanner.
+  msgs="$(git log --no-color --format='%B' "$base..$local_oid" 2>/dev/null || true)"
+  printf '%s\n' "$msgs" | bash "$SCAN" >/dev/null || rc=1
+  added="$(git diff --no-color "$base" "$local_oid" 2>/dev/null \
+             | grep '^+' | grep -v '^+++' | sed 's/^+//' || true)"
+  printf '%s\n' "$added" | bash "$SCAN" >/dev/null || rc=1
 done
 
 if [[ $rc -ne 0 ]]; then
