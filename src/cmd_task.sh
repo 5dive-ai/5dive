@@ -4092,6 +4092,11 @@ _gate_channel_proof_ok() {
 # stderr; an unanswered gate must never look delivered merely because curl ran.
 _task_gate_delivery_log() { # <ok|error> <task_ids> <chat> <message_id> <detail>
   local result="$1" task_ids="$2" chat="$3" message_id="$4" detail="$5"
+  # DIVE-1968 criterion 3: count the ATTEMPT, not the write. The delivery
+  # assertion in task_need_notify needs to know whether this gate reached a
+  # terminal verdict at all, and it must reach the same answer on a fenced
+  # fixture store as on prod — otherwise every unit harness would trip it.
+  TASK_GATE_DELIVERY_ROWS=$(( ${TASK_GATE_DELIVERY_ROWS:-0} + 1 ))
   local idents="$task_ids"
   if [[ "$task_ids" =~ ^[0-9]+(,[0-9]+)*$ ]]; then
     idents=$(db "SELECT group_concat(ident, ',') FROM tasks WHERE id IN (${task_ids});" 2>/dev/null) || idents="$task_ids"
@@ -4110,7 +4115,20 @@ _task_gate_delivery_log() { # <ok|error> <task_ids> <chat> <message_id> <detail>
   # "no paired channel for filer X or anyone above it" row into production
   # telemetry. Measured on this box: of 36 distinct idents in the error rows, 17
   # existed ONLY in fixture stores; the true post-DIVE-1927 production population
-  # is 28 rows on 2 tasks, not the 194 on 13 the ticket was filed on.
+  # is far smaller than the 194 rows on 13 tasks the ticket was filed on.
+  #
+  # CORRECTION to this comment's first cut (and to PR #170's body), because the
+  # number it quoted was derived the wrong way and is now cited knowledge: it said
+  # "28 rows on 2 tasks", from an IDENT-EXISTS-IN-PROD-STORE filter. That filter is
+  # insufficient — fixtures REUSE real idents. The sound discriminator is the
+  # PENDING-GATE WINDOW: a row is a real delivery attempt only if
+  # need_asked_at <= ts < need_answered_at, because the notify path will not
+  # re-fire an answered gate and cmd_task_gate_escalate refuses anything not
+  # pending. Under the window filter the post-DIVE-1927 population is ZERO genuine
+  # production rows: DIVE-1 and DIVE-1956 never had a gate at all, and STEER-1's 26
+  # rows all land six days AFTER its gate was answered while STEER-1 is named in two
+  # fixtures. So "the largest real shape is absent-from-org, 13 of 28" was the
+  # fixture population talking. The fence is right; only those numbers were wrong.
   #
   # That contamination is worse than noise, and in BOTH directions: it inflated the
   # apparent blast radius AND it hid the real residual inside it. It also
@@ -4399,7 +4417,65 @@ _task_gate_reply_markup() { # <row_id> <type> <options> <recommend> <nonce> <cha
   printf '%s' "$reply_markup"
 }
 
+# DIVE-1968 criterion 3 — THE DELIVERY ASSERTION.
+#
+# Every branch below records a verdict: an `ok` row, an `error` row, or a
+# privileged re-send whose child records one. The bug is what happens when NONE of
+# them runs. Measured on this box while reading the residual: of 9 real post-fix
+# gates, 5 recorded NEITHER an ok nor an error row — they were filed, they returned
+# 0, and they left no trace in the only dataset anyone consults to judge whether
+# the gate rail works. That is strictly worse than a logged failure. A logged
+# failure is a bug report; silence is indistinguishable from success, and it is
+# what let this whole class survive a live end-to-end verification of DIVE-1927.
+#
+# So the delivery verdict is now MANDATORY rather than emergent. If the inner path
+# returns without any delivery row, we synthesise the missing verdict (error, with
+# a detail that names the hole rather than guessing a cause), warn loudly at the
+# filer, and downgrade a bare `return 0` to rc 3 — FILED, NOT NOTIFIED. rc 3 is an
+# existing, handled contract: the gate row stands and is answerable on the
+# dashboard, gate_pinged_at stays NULL, and the re-nag sweep escalates it. That
+# matters more than the log line: an unrecorded delivery used to also claim the
+# ping, which suppressed the one mechanism that would have rescued it.
+#
+# Deliberately a wrapper around the unchanged body: the invariant is "no exit from
+# this function without a verdict", and a wrapper enforces it for the four exits
+# that exist today AND for whichever ones get added later — which is the actual
+# failure mode, since none of today's exits was written intending to be silent.
+# The verdict FOLLOWS THE DELIVERY STATE — it is not assumed from the silence. Two
+# different holes hide behind "no row", and collapsing them would have traded a
+# missing row for a WRONG one:
+#   * delivered, unrecorded  -> the send was confirmed (TASK_SEND_DELIVERED=1) and
+#     only the bookkeeping is missing. Backfill the `ok` row. This is the larger
+#     half of the measured 5, and calling it a failure would have manufactured
+#     error rows for gates that reached their human — re-contaminating the dataset
+#     with the opposite bias, on the very ticket about a mis-measured one.
+#   * neither delivered nor recorded -> nobody can show a human was reached.
+#     Synthesise the error row and downgrade rc 0 to 3.
+# Found by two pre-existing tests (gate_channelless_escalation, gate_filer_own_channel)
+# going red against the first cut, which asserted on the row alone. They were right
+# and the assertion was wrong: both drive a stubbed send that reports DELIVERED,
+# which is exactly the delivered-but-unrecorded shape. Both pass UNCHANGED here —
+# that they were not edited to accommodate this diff is the point.
 task_need_notify() {
+  TASK_GATE_DELIVERY_ROWS=0
+  TASK_SEND_DELIVERED=0
+  local _rc=0
+  _task_need_notify_deliver "$@" || _rc=$?
+  if (( ${TASK_GATE_DELIVERY_ROWS:-0} == 0 )); then
+    if [[ "${TASK_SEND_DELIVERED:-0}" == "1" ]]; then
+      _task_gate_delivery_log ok "$1" "${TASK_CH_CHAT:-}" "${TASK_SEND_MESSAGE_IDS%%,*}" \
+        "confirmed send, backfilled by the delivery assertion (the notify path recorded no row of its own)"
+    else
+      _task_gate_delivery_log error "$1" "" "" \
+        "no delivery verdict recorded by the notify path (rc=${_rc}) and no confirmed send; delivery is UNVERIFIABLE, treating as unnotified"
+      warn "$1: gate delivery is UNVERIFIABLE — the notify path exited (rc=${_rc}) with neither a confirmed send nor a recorded verdict, so nobody can show a human was reached. Treated as FILED UNNOTIFIED: the re-nag will escalate it. Answer on the dashboard or: 5dive task answer $1"
+      (( _rc == 0 )) && _rc=3
+    fi
+  fi
+  return $_rc
+}
+
+_task_need_notify_deliver() {
   local ident="$1" need_type="$2" ask="$3" options="$4" recommend="${5:-}"
   local secret_key="${6:-}" connector="${7:-}" human_nonce="${8:-}"
   local precedent_cite="${9:-}"  # OSS-11: prior-answer citation, empty if none
@@ -4461,6 +4537,14 @@ task_need_notify() {
       if [[ -n "$_paired" && $EUID -ne 0 && -z "${TASK_GATE_ESCALATING:-}" ]]; then
         if _task_gate_escalate_via_sudo "$ident" "$human_nonce"; then
           warn "$ident: gate alert delivered to ${_paired} via a privileged re-send (its channel is not readable as this agent)"
+          # The row for this delivery was written by the CHILD process (it runs the
+          # same notify path as root against the same prod store), so nothing is
+          # missing from the log — but the counter lives in THIS shell, so credit it
+          # here or the delivery assertion below would read a confirmed delivery as
+          # an unrecorded one. Counted, not logged: logging here would double-count
+          # one send as two rows and re-inflate exactly the telemetry this ticket
+          # spent a whole round decontaminating.
+          TASK_GATE_DELIVERY_ROWS=$(( ${TASK_GATE_DELIVERY_ROWS:-0} + 1 ))
           return 0
         fi
         warn "$ident: privileged re-send to ${_paired} FAILED${TASK_GATE_ESCALATE_ERR:+ — ${TASK_GATE_ESCALATE_ERR}}"
