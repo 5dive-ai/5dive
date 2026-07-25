@@ -300,11 +300,8 @@ _compose_wire_role() {
   # DIVE-536/506: CC 2.1.181+ STRIPS a bare model alias ("opus") from a fresh
   # config dir, so a template that says `model: opus` silently loses it. Normalise
   # the alias to the full resolved id the runtime keeps; full ids pass untouched.
-  case "$model" in
-    opus)   model="claude-opus-4-8" ;;
-    sonnet) model="claude-sonnet-4-6" ;;
-    haiku)  model="claude-haiku-4-5-20251001" ;;
-  esac
+  # DIVE-1883: the id itself lives in src/lib/models.sh — do NOT re-inline it here.
+  model=$(resolve_model_alias "$model")
 
   # model / effort via the public config path (process-isolated; warns if the
   # runtime config isn't written yet — model just stays at its default).

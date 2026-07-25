@@ -26,6 +26,7 @@ cat \
   src/lib/error_codes.sh \
   src/lib/output.sh \
   src/lib/validation.sh \
+  src/lib/models.sh \
   src/lib/agent_setup.sh \
   src/lib/state.sh \
   src/lib/audit.sh \

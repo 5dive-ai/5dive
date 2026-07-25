@@ -239,6 +239,12 @@ Delegated push (bring your own GitHub App — DIVE-1376):
   # (contents:write, installed on your ship repos), held root-side in /etc/5dive/connectors — never a human token.
   # Full setup walkthrough: docs/delegated-push.md
 
+Models:
+  5dive models [--json]
+    Current Claude model id per short alias (opus / sonnet / fable / haiku).
+    Single source of truth for the agent-create pin and the telegram /model
+    picker — a model release is a one-line change in src/lib/models.sh.
+
 Health:
   5dive doctor [--fix] [--dry-run] [--category=deps|types|auth|creds|registry|shelld|channels|host|memory]
     Walks deps (tmux/jq/bun/python3/nvm/node/npm), type bins, live auth
@@ -574,6 +580,11 @@ main() {
           with_registry_lock cmd_account_set_active_provider "$@" ;;
         *) fail "$E_USAGE" "unknown account command: $acctcmd" ;;
       esac ;;
+    models)
+      # DIVE-1883: print the alias -> current model id map (source of truth in
+      # src/lib/models.sh). Read-only. The telegram plugin reads
+      # `5dive models --json` at boot so its /model picker can't drift again.
+      cmd_models "$@" ;;
     doctor)
       # Only audit when a mutating run is requested (--fix/--repair); read-only
       # runs (and --dry-run previews) would spam the log.
