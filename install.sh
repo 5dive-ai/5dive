@@ -18,10 +18,63 @@ if [[ -z "${GH_ORG:-}" ]]; then
   fi
 fi
 
+# >>> DIVE-1977 pin-resolution block (extracted verbatim by tests/install_pin_sha_unit.sh)
+# DIVE-1977: every path under raw.githubusercontent.com/<org>/5dive/main is an
+# INDEPENDENT CDN object with its own cache generation, so for a window after
+# each release the CDN can hand back the PREVIOUS bundle next to the NEW
+# 5dive.sha256. Nothing is corrupt and nothing was tampered with — the two
+# objects simply do not describe each other — but the checksum guard in
+# refresh_managed_files() fails closed and blames "corrupt download or tampered
+# mirror", which is a security-shaped alarm raised by a cache race on an
+# unattended 04:00 self-update.
+#
+# So resolve the mutable `main` ref to ONE immutable commit sha here, once, and
+# fetch every asset from raw/<sha>/. Staleness is fine: if the resolver hands
+# back a slightly older sha, both objects come from that one tree and the box
+# installs the previous release for a few minutes — a non-event. INCONSISTENCY
+# is the thing that is unfixable at the client, and a pinned tree cannot be
+# inconsistent. The guard itself stays exactly as strict as it was.
+#
+# Prints the sha on stdout, or fails if it cannot resolve one (the caller then
+# falls back to /main, and the mismatch message says which case it is in).
+resolve_gh_sha() {
+  local sha=""
+  # git ls-remote is exact and carries no API rate limit. A brand-new box may
+  # not have git yet — this script is what apt-installs it — so this is the
+  # normal path on every re-install and self-update, not on the first one.
+  if command -v git >/dev/null 2>&1; then
+    sha="$(git ls-remote "https://github.com/$GH_ORG/5dive.git" main 2>/dev/null | awk 'NR==1 {print $1}')" || sha=""
+    if [[ "$sha" =~ ^[0-9a-f]{40}$ ]]; then printf '%s\n' "$sha"; return 0; fi
+  fi
+  # First-install fallback: the commits atom feed. Unauthenticated, and not
+  # subject to the 60/hr api.github.com limit a NAT'd fleet would share.
+  sha="$(curl -fsSL --max-time 10 "https://github.com/$GH_ORG/5dive/commits/main.atom" 2>/dev/null \
+    | sed -n 's#.*Grit::Commit/\([0-9a-f]\{40\}\).*#\1#p' | head -1)" || sha=""
+  if [[ "$sha" =~ ^[0-9a-f]{40}$ ]]; then printf '%s\n' "$sha"; return 0; fi
+  # Last resort before giving up on pinning altogether.
+  sha="$(curl -fsSL --max-time 10 "https://api.github.com/repos/$GH_ORG/5dive/commits/main" 2>/dev/null \
+    | sed -n 's/.*"sha"[[:space:]]*:[[:space:]]*"\([0-9a-f]\{40\}\)".*/\1/p' | head -1)" || sha=""
+  if [[ "$sha" =~ ^[0-9a-f]{40}$ ]]; then printf '%s\n' "$sha"; return 0; fi
+  return 1
+}
+
 # Source for binaries / hooks / skills. Overridable for offline installs,
 # enterprise mirrors, and pre-publish smoke tests (which point this at a
-# `file://` bundle of the working tree).
-REPO="${REPO:-https://raw.githubusercontent.com/$GH_ORG/5dive/main}"
+# `file://` bundle of the working tree) — an explicit REPO is never re-pinned,
+# because we can't vouch for a foreign mirror's internal consistency. GH_SHA
+# pins the tree directly, skipping resolution (CI wanting a PR head, rollbacks).
+GH_PINNED_SHA="${GH_SHA:-}"
+if [[ -z "${REPO:-}" ]]; then
+  [[ -n "$GH_PINNED_SHA" ]] || GH_PINNED_SHA="$(resolve_gh_sha || true)"
+  if [[ -n "$GH_PINNED_SHA" ]]; then
+    REPO="https://raw.githubusercontent.com/$GH_ORG/5dive/$GH_PINNED_SHA"
+  else
+    REPO="https://raw.githubusercontent.com/$GH_ORG/5dive/main"
+  fi
+else
+  GH_PINNED_SHA=""
+fi
+# <<< DIVE-1977 pin-resolution block
 BIN_DIR="/usr/local/bin"
 STATE_DIR="/var/lib/5dive"
 CONNECTORS_DIR="/etc/5dive/connectors"
@@ -61,7 +114,15 @@ refresh_managed_files() {
     _got="$(sha256sum "$_bundle_tmp" | awk '{print $1}')"
     if [[ "$_want" != "$_got" ]]; then
       rm -f "$_bundle_tmp"
-      die "5dive bundle checksum mismatch (want ${_want:0:16}…, got ${_got:0:16}…) — refusing to install (corrupt download or tampered mirror)"
+      # DIVE-1977: name the cause we can actually justify. Pinned to one commit
+      # sha, both objects came from the same immutable tree, so a mismatch really
+      # is bad bytes. Unpinned (sha resolution failed), the far likelier cause is
+      # two CDN cache generations of a mutable ref — do NOT accuse the operator's
+      # mirror of tampering for that.
+      if [[ -n "$GH_PINNED_SHA" ]]; then
+        die "5dive bundle checksum mismatch (want ${_want:0:16}…, got ${_got:0:16}…) — refusing to install. Both objects came from the immutable tree $GH_PINNED_SHA, so this is not a cache skew: the download is corrupt or the mirror is tampered."
+      fi
+      die "5dive bundle checksum mismatch (want ${_want:0:16}…, got ${_got:0:16}…) — refusing to install. This box could not pin a commit sha, so the bundle and its checksum were fetched from the mutable ref $REPO and may be two different CDN cache generations (a stale mirror in the minutes after a release) rather than a corrupt download or a tampered mirror. Retry in a few minutes; if it persists, treat it as an integrity failure."
     fi
   else
     echo "  ! no published 5dive.sha256 (or fetch failed) — skipping integrity check" >&2
