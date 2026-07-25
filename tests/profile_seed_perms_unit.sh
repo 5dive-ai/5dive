@@ -76,6 +76,29 @@ check "profile root not widened" "$(stat -c '%a' "$AUTH_PROFILES_DIR/acme")" "70
 check "store root not widened"   "$(stat -c '%a' "$AUTH_PROFILES_DIR")" "700"
 chmod 0755 "$AUTH_PROFILES_DIR" "$AUTH_PROFILES_DIR/acme"
 
+# ...and the other side of that bound (main, PR #151): because the walk stops
+# BELOW the roots, correctness rests on the store root and each profile root
+# being group-traversable — a mode this function never sets and never checks.
+# The seed's real invariant is the WHOLE chain, so assert the whole chain: with
+# the roots at the 2750 that profile_type_dir creates, every component from the
+# store down to the credential must carry group r-x after normalize. This fails
+# loudly if the roots are ever created or tightened to 0700, which is exactly
+# the unasserted dependency.
+chmod 2750 "$AUTH_PROFILES_DIR" "$AUTH_PROFILES_DIR/acme"
+# Walk from the credential's own dir up to and INCLUDING the store root; above
+# that is the harness tmpdir, which is none of our business.
+chain_ok=yes
+probe="$(dirname "$AGY_CRED")"
+while :; do
+  perm="$(stat -c '%A' "$probe")"
+  # drwxr-s--- → [0]=type, [1..3]=user, [4..6]=group. Group r is [4], group x
+  # is [6] (shows as 's' when setgid is set, which our profile dirs are).
+  [[ "${perm:4:1}" == "r" && "${perm:6:1}" =~ ^[xs]$ ]] || chain_ok="no ($probe = $perm)"
+  [[ "$probe" == "$AUTH_PROFILES_DIR" ]] && break
+  probe="$(dirname "$probe")"
+done
+check "whole path chain is group-traversable after normalize" "$chain_ok" "yes"
+
 # Empty profile is a safe no-op (default profile keeps shared /home/claude paths).
 normalize_profile_seed_perms "" && echo "ok: empty-profile no-op returns 0" || { echo "FAIL: empty-profile"; fail=1; }
 

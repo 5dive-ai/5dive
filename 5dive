@@ -26,7 +26,7 @@ esac
 
 # Bumped on every public release. `build.sh` checks this line exists; CI fails
 # the bundle-drift check if it's missing or empty.
-readonly FIVE_VERSION="0.14.12"
+readonly FIVE_VERSION="0.14.13"
 
 # GitHub org our repos live under. The org is being renamed
 # 5dive-com -> 5dive-ai (2026-06); fetches must work on either side of the
@@ -4572,6 +4572,19 @@ heal_claude_shadow_creds() {
 #      is still unreadable, so fixing only the mode was never enough.
 # Dir walk is bounded to inside the profile root, so it can never widen
 # anything outside /var/lib/5dive/auth-profiles/<profile>.
+#
+# DEPENDENCY, called out because nothing here enforces it (main, PR #151):
+# the walk stops BELOW the profile root — it never chmods
+# ${AUTH_PROFILES_DIR}/<profile> or ${AUTH_PROFILES_DIR} themselves. Group
+# traverse on those two comes from their creation modes: the store is 2750
+# root:claude and each profile root is created 2750 by profile_type_dir, and
+# every agent is in group claude. If either is ever created or tightened to
+# 0700, every seed below it goes unreadable again and this function will not
+# notice. Deliberate: widening a directory this function did not create is a
+# bigger decision than fixing a credential's mode, and the two roots are ours
+# to keep correct at creation time. tests/profile_seed_perms_unit.sh asserts
+# both the bound (roots are never widened) and the dependency (a group-
+# traversable root is what makes the normalized file reachable).
 normalize_profile_seed_perms() {
   local profile="${1:-}"
   [[ -n "$profile" ]] || return 0
