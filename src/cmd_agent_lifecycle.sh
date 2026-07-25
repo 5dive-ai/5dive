@@ -1,3 +1,19 @@
+# DIVE-1900: re-normalize the seed-credential perms of whatever auth profile
+# <agent> is bound to, so the next boot's seed step can actually read them
+# without sudo. No-op when the agent is on the default profile (shared
+# /home/claude/.<type> paths, already group-readable), when the registry is
+# unreadable, or when we are not root. Never fails the caller.
+normalize_restart_profile_perms() {
+  local name="$1" reg profile
+  [[ $EUID -eq 0 ]] || return 0
+  declare -F normalize_profile_seed_perms >/dev/null 2>&1 || return 0
+  reg=$(registry_read 2>/dev/null) || return 0
+  profile=$(jq -r --arg n "$name" '.agents[$n].authProfile // empty' <<<"$reg" 2>/dev/null) || return 0
+  [[ -n "$profile" ]] || return 0
+  normalize_profile_seed_perms "$profile" || true
+  return 0
+}
+
 cmd_restart() {
   local name="" defer=0
   while [[ $# -gt 0 ]]; do
@@ -10,6 +26,15 @@ cmd_restart() {
   done
   [[ -n "$name" ]] || fail "$E_USAGE" "usage: 5dive agent restart <name> [--defer]"
   require_agent "$name"
+  # DIVE-1900: restart is THE documented "make a fresh login take effect" step,
+  # but the boot-time seed in 5dive-agent-start runs as agent-<name> and cannot
+  # chmod anything in the profile. So a successful login left a 0600 credential
+  # under 0700 vendor dot-dirs and every restart re-seeded nothing — silently,
+  # while the profile, `agent list` and the seat row all reported healthy.
+  # `agent restart` runs as root, so normalize the bound profile's seed perms
+  # here, right before the unit comes back up. Guarded + always-0 so a restart
+  # never fails on a perms hiccup.
+  normalize_restart_profile_perms "$name"
   if (( defer )); then
     # DIVE-1002: CLI-mediated deferred restart. `sudo 5dive` already runs as
     # root, so the CLI fires systemd-run internally — an (scoped-)admin agent

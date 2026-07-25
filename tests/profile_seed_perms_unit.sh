@@ -32,19 +32,49 @@ source "$SRC/cmd_auth.sh"
 fail=0
 check() { if [[ "$2" == "$3" ]]; then echo "ok: $1"; else echo "FAIL: $1 (want=$3 got=$2)"; fail=1; fi; }
 
-# Build a fake profile with 0600 codex + grok auth.json (as the CLIs write them).
-mkdir -p "$AUTH_PROFILES_DIR/acme/codex" "$AUTH_PROFILES_DIR/acme/grok/.grok"
+# Build a fake profile as the vendor CLIs actually write it: 0600 credential
+# files under 0700 dot-dirs (DIVE-1900 — the dirs were the other half of the
+# bug; a 0640 file under a 0700 dir is still unreadable to group=claude).
+AGY_CRED="$AUTH_PROFILES_DIR/acme/antigravity/.gemini/antigravity-cli/antigravity-oauth-token"
+OC_CRED="$AUTH_PROFILES_DIR/acme/openclaw/.openclaw/agents/main/agent/auth-profiles.json"
+mkdir -p "$AUTH_PROFILES_DIR/acme/codex" "$AUTH_PROFILES_DIR/acme/grok/.grok" \
+         "$AUTH_PROFILES_DIR/acme/hermes" "$(dirname "$AGY_CRED")" "$(dirname "$OC_CRED")"
 echo '{"token":"c"}' > "$AUTH_PROFILES_DIR/acme/codex/auth.json"
 echo '{"token":"g"}' > "$AUTH_PROFILES_DIR/acme/grok/.grok/auth.json"
-chmod 0600 "$AUTH_PROFILES_DIR/acme/codex/auth.json" "$AUTH_PROFILES_DIR/acme/grok/.grok/auth.json"
+echo '{"token":"h"}' > "$AUTH_PROFILES_DIR/acme/hermes/auth.json"
+echo 'ya29.agy-token'  > "$AGY_CRED"
+echo '{"token":"o"}' > "$OC_CRED"
+chmod 0600 "$AUTH_PROFILES_DIR/acme/codex/auth.json" "$AUTH_PROFILES_DIR/acme/grok/.grok/auth.json" \
+           "$AUTH_PROFILES_DIR/acme/hermes/auth.json" "$AGY_CRED" "$OC_CRED"
+chmod 0700 "$AUTH_PROFILES_DIR/acme/grok/.grok" "$(dirname "$AGY_CRED")" \
+           "$AUTH_PROFILES_DIR/acme/antigravity/.gemini" "$(dirname "$OC_CRED")"
 
 # Precondition: not group-readable.
 check "codex pre-perm 600" "$(stat -c '%a' "$AUTH_PROFILES_DIR/acme/codex/auth.json")" "600"
+check "agy pre-perm 600"   "$(stat -c '%a' "$AGY_CRED")" "600"
+check "agy dir pre-700"    "$(stat -c '%a' "$(dirname "$AGY_CRED")")" "700"
 
 normalize_profile_seed_perms "acme"
 
 check "codex now 640" "$(stat -c '%a' "$AUTH_PROFILES_DIR/acme/codex/auth.json")" "640"
 check "grok now 640"  "$(stat -c '%a' "$AUTH_PROFILES_DIR/acme/grok/.grok/auth.json")" "640"
+# DIVE-1900: the three types the old codex/grok-only loop skipped entirely.
+check "hermes now 640"  "$(stat -c '%a' "$AUTH_PROFILES_DIR/acme/hermes/auth.json")" "640"
+check "agy now 640"     "$(stat -c '%a' "$AGY_CRED")" "640"
+check "openclaw now 640" "$(stat -c '%a' "$OC_CRED")" "640"
+# ...and the dirs between the credential and the profile root are traversable,
+# or the mode fix above buys nothing.
+check "agy leaf dir g+rx"   "$(stat -c '%a' "$(dirname "$AGY_CRED")")" "750"
+check "agy .gemini g+rx"    "$(stat -c '%a' "$AUTH_PROFILES_DIR/acme/antigravity/.gemini")" "750"
+check "grok .grok g+rx"     "$(stat -c '%a' "$AUTH_PROFILES_DIR/acme/grok/.grok")" "750"
+check "openclaw leaf g+rx"  "$(stat -c '%a' "$(dirname "$OC_CRED")")" "750"
+# The walk must stop AT the profile root — never widen anything above it
+# (the root is already created 2750 g=claude by profile_type_dir).
+chmod 0700 "$AUTH_PROFILES_DIR/acme" "$AUTH_PROFILES_DIR"
+normalize_profile_seed_perms "acme"
+check "profile root not widened" "$(stat -c '%a' "$AUTH_PROFILES_DIR/acme")" "700"
+check "store root not widened"   "$(stat -c '%a' "$AUTH_PROFILES_DIR")" "700"
+chmod 0755 "$AUTH_PROFILES_DIR" "$AUTH_PROFILES_DIR/acme"
 
 # Empty profile is a safe no-op (default profile keeps shared /home/claude paths).
 normalize_profile_seed_perms "" && echo "ok: empty-profile no-op returns 0" || { echo "FAIL: empty-profile"; fail=1; }
