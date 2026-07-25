@@ -99,10 +99,23 @@ function dispatchSeatVote(opts) {
       const env = JSON.parse(stdout)
       reply = (env && env.data && env.data.reply) || ''
     } catch (e) {
-      // ask timed out (E_TIMEOUT), the agent isn't running, or the exec failed -> ABSTAIN.
-      return { vote: 'abstain', rationale: `no reply from ${seat.id} (${String(e && e.message || e).replace(/\s+/g, ' ').slice(0, 140)})` }
+      // ask timed out (E_TIMEOUT), the agent isn't running, or the exec failed. DIVE-1901/1869: this
+      // is a CAPTURE/TRANSPORT FAILURE, not a seat that declined to vote, and folding it into a plain
+      // abstain is the worst thing a governance engine can do — the receipt seals clean and misreports
+      // what the council decided. It still tallies as an abstain (a seat we could not hear cannot
+      // count as aye or nay), but it is TAGGED so the verdict, the receipt and a reader can tell the
+      // two apart. Never silently equal to "the seat abstained".
+      return { vote: 'abstain', abstainKind: 'capture-failed', capture: false,
+               rationale: `CAPTURE FAILED (not an abstention) — no reply captured from ${seat.id}: ${String(e && e.message || e).replace(/\s+/g, ' ').slice(0, 140)}` }
     }
-    return E.parseVote(reply) || { vote: 'abstain', rationale: `${seat.id} reply had no COUNCIL-VOTE line` }
+    // An EMPTY reply is the same defect one layer up: `ask` exited 0 having captured nothing. Before
+    // DIVE-1901 that arrived here indistinguishable from a seat that answered off-format.
+    if (!String(reply).trim()) {
+      return { vote: 'abstain', abstainKind: 'capture-empty', capture: false,
+               rationale: `CAPTURE FAILED (not an abstention) — ${seat.id} returned an EMPTY reply; the seat may well have answered` }
+    }
+    return E.parseVote(reply) || { vote: 'abstain', abstainKind: 'unparsed', capture: true,
+                                   rationale: `${seat.id} replied but with no COUNCIL-VOTE line` }
   }
 }
 // CNCL-18 dispatch: NON-BLOCKING ballots via the task queue (default fleet path). Instead of the
