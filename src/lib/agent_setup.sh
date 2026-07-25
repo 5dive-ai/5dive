@@ -38,7 +38,8 @@ MODEL_TIERING_CLAUDE_MD="/usr/local/lib/5dive/model-tiering-CLAUDE.md"
 OPERATIONAL_COMMS_CLAUDE_MD="/usr/local/lib/5dive/operational-comms-CLAUDE.md"
 # DIVE-1210: project-subagent override that shadows the harness's built-in
 # Explore agent and pins it to haiku. Every claude agent's settings.json pins
-# model:"claude-opus-4-8" (below), and CC >=2.1.198 has Explore inherit the
+# the current opus id (below, from src/lib/models.sh), and CC >=2.1.198 has
+# Explore inherit the
 # main conversation's model (capped at Opus) instead of always running on
 # Haiku — so without this override, every Explore delegation (the bulk of a
 # session's file/code search calls) silently runs full Opus.
@@ -83,7 +84,9 @@ _operator_ids() {
 }
 
 preseed_claude_agent() {
-  local name="$1" channels="$2" selected_model="${3:-claude-opus-4-8}"
+  # DIVE-1883: the default pin resolves from src/lib/models.sh — the one place a
+  # model release is recorded. An explicit $3 (DIVE-1103 BYO) still wins.
+  local name="$1" channels="$2" selected_model="${3:-$(resolve_model_alias opus)}"
   local user="agent-${name}" home="/home/agent-${name}"
   [[ -d "$home" ]] || fail "$E_GENERIC" "agent home missing: $home"
 
@@ -141,7 +144,9 @@ JSON
   # one-time startup migration (migrationVersion 13, fires on ANY launch — not
   # just /config) that STRIPS a bare alias model:"opus" from a FRESH config dir,
   # so a new agent would lose its pin on first boot and fall back to the default
-  # model. Valid ids (claude-opus-4-8) are left untouched. See DIVE-506.
+  # model. Valid full ids (claude-opus-5) are left untouched. See DIVE-506.
+  # DIVE-1883: which id "opus" resolves to lives in src/lib/models.sh — never
+  # re-inline a literal here.
   local settings
   settings=$(jq -n --argjson sl "$(jq -n "$status_line_obj")" --arg ghorg "$(gh_org)" --arg model "$selected_model" '{
     model: $model,

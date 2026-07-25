@@ -80,7 +80,11 @@ setup_src=$(<src/lib/agent_setup.sh)
 [[ "$create_src" == *'_apply_byo_hermes "$native" "$canonical" "$api_key" "$profile" "$model"'* ]]
 [[ "$create_src" == *'_claude_byo_model="$byo_model"'* ]]
 [[ "$create_src" == *'preseed_claude_agent "$name" "$channels" "$_claude_byo_model"'* ]]
-[[ "$setup_src" == *'selected_model="${3:-claude-opus-4-8}"'* ]]
+# DIVE-1883: the default pin is no longer a baked literal — it resolves from the
+# model catalogue (src/lib/models.sh). Assert the shape, not the id, so a model
+# release doesn't have to touch this test; models.sh owns the id and
+# tests/model_aliases_unit.sh owns asserting which id that is.
+[[ "$setup_src" == *'selected_model="${3:-$(resolve_model_alias opus)}"'* ]]
 [[ "$setup_src" == *'model: $model'* ]]
 
 echo 'PASS: explicit BYO model reaches Claude per-agent settings and Hermes config'
