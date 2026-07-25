@@ -59,6 +59,20 @@ resolve_bun() {
   return 1
 }
 
+# Newest on-disk Node 24 sibling binary (node, codex, ...). nvm creates only
+# VERSIONED dirs — `v24.18.0`, never a bare `v24` — so any literal
+# .../versions/node/v24/... path is a bug: it resolves on exactly one class of
+# box, the ones carrying a hand-made symlink (DIVE-1882). Sort with `-V`, not
+# glob order: lexicographically `v24.18.0` sorts BEFORE `v24.9.0`, so a plain
+# glob loop would pick the older runtime.
+newest_node24_bin() {
+  local name="$1" c
+  while IFS= read -r c; do
+    [[ -x "$c" ]] && { printf '%s\n' "$c"; return 0; }
+  done < <(printf '%s\n' /home/claude/.nvm/versions/node/v24.*/bin/"$name" | sort -Vr)
+  return 1
+}
+
 # OpenClaw is an npm launcher with `#!/usr/bin/env node`, but systemd does not
 # inherit claude's interactive nvm PATH. Prefer the stable link installed by
 # 5dive, then nvm's resolved Node 24, then any compatible on-disk Node 24. This
@@ -71,10 +85,26 @@ resolve_openclaw_node() {
   fi
   [[ -x /home/claude/.local/bin/node ]] \
     && { printf '%s\n' /home/claude/.local/bin/node; return 0; }
-  for c in /home/claude/.nvm/versions/node/v24.*/bin/node; do
-    [[ -x "$c" ]] && { printf '%s\n' "$c"; return 0; }
-  done
-  return 1
+  newest_node24_bin node
+}
+
+# codex is an npm global that lands in nvm's per-version bin dir. `5dive agent
+# install codex` symlinks it into ~/.local/bin (DIVE-1329) and that is what
+# TYPE_BIN[codex] points at, so prefer the stable link; then nvm's own resolver
+# if this shell has nvm; then the newest real v24.* dir for boxes provisioned
+# before the symlink dance. Do NOT reintroduce the bare `v24` alias path — it
+# does not exist on a freshly provisioned box, so agent-start exited 3 and
+# systemd restarted the unit forever (one box reached 9563 restarts in a day,
+# DIVE-1882). Installing codex did not help: the install lands in v24.18.0.
+resolve_codex() {
+  local c
+  [[ -x /home/claude/.local/bin/codex ]] \
+    && { printf '%s\n' /home/claude/.local/bin/codex; return 0; }
+  if declare -F nvm >/dev/null 2>&1; then
+    c="$(nvm which 24 2>/dev/null || true)"
+    [[ -n "$c" && -x "${c%/*}/codex" ]] && { printf '%s\n' "${c%/*}/codex"; return 0; }
+  fi
+  newest_node24_bin codex
 }
 
 
@@ -105,7 +135,10 @@ case "$TYPE" in
       none|"") ARGS=(chat) ;;
       *)       ARGS=(gateway run) ;;
     esac ;;
-  codex)    BIN="/home/claude/.nvm/versions/node/v24/bin/codex"; ARGS=() ;;
+  codex)
+    BIN="$(resolve_codex)" \
+      || { echo "codex not found (looked in /home/claude/.local/bin/codex and /home/claude/.nvm/versions/node/v24.*/bin/codex) — run: 5dive agent install codex --upgrade" >&2; exit 3; }
+    ARGS=() ;;
   opencode)
     # opencode's telegram bridge is a STANDALONE RELAY (telegram-opencode/
     # server.ts) — a THIRD run-model distinct from claude (--channels flag) and
