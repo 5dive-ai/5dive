@@ -1586,6 +1586,21 @@ _hb_gate_shipped_sweep() {
     # genuinely later merge still flags on a subsequent tick.
     _c_epoch=$(awk '{print $3}' <<<"$hit")
     _asked=$(db "SELECT COALESCE(strftime('%s', need_asked_at),'') FROM tasks WHERE id=${gid};")
+    # DIVE-2003: the fail-open path used to be SILENT. An unparseable epoch skips the
+    # comparison and flags as before — correct, because withholding a legitimate flag
+    # is a silence — but it wrote no log line and no audit row, so a guard that had
+    # STOPPED WORKING looked identical to one that had nothing to skip. olivia measured
+    # the collision: reverting only the test stub to its old no-epoch format produces
+    # 8/2, byte-identical to the signature of deleting the guard condition outright.
+    # Two different defects, one signature. So say it out loud when the comparison
+    # cannot be made.
+    if [[ ! "$_c_epoch" =~ ^[0-9]+$ ]]; then
+      _hb_log "[gate-shipped] ${gident} — commit epoch UNPARSEABLE from '${hit}'; pre-ask guard could not run, flagging anyway (fail-open)"
+      audit_log "gate shipped-flag" "ok" 0 -- "task=$gident" "warn=epoch-unparseable" "commit=$hit" || true
+    elif [[ ! "$_asked" =~ ^[0-9]+$ ]]; then
+      _hb_log "[gate-shipped] ${gident} — need_asked_at UNPARSEABLE; pre-ask guard could not run, flagging anyway (fail-open)"
+      audit_log "gate shipped-flag" "ok" 0 -- "task=$gident" "warn=asked-at-unparseable" "commit=$hit" || true
+    fi
     if [[ "$_c_epoch" =~ ^[0-9]+$ && "$_asked" =~ ^[0-9]+$ ]] && (( _c_epoch < _asked )); then
       _hb_log "[gate-shipped] ${gident} — newest matching commit PREDATES the open ask ($(date -u -d @"$_c_epoch" +%FT%TZ) < $(date -u -d @"$_asked" +%FT%TZ)); NOT flagging, gate stays eligible"
       audit_log "gate shipped-flag" "skip" 0 -- "task=$gident" "reason=commit-predates-ask" "commit=$hit" || true

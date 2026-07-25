@@ -149,5 +149,21 @@ flag=$(db "SELECT COALESCE(shipped_flag_at,'NULL') FROM tasks WHERE id=${gid};")
   && ok_t "DIVE-2001 control: commit AFTER the ask still flags and pings" \
   || bad_t "post-ask commit did not flag" "shipped_flag_at=$flag sent=[$(tr '\n' ',' <"$SEND_LOG")]"
 
+
+# --- DIVE-2003: the fail-open path must SPEAK -----------------------------------
+# Reverting only this stub to a no-epoch format produced 8/2 — byte-identical to
+# the signature of deleting the guard outright (olivia, DIVE-2001 verify). Two
+# defects, one signature, because the fail-open branch was silent. It now logs.
+reset
+gid=$(mk_gate 1 decision); MERGED="DIVE-${gid}"; MERGED_EPOCH="not-an-epoch"
+_hb_gate_shipped_sweep 2>"$TMP/hblog"
+flag=$(db "SELECT COALESCE(shipped_flag_at,'NULL') FROM tasks WHERE id=${gid};")
+[[ "$flag" != "NULL" ]] \
+  && ok_t "DIVE-2003: unparseable epoch still FLAGS (fail-open, never a silent withhold)" \
+  || bad_t "unparseable epoch withheld the flag" "shipped_flag_at=$flag"
+grep -q "epoch UNPARSEABLE" "$TMP/hblog" \
+  && ok_t "DIVE-2003: and it SAYS SO — a guard that could not run is visible in the log" \
+  || bad_t "fail-open was silent" "log=[$(tr '\n' ';' <"$TMP/hblog")]"
+
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]
