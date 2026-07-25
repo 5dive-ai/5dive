@@ -55,7 +55,13 @@ RUN_CMD='true' RUN_CMD_FIRST='' AGENT_NAME='tester' \
   FAST_SECS=999 CRASHLOOP_N=1 BACKOFF_CAP=1 CRASHLOOP_FLAG="$FLAG" \
   run_loop &
 LOOP_PID=$!
-sleep 1
+# poll for the flag rather than assuming one second is enough for the loop to
+# trip detection — on a loaded CI runner it is not, and the kill below then
+# lands BEFORE the flag/alert ever drop (flaky red, no bug). Bounded ~10s.
+for _i in $(seq 1 100); do [[ -f "$FLAG" ]] && break; sleep 0.1; done
+# never fail SILENTLY into a missing flag: say so out loud, or the assertions
+# below red as if the product misbehaved when the CHECK simply ran out of time.
+[[ -f "$FLAG" ]] || echo "crashloop: TIMED OUT after ~10s waiting for $FLAG — assertions below fail on a missing flag, not on a product bug" >&2
 kill "$LOOP_PID" 2>/dev/null || true
 wait "$LOOP_PID" 2>/dev/null || true
 

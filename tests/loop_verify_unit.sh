@@ -56,18 +56,46 @@ tid3=$(mk_target maker "UNIQ_target_three"); db "UPDATE tasks SET status='done' 
 ( cmd_loop_verify --target="$tid" --verifier=grader --max-iters=0 ) >/dev/null 2>&1; [[ $? -ne 0 ]] && ok_t "--max-iters=0 rejected" || bad_t "max-iters" "exit 0"
 ( cmd_loop_verify --target="$tid" --verifier=grader --ceiling=x ) >/dev/null 2>&1; [[ $? -ne 0 ]] && ok_t "non-int --ceiling rejected" || bad_t "ceiling" "exit 0"
 
+# Poll until a probe reports the background --wait spawn has actually landed its
+# row, instead of assuming a fixed `sleep 1` is enough. On a loaded 2-core CI
+# runner the spawn path (task insert + loop row, several sqlite/jq execs) can
+# take longer than a second: the id below then comes back EMPTY, the UPDATE that
+# is supposed to steer the waiter no-ops, and the waiter burns its full --wait
+# and reports the wrong status — a flaky red with no bug behind it (DIVE-1951).
+# Same precedent as wait_graders() in loop_panel_unit.sh. Bounded ~10s.
+poll_new() { # <prev-value> <probe...> → echo first value that is non-empty and != prev
+  local prev="$1"; shift
+  local i out=""
+  for i in $(seq 1 100); do
+    out=$("$@")
+    [[ -n "$out" && "$out" != "$prev" ]] && { printf '%s' "$out"; return 0; }
+    sleep 0.1
+  done
+  # never fail SILENTLY into an empty id: an empty return here makes the assertion
+  # below red as if the product misbehaved, when in fact the CHECK never got an
+  # answer. Say so out loud (DIVE-1951).
+  echo "poll_new: TIMED OUT after ~10s waiting for '$*' to yield a new value (prev='$prev', last='$out') — the next assertion fails on an EMPTY id, not on a product bug" >&2
+  printf '%s' "$out"; return 1
+}
+
+# the loop row for a target only exists once cmd_loop_verify is past its
+# terminal-target validation — poll for it before flipping the target, or the
+# flip can land first and the command legitimately rejects a done target.
+lv_loop_for() { db "SELECT lr.loop_id FROM loop_runs lr WHERE lr.child_task_ids='[$1]' ORDER BY lr.started_at DESC LIMIT 1;"; }
+
 # --- T5: --wait → done verdict pass (flip target done mid-wait)
 tidw=$(mk_target maker "UNIQ_target_wait")
 ( cmd_loop_verify --target="$tidw" --verifier=grader --wait=20 >"$TMP"/lv-done.out 2>&1 ) &
-bg=$!; sleep 1; db "UPDATE tasks SET status='done', result='graded PASS' WHERE id=$tidw;"; wait $bg
+bg=$!; poll_new "" lv_loop_for "$tidw" >/dev/null
+db "UPDATE tasks SET status='done', result='graded PASS' WHERE id=$tidw;"; wait $bg
 dst=$(jq -r '.data.status' "$TMP"/lv-done.out 2>/dev/null); dvd=$(jq -r '.data.verdict' "$TMP"/lv-done.out 2>/dev/null); dres=$(jq -r '.data.result' "$TMP"/lv-done.out 2>/dev/null)
 [[ "$dst" == "done" && "$dvd" == "pass" && "$dres" == "graded PASS" ]] && ok_t "--wait → done/pass with result" || bad_t "wait done" "$(cat "$TMP"/lv-done.out)"
 
 # --- T6: --wait halts on KILL
 tidk=$(mk_target maker "UNIQ_target_kill")
 ( cmd_loop_verify --target="$tidk" --verifier=grader --wait=20 >"$TMP"/lv-kill.out 2>&1 ) &
-bg=$!; sleep 1
-klid=$(db "SELECT lr.loop_id FROM loop_runs lr WHERE lr.child_task_ids='[$tidk]' ORDER BY lr.started_at DESC LIMIT 1;")
+bg=$!
+klid=$(poll_new "" lv_loop_for "$tidk")
 db "UPDATE loop_runs SET kill_requested=1 WHERE loop_id='$klid';"; wait $bg
 kst=$(jq -r '.data.status' "$TMP"/lv-kill.out 2>/dev/null)
 [[ "$kst" == "killed" ]] && ok_t "--wait halts on kill → killed" || bad_t "kill" "$(cat "$TMP"/lv-kill.out)"
@@ -75,8 +103,8 @@ kst=$(jq -r '.data.status' "$TMP"/lv-kill.out 2>/dev/null)
 # --- T7: --wait halts on CEILING
 tidc=$(mk_target maker "UNIQ_target_ceil")
 ( cmd_loop_verify --target="$tidc" --verifier=grader --ceiling=1000 --wait=20 >"$TMP"/lv-ceil.out 2>&1 ) &
-bg=$!; sleep 1
-clid=$(db "SELECT lr.loop_id FROM loop_runs lr WHERE lr.child_task_ids='[$tidc]' ORDER BY lr.started_at DESC LIMIT 1;")
+bg=$!
+clid=$(poll_new "" lv_loop_for "$tidc")
 db "UPDATE loop_runs SET tokens_spent=5000 WHERE loop_id='$clid';"; wait $bg
 cst=$(jq -r '.data.status' "$TMP"/lv-ceil.out 2>/dev/null); cvd=$(jq -r '.data.verdict' "$TMP"/lv-ceil.out 2>/dev/null)
 [[ "$cst" == "escalated" && "$cvd" == "escalated" ]] && ok_t "--wait halts on ceiling → escalated" || bad_t "ceiling halt" "$(cat "$TMP"/lv-ceil.out)"
