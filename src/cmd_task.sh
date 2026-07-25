@@ -40,8 +40,15 @@ _task_usage() {
                                                      # existing 'Branch: <name>' body line (delegated-push binding, DIVE-1462).
                                                      # DIVE-1935: a PR number the maker merely TYPES into --result/--body is a
                                                      # binding too, and merged-but-RED is refused as well as unmerged.
+                                                     # DIVE-1955: every binding carries its REPO. --pr= url is preferred (it
+                                                     # already does); for a 'Branch:' or a bare 'PR #N' add 'Repo: owner/repo'
+                                                     # to the body. A bare #N with no declared repo binds only when exactly one
+                                                     # known repo has a #N naming the ident — else it reports 'ambiguous'
+                                                     # rather than guess, because #N means a different PR in each repo.
   5dive task merge-audit [--limit=N] [--json]         # DIVE-1935: retrospective sweep — DONE tasks whose own record names a PR
                                                      # that never merged (or merged red). Read-only; reports, never reopens.
+                                                     # DIVE-1955: sweeps every repo in FIVE_GATE_REPOS (default: the CLI,
+                                                     # 5dive-api and 5dive-frontend), not just the CLI one.
   5dive task verify <id|DIVE-N> [--cmd="<command>"] [--no-done] [--timeout=<s>]
                                                      # run a check; exit 0 => proven-done (flips to done,
                                                      # captures output tail). Verb exits 0/1 = the verdict.
@@ -909,12 +916,146 @@ _gate_gh_token() {
 # asked for glued-to-alnum as a pinned negative and it caught that on the first run.
 # The named fixtures in tests/task_merge_gate_result_pr_unit.sh are the equivalence
 # proof; the canary below only proves the parser RAN.
-_gate_pr_refs_from_text() {
+#
+# DIVE-1955: refs are now emitted QUALIFIED, as `<slug>|<number>`, where <slug> is
+# the owner/repo the reference itself carries (pull URL) and EMPTY for a bare
+# "PR #N". A number alone does not identify a pull request — our product spans at
+# least three repos and their numbering collides — so the repo has to travel with
+# the ref instead of being supplied later by a constant. When the same number
+# appears both as a URL and bare in one text, the qualified form wins and the bare
+# duplicate is dropped: strictly more information about the same reference.
+_gate_pr_refs_qualified_from_text() {
   local text="$1"
   {
     printf '%s' "$text" | grep -oE  'https://github\.com/[A-Za-z0-9._-]+/[A-Za-z0-9._-]+/pull/[0-9]+[A-Za-z0-9]*'   || true
     printf '%s' "$text" | grep -oiE '(^|[^A-Za-z0-9])(PRs?|pull request)[[:space:]]*#?[[:space:]]*[0-9]+[A-Za-z0-9]*' || true
-  } | grep -oE '[0-9]+[A-Za-z0-9]*$' | awk '/^[0-9]{1,6}$/ && !seen[$0]++'
+  } | awk '
+      {
+        n = $0; sub(/^.*[^0-9]/, "", n)                       # trailing digit-run
+        if (n !~ /^[0-9]{1,6}$/) next                          # glued alnum / 7+ digits
+        if ($0 ~ /^https:\/\/github\.com\//) {
+          split($0, p, "/"); slug = p[4] "/" p[5]
+        } else slug = ""
+        if (slug != "") { if (qseen[slug "|" n]++) next; qual[n] = 1 }
+        else            { if (bseen[n]++) next }
+        order[++c] = slug "|" n
+      }
+      END { for (i = 1; i <= c; i++) { split(order[i], f, "|");
+              if (f[1] == "" && qual[f[2]]) continue          # URL form already emitted
+              print order[i] } }'
+}
+
+# Back-compat shape: the bare NUMBERS only, first-seen order. Kept because the
+# engine canary and the DIVE-1935 equivalence fixtures are written against it, and
+# because the audit's grouping only ever needed the number.
+_gate_pr_refs_from_text() {
+  _gate_pr_refs_qualified_from_text "$1" | awk -F'|' '!seen[$2]++ { print $2 }'
+}
+
+# DIVE-1955: the repos the merge-gate knows about, one slug per line, CLI first.
+# `_PUSH_DEFAULT_REPO` used to be the whole world: every bare `#N` resolved against
+# 5dive-ai/5dive, so lodar/5dive-api (== prod) and lodar/5dive-frontend had ZERO
+# coverage AND — worse — an api task naming "PR #6" got a CONFIDENT verdict about an
+# unrelated CLI pull request. Overridable so a new repo is config, not a patch, and
+# so the tests can point the whole gate at fixtures.
+_gate_repo_slugs() {
+  local raw="${FIVE_GATE_REPOS:-}"
+  if [[ -z "$raw" ]]; then
+    raw="$(_push_repo_slug "$_PUSH_DEFAULT_REPO") lodar/5dive-api lodar/5dive-frontend"
+  fi
+  printf '%s' "$raw" | tr ',' ' ' | tr -s '[:space:]' '\n' | awk 'NF && !seen[$0]++'
+}
+
+# _gate_slug_from_url <text> — OWNER/REPO out of the first github URL in <text>, or
+# empty. Accepts a pull URL, a repo URL and an ssh remote.
+_gate_slug_from_url() {
+  printf '%s' "$1" \
+    | grep -oE '(https://github\.com/|git@github\.com:)[A-Za-z0-9._-]+/[A-Za-z0-9._-]+' \
+    | head -1 | sed -E 's#^(https://github\.com/|git@github\.com:)##; s#\.git$##' || true
+}
+
+# _gate_task_repo_slug <delivery_ref> <body> — the repo THIS TASK declared, or empty.
+# Precedence: the delivery_ref URL (a delivered PR carries its own repo, which is why
+# ask 1 says prefer it) > an explicit `Repo: owner/repo` body line, the sibling of the
+# DIVE-1462 `Branch:` line > any github URL sitting in the body. Empty means unknown,
+# and unknown must stay unknown — it is never quietly filled in with a default.
+_gate_task_repo_slug() {
+  local dref="$1" body="$2" s=""
+  if [[ -n "$dref" ]]; then
+    s=$(_gate_slug_from_url "$dref"); [[ -n "$s" ]] && { printf '%s' "$s"; return 0; }
+  fi
+  local line
+  line=$(printf '%s\n' "$body" | grep -ioE '^[[:space:]]*repo:[[:space:]]*\S+' | head -1 || true)
+  if [[ -n "$line" ]]; then
+    line="${line#*:}"; line="${line#"${line%%[![:space:]]*}"}"
+    s=$(_gate_slug_from_url "$line")
+    [[ -z "$s" && "$line" =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$ ]] && s="${line%.git}"
+    [[ -n "$s" ]] && { printf '%s' "$s"; return 0; }
+  fi
+  _gate_slug_from_url "$body"
+}
+
+# _gate_pr_probe <n> <tok> <slug> <ident> — one bounded read-only lookup of PR #n in
+# <slug>, as `STATE|mergedAt|CHECKS|IDENTMATCH`, empty when the PR does not exist
+# there. IDENTMATCH is 1 when the PR's title or head branch names <ident> at word
+# boundaries — the EVIDENCE that this number, in this repo, belongs to this task.
+# That evidence is what lets a bare "#N" bind at all without guessing a repo.
+_gate_pr_probe() {
+  local n="$1" tok="$2" slug="$3" ident="$4"
+  GH_TOKEN="$tok" timeout 10s gh pr view "$n" --repo "$slug" \
+      --json state,mergedAt,statusCheckRollup,title,headRefName \
+      -q "[ .state,
+            (.mergedAt // \"null\"),
+            ( [ (.statusCheckRollup // [])[]? | (.conclusion // .state // \"\") ]
+              | if   any(. == \"FAILURE\" or . == \"TIMED_OUT\" or . == \"CANCELLED\" or . == \"ACTION_REQUIRED\" or . == \"ERROR\")
+                then \"FAILURE\" elif length == 0 then \"NONE\" else \"OK\" end ),
+            ( if ((.title // \"\") | test(\"(^|[^A-Za-z0-9])${ident}([^A-Za-z0-9]|\$)\";\"i\"))
+                 or ((.headRefName // \"\") | test(\"(^|[^A-Za-z0-9])${ident}([^A-Za-z0-9]|\$)\";\"i\"))
+              then \"1\" else \"0\" end ) ] | join(\"|\")" \
+      2>/dev/null || true
+}
+
+# _gate_resolve_qualified <slug|number> <tok> <ident> <task_slug> — resolve ONE
+# qualified ref to `<slug>|STATE|mergedAt|CHECKS`, or `AMBIGUOUS|<slug,slug,…>`, or
+# EMPTY for "exists nowhere we know / could not resolve".
+#
+# THIS IS THE ANTI-FABRICATION RULE (DIVE-1955 ask 2). Three cases:
+#   * the ref carries its own repo (pull URL)  -> resolve there, done.
+#   * the ref is bare and the TASK declared a repo -> resolve there, done.
+#   * the ref is bare and the task's repo is UNKNOWN -> do NOT pick a default. Probe
+#     every known repo and count the ones that actually HAVE a #N:
+#       0 -> unresolvable (empty), same loud note as before.
+#       1 -> that repo. There is nothing to disambiguate: the number identifies
+#            exactly one pull request in the world we know about. This is the common
+#            case and it is why the DIVE-1935 coverage does not regress.
+#       2+ -> a REAL collision. Break it only on evidence: if exactly one of them
+#            NAMES the ident in its title or head branch, that one binds. Otherwise
+#            AMBIGUOUS — any single verdict would be invented.
+# Ambiguous is a LOUD non-answer, never a block and never a pass — a fabricated
+# verdict can refuse a legitimate close or bless a bad one, which is strictly worse
+# than admitting we do not know which pull request the maker meant.
+_gate_resolve_qualified() {
+  local qref="$1" tok="$2" ident="$3" task_slug="$4"
+  local rslug="${qref%%|*}" n="${qref#*|}"
+  [[ -z "$rslug" && -n "$task_slug" ]] && rslug="$task_slug"
+  if [[ -n "$rslug" ]]; then
+    local st; st=$(_gate_pr_state "$n" "$tok" "$rslug")
+    [[ -n "$st" ]] && printf '%s|%s' "$rslug" "$st"
+    return 0
+  fi
+  local s p exists="" exists_n=0 only="" only_st="" named="" named_st="" named_n=0
+  while IFS= read -r s; do
+    [[ -n "$s" ]] || continue
+    p=$(_gate_pr_probe "$n" "$tok" "$s" "$ident")
+    [[ -n "$p" ]] || continue
+    exists="${exists:+$exists,}$s"; exists_n=$((exists_n+1)); only="$s"; only_st="${p%|*}"
+    if [[ "${p##*|}" == "1" ]]; then named_n=$((named_n+1)); named="$s"; named_st="${p%|*}"; fi
+  done < <(_gate_repo_slugs)
+  [[ $exists_n -eq 0 ]] && return 0
+  [[ $exists_n -eq 1 ]] && { printf '%s|%s' "$only" "$only_st"; return 0; }
+  [[ $named_n -eq 1 ]] && { printf '%s|%s' "$named" "$named_st"; return 0; }
+  printf 'AMBIGUOUS|%s' "$exists"
+  return 0
 }
 
 # _gate_pr_refs_engine_ok — positive control for the extractor above. "No refs
@@ -1033,10 +1174,15 @@ _task_status_cmd() {
   #      binding (DIVE-1462; resolved the same way cmd_push does). delivery_ref
   #      wins when both are present.
   if [[ "$verb" == "done" ]]; then
-    local _dref _branch=""
+    local _dref _branch="" _body _task_slug
     _dref=$(db "SELECT COALESCE(delivery_ref,'') FROM tasks WHERE id=${id};")
+    _body=$(db "SELECT COALESCE(body,'') FROM tasks WHERE id=${id};")
+    # DIVE-1955: the task's OWN repo, resolved once, from the bindings it actually
+    # carries (delivery_ref url > `Repo:` body line > a github url in the body).
+    # Empty = unknown, and unknown is a real answer here: it is what stops a bare
+    # `#N` from being resolved against a default slug further down.
+    _task_slug=$(_gate_task_repo_slug "$_dref" "$_body")
     if [[ -z "$_dref" ]]; then
-      local _body; _body=$(db "SELECT COALESCE(body,'') FROM tasks WHERE id=${id};")
       _branch=$(_push_branch_from_body "$_body")
     fi
     if [[ -n "$_dref" || -n "$_branch" ]]; then
@@ -1051,6 +1197,21 @@ _task_status_cmd() {
       # which errors outside a repo checkout).
       local _ghtok; _ghtok=$(_gate_gh_token)
       if [[ -n "$_dref" ]]; then
+        # DIVE-1955: a delivery_ref that is a full pull URL carries its own repo and
+        # `gh pr view <url>` needs no --repo. A BARE delivery_ref (`#6`, `6`) does
+        # not identify a pull request at all, and this is the fail-CLOSED declared
+        # path — so rather than resolve it against the CLI constant and hand back a
+        # confident verdict about some other repo's #6, refuse and ask for the URL.
+        # No live task carries a bare delivery_ref (all 7 are URLs, checked
+        # 2026-07-25); this exists so the shape can never be introduced silently.
+        if ! [[ "$_dref" =~ ^https?:// ]]; then
+          local _qd; _qd=$(_gate_resolve_qualified "|${_dref#\#}" "$_ghtok" "$ident" "$_task_slug")
+          if [[ -z "$_qd" || "$_qd" == AMBIGUOUS\|* ]]; then
+            policy_refuse "$E_CONFLICT" done-with-ambiguous-delivery-ref DIVE-1955 "$ident" "$ident cannot close: its delivery_ref \"$_dref\" is a bare PR number with no repo, and this product spans ${_qd#AMBIGUOUS|}${_qd:+ — }multiple repos whose numbering collides. A number alone does not identify a pull request. Re-bind it with the full URL (\`task deliver $ident --pr=https://github.com/<owner>/<repo>/pull/N\`), or add a \`Repo: <owner>/<repo>\` line to the body, then \`task done\`."
+          fi
+          _dref="https://github.com/${_qd%%|*}/pull/${_dref#\#}"
+          warn "$ident: bare delivery_ref resolved to $_dref by ident evidence (DIVE-1955) — bind the full URL next time."
+        fi
         local _state _merged
         _state=$(GH_TOKEN="$_ghtok" gh pr view "$_dref" --json state,mergedAt -q '.state' 2>/dev/null || echo "")
         _merged=$(GH_TOKEN="$_ghtok" gh pr view "$_dref" --json state,mergedAt -q '.mergedAt' 2>/dev/null || echo "")
@@ -1072,7 +1233,9 @@ _task_status_cmd() {
         # loud note, not a block, so a slow or check-less repo never stalls.
         # `--force-merge-gate` is the audited escape (a flaky post-merge run must
         # not make a landed task permanently unclosable).
-        local _rollup; _rollup=$(_gate_pr_state "$_dref" "$_ghtok" "$(_push_repo_slug "$_PUSH_DEFAULT_REPO")")
+        # DIVE-1955: the ref is a URL by here, so it carries its own repo — pass that
+        # slug, not the CLI constant, so nothing on this path depends on the default.
+        local _rollup; _rollup=$(_gate_pr_state "$_dref" "$_ghtok" "$(_gate_slug_from_url "$_dref")")
         case "${_rollup##*|}" in
           FAILURE)
             if [[ $force_merge_gate -eq 1 ]]; then
@@ -1085,11 +1248,20 @@ _task_status_cmd() {
           '') warn "$ident: could not verify the check status of $_dref (no gh token / network / gh) — merged-state confirmed, checks UNVERIFIED." ;;
         esac
       else
-        local _slug _bmerged
-        _slug=$(_push_repo_slug "$_PUSH_DEFAULT_REPO")
-        _bmerged=$(GH_TOKEN="$_ghtok" gh pr list --repo "$_slug" --head "$_branch" --state merged --json number,mergedAt -q '.[0].mergedAt' 2>/dev/null || echo "")
-        if [[ -z "$_bmerged" || "$_bmerged" == "null" ]]; then
-          policy_refuse "$E_CONFLICT" done-before-branch-merged DIVE-1830 "$ident" "$ident cannot close: no MERGED PR found for its branch '$_branch' in $_slug. done=merged-to-main (DIVE-1830) — open and merge a PR for that branch, then run task done. Use \`task cancel\` to abandon."
+        # DIVE-1955: a `Branch:` line names no repo, so this used to look for the
+        # merged PR in the CLI repo ONLY — an api/frontend branch could never satisfy
+        # its own fail-CLOSED gate. Search the task's declared repo when it has one,
+        # else every known repo, and pass if the branch landed in ANY of them.
+        local _slug _bmerged="" _searched=""
+        while IFS= read -r _slug; do
+          [[ -n "$_slug" ]] || continue
+          _searched="${_searched:+$_searched, }$_slug"
+          _bmerged=$(GH_TOKEN="$_ghtok" gh pr list --repo "$_slug" --head "$_branch" --state merged --json number,mergedAt -q '.[0].mergedAt' 2>/dev/null || echo "")
+          [[ -n "$_bmerged" && "$_bmerged" != "null" ]] && break
+          _bmerged=""
+        done < <(if [[ -n "$_task_slug" ]]; then printf '%s\n' "$_task_slug"; else _gate_repo_slugs; fi)
+        if [[ -z "$_bmerged" ]]; then
+          policy_refuse "$E_CONFLICT" done-before-branch-merged DIVE-1830 "$ident" "$ident cannot close: no MERGED PR found for its branch '$_branch' in $_searched. done=merged-to-main (DIVE-1830) — open and merge a PR for that branch, then run task done. If the branch lives in a repo not listed there, add a \`Repo: <owner>/<repo>\` line to the body. Use \`task cancel\` to abandon."
         fi
       fi
     fi
@@ -1112,27 +1284,40 @@ _task_status_cmd() {
   # with no escape is a footgun) — logged, and its leftover PR is digest-flagged.
   if [[ "$verb" == "done" && -z "$_dref" && -z "$_branch" ]]; then
     local _auto_hit="" _scan_ran=0
-    local _ghtok2="" _slug2=""
-    if command -v gh >/dev/null 2>&1; then
-      _ghtok2=$(_gate_gh_token)
-      _slug2=$(_push_repo_slug "$_PUSH_DEFAULT_REPO")
-    fi
+    # DIVE-1955: declared out here, not inside the token branch — they are read by
+    # the refusal messages below, and `set -u` turns an unset one into a crash on
+    # the very path (no gh token) this gate is supposed to survive.
+    local _ghtok2="" _slug2="" _sc_hit_slug="" _sc_total=0 _sc_ok=0
+    command -v gh >/dev/null 2>&1 && _ghtok2=$(_gate_gh_token)
     # DIVE-1935: NO TOKEN means the answer is unverified whatever gh prints — do
     # not run the query and then read its empty result as "repo is clean". That
     # inference is precisely how this gate reported a clean close for every unauthed
     # agent on the box. An empty token short-circuits to the unverified branch below.
     if [[ -n "$_ghtok2" ]]; then
-      # One bounded, read-only listing; filter title/headRefName client-side so a
-      # body-only mention can't match. `timeout 5s` + `|| echo ""` => any slow/
-      # failed/absent gh yields no hit and the close proceeds (fail-open).
+      # One bounded, read-only listing PER KNOWN REPO; filter title/headRefName
+      # client-side so a body-only mention can't match. `timeout 5s` + `|| echo ""`
+      # => any slow/failed/absent gh yields no hit and the close proceeds (fail-open).
       # The ident is matched at WORD BOUNDARIES (non-alnum on both sides), not as
       # a bare substring — else DIVE-202 would be false-blocked by an open PR
       # naming DIVE-2021/DIVE-2029. Case-insensitive so a lowercase branch
       # (`dive-202-fix`) matches the uppercase ident too.
-      _auto_hit=$(GH_TOKEN="$_ghtok2" timeout 5s gh pr list --repo "$_slug2" \
+      # DIVE-1955: this scan was single-repo, so an open api/frontend PR naming the
+      # ident never blocked anything — the mandatory gate simply did not exist for
+      # two of three repos. First hit wins and the refusal names WHICH repo. A repo
+      # whose listing fails does not count as scanned: partial coverage reported as
+      # full is the same succeeding-in-appearance shape DIVE-1935 was about.
+      while IFS= read -r _slug2; do
+        [[ -n "$_slug2" ]] || continue
+        _sc_total=$((_sc_total+1))
+        local _hit
+        _hit=$(GH_TOKEN="$_ghtok2" timeout 5s gh pr list --repo "$_slug2" \
                     --state open --limit 200 --json number,headRefName,title \
                     -q "[.[] | select((.title // \"\" | test(\"(^|[^A-Za-z0-9])${ident}([^A-Za-z0-9]|\$)\";\"i\")) or (.headRefName // \"\" | test(\"(^|[^A-Za-z0-9])${ident}([^A-Za-z0-9]|\$)\";\"i\"))) | .number] | .[0] // empty" \
-                    2>/dev/null) && _scan_ran=1 || _auto_hit=""
+                    2>/dev/null) && _sc_ok=$((_sc_ok+1)) || _hit=""
+        if [[ -n "$_hit" ]]; then _auto_hit="$_hit"; _sc_hit_slug="$_slug2"; break; fi
+      done < <(if [[ -n "$_task_slug" ]]; then printf '%s\n' "$_task_slug"; else _gate_repo_slugs; fi)
+      [[ $_sc_ok -eq $_sc_total && $_sc_total -gt 0 ]] && _scan_ran=1
+      [[ -n "$_auto_hit" ]] && _scan_ran=1
     fi
     # DIVE-1935: SAY SO when the scan could not run. A fail-open gate that returns
     # "no hit" for a gh outage and "no hit" for a clean repo is indistinguishable
@@ -1143,6 +1328,9 @@ _task_status_cmd() {
       local _scan_why="query-failed"
       command -v gh >/dev/null 2>&1 || _scan_why="gh-absent"
       [[ -n "$_ghtok2" ]] || _scan_why="no-gh-token"
+      # DIVE-1955: "3 repos, 2 listed" is partial coverage, and partial coverage
+      # announced as a clean scan is the defect this ticket is about, one level up.
+      [[ -n "$_ghtok2" && $_sc_total -gt 0 && $_sc_ok -lt $_sc_total ]] && _scan_why="partial-repo-scan-${_sc_ok}-of-${_sc_total}"
       warn "$ident: merge-gate could not query GitHub ($_scan_why) — this close is UNVERIFIED, not verified-clean (DIVE-1935)."
       audit_log "task.merge-gate-unverified" ok 0 -- "$ident" "reason=$_scan_why"
     fi
@@ -1154,7 +1342,7 @@ _task_status_cmd() {
     # safe: OPEN only (a "superseded by #150" mention of an abandoned PR must never
     # make a task unclosable, per DIVE-1835), and an unresolvable ref is a loud note
     # rather than a block, so a non-PR "#12" and an offline box both stay closable.
-    local _txt_open="" _txt_red="" _txt_unres=""
+    local _txt_open="" _txt_open_slug="" _txt_red="" _txt_unres="" _txt_amb=""
     # An empty ref list is only trustworthy if the parser can actually run. Without
     # this, a grep that cannot execute makes the text-binding gate a no-op that
     # looks exactly like a clean close (the ticket's own defect, one layer down).
@@ -1162,29 +1350,42 @@ _task_status_cmd() {
       warn "$ident: PR-reference parsing is BROKEN on this host (grep -oE unusable) — the result/body merge-gate did NOT run; this close is UNVERIFIED (DIVE-1935)."
       audit_log "task.merge-gate-unverified" ok 0 -- "$ident" "reason=ref-parser-broken"
     elif [[ -z "$_auto_hit" && $force_merge_gate -eq 0 && -n "$_ghtok2" ]]; then
-      local _txt _ref _n=0 _st
+      local _txt _qref _n=0 _st _rslug
       _txt="$result
-$(db "SELECT COALESCE(body,'') FROM tasks WHERE id=${id};")"
-      while IFS= read -r _ref; do
-        [[ -n "$_ref" ]] || continue
+$_body"
+      # DIVE-1955: refs are resolved QUALIFIED. A pull URL is checked in its own
+      # repo; a bare `#N` is checked in the task's declared repo, or — when that is
+      # unknown — bound only by ident evidence across the known repos and otherwise
+      # reported AMBIGUOUS. It is never resolved against a default slug: that path
+      # produced confident verdicts about the wrong pull request (an api "#6" judged
+      # against the CLI repo's unrelated #6), which can refuse a legitimate close or
+      # bless a bad one. Ambiguous blocks nothing and blesses nothing.
+      while IFS= read -r _qref; do
+        [[ -n "$_qref" ]] || continue
         # Bounded: 5 refs max per close, and the drop is announced — a silent cap
         # would read as "all references checked" when it wasn't.
         if (( _n >= 5 )); then warn "$ident: merge-gate checked the first 5 PR references named in the result/body; later ones were NOT checked."; break; fi
         _n=$((_n+1))
-        _st=$(_gate_pr_state "$_ref" "$_ghtok2" "$_slug2")
-        case "$_st" in
-          OPEN\|*)               _txt_open="$_ref";  break ;;
-          MERGED\|*\|FAILURE)    _txt_red="${_txt_red:+$_txt_red,}$_ref" ;;
-          '')                    _txt_unres="${_txt_unres:+$_txt_unres,}$_ref" ;;
+        _st=$(_gate_resolve_qualified "$_qref" "$_ghtok2" "$ident" "$_task_slug")
+        _rslug="${_st%%|*}"; _st="${_st#*|}"
+        case "$_rslug|$_st" in
+          AMBIGUOUS\|*)          _txt_amb="${_txt_amb:+$_txt_amb; }#${_qref#*|} in ${_st//,/, }" ;;
+          *\|OPEN\|*)            _txt_open="${_qref#*|}"; _txt_open_slug="$_rslug"; break ;;
+          *\|MERGED\|*\|FAILURE) _txt_red="${_txt_red:+$_txt_red,}${_rslug}#${_qref#*|}" ;;
+          \|)                    _txt_unres="${_txt_unres:+$_txt_unres,}${_qref#*|}" ;;
         esac
-      done < <(_gate_pr_refs_from_text "$_txt")
-      [[ -n "$_txt_unres" ]] && warn "$ident: could not resolve PR reference(s) #${_txt_unres//,/, #} named in the result/body against $_slug2 — merge state UNVERIFIED for those (a bare \"PR #N\" for ANOTHER repo cannot be resolved here; cite the full pull URL to have it checked)."
+      done < <(_gate_pr_refs_qualified_from_text "$_txt")
+      [[ -n "$_txt_unres" ]] && warn "$ident: could not resolve PR reference(s) #${_txt_unres//,/, #} named in the result/body in any known repo ($(_gate_repo_slugs | paste -sd, -)) — merge state UNVERIFIED for those. Cite the full pull URL, or add a \`Repo: <owner>/<repo>\` line, to have them checked."
+      if [[ -n "$_txt_amb" ]]; then
+        warn "$ident: AMBIGUOUS PR reference(s) — $_txt_amb. A bare number does not identify a pull request across our repos and this task declares none, so the merge state is UNVERIFIED rather than guessed (DIVE-1955). Cite the full pull URL or add a \`Repo: <owner>/<repo>\` line to the body."
+        audit_log "task.merge-gate-ambiguous" ok 0 -- "$ident" "refs=$_txt_amb"
+      fi
     fi
     if [[ -n "$_txt_open" && $force_merge_gate -eq 0 ]]; then
-      policy_refuse "$E_CONFLICT" done-with-open-pr-in-result DIVE-1935 "$ident" "$ident cannot close: its result/body names PR #$_txt_open, which is OPEN in $_slug2 and not merged to main. done=merged-to-main (DIVE-1935) — merge it then \`task done\`, bind it with \`task deliver --pr=\` if it is the delivery, \`task cancel\` to abandon, or \`task done $ident --force-merge-gate\` to override (audited)."
+      policy_refuse "$E_CONFLICT" done-with-open-pr-in-result DIVE-1935 "$ident" "$ident cannot close: its result/body names PR #$_txt_open, which is OPEN in $_txt_open_slug and not merged to main. done=merged-to-main (DIVE-1935) — merge it then \`task done\`, bind it with \`task deliver --pr=\` if it is the delivery, \`task cancel\` to abandon, or \`task done $ident --force-merge-gate\` to override (audited)."
     fi
     if [[ -n "$_txt_red" && $force_merge_gate -eq 0 ]]; then
-      policy_refuse "$E_CONFLICT" done-after-named-red-merge DIVE-1935 "$ident" "$ident cannot close: PR #${_txt_red//,/, #} named in its result/body is merged but its checks are RED. done=merged-AND-green (DIVE-1935) — fix main (or re-run the failed check), then task done, or \`task done $ident --force-merge-gate\` to override (audited)."
+      policy_refuse "$E_CONFLICT" done-after-named-red-merge DIVE-1935 "$ident" "$ident cannot close: PR ${_txt_red//,/, } named in its result/body is merged but its checks are RED. done=merged-AND-green (DIVE-1935) — fix main (or re-run the failed check), then task done, or \`task done $ident --force-merge-gate\` to override (audited)."
     fi
     if [[ $force_merge_gate -eq 1 ]]; then
       # Never a silent bypass: record the forced close (with the overridden PR #
@@ -1192,7 +1393,7 @@ $(db "SELECT COALESCE(body,'') FROM tasks WHERE id=${id};")"
       # behind is independently flagged by the weekly hygiene digest (#139).
       audit_log "task.force-merge-gate" ok 0 -- "$ident" "override_pr=${_auto_hit:-none}"
     elif [[ -n "$_auto_hit" ]]; then
-      policy_refuse "$E_CONFLICT" done-before-named-pr-merged DIVE-1835 "$ident" "$ident cannot close: open PR #$_auto_hit names it in its title/branch but is not merged to main. done=merged-to-main (DIVE-1835 mandatory gate) — merge it then \`task done\`, \`task cancel\` to abandon, or \`task done $ident --force-merge-gate\` to override (audited + surfaced in the weekly hygiene digest)."
+      policy_refuse "$E_CONFLICT" done-before-named-pr-merged DIVE-1835 "$ident" "$ident cannot close: open PR ${_sc_hit_slug}#$_auto_hit names it in its title/branch but is not merged to main. done=merged-to-main (DIVE-1835 mandatory gate) — merge it then \`task done\`, \`task cancel\` to abandon, or \`task done $ident --force-merge-gate\` to override (audited + surfaced in the weekly hygiene digest)."
     fi
   fi
   local set_result=""
@@ -1389,35 +1590,51 @@ cmd_task_merge_audit() {
     shift
   done
   command -v gh >/dev/null 2>&1 || fail "$E_GENERIC" "task merge-audit needs \`gh\` to resolve PR state — install gh."
-  local tok slug; tok=$(_gate_gh_token); slug=$(_push_repo_slug "$_PUSH_DEFAULT_REPO")
+  local tok slugs; tok=$(_gate_gh_token); slugs=$(_gate_repo_slugs | paste -sd, -)
   [[ -n "$tok" ]] || fail "$E_GENERIC" "task merge-audit could not resolve a gh token — every PR would report 'unverified', which is not an audit. Authenticate gh (or export GH_TOKEN) and re-run."
   _gate_pr_refs_engine_ok || fail "$E_GENERIC" "task merge-audit cannot parse PR references on this host (grep -oE unusable) — it would report a clean sweep by finding nothing at all. Fix grep and re-run."
-  local rows findings=0 unver=0 json_rows=""
-  rows=$(db "SELECT ident || '|' || REPLACE(REPLACE(COALESCE(delivery_ref,'') || ' ' || COALESCE(result,'') || ' ' || COALESCE(body,''), char(10), ' '), '|', ' ')
+  local rows findings=0 unver=0 amb=0 json_rows=""
+  rows=$(db "SELECT ident || '|' || COALESCE(delivery_ref,'') || '|' || REPLACE(REPLACE(COALESCE(delivery_ref,'') || ' ' || COALESCE(result,'') || ' ' || COALESCE(body,''), char(10), ' '), '|', ' ')
                FROM tasks WHERE status='done' ORDER BY COALESCE(done_at, created_at) DESC LIMIT ${limit};")
-  local line tident ttext ref st state
+  local line tident tdref ttext qref st state rslug tslug
   while IFS= read -r line; do
     [[ -n "$line" ]] || continue
-    tident="${line%%|*}"; ttext="${line#*|}"
-    while IFS= read -r ref; do
-      [[ -n "$ref" ]] || continue
-      st=$(_gate_pr_state "$ref" "$tok" "$slug"); state="${st%%|*}"
-      case "$state" in
-        MERGED) [[ "${st##*|}" == "FAILURE" ]] || continue
-                state="MERGED-RED" ;;
-        '')     state="unverified"; unver=$((unver+1)) ;;
-      esac
+    tident="${line%%|*}"; line="${line#*|}"
+    tdref="${line%%|*}"; ttext="${line#*|}"
+    # DIVE-1955: same repo resolution the gate uses, so the sweep and the gate can
+    # never disagree about which pull request a task means. The audit's OWN previous
+    # answer ("0 OPEN, 0 merged-red") was true only for the CLI repo, and reported
+    # DIVE-1874/1875 as CLOSED on a `#25` that is a 5dive-api number colliding with
+    # an old CLI one — a resolved-looking verdict about the wrong PR, which the
+    # footnote excused only for `unverified`.
+    tslug=$(_gate_task_repo_slug "$tdref" "$ttext")
+    while IFS= read -r qref; do
+      [[ -n "$qref" ]] || continue
+      st=$(_gate_resolve_qualified "$qref" "$tok" "$tident" "$tslug")
+      rslug="${st%%|*}"; st="${st#*|}"; state="${st%%|*}"
+      if [[ "$rslug" == "AMBIGUOUS" ]]; then
+        state="ambiguous"; rslug="${st//,/, }"; amb=$((amb+1))
+      elif [[ -z "$rslug" ]]; then
+        state="unverified"; rslug="-"; unver=$((unver+1))
+      else
+        case "$state" in
+          MERGED) [[ "${st##*|}" == "FAILURE" ]] || continue
+                  state="MERGED-RED" ;;
+        esac
+      fi
       findings=$((findings+1))
-      json_rows+=$(jq -nc --arg t "$tident" --arg p "$ref" --arg s "$state" '{ident:$t,pr:("#"+$p),state:$s}')$'\n'
-      [[ "${JSON_MODE:-0}" == "1" ]] || printf '%-12s PR #%-6s %s\n' "$tident" "$ref" "$state"
-    done < <(_gate_pr_refs_from_text "$ttext")
+      json_rows+=$(jq -nc --arg t "$tident" --arg p "${qref#*|}" --arg r "$rslug" --arg s "$state" \
+                     '{ident:$t,pr:("#"+$p),repo:$r,state:$s}')$'\n'
+      [[ "${JSON_MODE:-0}" == "1" ]] || printf '%-12s %-22s PR #%-6s %s\n' "$tident" "$rslug" "${qref#*|}" "$state"
+    done < <(_gate_pr_refs_qualified_from_text "$ttext")
   done <<<"$rows"
   local payload; payload=$(printf '%s' "$json_rows" | jq -sc '.')
-  [[ "${JSON_MODE:-0}" == "1" ]] || [[ $unver -eq 0 ]] || \
-    printf 'note: `unverified` = the number could not be resolved as a PR in %s. A bare "PR #N"\n      naming ANOTHER repo (api/app numbers collide with old CLI ones) lands here; it is NOT\n      evidence of an unmerged PR, and it is NOT evidence of a clean one either.\n' "$slug"
-  ok "merge-audit: scanned the newest $limit done task(s) in $slug — $findings PR reference(s) not merged-and-green ($unver unverified)" \
-     '{scanned:($n|tonumber), findings:($f|tonumber), unverified:($u|tonumber), rows:($r|fromjson)}' \
-     --arg n "$limit" --arg f "$findings" --arg u "$unver" --arg r "$payload"
+  if [[ "${JSON_MODE:-0}" != "1" ]] && (( unver + amb > 0 )); then
+    printf 'note: `unverified` = the number resolves to no PR in any known repo (%s).\n      `ambiguous` = a bare "PR #N" that exists in more than one of them and the task\n      declares no repo, so no single verdict is defensible. NEITHER is evidence of an\n      unmerged PR, and neither is evidence of a clean one. Cite the full pull URL, or\n      add a `Repo: <owner>/<repo>` line to the task body, to have them resolved.\n' "$slugs"
+  fi
+  ok "merge-audit: scanned the newest $limit done task(s) across $slugs — $findings PR reference(s) not merged-and-green ($unver unverified, $amb ambiguous)" \
+     '{scanned:($n|tonumber), repos:($rp|split(",")), findings:($f|tonumber), unverified:($u|tonumber), ambiguous:($a|tonumber), rows:($r|fromjson)}' \
+     --arg n "$limit" --arg rp "$slugs" --arg f "$findings" --arg u "$unver" --arg a "$amb" --arg r "$payload"
 }
 
 # DIVE-477: hand a maker-completed task to its verifier instead of closing it.

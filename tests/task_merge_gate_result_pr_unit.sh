@@ -35,8 +35,20 @@ a=("$@"); i=0
 while [[ $i -lt ${#a[@]} ]]; do case "${a[$i]}" in -q) expr="${a[$((i+1))]}"; i=$((i+2));; -q*) expr="${a[$i]#-q}"; i=$((i+1));; *) i=$((i+1));; esac; done
 if [[ "$1" == "pr" && "$2" == "view" ]]; then
   ref="${ref##*/}"                       # tolerate a full pull URL
-  fx="GH_STUB_PR_${ref}"; json="${!fx:-}"
-  [[ -n "$json" ]] || exit 1             # no fixture => unresolvable
+  # DIVE-1955: the stub is REPO-AWARE. A PR number exists in a specific repo, not
+  # in the abstract — an unaware stub answers every `--repo` identically, which
+  # makes every bare number look like a three-way collision and is exactly the
+  # confusion the gate now refuses to paper over. `GH_STUB_PR_<n>` means "in the
+  # CLI repo (and via a bare URL)"; `GH_STUB_PR_<REPO>_<n>` targets one repo.
+  repo=""; j=0
+  while [[ $j -lt ${#a[@]} ]]; do [[ "${a[$j]}" == "--repo" ]] && { repo="${a[$((j+1))]}"; break; }; j=$((j+1)); done
+  key="${repo##*/}"; key="${key//[^A-Za-z0-9]/_}"
+  json=""
+  if [[ -n "$key" ]]; then fx="GH_STUB_PR_${key}_${ref}"; json="${!fx:-}"; fi
+  if [[ -z "$json" && ( -z "$repo" || "$repo" == "5dive-ai/5dive" ) ]]; then
+    fx="GH_STUB_PR_${ref}"; json="${!fx:-}"
+  fi
+  [[ -n "$json" ]] || exit 1             # no fixture in THIS repo => unresolvable
   printf '%s' "$json" | jq -r "$expr" 2>/dev/null; exit 0
 fi
 if [[ "$1" == "pr" && "$2" == "list" ]]; then
