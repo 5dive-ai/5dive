@@ -176,6 +176,33 @@ if [[ $RC -eq 0 && "$(statusof AMB-1)" == "done" && "$OUT" == *AMBIGUOUS* \
 else
   bad_t 'ambiguous handling' "rc=$RC status=$(statusof AMB-1) audit=$amb_row refusals=$(refusals AMB-1) out=$OUT"
 fi
+# ...and the DURABLE half (review, Marcus): stderr scrolls away and the audit log is a
+# different artifact than the one anyone reads. The TASK ROW is the record, and a row
+# reading `done` with no finding IS the clean verdict the gate declined to make.
+res=$(db "SELECT COALESCE(result,'') FROM tasks WHERE ident='AMB-1';")
+if [[ "$res" == *"merge-gate: UNVERIFIED"* && "$res" == *"AMBIGUOUS"* \
+      && "$res" == *"merged as PR #6"* ]]; then
+  ok_t 'ambiguous stamps the RESULT as UNVERIFIED, appended to (never replacing) the maker text'
+else
+  bad_t 'ambiguous must be durable in the record' "result=[$res]"
+fi
+# The stamp must also appear when the maker passed NO --result at all: that row is the
+# emptiest-looking one there is, so it is the one most in need of the disclaimer.
+seed AMB-2 'delivery is PR #6'
+run_done AMB-2
+res2=$(db "SELECT COALESCE(result,'') FROM tasks WHERE ident='AMB-2';")
+[[ $RC -eq 0 && "$res2" == *"merge-gate: UNVERIFIED"* ]] \
+  && ok_t 'the UNVERIFIED stamp lands even on a close with no --result of its own' \
+  || bad_t 'stamp on empty result' "rc=$RC result=[$res2]"
+# A close the gate DID verify must stay pristine — the stamp is a non-verdict marker,
+# not a banner every close wears (which would make it invisible).
+clear_fx; export GH_STUB_PR_5dive_150="$MERGED_OK"
+seed CLEAN-1
+run_done CLEAN-1 --result='merged as PR #150'
+res3=$(db "SELECT COALESCE(result,'') FROM tasks WHERE ident='CLEAN-1';")
+[[ $RC -eq 0 && "$res3" == 'merged as PR #150' ]] \
+  && ok_t 'a genuinely verified close is NOT stamped — the marker stays meaningful' \
+  || bad_t 'clean close must not be stamped' "rc=$RC result=[$res3]"
 
 # --- 5. the collision IS resolved when exactly one side names the ident -------
 # Evidence, not a default: the api PR's title names the task, the CLI one does not.
@@ -250,11 +277,42 @@ clear_fx; export GH_STUB_LIST_FAIL_5dive_api=1
 seed PART-1
 run_done PART-1 --result='done'
 if [[ $RC -eq 0 && "$OUT" == *UNVERIFIED* && "$OUT" == *partial-repo-scan* ]] \
-   && grep -q 'merge-gate-unverified' "$AUDIT_CALLS"; then
+   && grep -q 'merge-gate-unverified' "$AUDIT_CALLS" \
+   && [[ "$(db "SELECT COALESCE(result,'') FROM tasks WHERE ident='PART-1';")" == *"merge-gate: UNVERIFIED"* ]]; then
   ok_t 'one unlistable repo makes the whole scan UNVERIFIED (partial-repo-scan), audited, fail-open'
 else
   bad_t 'partial scan honesty' "rc=$RC out=$OUT audit=$(cat "$AUDIT_CALLS")"
 fi
+
+# --- 10b. merged-RED is the LATEST RUN PER CHECK, not any failure in the rollup ----
+# Review catch (Marcus), verified against real timestamps on lodar/5dive-api#13:
+# smoke-gate FAILED 11:49:41, SUCCEEDED 12:41:15, merged 12:42:06. It went green and
+# THEN merged. `statusCheckRollup` still carries the stale FAILURE, so "any FAILURE"
+# called a healthy PR red. A merged-red table that cries wolf gets ignored, and then
+# it is worth less than no table.
+clear_fx
+export GH_STUB_PR_5dive_api_13='{"state":"MERGED","mergedAt":"2026-07-25T12:42:06Z","title":"t","headRefName":"b","statusCheckRollup":[{"name":"smoke-gate","conclusion":"FAILURE","completedAt":"2026-07-25T11:49:41Z"},{"name":"smoke-gate","conclusion":"SUCCESS","completedAt":"2026-07-25T12:41:15Z"}]}'
+seed RERUN-1
+run_done RERUN-1 --result='landed in PR #13'
+[[ $RC -eq 0 && "$(statusof RERUN-1)" == "done" ]] \
+  && ok_t 'a check that failed then was RE-RUN GREEN is green — no false merged-red (api#13)' \
+  || bad_t 'latest-run-per-check' "rc=$RC status=$(statusof RERUN-1) out=$OUT"
+# The inverse must still bite: green first, then a later failing run on the same check.
+clear_fx
+export GH_STUB_PR_5dive_api_12='{"state":"MERGED","mergedAt":"2026-07-25T10:10:12Z","title":"t","headRefName":"b","statusCheckRollup":[{"name":"smoke-gate","conclusion":"SUCCESS","completedAt":"2026-07-25T09:00:00Z"},{"name":"smoke-gate","conclusion":"FAILURE","completedAt":"2026-07-25T09:49:53Z"}]}'
+seed RERUN-2
+run_done RERUN-2 --result='landed in PR #12'
+[[ $RC -ne 0 && "$OUT" == *RED* ]] \
+  && ok_t 'the LATEST run still decides when it is the failing one (api#12 is genuinely red)' \
+  || bad_t 'latest-run-per-check inverse' "rc=$RC status=$(statusof RERUN-2) out=$OUT"
+# A stale failure on one check must not be laundered by a different check going green.
+clear_fx
+export GH_STUB_PR_5dive_api_14='{"state":"MERGED","mergedAt":"2026-07-25T12:00:00Z","title":"t","headRefName":"b","statusCheckRollup":[{"name":"smoke-gate","conclusion":"FAILURE","completedAt":"2026-07-25T11:00:00Z"},{"name":"lint","conclusion":"SUCCESS","completedAt":"2026-07-25T11:30:00Z"}]}'
+seed RERUN-3
+run_done RERUN-3 --result='landed in PR #14'
+[[ $RC -ne 0 && "$OUT" == *RED* ]] \
+  && ok_t 'grouping is PER CHECK NAME — a green lint cannot launder a red smoke-gate' \
+  || bad_t 'per-name grouping' "rc=$RC status=$(statusof RERUN-3) out=$OUT"
 
 # --- 11. a bare delivery_ref is refused outright ------------------------------
 # The fail-CLOSED declared path must not silently invent a repo either. No live task

@@ -18169,9 +18169,7 @@ _gate_pr_probe() {
       --json state,mergedAt,statusCheckRollup,title,headRefName \
       -q "[ .state,
             (.mergedAt // \"null\"),
-            ( [ (.statusCheckRollup // [])[]? | (.conclusion // .state // \"\") ]
-              | if   any(. == \"FAILURE\" or . == \"TIMED_OUT\" or . == \"CANCELLED\" or . == \"ACTION_REQUIRED\" or . == \"ERROR\")
-                then \"FAILURE\" elif length == 0 then \"NONE\" else \"OK\" end ),
+            $_GATE_ROLLUP_JQ,
             ( if ((.title // \"\") | test(\"(^|[^A-Za-z0-9])${ident}([^A-Za-z0-9]|\$)\";\"i\"))
                  or ((.headRefName // \"\") | test(\"(^|[^A-Za-z0-9])${ident}([^A-Za-z0-9]|\$)\";\"i\"))
               then \"1\" else \"0\" end ) ] | join(\"|\")" \
@@ -18231,6 +18229,25 @@ _gate_pr_refs_engine_ok() {
 4242" ]]
 }
 
+# DIVE-1955 (review, Marcus): the check verdict is the LATEST RUN PER CHECK NAME, not
+# "any FAILURE anywhere in the rollup". `statusCheckRollup` carries every run on the
+# head commit, so a check that failed and was then re-run green still contributes its
+# old FAILURE — and the gate called the PR red. Proven on lodar/5dive-api#13: smoke-gate
+# FAILED 11:49:41, SUCCEEDED 12:41:15, merged 12:42:06. It went green and then merged;
+# reporting it as a merged-red escape is a FALSE POSITIVE. A merged-red table that cries
+# wolf gets ignored, at which point it is worth less than no table at all.
+# Group by name (CheckRun) or context (StatusContext), sort each group by its own
+# timestamp, keep the last, and judge only those. Runs with no timestamp sort first, so
+# a timestamp-less duplicate can never outrank a real completion.
+readonly _GATE_ROLLUP_JQ='
+  ( [ (.statusCheckRollup // [])[]?
+      | { n: (.name // .context // ""),
+          c: (.conclusion // .state // ""),
+          t: (.completedAt // .startedAt // .createdAt // "") } ]
+    | group_by(.n) | map(sort_by(.t) | last | .c)
+    | if   any(. == "FAILURE" or . == "TIMED_OUT" or . == "CANCELLED" or . == "ACTION_REQUIRED" or . == "ERROR")
+      then "FAILURE" elif length == 0 then "NONE" else "OK" end )'
+
 # DIVE-1935: resolve ONE pr ref (number or url) to `STATE|mergedAt|CHECKS` where
 # CHECKS is FAILURE (at least one failed/cancelled/timed-out/action-required run),
 # NONE (no checks reported) or OK. Empty output means COULD NOT RESOLVE — no
@@ -18244,11 +18261,7 @@ _gate_pr_state() {
   [[ "$ref" =~ ^[0-9]+$ ]] && repo_arg=(--repo "$slug")
   GH_TOKEN="$tok" timeout 10s gh pr view "$ref" "${repo_arg[@]}" \
       --json state,mergedAt,statusCheckRollup \
-      -q '[ .state,
-            (.mergedAt // "null"),
-            ( [ (.statusCheckRollup // [])[]? | (.conclusion // .state // "") ]
-              | if   any(. == "FAILURE" or . == "TIMED_OUT" or . == "CANCELLED" or . == "ACTION_REQUIRED" or . == "ERROR")
-                then "FAILURE" elif length == 0 then "NONE" else "OK" end ) ] | join("|")' \
+      -q "[ .state, (.mergedAt // \"null\"), $_GATE_ROLLUP_JQ ] | join(\"|\")" \
       2>/dev/null || true
 }
 
@@ -18256,6 +18269,13 @@ _task_status_cmd() {
   local newstatus="$1" extra="$2" verb="$3"; shift 3
   tasks_db_init
   local result="" want_result=0 notify=0 no_preflight=0 force_merge_gate=0
+  # DIVE-1955 (review, Marcus): every reason the merge-gate could NOT reach an answer,
+  # accumulated so the close can be stamped UNVERIFIED in the DURABLE RECORD. A stderr
+  # warn and an audit row are necessary and not sufficient: the task row is what a
+  # reader sees months later, and a clean-looking row is a verdict the gate never made.
+  # Same rule we shipped in DIVE-1869 — a check that could not reach its answer must
+  # not render as one. Blocking nothing is fine; blessing by silence is not.
+  local _mg_unverified=""
   local -a positional=()
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -18408,7 +18428,8 @@ _task_status_cmd() {
               policy_refuse "$E_CONFLICT" done-after-red-merge DIVE-1935 "$ident" "$ident cannot close: its delivery PR $_dref is merged but its checks are RED. done=merged-AND-green (DIVE-1935) — fix main (or re-run the failed check), then task done, or \`task done $ident --force-merge-gate\` to override (audited)."
             fi
             ;;
-          '') warn "$ident: could not verify the check status of $_dref (no gh token / network / gh) — merged-state confirmed, checks UNVERIFIED." ;;
+          '') warn "$ident: could not verify the check status of $_dref (no gh token / network / gh) — merged-state confirmed, checks UNVERIFIED."
+              _mg_unverified="${_mg_unverified:+$_mg_unverified; }checks of $_dref unresolved (merged-state confirmed)" ;;
         esac
       else
         # DIVE-1955: a `Branch:` line names no repo, so this used to look for the
@@ -18496,6 +18517,7 @@ _task_status_cmd() {
       [[ -n "$_ghtok2" && $_sc_total -gt 0 && $_sc_ok -lt $_sc_total ]] && _scan_why="partial-repo-scan-${_sc_ok}-of-${_sc_total}"
       warn "$ident: merge-gate could not query GitHub ($_scan_why) — this close is UNVERIFIED, not verified-clean (DIVE-1935)."
       audit_log "task.merge-gate-unverified" ok 0 -- "$ident" "reason=$_scan_why"
+      _mg_unverified="${_mg_unverified:+$_mg_unverified; }repo scan did not run ($_scan_why)"
     fi
     # DIVE-1935: the PR reference the maker TYPED is a declaration too. DIVE-1922
     # closed with no delivery_ref and no Branch: line, so both bindings were empty
@@ -18512,6 +18534,7 @@ _task_status_cmd() {
     if [[ $force_merge_gate -eq 0 ]] && ! _gate_pr_refs_engine_ok; then
       warn "$ident: PR-reference parsing is BROKEN on this host (grep -oE unusable) — the result/body merge-gate did NOT run; this close is UNVERIFIED (DIVE-1935)."
       audit_log "task.merge-gate-unverified" ok 0 -- "$ident" "reason=ref-parser-broken"
+      _mg_unverified="${_mg_unverified:+$_mg_unverified; }PR-reference parser unusable on this host"
     elif [[ -z "$_auto_hit" && $force_merge_gate -eq 0 && -n "$_ghtok2" ]]; then
       local _txt _qref _n=0 _st _rslug
       _txt="$result
@@ -18538,10 +18561,14 @@ $_body"
           \|)                    _txt_unres="${_txt_unres:+$_txt_unres,}${_qref#*|}" ;;
         esac
       done < <(_gate_pr_refs_qualified_from_text "$_txt")
-      [[ -n "$_txt_unres" ]] && warn "$ident: could not resolve PR reference(s) #${_txt_unres//,/, #} named in the result/body in any known repo ($(_gate_repo_slugs | paste -sd, -)) — merge state UNVERIFIED for those. Cite the full pull URL, or add a \`Repo: <owner>/<repo>\` line, to have them checked."
+      if [[ -n "$_txt_unres" ]]; then
+        warn "$ident: could not resolve PR reference(s) #${_txt_unres//,/, #} named in the result/body in any known repo ($(_gate_repo_slugs | paste -sd, -)) — merge state UNVERIFIED for those. Cite the full pull URL, or add a \`Repo: <owner>/<repo>\` line, to have them checked."
+        _mg_unverified="${_mg_unverified:+$_mg_unverified; }PR reference(s) #${_txt_unres//,/, #} resolve to no PR in any known repo"
+      fi
       if [[ -n "$_txt_amb" ]]; then
         warn "$ident: AMBIGUOUS PR reference(s) — $_txt_amb. A bare number does not identify a pull request across our repos and this task declares none, so the merge state is UNVERIFIED rather than guessed (DIVE-1955). Cite the full pull URL or add a \`Repo: <owner>/<repo>\` line to the body."
         audit_log "task.merge-gate-ambiguous" ok 0 -- "$ident" "refs=$_txt_amb"
+        _mg_unverified="${_mg_unverified:+$_mg_unverified; }AMBIGUOUS PR reference(s) — $_txt_amb"
       fi
     fi
     if [[ -n "$_txt_open" && $force_merge_gate -eq 0 ]]; then
@@ -18558,6 +18585,25 @@ $_body"
     elif [[ -n "$_auto_hit" ]]; then
       policy_refuse "$E_CONFLICT" done-before-named-pr-merged DIVE-1835 "$ident" "$ident cannot close: open PR ${_sc_hit_slug}#$_auto_hit names it in its title/branch but is not merged to main. done=merged-to-main (DIVE-1835 mandatory gate) — merge it then \`task done\`, \`task cancel\` to abandon, or \`task done $ident --force-merge-gate\` to override (audited + surfaced in the weekly hygiene digest)."
     fi
+  fi
+  # DIVE-1955 (review, Marcus): STAMP THE RECORD. Every path above that could not
+  # reach an answer — an ambiguous bare `#N`, a repo whose listing failed, a dead ref
+  # parser, an unresolvable reference, unreadable checks on a confirmed merge — is a
+  # non-verdict, and until now it existed only as stderr (gone the moment the terminal
+  # scrolls) and an audit row (a different artifact than the one anyone reads). The
+  # task row said `done` with no finding, which is exactly the clean verdict the gate
+  # declined to make. The marker rides the result so the record itself carries it.
+  # Deliberately NOT a block and NOT a refusal: `ambiguous` means we do not know, and
+  # a close is still the right outcome. It just may not LOOK verified.
+  # Appended, never substituted, so the maker's own text is untouched; and only on a
+  # real `done` (a cancel was never gated, so it has nothing to disclaim).
+  if [[ -n "$_mg_unverified" && "$verb" == "done" ]]; then
+    local _mg_base="$result"
+    (( want_result )) || _mg_base=$(db "SELECT COALESCE(result,'') FROM tasks WHERE id=${id};")
+    result="${_mg_base}${_mg_base:+
+
+}[merge-gate: UNVERIFIED — ${_mg_unverified}. This close was NOT confirmed merged-and-green against GitHub; absence of a finding here is not evidence of one. (DIVE-1955)]"
+    want_result=1
   fi
   local set_result=""
   if (( want_result )); then
