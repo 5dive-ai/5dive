@@ -18,7 +18,7 @@ _task_usage() {
                                                      # --verifier=<agent> forces the rail ON at ANY priority.
                             [--task-budget=<tokens|\$cost>]  # per-run spend cap for the on-host loop (DIVE-824)
                                                      # loop spec: declarative verify loop (DIVE-476). --verify is
-                                                     # the default cmd for `task verify`; --verifier grades (writer!=grader)
+                                                     # the default cmd for 'task verify'; --verifier grades (writer!=grader)
   5dive task ls [--status=<s>] [--assignee=<agent>] [--mine] [--all] [--recurring]
                                                      # default: open tasks, priority-ordered; --recurring: templates
   5dive task show <id|DIVE-N>                        # full detail + subtasks + blockers
@@ -60,18 +60,18 @@ _task_usage() {
                                                      # observability (DIVE-478/597): maker→verifier board + LOOP-7
                                                      # loop_runs control window (topology/stage/iter/tokens-ceiling/
                                                      # status/⚠stuck). --runs=only loop_runs; --watch repaints;
-                                                     # --kill flips kill_requested (deferred-safe). Cost: `usage loops`.
-                                                     # Tokens/cost per loop: see `5dive usage` (same task ids).
+                                                     # --kill flips kill_requested (deferred-safe). Cost: 'usage loops'.
+                                                     # Tokens/cost per loop: see '5dive usage' (same task ids).
   5dive task cancel <id|DIVE-N> [--result=<text>]    # -> cancelled; --result captures why
   5dive task done|cancel ... [--keep-worktree]       # DIVE-1967: a close RECLAIMS node_modules from that task's worktrees (gitignored,
-                                                     # `npm ci`-regenerable -> structurally data-loss-free). --keep-worktree opts out.
+                                                     # 'npm ci'-regenerable -> structurally data-loss-free). --keep-worktree opts out.
                                                      # The worktree DIRECTORY is never deleted — it may hold unpushed commits.
   5dive task reclaim <id|DIVE-N>|--all [--dry-run]   # reclaim node_modules from closed tasks' worktrees. --all sweeps every worktree whose
                                                      # task is done/cancelled/absent and SKIPS in_progress/blocked. Also REPORTS which
                                                      # worktree dirs look prunable (nothing unpushed) — pruning itself stays a human call.
   5dive task block   <id|DIVE-N> --by=<id|DIVE-N>    # add a blocks edge, mark blocked
                                                      # Attempt first — blocking is the exception you must justify. Every block MUST carry a revisit anchor:
-                                                     #   --by=<id> (dependency, auto-clears on the blocker's done), OR route a timed hold via `task park --reason --wake`, OR a human `task need`.
+                                                     #   --by=<id> (dependency, auto-clears on the blocker's done), OR route a timed hold via 'task park --reason --wake', OR a human 'task need'.
                                                      # A bare reasonless/dateless block is refused (DIVE-1357).
   5dive task unblock <id|DIVE-N> [--by=<id|DIVE-N>]  # drop edge(s); back to todo if clear
   5dive task rm <id|DIVE-N>                          # delete (cascades subtasks + edges)
@@ -89,7 +89,7 @@ _task_usage() {
                                                      # -> blocked, awaiting a human (decision/secret/approval/manual)
   5dive task park <id|DIVE-N> --reason="..." --wake=<YYYY-MM-DD[ HH:MM]|+Nd|+Nh>
                                                      # QUIET timed wait (no ping, not in the inbox); the heartbeat auto-unparks at --wake.
-                                                     # --reason AND --wake are REQUIRED (DIVE-1357): a park with no revisit date is the block graveyard. Unknown date? pick a re-check (+7d). Waiting on a person? use `task need`.
+                                                     # --reason AND --wake are REQUIRED (DIVE-1357): a park with no revisit date is the block graveyard. Unknown date? pick a re-check (+7d). Waiting on a person? use 'task need'.
                                                      # back to todo when the time passes (heartbeat sweep, DIVE-891)
   5dive task unpark <id|DIVE-N>                      # clear a park early -> todo (unless task-deps still block it)
   5dive task inbox                                   # list ONLY human-gated tasks, priority-ordered
@@ -102,8 +102,8 @@ _task_usage() {
                                                      # tier-2 hard gates (money/destructive/secret) are SKIPPED and keep their per-gate button tap.
                                                      # --only limits it to one named gate. Invoked by the telegram plugin, which supplies the verified chat_id.
                                                      # approval/secret gates are human-only: blocked for agent-* callers,
-                                                     # and (DIVE-519) require --proof=<token from `5dive gate-proof`> once
-                                                     # `5dive gate-proof enforce on` is set. Trusted paths attach it automatically.
+                                                     # and (DIVE-519) require --proof=<token from '5dive gate-proof'> once
+                                                     # '5dive gate-proof enforce on' is set. Trusted paths attach it automatically.
 
   status: todo | in_progress | blocked | done | cancelled
 
