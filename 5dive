@@ -26,7 +26,7 @@ esac
 
 # Bumped on every public release. `build.sh` checks this line exists; CI fails
 # the bundle-drift check if it's missing or empty.
-readonly FIVE_VERSION="0.14.15"
+readonly FIVE_VERSION="0.15.0"
 
 # GitHub org our repos live under. The org is being renamed
 # 5dive-com -> 5dive-ai (2026-06); fetches must work on either side of the
@@ -36759,14 +36759,252 @@ _proof_tick() {
   return "$rc"
 }
 
+# _proof_scorecard — DIVE-1914. Multi-dimensional autonomy metrics, LOCAL and
+# read-only, broken down by risk tier. The badge (1 - asks/shipped) stays the
+# HEADLINE number; this exists so a single score is not the only score and
+# therefore not worth gaming (the DIVE-1441 anti-Goodhart argument).
+#
+# THE RULE THIS VERB IS BUILT AROUND: every rendered number is backed by a
+# source that was PROVEN to exist before the metric shipped. A metric with no
+# source renders 0.0% and reads as "we never get blocked" / "we never roll
+# back" — a confident zero on the honesty instrument itself, which is the
+# succeeding-in-appearance class we keep deleting. Absent, or an explicit
+# no-data marker WITH the reason, beats a confident zero every time.
+#
+# Ground-truthed against live digest + tasks.db on 2026-07-25. The spec claimed
+# cost was available at digest.usage; digest.usage is EMPTY in every window
+# (checked 1d and 7d, and --30d does not exist). Empty is not thin, it is
+# absent. Tokens come from usage_collect instead — a different source than the
+# spec named, and it measures tokens, not money.
+#
+# Numbers come VERBATIM from digest / tasks.db / usage_collect. There is
+# deliberately NO flag anywhere that adjusts one — same no-edit path as publish.
+_proof_scorecard() {
+  # --json is stripped GLOBALLY by main.sh before dispatch (it sets JSON_MODE),
+  # so a local `--json)` case here would be dead code that silently never fires
+  # and leaves --json rendering text. Read the global.
+  local json="${JSON_MODE:-0}" window="7d" by="tier"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --7d)   window="7d" ;;
+      --by=*) by="${1#*=}" ;;
+      # DIVE-1921: digest has no --30d (it errors "unknown arg"), so offering
+      # one here would be a window this verb cannot actually compute.
+      --30d)  fail "$E_USAGE" "proof scorecard: --30d not available — \`digest\` supports only --7d (tracked as DIVE-1921)" ;;
+      *) fail "$E_USAGE" "proof scorecard: unknown arg: $1" ;;
+    esac
+    shift
+  done
+  case "$by" in tier|class) ;; *) fail "$E_USAGE" "proof scorecard: --by must be tier|class" ;; esac
+
+  local self db work
+  self="$(command -v 5dive 2>/dev/null || echo "$0")"
+  db="${TASKS_DB:-${STATE_DIR}/tasks/tasks.db}"
+  # DIVE-1864 lesson, same trap one verb along: a live digest blows past
+  # MAX_ARG_STRLEN, so these go through FILES, never the environment. Passing
+  # them as env vars fails with a bare "Argument list too long" and no metric.
+  work="$(mktemp -d)"
+  "$self" digest --json --7d 2>/dev/null > "$work/digest.json"
+  [ -s "$work/digest.json" ] || fail "$E_GENERIC" "proof scorecard: digest produced no output"
+
+  # Tokens: usage_collect scans agent transcripts. Guarded — this lib is also
+  # sourced in contexts without cmd_usage.sh, and a missing collector must
+  # degrade to an honest no-data row, never to a zero.
+  : > "$work/usage.json"
+  if declare -F usage_collect >/dev/null 2>&1; then
+    usage_collect 604800 2>/dev/null > "$work/usage.json" || : > "$work/usage.json"
+  fi
+
+  # DIVE-1914 iteration 2 (olivia): --by used to be VALIDATED as legal and then
+  # never used — grouping was always by tier, so `--by=class` emitted
+  # "by":"class" beside a breakdown of tier data. Output asserting what the code
+  # never computed is precisely the class this verb exists to prevent. --by now
+  # selects both the grouping expression and what "known" means for coverage,
+  # and the label ships INSIDE the breakdown object so the two cannot disagree.
+  #
+  # class = project_key + priority (the ticket's approximation). Ground-truthed
+  # 2026-07-25: both columns are non-empty on all 408 shipped tasks in the
+  # window, so class coverage is complete where tier coverage is 27%.
+  local group_expr known_expr
+  case "$by" in
+    tier)  group_expr="COALESCE(CAST(tier AS TEXT),'untiered')"
+           known_expr="tier IS NOT NULL" ;;
+    class) group_expr="COALESCE(NULLIF(project_key,''),'unknown')||'/'||COALESCE(NULLIF(priority,''),'unknown')"
+           known_expr="project_key IS NOT NULL AND project_key<>'' AND priority IS NOT NULL AND priority<>''" ;;
+  esac
+
+  local rows
+  rows="$(db "SELECT
+      (SELECT COUNT(*) FROM tasks WHERE status='done' AND kind='standard' AND done_at>=datetime('now','-7 days')) || '|' ||
+      (SELECT COUNT(*) FROM tasks WHERE status='done' AND kind='standard' AND done_at>=datetime('now','-7 days') AND verifier IS NOT NULL AND verifier<>'') || '|' ||
+      (SELECT COUNT(*) FROM tasks WHERE status='done' AND kind='standard' AND done_at>=datetime('now','-7 days') AND verifier IS NOT NULL AND verifier<>'' AND COALESCE(iteration,1)<=1) || '|' ||
+      (SELECT COUNT(*) FROM tasks WHERE status='done' AND kind='standard' AND done_at>=datetime('now','-7 days') AND ${known_expr});" 2>/dev/null || true)"
+
+  local group_rows
+  group_rows="$(db "SELECT ${group_expr}, COUNT(*) FROM tasks
+                    WHERE status='done' AND kind='standard' AND done_at>=datetime('now','-7 days')
+                    GROUP BY 1 ORDER BY 2 DESC, 1;" 2>/dev/null || true)"
+
+  DIGEST_FILE="$work/digest.json" USAGE_FILE="$work/usage.json" DB_ROWS="$rows" GROUP_ROWS="$group_rows" \
+  WINDOW="$window" BY="$by" AS_JSON="$json" python3 <<'SCOREPY'
+import os, json, sys
+
+dg = json.load(open(os.environ["DIGEST_FILE"]))
+as_json = os.environ["AS_JSON"] == "1"
+parts = (os.environ.get("DB_ROWS") or "").strip().split("|")
+def num(i):
+    try: return int(parts[i])
+    except Exception: return None
+
+shipped_db, graded, first_pass, tiered = num(0), num(1), num(2), num(3)
+
+zh    = dg.get("zeroHuman") or {}
+stuck = dg.get("stuck") or {}
+pre   = dg.get("precedentPrefill") or {}
+
+shipped = zh.get("shipped")
+asks    = zh.get("humanTouches")
+
+# A metric is either SOURCED (value + the sample it rests on) or it is no-data
+# WITH a reason. There is no third state, and no path that emits a bare 0.
+def metric(name, value, sample=None, note=None, nodata=None):
+    return {"name": name, "value": value, "sample": sample, "note": note, "nodata": nodata}
+
+metrics = []
+
+# 1. human interruptions per accepted outcome — digest.zeroHuman (solid, n=408).
+if shipped:
+    metrics.append(metric("human interruptions per accepted outcome",
+                          round(asks / shipped, 3), f"{asks} asks / {shipped} shipped"))
+else:
+    metrics.append(metric("human interruptions per accepted outcome", None,
+                          nodata="no accepted outcomes in the window"))
+
+# 2. verifier first-pass rate — tasks.db maker/verifier rail. NOT in digest.
+if graded:
+    metrics.append(metric("verifier first-pass rate",
+                          f"{round(first_pass / graded * 100, 1)}%", f"n={graded} graded"))
+else:
+    metrics.append(metric("verifier first-pass rate", None,
+                          nodata="no verifier-graded tasks in the window"))
+
+# 3. median recovery time — digest.stuck, already computed upstream. The sample
+#    sits ON the number: one episode is not a median, and a reader must not have
+#    to find that in a footnote.
+if stuck.get("mttuSec") is not None and stuck.get("episodes"):
+    ep = stuck["episodes"]
+    metrics.append(metric("median recovery time", f"{stuck['mttuSec']}s",
+                          f"n={ep} episode" + ("" if ep == 1 else "s")))
+else:
+    metrics.append(metric("median recovery time", None,
+                          nodata="no recovery episodes in the window"))
+
+# 4. precedent acceptance — digest.precedentPrefill.
+if pre.get("count"):
+    metrics.append(metric("precedent acceptance rate",
+                          f"{pre.get('acceptanceRate')}%", f"n={pre['count']}"))
+else:
+    metrics.append(metric("precedent acceptance rate", None,
+                          nodata="no precedent prefills in the window"))
+
+# 5. TOKENS per accepted outcome. The row is NAMED for what it measures —
+#    a label is a footnote, the name is the claim, and a reader scanning a
+#    scorecard reads names. Never called "cost": see the money line below.
+tok_total = None
+try:
+    with open(os.environ["USAGE_FILE"]) as fh:
+        raw = fh.read().strip()
+    if raw:
+        tok_total = sum(int(a.get("total") or 0) for a in (json.loads(raw).get("agents") or []))
+except Exception:
+    tok_total = None
+if tok_total and shipped:
+    metrics.append(metric("tokens per accepted outcome", f"{round(tok_total / shipped):,}",
+                          f"{tok_total:,} tokens / {shipped} shipped", note="subscription tokens"))
+else:
+    metrics.append(metric("tokens per accepted outcome", None,
+                          nodata="token transcripts unreadable from here (needs root)"))
+
+# 6/7. No source exists. Rendered as an explicit marker naming the task that
+#      would build it — telling the reader WHY beats telling them THAT.
+metrics.append(metric("policy-blocked action attempts", None,
+                      nodata="nothing records a refused attempt yet (DIVE-1922)"))
+metrics.append(metric("autonomous rollback rate", None,
+                      nodata="nothing records a self-revert yet (DIVE-1923)"))
+
+by = os.environ["BY"]
+groups = []
+for line in (os.environ.get("GROUP_ROWS") or "").strip().splitlines():
+    if "|" in line:
+        k, v = line.rsplit("|", 1)
+        groups.append({"key": k, "shipped": int(v)})
+
+# The dimension label lives INSIDE the breakdown, so the header and the rows
+# cannot describe different things (the exact defect this iteration fixes).
+coverage = None
+if shipped_db:
+    coverage = {"dimension": by, "known": tiered, "total": shipped_db,
+                "pct": round((tiered or 0) / shipped_db * 100, 1)}
+
+# The money line is a FACT worth stating, not an omission to leave silent, and
+# it says WHY rather than that something is missing. It restates the standing
+# stance in cmd_usage.sh: subscription inference has no per-token price, so a
+# "$" column would be fiction.
+money_note = ("no money figure exists here: this work runs on a subscription plan, "
+              "so there is no per-token price and a \"$\" column would be fiction")
+
+out = {"window": os.environ["WINDOW"], "by": by,
+       "headline": {"note": "the badge (1 - asks/shipped) remains the headline number",
+                    "shipped": shipped, "humanAsks": asks},
+       "metrics": metrics,
+       "breakdown": {"by": by, "rows": groups},
+       "coverage": coverage,
+       "moneyNote": money_note}
+
+if as_json:
+    print(json.dumps(out, indent=2))
+    sys.exit(0)
+
+print(f"SCORECARD — last {out['window']}   (local, read-only; the badge stays the headline)")
+print()
+w = max(len(m["name"]) for m in metrics)
+for m in metrics:
+    if m["value"] is None:
+        print(f"  {m['name']:<{w}}   NO DATA — {m['nodata']}")
+    else:
+        tail = f"  ({m['sample']}" + (f"; {m['note']}" if m["note"] else "") + ")" if m["sample"] else ""
+        print(f"  {m['name']:<{w}}   {m['value']}{tail}")
+print()
+print(f"  {money_note}.")
+if groups:
+    print()
+    print("BY RISK TIER" if by == "tier" else "BY TASK CLASS (project / priority)")
+    # Coverage sits NEXT TO the breakdown, not under it: without this a reader
+    # takes 0/1/2 as the shape of the whole, when it describes only the tiered
+    # slice. The coverage number is the most actionable thing on the row — it
+    # says our own tiering discipline is the gap, not the metric.
+    if coverage:
+        print(f"  {by} known for {coverage['pct']}% of shipped work "
+              f"({coverage['known']} of {coverage['total']})")
+    kw = max(len(g["key"]) for g in groups)
+    for g in groups:
+        print(f"    {g['key']:<{max(kw, 10)}} {g['shipped']}")
+SCOREPY
+  local _rc=$?
+  rm -rf "$work"
+  return "$_rc"
+}
+
 cmd_proof() {
   case "${1:-}" in
     publish)       shift; _proof_publish "$@" ;;
     on|off|status) local _s="$1"; shift; _proof_onoff "$_s" "$@" ;;
+    scorecard)     shift; _proof_scorecard "$@" ;;
     tick)          shift; _proof_tick "$@" ;;
     -h|--help|"")
       cat <<'HELP'
 usage: 5dive proof status [--json]                    # LOCAL autonomy badge + config (no network)
+       5dive proof scorecard [--json] [--7d] [--by=tier|class]   # LOCAL multi-dim metrics by risk tier
        5dive proof on --repo=<url> [--branch=status] [--at=<0-23>] [--user=<u>]
        5dive proof off
        5dive proof publish [--dry-run] [--repo=<url>] [--branch=<b>]
@@ -36776,6 +37014,15 @@ usage: 5dive proof status [--json]                    # LOCAL autonomy badge + c
 lifetime ledger (OSS-38), materialized from task data: a shipped action is a
 done task; it "needed a human" only if it carried a gate a HUMAN answered (a
 lead/agent clearance does not count). Read-only, local, no publish.
+
+`proof scorecard` (DIVE-1914) breaks autonomy into several dimensions by risk
+tier, so a single score is not the only score and therefore not worth gaming.
+The badge stays the HEADLINE number. Local and read-only, like `proof status`.
+Every rendered number is backed by a source proven to exist before the metric
+shipped; a metric with no source shows an explicit NO DATA marker naming WHY,
+never a confident 0.0% that reads as "we never get blocked". No dollars — the
+work runs on a subscription plan, so the row is honestly named "tokens per
+accepted outcome" rather than a "cost" row with a footnote.
 
 `proof publish` writes the badge (badge.json + zero-human.json + history.jsonl)
 to a git status branch, computed VERBATIM from `5dive digest` — there is no flag
