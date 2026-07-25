@@ -336,6 +336,12 @@ cmd_task_set_branch() {
 # addendum can't clobber someone else's existing context. Also works on
 # recurring TEMPLATES (kind='recurring'), the DIVE-176 case. Refuses on a
 # closed task — same "can't retro-edit a closed task" guard as `task verifier`.
+# DIVE-1920 review (main): a body carries the spec/findings/reasoning a task is
+# graded against, so a silently rewritable body is the same last-write-wins gap
+# just flagged on need_asked_at — audit it like `task reject` does, naming the
+# actor, overwrite-vs-append, and the PRIOR length so a destructive overwrite is
+# distinguishable from an append after the fact. Not a permission check — the
+# fleet is a trust domain and collaborative body edits are legitimate.
 cmd_task_set_body() {
   tasks_db_init
   local append=0 task=""
@@ -357,10 +363,10 @@ cmd_task_set_body() {
   st=$(db "SELECT status FROM tasks WHERE id=${id};")
   [[ "$st" != "done" && "$st" != "cancelled" ]] \
     || fail "$E_VALIDATION" "$ident is already $st — its body is frozen (closed tasks don't get retro-edited; bounce it back first with: 5dive task reject $ident --feedback=\"…\")"
+  local body; body=$(db "SELECT COALESCE(body,'') FROM tasks WHERE id=${id};")
+  local prior_len=${#body}
   local newbody
   if (( append )); then
-    local body
-    body=$(db "SELECT COALESCE(body,'') FROM tasks WHERE id=${id};")
     if [[ -n "$body" ]]; then
       newbody="${body}"$'\n\n'"${text}"
     else
@@ -371,6 +377,8 @@ cmd_task_set_body() {
   fi
   db "UPDATE tasks SET body=$(sqlq "$newbody") WHERE id=${id};"
   local mode="replaced"; (( append )) && mode="appended"
+  [[ $EUID -eq 0 ]] && audit_log "task set-body" "ok" 0 -- \
+    "task=$ident" "actor=$(task_actor)" "mode=$mode" "prior_len=$prior_len" || true
   ok "$ident body $mode" '{ident:$id, mode:$m}' --arg id "$ident" --arg m "$mode"
 }
 
