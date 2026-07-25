@@ -269,14 +269,35 @@ heal_claude_shadow_creds() {
 # 0640 g=claude file is directly readable. Mirrors the 0640 root:claude posture
 # already used for opencode connector env files. Root-only (chmod on a
 # claude-owned file); no-op when the file is absent. Does NOT widen sudo.
+#
+# DIVE-1900: this covered codex+grok ONLY, so a SUCCESSFUL antigravity (or
+# openclaw/hermes) login wrote a perfectly good token into the profile that no
+# standard-isolation agent could ever read — the seed no-op'd and the agent
+# fell back to its own token exchange, failing with `invalid_grant "Malformed
+# auth code"`. That reads as an EXPIRED credential, so the profile (valid),
+# `agent list` (ACTIVE) and the seat row (enabled) all reported healthy while
+# the agent had no token at all. Two failure modes had to be fixed together:
+#   1. the FILE (now every file-seeded type, not just codex/grok), and
+#   2. the DIRS above it. The HOME-redirect types (grok/openclaw/antigravity)
+#      let the vendor CLI create its own dot-dirs under the profile, and those
+#      land 0700 owner=claude. A group-readable file under an untraversable dir
+#      is still unreadable, so fixing only the mode was never enough.
+# Dir walk is bounded to inside the profile root, so it can never widen
+# anything outside /var/lib/5dive/auth-profiles/<profile>.
 normalize_profile_seed_perms() {
   local profile="${1:-}"
   [[ -n "$profile" ]] || return 0
-  local type path
-  for type in codex grok; do
+  local root="${AUTH_PROFILES_DIR}/${profile}"
+  local type path dir
+  for type in codex grok hermes openclaw antigravity; do
     path=$(profile_type_auth_path "$profile" "$type" 2>/dev/null) || continue
     [[ -n "$path" && -f "$path" ]] || continue
     chmod 0640 "$path" 2>/dev/null || true
+    dir=$(dirname "$path")
+    while [[ "$dir" == "$root"/* ]]; do
+      chmod g+rx "$dir" 2>/dev/null || true
+      dir=$(dirname "$dir")
+    done
   done
 }
 
