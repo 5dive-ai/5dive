@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.15.27
+
+- tests: `heartbeat_gate_shipped_unit.sh` exited 0 unconditionally (DIVE-2003,
+  olivia's reject). Moving the tally `printf` to the end left `[[ "$FAIL" -eq 0 ]]`
+  stranded mid-file, so the harness's status became the printf's constant 0 — and
+  CI (`for t in tests/*.sh`) and `5dive task verify --cmd` BOTH grade on `$?`, so
+  every future regression in the sweep would have passed green. The verdict is now
+  the last command. Re-ran all four guard mutations grading on `$?`: previously all
+  four exited 0, now all four exit 1. Also documents why the drift branch writes an
+  audit row while the routine legacy-gate branch does not, and records the
+  deliberate ref-resolution coverage gap in the format-contract test.
+
 ## 0.15.26 — fix(audit): the audit log recorded privileged operations, not agent actions (DIVE-1989) (2026-07-25)
 
 - **the log we treat as ground truth systematically omitted every non-root agent action.** Nine `task` / `task need` sub-events were emitted as `[[ $EUID -eq 0 ]] && audit_log ... || true`. Measured side by side on a live box before the fix: `5dive task precedent off` run as `agent-dev` produced **zero** rows, and the byte-identical command under `sudo` produced one. `task precedent`, `task routing`, `task need withdraw`, `task need t0-auto`, `task need precedent-auto`, `task need lead-route` and `task reject gate-supersede` carry no dispatcher-level row of their own, so for those verbs the gated line was the **only** record that could exist.
