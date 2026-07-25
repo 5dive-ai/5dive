@@ -802,12 +802,34 @@ _proof_scorecard() {
       (SELECT COUNT(*) FROM tasks WHERE status='done' AND kind='standard' AND done_at>=datetime('now','-7 days') AND verifier IS NOT NULL AND verifier<>'' AND COALESCE(iteration,1)<=1) || '|' ||
       (SELECT COUNT(*) FROM tasks WHERE status='done' AND kind='standard' AND done_at>=datetime('now','-7 days') AND ${known_expr});" 2>/dev/null || true)"
 
+  # DIVE-1922: the policy-refusal source now EXISTS, so this metric stops being
+  # NO DATA. Two numbers are needed, not one. The count alone would read as
+  # "we never get blocked" when it is 0 — the same failure the marker existed to
+  # prevent — so it ships with the number of INSTRUMENTED sites beside it. An
+  # uninstrumented refusal site is invisible to this count, and the reader has to
+  # be told that. The site count is DERIVED from the shipped bundle rather than
+  # hand-maintained, because a hand-kept constant drifts and then lies.
+  local refusals="" refusal_sites=""
+  if [ "$(db "SELECT 1 FROM sqlite_master WHERE type='table' AND name='policy_refusals' LIMIT 1;" 2>/dev/null)" = "1" ]; then
+    refusals="$(db "SELECT COUNT(*) FROM policy_refusals WHERE ts>=datetime('now','-7 days');" 2>/dev/null || true)"
+    # `|| true` is LOAD-BEARING, not defensive noise. Under `set -euo pipefail` a
+    # grep that matches nothing exits 1, pipefail propagates it, and set -e kills
+    # the whole verb — printing NOTHING and exiting 1. That happens on any box
+    # whose INSTALLED bundle predates DIVE-1922 (this greps $self, the resolved
+    # `5dive` on PATH, not the tree being built), so the scorecard would have
+    # died silently on every box until the new version rolled. A silent exit is
+    # the failure mode this whole verb exists to argue against.
+    refusal_sites="$( { grep -oE 'policy_refuse "[^"]+" [a-z0-9-]+' "$self" 2>/dev/null || true; } \
+                     | awk '{print $NF}' | sort -u | wc -l | tr -d ' ')"
+  fi
+
   local group_rows
   group_rows="$(db "SELECT ${group_expr}, COUNT(*) FROM tasks
                     WHERE status='done' AND kind='standard' AND done_at>=datetime('now','-7 days')
                     GROUP BY 1 ORDER BY 2 DESC, 1;" 2>/dev/null || true)"
 
   DIGEST_FILE="$work/digest.json" USAGE_FILE="$work/usage.json" DB_ROWS="$rows" GROUP_ROWS="$group_rows" \
+  REFUSALS="$refusals" REFUSAL_SITES="$refusal_sites" \
   WINDOW="$window" BY="$by" AS_JSON="$json" python3 <<'SCOREPY'
 import os, json, sys
 
@@ -920,8 +942,26 @@ else:
 
 # 6/7. No source exists. Rendered as an explicit marker naming the task that
 #      would build it — telling the reader WHY beats telling them THAT.
-metrics.append(metric("policy-blocked action attempts", None,
-                      nodata="nothing records a refused attempt yet (DIVE-1922)"))
+# DIVE-1922 built the source (policy_refuse -> policy_refusals). A 0 is now a
+# real measurement rather than an absence — but only across the sites that are
+# INSTRUMENTED, so the count never ships without that denominator beside it.
+# Pre-DIVE-1922 stores have no table at all, which stays honest no-data.
+_ref = os.environ.get("REFUSALS", "").strip()
+_sites = os.environ.get("REFUSAL_SITES", "").strip()
+if _ref.isdigit() and _sites.isdigit() and int(_sites) > 0:
+    metrics.append(metric("policy-blocked action attempts", int(_ref),
+                          f"across {_sites} instrumented policy sites"))
+elif _sites.isdigit() and int(_sites) == 0:
+    # The store can record refusals but the RUNNING bundle has no instrumented
+    # sites (an installed CLI older than DIVE-1922). Rendering the raw count
+    # here would imply a denominator that does not exist. Say which of the two
+    # causes it actually is — a marker whose stated reason is wrong is its own
+    # small lie, and this metric exists to argue against exactly that.
+    metrics.append(metric("policy-blocked action attempts", None,
+                          nodata="this 5dive build has no instrumented policy sites — upgrade to record refusals (DIVE-1922)"))
+else:
+    metrics.append(metric("policy-blocked action attempts", None,
+                          nodata="no policy_refusals table in this store — nothing has recorded a refused attempt (DIVE-1922)"))
 metrics.append(metric("autonomous rollback rate", None,
                       nodata="nothing records a self-revert yet (DIVE-1923)"))
 
