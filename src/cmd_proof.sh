@@ -280,12 +280,23 @@ _proof_build() {
   git_name="${ZH_GIT_NAME:-$(git config --global user.name 2>/dev/null || true)}"
   git_email="${ZH_GIT_EMAIL:-$(git config --global user.email 2>/dev/null || true)}"
 
-  local self day_json week_json today today_label now_iso cli_version
+  local self day_json week_json today now_iso cli_version
   self="$(command -v 5dive 2>/dev/null || echo "$0")"
   day_json="$("$self" digest --json 2>/dev/null)"
   week_json="$("$self" digest --json --7d 2>/dev/null)"
   [ -n "$day_json" ] && [ -n "$week_json" ] || { echo "digest produced no output" >&2; return "$E_GENERIC"; }
-  today="$(date -u +%F)"; today_label="$(date -u '+%b %-d')"; now_iso="$(date -u +%FT%TZ)"
+  # DIVE-1908: today_label ("%b %-d") was computed and exported for years and
+  # read by NOTHING — which is how the missing badge date stayed invisible. The
+  # badge now uses $today (full ISO) directly, so the label is dead again and is
+  # removed rather than left lying around to imply a consumer that isn't there.
+  #
+  # ONE clock read, and $today is DERIVED from it rather than computed by a
+  # second `date -u`. Two independent computations that merely happen to agree
+  # are exactly what drifts — and across a midnight boundary two calls can
+  # genuinely disagree. This way badge.json's date, zero-human.json's `date` and
+  # its `generatedAtUtc` all describe the same instant structurally, so the
+  # equality the test asserts is wiring rather than a formatting convention.
+  now_iso="$(date -u +%FT%TZ)"; today="${now_iso%%T*}"
   cli_version="$("$self" --version 2>/dev/null | head -1 | awk '{print $2}')"
 
   local work; work="$(mktemp -d)"
@@ -322,7 +333,7 @@ _proof_build() {
   printf '%s' "$day_json"  > "$work/day.json"
   printf '%s' "$week_json" > "$work/week.json"
   summary="$(DAY_JSON_FILE="$work/day.json" WEEK_JSON_FILE="$work/week.json" TODAY="$today" \
-    TODAY_LABEL="$today_label" NOW_ISO="$now_iso" CLI_VERSION="$cli_version" \
+    NOW_ISO="$now_iso" CLI_VERSION="$cli_version" \
     PUB_HOST="$(_proof_host)" PUB_USER="$(id -un)" \
     METHODOLOGY_URL="$_PROOF_METHODOLOGY_URL" \
     python3 <<'PROOFPY'
@@ -406,8 +417,40 @@ if w_ship > 0:
 else:
     message = f"0 shipped, {w_ask} {ask_word}"
 
+# DIVE-1908: the badge carries its OWN date. The standing design claim was that
+# a dead publisher stops the date moving and "a stale date IS the alarm" — but
+# the date lived only in zero-human.json, which no README reader ever fetches.
+# badge.json had no date at all, so it rendered a stale number as CURRENT for as
+# long as the publisher stayed dead. That is our own defect class aimed at the
+# honesty instrument: the credibility artifact misrepresenting its own freshness.
+#
+# The date is appended to BOTH message branches deliberately — a zero-ship week
+# is exactly when someone would want to know how old the number is, so the date
+# must never be the thing that drops out when the reading gets unusual.
+#
+# Full ISO date, not a "Jul 25" label. This artifact's entire job is making
+# staleness visible to a reader who has NONE of our instrumentation, and a
+# month-day label is unambiguous only inside a 12-month window — a known-wrong
+# reading on the one artifact that exists in order not to be wrong. Pointing at
+# the internal hourly monitor as mitigation would be the very move that produced
+# this bug: "a stale date IS the alarm" was internal reasoning about an external
+# artifact. Better to delete the limit than document it.
+#
+# It is literally `today` — the SAME string that becomes datapoint["date"] just
+# below — so the badge and zero-human.json agree by being identical, not by
+# surviving a format transformation that could drift. That is why this reads
+# `today` rather than the TODAY_LABEL the shell used to derive for it.
+#
+# A DATE, never an AGE. A date is a FACT the artifact carries; an age ("2d ago")
+# is an ASSERTION that decays the moment it stops being rewritten. A dead
+# publisher frozen at "0d ago" would be actively LYING, where a frozen date is
+# merely stale and the reader can see it. Same reason there is no publisher-set
+# "stale" flag: a dead publisher cannot mark itself dead. Freshness has to be
+# readable from the last value the publisher WROTE, never from a status it would
+# have to keep updating while broken.
 badge = {"schemaVersion": 1, "label": "zero-human",
-         "message": message, "color": "blueviolet"}
+         "message": f"{message} · {today}",
+         "color": "blueviolet"}
 
 datapoint = {
     "generatedAtUtc": os.environ["NOW_ISO"],
@@ -423,7 +466,10 @@ if _pub:
     datapoint["publishedBy"] = _pub
 
 hist_path.write_text("".join(json.dumps(h, sort_keys=True) + "\n" for h in hist))
-pathlib.Path("badge.json").write_text(json.dumps(badge, indent=2) + "\n")
+# ensure_ascii=False so the middot stays a middot instead of a \u00b7 escape —
+# badge.json is read by shields (which parses JSON fine either way) but also by
+# humans checking whether the badge is stale, and that is the whole point of it.
+pathlib.Path("badge.json").write_text(json.dumps(badge, indent=2, ensure_ascii=False) + "\n")
 pathlib.Path("zero-human.json").write_text(json.dumps(datapoint, indent=2) + "\n")
 pathlib.Path("README.md").write_text(
     "# status\n\n"
