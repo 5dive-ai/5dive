@@ -484,6 +484,218 @@ inject_and_submit() {
   return 1
 }
 
+# _ask_accumulate <transcript-file> — reassemble a scrolling stream from repeated
+# screen snapshots. Reads one snapshot on stdin, folds it into the transcript,
+# prints the whole transcript. DIVE-1901: a full-screen TUI is an alternate-screen
+# pane with NO scrollback, so a snapshot is all we can ever have; the history has
+# to be built by us, one frame at a time.
+#
+# Frames overlap heavily (a screen mostly repeats between polls), so appending
+# blindly would duplicate everything. We align the new frame against the tail of
+# the transcript and keep only what is past the alignment — the standard
+# screen-scraper reassembly.
+#
+# The alignment is DELIBERATELY not an exact suffix/prefix match. A TUI redraws
+# lines IN PLACE (a spinner, a token counter, a "● Thinking…" line that becomes
+# the answer), so consecutive frames rarely agree exactly and an exact-match fold
+# falls all the way through to "append the whole frame" — which double-counts the
+# question echo and the answer, and leaves the marker sitting in the transcript
+# twice. So we score every candidate overlap and take the best one that mostly
+# agrees (>= half its lines), preferring the longest on a tie, and let the NEW
+# render of the shared region replace the old one so in-place updates settle to
+# their final text. If nothing aligns we anchor on the frame's first line if it
+# is still in the transcript tail, and only if THAT fails do we append the frame
+# whole — a duplicated line is recoverable, a lost vote is not.
+#
+# NB the python is passed with `-c`, NOT a `python3 - <<HEREDOC`. With `-` the
+# interpreter reads its PROGRAM from stdin, which silently replaces the piped
+# frame — `sys.stdin.read()` then returns nothing and every capture looks empty.
+# Same shape as the bug this function exists to fix, so it is worth naming.
+_ask_accumulate() {
+  local f="$1"
+  python3 -c '
+import sys, pathlib
+p = pathlib.Path(sys.argv[1])
+old = p.read_text().split("\n") if p.exists() else []
+if old and old[-1] == "":
+    old.pop()
+new = sys.stdin.read().split("\n")
+while new and not new[-1].strip():   # drop the pane s blank bottom padding
+    new.pop()
+
+def fold(old, new):
+    if not new:
+        return old
+    if not old:
+        return list(new)
+    limit = min(len(old), len(new))
+    best_k, best_score = 0, None
+    for k in range(1, limit + 1):
+        same = sum(1 for a, b in zip(old[-k:], new[:k]) if a == b)
+        if same < 2 or same * 2 < k:      # needs real, majority agreement
+            continue
+        score = (same / k, k)             # ratio first, then prefer the longer overlap
+        if best_score is None or score > best_score:
+            best_score, best_k = score, k
+    if best_k == 0:
+        # Nothing aligned as a block. Last chance: the frame s first real line may
+        # still be sitting in the transcript tail (the pane scrolled hard, or was
+        # redrawn from a different top line) — splice there.
+        anchor = next((l for l in new if l.strip()), None)
+        if anchor is not None:
+            for i in range(len(old) - 1, max(-1, len(old) - limit - 1), -1):
+                if old[i] == anchor:
+                    best_k = len(old) - i
+                    break
+    if best_k == 0:
+        return old + new                  # never drop a frame
+    return old[:len(old) - best_k] + new  # the newest render of the shared region wins
+
+out = fold(old, new)
+p.write_text("\n".join(out) + ("\n" if out else ""))
+sys.stdout.write("\n".join(out))
+' "$f"
+}
+
+# _ask_reply_window <baseline-file> <sent-message-file> <msg-id> — turn the
+# accumulated transcript on stdin into JUST what the seat said. Three subtractions,
+# in order, none of which needs a per-harness signature list:
+#
+#  1. SLICE. Keep only what follows the LAST line carrying our `id=<msg-id>`,
+#     stopping before the next `[5dive-msg` marker (so a message another agent
+#     sends the seat mid-wait can never be read as our reply). The marker line
+#     itself is kept for step 2 and dropped at the end — it is the anchor the echo
+#     consumer needs, since a wrapped question begins ON that line. With an empty
+#     msg-id (the scoped `_capture` path, which slices privileged-side) the whole
+#     input is the window.
+#  2. ECHO. The receiving CLI echoes the question back before answering, wrapped
+#     across as many lines as the pane is narrow — those lines are OUR text, not a
+#     reply, and returning them is a fabricated answer. We consume them by walking
+#     the sent message ONCE, IN ORDER: each leading line must appear in the message
+#     at (or just after) where the previous one ended. That ordering is what makes
+#     "reply with exactly this: <X>" work — the echoed X consumes the message s
+#     copy of X, so the seat s own X, having nothing left to match, survives.
+#  3. CHROME. Any line already on the pane immediately before we injected is
+#     furniture by construction — prompt, separators, footer, usage counter,
+#     whatever this TUI draws. Exact match over the whole baseline, plus a
+#     NORMALISED match (digits and day/month/am-pm tokens folded) over the
+#     baseline s bottom region, because the footer counters change between the
+#     baseline and the reply ("used 43% of your weekly limit", "Sonnet 5 5h: 12%")
+#     and an exact compare lets them through as though the seat had said them.
+#     Normalisation is limited to the bottom region and to lines with real words,
+#     so a numeric reply can never be normalised into a chrome match.
+#
+# What is left is what the SEAT produced. Empty output means we have not captured
+# a reply yet — never a reply.
+_ask_reply_window() {
+  local base="$1" msgf="$2" mid="$3" do_slice="${4:-1}"
+  python3 -c '
+import sys, pathlib, re
+base_p, msg_p, mid = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2]), sys.argv[3]
+do_slice = sys.argv[4] == "1"
+lines = sys.stdin.read().split("\n")
+
+# --- 0. the FENCE: if the seat wrapped its reply in our markers, that block IS
+# the reply, and no scraping heuristic can beat it. Chrome, status lines and the
+# question echo are all outside it by construction, and it needs no per-harness
+# knowledge at all. We take the LAST complete block with a non-empty body: the
+# question echo carries both markers too, but adjacent (they are adjacent in the
+# instruction text), so its body is empty and it is skipped.
+if mid:
+    op, cl = "<5dive-r:" + mid + ">", "</5dive-r:" + mid + ">"
+    opens = [i for i, l in enumerate(lines) if op in l and cl not in l]
+    for i in reversed(opens):
+        body = []
+        for l in lines[i + 1:]:
+            if cl in l:
+                # Dedent by the common indent the TUI added, so relative
+                # indentation inside a multi-line reply survives.
+                real = [b for b in body if b.strip()]
+                if real:
+                    pad = min(len(b) - len(b.lstrip()) for b in real)
+                    sys.stdout.write("\n".join(b[pad:].rstrip() for b in body).strip("\n"))
+                    sys.exit(0)
+                break
+            if op in l or "[5dive-msg" in l:
+                break
+            body.append(l)
+
+# --- 1. slice to our reply window (marker line inclusive) -------------------
+if mid and do_slice:
+    tag = "id=" + mid
+    start = None
+    for i, l in enumerate(lines):
+        if tag in l:
+            start = i
+    if start is None:
+        sys.exit(0)                       # marker not seen yet -> no window, no reply
+    win = [lines[start]]
+    for l in lines[start + 1:]:
+        if "[5dive-msg" in l:
+            break
+        win.append(l)
+else:
+    win = [l for l in lines if "[5dive-msg" not in l]
+
+# --- 2. consume the question echo ------------------------------------------
+msg = re.sub(r"\s+", " ", msg_p.read_text() if msg_p.exists() else "").strip()
+GLYPH = re.compile(r"^[>│┊|●⏺·⎿└╰\s]+")
+pos = 0
+if mid and do_slice and win:
+    head = win.pop(0)                     # the marker line: its tail is the start of the echo
+    frag = re.sub(r"\s+", " ", head.split("]", 1)[1] if "]" in head else "").strip()
+    if len(frag) >= 2:
+        j = msg.find(frag)
+        if j >= 0:
+            pos = j + len(frag)
+while win:
+    frag = re.sub(r"\s+", " ", GLYPH.sub("", win[0])).strip()
+    if len(frag) < 2:
+        win.pop(0)                        # blank / bare glyph inside the echo block
+        continue
+    j = msg.find(frag, pos)
+    if j < 0 or j - pos > 4:              # not the next thing we sent -> the echo is over
+        break
+    pos = j + len(frag)
+    win.pop(0)
+
+# --- 3. subtract the pane s own furniture -----------------------------------
+# Furniture is anchored to the BOTTOM of the pane, so only the the baseline bottom
+# region is the chrome list. Subtracting the whole baseline looks stronger and is
+# actually worse: it also deletes a genuine reply that happens to repeat text
+# still on screen (measured — a second identical ask returned only a status line
+# because the seats answer matched the same answer from the first ask).
+raw = [l for l in (base_p.read_text().split("\n") if base_p.exists() else "")][-20:]
+exact = {l.strip() for l in raw if l.strip()}
+DIGITS, WS, ALPHA = re.compile(r"\d+"), re.compile(r"\s+"), re.compile(r"[A-Za-z]")
+TIMEISH = re.compile(r"\b(?:mon|tue|wed|thu|fri|sat|sun|jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\b|\b[ap]m\b", re.I)
+def norm(s):
+    return WS.sub(" ", TIMEISH.sub("@", DIGITS.sub("#", s))).strip().lower()
+def wordy(s):
+    return len(ALPHA.findall(s)) >= 4
+# Dynamic counters live in the footer, so the fuzzy set is the baseline s bottom
+# region only. Older conversation text stays on exact-match, where a reply that
+# happens to repeat it is at worst dropped (a loud timeout), never fabricated.
+fuzzy = {norm(l.strip()) for l in raw if l.strip() and wordy(l)}
+RULE = re.compile("^[\\s─-╿▀-▟=_~*#.-]*$")
+# An in-progress indicator ("esc to interrupt", "Ctrl+C to cancel") is drawn only
+# WHILE the seat is thinking, so it is absent from the baseline and survives the
+# subtraction above. Matched by SHAPE — <key> ... interrupt/cancel/stop — rather
+# than by a per-harness string, because every TUI spinner is a self-describing
+# interrupt control and none of them is a reply.
+PROGRESS = re.compile(r"\b(?:esc|escape|ctrl[\s+-]*c)\b[^|]{0,32}?\b(?:interrupt|cancel|stop)\b", re.I)
+out = []
+for line in win:
+    s = line.strip()
+    if not s or s in exact or RULE.match(s) or "[5dive-msg" in s or PROGRESS.search(s):
+        continue
+    if wordy(s) and norm(s) in fuzzy:
+        continue
+    out.append(line)
+sys.stdout.write("\n".join(out))
+' "$base" "$msgf" "$mid" "$do_slice"
+}
+
 # DIVE-1065: privileged inter-agent delivery primitive. Hidden subcommand
 # (`5dive agent _deliver <target> <message>`) run as ROOT via a per-agent scoped
 # sudoers grant (write_standard_sudoers) so a standard-isolation agent can talk
@@ -893,13 +1105,40 @@ cmd_ask() {
     || fail "$E_VALIDATION" "invalid --from label '$sender' (lowercase letter start, [a-z0-9-], <=32 chars)"
   msg_id="$(gen_msg_id)"
 
+  # DIVE-1901: snapshot the pane BEFORE injecting. Two uses, both load-bearing:
+  # the baseline is the chrome list (everything already on screen is furniture,
+  # for whatever TUI this seat runs), and acc_file is where the scrolling
+  # transcript gets rebuilt frame by frame because an alternate-screen pane has
+  # no scrollback to read back. Both live in a per-ask temp dir so concurrent
+  # asks — a convene dispatches ballots in parallel — cannot share state.
+  local ask_tmp baseline_file acc_file msg_file
+  ask_tmp="$(mktemp -d)" || fail "$E_GENERIC" "ask: could not create a work dir"
+  # shellcheck disable=SC2064
+  trap "rm -rf '$ask_tmp'" RETURN
+  baseline_file="$ask_tmp/baseline"; acc_file="$ask_tmp/acc"; msg_file="$ask_tmp/msg"
+  : > "$acc_file"
+
+  # DIVE-1901: ask the seat to FENCE its reply. Scraping a pane is guesswork —
+  # every TUI draws status lines ("✻ Worked for 4s"), spinners and footers that a
+  # heuristic has to tell apart from an answer, and getting that wrong on a
+  # council ballot fabricates a vote. A fence removes the guess: whatever is
+  # between the two markers is the reply, in any harness, with no per-TUI
+  # signature list. Seats that ignore the instruction fall back to the heuristic
+  # window below, so this is strictly additive.
+  # The two markers are written ADJACENT here on purpose: the receiving CLI echoes
+  # this instruction back, and an echo whose markers have nothing between them is
+  # skipped by the extractor instead of being read as an empty reply.
+  local ask_message="${message} [reply-format] Put your answer between these two marker lines: <5dive-r:${msg_id}></5dive-r:${msg_id}> — the opening marker alone on one line, your answer next, the closing marker alone on the last line."
+  printf '%s' "$ask_message" > "$msg_file"
+  sudo -u "agent-${name}" tmux capture-pane -t "agent-${name}" -p 2>/dev/null > "$baseline_file" || : > "$baseline_file"
+
   if (( use_scoped )); then
     # Inject via the scoped delivery grant, carrying our fresh marker id.
     # _deliver validates the target + running session and builds the provenance
     # header (from=<caller> id=<msg_id> tier=standard). sudo -n = fail-closed.
     # A standard ask is peer-to-peer, so (like send) it carries no --reply-to
     # channel plumbing.
-    if ! sudo -n /usr/local/bin/5dive agent _deliver --id="$msg_id" "$name" "$message"; then
+    if ! sudo -n /usr/local/bin/5dive agent _deliver --id="$msg_id" "$name" "$ask_message"; then
       fail "$E_GENERIC" "scoped delivery to '$name' failed (missing _deliver grant? re-provision the agent)"
     fi
   else
@@ -910,7 +1149,7 @@ cmd_ask() {
     [[ -n "$reply_to_chat" ]] && header+=" reply-to-chat=${reply_to_chat}"
     [[ -n "$reply_to_msg" ]] && header+=" reply-to-msg=${reply_to_msg}"
     header+="]"
-    local payload="${header} ${message}"
+    local payload="${header} ${ask_message}"
     # Same boot-race guard as cmd_send: wait for the input prompt before sending
     # so a freshly-(re)started target doesn't silently drop the question.
     if ! wait_agent_input_ready "$name"; then
@@ -934,13 +1173,49 @@ cmd_ask() {
     if (( use_scoped )); then
       # Scoped bounded read: _capture returns ONLY our reply window, already
       # sliced (after our marker, up to the next marker). sudo -n = fail-closed.
+      # NB (DIVE-1901): _capture still reads a single point-in-time window, so
+      # the scroll-off failure below is only PARTIALLY mitigated on this path —
+      # we accumulate what it returns, but once the marker leaves the pane
+      # _capture itself returns empty. Fixing that means moving the slice out of
+      # the privileged read, which changes the _deliver/_capture surface, so it
+      # is filed as DIVE-1931 rather than widened here.
       slice=$(sudo -n /usr/local/bin/5dive agent _capture "$name" --after-id="$msg_id" --buffer-lines="$buf_lines" 2>/dev/null) || true
+      slice=$(_ask_accumulate "$acc_file" <<<"$slice")
+      # Already sliced privileged-side, so re-slicing at the marker is off — but
+      # the FENCE still runs (it is keyed on the msg id, not on the slice), so a
+      # scoped-sudo caller gets the same chrome-proof extraction as everyone else.
+      slice=$(_ask_reply_window "$baseline_file" "$msg_file" "$msg_id" 0 <<<"$slice")
     else
-      capture=$(sudo -u "agent-${name}" tmux capture-pane -t "agent-${name}" -p -S "-${buf_lines}" 2>/dev/null) || true
-      # Everything after the first line containing our marker. The receiver's
-      # CLI typically echoes the user input once, so the slice begins right
-      # after that echo and grows as the receiver responds.
-      slice=$(awk -v id="id=${msg_id}" 'found {print} index($0, id) {found=1}' <<<"$capture")
+      # DIVE-1901: capture the VISIBLE pane and accumulate across polls.
+      #
+      # The old read was `capture-pane -S -${buf_lines}` sliced at the marker,
+      # and it failed two ways, both measured on a CLAUDE agent (this was never
+      # an agy/opencode-only bug — every full-screen TUI is affected):
+      #
+      #  A. A full-screen TUI runs in tmux's ALTERNATE SCREEN, which has NO
+      #     SCROLLBACK. `-S -5000` returns the same ~24 visible lines as no -S
+      #     at all, so buf_lines=2000 is INERT: it reports a 2000-line window and
+      #     delivers a screenful, with no signal it was clamped. Once the
+      #     `id=<msg_id>` echo scrolls off — which any long message does — the
+      #     marker is unrecoverable, the slice is empty, and `ask` times out
+      #     while the seat HAS answered. Accumulating fixes this: we record the
+      #     marker while it is on screen and keep it after it scrolls away, which
+      #     is what a human running capture-pane by hand does implicitly.
+      #  B. See the chrome subtraction below.
+      #
+      # Non-alt-screen harnesses (codex) keep real scrollback, so accumulating
+      # visible frames is correct for both and needs no per-harness signatures.
+      #  B. The idle test used to be "the slice is non-empty and unchanged for
+      #     ${idle}s", which a STATIC TUI FOOTER satisfies before the seat has
+      #     typed a single character — measured: a short ask returned exit 0 in
+      #     9s carrying the usage-limit line, the separators, the empty prompt
+      #     and the model footer as though they were the reply. For a council
+      #     ballot that does not lose a vote, it FABRICATES one. _ask_reply_window
+      #     subtracts the question echo and the pane's own furniture, so a slice
+      #     is non-empty only once the SEAT has produced something.
+      capture=$(sudo -u "agent-${name}" tmux capture-pane -t "agent-${name}" -p 2>/dev/null) || true
+      slice=$(_ask_accumulate "$acc_file" <<<"$capture")
+      slice=$(_ask_reply_window "$baseline_file" "$msg_file" "$msg_id" <<<"$slice")
     fi
 
     if [[ "$slice" != "$prev_slice" ]]; then
@@ -958,9 +1233,21 @@ cmd_ask() {
   done
 
   if (( JSON_MODE )); then
-    jq -Rn --arg n "$name" --arg s "$sender" --arg i "$msg_id" --arg r "$reply" \
+    # DIVE-1901: the omit-empty key MUST NOT be `k:($v|select(length>0))`. When $v
+    # is empty that yields jq's `empty`, which propagates out of the surrounding
+    # object construction, so jq prints NOTHING and exits 0 — and `agent ask
+    # --json` has no --reply-to-chat on the a2a/council path, so it returned an
+    # EMPTY DOCUMENT on every successful ask. `council convene` does
+    # JSON.parse(stdout) on that, throws, and catches straight into an ABSTAIN.
+    # That is a second, independent cause of the reported "the seat answers, the
+    # rail returns nothing" — and it fires even when the capture is perfect.
+    # Merging an object that is `{}` when the value is empty omits the key
+    # without ever producing `empty`.
+    jq -cn --arg n "$name" --arg s "$sender" --arg i "$msg_id" --arg r "$reply" \
       --arg rc "$reply_to_chat" --arg rm "$reply_to_msg" \
-      '{ok:true, data:{name:$n, from:$s, msg_id:$i, reply:$r, reply_to_chat:($rc|select(length>0)), reply_to_msg:($rm|select(length>0))}}'
+      '{ok:true, data:({name:$n, from:$s, msg_id:$i, reply:$r}
+        + (if ($rc|length) > 0 then {reply_to_chat:$rc} else {} end)
+        + (if ($rm|length) > 0 then {reply_to_msg:$rm} else {} end))}'
   else
     printf '%s\n' "$reply"
   fi
