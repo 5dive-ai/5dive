@@ -436,6 +436,63 @@ TOML
   CODEX_OVERRIDE="export CODEX_HOME=$(printf %q "$AGENT_CODEX_HOME"); "
 fi
 
+# DIVE-1900: post-seed assertion, shared by the credential seed blocks below.
+#
+# The bug this whole area exists to kill is a SILENT one: a successful login
+# that never reaches the agent, while the auth profile, `5dive agent list` and
+# the seat row all report healthy. Fixing the seed is only half of that — the
+# other half is refusing to be quiet when it did not work. There are TWO silent
+# failures, not one:
+#
+#   1. no local credential at all — the agent boots unauthenticated and dies
+#      with `invalid_grant "Malformed auth code"`, which reads as an EXPIRED
+#      token, so the "fix" is a re-tap that changes nothing.
+#   2. a PRESENT local credential we could not check against the profile's
+#      (flagged by main on PR #151). The staleness probe fails closed, so the
+#      block re-seeds nothing and says nothing — and the agent keeps running on
+#      a token that no amount of re-authing will ever replace. Narrower than
+#      (1) now that normalization makes the plain read work, but it is the same
+#      shape, so it gets the same treatment.
+#
+# UNREADABLE and ABSENT are different faults with different fixes, so they are
+# distinguished rather than collapsed into one message: absence is "go log in",
+# unreadability is "the credential is fine, the perms are not".
+#
+# <label> human type name, <shared> profile/shared credential path,
+# <local> the agent's own copy. Never fails the boot.
+assert_cred_seeded() {
+  local label="$1" shared="$2" local_path="$3"
+  local readable=0 present=0
+  { cat "$shared" >/dev/null 2>&1 || sudo -n cat "$shared" >/dev/null 2>&1; } && readable=1
+  if (( readable )); then
+    present=1
+  else
+    # -e is only meaningful when the parent chain is traversable; when it is
+    # not, we cannot rule a credential out, so treat unknown AS present. The
+    # expensive mistake here is a false all-clear, not a false alarm.
+    if { [[ -e "$shared" ]] || sudo -n test -e "$shared" 2>/dev/null; }; then
+      present=1
+    elif ! { [[ -r "$(dirname "$shared")" ]] || sudo -n test -r "$(dirname "$shared")" 2>/dev/null; }; then
+      present=1
+    fi
+  fi
+
+  if (( readable )); then
+    return 0                      # we could read it; the seed above had its shot
+  fi
+  if (( ! present )); then
+    [[ -s "$local_path" ]] && return 0
+    echo "warn: ${label} has no credential at ${shared} — agent will boot unauthenticated (run: sudo 5dive agent auth login ${label})" >&2
+    return 0
+  fi
+  if [[ -s "$local_path" ]]; then
+    echo "ERROR: ${label} credential at ${shared} is NOT readable by $(id -un), so it could not be compared with the agent's own copy — the agent is running on a LOCAL token that may be STALE, and a re-auth will NOT reach it. Seeding/permission fault, not an expired token: run 'sudo 5dive agent restart <name>' as root to re-normalize perms." >&2
+  else
+    echo "ERROR: ${label} credential EXISTS at ${shared} but is NOT readable by $(id -un) — the agent will boot UNAUTHENTICATED and fail token exchange with 'Malformed auth code'. This is a seeding/permission fault, NOT an expired token: run 'sudo 5dive agent restart <name>' as root to re-normalize perms." >&2
+  fi
+  return 0
+}
+
 # Grok stores OAuth tokens in $HOME/.grok/auth.json (mode 0600). Same shared/
 # 0600 problem as codex: the host-level shared copy at /home/claude/.grok/
 # auth.json is owned by `claude` and unreadable to agent-<name> even though
@@ -674,11 +731,8 @@ if [[ "$TYPE" == "openclaw" ]]; then
       echo "warn: could not seed openclaw auth-profiles.json from $SHARED_OPENCLAW_AUTH" >&2
     fi
   fi
-  # DIVE-1900: loud on the wrong-layer failure (see the antigravity block).
-  if [[ ! -s "$LOCAL_OPENCLAW_AUTH" ]] \
-     && { [[ -e "$SHARED_OPENCLAW_AUTH" ]] || sudo -n test -e "$SHARED_OPENCLAW_AUTH" 2>/dev/null; }; then
-    echo "ERROR: openclaw credential EXISTS at $SHARED_OPENCLAW_AUTH but is NOT readable by $(id -un) — the agent will boot UNAUTHENTICATED even though the auth profile looks healthy. Seeding/permission fault, not an expired token: re-run 'sudo 5dive agent restart <name>' as root to re-normalize perms." >&2
-  fi
+  # DIVE-1900: loud on the wrong-layer failure (see assert_cred_seeded above).
+  assert_cred_seeded openclaw "$SHARED_OPENCLAW_AUTH" "$LOCAL_OPENCLAW_AUTH"
 
   # Inherit the profile's model defaults (`agents.defaults.model.primary`).
   # `openclaw models auth login --set-default` writes that key into the
@@ -785,18 +839,9 @@ if [[ "$TYPE" == "antigravity" ]]; then
       echo "warn: could not seed antigravity oauth token from $SHARED_AGY_AUTH" >&2
     fi
   fi
-  # DIVE-1900: be LOUD about the wrong-layer failure. Without this the agent
-  # boots, falls back to its own auth-code exchange and fails with
-  # `invalid_grant "Malformed auth code"` — which everyone reads as an expired
-  # credential and re-taps the login, fixing nothing. Say plainly that the
-  # credential exists upstream and did not arrive.
-  if [[ ! -s "$LOCAL_AGY_AUTH" ]]; then
-    if { [[ -e "$SHARED_AGY_AUTH" ]] || sudo -n test -e "$SHARED_AGY_AUTH" 2>/dev/null; }; then
-      echo "ERROR: antigravity credential EXISTS at $SHARED_AGY_AUTH but is NOT readable by $(id -un) — the agent will boot UNAUTHENTICATED and fail token exchange with 'Malformed auth code'. This is a seeding/permission fault, NOT an expired token: run 'sudo 5dive agent auth set antigravity --auth-profile=<profile>' or re-run 'sudo 5dive agent restart <name>' as root to re-normalize perms." >&2
-    else
-      echo "warn: antigravity has no credential at $SHARED_AGY_AUTH — agent will boot unauthenticated (run: sudo 5dive agent auth login antigravity)" >&2
-    fi
-  fi
+  # DIVE-1900: be LOUD about the wrong-layer failure — including the case where
+  # a local token is PRESENT but we could not check it against the profile's.
+  assert_cred_seeded antigravity "$SHARED_AGY_AUTH" "$LOCAL_AGY_AUTH"
 
   # Pre-complete agy's first-run onboarding so a freshly-created agent drops
   # straight into the chat instead of the interactive color-scheme / ToS /

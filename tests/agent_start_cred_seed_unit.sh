@@ -42,10 +42,16 @@ extract_block() { # <type>
   ' "$START"
 }
 
+# The blocks call assert_cred_seeded(), which is defined once above them — pull
+# the real definition in too so the block still runs standalone.
+HELPER="$(awk '/^assert_cred_seeded\(\) \{$/ { on=1 } on { print } on && $0 == "}" { exit }' "$START")"
+[[ -n "$HELPER" ]] || { echo "FAIL: could not extract assert_cred_seeded"; exit 1; }
+
 run_block() { # <block> <extra-env-assignments...>  -> stdout+stderr of the block
   local block="$1"; shift
   env PATH="$TMP/bin:$PATH" "$@" bash -c "
     set -uo pipefail
+    $HELPER
     $block
   " 2>&1
 }
@@ -89,6 +95,46 @@ if [[ $EUID -ne 0 ]]; then
   has "$out" 'Malformed auth code' \
       "agy: warning names the misleading downstream symptom"
   chmod 0644 "$AGY_SHARED"
+
+  # ROTATION BLIND SPOT (main, PR #151 flag 2): a PRESENT local token plus an
+  # unreadable shared one re-seeds nothing. Before this it also SAID nothing —
+  # the agent kept running on a token no re-auth could ever replace, which is
+  # the exact silent shape this block exists to kill.
+  chmod 0000 "$AGY_SHARED"
+  out=$(run_block "$AGY_BLOCK" TYPE=antigravity HOME="$AGY_HOME" \
+          PROFILE_STATE_DIR="$PROFILE" WORKDIR="$TMP")
+  check "agy: stale-local case keeps the local token" \
+        "$(cat "$LOCAL_AGY")" "ya29.rotated-agy-token"
+  has "$out" 'may be STALE' \
+      "agy: present-local + unreadable-shared is announced, not silent"
+  chmod 0644 "$AGY_SHARED"
+
+  # ...and an UNTRAVERSABLE profile dir must not read as "no credential" —
+  # unknown has to fail toward the alarm, never toward a false all-clear.
+  chmod 0000 "$(dirname "$AGY_SHARED")"
+  out=$(run_block "$AGY_BLOCK" TYPE=antigravity HOME="$AGY_HOME" \
+          PROFILE_STATE_DIR="$PROFILE" WORKDIR="$TMP")
+  has "$out" 'ERROR: antigravity credential' \
+      "agy: untraversable profile dir alarms rather than reporting absence"
+  if grep -q 'has no credential' <<<"$out"; then
+    echo "FAIL: agy: untraversable dir was misreported as 'no credential'"; fail=1
+  else
+    echo "ok: agy: untraversable dir not misreported as absence"
+  fi
+  chmod 0755 "$(dirname "$AGY_SHARED")"
+fi
+
+# A genuinely ABSENT credential is a different fault with a different fix, and
+# must not be dressed up as a perms alarm.
+ABSENT_PROFILE="$TMP/profile-absent"; mkdir -p "$ABSENT_PROFILE/.gemini/antigravity-cli"
+ABSENT_HOME="$TMP/home-absent"; mkdir -p "$ABSENT_HOME"
+out=$(run_block "$AGY_BLOCK" TYPE=antigravity HOME="$ABSENT_HOME" \
+        PROFILE_STATE_DIR="$ABSENT_PROFILE" WORKDIR="$TMP")
+has "$out" 'has no credential' "agy: absent credential reported as absent"
+if grep -q 'ERROR: antigravity credential' <<<"$out"; then
+  echo "FAIL: agy: absent credential raised a perms alarm"; fail=1
+else
+  echo "ok: agy: absent credential does not raise a perms alarm"
 fi
 
 # ---------- openclaw ----------
