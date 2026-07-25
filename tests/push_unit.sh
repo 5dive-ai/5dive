@@ -341,6 +341,19 @@ out=$(SUDO_UID=99999 _gate_authenticated_actor)
 [[ -z "$(_gate_agent_for_uid 'not-a-uid')" && -z "$(_gate_agent_for_uid '')" ]] \
   && ok_t "_gate_agent_for_uid rejects a non-numeric uid (DIVE-2004)" \
   || bad_t "_gate_agent_for_uid rejects a non-numeric uid" "got '$(_gate_agent_for_uid 'not-a-uid')'"
+# THE PATH WHERE A 'DENY' COULD QUIETLY BECOME AN 'ALLOW': a uid that resolves to a
+# REAL user who is simply not an agent. uid 0 exists on every box and is never an
+# agent, so `root` must come back EMPTY, not `root` — an empty return is compared
+# against `$reviewer` and can only ever refuse, whereas any non-empty leak here is
+# one string-compare away from authorizing. Exercises the real getent lookup (the
+# gate-check cases above stub this helper to stay hermetic).
+[[ -z "$(_gate_agent_for_uid 0)" ]] \
+  && ok_t "_gate_agent_for_uid maps a real NON-agent uid (0/root) to empty, not to its username (DIVE-2004)" \
+  || bad_t "_gate_agent_for_uid must not return a non-agent username" "got '$(_gate_agent_for_uid 0)'"
+# ...and an unassigned-but-numeric uid resolves to nothing at all.
+[[ -z "$(_gate_agent_for_uid 999999)" ]] \
+  && ok_t "_gate_agent_for_uid maps an unassigned uid to empty (fail closed, DIVE-2004)" \
+  || bad_t "_gate_agent_for_uid unassigned uid" "got '$(_gate_agent_for_uid 999999)'"
 
 seed_task DIVE-926 "Branch: feature-ok" approval "2026-07-18 00:00:00" \
   "yes" "human:test" "" 0
