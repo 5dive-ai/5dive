@@ -24,3 +24,42 @@ jobs:
             fi
           done
           exit $rc
+
+  # DIVE-1919: the bare runner above is a PRISTINE box — no /var/lib/5dive, no
+  # installed plugins. That is NOT the environment any agent actually runs the
+  # suite in: every one of us runs it on the control-plane host, where 5dive IS
+  # installed. Harnesses that leak out of their isolation (a path derived from
+  # the default STATE_DIR, an assertion that really tests "the product is absent
+  # here") therefore stayed green in CI and red on our own box — which trains
+  # everyone to ignore red, and then a real failure reads as the usual noise.
+  # This job seeds the host state that actually differs and reruns the same
+  # suite, so that class reds in CI instead of only under an agent's nose.
+  test-installed-host:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Simulate a box with 5dive installed
+        run: |
+          # live state dir + gate-proof enforcement flipped ON (as on the
+          # control plane) — catches harnesses whose gate paths escape STATE_DIR
+          sudo mkdir -p /var/lib/5dive
+          sudo touch /var/lib/5dive/gate-proof.enforce
+          sudo chmod 0644 /var/lib/5dive/gate-proof.enforce
+          # a real telegram-pi/-opencode checkout on the canonical fallback paths
+          # — catches assertions that only hold when the product is NOT installed
+          for p in telegram-pi telegram-opencode; do
+            sudo mkdir -p "/usr/local/lib/5dive/$p"
+            echo '// stub for the installed-host CI matrix' \
+              | sudo tee "/usr/local/lib/5dive/$p/server.ts" >/dev/null
+          done
+      - name: Run unit harnesses (installed host)
+        run: |
+          rc=0
+          for t in tests/*.sh; do
+            echo "=== $t"
+            if ! bash "$t"; then
+              echo "FAILED: $t"
+              rc=1
+            fi
+          done
+          exit $rc
