@@ -2883,6 +2883,41 @@ _gate_tier2_floor_hit() {
 # `fleet roll` so a tested-code push+fleet-roll files as a lead-routed tier-1. The
 # true-human floor still runs FIRST and wins (a "push the pricing change" gate
 # stays human), so these can only ever cost the lead one clear.
+# _gate_authenticated_actor — DIVE-2004. The agent identity the KERNEL enforced for
+# this invocation, or EMPTY when it cannot be established. This is deliberately NOT
+# `task_actor`: that resolves `--from=<who>` verbatim, so it answers "who does the
+# caller SAY they are" (provenance, right for the audit record) and must never be
+# asked "who is the caller" (authentication). Two trustworthy sources:
+#   1. the real process user — `agent-X` can only be reached by actually being X.
+#   2. `$SUDO_UID`, but ONLY at EUID 0 (DIVE-1413): sudo sets it, and a non-root
+#      process forging it cannot also become root. Below EUID 0 it is a plain env
+#      var, which is why DIVE-950 dropped the agent-forgeable `--proof` form.
+# FAILS CLOSED by design: neither source resolving means "unidentified", never
+# "trusted". The cost of a false empty is re-filing a gate; the cost of a false
+# identity is a self-authorized delegated push.
+# The dashboard path is unaffected and needs no marker: shelld runs as `claude`
+# (a NON-agent user) and sends `--human`, so those answers are `human:*` — already
+# authorized everywhere `lead:*` is, and never in want of a lead stamp.
+_gate_authenticated_actor() {
+  local u; u=$(id -un 2>/dev/null || echo '')
+  if [[ "$u" == agent-* ]]; then printf '%s' "${u#agent-}"; return; fi
+  if [[ "$(id -u 2>/dev/null || echo 1)" == "0" && -n "${SUDO_UID:-}" ]]; then
+    local su; su=$(getent passwd "$SUDO_UID" 2>/dev/null | cut -d: -f1)
+    [[ "$su" == agent-* ]] && { printf '%s' "${su#agent-}"; return; }
+  fi
+  printf ''
+}
+
+# _gate_agent_for_uid <uid> — the agent name owning a numeric uid, or EMPTY. Used
+# to re-check a STORED `need_answered_uid` (DIVE-756 stamps the real pre-sudo
+# invoker) against a claimed `need_answered_by`, so a `--from` spoof is visible
+# after the fact and not only at answer time.
+_gate_agent_for_uid() {
+  local uid="${1:-}"; [[ "$uid" =~ ^[0-9]+$ ]] || { printf ''; return; }
+  local u; u=$(getent passwd "$uid" 2>/dev/null | cut -d: -f1)
+  [[ "$u" == agent-* ]] && printf '%s' "${u#agent-}" || printf ''
+}
+
 _GATE_ENG_SHIP_RX='\bmerg(e|es|ed|ing)\b|pull request|\bpr\b|\bdiff\b|ship it|ship the|ship this|\bship(ping|ped)\b|deploy|redeploy|roll ?out|\broll(ing|ed)? out\b|land the|land it|land this|\bland(ing|ed)\b|rebase|hotfix|cut a branch|cut the release|push(es|ed|ing)? to (main|prod|production|origin)|push[^.]*github|delegated push|push[- ]for[- ]review|push .*(branch|for review|for a? ?pr|for code review)|5dive push|roll[^.]*fleet|fleet[- ]?roll|code review|approve the (merge|diff|change|pr|build|deploy|ship|commit)|build\.sh|smoke test|ci\b'
 _gate_eng_ship_hit() {
   local text; text=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
@@ -3698,6 +3733,19 @@ cmd_task_need() {
         return
       fi
     fi
+  fi
+
+  # DIVE-2004: LOUD AT FILE TIME. Reaching here means the gate was NOT lead-routed,
+  # so it has no routed_reviewer. A `decision` in that state can be answered by any
+  # agent, which is exactly why delegated push will not accept it — and the filer
+  # only finds out later, from a refusal that reads as if the answerer was at
+  # fault. If the ask is push-for-review shaped, say so now, while the filer is
+  # still standing here and re-filing costs nothing. Deliberately narrow: the ask
+  # must LOOK like a push gate, the type must be the one push cannot attribute, and
+  # the gate must be unrouted — a warning that fires on ordinary decisions would be
+  # wallpaper (DIVE-1955).
+  if [[ "$type" == "decision" ]] && _gate_eng_ship_hit "$ask"; then
+    warn "$ident is a push-for-review ask filed as --type=decision with no routed reviewer, so '5dive push' will REFUSE it: an unrouted decision can be answered by any agent, and push only accepts a human, a lead-clear, or a decision answered by this gate's own routed reviewer. Re-file with --type=approval (it routes to the org lead as a tier-1 they can clear), or keep the decision and route it to a reviewer."
   fi
 
   # DIVE-105: DM the paired human right now so the gate doesn't sit unseen.
@@ -5127,11 +5175,16 @@ cmd_task_answer() {
   # is never routed (routed_reviewer stays NULL), so it can never take this path.
   # DIVE-1243: `access` joins approval/manual as lead-clearable — the designated
   # routed_reviewer (and only that agent, on only this routed gate) may clear it.
+  # DIVE-2004: the caller identity here must be the one the KERNEL enforced, not
+  # the one the CLI was told. `need_answered_by` is provenance — `task_actor`
+  # returns `--from=<anything>` verbatim — so authorizing on it would let any agent
+  # mint `lead:<the reviewer>` for itself. `_gate_authenticated_actor` is the
+  # unforgeable half, and it FAILS CLOSED (empty -> no lead-clear).
   local _routed_rev; _routed_rev=$(db "SELECT COALESCE(routed_reviewer,'') FROM tasks WHERE id=${id};")
   local _lead_clear=0
   if [[ ( "$nt" == "approval" || "$nt" == "manual" || "$nt" == "access" ) && -n "$_routed_rev" ]]; then
-    local _c; _c=$(id -un 2>/dev/null || echo '?')
-    [[ "$_c" == "agent-${_routed_rev}" ]] && _lead_clear=1
+    local _auth; _auth=$(_gate_authenticated_actor)
+    [[ -n "$_auth" && "$_auth" == "$_routed_rev" ]] && _lead_clear=1
   fi
   # DIVE-1243: `access` is NOT open-agent-clearable (unlike decision) — a random
   # agent must not self-grant. It is gated here like the human-only types, so only

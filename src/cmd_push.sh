@@ -102,8 +102,32 @@ _push_gate_check() {
   # signature check. (The exact-match line is kept as belt-and-braces.)
   [[ "$gby" == lead:* ]] && authorized=1
   [[ -n "$reviewer" && "$gby" == "lead:${reviewer}" ]] && authorized=1
+  # DIVE-2004: a `decision` gate cleared by its own designated reviewer could never
+  # authorize a push, because `lead:` is minted ONLY for approval|manual|access —
+  # so the refusal accused the reviewer who had in fact cleared it. The predicate
+  # push actually needs is "was this authorized by the party it was routed to";
+  # the stamp is one way to prove that, not the only one. The claim `gby ==
+  # reviewer` is NOT sufficient on its own (`task answer --from=<reviewer>` writes
+  # it verbatim), so it must be corroborated by the stored `need_answered_uid`,
+  # which DIVE-756 stamps from the real pre-sudo invoker and no flag can set.
+  local uid_agent=""
+  if (( ! authorized )) && [[ "$gtype" == "decision" && -n "$reviewer" && "$gby" == "$reviewer" ]]; then
+    uid_agent=$(_gate_agent_for_uid "$guid")
+    [[ -n "$uid_agent" && "$uid_agent" == "$reviewer" ]] && authorized=1
+  fi
   if (( ! authorized )); then
-    fail "$E_VALIDATION" "gate on ${ident} was cleared by unauthorized provenance '${gby:-unknown}' — delegated push requires a human or a lead-clear (its designated routed reviewer)."
+    # Name the stamp REQUIRED and the one FOUND. A refusal that says "unauthorized
+    # provenance" while the designated reviewer is exactly who cleared it sends the
+    # reader off to audit the reviewer instead of the gate type (DIVE-1970/2000).
+    local detail=""
+    if [[ "$gtype" == "decision" && -n "$reviewer" && "$gby" == "$reviewer" ]]; then
+      detail=" — '${gby}' IS this gate's routed reviewer, but the recorded invoker uid ${guid:-<none>} maps to '${uid_agent:-no agent}', so the answer cannot be attributed to them. If that is unexpected, the answer was recorded with a --from that did not match who ran it."
+    elif [[ -n "$reviewer" ]]; then
+      detail=" — required 'human:*', 'lead:${reviewer}', or a decision answered by '${reviewer}' with a matching invoker uid; found '${gby:-unknown}'. A ${gtype:-gate} answered by the lead is only stamped 'lead:' for approval/manual/access."
+    else
+      detail=" — required 'human:*' or 'lead:*'; found '${gby:-unknown}', and this gate has no routed reviewer to attribute a decision answer to."
+    fi
+    fail "$E_VALIDATION" "gate on ${ident} was not cleared by an authority delegated push accepts${detail}"
   fi
   if [[ "$require_sig" == "1" ]] \
       && ! _gate_closure_verify "$id" "$gtype" "$ganswer" "$gby" "$gansweredat" "$guid" "$gsig"; then

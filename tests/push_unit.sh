@@ -226,7 +226,7 @@ out=$(authoritative_gate_check DIVE-907); rc=$?
 seed_task DIVE-924 "Branch: feature-ok" decision "2026-07-18 00:00:00" \
   "yes" "auto:ttl" "main"
 out=$(authoritative_gate_check DIVE-924); rc=$?
-{ [[ $rc -ne 0 ]] && grep -qi "unauthorized provenance" <<<"$out"; } \
+{ [[ $rc -ne 0 ]] && grep -qi "not cleared by an authority" <<<"$out"; } \
   && ok_t "gate predicate: auto-clear -> refuse" \
   || bad_t "gate predicate: auto-clear -> refuse" "rc=$rc :: $out"
 
@@ -259,9 +259,101 @@ out=$(authoritative_gate_check DIVE-1555A); rc=$?
 seed_task DIVE-1555B "Branch: feature-ok" decision "2026-07-18 00:00:00" \
   "yes" "main" ""
 out=$(authoritative_gate_check DIVE-1555B); rc=$?
-{ [[ $rc -ne 0 ]] && grep -qi "unauthorized provenance" <<<"$out"; } \
+{ [[ $rc -ne 0 ]] && grep -qi "not cleared by an authority" <<<"$out"; } \
   && ok_t "gate predicate: bare-agent (decision-clear 'main') -> still refuse (DIVE-1555)" \
   || bad_t "gate predicate: bare-agent (decision-clear 'main') -> still refuse (DIVE-1555)" "rc=$rc :: $out"
+
+
+# --- DIVE-2004: `lead:` is minted ONLY for approval|manual|access, so a DECISION
+# gate cleared by its own designated reviewer could never authorize a push — and
+# the refusal accused the reviewer who HAD cleared it. Push now accepts that case,
+# but only when the claim is corroborated by the stored invoker uid: `gby ==
+# reviewer` alone is caller-writable (`task answer --from=<reviewer>`).
+# `_gate_agent_for_uid` is stubbed per-case so the harness stays hermetic — CI
+# runners have no agent-* users, and the real getent lookup is exercised by the
+# _gate_authenticated_actor cases below.
+_uid_map=""
+_gate_agent_for_uid() { [[ "${1:-}" == "1000" ]] && printf '%s' "$_uid_map" || printf ''; }
+
+_uid_map="main"
+seed_task DIVE-2004A "Branch: feature-ok" decision "2026-07-18 00:00:00" "yes" "main" "main"
+out=$(authoritative_gate_check DIVE-2004A); rc=$?
+[[ $rc -eq 0 ]] \
+  && ok_t "decision cleared by its routed reviewer, uid corroborates -> pass (DIVE-2004)" \
+  || bad_t "decision cleared by its routed reviewer, uid corroborates -> pass (DIVE-2004)" "rc=$rc :: $out"
+
+# THE SPOOF: same row, but the recorded uid belongs to someone else — which is what
+# `task answer --from=main` run by another agent produces. Refused, and the refusal
+# must say WHY, or a real spoof is invisible.
+_uid_map="dev"
+out=$(authoritative_gate_check DIVE-2004A); rc=$?
+{ [[ $rc -ne 0 ]] && grep -q "IS this gate's routed reviewer" <<<"$out" \
+    && grep -q "maps to 'dev'" <<<"$out"; } \
+  && ok_t "decision + reviewer match but uid maps elsewhere -> refuse, naming the mismatch (DIVE-2004)" \
+  || bad_t "decision + reviewer match but uid maps elsewhere -> refuse, naming the mismatch (DIVE-2004)" "rc=$rc :: $out"
+
+# FAIL CLOSED: uid resolves to no agent at all -> refuse. Unidentifiable is not trusted.
+_uid_map=""
+out=$(authoritative_gate_check DIVE-2004A); rc=$?
+{ [[ $rc -ne 0 ]] && grep -q "maps to 'no agent'" <<<"$out"; } \
+  && ok_t "decision + reviewer match but uid resolves to nobody -> refuse (fail closed, DIVE-2004)" \
+  || bad_t "decision + reviewer match but uid resolves to nobody -> refuse (fail closed, DIVE-2004)" "rc=$rc :: $out"
+
+# A decision answered by a DIFFERENT agent than the reviewer is still refused, and
+# the message names the stamp it wanted rather than blaming the provenance value.
+_uid_map="main"
+seed_task DIVE-2004B "Branch: feature-ok" decision "2026-07-18 00:00:00" "yes" "qa" "main"
+out=$(authoritative_gate_check DIVE-2004B); rc=$?
+{ [[ $rc -ne 0 ]] && grep -q "required 'human:\*', 'lead:main'" <<<"$out"; } \
+  && ok_t "decision answered by a non-reviewer agent -> refuse, naming what was required (DIVE-2004)" \
+  || bad_t "decision answered by a non-reviewer agent -> refuse, naming what was required (DIVE-2004)" "rc=$rc :: $out"
+
+# An APPROVAL answered bare by its reviewer is NOT swept in by the new rule — the
+# carve-out is scoped to `decision`, the type that had no path to `lead:` at all.
+seed_task DIVE-2004C "Branch: feature-ok" approval "2026-07-18 00:00:00" "yes" "main" "main"
+out=$(authoritative_gate_check DIVE-2004C); rc=$?
+[[ $rc -ne 0 ]] \
+  && ok_t "approval with a BARE reviewer provenance -> still refuse (carve-out is decision-only, DIVE-2004)" \
+  || bad_t "approval with a BARE reviewer provenance -> still refuse (carve-out is decision-only, DIVE-2004)" "rc=$rc :: $out"
+
+unset -f _gate_agent_for_uid
+# shellcheck source=/dev/null
+source "$SRC/cmd_task.sh"   # restore the real helper for the cases below
+
+# _gate_authenticated_actor: the kernel-enforced identity, EMPTY when unknown.
+# Not `task_actor` — that returns --from verbatim, which is the whole bug.
+out=$(_gate_authenticated_actor)
+me=$(id -un)
+if [[ "$me" == agent-* ]]; then
+  [[ "$out" == "${me#agent-}" ]] \
+    && ok_t "_gate_authenticated_actor resolves the real agent user (DIVE-2004)" \
+    || bad_t "_gate_authenticated_actor resolves the real agent user (DIVE-2004)" "got '$out' as $me"
+else
+  [[ -z "$out" ]] \
+    && ok_t "_gate_authenticated_actor is EMPTY for a non-agent, non-root caller (fail closed, DIVE-2004)" \
+    || bad_t "_gate_authenticated_actor is EMPTY for a non-agent, non-root caller" "got '$out' as $me"
+fi
+# A forged --from must not move it: authentication ignores what the caller claims.
+out=$(SUDO_UID=99999 _gate_authenticated_actor)
+[[ "$out" == "$(_gate_authenticated_actor)" ]] \
+  && ok_t "_gate_authenticated_actor ignores an unmappable SUDO_UID below EUID 0 (DIVE-2004)" \
+  || bad_t "_gate_authenticated_actor ignores an unmappable SUDO_UID below EUID 0" "got '$out'"
+[[ -z "$(_gate_agent_for_uid 'not-a-uid')" && -z "$(_gate_agent_for_uid '')" ]] \
+  && ok_t "_gate_agent_for_uid rejects a non-numeric uid (DIVE-2004)" \
+  || bad_t "_gate_agent_for_uid rejects a non-numeric uid" "got '$(_gate_agent_for_uid 'not-a-uid')'"
+# THE PATH WHERE A 'DENY' COULD QUIETLY BECOME AN 'ALLOW': a uid that resolves to a
+# REAL user who is simply not an agent. uid 0 exists on every box and is never an
+# agent, so `root` must come back EMPTY, not `root` — an empty return is compared
+# against `$reviewer` and can only ever refuse, whereas any non-empty leak here is
+# one string-compare away from authorizing. Exercises the real getent lookup (the
+# gate-check cases above stub this helper to stay hermetic).
+[[ -z "$(_gate_agent_for_uid 0)" ]] \
+  && ok_t "_gate_agent_for_uid maps a real NON-agent uid (0/root) to empty, not to its username (DIVE-2004)" \
+  || bad_t "_gate_agent_for_uid must not return a non-agent username" "got '$(_gate_agent_for_uid 0)'"
+# ...and an unassigned-but-numeric uid resolves to nothing at all.
+[[ -z "$(_gate_agent_for_uid 999999)" ]] \
+  && ok_t "_gate_agent_for_uid maps an unassigned uid to empty (fail closed, DIVE-2004)" \
+  || bad_t "_gate_agent_for_uid unassigned uid" "got '$(_gate_agent_for_uid 999999)'"
 
 seed_task DIVE-926 "Branch: feature-ok" approval "2026-07-18 00:00:00" \
   "yes" "human:test" "" 0
