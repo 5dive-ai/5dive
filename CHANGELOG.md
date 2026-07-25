@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.15.20 — fix(heartbeat): the ship-flag fired on merges that PREDATED the open ask (DIVE-2001) (2026-07-25)
+
+- **a merge older than the gate cannot be evidence the gate is satisfied.** `_hb_gate_shipped_sweep` matched any commit referencing the ident and flagged the owner *"likely shipped, verify and close"* regardless of when it landed. On DIVE-1968 it cited a commit merged ~2h **before** the gate was even filed. On a ticket that lands in pieces — 1968 has five criteria across three PRs — that nudge points the right way for the wrong reason, arrives with the authority of an automatic check, and agrees with what the assignee already wants to do. DIVE-1968 exists *because* DIVE-1927 was closed on a proof that did not cover the open failure, so a mechanism manufacturing exactly that pressure was aimed at our worst-performing habit. Found by dev.
+- **it does NOT stamp `shipped_flag_at` when it skips.** The gate stays eligible, so a genuinely later merge still flags on a subsequent tick — suppressing the nudge must not also suppress the real one.
+- **an unknown commit timestamp fails OPEN** (flags as before) rather than silently withholding. Withholding a legitimate flag is a silence, and silence is the failure mode this whole class is about.
+- asserted in **both directions plus a negative control**: a commit predating the ask neither stamps nor pings, and the *same* fixture with a commit after the ask still flags and pings — without that control, both assertions pass just as happily on a sweep that has stopped flagging anything at all. Mutation-tested: disabling the guard turns exactly the two pre-ask assertions red.
+
 ## 0.15.19 — fix(task): a gate could be filed, report as pinged, and leave NO record that anyone was reached (DIVE-1968) (2026-07-25)
 
 - **the gate rail now refuses to exit without a delivery verdict.** Every branch of `task_need_notify` was written to record one — an `ok` row, an `error` row, or a privileged re-send whose child records it. The defect was what happened when none of them ran: measured on the control plane, **5 of 9 real gates filed after the DIVE-1927 fix recorded NEITHER an `ok` nor an `error` row.** They returned success and left no trace in the only dataset anyone consults to judge whether the rail works. A logged failure is a bug report; silence is indistinguishable from success, which is how this class survived a live end-to-end verification.
