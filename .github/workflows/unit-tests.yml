@@ -51,7 +51,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Every harness must be able to FAIL
-        run: bash tests/meta/harness-verdict-probe.sh --assume-clean
+        run: |
+          bash tests/meta/harness-verdict-probe.sh --assume-clean \
+            --label=pristine --report=probe-pristine.txt
+      # DIVE-2018: this run's `not-reached` set is not a failure and must not be —
+      # a harness that skips before its verdict has not been shown to be unwired,
+      # and three correctly-wired files were falsely accused that way. Which is
+      # exactly why THIS job cannot establish coverage: it can only report what it
+      # saw. The report goes to the union job, which asserts the invariant that
+      # does hold across environments. `if: always()` because a run that found
+      # UNWIRED still made a valid coverage observation, and losing it would let a
+      # red probe silently shrink the union.
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: { name: probe-pristine, path: probe-pristine.txt, if-no-files-found: error }
 
   test-installed-host:
     runs-on: ubuntu-latest
@@ -71,6 +84,16 @@ jobs:
             echo '// stub for the installed-host CI matrix' \
               | sudo tee "/usr/local/lib/5dive/$p/server.ts" >/dev/null
           done
+          # DIVE-2018: a `claude` user and at least one `agent-*` user. The control
+          # plane has both; a CI runner has neither, so gate_nonce_unit.sh and
+          # gate_sudo_uid_forge_unit.sh `exit 0` at their own SKIP guard before ever
+          # reaching a verdict. After the canary fix they were the LAST two harnesses
+          # the probe could not reach in ANY environment — and they are the gate
+          # identity and SUDO_UID forge tests, i.e. exactly the coverage whose absence
+          # matters most. Two throwaway system users, no shell, no home.
+          sudo useradd -M -N -s /usr/sbin/nologin claude 2>/dev/null || true
+          sudo useradd -M -N -s /usr/sbin/nologin agent-dev 2>/dev/null || true
+          getent passwd claude agent-dev
       - name: Run unit harnesses (installed host)
         run: |
           rc=0
@@ -82,3 +105,44 @@ jobs:
             fi
           done
           exit $rc
+      # DIVE-2018: the probe used to run ONLY on the pristine runner, so the
+      # harnesses CI never probed were precisely the ones that skip without live
+      # state — the gate and install paths, i.e. the most environment-sensitive
+      # code we have. Probing here too is what makes the union non-trivial: this
+      # environment reaches harnesses the pristine one cannot. `--assume-clean` is
+      # sound for the same reason it is in the pristine job — the step above just
+      # established the clean-green baseline IN THIS ENVIRONMENT, and if it went
+      # red this step does not run and the union job never reports coverage.
+      - name: Every harness must be able to FAIL (installed host)
+        run: |
+          bash tests/meta/harness-verdict-probe.sh --assume-clean \
+            --label=installed-host --report=probe-installed.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: { name: probe-installed, path: probe-installed.txt, if-no-files-found: error }
+
+  # DIVE-2018: NOT-REACHED is correctly not a failure in any single run, so no
+  # single run can establish that a harness has EVER been probed. On the control
+  # plane the probe read 135 wired / 16 not-reached; on the pristine runner 151
+  # wired / 0 not-reached. Both green, both 154 with the allowlist, probing
+  # DIFFERENT CORPORA, and nothing said so. The limit case is a harness that skips
+  # in every environment: reported "probed in an environment where it runs", and no
+  # environment ever does.
+  #
+  # This job owns the invariant that survives that: every harness in tests/*.sh is
+  # probed in AT LEAST ONE environment, or is allowlisted by name with a reason.
+  # A skip in one environment is still not an accusation; a skip in all of them is
+  # now a failure.
+  harness-verdict-union:
+    runs-on: ubuntu-latest
+    needs: [harness-verdict, test-installed-host]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with: { pattern: probe-*, merge-multiple: true }
+      # The union script fails closed on a missing, headerless, or different-corpus
+      # report, so a job that died before writing one cannot silently shrink what
+      # we claim to cover — the check would otherwise have the same shape of hole
+      # it exists to close.
+      - name: Every harness must be probed in SOME environment
+        run: bash tests/meta/harness-verdict-union.sh probe-pristine.txt probe-installed.txt
