@@ -44,6 +44,30 @@ cmd_send() {  # $1 = target agent; --message=… carries the body
 }
 audit_log() { return 0; }
 
+# DIVE-2122 — the stall alarm now probes agent SESSIONS directly, so these must be
+# stubbed for the whole run or the sweep reaches the REAL registry and REAL tmux
+# panes: measured, the unstubbed probe found a live host agent mid-turn and
+# correctly suppressed the alarm, turning two pre-existing arms red. A harness that
+# reaches the host is not isolated, and the arm it breaks is the one you trust least.
+# Default: an EMPTY fleet (probe unavailable) — the pre-DIVE-2122 behaviour of
+# alarming, so every arm above this point grades exactly what it graded before.
+PROBE_LOG="$TMP/probe"; : >"$PROBE_LOG"
+FLEET='{"agents":{}}'
+IDLE_MAP=""
+registry_read() { printf '%s' "$FLEET"; }
+# rc contract mirrors the real _hb_agent_idle: 0 idle, 1 busy/mid-turn, 2 unknown,
+# 3 blocked. Every probed name is logged so the EARLY EXIT is gradeable.
+_hb_agent_idle() {
+  local n="$1" e
+  printf '%s\n' "$n" >>"$PROBE_LOG"
+  for e in $IDLE_MAP; do [[ "${e%%:*}" == "$n" ]] && return "${e##*:}"; done
+  return 0
+}
+mkfleet() { local n out='{"agents":{' first=1
+  for n in "$@"; do [[ $first == 1 ]] || out+=','; out+="\"$n\":{\"heartbeat\":{\"enabled\":true}}"; first=0; done
+  printf '%s}}' "$out"; }
+
+
 tasks_db_init
 
 PASS=0; FAIL=0
@@ -252,6 +276,85 @@ _hb_stall_sweep >/dev/null 2>&1
 [[ ! -s "$SEND_LOG" ]] \
   && ok_t "recent fleet-wide gate_pinged_at -> pinger looks alive, canary does not trip" \
   || bad_t "canary false-tripped while pinger is alive" "$(cat "$SEND_LOG")"
+
+
+# =============================================================================
+# (d) DIVE-2122 — the alarm must MEASURE idleness, not infer it from a proxy
+#
+# in_progress==0 means "nobody used the task verb recently", not "nothing is
+# happening". Measured 2026-07-26: the alarm fired while the fleet ran 257 commands
+# in ten minutes and dev's last `task start` was 7.5 HOURS earlier. Fifth instance of
+# the same false positive. These arms pin the direct session probe that now gates it.
+# =============================================================================
+# the otherwise-firing condition: one stranded todo, persisted well past the window
+arm() { reset_all; local t; t=$(addt --assignee=dev -- "a stranded todo")
+  db "INSERT INTO task_prefs (key,value) VALUES ('stall_first_seen_at', datetime('now','-60 minutes'));"
+  : >"$SEND_LOG"; : >"$PROBE_LOG"; }
+stallmsg() { grep -c 'fleet-stall' "$SEND_LOG"; }
+
+# --- D1: THE FALSE POSITIVE. One agent actively working -> no alarm.
+FLEET=$(mkfleet dev olivia); IDLE_MAP="dev:1"; arm
+_hb_stall_sweep >/dev/null 2>&1
+[[ "$(stallmsg)" == "0" ]] \
+  && ok_t "D1 an ACTIVE agent session suppresses the alarm (in_progress is a proxy, the session is the artifact)" \
+  || bad_t "D1 active fleet must not alarm" "$(cat "$SEND_LOG")"
+[[ -z "$(db "SELECT value FROM task_prefs WHERE key='stall_first_seen_at';")" ]] \
+  && ok_t "D1 the idle clock is RESET on observed activity (an 'idle 60m+' claim we just disproved is not carried forward)" \
+  || bad_t "D1 clock must reset" "still $(db "SELECT value FROM task_prefs WHERE key='stall_first_seen_at';")"
+[[ "$(wc -l <"$PROBE_LOG")" == "1" ]] \
+  && ok_t "D1 the probe EARLY-EXITS on the first active agent (the common path costs one pane sample, not eleven)" \
+  || bad_t "D1 early exit" "probed: $(tr '\n' ',' <"$PROBE_LOG")"
+
+# --- D2: a genuinely idle fleet still alarms, and says what it measured.
+FLEET=$(mkfleet dev olivia); IDLE_MAP=""; arm
+_hb_stall_sweep >/dev/null 2>&1
+[[ "$(stallmsg)" == "1" ]] \
+  && ok_t "D2 a genuinely idle fleet STILL alarms (the fix must not silence the detector)" \
+  || bad_t "D2 idle fleet must alarm" "$(cat "$SEND_LOG")"
+grep -q 'probed 2 agent session(s): 2 idle' "$SEND_LOG" \
+  && ok_t "D2 the alarm NAMES what it checked (an alert that will not name its measurement reads like one that measured nothing)" \
+  || bad_t "D2 alarm must name its measurement" "$(cat "$SEND_LOG")"
+
+# --- D3: BLOCKED is not idle. It is the actual root in two recorded recurrences.
+FLEET=$(mkfleet dev olivia); IDLE_MAP="olivia:3"; arm
+_hb_stall_sweep >/dev/null 2>&1
+grep -q '1 BLOCKED (olivia)' "$SEND_LOG" \
+  && ok_t "D3 a BLOCKED agent is counted and NAMED, not bucketed with idle (frozen dialog does not self-clear)" \
+  || bad_t "D3 blocked must be named" "$(cat "$SEND_LOG")"
+
+# --- D4: UNMEASURABLE is a THIRD state. An uncapturable pane did not prove idleness.
+FLEET=$(mkfleet dev olivia); IDLE_MAP="olivia:2"; arm
+_hb_stall_sweep >/dev/null 2>&1
+grep -q 'UNMEASURABLE' "$SEND_LOG" && grep -q 'did not prove those idle' "$SEND_LOG" \
+  && ok_t "D4 an uncapturable pane reads UNMEASURABLE, never idle" \
+  || bad_t "D4 unmeasurable must not fold into idle" "$(cat "$SEND_LOG")"
+grep -q ': 1 idle' "$SEND_LOG" \
+  && ok_t "D4 ...and the idle COUNT excludes it (1 of 2, not 2 of 2)" \
+  || bad_t "D4 idle count must exclude the unmeasurable one" "$(cat "$SEND_LOG")"
+
+# --- D5: probe unavailable must still alarm, and must say the idleness is UNVERIFIED.
+# Fail-loud, not fail-silent: an unmeasurable probe cannot bless OR suppress.
+FLEET='{"agents":{}}'; IDLE_MAP=""; arm
+_hb_stall_sweep >/dev/null 2>&1
+[[ "$(stallmsg)" == "1" ]] && grep -q 'UNVERIFIED' "$SEND_LOG" \
+  && ok_t "D5 an unavailable probe still alarms and marks the idleness UNVERIFIED (never a silent pass)" \
+  || bad_t "D5 unavailable probe" "$(cat "$SEND_LOG")"
+
+# --- D6: a DELIVERED maker->verifier row is not 'stranded'. It is awaiting a grade,
+# it is on gap#2's clock already, and three of them padded the 2026-07-26 count.
+FLEET=$(mkfleet dev); IDLE_MAP=""
+reset_all
+d=$(addt --assignee=dev --verifier=olivia -- "delivered, awaiting the grade")
+( cmd_task_done "$d" ) >/dev/null 2>&1
+db "INSERT INTO task_prefs (key,value) VALUES ('stall_first_seen_at', datetime('now','-60 minutes'));"
+: >"$SEND_LOG"; : >"$PROBE_LOG"
+_hb_stall_sweep >/dev/null 2>&1
+[[ "$(stallmsg)" == "0" ]] \
+  && ok_t "D6 a delivered-awaiting-verifier row is NOT stranded actionable work (status=todo assigned to the VERIFIER)" \
+  || bad_t "D6 delivered row must not count as stranded" "$(cat "$SEND_LOG")"
+[[ "$(db "SELECT status||'/'||assignee FROM tasks WHERE id=${d};")" == "todo/olivia" ]] \
+  && ok_t "D6 ...and that row really is the todo/verifier shape the alarm used to miscount" \
+  || bad_t "D6 fixture shape" "got $(db "SELECT status||'/'||assignee FROM tasks WHERE id=${d};")"
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]
