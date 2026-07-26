@@ -34,6 +34,25 @@ jobs:
   # everyone to ignore red, and then a real failure reads as the usual noise.
   # This job seeds the host state that actually differs and reruns the same
   # suite, so that class reds in CI instead of only under an agent's nose.
+  # DIVE-2013: the suite above grades every harness on its EXIT STATUS, so a
+  # harness whose status is not wired to its own assertions is invisible to it —
+  # it prints FAIL and exits 0 and CI calls it green. That shipped for three
+  # consecutive releases (heartbeat_gate_shipped_unit.sh, 0.15.26-28). Static
+  # analysis cannot close it, so this job is EMPIRICAL: it injects a failure into
+  # each harness and demands the harness report it through $?.
+  #
+  # `needs: test` is load-bearing, not just ordering — it is what establishes the
+  # clean-green baseline, which lets this job skip its own clean run (halving it)
+  # WITHOUT becoming unsound. Run standalone (no --assume-clean) the script does
+  # the clean run itself, so it is never unsound locally either.
+  harness-verdict:
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+      - name: Every harness must be able to FAIL
+        run: bash tests/meta/harness-verdict-probe.sh --assume-clean
+
   test-installed-host:
     runs-on: ubuntu-latest
     steps:
