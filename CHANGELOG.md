@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.15.35 — docs(task): correct the `_task_gate_delivery_log` comment — the real shape is org-unreadable, not absent-from-org (DIVE-2006) (2026-07-26)
+
+Comment-only change, no behavior moves. The comment's "CORRECTION" paragraph (added
+for DIVE-1968/PR #170) retired the wrong "absent-from-org, 13 of 28" number but left
+no positive statement of what the real population or shape IS. DIVE-1988 re-derived
+the gate-delivery population from the full 1330-row union: 112 in-window rows on 85
+tasks — 11 error, 101 ok, 9 of the 11 later also `ok`. `absent-from-org` is zero
+instances; the real shape is **org-unreadable** (every agent's `access.json` is
+0600, unreadable to a peer). That shape has two distinct causes needing different
+fixes — the comment now keeps them separate: the filer itself has no channel
+(quinn, dev2, dev3 — seed a channel) vs. the filer's chain holds one nobody in that
+context may read (`main` -> `olivia` — pass the FILER name into a root-privileged
+probe). See `community/wiki/gate-delivery-telemetry-decontamination-dive1968.md`
+(DIVE-1988) for the full derivation.
+
 ## 0.15.34 — feat(task): `task set-body` — no verb could edit a task body after filing (DIVE-1920) (2026-07-26)
 
 `--body` was add-time only; the only remaining route to fix or extend a body afterward was a direct sqlite `UPDATE` on the shared `tasks.db`, which a scoped-sudo maker can't do and an admin correctly declines to do unilaterally. Hit three times in one night: a vague CONSIDER note that had to be respecified as a whole new task instead of rewritten in place, and two findings relayed over `agent send` instead of landing in the ticket they belonged to — the exact appending-is-not-compiling failure the wiki already names. For recurring TEMPLATES the cost is worse: a template filed with an empty body (DIVE-176) carries its instructions only in whoever remembers them.

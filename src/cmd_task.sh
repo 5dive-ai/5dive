@@ -4233,11 +4233,30 @@ _task_gate_delivery_log() { # <ok|error> <task_ids> <chat> <message_id> <detail>
   # PENDING-GATE WINDOW: a row is a real delivery attempt only if
   # need_asked_at <= ts < need_answered_at, because the notify path will not
   # re-fire an answered gate and cmd_task_gate_escalate refuses anything not
-  # pending. Under the window filter the post-DIVE-1927 population is ZERO genuine
-  # production rows: DIVE-1 and DIVE-1956 never had a gate at all, and STEER-1's 26
-  # rows all land six days AFTER its gate was answered while STEER-1 is named in two
-  # fixtures. So "the largest real shape is absent-from-org, 13 of 28" was the
-  # fixture population talking. The fence is right; only those numbers were wrong.
+  # pending. The fence is right; only PR #170's numbers and taxonomy were wrong.
+  #
+  # POSITIVE RESULT (DIVE-1988, re-derived on the full 1330-row union across all
+  # seven days, method cited beside every number because this dataset has now
+  # misled us four separate ways — see the wiki page linked below): the window
+  # filter gives 112 in-window rows on 85 tasks — 11 error, 101 ok. The 11 are one
+  # per task at filing time, and 9 of the 11 also carry a later `ok`. absent-from-org
+  # is ZERO instances, not "the largest real shape, 13 of 28" as PR #170 had it. The
+  # real shape is ORG-UNREADABLE: 10 of the 11 read "filing agent and org lead have
+  # no paired channel", 1 reads "no allowlisted DM or deliverable group topic", and
+  # every agent's access.json is 0600 — root can read it, a peer cannot.
+  #
+  # That shape has TWO causes and they take DIFFERENT fixes — do not collapse them:
+  #   (a) the filer itself has NO channel of its own at all (quinn, dev2, dev3 — 1
+  #       genuinely top-of-org, 2 with no access.json regardless): fix is SEED A
+  #       CHANNEL.
+  #   (b) the filer's OWN channel exists but its chain holds one nobody in that
+  #       context may read — main -> olivia, whose access.json is 600 under a 750
+  #       dir a peer can't even traverse, though root reads it fine: fix is PASS
+  #       THE FILER NAME into a root-privileged probe so it resolves the chain
+  #       with root's reach instead of the caller's.
+  # Only 1 of the 11 (quinn) is genuine top-of-org-with-no-channel; main alone is
+  # 8 of the 11, so the mass of the population is (b). Full derivation:
+  # community/wiki/gate-delivery-telemetry-decontamination-dive1968.md (DIVE-1988).
   #
   # That contamination is worse than noise, and in BOTH directions: it inflated the
   # apparent blast radius AND it hid the real residual inside it. It also
