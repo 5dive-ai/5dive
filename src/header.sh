@@ -228,7 +228,17 @@ declare -A TYPE_AUTH=(
 # so $HOME/.nvm and PATH resolve correctly. Empty string => no automated installer
 # (caller must hand-install). Idempotent: each recipe checks first.
 declare -A TYPE_INSTALL=(
-  [claude]="command -v claude >/dev/null || curl -fsSL https://claude.ai/install.sh | bash"
+  # Gate on the EXACT TYPE_BIN path, never `command -v claude` — DIVE-2075,
+  # reported by A-MO7SEN (github #196) and hit live during `5dive init` on a box
+  # carrying an old npm-global claude. `command -v` answers "is something named
+  # claude on PATH", which is a different question from "is the binary I am about
+  # to hand to the systemd unit present": the stray wins, the recipe no-ops in
+  # 0s, ~/.local/bin/claude is never created, and cmd_install fails with
+  # "install reported success but $bin still missing" — permanently, because the
+  # gate can never flip no matter how many times you retry. Same defect class as
+  # DIVE-2061 (`command -v 5dive` grading the installed CLI instead of the bundle
+  # under test). This is the question the codex comment below already prescribes.
+  [claude]="[[ -x /home/claude/.local/bin/claude ]] || curl -fsSL https://claude.ai/install.sh | bash"
   # Verify the EXACT TYPE_BIN path (not `command -v codex`): a stray
   # /usr/bin/codex from apt or a codex left over under a non-v24 nvm major
   # would short-circuit the install and surface as "install reported success
@@ -286,7 +296,11 @@ declare -A TYPE_INSTALL=(
   # 0s and the -x TYPE_BIN guard fails even though agy works. Same class as
   # grok's opportunistic-symlink gap below: ensure the TYPE_BIN symlink
   # ourselves instead of trusting where the binary happened to land.
-  [antigravity]="command -v agy >/dev/null || curl -fsSL https://antigravity.google/cli/install.sh | bash; [ -x /home/claude/.local/bin/agy ] || { mkdir -p /home/claude/.local/bin; p=\$(command -v agy 2>/dev/null || true); [ -n \"\$p\" ] && ln -sf \"\$p\" /home/claude/.local/bin/agy; }"
+  # DIVE-2075: the gate itself was still `command -v agy`, so a stray agy on PATH
+  # skipped the install and left us hoping the fallback could symlink something.
+  # Gate on TYPE_BIN; the trailing `command -v agy` stays, because there the
+  # question really is "where did the installer put it".
+  [antigravity]="[ -x /home/claude/.local/bin/agy ] || curl -fsSL https://antigravity.google/cli/install.sh | bash; [ -x /home/claude/.local/bin/agy ] || { mkdir -p /home/claude/.local/bin; p=\$(command -v agy 2>/dev/null || true); [ -n \"\$p\" ] && ln -sf \"\$p\" /home/claude/.local/bin/agy; }"
   # grok's installer drops the binary at ~/.grok/bin/grok but only creates the
   # ~/.local/bin/grok symlink *opportunistically* (its line 328 requires
   # ~/.local/bin already on PATH and ~/.grok/bin not on PATH). On a fresh VM
@@ -295,7 +309,10 @@ declare -A TYPE_INSTALL=(
   # symlink ourselves here rather than trusting the installer. We also drop the
   # installer's ~/.local/bin/agent symlink so it can't shadow future tooling.
   # The binary self-updates on launch; no daily-cron entry needed.
-  [grok]="command -v grok >/dev/null 2>&1 || curl -fsSL https://x.ai/cli/install.sh | bash; mkdir -p /home/claude/.local/bin; [ -e /home/claude/.grok/bin/grok ] && ln -sf /home/claude/.grok/bin/grok /home/claude/.local/bin/grok; rm -f /home/claude/.local/bin/agent"
+  # DIVE-2075: gate on TYPE_BIN, not `command -v grok` — a stray grok on PATH
+  # skipped the install, ~/.grok/bin/grok then did not exist so the symlink
+  # branch no-oped too, and the recipe still exited 0 via the trailing `rm -f`.
+  [grok]="[ -x /home/claude/.local/bin/grok ] || curl -fsSL https://x.ai/cli/install.sh | bash; mkdir -p /home/claude/.local/bin; [ -e /home/claude/.grok/bin/grok ] && ln -sf /home/claude/.grok/bin/grok /home/claude/.local/bin/grok; rm -f /home/claude/.local/bin/agent"
   # pi is a plain npm package. Install-on-demand like codex (nvm install 24 so the
   # global install lands in v24's bin dir even when the default alias drifted),
   # then symlink into ~/.local/bin like opencode/openclaw so TYPE_BIN[pi]
