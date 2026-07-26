@@ -1,5 +1,44 @@
 # Changelog
 
+## 0.16.7 — re-land DIVE-2058 with real isolation; usage_collect now REFUSES to read production transcripts from a fixture run (DIVE-2069) (2026-07-26)
+
+Re-lands dev2's TOP TASKS dispatch cross-check (DIVE-2058, backed out in 0.16.6 for
+reddening main) with the isolation defect that made it uid-dependent fixed at the root.
+
+**The bug under the bug.** `usage_collect` resolves an agent's transcript root via
+`home_of()`, which honours the `USAGE_HOME_ROOT` seam and otherwise falls back to
+`pwd.getpwnam("agent-"+name)`. The harness seeded fixtures under `$HOME`, so the two
+agreed only when it ran AS an `agent-*` user. Where that broke it did not fail — it fell
+back to the REAL agent homes and scored partial marks off the fleet's live transcripts
+(721 files under `/home/agent-dev` alone). Read-only, so nothing was corrupted, but
+"this harness passes" was partly a statement about production data, and that is
+unfalsifiable from inside the harness: a real transcript tree looks exactly like a
+well-seeded one.
+
+**Three named assertions were passing on production data**, and this is the concrete
+form of the finding rather than the hypothetical one. `dispatched` is a three-state —
+`false` means "pins were seen this pass and none was yours", `null` means "no pins seen
+at all, cannot say". The only `/goal` pin the fixtures seeded before the first read sits
+three days OUTSIDE the reporting window, so in a genuinely isolated tree `have_signal` is
+false and DIVE-90001 comes back `null`. The `dispatched=false` assertion and its two
+downstream rendering assertions were satisfiable only because the real homes supplied
+in-window pins. The harness now seeds its own in-window pin, so they mean something.
+
+**Fail closed, fenced on STORE IDENTITY.** `home_of()` now refuses the real-home fallback
+when the registry is not the production one, naming the remedy. Fenced on store identity
+rather than a test marker deliberately: NONE of the three harnesses calling `usage_collect`
+sets `FIVEDIVE_TEST`, so a marker-keyed guard would never have fired — including on the
+harness that had the bug. An opt-in fence is a fence you have to remember; store identity
+needs no env at all, so a harness that sets nothing is fenced by construction, including
+ones nobody has written yet (DIVE-1968's lesson, same shape). Production is unaffected:
+it reads the prod registry, so the fallback behaves exactly as before.
+
+Verified: the harness is now byte-identical in behaviour whoever runs it — 9/9 as
+`agent-dev` and 9/9 under a foreign `$HOME`, where it previously scored 6/2 by reading
+real homes. Guard proven by mutation: a fixture registry with no seam exits 1 with the
+refusal. `usage_coverage_unit` 11/11, `usage_presenter_coverage_unit` 26/26,
+`digest_autonomy` 8/8, `digest_mttu` 9/9, and `5dive usage` on the live box unchanged.
+
 ## 0.16.6 — revert: back out 0.16.5's usage dispatch cross-check (DIVE-2058) — its harness reads real fleet transcripts and reddened main (2026-07-26)
 
 Reverting my own merge, not dev2's analysis. `tests/usage_dispatch_flag_unit.sh` seeded fixtures under the real `$HOME` while `home_of()` resolves `pwd.getpwnam("agent-"+name)` with a synthetic `/home/agent-<name>` fallback. Those agree only where the running user IS an `agent-*` account. On CI (`runner`) they never meet: `probe_readable` reports `(readable, "nothing recorded")`, `.tasks` returns `[]`, and every assertion fails on an empty value.
