@@ -52,7 +52,7 @@ cat >"$TMP/bin/gh" <<'STUB'
 #!/usr/bin/env bash
 printf 'ARGS=%s\n' "$*" >>"$GH_ARGS_LOG"
 if [[ "$1" == "auth" && "$2" == "token" ]]; then printf '%s\n' "${GH_STUB_AUTH_TOKEN:-}"; [[ -n "${GH_STUB_AUTH_TOKEN:-}" ]] || exit 1; exit 0; fi
-a=("$@"); expr='.'; repo=""; i=0
+a=("$@"); expr='.'; repo=""; i=0; slice='.'
 while [[ $i -lt ${#a[@]} ]]; do
   case "${a[$i]}" in
     -q|--jq) expr="${a[$((i+1))]}"; i=$((i+2)) ;;
@@ -66,9 +66,22 @@ if [[ "$1" == "api" ]]; then
   path="$2"
   slug=$(printf '%s' "$path" | cut -d/ -f2,3)
   case "$path" in
-    */commits\?*)  # repos/<owner>/<repo>/commits?sha=<branch>&per_page=N
+    */commits\?*)  # repos/<owner>/<repo>/commits?sha=<branch>&per_page=N&page=K
       br="${path##*sha=}"; br="${br%%&*}"
-      fx="GH_STUB_COMMITS_$(key "${slug##*/}")_$(key "$br")" ;;
+      fx="GH_STUB_COMMITS_$(key "${slug##*/}")_$(key "$br")"
+      # THE STUB MODELS GITHUB'S per_page CLAMP, and that fidelity is the whole point
+      # of the DIVE-2120 arms. The real API caps per_page at 100 (olivia, measured
+      # live: 50->50 rows, 100->100, 200->100, 500->100), so a caller asking for 200
+      # gets a SHORT page for a reason that has nothing to do with history ending.
+      # A stub that honoured per_page literally would hand back 200 rows and no
+      # fixture could ever reproduce the bug — the harness would score the fix green
+      # against a world where the bug is impossible.
+      pp=30; case "$path" in *per_page=*) pp="${path##*per_page=}"; pp="${pp%%&*}" ;; esac
+      [[ "$pp" =~ ^[0-9]+$ ]] || pp=30
+      (( pp > 100 )) && pp=100                       # <- the clamp itself
+      pg=1; case "$path" in *"&page="*) pg="${path##*&page=}"; pg="${pg%%&*}" ;; esac
+      [[ "$pg" =~ ^[0-9]+$ && "$pg" -gt 0 ]] || pg=1
+      slice=".[$(( (pg-1)*pp )):$(( pg*pp ))]" ;;
     */compare/*)   # repos/<owner>/<repo>/compare/<base>...<head>
       cmp="${path##*/compare/}"; head="${cmp##*...}"
       fx="GH_STUB_CMP_$(key "${slug##*/}")_$(key "$head")" ;;
@@ -76,7 +89,7 @@ if [[ "$1" == "api" ]]; then
   esac
   json="${!fx:-}"
   [[ -n "$json" ]] || exit 1
-  printf '%s' "$json" | jq -r "$expr" 2>/dev/null; exit 0
+  printf '%s' "$json" | jq -c "$slice" 2>/dev/null | jq -r "$expr" 2>/dev/null; exit 0
 fi
 if [[ "$1" == "pr" && "$2" == "list" ]]; then
   lx="GH_STUB_PRLIST_$(key "${repo##*/}")"
@@ -130,6 +143,10 @@ clear_fx() { unset "${!GH_STUB_CMP_@}" "${!GH_STUB_PRLIST_@}" "${!GH_STUB_COMMIT
 # one that never existed. It now queries sha=main, so these stubs key on main, and only the
 # commit SUBJECT is matched (a whole-message match accepted incidental mentions).
 commits() { printf '[{"commit":{"message":"%s"}},{"commit":{"message":"chore: unrelated"}}]' "$1"; }
+# A history LONGER than one page. Every DIVE-2120 pagination arm needs a main whose
+# size is comparable to the real one (1000+ commits): the original defect is invisible
+# on any fixture that fits inside a single page, which is why every arm above missed it.
+many() { jq -cn --argjson n "$1" '[range(0;$n) | {commit:{message:("chore: filler " + (.|tostring))}}]'; }
 
 # GitHub's compare(base=main, head=branch) vocabulary: ahead_by counts commits the
 # HEAD has that main does not. 0 == the tip is an ancestor of main.
@@ -311,6 +328,81 @@ run_done ANC-9 --result='should NOT close on a body mention'
 [[ $RC -ne 0 && "$(statusof ANC-9)" != "done" ]] \
   && ok_t 'an ident named only in a commit BODY does not close (incidental mention != delivery)' \
   || bad_t 'body mention must not close' "rc=$RC status=$(statusof ANC-9) out=$OUT"
+
+# --- DIVE-2120 iter.2: A FULL PAGE IS NOT AN EXHAUSTED HISTORY -----------------
+# THE DEFECT olivia measured. The first cut asked for per_page=$n in ONE call and read
+# a short page as "history ran out". GitHub clamps per_page at 100, so at n=200 the
+# page was short for a reason unrelated to exhaustion: the scan saw 100 of main's
+# 1000+ commits and returned a GENUINE MISS, which fell through to the generic
+# "land the branch" refusal — the exact wrong advice this ticket was filed to kill.
+# Worse, the bound refusal's only documented remedy was "raise FIVE_GATE_ANCESTRY_SCAN",
+# i.e. the single input that triggers it. Someone whose work landed 150 commits ago
+# followed the instruction and ended up worse off than before the fix.
+# 300 commits, none naming the ident, bound 200: the scan must stop at its BOUND.
+clear_fx
+export GH_STUB_COMMITS_5dive_main="$(many 300)"
+: >"$GH_ARGS_LOG"
+seed ANC-10 'Branch: landed-long-ago'
+FIVE_GATE_ANCESTRY_SCAN=200 run_done ANC-10 --result='landed 250 commits back'
+slug=$(db "SELECT COALESCE(policy,'') FROM policy_refusals WHERE ident='ANC-10' ORDER BY rowid DESC LIMIT 1;")
+[[ $RC -ne 0 && "$slug" == "done-ident-not-found-within-scan-bound" ]] \
+  && ok_t 'n=200 over a 300-commit main is a BOUND-hit, not a miss (a clamped page is not an exhausted history)' \
+  || bad_t 'a full page must never read as exhaustion' "rc=$RC slug=[$slug] out=$OUT"
+# ...and the number in the message is what was WALKED. Reporting the CONFIGURED bound
+# was the lie inside the original defect: it claimed 200 having looked at 100.
+[[ "$OUT" == *"200 COMMITS WALKED"* ]] \
+  && ok_t 'the refusal reports the commits actually WALKED (200), not the number requested' \
+  || bad_t 'bound message must report the measurement' "out=$OUT"
+# ...and it must offer BOTH surviving explanations. A bound-hit cannot distinguish
+# "landed earlier" from "nothing ever named it", and advertising only the first sends
+# an empty-branch author off to raise a bound that can never help them.
+[[ "$OUT" == *"EMPTY branch"* && "$OUT" == *"FIVE_GATE_ANCESTRY_SCAN"* ]] \
+  && ok_t 'the bound refusal names BOTH live explanations, not just the one raising the bound fixes' \
+  || bad_t 'bound message must not present one hypothesis as the only one' "out=$OUT"
+
+# --- DIVE-2120 iter.2: THE SCAN ACTUALLY PAGINATES ------------------------------
+# What makes the refusal's advice TRUE. If n>100 did not paginate, "raise the bound"
+# would still be the instruction that converts an honest INCONCLUSIVE into a false
+# miss. Pin the request shape: a second page is fetched, and no request ever asks for
+# more than the API will give.
+grep -q 'per_page=100&page=2' "$GH_ARGS_LOG" \
+  && ok_t 'n>100 fetches page 2 — raising the bound really does walk further' \
+  || bad_t 'the scan must paginate past the clamp' "$(grep -c . "$GH_ARGS_LOG") gh calls, none for page 2"
+if grep -oE 'per_page=[0-9]+' "$GH_ARGS_LOG" | cut -d= -f2 | awk '$1>100{f=1} END{exit f?1:0}'; then
+  ok_t 'no request exceeds the 100 clamp, so a short page can only mean exhaustion'
+else
+  bad_t 'a request asked for more than the clamp' "$(grep -oE 'per_page=[0-9]+' "$GH_ARGS_LOG" | sort -u | tr '\n' ' ')"
+fi
+
+# --- DIVE-2120 iter.2: EXHAUSTION IS STILL DETECTABLE ABOVE THE CLAMP -----------
+# The mirror of ANC-10, and it is what keeps the fix from being "call everything
+# inconclusive". 150 commits with the bound at 200: page 2 comes back SHORT, which now
+# means what it says. This also revives DIVE-2101's anti-vacuity refusal, which
+# olivia found UNREACHABLE in production: at the default bound on a 1000+ commit main
+# the scan ALWAYS hit the bound, so _attr was never "0" and the arm never fired — it
+# passed only because every fixture here was smaller than one page. With exhaustion
+# detectable, an ancestor tip carrying nothing attributable is named as itself again.
+clear_fx
+export GH_STUB_CMP_5dive_dive_2120_empty_big="$ANCESTOR"
+export GH_STUB_COMMITS_5dive_main="$(many 150)"
+seed ANC-11 'Branch: dive-2120-empty-big'
+FIVE_GATE_ANCESTRY_SCAN=200 run_done ANC-11 --result='nothing was ever committed here'
+slug=$(db "SELECT COALESCE(policy,'') FROM policy_refusals WHERE ident='ANC-11' ORDER BY rowid DESC LIMIT 1;")
+[[ $RC -ne 0 && "$slug" == "done-on-vacuous-branch-ancestry" ]] \
+  && ok_t 'a history SHORTER than the bound still exhausts, so the anti-vacuity arm is reachable above one page' \
+  || bad_t 'exhaustion above the clamp must still be detectable' "rc=$RC slug=[$slug] out=$OUT"
+
+# --- DIVE-2120 iter.2: a hit on a LATER page still closes -----------------------
+# The acceptance path has to survive pagination too, or the fix trades a false miss
+# for a false refusal.
+clear_fx
+export GH_STUB_COMMITS_5dive_main="$(jq -cn --argjson f "$(many 120)" \
+  '$f + [{commit:{message:"task: the delivery (ANC-12)"}}] + $f')"
+seed ANC-12 'Branch: landed-on-page-two'
+FIVE_GATE_ANCESTRY_SCAN=300 run_done ANC-12 --result='landed, just not recently'
+[[ $RC -eq 0 && "$(statusof ANC-12)" == "done" ]] \
+  && ok_t 'a commit found on page 2 closes the task (pagination does not lose the acceptance)' \
+  || bad_t 'a later-page hit must close' "rc=$RC status=$(statusof ANC-12) out=$OUT"
 
 printf '\n%s passed, %s failed\n' "$PASS" "$FAIL"
 [[ $FAIL -eq 0 ]]

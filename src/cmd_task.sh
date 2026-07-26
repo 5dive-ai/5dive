@@ -1490,11 +1490,15 @@ _gate_branch_ident_on_main() {
   #
   # Returns: 1 = a commit on main names the ident
   #          0 = genuine miss (main's history was EXHAUSTED within the bound)
-  #      bound = not found, and the scan STOPPED AT THE BOUND — inconclusive, not a miss
+  # bound:<walked> = not found, and the scan STOPPED AT ITS BOUND after walking
+  #                  <walked> commits — inconclusive, not a miss. The number is the
+  #                  count actually WALKED, never the configured one: reporting the
+  #                  request as if it were the measurement is the whole bug below.
   #         "" = unreachable (no token, API down, timeout)
-  local slug="$1" tok="$3" ident="$4" main_br n out hits count
+  local slug="$1" tok="$3" ident="$4" main_br n per page walked out hits count
   main_br="${FIVE_GATE_MAIN_BRANCH:-main}"
   n="${FIVE_GATE_ANCESTRY_SCAN:-50}"
+  [[ "$n" =~ ^[0-9]+$ && "$n" -gt 0 ]] || n=50
   # SUBJECT LINE ONLY, not the whole message. Searching main widened the attribution
   # set: every commit reachable from a branch tip is on main, but not every commit on
   # main is reachable from that tip — so a whole-message match accepts INCIDENTAL
@@ -1503,21 +1507,45 @@ _gate_branch_ident_on_main() {
   # nothing for DIVE-2112. Our delivery commits put the ident in the SUBJECT
   # ("task: ... (DIVE-2112)"); prose references live in the body. Matching the subject
   # keeps the branch-deletion immunity without paying for it in a looser bar.
-  out=$(GH_TOKEN="$tok" timeout 10s gh api \
-        "repos/${slug}/commits?sha=${main_br}&per_page=${n}" \
-        -q "[ .[] | ((.commit.message // \"\") | split(\"\\n\")[0]) ] | [length, ([ .[]
-             | select(test(\"(^|[^A-Za-z0-9])${ident}([^A-Za-z0-9]|\$)\";\"i\")) ] | length)] | @tsv" \
-        2>/dev/null || true)
-  out="${out%%$'\n'*}"
-  count="${out%%$'\t'*}"; hits="${out##*$'\t'}"
-  [[ "$count" =~ ^[0-9]+$ && "$hits" =~ ^[0-9]+$ ]] || { printf ''; return 0; }
-  if [[ "$hits" -gt 0 ]]; then printf '1'; return 0; fi
-  # No hit. Whether that is a MISS or merely UNSEEN depends on why the scan stopped.
-  # A short page means main's history ran out inside the window, so the negative is
-  # real. A full page means we stopped counting, not that the work is absent — and a
-  # bounded search that reports its negative the way an exhaustive one would is
-  # asserting something it never measured (olivia, DIVE-2120).
-  if [[ "$count" -ge "$n" ]]; then printf 'bound'; else printf '0'; fi
+  #
+  # PAGINATED, and that is not an optimisation — it is the correctness fix.
+  # The first cut asked for per_page=$n in ONE call and inferred "history EXHAUSTED"
+  # from a short page. GitHub CLAMPS per_page at 100 (measured by olivia against the
+  # live API: 50->50 rows, 100->100, 200->100, 500->100), so at any n>100 the page
+  # came back short for a reason that has nothing to do with history running out: the
+  # scan saw 100 of main's 1000+ commits and returned "genuine miss". That fell
+  # through to the generic refusal telling the reader to LAND THE BRANCH — the exact
+  # wrong advice this ticket exists to kill — and the bound refusal's only documented
+  # remedy ("raise FIVE_GATE_ANCESTRY_SCAN") was the single input that triggered it.
+  # The remedy was worse than the disease.
+  #
+  # So: never request more than the clamp, and walk pages until the ident is found,
+  # history genuinely runs out, or n commits have actually been walked. The clamp was
+  # the only known cause of a short page that is not exhaustion, and asking for at
+  # most 100 removes it — a short page now means what the code says it means. This is
+  # also what makes the refusal's advice TRUE: raising the bound past 100 now walks
+  # further instead of silently converting an honest INCONCLUSIVE into a false miss.
+  walked=0; page=1
+  while (( walked < n )); do
+    per=$(( n - walked )); (( per > 100 )) && per=100
+    out=$(GH_TOKEN="$tok" timeout 10s gh api \
+          "repos/${slug}/commits?sha=${main_br}&per_page=${per}&page=${page}" \
+          -q "[ .[] | ((.commit.message // \"\") | split(\"\\n\")[0]) ] | [length, ([ .[]
+               | select(test(\"(^|[^A-Za-z0-9])${ident}([^A-Za-z0-9]|\$)\";\"i\")) ] | length)] | @tsv" \
+          2>/dev/null || true)
+    out="${out%%$'\n'*}"
+    count="${out%%$'\t'*}"; hits="${out##*$'\t'}"
+    [[ "$count" =~ ^[0-9]+$ && "$hits" =~ ^[0-9]+$ ]] || { printf ''; return 0; }
+    [[ "$hits" -gt 0 ]] && { printf '1'; return 0; }
+    walked=$(( walked + count ))
+    # A page SHORTER than the one asked for is the only honest evidence that main's
+    # history ran out inside the window, and it is honest evidence only because we
+    # never asked for more than the API will give.
+    (( count < per )) && { printf '0'; return 0; }
+    page=$(( page + 1 ))
+  done
+  # Stopped counting; did not run out. Report what was WALKED, not what was asked for.
+  printf 'bound:%s' "$walked"
 }
 
 _task_status_cmd() {
@@ -1780,7 +1808,7 @@ _task_status_cmd() {
         # BOTH halves — the tip is on main AND something reachable from it is
         # attributable to this ident (_gate_branch_ident_on_main). Neither half alone
         # closes anything.
-        local _slug _bmerged="" _searched="" _banc="" _anc="" _attr="" _anc_novac="" _attr_bound=""
+        local _slug _bmerged="" _searched="" _banc="" _anc="" _attr="" _anc_novac="" _attr_bound="" _attr_walked=""
         while IFS= read -r _slug; do
           [[ -n "$_slug" ]] || continue
           _searched="${_searched:+$_searched, }$_slug"
@@ -1792,7 +1820,10 @@ _task_status_cmd() {
           # guarded — an empty branch contributes no such commit.
           _attr=$(_gate_branch_ident_on_main "$_slug" "$_branch" "$_ghtok" "$ident")
           if [[ "$_attr" == "1" ]]; then _banc="$_slug"; break; fi
-          [[ "$_attr" == "bound" ]] && _attr_bound="$_slug"
+          # bound:<walked> — carry the MEASURED count into the refusal. The number in
+          # that message is the one thing a reader acts on, so it must be what the scan
+          # actually walked and not what it was configured to want.
+          [[ "$_attr" == bound:* ]] && { _attr_bound="$_slug"; _attr_walked="${_attr#bound:}"; }
           # Ancestry is kept ONLY to name the vacuous shape in the refusal; it can no longer
           # accept anything by itself (that was the DIVE-2101 bug).
           _anc=$(_gate_branch_ancestry "$_slug" "$_branch" "$_ghtok")
@@ -1811,7 +1842,7 @@ _task_status_cmd() {
           # a miss and must not read as one — a bounded search whose negative looks like an
           # exhaustive one asserts something it never measured. Own slug, so the durable
           # record says which of the two actually happened.
-          policy_refuse "$E_CONFLICT" done-ident-not-found-within-scan-bound DIVE-2120 "$ident" "$ident cannot close: NOT FOUND WITHIN THE LAST ${FIVE_GATE_ANCESTRY_SCAN:-50} COMMITS on ${FIVE_GATE_MAIN_BRANCH:-main} in $_attr_bound — INCONCLUSIVE, not a finding that the work is absent. The scan is bounded and stopped early; if this landed longer ago, raise it (FIVE_GATE_ANCESTRY_SCAN=<n>) and retry. A merged PR for '$_branch' also satisfies the gate. Attribution matches the ident in a commit SUBJECT, so a delivery whose subject omits $ident is not seen here."
+          policy_refuse "$E_CONFLICT" done-ident-not-found-within-scan-bound DIVE-2120 "$ident" "$ident cannot close: NOT FOUND IN THE $_attr_walked COMMITS WALKED on ${FIVE_GATE_MAIN_BRANCH:-main} in $_attr_bound — the scan stopped at its bound with main's history NOT exhausted, so this is INCONCLUSIVE, not a finding that the work is absent. TWO explanations survive and this scan cannot separate them: (a) the delivery landed more than $_attr_walked commits ago, or (b) nothing on main ever named $ident in a commit SUBJECT — which is what an EMPTY branch looks like, and a delivery whose subject omits the ident looks the same. For (a) raise the bound and retry (FIVE_GATE_ANCESTRY_SCAN=<n>, paginated since DIVE-2120, so n>100 really does walk n). For (b) land a commit whose SUBJECT names $ident (`5dive push $ident`) or bind the branch that carries it. A merged PR for '$_branch' also satisfies the gate."
         elif [[ -n "$_anc_novac" && -z "$_bmerged" ]]; then
           # The vacuous shape, named as itself: an ancestor tip carrying nothing
           # attributable is exactly what an EMPTY branch looks like, and a generic
