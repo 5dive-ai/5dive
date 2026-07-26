@@ -26,7 +26,7 @@ esac
 
 # Bumped on every public release. `build.sh` checks this line exists; CI fails
 # the bundle-drift check if it's missing or empty.
-readonly FIVE_VERSION="0.16.1"
+readonly FIVE_VERSION="0.16.2"
 
 # GitHub org our repos live under. The org is being renamed
 # 5dive-com -> 5dive-ai (2026-06); fetches must work on either side of the
@@ -40909,10 +40909,17 @@ SELFCHECK_HARNESS_SAMPLE="heartbeat_gate_shipped_unit.sh,gate_delivery_assertion
 # re-measure on an idle box before publishing a budget.
 
 _sc_probe_harness_verdicts() {
-  local root="${SELFCHECK_REPO_ROOT:-}"
-  [[ -n "$root" ]] || root=$(_sc_repo_root)
+  local root="${SELFCHECK_REPO_ROOT:-}" how="SELFCHECK_REPO_ROOT"
+  [[ -n "$root" ]] || { root=$(_sc_repo_root); how="resolved from cwd"; }
   [[ -n "$root" && -r "$root/tests/meta/harness-verdict-probe.sh" ]] \
     || { _sc_notreached "no-test-corpus" "no source checkout with tests/meta/harness-verdict-probe.sh is reachable from here (expected on an installed host; the pristine CI job reaches it)"; return; }
+  # DIVE-2061: NAME the corpus, and name HOW it was chosen. Resolution walks up from
+  # cwd, and this host carries ~10 5dive-cli-wt-* worktrees at assorted versions, so
+  # an operator standing in any of them silently got a verdict about a tree they were
+  # not thinking about. Same fix as probe 7's `[graded <path>]` — one run's output now
+  # shows which tree was measured instead of it taking two runs and a diff to notice.
+  local ncorpus; ncorpus=$(ls "$root"/tests/*.sh 2>/dev/null | wc -l)
+  local where="corpus $root ($ncorpus harnesses, $how)"
   local only="" scope="sample"
   if (( SELFCHECK_FULL )); then scope="full"; else only="--only=$SELFCHECK_HARNESS_SAMPLE"; fi
   (( SELFCHECK_ASSUME_CLEAN )) && only="$only --assume-clean"
@@ -40928,13 +40935,51 @@ _sc_probe_harness_verdicts() {
     | { if (( SELFCHECK_FULL )); then tee "$logf" >&2; else cat > "$logf"; fi; }
   rc=${PIPESTATUS[0]}
   out=$(cat "$logf"); rm -f "$logf"
-  local corpus
+  local corpus nwired
   corpus=$(grep -oE '[0-9]+ wired' <<<"$out" | head -1)
+  nwired=$(grep -oE '[0-9]+ wired' <<<"$out" | head -1 | grep -oE '^[0-9]+')
+  local scoped; scoped=$( ((SELFCHECK_FULL)) && echo 'tests/*.sh' || echo "$SELFCHECK_HARNESS_SAMPLE")
+
   if (( rc != 0 )); then
-    _sc_fail "harness-verdict-probe ($scope) exited $rc: $(grep -iE 'UNWIRED|UNPROBEABLE' <<<"$out" | head -3 | tr '\n' ' ')"
-  else
-    _sc_pass "mutation probe green over the $scope corpus [$( ((SELFCHECK_FULL)) && echo 'tests/*.sh' || echo "$SELFCHECK_HARNESS_SAMPLE")]${corpus:+ — $corpus}"
+    _sc_fail "harness-verdict-probe ($scope) exited $rc: $(grep -iE 'UNWIRED|UNPROBEABLE' <<<"$out" | head -3 | tr '\n' ' ') [$where]"
+    return
   fi
+
+  # DIVE-2061: ZERO PROBED IS NEVER A PASS. `0 wired, no failures` was read as "no
+  # failures found, therefore pass"; it means NOTHING WAS MEASURED. Found by main
+  # dogfooding the rolled 0.16.0: same binary, cwd a stale worktree, `0 wired` -> ok,
+  # rc 0. That is zero coverage folding into green — the exact rule this verb exists
+  # to enforce, broken inside it. And it was in one of the FOUR mutation-covered
+  # probes: the mutation varied the harness, never the CORPUS, so it always ran with
+  # a good one present. A dimension the mutation does not vary is not covered.
+  #
+  # `error`, not `fail`, and the distinction is load-bearing. The rail is not broken —
+  # the MEASUREMENT was misdirected. `fail` would accuse the harnesses of being
+  # unwired, which is a false accusation of exactly the kind DIVE-2018 warns is worse
+  # than a gap. `error` says the probe could not measure: it exits non-zero, it is
+  # counted apart from pass, and crucially the union does NOT count it as REACHED, so
+  # a zero-coverage run can no longer satisfy the union while proving nothing.
+  if [[ -z "$nwired" ]]; then
+    _sc_error "harness-verdict-probe ($scope) exited 0 but reported no wired count at all — its output shape changed and this probe can no longer read it [$where]"
+    return
+  fi
+  if (( nwired == 0 )); then
+    if (( ncorpus == 0 )); then
+      _sc_notreached "empty-corpus" "$root has tests/meta/harness-verdict-probe.sh but NO tests/*.sh to probe, so nothing could be measured [$where]"
+    else
+      local absent=""
+      if ! (( SELFCHECK_FULL )); then
+        local h
+        for h in ${SELFCHECK_HARNESS_SAMPLE//,/ }; do
+          [[ -e "$root/tests/$h" ]] || absent+="$h "
+        done
+      fi
+      _sc_error "probed ZERO harnesses and reported no failures — nothing was measured, so this is not a pass. The corpus has $ncorpus harnesses but none of the requested $scope set ran${absent:+; absent there: $absent}. selfcheck is grading the wrong tree, or the sample list has drifted. Set SELFCHECK_REPO_ROOT explicitly. [$where]"
+    fi
+    return
+  fi
+
+  _sc_pass "mutation probe green over the $scope corpus [$scoped] — $corpus [$where]"
 }
 
 # --- probe 5: bundle integrity ------------------------------------------------
@@ -40961,10 +41006,14 @@ _sc_repo_root() {
 _sc_probe_bundle_integrity() {
   command -v sha256sum >/dev/null 2>&1 \
     || { _sc_notreached "no-sha256sum" "sha256sum is not installed, so no checksum can be recomputed"; return; }
-  local root="${SELFCHECK_REPO_ROOT:-}"
-  [[ -n "$root" ]] || root=$(_sc_repo_root)
+  # DIVE-2061 shares this resolver, so it shares the hazard: cwd decides which of the
+  # box's ~10 worktrees gets graded. Name the tree in the verdict, same as probe 7's
+  # `[graded <path>]` — a probe that will not say what it measured cannot be checked.
+  local root="${SELFCHECK_REPO_ROOT:-}" how="SELFCHECK_REPO_ROOT"
+  [[ -n "$root" ]] || { root=$(_sc_repo_root); how="resolved from cwd"; }
   [[ -n "$root" && -r "$root/5dive" && -r "$root/5dive.sha256" ]] \
     || { _sc_notreached "no-bundle-checkout" "no source checkout carrying both ./5dive and ./5dive.sha256 is reachable from here (expected on an installed host)"; return; }
+  local where="tree $root ($how)"
 
   local want got
   want=$(tr -d '[:space:]' < "$root/5dive.sha256" | grep -oE '^[0-9a-f]{64}' || true)
@@ -40985,8 +41034,8 @@ _sc_probe_bundle_integrity() {
   fi
   [[ -n "$tmpb" ]] && rm -f "$tmpb"
 
-  if (( ${#bad[@]} )); then _sc_fail "$(printf '%s; ' "${bad[@]}")"
-  else _sc_pass "bundle, tracked checksum and src/ all agree (${got:0:12}…)"; fi
+  if (( ${#bad[@]} )); then _sc_fail "$(printf '%s; ' "${bad[@]}") [$where]"
+  else _sc_pass "bundle, tracked checksum and src/ all agree (${got:0:12}…) [$where]"; fi
 }
 
 # --- probe 6: snapshot rails --------------------------------------------------

@@ -112,6 +112,63 @@ mut_harness() {
 }
 assert_mutation harness-verdicts "a harness's exit status is stranded behind exit 0" mut_harness "UNWIRED"
 
+# ── rail 3b: the CORPUS is a dimension too (DIVE-2061) ───────────────────────
+# harness-verdicts was mutation-covered and STILL had a hole, because every mutation
+# above varies the HARNESS and none varied the CORPUS — it always ran with a good one
+# present. `0 wired, no failures` then read as pass, so a stale cwd graded nothing and
+# reported ok (found by main on the rolled 0.16.0: same binary, different cwd).
+#
+# The lesson is not "add this case"; it is that MUTATION COVERAGE IS PER-DIMENSION.
+# A probe reads several inputs — the artifact, the corpus, the actor, the environment —
+# and breaking one of them proves nothing about the others. "This probe is
+# mutation-covered" is not a property of the probe, it is a property of (probe, input).
+# The sample list is READ FROM THE BUNDLE UNDER TEST, never restated here. Two lists in
+# two places are one contract with two authors, and a drifted copy would delete the
+# wrong files and "prove" the probe sound (DIVE-2004's lesson, applied to a fixture).
+mut_corpus_missing_sample() {
+  local sample h n=0
+  sample=$(grep -m1 -oP '(?<=^SELFCHECK_HARNESS_SAMPLE=")[^"]+' "$WORK/5dive") || return 1
+  [[ -n "$sample" ]] || return 1
+  for h in ${sample//,/ }; do
+    [[ -e "$WORK/tests/$h" ]] && { rm -f "$WORK/tests/$h"; n=$((n+1)); }
+  done
+  # The mutation must have actually removed something, or this case would accuse a
+  # sound probe of asserting nothing — the audit-root trap from earlier in this file.
+  (( n > 0 ))
+}
+assert_mutation harness-verdicts "the corpus contains none of the sampled harnesses" \
+  mut_corpus_missing_sample "probed ZERO harnesses"
+
+# Zero probed must never read as pass, and the two zero-causes must not be conflated:
+# an EMPTY corpus is environmental (not-reached, exits 0 alone but never satisfies the
+# union), while a POPULATED corpus that yielded nothing means we graded the wrong tree
+# (error, exits non-zero). Collapsing them would either excuse a misdirected
+# measurement or falsely accuse an absent one.
+EMPTY="$TMP/emptycorpus"
+mkdir -p "$EMPTY/tests/meta"
+cp "$REPO/tests/meta/harness-verdict-probe.sh" "$EMPTY/tests/meta/" 2>/dev/null
+OUT=$(SELFCHECK_REPO_ROOT="$EMPTY" bash "$WORK/5dive" selfcheck --only=harness-verdicts 2>&1); RC=$?
+if grep -q 'NOT-REACHED' <<<"$OUT" && grep -q 'empty-corpus' <<<"$OUT"; then
+  ok_t "[harness-verdicts] an EMPTY corpus is not-reached (environmental), not a pass"
+else
+  fail_t "[harness-verdicts] empty corpus did not report not-reached/empty-corpus: $OUT"
+fi
+grep -q 'pass' <<<"$(sed -n '3p' <<<"$OUT")" && fail_t "[harness-verdicts] empty corpus read as pass" \
+  || ok_t "[harness-verdicts] empty corpus is never rendered as ok"
+
+# And the corpus must be NAMED — the fix that makes all of the above checkable from one
+# run instead of two runs and a diff. Same property probe 7 gained with [graded <path>].
+probe harness-verdicts
+if grep -q "corpus $WORK" <<<"$OUT"; then
+  ok_t "[harness-verdicts] names the corpus it graded, and how it was resolved"
+else
+  fail_t "[harness-verdicts] does not name the corpus: $(grep -o 'corpus [^]]*' <<<"$OUT")"
+fi
+probe bundle-integrity
+grep -q "tree $WORK" <<<"$OUT" \
+  && ok_t "[bundle-integrity] names the tree it graded (same resolver, same hazard)" \
+  || fail_t "[bundle-integrity] does not name the tree: $OUT"
+
 # ── rail 4: bundle integrity (cheap, and the same lesson) ────────────────────
 # A checksum that describes a different bundle is the DIVE-1977 two-cache-generations
 # state made local: the pair is self-consistent and neither half is the code.
