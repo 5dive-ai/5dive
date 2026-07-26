@@ -241,14 +241,20 @@ for name, turns in turns_by_agent.items():
 # nudge (a human/admin instructing an already-live session directly — real
 # and observed on this fleet), can legitimately carry zero in-window pins.
 # 'blocked' is exactly the opposite case and the one this ticket targets: a
-# blocked task is NOT supposed to be earning fresh legitimate tokens at all,
-# so an absent pin there is signal, not noise. (Verified against the live
-# fleet 2026-07-26: every currently-enrolled agent's heartbeat everyMin is
-# 5-30min and the hard-cap reaper force-closes in_progress at 3x that
-# (cmd_heartbeat.sh _HB_STALE_MULT) — well under the 24h default window —
-# so under heartbeat-only dispatch this case is near-empty today, but a
-# direct human/admin dispatch bypasses that path entirely and is not
-# provable false, hence the status carve-out rather than relying on timing.)
+# blocked task stays in the assignee's heartbeat rotation until
+# `task park --wake` (status alone does not remove it — see
+# community/wiki/gated-task-burns-no-park-lever.md), a confirmed mechanism by
+# which its open window keeps absorbing turns, so an absent pin there is
+# signal with a known cause, not noise. (INFERRED, not measured, from live
+# fleet config 2026-07-26 — flagging the distinction per olivia's review:
+# every currently-enrolled agent's heartbeat everyMin is 5-30min and the
+# hard-cap reaper force-closes in_progress at 3x that (cmd_heartbeat.sh
+# _HB_STALE_MULT) — well under the 24h default window — so under
+# heartbeat-only dispatch this case is near-empty today. That is a deduction
+# from config values, not an observation of zero false positives in
+# practice, and a direct human/admin dispatch bypasses the nudge path
+# entirely and is not provable false by timing regardless — hence the status
+# carve-out rather than relying on timing.)
 for a in wins:
     have_signal = bool(goal_pins.get(a))
     pinned_idents = goal_pins.get(a, set())
