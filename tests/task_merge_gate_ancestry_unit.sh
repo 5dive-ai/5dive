@@ -125,7 +125,10 @@ statusof() { db "SELECT status FROM tasks WHERE ident='$1';"; }
 refusals() { db "SELECT COUNT(*) FROM policy_refusals WHERE ident='$1';"; }
 run_done() { OUT=$(cmd_task_done "$@" 2>&1); RC=$?; }
 clear_fx() { unset "${!GH_STUB_CMP_@}" "${!GH_STUB_PRLIST_@}" "${!GH_STUB_COMMITS_@}" 2>/dev/null; }
-# Commits reachable from a branch tip, newest first, as the API returns them.
+# DIVE-2120: commits ON MAIN, newest first. Attribution used to query commits?sha=<branch>,
+# which 404s once the branch is deleted — making a merged-and-deleted branch identical to
+# one that never existed. It now queries sha=main, so these stubs key on main, and only the
+# commit SUBJECT is matched (a whole-message match accepted incidental mentions).
 commits() { printf '[{"commit":{"message":"%s"}},{"commit":{"message":"chore: unrelated"}}]' "$1"; }
 
 # GitHub's compare(base=main, head=branch) vocabulary: ahead_by counts commits the
@@ -138,7 +141,7 @@ MERGED_PR='[{"number":41,"mergedAt":"2026-07-26T09:00:00Z"}]'
 
 # --- 1. THE DIVE-2051 SHAPE: strict ancestor, no PR anywhere -> CLOSES ---------
 clear_fx; export GH_STUB_CMP_5dive_dive_2051_git_identity_guard="$ANCESTOR"
-export GH_STUB_COMMITS_5dive_dive_2051_git_identity_guard="$(commits 'fix(proof): refuse on unset identity (ANC-1)')"
+export GH_STUB_COMMITS_5dive_main="$(commits 'fix(proof): refuse on unset identity (ANC-1)')"
 seed ANC-1 'Branch: dive-2051-git-identity-guard'
 run_done ANC-1 --result='verified PASS, landed by delegated push'
 if [[ $RC -eq 0 && "$(statusof ANC-1)" == "done" && "$(refusals ANC-1)" == "0" ]]; then
@@ -152,7 +155,7 @@ fi
   || bad_t 'ancestry pass must be audible' "out=$OUT"
 # `identical` is the same fact (a tip that IS main) and must read the same way.
 clear_fx; export GH_STUB_CMP_5dive_dive_2051_tip="$IDENTICAL"
-export GH_STUB_COMMITS_5dive_dive_2051_tip="$(commits 'fix: landed (ANC-2)')"
+export GH_STUB_COMMITS_5dive_main="$(commits 'fix: landed (ANC-2)')"
 seed ANC-2 'Branch: dive-2051-tip'
 run_done ANC-2 --result='landed'
 [[ $RC -eq 0 && "$(statusof ANC-2)" == "done" ]] \
@@ -198,7 +201,7 @@ fi
 # there" — so acceptance needs attribution too.
 clear_fx
 export GH_STUB_CMP_5dive_dive_2101_empty="$ANCESTOR"          # tip IS on main...
-export GH_STUB_COMMITS_5dive_dive_2101_empty="$(commits 'chore(deps): bump something (DIVE-1)')"  # ...carrying nothing of ours
+export GH_STUB_COMMITS_5dive_main="$(commits 'chore(deps): bump something (DIVE-1)')"  # ...carrying nothing of ours
 seed VAC-1 'Branch: dive-2101-empty'
 run_done VAC-1 --result='nothing was ever committed here'
 if [[ $RC -ne 0 && "$(statusof VAC-1)" == "in_progress" && "$(refusals VAC-1)" == "1" ]]; then
@@ -221,7 +224,7 @@ run_done VAC-2 --result='unknowable'
 # ...and declining is SUBTRACTIVE only: it must not veto a perfectly good merged PR.
 clear_fx
 export GH_STUB_CMP_5dive_dive_2101_novac_with_pr="$ANCESTOR"
-export GH_STUB_COMMITS_5dive_dive_2101_novac_with_pr="$(commits 'chore: unrelated (DIVE-1)')"
+export GH_STUB_COMMITS_5dive_main="$(commits 'chore: unrelated (DIVE-1)')"
 export GH_STUB_PRLIST_5dive="$MERGED_PR"
 seed VAC-3 'Branch: dive-2101-novac-with-pr'
 run_done VAC-3 --result='merged by PR'
@@ -261,6 +264,53 @@ run_done NOB-1 --result='wrote it up'
 [[ $RC -eq 0 && "$(statusof NOB-1)" == "done" ]] \
   && ok_t 'a close with no binding at all is unaffected (zero regression)' \
   || bad_t 'no-binding close must be untouched' "rc=$RC status=$(statusof NOB-1) out=$OUT"
+
+# --- DIVE-2120: THE DELETED BRANCH ---------------------------------------------
+# Deleting a merged branch is routine hygiene (we deleted four the night DIVE-2101
+# shipped). Both old arms queried the API BY BRANCH NAME, so an absent ref 404s and a
+# merged-and-deleted branch became byte-identical to one that NEVER EXISTED — the task
+# then permanently un-closeable, with a refusal telling the reader to "land the branch"
+# for work already on main. No compare stub here AT ALL: that IS the deleted ref.
+clear_fx
+export GH_STUB_COMMITS_5dive_main="$(commits 'task: the fix (ANC-7)')"
+seed ANC-7 'Branch: deleted-after-merge'
+run_done ANC-7 --result='landed by delegated push; branch since deleted'
+[[ $RC -eq 0 && "$(statusof ANC-7)" == "done" ]] \
+  && ok_t 'a DELETED branch still closes — attribution is measured on main, not on the ref' \
+  || bad_t 'deleted branch must close' "rc=$RC status=$(statusof ANC-7) out=$OUT"
+
+# --- DIVE-2120: BOUND-HIT IS NOT A MISS ----------------------------------------
+# A bounded search whose negative reads like an exhaustive one asserts something it
+# never measured. Two commits with the bound forced to 2 means the scan STOPPED, it did
+# not exhaust main — so this must refuse under its OWN slug, not the generic one.
+clear_fx
+export GH_STUB_COMMITS_5dive_main="$(commits 'chore: something else entirely')"
+seed ANC-8 'Branch: some-branch'
+FIVE_GATE_ANCESTRY_SCAN=2 run_done ANC-8 --result='landed ages ago'
+slug=$(db "SELECT COALESCE(policy,'') FROM policy_refusals WHERE ident='ANC-8' ORDER BY rowid DESC LIMIT 1;")
+[[ $RC -ne 0 && "$slug" == "done-ident-not-found-within-scan-bound" ]] \
+  && ok_t 'a bound-hit refuses under its OWN slug, distinct from a genuine miss' \
+  || bad_t 'bound must be named as itself' "rc=$RC slug=[$slug] out=$OUT"
+[[ "$OUT" == *INCONCLUSIVE* ]] \
+  && ok_t 'the bound refusal says INCONCLUSIVE, not that the work is absent' \
+  || bad_t 'bound message must not read as a miss' "out=$OUT"
+
+# --- DIVE-2120: AN INCIDENTAL MENTION IS NOT A DELIVERY -------------------------
+# Searching main widened the attribution set: every commit reachable from a branch tip
+# is on main, but not every commit on main is reachable from that tip — so a
+# WHOLE-MESSAGE match accepts commits that merely REFERENCE the ident. Measured live
+# while building this: DIVE-2112 matched inside a 2-commit bound because the 0.16.20
+# RELEASE commit body names it, having delivered nothing for it. Only the SUBJECT is
+# matched. This arm exists because the first mutation run proved the tightening was
+# ungraded — every other fixture here is single-line, so subject == message and no
+# assertion could tell the two apart.
+clear_fx
+export GH_STUB_COMMITS_5dive_main='[{"commit":{"message":"release: assign the version four merges landed without\n\nsilently never receives ANC-9 or anything else"}},{"commit":{"message":"chore: unrelated"}}]'
+seed ANC-9 'Branch: mentioned-only'
+run_done ANC-9 --result='should NOT close on a body mention'
+[[ $RC -ne 0 && "$(statusof ANC-9)" != "done" ]] \
+  && ok_t 'an ident named only in a commit BODY does not close (incidental mention != delivery)' \
+  || bad_t 'body mention must not close' "rc=$RC status=$(statusof ANC-9) out=$OUT"
 
 printf '\n%s passed, %s failed\n' "$PASS" "$FAIL"
 [[ $FAIL -eq 0 ]]

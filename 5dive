@@ -19549,15 +19549,51 @@ _gate_branch_ancestry() {
 # through to the merged-PR search — this arm can only ever subtract an acceptance,
 # never add a refusal that DIVE-1830 did not already make. Read-only, bounded.
 _gate_branch_ident_on_main() {
-  local slug="$1" branch="$2" tok="$3" ident="$4" hits
-  hits=$(GH_TOKEN="$tok" timeout 10s gh api \
-        "repos/${slug}/commits?sha=${branch}&per_page=${FIVE_GATE_ANCESTRY_SCAN:-50}" \
-        -q "[ .[] | (.commit.message // \"\")
-             | select(test(\"(^|[^A-Za-z0-9])${ident}([^A-Za-z0-9]|\$)\";\"i\")) ] | length" \
+  # DIVE-2120: search MAIN, never the branch ref.
+  #
+  # The DIVE-2101 arms both queried the GitHub API BY BRANCH NAME
+  # (compare/main...<branch>, commits?sha=<branch>). Measured: against a ref absent
+  # from the remote both 404, so a MERGED-AND-DELETED branch returns byte-identical
+  # results to one that NEVER EXISTED — and deleting the branch on merge is routine
+  # hygiene we perform by default (four branches deleted the night DIVE-2101 shipped).
+  # The task then became permanently un-closeable on this path, and the refusal told
+  # the reader to "land the branch", which is wrong advice for work already on main.
+  #
+  # Searching main directly removes the dependency instead of repairing it, and it
+  # makes the VACUITY case structurally impossible rather than separately guarded: an
+  # empty branch contributes no commit naming the ident TO MAIN, so there is nothing
+  # to mistake for delivery. It also works retroactively on every existing binding.
+  #
+  # Returns: 1 = a commit on main names the ident
+  #          0 = genuine miss (main's history was EXHAUSTED within the bound)
+  #      bound = not found, and the scan STOPPED AT THE BOUND — inconclusive, not a miss
+  #         "" = unreachable (no token, API down, timeout)
+  local slug="$1" tok="$3" ident="$4" main_br n out hits count
+  main_br="${FIVE_GATE_MAIN_BRANCH:-main}"
+  n="${FIVE_GATE_ANCESTRY_SCAN:-50}"
+  # SUBJECT LINE ONLY, not the whole message. Searching main widened the attribution
+  # set: every commit reachable from a branch tip is on main, but not every commit on
+  # main is reachable from that tip — so a whole-message match accepts INCIDENTAL
+  # mentions. Measured while building this: DIVE-2112 matched inside a 2-commit bound
+  # because the 0.16.20 RELEASE commit's body happens to name it. That commit delivered
+  # nothing for DIVE-2112. Our delivery commits put the ident in the SUBJECT
+  # ("task: ... (DIVE-2112)"); prose references live in the body. Matching the subject
+  # keeps the branch-deletion immunity without paying for it in a looser bar.
+  out=$(GH_TOKEN="$tok" timeout 10s gh api \
+        "repos/${slug}/commits?sha=${main_br}&per_page=${n}" \
+        -q "[ .[] | ((.commit.message // \"\") | split(\"\\n\")[0]) ] | [length, ([ .[]
+             | select(test(\"(^|[^A-Za-z0-9])${ident}([^A-Za-z0-9]|\$)\";\"i\")) ] | length)] | @tsv" \
         2>/dev/null || true)
-  hits="${hits%%$'\n'*}"
-  [[ "$hits" =~ ^[0-9]+$ ]] || { printf ''; return 0; }
-  [[ "$hits" -gt 0 ]] && printf '1' || printf '0'
+  out="${out%%$'\n'*}"
+  count="${out%%$'\t'*}"; hits="${out##*$'\t'}"
+  [[ "$count" =~ ^[0-9]+$ && "$hits" =~ ^[0-9]+$ ]] || { printf ''; return 0; }
+  if [[ "$hits" -gt 0 ]]; then printf '1'; return 0; fi
+  # No hit. Whether that is a MISS or merely UNSEEN depends on why the scan stopped.
+  # A short page means main's history ran out inside the window, so the negative is
+  # real. A full page means we stopped counting, not that the work is absent — and a
+  # bounded search that reports its negative the way an exhaustive one would is
+  # asserting something it never measured (olivia, DIVE-2120).
+  if [[ "$count" -ge "$n" ]]; then printf 'bound'; else printf '0'; fi
 }
 
 _task_status_cmd() {
@@ -19820,16 +19856,23 @@ _task_status_cmd() {
         # BOTH halves — the tip is on main AND something reachable from it is
         # attributable to this ident (_gate_branch_ident_on_main). Neither half alone
         # closes anything.
-        local _slug _bmerged="" _searched="" _banc="" _anc="" _attr="" _anc_novac=""
+        local _slug _bmerged="" _searched="" _banc="" _anc="" _attr="" _anc_novac="" _attr_bound=""
         while IFS= read -r _slug; do
           [[ -n "$_slug" ]] || continue
           _searched="${_searched:+$_searched, }$_slug"
+          # DIVE-2120: attribution is measured against MAIN now, so it no longer depends on
+          # the branch ref existing — a merged-and-DELETED branch was byte-identical to one
+          # that never existed. Acceptance is the attribution alone: a commit ON MAIN whose
+          # SUBJECT names the ident IS work on main, which is the property ancestry existed
+          # to establish. Vacuity becomes structurally impossible rather than separately
+          # guarded — an empty branch contributes no such commit.
+          _attr=$(_gate_branch_ident_on_main "$_slug" "$_branch" "$_ghtok" "$ident")
+          if [[ "$_attr" == "1" ]]; then _banc="$_slug"; break; fi
+          [[ "$_attr" == "bound" ]] && _attr_bound="$_slug"
+          # Ancestry is kept ONLY to name the vacuous shape in the refusal; it can no longer
+          # accept anything by itself (that was the DIVE-2101 bug).
           _anc=$(_gate_branch_ancestry "$_slug" "$_branch" "$_ghtok")
-          if [[ "$_anc" == "1" ]]; then
-            _attr=$(_gate_branch_ident_on_main "$_slug" "$_branch" "$_ghtok" "$ident")
-            [[ "$_attr" == "1" ]] && { _banc="$_slug"; break; }
-            _anc_novac="$_slug"
-          fi
+          [[ "$_anc" == "1" && "$_attr" == "0" ]] && _anc_novac="$_slug"
           _bmerged=$(GH_TOKEN="$_ghtok" gh pr list --repo "$_slug" --head "$_branch" --state merged --json number,mergedAt -q '.[0].mergedAt' 2>/dev/null || echo "")
           [[ -n "$_bmerged" && "$_bmerged" != "null" ]] && break
           _bmerged=""
@@ -19839,6 +19882,12 @@ _task_status_cmd() {
           # passed on a merged PR are different records, and the reader of the record
           # months later cannot tell them apart from a clean exit (DIVE-1869 rule).
           warn "$ident: branch '$_branch' is an ANCESTOR of ${FIVE_GATE_MAIN_BRANCH:-main} in $_banc — its commits are all on main (no PR needed; delegated push, DIVE-2101). done=merged-to-main satisfied."
+        elif [[ -n "$_attr_bound" && -z "$_bmerged" ]]; then
+          # DIVE-2120: the scan stopped AT THE BOUND without finding the ident. That is NOT
+          # a miss and must not read as one — a bounded search whose negative looks like an
+          # exhaustive one asserts something it never measured. Own slug, so the durable
+          # record says which of the two actually happened.
+          policy_refuse "$E_CONFLICT" done-ident-not-found-within-scan-bound DIVE-2120 "$ident" "$ident cannot close: NOT FOUND WITHIN THE LAST ${FIVE_GATE_ANCESTRY_SCAN:-50} COMMITS on ${FIVE_GATE_MAIN_BRANCH:-main} in $_attr_bound — INCONCLUSIVE, not a finding that the work is absent. The scan is bounded and stopped early; if this landed longer ago, raise it (FIVE_GATE_ANCESTRY_SCAN=<n>) and retry. A merged PR for '$_branch' also satisfies the gate. Attribution matches the ident in a commit SUBJECT, so a delivery whose subject omits $ident is not seen here."
         elif [[ -n "$_anc_novac" && -z "$_bmerged" ]]; then
           # The vacuous shape, named as itself: an ancestor tip carrying nothing
           # attributable is exactly what an EMPTY branch looks like, and a generic
