@@ -41,6 +41,42 @@ export NVM_DIR="/home/claude/.nvm"
 # shellcheck disable=SC1091
 [[ -s "$NVM_DIR/nvm.sh" ]] && . "$NVM_DIR/nvm.sh" || true
 
+# DIVE-1263: the opencode/pi telegram bridges are launched via `bun`, but our
+# installers drop bun in DIFFERENT places depending on the path taken:
+#   /usr/local/bin/bun          — ensure_bun_for_agent (BUN_INSTALL=/usr/local; managed boxes + `doctor --repair`)
+#   /home/claude/.bun/bin/bun   — install.sh's `bun.sh/install` default (BUN_INSTALL=$HOME/.bun)
+#   /home/claude/.local/bin/bun — legacy hardcode / older provisioning
+# The old code hardcoded ONLY ~claude/.local/bin/bun, so on a fresh install.sh
+# host (bun at ~claude/.bun/bin/bun) the bridge exit-3'd → systemd crash-loop
+# (lodar saw a restart counter of 132). Resolve across all install locations,
+# falling back to whatever is on PATH.
+resolve_bun() {
+  local c
+  for c in /usr/local/bin/bun /home/claude/.bun/bin/bun /home/claude/.local/bin/bun; do
+    [[ -x "$c" ]] && { printf '%s\n' "$c"; return 0; }
+  done
+  command -v bun 2>/dev/null && return 0
+  return 1
+}
+
+# OpenClaw is an npm launcher with `#!/usr/bin/env node`, but systemd does not
+# inherit claude's interactive nvm PATH. Prefer the stable link installed by
+# 5dive, then nvm's resolved Node 24, then any compatible on-disk Node 24. This
+# also keeps older boxes working before their next `agent install --upgrade`.
+resolve_openclaw_node() {
+  local c
+  if declare -F nvm >/dev/null 2>&1; then
+    c="$(nvm which 24 2>/dev/null || true)"
+    [[ -n "$c" && -x "$c" ]] && { printf '%s\n' "$c"; return 0; }
+  fi
+  [[ -x /home/claude/.local/bin/node ]] \
+    && { printf '%s\n' /home/claude/.local/bin/node; return 0; }
+  for c in /home/claude/.nvm/versions/node/v24.*/bin/node; do
+    [[ -x "$c" ]] && { printf '%s\n' "$c"; return 0; }
+  done
+  return 1
+}
+
 
 # openclaw splits "the agent that runs and answers chat messages"
 # (`openclaw gateway run`) from "the local TUI for talking to that
@@ -52,11 +88,19 @@ export NVM_DIR="/home/claude/.nvm"
 # the case (only `none|""` runs chat) so any future channel type added
 # via valid_channel automatically routes to the gateway without
 # requiring a parallel update here.
+OPENCLAW_PATH_OVERRIDE=""
 case "$TYPE" in
   claude)   BIN="/home/claude/.local/bin/claude"; ARGS=(--dangerously-skip-permissions) ;;
   hermes)   BIN="/home/claude/.local/bin/hermes"; ARGS=() ;;
   openclaw)
     BIN="/home/claude/.local/bin/openclaw"
+    OPENCLAW_NODE_BIN="$(resolve_openclaw_node)" \
+      || { echo "node not found for openclaw (need Node 24; run: 5dive agent install openclaw --upgrade)" >&2; exit 3; }
+    OPENCLAW_NODE_DIR="${OPENCLAW_NODE_BIN%/*}"
+    export PATH="${OPENCLAW_NODE_DIR}:/home/claude/.local/bin:${PATH}"
+    # tmux starts a fresh login shell, whose startup files may replace PATH.
+    # Re-assert the resolved Node directory inside that shell before exec.
+    OPENCLAW_PATH_OVERRIDE="export PATH=$(printf %q "$OPENCLAW_NODE_DIR"):/home/claude/.local/bin:\$PATH; "
     case "$CHANNELS" in
       none|"") ARGS=(chat) ;;
       *)       ARGS=(gateway run) ;;
@@ -83,10 +127,36 @@ case "$TYPE" in
       done
       [[ -n "$OPENCODE_PLUGIN_DIR" ]] \
         || { echo "telegram-opencode plugin not found (set TELEGRAM_OPENCODE_PLUGIN_DIR or deploy it)" >&2; exit 3; }
-      BIN="/home/claude/.local/bin/bun"
+      BIN="$(resolve_bun)" \
+        || { echo "bun not found (looked in /usr/local/bin, ~claude/.bun/bin, ~claude/.local/bin, PATH) — install bun or run '5dive doctor --repair'" >&2; exit 3; }
       ARGS=(run --cwd "$OPENCODE_PLUGIN_DIR" --shell=bun --silent start)
     else
       BIN="/home/claude/.local/bin/opencode"; ARGS=()
+    fi ;;
+  pi)
+    # pi (earendil-works/pi) is EXTENSION-based (DIVE-1198 SPIKE): no MCP/hooks
+    # config surface, so its telegram bridge is a STANDALONE RELAY (telegram-pi/
+    # server.ts) — the same run-model as opencode, distinct from claude
+    # (--channels flag) and codex/grok/agy (MCP wired into config). The relay IS
+    # the agent's main process and hosts pi via pi's extension API, so for
+    # channels=telegram we launch it via bun (`bun run --cwd <plugin> ... start`)
+    # instead of the pi TUI. PI_BIN + PI_PROJECT_DIR are exported via
+    # PI_OVERRIDE below. Resolver kept in sync with pi_plugin_dir() in
+    # agent_setup.sh (the boot script is standalone, so it's duplicated).
+    if [[ "$CHANNELS" == "telegram" ]]; then
+      PI_PLUGIN_DIR=""
+      for _c in "${TELEGRAM_PI_PLUGIN_DIR:-}" \
+                /usr/local/lib/5dive/telegram-pi \
+                /home/claude/projects/5dive/5dive-plugins/plugins/telegram-pi; do
+        [[ -n "$_c" && -f "$_c/server.ts" ]] && { PI_PLUGIN_DIR="$_c"; break; }
+      done
+      [[ -n "$PI_PLUGIN_DIR" ]] \
+        || { echo "telegram-pi plugin not found (set TELEGRAM_PI_PLUGIN_DIR or deploy it)" >&2; exit 3; }
+      BIN="$(resolve_bun)" \
+        || { echo "bun not found (looked in /usr/local/bin, ~claude/.bun/bin, ~claude/.local/bin, PATH) — install bun or run '5dive doctor --repair'" >&2; exit 3; }
+      ARGS=(run --cwd "$PI_PLUGIN_DIR" --shell=bun --silent start)
+    else
+      BIN="/home/claude/.local/bin/pi"; ARGS=()
     fi ;;
   # antigravity ships as `agy` (Google's native-Go gemini-cli successor). The
   # type id stays "antigravity" everywhere (agents.d/<name>.env, TYPE_BIN,
@@ -137,6 +207,9 @@ case "$CH" in
       # channel + token from ~/.opencode/channels/telegram state, not argv — so
       # no --channels flag is appended here.
       opencode) : ;;
+      # pi's relay (launched via bun in the type-dispatch above) likewise reads
+      # its channel + token from ~/.pi/channels/telegram state, not argv.
+      pi) : ;;
     esac ;;
   discord)
     case "$TYPE" in
@@ -184,13 +257,47 @@ OPENCODE_OVERRIDE=""
 if [[ "$TYPE" == "opencode" && "$CHANNELS" == "telegram" ]]; then
   OPENCODE_OVERRIDE="export OPENCODE_BIN=$(printf %q "/home/claude/.local/bin/opencode") OPENCODE_PROJECT_DIR=$(printf %q "$WORKDIR"); "
 fi
+# pi+telegram relay env (see the pi case in the type-dispatch). The relay hosts
+# pi via its extension API and needs PI_BIN (abs path — agent users skip
+# .bashrc, so a bare `pi` wouldn't resolve) and should treat the agent's WORKDIR
+# as its project dir (else it defaults to the plugin dir, which is the bun
+# --cwd). Mirrors OPENCODE_OVERRIDE.
+PI_OVERRIDE=""
+if [[ "$TYPE" == "pi" && "$CHANNELS" == "telegram" ]]; then
+  PI_OVERRIDE="export PI_BIN=$(printf %q "/home/claude/.local/bin/pi") PI_PROJECT_DIR=$(printf %q "$WORKDIR"); "
+fi
 if [[ "$TYPE" == "codex" ]]; then
   AGENT_CODEX_HOME="$HOME/.codex"
   install -d -m 700 "$AGENT_CODEX_HOME"
   SHARED_AUTH="${PROFILE_STATE_DIR:+$PROFILE_STATE_DIR/auth.json}"
-  SHARED_AUTH="${SHARED_AUTH:-/home/claude/.codex/auth.json}"
+  # DIVE-1322: no bound profile → read the canonical shared codex profile
+  # (/var/lib/5dive/auth-profiles/codex/codex/auth.json) DIRECTLY rather than
+  # /home/claude/.codex/auth.json. The latter is a convenience symlink that is
+  # (re)created lazily at codex-login time, so a codex agent booting before it
+  # exists found no source, failed to seed, and codex then minted a bogus
+  # apikey auth.json from a stray OPENAI_API_KEY env var (401, silently deaf).
+  # The profile file is provisioned at host setup and is stable. Keep the
+  # symlink as a legacy fallback for a box whose canonical profile is unpopulated.
+  if [[ -z "$SHARED_AUTH" ]]; then
+    SHARED_AUTH="/var/lib/5dive/auth-profiles/codex/codex/auth.json"
+    { [[ -e "$SHARED_AUTH" ]] || sudo -n test -e "$SHARED_AUTH" 2>/dev/null; } \
+      || SHARED_AUTH="/home/claude/.codex/auth.json"
+  fi
   LOCAL_AUTH="$AGENT_CODEX_HOME/auth.json"
-  if [[ -e "$SHARED_AUTH" ]] && { [[ ! -f "$LOCAL_AUTH" ]] || [[ "$SHARED_AUTH" -nt "$LOCAL_AUTH" ]]; }; then
+  # DIVE-1322: re-seed when codex has already written a bad apikey auth.json
+  # while the shared source is a valid chatgpt-oauth credential. Without this,
+  # the mtime check below never fires (the local file isn't older), so a
+  # once-deaf agent stayed deaf across restarts — and `config set
+  # auth-profile=codex` + restart never re-seeded the credential either.
+  RESEED_BAD_LOCAL=0
+  if [[ -f "$LOCAL_AUTH" ]] \
+     && { grep -q '"auth_mode"[[:space:]]*:[[:space:]]*"apikey"' "$LOCAL_AUTH" 2>/dev/null \
+          || ! grep -q '"auth_mode"[[:space:]]*:[[:space:]]*"chatgpt"' "$LOCAL_AUTH" 2>/dev/null; } \
+     && { grep -q '"auth_mode"[[:space:]]*:[[:space:]]*"chatgpt"' "$SHARED_AUTH" 2>/dev/null \
+          || sudo -n grep -q '"auth_mode"[[:space:]]*:[[:space:]]*"chatgpt"' "$SHARED_AUTH" 2>/dev/null; }; then
+    RESEED_BAD_LOCAL=1
+  fi
+  if [[ -e "$SHARED_AUTH" ]] && { [[ ! -f "$LOCAL_AUTH" ]] || [[ "$SHARED_AUTH" -nt "$LOCAL_AUTH" ]] || (( RESEED_BAD_LOCAL )); }; then
     TMP="$(mktemp -p "$AGENT_CODEX_HOME" .auth.XXXXXX)"
     # DIVE-1188: standard-isolation agents have NO passwordless sudo, so the old
     # `sudo -n cat` bailed and the agent booted unauthenticated. The profile
@@ -441,23 +548,31 @@ if [[ "$TYPE" == "hermes" ]]; then
   # silently lose the user's BYO provider choice. The profile dir's
   # config.yaml is authoritative for model/provider; any drift in LOCAL just
   # means hermes wrote a fresh default that needs to be overridden.
+  # DIVE-1394: standard-isolation agents have NO passwordless sudo, so the
+  # old sudo-only test/cmp/cat bailed for every default (non-admin) hermes
+  # agent — the seed silently no-op'd and the agent booted with no provider,
+  # dropping straight into the Nous "hermes setup" wizard. Mirror the codex/
+  # grok DIVE-1188 fix: try a plain read first (the shared file is normalized
+  # 0640 g=claude and every agent is in group claude, so a group read works
+  # over the 2750/0775 g=claude dir) and only fall back to `sudo -n` for a
+  # not-yet-normalized 0600 file on an admin agent.
   seed_one() {
     local f="$1" mode="$2"  # mode: mtime | content
     local SHARED="$SHARED_HERMES_DIR/$f"
     local LOCAL="$AGENT_HERMES_HOME/$f"
-    sudo -n test -e "$SHARED" || return 0
+    { [[ -e "$SHARED" ]] || sudo -n test -e "$SHARED" 2>/dev/null; } || return 0
     local stale=0
     if [[ ! -f "$LOCAL" ]]; then
       stale=1
     elif [[ "$mode" == "content" ]]; then
-      sudo -n cmp -s "$SHARED" "$LOCAL" 2>/dev/null || stale=1
+      { cmp -s "$SHARED" "$LOCAL" 2>/dev/null || sudo -n cmp -s "$SHARED" "$LOCAL" 2>/dev/null; } || stale=1
     else
-      sudo -n test "$SHARED" -nt "$LOCAL" && stale=1
+      { [[ "$SHARED" -nt "$LOCAL" ]] 2>/dev/null || sudo -n test "$SHARED" -nt "$LOCAL" 2>/dev/null; } && stale=1
     fi
     (( stale )) || return 0
     local TMP
     TMP="$(mktemp -p "$AGENT_HERMES_HOME" ".${f}.XXXXXX")"
-    if sudo -n cat "$SHARED" > "$TMP" 2>/dev/null; then
+    if { cat "$SHARED" 2>/dev/null || sudo -n cat "$SHARED" 2>/dev/null; } > "$TMP" && [[ -s "$TMP" ]]; then
       chmod 600 "$TMP"
       mv "$TMP" "$LOCAL"
       hermes_seeded=1
@@ -883,19 +998,70 @@ if [[ "$CHANNELS" == *telegram* && "$TYPE" != "claude" ]]; then
   unset _tg_state _tg_env _tg_tmp 2>/dev/null || :
 fi
 
+# DIVE-1769: gate the FIRST claude launch on auth creds being wired. systemd
+# reads the EnvironmentFile=s (anthropic.env, then %i-auth.env last-wins) exactly
+# once, at unit activation. On a brand-new agent's very first boot the unit can
+# start BEFORE the provisioning step has written the OAuth token into those files
+# — so claude launches unauthenticated and the first thing the owner sees is an
+# alarming "Sign-in to Claude Code expired / auth_required / exit 6". It self-
+# heals on the follow-up restart once creds land, but the transient error should
+# never surface. Fix: before the first launch, wait (bounded) for this agent's
+# credential to appear on disk, then re-export the auth files into our env —
+# systemd won't re-read them, so a token that lands after unit-start is otherwise
+# invisible to the claude we exec. Re-export is unconditional (covers the race
+# where the file populates between unit-start and now) and idempotent, replaying
+# the unit's EnvironmentFile ordering (shared default first, profile override
+# last) so the profiled agent keeps its own account. On timeout we launch anyway
+# — no worse than the pre-fix self-heal-via-restart path.
+if [[ "$TYPE" == "claude" ]]; then
+  # The file that must carry THIS agent's identity: the profile combined.env when
+  # a profile is bound (its token wins), else the shared anthropic.env.
+  if [[ -n "$PROFILE" ]]; then
+    _primary_auth="/var/lib/5dive/agents.d/${NAME}-auth.env"
+  else
+    _primary_auth="/etc/5dive/connectors/anthropic.env"
+  fi
+  # A non-empty value for any of these three keys = usable claude credential
+  # (OAuth token, API key, or BYO ANTHROPIC_AUTH_TOKEN).
+  _creds_re='^(CLAUDE_CODE_OAUTH_TOKEN|ANTHROPIC_API_KEY|ANTHROPIC_AUTH_TOKEN)=.+'
+  _deadline=$(( SECONDS + ${CLAUDE_AUTH_WAIT_SECS:-45} ))
+  _waited=0
+  until grep -qE "$_creds_re" "$_primary_auth" 2>/dev/null; do
+    (( SECONDS >= _deadline )) && break
+    _waited=1
+    sleep 1
+  done
+  if grep -qE "$_creds_re" "$_primary_auth" 2>/dev/null; then
+    # Re-export from disk so the exec'd claude sees the creds systemd read too
+    # early (or not at all). Files are systemd EnvironmentFile format: literal
+    # KEY=value per line, no shell expansion, unquoted — split on the first '='.
+    for _af in "/etc/5dive/connectors/anthropic.env" "${PROFILE:+/var/lib/5dive/agents.d/${NAME}-auth.env}"; do
+      [[ -n "$_af" && -r "$_af" ]] || continue
+      while IFS= read -r _line || [[ -n "$_line" ]]; do
+        [[ "$_line" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]] || continue
+        export "${_line%%=*}=${_line#*=}"
+      done < "$_af"
+    done
+    [[ "$_waited" == 1 ]] && echo "[5dive] agent=${NAME} claude creds landed during first-boot wait — launching authenticated" >&2
+  else
+    echo "[5dive] agent=${NAME} WARN: claude creds absent after ${CLAUDE_AUTH_WAIT_SECS:-45}s wait; launching anyway (self-heals on next restart)" >&2
+  fi
+  unset _primary_auth _creds_re _deadline _waited _af _line 2>/dev/null || :
+fi
+
 CMD_STR=$(printf '%q ' "$BIN" "${ARGS[@]}")
 
-# First-attach onboarding for openclaw with no channel: openclaw chat is the
-# bare TUI and never surfaces channel setup, so a non-technical user has no
-# obvious way to wire telegram/discord/etc. after agent create. Run
-# `openclaw configure` once on first attach so the user sees the channel
-# wizard, then drop into chat (and stay there on every subsequent attach).
-# Sentinel lives in $HOME/.openclaw so it's per-agent; rm it to re-run.
+# Headless first-boot for openclaw with no channel. The old prelude ran the
+# interactive `openclaw configure` wizard inside the unattended tmux session;
+# agent ask then typed into that wizard and timed out instead of reaching chat.
+# `config set` is OpenClaw's non-interactive configuration surface. Seed the
+# runtime prerequisite here and enter chat immediately. The sentinel is
+# per-agent; removing it safely re-runs this idempotent bootstrap.
 PRELUDE=""
 if [[ "$TYPE" == "openclaw" ]] && [[ "$CHANNELS" == "none" || -z "$CHANNELS" ]]; then
   SENTINEL_Q=$(printf %q "$HOME/.openclaw/.5dive-bootstrapped")
   BIN_Q=$(printf %q "$BIN")
-  PRELUDE="[[ -e ${SENTINEL_Q} ]] || { mkdir -p $(printf %q "$HOME/.openclaw"); ${BIN_Q} configure; touch ${SENTINEL_Q}; }; "
+  PRELUDE="[[ -e ${SENTINEL_Q} ]] || { mkdir -p $(printf %q "$HOME/.openclaw"); ${BIN_Q} config set gateway.mode local && touch ${SENTINEL_Q}; }; "
 fi
 
 # When a resume id is armed, the first loop iteration launches with
@@ -942,7 +1108,7 @@ else
   LOOP="while true; do ${CMD_STR}; sleep 2; done"
 fi
 
-INNER="unset CLAUDE_CONFIG_DIR ${UNSET_CREDS}; ${STAGE_GUARD}${CODEX_OVERRIDE}${OPENCODE_OVERRIDE}${PRELUDE}${LOOP}"
+INNER="unset CLAUDE_CONFIG_DIR ${UNSET_CREDS}; ${STAGE_GUARD}${OPENCLAW_PATH_OVERRIDE}${CODEX_OVERRIDE}${OPENCODE_OVERRIDE}${PI_OVERRIDE}${PRELUDE}${LOOP}"
 [[ -n "$PROFILE" ]] && echo "[5dive] agent=${NAME} using auth-profile=${PROFILE}" >&2
 
 /usr/bin/tmux new-session -d -s "$SESSION" -c "$WORKDIR" \

@@ -17,7 +17,9 @@ set -euo pipefail
 
 cd "$(dirname "$0")"
 
-OUT="5dive"
+# Output path is overridable (BUILD_OUT) so tests can build a throwaway binary to a
+# temp dir without dirtying the tracked ./5dive artifact. Defaults to the repo ./5dive.
+OUT="${BUILD_OUT:-5dive}"
 
 cat \
   src/header.sh \
@@ -51,6 +53,8 @@ cat \
   src/cmd_project.sh \
   src/cmd_goal.sh \
   src/cmd_objective.sh \
+  src/cmd_company.sh \
+  src/cmd_council.sh \
   src/cmd_loop.sh \
   src/cmd_loop_pack.sh \
   src/cmd_crew.sh \
@@ -60,6 +64,7 @@ cat \
   src/cmd_usage.sh \
   src/cmd_digest.sh \
   src/cmd_proof.sh \
+  src/cmd_push.sh \
   src/cmd_memory.sh \
   src/cmd_pack.sh \
   src/cmd_secret.sh \
@@ -77,4 +82,9 @@ if ! grep -qE '^readonly FIVE_VERSION="[^"]+"' "$OUT"; then
   exit 1
 fi
 
-echo "built $OUT ($(wc -l < "$OUT") lines, $(grep -oE '^readonly FIVE_VERSION="[^"]+"' "$OUT" | cut -d'"' -f2))"
+# DIVE-1261: publish a sha256 of the bundle so the installer can verify the
+# fetched binary before swapping it in. Regenerated on every build and committed
+# alongside the bundle; CI's build+diff drift check keeps the two in sync.
+sha256sum "$OUT" | awk '{print $1}' > "$OUT.sha256"
+
+echo "built $OUT ($(wc -l < "$OUT") lines, $(grep -oE '^readonly FIVE_VERSION="[^"]+"' "$OUT" | cut -d'"' -f2)) + $OUT.sha256 ($(cut -c1-16 "$OUT.sha256")…)"
