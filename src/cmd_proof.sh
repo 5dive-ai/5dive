@@ -1032,8 +1032,22 @@ _proof_scorecard() {
                     WHERE status='done' AND kind='standard' AND done_at>=datetime('now','-7 days')
                     GROUP BY 1 ORDER BY 2 DESC, 1;" 2>/dev/null || true)"
 
+  # DIVE-1923: the ship ledger now sources "autonomous rollback rate". Four
+  # numbers, not one. The rate's numerator and denominator come from the SAME
+  # instrument (`5dive push`), which is what lets it state its own coverage
+  # instead of leaving the reader to guess at it; the unattributable reverts and
+  # the ledger's start date are part of the metric, not metadata about it.
+  local ships="" rollbacks="" rollbacks_unproven="" ledger_since=""
+  if [ "$(db "SELECT 1 FROM sqlite_master WHERE type='table' AND name='ship_events' LIMIT 1;" 2>/dev/null)" = "1" ]; then
+    ships="$(db "SELECT COUNT(*) FROM ship_events WHERE kind='ship' AND ts>=datetime('now','-7 days');" 2>/dev/null || true)"
+    rollbacks="$(db "SELECT COUNT(*) FROM ship_events WHERE kind='rollback' AND self=1 AND ts>=datetime('now','-7 days');" 2>/dev/null || true)"
+    rollbacks_unproven="$(db "SELECT COUNT(*) FROM ship_events WHERE kind='rollback' AND self=0 AND ts>=datetime('now','-7 days');" 2>/dev/null || true)"
+    ledger_since="$(db "SELECT COALESCE(MIN(ts),'') FROM ship_events;" 2>/dev/null || true)"
+  fi
+
   DIGEST_FILE="$work/digest.json" USAGE_FILE="$work/usage.json" DB_ROWS="$rows" GROUP_ROWS="$group_rows" \
   REFUSALS="$refusals" REFUSAL_SITES="$refusal_sites" SELF_PATH="$self" \
+  SHIPS="$ships" ROLLBACKS="$rollbacks" ROLLBACKS_UNPROVEN="$rollbacks_unproven" LEDGER_SINCE="$ledger_since" \
   WINDOW="$window" BY="$by" AS_JSON="$json" python3 <<'SCOREPY'
 import os, json, sys
 
@@ -1166,8 +1180,50 @@ elif _sites.isdigit() and int(_sites) == 0:
 else:
     metrics.append(metric("policy-blocked action attempts", None,
                           nodata="no policy_refusals table in this store — nothing has recorded a refused attempt (DIVE-1922)"))
-metrics.append(metric("autonomous rollback rate", None,
-                      nodata="nothing records a self-revert yet (DIVE-1923)"))
+# DIVE-1923 built the source (5dive push -> ship_events). The three states of a
+# metric all live on this one row, and telling them apart is the whole point:
+#   - no ledger at all        -> honest NO DATA (a store older than this build)
+#   - a ledger with 0 ships   -> STILL no data. A rate over zero ships is
+#     UNDEFINED, not 0.0%, and 0.0% is exactly the reading ("we never roll back")
+#     the original marker existed to refuse. An empty denominator must never
+#     render as a confident numerator.
+#   - ships > 0               -> a real rate, shipping with the sample it rests
+#     on and with the reverts it could NOT attribute, because a rate that hides
+#     what it excluded is a coverage claim it never earned.
+#
+# The denominator is named for what it COUNTS — commits pushed through
+# `5dive push` — and never as bare "ships" (main, reviewing this change). Both of
+# its errors are then visible in the label rather than in a note the reader may
+# not reach. Work that bypasses `5dive push` under-counts it and biases the rate
+# UP, which is pessimistic and safe in a published autonomy number; a branch
+# pushed and then ABANDONED counts as a ship, which inflates the denominator and
+# biases the rate DOWN. A flattering denominator produces a flattering rate, and
+# that is the 0.0%-reads-as-"we never roll back" failure one level up. Naming the
+# denominator honestly makes the row honest by construction rather than
+# honest-if-you-read-the-note. Reconciling pushed-vs-merged is DIVE-2127.
+_ships = os.environ.get("SHIPS", "").strip()
+_rb    = os.environ.get("ROLLBACKS", "").strip()
+_rbu   = os.environ.get("ROLLBACKS_UNPROVEN", "").strip()
+_since = (os.environ.get("LEDGER_SINCE", "").strip() or "")[:10]
+if not _ships.isdigit():
+    metrics.append(metric("autonomous rollback rate", None,
+                          nodata="no ship_events ledger in this store — nothing records a "
+                                 "self-revert yet (DIVE-1923)"))
+elif int(_ships) == 0:
+    metrics.append(metric("autonomous rollback rate", None,
+                          nodata=("nothing pushed through `5dive push` in this window"
+                                  + (f" (ledger opened {_since})" if _since else " (ledger is empty)")
+                                  + " — a rate over an empty denominator is undefined, not 0.0% (DIVE-1923)")))
+else:
+    _s, _r, _u = int(_ships), int(_rb or 0), int(_rbu or 0)
+    _sample = f"{_r} of {_s} commits pushed through `5dive push` were reverted"
+    if _u:
+        _sample += (f"; {_u} further revert(s) undid commits absent from this ledger, so they "
+                    f"cannot be shown to be self-inflicted and are excluded from the numerator")
+    metrics.append(metric("autonomous rollback rate", f"{round(_r / _s * 100, 1)}%", _sample,
+                          note="the denominator is commits PUSHED, not commits merged — a branch "
+                               "pushed and abandoned still counts (which biases this rate DOWN), "
+                               "and work landed by any other route is invisible (which biases it UP)"))
 
 by = os.environ["BY"]
 groups = []

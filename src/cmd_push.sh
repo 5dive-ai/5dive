@@ -381,6 +381,56 @@ cmd_push() {
 # Invoked over NOPASSWD sudo by cmd_push; parameters on stdin keep the grant
 # exact-path (sudo-rs safe). Not advertised; not itself audited (the parent
 # `push` verb is).
+# _push_record_ship_ledger <repopath> <branch> <ident> <slug> — DIVE-1923.
+#
+# Record what this push actually shipped, and which of those commits UNDO a
+# previous ship. `5dive push` is the fleet's shipping rail, so it is the one
+# place that observes a ship at the moment it happens — and a revert announces
+# itself in a line git writes itself ("This reverts commit <sha>."), so the
+# rollback half of the metric demands no new discipline from any agent. That
+# matters: DIVE-1935's lesson was that the signal we needed was already sitting
+# in plain text, and a capture path nobody has to remember is the only kind that
+# stays true.
+#
+# Ships are recorded BEFORE rollbacks, in two passes, on purpose. `rev-list` is
+# newest-first, and a branch can carry both a commit and its revert; recording
+# in that order would look up the reverted sha before its ship row existed and
+# mark a provable self-revert as unattributable.
+#
+# With no local main/master to fork from we record the TIP ONLY rather than
+# walking the branch's whole history: inventing ship rows for commits this push
+# did not ship would inflate the denominator, and an under-counted rate that
+# names its own instrument is honest where an invented one is not.
+#
+# Wholly best-effort — every failure path is silent and non-fatal. The push has
+# already succeeded by the time this runs, and telemetry must never turn a
+# landed ship into an error.
+_push_record_ship_ledger() {
+  local repopath="$1" branch="$2" ident="$3" slug="$4"
+  local -a G=(git -C "$repopath" -c "safe.directory=$repopath")
+  local base="" ref range="" c rv
+  for ref in refs/remotes/origin/main refs/remotes/origin/master refs/heads/main refs/heads/master; do
+    "${G[@]}" rev-parse --verify --quiet "$ref" >/dev/null 2>&1 || continue
+    base=$("${G[@]}" merge-base "$ref" "refs/heads/${branch}" 2>/dev/null) || base=""
+    [[ -n "$base" ]] && break
+  done
+  if [[ -n "$base" ]]; then range="${base}..refs/heads/${branch}"; else range="-n 1 refs/heads/${branch}"; fi
+
+  local -a shas=()
+  while IFS= read -r c; do [[ -n "$c" ]] && shas+=("$c"); done     < <("${G[@]}" rev-list --no-merges --max-count=500 $range 2>/dev/null || true)
+  [[ ${#shas[@]} -gt 0 ]] || return 0
+
+  for c in "${shas[@]}"; do
+    ship_ledger_record ship "$ident" "$slug" "$branch" "$c" ""
+  done
+  for c in "${shas[@]}"; do
+    rv=$("${G[@]}" show -s --format=%B "$c" 2>/dev/null \
+         | sed -n 's/^[[:space:]]*This reverts commit \([0-9a-f]\{7,40\}\)\.\{0,1\}[[:space:]]*$/\1/p' | head -1)
+    [[ -n "$rv" ]] && ship_ledger_record rollback "$ident" "$slug" "$branch" "$c" "$rv"
+  done
+  return 0
+}
+
 cmd_push_do() {
   [[ "$(id -u)" -eq 0 ]] || fail "$E_PERMISSION" "_push_do is root-only"
   local ident repopath branch repourl
@@ -472,6 +522,9 @@ cmd_push_do() {
   [[ $rc -eq 0 ]] || fail "$E_GENERIC" "push failed (branch ${branch}); see output above."
   local slug sha; slug=$(_push_repo_slug "$repourl")
   sha=$("${G[@]}" rev-parse --short "refs/heads/${branch}")
+  # DIVE-1923: ship ledger. After the push, never before — this records what
+  # landed, so a failed push must leave no trace. Never fatal.
+  _push_record_ship_ledger "$repopath" "$branch" "$ident" "$slug" 2>/dev/null || true
   local author_note; [[ -n "$author" ]] && author_note="author enforced" || author_note="no author restriction"
   ok "pushed ${branch}@${sha} → ${slug} (delegated, repo-scoped token, ${author_note}, gate cleared)" \
      "$(jq -n --arg t "$ident" --arg b "$branch" --arg s "$sha" --arg r "$slug" \
