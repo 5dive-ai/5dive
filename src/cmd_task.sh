@@ -377,7 +377,7 @@ cmd_task_set_body() {
   fi
   db "UPDATE tasks SET body=$(sqlq "$newbody") WHERE id=${id};"
   local mode="replaced"; (( append )) && mode="appended"
-  [[ $EUID -eq 0 ]] && audit_log "task set-body" "ok" 0 -- \
+  audit_log "task set-body" "ok" 0 -- \
     "task=$ident" "actor=$(task_actor)" "mode=$mode" "prior_len=$prior_len" || true
   ok "$ident body $mode" '{ident:$id, mode:$m}' --arg id "$ident" --arg m "$mode"
 }
