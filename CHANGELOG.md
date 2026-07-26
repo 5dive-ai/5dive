@@ -1,28 +1,5 @@
 # Changelog
 
-## 0.16.9 — `task need --type=decision` warns at file time on a branch-bound task (DIVE-2074) (2026-07-26)
-
-DIVE-2073 hit this live: a decision gate routed to a named reviewer got answered
-instead by the org lead (a legitimate, well-intentioned clear) — `need_answered_by`
-recorded the bare lead name, not `lead:*`, because that stamp is only minted for
-approval/manual/access. `5dive push` then refused, and the failure surfaced one step
-later, on the pusher, who had no way to obtain the authority the refusal named without
-re-gating an already-answered question.
-
-`5dive task need` now warns at FILE time — while `--type` can still be changed —
-whenever a `--type=decision` gate is filed on a task whose body carries a `Branch:`
-line: a decision only authorizes push when answered by its own routed reviewer (or a
-human/lead clear); anyone else clearing it, however authoritative, will not satisfy
-push. The warning suggests `--type=approval` instead, which routes to the org lead as
-a tier-1 they can clear outright. Advisory only — decision still files; this moves the
-discovery to the moment the filer can still pick the right type.
-
-Complements, does not replace, the DIVE-2004 unrouted-eng-ship-ask warning: that one
-fires on ask *text* matching a push-shape with no routed reviewer; this one fires on
-the task's actual `Branch:` binding regardless of routing state, since a ROUTED
-decision fails just the same when the LEAD (not the routed reviewer) is the one who
-clears it.
-
 ## 0.16.8 — docs(selfcheck): the --full duration figure, with its conditions (DIVE-2039 follow-up) (2026-07-26)
 
 `--full`'s documented runtime has been wrong twice, in opposite directions, and both

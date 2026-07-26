@@ -116,7 +116,13 @@ caught.
 - No `--no-verify` on commits — CI runs the same checks anyway, you'll
   just learn about the failure later.
 - Don't bump the version in your PR. `FIVE_VERSION` is bumped at release
-  time, not per-merge.
+  time, not per-merge. Still rebuild the bundle (`bash build.sh`) and commit
+  it — `bundle-drift` CI checks `bundle == build(src)`, which is unaffected
+  by the version; only `version-bump-guard` cares about `FIVE_VERSION`, and
+  it fires solely on a push to `refs/heads/main`, never on a branch/PR. So a
+  PR with a rebuilt-but-unbumped bundle is exactly what both checks want —
+  don't reach for a version bump to placate `bundle-drift`, it isn't asking
+  for one.
 
 ## Reporting bugs / requesting features
 
