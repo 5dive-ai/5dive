@@ -52,7 +52,7 @@ esac; done
 #                                 than the other two; say so rather than imply parity.
 ALLOW_UNPROBEABLE="council_amend_e2e.sh council_roster_lineage_e2e.sh schema_sync_unit.sh"
 
-WIRED=(); UNWIRED=(); UNPROBEABLE=(); ALREADY_RED=(); ALLOWED=()
+WIRED=(); UNWIRED=(); UNPROBEABLE=(); ALREADY_RED=(); ALLOWED=(); NOT_REACHED=()
 
 # Extract the verdict variable from a harness's last executable line.
 # Prints "<var>\t<lineno>" or nothing. Handles the shapes olivia's census found:
@@ -150,18 +150,31 @@ if [[ " $ALLOW_UNPROBEABLE " == *" $b "* ]]; then ALLOWED+=("$b"); else UNPROBEA
   # keeping it in the same directory preserves every harness's
   # `cd "$(dirname "$0")/.."` and its relative fixture paths.
   mutant="tests/.probe-${b}"
-  awk -v n="$ln" -v inj="$inject" 'NR==n{print inj} {print}' "$t" > "$mutant"
-  timeout "$TIMEOUT" bash "$mutant" >/dev/null 2>&1; rc=$?
+  # CANARY: a mutation that never EXECUTED proves nothing, and calling that
+  # "unwired" is a false accusation. Harnesses that skip early in one environment
+  # (no 5dive installed, not root) exit 0 long before the verdict — which is
+  # exactly how three correctly-wired files were reported UNWIRED on the CI runner
+  # while passing on this box. So the injected line announces itself, and a run
+  # that never reached it is NOT-REACHED, never UNWIRED.
+  # (community/wiki/test-harness-credential-reach-and-transcript-durability.md:
+  #  a canary proves the extractor RAN; the fixture proves it is still RIGHT.)
+  awk -v n="$ln" -v inj="$inject" 'NR==n{print inj; print "printf \x27__PROBE_REACHED__\\n\x27 >&2"} {print}' "$t" > "$mutant"
+  out=$(timeout "$TIMEOUT" bash "$mutant" 2>&1 >/dev/null); rc=$?
   rm -f "$mutant"
+  if ! grep -q '__PROBE_REACHED__' <<<"$out"; then
+    NOT_REACHED+=("$b (verdict line $ln never executed — harness exits early in this environment)")
+    continue
+  fi
   if (( rc == 0 )); then
     UNWIRED+=("$b — $strategy")
   else WIRED+=("$b"); fi
 done
 
-printf 'harness-verdict-probe: %d wired, %d UNWIRED, %d UNPROBEABLE, %d allowlisted, %d already-red\n' \
-  "${#WIRED[@]}" "${#UNWIRED[@]}" "${#UNPROBEABLE[@]}" "${#ALLOWED[@]}" "${#ALREADY_RED[@]}"
+printf 'harness-verdict-probe: %d wired, %d UNWIRED, %d UNPROBEABLE, %d allowlisted, %d not-reached, %d already-red\n' \
+  "${#WIRED[@]}" "${#UNWIRED[@]}" "${#UNPROBEABLE[@]}" "${#ALLOWED[@]}" "${#NOT_REACHED[@]}" "${#ALREADY_RED[@]}"
 for x in "${UNWIRED[@]:-}";     do [[ -n "$x" ]] && printf 'UNWIRED      %s — exit status is NOT wired to its assertions; it cannot fail CI\n' "$x"; done
 for x in "${UNPROBEABLE[@]:-}"; do [[ -n "$x" ]] && printf 'UNPROBEABLE  %s — no identifiable verdict variable; NOT counted clean\n' "$x"; done
+for x in "${NOT_REACHED[@]:-}";  do [[ -n "$x" ]] && printf 'not-reached  %s — skipped before the verdict here; probed in an environment where it runs\n' "$x"; done
 for x in "${ALLOWED[@]:-}";     do [[ -n "$x" ]] && printf 'allowlisted  %s — unprobeable, permitted by name with a recorded reason\n' "$x"; done
 for x in "${ALREADY_RED[@]:-}"; do [[ -n "$x" ]] && printf 'ALREADY-RED  %s — failed its own clean run; reported, not probed\n' "$x"; done
 (( ${#UNWIRED[@]} == 0 && ${#UNPROBEABLE[@]} == 0 ))
