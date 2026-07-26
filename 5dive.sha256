@@ -1,1 +1,5 @@
+<<<<<<< HEAD
 9d4a9530e8bb67bb781490f7e15f2a36f912b6d9cfea79a2e3355cc9c4ff9997
+=======
+2b84c620a0c4a6c9f61eabd5416914c7cbb51b66df8f87992ab023770b18d11f
+>>>>>>> 3c20bde (fix(agent): report the enforced sudo grant beside the isolation label (DIVE-2079))
