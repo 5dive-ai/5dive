@@ -96,6 +96,11 @@ mkdir -p "$TASKS_DIR"; set +e
 tasks_db_init
 task_need_notify() { :; }
 _task_close_notify() { :; }
+# DIVE-2010: audit_log for task-store events is now fenced on store identity
+# (_task_human_send_allowed). Declare this fixture store PROD for the purposes
+# of that fence so the audit-content assertions below still exercise the real
+# call, exactly as tests/gate_telemetry_fence_unit.sh's on-store case does.
+export FIVEDIVE_PROD_TASKS_DB="$TASKS_DB"
 AUDIT_CALLS="$TMP/audit.calls"; : >"$AUDIT_CALLS"
 audit_log() { printf '%s\n' "$*" >>"$AUDIT_CALLS"; }
 export GH_STUB_AUTH_TOKEN="tok"

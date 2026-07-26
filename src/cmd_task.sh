@@ -377,7 +377,7 @@ cmd_task_set_body() {
   fi
   db "UPDATE tasks SET body=$(sqlq "$newbody") WHERE id=${id};"
   local mode="replaced"; (( append )) && mode="appended"
-  audit_log "task set-body" "ok" 0 -- \
+  _task_store_audit_log "task set-body" "ok" 0 -- \
     "task=$ident" "actor=$(task_actor)" "mode=$mode" "prior_len=$prior_len" || true
   ok "$ident body $mode" '{ident:$id, mode:$m}' --arg id "$ident" --arg m "$mode"
 }
@@ -1662,7 +1662,7 @@ _task_status_cmd() {
       # announced as a clean scan is the defect this ticket is about, one level up.
       [[ -n "$_ghtok2" && $_sc_total -gt 0 && $_sc_ok -lt $_sc_total ]] && _scan_why="partial-repo-scan-${_sc_ok}-of-${_sc_total}"
       warn "$ident: merge-gate could not query GitHub ($_scan_why) — this close is UNVERIFIED, not verified-clean (DIVE-1935)."
-      audit_log "task.merge-gate-unverified" ok 0 -- "$ident" "reason=$_scan_why"
+      _task_store_audit_log "task.merge-gate-unverified" ok 0 -- "$ident" "reason=$_scan_why"
       _mg_unverified="${_mg_unverified:+$_mg_unverified; }repo scan did not complete ($_scan_why)"
     fi
     # DIVE-1935: the PR reference the maker TYPED is a declaration too. DIVE-1922
@@ -1687,7 +1687,7 @@ $_body"
     # looks exactly like a clean close (the ticket's own defect, one layer down).
     if [[ $force_merge_gate -eq 0 ]] && ! _gate_pr_refs_engine_ok; then
       warn "$ident: PR-reference parsing is BROKEN on this host (grep -oE unusable) — the result/body merge-gate did NOT run; this close is UNVERIFIED (DIVE-1935)."
-      audit_log "task.merge-gate-unverified" ok 0 -- "$ident" "reason=ref-parser-broken"
+      _task_store_audit_log "task.merge-gate-unverified" ok 0 -- "$ident" "reason=ref-parser-broken"
       _mg_unverified="${_mg_unverified:+$_mg_unverified; }PR-reference parser unusable on this host"
     elif [[ -z "$_auto_hit" && $force_merge_gate -eq 0 && -n "$_ghtok2" ]]; then
       local _txt _qref _n=0 _st _rslug
@@ -3846,8 +3846,15 @@ cmd_task_need() {
   local _nrc=0
   TASK_GATE_FILER="$actor" \
     task_need_notify "$ident" "$type" "$ask" "$options" "$recommend" "$secret_key" "$connector" "$human_nonce" "$precedent_cite" || _nrc=$?
-  [[ "$_nrc" == "3" && $EUID -eq 0 ]] \
-    && audit_log "task need unnotified" "error" 1 -- "task=$ident" "type=$type" "filer=$actor" || true
+  # DIVE-2010: this used to also require $EUID to be root before auditing — the
+  # exact anti-pattern audit.sh's own audit_log doc says never to use (it
+  # predates _emit_audit_line's non-root privileged fallback, DIVE-1989) AND
+  # carried no store-identity fence, so a fixture-TASKS_DB suite run as root
+  # wrote real-looking rows with fixture idents into the real audit log. Fixed
+  # by dropping the root condition (audit_log/_task_store_audit_log handle the
+  # non-root case) and routing through the store fence instead.
+  [[ "$_nrc" == "3" ]] \
+    && _task_store_audit_log "task need unnotified" "error" 1 -- "task=$ident" "type=$type" "filer=$actor" || true
   local floor_note=""; (( tier_floored )) && floor_note=" [tier forced to 2 — T2 category floor]"
   local prec_note=""; [[ -n "$precedent_cite" ]] && prec_note=" [${precedent_cite}]"
   # rc 3 = filed, answerable, but nobody was PINGED. Say so on the record instead
@@ -4318,6 +4325,30 @@ _task_human_send_allowed() {
   ra="$(readlink -f "$active" 2>/dev/null || printf '%s' "$active")"
   rp="$(readlink -f "$prod" 2>/dev/null || printf '%s' "$prod")"
   [[ -n "$ra" && "$ra" == "$rp" ]]
+}
+
+# DIVE-2010: fence a task-store-driven audit_log call on STORE IDENTITY, reusing
+# the exact primitive _task_gate_delivery_log (DIVE-1968) already trusts for the
+# same risk shape — a row built from live TASKS_DB state (a task ident, a filer,
+# a gate type) written by a fixture store is a real-looking row with a fixture
+# ident landing in the real fleet audit log. Measured on this box: a 41-suite
+# run wrote 6 such rows via "task need unnotified" alone (fixture idents
+# DIVE-1..4, filer=dev); re-sweeping tests/task_*unit.sh + tests/gate_*unit.sh
+# after fixing that site found 2 MORE live call sites doing the same thing
+# ("task set-body", "task.merge-gate-unverified") before they were routed
+# through this wrapper too. Other unconditional task-store call sites remain
+# (tracked in DIVE-2045) — untested is not the same claim as leak-free.
+# Withholding is announced ONCE per process — a silent fence is the same
+# fail-open shape as no fence (DIVE-1968 assertion 2).
+_TASK_STORE_AUDIT_FENCED=""
+_task_store_audit_log() { # <cmd> <result> <code> -- <args...>
+  if _task_human_send_allowed; then
+    audit_log "$@"
+  elif [[ -z "${_TASK_STORE_AUDIT_FENCED:-}" ]]; then
+    _TASK_STORE_AUDIT_FENCED=1
+    warn "task audit telemetry withheld: TASKS_DB is not the production store, so this row is NOT written to the fleet audit log (DIVE-2010)."
+  fi
+  return 0
 }
 
 TASK_SEND_DELIVERED=0

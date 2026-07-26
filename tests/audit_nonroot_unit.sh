@@ -138,14 +138,36 @@ else
 fi
 
 # --- 6. no audit_log call anywhere in src/ is re-gated on $EUID --------------
-# The whole defect, as a grep. Nine sites had this shape; a tenth added later
-# would silently re-open the hole for whichever verb it guards.
+# The whole defect, as a grep. Nine sites had this shape; a tenth
+# (cmd_task.sh's `task need unnotified` row) evaded this EXACT check for a full
+# release, because grep matches per PHYSICAL line and that site split the
+# pattern across two lines with a `\` continuation:
+#   [[ "$_nrc" == "3" && $EUID -eq 0 ]] \
+#     && audit_log "task need unnotified" ...
+# — `EUID -eq 0 ]] && audit_log` never appears on one line, so the old
+# single-line grep passed vacuously while the live defect sat three lines below
+# it (DIVE-2010; measured leak: 6 real-audit-log rows from a fixture TASKS_DB,
+# "task need unnotified" on idents DIVE-1..4). Join `\`-continuations into one
+# logical line per file before matching, so a future split can't hide in it
+# either. Also matches a call routed through a fenced wrapper
+# (_task_store_audit_log, DIVE-2010) — EUID-gating the wrapper would be the
+# identical defect one layer up.
 unset -f sudo
-GATED=$(grep -rn 'EUID -eq 0 \]\] && audit_log' "$SRC/" 2>/dev/null)
+GATED=""
+while IFS= read -r -d '' f; do
+  joined=$(awk '
+    { line = (line == "" ? $0 : line " " $0)
+      if (line ~ /\\$/) { sub(/\\$/, "", line); next }
+      print line; line = "" }
+    END { if (line != "") print line }
+  ' "$f")
+  hit=$(grep -n 'EUID -eq 0 \]\] *&& *\(_task_store_audit_log\|audit_log\)' <<<"$joined")
+  [[ -n "$hit" ]] && GATED+="$f:"$'\n'"$hit"$'\n'
+done < <(find "$SRC" -name '*.sh' -print0)
 if [[ -z "$GATED" ]]; then
-  ok_t "no audit_log call is gated on \$EUID"
+  ok_t "no audit_log call is gated on \$EUID (continuation-joined scan)"
 else
-  bad_t "no audit_log call is gated on \$EUID" "$GATED"
+  bad_t "no audit_log call is gated on \$EUID (continuation-joined scan)" "$GATED"
 fi
 
 # --- 7. suite guard: the real fleet log was never touched --------------------
