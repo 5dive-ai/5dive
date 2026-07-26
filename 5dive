@@ -26,7 +26,7 @@ esac
 
 # Bumped on every public release. `build.sh` checks this line exists; CI fails
 # the bundle-drift check if it's missing or empty.
-readonly FIVE_VERSION="0.16.7"
+readonly FIVE_VERSION="0.16.8"
 
 # GitHub org our repos live under. The org is being renamed
 # 5dive-com -> 5dive-ai (2026-06); fetches must work on either side of the
@@ -40809,9 +40809,14 @@ HELP
 # FIVEDIVE_NO_HUMAN_SEND plus a non-prod TASKS_DB (the DIVE-1506 positive allowlist).
 #
 # PROVEN BY MUTATION, NOT BY A GREEN RUN. A green run cannot tell a working probe from
-# a probe that asserts nothing. tests/selfcheck_mutation_e2e.sh breaks each of the
-# first three rails for real and requires selfcheck to go red, then restores and
+# a probe that asserts nothing. tests/selfcheck_mutation_e2e.sh breaks ALL SEVEN rails
+# for real and requires selfcheck to go red AND name the breakage, then restores and
 # requires green. "It passed" is not evidence here; "it failed when I broke it" is.
+#
+# And coverage is PER-DIMENSION, not per-probe: a mutation that varies the harness says
+# nothing about the corpus, the actor or the environment. Both defects review found lived
+# in probes whose coverage claim was true along the only axis anyone had varied — see
+# community/wiki/mutation-coverage-is-per-dimension.md.
 
 # The corpus, in order. Declared in ONE place: the report header, the --list output and
 # the union script's contract all read this, so they cannot drift into three lists.
@@ -41040,11 +41045,18 @@ SELFCHECK_HARNESS_SAMPLE="heartbeat_gate_shipped_unit.sh,gate_delivery_assertion
 # it goes, because a 15-minute job writing zero bytes is indistinguishable from a hang
 # and CI would have to guess. Slow is a budget; silent is a defect.
 #
-# The first figure published here was ~70min, extrapolated from a per-harness rate
-# sampled while a mutation e2e and CI polling were competing for the same box. It was
-# 7x wrong and it was already being quoted back as guidance for CI timeouts. A
-# measurement taken under unrecorded load is a guess wearing a number's clothes —
-# re-measure on an idle box before publishing a budget.
+# The duration figure has now been wrong TWICE, in opposite directions, and both times
+# the error was the same: publishing a number without publishing its conditions.
+#   1. ~70min — extrapolated from a per-harness rate sampled while a mutation e2e and
+#      CI polling fought for the same box. 7x too high.
+#   2. ~10min — a real measurement, but labelled "on an idle control plane" when the
+#      box has 17 agent homes and I never recorded its load. Main then measured ~156
+#      of 164 at 21min on that same box under normal fleet load, i.e. roughly double,
+#      and someone budgeting a CI timeout off 10min would have read the kill as a
+#      hang — the exact failure this file exists to remove.
+# A duration is not a property of the code; it is a property of (mode, machine, load).
+# State all three or state none. The help text now carries the mode, the machine, and
+# both observations, and says the fast figure is a FLOOR.
 
 _sc_probe_harness_verdicts() {
   local root="${SELFCHECK_REPO_ROOT:-}" how="SELFCHECK_REPO_ROOT"
@@ -41448,8 +41460,8 @@ cmd_selfcheck() {
 
 _sc_usage() {
   cat <<'USAGE'
-5dive selfcheck [--json] [--only=<probe,...>] [--full] [--strict]
-                [--report=<file>] [--label=<env>] [--list]
+5dive selfcheck [--json] [--only=<probe,...>] [--full] [--assume-clean] [--strict]
+                [--allow=<probe,...>] [--report=<file>] [--label=<env>] [--list]
 
 Runs each critical rail FOR REAL in an isolated state dir and asserts the EFFECT it
 is supposed to have, not the string it printed.
@@ -41459,12 +41471,28 @@ state and is NEVER folded into pass — a probe whose precondition is absent has
 been shown to work. A NOT-REACHED with no reason exits non-zero.
 
   --full      run the harness mutation sweep over the WHOLE corpus instead of the
-              named sample. MEASURED on an idle control plane: 10m21s wall for 164
-              harnesses with --assume-clean (~3.8s each), roughly double bare, since
-              each harness runs twice (clean, then mutated). Budget ~15min / ~30min
-              bare and give it its own CI timeout; it does not belong on an
-              interactive path. Per-harness progress streams to stderr throughout —
-              it is slow, never silent.
+              named sample.
+
+              MEASURED (all on the shared control plane, 17 agent homes resident, no
+              other sweep running). The mode is part of every figure:
+
+                --assume-clean   164 harnesses  10m21s   (3.79s / harness)
+                --assume-clean   168 harnesses  10m37s   (3.79s / harness)
+                bare             164 harnesses  21m44s   (7.95s / harness)
+
+              These agree, and the arithmetic is the check: bare runs each harness
+              TWICE, clean then mutated, so ~2x. Two --assume-clean runs four
+              harnesses apart give the same per-harness cost, which is what makes
+              this a rate rather than an anecdote.
+
+              BUDGET (not a measurement — a ceiling with headroom for fleet load):
+              allow 30min with --assume-clean, 60min bare, give it its own CI
+              timeout, and keep it off any interactive path. Every observed run above
+              is well under those; they are deliberately generous, because the
+              failure they prevent is a timeout kill being read as a hang.
+
+              Per-harness progress streams to stderr throughout, so a slow run
+              announces itself rather than looking wedged — it is slow, never silent.
   --assume-clean
               the suite just ran green IN THIS ENVIRONMENT, so skip the harness
               probe's own clean run. Halves --full. Sound only if that is true.

@@ -1,5 +1,38 @@
 # Changelog
 
+## 0.16.8 — docs(selfcheck): the --full duration figure, with its conditions (DIVE-2039 follow-up) (2026-07-26)
+
+`--full`'s documented runtime has been wrong twice, in opposite directions, and both
+times for the same reason: a number published without its conditions.
+
+- **~70min** was extrapolated from a per-harness rate sampled while a mutation e2e and
+  CI polling were competing for the same box — 7x too high.
+- **~10min** was a real measurement (10m21s, 164 harnesses, from a frozen bundle) but
+  it was taken **with `--assume-clean`** and labelled "on an idle control plane" when
+  the box carries 17 agent homes and its load was never recorded. main measured
+  **21:44 bare** on the same box — which AGREES with it: bare runs each harness twice,
+  and 21:44 is almost exactly double 10:21. The mode was the entire difference, and
+  someone budgeting a CI timeout off "~10 minutes" then running bare would be killed at
+  the ceiling and read it as a hang — the exact failure `selfcheck` exists to remove.
+
+A duration is not a property of the code; it is a property of (mode, machine, load).
+`--help` now separates the two things that were being conflated:
+
+- **MEASURED**, mode stated on every row — `--assume-clean` 164/10m21s and 168/10m37s
+  (3.79s per harness both times), bare 164/21m44s (7.95s). They agree, and the
+  arithmetic is the check: bare runs each harness twice, so ~2x. Two `--assume-clean`
+  runs four harnesses apart giving the identical per-harness cost is what makes it a
+  rate rather than an anecdote.
+- **BUDGET** — 30min with `--assume-clean`, 60min bare, own CI timeout, never
+  interactive. Explicitly *not* a measurement: every observed run is well under it,
+  because the failure it prevents is a timeout kill being read as a hang.
+
+The earlier text called the fast figure a FLOOR, which read as a measurement sitting
+below several faster observed runs. Also adds `--allow=` and `--assume-clean` to the
+synopsis line, which listed neither.
+
+No code path changes.
+
 ## 0.16.7 — re-land DIVE-2058 with real isolation; usage_collect now REFUSES to read production transcripts from a fixture run (DIVE-2069) (2026-07-26)
 
 Re-lands dev2's TOP TASKS dispatch cross-check (DIVE-2058, backed out in 0.16.6 for
