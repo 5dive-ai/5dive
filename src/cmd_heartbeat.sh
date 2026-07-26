@@ -1803,6 +1803,77 @@ _hb_council_rot_sweep() {
 #      the fleet-wide MAX(gate_pinged_at). Eligible gates existing while no ping
 #      has landed in over an hour means the batch looks dead — alarm main,
 #      throttled to avoid re-alarming every tick while it stays broken.
+# DIVE-2122 — READ THE ARTIFACT, NOT A PROXY FOR IT.
+#
+# The gap#3 alarm below asserts "nothing is self-correcting" on the strength of
+# tasks.status='in_progress' == 0. That is a PROXY for "an agent is doing work", and
+# it is wrong in exactly the productive case. Measured 2026-07-26 20:06, when the
+# alarm fired while the fleet was working: 257 agent commands in the preceding ten
+# minutes (dev 112, main 42, olivia 38, marketing 25, codex 20, community 10,
+# creative 10), dev running `gh pr` seconds before the alert, 12 tasks closed in 3h,
+# all 10 units active. dev's last `task start` was SEVEN AND A HALF HOURS earlier.
+# Agents do substantial work without ever holding a row in in_progress: builders work
+# in worktrees against a branch, a delivered maker->verifier task sits at status=todo
+# assigned to the VERIFIER, and verification / wiki compiles / review / inter-agent
+# exchange never touch task status at all. So in_progress==0 means "nobody used the
+# task verb recently", which is not the claim the alert makes.
+# This is the fifth recorded instance of the same false positive (2026-07-19, 07-21,
+# 07-22 x2, 07-26); the takeaway was written down after the third and never built.
+#
+# WHY THIS PROBE AND NOT THE OBVIOUS ONES — both alternatives were measured and both
+# would have SILENCED the detector, which is far worse than the false positive it
+# fixes (a noisy alarm is visible; a dead one is not):
+#   * session-transcript mtime — the heartbeat NUDGES agents during a genuine stall,
+#     and a nudge appends to the transcript. Freshness would be manufactured by the
+#     very condition we are trying to detect.
+#   * raw command count from the sudo journal — ~90% of it is automated polling. In a
+#     20-minute sample: 140 `5dive task coordinator`, 20 `task inbox`, 20 `agent
+#     info`, 22 `tmux has-session`, 18 `capture-pane`, 20 codex version probes. A
+#     dead fleet still emits all of it, so any threshold over raw volume reads busy
+#     forever. Excluding the pollers needs a hand-maintained allowlist that nobody
+#     owns and that rots toward "everything looks busy" — the DIVE-2118 shape, a rule
+#     whose performance half has no owner.
+# `_hb_agent_idle` is the existing, already-maintained read of the actual artifact:
+# the agent session itself (native runtime state where available, pane-stability plus
+# a per-runtime composer marker otherwise). Reusing it means this probe cannot drift
+# away from the fleet's own notion of busy.
+#
+# COST is paid only when the alarm would otherwise fire (rare, and throttled to once
+# per _HB_STALL_MIN_MINUTES): a pane probe samples twice _HB_IDLE_SAMPLE_SEC apart.
+# It early-exits on the first ACTIVE agent, so the common false-positive path is one
+# probe, not eleven.
+#
+# Sets _HB_ACT_{CHECKED,ACTIVE,IDLE,BLOCKED,UNKNOWN} and _HB_ACT_{ACTIVE,BLOCKED}_NAMES.
+# UNKNOWN is a THIRD state and is never folded into idle: an uncapturable pane did
+# not prove the agent idle, and an alert that cannot tell "measured idle" from "could
+# not measure" is asserting something it never measured.
+_HB_ACT_CHECKED=0; _HB_ACT_ACTIVE=0; _HB_ACT_IDLE=0; _HB_ACT_BLOCKED=0; _HB_ACT_UNKNOWN=0
+_HB_ACT_ACTIVE_NAMES=""; _HB_ACT_BLOCKED_NAMES=""
+_hb_fleet_activity_probe() {
+  local stop_on_active="${1:-1}" reg name rc
+  _HB_ACT_CHECKED=0; _HB_ACT_ACTIVE=0; _HB_ACT_IDLE=0; _HB_ACT_BLOCKED=0; _HB_ACT_UNKNOWN=0
+  _HB_ACT_ACTIVE_NAMES=""; _HB_ACT_BLOCKED_NAMES=""
+  reg=$(registry_read 2>/dev/null) || reg=""
+  [[ -n "$reg" ]] || return 0
+  for name in $(jq -r '.agents | to_entries[] | select(.value.heartbeat != null) | .key' <<<"$reg" 2>/dev/null); do
+    _HB_ACT_CHECKED=$((_HB_ACT_CHECKED + 1))
+    _hb_agent_idle "$name" >/dev/null 2>&1; rc=$?
+    case "$rc" in
+      0) _HB_ACT_IDLE=$((_HB_ACT_IDLE + 1)) ;;
+      1) _HB_ACT_ACTIVE=$((_HB_ACT_ACTIVE + 1))
+         _HB_ACT_ACTIVE_NAMES="${_HB_ACT_ACTIVE_NAMES:+${_HB_ACT_ACTIVE_NAMES},}${name}"
+         (( stop_on_active )) && return 0 ;;
+      # A BLOCKED agent (permission/usage dialog) is not idle and not working — it is
+      # the actual root in two of the recorded recurrences, so it is counted and named
+      # rather than silently bucketed with idle.
+      3) _HB_ACT_BLOCKED=$((_HB_ACT_BLOCKED + 1))
+         _HB_ACT_BLOCKED_NAMES="${_HB_ACT_BLOCKED_NAMES:+${_HB_ACT_BLOCKED_NAMES},}${name}" ;;
+      *) _HB_ACT_UNKNOWN=$((_HB_ACT_UNKNOWN + 1)) ;;
+    esac
+  done
+  return 0
+}
+
 _hb_stall_sweep() {
   # (a) GAP#2 — surface stale maker->verifier deliveries.
   local vrow vid vident vfier vdelivered vmins
@@ -1834,9 +1905,18 @@ _hb_stall_sweep() {
 
   total_stranded=0
   if (( in_prog == 0 && running_loops == 0 )); then
+    # DIVE-2122: a DELIVERED maker->verifier row is status='todo' assigned to the
+    # VERIFIER. It is neither unclaimed nor stranded — it is awaiting a grade, and
+    # gap#2 above already surfaces it on its own clock. Counting it here inflated the
+    # stranded number with work that was moving (three such rows at the 2026-07-26
+    # alert). Same predicate as the gap#2 query, so the two cannot disagree.
     stranded_todo=$(db "SELECT COUNT(*) FROM tasks
                         WHERE status='todo' AND kind='standard'
-                          AND assignee IS NOT NULL AND assignee != '';" 2>/dev/null || echo 0)
+                          AND assignee IS NOT NULL AND assignee != ''
+                          AND NOT (verifier IS NOT NULL AND maker_agent IS NOT NULL
+                                   AND assignee=verifier
+                                   AND handoff_delivered_at IS NOT NULL
+                                   AND handoff_ack_at IS NULL);" 2>/dev/null || echo 0)
     # A gate is STRANDED-actionable (counts toward the alarm) only when it's
     # fleet-actionable (tier<=1, an agent can clear it) OR it has never been
     # surfaced to the human at all (need_asked_at AND gate_pinged_at both
@@ -1868,11 +1948,29 @@ _hb_stall_sweep() {
       last_alert=$(db "SELECT value FROM task_prefs WHERE key='stall_alerted_at';" 2>/dev/null)
       cutoff=$(date -u -d "${_HB_STALL_MIN_MINUTES} minutes ago" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo "")
       if [[ -z "$last_alert" || ( -n "$cutoff" && "$last_alert" < "$cutoff" ) ]]; then
-        ( cmd_send "main" --from="task-engine" \
-            --message="🛑 fleet-stall: 0 agents in_progress, 0 running loops, but ${total_stranded} stranded actionable item(s) (${stranded_todo} unclaimed todo, ${open_gates} open gate(s)) have sat idle $((since_secs / 60))m+ — nothing is self-correcting. Check \`5dive task ls\` / \`5dive task inbox\` (DIVE-1416 gap#3)." ) >/dev/null 2>&1 || true
-        db "INSERT INTO task_prefs (key,value) VALUES ('stall_alerted_at', datetime('now'))
-            ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=datetime('now');"
-        _hb_log "[stall-sweep] fleet-idle $((since_secs / 60))m with ${total_stranded} stranded item(s) -> alarmed main"
+        # DIVE-2122: before asserting "nothing is self-correcting", MEASURE it.
+        _hb_fleet_activity_probe 1
+        if (( _HB_ACT_ACTIVE > 0 )); then
+          # The fleet is working; the proxy was wrong, not the fleet. Reset the clock
+          # too — "idle Nm+" is a claim about elapsed idleness, and we just observed
+          # the opposite, so carrying N forward would report a number we disproved.
+          db "DELETE FROM task_prefs WHERE key='stall_first_seen_at';"
+          _hb_log "[stall-sweep] SUPPRESSED: ${total_stranded} stranded item(s) and 0 in_progress, but agent '${_HB_ACT_ACTIVE_NAMES}' is actively working — in_progress is a proxy, the session is the artifact (DIVE-2122)"
+        else
+          # Nothing active. Re-probe WITHOUT the early exit so the alert can say what
+          # it actually checked; an alarm that will not name its measurement cannot be
+          # told apart from one that measured nothing.
+          _hb_fleet_activity_probe 0
+          local _act_detail="probed ${_HB_ACT_CHECKED} agent session(s): ${_HB_ACT_IDLE} idle"
+          (( _HB_ACT_BLOCKED > 0 )) && _act_detail="${_act_detail}, ${_HB_ACT_BLOCKED} BLOCKED (${_HB_ACT_BLOCKED_NAMES}) — a frozen permission/usage dialog is the usual root and does NOT self-clear"
+          (( _HB_ACT_UNKNOWN > 0 )) && _act_detail="${_act_detail}, ${_HB_ACT_UNKNOWN} UNMEASURABLE (pane uncapturable) — this alert did not prove those idle"
+          (( _HB_ACT_CHECKED == 0 )) && _act_detail="session probe UNAVAILABLE (no agents readable) — idleness is UNVERIFIED, not measured"
+          ( cmd_send "main" --from="task-engine" \
+              --message="🛑 fleet-stall: ${total_stranded} stranded actionable item(s) (${stranded_todo} unclaimed todo, ${open_gates} open gate(s)) idle $((since_secs / 60))m+ with 0 in_progress and 0 running loops — and ${_act_detail}. Check \`5dive task ls\` / \`5dive task inbox\` (DIVE-1416 gap#3, session probe DIVE-2122)." ) >/dev/null 2>&1 || true
+          db "INSERT INTO task_prefs (key,value) VALUES ('stall_alerted_at', datetime('now'))
+              ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=datetime('now');"
+          _hb_log "[stall-sweep] fleet-idle $((since_secs / 60))m with ${total_stranded} stranded item(s), ${_act_detail} -> alarmed main"
+        fi
       fi
     fi
   else
