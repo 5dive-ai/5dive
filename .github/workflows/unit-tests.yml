@@ -84,6 +84,16 @@ jobs:
             echo '// stub for the installed-host CI matrix' \
               | sudo tee "/usr/local/lib/5dive/$p/server.ts" >/dev/null
           done
+          # DIVE-2018: a `claude` user and at least one `agent-*` user. The control
+          # plane has both; a CI runner has neither, so gate_nonce_unit.sh and
+          # gate_sudo_uid_forge_unit.sh `exit 0` at their own SKIP guard before ever
+          # reaching a verdict. After the canary fix they were the LAST two harnesses
+          # the probe could not reach in ANY environment — and they are the gate
+          # identity and SUDO_UID forge tests, i.e. exactly the coverage whose absence
+          # matters most. Two throwaway system users, no shell, no home.
+          sudo useradd -M -N -s /usr/sbin/nologin claude 2>/dev/null || true
+          sudo useradd -M -N -s /usr/sbin/nologin agent-dev 2>/dev/null || true
+          getent passwd claude agent-dev
       - name: Run unit harnesses (installed host)
         run: |
           rc=0
