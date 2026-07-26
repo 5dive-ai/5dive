@@ -40,6 +40,11 @@ ok_t()  { PASS=$((PASS+1)); printf 'ok   - %s\n' "$1"; }
 bad_t() { FAIL=$((FAIL+1)); printf 'FAIL - %s\n   %s\n' "$1" "${2:-}"; }
 run()  { local verb="$1"; shift; ( JSON_MODE=1; "cmd_task_$verb" "$@" ) 2>"$TMP"/err; }
 runt() { local verb="$1"; shift; ( JSON_MODE=0; "cmd_task_$verb" "$@" ) 2>"$TMP"/err; }
+# DIVE-2007: the delivered-loop close guard reads the ACTOR, so a case about who
+# may close has to say who is calling. task_actor() falls back to $USER when there
+# is no sudo mapping and no --from.
+run_as() { local who="$1" verb="$2"; shift 2
+           ( USER="agent-${who}"; SUDO_UID=""; SUDO_USER=""; JSON_MODE=1; "cmd_task_$verb" "$@" ) 2>"$TMP"/err; }
 jf()   { jq -r "$1" 2>/dev/null; }
 has()  { [[ "$1" == *"$2"* ]]; }
 
@@ -192,12 +197,20 @@ mk_out=$(run verifier "$low_id" alice); mk_rc=$?
   && ok_t "T10d mid-review, re-pointing at the MAKER is refused as self-grading" \
   || bad_t "T10d mid-review, re-pointing at the MAKER is refused as self-grading" "rc=$mk_rc $mk_out $(cat "$TMP"/err)"
 
-# And the new grader's own `task done` (verifier==assignee) closes it for real.
-run done "$low_id" --result="graded PASS" >/dev/null
+# DIVE-2007 changed what "the grader's own done" MEANS here. It used to be
+# positional — verifier==assignee, satisfied by the re-point alone, so ANY caller
+# closed it. It is now the ACTOR: only carol closes carol's review. Both halves
+# asserted, maker-first, so the case can no longer pass on position alone.
+mk_close=$(run_as alice done "$low_id" --result="maker sneaks a close"); mk_close_rc=$?
+(( mk_close_rc != 0 )) && [[ "$(db "SELECT status FROM tasks WHERE id=${low_id};")" == "todo" ]] \
+  && ok_t "T10e the MAKER's done on the re-pointed review is refused (DIVE-2007)" \
+  || bad_t "T10e the MAKER's done on the re-pointed review is refused (DIVE-2007)" \
+           "rc=$mk_close_rc status=$(db "SELECT status FROM tasks WHERE id=${low_id};") $(cat "$TMP"/err)"
+run_as carol done "$low_id" --result="graded PASS" >/dev/null
 [[ "$(db "SELECT status FROM tasks WHERE id=${low_id};")" == "done" ]] \
-  && ok_t "T10e the re-pointed grader's own 'task done' closes the task" \
-  || bad_t "T10e the re-pointed grader's own 'task done' closes the task" \
-           "status=$(db "SELECT status FROM tasks WHERE id=${low_id};")"
+  && ok_t "T10f the re-pointed grader's own 'task done' closes the task" \
+  || bad_t "T10f the re-pointed grader's own 'task done' closes the task" \
+           "status=$(db "SELECT status FROM tasks WHERE id=${low_id};") $(cat "$TMP"/err)"
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]

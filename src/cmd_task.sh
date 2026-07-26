@@ -117,7 +117,9 @@ _task_usage() {
   their todo; the heartbeat wakes them). The verifier grades against acceptance_criteria
   / runs 'task verify', then closes it ('task done', which closes for real since
   verifier==assignee) on PASS or 'task reject --feedback=' on FAIL (bounce back to the
-  maker, or escalate to a human at max_iterations). Writer never grades itself.
+  maker, or escalate to a human at max_iterations). Writer never grades itself:
+  once delivered, a 'task done' from anyone but the verifier is REFUSED (DIVE-2007) —
+  to amend a delivered result, send the correction to the verifier, don't re-run done.
 
   Any agent (group claude) can run these without sudo. Add --json for machine output.
 USAGE
@@ -1474,6 +1476,45 @@ _task_status_cmd() {
     if [[ -n "$_vfier" && "$_vfier" != "$_asignee" ]]; then
       _task_route_to_verifier "$id" "$_vfier" "$_asignee" "$result" "$want_result"
       return
+    fi
+    # DIVE-2007: the DELIVERED state must be durable against its own MAKER. The
+    # routing test above is positional (`verifier != assignee`), and delivery
+    # flips assignee TO the verifier — so a SECOND `task done` by the same maker
+    # read as "the verifier's own close" and fell straight through to a real
+    # close. DIVE-1988 closed that way: status=done, iteration 1 still open, the
+    # verifier never graded. Hit from the other side on DIVE-2002. Key the guard
+    # on the ACTOR, not on who the row is assigned to: while a loop is delivered
+    # (maker recorded, verifier holding it), only the verifier may close it.
+    # Refuse rather than re-deliver at iteration+1 — a silent re-delivery burns
+    # the max_iterations budget and would let a wrong `done` escalate the loop.
+    # Same shape as DIVE-1330's handoff guard (block + name the real verbs).
+    if [[ -n "$_vfier" && "$_vfier" == "$_asignee" ]]; then
+      local _maker _actor _st _iter
+      _maker=$(db "SELECT COALESCE(maker_agent,'') FROM tasks WHERE id=${id};")
+      _st=$(db  "SELECT COALESCE(status,'')        FROM tasks WHERE id=${id};")
+      _iter=$(db "SELECT COALESCE(iteration,0)     FROM tasks WHERE id=${id};")
+      _actor=$(task_actor)
+      # Already-closed tasks pass through (a repeat `done` stays idempotent);
+      # only a LIVE delivered loop is protected.
+      #
+      # `cli` is `task_actor`'s "could not attribute this invocation" sentinel —
+      # a non-agent user, root cron, CI. It is deliberately EXEMPT, and CI is what
+      # found this: with $USER unresolvable this guard fired ahead of the DIVE-1830
+      # merge-gate on tests/task_deliver_merge_gate_unit.sh Tb/Tc, so a close whose
+      # real problem was an unmerged delivery PR got refused citing DIVE-2007 (Tb
+      # asserts the message names DIVE-1830) and a MERGED one was refused outright
+      # (Tc). Two costs, both bad: the reader is sent after the wrong rule, and a
+      # legitimate non-agent close is blocked by a rail aimed at something else.
+      # The threat model here is a MAKER — a resolvable agent — closing its own
+      # work; DIVE-1988's maker resolved to `dev` and is still caught. An
+      # unattributable caller is a DIFFERENT question and not this ticket's to
+      # answer. It stayed green on every dev box because $USER there resolves to
+      # an agent, which is exactly why local green is not CI green.
+      if [[ -n "$_maker" && "$_actor" != "$_vfier" && "$_actor" != "cli" \
+            && "$_st" != "done" && "$_st" != "cancelled" ]]; then
+        policy_refuse "$E_CONFLICT" done-over-delivered-loop DIVE-2007 "$ident" \
+          "$ident is DELIVERED to verifier '${_vfier}' (iteration ${_iter}, maker '${_maker}') and has NOT been graded — a 'task done' from '${_actor}' would close it ungraded, which is the maker grading its own work (writer != grader, DIVE-477). Only '${_vfier}' can close it. To CORRECT the result text do NOT re-run done: send the correction to '${_vfier}' (5dive agent send ${_vfier} \"...\") and let them fold it in. Real exits: '5dive task reject $ident --feedback=...' (verifier bounces it back), '5dive task verify $ident --cmd=\"<acceptance test>\"' (evidence-backed close), or '5dive task cancel $ident --result=...' (abandon)."
+      fi
     fi
   fi
   # DIVE-555 gate enforcement (DIVE-393/394 class): a `task done` must NOT close
