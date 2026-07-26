@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.16.18 — fix(agent): an unmeasurable sudo grant no longer renders as the genuine class "custom" (DIVE-2098) (2026-07-26)
+
+`isolation_implied_by_grant` ended in a catch-all `*) printf 'custom'`. **`custom` is a real
+member of that vocabulary**, so the *absence of a measurement* rendered as a confident privilege
+claim. Measured live on the control plane, same caller, peer row `agent-main`: implied isolation
+read `custom` where the truth is legacy root-all — wrong by two steps, and wrong in the
+reassuring direction.
+
+Guarded at both layers: the helper maps `unknown` and any unrecognised class to `unknown`, and
+the `agent info` projection emits **null** rather than a string, because every other member of
+that field's vocabulary is a definite class.
+
+Why DIVE-2079's suite stayed green through this: **the test re-implemented the `diverges`
+predicate rather than driving the real projection — and a copy of one field cannot catch a bug
+in the field beside it.** The new harness drives the actual `cmd_info` projection over a fixture
+state dir as a non-root caller: 4 graded failures on pristine main, 37/37 after, and mutation-
+graded per layer so reverting either guard alone is still caught by the other.
+
 ## 0.16.17 — fix(loop): a collided loop_id killed the panel's own INSERT, and the harness poller then hid it (DIVE-2083) (2026-07-26)
 
 The red main on `73752da` was **two defects in one chain**, and each was separately dismissed
