@@ -41,6 +41,10 @@
 #      owner from an earlier send in the same process
 #   6. the delivery row carries via=<agent> and path=<rail> on all three rails:
 #      file-time, renag, privileged-resend
+#   7. (DIVE-2084) ...and the CHAIN resolver clears the owner too, which is a
+#      separate line from 5: for a NON-empty chain the per-candidate clear inside
+#      _task_agent_channel makes _task_chain_channel's own clear behaviourally
+#      redundant, so only an EMPTY chain grades it.
 # Run: bash tests/gate_delivery_actor_unit.sh   (no root, no network)
 set -uo pipefail
 cd "$(dirname "$0")/.."
@@ -175,6 +179,50 @@ if grep -q 'via=olivia path=renag' "$FIVEDIVE_GATE_NOTIFY_LOG" 2>/dev/null; then
 else
   bad_t "notify log carries via/path" "$(tail -2 "$FIVEDIVE_GATE_NOTIFY_LOG" 2>/dev/null)"
 fi
+
+# ---- 4. an EMPTY escalation chain still clears the owner (DIVE-2084) ---------
+# _task_chain_channel clears TASK_CH_AGENT on entry, then loops candidates
+# calling _task_agent_channel, which clears again per candidate. So for any
+# NON-empty chain the entry clear is behaviourally redundant and section 3 above
+# already covers the observable — which is why deleting it left this harness at
+# 11/0. The one shape that grades it is a chain of ZERO entries: the loop body
+# never runs, and the entry clear is then the ONLY thing standing between a
+# failed resolve and an error row that borrows the PREVIOUS send's owner.
+#
+# Zero entries is reachable, not theoretical. _task_escalation_chain emits
+# nothing when the filer has no reports_to AND the coordinator is either empty or
+# IS the filer — i.e. every gate filed by the top-of-org agent, the one shape
+# DIVE-1968 measured as the only real failure population (and per DIVE-2031 the
+# coordinator resolved empty fleetwide for a while, which makes it every filer).
+#
+# The process shape is the root re-nag sweep: it walks EVERY pending gate in one
+# process, so gate A's successful resolve is still sitting in the global when
+# gate B's fails.
+db "INSERT INTO agents_org(name, reports_to, role) VALUES ('olivia', NULL, 'coordinator');" >/dev/null
+
+# Non-vacuity guard: if the fixture ever drifts into a NON-empty chain the
+# assertion below would pass through the per-candidate clear instead of the line
+# under test, and go quietly green against the mutant. Pin the precondition.
+chain_n=$(_task_escalation_chain olivia | grep -c '[^[:space:]]')
+if [[ "$chain_n" == "0" ]]; then
+  ok_t "a top-of-org filer who IS the coordinator has an empty escalation chain"
+else
+  bad_t "top-of-org filer has an empty escalation chain" \
+        "chain has $chain_n entries: $(_task_escalation_chain olivia | tr '\n' ' ')"
+fi
+
+mk_channel marketing
+_task_agent_channel marketing    # gate A in this sweep resolved; TASK_CH_AGENT=marketing
+TASK_GATE_RENAG=1
+if _task_chain_channel olivia; then
+  bad_t "an empty chain fails the resolve" "returned 0 with TASK_CH_AGENT='$TASK_CH_AGENT'"
+else
+  _task_gate_delivery_log error DIVE-2050 "" "" \
+    "no paired channel for filer olivia or anyone above it"
+  row_says "an empty-chain resolve records via=none, not the previous gate's owner" \
+           "via=none" "path=renag"
+fi
+TASK_GATE_RENAG=""
 
 printf '\n%s: %d passed, %d failed\n' "$(basename "$0")" "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]
