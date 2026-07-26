@@ -121,6 +121,11 @@ resolve_codex() {
 OPENCLAW_PATH_OVERRIDE=""
 case "$TYPE" in
   claude)   BIN="/home/claude/.local/bin/claude"; ARGS=(--dangerously-skip-permissions) ;;
+  # --respect-workspace-trust false: devin's workspace-trust dialog blocks
+  # the unattended tmux session on first boot in a new workdir (verified
+  # live against devin 3000.2.17); unattended parity with claude's
+  # skip-permissions posture.
+  devin)    BIN="/home/claude/.local/bin/devin"; ARGS=(--permission-mode dangerous --respect-workspace-trust false) ;;
   hermes)   BIN="/home/claude/.local/bin/hermes"; ARGS=() ;;
   openclaw)
     BIN="/home/claude/.local/bin/openclaw"
@@ -348,6 +353,35 @@ cred_seed_why() { # <path>
   fi
 }
 
+if [[ "$TYPE" == "devin" ]]; then
+  # devin resolves state from $HOME: credentials at ~/.local/share/devin/
+  # credentials.toml, config at ~/.config/devin/config.json (which carries
+  # shell.setup_complete=true — seeding it suppresses devin's first-run
+  # wizard, which would otherwise block the unattended tmux session). Seed
+  # both from the shared /home/claude login; re-seed when the shared copy is
+  # newer (someone re-ran `5dive agent auth login devin`). Mirrors the codex
+  # auth seeding below.
+  AGENT_DEVIN_DATA="$HOME/.local/share/devin"
+  AGENT_DEVIN_CFG="$HOME/.config/devin"
+  install -d -m 700 "$AGENT_DEVIN_DATA" "$AGENT_DEVIN_CFG"
+  for _pair in \
+    "/home/claude/.local/share/devin/credentials.toml:$AGENT_DEVIN_DATA/credentials.toml" \
+    "/home/claude/.config/devin/config.json:$AGENT_DEVIN_CFG/config.json"; do
+    _src="${_pair%%:*}"; _dst="${_pair#*:}"
+    if { [[ -e "$_src" ]] || sudo -n test -e "$_src" 2>/dev/null; } \
+       && { [[ ! -f "$_dst" ]] || [[ "$_src" -nt "$_dst" ]]; }; then
+      _tmp="$(mktemp -p "$(dirname "$_dst")" .seed.XXXXXX)"
+      if { cat "$_src" 2>/dev/null || sudo -n cat "$_src" 2>/dev/null; } > "$_tmp" && [[ -s "$_tmp" ]]; then
+        chmod 600 "$_tmp"
+        mv "$_tmp" "$_dst"
+      else
+        rm -f "$_tmp"
+        echo "warn: could not seed $(basename "$_dst") from $_src" >&2
+      fi
+    fi
+  done
+  unset _pair _src _dst _tmp 2>/dev/null || :
+fi
 if [[ "$TYPE" == "codex" ]]; then
   AGENT_CODEX_HOME="$HOME/.codex"
   install -d -m 700 "$AGENT_CODEX_HOME"
@@ -1083,6 +1117,9 @@ case "$TYPE" in
   antigravity|grok)
     # OAuth via auth file (~/.gemini/antigravity-cli/* and ~/.grok/auth.json).
     # Same cross-provider leak posture as hermes/openclaw — drop everything.
+    UNSET_CREDS="CLAUDE_CODE_OAUTH_TOKEN ANTHROPIC_API_KEY OPENAI_API_KEY GEMINI_API_KEY GOOGLE_API_KEY" ;;
+  devin)
+    # OAuth via credentials.toml — no provider env vars belong here.
     UNSET_CREDS="CLAUDE_CODE_OAUTH_TOKEN ANTHROPIC_API_KEY OPENAI_API_KEY GEMINI_API_KEY GOOGLE_API_KEY" ;;
   *)
     UNSET_CREDS="" ;;

@@ -963,6 +963,7 @@ _hb_idle_marker() {
     claude)       printf '❯' ;;
     codex)        printf '›' ;;
     antigravity)  printf '? for shortcuts' ;;
+    devin)        printf '❭' ;;
     *)            printf '' ;;  # grok/opencode/unknown: byte-stability alone
   esac
 }

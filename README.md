@@ -109,6 +109,7 @@ No broker, no protocol, no framework. Shared filesystem, shared CLI.
 | `codex`       | OpenAI Codex           | OAuth / API key | Telegram |
 | `antigravity` | Google Antigravity     | Google OAuth | Telegram |
 | `grok`        | xAI Grok               | OAuth (xAI) / API key | Telegram |
+| `devin`       | Cognition Devin        | OAuth (Devin account) | — |
 | `hermes`      | third-party multi-provider harness | API key | Telegram, Discord |
 | `openclaw`    | third-party multi-provider harness | API key | Telegram, Discord |
 | `opencode`    | OpenCode               | API key | Telegram |

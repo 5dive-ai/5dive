@@ -160,6 +160,11 @@ declare -A TYPE_BIN=(
   # it into ~/.local/bin so TYPE_BIN resolves on every box (same dance as
   # opencode/openclaw). MIT, ~70.8k stars. Added for the v0.9 pi epic (DIVE-1196).
   [pi]="/home/claude/.local/bin/pi"
+  # devin is Cognition's CLI (native binary). The cli.devin.ai installer
+  # drops a versioned store at ~/.local/share/devin/cli/_versions/ and
+  # symlinks ~/.local/bin/devin — TYPE_BIN points at the symlink, same
+  # convention as grok/opencode.
+  [devin]="/home/claude/.local/bin/devin"
 )
 # Which types accept --channels=telegram|discord. Each type wires the channel
 # differently (see install_channel_for_<type>_agent below):
@@ -215,6 +220,10 @@ declare -A TYPE_CHANNELS=(
   # marks pi channel-capable — creating a pi agent WITH --channels will fail at
   # install_channel_for_agent's dispatch until 1201 adds the `pi)` case. telegram only.
   [pi]=1
+  # devin has no telegram/discord bridge yet — reachable via agent send/ask,
+  # the task queue, and sibling agents. Explicit 0 (not omission) to declare
+  # the no-channel intent, per the DIVE-2076 note above this map.
+  [devin]=0
 )
 # Auth sentinel per type. Agent users run as agent-<name> (in group `claude`)
 # and cannot read /home/claude/.claude/settings.json (mode 0600), so for
@@ -255,6 +264,10 @@ declare -A TYPE_AUTH=(
   # ANTHROPIC_API_KEY/OPENAI_API_KEY env var (no file written) — the api-key
   # injection path (TYPE_API_FILE/VAR + cmd_auth) is finalized in DIVE-1200.
   [pi]="/home/claude/.pi/agent/auth.json"
+  # devin writes ~/.local/share/devin/credentials.toml on `devin auth login`
+  # (browser OAuth against the user's Devin account — no API key). Verified
+  # empirically against devin 3000.2.17.
+  [devin]="/home/claude/.local/share/devin/credentials.toml"
 )
 # Installer recipe per type. Run as `claude` user via `sudo -u claude -i bash -lc <recipe>`
 # so $HOME/.nvm and PATH resolve correctly. Empty string => no automated installer
@@ -271,6 +284,9 @@ declare -A TYPE_INSTALL=(
   # DIVE-2061 (`command -v 5dive` grading the installed CLI instead of the bundle
   # under test). This is the question the codex comment below already prescribes.
   [claude]="[[ -x /home/claude/.local/bin/claude ]] || curl -fsSL https://claude.ai/install.sh | bash"
+  # devin: same exact-path guard; the installer self-manages the versioned
+  # store + ~/.local/bin symlink, so -x makes the recipe idempotent.
+  [devin]="[[ -x /home/claude/.local/bin/devin ]] || curl -fsSL https://cli.devin.ai/install.sh | bash"
   # Verify the EXACT TYPE_BIN path (not `command -v codex`): a stray
   # /usr/bin/codex from apt or a codex left over under a non-v24 nvm major
   # would short-circuit the install and surface as "install reported success
@@ -684,6 +700,9 @@ declare -A TYPE_PROBE=(
   # subcommand is meant for headless but takes longer to spin up than
   # we want for a 5s probe. Stick with file-presence.
   [grok]=''
+  # devin -p spins up a full agent session — too slow for a 5s probe.
+  # File-presence via the TYPE_AUTH sentinel.
+  [devin]=''
 )
 
 # -------- exit codes & output helpers --------
@@ -6262,6 +6281,10 @@ cmd_auth_login() {
          '{type:$t, var:$v, profile:$p}' \
          --arg t "claude" --arg v "CLAUDE_CODE_OAUTH_TOKEN" --arg p "${profile:-}"
       return ;;
+    devin)
+      # devin signs in via its own browser/device flow and persists
+      # ~/.local/share/devin/credentials.toml (the TYPE_AUTH sentinel).
+      exec sudo -u claude -i env $extra_env "$bin" auth login ;;
     hermes)
       # hermes signs in to OpenAI via its own device-code flow. Run it
       # interactively so the user can see the URL/code and Ctrl+C cleanly.
@@ -14191,6 +14214,9 @@ _mirror_follow_migration() {
 # "›" so codex is detected like every other TUI. Collision-free (only codex draws
 # "›"; claude "❯"; antigravity its footer), so it stays type-agnostic. Keep this
 # set in lockstep with _hb_idle_marker (cmd_heartbeat.sh) — they must not drift.
+# devin's composer glyph is ❭ (U+276D — verified live against devin
+# 3000.2.17); distinct from claude's ❯ and codex's ›, so it stays
+# collision-free in the OR-set.
 # The marker set lives in one PURE predicate (_agent_pane_input_ready) so it can
 # be unit-tested against real pane samples with NO tmux — and a future TUI's
 # marker is added in exactly one place. The readiness set is a SUPERSET of the
@@ -14198,7 +14224,7 @@ _mirror_follow_migration() {
 # readiness — not idle — probe accepts); heartbeat_idle_marker_unit.sh asserts
 # every idle marker is also a readiness marker, so the two can never drift again.
 _agent_pane_input_ready() {
-  grep -qE '❯|›|\? for shortcuts|esc to cancel' <<<"${1:-}"
+  grep -qE '❯|›|❭|\? for shortcuts|esc to cancel' <<<"${1:-}"
 }
 wait_agent_input_ready() {
   local name="$1" timeout="${2:-45}"
@@ -16534,7 +16560,7 @@ USAGE
     "Pick the coding agent that will power your first teammate."
 
   # --- Step 1: pick a type ---
-  local -a types=(claude codex antigravity grok hermes openclaw opencode pi)
+  local -a types=(claude codex antigravity grok hermes openclaw opencode pi devin)
   local -A type_desc=(
     [claude]="Anthropic's Claude — recommended"
     [codex]="OpenAI Codex"
@@ -16544,6 +16570,7 @@ USAGE
     [openclaw]="Open-source agent — bring your own provider"
     [opencode]="Open-source agent — bring your own provider"
     [pi]="Extension-based coding agent — bring your own provider"
+    [devin]="Cognition's Devin CLI"
   )
   local -A type_label=(
     [claude]="Claude Code"
@@ -16554,6 +16581,7 @@ USAGE
     [openclaw]="OpenClaw"
     [opencode]="OpenCode"
     [pi]="Pi"
+    [devin]="Devin"
   )
   local -a type_menu=()
   local t
@@ -36474,6 +36502,7 @@ _hb_idle_marker() {
     claude)       printf '❯' ;;
     codex)        printf '›' ;;
     antigravity)  printf '? for shortcuts' ;;
+    devin)        printf '❭' ;;
     *)            printf '' ;;  # grok/opencode/unknown: byte-stability alone
   esac
 }
