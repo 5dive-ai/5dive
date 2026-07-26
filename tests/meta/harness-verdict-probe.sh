@@ -137,11 +137,21 @@ counter_verdict() {   # -> "<var>\t<lineno>\t<last|not-last>"
 
 CORPUS_N=0; for t in tests/*.sh; do [[ -e "$t" ]] && CORPUS_N=$(( CORPUS_N + 1 )); done
 only_set=" ${ONLY//,/ } "
+# DIVE-2039: every line of this script's output was buffered into arrays and printed
+# at the END, so a full sweep wrote ZERO BYTES for tens of minutes — indistinguishable
+# from a hang, both to a person and to CI, which has to guess whether to keep waiting.
+# `5dive selfcheck --full` inherited that silence and was reported as a hang before
+# anyone could show it was merely slow. Progress goes to STDERR only: stdout carries
+# the summary and the report file carries the verdicts, and both formats are read by
+# harness-verdict-union.sh, so neither may gain a line.
+PROBED_N=0
 for t in tests/*.sh; do
   b=$(basename "$t")
   # --only takes a LIST so a second environment can re-probe exactly the harnesses
   # the first one skipped, instead of paying for the whole corpus twice.
   [[ -n "$ONLY" && "$only_set" != *" $b "* ]] && continue
+  PROBED_N=$(( PROBED_N + 1 ))
+  printf '  probing %d/%d %s\n' "$PROBED_N" "$CORPUS_N" "$b" >&2
   if (( ! ASSUME_CLEAN )); then
     if ! timeout "$TIMEOUT" bash "$t" >/dev/null 2>&1; then ALREADY_RED+=("$b"); continue; fi
   fi

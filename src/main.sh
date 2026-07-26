@@ -251,6 +251,17 @@ Models:
     picker — a model release is a one-line change in src/lib/models.sh.
 
 Health:
+  5dive selfcheck [--json] [--only=<probe,...>] [--full] [--strict] [--allow=<probe,...>] [--report=<f>] [--label=<env>] [--list]
+    Does each rail ACT? Runs gate delivery, the audit log (root AND non-root),
+    the test-harness mutation probe, bundle integrity, the crontab snapshot and
+    the scorecard FOR REAL in an isolated state dir and asserts the EFFECT, not
+    the string printed. Every probe is pass | fail | NOT-REACHED — NOT-REACHED
+    is a first-class third state, never folded into pass, and one with no reason
+    exits non-zero. Where doctor asks whether the box is healthy, this asks
+    whether our own instruments can still tell. Union the --report= files from
+    two environments (tests/meta/selfcheck-union.sh) to prove no probe is
+    skipped everywhere.
+
   5dive doctor [--fix] [--dry-run] [--category=deps|types|auth|creds|registry|shelld|channels|host|memory]
     Walks deps (tmux/jq/bun/python3/nvm/node/npm), type bins, live auth
     probes, stale shadow-credential heal (creds), registry integrity, channel
@@ -615,6 +626,14 @@ main() {
     watch)
       # Live multi-agent dashboard (htop-style). Read-only — no audit, no lock.
       cmd_watch "$@" ;;
+    selfcheck)
+      # DIVE-2039 (v0.16 "Fails loud"): run each critical rail for real in an
+      # ISOLATED state dir and assert the EFFECT, not the report. Every write it
+      # makes lands under its own throwaway STATE_DIR/TASKS_DB/AUDIT_LOG, so this
+      # never touches the live store, never pings a human, and needs no lock. Not
+      # audited: it mutates nothing outside its own temp dirs (same posture as
+      # doctor without --fix).
+      cmd_selfcheck "$@" ;;
     task)
       # Shared task queue (sqlite). Group-writable store, so no root/lock and
       # no audit — these are high-frequency, low-risk ops any agent runs. SQLite

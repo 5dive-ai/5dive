@@ -1,5 +1,60 @@
 # Changelog
 
+## 0.16.0 — `5dive selfcheck`: prove the rails ACTED, not that they reported (DIVE-2039) (2026-07-26)
+
+Opens v0.16 "Fails loud" (epic DIVE-2038). Every check we owned graded a rail on
+what it REPORTED. This one grades it on what it CHANGED — the 24h that produced
+0.15.8..0.15.30 had one dominant defect: a rail that reported success and changed
+nothing (DIVE-2003 harness exit 0 with a stranded verdict, DIVE-1989 nine audit
+sub-events gated on `$EUID`, DIVE-1968 gates filed and pinged recording nothing,
+DIVE-1991 a snapshot exiting 0 having saved nothing, DIVE-1977 a bundle and its
+checksum from two cache generations, DIVE-1929 a partial read rendered as a number).
+None of them was catchable by running the rail and reading its output.
+
+`5dive selfcheck [--json] [--only=] [--full] [--strict] [--allow=] [--report=]
+[--label=] [--list]` runs each critical rail FOR REAL in an isolated
+STATE_DIR/TASKS_DB/AUDIT_LOG and asserts the effect: a filed gate leaves a delivery
+row carrying the channel it reached (both the silent-path `error` row + rc 3 and the
+confirmed-send `ok` backfill); an audit row lands for an action, or a blocked append
+leaves a drop marker; every harness's exit status is wired to its own verdict
+(mutation, not a green run); the tracked bundle, its checksum and `src/` all agree;
+committed crontab snapshots match the live crontabs and a save-nothing run exits
+non-zero; and every scorecard row either says NO DATA and names what was missed or
+carries a number and declares its coverage.
+
+**NOT-REACHED is a first-class third verdict**, never folded into pass, and one with
+no reason exits non-zero. Because a reasoned skip is correctly not a failure in any
+single run, `--report=` + `tests/meta/selfcheck-union.sh` assert the invariant that
+does survive: every probe is REACHED in at least one environment. CI now runs
+selfcheck in three environments (pristine, installed-host, installed-root) and unions
+them — `audit-root` and `audit-nonroot` are separate probes precisely because
+DIVE-1989 stayed invisible for as long as the audit log was measured from one side.
+
+Proven by MUTATION, not by a green run (`tests/selfcheck_mutation_e2e.sh`): **all seven**
+probes are broken for real in a throwaway copy of the tree, selfcheck is required to go
+red AND to name the breakage, then restored and required to go green. "It passed" is not
+evidence for a prover of this defect class; "it failed when I broke it" is.
+
+Review by main found two defects in the first cut, both of which the mutation coverage
+now pins:
+
+- **`scorecard-honesty` was blind.** It resolved the binary to grade as
+  `command -v 5dive || $0`, and `command -v` wins wherever 5dive is installed — every
+  agent's box. So a mutated bundle graded the healthy INSTALLED CLI: `./5dive proof
+  scorecard` printed `0.42` for all seven metrics, including dimensions with no data
+  source at all, while `./5dive selfcheck` reported ok and claimed "6 degraded to NO
+  DATA". It graded a different artifact than the one it lives in and could not tell.
+  Invisible in CI, where nothing is installed and `$0` won. Now resolved
+  running-bundle-first, every candidate verified to BE a 5dive bundle, and the pass
+  message names the artifact it graded.
+- **`--full` ran >15 minutes writing zero bytes** and was indistinguishable from a hang.
+  The duration is inherent (every harness, twice) and is now documented with an
+  `--assume-clean` fast path, but the silence was its own defect:
+  `tests/meta/harness-verdict-probe.sh` buffered every line into arrays and printed at
+  the end, so `5dive selfcheck --full` inherited it. Both now stream per-harness
+  progress to **stderr** — stdout stays clean for `--json` and the report, which is
+  asserted.
+
 ## 0.15.41 — fix(task): no CLI lever stopped a recurring template — cancel/block/park all left it firing, and `task ls --recurring` disagreed with the scheduler (DIVE-2055) (2026-07-26)
 
 - **the materializer's fire query keyed on `kind='recurring' AND schedule IS NOT NULL` alone — no status check.** A template moved to `cancelled`, `blocked` (via `task block` or `task park`, which both write status='blocked'), or `done` kept firing on its cron forever; none of the three CLI verbs that look like a stop lever actually stopped anything. Proven live on DIVE-1447: cancelled on 2026-07-25, it fired again the next morning and spawned an 8th void instance.

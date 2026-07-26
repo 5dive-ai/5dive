@@ -65,6 +65,18 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with: { name: probe-pristine, path: probe-pristine.txt, if-no-files-found: error }
+      # DIVE-2039: the rail prover, from the pristine side. `snapshot-rails` is
+      # allowlisted because GitHub CI has no ops checkout — that exemption can
+      # never be earned here by adding another job, which is the difference
+      # between an allowlist and a skip. Every other probe must be REACHED by
+      # this job or the installed-host one, and the union below asserts it.
+      - name: Do the rails ACT? (pristine)
+        run: |
+          bash ./5dive selfcheck --allow=snapshot-rails \
+            --label=pristine --report=selfcheck-pristine.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: { name: selfcheck-pristine, path: selfcheck-pristine.txt, if-no-files-found: error }
 
   test-installed-host:
     runs-on: ubuntu-latest
@@ -120,6 +132,23 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with: { name: probe-installed, path: probe-installed.txt, if-no-files-found: error }
+      # DIVE-2039: TWICE, and that is the point. DIVE-1989 stayed invisible for as
+      # long as the audit log was measured from one side — the same command wrote 0
+      # rows as an agent and 1 row under sudo. `audit-root` is honestly NOT-REACHED
+      # from an unprivileged run and `audit-nonroot` from a root one, so neither
+      # invocation can cover the rail and neither pretends to. The union does.
+      - name: Do the rails ACT? (installed host, unprivileged)
+        run: |
+          bash ./5dive selfcheck --allow=snapshot-rails \
+            --label=installed-host --report=selfcheck-installed.txt
+      - name: Do the rails ACT? (installed host, root)
+        run: |
+          sudo bash ./5dive selfcheck --allow=snapshot-rails \
+            --label=installed-root --report=selfcheck-root.txt
+          sudo chown "$USER" selfcheck-root.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: { name: selfcheck-installed, path: "selfcheck-*.txt", if-no-files-found: error }
 
   # DIVE-2018: NOT-REACHED is correctly not a failure in any single run, so no
   # single run can establish that a harness has EVER been probed. On the control
@@ -146,3 +175,26 @@ jobs:
       # it exists to close.
       - name: Every harness must be probed in SOME environment
         run: bash tests/meta/harness-verdict-union.sh probe-pristine.txt probe-installed.txt
+
+  # DIVE-2039: the same invariant one level out, over the RAILS rather than the
+  # harnesses. `5dive selfcheck` reports pass | fail | NOT-REACHED and NOT-REACHED
+  # is deliberately not a failure in any single run — a probe whose precondition is
+  # absent has not been shown to be broken, and calling it broken is a false
+  # accusation. The cost is that coverage becomes environment-dependent unless
+  # something asserts the union, and a probe not reached in ANY environment is a
+  # rail nobody measures, reporting green forever. That is the DIVE-2018 shape
+  # exactly, which is why it is closed here on day one instead of after it bites.
+  selfcheck-union:
+    runs-on: ubuntu-latest
+    needs: [harness-verdict, test-installed-host]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with: { pattern: selfcheck-*, merge-multiple: true }
+      # Fails closed on a missing, headerless, different-corpus or
+      # disagreeing-allowlist report — a job that died before writing one cannot
+      # silently shrink what we claim to cover.
+      - name: Every rail must be PROVEN in SOME environment
+        run: |
+          bash tests/meta/selfcheck-union.sh \
+            selfcheck-pristine.txt selfcheck-installed.txt selfcheck-root.txt
