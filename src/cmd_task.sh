@@ -3337,6 +3337,22 @@ cmd_task_need() {
   if [[ -n "$options" && "$type" != "decision" ]]; then
     fail "$E_VALIDATION" "--options only applies to --type=decision"
   fi
+  # DIVE-2074: a decision gate on a branch-bound (delegated-push) task is a trap —
+  # `5dive push` only accepts a decision answer from the gate's OWN routed reviewer
+  # (matching invoker uid) or a human/lead stamp; a lead who answers on someone
+  # else's behalf (e.g. the org lead clearing a decision routed to a named
+  # reviewer) stamps as a bare agent name, which push refuses. That refusal lands
+  # on the PUSHER, one step after the lead believed they'd unblocked the work (see
+  # DIVE-2073/DIVE-2004). Surface the trap at FILE time, while --type can still be
+  # changed, instead of after an unusable answer is already recorded.
+  if [[ "$type" == "decision" ]]; then
+    local _need_body _need_branch
+    _need_body=$(db "SELECT COALESCE(body,'') FROM tasks WHERE id=${id};")
+    _need_branch=$(_push_branch_from_body "$_need_body")
+    if [[ -n "$_need_branch" ]]; then
+      warn "$ident is branch-bound (Branch: ${_need_branch}) — a --type=decision gate only authorizes 'push' when answered by ITS OWN routed reviewer; a lead clearing it on someone else's behalf will NOT satisfy push (DIVE-2073). If this gate is meant to unblock a delegated push, file --type=approval instead."
+    fi
+  fi
   # DIVE-931: --secret-key / --connector name the drop target and only make sense
   # on a secret gate. Require them together (a key with no connector has nowhere
   # to land, and vice versa) and validate against the same charsets the box-side

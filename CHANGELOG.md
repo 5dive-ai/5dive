@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.16.11 — fix(task): `task need` warns at file time when a decision gate lands on a branch-bound task (DIVE-2074) (2026-07-26)
+
+A `--type=decision` gate only authorizes `push` when it is answered by that task's OWN
+routed reviewer. A lead clearing it on someone else's behalf does not satisfy the push
+guard (DIVE-2073) — the gate reads as answered and the push still refuses, which is a
+confusing pair of states to debug after the fact.
+
+`task need` now warns at file time when a decision gate is filed against a branch-bound
+task, and points at `--type=approval` as the verb that actually unblocks a delegated push.
+Also documents the `bundle-drift` / `version-bump-guard` split in CONTRIBUTING: the former
+asserts `bundle == build(src)` and is version-independent, so a failing drift check is
+never asking for a version bump.
+
 ## 0.16.10 — fix(update): `update --check` fetched only the bundle, so it had nothing to cross-check and read a stale cache generation as up-to-date (DIVE-2042) (2026-07-26)
 
 `5dive update --check` printed `OK — CLI 0.15.34 is up to date` twice, several minutes
