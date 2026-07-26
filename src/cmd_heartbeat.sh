@@ -1171,6 +1171,12 @@ _hb_wake() {
 # it (|| log) so a materializer failure can NEVER abort the wake loop — the
 # heartbeat-never-woke bug class.
 #
+# DIVE-2055: the query used to key on kind+schedule alone, so a cancelled,
+# blocked, or parked template kept firing forever — none of `task cancel`,
+# `task block`, or `task park` (all of which move status off 'todo') had any
+# effect on the scheduler. status='todo' is now part of the fire predicate,
+# so any of those three verbs is a real stop lever; no new CLI verb needed.
+#
 # For each kind='recurring' template: fire when its cron matches `now` AND it
 # hasn't already fired THIS minute (last_fired_at guard — stops a double-fire if
 # two ticks land in the same matching minute). DEDUP (skip-if-open): don't
@@ -1206,7 +1212,7 @@ _hb_materialize_recurring() {
     else
       _hb_log "[materializer] $(_hb_ident "$tid") insert failed"
     fi
-  done < <(db "SELECT id, schedule, COALESCE(last_fired_at,'') FROM tasks WHERE kind='recurring' AND schedule IS NOT NULL;" 2>/dev/null | tr '|' '\t')
+  done < <(db "SELECT id, schedule, COALESCE(last_fired_at,'') FROM tasks WHERE kind='recurring' AND schedule IS NOT NULL AND status='todo';" 2>/dev/null | tr '|' '\t')
   _hb_log "[materializer] pass done — ${n_made} materialized"
   return 0
 }

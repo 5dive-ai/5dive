@@ -26,7 +26,7 @@ esac
 
 # Bumped on every public release. `build.sh` checks this line exists; CI fails
 # the bundle-drift check if it's missing or empty.
-readonly FIVE_VERSION="0.15.40"
+readonly FIVE_VERSION="0.15.41"
 
 # GitHub org our repos live under. The org is being renamed
 # 5dive-com -> 5dive-ai (2026-06); fetches must work on either side of the
@@ -17737,6 +17737,8 @@ _task_usage() {
                                                      # the default cmd for 'task verify'; --verifier grades (writer!=grader)
   5dive task ls [--status=<s>] [--assignee=<agent>] [--mine] [--all] [--recurring]
                                                      # default: open tasks, priority-ordered; --recurring: templates
+                                                     # the scheduler is actually still driving (schedule set, status=todo);
+                                                     # --recurring --all: every template regardless, incl. stopped ones
   5dive task show <id|DIVE-N>                        # full detail + subtasks + blockers
   5dive task assign <id|DIVE-N> <agent>
   5dive task verifier <id|DIVE-N> <agent> [--accept=<criteria>] [--max-iters=<n>]
@@ -18506,6 +18508,14 @@ cmd_task_ls() {
   local where="1=1" order
   if (( recurring )); then
     where+=" AND kind='recurring'"
+    # DIVE-2055: default to the EXACT predicate the heartbeat materializer
+    # fires on (schedule IS NOT NULL AND status='todo') so this listing can't
+    # tell a different story than the scheduler — a cancelled/blocked/parked
+    # template used to still appear here with a blank schedule and a stale
+    # last_fired timestamp, reading as a live driver that fired recently.
+    # --all lifts the filter for an audit view of every template regardless
+    # of whether the scheduler still sees it.
+    (( all )) || where+=" AND schedule IS NOT NULL AND status='todo'"
     order="ORDER BY id"
   else
     where+=" AND kind='standard'"
@@ -18549,7 +18559,7 @@ cmd_task_ls() {
     # ("Argument list too long"). stdin has no such cap. (DIVE-222)
     printf '%s' "$rows" | jq -c '{ok:true, data:{tasks:.}}'
   elif (( recurring )); then
-    dbfmt -box "SELECT ident, schedule, COALESCE(assignee,'-') AS assignee, COALESCE(last_fired_at,'never') AS last_fired, title FROM tasks WHERE ${where} ${order};"
+    dbfmt -box "SELECT ident, status, COALESCE(schedule,'-') AS schedule, COALESCE(assignee,'-') AS assignee, COALESCE(last_fired_at,'never') AS last_fired, title FROM tasks WHERE ${where} ${order};"
   else
     dbfmt -box "SELECT ident, status, priority, COALESCE(assignee,'-') AS assignee, title FROM tasks WHERE ${where} ${order};"
   fi
@@ -35088,6 +35098,12 @@ _hb_wake() {
 # it (|| log) so a materializer failure can NEVER abort the wake loop — the
 # heartbeat-never-woke bug class.
 #
+# DIVE-2055: the query used to key on kind+schedule alone, so a cancelled,
+# blocked, or parked template kept firing forever — none of `task cancel`,
+# `task block`, or `task park` (all of which move status off 'todo') had any
+# effect on the scheduler. status='todo' is now part of the fire predicate,
+# so any of those three verbs is a real stop lever; no new CLI verb needed.
+#
 # For each kind='recurring' template: fire when its cron matches `now` AND it
 # hasn't already fired THIS minute (last_fired_at guard — stops a double-fire if
 # two ticks land in the same matching minute). DEDUP (skip-if-open): don't
@@ -35123,7 +35139,7 @@ _hb_materialize_recurring() {
     else
       _hb_log "[materializer] $(_hb_ident "$tid") insert failed"
     fi
-  done < <(db "SELECT id, schedule, COALESCE(last_fired_at,'') FROM tasks WHERE kind='recurring' AND schedule IS NOT NULL;" 2>/dev/null | tr '|' '\t')
+  done < <(db "SELECT id, schedule, COALESCE(last_fired_at,'') FROM tasks WHERE kind='recurring' AND schedule IS NOT NULL AND status='todo';" 2>/dev/null | tr '|' '\t')
   _hb_log "[materializer] pass done — ${n_made} materialized"
   return 0
 }

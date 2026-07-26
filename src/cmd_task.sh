@@ -21,6 +21,8 @@ _task_usage() {
                                                      # the default cmd for 'task verify'; --verifier grades (writer!=grader)
   5dive task ls [--status=<s>] [--assignee=<agent>] [--mine] [--all] [--recurring]
                                                      # default: open tasks, priority-ordered; --recurring: templates
+                                                     # the scheduler is actually still driving (schedule set, status=todo);
+                                                     # --recurring --all: every template regardless, incl. stopped ones
   5dive task show <id|DIVE-N>                        # full detail + subtasks + blockers
   5dive task assign <id|DIVE-N> <agent>
   5dive task verifier <id|DIVE-N> <agent> [--accept=<criteria>] [--max-iters=<n>]
@@ -790,6 +792,14 @@ cmd_task_ls() {
   local where="1=1" order
   if (( recurring )); then
     where+=" AND kind='recurring'"
+    # DIVE-2055: default to the EXACT predicate the heartbeat materializer
+    # fires on (schedule IS NOT NULL AND status='todo') so this listing can't
+    # tell a different story than the scheduler — a cancelled/blocked/parked
+    # template used to still appear here with a blank schedule and a stale
+    # last_fired timestamp, reading as a live driver that fired recently.
+    # --all lifts the filter for an audit view of every template regardless
+    # of whether the scheduler still sees it.
+    (( all )) || where+=" AND schedule IS NOT NULL AND status='todo'"
     order="ORDER BY id"
   else
     where+=" AND kind='standard'"
@@ -833,7 +843,7 @@ cmd_task_ls() {
     # ("Argument list too long"). stdin has no such cap. (DIVE-222)
     printf '%s' "$rows" | jq -c '{ok:true, data:{tasks:.}}'
   elif (( recurring )); then
-    dbfmt -box "SELECT ident, schedule, COALESCE(assignee,'-') AS assignee, COALESCE(last_fired_at,'never') AS last_fired, title FROM tasks WHERE ${where} ${order};"
+    dbfmt -box "SELECT ident, status, COALESCE(schedule,'-') AS schedule, COALESCE(assignee,'-') AS assignee, COALESCE(last_fired_at,'never') AS last_fired, title FROM tasks WHERE ${where} ${order};"
   else
     dbfmt -box "SELECT ident, status, priority, COALESCE(assignee,'-') AS assignee, title FROM tasks WHERE ${where} ${order};"
   fi
