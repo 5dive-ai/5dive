@@ -181,6 +181,14 @@ publish_rc_for() {
   && ok_t "refusal and no-op do not converge on one exit code" || bad_t "codes converged"
 # And the cron driver must not launder the refusal into success the way it
 # legitimately does for the no-op.
+#
+# DIVE-2100: these two grade _proof_tick's MAPPING TABLE in isolation — they stub
+# _proof_publish and feed it a LITERAL rc, so they say nothing about which rc the
+# real refusal actually produces. Named accordingly. The end-to-end property
+# ("a no-identity box fails its nightly cron") is asserted below, unstubbed,
+# because the literal 4 here is a restatement of the coupling, not a test of it:
+# a future renumbering of the refusal code that dutifully updates the assertions
+# above would leave this pair grading a code nothing returns — green and vacuous.
 tick_rc_for() {
   ( _FAKE_RC="$1"
     _proof_publish() { return "$_FAKE_RC"; }
@@ -189,10 +197,39 @@ tick_rc_for() {
     _proof_tick >/dev/null 2>&1 ) ; echo $?
 }
 [[ "$(tick_rc_for 3)" == "0" ]] \
-  && ok_t "cron tick maps the no-op to success (unchanged)" || bad_t "tick no-op" "got=$(tick_rc_for 3)"
+  && ok_t "tick mapping table: rc 3 -> success (unit, stubbed publish)" || bad_t "tick no-op" "got=$(tick_rc_for 3)"
 [[ "$(tick_rc_for 4)" != "0" ]] \
-  && ok_t "cron tick does NOT launder the refusal into a healthy night" \
-  || bad_t "tick laundered refusal" "got=$(tick_rc_for 4)"
+  && ok_t "tick mapping table: rc 4 stays non-zero (unit, stubbed publish)" \
+  || bad_t "tick laundered rc 4" "got=$(tick_rc_for 4)"
+
+# --- Case 10: END-TO-END — a no-identity box FAILS its nightly cron ----------
+# DIVE-2100. The property the whole DIVE-2051 fix exists to guarantee, asserted
+# as ONE unbroken chain instead of two halves joined by a literal:
+#   real _proof_identity -> real _proof_build guard -> real _proof_publish rc
+#   mapping -> real _proof_tick mapping -> non-zero.
+# Nothing is stubbed. `_PROOF_GATE_SKIP=1` is production's own seam for the OSS-39
+# approval gate (cmd_proof.sh:203), not a test double, and the repo points at the
+# unreachable file:// url so `git ls-remote` fails locally with no network — the
+# guard fires long before either matters.
+# Renumber `return 4` in _proof_build to ANY value _proof_tick maps to success and
+# this reds by name; that is the regression this case exists for.
+tick_rc_real() {
+  ( git config --global --unset user.name  2>/dev/null
+    git config --global --unset user.email 2>/dev/null
+    printf '{"enabled":true,"repo":"%s","branch":"status"}\n' "$UNREACHABLE" > "$STATE_DIR/proof.json"
+    export _PROOF_GATE_SKIP=1
+    _proof_tick >/dev/null 2>"$TMP/tick-err" ) ; echo $?
+}
+RC="$(tick_rc_real)"
+[[ "$RC" != "0" ]] \
+  && ok_t "END-TO-END: a no-identity box fails its nightly cron (nothing stubbed)" \
+  || bad_t "end-to-end tick laundered the refusal" "rc=$RC err=$(head -3 "$TMP/tick-err")"
+# …and it must fail for the IDENTITY reason. Without this, any incidental error
+# (missing jq, an unrelated fail) would satisfy the assertion above for the wrong
+# reason — and deleting the guard outright would read as a pass.
+grep -q "NO GIT IDENTITY CONFIGURED" "$TMP/tick-err" \
+  && ok_t "END-TO-END: the cron failure is the identity refusal, not an incidental error" \
+  || bad_t "end-to-end failure reason" "err=$(head -5 "$TMP/tick-err")"
 
 echo
 echo "passed: $PASS  failed: $FAIL"
