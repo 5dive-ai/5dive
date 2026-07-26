@@ -155,6 +155,27 @@ grep -q 'task.force-merge-gate.*DIVE-907.*override_pr=907' "$AUDIT_CALLS" \
   && ok_t "T7 the forced close is written to the audit log with the overridden PR #" \
   || bad_t "T7 override audited" "audit=$(cat "$AUDIT_CALLS")"
 
+# --- T7b (DIVE-2062): OFF the prod store, the SAME override writes NO row ------
+# T7 above only ever ran ON the prod store (FIVEDIVE_PROD_TASKS_DB was declared
+# at the top of this file and never unset) — per the DIVE-2054 verifier pass
+# (dev3, 2026-07-26) this suite reached the site but only ever on its ALLOWED
+# side. This proves the WITHHELD side too, and that it is announced.
+unset _TASK_STORE_AUDIT_FENCED
+: >"$AUDIT_CALLS"
+seed DIVE-909
+export GH_STUB_PRLIST='[{"number":909,"headRefName":"feat/DIVE-909","title":"DIVE-909 thing"}]'
+out=$(FIVEDIVE_PROD_TASKS_DB="$TMP/somewhere-else/tasks.db" cmd_task_done DIVE-909 --force-merge-gate 2>"$TMP/offstore.err"); rc=$?
+[[ $rc -eq 0 && "$(statusof DIVE-909)" == "done" ]] \
+  && ok_t "T7b off-store: the override itself still closes (fail-open on the WRITE side)" \
+  || bad_t "T7b override still closes" "rc=$rc status=$(statusof DIVE-909)"
+[[ ! -s "$AUDIT_CALLS" ]] \
+  && ok_t "T7b off the prod store, the forced-close override writes NO audit row" \
+  || bad_t "T7b off-store must not audit" "$(cat "$AUDIT_CALLS")"
+grep -q "telemetry withheld" "$TMP/offstore.err" \
+  && ok_t "T7b the withholding is ANNOUNCED, not silent" \
+  || bad_t "T7b fence must announce" "err=$(cat "$TMP/offstore.err")"
+unset _TASK_STORE_AUDIT_FENCED
+
 # --- T8: a DECLARED-binding task is handled by the DIVE-1830 path, NOT this one
 #     (auto-detect must be skipped when a delivery_ref exists — no double gate). -
 seed DIVE-908

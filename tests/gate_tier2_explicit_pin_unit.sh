@@ -254,5 +254,24 @@ grep -q '^task.gate-tier2-pin-escalated$' "$AUDIT_FILE" \
   && bad_t "no audit row on the un-pinned downgrade" "rows='$(tr '\n' ',' <"$AUDIT_FILE")'" \
   || ok_t "un-pinned eng-ship downgrade records NO pin-escalation row"
 
+# 18 (DIVE-2062): OFF the prod store, the SAME pinned escalation writes NO row,
+# and the withholding is announced. Cases 16/17 above only ever ran ON the prod
+# store (FIVEDIVE_PROD_TASKS_DB was declared at the top of this file and never
+# unset) — per the DIVE-2054 verifier pass (dev3, 2026-07-26) this suite
+# reached the site but only ever on its ALLOWED side. This proves WITHHELD too.
+route_reset; audit_reset; unset _TASK_STORE_AUDIT_FENCED
+seed DIVE-952 'LAND the dive-1957 branch: settle MERGE order'
+FIVEDIVE_PROD_TASKS_DB="$TMP/somewhere-else/tasks.db" cmd_task_need DIVE-952 \
+  --type=decision --tier=2 --from=dev \
+  --ask="Which wording ships on the public page?" --options="A|B" --recommend="A" \
+  >/dev/null 2>"$TMP/offstore.err"
+[[ ! -s "$AUDIT_FILE" ]] \
+  && ok_t "off the prod store, the pin-escalation writes NO audit row" \
+  || bad_t "off-store must not audit" "rows='$(tr '\n' ',' <"$AUDIT_FILE")'"
+grep -q "telemetry withheld" "$TMP/offstore.err" \
+  && ok_t "the withholding is ANNOUNCED, not silent" \
+  || bad_t "fence must announce" "err=$(cat "$TMP/offstore.err")"
+unset _TASK_STORE_AUDIT_FENCED
+
 printf '\n%s\n' "PASS=$PASS FAIL=$FAIL"
 [[ "$FAIL" == "0" ]]

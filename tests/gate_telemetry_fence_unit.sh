@@ -170,6 +170,27 @@ fi
   && ok_t 'and the message says UNVERIFIED rather than asserting nobody was reachable' \
   || bad_t 'rc=2 message' "out=$out"
 
+# --- 4b (DIVE-2062): OFF the prod store, gate-escalate's OWN row is withheld -
+# `task gate-escalate` (cmd_task.sh ~4279/4291) is routed through
+# _task_store_audit_log — a SEPARATE fence from _task_gate_delivery_log's own
+# (case 1 above). Case 4 just proved it fires ON-store (FIVEDIVE_PROD_TASKS_DB
+# was set to $TASKS_DB back in case 3 and never unset); per the DIVE-2054
+# verifier pass (dev3, 2026-07-26) this suite reached the site but only ever
+# on its ALLOWED side. This proves the WITHHELD side too.
+reset
+unset _TASK_STORE_AUDIT_FENCED
+export FIVEDIVE_PROD_TASKS_DB="$TMP/somewhere-else/tasks.db"
+seed_gate ESC-2
+out=$(cmd_task_gate_escalate ESC-2 2>"$TMP/escoff.err")
+[[ ! -s "$AUDIT_CALLS" ]] \
+  && ok_t 'off the prod store, gate-escalate writes NO audit row' \
+  || bad_t 'off-store must not audit' "$(cat "$AUDIT_CALLS")"
+grep -q "telemetry withheld" "$TMP/escoff.err" \
+  && ok_t 'the withholding is ANNOUNCED, not silent' \
+  || bad_t 'fence must announce' "err=$(cat "$TMP/escoff.err")"
+unset _TASK_STORE_AUDIT_FENCED
+export FIVEDIVE_PROD_TASKS_DB="$TASKS_DB"   # restore on-store default for the cases below
+
 # --- 5. the privileged re-send keeps the child's REASON ----------------------
 # `>/dev/null 2>&1` discarded it, so the parent could only ever say FAILED — and a
 # whole diagnosis round went into guessing whether sudo had refused the invocation

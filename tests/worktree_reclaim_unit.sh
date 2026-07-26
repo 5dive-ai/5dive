@@ -30,6 +30,16 @@ PASS=0; FAIL=0
 ok_t()  { PASS=$((PASS+1)); printf 'ok   - %s\n' "$1"; }
 bad_t() { FAIL=$((FAIL+1)); printf 'FAIL - %s\n   %s\n' "$1" "${2:-}"; }
 jf()    { jq -r "$1" 2>/dev/null; }
+# DIVE-2062: _task_reclaim_on_close's own "task reclaim" audit_log call (routed
+# through _task_store_audit_log, DIVE-2010/2054) was reached by NO tests_*/
+# gate_*/heartbeat_*/audit_* suite per the DIVE-2054 verifier pass (dev3,
+# 2026-07-26) — a scope artifact of that sweep's glob (this file is named
+# worktree_*, not task_*), not evidence the site itself was unreached; every
+# `cmd_task_done` call below already drives it. Stub audit_log so the two new
+# cases further down can assert on/off-store behaviour without ever touching
+# the real fleet log.
+AUDIT_CALLS="$TMP/audit.calls"; : >"$AUDIT_CALLS"
+audit_log() { printf '%s\n' "$*" >>"$AUDIT_CALLS"; }
 
 ROOT="$TMP/projects"
 WORKTREE_ROOT="$ROOT"     # disk.sh reads this global on every call
@@ -99,6 +109,37 @@ USER=agent-dev cmd_task_done DIVE-196 --result="done" >/dev/null 2>"$TMP/err"
 [[ -d "$ROOT/proj/node_modules" ]] \
   && ok_t "the primary clone in the same parent dir is untouched" \
   || bad_t "primary clone untouched"
+
+# ---------------------------------------------------------------- audit fence
+# DIVE-2062: the "task reclaim" row _task_reclaim_on_close writes is
+# task-store state (a reclaim stat for THIS task's worktrees), so it is fenced
+# on store identity exactly like the other DIVE-2054 sites. Mirrors
+# tests/heartbeat_gate_shipped_unit.sh Case 12's on/off-store pattern for this
+# cmd_task.sh site.
+mk_wt proj-wt-800
+mkt 800 "reclaim fixture 800 (audit on-store)" >/dev/null
+export FIVEDIVE_PROD_TASKS_DB="$TASKS_DB"
+USER=agent-dev cmd_task_done DIVE-800 --result="done" >/dev/null 2>"$TMP/err-onstore"
+grep -q 'task reclaim.*DIVE-800.*worktrees=1' "$AUDIT_CALLS" \
+  && ok_t "on-store: closing a task with a reclaimable worktree audits 'task reclaim'" \
+  || bad_t "on-store audit row" "$(cat "$AUDIT_CALLS")"
+unset FIVEDIVE_PROD_TASKS_DB
+
+: >"$AUDIT_CALLS"
+unset _TASK_STORE_AUDIT_FENCED
+mk_wt proj-wt-801
+mkt 801 "reclaim fixture 801 (audit off-store)" >/dev/null
+USER=agent-dev cmd_task_done DIVE-801 --result="done" >/dev/null 2>"$TMP/err-offstore"
+[[ ! -d "$ROOT/proj-wt-801/node_modules" ]] \
+  && ok_t "off-store: the reclaim itself still runs (fail-open on the WRITE side)" \
+  || bad_t "off-store reclaim still runs" "$(ls "$ROOT/proj-wt-801" 2>&1)"
+[[ ! -s "$AUDIT_CALLS" ]] \
+  && ok_t "off the prod store, task reclaim writes NO audit row" \
+  || bad_t "off-store must not audit" "$(cat "$AUDIT_CALLS")"
+grep -q "telemetry withheld" "$TMP/err-offstore" \
+  && ok_t "the withholding is ANNOUNCED, not silent" \
+  || bad_t "fence must announce" "err=$(cat "$TMP/err-offstore")"
+unset _TASK_STORE_AUDIT_FENCED
 
 # ---------------------------------------------------------------- escape hatches
 # These are what an operator reaches for when the reclaim misbehaves at 3am, so

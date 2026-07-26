@@ -209,6 +209,29 @@ res3=$(db "SELECT COALESCE(result,'') FROM tasks WHERE ident='CLEAN-1';")
   && ok_t 'a genuinely verified close is NOT stamped — the marker stays meaningful' \
   || bad_t 'clean close must not be stamped' "rc=$RC result=[$res3]"
 
+# --- DIVE-2062: OFF the prod store, the SAME ambiguous collision writes NO row
+# Case 4 above only ever ran ON the prod store (FIVEDIVE_PROD_TASKS_DB was
+# declared at the top of this file and never unset) — per the DIVE-2054
+# verifier pass (dev3, 2026-07-26) this suite reached the site but only ever on
+# its ALLOWED side. This proves the WITHHELD side too, and that it is announced.
+unset _TASK_STORE_AUDIT_FENCED
+clear_fx
+export GH_STUB_PR_5dive_6="$MERGED_OK"
+export GH_STUB_PR_5dive_api_6="$OPEN_RED"
+: >"$AUDIT_CALLS"
+seed AMBOFF-1
+FIVEDIVE_PROD_TASKS_DB="$TMP/somewhere-else/tasks.db" run_done AMBOFF-1 --result='merged as PR #6'
+[[ $RC -eq 0 && "$(statusof AMBOFF-1)" == "done" && "$OUT" == *AMBIGUOUS* ]] \
+  && ok_t 'off-store: the ambiguous close itself still proceeds loud (fail-open on the WRITE side)' \
+  || bad_t 'off-store ambiguous still proceeds' "rc=$RC status=$(statusof AMBOFF-1) out=$OUT"
+[[ ! -s "$AUDIT_CALLS" ]] \
+  && ok_t 'off the prod store, task.merge-gate-ambiguous writes NO audit row' \
+  || bad_t 'off-store must not audit' "$(cat "$AUDIT_CALLS")"
+[[ "$OUT" == *"telemetry withheld"* ]] \
+  && ok_t 'the withholding is ANNOUNCED, not silent' \
+  || bad_t 'fence must announce' "out=$OUT"
+unset _TASK_STORE_AUDIT_FENCED
+
 # --- 5. the collision IS resolved when exactly one side names the ident -------
 # Evidence, not a default: the api PR's title names the task, the CLI one does not.
 clear_fx

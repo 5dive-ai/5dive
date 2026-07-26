@@ -158,6 +158,32 @@ grep -q 'task.merge-gate-reported-on' "$AUDIT_CALLS" \
   && ok_t 'the set-aside citations are audited, so a mis-read delivery is findable' \
   || bad_t 'reported-on audit row' "$(cat "$AUDIT_CALLS")"
 
+# --- DIVE-2062: OFF the prod store, the SAME reported-on row writes NO row ----
+# The case above only ever ran ON the prod store (FIVEDIVE_PROD_TASKS_DB was
+# declared at the top of this file and never unset) — per the DIVE-2054
+# verifier pass (dev3, 2026-07-26) this suite reached the site but only ever on
+# its ALLOWED side. This proves the WITHHELD side too, and that it is announced.
+unset _TASK_STORE_AUDIT_FENCED
+clear_fx
+export GH_STUB_PR_5dive_168="$MERGED_OK"
+export GH_STUB_PR_5dive_api_10="$OPEN_X"
+export GH_STUB_PR_5dive_api_17="$OPEN_X"
+: >"$AUDIT_CALLS"
+seed INVOFF-1
+out=$(FIVEDIVE_PROD_TASKS_DB="$TMP/somewhere-else/tasks.db" cmd_task_done INVOFF-1 \
+  --result='Shipped as PR #168, merged and green. Follow-ups still open: PR #10 and PR #17 in the api repo.' \
+  2>"$TMP/offstore.err"); rc=$?
+[[ $rc -eq 0 && "$(statusof INVOFF-1)" == "done" ]] \
+  && ok_t 'off-store: the close itself still proceeds (fail-open on the WRITE side)' \
+  || bad_t 'off-store close still proceeds' "rc=$rc status=$(statusof INVOFF-1)"
+[[ ! -s "$AUDIT_CALLS" ]] \
+  && ok_t 'off the prod store, task.merge-gate-reported-on writes NO audit row' \
+  || bad_t 'off-store must not audit' "$(cat "$AUDIT_CALLS")"
+grep -q "telemetry withheld" "$TMP/offstore.err" \
+  && ok_t 'the withholding is ANNOUNCED, not silent' \
+  || bad_t 'fence must announce' "err=$(cat "$TMP/offstore.err")"
+unset _TASK_STORE_AUDIT_FENCED
+
 # --- 3. a cited OPEN PR alone does not block the close ------------------------
 # The fleet-wide close blocker this ticket exists to prevent: a pure triage/audit
 # close that enumerates other tasks' open PRs and delivers nothing of its own.
