@@ -1416,6 +1416,74 @@ _gate_pr_state() {
       2>/dev/null || true
 }
 
+# DIVE-2101: _gate_branch_ancestry <slug> <branch> <tok> — is <branch>'s tip an
+# ANCESTOR of that repo's main? Prints "1" (yes: every commit on the branch is
+# already on main), "0" (demonstrably not) or EMPTY when the question could not be
+# REACHED — no token, no network, gh absent, repo/branch gone, unparseable answer.
+#
+# Empty is not "no", and the caller must never read it as one: it falls through to
+# the merged-PR path exactly as if this check did not exist, so an outage can only
+# ever cost the NEW acceptance, never manufacture a refusal that DIVE-1830 did not
+# already make.
+#
+# Asked over the API rather than a local `git merge-base --is-ancestor` on purpose:
+# `task done` runs from any cwd (and from root/cron), so there is no checkout to
+# trust — the same reason the merged-PR probe next to it passes --repo explicitly
+# (DIVE-1834). `compare/main...branch` answers the ancestry question directly:
+# ahead_by is the count of commits the branch has that main does not, so ahead_by==0
+# (status `identical` or `behind`) IS "the tip is an ancestor". Both are required
+# together so a shape-changed payload reads as unresolved, not as a pass.
+# Read-only, bounded by `timeout`, token passed via env and never in argv.
+_gate_branch_ancestry() {
+  local slug="$1" branch="$2" tok="$3" out st ahead
+  out=$(GH_TOKEN="$tok" timeout 10s gh api \
+        "repos/${slug}/compare/${FIVE_GATE_MAIN_BRANCH:-main}...${branch}" \
+        -q '[(.status // ""), ((.ahead_by // "") | tostring)] | join("|")' 2>/dev/null || true)
+  out="${out%%$'\n'*}"
+  st="${out%%|*}"; ahead="${out##*|}"
+  if [[ -z "$st" || "$out" != *"|"* ]]; then printf ''; return 0; fi
+  if [[ "$ahead" == "0" && ( "$st" == "identical" || "$st" == "behind" ) ]]; then
+    printf '1'; return 0
+  fi
+  printf '0'
+}
+
+# DIVE-2101 (main's vacuity arm, before merge): ancestry ALONE is trivially true
+# for a branch with ZERO commits — its tip IS a commit on main — so a task bound to
+# a branch nobody ever committed to would satisfy done=merged-to-main having
+# delivered NOTHING. That is the mirror of the unmerged case: "commits that did not
+# land" and "no commits at all" are different shapes, and only the first is covered
+# by refusing a branch that is ahead of main. Ancestry answers "is this tip on
+# main", never "did this task put anything there", and no amount of ancestry
+# arithmetic separates them (merge-base(tip,main)==tip in BOTH).
+#
+# So ATTRIBUTION is asked separately: does any commit reachable from the branch tip
+# name <ident> at word boundaries? Same evidence idiom `_gate_pr_probe` already uses
+# to bind a bare #N (title/head-branch naming the ident) — here against commit
+# messages, which is this repo's standing convention. Because the tip is already
+# established as an ancestor of main, every commit it reaches IS on main, so a hit
+# means "work for this task is on main" measured on the commits themselves.
+# Deliberately NOT solved by recording a base SHA at `set-branch` time: that reads
+# only for bindings made after it ships, and the live casualties (DIVE-2051, and
+# this ticket's own binding) are already bound — an anti-vacuity arm that cannot
+# see the vacuum it was written for is theatre.
+#
+# Prints "1" (attributable), "0" (nothing on the branch names the ident) or EMPTY
+# when unreachable. Empty and "0" both DECLINE the ancestry acceptance and fall
+# through to the merged-PR search — this arm can only ever subtract an acceptance,
+# never add a refusal that DIVE-1830 did not already make. Read-only, bounded.
+_gate_branch_ident_on_main() {
+  local slug="$1" branch="$2" tok="$3" ident="$4" hits
+  hits=$(GH_TOKEN="$tok" timeout 10s gh api \
+        "repos/${slug}/commits?sha=${branch}&per_page=${FIVE_GATE_ANCESTRY_SCAN:-50}" \
+        -q "[ .[] | (.commit.message // \"\")
+             | select(test(\"(^|[^A-Za-z0-9])${ident}([^A-Za-z0-9]|\$)\";\"i\")) ] | length" \
+        2>/dev/null || true)
+  hits="${hits%%$'\n'*}"
+  [[ "$hits" =~ ^[0-9]+$ ]] || { printf ''; return 0; }
+  [[ "$hits" -gt 0 ]] && printf '1' || printf '0'
+}
+
 _task_status_cmd() {
   local newstatus="$1" extra="$2" verb="$3"; shift 3
   tasks_db_init
@@ -1652,16 +1720,57 @@ _task_status_cmd() {
         # merged PR in the CLI repo ONLY — an api/frontend branch could never satisfy
         # its own fail-CLOSED gate. Search the task's declared repo when it has one,
         # else every known repo, and pass if the branch landed in ANY of them.
-        local _slug _bmerged="" _searched=""
+        #
+        # DIVE-2101: TWO independent ways to satisfy done=merged-to-main here, tried
+        # per repo in this order:
+        #   1. ANCESTRY — the branch tip is an ancestor of that repo's main.
+        #   2. a MERGED PR for the branch (the DIVE-1955 search, unchanged).
+        # Ancestry is not a relaxation, it is the SAME requirement measured directly:
+        # "a PR was merged" is a proxy artifact for "the code is in main", and the
+        # DELEGATED-PUSH path (DIVE-1496 — how an agent without gh auth lands a branch
+        # at all) produces the fact without ever producing the artifact. Measured on
+        # DIVE-2051: work provably 0 commits ahead of main, no PR possible (its diff
+        # would be EMPTY), and the gate refused forever. That is unsatisfiable, not
+        # strict, and it is the standing shape of every delegated push.
+        #   Ancestry PASSING is sufficient. Ancestry FAILING is a no-op — it falls
+        # through to 2, and only BOTH failing refuses. That fall-through is
+        # load-bearing, not defensive dressing: a SQUASH-merged branch tip is NOT an
+        # ancestor of main even though its content is in, so a squash-merged delivery
+        # must keep closing on its merged PR exactly as before. Neither check can
+        # veto the other; this adds an acceptance path and removes none.
+        #   ANCESTRY IS NOT ENOUGH ON ITS OWN (main, pre-merge): a branch with ZERO
+        # commits has a tip that IS a commit on main, so it is trivially an ancestor
+        # and would close a task that delivered nothing. Acceptance therefore needs
+        # BOTH halves — the tip is on main AND something reachable from it is
+        # attributable to this ident (_gate_branch_ident_on_main). Neither half alone
+        # closes anything.
+        local _slug _bmerged="" _searched="" _banc="" _anc="" _attr="" _anc_novac=""
         while IFS= read -r _slug; do
           [[ -n "$_slug" ]] || continue
           _searched="${_searched:+$_searched, }$_slug"
+          _anc=$(_gate_branch_ancestry "$_slug" "$_branch" "$_ghtok")
+          if [[ "$_anc" == "1" ]]; then
+            _attr=$(_gate_branch_ident_on_main "$_slug" "$_branch" "$_ghtok" "$ident")
+            [[ "$_attr" == "1" ]] && { _banc="$_slug"; break; }
+            _anc_novac="$_slug"
+          fi
           _bmerged=$(GH_TOKEN="$_ghtok" gh pr list --repo "$_slug" --head "$_branch" --state merged --json number,mergedAt -q '.[0].mergedAt' 2>/dev/null || echo "")
           [[ -n "$_bmerged" && "$_bmerged" != "null" ]] && break
           _bmerged=""
         done < <(if [[ -n "$_task_slug" ]]; then printf '%s\n' "$_task_slug"; else _gate_repo_slugs; fi)
-        if [[ -z "$_bmerged" ]]; then
-          policy_refuse "$E_CONFLICT" done-before-branch-merged DIVE-1830 "$ident" "$ident cannot close: no MERGED PR found for its branch '$_branch' in $_searched. done=merged-to-main (DIVE-1830) — open and merge a PR for that branch, then run task done. If the branch lives in a repo not listed there, add a \`Repo: <owner>/<repo>\` line to the body. Use \`task cancel\` to abandon."
+        if [[ -n "$_banc" ]]; then
+          # Say WHICH evidence closed it. A close that passed on ancestry and one that
+          # passed on a merged PR are different records, and the reader of the record
+          # months later cannot tell them apart from a clean exit (DIVE-1869 rule).
+          warn "$ident: branch '$_branch' is an ANCESTOR of ${FIVE_GATE_MAIN_BRANCH:-main} in $_banc — its commits are all on main (no PR needed; delegated push, DIVE-2101). done=merged-to-main satisfied."
+        elif [[ -n "$_anc_novac" && -z "$_bmerged" ]]; then
+          # The vacuous shape, named as itself: an ancestor tip carrying nothing
+          # attributable is exactly what an EMPTY branch looks like, and a generic
+          # "not merged" here would send the reader off to merge something that is
+          # already in.
+          policy_refuse "$E_CONFLICT" done-on-vacuous-branch-ancestry DIVE-2101 "$ident" "$ident cannot close: branch '$_branch' points at a commit that IS on ${FIVE_GATE_MAIN_BRANCH:-main} in $_anc_novac, but NO commit reachable from it names $ident — which is what an EMPTY branch (created, never committed to) looks like, and is indistinguishable from one here. done=merged-to-main (DIVE-1830/2101) needs work ON main, not a tip on main: commit the work naming $ident and land it (\`5dive push $ident\`), or bind the branch that actually carries it (\`task set-branch $ident <branch>\`). A merged PR for the branch also satisfies the gate. Use \`task cancel\` to abandon."
+        elif [[ -z "$_bmerged" ]]; then
+          policy_refuse "$E_CONFLICT" done-before-branch-merged DIVE-1830 "$ident" "$ident cannot close: branch '$_branch' is NOT on ${FIVE_GATE_MAIN_BRANCH:-main} — it is neither an ancestor of it nor the head of a MERGED PR in $_searched. done=merged-to-main (DIVE-1830) — land the branch (delegated push: \`5dive push $ident\`, or open and merge a PR), then run task done. If the branch lives in a repo not listed there, add a \`Repo: <owner>/<repo>\` line to the body. Use \`task cancel\` to abandon."
         fi
       fi
     fi
