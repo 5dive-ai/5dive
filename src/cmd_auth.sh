@@ -876,8 +876,13 @@ _opencode_merge_model_config() {
 # emits nothing) when the binary is missing or enumeration fails offline.
 opencode_catalog() {
   local var="$1" key="$2"
-  local ocbin="${OPENCODE_BIN:-$(command -v opencode 2>/dev/null || echo /home/claude/.local/bin/opencode)}"
-  [[ -x "$ocbin" ]] || return 1
+  # DIVE-2075: TYPE_BIN first, PATH only as a fallback. `command -v opencode`
+  # resolves on the CALLER's PATH (root, usually) — a stray copy there would have
+  # us validate --model against a different binary's catalog than the one the
+  # agent unit actually runs (which uses TYPE_BIN's path directly).
+  local ocbin="${OPENCODE_BIN:-${TYPE_BIN[opencode]:-}}"
+  [[ -x "$ocbin" ]] || ocbin="$(command -v opencode 2>/dev/null || true)"
+  [[ -n "$ocbin" && -x "$ocbin" ]] || return 1
   local h; h=$(mktemp -d) || return 1
   HOME="$h" env "${var}=${key}" "$ocbin" models 2>/dev/null; local rc=$?
   rm -rf "$h"
@@ -951,8 +956,10 @@ opencode_apply_model_default() {
 # fails offline — the caller fails OPEN on that. DIVE-1402.
 pi_catalog() {
   local provider="$1" var="$2" key="$3"
-  local pibin="${PI_BIN:-$(command -v pi 2>/dev/null || echo /home/claude/.local/bin/pi)}"
-  [[ -x "$pibin" ]] || return 1
+  # DIVE-2075: TYPE_BIN first, PATH only as a fallback — see opencode_catalog.
+  local pibin="${PI_BIN:-${TYPE_BIN[pi]:-}}"
+  [[ -x "$pibin" ]] || pibin="$(command -v pi 2>/dev/null || true)"
+  [[ -n "$pibin" && -x "$pibin" ]] || return 1
   local h; h=$(mktemp -d) || return 1
   HOME="$h" env "${var}=${key}" "$pibin" --list-models 2>/dev/null \
     | awk -v p="$provider" '$1==p { sub(/^~/, "", $2); print $2 }'
