@@ -1345,6 +1345,185 @@ auth_session_dir() {
   echo "$dir"
 }
 
+# ── session teardown + reaping (DIVE-1884) ──────────────────────────────────
+# Every auth session spawns its own tmux SERVER on a private socket
+# (<session-dir>/tmux.sock) hosting `script -q -f -c "<cli> login"`. Nothing
+# used to clean these up: an abandoned attempt left the login CLI resident
+# forever (main found an agy from the previous day still burning ~11min CPU /
+# ~178MB RSS on the DIVE-1868 demo box) and the session dir behind with it.
+# `kill-session` alone isn't enough — the server outlives its last session, so
+# kill the server too and then confirm the PTY child is actually gone.
+#
+# How long a session may sit in a NON-terminal state before the reaper expires
+# it, and how long a TERMINAL session's dir is kept for the dashboard to read
+# back. Both overridable for tests / operators.
+AUTH_SESSION_MAX_AGE_SECS="${FIVE_AUTH_SESSION_MAX_AGE:-1800}"
+AUTH_SESSION_TTL_SECS="${FIVE_AUTH_SESSION_TTL:-86400}"
+# How long `poll` waits for a device URL before failing loud with the pane tail.
+#
+# MEASURED, not guessed (agy 1.1.7, pristine HOME, same spawn shape as below):
+# first paint + login-method menu at T+2s, OAuth URL at T+4s. 300s is ~75x the
+# healthy path. The asymmetry is deliberate — too SHORT converts a slow-but-
+# working auth into a hard provisioning failure, i.e. a regression created by
+# this fix, while too LONG merely delays a report that used to never come at
+# all. Don't tighten this per type without measuring that type first.
+AUTH_URL_TIMEOUT_SECS="${FIVE_AUTH_URL_TIMEOUT:-300}"
+
+# A pid and its descendants, parents first. EXACT pids only — we never
+# `kill -<pgid>`; a stray group-kill on this host once took prod down for 19
+# minutes, and the tmux server shares its group with things we don't own.
+auth_pid_tree() {
+  local pid="$1" kid
+  [[ "$pid" =~ ^[0-9]+$ ]] && (( pid > 1 )) || return 0
+  kill -0 "$pid" 2>/dev/null || return 0
+  echo "$pid"
+  for kid in $(ps -o pid= --ppid "$pid" 2>/dev/null); do
+    auth_pid_tree "$kid"
+  done
+}
+
+# TERM the tree leaves-first (so children aren't reparented mid-teardown),
+# give it a moment, then KILL whatever ignored it.
+auth_kill_pid_tree() {
+  local root="$1" pids=() i
+  mapfile -t pids < <(auth_pid_tree "$root")
+  (( ${#pids[@]} )) || return 0
+  for (( i=${#pids[@]}-1; i>=0; i-- )); do kill -TERM "${pids[i]}" 2>/dev/null || true; done
+  local waited=0
+  while (( waited < 3 )); do
+    kill -0 "$root" 2>/dev/null || return 0
+    sleep 1; waited=$(( waited + 1 ))
+  done
+  for (( i=${#pids[@]}-1; i>=0; i-- )); do kill -KILL "${pids[i]}" 2>/dev/null || true; done
+}
+
+# Tear a session's tmux server down and make sure nothing survives it.
+# Idempotent — safe to call on an already-dead session.
+auth_teardown_session() {
+  local dir="$1"
+  local sid session sock pids=() p
+  sid=$(basename "$dir")
+  session="auth-${sid}"
+  sock="${dir}/tmux.sock"
+  # Pane pids while the server still answers; fall back to the pid recorded at
+  # spawn time when the socket is gone but the child was reparented to init.
+  if [[ -S "$sock" ]]; then
+    mapfile -t pids < <(sudo -u claude tmux -S "$sock" list-panes -a -F '#{pane_pid}' 2>/dev/null)
+  fi
+  if (( ${#pids[@]} == 0 )) && [[ -s "${dir}/meta.json" ]]; then
+    mapfile -t pids < <(jq -r '.panePid // empty' "${dir}/meta.json" 2>/dev/null)
+  fi
+  sudo -u claude tmux -S "$sock" kill-session -t "$session" 2>/dev/null || true
+  sudo -u claude tmux -S "$sock" kill-server 2>/dev/null || true
+  for p in "${pids[@]}"; do auth_kill_pid_tree "$p"; done
+}
+
+# Drop a session dir, but never abort the sweep over one we can't remove (an
+# unprivileged caller, a busy mount). Warn and keep going — a sweep that dies
+# silently mid-loop under `set -e` is the failure shape we're here to fix.
+auth_rm_session_dir() {
+  local dir="$1"
+  rm -rf -- "$dir" 2>/dev/null \
+    || warn "auth reap: could not remove $dir (need root?)"
+}
+
+# Age in seconds of an ISO-8601 timestamp; huge number if unparseable, so a
+# corrupt meta.json reaps rather than pins a session open forever.
+auth_ts_age() {
+  local ts="$1" epoch now
+  now=$(date +%s)
+  epoch=$(date -d "$ts" +%s 2>/dev/null) || { echo 999999999; return 0; }
+  [[ -n "$epoch" ]] || { echo 999999999; return 0; }
+  echo $(( now - epoch ))
+}
+
+# cmd_auth_reap — sweep $AUTH_SESSIONS_DIR. Two stages, because the dashboard
+# still wants to read WHY a session ended:
+#   1. non-terminal + older than --max-age  -> tear down + mark expired
+#      (this is what kills the abandoned login CLI),
+#   2. terminal   + older than --ttl        -> tear down (belt+braces) + rm dir.
+# Called opportunistically from `auth start` so the fleet self-heals without a
+# cron entry, and exposed as a verb for operators / a periodic sweep.
+cmd_auth_reap() {
+  local ttl="$AUTH_SESSION_TTL_SECS" max_age="$AUTH_SESSION_MAX_AGE_SECS" dry=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --ttl=*)      ttl="${1#--ttl=}" ;;
+      --max-age=*)  max_age="${1#--max-age=}" ;;
+      --dry-run)    dry=1 ;;
+      -*)           fail "$E_USAGE" "unknown flag: $1" ;;
+      *)            fail "$E_USAGE" "usage: 5dive agent auth reap [--ttl=<secs>] [--max-age=<secs>] [--dry-run]" ;;
+    esac
+    shift
+  done
+  [[ "$ttl" =~ ^[0-9]+$ && "$max_age" =~ ^[0-9]+$ ]] \
+    || fail "$E_VALIDATION" "--ttl/--max-age take whole seconds"
+
+  local expired=0 removed=0 kept=0 dir sid state age
+  local nullglob_was=0
+  shopt -q nullglob && nullglob_was=1
+  shopt -s nullglob
+  for dir in "$AUTH_SESSIONS_DIR"/*/; do
+    dir="${dir%/}"
+    sid=$(basename "$dir")
+    [[ "$sid" =~ ^[0-9a-f]{16}$ ]] || continue
+    state=""
+    [[ -s "${dir}/meta.json" ]] && state=$(jq -r '.state // ""' "${dir}/meta.json" 2>/dev/null)
+    case "$state" in
+      ok|expired|error)
+        age=$(auth_ts_age "$(jq -r '.updatedAt // .createdAt // ""' "${dir}/meta.json" 2>/dev/null)")
+        if (( age > ttl )); then
+          if (( dry )); then step "would remove $sid (state=$state, ${age}s old)"
+          else auth_teardown_session "$dir"; auth_rm_session_dir "$dir"; fi
+          removed=$(( removed + 1 ))
+        else
+          kept=$(( kept + 1 ))
+        fi
+        ;;
+      "")
+        # No/unreadable meta.json — age off the dir itself, then drop it.
+        age=$(( $(date +%s) - $(stat -c %Y "$dir" 2>/dev/null || echo 0) ))
+        if (( age > ttl )); then
+          if (( dry )); then step "would remove $sid (no meta.json, ${age}s old)"
+          else auth_teardown_session "$dir"; auth_rm_session_dir "$dir"; fi
+          removed=$(( removed + 1 ))
+        else
+          kept=$(( kept + 1 ))
+        fi
+        ;;
+      *)
+        age=$(auth_ts_age "$(jq -r '.createdAt // ""' "${dir}/meta.json" 2>/dev/null)")
+        if (( age > max_age )); then
+          if (( dry )); then
+            step "would expire $sid (state=$state, ${age}s old)"
+          else
+            auth_teardown_session "$dir"
+            jq --arg s "expired" --arg ts "$(date -Iseconds)" --argjson a "$age" \
+               '.state = $s | .updatedAt = $ts
+                | .error = (.error // "auth session abandoned — reaped after \($a)s with no completed login")' \
+               "${dir}/meta.json" > "${dir}/meta.json.tmp" \
+              && mv "${dir}/meta.json.tmp" "${dir}/meta.json"
+          fi
+          expired=$(( expired + 1 ))
+        else
+          kept=$(( kept + 1 ))
+        fi
+        ;;
+    esac
+  done
+  (( nullglob_was )) || shopt -u nullglob
+
+  ok "auth sessions reaped" \
+     '{expired:$e, removed:$r, kept:$k, dryRun:($d == "1")}' \
+     --argjson e "$expired" --argjson r "$removed" --argjson k "$kept" --arg d "$dry"
+}
+
+# Best-effort reap from the `auth start` path — never let a sweep failure block
+# someone from logging in.
+auth_reap_quiet() {
+  ( JSON_MODE=0 QUIET=1 cmd_auth_reap ) >/dev/null 2>&1 || true
+}
+
 # Extract the OAuth URL from a claude setup-token PTY log. claude v2.1.119
 # emits the URL in two places:
 #   1. as the target of an OSC 8 hyperlink escape: `ESC]8;id=<id>;<URL>BEL<text>ESC]8;;BEL`
@@ -1481,6 +1660,9 @@ cmd_auth_start() {
   fi
 
   require_auth_session_root
+  # DIVE-1884: sweep abandoned sessions before adding another. Keeps the
+  # self-heal on the path that actually runs, so no cron entry is required.
+  auth_reap_quiet
   local sid dir
   sid=$(gen_session_id)
   dir="${AUTH_SESSIONS_DIR}/${sid}"
@@ -1510,12 +1692,17 @@ cmd_auth_start() {
       ;;
   esac
 
+  # DIVE-1884: bound the wait for a device URL. A harness that never reaches
+  # device-auth (agy sitting on its first-run onboarding wizard) is otherwise
+  # indistinguishable from "still waiting on the IdP" and the operator waits
+  # forever. poll fails loud with the pane tail once this passes.
+  local url_deadline=$(( $(date +%s) + AUTH_URL_TIMEOUT_SECS ))
   jq -n --arg t "$type" --arg p "$profile" --arg s "pending_url" \
         --arg ts "$(date -Iseconds)" --arg sid "$sid" \
-        --argjson ab "$auth_baseline" '{
+        --argjson ab "$auth_baseline" --argjson ud "$url_deadline" '{
     sessionId: $sid, type: $t, profile: $p, state: $s,
     url: null, code: null, error: null,
-    authBaselineMtime: $ab,
+    authBaselineMtime: $ab, urlDeadline: $ud, panePid: null, paneTail: null,
     createdAt: $ts, updatedAt: $ts
   }' > "${dir}/meta.json"
   chmod 640 "${dir}/meta.json"
@@ -1621,6 +1808,15 @@ cmd_auth_start() {
     tmux -S '$sock' new-session -d -s '$session' -x $pane_width -y 50 \
       'env $extra_env script -q -f -c \"$login_cmd\" $log'
   " >&2 || fail "$E_GENERIC" "failed to spawn tmux session"
+
+  # Record the PTY child's pid so teardown can still reach it if the tmux
+  # server dies first and the login CLI gets reparented to init (DIVE-1884).
+  local pane_pid
+  pane_pid=$(sudo -u claude tmux -S "$sock" list-panes -a -F '#{pane_pid}' 2>/dev/null | head -1)
+  if [[ "$pane_pid" =~ ^[0-9]+$ ]]; then
+    jq --argjson pp "$pane_pid" '.panePid = $pp' "${dir}/meta.json" \
+      > "${dir}/meta.json.tmp" && mv "${dir}/meta.json.tmp" "${dir}/meta.json"
+  fi
 
   ok "device-code session started" \
      '{sessionId:$s, type:$t, profile:$p, state:"pending_url"}' \
@@ -1728,6 +1924,42 @@ cmd_auth_poll() {
             fi
             ;;
         esac
+
+        # DIVE-1884: FAIL LOUD instead of sitting on pending_url forever.
+        # A harness can wedge BEFORE device-auth is ever reached — agy on a
+        # profile with no prior login opens its first-run onboarding wizard
+        # (colour-scheme picker, then a Terms-of-Service + data-use consent
+        # screen with [Previous]/[Done]) and waits for keystrokes nobody
+        # sends. That looked identical to "still waiting on the IdP", so the
+        # operator waited forever with no signal. Past the deadline we tear
+        # the session down and surface the PANE TAIL in the error, so whoever
+        # is watching sees the wizard instead of guessing.
+        #
+        # We deliberately do NOT drive that wizard: its second screen is a
+        # legal consent with a pre-ticked data-collection checkbox. Auto-
+        # advancing it would be a machine accepting terms on a human's behalf.
+        # Any future auto-onboarding MUST stop at the consent screen and hand
+        # over to a person. Escalated to lodar; unresolved at time of writing.
+        if [[ "$state" == "pending_url" && "$alive" == "1" ]]; then
+          local url_deadline
+          url_deadline=$(jq -r '.urlDeadline // 0' "$meta")
+          if [[ "$url_deadline" != "0" ]] && (( $(date +%s) > url_deadline )); then
+            local tail_txt="" hint=""
+            sudo -u claude tmux -S "$sock" capture-pane -p -J -S -200 \
+              -t "$session" 2>/dev/null | grep -v '^[[:space:]]*$' | tail -20 \
+              > "${dir}/pane.txt" 2>/dev/null || true
+            [[ -s "${dir}/pane.txt" ]] && tail_txt=$(cat "${dir}/pane.txt")
+            if grep -qiE 'terms of service|privacy|data (use|collection)|colou?r scheme|\[ *done *\]|\[ *previous *\]|get started|welcome' <<<"$tail_txt"; then
+              hint=" — it is sitting on an interactive FIRST-RUN ONBOARDING wizard (not device auth); that screen needs a human"
+            fi
+            auth_teardown_session "$dir"
+            state="error"
+            jq --arg s "$state" --arg ts "$(date -Iseconds)" --arg pt "$tail_txt" \
+               --arg e "$type printed no device URL within ${AUTH_URL_TIMEOUT_SECS}s${hint}. Pane tail is in .paneTail (and ${dir}/pane.txt)." \
+               '.state = $s | .error = $e | .paneTail = (if $pt == "" then null else $pt end) | .updatedAt = $ts' \
+               "$meta" > "${meta}.tmp" && mv "${meta}.tmp" "$meta"
+          fi
+        fi
       fi
 
       if [[ "$state" == "awaiting_code" || "$state" == "submitted" ]]; then
@@ -1781,7 +2013,7 @@ cmd_auth_poll() {
             stable=$(jq -r '.agyTokenMtime // 0' "$meta")
             if [[ -s "$sentinel" ]] && (( current > baseline )) && (( current == stable )); then
               # Two consecutive polls saw the SAME non-empty token -> finalized.
-              sudo -u claude tmux -S "$sock" kill-session -t "$session" 2>/dev/null || true
+              auth_teardown_session "$dir"
               state="ok"
               jq --arg s "$state" --arg ts "$(date -Iseconds)" \
                 '.state = $s | .updatedAt = $ts' "$meta" > "${meta}.tmp" \
@@ -1801,7 +2033,7 @@ cmd_auth_poll() {
                  '.state = $s | .error = $e | .updatedAt = $ts' "$meta" > "${meta}.tmp" \
                 && mv "${meta}.tmp" "$meta"
             elif [[ "$deadline" != "0" ]] && (( now > deadline )); then
-              sudo -u claude tmux -S "$sock" kill-session -t "$session" 2>/dev/null || true
+              auth_teardown_session "$dir"
               state="error"
               jq --arg s "$state" --arg e "antigravity onboarding did not finalize a usable token within 240s of code submit" \
                  --arg ts "$(date -Iseconds)" \
@@ -1835,7 +2067,7 @@ cmd_auth_poll() {
               current=$(stat -c %Y "$sentinel" 2>/dev/null || echo 0)
             fi
             if (( current > baseline )); then
-              sudo -u claude tmux -S "$sock" kill-session -t "$session" 2>/dev/null || true
+              auth_teardown_session "$dir"
               state="ok"
               jq --arg s "$state" --arg ts "$(date -Iseconds)" \
                 '.state = $s | .updatedAt = $ts' "$meta" > "${meta}.tmp" \
@@ -1865,7 +2097,7 @@ cmd_auth_poll() {
               else
                 printf '%s' "$tok" | write_default_connector "anthropic.env" "CLAUDE_CODE_OAUTH_TOKEN"
               fi
-              sudo -u claude tmux -S "$sock" kill-session -t "$session" 2>/dev/null || true
+              auth_teardown_session "$dir"
               state="ok"
               jq --arg s "$state" --arg ts "$(date -Iseconds)" \
                 '.state = $s | .updatedAt = $ts' "$meta" > "${meta}.tmp" \
@@ -1898,7 +2130,11 @@ cmd_auth_poll() {
   if (( JSON_MODE )); then
     jq -c '{ok:true, data: .}' "$meta"
   else
-    jq -r '"sessionId: \(.sessionId)\ntype:      \(.type)\nprofile:   \(.profile // "-")\nstate:     \(.state)\nurl:       \(.url // "-")\ncode:      \(.code // "-")\nerror:     \(.error // "-")\nupdatedAt: \(.updatedAt)"' "$meta"
+    # DIVE-1884: when the session died without ever reaching device auth, the
+    # pane tail is the whole diagnosis — print it rather than making the
+    # operator go find the private tmux socket.
+    jq -r '"sessionId: \(.sessionId)\ntype:      \(.type)\nprofile:   \(.profile // "-")\nstate:     \(.state)\nurl:       \(.url // "-")\ncode:      \(.code // "-")\nerror:     \(.error // "-")\nupdatedAt: \(.updatedAt)"
+           + (if .paneTail then "\n--- last screen ---\n" + .paneTail else "" end)' "$meta"
   fi
 }
 
@@ -1973,7 +2209,7 @@ cmd_auth_cancel() {
   local sock="${dir}/tmux.sock"
   local session="auth-${sid}"
 
-  sudo -u claude tmux -S "$sock" kill-session -t "$session" 2>/dev/null || true
+  auth_teardown_session "$dir"
   jq --arg s "expired" --arg ts "$(date -Iseconds)" \
      '.state = (if (.state == "ok") then "ok" else $s end) | .updatedAt = $ts' "$meta" \
      > "${meta}.tmp" && mv "${meta}.tmp" "$meta"

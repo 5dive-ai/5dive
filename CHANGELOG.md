@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.15.33
+
+- **`agent auth start` no longer wedges forever on a first-run onboarding TUI.**
+  `pending_url` was indistinguishable from "still waiting on the IdP", so an
+  antigravity session that never reached device auth — agy opens a colour-scheme
+  picker and a Terms-of-Service + data-use consent screen on a profile with no
+  prior login, and waits for keystrokes nobody sends — looked identical to normal
+  progress and the operator waited indefinitely. `auth poll` now bounds the wait
+  (`FIVE_AUTH_URL_TIMEOUT`, default 300s — measured, not guessed: agy 1.1.7 on a
+  pristine HOME paints its login menu at T+2s and its OAuth URL at T+4s, so this is
+  ~75x the healthy path) and fails LOUD with the last screen of
+  the pane in `.paneTail` plus a hint when it recognises an onboarding wizard.
+  The consent screen is deliberately NOT auto-advanced — a machine must not accept
+  terms on a person's behalf — and a test canary fails if that changes (DIVE-1884).
+- **`agent auth reap` — abandoned login processes are cleaned up.** Nothing used to
+  reap auth sessions: an abandoned attempt left the login CLI resident indefinitely
+  and its session dir behind forever. Two stages — non-terminal sessions past
+  `--max-age` (default 1800s) are torn down and marked expired with a reason;
+  terminal sessions past `--ttl` (default 86400s) have their dir removed. `auth
+  start` sweeps first, so a box self-heals without a cron entry, and `auth cancel`
+  now kills the tmux SERVER and the PTY child rather than just the session
+  (exact pids only, never a process-group kill) (DIVE-1884).
+- docs: `--help` notes that each auth session's login TUI lives on a PRIVATE tmux
+  socket, so a plain `tmux ls` shows nothing, plus the attach command (DIVE-1884).
+
 ## 0.15.30
 
 - **CORRECTION to the 0.15.27 entry.** That entry (and its commit message) stated it
