@@ -93,6 +93,14 @@ _push_gate_check() {
   # sanctioned lead-clear path in `task answer` (cmd_task.sh), which fires only
   # when the caller was `agent-X` AND X was the gate's routed_reviewer at clear
   # time — so the value after `lead:` IS the designated reviewer who cleared it.
+  # DIVE-2099 adds a SECOND minting path under the same `lead:` prefix:
+  # `lead:standing:X` records the org lead clearing an ENGINEERING approval under
+  # their standing authority, with no routing involved (so `reviewer` is legitimately
+  # empty there). It is authorized by the generic `lead:*` arm below on purpose —
+  # push-for-review on our own repos is in-scope item #1 of that grant — and it is
+  # equally signature-bound, since `need_answered_by` is inside the signed closure.
+  # Read `lead:standing:X` as "the org lead X, standing authority"; `lead:X` stays
+  # "the designated reviewer X".
   # Requiring routed_reviewer to still match at push time was the bug: routing
   # can be mutated after the clear (a re-route, or the DIVE-1437 T2-escalation
   # NULLs routed_reviewer), stranding a correctly lead-cleared push with an empty
