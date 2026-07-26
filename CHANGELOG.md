@@ -1,5 +1,41 @@
 # Changelog
 
+## 0.16.2 — fix(selfcheck): harness-verdicts reported PASS having probed ZERO harnesses (DIVE-2061) (2026-07-26)
+
+Found by main dogfooding the freshly-rolled 0.16.0 on the live control plane, minutes
+after DIVE-2039 merged. Same binary, only the cwd differing:
+
+    cwd = a 0.16.0 checkout  -> "... — 3 wired"  verdict: pass
+    cwd = a stale worktree   -> "... — 0 wired"  verdict: pass   <-- nothing measured
+
+`0 wired, no failures` was read as "no failures found, therefore pass". It means
+**nothing was measured** — zero coverage folding into green, which is precisely the
+NOT-REACHED-is-a-third-state rule this verb exists to enforce, broken inside it. It also
+weakened the union: `tests/meta/selfcheck-union.sh` asserts every probe is REACHED
+somewhere, so a probe passing on zero coverage satisfied the union while proving nothing.
+
+Two fixes:
+
+- **Zero probed is never a pass.** An empty corpus is `not-reached (empty-corpus)` —
+  environmental, nothing to measure. A POPULATED corpus that yielded zero is `error`,
+  which exits non-zero and, critically, is **not** counted as REACHED by the union. It
+  is deliberately `error` and not `fail`: the rail is not broken, the MEASUREMENT was
+  misdirected, and `fail` would falsely accuse the harnesses of being unwired.
+- **The corpus is named, and so is how it was chosen.** Resolution walks up from cwd and
+  this host carries ~10 `5dive-cli-wt-*` worktrees at assorted versions, so an operator
+  silently got a verdict about a tree they were not thinking about. Both
+  `harness-verdicts` and `bundle-integrity` (same resolver, same hazard) now print
+  `[corpus <path> (N harnesses, how)]`, the same self-evidence probe 7 gained from
+  `[graded <path>]`.
+
+The durable lesson is about coverage, not this bug: **mutation coverage is
+per-DIMENSION.** `harness-verdicts` was one of the four mutation-covered probes and still
+had a hole, because every existing mutation varied the HARNESS and none varied the
+CORPUS — they always ran with a good one present. "This probe is mutation-covered" is not
+a property of the probe; it is a property of (probe, input). `tests/selfcheck_mutation_e2e.sh`
+now varies the corpus too, reads the sample list from the bundle under test rather than
+restating it, and asserts its own mutation actually removed something.
+
 ## 0.16.1 — fix(audit): fence the remaining `cmd_task.sh`/`cmd_heartbeat.sh` audit_log sites on TASKS_DB store identity (DIVE-2054) (2026-07-26)
 
 - **Follow-up to DIVE-2010**: 21 more task-store-driven `audit_log` call sites (merge-gate
