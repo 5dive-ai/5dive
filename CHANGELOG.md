@@ -1,5 +1,84 @@
 # Changelog
 
+## 0.16.11 — fix(task): `task need` warns at file time when a decision gate lands on a branch-bound task (DIVE-2074) (2026-07-26)
+
+A `--type=decision` gate only authorizes `push` when it is answered by that task's OWN
+routed reviewer. A lead clearing it on someone else's behalf does not satisfy the push
+guard (DIVE-2073) — the gate reads as answered and the push still refuses, which is a
+confusing pair of states to debug after the fact.
+
+`task need` now warns at file time when a decision gate is filed against a branch-bound
+task, and points at `--type=approval` as the verb that actually unblocks a delegated push.
+Also documents the `bundle-drift` / `version-bump-guard` split in CONTRIBUTING: the former
+asserts `bundle == build(src)` and is version-independent, so a failing drift check is
+never asking for a version bump.
+
+## 0.16.10 — fix(update): `update --check` fetched only the bundle, so it had nothing to cross-check and read a stale cache generation as up-to-date (DIVE-2042) (2026-07-26)
+
+`5dive update --check` printed `OK — CLI 0.15.34 is up to date` twice, several minutes
+apart, while main was already publishing 0.15.35. It was not wrong about its own
+arithmetic — it was answering a question it could not answer.
+
+**The window.** raw.githubusercontent serves the bundle and its `.sha256` as two
+independent cache objects, so for minutes after every push to main it can hand back a
+stale bundle beside a fresh checksum. DIVE-1977 fixed this on the install path by
+pinning; the same window has since been seen on the contents API too, so treat it as a
+property of GitHub's read paths rather than of `raw/main`. The window itself is cache
+physics and is not a defect.
+
+**The defect** is what the checker did with it. `update --check` fetched only the
+bundle — it never fetched the checksum at all, so it had nothing to cross-check
+against. It read `FIVE_VERSION` off the stale generation, found it equal to the local
+version and rendered a confident green. It could say up-to-date or behind, and a checker
+that can only say yes or no says yes when it does not know. That matters past this host:
+the window opens on every push to main, and main HEAD is what customer boxes self-update
+from, so every ship had a period where a box asking "am I current?" was told yes and was
+wrong. Transient, which is exactly what made it easy to dismiss.
+
+Note the severity ordering against its two siblings. When the install guard hits this
+split it REFUSES, loudly, and someone goes and looks. This one SUCCEEDS and hands back a
+plausible wrong number, in the direction most likely to suppress the response — which is
+why the most benign-looking of the three was the expensive one.
+
+**Now three states: up-to-date / behind / INDETERMINATE.** Both reads go through one
+`_published_cli_probe`, which applies two defences in order. It PINS — `git ls-remote`
+rides the git transport, not the raw CDN, so it has no split-generation window; main is
+resolved to one immutable sha and both objects are fetched from `raw/<sha>/`, where they
+cannot disagree. Unresolvable falls back to `/main` rather than failing shut. And it
+VERIFIES — the bundle we were actually served is hashed against the `.sha256` we were
+actually served, which is the only propagation signal available on the unpinned path.
+A disagreement is reported as indeterminate with a NON-ZERO exit, so an unattended
+caller branches on status alone and never reads a green it was not given. The message
+branches on whether the accusation is justifiable (DIVE-1977's rule): pinned names the
+sha, unpinned says cache generations and to retry.
+
+`supervisor`'s `cliStale` probe carried the identical defect and now shares the probe:
+anything short of a consistent read leaves staleness `unknown` rather than minting a
+`behind=false` for a box it did not measure. It already owned an `unknown` vocabulary
+for a missing nightly log and still resolved this read confidently — a component that
+has the right word and does not reach for it is harder to spot than one that lacks it.
+`update --check --json` gains `source`, naming the ref the answer came from, so a
+surprising number can be re-fetched at the exact identity that produced it.
+`behind`/`stale` are unchanged and are now only ever emitted on the consistent path.
+
+`tests/update_check_propagation_unit.sh` extracts the probe verbatim between its fence
+markers and runs the shipped bytes against stubbed `git`/`curl` on a minimal PATH with
+the REAL `sha256sum` — no network. It replays the incident byte for byte, and grades the
+three render states as a set: the "no green here" assertions are only meaningful because
+two positive controls prove the same harness can reach a green and a behind. The first
+cut of the harness passed those negatives vacuously, on a command that had crashed for
+want of `date` — a negative assertion is satisfied by absence, and a crash produces
+perfect absence. Negative control (verification disabled) reds 8 of 17.
+
+
+## 0.16.9 — fix(gate): a gate-delivery row could say `user=unknown` while asserting a confirmed send (DIVE-2073) (2026-07-26)
+
+Maker dev3. `audit_log` now records `user=root` for *no invoking user by design* and reserves `unknown` for a genuine non-root resolution failure (behind an `_audit_is_root` seam, since `$EUID` is readonly). The delivery row additionally carries `via=<channel-owner-agent>` and `path=<file-time|renag|privileged-resend>`, with `TASK_CH_AGENT` cleared on a miss so an error row cannot borrow a stale owner.
+
+Root cause was measured, not inferred, and it corrected the guess in the ticket: these rows land at `:NN:02` — the root heartbeat re-nag, which has no `SUDO_USER` and no `USER` — not the privileged re-send. Confirmed across the whole audit log: unknown-actor rows cluster at seconds :00–:04 (3/165/128/17/3) while actor-resolved delivery rows scatter with no dominant second. Instrumenting the guessed path would have left the actual producer emitting `unknown` on every run while the ticket closed green.
+
+Surfaced by marketing from real DIVE-2050 rows. `via=` retroactively answers the question that left DIVE-1927's residual 2 unprovable: which bot delivered `message_id=691` could only be inferred from per-bot message-id spaces, and is now on the row.
+
 ## 0.16.8 — docs(selfcheck): the --full duration figure, with its conditions (DIVE-2039 follow-up) (2026-07-26)
 
 `--full`'s documented runtime has been wrong twice, in opposite directions, and both

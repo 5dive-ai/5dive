@@ -278,10 +278,20 @@ _SUP_CLI_STALE="unknown"
 _sup_cli_check() {
   (( _SUP_CLI_CHECKED )) && return 0
   _SUP_CLI_CHECKED=1
-  command -v curl >/dev/null 2>&1 || return 0
-  local latest
-  latest=$(curl -fsSL --max-time 5 "https://raw.githubusercontent.com/$(gh_org)/5dive/main/5dive" 2>/dev/null \
-    | grep -m1 -oP '(?<=^readonly FIVE_VERSION=")[^"]+') || true
+  # DIVE-2042: the published version is read through _published_cli_probe, which
+  # pins both fetches to one immutable sha and verifies the bundle against its
+  # own checksum. Anything short of a CONSISTENT read leaves staleness UNKNOWN
+  # rather than resolving it — during the propagation window the raw CDN can
+  # serve a bundle one release behind, and believing it would mint a confident
+  # `behind=false` for a box we did not actually measure. Same doctrine this
+  # probe already applies to a missing nightly log: absence of evidence is not
+  # evidence of currency.
+  local probe
+  probe=$(_published_cli_probe) || return 0
+  local -a p=()
+  mapfile -t p <<<"$probe"
+  [[ "${p[0]:-}" == consistent ]] || return 0
+  local latest="${p[1]:-}"
   [[ -n "$latest" ]] || return 0
   _SUP_CLI_LATEST="$latest"
   if ! version_lt "$FIVE_VERSION" "$latest"; then
