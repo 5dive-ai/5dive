@@ -39,6 +39,10 @@ for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh \
   source "$SRC/$f"
 done
 STATE_DIR="$TMP"; TASKS_DIR="$STATE_DIR/tasks"; TASKS_DB="$TASKS_DIR/tasks.db"
+# DIVE-2054: "task need lead-route" is now routed through _task_store_audit_log
+# (STORE IDENTITY fence, DIVE-2010) — declare this fixture store as prod so the
+# audit-row assertions below keep exercising the real path.
+export FIVEDIVE_PROD_TASKS_DB="$TASKS_DB"
 mkdir -p "$TASKS_DIR"; set +e
 
 # Capture delivery rows locally. _task_gate_delivery_log honours this path even

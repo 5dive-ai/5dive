@@ -41,7 +41,8 @@ ESC_LOG="$TMP/escalated"; : >"$ESC_LOG"
 cmd_send()            { printf '%s\n' "$1" >>"$ESC_LOG"; }   # $1 = target agent
 _task_agent_channel() { return 0; }                          # everyone has a channel
 _task_send_owner()    { return 0; }                          # owner re-ping = no-op here
-audit_log()           { return 0; }
+AUDIT_LOG_CALLS="$TMP/audit"; : >"$AUDIT_LOG_CALLS"
+audit_log()           { printf '%s\n' "$*" >>"$AUDIT_LOG_CALLS"; return 0; }
 
 PASS=0; FAIL=0
 ok_t()  { PASS=$((PASS+1)); printf 'ok   - %s\n' "$1"; }
@@ -58,7 +59,7 @@ mk_gate() {  # <assignee> <days_old>
               'decision', 2, 'need a human call', datetime('now','-$2 days'), NULL);
       SELECT last_insert_rowid();"
 }
-reset() { db "DELETE FROM tasks;"; : >"$ESC_LOG"; }
+reset() { db "DELETE FROM tasks;"; : >"$ESC_LOG"; : >"$AUDIT_LOG_CALLS"; }
 
 # --- Case 1: gate older than the SLA → org-parent escalated -------------------
 reset
@@ -124,6 +125,25 @@ row=$(db "SELECT COALESCE(need_answer,'x')||'|'||COALESCE(need_answered_by,'x')|
 [[ "$row" == "approve|auto:ttl|0|todo" ]] \
   && ok_t "T1 gate >48h: rec applied via auto:ttl (uid 0) + task unblocked to todo" \
   || bad_t "T1 48h TTL did not apply the rec as expected" "got=[$row] want=[approve|auto:ttl|0|todo]"
+
+# --- Case 6b (DIVE-2054): "gate ttl-auto" is fenced on STORE IDENTITY --------
+# on the prod store the row is written as before; off the prod store it is
+# withheld — proves _task_store_audit_log actually gates this call site.
+unset _TASK_STORE_AUDIT_FENCED
+reset
+gid=$(mk_t1_gate worker 60 approve)
+FIVEDIVE_PROD_TASKS_DB="$TASKS_DB" _hb_gate_ttl_sweep
+grep -q "^gate ttl-auto ok" "$AUDIT_LOG_CALLS" \
+  && ok_t "DIVE-2054: on the prod store, gate ttl-auto writes its audit row as before" \
+  || bad_t "DIVE-2054: on-store row must still be written" "audit=[$(cat "$AUDIT_LOG_CALLS")]"
+unset _TASK_STORE_AUDIT_FENCED
+reset
+gid=$(mk_t1_gate worker 60 approve)
+FIVEDIVE_PROD_TASKS_DB="$TMP/somewhere-else/tasks.db" _hb_gate_ttl_sweep
+[[ ! -s "$AUDIT_LOG_CALLS" ]] \
+  && ok_t "DIVE-2054: off the prod store, gate ttl-auto writes NO audit row" \
+  || bad_t "DIVE-2054: off-store must not audit" "audit=[$(cat "$AUDIT_LOG_CALLS")]"
+unset _TASK_STORE_AUDIT_FENCED
 
 # Case 7: tier-1 gate + rec, only 24h old (<48h) → left untouched
 reset

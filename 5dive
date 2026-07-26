@@ -26,7 +26,7 @@ esac
 
 # Bumped on every public release. `build.sh` checks this line exists; CI fails
 # the bundle-drift check if it's missing or empty.
-readonly FIVE_VERSION="0.16.0"
+readonly FIVE_VERSION="0.16.1"
 
 # GitHub org our repos live under. The org is being renamed
 # 5dive-com -> 5dive-ai (2026-06); fetches must work on either side of the
@@ -17882,7 +17882,8 @@ _task_reclaim_on_close() {
   # silent skip would read as "there was nothing to reclaim", which is the
   # empty-output-is-not-an-empty-answer defect (DIVE-1869), just in a disk sweep.
   (( failed )) && step "warn: $failed node_modules tree(s) for $ident not removable as $(id -un) — run: sudo 5dive task reclaim $ident"
-  audit_log "task reclaim" ok 0 -- "$ident" "worktrees=$seen" "kb=$kb" "removed=$removed" "failed=$failed"
+  # DIVE-2054: task-store state (a reclaim stat for THIS task's worktrees) — fenced.
+  _task_store_audit_log "task reclaim" ok 0 -- "$ident" "worktrees=$seen" "kb=$kb" "removed=$removed" "failed=$failed"
   return 0
 }
 
@@ -19335,7 +19336,12 @@ _task_status_cmd() {
         case "${_rollup##*|}" in
           FAILURE)
             if [[ $force_merge_gate -eq 1 ]]; then
-              audit_log "task.force-merge-gate" ok 0 -- "$ident" "override_red_merge=$_dref"
+              # DIVE-2054 (judgment call, not a mechanical sweep): a pure task-store
+              # override record (ident + which PR was forced) — no delivery/identity
+              # component like the 5389/5638/3264 exemptions carry, and its sibling
+              # "task.merge-gate-unverified" a few lines below was already fenced by
+              # DIVE-2010. Fenced for consistency within the same merge-gate family.
+              _task_store_audit_log "task.force-merge-gate" ok 0 -- "$ident" "override_red_merge=$_dref"
               warn "$ident: delivery PR $_dref merged with FAILING checks — closing anyway (--force-merge-gate, audited)."
             else
               policy_refuse "$E_CONFLICT" done-after-red-merge DIVE-1935 "$ident" "$ident cannot close: its delivery PR $_dref is merged but its checks are RED. done=merged-AND-green (DIVE-1935) — fix main (or re-run the failed check), then task done, or \`task done $ident --force-merge-gate\` to override (audited)."
@@ -19502,7 +19508,9 @@ $_body"
       fi
       if [[ -n "$_txt_amb" ]]; then
         warn "$ident: AMBIGUOUS PR reference(s) — $_txt_amb. A bare number does not identify a pull request across our repos and this task declares none, so the merge state is UNVERIFIED rather than guessed (DIVE-1955). Cite the full pull URL or add a \`Repo: <owner>/<repo>\` line to the body."
-        audit_log "task.merge-gate-ambiguous" ok 0 -- "$ident" "refs=$_txt_amb"
+        # DIVE-2054 (judgment call): pure task-store text-match record, same
+        # family as the already-fenced "task.merge-gate-unverified" — fenced.
+        _task_store_audit_log "task.merge-gate-ambiguous" ok 0 -- "$ident" "refs=$_txt_amb"
         _mg_unverified="${_mg_unverified:+$_mg_unverified; }AMBIGUOUS PR reference(s) — $_txt_amb"
       fi
       # DIVE-1965: say which refs were set aside and WHY, with both escapes named.
@@ -19514,7 +19522,8 @@ $_body"
       # delivery landed in here, this line is where they see it.
       if [[ -n "$_txt_cited" ]]; then
         warn "$ident: merge-gate treated PR reference(s) #${_txt_cited//,/, #} as CITED, not delivered — nothing binds them to this task, so their merge state was NOT checked (DIVE-1965). If one of them IS this task's delivery, bind it (\`task deliver $ident --pr=<url>\`) or say so (\"merged as PR #N\", or a \`Delivered: <url>\` line)."
-        audit_log "task.merge-gate-reported-on" ok 0 -- "$ident" "refs=$_txt_cited"
+        # DIVE-2054 (judgment call): same merge-gate family as -ambiguous above — fenced.
+        _task_store_audit_log "task.merge-gate-reported-on" ok 0 -- "$ident" "refs=$_txt_cited"
       fi
     fi
     if [[ -n "$_txt_open" && $force_merge_gate -eq 0 ]]; then
@@ -19527,7 +19536,9 @@ $_body"
       # Never a silent bypass: record the forced close (with the overridden PR #
       # if any) to the tamper-evident audit log. The unmerged PR/branch it leaves
       # behind is independently flagged by the weekly hygiene digest (#139).
-      audit_log "task.force-merge-gate" ok 0 -- "$ident" "override_pr=${_auto_hit:-none}"
+      # DIVE-2054 (judgment call): same reasoning as the other force-merge-gate
+      # site above — task-store override record, fenced for consistency.
+      _task_store_audit_log "task.force-merge-gate" ok 0 -- "$ident" "override_pr=${_auto_hit:-none}"
     elif [[ -n "$_auto_hit" ]]; then
       policy_refuse "$E_CONFLICT" done-before-named-pr-merged DIVE-1835 "$ident" "$ident cannot close: open PR ${_sc_hit_slug}#$_auto_hit names it in its title/branch but is not merged to main. done=merged-to-main (DIVE-1835 mandatory gate) — merge it then \`task done\`, \`task cancel\` to abandon, or \`task done $ident --force-merge-gate\` to override (audited + surfaced in the weekly hygiene digest)."
     fi
@@ -19878,7 +19889,8 @@ cmd_task_reject() {
     db "UPDATE tasks SET need_answer='(superseded — task rejected, bounced to maker)',
           need_answered_at=$(sqlq "$_sup_ts"), need_answered_by='auto:reject', gate_pinged_at=NULL
         WHERE id=${id} AND need_answered_at IS NULL;"
-    audit_log "task reject gate-supersede" "ok" 0 -- "task=$ident" || true
+    # DIVE-2054: task-store state — fenced.
+    _task_store_audit_log "task reject gate-supersede" "ok" 0 -- "task=$ident" || true
   fi
   # max_iterations reached -> stop bouncing, park it on a human to decide.
   if (( maxi > 0 && iter >= maxi )); then
@@ -20580,13 +20592,15 @@ cmd_task_precedent() {
       ;;
     on|enable)
       _task_pref_set precedent_autoclear on
-      audit_log "task precedent" "on" 0 -- "pref=precedent_autoclear" || true
+      # DIVE-2054: a fleet-wide pref toggle keyed off the active store — fenced.
+      _task_store_audit_log "task precedent" "on" 0 -- "pref=precedent_autoclear" || true
       ok "precedent auto-clear: ON — resolved tier-1 gates with proven human precedent now clear at file-time" \
          '{pref:"precedent_autoclear", value:"on"}'
       ;;
     off|disable)
       _task_pref_set precedent_autoclear off
-      audit_log "task precedent" "off" 0 -- "pref=precedent_autoclear" || true
+      # DIVE-2054: same as the "on" branch above — fenced.
+      _task_store_audit_log "task precedent" "off" 0 -- "pref=precedent_autoclear" || true
       ok "precedent auto-clear: OFF — tier-1 gates always surface to a human" \
          '{pref:"precedent_autoclear", value:"off"}'
       ;;
@@ -20614,13 +20628,15 @@ cmd_task_routing() {
       ;;
     on|enable)
       _task_pref_set gate_builder_routing on
-      audit_log "task routing" "on" 0 -- "pref=gate_builder_routing" || true
+      # DIVE-2054: same reasoning as "task precedent" above — fenced.
+      _task_store_audit_log "task routing" "on" 0 -- "pref=gate_builder_routing" || true
       ok "builder-gate routing: ON — a non-lead agent's tier<2 decision gate now routes to the org lead before pinging the human" \
          '{pref:"gate_builder_routing", value:"on"}'
       ;;
     off|disable)
       _task_pref_set gate_builder_routing off
-      audit_log "task routing" "off" 0 -- "pref=gate_builder_routing" || true
+      # DIVE-2054: same reasoning as "task routing on" above — fenced.
+      _task_store_audit_log "task routing" "off" 0 -- "pref=gate_builder_routing" || true
       ok "builder-gate routing: OFF — decision gates ping the human directly" \
          '{pref:"gate_builder_routing", value:"off"}'
       ;;
@@ -20987,6 +21003,10 @@ cmd_task_need() {
         UPDATE tasks SET status='todo'
           WHERE id=${id} AND status='blocked'
             AND NOT EXISTS (SELECT 1 FROM task_deps WHERE task_id=${id});"
+    # DIVE-2054: DELIBERATELY UNFENCED. Carries asserted_from=, the identity-assertion
+    # audit trail red-teamed on DIVE-1401 — a fixture store must never be able to
+    # suppress it (fencing here would trade a contamination bug for an
+    # evidence-suppression bug, the DIVE-1968 fail-open family). See DIVE-2054 wiki.
     audit_log "task need withdraw" "ok" 0 -- "task=$ident" "type=$w_type" "by=${w_name:-$w_kind}" "asserted_from=${from:-}" || true
     local w_new; w_new=$(db "SELECT status FROM tasks WHERE id=${id};")
     ok "$ident gate withdrawn (${w_type}) — moot request cleared, no secret/grant recorded; task now ${w_new}" \
@@ -21214,7 +21234,8 @@ cmd_task_need() {
         # ship gates past their lead to the paired human. Audit the branch that
         # declines to act, not just the one that acts — otherwise the only signal
         # is the human complaining about gate spam.
-        audit_log "task.gate-tier2-pin-escalated" ok 0 -- "$ident" "filer=$(task_actor "$from")" "lead=$_es_reviewer" "type=$type"
+        # DIVE-2054: task-store measurement of a filer/lead pattern — fenced.
+        _task_store_audit_log "task.gate-tier2-pin-escalated" ok 0 -- "$ident" "filer=$(task_actor "$from")" "lead=$_es_reviewer" "type=$type"
       elif [[ -n "$_es_reviewer" && ( "$type" == "decision" || "$type" == "approval" ) ]]; then
         tier=1; _eng_ship=1
       fi
@@ -21339,7 +21360,8 @@ cmd_task_need() {
         UPDATE tasks SET status='todo'
           WHERE id=${id} AND status='blocked'
             AND NOT EXISTS (SELECT 1 FROM task_deps WHERE task_id=${id});"
-    audit_log "task need t0-auto" "ok" 0 -- "task=$ident" "type=$type" "applied=$recommend" || true
+    # DIVE-2054: auto-clear applied from task-store data — fenced.
+    _task_store_audit_log "task need t0-auto" "ok" 0 -- "task=$ident" "type=$type" "applied=$recommend" || true
     ok "$ident tier-0 gate auto-cleared — applied: $recommend" \
        '{id:($i|tonumber), ident:$id, tier:0, auto_applied:$rc, need_type:$ty}' \
        --arg i "$id" --arg id "$ident" --arg rc "$recommend" --arg ty "$type"
@@ -21419,7 +21441,8 @@ cmd_task_need() {
                 UPDATE tasks SET status='todo'
                   WHERE id=${id} AND status='blocked'
                     AND NOT EXISTS (SELECT 1 FROM task_deps WHERE task_id=${id});"
-            audit_log "task need precedent-auto" "ok" 0 -- "task=$ident" "type=$type" "applied=$_qans" "precedent=$_qid" || true
+            # DIVE-2054: same reasoning as "task need t0-auto" above — fenced.
+            _task_store_audit_log "task need precedent-auto" "ok" 0 -- "task=$ident" "type=$type" "applied=$_qans" "precedent=$_qid" || true
             ok "$ident tier-1 gate auto-cleared from human precedent — applied: $_qans (precedent #$_qid)" \
                '{id:($i|tonumber), ident:$id, tier:1, need_type:$ty, auto_applied:$rc, need_answered_by:"auto:precedent", precedent_ref:($pr|tonumber)}' \
                --arg i "$id" --arg id "$ident" --arg ty "$type" --arg rc "$_qans" --arg pr "$_qid"
@@ -21568,7 +21591,10 @@ cmd_task_need() {
         # carries the delivery verdict, and is only `ok` when the send was confirmed.
         local _rres="ok" _rrc=0
         [[ "$_rstate" == "failed" ]] && { _rres="error"; _rrc=1; }
-        audit_log "task need lead-route" "$_rres" "$_rrc" -- "task=$ident" "type=$type" \
+        # DIVE-2054: internal lead-routing telemetry keyed off task-store data —
+        # unlike the escalate-to-human/clear-recs exemptions this carries no
+        # channel/chat proof, so fenced (not exempted).
+        _task_store_audit_log "task need lead-route" "$_rres" "$_rrc" -- "task=$ident" "type=$type" \
           "reviewer=$_reviewer" "filer=$actor" "delivery=$_rstate" || true
         case "$_rstate" in
           delivered) ;;
@@ -21952,7 +21978,8 @@ cmd_task_gate_escalate() {
   # ok on an unconfirmed send would rebuild the exact bug this fixes one layer up.
   [[ "$rc" == "0" && "${TASK_SEND_DELIVERED:-0}" != "1" ]] && rc=2
   if [[ "$rc" == "0" ]]; then
-    audit_log "task gate-escalate" "ok" 0 -- "task=$ident" "type=$nt" "filer=${filer:-unknown}" || true
+    # DIVE-2054: task-store re-send outcome — fenced.
+    _task_store_audit_log "task gate-escalate" "ok" 0 -- "task=$ident" "type=$nt" "filer=${filer:-unknown}" || true
     ok "$ident gate alert re-sent from a privileged context (filer ${filer:-unknown} is unpaired)" \
        '{ident:$id, escalated:true, filer:$f}' --arg id "$ident" --arg f "$filer"
     return 0
@@ -21963,7 +21990,8 @@ cmd_task_gate_escalate() {
   # the second reading whichever happened. Record the real rc, and say which of the
   # two it was, because "zero error rows after ship" is only checkable if the rows
   # can say what happened.
-  audit_log "task gate-escalate" "error" "$rc" -- "task=$ident" "type=$nt" "filer=${filer:-unknown}" "rc=$rc" || true
+  # DIVE-2054: same reasoning as the "ok" branch above — fenced.
+  _task_store_audit_log "task gate-escalate" "error" "$rc" -- "task=$ident" "type=$nt" "filer=${filer:-unknown}" "rc=$rc" || true
   if [[ "$rc" == "2" ]]; then
     fail "$E_AUTH_REQUIRED" "$ident: a channel WAS resolved in the chain above ${filer:-the filer}, but the Bot API send was not confirmed — delivery is UNVERIFIED, not refused (DIVE-1968)."
   fi
@@ -22940,12 +22968,16 @@ _task_inbox_send() {
       db "UPDATE tasks SET human_nonce_hash=$(sqlq "${nonce_hashes[$i]}")
           WHERE id=${nonce_ids[$i]} AND need_answered_at IS NULL;" 2>/dev/null || true
     done
+    # DIVE-2054: DELIBERATELY UNFENCED, same shape as "task clear-recs" (5389) —
+    # carries chat_proof=$channel_proof, proof a real channel was (or wasn't) hit
+    # for this digest send. A fixture store must never be able to suppress that.
     audit_log "task inbox send" "ok" 0 -- \
       "gates=${shown}/${total}" "chat_proof=${channel_proof:-none}" "message_id=${TASK_SEND_MESSAGE_IDS:-none}"
     ok "inbox digest sent (${shown}/${total} gates)" \
       '{sent:true, gates:($g|tonumber), total:($t|tonumber), message_ids:$m}' \
       --arg g "$shown" --arg t "$total" --arg m "${TASK_SEND_MESSAGE_IDS:-}"
   else
+    # DIVE-2054: DELIBERATELY UNFENCED, same exemption as the "ok" branch above.
     audit_log "task inbox send" "error" 1 -- \
       "gates=${shown}/${total}" "chat_proof=${channel_proof:-none}"
     fail "$E_GENERIC" "inbox digest delivery unconfirmed — nonce hashes left unrotated, earlier alert buttons remain valid"
@@ -23000,7 +23032,9 @@ cmd_gate_proof() {
       _signed=present
       _gate_closure_verify "$vid" "$_nt" "$_vfs" "$_nb" "$_nat" "$_nuid" "$_nsig" && _valid=true
     fi
-    audit_log "gate-proof verify" "$([[ "$_valid" == true ]] && echo ok || echo error)" 0 -- \
+    # DIVE-2054: the nonce/signature being verified is itself TASKS_DB state for
+    # $vident (not an independent real-world channel/identity fact) — fenced.
+    _task_store_audit_log "gate-proof verify" "$([[ "$_valid" == true ]] && echo ok || echo error)" 0 -- \
       "task=$vident" "type=$_nt" "signed=$_signed" "valid=$_valid" "uid=${_nuid:-}" "by=${_nb:-}"
     if (( JSON_MODE )); then
       ok "gate-proof verify $vident: signed=$_signed valid=$_valid" \
@@ -23043,6 +23077,9 @@ cmd_gate_proof() {
   # the enforcement toggle). A stray mint caller gets a loud, AUDITED failure here
   # rather than a silent forge.
   require_root "gate-proof"
+  # DIVE-2054: DELIBERATELY UNFENCED — store-identity fencing doesn't apply here at
+  # all. This row carries no TASKS_DB-derived data (a constant + raw CLI args); it
+  # is a bare record that a removed, forgeable command path was invoked at all.
   audit_log "gate-proof mint" "error" 1 -- "removed=DIVE-950" "args=${1:-} ${2:-}"
   fail "$E_USAGE" "gate-proof mint is removed (DIVE-950): the --proof evidence form was agent-forgeable. Gates clear via a human tap (per-gate nonce) or a non-agent SUDO_UID. Valid subcommands: gate-proof enforce on|off|status | verify <id> | sign."
 }
@@ -23112,6 +23149,8 @@ cmd_task_clear_recs() {
   done <<<"$rows"
 
   local n=${#cleared[@]}
+  # DIVE-2054: DELIBERATELY UNFENCED (ticket-named exemption) — carries
+  # chat=$channel_proof, the proof a real channel was hit.
   audit_log "task clear-recs" "ok" 0 -- "cleared=$n" "only=${only:-all}" "chat=$channel_proof" "list=${cleared[*]:-none}"
   if (( n == 0 )); then
     ok "no eligible gates to clear (agent-clearable, tier<2, with a recommendation)$([[ -n "$only" ]] && echo " for $only")" \
@@ -23241,7 +23280,8 @@ cmd_task_answer() {
       # stderr). The fail + non-zero exit is the record.
       fail "$E_AUTH_REQUIRED" "$ident is a '$nt' gate — only a human can clear it. Answer it from Telegram (tap the button) or the dashboard; an agent can't self-answer an approval/secret/manual gate."
     fi
-    [[ "$_lead_clear" == "1" ]] && audit_log "task answer lead-clear" "ok" 0 -- "task=$ident" "type=$nt" "reviewer=$_routed_rev" 2>/dev/null || true
+    # DIVE-2054: routed_reviewer is task-store state for $ident — fenced.
+    [[ "$_lead_clear" == "1" ]] && _task_store_audit_log "task answer lead-clear" "ok" 0 -- "task=$ident" "type=$nt" "reviewer=$_routed_rev" 2>/dev/null || true
   fi
 
   # DIVE-916/950: hard human gates (approval/secret/manual) need HUMAN evidence
@@ -23293,7 +23333,10 @@ cmd_task_answer() {
     # routed_reviewer (never secret), so no un-routed human gate is affected.
     local _evid=$(( _hp || _su || _lead_clear || _cp_ok ))
     local _caller2; _caller2=$(id -un 2>/dev/null || echo '?')
-    audit_log "task answer gate" "$([[ $_evid -eq 1 ]] && echo ok || echo error)" 0 -- \
+    # DIVE-2054: the human-proof/nonce evidence being scored here is stored
+    # against $ident in TASKS_DB (not an independent channel/delivery fact like
+    # the 3 named exemptions) — fenced.
+    _task_store_audit_log "task answer gate" "$([[ $_evid -eq 1 ]] && echo ok || echo error)" 0 -- \
       "task=$ident" "type=$nt" "channel_proof=$([[ -n "$channel_proof" ]] && echo present || echo absent)" "cp_ok=$_cp_ok" \
       "human_proof=$([[ -n "$human_proof" ]] && echo present || echo absent)" "nonce_valid=$_hp" \
       "sudo_nonagent=$_su" "human=$human" "caller=$_caller2" "sudo_uid=${SUDO_UID:-}" \
@@ -23361,6 +23404,8 @@ cmd_task_answer() {
       # fresh with the tap keyboard.
       local _esc_nonce=""; _esc_nonce=$(_human_nonce_mint)
       db "UPDATE tasks SET routed_reviewer=NULL, gate_pinged_at=NULL$([[ -n "$_esc_nonce" ]] && echo ", human_nonce_hash=$(sqlq "$(_human_nonce_sha "$_esc_nonce")")") WHERE id=${id};"
+      # DIVE-2054: DELIBERATELY UNFENCED (ticket-named exemption) — records an
+      # escalation actually leaving the fleet.
       audit_log "task answer escalate-to-human" ok 0 -- \
         "task=$ident" "type=$nt" "tier=$gtier" "reason=T2-floor refused routed gate — escalated to human with buttons" \
         "was_routed_to=$_routed_rev" "caller=$_caller3" "sudo_uid=${SUDO_UID:-}" 2>/dev/null || true
@@ -23370,7 +23415,8 @@ cmd_task_answer() {
          --arg i "$id" --arg id "$ident" --arg ty "$nt" --arg rv "$_routed_rev" --arg ak "$_esc_ask"
       return 0
     fi
-    audit_log "task answer gate" error 0 -- \
+    # DIVE-2054: same reasoning as the "task answer gate" site above — fenced.
+    _task_store_audit_log "task answer gate" error 0 -- \
       "task=$ident" "type=$nt" "tier=$gtier" "reason=non-human answer on tier-2 floor" \
       "human=$human" "caller=$_caller3" "sudo_uid=${SUDO_UID:-}"
     fail "$E_AUTH_REQUIRED" "$ident is a tier-2 human gate ($nt) — only a human can clear it, so an agent answer is refused. Tap the button in Telegram or use the dashboard. (If the tier-2 floor over-fired on this gate, re-file it at a lower --tier.)"
@@ -35194,7 +35240,9 @@ _hb_gate_ttl_sweep() {
         UPDATE tasks SET status='todo'
           WHERE id=${gid} AND status='blocked'
             AND NOT EXISTS (SELECT 1 FROM task_deps WHERE task_id=${gid});"
-    audit_log "gate ttl-auto" "ok" 0 -- "task=$gident" "type=$gtype" "applied=$grec" || true
+    # DIVE-2054: task-store auto-clear (TTL) — fenced on STORE IDENTITY, same
+    # primitive as cmd_task.sh's _task_store_audit_log (DIVE-2010).
+    _task_store_audit_log "gate ttl-auto" "ok" 0 -- "task=$gident" "type=$gtype" "applied=$grec" || true
     [[ -n "$gowner" ]] && ( cmd_send "$gowner" --message="⏱ ${gident} tier-1 gate hit its 48h TTL — recommendation applied: ${grec}. Resume the task; run \`5dive task show ${gident}\`." ) >/dev/null 2>&1 || true
     _hb_log "[gate-ttl] ${gident} T1 48h TTL -> applied rec"
   done < <(db "SELECT id||x'1f'||need_type||x'1f'||COALESCE(recommend,'')||x'1f'||COALESCE(assignee,'')
@@ -35530,7 +35578,8 @@ _hb_gate_shipped_sweep() {
     # silence), but it must never again be silent.
     if [[ ! "$_c_epoch" =~ ^[0-9]+$ ]]; then
       _hb_log "[gate-shipped] ${gident} — commit epoch UNPARSEABLE from lookup (\"${hit}\"); flagging anyway, but the predates-ask guard could NOT run (lookup format drift?)"
-      audit_log "gate shipped-flag" "degraded" 0 -- "task=$gident" "reason=epoch-unparseable" "commit=$hit" || true
+      # DIVE-2054: task-store gate-sweep telemetry — fenced.
+      _task_store_audit_log "gate shipped-flag" "degraded" 0 -- "task=$gident" "reason=epoch-unparseable" "commit=$hit" || true
     elif [[ ! "$_asked" =~ ^[0-9]+$ ]]; then
       # Deliberately a DIFFERENT message from the drift case above: legacy gates
       # predate need_asked_at, so this is expected and routine. Folding the two
@@ -35542,11 +35591,13 @@ _hb_gate_shipped_sweep() {
       _hb_log "[gate-shipped] ${gident} — no need_asked_at stamp; predates-ask guard not applicable (legacy gate)"
     elif (( _c_epoch < _asked )); then
       _hb_log "[gate-shipped] ${gident} — newest matching commit PREDATES the open ask ($(date -u -d @"$_c_epoch" +%FT%TZ) < $(date -u -d @"$_asked" +%FT%TZ)); NOT flagging, gate stays eligible"
-      audit_log "gate shipped-flag" "skip" 0 -- "task=$gident" "reason=commit-predates-ask" "commit=$hit" || true
+      # DIVE-2054: same reasoning as the "degraded" case above — fenced.
+      _task_store_audit_log "gate shipped-flag" "skip" 0 -- "task=$gident" "reason=commit-predates-ask" "commit=$hit" || true
       continue
     fi
     db "UPDATE tasks SET shipped_flag_at=datetime('now') WHERE id=${gid};"
-    audit_log "gate shipped-flag" "ok" 0 -- "task=$gident" "type=$gtype" "commit=$hit" || true
+    # DIVE-2054: same reasoning as the two branches above — fenced.
+    _task_store_audit_log "gate shipped-flag" "ok" 0 -- "task=$gident" "type=$gtype" "commit=$hit" || true
     _hb_log "[gate-shipped] ${gident} — commit on ${_HB_GATE_SHIPPED_REF} references it: ${hit} -> flagged"
     if [[ -n "$gowner" ]] && _task_agent_channel "$gowner"; then
       ( cmd_send "$gowner" --message="🚢 ${gident} — a commit referencing this open ${gtype} gate landed on ${_HB_GATE_SHIPPED_REF} (${hit}). Likely shipped: verify and close with \`5dive task show ${gident}\`. Auto-flag only — a merge is not a sign-off, so it stays open until you clear it." ) >/dev/null 2>&1 || true

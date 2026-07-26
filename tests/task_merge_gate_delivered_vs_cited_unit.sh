@@ -82,6 +82,11 @@ for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh \
   source "$SRC/$f"
 done
 STATE_DIR="$TMP"; TASKS_DIR="$STATE_DIR/tasks"; TASKS_DB="$TASKS_DIR/tasks.db"
+# DIVE-2054: "task.merge-gate-ambiguous" / "task.merge-gate-reported-on" are now
+# routed through _task_store_audit_log (STORE IDENTITY fence, DIVE-2010) —
+# declare this fixture store as prod so the audit-row assertions below keep
+# exercising the real path.
+export FIVEDIVE_PROD_TASKS_DB="$TASKS_DB"
 JSON_MODE=0
 mkdir -p "$TASKS_DIR"; set +e
 tasks_db_init

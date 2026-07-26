@@ -38,6 +38,11 @@ for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh \
 done
 STATE_DIR="$TMP"; TASKS_DIR="$STATE_DIR/tasks"; TASKS_DB="$TASKS_DIR/tasks.db"
 JSON_MODE=1
+# DIVE-2054: "task.gate-tier2-pin-escalated" is now routed through
+# _task_store_audit_log (STORE IDENTITY fence, DIVE-2010) — declare this
+# fixture store as prod so the audit-row assertion below keeps exercising the
+# real path, mirroring task_merge_gate_multirepo_unit.sh's DIVE-2010 fix.
+export FIVEDIVE_PROD_TASKS_DB="$TASKS_DB"
 mkdir -p "$TASKS_DIR"; set +e
 
 PASS=0; FAIL=0

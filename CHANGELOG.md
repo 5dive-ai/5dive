@@ -1,5 +1,33 @@
 # Changelog
 
+## 0.16.1 — fix(audit): fence the remaining `cmd_task.sh`/`cmd_heartbeat.sh` audit_log sites on TASKS_DB store identity (DIVE-2054) (2026-07-26)
+
+- **Follow-up to DIVE-2010**: 21 more task-store-driven `audit_log` call sites (merge-gate
+  overrides, `task precedent`/`task routing` toggles, gate-tier2-pin escalation, `task need`
+  auto-clears/lead-route, `task gate-escalate`, `gate-proof verify`, `task answer lead-clear`/
+  `gate`, `task reclaim`, and the 4 `cmd_heartbeat.sh` gate-ttl/shipped-flag sites) now route
+  through `_task_store_audit_log`, so a fixture `TASKS_DB` can no longer write a fixture-ident
+  row into the real fleet audit log from any of them.
+- **5 sites were deliberately left unfenced**, each with an in-code reason: `task need withdraw`
+  (`asserted_from=`), `task clear-recs` and `task inbox send` (carry `chat`/`chat_proof=
+  $channel_proof`), `task answer escalate-to-human`, and `gate-proof mint` (carries no
+  TASKS_DB-derived data at all). Fencing these would trade a contamination bug for an
+  evidence-suppression bug — the same fail-open family DIVE-1968 exists to prevent.
+- **New regression lock**: `tests/audit_task_store_classification_unit.sh` fails if a future
+  `audit_log` call in either file has neither marker — forcing classification instead of a
+  silent default either way.
+- Two `cmd_heartbeat.sh` suites that stubbed `audit_log` as a shell function (defeating any
+  internal fence) gained explicit on-store/off-store proof cases so the fence on those sites
+  is actually exercised, not just inert.
+- **Verified by mutation, and the mutation itself needed correcting** (dev3): run literally,
+  reverting each fence reported 0 of ~21 sites leaking — a FALSE NEGATIVE on 14 of 17 live
+  sites, because the suites exercising them stub `audit_log` as a shell function, so
+  unfencing routes the call into the stub rather than the log being diffed. Measuring the
+  fence's own ALLOWED/WITHHELD decision instead (immune to downstream stubbing) proved 119
+  withheld calls across 12 distinct sites. Residual stated, not rounded away: 5 sites are
+  reached only on-store (open side proven, closed side not) and 3 (`gate-proof verify`,
+  `task need t0-auto`, `task reclaim`) are reached by no suite at all and remain unmeasured.
+
 ## 0.16.0 — `5dive selfcheck`: prove the rails ACTED, not that they reported (DIVE-2039) (2026-07-26)
 
 Opens v0.16 "Fails loud" (epic DIVE-2038). Every check we owned graded a rail on

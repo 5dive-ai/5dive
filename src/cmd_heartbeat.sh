@@ -1267,7 +1267,9 @@ _hb_gate_ttl_sweep() {
         UPDATE tasks SET status='todo'
           WHERE id=${gid} AND status='blocked'
             AND NOT EXISTS (SELECT 1 FROM task_deps WHERE task_id=${gid});"
-    audit_log "gate ttl-auto" "ok" 0 -- "task=$gident" "type=$gtype" "applied=$grec" || true
+    # DIVE-2054: task-store auto-clear (TTL) — fenced on STORE IDENTITY, same
+    # primitive as cmd_task.sh's _task_store_audit_log (DIVE-2010).
+    _task_store_audit_log "gate ttl-auto" "ok" 0 -- "task=$gident" "type=$gtype" "applied=$grec" || true
     [[ -n "$gowner" ]] && ( cmd_send "$gowner" --message="⏱ ${gident} tier-1 gate hit its 48h TTL — recommendation applied: ${grec}. Resume the task; run \`5dive task show ${gident}\`." ) >/dev/null 2>&1 || true
     _hb_log "[gate-ttl] ${gident} T1 48h TTL -> applied rec"
   done < <(db "SELECT id||x'1f'||need_type||x'1f'||COALESCE(recommend,'')||x'1f'||COALESCE(assignee,'')
@@ -1603,7 +1605,8 @@ _hb_gate_shipped_sweep() {
     # silence), but it must never again be silent.
     if [[ ! "$_c_epoch" =~ ^[0-9]+$ ]]; then
       _hb_log "[gate-shipped] ${gident} — commit epoch UNPARSEABLE from lookup (\"${hit}\"); flagging anyway, but the predates-ask guard could NOT run (lookup format drift?)"
-      audit_log "gate shipped-flag" "degraded" 0 -- "task=$gident" "reason=epoch-unparseable" "commit=$hit" || true
+      # DIVE-2054: task-store gate-sweep telemetry — fenced.
+      _task_store_audit_log "gate shipped-flag" "degraded" 0 -- "task=$gident" "reason=epoch-unparseable" "commit=$hit" || true
     elif [[ ! "$_asked" =~ ^[0-9]+$ ]]; then
       # Deliberately a DIFFERENT message from the drift case above: legacy gates
       # predate need_asked_at, so this is expected and routine. Folding the two
@@ -1615,11 +1618,13 @@ _hb_gate_shipped_sweep() {
       _hb_log "[gate-shipped] ${gident} — no need_asked_at stamp; predates-ask guard not applicable (legacy gate)"
     elif (( _c_epoch < _asked )); then
       _hb_log "[gate-shipped] ${gident} — newest matching commit PREDATES the open ask ($(date -u -d @"$_c_epoch" +%FT%TZ) < $(date -u -d @"$_asked" +%FT%TZ)); NOT flagging, gate stays eligible"
-      audit_log "gate shipped-flag" "skip" 0 -- "task=$gident" "reason=commit-predates-ask" "commit=$hit" || true
+      # DIVE-2054: same reasoning as the "degraded" case above — fenced.
+      _task_store_audit_log "gate shipped-flag" "skip" 0 -- "task=$gident" "reason=commit-predates-ask" "commit=$hit" || true
       continue
     fi
     db "UPDATE tasks SET shipped_flag_at=datetime('now') WHERE id=${gid};"
-    audit_log "gate shipped-flag" "ok" 0 -- "task=$gident" "type=$gtype" "commit=$hit" || true
+    # DIVE-2054: same reasoning as the two branches above — fenced.
+    _task_store_audit_log "gate shipped-flag" "ok" 0 -- "task=$gident" "type=$gtype" "commit=$hit" || true
     _hb_log "[gate-shipped] ${gident} — commit on ${_HB_GATE_SHIPPED_REF} references it: ${hit} -> flagged"
     if [[ -n "$gowner" ]] && _task_agent_channel "$gowner"; then
       ( cmd_send "$gowner" --message="🚢 ${gident} — a commit referencing this open ${gtype} gate landed on ${_HB_GATE_SHIPPED_REF} (${hit}). Likely shipped: verify and close with \`5dive task show ${gident}\`. Auto-flag only — a merge is not a sign-off, so it stays open until you clear it." ) >/dev/null 2>&1 || true

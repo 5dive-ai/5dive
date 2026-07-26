@@ -31,6 +31,12 @@ TASKS_DIR="$STATE_DIR/tasks"
 TASKS_DB="$TASKS_DIR/tasks.db"
 JSON_MODE=1
 mkdir -p "$TASKS_DIR"
+# DIVE-2054: the "gate shipped-flag" audit_log calls are now routed through
+# _task_store_audit_log (STORE IDENTITY fence, DIVE-2010/2054) — declare this
+# fixture store as prod so the existing on-store assertions below (Case 9)
+# keep exercising the real audit path, mirroring gate_telemetry_fence_unit.sh's
+# on-store case. Case 12 below flips this off to prove the fence's other side.
+export FIVEDIVE_PROD_TASKS_DB="$TASKS_DB"
 set +e
 
 tasks_db_init
@@ -177,6 +183,23 @@ grep -q "UNPARSEABLE" <<<"$out" \
 grep -q "reason=epoch-unparseable" "$AUDIT_LOG_CALLS" \
   && ok_t "DIVE-2003: the drift leaves an audit row (degraded), not just a log line" \
   || bad_t "DIVE-2003: no audit row for the drift" "audit=[$(tr '\n' ',' <"$AUDIT_LOG_CALLS")]"
+
+# --- Case 12 (DIVE-2054): OFF the prod store, the shipped-flag audit row is ---
+# withheld, not written — proves the _task_store_audit_log fence actually gates
+# this call site (not just that it compiles). Mirrors
+# tests/audit_task_store_fence_unit.sh's off-store case, for a cmd_heartbeat.sh
+# site instead of a cmd_task.sh one.
+reset
+unset _TASK_STORE_AUDIT_FENCED
+gid=$(mk_gate 1 decision); MERGED="DIVE-$gid"; DRIFT=1
+FIVEDIVE_PROD_TASKS_DB="$TMP/somewhere-else/tasks.db" _hb_gate_shipped_sweep >/dev/null 2>"$TMP/offstore.err"
+[[ ! -s "$AUDIT_LOG_CALLS" ]] \
+  && ok_t "DIVE-2054: off the prod store, gate shipped-flag writes NO audit row" \
+  || bad_t "DIVE-2054: off-store must not audit" "$(cat "$AUDIT_LOG_CALLS")"
+grep -q "telemetry withheld" "$TMP/offstore.err" \
+  && ok_t "DIVE-2054: the withholding is ANNOUNCED, not silent" \
+  || bad_t "DIVE-2054: fence must announce" "err=$(cat "$TMP/offstore.err")"
+unset _TASK_STORE_AUDIT_FENCED
 
 # --- Case 10 (DIVE-2003): hermetic FORMAT CONTRACT on the real function ------
 # COVERAGE GAP, deliberate and recorded (DIVE-2014): _HB_GATE_SHIPPED_REF=HEAD here
