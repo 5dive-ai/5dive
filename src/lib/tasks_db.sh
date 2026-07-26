@@ -1311,7 +1311,7 @@ valid_cron_expr() {
 _cron_field_match() {
   local field="$1" val="$2" part lo hi step
   val=$((10#$val))
-  local -a parts; IFS=',' read -ra parts <<<"$field"
+  local -a parts=(); IFS=',' read -ra parts <<<"$field"
   for part in "${parts[@]}"; do
     step=1
     if [[ "$part" == */* ]]; then
@@ -1352,7 +1352,7 @@ _cron_dow_match() {
 # Returns 0 if due at that minute, 1 otherwise.
 _cron_matches() {
   local expr="$1" epoch="$2"
-  local -a cm; read -r -a cm <<<"$expr"
+  local -a cm=(); read -r -a cm <<<"$expr"
   [[ ${#cm[@]} -eq 5 ]] || return 1
   local emin ehour edom emon edow
   read -r emin ehour edom emon edow < <(date -u -d "@${epoch}" +'%M %H %d %m %w' 2>/dev/null)

@@ -4648,7 +4648,7 @@ valid_cron_expr() {
 _cron_field_match() {
   local field="$1" val="$2" part lo hi step
   val=$((10#$val))
-  local -a parts; IFS=',' read -ra parts <<<"$field"
+  local -a parts=(); IFS=',' read -ra parts <<<"$field"
   for part in "${parts[@]}"; do
     step=1
     if [[ "$part" == */* ]]; then
@@ -4689,7 +4689,7 @@ _cron_dow_match() {
 # Returns 0 if due at that minute, 1 otherwise.
 _cron_matches() {
   local expr="$1" epoch="$2"
-  local -a cm; read -r -a cm <<<"$expr"
+  local -a cm=(); read -r -a cm <<<"$expr"
   [[ ${#cm[@]} -eq 5 ]] || return 1
   local emin ehour edom emon edow
   read -r emin ehour edom emon edow < <(date -u -d "@${epoch}" +'%M %H %d %m %w' 2>/dev/null)
@@ -12380,7 +12380,7 @@ _team_bot_do_shared() {
   # Resolve requested names against relay candidates — never touch a personal-bot
   # agent or an unknown/unsupported one.
   local targets_json="{}" name type sd tt
-  local -a req
+  local -a req=()
   IFS=',' read -ra req <<<"$agents_filter"
   for name in "${req[@]}"; do
     name="${name// /}"
@@ -12517,7 +12517,7 @@ PY
 
   # 3) For each agent that got a topic: enable the telegram plugin (send-only)
   #    + regenerate its systemd env with channels=telegram.
-  local -a wired
+  local -a wired=()
   while IFS= read -r name; do [[ -n "$name" ]] && wired+=("$name"); done \
     < <(jq -r '.[] | select(.status=="relayed") | .agent' <<<"$results")
 
@@ -17871,7 +17871,7 @@ _compose_write_role_md() {
   fi
 
   # Managers (reports_to) and direct reports (who lists $name as a manager).
-  local -a mgrs reports
+  local -a mgrs=() reports=()
   mapfile -t mgrs    < <(jq -r --arg n "$name" '.agents[$n].reports_to // empty | if type=="array" then .[] else . end' <<<"$spec")
   mapfile -t reports < <(jq -r --arg n "$name" '.agents | to_entries[] | select((.value.reports_to // empty) | if type=="array" then any(. == $n) else . == $n end) | .key' <<<"$spec")
 
@@ -17951,7 +17951,7 @@ _compose_wire_role() {
   _compose_write_role_md "$spec" "$name" "$spec_dir"
 
   # Seed goals into the shared task queue, assigned to the role, from its manager.
-  local -a goals
+  local -a goals=()
   mapfile -t goals < <(jq -r '(.goals // [])[]' <<<"$agent")
   local g
   for g in "${goals[@]}"; do
@@ -34023,7 +34023,7 @@ cmd_loop_map() {
   # index-aligned result slots; scheduler caps live (non-terminal) child tasks.
   # A plain `live` counter (not ${#assoc[@]}) keeps every expansion set-u-safe
   # even when the in-flight map is momentarily empty (header runs set -euo).
-  local -a results; local i; for (( i=0; i<n; i++ )); do results[$i]="null"; done
+  local -a results=(); local i; for (( i=0; i<n; i++ )); do results[$i]="null"; done
   local -A inflight          # index->tid for currently-live children
   local -a child_ids=()
   local next=0 completed=0 ok_n=0 failed_n=0 live=0 halt="" spent="0"
@@ -34142,7 +34142,7 @@ cmd_loop_until_dry() {
               ${eff_ceiling}, 'running', '[]', ${now}, ${now});"
 
   local seen_keys="[]" accum="[]"      # seen-set (all keys ever) + kept items
-  local -a child_ids
+  local -a child_ids=()
   local round_no=0 empty_streak=0 exit_reason="" spent="0"
   local poll="${LOOP_POLL_SECS:-4}"
   while :; do
@@ -34233,9 +34233,9 @@ cmd_loop_collect() {
   [[ -n "$handles" ]] || fail "$E_USAGE" "loop collect: --handles=<loopId,loopId,…> required"
   [[ -z "$timeout" || "$timeout" =~ ^[1-9][0-9]*$ ]] || fail "$E_VALIDATION" "--timeout must be a positive integer (seconds)"
 
-  local -a hids; IFS=',' read -r -a hids <<< "$handles"
+  local -a hids=(); IFS=',' read -r -a hids <<< "$handles"
   # Resolve each handle → its backing task ids (index-aligned to the handle list).
-  local -a tids
+  local -a tids=()
   local h
   for h in "${hids[@]}"; do
     h="$(printf '%s' "$h" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
