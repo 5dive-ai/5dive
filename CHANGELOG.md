@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.16.9 — fix(gate): a gate-delivery row could say `user=unknown` while asserting a confirmed send (DIVE-2073) (2026-07-26)
+
+Maker dev3. `audit_log` now records `user=root` for *no invoking user by design* and reserves `unknown` for a genuine non-root resolution failure (behind an `_audit_is_root` seam, since `$EUID` is readonly). The delivery row additionally carries `via=<channel-owner-agent>` and `path=<file-time|renag|privileged-resend>`, with `TASK_CH_AGENT` cleared on a miss so an error row cannot borrow a stale owner.
+
+Root cause was measured, not inferred, and it corrected the guess in the ticket: these rows land at `:NN:02` — the root heartbeat re-nag, which has no `SUDO_USER` and no `USER` — not the privileged re-send. Confirmed across the whole audit log: unknown-actor rows cluster at seconds :00–:04 (3/165/128/17/3) while actor-resolved delivery rows scatter with no dominant second. Instrumenting the guessed path would have left the actual producer emitting `unknown` on every run while the ticket closed green.
+
+Surfaced by marketing from real DIVE-2050 rows. `via=` retroactively answers the question that left DIVE-1927's residual 2 unprovable: which bot delivered `message_id=691` could only be inferred from per-bot message-id spaces, and is now on the row.
+
 ## 0.16.8 — docs(selfcheck): the --full duration figure, with its conditions (DIVE-2039 follow-up) (2026-07-26)
 
 `--full`'s documented runtime has been wrong twice, in opposite directions, and both
