@@ -64,7 +64,7 @@ cmd_config() {
     case "$k" in
       channels)
         valid_channel "$v" || fail "$E_VALIDATION" "invalid channels: $v"
-        if [[ "$v" != "none" ]] && [[ "${TYPE_CHANNELS[$type]}" != "1" ]]; then
+        if [[ "$v" != "none" ]] && [[ "${TYPE_CHANNELS[$type]:-0}" != "1" ]]; then
           fail "$E_VALIDATION" "type '$type' does not support channels"
         fi
         if [[ "$type" != "claude" ]] && channel_in_list dashboard "$v"; then
@@ -87,7 +87,7 @@ cmd_config() {
         applied_keys+=("workdir")
         ;;
       telegram.token)
-        [[ "${TYPE_CHANNELS[$type]}" == "1" ]] \
+        [[ "${TYPE_CHANNELS[$type]:-0}" == "1" ]] \
           || fail "$E_VALIDATION" "type '$type' does not support telegram channels"
         # `telegram.token=-` reads the token from stdin so the secret never
         # enters argv (/proc/<pid>/cmdline, shelld's audit log, server access
@@ -104,7 +104,7 @@ cmd_config() {
         applied_keys+=("telegram.token")
         ;;
       discord.token)
-        [[ "${TYPE_CHANNELS[$type]}" == "1" ]] \
+        [[ "${TYPE_CHANNELS[$type]:-0}" == "1" ]] \
           || fail "$E_VALIDATION" "type '$type' does not support discord channels"
         # discord.token=- — same stdin sentinel as telegram.token above.
         if [[ "$v" == "-" ]]; then
@@ -117,7 +117,7 @@ cmd_config() {
         applied_keys+=("discord.token")
         ;;
       telegram.home-channel)
-        [[ "${TYPE_CHANNELS[$type]}" == "1" ]] \
+        [[ "${TYPE_CHANNELS[$type]:-0}" == "1" ]] \
           || fail "$E_VALIDATION" "type '$type' does not support telegram channels"
         valid_telegram_chat_id "$v" \
           || fail "$E_VALIDATION" "telegram.home-channel must be a numeric chat id"
@@ -125,7 +125,7 @@ cmd_config() {
         applied_keys+=("telegram.home-channel")
         ;;
       telegram.allowed-users)
-        [[ "${TYPE_CHANNELS[$type]}" == "1" ]] \
+        [[ "${TYPE_CHANNELS[$type]:-0}" == "1" ]] \
           || fail "$E_VALIDATION" "type '$type' does not support telegram channels"
         valid_telegram_chat_id_list "$v" \
           || fail "$E_VALIDATION" "telegram.allowed-users must be a comma-separated list of numeric ids"
@@ -413,7 +413,7 @@ cmd_types() {
     local installed=false
     [[ -x "$bin" ]] && installed=true
     local channels=false
-    [[ "${TYPE_CHANNELS[$type]}" == "1" ]] && channels=true
+    [[ "${TYPE_CHANNELS[$type]:-0}" == "1" ]] && channels=true
     arr=$(jq -c \
       --arg n "$type" --arg b "$bin" \
       --argjson i "$installed" --argjson c "$channels" \

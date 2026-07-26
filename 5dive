@@ -107,6 +107,31 @@ CONNECTORS_DIR="${FIVEDIVE_CONNECTOR_DIR:-/etc/5dive/connectors}"
 # Known agent types -> (bin path, supports channels yes/no).
 # auth_file is the shared-config path that indicates the type is authenticated.
 # Extend here to add a new agent type.
+#
+# ADDING A TYPE — the absent-vs-zero contract for every TYPE_* map below.
+# These maps are read under `set -uo pipefail`, so whether an omitted key
+# DEGRADES or CRASHES is a per-map decision that has to be written down. Two
+# kinds, and the difference is not guessable from the declaration:
+#
+#   REQUIRED  — TYPE_BIN. It IS the type registry: is_known_type is literally
+#               `[[ -n "${TYPE_BIN[$1]+x}" ]]` (lib/validation.sh), and readers
+#               loop `${!TYPE_BIN[@]}`. A type absent here does not exist, so
+#               bare reads are correct by construction.
+#   OPTIONAL  — everything else (TYPE_CHANNELS, TYPE_AUTH, TYPE_INSTALL,
+#               TYPE_API_FILE, TYPE_API_VAR, TYPE_PROBE, TYPE_SKILLS_DIR).
+#               Omission is a MEANINGFUL signal with a documented default, so
+#               every reader MUST supply it: `${TYPE_X[$type]:-<default>}`.
+#               A bare read turns a supported state into an unbound-variable
+#               crash that names the ARRAY and not the type — which is exactly
+#               the bug DIVE-2076 fixed in five readers, and DIVE-2076's sweep
+#               found again in cmd_auth_set, where the crash pre-empted a
+#               graceful `fail` written for that very case one line below.
+#
+# Registering a new type: add TYPE_BIN (mandatory) and then decide each optional
+# map explicitly. Prefer an explicit entry over relying on the default — write
+# `[newtype]=0` in TYPE_CHANNELS rather than omitting it, so the intent is
+# reviewable. tests/type_map_registration_contract_unit.sh enforces both halves:
+# every optional-map reader carries a default, and TYPE_BIN keys are covered.
 declare -A TYPE_BIN=(
   [claude]="/home/claude/.local/bin/claude"
   # codex is an npm global under nvm's per-version bin dir. Rather than hardcode
@@ -158,6 +183,13 @@ declare -A TYPE_BIN=(
 #              --always-approve (set in 5dive-agent-start), which also
 #              auto-trusts plugin/MCP commands. telegram only.
 # Only claude needs the pair-code roundtrip — see cmd_pair's dispatch.
+#
+# OPTIONAL map, default 0 (see the absent-vs-zero contract above TYPE_BIN).
+# An omitted key now reads as "no channel support" and `--channels` fails with
+# the normal validation error naming the type; before DIVE-2076 it hard-crashed
+# `agent types` with an unbound-variable error naming this array instead.
+# Still write `[newtype]=0` explicitly rather than omitting: the default keeps a
+# customer's box from crashing, it is not a substitute for declaring intent.
 declare -A TYPE_CHANNELS=(
   [claude]=1
   [openclaw]=1
@@ -5824,7 +5856,13 @@ cmd_auth_set() {
   # off the bottom because they're not in TYPE_API_FILE — by design: their
   # credentials live in native state dirs, not env files. Pass --provider
   # to route those through apply_byo_provider above.
-  local var="${TYPE_API_VAR[$type]}" fname="${TYPE_API_FILE[$type]}"
+  # Both defaults are load-bearing, not defensive padding: TYPE_API_VAR/TYPE_API_FILE
+  # are SPARSE BY DESIGN (see their comments), so under `set -u` a bare read here
+  # crashed with an unbound-variable error naming the ARRAY — one line before the
+  # graceful `fail` below that names the TYPE and even names hermes/openclaw.
+  # Absence is the signal this path is built to handle; let it reach its own guard.
+  # DIVE-2076.
+  local var="${TYPE_API_VAR[$type]:-}" fname="${TYPE_API_FILE[$type]:-}"
   case "$type" in
     claude)
       if [[ "$api_key" =~ ^sk-ant-oat01- ]]; then
@@ -6932,7 +6970,10 @@ account_types_authed() {
   local env_file="${AUTH_PROFILES_DIR}/${name}/combined.env"
   if [[ -s "$env_file" ]]; then
     for type in "${!TYPE_API_VAR[@]}"; do
-      local var="${TYPE_API_VAR[$type]}"
+      # Present by construction (iterating this map's own keys), but the
+      # absent-vs-zero contract in header.sh is deliberately exemption-free:
+      # a rule with no carve-outs is one a contributor can follow. DIVE-2076.
+      local var="${TYPE_API_VAR[$type]:-}"
       if grep -q "^${var}=" "$env_file" 2>/dev/null \
          || ([[ "$type" == "claude" ]] && grep -q "^CLAUDE_CODE_OAUTH_TOKEN=" "$env_file" 2>/dev/null); then
         # Dedup: skip if already added via per-type sentinel above.
@@ -9072,8 +9113,15 @@ cmd_create() {
     fi
   fi
 
-  if [[ "$channels" != "none" ]] && [[ "${TYPE_CHANNELS[$type]}" != "1" ]]; then
-    fail "$E_VALIDATION" "type '$type' does not support channels (only: claude, codex, grok, antigravity, opencode, openclaw, hermes)"
+  if [[ "$channels" != "none" ]] && [[ "${TYPE_CHANNELS[$type]:-0}" != "1" ]]; then
+    # Derive the supported list rather than hardcoding it: a hardcoded list is one
+    # more place a new type has to be registered and silently won't be (DIVE-2076).
+    local -a _ch_ok=()
+    local _t
+    for _t in "${!TYPE_CHANNELS[@]}"; do
+      [[ "${TYPE_CHANNELS[$_t]:-0}" == "1" ]] && _ch_ok+=("$_t")
+    done
+    fail "$E_VALIDATION" "type '$type' does not support channels (only: ${_ch_ok[*]})"
   fi
   # codex + grok + antigravity + opencode ship a telegram bridge only — no discord build yet.
   if [[ "$type" == "codex" || "$type" == "grok" || "$type" == "antigravity" || "$type" == "opencode" ]] \
@@ -10063,7 +10111,7 @@ cmd_config() {
     case "$k" in
       channels)
         valid_channel "$v" || fail "$E_VALIDATION" "invalid channels: $v"
-        if [[ "$v" != "none" ]] && [[ "${TYPE_CHANNELS[$type]}" != "1" ]]; then
+        if [[ "$v" != "none" ]] && [[ "${TYPE_CHANNELS[$type]:-0}" != "1" ]]; then
           fail "$E_VALIDATION" "type '$type' does not support channels"
         fi
         if [[ "$type" != "claude" ]] && channel_in_list dashboard "$v"; then
@@ -10086,7 +10134,7 @@ cmd_config() {
         applied_keys+=("workdir")
         ;;
       telegram.token)
-        [[ "${TYPE_CHANNELS[$type]}" == "1" ]] \
+        [[ "${TYPE_CHANNELS[$type]:-0}" == "1" ]] \
           || fail "$E_VALIDATION" "type '$type' does not support telegram channels"
         # `telegram.token=-` reads the token from stdin so the secret never
         # enters argv (/proc/<pid>/cmdline, shelld's audit log, server access
@@ -10103,7 +10151,7 @@ cmd_config() {
         applied_keys+=("telegram.token")
         ;;
       discord.token)
-        [[ "${TYPE_CHANNELS[$type]}" == "1" ]] \
+        [[ "${TYPE_CHANNELS[$type]:-0}" == "1" ]] \
           || fail "$E_VALIDATION" "type '$type' does not support discord channels"
         # discord.token=- — same stdin sentinel as telegram.token above.
         if [[ "$v" == "-" ]]; then
@@ -10116,7 +10164,7 @@ cmd_config() {
         applied_keys+=("discord.token")
         ;;
       telegram.home-channel)
-        [[ "${TYPE_CHANNELS[$type]}" == "1" ]] \
+        [[ "${TYPE_CHANNELS[$type]:-0}" == "1" ]] \
           || fail "$E_VALIDATION" "type '$type' does not support telegram channels"
         valid_telegram_chat_id "$v" \
           || fail "$E_VALIDATION" "telegram.home-channel must be a numeric chat id"
@@ -10124,7 +10172,7 @@ cmd_config() {
         applied_keys+=("telegram.home-channel")
         ;;
       telegram.allowed-users)
-        [[ "${TYPE_CHANNELS[$type]}" == "1" ]] \
+        [[ "${TYPE_CHANNELS[$type]:-0}" == "1" ]] \
           || fail "$E_VALIDATION" "type '$type' does not support telegram channels"
         valid_telegram_chat_id_list "$v" \
           || fail "$E_VALIDATION" "telegram.allowed-users must be a comma-separated list of numeric ids"
@@ -10412,7 +10460,7 @@ cmd_types() {
     local installed=false
     [[ -x "$bin" ]] && installed=true
     local channels=false
-    [[ "${TYPE_CHANNELS[$type]}" == "1" ]] && channels=true
+    [[ "${TYPE_CHANNELS[$type]:-0}" == "1" ]] && channels=true
     arr=$(jq -c \
       --arg n "$type" --arg b "$bin" \
       --argjson i "$installed" --argjson c "$channels" \

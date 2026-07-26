@@ -1145,7 +1145,13 @@ cmd_auth_set() {
   # off the bottom because they're not in TYPE_API_FILE — by design: their
   # credentials live in native state dirs, not env files. Pass --provider
   # to route those through apply_byo_provider above.
-  local var="${TYPE_API_VAR[$type]}" fname="${TYPE_API_FILE[$type]}"
+  # Both defaults are load-bearing, not defensive padding: TYPE_API_VAR/TYPE_API_FILE
+  # are SPARSE BY DESIGN (see their comments), so under `set -u` a bare read here
+  # crashed with an unbound-variable error naming the ARRAY — one line before the
+  # graceful `fail` below that names the TYPE and even names hermes/openclaw.
+  # Absence is the signal this path is built to handle; let it reach its own guard.
+  # DIVE-2076.
+  local var="${TYPE_API_VAR[$type]:-}" fname="${TYPE_API_FILE[$type]:-}"
   case "$type" in
     claude)
       if [[ "$api_key" =~ ^sk-ant-oat01- ]]; then

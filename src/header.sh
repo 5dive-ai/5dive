@@ -107,6 +107,31 @@ CONNECTORS_DIR="${FIVEDIVE_CONNECTOR_DIR:-/etc/5dive/connectors}"
 # Known agent types -> (bin path, supports channels yes/no).
 # auth_file is the shared-config path that indicates the type is authenticated.
 # Extend here to add a new agent type.
+#
+# ADDING A TYPE — the absent-vs-zero contract for every TYPE_* map below.
+# These maps are read under `set -uo pipefail`, so whether an omitted key
+# DEGRADES or CRASHES is a per-map decision that has to be written down. Two
+# kinds, and the difference is not guessable from the declaration:
+#
+#   REQUIRED  — TYPE_BIN. It IS the type registry: is_known_type is literally
+#               `[[ -n "${TYPE_BIN[$1]+x}" ]]` (lib/validation.sh), and readers
+#               loop `${!TYPE_BIN[@]}`. A type absent here does not exist, so
+#               bare reads are correct by construction.
+#   OPTIONAL  — everything else (TYPE_CHANNELS, TYPE_AUTH, TYPE_INSTALL,
+#               TYPE_API_FILE, TYPE_API_VAR, TYPE_PROBE, TYPE_SKILLS_DIR).
+#               Omission is a MEANINGFUL signal with a documented default, so
+#               every reader MUST supply it: `${TYPE_X[$type]:-<default>}`.
+#               A bare read turns a supported state into an unbound-variable
+#               crash that names the ARRAY and not the type — which is exactly
+#               the bug DIVE-2076 fixed in five readers, and DIVE-2076's sweep
+#               found again in cmd_auth_set, where the crash pre-empted a
+#               graceful `fail` written for that very case one line below.
+#
+# Registering a new type: add TYPE_BIN (mandatory) and then decide each optional
+# map explicitly. Prefer an explicit entry over relying on the default — write
+# `[newtype]=0` in TYPE_CHANNELS rather than omitting it, so the intent is
+# reviewable. tests/type_map_registration_contract_unit.sh enforces both halves:
+# every optional-map reader carries a default, and TYPE_BIN keys are covered.
 declare -A TYPE_BIN=(
   [claude]="/home/claude/.local/bin/claude"
   # codex is an npm global under nvm's per-version bin dir. Rather than hardcode
@@ -158,6 +183,13 @@ declare -A TYPE_BIN=(
 #              --always-approve (set in 5dive-agent-start), which also
 #              auto-trusts plugin/MCP commands. telegram only.
 # Only claude needs the pair-code roundtrip — see cmd_pair's dispatch.
+#
+# OPTIONAL map, default 0 (see the absent-vs-zero contract above TYPE_BIN).
+# An omitted key now reads as "no channel support" and `--channels` fails with
+# the normal validation error naming the type; before DIVE-2076 it hard-crashed
+# `agent types` with an unbound-variable error naming this array instead.
+# Still write `[newtype]=0` explicitly rather than omitting: the default keeps a
+# customer's box from crashing, it is not a substitute for declaring intent.
 declare -A TYPE_CHANNELS=(
   [claude]=1
   [openclaw]=1
