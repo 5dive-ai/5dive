@@ -1,5 +1,35 @@
 # Changelog
 
+## 0.16.20 — four merges that landed at 0.16.19 and could never have reached a box (2026-07-26)
+
+Version assignment, not a feature. `0.16.19` was already published when #218, #219, #220 and
+#221 merged, and the no-bump-in-a-PR rule assigns the version **at merge, by merge order** — but
+nobody performed the assignment. So four merges sat on main claiming a version that already
+described a *different* bundle.
+
+That is the exact DIVE-2065 incident: the shared-checkout updater is **version-triggered, not
+content-hash triggered**, so every box already on 0.16.19 would have kept its old binary forever
+and silently never received any of this. `version-uniqueness` caught it on the push to main and
+turned main red, which is the job working.
+
+What this version actually carries:
+
+- **DIVE-2112** — `task reject` could reopen a closed task, destroy the verifier's ACK, and file
+  the write under a verifier who never made it. Attribution now names the real actor, the maker
+  cannot reject its own delivery, a graded task is not reopened by anyone but its grader, and a
+  prior result is preserved rather than replaced.
+- **DIVE-2072** — a repo-tracked hook protects only branches that contain it, so a guard added to
+  main is silently absent on every branch cut before it. A missing hook cannot announce its own
+  absence, so the detection lives in CI at PR time, where the remedy is still a rebase.
+- **DIVE-2101** — the DIVE-1830 merge-gate demanded a merged PR the delegated-push path can never
+  produce, making it unsatisfiable rather than strict. Branch-tip ancestry is now accepted
+  alongside the merged-PR search, with an attribution arm so a zero-commit branch cannot close a
+  task by being trivially an ancestor.
+- **DIVE-2072 follow-up** — the rule-2 assertion graded string interpolation rather than message
+  distinctness, and stayed green under a mutation that folded both messages into one template.
+
+No tag and no GitHub release: releases are batched, not cut per patch.
+
 ## 0.16.19 — fix(gate): audit the gate answer at the WRITE — a `decision` answer was stored with no audit event behind it (DIVE-2090) (2026-07-26)
 
 Reported three times in one day, from three directions, and each report reached for a more
