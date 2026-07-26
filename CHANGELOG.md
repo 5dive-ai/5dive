@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.15.37 — fix(task): fence audit_log on TASKS_DB store identity (DIVE-2010) (2026-07-26)
+
+`cmd_task_need`'s "unnotified" audit row was gated on `$EUID -eq 0` instead of
+store identity — the exact anti-pattern DIVE-1989 removed elsewhere — and
+DIVE-1989's own regression grep (`tests/audit_nonroot_unit.sh`) never caught it
+because the code split the pattern across a `\` line continuation, evading a
+single-line grep for a full release. Measured leak: 6 real rows in the fleet
+audit log with fixture idents (`DIVE-1..4`) from a 41-suite test run. Fixed by
+dropping the `$EUID` condition and routing through a new `_task_store_audit_log`
+wrapper that reuses DIVE-1968's `_task_human_send_allowed` store-identity fence
+(withholding announced once, never silently); hardened the regression grep to
+join line continuations before matching. Re-sweeping `tests/task_*unit.sh` and
+`tests/gate_*unit.sh` surfaced 2 more live leaks at the same shape (`task
+set-body`, `task.merge-gate-unverified`) — fixed the same way. Full
+`task_*`/`gate_*`/`heartbeat_*` unit sweep after all fixes: 0 failures, 0 bytes
+appended to the real audit log. See
+`community/wiki/audit-log-store-fence-task-need-unnotified-dive2010.md`. ~13
+other unconditional task-store `audit_log` call sites remain unfenced but
+unmeasured; tracked separately as DIVE-2045.
+
 ## 0.15.36 — fix(task): GATE_PROOF_KEY/ENFORCE (and OPERATOR_STORE) were bound at SOURCE time, so an isolated STATE_DIR did not actually isolate them (DIVE-1950) (2026-07-26)
 
 Systemic follow-up to DIVE-1919. `tasks_db.sh` derived `GATE_PROOF_KEY`/`GATE_PROOF_ENFORCE` from `$STATE_DIR` once, at source time. Every isolated unit harness sources the libs FIRST and re-points `STATE_DIR` at a throwaway temp dir AFTER — so those two stayed frozen on the pre-isolation default (`/var/lib/5dive` in production) for the harness's entire run. `_gate_proof_enforced()` then read the LIVE host's enforcement sentinel and `_gate_proof_ensure_key`/`_gate_closure_sign` read/wrote the LIVE key, from inside a test that believed it was isolated. That is exactly how `task_park_gate_guard_unit.sh` failed under DIVE-1919: a harness whose control path answers a gate with `--human` died `E_AUTH_REQUIRED` against a control-plane box (enforcement flipped on 2026-07-24) and passed against a clean CI runner. DIVE-1919 fixed that one harness by binding the two paths explicitly — the same two lines 8 sibling gate harnesses already carried — but roughly 53 harnesses re-point `STATE_DIR` after sourcing WITHOUT that binding and were latently exposed the moment any of them touched a gate path.

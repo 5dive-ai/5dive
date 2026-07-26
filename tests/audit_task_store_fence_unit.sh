@@ -93,11 +93,18 @@ ERR2=$(cat "$TMP/second.err")
 reset
 export FIVEDIVE_PROD_TASKS_DB="$TASKS_DB"   # active store IS declared prod
 t3=$(addt --assignee=dev -- "on-store fixture gate task")
+t3_ident=$(db "SELECT ident FROM tasks WHERE id=$t3;")
 cmd_task_need "$t3" --type=decision --options="X|Y" --ask="pick" >/dev/null 2>&1
-if grep -q '^task need unnotified' "$AUDIT_CALLS" && grep -q "filer=dev" "$AUDIT_CALLS"; then
-  ok_t "on the prod store the unnotified-gate audit row is written exactly as before"
+# DIVE-2010 review (main): assert the SHAPE of the row, not the identity of
+# whoever runs the suite. `filer=` comes from task_actor(), which resolves to
+# the CALLER's own identity (dev2 -> dev here, but "main" on main's box, and
+# neither in CI) — hardcoding "filer=dev" is exactly the DIVE-1919 defect, a
+# harness asserting a fact about its own host rather than about the code.
+LINE=$(grep '^task need unnotified' "$AUDIT_CALLS")
+if [[ "$LINE" == *"task=${t3_ident} type=decision"* && "$LINE" =~ filer=[^[:space:]]+ ]]; then
+  ok_t "on the prod store the unnotified-gate audit row is written exactly as before (ident + a filer field, any actor)"
 else
-  bad_t "on-store row must still be written" "$(cat "$AUDIT_CALLS")"
+  bad_t "on-store row must still be written" "line=[$LINE] audit=[$(cat "$AUDIT_CALLS")]"
 fi
 
 # --- 3. SUITE GUARD: this file must never reach production telemetry --------
