@@ -168,7 +168,16 @@ if [[ " $ALLOW_UNPROBEABLE " == *" $b "* ]]; then ALLOWED+=("$b"); else UNPROBEA
   # that never reached it is NOT-REACHED, never UNWIRED.
   # (community/wiki/test-harness-credential-reach-and-transcript-durability.md:
   #  a canary proves the extractor RAN; the fixture proves it is still RIGHT.)
-  awk -v n="$ln" -v inj="$inject" 'NR==n{print inj; print "printf \x27__PROBE_REACHED__\\n\x27 >&2"} {print}' "$t" > "$mutant"
+  # DIVE-2018: the canary must print BEFORE the injected mutation, not after.
+  # Its job is to answer "did execution reach the injection point", and placing it
+  # after a statement whose whole purpose is to be FATAL guarantees it cannot: for
+  # the ABORT family the injected `false` under `set -e` terminates the shell on
+  # the spot, so the canary never ran, so EVERY abort-family harness reported
+  # not-reached — in every environment, forever. That is olivia's limit case made
+  # real, and it was 18 harnesses: reported "probed in an environment where it
+  # runs" while no environment ever could. Before it, `set -e` harnesses were
+  # structurally unprobeable and the check was green about it.
+  awk -v n="$ln" -v inj="$inject" 'NR==n{print "printf \x27__PROBE_REACHED__\\n\x27 >&2"; print inj} {print}' "$t" > "$mutant"
   out=$(timeout "$TIMEOUT" bash "$mutant" 2>&1 >/dev/null); rc=$?
   rm -f "$mutant"
   if ! grep -q '__PROBE_REACHED__' <<<"$out"; then
