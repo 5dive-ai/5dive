@@ -19,6 +19,18 @@
 # (install.sh seeds it OFF and never clobbers it). One digest per fleet → one
 # file. Shape: {"enabled":bool,"hour":0-23,"lastSent":"YYYY-MM-DD"}. DEFAULT OFF
 # (DIVE-544, Mark): customers opt in only via the telegram /digest command.
+
+# DIVE-2080. `five_self_bundle` lives in src/lib/self.sh, concatenated ahead of this
+# file in the bundle — so in the built artifact this block is dead. It exists for the
+# unit harnesses that source ONLY this file out of the split tree: without it the call
+# sites below would die as command-not-found, which is how a "resolve myself honestly"
+# rule turns back into a silent wrong answer.
+if ! declare -F five_self_bundle >/dev/null 2>&1; then
+  _five_self_lib="$(dirname -- "${BASH_SOURCE[0]}")/lib/self.sh"
+  # shellcheck source=lib/self.sh
+  [[ -r "$_five_self_lib" ]] && source "$_five_self_lib"
+  unset _five_self_lib
+fi
 _digest_pref_file() { echo "${STATE_DIR}/digest.json"; }
 _digest_pref_enabled() {
   local f; f="$(_digest_pref_file)"
@@ -72,6 +84,12 @@ _digest_tick() {
   last="$(jq -r '.lastSent // ""' "$f" 2>/dev/null)" || last=""
   [ "$last" = "$today" ] && return 0                     # already sent today
 
+  # DIVE-2080 decided this site DELIBERATELY keeps `command -v`. Everything else that
+  # re-invokes the CLI to produce evidence moved to five_self_bundle; this one is not an
+  # evidence path. It is the root cron driver re-execing `digest --send` as ANOTHER
+  # UNIX user via sudo, and the intent really is "run the CLI installed on this box" —
+  # a worktree bundle root happens to be sitting in is the wrong answer here, and it may
+  # not even be readable by agent-<name>. Not a blanket replace: see src/lib/self.sh.
   local self; self="$(command -v 5dive 2>/dev/null || echo "$0")"
   local names name sent=0
   names=$(jq -r '.agents | keys[]' "$REGISTRY" 2>/dev/null) || names=""
@@ -120,8 +138,12 @@ cmd_digest() {
   # in-process) so each gets a clean dispatch + setup and the EXIT-audit trap /
   # errexit of one sub-call can't abort the digest. Assignment-level `|| fallback`
   # guarantees a valid empty shape if a source is unavailable.
+  # DIVE-2080: digest's numbers are the input to `proof scorecard` and the published
+  # badge, so the sub-calls that produce them must be THIS bundle. Preferring PATH here
+  # meant a worktree bundle reported the installed CLI's fleet. Unresolvable keeps the
+  # pre-existing `bash "$0"` fallback rather than inventing a source.
   local self
-  self="$(command -v 5dive 2>/dev/null || true)"
+  self="$(five_self_bundle 2>/dev/null || true)"
   _digest_run() { if [ -n "$self" ]; then "$self" "$@"; else bash "$0" "$@"; fi; }
 
   # The one shape allowed to stand in for an unread usage source (DIVE-1937).

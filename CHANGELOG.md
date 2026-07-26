@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.16.16 — fix(proof): hoist the self-bundle resolver to one implementation; proof scorecard and digest were grading the INSTALLED bundle (DIVE-2080) (2026-07-26)
+
+Third instance of the `command -v` primitive, one call deeper than the previous fix reached.
+DIVE-2061 fixed `selfcheck` probe 7 to resolve the bundle under test — then
+`cmd_proof_scorecard` re-resolved `command -v 5dive || $0` and shelled `digest` into the
+**installed** bundle. On every agent box, the metric rows probe 7 graded came from a different
+artifact than the one under test. The same line sat in proof badges and in `cmd_digest`'s own
+sources.
+
+Hoisted to one implementation, `five_self_bundle` in the new `src/lib/self.sh`. Scorecard,
+badges and digest's three sources use it and fail loudly when self is unresolvable.
+`_digest_tick` deliberately keeps `command -v`, with the rationale recorded at the site: root
+sudo-re-execs `digest --send` as another unix user, where the installed CLI is the correct
+answer and a worktree bundle may be unreadable to `agent-<name>`. Per-site judgement, not a
+blanket substitution.
+
 ## 0.16.15 — fix(heartbeat): a /goal dispatched onto a verifier-loop task could only be satisfied by bypassing the verifier (DIVE-2063) (2026-07-26)
 
 The heartbeat's `/goal` nudge accepts three terminal states: `done`, `cancelled`, or
