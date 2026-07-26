@@ -1,5 +1,41 @@
 # Changelog
 
+## 0.16.13 — fix(types): an omitted TYPE_* key degrades as documented instead of crashing under `set -u` (DIVE-2076) (2026-07-26)
+
+Second of the two defects A-MO7SEN reported in #196 while registering a new agent type. A
+bare `${TYPE_CHANNELS[$type]}` read under `set -u` made a type registered without that key
+hard-crash `agent types` with an unbound-variable error naming the *array* rather than the
+type — an error message that points at our internals instead of the missing key. Seven
+readers fixed (the ticket named five); a `:-0` default now routes an omitted key into the
+existing "type X does not support channels" path.
+
+The sweep found a live instance rather than a future-type hypothetical: `cmd_auth.sh` read
+`TYPE_API_VAR` / `TYPE_API_FILE` bare one line above a graceful `fail` written for exactly
+the absent case, which even names hermes and openclaw. Both maps are sparse by design and
+their comments claimed `cmd_auth_set` "already fails gracefully when a type isn't in this
+map" — under `set -u` execution never reached that line, so 4 of 8 types (hermes, openclaw,
+antigravity, pi) crashed on `auth set-key` instead of getting the message. **The comment
+described behaviour the code did not have.**
+
+## 0.16.12 — fix(install): TYPE_INSTALL for claude/antigravity/grok was gated on `command -v`, so a stray binary already on PATH suppressed the install forever (DIVE-2075) (2026-07-26)
+
+Reported externally by A-MO7SEN as issue #196. The install recipes for `claude`,
+`antigravity` and `grok` were each guarded by `command -v <tool> >/dev/null ||`, which asks
+"is something by this name on PATH?" — not "is the thing we manage installed?". An unrelated
+npm-global `claude` on PATH therefore satisfied the guard, the install never ran, and
+`TYPE_BIN` was never created. The failure is permanent and silent: nothing errors, the tool
+simply never appears where the product expects it.
+
+The guards now key off the same `TYPE_BIN[...]` paths the verify step reads, so the gate and
+the verification agree by construction rather than by coincidence. The one surviving
+`command -v` inside `TYPE_INSTALL` is antigravity's trailing where-did-it-land fallback,
+which is the correct use. The `cmd_auth.sh` reversal keeps an explicit `*_BIN` override
+winning.
+
+Same primitive as DIVE-2061 earlier the same day: **`command -v` answers a question about
+PATH, and every use of it as a proxy for "our artifact exists" is a defect waiting for an
+unrelated binary to shadow it.**
+
 ## 0.16.11 — fix(task): `task need` warns at file time when a decision gate lands on a branch-bound task (DIVE-2074) (2026-07-26)
 
 A `--type=decision` gate only authorizes `push` when it is answered by that task's OWN
