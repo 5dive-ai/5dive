@@ -215,8 +215,18 @@ _push_author_scan() {
     # and the maker goes off rewriting authorship on a clean branch.
     local against; against=$(_push_repo_slug "$repourl")
     [[ -n "$repo_src" ]] && against="${against} (target resolved from ${repo_src})"
+    # DIVE-2051: `agent create` seeds every agent user a synthetic
+    # agent-<name>@agents.noreply.5dive.ai identity, so no personal address can
+    # be inferred into a commit. Correct, and it means an agent committing in a
+    # repo with an author policy lands HERE. Hand it the fix instead of a wall —
+    # the mitigation must not live as tribal knowledge (main's call).
+    local seeded_hint=""
+    if printf '%s\n' "$offenders" | grep -q '@agents\.noreply\.5dive\.ai>'; then
+      local a_name a_email; a_name="${author%% <*}"; a_email="${author##*<}"; a_email="${a_email%>}"
+      seeded_hint=" NOTE: the address above is the SYNTHETIC identity 5dive provisioning gives an agent user (DIVE-2051) — deliberate, not a mistake, but not an author this repo accepts. Set the repo-local author once in the checkout you commit from, then re-author:  git -C <your checkout> config user.name '${a_name}' && git -C <your checkout> config user.email '${a_email}'"
+    fi
     fail "$E_VALIDATION" \
-      "author check FAILED against ${against} — scanned ${scope}. The commit(s) above are not authored '${author}' (the configured GITHUB_APP_COMMIT_AUTHOR). If you do not recognise them, check the TARGET REPO first: a push aimed at the wrong repository lists that repository's unrelated history here. Otherwise re-author (git rebase --exec 'git commit --amend --author=\"${author}\" --no-edit') before pushing; your git host's author gate would reject them."
+      "author check FAILED against ${against} — scanned ${scope}. The commit(s) above are not authored '${author}' (the configured GITHUB_APP_COMMIT_AUTHOR). If you do not recognise them, check the TARGET REPO first: a push aimed at the wrong repository lists that repository's unrelated history here. Otherwise re-author (git rebase --exec 'git commit --amend --author=\"${author}\" --no-edit') before pushing; your git host's author gate would reject them.${seeded_hint}"
   fi
 }
 

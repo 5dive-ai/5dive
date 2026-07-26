@@ -39310,6 +39310,19 @@ PY
 #   - history.jsonl is append-only; the status branch's git history is the
 #     tamper-evident audit trail.
 #   - Idempotent per-day: a re-run is a no-op (exit 3).
+#
+# `proof publish` exit contract (verb-local, NOT the global error_codes table):
+#   0  published
+#   3  already published today — a healthy no-op
+#   4  REFUSED: no publishing identity configured (DIVE-2051)
+#   *  other failure
+# 3 and 4 are deliberately distinct and must stay that way. They are semantic
+# opposites — "everything is fine and already done" vs "your config is broken
+# and I refused" — and the caller that cannot tell them apart is the cron:
+# _proof_tick maps 3 to success, so a refusal sharing that code would report a
+# permanently broken box as a healthy night, which is the DIVE-2044 silent-stop
+# shape (26h of no publishes read as business as usual). Asserted by
+# tests/proof_identity_guard_unit.sh so they cannot converge again.
 #   - Failure mode is visible staleness: if the digest or push fails, nothing
 #     publishes and the badge date stops moving. No curated pauses; bad weeks
 #     and fresh-box zeros publish exactly like good ones.
@@ -39338,6 +39351,11 @@ _PROOF_DEFAULT_REPO="https://github.com/5dive-ai/5dive.git"
 # DIVE-2051: resolved publishing identity (set by _proof_identity). Declared
 # here so `set -u` holds on every read path, including `proof status`.
 _PROOF_ID_NAME=""; _PROOF_ID_EMAIL=""; _PROOF_ID_SOURCE=""; _PROOF_ID_UNCHECKED=0
+# The refusal's OWN exit code, separate from 3 (idempotent no-op) — see the exit
+# contract at the top of this file. Verb-local by design: `proof publish` already
+# owns 3 for its no-op, so its codes are read against that contract and not
+# against the global error_codes table (where 4 is E_NOT_FOUND).
+_PROOF_RC_NO_IDENTITY=4
 _PROOF_METHODOLOGY_URL="https://github.com/5dive-ai/5dive/blob/main/docs/zero-human.md"
 
 _proof_pref_get() {
@@ -39926,12 +39944,16 @@ _proof_publish() {
     echo "proof: already published today for $branch, nothing to do"
     return 3
   fi
-  # DIVE-2051: rc 4 is the identity refusal. It gets its own exit class rather
-  # than the E_GENERIC catch-all so a caller (or the cron log) can tell "this
-  # box is misconfigured, and will stay misconfigured until someone pins an
-  # identity" apart from "the network flaked tonight". _proof_build already
-  # printed the how-to-fix block.
-  [ "$rc" -ne 4 ] || fail "$E_VALIDATION" "proof publish: refused — no publishing identity configured (nothing was published)"
+  # DIVE-2051: the identity refusal exits 4, its OWN code — not the E_GENERIC
+  # catch-all (which reads as "the network flaked tonight" and invites a retry
+  # that cannot succeed) and above all NOT 3, which this verb already spends on
+  # the healthy already-published-today no-op. _proof_tick maps 3 to success, so
+  # a refusal sharing it would report a permanently broken box as a good night.
+  # _proof_build already printed the how-to-fix block.
+  if [ "$rc" -eq 4 ]; then
+    echo "error: proof publish: REFUSED — no publishing identity configured (nothing was published, and nothing will publish until one is pinned)" >&2
+    return "$_PROOF_RC_NO_IDENTITY"
+  fi
   [ "$rc" -eq 0 ] || fail "$E_GENERIC" "proof publish: failed (rc=$rc) — nothing published"
   if [ "$first" -eq 1 ]; then
     _proof_badge_snippet "$repo" "$branch"
@@ -40166,6 +40188,10 @@ _proof_tick() {
   [ -r "$f" ] || return 0
   [ "$(jq -r '.enabled // false' "$f" 2>/dev/null)" = "true" ] || return 0
   _proof_publish >/dev/null || rc=$?
+  # 3 (already published today) is a genuine success for a scheduled run. 4 (no
+  # publishing identity, DIVE-2051) is NOT, and is deliberately left non-zero:
+  # it is the one failure that repeats every night until a human acts, so it is
+  # exactly the one a scheduled run must not report as fine.
   [ "$rc" -eq 3 ] && rc=0
   return "$rc"
 }
@@ -40532,6 +40558,11 @@ address (e.g. <user>@users.noreply.github.com), not a personal inbox: on a box
 where an agent publishes, the most available address is the operator's own,
 which Claude Code puts in every agent's prompt by default. `proof status` shows
 the resolved identity and its source.
+
+`proof publish` exit codes: 0 published, 3 already published today (a healthy
+no-op), 4 REFUSED for no identity, other non-zero for other failures. 3 and 4
+are separate on purpose — a scheduled run treats 3 as success, so a refusal
+sharing that code would report a permanently broken box as a healthy night.
 HELP
       ;;
     *) fail "$E_USAGE" "proof: unknown subcommand: ${1:-} (publish|on|off|status|tick)" ;;
@@ -40754,8 +40785,18 @@ _push_author_scan() {
     # and the maker goes off rewriting authorship on a clean branch.
     local against; against=$(_push_repo_slug "$repourl")
     [[ -n "$repo_src" ]] && against="${against} (target resolved from ${repo_src})"
+    # DIVE-2051: `agent create` seeds every agent user a synthetic
+    # agent-<name>@agents.noreply.5dive.ai identity, so no personal address can
+    # be inferred into a commit. Correct, and it means an agent committing in a
+    # repo with an author policy lands HERE. Hand it the fix instead of a wall —
+    # the mitigation must not live as tribal knowledge (main's call).
+    local seeded_hint=""
+    if printf '%s\n' "$offenders" | grep -q '@agents\.noreply\.5dive\.ai>'; then
+      local a_name a_email; a_name="${author%% <*}"; a_email="${author##*<}"; a_email="${a_email%>}"
+      seeded_hint=" NOTE: the address above is the SYNTHETIC identity 5dive provisioning gives an agent user (DIVE-2051) — deliberate, not a mistake, but not an author this repo accepts. Set the repo-local author once in the checkout you commit from, then re-author:  git -C <your checkout> config user.name '${a_name}' && git -C <your checkout> config user.email '${a_email}'"
+    fi
     fail "$E_VALIDATION" \
-      "author check FAILED against ${against} — scanned ${scope}. The commit(s) above are not authored '${author}' (the configured GITHUB_APP_COMMIT_AUTHOR). If you do not recognise them, check the TARGET REPO first: a push aimed at the wrong repository lists that repository's unrelated history here. Otherwise re-author (git rebase --exec 'git commit --amend --author=\"${author}\" --no-edit') before pushing; your git host's author gate would reject them."
+      "author check FAILED against ${against} — scanned ${scope}. The commit(s) above are not authored '${author}' (the configured GITHUB_APP_COMMIT_AUTHOR). If you do not recognise them, check the TARGET REPO first: a push aimed at the wrong repository lists that repository's unrelated history here. Otherwise re-author (git rebase --exec 'git commit --amend --author=\"${author}\" --no-edit') before pushing; your git host's author gate would reject them.${seeded_hint}"
   fi
 }
 

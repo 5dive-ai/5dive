@@ -40,6 +40,18 @@ unset ZH_GIT_NAME ZH_GIT_EMAIL
 # shellcheck disable=SC1091
 source src/cmd_proof.sh
 
+# Degrade to GRADED FAILURES, not a crash, when the feature is absent — i.e.
+# when this harness is run against a pre-fix tree to prove it is non-vacuous.
+# main's review point: a crash proves "this file cannot run here", which is a
+# weaker claim than "these assertions detect the defect". The stub CLEARS the
+# resolved identity rather than no-op'ing, so a stale value from an earlier case
+# can never make a later assertion pass for the wrong reason.
+if ! declare -F _proof_identity >/dev/null 2>&1; then
+  _proof_identity() { _PROOF_ID_NAME=""; _PROOF_ID_EMAIL=""; _PROOF_ID_SOURCE=""; _PROOF_ID_UNCHECKED=0; }
+fi
+: "${_PROOF_ID_NAME:=}"; : "${_PROOF_ID_EMAIL:=}"
+: "${_PROOF_ID_SOURCE:=}"; : "${_PROOF_ID_UNCHECKED:=0}"
+
 PASS=0; FAIL=0
 ok_t()  { PASS=$((PASS+1)); printf 'ok   - %s\n' "$1"; }
 bad_t() { FAIL=$((FAIL+1)); printf 'FAIL - %s\n   %s\n' "$1" "${2:-}"; }
@@ -142,6 +154,45 @@ fi
 RC=$?
 [[ "$RC" == "2" || "$RC" == "3" ]] \
   && ok_t "--as-email without --as-name / malformed is rejected" || bad_t "as-email validation" "rc=$RC"
+
+# --- Case 9: the refusal and the idempotent no-op must NOT share an exit code -
+# main's review catch. Both used to surface as 3 at the verb boundary, and the
+# caller that cannot tell them apart is the cron: _proof_tick maps 3 to success,
+# so a refusal sharing it reports a permanently broken box as a healthy night —
+# the DIVE-2044 silent-stop shape, reintroduced through a different door. Driven
+# by stubbing _proof_build's two return values, which is the exact seam where
+# they converged.
+# NB: the stub reads a GLOBAL, not "$1" — inside the redefinition $1 is
+# _proof_build's own first argument (the repo url), not the rc we want back.
+publish_rc_for() {
+  ( _FAKE_RC="$1"
+    _proof_build() { return "$_FAKE_RC"; }
+    _proof_publish_gate() { return 0; }
+    git() { case "$1" in ls-remote) return 0 ;; *) command git "$@" ;; esac; }
+    _proof_publish >/dev/null 2>&1 ) ; echo $?
+}
+[[ "$(publish_rc_for 3)" == "3" ]] \
+  && ok_t "already-published-today still exits 3 (the healthy no-op)" \
+  || bad_t "no-op exit code" "got=$(publish_rc_for 3)"
+[[ "$(publish_rc_for 4)" == "4" ]] \
+  && ok_t "the identity refusal exits 4, its own code" \
+  || bad_t "refusal exit code" "got=$(publish_rc_for 4)"
+[[ "$(publish_rc_for 3)" != "$(publish_rc_for 4)" ]] \
+  && ok_t "refusal and no-op do not converge on one exit code" || bad_t "codes converged"
+# And the cron driver must not launder the refusal into success the way it
+# legitimately does for the no-op.
+tick_rc_for() {
+  ( _FAKE_RC="$1"
+    _proof_publish() { return "$_FAKE_RC"; }
+    _proof_pref_file() { echo "$TMP/tick.json"; }
+    printf '{"enabled":true}\n' > "$TMP/tick.json"
+    _proof_tick >/dev/null 2>&1 ) ; echo $?
+}
+[[ "$(tick_rc_for 3)" == "0" ]] \
+  && ok_t "cron tick maps the no-op to success (unchanged)" || bad_t "tick no-op" "got=$(tick_rc_for 3)"
+[[ "$(tick_rc_for 4)" != "0" ]] \
+  && ok_t "cron tick does NOT launder the refusal into a healthy night" \
+  || bad_t "tick laundered refusal" "got=$(tick_rc_for 4)"
 
 echo
 echo "passed: $PASS  failed: $FAIL"
