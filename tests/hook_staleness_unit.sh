@@ -74,9 +74,18 @@ D2=$(mkrepo e2); git -C "$D2" checkout -q --orphan orphan; git -C "$D2" rm -rqf 
 echo z > "$D2/z"; git -C "$D2" add -A; git -C "$D2" commit -qm orphan
 run "$D2" HEAD main; rc=$?
 (( rc == 2 )) && ok_t "E unrelated histories also exit 2" || bad_t "E orphan" "rc=$rc $(cat "$TMP/err")"
-[[ "$(cat "$TMP/err")" != "$E1" ]] \
-  && ok_t "E the two UNDETERMINED causes emit DIFFERENT messages (rule 2: not folded)" \
-  || bad_t "E folded messages" "a missing ref and unrelated histories read identically — the rare one hides in the routine one"
+# olivia, verifying DIVE-2072: the first version of this compared the two runs
+# RAW — and they use different MAIN_REF values ('nonexistent-ref' vs 'main'), so
+# the interpolated ref name ALONE made the strings differ. It graded string
+# interpolation, not message distinctness, and stayed GREEN under a mutation that
+# folded both causes into one shared template. Normalise the quoted ref out of
+# both before comparing, so only the TEMPLATE is under test.
+norm_ref() { sed "s/'[^']*'/'REF'/g"; }
+E1N=$(printf '%s' "$E1" | norm_ref)
+E2N=$(norm_ref < "$TMP/err")
+[[ "$E2N" != "$E1N" ]] \
+  && ok_t "E the two UNDETERMINED causes emit DIFFERENT message TEMPLATES (rule 2: not folded)" \
+  || bad_t "E folded messages" "a missing ref and unrelated histories read identically once the ref name is normalised out — the rare one hides in the routine one"
 
 printf '\n%s passed, %s failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" == 0 ]]
