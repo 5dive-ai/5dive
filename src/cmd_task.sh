@@ -4005,7 +4005,15 @@ TASK_GATE_ESCALATE_ERR=""
 # gate-TTL sweep (which runs as root from cron — no sudo chain, no agent-* USER)
 # can resolve a FILING AGENT's channel per gate row instead of from the caller.
 _task_agent_channel() {
-  TASK_CH_TOKEN="" TASK_CH_ACCESS="" TASK_CH_TYPE=""
+  # DIVE-2073: TASK_CH_AGENT is set HERE, not only in _task_chain_channel. This
+  # is the one resolver every send path funnels through (own channel, by-name
+  # privileged, chain walk), so it is the only place that can name WHOSE bot
+  # carried a message on all of them. Without it the delivery row could say a
+  # message_id but never which bot's id space it lives in — and since each bot
+  # holds its OWN conversation with the same human, ids from different bots are
+  # not comparable. That is exactly why DIVE-1927's residual 2 could not be
+  # discharged from the log alone.
+  TASK_CH_TOKEN="" TASK_CH_ACCESS="" TASK_CH_TYPE="" TASK_CH_AGENT=""
   local name="$1"
   [[ -n "$name" ]] || return 1
   local token="" token_file="${CONNECTORS_DIR}/telegram-${name}.env"
@@ -4016,7 +4024,7 @@ _task_agent_channel() {
   for t in claude codex grok antigravity; do
     d=$(_tg_access_state_dir "agent-${name}" "$t") || continue
     if [[ -r "${d}/access.json" ]]; then
-      TASK_CH_TOKEN="$token" TASK_CH_ACCESS="${d}/access.json" TASK_CH_TYPE="$t"
+      TASK_CH_TOKEN="$token" TASK_CH_ACCESS="${d}/access.json" TASK_CH_TYPE="$t" TASK_CH_AGENT="$name"
       return 0
     fi
   done
@@ -4341,9 +4349,32 @@ _task_gate_delivery_log() { # <ok|error> <task_ids> <chat> <message_id> <detail>
   fi
   [[ -n "$idents" ]] || idents="unknown"
   detail=${detail//$'\n'/ }
+  # DIVE-2073: NAME THE ACTOR AND THE CHANNEL ON EVERY PATH. The audit row's
+  # `user` answers only "which uid ran the process", and on both privileged
+  # paths that is root — which names nobody. A row reading "confirmed Bot API
+  # send" while its actor is unnameable proves that SOMETHING sent it, not who,
+  # and on the privileged re-send the whole question the path exists to answer
+  # is "did the escalation reach a human through a DIFFERENT channel than the
+  # filer's". Two facts have to live on the row itself:
+  #   via=   whose bot/channel carried it (TASK_CH_AGENT — every resolver sets it)
+  #   path=  which rail the send is on
+  # Measured cost of not having them (2026-07-26, DIVE-1927 residual 2): a
+  # delivery to lodar at 10:25:02 carried message_id 691 while the same day's
+  # other rows sat at 26235-26309 — two id spaces, because each bot keeps its
+  # own conversation with the same human, so ids from different bots are not
+  # comparable. The row was circumstantially olivia's and could not be PROVEN
+  # so, and a residual stayed open on evidence we should have been writing.
+  # `via=none` is honest and DISTINCT from a resolved owner: an error row that
+  # never resolved a channel has no owner. It must never borrow a stale one from
+  # an earlier send in the same process, which is why _task_agent_channel clears
+  # TASK_CH_AGENT on entry rather than only setting it on success.
+  local _via="${TASK_CH_AGENT:-none}" _path="file-time"
+  if [[ "${TASK_GATE_ESCALATING:-}" == "1" ]]; then _path="privileged-resend"
+  elif [[ "${TASK_GATE_RENAG:-}" == "1" ]]; then _path="renag"
+  fi
   local line
-  line=$(printf 'gate-delivery result=%s tasks=%s chat=%s message_id=%s detail=%q' \
-    "$result" "$idents" "${chat:-none}" "${message_id:-none}" "${detail:-none}")
+  line=$(printf 'gate-delivery result=%s tasks=%s chat=%s message_id=%s via=%s path=%s detail=%q' \
+    "$result" "$idents" "${chat:-none}" "${message_id:-none}" "$_via" "$_path" "${detail:-none}")
   # DIVE-1968: FENCE THE TELEMETRY ON STORE IDENTITY. This log and the audit rows
   # are the ONLY dataset anyone reads to judge whether the gate rail works, and
   # until now every run wrote into them from a HARDCODED prod path regardless of
@@ -4422,7 +4453,8 @@ _task_gate_delivery_log() { # <ok|error> <task_ids> <chat> <message_id> <detail>
   fi
   if (( _prod_telemetry )); then
     audit_log "gate delivery" "$result" "$([[ "$result" == "ok" ]] && echo 0 || echo 1)" -- \
-      "tasks=$idents" "chat=${chat:-none}" "message_id=${message_id:-none}" "detail=${detail:-none}" || true
+      "tasks=$idents" "chat=${chat:-none}" "message_id=${message_id:-none}" \
+      "via=$_via" "path=$_path" "detail=${detail:-none}" || true
   elif [[ -z "${_TASK_GATE_TELEMETRY_FENCED:-}" ]]; then
     _TASK_GATE_TELEMETRY_FENCED=1
     warn "gate-delivery telemetry withheld: TASKS_DB is not the production store, so these rows are NOT written to the fleet log or audit (DIVE-1968). Set FIVEDIVE_GATE_NOTIFY_LOG to capture them locally."

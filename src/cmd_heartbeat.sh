@@ -1415,7 +1415,13 @@ _hb_gate_renag_batch() { # <recipient_agent> <comma-separated task ids> <route_l
   local reply_markup=""
   [[ "$rows" != "[]" ]] && reply_markup=$(jq -cn --argjson rows "$rows" '{inline_keyboard:$rows}' 2>/dev/null) || true
   text+=$'\n\n'"Tap a button, open /task links, or answer from the dashboard. First reminder is after 1h; later reminders are batched every 24h until answered."
+  # DIVE-2073: mark the rail so the delivery row can say which path it is on.
+  # This sweep runs as root from cron with no invoking user, so `user` on the row
+  # is root and names no agent; without this every :NN:02 delivery is
+  # indistinguishable from a file-time send by the same uid.
+  TASK_GATE_RENAG=1
   _task_send_owner "$text" "$reply_markup" "$idlist"
+  TASK_GATE_RENAG=""
   if [[ "${TASK_SEND_DELIVERED:-0}" == "1" ]]; then
     # Do not invalidate the original alert's nonce until the new button-bearing
     # message has a confirmed receipt. The tiny post-ack/update interval is far
