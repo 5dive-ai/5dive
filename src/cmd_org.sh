@@ -110,15 +110,29 @@ cmd_org_set() {
   (( role_set ))  && db "UPDATE agents_org SET role=$(sqlq_or_null "$role"),   updated_at=datetime('now') WHERE name=$(sqlq "$name");"
   (( title_set )) && db "UPDATE agents_org SET title=$(sqlq_or_null "$title"), updated_at=datetime('now') WHERE name=$(sqlq "$name");"
 
-  # DIVE-2124 — require_root is a hard boundary only where agents lack blanket sudo.
-  # On THIS control-plane host they have NOPASSWD:ALL (measured), so `sudo 5dive org
-  # set` stays available to any agent. Record who re-parented whom, in OUR audit trail
-  # and not only the OS journal: a self-grant on the gate-routing path should be a
-  # recorded act rather than an invisible one. SUDO_USER is the real principal, since
-  # sudo flattens every caller to EUID 0.
+  # DIVE-2124 — record the chart write, and be honest about what the record proves.
+  # require_root is a hard boundary only where agents lack blanket sudo; on THIS host
+  # they have NOPASSWD:ALL (measured), so `sudo 5dive org set` stays reachable.
+  #
+  # by_claimed IS NOT EVIDENCE, and is named so it cannot be read as any. It is
+  # SUDO_USER, a plain environment variable, and the verifier forged it:
+  #   sudo -u agent-dev sudo -n env SUDO_USER=lodar SUDO_UID=0 <build> org set ...
+  # produced a record reading {user:lodar, by=lodar} for a write actually performed by
+  # agent-dev — an agent self-grant on the gate-routing path logged as an act by the
+  # human CEO. That is WORSE than no attribution, because the trail points somewhere
+  # specific and wrong. The field is kept and relabelled rather than dropped: the
+  # honest half (a write happened, to whom, on which edge) is still worth having.
+  #
+  # The textbook fix does not work on this host: /proc/self/loginuid is unset
+  # (4294967295, byte-identical honest and forged) because agents run as systemd
+  # services with no PAM login. The authoritative record of who invoked sudo is
+  # sudo's OWN journal entry, which this process neither writes nor can forge —
+  # correlate there when attribution actually has to hold. Until something does that,
+  # this arm does NOT close the blanket-sudo gap and must not be described as if it
+  # does.
   local _aud_mgr="(unchanged)"
   if (( mgr_set )); then (( mgr_clear )) && _aud_mgr="(cleared)" || _aud_mgr="$mgr_name"; fi
-  audit_log "org set" ok 0 -- "agent=$name" "reports_to=$_aud_mgr" "by=${SUDO_USER:-root}"
+  audit_log "org set" ok 0 -- "agent=$name" "reports_to=$_aud_mgr" "by_claimed=${SUDO_USER:-root}"
 
   if (( JSON_MODE )); then
     local row; row=$(dbfmt -json "SELECT name, reports_to, role, title FROM agents_org WHERE name=$(sqlq "$name");")
@@ -205,6 +219,7 @@ cmd_org_rm() {
   local exists; exists=$(db "SELECT 1 FROM agents_org WHERE name=$(sqlq "$name");")
   [[ -n "$exists" ]] || fail "$E_NOT_FOUND" "agent '$name' is not placed in the org chart"
   db "DELETE FROM agents_org WHERE name=$(sqlq "$name");"
-  audit_log "org rm" ok 0 -- "agent=$name" "by=${SUDO_USER:-root}"
+  # by_claimed: caller-controlled, not evidence — see the note in cmd_org_set.
+  audit_log "org rm" ok 0 -- "agent=$name" "by_claimed=${SUDO_USER:-root}"
   ok "$name removed from org chart" '{name:$n, removed:true}' --arg n "$name"
 }

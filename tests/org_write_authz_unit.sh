@@ -138,9 +138,27 @@ source "$SRC/lib/validation.sh"
 grep -q 'org set' "$AUDIT_CALLS" && grep -q 'agent=audited-2124' "$AUDIT_CALLS" \
   && ok_t "a privileged 'org set' writes an audit record naming the agent and the new manager" \
   || bad_t "org set must be audited" "$(cat "$AUDIT_CALLS")"
-grep -q 'by=agent-dev' "$AUDIT_CALLS" \
-  && ok_t "...and the record names the REAL principal (SUDO_USER), not the flattened root identity" \
-  || bad_t "audit must record SUDO_USER" "$(cat "$AUDIT_CALLS")"
+grep -q 'by_claimed=agent-dev' "$AUDIT_CALLS" \
+  && ok_t "...and records the caller SUDO_USER reported, under a name that says it is only a CLAIM" \
+  || bad_t "audit must record the claimed caller" "$(cat "$AUDIT_CALLS")"
+# THE BARE LABEL MUST NOT COME BACK. `by=` reads as evidence of who acted. It is not:
+# SUDO_USER is a plain env var, and the verifier forged it end to end —
+# `sudo -u agent-dev sudo -n env SUDO_USER=lodar ... org set ...` logged {by=lodar}
+# for a write agent-dev performed, pointing the trail at the human CEO. A field that
+# names a specific wrong principal is worse than one that names none.
+grep -qE '(^| )by=' "$AUDIT_CALLS" \
+  && bad_t "the bare 'by=' label is back" "it reads as evidence; SUDO_USER is caller-controlled: $(cat "$AUDIT_CALLS")" \
+  || ok_t "the evidence-implying bare 'by=' label is gone"
+# ...and PIN THE FORGEABILITY so nobody later upgrades this field's meaning. The test
+# IS the counterexample: the caller sets the value, so the record follows the caller.
+: >"$AUDIT_CALLS"
+require_root() { :; }
+( SUDO_USER=lodar cmd_org_set forged-2124 --manager=dev ) >/dev/null 2>&1
+# shellcheck source=/dev/null
+source "$SRC/lib/validation.sh"
+grep -q 'by_claimed=lodar' "$AUDIT_CALLS" \
+  && ok_t "FORGEABLE BY CONSTRUCTION: any caller can set SUDO_USER, so by_claimed follows the caller and is never evidence" \
+  || bad_t "forgeability arm did not reproduce" "$(cat "$AUDIT_CALLS")"
 grep -q 'reports_to=dev' "$AUDIT_CALLS" \
   && ok_t "...and the resolved edge, so a self-grant is legible in the trail without diffing the table" \
   || bad_t "audit must record the edge" "$(cat "$AUDIT_CALLS")"

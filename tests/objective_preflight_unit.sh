@@ -42,6 +42,35 @@ set +e
 
 tasks_db_init
 
+# DIVE-2124: seed the org chart DIRECTLY, never through `org set`.
+# `org set` is root-only now — the chart is trusted input to gate routing, so
+# writing it is a privileged act. A FIXTURE has no business exercising authz: it
+# needs the ROW, not the verb. Calling the verb here made 11 arms in this file and
+# its sibling fail for a reason with nothing to do with what they test, and every
+# one that died was a gate-routing verifier-resolution arm — the exact consumer the
+# authz change exists to protect. Seeding the row keeps require_root REAL in this
+# harness (no global stub, which would hide a future guard regression) while the
+# arms go on testing what they are about.
+org_seed() {  # <name> [--manager=x] [--role=x] [--title=x]
+  local n="$1"; shift
+  local mgr="" role="" title="" a
+  for a in "$@"; do
+    case "$a" in
+      --manager=*) mgr="${a#*=}" ;;
+      --role=*)    role="${a#*=}" ;;
+      --title=*)   title="${a#*=}" ;;
+    esac
+  done
+  db "INSERT OR IGNORE INTO agents_org (name) VALUES ($(sqlq "$n"));"
+  if [[ -n "$mgr" ]]; then
+    db "INSERT OR IGNORE INTO agents_org (name) VALUES ($(sqlq "$mgr"));
+        UPDATE agents_org SET reports_to=$(sqlq "$mgr") WHERE name=$(sqlq "$n");"
+  fi
+  [[ -n "$role"  ]] && db "UPDATE agents_org SET role=$(sqlq "$role")   WHERE name=$(sqlq "$n");"
+  [[ -n "$title" ]] && db "UPDATE agents_org SET title=$(sqlq "$title") WHERE name=$(sqlq "$n");"
+  return 0
+}
+
 PASS=0; FAIL=0
 ok_t()  { PASS=$((PASS+1)); printf 'ok   - %s\n' "$1"; }
 bad_t() { FAIL=$((FAIL+1)); printf 'FAIL - %s\n   %s\n' "$1" "${2:-}"; }
@@ -59,8 +88,8 @@ r=$(run setstatus active "bare")
   && ok_t "bare box (no org) resumes fine — preflight never false-fails" || bad_t "bare resume" "$r :: $(cat "$TMP/err")"
 
 # Seed an org chart: a coordinator planner + one distinct teammate (the verifier).
-( cmd_org set boss --role=coordinator ) >/dev/null 2>&1
-( cmd_org set worker --manager=boss ) >/dev/null 2>&1
+org_seed boss --role=coordinator
+org_seed worker --manager=boss
 
 # T2: populated org, coordinator resolvable, distinct teammate exists -> PASS.
 ( cmd_objective_add "wired" --metric-cmd="echo 5" --target=100 --planner=boss ) >/dev/null 2>&1
@@ -75,7 +104,7 @@ oid_pre() { ( cmd_objective_preflight "$1" "$2" ) >/dev/null 2>&1; }
 # fresh single-member org db slice: point planner at 'solo' and ensure no distinct member
 # (simulate by making the objective's planner a name that is the sole org row).
 db "DELETE FROM agents_org;"
-( cmd_org set solo --role=coordinator ) >/dev/null 2>&1
+org_seed solo --role=coordinator
 ( cmd_objective_add "single" --metric-cmd="echo 5" --target=100 --planner=solo ) >/dev/null 2>&1
 ( cmd_objective_setstatus paused "single" ) >/dev/null 2>&1
 r=$(run setstatus active "single")
@@ -83,7 +112,7 @@ r=$(run setstatus active "single")
   && ok_t "planner is the only org member -> missing_verifier (refused)" || bad_t "missing_verifier" "$r :: $(cat "$TMP/err")"
 
 # T4: planner not present in a populated org -> role_unreachable.
-( cmd_org set helper --manager=solo ) >/dev/null 2>&1   # org now has a distinct member
+org_seed helper --manager=solo   # org now has a distinct member
 ( cmd_objective_add "dangling" --metric-cmd="echo 5" --target=100 --planner=ghost ) >/dev/null 2>&1
 ( cmd_objective_setstatus paused "dangling" ) >/dev/null 2>&1
 r=$(run setstatus active "dangling")
@@ -110,8 +139,8 @@ r=$(run setstatus active "dangling" --force)
 # Build a live objective, run a replan whose diff files a gate (proposal awaiting
 # a decision), then a follow-up replan must WAIT on that gate rather than plan again.
 db "DELETE FROM agents_org;"
-( cmd_org set boss --role=coordinator ) >/dev/null 2>&1
-( cmd_org set worker --manager=boss ) >/dev/null 2>&1
+org_seed boss --role=coordinator
+org_seed worker --manager=boss
 ( cmd_objective_add "hg" --metric-cmd="echo 5" --target=100 --planner=boss --max-new-per-cycle=2 ) >/dev/null 2>&1
 HID=$(objid "hg")
 db "INSERT INTO objective_readings (objective_id, value, rc) VALUES ($HID, 5, 0);"
