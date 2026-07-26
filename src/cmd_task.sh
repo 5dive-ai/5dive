@@ -2198,7 +2198,10 @@ cmd_task_reject() {
   local fb_txt="❌ ${_rj_actor} rejected (iteration ${iter}): ${feedback:-no feedback given}"
   # (4) never silently discard a landed record.
   if [[ "$_rj_st" == 'done' && -n "$_rj_prev" ]]; then
-    fb_txt="${fb_txt}"$'\n'"--- superseded result (DIVE-2112, preserved) ---"$'\n'"${_rj_prev}"
+    # ONE marker, deliberately shared with the verify path (olivia, DIVE-2112: "extend,
+    # do not fork the marker") so a single grep finds every superseded record. The
+    # ticket in the string names the CONVENTION's origin, not this call site.
+    fb_txt="${fb_txt}"$'\n'"--- superseded result (DIVE-2067, preserved) ---"$'\n'"${_rj_prev}"
   fi
   # DIVE-1495: a reject supersedes any still-open need-gate on this task. Leaving
   # it 'pending' (need_answered_at NULL) let the DIVE-1490 re-nag ladder keep

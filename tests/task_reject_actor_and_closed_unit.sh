@@ -102,7 +102,7 @@ D=$(seed_closed "D verifier reopens own grade")
 out=$(as main cmd_task_reject "$D" --feedback="I was wrong, reopening"); rc=$?
 (( rc == 0 )) && ok_t "D the grader may reopen their own grade (rc=0)" \
   || bad_t "D grader locked out" "rc=$rc $(cat "$TMP"/err)"
-[[ "$(res_of "$D")" == *"superseded result (DIVE-2112, preserved)"* ]] \
+[[ "$(res_of "$D")" == *"superseded result (DIVE-2067, preserved)"* ]] \
   && ok_t "D prior result preserved under a superseded marker" || bad_t "D marker missing" "$(res_of "$D")"
 [[ "$(res_of "$D")" == *"the seal only grades the bundle"* ]] \
   && ok_t "D the ACK's actual TEXT survives, not just a marker" || bad_t "D ACK text lost" "$(res_of "$D")"
