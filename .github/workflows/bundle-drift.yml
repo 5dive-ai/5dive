@@ -82,4 +82,10 @@ jobs:
             echo "version-uniqueness: no usable previous main tip (new branch or force event) — skipping delta scan."
             exit 0
           fi
-          ./scripts/version-uniqueness-scan.sh "${{ github.sha }}" "$before"
+          # DIVE-2125: the gate, not the raw scan. version-uniqueness and version-assign
+          # are triggered by the SAME push and race — measured on 186b0e3 and 6fd082e,
+          # this job failed on the merge commit while the assigner was still computing
+          # the repair, leaving a permanently red run on a merge that ended healthy.
+          # The gate tolerates ONLY the assignable shape, and only after PROVING the
+          # repair landed by re-scanning main's new tip; anything else still fails.
+          ./scripts/version-uniqueness-gate.sh "${{ github.sha }}" "$before"
