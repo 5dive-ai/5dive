@@ -179,7 +179,7 @@ try:
     con = sqlite3.connect(task_db)
     con.row_factory = sqlite3.Row
     rows = con.execute(
-        "SELECT ident,title,assignee,started_at,done_at,iteration FROM tasks "
+        "SELECT ident,title,assignee,started_at,done_at,iteration,status FROM tasks "
         "WHERE started_at IS NOT NULL AND assignee IS NOT NULL"
     ).fetchall()
     con.close()
@@ -199,6 +199,7 @@ for r in rows:
         "ident": r["ident"], "title": r["title"] or "",
         "start": s, "end": e, "total": 0, "output": 0, "turns": 0,
         "iteration": r["iteration"],   # DIVE-478: maker→verifier loop round (NULL if not a loop)
+        "status": r["status"],
     })
 for a in wins:
     wins[a].sort(key=lambda w: w["start"], reverse=True)
@@ -231,12 +232,35 @@ for name, turns in turns_by_agent.items():
 # rather than accusing every row: a partial read must not render as a
 # confident number (DIVE-1929/1937), and that cuts both ways — it must not
 # render as a confident accusation either.
+#
+# NEVER flag a task whose status is 'in_progress': the heartbeat only sends
+# the fixed /goal nudge on the todo->in_progress transition (never re-nudges
+# an already-started task — see cmd_heartbeat.sh's status='todo' dispatch
+# predicate), so a genuinely still-active task worked continuously past the
+# reporting window's start, OR started via a path other than the heartbeat
+# nudge (a human/admin instructing an already-live session directly — real
+# and observed on this fleet), can legitimately carry zero in-window pins.
+# 'blocked' is exactly the opposite case and the one this ticket targets: a
+# blocked task is NOT supposed to be earning fresh legitimate tokens at all,
+# so an absent pin there is signal, not noise. (Verified against the live
+# fleet 2026-07-26: every currently-enrolled agent's heartbeat everyMin is
+# 5-30min and the hard-cap reaper force-closes in_progress at 3x that
+# (cmd_heartbeat.sh _HB_STALE_MULT) — well under the 24h default window —
+# so under heartbeat-only dispatch this case is near-empty today, but a
+# direct human/admin dispatch bypasses that path entirely and is not
+# provable false, hence the status carve-out rather than relying on timing.)
 for a in wins:
     have_signal = bool(goal_pins.get(a))
     pinned_idents = goal_pins.get(a, set())
     for w in wins[a]:
         if w["turns"]:
-            dispatched = (w["ident"] in pinned_idents) if have_signal else None
+            has_pin = w["ident"] in pinned_idents
+            if not have_signal:
+                dispatched = None
+            elif w.get("status") == "in_progress":
+                dispatched = True if has_pin else None
+            else:
+                dispatched = has_pin
             tasks.append({"ident":w["ident"],"title":w["title"],"assignee":a,
                           "total":w["total"],"output":w["output"],"turns":w["turns"],
                           "iteration":w["iteration"],"dispatched":dispatched})

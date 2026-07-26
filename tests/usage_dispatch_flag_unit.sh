@@ -127,5 +127,29 @@ d3=$(jq -r '.tasks[] | select(.ident=="DIVE-90003") | .dispatched' <<<"$data2")
 [[ "$d3" == "true" ]] && ok_t "genuinely dispatched task reads dispatched=true (no false positives)" \
   || bad_t "expected DIVE-90003 dispatched=true" "got $d3"
 
+# --- control: an in_progress task with NO pin at all (e.g. dispatched by a direct
+#     human/admin instruction to an already-live session, not the heartbeat's fixed
+#     /goal template) must NOT be flagged false — only 'blocked' (and other
+#     non-active statuses) are asserted against pin absence. Raised by olivia's
+#     verifier review: the heartbeat only nudges on the todo->in_progress
+#     transition, never re-nudges an already-started task, so a still-active task
+#     can legitimately carry zero in-window pins. ---
+T4=$(( NOW_EPOCH - 900 ))
+db "INSERT INTO tasks (ident, title, status, assignee, created_by, started_at)
+    VALUES ('DIVE-90004','in_progress, dispatched some other way','in_progress','$AGENT','main','$(iso "$T4")');"
+# keep a genuine pin for a DIFFERENT ident in-window (DIVE-90003, still from T2) so
+# have_signal=True for this agent — the point being tested is "have signal, but no
+# pin for THIS ident", not "no signal for this agent at all" (that's DIVE-90001's case).
+cat > "$PROJDIR/recent.jsonl" <<EOF
+{"type":"user","timestamp":"$(iso "$T2")","message":{"role":"user","content":"/goal Task DIVE-90003 shows status done or cancelled..."}}
+{"type":"assistant","timestamp":"$(iso "$T4")","message":{"role":"assistant","model":"claude-sonnet-5","usage":{"input_tokens":50,"output_tokens":2000,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}}
+EOF
+touch -d "@$NOW_EPOCH" "$PROJDIR/recent.jsonl"
+
+data4=$(usage_collect "$SINCE_EPOCH")
+d4=$(jq -r '.tasks[] | select(.ident=="DIVE-90004") | .dispatched' <<<"$data4")
+[[ "$d4" == "null" ]] && ok_t "in_progress task with zero pins reads dispatched=null, NOT flagged false" \
+  || bad_t "expected DIVE-90004 dispatched=null (unknown, not accused)" "got $d4"
+
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]
