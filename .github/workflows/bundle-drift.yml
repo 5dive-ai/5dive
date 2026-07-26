@@ -28,13 +28,37 @@ jobs:
 
   # DIVE-2065: CI-side twin of scripts/version-bump-guard.sh's push-time check
   # (scripts/git-hooks/pre-push). Catches a version collision that bypassed
-  # the local hook — --no-verify, a box that never ran
-  # scripts/install-pii-push-guard.sh, or a race between two pushes that each
-  # looked clear against a now-stale main. Only runs on pushes that actually
+  # the local hook. The bypasses, MOST COMMON FIRST (DIVE-2072 corrected this
+  # enumeration — it used to omit the first one, which is the only entry that
+  # requires no mistake by anyone, and its absence told readers to trust the
+  # local hook more than they should):
+  #   - a branch CUT BEFORE the guard landed on main. core.hooksPath makes git
+  #     run the hook from YOUR working tree, so a guard added to main is simply
+  #     absent on every older branch, silently, for as long as they live. See
+  #     the hook-staleness job below, which catches this at PR time.
+  #   - --no-verify
+  #   - a box that never ran scripts/install-pii-push-guard.sh
+  #   - a race between two pushes that each looked clear against a now-stale main. Only runs on pushes that actually
   # land on main (a PR's own commits aren't reachable from main yet, and
   # CONTRIBUTING.md says PRs don't bump the version anyway) and only checks
   # the delta this push introduced — see version-uniqueness-scan.sh's own
   # header for why a full-history sweep would be permanently red instead.
+  # DIVE-2072: a repo-tracked hook protects only branches that CONTAIN it, and a
+  # MISSING HOOK CANNOT ANNOUNCE ITS OWN ABSENCE — so this lives in CI, which is
+  # present when the hook is not, and runs at PR time where the remedy is still a
+  # cheap rebase rather than a post-hoc CI catch after the damage landed.
+  hook-staleness:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: This branch's copy of scripts/git-hooks must not be behind main's
+        run: |
+          git fetch -q origin main
+          bash scripts/hook-staleness-check.sh HEAD origin/main
+
   version-uniqueness:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
