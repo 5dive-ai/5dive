@@ -20247,7 +20247,35 @@ cmd_task_reject() {
   vfier=$(db "SELECT COALESCE(verifier,'')       FROM tasks WHERE id=${id};")
   [[ -n "$maker" ]] || fail "$E_VALIDATION" \
     "$ident is not in a maker→verifier loop (no maker to bounce to) — use 'task need'/'task block' for a plain rejection"
-  local fb_txt="❌ verifier '${vfier:-?}' rejected (iteration ${iter}): ${feedback:-no feedback given}"
+  # DIVE-2112: found by olivia verifying DIVE-2067 — whose refusal text pointed makers HERE.
+  # Measured on a fixture: a MAKER reject of an already-done task returned rc=0, reopened it,
+  # replaced the verifier ACK, and — because the string hard-coded the RECORDED verifier —
+  # recorded the write under a verifier who never made it. dev2 pressed the button, the board
+  # said olivia did. Destroying a record is bad; MANUFACTURING a false one is worse.
+  #
+  # Scoped like DIVE-2067 rather than symmetrically: a lead bouncing an OPEN task is
+  # legitimate and stays working. Only the two cases with nothing to escape from are refused.
+  _rj_actor=$(task_actor "")
+  _rj_st=$(db "SELECT COALESCE(status,'') FROM tasks WHERE id=${id};")
+  # (1) the writer may not grade its own work (DIVE-477) — and a maker reject would otherwise
+  # be filed under the verifier's name, which is the false-record half.
+  if [[ -n "$maker" && "$_rj_actor" == "$maker" ]]; then
+    policy_refuse "$E_CONFLICT" reject-by-maker DIVE-2112 "$ident" \
+      "$ident lists you ('${_rj_actor}') as its MAKER. A reject is the verifier's grade, so this would be the writer grading its own delivery (DIVE-477) and would be recorded under '${vfier:-the verifier}''s name. Ask '${vfier:-the verifier}' to bounce it back, or send them what you found and let them decide."
+  fi
+  # (2) a CLOSED, graded task is not reopened by someone other than its grader. Deliberately
+  # names no alternative verb: this fix exists because DIVE-2067's refusal enumerated one.
+  if [[ "$_rj_st" == 'done' && -n "$vfier" && "$_rj_actor" != "$vfier" ]]; then
+    policy_refuse "$E_CONFLICT" reject-over-closed DIVE-2112 "$ident" \
+      "$ident is already done and was graded by '${vfier}', not by you ('${_rj_actor}'). Reopening it here would discard that grade and file the reopen under '${vfier}''s name. '${vfier}' can reopen their own grade; anyone else should raise a NEW task citing $ident."
+  fi
+  _rj_prev=$(db "SELECT COALESCE(result,'') FROM tasks WHERE id=${id};")
+  # (3) attribute to the REAL actor, never to the recorded verifier by assumption.
+  local fb_txt="❌ ${_rj_actor} rejected (iteration ${iter}): ${feedback:-no feedback given}"
+  # (4) never silently discard a landed record.
+  if [[ "$_rj_st" == 'done' && -n "$_rj_prev" ]]; then
+    fb_txt="${fb_txt}"$'\n'"--- superseded result (DIVE-2112, preserved) ---"$'\n'"${_rj_prev}"
+  fi
   # DIVE-1495: a reject supersedes any still-open need-gate on this task. Leaving
   # it 'pending' (need_answered_at NULL) let the DIVE-1490 re-nag ladder keep
   # firing a question the reject already mooted (CNCL-9: lodar was re-nagged AFTER
