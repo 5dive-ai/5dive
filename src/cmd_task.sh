@@ -1449,6 +1449,19 @@ _task_status_cmd() {
   done
   [[ ${#positional[@]} -gt 0 ]] || fail "$E_USAGE" "usage: 5dive task $verb <id|DIVE-N> [--result=<text>] [--notify]"
   resolve_task_id "${positional[0]}"; local id="$RESOLVED_TASK_ID" ident="$RESOLVED_TASK_IDENT"
+  # DIVE-2059: 'task start' on a recurring TEMPLATE was never meaningful — it
+  # sets status='in_progress', and post-DIVE-2055 the materializer's fire
+  # predicate requires status='todo', so this silently retired the template's
+  # schedule (no error, no output) and dropped it from the default
+  # `task ls --recurring` listing too (same live predicate). cancel/block/park
+  # on a template ARE the real, intentional stop levers (that's the DIVE-2055
+  # fix) and must keep working — this refuses ONLY the meaningless 'start' verb.
+  if [[ "$verb" == "start" ]]; then
+    local _tpl_kind; _tpl_kind=$(db "SELECT kind FROM tasks WHERE id=${id};")
+    if [[ "$_tpl_kind" == "recurring" ]]; then
+      policy_refuse "$E_VALIDATION" start-on-recurring-template DIVE-2059 "$ident" "$ident is a recurring TEMPLATE (kind='recurring'), not a worked task — 'task start' has no meaning here and would silently stop it firing (the materializer only fires status='todo' templates, DIVE-2055/DIVE-2059). To stop the template use 'task cancel $ident', 'task block $ident --by=<id>', or 'task park $ident --reason=<why> --wake=<when>'. To work an instance it already fired, start that materialized child task instead."
+    fi
+  fi
   # DIVE-1375: fail-loud preflight — surface identity/auth/repo gaps at `start`
   # BEFORE the agent burns a turn discovering them mid-task. Advisory only
   # (never blocks the start); runs from the caller's cwd.

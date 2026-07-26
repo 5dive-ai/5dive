@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.16.3 — fix(task): `task start` on a recurring TEMPLATE silently killed the driver, post-DIVE-2055 (DIVE-2059) (2026-07-26)
+
+DIVE-2055 made the materializer's fire predicate require `status='todo'`, which is what
+finally made `cancel`/`block`/`park` real stop levers on a template. It also created a new
+failure mode: `_task_status_cmd` had no `kind='recurring'` guard, so `task start
+<template-ident>` set `status='in_progress'` — a status the materializer never fires on —
+with no error and no output. The template just stopped firing, and since `task ls
+--recurring` now also defaults to the live predicate, the stopped template vanished from
+the default listing too; only `--recurring --all` still showed it.
+
+- `_task_status_cmd` now refuses `start` when the target row is `kind='recurring'`,
+  naming the real stop levers (`cancel`/`block`/`park`) in the refusal. `cancel`/`block`/
+  `park` on a template are untouched — those are the DIVE-2055 stop levers and remain the
+  only meaningful way to retire one.
+- New `tests/task_start_recurring_guard_unit.sh` (7/7): start-on-template is refused with
+  status/schedule intact, cancel/block on a template still work, start on an ordinary task
+  is unchanged. Full `tests/task_*_unit.sh` and `tests/heartbeat_*_unit.sh` suites re-run
+  clean (the pre-existing `task_deliver_merge_gate_unit.sh` Tb/Tc failure is unrelated —
+  reproduces identically on `origin/main` before this change).
+
 ## 0.16.2 — fix(selfcheck): harness-verdicts reported PASS having probed ZERO harnesses (DIVE-2061) (2026-07-26)
 
 Found by main dogfooding the freshly-rolled 0.16.0 on the live control plane, minutes
