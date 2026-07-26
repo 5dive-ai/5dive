@@ -443,6 +443,41 @@ CREATE TABLE IF NOT EXISTS policy_refusals (
 );
 CREATE INDEX IF NOT EXISTS policy_refusals_ts_idx ON policy_refusals(ts, policy);
 
+-- DIVE-1923: the ship ledger — the capture path behind `proof scorecard`'s
+-- "autonomous rollback rate". Nothing recorded an agent UNDOING work it had
+-- already shipped: `task reject` is a VERIFIER bounce on the maker->verifier
+-- rail, which happens BEFORE a ship and is a different event, so the metric had
+-- no source at all and a rendered 0.0% would have read as "we never roll back".
+--   Numerator and denominator come from the SAME instrument. A rate whose two
+-- halves are sourced differently cannot report its own coverage; both kinds of
+-- row here are written by the one site that observes a ship, `5dive push`. The
+-- rollback half needs no new discipline from anyone because git itself writes
+-- "This reverts commit <sha>" into a revert's message.
+--   kind    ship|rollback (a revert is BOTH: it is a commit that was shipped)
+--   reverts for kind='rollback', the sha the commit undoes
+--   self    1 ONLY when that sha is itself a recorded ship — i.e. we can PROVE
+--           the fleet undid its own shipped work. Every commit here is authored
+--           `lodar` by policy, so authorship can never establish that. An
+--           unprovable revert is stored with self=0 and surfaced as coverage,
+--           never silently promoted into the numerator.
+-- Append-only, never updated or deleted, never referenced by tasks/projects so
+-- it cannot touch the queue. The UNIQUE index is what makes re-pushing the same
+-- branch idempotent rather than a way to inflate the denominator.
+CREATE TABLE IF NOT EXISTS ship_events (
+  id      INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts      TEXT NOT NULL DEFAULT (datetime('now')),
+  kind    TEXT NOT NULL,
+  actor   TEXT,
+  ident   TEXT,
+  repo    TEXT,
+  branch  TEXT,
+  sha     TEXT NOT NULL,
+  reverts TEXT,
+  self    INTEGER NOT NULL DEFAULT 0
+);
+CREATE UNIQUE INDEX IF NOT EXISTS ship_events_kind_sha_idx ON ship_events(kind, sha);
+CREATE INDEX IF NOT EXISTS ship_events_ts_idx ON ship_events(ts, kind);
+
 -- OSS-21: fleet-wide policy prefs as a tiny key/value store. Currently holds
 -- precedent_autoclear (on|off, default off when the row is absent) — the switch
 -- that lets a resolved tier-1 gate clear itself from proven human precedent.
@@ -764,6 +799,55 @@ END;
 CREATE INDEX IF NOT EXISTS tasks_project_idx ON tasks(project_key);
 COMMIT;
 MIG
+  fi
+
+  # DIVE-1923: the ship ledger, for stores that predate it. Guarded on
+  # ship_events ITSELF, never on a neighbouring table — DIVE-1922 shipped its
+  # migration nested under a `policy_refusals`-absent check, so on every box that
+  # already had that table the block never ran and the metric read NO DATA
+  # forever, indistinguishable from "nothing has been reverted yet". Every box
+  # alive today HAS policy_refusals, so nesting this one there would reproduce
+  # that bug exactly. Guard on the table you are creating.
+  local has_ship_events
+  has_ship_events=$(sqlite3 -cmd ".timeout 5000" "$TASKS_DB" \
+    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='ship_events' LIMIT 1;" 2>/dev/null)
+  if [[ "$has_ship_events" != "1" ]]; then
+    sqlite3 -cmd ".timeout 5000" "$TASKS_DB" <<'SHIPMIG' >/dev/null 2>&1 || true
+-- DIVE-1923: the ship ledger — the capture path behind `proof scorecard`'s
+-- "autonomous rollback rate". Nothing recorded an agent UNDOING work it had
+-- already shipped: `task reject` is a VERIFIER bounce on the maker->verifier
+-- rail, which happens BEFORE a ship and is a different event, so the metric had
+-- no source at all and a rendered 0.0% would have read as "we never roll back".
+--   Numerator and denominator come from the SAME instrument. A rate whose two
+-- halves are sourced differently cannot report its own coverage; both kinds of
+-- row here are written by the one site that observes a ship, `5dive push`. The
+-- rollback half needs no new discipline from anyone because git itself writes
+-- "This reverts commit <sha>" into a revert's message.
+--   kind    ship|rollback (a revert is BOTH: it is a commit that was shipped)
+--   reverts for kind='rollback', the sha the commit undoes
+--   self    1 ONLY when that sha is itself a recorded ship — i.e. we can PROVE
+--           the fleet undid its own shipped work. Every commit here is authored
+--           `lodar` by policy, so authorship can never establish that. An
+--           unprovable revert is stored with self=0 and surfaced as coverage,
+--           never silently promoted into the numerator.
+-- Append-only, never updated or deleted, never referenced by tasks/projects so
+-- it cannot touch the queue. The UNIQUE index is what makes re-pushing the same
+-- branch idempotent rather than a way to inflate the denominator.
+CREATE TABLE IF NOT EXISTS ship_events (
+  id      INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts      TEXT NOT NULL DEFAULT (datetime('now')),
+  kind    TEXT NOT NULL,
+  actor   TEXT,
+  ident   TEXT,
+  repo    TEXT,
+  branch  TEXT,
+  sha     TEXT NOT NULL,
+  reverts TEXT,
+  self    INTEGER NOT NULL DEFAULT 0
+);
+CREATE UNIQUE INDEX IF NOT EXISTS ship_events_kind_sha_idx ON ship_events(kind, sha);
+CREATE INDEX IF NOT EXISTS ship_events_ts_idx ON ship_events(ts, kind);
+SHIPMIG
   fi
 
   # LOOP-7 loop_runs table — additive, gated on absence so it takes no write lock
@@ -1390,6 +1474,37 @@ _gate_closure_verify() {
   local expect; expect=$(_gate_closure_sign "$1" "$2" "$3" "$4" "$5" "$6") || return 1
   [[ -n "$expect" ]] || return 1
   _gate_proof_ct_equal "$sig" "$expect"
+}
+
+# ship_ledger_record <kind> <ident> <repo> <branch> <sha> [reverts] — DIVE-1923.
+#
+# Append one row to the ship ledger, the capture path behind `proof scorecard`'s
+# "autonomous rollback rate". Before this, nothing in the fleet recorded an agent
+# undoing its OWN shipped work: `task reject` is a verifier bounce that happens
+# before a ship, so the metric had no source and had to render an explicit
+# NO DATA marker rather than a 0.0% that would read as "we never roll back".
+#
+# `self` is computed HERE, from the ledger, and is deliberately conservative: it
+# is 1 only when the reverted sha is already a recorded ship, which is the only
+# evidence available that the fleet undid ITS OWN work. Commit authorship cannot
+# supply it — every commit we push is authored `lodar` by policy, so author would
+# mark a human's revert as ours. A revert we cannot attribute is stored with
+# self=0 and reported as coverage beside the rate, never counted in it.
+#
+# Best-effort and never fatal: a ship that fails to record must still be a ship.
+# The UNIQUE(kind, sha) index makes re-pushing a branch idempotent, so the
+# denominator counts commits shipped rather than times `push` was run.
+ship_ledger_record() {
+  local kind="$1" ident="$2" repo="$3" branch="$4" sha="$5" reverts="${6:-}"
+  local actor self=0
+  actor="${SUDO_USER:-$(id -un 2>/dev/null || echo unknown)}"
+  if [[ "$kind" == "rollback" && -n "$reverts" ]]; then
+    [[ "$(db "SELECT 1 FROM ship_events WHERE kind='ship' AND sha=$(sqlq "$reverts") LIMIT 1;" 2>/dev/null)" == "1" ]] && self=1
+  fi
+  db "INSERT OR IGNORE INTO ship_events (kind, actor, ident, repo, branch, sha, reverts, self)
+      VALUES ($(sqlq "$kind"), $(sqlq "$actor"), $(sqlq "$ident"), $(sqlq "$repo"),
+              $(sqlq "$branch"), $(sqlq "$sha"), $(sqlq "$reverts"), $self);" \
+    >/dev/null 2>&1 || true
 }
 
 # policy_refuse <exit-code> <policy-slug> <ticket> <ident> <message> — DIVE-1922.
