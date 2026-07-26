@@ -32,3 +32,8 @@ npm-debug.log*
 # from commit 8932961 — strategic removal; if anyone restores it locally,
 # don't let it accidentally get re-added to the OSS repo)
 /ui/
+
+# transient mutants written by tests/meta/harness-verdict-probe.sh during a
+# `selfcheck --full` / probe sweep. They are deleted on a clean exit; a killed run
+# leaves them behind, and `git add -A` in the same tree would commit them (it did).
+tests/.probe-*
