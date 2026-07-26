@@ -1,0 +1,67 @@
+# DIVE-2118: perform the version assignment the merge rule describes and nothing owns.
+#
+# CONTRIBUTING says a PR must not bump FIVE_VERSION — it is assigned at MERGE, by
+# merge order. Everyone follows the prohibition; nobody performs the assignment.
+# On 2026-07-26, #218/#219/#220/#221 all merged claiming 0.16.19, a version already
+# published against a different bundle. The shared-checkout updater keys off
+# FIVE_VERSION, so until a human noticed, every box kept its old binary and received
+# NONE of those fixes.
+#
+# version-uniqueness already DETECTS this, and stays. It is a post-hoc detector on a
+# shared branch: it turns main red and hands cleanup to whoever notices. This job is
+# the performer, so the detector should stop having anything to find.
+#
+# BUMP YES, TAG NO. lodar froze GitHub releases 2026-07-26 (36 versions in ~36h).
+# The freeze is on the TAG, explicitly not the bump — the bump prevents two merges
+# claiming one version and keeps the installed-bundle-matches-its-commit selfcheck
+# honest. This job MUST NEVER create a tag or a release.
+name: version-assign
+on:
+  push:
+    branches: [main]
+
+# Serialise: two merges landing together must not both compute the same successor.
+concurrency:
+  group: version-assign-main
+  cancel-in-progress: false
+
+jobs:
+  assign:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Assign a version if the bundle moved without one
+        run: |
+          before="${{ github.event.before }}"
+          zero="0000000000000000000000000000000000000000"
+          if [[ -z "$before" || "$before" == "$zero" ]] || ! git cat-file -e "$before" 2>/dev/null; then
+            echo "version-assign: no usable previous main tip (new branch or force event) — skipping."
+            exit 0
+          fi
+          git config user.name  'lodar'
+          git config user.email 'markounik@gmail.com'
+          out=$(bash scripts/version-assign.sh HEAD "$before" --apply); rc=$?
+          echo "$out"
+          if (( rc == 2 )); then
+            echo "::error::version-assign could not determine whether a bump is owed — NOT a pass, see above."
+            exit 1
+          fi
+          if ! grep -q '^version-assign: applied ' <<<"$out"; then
+            exit 0   # nothing owed; the reason is printed above
+          fi
+          git add src/header.sh 5dive 5dive.sha256
+          git commit -q -m "release: assign $(grep -m1 -oE 'FIVE_VERSION=\"[^\"]+\"' src/header.sh | sed 's/.*\"\(.*\)\"/\1/') at merge (DIVE-2118, automated)
+
+          The bundle changed on main without FIVE_VERSION moving. CONTRIBUTING
+          assigns the version at merge by merge order; this performs that step so a
+          box on the previous version is not silently left without the merged fixes
+          (the shared-checkout updater is version-triggered, not content-hash
+          triggered — DIVE-2065).
+
+          No tag and no release: those are batched, deliberately (lodar, 2026-07-26)."
+          git push origin HEAD:main
+          echo "::notice::assigned $(grep -m1 -oE 'FIVE_VERSION=\"[^\"]+\"' src/header.sh) — no tag cut, releases are batched"
