@@ -36,6 +36,9 @@ _PROOF_CRON="${_PROOF_CRON:-/etc/cron.d/5dive-proof}"
 # Where the installed cron sends the tick's output. Overridable for tests.
 _PROOF_LOG="${_PROOF_LOG:-/var/log/5dive-proof.log}"
 _PROOF_DEFAULT_REPO="https://github.com/5dive-ai/5dive.git"
+# DIVE-2051: resolved publishing identity (set by _proof_identity). Declared
+# here so `set -u` holds on every read path, including `proof status`.
+_PROOF_ID_NAME=""; _PROOF_ID_EMAIL=""; _PROOF_ID_SOURCE=""; _PROOF_ID_UNCHECKED=0
 _PROOF_METHODOLOGY_URL="https://github.com/5dive-ai/5dive/blob/main/docs/zero-human.md"
 
 _proof_pref_get() {
@@ -270,15 +273,97 @@ Methodology and limits: ${_PROOF_METHODOLOGY_URL}
 SNIP
 }
 
+# _proof_identity [user] — resolve the identity this box AUTHORS PUBLIC COMMITS
+# WITH, and record where it came from. Sets _PROOF_ID_NAME / _PROOF_ID_EMAIL /
+# _PROOF_ID_SOURCE; an empty source means nothing resolved.
+#
+# DIVE-2051. Precedence, most explicit first:
+#   1. ZH_GIT_NAME / ZH_GIT_EMAIL           env — per-invocation pin
+#   2. proof.json .identity.{name,email}    `proof on --as-name= --as-email=`
+#   3. git config --global user.{name,email} of the publishing user
+#
+# Why this is not plumbing: these commits are public and permanent. A box with
+# no identity of its own leaves the author to be resolved by whoever is holding
+# the terminal — and for an agent the most available value is the operator's
+# personal email, which Claude Code injects into every agent's system prompt by
+# default with no opt-out (anthropics/claude-code#81138). So layer 3 is the LAST
+# resort, and "nothing resolved" is a refusal, never a guess (see _proof_build).
+#
+# [user] resolves layer 3 AS that user instead of the caller: `proof on` runs as
+# root while the cron publishes as --user, and root's ~/.gitconfig says nothing
+# about theirs. Checking as the caller is how you get a green configure and a
+# broken 02:00 publish.
+_proof_identity() {
+  local as="${1:-}" gname="" gemail="" cname cemail
+  _PROOF_ID_UNCHECKED=0
+  if [ -n "$as" ] && [ "$as" != "$(id -un 2>/dev/null)" ]; then
+    if [ "$(id -u)" = "0" ] && command -v runuser >/dev/null 2>&1; then
+      gname="$(runuser -u "$as" -- git config --global user.name 2>/dev/null || true)"
+      gemail="$(runuser -u "$as" -- git config --global user.email 2>/dev/null || true)"
+    else
+      # Another user's ~/.gitconfig is unreadable without root. Record that the
+      # check did not run — reporting "unset" here would be a false alarm about
+      # a box that is fine, which is the same defect as a false green pointed
+      # the other way: a claim about a check that never happened.
+      _PROOF_ID_UNCHECKED=1
+    fi
+  else
+    gname="$(git config --global user.name 2>/dev/null || true)"
+    gemail="$(git config --global user.email 2>/dev/null || true)"
+  fi
+  cname="$(_proof_pref_get '.identity.name')"
+  cemail="$(_proof_pref_get '.identity.email')"
+
+  _PROOF_ID_NAME="${ZH_GIT_NAME:-${cname:-$gname}}"
+  _PROOF_ID_EMAIL="${ZH_GIT_EMAIL:-${cemail:-$gemail}}"
+  # The source is named off the EMAIL — that is the field carrying the PII.
+  if   [ -n "${ZH_GIT_EMAIL:-}" ]; then _PROOF_ID_SOURCE="env ZH_GIT_EMAIL"
+  elif [ -n "$cemail" ];           then _PROOF_ID_SOURCE="proof.json identity"
+  elif [ -n "$gemail" ];           then _PROOF_ID_SOURCE="git config --global (${as:-$(id -un 2>/dev/null)})"
+  else                                  _PROOF_ID_SOURCE=""
+  fi
+}
+
+# _proof_identity_help [user] — what to run when no identity resolved. Printed
+# on refusal and on the `proof on` warning, so the fix is never a guess either.
+_proof_identity_help() {
+  local as="${1:-$(id -un 2>/dev/null)}"
+  cat <<HELP
+proof publish: NO GIT IDENTITY CONFIGURED — refusing to author public commits
+  as an inferred identity (DIVE-2051). Nothing was published.
+  Whatever address this box happens to have lying around would otherwise become
+  the permanent, public author of the badge history. Pin one explicitly:
+
+    5dive proof on --as-name="acme status bot" --as-email="bot@users.noreply.github.com"
+    ZH_GIT_NAME=… ZH_GIT_EMAIL=… 5dive proof publish
+    (as ${as}) git config --global user.name/user.email
+
+  Prefer a role address you are content to see in public git history forever —
+  GitHub's <user>@users.noreply.github.com form is the usual choice. Do NOT
+  point it at a personal inbox just to get past this message.
+HELP
+}
+
 # _proof_build <repo> <branch> <dry> — clone the status branch, build the three
 # files from the live digest verbatim, commit + push (unless dry). Echoes the
 # one-line summary on success. Returns: 0 published, 3 already published today,
-# non-zero on failure. First-publish (orphan branch) is detected by the caller.
+# 4 no publishing identity, non-zero on other failure. First-publish (orphan
+# branch) is detected by the caller.
 _proof_build() {
   local repo="$1" branch="$2" dry="$3"
   local git_name git_email
-  git_name="${ZH_GIT_NAME:-$(git config --global user.name 2>/dev/null || true)}"
-  git_email="${ZH_GIT_EMAIL:-$(git config --global user.email 2>/dev/null || true)}"
+  _proof_identity
+  git_name="$_PROOF_ID_NAME"; git_email="$_PROOF_ID_EMAIL"
+
+  # DIVE-2051: refuse BEFORE any work, including under --dry-run — a dry run
+  # that quietly skips the check is how the box first learns it is misconfigured
+  # at 02:00 from cron. A half identity (name, no email) refuses too: git would
+  # fill the gap with a synthesized user@hostname, which is the same guess in a
+  # different costume.
+  if [ -z "$git_name" ] || [ -z "$git_email" ]; then
+    _proof_identity_help >&2
+    return 4
+  fi
 
   local self day_json week_json today now_iso cli_version
   self="$(command -v 5dive 2>/dev/null || echo "$0")"
@@ -313,8 +398,8 @@ _proof_build() {
     git checkout --quiet --orphan "$branch" || return "$E_GENERIC"
     git rm -rfq . 2>/dev/null || true
   fi
-  [ -n "$git_name" ] && git config user.name "$git_name"
-  [ -n "$git_email" ] && git config user.email "$git_email"
+  git config user.name "$git_name"
+  git config user.email "$git_email"
 
   # Build the three files from the digest output verbatim. The builder is the
   # honesty-critical core (unit-tested via tests/proof_publish_unit.sh, which
@@ -491,7 +576,15 @@ PROOFPY
     echo "$summary"
     return 0
   fi
-  git commit --quiet -m "status: $summary" || return "$E_GENERIC"
+  # DIVE-2051: the resolved identity is passed through the GIT_AUTHOR_*/
+  # GIT_COMMITTER_* env, not left to the repo config written above. Config is
+  # the WEAKER source: an exported GIT_AUTHOR_EMAIL in the publishing shell
+  # overrides it, so a box that pinned an identity could still commit as
+  # whatever the environment happened to carry. This is the one place the
+  # authored identity is decided, and it is the one we refused to guess at.
+  GIT_AUTHOR_NAME="$git_name" GIT_AUTHOR_EMAIL="$git_email" \
+  GIT_COMMITTER_NAME="$git_name" GIT_COMMITTER_EMAIL="$git_email" \
+    git commit --quiet -m "status: $summary" || return "$E_GENERIC"
   git push --quiet origin "$branch" || return "$E_GENERIC"
   echo "$summary"
   return 0
@@ -534,6 +627,12 @@ _proof_publish() {
     echo "proof: already published today for $branch, nothing to do"
     return 3
   fi
+  # DIVE-2051: rc 4 is the identity refusal. It gets its own exit class rather
+  # than the E_GENERIC catch-all so a caller (or the cron log) can tell "this
+  # box is misconfigured, and will stay misconfigured until someone pins an
+  # identity" apart from "the network flaked tonight". _proof_build already
+  # printed the how-to-fix block.
+  [ "$rc" -ne 4 ] || fail "$E_VALIDATION" "proof publish: refused — no publishing identity configured (nothing was published)"
   [ "$rc" -eq 0 ] || fail "$E_GENERIC" "proof publish: failed (rc=$rc) — nothing published"
   if [ "$first" -eq 1 ]; then
     _proof_badge_snippet "$repo" "$branch"
@@ -587,13 +686,18 @@ CRON
 # _proof_onoff <on|off|status> [--repo=] [--branch=] [--at=] — pref + cron mgmt.
 _proof_onoff() {
   local sub="$1"; shift || true
-  local repo="" branch="" hour="" user="" f; f="$(_proof_pref_file)"
+  local repo="" branch="" hour="" user="" as_name="" as_email="" f; f="$(_proof_pref_file)"
   while [ $# -gt 0 ]; do
     case "$1" in
       --repo=*)   repo="${1#*=}" ;;
       --branch=*) branch="${1#*=}" ;;
       --at=*)     hour="${1#*=}" ;;
       --user=*)   user="${1#*=}" ;;
+      # DIVE-2051: pin the identity the badge commits are authored with, on the
+      # box, in config — so it is a decision someone made once rather than
+      # whatever ambient git config the publishing user happens to carry.
+      --as-name=*)  as_name="${1#*=}" ;;
+      --as-email=*) as_email="${1#*=}" ;;
       *) fail "$E_USAGE" "proof $sub: unknown arg: $1" ;;
     esac
     shift
@@ -612,6 +716,21 @@ _proof_onoff() {
       case "$hour" in ''|*[!0-9]*) fail "$E_USAGE" "proof on: --at must be an hour 0-23" ;; esac
       { [ "$hour" -ge 0 ] && [ "$hour" -le 23 ]; } || fail "$E_USAGE" "proof on: --at must be 0-23"
       id "$user" >/dev/null 2>&1 || fail "$E_USAGE" "proof on: --user=$user is not a known system user"
+      # DIVE-2051: an --as-email that is not an address would be persisted as
+      # the permanent public author of every badge commit, so validate here
+      # rather than at 02:00. --as-name/--as-email are set together or not at
+      # all; half an identity refuses at publish time anyway.
+      if [ -n "$as_email" ] || [ -n "$as_name" ]; then
+        [ -n "$as_name" ]  || fail "$E_USAGE" "proof on: --as-email needs --as-name (both, or neither)"
+        [ -n "$as_email" ] || fail "$E_USAGE" "proof on: --as-name needs --as-email (both, or neither)"
+        case "$as_email" in
+          *@*.*) : ;;
+          *) fail "$E_VALIDATION" "proof on: --as-email=$as_email does not look like an email address" ;;
+        esac
+        _proof_pref_write --arg n "$as_name" --arg e "$as_email" \
+          '.identity={name:$n,email:$e}' \
+          || fail "$E_GENERIC" "proof on: could not persist the publishing identity to ${f} — nothing enabled"
+      fi
       _proof_pref_write --arg r "$repo" --arg b "$branch" --argjson h "$hour" --arg u "$user" \
         '.enabled=true | .repo=$r | .branch=$b | .hour=$h | .user=$u' \
         || fail "$E_GENERIC" "proof on: could not persist ${f} — nothing enabled"
@@ -629,6 +748,18 @@ _proof_onoff() {
           echo "proof: fix with:  chgrp $(id -gn "$user" 2>/dev/null || echo "$user") ${f} && chmod g+w ${f}" >&2
         fi
       fi
+      # DIVE-2051: same shape, for identity. Resolve AS the cron user (root's
+      # ~/.gitconfig says nothing about theirs) and say so now — otherwise the
+      # box looks configured and the first thing it does at ${hour}:00 is
+      # refuse. Warn, don't fail: enabling the cron is still the right outcome,
+      # and the refusal at publish time is the actual guard.
+      _proof_identity "$user"
+      if [ -z "$_PROOF_ID_NAME" ] || [ -z "$_PROOF_ID_EMAIL" ]; then
+        echo "proof: WARNING — no publishing identity resolves for ${user}; the daily publish will REFUSE until one is pinned." >&2
+        _proof_identity_help "$user" >&2
+      else
+        echo "publish identity: ${_PROOF_ID_NAME} <${_PROOF_ID_EMAIL}> (${_PROOF_ID_SOURCE})"
+      fi
       ;;
     off)
       require_root
@@ -641,9 +772,16 @@ _proof_onoff() {
       # OSS-38/39: the LOCAL autonomy badge, computed from the ledger. No clone,
       # no publish — `proof status` is read-only and never touches the network.
       local led; led="$(_proof_ledger)"
+      # DIVE-2051: resolve the publishing identity as the CRON user, not the
+      # caller — `proof status` is mostly read by someone other than the user
+      # that actually publishes, and reporting the reader's identity would be a
+      # confident answer to a question nobody asked.
+      _proof_identity "$(jq -r '.user // "root"' <<<"$cur")"
       if [ "${JSON_MODE:-0}" = 1 ]; then
         jq -c --argjson autonomy "$led" --arg wr "$(_proof_state_writable)" \
-          '{autonomy:$autonomy, enabled:(.enabled//false), publishApproved:(.publishApproved//false), repo:(.repo//null), branch:(.branch//"status"), hour:(.hour//9), lastPublished:(.lastPublished//null), lastPublishedBy:(.lastPublishedBy//null), stateWritable:($wr != "")}' <<<"$cur"
+          --arg idn "$_PROOF_ID_NAME" --arg ide "$_PROOF_ID_EMAIL" --arg ids "$_PROOF_ID_SOURCE" \
+          --argjson idu "$_PROOF_ID_UNCHECKED" \
+          '{autonomy:$autonomy, enabled:(.enabled//false), publishApproved:(.publishApproved//false), repo:(.repo//null), branch:(.branch//"status"), hour:(.hour//9), lastPublished:(.lastPublished//null), lastPublishedBy:(.lastPublishedBy//null), stateWritable:($wr != ""), identity:(if $ids == "" then null else {name:$idn,email:$ide,source:$ids} end), identityUnchecked:($idu == 1)}' <<<"$cur"
         return 0
       fi
       local _ship _ask _apct
@@ -680,6 +818,18 @@ _proof_onoff() {
         echo "last published: ${last} (${staleness})${by}"
       else
         echo "last published: never"
+      fi
+      # DIVE-2051: WHAT the badge commits get authored as, and from where. An
+      # unset identity is a live misconfiguration on any box with the publisher
+      # on, so it is stated on the status line rather than discovered at 02:00.
+      if [ -n "$_PROOF_ID_SOURCE" ]; then
+        echo "publish identity: ${_PROOF_ID_NAME} <${_PROOF_ID_EMAIL}> (${_PROOF_ID_SOURCE})"
+      elif [ "$_PROOF_ID_UNCHECKED" = 1 ]; then
+        echo "publish identity: not checked — reading ${user_c}'s git config needs root (sudo 5dive proof status)"
+      elif [ "$enabled" = "true" ]; then
+        echo "publish identity: UNSET ⚠ — publish will REFUSE (5dive proof on --as-name=… --as-email=…)"
+      else
+        echo "publish identity: unset (pin one before enabling: --as-name=… --as-email=…)"
       fi
       # DIVE-1888: "never" is ambiguous — it reads identically whether nothing
       # has ever published or every publish was unable to record that it did.
@@ -1046,6 +1196,7 @@ cmd_proof() {
 usage: 5dive proof status [--json]                    # LOCAL autonomy badge + config (no network)
        5dive proof scorecard [--json] [--7d] [--by=tier|class]   # LOCAL multi-dim metrics by risk tier
        5dive proof on --repo=<url> [--branch=status] [--at=<0-23>] [--user=<u>]
+                      [--as-name=<n> --as-email=<e>]   # identity commits are authored with
        5dive proof off
        5dive proof publish [--dry-run] [--repo=<url>] [--branch=<b>]
        5dive proof tick        # cron driver; gated on the pref
@@ -1072,6 +1223,16 @@ files an approval gate to lodar and BLOCKS — no badge goes live without lodar'
 tap. `proof on/off` toggle the daily publisher; `--user` sets the cron's
 effective user (default root), which must own the box's git push credentials or
 the nightly push fails silently as visible staleness. See docs/zero-human.md.
+
+PUBLISHING IDENTITY (DIVE-2051): these are public, permanent commits, so the
+author is never inferred. It resolves ZH_GIT_NAME/ZH_GIT_EMAIL (env) > the
+identity pinned by `proof on --as-name= --as-email=` > the publishing user's
+`git config --global` — and if none of those is set, `proof publish` REFUSES
+instead of authoring as whatever address the box has lying around. Pin a role
+address (e.g. <user>@users.noreply.github.com), not a personal inbox: on a box
+where an agent publishes, the most available address is the operator's own,
+which Claude Code puts in every agent's prompt by default. `proof status` shows
+the resolved identity and its source.
 HELP
       ;;
     *) fail "$E_USAGE" "proof: unknown subcommand: ${1:-} (publish|on|off|status|tick)" ;;

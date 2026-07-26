@@ -37,6 +37,48 @@ create_agent_user() {
   else
     rm -f "/etc/sudoers.d/${user}"
   fi
+  seed_agent_git_identity "$name"
+}
+
+# DIVE-2051: give every agent user an EXPLICIT, non-personal git identity at
+# provisioning time, so who authors a commit is never left to be inferred.
+#
+# The gap this closes: git refuses to commit with no identity ("Please tell me
+# who you are"), which puts an agent one step from resolving one itself — and
+# the most available value on the box is the operator's personal email, because
+# Claude Code injects it into every agent's system prompt BY DEFAULT with no
+# opt-out (anthropics/claude-code#81138, where it bit a user upstream by
+# overwriting their repo's anonymized commit email with their personal one). A
+# box with a deliberate identity never reaches that step. This is not
+# hypothetical downstream: `5dive proof publish` authors PUBLIC commits with
+# whatever identity it finds, on a daily cron.
+#
+# Deliberately NON-CLOBBERING: an identity the operator already set always wins,
+# on a fresh create and on a re-run. Deliberately synthetic and obviously so —
+# nobody should mistake it for a real mailbox — and a repo with an author policy
+# of its own can still override it per-checkout (`git config user.email`).
+_agent_git_identity_email() { printf 'agent-%s@agents.noreply.5dive.ai\n' "$1"; }
+
+seed_agent_git_identity() {
+  local name="$1" user="agent-${1}"
+  command -v git >/dev/null 2>&1 || return 0
+  id -u "$user" &>/dev/null || return 0
+  local have_name have_email
+  have_name="$(sudo -u "$user" -H git config --global user.name 2>/dev/null || true)"
+  have_email="$(sudo -u "$user" -H git config --global user.email 2>/dev/null || true)"
+  [[ -n "$have_name" && -n "$have_email" ]] && return 0
+  # A half-set identity is completed rather than left alone: git fills the
+  # missing half from the environment (user@hostname), which is the same guess
+  # this exists to prevent.
+  if [[ -z "$have_name" ]]; then
+    sudo -u "$user" -H git config --global user.name "5dive agent ${name}" 2>/dev/null \
+      || warn "could not set a git identity for ${user}; it will have to resolve one itself before it can commit, and the most available value is the operator's personal email (DIVE-2051)"
+  fi
+  if [[ -z "$have_email" ]]; then
+    sudo -u "$user" -H git config --global user.email "$(_agent_git_identity_email "$name")" 2>/dev/null \
+      || warn "could not set a git email for ${user} (DIVE-2051)"
+  fi
+  return 0
 }
 
 # DIVE-1002: an 'admin' agent can run the company, not `rm -rf` the box. Its sudo

@@ -111,3 +111,36 @@ to edit a number, and re-runs are idempotent per day. On your first publish the
 verb prints the copy-paste README badge markdown pointing at YOUR status branch.
 The badge renders from your repo, links back here, and, like ours, moves only
 when the pipeline runs. Bad weeks and fresh-box zeros publish exactly the same.
+
+### Who the commits are authored as
+
+The publisher writes **public, permanent commits** to your status branch, so it
+never infers the author. Pin one explicitly:
+
+```sh
+# saved on the box, used by the daily cron:
+sudo 5dive proof on --repo=https://github.com/<you>/<repo>.git \
+  --as-name="<you> status bot" --as-email="<user>@users.noreply.github.com"
+
+# or per-invocation:
+ZH_GIT_NAME="<you> status bot" ZH_GIT_EMAIL="<user>@users.noreply.github.com" \
+  5dive proof publish
+```
+
+Resolution order is `ZH_GIT_NAME`/`ZH_GIT_EMAIL` → the identity saved by
+`proof on --as-name/--as-email` → the publishing user's `git config --global`.
+**If none of those is set, `proof publish` refuses and publishes nothing** — it
+will not author public commits as whatever address the box happens to have
+lying around. `5dive proof status` shows the resolved identity and which of the
+three it came from.
+
+Prefer a role address you are content to see in public git history forever;
+GitHub's `<user>@users.noreply.github.com` form is the usual choice. This
+matters more on a box you let agents drive: Claude Code puts the operator's
+email in every agent's system prompt by default with no opt-out
+([anthropics/claude-code#81138](https://github.com/anthropics/claude-code/issues/81138)),
+so on a box with no identity of its own, a personal address is the most
+available thing for an agent to resolve one with. For the same reason `5dive
+agent create` gives each agent user a synthetic
+`agent-<name>@agents.noreply.5dive.ai` identity at provisioning time, unless
+that user already has one — an identity you set is never overwritten.
