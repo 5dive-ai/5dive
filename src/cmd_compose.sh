@@ -246,7 +246,7 @@ _compose_write_role_md() {
   fi
 
   # Managers (reports_to) and direct reports (who lists $name as a manager).
-  local -a mgrs reports
+  local -a mgrs=() reports=()
   mapfile -t mgrs    < <(jq -r --arg n "$name" '.agents[$n].reports_to // empty | if type=="array" then .[] else . end' <<<"$spec")
   mapfile -t reports < <(jq -r --arg n "$name" '.agents | to_entries[] | select((.value.reports_to // empty) | if type=="array" then any(. == $n) else . == $n end) | .key' <<<"$spec")
 
@@ -326,7 +326,7 @@ _compose_wire_role() {
   _compose_write_role_md "$spec" "$name" "$spec_dir"
 
   # Seed goals into the shared task queue, assigned to the role, from its manager.
-  local -a goals
+  local -a goals=()
   mapfile -t goals < <(jq -r '(.goals // [])[]' <<<"$agent")
   local g
   for g in "${goals[@]}"; do

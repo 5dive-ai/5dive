@@ -840,7 +840,7 @@ cmd_loop_map() {
   # index-aligned result slots; scheduler caps live (non-terminal) child tasks.
   # A plain `live` counter (not ${#assoc[@]}) keeps every expansion set-u-safe
   # even when the in-flight map is momentarily empty (header runs set -euo).
-  local -a results; local i; for (( i=0; i<n; i++ )); do results[$i]="null"; done
+  local -a results=(); local i; for (( i=0; i<n; i++ )); do results[$i]="null"; done
   local -A inflight          # index->tid for currently-live children
   local -a child_ids=()
   local next=0 completed=0 ok_n=0 failed_n=0 live=0 halt="" spent="0"
@@ -959,7 +959,7 @@ cmd_loop_until_dry() {
               ${eff_ceiling}, 'running', '[]', ${now}, ${now});"
 
   local seen_keys="[]" accum="[]"      # seen-set (all keys ever) + kept items
-  local -a child_ids
+  local -a child_ids=()
   local round_no=0 empty_streak=0 exit_reason="" spent="0"
   local poll="${LOOP_POLL_SECS:-4}"
   while :; do
@@ -1050,9 +1050,9 @@ cmd_loop_collect() {
   [[ -n "$handles" ]] || fail "$E_USAGE" "loop collect: --handles=<loopId,loopId,…> required"
   [[ -z "$timeout" || "$timeout" =~ ^[1-9][0-9]*$ ]] || fail "$E_VALIDATION" "--timeout must be a positive integer (seconds)"
 
-  local -a hids; IFS=',' read -r -a hids <<< "$handles"
+  local -a hids=(); IFS=',' read -r -a hids <<< "$handles"
   # Resolve each handle → its backing task ids (index-aligned to the handle list).
-  local -a tids
+  local -a tids=()
   local h
   for h in "${hids[@]}"; do
     h="$(printf '%s' "$h" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
