@@ -34,7 +34,8 @@ done
 STATE_DIR="$TMP"; TASKS_DIR="$STATE_DIR/tasks"; TASKS_DB="$TASKS_DIR/tasks.db"
 JSON_MODE=0
 mkdir -p "$TASKS_DIR"; set +e
-audit_log() { return 0; }
+AUDIT_CALLS="$TMP/audit.calls"; : >"$AUDIT_CALLS"
+audit_log() { printf '%s\n' "$*" >>"$AUDIT_CALLS"; }
 tasks_db_init
 
 PASS=0; FAIL=0
@@ -122,6 +123,27 @@ if _org_usage 2>&1 | grep -qi 'any agent.*without sudo'; then
 else
   ok_t "the usage text no longer advertises unauthenticated writes"
 fi
+
+# --- 7. THE WRITE IS ATTRIBUTABLE ---------------------------------------------
+# require_root only bites where agents lack blanket sudo. On the control-plane host
+# they have NOPASSWD:ALL (measured 2026-07-26: `sudo -u agent-dev sudo -n -l` prints
+# "(ALL) NOPASSWD: ALL"), so `sudo 5dive org set` remains reachable by any agent and
+# the guard raises the bar rather than closing the door. What closes the gap there is
+# ATTRIBUTION: the re-parent must be a recorded act naming the real principal.
+: >"$AUDIT_CALLS"
+require_root() { :; }
+( SUDO_USER=agent-dev cmd_org_set audited-2124 --manager=dev ) >/dev/null 2>&1
+# shellcheck source=/dev/null
+source "$SRC/lib/validation.sh"
+grep -q 'org set' "$AUDIT_CALLS" && grep -q 'agent=audited-2124' "$AUDIT_CALLS" \
+  && ok_t "a privileged 'org set' writes an audit record naming the agent and the new manager" \
+  || bad_t "org set must be audited" "$(cat "$AUDIT_CALLS")"
+grep -q 'by=agent-dev' "$AUDIT_CALLS" \
+  && ok_t "...and the record names the REAL principal (SUDO_USER), not the flattened root identity" \
+  || bad_t "audit must record SUDO_USER" "$(cat "$AUDIT_CALLS")"
+grep -q 'reports_to=dev' "$AUDIT_CALLS" \
+  && ok_t "...and the resolved edge, so a self-grant is legible in the trail without diffing the table" \
+  || bad_t "audit must record the edge" "$(cat "$AUDIT_CALLS")"
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]

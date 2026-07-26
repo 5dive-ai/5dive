@@ -24812,6 +24812,16 @@ cmd_org_set() {
   (( role_set ))  && db "UPDATE agents_org SET role=$(sqlq_or_null "$role"),   updated_at=datetime('now') WHERE name=$(sqlq "$name");"
   (( title_set )) && db "UPDATE agents_org SET title=$(sqlq_or_null "$title"), updated_at=datetime('now') WHERE name=$(sqlq "$name");"
 
+  # DIVE-2124 — require_root is a hard boundary only where agents lack blanket sudo.
+  # On THIS control-plane host they have NOPASSWD:ALL (measured), so `sudo 5dive org
+  # set` stays available to any agent. Record who re-parented whom, in OUR audit trail
+  # and not only the OS journal: a self-grant on the gate-routing path should be a
+  # recorded act rather than an invisible one. SUDO_USER is the real principal, since
+  # sudo flattens every caller to EUID 0.
+  local _aud_mgr="(unchanged)"
+  if (( mgr_set )); then (( mgr_clear )) && _aud_mgr="(cleared)" || _aud_mgr="$mgr_name"; fi
+  audit_log "org set" ok 0 -- "agent=$name" "reports_to=$_aud_mgr" "by=${SUDO_USER:-root}"
+
   if (( JSON_MODE )); then
     local row; row=$(dbfmt -json "SELECT name, reports_to, role, title FROM agents_org WHERE name=$(sqlq "$name");")
     jq -cn --argjson r "$row" '{ok:true, data:($r[0])}'
@@ -24897,6 +24907,7 @@ cmd_org_rm() {
   local exists; exists=$(db "SELECT 1 FROM agents_org WHERE name=$(sqlq "$name");")
   [[ -n "$exists" ]] || fail "$E_NOT_FOUND" "agent '$name' is not placed in the org chart"
   db "DELETE FROM agents_org WHERE name=$(sqlq "$name");"
+  audit_log "org rm" ok 0 -- "agent=$name" "by=${SUDO_USER:-root}"
   ok "$name removed from org chart" '{name:$n, removed:true}' --arg n "$name"
 }
 # -------- hire (DIVE-603 / DIVE-993) — ergonomic alias for `agent create` -----
