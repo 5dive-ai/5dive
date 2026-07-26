@@ -820,8 +820,15 @@ cmd_create() {
     fi
   fi
 
-  if [[ "$channels" != "none" ]] && [[ "${TYPE_CHANNELS[$type]}" != "1" ]]; then
-    fail "$E_VALIDATION" "type '$type' does not support channels (only: claude, codex, grok, antigravity, opencode, openclaw, hermes)"
+  if [[ "$channels" != "none" ]] && [[ "${TYPE_CHANNELS[$type]:-0}" != "1" ]]; then
+    # Derive the supported list rather than hardcoding it: a hardcoded list is one
+    # more place a new type has to be registered and silently won't be (DIVE-2076).
+    local -a _ch_ok=()
+    local _t
+    for _t in "${!TYPE_CHANNELS[@]}"; do
+      [[ "${TYPE_CHANNELS[$_t]:-0}" == "1" ]] && _ch_ok+=("$_t")
+    done
+    fail "$E_VALIDATION" "type '$type' does not support channels (only: ${_ch_ok[*]})"
   fi
   # codex + grok + antigravity + opencode ship a telegram bridge only — no discord build yet.
   if [[ "$type" == "codex" || "$type" == "grok" || "$type" == "antigravity" || "$type" == "opencode" ]] \

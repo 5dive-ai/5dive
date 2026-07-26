@@ -34,7 +34,10 @@ account_types_authed() {
   local env_file="${AUTH_PROFILES_DIR}/${name}/combined.env"
   if [[ -s "$env_file" ]]; then
     for type in "${!TYPE_API_VAR[@]}"; do
-      local var="${TYPE_API_VAR[$type]}"
+      # Present by construction (iterating this map's own keys), but the
+      # absent-vs-zero contract in header.sh is deliberately exemption-free:
+      # a rule with no carve-outs is one a contributor can follow. DIVE-2076.
+      local var="${TYPE_API_VAR[$type]:-}"
       if grep -q "^${var}=" "$env_file" 2>/dev/null \
          || ([[ "$type" == "claude" ]] && grep -q "^CLAUDE_CODE_OAUTH_TOKEN=" "$env_file" 2>/dev/null); then
         # Dedup: skip if already added via per-type sentinel above.
