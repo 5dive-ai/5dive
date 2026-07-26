@@ -1,5 +1,35 @@
 # Changelog
 
+## 0.16.19 — fix(gate): audit the gate answer at the WRITE — a `decision` answer was stored with no audit event behind it (DIVE-2090) (2026-07-26)
+
+Reported three times in one day, from three directions, and each report reached for a more
+exotic mechanism than the one actually there. The measured signature was a stored, signed,
+nonce-bearing gate answer with nothing in the audit log to attribute it to — which is exactly
+the property DIVE-756 exists to provide.
+
+`cmd_task_answer` emitted `task answer gate` rows from its **pre-checks only**: the
+approval/secret/manual/access human-evidence block, and the tier-2 provenance-floor refusal.
+Neither fires for a `decision` gate below tier 2. So the answer UPDATE — which stamps
+`need_answer`, `need_answered_at`, `need_answered_by`, `need_answered_uid` and the DIVE-756
+closure signature — ran with **no audit call anywhere near it**. On the live board: **at least
+78** answered `decision` gates, not one of them auditable — measured 2026-07-26 17:16 UTC as
+`need_type='decision' AND need_answered_at IS NOT NULL AND need_answered_by NOT LIKE 'auto:%'`
+(127 across all gate types). That count drifts upward with every gate the fleet answers, so it
+is a lower bound at a moment, not a fixed fact; the finding is that it is greater than zero and
+that `decision` is our most common gate type.
+
+The divergence ran **both ways**, which is why the fix is a row at the write rather than a
+louder pre-check. The pre-check row is logged *before* the write and records that a CHECK
+passed, so an approval that clears the evidence block and then trips the tier-2 floor — or
+either `--value` usage `fail` — leaves an `ok` row behind with no answer stored at all.
+
+Fixed by emitting one row immediately after the UPDATE, for every `need_type`, reporting the
+provenance **as stored**. The write-site row is discriminated by `answered_by=`, a field no
+pre-check site carries, so "an answer was written" and "a check passed" are now separable in
+the log. Fenced on store identity like its siblings (DIVE-2054/2010) so a fixture store cannot
+mint real-looking gate rows, and `|| true` so a log that cannot be written never fails an
+answer that is already durable. The answer value is never logged.
+
 ## 0.16.18 — fix(agent): an unmeasurable sudo grant no longer renders as the genuine class "custom" (DIVE-2098) (2026-07-26)
 
 `isolation_implied_by_grant` ended in a catch-all `*) printf 'custom'`. **`custom` is a real

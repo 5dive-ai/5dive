@@ -1,0 +1,176 @@
+#!/usr/bin/env bash
+# DIVE-2090 isolated unit harness — a stored gate answer must carry an audit row.
+#
+# WHY THIS EXISTS. `cmd_task_answer` emitted `task answer gate` rows from its
+# PRE-CHECKS only: the approval/secret/manual/access human-evidence block, and
+# the tier-2 provenance-floor refusal. Neither fires for a `decision` gate below
+# tier 2, so the answer UPDATE — which stamps need_answer, need_answered_at,
+# need_answered_by, need_answered_uid and a DIVE-756 closure signature — ran with
+# NO audit event behind it at all. Scale when this landed: at least 78 answered
+# `decision` gates on the live board, none auditable (2026-07-26 17:16 UTC — a
+# lower bound at a moment, it climbs with every gate answered). That is the defect
+# reported three times (DIVE-2051 twice, DIVE-2084 once): a stored, signed,
+# nonce-bearing gate answer with nothing in the audit log to attribute it to,
+# which is precisely the property DIVE-756 exists to provide.
+#
+# The divergence ran BOTH ways, which is why the fix is a row at the WRITE and
+# not a louder pre-check: the pre-check row is logged BEFORE the write and says
+# a CHECK passed, so an approval that clears the evidence block and then trips
+# the tier-2 floor (or one of the two `--value` usage `fail`s) leaves an `ok`
+# row with no answer stored.
+#
+# What is pinned here:
+#   1. LIVENESS: a tier-1 `decision` answer both STORES the answer and emits a
+#      `task answer gate` row — the case that produced nothing before this fix;
+#   2. the row is the WRITE-SITE row, discriminated by `answered_by=` (a field
+#      no pre-check site carries) and it reports the provenance AS STORED;
+#   3. NON-VACUITY the other way: a refused tier-2 answer stores NOTHING and
+#      emits NO `answered_by=` row — the write-site row cannot appear without a
+#      write, so its presence is evidence of an answer, not of an attempt;
+#   4. the row is fenced on STORE IDENTITY (DIVE-2054/2010): off the prod store
+#      it is withheld and the withholding is ANNOUNCED, never silent. We diff
+#      the FENCE'S OWN allow/withhold decision, not the resulting DB row —
+#      measuring the row would measure the stub;
+#   5. the real fleet audit log is never touched by this suite, whichever case
+#      runs and whatever $EUID this suite happens to run under.
+# Run: bash tests/gate_answer_audit_unit.sh   (no root, no network)
+set -uo pipefail
+cd "$(dirname "$0")/.."
+SRC=src
+TMP="$(mktemp -d /tmp/gate-answer-audit.XXXXXX)"
+trap 'rm -rf "$TMP"' EXIT
+
+# shellcheck disable=SC1090
+for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh \
+         lib/agent_setup.sh lib/state.sh lib/audit.sh lib/registry.sh \
+         lib/tasks_db.sh cmd_task.sh cmd_org.sh cmd_project.sh; do
+  source "$SRC/$f"
+done
+
+# Suite guard: remember the REAL log's length up front, so the check at the
+# bottom fails if THIS run grew it (same shape as
+# tests/audit_task_store_fence_unit.sh).
+REALLOG=/var/log/5dive/agent-audit.log
+REALLOG_OFFSET=0
+[[ -r "$REALLOG" ]] && REALLOG_OFFSET=$(wc -c <"$REALLOG" 2>/dev/null || echo 0)
+
+STATE_DIR="$TMP"; TASKS_DIR="$STATE_DIR/tasks"; TASKS_DB="$TASKS_DIR/tasks.db"
+JSON_MODE=1
+mkdir -p "$TASKS_DIR"
+set +e   # AFTER sourcing: header.sh turns `set -e` back on.
+tasks_db_init
+
+PASS=0; FAIL=0
+ok_t()  { PASS=$((PASS+1)); printf 'ok   - %s\n' "$1"; }
+bad_t() { FAIL=$((FAIL+1)); printf 'FAIL - %s\n   %s\n' "$1" "${2:-}"; }
+addt()  { ( cmd_task_add "$@" ) 2>/dev/null | jq -r '.data.id'; }
+
+AUDIT_CALLS="$TMP/audit.calls"; : >"$AUDIT_CALLS"
+audit_log() { printf '%s\n' "$*" >>"$AUDIT_CALLS"; }
+# Preconditions, not observables: never ping a channel, and keep the tier-2
+# floor switched on so case 3 is deterministic on any box.
+task_need_notify() { return 0; }
+_gate_proof_enforced() { return 0; }
+reset() { : >"$AUDIT_CALLS"; unset _TASK_STORE_AUDIT_FENCED; }
+
+nat() { db "SELECT COALESCE(need_answered_at,'') FROM tasks WHERE id=${1};"; }
+nby() { db "SELECT COALESCE(need_answered_by,'') FROM tasks WHERE id=${1};"; }
+# The write-site row is the one carrying `answered_by=`; no pre-check site does.
+writerows() { grep -c 'task answer gate.*answered_by=' "$AUDIT_CALLS"; }
+
+# --- 1+2. ON the prod store: a tier-1 decision answer audits at the write -----
+# This is the exact shape that produced a stored answer and zero audit rows.
+reset
+export FIVEDIVE_PROD_TASKS_DB="$TASKS_DB"        # active store IS prod -> allowed
+t1=$(addt --assignee=dev -- "fixture decision gate")
+cmd_task_need "$t1" --type=decision --options="A|B" --recommend="A" \
+  --ask="pick one" --tier=1 >/dev/null 2>&1
+cmd_task_answer "$t1" --value="B" --human >/dev/null 2>&1
+STORED_AT=$(nat "$t1"); STORED_BY=$(nby "$t1")
+if [[ -n "$STORED_AT" ]]; then
+  ok_t "tier-1 decision answer is STORED (liveness — the path under test ran)"
+else
+  bad_t "answer was not stored, so nothing below measures the fix" "at='$STORED_AT'"
+fi
+if [[ "$(writerows)" == "1" ]]; then
+  ok_t "a stored tier-1 decision answer emits exactly one write-site audit row"
+else
+  bad_t "stored answer must emit ONE write-site audit row" \
+        "count=$(writerows) calls=$(cat "$AUDIT_CALLS")"
+fi
+ROW=$(grep 'task answer gate.*answered_by=' "$AUDIT_CALLS" | head -1)
+if [[ "$ROW" == *"answered_by=$STORED_BY"* && -n "$STORED_BY" ]]; then
+  ok_t "the row reports the provenance AS STORED (answered_by=$STORED_BY)"
+else
+  bad_t "row must echo the stored need_answered_by" "stored='$STORED_BY' row='$ROW'"
+fi
+if [[ "$ROW" == *"type=decision"* && "$ROW" == *"task="* ]]; then
+  ok_t "the row names the gate type and the task"
+else
+  bad_t "row must name type + task" "row='$ROW'"
+fi
+if grep -q 'task answer gate.*value=' "$AUDIT_CALLS"; then
+  bad_t "the answer VALUE must never reach the fleet audit log" "$ROW"
+else
+  ok_t "the answer value is not logged"
+fi
+
+# --- 3. NON-VACUITY: a REFUSED tier-2 answer writes nothing and audits no ----
+#        write-site row. The refusal `fail`s, so run it in a subshell.
+reset
+t2=$(addt --assignee=dev -- "fixture hard gate")
+cmd_task_need "$t2" --type=decision --options="A|B" --recommend="A" \
+  --ask="spend money on ads" --tier=2 >/dev/null 2>&1
+( cmd_task_answer "$t2" --value="A" ) >/dev/null 2>&1
+RC=$?
+if [[ "$RC" != "0" && -z "$(nat "$t2")" ]]; then
+  ok_t "a non-human tier-2 answer is refused and stores nothing"
+else
+  bad_t "tier-2 floor must refuse and store nothing" "rc=$RC at='$(nat "$t2")'"
+fi
+if [[ "$(writerows)" == "0" ]]; then
+  ok_t "a refused answer emits NO write-site row (row implies a write)"
+else
+  bad_t "write-site row appeared without a write" "$(cat "$AUDIT_CALLS")"
+fi
+if grep -q 'task answer gate.*reason=non-human answer on tier-2 floor' "$AUDIT_CALLS"; then
+  ok_t "the refusal still audits through its own (pre-check) row"
+else
+  bad_t "the tier-2 refusal row went missing" "$(cat "$AUDIT_CALLS")"
+fi
+
+# --- 4. OFF the prod store: the row is fenced, and the fence ANNOUNCES it -----
+reset
+export FIVEDIVE_PROD_TASKS_DB="$TMP/somewhere-else/tasks.db"
+t3=$(addt --assignee=dev -- "fixture off-store gate")
+cmd_task_need "$t3" --type=decision --options="A|B" --recommend="A" \
+  --ask="pick one" --tier=1 >/dev/null 2>&1
+reset
+cmd_task_answer "$t3" --value="B" --human >"$TMP/off.out" 2>"$TMP/off.err"
+if [[ -n "$(nat "$t3")" ]]; then
+  ok_t "off the prod store the answer still lands (the fence gates the LOG only)"
+else
+  bad_t "the fence must not cost the answer itself" "at='$(nat "$t3")'"
+fi
+if [[ "$(writerows)" == "0" ]]; then
+  ok_t "off the prod store the write-site row is WITHHELD"
+else
+  bad_t "fixture store leaked a gate-answer row" "$(cat "$AUDIT_CALLS")"
+fi
+if grep -q 'telemetry withheld' "$TMP/off.err" && grep -q 'DIVE-2010' "$TMP/off.err"; then
+  ok_t "the withholding is ANNOUNCED, never silent"
+else
+  bad_t "a silent fence is the same fail-open shape as no fence" "$(cat "$TMP/off.err")"
+fi
+
+# --- 5. suite guard: the real fleet log must be untouched --------------------
+NOW_OFFSET=0
+[[ -r "$REALLOG" ]] && NOW_OFFSET=$(wc -c <"$REALLOG" 2>/dev/null || echo 0)
+if [[ "$NOW_OFFSET" == "$REALLOG_OFFSET" ]]; then
+  ok_t "this suite wrote nothing to the real fleet audit log"
+else
+  bad_t "suite grew the REAL audit log" "$REALLOG_OFFSET -> $NOW_OFFSET"
+fi
+
+printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
+[[ "$FAIL" -eq 0 ]]

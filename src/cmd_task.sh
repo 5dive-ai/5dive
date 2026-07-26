@@ -5813,6 +5813,44 @@ cmd_task_answer() {
     db "UPDATE tasks SET need_answer=$(sqlq "$value"), need_answered_at=$(sqlq "$_ts"), need_answered_by=$(sqlq "$answered_by"), need_answered_uid=${_uidsql}, need_answer_sig=$(sqlq "$_sig") WHERE id=${id};"
   fi
 
+  # DIVE-2090: audit the answer AT THE WRITE, for EVERY need_type. Until now the
+  # only `task answer gate` rows came from the PRE-CHECKS above — the
+  # approval/secret/manual/access evidence block and the tier-2 floor refusal —
+  # so a `decision` gate, and any gate that is neither one of those four types
+  # nor tier-2-refused, stored need_answer/at/by/uid/sig with NO audit event
+  # behind it at all. That is the reported defect (three instances on DIVE-2051 /
+  # DIVE-2084): a stored, signed, nonce-bearing gate answer that the audit log
+  # cannot account for, which is exactly the property DIVE-756 exists to provide.
+  # Scale when this landed: AT LEAST 78 answered `decision` gates on the live
+  # board, none of them auditable (2026-07-26 17:16 UTC; need_type='decision' AND
+  # need_answered_at IS NOT NULL AND need_answered_by NOT LIKE 'auto:%'; 127
+  # across all types). A lower bound at a moment, not a fixed fact — it climbs
+  # with every gate the fleet answers.
+  #
+  # The divergence ran BOTH ways, so this is not just a missing row. The
+  # pre-check rows are emitted BEFORE the write and report a CHECK outcome: an
+  # approval that passes the evidence block and then trips the tier-2 floor, or
+  # hits the `--value is required` / secret `--value` usage `fail` just above,
+  # leaves an `ok` row behind with no answer stored. This row is emitted AFTER
+  # the UPDATE and reports the provenance AS STORED, so `task answer gate` at
+  # last means "an answer was written" rather than "a check passed". The two are
+  # distinguishable by the `answered_by=` field, which only this site carries.
+  #
+  # Fenced like its sibling call sites (DIVE-2054): a row built from live
+  # TASKS_DB state must not be written into the fleet audit log by a fixture
+  # store. `|| true` because the write has ALREADY landed — an audit log that
+  # cannot be written must never fail an answer that is already durable (a
+  # missing row is the defect we are fixing, but losing the answer would be
+  # worse, and the caller has no way to retry a half-applied answer). NEVER logs
+  # $value: a secret gate stores nothing, and a decision answer is the human's
+  # prose, neither of which belongs in the fleet log.
+  local _caller4; _caller4=$(id -un 2>/dev/null || echo '?')
+  _task_store_audit_log "task answer gate" ok 0 -- \
+    "task=$ident" "type=$nt" "tier=${gtier:-}" "answered_by=$answered_by" \
+    "uid=${_uid:-}" "sig=$([[ -n "$_sig" ]] && echo present || echo absent)" \
+    "human=$human" "lead_clear=$_lead_clear" "cp_ok=$_cp_ok" \
+    "caller=$_caller4" "sudo_uid=${SUDO_UID:-}" || true
+
   # DIVE-909: a standalone MANUAL gate answered "done" is the human saying "this
   # is handled / complete" — close the task as DONE, not back to todo. Without
   # this a park-marker holding COMPLETED work had no honest close: the agent
