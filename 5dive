@@ -8317,12 +8317,39 @@ cmd_list() {
     done
     _hc_hb=$(jq -r --arg n "$name" '.agents[$n].heartbeat.enabled // false' <<<"$reg" 2>/dev/null || echo false)
     [[ "$_hc_hb" == "true" ]] || hasleep="true"
+    # DIVE-2088: measure the ENFORCED sudo grant here too. DIVE-2079 fixed the
+    # per-agent DRILL-DOWN (`agent info`), but `list` is the SURVEY surface — the
+    # command you run to notice something is off, not the one you run once you
+    # already suspect it. It shipped `isolation` (the stored label) in --json with
+    # no measurement beside it, so three genuinely different privilege levels
+    # rendered identically to the reader most likely to be scanning for the
+    # difference. Same instrument as `info` on purpose: a second, cheaper-but-
+    # weaker measurement under a friendlier name would recreate the exact defect
+    # DIVE-2079 was worth shipping to remove.
+    #
+    # Cost: for a NON-root caller sudo_grant_lines never spawns sudo for a peer
+    # (it can only `sudo -l` itself), so this is a file-read per agent and every
+    # peer honestly reads `unknown`. Only a root caller pays one `sudo -l -U` per
+    # agent, and only a root caller can get a real answer for a peer.
+    # `|| true`: an unmeasurable grant is a reported `unknown`, never a failed list.
+    local _sg _sg_class _sg_runas _sg_extra _sg_implied
+    _sg=$(agent_sudo_grant "agent-${name}" || true)
+    [[ -n "$_sg" ]] || _sg="unknown|-|0"
+    _sg_class="${_sg%%|*}"
+    _sg_runas="${_sg#*|}"; _sg_runas="${_sg_runas%%|*}"
+    _sg_extra="${_sg##*|}"
+    _sg_implied=$(isolation_implied_by_grant "$_sg_class")
     enriched=$(jq -c --arg n "$name" --arg a "$active" --arg e "$sub" --argjson b2b "$b2b" \
       --arg model "$amodel" --arg effort "$aeffort" \
       --argjson hdeaf "$hdeaf" --argjson hasleep "$hasleep" \
+      --arg sgClass "$_sg_class" --arg sgRunas "$_sg_runas" \
+      --arg sgExtra "$_sg_extra" --arg sgImplied "$_sg_implied" \
       '.[$n] = {active: $a, enabled: $e, botToBotEnabled: $b2b,
                 model: (if $model == "" then null else $model end),
                 effort: (if $effort == "" then null else $effort end),
+                sudo: {grant: $sgClass, runas: $sgRunas, impliedIsolation: $sgImplied,
+                       measured: ($sgClass != "unknown"),
+                       extraEntries: ($sgExtra == "1")},
                 health: {deaf: $hdeaf, asleep: $hasleep}}' <<<"$enriched")
   done
   local merged
@@ -8341,6 +8368,13 @@ cmd_list() {
     botToBotEnabled: ($live[.key].botToBotEnabled // false),
     model: ($live[.key].model // null),
     effort: ($live[.key].effort // null),
+    # DIVE-2088: same shape `agent info` reports, so one schema serves both
+    # readers. `isolation` above is the stored LABEL; `sudo` here is the MEASURED
+    # grant; `diverges` is true only when a REAL measurement contradicts the
+    # label — `unknown` is never divergence, it is absence of evidence.
+    sudo: (($live[.key].sudo // {grant: "unknown", runas: "-", impliedIsolation: "custom",
+                                 measured: false, extraEntries: false}) as $s
+           | $s + {diverges: ($s.measured and $s.impliedIsolation != (.value.isolation // "admin"))}),
     health: ($live[.key].health // null)
   })' <<<"$reg")
   if (( JSON_MODE )); then
@@ -8348,9 +8382,30 @@ cmd_list() {
   else
     echo "$merged" | jq -r '
       if length == 0 then "no agents" else
-        (["NAME","TYPE","CHANNELS","PROFILE","ACTIVE","ENABLED"] | @tsv),
-        (.[] | [(.name + (if (.heartbeat.enabled // false) then " ∿" + ((.heartbeat.everyMin // 30)|tostring) + "m" else "" end)), .type, .channels, (.authProfile // "-"), .active, .enabled] | @tsv)
+        (["NAME","TYPE","CHANNELS","PROFILE","SUDO","ACTIVE","ENABLED"] | @tsv),
+        (.[] | [(.name + (if (.heartbeat.enabled // false) then " ∿" + ((.heartbeat.everyMin // 30)|tostring) + "m" else "" end)), .type, .channels, (.authProfile // "-"),
+                (if (.sudo.measured | not) then "unknown"
+                 else .sudo.grant + (if .sudo.diverges then "!" else "" end) + (if .sudo.extraEntries then "+" else "" end) end),
+                .active, .enabled] | @tsv)
       end' | column -t -s $'\t'
+    # DIVE-2088: the SUDO column is a MEASUREMENT, not the stored label, so the
+    # legend only prints for the states that need reading — and `unknown` says
+    # outright that nothing was measured rather than quietly falling back to the
+    # label (falling back is what made the label authoritative-looking in the
+    # first place). Detail deliberately stays in `agent info`; this is a survey.
+    local _lg_unk _lg_div _lg_ext
+    _lg_unk=$(jq -r '[.[] | select(.sudo.measured | not)] | length' <<<"$merged")
+    _lg_div=$(jq -r '[.[] | select(.sudo.diverges)] | length' <<<"$merged")
+    _lg_ext=$(jq -r '[.[] | select(.sudo.extraEntries)] | length' <<<"$merged")
+    if (( _lg_div )); then
+      echo
+      echo "! enforced grant DISAGREES with the stored isolation label — trust the grant (5dive agent info <name>)"
+    fi
+    (( _lg_ext )) && echo "+ extra sudoers entries this CLI did not write"
+    if (( _lg_unk )); then
+      (( _lg_div )) || echo
+      echo "unknown = grant not measurable as $(id -un); re-run as root for the measured column"
+    fi
   fi
 }
 
