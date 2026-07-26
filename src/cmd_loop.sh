@@ -38,7 +38,33 @@ cmd_loop() {
 
 # loop_id: a loop-run handle, distinct from a task ident. (Date.now is fine in
 # bash; the no-Date constraint is workflow-script-only.)
-_loop_new_id() { printf 'L-%s' "$(date +%s)$(printf '%04x' $((RANDOM)))"; }
+#
+# DIVE-2083: this handle lands under a PRIMARY KEY (loop_runs.loop_id), so a
+# repeat is not a cosmetic clash — it is a hard INSERT failure on a live loop
+# spawn, reaching the user as a raw `UNIQUE constraint failed` from sqlite
+# rather than a handled condition. The pre-2083 form was one-second epoch plus
+# 4 hex of $RANDOM, i.e. 15 bits of entropy inside a 1-second bucket; measured,
+# 1000 draws in one second collide with near-certainty. Widened to three
+# independent axes, so a repeat now needs all three to coincide at once:
+#   1. nanosecond clock — separates draws inside the same second;
+#   2. the drawing process's own pid ($BASHPID, which unlike $$ differs in every
+#      subshell — loop spawns fan out through `( … ) &`);
+#   3. 8 hex (32 bits) from /dev/urandom — a kernel CSPRNG, not bash's
+#      per-subshell reseed, so it holds up even with the clock axis pinned.
+# Deliberately NOT a retry-on-conflict loop: that treats the symptom and leaves
+# the handle itself ambiguous for every other reader.
+# Graded by tests/loop_id_collision_unit.sh (which INSERTs the draws under the
+# real PRIMARY KEY rather than checking bash-side string uniqueness).
+_loop_new_id() {
+  local ns pid rnd
+  ns=$(date +%s%N)
+  # non-GNU date has no %N and echoes it literally — fall back to seconds.
+  [[ "$ns" == *N* ]] && ns="$(date +%s)000000000"
+  pid=$(printf '%x' "${BASHPID:-$$}")
+  rnd=$(od -An -N4 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n')
+  [[ ${#rnd} -eq 8 ]] || rnd="$(printf '%04x%04x' $((RANDOM)) $((RANDOM)))"
+  printf 'L-%s%s%s' "$ns" "$pid" "$rnd"
+}
 
 _loop_help() {
   cat <<'EOF'
@@ -718,7 +744,12 @@ cmd_loop_panel() {
     killed=$(db "SELECT kill_requested FROM loop_runs WHERE loop_id=$(sqlq "$loop_id");")
     if [[ "$killed" == "1" ]]; then final_status="killed"; break; fi
     spent=$(_loop_spent "$loop_id")
-    if [[ "${spent:-0}" -ge "$eff_ceiling" ]]; then final_status="escalated"; break; fi
+    # DIVE-2083: name the ceiling breach as itself. It used to be labelled
+    # "escalated", which is also what a --wait TIMEOUT produces, so the two
+    # halts were indistinguishable to every caller — including the harness that
+    # is supposed to grade them (a timed-out panel passed the ceiling test for
+    # the wrong reason, and no assertion could tell).
+    if [[ "${spent:-0}" -ge "$eff_ceiling" ]]; then final_status="ceiling"; break; fi
     local pending; pending=$(db "SELECT COUNT(*) FROM tasks WHERE id IN (${ids_csv}) AND status NOT IN ('done','rejected','escalated','cancelled');")
     if [[ "${pending:-1}" == "0" ]]; then final_status="complete"; break; fi
     (( t >= deadline )) && { final_status="timeout"; break; }
@@ -763,9 +794,11 @@ cmd_loop_panel() {
       >/dev/null 2>&1 || true
   fi
 
-  ok "loop ${loop_id} panel ${verdict} (${pass_votes} pass / ${fail_votes} fail / quorum ${eff_quorum})" \
-     '{loopId:$l, handle:$l, status:$s, topology:"panel", verdict:$vd, pass:($p|tonumber), fail:($f|tonumber), abstain:($a|tonumber), quorum:($q|tonumber), votes:$vs, ceiling:($c|tonumber), tokensSpent:($sp|tonumber)}' \
-     --arg l "$loop_id" --arg s "$loop_status" --arg vd "$verdict" --arg p "$pass_votes" --arg f "$fail_votes" \
+  # haltReason (DIVE-2083) is WHY the poll stopped — complete|killed|ceiling|timeout —
+  # which `status` cannot carry: it maps both ceiling and timeout onto "escalated".
+  ok "loop ${loop_id} panel ${verdict} (${pass_votes} pass / ${fail_votes} fail / quorum ${eff_quorum}, ${final_status})" \
+     '{loopId:$l, handle:$l, status:$s, haltReason:$hr, topology:"panel", verdict:$vd, pass:($p|tonumber), fail:($f|tonumber), abstain:($a|tonumber), quorum:($q|tonumber), votes:$vs, ceiling:($c|tonumber), tokensSpent:($sp|tonumber)}' \
+     --arg l "$loop_id" --arg s "$loop_status" --arg hr "$final_status" --arg vd "$verdict" --arg p "$pass_votes" --arg f "$fail_votes" \
      --arg a "$abstain" --arg q "$eff_quorum" --argjson vs "$votes_json" --arg c "$eff_ceiling" --arg sp "${spent:-0}"
   return 0
 }
