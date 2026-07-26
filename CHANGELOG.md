@@ -1,5 +1,55 @@
 # Changelog
 
+## 0.15.39 — fix(gate): a lead-routed gate emitted ZERO delivery telemetry and never reached the DIVE-1968 delivery assertion (DIVE-2011) (2026-07-26)
+
+- **The DIVE-1968 delivery assertion did not cover the rail most builder gates take.**
+  The lead-route branch of `task need` sent its handoff inline and `return`ed before
+  `task_need_notify` was ever called, so "no gate exits without a delivery verdict"
+  was true of the human ping ONLY. A routed gate wrote **no gate-delivery row at
+  all** — not ok, not error — leaving the entire routed population invisible to the
+  one dataset anyone consults to judge whether gates reach anyone. Measured instance:
+  DIVE-1989's approval gate was filed and lead-cleared inside the post-assertion
+  window and `gate-notify.log` holds nothing for it.
+- **The routed send's exit status was structurally unobservable** — backgrounded
+  subshell, both streams to `/dev/null`, `|| true` outside it — so `routed to X`
+  printed whether or not X existed, was running, or had a live pane to inject into.
+- Fixed by dispatch, not duplication: `task_need_notify` now routes to a second
+  deliverer (`_task_need_route_deliver`) when `TASK_GATE_ROUTE_TO` is set, so both
+  rails share ONE assertion. A parallel assertion would be a second thing to go
+  inert, which is the failure mode being fixed.
+- The send stays detached, because `5dive agent send` waits up to 45s for the
+  receiver's input prompt and a busy-but-healthy peer burns that whole budget — a
+  synchronous send would stall the filer on the common case, and a `timeout`-
+  truncated one would kill the child *during* the readiness wait, before the inject,
+  turning a delivered handoff into a lost one. Instead the child logs the terminal
+  verdict itself and publishes its rc **after** the row lands, and the parent polls
+  that rc for 3s: every fast-failure shape (unknown agent, dead tmux session, denied
+  sudo, no CLI on PATH) is decided well inside that window, while a peer that is
+  merely mid-turn finishes in the background.
+- The printed claim never exceeds what was observed: `delivered` prints the plain
+  routed line, a confirmed failure prints `HANDOFF NOT DELIVERED` plus a loud warn
+  and names `5dive task answer <ident>`, and an unfinished send says
+  `delivery not yet confirmed`. In-flight is reported as in-flight and **not** as an
+  error — manufacturing error rows for healthy busy peers is the opposite-direction
+  bias of the mis-measurement DIVE-1968 was filed on. JSON gains
+  `delivery` + `notified`.
+- The gate itself always stands: a failed *ping* is not a failed *filing*.
+  `routed_reviewer` persists and `gate_pinged_at` stays NULL, so the heartbeat's T1
+  re-nag (which already resolves recipients through `routed_reviewer`) escalates it
+  within 15 minutes.
+- `tests/gate_route_delivery_unit.sh` (new, 28 assertions) drives the failing send as
+  well as the succeeding one — only the success shape was ever exercised before.
+- **Harness change worth reading, not just noting:** four existing routing harnesses
+  stubbed `task_need_notify` itself. Now that the wrapper is the shared entry point,
+  that stub would fire the `HUMAN_PINGED` sentinel on a *routed* gate — reporting a
+  human ping that never happened — and would suppress the route send those harnesses
+  assert on. The sentinel moved one layer down to `_task_need_notify_deliver`, where
+  it means what its name says. No assertion was weakened; all four are green
+  unchanged otherwise.
+- `_task_gate_delivery_log` takes an optional next-step clause: its failure warn
+  used to say "trying a visible group fallback" unconditionally, which is true only
+  of the Bot API path.
+
 ## 0.15.38 — fix(task): a maker's SECOND `task done` closed its own delivered task ungraded (DIVE-2007) (2026-07-26)
 
 - **the delivered state was not durable against its own maker.** The maker→verifier routing test is positional — `verifier != assignee` means "hand off" — and delivery flips `assignee` TO the verifier. So the second `task done` from the SAME maker satisfied `verifier == assignee`, read as "the verifier's own close", and fell through to a real close: DIVE-1988 went `status=done` with iteration 1 still open and the verifier never grading. Corroborated from the other side the same hour (DIVE-2002, main), so the bypass is reachable, obvious under pressure, and was the path of least resistance.
