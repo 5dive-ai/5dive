@@ -35,14 +35,16 @@ no(){ F=$((F+1)); echo "FAIL - $1"; [ -n "${2:-}" ] && echo "   $2"; }
 # no-wait assertions pass VACUOUSLY. A counter that is always 0 satisfies "<= 3"
 # without measuring anything.
 SCAN_CLEAN_FOR=""      # refs (space-separated) the scan considers clean
-SHAPE_OUT="";  SHAPE_RC=0
+SHAPE_OWED_FOR=""; SHAPE_RC=0   # refs the shape probe calls ASSIGNMENT OWED
 TIPS_STR=""
 STUBD="$(mktemp -d /tmp/uniq-gate-stub.XXXXXX)"; trap 'rm -rf "$STUBD"' EXIT
 POLL_LOG="$STUBD/polls"; TIP_IDX="$STUBD/idx"
 reset_stub() { : >"$POLL_LOG"; echo 0 >"$TIP_IDX"; }
 polls()      { wc -l <"$POLL_LOG" | tr -d ' '; }
 _uniq_scan()         { [[ " $SCAN_CLEAN_FOR " == *" $1 "* ]]; }
-_uniq_assign_shape() { printf '%s' "$SHAPE_OUT"; return $SHAPE_RC; }
+_uniq_assign_shape() {
+  if [[ " $SHAPE_OWED_FOR " == *" $1 "* ]]; then printf '%s' "$OWED"; else printf '%s' "$NOTOWED"; fi
+  return $SHAPE_RC; }
 _uniq_current_main() {
   echo x >>"$POLL_LOG"
   local i; i=$(cat "$TIP_IDX" 2>/dev/null || echo 0)
@@ -62,7 +64,7 @@ out=$(uniq_gate mergesha basesha 2>&1); rc=$?
                  || no "1 must not poll when clean" "polls=$(polls)"
 
 # --- 2. THE FIX: the assignable transient, repaired -> passes -----------------
-SCAN_CLEAN_FOR="assignsha"; SHAPE_OUT="$OWED"; SHAPE_RC=0
+SCAN_CLEAN_FOR="assignsha"; SHAPE_OWED_FOR="mergesha"; SHAPE_RC=0
 TIPS_STR="mergesha assignsha"; reset_stub
 out=$(uniq_gate mergesha basesha 2>&1); rc=$?
 (( rc == 0 )) && ok "2 an assignable collision that version-assign repairs no longer fails the merge commit" \
@@ -70,13 +72,13 @@ out=$(uniq_gate mergesha basesha 2>&1); rc=$?
 grep -q 'DID collide' <<<"$out" \
   && ok "2 ...and the pass states the collision WAS REAL, not a false alarm" \
   || no "2 must not report the collision as never having happened" "$out"
-grep -q 'REPAIRED TIP' <<<"$out" \
-  && ok "2 ...and names WHICH sha it verified, so green is not read as 'the merge commit was clean'" \
-  || no "2 must name the subject it verified" "$out"
+grep -q "repair's own delta" <<<"$out" && grep -q 'not claimed' <<<"$out" \
+  && ok "2 ...and names exactly what it verified AND disclaims what it did not: that the merge commit was ever unique" \
+  || no "2 must name the subject it verified and disclaim the rest" "$out"
 
 # --- 3. THE OVER-CORRECTION GUARD: assignable shape, repair NEVER lands -------
 # This is the arm that keeps the fix from silently recreating DIVE-2118.
-SCAN_CLEAN_FOR=""; SHAPE_OUT="$OWED"; SHAPE_RC=0
+SCAN_CLEAN_FOR=""; SHAPE_OWED_FOR="mergesha"; SHAPE_RC=0
 TIPS_STR="mergesha"; reset_stub
 out=$(uniq_gate mergesha basesha 2>&1); rc=$?
 (( rc == 1 )) && ok "3 an assignable collision that is NEVER repaired still FAILS (the tolerance is not silence)" \
@@ -88,7 +90,7 @@ grep -q 'main is unassigned right now' <<<"$out" \
                  || no "3 wait must be bounded" "polls=$(polls)"
 
 # --- 4. a GENUINE collision (not the assignable shape) still fails immediately -
-SCAN_CLEAN_FOR=""; SHAPE_OUT="$NOTOWED"; SHAPE_RC=0
+SCAN_CLEAN_FOR=""; SHAPE_OWED_FOR=""; SHAPE_RC=0
 TIPS_STR="assignsha"; reset_stub
 out=$(uniq_gate mergesha basesha 2>&1); rc=$?
 (( rc == 1 )) && ok "4 a collision version-assign will NOT repair still fails — the detector keeps its job" \
@@ -99,7 +101,8 @@ out=$(uniq_gate mergesha basesha 2>&1); rc=$?
 # --- 5. UNDETERMINED shape probe must NOT buy silence ------------------------
 # We know there IS a collision; what is unknown is whether a repair is coming. Unknown
 # is not "it will be handled" — same rule as DIVE-2120's bound message.
-SCAN_CLEAN_FOR=""; SHAPE_OUT='version-assign: UNDETERMINED — could not read FIVE_VERSION.'; SHAPE_RC=2
+SCAN_CLEAN_FOR=""; SHAPE_OWED_FOR=""; SHAPE_RC=2
+NOTOWED_SAVE="$NOTOWED"; NOTOWED='version-assign: UNDETERMINED — could not read FIVE_VERSION.'
 TIPS_STR="assignsha"; reset_stub
 out=$(uniq_gate mergesha basesha 2>&1); rc=$?
 (( rc == 1 )) && grep -q 'UNDETERMINED' <<<"$out" \
@@ -108,7 +111,8 @@ out=$(uniq_gate mergesha basesha 2>&1); rc=$?
 
 # --- 6. main moves but the collision persists -> still fails -----------------
 # The repair must be PROVEN by re-scanning, not inferred from "the tip changed".
-SCAN_CLEAN_FOR="somethingelse"; SHAPE_OUT="$OWED"; SHAPE_RC=0
+NOTOWED="$NOTOWED_SAVE"
+SCAN_CLEAN_FOR="somethingelse"; SHAPE_OWED_FOR="mergesha othersha"; SHAPE_RC=0
 TIPS_STR="othersha othersha othersha"; reset_stub
 out=$(uniq_gate mergesha basesha 2>&1); rc=$?
 (( rc == 1 )) && ok "6 main moving is NOT proof of repair — the new tip is re-scanned and still fails if it collides" \

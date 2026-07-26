@@ -30,6 +30,17 @@
 # a predicate drift; the copy that drifts is the one that decides whether to stay
 # quiet. Same discipline as the gap#2/stranded predicate sharing in DIVE-2122.
 #
+# KNOWN LIMIT, measured by replaying both real merges. Replaying 6fd082e against its
+# true base (c742ee1) RESOLVES correctly — that is the live, uncontended case this gate
+# is for. Replaying the OLDER merge 186b0e3 now FAILS, because main has since moved two
+# assignments past it, so the repair-delta scan (new..tip) spans later merges carrying
+# their own transient collisions. The same thing happens for real if another merge
+# lands DURING the wait window: the gate fails loudly and points at the version-assign
+# run rather than going quiet. That is the correct direction to degrade, but it is a
+# real limit, not a clean pass — tightening it would mean pinning the specific
+# assignment commit (by descent from <new>), which couples this to the assigner's
+# commit-message convention. Deliberately not done here.
+#
 # Usage: version-uniqueness-gate.sh <new-ref> <base-ref>
 # Exit 0 = no collision, or a transient one PROVEN repaired. Exit 1 = collision that
 #          is not the assignable shape, is undeterminable, or was never repaired.
@@ -91,12 +102,26 @@ uniq_gate() {
       echo "  ${waited}s: main is still at ${new:0:12} — no assignment commit yet."
       continue
     fi
-    if _uniq_scan "$tip" "$base"; then
+    # PROVING THE REPAIR IS NOT "RE-SCAN AGAINST THE ORIGINAL BASE". Caught by replaying
+    # the real 6fd082e incident: base..tip STILL CONTAINS the offending merge commit, so
+    # that scan collides forever no matter how perfectly the assigner performed. A gate
+    # built on it would fail every bundle-changing merge AFTER burning the whole wait
+    # window — strictly worse than the immediate red it was meant to remove. Twelve
+    # green stub arms missed this, because the stubs encoded the same wrong assumption
+    # the code did; only the replay against real history disagreed.
+    #
+    # The repair is proven by two facts instead:
+    #   1. the shape probe no longer says OWED at the tip — an assignment really landed
+    #      (same shared predicate, so this cannot disagree with the performer), and
+    #   2. the delta the repair itself introduced (new..tip) carries no collision.
+    local tipshape
+    tipshape=$(_uniq_assign_shape "$tip" "$base"); local tiprc=$?
+    if (( tiprc != 2 )) && ! grep -q 'ASSIGNMENT OWED' <<<"$tipshape" && _uniq_scan "$tip" "$new"; then
       # Say exactly what was and was not measured. Green here does NOT mean the merge
-      # commit was clean — it means the transient was repaired and the REPAIRED tip is
-      # unique. Reporting it as though the collision never happened would be the same
+      # commit was clean — it means the transient was repaired and the repair itself is
+      # clean. Reporting it as though the collision never happened would be the same
       # class of lie this ticket is about.
-      echo "version-uniqueness: RESOLVED. ${new:0:12} DID collide — that was real, not a false alarm — and version-assign repaired it at ${tip:0:12} within ${waited}s. Uniqueness is verified against the REPAIRED TIP, not against ${new:0:12}."
+      echo "version-uniqueness: RESOLVED. ${new:0:12} DID collide — that was real, not a false alarm — and version-assign repaired it at ${tip:0:12} within ${waited}s. Verified: no assignment is still owed at the tip, and the repair's own delta ${new:0:12}..${tip:0:12} is collision-free. NOT verified, and not claimed: that ${new:0:12} itself was ever unique. It was not."
       return 0
     fi
     echo "  ${waited}s: main moved to ${tip:0:12} but the collision is still there."
