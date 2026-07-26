@@ -101,6 +101,13 @@ _audit_note_drop() {
 # it turned the audit log into a record of privileged operations only, silently,
 # and nothing said so. _emit_audit_line handles the non-root case; let it.
 #
+# DIVE-2073 seam: $EUID is READONLY in bash, so a unit harness cannot exercise
+# the root branch of the actor fallback by assigning it. Same reason cmd_task.sh
+# grew _gate_is_root (DIVE-1968) — the hardcoded audit code behind an
+# unreachable root check survived a year precisely because no test could reach
+# it. A check nobody can exercise is a check nobody can trust.
+_audit_is_root() { [[ $EUID -eq 0 ]]; }
+
 # Emits one NDJSON line. Sensitive =<value> args are redacted ("--api-key=..."
 # becomes "--api-key=<redacted>"). Never fails the caller — writes are
 # best-effort so a full disk can't block a rescue rm.
@@ -125,7 +132,19 @@ audit_log() {
         sanitized+=("$a") ;;
     esac
   done
-  local user="${FIVEDIVE_AUDIT_USER:-${SUDO_USER:-${USER:-unknown}}}"
+  # DIVE-2073: `unknown` used to mean TWO different things and the reader could
+  # not tell them apart — "this process genuinely has no invoking user" (root
+  # cron: every gate-delivery row at :NN:02 is the heartbeat re-nag, which has
+  # neither SUDO_USER nor USER) and "actor resolution FAILED". Same absent-vs-
+  # forbidden conflation this codebase keeps paying for (DIVE-1927's paired
+  # probe, DIVE-1989's dropped rows): a row that says `unknown` cannot be used
+  # to answer "who delivered this", which is the whole load-bearing question on
+  # the privileged re-send path. Root with no invoking user is an identity BY
+  # DESIGN, so record it as `root`; `unknown` now means only the genuine
+  # failure — a NON-root process whose USER we could not read — and a reader
+  # seeing it should treat it as a defect, not as routine.
+  local user="${FIVEDIVE_AUDIT_USER:-${SUDO_USER:-${USER:-}}}"
+  [[ -n "$user" ]] || { if _audit_is_root; then user="root"; else user="unknown"; fi; }
   local ts
   ts=$(date -Iseconds)
   local line
