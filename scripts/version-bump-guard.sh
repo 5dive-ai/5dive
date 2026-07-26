@@ -25,6 +25,16 @@
 # only pushes that changed the bundle. A push that touches no source (e.g.
 # workflow/doc-only) leaves 5dive.sha256 unchanged and is exempt from #1.
 #
+# DIVE-2071: assertions 1 and 2 above are both behind `-n "$new_ver"` /
+# `-n "$new_bundle_ver"` / `-n "$new_sha"` guards, so if extraction of any of
+# them from NEW fails (missing file, or the `FIVE_VERSION=` anchor drifted —
+# a rename, a src/ reorg), every assertion above is silently skipped and this
+# script exits 0: clear to push. That is "if present then check", which
+# succeeds at nothing the moment the anchor moves — measured to pass the
+# exact DIVE-2065 incident clean when the anchor is perturbed. Extraction
+# failure at NEW is therefore checked FIRST and unconditionally, as its own
+# loud block, distinct from the two content assertions.
+#
 # Usage: version-bump-guard.sh <new-rev> [<base-rev>=origin/main]
 # Exit 0 = clear to push. Exit 1 = blocked, reason on stderr.
 set -uo pipefail
@@ -51,6 +61,23 @@ new_sha="$(_sha256file "$NEW")"
 base_sha="$(_sha256file "$BASE" 2>/dev/null || true)"
 
 fail=0
+
+# Extraction failure at NEW != clean. Checked first, unconditionally, with a
+# message distinct from the content-mismatch assertions below — an anchor
+# that can't be found is a different failure than an anchor that disagrees,
+# and folding them into one message would bury the drift signal.
+if [[ -z "$new_ver" ]]; then
+  echo "version-bump-guard: BLOCKED — could not extract FIVE_VERSION from src/header.sh at $NEW (missing file, or the 'readonly FIVE_VERSION=' anchor no longer matches). Extraction failure is not the same as a clean bundle — investigate before overriding." >&2
+  fail=1
+fi
+if [[ -z "$new_bundle_ver" ]]; then
+  echo "version-bump-guard: BLOCKED — could not extract FIVE_VERSION from the committed 5dive bundle at $NEW (missing file, or the anchor no longer matches)." >&2
+  fail=1
+fi
+if [[ -z "$new_sha" ]]; then
+  echo "version-bump-guard: BLOCKED — could not read 5dive.sha256 at $NEW (missing or empty)." >&2
+  fail=1
+fi
 
 if [[ -n "$new_ver" && -n "$new_bundle_ver" && "$new_ver" != "$new_bundle_ver" ]]; then
   echo "version-bump-guard: BLOCKED — src/header.sh declares FIVE_VERSION=$new_ver but the committed 5dive bundle embeds $new_bundle_ver." >&2

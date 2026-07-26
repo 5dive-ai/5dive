@@ -17,6 +17,15 @@
 # run against a wider range so it also catches a TOCTOU race between two
 # pushes that each looked clear against a now-stale base.
 #
+# DIVE-2071: every assertion below is behind `[[ -z "$ver" ]] && continue` /
+# `[[ -z "$sha" ]] && continue` — "if present then check", which is silently
+# vacuous the moment the `FIVE_VERSION=` anchor drifts (a rename, a src/
+# reorg). Measured to pass the real DIVE-2065 incident clean under a
+# perturbed anchor. So extraction at the tip (NEW) is asserted first and
+# unconditionally, distinct from the per-commit skip-on-empty in the sweep
+# below (which is deliberately tolerant of *historical* commits that never
+# had these files, per this script's own scoping note above).
+#
 # Usage: version-uniqueness-scan.sh <new-ref> [<base-ref>=origin/main]
 # Exit 0 = no new collision. Exit 1 = collision, detail on stderr.
 set -uo pipefail
@@ -32,7 +41,20 @@ _ver() {
 _sha256file() { git show "$1:5dive.sha256" 2>/dev/null; }
 
 fail=0
-declare -A base_shas   # version -> newline-joined set of 5dive.sha256 contents seen
+
+new_tip_ver="$(_ver "$NEW")"
+new_tip_sha="$(_sha256file "$NEW")"
+if [[ -z "$new_tip_ver" ]]; then
+  echo "version-uniqueness: BLOCKED — could not extract FIVE_VERSION from src/header.sh at $NEW (missing file, or the 'readonly FIVE_VERSION=' anchor no longer matches). Extraction failure is not the same as a clean scan." >&2
+  fail=1
+fi
+if [[ -z "$new_tip_sha" ]]; then
+  echo "version-uniqueness: BLOCKED — could not read 5dive.sha256 at $NEW (missing or empty)." >&2
+  fail=1
+fi
+
+declare -A base_shas    # version -> newline-joined set of 5dive.sha256 contents seen
+declare -A first_owner  # version -> "source|commit" of the first commit recorded for it
 
 _seen() {  # _seen "$version" "$sha" -> 0 if already recorded
   case $'\n'"${base_shas[$1]:-}"$'\n' in
@@ -40,14 +62,17 @@ _seen() {  # _seen "$version" "$sha" -> 0 if already recorded
     *) return 1 ;;
   esac
 }
-_record() { base_shas[$1]="${base_shas[$1]:-}"$'\n'"$2"; }
+_record() {  # _record "$version" "$sha" "$source" "$commit"
+  base_shas[$1]="${base_shas[$1]:-}"$'\n'"$2"
+  [[ -n "${first_owner[$1]:-}" ]] || first_owner[$1]="$3|$4"
+}
 
 # Phase 1: everything already accepted on BASE — build the lookup, report nothing.
 while read -r commit; do
   [[ -z "$commit" ]] && continue
   ver="$(_ver "$commit")"; [[ -z "$ver" ]] && continue
   sha="$(_sha256file "$commit")"; [[ -z "$sha" ]] && continue
-  _seen "$ver" "$sha" || _record "$ver" "$sha"
+  _seen "$ver" "$sha" || _record "$ver" "$sha" base "$commit"
 done < <(git log --format=%H "$BASE" -- src/header.sh 5dive.sha256 2>/dev/null)
 
 # Phase 2: only the commits this range is introducing.
@@ -56,11 +81,19 @@ while read -r commit; do
   ver="$(_ver "$commit")"; [[ -z "$ver" ]] && continue
   sha="$(_sha256file "$commit")"; [[ -z "$sha" ]] && continue
   if [[ -n "${base_shas[$ver]:-}" ]] && ! _seen "$ver" "$sha"; then
-    echo "version-uniqueness: $commit claims FIVE_VERSION $ver, already used on $BASE with a DIFFERENT bundle." >&2
+    prior="${first_owner[$ver]}"
+    prior_source="${prior%%|*}"
+    prior_commit="${prior#*|}"
+    if [[ "$prior_source" == base ]]; then
+      where="already used on $BASE (commit $prior_commit) with a DIFFERENT bundle"
+    else
+      where="already used earlier in this range by $prior_commit (before $BASE..$NEW reaches $commit) with a DIFFERENT bundle"
+    fi
+    echo "version-uniqueness: $commit claims FIVE_VERSION $ver, $where." >&2
     echo "  $commit: 5dive.sha256=$sha" >&2
     fail=1
   fi
-  _seen "$ver" "$sha" || _record "$ver" "$sha"
+  _seen "$ver" "$sha" || _record "$ver" "$sha" range "$commit"
 done < <(git log --format=%H --reverse "$BASE..$NEW" -- src/header.sh 5dive.sha256 2>/dev/null)
 
 exit $fail
