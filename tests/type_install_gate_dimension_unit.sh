@@ -16,11 +16,26 @@
 # (community/wiki/mutation-coverage-is-per-dimension.md, instance 3: a faithful
 # mutation aimed at the wrong axis reads green and means nothing).
 #
-# Two cases per type, because "always installs" would pass case A alone:
-#   A. stray-on-PATH, gate artifact ABSENT  -> the install action MUST run
-#   B. gate artifact PRESENT, no stray      -> the install action MUST NOT run
+# Three cases per type, because no single one of them is sufficient alone —
+# "always installs" passes A and C, "never installs" passes B:
+#   A. stray-on-PATH, gate artifact ABSENT   -> the install action MUST run
+#   B. gate artifact PRESENT, no stray       -> the install action MUST NOT run
+#   C. gate artifact PRESENT, FORCE_INSTALL=1 -> the install action MUST run
 # Textual assertion is deliberately not used: `command -v agy` legitimately
 # survives inside antigravity's post-install symlink fallback.
+#
+# Case C is DIVE-2095's addition, on the same ENVIRONMENT axis (FORCE_INSTALL is
+# an env var cmd_install exports) and observing the same thing — the gate's own
+# decision. DIVE-2081: `5dive agent install <type> --upgrade` exported
+# FORCE_INSTALL=1, then reported "<type> upgraded at <bin>" while 6 of 8 recipes
+# ignored the variable and no-oped in 0s; only codex and openclaw read it.
+# cmd_install infers "upgraded" from `[[ -x $bin ]]` — a post-condition that was
+# ALREADY TRUE before it ran, so it cannot tell an upgrade from a no-op and the
+# lie is silent. This loop is what binds the fix to the REGISTRY rather than to
+# the six recipes patched in 2026-07: it iterates ${!TYPE_INSTALL[@]}, so a ninth
+# recipe added without the escape reds case C on the day it lands. That is
+# deliberately stronger than grepping recipe text for "FORCE_INSTALL", which a
+# recipe could satisfy while still ignoring it.
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -44,9 +59,11 @@ gate_extra_for() {
 
 # Build a sandbox and run <type>'s recipe in it with the network/npm layer
 # stubbed. Echoes the recipe's stdout+stderr; the caller greps for $MARKER.
-# $2 = present|absent (whether the gate artifact exists), $3 = stray|nostray.
+# $2 = present|absent (whether the gate artifact exists), $3 = stray|nostray,
+# $4 = value of FORCE_INSTALL in the recipe's env (empty = the provisioning
+# path, 1 = what cmd_install --upgrade exports).
 run_gate() {
-  local type="$1" artifact="$2" stray="$3"
+  local type="$1" artifact="$2" stray="$3" force="${4:-}"
   local fake; fake=$(mktemp -d) || return 99
   local home="$fake/home/claude"
   local lbin="$home/.local/bin" prefix="$fake/npmprefix"
@@ -102,7 +119,7 @@ EOF
   # Recipe verbatim, re-rooted at the sandbox home. Recipes run under
   # `sudo -u claude -i bash -lc` on a real box: bash, no `set -e`.
   local recipe="${TYPE_INSTALL[$type]//\/home\/claude/$home}"
-  ( cd "$fake" && HOME="$home" PATH="$path" FORCE_INSTALL= \
+  ( cd "$fake" && HOME="$home" PATH="$path" FORCE_INSTALL="$force" \
       /usr/bin/env bash -c "$recipe" 2>&1 )
   rm -rf "$fake"
 }
@@ -131,6 +148,19 @@ for type in $(printf '%s\n' "${!TYPE_INSTALL[@]}" | sort); do
     echo "      not idempotent (or this harness cannot see the gate's decision)." >&2
     fails=$((fails+1))
   fi
+
+  out_c=$(run_gate "$type" present nostray 1)
+  if [[ "$out_c" != *"$MARKER"* ]]; then
+    echo "FAIL: $type — FORCE_INSTALL=1 did not reach the installer: the recipe" >&2
+    echo "      no-oped on its -x ${TYPE_BIN[$type]} gate. \`5dive agent install" >&2
+    echo "      $type --upgrade\` exports FORCE_INSTALL=1 and then reports" >&2
+    echo "      \"$type upgraded\" off \`[[ -x \$bin ]]\`, which was already true —" >&2
+    echo "      so this no-op is reported as a successful upgrade (DIVE-2081)." >&2
+    echo "      Give it codex's escape: { [[ -z \\\"\\\${FORCE_INSTALL:-}\\\" ]] &&" >&2
+    echo "      [[ -x <TYPE_BIN> ]]; } || { <install body> }. Recipe:" >&2
+    echo "      ${TYPE_INSTALL[$type]:0:160}" >&2
+    fails=$((fails+1))
+  fi
 done
 
 (( checked >= 6 )) || {
@@ -141,7 +171,7 @@ done
 if (( fails > 0 )); then
   echo "FAIL: $fails TYPE_INSTALL gate assertion(s) failed across $checked recipes" >&2
 else
-  echo "PASS: all $checked TYPE_INSTALL recipes gate on their exact artifact — install runs when TYPE_BIN is missing despite a stray on PATH, and no-ops when present"
+  echo "PASS: all $checked TYPE_INSTALL recipes gate on their exact artifact — install runs when TYPE_BIN is missing despite a stray on PATH, no-ops when present, and runs anyway under FORCE_INSTALL=1"
 fi
 # Verdict on its own last line, in a shape tests/meta/harness-verdict-probe.sh can
 # identify and mutate: `if (( fails ))` reads fine to a person but is UNPROBEABLE

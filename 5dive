@@ -270,7 +270,10 @@ declare -A TYPE_INSTALL=(
   # gate can never flip no matter how many times you retry. Same defect class as
   # DIVE-2061 (`command -v 5dive` grading the installed CLI instead of the bundle
   # under test). This is the question the codex comment below already prescribes.
-  [claude]="[[ -x /home/claude/.local/bin/claude ]] || curl -fsSL https://claude.ai/install.sh | bash"
+  # DIVE-2095: FORCE_INSTALL escape, same shape as codex below. Safe to force —
+  # claude.ai/install.sh has no existence gate at all ("Always download latest
+  # version", l.131), so re-running it IS upstream's upgrade path (DIVE-2081).
+  [claude]="{ [[ -z \"\${FORCE_INSTALL:-}\" ]] && [[ -x /home/claude/.local/bin/claude ]]; } || { curl -fsSL https://claude.ai/install.sh | bash; }"
   # Verify the EXACT TYPE_BIN path (not `command -v codex`): a stray
   # /usr/bin/codex from apt or a codex left over under a non-v24 nvm major
   # would short-circuit the install and surface as "install reported success
@@ -296,7 +299,11 @@ declare -A TYPE_INSTALL=(
   # non-interactive shells, so neither the verify check below nor the agent
   # systemd unit (which uses TYPE_BIN's path directly) would find it.
   # Symlink into ~/.local/bin so TYPE_BIN[opencode] resolves on every box.
-  [opencode]="[[ -x /home/claude/.local/bin/opencode ]] || { curl -fsSL https://opencode.ai/install | bash && mkdir -p /home/claude/.local/bin && ln -sf /home/claude/.opencode/bin/opencode /home/claude/.local/bin/opencode; }"
+  # DIVE-2095: FORCE_INSTALL escape. Safe to force — upstream resolves the latest
+  # GitHub release and short-circuits with "Version <v> already installed" +
+  # exit 0 when it matches (l.231), so it is a self-versioning upgrader and a
+  # forced re-run is free when we are already current (DIVE-2081).
+  [opencode]="{ [[ -z \"\${FORCE_INSTALL:-}\" ]] && [[ -x /home/claude/.local/bin/opencode ]]; } || { curl -fsSL https://opencode.ai/install | bash && mkdir -p /home/claude/.local/bin && ln -sf /home/claude/.opencode/bin/opencode /home/claude/.local/bin/opencode; }"
   # Both upstreams launch an interactive setup wizard that opens /dev/tty
   # after the binary lands. shelld runs us without a controlling terminal,
   # so the wizard's `exec </dev/tty` blows up with ENXIO and the recipe
@@ -310,7 +317,15 @@ declare -A TYPE_INSTALL=(
   # users from traversing it to exec the venv binary — the unit then
   # crash-loops with `binary not installed`. chmod back to 0775 to match
   # the live perms of /home/claude/.opencode and .local/share/claude.
-  [hermes]="[[ -x /home/claude/.local/bin/hermes ]] || { curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash -s -- --skip-setup && chmod 0775 /home/claude/.hermes; }"
+  # DIVE-2095: FORCE_INSTALL escape. Safe to force despite being the largest
+  # upstream (3127L): only code under INSTALL_DIR is replaced, while data,
+  # config, sessions and logs live in $HERMES_HOME and are explicitly left
+  # "unchanged" (l.434) with existing installs "preserved in-place" (l.186);
+  # l.473 states the run is idempotent precisely so calling it on every install
+  # repairs pre-existing installs. Its `.broken-<ts>` move (l.1179) is not a
+  # general clobber — it is guarded on an interrupted clone (`[ -d .git ] &&
+  # ! rev-parse --verify HEAD`) and it MOVES, never deletes (DIVE-2081).
+  [hermes]="{ [[ -z \"\${FORCE_INSTALL:-}\" ]] && [[ -x /home/claude/.local/bin/hermes ]]; } || { curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash -s -- --skip-setup && chmod 0775 /home/claude/.hermes; }"
   # openclaw's launcher is `#!/usr/bin/env node`, so symlinking only the CLI
   # into ~/.local/bin leaves it unexecutable in systemd/create-time envs where
   # nvm's per-version bin directory is absent from PATH. Install a supported
@@ -332,7 +347,13 @@ declare -A TYPE_INSTALL=(
   # skipped the install and left us hoping the fallback could symlink something.
   # Gate on TYPE_BIN; the trailing `command -v agy` stays, because there the
   # question really is "where did the installer put it".
-  [antigravity]="[ -x /home/claude/.local/bin/agy ] || curl -fsSL https://antigravity.google/cli/install.sh | bash; [ -x /home/claude/.local/bin/agy ] || { mkdir -p /home/claude/.local/bin; p=\$(command -v agy 2>/dev/null || true); [ -n \"\$p\" ] && ln -sf \"\$p\" /home/claude/.local/bin/agy; }"
+  # DIVE-2095: FORCE_INSTALL escape on the INSTALL gate only. Safe to force —
+  # the installer is a plain binary drop that overwrites in place (DIVE-2081).
+  # The trailing `command -v agy` symlink fallback stays UNCONDITIONAL: it is
+  # the DIVE-901 repair for "the binary works but TYPE_BIN is missing", which is
+  # orthogonal to whether we just installed. Pulling it inside the guard would
+  # re-open DIVE-901 on the forced path.
+  [antigravity]="{ [[ -z \"\${FORCE_INSTALL:-}\" ]] && [ -x /home/claude/.local/bin/agy ]; } || { curl -fsSL https://antigravity.google/cli/install.sh | bash; }; [ -x /home/claude/.local/bin/agy ] || { mkdir -p /home/claude/.local/bin; p=\$(command -v agy 2>/dev/null || true); [ -n \"\$p\" ] && ln -sf \"\$p\" /home/claude/.local/bin/agy; }"
   # grok's installer drops the binary at ~/.grok/bin/grok but only creates the
   # ~/.local/bin/grok symlink *opportunistically* (its line 328 requires
   # ~/.local/bin already on PATH and ~/.grok/bin not on PATH). On a fresh VM
@@ -344,14 +365,25 @@ declare -A TYPE_INSTALL=(
   # DIVE-2075: gate on TYPE_BIN, not `command -v grok` — a stray grok on PATH
   # skipped the install, ~/.grok/bin/grok then did not exist so the symlink
   # branch no-oped too, and the recipe still exited 0 via the trailing `rm -f`.
-  [grok]="[ -x /home/claude/.local/bin/grok ] || curl -fsSL https://x.ai/cli/install.sh | bash; mkdir -p /home/claude/.local/bin; [ -e /home/claude/.grok/bin/grok ] && ln -sf /home/claude/.grok/bin/grok /home/claude/.local/bin/grok; rm -f /home/claude/.local/bin/agent"
+  # DIVE-2095: FORCE_INSTALL escape on the INSTALL gate only. Safe to force —
+  # the installer is a plain binary drop that overwrites in place (DIVE-2081).
+  # The symlink + `rm -f .local/bin/agent` tail stays UNCONDITIONAL, as above:
+  # it repairs the opportunistic-symlink gap described here, which has nothing
+  # to do with whether an install just ran. NOTE: forcing an upgrade pulls a
+  # fresh xAI client. Grok BUILD is frozen our side over a client-side
+  # codebase-exfil path; that freeze is about the Build feature, not this CLI
+  # type, so it does not block the escape — but a newer client does NOT clear it.
+  [grok]="{ [[ -z \"\${FORCE_INSTALL:-}\" ]] && [ -x /home/claude/.local/bin/grok ]; } || { curl -fsSL https://x.ai/cli/install.sh | bash; }; mkdir -p /home/claude/.local/bin; [ -e /home/claude/.grok/bin/grok ] && ln -sf /home/claude/.grok/bin/grok /home/claude/.local/bin/grok; rm -f /home/claude/.local/bin/agent"
   # pi is a plain npm package. Install-on-demand like codex (nvm install 24 so the
   # global install lands in v24's bin dir even when the default alias drifted),
   # then symlink into ~/.local/bin like opencode/openclaw so TYPE_BIN[pi]
   # resolves on every box (the systemd unit uses TYPE_BIN's path directly, and
   # bash -lc skips .bashrc so npm's bin dir isn't on PATH). Idempotent via the
   # -x guard. \$-escaped so npm prefix expands when the recipe runs under bash -lc.
-  [pi]="[[ -x /home/claude/.local/bin/pi ]] || { . /home/claude/.nvm/nvm.sh && nvm install 24 >/dev/null && npm install -g @earendil-works/pi-coding-agent && mkdir -p /home/claude/.local/bin && ln -sf \"\$(npm prefix -g)/bin/pi\" /home/claude/.local/bin/pi; }"
+  # DIVE-2095: FORCE_INSTALL escape. Safe to force — the spec is untagged, so npm
+  # resolves the dist-tag every time and re-running IS the upgrade (DIVE-2081).
+  # Pinned @latest here for readability only; it is what npm already resolved.
+  [pi]="{ [[ -z \"\${FORCE_INSTALL:-}\" ]] && [[ -x /home/claude/.local/bin/pi ]]; } || { . /home/claude/.nvm/nvm.sh && nvm install 24 >/dev/null && npm install -g @earendil-works/pi-coding-agent@latest && mkdir -p /home/claude/.local/bin && ln -sf \"\$(npm prefix -g)/bin/pi\" /home/claude/.local/bin/pi; }"
 )
 
 # vercel-labs/skills CLI agent ID per 5dive type. `npx skills add --agent <id>`
