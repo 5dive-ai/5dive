@@ -121,5 +121,22 @@ out=$(as olivia cmd_task_reject "$F" --feedback="scope is wrong"); rc=$?
   && ok_t "F that bounce is attributed to olivia, not to verifier 'main'" \
   || bad_t "F attribution" "result=$(res_of "$F")"
 
+# --- G: the max_iterations ESCALATION branch is the SECOND write site olivia named.
+# It has its own `UPDATE tasks SET result=` and would carry the same false
+# attribution independently; assert it consumes the fixed string, not by reading.
+Gid=$(JSON_MODE=1 cmd_task_add "G max-iters escalation" --assignee=dev --verifier=main \
+        --accept=x --max-iters=1 2>"$TMP"/err | jq -r '.data.ident // empty')
+as dev cmd_task_done "$Gid" --result="maker delivery v1" >/dev/null
+out=$(as main cmd_task_reject "$Gid" --feedback="not good enough"); rc=$?
+[[ "$(db "SELECT COALESCE(max_iterations,0) FROM tasks WHERE ident=$(sqlq "$Gid");")" == "1" \
+   && "$(db "SELECT COALESCE(iteration,0) FROM tasks WHERE ident=$(sqlq "$Gid");")" -ge 1 ]] \
+  && ok_t "G fixture really is on the max_iterations branch (maxi=1, iter>=1)" \
+  || bad_t "G fixture" "not on the escalation path — the next assertion would be vacuous"
+[[ "$(res_of "$Gid")" == *"main rejected"* ]] \
+  && ok_t "G escalation branch attributes to the real actor too" \
+  || bad_t "G escalation attribution" "result=$(res_of "$Gid")"
+[[ "$(res_of "$Gid")" != *"verifier 'main' rejected"* ]] \
+  && ok_t "G escalation branch is not hard-coded either" || bad_t "G escalation hard-coded" "$(res_of "$Gid")"
+
 printf '\n%s passed, %s failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" == 0 ]]
