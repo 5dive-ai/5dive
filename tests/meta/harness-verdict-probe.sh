@@ -26,10 +26,16 @@
 # so the suite never runs this, and this never recurses into itself.
 set -uo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/../.." || exit 2
-ASSUME_CLEAN=0; ONLY=""; TIMEOUT=${PROBE_TIMEOUT:-180}
+ASSUME_CLEAN=0; ONLY=""; REPORT=""; LABEL=""; TIMEOUT=${PROBE_TIMEOUT:-180}
 for a in "$@"; do case "$a" in
   --assume-clean) ASSUME_CLEAN=1 ;;
-  --only=*) ONLY="${a#--only=}" ;;
+  --only=*) ONLY="${a#--only=}" ;;      # one basename, or a comma-separated list
+  # DIVE-2018: a machine-readable verdict per harness, so the UNION of several
+  # environments can be asserted to cover the corpus. NOT-REACHED is correctly not
+  # a failure in any single run (a skip is not an accusation), which is precisely
+  # why no single run can establish coverage — see harness-verdict-union.sh.
+  --report=*) REPORT="${a#--report=}" ;;
+  --label=*)  LABEL="${a#--label=}" ;;  # names the environment in union failures
   *) printf 'unknown arg: %s\n' "$a" >&2; exit 2 ;;
 esac; done
 
@@ -129,9 +135,13 @@ counter_verdict() {   # -> "<var>\t<lineno>\t<last|not-last>"
   return 1
 }
 
+CORPUS_N=0; for t in tests/*.sh; do [[ -e "$t" ]] && CORPUS_N=$(( CORPUS_N + 1 )); done
+only_set=" ${ONLY//,/ } "
 for t in tests/*.sh; do
-  [[ -n "$ONLY" && "$(basename "$t")" != "$ONLY" ]] && continue
   b=$(basename "$t")
+  # --only takes a LIST so a second environment can re-probe exactly the harnesses
+  # the first one skipped, instead of paying for the whole corpus twice.
+  [[ -n "$ONLY" && "$only_set" != *" $b "* ]] && continue
   if (( ! ASSUME_CLEAN )); then
     if ! timeout "$TIMEOUT" bash "$t" >/dev/null 2>&1; then ALREADY_RED+=("$b"); continue; fi
   fi
@@ -177,4 +187,45 @@ for x in "${UNPROBEABLE[@]:-}"; do [[ -n "$x" ]] && printf 'UNPROBEABLE  %s — 
 for x in "${NOT_REACHED[@]:-}";  do [[ -n "$x" ]] && printf 'not-reached  %s — skipped before the verdict here; probed in an environment where it runs\n' "$x"; done
 for x in "${ALLOWED[@]:-}";     do [[ -n "$x" ]] && printf 'allowlisted  %s — unprobeable, permitted by name with a recorded reason\n' "$x"; done
 for x in "${ALREADY_RED[@]:-}"; do [[ -n "$x" ]] && printf 'ALREADY-RED  %s — failed its own clean run; reported, not probed\n' "$x"; done
+
+# DIVE-2018: the machine-readable half. `not-reached` is still not a failure HERE
+# — a skip is not an accusation — so this run cannot establish coverage on its own.
+# It records what it actually observed and lets harness-verdict-union.sh assert the
+# invariant that does hold: every harness is probed in SOME environment.
+# The corpus size and the allowlist travel WITH the verdicts, because the defect
+# this closes is two green runs describing different corpora with nothing saying so.
+if [[ -n "$REPORT" ]]; then
+  {
+    printf '# harness-verdict-probe report — one line per harness observed by THIS run\n'
+    printf '# corpus=%d\n' "$CORPUS_N"
+    printf '# allowlist=%s\n' "${ALLOW_UNPROBEABLE// /,}"
+    printf '# label=%s\n' "${LABEL:-$(uname -n)}"
+    # Basename is field 1 in every array: the annotated entries are "<name> — …"
+    # and "<name> (…)", the rest are bare names.
+    for x in "${WIRED[@]:-}";       do [[ -n "$x" ]] && printf 'wired\t%s\n'        "${x%% *}"; done
+    for x in "${UNWIRED[@]:-}";     do [[ -n "$x" ]] && printf 'UNWIRED\t%s\n'      "${x%% *}"; done
+    for x in "${UNPROBEABLE[@]:-}"; do [[ -n "$x" ]] && printf 'UNPROBEABLE\t%s\n'  "${x%% *}"; done
+    for x in "${ALLOWED[@]:-}";     do [[ -n "$x" ]] && printf 'allowlisted\t%s\n'  "${x%% *}"; done
+    for x in "${NOT_REACHED[@]:-}"; do [[ -n "$x" ]] && printf 'not-reached\t%s\n'  "${x%% *}"; done
+    for x in "${ALREADY_RED[@]:-}"; do [[ -n "$x" ]] && printf 'already-red\t%s\n'  "${x%% *}"; done
+    # Terminating `:` is load-bearing. A brace group's status is its LAST command's,
+    # and every loop above ends on `[[ -n "$x" ]] && printf` — which is FALSE, not an
+    # error, whenever that category is empty. Without this the guard below fired on a
+    # perfectly good report and exited 1: a false failure whose only cause was reading
+    # the wrong exit status, which is the same defect this whole check exists to find,
+    # committed inside the fix for it. With `:`, a failed redirect (bash aborts the
+    # group before running anything) is the only thing that can make this non-zero.
+    :
+  } > "$REPORT" || { printf 'probe: FAILED to write report %s\n' "$REPORT" >&2; exit 1; }
+  # …and corroborate the EFFECT rather than trust that status: a mid-write failure
+  # (full disk) leaves a truncated file that the redirect status cannot see. The row
+  # count must match what we classified, or the report is not usable as evidence.
+  rows=$(grep -cv '^#' "$REPORT")
+  want=$(( ${#WIRED[@]} + ${#UNWIRED[@]} + ${#UNPROBEABLE[@]} + ${#ALLOWED[@]} + ${#NOT_REACHED[@]} + ${#ALREADY_RED[@]} ))
+  if (( rows != want )); then
+    printf 'probe: report %s has %d rows, classified %d — refusing to emit a partial report\n' "$REPORT" "$rows" "$want" >&2
+    exit 1
+  fi
+  printf 'report written: %s (%d harness rows)\n' "$REPORT" "$rows"
+fi
 (( ${#UNWIRED[@]} == 0 && ${#UNPROBEABLE[@]} == 0 ))
