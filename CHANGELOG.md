@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.15.34 — feat(task): `task set-body` — no verb could edit a task body after filing (DIVE-1920) (2026-07-26)
+
+`--body` was add-time only; the only remaining route to fix or extend a body afterward was a direct sqlite `UPDATE` on the shared `tasks.db`, which a scoped-sudo maker can't do and an admin correctly declines to do unilaterally. Hit three times in one night: a vague CONSIDER note that had to be respecified as a whole new task instead of rewritten in place, and two findings relayed over `agent send` instead of landing in the ticket they belonged to — the exact appending-is-not-compiling failure the wiki already names. For recurring TEMPLATES the cost is worse: a template filed with an empty body (DIVE-176) carries its instructions only in whoever remembers them.
+
+- `5dive task set-body <id|DIVE-N> <text...> [--append]` — default OVERWRITES the whole body (the add-time behavior, now available after the fact); `--append` tacks the text on with a blank-line separator instead, since appending a finding to an existing body is the common case and a full overwrite invites clobbering someone else's context.
+- Works on recurring templates the same as worked tasks — the DIVE-176 case.
+- Refused on a closed (`done`/`cancelled`) task, the same "can't retro-edit a closed task" guard `task verifier` already enforces; the remedy is `task reject` to reopen first.
+- `tests/task_set_body_unit.sh` (9 assertions) pins overwrite, append-onto-existing, append-onto-empty, the template case, the closed-task refusal (and that a refused write leaves the body untouched), and the bare-usage error.
+- audit: `set-body` calls `audit_log` UNCONDITIONALLY (task, actor, mode `replaced`/`appended`, prior body
+  length) — visibility only, no new permission check. It is NOT gated on `EUID==0`, and neither is
+  `cmd_task_reject`'s own call: a root-only audit line is a no-op for the main non-root use case, which is
+  exactly the anti-pattern DIVE-1989 removed from nine call sites fleet-wide in 0.15.26. A body carries the
+  spec a task is graded against, so a silently rewritable one is a last-write-wins gap; `prior_len` is what
+  makes a destructive overwrite distinguishable from an append after the fact.
+
 ## 0.15.33
 
 - **`agent auth start` no longer wedges forever on a first-run onboarding TUI.**
