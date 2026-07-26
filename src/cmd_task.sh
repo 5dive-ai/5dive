@@ -3821,17 +3821,40 @@ cmd_task_need() {
         # it is provenance only (decision is already agent-clearable by type).
         db "UPDATE tasks SET routed_reviewer=$(sqlq "$_reviewer") WHERE id=${id};"
         local _rrole="lead review"; [[ "$_verifier_route" == "1" ]] && _rrole="verifier review"
-        local _hmsg="🧭 [${ident}] routed to you for ${_rrole} (${type} gate). ${ask}"
-        [[ -n "$options" ]]   && _hmsg+=" Options: ${options}."
-        [[ -n "$recommend" ]] && _hmsg+=" ${actor} recommends: ${recommend}."
-        _hmsg+=" Resolve: 5dive task answer ${ident} --value=\"<choice>\" — or re-file to escalate to the human."
-        if command -v 5dive >/dev/null 2>&1; then
-          ( 5dive agent send "$_reviewer" "$_hmsg" --from="$actor" >/dev/null 2>&1 & ) || true
-        fi
-        audit_log "task need lead-route" "ok" 0 -- "task=$ident" "type=$type" "reviewer=$_reviewer" "filer=$actor" || true
-        ok "$ident routed to $_reviewer for ${_rrole} ($type, tier $tier) — $ask" \
-           '{id:($i|tonumber), ident:$id, status:"blocked", need_type:$ty, tier:($tr|tonumber), routed_to:$rv, ask:$ak, recommend:(($rc|select(length>0)) // null)}' \
-           --arg i "$id" --arg id "$ident" --arg ty "$type" --arg tr "$tier" --arg rv "$_reviewer" --arg ak "$ask" --arg rc "$recommend"
+        # DIVE-2011: the handoff goes through the SAME delivery assertion as the
+        # human ping (task_need_notify dispatches on TASK_GATE_ROUTE_TO), so a
+        # routed gate can no longer exit without a delivery verdict or leave the
+        # one dataset DIVE-1968 reads with no row for it. TASK_GATE_FILER pins the
+        # send's `--from` to the gate's own filer for the same reason the human
+        # path sets it: under `sudo -u agent-X` the ambient identity is the
+        # invoker, not the filer.
+        local _nrc=0
+        TASK_GATE_FILER="$actor" TASK_GATE_ROUTE_TO="$_reviewer" TASK_GATE_ROUTE_ROLE="$_rrole" \
+          task_need_notify "$ident" "$type" "$ask" "$options" "$recommend" || _nrc=$?
+        # Never print a bare "routed to X" on an unobserved send again. The claim
+        # is exactly what the delivery state supports: pinged, not-yet, or NOT.
+        local _rstate="${TASK_GATE_ROUTE_STATE:-inflight}" _rnote=""
+        # DIVE-2011 (olivia's second finding on DIVE-1968, read off the installed
+        # binary): this audit row's result was a HARDCODED "ok", so the routed rail
+        # did not merely emit nothing to the telemetry — it emitted a GREEN row for a
+        # send whose exit status had been discarded. An absent row is a gap; a false
+        # green is worse, because it is the shape a reader trusts. The row now
+        # carries the delivery verdict, and is only `ok` when the send was confirmed.
+        local _rres="ok" _rrc=0
+        [[ "$_rstate" == "failed" ]] && { _rres="error"; _rrc=1; }
+        audit_log "task need lead-route" "$_rres" "$_rrc" -- "task=$ident" "type=$type" \
+          "reviewer=$_reviewer" "filer=$actor" "delivery=$_rstate" || true
+        case "$_rstate" in
+          delivered) ;;
+          inflight)  _rnote=" [handoff dispatched — delivery not yet confirmed; the gate-delivery row lands when the send completes]" ;;
+          *)         _rnote=" [HANDOFF NOT DELIVERED — ${_reviewer} was NOT pinged${TASK_NOTIFY_FAIL_REASON:+ (${TASK_NOTIFY_FAIL_REASON})}; the gate stands, the re-nag escalates it (<=15 min), and it is answerable now with: 5dive task answer ${ident}]" ;;
+        esac
+        ok "$ident routed to $_reviewer for ${_rrole} ($type, tier $tier)${_rnote} — $ask" \
+           '{id:($i|tonumber), ident:$id, status:"blocked", need_type:$ty, tier:($tr|tonumber), routed_to:$rv, delivery:$ds, notified:($ds=="delivered"), ask:$ak, recommend:(($rc|select(length>0)) // null)}' \
+           --arg i "$id" --arg id "$ident" --arg ty "$type" --arg tr "$tier" --arg rv "$_reviewer" --arg ds "$_rstate" --arg ak "$ask" --arg rc "$recommend"
+        # No separate undelivered row: the lead-route row above already carries
+        # delivery=<state>, and a second row for the same event is how one send
+        # becomes two data points (the re-inflation DIVE-1968 spent a round undoing).
         return
       fi
     fi
@@ -4247,8 +4270,15 @@ _gate_channel_proof_ok() {
 # built notify log is group-writable for agent-filed gates (DIVE-1345), while
 # audit_log provides the tamper-evident event stream. Failures are ALSO loud on
 # stderr; an unanswered gate must never look delivered merely because curl ran.
-_task_gate_delivery_log() { # <ok|error> <task_ids> <chat> <message_id> <detail>
+_task_gate_delivery_log() { # <ok|error> <task_ids> <chat> <message_id> <detail> [next_step]
   local result="$1" task_ids="$2" chat="$3" message_id="$4" detail="$5"
+  # DIVE-2011: the failure warn's tail used to state "trying a visible group
+  # fallback" unconditionally, which is true only of the Bot API path. On the
+  # lead-route rail there is no group fallback, so the caller says what actually
+  # happens next. A wrong sentence in a shipped warn outlives the analysis that
+  # produced it (see the "28 rows on 2 tasks" correction below) — so it is a
+  # parameter, not a comment.
+  local next_step="${6:-trying a visible group fallback}"
   # DIVE-1968 criterion 3: count the ATTEMPT, not the write. The delivery
   # assertion in task_need_notify needs to know whether this gate reached a
   # terminal verdict at all, and it must reach the same answer on a fenced
@@ -4346,7 +4376,7 @@ _task_gate_delivery_log() { # <ok|error> <task_ids> <chat> <message_id> <detail>
     _TASK_GATE_TELEMETRY_FENCED=1
     warn "gate-delivery telemetry withheld: TASKS_DB is not the production store, so these rows are NOT written to the fleet log or audit (DIVE-1968). Set FIVEDIVE_GATE_NOTIFY_LOG to capture them locally."
   fi
-  [[ "$result" == "ok" ]] || warn "$idents: gate alert delivery FAILED for chat ${chat:-none} (${detail:-unknown}); trying a visible group fallback"
+  [[ "$result" == "ok" ]] || warn "$idents: gate alert delivery FAILED for chat ${chat:-none} (${detail:-unknown}); ${next_step}"
 }
 
 # DIVE-1506 — fail-closed guard: a gate alert (task_need_notify) or an /inbox digest
@@ -4656,11 +4686,24 @@ _task_gate_reply_markup() { # <row_id> <type> <options> <recommend> <nonce> <cha
 # and the assertion was wrong: both drive a stubbed send that reports DELIVERED,
 # which is exactly the delivered-but-unrecorded shape. Both pass UNCHANGED here —
 # that they were not edited to accommodate this diff is the point.
+#
+# DIVE-2011: the assertion now fences the LEAD-ROUTE rail too, by dispatch rather
+# than by a second copy. A routed gate never reached this wrapper at all — it sent
+# its handoff inline and `return`ed before the notify path was called — so
+# "no exit without a delivery verdict" was true of the human ping ONLY, on the
+# rail that now carries most builder gates. Measured: DIVE-1989's approval gate was
+# filed and lead-cleared inside the post-assertion window and gate-notify.log holds
+# nothing for it. One wrapper, two deliverers: a parallel assertion would be a
+# second thing to go inert, which is the failure mode of the thing being fixed.
 task_need_notify() {
   TASK_GATE_DELIVERY_ROWS=0
   TASK_SEND_DELIVERED=0
   local _rc=0
-  _task_need_notify_deliver "$@" || _rc=$?
+  if [[ -n "${TASK_GATE_ROUTE_TO:-}" ]]; then
+    _task_need_route_deliver "$@" || _rc=$?
+  else
+    _task_need_notify_deliver "$@" || _rc=$?
+  fi
   if (( ${TASK_GATE_DELIVERY_ROWS:-0} == 0 )); then
     if [[ "${TASK_SEND_DELIVERED:-0}" == "1" ]]; then
       _task_gate_delivery_log ok "$1" "${TASK_CH_CHAT:-}" "${TASK_SEND_MESSAGE_IDS%%,*}" \
@@ -4673,6 +4716,126 @@ task_need_notify() {
     fi
   fi
   return $_rc
+}
+
+# DIVE-2011 — the LEAD-ROUTE rail's deliverer, the routed twin of
+# _task_need_notify_deliver. Same wrapper, same telemetry, same rc contract.
+#
+# What it replaces, verbatim from the branch it was lifted out of:
+#
+#   ( 5dive agent send "$_reviewer" "$_hmsg" --from="$actor" >/dev/null 2>&1 & ) || true
+#   ok "$ident routed to $_reviewer ..."
+#
+# Three defects in two lines, and the third is the one that hides the other two:
+# the send is backgrounded, both streams go to /dev/null, and `|| true` sits
+# outside the subshell — so its exit status is not merely ignored, it is
+# STRUCTURALLY UNOBSERVABLE. "routed to X" printed whether or not X existed, was
+# running, or had a live tmux pane to inject into.
+#
+# The fix has to survive one hard constraint: `5dive agent send` waits up to 45s
+# for the receiver's input prompt (wait_agent_input_ready) and a BUSY-but-healthy
+# peer burns that whole budget. So neither of the two obvious fixes works —
+# a synchronous send stalls the filer for the better part of a minute on the
+# COMMON case, and a `timeout`-truncated one kills the child DURING the readiness
+# wait, i.e. before the inject, converting a delivered handoff into a lost one.
+# Making the send observable must not make it worse.
+#
+# So: observe the FAST FAILURES synchronously and let the slow tail run detached.
+# Every shape we actually care about — unknown agent (require_agent), dead tmux
+# session (E_NOT_RUNNING), sudo denied (the DIVE-1337 scoped-a2a gap), CLI absent
+# — is decided in well under a second, BEFORE the readiness wait. A short poll on
+# the child's own rc therefore catches all of them at the filer, while a peer that
+# is merely mid-turn is left to finish in the background.
+#
+# THE CHILD WRITES THE ROW, not the parent, and writes its rc file only AFTER the
+# row lands — so "parent observed an rc" implies "the row is already on disk", and
+# there is exactly one writer per gate with no double-count. The parent credits
+# TASK_GATE_DELIVERY_ROWS for the same reason the privileged re-send does: the row
+# exists, it was just written one process over, and re-logging here would
+# re-inflate the very telemetry DIVE-1968 spent a round decontaminating.
+#
+# The in-flight case is reported as in-flight, NOT as delivered and NOT as failed.
+# Calling it a failure would manufacture error rows for healthy busy peers — the
+# opposite-direction bias, on the ticket about a mis-measured dataset — and calling
+# it delivered is the lie being removed. TASK_GATE_ROUTE_STATE carries the three
+# states out to the caller's ok line, so the printed claim never exceeds what was
+# observed. rc stays on the existing 0/3 contract (3 = filed, NOT notified) rather
+# than minting a new code the human path's callers would not recognise.
+TASK_GATE_ROUTE_TO=""
+TASK_GATE_ROUTE_ROLE=""
+TASK_GATE_ROUTE_STATE=""
+_task_need_route_deliver() {
+  local ident="$1" need_type="$2" ask="$3" options="${4:-}" recommend="${5:-}"
+  local reviewer="${TASK_GATE_ROUTE_TO:-}" filer="${TASK_GATE_FILER:-}"
+  local role="${TASK_GATE_ROUTE_ROLE:-review}"
+  TASK_GATE_ROUTE_STATE="failed"
+  [[ -n "$reviewer" ]] || return 3
+  # The ident, not the row id: _task_gate_delivery_log resolves numeric ids with a
+  # DB read, and the detached child must not touch the store the parent is writing.
+  local msg="🧭 [${ident}] routed to you for ${role} (${need_type} gate). ${ask}"
+  [[ -n "$options" ]]   && msg+=" Options: ${options}."
+  [[ -n "$recommend" ]] && msg+=" ${filer} recommends: ${recommend}."
+  msg+=" Resolve: 5dive task answer ${ident} --value=\"<choice>\" — or re-file to escalate to the human."
+  if ! command -v 5dive >/dev/null 2>&1; then
+    TASK_NOTIFY_FAIL_REASON="the 5dive CLI is not on PATH here, so the handoff to ${reviewer} could never be sent"
+    _task_gate_delivery_log error "$ident" "agent:${reviewer}" "" \
+      "lead-route handoff to ${reviewer} not attempted: no 5dive CLI on PATH" \
+      "the gate stands and the re-nag escalates it"
+    return 3
+  fi
+  local _d; _d=$(mktemp -d "${TMPDIR:-/tmp}/5dive-gate-route.XXXXXX" 2>/dev/null) || _d=""
+  if [[ -z "$_d" ]]; then
+    # No scratch dir means no rc channel, so the send would be unobservable again.
+    # Send it anyway (delivery beats measurement) but record the blind spot as what
+    # it is rather than claiming a verdict we cannot have.
+    ( 5dive agent send "$reviewer" "$msg" --from="$filer" >/dev/null 2>&1 & ) || true
+    TASK_GATE_ROUTE_STATE="inflight"
+    _task_gate_delivery_log error "$ident" "agent:${reviewer}" "" \
+      "lead-route handoff to ${reviewer} dispatched UNOBSERVED: no writable scratch dir for the send's exit status" \
+      "the gate stands and the re-nag escalates it"
+    return 0
+  fi
+  # Detached so it outlives this command, but no longer mute: the child logs the
+  # terminal verdict itself, then publishes its rc, then cleans up its own dir (so
+  # cleanup has a single owner and cannot race the parent's poll).
+  ( {
+      local _crc=0 _cout=""
+      _cout=$(5dive agent send "$reviewer" "$msg" --from="$filer" 2>&1) || _crc=$?
+      if (( _crc == 0 )); then
+        _task_gate_delivery_log ok "$ident" "agent:${reviewer}" "" \
+          "lead-route handoff delivered to ${reviewer} (${role}) via 5dive agent send"
+      else
+        _task_gate_delivery_log error "$ident" "agent:${reviewer}" "" \
+          "5dive agent send to ${reviewer} failed rc=${_crc}: ${_cout//$'\n'/ }" \
+          "the gate stands and the re-nag escalates it"
+      fi >/dev/null 2>&1
+      printf '%s' "$_crc" >"${_d}/rc" 2>/dev/null || true
+      sleep 5; rm -rf "$_d" 2>/dev/null || true
+    } & ) || true
+  # Bounded observation window. 3s is comfortably past every fast-failure shape
+  # above and far short of the 45s readiness wait, so it separates "cannot deliver"
+  # from "not delivered YET" without paying for the latter.
+  local _w=0 _rc=""
+  while (( _w < 30 )); do
+    if [[ -s "${_d}/rc" ]]; then _rc=$(cat "${_d}/rc" 2>/dev/null) || _rc=""; break; fi
+    sleep 0.1; _w=$((_w+1))
+  done
+  # The child owns the row in every branch below; credit it so the wrapper's
+  # assertion does not synthesise a duplicate (see the privileged re-send).
+  TASK_GATE_DELIVERY_ROWS=$(( ${TASK_GATE_DELIVERY_ROWS:-0} + 1 ))
+  if [[ -z "$_rc" ]]; then
+    TASK_GATE_ROUTE_STATE="inflight"
+    return 0
+  fi
+  if [[ "$_rc" == "0" ]]; then
+    TASK_SEND_DELIVERED=1
+    TASK_GATE_ROUTE_STATE="delivered"
+    return 0
+  fi
+  TASK_GATE_ROUTE_STATE="failed"
+  TASK_NOTIFY_FAIL_REASON="the handoff send to ${reviewer} failed (rc=${_rc})"
+  warn "${ident}: the lead-route handoff to ${reviewer} FAILED (5dive agent send rc=${_rc}) — the gate is filed and routed on the record but ${reviewer} was NOT pinged. The re-nag escalates it (<=15 min); answerable now with: 5dive task answer ${ident}"
+  return 3
 }
 
 _task_need_notify_deliver() {

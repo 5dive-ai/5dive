@@ -37,7 +37,14 @@ tasks_db_init
 
 # Never DM the human or shell to a peer; record instead.
 HUMAN_PINGED=0
-task_need_notify() { HUMAN_PINGED=1; }
+# DIVE-2011: stub the HUMAN deliverer, not the wrapper. task_need_notify is now
+# the shared entry point for BOTH rails (it dispatches to the lead-route
+# deliverer when TASK_GATE_ROUTE_TO is set), so stubbing the wrapper would make
+# this sentinel fire on a ROUTED gate — i.e. report a human ping that never
+# happened — and would suppress the route send this harness is asserting on.
+# One layer down, HUMAN_PINGED means what its name says: the paired human's
+# notify path ran. The routed rail runs for real against the `5dive` stub.
+_task_need_notify_deliver() { HUMAN_PINGED=1; }
 audit_log() { :; }
 ROUTE_FILE="$TMP/route.log"; : >"$ROUTE_FILE"
 5dive() { if [[ "${1:-}" == "agent" && "${2:-}" == "send" ]]; then printf '%s\n' "${3:-}" >>"$ROUTE_FILE"; fi; return 0; }
