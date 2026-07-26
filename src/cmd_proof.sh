@@ -43,6 +43,18 @@
 # user must own the box's git push credentials — on boxes where root has none
 # (creds live with a service user), pass --user=<that user>.
 
+# DIVE-2080. `five_self_bundle` lives in src/lib/self.sh, concatenated ahead of this
+# file in the bundle — so in the built artifact this block is dead. It exists for the
+# unit harnesses that source ONLY this file out of the split tree: without it the call
+# sites below would die as command-not-found, which is how a "resolve myself honestly"
+# rule turns back into a silent wrong answer.
+if ! declare -F five_self_bundle >/dev/null 2>&1; then
+  _five_self_lib="$(dirname -- "${BASH_SOURCE[0]}")/lib/self.sh"
+  # shellcheck source=lib/self.sh
+  [[ -r "$_five_self_lib" ]] && source "$_five_self_lib"
+  unset _five_self_lib
+fi
+
 _proof_pref_file() { echo "${STATE_DIR}/proof.json"; }
 # Overridable for isolated tests; the real path needs root to write.
 _PROOF_CRON="${_PROOF_CRON:-/etc/cron.d/5dive-proof}"
@@ -384,7 +396,11 @@ _proof_build() {
   fi
 
   local self day_json week_json today now_iso cli_version
-  self="$(command -v 5dive 2>/dev/null || echo "$0")"
+  # DIVE-2080: the published badge IS the evidence, so it must be computed by the
+  # bundle that is publishing it. `command -v 5dive` sat here and handed the job to
+  # whatever was installed on the box — a badge describing a different artifact.
+  self="$(five_self_bundle)" \
+    || { echo "proof badges: could not identify the running 5dive bundle to compute the digest" >&2; return "$E_GENERIC"; }
   day_json="$("$self" digest --json 2>/dev/null)"
   week_json="$("$self" digest --json --7d 2>/dev/null)"
   [ -n "$day_json" ] && [ -n "$week_json" ] || { echo "digest produced no output" >&2; return "$E_GENERIC"; }
@@ -936,7 +952,12 @@ _proof_scorecard() {
   case "$by" in tier|class) ;; *) fail "$E_USAGE" "proof scorecard: --by must be tier|class" ;; esac
 
   local self db work
-  self="$(command -v 5dive 2>/dev/null || echo "$0")"
+  # DIVE-2080, the hole DIVE-2061 closed one call up. selfcheck's probe 7 carefully
+  # resolves the bundle under test and shells `"$self" proof scorecard --7d` into it —
+  # and this line then re-resolved onto the INSTALLED CLI, so the metric rows the probe
+  # grades came from a different artifact. Fail loudly rather than grade a stranger.
+  self="$(five_self_bundle)" \
+    || fail "$E_GENERIC" "proof scorecard: could not identify the running 5dive bundle to compute the digest"
   db="${TASKS_DB:-${STATE_DIR}/tasks/tasks.db}"
   # DIVE-1864 lesson, same trap one verb along: a live digest blows past
   # MAX_ARG_STRLEN, so these go through FILES, never the environment. Passing

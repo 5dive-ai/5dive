@@ -43,6 +43,18 @@
 # in probes whose coverage claim was true along the only axis anyone had varied — see
 # community/wiki/mutation-coverage-is-per-dimension.md.
 
+# DIVE-2080. `five_self_bundle` lives in src/lib/self.sh, concatenated ahead of this
+# file in the bundle — so in the built artifact this block is dead. It exists for the
+# unit harnesses that source ONLY this file out of the split tree: without it the call
+# sites below would die as command-not-found, which is how a "resolve myself honestly"
+# rule turns back into a silent wrong answer.
+if ! declare -F five_self_bundle >/dev/null 2>&1; then
+  _five_self_lib="$(dirname -- "${BASH_SOURCE[0]}")/lib/self.sh"
+  # shellcheck source=lib/self.sh
+  [[ -r "$_five_self_lib" ]] && source "$_five_self_lib"
+  unset _five_self_lib
+fi
+
 # The corpus, in order. Declared in ONE place: the report header, the --list output and
 # the union script's contract all read this, so they cannot drift into three lists.
 SELFCHECK_PROBES=(
@@ -110,16 +122,14 @@ _sc_tmp() { mktemp -d "${TMPDIR:-/tmp}/5dive-selfcheck.XXXXXX" 2>/dev/null; }
 # Order is running-bundle first, PATH last, and every candidate must actually BE a
 # 5dive bundle (a sourced `src/cmd_selfcheck.sh` under a test harness would otherwise
 # resolve `$0` to the harness itself). Returns 1 rather than guessing.
-_sc_self() {
-  local c
-  for c in "${BASH_SOURCE[0]:-}" "$0" "$(command -v 5dive 2>/dev/null)"; do
-    [[ -n "$c" && -x "$c" && -f "$c" ]] || continue
-    grep -qm1 '^readonly FIVE_VERSION=' "$c" 2>/dev/null || continue
-    readlink -f "$c" 2>/dev/null || printf '%s' "$c"
-    return 0
-  done
-  return 1
-}
+#
+# DIVE-2080 hoisted the body into src/lib/self.sh as `five_self_bundle`, because the
+# rule "grade the artifact you are part of" is only enforceable with ONE
+# implementation of it — the copy of this logic that did NOT exist was exactly how
+# `proof scorecard` defeated this probe one call deeper. Kept as a named wrapper: the
+# probes and tests below read better against _sc_self, and it marks selfcheck as the
+# original caller.
+_sc_self() { five_self_bundle; }
 
 # --- probe 1: gate delivery ---------------------------------------------------
 # DIVE-1968's assertion loop, closed. The EFFECT of filing a gate is a DELIVERY ROW,

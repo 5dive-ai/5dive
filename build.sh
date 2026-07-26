@@ -24,6 +24,7 @@ OUT="${BUILD_OUT:-5dive}"
 cat \
   src/header.sh \
   src/lib/error_codes.sh \
+  src/lib/self.sh \
   src/lib/output.sh \
   src/lib/validation.sh \
   src/lib/models.sh \
