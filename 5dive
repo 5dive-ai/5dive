@@ -41635,6 +41635,17 @@ else:
 #   - ships > 0               -> a real rate, shipping with the sample it rests
 #     on and with the reverts it could NOT attribute, because a rate that hides
 #     what it excluded is a coverage claim it never earned.
+#
+# The denominator is named for what it COUNTS — commits pushed through
+# `5dive push` — and never as bare "ships" (main, reviewing this change). Both of
+# its errors are then visible in the label rather than in a note the reader may
+# not reach. Work that bypasses `5dive push` under-counts it and biases the rate
+# UP, which is pessimistic and safe in a published autonomy number; a branch
+# pushed and then ABANDONED counts as a ship, which inflates the denominator and
+# biases the rate DOWN. A flattering denominator produces a flattering rate, and
+# that is the 0.0%-reads-as-"we never roll back" failure one level up. Naming the
+# denominator honestly makes the row honest by construction rather than
+# honest-if-you-read-the-note. Reconciling pushed-vs-merged is DIVE-2127.
 _ships = os.environ.get("SHIPS", "").strip()
 _rb    = os.environ.get("ROLLBACKS", "").strip()
 _rbu   = os.environ.get("ROLLBACKS_UNPROVEN", "").strip()
@@ -41645,18 +41656,19 @@ if not _ships.isdigit():
                                  "self-revert yet (DIVE-1923)"))
 elif int(_ships) == 0:
     metrics.append(metric("autonomous rollback rate", None,
-                          nodata=("no ship recorded through `5dive push` in this window"
+                          nodata=("nothing pushed through `5dive push` in this window"
                                   + (f" (ledger opened {_since})" if _since else " (ledger is empty)")
-                                  + " — a rate over zero ships is undefined, not 0.0% (DIVE-1923)")))
+                                  + " — a rate over an empty denominator is undefined, not 0.0% (DIVE-1923)")))
 else:
     _s, _r, _u = int(_ships), int(_rb or 0), int(_rbu or 0)
-    _sample = f"{_r} of {_s} recorded ships reverted"
+    _sample = f"{_r} of {_s} commits pushed through `5dive push` were reverted"
     if _u:
         _sample += (f"; {_u} further revert(s) undid commits absent from this ledger, so they "
                     f"cannot be shown to be self-inflicted and are excluded from the numerator")
     metrics.append(metric("autonomous rollback rate", f"{round(_r / _s * 100, 1)}%", _sample,
-                          note="a ship is a commit pushed through `5dive push`; work landed by "
-                               "any other route is invisible to this row"))
+                          note="the denominator is commits PUSHED, not commits merged — a branch "
+                               "pushed and abandoned still counts (which biases this rate DOWN), "
+                               "and work landed by any other route is invisible (which biases it UP)"))
 
 by = os.environ["BY"]
 groups = []

@@ -206,11 +206,11 @@ grep -q '2026-07-26' <<<"$R" \
 R="$(render SHIPS=100 ROLLBACKS=3 ROLLBACKS_UNPROVEN=0)"
 grep -q '"value": "3.0%"' <<<"$R" \
   && ok_t "ships > 0 renders a real rate" || bad_t "rate wrong" "$R"
-grep -q '3 of 100 recorded ships reverted' <<<"$R" \
+grep -q '3 of 100 commits pushed through' <<<"$R" \
   && ok_t "the sample rides ON the number, never in a footnote" || bad_t "no sample" "$R"
 
 R="$(render SHIPS=100 ROLLBACKS=0 ROLLBACKS_UNPROVEN=0)"
-grep -q '"value": "0.0%"' <<<"$R" && grep -q '0 of 100 recorded ships reverted' <<<"$R" \
+grep -q '"value": "0.0%"' <<<"$R" && grep -q '0 of 100 commits pushed through' <<<"$R" \
   && ok_t "0.0% over a NON-empty denominator is a real measurement and does ship" \
   || bad_t "honest zero suppressed" "a sourced zero must render; only an empty denominator must not: $R"
 
@@ -220,6 +220,24 @@ grep -q 'excluded from the numerator' <<<"$R" \
   || bad_t "hidden exclusions" "a rate that hides what it excluded is a coverage claim it never earned: $R"
 grep -q '"value": "1.0%"' <<<"$R" \
   && ok_t "unattributable reverts stay OUT of the numerator" || bad_t "inflated numerator" "$R"
+
+# --- Case 5b: the DENOMINATOR'S LABEL (main, reviewing this change). Naming it
+#     bare "ships" hides the direction of error that FLATTERS us: a branch pushed
+#     and then abandoned counts, inflating the denominator and biasing the rate
+#     DOWN. (Work that bypasses `5dive push` biases it UP, which is pessimistic
+#     and safe.) A flattering denominator produces a flattering rate — the same
+#     failure as the 0.0% this ticket exists to refuse, one level up. The row has
+#     to be honest by construction, not honest-if-you-read-the-note.
+R="$(render SHIPS=100 ROLLBACKS=3 ROLLBACKS_UNPROVEN=0)"
+grep -q 'recorded ships reverted' <<<"$R" \
+  && bad_t "the denominator is labelled bare \"ships\"" \
+           "name what it counts — commits PUSHED — or the abandoned-branch inflation is invisible: $R" \
+  || ok_t "the denominator is named for what it counts, not called bare \"ships\""
+grep -q 'PUSHED, not commits merged' <<<"$R" \
+  && ok_t "the row states pushed-not-merged in its own note" || bad_t "no pushed/merged note" "$R"
+grep -q 'biases this rate DOWN' <<<"$R" && grep -q 'biases it UP' <<<"$R" \
+  && ok_t "BOTH bias directions are stated — the flattering one is not omitted" \
+  || bad_t "one-sided bias note" "the direction that makes us look good is the one that must be named: $R"
 
 # --- Case 6: the shell-layer query. DIVE-1914's finding was that a guard written
 #     at the renderer layer passes while the defect sits in the shell's query
