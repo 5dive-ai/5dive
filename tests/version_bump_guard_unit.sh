@@ -61,6 +61,32 @@ commit_unrelated() {
   git rev-parse HEAD
 }
 
+# commit_missing_header BUNDLE_VERSION SHA_CONTENT MSG -> src/header.sh does
+# not exist at all (DIVE-2071 proof (a): extraction from NEW is impossible).
+commit_missing_header() {
+  rm -rf src
+  printf '#!/usr/bin/env bash\nreadonly FIVE_VERSION="%s"\necho hi\n' "$1" > 5dive
+  printf '%s\n' "$2" > 5dive.sha256
+  git add -A >/dev/null
+  git commit -q -m "$3"
+  git rev-parse HEAD
+}
+
+# commit_drifted_header VERSION BUNDLE_VERSION SHA_CONTENT MSG -> src/header.sh
+# uses a renamed identifier (FIVE_VERSION_XX) so the guards' `FIVE_VERSION=`
+# anchor can no longer find it, simulating a rename or a src/ reorg
+# (DIVE-2071 proof (b)). The bundle's own anchor is left intact so this
+# isolates the header-extraction failure specifically.
+commit_drifted_header() {
+  mkdir -p src
+  printf 'readonly FIVE_VERSION_XX="%s"\n' "$1" > src/header.sh
+  printf '#!/usr/bin/env bash\nreadonly FIVE_VERSION="%s"\necho hi\n' "$2" > 5dive
+  printf '%s\n' "$3" > 5dive.sha256
+  git add -A >/dev/null
+  git commit -q -m "$4"
+  git rev-parse HEAD
+}
+
 c0="$(commit_release 0.1.0 0.1.0 shaA "init 0.1.0")"
 # incident shape: bundle rebuilt (new content, new sha) but version NOT bumped
 c1="$(commit_release 0.1.0 0.1.0 shaB "follow-up: bundle rebuilt, version bump silently failed")"
@@ -123,6 +149,80 @@ bash "$BUMP_GUARD" "$c1" "$c1" >/dev/null 2>&1
 assert_exit "bump-guard: sanity — comparing a commit against itself never blocks" 0 "$?"
 bash "$UNIQ_SCAN" "$c1" "$c1" >/dev/null 2>&1
 assert_exit "uniqueness-scan: sanity — comparing a commit against itself never blocks" 0 "$?"
+
+# --- DIVE-2071: extraction failure at NEW must block loudly, not fail open ---
+# Proof (a): NEW is missing src/header.sh outright. Pre-fix this returned
+# rc=0 — every content assertion is behind `-n "$new_ver"`, so an empty
+# extraction skipped both of them and the guard reported "clear to push".
+git checkout -q "$c2"
+c6="$(commit_missing_header 0.1.2 shaE "src/header.sh deleted (extraction impossible)")"
+
+out="$(bash "$BUMP_GUARD" "$c6" "$c2" 2>&1)"; rc=$?
+assert_exit "bump-guard: blocks when src/header.sh is missing at NEW (was fail-open)" 1 "$rc"
+if [[ "$out" == *"could not extract FIVE_VERSION from src/header.sh"* ]]; then
+  ok_t "bump-guard: missing-header failure gets its own distinct message"
+else
+  bad_t "bump-guard: missing-header failure gets its own distinct message" "$out"
+fi
+
+out="$(bash "$UNIQ_SCAN" "$c6" "$c2" 2>&1)"; rc=$?
+assert_exit "uniqueness-scan: blocks when src/header.sh is missing at NEW (was fail-open)" 1 "$rc"
+
+# Proof (b): the FIVE_VERSION anchor in src/header.sh has drifted (renamed),
+# run against the REAL incident shape (same version, bundle rebuilt with
+# different content). Pre-fix this also returned rc=0 — it "silently passes
+# the exact bug it exists to catch" once the anchor can't be found, for
+# either commit in the pair.
+git checkout -q "$c0"
+d0="$(commit_drifted_header 0.1.0 0.1.0 shaA "init 0.1.0, but header anchor already renamed")"
+git checkout -q "$d0"
+d1="$(commit_drifted_header 0.1.0 0.1.0 shaB "bundle rebuilt, version bump silently failed, anchor still renamed")"
+
+out="$(bash "$BUMP_GUARD" "$d1" "$d0" 2>&1)"; rc=$?
+assert_exit "bump-guard: blocks the incident even when the FIVE_VERSION anchor drifted (was fail-open)" 1 "$rc"
+
+out="$(bash "$UNIQ_SCAN" "$d1" "$d0" 2>&1)"; rc=$?
+assert_exit "uniqueness-scan: blocks the incident even when the FIVE_VERSION anchor drifted (was fail-open)" 1 "$rc"
+
+# --- DIVE-2071: name the actual colliding commit; do not always blame $BASE --
+# Genuine intra-range collision: BOTH claims of the version are introduced by
+# this range itself, with no instance on BASE at all. The pre-fix message
+# unconditionally said "already used on $BASE", which is wrong here — the
+# prior claim is another NEW commit, not history reachable from BASE.
+git checkout -q "$c2"
+e0="$(commit_release 0.5.0 0.5.0 shaX "unrelated baseline, 0.5.0")"
+e1="$(commit_release 0.6.0 0.6.0 shaY "first claim of 0.6.0, introduced by this range")"
+e2="$(commit_release 0.6.0 0.6.0 shaZ "second claim of 0.6.0, different bundle, same range")"
+
+out="$(bash "$UNIQ_SCAN" "$e2" "$e0" 2>&1)"; rc=$?
+assert_exit "uniqueness-scan: catches a genuine intra-range collision" 1 "$rc"
+if [[ "$out" == *"earlier in this range"* && "$out" == *"$e1"* ]]; then
+  ok_t "uniqueness-scan: intra-range collision names the earlier NEW commit"
+else
+  bad_t "uniqueness-scan: intra-range collision names the earlier NEW commit" "$out"
+fi
+if [[ "$out" != *"already used on $e0"* ]]; then
+  ok_t "uniqueness-scan: intra-range collision does not misattribute the prior claim to \$BASE"
+else
+  bad_t "uniqueness-scan: intra-range collision does not misattribute the prior claim to \$BASE" "$out"
+fi
+
+# Control: when the prior claim genuinely lives further back in BASE's own
+# history than BASE's tip (a docs-only commit sits on top, touching neither
+# file), the message must name the ORIGINAL claiming commit, not just repeat
+# the literal $BASE argument.
+git checkout -q "$c0"
+g_base_tip="$(commit_unrelated "docs-only commit on top of 0.1.0, BASE tip")"
+git checkout -q "$g_base_tip"
+g1="$(commit_release 0.1.0 0.1.0 shaB "reuse 0.1.0 with a different bundle")"
+
+out="$(bash "$UNIQ_SCAN" "$g1" "$g_base_tip" 2>&1)"; rc=$?
+assert_exit "uniqueness-scan: catches a collision whose origin predates BASE's own tip" 1 "$rc"
+if [[ "$out" == *"already used on $g_base_tip"* && "$out" == *"$c0"* ]]; then
+  ok_t "uniqueness-scan: names the actual historical commit, not just the BASE argument"
+else
+  bad_t "uniqueness-scan: names the actual historical commit, not just the BASE argument" "$out"
+fi
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 (( FAIL == 0 ))
