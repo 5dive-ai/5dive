@@ -327,9 +327,28 @@ cmd_info() {
   model=$(resolve_agent_model "$type" "$name" || true)
   effort=$(resolve_agent_effort "$type" "$name" || true)
 
+  # DIVE-2079: measure the ENFORCED sudo grant so `info` reports what this agent
+  # can actually do, not only the label the registry stores. See
+  # agent_sudo_grant/classify_sudo_grant in cmd_agent_create.sh for the classes
+  # and for why the two can disagree. `|| true`: an unmeasurable grant is a
+  # reported `unknown`, never a failed `info`.
+  local grant grant_class grant_runas grant_extra grant_implied grant_english
+  grant=$(agent_sudo_grant "agent-${name}" || true)
+  [[ -n "$grant" ]] || grant="unknown|-|0"
+  grant_class="${grant%%|*}"
+  grant_runas="${grant#*|}"; grant_runas="${grant_runas%%|*}"
+  grant_extra="${grant##*|}"
+  grant_implied=$(isolation_implied_by_grant "$grant_class")
+  grant_english=$(sudo_grant_english "$grant_class")
+
   local obj
   obj=$(jq -c \
     --arg n "$name" \
+    --arg grantClass "$grant_class" \
+    --arg grantRunas "$grant_runas" \
+    --arg grantExtra "$grant_extra" \
+    --arg grantImplied "$grant_implied" \
+    --arg grantEnglish "$grant_english" \
     --arg default_wd "$DEFAULT_WORKDIR" \
     --arg active "${active:-unknown}" \
     --arg enabled "${enabled:-unknown}" \
@@ -345,6 +364,23 @@ cmd_info() {
       authProfile: ($a.authProfile // null),
       botUsername: ($a.botUsername // null),
       isolation: ($a.isolation // "admin"),
+      # DIVE-2079: `isolation` above is the stored LABEL (and `// "admin"` means
+      # a legacy agent with no field at all still reads `admin`); `sudo` below is
+      # the MEASURED grant. `diverges` is true when they disagree, which is the
+      # whole point of reporting both.
+      isolationLabelled: ($a.isolation != null),
+      sudo: {
+        grant: $grantClass,
+        runas: $grantRunas,
+        scope: $grantEnglish,
+        impliedIsolation: $grantImplied,
+        measured: ($grantClass != "unknown"),
+        extraEntries: ($grantExtra == "1"),
+        diverges: (
+          $grantClass != "unknown"
+          and $grantImplied != ($a.isolation // "admin")
+        )
+      },
       heartbeat: ($a.heartbeat // null),
       createdAt: $a.createdAt,
       active: $active,
@@ -366,9 +402,13 @@ cmd_info() {
       "channels:    \(.channels)\(if .botUsername then " (@\(.botUsername))" else "" end)",
       "profile:     \(.authProfile // "-")",
       "workdir:     \(.workdir)",
-      "isolation:   \(.isolation)",
+      "isolation:   \(.isolation) (label\(if .isolationLabelled then "" else ", defaulted — unset in registry" end))",
+      "sudo:        \(if .sudo.measured then "\(.sudo.grant) — \(.sudo.scope); runas \(.sudo.runas)" else "unknown — not measurable from here; run `sudo -n -l` as agent-\(.name), or re-run this as root" end)\(if .sudo.extraEntries then " (+ entries this CLI did not write)" else "" end)",
       "state:       \(.active) / \(.enabled)",
-      "created:     \(.createdAt // "unknown")"
+      "created:     \(.createdAt // "unknown")",
+      (if .sudo.diverges then
+         "\nWARNING: the label and the enforced grant DISAGREE. Label \"\(.isolation)\" describes \(if .isolation == "admin" then "the 5dive CLI as root" elif .isolation == "standard" then "5dive agent _deliver/_capture only" else "no sudo" end); the enforced grant is \(.sudo.grant) (\(.sudo.scope), runas \(.sudo.runas)). Trust the grant, not the label. Nothing re-writes a drop-in after create (create_agent_user is the only writer), so a drifted grant stays drifted until someone edits /etc/sudoers.d/agent-\(.name) by hand or recreates the agent."
+       else empty end)
     ' <<<"$obj"
   fi
 }

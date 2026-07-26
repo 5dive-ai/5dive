@@ -8204,9 +8204,28 @@ cmd_info() {
   model=$(resolve_agent_model "$type" "$name" || true)
   effort=$(resolve_agent_effort "$type" "$name" || true)
 
+  # DIVE-2079: measure the ENFORCED sudo grant so `info` reports what this agent
+  # can actually do, not only the label the registry stores. See
+  # agent_sudo_grant/classify_sudo_grant in cmd_agent_create.sh for the classes
+  # and for why the two can disagree. `|| true`: an unmeasurable grant is a
+  # reported `unknown`, never a failed `info`.
+  local grant grant_class grant_runas grant_extra grant_implied grant_english
+  grant=$(agent_sudo_grant "agent-${name}" || true)
+  [[ -n "$grant" ]] || grant="unknown|-|0"
+  grant_class="${grant%%|*}"
+  grant_runas="${grant#*|}"; grant_runas="${grant_runas%%|*}"
+  grant_extra="${grant##*|}"
+  grant_implied=$(isolation_implied_by_grant "$grant_class")
+  grant_english=$(sudo_grant_english "$grant_class")
+
   local obj
   obj=$(jq -c \
     --arg n "$name" \
+    --arg grantClass "$grant_class" \
+    --arg grantRunas "$grant_runas" \
+    --arg grantExtra "$grant_extra" \
+    --arg grantImplied "$grant_implied" \
+    --arg grantEnglish "$grant_english" \
     --arg default_wd "$DEFAULT_WORKDIR" \
     --arg active "${active:-unknown}" \
     --arg enabled "${enabled:-unknown}" \
@@ -8222,6 +8241,23 @@ cmd_info() {
       authProfile: ($a.authProfile // null),
       botUsername: ($a.botUsername // null),
       isolation: ($a.isolation // "admin"),
+      # DIVE-2079: `isolation` above is the stored LABEL (and `// "admin"` means
+      # a legacy agent with no field at all still reads `admin`); `sudo` below is
+      # the MEASURED grant. `diverges` is true when they disagree, which is the
+      # whole point of reporting both.
+      isolationLabelled: ($a.isolation != null),
+      sudo: {
+        grant: $grantClass,
+        runas: $grantRunas,
+        scope: $grantEnglish,
+        impliedIsolation: $grantImplied,
+        measured: ($grantClass != "unknown"),
+        extraEntries: ($grantExtra == "1"),
+        diverges: (
+          $grantClass != "unknown"
+          and $grantImplied != ($a.isolation // "admin")
+        )
+      },
       heartbeat: ($a.heartbeat // null),
       createdAt: $a.createdAt,
       active: $active,
@@ -8243,9 +8279,13 @@ cmd_info() {
       "channels:    \(.channels)\(if .botUsername then " (@\(.botUsername))" else "" end)",
       "profile:     \(.authProfile // "-")",
       "workdir:     \(.workdir)",
-      "isolation:   \(.isolation)",
+      "isolation:   \(.isolation) (label\(if .isolationLabelled then "" else ", defaulted — unset in registry" end))",
+      "sudo:        \(if .sudo.measured then "\(.sudo.grant) — \(.sudo.scope); runas \(.sudo.runas)" else "unknown — not measurable from here; run `sudo -n -l` as agent-\(.name), or re-run this as root" end)\(if .sudo.extraEntries then " (+ entries this CLI did not write)" else "" end)",
       "state:       \(.active) / \(.enabled)",
-      "created:     \(.createdAt // "unknown")"
+      "created:     \(.createdAt // "unknown")",
+      (if .sudo.diverges then
+         "\nWARNING: the label and the enforced grant DISAGREE. Label \"\(.isolation)\" describes \(if .isolation == "admin" then "the 5dive CLI as root" elif .isolation == "standard" then "5dive agent _deliver/_capture only" else "no sudo" end); the enforced grant is \(.sudo.grant) (\(.sudo.scope), runas \(.sudo.runas)). Trust the grant, not the label. Nothing re-writes a drop-in after create (create_agent_user is the only writer), so a drifted grant stays drifted until someone edits /etc/sudoers.d/agent-\(.name) by hand or recreates the agent."
+       else empty end)
     ' <<<"$obj"
   fi
 }
@@ -8356,6 +8396,29 @@ seed_agent_git_identity() {
 #                        deferred self-restart use `5dive agent restart --defer`,
 #                        which runs systemd-run internally under the already-root
 #                        CLI, so no raw grant is required.
+#
+# DIVE-2079 — say this outright, because two agents read the `systemd-run *` line
+# above as a claim about the grant this function WRITES and concluded their own
+# `/usr/local/bin/5dive *` was equivalent to `NOPASSWD: ALL`:
+#
+#   It is not, and the difference is not the wildcard. `systemd-run *` collapses
+#   to full root because systemd-run's PURPOSE is to exec an arbitrary command as
+#   root — any argument wildcard on such a binary hands over everything. The
+#   5dive CLI is the opposite case: it is only as wide as its own subcommands,
+#   and the standing invariant stated below (no 5dive subcommand may exec
+#   agent-controlled input as root) is precisely what keeps `5dive *` from
+#   collapsing the same way. The invariant is load-bearing, not decorative — the
+#   day one subcommand execs caller input as root, `cli-root` DOES become
+#   `root-all` and this grant stops being a boundary.
+#
+#   What this grant genuinely does NOT give is a runas target. Every line this
+#   function and render_standard_sudoers write is `(root)` only, so neither an
+#   admin nor a standard agent can `sudo -u claude ...` — they cannot borrow the
+#   `claude` user's authenticated gh/GitHub identity. A legacy pre-DIVE-1002
+#   `(ALL) NOPASSWD: ALL` agent can. That runas breadth, not the command
+#   scoping, is the real split between the two populations that both report
+#   `isolation=admin` today, which is why agent_sudo_grant reports runas
+#   separately from class.
 #   - `journalctl *`     pages through less by default -> `!sh` GTFOBins escape.
 #                        Logs go through `5dive agent logs` (--no-pager path).
 #   - `systemctl status` also pages by default -> same `!sh` escape. Service
@@ -8386,6 +8449,159 @@ SUDOERS
     rm -f "$tmp"
     fail "$E_GENERIC" "generated sudoers for ${user} failed visudo validation; aborting (no partial install)"
   fi
+}
+
+# DIVE-2079: read back a user's ENFORCED sudo grant and classify it — the inverse
+# of the two writers above, so `agent info` can report what an agent can actually
+# do rather than only the label the registry happens to store.
+#
+# Why this exists: `isolation` in the registry is a STORED LABEL, not a
+# measurement, and nothing keeps it honest. The DIVE-1002 v1->v2 migration
+# stamped isolation:"admin" on every pre-existing agent WITHOUT looking at its
+# sudoers file, so an agent provisioned before least-privilege (blanket
+# `(ALL) NOPASSWD: ALL`) reports the same `admin` as one provisioned after it
+# (the CLI-scoped grant write_admin_sudoers emits). Measured 2026-07-26 on
+# poke-two: agent-dev/main/olivia/marketing/community/creative are the former,
+# agent-dev2/dev3/codex/don the latter, and `agent info` called all of them
+# admin. Two agents reasoned about their own privilege from that label and got
+# it wrong in OPPOSITE directions. A label that cannot be wrong is worth more
+# than one that is convenient, so we now report the measurement beside it.
+#
+# Classes, in DESCENDING breadth (classify_sudo_grant reports the widest match):
+#   root-all   `NOPASSWD: ALL` — any command. WIDER than today's `admin`.
+#   cli-root   the whole 5dive CLI as root — exactly what `admin` means today.
+#   cli-scoped only the named hidden subcommands render_standard_sudoers emits
+#              (`agent _deliver|_capture|_self_restart`, `_audit_append`, and
+#              `_push_do` under --can-push) — what `standard` means.
+#   none       no sudoers entries at all — what `sandboxed` means.
+#   custom     entries matching none of the above (hand-edited / drifted).
+#   unknown    not measurable from where this ran (see sudo_grant_lines).
+#
+# Runas breadth is reported SEPARATELY because it, not the command scoping, is
+# what actually separates the two `admin` populations in practice: every grant
+# this CLI writes is `(root)` only, so a standard-or-modern-admin agent cannot
+# `sudo -u claude ...` at all, while a legacy `(ALL)` agent can become any user
+# on the box — including `claude`, whose gh credential is the human's GitHub
+# identity. That is the difference an operator is really asking about.
+
+# Emit the raw grant lines for a user on stdout; rc=1 if unmeasurable from here.
+#
+# Precedence is deliberate: `sudo -l` is the AUTHORITATIVE answer (it resolves
+# /etc/sudoers, group entries and drop-ins together), so we prefer it and only
+# fall back to reading the managed drop-in directly.
+#
+# SUDOERS_D overridden by the caller means "measure from these files only" —
+# that is the test seam, and it also stops a root-run harness from consulting
+# the live policy for a fixture user that does not exist.
+sudo_grant_lines() {
+  local user="$1" d="${SUDOERS_D:-/etc/sudoers.d}" out=""
+  if [[ "$d" == "/etc/sudoers.d" ]]; then
+    # root may list any user; a non-root caller may list only itself, and that
+    # answer is authoritative for it (this is the `sudo -n -l` an agent is told
+    # to run on itself). -n so a policy needing a password never blocks `info`.
+    if [[ "$(id -u)" == "0" ]]; then
+      if out=$(sudo -n -l -U "$user" 2>/dev/null); then printf '%s\n' "$out"; return 0; fi
+    elif [[ "$user" == "$(id -un)" ]]; then
+      if out=$(sudo -n -l 2>/dev/null); then printf '%s\n' "$out"; return 0; fi
+    fi
+  fi
+  [[ -r "${d}/${user}" ]] && { cat "${d}/${user}"; return 0; }
+  # Drop-in absent AND the directory readable => genuinely no managed grant.
+  # (An UNREADABLE directory is not evidence of absence — that is `unknown`.)
+  [[ -r "$d" && ! -e "${d}/${user}" ]] && return 0
+  return 1
+}
+
+# Classify grant lines read from stdin. Echoes `class|runas|extra`:
+#   class  one of the classes documented above (never `unknown` — the caller
+#          decides that from sudo_grant_lines' rc, since no output legitimately
+#          means `none`).
+#   runas  `any` if any entry allows an ALL runas (can become any user incl.
+#          claude), else `root`, else `-` when there are no entries.
+#   extra  1 when unrecognised entries exist ALONGSIDE a wider recognised one,
+#          so a drifted grant is never silently absorbed into a known class.
+#
+# Parses both shapes with one pass, since both carry `(runas)` then commands:
+#   sudoers file  `agent-x ALL=(root) NOPASSWD: /usr/local/bin/5dive, ...`
+#   sudo -l       `    (root) NOPASSWD: /usr/local/bin/5dive, ...`
+# `sudo -l`'s "Matching Defaults entries" preamble carries no parens, so it is
+# skipped by the same test.
+classify_sudo_grant() {
+  local line runas cmds cmd
+  local has_all=0 has_cli=0 has_a2a=0 has_other=0 any=0 runas_any=0
+  while IFS= read -r line; do
+    line="${line%%#*}"
+    [[ "$line" == *"("*")"* ]] || continue
+    runas="${line#*\(}"; runas="${runas%%\)*}"
+    cmds="${line#*\)}"
+    cmds="${cmds#*:}"   # drop the NOPASSWD:/PASSWD: tag; a no-colon tail is unchanged
+    # Split on commas WITHOUT word-splitting: a grant legitimately contains `*`
+    # and IFS-splitting an unquoted `$cmds` would glob-expand it against the cwd.
+    while [[ -n "$cmds" ]]; do
+      case "$cmds" in
+        *,*) cmd="${cmds%%,*}"; cmds="${cmds#*,}" ;;
+        *)   cmd="$cmds"; cmds="" ;;
+      esac
+      cmd="${cmd#"${cmd%%[![:space:]]*}"}"; cmd="${cmd%"${cmd##*[![:space:]]}"}"
+      [[ -n "$cmd" ]] || continue
+      any=1
+      [[ "$runas" == *ALL* ]] && runas_any=1
+      case "$cmd" in
+        ALL)                                            has_all=1 ;;
+        "/usr/local/bin/5dive"|"/usr/local/bin/5dive *") has_cli=1 ;;
+        "/usr/local/bin/5dive agent _deliver"*|"/usr/local/bin/5dive agent _capture"*|\
+        "/usr/local/bin/5dive agent _self_restart"*|"/usr/local/bin/5dive _audit_append"*|\
+        "/usr/local/bin/5dive _push_do"*)                has_a2a=1 ;;
+        *)                                              has_other=1 ;;
+      esac
+    done
+  done
+  local class extra=0
+  if   (( has_all )); then class="root-all"
+  elif (( has_cli )); then class="cli-root"
+  elif (( has_a2a )); then class="cli-scoped"
+  elif (( has_other )); then class="custom"
+  else class="none"
+  fi
+  [[ "$class" != "custom" ]] && (( has_other )) && extra=1
+  local runas="-"
+  (( any )) && { runas="root"; (( runas_any )) && runas="any"; }
+  printf '%s|%s|%s\n' "$class" "$runas" "$extra"
+}
+
+# The isolation label each class WOULD justify. `root-all` maps to no label at
+# all: nothing this CLI can provision is that wide, so it is named for what it
+# is rather than rounded down to the nearest label an operator would misread.
+isolation_implied_by_grant() {
+  case "$1" in
+    root-all) printf 'beyond-admin\n' ;;
+    cli-root) printf 'admin\n' ;;
+    cli-scoped) printf 'standard\n' ;;
+    none)     printf 'sandboxed\n' ;;
+    *)        printf 'custom\n' ;;
+  esac
+}
+
+# One-line human summary of a class, for `agent info`.
+sudo_grant_english() {
+  case "$1" in
+    root-all) printf 'any command, no restriction\n' ;;
+    cli-root) printf 'the 5dive CLI only\n' ;;
+    cli-scoped) printf 'a few named 5dive subcommands only\n' ;;
+    none)     printf 'no sudo\n' ;;
+    custom)   printf 'entries this CLI did not write\n' ;;
+    *)        printf 'not measurable from here\n' ;;
+  esac
+}
+
+# Measure + classify in one call. Echoes `class|runas|extra`, or
+# `unknown|-|0` when the grant could not be read from where this ran.
+agent_sudo_grant() {
+  local lines
+  if ! lines=$(sudo_grant_lines "$1" 2>/dev/null); then
+    printf 'unknown|-|0\n'; return 0
+  fi
+  printf '%s\n' "$lines" | classify_sudo_grant
 }
 
 # DIVE-1065/1074: scoped inter-agent a2a grants for a 'standard'-isolation agent.

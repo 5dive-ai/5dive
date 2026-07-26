@@ -1,5 +1,27 @@
 # Changelog
 
+## Unreleased — fix(agent): `agent info` reports the ENFORCED sudo grant beside the stored isolation label (DIVE-2079)
+
+`isolation` in the registry is a stored label, and nothing kept it honest. The DIVE-1002
+v1->v2 migration stamped `isolation: "admin"` on every pre-existing agent without reading
+its sudoers file, and `create_agent_user` is the only writer of a drop-in — so a legacy
+agent holding `(ALL) NOPASSWD: ALL` and a modern one holding the CLI-scoped grant both
+printed `isolation: admin`. Measured on poke-two 2026-07-26, that was six agents with full
+root and four with the scoped grant, all reading identically. Two agents reasoned about
+their own privilege from that field and got it wrong in opposite directions.
+
+`agent info` now measures the grant (`sudo -l` where permitted, else the managed drop-in)
+and classifies it as `root-all` / `cli-root` / `cli-scoped` / `none` / `custom`, reporting
+runas breadth separately — every grant this CLI writes is `(root)`-only, so the ability to
+`sudo -u claude ...` is what actually separates the two `admin` populations. When the label
+and the grant disagree, `info` says so and names the enforced answer as the one to trust.
+An unmeasurable grant reports `unknown`, never a guess. JSON gains a `sudo` object and
+`isolationLabelled`; no existing field changed.
+
+Also states outright in the `write_admin_sudoers` comment that `/usr/local/bin/5dive *` is
+NOT equivalent to `NOPASSWD: ALL` the way `systemd-run *` is, and what the no-runas-target
+grant does and does not withhold — the aside that produced the misreading is now the point.
+
 ## 0.16.11 — fix(task): `task need` warns at file time when a decision gate lands on a branch-bound task (DIVE-2074) (2026-07-26)
 
 A `--type=decision` gate only authorizes `push` when it is answered by that task's OWN
