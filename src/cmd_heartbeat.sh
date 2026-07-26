@@ -1094,37 +1094,72 @@ _hb_is_knowledge_task() {
     | grep -qiE 'research|digest|competitor|market (scan|intel|research)|\bintel\b|analy[sz]|\bfindings\b|survey|benchmark|landscape|write-?up|\bwiki\b|knowledge|investigat|\brecap\b|\bstudy\b'
 }
 
-# DIVE-2063: the maker→verifier terminal-state clause appended to the /goal nudge.
-# Emits a sentence (leading space) when the woken agent is the MAKER on a live
-# verifier loop, empty otherwise. Never fails the wake — any DB trouble yields "".
+# DIVE-2063 / DIVE-2111: the maker→verifier terminal-state clause appended to the
+# /goal nudge. Emits ONE sentence (leading space) when the woken agent stands on a
+# live verifier loop — the MAKER variant before the handoff, the VERIFIER variant
+# after it — empty otherwise. Never fails the wake: any DB trouble yields "".
+#
+# WHY BOTH HALVES EXIST. The /goal condition accepts exactly three terminal states
+# (done, cancelled, human gate). A loop rail has TWO roles and each has a correct,
+# complete action that reaches NONE of them:
+#   - maker: `task done` DELIVERS (status stays todo, assignee moves to the
+#     verifier). Fixed by DIVE-2063.
+#   - verifier: `task reject` returns a FAIL verdict (status back to todo, assignee
+#     back to the maker). DIVE-2063 declined this half on the premise that "for the
+#     verifier, the terminal close really is theirs" — false: accept is only ONE of
+#     the verifier's two terminal actions, and the other one wedges the session the
+#     same way (measured on DIVE-2090). A terminal-state clause has to enumerate
+#     TERMINAL ACTIONS, not the happy-path close.
 #
 # WHY IT IS NOT A FAIL-OPEN. The obvious wrong version of this ("a todo task with
 # something in its result field counts as done") would let a maker satisfy the goal
 # by writing a result and walking away — worse than the wedge it fixes. So:
 #   1. It is keyed on the LOOP SPEC, not on status text: a `verifier` must exist,
-#      and it must be someone other than the woken agent (an agent woken to GRADE
-#      gets no clause — for the verifier, the terminal close really is theirs).
+#      and whether it equals the woken agent is what SELECTS the variant — it is
+#      never inferred from prose.
 #   2. The agent must currently OWN the task (assignee = the woken agent), i.e. be
-#      the maker about to deliver, not a bystander.
-#   3. The state it names is the `handoff: delivered (awaiting verifier ACK)` line,
-#      which `task show` prints ONLY when maker_agent is set AND assignee=verifier
-#      AND the task is still open — i.e. only after `_task_route_to_verifier` has
-#      actually recorded the handoff. Nothing the agent can write by hand produces
-#      that line; only a real `task done` on a real loop does.
-# maker_agent is stamped from the pre-route assignee, so it equals the woken agent
-# by construction — the clause names a state the maker can genuinely reach.
+#      the maker about to deliver or the verifier holding the handoff — never a
+#      bystander.
+#   3. Maker variant: the state it names is the `handoff: delivered (awaiting
+#      verifier ACK)` line, which `task show` prints ONLY when maker_agent is set
+#      AND assignee=verifier AND the task is still open — i.e. only after
+#      `_task_route_to_verifier` has actually recorded the handoff. Nothing the
+#      agent can write by hand produces that line; only a real `task done` on a
+#      real loop does. maker_agent is stamped from the pre-route assignee, so it
+#      equals the woken agent by construction — a state the maker can genuinely
+#      reach.
+#   4. Verifier variant: gated on maker_agent being set, i.e. the SAME predicate
+#      `task show` uses to print the handoff line. Before delivery a verifier is
+#      just an ordinary owner and gets nothing; and the action it names (`task
+#      reject`) is itself refused by `cmd_task_reject` unless a maker exists, so
+#      the clause can never point at a verb the rail would reject.
 _hb_loop_terminal_clause() {
   local name="$1" task_id="$2" task_ident="$3"
   [[ "$task_id" =~ ^[0-9]+$ ]] || return 0
-  local vfier
-  vfier=$(db "SELECT COALESCE(verifier,'') FROM tasks
+  local row vfier maker
+  # One read, two fields: the verifier selects the variant, maker_agent proves the
+  # handoff. '|' is safe as a separator — both are agent names (validated slugs).
+  row=$(db "SELECT COALESCE(verifier,'')||'|'||COALESCE(maker_agent,'') FROM tasks
                WHERE id=${task_id} AND assignee=$(sqlq "$name")
                  AND status NOT IN ('done','cancelled');" 2>/dev/null) || return 0
-  [[ -n "$vfier" && "$vfier" != "$name" ]] || return 0
-  printf ' NOTE — %s carries a maker→verifier loop (verifier: %s), so your %s does NOT close it: it DELIVERS it (status stays todo and the task moves to %s to be graded). That delivery is a SECOND terminal state for THIS goal: treat the goal as MET, and stop, once %s prints a %s line under %s naming %s. Report that you delivered. Do NOT re-run %s, remove the verifier, or self-verify to force a status of done — the terminal close is %s'"'"'s, in their own session, and forcing it past them is a bypass, not progress.' \
-    "$task_ident" "$vfier" "'5dive task done ${task_ident}'" "$vfier" \
-    "'5dive task show ${task_ident}'" "'handoff: delivered (awaiting verifier ACK)'" \
-    "'loop spec:'" "'maker: ${name}'" "'task done'" "$vfier"
+  vfier="${row%%|*}"; maker="${row#*|}"
+  [[ -n "$vfier" ]] || return 0
+
+  if [[ "$vfier" != "$name" ]]; then
+    # MAKER variant — delivery is the second terminal state.
+    printf ' NOTE — %s carries a maker→verifier loop (verifier: %s), so your %s does NOT close it: it DELIVERS it (status stays todo and the task moves to %s to be graded). That delivery is a SECOND terminal state for THIS goal: treat the goal as MET, and stop, once %s prints a %s line under %s naming %s. Report that you delivered. Do NOT re-run %s, remove the verifier, or self-verify to force a status of done — the terminal close is %s'"'"'s, in their own session, and forcing it past them is a bypass, not progress.' \
+      "$task_ident" "$vfier" "'5dive task done ${task_ident}'" "$vfier" \
+      "'5dive task show ${task_ident}'" "'handoff: delivered (awaiting verifier ACK)'" \
+      "'loop spec:'" "'maker: ${name}'" "'task done'" "$vfier"
+    return 0
+  fi
+
+  # VERIFIER variant — only once the maker has actually handed off.
+  [[ -n "$maker" && "$maker" != "$name" ]] || return 0
+  printf ' NOTE — you are the VERIFIER on %s (maker: %s) and the handoff is already delivered, so you are here to GRADE the work, not to build or rescue it. A FAIL verdict is a complete, terminal outcome: if it does not pass, run %s and treat the goal as MET, and stop — the reject is a SECOND terminal state for THIS goal even though it leaves status todo, because it bounces the task back to %s (%s will show %s and a %s result line). Report that you rejected and why. Do NOT record a done you do not believe, cancel work that is verified-good, or file a human gate for something %s can fix in another pass — a correct reject IS the terminal action, and forcing a done/cancel past it writes a false record to the board.' \
+    "$task_ident" "$maker" "'5dive task reject ${task_ident} --feedback=\"<what to fix>\"'" \
+    "$maker" "'5dive task show ${task_ident}'" "'assignee = ${maker}'" \
+    "'❌ ${name} rejected'" "$maker"
 }
 
 # Wake one agent: ensure it's running, optionally clear context, send the nudge.
@@ -1187,6 +1222,14 @@ _hb_wake() {
   # the fail-open ones (a second 'task done', dropping the verifier). Teach the
   # nudge a second terminal state for loop tasks specifically. See the helper for
   # why this can't be satisfied by writing a result and walking away.
+  #
+  # DIVE-2111: and the same is true on the OTHER side of the rail. A verifier has
+  # TWO terminal actions, not one — accept ('task done', which does close) and
+  # REJECT (a FAIL verdict, which returns the task to the maker at status todo).
+  # DIVE-2063 declined the verifier half on the premise that its close is always
+  # terminal; measured false on DIVE-2090, where a correct reject left the grader
+  # with no honest exit and the goal re-fired five times. The helper now emits the
+  # role-appropriate variant, keyed on the loop spec either way.
   local loop_clause=""
   loop_clause=$(_hb_loop_terminal_clause "$name" "$task_id" "$task_ident") || loop_clause=""
   [[ -n "$loop_clause" ]] && nudge="${nudge}${loop_clause}"
