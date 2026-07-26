@@ -106,19 +106,129 @@ version_lt() {
 # anything past ~1.5 days means the auto-update isn't keeping up.
 readonly UPDATE_STALE_AFTER_SECS=$((36 * 3600))
 
+# >>> DIVE-2042 published-version probe
+#     (tests/update_check_propagation_unit.sh extracts this block VERBATIM
+#      between these markers and runs the shipped bytes — keep them.)
+#
+# _published_cli_probe — read the version main currently publishes, and say how
+# much we trust the read.
+#
+# "What does main publish?" is a THREE-state question, not a value.
+# raw.githubusercontent serves the bundle and its `.sha256` as two independent
+# cache objects, so for minutes after every push to main it can hand back a
+# STALE bundle beside a FRESH checksum — DIVE-1977 is the same window on the
+# install path, and it has since been observed on the contents API too. A probe
+# that can only return a version returns the stale one; the caller compares it
+# to the local version, finds them equal, and reports a confident "up to date"
+# to an operator asking precisely the question we could not answer. That window
+# opens on EVERY push to main, and main HEAD is what customer boxes self-update
+# from, so every ship has a period where a box asking "am I current?" is told
+# yes and is wrong.
+#
+# Two defences, in order:
+#   1. PIN. `git ls-remote` rides the git transport, not the raw CDN, so it has
+#      no split-generation window. Resolve main -> ONE immutable sha and fetch
+#      BOTH objects from raw/<sha>/, where they cannot disagree. Unresolvable
+#      (no git, no network) -> fall back to /main rather than fail shut; a
+#      probe that bricks is worse than the race it avoids.
+#   2. VERIFY. Hash the bundle we were ACTUALLY served and compare it to the
+#      `.sha256` we were ACTUALLY served. Their disagreement IS the
+#      propagation signal, and on the unpinned path it is the only one there is.
+#
+# Prints exactly three lines (never fails the caller):
+#   1  state    consistent | indeterminate | unavailable
+#   2  version  the published FIVE_VERSION — empty unless state is consistent
+#   3  detail   the ref the answer came from (consistent), else the reason.
+#               Never empty, so line 3 always exists.
+_published_cli_probe() {
+  local state version detail
+  _pcp_out() { printf '%s\n%s\n%s\n' "$1" "$2" "$3"; }
+
+  command -v curl >/dev/null 2>&1 \
+    || { _pcp_out unavailable "" "curl is not installed"; return 0; }
+  command -v sha256sum >/dev/null 2>&1 \
+    || { _pcp_out unavailable "" "sha256sum is not installed"; return 0; }
+
+  local org pinned=""
+  org=$(gh_org)
+  if command -v git >/dev/null 2>&1; then
+    pinned=$(GIT_TERMINAL_PROMPT=0 timeout 10 git ls-remote \
+      "https://github.com/$org/5dive" main 2>/dev/null | awk 'NR==1{print $1}') || pinned=""
+    [[ "$pinned" =~ ^[0-9a-f]{40}$ ]] || pinned=""
+  fi
+  local ref="${pinned:-main}"
+
+  local tmp
+  tmp=$(mktemp -d) || { _pcp_out unavailable "" "no writable temp dir"; return 0; }
+  local base="https://raw.githubusercontent.com/$org/5dive/$ref" fetched=1
+  curl -fsSL --max-time 10 -o "$tmp/5dive" "$base/5dive" 2>/dev/null || fetched=0
+  curl -fsSL --max-time 10 -o "$tmp/5dive.sha256" "$base/5dive.sha256" 2>/dev/null || fetched=0
+  if (( ! fetched )) || [[ ! -s "$tmp/5dive" || ! -s "$tmp/5dive.sha256" ]]; then
+    rm -rf "$tmp"
+    _pcp_out unavailable "" "could not fetch the published bundle and its checksum"
+    return 0
+  fi
+
+  local served published
+  served=$(sha256sum "$tmp/5dive" | awk '{print $1}')
+  published=$(awk 'NR==1{print $1}' "$tmp/5dive.sha256")
+  version=$(grep -m1 -oP '(?<=^readonly FIVE_VERSION=")[^"]+' "$tmp/5dive") || version=""
+  rm -rf "$tmp"
+
+  if [[ "$served" != "$published" ]]; then
+    # Branch the explanation on whether we can justify the accusation
+    # (DIVE-1977's rule). PINNED: both objects came from one immutable tree, so
+    # cache skew cannot explain it and something is genuinely wrong. UNPINNED:
+    # two cache generations is by far the likeliest cause, and rendering that
+    # as tampering is an alarm scarier than the fault.
+    if [[ -n "$pinned" ]]; then
+      detail="the bundle published at ${pinned:0:12} does not match its own checksum"
+    else
+      detail="the published bundle and its checksum are from different CDN cache generations (release propagation in progress)"
+    fi
+    _pcp_out indeterminate "" "$detail"
+    return 0
+  fi
+  if [[ -z "$version" ]]; then
+    _pcp_out indeterminate "" "the published bundle carries no FIVE_VERSION"
+    return 0
+  fi
+  _pcp_out consistent "$version" "$ref"
+}
+# <<< DIVE-2042 published-version probe
+
 # cmd_update_check — read-only (no root, no mutation) version probe for the
 # dashboard maintenance tile. Compares the installed CLI to the published
 # release and reads the last nightly soft-update result, then reports whether
 # the box is GENUINELY stale (behind AND the auto-update isn't catching up) vs
 # merely a release or two behind with a healthy nightly that'll close the gap.
+#
+# DIVE-2042: this answers in THREE states, not two. up-to-date / behind /
+# INDETERMINATE. A checker that can only say yes or no says yes when it does
+# not know, and the propagation window (see _published_cli_probe) is exactly
+# when it does not know. Indeterminate exits NON-ZERO so an unattended caller
+# branches on status alone and never reads a green it wasn't given.
 cmd_update_check() {
   [[ $# -eq 0 ]] || fail "$E_USAGE" "update --check takes no arguments"
   command -v curl >/dev/null 2>&1 || fail "$E_NOT_FOUND" "curl is required for update --check"
 
-  local current="$FIVE_VERSION" latest
-  latest=$(curl -fsSL "https://raw.githubusercontent.com/$(gh_org)/5dive/main/5dive" 2>/dev/null \
-    | grep -m1 -oP '(?<=^readonly FIVE_VERSION=")[^"]+') \
-    || true
+  local current="$FIVE_VERSION" probe
+  probe=$(_published_cli_probe)
+  local -a p=()
+  mapfile -t p <<<"$probe"
+  local state="${p[0]:-unavailable}" latest="${p[1]:-}" detail="${p[2]:-no detail}"
+
+  case "$state" in
+    consistent) ;;
+    indeterminate)
+      # Worded to avoid the substring "up to date" entirely: this line lands in
+      # nightly logs beside the green one, and half a grep must not read as a
+      # pass.
+      fail "$E_GENERIC" \
+        "cannot determine whether CLI $current is current — $detail; retry in a few minutes" ;;
+    *)
+      fail "$E_GENERIC" "could not determine the latest published version — $detail" ;;
+  esac
   [[ -n "$latest" ]] || fail "$E_GENERIC" "could not determine the latest published version"
 
   local behind=false
@@ -167,9 +277,15 @@ cmd_update_check() {
     prose="CLI $current is up to date"
   fi
 
+  # `behind`/`stale` keep their existing meaning and are only ever emitted on
+  # the consistent path — the indeterminate branch above exits before here, so
+  # a false `stale:false` can no longer be minted from a stale read.
+  # `source` names the ref the answer came from (a 40-char sha when pinned,
+  # "main" on the unpinned fallback) so a surprising number can be re-fetched
+  # at the exact identity that produced it.
   ok "$prose" \
-     '{current:$cur, latest:$lat, behind:$beh, stale:$stl, lastUpdateOk:$luo, lastUpdateAt:$lua}' \
-     --arg cur "$current" --arg lat "$latest" \
+     '{current:$cur, latest:$lat, behind:$beh, stale:$stl, lastUpdateOk:$luo, lastUpdateAt:$lua, source:$src}' \
+     --arg cur "$current" --arg lat "$latest" --arg src "$detail" \
      --argjson beh "$behind" --argjson stl "$stale" \
      --argjson luo "$last_ok_json" --argjson lua "$last_at_json"
 }
