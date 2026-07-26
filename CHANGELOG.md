@@ -122,6 +122,39 @@ Regression: `tests/agent_home_teardown_unit.sh` (17 assertions), including the g
 keeps the recursive `chown`/`rm -rf` off any path that is not this agent's own conventional
 home, and off a symlink at that path.
 
+## Unreleased — fix(proof): the daily publisher no longer dies on its own log, and a successful tick finally says so (DIVE-2044)
+
+The public zero-human badge stopped publishing for 26 hours and every signal said the
+job was running. The publisher logic was never the problem.
+
+**The cron line was `… 5dive proof tick >> /var/log/5dive-proof.log 2>&1`.** The log
+had been re-chowned to a user the cron could not write as, so the shell failed to open
+the redirect and **died before `5dive` was ever executed**. cron still logged the CMD
+line every night, so `journalctl` showed a healthy job for a publisher that had not run
+once. Proven, not inferred: appending to that file as the cron's user returned
+`Permission denied` before the ownership fix and succeeded after.
+
+The redirect is now **gone from the generated cron line**. `proof tick --log=<path>`
+hands the path to the tick, which writes its record **after** the publish and falls back
+to journald (`journalctl -t 5dive-proof`), then stderr, when the file is unwritable. An
+unwritable log now costs a log line, never a publish — the work must not sit downstream
+of its own observability. `proof status` detects a pre-fix cron line and rewrites it in
+place (with a loud warning when it lacks the rights); an install-time permission check
+cannot cover a permission that changes months later.
+
+**A successful tick used to print nothing at all.** The log's entire content across the
+outage was one *skip* line, so "published fine" and "never ran" produced identical logs.
+Every run now leaves one stamped line naming its outcome — `PUBLISHED` (with the stamp
+it recorded), `no-op — already published`, or `FAILED rc=N` — with the publisher's own
+output indented beneath it. The DIVE-2051 identity refusal stays non-zero and is named
+as such.
+
+The staleness monitor read `raw.githubusercontent.com`, which is CDN-cached and was
+still serving the previous day's stamp minutes after the real publish landed (the
+DIVE-2042 window again). Its verdict now comes from the GitHub API ref, with raw kept
+as a labelled fallback and its disagreement written to the log rather than silently
+resolved in the CDN's favour.
+
 ## Unreleased — fix(agent): typed sends REFUSE a credential/login pane, so an inter-agent message can no longer become the agent's API key (DIVE-2137, gh#214)
 
 Reported by A-MO7SEN (gh#214), his fourth confirmed find.
