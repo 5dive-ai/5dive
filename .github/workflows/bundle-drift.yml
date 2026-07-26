@@ -25,3 +25,29 @@ jobs:
             echo "Run ./build.sh locally and commit the result."
             exit 1
           fi
+
+  # DIVE-2065: CI-side twin of scripts/version-bump-guard.sh's push-time check
+  # (scripts/git-hooks/pre-push). Catches a version collision that bypassed
+  # the local hook — --no-verify, a box that never ran
+  # scripts/install-pii-push-guard.sh, or a race between two pushes that each
+  # looked clear against a now-stale main. Only runs on pushes that actually
+  # land on main (a PR's own commits aren't reachable from main yet, and
+  # CONTRIBUTING.md says PRs don't bump the version anyway) and only checks
+  # the delta this push introduced — see version-uniqueness-scan.sh's own
+  # header for why a full-history sweep would be permanently red instead.
+  version-uniqueness:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: No commit newly on main may claim a FIVE_VERSION already used by a different bundle
+        run: |
+          before="${{ github.event.before }}"
+          zero="0000000000000000000000000000000000000000"
+          if [[ -z "$before" || "$before" == "$zero" ]] || ! git cat-file -e "$before" 2>/dev/null; then
+            echo "version-uniqueness: no usable previous main tip (new branch or force event) — skipping delta scan."
+            exit 0
+          fi
+          ./scripts/version-uniqueness-scan.sh "${{ github.sha }}" "$before"
