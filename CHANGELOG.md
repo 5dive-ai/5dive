@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.16.17 — fix(loop): a collided loop_id killed the panel's own INSERT, and the harness poller then hid it (DIVE-2083) (2026-07-26)
+
+The red main on `73752da` was **two defects in one chain**, and each was separately dismissed
+as "not the cause" before the original job log settled it.
+
+`_loop_new_id` minted handles from a one-second epoch plus 15 bits of `$RANDOM`, under a
+`TEXT PRIMARY KEY`. T8's panel drew a handle T7's fan-out had taken seconds earlier, so the
+**panel's own INSERT died** — the row never landed, `wait_new_run` had nothing to count, the
+empty handle sent the kill to `loop_id=''`, and the panel polled a row that does not exist
+until its `--wait` deadline. Collision was the trigger; the poller was the amplifier.
+
+Fixed all three layers: a collision-proof `_loop_new_id` (nanoseconds + `BASHPID` + 32 bits
+from urandom), a poller that fails loudly instead of returning an empty handle, and a new
+`haltReason` field (`complete|killed|ceiling|timeout`). That last one exposed a fourth defect:
+**the ceiling test had never once exercised the ceiling** — the product collapsed ceiling and
+timeout onto the same `escalated` status, so the assertion passed on a timeout every run.
+
 ## 0.16.16 — fix(proof): hoist the self-bundle resolver to one implementation; proof scorecard and digest were grading the INSTALLED bundle (DIVE-2080) (2026-07-26)
 
 Third instance of the `command -v` primitive, one call deeper than the previous fix reached.

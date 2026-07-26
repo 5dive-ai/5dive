@@ -50,9 +50,18 @@ wait_graders() { # <token> <n> → fills global tids[]
   return 1
 }
 # poll until loop_runs grows past a prior count; echoes the newest panel loop_id.
-wait_new_run() { # <prev_count>
+# DIVE-2083: this poller reddened main, and it did it SILENTLY. `klid=$(wait_new_run …)`
+# throws the exit status away, so a timed-out poll handed T8 an EMPTY loop_id, the kill
+# UPDATE matched zero rows, and the panel ran on to its own --wait deadline. The harness
+# then reported the PRODUCT's status ("expected killed, got escalated") with nothing in
+# the message naming the poller — which is why the failure read as a product bug through
+# two diagnostic passes. Every caller now GRADES the poll, and the budget is 30s rather
+# than 10s: the panel must complete n full grader spawns (each a `task add`, several jq
+# and sqlite3 forks) BEFORE its own row lands, and a loaded 2-core CI runner is far
+# slower at that than a dev box.
+wait_new_run() { # <prev_count> → echoes the newest panel loop_id; rc=1 on timeout
   local i n
-  for i in $(seq 1 100); do
+  for i in $(seq 1 300); do
     n=$(db "SELECT COUNT(*) FROM loop_runs WHERE topology='panel';")
     if (( n > $1 )); then
       db "SELECT loop_id FROM loop_runs WHERE topology='panel' ORDER BY started_at DESC, rowid DESC LIMIT 1;"
@@ -143,21 +152,46 @@ fv=$(jq -r '.data.verdict' "$TMP"/panel-fail.out 2>/dev/null)
 nruns=$(db "SELECT COUNT(*) FROM loop_runs WHERE topology='panel';")
 ( cmd_loop_panel --agent=main --claim="UNIQ_killpanel x" --n=2 --wait=20 >"$TMP"/panel-kill.out 2>&1 ) &
 bgpid=$!
-klid=$(wait_new_run "$nruns")
-db "UPDATE loop_runs SET kill_requested=1 WHERE loop_id='$klid';"
+if klid=$(wait_new_run "$nruns"); then
+  db "UPDATE loop_runs SET kill_requested=1 WHERE loop_id='$klid';"
+else
+  bad_t "kill halt setup" "wait_new_run timed out — the panel row never appeared, so the kill was never applied to any row"
+fi
 wait $bgpid
 kst=$(jq -r '.data.status' "$TMP"/panel-kill.out 2>/dev/null)
-[[ "$kst" == "killed" ]] && ok_t "--wait halts on kill_requested → killed" || bad_t "kill halt" "$(cat "$TMP"/panel-kill.out)"
+khr=$(jq -r '.data.haltReason' "$TMP"/panel-kill.out 2>/dev/null)
+[[ "$kst" == "killed" && "$khr" == "killed" ]] \
+  && ok_t "--wait halts on kill_requested → killed" || bad_t "kill halt" "status=$kst haltReason=$khr $(cat "$TMP"/panel-kill.out)"
 
 # --- T9: --wait halts on CEILING breach → escalated
+# DIVE-2083: this case had NEVER exercised the ceiling. `_loop_spent` refreshes
+# on its first call (throttle window starts at 0), and `_loop_refresh_spend`
+# recomputes tokens_spent from the agent usage registry — which a unit harness
+# does not have, so it writes 0 straight over the 5000 this test pokes in. The
+# panel then ran to its --wait deadline and returned status "escalated", which is
+# also what a ceiling breach returns, so the assertion below went green on a
+# TIMEOUT. Stubbing the refresher removes the one input this harness cannot
+# supply (registry usage) and leaves tokens_spent as the input the ceiling
+# decision actually reads. haltReason is what makes the difference observable.
+_loop_refresh_spend() { db "SELECT COALESCE(tokens_spent,0) FROM loop_runs WHERE loop_id='$1';"; }
 nruns=$(db "SELECT COUNT(*) FROM loop_runs WHERE topology='panel';")
 ( cmd_loop_panel --agent=main --claim="UNIQ_ceilpanel x" --n=2 --ceiling=1000 --wait=20 >"$TMP"/panel-ceil.out 2>&1 ) &
 bgpid=$!
-clid=$(wait_new_run "$nruns")
-db "UPDATE loop_runs SET tokens_spent=5000 WHERE loop_id='$clid';"
+if clid=$(wait_new_run "$nruns"); then
+  db "UPDATE loop_runs SET tokens_spent=5000 WHERE loop_id='$clid';"
+else
+  bad_t "ceiling halt setup" "wait_new_run timed out — the panel row never appeared, so the ceiling was never breached"
+fi
 wait $bgpid
 cst=$(jq -r '.data.status' "$TMP"/panel-ceil.out 2>/dev/null)
-[[ "$cst" == "escalated" ]] && ok_t "--wait halts on ceiling breach → escalated" || bad_t "ceiling halt" "$(cat "$TMP"/panel-ceil.out)"
+chr=$(jq -r '.data.haltReason' "$TMP"/panel-ceil.out 2>/dev/null)
+# DIVE-2083: haltReason is load-bearing here, not decoration. `status` is
+# "escalated" for a ceiling breach AND for a --wait timeout, so asserting status
+# alone made this case VACUOUS: under the same broken poller that redded T8 this
+# assertion went green for the wrong reason, and could never have warned us.
+[[ "$cst" == "escalated" && "$chr" == "ceiling" ]] \
+  && ok_t "--wait halts on ceiling breach → escalated (haltReason=ceiling, not timeout)" \
+  || bad_t "ceiling halt" "status=$cst haltReason=$chr $(cat "$TMP"/panel-ceil.out)"
 
 echo "-----"; echo "PASS=$PASS FAIL=$FAIL"
 [[ $FAIL -eq 0 ]]
