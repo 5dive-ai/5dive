@@ -35,7 +35,7 @@ usage_collect() {
   local since="$1" db
   db="${TASKS_DB:-${STATE_DIR}/tasks/tasks.db}"
   REGISTRY="$REGISTRY" TASK_DB="$db" USAGE_SINCE="$since" python3 - <<'PY'
-import os, json, glob, time, re, sqlite3, errno, datetime as dt
+import os, json, glob, time, sqlite3, errno, datetime as dt
 
 since = int(os.environ["USAGE_SINCE"])
 now   = int(time.time())
@@ -122,16 +122,6 @@ def probe_readable(home, projects):
 # turns[name] = list of (epoch, out_tokens, total_tokens) for task attribution.
 agent_rows = []
 turns_by_agent = {}
-# goal_pins[name] = {"DIVE-N", ...} — task idents named in a USER turn, inside
-# the reporting window, by the heartbeat's /goal nudge (cmd_heartbeat.sh's
-# fixed template: "/goal Task DIVE-N shows status ..."). Cross-check for the
-# attribution below (DIVE-2058): it comes from message CONTENT inside THIS
-# window, not from the tasks table's started_at/done_at (which is what built
-# the window in the first place) and not from heartbeat.log (the subsystem
-# under suspicion in the incident this fixes) — an independently-sourced,
-# independently-timed signal. Same [since,now] scan as the usage turns below,
-# so no extra file I/O pass.
-goal_pins = {}
 for name, meta in agents.items():
     home = home_of(name)
     projects = os.path.join(home, ".claude", "projects")
@@ -141,7 +131,6 @@ for name, meta in agents.items():
         continue
     models = {}
     turns = []
-    pins = set()
     denied = None
     pat = os.path.join(projects, "*", "*.jsonl")
     for path in glob.glob(pat):
@@ -160,25 +149,6 @@ for name, meta in agents.items():
             continue
         with f:
             for line in f:
-                # Match ONLY the heartbeat's fixed nudge phrasing (cmd_heartbeat.sh:
-                # "/goal Task DIVE-N shows status done or cancelled..."), on a plain
-                # STRING user message — never a bare "DIVE-N" substring, and never a
-                # list-shaped `content` (a tool_result echoed back as a "user" turn,
-                # e.g. a `5dive task show` paste, can contain arbitrary DIVE-N
-                # mentions with zero relation to a dispatch; a genuine nudge is
-                # always a plain string content).
-                if "shows status done or cancelled" in line and '"user"' in line:
-                    try:
-                        po = json.loads(line)
-                    except Exception:
-                        po = None
-                    if po is not None and po.get("type") == "user":
-                        pts = to_epoch(po.get("timestamp"))
-                        if pts is not None and pts >= since:
-                            pmsg = po.get("message") or {}
-                            pcontent = pmsg.get("content")
-                            if isinstance(pcontent, str):
-                                pins.update(re.findall(r"Task (DIVE-\d+) shows status done or cancelled", pcontent))
                 if '"usage"' not in line or '"assistant"' not in line:
                     continue
                 try:
@@ -200,8 +170,6 @@ for name, meta in agents.items():
                 m = models.setdefault(model, {"in":0,"out":0,"cc":0,"cr":0,"turns":0})
                 m["in"]+=i; m["out"]+=ot; m["cc"]+=cc; m["cr"]+=cr; m["turns"]+=1
                 turns.append((ts, ot, i+ot+cc))   # total excludes cache-read
-    if pins:
-        goal_pins[name] = pins
     # A partial read of ONE agent still makes the company total partial: the row
     # is flagged even though its (understated) tokens are still reported.
     if denied:
@@ -240,7 +208,7 @@ try:
     con = sqlite3.connect(task_db)
     con.row_factory = sqlite3.Row
     rows = con.execute(
-        "SELECT ident,title,assignee,started_at,done_at,iteration,status FROM tasks "
+        "SELECT ident,title,assignee,started_at,done_at,iteration FROM tasks "
         "WHERE started_at IS NOT NULL AND assignee IS NOT NULL"
     ).fetchall()
     con.close()
@@ -260,7 +228,6 @@ for r in rows:
         "ident": r["ident"], "title": r["title"] or "",
         "start": s, "end": e, "total": 0, "output": 0, "turns": 0,
         "iteration": r["iteration"],   # DIVE-478: maker→verifier loop round (NULL if not a loop)
-        "status": r["status"],
     })
 for a in wins:
     wins[a].sort(key=lambda w: w["start"], reverse=True)
@@ -279,58 +246,12 @@ for name, turns in turns_by_agent.items():
             u = untracked.setdefault(name, {"total":0,"output":0})
             u["total"]+=tot; u["output"]+=out
 
-# --- dispatch cross-check (DIVE-2058, FALSIFIABLE INVARIANT) ---------------
-# "Every usage-attributed token window must intersect at least one DISPATCH
-# of that task" (olivia, verifier review). The window here is the REPORTING
-# window (since..now, i.e. the --24h/--7d the reader is looking at) — not the
-# task's own started_at..done_at span, which is exactly what let DIVE-1817
-# (dispatched once, three days before this window opened) swallow three days
-# of a different, never-`task start`-ed task's turns and still read as
-# "actively worked". A row whose ident has no /goal pin anywhere in [since,now]
-# is FLAGGED, not reported as a confident number. If an agent has NO pins at
-# all in [since,now] (older transcript format, or dispatched some other way),
-# there is no signal to check against — leave `dispatched` as None (unknown)
-# rather than accusing every row: a partial read must not render as a
-# confident number (DIVE-1929/1937), and that cuts both ways — it must not
-# render as a confident accusation either.
-#
-# NEVER flag a task whose status is 'in_progress': the heartbeat only sends
-# the fixed /goal nudge on the todo->in_progress transition (never re-nudges
-# an already-started task — see cmd_heartbeat.sh's status='todo' dispatch
-# predicate), so a genuinely still-active task worked continuously past the
-# reporting window's start, OR started via a path other than the heartbeat
-# nudge (a human/admin instructing an already-live session directly — real
-# and observed on this fleet), can legitimately carry zero in-window pins.
-# 'blocked' is exactly the opposite case and the one this ticket targets: a
-# blocked task stays in the assignee's heartbeat rotation until
-# `task park --wake` (status alone does not remove it — see
-# community/wiki/gated-task-burns-no-park-lever.md), a confirmed mechanism by
-# which its open window keeps absorbing turns, so an absent pin there is
-# signal with a known cause, not noise. (INFERRED, not measured, from live
-# fleet config 2026-07-26 — flagging the distinction per olivia's review:
-# every currently-enrolled agent's heartbeat everyMin is 5-30min and the
-# hard-cap reaper force-closes in_progress at 3x that (cmd_heartbeat.sh
-# _HB_STALE_MULT) — well under the 24h default window — so under
-# heartbeat-only dispatch this case is near-empty today. That is a deduction
-# from config values, not an observation of zero false positives in
-# practice, and a direct human/admin dispatch bypasses the nudge path
-# entirely and is not provable false by timing regardless — hence the status
-# carve-out rather than relying on timing.)
 for a in wins:
-    have_signal = bool(goal_pins.get(a))
-    pinned_idents = goal_pins.get(a, set())
     for w in wins[a]:
         if w["turns"]:
-            has_pin = w["ident"] in pinned_idents
-            if not have_signal:
-                dispatched = None
-            elif w.get("status") == "in_progress":
-                dispatched = True if has_pin else None
-            else:
-                dispatched = has_pin
             tasks.append({"ident":w["ident"],"title":w["title"],"assignee":a,
                           "total":w["total"],"output":w["output"],"turns":w["turns"],
-                          "iteration":w["iteration"],"dispatched":dispatched})
+                          "iteration":w["iteration"]})
 
 print(json.dumps({
     "window": {"since": since, "now": now},
@@ -482,20 +403,11 @@ usage_render_board() {
     else
       (["TASK","AGENT","ITER","OUTPUT","TOTAL","TITLE"] | @tsv),
       (.tasks | sort_by(-.total)[:12][] |
-        [ (.ident + (if .dispatched == false then " ⚠" else "" end)), .assignee,
+        [ .ident, .assignee,
           (if (.iteration // 0) > 0 then (.iteration|tostring) else "-" end),
           (.output|htok), (.total|htok),
           (.title | if length > 42 then .[:41] + "…" else . end) ] | @tsv)
     end' <<<"$data" | column -t -s $'\t' | sed 's/^/  /'
-
-  # DIVE-2058: rows with dispatched==false attribute tokens to a task with no
-  # /goal dispatch found in its window — flag rather than let a misattributed
-  # number stand unqualified (the DIVE-1817 13.8M incident).
-  local flagged
-  flagged=$(jq -r '[.tasks[] | select(.dispatched == false)] | length' <<<"$data" 2>/dev/null)
-  if [[ "${flagged:-0}" -gt 0 ]]; then
-    echo "  ⚠ ${flagged} row(s) above show tokens attributed to a task with no /goal dispatch found in its window — likely misattributed, treat as unverified (see DIVE-2058)."
-  fi
 
   # over-budget callout: ⚠ at the soft cap, ⛔ at the ceiling (see `5dive cost`).
   local over
@@ -560,7 +472,7 @@ usage_render_agent() {
   jq -r "$USAGE_JQ_HELPERS"'
     if (.tasks | map(select(.assignee==$n)) | length) == 0 then "    (none attributed)"
     else (.tasks | map(select(.assignee==$n)) | sort_by(-.total)[] |
-      "    " + .ident + (if .dispatched == false then " ⚠" else "" end) + "  " + (.total|htok) + "  " + .title) end
+      "    " + .ident + "  " + (.total|htok) + "  " + .title) end
     ' --arg n "$agent" <<<"$data"
 }
 

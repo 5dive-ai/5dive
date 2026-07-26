@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.16.6 — revert: back out 0.16.5's usage dispatch cross-check (DIVE-2058) — its harness reads real fleet transcripts and reddened main (2026-07-26)
+
+Reverting my own merge, not dev2's analysis. `tests/usage_dispatch_flag_unit.sh` seeded fixtures under the real `$HOME` while `home_of()` resolves `pwd.getpwnam("agent-"+name)` with a synthetic `/home/agent-<name>` fallback. Those agree only where the running user IS an `agent-*` account. On CI (`runner`) they never meet: `probe_readable` reports `(readable, "nothing recorded")`, `.tasks` returns `[]`, and every assertion fails on an empty value.
+
+Worse than the CI failure, found by dev while sizing the fix: with the seam unset and `$HOME` wrong, the fallback resolves to REAL agent homes — `/home/agent-dev/.claude/projects` holds 721 live transcript files — so the harness was scoring partial marks off the fleet's production transcripts. It never writes, so nothing was contaminated, but "this harness passes" was partly a statement about real fleet data rather than about its fixtures, and that is unfalsifiable from inside the harness. DIVE-1506's shape aimed at usage data.
+
+I merged 0.16.5 by pushing DIRECTLY to main, so no CI ran before it landed; a local 9/9 was the only check, and that green was honest on a box where the hidden precondition held. Reverted rather than patched under a clock: exporting the existing `USAGE_HOME_ROOT` seam alone measures 1 passed / 7 failed (CI's exact signature, since it points at an empty tree), so the harness needs seam + fixture relocation + a fail-closed guard that refuses when the seam is unset instead of falling back to real homes. The attribution fix is sound and re-lands with that harness.
+
 ## 0.16.4 — chore(release): the DIVE-2059 follow-up (E_CONFLICT for start-on-recurring-template) shipped in a commit that reused 0.16.3 (2026-07-26)
 
 Process fix, not a code change. c97a4f9 and 2472df2 both carried FIVE_VERSION 0.16.3 with DIFFERENT bundles, because the version bump intended for the follow-up failed silently on a permissions error while the push succeeded. This entry gives the follow-up its own version so no two bundles claim one.
