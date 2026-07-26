@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.16.15 — fix(heartbeat): a /goal dispatched onto a verifier-loop task could only be satisfied by bypassing the verifier (DIVE-2063) (2026-07-26)
+
+The heartbeat's `/goal` nudge accepts three terminal states: `done`, `cancelled`, or
+blocked-with-a-gate. A task carrying a maker→verifier loop reaches none of them by the
+maker's own hand — a correct `task done` **delivers** it (status stays `todo`, the task
+moves to the verifier, `handoff: delivered (awaiting verifier ACK)`). That is the rail
+working as designed, and it is the one outcome the goal refuses, so the maker's session
+kept re-firing "not done yet" with nothing productive left to do but wait on a peer's
+independent session. Four instances across three agents in one morning.
+
+The failure mode that matters is not the wasted turns: the only actions that WOULD have
+satisfied the goal were the fail-open ones (a second `task done`, or dropping the
+verifier). A guard whose only satisfiable path is dishonest eventually gets satisfied
+dishonestly.
+
+The nudge now names delivery as a second terminal state — but only for a genuine loop.
+The clause is keyed on the loop spec, not on status text: it is emitted only when a
+`verifier` exists, is someone other than the woken agent, and the agent currently owns
+the task; and the state it tells the agent to look for is the `handoff:` line that
+`task show` prints only once `task done` has actually recorded the handoff. Writing a
+result and walking away does not produce it. An agent woken to *grade* gets no clause —
+for the verifier, the terminal close really is theirs.
+
 ## 0.16.14 — fix(agent): `agent info` reports the ENFORCED sudo grant beside the stored isolation label (DIVE-2079) (2026-07-26)
 
 `isolation` in the registry is a stored label, and nothing kept it honest. The DIVE-1002

@@ -1094,6 +1094,39 @@ _hb_is_knowledge_task() {
     | grep -qiE 'research|digest|competitor|market (scan|intel|research)|\bintel\b|analy[sz]|\bfindings\b|survey|benchmark|landscape|write-?up|\bwiki\b|knowledge|investigat|\brecap\b|\bstudy\b'
 }
 
+# DIVE-2063: the maker→verifier terminal-state clause appended to the /goal nudge.
+# Emits a sentence (leading space) when the woken agent is the MAKER on a live
+# verifier loop, empty otherwise. Never fails the wake — any DB trouble yields "".
+#
+# WHY IT IS NOT A FAIL-OPEN. The obvious wrong version of this ("a todo task with
+# something in its result field counts as done") would let a maker satisfy the goal
+# by writing a result and walking away — worse than the wedge it fixes. So:
+#   1. It is keyed on the LOOP SPEC, not on status text: a `verifier` must exist,
+#      and it must be someone other than the woken agent (an agent woken to GRADE
+#      gets no clause — for the verifier, the terminal close really is theirs).
+#   2. The agent must currently OWN the task (assignee = the woken agent), i.e. be
+#      the maker about to deliver, not a bystander.
+#   3. The state it names is the `handoff: delivered (awaiting verifier ACK)` line,
+#      which `task show` prints ONLY when maker_agent is set AND assignee=verifier
+#      AND the task is still open — i.e. only after `_task_route_to_verifier` has
+#      actually recorded the handoff. Nothing the agent can write by hand produces
+#      that line; only a real `task done` on a real loop does.
+# maker_agent is stamped from the pre-route assignee, so it equals the woken agent
+# by construction — the clause names a state the maker can genuinely reach.
+_hb_loop_terminal_clause() {
+  local name="$1" task_id="$2" task_ident="$3"
+  [[ "$task_id" =~ ^[0-9]+$ ]] || return 0
+  local vfier
+  vfier=$(db "SELECT COALESCE(verifier,'') FROM tasks
+               WHERE id=${task_id} AND assignee=$(sqlq "$name")
+                 AND status NOT IN ('done','cancelled');" 2>/dev/null) || return 0
+  [[ -n "$vfier" && "$vfier" != "$name" ]] || return 0
+  printf ' NOTE — %s carries a maker→verifier loop (verifier: %s), so your %s does NOT close it: it DELIVERS it (status stays todo and the task moves to %s to be graded). That delivery is a SECOND terminal state for THIS goal: treat the goal as MET, and stop, once %s prints a %s line under %s naming %s. Report that you delivered. Do NOT re-run %s, remove the verifier, or self-verify to force a status of done — the terminal close is %s'"'"'s, in their own session, and forcing it past them is a bypass, not progress.' \
+    "$task_ident" "$vfier" "'5dive task done ${task_ident}'" "$vfier" \
+    "'5dive task show ${task_ident}'" "'handoff: delivered (awaiting verifier ACK)'" \
+    "'loop spec:'" "'maker: ${name}'" "'task done'" "$vfier"
+}
+
 # Wake one agent: ensure it's running, optionally clear context, send the nudge.
 # $3 is the concrete DIVE id (highest-priority todo) the tick picked for this
 # agent — scoping the /goal to one known id makes its completion check reliable
@@ -1144,6 +1177,19 @@ _hb_wake() {
   # soft, model-judged guard — it does NOT reliably halt a runaway loop, so the
   # real hard cap is the deterministic stale-in_progress reaper in the tick.
   local nudge="/goal Task ${task_ident} shows status done or cancelled, or is blocked with a human gate filed, on the 5dive board (verify ONLY by running: 5dive task show ${task_ident}). To achieve it: claim it with '5dive task start ${task_ident}', do the work, then close it with '5dive task done ${task_ident} --result=\"<one or two self-contained sentences — any output the creator needs to see; the dashboard and creator read this>\"'. If it needs a human decision, approval, a secret, or a manual step only a person can do, do NOT cancel — file a gate that pings the owner: '5dive task need ${task_ident} --type=decision --ask=\"<what you need from them>\"' (use --type=approval|secret|manual as fits). Keep the ask to ONE crisp question + ~1 line of essential context — put heavy detail in the task BODY, not the ask — and ALWAYS surface your recommended choice with --recommend=\"<option>\" (and --options=A|B for a decision) so the owner sees the advised answer first. Only if the task is genuinely irrelevant or impossible, run '5dive task cancel ${task_ident} --result=\"<why>\"'. Before you close (done or cancel), run a fast self-audit — (a) what am I least confident about here, and (b) what did I NOT check or leave missing? If either surfaces a real gap, fix it or file a gate instead of closing silently; otherwise close. Work ONLY this one task — do not start any other. Stop after 6 turns."
+
+  # DIVE-2063: a task carrying a maker→verifier loop can NEVER reach any of the
+  # three terminal states above by the MAKER's own hand. A correct 'task done'
+  # DELIVERS it (status stays todo, assignee moves to the verifier) — the rail
+  # working as designed, and the one outcome the condition refuses. So the goal
+  # re-fires every turn while the maker has nothing left to do but wait on a
+  # peer's independent session, and the only actions that WOULD satisfy it are
+  # the fail-open ones (a second 'task done', dropping the verifier). Teach the
+  # nudge a second terminal state for loop tasks specifically. See the helper for
+  # why this can't be satisfied by writing a result and walking away.
+  local loop_clause=""
+  loop_clause=$(_hb_loop_terminal_clause "$name" "$task_id" "$task_ident") || loop_clause=""
+  [[ -n "$loop_clause" ]] && nudge="${nudge}${loop_clause}"
 
   # DIVE-992: enrich the tick prompt from the shared seam. Pull the task's
   # title+body once, then (a) cite the most relevant memory hits so the agent
