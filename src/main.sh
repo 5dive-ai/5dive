@@ -172,6 +172,11 @@ Auth (lower-level; the dashboard uses these — prefer 'account' for human-drive
   5dive agent auth poll <session_id>                         # {state, url, error}
   5dive agent auth submit <session_id> --code=<callback>     # paste the claude callback code
   5dive agent auth cancel <session_id>
+  5dive agent auth reap [--ttl=<secs>] [--max-age=<secs>] [--dry-run]
+                                                       # kill abandoned login processes + drop old session dirs
+  # NB each session's login TUI lives on a PRIVATE tmux socket, so a plain
+  # 'tmux ls' shows nothing. To watch one live:
+  #   tmux -S /var/lib/5dive/auth-sessions/<session_id>/tmux.sock attach -t auth-<session_id>
 
 Tasks (shared queue, sqlite — any agent, no sudo):
   5dive task add <title...> [--priority=low|medium|high|urgent] [--assignee=<agent>] [--parent=<id>] [--project=<key>]
@@ -540,6 +545,9 @@ main() {
             cancel)
               AUDIT_CMD="agent auth cancel"; AUDIT_ARGS=("$@")
               cmd_auth_cancel "$@" ;;
+            reap)
+              AUDIT_CMD="agent auth reap"; AUDIT_ARGS=("$@")
+              cmd_auth_reap "$@" ;;
             *) fail "$E_USAGE" "unknown auth command: $authcmd" ;;
           esac ;;
         *)
