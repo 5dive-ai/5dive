@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.16.5 — fix(usage): TOP TASKS attributed tokens to a task with no dispatch in the window (DIVE-2058) (2026-07-26)
+
+A single row of `5dive usage` attributed 13.8M tokens to a task that had ZERO dispatches in the window it covered, and that row drove a fleet-stall diagnosis, a tier-2 spend gate, two tickets and a wiki page before anyone checked it. The attribution now cross-checks against dispatch and folds into the DIVE-1929/1937 coverage envelope, so a row with no supporting dispatch is flagged rather than reported as fact.
+
 ## 0.16.4 — chore(release): the DIVE-2059 follow-up (E_CONFLICT for start-on-recurring-template) shipped in a commit that reused 0.16.3 (2026-07-26)
 
 Process fix, not a code change. c97a4f9 and 2472df2 both carried FIVE_VERSION 0.16.3 with DIFFERENT bundles, because the version bump intended for the follow-up failed silently on a permissions error while the push succeeded. This entry gives the follow-up its own version so no two bundles claim one.
