@@ -7,6 +7,14 @@ on:
   pull_request:
   push:
     branches: ['**']
+  # DIVE-2118: dispatchable, so version-assign can trigger this after its own push.
+  # A GITHUB_TOKEN push does NOT trigger workflows; workflow_dispatch is GitHub's
+  # documented exception ("workflow_dispatch and repository_dispatch events always
+  # create workflow runs"), which is what makes version-assign's loop-safety and its
+  # commit-must-be-graded requirement compatible.
+  # NOTE this ONE file carries BOTH the drift check and the version-uniqueness job,
+  # so a single dispatch grades both — they are not two workflows.
+  workflow_dispatch:
 
 jobs:
   check:

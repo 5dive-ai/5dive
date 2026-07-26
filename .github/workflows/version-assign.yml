@@ -20,7 +20,8 @@ on:
   push:
     branches: [main]
 
-# Serialise: two merges landing together must not both compute the same successor.
+# Serialise the RUNS. Necessary, and provably not sufficient — see the retry loop
+# below: a human merge is not a member of this group.
 concurrency:
   group: version-assign-main
   cancel-in-progress: false
@@ -29,13 +30,17 @@ jobs:
   assign:
     runs-on: ubuntu-latest
     permissions:
-      contents: write
+      contents: write   # push the assignment commit to main
+      actions: write    # dispatch bundle-drift afterwards (see GRADED, below)
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
       - name: Assign a version if the bundle moved without one
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
+          set -uo pipefail
           before="${{ github.event.before }}"
           zero="0000000000000000000000000000000000000000"
           if [[ -z "$before" || "$before" == "$zero" ]] || ! git cat-file -e "$before" 2>/dev/null; then
@@ -44,17 +49,43 @@ jobs:
           fi
           git config user.name  'lodar'
           git config user.email 'markounik@gmail.com'
-          out=$(bash scripts/version-assign.sh HEAD "$before" --apply); rc=$?
-          echo "$out"
-          if (( rc == 2 )); then
-            echo "::error::version-assign could not determine whether a bump is owed — NOT a pass, see above."
-            exit 1
-          fi
-          if ! grep -q '^version-assign: applied ' <<<"$out"; then
-            exit 0   # nothing owed; the reason is printed above
-          fi
-          git add src/header.sh 5dive 5dive.sha256
-          git commit -q -m "release: assign $(grep -m1 -oE 'FIVE_VERSION=\"[^\"]+\"' src/header.sh | sed 's/.*\"\(.*\)\"/\1/') at merge (DIVE-2118, automated)
+
+          # THE RACE, and why `concurrency` alone does not close it (found in review,
+          # iteration 1). concurrency serialises RUNS — but a human MERGE is not in the
+          # group, and actions/checkout on a push event pins to github.sha, NOT main's
+          # tip. So if a merge lands between this job's checkout and its push, the push
+          # is non-fast-forward and the job dies. It is a WINDOW, not a certainty (a
+          # merge landing after we push is fine, and that run computes correctly), but
+          # it is likeliest in exactly the batched-merge scenario this job exists for.
+          # So: refetch, recompute against the moved tip, retry, and fail loudly.
+          #
+          # BASE stays github.event.before across retries, deliberately. If a previous
+          # run already assigned, the version HAS moved relative to that base, so the
+          # script reports "already moved" and we stop — one version per batch, which
+          # is the batching lodar wants. If nobody assigned, we assign once for the
+          # whole batch. Both are correct; neither double-bumps.
+          attempts=3
+          assigned=""
+          for (( try=1; try<=attempts; try++ )); do
+            git fetch -q origin main
+            tip=$(git rev-parse FETCH_HEAD)
+            if [[ "$tip" != "$(git rev-parse HEAD)" ]]; then
+              echo "version-assign: main moved to ${tip:0:12} since checkout (attempt $try/$attempts) — recomputing against the new tip."
+              git reset -q --hard "$tip"
+            fi
+
+            out=$(bash scripts/version-assign.sh HEAD "$before" --apply); rc=$?
+            echo "$out"
+            if (( rc == 2 )); then
+              echo "::error::version-assign could not determine whether a bump is owed — NOT a pass, see above."
+              exit 1
+            fi
+            if ! grep -q '^version-assign: applied ' <<<"$out"; then
+              exit 0   # nothing owed; the reason is printed above
+            fi
+
+            git add src/header.sh 5dive 5dive.sha256
+            git commit -q -m "release: assign $(grep -m1 -oE 'FIVE_VERSION=\"[^\"]+\"' src/header.sh | sed 's/.*\"\(.*\)\"/\1/') at merge (DIVE-2118, automated)
 
           The bundle changed on main without FIVE_VERSION moving. CONTRIBUTING
           assigns the version at merge by merge order; this performs that step so a
@@ -63,5 +94,35 @@ jobs:
           triggered — DIVE-2065).
 
           No tag and no release: those are batched, deliberately (lodar, 2026-07-26)."
-          git push origin HEAD:main
-          echo "::notice::assigned $(grep -m1 -oE 'FIVE_VERSION=\"[^\"]+\"' src/header.sh) — no tag cut, releases are batched"
+
+            if git push origin HEAD:main; then
+              assigned=$(grep -m1 -oE 'FIVE_VERSION="[^"]+"' src/header.sh | sed 's/.*"\(.*\)"/\1/')
+              break
+            fi
+            echo "version-assign: push rejected — main moved under us (attempt $try/$attempts). Dropping the local assignment and recomputing."
+            git reset -q --hard "$tip"
+          done
+
+          if [[ -z "$assigned" ]]; then
+            echo "::error::version-assign: main kept moving across $attempts attempts, so NO assignment was made and the bundle on main is still unassigned. Bump by hand (scripts/version-assign.sh HEAD <prev> --apply) or re-run this workflow."
+            exit 1
+          fi
+          echo "::notice::assigned ${assigned} — no tag cut, releases are batched"
+
+          # GRADED. A GITHUB_TOKEN push does not trigger workflows, so the assignment
+          # commit would otherwise never be seen by CI — leaving this job's own output
+          # ungraded, which is the exact shape of hole this ticket is about.
+          # workflow_dispatch is GitHub's documented exception and DOES create runs.
+          # bundle-drift.yml carries BOTH the drift check and the version-uniqueness
+          # job, so one dispatch grades both: they are one workflow, not two.
+          #
+          # HONEST CAVEAT, so nobody over-reads the resulting run: a dispatch targets a
+          # REF, not a sha. It grades main's TIP AT DISPATCH TIME — normally this
+          # commit, but whatever landed since if another merge beat us to it. Arguably
+          # the more useful subject, but it is not a per-sha attestation.
+          if gh workflow run bundle-drift.yml --ref main; then
+            echo "::notice::dispatched bundle-drift (drift + version-uniqueness) against main's tip"
+          else
+            echo "::error::THE ASSIGNMENT LANDED — ${assigned} is pushed to main and main is assigned, NOT broken. What failed is the follow-up dispatch, so this commit is UNGRADED by CI: re-run bundle-drift on main by hand."
+            exit 1
+          fi
