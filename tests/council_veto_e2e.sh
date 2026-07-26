@@ -1,0 +1,221 @@
+#!/usr/bin/env bash
+# CNCL-9 bash e2e — the authenticated founder veto WIRING (not just the node engine). Drives the
+# real `5dive council {init,convene,veto exercise,lineage verify}` bundle against an isolated
+# STATE_DIR + a self-provisioned gate-proof key, and asserts the four legs main's hard gate
+# required (2026-07-19): nonce-mismatch refused+logged, window-expiry refused, a real tap flipping
+# pass->blocked inside a sealed receipt, and lineage-verify GREEN after the veto. Plus the security
+# amendments: the receipt stores only the nonce DIGEST (never the raw bearer token), the pings
+# audit is 0600, a forged `--veto-by` is refused+logged, and a tampered receipt canonical is
+# refused (the re-seal hardening). Offline: COUNCIL_MOCK, no key/network/live tasks.db.
+#
+# Needs root (the gate-proof seal runs in-process against the isolated STATE_DIR). Re-execs under
+# passwordless sudo when available; SKIPs (green) otherwise — same posture as the node-skip in
+# council_unit.sh, so CI never goes red on a runner that can't seal.
+set -uo pipefail
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"; cd "$ROOT"
+FIVE="$ROOT/5dive"
+
+for b in node jq openssl sha256sum; do
+  command -v "$b" >/dev/null 2>&1 || { echo "SKIP: $b not on PATH (council veto e2e needs it)"; exit 0; }
+done
+[[ -x "$FIVE" ]] || { echo "SKIP: built ./5dive not found (run ./build.sh first)"; exit 0; }
+
+if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
+  if sudo -n true 2>/dev/null; then exec sudo -n env PATH="$PATH" bash "$0" "$@"; fi
+  echo "SKIP: council veto e2e needs root (in-process gate-proof seal) and passwordless sudo is unavailable"
+  exit 0
+fi
+
+TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
+export STATE_DIR="$TMP" COUNCIL_MOCK=1
+SINK="$TMP/nonce.sink"
+pass=0; fail=0
+ok(){ echo "  ok:   $1"; pass=$((pass+1)); }
+no(){ echo "  FAIL: $1"; fail=$((fail+1)); }
+sha(){ printf '%s' "$1" | sha256sum | awk '{print $1}'; }
+
+# CNCL-15: init now seeds a constitution.yaml and the constitution GOVERNS the veto window (posthoc_secs),
+# so the posthoc window is expressed in the constitution the council is seeded with — not via the
+# pre-constitution COUNCIL_VETO_POSTHOC_SECS env (a valid on-disk file wins over it, by design).
+# Seed a constitution with a 0s posthoc window (15m hold kept) so the window-expiry leg below fires.
+cat > "$TMP/constitution.yaml" <<'EOF'
+council:
+  bench: council
+veto:
+  hold_secs: 900
+  posthoc_secs: 0
+# veto e2e: zero posthoc window
+EOF
+
+# --- genesis + a convene that offers the founder veto --------------------------------------------
+"$FIVE" council init --seats="a:chair,b,c" --threshold="majority" --veto="tg:433634012" >/dev/null 2>&1 \
+  || { echo "FAIL: council init (cannot seal genesis — no gate-proof rail?)"; exit 1; }
+
+OFFERSINK="$TMP/offer.sink"
+COUNCIL_VETO_NONCE_SINK="$SINK" COUNCIL_VETO_OFFER_SINK="$OFFERSINK" \
+  "$FIVE" council convene "e2e: ship the thing?" --seats="a:chair,b,c" --mode=quick >/dev/null 2>&1 \
+  || { echo "FAIL: council convene"; exit 1; }
+RCPT="$(ls -1 "$TMP/council/receipts/"*.json 2>/dev/null | head -1)"
+[[ -f "$RCPT" ]] || { echo "FAIL: no sealed receipt produced"; exit 1; }
+DIGEST="$(jq -r '.sealedDigest' "$RCPT")"
+NONCE="$(cat "$SINK" 2>/dev/null)"
+[[ -n "$DIGEST" && -n "$NONCE" ]] || { echo "FAIL: could not read sealed digest / captured nonce"; exit 1; }
+
+# --- DIVE-1546 rail B: the founder delivery leg hands the raw nonce to the STRUCTURED seam only ---
+# The offer sink captures `_tg_veto_offer <recipient> <receiptDigest> <rawNonce> <executeAfter>`. The
+# raw nonce must ride ONLY here (structured), never in any chat-text leg — enforced at the source.
+[[ -s "$OFFERSINK" ]] && ok "structured veto-offer delivered (rail B seam fired)" || no "no structured veto-offer captured"
+OFFER_NONCE="$(awk -F'\t' 'NR==1{print $3}' "$OFFERSINK" 2>/dev/null)"
+OFFER_RCPT="$(awk -F'\t' 'NR==1{print $1}' "$OFFERSINK" 2>/dev/null)"
+OFFER_DIG="$(awk -F'\t' 'NR==1{print $2}' "$OFFERSINK" 2>/dev/null)"
+[[ "$OFFER_NONCE" == "$NONCE" ]] && ok "structured offer carries the RAW nonce (matches sealed offer)" || no "structured offer nonce mismatch"
+[[ "$OFFER_DIG" == "$DIGEST" ]] && ok "structured offer carries the receipt digest" || no "structured offer digest mismatch"
+[[ "$OFFER_RCPT" == "433634012" ]] && ok "structured offer targets the resolved founder recipient" || no "structured offer recipient wrong ($OFFER_RCPT)"
+# --- DIVE-1644: the offer must be self-contained — carry WHAT carried (motion) + the vote tally so
+# the founder never vetoes a sealed digest blind. Columns 5/6 of the structured sink.
+OFFER_MOTION="$(awk -F'\t' 'NR==1{print $5}' "$OFFERSINK" 2>/dev/null)"
+OFFER_TALLY="$(awk -F'\t' 'NR==1{print $6}' "$OFFERSINK" 2>/dev/null)"
+[[ "$OFFER_MOTION" == "e2e: ship the thing?" ]] && ok "DIVE-1644: structured offer carries the decision/motion text" || no "offer missing motion text (got '$OFFER_MOTION')"
+[[ "$OFFER_TALLY" == carried*approve* ]] && ok "DIVE-1644: structured offer carries the vote tally ($OFFER_TALLY)" || no "offer missing/garbled tally (got '$OFFER_TALLY')"
+# Source guarantee: the fallback chat-text leg must NEVER interpolate the raw nonce (rail B moved it
+# into the structured seam). Pin it against the built bundle so a regression re-adding it gates in CI.
+# Guard the CHAT-TEXT leg specifically: `_tg_send` (the prose message rail) must never interpolate
+# the raw nonce. The structured `_tg_veto_offer "$resolved" "$digest" "$nonce" ...` call legitimately
+# passes $nonce and is NOT matched (different function). Also pin the old leaky text literal.
+if grep -Eq '_tg_send[^;{}]*\$\{?nonce|Tap to VETO \(nonce' "$ROOT/src/cmd_council.sh"; then no "a chat-text (_tg_send) leg still prints the raw nonce (rail B violated)"; else ok "no chat-text leg interpolates the raw nonce (rail B: nonce is button-only)"; fi
+
+# --- security amendment 2: receipt stores the DIGEST, never the raw nonce; pings 0600 ------------
+[[ "$(jq -r '.vetoNonceDigest // empty' "$RCPT")" == "$(sha "$NONCE")" ]] \
+  && ok "receipt stores vetoNonceDigest = sha256(nonce)" || no "receipt vetoNonceDigest wrong/missing"
+[[ -z "$(jq -r '.vetoNonce // empty' "$RCPT")" ]] \
+  && ok "receipt does NOT carry the raw nonce" || no "raw nonce leaked into the receipt"
+perm="$(stat -c '%a' "$TMP/council/veto-pings.jsonl" 2>/dev/null || echo '-')"
+[[ "$perm" == "600" ]] && ok "veto-pings.jsonl is 0600" || no "veto-pings.jsonl perms=$perm (want 600)"
+[[ -z "$(jq -r '.nonce // empty' "$TMP/council/veto-pings.jsonl" 2>/dev/null)" ]] \
+  && ok "pings audit carries no raw nonce (digest only)" || no "pings audit leaked the raw nonce"
+
+# --- leg: nonce-mismatch refused + LOGGED --------------------------------------------------------
+if "$FIVE" council veto exercise --receipt="$DIGEST" --nonce="deadbeefdeadbeefdeadbeefdeadbeef" >/dev/null 2>&1; then
+  no "nonce-mismatch exercise was NOT refused"
+else
+  ok "nonce-mismatch exercise refused"
+fi
+[[ -f "$TMP/council/veto-audit.jsonl" ]] && grep -q '"event":"nonce-mismatch"' "$TMP/council/veto-audit.jsonl" \
+  && ok "nonce-mismatch written to the durable veto audit" || no "nonce-mismatch not logged"
+
+# --- leg: window-expiry refused (posthoc past the constitution's zero window) --------------------
+# The 0s posthoc window comes from the seeded constitution (CNCL-15: the file governs it).
+if "$FIVE" council veto exercise --receipt="$DIGEST" --nonce="$NONCE" --tier=posthoc >/dev/null 2>&1; then
+  no "expired-window exercise was NOT refused"
+else
+  ok "window-expiry exercise refused (past posthoc window)"
+fi
+
+# --- DIVE-1546: --receipt accepts a UNIQUE PREFIX (the telegram button carries a 12-char prefix,
+# not the full digest — the 64-byte callback_data cap). Resolution is fail-closed. -----------------
+# Ambiguity: two dummy receipts sharing a prefix must refuse BEFORE re-seal (match_count>1), never
+# silently pick one. (The dummies never reach re-seal; the ambiguity gate fires first.)
+printf '{"sealedDigest":"AMBIGpfx0000AAAA"}\n' > "$TMP/council/receipts/_dummy_a.json"
+printf '{"sealedDigest":"AMBIGpfx1111BBBB"}\n' > "$TMP/council/receipts/_dummy_b.json"
+if "$FIVE" council veto exercise --receipt="AMBIGpfx" --nonce="$NONCE" --tier=hold >/dev/null 2>&1; then
+  no "ambiguous receipt prefix was NOT refused"
+else
+  ok "ambiguous receipt prefix refused (fail-closed)"
+fi
+grep -q '"event":"ambiguous-prefix"' "$TMP/council/veto-audit.jsonl" 2>/dev/null \
+  && ok "ambiguous-prefix written to the durable veto audit" || no "ambiguous-prefix not logged"
+rm -f "$TMP/council/receipts/_dummy_a.json" "$TMP/council/receipts/_dummy_b.json"
+# Not-found: a prefix matching no receipt is refused (fail-closed).
+if "$FIVE" council veto exercise --receipt="ZZZZnope" --nonce="$NONCE" --tier=hold >/dev/null 2>&1; then
+  no "unknown receipt prefix was NOT refused"
+else
+  ok "unknown receipt prefix refused (fail-closed)"
+fi
+
+# --- leg: a REAL tap flips pass->blocked inside a sealed record — driven via a receipt PREFIX ------
+# (proves the whole prefix round-trip: `_tg_veto_offer` emits a 12-char prefix, exercise resolves it,
+# re-anchors to the FULL sealedDigest so the re-seal hardening below is unchanged.)
+"$FIVE" council veto exercise --receipt="${DIGEST:0:12}" --nonce="$NONCE" --tier=hold >/dev/null 2>&1 \
+  || no "valid veto exercise via receipt PREFIX returned nonzero"
+VREC="$(ls -1t "$TMP/council/receipts/"veto-*.json 2>/dev/null | head -1)"
+if [[ -f "$VREC" ]]; then
+  ok "chained veto record sealed to disk"
+  [[ "$(jq -r '.flippedVerdict.vetoed // false' "$VREC")" == "true" \
+     && "$(jq -r '.flippedVerdict.disposition // empty' "$VREC")" == "blocked" ]] \
+    && ok "authenticated tap flipped pass->blocked (vetoed, sealed)" \
+    || no "sealed veto record is not vetoed/blocked"
+else
+  no "no sealed veto record written"
+fi
+
+# --- DIVE-1546: _tg_veto_offer renders the nonce ONLY in the button callback_data, never in text --
+# Extract the function from the BUILT bundle and drive it with stubs for its two deps
+# (_task_owner_channel + _mirror_send), so we assert the rendered payload offline (no live rail).
+OFFER_FN="$TMP/offer_fn.sh"
+sed -n '/^_tg_veto_offer() {/,/^}/p' "$ROOT/src/cmd_council.sh" > "$OFFER_FN"
+if [[ -s "$OFFER_FN" ]]; then
+  CAP="$TMP/offer_capture.txt"
+  (
+    export TASK_CH_TOKEN="testtoken"
+    _task_owner_channel() { return 0; }
+    _mirror_send() { printf 'chat=%s\ntext=%s\nmarkup=%s\n' "$2" "$4" "$5" > "$CAP"; }
+    source "$OFFER_FN"
+    _tg_veto_offer "433634012" "dQtU1Z_iCpWuT3Ggu6RyV3TnwDkWb_YdtmS1n6qXL10" "0123456789abcdef0123456789abcdef" "2026-01-01T00:00:00Z"
+  )
+  grep -q '"callback_data":"veto:dQtU1Z_iCpWu:0123456789abcdef0123456789abcdef"' "$CAP" \
+    && ok "_tg_veto_offer button carries veto:<12prefix>:<nonce> in callback_data" || no "veto button callback_data wrong"
+  awk -F'text=' '/^text=/{print $2}' "$CAP" | grep -q '0123456789abcdef' \
+    && no "_tg_veto_offer LEAKED the raw nonce into the message text" || ok "_tg_veto_offer message text carries NO nonce (button-only)"
+  grep -q '^chat=433634012$' "$CAP" && ok "_tg_veto_offer targets the resolved founder chat" || no "_tg_veto_offer wrong chat"
+else
+  no "could not extract _tg_veto_offer from the built bundle"
+fi
+
+# --- leg: lineage verify GREEN after the veto (the chain-defect regression) ----------------------
+if "$FIVE" council lineage verify >/dev/null 2>&1; then
+  ok "lineage verify GREEN after veto"
+else
+  no "lineage verify BROKEN after veto (chain defect)"
+fi
+ent="$(wc -l < "$TMP/council/lineage.jsonl" 2>/dev/null | tr -d ' ')"
+[[ "$ent" == "2" ]] && ok "lineage has genesis + veto (2 entries)" || no "lineage entry count=$ent (want 2)"
+vseq="$(tail -n1 "$TMP/council/lineage.jsonl" | jq -r '.seq')"
+[[ "$vseq" == "1" ]] && ok "veto lineage entry seq=1 (not -1)" || no "veto lineage seq=$vseq (want 1)"
+
+# --- security amendment 3: forged --veto-by refused (exit 9) + LOGGED ----------------------------
+"$FIVE" council convene "forge attempt?" --seats="a:chair,b,c" --veto-by="lodar" >/dev/null 2>&1
+rc=$?
+[[ "$rc" -eq 9 ]] && ok "forged --veto-by refused (exit 9)" || no "forged --veto-by exit=$rc (want 9)"
+grep -q '"event":"forge-attempt-veto-by"' "$TMP/council/veto-audit.jsonl" 2>/dev/null \
+  && ok "forge attempt written to the durable veto audit" || no "forge attempt not logged"
+
+# --- hardening: a tampered receipt canonical is refused (re-seal mismatch) -----------------------
+COUNCIL_VETO_NONCE_SINK="$TMP/n2" "$FIVE" council convene "second convene" --seats="a:chair,b,c" --mode=quick >/dev/null 2>&1
+RCPT2="$(ls -1t "$TMP/council/receipts/"*.json | grep -v '/veto-' | head -1)"
+DIG2="$(jq -r '.sealedDigest' "$RCPT2")"; N2="$(cat "$TMP/n2")"
+jq '.canonical = (.canonical + " TAMPERED")' "$RCPT2" > "$TMP/rt.json" && cp "$TMP/rt.json" "$RCPT2"
+if "$FIVE" council veto exercise --receipt="$DIG2" --nonce="$N2" --tier=hold >/dev/null 2>&1; then
+  no "tampered-canonical receipt was NOT refused"
+else
+  ok "tampered-canonical receipt refused (re-seal hardening)"
+fi
+
+# --- AMENDMENT (main gate): swapping the WRAPPER .vetoNonceDigest to sha256(attacker-nonce) must be
+# refused. Pre-amendment the nonce digest lived OUTSIDE .canonical, so this edit slipped past the
+# re-seal check and let the attacker exercise with a chosen nonce. Now exercise reads the digest
+# from the SEALED canonical (seal-augment folded it in), so the wrapper edit is ignored and the
+# attacker's nonce fails authentication. .canonical is left INTACT here (re-seal still passes) to
+# prove it is the seal-binding read — not the existing re-seal check — that closes this hole.
+COUNCIL_VETO_NONCE_SINK="$TMP/n3" "$FIVE" council convene "third convene" --seats="a:chair,b,c" --mode=quick >/dev/null 2>&1
+RCPT3="$(ls -1t "$TMP/council/receipts/"*.json | grep -v '/veto-' | head -1)"
+DIG3="$(jq -r '.sealedDigest' "$RCPT3")"
+ATT_NONCE="attackerchosennonce0000000000000"
+jq --arg nd "$(sha "$ATT_NONCE")" '.vetoNonceDigest = $nd' "$RCPT3" > "$TMP/rt3.json" && cp "$TMP/rt3.json" "$RCPT3"
+if "$FIVE" council veto exercise --receipt="$DIG3" --nonce="$ATT_NONCE" --tier=hold >/dev/null 2>&1; then
+  no "swapped wrapper .vetoNonceDigest let an attacker exercise with a chosen nonce (HOLE OPEN)"
+else
+  ok "swapped wrapper .vetoNonceDigest refused — exercise reads the digest from the sealed canonical"
+fi
+
+echo "CNCL-9 veto e2e: $pass passed, $fail failed"
+[[ "$fail" -eq 0 ]]

@@ -40,9 +40,35 @@ say() { echo "→ $*"; }
 # the claude user, apt packages, nvm, or bun — so it's safe to rerun on a
 # populated host.
 refresh_managed_files() {
-  curl -fsSL "$REPO/5dive" -o "$BIN_DIR/5dive"
-  chmod 755 "$BIN_DIR/5dive"
-  ok "5dive → $BIN_DIR/5dive"
+  # DIVE-1261: fetch the bundle to a temp file, verify it against the published
+  # sha256, then atomically swap it in. A checksum MISMATCH is fatal (corrupt
+  # download or tampered mirror); an absent/unfetchable checksum only WARNS so a
+  # box can't be bricked if the .sha256 isn't published yet. (Integrity check v1:
+  # guards corruption + mirror tamper; not signing-strength — that needs an
+  # out-of-band key.) Temp lives in BIN_DIR so the final mv is a same-fs atomic swap.
+  local _bundle_tmp; _bundle_tmp="$(mktemp "${BIN_DIR}/.5dive.XXXXXX")"
+  curl -fsSL "$REPO/5dive" -o "$_bundle_tmp" || { rm -f "$_bundle_tmp"; die "failed to download 5dive bundle from $REPO/5dive"; }
+  local _want _got
+  # `|| _want=""` is load-bearing: under `set -euo pipefail` (line 6) a plain
+  # assignment whose command-substitution pipeline fails aborts the whole script
+  # BEFORE the else-branch below can treat an absent checksum as fail-soft. The
+  # offline install-smoke bundle (REPO=file:///opt/5dive-bundle) ships no
+  # 5dive.sha256, so curl exits 37 (CURLE_FILE_COULDNT_READ_FILE) and pipefail
+  # propagates it — reddening docker-install at the "Installing CLI binaries"
+  # step (DIVE-1271). Swallowing it here keeps the absent-checksum-warns contract.
+  _want="$(curl -fsSL "$REPO/5dive.sha256" 2>/dev/null | tr -d '[:space:]')" || _want=""
+  if [[ -n "$_want" ]]; then
+    _got="$(sha256sum "$_bundle_tmp" | awk '{print $1}')"
+    if [[ "$_want" != "$_got" ]]; then
+      rm -f "$_bundle_tmp"
+      die "5dive bundle checksum mismatch (want ${_want:0:16}…, got ${_got:0:16}…) — refusing to install (corrupt download or tampered mirror)"
+    fi
+  else
+    echo "  ! no published 5dive.sha256 (or fetch failed) — skipping integrity check" >&2
+  fi
+  chmod 755 "$_bundle_tmp"
+  mv -f "$_bundle_tmp" "$BIN_DIR/5dive"
+  ok "5dive → $BIN_DIR/5dive${_want:+ (sha256 verified)}"
 
   # DIVE-544: per-customer standup digest. The cron runs HOURLY but `digest tick`
   # is gated on a per-box pref that defaults OFF — nothing is delivered until a
@@ -294,6 +320,37 @@ JOURNALD
   fi
   rm -rf "$_ocode_tmp"
 
+  # Stage the telegram-pi plugin — same shape as telegram-opencode above. pi
+  # (earendil-works/pi) is EXTENSION-based with no plugin marketplace; its
+  # telegram bridge is a standalone long-running relay (server.ts) launched by
+  # 5dive-agent-start from this one shared checkout via absolute paths. Without
+  # this, pi+telegram agents can't be provisioned (install_channel_for_pi_
+  # agent's plugin-dir check fails) — i.e. pi telegram is a no-op on customer
+  # boxes until staged. Override with PI_PLUGIN_TARBALL for offline / pinned
+  # installs.
+  PI_PLUGIN_TARBALL="${PI_PLUGIN_TARBALL:-https://github.com/$GH_ORG/5dive-plugins/archive/refs/heads/main.tar.gz}"
+  _pi_tmp="$(mktemp -d)"
+  if curl -fsSL "$PI_PLUGIN_TARBALL" \
+      | tar -xz -C "$_pi_tmp" --strip-components=1 '5dive-plugins-main/plugins/telegram-pi' 2>/dev/null \
+      && [ -f "$_pi_tmp/plugins/telegram-pi/server.ts" ]; then
+    install -d -m 755 "$LIB_DIR/telegram-pi"
+    cp -a "$_pi_tmp/plugins/telegram-pi/." "$LIB_DIR/telegram-pi/"
+    if id -u claude >/dev/null 2>&1; then
+      chown -R claude:claude "$LIB_DIR/telegram-pi"
+      if sudo -u claude -H bash -lc "cd $(printf %q "$LIB_DIR/telegram-pi") && bun install --production --ignore-scripts --no-progress --no-summary" >/dev/null 2>&1; then
+        chmod -R a+rX "$LIB_DIR/telegram-pi"
+        ok "telegram-pi plugin"
+      else
+        echo "warn: bun install for telegram-pi failed — pi+telegram agents won't have the bridge until the next successful refresh" >&2
+      fi
+    else
+      echo "warn: no claude user — skipping telegram-pi bun install" >&2
+    fi
+  else
+    echo "warn: failed to stage telegram-pi from $PI_PLUGIN_TARBALL — pi+telegram won't be available until the next successful refresh" >&2
+  fi
+  rm -rf "$_pi_tmp"
+
   # CLAUDE.md fragment that preseed_claude_agent drops into a telegram-paired
   # agent's $HOME/.claude/ so the per-turn reply mandate + AskUserQuestion /
   # ExitPlanMode warning ride with the agents that actually need them — not
@@ -503,6 +560,9 @@ if [[ "${1:-}" == "--upgrade" ]]; then
 
   [[ -x "$BIN_DIR/5dive" ]] || die "no existing 5dive at $BIN_DIR/5dive — run install without --upgrade first"
 
+  # DIVE-1260: read the current version so we can report old -> new after the swap.
+  _old_ver="$(grep -m1 'readonly FIVE_VERSION=' "$BIN_DIR/5dive" 2>/dev/null | sed -E 's/.*="([^"]+)".*/\1/')"
+
   say "Upgrading 5dive CLI (skipping apt / nvm / bun / state setup)"
   refresh_managed_files
 
@@ -529,7 +589,13 @@ if [[ "${1:-}" == "--upgrade" ]]; then
   "$BIN_DIR/5dive" gate-proof enforce on >/dev/null 2>&1 || true
 
   echo
-  echo "5dive upgraded."
+  # DIVE-1260: report the version actually swapped in, read from the new bundle.
+  _new_ver="$(grep -m1 'readonly FIVE_VERSION=' "$BIN_DIR/5dive" 2>/dev/null | sed -E 's/.*="([^"]+)".*/\1/')"
+  if [[ -n "${_old_ver:-}" && "${_old_ver}" != "${_new_ver:-}" ]]; then
+    echo "5dive upgraded: ${_old_ver} -> ${_new_ver:-unknown}"
+  else
+    echo "5dive upgraded (now ${_new_ver:-unknown})"
+  fi
   exit 0
 fi
 
@@ -587,8 +653,13 @@ ok "Node.js $NODE_VERSION"
 # bun (needed for telegram plugin)
 say "Installing bun"
 if ! sudo -u claude bash -lc 'command -v bun' >/dev/null 2>&1; then
-  sudo -u claude bash -c 'curl -fsSL https://bun.sh/install | bash' 2>/dev/null
-  ok "bun installed"
+  # DIVE-1263: install system-wide to /usr/local/bin (BUN_INSTALL=/usr/local),
+  # matching ensure_bun_for_agent. The old default install dropped bun at
+  # ~claude/.bun/bin/bun, which 5dive-agent-start's hardcode missed → pi/opencode
+  # telegram bridges crash-looped on fresh boxes. Now every install path lands
+  # bun where the runtime resolver looks first.
+  curl -fsSL https://bun.sh/install | BUN_INSTALL=/usr/local bash >/dev/null 2>&1
+  ok "bun installed (/usr/local/bin/bun)"
 else
   ok "bun already present"
 fi
@@ -643,6 +714,9 @@ echo "  5dive agent list                          # list agents"
 echo "  5dive doctor --repair                     # auto-install agent type binaries"
 echo "  5dive agent create my-agent --type=claude # create your first agent"
 echo
-echo "To upgrade later: curl -fsSL $REPO/install.sh | sudo bash -s -- --upgrade"
+echo "To upgrade later: sudo 5dive self-update"
+echo "Managed hosts already update nightly. Self-hosted opt-in (root crontab):"
+echo "  0 4 * * * /usr/local/bin/5dive self-update >> /var/log/5dive-self-update.log 2>&1"
+echo "Fallback: curl -fsSL $REPO/install.sh | sudo bash -s -- --upgrade"
 echo "Full CLI docs: https://5dive.ai/docs/5dive-cli"
 echo "Source: https://github.com/$GH_ORG/5dive"
