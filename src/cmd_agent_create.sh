@@ -286,7 +286,14 @@ isolation_implied_by_grant() {
     cli-root) printf 'admin\n' ;;
     cli-scoped) printf 'standard\n' ;;
     none)     printf 'sandboxed\n' ;;
-    *)        printf 'custom\n' ;;
+    custom)   printf 'custom\n' ;;
+    # DIVE-2098: `unknown` is NOT a class, it is the absence of a measurement,
+    # and it used to fall through the catch-all into `custom` — a GENUINE class
+    # in this vocabulary, so an unmeasurable grant rendered as a confident
+    # privilege claim. Map it (and any class this function does not recognise)
+    # to `unknown`: a derived class must never be more certain than the
+    # measurement it is derived from.
+    *)        printf 'unknown\n' ;;
   esac
 }
 

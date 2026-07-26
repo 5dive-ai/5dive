@@ -373,7 +373,14 @@ cmd_info() {
         grant: $grantClass,
         runas: $grantRunas,
         scope: $grantEnglish,
-        impliedIsolation: $grantImplied,
+        # DIVE-2098: null, never a class, when the grant was not measured.
+        # `grant`/`scope` above already say "unknown"/"not measurable from
+        # here"; the whole vocabulary of THIS field is definite privilege classes,
+        # so there is no honest string for it and null is the only value a
+        # consumer cannot mistake for a measurement. Guarded HERE as well as in
+        # isolation_implied_by_grant so a future caller that re-derives the
+        # value cannot reintroduce the confident wrong answer.
+        impliedIsolation: (if $grantClass == "unknown" then null else $grantImplied end),
         measured: ($grantClass != "unknown"),
         extraEntries: ($grantExtra == "1"),
         diverges: (
