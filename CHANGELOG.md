@@ -8,7 +8,12 @@
 - Works on recurring templates the same as worked tasks — the DIVE-176 case.
 - Refused on a closed (`done`/`cancelled`) task, the same "can't retro-edit a closed task" guard `task verifier` already enforces; the remedy is `task reject` to reopen first.
 - `tests/task_set_body_unit.sh` (9 assertions) pins overwrite, append-onto-existing, append-onto-empty, the template case, the closed-task refusal (and that a refused write leaves the body untouched), and the bare-usage error.
-- audit: `set-body` now calls `audit_log` (task, actor, mode `replaced`/`appended`, prior body length) guarded on `EUID==0`, matching `cmd_task_reject`'s own convention exactly — visibility only, no new permission check.
+- audit: `set-body` calls `audit_log` UNCONDITIONALLY (task, actor, mode `replaced`/`appended`, prior body
+  length) — visibility only, no new permission check. It is NOT gated on `EUID==0`, and neither is
+  `cmd_task_reject`'s own call: a root-only audit line is a no-op for the main non-root use case, which is
+  exactly the anti-pattern DIVE-1989 removed from nine call sites fleet-wide in 0.15.26. A body carries the
+  spec a task is graded against, so a silently rewritable one is a last-write-wins gap; `prior_len` is what
+  makes a destructive overwrite distinguishable from an append after the fact.
 
 ## 0.15.33
 
