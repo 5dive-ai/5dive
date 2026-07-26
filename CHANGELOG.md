@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.16.4 — chore(release): the DIVE-2059 follow-up (E_CONFLICT for start-on-recurring-template) shipped in a commit that reused 0.16.3 (2026-07-26)
+
+Process fix, not a code change. c97a4f9 and 2472df2 both carried FIVE_VERSION 0.16.3 with DIFFERENT bundles, because the version bump intended for the follow-up failed silently on a permissions error while the push succeeded. This entry gives the follow-up its own version so no two bundles claim one.
+
 ## 0.16.3 — fix(task): `task start` on a recurring TEMPLATE silently killed the driver, post-DIVE-2055 (DIVE-2059) (2026-07-26)
 
 DIVE-2055 made the materializer's fire predicate require `status='todo'`, which is what
