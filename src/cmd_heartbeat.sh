@@ -1558,6 +1558,10 @@ _hb_gate_renag_sweep() {
   # T1 gates: group by the existing routed reviewer / org-lead resolution. A
   # lead's own T1 gate uses the coordinator/root channel instead of escalating
   # to the paired-human lane reserved for T2.
+  # DIVE-1945: this lane resolves the reviewer FROM the filer's org position, so
+  # it is a whose-ask-is-this question and takes gate_filed_by — unlike the T2
+  # sweep above, which batches by the channel OWNER and correctly stays on
+  # created_by. Same COALESCE fallback for pre-column gates.
   local grow gid filer reviewer routed
   declare -A lead_ids=()
   while IFS= read -r grow; do
@@ -1572,7 +1576,7 @@ _hb_gate_renag_sweep() {
       continue
     fi
     lead_ids[$reviewer]+="${lead_ids[$reviewer]:+,}${gid}"
-  done < <(db "SELECT id||x'1f'||COALESCE(NULLIF(created_by,''),assignee,'')||x'1f'||COALESCE(routed_reviewer,'')
+  done < <(db "SELECT id||x'1f'||COALESCE(NULLIF(gate_filed_by,''),NULLIF(created_by,''),assignee,'')||x'1f'||COALESCE(routed_reviewer,'')
                FROM tasks WHERE ${_HB_GATE_RENAG_WHERE} AND tier=1
                ORDER BY COALESCE(need_asked_at,updated_at,created_at),id;")
   for reviewer in "${!lead_ids[@]}"; do

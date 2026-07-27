@@ -3867,7 +3867,7 @@ cmd_task_need() {
           SET need_type=NULL, ask=NULL, need_options=NULL, recommend=NULL,
               secret_key=NULL, connector=NULL, ask_shape=NULL,
               precedent_ref=NULL, precedent_kind=NULL, routed_reviewer=NULL,
-              need_asked_at=NULL, gate_pinged_at=NULL
+              need_asked_at=NULL, gate_pinged_at=NULL, gate_filed_by=NULL
         WHERE id=${id};
         UPDATE tasks SET status='todo'
           WHERE id=${id} AND status='blocked'
@@ -4302,7 +4302,8 @@ cmd_task_need() {
             ask_shape=$(sqlq_or_null "$ask_shape"),
             precedent_ref=${precedent_ref:-NULL},
             precedent_kind=$(sqlq_or_null "$precedent_kind"),
-            tier=${tier}, need_asked_at=datetime('now'), gate_pinged_at=NULL
+            tier=${tier}, need_asked_at=datetime('now'), gate_pinged_at=NULL,
+            gate_filed_by=$(sqlq "$actor")
       WHERE id=${id};
       COMMIT;"
 
@@ -4949,10 +4950,19 @@ cmd_task_gate_escalate() {
   _gate_is_root || fail "$E_PERMISSION" "task gate-escalate must run as root (it reads other agents' channel state)"
 
   resolve_task_id "$ident_arg"; local id="$RESOLVED_TASK_ID" ident="$RESOLVED_TASK_IDENT"
+  # DIVE-1945: the filer is the gate's FILER-OF-RECORD (gate_filed_by, stamped by
+  # cmd_task_need from the acting agent), NOT the task's created_by. They differ
+  # whenever one agent files a gate on another agent's task — and then this walked
+  # the CREATOR's branch of the org chart and the alert read "filed by <creator>
+  # (no channel of its own)", wrong attribution about an agent that may well have
+  # one. Same bug DIVE-1927 fixed on the `task need` path via TASK_GATE_FILER,
+  # surviving here because this process cannot see that env var: it is a separate
+  # privileged run driven by the re-nag, so the filer has to come off the ROW.
+  # created_by remains the fallback for gates filed before the column existed.
   local grow
   grow=$(db "SELECT COALESCE(need_type,'')||x'1f'||COALESCE(ask,'')||x'1f'||COALESCE(need_options,'')||x'1f'||
                     COALESCE(recommend,'')||x'1f'||COALESCE(secret_key,'')||x'1f'||COALESCE(connector,'')||x'1f'||
-                    COALESCE(NULLIF(created_by,''),assignee,'')
+                    COALESCE(NULLIF(gate_filed_by,''),NULLIF(created_by,''),assignee,'')
              FROM tasks
              WHERE id=${id} AND need_type IS NOT NULL AND need_answered_at IS NULL
                AND status NOT IN ('done','cancelled');")

@@ -1,5 +1,26 @@
 # Changelog
 
+## Unreleased — fix(gate): a gate escalates from the agent that FILED it, not from whoever created the task (DIVE-1945)
+
+`task gate-escalate` derived the gate's filer as `COALESCE(created_by, assignee)`. Those agree
+only when the filer also created the task. When one agent files a gate on another's task the
+privileged re-send therefore started the escalation walk on the CREATOR's branch of the org
+chart, and the alert read "filed by <creator> (no channel of its own)" about an agent that may
+well have one. It is the bug DIVE-1927 fixed on the `task need` path via the `TASK_GATE_FILER`
+env pin, surviving in the sibling path: `gate-escalate` is a separate privileged process, so
+that env var cannot reach it and the filer has to come off the row.
+
+- **`tasks.gate_filed_by`** records the filer of record, stamped by `task need` from the acting
+  agent, read back by `gate-escalate`, and cleared by `task need --withdraw` with the rest of the
+  gate provenance. Legacy gates have no stamp and fall back to `created_by`, so nothing in flight
+  changes behaviour.
+- **The heartbeat T1 re-nag lane moves too.** It resolves the reviewer FROM the filer's org
+  position, which is the same whose-ask-is-this question. The T2 lane deliberately stays on
+  `created_by`: it batches by the channel OWNER, where `created_by` is the right key.
+- `tests/gate_filer_of_record_unit.sh` grades it on a two-branch org fixture (dev3 -> qa ->
+  olivia, main -> olivia) so the correct and the buggy reading deliver to DIFFERENT agents; the
+  legacy no-stamp row is the non-vacuity control.
+
 ## Unreleased — feat(comms): the terse rule now bounds HOW OFTEN you send, and covers agent-to-agent (DIVE-2191)
 
 DIVE-1613 ships a terse-comms fragment into every claude agent at create. Measured against one
