@@ -35,24 +35,82 @@ fi
 # is the thing that is unfixable at the client, and a pinned tree cannot be
 # inconsistent. The guard itself stays exactly as strict as it was.
 #
-# Prints the sha on stdout, or fails if it cannot resolve one (the caller then
-# falls back to /main, and the mismatch message says which case it is in).
-resolve_gh_sha() {
-  local sha=""
+# DIVE-2144: WHAT we resolve changed, and it is the whole point of that ticket.
+# It used to be the tip of `main`, which made merging identical to publishing:
+# an unreviewed merge was live on every box within one self-update, and the
+# version-assign commit sat on the customer critical path (DIVE-2118/2141/2142).
+# Now it is the newest RELEASE TAG. Cutting a tag becomes the publish act;
+# merging only stages. The pin mechanism below is unchanged — same ladder, same
+# raw/<sha>/ fetch, same DIVE-1977 consistency property — only its INPUT moved.
+#
+# Two ways to get this wrong, both measured on the real 285-tag repo, both of
+# which succeed loudly-plausibly rather than failing:
+#
+#   LEXICAL SORT. `sort | tail -1` — the form almost everyone writes — returns
+#   v0.9.9, not v0.15.34. That ships a six-minor-version DOWNGRADE to every box
+#   while exiting 0 with a real tag name in the log. Nothing downstream catches
+#   it: the sha is valid, the tree is consistent, the pin is honest. Version-sort
+#   (`sort -V`) is load-bearing, not tidiness. tests/install_pin_sha_unit.sh
+#   proves it by mutation.
+#
+#   FAILING OPEN TO /main. The old block fell back to the mutable ref when
+#   nothing resolved. Keeping that here would invert its meaning: pre-2144 the
+#   fallback was a PIN failure (same content, unpinned, risk = inconsistency);
+#   post-2144 the identical line is a POLICY failure (DIFFERENT, ungated content
+#   shipped as root). And "no tag resolves" is not a random event — it correlates
+#   with tags deleted, release process broken, incident in progress. So we fail
+#   CLOSED, which is a no-op, not a brick: the box keeps the CLI it already has,
+#   exactly as it does every hour nothing is published. Two explicit valves out
+#   already exist and the error names both — GH_SHA (pin a tree directly) and
+#   REPO (override the source entirely).
+
+# Newest release tag name (e.g. v0.15.34) on stdout, or return 1.
+resolve_gh_tag() {
+  local tags=""
   # git ls-remote is exact and carries no API rate limit. A brand-new box may
   # not have git yet — this script is what apt-installs it — so this is the
   # normal path on every re-install and self-update, not on the first one.
   if command -v git >/dev/null 2>&1; then
-    sha="$(git ls-remote "https://github.com/$GH_ORG/5dive.git" main 2>/dev/null | awk 'NR==1 {print $1}')" || sha=""
+    tags="$(git ls-remote --tags --refs "https://github.com/$GH_ORG/5dive.git" 'v*' 2>/dev/null \
+      | sed -n 's#.*refs/tags/##p')" || tags=""
+  fi
+  # First-install fallback: the tags atom feed. Unauthenticated, and not subject
+  # to the 60/hr api.github.com limit a NAT'd fleet would share.
+  if [[ -z "$tags" ]]; then
+    tags="$(curl -fsSL --max-time 10 "https://github.com/$GH_ORG/5dive/tags.atom" 2>/dev/null \
+      | sed -n 's#.*<title>[[:space:]]*\(v[0-9][^<]*\)</title>.*#\1#p')" || tags=""
+  fi
+  # Last resort before giving up on resolving a tag altogether.
+  if [[ -z "$tags" ]]; then
+    tags="$(curl -fsSL --max-time 10 "https://api.github.com/repos/$GH_ORG/5dive/tags?per_page=100" 2>/dev/null \
+      | sed -n 's/.*"name"[[:space:]]*:[[:space:]]*"\(v[0-9][^"]*\)".*/\1/p')" || tags=""
+  fi
+  [[ -n "$tags" ]] || return 1
+  # `sort -V`, never `sort` — see the LEXICAL SORT note above. The regex also
+  # drops anything that is not a plain vMAJOR.MINOR.PATCH release tag, so a
+  # `v1.0.0-rc1` or a `nightly` can never become the thing every box installs.
+  local newest
+  newest="$(printf '%s\n' "$tags" | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1)"
+  [[ -n "$newest" ]] || return 1
+  printf '%s\n' "$newest"
+}
+
+# Commit sha for tag $1 on stdout, or return 1. Same three-rung ladder.
+resolve_gh_sha() {
+  local tag="$1" sha="" out=""
+  if command -v git >/dev/null 2>&1; then
+    # An ANNOTATED tag's own sha is the tag object, which raw.githubusercontent
+    # does not serve — the `^{}` peel is the commit. 97 of our tags are
+    # annotated, so preferring the peeled line is required, not defensive.
+    out="$(git ls-remote --tags "https://github.com/$GH_ORG/5dive.git" "refs/tags/$tag" "refs/tags/$tag^{}" 2>/dev/null)" || out=""
+    sha="$(printf '%s\n' "$out" | awk '$2 ~ /\^\{\}$/ {print $1; exit}')"
+    [[ -n "$sha" ]] || sha="$(printf '%s\n' "$out" | awk 'NR==1 {print $1}')"
     if [[ "$sha" =~ ^[0-9a-f]{40}$ ]]; then printf '%s\n' "$sha"; return 0; fi
   fi
-  # First-install fallback: the commits atom feed. Unauthenticated, and not
-  # subject to the 60/hr api.github.com limit a NAT'd fleet would share.
-  sha="$(curl -fsSL --max-time 10 "https://github.com/$GH_ORG/5dive/commits/main.atom" 2>/dev/null \
+  sha="$(curl -fsSL --max-time 10 "https://github.com/$GH_ORG/5dive/commits/$tag.atom" 2>/dev/null \
     | sed -n 's#.*Grit::Commit/\([0-9a-f]\{40\}\).*#\1#p' | head -1)" || sha=""
   if [[ "$sha" =~ ^[0-9a-f]{40}$ ]]; then printf '%s\n' "$sha"; return 0; fi
-  # Last resort before giving up on pinning altogether.
-  sha="$(curl -fsSL --max-time 10 "https://api.github.com/repos/$GH_ORG/5dive/commits/main" 2>/dev/null \
+  sha="$(curl -fsSL --max-time 10 "https://api.github.com/repos/$GH_ORG/5dive/commits/$tag" 2>/dev/null \
     | sed -n 's/.*"sha"[[:space:]]*:[[:space:]]*"\([0-9a-f]\{40\}\)".*/\1/p' | head -1)" || sha=""
   if [[ "$sha" =~ ^[0-9a-f]{40}$ ]]; then printf '%s\n' "$sha"; return 0; fi
   return 1
@@ -63,14 +121,39 @@ resolve_gh_sha() {
 # `file://` bundle of the working tree) — an explicit REPO is never re-pinned,
 # because we can't vouch for a foreign mirror's internal consistency. GH_SHA
 # pins the tree directly, skipping resolution (CI wanting a PR head, rollbacks).
+# Both are the documented ways OUT of the tag rail, and the fail-closed errors
+# below name them, so an operator leaves the guarantee by choosing to rather
+# than by being moved out of it silently.
 GH_PINNED_SHA="${GH_SHA:-}"
-if [[ -z "${REPO:-}" ]]; then
-  [[ -n "$GH_PINNED_SHA" ]] || GH_PINNED_SHA="$(resolve_gh_sha || true)"
-  if [[ -n "$GH_PINNED_SHA" ]]; then
-    REPO="https://raw.githubusercontent.com/$GH_ORG/5dive/$GH_PINNED_SHA"
-  else
-    REPO="https://raw.githubusercontent.com/$GH_ORG/5dive/main"
+GH_PINNED_TAG=""
+if [[ "${1:-}" == "--uninstall" ]]; then
+  # Uninstall downloads nothing, so it must never be gated on the release rail
+  # being healthy. Failing closed here would be a brick in the one direction
+  # fail-closed exists to prevent: "we cannot publish right now" must not become
+  # "you cannot remove what we already installed".
+  REPO="${REPO:-}"
+  GH_PINNED_SHA=""
+elif [[ -z "${REPO:-}" ]]; then
+  if [[ -z "$GH_PINNED_SHA" ]]; then
+    GH_PINNED_TAG="$(resolve_gh_tag || true)"
+    if [[ -z "$GH_PINNED_TAG" ]]; then
+      # Distinct and greppable on purpose: this must never read like the ordinary
+      # "pinned to <tag>" line, and must never be a silent `|| true` into main.
+      printf 'error: 5dive install: NO RELEASE TAG RESOLVED — refusing to install from ungated main.\n' >&2
+      printf '       Nothing was changed; if 5dive is already installed it keeps running the version it has.\n' >&2
+      printf '       Retry later, or choose a source explicitly:\n' >&2
+      printf '         GH_SHA=<40-hex commit>   pin one tree directly (rollback, CI, a PR head)\n' >&2
+      printf '         REPO=<base url>          install from a mirror or an offline bundle\n' >&2
+      exit 1
+    fi
+    GH_PINNED_SHA="$(resolve_gh_sha "$GH_PINNED_TAG" || true)"
+    if [[ -z "$GH_PINNED_SHA" ]]; then
+      printf 'error: 5dive install: RELEASE TAG %s RESOLVED BUT ITS COMMIT DID NOT — refusing to install from ungated main.\n' "$GH_PINNED_TAG" >&2
+      printf '       Nothing was changed. Retry later, or set GH_SHA=<40-hex commit> / REPO=<base url> explicitly.\n' >&2
+      exit 1
+    fi
   fi
+  REPO="https://raw.githubusercontent.com/$GH_ORG/5dive/$GH_PINNED_SHA"
 else
   GH_PINNED_SHA=""
 fi
