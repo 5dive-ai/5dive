@@ -37,7 +37,12 @@
 #   5dive proof on --repo=<url> [--branch=status] [--at=<0-23>] [--user=<u>]
 #   5dive proof off
 #   5dive proof status [--json]
-#   5dive proof tick        # cron driver; gated on the pref
+#   5dive proof tick [--log=<path>]   # cron driver; gated on the pref
+#
+# `tick --log=` writes its own run record (one stamped line per outcome, success
+# included) and falls back to journald when the path is unwritable. The cron line
+# carries NO shell redirect: DIVE-2044 lost 26h of publishes to a `>>` that the
+# shell opened, and failed, before the publisher ever ran.
 #
 # OSS-30: the daily cron runs as --user (default root). The cron's effective
 # user must own the box's git push credentials — on boxes where root has none
@@ -69,6 +74,13 @@ _PROOF_ID_NAME=""; _PROOF_ID_EMAIL=""; _PROOF_ID_SOURCE=""; _PROOF_ID_UNCHECKED=
 # owns 3 for its no-op, so its codes are read against that contract and not
 # against the global error_codes table (where 4 is E_NOT_FOUND).
 _PROOF_RC_NO_IDENTITY=4
+# DIVE-2044: the tick's own "I did not even try" code — not configured, or the
+# pref says disabled. Produced only by _proof_tick_run before any publish, so it
+# cannot collide with a _proof_publish code. It exists because the first cut
+# returned plain 0 here and the run record then read "PUBLISHED" on a box that
+# published nothing: the exact defect this ticket is about, rebuilt inside its
+# own fix. A skip and a success must never share a value.
+_PROOF_RC_TICK_SKIP=5
 _PROOF_METHODOLOGY_URL="https://github.com/5dive-ai/5dive/blob/main/docs/zero-human.md"
 
 _proof_pref_get() {
@@ -723,28 +735,58 @@ _proof_publish() {
 _proof_install_cron() {
   local hour="$1" user="${2:-root}" log="$_PROOF_LOG"
   [ -d /etc/cron.d ] || { echo "proof: /etc/cron.d absent — skipping cron install" >&2; return 0; }
-  # DIVE-1888: the cron line redirects into $log, and the shell opens that file
-  # AS ${user} BEFORE /usr/local/bin/5dive ever runs. On this box the file was
-  # root:root 0644 while the publisher runs as a non-root user, so the whole
-  # command would have died on the redirect — before the publisher started, with
-  # cron mail as the only signal. Same shape as the DIVE-1896 monitor failure:
-  # a destination nobody proved. Prove it HERE, while we still have root, rather
-  # than discovering it at 02:40. Best-effort by design: a box without the log
-  # still gets its cron, it just gets told the output has nowhere to go.
+  # DIVE-1888: prepare the log while we still have root, rather than discovering
+  # at 02:00 that ${user} cannot write it. Best-effort by design: a box without
+  # the log still gets its cron.
+  #
+  # DIVE-2044 is why that preparation is no longer LOAD-BEARING. The cron line
+  # used to end `>> ${log} 2>&1`, and the shell opens that file AS ${user} BEFORE
+  # /usr/local/bin/5dive ever runs. Something re-chowned the log to nobody:root
+  # months after install; every night from then on the redirect failed with
+  # EACCES and the shell died with the publisher never invoked — while cron
+  # dutifully logged the CMD line, so journalctl showed the job "running" for 26
+  # hours of not publishing. An install-time check cannot cover a permission
+  # that changes later, so the redirect is GONE: the tick owns its own logging
+  # and degrades to journald (see _proof_emit_log). The publish must never be
+  # downstream of its own observability.
   if : >> "$log" 2>/dev/null \
      || { mkdir -p "$(dirname "$log")" 2>/dev/null && : >> "$log" 2>/dev/null; }; then
     if [ "$user" != "root" ] && ! chown "$user" "$log" 2>/dev/null; then
-      echo "proof: WARNING — could not chown ${log} to ${user}; the cron cannot open it, so its output (including publish failures) is lost." >&2
+      echo "proof: WARNING — could not chown ${log} to ${user}; the tick will log to journald instead (\`journalctl -t 5dive-proof\`). Publishing is unaffected." >&2
     fi
   else
-    echo "proof: WARNING — cannot create ${log}; the cron redirects there and will fail on the redirect before publishing anything." >&2
+    echo "proof: WARNING — cannot create ${log}; the tick will log to journald instead (\`journalctl -t 5dive-proof\`). Publishing is unaffected." >&2
   fi
   cat > "$_PROOF_CRON" <<CRON
 # 5dive zero-human proof publisher (OSS-17) — daily; gated on the per-box pref
 # (${STATE_DIR}/proof.json). Removed by \`5dive proof off\`.
-0 ${hour} * * * ${user} /usr/local/bin/5dive proof tick >> ${log} 2>&1
+#
+# DIVE-2044: NO shell redirect on this line, deliberately. \`>> ${log} 2>&1\` is
+# opened by the shell BEFORE 5dive runs, so an unwritable log killed the publish
+# before it started. --log= hands the path to the tick, which writes its record
+# AFTER the publish and falls back to journald if the file is unwritable.
+0 ${hour} * * * ${user} /usr/local/bin/5dive proof tick --log=${log}
 CRON
   chmod 644 "$_PROOF_CRON"
+}
+
+# _proof_cron_legacy_check — DIVE-2044. Crons installed before this fix still
+# carry the `>> <log> 2>&1` redirect, and nothing re-runs `proof on` on a box
+# that is already configured. Detect it on `proof status` and repair in place
+# when we hold the rights; a loud warning is the fallback. Never silence — the
+# whole defect was a box that looked configured and published nothing.
+_proof_cron_legacy_check() {
+  [ -f "$_PROOF_CRON" ] || return 0
+  grep -qE '^[0-9].*5dive proof tick.*>>' "$_PROOF_CRON" 2>/dev/null || return 0
+  local hour user
+  hour="$(sed -n 's/^0 \([0-9]*\) \* \* \* .*/\1/p' "$_PROOF_CRON" | head -1)"
+  user="$(sed -n 's/^0 [0-9]* \* \* \* \([^ ]*\) .*/\1/p' "$_PROOF_CRON" | head -1)"
+  echo "proof: WARNING — ${_PROOF_CRON} still uses the legacy \`>> ${_PROOF_LOG}\` redirect. The shell opens that file BEFORE 5dive runs, so an unwritable log kills the publish before it starts (DIVE-2044)." >&2
+  if [ -n "$hour" ] && [ -n "$user" ] && [ -w "$_PROOF_CRON" ] && _proof_install_cron "$hour" "$user"; then
+    echo "proof: rewrote ${_PROOF_CRON} without the redirect — the tick now logs to ${_PROOF_LOG} itself and falls back to journald." >&2
+  else
+    echo "proof: fix with:  sudo 5dive proof on --at=${hour:-2} --user=${user:-root}" >&2
+  fi
 }
 
 # _proof_onoff <on|off|status> [--repo=] [--branch=] [--at=] — pref + cron mgmt.
@@ -841,6 +883,9 @@ _proof_onoff() {
       # that actually publishes, and reporting the reader's identity would be a
       # confident answer to a question nobody asked.
       _proof_identity "$(jq -r '.user // "root"' <<<"$cur")"
+      # DIVE-2044: warn (and repair, with the rights) on a pre-fix cron line.
+      # Runs on the --json path too — it prints to stderr, so stdout stays clean.
+      _proof_cron_legacy_check
       if [ "${JSON_MODE:-0}" = 1 ]; then
         jq -c --argjson autonomy "$led" --arg wr "$(_proof_state_writable)" \
           --arg idn "$_PROOF_ID_NAME" --arg ide "$_PROOF_ID_EMAIL" --arg ids "$_PROOF_ID_SOURCE" \
@@ -926,17 +971,117 @@ _proof_onoff() {
 # The old "always return 0 so a miss never spams cron mail" trade is exactly
 # backwards: cron mail is a channel, silence is not. Exit 3 (already published
 # today) is a genuine success for a scheduled run and is mapped to 0.
+#
+# DIVE-2044 gave the tick two more jobs, both about being READABLE afterwards:
+#
+#   --log=<path>  own the logging instead of letting the cron shell redirect
+#                 into it. The redirect ran BEFORE the publisher and killed it
+#                 outright when the file was unwritable; this write happens
+#                 AFTER, so a broken log costs a log line, never a publish.
+#   a success record. `proof tick` used to print literally nothing on a good
+#                 night: the log accumulated skips and failures only, so an
+#                 operator reading it could not tell "published fine" from
+#                 "never ran". Every outcome now leaves one stamped line.
 _proof_tick() {
-  local f rc=0; f="$(_proof_pref_file)"
-  [ -r "$f" ] || return 0
-  [ "$(jq -r '.enabled // false' "$f" 2>/dev/null)" = "true" ] || return 0
-  _proof_publish >/dev/null || rc=$?
+  local logf="" a
+  for a in "$@"; do
+    case "$a" in
+      --log=*) logf="${a#--log=}" ;;
+      *) fail "$E_USAGE" "proof tick: unknown arg: $a" ;;
+    esac
+  done
+  local out rc=0
+  # Captured, not discarded: the publisher's own summary is the only place the
+  # published stamp appears, and it is exactly what the record needs to carry.
+  out="$(_proof_tick_run 2>&1)" || rc=$?
+  local pubrc="$rc"
+  # 5 (not configured / disabled) is not a failure — a box that never turned the
+  # publisher on is not broken — but it is emphatically not a publish either, and
+  # the record below says so.
+  [ "$rc" -eq "$_PROOF_RC_TICK_SKIP" ] && rc=0
   # 3 (already published today) is a genuine success for a scheduled run. 4 (no
   # publishing identity, DIVE-2051) is NOT, and is deliberately left non-zero:
   # it is the one failure that repeats every night until a human acts, so it is
-  # exactly the one a scheduled run must not report as fine.
+  # exactly the one a scheduled run must not report as fine. This is the ONE
+  # place the mapping happens; the record below still names the real outcome.
   [ "$rc" -eq 3 ] && rc=0
+  _proof_emit_log "$logf" "$(_proof_tick_record "$pubrc" "$out")"
+  # A FAILING tick names its reason on stderr as well, whichever rail took the
+  # record above. cron surfaces stderr; the record may have gone to a file or to
+  # journald, where a nightly cron failure is not where the operator is looking.
+  # Sending a failure ONLY to the log rail would rebuild this ticket's own defect
+  # one layer over: the DIVE-2051 identity refusal is precisely the failure that
+  # repeats every night until a human acts, so it is the one that must never be
+  # quiet on the channel a scheduled run reports through.
+  if [ "$rc" -ne 0 ]; then
+    printf '%s\n' "$out" >&2
+  fi
   return "$rc"
+}
+
+# _proof_tick_run — the tick's actual work, with its exit code UNMAPPED (3 still
+# means the healthy already-published no-op) so the caller can name the outcome.
+# The two "not configured" exits print rather than returning in silence: a log
+# whose only content is a skip is what made a dead publisher look alive.
+_proof_tick_run() {
+  local f rc=0; f="$(_proof_pref_file)"
+  [ -r "$f" ] || { echo "not configured on this box (${f} unreadable) — nothing to do"; return "$_PROOF_RC_TICK_SKIP"; }
+  [ "$(jq -r '.enabled // false' "$f" 2>/dev/null)" = "true" ] \
+    || { echo "disabled in ${f} (.enabled != true) — nothing to do"; return "$_PROOF_RC_TICK_SKIP"; }
+  _proof_publish || rc=$?
+  return "$rc"
+}
+
+# _proof_tick_record <publish-rc> <output> — one stamped line naming the outcome,
+# plus the publisher's own output indented beneath it. DIVE-2044 defect 2: the
+# 26h outage was invisible partly because a SUCCESSFUL tick wrote nothing at all,
+# so "published fine" and "never ran" produced identical logs.
+_proof_tick_record() {
+  local rc="$1" out="$2" now stamp verdict
+  now="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+  stamp="$(_proof_pref_get '.lastPublished' 2>/dev/null || true)"
+  case "$rc" in
+    0) verdict="PUBLISHED (lastPublished=${stamp:-unrecorded})" ;;
+    3) verdict="no-op — already published for ${stamp:-today}" ;;
+    "$_PROOF_RC_TICK_SKIP")
+       verdict="SKIPPED — the publisher is not enabled on this box; nothing was published" ;;
+    "$_PROOF_RC_NO_IDENTITY")
+       verdict="FAILED rc=${rc} — no publishing identity; nothing published, and nothing will until one is pinned (DIVE-2051)" ;;
+    *) verdict="FAILED rc=${rc} — nothing published" ;;
+  esac
+  printf '%s proof tick: %s\n' "$now" "$verdict"
+  [ -n "$out" ] && printf '%s\n' "$out" | sed "s/^/${now}   | /"
+  return 0
+}
+
+# _proof_emit_log <path|""> <record> — put the run record where an operator will
+# find it, and NEVER let that write change what already happened. The publish is
+# done by the time this runs. Three rails, most durable first:
+#   file → journald (`journalctl -t 5dive-proof`) → stderr (cron mail).
+# A degraded rail SAYS SO on the rail it fell back to, so "the log stopped" can
+# never again be read as "the publisher stopped" (or vice versa).
+_proof_emit_log() {
+  local logf="$1" rec="$2" why
+  [ -n "$rec" ] || return 0
+  # `2>/dev/null` FIRST, deliberately: redirections are applied left to right, so
+  # with the append first bash writes its own "No such file or directory"
+  # diagnostic — naming a bundle line number — to the real stderr before the
+  # silencer takes effect. Every failed nightly tick would have cron-mailed it.
+  if [ -n "$logf" ] && printf '%s\n' "$rec" 2>/dev/null >> "$logf"; then
+    return 0
+  fi
+  if [ -n "$logf" ]; then
+    # Says "the run happened", not "the publish happened" — the run below may be a
+    # SKIP, and a fallback banner that asserts a publish would be its own small lie.
+    why="proof tick: could NOT append to ${logf} as $(id -un) — logging degraded to this rail; the run itself completed and is recorded below (DIVE-2044)."
+  else
+    why="proof tick: no --log= given; run record follows."
+  fi
+  if command -v logger >/dev/null 2>&1 \
+     && printf '%s\n%s\n' "$why" "$rec" | logger -t 5dive-proof 2>/dev/null; then
+    return 0
+  fi
+  printf '%s\n%s\n' "$why" "$rec" >&2
 }
 
 # _proof_scorecard — DIVE-1914. Multi-dimensional autonomy metrics, LOCAL and
@@ -1328,7 +1473,13 @@ usage: 5dive proof status [--json]                    # LOCAL autonomy badge + c
                       [--as-name=<n> --as-email=<e>]   # identity commits are authored with
        5dive proof off
        5dive proof publish [--dry-run] [--repo=<url>] [--branch=<b>]
-       5dive proof tick        # cron driver; gated on the pref
+       5dive proof tick [--log=<path>]   # cron driver; gated on the pref
+
+`proof tick --log=` makes the tick own its logging: it writes ONE stamped line
+per run naming the outcome (PUBLISHED / no-op / FAILED, success included) and
+falls back to journald when the path is unwritable. The installed cron carries
+no `>>` redirect on purpose — the shell opens a redirect BEFORE the publisher
+runs, and an unwritable log silently killed 26h of publishes (DIVE-2044).
 
 `proof status` shows this company's autonomy badge — 1 − asks/shipped over the
 lifetime ledger (OSS-38), materialized from task data: a shipped action is a
