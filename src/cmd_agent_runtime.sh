@@ -784,6 +784,18 @@ if mid:
         if not core.startswith(m):
             return False
         return not re.search(r"\w", core[len(m):])
+    # LOCAL PATCH: same-line fence — "<5dive-r:id> answer </5dive-r:id>" on one
+    # line. Both unique markers present and closed, so it is a completed fence,
+    # not a scrape. The echoed instruction has the markers ADJACENT (empty
+    # inner text) and is skipped; an unfinished reply has no closing marker and
+    # cannot match. Scan newest-first so a retry beats an earlier answer.
+    for _l in reversed(lines):
+        if op in _l and cl in _l:
+            _inner = _l.split(op, 1)[1].split(cl, 1)[0].strip()
+            if _inner:
+                sys.stdout.write(_inner)
+                sys.exit(0)
+
     opens = [i for i, l in enumerate(lines) if is_marker(l, op)]
     started = False
     for i in reversed(opens):
