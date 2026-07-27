@@ -189,5 +189,74 @@ else
   ok "N BEHAVIOURAL: no tag verb in the extracted push path either — the no-tag guarantee followed the code out of the YAML"
 fi
 
+# ---------------------------------------------------------------------------
+# F THE GLUE. Extracting the loop into a script created a NEW unreachable seam: the
+# YAML lines that read its exit code. They are graded here by RUNNING THE SHIPPED
+# BLOCK — fenced out of .github/workflows/version-assign.yml, never retyped, so a
+# future edit to the step cannot drift past this arm the way a copy would.
+#
+# The trap being held shut: GitHub runs a `run:` with no `shell:` key as `bash -e {0}`,
+# and `set -uo pipefail` does NOT turn -e back off. Under `cmd; rc=$?`, errexit fires
+# on the loop's own non-zero exit and the rc line never runs — so exit 3 ("nothing
+# owed", the COMMON path on any doc-only merge) would escape as a red step. The arm
+# asserts the contract by EXIT CODE for all three returns, not by reading the source.
+if grep -q '^ *shell:' "$REPO/.github/workflows/version-assign.yml"; then
+  no "F precondition: the step now sets shell: — this arm's bash -e premise needs rechecking"
+else
+  ok "F precondition: the step declares no shell:, so GitHub runs it as 'bash -e {0}'"
+fi
+
+# Fence the block: the run: body of the assign step, dedented, expressions filled in.
+awk '/^ *run: \|$/{grab=1; next} grab{ if ($0 ~ /^ *$/) {print ""; next} if ($0 !~ /^          /) exit; sub(/^          /,""); print }' \
+  "$REPO/.github/workflows/version-assign.yml" > "$TMP/step.sh"
+sed -i 's/\${{ github.event.before }}/deadbeefdeadbeefdeadbeefdeadbeefdeadbeef/' "$TMP/step.sh"
+grep -q 'version-assign-push-loop.sh' "$TMP/step.sh" \
+  && ok "F the fence caught the real step body (it calls the push loop)" \
+  || no "F FENCE" "extraction produced nothing usable — the arm below would grade a stub, not the step"
+
+# A sandbox where the step can run: stubbed git (only cat-file is reached), a stubbed
+# push loop that returns the code under test, a stubbed gh, and a header to read.
+mkstep(){ # $1=dir  $2=loop exit code  $3=optional step.sh override
+  local d="$TMP/step-$1"; mkdir -p "$d/scripts" "$d/src" "$d/bin"
+  printf '#!/usr/bin/env bash\nexit %s\n' "$2" > "$d/scripts/version-assign-push-loop.sh"
+  printf 'readonly FIVE_VERSION="0.16.99"\n' > "$d/src/header.sh"
+  printf '#!/usr/bin/env bash\nexit 0\n' > "$d/bin/git";  printf '#!/usr/bin/env bash\necho "dispatched"\n' > "$d/bin/gh"
+  chmod +x "$d/bin/git" "$d/bin/gh" "$d/scripts/version-assign-push-loop.sh"
+  cp "${3:-$TMP/step.sh}" "$d/step.sh"; echo "$d"
+}
+runstep(){ ( cd "$1" && PATH="$1/bin:$PATH" bash -e ./step.sh >"$1/out" 2>&1 ); echo $?; }
+
+d=$(mkstep owed3 3); rc=$(runstep "$d")
+[[ "$rc" == 0 ]] \
+  && ok "F 'nothing owed' (loop exit 3) leaves the step GREEN — the quiet common path stays quiet" \
+  || no "F exit-3 leaks" "step exited $rc under bash -e; a doc-only merge would paint main red. $(cat "$d/out")"
+d=$(mkstep fail1 1); rc=$(runstep "$d")
+[[ "$rc" == 1 ]] \
+  && ok "F a loud loop failure (exit 1) still FAILS the step — the fix did not soften it into a pass" \
+  || no "F exit-1" "step exited $rc, expected 1"
+d=$(mkstep ok0 0); rc=$(runstep "$d")
+if [[ "$rc" == 0 ]] && grep -q 'dispatched' "$d/out"; then
+  ok "F a successful assignment (exit 0) proceeds to the bundle-drift dispatch"
+else
+  no "F exit-0" "step exited $rc / dispatch not reached: $(cat "$d/out")"
+fi
+
+# F-MUT: put the ORIGINAL `; rc=$?` back and demand the exit-3 arm go red. Without
+# this, all three arms above would keep passing under a shell that never had -e on,
+# and would be grading nothing. (Positive control: exit 1 must stay red either way,
+# so a red here is the errexit interaction and not a broken sandbox.)
+sed 's@^rc=0; \(bash scripts/version-assign-push-loop.sh .*\) || rc=$?$@\1; rc=$?@' "$TMP/step.sh" > "$TMP/step-mut.sh"
+if ! grep -q '3; rc=\$?' "$TMP/step-mut.sh"; then
+  no "F-MUT could not re-introduce the '; rc=\$?' form — the arms above are ungraded"
+else
+  d=$(mkstep mut3 3 "$TMP/step-mut.sh"); rcm=$(runstep "$d")
+  d=$(mkstep mut1 1 "$TMP/step-mut.sh"); rcc=$(runstep "$d")
+  if [[ "$rcm" == 3 && "$rcc" == 1 ]]; then
+    ok "F-MUT MUTATION: restoring '; rc=\$?' makes the exit-3 arm leak 3 (control: exit-1 still 1) — the arm grades the errexit seam, not the happy path"
+  else
+    no "F-MUT MUTATION" "mutant exited $rcm on 'nothing owed' (expected the 3 to leak) / $rcc on failure — arm F is not driven by the '|| rc=\$?'"
+  fi
+fi
+
 echo; echo "DIVE-2143 version-assign push classification: passed: $P  failed: $F"
 [ "$F" -eq 0 ]

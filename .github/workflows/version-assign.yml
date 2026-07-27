@@ -52,9 +52,17 @@ jobs:
           # could exercise it — and it shipped a retry loop that named the wrong cause
           # on a real failure (run 30231912328) with no way to have caught it first.
           #   0 = assigned and pushed (grade it)   3 = nothing owed   1 = failed loudly
-          bash scripts/version-assign-push-loop.sh "$before" 3; rc=$?
-          (( rc == 3 )) && exit 0
-          (( rc == 0 )) || exit 1
+          #
+          # `|| rc=$?`, NOT `; rc=$?`. GitHub runs a `run:` block with no `shell:` key
+          # as `bash -e {0}`, and the `set -uo pipefail` above does not turn -e back
+          # off — so under `; rc=$?` errexit fires on the loop's own exit and the line
+          # that reads rc never runs. The step would then exit 3 on the COMMON path
+          # (nothing owed, doc/workflow-only merge) and paint main red for the
+          # non-event this job exists to stay quiet about. Graded by arm F of
+          # tests/version_assign_push_unit.sh, which runs this block under `bash -e`.
+          rc=0; bash scripts/version-assign-push-loop.sh "$before" 3 || rc=$?
+          if (( rc == 3 )); then exit 0; fi
+          if (( rc != 0 )); then exit 1; fi
           assigned=$(grep -m1 -oE 'FIVE_VERSION="[^"]+"' src/header.sh | sed 's/.*"\(.*\)"/\1/')
 
           # GRADED. A GITHUB_TOKEN push does not trigger workflows, so the assignment
