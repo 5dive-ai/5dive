@@ -53,12 +53,42 @@ _uniq_current_main() {
   echo $(( i + 1 )) >"$TIP_IDX"
   printf '%s' "$v"
 }
+# DIVE-2125 (verifier finding): a regression in the wait bound does NOT go red, it
+# HANGS — measured exit 124 under timeout — and unit-tests.yml runs `for t in tests/*.sh`
+# with no per-test timeout, so that regression class costs a HUNG CI JOB instead of a
+# failing one. A hung job is the worst outcome for a check whose whole purpose is to be
+# readable, which is this ticket's own thesis pointed at its own harness.
+# So every gate call runs under a real `timeout`. That needs a child process: `timeout`
+# cannot wrap a shell function, so the child re-sources the gate and the stubs. If the
+# bound ever regresses, the arm gets rc=124 and goes RED on its own rc assertion.
+STUBS_FILE="$STUBD/stubs.sh"
+cat >"$STUBS_FILE" <<'STUBEOF'
+_uniq_scan()         { [[ " $SCAN_CLEAN_FOR " == *" $1 "* ]]; }
+_uniq_assign_shape() {
+  if [[ " $SHAPE_OWED_FOR " == *" $1 "* ]]; then printf '%s' "$OWED"; else printf '%s' "$NOTOWED"; fi
+  return "$SHAPE_RC"; }
+_uniq_current_main() {
+  echo x >>"$POLL_LOG"
+  local i; i=$(cat "$TIP_IDX" 2>/dev/null || echo 0)
+  local -a arr=($TIPS_STR)
+  local v="${arr[$i]:-${arr[${#arr[@]}-1]:-}}"
+  echo $(( i + 1 )) >"$TIP_IDX"
+  printf '%s' "$v"
+}
+STUBEOF
+run_gate() {
+  export SCAN_CLEAN_FOR SHAPE_OWED_FOR SHAPE_RC TIPS_STR OWED NOTOWED POLL_LOG TIP_IDX \
+         FIVE_UNIQ_POLL_SECS FIVE_UNIQ_ASSIGN_WAIT
+  timeout "${ARM_TIMEOUT:-20}" bash -c \
+    'source scripts/version-uniqueness-gate.sh; source "$1"; uniq_gate "$2" "$3"' \
+    _ "$STUBS_FILE" "$1" "$2" 2>&1
+}
 OWED='version-assign: ASSIGNMENT OWED — bundle changed (aaa -> bbb) with FIVE_VERSION still 0.16.22.'
 NOTOWED='version-assign: no assignment needed — the bundle is unchanged since BASE.'
 
 # --- 1. no collision at all: clean through, and it must NOT wait --------------
 SCAN_CLEAN_FOR="mergesha"; TIPS_STR="mergesha"; reset_stub
-out=$(uniq_gate mergesha basesha 2>&1); rc=$?
+out=$(run_gate mergesha basesha); rc=$?
 (( rc == 0 )) && ok "1 a clean scan passes" || no "1 clean must pass" "rc=$rc $out"
 (( $(polls) == 0 )) && ok "1 ...and does not wait on the assigner at all (no cost on the ordinary push)" \
                  || no "1 must not poll when clean" "polls=$(polls)"
@@ -66,7 +96,7 @@ out=$(uniq_gate mergesha basesha 2>&1); rc=$?
 # --- 2. THE FIX: the assignable transient, repaired -> passes -----------------
 SCAN_CLEAN_FOR="assignsha"; SHAPE_OWED_FOR="mergesha"; SHAPE_RC=0
 TIPS_STR="mergesha assignsha"; reset_stub
-out=$(uniq_gate mergesha basesha 2>&1); rc=$?
+out=$(run_gate mergesha basesha); rc=$?
 (( rc == 0 )) && ok "2 an assignable collision that version-assign repairs no longer fails the merge commit" \
              || no "2 repaired transient must pass" "rc=$rc $out"
 grep -q 'DID collide' <<<"$out" \
@@ -80,7 +110,7 @@ grep -q "repair's own delta" <<<"$out" && grep -q 'not claimed' <<<"$out" \
 # This is the arm that keeps the fix from silently recreating DIVE-2118.
 SCAN_CLEAN_FOR=""; SHAPE_OWED_FOR="mergesha"; SHAPE_RC=0
 TIPS_STR="mergesha"; reset_stub
-out=$(uniq_gate mergesha basesha 2>&1); rc=$?
+out=$(run_gate mergesha basesha); rc=$?
 (( rc == 1 )) && ok "3 an assignable collision that is NEVER repaired still FAILS (the tolerance is not silence)" \
              || no "3 unrepaired must fail" "rc=$rc $out"
 grep -q 'main is unassigned right now' <<<"$out" \
@@ -92,7 +122,7 @@ grep -q 'main is unassigned right now' <<<"$out" \
 # --- 4. a GENUINE collision (not the assignable shape) still fails immediately -
 SCAN_CLEAN_FOR=""; SHAPE_OWED_FOR=""; SHAPE_RC=0
 TIPS_STR="assignsha"; reset_stub
-out=$(uniq_gate mergesha basesha 2>&1); rc=$?
+out=$(run_gate mergesha basesha); rc=$?
 (( rc == 1 )) && ok "4 a collision version-assign will NOT repair still fails — the detector keeps its job" \
              || no "4 genuine collision must fail" "rc=$rc $out"
 (( $(polls) == 0 )) && ok "4 ...immediately, without burning the wait window on a repair nobody owes" \
@@ -104,7 +134,7 @@ out=$(uniq_gate mergesha basesha 2>&1); rc=$?
 SCAN_CLEAN_FOR=""; SHAPE_OWED_FOR=""; SHAPE_RC=2
 NOTOWED_SAVE="$NOTOWED"; NOTOWED='version-assign: UNDETERMINED — could not read FIVE_VERSION.'
 TIPS_STR="assignsha"; reset_stub
-out=$(uniq_gate mergesha basesha 2>&1); rc=$?
+out=$(run_gate mergesha basesha); rc=$?
 (( rc == 1 )) && grep -q 'UNDETERMINED' <<<"$out" \
   && ok "5 an UNDETERMINED shape probe is treated as a real collision, never as a pending repair" \
   || no "5 undetermined must not be tolerated" "rc=$rc $out"
@@ -114,7 +144,7 @@ out=$(uniq_gate mergesha basesha 2>&1); rc=$?
 NOTOWED="$NOTOWED_SAVE"
 SCAN_CLEAN_FOR="somethingelse"; SHAPE_OWED_FOR="mergesha othersha"; SHAPE_RC=0
 TIPS_STR="othersha othersha othersha"; reset_stub
-out=$(uniq_gate mergesha basesha 2>&1); rc=$?
+out=$(run_gate mergesha basesha); rc=$?
 (( rc == 1 )) && ok "6 main moving is NOT proof of repair — the new tip is re-scanned and still fails if it collides" \
              || no "6 tip movement must not be taken as repair" "rc=$rc $out"
 
