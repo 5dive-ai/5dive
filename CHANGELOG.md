@@ -1,5 +1,23 @@
 # Changelog
 
+## Unreleased — fix(agent): `agent list` carries the measured sudo grant too, so the SURVEY surface stops reading as authoritative (DIVE-2088)
+
+DIVE-2079 (below) fixed `agent info`, the per-agent drill-down. `agent list` was outside
+that ticket's scope and kept emitting `isolation` — the same unmeasured stored label — with
+nothing beside it. That left the honest command as the one you run once you already suspect
+a problem, and the dishonest one as the command that would have told you to suspect it: a
+fleet survey rendered `root-all`, `cli-root` and `cli-scoped` agents identically.
+
+`agent list` now measures each agent with the same `agent_sudo_grant` DIVE-2079 introduced
+(deliberately the same instrument, not a cheaper proxy under a friendlier name) and reports
+it in `--json` under the same `sudo` object shape `info` uses, so one schema serves both
+readers. The table gains a `SUDO` column carrying the measured class plus a marker — `!`
+when the enforced grant contradicts the stored label, `+` when unrecognised sudoers entries
+sit alongside a recognised grant — with the explanation left to `agent info`. A grant that
+could not be measured from where the command ran prints `unknown` and says so in a legend;
+it never falls back to the label. Only a root caller can measure a peer, so a non-root
+caller now honestly sees `unknown` for everyone but itself. No existing field changed.
+
 ## 0.16.20 — four merges that landed at 0.16.19 and could never have reached a box (2026-07-26)
 
 Version assignment, not a feature. `0.16.19` was already published when #218, #219, #220 and
