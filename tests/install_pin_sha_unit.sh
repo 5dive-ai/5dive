@@ -75,7 +75,7 @@ git_stub='case "$*" in
 esac'
 # curl: tags.atom lists both tags; commits/<tag>.atom yields that tag's commit.
 atom_stub='case "$*" in
-  *tags.atom*) printf "<entry><title>'"$TAG_OLD"'</title></entry>\n<entry><title>'"$TAG_NEW"'</title></entry>\n" ;;
+  *tags.atom*) printf "<id>tag:github.com,2008:Repository/1239570688/'"$TAG_OLD"'</id>\n<title>'"$TAG_OLD"' — a release headline</title>\n<id>tag:github.com,2008:Repository/1239570688/'"$TAG_NEW"'</id>\n<title>'"$TAG_NEW"' — a release headline</title>\n" ;;
   *commits/'"$TAG_NEW"'.atom*) printf "<id>tag:github.com,2008:Grit::Commit/'"$SHA_NEW"'</id>\n" ;;
   *commits/'"$TAG_OLD"'.atom*) printf "<id>tag:github.com,2008:Grit::Commit/'"$SHA_OLD"'</id>\n" ;;
   *) exit 22 ;;

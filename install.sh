@@ -75,10 +75,12 @@ resolve_gh_tag() {
       | sed -n 's#.*refs/tags/##p')" || tags=""
   fi
   # First-install fallback: the tags atom feed. Unauthenticated, and not subject
-  # to the 60/hr api.github.com limit a NAT'd fleet would share.
+  # to the 60/hr api.github.com limit a NAT'd fleet would share. Parse the
+  # <id> — NOT the <title>, which carries a human release headline after the tag
+  # ("v0.15.34 — task set-body") and matches nothing on the real feed.
   if [[ -z "$tags" ]]; then
     tags="$(curl -fsSL --max-time 10 "https://github.com/$GH_ORG/5dive/tags.atom" 2>/dev/null \
-      | sed -n 's#.*<title>[[:space:]]*\(v[0-9][^<]*\)</title>.*#\1#p')" || tags=""
+      | sed -n 's#.*<id>tag:github.com,[0-9]*:Repository/[0-9]*/\([^<]*\)</id>.*#\1#p')" || tags=""
   fi
   # Last resort before giving up on resolving a tag altogether.
   if [[ -z "$tags" ]]; then
