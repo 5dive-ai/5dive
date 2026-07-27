@@ -161,6 +161,24 @@ done
 ok_ "the transcript store is 0700/0600 and keyed so concurrent asks cannot collide"
 
 # ===========================================================================
+echo "case 5b — abandoned transcripts are pruned, live ones are not"
+# ===========================================================================
+# The store gains a file per ask and nothing else ever removes them, so the prune
+# is what keeps this from growing without bound. Asserting it matters because a
+# prune that quietly matches NOTHING looks identical to a prune that works — and
+# one that matches too much would delete a transcript mid-ask, taking the marker
+# with it and reintroducing the exact bug this ticket fixes.
+stale="${FIVE_CAPTURE_ACC_DIR}/4242.morpheus.staleaaaa"
+: > "$stale"; touch -d '3 hours ago' "$stale"
+fresh_before=$(ls "$FIVE_CAPTURE_ACC_DIR" | wc -l)
+FRAME="$F1"; cmd_capture morpheus --after-id="$MID" >/dev/null
+[[ ! -e "$stale" ]] || die "case5b: an abandoned transcript (3h old) was not pruned"
+[[ -f "${FIVE_CAPTURE_ACC_DIR}/${SUDO_UID:-0}.morpheus.${MID}" ]] \
+  || die "case5b: the prune ate the LIVE transcript for the ask in flight"
+(( fresh_before > 1 )) || die "case5b: fixture did not actually seed a stale file alongside a live one"
+ok_ "a stale transcript is pruned while the in-flight one survives"
+
+# ===========================================================================
 echo "case 6 — the full SCOPED ask chain returns the seat's answer, not chrome"
 # ===========================================================================
 # What `cmd_ask` actually does on the scoped path: _capture -> _ask_accumulate ->
