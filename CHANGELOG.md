@@ -1,5 +1,51 @@
 # Changelog
 
+## Unreleased — feat(task): the tier-2 floor says WHY it fired, and a design decision can appeal it on the record instead of by rewording (DIVE-2089)
+
+The T2 category floor reads SUBJECT MATTER as risk and picks the gate's audience from it. dev3
+filed a tier-1 sizing gate — "should an agent's right to act derive from the credentials it holds,
+or from a declared clearance level?" — and it was forced hard-human because the ask contains
+"credentials" and "privileged". The gate discusses credential handling as a design question and
+performs no credential operation. Talking about credentials is not handling credentials.
+
+Two things made that worse than a mis-tier. It was **silent** — dev3 only found out by re-reading
+their own filed gate, so an agent that files and moves on leaves a design question in the founder's
+inbox indefinitely. And the workaround was to **re-file with neutral wording**, which works, teaches
+the fleet to launder vocabulary to reach the right audience, and leaves no trace of having been
+done.
+
+- **The floor now names the term that fired.** `[tier forced to 2 — T2 category floor: matched
+  'credential']` on the result, plus a stderr warning at file time. For a `decision` gate it also
+  states the sanctioned appeal, and says not to reword the ask — the laundering path is now the one
+  the tool argues against, instead of the only one it leaves open.
+- **`--discusses="<why>"`** appeals a floor that fired on subject matter. It is a declaration, not
+  another guesser: there is no phrasing that reliably separates "discussing X" from "doing X", so
+  the filer states it, on the record. Unlike a reworded ask it is attributable, written into the
+  gate the reviewer reads, and audited whether it applies or is refused.
+- Four guards, and the declaration is not trusted on its own: `--type=decision` only (approval /
+  manual / secret / access declare an action by construction); only when the floor actually
+  over-fired; never for money, outbound customer comms, or irreversible infra/access, however it is
+  framed; and it downgrades only to a **lead-routed tier 1**, never to tier 0 and never to the
+  filer. An explicit `--tier=2` still vetoes it, and every refusal is loud.
+
+Deliberately not a sixth keyword class. DIVE-2099's design note is explicit that inferring this from
+more vocabulary reproduces the bug with the polarity reversed, where a false negative routes a real
+secret gate away from the human.
+
+**No existing gate changes tier.** Nothing moves unless a filer passes the new flag, which discharges
+the DIVE-2146 precondition by construction rather than by enumeration. Measured while checking it:
+the DIVE-2146 self-restart gate never tripped the floor at all — it reached the human because it was
+re-filed with an explicit `--tier=2`. Kept as a live assertion, so if the floor is ever widened to
+catch it, that test goes red first.
+
+The matched term also rides the `--json` payload as `floor_term` (null when nothing floored). An
+agent filing with `--json` previously got `tier_floored: true` and no way to learn which word did
+it, which leaves the machine reader in exactly the state this change exists to fix.
+
+`tests/gate_floor_declared_discussion_unit.sh` — 45 assertions, every arm exercised on the ask axis
+and on the TITLE axis (DIVE-1957: a suite that varies only the ask tests the axis a filer can
+already reword, and passes vacuously).
+
 ## 0.16.33 — fix(push): the author check refuses when it cannot bound the range, instead of grading the whole history (DIVE-2161)
 
 Reported by dev2, who pushed a one-commit branch that was correctly authored and got back

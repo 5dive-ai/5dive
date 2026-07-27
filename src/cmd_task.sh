@@ -89,6 +89,7 @@ _task_usage() {
                                                      # --type=access: manager-clearable "grant me X" gate — routes to the org lead first (any tier), lead-clearable; add --probe='test -w /path' to self-check the block
   5dive task need <id|DIVE-N> --withdraw            # DIVE-1401: cancel a still-pending gate the team filed but that's now moot — filer or org lead, no human tap. NOT a grant (never records a secret/approval); genuine clears stay human-only.
     --ask: ONE crisp question + ~1 line essential context, recommendation up front. Heavy detail goes in the task BODY, not the ask.
+    --discusses="<why>" (DIVE-2089, --type=decision ONLY): appeal a T2 floor that fired on SUBJECT MATTER. A design question that merely NAMES secrets/publishing/deletion performs none of them; declare that and the gate goes to your lead at tier 1 instead of the human. The declaration is recorded on the gate, shown to the reviewer, and audited — unlike rewording the ask, which reaches the same audience with no record of how. Refused, loudly, for money / customer comms / irreversible infra, for a pinned --tier=2, and when no lead sits above you.
     --recommend: your advised choice (strongly encouraged for decision/approval). Leads the alert as '✅ Recommended: <X>' and ⭐-marks its button. For a decision it must match one of --options.
     --tier (DIVE-891 risk tiers): 0 = auto-clear (rec applies NOW, no ping, digest line; requires --recommend)
              1 = agent-clearable; unanswered 48h -> the heartbeat applies the rec   2 = hard human gate (default for approval/secret/manual)
@@ -3403,6 +3404,111 @@ _gate_internal_residual() {
   printf '%s' "$text"
 }
 
+# DIVE-2089: the DECLARED-DISCUSSION appeal — the fifth (and last text-driven)
+# treatment of the T2 floor, and the only one that does NOT try to infer intent
+# from vocabulary.
+#
+# THE DEFECT IT ANSWERS. The floor reads SUBJECT MATTER and picks the audience
+# from it. dev3 filed a tier-1 SIZING gate on DIVE-2078 — "how should we model
+# capability vs clearance" — and it was floored hard-human because the ask
+# contains the words "credentials" and "privileged". The gate DISCUSSES
+# credential handling as a design question and performs NO credential operation.
+# Talking about credentials is not handling credentials.
+#
+# WHY NOT ANOTHER CLASS REGEX. eng-ship / curation / internal-ops all guess the
+# KIND from more vocabulary, and DIVE-2099's design note 1 is explicit that
+# adding a sixth guesser reproduces this bug with the polarity reversed — a
+# false NEGATIVE there routes a real secret gate to an agent. There is no
+# phrasing that reliably separates "discussing X" from "doing X": that is a fact
+# about the filer's intent, not about the text. So we stop inferring and make
+# the filer DECLARE it, on the record, with `--discusses="<why>"`.
+#
+# WHY A DECLARATION BEATS THE WORKAROUND IT REPLACES. dev3's actual remedy was
+# to re-file with neutral wording, which is the worst outcome available: it
+# works, it teaches the fleet to launder vocabulary to reach the right audience,
+# and it is INVISIBLE — a laundered ask is byte-indistinguishable from an ask
+# that never had the words. A declaration is the opposite on every axis: it is
+# attributable to its filer, it is written into the gate the LEAD then reads, and
+# it is audited. An agent that lies in a `--discusses` string is caught by the
+# reviewer looking at the claim; an agent that launders is caught by nobody.
+#
+# THE SAFETY MODEL, and it is deliberately four-deep — the declaration is NOT
+# trusted on its own:
+#   1. `--type=decision` ONLY. approval / manual / secret / access DECLARE AN
+#      ACTION by construction ("approve me doing X", "hand me the key"), so no
+#      appeal exists for them. decision is the one type whose content is a
+#      question. This is the ticket's own suggested shape: key off the declared
+#      action, not the substrings.
+#   2. Fires ONLY when the floor ACTUALLY over-fired (tier_floored==1), like
+#      DIVE-1480 — a non-floored decision's routing is untouched.
+#   3. NON-APPEALABLE CORE. Money, irreversible infra and real-comms terms can
+#      never be appealed, no matter what is declared: we re-test the floor with
+#      only the APPEALABLE terms stripped and refuse the appeal if anything
+#      still trips it. A "should we refund these customers, A or B" decision is
+#      a human call whether or not it is framed as design.
+#   4. It downgrades to a LEAD-ROUTED tier-1, never to tier-0 and never to the
+#      filer. A human is replaced by a reviewer, not by nobody; filer-is-lead ⇒
+#      no reviewer ⇒ no appeal (a lead cannot self-appeal to themselves).
+# Plus: an explicit --tier=2 vetoes it (DIVE-1957), and the appeal is refused
+# LOUDLY rather than silently ignored, so a filer never believes an appeal
+# applied when it did not.
+#
+# WHAT THIS DOES NOT REMOVE — the DIVE-2146 pre-condition, discharged by
+# construction rather than by enumeration. olivia's precondition on this ticket
+# is that the floor is currently the SOLE ENFORCER of at least one directive
+# (the self-restart confirm at projects/CLAUDE.md:13) and that a control which
+# stops firing emits NO signal. This design cannot regress any such gate,
+# because NOTHING here changes a gate's tier unless the filer PASSES A NEW FLAG.
+# An agent that files the self-restart approval exactly as before gets the exact
+# tier it got before — and `--discusses` is unavailable to it anyway, since that
+# gate is --type=approval (rule 1). The directive still needs encoding as its own
+# artifact; DIVE-2146 owns that arm and gates it on its own precondition.
+#
+# APPEALABLE: the vocabulary that routinely appears in DESIGN discussion of a
+# category without any action being requested — secrets/credentials handling
+# (2089's reported case), the content-publish-later terms DIVE-1381 already
+# treats as over-firing, and the recoverable-destructive verbs DIVE-1480 does.
+_GATE_FLOOR_APPEALABLE_RX='secret|credential|api key|token|password|publish|public post|announce|launch post|delete|destroy|wipe|purge'
+# NON-APPEALABLE (everything else in the floor, stated positively so a future
+# edit to the floor regex cannot silently widen what an appeal reaches): money,
+# real outbound comms, and irreversible infra/access. Never carved out.
+_GATE_FLOOR_NONAPPEALABLE_RX='spend|billing|invoice|charge|payment|refund|subscription|price|pricing|\$[0-9]|€[0-9]|press|customer email|email customers|newsletter|blast|teardown|drop[^.]{0,20}table|truncate|irreversible|revoke|dns|domain transfer'
+# _gate_floor_appeal_residual <text>: lower-case <text> and remove ONLY the
+# appealable terms. The caller re-tests the full floor against the result; if it
+# still fires, a non-appealable class is present and the appeal is refused.
+_gate_floor_appeal_residual() {
+  printf '%s' "$1" | tr '[:upper:]' '[:lower:]' \
+    | sed -E "s/(${_GATE_FLOOR_APPEALABLE_RX})//g"
+}
+# _gate_tier2_floor_term <text>: the SUBSTRING that tripped the floor, or empty.
+# DIVE-2089 defect 2 — the floor was SILENT. dev3 only discovered the escalation
+# by re-reading their own filed gate; an agent that files and moves on leaves a
+# design question in the founder's inbox indefinitely. "[tier forced to 2 — T2
+# category floor]" does not say WHICH word did it, and a filer cannot appeal or
+# even understand an escalation whose cause is unnamed. Reuses the same resolved
+# policy regex as the floor itself (constitution-aware, drift-fail-closed) so the
+# term reported is always the term that actually matched.
+_gate_tier2_floor_term() {
+  local text rx="$_GATE_T2_FLOOR_RX" loaded=""
+  text=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
+  if declare -F _council_hard_gate_rx >/dev/null 2>&1 \
+     && declare -F _council_constitution_path >/dev/null 2>&1; then
+    local cp; cp="$(_council_constitution_path 2>/dev/null || true)"
+    if [[ -n "$cp" && -f "$cp" ]] \
+       && ! { declare -F _council_constitution_drifted >/dev/null 2>&1 && _council_constitution_drifted; }; then
+      loaded="$(_council_hard_gate_rx 2>/dev/null || true)"
+      # Same ERE-validity guard as the floor (CNCL-28): Bash returns 2 for an
+      # invalid expression, and this helper must never report a term the floor
+      # itself did not use.
+      if [[ -n "$loaded" ]]; then
+        local ere_rc=0; [[ x =~ $loaded ]] || ere_rc=$?
+        (( ere_rc == 2 )) || rx="$loaded"
+      fi
+    fi
+  fi
+  [[ "$text" =~ $rx ]] && printf '%s' "${BASH_REMATCH[0]}"
+}
+
 # OSS-11 (DIVE-976) — _gate_ask_shape <ask>: normalize an ask into its "shape
 # key" so two gates that ask structurally the same question but about different
 # targets collapse to one key. Precedent matching uses EXACT shape-key equality
@@ -3448,7 +3554,7 @@ _gate_shape_jaccard() {
 
 cmd_task_need() {
   tasks_db_init
-  local type="" ask="" options="" recommend="" from="" tier="" secret_key="" connector="" probe="" withdraw=""
+  local type="" ask="" options="" recommend="" from="" tier="" secret_key="" connector="" probe="" withdraw="" discusses=""
   local -a positional=()
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -3470,13 +3576,18 @@ cmd_task_need() {
       # DIVE-1243: opt-in self-check for --type=access. The command MUST FAIL
       # (non-zero) for the gate to file; if it SUCCEEDS the block isn't real.
       --probe=*)     probe="${1#*=}" ;;
+      # DIVE-2089: declare that this DECISION gate DISCUSSES a floored category
+      # rather than performing it, with the reason. See the class comment above
+      # _GATE_FLOOR_APPEALABLE_RX — decision-type only, floor-over-fire only,
+      # non-appealable core excepted, lead-routed, audited.
+      --discusses=*) discusses="${1#*=}" ;;
       --)          shift; positional+=("$@"); break ;;
       -*)          fail "$E_USAGE" "unknown flag: $1" ;;
       *)           positional+=("$1") ;;
     esac
     shift
   done
-  [[ ${#positional[@]} -gt 0 ]] || fail "$E_USAGE" "usage: 5dive task need <id|DIVE-N> --type=decision|secret|approval|manual --ask=\"...\" [--options=A|B] [--recommend=\"A\"]  (or --withdraw to cancel a moot pending gate)"
+  [[ ${#positional[@]} -gt 0 ]] || fail "$E_USAGE" "usage: 5dive task need <id|DIVE-N> --type=decision|secret|approval|manual --ask=\"...\" [--options=A|B] [--recommend=\"A\"] [--discusses=\"why this decision only DISCUSSES a floored category\"]  (or --withdraw to cancel a moot pending gate)"
   resolve_task_id "${positional[0]}"; local id="$RESOLVED_TASK_ID" ident="$RESOLVED_TASK_IDENT"
 
   # DIVE-1401: --withdraw path. Secret/approval/manual gates are human-only to
@@ -3488,7 +3599,7 @@ cmd_task_need() {
   # coordinator, or a human caller (non-agent unix id). Genuine GRANT-clears stay
   # human-only via cmd_task_answer — this branch never touches that path.
   if [[ -n "$withdraw" ]]; then
-    [[ -z "$type$ask$options$recommend$tier$secret_key$connector$probe" ]] \
+    [[ -z "$type$ask$options$recommend$tier$secret_key$connector$probe$discusses" ]] \
       || fail "$E_USAGE" "--withdraw takes no other gate flags (it cancels the existing gate, not re-files one)"
     local w_type w_ans w_status
     w_type=$(db "SELECT COALESCE(need_type,'')        FROM tasks WHERE id=${id};")
@@ -3555,6 +3666,19 @@ cmd_task_need() {
 
   valid_need_type "$type" || fail "$E_VALIDATION" "bad --type '$type' (decision|secret|approval|manual|access)"
   [[ -n "$ask" ]] || fail "$E_USAGE" "--ask is required (what does the human need to provide?)"
+
+  # DIVE-2089: --discusses is a DECISION-only appeal. approval / manual / secret /
+  # access declare an ACTION by construction, so "I'm only discussing it" is not a
+  # coherent claim on them — refuse rather than accept-and-ignore, so a filer can
+  # never believe an appeal applied when it did not. Rule 1 of the four-deep safety
+  # model above; it is also what keeps this change unable to regress the
+  # DIVE-2146 self-restart APPROVAL gate.
+  if [[ -n "$discusses" ]]; then
+    [[ "$type" == "decision" ]] \
+      || fail "$E_VALIDATION" "--discusses only applies to --type=decision — a $type gate requests an ACTION, so it cannot be 'only discussing' the category. If this really is a design question, file it as --type=decision."
+    [[ ${#discusses} -ge 12 ]] \
+      || fail "$E_VALIDATION" "--discusses must state WHY this gate discusses rather than performs (it is recorded on the gate and read by the reviewer who clears it)"
+  fi
 
   # DIVE-1243: self-check for the manager-clearable `access` class. An access gate
   # claims "I'm blocked on a grant a teammate can give" — but a FALSE block (codex
@@ -3739,6 +3863,52 @@ cmd_task_need() {
     fi
   fi
 
+  # DIVE-2089: the DECLARED-DISCUSSION appeal. Runs after the three inferring
+  # classes so an ask that already qualifies as curation / internal-ops keeps its
+  # own class (and needs no declaration). Structure is DIVE-1480's — fires only on
+  # an ACTUAL over-fire, re-tests the floor on a residual, requires a reviewer,
+  # downgrades to a LEAD-routed tier-1 — with one deliberate difference: the class
+  # membership is DECLARED by the filer, not guessed from vocabulary. See the
+  # comment block on _GATE_FLOOR_APPEALABLE_RX for why that inversion is the whole
+  # point of the ticket.
+  # Every refusal path below is LOUD. A silently-ignored appeal would reproduce
+  # defect 2 (the escalation nobody sees) one layer up.
+  local _discusses_applied=0
+  if [[ -n "$discusses" ]]; then
+    if [[ "$tier_arg" == "2" ]]; then
+      # DIVE-1957: an explicit pin is the caller's hard-human contract and vetoes
+      # every downgrade class. Nothing to appeal — the floor never even ran.
+      warn "--discusses ignored: you pinned --tier=2, which is a hard-human contract and outranks the appeal. Drop the pin to appeal the floor."
+    elif [[ "$tier_floored" != "1" ]]; then
+      warn "--discusses ignored: the T2 category floor did not fire on this gate (tier $tier), so there is nothing to appeal."
+    elif [[ "$_curation" == "1" || "$_internal_ops" == "1" ]]; then
+      : # already downgraded by its own class; the declaration is recorded below
+    else
+      local _dd_title; _dd_title=$(db "SELECT COALESCE(title,'') FROM tasks WHERE id=${id};")
+      local _dd_residual; _dd_residual=$(_gate_floor_appeal_residual "${ask} ${_dd_title}")
+      if _gate_tier2_floor_hit "$_dd_residual"; then
+        # Rule 3: a non-appealable class (money / real comms / irreversible infra)
+        # is present. Name the surviving term so the refusal is actionable rather
+        # than mysterious — the filer can see it is not the word they meant.
+        local _dd_term; _dd_term=$(_gate_tier2_floor_term "$_dd_residual")
+        warn "--discusses REFUSED: this gate names a non-appealable category (matched '${_dd_term}'). Money, outbound customer comms and irreversible infra/access stay hard-human however they are framed. Staying at tier 2."
+      else
+        local _dd_reviewer; _dd_reviewer=$(_gate_route_reviewer "$(task_actor "$from")")
+        if [[ -z "$_dd_reviewer" ]]; then
+          # Rule 4: the appeal replaces a human with a REVIEWER, never with nobody.
+          warn "--discusses REFUSED: no lead sits above you in the org chart, so there is nobody to route the appeal to (a lead cannot self-appeal). Staying at tier 2."
+        else
+          tier=1; tier_floored=0; _discusses_applied=1
+        fi
+      fi
+    fi
+    # Audited whether or not it applied — the DECLARATION is the artifact that
+    # replaces the invisible rewording, so it has to survive a refusal too.
+    _task_store_audit_log "task need floor-appeal" \
+      "$( ((_discusses_applied)) && echo applied || echo refused )" 0 -- \
+      "task=$ident" "filer=$(task_actor "$from")" "declared=$discusses" || true
+  fi
+
   # DIVE-1359: eng-ship downgrade. A builder cannot file a hard-human (tier-2)
   # gate for an eng ship/merge/diff/deploy decision — that class is lead-clearable,
   # not a human call. When a NON-lead filer's decision/approval gate hits the
@@ -3807,6 +3977,14 @@ cmd_task_need() {
   # would have surfaced/applied a rec anyway.
   local ask_shape precedent_ref="" precedent_cite="" precedent_kind=""
   ask_shape=$(_gate_ask_shape "$ask")
+  # DIVE-2089: an APPLIED appeal is written into the ask the reviewer reads, so
+  # the claim it rests on is graded by the person it moved the gate to. This is
+  # the property the vocabulary workaround it replaces does not have — a
+  # laundered ask carries no trace of having been laundered. Appended AFTER
+  # ask_shape so the precedent key still matches the question, not the appeal.
+  if [[ "$_discusses_applied" == "1" ]]; then
+    ask="${ask}"$'\n\n'"[DIVE-2089 floor appeal — filer declared this DISCUSSES a tier-2 category rather than performing it: ${discusses}. Routed to you instead of the human on that claim; if it is wrong, this belongs with the human.]"
+  fi
   # Best prior ANSWERED gate: same need_type, EXACT ask_shape, from an equally- or
   # more-scrutinized tier (COALESCE(tier,2) so legacy NULL counts as T2 — a
   # rubber-stamped T0 can never prefill a T2 gate), answered within 90 days; most
@@ -4104,6 +4282,10 @@ cmd_task_need() {
   # DIVE-1480: an internal-ops/recovery gate the destructive floor over-fired on is
   # lead-routed by kind (set above), so the lead clears it instead of lodar.
   [[ "$_internal_ops" == "1" ]] && _routable=1
+  # DIVE-2089: a DECLARED-DISCUSSION appeal that survived every guard is
+  # lead-routed by kind — the appeal's entire effect is "a reviewer instead of the
+  # human", so it must not fall back to the human via the pref (rule 4).
+  [[ "$_discusses_applied" == "1" ]] && _routable=1
   # DIVE-1495: a verifier-route gate is routable by kind (to the verifier agent).
   [[ "$_verifier_route" == "1" ]] && _routable=1
   # DIVE-1957: backstop — an EXPLICIT --tier=2 is the caller's hard-human contract
@@ -4120,7 +4302,7 @@ cmd_task_need() {
     # DIVE-1359: eng-ship routing is likewise intrinsic to the KIND — it bypasses
     # the pref too, so the fix is live under the default (pref OFF) posture.
     local _route; _route=$(_task_pref_get gate_builder_routing); _route="${_route:-off}"
-    if [[ "$_route" == "on" || "$type" == "access" || "$_eng_ship" == "1" || "$_curation" == "1" || "$_internal_ops" == "1" || "$_verifier_route" == "1" ]]; then
+    if [[ "$_route" == "on" || "$type" == "access" || "$_eng_ship" == "1" || "$_curation" == "1" || "$_internal_ops" == "1" || "$_discusses_applied" == "1" || "$_verifier_route" == "1" ]]; then
       # DIVE-1495: a verifier-route targets the task's verifier directly; every
       # other kind resolves the filer's lead via the org chart.
       local _reviewer
@@ -4232,7 +4414,29 @@ cmd_task_need() {
   # non-root case) and routing through the store fence instead.
   [[ "$_nrc" == "3" ]] \
     && _task_store_audit_log "task need unnotified" "error" 1 -- "task=$ident" "type=$type" "filer=$actor" || true
-  local floor_note=""; (( tier_floored )) && floor_note=" [tier forced to 2 — T2 category floor]"
+  # DIVE-2089 defect 2 — the floor was SILENT about WHY. "[tier forced to 2 — T2
+  # category floor]" says an escalation happened but not what caused it, so the
+  # filer cannot tell a correct escalation from a subject-matter false positive,
+  # and cannot act on either. dev3 discovered their sizing gate had been floored
+  # only by re-reading it; an agent that files and moves on leaves a design
+  # question in the founder's inbox indefinitely. Name the matched term on the
+  # result AND warn on stderr, and — for a decision gate, the one type where an
+  # appeal exists — say what the sanctioned appeal is. Stating the appeal here is
+  # the anti-laundering lever: the filer who would otherwise re-file with neutral
+  # wording is shown an attributable, audited path to the same audience.
+  local floor_note="" floor_term=""
+  if (( tier_floored )); then
+    floor_term=$(_gate_tier2_floor_term "${ask} $(db "SELECT COALESCE(title,'') FROM tasks WHERE id=${id};")")
+    floor_note=" [tier forced to 2 — T2 category floor${floor_term:+: matched '$floor_term'}]"
+    local _fw="this gate was FORCED to tier 2 (hard human) by the T2 category floor"
+    [[ -n "$floor_term" ]] && _fw="$_fw because the ask or the task title contains '${floor_term}'"
+    if [[ "$type" == "decision" && -z "$discusses" ]]; then
+      _fw="$_fw. The floor matches SUBJECT MATTER, not the action you asked for. If this decision only DISCUSSES that category and performs nothing, re-file with --discusses=\"<why>\" — it is recorded on the gate and routed to your lead. Do NOT reword the ask to dodge the floor: that reaches the same audience with no record of how."
+    else
+      _fw="$_fw. It is answerable only by the paired human."
+    fi
+    warn "$_fw"
+  fi
   local prec_note=""; [[ -n "$precedent_cite" ]] && prec_note=" [${precedent_cite}]"
   # rc 3 = filed, answerable, but nobody was PINGED. Say so on the record instead
   # of letting an unnotified gate read exactly like a notified one — that
@@ -4243,8 +4447,8 @@ cmd_task_need() {
     unnotified_note=" [UNNOTIFIED — nobody was pinged; answer on the dashboard or: 5dive task answer ${ident}]"
   fi
   ok "$ident needs a human ($type, tier $tier)${floor_note}${prec_note}${unnotified_note} — $ask" \
-     '{id:($i|tonumber), ident:$id, status:"blocked", need_type:$ty, tier:($tr|tonumber), tier_floored:($fl=="1"), notified:($nf=="1"), ask:$ak, need_options:(($op|select(length>0)) // null), recommend:(($rc|select(length>0)) // null), precedent_ref:(($pr|select(length>0)|tonumber?) // null), assignee:$ac}' \
-     --arg i "$id" --arg id "$ident" --arg ty "$type" --arg tr "$tier" --arg fl "$tier_floored" --arg nf "$notified" --arg ak "$ask" --arg op "$options" --arg rc "$recommend" --arg pr "$precedent_ref" --arg ac "$actor"
+     '{id:($i|tonumber), ident:$id, status:"blocked", need_type:$ty, tier:($tr|tonumber), tier_floored:($fl=="1"), floor_term:(($ft|select(length>0)) // null), notified:($nf=="1"), ask:$ak, need_options:(($op|select(length>0)) // null), recommend:(($rc|select(length>0)) // null), precedent_ref:(($pr|select(length>0)|tonumber?) // null), assignee:$ac}' \
+     --arg i "$id" --arg id "$ident" --arg ty "$type" --arg tr "$tier" --arg fl "$tier_floored" --arg ft "$floor_term" --arg nf "$notified" --arg ak "$ask" --arg op "$options" --arg rc "$recommend" --arg pr "$precedent_ref" --arg ac "$actor"
 }
 
 # _task_owner_channel — resolve the filing agent's bot token + the per-type
