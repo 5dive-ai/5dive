@@ -644,6 +644,15 @@ delete_agent_user() {
   # operator keeps whatever was in it while a recycled uid inherits nothing.
   deluser --quiet "$user" 2>/dev/null || true
   rm -f "/etc/sudoers.d/${user}"
+  # DIVE-2102: the grant is gone as of the line above, so the capability rows
+  # recording it stop being true HERE. Mirrors the mint site: rows are written
+  # on the write that installs the grant and dropped on the write that removes
+  # it. Without this a reaped agent stays a CONFIRMED holder forever — and
+  # confirmed-holder is the only claim this registry makes, so a stale one is
+  # the only kind of wrong answer it can produce. DIVE-2138 documents that
+  # names and uids really are recycled on this host, so the successor would
+  # inherit its predecessor's confirmations.
+  capability_forget_agent "$user" || true
   quarantine_agent_home "$name" "$home" "$purge_home"
 }
 

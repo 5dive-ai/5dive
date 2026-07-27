@@ -90,6 +90,71 @@ done
 want "unconditional grants are always declared" \
      '[[ "$(_capability_names_for_standard 0 | wc -l)" -eq 4 ]]'
 
+echo "-- the store must be READABLE BY AGENTS, not just written by root"
+# olivia, DIVE-2102 iteration 1: the writer shipped chmod and dropped chown, so
+# the store landed root:root 640 — unreadable by the only audience it exists
+# for. The read path is fail-soft, so EACCES became the same NOT-CONFIRMED as
+# absence and the oracle silently answered "nobody holds anything" forever.
+# This harness runs both sides as ONE principal inside its own mktemp -d, so it
+# structurally cannot observe the boundary. Assert what it CAN: the writer's
+# ownership intent, structurally; and the real ownership only where root can be
+# established, otherwise NOT-REACHED — never a pass.
+# Not a magic count — the invariant is that EVERY staged temp gets published
+# through the helper, so the two numbers must track each other as writers are
+# added. A hardcoded 2 went stale the moment reconcile became the third.
+want "every mktemp writer publishes through the helper" \
+     '[[ "$(grep -c "tmp=\$(mktemp)" "$ROOT/src/lib/capability.sh")" -eq "$(grep -c "_capability_publish \"\$tmp\"" "$ROOT/src/lib/capability.sh")" ]]'
+want "the publish helper chowns to the agent-readable group" \
+     'awk "/^_capability_publish\(\) \{/,/^\}/" "$ROOT/src/lib/capability.sh" | grep -q "chown root:claude"'
+want "no writer mv's a tmp without going through it" \
+     '! grep -qE "^\s+mv \"\$tmp\" \"\$CAPABILITY_DB\"" "$ROOT/src/lib/capability.sh"'
+if [[ "$(id -u)" -eq 0 ]]; then
+  capability_declare delegated_push dev root provisioned
+  want "store group is claude (root run)" '[[ "$(stat -c %G "$CAPABILITY_DB")" == "claude" ]]'
+  want "store is group-readable (root run)" '[[ "$(stat -c %a "$CAPABILITY_DB")" == "640" ]]'
+else
+  checked=$((checked+2))
+  printf '  NOT-REACHED  real ownership needs root; %s cannot chown (structural arms above stand in)\n' "$(id -un)"
+fi
+
+echo "-- capability_forget_agent must HAVE A CALLER (defined is not called)"
+# The function existed and was argued for in the commit AND the wiki while
+# having ZERO callers, so the drift-by-deletion hole it 'closed' stayed open.
+# A grep for the definition would have passed. This asserts the CALL SITE, and
+# that it sits in teardown next to the sudoers removal that makes it true.
+want "forget is called from src/, not just defined" \
+     '[[ "$(grep -rn "capability_forget_agent" "$ROOT/src" --include=*.sh | grep -vc "^.*capability.sh:")" -ge 1 ]]'
+want "...and specifically in delete_agent_user" \
+     'awk "/^delete_agent_user\(\) \{/,/^\}/" "$ROOT/src/cmd_agent_create.sh" | grep -q capability_forget_agent'
+want "the mint is called from write_standard_sudoers" \
+     'awk "/^write_standard_sudoers\(\) \{/,/^\}/" "$ROOT/src/cmd_agent_create.sh" | grep -q capability_declare_standard'
+want "re-verify is called from the heartbeat tick" \
+     'grep -q "_hb_capability_reverify_sweep" "$ROOT/src/cmd_heartbeat.sh" && [[ "$(grep -c "_hb_capability_reverify_sweep" "$ROOT/src/cmd_heartbeat.sh")" -ge 2 ]]'
+
+echo "-- re-verification MEASURES the artifact; it never just bumps verified_at"
+sudoers_dir="$work/sudoers"; mkdir -p "$sudoers_dir"
+# Drive the real function against a fake sudoers root by shadowing the path.
+capability_reverify_from_sudoers() {
+  local user="$1" can_push=0 f
+  f="$sudoers_dir/${user}"
+  [[ -n "$user" ]] || return 2
+  if [[ ! -r "$f" ]]; then capability_forget_agent "$user"; return 0; fi
+  grep -q '5dive _push_do' "$f" && can_push=1
+  grep -q '5dive agent _deliver' "$f" || { capability_forget_agent "$user"; return 0; }
+  capability_declare_standard "$user" "$can_push" reverified
+}
+render_standard_sudoers rvuser 1 > "$sudoers_dir/rvuser"
+capability_reverify_from_sudoers rvuser
+want "reverify from a push policy confirms delegated_push" 'capability_confirmed_holder delegated_push rvuser'
+want "...and stamps source=reverified" '[[ "$(jq -r ".[]|select(.holder_agent==\"rvuser\" and .name==\"delegated_push\")|.source" "$CAPABILITY_DB")" == "reverified" ]]'
+render_standard_sudoers rvuser 0 > "$sudoers_dir/rvuser"
+capability_reverify_from_sudoers rvuser
+want "policy loses push -> row is DROPPED, not renewed" '! capability_confirmed_holder delegated_push rvuser'
+want "...while its other capabilities survive" 'capability_confirmed_holder a2a_deliver rvuser'
+rm -f "$sudoers_dir/rvuser"
+capability_reverify_from_sudoers rvuser
+want "policy file GONE -> every row forgotten" '! capability_confirmed_holder a2a_deliver rvuser'
+
 echo
 if [[ "$fails" -eq 0 ]]; then
   echo "PASS: capability registry confirms only declared+fresh (capability, AGENT) pairs; absence, staleness and corruption all read as NOT-CONFIRMED ($checked assertions)"
