@@ -1089,7 +1089,7 @@ _team_bot_do_shared() {
   # Resolve requested names against relay candidates — never touch a personal-bot
   # agent or an unknown/unsupported one.
   local targets_json="{}" name type sd tt
-  local -a req
+  local -a req=()
   IFS=',' read -ra req <<<"$agents_filter"
   for name in "${req[@]}"; do
     name="${name// /}"
@@ -1226,7 +1226,7 @@ PY
 
   # 3) For each agent that got a topic: enable the telegram plugin (send-only)
   #    + regenerate its systemd env with channels=telegram.
-  local -a wired
+  local -a wired=()
   while IFS= read -r name; do [[ -n "$name" ]] && wired+=("$name"); done \
     < <(jq -r '.[] | select(.status=="relayed") | .agent' <<<"$results")
 
