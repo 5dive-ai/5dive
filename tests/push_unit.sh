@@ -88,11 +88,25 @@ REPO="$TMP/repo"; mkdir -p "$REPO"
   git checkout -q -b feature-badauthor
   git commit -q --allow-empty -m "other-author" --author="$OTHER"
   git checkout -q master 2>/dev/null || git checkout -q main 2>/dev/null || true
+  # DIVE-2161. This repo's default branch is master, so `git fetch <url> main` —
+  # what the author scan runs — has ALWAYS failed here ("couldn't find remote ref
+  # main"). Pre-2161 that fell through to the unbounded fallback, which is the
+  # defect: every author assertion in this file was graded through the broken
+  # branch, and the harness header even documented it ("the fetch no-ops and it
+  # scans the branch"). Give the fixture the remote-tracking main every real work
+  # tree has, so those assertions rest on a real range bound instead. Verified
+  # load-bearing by deletion: without this line, `set committer: non-matching
+  # author -> refuse`, `author refusal names the repo it checked against` and the
+  # two cached-bound arms below all stop grading (the scan correctly SKIPs).
+  git update-ref refs/remotes/origin/main HEAD
 ) >/dev/null 2>&1
 
 # run_push <ident> [args...] — capture combined output + rc from cmd_push, run
 # inside the scratch repo (git checks need a work tree). --repo points at the
-# local repo so the author scan's `git fetch` no-ops and it scans the branch.
+# local repo. Its default branch is master, so the author scan's `git fetch <url>
+# main` fails and the scan falls to the CACHED refs/remotes/origin/main seeded
+# above (DIVE-2161 — before that ref existed, this fell to the unbounded fallback
+# that DIVE-2161 removed, i.e. these assertions were graded through the bug).
 run_push() {
   local ident="$1"; shift
   ( cd "$REPO"; cmd_push "$ident" --repo="file://$REPO" "$@" ) 2>&1
@@ -500,6 +514,168 @@ out=$( cd "$REPO"; GITHUB_APP_COMMIT_AUTHOR="$AUTHOR" cmd_push DIVE-906 --repo="
     && grep -qi "check the TARGET REPO first" <<<"$out"; } \
   && ok_t "author refusal names the repo it checked against" \
   || bad_t "author refusal names the repo it checked against" "rc=$rc :: $out"
+
+# --- DIVE-2161: an UNRESOLVABLE range bound must not render as a measurement.
+# dev2 pushed a one-commit, correctly-authored branch and got "author check
+# FAILED ... UNBOUNDED" plus hundreds of pre-policy commits listed as violations.
+# The tool could not fetch the target's main, silently widened the range to the
+# branch's entire history, and graded that. These arms fix the shape: the bound is
+# resolved, degraded to a cached one that SAYS it may be stale, or refused.
+#
+# REPO3 reproduces it: main carries pre-policy commits authored by someone else,
+# the feature branch carries ONE correctly-authored commit. An unbounded scan
+# reports the pre-policy commits; a bounded one reports nothing.
+REPO3="$TMP/repo3"; mkdir -p "$REPO3"
+( cd "$REPO3"
+  git init -q -b main
+  git config user.name test; git config user.email test@example.test
+  for i in 1 2 3; do git commit -q --allow-empty -m "pre-policy $i" --author="$OTHER"; done
+  git checkout -q -b feature-clean
+  git commit -q --allow-empty -m "the one real commit" --author="$AUTHOR"
+  git checkout -q -b feature-dirty main
+  git commit -q --allow-empty -m "genuinely wrong author" --author="$OTHER"
+) >/dev/null 2>&1
+PREPOLICY_SHA=$( cd "$REPO3" && git rev-parse main )
+UNFETCHABLE="file://$TMP/there-is-no-repo-here.git"   # fails fast, no network
+cache_on()  { ( cd "$REPO3" && git update-ref refs/remotes/origin/main main ) >/dev/null 2>&1; }
+cache_off() { ( cd "$REPO3" && git update-ref -d refs/remotes/origin/main ) >/dev/null 2>&1; }
+# run the scan in a subshell so its `fail` exits the subshell, not the harness
+scan3() { # <branch> <repo-url> <mode> -> combined output; rc from the subshell
+  ( _push_author_scan "$REPO3" "$2" "$1" "$AUTHOR" "a test" "$3" ) 2>&1
+}
+
+cache_off
+out=$(scan3 feature-clean "$UNFETCHABLE" authoritative); rc=$?
+{ [[ $rc -ne 0 ]] && grep -q "author check COULD NOT RUN" <<<"$out" \
+    && grep -q "could not determine WHICH commits" <<<"$out" \
+    && ! grep -q "author check FAILED" <<<"$out" \
+    && ! grep -q "$PREPOLICY_SHA" <<<"$out"; } \
+  && ok_t "2161: no bound, authoritative -> REFUSE, and lists no commits" \
+  || bad_t "2161: no bound, authoritative -> REFUSE, and lists no commits" "rc=$rc :: $out"
+
+# the refusal must name WHY the bound is missing — "I cannot measure" is only
+# actionable with the cause attached.
+{ grep -q "fetching that repo's main failed (" <<<"$out" \
+    && grep -Eq "not found, or is not visible|git said:" <<<"$out" \
+    && grep -q "no cached refs/remotes/origin/main" <<<"$out"; } \
+  && ok_t "2161: the refusal names the CAUSE of the missing bound" \
+  || bad_t "2161: the refusal names the CAUSE of the missing bound" "$out"
+
+out=$(scan3 feature-clean "$UNFETCHABLE" preflight); rc=$?
+{ [[ $rc -eq 0 ]] && grep -q "author check SKIPPED here" <<<"$out" \
+    && grep -q "re-run authoritatively" <<<"$out"; } \
+  && ok_t "2161: no bound, preflight -> SKIP with a reason (delegated push has no creds)" \
+  || bad_t "2161: no bound, preflight -> SKIP with a reason" "rc=$rc :: $out"
+
+# THE REPORTED BUG. Fetch impossible, cached origin/main present, branch clean:
+# pre-fix this printed the three pre-policy commits as author violations.
+cache_on
+out=$(scan3 feature-clean "$UNFETCHABLE" authoritative); rc=$?
+{ [[ $rc -eq 0 ]] && ! grep -q "$PREPOLICY_SHA" <<<"$out"; } \
+  && ok_t "2161: cached bound -> a clean branch PASSES (no phantom pre-policy offenders)" \
+  || bad_t "2161: cached bound -> a clean branch PASSES" "rc=$rc :: $out"
+grep -Eq "cached refs/remotes/origin/main|could not fetch" <<<"$out" \
+  && ok_t "2161: the cached bound is announced, not silent" \
+  || bad_t "2161: the cached bound is announced, not silent" "$out"
+
+# ...and a cached bound still CATCHES a genuinely mis-authored commit — exactly
+# one, the branch's own, not the pre-policy history behind it.
+out=$(scan3 feature-dirty "$UNFETCHABLE" authoritative); rc=$?
+n=$(grep -cE "^  [0-9a-f]{40} " <<<"$out")
+{ [[ $rc -ne 0 ]] && grep -q "author check FAILED" <<<"$out" && [[ "$n" -eq 1 ]] \
+    && grep -q "MAY BE STALE" <<<"$out"; } \
+  && ok_t "2161: cached bound catches a real bad author — exactly 1 offender, flagged stale" \
+  || bad_t "2161: cached bound catches a real bad author — exactly 1 offender, flagged stale" "rc=$rc n=$n :: $out"
+
+# a FRESH fetch still bounds authoritatively and says so (no stale caveat).
+out=$(scan3 feature-dirty "file://$REPO3" authoritative); rc=$?
+{ [[ $rc -ne 0 ]] && grep -q "not already on that repo's main" <<<"$out" \
+    && ! grep -q "MAY BE STALE" <<<"$out"; } \
+  && ok_t "2161: a fetchable remote still gives the fresh, authoritative bound" \
+  || bad_t "2161: a fetchable remote still gives the fresh, authoritative bound" "rc=$rc :: $out"
+
+# --- DIVE-2161 MUTATION ARMS. A harness that only exercises the resolvable path
+# passes forever while this defect stands (the ticket says so explicitly). Each
+# arm re-introduces one piece of the pre-fix behaviour into the SHIPPED source and
+# demands the corresponding assertion goes red. The sed is verified to have
+# actually changed the file — a mutation that did not land greens like a pass.
+mutate() { # <name> <sed-expr> -> path to the mutated source, or "" if sed no-op'd
+  local f="$TMP/mut-$1.sh"
+  sed "$2" "$SRC/cmd_push.sh" > "$f"
+  cmp -s "$f" "$SRC/cmd_push.sh" && { printf ''; return 1; }
+  printf '%s' "$f"
+}
+mut_scan3() { # <mutated-src> <branch> <repo-url> <mode>
+  ( source "$1" >/dev/null 2>&1; _push_author_scan "$REPO3" "$3" "$2" "$AUTHOR" "a test" "$4" ) 2>&1
+}
+
+# --- main's review note. The two DIVE-1461 author assertions near the top now
+# rest on the CACHED bound this fixture gained (`update-ref` above): without a
+# remote-tracking main the pre-flight would correctly SKIP and those assertions
+# would keep printing ok while grading nothing. Grade them here so nobody later
+# has to wonder whether they still red. Forced onto the cached rung with an
+# unfetchable --repo — otherwise whether an ambient fetch of the constant target
+# happens to succeed on the box decides which bound they use.
+seed_task DIVE-961 "Branch: feature-badauthor" approval "2026-07-18 00:00:00" "yes"
+seed_task DIVE-962 "Branch: feature-ok"        approval "2026-07-18 00:00:00" "yes"
+cached_push() { ( cd "$REPO"; GITHUB_APP_COMMIT_AUTHOR="$AUTHOR" cmd_push "$1" --repo="$UNFETCHABLE" --dry-run ) 2>&1; }
+mut_cached_push() { ( source "$1" >/dev/null 2>&1; cd "$REPO"; GITHUB_APP_COMMIT_AUTHOR="$AUTHOR" cmd_push "$2" --repo="$UNFETCHABLE" --dry-run ) 2>&1; }
+
+out=$(cached_push DIVE-961); rc=$?
+{ [[ $rc -ne 0 ]] && grep -q "author check FAILED" <<<"$out"; } \
+  && ok_t "2161: on the cached bound a bad author is still REFUSED (the 1461 assertion still grades)" \
+  || bad_t "2161: on the cached bound a bad author is still REFUSED" "rc=$rc :: $out"
+
+out=$(cached_push DIVE-962); rc=$?
+{ [[ $rc -eq 0 ]] && grep -q "CACHED bound, may be stale" <<<"$out"; } \
+  && ok_t "2161: a clean branch passes on the cached bound, and the dry-run SAYS the bound was cached" \
+  || bad_t "2161: a clean branch passes on the cached bound, and the dry-run SAYS the bound was cached" "rc=$rc :: $out"
+
+# M0 — take the cached bound away and the refusal above stops being produced:
+# proof that it is the cached rung doing the grading, not an ambient fetch.
+if M0=$(mutate m0 's|^    for cref in refs/remotes/origin/main refs/remotes/origin/master; do|    for cref in refs/remotes/__no_such_ref__; do|'); then
+  out=$(mut_cached_push "$M0" DIVE-961); rc=$?
+  { [[ $rc -eq 0 ]] && ! grep -q "author check FAILED" <<<"$out" \
+      && grep -q "author check SKIPPED here" <<<"$out"; } \
+    && ok_t "2161-MUT: without the cached bound the 1461 author assertion stops grading (arm is live)" \
+    || bad_t "2161-MUT: without the cached bound the 1461 author assertion stops grading" "rc=$rc :: $out"
+else
+  bad_t "2161-MUT: cached-bound grade of the 1461 assertions" "sed did not change cmd_push.sh — anchor moved"
+fi
+
+# M1 — the refusal widens to the whole history again (the exact pre-fix line).
+if M1=$(mutate m1 's|^      fail "\$E_GENERIC" "author check COULD NOT RUN.*|      rangespec="refs/heads/${branch}"; scope="MUTATED: the pre-2161 unbounded fallback"|'); then
+  cache_off
+  out=$(mut_scan3 "$M1" feature-clean "$UNFETCHABLE" authoritative); rc=$?
+  { [[ $rc -ne 0 ]] && grep -q "$PREPOLICY_SHA" <<<"$out"; } \
+    && ok_t "2161-MUT: re-widening the range makes the phantom list come back (arm is live)" \
+    || bad_t "2161-MUT: re-widening the range makes the phantom list come back" "the mutation did not reproduce the bug — the refusal arm may not be what is protecting us. rc=$rc :: $out"
+else
+  bad_t "2161-MUT: widen-the-range mutation" "sed did not change cmd_push.sh — the anchor moved, mutation NOT applied"
+fi
+
+# M2 — drop the cached-bound fallback: the reported case stops passing.
+if M2=$(mutate m2 's|^    for cref in refs/remotes/origin/main refs/remotes/origin/master; do|    for cref in refs/remotes/__no_such_ref__; do|'); then
+  cache_on
+  out=$(mut_scan3 "$M2" feature-clean "$UNFETCHABLE" authoritative); rc=$?
+  [[ $rc -ne 0 ]] \
+    && ok_t "2161-MUT: without the cached fallback the clean branch is refused (arm is live)" \
+    || bad_t "2161-MUT: without the cached fallback the clean branch is refused" "rc=$rc :: $out"
+else
+  bad_t "2161-MUT: drop-cached-fallback mutation" "sed did not change cmd_push.sh — anchor moved"
+fi
+
+# M3 — remove the preflight escape: a credential-less delegated push starts failing.
+if M3=$(mutate m3 's|^      \[\[ "\$mode" == preflight \]\] && { warn |      [[ "$mode" == "__never__" ]] \&\& { warn |'); then
+  cache_off
+  out=$(mut_scan3 "$M3" feature-clean "$UNFETCHABLE" preflight); rc=$?
+  [[ $rc -ne 0 ]] \
+    && ok_t "2161-MUT: without the preflight skip a credential-less pre-check hard-fails (arm is live)" \
+    || bad_t "2161-MUT: without the preflight skip a credential-less pre-check hard-fails" "rc=$rc :: $out"
+else
+  bad_t "2161-MUT: drop-preflight-skip mutation" "sed did not change cmd_push.sh — anchor moved"
+fi
+cache_off
 
 # --- DIVE-1462/STEER-4 builder-scoped sudoers: render_standard_sudoers emits the
 # _push_do grant ONLY for a builder (can_push=1), never for a plain standard

@@ -1,5 +1,43 @@
 # Changelog
 
+## 0.16.33 — fix(push): the author check refuses when it cannot bound the range, instead of grading the whole history (DIVE-2161)
+
+Reported by dev2, who pushed a one-commit branch that was correctly authored and got back
+"author check FAILED ... the range is UNBOUNDED" followed by hundreds of old commits listed
+as author violations. Every one of them was a phantom.
+
+`5dive push` bounds its author scan by fetching the target repo's main and taking a
+merge-base. It discarded that fetch's exit status and its stderr, so when the fetch failed
+the scan silently widened the range to the branch's ENTIRE history and reported every
+pre-policy commit in it as a violation. "I cannot determine which commits this branch adds"
+and "your branch has hundreds of bad-author commits" are different facts, and the tool
+printed the second whenever the first was true.
+
+The bound is now treated as a measurement that can be unavailable:
+
+- A fresh fetch bounds the scan authoritatively, as before.
+- A fetch that succeeds but finds no common ancestor is a real finding — the branch shares
+  nothing with that main, so the whole branch genuinely is new to it, and the message now
+  says that rather than blaming an unreachable remote.
+- If the fetch fails, a cached `refs/remotes/origin/main` is used instead and the output
+  says the bound may be stale, naming why the fresh one was unavailable.
+- With no bound at all, root's authoritative pass REFUSES and names what is missing and how
+  to restore it. It prints no commit list, because there is no honest list to print.
+- The agent-side pre-check SKIPS with the reason instead of refusing: a delegated pusher has
+  no GitHub credential by design, so no bound is a normal state there. Root still enforces.
+
+The dry-run's author line now reports which bound the verdict rests on, so a scan that was
+skipped or fell back to a cached ref no longer prints a flat "ok".
+
+Failed fetches also get a named cause — no credential, an unwritable `.git/` (a root-owned
+`FETCH_HEAD` left by an earlier root-run fetch, which is what dev2 hit), unreachable remote,
+or git's own last line rather than a paraphrase of it.
+
+Covered by mutation arms in `tests/push_unit.sh`: re-widening the range brings the phantom
+list back, dropping the cached fallback re-breaks the reported case, and removing the
+pre-flight skip hard-fails a credential-less push. A harness that only exercises the
+resolvable path would pass forever while this defect stood.
+
 ## 0.16.32 — fix(agent): `agent rm` no longer leaves the home dir for a recycled uid to inherit (DIVE-2138, gh#222)
 
 Reported by A-MO7SEN (gh#222), his fifth confirmed find.
