@@ -258,5 +258,48 @@ else
   fi
 fi
 
+# ---------------------------------------------------------------------------
+# P ANCHOR EXPIRY. Arm F's precondition guards a premise about GitHub's RUNNER. The
+# fixtures are a premise about GitHub's and git's WORDING, one layer out and with the
+# same expiry shape: if GitHub rewords GH006, every arm above keeps passing against a
+# capture that no longer resembles a real rejection, and the live path silently falls
+# through to `unknown`. We cannot test against a real remote — exercising the
+# protection branch means re-breaking main's protection — so the substitute is to
+# record WHICH substrings the verdict actually rests on and red if they stop being
+# load-bearing. It cannot detect a rewording at GitHub; it makes the fixture's
+# dependence on specific bytes VISIBLE instead of implicit, so the recapture has an
+# address. (Raised by Marcus in review of this branch.)
+declare -A ANCHOR=(
+  [protected-gh006.txt]='GH006|protected branch|required status check'
+  [race-fetch-first.txt]='fetch first|Updates were rejected because'
+  [race-non-fast-forward.txt]='non-fast-forward|Updates were rejected because'
+)
+declare -A ANCHOR_CLASS=(
+  [protected-gh006.txt]=protection
+  [race-fetch-first.txt]=race
+  [race-non-fast-forward.txt]=race
+)
+for f in "${!ANCHOR[@]}"; do
+  missing=""
+  IFS='|' read -r -a as <<<"${ANCHOR[$f]}"
+  for a in "${as[@]}"; do grep -qiF -- "$a" "$FIX/$f" || missing+="'$a' "; done
+  if [[ -z "$missing" ]]; then
+    ok "P $f still contains every recorded anchor (${ANCHOR[$f]//|/, })"
+  else
+    no "P $f LOST an anchor: $missing" "the capture no longer carries the text the classifier keys on — RECAPTURE it from a real rejection rather than editing the anchor list to match"
+  fi
+  # And prove the anchors are the WHOLE reason it matches: with all of them removed the
+  # verdict must fall to 'unknown'. If it still classifies, some other substring is
+  # carrying the match and the recorded anchor list is a fiction — which is exactly the
+  # state that would let a GitHub rewording pass unnoticed.
+  sed -E "s/(${ANCHOR[$f]})//Ig" "$FIX/$f" > "$TMP/stripped-$f"
+  got=$(bash "$CLS" < "$TMP/stripped-$f")
+  if [[ "$got" == unknown ]]; then
+    ok "P $f: stripping the anchors drops it to 'unknown' — the recorded list IS what the ${ANCHOR_CLASS[$f]} verdict rests on"
+  else
+    no "P $f anchors are not load-bearing" "stripped of ${ANCHOR[$f]} it still reads '$got', so the recorded anchors are not what the classifier keys on and arm P grades nothing"
+  fi
+done
+
 echo; echo "DIVE-2143 version-assign push classification: passed: $P  failed: $F"
 [ "$F" -eq 0 ]
