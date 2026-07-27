@@ -195,11 +195,20 @@ fi
 # BLOCK — fenced out of .github/workflows/version-assign.yml, never retyped, so a
 # future edit to the step cannot drift past this arm the way a copy would.
 #
-# The trap being held shut: GitHub runs a `run:` with no `shell:` key as `bash -e {0}`,
-# and `set -uo pipefail` does NOT turn -e back off. Under `cmd; rc=$?`, errexit fires
-# on the loop's own non-zero exit and the rc line never runs — so exit 3 ("nothing
-# owed", the COMMON path on any doc-only merge) would escape as a red step. The arm
-# asserts the contract by EXIT CODE for all three returns, not by reading the source.
+# The trap being held shut: a `run:` with no `shell:` key runs under errexit, and
+# `set -uo pipefail` does NOT turn it back off. Under `cmd; rc=$?`, errexit fires on the
+# loop's own non-zero exit and the rc line never runs — so exit 3 ("nothing owed", the
+# COMMON path on any doc-only merge) would escape as a red step. The arm asserts the
+# contract by EXIT CODE for all three returns, not by reading the source.
+#
+# MEASURED IN THIS REPO rather than read from the docs, because this arm's whole premise
+# is a claim about someone else's runner: throwaway branch ci-errexit-probe, run
+# 30243567053 (2026-07-27 06:41, deleted after). A step with no `shell:` printed
+# PROBE-START and then "Process completed with exit code 3" — the line after
+# `bash -c "exit 3"; rc=$?` never ran. Its control step with an explicit `shell: bash`
+# behaved IDENTICALLY, which is why the precondition below says a `shell:` key means
+# "recheck the premise" and not "the premise is void": `shell: bash` still carries -e,
+# so only a non-bash or flag-overriding shell would actually change the answer.
 if grep -q '^ *shell:' "$REPO/.github/workflows/version-assign.yml"; then
   no "F precondition: the step now sets shell: — this arm's bash -e premise needs rechecking"
 else

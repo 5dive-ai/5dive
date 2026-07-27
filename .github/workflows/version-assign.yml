@@ -53,13 +53,21 @@ jobs:
           # on a real failure (run 30231912328) with no way to have caught it first.
           #   0 = assigned and pushed (grade it)   3 = nothing owed   1 = failed loudly
           #
-          # `|| rc=$?`, NOT `; rc=$?`. GitHub runs a `run:` block with no `shell:` key
-          # as `bash -e {0}`, and the `set -uo pipefail` above does not turn -e back
-          # off — so under `; rc=$?` errexit fires on the loop's own exit and the line
-          # that reads rc never runs. The step would then exit 3 on the COMMON path
-          # (nothing owed, doc/workflow-only merge) and paint main red for the
-          # non-event this job exists to stay quiet about. Graded by arm F of
-          # tests/version_assign_push_unit.sh, which runs this block under `bash -e`.
+          # `|| rc=$?`, NOT `; rc=$?`. A `run:` block with no `shell:` key runs under
+          # errexit, and the `set -uo pipefail` above does not turn it back off — so
+          # under `; rc=$?` errexit fires on the loop's own exit and the line that reads
+          # rc never runs. The step would then exit 3 on the COMMON path (nothing owed,
+          # doc/workflow-only merge) and paint main red for the non-event this job
+          # exists to stay quiet about.
+          #
+          # MEASURED IN THIS REPO, not read from the docs: throwaway branch
+          # ci-errexit-probe, run 30243567053 (2026-07-27 06:41, since deleted). A step
+          # with no `shell:` printed PROBE-START, then `Process completed with exit
+          # code 3` — the line after `bash -c "exit 3"; rc=$?` NEVER RAN. Its control
+          # step with an explicit `shell: bash` behaved IDENTICALLY, so adding a
+          # `shell:` key is not an escape from this; only the `|| rc=$?` form is.
+          # Graded by arm F of tests/version_assign_push_unit.sh, which runs this very
+          # block under `bash -e`.
           rc=0; bash scripts/version-assign-push-loop.sh "$before" 3 || rc=$?
           if (( rc == 3 )); then exit 0; fi
           if (( rc != 0 )); then exit 1; fi
