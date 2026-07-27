@@ -20449,15 +20449,30 @@ _gate_task_repo_slug() {
   return 0
 }
 
+# _gate_bind_slug <qualified-ref> <task_slug> — the ONE repo a ref binds to, or EMPTY
+# for "nothing binds it, sweep every known repo". Precedence: the repo the ref carries
+# itself (a pull URL) > the repo the TASK declared > unbound.
+#
+# DIVE-1963 (Marcus, review): the resolver and the message reporting its scope used to
+# derive this INDEPENDENTLY, and the original comment claimed they "cannot drift". They
+# agreed, but that is parallel derivation — two copies that happen to match today, which
+# buys "does not currently drift". Cannot-drift is what a shared definition buys, so
+# here it is: one function, two callers, and the sentence the reader gets is computed
+# from the same answer the lookup used. Same shape as the DIVE-1932 lesson — a rule that
+# holds because of the shape of the code, rather than because something declares it, is
+# preserved by nothing.
+_gate_bind_slug() {
+  local rslug="${1%%|*}"
+  [[ -z "$rslug" && -n "$2" ]] && rslug="$2"
+  printf '%s' "$rslug"
+}
+
 # _gate_search_scope <qualified-ref> <task_slug> — the repo(s) a ref is ACTUALLY looked
 # up in, comma-joined. DIVE-1963: the unresolvable warning said "in any known repo"
 # after searching exactly ONE, so the message asserted a sweep that never happened, and
 # a warning that misstates its own scope is the defect class this arc exists to delete.
-# It branches on the SAME two inputs `_gate_resolve_qualified` branches on, in the same
-# order, so the sentence and the lookup cannot drift apart.
 _gate_search_scope() {
-  local rslug="${1%%|*}" task_slug="$2"
-  [[ -z "$rslug" && -n "$task_slug" ]] && rslug="$task_slug"
+  local rslug; rslug=$(_gate_bind_slug "$1" "$2")
   if [[ -n "$rslug" ]]; then printf '%s' "$rslug"
   else _gate_repo_slugs | paste -sd, -; fi
 }
@@ -20501,8 +20516,10 @@ _gate_pr_probe() {
 # than admitting we do not know which pull request the maker meant.
 _gate_resolve_qualified() {
   local qref="$1" tok="$2" ident="$3" task_slug="$4"
-  local rslug="${qref%%|*}" n="${qref#*|}"
-  [[ -z "$rslug" && -n "$task_slug" ]] && rslug="$task_slug"
+  local n="${qref#*|}" rslug
+  # DIVE-1963: shared with `_gate_search_scope`, so the repo we look in and the repo the
+  # warning NAMES are one answer, not two derivations that agree.
+  rslug=$(_gate_bind_slug "$qref" "$task_slug")
   if [[ -n "$rslug" ]]; then
     local st; st=$(_gate_pr_state "$n" "$tok" "$rslug")
     [[ -n "$st" ]] && printf '%s|%s' "$rslug" "$st"

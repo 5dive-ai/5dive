@@ -147,6 +147,23 @@ got_default=$(FIVE_GATE_REPOS='' _gate_repo_slugs)
   && ok_t 'with FIVE_GATE_REPOS unset the sweep really is all three repos (the superset precondition)' \
   || bad_t 'default repo set changed' "want [$want_default] got [$got_default]"
 
+# --- 1c. the lookup and the sentence share ONE definition --------------------
+# The message naming the searched scope used to derive the binding independently of the
+# resolver. They agreed, but agreement between two copies is "does not currently drift",
+# not "cannot" — so the derivation is now a single `_gate_bind_slug` both call. Pin the
+# contract that couples them: whenever a ref binds to one repo, that is the repo the
+# sentence names; when nothing binds it, the sentence names the whole sweep.
+bind_case() { # <name> <qref> <task_slug>
+  local b s; b=$(_gate_bind_slug "$2" "$3"); s=$(_gate_search_scope "$2" "$3")
+  local want="$b"; [[ -z "$b" ]] && want=$(_gate_repo_slugs | paste -sd, -)
+  [[ "$s" == "$want" ]] && ok_t "scope names what the lookup binds: $1" \
+                        || bad_t "scope names what the lookup binds: $1" "bind=[$b] scope=[$s] want=[$want]"
+}
+bind_case 'a ref carrying its own repo'      'lodar/5dive-api|6' ''
+bind_case 'a bare ref in a declaring task'   '|6' 'lodar/5dive-frontend'
+bind_case 'the ref own repo BEATS the task declaration' 'lodar/5dive-api|6' 'lodar/5dive-frontend'
+bind_case 'a bare ref with nothing to bind it' '|6' ''
+
 # --- 2. THE NARROWING IS GONE ------------------------------------------------
 # #10 exists ONLY in lodar/5dive-api, and it is OPEN. The body quotes the CLI URL.
 # Before: bound to 5dive-ai/5dive, no #10 there, "resolve to no PR in any known
