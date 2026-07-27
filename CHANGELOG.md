@@ -26,6 +26,12 @@ closing it as delivered; the nag pushed one of those options on a schedule.
   refused (DIVE-555). Scoped to an agent actor and to an EXPLICIT tier: a human caller is the
   party the gate is waiting on, and an untiered legacy row keeps DIVE-1495's supersede, so the
   CNCL-9 re-nag fix is untouched.
+- **`task verify --cmd` no longer auto-closes over an open gate either.** It closes by raw
+  `UPDATE`, so it never saw DIVE-555 — one `task verify --cmd=true` closed a task out from under
+  an unanswered human gate and the question then vanished from every open-gate view, which all
+  require an open status. That is DIVE-2067's lesson on this axis: the refusal on `task done`
+  names other verbs, and the named verb carried no equivalent check. The verify VERDICT is still
+  recorded; only the close waits, and `--no-done` is unaffected.
 - **The refusal prints a reachable exit, per caller.** A guard that forecloses the FAIL verdict
   with nothing but "wait for the human" converts a wrong-but-moving state into a correct-but-stuck
   one, and gets routed around. If you filed the gate you can retire it yourself

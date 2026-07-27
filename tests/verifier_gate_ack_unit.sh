@@ -253,6 +253,34 @@ as reviewer cmd_task_set_body "$J" "VERDICT: FAIL — reasons here" --append >/d
   && ok_t "ESCAPE the verdict is recordable while the human's gate still stands" \
   || bad_t "verdict not recordable" "body=$(col "$J" body) answered=$(col "$J" need_answered_at)"
 
+# (h) THE NAMED ALTERNATIVE IS AN ENTRY POINT. ARM3a's refusal on `task done`
+#     points at other verbs, and `task verify --cmd` closes by raw UPDATE — it
+#     never saw DIVE-555. Unguarded, every rail above is advisory: one `task
+#     verify --cmd=true` closes the row and the human's question disappears.
+K=$(deliver "verify --cmd must not close over a gate")
+as reviewer cmd_task_need "$K" --type=decision --tier=2 --options="A|B" --recommend="A" \
+   --ask="Leave open and parked, or close as delivered?" >/dev/null
+out=$(as reviewer cmd_task_verify "$K" --cmd=true); rc=$?
+(( rc != 0 )) && ok_t "ARM3c verify auto-close over an open gate exits non-zero (rc=$rc)" \
+  || bad_t "ARM3c verify closed it" "rc=$rc out=$out"
+[[ "$(col "$K" status)" != "done" && -z "$(col "$K" done_at)" && -z "$(col "$K" need_answered_at)" ]] \
+  && ok_t "ARM3c task not closed and the human's gate still stands" \
+  || bad_t "ARM3c state mutated" "status=$(col "$K" status) done_at=$(col "$K" done_at)"
+[[ "$(col "$K" result)" == *"verify PASS"* ]] \
+  && ok_t "ARM3c the verdict is still RECORDED — only the close waits" \
+  || bad_t "ARM3c evidence lost" "result=$(col "$K" result)"
+as reviewer cmd_task_verify "$K" --cmd=true --no-done >/dev/null
+[[ "$(col "$K" status)" != "done" ]] \
+  && ok_t "ARM3c --no-done still works on a gated row (the named exit is real)" \
+  || bad_t "--no-done closed it" "status=$(col "$K" status)"
+
+# CONTROL — verify still auto-closes an ordinary ungated task.
+L=$(printf '%s' "$(as maker cmd_task_add "plain task, no gate" --assignee=maker)" | jq -r '.data.ident')
+as maker cmd_task_verify "$L" --cmd=true >/dev/null
+[[ "$(col "$L" status)" == "done" ]] \
+  && ok_t "CONTROL verify still closes an ungated task (guard is not a blanket)" \
+  || bad_t "verify broken for ungated tasks" "status=$(col "$L" status)"
+
 echo "-----"
 echo "verifier_gate_ack_unit: $PASS passed, $FAIL failed"
 [[ $FAIL -eq 0 ]]

@@ -3037,6 +3037,23 @@ cmd_task_verify() {
 
   local flipped=0
   if (( rc == 0 )) && (( ! no_done )); then
+    # DIVE-2196: this auto-close is a TERMINAL CLOSE reached by raw UPDATE, so it
+    # never saw DIVE-555's pending-gate refusal — `task verify --cmd=true` closed a
+    # task out from under an unanswered human gate, and the question then vanished
+    # from every open-gate view (they all require an open status). That is the same
+    # bypass DIVE-2067 recorded on the ACK axis: the refusal on `task done` NAMES
+    # `task verify` as an alternative, and the named alternative carried no
+    # equivalent check. Refusing here is what makes the `done`/`reject` rails real
+    # rather than advisory. The verify RESULT is still recorded first — the evidence
+    # is worth keeping and is not what the gate is protecting; only the close waits.
+    local _vg_t _vg_a
+    _vg_t=$(db "SELECT COALESCE(need_type,'')        FROM tasks WHERE id=${id};")
+    _vg_a=$(db "SELECT COALESCE(need_answered_at,'') FROM tasks WHERE id=${id};")
+    if [[ -n "$_vg_t" && -z "$_vg_a" ]]; then
+      db "UPDATE tasks SET result=$(sqlq "$result_txt") WHERE id=${id};"
+      policy_refuse "$E_CONFLICT" verify-close-over-open-gate DIVE-2196 "$ident" \
+        "$ident has a pending '${_vg_t}' gate awaiting a human — the verify verdict is RECORDED, but the auto-close is refused: closing here would drop the human's question out of every open-gate view without anyone answering it, which is DIVE-555's bypass reached by a different verb. Exits: let them answer it ('5dive task answer $ident --value=...'), withdraw it if your result makes it moot ('5dive task need $ident --withdraw'), or re-run with --no-done to record evidence without closing."
+    fi
     db "UPDATE tasks SET status='done', done_at=datetime('now'), result=$(sqlq "$result_txt") WHERE id=${id};"
     flipped=1
     # DIVE-1415: `task verify` auto-done is a terminal close like `task done`, so
