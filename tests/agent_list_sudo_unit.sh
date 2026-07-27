@@ -40,7 +40,15 @@ PASS=0; FAIL=0
 ok()  { PASS=$((PASS+1)); printf '  ok   %s\n' "$1"; }
 bad() { FAIL=$((FAIL+1)); printf '  FAIL %s\n     want: %s\n     got:  %s\n' "$1" "$2" "$3"; }
 is()  { [[ "$2" == "$3" ]] && ok "$1" || bad "$1" "$3" "$2"; }
-isnt(){ [[ "$2" != "$3" ]] && ok "$1" || bad "$1" "anything but '$3'" "$2"; }
+# A bare `!=` is the one assertion shape that PASSES when the field it names is
+# absent: jq renders a missing key as the string `null`, which differs from any
+# real label, so the arm would go green on the very tree it exists to red.
+# `differs` requires the value PRESENT first, then different (DIVE-2136).
+differs(){
+  if   [[ -z "$2" || "$2" == null ]]; then bad "$1" "a present value, anything but '$3'" "${2:-<empty>}"
+  elif [[ "$2" != "$3" ]];            then ok  "$1"
+  else                                     bad "$1" "anything but '$3'" "$2"; fi
+}
 has() { [[ "$2" == *"$3"* ]] && ok "$1" || bad "$1" "contains: $3" "$2"; }
 hasnt(){ [[ "$2" != *"$3"* ]] && ok "$1" || bad "$1" "must NOT contain: $3" "$2"; }
 
@@ -157,7 +165,8 @@ is "unknown never claims divergence"           "$(g scoped .sudo.diverges)" "fal
 # because "not the label" and "not a genuine class" are different properties and
 # the value `unknown` is the only one that satisfies both.
 is "unknown does NOT fall back to the label"   "$(g scoped .sudo.impliedIsolation)" "unknown"
-isnt "impliedIsolation is not the stored label" "$(g scoped .sudo.impliedIsolation)" "$(g scoped .isolation)"
+differs "impliedIsolation is PRESENT and is not the stored label" \
+        "$(g scoped .sudo.impliedIsolation)" "$(g scoped .isolation)"
 is "stored label still reported alongside"     "$(g scoped .isolation)" "admin"
 SUDOERS_D="$TMP/sudoers.d"
 
