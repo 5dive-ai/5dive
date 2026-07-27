@@ -34,6 +34,35 @@ failure is named at the moment it bites rather than at boot.
 
 Also fixes the seed unit test itself, which ran the shipped blocks in an environment where
 their own helpers were undefined — a mutation to the failure path left it green.
+## Unreleased — fix(agent): the sudo-grant measurement can finally see a PEER, via one privileged read (DIVE-2135)
+
+DIVE-2079 and DIVE-2088 (below) replaced a stored label with a measurement. The measurement
+was caller-scoped: `/etc/sudoers.d` is `0700 root`, so a non-root caller could read only its
+own drop-in and every PEER came back `unknown`. Measured on this host: `agent info <peer>` as
+another agent, and as `claude` — the account the dashboard's exec tunnel runs as — both
+printed `unknown`. That is honest, and strictly better than the false `admin` it replaced,
+but the problem those tickets exist to solve was only un-lied-about, not solved: a fleet
+survey of nothing but `unknown` is also the shape a reader takes for a broken column.
+
+`sudo_grant_lines` now has a last-resort privileged read. Where the direct read is refused it
+asks `sudo -n` to do it, so a caller that holds real sudo (root, and `claude`) gets a real
+class for a peer. A caller whose sudo is scoped to one binary — every agent this CLI
+provisions today — is still refused, and still reports `unknown`. That difference is the
+feature working, not a shortfall: the answer is the caller's own capability, honestly stated.
+
+The refusal path is the part under test. A denied, unavailable, or truncated privileged read
+reports `unknown` — never the stored label, and never a measured `none`. Absence and denial
+stay distinguishable (DIVE-2120).
+
+`agent list` performs ONE batched privileged read for the whole fleet instead of one exec per
+row. `agent info` keeps the per-row read; it resolves a single agent. Sharing the measurement
+does not oblige sharing the call pattern: 16 agents on this host means a per-row fallback
+would write 16 auth-log rows every time anyone runs the survey, and the predictable end state
+of the noisiest writer in the audit log is that someone silences it. A batch that only half
+succeeds is discarded whole, so rows it could not cover never inherit rows it could.
+
+New harness `tests/agent_sudo_fallback_unit.sh` (44 assertions), stubbed at the single
+privileged-exec seam so it grades this code rather than the sudo policy of whoever runs it.
 
 ## Unreleased — fix(agent): `agent list` carries the measured sudo grant too, so the SURVEY surface stops reading as authoritative (DIVE-2088)
 
@@ -52,6 +81,8 @@ sit alongside a recognised grant — with the explanation left to `agent info`. 
 could not be measured from where the command ran prints `unknown` and says so in a legend;
 it never falls back to the label. Only a root caller can measure a peer, so a non-root
 caller now honestly sees `unknown` for everyone but itself. No existing field changed.
+(DIVE-2135, above, later widened that last point: a non-root caller holding real sudo can
+measure a peer through a privileged read. A caller scoped to one binary still cannot.)
 
 ## 0.16.20 — four merges that landed at 0.16.19 and could never have reached a box (2026-07-26)
 

@@ -44,6 +44,12 @@ cmd_list() {
       _active_map["$_n"]="$_as"; _enabled_map["$_n"]="$_ufs"
     fi
   fi
+  # DIVE-2135: ONE privileged read of the sudoers dir for the whole survey,
+  # before the per-agent loop. No-op (and no exec) for a root caller or a
+  # readable dir, where the per-row read already answers; on failure every row
+  # falls back to `unknown` rather than to the stored label. See
+  # sudo_grant_batch_load for why `list` batches where `info` does not.
+  sudo_grant_batch_load
   for name in $(echo "$out" | jq -r 'keys[]' 2>/dev/null); do
     local svc="5dive-agent@${name}"
     local active sub
@@ -109,10 +115,11 @@ cmd_list() {
     # weaker measurement under a friendlier name would recreate the exact defect
     # DIVE-2079 was worth shipping to remove.
     #
-    # Cost: for a NON-root caller sudo_grant_lines never spawns sudo for a peer
-    # (it can only `sudo -l` itself), so this is a file-read per agent and every
-    # peer honestly reads `unknown`. Only a root caller pays one `sudo -l -U` per
-    # agent, and only a root caller can get a real answer for a peer.
+    # Cost: a root caller pays one authoritative `sudo -l -U` per agent. A
+    # non-root caller pays a file-read per agent plus, at most, the ONE batched
+    # privileged read sudo_grant_batch_load did before this loop (DIVE-2135) —
+    # never one sudo exec per row, because the survey is the command people
+    # re-run and 16 auth-log rows per run is how an honest column gets silenced.
     # `|| true`: an unmeasurable grant is a reported `unknown`, never a failed list.
     local _sg _sg_class _sg_runas _sg_extra _sg_implied
     _sg=$(agent_sudo_grant "agent-${name}" || true)

@@ -8262,6 +8262,12 @@ cmd_list() {
       _active_map["$_n"]="$_as"; _enabled_map["$_n"]="$_ufs"
     fi
   fi
+  # DIVE-2135: ONE privileged read of the sudoers dir for the whole survey,
+  # before the per-agent loop. No-op (and no exec) for a root caller or a
+  # readable dir, where the per-row read already answers; on failure every row
+  # falls back to `unknown` rather than to the stored label. See
+  # sudo_grant_batch_load for why `list` batches where `info` does not.
+  sudo_grant_batch_load
   for name in $(echo "$out" | jq -r 'keys[]' 2>/dev/null); do
     local svc="5dive-agent@${name}"
     local active sub
@@ -8327,10 +8333,11 @@ cmd_list() {
     # weaker measurement under a friendlier name would recreate the exact defect
     # DIVE-2079 was worth shipping to remove.
     #
-    # Cost: for a NON-root caller sudo_grant_lines never spawns sudo for a peer
-    # (it can only `sudo -l` itself), so this is a file-read per agent and every
-    # peer honestly reads `unknown`. Only a root caller pays one `sudo -l -U` per
-    # agent, and only a root caller can get a real answer for a peer.
+    # Cost: a root caller pays one authoritative `sudo -l -U` per agent. A
+    # non-root caller pays a file-read per agent plus, at most, the ONE batched
+    # privileged read sudo_grant_batch_load did before this loop (DIVE-2135) —
+    # never one sudo exec per row, because the survey is the command people
+    # re-run and 16 auth-log rows per run is how an honest column gets silenced.
     # `|| true`: an unmeasurable grant is a reported `unknown`, never a failed list.
     local _sg _sg_class _sg_runas _sg_extra _sg_implied
     _sg=$(agent_sudo_grant "agent-${name}" || true)
@@ -8912,8 +8919,142 @@ sudo_grant_lines() {
   # Drop-in absent AND the directory readable => genuinely no managed grant.
   # (An UNREADABLE directory is not evidence of absence — that is `unknown`.)
   [[ -r "$d" && ! -e "${d}/${user}" ]] && return 0
-  return 1
+  # DIVE-2135: everything above is CALLER-SCOPED, and /etc/sudoers.d is 0700
+  # root, so for any realistic non-root caller every PEER fell out here as
+  # `unknown` — measured by olivia 2026-07-27 as agent-olivia AND as `claude`
+  # (the dashboard's caller). Honest, but the three-populations-render-
+  # identically problem DIVE-2079/2088 exist to solve is only un-lied-about,
+  # not solved, until the measurement can actually see a peer. Last resort: ask
+  # sudo to do the read. Fails closed to `unknown` (rc=1) by every path.
+  sudo_grant_lines_privileged "$user" "$d"
 }
+
+# --- DIVE-2135: the privileged read -----------------------------------------
+#
+# One protocol serves both readers. The dump is only trusted when it is
+# COMPLETE: it opens with an OK marker and closes with an END marker, and a
+# missing END discards the WHOLE dump. That is the absent-vs-forbidden
+# discipline (DIVE-2120) surviving batching — a read that half-succeeded must
+# never let the entries it could not cover inherit the ones it could, because
+# "no file for this user" means `none` ONLY if the whole directory was seen.
+_SUDOERS_DUMP_OK='===5DIVE-SUDOERS-DUMP-OK'
+_SUDOERS_DUMP_END='===5DIVE-SUDOERS-DUMP-END'
+_SUDOERS_DUMP_FILE='===5DIVE-SUDOERS-FILE:'
+
+# The one place a privileged read is attempted — the seam a test overrides so
+# the harness never depends on the real sudo policy of whoever runs it (that
+# caller-scoping is the defect under repair; a test that inherits it grades the
+# runner, not the code). Args are passed POSITIONALLY to sh, never interpolated
+# into the snippet, so a name can never become shell.
+#
+# NOT attempted as root: root already got an authoritative `sudo -l -U` above,
+# and re-entering sudo would only turn a settled answer into a second exec.
+sudoers_privileged_dump() {
+  local dir="$1" one="${2:-}"
+  [[ "$(id -u)" == "0" ]] && return 1
+  command -v sudo >/dev/null 2>&1 || return 1
+  sudo -n /bin/sh -c '
+    d=$1; one=$2
+    [ -d "$d" ] || exit 3
+    printf "%s\n" "'"$_SUDOERS_DUMP_OK"'"
+    if [ -n "$one" ]; then
+      if [ -f "$d/$one" ]; then
+        printf "%s%s\n" "'"$_SUDOERS_DUMP_FILE"'" "$one"
+        cat "$d/$one" || exit 4
+      fi
+    else
+      for f in "$d"/*; do
+        [ -f "$f" ] || continue
+        printf "%s%s\n" "'"$_SUDOERS_DUMP_FILE"'" "${f##*/}"
+        cat "$f" || exit 4
+      done
+    fi
+    printf "%s\n" "'"$_SUDOERS_DUMP_END"'"
+  ' sh "$dir" "$one" 2>/dev/null
+}
+
+# rc=0 only for a dump that is well-formed AND complete.
+_sudoers_dump_valid() {
+  [[ "$1" == "$_SUDOERS_DUMP_OK"* ]] || return 1
+  [[ "$1" == *"$_SUDOERS_DUMP_END" ]] || return 1
+  return 0
+}
+
+# Per-user privileged read — the `agent info` path, which resolves ONE agent and
+# so pays the exec once. Echoes the drop-in (empty output = the directory was
+# fully seen and holds no file for this user, i.e. a real `none`); rc=1 when the
+# read was denied or unavailable, which the caller renders as `unknown`.
+sudo_grant_lines_privileged() {
+  local user="$1" d="$2" dump=""
+  # A batch already loaded by `agent list` answers without another exec.
+  if [[ "${_SUDOERS_BATCH_STATE:-}" == "ok" ]]; then
+    printf '%s' "${_SUDOERS_BATCH[$user]:-}"
+    return 0
+  fi
+  [[ "${_SUDOERS_BATCH_STATE:-}" == "failed" ]] && return 1
+  dump=$(sudoers_privileged_dump "$d" "$user") || return 1
+  _sudoers_dump_valid "$dump" || return 1
+  _sudoers_dump_extract "$dump" "$user"
+  return 0
+}
+
+# Echo one user's lines out of a validated dump. No output is a legitimate
+# answer here (`none`), which is why validity is decided by the caller BEFORE
+# this runs and never inferred from emptiness.
+_sudoers_dump_extract() {
+  local dump="$1" want="$2" line cur="" out=""
+  while IFS= read -r line; do
+    case "$line" in
+      "$_SUDOERS_DUMP_FILE"*) cur="${line#"$_SUDOERS_DUMP_FILE"}"; continue ;;
+      "$_SUDOERS_DUMP_OK"|"$_SUDOERS_DUMP_END") continue ;;
+    esac
+    [[ "$cur" == "$want" ]] && out+="$line"$'\n'
+  done <<<"$dump"
+  printf '%s' "$out"
+}
+
+# Batched privileged read for the SURVEY reader (`agent list`).
+#
+# WHY list batches and info does not — expect this question, it is not an
+# inconsistency to tidy away: sharing the MEASUREMENT (`sudo_grant_lines` stays
+# the one instrument for both readers — that is the whole point of DIVE-2088, and
+# a second cheaper measurement under a friendlier name is the defect DIVE-2079
+# removed) does not oblige sharing the CALL PATTERN. `info` resolves one agent
+# and pays one exec; `list` resolves the fleet — 16 agents on this host today —
+# so a per-row fallback would write 16 auth-log rows EVERY TIME anyone runs the
+# survey. The cost that bites is not latency, it is making the honest-fleet-
+# survey feature the noisiest writer in the audit log, whose predictable end
+# state is someone silencing it and taking the honesty with it.
+#
+# Idempotent per process; `_SUDOERS_BATCH_STATE=failed` is remembered so a
+# denied dir is not re-probed once per row.
+sudo_grant_batch_load() {
+  local d="${SUDOERS_D:-/etc/sudoers.d}" dump="" line cur=""
+  [[ -n "${_SUDOERS_BATCH_STATE:-}" ]] && return 0
+  declare -gA _SUDOERS_BATCH=()
+  # Nothing to gain where the plain read already works (a readable dir — which
+  # includes every root caller, whose per-row `sudo -l -U` is authoritative and
+  # never reaches the fallback): keep those on the per-row path untouched. The
+  # test is the DIRECTORY's readability, not who the caller is, so a harness
+  # grades this code rather than the sudo policy of whoever ran it.
+  if [[ -r "$d" ]]; then _SUDOERS_BATCH_STATE="skip"; return 0; fi
+  if ! dump=$(sudoers_privileged_dump "$d") || ! _sudoers_dump_valid "$dump"; then
+    # Denied, unavailable, or truncated => EVERY row reports `unknown`. Never
+    # the stored label, never a measured `none`.
+    _SUDOERS_BATCH_STATE="failed"; return 0
+  fi
+  while IFS= read -r line; do
+    case "$line" in
+      "$_SUDOERS_DUMP_FILE"*) cur="${line#"$_SUDOERS_DUMP_FILE"}"; _SUDOERS_BATCH[$cur]=""; continue ;;
+      "$_SUDOERS_DUMP_OK"|"$_SUDOERS_DUMP_END") continue ;;
+    esac
+    [[ -n "$cur" ]] && _SUDOERS_BATCH[$cur]+="$line"$'\n'
+  done <<<"$dump"
+  _SUDOERS_BATCH_STATE="ok"
+}
+
+# Test seam / long-lived-process hygiene: forget a loaded batch.
+sudo_grant_batch_reset() { unset _SUDOERS_BATCH_STATE; declare -gA _SUDOERS_BATCH=(); }
 
 # Classify grant lines read from stdin. Echoes `class|runas|extra`:
 #   class  one of the classes documented above (never `unknown` — the caller
