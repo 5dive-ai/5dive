@@ -95,8 +95,21 @@ cmd_self_restart() {
 }
 
 cmd_rm() {
-  local name="${1:-}"
-  [[ -n "$name" ]] || fail "$E_USAGE" "usage: 5dive agent rm <name>"
+  local name="" purge_home=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      # DIVE-2138: opt IN to deleting the home. The default quarantines it,
+      # because deleting an agent's home is irreversible and teardown is not
+      # where that call belongs; --purge-home is for the operator who has
+      # already decided (reclaiming disk on a full box, throwaway test agents).
+      --purge-home) purge_home=1 ;;
+      --yes|-y)     ;;   # accepted + ignored: scripts and docs already pass it
+      -*)           fail "$E_USAGE" "unknown flag '$1' — usage: 5dive agent rm <name> [--purge-home]" ;;
+      *)            [[ -z "$name" ]] && name="$1" || fail "$E_USAGE" "usage: 5dive agent rm <name> [--purge-home]" ;;
+    esac
+    shift
+  done
+  [[ -n "$name" ]] || fail "$E_USAGE" "usage: 5dive agent rm <name> [--purge-home]"
   ensure_state
   local reg
   reg=$(registry_read)
@@ -115,7 +128,10 @@ cmd_rm() {
   remove_channel_secret telegram "$name"
   remove_channel_secret discord  "$name"
   step "Deleting user agent-${name}"
-  delete_agent_user "$name"
+  # DIVE-2138: also disposes of /home/agent-<name> (quarantine by default,
+  # delete under --purge-home) and reports which via _RM_HOME_DISPOSITION.
+  _RM_HOME_DISPOSITION="absent"
+  delete_agent_user "$name" "$purge_home"
   step "Updating registry"
   jq --arg n "$name" 'del(.agents[$n])' <<<"$reg" | registry_write
   # DIVE-1609: cascade the org-chart placement. The agents_org DELETE used to
@@ -129,8 +145,18 @@ cmd_rm() {
   # and re-seed from another agent of the same type if one remains. Best-
   # effort — never fails the remove.
   [[ -n "$rm_profile" ]] && paperclip_unseed_for_profile "$rm_profile" 2>/dev/null || true
+  # DIVE-2138: the home disposition is part of the receipt. A remove that could
+  # not move the home aside left a credential-bearing directory on disk for the
+  # next uid to inherit; that has to be visible to a JSON consumer, not only in
+  # the warn() a scripted caller never reads.
+  local _home_state="${_RM_HOME_DISPOSITION:-absent}" _home_path=""
+  if [[ "$_home_state" == quarantined:* ]]; then
+    _home_path="${_home_state#quarantined:}"
+    _home_state="quarantined"
+  fi
   ok "agent '$name' removed." \
-     '{name:$n, removed:true}' --arg n "$name"
+     '{name:$n, removed:true, home:({disposition:$hs} + (if $hp == "" then {} else {path:$hp} end))}' \
+     --arg n "$name" --arg hs "$_home_state" --arg hp "$_home_path"
 }
 
 # DIVE-345: move a path aside as <path>.disabled-<ts> (reversible) if present.

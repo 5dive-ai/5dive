@@ -549,19 +549,125 @@ write_standard_sudoers() {
   fi
 }
 
+# DIVE-2138 (gh#222, A-MO7SEN): where agent homes live, and where a removed
+# agent's home goes. Quarantine, not delete — an agent home can hold work the
+# operator still wants, and teardown is not the moment to make that call
+# irreversibly. Root-owned 0700 so a RECYCLED uid cannot read what it inherits
+# the number of. AGENT_HOME_ROOT is the same STATE_DIR-style override the rest
+# of the CLI uses; it is what lets the rootless unit harness drive these paths.
+AGENT_HOME_ROOT="${AGENT_HOME_ROOT:-/home}"
+REAPED_DIR="${REAPED_DIR:-${AGENT_HOME_ROOT}/.5dive-reaped}"
+
+# DIVE-2138: move a removed agent's home into the reaped area.
+#
+# `deluser` here runs WITHOUT --remove-home (deliberately, see delete_agent_user),
+# so /home/agent-<name> outlived the user — and `adduser` RECYCLES freed uids.
+# The next agent created therefore took the dead agent's uid and with it
+# ownership of the dead agent's home, auth.json / credentials.toml / channel
+# .env files included. Not a privilege escalation, but no operator expects
+# `agent rm` to leave that behind. Moving the home aside is what actually
+# closes it: after this, the recycled uid inherits a number and nothing else.
+#
+# Sets _RM_HOME_DISPOSITION for the caller's JSON/receipt. Best-effort: a
+# failure here is LOUD (it is the security-relevant half) but never fails the
+# remove, which has already torn down the unit and the secrets.
+quarantine_agent_home() {
+  local name="$1" home="$2" purge="${3:-0}"
+  _RM_HOME_DISPOSITION="absent"
+  [[ -n "$home" && -d "$home" ]] || return 0
+  # Hard guard. `home` comes from getent, i.e. from a file this code does not
+  # own, and everything below is a recursive chown or an rm -rf. Act ONLY on
+  # the exact conventional path for THIS agent; anything else (a custom
+  # --home, /home/claude, /, a symlink target) is reported and left alone.
+  if [[ "$home" != "${AGENT_HOME_ROOT}/agent-${name}" || -L "$home" ]]; then
+    _RM_HOME_DISPOSITION="left-in-place"
+    warn "home for agent '${name}' is '${home}', not the expected ${AGENT_HOME_ROOT}/agent-${name} — leaving it untouched. Check it by hand: a home left on disk can be inherited by a later agent that recycles this uid (DIVE-2138)."
+    return 0
+  fi
+  if [[ "$purge" == "1" ]]; then
+    if rm -rf -- "$home" 2>/dev/null; then
+      _RM_HOME_DISPOSITION="purged"
+      step "purged home ${home} (--purge-home)"
+    else
+      _RM_HOME_DISPOSITION="failed"
+      warn "could not purge ${home} — it stays on disk and a later agent recycling this uid would inherit it. Remove it by hand: sudo rm -rf ${home}"
+    fi
+    return 0
+  fi
+  local ts dest
+  ts=$(date +%Y%m%d%H%M%S)
+  dest="${REAPED_DIR}/${name}-${ts}"
+  if ! mkdir -p "$REAPED_DIR" 2>/dev/null; then
+    _RM_HOME_DISPOSITION="failed"
+    warn "could not create ${REAPED_DIR} — ${home} stays on disk and a later agent recycling this uid would inherit it (DIVE-2138). Move it aside by hand."
+    return 0
+  fi
+  chown root:root "$REAPED_DIR" 2>/dev/null || true
+  chmod 0700 "$REAPED_DIR" 2>/dev/null || true
+  if mv -- "$home" "$dest" 2>/dev/null; then
+    # Order matters: chown BEFORE chmod is fine either way here because the
+    # destination is already inside a 0700 root-only directory, so nothing
+    # unprivileged can traverse into it at any point in between.
+    chown -R root:root "$dest" 2>/dev/null || true
+    chmod 0700 "$dest" 2>/dev/null || true
+    _RM_HOME_DISPOSITION="quarantined:${dest}"
+    step "quarantined home ${home} -> ${dest} (root-only 0700; delete when you are sure)"
+  else
+    _RM_HOME_DISPOSITION="failed"
+    warn "could not move ${home} aside — it stays on disk and a later agent recycling this uid would inherit it, credentials included (DIVE-2138). Move it by hand: sudo mv ${home} ${dest}"
+  fi
+}
+
 delete_agent_user() {
-  local name="$1"
+  local name="$1" purge_home="${2:-0}"
   local user="agent-${name}"
+  _RM_HOME_DISPOSITION="absent"
   id -u "$user" &>/dev/null || return 0
+  # DIVE-2138: resolve the home from passwd BEFORE deluser, while the name
+  # still resolves — afterwards there is no record of where it was.
+  local home
+  home=$(getent passwd "$user" | cut -d: -f6)
+  [[ -n "$home" ]] || home="${AGENT_HOME_ROOT}/agent-${name}"
   # DIVE-1033: drop any traverse ACL we granted a sandboxed agent on
   # /home/claude BEFORE deluser, while the name still resolves — afterwards the
   # entry would linger as a bare numeric uid. No-op (harmless) for admin/standard.
   setfacl -x "u:${user}" /home/claude 2>/dev/null || true
-  # deluser removes the home dir; skip --remove-home to keep any per-agent
-  # state the user may have in their $HOME. Home is minimal anyway since
-  # configs live under /home/claude.
+  # Skip --remove-home: DIVE-2138 quarantines the home below instead, so the
+  # operator keeps whatever was in it while a recycled uid inherits nothing.
   deluser --quiet "$user" 2>/dev/null || true
   rm -f "/etc/sudoers.d/${user}"
+  quarantine_agent_home "$name" "$home" "$purge_home"
+}
+
+# DIVE-2138 (gh#222, A-MO7SEN): refuse a create whose home dir is a leftover.
+#
+# The reported failure was NOT the warning — it was WHERE the warning landed.
+# `adduser` only warns on an existing home ("Not touching this directory"), so
+# create sailed on, registered the agent in agents.json AND attached it to the
+# team bot, and only THEN died on the first write into a directory it did not
+# own. That left a half-created agent in the registry. Checked here, up front,
+# before any mutation, the same box state is a clean refusal.
+#
+# Returns 0 (silent) for the two legitimate shapes: no home at all, and a home
+# already owned by the user we are about to (re-)provision.
+agent_home_conflict_check() {
+  local name="$1"
+  # Separate lines: a same-`local` ${name} is not yet assigned, which under
+  # `set -u` aborts the whole CLI rather than merely reading empty.
+  local user="agent-${name}"
+  local home="${AGENT_HOME_ROOT}/agent-${name}"
+  [[ -e "$home" ]] || return 0
+  local owner_u owner_n
+  owner_u=$(stat -c '%u' "$home" 2>/dev/null) || return 0
+  owner_n=$(stat -c '%U' "$home" 2>/dev/null || echo "$owner_u")
+  # Existing user that already owns it => ordinary re-provision, not a leftover.
+  if id -u "$user" &>/dev/null && [[ "$owner_u" == "$(id -u "$user")" ]]; then
+    return 0
+  fi
+  # Name the uid explicitly: the whole failure mode is uid recycling, and on the
+  # reported box the owner did not resolve to a name at all (uid 1006, no such
+  # user) — a report that only prints a name says nothing in exactly that case.
+  fail "$E_CONFLICT" "${home} already exists, owned by ${owner_n} (uid ${owner_u}) — not by the agent-${name} user this create would make. That is a leftover home from a previously removed agent, and uids get recycled, so continuing would hand the new agent someone else's home and any credentials left in it (DIVE-2138). Move it aside first: sudo mv ${home} ${REAPED_DIR}/${name}-\$(date +%Y%m%d%H%M%S)"
 }
 
 # DIVE-499: accepted autonomy modes. 'son-of-anton' is a yolo synonym (a Silicon
@@ -1395,6 +1501,11 @@ cmd_create() {
   if jq -e --arg n "$name" '.agents[$n] != null' <<<"$reg" >/dev/null; then
     fail "$E_CONFLICT" "agent '$name' already exists"
   fi
+  # DIVE-2138: and refuse a stale home BEFORE any mutation. Deliberately placed
+  # next to the name-conflict check rather than next to create_agent_user (~350
+  # lines further down, after the team-bot attach and the registry write) — the
+  # reported bug is that this failure used to happen there.
+  agent_home_conflict_check "$name"
 
   # Install-on-demand: if the requested CLI isn't on disk, try the recipe.
   if [[ ! -x "${TYPE_BIN[$type]}" ]]; then
