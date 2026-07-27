@@ -34,6 +34,46 @@ source "$SRC/cmd_agent.sh"   # DIVE-2098: cmd_info owns the --json projection
 
 set +e   # header.sh enabled `set -e`; this harness asserts on values, not exits
 
+# --- DIVE-2135: stub the privileged-read seam -------------------------------
+# WHY THIS EXISTS. DIVE-2135 gave sudo_grant_lines a last-resort `sudo -n` read,
+# so "this directory is unreadable" stopped being a property of the FIXTURE and
+# became a property of the RUNNER: a caller who can escalate reads the fixture's
+# 0000 dir anyway, finds no drop-in, and honestly reports `none`. Measured on one
+# commit, same host, clean extractions, only the caller differing:
+#   as a cli-scoped agent  -> 37 passed / 0 failed
+#   as a full-sudo account -> 30 passed / 7 failed
+# The assertions were sound when written and became UNDERSPECIFIED, not wrong:
+# they ask "is the dir unreadable" AND "is the caller unable to escalate", and
+# only the first is about this code. So the harness now drives the seam itself
+# and the runner's own sudo policy never enters the answer.
+#
+# `granted` deliberately reads the REAL fixture (bypassing the mode the way a
+# privileged reader does) rather than inventing content, so a granted read still
+# proves the parse, not just the branch.
+PRIV_MODE=denied
+install_priv_stub() {
+  sudoers_privileged_dump() {
+    local dir="$1" one="${2:-}" f _m
+    [[ "$PRIV_MODE" == "granted" ]] || return 1
+    _m=$(stat -c %a "$dir" 2>/dev/null) || return 1
+    chmod u+rx "$dir" 2>/dev/null
+    printf '%s\n' "$_SUDOERS_DUMP_OK"
+    if [[ -n "$one" ]]; then
+      if [[ -f "$dir/$one" ]]; then
+        printf '%s%s\n' "$_SUDOERS_DUMP_FILE" "$one"; cat "$dir/$one"
+      fi
+    else
+      for f in "$dir"/*; do
+        [[ -f "$f" ]] || continue
+        printf '%s%s\n' "$_SUDOERS_DUMP_FILE" "${f##*/}"; cat "$f"
+      done
+    fi
+    printf '%s\n' "$_SUDOERS_DUMP_END"
+    chmod "$_m" "$dir" 2>/dev/null
+  }
+}
+install_priv_stub
+
 PASS=0; FAIL=0
 ok()   { PASS=$((PASS+1)); printf '  ok   %s\n' "$1"; }
 bad()  { FAIL=$((FAIL+1)); printf '  FAIL %s\n     want: %s\n     got:  %s\n' "$1" "$2" "$3"; }
@@ -147,9 +187,40 @@ is "absent drop-in, readable dir -> none" \
 # root, which can read anything and so cannot produce this case.
 if [[ "$(id -u)" != "0" ]]; then
   NOREAD="$TMP/noread"; mkdir -p "$NOREAD"; chmod 000 "$NOREAD"
-  is "unreadable dir -> unknown, NOT none" \
+  NOREAD_FULL="$TMP/noread-full"; mkdir -p "$NOREAD_FULL"
+  printf '%s\n' "$admin_now" > "$NOREAD_FULL/agent-modern"; chmod 000 "$NOREAD_FULL"
+
+  # ARM 1 — the privileged read is DENIED. Nothing could see the directory, so
+  # absence of evidence stays `unknown`. This is the original assertion, with
+  # the term that used to be implicit now stated.
+  PRIV_MODE=denied
+  is "unreadable dir + privileged read DENIED -> unknown, NOT none" \
      "$(SUDOERS_D="$NOREAD" agent_sudo_grant agent-modern)" "unknown|-|0"
-  chmod 755 "$NOREAD"
+
+  # ARM 2 — the privileged read is GRANTED and the dump is COMPLETE, so the
+  # whole directory really was seen and holds no drop-in. `none` here is a
+  # measurement, not a guess, and reporting `unknown` would now be the lie.
+  PRIV_MODE=granted
+  is "unreadable dir + GRANTED complete dump, no drop-in -> none" \
+     "$(SUDOERS_D="$NOREAD" agent_sudo_grant agent-modern)" "none|-|0"
+
+  # ARM 3 — granted must not be a synonym for `none`. Same escalation, same
+  # unreadable dir, but the drop-in IS there: the real class must come back, or
+  # arm 2 would pass just as well against a fallback that returns nothing.
+  is "unreadable dir + GRANTED, drop-in present -> the measured class" \
+     "$(SUDOERS_D="$NOREAD_FULL" agent_sudo_grant agent-modern)" "cli-root|root|0"
+
+  # ARM 4 — a TRUNCATED dump (no END marker) is not a partial answer, it is no
+  # answer: absent-vs-forbidden must survive a read that half-succeeded.
+  sudoers_privileged_dump() { printf '%s\n' "$_SUDOERS_DUMP_OK"; }
+  is "unreadable dir + TRUNCATED dump -> unknown, NOT none" \
+     "$(SUDOERS_D="$NOREAD_FULL" agent_sudo_grant agent-modern)" "unknown|-|0"
+  install_priv_stub    # restore the seam. Do NOT wrap the above in a subshell:
+                       # `is` increments PASS/FAIL and a subshell discards both,
+                       # so the assertion would report nothing and never fail.
+
+  PRIV_MODE=denied
+  chmod 755 "$NOREAD" "$NOREAD_FULL"
 else
   printf '  skip unreadable-dir case (running as root)\n'
 fi
@@ -242,6 +313,16 @@ is "measured control: impliedIsolation=admin (a real class)" \
 # ---------------------------------------------------------------------------
 echo "5b. mutation grade — reverting each guard must restore the defect"
 
+# PRECONDITION. The whole grade below is conditional on the baseline really
+# being UNMEASURED. Under a privileged runner with an unstubbed seam it silently
+# was not: control (B) failed, and control (A) kept PASSING for the wrong reason
+# (a measured `none` implies "sandboxed", a string, which is all (A) checked).
+# A control that has stopped grading must say so rather than report a number.
+if [[ "$(jq -r '.grant' <<<"$UNMEAS")" != "unknown" ]]; then
+  bad "mutation grade PRECONDITION: baseline is unmeasured" \
+      "grant=unknown before mutating" "$(jq -r '.grant' <<<"$UNMEAS")"
+fi
+
 MUT="$TMP/mutant"; mkdir -p "$MUT"
 
 # (A) revert ONLY the jq guard. The helper still refuses to invent a class, so
@@ -250,7 +331,7 @@ MUT="$TMP/mutant"; mkdir -p "$MUT"
 sed 's/impliedIsolation: (if $grantClass == "unknown" then null else $grantImplied end),/impliedIsolation: $grantImplied,/' \
   "$SRC/cmd_agent.sh" > "$MUT/cmd_agent.sh"
 if grep -q 'impliedIsolation: \$grantImplied,' "$MUT/cmd_agent.sh"; then
-  MUT_A="$( set +u; source "$MUT/cmd_agent.sh"; info_unmeasured )"
+  MUT_A="$( set +u; source "$MUT/cmd_agent.sh"; install_priv_stub; info_unmeasured )"
   is "(A) jq guard reverted -> impliedIsolation stops being null" \
      "$(jq -r '.impliedIsolation | type' <<<"$MUT_A")" "string"
 else
@@ -264,7 +345,7 @@ fi
 sed "s/^    custom)   printf 'custom.*$/    NEVERMATCH) : ;;/; s/^    \*)        printf 'unknown.*$/    *)        printf 'custom\\\\n' ;;/" \
   "$SRC/cmd_agent_create.sh" > "$MUT/cmd_agent_create.sh"
 if grep -q "^    \*)        printf 'custom" "$MUT/cmd_agent_create.sh"; then
-  MUT_B="$( set +u; source "$MUT/cmd_agent_create.sh"; source "$MUT/cmd_agent.sh"; info_unmeasured )"
+  MUT_B="$( set +u; source "$MUT/cmd_agent_create.sh"; source "$MUT/cmd_agent.sh"; install_priv_stub; info_unmeasured )"
   is "(B) both guards reverted -> the shipped defect returns (custom)" \
      "$(jq -r '.impliedIsolation' <<<"$MUT_B")" "custom"
   # and the helper alone, which is what section 2 pins
