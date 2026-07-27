@@ -132,6 +132,21 @@ Repo: lodar/5dive-frontend"
 slug_case 'a `Repo:` line given as a URL still declares' \
   'lodar/5dive-api' '' 'Repo: https://github.com/lodar/5dive-api'
 
+# --- 1b. the precondition the superset claim rests on ------------------------
+# "deleting inference cannot lose coverage" is true because the fallback sweep covers
+# EVERY known repo — and "known" is `_gate_repo_slugs`, i.e. FIVE_GATE_REPOS when it is
+# exported. This suite exports it (so it never follows a host's config), which would
+# leave the claim resting on an env var the suite itself set. Assert the DEFAULT with
+# the variable cleared, so the claim is pinned rather than assumed. A box that exports
+# a narrower list narrows the sweep with it; that is a config choice, stated here.
+want_default='5dive-ai/5dive
+lodar/5dive-api
+lodar/5dive-frontend'
+got_default=$(FIVE_GATE_REPOS='' _gate_repo_slugs)
+[[ "$got_default" == "$want_default" ]] \
+  && ok_t 'with FIVE_GATE_REPOS unset the sweep really is all three repos (the superset precondition)' \
+  || bad_t 'default repo set changed' "want [$want_default] got [$got_default]"
+
 # --- 2. THE NARROWING IS GONE ------------------------------------------------
 # #10 exists ONLY in lodar/5dive-api, and it is OPEN. The body quotes the CLI URL.
 # Before: bound to 5dive-ai/5dive, no #10 there, "resolve to no PR in any known

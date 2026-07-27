@@ -1313,6 +1313,15 @@ _gate_slug_from_url() {
 # the inference misses" — that leaves the dangerous half untouched. Same rule DIVE-1965
 # settled one layer up: a binding comes from a STRUCTURED, INTENTIONAL signal, never
 # from "a URL appeared in the text". Prose is evidence of discussion, not declaration.
+#
+# The superset is over the CONFIGURED repo set, not over all of GitHub (Marcus, review):
+# `_gate_repo_slugs` is the world, and it is `FIVE_GATE_REPOS` when that is exported.
+# Unset — the default on every box — it is the three real repos, which is what makes the
+# claim hold in practice, and tests/task_merge_gate_inferred_repo_unit.sh pins that
+# default with the env cleared rather than leaving it asserted in prose. A box that
+# exports a NARROWER list narrows the sweep too, and there the deleted inference could
+# have named a repo outside the configured world — but a binding that reaches outside
+# the set the operator configured is its own defect, not coverage worth keeping.
 _gate_task_repo_slug() {
   local dref="$1" body="$2" s=""
   if [[ -n "$dref" ]]; then
