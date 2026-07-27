@@ -1,5 +1,25 @@
 # Changelog
 
+## Unreleased — feat(comms): the terse rule now bounds HOW OFTEN you send, and covers agent-to-agent (DIVE-2191)
+
+DIVE-1613 ships a terse-comms fragment into every claude agent at create. Measured against one
+day of main's own traffic, it has two holes. It governs SHAPE, not VOLUME — main followed all six
+shape rules 94 times in a day. And it is scoped to human chat, while agent-to-agent was 84
+messages / 32,823 words: 2.2x the word volume of Telegram, on a channel with no rule at all. Every
+a2a word is output tokens for the sender AND input tokens for the receiving model, so it is the
+larger bill by more than 2.2x — and it is the bill the customer pays.
+
+- **A send gate for human chat.** A NEW message — the one that pushes to their phone — is for
+  finished / blocked-on-them / your own error. Everything else edits the message already on screen
+  or goes to the task board. Work-in-progress is not a message. Phrased to compose with the
+  telegram fragment's edit-for-progress rule rather than contradict it.
+- **A fixed a2a shape:** RESULT / EVIDENCE / BLOCKER / NEXT, empty fields dropped. Fixed fields
+  cannot ramble and the receiving model can parse them. Today's internal messages were 390-word
+  essays carrying maybe 60 words of decision.
+- **The verification rails are untouched, and now explicitly carved out**: this cuts the narration,
+  not the checking. Sending work to another agent to verify, and answering as the verifier, is the
+  work — the fragment says so in the same breath, so no agent reads "send less" as "verify less".
+
 ## Unreleased — feat(task): the tier-2 floor says WHY it fired, and a design decision can appeal it on the record instead of by rewording (DIVE-2089)
 
 The T2 category floor reads SUBJECT MATTER as risk and picks the gate's audience from it. dev3
