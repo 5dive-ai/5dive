@@ -1289,11 +1289,39 @@ _gate_slug_from_url() {
     | head -1 | sed -E 's#^(https://github\.com/|git@github\.com:)##; s#\.git$##' || true
 }
 
-# _gate_task_repo_slug <delivery_ref> <body> — the repo THIS TASK declared, or empty.
+# _gate_task_repo_slug <delivery_ref> <body> — the repo THIS TASK DECLARED, or empty.
 # Precedence: the delivery_ref URL (a delivered PR carries its own repo, which is why
 # ask 1 says prefer it) > an explicit `Repo: owner/repo` body line, the sibling of the
-# DIVE-1462 `Branch:` line > any github URL sitting in the body. Empty means unknown,
-# and unknown must stay unknown — it is never quietly filled in with a default.
+# DIVE-1462 `Branch:` line. Empty means unknown, and unknown must stay unknown — it is
+# never quietly filled in with a default.
+#
+# DIVE-1963: there was a THIRD fallback — any github URL sitting anywhere in the body —
+# and it read a URL that happened to be MENTIONED as a declaration of where this task's
+# work lives. DIVE-1955's own close is the specimen: its body QUOTES the constant it is
+# about (`_PUSH_DEFAULT_REPO="https://github.com/5dive-ai/5dive.git"`), so the gate
+# bound every bare `#N` to the CLI repo and never looked in api or frontend at all. The
+# ticket describing an implicit repo standing in for a missing one triggered a narrower
+# version of itself, sourced from prose instead of from a constant.
+#
+# Deleting it CANNOT lose coverage, which is why this is a deletion and not a widening:
+# with no declared repo a bare `#N` goes through the DIVE-1955 existence-count sweep,
+# which searches EVERY known repo — strictly a superset of the single repo the
+# inference picked. What it does delete is the sharper half. "The inferred repo misses"
+# is only one of the two cases; when the inferred repo HAS a `#N`, the old path handed
+# back a confident verdict about a pull request nobody claimed, which is the
+# "wrong, not blind" failure DIVE-1955 exists to remove. So the fix is NOT "sweep when
+# the inference misses" — that leaves the dangerous half untouched. Same rule DIVE-1965
+# settled one layer up: a binding comes from a STRUCTURED, INTENTIONAL signal, never
+# from "a URL appeared in the text". Prose is evidence of discussion, not declaration.
+#
+# The superset is over the CONFIGURED repo set, not over all of GitHub (Marcus, review):
+# `_gate_repo_slugs` is the world, and it is `FIVE_GATE_REPOS` when that is exported.
+# Unset — the default on every box — it is the three real repos, which is what makes the
+# claim hold in practice, and tests/task_merge_gate_inferred_repo_unit.sh pins that
+# default with the env cleared rather than leaving it asserted in prose. A box that
+# exports a NARROWER list narrows the sweep too, and there the deleted inference could
+# have named a repo outside the configured world — but a binding that reaches outside
+# the set the operator configured is its own defect, not coverage worth keeping.
 _gate_task_repo_slug() {
   local dref="$1" body="$2" s=""
   if [[ -n "$dref" ]]; then
@@ -1307,7 +1335,35 @@ _gate_task_repo_slug() {
     [[ -z "$s" && "$line" =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$ ]] && s="${line%.git}"
     [[ -n "$s" ]] && { printf '%s' "$s"; return 0; }
   fi
-  _gate_slug_from_url "$body"
+  return 0
+}
+
+# _gate_bind_slug <qualified-ref> <task_slug> — the ONE repo a ref binds to, or EMPTY
+# for "nothing binds it, sweep every known repo". Precedence: the repo the ref carries
+# itself (a pull URL) > the repo the TASK declared > unbound.
+#
+# DIVE-1963 (Marcus, review): the resolver and the message reporting its scope used to
+# derive this INDEPENDENTLY, and the original comment claimed they "cannot drift". They
+# agreed, but that is parallel derivation — two copies that happen to match today, which
+# buys "does not currently drift". Cannot-drift is what a shared definition buys, so
+# here it is: one function, two callers, and the sentence the reader gets is computed
+# from the same answer the lookup used. Same shape as the DIVE-1932 lesson — a rule that
+# holds because of the shape of the code, rather than because something declares it, is
+# preserved by nothing.
+_gate_bind_slug() {
+  local rslug="${1%%|*}"
+  [[ -z "$rslug" && -n "$2" ]] && rslug="$2"
+  printf '%s' "$rslug"
+}
+
+# _gate_search_scope <qualified-ref> <task_slug> — the repo(s) a ref is ACTUALLY looked
+# up in, comma-joined. DIVE-1963: the unresolvable warning said "in any known repo"
+# after searching exactly ONE, so the message asserted a sweep that never happened, and
+# a warning that misstates its own scope is the defect class this arc exists to delete.
+_gate_search_scope() {
+  local rslug; rslug=$(_gate_bind_slug "$1" "$2")
+  if [[ -n "$rslug" ]]; then printf '%s' "$rslug"
+  else _gate_repo_slugs | paste -sd, -; fi
 }
 
 # _gate_pr_probe <n> <tok> <slug> <ident> — one bounded read-only lookup of PR #n in
@@ -1349,8 +1405,10 @@ _gate_pr_probe() {
 # than admitting we do not know which pull request the maker meant.
 _gate_resolve_qualified() {
   local qref="$1" tok="$2" ident="$3" task_slug="$4"
-  local rslug="${qref%%|*}" n="${qref#*|}"
-  [[ -z "$rslug" && -n "$task_slug" ]] && rslug="$task_slug"
+  local n="${qref#*|}" rslug
+  # DIVE-1963: shared with `_gate_search_scope`, so the repo we look in and the repo the
+  # warning NAMES are one answer, not two derivations that agree.
+  rslug=$(_gate_bind_slug "$qref" "$task_slug")
   if [[ -n "$rslug" ]]; then
     local st; st=$(_gate_pr_state "$n" "$tok" "$rslug")
     [[ -n "$st" ]] && printf '%s|%s' "$rslug" "$st"
@@ -1986,12 +2044,16 @@ $_body"
           AMBIGUOUS\|*)          _txt_amb="${_txt_amb:+$_txt_amb; }#${_qref#*|} in ${_st//,/, }" ;;
           *\|OPEN\|*)            _txt_open="${_qref#*|}"; _txt_open_slug="$_rslug"; break ;;
           *\|MERGED\|*\|FAILURE) _txt_red="${_txt_red:+$_txt_red,}${_rslug}#${_qref#*|}" ;;
-          \|)                    _txt_unres="${_txt_unres:+$_txt_unres,}${_qref#*|}" ;;
+          \|)                    _txt_unres="${_txt_unres:+$_txt_unres; }#${_qref#*|} in $(_gate_search_scope "$_qref" "$_task_slug")" ;;
         esac
       done < <(_gate_pr_refs_qualified_from_text "$_txt")
       if [[ -n "$_txt_unres" ]]; then
-        warn "$ident: could not resolve PR reference(s) #${_txt_unres//,/, #} named in the result/body in any known repo ($(_gate_repo_slugs | paste -sd, -)) — merge state UNVERIFIED for those. Cite the full pull URL, or add a \`Repo: <owner>/<repo>\` line, to have them checked."
-        _mg_unverified="${_mg_unverified:+$_mg_unverified; }PR reference(s) #${_txt_unres//,/, #} resolve to no PR in any known repo"
+        # DIVE-1963: name the repo(s) ACTUALLY searched, per ref. A ref carrying its own
+        # pull URL is looked up there and nowhere else; a bare #N in a task that declares
+        # a repo is looked up there and nowhere else; only a bare #N with no declaration
+        # gets the full sweep. One sentence covered all three and was false for two.
+        warn "$ident: could not resolve PR reference(s) named in the result/body — $_txt_unres — merge state UNVERIFIED for those. Cite the full pull URL, or add a \`Repo: <owner>/<repo>\` line, to have them checked."
+        _mg_unverified="${_mg_unverified:+$_mg_unverified; }PR reference(s) resolve to no PR in the repo(s) searched — $_txt_unres"
       fi
       if [[ -n "$_txt_amb" ]]; then
         warn "$ident: AMBIGUOUS PR reference(s) — $_txt_amb. A bare number does not identify a pull request across our repos and this task declares none, so the merge state is UNVERIFIED rather than guessed (DIVE-1955). Cite the full pull URL or add a \`Repo: <owner>/<repo>\` line to the body."
@@ -2298,7 +2360,7 @@ cmd_task_merge_audit() {
   done <<<"$rows"
   local payload; payload=$(printf '%s' "$json_rows" | jq -sc '.')
   if [[ "${JSON_MODE:-0}" != "1" ]] && (( unver + amb > 0 )); then
-    printf 'note: `unverified` = the number resolves to no PR in any known repo (%s).\n      `ambiguous` = a bare "PR #N" that exists in more than one of them and the task\n      declares no repo, so no single verdict is defensible. NEITHER is evidence of an\n      unmerged PR, and neither is evidence of a clean one. Cite the full pull URL, or\n      add a `Repo: <owner>/<repo>` line to the task body, to have them resolved.\n' "$slugs"
+    printf 'note: `unverified` = the number resolves to no PR in the repo(s) searched FOR THAT\n      TASK — the one its own record DECLARES (a delivery_ref URL or a `Repo:` line) when it\n      declares one, else all of %s (DIVE-1963).\n      `ambiguous` = a bare "PR #N" that exists in more than one of them and the task\n      declares no repo, so no single verdict is defensible. NEITHER is evidence of an\n      unmerged PR, and neither is evidence of a clean one. Cite the full pull URL, or\n      add a `Repo: <owner>/<repo>` line to the task body, to have them resolved.\n' "$slugs"
   fi
   ok "merge-audit: scanned the newest $limit done task(s) across $slugs — $findings PR reference(s) not merged-and-green ($unver unverified, $amb ambiguous)" \
      '{scanned:($n|tonumber), repos:($rp|split(",")), findings:($f|tonumber), unverified:($u|tonumber), ambiguous:($a|tonumber), rows:($r|fromjson)}' \
