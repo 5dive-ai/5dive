@@ -9,7 +9,7 @@ name: install-smoke
 # confirm `5dive --version` works post-install.
 
 on:
-  # NO `paths:` FILTER ON pull_request — DELIBERATE, DIVE-2153.
+  # NO `paths:` FILTER ON pull_request — DELIBERATE, DIVE-2141 fallout.
   # `shellcheck` and `docker-install` are REQUIRED status checks on main. A
   # required context that does not RUN never reports, and GitHub blocks the PR
   # forever waiting for it — so a path filter here does not skip the check, it
