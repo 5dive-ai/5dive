@@ -22348,6 +22348,165 @@ _gate_eng_ship_hit() {
   [[ "$text" =~ $_GATE_ENG_SHIP_RX ]]
 }
 
+# DIVE-2099: the org lead's STANDING authority to clear an ENGINEERING approval
+# gate. lodar granted it 2026-07-26 ("agreed") in response to main asking for it
+# directly; main filed the ticket rather than implementing it because the
+# requester is the beneficiary. The boundary is therefore deliberately narrow and
+# the mechanism is deliberately visible in the record.
+#
+# WHAT IT ADDS: DIVE-1182/1243 already let the lead clear a gate that was ROUTED
+# to them at filing time (routed_reviewer == the authenticated caller). That is
+# the only lead-clear path today, so an engineering approval that reached the
+# human WITHOUT routing — pref off, filer-is-lead, a re-route that NULLed the
+# reviewer, or a gate filed before routing existed — is human-only forever, even
+# though its entire content is a judgement the lead can make. Three of the 14
+# gates in lodar's inbox on 2026-07-26 were exactly that. This predicate is the
+# standing authority: no routing required, but every other guard stays.
+#
+# WHY IT IS NOT "another keyword match" (design note 1 on the ticket, and the
+# DIVE-2089 trap): a keyword match here would be a false-NEGATIVE machine — the
+# dangerous polarity, where the lead self-clears something that should have gone
+# to the human. So vocabulary is never sufficient on its own. Eligibility is a
+# CONJUNCTION of an unforgeable identity check, a structural type/tier check, a
+# positive engineering classification, AND two independent exclusion tests. Text
+# can only ever REMOVE authority here; the guards that GRANT it are structural.
+#
+# FAIL CLOSED (design note 2): every unknown answers "no". An empty ask, an empty
+# or legacy-NULL tier, an unresolvable org lead, an unauthenticated caller, or a
+# text that does not positively classify as engineering all deny. An
+# unclassifiable gate is a human gate.
+_GATE_LEAD_STANDING_DENY_RX='customer.{0,20}(box|vm|host|server|instance|machine|account|repo|data|db)|client.{0,20}(box|vm|host|server|instance|machine)|(on|to|their) (a )?customer.s|marketing site|landing page|5dive\.com|public repo|docs site|blog post|\bbrand\b|rebrand|positioning|pricing page|go.to.market|\bstrategic\b|public relations|\bpr (agency|firm|retainer)\b|agent (create|creation|rm|remove|delete|fire|hire|repurpose|provision)|(create|remove|delete|fire|hire|repurpose|provision)( an?| the)? agent|sudoers|sudo (grant|access|rule|rules|policy)|grant.{0,20}sudo|root access|fleet privilege|privilege (grant|change|escalat)'
+_gate_lead_standing_denied() {
+  local text; text=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
+  [[ "$text" =~ $_GATE_LEAD_STANDING_DENY_RX ]]
+}
+# _gate_lead_standing_eligible <need_type> <tier> <text>  -> 0 when the standing
+# authority reaches this gate. <text> is the ask AND the title, because the gate
+# classifiers on both sides of this file read both (DIVE-1957) and a scope word
+# that appears only in the title must still be able to REMOVE authority.
+_gate_lead_standing_eligible() {
+  local nt="${1:-}" tier="${2:-}" text="${3:-}"
+  # Type: `approval` ONLY. `secret` is never lead-clearable at any tier;
+  # `manual` is by definition a step only a person can perform; `access` already
+  # has its own DIVE-1243 route; `decision` is lead-clearable by type already and
+  # needs no new authority. Narrowing to one type keeps the blast radius of a
+  # misclassification to the one class lodar actually granted.
+  [[ "$nt" == "approval" ]] || return 1
+  # Tier: exactly 1. Tier 2 is the hard human floor and this authority does NOT
+  # pierce it — an engineering gate that got floored to 2 (DIVE-2089's subject-
+  # matter misread) stays human-only until 2089 fixes the floor itself. Empty /
+  # legacy-NULL / 0 deny: an unknown tier is not a tier-1 gate.
+  [[ "$tier" == "1" ]] || return 1
+  # A gate with nothing to classify cannot be classified as engineering.
+  [[ -n "${text//[[:space:]]/}" ]] || return 1
+  # Positive engineering evidence. Absence of this is a DENY, not a default —
+  # this is the fail-closed direction: "not recognised as engineering" routes to
+  # the human exactly as it does today.
+  _gate_eng_ship_hit "$text" || return 1
+  # Exclusion 1 — the shared true-human floor (money, secrets/credentials,
+  # destructive, publish/press/customer-comms, dns). Belt-and-braces: a tier-1
+  # gate should already have failed this floor at filing, but a row filed before
+  # the floor existed, or one whose floor terms live in a title added later, must
+  # not inherit authority from a stale tier column.
+  ! _gate_tier2_floor_hit "$text" || return 1
+  # Exclusion 2 — the ticket's EXPLICITLY OUT OF SCOPE list that the T2 floor does
+  # NOT already cover: a customer's box, our customer-facing/public surfaces, a
+  # brand or strategic call, and fleet privilege changes.
+  ! _gate_lead_standing_denied "$text" || return 1
+  return 0
+}
+
+# DIVE-2099 iteration 2 — WHO holds the standing authority, anchored to a NAMED
+# agent. lodar answered the tier-2 decision gate 2026-07-27 with
+# `anchor-to-named-agent`, over `keep-chart-derived`.
+#
+# WHY THE ORG CHART CANNOT BE THE SOURCE (what iteration 1 got wrong): iteration 1
+# resolved the holder live at clear time with `_gate_route_reviewer(filer)`, which
+# reads `agents_org.reports_to`. DIVE-2124 put `require_root` on `org set`/`org rm`,
+# but every agent on this host holds (ALL) NOPASSWD:ALL, so `sudo 5dive org set` is
+# still reachable by any of them, and the column recording who wrote the row
+# (`by_claimed`) is caller-supplied and explicitly labelled non-evidence
+# (residual: DIVE-2131). Deriving the authority from a table the beneficiary can
+# rewrite is a self-grant path on the very authority being granted: rewrite the
+# chart to make yourself somebody's lead, then clear their gate as your own lead.
+#
+# THE ANCHOR: the agent NAMED in the constitution, trusted only when the on-disk
+# constitution still matches the digest SEALED into the council lineage. This is
+# the DIVE-1695 precedent, already load-bearing for the tier-2 hard-gate floor a
+# few hundred lines up: the file is forgeable, the chain is not. An agent CAN
+# `sudo` a new name into constitution.yaml — and the moment it does, the live
+# sha256 stops matching the sealed one, `_council_constitution_drifted` says
+# DRIFTED, and this function denies EVERYONE, including the name that was there
+# before. Re-sealing is a constitutional-class council motion (2/3 + full quorum +
+# founder veto), which no agent can convene against itself. So the write is not
+# prevented, it is made self-defeating and tamper-evident — which is the property
+# `require_root` alone does not have on a NOPASSWD:ALL host.
+#
+# FAIL CLOSED at every unknown: no council loader in scope, no sealed digest in
+# the lineage (a bare constitution.yaml is then just a file anyone can write), a
+# drifted file, a missing file, no `authority.eng_approval_lead` key, an empty
+# value, or a value that is not a plain agent name -> no standing authority for
+# anyone. Absence of a name is NOT "everyone" and is NOT "fall back to the chart".
+#
+# The org chart is still read for ROUTING (`_gate_route_reviewer`, unchanged) and
+# the resolved filer is still recorded in the audit row — but neither is consulted
+# for AUTHORITY any more. That separation is what the required test pins: mutate
+# the chart after filing and the clear must still be refused.
+_GATE_STANDING_LEAD_NAME_RX='^[a-z0-9][a-z0-9_-]{0,31}$'
+# Node-free reader for the one constitution field this authority needs, mirroring
+# `_council_constitution_drifted`'s reason for existing: the gate path must not
+# spin up the Node runtime (and must stay testable when cmd_task.sh is sourced
+# alone). Deliberately a STRICT subset of YAML — a top-level `authority:` block
+# and a scalar `eng_approval_lead:` inside it. Anything it cannot parse reads as
+# absent, which denies.
+_gate_constitution_standing_lead() {
+  local path="${1:-}" line val in_block=0
+  [[ -n "$path" && -f "$path" ]] || return 1
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="${line%$'\r'}"
+    [[ -z "${line//[[:space:]]/}" ]] && continue
+    [[ "$line" =~ ^[[:space:]]*# ]] && continue
+    # A non-indented line starts a new top-level key: we are inside `authority:`
+    # only while that key is the current one. Nested keys elsewhere in the file
+    # named `eng_approval_lead` therefore cannot grant anything.
+    if [[ "$line" =~ ^[^[:space:]] ]]; then
+      if [[ "$line" =~ ^authority:[[:space:]]*(#.*)?$ ]]; then in_block=1; else in_block=0; fi
+      continue
+    fi
+    (( in_block )) || continue
+    [[ "$line" =~ ^[[:space:]]+eng_approval_lead:[[:space:]]*(.*)$ ]] || continue
+    val="${BASH_REMATCH[1]}"
+    val="${val%%#*}"                       # strip a trailing comment
+    val="${val#"${val%%[![:space:]]*}"}"   # ltrim
+    val="${val%"${val##*[![:space:]]}"}"   # rtrim
+    val="${val%\"}"; val="${val#\"}"       # unquote "…"
+    val="${val%\'}"; val="${val#\'}"       # unquote '…'
+    [[ -n "$val" ]] || return 1
+    printf '%s' "$val"
+    return 0
+  done < "$path"
+  return 1
+}
+# _gate_standing_lead -> prints the named holder on stdout, or nothing + rc 1.
+_gate_standing_lead() {
+  declare -F _council_constitution_path >/dev/null 2>&1 || return 1
+  declare -F _council_sealed_constitution_digest >/dev/null 2>&1 || return 1
+  declare -F _council_constitution_drifted >/dev/null 2>&1 || return 1
+  # A constitution that was never sealed carries no authority: without a lineage
+  # record to drift FROM, the file is exactly as writable as the org chart, and
+  # anchoring to it would reproduce the self-grant path in a different file.
+  local sealed; sealed="$(_council_sealed_constitution_digest 2>/dev/null || true)"
+  [[ -n "$sealed" ]] || return 1
+  # Sealed but the live bytes differ (or the file is gone) -> deny everyone.
+  ! _council_constitution_drifted || return 1
+  local path; path="$(_council_constitution_path 2>/dev/null || true)"
+  local name; name="$(_gate_constitution_standing_lead "$path" 2>/dev/null || true)"
+  # A plain agent name only. Rejecting `human:main`, `*`, `all`, a path or a shell
+  # metacharacter keeps this a name comparison and nothing more.
+  [[ "$name" =~ $_GATE_STANDING_LEAD_NAME_RX ]] || return 1
+  printf '%s' "$name"
+}
+
 # DIVE-1381: the CONTENT-CURATION gate class — the third downgrade kind, mirror
 # of the eng-ship class (DIVE-1359) for our early-stage content surfaces
 # (OpenAgent / character-packs / the daily persona drip). Surfaced by DIVE-1366:
@@ -25120,6 +25279,39 @@ cmd_task_answer() {
     local _auth; _auth=$(_gate_authenticated_actor)
     [[ -n "$_auth" && "$_auth" == "$_routed_rev" ]] && _lead_clear=1
   fi
+  # DIVE-2099: the org lead's STANDING authority over ENGINEERING approvals — the
+  # same clearance as the routed lead-clear above, but WITHOUT requiring that this
+  # gate was routed to them at filing time. Identity is the unforgeable half and
+  # is checked FIRST: `_gate_authenticated_actor` reads the kernel-enforced unix
+  # caller (never --from, which `task_actor` returns verbatim — DIVE-2004), and
+  # `_gate_standing_lead` resolves the holder and itself fails closed to EMPTY.
+  # Both empty-checks are load-bearing: without them "" == "" would hand the
+  # authority to every caller on a box with no constitution.
+  #
+  # WHO the lead is comes from the agent NAMED in the SEALED constitution, never
+  # from the org chart (iteration 2; lodar answered `anchor-to-named-agent`
+  # 2026-07-27). See `_gate_standing_lead` for why the chart is a self-grant path
+  # on a NOPASSWD:ALL host and why the seal is what makes the anchor hold.
+  #
+  # `_ls_filer` is read for the AUDIT ROW ONLY and grants nothing. It stays the
+  # stored assignee (the agent that hit the gate — `task need` stamps it) falling
+  # back to created_by, the same COALESCE `owner` uses below, so the log still
+  # answers "whose gate was this" without the answer feeding the decision.
+  local _lead_standing=0
+  if [[ "$_lead_clear" != "1" && "$nt" == "approval" ]]; then
+    local _ls_auth _ls_lead _ls_filer
+    _ls_auth=$(_gate_authenticated_actor)
+    _ls_filer=$(db "SELECT COALESCE(NULLIF(assignee,''), NULLIF(created_by,''), '') FROM tasks WHERE id=${id};")
+    _ls_lead=$(_gate_standing_lead 2>/dev/null || true)
+    if [[ -n "$_ls_auth" && -n "$_ls_lead" && "$_ls_auth" == "$_ls_lead" ]]; then
+      local _ls_text
+      _ls_text=$(db "SELECT COALESCE(ask,'')||' '||COALESCE(title,'') FROM tasks WHERE id=${id};")
+      if _gate_lead_standing_eligible "$nt" "$gtier" "$_ls_text"; then
+        _lead_standing=1
+        _lead_clear=1
+      fi
+    fi
+  fi
   # DIVE-1243: `access` is NOT open-agent-clearable (unlike decision) — a random
   # agent must not self-grant. It is gated here like the human-only types, so only
   # the routed lead (_lead_clear above) OR a human may clear it. When access fell
@@ -25134,7 +25326,12 @@ cmd_task_answer() {
       fail "$E_AUTH_REQUIRED" "$ident is a '$nt' gate — only a human can clear it. Answer it from Telegram (tap the button) or the dashboard; an agent can't self-answer an approval/secret/manual gate."
     fi
     # DIVE-2054: routed_reviewer is task-store state for $ident — fenced.
-    [[ "$_lead_clear" == "1" ]] && _task_store_audit_log "task answer lead-clear" "ok" 0 -- "task=$ident" "type=$nt" "reviewer=$_routed_rev" 2>/dev/null || true
+    # DIVE-2099: `standing=` distinguishes the two clearances that reach here.
+    # This row records the DECISION TO ALLOW, which is not the same event as the
+    # answer landing in the DB — the authoritative post-write row is emitted
+    # after the UPDATE below (DIVE-2090: a pre-check row is not an audit of the
+    # write; the two diverge in both directions).
+    [[ "$_lead_clear" == "1" ]] && _task_store_audit_log "task answer lead-clear" "ok" 0 -- "task=$ident" "type=$nt" "reviewer=${_routed_rev:-<none>}" "standing=$_lead_standing" 2>/dev/null || true
   fi
 
   # DIVE-916/950: hard human gates (approval/secret/manual) need HUMAN evidence
@@ -25285,6 +25482,17 @@ cmd_task_answer() {
   # lead-sourced provenance (NOT human:*) — honest that an agent lead, not a human,
   # cleared it. Never overrides a genuine human:* answer.
   [[ "$_lead_clear" == "1" ]] && (( ! human )) && answered_by="lead:${answered_by}"
+  # DIVE-2099 (design note 3): a STANDING-authority clear must stay distinguishable
+  # from a human tap AND from a routed lead-clear, forever — not merely in a log
+  # line that can rotate or diverge from the row (DIVE-2090). So the distinction
+  # is carried by the persisted provenance itself: `lead:standing:<actor>`. The
+  # `lead:` prefix is preserved deliberately, so every existing `lead:*` consumer
+  # (cmd_push's delegated-push predicate, the digest's human-touch count, the
+  # proof ledger) keeps treating it as agent-sourced-not-human with no change;
+  # the `standing:` infix is the new, additive fact. `need_answered_by` is inside
+  # the DIVE-756 signed closure, so this marker is tamper-evident: a raw DB edit
+  # that downgrades `lead:standing:main` to `lead:main` fails `gate-proof verify`.
+  [[ "$_lead_standing" == "1" ]] && (( ! human )) && answered_by="lead:standing:$(task_actor "$from")"
 
   # DIVE-756: stamp the REAL invoker uid ($SUDO_UID survives `sudo -u agent-X`,
   # unlike need_answered_by) and a tamper-evidence signature over the closure
@@ -25319,6 +25527,31 @@ cmd_task_answer() {
   else
     (( value_set )) || fail "$E_USAGE" "--value is required (the human's answer)"
     db "UPDATE tasks SET need_answer=$(sqlq "$value"), need_answered_at=$(sqlq "$_ts"), need_answered_by=$(sqlq "$answered_by"), need_answered_uid=${_uidsql}, need_answer_sig=$(sqlq "$_sig") WHERE id=${id};"
+  fi
+
+  # DIVE-2099: the authoritative record of a STANDING-authority clear. Emitted
+  # AFTER the write and reading `need_answered_by` BACK OUT of the row, so it
+  # audits the state that actually landed rather than the intent to write it
+  # (DIVE-2090: gate-answer state was reaching the DB off the audited path, and a
+  # pre-check row greens identically whether or not the write happened). This is
+  # a privilege being exercised by the party that asked for it, so it names the
+  # authenticated caller, the real invoker uid, the tier and type it was allowed
+  # under, and the persisted provenance — enough to re-derive the eligibility
+  # decision from the log alone. Never fails the answer.
+  #
+  # `standing_lead=` is the NAME the sealed constitution carried at clear time and
+  # `authority_source=` says where it came from, so a reader can tell an anchored
+  # clear from the iteration-1 chart-derived one without diffing the binary.
+  # `filer=`/`routed_reviewer=` are recorded as context and are NOT inputs to the
+  # decision — the audit must not imply an authority the code does not consult.
+  if [[ "$_lead_standing" == "1" ]]; then
+    local _ls_persisted; _ls_persisted=$(db "SELECT COALESCE(need_answered_by,'') FROM tasks WHERE id=${id};")
+    _task_store_audit_log "task answer lead-standing-clear" \
+      "$([[ "$_ls_persisted" == lead:standing:* ]] && echo ok || echo error)" 0 -- \
+      "task=$ident" "type=$nt" "tier=$gtier" "authority=DIVE-2099 org-lead standing (engineering approval)" \
+      "authority_source=sealed-constitution:authority.eng_approval_lead" \
+      "authenticated_caller=${_ls_auth:-}" "standing_lead=${_ls_lead:-}" "filer=${_ls_filer:-}" "routed_reviewer=${_routed_rev:-<none>}" \
+      "persisted_provenance=${_ls_persisted:-<none>}" "invoker_uid=${_uid:-}" "human=$human" 2>/dev/null || true
   fi
 
   # DIVE-2090: audit the answer AT THE WRITE, for EVERY need_type. Until now the
@@ -29198,6 +29431,19 @@ ship:
 # comms: outbound-comms guardrails (e.g. public_requires_human: true). Empty = defaults.
 comms:
 #
+# authority: standing authorities held by a NAMED agent (DIVE-2099). EMPTY = nobody holds one,
+# which is the default — a fresh org grants nothing until it deliberately amends this in.
+#   eng_approval_lead: <agent> — that ONE agent may clear tier-1 ENGINEERING approval gates on
+#   its own authority instead of routing them to you. Every other guard still applies (approval
+#   type only, tier 1 only, positive engineering classification, hard_gates floor, out-of-scope
+#   exclusions). Deliberately NOT derived from the org chart: the chart is agent-writable, so
+#   deriving authority from it would let the holder appoint itself. This value is enforced only
+#   while the file matches its SEALED digest, so changing who holds it is an amendment, not an
+#   edit. Example:
+#     authority:
+#       eng_approval_lead: main
+authority:
+#
 # ===================================================================================
 # COUNCIL — OPTIONAL, and DORMANT until you convene one.
 # ===================================================================================
@@ -29228,6 +29474,9 @@ export const DEFAULT_CONSTITUTION = {
   hardGateRegex: DEFAULT_HARD_GATE_RX,
   ship: {},
   comms: {},
+  // DIVE-2099 — standing authorities held by a named agent. Empty by default: a fresh org
+  // grants nobody a standing clear until it deliberately amends this in.
+  authority: { engApprovalLead: '' },
 }
 
 function yamlScalar(raw) {
@@ -29348,7 +29597,7 @@ function quorumSpec(value) {
 
 export function normalizeConstitution(raw = {}) {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) throw new Error('constitution frontmatter must be a mapping')
-  const unknownTop = Object.keys(raw).filter(k => !['schema_version', 'council', 'quorum', 'thresholds', 'veto', 'hard_gates', 'ship', 'comms'].includes(k))
+  const unknownTop = Object.keys(raw).filter(k => !['schema_version', 'council', 'quorum', 'thresholds', 'veto', 'hard_gates', 'ship', 'comms', 'authority'].includes(k))
   if (unknownTop.length) throw new Error(`unknown constitution field(s): ${unknownTop.join(', ')}`)
   // DIVE-1702: OPTIONAL document version. Absent -> current (back-compat with every existing file).
   // Must be a positive integer; a version NEWER than this CLI understands is refused (fail-closed) so
@@ -29406,6 +29655,22 @@ export function normalizeConstitution(raw = {}) {
   for (const section of ['ship', 'comms']) {
     if (raw[section] != null && (typeof raw[section] !== 'object' || Array.isArray(raw[section]))) throw new Error(`${section} must be a mapping`)
   }
+  // DIVE-2099 — `authority`: standing authorities held by a NAMED agent, granted by the
+  // constitution itself rather than derived from the org chart (which is agent-writable, so
+  // deriving from it lets the beneficiary self-grant). Absent/empty = nobody holds it; there is
+  // no "everyone" value and no fallback. Bash reads this field node-free on the gate path and
+  // trusts it ONLY when the file still matches the sealed digest, so the enforced value can only
+  // change through a constitutional-class amendment.
+  if (raw.authority != null && (typeof raw.authority !== 'object' || Array.isArray(raw.authority))) throw new Error('authority must be a mapping')
+  const authority = raw.authority || {}
+  const unknownAuthority = Object.keys(authority).filter(k => k !== 'eng_approval_lead')
+  if (unknownAuthority.length) throw new Error(`unknown authority field(s): ${unknownAuthority.join(', ')}`)
+  if (authority.eng_approval_lead != null && typeof authority.eng_approval_lead !== 'string') throw new Error('authority.eng_approval_lead must be a string')
+  const engApprovalLead = String(authority.eng_approval_lead || '').trim()
+  // The same shape bash enforces (`_GATE_STANDING_LEAD_NAME_RX`): a plain agent name, so the
+  // value stays a name comparison. `human:x`, `*`, `all`, paths and metacharacters are rejected
+  // here rather than silently ignored at enforcement time.
+  if (engApprovalLead && !/^[a-z0-9][a-z0-9_-]{0,31}$/.test(engApprovalLead)) throw new Error('authority.eng_approval_lead must be a plain agent name (a-z0-9, _ or -, max 32)')
   return {
     schemaVersion,
     council: { bench: String(council.bench || DEFAULT_CONSTITUTION.council.bench) },
@@ -29420,6 +29685,7 @@ export function normalizeConstitution(raw = {}) {
     hardGates, hardGateRegex,
     ship: raw.ship && typeof raw.ship === 'object' ? raw.ship : {},
     comms: raw.comms && typeof raw.comms === 'object' ? raw.comms : {},
+    authority: { engApprovalLead },
   }
 }
 
@@ -43973,6 +44239,14 @@ _push_gate_check() {
   # sanctioned lead-clear path in `task answer` (cmd_task.sh), which fires only
   # when the caller was `agent-X` AND X was the gate's routed_reviewer at clear
   # time — so the value after `lead:` IS the designated reviewer who cleared it.
+  # DIVE-2099 adds a SECOND minting path under the same `lead:` prefix:
+  # `lead:standing:X` records the org lead clearing an ENGINEERING approval under
+  # their standing authority, with no routing involved (so `reviewer` is legitimately
+  # empty there). It is authorized by the generic `lead:*` arm below on purpose —
+  # push-for-review on our own repos is in-scope item #1 of that grant — and it is
+  # equally signature-bound, since `need_answered_by` is inside the signed closure.
+  # Read `lead:standing:X` as "the org lead X, standing authority"; `lead:X` stays
+  # "the designated reviewer X".
   # Requiring routed_reviewer to still match at push time was the bug: routing
   # can be mutated after the clear (a re-route, or the DIVE-1437 T2-escalation
   # NULLs routed_reviewer), stranding a correctly lead-cleared push with an empty
