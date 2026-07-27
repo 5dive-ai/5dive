@@ -578,6 +578,19 @@ ship:
 # comms: outbound-comms guardrails (e.g. public_requires_human: true). Empty = defaults.
 comms:
 #
+# authority: standing authorities held by a NAMED agent (DIVE-2099). EMPTY = nobody holds one,
+# which is the default — a fresh org grants nothing until it deliberately amends this in.
+#   eng_approval_lead: <agent> — that ONE agent may clear tier-1 ENGINEERING approval gates on
+#   its own authority instead of routing them to you. Every other guard still applies (approval
+#   type only, tier 1 only, positive engineering classification, hard_gates floor, out-of-scope
+#   exclusions). Deliberately NOT derived from the org chart: the chart is agent-writable, so
+#   deriving authority from it would let the holder appoint itself. This value is enforced only
+#   while the file matches its SEALED digest, so changing who holds it is an amendment, not an
+#   edit. Example:
+#     authority:
+#       eng_approval_lead: main
+authority:
+#
 # ===================================================================================
 # COUNCIL — OPTIONAL, and DORMANT until you convene one.
 # ===================================================================================
@@ -608,6 +621,9 @@ export const DEFAULT_CONSTITUTION = {
   hardGateRegex: DEFAULT_HARD_GATE_RX,
   ship: {},
   comms: {},
+  // DIVE-2099 — standing authorities held by a named agent. Empty by default: a fresh org
+  // grants nobody a standing clear until it deliberately amends this in.
+  authority: { engApprovalLead: '' },
 }
 
 function yamlScalar(raw) {
@@ -728,7 +744,7 @@ function quorumSpec(value) {
 
 export function normalizeConstitution(raw = {}) {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) throw new Error('constitution frontmatter must be a mapping')
-  const unknownTop = Object.keys(raw).filter(k => !['schema_version', 'council', 'quorum', 'thresholds', 'veto', 'hard_gates', 'ship', 'comms'].includes(k))
+  const unknownTop = Object.keys(raw).filter(k => !['schema_version', 'council', 'quorum', 'thresholds', 'veto', 'hard_gates', 'ship', 'comms', 'authority'].includes(k))
   if (unknownTop.length) throw new Error(`unknown constitution field(s): ${unknownTop.join(', ')}`)
   // DIVE-1702: OPTIONAL document version. Absent -> current (back-compat with every existing file).
   // Must be a positive integer; a version NEWER than this CLI understands is refused (fail-closed) so
@@ -786,6 +802,22 @@ export function normalizeConstitution(raw = {}) {
   for (const section of ['ship', 'comms']) {
     if (raw[section] != null && (typeof raw[section] !== 'object' || Array.isArray(raw[section]))) throw new Error(`${section} must be a mapping`)
   }
+  // DIVE-2099 — `authority`: standing authorities held by a NAMED agent, granted by the
+  // constitution itself rather than derived from the org chart (which is agent-writable, so
+  // deriving from it lets the beneficiary self-grant). Absent/empty = nobody holds it; there is
+  // no "everyone" value and no fallback. Bash reads this field node-free on the gate path and
+  // trusts it ONLY when the file still matches the sealed digest, so the enforced value can only
+  // change through a constitutional-class amendment.
+  if (raw.authority != null && (typeof raw.authority !== 'object' || Array.isArray(raw.authority))) throw new Error('authority must be a mapping')
+  const authority = raw.authority || {}
+  const unknownAuthority = Object.keys(authority).filter(k => k !== 'eng_approval_lead')
+  if (unknownAuthority.length) throw new Error(`unknown authority field(s): ${unknownAuthority.join(', ')}`)
+  if (authority.eng_approval_lead != null && typeof authority.eng_approval_lead !== 'string') throw new Error('authority.eng_approval_lead must be a string')
+  const engApprovalLead = String(authority.eng_approval_lead || '').trim()
+  // The same shape bash enforces (`_GATE_STANDING_LEAD_NAME_RX`): a plain agent name, so the
+  // value stays a name comparison. `human:x`, `*`, `all`, paths and metacharacters are rejected
+  // here rather than silently ignored at enforcement time.
+  if (engApprovalLead && !/^[a-z0-9][a-z0-9_-]{0,31}$/.test(engApprovalLead)) throw new Error('authority.eng_approval_lead must be a plain agent name (a-z0-9, _ or -, max 32)')
   return {
     schemaVersion,
     council: { bench: String(council.bench || DEFAULT_CONSTITUTION.council.bench) },
@@ -800,6 +832,7 @@ export function normalizeConstitution(raw = {}) {
     hardGates, hardGateRegex,
     ship: raw.ship && typeof raw.ship === 'object' ? raw.ship : {},
     comms: raw.comms && typeof raw.comms === 'object' ? raw.comms : {},
+    authority: { engApprovalLead },
   }
 }
 

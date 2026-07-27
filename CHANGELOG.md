@@ -1,5 +1,51 @@
 # Changelog
 
+## Unreleased — feat(task): the tier-2 floor says WHY it fired, and a design decision can appeal it on the record instead of by rewording (DIVE-2089)
+
+The T2 category floor reads SUBJECT MATTER as risk and picks the gate's audience from it. dev3
+filed a tier-1 sizing gate — "should an agent's right to act derive from the credentials it holds,
+or from a declared clearance level?" — and it was forced hard-human because the ask contains
+"credentials" and "privileged". The gate discusses credential handling as a design question and
+performs no credential operation. Talking about credentials is not handling credentials.
+
+Two things made that worse than a mis-tier. It was **silent** — dev3 only found out by re-reading
+their own filed gate, so an agent that files and moves on leaves a design question in the founder's
+inbox indefinitely. And the workaround was to **re-file with neutral wording**, which works, teaches
+the fleet to launder vocabulary to reach the right audience, and leaves no trace of having been
+done.
+
+- **The floor now names the term that fired.** `[tier forced to 2 — T2 category floor: matched
+  'credential']` on the result, plus a stderr warning at file time. For a `decision` gate it also
+  states the sanctioned appeal, and says not to reword the ask — the laundering path is now the one
+  the tool argues against, instead of the only one it leaves open.
+- **`--discusses="<why>"`** appeals a floor that fired on subject matter. It is a declaration, not
+  another guesser: there is no phrasing that reliably separates "discussing X" from "doing X", so
+  the filer states it, on the record. Unlike a reworded ask it is attributable, written into the
+  gate the reviewer reads, and audited whether it applies or is refused.
+- Four guards, and the declaration is not trusted on its own: `--type=decision` only (approval /
+  manual / secret / access declare an action by construction); only when the floor actually
+  over-fired; never for money, outbound customer comms, or irreversible infra/access, however it is
+  framed; and it downgrades only to a **lead-routed tier 1**, never to tier 0 and never to the
+  filer. An explicit `--tier=2` still vetoes it, and every refusal is loud.
+
+Deliberately not a sixth keyword class. DIVE-2099's design note is explicit that inferring this from
+more vocabulary reproduces the bug with the polarity reversed, where a false negative routes a real
+secret gate away from the human.
+
+**No existing gate changes tier.** Nothing moves unless a filer passes the new flag, which discharges
+the DIVE-2146 precondition by construction rather than by enumeration. Measured while checking it:
+the DIVE-2146 self-restart gate never tripped the floor at all — it reached the human because it was
+re-filed with an explicit `--tier=2`. Kept as a live assertion, so if the floor is ever widened to
+catch it, that test goes red first.
+
+The matched term also rides the `--json` payload as `floor_term` (null when nothing floored). An
+agent filing with `--json` previously got `tier_floored: true` and no way to learn which word did
+it, which leaves the machine reader in exactly the state this change exists to fix.
+
+`tests/gate_floor_declared_discussion_unit.sh` — 45 assertions, every arm exercised on the ask axis
+and on the TITLE axis (DIVE-1957: a suite that varies only the ask tests the axis a filer can
+already reword, and passes vacuously).
+
 ## 0.16.33 — fix(push): the author check refuses when it cannot bound the range, instead of grading the whole history (DIVE-2161)
 
 Reported by dev2, who pushed a one-commit branch that was correctly authored and got back
@@ -75,6 +121,39 @@ DIVE-1609 (the `agents_org` orphan), which is why it is one pass.
 Regression: `tests/agent_home_teardown_unit.sh` (17 assertions), including the guard that
 keeps the recursive `chown`/`rm -rf` off any path that is not this agent's own conventional
 home, and off a symlink at that path.
+
+## Unreleased — fix(proof): the daily publisher no longer dies on its own log, and a successful tick finally says so (DIVE-2044)
+
+The public zero-human badge stopped publishing for 26 hours and every signal said the
+job was running. The publisher logic was never the problem.
+
+**The cron line was `… 5dive proof tick >> /var/log/5dive-proof.log 2>&1`.** The log
+had been re-chowned to a user the cron could not write as, so the shell failed to open
+the redirect and **died before `5dive` was ever executed**. cron still logged the CMD
+line every night, so `journalctl` showed a healthy job for a publisher that had not run
+once. Proven, not inferred: appending to that file as the cron's user returned
+`Permission denied` before the ownership fix and succeeded after.
+
+The redirect is now **gone from the generated cron line**. `proof tick --log=<path>`
+hands the path to the tick, which writes its record **after** the publish and falls back
+to journald (`journalctl -t 5dive-proof`), then stderr, when the file is unwritable. An
+unwritable log now costs a log line, never a publish — the work must not sit downstream
+of its own observability. `proof status` detects a pre-fix cron line and rewrites it in
+place (with a loud warning when it lacks the rights); an install-time permission check
+cannot cover a permission that changes months later.
+
+**A successful tick used to print nothing at all.** The log's entire content across the
+outage was one *skip* line, so "published fine" and "never ran" produced identical logs.
+Every run now leaves one stamped line naming its outcome — `PUBLISHED` (with the stamp
+it recorded), `no-op — already published`, or `FAILED rc=N` — with the publisher's own
+output indented beneath it. The DIVE-2051 identity refusal stays non-zero and is named
+as such.
+
+The staleness monitor read `raw.githubusercontent.com`, which is CDN-cached and was
+still serving the previous day's stamp minutes after the real publish landed (the
+DIVE-2042 window again). Its verdict now comes from the GitHub API ref, with raw kept
+as a labelled fallback and its disagreement written to the log rather than silently
+resolved in the CDN's favour.
 
 ## Unreleased — fix(agent): typed sends REFUSE a credential/login pane, so an inter-agent message can no longer become the agent's API key (DIVE-2137, gh#214)
 
