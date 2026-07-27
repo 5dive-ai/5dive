@@ -1,5 +1,39 @@
 # Changelog
 
+## Unreleased — fix(agent): typed sends REFUSE a credential/login pane, so an inter-agent message can no longer become the agent's API key (DIVE-2137, gh#214)
+
+Reported by A-MO7SEN (gh#214), his fourth confirmed find.
+
+`agent send`/`ask` checked that the target pane was ready to receive keystrokes but never
+what the pane WAS. An agent that booted unauthenticated parks on its login menu, where codex
+draws the same composer glyph it draws in chat — so every readiness marker matched, the
+message was typed into the API-key field and submitted, and the message body became the
+agent's stored credential. Silent in both directions: the caller got `delivered`, and the
+agent went on authenticated with a garbage secret.
+
+Typed sends now fingerprint the pane first and FAIL CLOSED, returning a hard error naming
+the cause instead of typing. The guard sits on the single inject choke point
+(`inject_and_submit`) that `send`, `ask` and `_deliver` all funnel through, plus the
+heartbeat's `_hb_send_line` — a fourth site with the same blind spot, reached on an
+autonomous tick with nobody watching. `agent auth`'s deliberate login-code inject is
+explicitly left unguarded, and that boundary is asserted in the tests.
+
+Fingerprints are read verbatim out of the shipped codex and claude binaries rather than
+written from assumption, and the login-menu tier requires a co-occurring PAIR of menu rows:
+a single-substring match over the whole pane refuses ordinary traffic, since agents discuss
+credentials constantly (measured on live panes, not supposed). Screens we could not sample
+are declared as uncovered in the test file rather than guessed at.
+
+The trigger is fixed too. The credential seed in `5dive-agent-start` selected its source on
+mere EXISTENCE, so a box whose canonical profile was absent fell back to a 0600 root-owned
+legacy path that a standard-isolation agent cannot read; both arms of the read then failed
+and the only record was a `warn:` line in a log nobody reads. The seed now selects on
+READABILITY, distinguishes a missing source from a present-but-unreadable one (a perms
+fault, not a missing login), and leaves a breadcrumb the send-side refusal reads back so the
+failure is named at the moment it bites rather than at boot.
+
+Also fixes the seed unit test itself, which ran the shipped blocks in an environment where
+their own helpers were undefined — a mutation to the failure path left it green.
 ## Unreleased — fix(agent): the sudo-grant measurement can finally see a PEER, via one privileged read (DIVE-2135)
 
 DIVE-2079 and DIVE-2088 (below) replaced a stored label with a measurement. The measurement

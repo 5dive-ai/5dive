@@ -811,6 +811,17 @@ _hb_tier_rank() {
 # (never exits) so a single dead pane can't abort the whole tick.
 _hb_send_line() {
   local name="$1" text="$2" tries=0
+  # DIVE-2137: the heartbeat is the FOURTH typed-send site (send / ask / _deliver
+  # are the three in cmd_agent_runtime.sh) and had the same blind spot — it types
+  # a nudge into whatever the pane happens to be showing. An agent that booted
+  # unauthenticated is parked on its login menu, so an autonomous wake/nudge
+  # would write "continue" (or a whole task line) into the API-key field and
+  # submit it. Worse than the reported path, because no human is watching a tick.
+  # Same fail-closed predicate, one shared definition (cmd_agent_runtime.sh).
+  _agent_pane_safe_to_type "$name" || {
+    _hb_log "skip send to ${name}: pane is a credential/login prompt, not a chat input (DIVE-2137)" 2>/dev/null || true
+    return 1
+  }
   sudo -u "agent-${name}" tmux send-keys -t "agent-${name}" -l -- "$text" 2>/dev/null || return 1
   # DIVE-1217: `send-keys -l` lands as a bracketed PASTE. Claude commits it
   # synchronously so an immediate Enter submits (leave that path alone). Non-claude
