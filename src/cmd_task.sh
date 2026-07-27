@@ -3360,6 +3360,97 @@ _gate_lead_standing_eligible() {
   return 0
 }
 
+# DIVE-2099 iteration 2 — WHO holds the standing authority, anchored to a NAMED
+# agent. lodar answered the tier-2 decision gate 2026-07-27 with
+# `anchor-to-named-agent`, over `keep-chart-derived`.
+#
+# WHY THE ORG CHART CANNOT BE THE SOURCE (what iteration 1 got wrong): iteration 1
+# resolved the holder live at clear time with `_gate_route_reviewer(filer)`, which
+# reads `agents_org.reports_to`. DIVE-2124 put `require_root` on `org set`/`org rm`,
+# but every agent on this host holds (ALL) NOPASSWD:ALL, so `sudo 5dive org set` is
+# still reachable by any of them, and the column recording who wrote the row
+# (`by_claimed`) is caller-supplied and explicitly labelled non-evidence
+# (residual: DIVE-2131). Deriving the authority from a table the beneficiary can
+# rewrite is a self-grant path on the very authority being granted: rewrite the
+# chart to make yourself somebody's lead, then clear their gate as your own lead.
+#
+# THE ANCHOR: the agent NAMED in the constitution, trusted only when the on-disk
+# constitution still matches the digest SEALED into the council lineage. This is
+# the DIVE-1695 precedent, already load-bearing for the tier-2 hard-gate floor a
+# few hundred lines up: the file is forgeable, the chain is not. An agent CAN
+# `sudo` a new name into constitution.yaml — and the moment it does, the live
+# sha256 stops matching the sealed one, `_council_constitution_drifted` says
+# DRIFTED, and this function denies EVERYONE, including the name that was there
+# before. Re-sealing is a constitutional-class council motion (2/3 + full quorum +
+# founder veto), which no agent can convene against itself. So the write is not
+# prevented, it is made self-defeating and tamper-evident — which is the property
+# `require_root` alone does not have on a NOPASSWD:ALL host.
+#
+# FAIL CLOSED at every unknown: no council loader in scope, no sealed digest in
+# the lineage (a bare constitution.yaml is then just a file anyone can write), a
+# drifted file, a missing file, no `authority.eng_approval_lead` key, an empty
+# value, or a value that is not a plain agent name -> no standing authority for
+# anyone. Absence of a name is NOT "everyone" and is NOT "fall back to the chart".
+#
+# The org chart is still read for ROUTING (`_gate_route_reviewer`, unchanged) and
+# the resolved filer is still recorded in the audit row — but neither is consulted
+# for AUTHORITY any more. That separation is what the required test pins: mutate
+# the chart after filing and the clear must still be refused.
+_GATE_STANDING_LEAD_NAME_RX='^[a-z0-9][a-z0-9_-]{0,31}$'
+# Node-free reader for the one constitution field this authority needs, mirroring
+# `_council_constitution_drifted`'s reason for existing: the gate path must not
+# spin up the Node runtime (and must stay testable when cmd_task.sh is sourced
+# alone). Deliberately a STRICT subset of YAML — a top-level `authority:` block
+# and a scalar `eng_approval_lead:` inside it. Anything it cannot parse reads as
+# absent, which denies.
+_gate_constitution_standing_lead() {
+  local path="${1:-}" line val in_block=0
+  [[ -n "$path" && -f "$path" ]] || return 1
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="${line%$'\r'}"
+    [[ -z "${line//[[:space:]]/}" ]] && continue
+    [[ "$line" =~ ^[[:space:]]*# ]] && continue
+    # A non-indented line starts a new top-level key: we are inside `authority:`
+    # only while that key is the current one. Nested keys elsewhere in the file
+    # named `eng_approval_lead` therefore cannot grant anything.
+    if [[ "$line" =~ ^[^[:space:]] ]]; then
+      if [[ "$line" =~ ^authority:[[:space:]]*(#.*)?$ ]]; then in_block=1; else in_block=0; fi
+      continue
+    fi
+    (( in_block )) || continue
+    [[ "$line" =~ ^[[:space:]]+eng_approval_lead:[[:space:]]*(.*)$ ]] || continue
+    val="${BASH_REMATCH[1]}"
+    val="${val%%#*}"                       # strip a trailing comment
+    val="${val#"${val%%[![:space:]]*}"}"   # ltrim
+    val="${val%"${val##*[![:space:]]}"}"   # rtrim
+    val="${val%\"}"; val="${val#\"}"       # unquote "…"
+    val="${val%\'}"; val="${val#\'}"       # unquote '…'
+    [[ -n "$val" ]] || return 1
+    printf '%s' "$val"
+    return 0
+  done < "$path"
+  return 1
+}
+# _gate_standing_lead -> prints the named holder on stdout, or nothing + rc 1.
+_gate_standing_lead() {
+  declare -F _council_constitution_path >/dev/null 2>&1 || return 1
+  declare -F _council_sealed_constitution_digest >/dev/null 2>&1 || return 1
+  declare -F _council_constitution_drifted >/dev/null 2>&1 || return 1
+  # A constitution that was never sealed carries no authority: without a lineage
+  # record to drift FROM, the file is exactly as writable as the org chart, and
+  # anchoring to it would reproduce the self-grant path in a different file.
+  local sealed; sealed="$(_council_sealed_constitution_digest 2>/dev/null || true)"
+  [[ -n "$sealed" ]] || return 1
+  # Sealed but the live bytes differ (or the file is gone) -> deny everyone.
+  ! _council_constitution_drifted || return 1
+  local path; path="$(_council_constitution_path 2>/dev/null || true)"
+  local name; name="$(_gate_constitution_standing_lead "$path" 2>/dev/null || true)"
+  # A plain agent name only. Rejecting `human:main`, `*`, `all`, a path or a shell
+  # metacharacter keeps this a name comparison and nothing more.
+  [[ "$name" =~ $_GATE_STANDING_LEAD_NAME_RX ]] || return 1
+  printf '%s' "$name"
+}
+
 # DIVE-1381: the CONTENT-CURATION gate class — the third downgrade kind, mirror
 # of the eng-ship class (DIVE-1359) for our early-stage content surfaces
 # (OpenAgent / character-packs / the daily persona drip). Surfaced by DIVE-1366:
@@ -6137,27 +6228,25 @@ cmd_task_answer() {
   # gate was routed to them at filing time. Identity is the unforgeable half and
   # is checked FIRST: `_gate_authenticated_actor` reads the kernel-enforced unix
   # caller (never --from, which `task_actor` returns verbatim — DIVE-2004), and
-  # `_gate_route_reviewer` resolves the lead and itself fails closed to EMPTY.
+  # `_gate_standing_lead` resolves the holder and itself fails closed to EMPTY.
   # Both empty-checks are load-bearing: without them "" == "" would hand the
-  # authority to every caller on a box with no org chart.
+  # authority to every caller on a box with no constitution.
   #
-  # WHO the lead is must be resolved the SAME way ROUTING resolves it —
-  # `_gate_route_reviewer` on the gate's FILER, i.e. their manager, falling back
-  # to the org coordinator. Reading the coordinator DIRECTLY is wrong on a real
-  # chart: ours has no literal role='coordinator', so `_task_resolve_coordinator`
-  # returns the single root — olivia, the CEO — while every builder's actual lead
-  # is main. That would have granted this authority to the wrong agent AND
-  # withheld it from the one lodar named. The right predicate is "the lead this
-  # gate WOULD have been routed to", which is exactly what the routing resolver
-  # computes, and it returns EMPTY when the filer IS the lead (nobody above them).
-  # The filer is the stored assignee (the agent that hit the gate — `task need`
-  # stamps it), falling back to created_by; the same COALESCE `owner` uses below.
+  # WHO the lead is comes from the agent NAMED in the SEALED constitution, never
+  # from the org chart (iteration 2; lodar answered `anchor-to-named-agent`
+  # 2026-07-27). See `_gate_standing_lead` for why the chart is a self-grant path
+  # on a NOPASSWD:ALL host and why the seal is what makes the anchor hold.
+  #
+  # `_ls_filer` is read for the AUDIT ROW ONLY and grants nothing. It stays the
+  # stored assignee (the agent that hit the gate — `task need` stamps it) falling
+  # back to created_by, the same COALESCE `owner` uses below, so the log still
+  # answers "whose gate was this" without the answer feeding the decision.
   local _lead_standing=0
   if [[ "$_lead_clear" != "1" && "$nt" == "approval" ]]; then
     local _ls_auth _ls_lead _ls_filer
     _ls_auth=$(_gate_authenticated_actor)
     _ls_filer=$(db "SELECT COALESCE(NULLIF(assignee,''), NULLIF(created_by,''), '') FROM tasks WHERE id=${id};")
-    _ls_lead=$(_gate_route_reviewer "$_ls_filer")
+    _ls_lead=$(_gate_standing_lead 2>/dev/null || true)
     if [[ -n "$_ls_auth" && -n "$_ls_lead" && "$_ls_auth" == "$_ls_lead" ]]; then
       local _ls_text
       _ls_text=$(db "SELECT COALESCE(ask,'')||' '||COALESCE(title,'') FROM tasks WHERE id=${id};")
@@ -6393,12 +6482,19 @@ cmd_task_answer() {
   # authenticated caller, the real invoker uid, the tier and type it was allowed
   # under, and the persisted provenance — enough to re-derive the eligibility
   # decision from the log alone. Never fails the answer.
+  #
+  # `standing_lead=` is the NAME the sealed constitution carried at clear time and
+  # `authority_source=` says where it came from, so a reader can tell an anchored
+  # clear from the iteration-1 chart-derived one without diffing the binary.
+  # `filer=`/`routed_reviewer=` are recorded as context and are NOT inputs to the
+  # decision — the audit must not imply an authority the code does not consult.
   if [[ "$_lead_standing" == "1" ]]; then
     local _ls_persisted; _ls_persisted=$(db "SELECT COALESCE(need_answered_by,'') FROM tasks WHERE id=${id};")
     _task_store_audit_log "task answer lead-standing-clear" \
       "$([[ "$_ls_persisted" == lead:standing:* ]] && echo ok || echo error)" 0 -- \
       "task=$ident" "type=$nt" "tier=$gtier" "authority=DIVE-2099 org-lead standing (engineering approval)" \
-      "authenticated_caller=${_ls_auth:-}" "org_lead=${_ls_lead:-}" "filer=${_ls_filer:-}" "routed_reviewer=${_routed_rev:-<none>}" \
+      "authority_source=sealed-constitution:authority.eng_approval_lead" \
+      "authenticated_caller=${_ls_auth:-}" "standing_lead=${_ls_lead:-}" "filer=${_ls_filer:-}" "routed_reviewer=${_routed_rev:-<none>}" \
       "persisted_provenance=${_ls_persisted:-<none>}" "invoker_uid=${_uid:-}" "human=$human" 2>/dev/null || true
   fi
 

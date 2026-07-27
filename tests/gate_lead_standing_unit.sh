@@ -25,14 +25,22 @@ SRC=src
 TMP="$(mktemp -d /tmp/gate-lead-standing-unit.XXXXXX)"
 trap 'rm -rf "$TMP"' EXIT
 
+# STATE_DIR must be set BEFORE cmd_council.sh is sourced: its COUNCIL_DIR/COUNCIL_LINEAGE
+# are source-time globals derived from it (they are re-pinned below anyway, belt-and-braces).
+STATE_DIR="$TMP"
 # shellcheck disable=SC1090
 for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh \
          lib/agent_setup.sh lib/state.sh lib/audit.sh lib/registry.sh \
-         lib/tasks_db.sh cmd_task.sh; do
+         lib/tasks_db.sh cmd_task.sh cmd_council.sh; do
   # shellcheck source=/dev/null
   source "$SRC/$f"
 done
-STATE_DIR="$TMP"; TASKS_DIR="$STATE_DIR/tasks"; TASKS_DB="$TASKS_DIR/tasks.db"
+# cmd_council.sh LAST, matching the production bundle order (CNCL-14) — the council
+# loader is what makes `_gate_standing_lead` resolvable at all. Sourcing it here is not
+# convenience: the whole iteration-2 anchor lives in those three council helpers, and a
+# harness that stubbed them would be testing its own stubs.
+COUNCIL_DIR="$STATE_DIR/council"; COUNCIL_LINEAGE="$COUNCIL_DIR/lineage.jsonl"
+TASKS_DIR="$STATE_DIR/tasks"; TASKS_DB="$TASKS_DIR/tasks.db"
 GATE_PROOF_KEY="$STATE_DIR/gate-proof.key"
 GATE_PROOF_ENFORCE="$STATE_DIR/gate-proof.enforce"
 JSON_MODE=1
@@ -66,6 +74,32 @@ db "INSERT INTO agents_org (name, role, reports_to) VALUES ('marcus','coordinato
 db "INSERT INTO agents_org (name, role, reports_to) VALUES ('dev','builder','marcus');"
 [[ "$(_task_resolve_coordinator)" == "marcus" ]] \
   || { printf 'FAIL - harness precondition: org lead did not resolve to marcus\n'; exit 1; }
+
+# --- the ANCHOR (iteration 2, lodar answered `anchor-to-named-agent` 2026-07-27) -------
+# The holder is the agent NAMED in the constitution, and the name counts only while the
+# file still matches the digest SEALED into the council lineage. These helpers write both
+# halves so every arm below exercises the real `_council_*` chain, not a stub.
+constitution_yaml() {  # $1 = the named eng_approval_lead ('' = none), $2 = extra body
+  # NO `hard_gates:` key on purpose: absent means the loader keeps the SHIPPED default
+  # classes, so the tier-2 floor these arms lean on behaves exactly as in production. A
+  # trimmed hard_gates block here would silently narrow the floor and green S5/S5d for
+  # the wrong reason.
+  printf 'ship:\ncomms:\n'
+  [[ -n "${1:-}" ]] && printf 'authority:\n  eng_approval_lead: %s\n' "$1"
+  [[ -n "${2:-}" ]] && printf '%s\n' "$2"
+  return 0
+}
+write_constitution() { mkdir -p "$STATE_DIR"; printf '%s' "$1" > "$STATE_DIR/constitution.yaml"; }
+seal_constitution()  { # seal whatever bytes are on disk right now
+  mkdir -p "$COUNCIL_DIR"
+  printf '{"seq":1,"record":{"constitutionDigest":"%s"}}\n' \
+    "$(sha256sum < "$STATE_DIR/constitution.yaml" | awk '{print $1}')" > "$COUNCIL_LINEAGE"
+}
+anchor_to() { write_constitution "$(constitution_yaml "$1")"; seal_constitution; }
+
+anchor_to marcus
+[[ "$(_gate_standing_lead)" == "marcus" ]] \
+  || { printf 'FAIL - harness precondition: the sealed constitution did not anchor to marcus (got %s)\n' "$(_gate_standing_lead)"; exit 1; }
 
 seed_task() { db "INSERT INTO tasks (ident, title, status, created_by) VALUES ('$1',$(sqlq "${2:-t}"),'todo','dev');"; }
 answered()  { db "SELECT CASE WHEN need_answered_at IS NULL THEN 'open' ELSE 'closed' END FROM tasks WHERE ident='$1';"; }
@@ -277,9 +311,13 @@ unroute DIVE-408
 # filer AFTER filing — the lead is resolved from the stored filer at answer time.
 db "UPDATE tasks SET assignee='orphan', created_by='orphan' WHERE ident='DIVE-408';"
 out=$(cmd_task_answer DIVE-408 --value=approved --from=marcus 2>&1); rc=$?
-[[ $rc -ne 0 && "$(answered DIVE-408)" == "open" ]] \
-  && ok_t "S8 an unresolvable org lead grants NOBODY the authority (fail closed)" \
-  || bad_t "S8 unresolvable lead denies" "rc=$rc state=$(answered DIVE-408) out=$out"
+# ITERATION 2 INVERTS THIS ASSERTION, deliberately. Under iteration 1 an unresolvable
+# CHART meant no authority; under the anchor the chart is not an input at all, so the
+# constitution-named holder clears an orphan filer's gate. That is the behaviour change
+# lodar chose, and asserting the old outcome would quietly re-couple the two.
+[[ $rc -eq 0 && "$(provof DIVE-408)" == "lead:standing:marcus" ]] \
+  && ok_t "S8 an unresolvable CHART is irrelevant — the anchored holder still clears" \
+  || bad_t "S8 anchored holder clears on an unresolvable chart" "rc=$rc prov='$(provof DIVE-408)' out=$out"
 # S8b: THE ARM THAT ACTUALLY EXERCISES THE EMPTY-CHECKS. S8 above only proves the
 # INEQUALITY branch ("marcus" != ""), which a mutant with the -n guards removed still
 # passes. The guards earn their keep only when BOTH sides are empty: a NON-agent caller
@@ -353,45 +391,170 @@ else
   printf 'skip - S10b: src/cmd_push.sh not present\n'
 fi
 
-# ---------------------------------------------------------------------------------
-# S11: THE PRODUCTION CHART SHAPE — the case that caught a real defect in this very
-#      change during self-audit. Our chart has NO literal role='coordinator', so
-#      `_task_resolve_coordinator` returns the single ROOT (olivia, the CEO) while every
-#      builder's actual lead is main. Resolving the lead that way would have granted
-#      this authority to the WRONG agent and withheld it from the one lodar named. The
-#      lead must come from `_gate_route_reviewer` — the filer's manager — exactly as
-#      routing resolves it. Both directions are pinned here.
-# ---------------------------------------------------------------------------------
+# =================================================================================
+# ITERATION 2 — THE ANCHOR. olivia rejected iteration 1 for resolving the holder live
+# at clear time from `agents_org.reports_to`; lodar answered the tier-2 decision gate
+# `anchor-to-named-agent` on 2026-07-27. S11..S15 are that reject, executable.
+#
+# The chart is now RE-POINTED for every arm below to the production shape (olivia root,
+# main the builders' lead) — precisely so that a predicate that still consulted it would
+# give a DIFFERENT answer than the constitution does, and be caught.
+# =================================================================================
 db "DELETE FROM agents_org;"
 db "INSERT INTO agents_org (name, role, reports_to) VALUES ('olivia','AI CEO — conducts the fleet',NULL);"
 db "INSERT INTO agents_org (name, role, reports_to) VALUES ('main','engineering + infra + the 5dive CLI','olivia');"
 db "INSERT INTO agents_org (name, role, reports_to) VALUES ('dev','Backend lane','main');"
-[[ "$(_task_resolve_coordinator)" == "olivia" ]] \
-  && ok_t "S11 precond: the real chart's bare coordinator IS olivia, NOT main" \
-  || bad_t "S11 precond coordinator" "got '$(_task_resolve_coordinator)'"
-[[ "$(_gate_route_reviewer dev)" == "main" ]] \
-  && ok_t "S11 precond: dev's routed lead IS main (what the authority must key off)" \
-  || bad_t "S11 precond route reviewer" "got '$(_gate_route_reviewer dev)'"
 
+# ---------------------------------------------------------------------------------
+# S11: THE REQUIRED TEST from olivia's reject — "mutate the org chart AFTER filing and
+#      assert the clear is REFUSED". This is the self-grant path in one arm: `org set`
+#      is root-guarded (DIVE-2124) but every agent here holds (ALL) NOPASSWD:ALL, so
+#      writing the chart is one sudo away and `by_claimed` is caller-forgeable
+#      (DIVE-2131). mallory files nothing, rewrites the chart to make itself dev's
+#      lead, and tries to clear dev's gate. Under iteration 1 that SUCCEEDED. Every
+#      one of the 54 assertions this suite shipped with treated the chart as trusted
+#      ground truth, which is exactly why none of them could catch it.
+# ---------------------------------------------------------------------------------
+anchor_to marcus
 seed_task DIVE-411 "delegated push for the retry backoff fix"
 cmd_task_need DIVE-411 --type=approval --ask="approve delegated push for review of branch fix-retry-backoff" >/dev/null 2>&1
 unroute DIVE-411
 db "UPDATE tasks SET assignee='dev', created_by='dev' WHERE ident='DIVE-411';"
-FAKE_CALLER="agent-main"
-out=$(cmd_task_answer DIVE-411 --value=approved --from=main 2>&1); rc=$?
-[[ $rc -eq 0 && "$(provof DIVE-411)" == "lead:standing:main" ]] \
-  && ok_t "S11 main — the filer's ACTUAL lead — clears it (the grant lodar made)" \
-  || bad_t "S11 main clears" "rc=$rc prov='$(provof DIVE-411)' out=$out"
+# ... the gate is now FILED. The attacker mutates the chart afterwards.
+db "INSERT INTO agents_org (name, role, reports_to) VALUES ('mallory','Backend lane',NULL);"
+db "UPDATE agents_org SET reports_to='mallory' WHERE name='dev';"
+[[ "$(_gate_route_reviewer dev)" == "mallory" ]] \
+  && ok_t "S11 precond: the post-filing chart mutation DID take (dev now reports to mallory)" \
+  || bad_t "S11 precond chart mutated" "route_reviewer(dev)='$(_gate_route_reviewer dev)'"
+FAKE_CALLER="agent-mallory"
+_af_reset
+out=$(cmd_task_answer DIVE-411 --value=approved --from=mallory 2>&1); rc=$?
+[[ $rc -ne 0 && "$(answered DIVE-411)" == "open" ]] \
+  && ok_t "S11 a chart mutation AFTER filing does NOT confer the authority — REFUSED" \
+  || bad_t "S11 post-filing chart mutation refused" "rc=$rc state=$(answered DIVE-411) prov='$(provof DIVE-411)' out=$out"
+[[ "$(provof DIVE-411)" != *standing* ]] \
+  && ok_t "S11 the self-appointed lead mints no lead:standing provenance" \
+  || bad_t "S11 no standing provenance for self-appointed lead" "got '$(provof DIVE-411)'"
+grep -q "lead-standing-clear" <<<"$(_af)" \
+  && bad_t "S11 no standing audit row for a refused clear" "audit=$(_af)" \
+  || ok_t "S11 emits no lead-standing-clear audit row for the refused attempt"
 
+# ---------------------------------------------------------------------------------
+# S12: THE OTHER DIRECTION, and the non-vacuity partner to S11 — the chart is not
+#      merely ignored WHEN IT HELPS an attacker, it is not consulted at all. marcus is
+#      the constitution's name and is ABSENT from the chart entirely; the clear still
+#      lands. Without this arm, a predicate that simply always denied would pass S11.
+# ---------------------------------------------------------------------------------
+[[ -z "$(_gate_route_reviewer marcus)" && "$(db "SELECT COUNT(*) FROM agents_org WHERE name='marcus';")" == "0" ]] \
+  && ok_t "S12 precond: marcus is NOT in the org chart at all" \
+  || bad_t "S12 precond marcus absent" "route='$(_gate_route_reviewer marcus)'"
 seed_task DIVE-412 "delegated push for the retry backoff fix"
 cmd_task_need DIVE-412 --type=approval --ask="approve delegated push for review of branch fix-retry-backoff" >/dev/null 2>&1
 unroute DIVE-412
 db "UPDATE tasks SET assignee='dev', created_by='dev' WHERE ident='DIVE-412';"
-FAKE_CALLER="agent-olivia"
-out=$(cmd_task_answer DIVE-412 --value=approved --from=olivia 2>&1); rc=$?
-[[ $rc -ne 0 && "$(answered DIVE-412)" == "open" ]] \
-  && ok_t "S11 the chart ROOT who is not this filer's lead is REFUSED" \
-  || bad_t "S11 chart root refused" "rc=$rc state=$(answered DIVE-412) prov='$(provof DIVE-412)' out=$out"
+FAKE_CALLER="agent-marcus"
+_af_reset
+out=$(cmd_task_answer DIVE-412 --value=approved --from=marcus 2>&1); rc=$?
+[[ $rc -eq 0 && "$(provof DIVE-412)" == "lead:standing:marcus" ]] \
+  && ok_t "S12 the CONSTITUTION-named agent clears even with no chart standing at all" \
+  || bad_t "S12 named agent clears" "rc=$rc prov='$(provof DIVE-412)' out=$out"
+grep -q "authority_source=sealed-constitution:authority.eng_approval_lead" <<<"$(_af)" \
+  && ok_t "S12 audit names WHERE the authority came from, not just who used it" \
+  || bad_t "S12 audit names the authority source" "audit=$(_af)"
+grep -q "standing_lead=marcus" <<<"$(_af)" \
+  && ok_t "S12 audit records the anchored holder the clear was checked against" \
+  || bad_t "S12 audit records the anchored holder" "audit=$(_af)"
+
+# ---------------------------------------------------------------------------------
+# S13: DRIFT DENIES EVERYONE. The anchor's whole strength is that writing the file is
+#      self-defeating: an agent CAN sudo a new name in, and the moment it does the live
+#      sha256 stops matching the sealed one. Both halves are pinned — the injected name
+#      gains nothing, AND the legitimate holder loses the authority too (fail closed,
+#      not "fall back to the last good value").
+# ---------------------------------------------------------------------------------
+write_constitution "$(constitution_yaml mallory)"   # edited, NOT re-sealed
+[[ -z "$(_gate_standing_lead)" ]] \
+  && ok_t "S13 a drifted constitution resolves NO standing lead" \
+  || bad_t "S13 drift resolves nobody" "got '$(_gate_standing_lead)'"
+seed_task DIVE-413 "delegated push for the retry backoff fix"
+cmd_task_need DIVE-413 --type=approval --ask="approve delegated push for review of branch fix-retry-backoff" >/dev/null 2>&1
+unroute DIVE-413
+FAKE_CALLER="agent-mallory"
+out=$(cmd_task_answer DIVE-413 --value=approved --from=mallory 2>&1); rc=$?
+[[ $rc -ne 0 && "$(answered DIVE-413)" == "open" ]] \
+  && ok_t "S13 the name an agent WROTE ITSELF into the file is REFUSED (drift)" \
+  || bad_t "S13 injected name refused" "rc=$rc state=$(answered DIVE-413) out=$out"
+seed_task DIVE-414 "delegated push for the retry backoff fix"
+cmd_task_need DIVE-414 --type=approval --ask="approve delegated push for review of branch fix-retry-backoff" >/dev/null 2>&1
+unroute DIVE-414
+FAKE_CALLER="agent-marcus"
+out=$(cmd_task_answer DIVE-414 --value=approved --from=marcus 2>&1); rc=$?
+[[ $rc -ne 0 && "$(answered DIVE-414)" == "open" ]] \
+  && ok_t "S13 drift revokes the LEGITIMATE holder too — the tamper is not survivable" \
+  || bad_t "S13 legit holder also denied under drift" "rc=$rc state=$(answered DIVE-414) out=$out"
+
+# ---------------------------------------------------------------------------------
+# S14: NO SEAL, NO AUTHORITY. A constitution.yaml with no sealed digest behind it is
+#      exactly as writable as the org chart was, so anchoring to it would reproduce the
+#      self-grant path in a different file. An UNSEALED file naming marcus grants
+#      nothing; re-sealing the same bytes restores it (proving the seal is the variable
+#      under test, not some unrelated breakage).
+# ---------------------------------------------------------------------------------
+write_constitution "$(constitution_yaml marcus)"; rm -f "$COUNCIL_LINEAGE"
+[[ -z "$(_gate_standing_lead)" ]] \
+  && ok_t "S14 an UNSEALED constitution grants nobody, even naming the real holder" \
+  || bad_t "S14 unsealed grants nobody" "got '$(_gate_standing_lead)'"
+seed_task DIVE-415 "delegated push for the retry backoff fix"
+cmd_task_need DIVE-415 --type=approval --ask="approve delegated push for review of branch fix-retry-backoff" >/dev/null 2>&1
+unroute DIVE-415
+out=$(cmd_task_answer DIVE-415 --value=approved --from=marcus 2>&1); rc=$?
+[[ $rc -ne 0 && "$(answered DIVE-415)" == "open" ]] \
+  && ok_t "S14 and the clear is refused end-to-end, not just at the resolver" \
+  || bad_t "S14 unsealed clear refused" "rc=$rc state=$(answered DIVE-415) out=$out"
+seal_constitution
+[[ "$(_gate_standing_lead)" == "marcus" ]] \
+  && ok_t "S14 sealing the SAME bytes restores it — the seal is the variable" \
+  || bad_t "S14 seal restores" "got '$(_gate_standing_lead)'"
+
+# ---------------------------------------------------------------------------------
+# S15: THE FIELD ITSELF FAILS CLOSED. Absent, empty, non-name, and misplaced values all
+#      resolve to nobody. Absence of a name is never "everyone" and never a fallback to
+#      the chart — the failure mode a false NEGATIVE here would produce is exactly the
+#      one design note 1 exists to prevent.
+# ---------------------------------------------------------------------------------
+anchor_to ""            # no `authority:` block at all
+[[ -z "$(_gate_standing_lead)" ]] \
+  && ok_t "S15 no authority.eng_approval_lead key -> nobody (not everybody)" \
+  || bad_t "S15 absent key denies" "got '$(_gate_standing_lead)'"
+write_constitution "$(constitution_yaml "" 'authority:
+  eng_approval_lead:')"; seal_constitution
+[[ -z "$(_gate_standing_lead)" ]] \
+  && ok_t "S15 an EMPTY value -> nobody" \
+  || bad_t "S15 empty value denies" "got '$(_gate_standing_lead)'"
+# NB: a bare word like `all` is NOT in this list — it is a legal agent name and is
+# compared literally, so it grants only an agent actually called `all`. There is no
+# wildcard vocabulary in this field, which is the point: `*` below is refused as a name,
+# not interpreted as one.
+for _bad in '"human:marcus"' "'*'" "'MARCUS'" "'../../etc/passwd'" '"marcus; rm -rf /"'; do
+  write_constitution "$(constitution_yaml "" "authority:
+  eng_approval_lead: $_bad")"; seal_constitution
+  [[ -z "$(_gate_standing_lead)" ]] \
+    && ok_t "S15 a non-name value ($_bad) -> nobody" \
+    || bad_t "S15 non-name denies ($_bad)" "got '$(_gate_standing_lead)'"
+done
+# A key of the right NAME under the wrong PARENT must not grant: only a top-level
+# `authority:` block counts, so a nested lookalike elsewhere in the file is inert.
+write_constitution "$(constitution_yaml "" 'ship:
+  eng_approval_lead: marcus')"; seal_constitution
+[[ -z "$(_gate_standing_lead)" ]] \
+  && ok_t "S15 eng_approval_lead under a DIFFERENT top-level key grants nothing" \
+  || bad_t "S15 nested lookalike denies" "got '$(_gate_standing_lead)'"
+# ... and the same bytes under the right parent DO grant, so S15 is not passing because
+# the reader is simply broken.
+anchor_to marcus
+[[ "$(_gate_standing_lead)" == "marcus" ]] \
+  && ok_t "S15 non-vacuity: the reader still resolves a correctly-placed name" \
+  || bad_t "S15 non-vacuity" "got '$(_gate_standing_lead)'"
 FAKE_CALLER="agent-marcus"
 
 printf "\n%d passed, %d failed\n" "$PASS" "$FAIL"
