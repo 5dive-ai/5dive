@@ -1652,6 +1652,37 @@ _task_status_cmd() {
     if [[ "$_tpl_kind" == "recurring" ]]; then
       policy_refuse "$E_CONFLICT" start-on-recurring-template DIVE-2059 "$ident" "$ident is a recurring TEMPLATE (kind='recurring'), not a worked task — 'task start' has no meaning here and would silently stop it firing (the materializer only fires status='todo' templates, DIVE-2055/DIVE-2059). To stop the template use 'task cancel $ident', 'task block $ident --by=<id>', or 'task park $ident --reason=<why> --wake=<when>'. To work an instance it already fired, start that materialized child task instead."
     fi
+    # DIVE-2113: `task start` silently REOPENED a closed, graded task for ANY
+    # actor — neither maker nor verifier. Measured on an isolated fixture:
+    # status done -> in_progress, rc=0, and the ONLY output was an advisory warn
+    # about the assignee. The result survived (milder than the DIVE-2112 reject
+    # bug, which destroyed it), but the grade then described a task the board
+    # showed as OPEN.
+    #
+    # Worse than first recorded, and measured here rather than assumed: done_at
+    # is NOT cleared, so the row lands in_progress WHILE STILL CARRYING a
+    # done_at — internally contradictory, and any reader or query keying off
+    # done_at disagrees with the one keying off status.
+    #
+    # Same family as DIVE-2112: a writer landing on a closed task with no status
+    # check. Measured CLEAN in the same sweep, recorded so nobody re-audits:
+    # block (rc=2), unblock (rc=0), unpark (rc=0), deliver (rc=2) — none mutated
+    # status or result on a closed task.
+    #
+    # NO ALTERNATIVE VERB IS NAMED IN THE REFUSAL, DELIBERATELY. A refusal that
+    # enumerates exits publishes a route around itself, and each named verb
+    # inherits an obligation it was never audited for — that is exactly how
+    # DIVE-2067 happened, where `task done`'s refusal pointed at an unguarded
+    # `task verify --cmd` and a landed verifier ACK was replaced 39 seconds
+    # later. See community/wiki/a-guard-advertises-its-own-bypass.md. A reopen
+    # path exists in the code, but it is not audited as an entry point to a
+    # CLOSED row, so this refusal will not advertise it.
+    local _cs _cd
+    _cs=$(db "SELECT status FROM tasks WHERE id=${id};")
+    if [[ "$_cs" == "done" || "$_cs" == "cancelled" ]]; then
+      _cd=$(db "SELECT COALESCE(done_at,'unknown') FROM tasks WHERE id=${id};")
+      policy_refuse "$E_CONFLICT" start-on-closed-task DIVE-2113 "$ident" "$ident is CLOSED (status='${_cs}', closed ${_cd}) — 'task start' would silently reopen it to in_progress while LEAVING done_at set, so the row contradicts itself and any recorded grade would describe a task the board shows as open. If it genuinely must be reopened, that is a deliberate decision and belongs on the record; no alternative verb is named here on purpose, because a refusal that lists exits publishes a route around itself (DIVE-2067)."
+    fi
   fi
   # DIVE-1375: fail-loud preflight — surface identity/auth/repo gaps at `start`
   # BEFORE the agent burns a turn discovering them mid-task. Advisory only
