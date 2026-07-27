@@ -1,0 +1,162 @@
+# DIVE-2144: cut the release tag. This is the PUBLISH ACT.
+#
+# Under DIVE-2144 install.sh resolves the newest release TAG, not main HEAD. That
+# moves publishing off "someone merged" and onto "someone cut a tag" — and a publish
+# act with no owner is a shipping freeze. lodar answered the cadence gate 2026-07-27
+# 05:16, option A: NIGHTLY AUTO-CUT WHEN MAIN CHANGED AND CI IS GREEN, PLUS A MANUAL
+# CUT FOR HOTFIXES. This job is that answer.
+#
+# READ THIS BEFORE EDITING THE TAG NAME OR THE SORT: this job and install.sh's
+# resolve_gh_tag() are ONE RULE IMPLEMENTED TWICE. install.sh accepts only
+# ^v[0-9]+\.[0-9]+\.[0-9]+$ and takes `sort -V | tail -1`. If this job cuts anything
+# that rule would not select, it publishes nothing while reporting success — the tag
+# exists, the release page looks right, and every box keeps installing the older tag.
+# So the ladder below re-implements the SAME filter and the SAME sort, and then
+# ASSERTS the result actually sorts above the incumbent rather than trusting that it
+# does. That assertion is the one that catches a divergence between the two copies.
+#
+# WHAT THIS JOB DOES NOT DO: it does not bump FIVE_VERSION. version-assign.yml owns
+# the bump at merge; this job only publishes a version that already exists on main.
+# The two must not both write versions or they will race for the same number.
+name: release-cut
+on:
+  schedule:
+    # 03:00 UTC. Deliberately an hour ahead of the fleet's 04:00 self-update cron, so
+    # a nightly cut is available to the boxes that same night rather than a day later.
+    - cron: '0 3 * * *'
+  workflow_dispatch:
+    inputs:
+      reason:
+        description: 'Why this cut is being made by hand (hotfix, incident, first cut)'
+        required: true
+        type: string
+
+concurrency:
+  group: release-cut
+  cancel-in-progress: false
+
+jobs:
+  cut:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # create the tag and the release
+      checks: read      # read the CI verdict on main's tip
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Cut a release tag if main moved and CI is green on it
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MANUAL_REASON: ${{ inputs.reason }}
+        run: |
+          set -uo pipefail
+
+          sha=$(git rev-parse HEAD)
+          version=$(grep -m1 -oE 'FIVE_VERSION="[^"]+"' src/header.sh | sed 's/.*"\(.*\)"/\1/')
+          if [[ -z "$version" ]]; then
+            echo "::error::could not read FIVE_VERSION from src/header.sh on main — refusing to cut."
+            exit 1
+          fi
+          tag="v${version}"
+          echo "main tip ${sha:0:12} carries FIVE_VERSION=${version} -> candidate tag ${tag}"
+
+          # --- the incumbent, resolved by install.sh's OWN rule -------------------
+          # Same filter and same `sort -V` as resolve_gh_tag(). If these two ever
+          # disagree, the assertion further down is what surfaces it.
+          git fetch -q --tags origin
+          incumbent=$(git tag -l | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1)
+          echo "incumbent published tag (install.sh's rule): ${incumbent:-<none>}"
+
+          # --- has main actually moved? ------------------------------------------
+          if git rev-parse -q --verify "refs/tags/${tag}" >/dev/null; then
+            existing=$(git rev-list -n1 "refs/tags/${tag}")
+            if [[ "$existing" == "$sha" ]]; then
+              echo "::notice::${tag} already points at main's tip ${sha:0:12} — main has not moved since the last cut. Nothing to publish."
+              exit 0
+            fi
+            # A version published against one tree and now claimed by another is the
+            # DIVE-2118 failure class. Never move a published tag: boxes that already
+            # took it would silently receive different bytes under a version they
+            # already have, and nothing downstream would ever ask again.
+            echo "::error::${tag} EXISTS at ${existing:0:12} but main's tip is ${sha:0:12}. A published version is being claimed by a second tree. NOT re-pointing the tag. Bump FIVE_VERSION on main (scripts/version-assign.sh) so the new tree gets its own version."
+            exit 1
+          fi
+
+          # --- CI verdict on THAT EXACT SHA, and it must be non-vacuous ----------
+          # "no failing checks" is satisfied by "no checks at all", which is exactly
+          # the state a GITHUB_TOKEN push leaves behind (token pushes do not trigger
+          # workflows — see version-assign.yml). Treating that as green would publish
+          # an ungraded tree at precisely the moment our grading is broken, which is
+          # the failure this whole ticket exists to retire. So: count first.
+          runs=$(gh api --paginate "repos/${GITHUB_REPOSITORY}/commits/${sha}/check-runs" \
+                   --jq '.check_runs[] | [.name, .status, (.conclusion // "pending")] | @tsv' 2>/dev/null)
+          # >>> DIVE-2144 release-cut guard block (extracted verbatim by tests/release_cut_guards_unit.sh)
+          total=$(printf '%s' "$runs" | grep -c . || true)
+
+          if (( total == 0 )); then
+            echo "::error::CI NOT REACHED on ${sha:0:12} — ZERO check-runs exist for this commit, which is NOT the same as green. Refusing to cut ${tag}. (A GITHUB_TOKEN push does not trigger workflows; dispatch bundle-drift against main, let it complete, then re-run this job.)"
+            exit 1
+          fi
+
+          incomplete=$(awk -F'\t' '$2 != "completed"' <<<"$runs")
+          bad=$(awk -F'\t' '$3 != "success" && $3 != "skipped" && $3 != "neutral"' <<<"$runs" | awk -F'\t' '$2 == "completed"')
+
+          echo "CI on ${sha:0:12}: ${total} check-run(s)"
+          printf '%s\n' "$runs" | sed 's/^/  /'
+
+          if [[ -n "$incomplete" ]]; then
+            echo "::error::CI still IN FLIGHT on ${sha:0:12} — refusing to cut ${tag}. Unfinished:"
+            printf '%s\n' "$incomplete" | sed 's/^/  /'
+            exit 1
+          fi
+          if [[ -n "$bad" ]]; then
+            echo "::error::CI is RED on ${sha:0:12} — refusing to cut ${tag}. Failing:"
+            printf '%s\n' "$bad" | sed 's/^/  /'
+            exit 1
+          fi
+          echo "CI green on ${sha:0:12}: ${total}/${total} completed, none failing."
+          # <<< DIVE-2144 release-cut guard block
+
+          # --- the candidate must WIN install.sh's sort, not merely exist ---------
+          # Without this, a cut that is lexically fine but version-sorts BELOW the
+          # incumbent succeeds, exits 0, and publishes precisely nothing. The tag page
+          # would show it; no box would ever install it.
+          # Note the tie: `sort -V | tail -1` returns its LAST input when the two are
+          # equal, so a naive `winner != tag` check passes a tie. That is unreachable
+          # here (the tag-exists branch above already returned), but a guard that is
+          # correct only because of a precondition somewhere else stops being correct
+          # the moment someone reorders the steps. Reject `<=`, not `<`.
+          # >>> DIVE-2144 sort-assertion block (extracted verbatim by tests/release_cut_guards_unit.sh)
+          if [[ -n "$incumbent" ]]; then
+            winner=$(printf '%s\n%s\n' "$incumbent" "$tag" | sort -V | tail -1)
+            if [[ "$winner" != "$tag" || "$tag" == "$incumbent" ]]; then
+              echo "::error::${tag} does NOT sort above the incumbent ${incumbent} under 'sort -V', so install.sh would keep resolving ${incumbent} and this cut would publish NOTHING while succeeding. Refusing."
+              exit 1
+            fi
+          fi
+          # <<< DIVE-2144 sort-assertion block
+
+          # --- publish -----------------------------------------------------------
+          note="nightly auto-cut: main changed and CI is green (lodar 2026-07-27, cadence option A)"
+          [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]] && note="manual cut: ${MANUAL_REASON}"
+
+          git config user.name  'lodar'
+          git config user.email 'markounik@gmail.com'
+          git tag -a "$tag" "$sha" -m "${tag} — ${note}
+
+          Publishes ${sha} as the tree every box installs (DIVE-2144). CI green on
+          this exact sha: ${total} completed check-runs, none failing."
+          if ! git push origin "refs/tags/${tag}"; then
+            echo "::error::tag push rejected — ${tag} was NOT published. Nothing changed for any box; they keep installing ${incumbent:-the previous tag}."
+            exit 1
+          fi
+
+          gh release create "$tag" --title "$tag" --target "$sha" --notes "${note}
+
+          Installed by every box via install.sh's tag resolver (DIVE-2144). Previous published tag: ${incumbent:-none}." \
+            || echo "::warning::THE TAG IS PUBLISHED and boxes will take ${tag} — only the release PAGE failed to create. Not an error in the publish; create the release by hand if you want the notes."
+
+          echo "::notice::published ${tag} at ${sha:0:12} (was ${incumbent:-none}) — this is what every box now installs"

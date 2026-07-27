@@ -1,0 +1,19 @@
+# DIVE-2144, scope item 4. install.sh is the ONE file that survives the cutover as a
+# mutable-main-to-root path: cmd_selfupdate.sh re-fetches it from raw main on EVERY
+# upgrade and runs it as root via sudo bash. Publishing from a tag does not remove
+# that risk, it CONCENTRATES it — one small file instead of a 47k-line bundle, which
+# is a large improvement and also means a bad merge to this one path is still
+# instantly live on every box. Gate it accordingly. (olivia's finding 4.)
+#
+# WHY @lodar AND NOT A TEAM: the first cut of this file said @5dive-ai/maintainers.
+# That team does not exist — `gh api orgs/5dive-ai/teams` is empty and lodar is the
+# repo's only collaborator. GitHub does not fail a CODEOWNERS entry naming a
+# nonexistent team by refusing the merge; it just never requests the review. The file
+# would have looked like a gate and been a no-op, which is the exact failure class
+# this ticket exists to retire. Name a real owner or name none.
+#
+# CODEOWNERS only REQUESTS review on its own. It becomes a REQUIRED approval when
+# "Require review from Code Owners" is enabled in main's branch protection — a
+# repo-admin setting this file cannot set and does not claim to have set.
+/install.sh            @lodar
+/src/cmd_selfupdate.sh @lodar

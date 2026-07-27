@@ -1,0 +1,54 @@
+# DIVE-2144, scope item 4: put the root-path diff in front of a human on every PR.
+#
+# After the tag cutover, install.sh is the only file still fetched from mutable main
+# and executed AS ROOT on every box (cmd_selfupdate.sh re-fetches and runs it on each
+# upgrade). A change to it is live on the whole fleet the moment it merges, with no
+# tag in between. This job does not block that — CODEOWNERS plus branch protection is
+# what blocks it. This job makes it IMPOSSIBLE TO MERGE ONE WITHOUT HAVING SEEN IT:
+# the full diff lands in the job summary, so "I didn't realise that PR touched the
+# root path" stops being available as an explanation.
+name: install-guard
+on:
+  pull_request:
+    paths:
+      - 'install.sh'
+      - 'src/cmd_selfupdate.sh'
+
+jobs:
+  diff:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Surface the root-path diff
+        run: |
+          set -uo pipefail
+          base="${{ github.event.pull_request.base.sha }}"
+          head="${{ github.event.pull_request.head.sha }}"
+          files=$(git diff --name-only "$base" "$head" -- install.sh src/cmd_selfupdate.sh)
+
+          # The path filter above already decided this job should run, so an empty
+          # diff here means the filter and the diff disagree — do not report "clean".
+          if [[ -z "$files" ]]; then
+            echo "::warning::install-guard ran but sees no diff in install.sh or cmd_selfupdate.sh between ${base:0:12} and ${head:0:12}. The path filter and the diff disagree; this is NOT an all-clear."
+            exit 0
+          fi
+
+          {
+            echo "## Root-path change — read this diff"
+            echo
+            echo "This PR changes a file that is fetched from **mutable main** and executed"
+            echo "**as root** on every box during self-update. It goes live on the whole fleet"
+            echo "at merge, with no release tag in between (DIVE-2144)."
+            echo
+            echo "Changed: \`$(tr '\n' ' ' <<<"$files")\`"
+            echo
+            echo '```diff'
+            git diff "$base" "$head" -- install.sh src/cmd_selfupdate.sh
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          echo "::warning::This PR modifies the root-execution path ($(tr '\n' ' ' <<<"$files")). It reaches every box at merge, ungated by any tag. Full diff is in the job summary."
