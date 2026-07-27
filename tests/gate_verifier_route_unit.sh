@@ -44,45 +44,45 @@ route_sent()  { local i n; for i in $(seq 1 10); do [[ -s "$ROUTE_FILE" ]] && br
 route_last()  { local i; for i in $(seq 1 10); do [[ -s "$ROUTE_FILE" ]] && break; sleep 0.05; done; tail -n1 "$ROUTE_FILE" 2>/dev/null; }
 
 # Org chart: main is the lone root/coordinator; dev reports to main.
-db "INSERT INTO agents_org(name,reports_to,role) VALUES('main',NULL,'coordinator');"
-db "INSERT INTO agents_org(name,reports_to,role) VALUES('dev','main','builder');"
+db "INSERT INTO agents_org(name,reports_to,role) VALUES('fixture-verifier',NULL,'coordinator');"
+db "INSERT INTO agents_org(name,reports_to,role) VALUES('fixture-maker','fixture-verifier','builder');"
 
-# A live maker→verifier loop task: maker=dev, verifier=main, dev holds it.
+# A live maker→verifier loop task: maker=fixture-maker, verifier=fixture-verifier, dev holds it.
 seed_loop() {
   db "INSERT INTO tasks(ident,title,status,created_by,assignee,verifier,maker_agent,iteration,max_iterations)
-      VALUES('$1','loop task','todo','dev','dev','main','dev',1,5);"
+      VALUES('$1','loop task','todo','fixture-maker','fixture-maker','fixture-verifier','fixture-maker',1,5);"
 }
 
 # ---- 1. maker's decision gate routes to the verifier agent, not the human ----
 route_reset; seed_loop DIVE-501
 cmd_task_need DIVE-501 --type=decision --options='A|B' --recommend='A' \
-  --ask='Which schema for the field?' --from=dev >/dev/null 2>&1
-[[ "$(route_last)" == "main" ]] \
-  && ok_t "maker decision gate routes to verifier 'main'" \
-  || bad_t "maker decision gate routes to verifier 'main'" "route_last=$(route_last) human=$HUMAN_PINGED"
-[[ "$(db "SELECT COALESCE(routed_reviewer,'') FROM tasks WHERE ident='DIVE-501';")" == "main" ]] \
+  --ask='Which schema for the field?' --from=fixture-maker >/dev/null 2>&1
+[[ "$(route_last)" == "fixture-verifier" ]] \
+  && ok_t "maker decision gate routes to verifier 'fixture-verifier'" \
+  || bad_t "maker decision gate routes to verifier 'fixture-verifier'" "route_last=$(route_last) human=$HUMAN_PINGED"
+[[ "$(db "SELECT COALESCE(routed_reviewer,'') FROM tasks WHERE ident='DIVE-501';")" == "fixture-verifier" ]] \
   && ok_t "routed_reviewer persisted as verifier" \
   || bad_t "routed_reviewer persisted as verifier" "got=$(db "SELECT routed_reviewer FROM tasks WHERE ident='DIVE-501';")"
 
 # ---- 2. approval gate on the loop also routes to the verifier ----
 route_reset; seed_loop DIVE-502
-cmd_task_need DIVE-502 --type=approval --ask='OK to merge the refactor?' --from=dev >/dev/null 2>&1
-[[ "$(route_last)" == "main" ]] \
-  && ok_t "maker approval gate routes to verifier 'main'" \
-  || bad_t "maker approval gate routes to verifier 'main'" "route_last=$(route_last) human=$HUMAN_PINGED"
+cmd_task_need DIVE-502 --type=approval --ask='OK to merge the refactor?' --from=fixture-maker >/dev/null 2>&1
+[[ "$(route_last)" == "fixture-verifier" ]] \
+  && ok_t "maker approval gate routes to verifier 'fixture-verifier'" \
+  || bad_t "maker approval gate routes to verifier 'fixture-verifier'" "route_last=$(route_last) human=$HUMAN_PINGED"
 
 # ---- 3. filer IS the verifier -> no self-route (max-iters escalation stays human) ----
 route_reset; seed_loop DIVE-503
 cmd_task_need DIVE-503 --type=decision --options='A|B' --recommend='A' \
-  --ask='pick one' --from=main >/dev/null 2>&1
-[[ "$(route_last)" != "main" ]] \
+  --ask='pick one' --from=fixture-verifier >/dev/null 2>&1
+[[ "$(route_last)" != "fixture-verifier" ]] \
   && ok_t "verifier's own gate does not self-route to itself" \
   || bad_t "verifier's own gate does not self-route to itself" "route_last=$(route_last)"
 
 # ---- 4. tier-2 category floor (money) stays human even on a loop ----
 route_reset; seed_loop DIVE-504
 cmd_task_need DIVE-504 --type=decision --options='A|B' --recommend='A' \
-  --ask='Approve the $5000 refund to the customer?' --from=dev >/dev/null 2>&1
+  --ask='Approve the $5000 refund to the customer?' --from=fixture-maker >/dev/null 2>&1
 [[ "$HUMAN_PINGED" == "1" && "$(route_sent)" == "0" ]] \
   && ok_t "tier-2 money floor stays human, not verifier-routed" \
   || bad_t "tier-2 money floor stays human, not verifier-routed" "human=$HUMAN_PINGED sent=$(route_sent)"
@@ -91,7 +91,7 @@ cmd_task_need DIVE-504 --type=decision --options='A|B' --recommend='A' \
 # Seed a loop task carrying an OPEN manual gate, then reject it.
 db "INSERT INTO tasks(ident,title,status,created_by,assignee,verifier,maker_agent,iteration,max_iterations,
       need_type,ask,need_answered_at)
-    VALUES('DIVE-505','loop','blocked','dev','dev','main','dev',1,5,'manual','pending human thing',NULL);"
+    VALUES('DIVE-505','loop','blocked','fixture-maker','fixture-maker','fixture-verifier','fixture-maker',1,5,'manual','pending human thing',NULL);"
 cmd_task_reject DIVE-505 --feedback='needs another pass' >/dev/null 2>&1
 gate_open=$(db "SELECT CASE WHEN need_type IS NOT NULL AND need_answered_at IS NULL THEN 1 ELSE 0 END FROM tasks WHERE ident='DIVE-505';")
 answered_by=$(db "SELECT COALESCE(need_answered_by,'') FROM tasks WHERE ident='DIVE-505';")
