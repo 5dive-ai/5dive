@@ -58,7 +58,10 @@ for (( try=1; try<=ATTEMPTS; try++ )); do
     exit 3   # nothing owed; the reason is printed above
   fi
 
-  git add src/header.sh 5dive 5dive.sha256
+  # DIVE-2091: the bundle is generated at tag time and gitignored on main, so
+  # `git add 5dive` here would fail ("paths are ignored") and break the performer.
+  # Only the version bump belongs on main now.
+  git add src/header.sh
   git commit -q -m "release: assign $(grep -m1 -oE 'FIVE_VERSION="[^"]+"' src/header.sh | sed 's/.*"\(.*\)"/\1/') at merge (DIVE-2118, automated)
 
 The bundle changed on main without FIVE_VERSION moving. CONTRIBUTING assigns the

@@ -35,7 +35,10 @@ for a in "$@"; do [[ "$a" == "--apply" ]] && APPLY=1; done
 BASE="${BASE:-${NEW}^}"
 
 ver_at() { git show "$1:src/header.sh" 2>/dev/null | grep -m1 -oE '^readonly FIVE_VERSION="[^"]+"' | sed 's/.*"\(.*\)"/\1/'; }
-sha_at() { git show "$1:5dive.sha256" 2>/dev/null | cut -d' ' -f1; }
+# DIVE-2091: 5dive.sha256 is generated at tag time and no longer committed, so it
+# cannot be read from a commit. It was only ever a proxy for "did the source
+# change" — ask that directly. Same exemption for workflow/doc-only pushes.
+_src_changed() { ! git diff --quiet "$1" "$2" -- src build.sh 2>/dev/null; }
 
 if ! git rev-parse --verify --quiet "$NEW" >/dev/null; then
   echo "version-assign: UNDETERMINED — no such rev '$NEW'. This is NOT a pass." >&2; exit 2
@@ -45,21 +48,17 @@ if ! git rev-parse --verify --quiet "$BASE" >/dev/null; then
 fi
 
 v_new=$(ver_at "$NEW"); v_base=$(ver_at "$BASE")
-s_new=$(sha_at "$NEW"); s_base=$(sha_at "$BASE")
+src_moved=0; _src_changed "$BASE" "$NEW" && src_moved=1
 
 # Fail-open must be LOUD, and the two unreadable causes must not share a message.
 if [[ -z "$v_new" ]]; then
   echo "version-assign: UNDETERMINED — could not read FIVE_VERSION at '$NEW' (missing src/header.sh, or the 'readonly FIVE_VERSION=' anchor drifted). This is NOT a pass." >&2; exit 2
 fi
-if [[ -z "$s_new" ]]; then
-  echo "version-assign: UNDETERMINED — could not read 5dive.sha256 at '$NEW'. This is NOT a pass." >&2; exit 2
-fi
-
-if [[ "$s_new" == "$s_base" ]]; then
-  echo "version-assign: no assignment needed — the bundle is unchanged since '$BASE' (workflow/doc-only push)."; exit 0
+if [[ "$src_moved" == "0" ]]; then
+  echo "version-assign: no assignment needed — src/ and build.sh are unchanged since '$BASE' (workflow/doc-only push)."; exit 0
 fi
 if [[ "$v_new" != "$v_base" ]]; then
-  echo "version-assign: no assignment needed — the bundle changed AND FIVE_VERSION already moved ($v_base -> $v_new); whoever merged assigned it."; exit 0
+  echo "version-assign: no assignment needed — src changed AND FIVE_VERSION already moved ($v_base -> $v_new); whoever merged assigned it."; exit 0
 fi
 
 # The bundle moved and the version did not: this is the assignment nobody performed.
@@ -68,7 +67,7 @@ if [[ ! "$v_new" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
 fi
 NEXT="${BASH_REMATCH[1]}.${BASH_REMATCH[2]}.$(( BASH_REMATCH[3] + 1 ))"
 
-echo "version-assign: ASSIGNMENT OWED — bundle changed ($s_base -> $s_new) with FIVE_VERSION still $v_new."
+echo "version-assign: ASSIGNMENT OWED — src/ changed since '$BASE' with FIVE_VERSION still $v_new."
 echo "version-assign: next = $NEXT"
 (( APPLY )) || { echo "version-assign: --apply not given; nothing written."; exit 0; }
 
