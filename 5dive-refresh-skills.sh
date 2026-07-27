@@ -39,6 +39,14 @@ FIVE_BIN="${FIVE_BIN:-/usr/local/bin/5dive}"
 # newly-added defaults like openagent onto pre-existing boxes.
 DEFAULT_SKILLS=(
   "5dive-ai/skills:openagent"
+  # DIVE-2158: 5dive-cli was MISSING here while being seeded at provisioning
+  # (cmd_agent_create.sh: skills_specs=("5dive-cli")), so every agent carried a
+  # copy that this script could never refresh — the loop below iterates ONLY
+  # DEFAULT_SKILLS, there is no refresh-what-is-installed path. Result: a skill
+  # resync reached the repo and never reached a single agent, silently, while
+  # the maintenance wiki told people to "refresh via 5dive-refresh-skills.sh".
+  # The mechanism was right and the DATA was wrong, which is why nothing failed.
+  "5dive-ai/skills:5dive-cli"
 )
 
 [[ -x "$FIVE_BIN" ]] || { echo "no 5dive at $FIVE_BIN — skipping skills refresh" >&2; exit 0; }
