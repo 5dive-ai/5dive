@@ -88,18 +88,25 @@ REPO="$TMP/repo"; mkdir -p "$REPO"
   git checkout -q -b feature-badauthor
   git commit -q --allow-empty -m "other-author" --author="$OTHER"
   git checkout -q master 2>/dev/null || git checkout -q main 2>/dev/null || true
-  # DIVE-2161: a real work tree always has a remote-tracking main, and the author
-  # scan now uses it as a CACHED range bound when a fresh fetch is impossible
-  # (these tests have no credential for the constant target). Without it this
-  # fixture is unrepresentative — the scan would correctly SKIP for want of any
-  # bound and the author assertions below would stop measuring anything. The
-  # verdicts asserted are unchanged; only the bound they rest on is now realistic.
+  # DIVE-2161. This repo's default branch is master, so `git fetch <url> main` —
+  # what the author scan runs — has ALWAYS failed here ("couldn't find remote ref
+  # main"). Pre-2161 that fell through to the unbounded fallback, which is the
+  # defect: every author assertion in this file was graded through the broken
+  # branch, and the harness header even documented it ("the fetch no-ops and it
+  # scans the branch"). Give the fixture the remote-tracking main every real work
+  # tree has, so those assertions rest on a real range bound instead. Verified
+  # load-bearing by deletion: without this line, `set committer: non-matching
+  # author -> refuse`, `author refusal names the repo it checked against` and the
+  # two cached-bound arms below all stop grading (the scan correctly SKIPs).
   git update-ref refs/remotes/origin/main HEAD
 ) >/dev/null 2>&1
 
 # run_push <ident> [args...] — capture combined output + rc from cmd_push, run
 # inside the scratch repo (git checks need a work tree). --repo points at the
-# local repo so the author scan's `git fetch` no-ops and it scans the branch.
+# local repo. Its default branch is master, so the author scan's `git fetch <url>
+# main` fails and the scan falls to the CACHED refs/remotes/origin/main seeded
+# above (DIVE-2161 — before that ref existed, this fell to the unbounded fallback
+# that DIVE-2161 removed, i.e. these assertions were graded through the bug).
 run_push() {
   local ident="$1"; shift
   ( cd "$REPO"; cmd_push "$ident" --repo="file://$REPO" "$@" ) 2>&1
@@ -601,6 +608,40 @@ mutate() { # <name> <sed-expr> -> path to the mutated source, or "" if sed no-op
 mut_scan3() { # <mutated-src> <branch> <repo-url> <mode>
   ( source "$1" >/dev/null 2>&1; _push_author_scan "$REPO3" "$3" "$2" "$AUTHOR" "a test" "$4" ) 2>&1
 }
+
+# --- main's review note. The two DIVE-1461 author assertions near the top now
+# rest on the CACHED bound this fixture gained (`update-ref` above): without a
+# remote-tracking main the pre-flight would correctly SKIP and those assertions
+# would keep printing ok while grading nothing. Grade them here so nobody later
+# has to wonder whether they still red. Forced onto the cached rung with an
+# unfetchable --repo — otherwise whether an ambient fetch of the constant target
+# happens to succeed on the box decides which bound they use.
+seed_task DIVE-961 "Branch: feature-badauthor" approval "2026-07-18 00:00:00" "yes"
+seed_task DIVE-962 "Branch: feature-ok"        approval "2026-07-18 00:00:00" "yes"
+cached_push() { ( cd "$REPO"; GITHUB_APP_COMMIT_AUTHOR="$AUTHOR" cmd_push "$1" --repo="$UNFETCHABLE" --dry-run ) 2>&1; }
+mut_cached_push() { ( source "$1" >/dev/null 2>&1; cd "$REPO"; GITHUB_APP_COMMIT_AUTHOR="$AUTHOR" cmd_push "$2" --repo="$UNFETCHABLE" --dry-run ) 2>&1; }
+
+out=$(cached_push DIVE-961); rc=$?
+{ [[ $rc -ne 0 ]] && grep -q "author check FAILED" <<<"$out"; } \
+  && ok_t "2161: on the cached bound a bad author is still REFUSED (the 1461 assertion still grades)" \
+  || bad_t "2161: on the cached bound a bad author is still REFUSED" "rc=$rc :: $out"
+
+out=$(cached_push DIVE-962); rc=$?
+{ [[ $rc -eq 0 ]] && grep -q "CACHED bound, may be stale" <<<"$out"; } \
+  && ok_t "2161: a clean branch passes on the cached bound, and the dry-run SAYS the bound was cached" \
+  || bad_t "2161: a clean branch passes on the cached bound, and the dry-run SAYS the bound was cached" "rc=$rc :: $out"
+
+# M0 — take the cached bound away and the refusal above stops being produced:
+# proof that it is the cached rung doing the grading, not an ambient fetch.
+if M0=$(mutate m0 's|^    for cref in refs/remotes/origin/main refs/remotes/origin/master; do|    for cref in refs/remotes/__no_such_ref__; do|'); then
+  out=$(mut_cached_push "$M0" DIVE-961); rc=$?
+  { [[ $rc -eq 0 ]] && ! grep -q "author check FAILED" <<<"$out" \
+      && grep -q "author check SKIPPED here" <<<"$out"; } \
+    && ok_t "2161-MUT: without the cached bound the 1461 author assertion stops grading (arm is live)" \
+    || bad_t "2161-MUT: without the cached bound the 1461 author assertion stops grading" "rc=$rc :: $out"
+else
+  bad_t "2161-MUT: cached-bound grade of the 1461 assertions" "sed did not change cmd_push.sh — anchor moved"
+fi
 
 # M1 — the refusal widens to the whole history again (the exact pre-fix line).
 if M1=$(mutate m1 's|^      fail "\$E_GENERIC" "author check COULD NOT RUN.*|      rangespec="refs/heads/${branch}"; scope="MUTATED: the pre-2161 unbounded fallback"|'); then
