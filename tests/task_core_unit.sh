@@ -35,6 +35,35 @@ jf()  { jq -r "$1" 2>/dev/null; }
 
 tasks_db_init
 
+# DIVE-2124: seed the org chart DIRECTLY, never through `org set`.
+# `org set` is root-only now — the chart is trusted input to gate routing, so
+# writing it is a privileged act. A FIXTURE has no business exercising authz: it
+# needs the ROW, not the verb. Calling the verb here made 11 arms in this file and
+# its sibling fail for a reason with nothing to do with what they test, and every
+# one that died was a gate-routing verifier-resolution arm — the exact consumer the
+# authz change exists to protect. Seeding the row keeps require_root REAL in this
+# harness (no global stub, which would hide a future guard regression) while the
+# arms go on testing what they are about.
+org_seed() {  # <name> [--manager=x] [--role=x] [--title=x]
+  local n="$1"; shift
+  local mgr="" role="" title="" a
+  for a in "$@"; do
+    case "$a" in
+      --manager=*) mgr="${a#*=}" ;;
+      --role=*)    role="${a#*=}" ;;
+      --title=*)   title="${a#*=}" ;;
+    esac
+  done
+  db "INSERT OR IGNORE INTO agents_org (name) VALUES ($(sqlq "$n"));"
+  if [[ -n "$mgr" ]]; then
+    db "INSERT OR IGNORE INTO agents_org (name) VALUES ($(sqlq "$mgr"));
+        UPDATE agents_org SET reports_to=$(sqlq "$mgr") WHERE name=$(sqlq "$n");"
+  fi
+  [[ -n "$role"  ]] && db "UPDATE agents_org SET role=$(sqlq "$role")   WHERE name=$(sqlq "$n");"
+  [[ -n "$title" ]] && db "UPDATE agents_org SET title=$(sqlq "$title") WHERE name=$(sqlq "$n");"
+  return 0
+}
+
 # --- T1: add mints DIVE-N idents from the per-project counter
 id1=$(run add --assignee=alice -- "first task" | jf '.data.id')
 ident1=$(db "SELECT ident FROM tasks WHERE id=$id1;")
@@ -148,7 +177,7 @@ run start "$identz" >/dev/null
 
 # --- T15: DIVE-969 verifier-by-default posture
 # Stand up a coordinator so a grader distinct from the maker can be resolved.
-( cmd_org_set carol --role=coordinator ) >/dev/null 2>"$TMP"/err
+org_seed carol --role=coordinator
 # --- DIVE-1568: `task coordinator` verb exposes the resolved coordinator so the
 # needs-you banner can pin on ONE agent only. carol holds role='coordinator'.
 [[ "$(run coordinator | jf '.data.coordinator')" == "carol" ]] \
@@ -214,7 +243,7 @@ selfg_ls=$(run ls --all | jq -r --argjson i "$selfgid" '.data.tasks[] | select(.
 # The lone-root coordinator (carol) owns every auto-coordinated task, so
 # maker==coordinator constantly. Give the org a designated technical deputy and
 # carol's OWN work grades to that deputy instead of getting no grader at all.
-( cmd_org_set zoe --manager=carol --title="Zoe · CTO" ) >/dev/null 2>"$TMP"/err
+org_seed zoe --manager=carol --title="Zoe · CTO"
 zg=$(run add --assignee=carol --body="coordinator's own work" -- "carol builds it")
 [[ "$(echo "$zg" | jf '.data.verifyDefaulted')" == "true" && \
    "$(echo "$zg" | jf '.data.verifier')" == "zoe" ]] \
@@ -230,10 +259,10 @@ mgr=$(run add --assignee=zoe --body="zoe's real work" -- "zoe builds it")
 # --- DIVE-980: org-chart assignee-token routing on `task add` --------------
 # Place a small org: eng (role=engineer, charter mentions "backend"), doc,
 # and two designers (ambiguous role) to prove deterministic single-match only.
-( cmd_org_set eng --role=engineer --title="backend platform" ) >/dev/null 2>&1
-( cmd_org_set doc --role=writer --title="docs and copy" )      >/dev/null 2>&1
-( cmd_org_set d1  --role=designer )                            >/dev/null 2>&1
-( cmd_org_set d2  --role=designer )                            >/dev/null 2>&1
+org_seed eng --role=engineer --title="backend platform"
+org_seed doc --role=writer --title="docs and copy"
+org_seed d1  --role=designer
+org_seed d2  --role=designer
 
 # role:<r> routes to the unique holder
 r1=$(run add --assignee=role:engineer --body="w" -- "route by role")

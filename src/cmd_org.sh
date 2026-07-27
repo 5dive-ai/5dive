@@ -17,7 +17,11 @@ _org_usage() {
   5dive org ls                                       # flat list of everyone placed
   5dive org rm <agent>                               # remove (reports re-parent to null)
 
-  Any agent (group claude) can run these without sudo. Add --json for machine output.
+  READS (tree/show/ls) — any agent (group claude), no sudo.
+  WRITES (set/rm)      — root only. The chart is trusted input to gate routing
+                         (_gate_route_reviewer reads reports_to), so re-parenting is
+                         a fleet privilege change, not bookkeeping (DIVE-2124).
+  Add --json for machine output.
 USAGE
 }
 
@@ -36,6 +40,25 @@ cmd_org() {
 }
 
 cmd_org_set() {
+  # DIVE-2124 — the org chart is a SECURITY-RELEVANT TABLE and was writable by every
+  # principal it governs. There was no EUID/authorization check here at all, and the
+  # usage text advertised the hole as a feature ("any agent can run these without
+  # sudo"). Measured live before the fix: `sudo -u agent-dev 5dive org set
+  # testprobe-2099 --manager=dev` returned OK and the row landed in agents_org.
+  #
+  # WHY IT IS NOT BOOKKEEPING: _gate_route_reviewer(filer) resolves a builder's gate
+  # reviewer from agents_org.reports_to. An agent that can set its OWN reports_to can
+  # choose who reviews the gates it files — a self-grant on the authority path. Today
+  # routed_reviewer is stamped into the task row at filing time, which bounds the
+  # blast radius for gates ALREADY filed, but the resolution itself is live at filing,
+  # and any future live resolution inherits the same hole. Fixing the write side ends
+  # the class rather than the instance.
+  #
+  # Reads stay open (tree/show/ls) — agents need to see the chart to route work; it is
+  # writing it that is privileged. Legitimate writers are unaffected: `hire` and
+  # `compose up` reach ensure_state -> require_root before they ever get here
+  # (verified: `sudo -u agent-dev 5dive hire` already fails "must run as root").
+  require_root "org set"
   tasks_db_init
   local name="" manager="" role="" title=""
   local mgr_set=0 role_set=0 title_set=0
@@ -86,6 +109,30 @@ cmd_org_set() {
   fi
   (( role_set ))  && db "UPDATE agents_org SET role=$(sqlq_or_null "$role"),   updated_at=datetime('now') WHERE name=$(sqlq "$name");"
   (( title_set )) && db "UPDATE agents_org SET title=$(sqlq_or_null "$title"), updated_at=datetime('now') WHERE name=$(sqlq "$name");"
+
+  # DIVE-2124 — record the chart write, and be honest about what the record proves.
+  # require_root is a hard boundary only where agents lack blanket sudo; on THIS host
+  # they have NOPASSWD:ALL (measured), so `sudo 5dive org set` stays reachable.
+  #
+  # by_claimed IS NOT EVIDENCE, and is named so it cannot be read as any. It is
+  # SUDO_USER, a plain environment variable, and the verifier forged it:
+  #   sudo -u agent-dev sudo -n env SUDO_USER=lodar SUDO_UID=0 <build> org set ...
+  # produced a record reading {user:lodar, by=lodar} for a write actually performed by
+  # agent-dev — an agent self-grant on the gate-routing path logged as an act by the
+  # human CEO. That is WORSE than no attribution, because the trail points somewhere
+  # specific and wrong. The field is kept and relabelled rather than dropped: the
+  # honest half (a write happened, to whom, on which edge) is still worth having.
+  #
+  # The textbook fix does not work on this host: /proc/self/loginuid is unset
+  # (4294967295, byte-identical honest and forged) because agents run as systemd
+  # services with no PAM login. The authoritative record of who invoked sudo is
+  # sudo's OWN journal entry, which this process neither writes nor can forge —
+  # correlate there when attribution actually has to hold. Until something does that,
+  # this arm does NOT close the blanket-sudo gap and must not be described as if it
+  # does.
+  local _aud_mgr="(unchanged)"
+  if (( mgr_set )); then (( mgr_clear )) && _aud_mgr="(cleared)" || _aud_mgr="$mgr_name"; fi
+  audit_log "org set" ok 0 -- "agent=$name" "reports_to=$_aud_mgr" "by_claimed=${SUDO_USER:-root}"
 
   if (( JSON_MODE )); then
     local row; row=$(dbfmt -json "SELECT name, reports_to, role, title FROM agents_org WHERE name=$(sqlq "$name");")
@@ -161,6 +208,10 @@ cmd_org_ls() {
 }
 
 cmd_org_rm() {
+  # DIVE-2124 — a write, and the more destructive one: removing a row re-parents that
+  # agent's reports to NULL, which changes routing for everyone under them. Gated with
+  # `set` rather than left open, or the guard is trivially bypassed by rm-then-set.
+  require_root "org rm"
   tasks_db_init
   [[ $# -gt 0 ]] || fail "$E_USAGE" "usage: 5dive org rm <agent>"
   local name="$1"
@@ -168,5 +219,7 @@ cmd_org_rm() {
   local exists; exists=$(db "SELECT 1 FROM agents_org WHERE name=$(sqlq "$name");")
   [[ -n "$exists" ]] || fail "$E_NOT_FOUND" "agent '$name' is not placed in the org chart"
   db "DELETE FROM agents_org WHERE name=$(sqlq "$name");"
+  # by_claimed: caller-controlled, not evidence — see the note in cmd_org_set.
+  audit_log "org rm" ok 0 -- "agent=$name" "by_claimed=${SUDO_USER:-root}"
   ok "$name removed from org chart" '{name:$n, removed:true}' --arg n "$name"
 }
