@@ -8903,9 +8903,20 @@ SUDOERS
 # SUDOERS_D overridden by the caller means "measure from these files only" —
 # that is the test seam, and it also stops a root-run harness from consulting
 # the live policy for a fixture user that does not exist.
+#
+# DIVE-2152: that contract is enforced by ONE predicate, used by BOTH escalating
+# paths — the `sudo -l` below and the privileged dump. Every way of asking a
+# more-powerful process to answer is gated on the dir being the real one, so an
+# overridden SUDOERS_D cannot mean "these files, unless the caller can escalate
+# past the permissions the fixture set". Escalation defeats a fixture's mode
+# bits, so without this the same commit reads 37/0 as a cli-scoped caller and
+# 30/7 as a full-sudo one — a harness grading its runner, not the code. A stub
+# fixes that per harness and must be REMEMBERED; the predicate fixes the class.
+sudoers_dir_is_real() { [[ "${1:-}" == "/etc/sudoers.d" ]]; }
+
 sudo_grant_lines() {
   local user="$1" d="${SUDOERS_D:-/etc/sudoers.d}" out=""
-  if [[ "$d" == "/etc/sudoers.d" ]]; then
+  if sudoers_dir_is_real "$d"; then
     # root may list any user; a non-root caller may list only itself, and that
     # answer is authoritative for it (this is the `sudo -n -l` an agent is told
     # to run on itself). -n so a policy needing a password never blocks `info`.
@@ -8949,8 +8960,17 @@ _SUDOERS_DUMP_FILE='===5DIVE-SUDOERS-FILE:'
 #
 # NOT attempted as root: root already got an authoritative `sudo -l -U` above,
 # and re-entering sudo would only turn a settled answer into a second exec.
+#
+# NOT attempted for any directory but the real one (DIVE-2152) — the guard lives
+# HERE, at the single seam, rather than at the two call sites, for two reasons:
+# it covers `sudo_grant_batch_load`'s call as well as `sudo_grant_lines`', and a
+# harness that overrides the seam still reaches the whole fallback path with a
+# fixture dir, because its stub replaces the function this guard sits inside.
+# Confinement and testability are not in tension; placement is what reconciles
+# them. In production SUDOERS_D is never set, so this costs no real capability.
 sudoers_privileged_dump() {
   local dir="$1" one="${2:-}"
+  sudoers_dir_is_real "$dir" || return 1
   [[ "$(id -u)" == "0" ]] && return 1
   command -v sudo >/dev/null 2>&1 || return 1
   sudo -n /bin/sh -c '
