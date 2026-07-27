@@ -166,5 +166,38 @@ sc7n=$(printf '%s' "$ls_out" | jq -r --arg id "$LID2" '.data.loops[] | select(.i
   && ok_t "loop ls --json: graded run carries scorecard_json (overall=$sc7), ungraded stays empty" \
   || bad_t "loop ls scorecard" "$ls_out"
 
+# --- T8 (DIVE-2105): --wait halts on CEILING breach → escalated, haltReason=ceiling
+# This case did not exist. `cmd_loop_grade` polices the same ceiling as spawn/verify/
+# panel, but its harness had NO ceiling case at all — so unlike its siblings the
+# branch was not vacuously tested, it was untested. Deliberately LAST in the file:
+# the refresher stub below is global once defined, and this way it can affect
+# nothing above it.
+#
+# Same two mechanisms the siblings hit, which is why the stub is not optional:
+#   1. grade labelled a ceiling breach "escalated"; its non-complete arm maps a
+#      --wait timeout onto the same status AND the same verdict, so asserting
+#      either alone would assert the failure mode's own value (the DIVE-2083
+#      shape). haltReason is the field that discriminates.
+#   2. `_loop_spent` refreshes on its first call and `_loop_refresh_spend`
+#      recomputes tokens_spent from the agent usage registry — absent here — so
+#      the unstubbed refresher writes 0 over the 5000 poked in below and the
+#      breach never happens.
+_loop_refresh_spend() { db "SELECT COALESCE(tokens_spent,0) FROM loop_runs WHERE loop_id='$1';"; }
+prev_running=$(latest_grade_running)
+( cmd_loop_grade --target="$TGT" --verifier=main --ceiling=1000 --wait=20 >"$TMP"/loop-grade-ceil.out 2>&1 ) &
+bgpid=$!
+if clid=$(poll_new "$prev_running" latest_grade_running); then
+  db "UPDATE loop_runs SET tokens_spent=5000 WHERE loop_id='$clid';"
+else
+  bad_t "grade ceiling setup" "poll_new timed out — the grade loop row never appeared, so the ceiling was never breached"
+fi
+wait $bgpid
+cst=$(jq -r '.data.status' "$TMP"/loop-grade-ceil.out 2>/dev/null)
+cvd=$(jq -r '.data.verdict' "$TMP"/loop-grade-ceil.out 2>/dev/null)
+chr=$(jq -r '.data.haltReason' "$TMP"/loop-grade-ceil.out 2>/dev/null)
+[[ "$cst" == "escalated" && "$cvd" == "escalated" && "$chr" == "ceiling" ]] \
+  && ok_t "--wait halts on ceiling breach → escalated (haltReason=ceiling, not timeout)" \
+  || bad_t "grade ceiling halt" "status=$cst verdict=$cvd haltReason=$chr $(cat "$TMP"/loop-grade-ceil.out)"
+
 echo "-----"; echo "PASS=$PASS FAIL=$FAIL"
 [[ $FAIL -eq 0 ]]

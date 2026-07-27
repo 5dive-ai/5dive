@@ -106,20 +106,49 @@ poll_new() { # <prev-value> <probe...> → echo first value that is non-empty an
 # --- T4: --wait halts on KILL (flip kill_requested mid-wait)
 ( cmd_loop_spawn --agent=main --prompt="UNIQ_killme" --wait=20 >"$TMP"/loop-kill.out 2>&1 ) &
 bgpid=$!
-klid=$(poll_new "" loop_by_prompt UNIQ_killme)
-db "UPDATE loop_runs SET kill_requested=1 WHERE loop_id='$klid';"
+# DIVE-2105: GRADE the poll. `klid=$(poll_new …)` throws poll_new's exit status
+# away, so a timed-out poll steers nothing and the assertion below reds naming
+# the PRODUCT — the silent-poller shape that cost DIVE-2083 two diagnostic passes.
+if klid=$(poll_new "" loop_by_prompt UNIQ_killme); then
+  db "UPDATE loop_runs SET kill_requested=1 WHERE loop_id='$klid';"
+else
+  bad_t "kill halt setup" "poll_new timed out — the loop row never appeared, so kill_requested was never set on any row"
+fi
 wait $bgpid
 kst=$(jq -r '.data.status' "$TMP"/loop-kill.out 2>/dev/null)
 [[ "$kst" == "killed" ]] && ok_t "--wait halts on kill_requested → killed" || bad_t "kill halt" "$(cat "$TMP"/loop-kill.out)"
 
 # --- T5: --wait halts on CEILING breach
+# DIVE-2105: this case had NEVER exercised the ceiling — byte-for-byte the same
+# construction, and the same two independent mechanisms, as the panel's T9 that
+# DIVE-2083 fixed. MEASURED before the fix: this harness took 25.8s and 7.0s with
+# the refresher stubbed, a ~19s drop on a --wait=20 deadline. That runtime IS the
+# signature of the vacuity — the case was timing out, not breaching, every run.
+#   1. `cmd_loop_spawn` labelled a ceiling breach "escalated", and so does a
+#      --wait timeout AND a rejected/escalated backing task. The asserted value
+#      was also the failure mode's value, so the assertion could not discriminate.
+#   2. `_loop_spent` refreshes on its FIRST call (the throttle window starts at 0)
+#      and `_loop_refresh_spend` recomputes tokens_spent from the agent usage
+#      registry — which a unit harness does not have — writing 0 straight over
+#      the 5000 poked in below.
+# Stubbing the refresher removes the one input this harness cannot supply and
+# leaves tokens_spent as the input the ceiling decision actually READS; haltReason
+# is what makes ceiling-vs-timeout observable at all.
+_loop_refresh_spend() { db "SELECT COALESCE(tokens_spent,0) FROM loop_runs WHERE loop_id='$1';"; }
 ( cmd_loop_spawn --agent=main --prompt="UNIQ_spendy" --ceiling=1000 --wait=20 >"$TMP"/loop-ceil.out 2>&1 ) &
 bgpid=$!
-clid=$(poll_new "" loop_by_prompt UNIQ_spendy)
-db "UPDATE loop_runs SET tokens_spent=5000 WHERE loop_id='$clid';"
+if clid=$(poll_new "" loop_by_prompt UNIQ_spendy); then
+  db "UPDATE loop_runs SET tokens_spent=5000 WHERE loop_id='$clid';"
+else
+  bad_t "ceiling halt setup" "poll_new timed out — the loop row never appeared, so the ceiling was never breached"
+fi
 wait $bgpid
 cst=$(jq -r '.data.status' "$TMP"/loop-ceil.out 2>/dev/null)
-[[ "$cst" == "escalated" ]] && ok_t "--wait halts on ceiling breach → escalated" || bad_t "ceiling halt" "$(cat "$TMP"/loop-ceil.out)"
+chr=$(jq -r '.data.haltReason' "$TMP"/loop-ceil.out 2>/dev/null)
+# status alone is NOT an assertion here (see above): assert the halt REASON.
+[[ "$cst" == "escalated" && "$chr" == "ceiling" ]] \
+  && ok_t "--wait halts on ceiling breach → escalated (haltReason=ceiling, not timeout)" \
+  || bad_t "ceiling halt" "status=$cst haltReason=$chr $(cat "$TMP"/loop-ceil.out)"
 
 # --- T6: --wait returns clean done + result passthrough
 ( cmd_loop_spawn --agent=main --prompt="UNIQ_finish" --wait=20 >"$TMP"/loop-done.out 2>&1 ) &

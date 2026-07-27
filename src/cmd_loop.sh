@@ -342,7 +342,14 @@ cmd_loop_spawn() {
     if [[ "$killed" == "1" ]]; then final_status="killed"; break; fi
     # ceiling check
     spent=$(_loop_spent "$loop_id")
-    if [[ "${spent:-0}" -ge "$eff_ceiling" ]]; then final_status="escalated"; break; fi
+    # DIVE-2105 (same shape as DIVE-2083 in cmd_loop_panel): name the ceiling
+    # breach as ITSELF. Labelling it "escalated" collapsed it onto the backing
+    # task's own 'escalated' terminal state below, and `loop_status` then maps
+    # timeout onto "escalated" too — so a caller reading `status` cannot tell a
+    # ceiling halt from a timeout or from a task that escalated on its own.
+    # A test asserting status=='escalated' therefore asserts the failure mode's
+    # value as well as the success one, which is not an assertion.
+    if [[ "${spent:-0}" -ge "$eff_ceiling" ]]; then final_status="ceiling"; break; fi
     # terminal-state check on the backing task
     tstatus=$(db "SELECT status FROM tasks WHERE id=${task_id};")
     case "$tstatus" in
@@ -358,7 +365,10 @@ cmd_loop_spawn() {
   case "$final_status" in
     done)               loop_status="done" ;;
     killed)             loop_status="killed" ;;
-    escalated|rejected|timeout) loop_status="escalated" ;;
+    # DIVE-2105: 'ceiling' joins this arm so the WIRE status is unchanged for
+    # every existing reader — the new information rides on haltReason, which
+    # `status` provably cannot carry (four halt causes, two statuses).
+    ceiling|escalated|rejected|timeout) loop_status="escalated" ;;
   esac
   local now2; now2=$(date +%s)
   db "UPDATE loop_runs SET status=$(sqlq "$loop_status"), updated_at=${now2},
@@ -373,9 +383,15 @@ cmd_loop_spawn() {
       >/dev/null 2>&1 || true
   fi
 
+  # haltReason (DIVE-2105, mirroring DIVE-2083's panel field) is WHY the poll
+  # stopped — done|ceiling|killed|timeout|rejected|escalated|cancelled — which
+  # `status` cannot carry: it folds ceiling, timeout, rejected and a
+  # task-escalated onto the single value "escalated". The message text has
+  # printed final_status since DIVE-593; this only RETURNS what was already
+  # computed, so it is plumbing, not new logic.
   ok "loop ${loop_id} ${loop_status} (${final_status}) ← task ${task_ident}" \
-     '{loopId:$l, handle:$l, status:$s, role:$r, taskId:($t|tonumber), taskIdent:$ti, ceiling:($c|tonumber), tokensSpent:($sp|tonumber), result:$res}' \
-     --arg l "$loop_id" --arg s "$loop_status" --arg r "$role" --arg t "$task_id" --arg ti "$task_ident" \
+     '{loopId:$l, handle:$l, status:$s, haltReason:$hr, role:$r, taskId:($t|tonumber), taskIdent:$ti, ceiling:($c|tonumber), tokensSpent:($sp|tonumber), result:$res}' \
+     --arg l "$loop_id" --arg s "$loop_status" --arg hr "$final_status" --arg r "$role" --arg t "$task_id" --arg ti "$task_ident" \
      --arg c "$eff_ceiling" --arg sp "${spent:-0}" --arg res "$tresult"
   return 0
 }
@@ -464,7 +480,11 @@ cmd_loop_verify() {
     killed=$(db "SELECT kill_requested FROM loop_runs WHERE loop_id=$(sqlq "$loop_id");")
     if [[ "$killed" == "1" ]]; then final_status="killed"; break; fi
     spent=$(_loop_spent "$loop_id")
-    if [[ "${spent:-0}" -ge "$eff_ceiling" ]]; then final_status="escalated"; break; fi
+    # DIVE-2105: ceiling named as itself — see cmd_loop_spawn. Here the collapse
+    # is total: EVERY non-done, non-killed halt falls through the `*)` arm below
+    # onto status=escalated/verdict=escalated, so ceiling and timeout were the
+    # same two strings on the wire.
+    if [[ "${spent:-0}" -ge "$eff_ceiling" ]]; then final_status="ceiling"; break; fi
     tstatus=$(db "SELECT status FROM tasks WHERE id=${tid};")
     case "$tstatus" in
       done)                final_status="done";     break ;;
@@ -489,9 +509,11 @@ cmd_loop_verify() {
       --ask="loop ${loop_id} verify halted (${final_status}, ~${spent}tok/${eff_ceiling}) on ${tident}. Continue, adjust, or stop?" \
       >/dev/null 2>&1 || true
   fi
-  ok "loop ${loop_id} ${loop_status} (verdict ${verdict}) ← ${tident}" \
-     '{loopId:$l, handle:$l, status:$s, verdict:$vd, target:($t|tonumber), targetIdent:$ti, verifier:$v, ceiling:($c|tonumber), tokensSpent:($sp|tonumber), result:$res}' \
-     --arg l "$loop_id" --arg s "$loop_status" --arg vd "$verdict" --arg t "$tid" --arg ti "$tident" \
+  # haltReason (DIVE-2105): done|ceiling|killed|timeout|escalated|cancelled.
+  # Neither `status` nor `verdict` can carry it — both are three-valued.
+  ok "loop ${loop_id} ${loop_status} (verdict ${verdict}, ${final_status}) ← ${tident}" \
+     '{loopId:$l, handle:$l, status:$s, haltReason:$hr, verdict:$vd, target:($t|tonumber), targetIdent:$ti, verifier:$v, ceiling:($c|tonumber), tokensSpent:($sp|tonumber), result:$res}' \
+     --arg l "$loop_id" --arg s "$loop_status" --arg hr "$final_status" --arg vd "$verdict" --arg t "$tid" --arg ti "$tident" \
      --arg v "$verifier" --arg c "$eff_ceiling" --arg sp "${spent:-0}" --arg res "$tresult"
   return 0
 }
@@ -590,7 +612,10 @@ cmd_loop_grade() {
     killed=$(db "SELECT kill_requested FROM loop_runs WHERE loop_id=$(sqlq "$loop_id");")
     if [[ "$killed" == "1" ]]; then final_status="killed"; break; fi
     spent=$(_loop_spent "$loop_id")
-    if [[ "${spent:-0}" -ge "$eff_ceiling" ]]; then final_status="escalated"; break; fi
+    # DIVE-2105: ceiling named as itself — see cmd_loop_spawn. grade had the same
+    # collapse and, unlike spawn/verify, NO ceiling case in its harness at all,
+    # so the branch was not merely vacuously tested but untested.
+    if [[ "${spent:-0}" -ge "$eff_ceiling" ]]; then final_status="ceiling"; break; fi
     local gstatus; gstatus=$(db "SELECT status FROM tasks WHERE id=${gtid};")
     case "$gstatus" in
       done|rejected|escalated|cancelled) final_status="complete"; break ;;
@@ -618,9 +643,11 @@ cmd_loop_grade() {
      --argjson th "$eff_threshold" --arg ti "$tident" --arg v "$verifier" --argjson at "$now2" \
      '{overall:$o, criteria:$cr, verdict:$vd, threshold:$th, target:$ti, grader:$v, gradedAt:$at}')
   db "UPDATE loop_runs SET status=$(sqlq "$loop_status"), updated_at=${now2}, scorecard_json=$(sqlq "$scorecard_json") WHERE loop_id=$(sqlq "$loop_id");"
-  ok "loop ${loop_id} ${loop_status} — ${tident} scored ${overall}/100 (verdict ${verdict}, threshold ${eff_threshold})" \
-     '{loopId:$l, handle:$l, status:$s, verdict:$vd, overall:($o|tonumber), threshold:($th|tonumber), criteria:$cr, target:($t|tonumber), targetIdent:$ti, grader:$v, ceiling:($c|tonumber), tokensSpent:($sp|tonumber)}' \
-     --arg l "$loop_id" --arg s "$loop_status" --arg vd "$verdict" --arg o "${overall:-0}" --arg th "$eff_threshold" \
+  # haltReason (DIVE-2105): complete|ceiling|killed|timeout. `status` folds
+  # ceiling and timeout onto "escalated", and so does `verdict`.
+  ok "loop ${loop_id} ${loop_status} — ${tident} scored ${overall}/100 (verdict ${verdict}, threshold ${eff_threshold}, ${final_status})" \
+     '{loopId:$l, handle:$l, status:$s, haltReason:$hr, verdict:$vd, overall:($o|tonumber), threshold:($th|tonumber), criteria:$cr, target:($t|tonumber), targetIdent:$ti, grader:$v, ceiling:($c|tonumber), tokensSpent:($sp|tonumber)}' \
+     --arg l "$loop_id" --arg s "$loop_status" --arg hr "$final_status" --arg vd "$verdict" --arg o "${overall:-0}" --arg th "$eff_threshold" \
      --argjson cr "$criteria_json" --arg t "$tid" --arg ti "$tident" --arg v "$verifier" --arg c "$eff_ceiling" --arg sp "${spent:-0}"
   return 0
 }
