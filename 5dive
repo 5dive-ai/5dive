@@ -26,7 +26,7 @@ esac
 
 # Bumped on every public release. `build.sh` checks this line exists; CI fails
 # the bundle-drift check if it's missing or empty.
-readonly FIVE_VERSION="0.16.32"
+readonly FIVE_VERSION="0.16.33"
 
 # GitHub org our repos live under. The org is being renamed
 # 5dive-com -> 5dive-ai (2026-06); fetches must work on either side of the
@@ -43580,7 +43580,28 @@ _push_repo_from_worktree() {
   printf 'https://github.com/%s.git' "$slug"
 }
 
-# _push_author_scan <repo-path> <repo-url> <branch> <author> [repo-source] — fail-closed author
+# _push_fetch_why <git-fetch-stderr> — a SHORT named cause for a failed fetch, so
+# a missing range bound says WHY it is missing (DIVE-2161). The default arm
+# echoes git's own last line rather than paraphrasing: the remote usually already
+# said the true thing, and reaching for the nearest familiar cause is how a wrong
+# one gets named (DIVE-2143).
+_push_fetch_why() {
+  local err="$1"
+  case "$err" in
+    *"could not read Username"*|*"Authentication failed"*|*"terminal prompts disabled"*)
+      printf 'no git credential is available to this user for that repo' ;;
+    *FETCH_HEAD*|*"Permission denied"*|*"unable to create"*|*"Unable to create"*|*"cannot open"*)
+      printf "this user cannot write .git/ in that work tree — a root-owned FETCH_HEAD left by an earlier root-run fetch is the known cause; 'sudo chgrp -R claude <repo>/.git && sudo chmod -R g+w <repo>/.git' clears it" ;;
+    *"Could not resolve host"*|*"Connection timed out"*|*"unable to access"*)
+      printf 'the remote was not reachable from here' ;;
+    *"Repository not found"*|*"does not appear to be a git repository"*|*"not found"*)
+      printf 'that repository was not found, or is not visible to this user' ;;
+    "") printf 'git fetch failed without printing a reason' ;;
+    *) printf 'git said: %s' "$(printf '%s' "$err" | grep -v '^[[:space:]]*$' | tail -1 | cut -c1-200)" ;;
+  esac
+}
+
+# _push_author_scan <repo-path> <repo-url> <branch> <author> [repo-source] [mode] — fail-closed author
 # scan. If <author> is EMPTY, the deployment configured no committer, so there is
 # NO restriction and the scan is a no-op (DIVE-1461 config-only behavior). When
 # set, every commit on <branch> not already on the remote's main must match
@@ -43588,18 +43609,74 @@ _push_repo_from_worktree() {
 # pre-flight (a friendly early error, when the author is resolvable there) AND
 # authoritatively inside `_push_do`. `git -C` + a scoped safe.directory so it also
 # works when root operates on the agent's tree.
+#
+# DIVE-2161: THE RANGE BOUND IS ITSELF A MEASUREMENT, AND IT CAN BE UNAVAILABLE.
+# The old code discarded the fetch's exit status and its stderr, so "I cannot tell
+# which commits this branch adds" silently became "scan the branch's ENTIRE
+# history" — and every pre-policy commit in it was then reported as an author
+# violation. dev2 got hundreds of phantom offenders for a one-commit branch that
+# was correctly authored. Could-not-measure must never render as a measurement:
+# resolve the bound, degrade to a CACHED bound and SAY it may be stale, or refuse
+# and name what is missing. Never widen the range and grade against it.
+#
+# <mode> picks who the refusal belongs to:
+#   authoritative (default) — root's `_push_do`, which fetches with the App
+#     credential. No bound here is an anomaly: refuse rather than guess.
+#   preflight — the agent's advisory pre-check. A delegated pusher legitimately
+#     has NO GitHub credential (by design), so no bound is a NORMAL state: SKIP
+#     with the reason and let the authoritative pass enforce. The predicate is the
+#     condition itself, so a tree that regains a bound is re-armed automatically.
+# Sets _PUSH_AUTHOR_SCAN_BOUND to fresh|unrelated|cached|unavailable so the caller
+# can report which bound (if any) the verdict actually rests on.
 _push_author_scan() {
-  local repopath="$1" repourl="$2" branch="$3" author="$4" repo_src="${5:-}"
-  [[ -n "$author" ]] || return 0   # unset committer -> no author restriction
+  local repopath="$1" repourl="$2" branch="$3" author="$4" repo_src="${5:-}" mode="${6:-authoritative}"
+  _PUSH_AUTHOR_SCAN_BOUND=unavailable
+  [[ -n "$author" ]] || { _PUSH_AUTHOR_SCAN_BOUND=nocheck; return 0; }  # unset committer -> no author restriction
   local -a G=(git -C "$repopath" -c "safe.directory=$repopath")
-  local base rangespec offenders scope
-  "${G[@]}" fetch --quiet "$repourl" main 2>/dev/null || true
-  if base=$("${G[@]}" merge-base FETCH_HEAD "refs/heads/${branch}" 2>/dev/null) && [[ -n "$base" ]]; then
+  local base="" rangespec="" offenders scope="" fetch_err="" fetch_ok=0
+  # A fresh fetch is the only authoritative bound. Keep its stderr — WHY it failed
+  # is the diagnosis, and throwing it away is what left the tool with nothing to
+  # say but a fabricated list. GIT_TERMINAL_PROMPT=0 so a credential-less caller
+  # ERRORS with a readable reason instead of blocking on a username prompt.
+  if fetch_err=$(GIT_TERMINAL_PROMPT=0 "${G[@]}" fetch --quiet "$repourl" main 2>&1) \
+     && "${G[@]}" rev-parse --verify --quiet FETCH_HEAD >/dev/null 2>&1; then
+    fetch_ok=1
+    base=$("${G[@]}" merge-base FETCH_HEAD "refs/heads/${branch}" 2>/dev/null) || base=""
+  fi
+  if [[ $fetch_ok -eq 1 && -n "$base" ]]; then
+    _PUSH_AUTHOR_SCAN_BOUND=fresh
     rangespec="${base}..refs/heads/${branch}"
     scope="the commits on '${branch}' not already on that repo's main"
+  elif [[ $fetch_ok -eq 1 ]]; then
+    # MEASURED, not assumed: main was fetched and shares no ancestor with this
+    # branch, so every commit reachable from it really is new to that repo. This
+    # is the one case where the whole branch is the honest range.
+    _PUSH_AUTHOR_SCAN_BOUND=unrelated
+    rangespec="refs/heads/${branch}"
+    scope="EVERY commit reachable from '${branch}' — a FRESH fetch of that repo's main succeeded and shares NO common ancestor with this branch, so all of them are new to it"
   else
-    rangespec="refs/heads/${branch}"   # no shared base (new branch) — scan all
-    scope="EVERY commit reachable from '${branch}' — that repo's main could not be reached from here, so the range is UNBOUNDED, not 'your new commits'"
+    # No fresh bound. Degrade to a CACHED remote-tracking main if the tree has
+    # one, and say out loud that the bound may be stale; otherwise the bound is
+    # simply unavailable and there is nothing honest to grade.
+    local cref why; why=$(_push_fetch_why "$fetch_err")
+    for cref in refs/remotes/origin/main refs/remotes/origin/master; do
+      "${G[@]}" rev-parse --verify --quiet "$cref" >/dev/null 2>&1 || continue
+      base=$("${G[@]}" merge-base "$cref" "refs/heads/${branch}" 2>/dev/null) || base=""
+      [[ -n "$base" ]] && break
+    done
+    if [[ -n "$base" ]]; then
+      _PUSH_AUTHOR_SCAN_BOUND=cached
+      rangespec="${base}..refs/heads/${branch}"
+      scope="the commits on '${branch}' not already on the CACHED ${cref} — that bound MAY BE STALE, because a fresh fetch was not possible (${why})"
+      warn "author check: could not fetch ${repourl} (${why}) — bounding the scan with the cached ${cref} instead. If that ref is out of date this range can be too wide or too narrow; only a fresh fetch bounds it authoritatively. (DIVE-2161)"
+    else
+      # CANNOT MEASURE. Printing a list here would be a fabrication: the only
+      # scannable range left is the branch's entire history, which reports every
+      # pre-policy commit in it as a violation. Say what is missing instead.
+      local diag="the author check could not determine WHICH commits '${branch}' adds to $(_push_repo_slug "$repourl") — fetching that repo's main failed (${why}) and this work tree has no cached refs/remotes/origin/main to fall back on. Without a bound the only scannable range is the branch's ENTIRE history, which would report every pre-policy commit in it as an author violation; that is a fabricated result, so it is not produced."
+      [[ "$mode" == preflight ]] && { warn "author check SKIPPED here — ${diag} It is re-run authoritatively inside the push as root, which fetches with the App credential. (DIVE-2161)"; return 0; }
+      fail "$E_GENERIC" "author check COULD NOT RUN — ${diag} Restore the bound and retry: give this tree a fetchable origin/main ('git remote add origin <url> && git fetch origin main'), or clear whatever blocked the fetch (see the reason above). (DIVE-2161)"
+    fi
   fi
   offenders=$("${G[@]}" log --format='%H %an <%ae>' "$rangespec" 2>/dev/null \
               | grep -vF " ${author}" || true)
@@ -43739,11 +43816,26 @@ cmd_push() {
   elif [[ -r "$envf" ]]; then
     author=$( set -a; . "$envf" 2>/dev/null; set +a; _push_expected_author )
   fi
-  _push_author_scan "$repopath" "$repo" "$branch" "$author" "$repo_src"
+  # DIVE-2161: `preflight` — an agent delegated a push legitimately has no GitHub
+  # credential, so "cannot bound the range" is normal HERE and skips with a
+  # reason; root's authoritative pass refuses instead of guessing.
+  _push_author_scan "$repopath" "$repo" "$branch" "$author" "$repo_src" preflight
 
   local slug sha; slug=$(_push_repo_slug "$repo")
   sha=$(git rev-parse --short "refs/heads/${branch}")
-  local author_state; [[ -n "$author" ]] && author_state="ok (${author})" || author_state="deferred to push-time (not readable here)"
+  # DIVE-2161: the reported state must name the bound the verdict rests on. A flat
+  # "ok" over a skipped or cached-bound scan is the same could-not-measure-as-
+  # measurement this ticket is about, one line further downstream.
+  local author_state
+  if [[ -z "$author" ]]; then
+    author_state="deferred to push-time (not readable here)"
+  else
+    case "${_PUSH_AUTHOR_SCAN_BOUND:-}" in
+      unavailable) author_state="NOT CHECKED here — range bound unavailable; enforced at push time" ;;
+      cached)      author_state="ok against a CACHED bound, may be stale (${author})" ;;
+      *)           author_state="ok (${author})" ;;
+    esac
+  fi
 
   if [[ $dry -eq 1 ]]; then
     # DIVE-1970: the dry-run names WHERE the target came from, not just what it
@@ -43879,7 +43971,10 @@ cmd_push_do() {
   # restriction. This is the authoritative gate — the agent pre-flight is only a
   # best-effort preview and may have deferred here.
   local author; author=$(_push_expected_author)
-  _push_author_scan "$repopath" "$repourl" "$branch" "$author" "the caller's resolved target"
+  # DIVE-2161: `authoritative` — this pass runs as root and is the one that
+  # decides. If it cannot bound the range it REFUSES and names what is missing;
+  # it never substitutes the whole history and grades against it.
+  _push_author_scan "$repopath" "$repourl" "$branch" "$author" "the caller's resolved target" authoritative
 
   # Build a short-lived App JWT (iat -60s for clock skew, exp +9min < 10min max).
   local now iat exp header payload unsigned sig jwt
