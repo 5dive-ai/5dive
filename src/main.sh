@@ -75,7 +75,9 @@ Agents:
   5dive agent start <name>
   5dive agent stop <name>
   5dive agent restart <name>
-  5dive agent rm <name>                              # aliases: 5dive agent fire <name>  /  5dive fire <name>
+  5dive agent rm <name> [--purge-home]               # aliases: 5dive agent fire <name>  /  5dive fire <name>
+                                                     # home is quarantined to /home/.5dive-reaped/ (root 0700);
+                                                     # --purge-home deletes it instead (irreversible)
   5dive agent config <name> set channels=<none|telegram|discord|dashboard[,ch...]>
                                                      # comma-separable; dashboard (claude-only, no token)
                                                      # enables web-dashboard chat — the one-tap Enable chat

@@ -1,5 +1,43 @@
 # Changelog
 
+## 0.16.32 — fix(agent): `agent rm` no longer leaves the home dir for a recycled uid to inherit (DIVE-2138, gh#222)
+
+Reported by A-MO7SEN (gh#222), his fifth confirmed find.
+
+`agent rm` deleted the user but left `/home/agent-<name>` on disk, and `adduser` RECYCLES
+freed uids. So the next agent created inherited a removed agent's uid and, with it,
+ownership of that agent's home — `auth.json`, `credentials.toml` and channel `.env` files
+included. On his box four live agents each owned a dead agent's home. Not a privilege
+escalation, but nothing about `agent rm` suggests it leaves that behind.
+
+The same leftover also broke re-creating a previously-used name, and broke it in the worst
+order: `adduser` only WARNS on an existing home, so create sailed past it, registered the
+agent in `agents.json`, attached it to the team bot, and only then died on the first write
+into a directory it did not own — leaving a half-created agent in the registry.
+
+Both halves are fixed as one teardown-completeness pass:
+
+- **`agent rm` quarantines the home** to `/home/.5dive-reaped/<name>-<ts>`, root-owned
+  `0700`. Quarantine, not delete: an agent home can hold work the operator still wants, and
+  teardown is not the moment to make that call irreversibly. `--purge-home` deletes instead,
+  for the operator who has already decided. Either way a recycled uid inherits a number and
+  nothing else. The disposition is in the JSON receipt, so a remove that could NOT move the
+  home aside is visible to a scripted caller and not only to a `warn` nobody reads.
+- **`agent create` refuses up front** when `/home/agent-<name>` exists and is not owned by
+  the user the create would make. The check sits next to the name-conflict check, before any
+  mutation — the point of the bug is where the old failure landed, not that it failed. The
+  message names the path AND the owning uid, because on the reported box the owner did not
+  resolve to a name at all (uid 1006, no such user).
+
+His third suggestion — a uid-allocation map so a recycled uid cannot inherit stale state —
+is not implemented and is not needed for this: with the home gone from its path, there is no
+stale state left for the recycled uid to be handed. Same incomplete-teardown class as
+DIVE-1609 (the `agents_org` orphan), which is why it is one pass.
+
+Regression: `tests/agent_home_teardown_unit.sh` (17 assertions), including the guard that
+keeps the recursive `chown`/`rm -rf` off any path that is not this agent's own conventional
+home, and off a symlink at that path.
+
 ## Unreleased — fix(agent): typed sends REFUSE a credential/login pane, so an inter-agent message can no longer become the agent's API key (DIVE-2137, gh#214)
 
 Reported by A-MO7SEN (gh#214), his fourth confirmed find.

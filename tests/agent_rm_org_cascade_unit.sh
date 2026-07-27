@@ -58,7 +58,7 @@ ok_t()  { PASS=$((PASS+1)); printf 'ok   - %s\n' "$1"; }
 bad_t() { FAIL=$((FAIL+1)); printf 'FAIL - %s\n   %s\n' "$1" "${2:-}"; }
 
 # --- exercise ----------------------------------------------------------------
-cmd_rm agy >/dev/null 2>"$TMP/err"
+cmd_rm agy >"$TMP/out" 2>"$TMP/err"
 
 # 1. gone from registry
 gone_reg=$(jq -r '.agents.agy // "ABSENT"' "$REGISTRY")
@@ -82,6 +82,22 @@ child_mgr=$(db "SELECT COALESCE(reports_to,'(top)') FROM agents_org WHERE name='
 grep -q "reset-failed 5dive-agent@agy.service" "$SYSCTL_LOG" \
   && ok_t "agent rm reset-failed the templated unit" \
   || bad_t "reset-failed not issued" "$(cat "$SYSCTL_LOG")"
+
+# 5. DIVE-2138: the JSON receipt must actually PARSE. `ok()` runs jq and returns
+#    0 whatever jq says, so a filter that fails to compile prints nothing to
+#    stdout, writes a compile error to stderr nobody reads, and every other
+#    assertion here still passes. Caught exactly that (an unparenthesised `+` in
+#    an object value) — so assert on stdout, not on the exit status.
+if jq -e . "$TMP/out" >/dev/null 2>&1; then
+  ok_t "agent rm emits a receipt that is valid JSON"
+  disp=$(jq -r '.data.home.disposition // "MISSING"' "$TMP/out")
+  [[ "$disp" != "MISSING" ]] \
+    && ok_t "the receipt reports the home disposition (DIVE-2138)" \
+    || bad_t "receipt has no home disposition" "$(cat "$TMP/out")"
+else
+  bad_t "agent rm receipt is not valid JSON" \
+        "stdout=[$(cat "$TMP/out")] stderr=[$(tail -2 "$TMP/err")]"
+fi
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]
