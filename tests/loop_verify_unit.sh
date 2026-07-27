@@ -95,19 +95,43 @@ dst=$(jq -r '.data.status' "$TMP"/lv-done.out 2>/dev/null); dvd=$(jq -r '.data.v
 tidk=$(mk_target maker "UNIQ_target_kill")
 ( cmd_loop_verify --target="$tidk" --verifier=grader --wait=20 >"$TMP"/lv-kill.out 2>&1 ) &
 bg=$!
-klid=$(poll_new "" lv_loop_for "$tidk")
-db "UPDATE loop_runs SET kill_requested=1 WHERE loop_id='$klid';"; wait $bg
+# DIVE-2105: GRADE the poll — a discarded exit status steers nothing and reds the
+# next assertion as if the PRODUCT misbehaved (the DIVE-2083 silent-poller shape).
+if klid=$(poll_new "" lv_loop_for "$tidk"); then
+  db "UPDATE loop_runs SET kill_requested=1 WHERE loop_id='$klid';"
+else
+  bad_t "kill setup" "poll_new timed out — the verify loop row never appeared, so kill_requested was never set"
+fi
+wait $bg
 kst=$(jq -r '.data.status' "$TMP"/lv-kill.out 2>/dev/null)
 [[ "$kst" == "killed" ]] && ok_t "--wait halts on kill → killed" || bad_t "kill" "$(cat "$TMP"/lv-kill.out)"
 
 # --- T7: --wait halts on CEILING
+# DIVE-2105: this case had NEVER exercised the ceiling — the same construction and
+# the same two mechanisms as the panel's T9 (DIVE-2083). MEASURED before the fix:
+# this harness took 26.0s, and 7.0s with the refresher stubbed — a ~19s drop on a
+# --wait=20 deadline, i.e. it was halting on TIMEOUT every run.
+#   1. cmd_loop_verify labelled a ceiling breach "escalated", and its `*)` arm maps
+#      EVERY non-done, non-killed halt (timeout included) onto exactly the same
+#      status AND verdict — so both asserted values were also the failure mode's.
+#   2. `_loop_spent` refreshes on its first call and `_loop_refresh_spend`
+#      recomputes tokens_spent from the agent usage registry (absent in a unit
+#      harness), writing 0 over the 5000 poked in below.
+_loop_refresh_spend() { db "SELECT COALESCE(tokens_spent,0) FROM loop_runs WHERE loop_id='$1';"; }
 tidc=$(mk_target maker "UNIQ_target_ceil")
 ( cmd_loop_verify --target="$tidc" --verifier=grader --ceiling=1000 --wait=20 >"$TMP"/lv-ceil.out 2>&1 ) &
 bg=$!
-clid=$(poll_new "" lv_loop_for "$tidc")
-db "UPDATE loop_runs SET tokens_spent=5000 WHERE loop_id='$clid';"; wait $bg
+if clid=$(poll_new "" lv_loop_for "$tidc"); then
+  db "UPDATE loop_runs SET tokens_spent=5000 WHERE loop_id='$clid';"
+else
+  bad_t "ceiling halt setup" "poll_new timed out — the verify loop row never appeared, so the ceiling was never breached"
+fi
+wait $bg
 cst=$(jq -r '.data.status' "$TMP"/lv-ceil.out 2>/dev/null); cvd=$(jq -r '.data.verdict' "$TMP"/lv-ceil.out 2>/dev/null)
-[[ "$cst" == "escalated" && "$cvd" == "escalated" ]] && ok_t "--wait halts on ceiling → escalated" || bad_t "ceiling halt" "$(cat "$TMP"/lv-ceil.out)"
+chr=$(jq -r '.data.haltReason' "$TMP"/lv-ceil.out 2>/dev/null)
+[[ "$cst" == "escalated" && "$cvd" == "escalated" && "$chr" == "ceiling" ]] \
+  && ok_t "--wait halts on ceiling → escalated (haltReason=ceiling, not timeout)" \
+  || bad_t "ceiling halt" "status=$cst verdict=$cvd haltReason=$chr $(cat "$TMP"/lv-ceil.out)"
 
 echo "-----"; echo "PASS=$PASS FAIL=$FAIL"
 [[ $FAIL -eq 0 ]]
