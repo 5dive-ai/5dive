@@ -2045,14 +2045,19 @@ _hb_loop_ceiling_sweep() {
     kid_ids=$(printf '%s' "${kids:-}" | tr -cd '0-9,' | tr ',' ' ')
     if [[ -n "$kid_ids" ]]; then
       local in_list; in_list=$(printf '%s' "$kid_ids" | tr ' ' ',')
-      db "UPDATE tasks
+      # DIVE-2119: this auto-park retires gates on a whole SET of child tasks, so
+      # it runs the same archive-then-clear as `task park` — scoped to exactly the
+      # rows the park will touch, in one transaction. A fix scoped to the gate
+      # verbs alone would have left this path producing orphaned provenance.
+      local _park_pred="id IN (${in_list}) AND status IN ('todo','in_progress') AND parked_at IS NULL"
+      db "BEGIN IMMEDIATE;
+          $(_gate_archive_and_clear_sql loop-ceiling "$_park_pred")
+          UPDATE tasks
             SET status='blocked', parked_at=datetime('now'),
                 park_reason=$(sqlq "loop ${lid} hit its token ceiling (~${spent}/${ceil} tok) — halted by heartbeat before finishing"),
-                need_type=NULL, ask=NULL, need_options=NULL, recommend=NULL,
-                need_answer=NULL, need_answered_at=NULL
-          WHERE id IN (${in_list})
-            AND status IN ('todo','in_progress')
-            AND parked_at IS NULL;"
+                need_type=NULL, ask=NULL, need_options=NULL, recommend=NULL
+          WHERE ${_park_pred};
+          COMMIT;"
     fi
     _hb_log "[loop-ceiling] ${lid} breached ceiling (~${spent}/${ceil} tok) — halted (child tasks parked) + escalated"
     # Escalate-with-proof on the originating task (skip if it already has an open
