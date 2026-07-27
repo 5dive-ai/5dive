@@ -2251,6 +2251,19 @@ _hb_objective_reconcile() {
   return 0
 }
 
+# DIVE-2102: re-verify each registered agent's capabilities against its INSTALLED
+# sudoers file. Measurement, not a timestamp bump — see
+# capability_reverify_from_sudoers.
+_hb_capability_reverify_sweep() {
+  local reg name
+  reg=$(registry_read) || return 0
+  for name in $(jq -r '.agents | keys[]' <<<"$reg" 2>/dev/null); do
+    [[ -n "$name" ]] || continue
+    capability_reverify_from_sudoers "agent-${name}" || true
+  done
+  return 0
+}
+
 cmd_heartbeat_tick() {
   require_root "heartbeat tick"
   tasks_db_init
@@ -2276,6 +2289,12 @@ cmd_heartbeat_tick() {
   # here must NEVER abort the wake loop (the heartbeat-never-woke bug class). No-op
   # unless at least one agent is opt-in wake_mode=cold.
   _hb_autosleep_sweep "$now" || _hb_log "[autosleep] pass errored (non-fatal)"
+  # DIVE-2102: renew capability rows from the installed sudoers files. Without
+  # this the 7d TTL expires every row and the registry converges on permanently
+  # empty. Isolated like every other sweep — and note the failure direction is
+  # already safe: if this never runs, rows go stale and stale reads as ABSENT,
+  # which is today's behaviour. It can lose confirmations, never invent them.
+  _hb_capability_reverify_sweep || _hb_log "[capability-reverify] pass errored (non-fatal)"
   # DIVE-1355: the belt-and-suspenders half of the self-dispatch fix. Auto-recover
   # any task still stuck 'blocked' whose every blocking edge is a done/cancelled
   # task (repairs pre-existing rot like OSS-27 + any live cascade miss), and
