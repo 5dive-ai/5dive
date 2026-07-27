@@ -38,7 +38,11 @@ the DIVE-2146 self-restart gate never tripped the floor at all — it reached th
 re-filed with an explicit `--tier=2`. Kept as a live assertion, so if the floor is ever widened to
 catch it, that test goes red first.
 
-`tests/gate_floor_declared_discussion_unit.sh` — 36 assertions, every arm exercised on the ask axis
+The matched term also rides the `--json` payload as `floor_term` (null when nothing floored). An
+agent filing with `--json` previously got `tier_floored: true` and no way to learn which word did
+it, which leaves the machine reader in exactly the state this change exists to fix.
+
+`tests/gate_floor_declared_discussion_unit.sh` — 45 assertions, every arm exercised on the ask axis
 and on the TITLE axis (DIVE-1957: a suite that varies only the ask tests the axis a filer can
 already reword, and passes vacuously).
 

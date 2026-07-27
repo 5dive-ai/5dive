@@ -258,5 +258,81 @@ route_reset; seed DIVE-417
 ( cmd_task_need DIVE-417 --type=decision --from=dev --ask="$DESIGN_ASK" --discusses="dunno" >/dev/null 2>&1 )
 [[ "$?" != "0" ]] && ok_t "hygiene: an empty-calorie --discusses is refused (it is read by a human reviewer)" || bad_t "hygiene short reason" "rc was 0"
 
+# 16: THE SURFACE THE FILER RE-READS — the RESULT LINE, not the stderr warn.
+#     (olivia, iteration 1 reject.) The floor announces on TWO surfaces and only
+#     one was graded: arms 11/12 capture `2>&1 >/dev/null`, which is stderr and
+#     DISCARDS stdout, so the `ok ... ${floor_note}` line at cmd_task.sh:4449 had
+#     ZERO assertions across all 36 arms above. Proved by mutation, not by
+#     reading: strip ${floor_term:+: matched '$floor_term'} out of floor_note and
+#     the suite still returned 36 passed, 0 failed.
+#
+#     That is the wrong surface to leave unguarded, because it is the one defect
+#     2's own discovery story runs through. dev3 found the escalation by
+#     RE-READING their filed gate — the persisted result — not by catching a warn
+#     that had already scrolled past. The build note quoted this very line as the
+#     before/after evidence for the fix.
+#
+#     TWO reasons it was unasserted, and the second is the one that bites. This
+#     suite sets JSON_MODE=1 globally (line 52), and under JSON_MODE ok() emits
+#     the jq payload and NEVER renders the prose at all. So an arm that merely
+#     stopped discarding stdout would ALSO stay green under olivia's mutation —
+#     it would be grading through the bug. The mode has to be flipped for the
+#     duration or the assertion is decorative.
+route_reset; seed DIVE-420
+res=$( JSON_MODE=0; cmd_task_need DIVE-420 --type=decision --from=dev \
+  --ask="$DESIGN_ASK" --options="capability|clearance" --recommend="clearance" 2>/dev/null )
+grep -qi "T2 category floor" <<<"$res" \
+  && ok_t "result/ask: the RESULT LINE states the floor fired (not only the stderr warn)" \
+  || bad_t "result/ask states floor" "stdout: $res"
+grep -qi "matched 'credential'" <<<"$res" \
+  && ok_t "result/ask: the RESULT LINE names the MATCHED TERM" \
+  || bad_t "result/ask names term" "stdout: $res"
+
+# 17: same assertion on the TITLE axis (DIVE-1957) — the term the filer cannot
+#     reword away must be named on the durable surface too. The ask here is
+#     byte-neutral; 'token' can only have come from the seeded title.
+route_reset; seed DIVE-421 "design the token exchange between the runtime and the broker"
+res2=$( JSON_MODE=0; cmd_task_need DIVE-421 --type=decision --from=dev \
+  --ask="Should the exchange be modelled as a synchronous call or an async queue?" \
+  --options="sync|async" --recommend="async" 2>/dev/null )
+grep -qi "T2 category floor" <<<"$res2" \
+  && ok_t "result/TITLE: the RESULT LINE states the floor fired on a title-only match" \
+  || bad_t "result/TITLE states floor" "stdout: $res2"
+grep -qi "matched 'token'" <<<"$res2" \
+  && ok_t "result/TITLE: names the term that matched from the TITLE, the axis the filer cannot reword" \
+  || bad_t "result/TITLE names term" "stdout: $res2"
+
+# 18: NEGATIVE CONTROL + LIVENESS. Without both of these the two arms above can
+#     be satisfied by a constant, and the negative can pass on an EMPTY string —
+#     which is exactly the failure mode being fixed (prose that never rendered).
+route_reset; seed DIVE-422
+res3=$( JSON_MODE=0; cmd_task_need DIVE-422 --type=decision --from=dev \
+  --ask="Should the dashboard column order be priority-first or age-first?" \
+  --options="priority|age" --recommend="priority" 2>/dev/null )
+[[ -n "$res3" ]] \
+  && ok_t "result/no-op: LIVENESS — the prose result line rendered at all (JSON_MODE really is off)" \
+  || bad_t "result no-op liveness" "stdout was EMPTY — the negative below would pass vacuously"
+grep -qi "category floor" <<<"$res3" \
+  && bad_t "result/no-op must NOT claim a floor" "stdout: $res3" \
+  || ok_t "result/no-op: an unfloored gate's result line claims no floor (the note is not a constant)"
+
+# 19: the MACHINE-READABLE surface carries the WHY too. An agent that files with
+#     --json got tier_floored:true and no way to learn which term did it, so the
+#     JSON reader was left in exactly the state defect 2 describes. floor_term
+#     rides the payload, and is null — not "" — when nothing floored.
+route_reset; seed DIVE-423
+jres=$(cmd_task_need DIVE-423 --type=decision --from=dev \
+  --ask="$DESIGN_ASK" --options="capability|clearance" --recommend="clearance" 2>/dev/null)
+[[ "$(jq -r '.data.tier_floored' <<<"$jres" 2>/dev/null)" == "true" ]] \
+  && ok_t "json: tier_floored is reported" || bad_t "json tier_floored" "$jres"
+[[ "$(jq -r '.data.floor_term' <<<"$jres" 2>/dev/null)" == "credential" ]] \
+  && ok_t "json: the matched term rides the JSON payload" || bad_t "json floor_term" "$jres"
+route_reset; seed DIVE-424
+jres2=$(cmd_task_need DIVE-424 --type=decision --from=dev \
+  --ask="Should the dashboard column order be priority-first or age-first?" \
+  --options="priority|age" --recommend="priority" 2>/dev/null)
+[[ "$(jq -r '.data.floor_term' <<<"$jres2" 2>/dev/null)" == "null" ]] \
+  && ok_t "json: floor_term is null when nothing floored (not a constant)" || bad_t "json floor_term null" "$jres2"
+
 printf '\n%s passed, %s failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" == "0" ]]
