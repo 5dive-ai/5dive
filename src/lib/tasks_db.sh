@@ -227,9 +227,17 @@ CREATE TABLE IF NOT EXISTS tasks (
   -- migration-free throttle stamp; failed/unconfirmed sends leave it unchanged.
   -- wake_at: a parked task
   -- (task park --wake=...) auto-unparks when the heartbeat passes this time.
+  -- DIVE-1945: gate_filed_by = the ACTOR who filed THIS gate, stamped by
+  -- cmd_task_need. Not derivable from the row: created_by is the task's author
+  -- and assignee is rewritten to the filer only on the human lane, so a gate one
+  -- agent files on another's task had no record of whose ask it is. The
+  -- escalation chain is walked from the FILER (gate-escalate, T1 re-nag routing);
+  -- created_by stays the right key for the T2 re-nag, which batches by the
+  -- channel OWNER. NULL on legacy gates -> callers COALESCE back to created_by.
   tier                INTEGER,
   need_asked_at       TEXT,
   gate_pinged_at      TEXT,
+  gate_filed_by       TEXT,
   wake_at             TEXT,
   -- DIVE-931 secure credential drop: a --type=secret gate can name WHERE the
   -- value should land — secret_key is the env-var name, connector the
@@ -768,6 +776,7 @@ _tasks_db_migrate() {
            'iteration INTEGER' 'maker_agent TEXT' 'handoff_ack_at TEXT' 'task_budget TEXT' \
            'handoff_delivered_at TEXT' 'handoff_stale_pinged_at TEXT' \
            'tier INTEGER' 'need_asked_at TEXT' 'gate_pinged_at TEXT' 'wake_at TEXT' \
+           'gate_filed_by TEXT' \
            'secret_key TEXT' 'connector TEXT' 'human_nonce_hash TEXT' \
            'ask_shape TEXT' 'precedent_ref INTEGER' 'precedent_kind TEXT' \
            'shipped_flag_at TEXT' 'routed_reviewer TEXT' \
