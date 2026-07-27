@@ -963,7 +963,11 @@ _hb_idle_marker() {
     claude)       printf '❯' ;;
     codex)        printf '›' ;;
     antigravity)  printf '? for shortcuts' ;;
-    devin)        printf '❭' ;;
+    # devin renders ❭ for BOTH the composer AND menu selections (the
+    # workspace-trust dialog is '❭ 1 Yes, trust …'), and ❭ U+276D sits two
+    # codepoints from claude's ❯ U+276F. Key off the composer placeholder
+    # instead: unambiguous, and it cannot match a menu row.
+    devin)        printf 'Ask Devin' ;;
     *)            printf '' ;;  # grok/opencode/unknown: byte-stability alone
   esac
 }

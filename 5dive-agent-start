@@ -376,7 +376,7 @@ if [[ "$TYPE" == "devin" ]]; then
         mv "$_tmp" "$_dst"
       else
         rm -f "$_tmp"
-        echo "warn: could not seed $(basename "$_dst") from $_src" >&2
+        cred_seed_failed "could not seed $(basename "$_dst") from $_src"
       fi
     fi
   done
