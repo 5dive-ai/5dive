@@ -145,6 +145,50 @@ jobs:
 
           git config user.name  'lodar'
           git config user.email 'markounik@gmail.com'
+          # >>> DIVE-2091 release-commit block (extracted by tests/release_cut_bundle_unit.sh)
+          # The built bundle is NO LONGER COMMITTED ON MAIN. install.sh fetches
+          # $REPO/5dive and $REPO/5dive.sha256 where $REPO is raw.githubusercontent
+          # at the TAG's sha (DIVE-2144), so the bundle must exist in the tree THIS
+          # TAG POINTS AT — and nowhere else. Main stays clean, which is the whole
+          # point: a generated 47k-line file on main invalidates every open PR on
+          # every merge (three forced rebases in one day, two of them on an outside
+          # contributor).
+          #
+          # So build it here and tag a RELEASE COMMIT whose parent is main's tip.
+          # Pushing the tag carries the commit's objects, so raw.githubusercontent
+          # serves it even though no branch points at it.
+          #
+          # FAIL CLOSED, and this is the requirement that matters: a tag cut WITHOUT
+          # a bundle publishes nothing while looking successful — every box would
+          # keep the version it has and `install.sh` would die on the download. So
+          # the asserts below run BEFORE the tag exists, and any of them aborts the
+          # cut rather than producing a tag we would have to delete.
+          git checkout -q --detach "$sha"
+          ./build.sh || { echo "::error::build.sh failed — refusing to cut ${tag} with no bundle"; exit 1; }
+          [ -s 5dive ] && [ -s 5dive.sha256 ] \
+            || { echo "::error::build.sh produced no bundle/checksum — refusing to cut ${tag}"; exit 1; }
+          bash -n 5dive \
+            || { echo "::error::built bundle is not valid bash — refusing to cut ${tag}"; exit 1; }
+          _built=$(sha256sum 5dive | cut -d" " -f1)
+          _want=$(tr -d "[:space:]" < 5dive.sha256)
+          [ "$_built" = "$_want" ] \
+            || { echo "::error::bundle does not match its own 5dive.sha256 (${_built} vs ${_want}) — refusing to cut ${tag}"; exit 1; }
+          _bundle_ver=$(grep -m1 -oP "(?<=^readonly FIVE_VERSION=\")[^\"]+" 5dive)
+          [ "v${_bundle_ver}" = "$tag" ] \
+            || { echo "::error::built bundle says FIVE_VERSION=${_bundle_ver} but this cut is ${tag} — refusing to publish a bundle that disagrees with its own tag"; exit 1; }
+          git add -f 5dive 5dive.sha256
+          git -c user.name=lodar -c user.email=markounik@gmail.com \
+              commit -q -m "release ${tag}: built bundle (DIVE-2091 — generated at tag time, not carried on main)"
+          sha=$(git rev-parse HEAD)
+          # Prove the TREE BEING TAGGED carries what install.sh will fetch — read it
+          # back out of the object store rather than trusting the working tree.
+          git cat-file -e "${sha}:5dive" 2>/dev/null && git cat-file -e "${sha}:5dive.sha256" 2>/dev/null \
+            || { echo "::error::release commit ${sha} does not carry the bundle — refusing to cut ${tag}"; exit 1; }
+          [ "$(git show "${sha}:5dive" | sha256sum | cut -d" " -f1)" = "$_want" ] \
+            || { echo "::error::bundle in the release commit differs from the one just built — refusing to cut ${tag}"; exit 1; }
+          echo "release commit ${sha} carries bundle ${_want} (FIVE_VERSION=${_bundle_ver})"
+          # <<< DIVE-2091 release-commit block
+
           git tag -a "$tag" "$sha" -m "${tag} — ${note}
 
           Publishes ${sha} as the tree every box installs (DIVE-2144). CI green on

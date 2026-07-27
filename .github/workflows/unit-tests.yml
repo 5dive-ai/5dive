@@ -72,6 +72,8 @@ jobs:
       # this job or the installed-host one, and the union below asserts it.
       - name: Do the rails ACT? (pristine)
         run: |
+          # DIVE-2091: bundle is generated at tag time, not committed on main.
+          ./build.sh
           bash ./5dive selfcheck --allow=snapshot-rails \
             --label=pristine --report=selfcheck-pristine.txt
       - uses: actions/upload-artifact@v4
@@ -139,10 +141,14 @@ jobs:
       # invocation can cover the rail and neither pretends to. The union does.
       - name: Do the rails ACT? (installed host, unprivileged)
         run: |
+          # DIVE-2091: bundle is generated at tag time, not committed on main.
+          ./build.sh
           bash ./5dive selfcheck --allow=snapshot-rails \
             --label=installed-host --report=selfcheck-installed.txt
       - name: Do the rails ACT? (installed host, root)
         run: |
+          # DIVE-2091: bundle is generated at tag time, not committed on main.
+          ./build.sh
           sudo bash ./5dive selfcheck --allow=snapshot-rails \
             --label=installed-root --report=selfcheck-root.txt
           sudo chown "$USER" selfcheck-root.txt
