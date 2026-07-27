@@ -43,12 +43,23 @@ jobs:
             fi
           done
           echo "5dive and 5dive.sha256 are untracked, as required"
-      - name: The build must be DETERMINISTIC
+      - name: The build must be REPRODUCIBLE (not a provenance check)
         run: |
           # Tag-time generation only works if two builds of the same source agree:
           # the tag's bundle is built on a runner, and anyone auditing it rebuilds
           # elsewhere. If that is not reproducible, the published artifact is
           # unverifiable by anyone but the machine that made it.
+          #
+          # WHAT THIS DOES NOT CATCH, stated so nobody reads it as more than it is
+          # (dev, DIVE-2091): a STALE RECIPE. build.sh is itself a source file, so a
+          # rebuild with a build.sh from one commit against src/ from another emits a
+          # WRONG bundle — and does so DETERMINISTICALLY, then regenerates a matching
+          # .sha256 for it. Measured: 47,779 lines instead of 48,024, the whole of
+          # src/lib/capability.sh absent while its CALL SITES ship, and self-consistent
+          # throughout. Build-twice-and-compare passes on that, because the same wrong
+          # recipe is wrong the same way twice. This is a REPRODUCIBILITY check, not a
+          # PROVENANCE one. Provenance comes from release-cut building in a single
+          # detached checkout, where build.sh and src/ cannot be from different commits.
           a=$(sha256sum 5dive | cut -d' ' -f1)
           ./build.sh
           b=$(sha256sum 5dive | cut -d' ' -f1)

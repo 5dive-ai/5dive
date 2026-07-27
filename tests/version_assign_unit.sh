@@ -27,8 +27,13 @@ no(){ F=$((F+1)); echo "FAIL - $1"; [ -n "${2:-}" ] && echo "   $2"; }
 mk() { local d="$TMP/$RANDOM$RANDOM"; mkdir -p "$d/src"; git -C "$d" init -q -b main
   git -C "$d" config user.email t@t; git -C "$d" config user.name t
   printf 'readonly FIVE_VERSION="%s"\n' "$1" > "$d/src/header.sh"; printf '%s  5dive\n' "$2" > "$d/5dive.sha256"
+  # DIVE-2091: version-assign keys on "did src/ or build.sh change" now — the
+  # committed 5dive.sha256 is generated at tag time and absent from commits. The
+  # sha params keep their MEANING ("a different build") via the real signal.
+  printf '%s\n' "$2" > "$d/src/body.sh"
   git -C "$d" add -A; git -C "$d" commit -qm base
   printf 'readonly FIVE_VERSION="%s"\n' "$3" > "$d/src/header.sh"; printf '%s  5dive\n' "$4" > "$d/5dive.sha256"
+  printf '%s\n' "$4" > "$d/src/body.sh"
   # ALWAYS make the second commit non-empty: case C deliberately leaves version and
   # bundle identical, and an empty commit fails, which made mk() return git's error
   # text as the fixture path and reported a SCRIPT failure for a HARNESS bug.
@@ -51,7 +56,7 @@ grep -q 'no assignment needed' <<<"$out" && grep -q 'already moved' <<<"$out" \
 
 # C: bundle unchanged (workflow/doc-only push) -> exempt.
 d=$(mk 0.16.19 aaa 0.16.19 aaa); out=$(run "$d")
-grep -q 'bundle is unchanged' <<<"$out" && ok "C doc-only push is exempt" || no "C" "$out"
+grep -q 'src/ and build.sh are unchanged' <<<"$out" && ok "C doc-only push is exempt" || no "C" "$out"
 
 # D: NON-SEMVER must refuse to guess, not invent a successor.
 d=$(mk 0.16.19 aaa 0.16.19-rc1 bbb); out=$(run "$d")
@@ -84,7 +89,11 @@ SNAP="$TMP/version-assign.snapshot.sh"; cp "$S" "$SNAP"
 # iteration 2 of this very ticket — it ate this file). The probe now commits and
 # restores ONLY the paths it touches, never -a and never --hard, and the SENTINEL
 # below grades that. A harness that eats your working tree gets run once.
-PROBE_FILES=(src/cmd_task.sh src/header.sh 5dive 5dive.sha256)
+# DIVE-2091: 5dive and 5dive.sha256 are gitignored and untracked now, so naming
+# them in a path-limited `git commit --` aborts the whole commit and nothing lands
+# — which reads as "src unchanged" rather than as a harness error. Same removal as
+# scripts/version-assign-push-loop.sh's `git add`.
+PROBE_FILES=(src/cmd_task.sh src/header.sh)
 SENTINEL=$(cd "$REPO" && ls README.md CONTRIBUTING.md 2>/dev/null | head -1)
 trap 'git -C "$REPO" checkout -q -- "$SENTINEL" 2>/dev/null; rm -rf "$TMP"' EXIT
 printf '\n<!-- version-assign harness sentinel -->\n' >> "$REPO/$SENTINEL"
@@ -148,7 +157,8 @@ mkapply() { # $1 = honest|badsha
     fi
   } > "$d/build.sh"; chmod +x "$d/build.sh"
   git -C "$d" add -A; git -C "$d" commit -qm base
-  printf 'bbb  5dive\n' > "$d/5dive.sha256"   # bundle moved, version did not
+  printf 'bbb  5dive\n' > "$d/5dive.sha256"
+  printf 'bbb\n' > "$d/src/body.sh"   # DIVE-2091: src moved, version did not
   git -C "$d" add -A; git -C "$d" commit -qm new
   printf '%s' "$d"; }
 
