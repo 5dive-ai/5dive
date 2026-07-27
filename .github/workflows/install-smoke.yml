@@ -9,19 +9,19 @@ name: install-smoke
 # confirm `5dive --version` works post-install.
 
 on:
+  # NO `paths:` FILTER ON pull_request — DELIBERATE, DIVE-2153.
+  # `shellcheck` and `docker-install` are REQUIRED status checks on main. A
+  # required context that does not RUN never reports, and GitHub blocks the PR
+  # forever waiting for it — so a path filter here does not skip the check, it
+  # makes a whole class of PR (tests-only, docs-only, workflow-only)
+  # PERMANENTLY UNMERGEABLE. PR #237 was the first casualty.
+  # INVARIANT: if a job is a required context, its trigger must be
+  # unconditional. Cost is ~2 min of CI on PRs that could have skipped it;
+  # the alternative is an unmergeable PR and a human reaching for the admin
+  # bypass, which defeats the gate it was added to enforce.
+  # The `push:` filter below is UNCHANGED — required checks are enforced at the
+  # PR, and main pushes carry the admin bypass.
   pull_request:
-    paths:
-      - 'install.sh'
-      - '5dive'
-      - '5dive-agent-start'
-      - 'src/**'
-      - 'hooks/**'
-      - 'skills/**'
-      - 'systemd/**'
-      - 'docker/Dockerfile'
-      - 'projects-CLAUDE.md'
-      - 'telegram-agent-CLAUDE.md'
-      - '.github/workflows/install-smoke.yml'
   push:
     branches: [main]
     paths:
