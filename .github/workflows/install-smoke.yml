@@ -47,7 +47,11 @@ jobs:
       - name: Lint install + bundle + agent-start
         # Linting the bundle (not src/) lets us skip --shell=bash gymnastics
         # — bundle-drift already enforces that bundle == build.sh(src/).
-        run: shellcheck -S error install.sh 5dive 5dive-agent-start build.sh
+        # DIVE-2125 (verifier): scripts/ was linted by NOTHING, so every helper the
+        # CLI shells out to shipped unchecked. Widened rather than adding one file:
+        # measured zero findings across scripts/*.sh at -S error, so the broad fix is
+        # free today and closes the gap permanently instead of for one script.
+        run: shellcheck -S error install.sh 5dive 5dive-agent-start build.sh scripts/*.sh
 
   docker-install:
     runs-on: ubuntu-latest
