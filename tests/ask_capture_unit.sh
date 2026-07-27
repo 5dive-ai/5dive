@@ -305,5 +305,59 @@ assert_no_chrome "case8" "$got"
   || die "case8: fence did not engage on the scoped path, got: [$got]"
 ok_ "the fence engages with marker-slicing off, so scoped-sudo callers are covered"
 
+
+# ===========================================================================
+echo "case 9 — a CLOSED fence written on ONE line is a reply, not a miss"
+# ===========================================================================
+# Weaker seats routinely inline the whole fence: "<5dive-r:id> answer </5dive-r:id>".
+# It is fully closed and carries both unique markers, but the line-shape test
+# (marker alone on its line) rejected it, so `ask` returned nothing and the
+# caller could not tell "the seat said nothing" from "the seat answered and we
+# dropped it". Measured on devin 3000.2.17 (SWE-1.7); not devin-specific.
+base="$WORK/base9"; msg="$WORK/msg9"; acc="$WORK/acc9"
+printf '%s' "reply with pong ${FENCE_HINT}" > "$msg"
+frame 43 Tue 11 "  (idle)" > "$base"
+: > "$acc"
+got=$(printf '%s\n' \
+      "  reply with pong [reply-format] Put your answer between these two marker" \
+      "  lines: <5dive-r:${MID}></5dive-r:${MID}> — the opening marker alone" \
+      "  │ <5dive-r:${MID}> pong from the seat </5dive-r:${MID}>" \
+    | _ask_accumulate "$acc" | _ask_reply_window "$base" "$msg" "$MID" 1 1)
+assert_no_chrome "case9" "$got"
+[[ "$got" == "pong from the seat" ]] \
+  || die "case9: same-line fence not returned, got: [$got]"
+ok_ "a same-line fence returns the reply"
+
+# The echoed INSTRUCTION also carries both markers on one line — adjacent, so
+# the inner text is empty. It must never be mistaken for an answer; this is the
+# case that keeps the tolerance from becoming the scraping path again.
+base="$WORK/base9b"; msg="$WORK/msg9b"; acc="$WORK/acc9b"
+printf '%s' "reply with pong ${FENCE_HINT}" > "$msg"
+frame 43 Tue 11 "  (idle)" > "$base"
+: > "$acc"
+got=$(printf '%s\n' \
+      "  reply with pong [reply-format] Put your answer between these two marker" \
+      "  lines: <5dive-r:${MID}></5dive-r:${MID}> — the opening marker alone on" \
+      "  one line, your answer next, the closing marker alone on the last line." \
+      "✳ Cogitating… (7s · esc to interrupt)" \
+    | _ask_accumulate "$acc" | _ask_reply_window "$base" "$msg" "$MID" 1 1)
+assert_no_chrome "case9b" "$got"
+[[ -z "$got" ]] || die "case9b: echoed instruction returned as a reply: [$got]"
+ok_ "the echoed instruction (markers adjacent, empty inner) is still not a reply"
+
+# An unfinished same-line write has no closing marker, so there is nothing to
+# extract — a half-typed answer must not be returned as a whole one.
+base="$WORK/base9c"; msg="$WORK/msg9c"; acc="$WORK/acc9c"
+printf '%s' "reply with pong ${FENCE_HINT}" > "$msg"
+frame 43 Tue 11 "  (idle)" > "$base"
+: > "$acc"
+got=$(printf '%s\n' \
+      "  reply with pong [reply-format] Put your answer between these two marker" \
+      "  lines: <5dive-r:${MID}></5dive-r:${MID}> — the opening marker alone" \
+      "  │ <5dive-r:${MID}> pong fro" \
+    | _ask_accumulate "$acc" | _ask_reply_window "$base" "$msg" "$MID" 1 1)
+[[ -z "$got" ]] || die "case9c: mid-write same-line fence returned: [$got]"
+ok_ "a mid-write same-line fence (no closing marker) returns nothing"
+
 echo
 echo "PASS — ${pass} assertions (DIVE-1901 ask capture)"
