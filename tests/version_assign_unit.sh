@@ -186,11 +186,16 @@ grep -q 'the bump did NOT take in src/header.sh' <<<"$out" \
 
 # H: NO TAG, BEHAVIOURALLY. Arm F greps the output for "NO TAG", which grades a
 # sentence — a script that printed it and tagged anyway would pass. The real guarantee
-# is that no tag verb exists anywhere in the two SHIPPED files. (Only the shipped
+# is that no tag verb exists anywhere in the SHIPPED files. (Only the shipped
 # files are scanned: this harness does not run in CI, and it necessarily contains the
 # very strings being searched for.)
+#
+# DIVE-2143 moved the push loop OUT of the YAML and into scripts/version-assign-push-loop.sh,
+# so the scanned set had to move with it. A guarantee whose scope silently stops
+# covering the code it was written for is worse than no guarantee — it still reports.
 if grep -nEi 'git[[:space:]]+tag|gh[[:space:]]+release|refs/tags|--tags|create-release|action-gh-release' \
-     "$REPO/scripts/version-assign.sh" "$REPO/.github/workflows/version-assign.yml"; then
+     "$REPO/scripts/version-assign.sh" "$REPO/scripts/version-assign-push-loop.sh" \
+     "$REPO/scripts/git-push-reject-class.sh" "$REPO/.github/workflows/version-assign.yml"; then
   no "H a tag verb appears in a shipped file (bump yes, tag no — lodar froze releases)"
 else
   ok "H BEHAVIOURAL: no tag verb (git tag / gh release / refs/tags / --tags) appears in either shipped file"

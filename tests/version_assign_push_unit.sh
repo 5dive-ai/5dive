@@ -1,0 +1,193 @@
+#!/usr/bin/env bash
+# DIVE-2143 harness for the version-assign PUSH path: does it name the right cause,
+# and does it stop retrying a failure that retrying cannot fix?
+#
+# THE DEFECT THIS GRADES, measured on run 30231912328 (5dive-ai/5dive, 2026-07-27
+# 02:19). Branch protection rejected the assignment push. The loop printed
+#   "push rejected — main moved under us (attempt 1/3)"  ...2/3 ...3/3
+#   "::error::main kept moving across 3 attempts"
+# three times over. Main never moved — the tip was 02b356e for the whole run. Two
+# costs: three attempts burned on a DETERMINISTIC failure, and, worse, an error that
+# points the next reader at a concurrency bug in code that is working correctly.
+#
+# WHY THE ARMS BELOW ARE BEHAVIOURAL AND NOT MESSAGE GREPS. A harness that only
+# checked "does it print the protection message" would pass on a loop that printed it
+# and then retried twice anyway — the retry is half the defect. So the arms COUNT the
+# push attempts, using a stub `git` on PATH that records every invocation. Counting is
+# the assertion; the message is a second, separate one.
+#
+# AND WHY THERE IS A MUTATION ARM. tests/version_assign_unit.sh learned this the hard
+# way (its arms G/H exist because it stayed 16/16 green with two assertions replaced
+# by `true`). Arm M replaces the CLASSIFIER with one that always says "race" — the
+# pre-DIVE-2143 behaviour, exactly — and demands the run go back to 3 attempts. If the
+# discrimination is ever deleted, M fails; without M, arms C/D would keep passing on a
+# loop that had stopped discriminating for an unrelated reason.
+# Run: bash tests/version_assign_push_unit.sh
+set -uo pipefail
+cd "$(dirname "$0")/.."
+REPO="$PWD"
+CLS="$REPO/scripts/git-push-reject-class.sh"
+LOOP="$REPO/scripts/version-assign-push-loop.sh"
+FIX="$REPO/tests/fixtures/push-reject"
+TMP="$(mktemp -d /tmp/version-assign-push-unit.XXXXXX)"; trap 'rm -rf "$TMP"' EXIT
+P=0; F=0
+ok(){ P=$((P+1)); echo "ok   - $1"; }
+no(){ F=$((F+1)); echo "FAIL - $1"; [ -n "${2:-}" ] && echo "   $2"; }
+
+# ---------------------------------------------------------------------------
+# CLASSIFIER — graded against CAPTURED stderr (tests/fixtures/push-reject/), never
+# against text invented here. The GH006 capture is verbatim from the run above,
+# trailing whitespace and all.
+cls(){ bash "$CLS" < "$FIX/$1"; }
+
+[[ "$(cls protected-gh006.txt)" == protection ]] \
+  && ok "A the real GH006 capture classifies as 'protection' (not a race)" \
+  || no "A GH006" "got: $(cls protected-gh006.txt)"
+[[ "$(cls race-fetch-first.txt)" == race ]] \
+  && ok "A a real '(fetch first)' rejection classifies as 'race'" \
+  || no "A fetch-first" "got: $(cls race-fetch-first.txt)"
+[[ "$(cls race-non-fast-forward.txt)" == race ]] \
+  && ok "A a real '(non-fast-forward)' rejection classifies as 'race' (git words it differently after a fetch)" \
+  || no "A non-ff" "got: $(cls race-non-fast-forward.txt)"
+[[ "$(cls unknown-transport.txt)" == unknown ]] \
+  && ok "A an unrecognised failure classifies as 'unknown' — the class is REACHABLE, not decorative" \
+  || no "A unknown" "got: $(cls unknown-transport.txt)"
+
+# PRECEDENCE. The GH006 capture also carries '! [remote rejected]', and a protection
+# rejection that happened to mention a fast-forward hint must still read as protection:
+# the whole defect was a gated ref being reported as a race.
+printf '%s\n%s\n' "$(cat "$FIX/protected-gh006.txt")" "hint: Updates were rejected because the remote contains work" > "$TMP/mixed.txt"
+[[ "$(bash "$CLS" < "$TMP/mixed.txt")" == protection ]] \
+  && ok "A PRECEDENCE: protection wins when a capture carries BOTH markers (a gated ref must never read as a race)" \
+  || no "A precedence" "got: $(bash "$CLS" < "$TMP/mixed.txt")"
+[[ "$(printf '' | bash "$CLS")" == unknown ]] \
+  && ok "A empty stderr is 'unknown', not silently a race" || no "A empty" "got: $(printf '' | bash "$CLS")"
+
+# ---------------------------------------------------------------------------
+# LOOP — behavioural, with a stub `git` on PATH.
+#
+# The stub is the seam, and it is deliberately NOT a flag inside the shipped script:
+# a test-only branch grades the test-only branch. Here the production code runs
+# unmodified and every `git` it calls lands in a recorder. `scripts/version-assign.sh`
+# is stubbed the same way — the loop invokes it by RELATIVE path, so a fixture cwd
+# substitutes it without the shipped script knowing. What version-assign.sh itself
+# does is already graded by tests/version_assign_unit.sh; grading it twice here would
+# only couple the two.
+mkfix() { # $1 = push exit (0|1), $2 = fixture file of push stderr
+  local d="$TMP/fix$RANDOM$RANDOM"; mkdir -p "$d/scripts" "$d/src" "$d/bin"
+  printf 'readonly FIVE_VERSION="0.16.29"\n' > "$d/src/header.sh"
+  # stub version-assign.sh: always reports an applied assignment, so the loop always
+  # reaches the push. Its own logic is graded by version_assign_unit.sh.
+  { echo '#!/usr/bin/env bash'
+    echo 'echo "version-assign: applied 0.16.28 -> 0.16.29, bundle rebuilt (deadbeef). NO TAG."'; } \
+    > "$d/scripts/version-assign.sh"
+  # stub git: records every invocation, counts pushes, replays the captured stderr.
+  # rev-parse answers the same sha for FETCH_HEAD and HEAD, so "main moved" never
+  # fires and the only thing under test is what happens to the PUSH.
+  cat > "$d/bin/git" <<EOF
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >> '$d/git.log'
+case "\${1:-}" in
+  push)      echo push >> '$d/push.count'; cat '$2' >&2; exit $1 ;;
+  rev-parse) echo 0000000000000000000000000000000000000000 ;;
+esac
+exit 0
+EOF
+  chmod +x "$d/bin/git" "$d/scripts/version-assign.sh"
+  : > "$d/push.count"; : > "$d/git.log"
+  printf '%s' "$d"; }
+
+runloop() { # $1 = fixture dir, $2 = loop script to run (real or mutated)
+  ( cd "$1" && PATH="$1/bin:$PATH" bash "$2" beforesha 3 ) 2>&1; }
+# wc, not `grep -c || echo 0`: grep -c on an empty file prints 0 AND exits 1, so the
+# fallback fires too and the count comes back "0\n0" — a comparison that can never
+# match, i.e. an arm that fails for a reason that has nothing to do with the subject.
+pushes() { local n; n=$(wc -l < "$1/push.count"); echo "${n// /}"; }
+
+# B CONTROL: the happy path. Without it, a red C/D would prove nothing — a loop broken
+# for an unrelated reason also makes exactly one push attempt and fails.
+d=$(mkfix 0 "$FIX/race-fetch-first.txt"); out=$(runloop "$d" "$LOOP"); rc=$?
+(( rc == 0 )) && ok "B CONTROL: a push that SUCCEEDS exits 0 (so a red C/D means the classifier, not a broken fixture)" || no "B rc" "$rc: $out"
+[[ "$(pushes "$d")" == 1 ]] && ok "B CONTROL: and pushes exactly once" || no "B count" "$(pushes "$d")"
+grep -q 'assigned 0.16.29' <<<"$out" && ok "B CONTROL: and reports the version it assigned" || no "B msg" "$out"
+
+# C THE DEFECT: GH006 must fail on attempt 1 and must not blame a race.
+d=$(mkfix 1 "$FIX/protected-gh006.txt"); out=$(runloop "$d" "$LOOP"); rc=$?
+(( rc == 1 )) && ok "C a protection rejection FAILS (exit 1) — it is not swallowed" || no "C rc" "$rc: $out"
+[[ "$(pushes "$d")" == 1 ]] \
+  && ok "C BEHAVIOURAL: exactly ONE push attempt — the deterministic failure is not retried (was 3 on run 30231912328)" \
+  || no "C attempts" "expected 1 push, got $(pushes "$d")"
+grep -q 'rejected by branch protection' <<<"$out" \
+  && ok "C names branch protection as the cause" || no "C cause" "$out"
+# if/else, not `A && no || ok`: no() returns non-zero when called without a detail
+# argument, so the || arm would fire too and a FAILING assertion would also print an
+# "ok" line. The suite would still go red, but the transcript would say both things.
+if grep -qE 'main moved under us|kept moving' <<<"$out"; then
+  no "C LIE: it still blames a race — this is the exact sentence run 30231912328 printed three times" "$out"
+else
+  ok "C it does NOT print 'main moved under us' / 'kept moving' (the wrong cause)"
+fi
+grep -q 'GH006: Protected branch update failed' <<<"$out" \
+  && ok "C ECHOES the remote's own words rather than paraphrasing them" || no "C echo" "$out"
+grep -q '6 of 6 required status checks are expected' <<<"$out" \
+  && ok "C including the required-checks line, which is the actionable half" || no "C checks line" "$out"
+
+# D THE RACE STILL RETRIES. The fix must not turn every rejection into a hard stop —
+# the reset-and-recompute path is correct and is why the loop exists.
+for f in race-fetch-first race-non-fast-forward; do
+  d=$(mkfix 1 "$FIX/$f.txt"); out=$(runloop "$d" "$LOOP"); rc=$?
+  (( rc == 1 )) && ok "D ($f) an unresolvable race still fails loudly" || no "D rc ($f)" "$rc: $out"
+  [[ "$(pushes "$d")" == 3 ]] \
+    && ok "D ($f) BEHAVIOURAL: all 3 attempts are used — the genuine-race retry path is intact" \
+    || no "D attempts ($f)" "expected 3 pushes, got $(pushes "$d")"
+  grep -q 'main moved under us' <<<"$out" \
+    && ok "D ($f) and a real race IS reported as a race" || no "D msg ($f)" "$out"
+done
+
+# E UNKNOWN: no retry, no invented cause, and the raw text survives to the log.
+d=$(mkfix 1 "$FIX/unknown-transport.txt"); out=$(runloop "$d" "$LOOP"); rc=$?
+(( rc == 1 )) && ok "E an unrecognised rejection fails" || no "E rc" "$rc: $out"
+[[ "$(pushes "$d")" == 1 ]] \
+  && ok "E BEHAVIOURAL: it is not retried — 'unrecognised' is not quietly widened into 'race'" \
+  || no "E attempts" "expected 1 push, got $(pushes "$d")"
+grep -q 'UNRECOGNISED' <<<"$out" && ok "E says outright that it does not know the cause" || no "E msg" "$out"
+if grep -qE 'main moved under us|kept moving' <<<"$out"; then
+  no "E it reached for the nearest familiar cause instead of admitting ignorance" "$out"
+else
+  ok "E and does NOT reach for the nearest familiar cause"
+fi
+grep -q "Couldn't connect to server" <<<"$out" \
+  && ok "E the remote's own text reaches the log verbatim" || no "E echo" "$out"
+
+# ---------------------------------------------------------------------------
+# M MUTATION: break the discrimination, demand the arms above go red.
+#
+# The classifier is resolved relative to the loop script's own directory, so a COPY of
+# the shipped loop beside a stubbed classifier reproduces the pre-fix behaviour with
+# the loop itself untouched. If someone later deletes the protection branch, or makes
+# the classifier answer "race" to everything (which is precisely what the old code
+# did), this arm fails.
+mkdir -p "$TMP/mut/scripts"
+cp "$LOOP" "$TMP/mut/scripts/"
+{ echo '#!/usr/bin/env bash'; echo 'cat >/dev/null'; echo 'echo race'; } > "$TMP/mut/scripts/git-push-reject-class.sh"
+chmod +x "$TMP/mut/scripts/git-push-reject-class.sh"
+d=$(mkfix 1 "$FIX/protected-gh006.txt"); out=$(runloop "$d" "$TMP/mut/scripts/$(basename "$LOOP")")
+if [[ "$(pushes "$d")" == 3 ]] && grep -q 'main moved under us' <<<"$out"; then
+  ok "M MUTATION: a classifier that always says 'race' reproduces the defect (3 attempts + 'main moved under us') — so arm C is driven by the classifier, not by luck"
+else
+  no "M MUTATION" "mutating the classifier did NOT change the outcome ($(pushes "$d") pushes) — arms C/E are passing for some other reason and grade nothing"
+fi
+
+# N NO TAG, still. tests/version_assign_unit.sh arm H scans the two files that USED to
+# hold every shipped line of this subsystem. The push moved out of them, so the scan
+# had to move too — a guarantee whose scope quietly stops covering the code it was
+# written for is worse than no guarantee. (Kept here as well as there: whichever file
+# a future edit lands in, one of the two harnesses sees it.)
+if grep -nEi 'git[[:space:]]+tag|gh[[:space:]]+release|refs/tags|--tags|create-release|action-gh-release' "$LOOP" "$CLS"; then
+  no "N a tag verb appears in the extracted push path (bump yes, tag no — lodar froze releases)"
+else
+  ok "N BEHAVIOURAL: no tag verb in the extracted push path either — the no-tag guarantee followed the code out of the YAML"
+fi
+
+echo; echo "DIVE-2143 version-assign push classification: passed: $P  failed: $F"
+[ "$F" -eq 0 ]

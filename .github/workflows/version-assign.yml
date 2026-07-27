@@ -47,67 +47,15 @@ jobs:
             echo "version-assign: no usable previous main tip (new branch or force event) — skipping."
             exit 0
           fi
-          git config user.name  'lodar'
-          git config user.email 'markounik@gmail.com'
-
-          # THE RACE, and why `concurrency` alone does not close it (found in review,
-          # iteration 1). concurrency serialises RUNS — but a human MERGE is not in the
-          # group, and actions/checkout on a push event pins to github.sha, NOT main's
-          # tip. So if a merge lands between this job's checkout and its push, the push
-          # is non-fast-forward and the job dies. It is a WINDOW, not a certainty (a
-          # merge landing after we push is fine, and that run computes correctly), but
-          # it is likeliest in exactly the batched-merge scenario this job exists for.
-          # So: refetch, recompute against the moved tip, retry, and fail loudly.
-          #
-          # BASE stays github.event.before across retries, deliberately. If a previous
-          # run already assigned, the version HAS moved relative to that base, so the
-          # script reports "already moved" and we stop — one version per batch, which
-          # is the batching lodar wants. If nobody assigned, we assign once for the
-          # whole batch. Both are correct; neither double-bumps.
-          attempts=3
-          assigned=""
-          for (( try=1; try<=attempts; try++ )); do
-            git fetch -q origin main
-            tip=$(git rev-parse FETCH_HEAD)
-            if [[ "$tip" != "$(git rev-parse HEAD)" ]]; then
-              echo "version-assign: main moved to ${tip:0:12} since checkout (attempt $try/$attempts) — recomputing against the new tip."
-              git reset -q --hard "$tip"
-            fi
-
-            out=$(bash scripts/version-assign.sh HEAD "$before" --apply); rc=$?
-            echo "$out"
-            if (( rc == 2 )); then
-              echo "::error::version-assign could not determine whether a bump is owed — NOT a pass, see above."
-              exit 1
-            fi
-            if ! grep -q '^version-assign: applied ' <<<"$out"; then
-              exit 0   # nothing owed; the reason is printed above
-            fi
-
-            git add src/header.sh 5dive 5dive.sha256
-            git commit -q -m "release: assign $(grep -m1 -oE 'FIVE_VERSION=\"[^\"]+\"' src/header.sh | sed 's/.*\"\(.*\)\"/\1/') at merge (DIVE-2118, automated)
-
-          The bundle changed on main without FIVE_VERSION moving. CONTRIBUTING
-          assigns the version at merge by merge order; this performs that step so a
-          box on the previous version is not silently left without the merged fixes
-          (the shared-checkout updater is version-triggered, not content-hash
-          triggered — DIVE-2065).
-
-          No tag and no release: those are batched, deliberately (lodar, 2026-07-26)."
-
-            if git push origin HEAD:main; then
-              assigned=$(grep -m1 -oE 'FIVE_VERSION="[^"]+"' src/header.sh | sed 's/.*"\(.*\)"/\1/')
-              break
-            fi
-            echo "version-assign: push rejected — main moved under us (attempt $try/$attempts). Dropping the local assignment and recomputing."
-            git reset -q --hard "$tip"
-          done
-
-          if [[ -z "$assigned" ]]; then
-            echo "::error::version-assign: main kept moving across $attempts attempts, so NO assignment was made and the bundle on main is still unassigned. Bump by hand (scripts/version-assign.sh HEAD <prev> --apply) or re-run this workflow."
-            exit 1
-          fi
-          echo "::notice::assigned ${assigned} — no tag cut, releases are batched"
+          # DIVE-2143: the retry loop lives in scripts/version-assign-push-loop.sh so a
+          # harness can reach it. It used to be inline here, where nothing in tests/
+          # could exercise it — and it shipped a retry loop that named the wrong cause
+          # on a real failure (run 30231912328) with no way to have caught it first.
+          #   0 = assigned and pushed (grade it)   3 = nothing owed   1 = failed loudly
+          bash scripts/version-assign-push-loop.sh "$before" 3; rc=$?
+          (( rc == 3 )) && exit 0
+          (( rc == 0 )) || exit 1
+          assigned=$(grep -m1 -oE 'FIVE_VERSION="[^"]+"' src/header.sh | sed 's/.*"\(.*\)"/\1/')
 
           # GRADED. A GITHUB_TOKEN push does not trigger workflows, so the assignment
           # commit would otherwise never be seen by CI — leaving this job's own output
