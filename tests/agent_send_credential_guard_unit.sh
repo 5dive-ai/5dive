@@ -39,9 +39,14 @@
 set -uo pipefail
 cd "$(dirname "$0")/.."
 
-fail=0
-ok_t()  { echo "ok: $1"; }
-bad_t() { echo "FAIL: $1"; fail=1; }
+# Counter shape matches the rest of tests/ on purpose: tests/meta/harness-verdict-probe.sh
+# must be able to identify this harness's verdict variable and prove the exit
+# status is actually wired to it. A harness it cannot probe is "NOT counted
+# clean" — which is the same failure mode this whole ticket is about, one level
+# up: a green result that was never measured.
+PASS=0; FAIL=0
+ok_t()  { PASS=$((PASS+1)); printf 'ok   - %s\n' "$1"; }
+bad_t() { FAIL=$((FAIL+1)); printf 'FAIL - %s\n' "$1"; }
 
 # Source the SHIPPED predicate out of the real source file so this test cannot
 # drift from the code that runs. Same technique as heartbeat_idle_marker_unit.sh.
@@ -175,5 +180,5 @@ else
 fi
 
 echo
-if (( fail )); then echo "FAILED"; exit 1; fi
-echo "all credential-guard checks passed"
+printf 'credential-guard: %d passed, %d failed\n' "$PASS" "$FAIL"
+[[ "$FAIL" -eq 0 ]]
