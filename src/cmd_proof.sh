@@ -155,6 +155,31 @@ _proof_pref_write() {
 # human_nonce_hash (a human tap token). A lead/agent clearance ('lead:*', a bare
 # agent name, 'auto:*') is NOT an ask.
 #
+# DIVE-2119 — the two arms are guarded DIFFERENTLY, on purpose:
+#
+#   need_answered_by arm  → now requires need_answered_at IS NOT NULL.
+#     This arm asks "did a human ANSWER this?", and until now it read the
+#     answerer without checking that anyone answered — so a re-filed gate wearing
+#     the PREVIOUS gate's `human:*` provenance (DIVE-2094's re-file residue) would
+#     have counted an ask that never happened. Latent, not live: measured 0 rows
+#     in this partition on the live board (it also requires status='done' AND
+#     kind='standard'), so adding the guard moves the published number by zero
+#     today and closes the channel for good. Every other reader of
+#     need_answered_by in the tree already guards on need_answered_at first;
+#     this was the one that didn't.
+#
+#   human_nonce_hash arm  → deliberately NOT guarded on need_answered_at.
+#     A minted nonce means the gate was DELIVERED to a human for a tap. Work that
+#     stopped on a human and got no answer still needed a human — arguably more
+#     so — and counting it keeps the autonomy number CONSERVATIVE (an unanswered
+#     ask stays an ask, so the badge understates autonomy rather than flattering
+#     it). Adding the guard here would have silently RAISED a published metric by
+#     dropping 5 live rows from the ask count, which is not a change to make as a
+#     side effect of a residue fix. The residue risk this arm did carry is closed
+#     at the source instead: DIVE-2119 resets human_nonce_hash whenever a gate is
+#     retired (_gate_archive_and_clear_sql), so a surviving nonce now always
+#     belongs to the gate being counted.
+#
 # NB we deliberately DON'T key off need_answered_uid: DIVE-756 captures that REAL
 # uid on EVERY sudo'd answer (lead agents included) as tamper-evidence, so it is
 # not a human marker — counting it would over-count asks and dishonestly
@@ -171,7 +196,8 @@ _proof_ledger() {
     # Single row "shipped|asks"; COALESCE guards the all-NULL SUM on an empty set.
     row="$(db "SELECT COUNT(*) || '|' || COALESCE(SUM(
                  CASE WHEN need_type IS NOT NULL
-                       AND (need_answered_by LIKE 'human:%'
+                       AND ((need_answered_at IS NOT NULL
+                             AND need_answered_by LIKE 'human:%')
                             OR (human_nonce_hash IS NOT NULL AND human_nonce_hash <> ''))
                       THEN 1 ELSE 0 END), 0)
                FROM tasks

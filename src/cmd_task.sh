@@ -3063,12 +3063,18 @@ cmd_task_park() {
     esac
     wake_sql=$(sqlq "$wake_ts")
   fi
-  db "UPDATE tasks
+  # DIVE-2119: park retires a gate too (an ANSWERED one — a live gate is refused
+  # above), so it goes through the same archive-then-clear as file/withdraw
+  # rather than nulling half the columns itself. One transaction: the archive
+  # must not survive without the reset, or the reset without the archive.
+  db "BEGIN IMMEDIATE;
+      $(_gate_archive_and_clear_sql park "id=${tid} AND status NOT IN ('done','cancelled')")
+      UPDATE tasks
         SET status='blocked', parked_at=datetime('now'), park_reason=$(sqlq "$reason"),
             wake_at=${wake_sql},
-            need_type=NULL, ask=NULL, need_options=NULL, recommend=NULL,
-            need_answer=NULL, need_answered_at=NULL
-      WHERE id=${tid} AND status NOT IN ('done','cancelled');"
+            need_type=NULL, ask=NULL, need_options=NULL, recommend=NULL
+      WHERE id=${tid} AND status NOT IN ('done','cancelled');
+      COMMIT;"
   local wake_note=""; [[ "$wake_sql" != "NULL" ]] && wake_note=" — wakes $(db "SELECT wake_at FROM tasks WHERE id=${tid};") UTC"
   ok "$tident parked (no action needed)${reason:+ — $reason}${wake_note}" \
      '{task:($t|tonumber), task_ident:$ti, parked:true, reason:$r, wake_at:(($w|select(length>0)) // null)}' \
@@ -3508,18 +3514,33 @@ cmd_task_need() {
     [[ -n "$w_name" && -n "$w_lead"  && "$w_name" == "$w_lead"  ]] && w_ok=1  # filer's lead
     [[ -n "$w_name" && -n "$w_coord" && "$w_name" == "$w_coord" ]] && w_ok=1  # org coordinator
     (( w_ok )) || policy_refuse "$E_AUTH_REQUIRED" gate-withdraw-not-authorized DIVE-1401 "$ident" "only the gate's filer (${w_filer:-?}), their lead, or a human can withdraw $ident's gate"
-    # Clear every gate field (NEVER need_answer/need_answered_at — this is not a
-    # grant) and unblock back to todo when no dependency edge still holds it.
-    db "UPDATE tasks
+    # Clear every gate field and unblock back to todo when no dependency edge
+    # still holds it. The withdrawn gate is archived to gate_history first, in
+    # the same transaction (DIVE-2119).
+    #
+    # DIVE-2119: this comment used to read "Clear every gate field (NEVER
+    # need_answer/need_answered_at — this is not a grant)" while the UPDATE it
+    # sits on cleared 12 fields and left need_answered_by / need_answered_uid /
+    # need_answer_sig standing — so a withdrawn gate left orphaned answer
+    # provenance behind (13 of the 21 rows DIVE-2094 measured were this path and
+    # `task park`). Two things were wrong with the old wording: it claimed a
+    # completeness it did not have, and its parenthetical is backwards — the
+    # answer columns ARE nulled here (a withdrawal records no grant, which is the
+    # property it was reaching for). Both are now true: _gate_archive_and_clear_sql
+    # resets all six provenance columns, so no answer or answerer survives a
+    # withdrawal, and the outgoing gate is preserved in gate_history instead.
+    db "BEGIN IMMEDIATE;
+        $(_gate_archive_and_clear_sql withdraw "id=${id}")
+        UPDATE tasks
           SET need_type=NULL, ask=NULL, need_options=NULL, recommend=NULL,
               secret_key=NULL, connector=NULL, ask_shape=NULL,
               precedent_ref=NULL, precedent_kind=NULL, routed_reviewer=NULL,
-              need_asked_at=NULL, gate_pinged_at=NULL,
-              need_answer=NULL, need_answered_at=NULL
+              need_asked_at=NULL, gate_pinged_at=NULL
         WHERE id=${id};
         UPDATE tasks SET status='todo'
           WHERE id=${id} AND status='blocked'
-            AND NOT EXISTS (SELECT 1 FROM task_deps WHERE task_id=${id});"
+            AND NOT EXISTS (SELECT 1 FROM task_deps WHERE task_id=${id});
+        COMMIT;"
     # DIVE-2054: DELIBERATELY UNFENCED. Carries asserted_from=, the identity-assertion
     # audit trail red-teamed on DIVE-1401 — a fixture store must never be able to
     # suppress it (fencing here would trade a contamination bug for an
@@ -3865,7 +3886,14 @@ cmd_task_need() {
   # `task answer` knows who to ping to resume. The inbox is defined by the gate
   # (need_type set), not by assignee, so it still surfaces to the human.
   local actor; actor=$(task_actor "$from")
-  db "UPDATE tasks
+  # DIVE-2119: a re-file DESTROYS the previous gate — archive it to gate_history
+  # and reset all six provenance columns in the same transaction, before the
+  # SET below overwrites need_type/ask/tier. Without the archive the previous
+  # gate leaves nothing but a stale answerer; without the reset the incoming
+  # gate wears that answerer's identity, uid and signature (DIVE-2094).
+  db "BEGIN IMMEDIATE;
+      $(_gate_archive_and_clear_sql file "id=${id}")
+      UPDATE tasks
         SET status='blocked', assignee=$(sqlq "$actor"),
             need_type=$(sqlq "$type"), ask=$(sqlq "$ask"),
             need_options=$(sqlq_or_null "$options"),
@@ -3875,9 +3903,9 @@ cmd_task_need() {
             ask_shape=$(sqlq_or_null "$ask_shape"),
             precedent_ref=${precedent_ref:-NULL},
             precedent_kind=$(sqlq_or_null "$precedent_kind"),
-            tier=${tier}, need_asked_at=datetime('now'), gate_pinged_at=NULL,
-            need_answer=NULL, need_answered_at=NULL
-      WHERE id=${id};"
+            tier=${tier}, need_asked_at=datetime('now'), gate_pinged_at=NULL
+      WHERE id=${id};
+      COMMIT;"
 
   # DIVE-891 tier 0: apply the recommendation right now — the gate exists only
   # as a signed-off record in the log/digest, never as a ping. Provenance is

@@ -3815,6 +3815,39 @@ CREATE TABLE IF NOT EXISTS ship_events (
 CREATE UNIQUE INDEX IF NOT EXISTS ship_events_kind_sha_idx ON ship_events(kind, sha);
 CREATE INDEX IF NOT EXISTS ship_events_ts_idx ON ship_events(ts, kind);
 
+-- DIVE-2119: append-only gate history. `tasks` carries exactly ONE set of need_*
+-- columns, so a task can only ever prove its MOST RECENT gate — and every verb
+-- that retires a gate (a re-file, `need --withdraw`, `task park`, the
+-- loop-ceiling auto-park) overwrote the previous one with nothing kept. One row
+-- is appended here, in the SAME transaction, immediately BEFORE the provenance
+-- columns are reset, so a displaced gate survives its own retirement. Written
+-- only by _gate_archive_and_clear_sql; append-only (never updated or deleted)
+-- and never referenced by tasks/projects, so it cannot touch the queue.
+-- retired_by is the verb that displaced it: file|withdraw|park|loop-ceiling.
+-- Additive, never referenced by tasks/projects, so it can't touch the queue.
+-- Defined identically inside _tasks_db_migrate for pre-existing stores; keep the
+-- two copies byte-identical (tests/schema_sync_unit.sh).
+CREATE TABLE IF NOT EXISTS gate_history (
+  id                INTEGER PRIMARY KEY AUTOINCREMENT,
+  task_id           INTEGER NOT NULL,
+  ident             TEXT,
+  need_type         TEXT,
+  ask               TEXT,
+  need_options      TEXT,
+  recommend         TEXT,
+  tier              INTEGER,
+  need_asked_at     TEXT,
+  need_answer       TEXT,
+  need_answered_at  TEXT,
+  need_answered_by  TEXT,
+  need_answered_uid INTEGER,
+  need_answer_sig   TEXT,
+  human_nonce_hash  TEXT,
+  retired_by        TEXT NOT NULL,
+  retired_at        TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS gate_history_task_idx ON gate_history(task_id, id);
+
 -- OSS-21: fleet-wide policy prefs as a tiny key/value store. Currently holds
 -- precedent_autoclear (on|off, default off when the row is absent) — the switch
 -- that lets a resolved tier-1 gate clear itself from proven human precedent.
@@ -4303,6 +4336,42 @@ CREATE INDEX IF NOT EXISTS policy_refusals_ts_idx ON policy_refusals(ts, policy)
 MIG
   fi
 
+  # DIVE-2119 gate_history — additive, gated on absence so it takes no write lock
+  # on every command. Brand-new append-only table, never referenced by
+  # tasks/projects, so creating it cannot touch the existing queue. NOTE this
+  # starts EMPTY on an existing store and no backfill is possible: for every row
+  # already carrying orphaned answer provenance the answer TEXT was overwritten
+  # long ago, so the pre-fix era is known-blind by construction (same posture
+  # DIVE-2090 took for its unaudited era). Keep this definition byte-identical to
+  # the one in _tasks_schema above (tests/schema_sync_unit.sh).
+  local has_gate_history
+  has_gate_history=$(sqlite3 -cmd ".timeout 5000" "$TASKS_DB" \
+    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='gate_history' LIMIT 1;" 2>/dev/null)
+  if [[ "$has_gate_history" != "1" ]]; then
+    sqlite3 -cmd ".timeout 5000" "$TASKS_DB" <<'MIG' >/dev/null 2>&1 || true
+CREATE TABLE IF NOT EXISTS gate_history (
+  id                INTEGER PRIMARY KEY AUTOINCREMENT,
+  task_id           INTEGER NOT NULL,
+  ident             TEXT,
+  need_type         TEXT,
+  ask               TEXT,
+  need_options      TEXT,
+  recommend         TEXT,
+  tier              INTEGER,
+  need_asked_at     TEXT,
+  need_answer       TEXT,
+  need_answered_at  TEXT,
+  need_answered_by  TEXT,
+  need_answered_uid INTEGER,
+  need_answer_sig   TEXT,
+  human_nonce_hash  TEXT,
+  retired_by        TEXT NOT NULL,
+  retired_at        TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS gate_history_task_idx ON gate_history(task_id, id);
+MIG
+  fi
+
   # DIVE-748 — additive scorecard column on already-created loop_runs tables.
   # The create-if-absent block above only covers fresh stores; existing loop_runs
   # (e.g. prod) need the column added. Pure expand: NULL backfill, old rows/queries
@@ -4690,6 +4759,59 @@ _gate_proof_hmac() {
   printf '%s' "$payload" \
     | openssl dgst -sha256 -mac HMAC -macopt "hexkey:$key" -binary 2>/dev/null \
     | openssl base64 -A 2>/dev/null | tr '+/' '-_' | tr -d '='
+}
+
+# DIVE-2119 — the ONE way to retire a gate. Emits SQL that (1) appends the
+# outgoing gate to gate_history and (2) nulls ALL SIX provenance columns.
+#
+# Why one helper and not six columns inlined at each site: before this, four
+# separate UPDATEs retired a gate by nulling only the two columns that carry the
+# MEANING (need_answer, need_answered_at) and left the three that carry the
+# ATTRIBUTION (need_answered_by, need_answered_uid, need_answer_sig) plus the
+# human tap nonce standing. That partial reset produces a row that reads as
+# unanswered to every guard and as human-attested to every reader that skips the
+# guard — 21 live rows did exactly that (DIVE-2094). Nulling the three without
+# archiving first would have been worse still: with no gate history anywhere,
+# the leaked attribution WAS the only surviving trace of the previous gate. So
+# archive and clear are one indivisible operation, and they live here so a fifth
+# retirement path cannot re-open the hole by forgetting half of it.
+#
+# human_nonce_hash is in the reset set for a second reason: _human_nonce_verify
+# checks a presented nonce against whatever hash the row currently holds, so a
+# nonce minted for a SUPERSEDED tier-2 gate would otherwise still verify against
+# the gate that replaced it — an old Telegram tap button clearing a new gate.
+# The mint at cmd_task_need runs AFTER the filing UPDATE, so clearing here never
+# eats the incoming gate's own nonce.
+#
+# Usage: db "BEGIN IMMEDIATE; $(_gate_archive_and_clear_sql <verb> "<pred>") <your UPDATE>; COMMIT;"
+# Emit this BEFORE the caller's own UPDATE — the archive reads need_type/ask/tier
+# off the row, which a re-file is about to overwrite. <pred> is a WHERE fragment
+# on tasks and may match many rows (the loop-ceiling park archives a whole set).
+_gate_archive_and_clear_sql() {
+  local verb="$1" pred="$2"
+  # printf, not a heredoc: an UNQUOTED heredoc carrying $( is the shape
+  # tests/heredoc_substitution_unit.sh forbids by pattern (DIVE-2005), and
+  # allowlisting a site blunts that scanner. The interpolation here is
+  # deliberate, so make it explicit instead of exempt.
+  printf '%s\n' \
+    "INSERT INTO gate_history (task_id, ident, need_type, ask, need_options, recommend," \
+    "                          tier, need_asked_at, need_answer, need_answered_at," \
+    "                          need_answered_by, need_answered_uid, need_answer_sig," \
+    "                          human_nonce_hash, retired_by)" \
+    "  SELECT id, ident, need_type, ask, need_options, recommend," \
+    "         tier, need_asked_at, need_answer, need_answered_at," \
+    "         need_answered_by, need_answered_uid, need_answer_sig," \
+    "         human_nonce_hash, $(sqlq "$verb")" \
+    "    FROM tasks" \
+    "   WHERE (${pred})" \
+    "     AND (need_type IS NOT NULL OR need_answer IS NOT NULL" \
+    "          OR need_answered_at IS NOT NULL OR need_answered_by IS NOT NULL" \
+    "          OR need_answered_uid IS NOT NULL OR need_answer_sig IS NOT NULL" \
+    "          OR (human_nonce_hash IS NOT NULL AND human_nonce_hash <> ''));" \
+    "UPDATE tasks" \
+    "   SET need_answer=NULL, need_answered_at=NULL, need_answered_by=NULL," \
+    "       need_answered_uid=NULL, need_answer_sig=NULL, human_nonce_hash=NULL" \
+    " WHERE (${pred});"
 }
 
 # Constant-time compare: full-length scan, no early exit. Length isn't secret (the
@@ -21254,12 +21376,18 @@ cmd_task_park() {
     esac
     wake_sql=$(sqlq "$wake_ts")
   fi
-  db "UPDATE tasks
+  # DIVE-2119: park retires a gate too (an ANSWERED one — a live gate is refused
+  # above), so it goes through the same archive-then-clear as file/withdraw
+  # rather than nulling half the columns itself. One transaction: the archive
+  # must not survive without the reset, or the reset without the archive.
+  db "BEGIN IMMEDIATE;
+      $(_gate_archive_and_clear_sql park "id=${tid} AND status NOT IN ('done','cancelled')")
+      UPDATE tasks
         SET status='blocked', parked_at=datetime('now'), park_reason=$(sqlq "$reason"),
             wake_at=${wake_sql},
-            need_type=NULL, ask=NULL, need_options=NULL, recommend=NULL,
-            need_answer=NULL, need_answered_at=NULL
-      WHERE id=${tid} AND status NOT IN ('done','cancelled');"
+            need_type=NULL, ask=NULL, need_options=NULL, recommend=NULL
+      WHERE id=${tid} AND status NOT IN ('done','cancelled');
+      COMMIT;"
   local wake_note=""; [[ "$wake_sql" != "NULL" ]] && wake_note=" — wakes $(db "SELECT wake_at FROM tasks WHERE id=${tid};") UTC"
   ok "$tident parked (no action needed)${reason:+ — $reason}${wake_note}" \
      '{task:($t|tonumber), task_ident:$ti, parked:true, reason:$r, wake_at:(($w|select(length>0)) // null)}' \
@@ -21699,18 +21827,33 @@ cmd_task_need() {
     [[ -n "$w_name" && -n "$w_lead"  && "$w_name" == "$w_lead"  ]] && w_ok=1  # filer's lead
     [[ -n "$w_name" && -n "$w_coord" && "$w_name" == "$w_coord" ]] && w_ok=1  # org coordinator
     (( w_ok )) || policy_refuse "$E_AUTH_REQUIRED" gate-withdraw-not-authorized DIVE-1401 "$ident" "only the gate's filer (${w_filer:-?}), their lead, or a human can withdraw $ident's gate"
-    # Clear every gate field (NEVER need_answer/need_answered_at — this is not a
-    # grant) and unblock back to todo when no dependency edge still holds it.
-    db "UPDATE tasks
+    # Clear every gate field and unblock back to todo when no dependency edge
+    # still holds it. The withdrawn gate is archived to gate_history first, in
+    # the same transaction (DIVE-2119).
+    #
+    # DIVE-2119: this comment used to read "Clear every gate field (NEVER
+    # need_answer/need_answered_at — this is not a grant)" while the UPDATE it
+    # sits on cleared 12 fields and left need_answered_by / need_answered_uid /
+    # need_answer_sig standing — so a withdrawn gate left orphaned answer
+    # provenance behind (13 of the 21 rows DIVE-2094 measured were this path and
+    # `task park`). Two things were wrong with the old wording: it claimed a
+    # completeness it did not have, and its parenthetical is backwards — the
+    # answer columns ARE nulled here (a withdrawal records no grant, which is the
+    # property it was reaching for). Both are now true: _gate_archive_and_clear_sql
+    # resets all six provenance columns, so no answer or answerer survives a
+    # withdrawal, and the outgoing gate is preserved in gate_history instead.
+    db "BEGIN IMMEDIATE;
+        $(_gate_archive_and_clear_sql withdraw "id=${id}")
+        UPDATE tasks
           SET need_type=NULL, ask=NULL, need_options=NULL, recommend=NULL,
               secret_key=NULL, connector=NULL, ask_shape=NULL,
               precedent_ref=NULL, precedent_kind=NULL, routed_reviewer=NULL,
-              need_asked_at=NULL, gate_pinged_at=NULL,
-              need_answer=NULL, need_answered_at=NULL
+              need_asked_at=NULL, gate_pinged_at=NULL
         WHERE id=${id};
         UPDATE tasks SET status='todo'
           WHERE id=${id} AND status='blocked'
-            AND NOT EXISTS (SELECT 1 FROM task_deps WHERE task_id=${id});"
+            AND NOT EXISTS (SELECT 1 FROM task_deps WHERE task_id=${id});
+        COMMIT;"
     # DIVE-2054: DELIBERATELY UNFENCED. Carries asserted_from=, the identity-assertion
     # audit trail red-teamed on DIVE-1401 — a fixture store must never be able to
     # suppress it (fencing here would trade a contamination bug for an
@@ -22056,7 +22199,14 @@ cmd_task_need() {
   # `task answer` knows who to ping to resume. The inbox is defined by the gate
   # (need_type set), not by assignee, so it still surfaces to the human.
   local actor; actor=$(task_actor "$from")
-  db "UPDATE tasks
+  # DIVE-2119: a re-file DESTROYS the previous gate — archive it to gate_history
+  # and reset all six provenance columns in the same transaction, before the
+  # SET below overwrites need_type/ask/tier. Without the archive the previous
+  # gate leaves nothing but a stale answerer; without the reset the incoming
+  # gate wears that answerer's identity, uid and signature (DIVE-2094).
+  db "BEGIN IMMEDIATE;
+      $(_gate_archive_and_clear_sql file "id=${id}")
+      UPDATE tasks
         SET status='blocked', assignee=$(sqlq "$actor"),
             need_type=$(sqlq "$type"), ask=$(sqlq "$ask"),
             need_options=$(sqlq_or_null "$options"),
@@ -22066,9 +22216,9 @@ cmd_task_need() {
             ask_shape=$(sqlq_or_null "$ask_shape"),
             precedent_ref=${precedent_ref:-NULL},
             precedent_kind=$(sqlq_or_null "$precedent_kind"),
-            tier=${tier}, need_asked_at=datetime('now'), gate_pinged_at=NULL,
-            need_answer=NULL, need_answered_at=NULL
-      WHERE id=${id};"
+            tier=${tier}, need_asked_at=datetime('now'), gate_pinged_at=NULL
+      WHERE id=${id};
+      COMMIT;"
 
   # DIVE-891 tier 0: apply the recommendation right now — the gate exists only
   # as a signed-off record in the log/digest, never as a ping. Provenance is
@@ -36925,14 +37075,19 @@ _hb_loop_ceiling_sweep() {
     kid_ids=$(printf '%s' "${kids:-}" | tr -cd '0-9,' | tr ',' ' ')
     if [[ -n "$kid_ids" ]]; then
       local in_list; in_list=$(printf '%s' "$kid_ids" | tr ' ' ',')
-      db "UPDATE tasks
+      # DIVE-2119: this auto-park retires gates on a whole SET of child tasks, so
+      # it runs the same archive-then-clear as `task park` — scoped to exactly the
+      # rows the park will touch, in one transaction. A fix scoped to the gate
+      # verbs alone would have left this path producing orphaned provenance.
+      local _park_pred="id IN (${in_list}) AND status IN ('todo','in_progress') AND parked_at IS NULL"
+      db "BEGIN IMMEDIATE;
+          $(_gate_archive_and_clear_sql loop-ceiling "$_park_pred")
+          UPDATE tasks
             SET status='blocked', parked_at=datetime('now'),
                 park_reason=$(sqlq "loop ${lid} hit its token ceiling (~${spent}/${ceil} tok) — halted by heartbeat before finishing"),
-                need_type=NULL, ask=NULL, need_options=NULL, recommend=NULL,
-                need_answer=NULL, need_answered_at=NULL
-          WHERE id IN (${in_list})
-            AND status IN ('todo','in_progress')
-            AND parked_at IS NULL;"
+                need_type=NULL, ask=NULL, need_options=NULL, recommend=NULL
+          WHERE ${_park_pred};
+          COMMIT;"
     fi
     _hb_log "[loop-ceiling] ${lid} breached ceiling (~${spent}/${ceil} tok) — halted (child tasks parked) + escalated"
     # Escalate-with-proof on the originating task (skip if it already has an open
@@ -40778,6 +40933,31 @@ _proof_pref_write() {
 # human_nonce_hash (a human tap token). A lead/agent clearance ('lead:*', a bare
 # agent name, 'auto:*') is NOT an ask.
 #
+# DIVE-2119 — the two arms are guarded DIFFERENTLY, on purpose:
+#
+#   need_answered_by arm  → now requires need_answered_at IS NOT NULL.
+#     This arm asks "did a human ANSWER this?", and until now it read the
+#     answerer without checking that anyone answered — so a re-filed gate wearing
+#     the PREVIOUS gate's `human:*` provenance (DIVE-2094's re-file residue) would
+#     have counted an ask that never happened. Latent, not live: measured 0 rows
+#     in this partition on the live board (it also requires status='done' AND
+#     kind='standard'), so adding the guard moves the published number by zero
+#     today and closes the channel for good. Every other reader of
+#     need_answered_by in the tree already guards on need_answered_at first;
+#     this was the one that didn't.
+#
+#   human_nonce_hash arm  → deliberately NOT guarded on need_answered_at.
+#     A minted nonce means the gate was DELIVERED to a human for a tap. Work that
+#     stopped on a human and got no answer still needed a human — arguably more
+#     so — and counting it keeps the autonomy number CONSERVATIVE (an unanswered
+#     ask stays an ask, so the badge understates autonomy rather than flattering
+#     it). Adding the guard here would have silently RAISED a published metric by
+#     dropping 5 live rows from the ask count, which is not a change to make as a
+#     side effect of a residue fix. The residue risk this arm did carry is closed
+#     at the source instead: DIVE-2119 resets human_nonce_hash whenever a gate is
+#     retired (_gate_archive_and_clear_sql), so a surviving nonce now always
+#     belongs to the gate being counted.
+#
 # NB we deliberately DON'T key off need_answered_uid: DIVE-756 captures that REAL
 # uid on EVERY sudo'd answer (lead agents included) as tamper-evidence, so it is
 # not a human marker — counting it would over-count asks and dishonestly
@@ -40794,7 +40974,8 @@ _proof_ledger() {
     # Single row "shipped|asks"; COALESCE guards the all-NULL SUM on an empty set.
     row="$(db "SELECT COUNT(*) || '|' || COALESCE(SUM(
                  CASE WHEN need_type IS NOT NULL
-                       AND (need_answered_by LIKE 'human:%'
+                       AND ((need_answered_at IS NOT NULL
+                             AND need_answered_by LIKE 'human:%')
                             OR (human_nonce_hash IS NOT NULL AND human_nonce_hash <> ''))
                       THEN 1 ELSE 0 END), 0)
                FROM tasks
