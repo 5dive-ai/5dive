@@ -26,7 +26,7 @@ esac
 
 # Bumped on every public release. `build.sh` checks this line exists; CI fails
 # the bundle-drift check if it's missing or empty.
-readonly FIVE_VERSION="0.16.29"
+readonly FIVE_VERSION="0.16.30"
 
 # GitHub org our repos live under. The org is being renamed
 # 5dive-com -> 5dive-ai (2026-06); fetches must work on either side of the
@@ -13913,6 +13913,107 @@ wait_agent_input_ready() {
   return 1
 }
 
+# DIVE-2137 (gh#214, reported by A-MO7SEN) — CREDENTIAL-PROMPT GUARD.
+#
+# `send`/`ask`/`_deliver` all assume the target pane is parked at a CHAT input.
+# They check that something is ready to receive keystrokes (_agent_pane_input_ready)
+# but never what that something IS. When the agent booted unauthenticated it sits
+# on its login menu instead, and every marker above still matches — codex draws
+# its "›" composer glyph on the API-key entry screen exactly as it does in chat.
+# So an ordinary inter-agent message is typed into the credential field and
+# SUBMITTED: the message body becomes the agent's stored API key (codex writes it
+# straight to auth.json). Silent in both directions — the caller gets `delivered`,
+# and the agent is now authenticated with a garbage secret.
+#
+# Fail-CLOSED is the whole point (a best-effort "warn and type anyway" is what
+# made this reachable): we refuse and return a hard error rather than risk
+# writing a peer's message into a secret store.
+#
+# PROVENANCE OF THE FINGERPRINTS — deliberately not invented. Every string below
+# was read out of a shipped binary on a real box, verbatim:
+#   codex   `.../@openai/codex-linux-x64/vendor/.../bin/codex` (strings)
+#             "Sign in with ChatGPT" / "Sign in with Device Code"
+#             "Provide your own API key" / "Pay for what you use"
+#             "Paste or type your API key below. It will be stored locally in auth.json."
+#             "Detected OPENAI_API_KEY environment variable."
+#   claude  `~/.local/share/claude/versions/2.1.220` (strings)
+#             "Claude account with subscription" / "Anthropic Console account"
+# The codex pair independently CONFIRMS the two rows A-MO7SEN quoted from his own
+# pane in gh#214. Strings we could NOT confirm against a shipped artifact (e.g.
+# "Select login method", "Enter your API key") are deliberately NOT matched here —
+# see tests/agent_send_credential_guard_unit.sh, which records that gap rather
+# than papering over it.
+#
+# TWO TIERS, because where a string appears carries as much signal as the string:
+#  1. LOGIN MENU — matched anywhere in the pane, but only on a CO-OCCURRING PAIR
+#     of verbatim menu rows. A single row is not enough: agents talk about auth
+#     constantly, and a one-line whole-pane match would refuse legitimate traffic.
+#     (Measured, not assumed: while building this, a scan of live panes on this
+#     box matched "api key" and "sign in" inside MY OWN chat pane — ordinary work
+#     text. The pair requirement is what that observation bought.)
+#  2. SECRET ENTRY FIELD — matched only in the LIVE PROMPT REGION (last 15 lines),
+#     never in scrollback, so quoting a past login screen in chat can't trip it.
+#     Includes a narrow generic rule for TUIs we have no sample of: a lone
+#     "Password:" / "API key:" / "Token:" label with NOTHING after the colon,
+#     which is a field awaiting input and essentially never prose.
+_agent_pane_credential_prompt() {
+  local pane="${1:-}" tail_region
+  [[ -n "$pane" ]] || return 1
+
+  # Tier 1 — login/auth MENU (co-occurring verbatim rows, anywhere in the pane).
+  grep -qF 'Sign in with ChatGPT' <<<"$pane" \
+    && grep -qF 'Provide your own API key' <<<"$pane" && return 0
+  grep -qF 'Sign in with ChatGPT' <<<"$pane" \
+    && grep -qF 'Sign in with Device Code' <<<"$pane" && return 0
+  grep -qF 'Claude account with subscription' <<<"$pane" \
+    && grep -qF 'Anthropic Console account' <<<"$pane" && return 0
+
+  # Tier 2 — SECRET ENTRY FIELD, live prompt region only.
+  tail_region="$(tail -n 15 <<<"$pane")"
+  grep -qF 'Paste or type your API key' <<<"$tail_region" && return 0
+  grep -qF 'Detected OPENAI_API_KEY environment variable.' <<<"$tail_region" && return 0
+  grep -qE '^[[:space:]]*[>❯›*-]?[[:space:]]*(Password|Passphrase|API [Kk]ey|Api [Kk]ey|Token|Secret)[[:space:]]*:[[:space:]]*$' \
+    <<<"$tail_region" && return 0
+
+  return 1
+}
+
+# Boot-time breadcrumb left by the credential seed in `5dive-agent-start` when it
+# could not read its source (DIVE-2137 defect A — see that script). Best-effort:
+# printing nothing just means the refusal below carries no root-cause hint.
+_agent_cred_seed_failure() {
+  local name="$1"
+  sudo -u "agent-${name}" cat "/home/agent-${name}/.5dive-cred-seed-failed" 2>/dev/null | head -1 || true
+}
+
+# Capture the target pane and decide whether typing into it is safe.
+# 0 = safe to type, 1 = REFUSE (pane is a credential/login surface).
+# Escape hatch for an operator who genuinely means to type into a login screen:
+# FIVE_ALLOW_CREDENTIAL_PANE=1. Named in the refusal message so it is findable.
+_agent_pane_safe_to_type() {
+  local name="$1" pane
+  [[ "${FIVE_ALLOW_CREDENTIAL_PANE:-0}" == "1" ]] && return 0
+  pane=$(sudo -u "agent-${name}" tmux capture-pane -p -t "agent-${name}" 2>/dev/null || true)
+  _agent_pane_credential_prompt "$pane" && return 1
+  return 0
+}
+
+# Shared refusal text for the three inject sites, so the message can't drift.
+_agent_credential_refusal_msg() {
+  local name="$1" why
+  why="$(_agent_cred_seed_failure "$name")"
+  local m="refused to send: agent '${name}' is parked on a CREDENTIAL/LOGIN prompt, not a chat input"
+  m+=" — typing there would store the message body as its API key (DIVE-2137, gh#214)."
+  if [[ -n "$why" ]]; then
+    m+=" Root cause at boot: ${why}"
+  else
+    m+=" The agent most likely booted unauthenticated; check its credential seed."
+  fi
+  m+=" Fix the credential (5dive agent auth ...) and restart it, then resend."
+  m+=" To type into the prompt on purpose: FIVE_ALLOW_CREDENTIAL_PANE=1."
+  printf '%s\n' "$m"
+}
+
 # Inject a payload into the agent's tmux pane and SUBMIT it, robust against the
 # TUI's bracketed-paste handling (DIVE-147). A large/multiline `send-keys -l` is
 # absorbed by the TUI as a bracketed PASTE — the prompt shows
@@ -13942,6 +14043,12 @@ wait_agent_input_ready() {
 inject_and_submit() {
   local name="$1" payload="$2" tries=0 pane
   local user="agent-${name}"   # separate stmt: ${name} in the same line aborts under set -u (silent msg drop)
+  # DIVE-2137: the ONE choke point every typed send funnels through (cmd_send,
+  # cmd_ask, _deliver). The guard lives here rather than at the three call sites
+  # for the same reason the readiness marker set was collapsed into one predicate
+  # in DIVE-1528 — a per-site copy is a per-site drift. Distinct rc 3 so callers
+  # can tell "refused, nothing was typed" from rc 1 "typed but maybe unsubmitted".
+  _agent_pane_safe_to_type "$name" || return 3
   sudo -u "$user" tmux send-keys -t "agent-${name}" -l -- "$payload"
   # Let the TUI finish ingesting the (possibly bracketed-paste) payload before the
   # Enter, so the newline isn't bundled into the paste sequence.
@@ -14316,7 +14423,11 @@ cmd_deliver() {
   if ! wait_agent_input_ready "$target"; then
     step "agent '$target' input prompt not detected after 45s — sending best-effort (may be lost if still booting)"
   fi
-  if ! inject_and_submit "$target" "$payload"; then
+  local _rc=0
+  inject_and_submit "$target" "$payload" || _rc=$?
+  if (( _rc == 3 )); then
+    fail "$E_AUTH_REQUIRED" "$(_agent_credential_refusal_msg "$target")"
+  elif (( _rc != 0 )); then
     step "agent '$target': payload may not have submitted — pane still shows an unsent paste buffer after retries (large-paste submit race, DIVE-147)"
   fi
   ok "delivered to agent '$target'." \
@@ -14565,7 +14676,11 @@ cmd_send() {
     step "agent '$name' input prompt not detected after 45s — sending best-effort (may be lost if still booting)"
   fi
 
-  if ! inject_and_submit "$name" "$payload"; then
+  local _rc=0
+  inject_and_submit "$name" "$payload" || _rc=$?
+  if (( _rc == 3 )); then
+    fail "$E_AUTH_REQUIRED" "$(_agent_credential_refusal_msg "$name")"
+  elif (( _rc != 0 )); then
     step "agent '$name': payload may not have submitted — pane still shows an unsent paste buffer after retries (large-paste submit race, DIVE-147)"
   fi
 
@@ -14702,8 +14817,17 @@ cmd_ask() {
     # header (from=<caller> id=<msg_id> tier=standard). sudo -n = fail-closed.
     # A standard ask is peer-to-peer, so (like send) it carries no --reply-to
     # channel plumbing.
-    if ! sudo -n /usr/local/bin/5dive agent _deliver --id="$msg_id" "$name" "$ask_message"; then
-      fail "$E_GENERIC" "scoped delivery to '$name' failed (missing _deliver grant? re-provision the agent)"
+    # DIVE-2137: capture _deliver's stderr instead of letting it vanish. The
+    # credential-prompt refusal (E_AUTH_REQUIRED=6) is raised INSIDE _deliver, so
+    # a blanket "missing grant?" here would relabel a fail-closed secret guard as
+    # a provisioning problem — the caller would go re-provision the agent and
+    # resend, straight back into the prompt. Pass rc 6 and its message through.
+    local _derr _drc=0
+    _derr=$(sudo -n /usr/local/bin/5dive agent _deliver --id="$msg_id" "$name" "$ask_message" 2>&1 >/dev/null) || _drc=$?
+    if (( _drc == E_AUTH_REQUIRED )); then
+      fail "$E_AUTH_REQUIRED" "${_derr#*: }"
+    elif (( _drc != 0 )); then
+      fail "$E_GENERIC" "scoped delivery to '$name' failed (missing _deliver grant? re-provision the agent)${_derr:+ — $_derr}"
     fi
   else
     require_agent "$name"
@@ -14719,7 +14843,11 @@ cmd_ask() {
     if ! wait_agent_input_ready "$name"; then
       step "agent '$name' input prompt not detected after 45s — sending best-effort (may be lost if still booting)"
     fi
-    if ! inject_and_submit "$name" "$payload"; then
+    local _rc=0
+    inject_and_submit "$name" "$payload" || _rc=$?
+    if (( _rc == 3 )); then
+      fail "$E_AUTH_REQUIRED" "$(_agent_credential_refusal_msg "$name")"
+    elif (( _rc != 0 )); then
       step "agent '$name': question may not have submitted — pane still shows an unsent paste buffer after retries (large-paste submit race, DIVE-147)"
     fi
   fi
@@ -35896,6 +36024,17 @@ _hb_tier_rank() {
 # (never exits) so a single dead pane can't abort the whole tick.
 _hb_send_line() {
   local name="$1" text="$2" tries=0
+  # DIVE-2137: the heartbeat is the FOURTH typed-send site (send / ask / _deliver
+  # are the three in cmd_agent_runtime.sh) and had the same blind spot — it types
+  # a nudge into whatever the pane happens to be showing. An agent that booted
+  # unauthenticated is parked on its login menu, so an autonomous wake/nudge
+  # would write "continue" (or a whole task line) into the API-key field and
+  # submit it. Worse than the reported path, because no human is watching a tick.
+  # Same fail-closed predicate, one shared definition (cmd_agent_runtime.sh).
+  _agent_pane_safe_to_type "$name" || {
+    _hb_log "skip send to ${name}: pane is a credential/login prompt, not a chat input (DIVE-2137)" 2>/dev/null || true
+    return 1
+  }
   sudo -u "agent-${name}" tmux send-keys -t "agent-${name}" -l -- "$text" 2>/dev/null || return 1
   # DIVE-1217: `send-keys -l` lands as a bracketed PASTE. Claude commits it
   # synchronously so an immediate Enter submits (leave that path alone). Non-claude

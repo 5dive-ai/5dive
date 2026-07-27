@@ -299,6 +299,55 @@ PI_OVERRIDE=""
 if [[ "$TYPE" == "pi" && "$CHANNELS" == "telegram" ]]; then
   PI_OVERRIDE="export PI_BIN=$(printf %q "/home/claude/.local/bin/pi") PI_PROJECT_DIR=$(printf %q "$WORKDIR"); "
 fi
+# DIVE-2137 (gh#214) defect A — MAKE A FAILED SEED OBSERVABLE.
+#
+# Every `warn: could not seed ...` below goes to stderr, which lands in the
+# journal, which nobody reads. The agent then boots UNAUTHENTICATED straight to
+# its login menu — and from there the send-into-a-credential-prompt bug (defect
+# B, see _agent_pane_credential_prompt in cmd_agent_runtime.sh) turns the next
+# ordinary inter-agent message into the agent's stored API key. The log line is
+# the only record that anything went wrong, and it is invisible at every surface
+# an operator actually looks at.
+#
+# So the failure now also writes a BREADCRUMB in the agent's own home, which the
+# send-side refusal reads back to name the root cause at the moment it bites
+# ("Root cause at boot: ..."). Written by the agent itself, so no privilege is
+# needed; removed on a successful seed so it can never go stale.
+# Deliberately self-contained: derived from $HOME inside the function rather
+# than captured in a script-level variable. These run under `set -u`, and a
+# helper that reaches for an outer variable dies mid-seed the moment it is
+# called from a context that didn't set it — taking the rest of the seed's
+# diagnostics down with it. (That is not hypothetical: it is what the
+# block-extraction unit test caught the first time this was written.)
+cred_seed_breadcrumb_path() { printf '%s/.5dive-cred-seed-failed' "${HOME:-/tmp}"; }
+cred_seed_failed() { # <reason>
+  local _bc; _bc="$(cred_seed_breadcrumb_path)"
+  printf '%s\n' "$1" > "$_bc" 2>/dev/null || true
+  chmod 640 "$_bc" 2>/dev/null || true
+  echo "warn: $1" >&2
+}
+cred_seed_ok() { rm -f "$(cred_seed_breadcrumb_path)" 2>/dev/null || true; }
+# Can this process actually READ the path? A seed source that merely EXISTS is
+# the trap that produced gh#214: the canonical profile was absent, so the legacy
+# 0600 claude:claude symlink was selected on `-e` alone, and both arms of the
+# read (plain, then `sudo -n`) then failed for a standard-isolation agent.
+cred_src_readable() { # <path>
+  [[ -r "$1" ]] || sudo -n test -r "$1" 2>/dev/null
+}
+# Distinguish the two failure shapes an operator has to act on differently:
+# a MISSING source (nobody has logged this profile in) vs a PRESENT but
+# UNREADABLE one (a perms fault — see normalize_profile_seed_perms, DIVE-1900).
+# gh#214 was the second kind and read as the first everywhere.
+cred_seed_why() { # <path>
+  if ! { [[ -e "$1" ]] || sudo -n test -e "$1" 2>/dev/null; }; then
+    printf 'source missing'
+  elif ! cred_src_readable "$1"; then
+    printf 'source present but UNREADABLE by %s — perms fault, not a missing login' "$(id -un)"
+  else
+    printf 'source readable but copy failed'
+  fi
+}
+
 if [[ "$TYPE" == "codex" ]]; then
   AGENT_CODEX_HOME="$HOME/.codex"
   install -d -m 700 "$AGENT_CODEX_HOME"
@@ -313,8 +362,16 @@ if [[ "$TYPE" == "codex" ]]; then
   # symlink as a legacy fallback for a box whose canonical profile is unpopulated.
   if [[ -z "$SHARED_AUTH" ]]; then
     SHARED_AUTH="/var/lib/5dive/auth-profiles/codex/codex/auth.json"
-    { [[ -e "$SHARED_AUTH" ]] || sudo -n test -e "$SHARED_AUTH" 2>/dev/null; } \
-      || SHARED_AUTH="/home/claude/.codex/auth.json"
+    # DIVE-2137: select on READABILITY, not mere existence. A canonical profile
+    # that exists but this agent cannot read is useless, and falling back to the
+    # 0600 claude:claude legacy symlink on an `-e` test is exactly how gh#214's
+    # box ended up seeding nothing. Prefer whichever source we can actually read;
+    # if neither is readable, keep the canonical path so the breadcrumb below
+    # names the file an operator should go fix.
+    if ! cred_src_readable "$SHARED_AUTH"; then
+      cred_src_readable /home/claude/.codex/auth.json \
+        && SHARED_AUTH="/home/claude/.codex/auth.json"
+    fi
   fi
   LOCAL_AUTH="$AGENT_CODEX_HOME/auth.json"
   # DIVE-1322: re-seed when codex has already written a bad apikey auth.json
@@ -341,9 +398,10 @@ if [[ "$TYPE" == "codex" ]]; then
     if { cat "$SHARED_AUTH" 2>/dev/null || sudo -n cat "$SHARED_AUTH" 2>/dev/null; } > "$TMP" && [[ -s "$TMP" ]]; then
       chmod 600 "$TMP"
       mv "$TMP" "$LOCAL_AUTH"
+      cred_seed_ok
     else
       rm -f "$TMP"
-      echo "warn: could not seed codex auth.json from $SHARED_AUTH" >&2
+      cred_seed_failed "could not seed codex auth.json from $SHARED_AUTH ($(cred_seed_why "$SHARED_AUTH")) — agent will boot UNAUTHENTICATED"
     fi
   fi
   # Bypass codex's first-run trust prompt + approval/sandbox dialogs. Mirrors
@@ -522,9 +580,10 @@ if [[ "$TYPE" == "grok" ]]; then
     if { cat "$SHARED_GROK_AUTH" 2>/dev/null || sudo -n cat "$SHARED_GROK_AUTH" 2>/dev/null; } > "$TMP" && [[ -s "$TMP" ]]; then
       chmod 600 "$TMP"
       mv "$TMP" "$LOCAL_GROK_AUTH"
+      cred_seed_ok
     else
       rm -f "$TMP"
-      echo "warn: could not seed grok auth.json from $SHARED_GROK_AUTH" >&2
+      cred_seed_failed "could not seed grok auth.json from $SHARED_GROK_AUTH ($(cred_seed_why "$SHARED_GROK_AUTH")) — agent will boot UNAUTHENTICATED"
     fi
   fi
 fi
@@ -665,10 +724,11 @@ if [[ "$TYPE" == "hermes" ]]; then
     if { cat "$SHARED" 2>/dev/null || sudo -n cat "$SHARED" 2>/dev/null; } > "$TMP" && [[ -s "$TMP" ]]; then
       chmod 600 "$TMP"
       mv "$TMP" "$LOCAL"
+      cred_seed_ok
       hermes_seeded=1
     else
       rm -f "$TMP"
-      echo "warn: could not seed hermes $f from $SHARED" >&2
+      cred_seed_failed "could not seed hermes $f from $SHARED ($(cred_seed_why "$SHARED")) — agent will boot UNAUTHENTICATED"
     fi
   }
   seed_one auth.json   mtime
@@ -726,9 +786,10 @@ if [[ "$TYPE" == "openclaw" ]]; then
     if { cat "$SHARED_OPENCLAW_AUTH" 2>/dev/null || sudo -n cat "$SHARED_OPENCLAW_AUTH" 2>/dev/null; } > "$TMP" && [[ -s "$TMP" ]]; then
       chmod 600 "$TMP"
       mv "$TMP" "$LOCAL_OPENCLAW_AUTH"
+      cred_seed_ok
     else
       rm -f "$TMP"
-      echo "warn: could not seed openclaw auth-profiles.json from $SHARED_OPENCLAW_AUTH" >&2
+      cred_seed_failed "could not seed openclaw auth-profiles.json from $SHARED_OPENCLAW_AUTH ($(cred_seed_why "$SHARED_OPENCLAW_AUTH")) — agent will boot UNAUTHENTICATED"
     fi
   fi
   # DIVE-1900: loud on the wrong-layer failure (see assert_cred_seeded above).
@@ -834,9 +895,10 @@ if [[ "$TYPE" == "antigravity" ]]; then
     if { cat "$SHARED_AGY_AUTH" 2>/dev/null || sudo -n cat "$SHARED_AGY_AUTH" 2>/dev/null; } > "$TMP" && [[ -s "$TMP" ]]; then
       chmod 600 "$TMP"
       mv "$TMP" "$LOCAL_AGY_AUTH"
+      cred_seed_ok
     else
       rm -f "$TMP"
-      echo "warn: could not seed antigravity oauth token from $SHARED_AGY_AUTH" >&2
+      cred_seed_failed "could not seed antigravity oauth token from $SHARED_AGY_AUTH ($(cred_seed_why "$SHARED_AGY_AUTH")) — agent will boot UNAUTHENTICATED"
     fi
   fi
   # DIVE-1900: be LOUD about the wrong-layer failure — including the case where

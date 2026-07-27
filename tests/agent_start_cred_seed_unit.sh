@@ -42,10 +42,47 @@ extract_block() { # <type>
   ' "$START"
 }
 
-# The blocks call assert_cred_seeded(), which is defined once above them — pull
-# the real definition in too so the block still runs standalone.
-HELPER="$(awk '/^assert_cred_seeded\(\) \{$/ { on=1 } on { print } on && $0 == "}" { exit }' "$START")"
-[[ -n "$HELPER" ]] || { echo "FAIL: could not extract assert_cred_seeded"; exit 1; }
+# The blocks call helper functions defined once above them — pull the real
+# definitions in too so a block still runs standalone.
+#
+# DIVE-2137: this used to extract assert_cred_seeded ONLY. When the seed blocks
+# grew cred_seed_failed/cred_seed_ok, the extracted blocks kept calling them and
+# the harness kept passing — bash reports an unknown function as a non-fatal
+# "command not found" on stderr, and nothing here was looking. Every block was
+# being exercised in a universe where its own helpers did not exist, and a
+# mutation to cred_seed_failed's output left the suite green. So: extract EVERY
+# top-level helper the blocks rely on, and then assert (below) that no function
+# a block calls is missing — the harness now fails loudly instead of measuring
+# a script that could never run.
+extract_fn() { # <name>
+  # Literal prefix match: the name contains "()" which are ERE metacharacters,
+  # so a regex compare silently matches the wrong thing (it matched a bare
+  # "name {" and therefore nothing at all). Definitions may carry a trailing
+  # comment ("cred_seed_failed() { # <reason>"), so prefix, not equality.
+  awk -v m="$1() {" 'substr($0,1,length(m))==m { on=1 } on { print } on && $0 == "}" { exit }' "$START"
+}
+HELPER=""
+for _fn in assert_cred_seeded cred_seed_breadcrumb_path cred_seed_failed cred_seed_ok cred_src_readable cred_seed_why; do
+  _def="$(extract_fn "$_fn")"
+  [[ -n "$_def" ]] || { echo "FAIL: could not extract $_fn from $START"; exit 1; }
+  HELPER+="$_def"$'\n'
+done
+
+# Non-vacuity guard: a block that calls an undefined function would otherwise
+# run to completion with only a stderr grumble. Assert the run environment can
+# actually resolve every 5dive-defined helper the block invokes.
+assert_no_missing_fn() { # <label> <block>
+  local label="$1" block="$2" missing=""
+  local fn
+  for fn in $(grep -oE '\b(assert_cred_seeded|cred_seed_breadcrumb_path|cred_seed_failed|cred_seed_ok|cred_src_readable|cred_seed_why)\b' <<<"$block" | sort -u); do
+    grep -qE "^${fn}\(\) \{" <<<"$HELPER" || missing+=" $fn"
+  done
+  if [[ -n "$missing" ]]; then
+    echo "FAIL: $label calls helper(s) the harness never defines:$missing"; fail=1
+  else
+    echo "ok: $label — every helper it calls is defined in the run environment"
+  fi
+}
 
 run_block() { # <block> <extra-env-assignments...>  -> stdout+stderr of the block
   local block="$1"; shift
@@ -59,6 +96,7 @@ run_block() { # <block> <extra-env-assignments...>  -> stdout+stderr of the bloc
 # ---------- antigravity ----------
 AGY_BLOCK="$(extract_block antigravity)"
 [[ -n "$AGY_BLOCK" ]] || { echo "FAIL: could not extract antigravity block"; exit 1; }
+assert_no_missing_fn "antigravity block" "$AGY_BLOCK"
 
 PROFILE="$TMP/profile-agy"
 AGY_SHARED="$PROFILE/.gemini/antigravity-cli/antigravity-oauth-token"
@@ -140,6 +178,7 @@ fi
 # ---------- openclaw ----------
 OC_BLOCK="$(extract_block openclaw)"
 [[ -n "$OC_BLOCK" ]] || { echo "FAIL: could not extract openclaw block"; exit 1; }
+assert_no_missing_fn "openclaw block" "$OC_BLOCK"
 
 PROFILE_OC="$TMP/profile-oc"
 OC_SHARED="$PROFILE_OC/.openclaw/agents/main/agent/auth-profiles.json"
