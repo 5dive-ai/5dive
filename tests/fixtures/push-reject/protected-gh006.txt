@@ -1,0 +1,6 @@
+remote: error: GH006: Protected branch update failed for refs/heads/main.        
+remote: 
+remote: - 6 of 6 required status checks are expected.        
+To https://github.com/5dive-ai/5dive
+ ! [remote rejected] HEAD -> main (protected branch hook declined)
+error: failed to push some refs to 'https://github.com/5dive-ai/5dive'
