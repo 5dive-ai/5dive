@@ -3000,6 +3000,12 @@ CAPABILITY_LOCK="${CAPABILITY_LOCK:-${STATE_DIR}/capabilities.lock}"
 # the only degradation that cannot create a NEW failure mode. Re-verification is
 # the root heartbeat's job; this is the backstop for when it has not run.
 CAPABILITY_TTL_SECONDS="${CAPABILITY_TTL_SECONDS:-604800}"  # 7d
+# Injectable so the unit suite can drive THE REAL FUNCTION. Iteration 2 shipped a
+# reverify arm that exercised a hand-written COPY of capability_reverify_from_sudoers
+# defined inside the test — so the shipped function had ZERO coverage, proven by
+# reintroducing a bug into it and watching the suite still pass 36/36 (olivia).
+# A copy under test is the wrong universe: it agrees with the mutant.
+CAPABILITY_SUDOERS_DIR="${CAPABILITY_SUDOERS_DIR:-/etc/sudoers.d}"
 
 # Its OWN lock, deliberately not REGISTRY_LOCK. The mint happens inside
 # write_standard_sudoers, and making a sudoers install depend on the agent
@@ -3193,11 +3199,17 @@ capability_declare_standard() {
 capability_reverify_from_sudoers() {
   local user="$1" can_push=0 f
   [[ -n "$user" ]] || return 2
-  # NOT one `local` line: the builtin expands every word BEFORE it assigns any,
-  # so `local user="$1" f=".../${user}"` reads $user while it is still unset and
-  # dies under `set -u`. Found by the unit arm, in this function, before it ran
-  # anywhere real.
-  f="/etc/sudoers.d/${user}"
+  # NOT one `local` line. `local a="$1" b="...${a}"` expands every word before it
+  # assigns any, so ${a} resolves to whatever `a` meant in the CALLER's scope
+  # under bash dynamic scoping — NOT to "$1".
+  #
+  # The failure is a SILENTLY WRONG VALUE, not a crash, and getting that wrong is
+  # what lets sibling instances survive review. The identical pattern is on
+  # origin/main in write_standard_sudoers today and provisioning works, because
+  # the caller happens to have `user` set to the same thing. Orphaned under
+  # `set -u` it dies unbound; under `set -eo` alone it silently builds a path
+  # from the wrong value. See [[multi-assign-local-takes-the-callers-value]].
+  f="${CAPABILITY_SUDOERS_DIR}/${user}"
   if [[ ! -r "$f" ]]; then
     # Absent OR unreadable. Both mean "cannot confirm from the artifact", and
     # forgetting degrades to absent = today's behaviour. Never the other way.

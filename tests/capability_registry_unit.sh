@@ -132,28 +132,48 @@ want "re-verify is called from the heartbeat tick" \
      'grep -q "_hb_capability_reverify_sweep" "$ROOT/src/cmd_heartbeat.sh" && [[ "$(grep -c "_hb_capability_reverify_sweep" "$ROOT/src/cmd_heartbeat.sh")" -ge 2 ]]'
 
 echo "-- re-verification MEASURES the artifact; it never just bumps verified_at"
+# Every arm below is a TRANSITION test with its own fixture: assert the state
+# BEFORE, act, assert the state AFTER. Iteration 2's arms shared state and ran in
+# order, so two of three mutations to the real function still passed — an arm that
+# asserts only a final condition can be satisfied by the state it inherited.
 sudoers_dir="$work/sudoers"; mkdir -p "$sudoers_dir"
-# Drive the real function against a fake sudoers root by shadowing the path.
-capability_reverify_from_sudoers() {
-  local user="$1" can_push=0 f
-  f="$sudoers_dir/${user}"
-  [[ -n "$user" ]] || return 2
-  if [[ ! -r "$f" ]]; then capability_forget_agent "$user"; return 0; fi
-  grep -q '5dive _push_do' "$f" && can_push=1
-  grep -q '5dive agent _deliver' "$f" || { capability_forget_agent "$user"; return 0; }
-  capability_declare_standard "$user" "$can_push" reverified
+export CAPABILITY_SUDOERS_DIR="$sudoers_dir"
+
+reset_rv() { # <user> — put the agent in a known CONFIRMED state, independent of prior arms
+  capability_forget_agent "$1"
+  capability_declare a2a_deliver   "$1" root provisioned
+  capability_declare delegated_push "$1" root provisioned
 }
-render_standard_sudoers rvuser 1 > "$sudoers_dir/rvuser"
-capability_reverify_from_sudoers rvuser
-want "reverify from a push policy confirms delegated_push" 'capability_confirmed_holder delegated_push rvuser'
-want "...and stamps source=reverified" '[[ "$(jq -r ".[]|select(.holder_agent==\"rvuser\" and .name==\"delegated_push\")|.source" "$CAPABILITY_DB")" == "reverified" ]]'
-render_standard_sudoers rvuser 0 > "$sudoers_dir/rvuser"
-capability_reverify_from_sudoers rvuser
-want "policy loses push -> row is DROPPED, not renewed" '! capability_confirmed_holder delegated_push rvuser'
-want "...while its other capabilities survive" 'capability_confirmed_holder a2a_deliver rvuser'
-rm -f "$sudoers_dir/rvuser"
-capability_reverify_from_sudoers rvuser
-want "policy file GONE -> every row forgotten" '! capability_confirmed_holder a2a_deliver rvuser'
+
+# A. policy grants push -> push CONFIRMED, and it is a real re-derivation
+reset_rv rvA; capability_forget_agent rvA
+render_standard_sudoers rvA 1 > "$sudoers_dir/rvA"
+want "A: no rows before"            '! capability_confirmed_holder delegated_push rvA'
+capability_reverify_from_sudoers rvA
+want "A: push confirmed after"      'capability_confirmed_holder delegated_push rvA'
+want "A: stamped source=reverified" '[[ "$(jq -r ".[]|select(.holder_agent==\"rvA\" and .name==\"delegated_push\")|.source" "$CAPABILITY_DB")" == "reverified" ]]'
+
+# B. policy LOSES push -> the row must be DROPPED, not left to expire
+reset_rv rvB
+render_standard_sudoers rvB 0 > "$sudoers_dir/rvB"
+want "B: push confirmed BEFORE"     'capability_confirmed_holder delegated_push rvB'
+capability_reverify_from_sudoers rvB
+want "B: push DROPPED after"        '! capability_confirmed_holder delegated_push rvB'
+want "B: other caps survive"        'capability_confirmed_holder a2a_deliver rvB'
+
+# C. policy file GONE -> every row forgotten (the -r branch)
+reset_rv rvC
+rm -f "$sudoers_dir/rvC"
+want "C: confirmed BEFORE"          'capability_confirmed_holder a2a_deliver rvC'
+capability_reverify_from_sudoers rvC
+want "C: ALL rows gone after"       '! capability_confirmed_holder a2a_deliver rvC && ! capability_confirmed_holder delegated_push rvC'
+
+# D. a policy that is NOT a standard policy -> decline, do not claim standard caps
+reset_rv rvD
+printf 'rvD ALL=(ALL) NOPASSWD: ALL\n' > "$sudoers_dir/rvD"
+want "D: confirmed BEFORE"          'capability_confirmed_holder a2a_deliver rvD'
+capability_reverify_from_sudoers rvD
+want "D: admin policy claims NOTHING" '! capability_confirmed_holder a2a_deliver rvD'
 
 echo
 if [[ "$fails" -eq 0 ]]; then
