@@ -69,6 +69,17 @@ open(p,"w").write(s.replace(o,n,1))'
 
 # --- Arm 0: the PRECONDITION. Prove the harness COLLECTS before grading any
 # "exactly one red" claim. Two independent defects at once must yield TWO names.
+#
+# WHAT THIS ARM CANNOT SEE, stated because a blind spot left in someone's head
+# is not recorded anywhere. Arm 0 counts reds; it does not know how many
+# assertions RAN. A harness truncated so that both defect assertions survive
+# still reports two reds and arm 0 passes, on a matrix silently missing
+# assertions. MEASURED, not reasoned: deleting one late assertion leaves arm 0
+# green (+1 precondition) while armB refuses on the pinned count. armB is what
+# covers this, which is why arm 0 alone is never sufficient to start grading.
+# (dev hit the same blindness in their DIVE-1932 grader from the other side:
+# theirs asserts two specific NAMES, so it fails the name check on a short
+# harness and the count never matters — the same hole, differently shaped.)
 fresh
 mutate src/cmd_digest.sh '      --30d)   window=2592000 ;;
 ' '' || { echo "FAIL - arm0 mutation A did not apply"; exit 1; }
@@ -77,7 +88,7 @@ mutate src/cmd_digest.sh 'window_label = _WINDOW_LABELS.get(window) or f"{max(1,
   || { echo "FAIL - arm0 mutation B did not apply"; exit 1; }
 reds="$(run_reds)"; n_reds="$(grep -c . <<<"$reds")"
 [[ "$n_reds" -ge 2 ]] \
-  && ok_p "arm0: the harness COLLECTS — two independent defects yield $n_reds named reds, not one" \
+  && ok_p "arm0: the harness COLLECTS — two independent defects yield $n_reds named reds, not one (blind to truncation; armB covers that)" \
   || {
     bad_t "harness is fail-fast" "two defects produced $n_reds red(s): $reds — a single-red claim is unsupportable on this instrument"
     # REFUSE to grade the rest. On a fail-fast harness every arm below asserts a
