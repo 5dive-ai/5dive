@@ -1,0 +1,33 @@
+# DIVE-2250 — GENERATED FILES MUST NEVER BE MERGED. REGENERATE THEM.
+#
+# `-merge` unsets the merge attribute, which makes git refuse a content merge and
+# leave the path UNMERGED (index stages 1/2/3, `UU` in status) instead of running a
+# three-way TEXT merge over it.
+#
+# WHY: `5dive` is a ~49,500-line file produced by ./build.sh from src/*.sh. To git it
+# was an ordinary text file — `git check-attr merge -- 5dive` reported `unspecified` —
+# so any merge where both sides had rebuilt it ran a line-level merge and REPORTED
+# SUCCESS, producing a bundle that no src/ tree ever generated. Measured live on
+# 2026-07-27: merging main into a branch raised exactly ONE conflict, 5dive.sha256,
+# while the bundle itself stitched silently. install.sh fetches the bundle directly,
+# so that artifact is customer-facing.
+#
+# The only thing that was catching this is an ACCIDENT, not a guard: 5dive.sha256 is a
+# single 64-hex line, so two rebuilt branches always collide on that one line. Give
+# that file a header and the collision stops and a stitched bundle ships with no local
+# signal at all until bundle-drift runs, which is after push.
+#
+# ── READ THIS AT CONFLICT TIME ────────────────────────────────────────────────
+# When one of these paths conflicts, THE WORKTREE FILE WILL LOOK COMPLETELY NORMAL.
+# There are NO conflict markers in it — `-merge` leaves OUR version verbatim.
+# Measured: index UU, worktree == ours, 0 occurrences of <<<<<<< or >>>>>>>.
+# So `git add` is the natural next move and it silently commits a STALE bundle.
+#
+#   DO NOT edit these files. DO NOT `git add` them as-is.
+#   REGENERATE:  ./build.sh   then  git add 5dive 5dive.sha256
+#
+# "Resolve the conflict" is the wrong instruction here and this comment deliberately
+# does not use those words: there is nothing in the file to resolve.
+# ──────────────────────────────────────────────────────────────────────────────
+5dive              -merge
+src/cmd_council.sh -merge
