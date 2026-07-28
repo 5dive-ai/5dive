@@ -30,9 +30,10 @@ same shape rule the strict matcher uses (a TUI draws punctuation and box glyphs,
 never words), so a gutter glyph beside the closing marker does not read as an answer.
 An unclosed fence still returns nothing, so the rail keeps polling.
 
-Graded on three verbatim `capture-pane` dumps from the live seat: 6 of 11 assertions
-are red on the shipped extractor and green after, while the anti-echo/negative ones
-hold on BOTH trees — those are the guarantees the change must not buy its fix with.
+Graded on three verbatim `capture-pane` dumps from the live seat: 8 of 11 assertions
+are red on the shipped extractor and green after, while the 4 that stay green on both
+trees are the strict-path and anti-echo ones — the guarantees the change must not buy
+its fix with.
 5 of 5 mutants killed on the committed tree. Verified end to end against that same
 seat, back to back:
 
