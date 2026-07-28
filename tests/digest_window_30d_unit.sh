@@ -187,7 +187,12 @@ printf '\n%s passed, %s failed\n' "$PASS" "$FAIL"
 # The house verdict idiom (digest_mttu / digest_autonomy / proof_scorecard all use
 # it verbatim): the LAST executable line IS the verdict, so the script's exit
 # status is this comparison. tests/meta/harness-verdict-probe.sh identifies the
-# verdict variable from this line and mutates it; an explicit-exit form
-# (`[[ … ]] || exit 1`) is a shape it can fail to classify, which reports
-# UNPROBEABLE and fails harness-verdict-union.sh closed. Do not "simplify" this.
+# verdict variable from this line and mutates it to prove the verdict is wired.
+#
+# CONSISTENCY, NOT NECESSITY - measured, because the first version of this comment
+# guessed. This harness previously ended `[[ "$FAIL" == "0" ]] || exit 1`, and the
+# probe classifies BOTH forms as `wired` (`--only=digest_window_30d_unit.sh`:
+# 1 wired, 0 UNPROBEABLE, either way). The explicit-exit form was NOT unprobeable
+# and no CI red was averted by changing it. It matches the neighbours now, which is
+# worth something on its own, but do not repeat the claim that it had to.
 [[ "$FAIL" -eq 0 ]]
