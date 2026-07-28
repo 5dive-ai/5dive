@@ -649,9 +649,24 @@ valid_byo_provider() {
 # ANTHROPIC_AUTH_TOKEN and the per-tier model ids (the modern Claude Code knobs
 # ANTHROPIC_DEFAULT_{OPUS,SONNET,HAIKU}_MODEL — so whichever tier the agent
 # selects, and the background haiku tasks, map to a model the provider actually
-# serves instead of 404-ing on "claude-…"). Only providers with a documented
-# anthropic-compat endpoint are listed; the rest of BYO_PROVIDER_LABEL is
-# intentionally absent here (no compat path → would break the harness). Model
+# serves instead of 404-ing on "claude-…"). Listed endpoints are VERIFIED, not
+# necessarily vendor-DOCUMENTED — and the distinction is load-bearing, so do not
+# "tidy" it back. Verified means: the route answers (401 for absent/invalid
+# credentials, NOT 404 — a nonsense sibling path on the same host does return a
+# real url.not_found body, which is what makes the 401 mean something) and a
+# discriminating auth layer runs behind it (absent vs invalid credentials give
+# different messages AND different error types).
+#   moonshot is REAL BUT UNDOCUMENTED, measured 2026-07-28 (DIVE-2246). Moonshot's
+# own docs describe an OpenAI-compatible API only — no `anthropic`, no `messages`,
+# no ANTHROPIC_BASE_URL anywhere — yet api.moonshot.ai/anthropic answers exactly as
+# above. A MISSING DOC PAGE IS NOT A MISSING ENDPOINT.
+#   This comment previously said "only providers with a DOCUMENTED anthropic-compat
+# endpoint are listed", which the table below it violated. That is worse than no
+# comment: an auditor applying the stated rule finds moonshot backed by no vendor
+# doc and DELETES A WORKING PROVIDER. If you add an entry here, verify the route
+# yourself and say so — do not go looking for a doc page to justify it.
+# The rest of BYO_PROVIDER_LABEL is intentionally absent (no compat path at all →
+# would break the harness). Model
 # ids drift upstream — operators can override per agent via the model picker, or
 # we bump these. Values verified against vendor Claude-Code docs 2026-06-03.
 # OpenRouter (DIVE-1100): OpenRouter ships a NATIVE Anthropic-skin endpoint at
