@@ -223,5 +223,41 @@ cmd_task_need DIVE-811 --type=approval --from=dev \
   --ask="which of these two wordings should we use?" --recommend="A" >/dev/null 2>&1
 assert_lead_routed DIVE-811 "answer A applies to an APPROVAL gate too (filing floor and routing arm agree)"
 
+# =============================================================================
+# (13) IN-SUITE MUTATION GRADE of the fallback. olivia's point at the merge gate:
+#      strong instrument assertions are not a mutation grade. A mutant run once by
+#      hand is a CLAIM; a mutant in the suite is an ARTIFACT that reds when someone
+#      removes the fallback later. Regress _gate_ask_substantive to always-true and
+#      require the lazy-filing case to STOP reaching the human. If the outcome does
+#      NOT change, the fallback is decorative however well instrumented it is.
+# =============================================================================
+# It must be DIFFERENTIAL. Asserting only the mutant's outcome ("tier != 2 under the
+# mutant") passes vacuously when the fallback has ALREADY been removed from source --
+# measured: with the fallback deleted this arm still read ok. So run the SAME filing
+# twice, real and mutant, and require the two to DIFFER. That is the anchor-assert-
+# the-baseline-differs rule applied to a mutation arm.
+route_reset; seed DIVE-812 'delete all customer data'
+cmd_task_need DIVE-812 --type=decision --from=dev \
+  --ask="approve this" --options="A|B" --recommend="A" >/dev/null 2>&1
+_REAL_TIER=$(tierof DIVE-812)
+_SUBSTANTIVE_REAL=$(declare -f _gate_ask_substantive)
+_gate_ask_substantive() { return 0; }   # MUTANT: every ask counts as substantive
+route_reset; seed DIVE-814 'delete all customer data'
+cmd_task_need DIVE-814 --type=decision --from=dev \
+  --ask="approve this" --options="A|B" --recommend="A" >/dev/null 2>&1
+_MUTANT_TIER=$(tierof DIVE-814)
+eval "$_SUBSTANTIVE_REAL"               # restore BEFORE asserting, so a failed
+                                        # assertion can never leave the mutant live
+{ [[ "$_REAL_TIER" == "2" && "$_MUTANT_TIER" != "2" ]]; } \
+  && ok_t "MUTATION: real='2' vs mutant='$_MUTANT_TIER' — regressing _gate_ask_substantive CHANGES the outcome, so the fallback is load-bearing" \
+  || bad_t "MUTATION: fallback is decorative" "real tier='$_REAL_TIER' mutant tier='$_MUTANT_TIER' — the mutation changed nothing, so this arm proves nothing"
+
+# (14) …and prove the RESTORE took, or every assertion after (13) would be grading
+#      the mutant and this suite would report on code that is not shipped.
+route_reset; seed DIVE-813 'delete all customer data'
+cmd_task_need DIVE-813 --type=decision --from=dev \
+  --ask="approve this" --options="A|B" --recommend="A" >/dev/null 2>&1
+assert_human DIVE-813 "MUTATION: the real predicate is RESTORED (the mutant did not leak into the suite)"
+
 printf '\nDIVE-2224 gate seam: %d passed, %d failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]
