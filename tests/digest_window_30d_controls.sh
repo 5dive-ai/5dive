@@ -167,6 +167,54 @@ mutate src/cmd_proof.sh "policy_refusals WHERE ts>=datetime('now',\$(sqlq \"\$sq
   || { echo "FAIL - C3 mutation did not apply"; exit 1; }
 expect_only "C3 leave ONE scorecard SQL site at 7 days (MIXED-WINDOW)" "a hard-coded span survives in the scorecard"
 
+# --- Arm S: SELF-TEST of this runner's own count branch.
+#
+# dev's audit of their grader, applied here: expect_only()'s "N of N assertions
+# evaluated" branch is reachable and nothing else demonstrates it REDS when it
+# should. Arm 0 grades a two-defect run and armB grades the pristine run, so
+# neither can fire it — it trips only when an INDIVIDUAL mutation's run comes up
+# short. Until this arm existed that control lived in a transcript, which is the
+# defect this file exists to fix, one level up: the grader was committed and the
+# grader's own control was prose.
+#
+# Keyed to C3's defect ONLY, deliberately: arm 0 uses the two DIGEST defects and
+# armB runs pristine, so both still see whole matrices and pass, isolating the
+# count branch as the one thing that can catch this. A control caught by a
+# different arm proves nothing about the arm it was written for.
+#
+# The staged harness is doctored to exit early ONLY when C3's defect is present.
+# Anchor and injection travel through the ENVIRONMENT rather than being quoted
+# into the python, because nesting bash and python quoting is how the first two
+# attempts at this arm silently produced dead code and a syntax error.
+_armS_truncate() {
+  SELF_ANCHOR="grep -q 'digest --json \"--\\\$window\"' <<<\"\$SCORE_FN\"" \
+  SELF_INJ="[[ \"\$HARDCODED\" == \"1\" ]] || { printf '\\n%s passed, %s failed\\n' \"\$PASS\" \"\$FAIL\"; exit 1; }" \
+  SELF_F="$TMP/w/tests/digest_window_30d_unit.sh" python3 <<'SELFPY'
+import os, sys
+p = os.environ["SELF_F"]
+s = open(p).read()
+a = os.environ["SELF_ANCHOR"]
+if a not in s:
+    sys.exit(1)
+open(p, "w").write(s.replace(a, os.environ["SELF_INJ"] + "\n" + a, 1))
+SELFPY
+}
+fresh
+if ! _armS_truncate; then
+  bad_t "armS: could not stage the self-test truncation" "the anchor in digest_window_30d_unit.sh moved — this arm no longer tests what it claims, and a silent skip would leave the count branch uncontrolled"
+elif ! mutate src/cmd_proof.sh "policy_refusals WHERE ts>=datetime('now',\$(sqlq \"\$sql_window\"))" \
+                               "policy_refusals WHERE ts>=datetime('now','-7 days')"; then
+  bad_t "armS: the C3 mutation did not apply" "cannot self-test the count branch without it"
+else
+  # expect_only runs in a SUBSHELL so its bad_t cannot touch the real counters.
+  _out="$( expect_only "armS probe" "a hard-coded span survives in the scorecard" 2>&1 )"
+  if grep -q "correct red name, but the harness evaluated" <<<"$_out"; then
+    ok_t "armS: the count branch REDS on a short matrix even when the red NAME is correct ($(sed -n 's/.*evaluated \([0-9]* of [0-9]*\).*/\1/p' <<<"$_out"))"
+  else
+    bad_t "armS: the count branch did NOT fire on a deliberately short matrix" "expect_only printed: $(tr '\n' '|' <<<"$_out")"
+  fi
+fi
+
 printf '\n%s assertions passed, %s failed  (+%s precondition, which grades the INSTRUMENT, not the code)\n' \
   "$PASS" "$FAIL" "$PRECOND"
 [[ "$FAIL" -eq 0 ]]
