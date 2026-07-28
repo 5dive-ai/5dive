@@ -14,6 +14,28 @@
 #   5dive digest            # human/Telegram-ready text for the last 24h
 #   5dive digest --json     # structured { window, done, inProgress, blocked, usage, health }
 #   5dive digest --7d       # widen the window to 7 days
+#   5dive digest --30d      # widen the window to 30 days (DIVE-1921)
+#
+# DIVE-1921 — WHAT THE WINDOW ACTUALLY SCOPES. Widening is not uniform across
+# this payload, and a reader who assumes it is will misread half the digest.
+# Three kinds of aggregate live here:
+#   SUMS over the window   — done, autoCleared, zeroHuman.*, autonomy.shipped/
+#                            asked, precedentPrefill.count/accepted,
+#                            stuck.episodes. These scale with the window.
+#   RATES/MEANS over it    — precedentPrefill.acceptanceRate, stuck.mttuSec and
+#                            stuck.byCause[].mttuSec. The denominator grows, so
+#                            a wider window is the FIX for the thin-n readings
+#                            DIVE-1914 hit (mttuSec off one episode, precedent
+#                            acceptance off n=2).
+#   POINT READINGS         — inProgress, blocked, usage, usageCoverage, health,
+#                            loops, stuck.openStuck, autonomy.uptimeDays and the
+#                            objectives' current/gap/inflight. These are "as of
+#                            now" and are IDENTICAL at 24h, 7d and 30d.
+# The last group is the hazard: `usage` is usage_collect's own 5h/7d rolling
+# read and `loops` is every loop ever (--all), so under a "last 30 days" header
+# they read as 30 days of tokens when they are nothing of the kind. They are
+# therefore named in the JSON `pointInTime` map and captioned in the text, so
+# the window label can never be applied to a number it does not describe.
 
 # Per-box digest preference, in the shared state dir so it SURVIVES CLI updates
 # (install.sh seeds it OFF and never clobbers it). One digest per fleet → one
@@ -119,10 +141,11 @@ cmd_digest() {
   while [ $# -gt 0 ]; do
     case "$1" in
       --7d)    window=604800 ;;
+      --30d)   window=2592000 ;;
       --24h|--day) window=86400 ;;
       --send)  do_send=1 ;;
       -h|--help)
-        echo "usage: 5dive digest [--json] [--7d] [--send]"
+        echo "usage: 5dive digest [--json] [--7d|--30d] [--send]"
         echo "       5dive digest on [--at=<0-23>] | off | status   # per-box auto-delivery (default OFF)"
         echo "       5dive digest tick                              # cron driver (hourly; gated on the pref)"
         echo "  --send  deliver the digest to the paired Telegram chat (text only)"
@@ -434,7 +457,30 @@ def _hdur(sec):
     if h < 48: return f"{h:.1f}h"
     return f"{h/24:.1f}d"
 
-window_label = "7 days" if window >= 604800 else "24h"
+# DIVE-1921: this was a `>=` ladder — `"7 days" if window >= 604800 else "24h"`
+# — so ANY window wider than a week rendered under a "last 7 days" header. The
+# headline of the digest would have asserted a span it did not measure, and the
+# scorecard downstream reads this label. Derive it from the window instead, with
+# a computed fallback so a future width can never silently borrow another's name.
+_WINDOW_LABELS = {86400: "24h", 604800: "7 days", 2592000: "30 days"}
+window_label = _WINDOW_LABELS.get(window) or f"{max(1, round(window / 86400))} days"
+
+# DIVE-1921: the window scopes the sums and the rates; it does NOT scope the
+# point readings (see the header block). Naming them in the payload is what
+# stops a consumer applying `window.label` to a number it does not describe —
+# `usage` is usage_collect's own 5h/7d rolling read, `loops` is every loop ever.
+point_in_time = {
+    "inProgress":    "current status, not a window count",
+    "blocked":       "current status, not a window count",
+    "usage":         "usage_collect's own rolling 5h/7d limits — never this window",
+    "usageCoverage": "describes the usage read above, same rolling scope",
+    "health":        "freshness and rate-limit pressure as of now",
+    "loops":         "every loop the fleet has run (--all), not a window slice",
+    "stuck.openStuck":       "agents wedged right now",
+    "autonomy.uptimeDays":   "all-time streak since the last human-blocking gate",
+    "objectives[].current":  "latest reading; only .trend/.baseline use the window",
+    "objectives[].inflight": "open linked tasks as of now",
+}
 
 # OSS-14: one-glance autonomy rollup — "ran N days, shipped X, asked you Y",
 # with trend vs the prior window. Deterministic, from data already loaded; the
@@ -447,6 +493,14 @@ def _window_counts(lo, hi):
               and lo <= (to_epoch(t.get("need_answered_at")) or -1) < hi)
     return ship, ask
 prev_ship, prev_ask = _window_counts(since - window, since)
+# DIVE-1921: the trend compares this window against the one before it, so a 30d
+# reading reaches 60 days back. If the store does not go that far, the prior
+# counts are a PARTIAL span reported as a whole one and the arrow overstates the
+# improvement — the wider the window, the more likely that is. Say so rather
+# than render a flattering delta: the earliest row we hold has to predate the
+# prior window's start for the comparison to be like-for-like.
+_first_seen = [x for x in (to_epoch(t.get("created_at")) for t in work if t.get("created_at")) if x]
+prior_complete = bool(_first_seen) and min(_first_seen) <= (since - window)
 # uptime = days since the last human-blocking stall. An open gate right now means
 # not-autonomous this instant (0); else days since the most recent gate was filed;
 # else (never needed a human) the streak runs since the company's first task.
@@ -461,7 +515,8 @@ else:
         uptime_days = max(0, (now - min(_born)) // 86400) if _born else 0
 autonomy = {"uptimeDays": uptime_days, "currentlyBlocked": bool(blocked),
             "shipped": len(done_l), "asked": len(ht_l),
-            "priorShipped": prev_ship, "priorAsked": prev_ask, "windowLabel": window_label}
+            "priorShipped": prev_ship, "priorAsked": prev_ask, "windowLabel": window_label,
+            "priorWindowComplete": prior_complete}
 
 # OSS-19 (OSS-26) objectives: current vs target with a window trend, riding the
 # same window-delta idea as _window_counts. current/baseline come straight from
@@ -500,7 +555,9 @@ for o in obj_rows:
 
 if as_json:
     print(json.dumps({
-        "window": {"since": since, "now": now, "label": window_label},
+        "window": {"since": since, "now": now, "label": window_label,
+                   "seconds": window, "days": round(window / 86400, 2)},
+        "pointInTime": point_in_time,
         "objectives": objectives,
         "done": done_l, "inProgress": ip_l, "blocked": blk_l, "autoCleared": auto_l,
         "zeroHuman": {"shipped": len(done_l), "humanTouches": len(ht_l), "gates": ht_l},
@@ -531,7 +588,10 @@ else:
     def _trend(cur, prev):
         d = cur - prev
         arrow = "↑" if d > 0 else ("↓" if d < 0 else "→")
-        return f" ({arrow}{abs(d)} vs {prev} prior {window_label})"
+        # DIVE-1921: a prior window the store does not fully cover is a partial
+        # span; saying so costs one word and stops the arrow reading as growth.
+        partial = "" if prior_complete else ", a span the store does not fully cover"
+        return f" ({arrow}{abs(d)} vs {prev} prior {window_label}{partial})"
     _up = ("currently waiting on you" if autonomy["currentlyBlocked"]
            else f"ran {autonomy['uptimeDays']}d without needing you")
     out.append(f"\U0001F9BE Autonomy — {_up} · shipped {len(done_l)}{_trend(len(done_l), prev_ship)}"
@@ -593,7 +653,9 @@ else:
     if loops_burn:
         out.append("")
         cap_note = f", {len(loops_capped)} hit ceiling" if loops_capped else ""
-        out.append(f"\U0001F504 Loop burn ({_htok(loops_total)} tok{cap_note})")
+        # DIVE-1921: `usage loops --all` is every loop the fleet has run, so this
+        # total is NOT a slice of the window it is printed under. Say which.
+        out.append(f"\U0001F504 Loop burn ({_htok(loops_total)} tok{cap_note}, all loops — not the {window_label})")
         for l in loops_burn[:6]:
             ceil = _htok(l["ceiling"]) if l["ceiling"] is not None else "∞"
             flag = " ⛔ ceiling" if l["atCeiling"] else ""
@@ -641,6 +703,13 @@ else:
         else:
             out.append("\U0001F49B Heartbeats fresh; rate-limit pressure UNVERIFIED — "
                        "the burn read above was short of the fleet")
+    # DIVE-1921: the header says "last {window_label}" and most of the body honours
+    # it — but token burn, loop burn and the in-progress/blocked/still-stuck counts
+    # are as-of-now readings that do not move with the window. Under a 30d header
+    # that gap is wide enough to be read as a claim, so it gets stated once.
+    out.append(f"\U0001F4CF Window — sums and rates above cover the last {window_label}; "
+               "token burn (5h/7d rolling), loop burn, in-progress/needs-you and "
+               "still-stuck are as-of-now readings, unchanged by the window.")
     print("\n".join(out))
 PY
 

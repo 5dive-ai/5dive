@@ -1112,15 +1112,32 @@ _proof_scorecard() {
   while [ $# -gt 0 ]; do
     case "$1" in
       --7d)   window="7d" ;;
+      # DIVE-1921 shipped digest --30d, so the window this verb was specified
+      # with (DIVE-1914: [--7d|--30d]) is finally computable and the refusal
+      # that stood here is gone. 30d is the FIX for the thin-n rows below —
+      # median recovery time off one episode, precedent acceptance off n=2.
+      --30d)  window="30d" ;;
       --by=*) by="${1#*=}" ;;
-      # DIVE-1921: digest has no --30d (it errors "unknown arg"), so offering
-      # one here would be a window this verb cannot actually compute.
-      --30d)  fail "$E_USAGE" "proof scorecard: --30d not available — \`digest\` supports only --7d (tracked as DIVE-1921)" ;;
       *) fail "$E_USAGE" "proof scorecard: unknown arg: $1" ;;
     esac
     shift
   done
   case "$by" in tier|class) ;; *) fail "$E_USAGE" "proof scorecard: --by must be tier|class" ;; esac
+
+  # DIVE-1921: the window must move as ONE unit. Every number below comes from
+  # one of three readers — the digest sub-call, the tasks/ship/policy SQL, and
+  # the token collector — and they are combined into single ratios (asks over
+  # shipped, first-pass over graded, tokens over shipped). A site left behind at
+  # 7 days therefore does not render as a wrong window; it renders as a
+  # PLAUSIBLE RATE with a numerator and denominator measured over different
+  # spans, which is invisible in the output. That is why nothing past this point
+  # is allowed to spell a span out by hand: it all derives from here.
+  local sql_window usage_secs
+  case "$window" in
+    7d)  sql_window="-7 days"  ; usage_secs=604800 ;;
+    30d) sql_window="-30 days" ; usage_secs=2592000 ;;
+    *)   fail "$E_USAGE" "proof scorecard: unsupported window: $window" ;;
+  esac
 
   local self db work
   # DIVE-2080, the hole DIVE-2061 closed one call up. selfcheck's probe 7 carefully
@@ -1134,7 +1151,7 @@ _proof_scorecard() {
   # MAX_ARG_STRLEN, so these go through FILES, never the environment. Passing
   # them as env vars fails with a bare "Argument list too long" and no metric.
   work="$(mktemp -d)"
-  "$self" digest --json --7d 2>/dev/null > "$work/digest.json"
+  "$self" digest --json "--$window" 2>/dev/null > "$work/digest.json"
   [ -s "$work/digest.json" ] || fail "$E_GENERIC" "proof scorecard: digest produced no output"
 
   # Tokens: usage_collect scans agent transcripts. Guarded — this lib is also
@@ -1142,7 +1159,7 @@ _proof_scorecard() {
   # degrade to an honest no-data row, never to a zero.
   : > "$work/usage.json"
   if declare -F usage_collect >/dev/null 2>&1; then
-    usage_collect 604800 2>/dev/null > "$work/usage.json" || : > "$work/usage.json"
+    usage_collect "$usage_secs" 2>/dev/null > "$work/usage.json" || : > "$work/usage.json"
   fi
 
   # DIVE-1914 iteration 2 (olivia): --by used to be VALIDATED as legal and then
@@ -1165,10 +1182,10 @@ _proof_scorecard() {
 
   local rows
   rows="$(db "SELECT
-      (SELECT COUNT(*) FROM tasks WHERE status='done' AND kind='standard' AND done_at>=datetime('now','-7 days')) || '|' ||
-      (SELECT COUNT(*) FROM tasks WHERE status='done' AND kind='standard' AND done_at>=datetime('now','-7 days') AND verifier IS NOT NULL AND verifier<>'') || '|' ||
-      (SELECT COUNT(*) FROM tasks WHERE status='done' AND kind='standard' AND done_at>=datetime('now','-7 days') AND verifier IS NOT NULL AND verifier<>'' AND COALESCE(iteration,1)<=1) || '|' ||
-      (SELECT COUNT(*) FROM tasks WHERE status='done' AND kind='standard' AND done_at>=datetime('now','-7 days') AND ${known_expr});" 2>/dev/null || true)"
+      (SELECT COUNT(*) FROM tasks WHERE status='done' AND kind='standard' AND done_at>=datetime('now',$(sqlq "$sql_window"))) || '|' ||
+      (SELECT COUNT(*) FROM tasks WHERE status='done' AND kind='standard' AND done_at>=datetime('now',$(sqlq "$sql_window")) AND verifier IS NOT NULL AND verifier<>'') || '|' ||
+      (SELECT COUNT(*) FROM tasks WHERE status='done' AND kind='standard' AND done_at>=datetime('now',$(sqlq "$sql_window")) AND verifier IS NOT NULL AND verifier<>'' AND COALESCE(iteration,1)<=1) || '|' ||
+      (SELECT COUNT(*) FROM tasks WHERE status='done' AND kind='standard' AND done_at>=datetime('now',$(sqlq "$sql_window")) AND ${known_expr});" 2>/dev/null || true)"
 
   # DIVE-1922: the policy-refusal source now EXISTS, so this metric stops being
   # NO DATA. Two numbers are needed, not one. The count alone would read as
@@ -1179,7 +1196,7 @@ _proof_scorecard() {
   # hand-maintained, because a hand-kept constant drifts and then lies.
   local refusals="" refusal_sites=""
   if [ "$(db "SELECT 1 FROM sqlite_master WHERE type='table' AND name='policy_refusals' LIMIT 1;" 2>/dev/null)" = "1" ]; then
-    refusals="$(db "SELECT COUNT(*) FROM policy_refusals WHERE ts>=datetime('now','-7 days');" 2>/dev/null || true)"
+    refusals="$(db "SELECT COUNT(*) FROM policy_refusals WHERE ts>=datetime('now',$(sqlq "$sql_window"));" 2>/dev/null || true)"
     # `|| true` is LOAD-BEARING, not defensive noise. Under `set -euo pipefail` a
     # grep that matches nothing exits 1, pipefail propagates it, and set -e kills
     # the whole verb — printing NOTHING and exiting 1. That happens on any box
@@ -1200,7 +1217,7 @@ _proof_scorecard() {
 
   local group_rows
   group_rows="$(db "SELECT ${group_expr}, COUNT(*) FROM tasks
-                    WHERE status='done' AND kind='standard' AND done_at>=datetime('now','-7 days')
+                    WHERE status='done' AND kind='standard' AND done_at>=datetime('now',$(sqlq "$sql_window"))
                     GROUP BY 1 ORDER BY 2 DESC, 1;" 2>/dev/null || true)"
 
   # DIVE-1923: the ship ledger now sources "autonomous rollback rate". Four
@@ -1210,9 +1227,9 @@ _proof_scorecard() {
   # the ledger's start date are part of the metric, not metadata about it.
   local ships="" rollbacks="" rollbacks_unproven="" ledger_since=""
   if [ "$(db "SELECT 1 FROM sqlite_master WHERE type='table' AND name='ship_events' LIMIT 1;" 2>/dev/null)" = "1" ]; then
-    ships="$(db "SELECT COUNT(*) FROM ship_events WHERE kind='ship' AND ts>=datetime('now','-7 days');" 2>/dev/null || true)"
-    rollbacks="$(db "SELECT COUNT(*) FROM ship_events WHERE kind='rollback' AND self=1 AND ts>=datetime('now','-7 days');" 2>/dev/null || true)"
-    rollbacks_unproven="$(db "SELECT COUNT(*) FROM ship_events WHERE kind='rollback' AND self=0 AND ts>=datetime('now','-7 days');" 2>/dev/null || true)"
+    ships="$(db "SELECT COUNT(*) FROM ship_events WHERE kind='ship' AND ts>=datetime('now',$(sqlq "$sql_window"));" 2>/dev/null || true)"
+    rollbacks="$(db "SELECT COUNT(*) FROM ship_events WHERE kind='rollback' AND self=1 AND ts>=datetime('now',$(sqlq "$sql_window"));" 2>/dev/null || true)"
+    rollbacks_unproven="$(db "SELECT COUNT(*) FROM ship_events WHERE kind='rollback' AND self=0 AND ts>=datetime('now',$(sqlq "$sql_window"));" 2>/dev/null || true)"
     ledger_since="$(db "SELECT COALESCE(MIN(ts),'') FROM ship_events;" 2>/dev/null || true)"
   fi
 
@@ -1468,7 +1485,7 @@ cmd_proof() {
     -h|--help|"")
       cat <<'HELP'
 usage: 5dive proof status [--json]                    # LOCAL autonomy badge + config (no network)
-       5dive proof scorecard [--json] [--7d] [--by=tier|class]   # LOCAL multi-dim metrics by risk tier
+       5dive proof scorecard [--json] [--7d|--30d] [--by=tier|class]   # LOCAL multi-dim metrics by risk tier
        5dive proof on --repo=<url> [--branch=status] [--at=<0-23>] [--user=<u>]
                       [--as-name=<n> --as-email=<e>]   # identity commits are authored with
        5dive proof off
