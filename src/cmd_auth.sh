@@ -1258,6 +1258,10 @@ cmd_auth_login() {
          '{type:$t, var:$v, profile:$p}' \
          --arg t "claude" --arg v "CLAUDE_CODE_OAUTH_TOKEN" --arg p "${profile:-}"
       return ;;
+    devin)
+      # devin signs in via its own browser/device flow and persists
+      # ~/.local/share/devin/credentials.toml (the TYPE_AUTH sentinel).
+      exec sudo -u claude -i env $extra_env "$bin" auth login ;;
     hermes)
       # hermes signs in to OpenAI via its own device-code flow. Run it
       # interactively so the user can see the URL/code and Ctrl+C cleanly.

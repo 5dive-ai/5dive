@@ -405,6 +405,14 @@ _mirror_follow_migration() {
 # "›" so codex is detected like every other TUI. Collision-free (only codex draws
 # "›"; claude "❯"; antigravity its footer), so it stays type-agnostic. Keep this
 # set in lockstep with _hb_idle_marker (cmd_heartbeat.sh) — they must not drift.
+# devin does NOT get a glyph. Its composer is ❭ (U+276D), two codepoints from
+# claude's ❯ (U+276F) and near-identical in most fonts — but worse, devin uses
+# the SAME glyph for menu selections, so its workspace-trust dialog reads
+# '❭ 1 Yes, trust <path>'. A glyph match there would report a credential/menu
+# prompt as a chat composer and type into it — the gh#214 failure from the
+# other end. Its composer placeholders are matched instead: 'Ask Devin' when
+# idle, 'Guide Devin' mid-turn. Both are prose, so no codepoint collision is
+# possible and a menu row cannot match. Fixtures: heartbeat_idle_marker_unit.
 # The marker set lives in one PURE predicate (_agent_pane_input_ready) so it can
 # be unit-tested against real pane samples with NO tmux — and a future TUI's
 # marker is added in exactly one place. The readiness set is a SUPERSET of the
@@ -412,7 +420,7 @@ _mirror_follow_migration() {
 # readiness — not idle — probe accepts); heartbeat_idle_marker_unit.sh asserts
 # every idle marker is also a readiness marker, so the two can never drift again.
 _agent_pane_input_ready() {
-  grep -qE '❯|›|\? for shortcuts|esc to cancel' <<<"${1:-}"
+  grep -qE '❯|›|Ask Devin|Guide Devin|\? for shortcuts|esc to cancel' <<<"${1:-}"
 }
 wait_agent_input_ready() {
   local name="$1" timeout="${2:-45}"
