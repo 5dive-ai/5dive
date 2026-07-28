@@ -3726,6 +3726,143 @@ _gate_standing_lead() {
   printf '%s' "$name"
 }
 
+# DIVE-2233 — the SECOND authority that was still derived from the org chart, and the
+# one DIVE-2099 explicitly left alone ("the org chart is still read for ROUTING,
+# unchanged"). Routing turned out not to be only routing:
+#
+#   _gate_route_reviewer(filer)  reads agents_org.reports_to           (agent-writable)
+#     -> UPDATE tasks SET routed_reviewer=<that name>                  (persisted at FILE time)
+#       -> cmd_task_answer: nt in approval|manual|access AND actor == routed_reviewer
+#          -> _lead_clear=1 -> that agent CLEARS A HUMAN-ONLY GATE
+#
+# So `sudo 5dive org set <victim> --manager=<me>` is a one-command self-grant: re-parent
+# a builder, wait for (or provoke) their next ship gate, and clear it as their lead. The
+# `require_root` on `org set` (DIVE-2124) does not help on a NOPASSWD:ALL host, and the
+# `by_claimed` record of who wrote the row is caller-supplied and explicitly non-evidence.
+#
+# THE SPLIT THAT FIXES IT: routing and authorization are two different questions and only
+# one of them has to be trustworthy.
+#   - WHO IS PINGED stays chart-derived. That is a notification: routing a gate to the
+#     wrong agent wastes their attention, it does not clear anything. Left unchanged so
+#     re-parenting an org keeps working the way an org expects.
+#   - WHO MAY CLEAR comes from these sealed bytes and nowhere else. An agent that writes
+#     itself into somebody's `reports_to` still gets the ping and still cannot clear; the
+#     gate falls through to the human exactly as if no lead had been named.
+# Deriving BOTH from the chart is what made the write an authority grant. Deriving only
+# the ping from it makes the same write inert.
+#
+# The seal is what carries the property, same as DIVE-2099: an agent CAN sudo a new name
+# into constitution.yaml, and the moment it does the live sha256 stops matching the digest
+# sealed in the council lineage, `_council_constitution_drifted` says DRIFTED, and this
+# returns EMPTY — denying every lead including the legitimate ones. Re-sealing is a
+# constitutional-class motion (2/3 + full quorum + founder veto) no agent convenes against
+# itself. The write is not prevented, it is made self-defeating.
+#
+# FAIL CLOSED at every unknown (no council loader, no sealed digest, drift, missing file,
+# no key, empty list, a malformed entry) -> NO name may lead-clear. Absence is not
+# "everyone" and is NOT "fall back to the chart" — falling back would restore the exact
+# path this closes. Note the operational consequence and that it is intended: on a box
+# whose constitution does not name `gate_clear_leads`, routed lead-clear is INERT and
+# every routed approval/manual/access gate waits for a human. That is a real posture
+# change, so the refusal is logged with a REASON (see `_gate_clear_lead_denied_reason`)
+# rather than being a silent nothing — an authority that quietly stopped working is the
+# failure mode DIVE-1935 cost us a day on.
+_GATE_CLEAR_LEAD_NAME_RX="$_GATE_STANDING_LEAD_NAME_RX"
+# Node-free reader for `authority.gate_clear_leads`, a STRICT subset of YAML: a top-level
+# `authority:` block containing a `gate_clear_leads:` key whose value is a BLOCK SEQUENCE
+# of plain scalars. Prints one name per line. A flow sequence (`[a, b]`), a nested map, or
+# anything else it cannot parse reads as ABSENT, which denies — a reader that guessed at a
+# shape it does not really support would be granting authority from bytes nobody verified.
+_gate_constitution_clear_leads() {
+  local path="${1:-}" line val in_block=0 in_list=0 n=0
+  [[ -n "$path" && -f "$path" ]] || return 1
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="${line%$'\r'}"
+    [[ -z "${line//[[:space:]]/}" ]] && continue
+    [[ "$line" =~ ^[[:space:]]*# ]] && continue
+    # A non-indented line starts a new top-level key. `gate_clear_leads` nested under any
+    # other top-level key therefore grants nothing.
+    if [[ "$line" =~ ^[^[:space:]] ]]; then
+      if [[ "$line" =~ ^authority:[[:space:]]*(#.*)?$ ]]; then in_block=1; else in_block=0; fi
+      in_list=0
+      continue
+    fi
+    (( in_block )) || continue
+    # An indented NON-list key ends the sequence — `gate_clear_leads:` followed by
+    # `eng_approval_lead:` must not swallow the latter as an entry.
+    if [[ ! "$line" =~ ^[[:space:]]+- ]]; then
+      if [[ "$line" =~ ^[[:space:]]+gate_clear_leads:[[:space:]]*(.*)$ ]]; then
+        val="${BASH_REMATCH[1]}"; val="${val%%#*}"
+        val="${val#"${val%%[![:space:]]*}"}"; val="${val%"${val##*[![:space:]]}"}"
+        # Only an EMPTY value opens a block sequence. An inline value here is a scalar or a
+        # flow sequence — neither is the supported shape, so refuse the whole key rather
+        # than parse half of `[a, b]` into a name.
+        [[ -n "$val" ]] && return 1
+        in_list=1
+      else
+        in_list=0
+      fi
+      continue
+    fi
+    (( in_list )) || continue
+    [[ "$line" =~ ^[[:space:]]+-[[:space:]]*(.*)$ ]] || continue
+    val="${BASH_REMATCH[1]}"
+    val="${val%%#*}"                       # strip a trailing comment
+    val="${val#"${val%%[![:space:]]*}"}"   # ltrim
+    val="${val%"${val##*[![:space:]]}"}"   # rtrim
+    val="${val%\"}"; val="${val#\"}"       # unquote "…"
+    val="${val%\'}"; val="${val#\'}"       # unquote '…'
+    [[ -n "$val" ]] || continue
+    printf '%s\n' "$val"
+    n=$((n+1))
+  done < "$path"
+  (( n > 0 ))
+}
+# _gate_clear_leads -> prints the sealed allowlist, one name per line, or nothing + rc 1.
+# Same fail-closed chain as _gate_standing_lead, for the same reasons.
+_gate_clear_leads() {
+  declare -F _council_constitution_path >/dev/null 2>&1 || return 1
+  declare -F _council_sealed_constitution_digest >/dev/null 2>&1 || return 1
+  declare -F _council_constitution_drifted >/dev/null 2>&1 || return 1
+  # Never sealed = the file is exactly as writable as the org chart, so anchoring to it
+  # would reproduce the self-grant in a different file.
+  local sealed; sealed="$(_council_sealed_constitution_digest 2>/dev/null || true)"
+  [[ -n "$sealed" ]] || return 1
+  ! _council_constitution_drifted || return 1
+  local path; path="$(_council_constitution_path 2>/dev/null || true)"
+  local names; names="$(_gate_constitution_clear_leads "$path" 2>/dev/null || true)"
+  [[ -n "$names" ]] || return 1
+  # Validate EVERY entry and refuse the whole list if any one is malformed. Dropping the
+  # bad entry and keeping the rest would let a hostile edit that fails validation still
+  # shift the effective allowlist, which is a partial grant from bytes we just rejected.
+  local nm
+  while IFS= read -r nm; do
+    [[ "$nm" =~ $_GATE_CLEAR_LEAD_NAME_RX ]] || return 1
+  done <<< "$names"
+  printf '%s\n' "$names"
+}
+# Is $1 named in the sealed allowlist? rc 0 = yes. Everything else = no.
+_gate_clear_lead_allowed() {
+  local who="${1:-}" nm; [[ -n "$who" ]] || return 1
+  local names; names="$(_gate_clear_leads 2>/dev/null || true)"
+  [[ -n "$names" ]] || return 1
+  while IFS= read -r nm; do [[ "$nm" == "$who" ]] && return 0; done <<< "$names"
+  return 1
+}
+# Why was a routed lead-clear refused? Emitted into the audit row so "the seal is not set
+# up on this box" is distinguishable from "this agent is not a lead" — the two demand
+# completely different responses (convene a motion vs. investigate a self-grant attempt)
+# and are indistinguishable from the gate's behaviour alone.
+_gate_clear_lead_denied_reason() {
+  declare -F _council_sealed_constitution_digest >/dev/null 2>&1 || { printf 'no-council-loader'; return; }
+  local sealed; sealed="$(_council_sealed_constitution_digest 2>/dev/null || true)"
+  [[ -n "$sealed" ]] || { printf 'constitution-unsealed'; return; }
+  if _council_constitution_drifted 2>/dev/null; then printf 'constitution-drifted'; return; fi
+  local names; names="$(_gate_clear_leads 2>/dev/null || true)"
+  [[ -n "$names" ]] || { printf 'no-gate-clear-leads-key'; return; }
+  printf 'not-a-sealed-lead'
+}
+
 # DIVE-1381: the CONTENT-CURATION gate class — the third downgrade kind, mirror
 # of the eng-ship class (DIVE-1359) for our early-stage content surfaces
 # (OpenAgent / character-packs / the daily persona drip). Surfaced by DIVE-1366:
@@ -6675,10 +6812,40 @@ cmd_task_answer() {
   # mint `lead:<the reviewer>` for itself. `_gate_authenticated_actor` is the
   # unforgeable half, and it FAILS CLOSED (empty -> no lead-clear).
   local _routed_rev; _routed_rev=$(db "SELECT COALESCE(routed_reviewer,'') FROM tasks WHERE id=${id};")
-  local _lead_clear=0
+  local _lead_clear=0 _rc_sealed=0 _rc_deny=""
   if [[ ( "$nt" == "approval" || "$nt" == "manual" || "$nt" == "access" ) && -n "$_routed_rev" ]]; then
     local _auth; _auth=$(_gate_authenticated_actor)
-    [[ -n "$_auth" && "$_auth" == "$_routed_rev" ]] && _lead_clear=1
+    if [[ -n "$_auth" && "$_auth" == "$_routed_rev" ]]; then
+      # DIVE-2233 PHASE 1 — READER ONLY, DECIDES NOTHING. Routing still carries the
+      # clearance exactly as it does today; `_lead_clear=1` is unconditional here and
+      # this release changes no gate's outcome. What the seal WOULD have decided is
+      # resolved and recorded on the audit row below (`sealed=`), and phase 3 flips
+      # this one branch to make it binding.
+      #
+      # Reader-before-enforcer, and the ordering is forced rather than cautious: the
+      # constitution normalizer REJECTS unknown top-level authority keys and
+      # loadConstitution fails closed to shipped defaults, so a council motion sealing
+      # `gate_clear_leads` BEFORE this release ships would not merely fail to help —
+      # it would invalidate the whole document on every box still running the current
+      # CLI and silently collapse it to defaults. The key has to be READABLE before it
+      # can safely be SEALED, and sealed before it can be ENFORCED.
+      #
+      # Deliberately NOT a feature flag: a flag on an agent-writable surface reopens
+      # the exact self-grant this ticket closes. The gate between phases is a release,
+      # which agents cannot cut for themselves.
+      #
+      # Recording it now is not bookkeeping. `sealed=0` rows are the fleet-wide
+      # measurement of which lead-clears phase 3 will start refusing — collected for a
+      # whole release, from production traffic, before anything breaks. Running the
+      # reader on every lead-clear also keeps it from rotting unexercised between the
+      # two cuts.
+      _lead_clear=1
+      if _gate_clear_lead_allowed "$_routed_rev"; then
+        _rc_sealed=1
+      else
+        _rc_deny="$(_gate_clear_lead_denied_reason)"
+      fi
+    fi
   fi
   # DIVE-2099: the org lead's STANDING authority over ENGINEERING approvals — the
   # same clearance as the routed lead-clear above, but WITHOUT requiring that this
@@ -6734,7 +6901,11 @@ cmd_task_answer() {
     # answer landing in the DB — the authoritative post-write row is emitted
     # after the UPDATE below (DIVE-2090: a pre-check row is not an audit of the
     # write; the two diverge in both directions).
-    [[ "$_lead_clear" == "1" ]] && _task_store_audit_log "task answer lead-clear" "ok" 0 -- "task=$ident" "type=$nt" "reviewer=${_routed_rev:-<none>}" "standing=$_lead_standing" 2>/dev/null || true
+    # DIVE-2233 phase 1: `sealed=` records what the SEAL would have decided about this
+    # clear, and `denied=` why not. Nothing here changes the outcome — the row is the
+    # instrument. Counting `sealed=0` rows fleet-wide over this release is how we size
+    # phase 3's blast radius from real traffic instead of predicting it.
+    [[ "$_lead_clear" == "1" ]] && _task_store_audit_log "task answer lead-clear" "ok" 0 -- "task=$ident" "type=$nt" "reviewer=${_routed_rev:-<none>}" "standing=$_lead_standing" "sealed=$_rc_sealed" "would_deny=${_rc_deny:-<none>}" 2>/dev/null || true
   fi
 
   # DIVE-916/950: hard human gates (approval/secret/manual) need HUMAN evidence

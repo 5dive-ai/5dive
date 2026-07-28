@@ -589,6 +589,15 @@ comms:
 #   edit. Example:
 #     authority:
 #       eng_approval_lead: main
+#   gate_clear_leads: [<agent>, ...] — the agents allowed to CLEAR an approval/manual/access
+#   gate that was ROUTED to them (DIVE-2233). The org chart still decides who a gate is routed
+#   TO — that is a notification. This list decides who may clear one, so re-parenting the chart
+#   moves the ping and never the authority. EMPTY = nobody may lead-clear and every routed gate
+#   falls through to a human, which is the safe default and NOT an outage. Example:
+#     authority:
+#       gate_clear_leads:
+#         - main
+#         - marketing
 authority:
 #
 # ===================================================================================
@@ -623,7 +632,7 @@ export const DEFAULT_CONSTITUTION = {
   comms: {},
   // DIVE-2099 — standing authorities held by a named agent. Empty by default: a fresh org
   // grants nobody a standing clear until it deliberately amends this in.
-  authority: { engApprovalLead: '' },
+  authority: { engApprovalLead: '', gateClearLeads: [] },
 }
 
 function yamlScalar(raw) {
@@ -810,14 +819,34 @@ export function normalizeConstitution(raw = {}) {
   // change through a constitutional-class amendment.
   if (raw.authority != null && (typeof raw.authority !== 'object' || Array.isArray(raw.authority))) throw new Error('authority must be a mapping')
   const authority = raw.authority || {}
-  const unknownAuthority = Object.keys(authority).filter(k => k !== 'eng_approval_lead')
+  const AUTHORITY_KEYS = ['eng_approval_lead', 'gate_clear_leads']
+  const unknownAuthority = Object.keys(authority).filter(k => !AUTHORITY_KEYS.includes(k))
   if (unknownAuthority.length) throw new Error(`unknown authority field(s): ${unknownAuthority.join(', ')}`)
   if (authority.eng_approval_lead != null && typeof authority.eng_approval_lead !== 'string') throw new Error('authority.eng_approval_lead must be a string')
   const engApprovalLead = String(authority.eng_approval_lead || '').trim()
   // The same shape bash enforces (`_GATE_STANDING_LEAD_NAME_RX`): a plain agent name, so the
   // value stays a name comparison. `human:x`, `*`, `all`, paths and metacharacters are rejected
   // here rather than silently ignored at enforcement time.
-  if (engApprovalLead && !/^[a-z0-9][a-z0-9_-]{0,31}$/.test(engApprovalLead)) throw new Error('authority.eng_approval_lead must be a plain agent name (a-z0-9, _ or -, max 32)')
+  const AGENT_NAME_RE = /^[a-z0-9][a-z0-9_-]{0,31}$/
+  if (engApprovalLead && !AGENT_NAME_RE.test(engApprovalLead)) throw new Error('authority.eng_approval_lead must be a plain agent name (a-z0-9, _ or -, max 32)')
+  // DIVE-2233 — `gate_clear_leads`: the agents permitted to exercise the ROUTED lead-clear
+  // (DIVE-1182/1243) on an approval/manual/access gate. A LIST, not a scalar, because routing is
+  // per-filer: a real org has several managers who each legitimately clear their own reports'
+  // gates, and collapsing that to one name would break every branch of the chart but one.
+  //
+  // This does NOT decide who a gate is ROUTED to — the org chart still does that, and routing is
+  // a notification concern. It decides who may CLEAR. That split is the whole fix: an agent that
+  // sudo-writes itself into a builder's `reports_to` still receives the ping and still cannot
+  // clear, because the name it just gave itself is not in these sealed bytes.
+  if (authority.gate_clear_leads != null && !Array.isArray(authority.gate_clear_leads)) throw new Error('authority.gate_clear_leads must be a list of agent names')
+  const gateClearLeads = (authority.gate_clear_leads || []).map(v => {
+    if (typeof v !== 'string') throw new Error('authority.gate_clear_leads entries must be strings')
+    return v.trim()
+  }).filter(v => v !== '')
+  for (const n of gateClearLeads) {
+    if (!AGENT_NAME_RE.test(n)) throw new Error(`authority.gate_clear_leads entry '${n}' must be a plain agent name (a-z0-9, _ or -, max 32)`)
+  }
+  if (new Set(gateClearLeads).size !== gateClearLeads.length) throw new Error('authority.gate_clear_leads must not repeat a name')
   return {
     schemaVersion,
     council: { bench: String(council.bench || DEFAULT_CONSTITUTION.council.bench) },
@@ -832,7 +861,7 @@ export function normalizeConstitution(raw = {}) {
     hardGates, hardGateRegex,
     ship: raw.ship && typeof raw.ship === 'object' ? raw.ship : {},
     comms: raw.comms && typeof raw.comms === 'object' ? raw.comms : {},
-    authority: { engApprovalLead },
+    authority: { engApprovalLead, gateClearLeads },
   }
 }
 
