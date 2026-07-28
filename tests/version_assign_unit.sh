@@ -56,9 +56,14 @@ grep -q 'next = 0.16.20' <<<"$out" && ok "A computes the next patch (0.16.19 -> 
 grep -q 'nothing written' <<<"$out" && ok "A is dry by default — no --apply, no write" || no "A dry" "$out"
 
 # B: version already moved -> nothing owed (the merger did assign it).
+# DIVE-2230 collapsed the two not-owed REASONS into one, because they were both
+# proxies for the same absolute fact: main's bundle is the bundle its version
+# shipped. Here the anchor IS the head commit, so the sha it recorded is the sha at
+# HEAD. The old wording ("FIVE_VERSION already moved") is gone deliberately — it
+# described the delta, which is the thing that could be laundered.
 d=$(mk 0.16.19 aaa 0.16.20 bbb); out=$(run "$d")
-grep -q 'no assignment needed' <<<"$out" && grep -q 'already moved' <<<"$out" \
-  && ok "B version already assigned -> nothing owed" || no "B" "$out"
+grep -q 'no assignment needed' <<<"$out" && grep -q '0.16.20 was assigned at' <<<"$out" \
+  && ok "B version already assigned -> nothing owed, measured against that assignment" || no "B" "$out"
 
 # C: bundle unchanged (workflow/doc-only push) -> exempt.
 d=$(mk 0.16.19 aaa 0.16.19 aaa); out=$(run "$d")
@@ -212,5 +217,100 @@ else
   ok "H BEHAVIOURAL: no tag verb (git tag / gh release / refs/tags / --tags) appears in either shipped file"
 fi
 
-echo; echo "DIVE-2118 version-assign: passed: $P  failed: $F"
+# ---------------------------------------------------------------------------
+# I: DIVE-2230 — THE FAILED ASSIGNMENT MUST NOT LAUNDER ITSELF GREEN.
+#
+# The regression case is NOT "a push fails". Arms A/G already cover that, and the
+# BROKEN implementation passes them: at the failing commit itself the bundle did move
+# in that push, so a delta check and an absolute check agree. The case is "a push
+# fails, THEN an unrelated non-bundle commit lands" — the delta comes back clean, the
+# obligation vanishes, and every subsequent run is green with main unassigned.
+#
+# So this arm is DIFFERENTIAL by construction. It runs the real script AND a mutant
+# that restores the one line of old behaviour (anchor -> BASE), and demands they
+# DISAGREE on the three-commit fixture while AGREEING on the two-commit one. A test
+# that only asserts the real script would pass on an implementation that had merely
+# been reworded.
+mklaunder() { # v/sha at the assignment, then the failed-assign commit, then N doc commits
+  local d="$TMP/launder$RANDOM$RANDOM" i; mkdir -p "$d/src"
+  git -C "$d" init -q -b main; git -C "$d" config user.email t@t; git -C "$d" config user.name t
+  printf 'readonly FIVE_VERSION="0.16.19"\n' > "$d/src/header.sh"; printf 'aaa  5dive\n' > "$d/5dive.sha256"
+  git -C "$d" add -A; git -C "$d" commit -qm "release: assign 0.16.19"
+  # the merge whose assignment FAILED to push: bundle moved, version did not
+  printf 'bbb  5dive\n' > "$d/5dive.sha256"; git -C "$d" add -A; git -C "$d" commit -qm "feat: bundle moves, assignment never landed"
+  for (( i=0; i<${1:-0}; i++ )); do   # unrelated non-bundle pushes (workflow/doc-only)
+    printf 'doc %s\n' "$i" > "$d/README.md"; git -C "$d" add -A; git -C "$d" commit -qm "docs: unrelated"
+  done
+  printf '%s' "$d"; }
+
+# The mutant: one line, restoring exactly the semantics this ticket removed.
+MUT="$TMP/version-assign.mutant.sh"
+sed 's|^s_anchor=$(sha_at "$ANCHOR")$|s_anchor=$(sha_at "$BASE")|' "$S" > "$MUT"
+# CONFIRM THE MUTATION LANDED. A sed that silently matched nothing would make every
+# arm below compare the script against ITSELF and report a confident green.
+if ! cmp -s "$S" "$MUT" && grep -q 's_anchor=$(sha_at "$BASE")' "$MUT"; then
+  ok "I0 CONTROL: the mutant differs from the real script and carries the old base-relative line"
+else
+  no "I0 mutant" "the mutation did not land — every I arm below would be comparing the script to itself"
+fi
+
+# I1 THE FIRST HALF, where broken and fixed AGREE. Both must say OWED; if the mutant
+# were simply broken rather than old, this is where it would show.
+d=$(mklaunder 0)
+real=$( cd "$d" && bash "$S"   HEAD HEAD~1 2>&1 )
+mut=$(  cd "$d" && bash "$MUT" HEAD HEAD~1 2>&1 )
+grep -q 'ASSIGNMENT OWED' <<<"$real" && ok "I1 at the failed-assign commit, the fixed script reports OWED" || no "I1 real" "$real"
+grep -q 'ASSIGNMENT OWED' <<<"$mut"  && ok "I1 CONTROL: and so does the OLD behaviour — this half never discriminated" || no "I1 mut" "$mut"
+
+# I2 THE SECOND HALF — the actual regression. One unrelated doc commit lands on top.
+# Measured on the real repo as runs #268 (loud, correct) then #271 (green, wrong).
+d=$(mklaunder 1)
+real=$( cd "$d" && bash "$S"   HEAD HEAD~1 2>&1 ); rc=$?
+mut=$(  cd "$d" && bash "$MUT" HEAD HEAD~1 2>&1 )
+(( rc == 0 )) && ok "I2 owed-after-a-doc-commit still exits 0 (a finding, not an error)" || no "I2 rc" "$rc: $real"
+grep -q 'ASSIGNMENT OWED' <<<"$real" \
+  && ok "I2 REGRESSION: a doc-only commit ON TOP of a failed assignment still reports the debt" || no "I2 real" "$real"
+grep -q 'next = 0.16.20' <<<"$real" && ok "I2 and still computes the successor it computed before the failure" || no "I2 next" "$real"
+grep -q 'no assignment needed' <<<"$mut" \
+  && ok "I2 DIFFERENTIAL: the OLD behaviour calls the same tree green — this arm discriminates" || no "I2 mut" "$mut"
+
+# I3 the debt survives an ARBITRARY number of unrelated pushes, not just one. The
+# erasure is permanent in the broken version, so a fix that only looked one commit
+# further back would pass I2 and still be wrong.
+d=$(mklaunder 5)
+real=$( cd "$d" && bash "$S" HEAD HEAD~1 2>&1 )
+grep -q 'ASSIGNMENT OWED' <<<"$real" && ok "I3 the debt survives 5 unrelated commits (absolute, not a wider window)" || no "I3" "$real"
+
+# I4 NON-VACUITY. The fix must not answer OWED to everything: once the assignment
+# actually lands, doc commits on top must go quiet. Without this arm, `exit 0 after
+# echoing OWED` would pass I1-I3.
+d=$(mklaunder 1)
+printf 'readonly FIVE_VERSION="0.16.20"\n' > "$d/src/header.sh"   # the assignment lands
+git -C "$d" add -A; git -C "$d" commit -qm "release: assign 0.16.20 at merge"
+printf 'doc after\n' > "$d/README.md"; git -C "$d" add -A; git -C "$d" commit -qm "docs: unrelated"
+real=$( cd "$d" && bash "$S" HEAD HEAD~1 2>&1 ); rc=$?
+(( rc == 0 )) && grep -q 'no assignment needed' <<<"$real" \
+  && ok "I4 NON-VACUITY: once the assignment lands, later doc commits report nothing owed" || no "I4" "$rc: $real"
+grep -q 'assigned at' <<<"$real" \
+  && ok "I4 and names the commit it measured against, so the claim is checkable" || no "I4 anchor named" "$real"
+
+# J: A TRUNCATED HISTORY MUST REFUSE, NOT GUESS. The anchor walk is only as good as
+# the history it can see, and CI checks out with a depth. If the assignment is below
+# the graft, "the version never changed here" is indistinguishable from "this is the
+# first version" — and quietly picking either restores the fail-open one layer down.
+# Depth 2 on purpose: HEAD~1 resolves, so the BASE canary passes and this arm grades
+# the ANCHOR path rather than the pre-existing base check.
+d=$(mklaunder 3)
+sh="$TMP/shallow$RANDOM"
+if git clone -q --depth=2 "file://$d" "$sh" 2>/dev/null; then
+  [[ "$(git -C "$sh" rev-parse --is-shallow-repository)" == "true" ]] \
+    && ok "J CONTROL: the clone really is shallow (otherwise this arm proves nothing)" || no "J control" "not shallow"
+  out=$( cd "$sh" && bash "$S" HEAD HEAD~1 2>&1 ); rc=$?
+  (( rc == 2 )) && ok "J a shallow history exits 2 rather than reporting a clean tree" || no "J rc" "$rc: $out"
+  grep -q 'SHALLOW' <<<"$out" && ok "J and names truncation as the cause, not the version" || no "J msg" "$out"
+else
+  no "J shallow clone could not be created — the arm did NOT run (this is not a pass)"
+fi
+
+echo; echo "DIVE-2118/2230 version-assign: passed: $P  failed: $F"
 [ "$F" -eq 0 ]

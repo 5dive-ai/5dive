@@ -22,7 +22,37 @@
 # installed-bundle-matches-its-commit selfcheck honest). So this script bumps,
 # and must NEVER create a tag or a GitHub release.
 #
+# DIVE-2230: THE QUESTION IS ABSOLUTE, SO THE BASE IS DERIVED, NEVER PASSED.
+#
+# This script used to compare the bundle at <new-rev> against <base-rev> — the
+# PREVIOUS COMMIT. That asks "did the bundle move in THIS push". The invariant it
+# exists to defend is "does main's bundle match the LAST ASSIGNED VERSION". Those
+# two agree exactly until an assignment fails to land. After that the debt is
+# carried by no one and ERASED by the next unrelated commit, silently and for good.
+#
+# Measured 2026-07-28, three artifacts: run #268 (a2e2009) printed "ASSIGNMENT
+# OWED ... next = 0.16.36" and died on a branch-protection push rejection — loud
+# and correct. Run #271 (0e37bf7), a workflow-only push, then printed "no
+# assignment needed — the bundle is unchanged since a2e2009" and went GREEN, with
+# main's bundle still unassigned. Every run after that was green too. bundle-drift
+# cannot see it either: it compares bundle to SOURCE, and those agree.
+#
+# So the base is now the ANCHOR: the commit that set FIVE_VERSION to its CURRENT
+# value. The bundle recorded there IS the bundle this version shipped, so the
+# comparison answers the absolute question at ANY commit, independent of what the
+# adjacent one did — and one transient push failure can no longer launder itself
+# green. Same wrong-target shape as an anchor pinned to a moving ref (DIVE-2213):
+# the instrument was fine, the thing it was pointed at was not.
+#
+# <base-rev> is still ACCEPTED and still VALIDATED — an unresolvable base means a
+# truncated fetch, and a truncated fetch is exactly what breaks the anchor walk, so
+# it stays as a canary. It is never DECIDED on. A caller cannot reintroduce the
+# delta semantics by passing the wrong thing, which is why version-assign.yml needs
+# no change: its `$before` is now inert.
+#
 # Usage: version-assign.sh <new-rev> [<base-rev>] [--apply]
+#        <base-rev> is a truncated-history canary only; the owed/not-owed decision
+#        is computed against the last ASSIGNED version, never against it.
 # Exit:  0 = no assignment needed (prints why) or assignment computed/applied
 #        2 = could not determine (NOT a pass — never silently skip)
 set -uo pipefail
@@ -41,11 +71,11 @@ if ! git rev-parse --verify --quiet "$NEW" >/dev/null; then
   echo "version-assign: UNDETERMINED — no such rev '$NEW'. This is NOT a pass." >&2; exit 2
 fi
 if ! git rev-parse --verify --quiet "$BASE" >/dev/null; then
-  echo "version-assign: UNDETERMINED — no usable base rev '$BASE' (first commit, or a truncated fetch). This is NOT a pass; a bump may be owed and could not be computed." >&2; exit 2
+  echo "version-assign: UNDETERMINED — no usable base rev '$BASE' (first commit, or a truncated fetch). This is NOT a pass; a bump may be owed and could not be computed. The base does not decide anything (DIVE-2230) — it is kept as a truncated-history canary, and a truncated history is what breaks the anchor walk below." >&2; exit 2
 fi
 
-v_new=$(ver_at "$NEW"); v_base=$(ver_at "$BASE")
-s_new=$(sha_at "$NEW"); s_base=$(sha_at "$BASE")
+v_new=$(ver_at "$NEW")
+s_new=$(sha_at "$NEW")
 
 # Fail-open must be LOUD, and the two unreadable causes must not share a message.
 if [[ -z "$v_new" ]]; then
@@ -55,20 +85,53 @@ if [[ -z "$s_new" ]]; then
   echo "version-assign: UNDETERMINED — could not read 5dive.sha256 at '$NEW'. This is NOT a pass." >&2; exit 2
 fi
 
-if [[ "$s_new" == "$s_base" ]]; then
-  echo "version-assign: no assignment needed — the bundle is unchanged since '$BASE' (workflow/doc-only push)."; exit 0
+# THE ANCHOR: walk back over the commits that touched src/header.sh and stop at the
+# first one carrying a DIFFERENT version. The commit after it — the oldest one still
+# carrying $v_new — is where $v_new was assigned. First-parent, because main's trunk
+# is what gets assigned; a merge that changes the version relative to its first
+# parent is itself an assignment and is listed.
+#
+# Walking is the whole point: reading it off the adjacent commit is the bug. The loop
+# normally ends on its first or second iteration (the version moves nearly every
+# release commit), and it is bounded by the history of ONE file.
+ANCHOR=""
+while IFS= read -r c; do
+  [[ -z "$c" ]] && continue
+  if [[ "$(ver_at "$c")" != "$v_new" ]]; then break; fi
+  ANCHOR="$c"
+done < <(git log --first-parent --format=%H "$NEW" -- src/header.sh)
+
+# Never infer an anchor we could not actually see. A shallow clone reaches the end of
+# its grafted history and reports "the version never changed", which is
+# indistinguishable from a genuinely-first version except by asking git whether the
+# history is complete. Guessing here would restore the exact fail-open this ticket is
+# about, one layer down.
+if [[ -z "$ANCHOR" ]]; then
+  echo "version-assign: UNDETERMINED — could not locate the commit that assigned FIVE_VERSION $v_new at '$NEW'. This is NOT a pass; a bump may be owed and could not be computed." >&2; exit 2
 fi
-if [[ "$v_new" != "$v_base" ]]; then
-  echo "version-assign: no assignment needed — the bundle changed AND FIVE_VERSION already moved ($v_base -> $v_new); whoever merged assigned it."; exit 0
+if [[ "$(git rev-parse --is-shallow-repository 2>/dev/null)" == "true" ]] && [[ -z "$(git rev-parse --verify --quiet "${ANCHOR}^" 2>/dev/null)" ]]; then
+  echo "version-assign: UNDETERMINED — the history is SHALLOW and the walk ran off its end at '${ANCHOR:0:12}', so '$v_new' may have been assigned before the graft. This is NOT a pass; fetch with depth 0." >&2; exit 2
 fi
 
-# The bundle moved and the version did not: this is the assignment nobody performed.
+s_anchor=$(sha_at "$ANCHOR")
+if [[ -z "$s_anchor" ]]; then
+  echo "version-assign: UNDETERMINED — could not read 5dive.sha256 at the assignment commit '${ANCHOR:0:12}'. This is NOT a pass." >&2; exit 2
+fi
+
+if [[ "$s_new" == "$s_anchor" ]]; then
+  echo "version-assign: no assignment needed — the bundle is unchanged since $v_new was assigned at ${ANCHOR:0:12}; main ships the bundle its version claims."; exit 0
+fi
+
+# The bundle moved since the version was last assigned, and the version did not
+# follow: this is the assignment nobody performed. Note this is TRUE even when the
+# move happened several commits ago and this push touched nothing — that case is
+# DIVE-2230 itself, and reporting it is the fix.
 if [[ ! "$v_new" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
   echo "version-assign: UNDETERMINED — FIVE_VERSION '$v_new' is not MAJOR.MINOR.PATCH, refusing to guess the successor. This is NOT a pass." >&2; exit 2
 fi
 NEXT="${BASH_REMATCH[1]}.${BASH_REMATCH[2]}.$(( BASH_REMATCH[3] + 1 ))"
 
-echo "version-assign: ASSIGNMENT OWED — bundle changed ($s_base -> $s_new) with FIVE_VERSION still $v_new."
+echo "version-assign: ASSIGNMENT OWED — bundle changed (${s_anchor:0:16} -> ${s_new:0:16}) since $v_new was assigned at ${ANCHOR:0:12}, with FIVE_VERSION still $v_new."
 echo "version-assign: next = $NEXT"
 (( APPLY )) || { echo "version-assign: --apply not given; nothing written."; exit 0; }
 
