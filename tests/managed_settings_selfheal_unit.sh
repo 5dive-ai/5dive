@@ -12,6 +12,9 @@
 #      self-heals with a single box-local command (no per-box install.sh rerun).
 # Run: bash tests/managed_settings_selfheal_unit.sh
 set -uo pipefail
+
+# DIVE-2211: name the tree this harness grades (tests/lib/grading_tree.sh).
+. "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh"
 cd "$(dirname "$0")/.."
 
 PASS=0; FAIL=0

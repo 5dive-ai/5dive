@@ -20,6 +20,9 @@
 # Isolated: source src/ libs, throwaway STATE_DIR, the live tasks.db is never
 # touched. Run: bash tests/gate_filer_of_record_unit.sh
 set -uo pipefail
+
+# DIVE-2211: name the tree this harness grades (tests/lib/grading_tree.sh).
+. "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh"
 cd "$(dirname "$0")/.."
 SRC=src
 TMP="$(mktemp -d /tmp/gate-filer-record.XXXXXX)"

@@ -15,6 +15,9 @@
 # delivery pre-flight deterministic regardless of the runner's real sudo rights. No root, no seal,
 # no live board. Exit 0 == green.
 set -uo pipefail
+
+# DIVE-2211: name the tree this harness grades (tests/lib/grading_tree.sh).
+. "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"; cd "$ROOT"
 
 pass=0; fail=0

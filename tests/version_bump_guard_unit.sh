@@ -17,6 +17,9 @@
 # needed to exercise them). Never touches the real repo's git state.
 # Run: bash tests/version_bump_guard_unit.sh  (no root, no network).
 set -uo pipefail
+
+# DIVE-2211: name the tree this harness grades (tests/lib/grading_tree.sh).
+. "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BUMP_GUARD="$ROOT/scripts/version-bump-guard.sh"
 UNIQ_SCAN="$ROOT/scripts/version-uniqueness-scan.sh"

@@ -15,6 +15,9 @@
 # `[[ "$PROBED" == *" $h "* ]] && continue` line and case 1 reds; drop the
 # `hdr_corpus != ${#corpus[@]}` guard and case 6 reds.
 set -uo pipefail
+
+# DIVE-2211: name the tree this harness grades (tests/lib/grading_tree.sh).
+. "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh"
 cd "$(dirname "${BASH_SOURCE[0]}")/.." || exit 2
 UNION="$PWD/tests/meta/harness-verdict-union.sh"
 [[ -x "$UNION" || -r "$UNION" ]] || { printf 'FAIL: %s not found\n' "$UNION"; exit 1; }

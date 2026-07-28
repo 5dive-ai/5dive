@@ -15,6 +15,9 @@
 # fixture table, so this never files a gate, never writes an audit row and never
 # shells out.
 set -uo pipefail
+
+# DIVE-2211: name the tree this harness grades (tests/lib/grading_tree.sh).
+. "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh"
 cd "$(dirname "${BASH_SOURCE[0]}")/.." || exit 2
 SRC=src
 # shellcheck disable=SC1090

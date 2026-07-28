@@ -13,6 +13,9 @@
 # per-agent --sleep-after override; has_work is fail-closed on a db error.
 # Run: bash tests/heartbeat_wake_sleep_unit.sh   (no root, no network, no systemd).
 set -uo pipefail
+
+# DIVE-2211: name the tree this harness grades (tests/lib/grading_tree.sh).
+. "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh"
 cd "$(dirname "$0")/.."
 SRC=src
 

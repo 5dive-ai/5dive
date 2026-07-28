@@ -13,6 +13,9 @@
 # Both cases source src/ directly and stub every side effect — no root,
 # network, credentials, users, registry, or live state is touched.
 set -euo pipefail
+
+# DIVE-2211: name the tree this harness grades (tests/lib/grading_tree.sh).
+. "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh"
 cd "$(dirname "$0")/.."
 
 # shellcheck disable=SC1091

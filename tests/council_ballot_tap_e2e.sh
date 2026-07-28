@@ -9,6 +9,9 @@
 # ballot whose body carries nonceDigest=sha256(NONCE); `task done` is logged. SKIPs green when node/
 # jq/sha256sum are missing or the build fails. Exit 0 == green.
 set -u
+
+# DIVE-2211: name the tree this harness grades (tests/lib/grading_tree.sh).
+. "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 for b in node jq sha256sum; do
   command -v "$b" >/dev/null 2>&1 || { echo "SKIP: $b not on PATH (council ballot-tap e2e needs it)"; exit 0; }

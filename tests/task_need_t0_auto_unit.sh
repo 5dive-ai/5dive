@@ -12,6 +12,9 @@
 # community/wiki/audit-log-store-fence-task-need-unnotified-dive2010.md).
 # Run: bash tests/task_need_t0_auto_unit.sh  (no root, no network).
 set -uo pipefail
+
+# DIVE-2211: name the tree this harness grades (tests/lib/grading_tree.sh).
+. "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh"
 cd "$(dirname "$0")/.."
 SRC=src
 TMP="$(mktemp -d /tmp/task-need-t0-unit.XXXXXX)"

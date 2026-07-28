@@ -10,6 +10,9 @@
 #
 # Hermetic: fixture reports in a throwaway dir. Never runs `5dive selfcheck`.
 set -uo pipefail
+
+# DIVE-2211: name the tree this harness grades (tests/lib/grading_tree.sh).
+. "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh"
 cd "$(dirname "${BASH_SOURCE[0]}")/.." || exit 2
 UNION="$PWD/tests/meta/selfcheck-union.sh"
 [[ -r "$UNION" ]] || { printf 'FAIL: %s not found\n' "$UNION"; exit 1; }

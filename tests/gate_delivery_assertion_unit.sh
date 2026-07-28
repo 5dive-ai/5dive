@@ -8,6 +8,9 @@
 # that do not exist yet — the four that exist today were each written intending to
 # record something, and the hole appeared anyway.
 set -uo pipefail
+
+# DIVE-2211: name the tree this harness grades (tests/lib/grading_tree.sh).
+. "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh"
 cd "$(dirname "$0")/.."
 SRC=src
 TMP=$(mktemp -d /tmp/gate-delivery-assert.XXXXXX)

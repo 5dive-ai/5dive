@@ -7,6 +7,9 @@
 # (only WRITE/verify do), so a hand-synthesized lineage exercises the sealed case root-free — this
 # GATES in CI. SKIPs green when node/jq missing or the build fails. Exit 0 == green.
 set -u
+
+# DIVE-2211: name the tree this harness grades (tests/lib/grading_tree.sh).
+. "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 for b in node jq; do
   command -v "$b" >/dev/null 2>&1 || { echo "SKIP: $b not on PATH (constitution show e2e needs it)"; exit 0; }

@@ -13,6 +13,9 @@
 # inc counts + rolls over; always_on agents are never budgeted; cost is surfaced.
 # Run: bash tests/heartbeat_wake_dispatch_unit.sh  (no root, no network).
 set -uo pipefail
+
+# DIVE-2211: name the tree this harness grades (tests/lib/grading_tree.sh).
+. "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh"
 cd "$(dirname "$0")/.."
 SRC=src
 

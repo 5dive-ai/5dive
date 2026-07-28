@@ -2,6 +2,9 @@
 # DIVE-1499: `task inbox --send` — owner digest with working per-gate tap
 # buttons, nonce never on stdout, hash rotation only after confirmed delivery.
 set -uo pipefail
+
+# DIVE-2211: name the tree this harness grades (tests/lib/grading_tree.sh).
+. "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh"
 cd "$(dirname "$0")/.."
 SRC=src
 TMP=$(mktemp -d /tmp/inbox-send.XXXXXX)

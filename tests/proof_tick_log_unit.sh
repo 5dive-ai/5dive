@@ -19,6 +19,9 @@
 #   6. a legacy `>>` cron is detected and rewritten by _proof_cron_legacy_check.
 # Run: bash tests/proof_tick_log_unit.sh   (no root, no network).
 set -uo pipefail
+
+# DIVE-2211: name the tree this harness grades (tests/lib/grading_tree.sh).
+. "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh"
 cd "$(dirname "$0")/.."
 
 TMP="$(mktemp -d /tmp/proof-tick-log.XXXXXX)"

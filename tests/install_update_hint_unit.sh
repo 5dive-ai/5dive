@@ -3,6 +3,9 @@
 # distinguishes managed nightly updates from self-hosted opt-in scheduling,
 # and preserves the raw installer upgrade as a fallback.
 set -uo pipefail
+
+# DIVE-2211: name the tree this harness grades (tests/lib/grading_tree.sh).
+. "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"; cd "$ROOT" || exit 1
 PASS=0; FAIL=0
 ok_t(){ PASS=$((PASS+1)); printf 'ok   - %s\n' "$1"; }

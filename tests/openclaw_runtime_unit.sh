@@ -3,6 +3,9 @@
 # DIVE-1328: OpenClaw gets Node on PATH and never gates chat on a wizard.
 # Static/source-level test: no root, network, users, or runtime state touched.
 set -euo pipefail
+
+# DIVE-2211: name the tree this harness grades (tests/lib/grading_tree.sh).
+. "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh"
 cd "$(dirname "$0")/.."
 
 # shellcheck disable=SC1091

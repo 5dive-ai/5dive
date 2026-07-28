@@ -4,6 +4,9 @@
 # standard/sandboxed agent must NOT claim powers it lacks, so it keeps the plain
 # per-type welcome. A curl trap captures the sent text without any network call.
 set -uo pipefail
+
+# DIVE-2211: name the tree this harness grades (tests/lib/grading_tree.sh).
+. "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh"
 cd "$(dirname "$0")/.."
 SRC=src
 TMP=$(mktemp -d /tmp/welcome-iso.XXXXXX)

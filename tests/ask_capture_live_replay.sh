@@ -37,6 +37,9 @@
 # incomplete the rail returns NOTHING (which keeps it polling and, failing that,
 # times out loudly), and once the fence closes it returns the token EXACTLY.
 set -euo pipefail
+
+# DIVE-2211: name the tree this harness grades (tests/lib/grading_tree.sh).
+. "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh"
 cd "$(dirname "$0")/.."
 
 # shellcheck disable=SC1091

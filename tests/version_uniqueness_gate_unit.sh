@@ -17,6 +17,9 @@
 # network-and-clock test would be too slow and flaky to run every push.
 # Run: bash tests/version_uniqueness_gate_unit.sh  (no root, no network)
 set -uo pipefail
+
+# DIVE-2211: name the tree this harness grades (tests/lib/grading_tree.sh).
+. "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh"
 cd "$(dirname "$0")/.."
 # shellcheck source=/dev/null
 source scripts/version-uniqueness-gate.sh          # sourced => functions only

@@ -3,6 +3,9 @@
 # real arrow-key bytes and secret input through a pseudo-terminal; no root,
 # network, auth, install, or agent state is touched.
 set -euo pipefail
+
+# DIVE-2211: name the tree this harness grades (tests/lib/grading_tree.sh).
+. "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh"
 cd "$(dirname "$0")/.."
 
 # Structural coverage: every bounded choice uses the shared picker, all secret

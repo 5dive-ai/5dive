@@ -6,6 +6,9 @@
 # Pure function test: no root, no network. AUTH_PROFILES_DIR + a fake connector
 # dir are pointed at a tmpdir.
 set -uo pipefail
+
+# DIVE-2211: name the tree this harness grades (tests/lib/grading_tree.sh).
+. "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh"
 cd "$(dirname "$0")/.."
 SRC=src
 TMP=$(mktemp -d /tmp/pi-badge.XXXXXX)

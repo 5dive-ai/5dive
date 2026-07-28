@@ -13,6 +13,9 @@
 #   - the seeded address is non-personal and obviously synthetic.
 # Run: bash tests/agent_git_identity_unit.sh   (no root, no user creation).
 set -uo pipefail
+
+# DIVE-2211: name the tree this harness grades (tests/lib/grading_tree.sh).
+. "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh"
 cd "$(dirname "$0")/.."
 
 TMP="$(mktemp -d /tmp/agent-git-identity.XXXXXX)"

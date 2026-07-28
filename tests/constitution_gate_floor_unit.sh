@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 # CNCL-14: task tier-floor consumer reads hard_gates from constitution.yaml.
 set -uo pipefail
+
+# DIVE-2211: name the tree this harness grades (tests/lib/grading_tree.sh).
+. "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh"
 cd "$(dirname "$0")/.."
 
 for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh \

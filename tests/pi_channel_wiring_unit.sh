@@ -16,6 +16,9 @@
 # launch is exercised once telegram-pi (DIVE-1202) is deployed.
 # Run: bash tests/pi_channel_wiring_unit.sh  (no root, no network, no tmux).
 set -uo pipefail
+
+# DIVE-2211: name the tree this harness grades (tests/lib/grading_tree.sh).
+. "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh"
 cd "$(dirname "$0")/.."
 SRC=src
 

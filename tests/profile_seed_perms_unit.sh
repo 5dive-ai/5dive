@@ -6,6 +6,9 @@
 # boot). Pure, no root, no network:
 #   bash tests/profile_seed_perms_unit.sh
 set -uo pipefail
+
+# DIVE-2211: name the tree this harness grades (tests/lib/grading_tree.sh).
+. "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh"
 cd "$(dirname "$0")/.."
 SRC=src
 TMP="$(mktemp -d /tmp/profile-seed-perms-unit.XXXXXX)"

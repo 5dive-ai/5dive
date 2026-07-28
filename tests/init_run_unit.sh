@@ -9,6 +9,9 @@
 #     in BOTH modes (quiet backgrounds the cmd; the pipe must still flow)
 #   - the sub-process rc propagates, and quiet surfaces the log path on failure
 set -euo pipefail
+
+# DIVE-2211: name the tree this harness grades (tests/lib/grading_tree.sh).
+. "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh"
 cd "$(dirname "$0")/.."
 export NO_COLOR=1
 # shellcheck disable=SC1091

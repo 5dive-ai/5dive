@@ -13,6 +13,9 @@
 # it GATES in CI too (CI never builds ./5dive, and no root/sudo/seal is needed — these verbs are
 # pure). SKIPs green only when node/jq/openssl are missing or the build fails. Exit 0 == green.
 set -u
+
+# DIVE-2211: name the tree this harness grades (tests/lib/grading_tree.sh).
+. "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 ENGINE="$ROOT/src/council/engine.mjs"
 for b in node jq openssl; do

@@ -10,6 +10,9 @@
 # rejecting a mid-turn / dialog sample (so a busy agent can't false-read idle).
 # Run: bash tests/heartbeat_idle_marker_unit.sh  (no root, no network, no tmux).
 set -uo pipefail
+
+# DIVE-2211: name the tree this harness grades (tests/lib/grading_tree.sh).
+. "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh"
 cd "$(dirname "$0")/.."
 SRC=src
 

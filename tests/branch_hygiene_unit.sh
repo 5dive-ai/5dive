@@ -8,6 +8,9 @@ trap 'rm -rf "$TMP"' EXIT
 cat >"$TMP/gh" <<'MOCK'
 #!/usr/bin/env bash
 set -euo pipefail
+
+# DIVE-2211: name the tree this harness grades (tests/lib/grading_tree.sh).
+. "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh"
 args="$*"
 
 case "$args" in

@@ -25,6 +25,9 @@
 #
 # Offline: tmux/sudo/root are stubbed, frames are replayed from fixtures.
 set -euo pipefail
+
+# DIVE-2211: name the tree this harness grades (tests/lib/grading_tree.sh).
+. "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh"
 cd "$(dirname "$0")/.."
 
 # shellcheck disable=SC1091

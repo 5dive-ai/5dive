@@ -37,6 +37,9 @@
 # Pure: sources only the predicate, no tmux, no root, no network.
 #   bash tests/agent_send_credential_guard_unit.sh
 set -uo pipefail
+
+# DIVE-2211: name the tree this harness grades (tests/lib/grading_tree.sh).
+. "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh"
 cd "$(dirname "$0")/.."
 
 # Counter shape matches the rest of tests/ on purpose: tests/meta/harness-verdict-probe.sh

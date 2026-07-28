@@ -16,6 +16,9 @@
 # network calls and asserts the shipped bytes rather than a paraphrase of them.
 # sha256sum is the REAL one — the consistency check is genuinely exercised.
 set -uo pipefail
+
+# DIVE-2211: name the tree this harness grades (tests/lib/grading_tree.sh).
+. "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"; cd "$ROOT" || exit 1
 PASS=0; FAIL=0
 ok_t(){ PASS=$((PASS+1)); printf 'ok   - %s\n' "$1"; }

@@ -12,6 +12,9 @@
 # DIVE-1919 found and DIVE-1950 fixes for good via lazy getters.
 # Run: bash tests/gate_proof_lazy_resolve_unit.sh   (no root, no network).
 set -uo pipefail
+
+# DIVE-2211: name the tree this harness grades (tests/lib/grading_tree.sh).
+. "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh"
 cd "$(dirname "$0")/.."
 SRC=src
 OLD_STATE="$(mktemp -d /tmp/gate-proof-lazy-old.XXXXXX)"

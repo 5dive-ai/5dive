@@ -16,6 +16,9 @@
 # no-tag guarantee behaviourally instead of by its message.
 # Run: bash tests/version_assign_unit.sh
 set -uo pipefail
+
+# DIVE-2211: name the tree this harness grades (tests/lib/grading_tree.sh).
+. "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh"
 cd "$(dirname "$0")/.."
 REPO="$PWD"; S="$REPO/scripts/version-assign.sh"
 TMP="$(mktemp -d /tmp/version-assign-unit.XXXXXX)"; trap 'rm -rf "$TMP"' EXIT

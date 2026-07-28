@@ -18,6 +18,9 @@
 #
 #   bash tests/task_start_closed_unit.sh
 set -uo pipefail
+
+# DIVE-2211: name the tree this harness grades (tests/lib/grading_tree.sh).
+. "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh"
 SRC="${SRC:-src}"
 TMP="$(mktemp -d /tmp/task-start-closed.XXXXXX)"
 trap 'rm -rf "$TMP"' EXIT

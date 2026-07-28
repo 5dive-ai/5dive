@@ -4,6 +4,9 @@
 # OpenAI") was dropped (ToS-gray / inference-block prone), so init no longer
 # offers an oauth choice. No root/network needed.
 set -uo pipefail
+
+# DIVE-2211: name the tree this harness grades (tests/lib/grading_tree.sh).
+. "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh"
 cd "$(dirname "$0")/.."
 
 for f in src/header.sh src/lib/error_codes.sh src/lib/output.sh src/lib/validation.sh src/cmd_auth.sh; do

@@ -12,6 +12,9 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DRIVER="$(mktemp)"
 cat > "$DRIVER" <<DRV
 set -euo pipefail
+
+# DIVE-2211: name the tree this harness grades (tests/lib/grading_tree.sh).
+. "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh"
 # Pull in just the helper functions without running cmd_init.
 source "$ROOT/src/cmd_init.sh"
 export COLUMNS=80

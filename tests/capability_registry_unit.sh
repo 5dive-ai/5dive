@@ -7,6 +7,9 @@
 # so it is what this file spends most of its arms on.
 set -uo pipefail
 
+# DIVE-2211: name the tree this harness grades (tests/lib/grading_tree.sh).
+. "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh"
+
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 work=$(mktemp -d); trap 'rm -rf "$work"' EXIT
 STATE_DIR="$work/state"; mkdir -p "$STATE_DIR"

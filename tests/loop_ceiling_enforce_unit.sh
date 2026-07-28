@@ -4,6 +4,9 @@
 # fire-and-forget loop over its ceiling is caught. Isolated: throwaway STATE_DIR + a
 # synthetic ~/.claude transcript under a temp HOME. Never touches the live queue.
 set -uo pipefail
+
+# DIVE-2211: name the tree this harness grades (tests/lib/grading_tree.sh).
+. "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh"
 cd "$(dirname "$0")/.."
 SRC=src
 TMP="$(mktemp -d /tmp/loop-ceil-enforce.XXXXXX)"

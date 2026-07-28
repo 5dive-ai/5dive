@@ -41,6 +41,9 @@
 # The helpers are pure (stdin + temp files), so the whole frame sequence is
 # replayed offline — no tmux, no agent, no root, no network.
 set -euo pipefail
+
+# DIVE-2211: name the tree this harness grades (tests/lib/grading_tree.sh).
+. "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh"
 cd "$(dirname "$0")/.."
 
 # shellcheck disable=SC1091

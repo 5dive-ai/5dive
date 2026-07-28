@@ -8,6 +8,9 @@
 # definition stops being identical (comments/whitespace ignored).
 # Run: bash tests/schema_sync_unit.sh   (no root, no network).
 set -uo pipefail
+
+# DIVE-2211: name the tree this harness grades (tests/lib/grading_tree.sh).
+. "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh"
 cd "$(dirname "$0")/.."
 
 command -v python3 >/dev/null 2>&1 || { echo "skip - python3 not available"; exit 0; }

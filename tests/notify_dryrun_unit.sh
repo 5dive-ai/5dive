@@ -5,6 +5,9 @@
 # a curl trap proves no POST is ever attempted while FIVEDIVE_NOTIFY_DRYRUN is
 # set (a 2026-07-19 render test DM'd the real owner via the live token).
 set -uo pipefail
+
+# DIVE-2211: name the tree this harness grades (tests/lib/grading_tree.sh).
+. "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh"
 cd "$(dirname "$0")/.."
 SRC=src
 TMP=$(mktemp -d /tmp/notify-dryrun.XXXXXX)

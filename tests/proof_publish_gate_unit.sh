@@ -12,6 +12,9 @@
 #   - a human REJECT blocks.
 # Run: bash tests/proof_publish_gate_unit.sh   (no root, no network).
 set -uo pipefail
+
+# DIVE-2211: name the tree this harness grades (tests/lib/grading_tree.sh).
+. "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh"
 cd "$(dirname "$0")/.."
 
 command -v jq >/dev/null 2>&1 || { echo "SKIP - jq absent"; exit 0; }

@@ -24,6 +24,9 @@
 # loop that had stopped discriminating for an unrelated reason.
 # Run: bash tests/version_assign_push_unit.sh
 set -uo pipefail
+
+# DIVE-2211: name the tree this harness grades (tests/lib/grading_tree.sh).
+. "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh"
 cd "$(dirname "$0")/.."
 REPO="$PWD"
 CLS="$REPO/scripts/git-push-reject-class.sh"

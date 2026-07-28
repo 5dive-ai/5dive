@@ -30,6 +30,9 @@
 # so a real session cannot influence the result whoever runs it.
 # Run: bash tests/usage_dispatch_flag_unit.sh  (no sudo, no network).
 set -uo pipefail
+
+# DIVE-2211: name the tree this harness grades (tests/lib/grading_tree.sh).
+. "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh"
 cd "$(dirname "$0")/.."
 SRC=src
 

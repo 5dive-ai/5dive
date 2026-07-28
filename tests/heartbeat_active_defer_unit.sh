@@ -12,6 +12,9 @@
 # This asserts the counter's progress-reset + escalation semantics and the clear.
 # Run: bash tests/heartbeat_active_defer_unit.sh  (no root, no network, no tmux).
 set -uo pipefail
+
+# DIVE-2211: name the tree this harness grades (tests/lib/grading_tree.sh).
+. "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh"
 cd "$(dirname "$0")/.."
 SRC=src
 

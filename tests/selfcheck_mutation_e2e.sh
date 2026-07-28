@@ -17,6 +17,9 @@
 # live tree is never mutated — a harness that edits the source it is grading can
 # leave a box broken when it dies halfway.
 set -uo pipefail
+
+# DIVE-2211: name the tree this harness grades (tests/lib/grading_tree.sh).
+. "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh"
 cd "$(dirname "${BASH_SOURCE[0]}")/.." || exit 2
 REPO="$PWD"
 

@@ -4,6 +4,9 @@
 # *.mjs). All three are offline (COUNCIL_MOCK / mock adapters — no key, no network, no live
 # tasks.db). node is present on the CI runner (other harnesses shell it too).
 set -uo pipefail
+
+# DIVE-2211: name the tree this harness grades (tests/lib/grading_tree.sh).
+. "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"; cd "$ROOT"
 
 if ! command -v node >/dev/null 2>&1; then

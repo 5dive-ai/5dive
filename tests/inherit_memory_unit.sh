@@ -14,6 +14,9 @@
 #   4. _rebuild_inherited_index — regenerates a MEMORY.md index over the seed.
 # Run: bash tests/inherit_memory_unit.sh
 set -uo pipefail
+
+# DIVE-2211: name the tree this harness grades (tests/lib/grading_tree.sh).
+. "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh"
 cd "$(dirname "$0")/.."
 SRC=src
 

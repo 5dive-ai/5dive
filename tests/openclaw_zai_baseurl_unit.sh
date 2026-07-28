@@ -10,6 +10,9 @@
 # shells out to sudo + the real openclaw binary, so (as with the DIVE-1318/1819
 # sibling tests) we assert against the table values and the parsed function body.
 set -uo pipefail
+
+# DIVE-2211: name the tree this harness grades (tests/lib/grading_tree.sh).
+. "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh"
 cd "$(dirname "$0")/.."
 SRC=src
 for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh cmd_auth.sh cmd_agent_create.sh; do

@@ -21,6 +21,9 @@
 #            survives, and the two branches compute DIFFERENT spans
 # Run: bash tests/digest_window_30d_unit.sh  (no root, no network, no live DB).
 set -uo pipefail
+
+# DIVE-2211: name the tree this harness grades (tests/lib/grading_tree.sh).
+. "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh"
 cd "$(dirname "$0")/.."
 
 TMP="$(mktemp -d /tmp/digest-30d.XXXXXX)"

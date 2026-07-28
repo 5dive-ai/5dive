@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 # DIVE init: isolation-tier picker (no root/network needed — inspects cmd_init body).
 set -euo pipefail
+
+# DIVE-2211: name the tree this harness grades (tests/lib/grading_tree.sh).
+. "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck source=../src/cmd_init.sh
 source "$ROOT/src/cmd_init.sh"

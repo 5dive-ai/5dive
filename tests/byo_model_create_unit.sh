@@ -2,6 +2,9 @@
 # DIVE-1327: create-time BYO --model propagation for Claude + Hermes.
 # No root, network, credentials, users, or runtime state are touched.
 set -euo pipefail
+
+# DIVE-2211: name the tree this harness grades (tests/lib/grading_tree.sh).
+. "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh"
 cd "$(dirname "$0")/.."
 
 # shellcheck disable=SC1091

@@ -7,6 +7,9 @@
 #   - a worktree whose task is still in_progress
 #   - the worktree DIRECTORY itself, always, even when provably clean
 set -uo pipefail
+
+# DIVE-2211: name the tree this harness grades (tests/lib/grading_tree.sh).
+. "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh"
 cd "$(dirname "$0")/.."
 SRC=src
 TMP="$(mktemp -d /tmp/wt-reclaim-unit.XXXXXX)"

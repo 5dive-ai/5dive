@@ -14,6 +14,9 @@
 # must not grow a superseded marker.
 # Run: bash tests/task_reject_actor_and_closed_unit.sh
 set -uo pipefail
+
+# DIVE-2211: name the tree this harness grades (tests/lib/grading_tree.sh).
+. "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh"
 cd "$(dirname "$0")/.."
 SRC=src
 

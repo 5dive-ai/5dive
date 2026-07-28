@@ -14,6 +14,9 @@
 #     - metric flat for N cycles -> no_progress + objective PAUSED
 # Run: bash tests/objective_preflight_unit.sh
 set -uo pipefail
+
+# DIVE-2211: name the tree this harness grades (tests/lib/grading_tree.sh).
+. "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh"
 cd "$(dirname "$0")/.."
 SRC=src
 

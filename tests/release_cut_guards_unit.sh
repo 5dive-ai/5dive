@@ -15,6 +15,9 @@
 #       release page looks correct.
 # Neither is visible downstream, which is why they are asserted here.
 set -uo pipefail
+
+# DIVE-2211: name the tree this harness grades (tests/lib/grading_tree.sh).
+. "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh"
 cd "$(dirname "$0")/.."
 
 WF=.github/workflows/release-cut.yml

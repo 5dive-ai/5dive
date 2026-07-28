@@ -5,6 +5,9 @@
 # leaked: council_gate_e2e's `task need` DM'd fixture gates (dive1-4) to lodar because the DB was
 # isolated but the send path was not. The guard is a POSITIVE prod-DB allowlist (blocklists rot).
 set -uo pipefail
+
+# DIVE-2211: name the tree this harness grades (tests/lib/grading_tree.sh).
+. "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh"
 cd "$(dirname "$0")/.."
 SRC=src
 TMP=$(mktemp -d /tmp/fixture-guard.XXXXXX)

@@ -5,6 +5,9 @@
 # over piped stdin (its dumb-terminal numbered branch), so it gates in CI with no
 # TTY, no root, and no gate-proof key. Exit 0 == green.
 set -u
+
+# DIVE-2211: name the tree this harness grades (tests/lib/grading_tree.sh).
+. "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
 # The wizard + its UI helpers are plain function defs — source them directly.

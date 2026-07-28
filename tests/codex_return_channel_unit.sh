@@ -9,6 +9,9 @@
 # preseed_codex_return_channel with the filesystem primitives stubbed to a temp
 # HOME. The real ownership/perms plumbing is covered by the create-path smoke test.
 set -euo pipefail
+
+# DIVE-2211: name the tree this harness grades (tests/lib/grading_tree.sh).
+. "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh"
 cd "$(dirname "$0")/.."
 
 # shellcheck disable=SC1091

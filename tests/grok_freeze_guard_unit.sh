@@ -6,6 +6,9 @@
 # (2) functional behaviour of the refuse/override condition against the built
 # `5dive` binary.
 set -uo pipefail
+
+# DIVE-2211: name the tree this harness grades (tests/lib/grading_tree.sh).
+. "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh"
 cd "$(dirname "$0")/.." || exit 1
 SRC="src/cmd_agent_create.sh"
 BIN="./5dive"

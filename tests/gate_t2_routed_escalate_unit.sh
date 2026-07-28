@@ -13,6 +13,9 @@
 # NON-routed tier-2 gate is unchanged (already got its human button at filing → still
 # refused). Isolation matches the sibling harnesses. Run: bash tests/gate_t2_routed_escalate_unit.sh
 set -uo pipefail
+
+# DIVE-2211: name the tree this harness grades (tests/lib/grading_tree.sh).
+. "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh"
 cd "$(dirname "$0")/.."
 SRC=src
 TMP="$(mktemp -d /tmp/gate-t2-routed-escalate-unit.XXXXXX)"

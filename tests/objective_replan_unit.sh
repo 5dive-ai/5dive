@@ -14,6 +14,9 @@
 #   - stop-conditions: paused / target-reached / budget-exhausted are terminal
 # Run: bash tests/objective_replan_unit.sh  (no root, no network).
 set -uo pipefail
+
+# DIVE-2211: name the tree this harness grades (tests/lib/grading_tree.sh).
+. "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh"
 cd "$(dirname "$0")/.."
 SRC=src
 

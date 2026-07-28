@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 # DIVE-1261: installer bundle checksum (build emit + install verify logic).
 set -uo pipefail
+
+# DIVE-2211: name the tree this harness grades (tests/lib/grading_tree.sh).
+. "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"; cd "$ROOT"
 PASS=0; FAIL=0
 ok_t(){ PASS=$((PASS+1)); printf 'ok   - %s\n' "$1"; }

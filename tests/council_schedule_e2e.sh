@@ -14,6 +14,9 @@
 # dispatch. Builds a throwaway ./5dive (BUILD_OUT) so it GATES in CI; SKIPs green if it can't
 # build or node/jq are missing. Exit 0 == green.
 set -u
+
+# DIVE-2211: name the tree this harness grades (tests/lib/grading_tree.sh).
+. "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 for b in node jq; do
   command -v "$b" >/dev/null 2>&1 || { echo "SKIP: $b not on PATH (council schedule e2e needs it)"; exit 0; }

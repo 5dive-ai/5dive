@@ -5,6 +5,9 @@
 # fix reads the JSON body: on the unreachable-bot case it emits an open-your-bot
 # nudge and returns 3; a real send returns 0; any other API error returns 1.
 set -uo pipefail
+
+# DIVE-2211: name the tree this harness grades (tests/lib/grading_tree.sh).
+. "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh"
 cd "$(dirname "$0")/.."
 SRC=src
 TMP=$(mktemp -d /tmp/welcome-403.XXXXXX)

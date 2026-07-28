@@ -18,6 +18,9 @@
 # Isolated: temp sqlite store, no prod DB, no root, no network.
 #   bash tests/policy_refusals_unit.sh
 set -uo pipefail
+
+# DIVE-2211: name the tree this harness grades (tests/lib/grading_tree.sh).
+. "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh"
 cd "$(dirname "$0")/.."
 
 TMP="$(mktemp -d /tmp/policy-refusals.XXXXXX)"

@@ -14,6 +14,9 @@
 # this whole iteration exists to fix — and a live seat was spent discovering it.
 # So: stub the world, run the real cmd_ask, assert the string it prints.
 set -euo pipefail
+
+# DIVE-2211: name the tree this harness grades (tests/lib/grading_tree.sh).
+. "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh"
 cd "$(dirname "$0")/.."
 
 # shellcheck disable=SC1091

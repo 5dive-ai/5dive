@@ -16,6 +16,9 @@
 # network. chown root:claude fails as non-root and is (correctly) non-fatal — the
 # chmods still run because we run under `set +e`. Run: bash tests/gate_notify_log_observable_unit.sh
 set -uo pipefail
+
+# DIVE-2211: name the tree this harness grades (tests/lib/grading_tree.sh).
+. "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh"
 cd "$(dirname "$0")/.."
 SRC=src
 TMP="$(mktemp -d /tmp/gate-notify-log-unit.XXXXXX)"

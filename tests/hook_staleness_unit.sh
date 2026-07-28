@@ -6,6 +6,9 @@
 # reimplementation drifts in exactly the way the thing you are catching drifts.
 # Run: bash tests/hook_staleness_unit.sh
 set -uo pipefail
+
+# DIVE-2211: name the tree this harness grades (tests/lib/grading_tree.sh).
+. "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh"
 cd "$(dirname "$0")/.."
 CHECK="$PWD/scripts/hook-staleness-check.sh"
 TMP="$(mktemp -d /tmp/hook-staleness-unit.XXXXXX)"; trap 'rm -rf "$TMP"' EXIT

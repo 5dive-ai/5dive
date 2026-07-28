@@ -27,6 +27,9 @@
 # tree is never written to, so this is safe under CI and safe to run dirty.
 # Run: bash tests/digest_window_30d_controls.sh   (no root, no network.)
 set -uo pipefail
+
+# DIVE-2211: name the tree this harness grades (tests/lib/grading_tree.sh).
+. "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh"
 cd "$(dirname "$0")/.."
 REPO="$PWD"
 

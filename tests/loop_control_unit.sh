@@ -7,6 +7,9 @@
 # (memory reference_5dive_cli_smoke_hits_live_taskdb).
 # Run: bash tests/loop_control_unit.sh  (no root, no network).
 set -uo pipefail
+
+# DIVE-2211: name the tree this harness grades (tests/lib/grading_tree.sh).
+. "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh"
 cd "$(dirname "$0")/.."
 SRC=src
 TMP="$(mktemp -d /tmp/loop-control-unit.XXXXXX)"

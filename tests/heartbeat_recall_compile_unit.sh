@@ -10,6 +10,9 @@
 # heading, and degrades to empty (never errors) on no-query / no-store.
 # Run: bash tests/heartbeat_recall_compile_unit.sh  (no root, no network).
 set -uo pipefail
+
+# DIVE-2211: name the tree this harness grades (tests/lib/grading_tree.sh).
+. "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh"
 cd "$(dirname "$0")/.."
 SRC=src
 

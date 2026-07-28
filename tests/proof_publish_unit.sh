@@ -9,6 +9,9 @@
 #   - cumulative totals sum the non-overlapping 24h datapoints across days.
 # Run: bash tests/proof_publish_unit.sh   (no root, no network).
 set -uo pipefail
+
+# DIVE-2211: name the tree this harness grades (tests/lib/grading_tree.sh).
+. "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh"
 cd "$(dirname "$0")/.."
 
 TMP="$(mktemp -d /tmp/proof-publish.XXXXXX)"

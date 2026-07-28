@@ -9,6 +9,9 @@
 # (root). Re-execs under passwordless sudo when available; SKIPs (green) otherwise — same posture
 # as council_gate_e2e.sh, so CI never reds on a runner that can't init. Offline.
 set -uo pipefail
+
+# DIVE-2211: name the tree this harness grades (tests/lib/grading_tree.sh).
+. "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"; cd "$ROOT"
 FIVE="$ROOT/5dive"
 

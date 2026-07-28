@@ -3,6 +3,9 @@
 # REAL on-disk Ed25519 keys and proves: keys are 0600 owner-only, the honest path verifies green,
 # and forged / cross-convene-replay / revoked-key votes are all rejected (non-zero exit). Exit 0 == green.
 set -u
+
+# DIVE-2211: name the tree this harness grades (tests/lib/grading_tree.sh).
+. "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh"
 ENGINE="$(cd "$(dirname "$0")/.." && pwd)/src/council/engine.mjs"
 CLI="$(cd "$(dirname "$0")/.." && pwd)/src/council/cli.mjs"
 TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT

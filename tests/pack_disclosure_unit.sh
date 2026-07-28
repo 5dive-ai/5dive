@@ -9,6 +9,9 @@
 #      hooks unless --allow-hooks was passed.
 # Run: bash tests/pack_disclosure_unit.sh
 set -uo pipefail
+
+# DIVE-2211: name the tree this harness grades (tests/lib/grading_tree.sh).
+. "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh"
 cd "$(dirname "$0")/.."
 SRC=src
 
