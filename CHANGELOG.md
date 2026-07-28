@@ -1,5 +1,34 @@
 # Changelog
 
+## Unreleased — feat(digest): a 30-day window, with the aggregates it does NOT scope named out loud (DIVE-1921)
+
+`digest` offered only `--7d`, so `proof scorecard` (specified as `[--7d|--30d]` in DIVE-1914)
+shipped 7d-only and refused `--30d` outright. The value is not the flag: a 7-day window is why
+the scorecard's median recovery time rested on ONE episode and its precedent acceptance on n=2.
+On the live store the 30d window takes those to 2 episodes and the verifier first-pass rate to
+n=335 graded.
+
+Widening is not uniform, so each aggregate was classified before it moved:
+
+- **Sums** (`done`, `zeroHuman.*`, `autoCleared`, `stuck.episodes`) and **rates**
+  (`precedentPrefill.acceptanceRate`, `stuck.mttuSec`) scale with the window, as intended.
+- **Point readings** (`usage`, `loops`, `health`, `inProgress`, `blocked`, `stuck.openStuck`,
+  `autonomy.uptimeDays`, the objectives' `current`/`inflight`) do NOT. `usage` is the collector's
+  own rolling 5h/7d read and `loops` is every loop ever, so under a "last 30 days" header they
+  read as 30 days of tokens. They are now named in a `pointInTime` map in the JSON and captioned
+  in the text.
+- **`window.label` was a `>=` ladder** (`"7 days" if window >= 604800`), so any window wider than
+  a week rendered under a "last 7 days" header. It is now derived from the window.
+- **`autonomy.priorWindowComplete`** is new. The trend compares against the preceding window, so
+  a 30d reading reaches 60 days back. The live store does not go that far, which rendered as
+  `↑595 vs 0 prior 30 days` — growth from zero, on a span that simply has no data. The flag makes
+  the text say so.
+
+`proof scorecard --30d` is unblocked and its window now moves as one unit: the digest sub-call,
+all nine SQL spans and the token read derive from a single mapping, because a site left at 7 days
+would not render as a wrong window but as a plausible rate whose numerator and denominator were
+measured over different spans.
+
 ## Unreleased — fix(gate): a gate escalates from the agent that FILED it, not from whoever created the task (DIVE-1945)
 
 `task gate-escalate` derived the gate's filer as `COALESCE(created_by, assignee)`. Those agree
