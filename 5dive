@@ -26,7 +26,7 @@ esac
 
 # Bumped on every public release. `build.sh` checks this line exists; CI fails
 # the bundle-drift check if it's missing or empty.
-readonly FIVE_VERSION="0.16.33"
+readonly FIVE_VERSION="0.16.36"
 
 # GitHub org our repos live under. The org is being renamed
 # 5dive-com -> 5dive-ai (2026-06); fetches must work on either side of the
@@ -3590,6 +3590,135 @@ registry_read() {
   [[ -f "$REGISTRY" ]] && cat "$REGISTRY" || echo '{"agents":{}}'
 }
 
+# registry_read() deliberately collapses "no registry yet" onto an empty-but-valid
+# body so every read site can `jq` it without a guard. That is fine for callers
+# who only want a value, and WRONG for callers who need to know whether the read
+# happened at all: a permission failure, a truncated file and a genuinely empty
+# fleet all come back as `{"agents":{}}`, indistinguishable.
+#
+# This is the checked variant. It never invents a body. Exit codes:
+#   0  JSON on stdout
+#   3  no registry file
+#   4  file present but unreadable (perms, I/O)
+#   5  file read but not parseable as JSON (truncation, partial write)
+registry_read_checked() {
+  [[ -e "$REGISTRY" ]] || return 3
+  local body
+  body="$(cat "$REGISTRY" 2>/dev/null)" || return 4
+  printf '%s' "$body" | jq -e . >/dev/null 2>&1 || return 5
+  printf '%s\n' "$body"
+}
+
+# DIVE-1064 stamped the sender's isolation tier into the inter-agent envelope.
+# DIVE-2210 is about what that stamp does when it CANNOT be established.
+#
+# tier= is the one unforgeable field in `[5dive-msg ...]`: from= is caller-supplied
+# and only format-validated, so tier= is the field that actually catches a
+# cross-tier peer. Every site stamped it as `[[ -n "$t" ]] && header+=" tier=$t"`
+# over a lookup whose stderr went to /dev/null — so a missing sudo caller, an
+# unreadable registry, malformed JSON and a genuinely untiered sender ALL rendered
+# as the field simply not being there. A receiver could not tell "not measured"
+# from "measured, nothing to report". That is a fail-open on the only real control,
+# and the same not-reached-vs-pass collapse as the v0.16 selfcheck work.
+#
+# So this never returns empty. A tier we could not establish is stamped
+# `unknown:<reason>`, which is a value, is obviously not a tier, and says why.
+# Callers append it UNCONDITIONALLY — absence of tier= now means "sent by a build
+# that predates this", not "sender has no tier".
+envelope_tier() {
+  local caller="${1:-}"
+  [[ -n "$caller" ]] || { printf 'unknown:no-caller\n'; return 0; }
+  local body rc=0
+  body="$(registry_read_checked)" || rc=$?
+  case "$rc" in
+    0) : ;;
+    3) printf 'unknown:no-registry\n';          return 0 ;;
+    5) printf 'unknown:registry-unparsable\n';  return 0 ;;
+    *) printf 'unknown:registry-unreadable\n';  return 0 ;;
+  esac
+  local t=""
+  t="$(printf '%s' "$body" | jq -r --arg n "$caller" '.agents[$n].isolation // empty' 2>/dev/null)" \
+    || { printf 'unknown:lookup-failed\n'; return 0; }
+  [[ -n "$t" ]] || { printf 'unknown:unregistered\n'; return 0; }
+  # The value lands in a SPACE-DELIMITED header. A tier carrying a space would
+  # forge additional envelope fields, so anything that is not a bare token is
+  # reported as unusable rather than pasted through.
+  [[ "$t" =~ ^[a-z][a-z0-9_-]{0,31}$ ]] || { printf 'unknown:malformed-tier\n'; return 0; }
+  printf '%s\n' "$t"
+}
+
+# ---------------------------------------------------------------------------
+# DIVE-2213: the SAME not-measured-vs-measured-absent collapse as DIVE-2210, but
+# at a DECISION site (the heartbeat's privilege-escalation-by-queue guard) rather
+# than a display one. envelope_tier() above is deliberately left byte-for-byte
+# alone -- its output is a shipped, verified WIRE FORMAT -- so the finer
+# partition a decision needs lives here instead.
+#
+# The distinction envelope_tier() cannot make, and does not need to: it reports
+# `unknown:unregistered` for BOTH
+#   (a) the name is not a key under .agents at all -- a human, or an external
+#       filer. That is a MEASUREMENT: this creator correctly has no tier, and
+#       every task lodar files takes this path.
+#   (b) the agent IS registered but its .isolation is missing/null -- NOT
+#       measured. A hole.
+# tests/envelope_tier_provenance_unit.sh asserts (a) and (b) collide, on purpose.
+# A guard deciding whether to trust a creator must not treat them the same: hold
+# on (a) and the fleet stops running human-filed work; fall through on (b) and an
+# untiered agent is permanently exempt from the guard.
+#
+# Reasons (never empty, and a failure is never a bare tier):
+#   unknown:no-caller            no name supplied
+#   unknown:no-registry          registry file absent
+#   unknown:registry-unreadable  present, could not be read
+#   unknown:registry-unparsable  present, read, not JSON
+#   unknown:no-agents-map        parsed, but .agents is not an object
+#   unknown:lookup-failed        jq errored on a body that parsed
+#   unknown:unregistered         name is NOT under .agents        (MEASURED)
+#   unknown:no-tier              key present, isolation absent    (not measured)
+#   unknown:malformed-tier       isolation present, not a bare token
+agent_tier() {
+  local who="${1:-}"
+  [[ -n "$who" ]] || { printf 'unknown:no-caller\n'; return 0; }
+  local body rc=0
+  body="$(registry_read_checked)" || rc=$?
+  case "$rc" in
+    0) : ;;
+    3) printf 'unknown:no-registry\n';          return 0 ;;
+    5) printf 'unknown:registry-unparsable\n';  return 0 ;;
+    *) printf 'unknown:registry-unreadable\n';  return 0 ;;
+  esac
+  local present
+  present="$(printf '%s' "$body" | jq -r --arg n "$who" \
+    'if (.agents|type) != "object" then "no-map" elif (.agents|has($n)) then "y" else "n" end' 2>/dev/null)" \
+    || { printf 'unknown:lookup-failed\n'; return 0; }
+  case "$present" in
+    y)      : ;;
+    n)      printf 'unknown:unregistered\n';  return 0 ;;
+    no-map) printf 'unknown:no-agents-map\n'; return 0 ;;
+    *)      printf 'unknown:lookup-failed\n'; return 0 ;;
+  esac
+  local t
+  t="$(printf '%s' "$body" | jq -r --arg n "$who" '.agents[$n].isolation // empty' 2>/dev/null)" \
+    || { printf 'unknown:lookup-failed\n'; return 0; }
+  [[ -n "$t" ]] || { printf 'unknown:no-tier\n'; return 0; }
+  # Same injection rule as envelope_tier(): a tier is a bare token or it is
+  # unusable. A decision site must never rank a value it could not validate.
+  [[ "$t" =~ ^[a-z][a-z0-9_-]{0,31}$ ]] || { printf 'unknown:malformed-tier\n'; return 0; }
+  printf '%s\n' "$t"
+}
+
+# True when a tier string means "we could not measure it". Every unknown:* EXCEPT
+# unregistered, which IS a measurement (this name is not an agent). This is the
+# one predicate that separates the two halves of the old rank-0 bucket -- keep the
+# polarity here and callers cannot re-collapse them by writing `unknown:*`.
+tier_unmeasured() {
+  case "$1" in
+    unknown:unregistered) return 1 ;;
+    unknown:*)            return 0 ;;
+    *)                    return 1 ;;
+  esac
+}
+
 registry_write() {
   # stdin -> registry, atomic
   local tmp
@@ -3828,9 +3957,17 @@ CREATE TABLE IF NOT EXISTS tasks (
   -- migration-free throttle stamp; failed/unconfirmed sends leave it unchanged.
   -- wake_at: a parked task
   -- (task park --wake=...) auto-unparks when the heartbeat passes this time.
+  -- DIVE-1945: gate_filed_by = the ACTOR who filed THIS gate, stamped by
+  -- cmd_task_need. Not derivable from the row: created_by is the task's author
+  -- and assignee is rewritten to the filer only on the human lane, so a gate one
+  -- agent files on another's task had no record of whose ask it is. The
+  -- escalation chain is walked from the FILER (gate-escalate, T1 re-nag routing);
+  -- created_by stays the right key for the T2 re-nag, which batches by the
+  -- channel OWNER. NULL on legacy gates -> callers COALESCE back to created_by.
   tier                INTEGER,
   need_asked_at       TEXT,
   gate_pinged_at      TEXT,
+  gate_filed_by       TEXT,
   wake_at             TEXT,
   -- DIVE-931 secure credential drop: a --type=secret gate can name WHERE the
   -- value should land — secret_key is the env-var name, connector the
@@ -4369,6 +4506,7 @@ _tasks_db_migrate() {
            'iteration INTEGER' 'maker_agent TEXT' 'handoff_ack_at TEXT' 'task_budget TEXT' \
            'handoff_delivered_at TEXT' 'handoff_stale_pinged_at TEXT' \
            'tier INTEGER' 'need_asked_at TEXT' 'gate_pinged_at TEXT' 'wake_at TEXT' \
+           'gate_filed_by TEXT' \
            'secret_key TEXT' 'connector TEXT' 'human_nonce_hash TEXT' \
            'ask_shape TEXT' 'precedent_ref INTEGER' 'precedent_kind TEXT' \
            'shipped_flag_at TEXT' 'routed_reviewer TEXT' \
@@ -14995,16 +15133,18 @@ cmd_deliver() {
   # Sender + tier from the real sudo caller (agent-X -> X). A non-agent caller
   # (direct root / human) records as "human"; tier is empty unless the sender is
   # a registered agent. Mirrors auto_sender_from_sudo + the DIVE-1064 tier stamp.
-  local s="${SUDO_USER#agent-}"
-  [[ "${SUDO_USER:-}" == agent-* ]] || s="human"
-  local tier=""
-  tier="$(registry_read | jq -r --arg n "$s" '.agents[$n].isolation // empty' 2>/dev/null)"
+  local s="${SUDO_USER#agent-}" _caller=""
+  if [[ "${SUDO_USER:-}" == agent-* ]]; then _caller="$s"; else s="human"; fi
+  # DIVE-2210: ALWAYS stamped, never conditional. A non-agent caller gets
+  # tier=unknown:no-caller rather than a clean envelope with the field missing.
+  local tier
+  tier="$(envelope_tier "$_caller")"
 
   # Provenance envelope, mirroring cmd_send's [5dive-msg ...] header format.
   # Field order matches cmd_send: from, id, tier.
   local header="[5dive-msg from=${s}"
   [[ -n "$msgid" ]] && header+=" id=${msgid}"
-  [[ -n "$tier" ]] && header+=" tier=${tier}"
+  header+=" tier=${tier}"
   header+="]"
   local payload="${header} ${message}"
 
@@ -15070,9 +15210,64 @@ cmd_capture() {
 
   local capture
   capture=$(sudo -u "agent-${target}" tmux capture-pane -t "agent-${target}" -p -S "-${buf_lines}" 2>/dev/null) || true
+
+  # DIVE-1931: fold this frame into a transcript BEFORE slicing, so the marker
+  # survives scroll-off.
+  #
+  # `-S` is not a window we can rely on: a full-screen TUI is an alternate-screen
+  # pane, whose scrollback is per-harness and often absent (DIVE-1901), so this
+  # capture is frequently just the ~24 visible lines. A single point-in-time read
+  # therefore loses the `id=<after-id>` line the moment a long reply pushes it off
+  # screen — and with the anchor gone the awk below matches nothing and returns
+  # EMPTY while the seat has answered. The direct path already solves this by
+  # accumulating frames; the caller cannot do that here because the slice happens
+  # on the far side of the sudo boundary and empty is all it ever sees.
+  #
+  # So the accumulation moves in here, and the bound stays privileged-side —
+  # which is the point. This does NOT widen the read surface: the output is still
+  # only "after MY marker, before the next [5dive-msg", and every line in the
+  # transcript is a line this same caller was already handed by an earlier
+  # `_capture` in its own poll loop. Folding frames is something the caller could
+  # have done itself with the returns it already had; doing it here is what lets
+  # the SLICE still be applied to them. What a caller cannot get remains exactly
+  # what it could not get before: anything preceding its own marker (the awk only
+  # starts printing after it), anything past the next message boundary, and any
+  # window whose id it did not mint (gen_msg_id is 4-byte urandom).
+  #
+  # Keyed by (caller uid, target, marker) so concurrent asks — a convene fans out
+  # ballots in parallel — never share a transcript, and one caller cannot feed
+  # frames into another's. Root-owned and owner-only: the transcript itself is
+  # never emitted, only the slice of it. (Under /var/lib/5dive, which is 2750,
+  # the dir inherits the setgid bit and reads 2700 — group and other still have
+  # no bits, which is the property that matters.)
+  local acc_dir="${FIVE_CAPTURE_ACC_DIR:-/var/lib/5dive/capture-acc}"
+  local uid_key="${SUDO_UID:-0}"
+  # SUDO_UID is only meaningful because we are EUID 0 here (require_root above);
+  # validate anyway so the key can never be anything but a filename component.
+  [[ "$uid_key" =~ ^[0-9]{1,10}$ ]] || uid_key="0"
+  local acc_file=""
+  if mkdir -p "$acc_dir" 2>/dev/null && chmod 700 "$acc_dir" 2>/dev/null; then
+    # Bound the store: a transcript outlives at most one ask (`--timeout` is
+    # minutes), so anything untouched for an hour is abandoned. Without this the
+    # dir grows one file per ask, forever.
+    find "$acc_dir" -maxdepth 1 -type f -mmin +60 -delete 2>/dev/null || true
+    acc_file="${acc_dir}/${uid_key}.${target}.${after_id}"
+    if : >> "$acc_file" 2>/dev/null; then
+      chmod 600 "$acc_file" 2>/dev/null || true
+    else
+      acc_file=""
+    fi
+  fi
+  # Fail OPEN to the old single-frame behaviour if the store is unavailable: a
+  # read-only /var/lib must degrade `ask` to the pre-DIVE-1931 capture, not
+  # break it.
+  if [[ -n "$acc_file" ]]; then
+    capture=$(_ask_accumulate "$acc_file" <<<"$capture")
+  fi
+
   # Slice: lines AFTER the first line containing id=<after-id>, stopping BEFORE
   # the next [5dive-msg marker (bounds the read to a single reply window). Empty
-  # output if the marker isn't present yet — the caller (`ask`) polls until the
+  # output if the marker has not been seen yet — the caller (`ask`) polls until the
   # reply appears and stabilises.
   awk -v id="id=${after_id}" '
     found && index($0, "[5dive-msg") { exit }
@@ -15246,13 +15441,17 @@ cmd_send() {
       msg_id="$(gen_msg_id)"
       # DIVE-1064: stamp the sender's isolation tier so a receiver can down-trust
       # a lower-privilege peer. Derived from the REAL sudo caller (not the
-      # spoofable --from label), so it holds even if from= is forged. Omitted
-      # when there's no agent caller (human/root) or no recorded tier.
+      # spoofable --from label), so it holds even if from= is forged.
+      # DIVE-2210: and stamped UNCONDITIONALLY. This is the exact fail-open the
+      # ticket is about — `--from=community` with no sudo caller used to render
+      # `[5dive-msg from=community id=...]`, byte-identical to a legitimate
+      # untiered send, so the forgeable field survived and the unforgeable one
+      # silently vanished. Now it reads tier=unknown:no-caller.
       local _caller _tier=""
       _caller="$(auto_sender_from_sudo)"
-      [[ -n "$_caller" ]] && _tier="$(registry_read | jq -r --arg n "$_caller" '.agents[$n].isolation // empty' 2>/dev/null)"
+      _tier="$(envelope_tier "$_caller")"
       local header="[5dive-msg from=${sender} id=${msg_id}"
-      [[ -n "$_tier" ]] && header+=" tier=${_tier}"
+      header+=" tier=${_tier}"
       [[ -n "$reply_to_chat" ]] && header+=" reply-to-chat=${reply_to_chat}"
       [[ -n "$reply_to_msg" ]] && header+=" reply-to-msg=${reply_to_msg}"
       header+="]"
@@ -15424,7 +15623,12 @@ cmd_ask() {
     require_agent "$name"
     sudo -u "agent-${name}" tmux has-session -t "agent-${name}" 2>/dev/null \
       || fail "$E_NOT_RUNNING" "tmux session 'agent-${name}' not found (is the agent running?)"
-    local header="[5dive-msg from=${sender} id=${msg_id}"
+    # DIVE-2210: `ask`'s direct-inject path carried NO tier field at all — it was
+    # never added when DIVE-1064 stamped `send` and `_deliver`. An envelope with
+    # no tier= is exactly the ambiguity this ticket closes, so `ask` now stamps
+    # the same field from the same resolver. (The scoped branch above already
+    # inherits it: `_deliver` builds that envelope.)
+    local header="[5dive-msg from=${sender} id=${msg_id} tier=$(envelope_tier "$(auto_sender_from_sudo)")"
     [[ -n "$reply_to_chat" ]] && header+=" reply-to-chat=${reply_to_chat}"
     [[ -n "$reply_to_msg" ]] && header+=" reply-to-msg=${reply_to_msg}"
     header+="]"
@@ -15456,12 +15660,12 @@ cmd_ask() {
     if (( use_scoped )); then
       # Scoped bounded read: _capture returns ONLY our reply window, already
       # sliced (after our marker, up to the next marker). sudo -n = fail-closed.
-      # NB (DIVE-1901): _capture still reads a single point-in-time window, so
-      # the scroll-off failure below is only PARTIALLY mitigated on this path —
-      # we accumulate what it returns, but once the marker leaves the pane
-      # _capture itself returns empty. Fixing that means moving the slice out of
-      # the privileged read, which changes the _deliver/_capture surface, so it
-      # is filed as DIVE-1931 rather than widened here.
+      # DIVE-1931: _capture now accumulates frames on ITS side of the boundary
+      # before slicing, so the marker survives scroll-off here exactly as it does
+      # on the direct path — the window it returns is cumulative, not a single
+      # point-in-time read. The fold below is kept because folding a superset of
+      # what we already hold is idempotent, and it keeps acc_file populated for
+      # the timeout diagnostics and the forensic dump.
       slice=$(sudo -n /usr/local/bin/5dive agent _capture "$name" --after-id="$msg_id" --buffer-lines="$buf_lines" 2>/dev/null) || true
       slice=$(_ask_accumulate "$acc_file" <<<"$slice")
       # Already sliced privileged-side, so re-slicing at the marker is off — but
@@ -19957,12 +20161,33 @@ cmd_task_show() {
     dbfmt -line "SELECT ident, title, status, priority, assignee, created_by, parent_id, created_at, started_at, done_at, body, result FROM tasks WHERE id=${id};"
     # DIVE-1064: surface the creator's isolation tier (read-time from the
     # registry, no schema change) so a reader/agent can down-trust a task filed
-    # by a lower-privilege peer. Shown only when the creator is a known agent.
+    # by a lower-privilege peer.
+    #
+    # DIVE-2213: this used to print the line ONLY when the lookup came back
+    # non-empty, over a lookup whose stderr went to /dev/null — so an unreadable
+    # registry, a jq failure and a creator who genuinely has no tier all rendered
+    # as the line simply not being there, and a reader could not tell "no tier"
+    # from "not measured". Third instance of the DIVE-2210 shape (display-only;
+    # the decision-site instance is cmd_heartbeat.sh's DIVE-1065 guard).
+    #
+    # The line is now ALWAYS printed, in three distinguishable states. That
+    # changes `task show`'s human output shape for every task; checked first —
+    # origin/main across 5dive-cli / api / app / plugins / mcp has no consumer of
+    # this line other than the site emitting it, and the machine path is the
+    # --json branch above, which never carried it.
     local _cb _ctier=""
     _cb=$(db "SELECT COALESCE(created_by,'') FROM tasks WHERE id=${id};")
-    [[ -n "$_cb" ]] && _ctier="$(registry_read | jq -r --arg n "$_cb" '.agents[$n].isolation // empty' 2>/dev/null)"
-    [[ -n "$_ctier" ]] && printf 'created_by_tier = %s
-' "$_ctier"
+    _ctier="$(agent_tier "$_cb")"
+    case "$_ctier" in
+      unknown:no-caller)    printf 'created_by_tier = none (no creator recorded)
+' ;;
+      unknown:unregistered) printf 'created_by_tier = none (creator is not a registered agent)
+' ;;
+      unknown:*)            printf 'created_by_tier = %s (NOT measured)
+' "$_ctier" ;;
+      *)                    printf 'created_by_tier = %s
+' "$_ctier" ;;
+    esac
     # Human gate (only when set) — mirrors the conditional subtasks/blockers
     # blocks below so an ordinary task's `show` stays clean.
     local gate
@@ -20378,11 +20603,39 @@ _gate_slug_from_url() {
     | head -1 | sed -E 's#^(https://github\.com/|git@github\.com:)##; s#\.git$##' || true
 }
 
-# _gate_task_repo_slug <delivery_ref> <body> — the repo THIS TASK declared, or empty.
+# _gate_task_repo_slug <delivery_ref> <body> — the repo THIS TASK DECLARED, or empty.
 # Precedence: the delivery_ref URL (a delivered PR carries its own repo, which is why
 # ask 1 says prefer it) > an explicit `Repo: owner/repo` body line, the sibling of the
-# DIVE-1462 `Branch:` line > any github URL sitting in the body. Empty means unknown,
-# and unknown must stay unknown — it is never quietly filled in with a default.
+# DIVE-1462 `Branch:` line. Empty means unknown, and unknown must stay unknown — it is
+# never quietly filled in with a default.
+#
+# DIVE-1963: there was a THIRD fallback — any github URL sitting anywhere in the body —
+# and it read a URL that happened to be MENTIONED as a declaration of where this task's
+# work lives. DIVE-1955's own close is the specimen: its body QUOTES the constant it is
+# about (`_PUSH_DEFAULT_REPO="https://github.com/5dive-ai/5dive.git"`), so the gate
+# bound every bare `#N` to the CLI repo and never looked in api or frontend at all. The
+# ticket describing an implicit repo standing in for a missing one triggered a narrower
+# version of itself, sourced from prose instead of from a constant.
+#
+# Deleting it CANNOT lose coverage, which is why this is a deletion and not a widening:
+# with no declared repo a bare `#N` goes through the DIVE-1955 existence-count sweep,
+# which searches EVERY known repo — strictly a superset of the single repo the
+# inference picked. What it does delete is the sharper half. "The inferred repo misses"
+# is only one of the two cases; when the inferred repo HAS a `#N`, the old path handed
+# back a confident verdict about a pull request nobody claimed, which is the
+# "wrong, not blind" failure DIVE-1955 exists to remove. So the fix is NOT "sweep when
+# the inference misses" — that leaves the dangerous half untouched. Same rule DIVE-1965
+# settled one layer up: a binding comes from a STRUCTURED, INTENTIONAL signal, never
+# from "a URL appeared in the text". Prose is evidence of discussion, not declaration.
+#
+# The superset is over the CONFIGURED repo set, not over all of GitHub (Marcus, review):
+# `_gate_repo_slugs` is the world, and it is `FIVE_GATE_REPOS` when that is exported.
+# Unset — the default on every box — it is the three real repos, which is what makes the
+# claim hold in practice, and tests/task_merge_gate_inferred_repo_unit.sh pins that
+# default with the env cleared rather than leaving it asserted in prose. A box that
+# exports a NARROWER list narrows the sweep too, and there the deleted inference could
+# have named a repo outside the configured world — but a binding that reaches outside
+# the set the operator configured is its own defect, not coverage worth keeping.
 _gate_task_repo_slug() {
   local dref="$1" body="$2" s=""
   if [[ -n "$dref" ]]; then
@@ -20396,7 +20649,35 @@ _gate_task_repo_slug() {
     [[ -z "$s" && "$line" =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$ ]] && s="${line%.git}"
     [[ -n "$s" ]] && { printf '%s' "$s"; return 0; }
   fi
-  _gate_slug_from_url "$body"
+  return 0
+}
+
+# _gate_bind_slug <qualified-ref> <task_slug> — the ONE repo a ref binds to, or EMPTY
+# for "nothing binds it, sweep every known repo". Precedence: the repo the ref carries
+# itself (a pull URL) > the repo the TASK declared > unbound.
+#
+# DIVE-1963 (Marcus, review): the resolver and the message reporting its scope used to
+# derive this INDEPENDENTLY, and the original comment claimed they "cannot drift". They
+# agreed, but that is parallel derivation — two copies that happen to match today, which
+# buys "does not currently drift". Cannot-drift is what a shared definition buys, so
+# here it is: one function, two callers, and the sentence the reader gets is computed
+# from the same answer the lookup used. Same shape as the DIVE-1932 lesson — a rule that
+# holds because of the shape of the code, rather than because something declares it, is
+# preserved by nothing.
+_gate_bind_slug() {
+  local rslug="${1%%|*}"
+  [[ -z "$rslug" && -n "$2" ]] && rslug="$2"
+  printf '%s' "$rslug"
+}
+
+# _gate_search_scope <qualified-ref> <task_slug> — the repo(s) a ref is ACTUALLY looked
+# up in, comma-joined. DIVE-1963: the unresolvable warning said "in any known repo"
+# after searching exactly ONE, so the message asserted a sweep that never happened, and
+# a warning that misstates its own scope is the defect class this arc exists to delete.
+_gate_search_scope() {
+  local rslug; rslug=$(_gate_bind_slug "$1" "$2")
+  if [[ -n "$rslug" ]]; then printf '%s' "$rslug"
+  else _gate_repo_slugs | paste -sd, -; fi
 }
 
 # _gate_pr_probe <n> <tok> <slug> <ident> — one bounded read-only lookup of PR #n in
@@ -20438,8 +20719,10 @@ _gate_pr_probe() {
 # than admitting we do not know which pull request the maker meant.
 _gate_resolve_qualified() {
   local qref="$1" tok="$2" ident="$3" task_slug="$4"
-  local rslug="${qref%%|*}" n="${qref#*|}"
-  [[ -z "$rslug" && -n "$task_slug" ]] && rslug="$task_slug"
+  local n="${qref#*|}" rslug
+  # DIVE-1963: shared with `_gate_search_scope`, so the repo we look in and the repo the
+  # warning NAMES are one answer, not two derivations that agree.
+  rslug=$(_gate_bind_slug "$qref" "$task_slug")
   if [[ -n "$rslug" ]]; then
     local st; st=$(_gate_pr_state "$n" "$tok" "$rslug")
     [[ -n "$st" ]] && printf '%s|%s' "$rslug" "$st"
@@ -20682,6 +20965,37 @@ _task_status_cmd() {
     local _tpl_kind; _tpl_kind=$(db "SELECT kind FROM tasks WHERE id=${id};")
     if [[ "$_tpl_kind" == "recurring" ]]; then
       policy_refuse "$E_CONFLICT" start-on-recurring-template DIVE-2059 "$ident" "$ident is a recurring TEMPLATE (kind='recurring'), not a worked task — 'task start' has no meaning here and would silently stop it firing (the materializer only fires status='todo' templates, DIVE-2055/DIVE-2059). To stop the template use 'task cancel $ident', 'task block $ident --by=<id>', or 'task park $ident --reason=<why> --wake=<when>'. To work an instance it already fired, start that materialized child task instead."
+    fi
+    # DIVE-2113: `task start` silently REOPENED a closed, graded task for ANY
+    # actor — neither maker nor verifier. Measured on an isolated fixture:
+    # status done -> in_progress, rc=0, and the ONLY output was an advisory warn
+    # about the assignee. The result survived (milder than the DIVE-2112 reject
+    # bug, which destroyed it), but the grade then described a task the board
+    # showed as OPEN.
+    #
+    # Worse than first recorded, and measured here rather than assumed: done_at
+    # is NOT cleared, so the row lands in_progress WHILE STILL CARRYING a
+    # done_at — internally contradictory, and any reader or query keying off
+    # done_at disagrees with the one keying off status.
+    #
+    # Same family as DIVE-2112: a writer landing on a closed task with no status
+    # check. Measured CLEAN in the same sweep, recorded so nobody re-audits:
+    # block (rc=2), unblock (rc=0), unpark (rc=0), deliver (rc=2) — none mutated
+    # status or result on a closed task.
+    #
+    # NO ALTERNATIVE VERB IS NAMED IN THE REFUSAL, DELIBERATELY. A refusal that
+    # enumerates exits publishes a route around itself, and each named verb
+    # inherits an obligation it was never audited for — that is exactly how
+    # DIVE-2067 happened, where `task done`'s refusal pointed at an unguarded
+    # `task verify --cmd` and a landed verifier ACK was replaced 39 seconds
+    # later. See community/wiki/a-guard-advertises-its-own-bypass.md. A reopen
+    # path exists in the code, but it is not audited as an entry point to a
+    # CLOSED row, so this refusal will not advertise it.
+    local _cs _cd
+    _cs=$(db "SELECT status FROM tasks WHERE id=${id};")
+    if [[ "$_cs" == "done" || "$_cs" == "cancelled" ]]; then
+      _cd=$(db "SELECT COALESCE(done_at,'unknown') FROM tasks WHERE id=${id};")
+      policy_refuse "$E_CONFLICT" start-on-closed-task DIVE-2113 "$ident" "$ident is CLOSED (status='${_cs}', closed ${_cd}) — 'task start' would silently reopen it to in_progress while LEAVING done_at set, so the row contradicts itself and any recorded grade would describe a task the board shows as open. If it genuinely must be reopened, that is a deliberate decision and belongs on the record; no alternative verb is named here on purpose, because a refusal that lists exits publishes a route around itself (DIVE-2067)."
     fi
   fi
   # DIVE-1375: fail-loud preflight — surface identity/auth/repo gaps at `start`
@@ -21075,12 +21389,16 @@ $_body"
           AMBIGUOUS\|*)          _txt_amb="${_txt_amb:+$_txt_amb; }#${_qref#*|} in ${_st//,/, }" ;;
           *\|OPEN\|*)            _txt_open="${_qref#*|}"; _txt_open_slug="$_rslug"; break ;;
           *\|MERGED\|*\|FAILURE) _txt_red="${_txt_red:+$_txt_red,}${_rslug}#${_qref#*|}" ;;
-          \|)                    _txt_unres="${_txt_unres:+$_txt_unres,}${_qref#*|}" ;;
+          \|)                    _txt_unres="${_txt_unres:+$_txt_unres; }#${_qref#*|} in $(_gate_search_scope "$_qref" "$_task_slug")" ;;
         esac
       done < <(_gate_pr_refs_qualified_from_text "$_txt")
       if [[ -n "$_txt_unres" ]]; then
-        warn "$ident: could not resolve PR reference(s) #${_txt_unres//,/, #} named in the result/body in any known repo ($(_gate_repo_slugs | paste -sd, -)) — merge state UNVERIFIED for those. Cite the full pull URL, or add a \`Repo: <owner>/<repo>\` line, to have them checked."
-        _mg_unverified="${_mg_unverified:+$_mg_unverified; }PR reference(s) #${_txt_unres//,/, #} resolve to no PR in any known repo"
+        # DIVE-1963: name the repo(s) ACTUALLY searched, per ref. A ref carrying its own
+        # pull URL is looked up there and nowhere else; a bare #N in a task that declares
+        # a repo is looked up there and nowhere else; only a bare #N with no declaration
+        # gets the full sweep. One sentence covered all three and was false for two.
+        warn "$ident: could not resolve PR reference(s) named in the result/body — $_txt_unres — merge state UNVERIFIED for those. Cite the full pull URL, or add a \`Repo: <owner>/<repo>\` line, to have them checked."
+        _mg_unverified="${_mg_unverified:+$_mg_unverified; }PR reference(s) resolve to no PR in the repo(s) searched — $_txt_unres"
       fi
       if [[ -n "$_txt_amb" ]]; then
         warn "$ident: AMBIGUOUS PR reference(s) — $_txt_amb. A bare number does not identify a pull request across our repos and this task declares none, so the merge state is UNVERIFIED rather than guessed (DIVE-1955). Cite the full pull URL or add a \`Repo: <owner>/<repo>\` line to the body."
@@ -21387,7 +21705,7 @@ cmd_task_merge_audit() {
   done <<<"$rows"
   local payload; payload=$(printf '%s' "$json_rows" | jq -sc '.')
   if [[ "${JSON_MODE:-0}" != "1" ]] && (( unver + amb > 0 )); then
-    printf 'note: `unverified` = the number resolves to no PR in any known repo (%s).\n      `ambiguous` = a bare "PR #N" that exists in more than one of them and the task\n      declares no repo, so no single verdict is defensible. NEITHER is evidence of an\n      unmerged PR, and neither is evidence of a clean one. Cite the full pull URL, or\n      add a `Repo: <owner>/<repo>` line to the task body, to have them resolved.\n' "$slugs"
+    printf 'note: `unverified` = the number resolves to no PR in the repo(s) searched FOR THAT\n      TASK — the one its own record DECLARES (a delivery_ref URL or a `Repo:` line) when it\n      declares one, else all of %s (DIVE-1963).\n      `ambiguous` = a bare "PR #N" that exists in more than one of them and the task\n      declares no repo, so no single verdict is defensible. NEITHER is evidence of an\n      unmerged PR, and neither is evidence of a clean one. Cite the full pull URL, or\n      add a `Repo: <owner>/<repo>` line to the task body, to have them resolved.\n' "$slugs"
   fi
   ok "merge-audit: scanned the newest $limit done task(s) across $slugs — $findings PR reference(s) not merged-and-green ($unver unverified, $amb ambiguous)" \
      '{scanned:($n|tonumber), repos:($rp|split(",")), findings:($f|tonumber), unverified:($u|tonumber), ambiguous:($a|tonumber), rows:($r|fromjson)}' \
@@ -21491,7 +21809,56 @@ cmd_task_reject() {
   # manual gate to a human on purpose.
   local _open_gate; _open_gate=$(db "SELECT CASE WHEN need_type IS NOT NULL
         AND need_answered_at IS NULL THEN 1 ELSE 0 END FROM tasks WHERE id=${id};")
+  # DIVE-2196: ...but NOT a tier-2 one. The supersede below writes
+  # need_answered_by='auto:reject' with raw SQL, which is a NON-HUMAN provenance on
+  # a gate the tier-2 floor exists to keep human-only — cmd_task_answer refuses
+  # exactly that write, and this path reaches around it. `task done` over a live
+  # gate is already refused (DIVE-555); reject was the remaining verb by which an
+  # agent could clear a human's pending question as a side effect of its own move.
+  # Scoped to an AGENT actor: a genuine human caller is the very party the gate is
+  # waiting on, and an unattributable one ('none': CI, root cron) is the different
+  # question DIVE-2007 got wrong by answering it here. Tier<=1 keeps DIVE-1495's
+  # supersede untouched — a fleet-actionable gate is one an agent could have
+  # cleared anyway, and leaving it pending is the CNCL-9 re-nag defect.
   if [[ "$_open_gate" == "1" ]]; then
+    # EXPLICIT tier only. Every gate filed through `task need` writes a tier, so a
+    # NULL one is a legacy or hand-inserted row that predates tiers — inferring a
+    # human-only floor from a missing value would retro-fit this refusal onto rows
+    # nobody ever tiered and silently break DIVE-1495's supersede where it has
+    # always applied (caught by tests/gate_verifier_route_unit.sh, whose DIVE-505
+    # fixture is exactly that shape). Fail-closed on an absent tier belongs where a
+    # gate is being ANSWERED — a grant; here the question is whether a rail that has
+    # worked since DIVE-1495 keeps working.
+    local _og_tier _og_type _og_actor _og_kind
+    _og_tier=$(db "SELECT COALESCE(tier,'')            FROM tasks WHERE id=${id};")
+    _og_type=$(db "SELECT COALESCE(need_type,'gate')   FROM tasks WHERE id=${id};")
+    _og_actor=$(_gate_withdraw_actor)          # "agent <name>" | "human" | "none"
+    _og_kind="${_og_actor%% *}"
+    if [[ -n "$_og_tier" && "$_og_tier" -ge 2 && "$_og_kind" == "agent" ]]; then
+      # MIRROR QUESTION (main, pre-merge): what does this guard make unreachable?
+      # A verifier who grades the work a FAIL while a tier-2 gate stands. If the
+      # only answer were "wait for the human", the rail would convert a
+      # wrong-but-moving state into a correct-but-stuck one and the next agent
+      # would route around it. So the refusal PRINTS the exit, and which exit
+      # depends on who the caller is:
+      #   - you filed the gate  -> you can retire it yourself: `need --withdraw`
+      #     then reject. Two explicit steps, one of them recorded in gate_history
+      #     as a withdrawal, which is the whole difference from a forged answer.
+      #   - someone else filed it -> you cannot retire their ask and must not
+      #     answer it for them, but your GRADE does not have to wait on it:
+      #     `task set-body --append` records the verdict now, the reject lands
+      #     when the gate clears. Nothing is lost, only the loop transition waits.
+      local _og_filer _og_me _og_exit
+      _og_filer=$(db "SELECT COALESCE(NULLIF(gate_filed_by,''), assignee, '') FROM tasks WHERE id=${id};")
+      _og_me="${_og_actor#agent }"
+      if [[ -n "$_og_filer" && "$_og_filer" == "$_og_me" ]]; then
+        _og_exit="You filed this gate, so you can retire it yourself: '5dive task need $ident --withdraw' (a withdrawal, archived to gate_history — not an answer put in a human's mouth), then reject. Do that only if your grade makes the question genuinely moot."
+      else
+        _og_exit="'${_og_filer:-its filer}' or their lead can withdraw it ('5dive task need $ident --withdraw') if your grade makes the question moot — ask them, do not answer it for them. Your grade does not have to wait on that: record it now with '5dive task set-body $ident \"VERDICT: ...\" --append' and send it to the maker, then reject once the gate clears."
+      fi
+      policy_refuse "$E_CONFLICT" reject-over-tier2-gate DIVE-2196 "$ident" \
+        "$ident has an OPEN tier-2 ${_og_type} gate awaiting a human — rejecting it would mark that gate '(superseded)' with provenance 'auto:reject', i.e. an agent clearing a human-only gate as a side effect of its own move (DIVE-1117 floor, DIVE-2196). The wait is on the human, not on you. ${_og_exit} A human answering it ('5dive task answer $ident --value=...') also clears the way."
+    fi
     local _sup_ts; _sup_ts=$(date -u '+%Y-%m-%d %H:%M:%S')
     db "UPDATE tasks SET need_answer='(superseded — task rejected, bounced to maker)',
           need_answered_at=$(sqlq "$_sup_ts"), need_answered_by='auto:reject', gate_pinged_at=NULL
@@ -21984,6 +22351,23 @@ cmd_task_verify() {
 
   local flipped=0
   if (( rc == 0 )) && (( ! no_done )); then
+    # DIVE-2196: this auto-close is a TERMINAL CLOSE reached by raw UPDATE, so it
+    # never saw DIVE-555's pending-gate refusal — `task verify --cmd=true` closed a
+    # task out from under an unanswered human gate, and the question then vanished
+    # from every open-gate view (they all require an open status). That is the same
+    # bypass DIVE-2067 recorded on the ACK axis: the refusal on `task done` NAMES
+    # `task verify` as an alternative, and the named alternative carried no
+    # equivalent check. Refusing here is what makes the `done`/`reject` rails real
+    # rather than advisory. The verify RESULT is still recorded first — the evidence
+    # is worth keeping and is not what the gate is protecting; only the close waits.
+    local _vg_t _vg_a
+    _vg_t=$(db "SELECT COALESCE(need_type,'')        FROM tasks WHERE id=${id};")
+    _vg_a=$(db "SELECT COALESCE(need_answered_at,'') FROM tasks WHERE id=${id};")
+    if [[ -n "$_vg_t" && -z "$_vg_a" ]]; then
+      db "UPDATE tasks SET result=$(sqlq "$result_txt") WHERE id=${id};"
+      policy_refuse "$E_CONFLICT" verify-close-over-open-gate DIVE-2196 "$ident" \
+        "$ident has a pending '${_vg_t}' gate awaiting a human — the verify verdict is RECORDED, but the auto-close is refused: closing here would drop the human's question out of every open-gate view without anyone answering it, which is DIVE-555's bypass reached by a different verb. Exits: let them answer it ('5dive task answer $ident --value=...'), withdraw it if your result makes it moot ('5dive task need $ident --withdraw'), or re-run with --no-done to record evidence without closing."
+    fi
     db "UPDATE tasks SET status='done', done_at=datetime('now'), result=$(sqlq "$result_txt") WHERE id=${id};"
     flipped=1
     # DIVE-1415: `task verify` auto-done is a terminal close like `task done`, so
@@ -22894,7 +23278,7 @@ cmd_task_need() {
           SET need_type=NULL, ask=NULL, need_options=NULL, recommend=NULL,
               secret_key=NULL, connector=NULL, ask_shape=NULL,
               precedent_ref=NULL, precedent_kind=NULL, routed_reviewer=NULL,
-              need_asked_at=NULL, gate_pinged_at=NULL
+              need_asked_at=NULL, gate_pinged_at=NULL, gate_filed_by=NULL
         WHERE id=${id};
         UPDATE tasks SET status='todo'
           WHERE id=${id} AND status='blocked'
@@ -23312,6 +23696,16 @@ cmd_task_need() {
   # `task answer` knows who to ping to resume. The inbox is defined by the gate
   # (need_type set), not by assignee, so it still surfaces to the human.
   local actor; actor=$(task_actor "$from")
+  # DIVE-2196: filing a gate on a task DELIVERED to you IS an act of review — the
+  # verifier demonstrably opened it and escalated. Stamp the handoff ACK in the same
+  # transaction, so "reviewed it and escalated to a human" stops being byte-identical
+  # to "never looked at it": handoff_ack_at NULL is what the stall sweep, `task show`
+  # and the loop board all read as UNACKNOWLEDGED, and on DIVE-2146 that made the
+  # sweep nag a verifier who had already graded and escalated. Same receiver rule as
+  # DIVE-1378's `task start` ACK — the REAL actor only (never --from, which would let
+  # a third party forge the verifier's receipt), only while they are the assigned
+  # verifier of a delivered row, COALESCE so a set ACK never moves.
+  local _ack_actor; _ack_actor=$(task_actor)
   # DIVE-2119: a re-file DESTROYS the previous gate — archive it to gate_history
   # and reset all six provenance columns in the same transaction, before the
   # SET below overwrites need_type/ask/tier. Without the archive the previous
@@ -23321,6 +23715,12 @@ cmd_task_need() {
       $(_gate_archive_and_clear_sql file "id=${id}")
       UPDATE tasks
         SET status='blocked', assignee=$(sqlq "$actor"),
+            handoff_ack_at=CASE
+              WHEN maker_agent IS NOT NULL AND verifier IS NOT NULL
+                   AND assignee=verifier AND verifier=$(sqlq "$_ack_actor")
+                   AND handoff_delivered_at IS NOT NULL
+              THEN COALESCE(handoff_ack_at, datetime('now'))
+              ELSE handoff_ack_at END,
             need_type=$(sqlq "$type"), ask=$(sqlq "$ask"),
             need_options=$(sqlq_or_null "$options"),
             recommend=$(sqlq_or_null "$recommend"),
@@ -23329,7 +23729,8 @@ cmd_task_need() {
             ask_shape=$(sqlq_or_null "$ask_shape"),
             precedent_ref=${precedent_ref:-NULL},
             precedent_kind=$(sqlq_or_null "$precedent_kind"),
-            tier=${tier}, need_asked_at=datetime('now'), gate_pinged_at=NULL
+            tier=${tier}, need_asked_at=datetime('now'), gate_pinged_at=NULL,
+            gate_filed_by=$(sqlq "$actor")
       WHERE id=${id};
       COMMIT;"
 
@@ -23976,10 +24377,19 @@ cmd_task_gate_escalate() {
   _gate_is_root || fail "$E_PERMISSION" "task gate-escalate must run as root (it reads other agents' channel state)"
 
   resolve_task_id "$ident_arg"; local id="$RESOLVED_TASK_ID" ident="$RESOLVED_TASK_IDENT"
+  # DIVE-1945: the filer is the gate's FILER-OF-RECORD (gate_filed_by, stamped by
+  # cmd_task_need from the acting agent), NOT the task's created_by. They differ
+  # whenever one agent files a gate on another agent's task — and then this walked
+  # the CREATOR's branch of the org chart and the alert read "filed by <creator>
+  # (no channel of its own)", wrong attribution about an agent that may well have
+  # one. Same bug DIVE-1927 fixed on the `task need` path via TASK_GATE_FILER,
+  # surviving here because this process cannot see that env var: it is a separate
+  # privileged run driven by the re-nag, so the filer has to come off the ROW.
+  # created_by remains the fallback for gates filed before the column existed.
   local grow
   grow=$(db "SELECT COALESCE(need_type,'')||x'1f'||COALESCE(ask,'')||x'1f'||COALESCE(need_options,'')||x'1f'||
                     COALESCE(recommend,'')||x'1f'||COALESCE(secret_key,'')||x'1f'||COALESCE(connector,'')||x'1f'||
-                    COALESCE(NULLIF(created_by,''),assignee,'')
+                    COALESCE(NULLIF(gate_filed_by,''),NULLIF(created_by,''),assignee,'')
              FROM tasks
              WHERE id=${id} AND need_type IS NOT NULL AND need_answered_at IS NULL
                AND status NOT IN ('done','cancelled');")
@@ -31140,12 +31550,17 @@ export function dispatchBallotVote(opts = {}) {
   // with a result, or the deadline elapses. The collection-loop deadline is AUTHORITATIVE regardless
   // of any stamp in the task body. A human tap and an agent heartbeat close the task identically, so
   // this loop is byte-identical for both — no new collection/quorum/abstain path (DIVE-1564).
-  const collect = async (seat, taskId, deadlineAt, deadlineIso, kind, nudgeInfo) => {
+  const collect = async (seat, taskId, deadlineAt, deadlineIso, kind, nudgeInfo, priorFailure) => {
     // DIVE-1739: fire the single mid-window nudge once ~nudgeFrac of the window has elapsed with the
     // ballot still open. nudgeInfo is null for seats that don't get a pane nudge (e.g. human seats,
     // which vote by tap and were already delivered a Telegram ballot).
     const nudgeAt = nudgeInfo ? deadlineAt - (deadlineAt - now()) * (1 - nudgeFrac) : Infinity
     let nudged = false
+    // DIVE-2220: the DELIVERY LEDGER for this ballot. `failure` is set the moment we learn a delivery
+    // attempt did not land; `delivered` records that one demonstrably did. Both are consulted only on
+    // the deadline path — a seat that votes anyway needs no excuse for a lost nudge.
+    let failure = priorFailure || null
+    let delivered = false
     while (now() < deadlineAt) {
       let row = null
       try {
@@ -31159,7 +31574,27 @@ export function dispatchBallotVote(opts = {}) {
       }
       if (nudgeInfo && !nudged && now() >= nudgeAt) {
         nudged = true
-        try { nudge(nudgeInfo.agent, nudgeInfo.msg) } catch { /* best-effort — abstain-on-miss unchanged */ }
+        // DIVE-2220: this ONE nudge is, for a seat with no heartbeat, the only delivery that can
+        // actually wake it — the queued ballot task wakes nobody on its own. Its failure used to be
+        // swallowed TWICE over: the bare catch here discarded a throw, and the production nudge rail
+        // (nudgeSeatAgent) never throws at all — it RETURNS a failure — so the catch could not have
+        // fired in prod even once. Either way the seat fell through to the same 'no vote by deadline'
+        // string a genuinely-silent seat produces, and the receipt sealed captureFailed=0: an
+        // affirmative claim that nothing failed to be collected, over a seat we cannot show was ever
+        // asked. Record the outcome (both shapes) instead of discarding it.
+        let why = null
+        try {
+          const r = nudge(nudgeInfo.agent, nudgeInfo.msg)
+          if (r === false || (r && typeof r === 'object' && r.ok === false)) {
+            why = (r && r.why) ? String(r.why).replace(/\s+/g, ' ').slice(0, 140) : 'nudge rail reported failure'
+          }
+        } catch (e) { why = clip(e) }
+        if (why) {
+          failure = failure || { kind: 'nudge-failed', why: `mid-window nudge to ${nudgeInfo.agent} not delivered: ${why}` }
+          // Log it. Before this, a swallowed nudge was invisible even to an operator watching the
+          // convene live — its entire stderr was five lines of summary.
+          try { process.stderr.write(`[council] NUDGE FAILED — seat=${seat.id} agent=${nudgeInfo.agent} ballot=${taskId}: ${why}\n`) } catch { /* ignore */ }
+        } else delivered = true
       }
       await sleep(pollSecs * 1000)
     }
@@ -31169,7 +31604,19 @@ export function dispatchBallotVote(opts = {}) {
     // task may already be closed (a tap landed at the wire) or the cancel may race — either way the
     // seat's verdict is an abstain regardless, so a cancel gap never changes the tally.
     try { exec(['task', 'cancel', String(taskId), '--result=council ballot spent — no vote by deadline (== abstain); auto-cancelled on convene seal (CNCL-29)']) } catch { /* already closed / not cancellable — abstain stands */ }
-    return { vote: 'abstain', rationale: `${seat.id} ${kind} ${taskId}: no vote by deadline ${deadlineIso} (deadline/no-vote)` }
+    // DIVE-2220: a delivery attempt that we KNOW did not land makes this a CAPTURE failure, not an
+    // abstention. Tagged (capture:false) so captureAudit counts it, the verdict can refuse instead of
+    // sealing a clean-looking receipt, and the sealed `unreached:` line names the seat — the same
+    // treatment ballot-mint-failed already gets one branch away.
+    if (failure) {
+      return { vote: 'abstain', abstainKind: failure.kind, capture: false,
+               rationale: `CAPTURE FAILED (not an abstention) — ${seat.id} ${kind} ${taskId}: ${failure.why}; the seat cannot be shown to have been asked before the deadline ${deadlineIso}` }
+    }
+    // DIVE-2220: 'no vote by deadline' is a claim ABOUT THE SEAT, so it must carry what we can actually
+    // show about delivery. `nudged` says a wake reached the seat; `queued` says only that the ballot
+    // task was minted into its queue and the mid-window nudge never fired.
+    const told = nudgeInfo ? (delivered ? `; nudged ${nudgeInfo.agent} mid-window` : '; ballot queued, no mid-window nudge fired') : ''
+    return { vote: 'abstain', rationale: `${seat.id} ${kind} ${taskId}: no vote by deadline ${deadlineIso} (deadline/no-vote${told})` }
   }
   return async (seat, ctx) => {
     const prompt = E.seatPrompt(seat, ctx)   // blind in round 1 (engine-guaranteed)
@@ -31222,8 +31669,18 @@ export function dispatchBallotVote(opts = {}) {
       // Emit is an injectable, never-throws seam. The CLI cannot send an inline keyboard itself
       // (DIVE-1546); the concrete button delivery is the telegram plugin tap handler (DIVE-1566), which
       // consumes this exact payload. A delivery gap just leaves the task un-tapped -> abstain-on-miss.
-      try { await emitBallot(payload) } catch { /* best-effort: the missed-tap path is already an abstain */ }
-      return collect(seat, taskId, deadlineAt, deadlineIso, 'human ballot')
+      // DIVE-2220: an emit that THREW is a delivery failure — the buttons never went out — and must
+      // not resolve to the same untagged 'no vote by deadline' a human who saw the ballot and didn't
+      // tap produces. (A `{delivered:false}` RETURN is deliberately NOT treated as failure here: the
+      // default emit returns exactly that as a breadcrumb meaning "the plugin renders the buttons",
+      // so it does not distinguish an outage. That gap is real and stays open — see DIVE-2220.)
+      let emitFailure = null
+      try { await emitBallot(payload) } catch (e) { emitFailure = clip(e) }
+      if (emitFailure) {
+        try { process.stderr.write(`[council] BALLOT EMIT FAILED — seat=${seat.id} chat=${chat} ballot=${taskId}: ${emitFailure}\n`) } catch { /* ignore */ }
+      }
+      return collect(seat, taskId, deadlineAt, deadlineIso, 'human ballot', null,
+        emitFailure ? { kind: 'ballot-emit-failed', why: `Telegram ballot emit failed: ${emitFailure}` } : null)
     }
     // ---- agent seat (CNCL-18, unchanged) ----
     // CNCL-16: mint into the seat's REGISTRY agent (persona 'theo' -> 'marketing', etc.). Pre-flight
@@ -31460,9 +31917,16 @@ function nudgeSeatAgent(agent, msg) {
   const bin = process.env.COUNCIL_5DIVE_BIN || '5dive'
   try {
     execFileSync(bin, ['agent', 'send', String(agent), String(msg)],
-      { encoding: 'utf-8', timeout: 30000, stdio: ['ignore', 'ignore', 'ignore'] })
-    return true
-  } catch { return false }
+      { encoding: 'utf-8', timeout: 30000, stdio: ['ignore', 'pipe', 'pipe'] })
+    return { ok: true }
+  } catch (e) {
+    // DIVE-2220: report WHY, never a bare false. This rail is the only wake a heartbeat-less seat
+    // gets, so its failure has to be able to reach the receipt. stderr is piped (was `ignore`) purely
+    // so the reason is something a reader can act on; nothing is printed by this function itself.
+    const stderr = String((e && e.stderr) || '').replace(/\s+/g, ' ').trim()
+    const why = `${String((e && e.message) || e).replace(/\s+/g, ' ')}${stderr ? ` :: ${stderr}` : ''}`.slice(0, 140)
+    return { ok: false, why }
+  }
 }
 
 // DIVE-1739 (gate answer A — preserve strict 6/6, fix reliability operationally). Before a FULL-QUORUM
@@ -37839,6 +38303,10 @@ _hb_gate_renag_sweep() {
   # T1 gates: group by the existing routed reviewer / org-lead resolution. A
   # lead's own T1 gate uses the coordinator/root channel instead of escalating
   # to the paired-human lane reserved for T2.
+  # DIVE-1945: this lane resolves the reviewer FROM the filer's org position, so
+  # it is a whose-ask-is-this question and takes gate_filed_by — unlike the T2
+  # sweep above, which batches by the channel OWNER and correctly stays on
+  # created_by. Same COALESCE fallback for pre-column gates.
   local grow gid filer reviewer routed
   declare -A lead_ids=()
   while IFS= read -r grow; do
@@ -37853,7 +38321,7 @@ _hb_gate_renag_sweep() {
       continue
     fi
     lead_ids[$reviewer]+="${lead_ids[$reviewer]:+,}${gid}"
-  done < <(db "SELECT id||x'1f'||COALESCE(NULLIF(created_by,''),assignee,'')||x'1f'||COALESCE(routed_reviewer,'')
+  done < <(db "SELECT id||x'1f'||COALESCE(NULLIF(gate_filed_by,''),NULLIF(created_by,''),assignee,'')||x'1f'||COALESCE(routed_reviewer,'')
                FROM tasks WHERE ${_HB_GATE_RENAG_WHERE} AND tier=1
                ORDER BY COALESCE(need_asked_at,updated_at,created_at),id;")
   for reviewer in "${!lead_ids[@]}"; do
@@ -38168,6 +38636,21 @@ _hb_fleet_activity_probe() {
 
 _hb_stall_sweep() {
   # (a) GAP#2 — surface stale maker->verifier deliveries.
+  #
+  # DIVE-2196: a row BLOCKED on an unanswered human gate is excluded. 'blocked' is
+  # not in ('done','cancelled'), so such a row used to pass the filter and get
+  # nagged — but the wait there is on a HUMAN, not on the verifier, and the remedy
+  # this ping prescribes is the harmful action: on a maker->verifier task the
+  # verifier's ACK *is* the close, so "run task start then task done/task reject"
+  # asks them to resolve a pending human gate by side effect. Fired live on
+  # DIVE-2146, whose gate asked lodar to choose between leaving it open and closing
+  # it as delivered — i.e. the nag pushed option B in a question nobody had
+  # answered. The gate-live predicate matches the one inbox/show/park use
+  # (need_type set AND not yet answered; status is already constrained above).
+  # An ANSWERED gate does not exclude: the wait is back on the verifier.
+  # (gap#3's stranded_todo below keeps its own predicate — it counts status='todo'
+  # rows, and a gate-blocked row is 'blocked'; open gates are counted by open_gates,
+  # where a pinged tier-2 gate is deliberately PARKED rather than stranded.)
   local vrow vid vident vfier vdelivered vmins
   while IFS= read -r vrow; do
     [[ -n "$vrow" ]] || continue
@@ -38186,6 +38669,7 @@ _hb_stall_sweep() {
                  AND assignee=verifier AND status NOT IN ('done','cancelled')
                  AND handoff_ack_at IS NULL AND handoff_stale_pinged_at IS NULL
                  AND handoff_delivered_at IS NOT NULL
+                 AND NOT (need_type IS NOT NULL AND need_answered_at IS NULL)
                  AND handoff_delivered_at <= datetime('now','-${_HB_VERIFY_STALE_MIN} minutes');")
 
   # (b) GAP#3 core — fleet-idle-while-actionable-work-is-open, persisting.
@@ -38675,16 +39159,51 @@ cmd_heartbeat_tick() {
     # this, the heartbeat would auto-run it (privilege-escalation-by-queue). If
     # the task's creator is strictly LOWER-privileged than its assignee, HOLD the
     # task (don't auto-wake) — a human or the assignee can still run it manually.
-    # Isolated + best-effort: any lookup miss falls through to the normal wake and
-    # never aborts the tick (a self-assigned task, human/unknown creator, or an
-    # equal/higher-tier creator is unaffected).
+    #
+    # DIVE-2213 — this used to read the two tiers with `jq ... 2>/dev/null` and
+    # rank an empty result 0, then skip itself whenever either rank was 0. That
+    # made a lookup that NEVER HAPPENED indistinguishable from a creator who
+    # legitimately has no tier, and the tie went to running the work: an
+    # unmeasured tier DISABLED the guard. Same collapse as DIVE-2210's envelope,
+    # one class worse because this is a decision, not a display.
+    #
+    # The ticket framed the fix as a binary — hold everything unmeasured (fail
+    # closed, may stall the fleet) or wake with a loud log (fail open, no longer
+    # silent). It is a FALSE binary, and rank-0 is what disguised it. Two
+    # populations were sharing that bucket and they want OPPOSITE policies:
+    #
+    #   MEASURED, no tier  — the creator is not a registered agent: a human, or
+    #     an external filer. This is the majority of the board. Falling through
+    #     is not a failure mode, it is DIVE-1065's intent. Holding here would
+    #     stall every human-filed task fleet-wide, which is the cost the ticket
+    #     was (correctly) afraid of.
+    #   NOT MEASURED       — registry absent/unreadable/unparsable, jq errored,
+    #     or the agent IS registered and its isolation is missing/malformed. We
+    #     have no basis to rank either side, so ranking them 0 asserts something
+    #     we do not know. HOLD.
+    #
+    # Holding only the second is cheap: a healthy registry never produces it, so
+    # this cannot stall the fleet in steady state, and each cause names itself in
+    # the log so a hold is repairable rather than mysterious. agent_tier() +
+    # tier_unmeasured() (src/lib/registry.sh) draw exactly that line — note they
+    # are NOT envelope_tier(), which folds both populations into
+    # `unknown:unregistered` because a wire format has no decision to make.
+    #
+    # Still isolated: a hold skips ONE agent's wake this tick and never aborts
+    # the tick. A self-assigned task and an equal/higher-tier creator are
+    # unaffected.
     local _cby _ctier _atier
     _cby=$(db "SELECT COALESCE(created_by,'') FROM tasks WHERE id=${task_id};" 2>/dev/null || echo "")
     if [[ -n "$_cby" && "$_cby" != "$name" ]]; then
-      _ctier=$(jq -r --arg n "$_cby"  '.agents[$n].isolation // empty' <<<"$reg" 2>/dev/null)
-      _atier=$(jq -r --arg n "$name"  '.agents[$n].isolation // empty' <<<"$reg" 2>/dev/null)
+      _ctier=$(agent_tier "$_cby"); _atier=$(agent_tier "$name")
+      if tier_unmeasured "$_ctier" || tier_unmeasured "$_atier"; then
+        _hb_log "[$name] task ${task_ident} tier NOT MEASURED (creator ${_cby}=${_ctier}, assignee ${name}=${_atier}) — holding, not auto-running (DIVE-2213)"
+        continue
+      fi
+      # Only measured values reach the ranking. `unknown:unregistered` ranks 0
+      # via the catch-all, which is the human/external fall-through above.
       local _cr _ar
-      _cr=$(_hb_tier_rank "${_ctier:-}"); _ar=$(_hb_tier_rank "${_atier:-}")
+      _cr=$(_hb_tier_rank "$_ctier"); _ar=$(_hb_tier_rank "$_atier")
       if (( _cr > 0 && _ar > 0 && _cr < _ar )); then
         _hb_log "[$name] task ${task_ident} created by lower-tier ${_cby}(${_ctier}) < assignee(${_atier}) — holding, not auto-running"
         continue
@@ -41412,6 +41931,28 @@ cmd_activity() {
 #   5dive digest            # human/Telegram-ready text for the last 24h
 #   5dive digest --json     # structured { window, done, inProgress, blocked, usage, health }
 #   5dive digest --7d       # widen the window to 7 days
+#   5dive digest --30d      # widen the window to 30 days (DIVE-1921)
+#
+# DIVE-1921 — WHAT THE WINDOW ACTUALLY SCOPES. Widening is not uniform across
+# this payload, and a reader who assumes it is will misread half the digest.
+# Three kinds of aggregate live here:
+#   SUMS over the window   — done, autoCleared, zeroHuman.*, autonomy.shipped/
+#                            asked, precedentPrefill.count/accepted,
+#                            stuck.episodes. These scale with the window.
+#   RATES/MEANS over it    — precedentPrefill.acceptanceRate, stuck.mttuSec and
+#                            stuck.byCause[].mttuSec. The denominator grows, so
+#                            a wider window is the FIX for the thin-n readings
+#                            DIVE-1914 hit (mttuSec off one episode, precedent
+#                            acceptance off n=2).
+#   POINT READINGS         — inProgress, blocked, usage, usageCoverage, health,
+#                            loops, stuck.openStuck, autonomy.uptimeDays and the
+#                            objectives' current/gap/inflight. These are "as of
+#                            now" and are IDENTICAL at 24h, 7d and 30d.
+# The last group is the hazard: `usage` is usage_collect's own 5h/7d rolling
+# read and `loops` is every loop ever (--all), so under a "last 30 days" header
+# they read as 30 days of tokens when they are nothing of the kind. They are
+# therefore named in the JSON `pointInTime` map and captioned in the text, so
+# the window label can never be applied to a number it does not describe.
 
 # Per-box digest preference, in the shared state dir so it SURVIVES CLI updates
 # (install.sh seeds it OFF and never clobbers it). One digest per fleet → one
@@ -41517,10 +42058,11 @@ cmd_digest() {
   while [ $# -gt 0 ]; do
     case "$1" in
       --7d)    window=604800 ;;
+      --30d)   window=2592000 ;;
       --24h|--day) window=86400 ;;
       --send)  do_send=1 ;;
       -h|--help)
-        echo "usage: 5dive digest [--json] [--7d] [--send]"
+        echo "usage: 5dive digest [--json] [--7d|--30d] [--send]"
         echo "       5dive digest on [--at=<0-23>] | off | status   # per-box auto-delivery (default OFF)"
         echo "       5dive digest tick                              # cron driver (hourly; gated on the pref)"
         echo "  --send  deliver the digest to the paired Telegram chat (text only)"
@@ -41832,7 +42374,30 @@ def _hdur(sec):
     if h < 48: return f"{h:.1f}h"
     return f"{h/24:.1f}d"
 
-window_label = "7 days" if window >= 604800 else "24h"
+# DIVE-1921: this was a `>=` ladder — `"7 days" if window >= 604800 else "24h"`
+# — so ANY window wider than a week rendered under a "last 7 days" header. The
+# headline of the digest would have asserted a span it did not measure, and the
+# scorecard downstream reads this label. Derive it from the window instead, with
+# a computed fallback so a future width can never silently borrow another's name.
+_WINDOW_LABELS = {86400: "24h", 604800: "7 days", 2592000: "30 days"}
+window_label = _WINDOW_LABELS.get(window) or f"{max(1, round(window / 86400))} days"
+
+# DIVE-1921: the window scopes the sums and the rates; it does NOT scope the
+# point readings (see the header block). Naming them in the payload is what
+# stops a consumer applying `window.label` to a number it does not describe —
+# `usage` is usage_collect's own 5h/7d rolling read, `loops` is every loop ever.
+point_in_time = {
+    "inProgress":    "current status, not a window count",
+    "blocked":       "current status, not a window count",
+    "usage":         "usage_collect's own rolling 5h/7d limits — never this window",
+    "usageCoverage": "describes the usage read above, same rolling scope",
+    "health":        "freshness and rate-limit pressure as of now",
+    "loops":         "every loop the fleet has run (--all), not a window slice",
+    "stuck.openStuck":       "agents wedged right now",
+    "autonomy.uptimeDays":   "all-time streak since the last human-blocking gate",
+    "objectives[].current":  "latest reading; only .trend/.baseline use the window",
+    "objectives[].inflight": "open linked tasks as of now",
+}
 
 # OSS-14: one-glance autonomy rollup — "ran N days, shipped X, asked you Y",
 # with trend vs the prior window. Deterministic, from data already loaded; the
@@ -41845,6 +42410,14 @@ def _window_counts(lo, hi):
               and lo <= (to_epoch(t.get("need_answered_at")) or -1) < hi)
     return ship, ask
 prev_ship, prev_ask = _window_counts(since - window, since)
+# DIVE-1921: the trend compares this window against the one before it, so a 30d
+# reading reaches 60 days back. If the store does not go that far, the prior
+# counts are a PARTIAL span reported as a whole one and the arrow overstates the
+# improvement — the wider the window, the more likely that is. Say so rather
+# than render a flattering delta: the earliest row we hold has to predate the
+# prior window's start for the comparison to be like-for-like.
+_first_seen = [x for x in (to_epoch(t.get("created_at")) for t in work if t.get("created_at")) if x]
+prior_complete = bool(_first_seen) and min(_first_seen) <= (since - window)
 # uptime = days since the last human-blocking stall. An open gate right now means
 # not-autonomous this instant (0); else days since the most recent gate was filed;
 # else (never needed a human) the streak runs since the company's first task.
@@ -41859,7 +42432,8 @@ else:
         uptime_days = max(0, (now - min(_born)) // 86400) if _born else 0
 autonomy = {"uptimeDays": uptime_days, "currentlyBlocked": bool(blocked),
             "shipped": len(done_l), "asked": len(ht_l),
-            "priorShipped": prev_ship, "priorAsked": prev_ask, "windowLabel": window_label}
+            "priorShipped": prev_ship, "priorAsked": prev_ask, "windowLabel": window_label,
+            "priorWindowComplete": prior_complete}
 
 # OSS-19 (OSS-26) objectives: current vs target with a window trend, riding the
 # same window-delta idea as _window_counts. current/baseline come straight from
@@ -41898,7 +42472,9 @@ for o in obj_rows:
 
 if as_json:
     print(json.dumps({
-        "window": {"since": since, "now": now, "label": window_label},
+        "window": {"since": since, "now": now, "label": window_label,
+                   "seconds": window, "days": round(window / 86400, 2)},
+        "pointInTime": point_in_time,
         "objectives": objectives,
         "done": done_l, "inProgress": ip_l, "blocked": blk_l, "autoCleared": auto_l,
         "zeroHuman": {"shipped": len(done_l), "humanTouches": len(ht_l), "gates": ht_l},
@@ -41929,7 +42505,10 @@ else:
     def _trend(cur, prev):
         d = cur - prev
         arrow = "↑" if d > 0 else ("↓" if d < 0 else "→")
-        return f" ({arrow}{abs(d)} vs {prev} prior {window_label})"
+        # DIVE-1921: a prior window the store does not fully cover is a partial
+        # span; saying so costs one word and stops the arrow reading as growth.
+        partial = "" if prior_complete else ", a span the store does not fully cover"
+        return f" ({arrow}{abs(d)} vs {prev} prior {window_label}{partial})"
     _up = ("currently waiting on you" if autonomy["currentlyBlocked"]
            else f"ran {autonomy['uptimeDays']}d without needing you")
     out.append(f"\U0001F9BE Autonomy — {_up} · shipped {len(done_l)}{_trend(len(done_l), prev_ship)}"
@@ -41991,7 +42570,9 @@ else:
     if loops_burn:
         out.append("")
         cap_note = f", {len(loops_capped)} hit ceiling" if loops_capped else ""
-        out.append(f"\U0001F504 Loop burn ({_htok(loops_total)} tok{cap_note})")
+        # DIVE-1921: `usage loops --all` is every loop the fleet has run, so this
+        # total is NOT a slice of the window it is printed under. Say which.
+        out.append(f"\U0001F504 Loop burn ({_htok(loops_total)} tok{cap_note}, all loops — not the {window_label})")
         for l in loops_burn[:6]:
             ceil = _htok(l["ceiling"]) if l["ceiling"] is not None else "∞"
             flag = " ⛔ ceiling" if l["atCeiling"] else ""
@@ -42039,6 +42620,13 @@ else:
         else:
             out.append("\U0001F49B Heartbeats fresh; rate-limit pressure UNVERIFIED — "
                        "the burn read above was short of the fleet")
+    # DIVE-1921: the header says "last {window_label}" and most of the body honours
+    # it — but token burn, loop burn and the in-progress/blocked/still-stuck counts
+    # are as-of-now readings that do not move with the window. Under a 30d header
+    # that gap is wide enough to be read as a claim, so it gets stated once.
+    out.append(f"\U0001F4CF Window — sums and rates above cover the last {window_label}; "
+               "token burn (5h/7d rolling), loop burn, in-progress/needs-you and "
+               "still-stuck are as-of-now readings, unchanged by the window.")
     print("\n".join(out))
 PY
 
@@ -43171,15 +43759,32 @@ _proof_scorecard() {
   while [ $# -gt 0 ]; do
     case "$1" in
       --7d)   window="7d" ;;
+      # DIVE-1921 shipped digest --30d, so the window this verb was specified
+      # with (DIVE-1914: [--7d|--30d]) is finally computable and the refusal
+      # that stood here is gone. 30d is the FIX for the thin-n rows below —
+      # median recovery time off one episode, precedent acceptance off n=2.
+      --30d)  window="30d" ;;
       --by=*) by="${1#*=}" ;;
-      # DIVE-1921: digest has no --30d (it errors "unknown arg"), so offering
-      # one here would be a window this verb cannot actually compute.
-      --30d)  fail "$E_USAGE" "proof scorecard: --30d not available — \`digest\` supports only --7d (tracked as DIVE-1921)" ;;
       *) fail "$E_USAGE" "proof scorecard: unknown arg: $1" ;;
     esac
     shift
   done
   case "$by" in tier|class) ;; *) fail "$E_USAGE" "proof scorecard: --by must be tier|class" ;; esac
+
+  # DIVE-1921: the window must move as ONE unit. Every number below comes from
+  # one of three readers — the digest sub-call, the tasks/ship/policy SQL, and
+  # the token collector — and they are combined into single ratios (asks over
+  # shipped, first-pass over graded, tokens over shipped). A site left behind at
+  # 7 days therefore does not render as a wrong window; it renders as a
+  # PLAUSIBLE RATE with a numerator and denominator measured over different
+  # spans, which is invisible in the output. That is why nothing past this point
+  # is allowed to spell a span out by hand: it all derives from here.
+  local sql_window usage_secs
+  case "$window" in
+    7d)  sql_window="-7 days"  ; usage_secs=604800 ;;
+    30d) sql_window="-30 days" ; usage_secs=2592000 ;;
+    *)   fail "$E_USAGE" "proof scorecard: unsupported window: $window" ;;
+  esac
 
   local self db work
   # DIVE-2080, the hole DIVE-2061 closed one call up. selfcheck's probe 7 carefully
@@ -43193,7 +43798,7 @@ _proof_scorecard() {
   # MAX_ARG_STRLEN, so these go through FILES, never the environment. Passing
   # them as env vars fails with a bare "Argument list too long" and no metric.
   work="$(mktemp -d)"
-  "$self" digest --json --7d 2>/dev/null > "$work/digest.json"
+  "$self" digest --json "--$window" 2>/dev/null > "$work/digest.json"
   [ -s "$work/digest.json" ] || fail "$E_GENERIC" "proof scorecard: digest produced no output"
 
   # Tokens: usage_collect scans agent transcripts. Guarded — this lib is also
@@ -43201,7 +43806,7 @@ _proof_scorecard() {
   # degrade to an honest no-data row, never to a zero.
   : > "$work/usage.json"
   if declare -F usage_collect >/dev/null 2>&1; then
-    usage_collect 604800 2>/dev/null > "$work/usage.json" || : > "$work/usage.json"
+    usage_collect "$usage_secs" 2>/dev/null > "$work/usage.json" || : > "$work/usage.json"
   fi
 
   # DIVE-1914 iteration 2 (olivia): --by used to be VALIDATED as legal and then
@@ -43224,10 +43829,10 @@ _proof_scorecard() {
 
   local rows
   rows="$(db "SELECT
-      (SELECT COUNT(*) FROM tasks WHERE status='done' AND kind='standard' AND done_at>=datetime('now','-7 days')) || '|' ||
-      (SELECT COUNT(*) FROM tasks WHERE status='done' AND kind='standard' AND done_at>=datetime('now','-7 days') AND verifier IS NOT NULL AND verifier<>'') || '|' ||
-      (SELECT COUNT(*) FROM tasks WHERE status='done' AND kind='standard' AND done_at>=datetime('now','-7 days') AND verifier IS NOT NULL AND verifier<>'' AND COALESCE(iteration,1)<=1) || '|' ||
-      (SELECT COUNT(*) FROM tasks WHERE status='done' AND kind='standard' AND done_at>=datetime('now','-7 days') AND ${known_expr});" 2>/dev/null || true)"
+      (SELECT COUNT(*) FROM tasks WHERE status='done' AND kind='standard' AND done_at>=datetime('now',$(sqlq "$sql_window"))) || '|' ||
+      (SELECT COUNT(*) FROM tasks WHERE status='done' AND kind='standard' AND done_at>=datetime('now',$(sqlq "$sql_window")) AND verifier IS NOT NULL AND verifier<>'') || '|' ||
+      (SELECT COUNT(*) FROM tasks WHERE status='done' AND kind='standard' AND done_at>=datetime('now',$(sqlq "$sql_window")) AND verifier IS NOT NULL AND verifier<>'' AND COALESCE(iteration,1)<=1) || '|' ||
+      (SELECT COUNT(*) FROM tasks WHERE status='done' AND kind='standard' AND done_at>=datetime('now',$(sqlq "$sql_window")) AND ${known_expr});" 2>/dev/null || true)"
 
   # DIVE-1922: the policy-refusal source now EXISTS, so this metric stops being
   # NO DATA. Two numbers are needed, not one. The count alone would read as
@@ -43238,7 +43843,7 @@ _proof_scorecard() {
   # hand-maintained, because a hand-kept constant drifts and then lies.
   local refusals="" refusal_sites=""
   if [ "$(db "SELECT 1 FROM sqlite_master WHERE type='table' AND name='policy_refusals' LIMIT 1;" 2>/dev/null)" = "1" ]; then
-    refusals="$(db "SELECT COUNT(*) FROM policy_refusals WHERE ts>=datetime('now','-7 days');" 2>/dev/null || true)"
+    refusals="$(db "SELECT COUNT(*) FROM policy_refusals WHERE ts>=datetime('now',$(sqlq "$sql_window"));" 2>/dev/null || true)"
     # `|| true` is LOAD-BEARING, not defensive noise. Under `set -euo pipefail` a
     # grep that matches nothing exits 1, pipefail propagates it, and set -e kills
     # the whole verb — printing NOTHING and exiting 1. That happens on any box
@@ -43259,7 +43864,7 @@ _proof_scorecard() {
 
   local group_rows
   group_rows="$(db "SELECT ${group_expr}, COUNT(*) FROM tasks
-                    WHERE status='done' AND kind='standard' AND done_at>=datetime('now','-7 days')
+                    WHERE status='done' AND kind='standard' AND done_at>=datetime('now',$(sqlq "$sql_window"))
                     GROUP BY 1 ORDER BY 2 DESC, 1;" 2>/dev/null || true)"
 
   # DIVE-1923: the ship ledger now sources "autonomous rollback rate". Four
@@ -43269,9 +43874,9 @@ _proof_scorecard() {
   # the ledger's start date are part of the metric, not metadata about it.
   local ships="" rollbacks="" rollbacks_unproven="" ledger_since=""
   if [ "$(db "SELECT 1 FROM sqlite_master WHERE type='table' AND name='ship_events' LIMIT 1;" 2>/dev/null)" = "1" ]; then
-    ships="$(db "SELECT COUNT(*) FROM ship_events WHERE kind='ship' AND ts>=datetime('now','-7 days');" 2>/dev/null || true)"
-    rollbacks="$(db "SELECT COUNT(*) FROM ship_events WHERE kind='rollback' AND self=1 AND ts>=datetime('now','-7 days');" 2>/dev/null || true)"
-    rollbacks_unproven="$(db "SELECT COUNT(*) FROM ship_events WHERE kind='rollback' AND self=0 AND ts>=datetime('now','-7 days');" 2>/dev/null || true)"
+    ships="$(db "SELECT COUNT(*) FROM ship_events WHERE kind='ship' AND ts>=datetime('now',$(sqlq "$sql_window"));" 2>/dev/null || true)"
+    rollbacks="$(db "SELECT COUNT(*) FROM ship_events WHERE kind='rollback' AND self=1 AND ts>=datetime('now',$(sqlq "$sql_window"));" 2>/dev/null || true)"
+    rollbacks_unproven="$(db "SELECT COUNT(*) FROM ship_events WHERE kind='rollback' AND self=0 AND ts>=datetime('now',$(sqlq "$sql_window"));" 2>/dev/null || true)"
     ledger_since="$(db "SELECT COALESCE(MIN(ts),'') FROM ship_events;" 2>/dev/null || true)"
   fi
 
@@ -43527,7 +44132,7 @@ cmd_proof() {
     -h|--help|"")
       cat <<'HELP'
 usage: 5dive proof status [--json]                    # LOCAL autonomy badge + config (no network)
-       5dive proof scorecard [--json] [--7d] [--by=tier|class]   # LOCAL multi-dim metrics by risk tier
+       5dive proof scorecard [--json] [--7d|--30d] [--by=tier|class]   # LOCAL multi-dim metrics by risk tier
        5dive proof on --repo=<url> [--branch=status] [--at=<0-23>] [--user=<u>]
                       [--as-name=<n> --as-email=<e>]   # identity commits are authored with
        5dive proof off

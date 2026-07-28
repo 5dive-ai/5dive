@@ -868,12 +868,33 @@ cmd_task_show() {
     dbfmt -line "SELECT ident, title, status, priority, assignee, created_by, parent_id, created_at, started_at, done_at, body, result FROM tasks WHERE id=${id};"
     # DIVE-1064: surface the creator's isolation tier (read-time from the
     # registry, no schema change) so a reader/agent can down-trust a task filed
-    # by a lower-privilege peer. Shown only when the creator is a known agent.
+    # by a lower-privilege peer.
+    #
+    # DIVE-2213: this used to print the line ONLY when the lookup came back
+    # non-empty, over a lookup whose stderr went to /dev/null — so an unreadable
+    # registry, a jq failure and a creator who genuinely has no tier all rendered
+    # as the line simply not being there, and a reader could not tell "no tier"
+    # from "not measured". Third instance of the DIVE-2210 shape (display-only;
+    # the decision-site instance is cmd_heartbeat.sh's DIVE-1065 guard).
+    #
+    # The line is now ALWAYS printed, in three distinguishable states. That
+    # changes `task show`'s human output shape for every task; checked first —
+    # origin/main across 5dive-cli / api / app / plugins / mcp has no consumer of
+    # this line other than the site emitting it, and the machine path is the
+    # --json branch above, which never carried it.
     local _cb _ctier=""
     _cb=$(db "SELECT COALESCE(created_by,'') FROM tasks WHERE id=${id};")
-    [[ -n "$_cb" ]] && _ctier="$(registry_read | jq -r --arg n "$_cb" '.agents[$n].isolation // empty' 2>/dev/null)"
-    [[ -n "$_ctier" ]] && printf 'created_by_tier = %s
-' "$_ctier"
+    _ctier="$(agent_tier "$_cb")"
+    case "$_ctier" in
+      unknown:no-caller)    printf 'created_by_tier = none (no creator recorded)
+' ;;
+      unknown:unregistered) printf 'created_by_tier = none (creator is not a registered agent)
+' ;;
+      unknown:*)            printf 'created_by_tier = %s (NOT measured)
+' "$_ctier" ;;
+      *)                    printf 'created_by_tier = %s
+' "$_ctier" ;;
+    esac
     # Human gate (only when set) — mirrors the conditional subtasks/blockers
     # blocks below so an ordinary task's `show` stays clean.
     local gate
@@ -1289,11 +1310,39 @@ _gate_slug_from_url() {
     | head -1 | sed -E 's#^(https://github\.com/|git@github\.com:)##; s#\.git$##' || true
 }
 
-# _gate_task_repo_slug <delivery_ref> <body> — the repo THIS TASK declared, or empty.
+# _gate_task_repo_slug <delivery_ref> <body> — the repo THIS TASK DECLARED, or empty.
 # Precedence: the delivery_ref URL (a delivered PR carries its own repo, which is why
 # ask 1 says prefer it) > an explicit `Repo: owner/repo` body line, the sibling of the
-# DIVE-1462 `Branch:` line > any github URL sitting in the body. Empty means unknown,
-# and unknown must stay unknown — it is never quietly filled in with a default.
+# DIVE-1462 `Branch:` line. Empty means unknown, and unknown must stay unknown — it is
+# never quietly filled in with a default.
+#
+# DIVE-1963: there was a THIRD fallback — any github URL sitting anywhere in the body —
+# and it read a URL that happened to be MENTIONED as a declaration of where this task's
+# work lives. DIVE-1955's own close is the specimen: its body QUOTES the constant it is
+# about (`_PUSH_DEFAULT_REPO="https://github.com/5dive-ai/5dive.git"`), so the gate
+# bound every bare `#N` to the CLI repo and never looked in api or frontend at all. The
+# ticket describing an implicit repo standing in for a missing one triggered a narrower
+# version of itself, sourced from prose instead of from a constant.
+#
+# Deleting it CANNOT lose coverage, which is why this is a deletion and not a widening:
+# with no declared repo a bare `#N` goes through the DIVE-1955 existence-count sweep,
+# which searches EVERY known repo — strictly a superset of the single repo the
+# inference picked. What it does delete is the sharper half. "The inferred repo misses"
+# is only one of the two cases; when the inferred repo HAS a `#N`, the old path handed
+# back a confident verdict about a pull request nobody claimed, which is the
+# "wrong, not blind" failure DIVE-1955 exists to remove. So the fix is NOT "sweep when
+# the inference misses" — that leaves the dangerous half untouched. Same rule DIVE-1965
+# settled one layer up: a binding comes from a STRUCTURED, INTENTIONAL signal, never
+# from "a URL appeared in the text". Prose is evidence of discussion, not declaration.
+#
+# The superset is over the CONFIGURED repo set, not over all of GitHub (Marcus, review):
+# `_gate_repo_slugs` is the world, and it is `FIVE_GATE_REPOS` when that is exported.
+# Unset — the default on every box — it is the three real repos, which is what makes the
+# claim hold in practice, and tests/task_merge_gate_inferred_repo_unit.sh pins that
+# default with the env cleared rather than leaving it asserted in prose. A box that
+# exports a NARROWER list narrows the sweep too, and there the deleted inference could
+# have named a repo outside the configured world — but a binding that reaches outside
+# the set the operator configured is its own defect, not coverage worth keeping.
 _gate_task_repo_slug() {
   local dref="$1" body="$2" s=""
   if [[ -n "$dref" ]]; then
@@ -1307,7 +1356,35 @@ _gate_task_repo_slug() {
     [[ -z "$s" && "$line" =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$ ]] && s="${line%.git}"
     [[ -n "$s" ]] && { printf '%s' "$s"; return 0; }
   fi
-  _gate_slug_from_url "$body"
+  return 0
+}
+
+# _gate_bind_slug <qualified-ref> <task_slug> — the ONE repo a ref binds to, or EMPTY
+# for "nothing binds it, sweep every known repo". Precedence: the repo the ref carries
+# itself (a pull URL) > the repo the TASK declared > unbound.
+#
+# DIVE-1963 (Marcus, review): the resolver and the message reporting its scope used to
+# derive this INDEPENDENTLY, and the original comment claimed they "cannot drift". They
+# agreed, but that is parallel derivation — two copies that happen to match today, which
+# buys "does not currently drift". Cannot-drift is what a shared definition buys, so
+# here it is: one function, two callers, and the sentence the reader gets is computed
+# from the same answer the lookup used. Same shape as the DIVE-1932 lesson — a rule that
+# holds because of the shape of the code, rather than because something declares it, is
+# preserved by nothing.
+_gate_bind_slug() {
+  local rslug="${1%%|*}"
+  [[ -z "$rslug" && -n "$2" ]] && rslug="$2"
+  printf '%s' "$rslug"
+}
+
+# _gate_search_scope <qualified-ref> <task_slug> — the repo(s) a ref is ACTUALLY looked
+# up in, comma-joined. DIVE-1963: the unresolvable warning said "in any known repo"
+# after searching exactly ONE, so the message asserted a sweep that never happened, and
+# a warning that misstates its own scope is the defect class this arc exists to delete.
+_gate_search_scope() {
+  local rslug; rslug=$(_gate_bind_slug "$1" "$2")
+  if [[ -n "$rslug" ]]; then printf '%s' "$rslug"
+  else _gate_repo_slugs | paste -sd, -; fi
 }
 
 # _gate_pr_probe <n> <tok> <slug> <ident> — one bounded read-only lookup of PR #n in
@@ -1349,8 +1426,10 @@ _gate_pr_probe() {
 # than admitting we do not know which pull request the maker meant.
 _gate_resolve_qualified() {
   local qref="$1" tok="$2" ident="$3" task_slug="$4"
-  local rslug="${qref%%|*}" n="${qref#*|}"
-  [[ -z "$rslug" && -n "$task_slug" ]] && rslug="$task_slug"
+  local n="${qref#*|}" rslug
+  # DIVE-1963: shared with `_gate_search_scope`, so the repo we look in and the repo the
+  # warning NAMES are one answer, not two derivations that agree.
+  rslug=$(_gate_bind_slug "$qref" "$task_slug")
   if [[ -n "$rslug" ]]; then
     local st; st=$(_gate_pr_state "$n" "$tok" "$rslug")
     [[ -n "$st" ]] && printf '%s|%s' "$rslug" "$st"
@@ -1593,6 +1672,37 @@ _task_status_cmd() {
     local _tpl_kind; _tpl_kind=$(db "SELECT kind FROM tasks WHERE id=${id};")
     if [[ "$_tpl_kind" == "recurring" ]]; then
       policy_refuse "$E_CONFLICT" start-on-recurring-template DIVE-2059 "$ident" "$ident is a recurring TEMPLATE (kind='recurring'), not a worked task — 'task start' has no meaning here and would silently stop it firing (the materializer only fires status='todo' templates, DIVE-2055/DIVE-2059). To stop the template use 'task cancel $ident', 'task block $ident --by=<id>', or 'task park $ident --reason=<why> --wake=<when>'. To work an instance it already fired, start that materialized child task instead."
+    fi
+    # DIVE-2113: `task start` silently REOPENED a closed, graded task for ANY
+    # actor — neither maker nor verifier. Measured on an isolated fixture:
+    # status done -> in_progress, rc=0, and the ONLY output was an advisory warn
+    # about the assignee. The result survived (milder than the DIVE-2112 reject
+    # bug, which destroyed it), but the grade then described a task the board
+    # showed as OPEN.
+    #
+    # Worse than first recorded, and measured here rather than assumed: done_at
+    # is NOT cleared, so the row lands in_progress WHILE STILL CARRYING a
+    # done_at — internally contradictory, and any reader or query keying off
+    # done_at disagrees with the one keying off status.
+    #
+    # Same family as DIVE-2112: a writer landing on a closed task with no status
+    # check. Measured CLEAN in the same sweep, recorded so nobody re-audits:
+    # block (rc=2), unblock (rc=0), unpark (rc=0), deliver (rc=2) — none mutated
+    # status or result on a closed task.
+    #
+    # NO ALTERNATIVE VERB IS NAMED IN THE REFUSAL, DELIBERATELY. A refusal that
+    # enumerates exits publishes a route around itself, and each named verb
+    # inherits an obligation it was never audited for — that is exactly how
+    # DIVE-2067 happened, where `task done`'s refusal pointed at an unguarded
+    # `task verify --cmd` and a landed verifier ACK was replaced 39 seconds
+    # later. See community/wiki/a-guard-advertises-its-own-bypass.md. A reopen
+    # path exists in the code, but it is not audited as an entry point to a
+    # CLOSED row, so this refusal will not advertise it.
+    local _cs _cd
+    _cs=$(db "SELECT status FROM tasks WHERE id=${id};")
+    if [[ "$_cs" == "done" || "$_cs" == "cancelled" ]]; then
+      _cd=$(db "SELECT COALESCE(done_at,'unknown') FROM tasks WHERE id=${id};")
+      policy_refuse "$E_CONFLICT" start-on-closed-task DIVE-2113 "$ident" "$ident is CLOSED (status='${_cs}', closed ${_cd}) — 'task start' would silently reopen it to in_progress while LEAVING done_at set, so the row contradicts itself and any recorded grade would describe a task the board shows as open. If it genuinely must be reopened, that is a deliberate decision and belongs on the record; no alternative verb is named here on purpose, because a refusal that lists exits publishes a route around itself (DIVE-2067)."
     fi
   fi
   # DIVE-1375: fail-loud preflight — surface identity/auth/repo gaps at `start`
@@ -1986,12 +2096,16 @@ $_body"
           AMBIGUOUS\|*)          _txt_amb="${_txt_amb:+$_txt_amb; }#${_qref#*|} in ${_st//,/, }" ;;
           *\|OPEN\|*)            _txt_open="${_qref#*|}"; _txt_open_slug="$_rslug"; break ;;
           *\|MERGED\|*\|FAILURE) _txt_red="${_txt_red:+$_txt_red,}${_rslug}#${_qref#*|}" ;;
-          \|)                    _txt_unres="${_txt_unres:+$_txt_unres,}${_qref#*|}" ;;
+          \|)                    _txt_unres="${_txt_unres:+$_txt_unres; }#${_qref#*|} in $(_gate_search_scope "$_qref" "$_task_slug")" ;;
         esac
       done < <(_gate_pr_refs_qualified_from_text "$_txt")
       if [[ -n "$_txt_unres" ]]; then
-        warn "$ident: could not resolve PR reference(s) #${_txt_unres//,/, #} named in the result/body in any known repo ($(_gate_repo_slugs | paste -sd, -)) — merge state UNVERIFIED for those. Cite the full pull URL, or add a \`Repo: <owner>/<repo>\` line, to have them checked."
-        _mg_unverified="${_mg_unverified:+$_mg_unverified; }PR reference(s) #${_txt_unres//,/, #} resolve to no PR in any known repo"
+        # DIVE-1963: name the repo(s) ACTUALLY searched, per ref. A ref carrying its own
+        # pull URL is looked up there and nowhere else; a bare #N in a task that declares
+        # a repo is looked up there and nowhere else; only a bare #N with no declaration
+        # gets the full sweep. One sentence covered all three and was false for two.
+        warn "$ident: could not resolve PR reference(s) named in the result/body — $_txt_unres — merge state UNVERIFIED for those. Cite the full pull URL, or add a \`Repo: <owner>/<repo>\` line, to have them checked."
+        _mg_unverified="${_mg_unverified:+$_mg_unverified; }PR reference(s) resolve to no PR in the repo(s) searched — $_txt_unres"
       fi
       if [[ -n "$_txt_amb" ]]; then
         warn "$ident: AMBIGUOUS PR reference(s) — $_txt_amb. A bare number does not identify a pull request across our repos and this task declares none, so the merge state is UNVERIFIED rather than guessed (DIVE-1955). Cite the full pull URL or add a \`Repo: <owner>/<repo>\` line to the body."
@@ -2298,7 +2412,7 @@ cmd_task_merge_audit() {
   done <<<"$rows"
   local payload; payload=$(printf '%s' "$json_rows" | jq -sc '.')
   if [[ "${JSON_MODE:-0}" != "1" ]] && (( unver + amb > 0 )); then
-    printf 'note: `unverified` = the number resolves to no PR in any known repo (%s).\n      `ambiguous` = a bare "PR #N" that exists in more than one of them and the task\n      declares no repo, so no single verdict is defensible. NEITHER is evidence of an\n      unmerged PR, and neither is evidence of a clean one. Cite the full pull URL, or\n      add a `Repo: <owner>/<repo>` line to the task body, to have them resolved.\n' "$slugs"
+    printf 'note: `unverified` = the number resolves to no PR in the repo(s) searched FOR THAT\n      TASK — the one its own record DECLARES (a delivery_ref URL or a `Repo:` line) when it\n      declares one, else all of %s (DIVE-1963).\n      `ambiguous` = a bare "PR #N" that exists in more than one of them and the task\n      declares no repo, so no single verdict is defensible. NEITHER is evidence of an\n      unmerged PR, and neither is evidence of a clean one. Cite the full pull URL, or\n      add a `Repo: <owner>/<repo>` line to the task body, to have them resolved.\n' "$slugs"
   fi
   ok "merge-audit: scanned the newest $limit done task(s) across $slugs — $findings PR reference(s) not merged-and-green ($unver unverified, $amb ambiguous)" \
      '{scanned:($n|tonumber), repos:($rp|split(",")), findings:($f|tonumber), unverified:($u|tonumber), ambiguous:($a|tonumber), rows:($r|fromjson)}' \
@@ -2402,7 +2516,56 @@ cmd_task_reject() {
   # manual gate to a human on purpose.
   local _open_gate; _open_gate=$(db "SELECT CASE WHEN need_type IS NOT NULL
         AND need_answered_at IS NULL THEN 1 ELSE 0 END FROM tasks WHERE id=${id};")
+  # DIVE-2196: ...but NOT a tier-2 one. The supersede below writes
+  # need_answered_by='auto:reject' with raw SQL, which is a NON-HUMAN provenance on
+  # a gate the tier-2 floor exists to keep human-only — cmd_task_answer refuses
+  # exactly that write, and this path reaches around it. `task done` over a live
+  # gate is already refused (DIVE-555); reject was the remaining verb by which an
+  # agent could clear a human's pending question as a side effect of its own move.
+  # Scoped to an AGENT actor: a genuine human caller is the very party the gate is
+  # waiting on, and an unattributable one ('none': CI, root cron) is the different
+  # question DIVE-2007 got wrong by answering it here. Tier<=1 keeps DIVE-1495's
+  # supersede untouched — a fleet-actionable gate is one an agent could have
+  # cleared anyway, and leaving it pending is the CNCL-9 re-nag defect.
   if [[ "$_open_gate" == "1" ]]; then
+    # EXPLICIT tier only. Every gate filed through `task need` writes a tier, so a
+    # NULL one is a legacy or hand-inserted row that predates tiers — inferring a
+    # human-only floor from a missing value would retro-fit this refusal onto rows
+    # nobody ever tiered and silently break DIVE-1495's supersede where it has
+    # always applied (caught by tests/gate_verifier_route_unit.sh, whose DIVE-505
+    # fixture is exactly that shape). Fail-closed on an absent tier belongs where a
+    # gate is being ANSWERED — a grant; here the question is whether a rail that has
+    # worked since DIVE-1495 keeps working.
+    local _og_tier _og_type _og_actor _og_kind
+    _og_tier=$(db "SELECT COALESCE(tier,'')            FROM tasks WHERE id=${id};")
+    _og_type=$(db "SELECT COALESCE(need_type,'gate')   FROM tasks WHERE id=${id};")
+    _og_actor=$(_gate_withdraw_actor)          # "agent <name>" | "human" | "none"
+    _og_kind="${_og_actor%% *}"
+    if [[ -n "$_og_tier" && "$_og_tier" -ge 2 && "$_og_kind" == "agent" ]]; then
+      # MIRROR QUESTION (main, pre-merge): what does this guard make unreachable?
+      # A verifier who grades the work a FAIL while a tier-2 gate stands. If the
+      # only answer were "wait for the human", the rail would convert a
+      # wrong-but-moving state into a correct-but-stuck one and the next agent
+      # would route around it. So the refusal PRINTS the exit, and which exit
+      # depends on who the caller is:
+      #   - you filed the gate  -> you can retire it yourself: `need --withdraw`
+      #     then reject. Two explicit steps, one of them recorded in gate_history
+      #     as a withdrawal, which is the whole difference from a forged answer.
+      #   - someone else filed it -> you cannot retire their ask and must not
+      #     answer it for them, but your GRADE does not have to wait on it:
+      #     `task set-body --append` records the verdict now, the reject lands
+      #     when the gate clears. Nothing is lost, only the loop transition waits.
+      local _og_filer _og_me _og_exit
+      _og_filer=$(db "SELECT COALESCE(NULLIF(gate_filed_by,''), assignee, '') FROM tasks WHERE id=${id};")
+      _og_me="${_og_actor#agent }"
+      if [[ -n "$_og_filer" && "$_og_filer" == "$_og_me" ]]; then
+        _og_exit="You filed this gate, so you can retire it yourself: '5dive task need $ident --withdraw' (a withdrawal, archived to gate_history — not an answer put in a human's mouth), then reject. Do that only if your grade makes the question genuinely moot."
+      else
+        _og_exit="'${_og_filer:-its filer}' or their lead can withdraw it ('5dive task need $ident --withdraw') if your grade makes the question moot — ask them, do not answer it for them. Your grade does not have to wait on that: record it now with '5dive task set-body $ident \"VERDICT: ...\" --append' and send it to the maker, then reject once the gate clears."
+      fi
+      policy_refuse "$E_CONFLICT" reject-over-tier2-gate DIVE-2196 "$ident" \
+        "$ident has an OPEN tier-2 ${_og_type} gate awaiting a human — rejecting it would mark that gate '(superseded)' with provenance 'auto:reject', i.e. an agent clearing a human-only gate as a side effect of its own move (DIVE-1117 floor, DIVE-2196). The wait is on the human, not on you. ${_og_exit} A human answering it ('5dive task answer $ident --value=...') also clears the way."
+    fi
     local _sup_ts; _sup_ts=$(date -u '+%Y-%m-%d %H:%M:%S')
     db "UPDATE tasks SET need_answer='(superseded — task rejected, bounced to maker)',
           need_answered_at=$(sqlq "$_sup_ts"), need_answered_by='auto:reject', gate_pinged_at=NULL
@@ -2895,6 +3058,23 @@ cmd_task_verify() {
 
   local flipped=0
   if (( rc == 0 )) && (( ! no_done )); then
+    # DIVE-2196: this auto-close is a TERMINAL CLOSE reached by raw UPDATE, so it
+    # never saw DIVE-555's pending-gate refusal — `task verify --cmd=true` closed a
+    # task out from under an unanswered human gate, and the question then vanished
+    # from every open-gate view (they all require an open status). That is the same
+    # bypass DIVE-2067 recorded on the ACK axis: the refusal on `task done` NAMES
+    # `task verify` as an alternative, and the named alternative carried no
+    # equivalent check. Refusing here is what makes the `done`/`reject` rails real
+    # rather than advisory. The verify RESULT is still recorded first — the evidence
+    # is worth keeping and is not what the gate is protecting; only the close waits.
+    local _vg_t _vg_a
+    _vg_t=$(db "SELECT COALESCE(need_type,'')        FROM tasks WHERE id=${id};")
+    _vg_a=$(db "SELECT COALESCE(need_answered_at,'') FROM tasks WHERE id=${id};")
+    if [[ -n "$_vg_t" && -z "$_vg_a" ]]; then
+      db "UPDATE tasks SET result=$(sqlq "$result_txt") WHERE id=${id};"
+      policy_refuse "$E_CONFLICT" verify-close-over-open-gate DIVE-2196 "$ident" \
+        "$ident has a pending '${_vg_t}' gate awaiting a human — the verify verdict is RECORDED, but the auto-close is refused: closing here would drop the human's question out of every open-gate view without anyone answering it, which is DIVE-555's bypass reached by a different verb. Exits: let them answer it ('5dive task answer $ident --value=...'), withdraw it if your result makes it moot ('5dive task need $ident --withdraw'), or re-run with --no-done to record evidence without closing."
+    fi
     db "UPDATE tasks SET status='done', done_at=datetime('now'), result=$(sqlq "$result_txt") WHERE id=${id};"
     flipped=1
     # DIVE-1415: `task verify` auto-done is a terminal close like `task done`, so
@@ -3805,7 +3985,7 @@ cmd_task_need() {
           SET need_type=NULL, ask=NULL, need_options=NULL, recommend=NULL,
               secret_key=NULL, connector=NULL, ask_shape=NULL,
               precedent_ref=NULL, precedent_kind=NULL, routed_reviewer=NULL,
-              need_asked_at=NULL, gate_pinged_at=NULL
+              need_asked_at=NULL, gate_pinged_at=NULL, gate_filed_by=NULL
         WHERE id=${id};
         UPDATE tasks SET status='todo'
           WHERE id=${id} AND status='blocked'
@@ -4223,6 +4403,16 @@ cmd_task_need() {
   # `task answer` knows who to ping to resume. The inbox is defined by the gate
   # (need_type set), not by assignee, so it still surfaces to the human.
   local actor; actor=$(task_actor "$from")
+  # DIVE-2196: filing a gate on a task DELIVERED to you IS an act of review — the
+  # verifier demonstrably opened it and escalated. Stamp the handoff ACK in the same
+  # transaction, so "reviewed it and escalated to a human" stops being byte-identical
+  # to "never looked at it": handoff_ack_at NULL is what the stall sweep, `task show`
+  # and the loop board all read as UNACKNOWLEDGED, and on DIVE-2146 that made the
+  # sweep nag a verifier who had already graded and escalated. Same receiver rule as
+  # DIVE-1378's `task start` ACK — the REAL actor only (never --from, which would let
+  # a third party forge the verifier's receipt), only while they are the assigned
+  # verifier of a delivered row, COALESCE so a set ACK never moves.
+  local _ack_actor; _ack_actor=$(task_actor)
   # DIVE-2119: a re-file DESTROYS the previous gate — archive it to gate_history
   # and reset all six provenance columns in the same transaction, before the
   # SET below overwrites need_type/ask/tier. Without the archive the previous
@@ -4232,6 +4422,12 @@ cmd_task_need() {
       $(_gate_archive_and_clear_sql file "id=${id}")
       UPDATE tasks
         SET status='blocked', assignee=$(sqlq "$actor"),
+            handoff_ack_at=CASE
+              WHEN maker_agent IS NOT NULL AND verifier IS NOT NULL
+                   AND assignee=verifier AND verifier=$(sqlq "$_ack_actor")
+                   AND handoff_delivered_at IS NOT NULL
+              THEN COALESCE(handoff_ack_at, datetime('now'))
+              ELSE handoff_ack_at END,
             need_type=$(sqlq "$type"), ask=$(sqlq "$ask"),
             need_options=$(sqlq_or_null "$options"),
             recommend=$(sqlq_or_null "$recommend"),
@@ -4240,7 +4436,8 @@ cmd_task_need() {
             ask_shape=$(sqlq_or_null "$ask_shape"),
             precedent_ref=${precedent_ref:-NULL},
             precedent_kind=$(sqlq_or_null "$precedent_kind"),
-            tier=${tier}, need_asked_at=datetime('now'), gate_pinged_at=NULL
+            tier=${tier}, need_asked_at=datetime('now'), gate_pinged_at=NULL,
+            gate_filed_by=$(sqlq "$actor")
       WHERE id=${id};
       COMMIT;"
 
@@ -4887,10 +5084,19 @@ cmd_task_gate_escalate() {
   _gate_is_root || fail "$E_PERMISSION" "task gate-escalate must run as root (it reads other agents' channel state)"
 
   resolve_task_id "$ident_arg"; local id="$RESOLVED_TASK_ID" ident="$RESOLVED_TASK_IDENT"
+  # DIVE-1945: the filer is the gate's FILER-OF-RECORD (gate_filed_by, stamped by
+  # cmd_task_need from the acting agent), NOT the task's created_by. They differ
+  # whenever one agent files a gate on another agent's task — and then this walked
+  # the CREATOR's branch of the org chart and the alert read "filed by <creator>
+  # (no channel of its own)", wrong attribution about an agent that may well have
+  # one. Same bug DIVE-1927 fixed on the `task need` path via TASK_GATE_FILER,
+  # surviving here because this process cannot see that env var: it is a separate
+  # privileged run driven by the re-nag, so the filer has to come off the ROW.
+  # created_by remains the fallback for gates filed before the column existed.
   local grow
   grow=$(db "SELECT COALESCE(need_type,'')||x'1f'||COALESCE(ask,'')||x'1f'||COALESCE(need_options,'')||x'1f'||
                     COALESCE(recommend,'')||x'1f'||COALESCE(secret_key,'')||x'1f'||COALESCE(connector,'')||x'1f'||
-                    COALESCE(NULLIF(created_by,''),assignee,'')
+                    COALESCE(NULLIF(gate_filed_by,''),NULLIF(created_by,''),assignee,'')
              FROM tasks
              WHERE id=${id} AND need_type IS NOT NULL AND need_answered_at IS NULL
                AND status NOT IN ('done','cancelled');")

@@ -9,6 +9,17 @@
 # `gh` is STUBBED on PATH so the gate's merge check is fully controllable.
 # Run: bash tests/task_deliver_merge_gate_unit.sh  (no root, no network).
 set -uo pipefail
+
+# DIVE-2211: name the tree this harness grades (tests/lib/grading_tree.sh).
+# Three-state: if the helper is unreachable (a staged copy that did not carry
+# tests/lib/), the log says NO TREE WAS NAMED rather than falling silent, and a
+# `set -e` harness is not killed by a failed source.
+# NOTE the absence of `2>/dev/null`. The obvious hardening -- redirect the
+# source's stderr so bash's "No such file" does not litter the log -- also
+# swallows the helper's own stderr line, which IS the payload. That silenced all
+# 210 harnesses at once while every other check in this change stayed green.
+. "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh" \
+  || printf 'grading tree: UNRESOLVED (tests/lib/grading_tree.sh not reachable; no tree named)\n' >&2
 cd "$(dirname "$0")/.."
 SRC=src
 TMP="$(mktemp -d /tmp/deliver-gate-unit.XXXXXX)"
@@ -22,6 +33,26 @@ trap 'rm -rf "$TMP"' EXIT
 mkdir -p "$TMP/bin"
 printf '#!/usr/bin/env bash\nexit 1\n' >"$TMP/bin/sudo"
 chmod +x "$TMP/bin/sudo"
+# DIVE-2114/DIVE-2066: PIN THE ACTOR. Tb/Tc call cmd_task_done with no actor, so
+# task_actor() (src/lib/tasks_db.sh) falls through auto_sender_from_sudo — dead
+# here because sudo is stubbed to exit 1 — and lands on the REAL $USER, stripped
+# of an `agent-` prefix. The fixture hardcodes DIVE-201's verifier as `dev`, and
+# DIVE-2007's writer-!=-grader rail refuses anyone else with a DIVE-477 message.
+# Tb/Tc assert on the DIVE-1830 merge-gate text, so they read GREEN only on a box
+# whose $USER strips to literally `dev` and RED everywhere else. That is the same
+# env leak sudo/gh are already stubbed against three lines up — the harness's own
+# greenness depended on who ran it, which makes it a regression detector for
+# nobody. Measured before the pin: 9 passed / 2 failed as both `claude` and
+# `agent-dev2`; the refusal named DIVE-477, not DIVE-1830.
+# BOTH vars, and SUDO_USER is the one that actually bit: task_actor() consults
+# auto_sender_from_sudo() FIRST, which reads $SUDO_USER (validation.sh:73) — so
+# under any `sudo -u X bash tests/...` the invoking agent leaks in and wins
+# before $USER is ever read. DIVE-2066 recorded this as a $USER leak; measured
+# here it is SUDO_USER that dominates, which is why pinning $USER alone changed
+# nothing (still 9/2, actor still resolved to 'main').
+SUDO_USER=agent-dev
+USER=agent-dev
+export SUDO_USER USER
 cat >"$TMP/bin/gh" <<'STUB'
 #!/usr/bin/env bash
 # Minimal stand-in for all three merge-gate calls:

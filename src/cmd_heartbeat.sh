@@ -1563,6 +1563,10 @@ _hb_gate_renag_sweep() {
   # T1 gates: group by the existing routed reviewer / org-lead resolution. A
   # lead's own T1 gate uses the coordinator/root channel instead of escalating
   # to the paired-human lane reserved for T2.
+  # DIVE-1945: this lane resolves the reviewer FROM the filer's org position, so
+  # it is a whose-ask-is-this question and takes gate_filed_by — unlike the T2
+  # sweep above, which batches by the channel OWNER and correctly stays on
+  # created_by. Same COALESCE fallback for pre-column gates.
   local grow gid filer reviewer routed
   declare -A lead_ids=()
   while IFS= read -r grow; do
@@ -1577,7 +1581,7 @@ _hb_gate_renag_sweep() {
       continue
     fi
     lead_ids[$reviewer]+="${lead_ids[$reviewer]:+,}${gid}"
-  done < <(db "SELECT id||x'1f'||COALESCE(NULLIF(created_by,''),assignee,'')||x'1f'||COALESCE(routed_reviewer,'')
+  done < <(db "SELECT id||x'1f'||COALESCE(NULLIF(gate_filed_by,''),NULLIF(created_by,''),assignee,'')||x'1f'||COALESCE(routed_reviewer,'')
                FROM tasks WHERE ${_HB_GATE_RENAG_WHERE} AND tier=1
                ORDER BY COALESCE(need_asked_at,updated_at,created_at),id;")
   for reviewer in "${!lead_ids[@]}"; do
@@ -1892,6 +1896,21 @@ _hb_fleet_activity_probe() {
 
 _hb_stall_sweep() {
   # (a) GAP#2 — surface stale maker->verifier deliveries.
+  #
+  # DIVE-2196: a row BLOCKED on an unanswered human gate is excluded. 'blocked' is
+  # not in ('done','cancelled'), so such a row used to pass the filter and get
+  # nagged — but the wait there is on a HUMAN, not on the verifier, and the remedy
+  # this ping prescribes is the harmful action: on a maker->verifier task the
+  # verifier's ACK *is* the close, so "run task start then task done/task reject"
+  # asks them to resolve a pending human gate by side effect. Fired live on
+  # DIVE-2146, whose gate asked lodar to choose between leaving it open and closing
+  # it as delivered — i.e. the nag pushed option B in a question nobody had
+  # answered. The gate-live predicate matches the one inbox/show/park use
+  # (need_type set AND not yet answered; status is already constrained above).
+  # An ANSWERED gate does not exclude: the wait is back on the verifier.
+  # (gap#3's stranded_todo below keeps its own predicate — it counts status='todo'
+  # rows, and a gate-blocked row is 'blocked'; open gates are counted by open_gates,
+  # where a pinged tier-2 gate is deliberately PARKED rather than stranded.)
   local vrow vid vident vfier vdelivered vmins
   while IFS= read -r vrow; do
     [[ -n "$vrow" ]] || continue
@@ -1910,6 +1929,7 @@ _hb_stall_sweep() {
                  AND assignee=verifier AND status NOT IN ('done','cancelled')
                  AND handoff_ack_at IS NULL AND handoff_stale_pinged_at IS NULL
                  AND handoff_delivered_at IS NOT NULL
+                 AND NOT (need_type IS NOT NULL AND need_answered_at IS NULL)
                  AND handoff_delivered_at <= datetime('now','-${_HB_VERIFY_STALE_MIN} minutes');")
 
   # (b) GAP#3 core — fleet-idle-while-actionable-work-is-open, persisting.
@@ -2399,16 +2419,51 @@ cmd_heartbeat_tick() {
     # this, the heartbeat would auto-run it (privilege-escalation-by-queue). If
     # the task's creator is strictly LOWER-privileged than its assignee, HOLD the
     # task (don't auto-wake) — a human or the assignee can still run it manually.
-    # Isolated + best-effort: any lookup miss falls through to the normal wake and
-    # never aborts the tick (a self-assigned task, human/unknown creator, or an
-    # equal/higher-tier creator is unaffected).
+    #
+    # DIVE-2213 — this used to read the two tiers with `jq ... 2>/dev/null` and
+    # rank an empty result 0, then skip itself whenever either rank was 0. That
+    # made a lookup that NEVER HAPPENED indistinguishable from a creator who
+    # legitimately has no tier, and the tie went to running the work: an
+    # unmeasured tier DISABLED the guard. Same collapse as DIVE-2210's envelope,
+    # one class worse because this is a decision, not a display.
+    #
+    # The ticket framed the fix as a binary — hold everything unmeasured (fail
+    # closed, may stall the fleet) or wake with a loud log (fail open, no longer
+    # silent). It is a FALSE binary, and rank-0 is what disguised it. Two
+    # populations were sharing that bucket and they want OPPOSITE policies:
+    #
+    #   MEASURED, no tier  — the creator is not a registered agent: a human, or
+    #     an external filer. This is the majority of the board. Falling through
+    #     is not a failure mode, it is DIVE-1065's intent. Holding here would
+    #     stall every human-filed task fleet-wide, which is the cost the ticket
+    #     was (correctly) afraid of.
+    #   NOT MEASURED       — registry absent/unreadable/unparsable, jq errored,
+    #     or the agent IS registered and its isolation is missing/malformed. We
+    #     have no basis to rank either side, so ranking them 0 asserts something
+    #     we do not know. HOLD.
+    #
+    # Holding only the second is cheap: a healthy registry never produces it, so
+    # this cannot stall the fleet in steady state, and each cause names itself in
+    # the log so a hold is repairable rather than mysterious. agent_tier() +
+    # tier_unmeasured() (src/lib/registry.sh) draw exactly that line — note they
+    # are NOT envelope_tier(), which folds both populations into
+    # `unknown:unregistered` because a wire format has no decision to make.
+    #
+    # Still isolated: a hold skips ONE agent's wake this tick and never aborts
+    # the tick. A self-assigned task and an equal/higher-tier creator are
+    # unaffected.
     local _cby _ctier _atier
     _cby=$(db "SELECT COALESCE(created_by,'') FROM tasks WHERE id=${task_id};" 2>/dev/null || echo "")
     if [[ -n "$_cby" && "$_cby" != "$name" ]]; then
-      _ctier=$(jq -r --arg n "$_cby"  '.agents[$n].isolation // empty' <<<"$reg" 2>/dev/null)
-      _atier=$(jq -r --arg n "$name"  '.agents[$n].isolation // empty' <<<"$reg" 2>/dev/null)
+      _ctier=$(agent_tier "$_cby"); _atier=$(agent_tier "$name")
+      if tier_unmeasured "$_ctier" || tier_unmeasured "$_atier"; then
+        _hb_log "[$name] task ${task_ident} tier NOT MEASURED (creator ${_cby}=${_ctier}, assignee ${name}=${_atier}) — holding, not auto-running (DIVE-2213)"
+        continue
+      fi
+      # Only measured values reach the ranking. `unknown:unregistered` ranks 0
+      # via the catch-all, which is the human/external fall-through above.
       local _cr _ar
-      _cr=$(_hb_tier_rank "${_ctier:-}"); _ar=$(_hb_tier_rank "${_atier:-}")
+      _cr=$(_hb_tier_rank "$_ctier"); _ar=$(_hb_tier_rank "$_atier")
       if (( _cr > 0 && _ar > 0 && _cr < _ar )); then
         _hb_log "[$name] task ${task_ident} created by lower-tier ${_cby}(${_ctier}) < assignee(${_atier}) — holding, not auto-running"
         continue

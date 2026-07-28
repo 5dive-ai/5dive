@@ -5,10 +5,27 @@
 # Harness mirrors gate_ship_routing_unit.sh: source src/ libs, throwaway STATE_DIR,
 # no root, no network. Run: bash tests/gate_verifier_route_unit.sh
 set -uo pipefail
+
+# DIVE-2211: name the tree this harness grades (tests/lib/grading_tree.sh).
+# Three-state: if the helper is unreachable (a staged copy that did not carry
+# tests/lib/), the log says NO TREE WAS NAMED rather than falling silent, and a
+# `set -e` harness is not killed by a failed source.
+# NOTE the absence of `2>/dev/null`. The obvious hardening -- redirect the
+# source's stderr so bash's "No such file" does not litter the log -- also
+# swallows the helper's own stderr line, which IS the payload. That silenced all
+# 210 harnesses at once while every other check in this change stayed green.
+. "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh" \
+  || printf 'grading tree: UNRESOLVED (tests/lib/grading_tree.sh not reachable; no tree named)\n' >&2
 cd "$(dirname "$0")/.."
 SRC=src
 TMP="$(mktemp -d /tmp/gate-vfroute-unit.XXXXXX)"
-trap 'rm -rf "$TMP"' EXIT
+# DIVE-2190: this harness has no `set -e`, but `fail()` exits the whole script, so a
+# refusal inside any cmd_* call ends the run with the last line on screen being an `ok`
+# and NO summary — a red that looks like a pass that stopped early. Say so, loudly, and
+# without touching the exit status the verdict line set.
+SUMMARY_PRINTED=0
+# shellcheck disable=SC2154  # rc is assigned inside the trap body
+trap 'rc=$?; rm -rf "$TMP"; [[ "$SUMMARY_PRINTED" == 1 ]] || printf "ABORTED - gate_verifier_route_unit exited early (rc=%s) before its summary; every assertion after the last ok above was SKIPPED, not passed\n" "$rc" >&2' EXIT
 
 for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh \
          lib/agent_setup.sh lib/state.sh lib/audit.sh lib/registry.sh \
@@ -16,6 +33,18 @@ for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh \
   # shellcheck source=/dev/null
   source "$SRC/$f"
 done
+# DIVE-2190: the harness isolates STATE_DIR but the CALLER IDENTITY is ambient — task_actor
+# reads SUDO_USER/USER — while the fixtures hard-code real agent names (maker='dev'). Run this
+# suite as the agent literally named `dev` and the DIVE-2112 self-grading guard fires on step 5's
+# reject for the right reason, killing the run. CI runs as a user matching no fixture, so it is
+# permanently green there. Pin identity the way STATE_DIR is pinned, so WHO runs the suite stops
+# being an input. Wrapping the REAL resolver (rather than reimplementing it) keeps the --from
+# precedence under test instead of under simulation, and keeps the override inside this shell —
+# there is deliberately no env var that could forge an actor in production.
+eval "task_actor_REAL() $(declare -f task_actor | tail -n +2)"
+FIXTURE_ACTOR=fixture-runner   # not a real agent; set per-step to impersonate one on purpose
+task_actor() { USER="agent-${FIXTURE_ACTOR}" SUDO_USER='' task_actor_REAL "$@"; }
+
 STATE_DIR="$TMP"; TASKS_DIR="$STATE_DIR/tasks"; TASKS_DB="$TASKS_DIR/tasks.db"
 JSON_MODE=1
 mkdir -p "$TASKS_DIR"; set +e
@@ -92,7 +121,10 @@ cmd_task_need DIVE-504 --type=decision --options='A|B' --recommend='A' \
 db "INSERT INTO tasks(ident,title,status,created_by,assignee,verifier,maker_agent,iteration,max_iterations,
       need_type,ask,need_answered_at)
     VALUES('DIVE-505','loop','blocked','dev','dev','main','dev',1,5,'manual','pending human thing',NULL);"
-cmd_task_reject DIVE-505 --feedback='needs another pass' >/dev/null 2>&1
+# DIVE-2190: stdout only. This call can END the harness (cmd_* refusals go through fail()),
+# and `2>&1` sent the one line explaining WHY straight to /dev/null — the failure erased its
+# own reason. Redirect noise, never diagnosis.
+cmd_task_reject DIVE-505 --feedback='needs another pass' >/dev/null
 gate_open=$(db "SELECT CASE WHEN need_type IS NOT NULL AND need_answered_at IS NULL THEN 1 ELSE 0 END FROM tasks WHERE ident='DIVE-505';")
 answered_by=$(db "SELECT COALESCE(need_answered_by,'') FROM tasks WHERE ident='DIVE-505';")
 [[ "$gate_open" == "0" && "$answered_by" == "auto:reject" ]] \
@@ -102,6 +134,26 @@ answered_by=$(db "SELECT COALESCE(need_answered_by,'') FROM tasks WHERE ident='D
   && ok_t "rejected task still bounces to maker (status todo)" \
   || bad_t "rejected task still bounces to maker (status todo)" "status=$(db "SELECT status FROM tasks WHERE ident='DIVE-505';")"
 
+# ---- 6. the identity pin is a pin, not an off switch (DIVE-2190 negative control) ----
+# Step 5 only passes because the actor is NOT the maker. Impersonate the maker on purpose and
+# the DIVE-2112 guard must still refuse — otherwise a pin that silently resolved to "nobody"
+# would look identical to a working one. Subshell: policy_refuse exits, and that exit is the
+# assertion here, not an abort.
+db "INSERT INTO tasks(ident,title,status,created_by,assignee,verifier,maker_agent,iteration,max_iterations,
+      need_type,ask,need_answered_at)
+    VALUES('DIVE-506','loop','blocked','dev','dev','main','dev',1,5,'manual','pending human thing',NULL);"
+FIXTURE_ACTOR=dev
+rj_out=$(cmd_task_reject DIVE-506 --feedback='maker grading itself' 2>&1); rj_rc=$?
+FIXTURE_ACTOR=fixture-runner
+[[ "$rj_rc" != "0" && "$rj_out" == *MAKER* ]] \
+  && ok_t "maker impersonation is still refused (identity pin does not disarm DIVE-2112)" \
+  || bad_t "maker impersonation is still refused" "rc=$rj_rc out=${rj_out//$'\n'/ }"
+[[ "$(db "SELECT status FROM tasks WHERE ident='DIVE-506';")" == "blocked" \
+   && "$(db "SELECT COALESCE(need_answered_by,'') FROM tasks WHERE ident='DIVE-506';")" == "" ]] \
+  && ok_t "refused reject wrote nothing (status and gate untouched)" \
+  || bad_t "refused reject wrote nothing" "status=$(db "SELECT status FROM tasks WHERE ident='DIVE-506';") answered_by=$(db "SELECT need_answered_by FROM tasks WHERE ident='DIVE-506';")"
+
 echo "-----"
 echo "gate_verifier_route_unit: $PASS passed, $FAIL failed"
+SUMMARY_PRINTED=1
 [[ "$FAIL" == "0" ]]

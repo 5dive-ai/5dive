@@ -924,16 +924,18 @@ cmd_deliver() {
   # Sender + tier from the real sudo caller (agent-X -> X). A non-agent caller
   # (direct root / human) records as "human"; tier is empty unless the sender is
   # a registered agent. Mirrors auto_sender_from_sudo + the DIVE-1064 tier stamp.
-  local s="${SUDO_USER#agent-}"
-  [[ "${SUDO_USER:-}" == agent-* ]] || s="human"
-  local tier=""
-  tier="$(registry_read | jq -r --arg n "$s" '.agents[$n].isolation // empty' 2>/dev/null)"
+  local s="${SUDO_USER#agent-}" _caller=""
+  if [[ "${SUDO_USER:-}" == agent-* ]]; then _caller="$s"; else s="human"; fi
+  # DIVE-2210: ALWAYS stamped, never conditional. A non-agent caller gets
+  # tier=unknown:no-caller rather than a clean envelope with the field missing.
+  local tier
+  tier="$(envelope_tier "$_caller")"
 
   # Provenance envelope, mirroring cmd_send's [5dive-msg ...] header format.
   # Field order matches cmd_send: from, id, tier.
   local header="[5dive-msg from=${s}"
   [[ -n "$msgid" ]] && header+=" id=${msgid}"
-  [[ -n "$tier" ]] && header+=" tier=${tier}"
+  header+=" tier=${tier}"
   header+="]"
   local payload="${header} ${message}"
 
@@ -999,9 +1001,64 @@ cmd_capture() {
 
   local capture
   capture=$(sudo -u "agent-${target}" tmux capture-pane -t "agent-${target}" -p -S "-${buf_lines}" 2>/dev/null) || true
+
+  # DIVE-1931: fold this frame into a transcript BEFORE slicing, so the marker
+  # survives scroll-off.
+  #
+  # `-S` is not a window we can rely on: a full-screen TUI is an alternate-screen
+  # pane, whose scrollback is per-harness and often absent (DIVE-1901), so this
+  # capture is frequently just the ~24 visible lines. A single point-in-time read
+  # therefore loses the `id=<after-id>` line the moment a long reply pushes it off
+  # screen — and with the anchor gone the awk below matches nothing and returns
+  # EMPTY while the seat has answered. The direct path already solves this by
+  # accumulating frames; the caller cannot do that here because the slice happens
+  # on the far side of the sudo boundary and empty is all it ever sees.
+  #
+  # So the accumulation moves in here, and the bound stays privileged-side —
+  # which is the point. This does NOT widen the read surface: the output is still
+  # only "after MY marker, before the next [5dive-msg", and every line in the
+  # transcript is a line this same caller was already handed by an earlier
+  # `_capture` in its own poll loop. Folding frames is something the caller could
+  # have done itself with the returns it already had; doing it here is what lets
+  # the SLICE still be applied to them. What a caller cannot get remains exactly
+  # what it could not get before: anything preceding its own marker (the awk only
+  # starts printing after it), anything past the next message boundary, and any
+  # window whose id it did not mint (gen_msg_id is 4-byte urandom).
+  #
+  # Keyed by (caller uid, target, marker) so concurrent asks — a convene fans out
+  # ballots in parallel — never share a transcript, and one caller cannot feed
+  # frames into another's. Root-owned and owner-only: the transcript itself is
+  # never emitted, only the slice of it. (Under /var/lib/5dive, which is 2750,
+  # the dir inherits the setgid bit and reads 2700 — group and other still have
+  # no bits, which is the property that matters.)
+  local acc_dir="${FIVE_CAPTURE_ACC_DIR:-/var/lib/5dive/capture-acc}"
+  local uid_key="${SUDO_UID:-0}"
+  # SUDO_UID is only meaningful because we are EUID 0 here (require_root above);
+  # validate anyway so the key can never be anything but a filename component.
+  [[ "$uid_key" =~ ^[0-9]{1,10}$ ]] || uid_key="0"
+  local acc_file=""
+  if mkdir -p "$acc_dir" 2>/dev/null && chmod 700 "$acc_dir" 2>/dev/null; then
+    # Bound the store: a transcript outlives at most one ask (`--timeout` is
+    # minutes), so anything untouched for an hour is abandoned. Without this the
+    # dir grows one file per ask, forever.
+    find "$acc_dir" -maxdepth 1 -type f -mmin +60 -delete 2>/dev/null || true
+    acc_file="${acc_dir}/${uid_key}.${target}.${after_id}"
+    if : >> "$acc_file" 2>/dev/null; then
+      chmod 600 "$acc_file" 2>/dev/null || true
+    else
+      acc_file=""
+    fi
+  fi
+  # Fail OPEN to the old single-frame behaviour if the store is unavailable: a
+  # read-only /var/lib must degrade `ask` to the pre-DIVE-1931 capture, not
+  # break it.
+  if [[ -n "$acc_file" ]]; then
+    capture=$(_ask_accumulate "$acc_file" <<<"$capture")
+  fi
+
   # Slice: lines AFTER the first line containing id=<after-id>, stopping BEFORE
   # the next [5dive-msg marker (bounds the read to a single reply window). Empty
-  # output if the marker isn't present yet — the caller (`ask`) polls until the
+  # output if the marker has not been seen yet — the caller (`ask`) polls until the
   # reply appears and stabilises.
   awk -v id="id=${after_id}" '
     found && index($0, "[5dive-msg") { exit }
@@ -1175,13 +1232,17 @@ cmd_send() {
       msg_id="$(gen_msg_id)"
       # DIVE-1064: stamp the sender's isolation tier so a receiver can down-trust
       # a lower-privilege peer. Derived from the REAL sudo caller (not the
-      # spoofable --from label), so it holds even if from= is forged. Omitted
-      # when there's no agent caller (human/root) or no recorded tier.
+      # spoofable --from label), so it holds even if from= is forged.
+      # DIVE-2210: and stamped UNCONDITIONALLY. This is the exact fail-open the
+      # ticket is about — `--from=community` with no sudo caller used to render
+      # `[5dive-msg from=community id=...]`, byte-identical to a legitimate
+      # untiered send, so the forgeable field survived and the unforgeable one
+      # silently vanished. Now it reads tier=unknown:no-caller.
       local _caller _tier=""
       _caller="$(auto_sender_from_sudo)"
-      [[ -n "$_caller" ]] && _tier="$(registry_read | jq -r --arg n "$_caller" '.agents[$n].isolation // empty' 2>/dev/null)"
+      _tier="$(envelope_tier "$_caller")"
       local header="[5dive-msg from=${sender} id=${msg_id}"
-      [[ -n "$_tier" ]] && header+=" tier=${_tier}"
+      header+=" tier=${_tier}"
       [[ -n "$reply_to_chat" ]] && header+=" reply-to-chat=${reply_to_chat}"
       [[ -n "$reply_to_msg" ]] && header+=" reply-to-msg=${reply_to_msg}"
       header+="]"
@@ -1353,7 +1414,12 @@ cmd_ask() {
     require_agent "$name"
     sudo -u "agent-${name}" tmux has-session -t "agent-${name}" 2>/dev/null \
       || fail "$E_NOT_RUNNING" "tmux session 'agent-${name}' not found (is the agent running?)"
-    local header="[5dive-msg from=${sender} id=${msg_id}"
+    # DIVE-2210: `ask`'s direct-inject path carried NO tier field at all — it was
+    # never added when DIVE-1064 stamped `send` and `_deliver`. An envelope with
+    # no tier= is exactly the ambiguity this ticket closes, so `ask` now stamps
+    # the same field from the same resolver. (The scoped branch above already
+    # inherits it: `_deliver` builds that envelope.)
+    local header="[5dive-msg from=${sender} id=${msg_id} tier=$(envelope_tier "$(auto_sender_from_sudo)")"
     [[ -n "$reply_to_chat" ]] && header+=" reply-to-chat=${reply_to_chat}"
     [[ -n "$reply_to_msg" ]] && header+=" reply-to-msg=${reply_to_msg}"
     header+="]"
@@ -1385,12 +1451,12 @@ cmd_ask() {
     if (( use_scoped )); then
       # Scoped bounded read: _capture returns ONLY our reply window, already
       # sliced (after our marker, up to the next marker). sudo -n = fail-closed.
-      # NB (DIVE-1901): _capture still reads a single point-in-time window, so
-      # the scroll-off failure below is only PARTIALLY mitigated on this path —
-      # we accumulate what it returns, but once the marker leaves the pane
-      # _capture itself returns empty. Fixing that means moving the slice out of
-      # the privileged read, which changes the _deliver/_capture surface, so it
-      # is filed as DIVE-1931 rather than widened here.
+      # DIVE-1931: _capture now accumulates frames on ITS side of the boundary
+      # before slicing, so the marker survives scroll-off here exactly as it does
+      # on the direct path — the window it returns is cumulative, not a single
+      # point-in-time read. The fold below is kept because folding a superset of
+      # what we already hold is idempotent, and it keeps acc_file populated for
+      # the timeout diagnostics and the forensic dump.
       slice=$(sudo -n /usr/local/bin/5dive agent _capture "$name" --after-id="$msg_id" --buffer-lines="$buf_lines" 2>/dev/null) || true
       slice=$(_ask_accumulate "$acc_file" <<<"$slice")
       # Already sliced privileged-side, so re-slicing at the marker is off — but

@@ -1,5 +1,221 @@
 # Changelog
 
+## Unreleased — fix(heartbeat): an UNMEASURABLE tier no longer disables the privilege-escalation-by-queue guard (DIVE-2213)
+
+Second instance of the DIVE-2210 shape, at a **decision** site rather than a display
+one. DIVE-1065 refuses to auto-drive a higher-tier agent from a lower-tier creator's
+task. It read both tiers as `jq ... '.agents[$n].isolation // empty' 2>/dev/null`,
+ranked an empty result `0`, and then skipped itself whenever either rank was `0` — so
+a lookup that never happened did not hold the task, it **disabled the check**, and the
+heartbeat auto-ran the work.
+
+The ticket framed the fix as a binary: hold everything unmeasured (fail closed, may
+stall the fleet) or wake with a loud log (fail open, no longer silent). It is a false
+binary, and rank-0 is what disguised it. Two populations shared that bucket and they
+want opposite policies:
+
+- **measured, no tier** — the creator is not a registered agent (a human, an external
+  filer). The majority of the board. Falling through is DIVE-1065's intent, not a
+  failure mode; holding here would stall every human-filed task fleet-wide.
+- **not measured** — registry absent/unreadable/unparsable, jq errored, or a
+  *registered* agent whose `isolation` is missing or malformed. No basis to rank
+  either side.
+
+Only the second holds now. A healthy registry never produces it, so this cannot stall
+the fleet in steady state, and every hold names its own cause in the tick log.
+
+Measured by extracting the guard block **verbatim** from both this tree and
+`origin/main` and driving the same nine causes through each
+(`tests/heartbeat_tier_guard_unmeasured_unit.sh`):
+
+    distinct decisions across 9 causes: OLD=2  NEW=3
+    OLD: WAKE WAKE WAKE WAKE WAKE WAKE WAKE HOLD:escalation WAKE
+    NEW: WAKE HOLD HOLD HOLD HOLD HOLD HOLD HOLD:escalation WAKE
+
+The pre-fix block auto-ran on **6 of 6** unmeasured causes while still holding the one
+real escalation — i.e. it looked like a working guard.
+
+`agent_tier()` + `tier_unmeasured()` (`src/lib/registry.sh`) draw the line.
+They are deliberately **not** `envelope_tier()`, which reports `unknown:unregistered`
+for both populations on purpose (a wire format has no decision to make);
+`envelope_tier()` is asserted byte-identical to `origin/main` so DIVE-2210's shipped
+wire format does not move.
+
+**Reachability, stated rather than overclaimed:** pre-fix, a whole-registry failure
+could not reach this guard at all — the wake loop enumerates agents from the same
+`$reg` blob, so a failed read yielded zero agents. Reachable pre-fix were the three
+that leave the registry loadable: a registered-but-untiered creator, a malformed tier,
+and a jq failure. The other three become reachable *after* this change, because
+`agent_tier()` re-reads at decision time and so also catches a registry that dies
+mid-tick.
+
+Third instance, display-only: `task show`'s `created_by_tier` line was printed only
+when the lookup returned non-empty, so on failure the line vanished and a reader could
+not tell "no tier" from "not measured". It is now always printed, in three
+distinguishable states. This changes `task show`'s human output shape for every task;
+checked first — `origin/main` across 5dive-cli / api / app / plugins / mcp has no
+consumer of that line other than the site emitting it, and the machine path is
+`--json`, which never carried it.
+
+## Unreleased — fix(a2a): the envelope's tier= field is now always stamped, with a reason when it cannot be measured (DIVE-2210)
+
+`tier=` is the ONE unforgeable field in `[5dive-msg from=X id=Y tier=Z]`. `from=` is
+caller-supplied (`--from=`) and only format-validated, so `tier=` is the field that
+actually catches a cross-tier peer. Every stamping site wrote it as
+`[[ -n "$t" ]] && header+=" tier=$t"` over a lookup whose stderr went to `/dev/null`.
+
+Measured against the shipped 0.16.33 bundle by extracting its own `registry_read` and
+`cmd_send` stamp verbatim: four different outcomes render **one identical envelope**.
+
+    [control ] real sudo caller, good registry : [5dive-msg from=community id=deadbeef tier=admin]
+    [cause 1 ] no sudo caller (--from=)        : [5dive-msg from=community id=deadbeef]
+    [cause 2 ] registry missing/unreadable     : [5dive-msg from=community id=deadbeef]
+    [cause 3 ] registry truncated (jq fails)   : [5dive-msg from=community id=deadbeef]
+    [cause 4 ] genuinely untiered sender       : [5dive-msg from=community id=deadbeef]
+    distinct envelopes across 4 causes: 1
+
+So a receiver could not tell *not measured* from *measured, nothing there*. The
+forgeable field survives; the unforgeable one disappears without a trace. Cause 1 is
+the sharp edge: `--from=community` with no sudo caller produced a clean, plausible
+envelope attributed to community and carrying no tier at all.
+
+- New `envelope_tier()` **never returns empty**. A tier it cannot establish is stamped
+  `unknown:<reason>` — `no-caller`, `no-registry`, `registry-unreadable`,
+  `registry-unparsable`, `lookup-failed`, `unregistered`, `malformed-tier`. The four
+  causes above stop colliding.
+- New `registry_read_checked()` separates "the read failed" from "the fleet is empty".
+  Plain `registry_read()` manufactures `{"agents":{}}` for both, which is what let a
+  failed read render as a clean absence.
+- A tier value that is not a bare token is refused (`unknown:malformed-tier`) rather
+  than pasted into a space-delimited header, where it could forge extra fields.
+- All three envelope builders now append `tier=` **unconditionally**. `agent ask`'s
+  direct-inject path carried no tier at all — it was never added when DIVE-1064
+  stamped `send` and `_deliver`.
+
+Reading the new output: absence of `tier=` now means "sent by a build older than
+0.16.35", not "this sender has no tier".
+
+NOT changed here, and deliberately named rather than folded in: the same
+swallow-and-omit idiom appears at two non-envelope sites — `cmd_heartbeat.sh`'s
+privilege-escalation-by-queue guard (a *decision*, and it fails open: an unmeasured
+tier ranks 0, and the guard is skipped entirely when either rank is 0) and
+`task show`'s `created_by_tier` display line. Both are filed separately; the first
+changes fleet-wide auto-run behaviour and needs its own verification.
+
+## Unreleased — feat(digest): a 30-day window, with the aggregates it does NOT scope named out loud (DIVE-1921)
+
+`digest` offered only `--7d`, so `proof scorecard` (specified as `[--7d|--30d]` in DIVE-1914)
+shipped 7d-only and refused `--30d` outright. The value is not the flag: a 7-day window is why
+the scorecard's median recovery time rested on ONE episode and its precedent acceptance on n=2.
+On the live store the 30d window takes those to 2 episodes and the verifier first-pass rate to
+n=335 graded.
+
+Widening is not uniform, so each aggregate was classified before it moved:
+
+- **Sums** (`done`, `zeroHuman.*`, `autoCleared`, `stuck.episodes`) and **rates**
+  (`precedentPrefill.acceptanceRate`, `stuck.mttuSec`) scale with the window, as intended.
+- **Point readings** (`usage`, `loops`, `health`, `inProgress`, `blocked`, `stuck.openStuck`,
+  `autonomy.uptimeDays`, the objectives' `current`/`inflight`) do NOT. `usage` is the collector's
+  own rolling 5h/7d read and `loops` is every loop ever, so under a "last 30 days" header they
+  read as 30 days of tokens. They are now named in a `pointInTime` map in the JSON and captioned
+  in the text.
+- **`window.label` was a `>=` ladder** (`"7 days" if window >= 604800`), so any window wider than
+  a week rendered under a "last 7 days" header. It is now derived from the window.
+- **`autonomy.priorWindowComplete`** is new. The trend compares against the preceding window, so
+  a 30d reading reaches 60 days back. The live store does not go that far, which rendered as
+  `↑595 vs 0 prior 30 days` — growth from zero, on a span that simply has no data. The flag makes
+  the text say so.
+
+`proof scorecard --30d` is unblocked and its window now moves as one unit: the digest sub-call,
+all nine SQL spans and the token read derive from a single mapping, because a site left at 7 days
+would not render as a wrong window but as a plausible rate whose numerator and denominator were
+measured over different spans.
+## Unreleased — fix(heartbeat/task): a verifier who filed a human gate has ACTED, and neither verb may resolve that gate by side effect (DIVE-2196)
+
+The stall-sweep nagged a verifier who had already reviewed the work and escalated a policy
+question to a human. It selects delivered maker->verifier rows on `status NOT IN
+('done','cancelled') AND handoff_ack_at IS NULL`, and a row BLOCKED on an unanswered gate
+satisfies both: `blocked` is not a closed status, and filing a gate stamped no ACK, so
+"reviewed it and escalated" was byte-identical to "never opened it". Fired live on DIVE-2146.
+
+The remedy it prescribed was the harm. On a maker->verifier task the verifier's ACK *is* the
+close, so "run `task start` then `task done`/`task reject`" asked them to resolve a pending
+human gate as a side effect of an ordinary acknowledgement, in whatever direction the verb
+happened to point. DIVE-2146's gate asked lodar to choose between leaving the ticket open and
+closing it as delivered; the nag pushed one of those options on a schedule.
+
+- **The sweep skips a row blocked on an unanswered gate.** The wait there is on a human, not on
+  the verifier. An ANSWERED gate does not exempt: the wait is back on the verifier, and that row
+  is still surfaced.
+- **Filing a gate on a row delivered to you stamps `handoff_ack_at`.** Same receiver rule as
+  DIVE-1378's `task start` ACK: the real actor only (never `--from`), only while they hold the
+  row as its assigned verifier. The record now says what happened.
+- **`task reject` refuses over an explicit tier-2 gate.** It auto-answers the gate with
+  `need_answered_by='auto:reject'`, a non-human provenance the tier-2 floor exists to forbid and
+  that `task answer` refuses outright, reached around by raw SQL. `task done` was already
+  refused (DIVE-555). Scoped to an agent actor and to an EXPLICIT tier: a human caller is the
+  party the gate is waiting on, and an untiered legacy row keeps DIVE-1495's supersede, so the
+  CNCL-9 re-nag fix is untouched.
+- **`task verify --cmd` no longer auto-closes over an open gate either.** It closes by raw
+  `UPDATE`, so it never saw DIVE-555 — one `task verify --cmd=true` closed a task out from under
+  an unanswered human gate and the question then vanished from every open-gate view, which all
+  require an open status. That is DIVE-2067's lesson on this axis: the refusal on `task done`
+  names other verbs, and the named verb carried no equivalent check. The verify VERDICT is still
+  recorded; only the close waits, and `--no-done` is unaffected.
+- **The refusal prints a reachable exit, per caller.** A guard that forecloses the FAIL verdict
+  with nothing but "wait for the human" converts a wrong-but-moving state into a correct-but-stuck
+  one, and gets routed around. If you filed the gate you can retire it yourself
+  (`task need --withdraw`, archived to `gate_history` as a withdrawal rather than an answer put in
+  a human's mouth) and then reject. If someone else filed it you cannot retire their ask, but your
+  grade need not wait on it: `task set-body --append` records the verdict now and the reject lands
+  when the gate clears. Both paths are executed in the tests, not just quoted in the message.
+- `tests/verifier_gate_ack_unit.sh` grades all three by mutation. The first fixture was VACUOUS:
+  with the ACK stamp in place, deleting the sweep's exclusion left the suite green, because
+  `handoff_ack_at IS NULL` was doing the skipping. Two fixes for one symptom, one standing in
+  for the other. The arm now runs on a live-gate/no-ACK row, which is DIVE-2146's shape today
+  and the shape of every gate-blocked row already on the board.
+
+## Unreleased — fix(gate): a gate escalates from the agent that FILED it, not from whoever created the task (DIVE-1945)
+
+`task gate-escalate` derived the gate's filer as `COALESCE(created_by, assignee)`. Those agree
+only when the filer also created the task. When one agent files a gate on another's task the
+privileged re-send therefore started the escalation walk on the CREATOR's branch of the org
+chart, and the alert read "filed by <creator> (no channel of its own)" about an agent that may
+well have one. It is the bug DIVE-1927 fixed on the `task need` path via the `TASK_GATE_FILER`
+env pin, surviving in the sibling path: `gate-escalate` is a separate privileged process, so
+that env var cannot reach it and the filer has to come off the row.
+
+- **`tasks.gate_filed_by`** records the filer of record, stamped by `task need` from the acting
+  agent, read back by `gate-escalate`, and cleared by `task need --withdraw` with the rest of the
+  gate provenance. Legacy gates have no stamp and fall back to `created_by`, so nothing in flight
+  changes behaviour.
+- **The heartbeat T1 re-nag lane moves too.** It resolves the reviewer FROM the filer's org
+  position, which is the same whose-ask-is-this question. The T2 lane deliberately stays on
+  `created_by`: it batches by the channel OWNER, where `created_by` is the right key.
+- `tests/gate_filer_of_record_unit.sh` grades it on a two-branch org fixture (dev3 -> qa ->
+  olivia, main -> olivia) so the correct and the buggy reading deliver to DIFFERENT agents; the
+  legacy no-stamp row is the non-vacuity control.
+
+## Unreleased — feat(comms): the terse rule now bounds HOW OFTEN you send, and covers agent-to-agent (DIVE-2191)
+
+DIVE-1613 ships a terse-comms fragment into every claude agent at create. Measured against one
+day of main's own traffic, it has two holes. It governs SHAPE, not VOLUME — main followed all six
+shape rules 94 times in a day. And it is scoped to human chat, while agent-to-agent was 84
+messages / 32,823 words: 2.2x the word volume of Telegram, on a channel with no rule at all. Every
+a2a word is output tokens for the sender AND input tokens for the receiving model, so it is the
+larger bill by more than 2.2x — and it is the bill the customer pays.
+
+- **A send gate for human chat.** A NEW message — the one that pushes to their phone — is for
+  finished / blocked-on-them / your own error. Everything else edits the message already on screen
+  or goes to the task board. Work-in-progress is not a message. Phrased to compose with the
+  telegram fragment's edit-for-progress rule rather than contradict it.
+- **A fixed a2a shape:** RESULT / EVIDENCE / BLOCKER / NEXT, empty fields dropped. Fixed fields
+  cannot ramble and the receiving model can parse them. Today's internal messages were 390-word
+  essays carrying maybe 60 words of decision.
+- **The verification rails are untouched, and now explicitly carved out**: this cuts the narration,
+  not the checking. Sending work to another agent to verify, and answering as the verifier, is the
+  work — the fragment says so in the same breath, so no agent reads "send less" as "verify less".
+
 ## Unreleased — feat(task): the tier-2 floor says WHY it fired, and a design decision can appeal it on the record instead of by rewording (DIVE-2089)
 
 The T2 category floor reads SUBJECT MATTER as risk and picks the gate's audience from it. dev3
