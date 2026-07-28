@@ -195,12 +195,29 @@ mirror_interagent_outbound() {
     _mirror_post "$token" "$group_chat_id" "$thread_id" \
       "$(printf '%s\n%s' "$to_label" "$trimmed")" "$access_file"
   else
-    local _total=${#trimmed} _off=0 _idx=1 _chunk _label _overflow
+    local _total=${#trimmed} _off=0 _idx=1 _chunk _label _overflow _nchunks
+    # DIVE-2265: a zero/negative width slices an EMPTY chunk, so _off never
+    # advances. The loop still terminates (_idx increments regardless), but it
+    # posts max_chunks BLANK messages to the group. Nothing is deliverable under
+    # that config, so deliver nothing rather than a wall of empties.
+    if (( max_chars <= 0 )); then
+      printf 'mirror: MIRROR_MAX_BODY_CHARS=%s is not a usable width — nothing mirrored\n' \
+        "$max_chars" >&2
+      return 0
+    fi
+    # DIVE-2265: the denominator must be the number of chunks this body ACTUALLY
+    # produces, not the configured ceiling. With MIRROR_CHUNKS=5 and a 2-chunk
+    # body the old label read "(cont. 2/5)" and the reader waited for a third
+    # part that never arrives. It is constant for the whole message, so compute
+    # it ONCE here — computing it inside the loop is what invites the
+    # per-iteration mistake this is fixing.
+    _nchunks=$(( (_total + max_chars - 1) / max_chars ))
+    (( _nchunks > max_chunks )) && _nchunks=$max_chunks
     while (( _off < _total && _idx <= max_chunks )); do
       _chunk="${trimmed:$_off:$max_chars}"
       _off=$(( _off + ${#_chunk} ))
       _label="$to_label"
-      (( _idx > 1 )) && _label="${to_label} (cont. ${_idx}/${max_chunks})"
+      (( _idx > 1 )) && _label="${to_label} (cont. ${_idx}/${_nchunks})"
       _overflow=""
       if (( _idx == max_chunks && _off < _total )); then
         _overflow=" (+$(( _total - _off )) chars)"
