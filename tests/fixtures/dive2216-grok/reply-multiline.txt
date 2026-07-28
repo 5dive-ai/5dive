@@ -1,0 +1,24 @@
+
+  /home/claude/projects                                             17K / 500K
+
+
+     ❯ [5dive-msg from=ask id=be8222f3 tier=unknown:no-caller] In    3:21 AM
+       two short lines: your role, then a line starting VERDICT:
+       [reply-format] Put your answer between these two marker …
+
+
+     ◆ Thought for 0.0s
+
+     <5dive-r:be8222f3> Creative, CMO VERDICT: marketing lead on     3:21 AM
+     this team </5dive-r:be8222f3>
+
+     Worked for 2.6s                                                           █
+                                                                               █
+                                                                               █
+
+  ╭──────────────────────────────────────────────────────────────────────────╮
+  │ ❯                                                                        │
+  ╰─────────────────────────────────────── Grok 4.5 (high) · always-approve ─╯
+
+  Shift+Tab:mode  │  Ctrl+x:shortcuts
+

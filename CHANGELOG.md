@@ -1,5 +1,52 @@
 # Changelog
 
+## Unreleased — fix(ask): a reply fence whose markers sit INLINE is now harvested, so a grok seat stops reading as a silent abstain (DIVE-2216)
+
+`agent ask` returned nothing from a grok seat that had answered correctly. Reproduced
+live on the released 0.16.32, twice, on the demo box's `creative` seat:
+
+    $ 5dive agent ask creative "Reply with exactly: ALIVE-2216"
+    error: no idle reply from 'creative' within 120s (msg_id=1f18a833) — the reply
+    fence was OPENED but never completed …
+
+    (the same pane, verbatim)
+         <5dive-r:1f18a833> ALIVE-2216 </5dive-r:1f18a833>               3:08 AM
+
+The fence was complete and the answer was between its markers. The extractor accepted
+a marker only when it was **alone on its line**, and grok compresses whitespace: the
+opening marker is followed by the answer, so no block ever opened. For the prose shape
+(closer pushed onto the end of the last line) the block was rejected outright as an
+echoed instruction. Every grok seat in the fleet was affected on every fenced ask,
+and a council ballot from one auto-abstained without a visible reason (DIVE-1739),
+quietly lowering the effective roster — the failure class DIVE-1901 exists to remove.
+
+The exact-line rule is not wrong, it is just the wrong discriminator. It is kept as
+the first pass; when it finds nothing, an inline pair is now accepted **only if the
+text between the two markers is non-empty**. The echoed instruction carries them
+ADJACENT by construction (`<5dive-r:ID></5dive-r:ID>`, how the hint is written), so
+its between-text is empty however the composer wraps it — including the wrap that
+defeated DIVE-1901 iteration 1, which is pinned as a test. Content is judged by the
+same shape rule the strict matcher uses (a TUI draws punctuation and box glyphs,
+never words), so a gutter glyph beside the closing marker does not read as an answer.
+An unclosed fence still returns nothing, so the rail keeps polling.
+
+Graded on three verbatim `capture-pane` dumps from the live seat: 8 of 11 assertions
+are red on the shipped extractor and green after, while the 4 that stay green on both
+trees are the strict-path and anti-echo ones — the guarantees the change must not buy
+its fix with.
+5 of 5 mutants killed on the committed tree. Verified end to end against that same
+seat, back to back:
+
+    installed 0.16.32 : rc=11 after 120s, nothing returned  (the seat had answered)
+    this build        : rc=0 in seconds, "FIXED-2216"
+
+KNOWN LIMIT, pinned as a test rather than left to be found. When grok WRAPS its reply
+at the pane width, the TUI paints its right-margin clock on that first visual row,
+physically between the markers, so `3:21 AM` comes back inside the answer. Removing it
+would mean recognising a right-margin clock — a per-harness chrome signature, which is
+what DIVE-1901 refused to grow. The answer itself is intact and a ballot line survives,
+so the silent abstain is gone; a caller doing an exact string compare against a wrapped
+grok reply should expect it.
 ## Unreleased — fix(heartbeat): an UNMEASURABLE tier no longer disables the privilege-escalation-by-queue guard (DIVE-2213)
 
 Second instance of the DIVE-2210 shape, at a **decision** site rather than a display

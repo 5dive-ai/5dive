@@ -1,0 +1,24 @@
+
+  /home/claude/projects                                             17K / 500K
+
+
+     ❯ [5dive-msg from=ask id=19f3bb66] In one short sentence:       3:12 AM
+       what is your specific role and job title on this team? If
+       you have not been told, say NOT TOLD. [reply-format] Put …
+
+
+     ◆ Thought for 0.6s
+
+     <5dive-r:19f3bb66> Creative, the CMO. </5dive-r:19f3bb66>       3:12 AM
+                                                                               █
+     Worked for 2.2s                                                           █
+                                                                               █
+                                                                               █
+                                                                               █
+
+  ╭──────────────────────────────────────────────────────────────────────────╮
+  │ ❯                                                                        │
+  ╰─────────────────────────────────────── Grok 4.5 (high) · always-approve ─╯
+
+  Shift+Tab:mode  │  Ctrl+x:shortcuts
+

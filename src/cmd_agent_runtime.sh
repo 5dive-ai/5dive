@@ -775,6 +775,77 @@ if mid:
             body.append(l)
         if [b for b in body if b.strip()]:
             started = True          # opened and produced content, but never closed
+
+    # --- 0b. the INLINE fence (DIVE-2216). The exact-line rule above is right
+    # for what it defends, but it also rejects a REAL reply from a harness that
+    # does not put the markers on lines of their own. Grok emits, verbatim:
+    #
+    #     <5dive-r:ID> ALIVE </5dive-r:ID>              (both markers, one line)
+    #     ... VERDICT: insufficient </5dive-r:ID>       (closer beside the prose)
+    #
+    # Fence present, content present, and 0.16.32 harvested NOTHING from either —
+    # so a grok seat was a SILENT ABSTAIN on every fenced ask, council ballots
+    # included. That is the failure mode this whole rail exists to remove.
+    #
+    # The discriminator that lets the strictness go without letting the ECHO back
+    # in is not the layout, it is the CONTENT. The echoed instruction carries the
+    # two markers ADJACENT (`<5dive-r:ID></5dive-r:ID>` — that is how the hint is
+    # written, deliberately), so the text between its markers is empty BY
+    # CONSTRUCTION, however the composer wraps it and whichever side the prose
+    # lands on. A real reply always has something between them. So: accept an
+    # inline pair only when what sits between the markers is non-empty, and the
+    # echo remains unreturnable — including the wrapped shape that broke the
+    # adjacency defence in DIVE-1901 iteration 1 (opening marker isolated on its
+    # own line by a line break, closing marker leading the next), which lands here
+    # with an empty body and is still dropped.
+    #
+    # Two narrower rules on top, for the same reason:
+    #   - a line with the opening marker but NO closer only opens a block if the
+    #     marker STARTS it (TUI decoration allowed, words not) — prose before the
+    #     opening marker is the signature of the echo;
+    #   - an unclosed block still returns nothing, so a mid-write frame keeps the
+    #     rail polling exactly as before.
+    # This runs only after the strict pass has found nothing, so no seat that
+    # works today changes behaviour.
+    def wordy(s):
+        # Is there CONTENT here, as opposed to what the TUI drew? Same shape rule
+        # the strict matcher uses: decoration is punctuation, box glyphs and
+        # space, never words. This is load-bearing — the first draft asked only
+        # for non-whitespace, and the wrapped echo came back as "▌", its own
+        # gutter glyph, which would have reopened DIVE-1901 through the new path.
+        return bool(re.sub(r"^[^\w<]+", "", s.strip()))
+    for i in reversed([i for i, l in enumerate(lines) if op in l]):
+        head_l = lines[i]
+        a = head_l.index(op) + len(op)
+        if cl in head_l[a:]:
+            # Complete pair on ONE line. Empty between => the echo, never a reply.
+            # Plain strip is right HERE and only here: a TUI draws its decoration
+            # at the START of a line, so anything sitting between two markers
+            # mid-line was put there by the seat.
+            between = head_l[a:head_l.index(cl, a)].strip()
+            if between:
+                sys.stdout.write(between)
+                sys.exit(0)
+            continue
+        if not re.sub(r"^[^\w<]+", "", head_l.strip()).startswith(op):
+            continue                # words before the marker: the echo, not a reply
+        lead = head_l[a:].strip()   # content the seat put after the opening marker
+        body = []
+        for l in lines[i + 1:]:
+            if op in l or "[5dive-msg" in l:
+                break
+            if cl in l:
+                pre = l[:l.index(cl)]
+                blk = body + ([pre] if wordy(pre) else [])
+                real = [b for b in blk if b.strip()]
+                if not (lead or [b for b in blk if wordy(b)]):
+                    break           # fence closed around nothing: the echo again
+                pad = min((len(b) - len(b.lstrip()) for b in real), default=0)
+                out = ([lead] if lead else []) + [b[pad:].rstrip() for b in blk]
+                sys.stdout.write("\n".join(out).strip("\n"))
+                sys.exit(0)
+            body.append(l)
+
     # FENCE-ONLY (DIVE-1901 iteration 2). Everything this ticket has ever caught
     # fabricating came from the scraping fallback below, never from the fence:
     # 0.14.7 returned the token PLUS the footer on antigravity and PURE BOX-DRAWING
