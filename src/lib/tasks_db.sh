@@ -1508,6 +1508,34 @@ _gate_proof_ct_equal() {
 # that can't mint yet would fail closed. Root toggles it.
 _gate_proof_enforced() { [[ -f "$(_gate_proof_enforce_file)" ]]; }
 
+# ── DIVE-2235: the HUMAN CLASS, and class-over-tier ──────────────────────────
+# The gate types that mint and verify a one-time human nonce. This list already
+# existed three times over in cmd_task.sh (the mint site in cmd_task_need, and
+# the two evidence blocks in cmd_task_answer); it is named here once so the
+# THREE AUTO-ANSWER WRITERS can consult it too.
+#
+# THE RULE: TIER MUST NOT BE ABLE TO DOWNGRADE CLASS. Tier says how urgently a
+# gate is pushed at a person. It must not decide WHETHER a person answers it.
+# A gate of a human class is one a human has to answer, at any tier, so none of
+#   1. `_hb_gate_ttl_sweep` — the 48h tier-1 TTL that applies `recommend`
+#   2. `cmd_task_need`'s tier-0 apply-at-file-time
+#   3. `cmd_task_need`'s OSS-21 precedent auto-clear
+# may decide one. Before DIVE-2235 the TTL sweep excluded only 'secret', so a
+# tier-1 APPROVAL auto-applied its own recommendation after 48 hours with no
+# human anywhere near it — live on DIVE-2224, where lodar's own escalation-floor
+# decision was scheduled to self-approve from the recommendation of the agent
+# who filed it.
+#
+# 'decision' is deliberately NOT a human class here. It mints no nonce (same
+# list), and the DIVE-861 TTL default exists for exactly that class — a decision
+# with a recommendation, unanswered for two days, taking its recommendation is
+# the designed behaviour, not a defect. Making human=1 unforgeable so that
+# 'decision' can join this list is the v0.18 "proof of who" work; it is NOT this
+# change, and adding decision here would silently kill the TTL sweep entirely.
+_gate_human_class() { case "${1:-}" in approval|secret|manual|access) return 0 ;; *) return 1 ;; esac; }
+# SQL form of the same list, for the sweep predicates. Keep in lockstep above.
+_GATE_HUMAN_CLASS_SQL="('approval','secret','manual','access')"
+
 # ── DIVE-916: per-gate HUMAN nonce (close the sudo->--human forge) ────────────
 # Distinct from the DIVE-519 --proof token: that is a box-wide, TTL'd, HMAC proof
 # any trusted path can mint; this is a per-GATE secret bound to one task row. Its

@@ -193,11 +193,24 @@ eq_t "fuzzy: option-mismatch kind=fuzzy"    "$(field DIVE-1052 precedent_kind)" 
 # EXACT human precedent only. Seed a human precedent at a chosen age (minutes ago)
 # so "most recent qualifying gate" is deterministic; seed_prec_by sets an
 # arbitrary provenance to prove the human-only / no-compounding seed rules.
+# DIVE-2235: a qualifying seed now needs a surviving human_nonce_hash as well as
+# the human:* prefix — the prefix alone is a self-declaration written from the
+# caller's own username (DIVE-2224). seed_human_prec_age therefore stamps a
+# nonce; seed_human_noNonce below is the same row WITHOUT one, and is the exact
+# laundering shape the new filter has to reject (case A10).
 seed_human_prec_age() { # <ident> <type> <tier> <shape> <answer> <min-ago>
   seed_task "$1"
   db "UPDATE tasks SET need_type='$2', tier=$3, ask_shape=$(sqlq "$4"),
         need_answer=$(sqlq "$5"), need_answered_at=datetime('now','-$6 minute'),
-        need_answered_by='human:mark', status='todo' WHERE ident='$1';"
+        need_answered_by='human:mark', human_nonce_hash='deadbeefcafe',
+        status='todo' WHERE ident='$1';"
+}
+seed_human_noNonce() { # <ident> <type> <tier> <shape> <answer> <min-ago>
+  seed_task "$1"
+  db "UPDATE tasks SET need_type='$2', tier=$3, ask_shape=$(sqlq "$4"),
+        need_answer=$(sqlq "$5"), need_answered_at=datetime('now','-$6 minute'),
+        need_answered_by='human:mark', human_nonce_hash=NULL,
+        status='todo' WHERE ident='$1';"
 }
 seed_prec_by() { # <ident> <type> <tier> <shape> <answer> <answered_by>
   seed_task "$1"
@@ -314,6 +327,39 @@ seed_task DIVE-1263
 cmd_task_need DIVE-1263 --type=decision --ask="$ASK_AC" --options="yes|no" >/dev/null 2>&1
 eq_t "autoclear A8: OFF re-blocks qualifier"  "$(field DIVE-1263 status)"           "blocked"
 eq_t "autoclear A8: OFF unanswered"           "$(field DIVE-1263 need_answered_at)" "∅"
+
+# A10 (DIVE-2235): the LAUNDERING shape. Two unanimous seeds stamped
+# `human:mark` that carry NO human_nonce_hash — byte-identical to the DIVE-2224
+# self-clears, which an agent produced by passing --human and which the old
+# `LIKE 'human:%'` filter accepted as human precedent. Same inputs as A1 in every
+# respect except the nonce, so this is differential against A1 above rather than
+# a standalone assertion: A1 (nonce present) clears, A10 (nonce absent) does not.
+cmd_task_precedent on >/dev/null 2>&1
+ASK_NN="restart the metrics collector on box delta"; SHAPE_NN="$(_gate_ask_shape "$ASK_NN")"
+seed_human_noNonce DIVE-1280 decision 1 "$SHAPE_NN" yes 10
+seed_human_noNonce DIVE-1281 decision 1 "$SHAPE_NN" yes 5
+seed_task DIVE-1282
+cmd_task_need DIVE-1282 --type=decision --ask="$ASK_NN" --options="yes|no" >/dev/null 2>&1
+eq_t "autoclear A10: nonce-less human seed blocks"     "$(field DIVE-1282 status)"           "blocked"
+eq_t "autoclear A10: nonce-less human seed unanswered" "$(field DIVE-1282 need_answered_at)" "∅"
+# Liveness for A10: prove the seeds were otherwise QUALIFYING, i.e. the block is
+# the nonce filter and not some unrelated disqualifier (shape drift, age, tier).
+# Adding the nonce to the same two rows must flip the identical gate to cleared.
+db "UPDATE tasks SET human_nonce_hash='deadbeefcafe' WHERE ident IN ('DIVE-1280','DIVE-1281');"
+seed_task DIVE-1283
+cmd_task_need DIVE-1283 --type=decision --ask="$ASK_NN" --options="yes|no" >/dev/null 2>&1
+eq_t "autoclear A10 liveness: +nonce clears"  "$(field DIVE-1283 need_answered_by)" "auto:precedent"
+
+# A11 (DIVE-2235): class over tier. A tier-1 APPROVAL is human-class, so it must
+# never reach the precedent path at all, however unanimous and nonce-backed the
+# precedent is. Before this change only 'secret' was excluded here.
+ASK_AP="tidy the archived build logs"; SHAPE_AP="$(_gate_ask_shape "$ASK_AP")"
+seed_human_prec_age DIVE-1290 approval 1 "$SHAPE_AP" yes 10
+seed_human_prec_age DIVE-1291 approval 1 "$SHAPE_AP" yes 5
+seed_task DIVE-1292
+cmd_task_need DIVE-1292 --type=approval --ask="$ASK_AP" --tier=1 >/dev/null 2>&1
+eq_t "autoclear A11: approval never precedent-cleared" "$(field DIVE-1292 need_answered_at)" "∅"
+eq_t "autoclear A11: approval stays blocked"           "$(field DIVE-1292 status)"           "blocked"
 
 echo "-------------------------------------"
 echo "gate_precedent_unit: ${PASS} passed, ${FAIL} failed"
