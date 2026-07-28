@@ -58,6 +58,7 @@ fi
 # The corpus, in order. Declared in ONE place: the report header, the --list output and
 # the union script's contract all read this, so they cannot drift into three lists.
 SELFCHECK_PROBES=(
+  lead-clear-seal
   gate-delivery
   audit-root
   audit-nonroot
@@ -69,6 +70,7 @@ SELFCHECK_PROBES=(
 
 _sc_title() {
   case "$1" in
+    lead-clear-seal)   echo "the sealed lead-clear allowlist is armed, or reported inert before a gate hits it" ;;
     gate-delivery)     echo "a filed gate leaves a delivery row on the filer's own channel" ;;
     audit-root)        echo "a privileged action lands an audit row" ;;
     audit-nonroot)     echo "an UNPRIVILEGED agent action lands an audit row, or leaves a drop marker" ;;
@@ -142,6 +144,61 @@ _sc_self() { five_self_bundle; }
 # a CONFIRMED-but-unrecorded send must backfill an `ok` row carrying the chat it
 # reached. Labelling the second a failure would manufacture error rows for gates that
 # did reach their human — re-contaminating the dataset with the opposite bias.
+# --- probe: the sealed lead-clear allowlist (DIVE-2233) -----------------------
+# DIVE-2233 moved the routed gate-clear from agents_org (agent-writable) to
+# authority.gate_clear_leads in the SEALED constitution. That is fail-closed by
+# design: a box that never sealed the key has NO agent able to lead-clear an
+# approval/manual/access gate, and every one falls through to a human. Safe, but
+# until now discoverable ONLY by filing a gate and being refused — the refusal is
+# the first time anyone learns the rail is inert. Marcus's ask on the pre-push
+# read: report it BEFORE the first refusal.
+#
+# WHY BOTH STATES ARE `pass` AND NOT `not-reached`. `not-reached` means nothing
+# was measured; here something is. "Inert" is an ANSWER, not an absence — we
+# resolved the allowlist and found none. Encoding it as not-reached would also
+# be self-defeating: sealing the key is a constitutional motion no agent convenes
+# against itself (the whole point of the ticket), so the probe would be
+# not-reached in EVERY environment until a council motion lands, and
+# tests/meta/selfcheck-union.sh correctly reds a probe that reaches no verdict
+# anywhere. A rail that cannot be armed by the thing being measured must not
+# gate that thing's own CI.
+#
+# `drifted` IS a fail: the on-disk constitution no longer matches the digest
+# sealed into the council lineage, which denies EVERYONE including the legitimate
+# holder. That is the tamper-is-self-defeating property firing, and it is an alarm.
+_sc_probe_lead_clear_seal() {
+  declare -F _gate_clear_leads >/dev/null 2>&1 \
+    || { _sc_notreached "no-gate-clear-reader" "_gate_clear_leads is not defined in this build"; return; }
+  declare -F _gate_clear_lead_denied_reason >/dev/null 2>&1 \
+    || { _sc_notreached "no-deny-reason" "_gate_clear_lead_denied_reason is not defined in this build"; return; }
+
+  # Context only, never the verdict: DIVE-2099's standing lead lives in the SAME
+  # document and had no visibility either (Marcus: a pattern gap inherited, not made).
+  # Reported on this line because it is free and the two share a failure mode.
+  local standing="unknown"
+  if declare -F _gate_standing_lead >/dev/null 2>&1; then
+    local sl; sl="$(_gate_standing_lead 2>/dev/null || true)"
+    [[ -n "$sl" ]] && standing="eng_approval_lead=$sl" || standing="eng_approval_lead=none"
+  fi
+
+  local names; names="$(_gate_clear_leads 2>/dev/null || true)"
+  if [[ -n "$names" ]]; then
+    local n; n=$(printf '%s\n' "$names" | grep -c .)
+    _sc_pass "routed lead-clear is ARMED: $n sealed lead(s) [$(printf '%s' "$names" | tr '\n' ' ')] may clear a gate routed to them; $standing"
+    return
+  fi
+
+  local why; why="$(_gate_clear_lead_denied_reason 2>/dev/null || echo unknown)"
+  case "$why" in
+    constitution-drifted)
+      _sc_fail "the on-disk constitution does not match the digest sealed into the council lineage (drifted) — routed lead-clear is denied to EVERYONE including its legitimate holder, and this is the tamper alarm, not a config gap. Re-sealing is a council motion; $standing" ;;
+    no-council-loader)
+      _sc_notreached "no-council-loader" "the council constitution helpers are absent from this build, so the allowlist cannot be resolved at all" ;;
+    *)
+      _sc_pass "routed lead-clear is INERT on this box ($why): NO agent can clear an approval/manual/access gate routed to it, and every such gate falls through to a human. Fail-closed and safe — arming it means sealing authority.gate_clear_leads via a council motion, which is deliberately not something an agent can do for itself. $standing" ;;
+  esac
+}
+
 _sc_probe_gate_delivery() {
   declare -F task_need_notify >/dev/null 2>&1 \
     || { _sc_notreached "no-gate-rail" "task_need_notify is not defined in this build"; return; }
@@ -548,6 +605,7 @@ _sc_probe_scorecard_honesty() {
 
 _sc_dispatch() {
   case "$1" in
+    lead-clear-seal)   _sc_probe_lead_clear_seal ;;
     gate-delivery)     _sc_probe_gate_delivery ;;
     audit-root)        _sc_probe_audit_root ;;
     audit-nonroot)     _sc_probe_audit_nonroot ;;

@@ -284,5 +284,69 @@ else
   printf 'SKIP - snapshot-rails mutation needs a readable crontab-snapshot.sh and `sudo -n crontab -l`; this probe is UNPROVEN in this run\n'
 fi
 
+# ── rail 8: the sealed lead-clear allowlist (DIVE-2233) ──────────────────────
+# This probe cannot be proven the way the others are. Its mutation is not a code edit:
+# the rail it grades is a SEALED DOCUMENT, so the only breakage that matters is the
+# document ceasing to match the digest sealed into the council lineage. And the ARMED
+# branch is unreachable on any box we run this on — nothing has convened the council
+# motion that seals `gate_clear_leads`, which is the ticket's own property, not a gap.
+# So the fixture supplies a sealed constitution via STATE_DIR and drives all three
+# states in one place. Without this the probe would ship having only ever emitted
+# "INERT" — indistinguishable from a probe hard-coded to say INERT.
+SC_LC="$(mktemp -d "${TMPDIR:-/tmp}/5dive-lcseal.XXXXXX")"
+sc_lc_seal() {  # re-seal whatever bytes are on disk right now
+  mkdir -p "$SC_LC/council"
+  printf '{"seq":1,"record":{"constitutionDigest":"%s"}}\n' \
+    "$(sha256sum < "$SC_LC/constitution.yaml" | awk '{print $1}')" > "$SC_LC/council/lineage.jsonl"
+}
+printf 'ship:\ncomms:\nauthority:\n  gate_clear_leads:\n    - main\n' > "$SC_LC/constitution.yaml"
+sc_lc_seal
+SC_ENV=(STATE_DIR="$SC_LC")
+
+probe lead-clear-seal
+if [[ $RC -eq 0 ]] && grep -q 'ARMED' <<<"$OUT"; then
+  ok_t "[lead-clear-seal] a SEALED allowlist reports ARMED and names the lead"
+else
+  fail_t "[lead-clear-seal] a sealed allowlist did not report ARMED (rc=$RC): $OUT"
+fi
+# NON-VACUITY for the INERT message the live box emits: the same probe, same code,
+# must say something DIFFERENT here. A probe that always printed INERT would pass
+# every assertion the live run can make.
+grep -q 'INERT' <<<"$OUT" && fail_t "[lead-clear-seal] reported INERT while a lead WAS sealed — the probe does not read the document" \
+                          || ok_t "[lead-clear-seal] ARMED and INERT are distinguishable (not a fixed string)"
+
+# THE MUTATION: tamper the sealed bytes without re-sealing. This is the
+# tamper-is-self-defeating property — the legitimate holder loses the clearance too.
+printf '    - rogue\n' >> "$SC_LC/constitution.yaml"
+probe lead-clear-seal
+if [[ $RC -ne 0 ]]; then ok_t "[lead-clear-seal] RED when the constitution is tampered without re-sealing"
+else fail_t "[lead-clear-seal] STILL GREEN with a drifted constitution — this probe asserts nothing: $OUT"; fi
+if grep -qi 'drift' <<<"$OUT"; then ok_t "[lead-clear-seal] the red names DRIFT, not a generic config gap"
+else fail_t "[lead-clear-seal] red for an unnamed reason (wanted /drift/): $OUT"; fi
+# And it must NOT read as the benign inert state — those demand opposite responses
+# (investigate a tamper vs. convene a motion).
+grep -q 'INERT' <<<"$OUT" && fail_t "[lead-clear-seal] a DRIFTED constitution reported as benign INERT" \
+                          || ok_t "[lead-clear-seal] drift is not conflated with the benign inert state"
+
+# Recovery: re-sealing the tampered bytes restores it — the seal is the variable.
+sc_lc_seal
+probe lead-clear-seal
+if [[ $RC -eq 0 ]] && grep -q 'ARMED' <<<"$OUT"; then
+  ok_t "[lead-clear-seal] green again once the same bytes are re-sealed (the seal is the variable)"
+else
+  fail_t "[lead-clear-seal] did not recover after re-sealing (rc=$RC): $OUT"
+fi
+
+# The INERT branch, proven against a real empty state dir rather than assumed.
+rm -f "$SC_LC/constitution.yaml" "$SC_LC/council/lineage.jsonl"
+probe lead-clear-seal
+if [[ $RC -eq 0 ]] && grep -q 'INERT' <<<"$OUT"; then
+  ok_t "[lead-clear-seal] an unsealed box reports INERT and stays GREEN (fail-closed is not a failure)"
+else
+  fail_t "[lead-clear-seal] an unsealed box did not report a green INERT (rc=$RC): $OUT"
+fi
+SC_ENV=()
+rm -rf "$SC_LC"
+
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [[ $FAIL -eq 0 ]]
