@@ -1891,6 +1891,21 @@ _hb_fleet_activity_probe() {
 
 _hb_stall_sweep() {
   # (a) GAP#2 — surface stale maker->verifier deliveries.
+  #
+  # DIVE-2196: a row BLOCKED on an unanswered human gate is excluded. 'blocked' is
+  # not in ('done','cancelled'), so such a row used to pass the filter and get
+  # nagged — but the wait there is on a HUMAN, not on the verifier, and the remedy
+  # this ping prescribes is the harmful action: on a maker->verifier task the
+  # verifier's ACK *is* the close, so "run task start then task done/task reject"
+  # asks them to resolve a pending human gate by side effect. Fired live on
+  # DIVE-2146, whose gate asked lodar to choose between leaving it open and closing
+  # it as delivered — i.e. the nag pushed option B in a question nobody had
+  # answered. The gate-live predicate matches the one inbox/show/park use
+  # (need_type set AND not yet answered; status is already constrained above).
+  # An ANSWERED gate does not exclude: the wait is back on the verifier.
+  # (gap#3's stranded_todo below keeps its own predicate — it counts status='todo'
+  # rows, and a gate-blocked row is 'blocked'; open gates are counted by open_gates,
+  # where a pinged tier-2 gate is deliberately PARKED rather than stranded.)
   local vrow vid vident vfier vdelivered vmins
   while IFS= read -r vrow; do
     [[ -n "$vrow" ]] || continue
@@ -1909,6 +1924,7 @@ _hb_stall_sweep() {
                  AND assignee=verifier AND status NOT IN ('done','cancelled')
                  AND handoff_ack_at IS NULL AND handoff_stale_pinged_at IS NULL
                  AND handoff_delivered_at IS NOT NULL
+                 AND NOT (need_type IS NOT NULL AND need_answered_at IS NULL)
                  AND handoff_delivered_at <= datetime('now','-${_HB_VERIFY_STALE_MIN} minutes');")
 
   # (b) GAP#3 core — fleet-idle-while-actionable-work-is-open, persisting.
