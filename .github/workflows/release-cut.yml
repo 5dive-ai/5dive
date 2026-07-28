@@ -92,8 +92,25 @@ jobs:
           # an ungraded tree at precisely the moment our grading is broken, which is
           # the failure this whole ticket exists to retire. So: count first.
           runs=$(gh api --paginate "repos/${GITHUB_REPOSITORY}/commits/${sha}/check-runs" \
-                   --jq '.check_runs[] | [.name, .status, (.conclusion // "pending")] | @tsv' 2>/dev/null)
+                   --jq '.check_runs[] | [.name, .status, (.conclusion // "pending"), (.details_url // "")] | @tsv' 2>/dev/null)
           # >>> DIVE-2144 release-cut guard block (extracted verbatim by tests/release_cut_guards_unit.sh)
+          # DIVE-2238: DROP THIS RUN'S OWN CHECK-RUNS BEFORE COUNTING ANYTHING.
+          # This job runs against main's tip, so its own `cut` job is a check-run on
+          # the very sha it is grading — permanently `in_progress` for as long as it
+          # executes. Counting it makes the completeness guard UNSATISFIABLE BY
+          # CONSTRUCTION: the job waits for itself, refuses, and would do so every
+          # night on a fully green main. It failed exactly that way on its only run
+          # (30332498204, 2026-07-28: "CI still IN FLIGHT ... Unfinished: cut
+          # in_progress"), and 49 commits sat unpublished behind it while every box
+          # kept installing v0.16.32.
+          # Matched on the RUN ID in details_url, not on the job name: renaming the
+          # job must not silently re-introduce the self-reference. Dropping the whole
+          # run rather than just this job is the correct rule — no job of this run can
+          # be a precondition for this run. Everything below is unchanged, and still
+          # sees a genuinely in-flight OTHER run.
+          if [[ -n "${GITHUB_RUN_ID:-}" ]]; then
+            runs=$(awk -F'\t' -v self="/actions/runs/${GITHUB_RUN_ID}/" 'index($4, self) == 0' <<<"$runs")
+          fi
           total=$(printf '%s' "$runs" | grep -c . || true)
 
           if (( total == 0 )); then
@@ -104,8 +121,8 @@ jobs:
           incomplete=$(awk -F'\t' '$2 != "completed"' <<<"$runs")
           bad=$(awk -F'\t' '$3 != "success" && $3 != "skipped" && $3 != "neutral"' <<<"$runs" | awk -F'\t' '$2 == "completed"')
 
-          echo "CI on ${sha:0:12}: ${total} check-run(s)"
-          printf '%s\n' "$runs" | sed 's/^/  /'
+          echo "CI on ${sha:0:12}: ${total} check-run(s) (excluding this run's own)"
+          printf '%s\n' "$runs" | cut -f1-3 | sed 's/^/  /'
 
           if [[ -n "$incomplete" ]]; then
             echo "::error::CI still IN FLIGHT on ${sha:0:12} — refusing to cut ${tag}. Unfinished:"

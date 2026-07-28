@@ -57,6 +57,33 @@ verdict(){ # $1 = check-runs TSV ; echoes NOT-REACHED|IN-FLIGHT|RED|GREEN
   fi
   grep -q 'CI green on' <<<"$out" && echo GREEN || echo "OTHER-OK:$out"
 }
+verdict_run(){ # $1 = check-runs TSV (4-col), $2 = GITHUB_RUN_ID ; echoes like verdict()
+  local out rc
+  out=$(runs="$1" sha=deadbeefcafe tag=v9.9.9 GITHUB_RUN_ID="$2" bash -c "
+    set -uo pipefail
+    $GUARD
+  " 2>&1); rc=$?
+  if (( rc != 0 )); then
+    grep -q 'CI NOT REACHED'    <<<"$out" && { echo NOT-REACHED; return; }
+    grep -q 'CI still IN FLIGHT' <<<"$out" && { echo IN-FLIGHT;   return; }
+    grep -q 'CI is RED'          <<<"$out" && { echo RED;         return; }
+    echo "OTHER-FAIL:$out"; return
+  fi
+  grep -q 'CI green on' <<<"$out" && echo GREEN || echo "OTHER-OK:$out"
+}
+
+# DIVE-2238 fixtures. Column 4 is details_url, which is how a check-run is traced
+# back to the workflow run that owns it.
+SELF_URL='https://github.com/5dive-ai/5dive/actions/runs/30332498204/job/90190441674'
+OTHER_URL='https://github.com/5dive-ai/5dive/actions/runs/99999999999/job/1'
+# This job's own row (in_progress, forever, because it IS the running job) plus a
+# fully green board — the EXACT shape of run 30332498204 that refused to publish.
+SELF_INFLIGHT=$(printf 'cut\tin_progress\tpending\t%s\ntest\tcompleted\tsuccess\t%s\nscan\tcompleted\tsuccess\t%s' "$SELF_URL" "$OTHER_URL" "$OTHER_URL")
+# Same board, but the in-flight check belongs to a DIFFERENT run. Must still block.
+OTHER_INFLIGHT=$(printf 'test\tin_progress\tpending\t%s\nscan\tcompleted\tsuccess\t%s' "$OTHER_URL" "$OTHER_URL")
+# Nothing but our own rows: after filtering there is no evidence at all.
+ONLY_SELF=$(printf 'cut\tin_progress\tpending\t%s' "$SELF_URL")
+
 cut_decision(){ # $1 = incumbent, $2 = candidate ; echoes CUT|REFUSE
   incumbent="$1" tag="$2" bash -c "set -uo pipefail; $SORTA" >/dev/null 2>&1 && echo CUT || echo REFUSE
 }
@@ -70,6 +97,14 @@ ok "cancelled -> RED"                           "$(verdict "$(printf 'test\tcomp
 ok "timed_out -> RED"                           "$(verdict "$(printf 'test\tcompleted\ttimed_out')")" "RED"
 ok "still in_progress -> IN-FLIGHT, not GREEN"  "$(verdict "$(printf 'test\tin_progress\tpending\nscan\tcompleted\tsuccess')")" "IN-FLIGHT"
 ok "queued -> IN-FLIGHT"                        "$(verdict "$(printf 'test\tqueued\tpending')")" "IN-FLIGHT"
+
+echo "== DIVE-2238: the job must not count ITSELF as unfinished CI =="
+ok "own in_progress row is excluded -> GREEN"   "$(verdict_run "$SELF_INFLIGHT"  30332498204)" "GREEN"
+ok "ANOTHER run's in_progress still blocks"     "$(verdict_run "$OTHER_INFLIGHT" 30332498204)" "IN-FLIGHT"
+ok "only our own rows -> NOT-REACHED, not GREEN" "$(verdict_run "$ONLY_SELF"     30332498204)" "NOT-REACHED"
+# Without a run id (local/manual invocation) nothing is filtered and the old
+# behaviour stands, so the filter can never silently swallow a real in-flight run.
+ok "no GITHUB_RUN_ID -> nothing filtered"       "$(verdict_run "$SELF_INFLIGHT"  '')"          "IN-FLIGHT"
 
 echo "== guard B: the candidate must WIN install.sh's sort, not merely exist =="
 ok "v0.16.32 over v0.15.34 -> CUT"              "$(cut_decision v0.15.34 v0.16.32)" "CUT"
@@ -86,13 +121,24 @@ ok "install.sh still sorts with sort -V"        "$(grep -c 'sort -V' install.sh 
 ok "the workflow sorts with sort -V too"        "$(grep -c 'sort -V' "$WF" | awk '$1>0{print "yes"}')" "yes"
 
 echo "== non-vacuity: each guard must RED when mutated =="
+# DIVE-2238: this helper used to announce a no-op mutation with `echo` and bump
+# `fail` — but every call site is `m=$(mutate ...)`, so the warning was CAPTURED
+# INTO THE VARIABLE instead of printed, and the increment happened in a subshell
+# and was discarded. A mutation that stopped applying therefore made its whole arm
+# VANISH: no FAIL, no ok, just one fewer assertion in a total nobody diffs. That is
+# the vacuous-control shape (community/wiki/a-vacuously-passing-control-is-invisible-in-a-failure-list.md)
+# living inside the machinery written to prevent it. Measured: running this suite
+# against the pre-fix workflow printed "20 passed, 2 failed" — 22 of 23 arms, with
+# the 23rd gone silently. The warning now goes to STDERR (never capturable into $m)
+# and each call site registers its own explicit failure.
 mutate(){ # $1 = sed expr applied to the extracted block var named by $2
   local expr="$1" var="$2" before after
   before="${!var}"
   after=$(sed "$expr" <<<"$before")
-  [[ "$after" == "$before" ]] && { echo "FAIL - mutation '$expr' did not apply (arm is VACUOUS)"; fail=$((fail+1)); return 1; }
+  [[ "$after" == "$before" ]] && { printf 'mutation did not apply: %s\n' "$expr" >&2; return 1; }
   printf '%s' "$after"
 }
+vacuous(){ fail=$((fail+1)); echo "FAIL - $1: mutation did not apply, so this arm graded NOTHING (VACUOUS)"; }
 
 # (a) drop the zero-check: absence must stop reading as green
 if m=$(mutate 's/if (( total == 0 )); then/if false; then/' GUARD); then
@@ -100,6 +146,19 @@ if m=$(mutate 's/if (( total == 0 )); then/if false; then/' GUARD); then
   ok "MUTANT drop zero-check: empty runs no longer NOT-REACHED" \
      "$([[ "$(verdict "")" == "NOT-REACHED" ]] && echo caught-nothing || echo mutant-detected)" "mutant-detected"
   GUARD="$GUARD_SAVE"
+else
+  vacuous "drop zero-check"
+fi
+# (a2) DIVE-2238: drop the self-filter — the job must go back to blocking on itself.
+# This is the arm that proves the fix is load-bearing rather than decorative: before
+# the fix this fixture returned IN-FLIGHT and the job could never publish.
+if m=$(mutate 's|if \[\[ -n "${GITHUB_RUN_ID:-}" \]\]; then|if false; then|' GUARD); then
+  GUARD_SAVE="$GUARD"; GUARD="$m"
+  ok "MUTANT drop self-filter: job blocks on itself again" \
+     "$([[ "$(verdict_run "$SELF_INFLIGHT" 30332498204)" == "GREEN" ]] && echo caught-nothing || echo mutant-detected)" "mutant-detected"
+  GUARD="$GUARD_SAVE"
+else
+  vacuous "drop self-filter"
 fi
 # (b) drop the in-flight arm: a running check must stop reading as green
 if m=$(mutate '/incomplete=\$(awk/s/\$2 != "completed"/1==0/' GUARD); then
@@ -107,6 +166,8 @@ if m=$(mutate '/incomplete=\$(awk/s/\$2 != "completed"/1==0/' GUARD); then
   ok "MUTANT drop in-flight arm: running check no longer IN-FLIGHT" \
      "$([[ "$(verdict "$(printf 'test\tin_progress\tpending')")" == "IN-FLIGHT" ]] && echo caught-nothing || echo mutant-detected)" "mutant-detected"
   GUARD="$GUARD_SAVE"
+else
+  vacuous "drop in-flight arm"
 fi
 # (c) lexical sort: this is olivia's measured v0.9.9 downgrade, in the cutter
 if m=$(mutate 's/sort -V/sort/' SORTA); then
@@ -114,6 +175,8 @@ if m=$(mutate 's/sort -V/sort/' SORTA); then
   ok "MUTANT lexical sort: v0.9.9 stops being refused" \
      "$(cut_decision v0.15.34 v0.9.9)" "CUT"
   SORTA="$SORTA_SAVE"
+else
+  vacuous "lexical sort"
 fi
 
 echo
