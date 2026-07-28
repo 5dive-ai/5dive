@@ -916,16 +916,18 @@ cmd_deliver() {
   # Sender + tier from the real sudo caller (agent-X -> X). A non-agent caller
   # (direct root / human) records as "human"; tier is empty unless the sender is
   # a registered agent. Mirrors auto_sender_from_sudo + the DIVE-1064 tier stamp.
-  local s="${SUDO_USER#agent-}"
-  [[ "${SUDO_USER:-}" == agent-* ]] || s="human"
-  local tier=""
-  tier="$(registry_read | jq -r --arg n "$s" '.agents[$n].isolation // empty' 2>/dev/null)"
+  local s="${SUDO_USER#agent-}" _caller=""
+  if [[ "${SUDO_USER:-}" == agent-* ]]; then _caller="$s"; else s="human"; fi
+  # DIVE-2210: ALWAYS stamped, never conditional. A non-agent caller gets
+  # tier=unknown:no-caller rather than a clean envelope with the field missing.
+  local tier
+  tier="$(envelope_tier "$_caller")"
 
   # Provenance envelope, mirroring cmd_send's [5dive-msg ...] header format.
   # Field order matches cmd_send: from, id, tier.
   local header="[5dive-msg from=${s}"
   [[ -n "$msgid" ]] && header+=" id=${msgid}"
-  [[ -n "$tier" ]] && header+=" tier=${tier}"
+  header+=" tier=${tier}"
   header+="]"
   local payload="${header} ${message}"
 
@@ -1222,13 +1224,17 @@ cmd_send() {
       msg_id="$(gen_msg_id)"
       # DIVE-1064: stamp the sender's isolation tier so a receiver can down-trust
       # a lower-privilege peer. Derived from the REAL sudo caller (not the
-      # spoofable --from label), so it holds even if from= is forged. Omitted
-      # when there's no agent caller (human/root) or no recorded tier.
+      # spoofable --from label), so it holds even if from= is forged.
+      # DIVE-2210: and stamped UNCONDITIONALLY. This is the exact fail-open the
+      # ticket is about — `--from=community` with no sudo caller used to render
+      # `[5dive-msg from=community id=...]`, byte-identical to a legitimate
+      # untiered send, so the forgeable field survived and the unforgeable one
+      # silently vanished. Now it reads tier=unknown:no-caller.
       local _caller _tier=""
       _caller="$(auto_sender_from_sudo)"
-      [[ -n "$_caller" ]] && _tier="$(registry_read | jq -r --arg n "$_caller" '.agents[$n].isolation // empty' 2>/dev/null)"
+      _tier="$(envelope_tier "$_caller")"
       local header="[5dive-msg from=${sender} id=${msg_id}"
-      [[ -n "$_tier" ]] && header+=" tier=${_tier}"
+      header+=" tier=${_tier}"
       [[ -n "$reply_to_chat" ]] && header+=" reply-to-chat=${reply_to_chat}"
       [[ -n "$reply_to_msg" ]] && header+=" reply-to-msg=${reply_to_msg}"
       header+="]"
@@ -1400,7 +1406,12 @@ cmd_ask() {
     require_agent "$name"
     sudo -u "agent-${name}" tmux has-session -t "agent-${name}" 2>/dev/null \
       || fail "$E_NOT_RUNNING" "tmux session 'agent-${name}' not found (is the agent running?)"
-    local header="[5dive-msg from=${sender} id=${msg_id}"
+    # DIVE-2210: `ask`'s direct-inject path carried NO tier field at all — it was
+    # never added when DIVE-1064 stamped `send` and `_deliver`. An envelope with
+    # no tier= is exactly the ambiguity this ticket closes, so `ask` now stamps
+    # the same field from the same resolver. (The scoped branch above already
+    # inherits it: `_deliver` builds that envelope.)
+    local header="[5dive-msg from=${sender} id=${msg_id} tier=$(envelope_tier "$(auto_sender_from_sudo)")"
     [[ -n "$reply_to_chat" ]] && header+=" reply-to-chat=${reply_to_chat}"
     [[ -n "$reply_to_msg" ]] && header+=" reply-to-msg=${reply_to_msg}"
     header+="]"
