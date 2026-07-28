@@ -64,11 +64,19 @@ set -uo pipefail
 # 210 harnesses at once while every other check in this change stayed green.
 . "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh" \
   || printf 'grading tree: UNRESOLVED (tests/lib/grading_tree.sh not reachable; no tree named)\n' >&2
+# DIVE-2229: pinned-commit baselines, fail-closed. Same no-2>/dev/null rule.
+. "$(dirname "${BASH_SOURCE[0]}")/lib/pinned_baseline.sh" \
+  || printf 'pinned baseline helper: UNRESOLVED (tests/lib/pinned_baseline.sh not reachable)\n' >&2
 cd "$(dirname "$0")/.."
 
 PASS=0; FAIL=0; SKIP=0
 ok_t()   { PASS=$((PASS+1)); printf 'ok   - %s\n' "$1"; }
-bad_t()  { FAIL=$((FAIL+1)); printf 'FAIL - %s\n' "$1"; }
+# DIVE-2229: $2 used to be DROPPED here, so a caller that carefully explained WHY
+# an arm failed printed only its headline. Found by reading the offline run's
+# actual output rather than the call site — the message was written, passed, and
+# swallowed. Second line only when there is one, so the 40 single-arg callers
+# above are unchanged.
+bad_t()  { FAIL=$((FAIL+1)); printf 'FAIL - %s\n' "$1"; [[ -n "${2:-}" ]] && printf '       %s\n' "$2"; return 0; }
 skip_t() { SKIP=$((SKIP+1)); printf 'SKIP - %s\n' "$1"; }
 eq_t()   { if [[ "$2" == "$3" ]]; then ok_t "$1"; else bad_t "$1 (expected '$2', got '$3')"; fi; }
 
@@ -245,10 +253,17 @@ done
 # claim it anchors; name the COMMIT. (It also explains a count that looked like
 # a disagreement: on a checkout with no reachable baseline these two SKIP, so
 # the same harness honestly reports 36+2 there and 41 here.)
-PRE_FIX_REF="9258ee1"   # main immediately before DIVE-2213 merged (PR #268)
+PRE_FIX_REF="9258ee1ae81b6e96210d0af026f2f3a4a556a518"   # main immediately before DIVE-2213 merged (PR #268)
+# FULL 40 chars, deliberately: `git fetch origin <abbrev>` is rejected with
+# "couldn't find remote ref", so an abbreviated pin makes the shallow-tree
+# fallback in pinned_baseline.sh DEAD CODE and every shallow box reds. Measured.
 OLD_SRC="$TMP/old_heartbeat.sh"
-if git rev-parse --verify -q "${PRE_FIX_REF}^{commit}" >/dev/null 2>&1 \
-   && git show "${PRE_FIX_REF}:src/cmd_heartbeat.sh" > "$OLD_SRC" 2>/dev/null; then
+# DIVE-2229: pinning fixed the ref but left the OTHER half — in a depth-1 CI
+# checkout the pinned commit is not present, this went `skip`, and a skip reads
+# as green to everyone quoting the tally. It now FETCHES that one commit and
+# REDS if it still cannot get it, because "the anchor did not run" and "the
+# anchor passed" must never print the same colour.
+if pinned_blob "$PRE_FIX_REF" src/cmd_heartbeat.sh "$OLD_SRC"; then
   if _mk_decider decide_old < <(_extract_guard < "$OLD_SRC"); then
     declare -a OLD_OUT=()
     for row in "${CAUSES[@]}"; do
@@ -287,7 +302,7 @@ if git rev-parse --verify -q "${PRE_FIX_REF}^{commit}" >/dev/null 2>&1 \
     skip_t "ANCHOR: ${PRE_FIX_REF}'s cmd_heartbeat.sh has no extractable guard block"
   fi
 else
-  skip_t "ANCHOR: pinned baseline ${PRE_FIX_REF} unavailable (shallow clone?) — pre-fix collapse NOT re-measured here"
+  bad_t "ANCHOR: pre-fix collapse NOT re-measured" "$(pinned_unavailable_msg "$PRE_FIX_REF")"
 fi
 
 # ---------------------------------------------------------------------------
@@ -306,12 +321,36 @@ fi
 
 # DIVE-2210's envelope_tier() is a shipped wire format that olivia verified.
 # This ticket adds a sibling; it must not edit it.
-if git rev-parse --verify -q origin/main >/dev/null 2>&1; then
-  old_et="$(git show origin/main:src/lib/registry.sh 2>/dev/null | awk '/^envelope_tier\(\) \{$/ { on=1 } on { print } on && $0 == "}" { exit }')"
-  new_et="$(awk '/^envelope_tier\(\) \{$/ { on=1 } on { print } on && $0 == "}" { exit }' src/lib/registry.sh)"
-  eq_t "envelope_tier() is byte-identical to origin/main (DIVE-2210 untouched)" "$old_et" "$new_et"
+#
+# DIVE-2229 — THIS ARM WAS THE VACUOUS ONE, and it is the arm olivia cited as
+# proof DIVE-2210's wire format was unmoved. It compared against `origin/main`,
+# so once DIVE-2213 merged it was comparing main's registry.sh to main's
+# registry.sh: a must-not-change assertion whose two sides are the same file
+# cannot fail. It does not go red when it stops meaning anything — it goes `ok`
+# forever. Worse, in a `clone --depth=1 --branch main` the ref RESOLVES (to HEAD),
+# so "did origin/main resolve?" never detected it either.
+#
+# e32fab8 is the commit that SHIPPED envelope_tier() for DIVE-2210 — the exact
+# bytes olivia verified — so the pin is what the sentence already claimed to be
+# comparing against, and it is immutable.
+ENVELOPE_TIER_REF="e32fab8e39d9382453f4d1ea680e97f2e386767b"   # DIVE-2210 (full sha: fetchable)
+OLD_REG="$TMP/old_registry.sh"
+_extract_et() { awk '/^envelope_tier\(\) \{$/ { on=1 } on { print } on && $0 == "}" { exit }'; }
+if pinned_blob "$ENVELOPE_TIER_REF" src/lib/registry.sh "$OLD_REG"; then
+  old_et="$(_extract_et < "$OLD_REG")"
+  new_et="$(_extract_et < src/lib/registry.sh)"
+  # NON-VACUITY, asserted and not assumed. Both sides are produced by the same
+  # awk range, so a rename of envelope_tier() empties BOTH and eq_t goes green on
+  # a function that no longer exists. The equality below is only worth reading
+  # after this line has established there is something to compare.
+  if [[ -n "$old_et" && -n "$new_et" ]]; then
+    ok_t "envelope_tier() is extractable on BOTH sides ($(wc -l <<<"$old_et") / $(wc -l <<<"$new_et") lines) — the equality below is non-vacuous"
+    eq_t "envelope_tier() is byte-identical to ${ENVELOPE_TIER_REF} (DIVE-2210 untouched)" "$old_et" "$new_et"
+  else
+    bad_t "envelope_tier() drift check is VACUOUS" "extracted ${#old_et} bytes at ${ENVELOPE_TIER_REF} and ${#new_et} bytes here — an empty side makes byte-equality meaningless; the function was renamed, moved out of src/lib/registry.sh, or its opening line no longer matches the extractor"
+  fi
 else
-  skip_t "envelope_tier() drift check (origin/main unavailable)"
+  bad_t "envelope_tier() drift check did NOT run" "$(pinned_unavailable_msg "$ENVELOPE_TIER_REF")"
 fi
 
 # ---------------------------------------------------------------------------

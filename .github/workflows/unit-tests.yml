@@ -12,7 +12,15 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
+      # DIVE-2229: fetch-depth is load-bearing, not hygiene. actions/checkout@v4
+      # defaults to depth 1, and the harnesses below anchor "what this code did
+      # BEFORE" to pinned commits. At depth 1 none of those commits are present,
+      # so every one of those arms was NOT-REACHED in the only environment that
+      # gates a merge — measured on a true depth-1 clone: 36 passed, 0 failed,
+      # 2 SKIPPED, against 41/0/0 on a full checkout. That had been true since
+      # this workflow was written; a skip count is not a green count.
       - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
       - name: Run unit harnesses
         run: |
           rc=0
@@ -49,7 +57,9 @@ jobs:
     runs-on: ubuntu-latest
     needs: test
     steps:
+      # DIVE-2229: full history — pinned baselines must resolve here too.
       - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
       - name: Every harness must be able to FAIL
         run: |
           bash tests/meta/harness-verdict-probe.sh --assume-clean \
@@ -81,7 +91,9 @@ jobs:
   test-installed-host:
     runs-on: ubuntu-latest
     steps:
+      # DIVE-2229: full history — pinned baselines must resolve here too.
       - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
       - name: Simulate a box with 5dive installed
         run: |
           # live state dir + gate-proof enforcement flipped ON (as on the
@@ -166,7 +178,9 @@ jobs:
     runs-on: ubuntu-latest
     needs: [harness-verdict, test-installed-host]
     steps:
+      # DIVE-2229: full history — pinned baselines must resolve here too.
       - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
       - uses: actions/download-artifact@v4
         with: { pattern: probe-*, merge-multiple: true }
       # The union script fails closed on a missing, headerless, or different-corpus
@@ -188,7 +202,9 @@ jobs:
     runs-on: ubuntu-latest
     needs: [harness-verdict, test-installed-host]
     steps:
+      # DIVE-2229: full history — pinned baselines must resolve here too.
       - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
       - uses: actions/download-artifact@v4
         with: { pattern: selfcheck-*, merge-multiple: true }
       # Fails closed on a missing, headerless, different-corpus or
