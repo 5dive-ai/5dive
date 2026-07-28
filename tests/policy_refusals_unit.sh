@@ -29,6 +29,9 @@ set -uo pipefail
 # 210 harnesses at once while every other check in this change stayed green.
 . "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh" \
   || printf 'grading tree: UNRESOLVED (tests/lib/grading_tree.sh not reachable; no tree named)\n' >&2
+# DIVE-2229: pinned-commit baselines, fail-closed. Same no-2>/dev/null rule.
+. "$(dirname "${BASH_SOURCE[0]}")/lib/pinned_baseline.sh" \
+  || printf 'pinned baseline helper: UNRESOLVED (tests/lib/pinned_baseline.sh not reachable)\n' >&2
 cd "$(dirname "$0")/.."
 
 TMP="$(mktemp -d /tmp/policy-refusals.XXXXXX)"
@@ -160,15 +163,21 @@ DUPES="$(grep -oE 'policy_refuse "[^"]+" [a-z0-9-]+' src/cmd_task.sh | awk '{pri
 #     an unrelated environmental reason on this host, so it never reached the
 #     assertion. Compare every instrumented site against the code it had on
 #     origin/main — the only source of truth for "what it used to do".
-# Do not merely CHECK for origin/main — try to obtain it. A shallow CI checkout
-# legitimately lacks it, and the old code turned that into a silent `ok`.
-if ! git rev-parse --verify origin/main >/dev/null 2>&1; then
-  git fetch --depth=1 origin main >/dev/null 2>&1 || true
-fi
-if git rev-parse --verify origin/main >/dev/null 2>&1 || git rev-parse --verify FETCH_HEAD >/dev/null 2>&1; then
-  MAIN_REF=origin/main
-  git rev-parse --verify origin/main >/dev/null 2>&1 || MAIN_REF=FETCH_HEAD
-  git show "${MAIN_REF}:src/cmd_task.sh" > "$TMP/orig_task.sh" 2>/dev/null
+# Do not merely CHECK for the baseline — try to obtain it. A shallow CI checkout
+# legitimately lacks it, and the oldest version of this code turned that into a
+# silent `ok`.
+#
+# DIVE-2229 — but "obtain origin/main" was still the wrong target. `origin/main`
+# and its `FETCH_HEAD` fallback both name the CURRENT tip, so once this
+# instrumentation merged the comparison read the post-instrumentation file and
+# asked whether it matched itself. The question this arm exists to answer is
+# "what did these sites do BEFORE they were instrumented", and only a commit can
+# answer that. e142832 is main immediately before da303e9 (DIVE-1922, PR #156)
+# introduced policy_refuse at all, so it is the last tree in which every one of
+# these sites still called `fail` directly — checked non-vacuous: it carries
+# fail "$E_AUTH_REQUIRED" (7), fail "$E_CONFLICT" (12) and fail "$E_USAGE" (73).
+PRE_INSTRUMENT_REF="e14283209d022c16034f4a4679d0a46463ddd8f3"   # before DIVE-1922 (PR #156)
+if pinned_blob "$PRE_INSTRUMENT_REF" src/cmd_task.sh "$TMP/orig_task.sh"; then
   drift=0
   while read -r code slug; do
     # the message is unchanged by instrumentation, so match the site by its slug's
@@ -185,22 +194,32 @@ if git rev-parse --verify origin/main >/dev/null 2>&1 || git rev-parse --verify 
   grep -q 'local code="\$1"' src/lib/tasks_db.sh \
     && ok_t "policy_refuse takes the exit code as a PARAMETER, so instrumenting preserves behaviour" \
     || bad_t "hardcoded exit code" "policy_refuse forces one code onto every site it instruments"
-  # Every code still in use must be one origin/main actually used at a refusal.
+  # Every code still in use must be one the pre-instrumentation tree actually
+  # used at a refusal.
+  #
+  # NON-VACUITY FIRST: the loop below is a series of "is this code present in the
+  # baseline file" greps, and an EMPTY baseline file answers no to all of them —
+  # which reds, so that direction is safe — but a baseline that simply contains
+  # no `fail "$E_..."` at all would make a green here mean nothing. Establish the
+  # denominator before reading the verdict.
+  base_fails="$(grep -cF 'fail "$E_' "$TMP/orig_task.sh" || true)"
+  [[ "${base_fails:-0}" -gt 0 ]] \
+    && ok_t "baseline ${PRE_INSTRUMENT_REF}:src/cmd_task.sh carries $base_fails direct fail sites — the subset check below has a denominator" \
+    || bad_t "baseline carries NO direct fail sites" "${PRE_INSTRUMENT_REF}:src/cmd_task.sh has no \`fail \"\$E_…\"\` at all, so 'every code existed at a refusal there' cannot be answered — the pin is wrong or the file moved"
   unknown=""
   for c in $(grep -oE 'policy_refuse "\$E_[A-Z_]+"' src/cmd_task.sh | grep -oE 'E_[A-Z_]+' | sort -u); do
-    grep -q "fail \"\$${c}\"" "$TMP/orig_task.sh" || unknown="$unknown $c"
+    grep -qF "fail \"\$${c}\"" "$TMP/orig_task.sh" || unknown="$unknown $c"
   done
   [[ -z "$unknown" ]] \
-    && ok_t "every exit code used by an instrumented site existed at a refusal on origin/main" \
+    && ok_t "every exit code used by an instrumented site existed at a refusal at ${PRE_INSTRUMENT_REF} (pre-instrumentation)" \
     || bad_t "invented exit code" "$unknown"
 else
-  # NOT ok_t. This comparison is the only thing standing between "telemetry was
-  # added" and "telemetry silently changed three exit codes", which is a defect
-  # this ticket already shipped once. Counting a skip as a pass is how a suite
-  # reports green while its load-bearing assertion never ran, so it is a FAILURE
-  # here — CI always has origin/main, and a developer box that does not can fetch.
-  bad_t "origin/main unreachable — the behaviour-preservation comparison did NOT run" \
-        "a fetch was attempted and failed; this assertion is not optional"
+  # NOT ok_t, and NOT skip_t. This comparison is the only thing standing between
+  # "telemetry was added" and "telemetry silently changed three exit codes",
+  # which is a defect this ticket already shipped once. Counting a skip as a pass
+  # is how a suite reports green while its load-bearing assertion never ran.
+  bad_t "the behaviour-preservation comparison did NOT run" \
+        "$(pinned_unavailable_msg "$PRE_INSTRUMENT_REF")"
 fi
 
 # --- Case 5: policy_refuse is reserved for POLICY refusals. If it ever spreads
