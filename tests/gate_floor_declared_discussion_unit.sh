@@ -127,11 +127,18 @@ cmd_task_need DIVE-403 --type=decision --from=dev \
   --ask="$DESIGN_ASK" --options="capability|clearance" --recommend="clearance" >/dev/null 2>&1
 [[ "$(tierof DIVE-403)" == "2" ]] && ok_t "mutation: same ask WITHOUT --discusses still floors to tier 2" || bad_t "mutation ask tier 2" "got '$(tierof DIVE-403)'"
 [[ "$HUMAN_PINGED" == "1" ]] && ok_t "mutation: same ask WITHOUT --discusses still pings the human" || bad_t "mutation ask pings human" "HUMAN_PINGED=$HUMAN_PINGED"
+# DIVE-2224 answer A (lodar, 2026-07-28 05:32): this arm changed DISPOSITION, not
+# PURPOSE. A floor term in the TITLE with a substantive ask no longer floors -- it
+# routes to the lead stamped floored_by=title. The guard still has to prove the title
+# is READ AT ALL, so it now grades that stamp: if the title axis went dead the gate
+# would be tier 1 with NO stamp, and this arm reds exactly as it did before.
 route_reset; seed DIVE-404 "design the token exchange between the runtime and the broker"
-cmd_task_need DIVE-404 --type=decision --from=dev \
+res404=$( JSON_MODE=0; cmd_task_need DIVE-404 --type=decision --from=dev \
   --ask="Should the exchange be modelled as a synchronous call or an async queue?" \
-  --options="sync|async" --recommend="async" >/dev/null 2>&1
-[[ "$(tierof DIVE-404)" == "2" ]] && ok_t "mutation/TITLE: same title WITHOUT --discusses still floors to tier 2" || bad_t "mutation title tier 2" "got '$(tierof DIVE-404)'"
+  --options="sync|async" --recommend="async" 2>/dev/null )
+{ [[ "$(tierof DIVE-404)" == "1" ]] && grep -qi "floored_by=title" <<<"$res404"; } \
+  && ok_t "mutation/TITLE: the title axis is still LIVE — lead-routed and STAMPED floored_by=title (answer A)" \
+  || bad_t "mutation title stamped" "tier='$(tierof DIVE-404)' stdout: $res404"
 
 # 4: SAFETY — the non-appealable MONEY core survives any declaration.
 route_reset; seed DIVE-405
@@ -306,9 +313,13 @@ route_reset; seed DIVE-421 "design the token exchange between the runtime and th
 res2=$( JSON_MODE=0; cmd_task_need DIVE-421 --type=decision --from=dev \
   --ask="Should the exchange be modelled as a synchronous call or an async queue?" \
   --options="sync|async" --recommend="async" 2>/dev/null )
-grep -qi "T2 category floor" <<<"$res2" \
-  && ok_t "result/TITLE: the RESULT LINE states the floor fired on a title-only match" \
-  || bad_t "result/TITLE states floor" "stdout: $res2"
+# DIVE-2224 answer A: the durable surface must still NAME the title term -- that was
+# always this arm's point ("the term the filer cannot reword away is named on the
+# durable surface"). What changed is what it says about it: routed to the lead and
+# stamped, rather than floored to the human.
+grep -qi "floored_by=title" <<<"$res2" \
+  && ok_t "result/TITLE: the RESULT LINE states the gate was NOT floored and why (floored_by=title)" \
+  || bad_t "result/TITLE states floored_by" "stdout: $res2"
 grep -qi "matched 'token'" <<<"$res2" \
   && ok_t "result/TITLE: names the term that matched from the TITLE, the axis the filer cannot reword" \
   || bad_t "result/TITLE names term" "stdout: $res2"

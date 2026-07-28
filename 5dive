@@ -22931,6 +22931,73 @@ _gate_tier2_floor_hit() {
   [[ "$text" =~ $floor_rx ]]
 }
 
+# DIVE-2224: NEVER concatenate two SUBJECTS into one classifier input. The ASK is
+# what is being asked for, written at gate-filing time; the TITLE is what the
+# ticket is about, written at ticket-creation time. They are different statements,
+# and joining them with a space lets any BOUNDED-DISTANCE pattern match ACROSS the
+# seam and fabricate a classification present in NEITHER field.
+#
+# Measured on origin/main with the shipped floor: ask "confirm we can drop" MISSES,
+# title "table stakes: the onboarding rewrite" MISSES, the join HITS -- on
+# `drop[^.]{0,20}table`, a database-deletion guard, between two texts about neither.
+# Second instance of the shape after DIVE-1481's 20-char co-reference window, so it
+# is a property of the JOIN and not of one regex; every classifier that reads both
+# fields has it.
+#
+# Evaluating each field SEPARATELY preserves "either field can trip it" -- the
+# DIVE-1957 title axis, which is load-bearing in both directions -- and removes only
+# the phantoms. It cannot suppress a real single-field match, so it is strictly
+# safer than the join for an UPGRADE classifier (the floor) and for a DOWNGRADE one
+# (eng-ship / curation / internal-ops), where a fabricated hit is the dangerous
+# direction because it REMOVES a human.
+_gate_hit_either() {   # <predicate-fn> <ask> <title>
+  local _fn="$1"; "$_fn" "${2-}" || "$_fn" "${3-}"
+}
+
+# DIVE-2224 PART 2 — lodar answered A on 2026-07-28. The floor's SUBJECT is the ASK.
+#
+# WHY. A title cannot be a REQUEST. It is written at ticket-creation time to describe
+# a DEFECT; the ask is written at gate-filing time to describe what is being asked
+# for. Flooring on the title treats a description as a request, and the filer cannot
+# reword their way out of it -- DIVE-2216 could not file a push gate AT ALL, because
+# 'deleted' sits in its own title. Measured over the 177 filed gates carrying an ask:
+# 40 match on the ask (unchanged), 15 match TITLE-ONLY (move to the lead), 122 match
+# neither -- so this moves ~27% of human gates to the lead, and understates it,
+# because gates that could never be filed never entered the count.
+#
+# THE FALLBACK IS LOAD-BEARING, NOT A FOOTNOTE (olivia's condition, adopted). A
+# works only while the ask is a TRUTHFUL statement of the request. The failure case
+# is a lazy filing -- ask "approve this", title "delete all customer data" -- where
+# the title genuinely IS the only statement of the request. An ask that names nothing
+# is a badly-filed gate, and the floor FAILS CLOSED on it rather than trusting the
+# filer. Bias is deliberately toward NOT-substantive: a wrongly-floored gate costs
+# one tap, a wrongly-unfloored one lets a destructive ask reach an agent.
+_GATE_ASK_FILLER_RX='approve|approved|approval|please|confirm|confirmation|ok|okay|yes|no|this|that|these|those|it|its|the|a|an|and|or|to|for|of|on|in|is|are|be|go|ahead|proceed|sign|off|signoff|thanks|thank|you|we|i|can|could|would|should|do|does|did|need|needs|needed|want|review|now|asap|me|my|our|us|us|pls|plz'
+_gate_ask_substantive() {   # <ask> -> 0 when the ask states something of its own
+  local t n
+  t=$(printf '%s' "${1-}" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]+/ /g')
+  t=$(printf '%s' "$t" | sed -E "s/\b(${_GATE_ASK_FILLER_RX})\b//g")
+  n=$(printf '%s' "$t" | wc -w)
+  (( n >= 3 ))
+}
+# _gate_floor_axis <ask> <title> -> echoes WHICH field decided, so every consumer
+# (the filing floor and the approval/manual routing arm) makes the SAME call from
+# the same inputs instead of each re-deriving it:
+#   ask            floor fires -- hard human, unchanged from before DIVE-2224
+#   title-fallback floor fires -- title matched and the ask states nothing (olivia's
+#                  fail-closed condition)
+#   title          floor does NOT fire -- lead-routed, stamped floored_by=title
+#   none           floor does not fire
+_gate_floor_axis() {
+  local a="${1-}" t="${2-}"
+  if _gate_tier2_floor_hit "$a"; then printf 'ask'; return 0; fi
+  if _gate_tier2_floor_hit "$t"; then
+    if _gate_ask_substantive "$a"; then printf 'title'; else printf 'title-fallback'; fi
+    return 0
+  fi
+  printf 'none'
+}
+
 # DIVE-1359: the ENG-SHIP gate class. An eng ship / merge / diff / deploy
 # approval is NOT a human call — it is the org lead's (Marcus) to clear. But a
 # builder can file one as a hard-human gate (default, or explicit --tier=2),
@@ -23034,7 +23101,12 @@ _gate_lead_standing_denied() {
 # classifiers on both sides of this file read both (DIVE-1957) and a scope word
 # that appears only in the title must still be able to REMOVE authority.
 _gate_lead_standing_eligible() {
-  local nt="${1:-}" tier="${2:-}" text="${3:-}"
+  # DIVE-2224: <ask> and <title> are SEPARATE arguments. They used to arrive
+  # pre-joined (`ask||' '||title` in SQL), which let a bounded-distance pattern
+  # straddle the seam -- and here a phantom `_gate_eng_ship_hit` GRANTS standing
+  # authority on a gate neither field classifies as engineering. The 4th argument
+  # is optional so a 3-argument caller keeps its exact single-text behaviour.
+  local nt="${1:-}" tier="${2:-}" text="${3:-}" text2="${4-}"
   # Type: `approval` ONLY. `secret` is never lead-clearable at any tier;
   # `manual` is by definition a step only a person can perform; `access` already
   # has its own DIVE-1243 route; `decision` is lead-clearable by type already and
@@ -23047,21 +23119,21 @@ _gate_lead_standing_eligible() {
   # legacy-NULL / 0 deny: an unknown tier is not a tier-1 gate.
   [[ "$tier" == "1" ]] || return 1
   # A gate with nothing to classify cannot be classified as engineering.
-  [[ -n "${text//[[:space:]]/}" ]] || return 1
+  [[ -n "${text//[[:space:]]/}" || -n "${text2//[[:space:]]/}" ]] || return 1
   # Positive engineering evidence. Absence of this is a DENY, not a default —
   # this is the fail-closed direction: "not recognised as engineering" routes to
   # the human exactly as it does today.
-  _gate_eng_ship_hit "$text" || return 1
+  _gate_hit_either _gate_eng_ship_hit "$text" "$text2" || return 1
   # Exclusion 1 — the shared true-human floor (money, secrets/credentials,
   # destructive, publish/press/customer-comms, dns). Belt-and-braces: a tier-1
   # gate should already have failed this floor at filing, but a row filed before
   # the floor existed, or one whose floor terms live in a title added later, must
   # not inherit authority from a stale tier column.
-  ! _gate_tier2_floor_hit "$text" || return 1
+  ! _gate_hit_either _gate_tier2_floor_hit "$text" "$text2" || return 1
   # Exclusion 2 — the ticket's EXPLICITLY OUT OF SCOPE list that the T2 floor does
   # NOT already cover: a customer's box, our customer-facing/public surfaces, a
   # brand or strategic call, and fleet privilege changes.
-  ! _gate_lead_standing_denied "$text" || return 1
+  ! _gate_hit_either _gate_lead_standing_denied "$text" "$text2" || return 1
   return 0
 }
 
@@ -23645,14 +23717,27 @@ cmd_task_need() {
     case "$type" in decision|approval) tier=1 ;; *) tier=2 ;; esac  # DIVE-1284
   fi
   local tier_floored=0
+  local _floored_by_title=0 _floor_axis=none _ft_title=""   # DIVE-2224
   if [[ "$tier" != "2" ]]; then
     if [[ "$type" == "secret" ]]; then
       tier=2; tier_floored=1
     else
       local ttl_title; ttl_title=$(db "SELECT COALESCE(title,'') FROM tasks WHERE id=${id};")
-      if _gate_tier2_floor_hit "${ask} ${ttl_title}"; then
-        tier=2; tier_floored=1
-      fi
+      # DIVE-2224: per-field, never the join; and the ASK is the subject (answer A).
+      _floor_axis=$(_gate_floor_axis "$ask" "$ttl_title")
+      case "$_floor_axis" in
+        ask) tier=2; tier_floored=1 ;;
+        title-fallback)
+          tier=2; tier_floored=1
+          warn "gate floored on the TITLE because the ask states nothing of its own ('${ask}'). A self-contained ask is the standing rule; the floor fails closed rather than trust a filing whose only statement of the request is the ticket title."
+          ;;
+        title)
+          # Not floored. The reviewer is told WHY in one line so 'this ticket is
+          # about deletion' is a fact they hold, and escalating is one step.
+          _floored_by_title=1; _ft_title="$ttl_title"
+          warn "gate NOT floored: the tier-2 category term is in the TASK TITLE, not in the ask (DIVE-2224 answer A). Routed to the lead, stamped floored_by=title — escalate it if the ask really is asking for that."
+          ;;
+      esac
     fi
   fi
 
@@ -23679,10 +23764,15 @@ cmd_task_need() {
   local _curation=0
   if [[ "$tier_arg" != "2" && ( "$type" == "decision" || "$type" == "approval" ) ]]; then
     local _cc_title; _cc_title=$(db "SELECT COALESCE(title,'') FROM tasks WHERE id=${id};")
-    local _cc_text="${ask} ${_cc_title}"
-    local _cc_residual; _cc_residual=$(printf '%s' "$_cc_text" \
+    # DIVE-2224: classify and strip PER FIELD. Building one residual from the join
+    # let the publish-strip and the re-tested floor both straddle the seam.
+    local _cc_res_ask _cc_res_title
+    _cc_res_ask=$(printf '%s' "$ask" \
       | tr '[:upper:]' '[:lower:]' | sed -E "s/(${_GATE_CONTENT_PUBLISH_RX})//g")
-    if _gate_content_curation_hit "$_cc_text" && ! _gate_tier2_floor_hit "$_cc_residual"; then
+    _cc_res_title=$(printf '%s' "$_cc_title" \
+      | tr '[:upper:]' '[:lower:]' | sed -E "s/(${_GATE_CONTENT_PUBLISH_RX})//g")
+    if _gate_hit_either _gate_content_curation_hit "$ask" "$_cc_title" \
+       && ! _gate_hit_either _gate_tier2_floor_hit "$_cc_res_ask" "$_cc_res_title"; then
       local _cc_reviewer; _cc_reviewer=$(_gate_route_reviewer "$(task_actor "$from")")
       if [[ -n "$_cc_reviewer" ]]; then
         tier=1; tier_floored=0; _curation=1
@@ -23714,12 +23804,19 @@ cmd_task_need() {
   if [[ "$tier_arg" != "2" && "$tier_floored" == "1" && "$_curation" == "0" \
         && ( "$type" == "decision" || "$type" == "approval" ) ]]; then
     local _io_title; _io_title=$(db "SELECT COALESCE(title,'') FROM tasks WHERE id=${id};")
-    local _io_text="${ask} ${_io_title}"
     # DIVE-1481: strip a destructive term only where it is CO-REFERENT to an
     # internal-ops object, not everywhere it appears — a prod-object verb survives
     # into the residual and keeps the gate hard-human.
-    local _io_residual; _io_residual=$(_gate_internal_residual "$_io_text")
-    if _gate_internal_ops_hit "$_io_text" && ! _gate_tier2_floor_hit "$_io_residual"; then
+    # DIVE-2224: run that strip PER FIELD. DIVE-1481's window is 20 characters, and
+    # on the joined string it reached across the seam and manufactured a
+    # co-reference present in neither text -- which STRIPS a destructive term the
+    # floor should have kept, i.e. it removes a human. This is the dangerous
+    # direction of the seam bug, not the annoying one.
+    local _io_res_ask _io_res_title
+    _io_res_ask=$(_gate_internal_residual "$ask")
+    _io_res_title=$(_gate_internal_residual "$_io_title")
+    if _gate_hit_either _gate_internal_ops_hit "$ask" "$_io_title" \
+       && ! _gate_hit_either _gate_tier2_floor_hit "$_io_res_ask" "$_io_res_title"; then
       local _io_reviewer; _io_reviewer=$(_gate_route_reviewer "$(task_actor "$from")")
       if [[ -n "$_io_reviewer" ]]; then
         tier=1; tier_floored=0; _internal_ops=1
@@ -23749,8 +23846,12 @@ cmd_task_need() {
       : # already downgraded by its own class; the declaration is recorded below
     else
       local _dd_title; _dd_title=$(db "SELECT COALESCE(title,'') FROM tasks WHERE id=${id};")
-      local _dd_residual; _dd_residual=$(_gate_floor_appeal_residual "${ask} ${_dd_title}")
-      if _gate_tier2_floor_hit "$_dd_residual"; then
+      # DIVE-2224: appeal residual is computed PER FIELD too — a phantom seam match
+      # here would REFUSE a legitimate appeal, naming a term neither text contains.
+      local _dd_res_ask _dd_res_title
+      _dd_res_ask=$(_gate_floor_appeal_residual "$ask")
+      _dd_res_title=$(_gate_floor_appeal_residual "$_dd_title")
+      if _gate_hit_either _gate_tier2_floor_hit "$_dd_res_ask" "$_dd_res_title"; then
         # Rule 3: a non-appealable class (money / real comms / irreversible infra)
         # is present. Name the surviving term so the refusal is actionable rather
         # than mysterious — the filer can see it is not the word they meant.
@@ -23788,7 +23889,7 @@ cmd_task_need() {
   local _eng_ship=0
   if [[ "$tier_floored" == "0" && ( "$type" == "decision" || "$type" == "approval" || "$type" == "manual" ) ]]; then
     local _es_title; _es_title=$(db "SELECT COALESCE(title,'') FROM tasks WHERE id=${id};")
-    if _gate_eng_ship_hit "${ask} ${_es_title}"; then
+    if _gate_hit_either _gate_eng_ship_hit "$ask" "$_es_title"; then   # DIVE-2224: per-field
       local _es_reviewer; _es_reviewer=$(_gate_route_reviewer "$(task_actor "$from")")
       # DIVE-1738: builder ship-handoff nudge. approval/manual gates are
       # HUMAN-ONLY (cmd_task_answer's provenance floor) UNLESS routed — they
@@ -24206,7 +24307,9 @@ cmd_task_need() {
     approval|manual)
       if [[ "$tier_arg" != "2" ]]; then
         local _rt_title; _rt_title=$(db "SELECT COALESCE(title,'') FROM tasks WHERE id=${id};")
-        _gate_tier2_floor_hit "${ask} ${_rt_title}" || _routable=1
+        # DIVE-2224: identical axis call as the filing floor -- an approval/manual
+        # gate must not be routable by one rule and floored by another.
+        case "$(_gate_floor_axis "$ask" "$_rt_title")" in ask|title-fallback) ;; *) _routable=1 ;; esac
       fi ;;
     # DIVE-1243: the manager-clearable class routes to the lead FIRST regardless
     # of tier — that is the whole point of the type. The ONLY fall-through to the
@@ -24222,6 +24325,12 @@ cmd_task_need() {
   # DIVE-1480: an internal-ops/recovery gate the destructive floor over-fired on is
   # lead-routed by kind (set above), so the lead clears it instead of lodar.
   [[ "$_internal_ops" == "1" ]] && _routable=1
+  # DIVE-2224 (answer A): a gate the floor declined to fire on BECAUSE the term was
+  # in the title is lead-routed BY KIND. Being un-floored is not the same as being
+  # routed -- with gate_builder_routing at its default (off) an ordinary tier-1 gate
+  # still pings the paired human, so without this line answer A would move the tier
+  # and change nothing about who gets woken, which is the entire point of the ticket.
+  [[ "$_floored_by_title" == "1" ]] && _routable=1
   # DIVE-2089: a DECLARED-DISCUSSION appeal that survived every guard is
   # lead-routed by kind — the appeal's entire effect is "a reviewer instead of the
   # human", so it must not fall back to the human via the pref (rule 4).
@@ -24242,7 +24351,11 @@ cmd_task_need() {
     # DIVE-1359: eng-ship routing is likewise intrinsic to the KIND — it bypasses
     # the pref too, so the fix is live under the default (pref OFF) posture.
     local _route; _route=$(_task_pref_get gate_builder_routing); _route="${_route:-off}"
-    if [[ "$_route" == "on" || "$type" == "access" || "$_eng_ship" == "1" || "$_curation" == "1" || "$_internal_ops" == "1" || "$_discusses_applied" == "1" || "$_verifier_route" == "1" ]]; then
+    # DIVE-2224: a title-only floor is intrinsic to the KIND too, and must bypass the
+    # pref for the same reason eng-ship does. Routable-but-pref-gated would have left
+    # answer A moving the TIER while the human still got the ping -- two layers, and
+    # only the second one decides who is woken.
+    if [[ "$_route" == "on" || "$type" == "access" || "$_eng_ship" == "1" || "$_curation" == "1" || "$_internal_ops" == "1" || "$_discusses_applied" == "1" || "$_verifier_route" == "1" || "$_floored_by_title" == "1" ]]; then
       # DIVE-1495: a verifier-route targets the task's verifier directly; every
       # other kind resolves the filer's lead via the org chart.
       local _reviewer
@@ -24262,6 +24375,7 @@ cmd_task_need() {
         # invoker, not the filer.
         local _nrc=0
         TASK_GATE_FILER="$actor" TASK_GATE_ROUTE_TO="$_reviewer" TASK_GATE_ROUTE_ROLE="$_rrole" \
+        TASK_GATE_FLOORED_BY="$([[ "$_floored_by_title" == "1" ]] && printf 'title' || printf '')" \
           task_need_notify "$ident" "$type" "$ask" "$options" "$recommend" || _nrc=$?
         # Never print a bare "routed to X" on an unobserved send again. The claim
         # is exactly what the delivery state supports: pinged, not-yet, or NOT.
@@ -24284,7 +24398,13 @@ cmd_task_need() {
           inflight)  _rnote=" [handoff dispatched — delivery not yet confirmed; the gate-delivery row lands when the send completes]" ;;
           *)         _rnote=" [HANDOFF NOT DELIVERED — ${_reviewer} was NOT pinged${TASK_NOTIFY_FAIL_REASON:+ (${TASK_NOTIFY_FAIL_REASON})}; the gate stands, the re-nag escalates it (<=15 min), and it is answerable now with: 5dive task answer ${ident}]" ;;
         esac
-        ok "$ident routed to $_reviewer for ${_rrole} ($type, tier $tier)${_rnote} — $ask" \
+        # DIVE-2224: when the floor declined to fire only because the term was in the
+        # TITLE, say so HERE. A stderr warn is not the durable surface -- the routed
+        # reviewer reads this line, and "escalate if the ask really is asking for
+        # that" is only actionable if they are told which term and from where.
+        local _fbt=""
+        [[ "$_floored_by_title" == "1" ]] && _fbt=" [floored_by=title: the T2 category floor matched '$(_gate_tier2_floor_term "$_ft_title")' in the TASK TITLE, not in the ask — escalate to the human if the ask really is asking for that]"
+        ok "$ident routed to $_reviewer for ${_rrole} ($type, tier $tier)${_rnote}${_fbt} — $ask" \
            '{id:($i|tonumber), ident:$id, status:"blocked", need_type:$ty, tier:($tr|tonumber), routed_to:$rv, delivery:$ds, notified:($ds=="delivered"), ask:$ak, recommend:(($rc|select(length>0)) // null)}' \
            --arg i "$id" --arg id "$ident" --arg ty "$type" --arg tr "$tier" --arg rv "$_reviewer" --arg ds "$_rstate" --arg ak "$ask" --arg rc "$recommend"
         # No separate undelivered row: the lead-route row above already carries
@@ -26038,9 +26158,11 @@ cmd_task_answer() {
     _ls_filer=$(db "SELECT COALESCE(NULLIF(assignee,''), NULLIF(created_by,''), '') FROM tasks WHERE id=${id};")
     _ls_lead=$(_gate_standing_lead 2>/dev/null || true)
     if [[ -n "$_ls_auth" && -n "$_ls_lead" && "$_ls_auth" == "$_ls_lead" ]]; then
-      local _ls_text
-      _ls_text=$(db "SELECT COALESCE(ask,'')||' '||COALESCE(title,'') FROM tasks WHERE id=${id};")
-      if _gate_lead_standing_eligible "$nt" "$gtier" "$_ls_text"; then
+      # DIVE-2224: read the two fields SEPARATELY rather than ||' '|| in SQL.
+      local _ls_ask _ls_title
+      _ls_ask=$(db "SELECT COALESCE(ask,'') FROM tasks WHERE id=${id};")
+      _ls_title=$(db "SELECT COALESCE(title,'') FROM tasks WHERE id=${id};")
+      if _gate_lead_standing_eligible "$nt" "$gtier" "$_ls_ask" "$_ls_title"; then
         _lead_standing=1
         _lead_clear=1
       fi
