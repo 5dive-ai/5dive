@@ -1555,6 +1555,10 @@ persona_target() { # persona_target <name> <type>
     warn "[$name] no persona path is known for agent type '$type' — role/persona doc NOT installed"
     warn "[$name] refusing to fall back to ~/.claude/CLAUDE.md: a '$type' harness does not read it, so the write would succeed and the persona would still never reach the model (DIVE-2223)"
     warn "[$name] fix: probe a live seat, then add [$type]=<path-relative-to-\$HOME> to TYPE_PERSONA_FILE in src/header.sh — or install the doc by hand"
+    # A deferred residual is only as durable as the ticket that holds it: name
+    # the row so whoever hits this lands on it instead of re-deriving the gap.
+    [[ "$type" == "hermes" || "$type" == "openclaw" ]] \
+      && warn "[$name] hermes/openclaw are unmapped on purpose (never probe-verified) — tracked as DIVE-2245"
     return 1
   fi
   printf '%s\n' "${root}/agent-${name}/${rel}"

@@ -120,6 +120,11 @@ for t in hermes openclaw newtype; do
     bad "refusal for '$t' does not name the claude path it is refusing to fall back to"
   elif ! grep -q "TYPE_PERSONA_FILE" "$WARNLOG"; then
     bad "refusal for '$t' does not tell the operator how to map the type"
+  elif [[ "$t" != newtype ]] && ! grep -q "DIVE-2245" "$WARNLOG"; then
+    # A deferred residual is only as durable as the ticket that holds it: the
+    # refusal for a KNOWN-unmapped type has to name the row tracking the probe,
+    # or the gap gets re-derived from scratch every time someone hits it.
+    bad "refusal for known-unmapped type '$t' does not name the tracking ticket"
   else
     note "$t -> refused loudly (rc=$rc, $(wc -l <"$WARNLOG") warn lines)"
   fi
