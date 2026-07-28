@@ -217,7 +217,8 @@ _compose_import_args() {
 }
 
 # Build the "## Role" + "## Reporting" markdown for one agent and append it to
-# the agent's $HOME/.claude/CLAUDE.md — BELOW the shared telegram fragment that
+# the persona file the agent's harness actually reads (TYPE_PERSONA_FILE,
+# DIVE-2223 — ~/.claude/CLAUDE.md for claude/grok, elsewhere for the rest) — BELOW the shared telegram fragment that
 # cmd_create already dropped (telegram agents) or as a fresh file (others). This
 # is the v1 gap: every telegram agent used to get only the shared mandate; now a
 # CEO vs DevOps carry distinct role instructions + a real delegation map.
@@ -273,14 +274,13 @@ _compose_write_role_md() {
     done
   fi
 
-  local user="agent-${name}" home="/home/agent-${name}" md
-  md="$home/.claude/CLAUDE.md"
-  sudo -u "$user" mkdir -p "$home/.claude" 2>/dev/null || true
-  if printf '%s' "$block" | sudo -u "$user" tee -a "$md" >/dev/null 2>&1; then
-    sudo chmod 644 "$md" 2>/dev/null || true
-  else
-    warn "[$name] could not write role instructions to $md"
-  fi
+  # DIVE-2223: land the block in the file THIS harness reads. It used to go to
+  # ~/.claude/CLAUDE.md for every type, which on a codex/opencode/pi/antigravity
+  # seat is a write that succeeds into a path with no consumer. An unmapped type
+  # warns loudly and installs nothing rather than defaulting to the claude path.
+  local type
+  type=$(jq -r '.type // "claude"' <<<"$agent")
+  persona_append_block "$name" "$type" "$block" || true
 }
 
 # Apply the v2 role wiring for one freshly-created agent: model, effort, org

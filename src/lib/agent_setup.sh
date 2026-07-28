@@ -351,6 +351,78 @@ preseed_codex_return_channel() {
   _codex_return_channel_doc "$name" | sudo -u "$user" tee "$file" >/dev/null
 }
 
+# ---------------------------------------------------------------------------
+# DIVE-2223: a persona has to land where the agent's HARNESS reads it
+# ---------------------------------------------------------------------------
+# Resolve the persona / standing-instructions file for one agent. Echoes the
+# absolute path on stdout; returns 1 after a LOUD warning for a type with no
+# mapped path. Callers must NOT fall back to ~/.claude/CLAUDE.md: that silent
+# default is the bug — `tee` returns 0, `chmod` returns 0, no warning fires, the
+# operator sees a clean create, and the persona never reaches the model.
+#
+# PERSONA_HOME_ROOT overrides /home so the unit test can exercise the real
+# writers against a temp tree instead of asserting on greps.
+persona_target() { # persona_target <name> <type>
+  local name="$1" type="$2" rel root="${PERSONA_HOME_ROOT:-/home}"
+  rel="${TYPE_PERSONA_FILE[$type]:-}"
+  if [[ -z "$rel" ]]; then
+    warn "[$name] no persona path is known for agent type '$type' — role/persona doc NOT installed"
+    warn "[$name] refusing to fall back to ~/.claude/CLAUDE.md: a '$type' harness does not read it, so the write would succeed and the persona would still never reach the model (DIVE-2223)"
+    warn "[$name] fix: probe a live seat, then add [$type]=<path-relative-to-\$HOME> to TYPE_PERSONA_FILE in src/header.sh — or install the doc by hand"
+    return 1
+  fi
+  printf '%s\n' "${root}/agent-${name}/${rel}"
+}
+
+# Create the persona file's parent dir owned by the agent. A dir that already
+# exists is left alone — ~/.claude is wired earlier in create and re-moding it
+# here would be a side effect nobody asked for.
+_persona_ensure_dir() { # _persona_ensure_dir <user> <file>
+  local user="$1" dir
+  dir=$(dirname "$2")
+  [[ -d "$dir" ]] || install -d -o "$user" -g "$user" -m 700 "$dir" 2>/dev/null || true
+}
+
+# Append a generated block (role + reporting) to the harness's persona file.
+persona_append_block() { # persona_append_block <name> <type> <block>
+  local name="$1" type="$2" block="$3" md
+  # NB: a separate `local` — bash expands every RHS in one `local` list before
+  # binding any of them, so "agent-${name}" on the same line dies under `set -u`.
+  local user="agent-${name}"
+  md=$(persona_target "$name" "$type") || return 1
+  _persona_ensure_dir "$user" "$md"
+  if printf '%s' "$block" | sudo -u "$user" tee -a "$md" >/dev/null 2>&1; then
+    sudo chmod 644 "$md" 2>/dev/null || true
+    step "[$name] role instructions appended to $md (type=$type)"
+  else
+    warn "[$name] could not write role instructions to $md"
+    return 1
+  fi
+}
+
+# Install a persona DOC on top of whatever standing instructions the seat already
+# carries. PREPEND, never clobber: a codex seat is created with ~/.codex/AGENTS.md
+# already holding the DIVE-1410 return-channel plumbing, and an overwrite would
+# silently drop operational instructions in order to install an identity. Both
+# halves have to survive.
+persona_install_doc() { # persona_install_doc <name> <type> <src-file>
+  local name="$1" type="$2" src="$3" md tmp rc=0
+  local user="agent-${name}"  # separate `local` — see persona_append_block
+  [[ -f "$src" ]] || return 1
+  md=$(persona_target "$name" "$type") || return 1
+  _persona_ensure_dir "$user" "$md"
+  tmp=$(mktemp) || return 1
+  { cat "$src"; if [[ -s "$md" ]]; then printf '\n'; cat "$md"; fi; } >"$tmp" || rc=1
+  if (( rc == 0 )) && install -o "$user" -g "$user" -m 644 "$tmp" "$md" 2>/dev/null; then
+    rm -f "$tmp"
+    step "[$name] persona installed at $md (type=$type)"
+    return 0
+  fi
+  rm -f "$tmp"
+  warn "[$name] could not install persona doc to $md"
+  return 1
+}
+
 # Types that `npx skills add --agent <id>` doesn't recognize. The upstream
 # vercel-labs/skills CLI gates --agent against a hardcoded registry; passing
 # an unknown id fails with "Invalid agents: <id>" (verified for grok 0.x).

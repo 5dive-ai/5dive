@@ -449,6 +449,40 @@ declare -A TYPE_API_VAR=(
   # cmd_auth_set resolves pi's target var from --provider via PI_PROVIDER_VAR.
 )
 
+# DIVE-2223: the file each harness ACTUALLY reads for its persona / standing
+# instructions, relative to the agent user's $HOME. Before this map every persona
+# was appended to ~/.claude/CLAUDE.md regardless of type: on a codex / opencode /
+# pi / antigravity seat that write SUCCEEDS into a path with no consumer, so the
+# agent runs bare while every file census counts a persona (same family as
+# DIVE-1930). Rows were measured with a before/after role probe on a live seat,
+# not read from docs — see community/wiki/per-harness-persona-file-paths.md.
+#
+# OPTIONAL map whose default is deliberately NOT the claude path: an unmapped
+# type makes persona_target() REFUSE and warn loudly (src/lib/agent_setup.sh).
+# Silently defaulting to ~/.claude/CLAUDE.md IS the bug this map removes, so an
+# unknown type has to be loud rather than quietly wrong.
+declare -A TYPE_PERSONA_FILE=(
+  [claude]=".claude/CLAUDE.md"
+  # grok lands here by DOCUMENTED BEHAVIOUR, not by accident: its
+  # docs/user-guide/12-project-rules.md says Claude compatibility is ON by
+  # default, so it scans home-level ~/.claude/ for CLAUDE.md / AGENTS.md. One
+  # path, two harnesses.
+  [grok]=".claude/CLAUDE.md"
+  # codex ALREADY holds the DIVE-1410 return-channel doc here (preseeded during
+  # create by preseed_codex_return_channel), so persona_install_doc PREPENDS —
+  # an overwrite would delete operational plumbing to install an identity.
+  [codex]=".codex/AGENTS.md"
+  [opencode]=".config/opencode/AGENTS.md"
+  # note the /agent segment: pi's resource loader does not read ~/.pi/AGENTS.md
+  # (same trap as SKILLS_INSTALL_DIR[pi], DIVE-1265).
+  [pi]=".pi/agent/AGENTS.md"
+  # antigravity reuses Google's ~/.gemini parent (see the TYPE_BIN note).
+  [antigravity]=".gemini/GEMINI.md"
+  # hermes and openclaw are DELIBERATELY UNMAPPED: neither has been probe-verified
+  # on a live seat, and a guessed path is exactly the silent no-op this ticket
+  # removes. Creating one with a role warns loudly and installs nothing.
+)
+
 # OpenCode reads provider API keys directly from standard environment variables.
 # Keep this catalog deliberately small: these are the providers the 5dive auth
 # path has explicitly verified and can inject without writing OpenCode's native

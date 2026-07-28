@@ -449,6 +449,40 @@ declare -A TYPE_API_VAR=(
   # cmd_auth_set resolves pi's target var from --provider via PI_PROVIDER_VAR.
 )
 
+# DIVE-2223: the file each harness ACTUALLY reads for its persona / standing
+# instructions, relative to the agent user's $HOME. Before this map every persona
+# was appended to ~/.claude/CLAUDE.md regardless of type: on a codex / opencode /
+# pi / antigravity seat that write SUCCEEDS into a path with no consumer, so the
+# agent runs bare while every file census counts a persona (same family as
+# DIVE-1930). Rows were measured with a before/after role probe on a live seat,
+# not read from docs — see community/wiki/per-harness-persona-file-paths.md.
+#
+# OPTIONAL map whose default is deliberately NOT the claude path: an unmapped
+# type makes persona_target() REFUSE and warn loudly (src/lib/agent_setup.sh).
+# Silently defaulting to ~/.claude/CLAUDE.md IS the bug this map removes, so an
+# unknown type has to be loud rather than quietly wrong.
+declare -A TYPE_PERSONA_FILE=(
+  [claude]=".claude/CLAUDE.md"
+  # grok lands here by DOCUMENTED BEHAVIOUR, not by accident: its
+  # docs/user-guide/12-project-rules.md says Claude compatibility is ON by
+  # default, so it scans home-level ~/.claude/ for CLAUDE.md / AGENTS.md. One
+  # path, two harnesses.
+  [grok]=".claude/CLAUDE.md"
+  # codex ALREADY holds the DIVE-1410 return-channel doc here (preseeded during
+  # create by preseed_codex_return_channel), so persona_install_doc PREPENDS —
+  # an overwrite would delete operational plumbing to install an identity.
+  [codex]=".codex/AGENTS.md"
+  [opencode]=".config/opencode/AGENTS.md"
+  # note the /agent segment: pi's resource loader does not read ~/.pi/AGENTS.md
+  # (same trap as SKILLS_INSTALL_DIR[pi], DIVE-1265).
+  [pi]=".pi/agent/AGENTS.md"
+  # antigravity reuses Google's ~/.gemini parent (see the TYPE_BIN note).
+  [antigravity]=".gemini/GEMINI.md"
+  # hermes and openclaw are DELIBERATELY UNMAPPED: neither has been probe-verified
+  # on a live seat, and a guessed path is exactly the silent no-op this ticket
+  # removes. Creating one with a role warns loudly and installs nothing.
+)
+
 # OpenCode reads provider API keys directly from standard environment variables.
 # Keep this catalog deliberately small: these are the providers the 5dive auth
 # path has explicitly verified and can inject without writing OpenCode's native
@@ -1501,6 +1535,78 @@ preseed_codex_return_channel() {
   install -d -m 700 -o "$user" -g "$user" "$dir" 2>/dev/null || return 0
   install -m 600 -o "$user" -g "$user" /dev/null "$file" 2>/dev/null || return 0
   _codex_return_channel_doc "$name" | sudo -u "$user" tee "$file" >/dev/null
+}
+
+# ---------------------------------------------------------------------------
+# DIVE-2223: a persona has to land where the agent's HARNESS reads it
+# ---------------------------------------------------------------------------
+# Resolve the persona / standing-instructions file for one agent. Echoes the
+# absolute path on stdout; returns 1 after a LOUD warning for a type with no
+# mapped path. Callers must NOT fall back to ~/.claude/CLAUDE.md: that silent
+# default is the bug — `tee` returns 0, `chmod` returns 0, no warning fires, the
+# operator sees a clean create, and the persona never reaches the model.
+#
+# PERSONA_HOME_ROOT overrides /home so the unit test can exercise the real
+# writers against a temp tree instead of asserting on greps.
+persona_target() { # persona_target <name> <type>
+  local name="$1" type="$2" rel root="${PERSONA_HOME_ROOT:-/home}"
+  rel="${TYPE_PERSONA_FILE[$type]:-}"
+  if [[ -z "$rel" ]]; then
+    warn "[$name] no persona path is known for agent type '$type' — role/persona doc NOT installed"
+    warn "[$name] refusing to fall back to ~/.claude/CLAUDE.md: a '$type' harness does not read it, so the write would succeed and the persona would still never reach the model (DIVE-2223)"
+    warn "[$name] fix: probe a live seat, then add [$type]=<path-relative-to-\$HOME> to TYPE_PERSONA_FILE in src/header.sh — or install the doc by hand"
+    return 1
+  fi
+  printf '%s\n' "${root}/agent-${name}/${rel}"
+}
+
+# Create the persona file's parent dir owned by the agent. A dir that already
+# exists is left alone — ~/.claude is wired earlier in create and re-moding it
+# here would be a side effect nobody asked for.
+_persona_ensure_dir() { # _persona_ensure_dir <user> <file>
+  local user="$1" dir
+  dir=$(dirname "$2")
+  [[ -d "$dir" ]] || install -d -o "$user" -g "$user" -m 700 "$dir" 2>/dev/null || true
+}
+
+# Append a generated block (role + reporting) to the harness's persona file.
+persona_append_block() { # persona_append_block <name> <type> <block>
+  local name="$1" type="$2" block="$3" md
+  # NB: a separate `local` — bash expands every RHS in one `local` list before
+  # binding any of them, so "agent-${name}" on the same line dies under `set -u`.
+  local user="agent-${name}"
+  md=$(persona_target "$name" "$type") || return 1
+  _persona_ensure_dir "$user" "$md"
+  if printf '%s' "$block" | sudo -u "$user" tee -a "$md" >/dev/null 2>&1; then
+    sudo chmod 644 "$md" 2>/dev/null || true
+    step "[$name] role instructions appended to $md (type=$type)"
+  else
+    warn "[$name] could not write role instructions to $md"
+    return 1
+  fi
+}
+
+# Install a persona DOC on top of whatever standing instructions the seat already
+# carries. PREPEND, never clobber: a codex seat is created with ~/.codex/AGENTS.md
+# already holding the DIVE-1410 return-channel plumbing, and an overwrite would
+# silently drop operational instructions in order to install an identity. Both
+# halves have to survive.
+persona_install_doc() { # persona_install_doc <name> <type> <src-file>
+  local name="$1" type="$2" src="$3" md tmp rc=0
+  local user="agent-${name}"  # separate `local` — see persona_append_block
+  [[ -f "$src" ]] || return 1
+  md=$(persona_target "$name" "$type") || return 1
+  _persona_ensure_dir "$user" "$md"
+  tmp=$(mktemp) || return 1
+  { cat "$src"; if [[ -s "$md" ]]; then printf '\n'; cat "$md"; fi; } >"$tmp" || rc=1
+  if (( rc == 0 )) && install -o "$user" -g "$user" -m 644 "$tmp" "$md" 2>/dev/null; then
+    rm -f "$tmp"
+    step "[$name] persona installed at $md (type=$type)"
+    return 0
+  fi
+  rm -f "$tmp"
+  warn "[$name] could not install persona doc to $md"
+  return 1
 }
 
 # Types that `npx skills add --agent <id>` doesn't recognize. The upstream
@@ -18921,7 +19027,8 @@ _compose_import_args() {
 }
 
 # Build the "## Role" + "## Reporting" markdown for one agent and append it to
-# the agent's $HOME/.claude/CLAUDE.md — BELOW the shared telegram fragment that
+# the persona file the agent's harness actually reads (TYPE_PERSONA_FILE,
+# DIVE-2223 — ~/.claude/CLAUDE.md for claude/grok, elsewhere for the rest) — BELOW the shared telegram fragment that
 # cmd_create already dropped (telegram agents) or as a fresh file (others). This
 # is the v1 gap: every telegram agent used to get only the shared mandate; now a
 # CEO vs DevOps carry distinct role instructions + a real delegation map.
@@ -18977,14 +19084,13 @@ _compose_write_role_md() {
     done
   fi
 
-  local user="agent-${name}" home="/home/agent-${name}" md
-  md="$home/.claude/CLAUDE.md"
-  sudo -u "$user" mkdir -p "$home/.claude" 2>/dev/null || true
-  if printf '%s' "$block" | sudo -u "$user" tee -a "$md" >/dev/null 2>&1; then
-    sudo chmod 644 "$md" 2>/dev/null || true
-  else
-    warn "[$name] could not write role instructions to $md"
-  fi
+  # DIVE-2223: land the block in the file THIS harness reads. It used to go to
+  # ~/.claude/CLAUDE.md for every type, which on a codex/opencode/pi/antigravity
+  # seat is a write that succeeds into a path with no consumer. An unmapped type
+  # warns loudly and installs nothing rather than defaulting to the claude path.
+  local type
+  type=$(jq -r '.type // "claude"' <<<"$agent")
+  persona_append_block "$name" "$type" "$block" || true
 }
 
 # Apply the v2 role wiring for one freshly-created agent: model, effort, org
@@ -47827,9 +47933,12 @@ cmd_import() {
 
   local cdir="/home/agent-${as}/.claude"
 
-  # Layer the identity doc.
+  # Layer the identity doc into the file THIS harness actually reads (DIVE-2223).
+  # persona.yaml / avatar.png / settings.json below stay under ~/.claude because
+  # 5dive itself reads those; the persona DOC is the one that has to follow the
+  # type, and on a codex seat it prepends above the DIVE-1410 return-channel doc.
   if [[ -f "$stage/CLAUDE.md" ]]; then
-    install -o "agent-${as}" -g "agent-${as}" -m 644 "$stage/CLAUDE.md" "$cdir/CLAUDE.md" 2>/dev/null || true
+    persona_install_doc "$as" "$type" "$stage/CLAUDE.md" || true
   fi
 
   # Preserve the OpenAgent persona.yaml (DIVE-656) so the imported agent owns its
