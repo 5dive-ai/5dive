@@ -1,5 +1,62 @@
 # Changelog
 
+## Unreleased — fix(heartbeat): an UNMEASURABLE tier no longer disables the privilege-escalation-by-queue guard (DIVE-2213)
+
+Second instance of the DIVE-2210 shape, at a **decision** site rather than a display
+one. DIVE-1065 refuses to auto-drive a higher-tier agent from a lower-tier creator's
+task. It read both tiers as `jq ... '.agents[$n].isolation // empty' 2>/dev/null`,
+ranked an empty result `0`, and then skipped itself whenever either rank was `0` — so
+a lookup that never happened did not hold the task, it **disabled the check**, and the
+heartbeat auto-ran the work.
+
+The ticket framed the fix as a binary: hold everything unmeasured (fail closed, may
+stall the fleet) or wake with a loud log (fail open, no longer silent). It is a false
+binary, and rank-0 is what disguised it. Two populations shared that bucket and they
+want opposite policies:
+
+- **measured, no tier** — the creator is not a registered agent (a human, an external
+  filer). The majority of the board. Falling through is DIVE-1065's intent, not a
+  failure mode; holding here would stall every human-filed task fleet-wide.
+- **not measured** — registry absent/unreadable/unparsable, jq errored, or a
+  *registered* agent whose `isolation` is missing or malformed. No basis to rank
+  either side.
+
+Only the second holds now. A healthy registry never produces it, so this cannot stall
+the fleet in steady state, and every hold names its own cause in the tick log.
+
+Measured by extracting the guard block **verbatim** from both this tree and
+`origin/main` and driving the same nine causes through each
+(`tests/heartbeat_tier_guard_unmeasured_unit.sh`):
+
+    distinct decisions across 9 causes: OLD=2  NEW=3
+    OLD: WAKE WAKE WAKE WAKE WAKE WAKE WAKE HOLD:escalation WAKE
+    NEW: WAKE HOLD HOLD HOLD HOLD HOLD HOLD HOLD:escalation WAKE
+
+The pre-fix block auto-ran on **6 of 6** unmeasured causes while still holding the one
+real escalation — i.e. it looked like a working guard.
+
+`agent_tier()` + `tier_unmeasured()` (`src/lib/registry.sh`) draw the line.
+They are deliberately **not** `envelope_tier()`, which reports `unknown:unregistered`
+for both populations on purpose (a wire format has no decision to make);
+`envelope_tier()` is asserted byte-identical to `origin/main` so DIVE-2210's shipped
+wire format does not move.
+
+**Reachability, stated rather than overclaimed:** pre-fix, a whole-registry failure
+could not reach this guard at all — the wake loop enumerates agents from the same
+`$reg` blob, so a failed read yielded zero agents. Reachable pre-fix were the three
+that leave the registry loadable: a registered-but-untiered creator, a malformed tier,
+and a jq failure. The other three become reachable *after* this change, because
+`agent_tier()` re-reads at decision time and so also catches a registry that dies
+mid-tick.
+
+Third instance, display-only: `task show`'s `created_by_tier` line was printed only
+when the lookup returned non-empty, so on failure the line vanished and a reader could
+not tell "no tier" from "not measured". It is now always printed, in three
+distinguishable states. This changes `task show`'s human output shape for every task;
+checked first — `origin/main` across 5dive-cli / api / app / plugins / mcp has no
+consumer of that line other than the site emitting it, and the machine path is
+`--json`, which never carried it.
+
 ## Unreleased — fix(a2a): the envelope's tier= field is now always stamped, with a reason when it cannot be measured (DIVE-2210)
 
 `tier=` is the ONE unforgeable field in `[5dive-msg from=X id=Y tier=Z]`. `from=` is
