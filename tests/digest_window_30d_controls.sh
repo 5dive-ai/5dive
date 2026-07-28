@@ -89,15 +89,53 @@ reds="$(run_reds)"; n_reds="$(grep -c . <<<"$reds")"
     exit 1
   }
 
+# --- Arm B: the positive control, and the source of the BASELINE count. Runs
+# BEFORE the graded arms because they are measured against it: without a known
+# whole-matrix size there is nothing to compare a mutation's total to. Also
+# catches a silently-broken staging, which would otherwise read as a pass.
+fresh
+reds="$(run_reds)"; tally="$(run_tally)"
+BASELINE_N="$(awk '{print $1 + $3}' <<<"$tally" 2>/dev/null)"
+# PINNED, and cross-checked against the derived count. Deriving the baseline
+# alone is not enough: a UNIFORMLY truncated harness truncates the baseline too,
+# so derived == mutated and every arm passes on a matrix that is short at both
+# ends. The pin is what makes truncation visible. Update it deliberately when
+# assertions are added to digest_window_30d_unit.sh — a stale pin also reds.
+BASELINE_EXPECTED=21
+if [[ -n "$reds" ]]; then
+  bad_t "pristine copy is not green" "$(tr '\n' '|' <<<"$reds")"
+  BASELINE_N=""
+elif [[ "$BASELINE_N" != "$BASELINE_EXPECTED" ]]; then
+  bad_t "baseline is not the pinned size" "pristine run evaluated ${BASELINE_N:-no} assertions, pinned at $BASELINE_EXPECTED (tally: $tally) — either the harness is truncated or the pin is stale; BOTH invalidate every arm below"
+  BASELINE_N=""
+else
+  ok_t "armB: the pristine copy reds NOTHING and evaluates $BASELINE_N assertions, matching the pinned baseline"
+fi
+if [[ -z "$BASELINE_N" ]]; then
+  printf '\nREFUSING to grade C1-C3: no valid baseline, so "N of N assertions evaluated"\nis not checkable. Fix the harness or the pin, not these arms.\n'
+  printf '\n%s assertions passed, %s failed  (+%s precondition)\n' "$PASS" "$FAIL" "$PRECOND"
+  exit 1
+fi
+
 # --- Arms 1-3: each defect in isolation reds its OWN assertion and no other.
 # expected_only <label> <expected assertion name>
 expect_only() {
-  local label="$1" want="$2" reds tally n
+  local label="$1" want="$2" reds tally n total
   reds="$(run_reds)"; tally="$(run_tally)"; n="$(grep -c . <<<"$reds")"
-  if [[ "$reds" == "$want" ]]; then
-    ok_t "$label -> reds exactly \"$want\"  [tally: $tally]"
-  else
+  # dev's DIVE-1932 finding, applied to THIS grader: reading which assertions
+  # red says nothing about whether the harness produced a WHOLE matrix. A
+  # mutation that reds the right name and then exits early satisfies the name
+  # check while most assertions never ran — the grader would certify a partial
+  # run as a clean single-red. So the count is ASSERTED, not printed. Earlier
+  # revisions of this file displayed `tally` inside the pass label and checked
+  # nothing, which is the same defect one level up.
+  total="$(awk '{print $1 + $3}' <<<"$tally" 2>/dev/null)"
+  if [[ "$reds" != "$want" ]]; then
     bad_t "$label" "expected exactly \"$want\"; got $n red(s): $(tr '\n' '|' <<<"$reds")"
+  elif [[ "$total" != "$BASELINE_N" ]]; then
+    bad_t "$label" "correct red name, but the harness evaluated $total of $BASELINE_N assertions ($tally) — a PARTIAL matrix cannot support \"reds exactly one\""
+  else
+    ok_t "$label -> reds exactly \"$want\", $total of $BASELINE_N assertions evaluated"
   fi
 }
 
@@ -117,14 +155,6 @@ mutate src/cmd_proof.sh "policy_refusals WHERE ts>=datetime('now',\$(sqlq \"\$sq
                         "policy_refusals WHERE ts>=datetime('now','-7 days')" \
   || { echo "FAIL - C3 mutation did not apply"; exit 1; }
 expect_only "C3 leave ONE scorecard SQL site at 7 days (MIXED-WINDOW)" "a hard-coded span survives in the scorecard"
-
-# --- Arm 4: the positive control. Unmutated, nothing reds. Without this, an
-# expect_only arm that silently staged a broken copy would look like a pass.
-fresh
-reds="$(run_reds)"
-[[ -z "$reds" ]] \
-  && ok_t "arm4: the pristine copy reds NOTHING (the mutations, not the staging, cause the reds)" \
-  || bad_t "pristine copy is not green" "$(tr '\n' '|' <<<"$reds")"
 
 printf '\n%s assertions passed, %s failed  (+%s precondition, which grades the INSTRUMENT, not the code)\n' \
   "$PASS" "$FAIL" "$PRECOND"
