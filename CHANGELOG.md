@@ -1,5 +1,50 @@
 # Changelog
 
+## Unreleased — fix(a2a): the envelope's tier= field is now always stamped, with a reason when it cannot be measured (DIVE-2210)
+
+`tier=` is the ONE unforgeable field in `[5dive-msg from=X id=Y tier=Z]`. `from=` is
+caller-supplied (`--from=`) and only format-validated, so `tier=` is the field that
+actually catches a cross-tier peer. Every stamping site wrote it as
+`[[ -n "$t" ]] && header+=" tier=$t"` over a lookup whose stderr went to `/dev/null`.
+
+Measured against the shipped 0.16.33 bundle by extracting its own `registry_read` and
+`cmd_send` stamp verbatim: four different outcomes render **one identical envelope**.
+
+    [control ] real sudo caller, good registry : [5dive-msg from=community id=deadbeef tier=admin]
+    [cause 1 ] no sudo caller (--from=)        : [5dive-msg from=community id=deadbeef]
+    [cause 2 ] registry missing/unreadable     : [5dive-msg from=community id=deadbeef]
+    [cause 3 ] registry truncated (jq fails)   : [5dive-msg from=community id=deadbeef]
+    [cause 4 ] genuinely untiered sender       : [5dive-msg from=community id=deadbeef]
+    distinct envelopes across 4 causes: 1
+
+So a receiver could not tell *not measured* from *measured, nothing there*. The
+forgeable field survives; the unforgeable one disappears without a trace. Cause 1 is
+the sharp edge: `--from=community` with no sudo caller produced a clean, plausible
+envelope attributed to community and carrying no tier at all.
+
+- New `envelope_tier()` **never returns empty**. A tier it cannot establish is stamped
+  `unknown:<reason>` — `no-caller`, `no-registry`, `registry-unreadable`,
+  `registry-unparsable`, `lookup-failed`, `unregistered`, `malformed-tier`. The four
+  causes above stop colliding.
+- New `registry_read_checked()` separates "the read failed" from "the fleet is empty".
+  Plain `registry_read()` manufactures `{"agents":{}}` for both, which is what let a
+  failed read render as a clean absence.
+- A tier value that is not a bare token is refused (`unknown:malformed-tier`) rather
+  than pasted into a space-delimited header, where it could forge extra fields.
+- All three envelope builders now append `tier=` **unconditionally**. `agent ask`'s
+  direct-inject path carried no tier at all — it was never added when DIVE-1064
+  stamped `send` and `_deliver`.
+
+Reading the new output: absence of `tier=` now means "sent by a build older than
+0.16.35", not "this sender has no tier".
+
+NOT changed here, and deliberately named rather than folded in: the same
+swallow-and-omit idiom appears at two non-envelope sites — `cmd_heartbeat.sh`'s
+privilege-escalation-by-queue guard (a *decision*, and it fails open: an unmeasured
+tier ranks 0, and the guard is skipped entirely when either rank is 0) and
+`task show`'s `created_by_tier` display line. Both are filed separately; the first
+changes fleet-wide auto-run behaviour and needs its own verification.
+
 ## Unreleased — feat(digest): a 30-day window, with the aggregates it does NOT scope named out loud (DIVE-1921)
 
 `digest` offered only `--7d`, so `proof scorecard` (specified as `[--7d|--30d]` in DIVE-1914)
