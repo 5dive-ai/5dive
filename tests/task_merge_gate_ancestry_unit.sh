@@ -10,24 +10,34 @@
 #
 # The fix is proxy-vs-direct, NOT strict-vs-loose: "a PR was merged" is a proxy for
 # "the code is in main"; ancestry measures that fact directly. What is pinned here:
-#   1. ANCESTOR, no PR                  -> CLOSES        (the DIVE-2051 shape)
+#   1. on main, no PR                   -> CLOSES        (the DIVE-2051 shape).
+#      Post-DIVE-2120 the accepting evidence is ATTRIBUTION, not ancestry: a commit
+#      reachable from main names the ident. Ancestry is diagnostic only.
 #   2. SQUASH-merged, NOT an ancestor, merged PR -> STILL CLOSES  (fall-through kept)
 #   3. genuinely unmerged, no PR        -> STILL REFUSES (the non-vacuity partner:
 #      without it, a fix that always passes scores green on 1 and 2)
 #  3b. an EMPTY branch (zero commits: its tip IS a commit on main, so ancestry is
 #      trivially true) is REFUSED — ancestry says "this tip is on main", never "this
-#      task put something there", so acceptance needs ATTRIBUTION as well: some
-#      commit reachable from the tip names the ident. Raised by main pre-merge; it
+#      task put something there", so acceptance rests on ATTRIBUTION: some commit
+#      reachable from main names the ident. ("as well" until DIVE-2184 — attribution
+#      is not a second half, it is the whole of acceptance.) Raised by main pre-merge; it
 #      is the MIRROR of case 3, and neither covers the other.
 #   4. ancestry UNREACHABLE (gh/network/token) is not "no": with a merged PR it still
 #      closes, and WITHOUT one it still refuses — an outage can never invent either
 #      verdict.
-#   5. the ancestry pass is AUDIBLE in the close (which evidence closed it), and the
-#      refusal text names both roads it tried.
+#   5. the ATTRIBUTION pass is AUDIBLE in the close (which evidence closed it), and
+#      the refusal text names both roads it tried. DIVE-2184: it said "ancestry pass"
+#      and the close line said ANCESTOR, so the assertion and the message agreed with
+#      each other and with nothing else.
 #
 # MUTATION GRADE (run by hand against src/cmd_task.sh, both must go red):
-#   * neuter the ancestry acceptance — `_gate_branch_ancestry() { printf '0'; }`
-#     -> case 1 FAILS (refuses the ancestor).
+#   * neuter the ATTRIBUTION acceptance — `_gate_branch_ident_on_main() { printf '0'; }`
+#     -> case 1 FAILS (refuses work that is on main).
+#     DIVE-2184: this bullet used to name `_gate_branch_ancestry() { printf '0'; }`
+#     and claim case 1 would fail. RUN IT: case 1 PASSES. Since DIVE-2120 ancestry
+#     accepts nothing, so that mutation is a VOID one — and a void mutation
+#     instruction is worse than a stale comment, because the next verifier runs it,
+#     sees green, and concludes either the suite is broken or their change is safe.
 #   * neuter the attribution arm — `_gate_branch_ident_on_main() { printf '1'; }`
 #     -> case 3b FAILS (an empty branch closes).
 #   * neuter the refusal — delete/short-circuit the `policy_refuse` in the branch
@@ -178,9 +188,20 @@ else
   bad_t 'ancestor must close' "rc=$RC status=$(statusof ANC-1) refusals=$(refusals ANC-1) out=$OUT"
 fi
 # ...and the record says WHICH road closed it, not just that it closed.
-[[ "$OUT" == *ANCESTOR* && "$OUT" == *"dive-2051-git-identity-guard"* && "$OUT" == *"5dive-ai/5dive"* ]] \
-  && ok_t 'the close names the ancestry evidence and the repo it was proved in' \
-  || bad_t 'ancestry pass must be audible' "out=$OUT"
+#
+# DIVE-2184: this asserted *ANCESTOR* and was green only because the MESSAGE said so.
+# This scenario sets BOTH an ancestry stub and an attribution stub, and since DIVE-2120
+# it is ATTRIBUTION that accepts — measured by removing the attribution stub from this
+# very case, which makes the gate REFUSE (rc=5, "NO commit reachable from it names
+# ANC-1"). So ancestry accepts nothing on its own and the old assertion was checking the
+# false claim rather than the mechanism, which is how the wording survived the DIVE-2120
+# semantics change. Assert the evidence that actually accepted.
+[[ "$OUT" == *"names ANC-1 in its SUBJECT"* && "$OUT" == *"5dive-ai/5dive"* ]] \
+  && ok_t 'the close names the ATTRIBUTION evidence and the repo it was proved in' \
+  || bad_t 'attribution pass must be audible' "out=$OUT"
+[[ "$OUT" != *"is an ANCESTOR of"* ]] \
+  && ok_t 'and does not claim ancestry, which accepts nothing since DIVE-2120' \
+  || bad_t 'close line still claims ancestry' "out=$OUT"
 # `identical` is the same fact (a tip that IS main) and must read the same way.
 clear_fx; export GH_STUB_CMP_5dive_dive_2051_tip="$IDENTICAL"
 export GH_STUB_COMMITS_5dive_main="$(commits 'fix: landed (ANC-2)')"
@@ -414,6 +435,20 @@ FIVE_GATE_ANCESTRY_SCAN=300 run_done ANC-12 --result='landed, just not recently'
 [[ $RC -eq 0 && "$(statusof ANC-12)" == "done" ]] \
   && ok_t 'a commit found on page 2 closes the task (pagination does not lose the acceptance)' \
   || bad_t 'a later-page hit must close' "rc=$RC status=$(statusof ANC-12) out=$OUT"
+
+# --- DIVE-2184: the close-evidence line must name the evidence that ACTUALLY closed
+# The accepting branch is fed by _gate_branch_ident_on_main (ATTRIBUTION). It used to
+# print "is an ANCESTOR of main ... (no PR needed; delegated push)" — false on both
+# counts for a squash-merged PR, whose tip is not an ancestor of main at all. A close
+# record that names the wrong evidence is worse than a terse one: nobody re-derives it.
+clear_fx
+export GH_STUB_COMMITS_5dive_main='[{"commit":{"message":"cli: the thing (ANC-84) (#248)"}}]'
+seed ANC-84 'Branch: squash-merged-so-not-an-ancestor'
+run_done ANC-84 --result='landed via a squash-merged PR'
+[[ $RC -eq 0 && "$(statusof ANC-84)" == "done" ]]   && ok_t 'attribution still closes the task'   || bad_t 'attribution must still close' "rc=$RC status=$(statusof ANC-84) out=$OUT"
+grep -q 'names ANC-84 in its SUBJECT' <<<"$OUT"   && ok_t 'the close line names ATTRIBUTION as the evidence'   || bad_t 'close line must say a commit subject named the ident' "out=$OUT"
+grep -qi 'is an ANCESTOR of' <<<"$OUT"   && bad_t 'close line must NOT claim ancestry (it was not measured)' "out=$OUT"   || ok_t 'no false ancestry claim'
+grep -q 'no PR needed; delegated push' <<<"$OUT"   && bad_t 'close line must NOT assert the delegated-push route (the corrected text may MENTION it while disclaiming)' "out=$OUT"   || ok_t 'no false delegated-push claim'
 
 printf '\n%s passed, %s failed\n' "$PASS" "$FAIL"
 [[ $FAIL -eq 0 ]]
