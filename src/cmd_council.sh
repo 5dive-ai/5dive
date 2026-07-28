@@ -2254,12 +2254,17 @@ export function dispatchBallotVote(opts = {}) {
   // with a result, or the deadline elapses. The collection-loop deadline is AUTHORITATIVE regardless
   // of any stamp in the task body. A human tap and an agent heartbeat close the task identically, so
   // this loop is byte-identical for both — no new collection/quorum/abstain path (DIVE-1564).
-  const collect = async (seat, taskId, deadlineAt, deadlineIso, kind, nudgeInfo) => {
+  const collect = async (seat, taskId, deadlineAt, deadlineIso, kind, nudgeInfo, priorFailure) => {
     // DIVE-1739: fire the single mid-window nudge once ~nudgeFrac of the window has elapsed with the
     // ballot still open. nudgeInfo is null for seats that don't get a pane nudge (e.g. human seats,
     // which vote by tap and were already delivered a Telegram ballot).
     const nudgeAt = nudgeInfo ? deadlineAt - (deadlineAt - now()) * (1 - nudgeFrac) : Infinity
     let nudged = false
+    // DIVE-2220: the DELIVERY LEDGER for this ballot. `failure` is set the moment we learn a delivery
+    // attempt did not land; `delivered` records that one demonstrably did. Both are consulted only on
+    // the deadline path — a seat that votes anyway needs no excuse for a lost nudge.
+    let failure = priorFailure || null
+    let delivered = false
     while (now() < deadlineAt) {
       let row = null
       try {
@@ -2273,7 +2278,27 @@ export function dispatchBallotVote(opts = {}) {
       }
       if (nudgeInfo && !nudged && now() >= nudgeAt) {
         nudged = true
-        try { nudge(nudgeInfo.agent, nudgeInfo.msg) } catch { /* best-effort — abstain-on-miss unchanged */ }
+        // DIVE-2220: this ONE nudge is, for a seat with no heartbeat, the only delivery that can
+        // actually wake it — the queued ballot task wakes nobody on its own. Its failure used to be
+        // swallowed TWICE over: the bare catch here discarded a throw, and the production nudge rail
+        // (nudgeSeatAgent) never throws at all — it RETURNS a failure — so the catch could not have
+        // fired in prod even once. Either way the seat fell through to the same 'no vote by deadline'
+        // string a genuinely-silent seat produces, and the receipt sealed captureFailed=0: an
+        // affirmative claim that nothing failed to be collected, over a seat we cannot show was ever
+        // asked. Record the outcome (both shapes) instead of discarding it.
+        let why = null
+        try {
+          const r = nudge(nudgeInfo.agent, nudgeInfo.msg)
+          if (r === false || (r && typeof r === 'object' && r.ok === false)) {
+            why = (r && r.why) ? String(r.why).replace(/\s+/g, ' ').slice(0, 140) : 'nudge rail reported failure'
+          }
+        } catch (e) { why = clip(e) }
+        if (why) {
+          failure = failure || { kind: 'nudge-failed', why: `mid-window nudge to ${nudgeInfo.agent} not delivered: ${why}` }
+          // Log it. Before this, a swallowed nudge was invisible even to an operator watching the
+          // convene live — its entire stderr was five lines of summary.
+          try { process.stderr.write(`[council] NUDGE FAILED — seat=${seat.id} agent=${nudgeInfo.agent} ballot=${taskId}: ${why}\n`) } catch { /* ignore */ }
+        } else delivered = true
       }
       await sleep(pollSecs * 1000)
     }
@@ -2283,7 +2308,19 @@ export function dispatchBallotVote(opts = {}) {
     // task may already be closed (a tap landed at the wire) or the cancel may race — either way the
     // seat's verdict is an abstain regardless, so a cancel gap never changes the tally.
     try { exec(['task', 'cancel', String(taskId), '--result=council ballot spent — no vote by deadline (== abstain); auto-cancelled on convene seal (CNCL-29)']) } catch { /* already closed / not cancellable — abstain stands */ }
-    return { vote: 'abstain', rationale: `${seat.id} ${kind} ${taskId}: no vote by deadline ${deadlineIso} (deadline/no-vote)` }
+    // DIVE-2220: a delivery attempt that we KNOW did not land makes this a CAPTURE failure, not an
+    // abstention. Tagged (capture:false) so captureAudit counts it, the verdict can refuse instead of
+    // sealing a clean-looking receipt, and the sealed `unreached:` line names the seat — the same
+    // treatment ballot-mint-failed already gets one branch away.
+    if (failure) {
+      return { vote: 'abstain', abstainKind: failure.kind, capture: false,
+               rationale: `CAPTURE FAILED (not an abstention) — ${seat.id} ${kind} ${taskId}: ${failure.why}; the seat cannot be shown to have been asked before the deadline ${deadlineIso}` }
+    }
+    // DIVE-2220: 'no vote by deadline' is a claim ABOUT THE SEAT, so it must carry what we can actually
+    // show about delivery. `nudged` says a wake reached the seat; `queued` says only that the ballot
+    // task was minted into its queue and the mid-window nudge never fired.
+    const told = nudgeInfo ? (delivered ? `; nudged ${nudgeInfo.agent} mid-window` : '; ballot queued, no mid-window nudge fired') : ''
+    return { vote: 'abstain', rationale: `${seat.id} ${kind} ${taskId}: no vote by deadline ${deadlineIso} (deadline/no-vote${told})` }
   }
   return async (seat, ctx) => {
     const prompt = E.seatPrompt(seat, ctx)   // blind in round 1 (engine-guaranteed)
@@ -2336,8 +2373,18 @@ export function dispatchBallotVote(opts = {}) {
       // Emit is an injectable, never-throws seam. The CLI cannot send an inline keyboard itself
       // (DIVE-1546); the concrete button delivery is the telegram plugin tap handler (DIVE-1566), which
       // consumes this exact payload. A delivery gap just leaves the task un-tapped -> abstain-on-miss.
-      try { await emitBallot(payload) } catch { /* best-effort: the missed-tap path is already an abstain */ }
-      return collect(seat, taskId, deadlineAt, deadlineIso, 'human ballot')
+      // DIVE-2220: an emit that THREW is a delivery failure — the buttons never went out — and must
+      // not resolve to the same untagged 'no vote by deadline' a human who saw the ballot and didn't
+      // tap produces. (A `{delivered:false}` RETURN is deliberately NOT treated as failure here: the
+      // default emit returns exactly that as a breadcrumb meaning "the plugin renders the buttons",
+      // so it does not distinguish an outage. That gap is real and stays open — see DIVE-2220.)
+      let emitFailure = null
+      try { await emitBallot(payload) } catch (e) { emitFailure = clip(e) }
+      if (emitFailure) {
+        try { process.stderr.write(`[council] BALLOT EMIT FAILED — seat=${seat.id} chat=${chat} ballot=${taskId}: ${emitFailure}\n`) } catch { /* ignore */ }
+      }
+      return collect(seat, taskId, deadlineAt, deadlineIso, 'human ballot', null,
+        emitFailure ? { kind: 'ballot-emit-failed', why: `Telegram ballot emit failed: ${emitFailure}` } : null)
     }
     // ---- agent seat (CNCL-18, unchanged) ----
     // CNCL-16: mint into the seat's REGISTRY agent (persona 'theo' -> 'marketing', etc.). Pre-flight
@@ -2574,9 +2621,16 @@ function nudgeSeatAgent(agent, msg) {
   const bin = process.env.COUNCIL_5DIVE_BIN || '5dive'
   try {
     execFileSync(bin, ['agent', 'send', String(agent), String(msg)],
-      { encoding: 'utf-8', timeout: 30000, stdio: ['ignore', 'ignore', 'ignore'] })
-    return true
-  } catch { return false }
+      { encoding: 'utf-8', timeout: 30000, stdio: ['ignore', 'pipe', 'pipe'] })
+    return { ok: true }
+  } catch (e) {
+    // DIVE-2220: report WHY, never a bare false. This rail is the only wake a heartbeat-less seat
+    // gets, so its failure has to be able to reach the receipt. stderr is piped (was `ignore`) purely
+    // so the reason is something a reader can act on; nothing is printed by this function itself.
+    const stderr = String((e && e.stderr) || '').replace(/\s+/g, ' ').trim()
+    const why = `${String((e && e.message) || e).replace(/\s+/g, ' ')}${stderr ? ` :: ${stderr}` : ''}`.slice(0, 140)
+    return { ok: false, why }
+  }
 }
 
 // DIVE-1739 (gate answer A — preserve strict 6/6, fix reliability operationally). Before a FULL-QUORUM
