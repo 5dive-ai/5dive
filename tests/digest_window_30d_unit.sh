@@ -184,4 +184,10 @@ V7="$(eval_win 7d)"; V30="$(eval_win 30d)"
   || bad_t "inert --30d" "both windows produce '$V7'"
 
 printf '\n%s passed, %s failed\n' "$PASS" "$FAIL"
-[[ "$FAIL" == "0" ]] || exit 1
+# The house verdict idiom (digest_mttu / digest_autonomy / proof_scorecard all use
+# it verbatim): the LAST executable line IS the verdict, so the script's exit
+# status is this comparison. tests/meta/harness-verdict-probe.sh identifies the
+# verdict variable from this line and mutates it; an explicit-exit form
+# (`[[ … ]] || exit 1`) is a shape it can fail to classify, which reports
+# UNPROBEABLE and fails harness-verdict-union.sh closed. Do not "simplify" this.
+[[ "$FAIL" -eq 0 ]]
