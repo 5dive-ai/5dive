@@ -1,5 +1,50 @@
 # Changelog
 
+## Unreleased — fix(heartbeat/task): a verifier who filed a human gate has ACTED, and neither verb may resolve that gate by side effect (DIVE-2196)
+
+The stall-sweep nagged a verifier who had already reviewed the work and escalated a policy
+question to a human. It selects delivered maker->verifier rows on `status NOT IN
+('done','cancelled') AND handoff_ack_at IS NULL`, and a row BLOCKED on an unanswered gate
+satisfies both: `blocked` is not a closed status, and filing a gate stamped no ACK, so
+"reviewed it and escalated" was byte-identical to "never opened it". Fired live on DIVE-2146.
+
+The remedy it prescribed was the harm. On a maker->verifier task the verifier's ACK *is* the
+close, so "run `task start` then `task done`/`task reject`" asked them to resolve a pending
+human gate as a side effect of an ordinary acknowledgement, in whatever direction the verb
+happened to point. DIVE-2146's gate asked lodar to choose between leaving the ticket open and
+closing it as delivered; the nag pushed one of those options on a schedule.
+
+- **The sweep skips a row blocked on an unanswered gate.** The wait there is on a human, not on
+  the verifier. An ANSWERED gate does not exempt: the wait is back on the verifier, and that row
+  is still surfaced.
+- **Filing a gate on a row delivered to you stamps `handoff_ack_at`.** Same receiver rule as
+  DIVE-1378's `task start` ACK: the real actor only (never `--from`), only while they hold the
+  row as its assigned verifier. The record now says what happened.
+- **`task reject` refuses over an explicit tier-2 gate.** It auto-answers the gate with
+  `need_answered_by='auto:reject'`, a non-human provenance the tier-2 floor exists to forbid and
+  that `task answer` refuses outright, reached around by raw SQL. `task done` was already
+  refused (DIVE-555). Scoped to an agent actor and to an EXPLICIT tier: a human caller is the
+  party the gate is waiting on, and an untiered legacy row keeps DIVE-1495's supersede, so the
+  CNCL-9 re-nag fix is untouched.
+- **`task verify --cmd` no longer auto-closes over an open gate either.** It closes by raw
+  `UPDATE`, so it never saw DIVE-555 — one `task verify --cmd=true` closed a task out from under
+  an unanswered human gate and the question then vanished from every open-gate view, which all
+  require an open status. That is DIVE-2067's lesson on this axis: the refusal on `task done`
+  names other verbs, and the named verb carried no equivalent check. The verify VERDICT is still
+  recorded; only the close waits, and `--no-done` is unaffected.
+- **The refusal prints a reachable exit, per caller.** A guard that forecloses the FAIL verdict
+  with nothing but "wait for the human" converts a wrong-but-moving state into a correct-but-stuck
+  one, and gets routed around. If you filed the gate you can retire it yourself
+  (`task need --withdraw`, archived to `gate_history` as a withdrawal rather than an answer put in
+  a human's mouth) and then reject. If someone else filed it you cannot retire their ask, but your
+  grade need not wait on it: `task set-body --append` records the verdict now and the reject lands
+  when the gate clears. Both paths are executed in the tests, not just quoted in the message.
+- `tests/verifier_gate_ack_unit.sh` grades all three by mutation. The first fixture was VACUOUS:
+  with the ACK stamp in place, deleting the sweep's exclusion left the suite green, because
+  `handoff_ack_at IS NULL` was doing the skipping. Two fixes for one symptom, one standing in
+  for the other. The arm now runs on a live-gate/no-ACK row, which is DIVE-2146's shape today
+  and the shape of every gate-blocked row already on the board.
+
 ## Unreleased — fix(gate): a gate escalates from the agent that FILED it, not from whoever created the task (DIVE-1945)
 
 `task gate-escalate` derived the gate's filer as `COALESCE(created_by, assignee)`. Those agree

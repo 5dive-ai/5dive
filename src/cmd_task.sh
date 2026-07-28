@@ -2495,7 +2495,56 @@ cmd_task_reject() {
   # manual gate to a human on purpose.
   local _open_gate; _open_gate=$(db "SELECT CASE WHEN need_type IS NOT NULL
         AND need_answered_at IS NULL THEN 1 ELSE 0 END FROM tasks WHERE id=${id};")
+  # DIVE-2196: ...but NOT a tier-2 one. The supersede below writes
+  # need_answered_by='auto:reject' with raw SQL, which is a NON-HUMAN provenance on
+  # a gate the tier-2 floor exists to keep human-only — cmd_task_answer refuses
+  # exactly that write, and this path reaches around it. `task done` over a live
+  # gate is already refused (DIVE-555); reject was the remaining verb by which an
+  # agent could clear a human's pending question as a side effect of its own move.
+  # Scoped to an AGENT actor: a genuine human caller is the very party the gate is
+  # waiting on, and an unattributable one ('none': CI, root cron) is the different
+  # question DIVE-2007 got wrong by answering it here. Tier<=1 keeps DIVE-1495's
+  # supersede untouched — a fleet-actionable gate is one an agent could have
+  # cleared anyway, and leaving it pending is the CNCL-9 re-nag defect.
   if [[ "$_open_gate" == "1" ]]; then
+    # EXPLICIT tier only. Every gate filed through `task need` writes a tier, so a
+    # NULL one is a legacy or hand-inserted row that predates tiers — inferring a
+    # human-only floor from a missing value would retro-fit this refusal onto rows
+    # nobody ever tiered and silently break DIVE-1495's supersede where it has
+    # always applied (caught by tests/gate_verifier_route_unit.sh, whose DIVE-505
+    # fixture is exactly that shape). Fail-closed on an absent tier belongs where a
+    # gate is being ANSWERED — a grant; here the question is whether a rail that has
+    # worked since DIVE-1495 keeps working.
+    local _og_tier _og_type _og_actor _og_kind
+    _og_tier=$(db "SELECT COALESCE(tier,'')            FROM tasks WHERE id=${id};")
+    _og_type=$(db "SELECT COALESCE(need_type,'gate')   FROM tasks WHERE id=${id};")
+    _og_actor=$(_gate_withdraw_actor)          # "agent <name>" | "human" | "none"
+    _og_kind="${_og_actor%% *}"
+    if [[ -n "$_og_tier" && "$_og_tier" -ge 2 && "$_og_kind" == "agent" ]]; then
+      # MIRROR QUESTION (main, pre-merge): what does this guard make unreachable?
+      # A verifier who grades the work a FAIL while a tier-2 gate stands. If the
+      # only answer were "wait for the human", the rail would convert a
+      # wrong-but-moving state into a correct-but-stuck one and the next agent
+      # would route around it. So the refusal PRINTS the exit, and which exit
+      # depends on who the caller is:
+      #   - you filed the gate  -> you can retire it yourself: `need --withdraw`
+      #     then reject. Two explicit steps, one of them recorded in gate_history
+      #     as a withdrawal, which is the whole difference from a forged answer.
+      #   - someone else filed it -> you cannot retire their ask and must not
+      #     answer it for them, but your GRADE does not have to wait on it:
+      #     `task set-body --append` records the verdict now, the reject lands
+      #     when the gate clears. Nothing is lost, only the loop transition waits.
+      local _og_filer _og_me _og_exit
+      _og_filer=$(db "SELECT COALESCE(NULLIF(gate_filed_by,''), assignee, '') FROM tasks WHERE id=${id};")
+      _og_me="${_og_actor#agent }"
+      if [[ -n "$_og_filer" && "$_og_filer" == "$_og_me" ]]; then
+        _og_exit="You filed this gate, so you can retire it yourself: '5dive task need $ident --withdraw' (a withdrawal, archived to gate_history — not an answer put in a human's mouth), then reject. Do that only if your grade makes the question genuinely moot."
+      else
+        _og_exit="'${_og_filer:-its filer}' or their lead can withdraw it ('5dive task need $ident --withdraw') if your grade makes the question moot — ask them, do not answer it for them. Your grade does not have to wait on that: record it now with '5dive task set-body $ident \"VERDICT: ...\" --append' and send it to the maker, then reject once the gate clears."
+      fi
+      policy_refuse "$E_CONFLICT" reject-over-tier2-gate DIVE-2196 "$ident" \
+        "$ident has an OPEN tier-2 ${_og_type} gate awaiting a human — rejecting it would mark that gate '(superseded)' with provenance 'auto:reject', i.e. an agent clearing a human-only gate as a side effect of its own move (DIVE-1117 floor, DIVE-2196). The wait is on the human, not on you. ${_og_exit} A human answering it ('5dive task answer $ident --value=...') also clears the way."
+    fi
     local _sup_ts; _sup_ts=$(date -u '+%Y-%m-%d %H:%M:%S')
     db "UPDATE tasks SET need_answer='(superseded — task rejected, bounced to maker)',
           need_answered_at=$(sqlq "$_sup_ts"), need_answered_by='auto:reject', gate_pinged_at=NULL
@@ -2988,6 +3037,23 @@ cmd_task_verify() {
 
   local flipped=0
   if (( rc == 0 )) && (( ! no_done )); then
+    # DIVE-2196: this auto-close is a TERMINAL CLOSE reached by raw UPDATE, so it
+    # never saw DIVE-555's pending-gate refusal — `task verify --cmd=true` closed a
+    # task out from under an unanswered human gate, and the question then vanished
+    # from every open-gate view (they all require an open status). That is the same
+    # bypass DIVE-2067 recorded on the ACK axis: the refusal on `task done` NAMES
+    # `task verify` as an alternative, and the named alternative carried no
+    # equivalent check. Refusing here is what makes the `done`/`reject` rails real
+    # rather than advisory. The verify RESULT is still recorded first — the evidence
+    # is worth keeping and is not what the gate is protecting; only the close waits.
+    local _vg_t _vg_a
+    _vg_t=$(db "SELECT COALESCE(need_type,'')        FROM tasks WHERE id=${id};")
+    _vg_a=$(db "SELECT COALESCE(need_answered_at,'') FROM tasks WHERE id=${id};")
+    if [[ -n "$_vg_t" && -z "$_vg_a" ]]; then
+      db "UPDATE tasks SET result=$(sqlq "$result_txt") WHERE id=${id};"
+      policy_refuse "$E_CONFLICT" verify-close-over-open-gate DIVE-2196 "$ident" \
+        "$ident has a pending '${_vg_t}' gate awaiting a human — the verify verdict is RECORDED, but the auto-close is refused: closing here would drop the human's question out of every open-gate view without anyone answering it, which is DIVE-555's bypass reached by a different verb. Exits: let them answer it ('5dive task answer $ident --value=...'), withdraw it if your result makes it moot ('5dive task need $ident --withdraw'), or re-run with --no-done to record evidence without closing."
+    fi
     db "UPDATE tasks SET status='done', done_at=datetime('now'), result=$(sqlq "$result_txt") WHERE id=${id};"
     flipped=1
     # DIVE-1415: `task verify` auto-done is a terminal close like `task done`, so
@@ -4316,6 +4382,16 @@ cmd_task_need() {
   # `task answer` knows who to ping to resume. The inbox is defined by the gate
   # (need_type set), not by assignee, so it still surfaces to the human.
   local actor; actor=$(task_actor "$from")
+  # DIVE-2196: filing a gate on a task DELIVERED to you IS an act of review — the
+  # verifier demonstrably opened it and escalated. Stamp the handoff ACK in the same
+  # transaction, so "reviewed it and escalated to a human" stops being byte-identical
+  # to "never looked at it": handoff_ack_at NULL is what the stall sweep, `task show`
+  # and the loop board all read as UNACKNOWLEDGED, and on DIVE-2146 that made the
+  # sweep nag a verifier who had already graded and escalated. Same receiver rule as
+  # DIVE-1378's `task start` ACK — the REAL actor only (never --from, which would let
+  # a third party forge the verifier's receipt), only while they are the assigned
+  # verifier of a delivered row, COALESCE so a set ACK never moves.
+  local _ack_actor; _ack_actor=$(task_actor)
   # DIVE-2119: a re-file DESTROYS the previous gate — archive it to gate_history
   # and reset all six provenance columns in the same transaction, before the
   # SET below overwrites need_type/ask/tier. Without the archive the previous
@@ -4325,6 +4401,12 @@ cmd_task_need() {
       $(_gate_archive_and_clear_sql file "id=${id}")
       UPDATE tasks
         SET status='blocked', assignee=$(sqlq "$actor"),
+            handoff_ack_at=CASE
+              WHEN maker_agent IS NOT NULL AND verifier IS NOT NULL
+                   AND assignee=verifier AND verifier=$(sqlq "$_ack_actor")
+                   AND handoff_delivered_at IS NOT NULL
+              THEN COALESCE(handoff_ack_at, datetime('now'))
+              ELSE handoff_ack_at END,
             need_type=$(sqlq "$type"), ask=$(sqlq "$ask"),
             need_options=$(sqlq_or_null "$options"),
             recommend=$(sqlq_or_null "$recommend"),
