@@ -15,7 +15,15 @@
 set -uo pipefail
 
 # DIVE-2211: name the tree this harness grades (tests/lib/grading_tree.sh).
-. "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh"
+# Three-state: if the helper is unreachable (a staged copy that did not carry
+# tests/lib/), the log says NO TREE WAS NAMED rather than falling silent, and a
+# `set -e` harness is not killed by a failed source.
+# NOTE the absence of `2>/dev/null`. The obvious hardening -- redirect the
+# source's stderr so bash's "No such file" does not litter the log -- also
+# swallows the helper's own stderr line, which IS the payload. That silenced all
+# 210 harnesses at once while every other check in this change stayed green.
+. "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh" \
+  || printf 'grading tree: UNRESOLVED (tests/lib/grading_tree.sh not reachable; no tree named)\n' >&2
 cd "$(dirname "$0")/.."
 SRC=src
 TMP="$(mktemp -d /tmp/gate-internalops-unit.XXXXXX)"

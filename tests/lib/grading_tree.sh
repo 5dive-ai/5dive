@@ -96,3 +96,4 @@ if [[ -z "${_5D_GRADING_TREE_PRINTED:-}" ]]; then
   _5D_GRADING_TREE_PRINTED=1
   _5d_grading_tree_line >&2
 fi
+:

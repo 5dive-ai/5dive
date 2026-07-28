@@ -14,7 +14,15 @@ set -uo pipefail
 cd "$(dirname "$0")/.."
 
 # shellcheck source=lib/grading_tree.sh
-. "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh"
+# Three-state: if the helper is unreachable (a staged copy that did not carry
+# tests/lib/), the log says NO TREE WAS NAMED rather than falling silent, and a
+# `set -e` harness is not killed by a failed source.
+# NOTE the absence of `2>/dev/null`. The obvious hardening -- redirect the
+# source's stderr so bash's "No such file" does not litter the log -- also
+# swallows the helper's own stderr line, which IS the payload. That silenced all
+# 210 harnesses at once while every other check in this change stayed green.
+. "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh" \
+  || printf 'grading tree: UNRESOLVED (tests/lib/grading_tree.sh not reachable; no tree named)\n' >&2
 
 TMP="$(mktemp -d /tmp/grading-tree.XXXXXX)"
 trap 'rm -rf "$TMP"' EXIT
@@ -107,6 +115,17 @@ if ( set -euo pipefail
 else
   nok "sourcing under set -euo pipefail returned nonzero"
 fi
+
+# ---- 8. END TO END: a REAL corpus harness emits the line ------------------
+# The case that was missing, and its absence cost the whole change. Case 1-7
+# source the helper DIRECTLY; the contract test credits only the presence of a
+# source LINE. Neither exercises the call site as it appears in a harness -- so
+# a `2>/dev/null` added to that line to hide bash's "No such file" swallowed the
+# helper's stderr, silenced all 210 harnesses, and every other check stayed
+# green. Grade the seam, not just the two things it joins.
+e2e="$(bash tests/names_the_tree_contract_unit.sh 2>&1 >/dev/null | grep -c 'grading tree:')"
+if [[ "$e2e" == "1" ]]; then ok "a real harness emits exactly one grading-tree line on stderr"
+else nok "a real harness emitted $e2e grading-tree lines on stderr (want 1)"; fi
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]
