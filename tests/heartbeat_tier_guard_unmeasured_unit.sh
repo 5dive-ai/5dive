@@ -36,9 +36,11 @@
 #   B. tier_unmeasured() keeps the polarity: unregistered is a MEASUREMENT.
 #   C. The guard block, extracted VERBATIM from src/cmd_heartbeat.sh, decides
 #      correctly under nine causes.
-#   D. ANCHOR: the same harness driving the PRE-FIX block (extracted from
-#      origin/main, not reimplemented here) collapses those causes. Without this
-#      the suite could pass against a guard that never had the bug.
+#   D. ANCHOR: the same harness driving the PRE-FIX block (extracted from a
+#      PINNED commit, not reimplemented here) collapses those causes. Without
+#      this the suite could pass against a guard that never had the bug. The
+#      pin is load-bearing: naming a branch made the anchor compare post-fix to
+#      post-fix the moment this merged. See the PRE_FIX_REF note below.
 #   E. Structural: no decision site re-adds a stderr-swallowed isolation read,
 #      and envelope_tier() is byte-identical to origin/main (DIVE-2210 is a
 #      shipped wire format; this ticket must not move it).
@@ -51,6 +53,17 @@
 # Pure: fixture registries in a tmpdir, no root, no network, no tmux, no db.
 #   bash tests/heartbeat_tier_guard_unmeasured_unit.sh
 set -uo pipefail
+
+# DIVE-2211: name the tree this harness grades (tests/lib/grading_tree.sh).
+# Three-state: if the helper is unreachable (a staged copy that did not carry
+# tests/lib/), the log says NO TREE WAS NAMED rather than falling silent, and a
+# `set -e` harness is not killed by a failed source.
+# NOTE the absence of `2>/dev/null`. The obvious hardening -- redirect the
+# source's stderr so bash's "No such file" does not litter the log -- also
+# swallows the helper's own stderr line, which IS the payload. That silenced all
+# 210 harnesses at once while every other check in this change stayed green.
+. "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh" \
+  || printf 'grading tree: UNRESOLVED (tests/lib/grading_tree.sh not reachable; no tree named)\n' >&2
 cd "$(dirname "$0")/.."
 
 PASS=0; FAIL=0; SKIP=0
@@ -218,13 +231,24 @@ for row in "${CAUSES[@]}"; do
   eq_t "guard/$label" "$want" "$got"
 done
 
-# D. ANCHOR. Same harness, PRE-FIX block taken from origin/main — not retyped
-# here, so this cannot silently agree with my reading of the old code. If the
-# baseline is unavailable, SKIP loudly: an anchor that cannot run must not read
-# as a pass.
+# D. ANCHOR. Same harness, PRE-FIX block taken from a PINNED COMMIT — not
+# retyped here, so this cannot silently agree with my reading of the old code.
+# If the baseline is unavailable, SKIP loudly: an anchor that cannot run must
+# not read as a pass.
+#
+# IT USED TO SAY `origin/main`, AND THAT WAS SELF-INVALIDATING. The moment this
+# fix merged, origin/main BECAME the post-fix tree, so the anchor compared post
+# to post: it reported "pre-fix block only auto-ran on 0/6 unmeasured causes"
+# and "fix did not increase distinguishable decisions (3 -> 3)" — red for a
+# reason that has nothing to do with the code under test, on main, inherited by
+# whoever merged next. A baseline named by a BRANCH moves out from under the
+# claim it anchors; name the COMMIT. (It also explains a count that looked like
+# a disagreement: on a checkout with no reachable baseline these two SKIP, so
+# the same harness honestly reports 36+2 there and 41 here.)
+PRE_FIX_REF="9258ee1"   # main immediately before DIVE-2213 merged (PR #268)
 OLD_SRC="$TMP/old_heartbeat.sh"
-if git rev-parse --verify -q origin/main >/dev/null 2>&1 \
-   && git show origin/main:src/cmd_heartbeat.sh > "$OLD_SRC" 2>/dev/null; then
+if git rev-parse --verify -q "${PRE_FIX_REF}^{commit}" >/dev/null 2>&1 \
+   && git show "${PRE_FIX_REF}:src/cmd_heartbeat.sh" > "$OLD_SRC" 2>/dev/null; then
   if _mk_decider decide_old < <(_extract_guard < "$OLD_SRC"); then
     declare -a OLD_OUT=()
     for row in "${CAUSES[@]}"; do
@@ -260,10 +284,10 @@ if git rev-parse --verify -q origin/main >/dev/null 2>&1 \
       bad_t "fix did not increase distinguishable decisions ($n_old -> $n_new)"
     fi
   else
-    skip_t "ANCHOR: origin/main's cmd_heartbeat.sh has no extractable guard block"
+    skip_t "ANCHOR: ${PRE_FIX_REF}'s cmd_heartbeat.sh has no extractable guard block"
   fi
 else
-  skip_t "ANCHOR: origin/main unavailable (shallow clone?) — pre-fix collapse NOT re-measured here"
+  skip_t "ANCHOR: pinned baseline ${PRE_FIX_REF} unavailable (shallow clone?) — pre-fix collapse NOT re-measured here"
 fi
 
 # ---------------------------------------------------------------------------
