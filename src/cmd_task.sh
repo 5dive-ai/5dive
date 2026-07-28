@@ -4950,6 +4950,51 @@ cmd_task_need() {
   # SET below overwrites need_type/ask/tier. Without the archive the previous
   # gate leaves nothing but a stale answerer; without the reset the incoming
   # gate wears that answerer's identity, uid and signature (DIVE-2094).
+  # DIVE-2233 item 2 — mint the per-gate human nonce BEFORE the gate is persisted, and
+  # refuse to persist it at all if a tier-2 gate cannot arm itself.
+  #
+  # ORDERING IS THE WHOLE FIX, and getting it wrong was worse than not fixing it. The
+  # refusal originally sat after this UPDATE, so a mint failure aborted the command
+  # having ALREADY written need_type/ask/tier — leaving exactly the half-armed tier-2
+  # gate it refuses to create, while telling the caller it had failed. Caught by arm M2
+  # of gate_t2_nonce_proof_unit ("no half-filed gate is left behind"), which is the arm
+  # I nearly did not write because the refusal "obviously" prevented the state.
+  #
+  # WHY IT MUST FAIL CLOSED. An empty mint used to be silent: no UPDATE, hash NULL, gate
+  # files normally, no warning and no audit row — indistinguishable from a properly
+  # minted gate. Survivable while nothing read the column; NOT survivable once the
+  # tier-2 floor treats a NULL hash as "skip the check", because then a box with a
+  # broken RNG has no floor while every gate on it still LOOKS protected. That is
+  # DIVE-2131 restated. `_human_nonce_verify` already fails closed on a missing hash;
+  # the floor inverted that into a fail-open by skipping, so the refusal belongs HERE,
+  # where the absence is created, not there, where it is only observed.
+  #
+  # Scoped to tier 2 deliberately: for the other human types a NULL hash still means
+  # what it always meant and DIVE-916's verify path fails closed on it unchanged, so
+  # widening this would break gate filing for no security gain. With the /dev/urandom
+  # fallback in `_human_nonce_mint`, reaching this refusal means both the CSPRNG and
+  # openssl are gone — a broken box, not a routine one.
+  # DIVE-2365 (rebase onto DIVE-2356): the condition is "hard-human TYPE **or**
+  # tier>=2", NOT `tier == "2"`. This branch and the persist site below were written
+  # against different mint conditions on two branches; a string compare misses tier
+  # 3+, so the arm-or-refuse decision would cover a NARROWER set than the floor it
+  # exists to protect — the fail-open this commit closes, reintroduced one tier up.
+  # `_t2` is what the refusal keys on, so it tracks the tier arm alone: a hard-human
+  # type at tier 0/1 still files on an empty mint exactly as it always did.
+  local human_nonce="" _mint_nonce=0 _t2=0
+  case "$type" in approval|secret|manual|access) _mint_nonce=1 ;; esac
+  [[ "${tier:-}" =~ ^[0-9]+$ ]] && (( tier >= 2 )) && { _mint_nonce=1; _t2=1; }
+  (( _mint_nonce )) && human_nonce=$(_human_nonce_mint)
+  if (( _t2 )) && [[ -z "$human_nonce" ]]; then
+    # DIVE-2054: DELIBERATELY UNFENCED — a hard gate that could not arm itself is a
+    # fleet-health event, and it must leave evidence even though the caller is told.
+    audit_log "task need nonce-mint-failed" error 0 -- \
+      "task=$ident" "type=$type" "tier=$tier" \
+      "reason=could not mint a per-gate human nonce (openssl and /dev/urandom both unusable)" \
+      2>/dev/null || true
+    fail "$E_GENERIC" "$ident: refusing to file a tier-2 gate that cannot mint its own human proof — openssl and /dev/urandom are both unusable on this box, so the tier-2 human floor could not be enforced on it. Filing it anyway would create a gate that LOOKS hard-gated and is not (DIVE-2131). Fix the box's RNG, or file this at a lower --tier if it genuinely is not a human-only call."
+  fi
+
   db "BEGIN IMMEDIATE;
       $(_gate_archive_and_clear_sql file "id=${id}")
       UPDATE tasks
@@ -5424,14 +5469,11 @@ cmd_task_need() {
   # HAVE a nonce (S16), so every gate already in flight keeps clearing. See the
   # ORDERING note above — refuse-on-NULL waits for tier-2 decisions to accumulate
   # nonces in the wild.
-  local human_nonce="" _mint_nonce=0
-  case "$type" in approval|secret|manual|access) _mint_nonce=1 ;; esac
-  [[ "${tier:-}" =~ ^[0-9]+$ ]] && (( tier >= 2 )) && _mint_nonce=1
-  if (( _mint_nonce )); then
-    human_nonce=$(_human_nonce_mint)
-    [[ -n "$human_nonce" ]] \
-      && db "UPDATE tasks SET human_nonce_hash=$(sqlq "$(_human_nonce_sha "$human_nonce")") WHERE id=${id};"
-  fi
+  # THE MINT ITSELF HAS MOVED UP (DIVE-2054 ordering fix, above the first tasks UPDATE):
+  # a tier-2 gate that cannot arm itself must refuse BEFORE any row is written, not after.
+  # Only the persist survives here.
+  [[ -n "$human_nonce" ]] \
+    && db "UPDATE tasks SET human_nonce_hash=$(sqlq "$(_human_nonce_sha "$human_nonce")") WHERE id=${id};"
   # DIVE-1927: rc 3 = filed and answerable, but NOBODY was pinged. The gate always
   # stands — the dashboard "Needs you" card, `task inbox` and `task answer` need no
   # channel, and a headless/solo/CI box answers gates exactly that way. What must

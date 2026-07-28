@@ -318,6 +318,63 @@ out=$(cmd_task_answer DIVE-510 --value=A --from=main --human --human-proof="$(pr
   && ok_t "S17 a WRONG proof is refused (the value is checked, not its presence)" \
   || bad_t "S17 wrong proof" "rc=$rc state=$(answered DIVE-510) out=$out"
 
+# --------------------------------------------------------------------------------------
+# M — THE MINT ITSELF (DIVE-2233 item 2, found by Marcus on the pre-merge read).
+#     Everything above assumes a nonce exists. If the mint silently yields nothing, the
+#     tier-2 block is SKIPPED and a bare `--human` is accepted with no proof — the floor
+#     is absent on that box while every gate on it still looks protected. That is
+#     DIVE-2131 restated, so it is graded here rather than assumed away.
+# --------------------------------------------------------------------------------------
+# M1 THE FALLBACK. openssl broken must NOT disarm the floor: /dev/urandom is the same
+#    kernel CSPRNG openssl seeds from, so the nonce is not weaker for coming from it.
+( openssl() { return 1; }
+  n=$(_human_nonce_mint) && [[ "$n" =~ ^[0-9a-f]{32}$ ]] ) \
+  && ok_t "M1 a broken openssl falls back to /dev/urandom and still mints 32 hex chars" \
+  || bad_t "M1 fallback mint" "no well-formed nonce when openssl fails"
+# M1b the mint VALIDATES rather than trusting: a truncated 12-char read is not a nonce.
+( _human_nonce_mint() { printf 'abc123'; }
+  [[ "$(_human_nonce_mint)" =~ ^[0-9a-f]{32}$ ]] ) \
+  && bad_t "M1b short value must not pass as a nonce" "12 chars accepted" \
+  || ok_t "M1b a short/truncated value is not a well-formed nonce"
+
+# M2 THE REFUSAL. Both sources gone => a tier-2 gate must REFUSE TO FILE. Filing it would
+#    create a gate claiming a hard human floor it cannot enforce.
+_af_reset 2>/dev/null || true
+seed_task DIVE-520 "rotate the prod signing key"
+out=$( _human_nonce_mint() { return 1; }
+       cmd_task_need DIVE-520 --type=decision --tier=2 --options="A|B" \
+         --ask="which rollout order" --from=dev 2>&1 ); rc=$?
+[[ $rc -ne 0 ]] \
+  && ok_t "M2 a tier-2 gate whose nonce cannot be minted REFUSES to file (rc=$rc)" \
+  || bad_t "M2 mint-failure refused" "rc=$rc out=$out"
+[[ "$out" == *"cannot mint its own human proof"* ]] \
+  && ok_t "M2 the refusal names the cause (RNG), not a generic internal error" \
+  || bad_t "M2 refusal names cause" "out=$out"
+[[ -z "$(hashof DIVE-520)" && "$(db "SELECT COALESCE(need_type,'') FROM tasks WHERE ident='DIVE-520';")" == "" ]] \
+  && ok_t "M2 no half-filed gate is left behind (need_type unset, no hash)" \
+  || bad_t "M2 no partial gate" "type='$(db "SELECT COALESCE(need_type,'') FROM tasks WHERE ident='DIVE-520';")' hash='$(hashof DIVE-520)'"
+
+# M3 SCOPE. The refusal is tier-2 ONLY. A tier-1 gate with the same broken mint still
+#    files — its NULL hash means what it always meant, and DIVE-916's verify path fails
+#    closed on it unchanged. Widening the refusal would take out gate filing for no gain.
+seed_task DIVE-521 "pick the rollout order"
+out=$( _human_nonce_mint() { return 1; }
+       cmd_task_need DIVE-521 --type=decision --tier=1 --options="A|B" \
+         --ask="which rollout order" --from=dev 2>&1 ); rc=$?
+[[ $rc -eq 0 ]] \
+  && ok_t "M3 a TIER-1 gate with the same broken mint still files (refusal is scoped)" \
+  || bad_t "M3 tier-1 unaffected" "rc=$rc out=$out"
+
+# M4 NON-VACUITY FOR M2. The same gate shape with a WORKING mint files fine — without
+#    this, an M2 that passed because `cmd_task_need` is broken for every tier-2 gate
+#    would be indistinguishable from one that passed for the right reason.
+seed_task DIVE-522 "rotate the prod signing key"
+out=$(cmd_task_need DIVE-522 --type=decision --tier=2 --options="A|B" \
+        --ask="which rollout order" --from=dev 2>&1); rc=$?
+[[ $rc -eq 0 && -n "$(hashof DIVE-522)" ]] \
+  && ok_t "M4 the SAME gate with a working mint files and stores a hash (M2 is not vacuous)" \
+  || bad_t "M4 non-vacuity" "rc=$rc hash='$(hashof DIVE-522)' out=$out"
+
 printf '\n%s\n' "-----------------------------------------------"
 printf 'DIVE-2233 item 2 — tier-2 nonce: mint, emit, verify: %d passed, %d failed\n' "$PASS" "$FAIL"
 [[ $FAIL -eq 0 ]]

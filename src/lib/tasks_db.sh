@@ -1697,8 +1697,32 @@ _human_nonce_sha() {
 
 # Mint a fresh nonce. 16 bytes = 32 hex chars: unguessable, and short enough that
 # `tna:<numid>:<action>:<nonce>` stays under Telegram's 64-byte callback cap.
-# Echoes the RAW nonce on stdout (caller stores only its hash).
-_human_nonce_mint() { openssl rand -hex 16 2>/dev/null; }
+# Echoes the RAW nonce on stdout (caller stores only its hash). rc 0 only when a
+# well-formed nonce was actually produced.
+#
+# DIVE-2233 item 2 (found by Marcus on the pre-merge read): this used to be a bare
+# `openssl rand -hex 16 2>/dev/null` — stderr suppressed, rc unchecked. A missing or
+# broken openssl therefore returned EMPTY, the caller's `[[ -n $human_nonce ]] &&`
+# skipped the UPDATE, and the gate filed with human_nonce_hash NULL and nothing
+# anywhere saying so. That was harmless while nothing read the column; it stopped
+# being harmless at the commit that made NULL mean "skip the tier-2 floor". An
+# inherited silent-empty becomes a security property at the moment something starts
+# reading it, and that is the commit that owes it a voice.
+#
+# Two changes: a FALLBACK so a single missing tool cannot disarm the floor, and an
+# rc so the caller can refuse rather than guess. /dev/urandom is the kernel CSPRNG —
+# the same source openssl seeds from — so the fallback is not a weaker nonce, and it
+# is present on every box we run on. The result is validated either way: a truncated
+# read that yields 12 hex chars must not pass as a nonce.
+_human_nonce_mint() {
+  local n=""
+  n=$(openssl rand -hex 16 2>/dev/null) || n=""
+  if [[ ! "$n" =~ ^[0-9a-f]{32}$ ]]; then
+    n=$(od -An -tx1 -N16 /dev/urandom 2>/dev/null | tr -d ' \n')
+  fi
+  [[ "$n" =~ ^[0-9a-f]{32}$ ]] || return 1
+  printf '%s' "$n"
+}
 
 # Verify a presented nonce against the stored hash for task <id>. 0 = match.
 # Fails closed on a gate with no stored hash (legacy row / non-human gate) or an
