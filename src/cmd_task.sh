@@ -4500,6 +4500,21 @@ cmd_task_need() {
     fi
   fi
 
+  # DIVE-2235 class-over-tier, applied BEFORE the write below so the stored tier
+  # is the floored one (a record showing tier=0 on a gate that was pinged would
+  # be its own small lie). Tier 0 IS an auto-answer: it applies `recommend` at
+  # file time and never pings. A human-class gate must not be auto-answered at
+  # any tier, so tier 0 on one of those is floored to 1 — the gate is filed,
+  # a nonce is minted, and a person is asked. Cost of a mis-classification is
+  # now one ping instead of a silent self-clear that nothing in the record
+  # distinguishes from a considered call. Deliberately NOT floored to 2: this
+  # change corrects the class violation only, it does not re-tier the fleet.
+  if [[ "$tier" == "0" ]] && _gate_human_class "$type"; then
+    tier=1
+    _task_store_audit_log "task need class-floor" "ok" 0 -- \
+      "task=$ident" "type=$type" "from_tier=0" "to_tier=1" "reason=human_class" || true
+  fi
+
   # assignee=actor: the agent hitting the gate becomes the owner-of-record, so
   # `task answer` knows who to ping to resume. The inbox is defined by the gate
   # (need_type set), not by assignee, so it still surfaces to the human.
@@ -4567,10 +4582,9 @@ cmd_task_need() {
   # OSS-21: tier-1 precedent auto-clear (behind pref precedent_autoclear, default
   # OFF). Runs AFTER tier resolution + the T2 floor (both unchanged) and AFTER the
   # main gate write above, so it can only ever act on a gate that has ALREADY
-  # resolved to tier 1 — T0 returned above, and T2/secret are excluded by the
+  # resolved to tier 1 — T0 returned above, and T2/HUMAN-CLASS are excluded by the
   # guard. Qualify precedent = EXACT ask_shape + same need_type, >=2 DISTINCT prior
-  # gates answered by a HUMAN (need_answered_by LIKE 'human:%' — this alone
-  # excludes every auto:* seed, so no compounding) that were NOT themselves fuzzy-
+  # gates answered by a VERIFIED human (see below) that were NOT themselves fuzzy-
   # prefilled (precedent_kind<>'fuzzy' — OSS-20's advisory fuzzy match can never
   # leak into the auto-clear seed set; exact human precedent only), IDENTICAL
   # need_answer, within
@@ -4581,7 +4595,26 @@ cmd_task_need() {
   # most-recent qualifying gate. The digest surfaces it through the auto:* Auto-
   # cleared section with the precedent citation (DIVE-891 path). Secret gates and
   # T2 provably never reach here; pref OFF is exact pre-OSS-21 behaviour.
-  if [[ "$tier" == "1" && "$type" != "secret" && -n "$ask_shape" ]]; then
+  #
+  # DIVE-2235 changes the SEED TEST, and this is the subtle half of the ticket.
+  # The old filter was `need_answered_by LIKE 'human:%'`, with a comment saying
+  # it excludes every auto:* seed — true, and it does stop the auto writers
+  # compounding. But `human:<name>` is a SELF-DECLARATION written from the
+  # caller's own username: on DIVE-2224 two agent self-clears were stamped
+  # `human:olivia` and would have QUALIFIED AS HUMAN PRECEDENT. The guard built
+  # to stop laundering was checking the one field that cannot be trusted. So the
+  # seed now additionally requires a per-gate human nonce to have been minted and
+  # survived to the answer (human_nonce_hash non-empty — _gate_archive_and_clear
+  # nulls it on a re-file, so it can only be the nonce this answer was given).
+  #
+  # HONEST CONSEQUENCE, stated rather than discovered later: combined with the
+  # class guard, the only class that still reaches here is 'decision', and
+  # decision gates do not mint a nonce (_gate_human_class's list is the mint
+  # list). So precedent auto-clear is INERT until decision gates mint — that is
+  # the v0.18 "proof of who" work. Inert is the correct direction for a pref
+  # that ships OFF and whose failure mode is "ask the human instead", but inert
+  # AND SILENT is the DIVE-1935 shape, so the decline is logged loudly below.
+  if [[ "$tier" == "1" && -n "$ask_shape" ]] && ! _gate_human_class "$type"; then
     local _ac; _ac=$(_task_pref_get precedent_autoclear); _ac="${_ac:-off}"
     if [[ "$_ac" == "on" ]]; then
       # One atomic read of the human-precedent set on this exact shape: newest
@@ -4594,6 +4627,7 @@ cmd_task_need() {
                AND need_type=$(sqlq "$type")
                AND ask_shape IS NOT NULL AND ask_shape=$(sqlq "$ask_shape")
                AND need_answered_by LIKE 'human:%'
+               AND human_nonce_hash IS NOT NULL AND human_nonce_hash <> ''
                AND COALESCE(precedent_kind,'') <> 'fuzzy'
                AND COALESCE(tier,2) >= 1
                AND need_answered_at >= datetime('now','-90 day'))
@@ -4603,6 +4637,7 @@ cmd_task_need() {
                AND need_type=$(sqlq "$type")
                AND ask_shape IS NOT NULL AND ask_shape=$(sqlq "$ask_shape")
                AND need_answered_by LIKE 'human:%'
+               AND human_nonce_hash IS NOT NULL AND human_nonce_hash <> ''
                AND COALESCE(precedent_kind,'') <> 'fuzzy'
                AND COALESCE(tier,2) >= 1
                AND need_answered_at >= datetime('now','-90 day'))
@@ -4611,10 +4646,34 @@ cmd_task_need() {
           AND t1.need_type=$(sqlq "$type")
           AND t1.ask_shape IS NOT NULL AND t1.ask_shape=$(sqlq "$ask_shape")
           AND t1.need_answered_by LIKE 'human:%'
+          AND t1.human_nonce_hash IS NOT NULL AND t1.human_nonce_hash <> ''
           AND COALESCE(t1.precedent_kind,'') <> 'fuzzy'
           AND COALESCE(t1.tier,2) >= 1
           AND t1.need_answered_at >= datetime('now','-90 day')
         ORDER BY t1.need_answered_at DESC LIMIT 1;")
+      # DIVE-2235: make the DECLINE observable. If no nonce-verified seed
+      # qualified, count the seeds the OLD self-declaration filter would have
+      # accepted. A non-zero count is exactly the laundering this change stops,
+      # and it is the number that says "the nonce path is not live for this
+      # class yet" — without this row the feature would simply never fire and
+      # nothing would say why (DIVE-1935: inert while reporting itself working).
+      if [[ -z "$_qrow" ]]; then
+        local _unverified
+        _unverified=$(db "SELECT COUNT(*) FROM tasks
+             WHERE need_answer IS NOT NULL AND id<>${id}
+               AND need_type=$(sqlq "$type")
+               AND ask_shape IS NOT NULL AND ask_shape=$(sqlq "$ask_shape")
+               AND need_answered_by LIKE 'human:%'
+               AND COALESCE(precedent_kind,'') <> 'fuzzy'
+               AND COALESCE(tier,2) >= 1
+               AND need_answered_at >= datetime('now','-90 day');" 2>/dev/null || echo 0)
+        [[ "$_unverified" =~ ^[0-9]+$ ]] || _unverified=0
+        if (( _unverified > 0 )); then
+          _task_store_audit_log "task need precedent-declined" "ok" 0 -- \
+            "task=$ident" "type=$type" "unverified_seeds=$_unverified" \
+            "reason=no_nonce_verified_precedent" || true
+        fi
+      fi
       if [[ -n "$_qrow" ]]; then
         local _qid _qans _qdistinct _qtotal
         IFS=$'\x1f' read -r _qid _qans _qdistinct _qtotal <<<"$_qrow"

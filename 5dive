@@ -26,7 +26,7 @@ esac
 
 # Bumped on every public release. `build.sh` checks this line exists; CI fails
 # the bundle-drift check if it's missing or empty.
-readonly FIVE_VERSION="0.16.36"
+readonly FIVE_VERSION="0.17.1"
 
 # GitHub org our repos live under. The org is being renamed
 # 5dive-com -> 5dive-ai (2026-06); fetches must work on either side of the
@@ -160,6 +160,11 @@ declare -A TYPE_BIN=(
   # it into ~/.local/bin so TYPE_BIN resolves on every box (same dance as
   # opencode/openclaw). MIT, ~70.8k stars. Added for the v0.9 pi epic (DIVE-1196).
   [pi]="/home/claude/.local/bin/pi"
+  # devin is Cognition's CLI (native binary). The cli.devin.ai installer
+  # drops a versioned store at ~/.local/share/devin/cli/_versions/ and
+  # symlinks ~/.local/bin/devin — TYPE_BIN points at the symlink, same
+  # convention as grok/opencode.
+  [devin]="/home/claude/.local/bin/devin"
 )
 # Which types accept --channels=telegram|discord. Each type wires the channel
 # differently (see install_channel_for_<type>_agent below):
@@ -215,6 +220,10 @@ declare -A TYPE_CHANNELS=(
   # marks pi channel-capable — creating a pi agent WITH --channels will fail at
   # install_channel_for_agent's dispatch until 1201 adds the `pi)` case. telegram only.
   [pi]=1
+  # devin has no telegram/discord bridge yet — reachable via agent send/ask,
+  # the task queue, and sibling agents. Explicit 0 (not omission) to declare
+  # the no-channel intent, per the DIVE-2076 note above this map.
+  [devin]=0
 )
 # Auth sentinel per type. Agent users run as agent-<name> (in group `claude`)
 # and cannot read /home/claude/.claude/settings.json (mode 0600), so for
@@ -255,6 +264,10 @@ declare -A TYPE_AUTH=(
   # ANTHROPIC_API_KEY/OPENAI_API_KEY env var (no file written) — the api-key
   # injection path (TYPE_API_FILE/VAR + cmd_auth) is finalized in DIVE-1200.
   [pi]="/home/claude/.pi/agent/auth.json"
+  # devin writes ~/.local/share/devin/credentials.toml on `devin auth login`
+  # (browser OAuth against the user's Devin account — no API key). Verified
+  # empirically against devin 3000.2.17.
+  [devin]="/home/claude/.local/share/devin/credentials.toml"
 )
 # Installer recipe per type. Run as `claude` user via `sudo -u claude -i bash -lc <recipe>`
 # so $HOME/.nvm and PATH resolve correctly. Empty string => no automated installer
@@ -271,6 +284,9 @@ declare -A TYPE_INSTALL=(
   # DIVE-2061 (`command -v 5dive` grading the installed CLI instead of the bundle
   # under test). This is the question the codex comment below already prescribes.
   [claude]="[[ -x /home/claude/.local/bin/claude ]] || curl -fsSL https://claude.ai/install.sh | bash"
+  # devin: same exact-path guard; the installer self-manages the versioned
+  # store + ~/.local/bin symlink, so -x makes the recipe idempotent.
+  [devin]="[[ -x /home/claude/.local/bin/devin ]] || curl -fsSL https://cli.devin.ai/install.sh | bash"
   # Verify the EXACT TYPE_BIN path (not `command -v codex`): a stray
   # /usr/bin/codex from apt or a codex left over under a non-v24 nvm major
   # would short-circuit the install and surface as "install reported success
@@ -431,6 +447,40 @@ declare -A TYPE_API_VAR=(
   [grok]="XAI_API_KEY"
   # pi is deliberately absent: it's multi-provider (no single native var).
   # cmd_auth_set resolves pi's target var from --provider via PI_PROVIDER_VAR.
+)
+
+# DIVE-2223: the file each harness ACTUALLY reads for its persona / standing
+# instructions, relative to the agent user's $HOME. Before this map every persona
+# was appended to ~/.claude/CLAUDE.md regardless of type: on a codex / opencode /
+# pi / antigravity seat that write SUCCEEDS into a path with no consumer, so the
+# agent runs bare while every file census counts a persona (same family as
+# DIVE-1930). Rows were measured with a before/after role probe on a live seat,
+# not read from docs — see community/wiki/per-harness-persona-file-paths.md.
+#
+# OPTIONAL map whose default is deliberately NOT the claude path: an unmapped
+# type makes persona_target() REFUSE and warn loudly (src/lib/agent_setup.sh).
+# Silently defaulting to ~/.claude/CLAUDE.md IS the bug this map removes, so an
+# unknown type has to be loud rather than quietly wrong.
+declare -A TYPE_PERSONA_FILE=(
+  [claude]=".claude/CLAUDE.md"
+  # grok lands here by DOCUMENTED BEHAVIOUR, not by accident: its
+  # docs/user-guide/12-project-rules.md says Claude compatibility is ON by
+  # default, so it scans home-level ~/.claude/ for CLAUDE.md / AGENTS.md. One
+  # path, two harnesses.
+  [grok]=".claude/CLAUDE.md"
+  # codex ALREADY holds the DIVE-1410 return-channel doc here (preseeded during
+  # create by preseed_codex_return_channel), so persona_install_doc PREPENDS —
+  # an overwrite would delete operational plumbing to install an identity.
+  [codex]=".codex/AGENTS.md"
+  [opencode]=".config/opencode/AGENTS.md"
+  # note the /agent segment: pi's resource loader does not read ~/.pi/AGENTS.md
+  # (same trap as SKILLS_INSTALL_DIR[pi], DIVE-1265).
+  [pi]=".pi/agent/AGENTS.md"
+  # antigravity reuses Google's ~/.gemini parent (see the TYPE_BIN note).
+  [antigravity]=".gemini/GEMINI.md"
+  # hermes and openclaw are DELIBERATELY UNMAPPED: neither has been probe-verified
+  # on a live seat, and a guessed path is exactly the silent no-op this ticket
+  # removes. Creating one with a role warns loudly and installs nothing.
 )
 
 # OpenCode reads provider API keys directly from standard environment variables.
@@ -684,6 +734,9 @@ declare -A TYPE_PROBE=(
   # subcommand is meant for headless but takes longer to spin up than
   # we want for a 5s probe. Stick with file-presence.
   [grok]=''
+  # devin -p spins up a full agent session — too slow for a 5s probe.
+  # File-presence via the TYPE_AUTH sentinel.
+  [devin]=''
 )
 
 # -------- exit codes & output helpers --------
@@ -1482,6 +1535,82 @@ preseed_codex_return_channel() {
   install -d -m 700 -o "$user" -g "$user" "$dir" 2>/dev/null || return 0
   install -m 600 -o "$user" -g "$user" /dev/null "$file" 2>/dev/null || return 0
   _codex_return_channel_doc "$name" | sudo -u "$user" tee "$file" >/dev/null
+}
+
+# ---------------------------------------------------------------------------
+# DIVE-2223: a persona has to land where the agent's HARNESS reads it
+# ---------------------------------------------------------------------------
+# Resolve the persona / standing-instructions file for one agent. Echoes the
+# absolute path on stdout; returns 1 after a LOUD warning for a type with no
+# mapped path. Callers must NOT fall back to ~/.claude/CLAUDE.md: that silent
+# default is the bug — `tee` returns 0, `chmod` returns 0, no warning fires, the
+# operator sees a clean create, and the persona never reaches the model.
+#
+# PERSONA_HOME_ROOT overrides /home so the unit test can exercise the real
+# writers against a temp tree instead of asserting on greps.
+persona_target() { # persona_target <name> <type>
+  local name="$1" type="$2" rel root="${PERSONA_HOME_ROOT:-/home}"
+  rel="${TYPE_PERSONA_FILE[$type]:-}"
+  if [[ -z "$rel" ]]; then
+    warn "[$name] no persona path is known for agent type '$type' — role/persona doc NOT installed"
+    warn "[$name] refusing to fall back to ~/.claude/CLAUDE.md: a '$type' harness does not read it, so the write would succeed and the persona would still never reach the model (DIVE-2223)"
+    warn "[$name] fix: probe a live seat, then add [$type]=<path-relative-to-\$HOME> to TYPE_PERSONA_FILE in src/header.sh — or install the doc by hand"
+    # A deferred residual is only as durable as the ticket that holds it: name
+    # the row so whoever hits this lands on it instead of re-deriving the gap.
+    [[ "$type" == "hermes" || "$type" == "openclaw" ]] \
+      && warn "[$name] hermes/openclaw are unmapped on purpose (never probe-verified) — tracked as DIVE-2245"
+    return 1
+  fi
+  printf '%s\n' "${root}/agent-${name}/${rel}"
+}
+
+# Create the persona file's parent dir owned by the agent. A dir that already
+# exists is left alone — ~/.claude is wired earlier in create and re-moding it
+# here would be a side effect nobody asked for.
+_persona_ensure_dir() { # _persona_ensure_dir <user> <file>
+  local user="$1" dir
+  dir=$(dirname "$2")
+  [[ -d "$dir" ]] || install -d -o "$user" -g "$user" -m 700 "$dir" 2>/dev/null || true
+}
+
+# Append a generated block (role + reporting) to the harness's persona file.
+persona_append_block() { # persona_append_block <name> <type> <block>
+  local name="$1" type="$2" block="$3" md
+  # NB: a separate `local` — bash expands every RHS in one `local` list before
+  # binding any of them, so "agent-${name}" on the same line dies under `set -u`.
+  local user="agent-${name}"
+  md=$(persona_target "$name" "$type") || return 1
+  _persona_ensure_dir "$user" "$md"
+  if printf '%s' "$block" | sudo -u "$user" tee -a "$md" >/dev/null 2>&1; then
+    sudo chmod 644 "$md" 2>/dev/null || true
+    step "[$name] role instructions appended to $md (type=$type)"
+  else
+    warn "[$name] could not write role instructions to $md"
+    return 1
+  fi
+}
+
+# Install a persona DOC on top of whatever standing instructions the seat already
+# carries. PREPEND, never clobber: a codex seat is created with ~/.codex/AGENTS.md
+# already holding the DIVE-1410 return-channel plumbing, and an overwrite would
+# silently drop operational instructions in order to install an identity. Both
+# halves have to survive.
+persona_install_doc() { # persona_install_doc <name> <type> <src-file>
+  local name="$1" type="$2" src="$3" md tmp rc=0
+  local user="agent-${name}"  # separate `local` — see persona_append_block
+  [[ -f "$src" ]] || return 1
+  md=$(persona_target "$name" "$type") || return 1
+  _persona_ensure_dir "$user" "$md"
+  tmp=$(mktemp) || return 1
+  { cat "$src"; if [[ -s "$md" ]]; then printf '\n'; cat "$md"; fi; } >"$tmp" || rc=1
+  if (( rc == 0 )) && install -o "$user" -g "$user" -m 644 "$tmp" "$md" 2>/dev/null; then
+    rm -f "$tmp"
+    step "[$name] persona installed at $md (type=$type)"
+    return 0
+  fi
+  rm -f "$tmp"
+  warn "[$name] could not install persona doc to $md"
+  return 1
 }
 
 # Types that `npx skills add --agent <id>` doesn't recognize. The upstream
@@ -5219,6 +5348,34 @@ _gate_proof_ct_equal() {
 # that can't mint yet would fail closed. Root toggles it.
 _gate_proof_enforced() { [[ -f "$(_gate_proof_enforce_file)" ]]; }
 
+# ── DIVE-2235: the HUMAN CLASS, and class-over-tier ──────────────────────────
+# The gate types that mint and verify a one-time human nonce. This list already
+# existed three times over in cmd_task.sh (the mint site in cmd_task_need, and
+# the two evidence blocks in cmd_task_answer); it is named here once so the
+# THREE AUTO-ANSWER WRITERS can consult it too.
+#
+# THE RULE: TIER MUST NOT BE ABLE TO DOWNGRADE CLASS. Tier says how urgently a
+# gate is pushed at a person. It must not decide WHETHER a person answers it.
+# A gate of a human class is one a human has to answer, at any tier, so none of
+#   1. `_hb_gate_ttl_sweep` — the 48h tier-1 TTL that applies `recommend`
+#   2. `cmd_task_need`'s tier-0 apply-at-file-time
+#   3. `cmd_task_need`'s OSS-21 precedent auto-clear
+# may decide one. Before DIVE-2235 the TTL sweep excluded only 'secret', so a
+# tier-1 APPROVAL auto-applied its own recommendation after 48 hours with no
+# human anywhere near it — live on DIVE-2224, where lodar's own escalation-floor
+# decision was scheduled to self-approve from the recommendation of the agent
+# who filed it.
+#
+# 'decision' is deliberately NOT a human class here. It mints no nonce (same
+# list), and the DIVE-861 TTL default exists for exactly that class — a decision
+# with a recommendation, unanswered for two days, taking its recommendation is
+# the designed behaviour, not a defect. Making human=1 unforgeable so that
+# 'decision' can join this list is the v0.18 "proof of who" work; it is NOT this
+# change, and adding decision here would silently kill the TTL sweep entirely.
+_gate_human_class() { case "${1:-}" in approval|secret|manual|access) return 0 ;; *) return 1 ;; esac; }
+# SQL form of the same list, for the sweep predicates. Keep in lockstep above.
+_GATE_HUMAN_CLASS_SQL="('approval','secret','manual','access')"
+
 # ── DIVE-916: per-gate HUMAN nonce (close the sudo->--human forge) ────────────
 # Distinct from the DIVE-519 --proof token: that is a box-wide, TTL'd, HMAC proof
 # any trusted path can mint; this is a per-GATE secret bound to one task row. Its
@@ -6645,6 +6802,10 @@ cmd_auth_login() {
          '{type:$t, var:$v, profile:$p}' \
          --arg t "claude" --arg v "CLAUDE_CODE_OAUTH_TOKEN" --arg p "${profile:-}"
       return ;;
+    devin)
+      # devin signs in via its own browser/device flow and persists
+      # ~/.local/share/devin/credentials.toml (the TYPE_AUTH sentinel).
+      exec sudo -u claude -i env $extra_env "$bin" auth login ;;
     hermes)
       # hermes signs in to OpenAI via its own device-code flow. Run it
       # interactively so the user can see the URL/code and Ctrl+C cleanly.
@@ -14591,6 +14752,14 @@ _mirror_follow_migration() {
 # "›" so codex is detected like every other TUI. Collision-free (only codex draws
 # "›"; claude "❯"; antigravity its footer), so it stays type-agnostic. Keep this
 # set in lockstep with _hb_idle_marker (cmd_heartbeat.sh) — they must not drift.
+# devin does NOT get a glyph. Its composer is ❭ (U+276D), two codepoints from
+# claude's ❯ (U+276F) and near-identical in most fonts — but worse, devin uses
+# the SAME glyph for menu selections, so its workspace-trust dialog reads
+# '❭ 1 Yes, trust <path>'. A glyph match there would report a credential/menu
+# prompt as a chat composer and type into it — the gh#214 failure from the
+# other end. Its composer placeholders are matched instead: 'Ask Devin' when
+# idle, 'Guide Devin' mid-turn. Both are prose, so no codepoint collision is
+# possible and a menu row cannot match. Fixtures: heartbeat_idle_marker_unit.
 # The marker set lives in one PURE predicate (_agent_pane_input_ready) so it can
 # be unit-tested against real pane samples with NO tmux — and a future TUI's
 # marker is added in exactly one place. The readiness set is a SUPERSET of the
@@ -14598,7 +14767,7 @@ _mirror_follow_migration() {
 # readiness — not idle — probe accepts); heartbeat_idle_marker_unit.sh asserts
 # every idle marker is also a readiness marker, so the two can never drift again.
 _agent_pane_input_ready() {
-  grep -qE '❯|›|\? for shortcuts|esc to cancel' <<<"${1:-}"
+  grep -qE '❯|›|Ask Devin|Guide Devin|\? for shortcuts|esc to cancel' <<<"${1:-}"
 }
 wait_agent_input_ready() {
   local name="$1" timeout="${2:-45}"
@@ -14953,6 +15122,77 @@ if mid:
             body.append(l)
         if [b for b in body if b.strip()]:
             started = True          # opened and produced content, but never closed
+
+    # --- 0b. the INLINE fence (DIVE-2216). The exact-line rule above is right
+    # for what it defends, but it also rejects a REAL reply from a harness that
+    # does not put the markers on lines of their own. Grok emits, verbatim:
+    #
+    #     <5dive-r:ID> ALIVE </5dive-r:ID>              (both markers, one line)
+    #     ... VERDICT: insufficient </5dive-r:ID>       (closer beside the prose)
+    #
+    # Fence present, content present, and 0.16.32 harvested NOTHING from either —
+    # so a grok seat was a SILENT ABSTAIN on every fenced ask, council ballots
+    # included. That is the failure mode this whole rail exists to remove.
+    #
+    # The discriminator that lets the strictness go without letting the ECHO back
+    # in is not the layout, it is the CONTENT. The echoed instruction carries the
+    # two markers ADJACENT (`<5dive-r:ID></5dive-r:ID>` — that is how the hint is
+    # written, deliberately), so the text between its markers is empty BY
+    # CONSTRUCTION, however the composer wraps it and whichever side the prose
+    # lands on. A real reply always has something between them. So: accept an
+    # inline pair only when what sits between the markers is non-empty, and the
+    # echo remains unreturnable — including the wrapped shape that broke the
+    # adjacency defence in DIVE-1901 iteration 1 (opening marker isolated on its
+    # own line by a line break, closing marker leading the next), which lands here
+    # with an empty body and is still dropped.
+    #
+    # Two narrower rules on top, for the same reason:
+    #   - a line with the opening marker but NO closer only opens a block if the
+    #     marker STARTS it (TUI decoration allowed, words not) — prose before the
+    #     opening marker is the signature of the echo;
+    #   - an unclosed block still returns nothing, so a mid-write frame keeps the
+    #     rail polling exactly as before.
+    # This runs only after the strict pass has found nothing, so no seat that
+    # works today changes behaviour.
+    def wordy(s):
+        # Is there CONTENT here, as opposed to what the TUI drew? Same shape rule
+        # the strict matcher uses: decoration is punctuation, box glyphs and
+        # space, never words. This is load-bearing — the first draft asked only
+        # for non-whitespace, and the wrapped echo came back as "▌", its own
+        # gutter glyph, which would have reopened DIVE-1901 through the new path.
+        return bool(re.sub(r"^[^\w<]+", "", s.strip()))
+    for i in reversed([i for i, l in enumerate(lines) if op in l]):
+        head_l = lines[i]
+        a = head_l.index(op) + len(op)
+        if cl in head_l[a:]:
+            # Complete pair on ONE line. Empty between => the echo, never a reply.
+            # Plain strip is right HERE and only here: a TUI draws its decoration
+            # at the START of a line, so anything sitting between two markers
+            # mid-line was put there by the seat.
+            between = head_l[a:head_l.index(cl, a)].strip()
+            if between:
+                sys.stdout.write(between)
+                sys.exit(0)
+            continue
+        if not re.sub(r"^[^\w<]+", "", head_l.strip()).startswith(op):
+            continue                # words before the marker: the echo, not a reply
+        lead = head_l[a:].strip()   # content the seat put after the opening marker
+        body = []
+        for l in lines[i + 1:]:
+            if op in l or "[5dive-msg" in l:
+                break
+            if cl in l:
+                pre = l[:l.index(cl)]
+                blk = body + ([pre] if wordy(pre) else [])
+                real = [b for b in blk if b.strip()]
+                if not (lead or [b for b in blk if wordy(b)]):
+                    break           # fence closed around nothing: the echo again
+                pad = min((len(b) - len(b.lstrip()) for b in real), default=0)
+                out = ([lead] if lead else []) + [b[pad:].rstrip() for b in blk]
+                sys.stdout.write("\n".join(out).strip("\n"))
+                sys.exit(0)
+            body.append(l)
+
     # FENCE-ONLY (DIVE-1901 iteration 2). Everything this ticket has ever caught
     # fabricating came from the scraping fallback below, never from the fence:
     # 0.14.7 returned the token PLUS the footer on antigravity and PURE BOX-DRAWING
@@ -17000,7 +17240,7 @@ USAGE
     "Pick the coding agent that will power your first teammate."
 
   # --- Step 1: pick a type ---
-  local -a types=(claude codex antigravity grok hermes openclaw opencode pi)
+  local -a types=(claude codex antigravity grok hermes openclaw opencode pi devin)
   local -A type_desc=(
     [claude]="Anthropic's Claude — recommended"
     [codex]="OpenAI Codex"
@@ -17010,6 +17250,7 @@ USAGE
     [openclaw]="Open-source agent — bring your own provider"
     [opencode]="Open-source agent — bring your own provider"
     [pi]="Extension-based coding agent — bring your own provider"
+    [devin]="Cognition's Devin CLI"
   )
   local -A type_label=(
     [claude]="Claude Code"
@@ -17020,6 +17261,7 @@ USAGE
     [openclaw]="OpenClaw"
     [opencode]="OpenCode"
     [pi]="Pi"
+    [devin]="Devin"
   )
   local -a type_menu=()
   local t
@@ -18789,7 +19031,8 @@ _compose_import_args() {
 }
 
 # Build the "## Role" + "## Reporting" markdown for one agent and append it to
-# the agent's $HOME/.claude/CLAUDE.md — BELOW the shared telegram fragment that
+# the persona file the agent's harness actually reads (TYPE_PERSONA_FILE,
+# DIVE-2223 — ~/.claude/CLAUDE.md for claude/grok, elsewhere for the rest) — BELOW the shared telegram fragment that
 # cmd_create already dropped (telegram agents) or as a fresh file (others). This
 # is the v1 gap: every telegram agent used to get only the shared mandate; now a
 # CEO vs DevOps carry distinct role instructions + a real delegation map.
@@ -18845,14 +19088,13 @@ _compose_write_role_md() {
     done
   fi
 
-  local user="agent-${name}" home="/home/agent-${name}" md
-  md="$home/.claude/CLAUDE.md"
-  sudo -u "$user" mkdir -p "$home/.claude" 2>/dev/null || true
-  if printf '%s' "$block" | sudo -u "$user" tee -a "$md" >/dev/null 2>&1; then
-    sudo chmod 644 "$md" 2>/dev/null || true
-  else
-    warn "[$name] could not write role instructions to $md"
-  fi
+  # DIVE-2223: land the block in the file THIS harness reads. It used to go to
+  # ~/.claude/CLAUDE.md for every type, which on a codex/opencode/pi/antigravity
+  # seat is a write that succeeds into a path with no consumer. An unmapped type
+  # warns loudly and installs nothing rather than defaulting to the claude path.
+  local type
+  type=$(jq -r '.type // "claude"' <<<"$agent")
+  persona_append_block "$name" "$type" "$block" || true
 }
 
 # Apply the v2 role wiring for one freshly-created agent: model, effort, org
@@ -23659,6 +23901,21 @@ cmd_task_need() {
     fi
   fi
 
+  # DIVE-2235 class-over-tier, applied BEFORE the write below so the stored tier
+  # is the floored one (a record showing tier=0 on a gate that was pinged would
+  # be its own small lie). Tier 0 IS an auto-answer: it applies `recommend` at
+  # file time and never pings. A human-class gate must not be auto-answered at
+  # any tier, so tier 0 on one of those is floored to 1 — the gate is filed,
+  # a nonce is minted, and a person is asked. Cost of a mis-classification is
+  # now one ping instead of a silent self-clear that nothing in the record
+  # distinguishes from a considered call. Deliberately NOT floored to 2: this
+  # change corrects the class violation only, it does not re-tier the fleet.
+  if [[ "$tier" == "0" ]] && _gate_human_class "$type"; then
+    tier=1
+    _task_store_audit_log "task need class-floor" "ok" 0 -- \
+      "task=$ident" "type=$type" "from_tier=0" "to_tier=1" "reason=human_class" || true
+  fi
+
   # assignee=actor: the agent hitting the gate becomes the owner-of-record, so
   # `task answer` knows who to ping to resume. The inbox is defined by the gate
   # (need_type set), not by assignee, so it still surfaces to the human.
@@ -23726,10 +23983,9 @@ cmd_task_need() {
   # OSS-21: tier-1 precedent auto-clear (behind pref precedent_autoclear, default
   # OFF). Runs AFTER tier resolution + the T2 floor (both unchanged) and AFTER the
   # main gate write above, so it can only ever act on a gate that has ALREADY
-  # resolved to tier 1 — T0 returned above, and T2/secret are excluded by the
+  # resolved to tier 1 — T0 returned above, and T2/HUMAN-CLASS are excluded by the
   # guard. Qualify precedent = EXACT ask_shape + same need_type, >=2 DISTINCT prior
-  # gates answered by a HUMAN (need_answered_by LIKE 'human:%' — this alone
-  # excludes every auto:* seed, so no compounding) that were NOT themselves fuzzy-
+  # gates answered by a VERIFIED human (see below) that were NOT themselves fuzzy-
   # prefilled (precedent_kind<>'fuzzy' — OSS-20's advisory fuzzy match can never
   # leak into the auto-clear seed set; exact human precedent only), IDENTICAL
   # need_answer, within
@@ -23740,7 +23996,26 @@ cmd_task_need() {
   # most-recent qualifying gate. The digest surfaces it through the auto:* Auto-
   # cleared section with the precedent citation (DIVE-891 path). Secret gates and
   # T2 provably never reach here; pref OFF is exact pre-OSS-21 behaviour.
-  if [[ "$tier" == "1" && "$type" != "secret" && -n "$ask_shape" ]]; then
+  #
+  # DIVE-2235 changes the SEED TEST, and this is the subtle half of the ticket.
+  # The old filter was `need_answered_by LIKE 'human:%'`, with a comment saying
+  # it excludes every auto:* seed — true, and it does stop the auto writers
+  # compounding. But `human:<name>` is a SELF-DECLARATION written from the
+  # caller's own username: on DIVE-2224 two agent self-clears were stamped
+  # `human:olivia` and would have QUALIFIED AS HUMAN PRECEDENT. The guard built
+  # to stop laundering was checking the one field that cannot be trusted. So the
+  # seed now additionally requires a per-gate human nonce to have been minted and
+  # survived to the answer (human_nonce_hash non-empty — _gate_archive_and_clear
+  # nulls it on a re-file, so it can only be the nonce this answer was given).
+  #
+  # HONEST CONSEQUENCE, stated rather than discovered later: combined with the
+  # class guard, the only class that still reaches here is 'decision', and
+  # decision gates do not mint a nonce (_gate_human_class's list is the mint
+  # list). So precedent auto-clear is INERT until decision gates mint — that is
+  # the v0.18 "proof of who" work. Inert is the correct direction for a pref
+  # that ships OFF and whose failure mode is "ask the human instead", but inert
+  # AND SILENT is the DIVE-1935 shape, so the decline is logged loudly below.
+  if [[ "$tier" == "1" && -n "$ask_shape" ]] && ! _gate_human_class "$type"; then
     local _ac; _ac=$(_task_pref_get precedent_autoclear); _ac="${_ac:-off}"
     if [[ "$_ac" == "on" ]]; then
       # One atomic read of the human-precedent set on this exact shape: newest
@@ -23753,6 +24028,7 @@ cmd_task_need() {
                AND need_type=$(sqlq "$type")
                AND ask_shape IS NOT NULL AND ask_shape=$(sqlq "$ask_shape")
                AND need_answered_by LIKE 'human:%'
+               AND human_nonce_hash IS NOT NULL AND human_nonce_hash <> ''
                AND COALESCE(precedent_kind,'') <> 'fuzzy'
                AND COALESCE(tier,2) >= 1
                AND need_answered_at >= datetime('now','-90 day'))
@@ -23762,6 +24038,7 @@ cmd_task_need() {
                AND need_type=$(sqlq "$type")
                AND ask_shape IS NOT NULL AND ask_shape=$(sqlq "$ask_shape")
                AND need_answered_by LIKE 'human:%'
+               AND human_nonce_hash IS NOT NULL AND human_nonce_hash <> ''
                AND COALESCE(precedent_kind,'') <> 'fuzzy'
                AND COALESCE(tier,2) >= 1
                AND need_answered_at >= datetime('now','-90 day'))
@@ -23770,10 +24047,34 @@ cmd_task_need() {
           AND t1.need_type=$(sqlq "$type")
           AND t1.ask_shape IS NOT NULL AND t1.ask_shape=$(sqlq "$ask_shape")
           AND t1.need_answered_by LIKE 'human:%'
+          AND t1.human_nonce_hash IS NOT NULL AND t1.human_nonce_hash <> ''
           AND COALESCE(t1.precedent_kind,'') <> 'fuzzy'
           AND COALESCE(t1.tier,2) >= 1
           AND t1.need_answered_at >= datetime('now','-90 day')
         ORDER BY t1.need_answered_at DESC LIMIT 1;")
+      # DIVE-2235: make the DECLINE observable. If no nonce-verified seed
+      # qualified, count the seeds the OLD self-declaration filter would have
+      # accepted. A non-zero count is exactly the laundering this change stops,
+      # and it is the number that says "the nonce path is not live for this
+      # class yet" — without this row the feature would simply never fire and
+      # nothing would say why (DIVE-1935: inert while reporting itself working).
+      if [[ -z "$_qrow" ]]; then
+        local _unverified
+        _unverified=$(db "SELECT COUNT(*) FROM tasks
+             WHERE need_answer IS NOT NULL AND id<>${id}
+               AND need_type=$(sqlq "$type")
+               AND ask_shape IS NOT NULL AND ask_shape=$(sqlq "$ask_shape")
+               AND need_answered_by LIKE 'human:%'
+               AND COALESCE(precedent_kind,'') <> 'fuzzy'
+               AND COALESCE(tier,2) >= 1
+               AND need_answered_at >= datetime('now','-90 day');" 2>/dev/null || echo 0)
+        [[ "$_unverified" =~ ^[0-9]+$ ]] || _unverified=0
+        if (( _unverified > 0 )); then
+          _task_store_audit_log "task need precedent-declined" "ok" 0 -- \
+            "task=$ident" "type=$type" "unverified_seeds=$_unverified" \
+            "reason=no_nonce_verified_precedent" || true
+        fi
+      fi
       if [[ -n "$_qrow" ]]; then
         local _qid _qans _qdistinct _qtotal
         IFS=$'\x1f' read -r _qid _qans _qdistinct _qtotal <<<"$_qrow"
@@ -31517,12 +31818,17 @@ export function dispatchBallotVote(opts = {}) {
   // with a result, or the deadline elapses. The collection-loop deadline is AUTHORITATIVE regardless
   // of any stamp in the task body. A human tap and an agent heartbeat close the task identically, so
   // this loop is byte-identical for both — no new collection/quorum/abstain path (DIVE-1564).
-  const collect = async (seat, taskId, deadlineAt, deadlineIso, kind, nudgeInfo) => {
+  const collect = async (seat, taskId, deadlineAt, deadlineIso, kind, nudgeInfo, priorFailure) => {
     // DIVE-1739: fire the single mid-window nudge once ~nudgeFrac of the window has elapsed with the
     // ballot still open. nudgeInfo is null for seats that don't get a pane nudge (e.g. human seats,
     // which vote by tap and were already delivered a Telegram ballot).
     const nudgeAt = nudgeInfo ? deadlineAt - (deadlineAt - now()) * (1 - nudgeFrac) : Infinity
     let nudged = false
+    // DIVE-2220: the DELIVERY LEDGER for this ballot. `failure` is set the moment we learn a delivery
+    // attempt did not land; `delivered` records that one demonstrably did. Both are consulted only on
+    // the deadline path — a seat that votes anyway needs no excuse for a lost nudge.
+    let failure = priorFailure || null
+    let delivered = false
     while (now() < deadlineAt) {
       let row = null
       try {
@@ -31536,7 +31842,27 @@ export function dispatchBallotVote(opts = {}) {
       }
       if (nudgeInfo && !nudged && now() >= nudgeAt) {
         nudged = true
-        try { nudge(nudgeInfo.agent, nudgeInfo.msg) } catch { /* best-effort — abstain-on-miss unchanged */ }
+        // DIVE-2220: this ONE nudge is, for a seat with no heartbeat, the only delivery that can
+        // actually wake it — the queued ballot task wakes nobody on its own. Its failure used to be
+        // swallowed TWICE over: the bare catch here discarded a throw, and the production nudge rail
+        // (nudgeSeatAgent) never throws at all — it RETURNS a failure — so the catch could not have
+        // fired in prod even once. Either way the seat fell through to the same 'no vote by deadline'
+        // string a genuinely-silent seat produces, and the receipt sealed captureFailed=0: an
+        // affirmative claim that nothing failed to be collected, over a seat we cannot show was ever
+        // asked. Record the outcome (both shapes) instead of discarding it.
+        let why = null
+        try {
+          const r = nudge(nudgeInfo.agent, nudgeInfo.msg)
+          if (r === false || (r && typeof r === 'object' && r.ok === false)) {
+            why = (r && r.why) ? String(r.why).replace(/\s+/g, ' ').slice(0, 140) : 'nudge rail reported failure'
+          }
+        } catch (e) { why = clip(e) }
+        if (why) {
+          failure = failure || { kind: 'nudge-failed', why: `mid-window nudge to ${nudgeInfo.agent} not delivered: ${why}` }
+          // Log it. Before this, a swallowed nudge was invisible even to an operator watching the
+          // convene live — its entire stderr was five lines of summary.
+          try { process.stderr.write(`[council] NUDGE FAILED — seat=${seat.id} agent=${nudgeInfo.agent} ballot=${taskId}: ${why}\n`) } catch { /* ignore */ }
+        } else delivered = true
       }
       await sleep(pollSecs * 1000)
     }
@@ -31546,7 +31872,19 @@ export function dispatchBallotVote(opts = {}) {
     // task may already be closed (a tap landed at the wire) or the cancel may race — either way the
     // seat's verdict is an abstain regardless, so a cancel gap never changes the tally.
     try { exec(['task', 'cancel', String(taskId), '--result=council ballot spent — no vote by deadline (== abstain); auto-cancelled on convene seal (CNCL-29)']) } catch { /* already closed / not cancellable — abstain stands */ }
-    return { vote: 'abstain', rationale: `${seat.id} ${kind} ${taskId}: no vote by deadline ${deadlineIso} (deadline/no-vote)` }
+    // DIVE-2220: a delivery attempt that we KNOW did not land makes this a CAPTURE failure, not an
+    // abstention. Tagged (capture:false) so captureAudit counts it, the verdict can refuse instead of
+    // sealing a clean-looking receipt, and the sealed `unreached:` line names the seat — the same
+    // treatment ballot-mint-failed already gets one branch away.
+    if (failure) {
+      return { vote: 'abstain', abstainKind: failure.kind, capture: false,
+               rationale: `CAPTURE FAILED (not an abstention) — ${seat.id} ${kind} ${taskId}: ${failure.why}; the seat cannot be shown to have been asked before the deadline ${deadlineIso}` }
+    }
+    // DIVE-2220: 'no vote by deadline' is a claim ABOUT THE SEAT, so it must carry what we can actually
+    // show about delivery. `nudged` says a wake reached the seat; `queued` says only that the ballot
+    // task was minted into its queue and the mid-window nudge never fired.
+    const told = nudgeInfo ? (delivered ? `; nudged ${nudgeInfo.agent} mid-window` : '; ballot queued, no mid-window nudge fired') : ''
+    return { vote: 'abstain', rationale: `${seat.id} ${kind} ${taskId}: no vote by deadline ${deadlineIso} (deadline/no-vote${told})` }
   }
   return async (seat, ctx) => {
     const prompt = E.seatPrompt(seat, ctx)   // blind in round 1 (engine-guaranteed)
@@ -31599,8 +31937,18 @@ export function dispatchBallotVote(opts = {}) {
       // Emit is an injectable, never-throws seam. The CLI cannot send an inline keyboard itself
       // (DIVE-1546); the concrete button delivery is the telegram plugin tap handler (DIVE-1566), which
       // consumes this exact payload. A delivery gap just leaves the task un-tapped -> abstain-on-miss.
-      try { await emitBallot(payload) } catch { /* best-effort: the missed-tap path is already an abstain */ }
-      return collect(seat, taskId, deadlineAt, deadlineIso, 'human ballot')
+      // DIVE-2220: an emit that THREW is a delivery failure — the buttons never went out — and must
+      // not resolve to the same untagged 'no vote by deadline' a human who saw the ballot and didn't
+      // tap produces. (A `{delivered:false}` RETURN is deliberately NOT treated as failure here: the
+      // default emit returns exactly that as a breadcrumb meaning "the plugin renders the buttons",
+      // so it does not distinguish an outage. That gap is real and stays open — see DIVE-2220.)
+      let emitFailure = null
+      try { await emitBallot(payload) } catch (e) { emitFailure = clip(e) }
+      if (emitFailure) {
+        try { process.stderr.write(`[council] BALLOT EMIT FAILED — seat=${seat.id} chat=${chat} ballot=${taskId}: ${emitFailure}\n`) } catch { /* ignore */ }
+      }
+      return collect(seat, taskId, deadlineAt, deadlineIso, 'human ballot', null,
+        emitFailure ? { kind: 'ballot-emit-failed', why: `Telegram ballot emit failed: ${emitFailure}` } : null)
     }
     // ---- agent seat (CNCL-18, unchanged) ----
     // CNCL-16: mint into the seat's REGISTRY agent (persona 'theo' -> 'marketing', etc.). Pre-flight
@@ -31837,9 +32185,16 @@ function nudgeSeatAgent(agent, msg) {
   const bin = process.env.COUNCIL_5DIVE_BIN || '5dive'
   try {
     execFileSync(bin, ['agent', 'send', String(agent), String(msg)],
-      { encoding: 'utf-8', timeout: 30000, stdio: ['ignore', 'ignore', 'ignore'] })
-    return true
-  } catch { return false }
+      { encoding: 'utf-8', timeout: 30000, stdio: ['ignore', 'pipe', 'pipe'] })
+    return { ok: true }
+  } catch (e) {
+    // DIVE-2220: report WHY, never a bare false. This rail is the only wake a heartbeat-less seat
+    // gets, so its failure has to be able to reach the receipt. stderr is piped (was `ignore`) purely
+    // so the reason is something a reader can act on; nothing is printed by this function itself.
+    const stderr = String((e && e.stderr) || '').replace(/\s+/g, ' ').trim()
+    const why = `${String((e && e.message) || e).replace(/\s+/g, ' ')}${stderr ? ` :: ${stderr}` : ''}`.slice(0, 140)
+    return { ok: false, why }
+  }
 }
 
 // DIVE-1739 (gate answer A — preserve strict 6/6, fix reliability operationally). Before a FULL-QUORUM
@@ -37616,6 +37971,11 @@ _hb_idle_marker() {
     claude)       printf '❯' ;;
     codex)        printf '›' ;;
     antigravity)  printf '? for shortcuts' ;;
+    # devin renders ❭ for BOTH the composer AND menu selections (the
+    # workspace-trust dialog is '❭ 1 Yes, trust …'), and ❭ U+276D sits two
+    # codepoints from claude's ❯ U+276F. Key off the composer placeholder
+    # instead: unambiguous, and it cannot match a menu row.
+    devin)        printf 'Ask Devin' ;;
     *)            printf '' ;;  # grok/opencode/unknown: byte-stability alone
   esac
 }
@@ -37977,8 +38337,11 @@ _hb_materialize_recurring() {
 #   (2) T1 TTL — a tier-1 gate unanswered for 48h gets its recommendation
 #       applied. Provenance is 'auto:ttl' + uid 0 and the closure IS signed
 #       (root context) so gate-proof verify explains it rather than flagging a
-#       raw-sqlite forgery. Deliberately NEVER: secret gates (nothing to
-#       apply), loop gate steps (a relay must not advance on a timeout — and
+#       raw-sqlite forgery. Deliberately NEVER: HUMAN-CLASS gates
+#       (_gate_human_class — DIVE-2235; this used to exclude only 'secret', so
+#       a tier-1 APPROVAL/MANUAL/ACCESS self-applied its own recommendation
+#       after 48h with no human: tier was downgrading class), loop gate steps
+#       (a relay must not advance on a timeout — and
 #       _task_loop_advance requires human:* anyway), rows without a
 #       recommendation, or rows without a real need_asked_at stamp (legacy
 #       gates predate the column; never auto-apply on a fuzzy clock — they're
@@ -38028,7 +38391,8 @@ _hb_gate_ttl_sweep() {
   done < <(db "SELECT id||x'1f'||need_type||x'1f'||COALESCE(recommend,'')||x'1f'||COALESCE(assignee,'')
                FROM tasks
                WHERE need_type IS NOT NULL AND need_answered_at IS NULL
-                 AND tier=1 AND recommend IS NOT NULL AND need_type != 'secret'
+                 AND tier=1 AND recommend IS NOT NULL
+                 AND need_type NOT IN ${_GATE_HUMAN_CLASS_SQL}
                  AND need_asked_at IS NOT NULL AND need_asked_at <= datetime('now','-48 hours')
                  AND (body IS NULL OR body NOT LIKE '%${_LOOP_MARK}:%')
                  AND status NOT IN ('done','cancelled');")
@@ -38038,8 +38402,15 @@ _hb_gate_ttl_sweep() {
   # need_asked_at; updated_at is a fine fuzzy clock when the worst case is a
   # reminder. The stale filter (need_answered_at IS NULL etc.) matches the
   # canonical inbox definition.
+  # DIVE-2235: the tier-1 human-class arm is NOT cosmetic. Pass (2) just stopped
+  # TTL-applying those gates, and pass (3) previously only covered tier-1 gates
+  # with NO recommendation — so a tier-1 approval WITH a recommendation would
+  # have become an orphan: never auto-applied, never reminded, invisible. The
+  # two predicates are complementary BY CONSTRUCTION on the same list; when one
+  # stops resolving a gate the other has to start reminding about it.
   local _t2_where="need_type IS NOT NULL AND need_answered_at IS NULL
-                 AND (tier IS NULL OR tier=2 OR (tier=1 AND recommend IS NULL))
+                 AND (tier IS NULL OR tier=2 OR (tier=1 AND recommend IS NULL)
+                      OR (tier=1 AND need_type IN ${_GATE_HUMAN_CLASS_SQL}))
                  AND COALESCE(need_asked_at, updated_at) <= datetime('now','-72 hours')
                  AND (gate_pinged_at IS NULL OR gate_pinged_at <= datetime('now','-7 days'))
                  AND status NOT IN ('done','cancelled')"
@@ -38666,7 +39037,8 @@ _hb_stall_sweep() {
   # code can go dark with it.
   local eligible; eligible=$(db "SELECT COUNT(*) FROM tasks
                WHERE need_type IS NOT NULL AND need_answered_at IS NULL
-                 AND (tier IS NULL OR tier=2 OR (tier=1 AND recommend IS NULL))
+                 AND (tier IS NULL OR tier=2 OR (tier=1 AND recommend IS NULL)
+                      OR (tier=1 AND need_type IN ${_GATE_HUMAN_CLASS_SQL}))
                  AND COALESCE(need_asked_at, updated_at) <= datetime('now','-72 hours','-30 minutes')
                  AND (gate_pinged_at IS NULL OR gate_pinged_at <= datetime('now','-7 days'))
                  AND status NOT IN ('done','cancelled');" 2>/dev/null || echo 0)
@@ -47565,9 +47937,12 @@ cmd_import() {
 
   local cdir="/home/agent-${as}/.claude"
 
-  # Layer the identity doc.
+  # Layer the identity doc into the file THIS harness actually reads (DIVE-2223).
+  # persona.yaml / avatar.png / settings.json below stay under ~/.claude because
+  # 5dive itself reads those; the persona DOC is the one that has to follow the
+  # type, and on a codex seat it prepends above the DIVE-1410 return-channel doc.
   if [[ -f "$stage/CLAUDE.md" ]]; then
-    install -o "agent-${as}" -g "agent-${as}" -m 644 "$stage/CLAUDE.md" "$cdir/CLAUDE.md" 2>/dev/null || true
+    persona_install_doc "$as" "$type" "$stage/CLAUDE.md" || true
   fi
 
   # Preserve the OpenAgent persona.yaml (DIVE-656) so the imported agent owns its

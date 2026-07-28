@@ -3,7 +3,7 @@
 // no `5dive` exec (a mock seatVote adapter stands in for the ask rail). Exit 0 == green.
 import {
   parseVote, seatPrompt, normalizeSeatVote, synthesizeNarrative, buildConveneVerdict,
-  tallyVotes, runCouncil, VOTE_TOKENS, canonicalTranscript, carryForwardVotes,
+  tallyVotes, runCouncil, VOTE_TOKENS, canonicalTranscript, carryForwardVotes, captureAudit,
 } from '../src/council/engine.mjs'
 // CNCL-18: the non-blocking ballot ADAPTER lives in cli.mjs (guarded entrypoint so this import
 // does NOT run the arg-parser). We drive its PURE collection logic with injected exec/clock seams.
@@ -360,6 +360,72 @@ ok(ballotTap({ ref: 'DIVE-1600', vote: 'a', nonce: '', _exec: () => { throw new 
 {
   const r = ballotTap({ ref: 'DIVE-1600', vote: 'a', nonce: NONCE, _exec: tapExec({ doneThrows: true }), _audit: () => {} })
   ok(r.ok === false && r.reason === 'task done failed', 'ballot-tap: a failed close is reported, never a false success')
+}
+
+// ---- DIVE-2220: a mid-window nudge that never LANDED must not seal as a plain deadline abstain ----
+// Grades src/council/cli.mjs `dispatchBallotVote`.collect + src/council/engine.mjs captureAudit/
+// canonicalTranscript. The defect: the single best-effort nudge is the ONLY delivery a heartbeat-less
+// seat gets, and its failure was discarded — so a seat we cannot show was ever asked sealed as
+// "abstain :: no vote by deadline" with verdict.captureFailed = 0, an affirmative claim that nothing
+// failed to be collected. Both failure SHAPES are graded: a throw (what the bare catch swallowed) and
+// a `false`/`{ok:false}` RETURN (what the production rail nudgeSeatAgent actually does — the catch
+// could never have fired in prod, so a fix that only handles the throw is still broken on the real path).
+{
+  const ballotExec = (voteAfter) => (args) => {
+    if (args[0] === 'task' && args[1] === 'add') return JSON.stringify({ data: { ident: 'DIVE-2220b' } })
+    if (args[0] === 'task' && args[1] === 'show') {
+      return voteAfter && voteAfter()
+        ? JSON.stringify({ data: { task: { ident: 'DIVE-2220b', status: 'done', result: 'COUNCIL-VOTE: approve :: fine' } } })
+        : JSON.stringify({ data: { task: { ident: 'DIVE-2220b', status: 'todo', result: '' } } })
+    }
+    return ''
+  }
+  const runBallot = async (nudgeImpl, voteAfterMs) => {
+    let t = 0
+    const clock = { get now() { return t } }
+    const dispatch = dispatchBallotVote({
+      deadline: 100, poll: 5, from: 'council',
+      _now: () => t,
+      _sleep: async (ms) => { t += ms },
+      _exec: ballotExec(voteAfterMs == null ? null : () => clock.now >= voteAfterMs),
+      _nudge: nudgeImpl,
+    })
+    return dispatch({ id: 'dario', lens: 'CTO' }, { question: 'ship it?', round: 1 })
+  }
+
+  // (a) PRODUCTION shape: the nudge rail reports failure by RETURNING, never by throwing.
+  const retFalse = await runBallot(() => false)
+  ok(retFalse.vote === 'abstain', 'DIVE-2220: a failed nudge still tallies as an abstain (a seat we cannot hear is not an aye)')
+  ok(retFalse.abstainKind === 'nudge-failed', 'DIVE-2220: nudge that RETURNS false -> abstainKind nudge-failed (the prod rail never throws)')
+  ok(retFalse.capture === false, 'DIVE-2220: nudge that RETURNS false -> capture:false so captureFailed counts it')
+  ok(!/^\S+ ballot .*: no vote by deadline/.test(retFalse.rationale), 'DIVE-2220: an undelivered nudge does NOT get the plain deadline/no-vote rationale')
+  ok(/CAPTURE FAILED/.test(retFalse.rationale) && /cannot be shown to have been asked/.test(retFalse.rationale), 'DIVE-2220: rationale says the seat cannot be shown to have been asked')
+
+  // (b) the shape the bare catch was written for.
+  const threw = await runBallot(() => { throw new Error('agent send: no such agent') })
+  ok(threw.abstainKind === 'nudge-failed' && threw.capture === false, 'DIVE-2220: nudge that THROWS -> tagged nudge-failed, capture:false')
+  ok(/no such agent/.test(threw.rationale), 'DIVE-2220: the throw reason reaches the rationale (was discarded)')
+
+  // (c) structured failure carries its reason.
+  const structured = await runBallot(() => ({ ok: false, why: 'exit 1 :: permission denied' }))
+  ok(structured.abstainKind === 'nudge-failed' && /permission denied/.test(structured.rationale), 'DIVE-2220: {ok:false,why} nudge failure carries why into the rationale')
+
+  // (d) a DELIVERED nudge is untagged and the rationale records that the seat was told.
+  const delivered = await runBallot(() => ({ ok: true }))
+  ok(delivered.vote === 'abstain' && delivered.abstainKind == null && delivered.capture !== false, 'DIVE-2220: a delivered nudge + silent seat stays a REAL abstention (not a capture failure)')
+  ok(/no vote by deadline/.test(delivered.rationale) && /nudged dario mid-window/.test(delivered.rationale), 'DIVE-2220: a delivered nudge is NAMED in the deadline rationale (told vs merely queued)')
+
+  // (e) a seat that VOTES after a failed nudge is not tagged — the ledger applies only at the deadline.
+  const votedAnyway = await runBallot(() => false, 60000)
+  ok(votedAnyway.vote === 'approve' && votedAnyway.capture !== false, 'DIVE-2220: a seat that votes anyway is never tagged for a lost nudge')
+
+  // (f) the tag has to REACH the artifact: audit counts it and the SEALED bytes name the seat.
+  const rows = [normalizeSeatVote({ id: 'dario' }, retFalse), normalizeSeatVote({ id: 'root' }, { vote: 'approve', rationale: 'ok' })]
+  const audit = captureAudit(rows)
+  ok(audit.captureFailed === 1, 'DIVE-2220: captureFailed counts the undelivered-nudge seat (was 0 — the false clean-collection claim)')
+  ok(audit.captureFailedSeats[0]?.seat === 'dario' && audit.captureFailedSeats[0]?.kind === 'nudge-failed', 'DIVE-2220: the audit names the seat + kind')
+  const sealed = canonicalTranscript({ council: 'c', mode: 'm', stampedAt: 'T', question: 'ship it?', seats: ['dario', 'root'], votes: rows, verdict: { recommendation: 'approve', confidence: 0.5, tally: { approve: 1 } } })
+  ok(/^unreached: dario:nudge-failed$/m.test(sealed), 'DIVE-2220: the SEALED receipt carries unreached: dario:nudge-failed (the durable record, not just the run)')
 }
 
 console.log(`\nCNCL-7 dispatch: ${pass} passed, ${fail} failed (bound to src/council/engine.mjs)`)

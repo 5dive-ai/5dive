@@ -405,6 +405,14 @@ _mirror_follow_migration() {
 # "›" so codex is detected like every other TUI. Collision-free (only codex draws
 # "›"; claude "❯"; antigravity its footer), so it stays type-agnostic. Keep this
 # set in lockstep with _hb_idle_marker (cmd_heartbeat.sh) — they must not drift.
+# devin does NOT get a glyph. Its composer is ❭ (U+276D), two codepoints from
+# claude's ❯ (U+276F) and near-identical in most fonts — but worse, devin uses
+# the SAME glyph for menu selections, so its workspace-trust dialog reads
+# '❭ 1 Yes, trust <path>'. A glyph match there would report a credential/menu
+# prompt as a chat composer and type into it — the gh#214 failure from the
+# other end. Its composer placeholders are matched instead: 'Ask Devin' when
+# idle, 'Guide Devin' mid-turn. Both are prose, so no codepoint collision is
+# possible and a menu row cannot match. Fixtures: heartbeat_idle_marker_unit.
 # The marker set lives in one PURE predicate (_agent_pane_input_ready) so it can
 # be unit-tested against real pane samples with NO tmux — and a future TUI's
 # marker is added in exactly one place. The readiness set is a SUPERSET of the
@@ -412,7 +420,7 @@ _mirror_follow_migration() {
 # readiness — not idle — probe accepts); heartbeat_idle_marker_unit.sh asserts
 # every idle marker is also a readiness marker, so the two can never drift again.
 _agent_pane_input_ready() {
-  grep -qE '❯|›|\? for shortcuts|esc to cancel' <<<"${1:-}"
+  grep -qE '❯|›|Ask Devin|Guide Devin|\? for shortcuts|esc to cancel' <<<"${1:-}"
 }
 wait_agent_input_ready() {
   local name="$1" timeout="${2:-45}"
@@ -767,6 +775,77 @@ if mid:
             body.append(l)
         if [b for b in body if b.strip()]:
             started = True          # opened and produced content, but never closed
+
+    # --- 0b. the INLINE fence (DIVE-2216). The exact-line rule above is right
+    # for what it defends, but it also rejects a REAL reply from a harness that
+    # does not put the markers on lines of their own. Grok emits, verbatim:
+    #
+    #     <5dive-r:ID> ALIVE </5dive-r:ID>              (both markers, one line)
+    #     ... VERDICT: insufficient </5dive-r:ID>       (closer beside the prose)
+    #
+    # Fence present, content present, and 0.16.32 harvested NOTHING from either —
+    # so a grok seat was a SILENT ABSTAIN on every fenced ask, council ballots
+    # included. That is the failure mode this whole rail exists to remove.
+    #
+    # The discriminator that lets the strictness go without letting the ECHO back
+    # in is not the layout, it is the CONTENT. The echoed instruction carries the
+    # two markers ADJACENT (`<5dive-r:ID></5dive-r:ID>` — that is how the hint is
+    # written, deliberately), so the text between its markers is empty BY
+    # CONSTRUCTION, however the composer wraps it and whichever side the prose
+    # lands on. A real reply always has something between them. So: accept an
+    # inline pair only when what sits between the markers is non-empty, and the
+    # echo remains unreturnable — including the wrapped shape that broke the
+    # adjacency defence in DIVE-1901 iteration 1 (opening marker isolated on its
+    # own line by a line break, closing marker leading the next), which lands here
+    # with an empty body and is still dropped.
+    #
+    # Two narrower rules on top, for the same reason:
+    #   - a line with the opening marker but NO closer only opens a block if the
+    #     marker STARTS it (TUI decoration allowed, words not) — prose before the
+    #     opening marker is the signature of the echo;
+    #   - an unclosed block still returns nothing, so a mid-write frame keeps the
+    #     rail polling exactly as before.
+    # This runs only after the strict pass has found nothing, so no seat that
+    # works today changes behaviour.
+    def wordy(s):
+        # Is there CONTENT here, as opposed to what the TUI drew? Same shape rule
+        # the strict matcher uses: decoration is punctuation, box glyphs and
+        # space, never words. This is load-bearing — the first draft asked only
+        # for non-whitespace, and the wrapped echo came back as "▌", its own
+        # gutter glyph, which would have reopened DIVE-1901 through the new path.
+        return bool(re.sub(r"^[^\w<]+", "", s.strip()))
+    for i in reversed([i for i, l in enumerate(lines) if op in l]):
+        head_l = lines[i]
+        a = head_l.index(op) + len(op)
+        if cl in head_l[a:]:
+            # Complete pair on ONE line. Empty between => the echo, never a reply.
+            # Plain strip is right HERE and only here: a TUI draws its decoration
+            # at the START of a line, so anything sitting between two markers
+            # mid-line was put there by the seat.
+            between = head_l[a:head_l.index(cl, a)].strip()
+            if between:
+                sys.stdout.write(between)
+                sys.exit(0)
+            continue
+        if not re.sub(r"^[^\w<]+", "", head_l.strip()).startswith(op):
+            continue                # words before the marker: the echo, not a reply
+        lead = head_l[a:].strip()   # content the seat put after the opening marker
+        body = []
+        for l in lines[i + 1:]:
+            if op in l or "[5dive-msg" in l:
+                break
+            if cl in l:
+                pre = l[:l.index(cl)]
+                blk = body + ([pre] if wordy(pre) else [])
+                real = [b for b in blk if b.strip()]
+                if not (lead or [b for b in blk if wordy(b)]):
+                    break           # fence closed around nothing: the echo again
+                pad = min((len(b) - len(b.lstrip()) for b in real), default=0)
+                out = ([lead] if lead else []) + [b[pad:].rstrip() for b in blk]
+                sys.stdout.write("\n".join(out).strip("\n"))
+                sys.exit(0)
+            body.append(l)
+
     # FENCE-ONLY (DIVE-1901 iteration 2). Everything this ticket has ever caught
     # fabricating came from the scraping fallback below, never from the fence:
     # 0.14.7 returned the token PLUS the footer on antigravity and PURE BOX-DRAWING

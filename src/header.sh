@@ -26,7 +26,7 @@ esac
 
 # Bumped on every public release. `build.sh` checks this line exists; CI fails
 # the bundle-drift check if it's missing or empty.
-readonly FIVE_VERSION="0.16.36"
+readonly FIVE_VERSION="0.17.1"
 
 # GitHub org our repos live under. The org is being renamed
 # 5dive-com -> 5dive-ai (2026-06); fetches must work on either side of the
@@ -160,6 +160,11 @@ declare -A TYPE_BIN=(
   # it into ~/.local/bin so TYPE_BIN resolves on every box (same dance as
   # opencode/openclaw). MIT, ~70.8k stars. Added for the v0.9 pi epic (DIVE-1196).
   [pi]="/home/claude/.local/bin/pi"
+  # devin is Cognition's CLI (native binary). The cli.devin.ai installer
+  # drops a versioned store at ~/.local/share/devin/cli/_versions/ and
+  # symlinks ~/.local/bin/devin — TYPE_BIN points at the symlink, same
+  # convention as grok/opencode.
+  [devin]="/home/claude/.local/bin/devin"
 )
 # Which types accept --channels=telegram|discord. Each type wires the channel
 # differently (see install_channel_for_<type>_agent below):
@@ -215,6 +220,10 @@ declare -A TYPE_CHANNELS=(
   # marks pi channel-capable — creating a pi agent WITH --channels will fail at
   # install_channel_for_agent's dispatch until 1201 adds the `pi)` case. telegram only.
   [pi]=1
+  # devin has no telegram/discord bridge yet — reachable via agent send/ask,
+  # the task queue, and sibling agents. Explicit 0 (not omission) to declare
+  # the no-channel intent, per the DIVE-2076 note above this map.
+  [devin]=0
 )
 # Auth sentinel per type. Agent users run as agent-<name> (in group `claude`)
 # and cannot read /home/claude/.claude/settings.json (mode 0600), so for
@@ -255,6 +264,10 @@ declare -A TYPE_AUTH=(
   # ANTHROPIC_API_KEY/OPENAI_API_KEY env var (no file written) — the api-key
   # injection path (TYPE_API_FILE/VAR + cmd_auth) is finalized in DIVE-1200.
   [pi]="/home/claude/.pi/agent/auth.json"
+  # devin writes ~/.local/share/devin/credentials.toml on `devin auth login`
+  # (browser OAuth against the user's Devin account — no API key). Verified
+  # empirically against devin 3000.2.17.
+  [devin]="/home/claude/.local/share/devin/credentials.toml"
 )
 # Installer recipe per type. Run as `claude` user via `sudo -u claude -i bash -lc <recipe>`
 # so $HOME/.nvm and PATH resolve correctly. Empty string => no automated installer
@@ -271,6 +284,9 @@ declare -A TYPE_INSTALL=(
   # DIVE-2061 (`command -v 5dive` grading the installed CLI instead of the bundle
   # under test). This is the question the codex comment below already prescribes.
   [claude]="[[ -x /home/claude/.local/bin/claude ]] || curl -fsSL https://claude.ai/install.sh | bash"
+  # devin: same exact-path guard; the installer self-manages the versioned
+  # store + ~/.local/bin symlink, so -x makes the recipe idempotent.
+  [devin]="[[ -x /home/claude/.local/bin/devin ]] || curl -fsSL https://cli.devin.ai/install.sh | bash"
   # Verify the EXACT TYPE_BIN path (not `command -v codex`): a stray
   # /usr/bin/codex from apt or a codex left over under a non-v24 nvm major
   # would short-circuit the install and surface as "install reported success
@@ -431,6 +447,40 @@ declare -A TYPE_API_VAR=(
   [grok]="XAI_API_KEY"
   # pi is deliberately absent: it's multi-provider (no single native var).
   # cmd_auth_set resolves pi's target var from --provider via PI_PROVIDER_VAR.
+)
+
+# DIVE-2223: the file each harness ACTUALLY reads for its persona / standing
+# instructions, relative to the agent user's $HOME. Before this map every persona
+# was appended to ~/.claude/CLAUDE.md regardless of type: on a codex / opencode /
+# pi / antigravity seat that write SUCCEEDS into a path with no consumer, so the
+# agent runs bare while every file census counts a persona (same family as
+# DIVE-1930). Rows were measured with a before/after role probe on a live seat,
+# not read from docs — see community/wiki/per-harness-persona-file-paths.md.
+#
+# OPTIONAL map whose default is deliberately NOT the claude path: an unmapped
+# type makes persona_target() REFUSE and warn loudly (src/lib/agent_setup.sh).
+# Silently defaulting to ~/.claude/CLAUDE.md IS the bug this map removes, so an
+# unknown type has to be loud rather than quietly wrong.
+declare -A TYPE_PERSONA_FILE=(
+  [claude]=".claude/CLAUDE.md"
+  # grok lands here by DOCUMENTED BEHAVIOUR, not by accident: its
+  # docs/user-guide/12-project-rules.md says Claude compatibility is ON by
+  # default, so it scans home-level ~/.claude/ for CLAUDE.md / AGENTS.md. One
+  # path, two harnesses.
+  [grok]=".claude/CLAUDE.md"
+  # codex ALREADY holds the DIVE-1410 return-channel doc here (preseeded during
+  # create by preseed_codex_return_channel), so persona_install_doc PREPENDS —
+  # an overwrite would delete operational plumbing to install an identity.
+  [codex]=".codex/AGENTS.md"
+  [opencode]=".config/opencode/AGENTS.md"
+  # note the /agent segment: pi's resource loader does not read ~/.pi/AGENTS.md
+  # (same trap as SKILLS_INSTALL_DIR[pi], DIVE-1265).
+  [pi]=".pi/agent/AGENTS.md"
+  # antigravity reuses Google's ~/.gemini parent (see the TYPE_BIN note).
+  [antigravity]=".gemini/GEMINI.md"
+  # hermes and openclaw are DELIBERATELY UNMAPPED: neither has been probe-verified
+  # on a live seat, and a guessed path is exactly the silent no-op this ticket
+  # removes. Creating one with a role warns loudly and installs nothing.
 )
 
 # OpenCode reads provider API keys directly from standard environment variables.
@@ -684,4 +734,7 @@ declare -A TYPE_PROBE=(
   # subcommand is meant for headless but takes longer to spin up than
   # we want for a 5s probe. Stick with file-presence.
   [grok]=''
+  # devin -p spins up a full agent session — too slow for a 5s probe.
+  # File-presence via the TYPE_AUTH sentinel.
+  [devin]=''
 )

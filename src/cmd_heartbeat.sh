@@ -963,6 +963,11 @@ _hb_idle_marker() {
     claude)       printf '❯' ;;
     codex)        printf '›' ;;
     antigravity)  printf '? for shortcuts' ;;
+    # devin renders ❭ for BOTH the composer AND menu selections (the
+    # workspace-trust dialog is '❭ 1 Yes, trust …'), and ❭ U+276D sits two
+    # codepoints from claude's ❯ U+276F. Key off the composer placeholder
+    # instead: unambiguous, and it cannot match a menu row.
+    devin)        printf 'Ask Devin' ;;
     *)            printf '' ;;  # grok/opencode/unknown: byte-stability alone
   esac
 }
@@ -1324,8 +1329,11 @@ _hb_materialize_recurring() {
 #   (2) T1 TTL — a tier-1 gate unanswered for 48h gets its recommendation
 #       applied. Provenance is 'auto:ttl' + uid 0 and the closure IS signed
 #       (root context) so gate-proof verify explains it rather than flagging a
-#       raw-sqlite forgery. Deliberately NEVER: secret gates (nothing to
-#       apply), loop gate steps (a relay must not advance on a timeout — and
+#       raw-sqlite forgery. Deliberately NEVER: HUMAN-CLASS gates
+#       (_gate_human_class — DIVE-2235; this used to exclude only 'secret', so
+#       a tier-1 APPROVAL/MANUAL/ACCESS self-applied its own recommendation
+#       after 48h with no human: tier was downgrading class), loop gate steps
+#       (a relay must not advance on a timeout — and
 #       _task_loop_advance requires human:* anyway), rows without a
 #       recommendation, or rows without a real need_asked_at stamp (legacy
 #       gates predate the column; never auto-apply on a fuzzy clock — they're
@@ -1375,7 +1383,8 @@ _hb_gate_ttl_sweep() {
   done < <(db "SELECT id||x'1f'||need_type||x'1f'||COALESCE(recommend,'')||x'1f'||COALESCE(assignee,'')
                FROM tasks
                WHERE need_type IS NOT NULL AND need_answered_at IS NULL
-                 AND tier=1 AND recommend IS NOT NULL AND need_type != 'secret'
+                 AND tier=1 AND recommend IS NOT NULL
+                 AND need_type NOT IN ${_GATE_HUMAN_CLASS_SQL}
                  AND need_asked_at IS NOT NULL AND need_asked_at <= datetime('now','-48 hours')
                  AND (body IS NULL OR body NOT LIKE '%${_LOOP_MARK}:%')
                  AND status NOT IN ('done','cancelled');")
@@ -1385,8 +1394,15 @@ _hb_gate_ttl_sweep() {
   # need_asked_at; updated_at is a fine fuzzy clock when the worst case is a
   # reminder. The stale filter (need_answered_at IS NULL etc.) matches the
   # canonical inbox definition.
+  # DIVE-2235: the tier-1 human-class arm is NOT cosmetic. Pass (2) just stopped
+  # TTL-applying those gates, and pass (3) previously only covered tier-1 gates
+  # with NO recommendation — so a tier-1 approval WITH a recommendation would
+  # have become an orphan: never auto-applied, never reminded, invisible. The
+  # two predicates are complementary BY CONSTRUCTION on the same list; when one
+  # stops resolving a gate the other has to start reminding about it.
   local _t2_where="need_type IS NOT NULL AND need_answered_at IS NULL
-                 AND (tier IS NULL OR tier=2 OR (tier=1 AND recommend IS NULL))
+                 AND (tier IS NULL OR tier=2 OR (tier=1 AND recommend IS NULL)
+                      OR (tier=1 AND need_type IN ${_GATE_HUMAN_CLASS_SQL}))
                  AND COALESCE(need_asked_at, updated_at) <= datetime('now','-72 hours')
                  AND (gate_pinged_at IS NULL OR gate_pinged_at <= datetime('now','-7 days'))
                  AND status NOT IN ('done','cancelled')"
@@ -2013,7 +2029,8 @@ _hb_stall_sweep() {
   # code can go dark with it.
   local eligible; eligible=$(db "SELECT COUNT(*) FROM tasks
                WHERE need_type IS NOT NULL AND need_answered_at IS NULL
-                 AND (tier IS NULL OR tier=2 OR (tier=1 AND recommend IS NULL))
+                 AND (tier IS NULL OR tier=2 OR (tier=1 AND recommend IS NULL)
+                      OR (tier=1 AND need_type IN ${_GATE_HUMAN_CLASS_SQL}))
                  AND COALESCE(need_asked_at, updated_at) <= datetime('now','-72 hours','-30 minutes')
                  AND (gate_pinged_at IS NULL OR gate_pinged_at <= datetime('now','-7 days'))
                  AND status NOT IN ('done','cancelled');" 2>/dev/null || echo 0)
