@@ -183,17 +183,33 @@ mirror_interagent_outbound() {
   fi
 
   local max_chars="${MIRROR_MAX_BODY_CHARS:-800}"
-  local body_disp overflow=""
-  if (( ${#trimmed} > max_chars )); then
-    body_disp="${trimmed:0:$((max_chars - 1))}…"
-    overflow=" (+$(( ${#trimmed} - max_chars )) chars)"
+  # MIRROR_CHUNKS: how many messages a long mirror may span (each up to
+  # max_chars). Default 1 = the original single-message crop. When a body
+  # overflows, chunks 2..N are labelled "(cont. i/N)" so the group reads as
+  # one continued message; only what exceeds the LAST chunk is cropped with
+  # the (+N chars) counter, so the flood ceiling stays bounded at
+  # max_chunks * max_chars regardless of how much an agent pastes.
+  local max_chunks="${MIRROR_CHUNKS:-1}"
+  [[ "$max_chunks" =~ ^[0-9]+$ ]] && (( max_chunks >= 1 )) || max_chunks=1
+  if (( ${#trimmed} <= max_chars )); then
+    _mirror_post "$token" "$group_chat_id" "$thread_id" \
+      "$(printf '%s\n%s' "$to_label" "$trimmed")" "$access_file"
   else
-    body_disp="$trimmed"
+    local _total=${#trimmed} _off=0 _idx=1 _chunk _label _overflow
+    while (( _off < _total && _idx <= max_chunks )); do
+      _chunk="${trimmed:$_off:$max_chars}"
+      _off=$(( _off + ${#_chunk} ))
+      _label="$to_label"
+      (( _idx > 1 )) && _label="${to_label} (cont. ${_idx}/${max_chunks})"
+      _overflow=""
+      if (( _idx == max_chunks && _off < _total )); then
+        _overflow=" (+$(( _total - _off )) chars)"
+      fi
+      _mirror_post "$token" "$group_chat_id" "$thread_id" \
+        "$(printf '%s\n%s%s' "$_label" "$_chunk" "$_overflow")" "$access_file"
+      _idx=$(( _idx + 1 ))
+    done
   fi
-
-  local mirror_text
-  mirror_text=$(printf '%s\n%s%s' "$to_label" "$body_disp" "$overflow")
-  _mirror_post "$token" "$group_chat_id" "$thread_id" "$mirror_text" "$access_file"
 }
 
 # Result globals consumed by load-bearing callers such as task gate delivery.
