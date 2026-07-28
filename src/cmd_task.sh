@@ -868,12 +868,33 @@ cmd_task_show() {
     dbfmt -line "SELECT ident, title, status, priority, assignee, created_by, parent_id, created_at, started_at, done_at, body, result FROM tasks WHERE id=${id};"
     # DIVE-1064: surface the creator's isolation tier (read-time from the
     # registry, no schema change) so a reader/agent can down-trust a task filed
-    # by a lower-privilege peer. Shown only when the creator is a known agent.
+    # by a lower-privilege peer.
+    #
+    # DIVE-2213: this used to print the line ONLY when the lookup came back
+    # non-empty, over a lookup whose stderr went to /dev/null — so an unreadable
+    # registry, a jq failure and a creator who genuinely has no tier all rendered
+    # as the line simply not being there, and a reader could not tell "no tier"
+    # from "not measured". Third instance of the DIVE-2210 shape (display-only;
+    # the decision-site instance is cmd_heartbeat.sh's DIVE-1065 guard).
+    #
+    # The line is now ALWAYS printed, in three distinguishable states. That
+    # changes `task show`'s human output shape for every task; checked first —
+    # origin/main across 5dive-cli / api / app / plugins / mcp has no consumer of
+    # this line other than the site emitting it, and the machine path is the
+    # --json branch above, which never carried it.
     local _cb _ctier=""
     _cb=$(db "SELECT COALESCE(created_by,'') FROM tasks WHERE id=${id};")
-    [[ -n "$_cb" ]] && _ctier="$(registry_read | jq -r --arg n "$_cb" '.agents[$n].isolation // empty' 2>/dev/null)"
-    [[ -n "$_ctier" ]] && printf 'created_by_tier = %s
-' "$_ctier"
+    _ctier="$(agent_tier "$_cb")"
+    case "$_ctier" in
+      unknown:no-caller)    printf 'created_by_tier = none (no creator recorded)
+' ;;
+      unknown:unregistered) printf 'created_by_tier = none (creator is not a registered agent)
+' ;;
+      unknown:*)            printf 'created_by_tier = %s (NOT measured)
+' "$_ctier" ;;
+      *)                    printf 'created_by_tier = %s
+' "$_ctier" ;;
+    esac
     # Human gate (only when set) — mirrors the conditional subtasks/blockers
     # blocks below so an ordinary task's `show` stays clean.
     local gate
