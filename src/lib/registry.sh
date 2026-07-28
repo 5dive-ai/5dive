@@ -73,6 +73,78 @@ envelope_tier() {
   printf '%s\n' "$t"
 }
 
+# ---------------------------------------------------------------------------
+# DIVE-2213: the SAME not-measured-vs-measured-absent collapse as DIVE-2210, but
+# at a DECISION site (the heartbeat's privilege-escalation-by-queue guard) rather
+# than a display one. envelope_tier() above is deliberately left byte-for-byte
+# alone -- its output is a shipped, verified WIRE FORMAT -- so the finer
+# partition a decision needs lives here instead.
+#
+# The distinction envelope_tier() cannot make, and does not need to: it reports
+# `unknown:unregistered` for BOTH
+#   (a) the name is not a key under .agents at all -- a human, or an external
+#       filer. That is a MEASUREMENT: this creator correctly has no tier, and
+#       every task lodar files takes this path.
+#   (b) the agent IS registered but its .isolation is missing/null -- NOT
+#       measured. A hole.
+# tests/envelope_tier_provenance_unit.sh asserts (a) and (b) collide, on purpose.
+# A guard deciding whether to trust a creator must not treat them the same: hold
+# on (a) and the fleet stops running human-filed work; fall through on (b) and an
+# untiered agent is permanently exempt from the guard.
+#
+# Reasons (never empty, and a failure is never a bare tier):
+#   unknown:no-caller            no name supplied
+#   unknown:no-registry          registry file absent
+#   unknown:registry-unreadable  present, could not be read
+#   unknown:registry-unparsable  present, read, not JSON
+#   unknown:no-agents-map        parsed, but .agents is not an object
+#   unknown:lookup-failed        jq errored on a body that parsed
+#   unknown:unregistered         name is NOT under .agents        (MEASURED)
+#   unknown:no-tier              key present, isolation absent    (not measured)
+#   unknown:malformed-tier       isolation present, not a bare token
+agent_tier() {
+  local who="${1:-}"
+  [[ -n "$who" ]] || { printf 'unknown:no-caller\n'; return 0; }
+  local body rc=0
+  body="$(registry_read_checked)" || rc=$?
+  case "$rc" in
+    0) : ;;
+    3) printf 'unknown:no-registry\n';          return 0 ;;
+    5) printf 'unknown:registry-unparsable\n';  return 0 ;;
+    *) printf 'unknown:registry-unreadable\n';  return 0 ;;
+  esac
+  local present
+  present="$(printf '%s' "$body" | jq -r --arg n "$who" \
+    'if (.agents|type) != "object" then "no-map" elif (.agents|has($n)) then "y" else "n" end' 2>/dev/null)" \
+    || { printf 'unknown:lookup-failed\n'; return 0; }
+  case "$present" in
+    y)      : ;;
+    n)      printf 'unknown:unregistered\n';  return 0 ;;
+    no-map) printf 'unknown:no-agents-map\n'; return 0 ;;
+    *)      printf 'unknown:lookup-failed\n'; return 0 ;;
+  esac
+  local t
+  t="$(printf '%s' "$body" | jq -r --arg n "$who" '.agents[$n].isolation // empty' 2>/dev/null)" \
+    || { printf 'unknown:lookup-failed\n'; return 0; }
+  [[ -n "$t" ]] || { printf 'unknown:no-tier\n'; return 0; }
+  # Same injection rule as envelope_tier(): a tier is a bare token or it is
+  # unusable. A decision site must never rank a value it could not validate.
+  [[ "$t" =~ ^[a-z][a-z0-9_-]{0,31}$ ]] || { printf 'unknown:malformed-tier\n'; return 0; }
+  printf '%s\n' "$t"
+}
+
+# True when a tier string means "we could not measure it". Every unknown:* EXCEPT
+# unregistered, which IS a measurement (this name is not an agent). This is the
+# one predicate that separates the two halves of the old rank-0 bucket -- keep the
+# polarity here and callers cannot re-collapse them by writing `unknown:*`.
+tier_unmeasured() {
+  case "$1" in
+    unknown:unregistered) return 1 ;;
+    unknown:*)            return 0 ;;
+    *)                    return 1 ;;
+  esac
+}
+
 registry_write() {
   # stdin -> registry, atomic
   local tmp
