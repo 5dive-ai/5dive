@@ -26081,6 +26081,55 @@ cmd_task_answer() {
   # blocks let it through. The tier-2 provenance floor further down uses this.
   local gtier; gtier=$(db "SELECT COALESCE(tier,'') FROM tasks WHERE id=${id};")
 
+  # DIVE-2228: refuse a STATUS-MOVING answer on an already-CLOSED row, before any
+  # write. cmd_task_answer's only precondition is the one above — "this row has an
+  # unanswered gate" — and nothing in it is about status, while a closed task
+  # carrying a dangling gate is an ordinary state (file a gate, then close or
+  # cancel without answering it). Two writers below then ran with no status
+  # predicate at all: the DIVE-909 close-as-done branch (WHERE id=${id}) and the
+  # DIVE-552 loop-gate advance/bounce. MEASURED on an isolated fixture as a third
+  # party who is neither maker nor verifier: on a `done` row, rc=0 and done_at
+  # RE-STAMPED to now (the verifier's close time destroyed); on a `cancelled` row,
+  # rc=0 and cancelled -> done, with _task_cascade_unblock then releasing its
+  # dependents — something `task cancel` itself never does.
+  #
+  # `result` survived both, because DIVE-2067's CASE WHEN result='' guard was
+  # already applied. THAT is why this was missed for so long: the field everyone
+  # learned to watch was protected, so the row looked defended while status and
+  # done_at were not. When auditing a status writer, check every field the close
+  # sets, not just the one the verb names.
+  #
+  # REACHABILITY, stated precisely: every gate LIST query carries
+  # status NOT IN ('done','cancelled'), so a freshly rendered inbox never offers
+  # the button on a closed task. The exposure is the message ALREADY SENT —
+  # callback_data tna:<id>:done -> teambot -> `task answer --value=done`. Telegram
+  # inline buttons on delivered messages DO NOT EXPIRE, so a manual gate pinged
+  # while the task was open keeps a live ✅ Done button in chat history
+  # indefinitely, and a tap months later lands the write. The live surface is
+  # filtered; the historical surface is not, and it outlives the state it was
+  # rendered against.
+  #
+  # SCOPE is DIVE-2067's, not symmetry. Only the paths that MOVE the row are
+  # refused. Answering a decision/approval/secret gate on a closed row is
+  # measured clean (its else-branch is fenced on status='blocked') and stays
+  # working — including the DIVE-931 secret-drop write, which may legitimately
+  # land after the task closed. The refusal fires here rather than at the write
+  # so the command is all-or-nothing: past this point the answer is already
+  # recorded, and refusing there would leave a gate answered under a non-zero rc.
+  local _lk; _lk=$(_loop_kind "$id")
+  local _close_done=0
+  if [[ "$nt" == "manual" && "$_lk" != gate:* ]]; then
+    local _dv; _dv=$(printf '%s' "${value:-}" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')
+    [[ "$_dv" == "done" ]] && _close_done=1
+  fi
+  local _row_status; _row_status=$(db "SELECT status FROM tasks WHERE id=${id};")
+  local _row_closed=0
+  case "$_row_status" in done|cancelled) _row_closed=1 ;; esac
+  if (( _row_closed )) && { (( _close_done )) || [[ "$_lk" == gate:* ]]; }; then
+    policy_refuse "$E_CONFLICT" "task_answer_closed_row" "DIVE-2228" "$ident" \
+      "$ident is already ${_row_status} — answering this gate would move a closed task's status, so it is refused. The close record (status, done_at, result) stands."
+  fi
+
   # DIVE-1305: the paired-human channel proof is a valid human-evidence form, but
   # STRICTLY for tier<2 gates. tier 2 is the hard-human floor (money/destructive/
   # secret are floored there) and lodar's chosen scope keeps those a
@@ -26457,18 +26506,17 @@ cmd_task_answer() {
   # `task answer --value=done`, DIVE-356) now lands here and closes cleanly — no
   # plugin/fork change needed. Loop GATE steps are EXEMPT (_lk=gate:*): a manual
   # answer there drives the relay advance below, which owns that status move.
-  local _lk; _lk=$(_loop_kind "$id")
-  local _close_done=0
-  if [[ "$nt" == "manual" && "$_lk" != gate:* ]]; then
-    local _dv; _dv=$(printf '%s' "${value:-}" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')
-    [[ "$_dv" == "done" ]] && _close_done=1
-  fi
+  # DIVE-2228: _lk and _close_done are resolved ABOVE, before any write, because
+  # the closed-row refusal keys on them. Do not recompute them here.
   if (( _close_done )); then
     # Close as done + stamp a result IF empty (never clobber real work notes) so
     # the dashboard/creator sees why it closed rather than a blank card.
+    # DIVE-2228: the status predicate is defence in depth — the refusal above is
+    # the real fence. It is kept so this UPDATE cannot re-stamp a graded row even
+    # if a future caller reaches it by another route.
     db "UPDATE tasks SET status='done', done_at=datetime('now'),
            result=CASE WHEN COALESCE(result,'')='' THEN 'Closed via manual-gate tap — marked done by '||$(sqlq "$answered_by") ELSE result END
-        WHERE id=${id};"
+        WHERE id=${id} AND status NOT IN ('done','cancelled');"
     # DIVE-1415: a manual-gate answer that closes the task DONE is terminal — its
     # dependents must release just as they would on `task done`.
     _task_cascade_unblock "$id" || true
@@ -26518,14 +26566,27 @@ cmd_task_answer() {
         _run=$(db "SELECT COALESCE(parent_id,'') FROM tasks WHERE id=${id};")
         _prev=$(db "SELECT id FROM tasks WHERE parent_id=${_run:-0} AND id<${id} AND body LIKE '%${_LOOP_MARK}:%' ORDER BY id DESC LIMIT 1;")
         if [[ -n "$_prev" ]]; then
+          # DIVE-2228: the fence goes IN THE WHERE, matching the idiom the
+          # else-branch above has always used, so a future write here either
+          # copies its neighbours or looks visibly different from all of them.
+          # THE ${_prev} WRITE IS DELIBERATELY NOT FENCED — it targets a
+          # DIFFERENT row, and reopening it is the whole point of a bounce: the
+          # previous step is ALWAYS done at that moment, so a status fence there
+          # would not harden the bounce, it would delete it. (A bounce onto a
+          # CANCELLED _prev would be wrong for a different reason; that is
+          # DIVE-552's semantics, unmeasured, and deliberately not changed here.)
+          # tests/task_answer_closed_row_unit.sh enumerates these writes and
+          # asserts the rule per target, so the exemption is graded, not assumed.
           db "INSERT OR IGNORE INTO task_deps (task_id, blocked_by) VALUES (${id}, ${_prev});
-              UPDATE tasks SET status='blocked' WHERE id=${id};
+              UPDATE tasks SET status='blocked' WHERE id=${id} AND status NOT IN ('done','cancelled');
               UPDATE tasks SET status='todo', started_at=NULL WHERE id=${_prev};"
           local _pw _pl; _pw=$(db "SELECT COALESCE(assignee,'') FROM tasks WHERE id=${_prev};"); _pl=$(db "SELECT title FROM tasks WHERE id=${_prev};")
           [[ -n "$_pw" ]] && ( cmd_send "$_pw" --from="loop" --message="↩ Loop bounced back — redo: ${_pl}" ) >/dev/null 2>&1 || true
         fi
       else
-        db "UPDATE tasks SET status='done', done_at=datetime('now') WHERE id=${id};"
+        # DIVE-2228: defence in depth, same as the close-as-done branch — a
+        # gate STEP that is already closed is refused above, before any write.
+        db "UPDATE tasks SET status='done', done_at=datetime('now') WHERE id=${id} AND status NOT IN ('done','cancelled');"
         _task_loop_advance "$id" || true
         # DIVE-1415: _task_loop_advance only frees this gate's loop-STEP siblings;
         # a non-loop task blocked_by this gate step is a cross-DAG dependent it
