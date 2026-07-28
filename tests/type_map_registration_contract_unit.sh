@@ -38,7 +38,7 @@ note() { echo "  .. $*"; }
 
 # TYPE_BIN is REQUIRED (it IS the registry — is_known_type tests it), so bare
 # reads of it are correct by construction and deliberately not listed here.
-OPTIONAL_MAPS=(TYPE_CHANNELS TYPE_AUTH TYPE_INSTALL TYPE_API_FILE TYPE_API_VAR TYPE_PROBE TYPE_SKILLS_DIR)
+OPTIONAL_MAPS=(TYPE_CHANNELS TYPE_AUTH TYPE_INSTALL TYPE_API_FILE TYPE_API_VAR TYPE_PROBE TYPE_SKILLS_DIR TYPE_PERSONA_FILE)
 
 # --- (1) static: no bare variable-keyed read of an optional map --------------
 #

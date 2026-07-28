@@ -1248,9 +1248,12 @@ cmd_import() {
 
   local cdir="/home/agent-${as}/.claude"
 
-  # Layer the identity doc.
+  # Layer the identity doc into the file THIS harness actually reads (DIVE-2223).
+  # persona.yaml / avatar.png / settings.json below stay under ~/.claude because
+  # 5dive itself reads those; the persona DOC is the one that has to follow the
+  # type, and on a codex seat it prepends above the DIVE-1410 return-channel doc.
   if [[ -f "$stage/CLAUDE.md" ]]; then
-    install -o "agent-${as}" -g "agent-${as}" -m 644 "$stage/CLAUDE.md" "$cdir/CLAUDE.md" 2>/dev/null || true
+    persona_install_doc "$as" "$type" "$stage/CLAUDE.md" || true
   fi
 
   # Preserve the OpenAgent persona.yaml (DIVE-656) so the imported agent owns its
