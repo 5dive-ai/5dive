@@ -261,7 +261,7 @@ USAGE
     "Pick the coding agent that will power your first teammate."
 
   # --- Step 1: pick a type ---
-  local -a types=(claude codex antigravity grok hermes openclaw opencode pi)
+  local -a types=(claude codex antigravity grok hermes openclaw opencode pi devin)
   local -A type_desc=(
     [claude]="Anthropic's Claude — recommended"
     [codex]="OpenAI Codex"
@@ -271,6 +271,7 @@ USAGE
     [openclaw]="Open-source agent — bring your own provider"
     [opencode]="Open-source agent — bring your own provider"
     [pi]="Extension-based coding agent — bring your own provider"
+    [devin]="Cognition's Devin CLI"
   )
   local -A type_label=(
     [claude]="Claude Code"
@@ -281,6 +282,7 @@ USAGE
     [openclaw]="OpenClaw"
     [opencode]="OpenCode"
     [pi]="Pi"
+    [devin]="Devin"
   )
   local -a type_menu=()
   local t

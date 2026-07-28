@@ -26,7 +26,7 @@ esac
 
 # Bumped on every public release. `build.sh` checks this line exists; CI fails
 # the bundle-drift check if it's missing or empty.
-readonly FIVE_VERSION="0.16.36"
+readonly FIVE_VERSION="0.17.0"
 
 # GitHub org our repos live under. The org is being renamed
 # 5dive-com -> 5dive-ai (2026-06); fetches must work on either side of the
@@ -160,6 +160,11 @@ declare -A TYPE_BIN=(
   # it into ~/.local/bin so TYPE_BIN resolves on every box (same dance as
   # opencode/openclaw). MIT, ~70.8k stars. Added for the v0.9 pi epic (DIVE-1196).
   [pi]="/home/claude/.local/bin/pi"
+  # devin is Cognition's CLI (native binary). The cli.devin.ai installer
+  # drops a versioned store at ~/.local/share/devin/cli/_versions/ and
+  # symlinks ~/.local/bin/devin — TYPE_BIN points at the symlink, same
+  # convention as grok/opencode.
+  [devin]="/home/claude/.local/bin/devin"
 )
 # Which types accept --channels=telegram|discord. Each type wires the channel
 # differently (see install_channel_for_<type>_agent below):
@@ -215,6 +220,10 @@ declare -A TYPE_CHANNELS=(
   # marks pi channel-capable — creating a pi agent WITH --channels will fail at
   # install_channel_for_agent's dispatch until 1201 adds the `pi)` case. telegram only.
   [pi]=1
+  # devin has no telegram/discord bridge yet — reachable via agent send/ask,
+  # the task queue, and sibling agents. Explicit 0 (not omission) to declare
+  # the no-channel intent, per the DIVE-2076 note above this map.
+  [devin]=0
 )
 # Auth sentinel per type. Agent users run as agent-<name> (in group `claude`)
 # and cannot read /home/claude/.claude/settings.json (mode 0600), so for
@@ -255,6 +264,10 @@ declare -A TYPE_AUTH=(
   # ANTHROPIC_API_KEY/OPENAI_API_KEY env var (no file written) — the api-key
   # injection path (TYPE_API_FILE/VAR + cmd_auth) is finalized in DIVE-1200.
   [pi]="/home/claude/.pi/agent/auth.json"
+  # devin writes ~/.local/share/devin/credentials.toml on `devin auth login`
+  # (browser OAuth against the user's Devin account — no API key). Verified
+  # empirically against devin 3000.2.17.
+  [devin]="/home/claude/.local/share/devin/credentials.toml"
 )
 # Installer recipe per type. Run as `claude` user via `sudo -u claude -i bash -lc <recipe>`
 # so $HOME/.nvm and PATH resolve correctly. Empty string => no automated installer
@@ -271,6 +284,9 @@ declare -A TYPE_INSTALL=(
   # DIVE-2061 (`command -v 5dive` grading the installed CLI instead of the bundle
   # under test). This is the question the codex comment below already prescribes.
   [claude]="[[ -x /home/claude/.local/bin/claude ]] || curl -fsSL https://claude.ai/install.sh | bash"
+  # devin: same exact-path guard; the installer self-manages the versioned
+  # store + ~/.local/bin symlink, so -x makes the recipe idempotent.
+  [devin]="[[ -x /home/claude/.local/bin/devin ]] || curl -fsSL https://cli.devin.ai/install.sh | bash"
   # Verify the EXACT TYPE_BIN path (not `command -v codex`): a stray
   # /usr/bin/codex from apt or a codex left over under a non-v24 nvm major
   # would short-circuit the install and surface as "install reported success
@@ -684,4 +700,7 @@ declare -A TYPE_PROBE=(
   # subcommand is meant for headless but takes longer to spin up than
   # we want for a 5s probe. Stick with file-presence.
   [grok]=''
+  # devin -p spins up a full agent session — too slow for a 5s probe.
+  # File-presence via the TYPE_AUTH sentinel.
+  [devin]=''
 )

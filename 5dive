@@ -26,7 +26,7 @@ esac
 
 # Bumped on every public release. `build.sh` checks this line exists; CI fails
 # the bundle-drift check if it's missing or empty.
-readonly FIVE_VERSION="0.16.36"
+readonly FIVE_VERSION="0.17.0"
 
 # GitHub org our repos live under. The org is being renamed
 # 5dive-com -> 5dive-ai (2026-06); fetches must work on either side of the
@@ -160,6 +160,11 @@ declare -A TYPE_BIN=(
   # it into ~/.local/bin so TYPE_BIN resolves on every box (same dance as
   # opencode/openclaw). MIT, ~70.8k stars. Added for the v0.9 pi epic (DIVE-1196).
   [pi]="/home/claude/.local/bin/pi"
+  # devin is Cognition's CLI (native binary). The cli.devin.ai installer
+  # drops a versioned store at ~/.local/share/devin/cli/_versions/ and
+  # symlinks ~/.local/bin/devin — TYPE_BIN points at the symlink, same
+  # convention as grok/opencode.
+  [devin]="/home/claude/.local/bin/devin"
 )
 # Which types accept --channels=telegram|discord. Each type wires the channel
 # differently (see install_channel_for_<type>_agent below):
@@ -215,6 +220,10 @@ declare -A TYPE_CHANNELS=(
   # marks pi channel-capable — creating a pi agent WITH --channels will fail at
   # install_channel_for_agent's dispatch until 1201 adds the `pi)` case. telegram only.
   [pi]=1
+  # devin has no telegram/discord bridge yet — reachable via agent send/ask,
+  # the task queue, and sibling agents. Explicit 0 (not omission) to declare
+  # the no-channel intent, per the DIVE-2076 note above this map.
+  [devin]=0
 )
 # Auth sentinel per type. Agent users run as agent-<name> (in group `claude`)
 # and cannot read /home/claude/.claude/settings.json (mode 0600), so for
@@ -255,6 +264,10 @@ declare -A TYPE_AUTH=(
   # ANTHROPIC_API_KEY/OPENAI_API_KEY env var (no file written) — the api-key
   # injection path (TYPE_API_FILE/VAR + cmd_auth) is finalized in DIVE-1200.
   [pi]="/home/claude/.pi/agent/auth.json"
+  # devin writes ~/.local/share/devin/credentials.toml on `devin auth login`
+  # (browser OAuth against the user's Devin account — no API key). Verified
+  # empirically against devin 3000.2.17.
+  [devin]="/home/claude/.local/share/devin/credentials.toml"
 )
 # Installer recipe per type. Run as `claude` user via `sudo -u claude -i bash -lc <recipe>`
 # so $HOME/.nvm and PATH resolve correctly. Empty string => no automated installer
@@ -271,6 +284,9 @@ declare -A TYPE_INSTALL=(
   # DIVE-2061 (`command -v 5dive` grading the installed CLI instead of the bundle
   # under test). This is the question the codex comment below already prescribes.
   [claude]="[[ -x /home/claude/.local/bin/claude ]] || curl -fsSL https://claude.ai/install.sh | bash"
+  # devin: same exact-path guard; the installer self-manages the versioned
+  # store + ~/.local/bin symlink, so -x makes the recipe idempotent.
+  [devin]="[[ -x /home/claude/.local/bin/devin ]] || curl -fsSL https://cli.devin.ai/install.sh | bash"
   # Verify the EXACT TYPE_BIN path (not `command -v codex`): a stray
   # /usr/bin/codex from apt or a codex left over under a non-v24 nvm major
   # would short-circuit the install and surface as "install reported success
@@ -684,6 +700,9 @@ declare -A TYPE_PROBE=(
   # subcommand is meant for headless but takes longer to spin up than
   # we want for a 5s probe. Stick with file-presence.
   [grok]=''
+  # devin -p spins up a full agent session — too slow for a 5s probe.
+  # File-presence via the TYPE_AUTH sentinel.
+  [devin]=''
 )
 
 # -------- exit codes & output helpers --------
@@ -6645,6 +6664,10 @@ cmd_auth_login() {
          '{type:$t, var:$v, profile:$p}' \
          --arg t "claude" --arg v "CLAUDE_CODE_OAUTH_TOKEN" --arg p "${profile:-}"
       return ;;
+    devin)
+      # devin signs in via its own browser/device flow and persists
+      # ~/.local/share/devin/credentials.toml (the TYPE_AUTH sentinel).
+      exec sudo -u claude -i env $extra_env "$bin" auth login ;;
     hermes)
       # hermes signs in to OpenAI via its own device-code flow. Run it
       # interactively so the user can see the URL/code and Ctrl+C cleanly.
@@ -14591,6 +14614,14 @@ _mirror_follow_migration() {
 # "›" so codex is detected like every other TUI. Collision-free (only codex draws
 # "›"; claude "❯"; antigravity its footer), so it stays type-agnostic. Keep this
 # set in lockstep with _hb_idle_marker (cmd_heartbeat.sh) — they must not drift.
+# devin does NOT get a glyph. Its composer is ❭ (U+276D), two codepoints from
+# claude's ❯ (U+276F) and near-identical in most fonts — but worse, devin uses
+# the SAME glyph for menu selections, so its workspace-trust dialog reads
+# '❭ 1 Yes, trust <path>'. A glyph match there would report a credential/menu
+# prompt as a chat composer and type into it — the gh#214 failure from the
+# other end. Its composer placeholders are matched instead: 'Ask Devin' when
+# idle, 'Guide Devin' mid-turn. Both are prose, so no codepoint collision is
+# possible and a menu row cannot match. Fixtures: heartbeat_idle_marker_unit.
 # The marker set lives in one PURE predicate (_agent_pane_input_ready) so it can
 # be unit-tested against real pane samples with NO tmux — and a future TUI's
 # marker is added in exactly one place. The readiness set is a SUPERSET of the
@@ -14598,7 +14629,7 @@ _mirror_follow_migration() {
 # readiness — not idle — probe accepts); heartbeat_idle_marker_unit.sh asserts
 # every idle marker is also a readiness marker, so the two can never drift again.
 _agent_pane_input_ready() {
-  grep -qE '❯|›|\? for shortcuts|esc to cancel' <<<"${1:-}"
+  grep -qE '❯|›|Ask Devin|Guide Devin|\? for shortcuts|esc to cancel' <<<"${1:-}"
 }
 wait_agent_input_ready() {
   local name="$1" timeout="${2:-45}"
@@ -17071,7 +17102,7 @@ USAGE
     "Pick the coding agent that will power your first teammate."
 
   # --- Step 1: pick a type ---
-  local -a types=(claude codex antigravity grok hermes openclaw opencode pi)
+  local -a types=(claude codex antigravity grok hermes openclaw opencode pi devin)
   local -A type_desc=(
     [claude]="Anthropic's Claude — recommended"
     [codex]="OpenAI Codex"
@@ -17081,6 +17112,7 @@ USAGE
     [openclaw]="Open-source agent — bring your own provider"
     [opencode]="Open-source agent — bring your own provider"
     [pi]="Extension-based coding agent — bring your own provider"
+    [devin]="Cognition's Devin CLI"
   )
   local -A type_label=(
     [claude]="Claude Code"
@@ -17091,6 +17123,7 @@ USAGE
     [openclaw]="OpenClaw"
     [opencode]="OpenCode"
     [pi]="Pi"
+    [devin]="Devin"
   )
   local -a type_menu=()
   local t
@@ -31588,12 +31621,17 @@ export function dispatchBallotVote(opts = {}) {
   // with a result, or the deadline elapses. The collection-loop deadline is AUTHORITATIVE regardless
   // of any stamp in the task body. A human tap and an agent heartbeat close the task identically, so
   // this loop is byte-identical for both — no new collection/quorum/abstain path (DIVE-1564).
-  const collect = async (seat, taskId, deadlineAt, deadlineIso, kind, nudgeInfo) => {
+  const collect = async (seat, taskId, deadlineAt, deadlineIso, kind, nudgeInfo, priorFailure) => {
     // DIVE-1739: fire the single mid-window nudge once ~nudgeFrac of the window has elapsed with the
     // ballot still open. nudgeInfo is null for seats that don't get a pane nudge (e.g. human seats,
     // which vote by tap and were already delivered a Telegram ballot).
     const nudgeAt = nudgeInfo ? deadlineAt - (deadlineAt - now()) * (1 - nudgeFrac) : Infinity
     let nudged = false
+    // DIVE-2220: the DELIVERY LEDGER for this ballot. `failure` is set the moment we learn a delivery
+    // attempt did not land; `delivered` records that one demonstrably did. Both are consulted only on
+    // the deadline path — a seat that votes anyway needs no excuse for a lost nudge.
+    let failure = priorFailure || null
+    let delivered = false
     while (now() < deadlineAt) {
       let row = null
       try {
@@ -31607,7 +31645,27 @@ export function dispatchBallotVote(opts = {}) {
       }
       if (nudgeInfo && !nudged && now() >= nudgeAt) {
         nudged = true
-        try { nudge(nudgeInfo.agent, nudgeInfo.msg) } catch { /* best-effort — abstain-on-miss unchanged */ }
+        // DIVE-2220: this ONE nudge is, for a seat with no heartbeat, the only delivery that can
+        // actually wake it — the queued ballot task wakes nobody on its own. Its failure used to be
+        // swallowed TWICE over: the bare catch here discarded a throw, and the production nudge rail
+        // (nudgeSeatAgent) never throws at all — it RETURNS a failure — so the catch could not have
+        // fired in prod even once. Either way the seat fell through to the same 'no vote by deadline'
+        // string a genuinely-silent seat produces, and the receipt sealed captureFailed=0: an
+        // affirmative claim that nothing failed to be collected, over a seat we cannot show was ever
+        // asked. Record the outcome (both shapes) instead of discarding it.
+        let why = null
+        try {
+          const r = nudge(nudgeInfo.agent, nudgeInfo.msg)
+          if (r === false || (r && typeof r === 'object' && r.ok === false)) {
+            why = (r && r.why) ? String(r.why).replace(/\s+/g, ' ').slice(0, 140) : 'nudge rail reported failure'
+          }
+        } catch (e) { why = clip(e) }
+        if (why) {
+          failure = failure || { kind: 'nudge-failed', why: `mid-window nudge to ${nudgeInfo.agent} not delivered: ${why}` }
+          // Log it. Before this, a swallowed nudge was invisible even to an operator watching the
+          // convene live — its entire stderr was five lines of summary.
+          try { process.stderr.write(`[council] NUDGE FAILED — seat=${seat.id} agent=${nudgeInfo.agent} ballot=${taskId}: ${why}\n`) } catch { /* ignore */ }
+        } else delivered = true
       }
       await sleep(pollSecs * 1000)
     }
@@ -31617,7 +31675,19 @@ export function dispatchBallotVote(opts = {}) {
     // task may already be closed (a tap landed at the wire) or the cancel may race — either way the
     // seat's verdict is an abstain regardless, so a cancel gap never changes the tally.
     try { exec(['task', 'cancel', String(taskId), '--result=council ballot spent — no vote by deadline (== abstain); auto-cancelled on convene seal (CNCL-29)']) } catch { /* already closed / not cancellable — abstain stands */ }
-    return { vote: 'abstain', rationale: `${seat.id} ${kind} ${taskId}: no vote by deadline ${deadlineIso} (deadline/no-vote)` }
+    // DIVE-2220: a delivery attempt that we KNOW did not land makes this a CAPTURE failure, not an
+    // abstention. Tagged (capture:false) so captureAudit counts it, the verdict can refuse instead of
+    // sealing a clean-looking receipt, and the sealed `unreached:` line names the seat — the same
+    // treatment ballot-mint-failed already gets one branch away.
+    if (failure) {
+      return { vote: 'abstain', abstainKind: failure.kind, capture: false,
+               rationale: `CAPTURE FAILED (not an abstention) — ${seat.id} ${kind} ${taskId}: ${failure.why}; the seat cannot be shown to have been asked before the deadline ${deadlineIso}` }
+    }
+    // DIVE-2220: 'no vote by deadline' is a claim ABOUT THE SEAT, so it must carry what we can actually
+    // show about delivery. `nudged` says a wake reached the seat; `queued` says only that the ballot
+    // task was minted into its queue and the mid-window nudge never fired.
+    const told = nudgeInfo ? (delivered ? `; nudged ${nudgeInfo.agent} mid-window` : '; ballot queued, no mid-window nudge fired') : ''
+    return { vote: 'abstain', rationale: `${seat.id} ${kind} ${taskId}: no vote by deadline ${deadlineIso} (deadline/no-vote${told})` }
   }
   return async (seat, ctx) => {
     const prompt = E.seatPrompt(seat, ctx)   // blind in round 1 (engine-guaranteed)
@@ -31670,8 +31740,18 @@ export function dispatchBallotVote(opts = {}) {
       // Emit is an injectable, never-throws seam. The CLI cannot send an inline keyboard itself
       // (DIVE-1546); the concrete button delivery is the telegram plugin tap handler (DIVE-1566), which
       // consumes this exact payload. A delivery gap just leaves the task un-tapped -> abstain-on-miss.
-      try { await emitBallot(payload) } catch { /* best-effort: the missed-tap path is already an abstain */ }
-      return collect(seat, taskId, deadlineAt, deadlineIso, 'human ballot')
+      // DIVE-2220: an emit that THREW is a delivery failure — the buttons never went out — and must
+      // not resolve to the same untagged 'no vote by deadline' a human who saw the ballot and didn't
+      // tap produces. (A `{delivered:false}` RETURN is deliberately NOT treated as failure here: the
+      // default emit returns exactly that as a breadcrumb meaning "the plugin renders the buttons",
+      // so it does not distinguish an outage. That gap is real and stays open — see DIVE-2220.)
+      let emitFailure = null
+      try { await emitBallot(payload) } catch (e) { emitFailure = clip(e) }
+      if (emitFailure) {
+        try { process.stderr.write(`[council] BALLOT EMIT FAILED — seat=${seat.id} chat=${chat} ballot=${taskId}: ${emitFailure}\n`) } catch { /* ignore */ }
+      }
+      return collect(seat, taskId, deadlineAt, deadlineIso, 'human ballot', null,
+        emitFailure ? { kind: 'ballot-emit-failed', why: `Telegram ballot emit failed: ${emitFailure}` } : null)
     }
     // ---- agent seat (CNCL-18, unchanged) ----
     // CNCL-16: mint into the seat's REGISTRY agent (persona 'theo' -> 'marketing', etc.). Pre-flight
@@ -31908,9 +31988,16 @@ function nudgeSeatAgent(agent, msg) {
   const bin = process.env.COUNCIL_5DIVE_BIN || '5dive'
   try {
     execFileSync(bin, ['agent', 'send', String(agent), String(msg)],
-      { encoding: 'utf-8', timeout: 30000, stdio: ['ignore', 'ignore', 'ignore'] })
-    return true
-  } catch { return false }
+      { encoding: 'utf-8', timeout: 30000, stdio: ['ignore', 'pipe', 'pipe'] })
+    return { ok: true }
+  } catch (e) {
+    // DIVE-2220: report WHY, never a bare false. This rail is the only wake a heartbeat-less seat
+    // gets, so its failure has to be able to reach the receipt. stderr is piped (was `ignore`) purely
+    // so the reason is something a reader can act on; nothing is printed by this function itself.
+    const stderr = String((e && e.stderr) || '').replace(/\s+/g, ' ').trim()
+    const why = `${String((e && e.message) || e).replace(/\s+/g, ' ')}${stderr ? ` :: ${stderr}` : ''}`.slice(0, 140)
+    return { ok: false, why }
+  }
 }
 
 // DIVE-1739 (gate answer A — preserve strict 6/6, fix reliability operationally). Before a FULL-QUORUM
@@ -37687,6 +37774,11 @@ _hb_idle_marker() {
     claude)       printf '❯' ;;
     codex)        printf '›' ;;
     antigravity)  printf '? for shortcuts' ;;
+    # devin renders ❭ for BOTH the composer AND menu selections (the
+    # workspace-trust dialog is '❭ 1 Yes, trust …'), and ❭ U+276D sits two
+    # codepoints from claude's ❯ U+276F. Key off the composer placeholder
+    # instead: unambiguous, and it cannot match a menu row.
+    devin)        printf 'Ask Devin' ;;
     *)            printf '' ;;  # grok/opencode/unknown: byte-stability alone
   esac
 }
