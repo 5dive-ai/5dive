@@ -94,6 +94,31 @@ secret drop, supervisor), extend the matching harness in the same PR. New
 harnesses that follow the same pattern are very welcome; the biggest
 uncovered surfaces are the task core verbs and the agent lifecycle.
 
+**If you add a harness, it must name the tree it grades.** Every harness reads
+`src/` from the working tree by relative path, so a green log is a claim about
+whatever is on disk, not about a commit: a run against a stale checkout and a
+run against `origin/main` produce byte-identical output. Paste this immediately
+after `set -uo pipefail` in your new file (copy it verbatim from any existing
+harness, e.g. `tests/usage_coverage_unit.sh`):
+
+```bash
+# DIVE-2211: name the tree this harness grades (tests/lib/grading_tree.sh).
+. "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh" \
+  || printf 'grading tree: UNRESOLVED (tests/lib/grading_tree.sh not reachable; no tree named)\n' >&2
+```
+
+Keep the **absence** of `2>/dev/null` on that line, and keep the comment block
+that explains why: the helper writes its one line to stderr by design, so
+redirecting the source's stderr to hide bash's "No such file" also swallows the
+payload, silently, across the whole corpus.
+
+`tests/names_the_tree_contract_unit.sh` enforces this over `tests/*.sh` and
+prints the exact block to paste when it fails. Note that it is a **merge-order
+hazard**: it enumerates the corpus rather than a fixed list, so two PRs that are
+each green in isolation can red on merge, and whoever merges second inherits the
+failure. If CI reds on a harness you did not touch, rebase on `main` and add the
+block to the new file; that is the whole fix.
+
 Heavyweight smoke test: if you touched `install.sh`, `src/cmd_agent.sh`,
 `src/lib/agent_setup.sh`, or anything else on the agent-create path, a
 maintainer will run a full-VM smoke (provisions a real cloud box, runs the

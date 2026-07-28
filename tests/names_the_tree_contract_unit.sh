@@ -62,11 +62,12 @@ if (( ${#CORPUS[@]} < 50 )); then
 fi
 ok "corpus enumerates ${#CORPUS[@]} harnesses"
 
-MISSING=()
+MISSING=(); PRESENT=()
 for t in "${CORPUS[@]}"; do
   # The source line, whatever spelling: what matters is that this harness pulls
   # in the helper, so its log cannot be silent about which tree it graded.
   if grep -qE '(^|[[:space:]])(\.|source)[[:space:]].*lib/grading_tree\.sh' "$t"; then
+    PRESENT+=("$t")
     continue
   fi
   MISSING+=("$t")
@@ -77,6 +78,48 @@ if (( ${#MISSING[@]} == 0 )); then
 else
   nok "${#MISSING[@]} harness(es) do not source $HELPER -- their logs name no tree:"
   for m in "${MISSING[@]}"; do printf '       %s\n' "$m"; done
+
+  # STATE THE FIX, do not merely name the file.  A corpus-wide invariant is a
+  # STANDING OBLIGATION on every future harness author, and it is a MERGE-ORDER
+  # hazard: two PRs each green in isolation red on merge, and whoever merges
+  # second takes the hit through no fault of their own.  That author gets a red
+  # they did not cause, in a file they did not write, and if the message only
+  # names their file they will green it by whatever works -- which is exactly
+  # how the `2>/dev/null` spelling that silenced the whole corpus gets
+  # reintroduced.  The obligation ships WITH the invariant or the invariant
+  # decays.  See also CONTRIBUTING.md "Testing".
+  #
+  # The block is COPIED FROM A LIVE PASSING HARNESS at failure time rather than
+  # stored as a literal here.  Two reasons, both from this ticket: a stored copy
+  # is a second target that drifts out of sync with the corpus and nothing would
+  # grade the seam between them; and a literal source line in THIS file would
+  # match the grep above, so deleting this file's own call site would still
+  # report present -- the control weakened by the message that explains it.
+  SNIPPET=""; EXEMPLAR=""
+  for t in "${PRESENT[@]}"; do
+    [[ "$t" == "tests/names_the_tree_contract_unit.sh" ]] && continue
+    SNIPPET="$(awk '/^# DIVE-2211: name the tree/,/no tree named/' "$t")"
+    # An unclosed awk range runs to EOF and would dump a whole harness, so the
+    # extraction has to be confirmed, not assumed.
+    if [[ -n "$SNIPPET" ]] \
+       && [[ "$(printf '%s\n' "$SNIPPET" | wc -l)" -le 15 ]] \
+       && printf '%s\n' "$SNIPPET" | grep -q 'no tree named'; then
+      EXEMPLAR="$t"
+      break
+    fi
+    SNIPPET=""
+  done
+  # Could-not-run is its own branch here too: if no exemplar can be extracted,
+  # say that instead of printing an empty fix that reads like there isn't one.
+  if [[ -n "$SNIPPET" ]]; then
+    printf '\n       FIX -- paste this immediately after `set -uo pipefail`, copied verbatim from %s:\n\n' "$EXEMPLAR"
+    printf '%s\n' "$SNIPPET" | sed 's/^/           /'
+    printf '\n       Keep the ABSENCE of `2>/dev/null` on the source line: it would swallow the\n'
+    printf '       helper stderr line, which IS the payload, and no other check would notice.\n'
+  else
+    printf '\n       FIX -- could not extract the canonical block from any passing harness;\n'
+    printf '       copy the lines following `set -uo pipefail` in tests/grading_tree_unit.sh.\n'
+  fi
 fi
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
