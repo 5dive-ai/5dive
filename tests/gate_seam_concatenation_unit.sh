@@ -172,6 +172,63 @@ cmd_task_need DIVE-807 --type=decision --from=dev \
 assert_lead_routed DIVE-807 "non-vacuity: a REAL internal-ops TITLE (verb+object in one field) still downgrades"
 
 # =============================================================================
+# DOWN DIRECTION, the OTHER TWO downgrade classifiers.
+#
+# WHY THESE EXIST. The seam change touches SEVEN call sites, but arms (1)-(7) above
+# drive only the floor, the routing arm and internal-ops. Measured: regressing the
+# CURATION site (:4272) and the ENG-SHIP site (:4390) back to the joined string is
+# caught by NOTHING -- this suite stayed 17/0, tests/gate_ship_routing_unit.sh and
+# tests/gate_tier2_explicit_pin_unit.sh both stayed rc=0. Two of the seven sites were
+# CHANGED BUT UNGRADED, sitting in the same commit as five graded ones and looking
+# equally covered. That is the same shape as an assertion with no demonstrated effect
+# (DIVE-2250, main): ask which arms are parameterised over the thing under test and
+# which are hard-coded to one instance of it.
+#
+# Both classifiers DOWNGRADE, so a phantom here REMOVES a human -- the dangerous
+# direction. The tier alone cannot see it: a phantom and a control both land tier 1,
+# and only the ROUTING differs. assert_not_routed grades that, because
+# assert_not_floored would have passed on the broken code.
+# =============================================================================
+
+# not lead-routed: tier 1 with NO reviewer. The human still gets it. This is the
+# distinction assert_not_floored cannot make -- both states are tier 1.
+assert_not_routed() { # <ident> <label>
+  local id="$1" lbl="$2" t r; t=$(tierof "$id"); r=$(routedof "$id")
+  [[ "$t" == "1" && -z "$r" ]] \
+    && ok_t "$lbl" || bad_t "$lbl" "tier='$t' routed='$r' human=$HUMAN_PINGED"
+}
+
+# (7a) ENG-SHIP PHANTOM. `push[^.]*github` is a bounded-distance pattern: 'push' ends
+#      the ask, 'github' opens the title, and the window closes over the join. Neither
+#      field is about shipping anything. A phantom hit here routes the gate to the lead
+#      BY KIND, bypassing the pref -- it removes the human from a gate nobody
+#      classified as engineering.
+route_reset; seed DIVE-861 'github outage postmortem, customer impact'
+cmd_task_need DIVE-861 --type=decision --from=dev \
+  --ask="approve the push" --options="A|B" --recommend="A" >/dev/null 2>&1
+assert_not_routed DIVE-861 "seam: 'push' in ask + 'github' in title does NOT fabricate an ENG-SHIP downgrade"
+
+# (7b) NON-VACUITY for (7a): a REAL eng-ship ask must still route to the lead. Without
+#      this, (7a) passes by breaking the DIVE-1359 eng-ship class outright.
+route_reset; seed DIVE-862 'onboarding rewrite'
+cmd_task_need DIVE-862 --type=decision --from=dev \
+  --ask="approve the merge of the release branch" --options="A|B" --recommend="A" >/dev/null 2>&1
+assert_lead_routed DIVE-862 "non-vacuity: a REAL eng-ship ask (one field) still routes to the lead"
+
+# (7c) CURATION PHANTOM. `ready for the (queue|drip)` spans the seam: 'ready for the'
+#      ends the ask, 'queue' opens the title. Neither field is about content curation.
+route_reset; seed DIVE-863 'queue of open support tickets'
+cmd_task_need DIVE-863 --type=decision --from=dev \
+  --ask="is this ready for the" --options="A|B" --recommend="A" >/dev/null 2>&1
+assert_not_routed DIVE-863 "seam: 'ready for the' in ask + 'queue' in title does NOT fabricate a CURATION downgrade"
+
+# (7d) NON-VACUITY for (7c): a REAL curation ask must still route to the reviewer.
+route_reset; seed DIVE-864 'onboarding rewrite'
+cmd_task_need DIVE-864 --type=decision --from=dev \
+  --ask="approve the persona card for the drip queue" --options="A|B" --recommend="A" >/dev/null 2>&1
+assert_lead_routed DIVE-864 "non-vacuity: a REAL curation ask (one field) still routes to the reviewer"
+
+# =============================================================================
 # PART 2 — the ASK is the subject, and the EMPTY-ASK FALLBACK is load-bearing
 # =============================================================================
 
