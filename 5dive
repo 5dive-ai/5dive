@@ -21409,19 +21409,31 @@ _task_status_cmd() {
         # DIVE-2051: work provably 0 commits ahead of main, no PR possible (its diff
         # would be EMPTY), and the gate refused forever. That is unsatisfiable, not
         # strict, and it is the standing shape of every delegated push.
-        #   Ancestry PASSING is sufficient. Ancestry FAILING is a no-op — it falls
-        # through to 2, and only BOTH failing refuses. That fall-through is
-        # load-bearing, not defensive dressing: a SQUASH-merged branch tip is NOT an
-        # ancestor of main even though its content is in, so a squash-merged delivery
-        # must keep closing on its merged PR exactly as before. Neither check can
-        # veto the other; this adds an acceptance path and removes none.
-        #   ANCESTRY IS NOT ENOUGH ON ITS OWN (main, pre-merge): a branch with ZERO
-        # commits has a tip that IS a commit on main, so it is trivially an ancestor
-        # and would close a task that delivered nothing. Acceptance therefore needs
-        # BOTH halves — the tip is on main AND something reachable from it is
-        # attributable to this ident (_gate_branch_ident_on_main). Neither half alone
-        # closes anything.
-        local _slug _bmerged="" _searched="" _banc="" _anc="" _attr="" _anc_novac="" _attr_bound="" _attr_walked=""
+        #   DIVE-2184 — THIS PARAGRAPH USED TO DESCRIBE PRE-DIVE-2120 SEMANTICS AND WAS
+        # FALSE. It said "Ancestry PASSING is sufficient" and "Acceptance needs BOTH
+        # halves ... Neither half alone closes anything". Both are wrong now, and the
+        # wrong version is what the close message was written against, which is how it
+        # came to claim ancestry for a squash-merged PR. Corrected against MEASUREMENT,
+        # not reading (olivia, DIVE-2184 iteration 1):
+        #   * stub _gate_branch_ident_on_main to 0, leave ancestry passing -> the
+        #     ancestor case REFUSES. Attribution is NECESSARY.
+        #   * stub _gate_branch_ancestry to 0, leave attribution passing -> the same
+        #     case still CLOSES. Ancestry is neither necessary nor sufficient.
+        #   SO: SINCE DIVE-2120, ATTRIBUTION IS THE ONLY THING THAT ACCEPTS on this
+        # path — some commit reachable from main names this ident in its subject
+        # (_gate_branch_ident_on_main). _gate_branch_ancestry survives as diagnostic
+        # context in the refusal text; it cannot close anything on its own. If you are
+        # changing acceptance, change attribution — ancestry is not a lever any more.
+        #   The empty-branch hazard the old text worried about is still covered, by
+        # attribution alone rather than by a second half: a branch with ZERO commits
+        # has a tip that IS on main, so ancestry is trivially true of it, but no commit
+        # names the ident, so it is refused. That is why vacuity is structurally
+        # impossible here instead of separately guarded.
+        #   Squash-merges still close, and this is the case that produced the ticket:
+        # a squash rewrites the sha, so the branch tip is NOT an ancestor of main even
+        # though the content is in. Attribution finds it anyway, because the squash
+        # commit subject carries the ident.
+        local _slug _bmerged="" _searched="" _attr_slug="" _anc="" _attr="" _anc_novac="" _attr_bound="" _attr_walked=""
         while IFS= read -r _slug; do
           [[ -n "$_slug" ]] || continue
           _searched="${_searched:+$_searched, }$_slug"
@@ -21432,7 +21444,7 @@ _task_status_cmd() {
           # to establish. Vacuity becomes structurally impossible rather than separately
           # guarded — an empty branch contributes no such commit.
           _attr=$(_gate_branch_ident_on_main "$_slug" "$_branch" "$_ghtok" "$ident")
-          if [[ "$_attr" == "1" ]]; then _banc="$_slug"; break; fi
+          if [[ "$_attr" == "1" ]]; then _attr_slug="$_slug"; break; fi
           # bound:<walked> — carry the MEASURED count into the refusal. The number in
           # that message is the one thing a reader acts on, so it must be what the scan
           # actually walked and not what it was configured to want.
@@ -21445,11 +21457,22 @@ _task_status_cmd() {
           [[ -n "$_bmerged" && "$_bmerged" != "null" ]] && break
           _bmerged=""
         done < <(if [[ -n "$_task_slug" ]]; then printf '%s\n' "$_task_slug"; else _gate_repo_slugs; fi)
-        if [[ -n "$_banc" ]]; then
+        if [[ -n "$_attr_slug" ]]; then
           # Say WHICH evidence closed it. A close that passed on ancestry and one that
           # passed on a merged PR are different records, and the reader of the record
           # months later cannot tell them apart from a clean exit (DIVE-1869 rule).
-          warn "$ident: branch '$_branch' is an ANCESTOR of ${FIVE_GATE_MAIN_BRANCH:-main} in $_banc — its commits are all on main (no PR needed; delegated push, DIVE-2101). done=merged-to-main satisfied."
+          # DIVE-2184: this branch accepts on ATTRIBUTION, not ancestry. The variable
+          # feeding it is set by _gate_branch_ident_on_main; _gate_branch_ancestry was
+          # demoted by DIVE-2120 and can no longer accept anything. The message claimed
+          # ancestry anyway, and asserted "no PR needed; delegated push" — both false for
+          # DIVE-2102, which closed via SQUASH-MERGED PR #248 whose tip is not an ancestor
+          # of main at all. The comment directly above already demanded this say WHICH
+          # evidence closed it; it named the wrong one.
+          #
+          # Attribution CANNOT distinguish a delegated push from a squash-merged PR — a
+          # squash rewrites the sha, so both look identical to a subject scan. So this
+          # states what was measured and claims neither route.
+          warn "$ident: a commit on ${FIVE_GATE_MAIN_BRANCH:-main} in $_attr_slug names $ident in its SUBJECT — the work is on main (attribution, DIVE-2120). This does NOT establish HOW it landed: a delegated push and a squash-merged PR are indistinguishable to a subject scan, because a squash rewrites the sha. done=merged-to-main satisfied."
         elif [[ -n "$_attr_bound" && -z "$_bmerged" ]]; then
           # DIVE-2120: the scan stopped AT THE BOUND without finding the ident. That is NOT
           # a miss and must not read as one — a bounded search whose negative looks like an
