@@ -58,10 +58,34 @@ answeredby(){ db "SELECT COALESCE(need_answered_by,'') FROM tasks WHERE ident='$
 # =============================================================================
 export FIVEDIVE_PROD_TASKS_DB="$TASKS_DB"
 
+# DIVE-2235 — the class this file drives changed from approval to decision.
+# Tier 0 IS an auto-answer, and class now outranks tier: approval/manual/access/
+# secret are human-class and are floored to tier 1 instead of auto-clearing,
+# whatever tier they were pinned to. `decision` is the one class that still
+# auto-clears at tier 0 (deliberately out of the human class pending v0.18), so
+# it is what keeps the DIVE-2062 coverage of this branch alive. Case 0 below
+# grades the approval side, so the old behaviour is not merely deleted from the
+# suite — it is asserted to have changed.
+#
+# 0: a human-class gate pinned to tier 0 is floored and left for a person.
+seed DIVE-0
+cmd_task_need DIVE-0 --type=approval --tier=0 --recommend="approved" \
+  --ask="ok to proceed?" --from=dev >/dev/null 2>&1
+[[ "$(db "SELECT COUNT(*) FROM tasks WHERE ident='DIVE-0';")" == "1" \
+   && "$(db "SELECT COALESCE(need_type,'') FROM tasks WHERE ident='DIVE-0';")" == "approval" ]] \
+  && ok_t "class-over-tier: the approval gate was filed (the negatives below read a real row)" \
+  || bad_t "approval gate filed" "type=$(db "SELECT COALESCE(need_type,'∅') FROM tasks WHERE ident='DIVE-0';")"
+[[ "$(db "SELECT COALESCE(tier,'∅') FROM tasks WHERE ident='DIVE-0';")" == "1" ]] \
+  && ok_t "class-over-tier: approval pinned to tier 0 is floored to tier 1" \
+  || bad_t "approval floored" "tier=$(db "SELECT COALESCE(tier,'∅') FROM tasks WHERE ident='DIVE-0';")"
+[[ -z "$(answerof DIVE-0)" && "$(answeredby DIVE-0)" == "" && "$(statusof DIVE-0)" == "blocked" ]] \
+  && ok_t "class-over-tier: approval is NOT auto-applied and stays blocked for a human" \
+  || bad_t "approval must not auto-apply" "answer=$(answerof DIVE-0) by=$(answeredby DIVE-0) status=$(statusof DIVE-0)"
+
 # 1: tier-0 with no dependents auto-applies the recommendation AND unblocks.
 seed DIVE-1
-out=$(cmd_task_need DIVE-1 --type=approval --tier=0 --recommend="approved" \
-  --ask="ok to proceed?" --from=dev 2>"$TMP/err1")
+out=$(cmd_task_need DIVE-1 --type=decision --tier=0 --recommend="approved" \
+  --options="approved|rejected" --ask="ok to proceed?" --from=dev 2>"$TMP/err1")
 [[ "$(printf '%s' "$out" | jf '.data.tier')" == "0" \
    && "$(printf '%s' "$out" | jf '.data.auto_applied')" == "approved" ]] \
   && ok_t "tier-0 gate reports auto_applied in its envelope" \
@@ -72,14 +96,14 @@ out=$(cmd_task_need DIVE-1 --type=approval --tier=0 --recommend="approved" \
 [[ "$(statusof DIVE-1)" == "todo" ]] \
   && ok_t "with no blocking dep, the task returns straight to todo (never pings a human)" \
   || bad_t "unblocked to todo" "status=$(statusof DIVE-1)"
-grep -q 'task need t0-auto.*task=DIVE-1.*type=approval.*applied=approved' "$AUDIT_CALLS" \
+grep -q 'task need t0-auto.*task=DIVE-1.*type=decision.*applied=approved' "$AUDIT_CALLS" \
   && ok_t "on-store: the auto-clear is audited with the applied value" \
   || bad_t "on-store audit row" "$(cat "$AUDIT_CALLS")"
 
 # 2: --tier=0 requires --recommend (usage guard, not the fence — quick sanity so
 #    the case above isn't accidentally exercising a permissive branch).
 seed DIVE-2
-out=$(cmd_task_need DIVE-2 --type=approval --tier=0 --ask="ok?" --from=dev 2>&1); rc=$?
+out=$(cmd_task_need DIVE-2 --type=decision --tier=0 --options="yes|no" --ask="ok?" --from=dev 2>&1); rc=$?
 [[ $rc -ne 0 && "$out" == *"--recommend is required"* ]] \
   && ok_t "tier=0 without --recommend is refused up front (nothing to auto-apply)" \
   || bad_t "tier0 needs recommend" "rc=$rc out=$out"
@@ -93,8 +117,8 @@ db "UPDATE tasks SET status='in_progress' WHERE ident='DIVE-3-BLOCKER';"
 blocker_id=$(db "SELECT id FROM tasks WHERE ident='DIVE-3-BLOCKER';")
 target_id=$(db "SELECT id FROM tasks WHERE ident='DIVE-3';")
 db "INSERT INTO task_deps (task_id, blocked_by) VALUES (${target_id}, ${blocker_id});"
-cmd_task_need DIVE-3 --type=approval --tier=0 --recommend="approved" \
-  --ask="ok?" --from=dev >/dev/null 2>&1
+cmd_task_need DIVE-3 --type=decision --tier=0 --recommend="approved" \
+  --options="approved|rejected" --ask="ok?" --from=dev >/dev/null 2>&1
 [[ "$(answerof DIVE-3)" == "approved" && "$(statusof DIVE-3)" == "blocked" ]] \
   && ok_t "tier-0 auto-applies the answer even while a dependency still blocks the status flip" \
   || bad_t "dep-blocked tier0" "answer=$(answerof DIVE-3) status=$(statusof DIVE-3)"
@@ -108,8 +132,8 @@ cmd_task_need DIVE-3 --type=approval --tier=0 --recommend="approved" \
 unset _TASK_STORE_AUDIT_FENCED
 export FIVEDIVE_PROD_TASKS_DB="$TMP/somewhere-else/tasks.db"
 seed DIVE-4
-cmd_task_need DIVE-4 --type=approval --tier=0 --recommend="approved" \
-  --ask="ok?" --from=dev >/dev/null 2>"$TMP/offstore.err"
+cmd_task_need DIVE-4 --type=decision --tier=0 --recommend="approved" \
+  --options="approved|rejected" --ask="ok?" --from=dev >/dev/null 2>"$TMP/offstore.err"
 [[ "$(answerof DIVE-4)" == "approved" ]] \
   && ok_t "off-store: the auto-clear itself still applies (fail-open on the WRITE side — this is task-store state, not telemetry)" \
   || bad_t "off-store auto-clear still applies" "answer=$(answerof DIVE-4)"

@@ -70,6 +70,23 @@ bad_t() { FAIL=$((FAIL+1)); printf 'FAIL - %s\n   %s\n' "$1" "${2:-}"; }
 eq_t()  { if [[ "$2" == "$3" ]]; then ok_t "$1"; else bad_t "$1" "want [$3] got [$2]"; fi; }
 field() { db "SELECT COALESCE($2,'∅') FROM tasks WHERE ident='$1';"; }
 
+# ∅ IS NOT ONE STATE. field() renders COALESCE(col,'∅'), so '∅' is returned both
+# when the column is NULL and when NO ROW MATCHED — and sqlite returns the empty
+# set silently, rc 0. Every negative below ("was not auto-answered", "was not
+# created") therefore reads ∅ identically against a fixture that was never built
+# and against a guard that held. That is the DIVE-2114 vacuous-control shape, and
+# it is not hypothetical here: this harness shipped with `>/tmp/gcot3.out`, a
+# fixed path outside $TMP. /tmp is sticky, so whoever ran the suite first owned
+# the file and every OTHER user's redirect failed with EACCES — and a failed
+# redirection means bash never runs the command at all. cmd_task_need was never
+# invoked, the row kept the tier NULL that seed_task left, and the assertion read
+# ∅. The harness was green for its author and red for main, root and claude.
+#
+# So: assert EXISTENCE separately from any field, and pair every ∅ with a
+# POSITIVE reading off the same row that only a live command could have written.
+rows()  { db "SELECT COUNT(*) FROM tasks WHERE ident='$1';"; }
+exists_t() { eq_t "$2" "$(rows "$1")" "1"; }
+
 # ==================== part 1: the 48h TTL sweep (writer 1) ===================
 # One aged tier-1 gate per class, all with a recommendation, all filed 50h ago,
 # all swept on the SAME _hb_gate_ttl_sweep call. Whatever the sweep does, it does
@@ -94,6 +111,12 @@ eq_t "TTL control: decision answer is the recommendation" \
      "$(field TTL-decision need_answer)" "yes"
 
 for t in approval manual access secret; do
+  # Existence + a positive reading FIRST: the two ∅s below are only evidence that
+  # the sweep declined to answer this row if the row is there and is still the
+  # aged tier-1 gate of that class the sweep was offered.
+  exists_t "TTL-$t" "TTL: tier-1 ${t} row exists (the ∅s below are about a real row)"
+  eq_t "TTL: tier-1 ${t} is still an aged gate of its class" \
+       "$(field "TTL-$t" need_type)|$(field "TTL-$t" tier)|$(field "TTL-$t" recommend)" "${t}|1|yes"
   eq_t "TTL: tier-1 ${t} is NOT auto-applied (human class)" \
        "$(field "TTL-$t" need_answered_by)" "∅"
   eq_t "TTL: tier-1 ${t} left unanswered" \
@@ -104,17 +127,51 @@ done
 # 72h stale-gate reminder picks them up — otherwise a tier-1 approval WITH a
 # recommendation is an orphan: never applied, never reminded, invisible. The
 # reminder predicate used to cover tier-1 only when recommend IS NULL, which is
-# exactly the row shape above. Grade the predicate the sweep actually uses.
-_t2_reminder_hits() { # <ident>
-  db "SELECT COUNT(*) FROM tasks
-      WHERE ident='$1' AND need_type IS NOT NULL AND need_answered_at IS NULL
-        AND (tier IS NULL OR tier=2 OR (tier=1 AND recommend IS NULL)
-             OR (tier=1 AND need_type IN ${_GATE_HUMAN_CLASS_SQL}))
-        AND status NOT IN ('done','cancelled');"
+# exactly the row shape above.
+#
+# GRADE THE SHIPPED PREDICATE, NOT A COPY OF IT. The first version of this block
+# re-declared _t2_where's SQL here and counted rows against the local copy. It
+# was green — and it stayed green when the arm was DELETED from
+# cmd_heartbeat.sh, because nothing in it ever read cmd_heartbeat.sh. A test
+# that reimplements the thing it grades cannot fail for the reason it exists.
+# So: age a fresh set past 72h, run the REAL sweep, and read what the reminder
+# actually addressed.
+REMINDERS="$TMP/reminders"; : >"$REMINDERS"
+_task_send_owner() { printf '%s\n' "$1" >>"$REMINDERS"; return 0; }
+
+mk_stale() { # <ident> <need_type> — 80h old, past the 72h reminder threshold
+  db "INSERT INTO tasks (ident, title, priority, assignee, created_by, kind, status,
+                         need_type, tier, ask, recommend, need_asked_at, gate_pinged_at)
+      VALUES ('$1', 'stale gate', 'medium', 'worker', 'main', 'standard', 'blocked',
+              '$2', 1, 'the ask', 'yes', datetime('now','-80 hours'), NULL);"
 }
+for t in decision approval manual access secret; do
+  mk_stale "REM-$t" "$t"
+done
+
+_hb_gate_ttl_sweep
+
+# CONTROL FIRST, again, and it is a two-sided one: the decision gate must be
+# RESOLVED by pass 2 rather than reminded about, which is what proves the two
+# predicates are complementary rather than merely both-true. If REM-decision
+# showed up in the reminder text, the sweep would be nagging about gates it had
+# just answered.
+eq_t "reminder control: stale tier-1 DECISION was TTL-applied, not reminded" \
+     "$(field REM-decision need_answered_by)" "auto:ttl"
+grep -q 'REM-decision' "$REMINDERS" \
+  && bad_t "reminder control: decision must NOT be in the reminder" "it was TTL-applied; nagging about it is a double-handling bug" \
+  || ok_t "reminder control: the TTL-applied decision is absent from the reminder"
+[[ -s "$REMINDERS" ]] \
+  && ok_t "reminder: the 72h stale-gate reminder fired at all (the greps below are live)" \
+  || bad_t "reminder never fired" "_task_send_owner was not called — every grep below would pass vacuously"
+
 for t in approval manual access secret; do
-  eq_t "TTL: tier-1 ${t} is reminder-eligible (not orphaned)" \
-       "$(_t2_reminder_hits "TTL-$t")" "1"
+  exists_t "REM-$t" "reminder: stale tier-1 ${t} row exists"
+  eq_t "reminder: stale tier-1 ${t} was NOT TTL-applied" \
+       "$(field "REM-$t" need_answered_by)" "∅"
+  grep -q "REM-$t" "$REMINDERS" \
+    && ok_t "reminder: tier-1 ${t} IS named in the stale-gate reminder (not orphaned)" \
+    || bad_t "reminder: tier-1 ${t} orphaned" "not applied by the TTL sweep and not named in the reminder text: $(cat "$REMINDERS")"
 done
 
 # ==================== part 2: tier-0 apply-at-file (writer 2) ================
@@ -144,7 +201,14 @@ eq_t "T0 control: decision tier stays 0" "$(field DIVE-2300 tier)" "0"
 # untested class.
 seed_task DIVE-2301
 ( cmd_task_need DIVE-2301 --type=approval --tier=0 --ask="do the routine thing" \
-    --recommend="yes" ) >/dev/null 2>&1
+    --recommend="yes" ) >"$TMP/t0-approval.out" 2>&1
+# LIVENESS before the negative: the gate must actually have been FILED. Without
+# this, "approval is NOT auto-answered" passes just as happily when cmd_task_need
+# never ran — which is precisely how this file used to go red for everyone but
+# its author.
+exists_t DIVE-2301 "T0: approval task row exists"
+eq_t "T0: approval gate was actually filed (cmd_task_need ran)" \
+     "$(field DIVE-2301 need_type)" "approval"
 eq_t "T0: approval pinned to tier 0 is floored to tier 1" "$(field DIVE-2301 tier)" "1"
 eq_t "T0: approval is NOT auto-answered"     "$(field DIVE-2301 need_answered_at)" "∅"
 eq_t "T0: approval left blocked for a human" "$(field DIVE-2301 status)"           "blocked"
@@ -153,12 +217,20 @@ n=2310
 for t in manual access; do
   n=$((n+1)); id="DIVE-$n"
   seed_task "$id"
-  ( cmd_task_need "$id" --type="$t" --tier=0 --ask="do the routine thing" ) >/dev/null 2>&1
+  ( cmd_task_need "$id" --type="$t" --tier=0 --ask="do the routine thing" ) >"$TMP/t0-$t.out" 2>&1
   rc=$?
   [[ "$rc" -ne 0 ]] \
     && ok_t "T0: ${t} cannot be filed at tier 0 at all (arg validation refuses)" \
     || bad_t "T0: ${t} cannot be filed at tier 0" "cmd_task_need returned 0"
+  # The refusal must be a REFUSAL, not an absence. The task row has to be there
+  # (so ∅ means "the column is NULL", not "there is nothing to read"), and the
+  # command has to have said why — a non-zero rc with no output is what a failed
+  # redirect or a missing binary looks like, and both would pass the rc check.
+  exists_t "$id" "T0: ${t} task row exists (so the ∅ below is a NULL column)"
   eq_t "T0: ${t} gate was not created"  "$(field "$id" need_type)" "∅"
+  [[ -s "$TMP/t0-$t.out" ]] \
+    && ok_t "T0: ${t} refusal is spoken, not silent" \
+    || bad_t "T0: ${t} refusal is spoken" "cmd_task_need produced no output — rc alone cannot tell a refusal from a command that never ran"
 done
 
 # secret is the exception and lands one layer earlier: --tier=0 is accepted (a
@@ -168,8 +240,19 @@ done
 # DIFFERENT reason than approval's, and a reader who assumes the class floor did
 # it would be wrong about which guard is load-bearing.
 seed_task DIVE-2320
-( cmd_task_need DIVE-2320 --type=secret --tier=0 --ask="drop the api key" ) >/tmp/gcot3.out 2>&1
+# $TMP, never a fixed /tmp path — see the ∅ note above. This one line is what
+# made the harness pass for its author and fail for main, root and claude.
+( cmd_task_need DIVE-2320 --type=secret --tier=0 --ask="drop the api key" ) >"$TMP/t0-secret.out" 2>&1
+exists_t DIVE-2320 "T0: secret task row exists"
+eq_t "T0: secret gate was actually filed (cmd_task_need ran)" \
+     "$(field DIVE-2320 need_type)" "secret"
+# The floored tier is PERSISTED, not merely reported. The envelope says tier 2;
+# this reads the column back, because a response that disagrees with the row is
+# this ticket's own defect one layer over.
 eq_t "T0: secret is re-tiered above 0 by the T2 floor" "$(field DIVE-2320 tier)" "2"
+grep -q 'FORCED to tier 2' "$TMP/t0-secret.out" \
+  && ok_t "T0: the T2 keyword floor is the guard that fired (announced on stderr)" \
+  || bad_t "T0: T2 floor announced" "no 'FORCED to tier 2' in the captured output"
 eq_t "T0: secret is NOT auto-answered"                 "$(field DIVE-2320 need_answered_at)" "∅"
 
 # The floor must be OBSERVABLE, not just correct. A silent re-tier is the same
