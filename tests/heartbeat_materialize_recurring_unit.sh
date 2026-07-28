@@ -121,5 +121,118 @@ else
   bad_t "task ls --recurring --all shows every template" "$all_list"
 fi
 
+# ---------------------------------------------------------------------------
+# DIVE-2237: a SKIP must leave a trace on the row, not only in _hb_log.
+#
+# The dedup itself is unchanged and is not under test here — what is under test
+# is whether the board can tell "the materializer looked at this template and
+# declined" apart from "the scheduler never reached it". Before this change both
+# readings were the same one: a stale last_fired_at.
+#
+# NOTE ON THE CLOCK. _hb_materialize_recurring has a same-minute guard that
+# `continue`s BEFORE the dedup check, so two passes in one wall-clock minute
+# would never reach the skip branch and every arm below would be vacuously
+# green. Each pass is therefore handed a `now` two minutes after the last, and
+# the cron is '* * * * *' so it still matches.
+last_skipped_of() { db "SELECT COALESCE(last_skipped_at,'') FROM tasks WHERE id=${1};"; }
+ident_of_instance() { db "SELECT ident FROM tasks WHERE from_template_id=${1} ORDER BY id LIMIT 1;"; }
+
+t_sup=$(mk_template "suppressed template" todo)
+t0=$(date -u +%s)
+
+# Pass 1 — nothing open yet, so it fires. This is also the ANCHOR for the skip
+# stamp: the FIRE path must not touch last_skipped_at, or a non-empty value
+# below would prove nothing about the skip path.
+_hb_materialize_recurring "$t0"
+if [[ "$(instances_of "$t_sup")" == "1" ]]; then
+  ok_t "2237 anchor: first pass fires (one instance)"
+else
+  bad_t "2237 anchor: first pass fires (one instance)" "got $(instances_of "$t_sup")"
+fi
+if [[ -z "$(last_skipped_of "$t_sup")" ]]; then
+  ok_t "2237 anchor: a FIRE does not stamp last_skipped_at"
+else
+  bad_t "2237 anchor: a FIRE does not stamp last_skipped_at" "got $(last_skipped_of "$t_sup")"
+fi
+
+# Differential for the last_fired arm. Both passes land in the same wall-clock
+# second, so "unchanged" would be trivially true even if the skip path DID
+# write last_fired_at = datetime('now'). Park it on a sentinel first: any write
+# by the skip path now shows up as a value that is obviously not the sentinel.
+# (The sentinel is far in the past, so the same-minute guard still lets the
+# pass through to the dedup.)
+SENTINEL='2000-01-01 00:00:00'
+db "UPDATE tasks SET last_fired_at='${SENTINEL}' WHERE id=${t_sup};" >/dev/null
+
+# Pass 2 — the pass-1 instance is still open, so this is the skip.
+_hb_materialize_recurring "$((t0 + 120))"
+if [[ "$(instances_of "$t_sup")" == "1" ]]; then
+  ok_t "2237 skip: open instance still suppresses the fire (dedup unchanged)"
+else
+  bad_t "2237 skip: open instance still suppresses the fire (dedup unchanged)" \
+        "expected 1 instance, got $(instances_of "$t_sup")"
+fi
+if [[ "$(last_fired_of "$t_sup")" == "$SENTINEL" ]]; then
+  ok_t "2237 skip: last_fired_at is NOT advanced by a skip"
+else
+  bad_t "2237 skip: last_fired_at is NOT advanced by a skip" \
+        "sentinel was '${SENTINEL}', now '$(last_fired_of "$t_sup")'"
+fi
+skipped_after_skip=$(last_skipped_of "$t_sup")
+if [[ -n "$skipped_after_skip" ]]; then
+  ok_t "2237 skip: last_skipped_at IS stamped"
+else
+  bad_t "2237 skip: last_skipped_at IS stamped" "still empty after a skipped tick"
+fi
+
+# The listing is the surface. Both renderers, because this harness runs with
+# JSON_MODE=1 and would otherwise never execute the -box branch at all.
+inst_ident=$(ident_of_instance "$t_sup")
+json_list=$(cmd_task_ls --recurring)
+JSON_MODE=0 box_list=$(cmd_task_ls --recurring)
+
+if grep -q '"last_skipped_at"' <<<"$json_list" \
+   && [[ "$(jq -r --arg i "$inst_ident" '.data.tasks[] | select(.title=="suppressed template") | .blocked_by' <<<"$json_list")" == "$inst_ident" ]]; then
+  ok_t "2237 surface: --json carries last_skipped_at + names the blocking instance"
+else
+  bad_t "2237 surface: --json carries last_skipped_at + names the blocking instance" "$json_list"
+fi
+if grep -q 'last_skipped' <<<"$box_list" && grep -q 'blocked_by' <<<"$box_list" \
+   && grep -q "$inst_ident" <<<"$box_list"; then
+  ok_t "2237 surface: task ls --recurring table shows the skip + the blocker"
+else
+  bad_t "2237 surface: task ls --recurring table shows the skip + the blocker" "$box_list"
+fi
+# Liveness for that box arm: a template with NO open instance must NOT be
+# reported as blocked, or the two greps above would pass on a table that marks
+# everything.
+if [[ "$(awk -v t='todo template' '$0 ~ t' <<<"$box_list" | grep -c "$inst_ident")" == "0" ]]; then
+  ok_t "2237 surface: an unblocked template is not marked blocked"
+else
+  bad_t "2237 surface: an unblocked template is not marked blocked" "$box_list"
+fi
+
+# Pass 3 — close the blocker; the template must fire again, and the historical
+# skip stamp must survive (it records what happened, it is not a live flag).
+db "UPDATE tasks SET status='done' WHERE from_template_id=${t_sup};" >/dev/null
+_hb_materialize_recurring "$((t0 + 240))"
+if [[ "$(instances_of "$t_sup")" == "2" ]]; then
+  ok_t "2237 recovery: closing the blocker lets the template fire again"
+else
+  bad_t "2237 recovery: closing the blocker lets the template fire again" \
+        "expected 2 instances, got $(instances_of "$t_sup")"
+fi
+if [[ "$(last_fired_of "$t_sup")" != "$SENTINEL" ]]; then
+  ok_t "2237 recovery: a real fire DOES advance last_fired_at"
+else
+  bad_t "2237 recovery: a real fire DOES advance last_fired_at" "still on the sentinel"
+fi
+if [[ "$(last_skipped_of "$t_sup")" == "$skipped_after_skip" ]]; then
+  ok_t "2237 recovery: the fire leaves the skip history intact"
+else
+  bad_t "2237 recovery: the fire leaves the skip history intact" \
+        "was '${skipped_after_skip}', now '$(last_skipped_of "$t_sup")'"
+fi
+
 echo "-- ${PASS} passed, ${FAIL} failed --"
 [[ $FAIL -eq 0 ]]

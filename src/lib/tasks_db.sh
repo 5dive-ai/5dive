@@ -162,6 +162,16 @@ CREATE TABLE IF NOT EXISTS tasks (
   kind             TEXT NOT NULL DEFAULT 'standard',
   schedule         TEXT,
   last_fired_at    TEXT,
+  -- DIVE-2237. last_fired_at moves ONLY on a successful INSERT, so a template
+  -- the materializer looked at and declined to fire (skip-if-open dedup) is
+  -- indistinguishable on the board from a template the scheduler never reached
+  -- -- box down, cron wrong, heartbeat dead. last_skipped_at is the other half
+  -- of that reading: stamped every tick the template was DUE and deliberately
+  -- suppressed. Recent last_skipped_at + stale last_fired_at = suppressed (a
+  -- human must close the stuck instance); both stale = the scheduler is not
+  -- reaching it at all. Deliberately a separate column, not a status: the
+  -- dedup decision itself is unchanged by this.
+  last_skipped_at  TEXT,
   -- DIVE-138 step 2. A materialized instance links back to the recurring
   -- template it was cloned from via from_template_id (NULL for templates and
   -- ordinary tasks); the materializer's skip-if-open dedup keys on it. NOT a FK
@@ -782,7 +792,7 @@ _tasks_db_migrate() {
            'shipped_flag_at TEXT' 'routed_reviewer TEXT' \
            'delivery_ref TEXT' 'delivered_at TEXT' \
            'originated_by_objective INTEGER' 'originated_cycle INTEGER' \
-           'verify_unavailable INTEGER'; do
+           'verify_unavailable INTEGER' 'last_skipped_at TEXT'; do
     if ! printf '%s\n' "$cols" | grep -qx "${c%% *}"; then
       sqlite3 -cmd ".timeout 5000" "$TASKS_DB" \
         "ALTER TABLE tasks ADD COLUMN ${c};" >/dev/null 2>&1 || true

@@ -1307,6 +1307,14 @@ _hb_materialize_recurring() {
     fi
     open=$(db "SELECT COUNT(*) FROM tasks WHERE from_template_id=${tid} AND status NOT IN ('done','cancelled');" 2>/dev/null || echo 1)
     if [[ "${open:-1}" != "0" ]]; then
+      # DIVE-2237: RECORD the skip. The dedup decision is unchanged -- we still
+      # skip -- but a skip now leaves a trace on the row itself, not only in
+      # _hb_log (which nothing surfaces and nobody reads). Without this, a
+      # template suppressed for days reads on `task ls --recurring` exactly like
+      # one the scheduler never reached, and a monitor implemented as a
+      # recurring task can switch itself off in silence. Best-effort: a failed
+      # stamp must never change whether the pass fires anything.
+      db "UPDATE tasks SET last_skipped_at=datetime('now') WHERE id=${tid};" >/dev/null 2>&1 || true
       _hb_log "[materializer] $(_hb_ident "$tid") due but an open instance exists — skip"
       continue
     fi

@@ -1,5 +1,36 @@
 # Changelog
 
+## Unreleased — fix(task): a recurring template that the scheduler SKIPPED now says so, instead of reading exactly like one it never reached (DIVE-2237)
+
+The materializer's skip-if-open dedup is right for a chore: don't pile up dailies when the
+assignee is behind. Two properties made it dangerous for anything that reports on the
+present. The skip is unbounded — one unclosed instance stops the template firing forever,
+not for a day — and `last_fired_at` moves only on a successful INSERT, so a suppressed
+template and a template the scheduler never reached produce the SAME reading on
+`task ls --recurring`. The only trace was `_hb_log`, which nothing surfaces.
+
+Measured 2026-07-28: the nightly recap (DIVE-176) missed a whole day, and per the wiki note
+`recap-lateness-delays-gate-aging` that recap is the only thing that surfaces human-gate
+AGE. So the failure mode is not a missed chore — it is an alarm switching itself off, with
+the suppressed artifact being the one that would have reported it. Four gates sat 3-5 days
+unread. Four other templates were skipped the same night.
+
+The dedup is UNCHANGED and still fires exactly when it did. What changed is that a skip is
+now on the record: a new `last_skipped_at` column stamped on every tick the template was due
+and deliberately suppressed. Read together the two columns separate the cases that used to
+look identical — recent `last_skipped_at` with a stale `last_fired_at` means suppressed and
+a human must close the blocker; both stale means the scheduler is not reaching the template
+at all. `task ls --recurring` gains a `last_skipped` column and a `blocked_by` column naming
+the open instance doing the blocking, derived from the same predicate the materializer
+dedups on, so the listing cannot tell a different story than the scheduler. `--json` carries
+both for the dashboard.
+
+Whether skip-if-open is the right POLICY for templates whose output is a reading of the
+present (recap, version loop, scoreboards) as opposed to fungible chores (disk reclaim) is a
+separate call and deliberately not made here: Tuesday's recap is not satisfied by
+Wednesday's run, but changing the dedup is not needed to make a skip visible, and the two
+should not ride together.
+
 ## Unreleased — fix(ask): a reply fence whose markers sit INLINE is now harvested, so a grok seat stops reading as a silent abstain (DIVE-2216)
 
 `agent ask` returned nothing from a grok seat that had answered correctly. Reproduced
