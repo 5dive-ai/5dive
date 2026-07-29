@@ -63,7 +63,7 @@ else
 fi
 [[ -n "${agents// }" ]] || { echo "no agents to refresh"; exit 0; }
 
-refreshed=0 failed=0 booting=0
+changed=0 unchanged=0 first_install=0 failed=0 booting=0
 for ag in $agents; do
   user="agent-$ag"
   home=$(getent passwd "$user" | cut -d: -f6)
@@ -82,8 +82,24 @@ for ag in $agents; do
   for spec in "${DEFAULT_SKILLS[@]}"; do
     source="${spec%%:*}" skill="${spec#*:}"
     echo "+ $ag — re-pulling $skill from $source"
-    if "$FIVE_BIN" agent skill "$ag" add --source="$source" --skill="$skill" --force >&2; then
-      refreshed=$((refreshed+1))
+    # DIVE-2282: --json so we can read back the content hash the installer now
+    # records in the per-agent skills manifest. "N re-pulled" couldn't tell an
+    # unchanged re-pull from a rewritten skill body — .data.changed and
+    # .data.previous_content_sha256 can. Exit status still decides pass/fail
+    # (jq only buckets), so a box without jq degrades but never miscounts a
+    # failure. Progress chatter stays on stderr and still reaches the cron log.
+    if out=$("$FIVE_BIN" agent skill "$ag" add --source="$source" --skill="$skill" --force --json); then
+      prev=$(jq -r '.data.previous_content_sha256 // ""' <<<"$out" 2>/dev/null)
+      if [[ -z "$prev" ]]; then
+        echo "  first install (no previous hash on record)"
+        first_install=$((first_install+1))
+      elif [[ "$(jq -r '.data.changed // false' <<<"$out" 2>/dev/null)" == "true" ]]; then
+        echo "  changed (content hash differs from previous)"
+        changed=$((changed+1))
+      else
+        echo "  unchanged"
+        unchanged=$((unchanged+1))
+      fi
     else
       echo "  warn: $skill refresh failed for $ag (continuing)" >&2
       failed=$((failed+1))
@@ -91,4 +107,4 @@ for ag in $agents; do
   done
 done
 
-echo "skills refresh done: $refreshed re-pulled, $failed failed, $booting awaiting first boot"
+echo "skills refresh done: $changed changed, $unchanged unchanged, $first_install first-install, $failed failed, $booting awaiting first boot"

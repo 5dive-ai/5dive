@@ -16787,6 +16787,25 @@ cmd_skill() {
   esac
 }
 
+# _skill_read_result <result-file>
+# Hydrate SKILL_RES_* from the JSON line an install heredoc left behind
+# (DIVE-2282). Best-effort: a missing/garbage file just leaves the defaults, so
+# a successful install is never downgraded to a failure over its own reporting.
+_skill_read_result() {
+  local f="$1"
+  SKILL_RES_CHANGED="false"; SKILL_RES_CONTENT=""; SKILL_RES_RESOLVED=""; SKILL_RES_PREV=""
+  if [[ -s "$f" ]]; then
+    # `if .changed == true` (not `.changed // false`) so the value is always a
+    # bare true/false literal — it's fed to jq as --argjson.
+    SKILL_RES_CHANGED=$(jq -r 'if .changed == true then "true" else "false" end' "$f" 2>/dev/null || echo "false")
+    SKILL_RES_CONTENT=$(jq -r '.content_sha256 // empty' "$f" 2>/dev/null || true)
+    SKILL_RES_RESOLVED=$(jq -r '.resolved_sha // empty' "$f" 2>/dev/null || true)
+    SKILL_RES_PREV=$(jq -r '.previous_content_sha256 // empty' "$f" 2>/dev/null || true)
+  fi
+  [[ "$SKILL_RES_CHANGED" == "true" ]] || SKILL_RES_CHANGED="false"
+  rm -f "$f"
+}
+
 cmd_skill_add() {
   local name="$1"; shift
   local source="" skill="" force=0
@@ -16820,6 +16839,14 @@ cmd_skill_add() {
   local isolation
   isolation=$(grep -oP '(?<=AGENT_ISOLATION=)\S+' "${ENV_DIR}/${name}.env" 2>/dev/null || echo "admin")
 
+  # Channel for the install heredoc to hand its manifest numbers back to us:
+  # heredoc stdout is mirrored to stderr for humans, so the machine-readable
+  # result travels through a temp file instead (DIVE-2282). Owned by the agent
+  # user because the admin strategy runs the heredoc as that user.
+  local result_file
+  result_file=$(mktemp -t skill-result-XXXXXX)
+  chown "$user" "$result_file" 2>/dev/null || true
+
   step "Installing skill '$skill' from '$source' for agent '$name' (--agent $agent_id)"
   # Same pattern as install_channel_plugin_for_agent: non-login shell,
   # CLAUDE_CONFIG_DIR unset so $HOME is the install target root, nvm
@@ -16838,13 +16865,16 @@ cmd_skill_add() {
   if _skill_needs_manual_install "$type"; then
     local run_as="sudo -u $user -H"
     [[ "$isolation" == "sandboxed" ]] && run_as=""
-    if ! $run_as env HOME="$home" SOURCE="$source" SKILL="$skill" INSTALL_DIR="$install_dir" bash -s >&2 <<'SKILL_ADD_MANUAL'
+    if ! $run_as env HOME="$home" SOURCE="$source" SKILL="$skill" INSTALL_DIR="$install_dir" RESULT_FILE="$result_file" bash -s >&2 <<'SKILL_ADD_MANUAL'
 set -euo pipefail
 unset CLAUDE_CONFIG_DIR
 cd "$HOME"
 TMPDIR=$(mktemp -d -t skill-XXXXXX)
 trap 'rm -rf "$TMPDIR"' EXIT
 timeout 60 git clone --depth=1 "https://github.com/$SOURCE.git" "$TMPDIR/repo" >/dev/null 2>&1
+# Read the commit off the clone while it's still around — the EXIT trap only
+# fires when this shell ends, but the manifest write below wants the sha.
+RESOLVED_SHA=$(/usr/bin/git -C "$TMPDIR/repo" rev-parse HEAD 2>/dev/null || echo "")
 SRC_DIR=""
 for d in "$TMPDIR/repo/$SKILL" "$TMPDIR/repo/skills/$SKILL"; do
   if [ -f "$d/SKILL.md" ]; then SRC_DIR="$d"; break; fi
@@ -16854,21 +16884,48 @@ mkdir -p "$HOME/$INSTALL_DIR"
 rm -rf "$HOME/$INSTALL_DIR/$SKILL"
 cp -r "$SRC_DIR" "$HOME/$INSTALL_DIR/$SKILL"
 [ -d "$HOME/$INSTALL_DIR/$SKILL" ] || { echo "ERROR: $INSTALL_DIR/$SKILL missing after install" >&2; exit 1; }
+# DIVE-2282 manifest write. Absolute tool paths: the agent's PATH is whatever
+# its login shell/nvm left behind, and this must not depend on that.
+MANIFEST="$HOME/$INSTALL_DIR/.skills-manifest.json"
+if ! /usr/bin/jq -e . "$MANIFEST" >/dev/null 2>&1; then echo '{}' > "$MANIFEST" 2>/dev/null || true; fi
+PREV_SHA=$(/usr/bin/jq -r --arg k "$SKILL" '.[$k].content_sha256 // ""' "$MANIFEST" 2>/dev/null || echo "")
+# Relative paths + sorted list => same tree hashes the same anywhere.
+CONTENT_SHA=$(cd "$HOME/$INSTALL_DIR/$SKILL" && find . -type f -print0 | sort -z | xargs -0 -r /usr/bin/sha256sum | /usr/bin/sha256sum | cut -d' ' -f1) || CONTENT_SHA=""
+CHANGED=false
+if [ -n "$PREV_SHA" ] && [ "$PREV_SHA" != "$CONTENT_SHA" ]; then CHANGED=true; fi
+if /usr/bin/jq --arg k "$SKILL" --arg s "$SOURCE" --arg r "$RESOLVED_SHA" --arg c "$CONTENT_SHA" \
+     --arg t "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+     '.[$k] = {source:$s, resolved_sha:$r, content_sha256:$c, installed_at:$t}' \
+     "$MANIFEST" > "$MANIFEST.tmp" 2>/dev/null; then
+  mv "$MANIFEST.tmp" "$MANIFEST"
+else
+  rm -f "$MANIFEST.tmp"
+  echo "warn: could not update $MANIFEST for $SKILL" >&2
+fi
+[ -n "${RESULT_FILE:-}" ] && /usr/bin/jq -cn --arg s "$SOURCE" --arg r "$RESOLVED_SHA" --arg c "$CONTENT_SHA" \
+  --arg p "$PREV_SHA" --argjson ch "$CHANGED" \
+  '{source:$s, resolved_sha:$r, content_sha256:$c, previous_content_sha256:$p, changed:$ch}' \
+  > "$RESULT_FILE" 2>/dev/null || true
 echo "manual-installed $SKILL → $HOME/$INSTALL_DIR/$SKILL"
 SKILL_ADD_MANUAL
     then
+      rm -f "$result_file"
       fail "$E_GENERIC" "skill install failed for '$skill' on agent '$name'"
     fi
-    [[ "$isolation" == "sandboxed" ]] && chown -R "${user}:${user}" "$home/$install_dir/$skill" 2>/dev/null || true
+    [[ "$isolation" == "sandboxed" ]] && chown -R "${user}:${user}" "$home/$install_dir/$skill" "$home/$install_dir/.skills-manifest.json" 2>/dev/null || true
+    _skill_read_result "$result_file"
     ok "skill '$skill' installed for agent '$name'." \
-       '{name:$n, source:$s, skill:$k, agent:$a, action:"add", strategy:"manual"}' \
-       --arg n "$name" --arg s "$source" --arg k "$skill" --arg a "$agent_id"
+       '{name:$n, source:$s, skill:$k, agent:$a, action:"add", strategy:"manual", changed:$ch, content_sha256:$cs, previous_content_sha256:$ps, resolved_sha:$rs}' \
+       --arg n "$name" --arg s "$source" --arg k "$skill" --arg a "$agent_id" \
+       --argjson ch "$SKILL_RES_CHANGED" --arg cs "$SKILL_RES_CONTENT" \
+       --arg ps "$SKILL_RES_PREV" --arg rs "$SKILL_RES_RESOLVED"
     return 0
   fi
 
   if [[ "$isolation" == "sandboxed" ]]; then
     if ! HOME="$home" \
          SOURCE="$source" SKILL="$skill" AGENT_ID="$agent_id" INSTALL_DIR="$install_dir" FORCE="$force" \
+         RESULT_FILE="$result_file" \
          bash -s >&2 <<'SKILL_ADD_SANDBOXED'
 set -euo pipefail
 unset CLAUDE_CONFIG_DIR
@@ -16882,13 +16939,38 @@ cd "$HOME"
 [ "${FORCE:-0}" = 1 ] && rm -rf "$INSTALL_DIR/$SKILL"
 timeout 180 npx -y skills add "https://github.com/$SOURCE" --skill "$SKILL" --agent "$AGENT_ID" --yes 2>&1 | tail -25
 [ -d "$INSTALL_DIR/$SKILL" ] || { echo "ERROR: $INSTALL_DIR/$SKILL missing after install" >&2; exit 1; }
+# DIVE-2282 manifest write. No local clone on the npx path, so the commit is
+# best-effort over the network; an empty sha never fails the install. Absolute
+# tool paths so this doesn't depend on what nvm put on PATH.
+RESOLVED_SHA=$(timeout 20 /usr/bin/git ls-remote "https://github.com/$SOURCE.git" HEAD 2>/dev/null | cut -f1 || echo "")
+MANIFEST="$HOME/$INSTALL_DIR/.skills-manifest.json"
+if ! /usr/bin/jq -e . "$MANIFEST" >/dev/null 2>&1; then echo '{}' > "$MANIFEST" 2>/dev/null || true; fi
+PREV_SHA=$(/usr/bin/jq -r --arg k "$SKILL" '.[$k].content_sha256 // ""' "$MANIFEST" 2>/dev/null || echo "")
+# Relative paths + sorted list => same tree hashes the same anywhere.
+CONTENT_SHA=$(cd "$HOME/$INSTALL_DIR/$SKILL" && find . -type f -print0 | sort -z | xargs -0 -r /usr/bin/sha256sum | /usr/bin/sha256sum | cut -d' ' -f1) || CONTENT_SHA=""
+CHANGED=false
+if [ -n "$PREV_SHA" ] && [ "$PREV_SHA" != "$CONTENT_SHA" ]; then CHANGED=true; fi
+if /usr/bin/jq --arg k "$SKILL" --arg s "$SOURCE" --arg r "$RESOLVED_SHA" --arg c "$CONTENT_SHA" \
+     --arg t "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+     '.[$k] = {source:$s, resolved_sha:$r, content_sha256:$c, installed_at:$t}' \
+     "$MANIFEST" > "$MANIFEST.tmp" 2>/dev/null; then
+  mv "$MANIFEST.tmp" "$MANIFEST"
+else
+  rm -f "$MANIFEST.tmp"
+  echo "warn: could not update $MANIFEST for $SKILL" >&2
+fi
+[ -n "${RESULT_FILE:-}" ] && /usr/bin/jq -cn --arg s "$SOURCE" --arg r "$RESOLVED_SHA" --arg c "$CONTENT_SHA" \
+  --arg p "$PREV_SHA" --argjson ch "$CHANGED" \
+  '{source:$s, resolved_sha:$r, content_sha256:$c, previous_content_sha256:$p, changed:$ch}' \
+  > "$RESULT_FILE" 2>/dev/null || true
 SKILL_ADD_SANDBOXED
     then
+      rm -f "$result_file"
       fail "$E_GENERIC" "skill install failed for '$skill' on agent '$name'"
     fi
-    chown -R "${user}:${user}" "$home/$install_dir/$skill" 2>/dev/null || true
+    chown -R "${user}:${user}" "$home/$install_dir/$skill" "$home/$install_dir/.skills-manifest.json" 2>/dev/null || true
   else
-    if ! sudo -u "$user" -H env SOURCE="$source" SKILL="$skill" AGENT_ID="$agent_id" INSTALL_DIR="$install_dir" FORCE="$force" bash -s >&2 <<'SKILL_ADD'
+    if ! sudo -u "$user" -H env SOURCE="$source" SKILL="$skill" AGENT_ID="$agent_id" INSTALL_DIR="$install_dir" FORCE="$force" RESULT_FILE="$result_file" bash -s >&2 <<'SKILL_ADD'
 set -euo pipefail
 unset CLAUDE_CONFIG_DIR
 export NVM_DIR="/home/claude/.nvm"
@@ -16901,15 +16983,43 @@ cd "$HOME"
 [ "${FORCE:-0}" = 1 ] && rm -rf "$INSTALL_DIR/$SKILL"
 timeout 180 npx -y skills add "https://github.com/$SOURCE" --skill "$SKILL" --agent "$AGENT_ID" --yes 2>&1 | tail -25
 [ -d "$INSTALL_DIR/$SKILL" ] || { echo "ERROR: $INSTALL_DIR/$SKILL missing after install" >&2; exit 1; }
+# DIVE-2282 manifest write. No local clone on the npx path, so the commit is
+# best-effort over the network; an empty sha never fails the install. Absolute
+# tool paths so this doesn't depend on what nvm put on PATH.
+RESOLVED_SHA=$(timeout 20 /usr/bin/git ls-remote "https://github.com/$SOURCE.git" HEAD 2>/dev/null | cut -f1 || echo "")
+MANIFEST="$HOME/$INSTALL_DIR/.skills-manifest.json"
+if ! /usr/bin/jq -e . "$MANIFEST" >/dev/null 2>&1; then echo '{}' > "$MANIFEST" 2>/dev/null || true; fi
+PREV_SHA=$(/usr/bin/jq -r --arg k "$SKILL" '.[$k].content_sha256 // ""' "$MANIFEST" 2>/dev/null || echo "")
+# Relative paths + sorted list => same tree hashes the same anywhere.
+CONTENT_SHA=$(cd "$HOME/$INSTALL_DIR/$SKILL" && find . -type f -print0 | sort -z | xargs -0 -r /usr/bin/sha256sum | /usr/bin/sha256sum | cut -d' ' -f1) || CONTENT_SHA=""
+CHANGED=false
+if [ -n "$PREV_SHA" ] && [ "$PREV_SHA" != "$CONTENT_SHA" ]; then CHANGED=true; fi
+if /usr/bin/jq --arg k "$SKILL" --arg s "$SOURCE" --arg r "$RESOLVED_SHA" --arg c "$CONTENT_SHA" \
+     --arg t "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+     '.[$k] = {source:$s, resolved_sha:$r, content_sha256:$c, installed_at:$t}' \
+     "$MANIFEST" > "$MANIFEST.tmp" 2>/dev/null; then
+  mv "$MANIFEST.tmp" "$MANIFEST"
+else
+  rm -f "$MANIFEST.tmp"
+  echo "warn: could not update $MANIFEST for $SKILL" >&2
+fi
+[ -n "${RESULT_FILE:-}" ] && /usr/bin/jq -cn --arg s "$SOURCE" --arg r "$RESOLVED_SHA" --arg c "$CONTENT_SHA" \
+  --arg p "$PREV_SHA" --argjson ch "$CHANGED" \
+  '{source:$s, resolved_sha:$r, content_sha256:$c, previous_content_sha256:$p, changed:$ch}' \
+  > "$RESULT_FILE" 2>/dev/null || true
 SKILL_ADD
     then
+      rm -f "$result_file"
       fail "$E_GENERIC" "skill install failed for '$skill' on agent '$name'"
     fi
   fi
 
+  _skill_read_result "$result_file"
   ok "skill '$skill' installed for agent '$name'." \
-     '{name:$n, source:$s, skill:$k, agent:$a, action:"add"}' \
-     --arg n "$name" --arg s "$source" --arg k "$skill" --arg a "$agent_id"
+     '{name:$n, source:$s, skill:$k, agent:$a, action:"add", changed:$ch, content_sha256:$cs, previous_content_sha256:$ps, resolved_sha:$rs}' \
+     --arg n "$name" --arg s "$source" --arg k "$skill" --arg a "$agent_id" \
+     --argjson ch "$SKILL_RES_CHANGED" --arg cs "$SKILL_RES_CONTENT" \
+     --arg ps "$SKILL_RES_PREV" --arg rs "$SKILL_RES_RESOLVED"
 }
 
 # _skill_list_json <name> -> prints the installed-skills JSON array for one
@@ -17042,6 +17152,13 @@ cd "$HOME"
 target="$INSTALL_DIR/$SKILL"
 if [ -e "$target" ] || [ -L "$target" ]; then
   rm -rf "$target"
+  # Drop the skill's manifest entry too, so the record can't outlive the dir
+  # it describes (DIVE-2282). Best-effort: never fails the removal.
+  MANIFEST="$INSTALL_DIR/.skills-manifest.json"
+  if [ -f "$MANIFEST" ]; then
+    /usr/bin/jq --arg k "$SKILL" 'del(.[$k])' "$MANIFEST" > "$MANIFEST.tmp" 2>/dev/null \
+      && mv "$MANIFEST.tmp" "$MANIFEST" || rm -f "$MANIFEST.tmp"
+  fi
   echo "Removed $target"
 else
   echo "Skill not found: $target" >&2
