@@ -19,7 +19,12 @@ jobs:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
-          set -uo pipefail
+          # set +e is LOAD-BEARING: GitHub runs `run:` under `bash -e`, so a
+          # findings exit (3) would abort the step before rc is ever read and a
+          # FINDING would present as a BUILD FAILURE. That inverts the design —
+          # this annotates, it does not block. Caught by this guard failing its
+          # own first PR on exit 3.
+          set +e
           bash scripts/supply-chain-scan.sh "$BASE_SHA" "$HEAD_SHA" .
           rc=$?
           # 0 = nothing to audit. 3 = findings, ANNOTATE but do not block: the
