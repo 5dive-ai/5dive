@@ -751,6 +751,14 @@ cmd_task_add() {
   # Ident is stamped by the AFTER INSERT trigger from the project's counter, so
   # read it back rather than assuming the DIVE- prefix (DIVE-484).
   local ident; ident=$(db "SELECT ident FROM tasks WHERE id=${id};")
+  # INST-4: first row of this task's lifecycle. The title is hashed as the input
+  # payload rather than stored twice — tasks.title is already the authority on
+  # what was asked, and the digest is what lets a reader prove the title was not
+  # edited after the fact.
+  ledger_emit task.created ident="$ident" task_id="$id" \
+    parent="$(db "SELECT COALESCE(p.ident,'') FROM tasks t LEFT JOIN tasks p ON p.id=t.parent_id WHERE t.id=${id};" 2>/dev/null)" \
+    actor="$creator" in="$title" \
+    detail="${priority} → ${assignee:-unassigned}${verifier:+ (verifier ${verifier})}"
   if [[ "$kind" == "recurring" ]]; then
     ok "created recurring ${ident} (${recurring}, fresh=$([[ "$fresh_sql" == "1" ]] && echo on || echo off)) — $title" \
        '{id:($i|tonumber), ident:$id, project:$pr, title:$t, priority:$p, assignee:$a, created_by:$c, kind:"recurring", schedule:$s, fresh:($f=="1")}' \
@@ -2429,6 +2437,30 @@ $_body"
       _task_close_notify "$ident" "$verb" "$result" || true
     fi
   fi
+  # INST-4: the state transition, on the unified timeline.
+  #
+  # Emitted from the ONE place all three verbs funnel through, not from the three
+  # cmd_task_{start,done,cancel} wrappers, so a fourth verb added later cannot
+  # ship without its ledger row. The `result` is hashed, not stored: it can carry
+  # anything a maker typed, and the ledger must stay safe to read at a lower
+  # privilege than the board it describes.
+  #
+  # A `done` that DELIVERS (maker→verifier handoff) is not a close, and recording
+  # it as one would make the ledger claim work was finished that is still waiting
+  # to be graded — the exact overstatement the verifier rail exists to prevent.
+  local _lk="task.${newstatus}"
+  [[ "$newstatus" == "in_progress" ]] && _lk="task.started"
+  [[ -n "$handoff_ack" ]] && _lk="task.delivered"
+  #
+  # actor= is the BOARD identity (task_actor), not the OS user the default
+  # resolver would supply. The smoke run that caught this had task.created say
+  # `dev` and task.started say `agent-dev` for the same person on the same task —
+  # two rows in one timeline disagreeing about who acted, which is precisely the
+  # failure the shared _actor_identity resolver was meant to prevent. A default
+  # is only shared if every site actually takes it.
+  ledger_emit "$_lk" ident="$ident" task_id="$id" actor="$(task_actor)" out="$result" \
+    detail="$verb${handoff_ack:+ → verifier ${handoff_ack}}"
+
   local ok_msg="$ident $verb"
   [[ -n "$handoff_ack" ]] && ok_msg+=" — verifier ACK: reviewing"
   ok "$ok_msg" \
@@ -5127,6 +5159,13 @@ cmd_task_need() {
       WHERE id=${id};
       COMMIT;"
 
+  # INST-4: the gate is the authority record — who asked whom for permission, at
+  # what tier. The ask text is hashed, not stored: a tier-2 ask routinely names
+  # the money, the box, or the destructive verb it is asking about.
+  ledger_emit gate.filed ident="$ident" task_id="$id" actor="$actor" \
+    policy="tier${tier}:${type}" in="$ask" \
+    detail="${type} gate filed at tier ${tier}${recommend:+ (recommend: ${recommend})}"
+
   # DIVE-891 tier 0: apply the recommendation right now — the gate exists only
   # as a signed-off record in the log/digest, never as a ping. Provenance is
   # 'auto:t0' (never human:*, so a loop approval gate can NOT be advanced this
@@ -7677,6 +7716,24 @@ cmd_task_answer() {
     (( value_set )) || fail "$E_USAGE" "--value is required (the human's answer)"
     db "UPDATE tasks SET need_answer=$(sqlq "$value"), need_answered_at=$(sqlq "$_ts"), need_answered_by=$(sqlq "$answered_by"), need_answered_uid=${_uidsql}, need_answer_sig=$(sqlq "$_sig") WHERE id=${id};"
   fi
+
+  # INST-4: the gate CLEAR — the row that decides whether this task's timeline
+  # reads "zero-human" or "a human authorized it", so it is worth more care than
+  # the emits around it.
+  #
+  # Provenance is read BACK OUT of the row, not taken from $answered_by, for the
+  # DIVE-2090 reason spelled out below: the shell variable is the intent to
+  # write, and only the persisted column is the state that landed. A ledger that
+  # records intent would attest to clears that never happened.
+  #
+  # The answer VALUE is hashed, never stored — and for a secret gate not even
+  # hashed: `_vfs` is empty there by construction, so the one gate type whose
+  # payload is a live credential contributes no digest at all. A digest of a
+  # short, guessable answer is not the protection it looks like.
+  local _lg_prov; _lg_prov=$(db "SELECT COALESCE(need_answered_by,'') FROM tasks WHERE id=${id};" 2>/dev/null)
+  ledger_emit gate.answered ident="$ident" task_id="$id" actor="${_lg_prov:-unknown}" \
+    policy="tier${gtier}:${nt}" out="$_vfs" \
+    detail="${nt} gate cleared by ${_lg_prov:-<unrecorded>}$([[ "$_lg_prov" == human:* ]] && echo ' (human touchpoint)')"
 
   # DIVE-2099: the authoritative record of a STANDING-authority clear. Emitted
   # AFTER the write and reading `need_answered_by` BACK OUT of the row, so it

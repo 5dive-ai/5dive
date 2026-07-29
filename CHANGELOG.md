@@ -1,5 +1,35 @@
 # Changelog
 
+## Unreleased — feat(ledger): one append-only lifecycle log with the authority envelope (INST-4, phase A)
+
+We were already event-sourcing, in four separate append-only silos — `supervisor_events`,
+`objective_readings`, the council lineage, and the `_audit_append` log. Each is correct and each
+answers a different question, which is the problem: none can answer "who was authorized to do
+this, why, and what happened next", because the answer is split across four schemas with four
+notions of actor and no shared key. `5dive trace` had to hand-join transition *columns* on the
+tasks row to fake one timeline.
+
+`lifecycle_events` is that one log. Every row carries the full envelope: actor, **authority**
+(`root` / `sudo:<who>` / `self` — the elevation the audit log has never recorded), parent,
+idempotency key, input/output digests, policy decision, usage and host. `ledger_emit` hashes
+`in=`/`out=` payloads itself, so a call site physically cannot write content into the table;
+a secret gate contributes no digest at all.
+
+Additive by construction. No existing write was moved or removed, the state machine is
+untouched, and a ledger write can never fail the action it describes. `trace` gains a `ledger:`
+section shown *beside* the derived timeline rather than merged into it — one is reconstructed
+from current state, the other was recorded at the time, and where they disagree that is the
+finding.
+
+An empty ledger has two meanings and the rows cannot separate them, so init stamps a
+`ledger_started` marker once and `trace` says which it is: no events, predates the ledger, or —
+if the marker is missing — unknown. Emitters are live on task create/start/deliver/done/cancel,
+gate file/answer, policy refusal, and ship/rollback. Remaining lifecycle sites and the four
+silos still write only where they write today; folding them in is the next phase.
+`tests/ledger_unit.sh` covers the migration on a store that already has the neighbouring silos,
+marker idempotency, the no-raw-payload property (mutation-graded), idempotency in both
+directions, and the never-fails-the-caller contract.
+
 ## Unreleased — feat(task): displaced gates have a reader with an honest coverage boundary (DIVE-2133)
 
 `gate_history` stopped gate retirement from destroying the previous ask, answer and

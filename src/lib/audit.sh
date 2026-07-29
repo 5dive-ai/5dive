@@ -108,6 +108,44 @@ _audit_note_drop() {
 # it. A check nobody can exercise is a check nobody can trust.
 _audit_is_root() { [[ $EUID -eq 0 ]]; }
 
+# _actor_identity — the ONE resolver for "who is acting", shared by the audit log
+# and the INST-4 lifecycle ledger.
+#
+# It is deliberately a single function rather than the same four-fallback
+# expression copy-pasted per trail. Two evidence trails that disagree about the
+# actor are worse than one trail: a reader cannot tell a real identity conflict
+# from two resolvers drifting apart, and there is nothing in either row that says
+# which resolver produced it. Same reason the ledger below reuses this instead of
+# re-deriving the caller.
+#
+# DIVE-2073 semantics are preserved verbatim: root with no invoking user is an
+# identity BY DESIGN (`root`), and `unknown` means only the genuine failure — a
+# NON-root process whose USER we could not read.
+_actor_identity() {
+  local user="${FIVEDIVE_AUDIT_USER:-${SUDO_USER:-${USER:-}}}"
+  [[ -n "$user" ]] || { if _audit_is_root; then user="root"; else user="unknown"; fi; }
+  printf '%s' "$user"
+}
+
+# _actor_authority — under WHOSE authority the current process is acting.
+#
+# Distinct from _actor_identity on purpose. Identity answers "who"; authority
+# answers "with what powers, granted by whom". `sudo:claude` and `self` can carry
+# the same identity and are not the same act, and the audit log has never been
+# able to say which — it records the invoking user and drops the elevation. For a
+# ledger whose whole job is "who was AUTHORIZED to act", that distinction is the
+# payload, not a detail.
+#   root        EUID 0 with no invoking user (cron, systemd, the privileged rails)
+#   sudo:<who>  EUID 0 reached by elevation from <who>
+#   self        unelevated — the agent acting as itself
+_actor_authority() {
+  if [[ $EUID -eq 0 ]]; then
+    if [[ -n "${SUDO_USER:-}" ]]; then printf 'sudo:%s' "$SUDO_USER"; else printf 'root'; fi
+  else
+    printf 'self'
+  fi
+}
+
 # Emits one NDJSON line. Sensitive =<value> args are redacted ("--api-key=..."
 # becomes "--api-key=<redacted>"). Never fails the caller — writes are
 # best-effort so a full disk can't block a rescue rm.
@@ -143,8 +181,7 @@ audit_log() {
   # DESIGN, so record it as `root`; `unknown` now means only the genuine
   # failure — a NON-root process whose USER we could not read — and a reader
   # seeing it should treat it as a defect, not as routine.
-  local user="${FIVEDIVE_AUDIT_USER:-${SUDO_USER:-${USER:-}}}"
-  [[ -n "$user" ]] || { if _audit_is_root; then user="root"; else user="unknown"; fi; }
+  local user; user=$(_actor_identity)
   local ts
   ts=$(date -Iseconds)
   local line

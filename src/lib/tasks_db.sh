@@ -754,6 +754,76 @@ CREATE TABLE IF NOT EXISTS objective_cycles (
   outcome       TEXT NOT NULL DEFAULT 'noop'
 );
 CREATE INDEX IF NOT EXISTS objective_cycles_idx ON objective_cycles(objective_id, cycle_no);
+
+-- INST-4: the unified lifecycle ledger — ONE append-only log for the whole
+-- task/gate/verify/ship lifecycle, carrying the full authority envelope on every
+-- row (actor, authority, parent, idempotency key, input/output hashes, policy
+-- decision, usage, host).
+--
+-- We were ALREADY event-sourcing, in four separate append-only silos:
+-- supervisor_events (DIVE-724), objective_readings (OSS-19), the council
+-- governance lineage, and the _audit_append log (DIVE-1268). Each is correct and
+-- each answers a different question, which is precisely the problem: no single
+-- one of them can answer "who was authorized to do this, why, and what happened
+-- next", because the answer is split across four schemas with four different
+-- notions of actor, four timestamp conventions, and no shared key. `5dive trace`
+-- had to hand-join transition COLUMNS on the tasks row to fake one.
+--
+-- ADDITIVE BY CONSTRUCTION. This does NOT replace the state machine, the four
+-- silos, or any existing write. Every current writer keeps writing where it
+-- writes today; the emitters below run ALONGSIDE them. The tasks row stays the
+-- authority on current state — read it as the materialized view this log would
+-- rebuild, not as a thing to be migrated. Nothing here is referenced by
+-- tasks/projects, so it cannot touch the queue, and a ledger write that fails
+-- can never fail the action it describes (see ledger_emit).
+--
+-- READ THE START MARKER BEFORE READING THE ROWS. A ledger installed today has
+-- nothing to say about work that finished yesterday, and the failure mode this
+-- codebase keeps paying for is exactly that: absence read as evidence. The
+-- ledger_started pref (task_prefs) stamps the first init, and `trace` refuses to
+-- render an empty ledger section for a task that predates it.
+--   kind       dotted lifecycle verb: task.created|task.started|task.delivered|
+--              task.done|task.cancelled|gate.filed|gate.answered|policy.refused|
+--              ship|rollback
+--   actor      the identity the RECORDING SITE is authoritative for, which is not
+--              the same namespace for every kind and should not be forced to be.
+--              Task lifecycle rows carry the BOARD actor (task_actor: `dev`),
+--              because the org is what those events are about. ship/rollback rows
+--              carry the ship actor ship_events already recorded, so the two rows
+--              about one ship can never disagree. gate.answered carries the
+--              persisted gate provenance (`human:...`, `lead:standing:...`), which
+--              is the only identity that decides whether a human touched the work.
+--   authority  root | sudo:<who> | self — the elevation, which the audit log has
+--              never recorded (see _actor_authority)
+--   idem_key   natural key for the event. The UNIQUE index makes a retried emit
+--              collapse instead of double-counting; a caller needing genuine
+--              repeats supplies its own distinguishing key.
+--   input_hash/output_hash  sha256 (first 16 hex) of the raw payloads, hashed by
+--              ledger_emit. The ledger stores digests, never the content, so it
+--              stays safe to read at a lower privilege than the thing it records.
+-- Append-only: never updated, never deleted.
+-- Defined identically inside _tasks_db_migrate for pre-existing stores; keep the
+-- two copies byte-identical (tests/schema_sync_unit.sh).
+CREATE TABLE IF NOT EXISTS lifecycle_events (
+  id              INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts              TEXT NOT NULL DEFAULT (datetime('now')),
+  kind            TEXT NOT NULL,
+  ident           TEXT,
+  task_id         INTEGER,
+  actor           TEXT NOT NULL,
+  authority       TEXT NOT NULL DEFAULT 'self',
+  parent_ident    TEXT,
+  idem_key        TEXT NOT NULL,
+  input_hash      TEXT,
+  output_hash     TEXT,
+  policy_decision TEXT,
+  tokens          INTEGER,
+  host            TEXT,
+  detail          TEXT
+);
+CREATE UNIQUE INDEX IF NOT EXISTS lifecycle_events_idem_idx ON lifecycle_events(idem_key);
+CREATE INDEX IF NOT EXISTS lifecycle_events_ident_idx ON lifecycle_events(ident, id);
+CREATE INDEX IF NOT EXISTS lifecycle_events_ts_idx ON lifecycle_events(ts, kind);
 SQL
 }
 
@@ -1318,6 +1388,47 @@ CREATE INDEX IF NOT EXISTS objective_cycles_idx ON objective_cycles(objective_id
 MIG
   fi
 
+  # INST-4 lifecycle_events — additive, gated on its OWN absence. Brand-new,
+  # never referenced by tasks/projects. Keep this CREATE body byte-identical to
+  # the copy in _tasks_schema above (tests/schema_sync_unit.sh).
+  local has_lifecycle
+  has_lifecycle=$(sqlite3 -cmd ".timeout 5000" "$TASKS_DB" \
+    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='lifecycle_events' LIMIT 1;" 2>/dev/null)
+  if [[ "$has_lifecycle" != "1" ]]; then
+    sqlite3 -cmd ".timeout 5000" "$TASKS_DB" <<'MIG' >/dev/null 2>&1 || true
+CREATE TABLE IF NOT EXISTS lifecycle_events (
+  id              INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts              TEXT NOT NULL DEFAULT (datetime('now')),
+  kind            TEXT NOT NULL,
+  ident           TEXT,
+  task_id         INTEGER,
+  actor           TEXT NOT NULL,
+  authority       TEXT NOT NULL DEFAULT 'self',
+  parent_ident    TEXT,
+  idem_key        TEXT NOT NULL,
+  input_hash      TEXT,
+  output_hash     TEXT,
+  policy_decision TEXT,
+  tokens          INTEGER,
+  host            TEXT,
+  detail          TEXT
+);
+CREATE UNIQUE INDEX IF NOT EXISTS lifecycle_events_idem_idx ON lifecycle_events(idem_key);
+CREATE INDEX IF NOT EXISTS lifecycle_events_ident_idx ON lifecycle_events(ident, id);
+CREATE INDEX IF NOT EXISTS lifecycle_events_ts_idx ON lifecycle_events(ts, kind);
+MIG
+  fi
+
+  # INST-4: stamp the ledger's own start. `trace` needs to distinguish "this task
+  # produced no lifecycle events" from "this task ran before the ledger existed",
+  # and only a marker written at install time can tell them apart — by the time a
+  # reader asks, an empty result looks identical either way. Written once; the
+  # INSERT OR IGNORE keeps every later init a no-op so the marker records the
+  # FIRST init on this box, not the most recent one.
+  sqlite3 -cmd ".timeout 5000" "$TASKS_DB" \
+    "INSERT OR IGNORE INTO task_prefs (key, value) VALUES ('ledger_started', datetime('now'));" \
+    >/dev/null 2>&1 || true
+
   # DIVE-1737 — async self-heal materialize: additive planner-handle columns on
   # already-created objective_cycles tables. When a planner loop times out past
   # OBJ_PLANNER_WAIT_DEFAULT, replan records an 'awaiting_planner' cycle stamped
@@ -1828,6 +1939,82 @@ _gate_closure_verify() {
   _gate_proof_ct_equal "$sig" "$expect"
 }
 
+# ── INST-4: the unified lifecycle ledger writer ──────────────────────────────
+#
+# ledger_emit <kind> [k=v ...] — append ONE row to lifecycle_events.
+#
+# Keys: ident, task_id, parent, actor, authority, idem, in, out, policy, tokens,
+# detail. Everything is optional except <kind>.
+#
+#   in= / out=  take the RAW payload and are HASHED here, never stored. Call
+#               sites therefore cannot leak a secret, a gate answer, or a task
+#               body into a table that is read by lower-privileged consumers —
+#               they physically have no way to write content into it. That is a
+#               property of this function, not a rule call sites must remember.
+#   idem=       the natural key. Omitted, it is derived deterministically from
+#               kind+ident+task_id+payload digest, so a retried emit collapses
+#               instead of double-counting. A caller whose event legitimately
+#               repeats with an identical payload MUST pass its own key
+#               (ship_ledger_record passes the sha; policy refusals pass a clock
+#               nonce) — otherwise the second occurrence is silently dropped, and
+#               a dropped row here is indistinguishable from an event that never
+#               happened.
+#
+# NEVER fails the caller and never speaks to it. A lifecycle event that cannot be
+# recorded must not turn a successful `task done` into a failed one; the ledger
+# is evidence about the action, not part of it. This is the same posture as
+# audit_log and ship_ledger_record.
+ledger_hash() {
+  # First 16 hex of sha256 — enough to compare payloads, short enough to render
+  # in a terminal timeline. Empty input hashes to empty, so an absent payload
+  # stays visibly absent rather than becoming the well-known sha256 of "".
+  local raw="${1:-}"
+  [[ -n "$raw" ]] || { printf ''; return 0; }
+  printf '%s' "$raw" | sha256sum 2>/dev/null | cut -c1-16 || printf ''
+}
+
+ledger_emit() {
+  local kind="${1:-}"; shift || true
+  [[ -n "$kind" ]] || return 0
+  local ident="" task_id="" parent="" actor="" authority="" idem=""
+  local raw_in="" raw_out="" policy="" tokens="" detail="" kv
+  for kv in "$@"; do
+    case "$kv" in
+      ident=*)     ident="${kv#*=}" ;;
+      task_id=*)   task_id="${kv#*=}" ;;
+      parent=*)    parent="${kv#*=}" ;;
+      actor=*)     actor="${kv#*=}" ;;
+      authority=*) authority="${kv#*=}" ;;
+      idem=*)      idem="${kv#*=}" ;;
+      in=*)        raw_in="${kv#*=}" ;;
+      out=*)       raw_out="${kv#*=}" ;;
+      policy=*)    policy="${kv#*=}" ;;
+      tokens=*)    tokens="${kv#*=}" ;;
+      detail=*)    detail="${kv#*=}" ;;
+    esac
+  done
+  local in_hash out_hash
+  in_hash=$(ledger_hash "$raw_in")
+  out_hash=$(ledger_hash "$raw_out")
+  # One resolver for identity, shared with the audit log (_actor_identity), so
+  # the two trails can never disagree about who acted.
+  [[ -n "$actor" ]]     || actor=$(_actor_identity)
+  [[ -n "$authority" ]] || authority=$(_actor_authority)
+  [[ -n "$idem" ]]      || idem="${kind}|${ident}|${task_id}|$(ledger_hash "${detail}${in_hash}${out_hash}")"
+  local host="${HOSTNAME:-$(hostname 2>/dev/null || echo unknown)}"
+  [[ "$task_id" =~ ^[0-9]+$ ]] || task_id=""
+  [[ "$tokens"  =~ ^[0-9]+$ ]] || tokens=""
+  db "INSERT OR IGNORE INTO lifecycle_events
+        (kind, ident, task_id, actor, authority, parent_ident, idem_key,
+         input_hash, output_hash, policy_decision, tokens, host, detail)
+      VALUES ($(sqlq "$kind"), $(sqlq_or_null "$ident"), ${task_id:-NULL},
+              $(sqlq "$actor"), $(sqlq "$authority"), $(sqlq_or_null "$parent"),
+              $(sqlq "$idem"), $(sqlq_or_null "$in_hash"), $(sqlq_or_null "$out_hash"),
+              $(sqlq_or_null "$policy"), ${tokens:-NULL}, $(sqlq_or_null "$host"),
+              $(sqlq_or_null "$detail"));" >/dev/null 2>&1 || true
+  return 0
+}
+
 # ship_ledger_record <kind> <ident> <repo> <branch> <sha> [reverts] — DIVE-1923.
 #
 # Append one row to the ship ledger, the capture path behind `proof scorecard`'s
@@ -1857,6 +2044,13 @@ ship_ledger_record() {
       VALUES ($(sqlq "$kind"), $(sqlq "$actor"), $(sqlq "$ident"), $(sqlq "$repo"),
               $(sqlq "$branch"), $(sqlq "$sha"), $(sqlq "$reverts"), $self);" \
     >/dev/null 2>&1 || true
+  # INST-4: mirror into the unified ledger. ship_events keeps its own shape (the
+  # scorecard's rate is computed from it and stays sourced from ONE instrument);
+  # this row is the same fact placed on the lifecycle timeline next to the gate
+  # that authorized it and the verifier who graded it. idem is the sha, matching
+  # the UNIQUE(kind,sha) contract above — re-pushing a branch stays one event.
+  ledger_emit "$kind" ident="$ident" actor="$actor" idem="${kind}:${sha}" \
+    out="$sha" detail="${repo:-?}@${branch:-?} ${sha}${reverts:+ reverts ${reverts}}"
 }
 
 # policy_refuse <exit-code> <policy-slug> <ticket> <ident> <message> — DIVE-1922.
@@ -1893,5 +2087,18 @@ policy_refuse() {
   db "INSERT INTO policy_refusals (policy, ticket, actor, ident, detail)
       VALUES ($(sqlq "$policy"), $(sqlq "$ticket"), $(sqlq "$actor"), $(sqlq "$ident"), $(sqlq "$msg"));" \
     >/dev/null 2>&1 || true
+  # INST-4: a refusal is a lifecycle event — arguably the most load-bearing one,
+  # since it is the only kind that proves the authority envelope was ENFORCED and
+  # not merely recorded. policy_decision carries the stable slug (not the message
+  # text, so rewording a refusal never breaks the series).
+  #
+  # An explicit clock-nonce idem key, NOT the derived default: the same actor
+  # hitting the same wall twice is two genuine attempts, and the derived key
+  # (which digests the payload) would collapse them into one — turning "they kept
+  # trying" into "they tried once", on the exact metric that measures how often
+  # policy bites.
+  ledger_emit policy.refused ident="$ident" actor="$actor" policy="$policy" \
+    idem="refuse:${policy}:${ident}:$(date +%s%N 2>/dev/null || echo $$)" \
+    in="$msg" detail="${policy}${ticket:+ (${ticket})} — refused with code ${code}"
   fail "$code" "$msg"
 }
