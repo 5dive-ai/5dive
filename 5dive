@@ -55,6 +55,16 @@ gh_org() {
 STATE_DIR="${STATE_DIR:-/var/lib/5dive}"
 REGISTRY="${STATE_DIR}/agents.json"
 ENV_DIR="${STATE_DIR}/agents.d"
+
+# DIVE-2336: the payload meaning "the env-override reporter did not run". Defined HERE, not
+# in lib/env_overrides.sh, because it is the fallback for that file being unavailable — a
+# fallback must not live inside the thing it is a fallback for. Caught by the full suite:
+# tests/selfcheck_unit.sh sources only header/error_codes/output/cmd_selfcheck, so a
+# call-site fallback that invoked `_env_ov_unavailable` found NO function, produced an
+# empty string, and `jq --argjson eov ""` killed the whole --json contract (33/0 -> 26/7).
+# NOT named FIVE_* on purpose: tests/lib/env_isolation.sh (DIVE-2325) blanket-clears that
+# namespace, which would delete this constant inside every harness that needs it.
+_5D_ENV_OV_UNAVAILABLE='{"process":[],"configured":[],"configured_state":"unavailable","configured_unreadable":[]}'
 SYSTEMD_UNIT="5dive-agent@"
 
 # Bumped when the on-disk registry shape changes in a way that older CLIs
@@ -3173,6 +3183,37 @@ ensure_state_ro() {
 # it is a forward guard so a reporting surface can never become an exfil path. Redaction
 # says nothing about whether a knob should be set, so it is not judgement either.
 
+# _env_ov_unavailable — the payload for "the reporter itself did not run" (DIVE-2336).
+#
+# THE DEFECT IT REPLACES. Both consumers wrapped the call as
+#   X=$(_env_overrides_json 2>/dev/null || printf '{}')   and   [[ -n "$X" ]] || X='{}'
+# so a hard failure rendered as `{}` — no process overrides, no configured overrides, no
+# state — which reads as NO OVERRIDES ARE SET. That is the could-not-check-as-negative
+# shape DIVE-2318 closed in the merge gate and DIVE-2327 closed for an unreadable
+# agents.d, reappearing one level up inside the code that closes it. The surface already
+# distinguishes read/partial/unreadable/absent for the FILES and could not distinguish
+# "the reporter failed" from "there is nothing to report".
+#
+# MEASURED, and it decides which of the four sites matters most (2026-07-29, by stubbing
+# jq to fail at each of the 7 invocations a clean run makes): EVERY failure position
+# cascades to rc!=0 with EMPTY STDOUT. So the `|| printf '{}'` arm is NOT the one the real
+# failure mode reaches — the EMPTY-STRING coercion is, which is why fixing only the two
+# obvious sites would have left the live path untouched.
+#
+# NO jq HERE, deliberately: the most likely reason the reporter failed is that jq is gone,
+# so a fallback that needs jq to say "jq is gone" says nothing at all.
+_env_ov_unavailable() {
+  # ONE definition, in header.sh — see there for why it does not live in this file.
+  # NOT `${VAR:-<json>}`: a `}` inside the default TERMINATES the parameter expansion, so
+  # that form emitted the payload plus a stray trailing brace and every consumer got
+  # malformed JSON. T0 now pins the output as parseable, which is what caught it.
+  if [[ -n "${_5D_ENV_OV_UNAVAILABLE:-}" ]]; then
+    printf '%s' "$_5D_ENV_OV_UNAVAILABLE"
+  else
+    printf '{"process":[],"configured":[],"configured_state":"unavailable","configured_unreadable":[]}'
+  fi
+}
+
 # _env_ov_redact <name> <value> — the value, or a placeholder when the NAME is
 # credential-shaped. Name-based on purpose: a value-based heuristic would have to look
 # at the secret to decide, and would leak it through its own logic.
@@ -3228,7 +3269,13 @@ _env_overrides_json() {
   while IFS= read -r n; do
     [[ -n "$n" ]] || continue
     v=$(_env_ov_redact "$n" "${!n-}")
-    proc=$(jq -c --arg k "$n" --arg v "$v" '. + [{name:$k, value:$v}]' <<<"$proc")
+    # DIVE-2336: rc CHECKED, not assumed. Unchecked, a failed jq here empties $proc and the
+    # NEXT jq then fails on invalid --argjson, so the run happens to die instead of emitting
+    # a short list. Measured true today at all 7 positions — and it is ACCIDENTAL, not
+    # designed: it holds only because the poison propagates. One `|| true` added anywhere
+    # downstream turns the same failure into a well-formed PARTIAL emitted as complete.
+    proc=$(jq -c --arg k "$n" --arg v "$v" '. + [{name:$k, value:$v}]' <<<"$proc") \
+      || { _env_ov_unavailable; return 0; }
   done < <(compgen -e 2>/dev/null | grep '^FIVE_' | sort || true)
 
   while IFS= read -r pat; do
@@ -3248,7 +3295,8 @@ _env_overrides_json() {
         val="${val%\"}"; val="${val#\"}"; val="${val%\'}"; val="${val#\'}"
         val=$(_env_ov_redact "$name" "$val")
         conf=$(jq -c --arg k "$name" --arg v "$val" --arg f "$f" \
-                 '. + [{name:$k, value:$v, file:$f}]' <<<"$conf")
+                 '. + [{name:$k, value:$v, file:$f}]' <<<"$conf") \
+          || { _env_ov_unavailable; return 0; }
       done < <(grep -E '^[[:space:]]*(export[[:space:]]+)?FIVE_[A-Za-z0-9_]+=' "$f" 2>/dev/null || true)
     done
   done < <(printf '%s\n' "${_paths[@]}")
@@ -3276,8 +3324,12 @@ _env_overrides_json() {
   else                                state="absent"
   fi
 
+  # Final assembly is checked too, and the function NEVER exits non-zero with empty
+  # stdout: a caller that has to invent a payload is a caller that will invent the wrong
+  # one, which is exactly what happened at all four call sites.
   jq -cn --argjson p "$proc" --argjson c "$conf" --arg s "$state" --argjson u "$unread" \
-    '{process:$p, configured:$c, configured_state:$s, configured_unreadable:$u}'
+    '{process:$p, configured:$c, configured_state:$s, configured_unreadable:$u}' \
+    || { _env_ov_unavailable; return 0; }
 }
 # DIVE-2102 — the C2 capability registry.
 #
@@ -19063,8 +19115,16 @@ cmd_doctor() {
 
     # DIVE-2328: the FIVE_* override report is assembled here but is NOT a check and
     # never enters DOCTOR_CHECKS. See below the summary for why that matters.
-    DOCTOR_ENV_OVERRIDES=$(_env_overrides_json 2>/dev/null || printf '{}')
-    [[ -n "$DOCTOR_ENV_OVERRIDES" ]] || DOCTOR_ENV_OVERRIDES='{}'
+    # DIVE-2336: BOTH arms used to coerce to '{}', which reads as "no overrides set".
+    # The empty-string arm is the one the real failure mode reaches (measured: every jq
+    # failure position cascades to rc!=0 with EMPTY stdout), so fixing only the visible
+    # `|| printf` would have left the live path untouched.
+    DOCTOR_ENV_OVERRIDES=$(_env_overrides_json 2>/dev/null)
+    # One condition covers BOTH old coercions: a non-zero exit and an empty result both
+    # arrive here as empty. The fallback is a CONSTANT, never `_env_ov_unavailable` — that
+    # function ships in the same file as the reporter, so it is missing in exactly the
+    # cases the fallback exists for.
+    [[ -n "$DOCTOR_ENV_OVERRIDES" ]] || DOCTOR_ENV_OVERRIDES="$_5D_ENV_OV_UNAVAILABLE"
   fi
 
   # --- summary + output ---
@@ -47059,8 +47119,12 @@ cmd_selfcheck() {
     # a knob in effect is a fact about this box, not a rail that did or did not act,
     # and folding it into the verdicts would make correct configuration read as a
     # failure. See src/lib/env_overrides.sh.
-    local _eov; _eov=$(_env_overrides_json 2>/dev/null || printf '{}')
-    [[ -n "$_eov" ]] || _eov='{}'
+    # DIVE-2336: see cmd_doctor.sh — both arms coerced a FAILURE into "nothing to report".
+    # See cmd_doctor.sh: the fallback is a CONSTANT from header.sh, because
+    # _env_ov_unavailable is as absent as _env_overrides_json in the case it covers —
+    # which is how this harness's own --json contract got broken.
+    local _eov; _eov=$(_env_overrides_json 2>/dev/null)
+    [[ -n "$_eov" ]] || _eov="$_5D_ENV_OV_UNAVAILABLE"
     printf '%s' "$jarr" | jq -s --arg label "$label" \
       --argjson fails "$fails" --argjson notreached "$notreached" \
       --argjson unexplained "$unexplained" --argjson passes "$passes" --argjson errors "$errors" \

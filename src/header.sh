@@ -55,6 +55,16 @@ gh_org() {
 STATE_DIR="${STATE_DIR:-/var/lib/5dive}"
 REGISTRY="${STATE_DIR}/agents.json"
 ENV_DIR="${STATE_DIR}/agents.d"
+
+# DIVE-2336: the payload meaning "the env-override reporter did not run". Defined HERE, not
+# in lib/env_overrides.sh, because it is the fallback for that file being unavailable — a
+# fallback must not live inside the thing it is a fallback for. Caught by the full suite:
+# tests/selfcheck_unit.sh sources only header/error_codes/output/cmd_selfcheck, so a
+# call-site fallback that invoked `_env_ov_unavailable` found NO function, produced an
+# empty string, and `jq --argjson eov ""` killed the whole --json contract (33/0 -> 26/7).
+# NOT named FIVE_* on purpose: tests/lib/env_isolation.sh (DIVE-2325) blanket-clears that
+# namespace, which would delete this constant inside every harness that needs it.
+_5D_ENV_OV_UNAVAILABLE='{"process":[],"configured":[],"configured_state":"unavailable","configured_unreadable":[]}'
 SYSTEMD_UNIT="5dive-agent@"
 
 # Bumped when the on-disk registry shape changes in a way that older CLIs
