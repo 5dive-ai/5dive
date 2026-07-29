@@ -3492,7 +3492,32 @@ _gate_tier2_floor_hit() {
       fi
     fi
   fi
-  [[ "$text" =~ $floor_rx ]]
+  # DIVE-2301: the floor terms are a bare alternation with no boundary, so every
+  # one of them is a SUBSTRING matcher: 'press' fires on suppression/expression/
+  # compressed/depression, 'charge' on recharge/supercharge. Both live on the
+  # NON-APPEALABLE list, so an ask that legitimately says "stop forging a
+  # suppression" floored to tier 2 with no appeal path, on a word that has nothing
+  # to do with press or money.
+  #
+  # The boundary is applied HERE, at the match site, and not by writing \b onto
+  # each term in $_GATE_T2_FLOOR_RX. Two reasons, both measured:
+  #
+  #   1. $floor_rx is POLICY DATA and may have been replaced wholesale by a sealed
+  #      constitution.yaml a few lines up. Anchoring the shipped default would
+  #      leave the defect live in exactly the path where the policy is
+  #      authoritative, and an org's own terms would still be substring matchers.
+  #   2. \b CANNOT anchor the money terms. \b asserts a word/non-word transition,
+  #      and '$' is not a word character, so `\b\$[0-9]` never matches: with a
+  #      per-term \b, "approve $500 for ads" and "wire €900 to the vendor" stop
+  #      flooring ALTOGETHER. That trades a false positive for a false NEGATIVE on
+  #      the one class with no escape path. `(^|[^[:alnum:]_])` is a leading
+  #      boundary that a non-word term can also sit behind, and it keeps both.
+  #
+  # LEADING only, deliberately: the terms are unanchored at the tail so inflections
+  # keep matching (revoked, truncated, charges, pressing). Containment inside an
+  # unrelated STEM is the defect; containment at the start of a longer word
+  # (pressure, deleterious) still fires and is the accepted cost of that choice.
+  [[ "$text" =~ (^|[^[:alnum:]_])($floor_rx) ]]
 }
 
 # DIVE-2224: NEVER concatenate two SUBJECTS into one classifier input. The ASK is
@@ -4109,6 +4134,20 @@ _GATE_FLOOR_APPEALABLE_RX='secret|credential|api key|token|password|publish|publ
 # NON-APPEALABLE (everything else in the floor, stated positively so a future
 # edit to the floor regex cannot silently widen what an appeal reaches): money,
 # real outbound comms, and irreversible infra/access. Never carved out.
+#
+# DIVE-2301: this constant is DOCUMENTATION OF RECORD, not a matcher — nothing
+# matches against it (grep the tree: one definition, zero uses). The non-appealable
+# decision is reached by SUBTRACTION: strip the appealable terms and re-test the
+# FULL floor, so the boundary fix at _gate_tier2_floor_hit is what actually stops
+# 'suppression' from being read as the non-appealable 'press' in an appeal refusal.
+# If this list is ever promoted to a live matcher it must go through the same
+# leading-boundary wrapper and NOT per-term \b, which cannot anchor \$[0-9]/€[0-9]
+# and would silently drop the money class out of the un-appealable half.
+#
+# The appeal path depends on an invariant this pair must keep: no APPEALABLE term
+# may be a substring of a NON-APPEALABLE one, or stripping the former would erase
+# the latter and hand an appeal to a class that has none. Asserted in
+# tests/gate_floor_word_boundary_unit.sh rather than left to review.
 _GATE_FLOOR_NONAPPEALABLE_RX='spend|billing|invoice|charge|payment|refund|subscription|price|pricing|\$[0-9]|€[0-9]|press|customer email|email customers|newsletter|blast|teardown|drop[^.]{0,20}table|truncate|irreversible|revoke|dns|domain transfer'
 # _gate_floor_appeal_residual <text>: lower-case <text> and remove ONLY the
 # appealable terms. The caller re-tests the full floor against the result; if it
@@ -4143,7 +4182,12 @@ _gate_tier2_floor_term() {
       fi
     fi
   fi
-  [[ "$text" =~ $rx ]] && printf '%s' "${BASH_REMATCH[0]}"
+  # DIVE-2301: same leading-boundary wrapper as the floor itself — this helper must
+  # never report a term the floor did not use, and that includes never reporting a
+  # term the floor no longer matches. BASH_REMATCH[0] now carries the boundary
+  # character too (" press"), so the TERM is group 2; reporting [0] would print a
+  # leading space into the warn line and into the gate record.
+  [[ "$text" =~ (^|[^[:alnum:]_])($rx) ]] && printf '%s' "${BASH_REMATCH[2]}"
 }
 
 # OSS-11 (DIVE-976) — _gate_ask_shape <ask>: normalize an ask into its "shape

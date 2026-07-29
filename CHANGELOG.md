@@ -1,5 +1,44 @@
 # Changelog
 
+## Unreleased — fix(task): the tier-2 category floor stops reading `press` inside `suppression`, without dropping `$500` out of the un-appealable half (DIVE-2301)
+
+The floor terms were a bare alternation with no boundary, which made every one of them a
+SUBSTRING matcher. `press` fired on suppression, expression, compressed, impressive and
+depression; `charge` fired on recharge and supercharge. Both terms live on the NON-APPEALABLE
+list, so an ask that legitimately said "stop forging a suppression" floored to tier 2 with no
+appeal path, naming a word about neither the press nor money. DIVE-2273's own push gate hit
+exactly this and escaped only because the match landed in the TITLE, which DIVE-2224 answer A
+exempts. The same word in an ask has no exemption.
+
+THE PRESCRIBED FIX WOULD HAVE FAILED OPEN ON MONEY, and this is why the change is not where
+the ticket put it. `\b` asserts a word/non-word transition and `$` is not a word character, so
+`\b\$[0-9]` never matches: writing a leading `\b` onto each term — the ticket's measured
+proposal, correct on every term it tested — makes "approve $500 for ads" and "wire €900 to the
+vendor" stop flooring ALTOGETHER. That trades a false positive for a false NEGATIVE on the one
+class with no escape path. Measured, not reasoned: the mutation is kept as a graded arm, and a
+per-term-`\b` build reds 5 arms of the new harness while leaving the false-positive and
+inflection arms green — the shape that would have let it merge.
+
+WHAT LANDED. A leading boundary `(^|[^[:alnum:]_])` applied at the MATCH SITE
+(`_gate_tier2_floor_hit`, `_gate_tier2_floor_term`) rather than written into the term list.
+Two consequences beyond the ticket: a non-word term can sit behind it, so the money class keeps
+firing; and it anchors the regex a sealed `constitution.yaml` supplies, which REPLACES the
+shipped default wholesale — anchoring the default alone would have left the defect live in
+exactly the path where the policy is authoritative, and every org's own terms would still be
+substring matchers. LEADING only, deliberately: the tail stays open so inflections keep
+matching (revoked, truncated, charges, pressing). Containment at the START of a longer word
+(pressure, deleterious) still fires and is the accepted cost of keeping those.
+
+ALSO RECORDED, not changed: `_GATE_FLOOR_NONAPPEALABLE_RX` is documentation of record, not a
+matcher — one definition, zero uses. The non-appealable decision is reached by SUBTRACTION
+(strip the appealable terms, re-test the full floor), so the boundary fix is what actually stops
+an appeal being refused in the name of a `press` the ask never contained. The invariant that
+subtraction depends on — no appealable term may be a substring of a non-appealable one, or
+stripping the former erases the latter — is now asserted by a test instead of left to review.
+
+`tests/gate_floor_word_boundary_unit.sh`: 32 arms, both halves graded on purpose so a later
+"fix" for the false positives cannot quietly break the true ones.
+
 ## Unreleased — fix(tasks): the production task board refuses a write from a sourced-library caller, so a harness cannot leak fixture rows onto it (DIVE-2249)
 
 On 2026-07-27 a run of `tests/gate_verifier_route_unit.sh` appended six fixture rows to the
