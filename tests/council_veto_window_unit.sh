@@ -190,6 +190,96 @@ else
   echo "  skip: node not on PATH (precedent-pool extraction)"
 fi
 
+echo "--- FINDING 3 (iteration 2): a subject-less PRIMARY convene is refused AT CONVENE TIME"
+# WHY THIS IS GRADED HERE AND NOT ONLY IN council_veto_e2e.sh: that suite needs root to seal a
+# genesis, so it SKIPS in a scoped session — and a skip is NOT-REACHED, never PASS. The iteration-1
+# build shipped precisely because the only test that could see this class never ran. These arms are
+# offline: no key, no root, no live state.
+#
+# The iteration-1 defect was NOT in the predicate — `_council_veto_offer_eligible` correctly said
+# "primary bench, no subject" (rc 2). It was in what the CALL SITE did with that answer: record the
+# omission and convene anyway. The receipt sealed, no offer was minted, and the founder veto
+# silently ceased to exist with nothing red anywhere. So both halves are graded, and so is the SEAM
+# between them — the seam is where it broke.
+CHK_SRC="$(extract _council_convene_subject_check)"
+ELIG_SRC="$(extract _council_veto_offer_eligible)"
+if [[ -z "$CHK_SRC" || -z "$ELIG_SRC" ]]; then
+  no "could not extract _council_convene_subject_check / _council_veto_offer_eligible from $SRC"
+else
+  # (a) the predicate pair: primary + no subject is the ONLY combination that refuses.
+  cat > "$TMP/subj.sh" <<EOSH
+set -uo pipefail
+$ELIG_SRC
+$CHK_SRC
+EOSH
+  probe(){ # $1=bench $2=seats_given $3=subject $4=msubject $5=mkind $6=genesis -> "eligrc|chkrc|msg"
+    local e c m
+    m="$(bash -c "source '$TMP/subj.sh'; _council_veto_offer_eligible '$1' '$2' council '$3' '$4' '$5'" 2>/dev/null)"; e=$?
+    m="$(bash -c "source '$TMP/subj.sh'; _council_convene_subject_check '$e' '$6'" 2>/dev/null)"; c=$?
+    printf '%s|%s|%s' "$e" "$c" "$m"
+  }
+  r="$(probe "" 0 "" "" "" 1)"
+  [[ "${r%%|*}" == "2" && "$(printf '%s' "$r" | cut -d'|' -f2)" == "1" ]] \
+    && ok "primary bench + no subject + genesis -> REFUSE (elig=2, check=1)" || no "primary/no-subject did not refuse (got $r)"
+  printf '%s' "$r" | grep -q -- '--subject' && ok "the refusal message names the --subject flag the caller must supply" || no "refusal message does not name --subject (got $r)"
+  # the three combinations that must NOT refuse — a check that refused everything would otherwise
+  # read as a pass on the arm above.
+  r="$(probe "" 0 "DIVE-1" "" "" 1)"
+  [[ "$(printf '%s' "$r" | cut -d'|' -f2)" == "0" ]] && ok "primary bench WITH a subject convenes (check=0)" || no "a subject-bearing primary convene was refused (got $r)"
+  r="$(probe "" 1 "" "" "" 1)"
+  [[ "${r%%|*}" == "1" && "$(printf '%s' "$r" | cut -d'|' -f2)" == "0" ]] \
+    && ok "an AD-HOC --seats panel with no subject is UNTOUCHED (elig=1, check=0)" || no "the subject requirement leaked onto ad-hoc panels (got $r)"
+  r="$(probe "" 0 "" "" "amend" 1)"
+  [[ "${r%%|*}" == "0" && "$(printf '%s' "$r" | cut -d'|' -f2)" == "0" ]] \
+    && ok "a governance MOTION is self-identifying (kind supplies the subject; elig=0)" || no "a motion convene was refused (got $r)"
+  r="$(probe "" 0 "" "" "" 0)"
+  [[ "$(printf '%s' "$r" | cut -d'|' -f2)" == "0" ]] \
+    && ok "with no sealed genesis the check stands down (cli.mjs already fails that convene closed)" || no "no-genesis leg refused in the wrong layer (got $r)"
+
+  # (b) THE SEAM: run the real call-site block with the collaborators stubbed, and assert it ABORTS.
+  # This is the arm that would have caught iteration 1 — the predicate was already right there.
+  CALL_SRC="$(sed -n '/^  local _cv_refusal=""$/,/^  fi$/p' "$SRC" | sed 's/^  local /  /')"
+  callsites="$(grep -cF '_council_convene_subject_check "$_cv_elig"' "$SRC")"
+  [[ "$callsites" == "1" ]] && ok "the convene-time check has exactly ONE call site (seam grading below is sound)" \
+    || no "call-site count = $callsites (expected 1) — the seam grade is unsound"
+  if [[ -z "$CALL_SRC" ]]; then
+    no "could not extract the convene-time call site from $SRC"
+  else
+    seam(){ # $1 = check rc to simulate -> writes a trace to stdout
+      cat > "$TMP/seam.sh" <<EOSH
+set -uo pipefail
+E_USAGE=2
+_cv_elig=2; genesis_exists=1
+_council_convene_subject_check(){ printf '%s' "supply --subject"; return $1; }
+_council_veto_offer_omitted(){ echo "OMITTED"; return 0; }
+fail(){ echo "FAILED rc=\$1"; exit 99; }
+$CALL_SRC
+echo "CONVENE-PROCEEDED"
+EOSH
+      bash "$TMP/seam.sh" 2>&1
+    }
+    t="$(seam 1)"
+    if printf '%s' "$t" | grep -q 'FAILED rc=2' && ! printf '%s' "$t" | grep -q 'CONVENE-PROCEEDED'; then
+      ok "the call site ABORTS the convene on a refusal (fail rc=E_USAGE, deliberation never runs)"
+    else
+      no "the call site did not abort — this is the iteration-1 defect (trace: $t)"
+    fi
+    printf '%s' "$t" | grep -q 'OMITTED' && ok "the refusal is still written to the auditable veto ledger before aborting" \
+      || no "a refused convene leaves no audit row (trace: $t)"
+    # negative control: with the check standing down the SAME block must fall through and convene.
+    t="$(seam 0)"
+    printf '%s' "$t" | grep -q 'CONVENE-PROCEEDED' && ok "with nothing to refuse the same block falls through and the convene proceeds" \
+      || no "the call site aborts unconditionally (trace: $t)"
+  fi
+
+  # (c) the in-repo PRIMARY-bench callers must each name a subject, or they self-refuse in prod.
+  # (gate-clear and the motion path already did; rot-triage and schedule did not.)
+  grep -q -- '_council_convene_json "$q" --mode=adversarial --subject=' "$SRC" \
+    && ok "the rot-triage convene names its subject" || no "rot-triage convenes the primary council with no subject"
+  grep -q -- '--subject="schedule:$name"' "$SRC" \
+    && ok "the scheduled convene names its subject" || no "council schedule convenes the primary council with no subject"
+fi
+
 echo
 echo "council veto-window unit: $pass passed, $fail failed"
 [[ "$fail" -eq 0 ]]

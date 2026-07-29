@@ -87,14 +87,14 @@ if "$FIVE" council verify >/dev/null 2>&1; then no "verify GREEN on a drifted (h
 V="$("$FIVE" council verify --json 2>/dev/null)"
 [[ "$(printf '%s' "$V" | jq -r '.data.constitutionOk')" == "false" ]] && ok "verify --json flags constitutionOk=false on drift" || no "verify json did not flag the drift"
 # a primary-council convene under drift ESCALATES (does not enforce forged governance)
-C="$("$FIVE" council convene "Ship the thing?" --json 2>/dev/null)"
+C="$("$FIVE" council convene "Ship the thing?" --subject="DIVE-2257 drift leg" --json 2>/dev/null)"
 [[ "$(printf '%s' "$C" | jq -r '.data.driftEscalated')" == "true" ]] && ok "primary-council convene ESCALATES under drift" || no "convene did not drift-escalate ($C)"
 [[ "$(printf '%s' "$C" | jq -r '.data.verdict.recommendation')" == "escalate" ]] && ok "the drift verdict is escalate" || no "drift verdict not escalate"
 
 # --- drift is RECOVERABLE: restore the sealed file -> GREEN again --------------------------------
 cp "$TMP/new.yaml" "$CFILE"
 "$FIVE" council verify >/dev/null 2>&1 && ok "verify GREEN again once the sealed constitution.yaml is restored" || no "verify still RED after restoring the file"
-[[ "$(printf '%s' "$("$FIVE" council convene "Ship the thing?" --json 2>/dev/null)" | jq -r '.data.driftEscalated // empty')" == "" ]] && ok "convene no longer drift-escalates once restored" || no "convene still drift-escalates after restore"
+[[ "$(printf '%s' "$("$FIVE" council convene "Ship the thing?" --subject="DIVE-2257 drift leg" --json 2>/dev/null)" | jq -r '.data.driftEscalated // empty')" == "" ]] && ok "convene no longer drift-escalates once restored" || no "convene still drift-escalates after restore"
 
 echo
 if (( fail )); then echo "CNCL-15 amend/drift e2e: $pass passed, $fail FAILED"; exit 1; fi
