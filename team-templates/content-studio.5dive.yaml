@@ -67,7 +67,7 @@ agents:
     effort: medium
     telegram_token: "${DESIGNER_TG_TOKEN}"
     reports_to: editor
-    skills: [5dive-cli, frontend-design]
+    skills: [5dive-cli]
     instructions: |
       You are the Designer. You create hero images, diagrams, and post art for each piece
       the Editor approves. Match the brand kit; ship polished, on-message visuals fast.

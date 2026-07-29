@@ -37,3 +37,9 @@ npm-debug.log*
 # `selfcheck --full` / probe sweep. They are deleted on a clean exit; a killed run
 # leaves them behind, and `git add -A` in the same tree would commit them (it did).
 tests/.probe-*
+
+# DIVE-2091: the built bundle is generated at TAG time by release-cut.yml,
+# never committed on main — a 47k-line generated file on main invalidates every
+# open PR on every merge. install.sh fetches it from the tag's tree.
+/5dive
+/5dive.sha256
