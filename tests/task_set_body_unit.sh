@@ -52,14 +52,27 @@ out=$(run set_body "$id1" "here is the missing context")
   && ok_t "set-body writes the body" || bad_t "set-body writes the body" "got: $(bodyof "$id1")"
 
 # --- T2: default overwrites, not appends
-run set_body "$id1" "replacement text" >/dev/null
+out2=$(run set_body "$id1" "replacement text")
 [[ "$(bodyof "$id1")" == "replacement text" ]] \
   && ok_t "set-body (no --append) overwrites the prior body" || bad_t "set-body overwrites" "got: $(bodyof "$id1")"
+[[ "$(printf '%s' "$out2" | jf '.data.prior_lines')" == "1" \
+   && "$(printf '%s' "$out2" | jf '.data.new_lines')" == "1" \
+   && "$(printf '%s' "$out2" | jf '.data.prior_len')" == "27" \
+   && "$(printf '%s' "$out2" | jf '.data.new_len')" == "16" ]] \
+  && ok_t "set-body overwrite reports its before/after magnitude" \
+  || bad_t "set-body overwrite magnitude" "$out2"
+JSON_MODE=0
+out2_prose=$(run set_body "$id1" $'replacement line one\nreplacement line two')
+JSON_MODE=1
+[[ "$out2_prose" == *"1 line -> 2 lines, +1"* ]] \
+  && ok_t "set-body prose announces overwrite line delta" \
+  || bad_t "set-body prose overwrite magnitude" "$out2_prose"
 
 # --- T3: --append tacks onto the existing body without clobbering it
+before3=$(bodyof "$id1")
 run set_body "$id1" "an addendum" --append >/dev/null
 b3=$(bodyof "$id1")
-{ printf '%s' "$b3" | grep -q "replacement text" && printf '%s' "$b3" | grep -q "an addendum"; } \
+[[ "$b3" == "${before3}"$'\n\n'"an addendum" ]] \
   && ok_t "set-body --append preserves the prior body and adds the new text" \
   || bad_t "set-body --append preserves + adds" "$b3"
 
@@ -88,6 +101,21 @@ e6=$(run set_body "$id4" "too late"); rc=$?
 e7=$(run set_body "$id1"); rc=$?
 [[ $rc -ne 0 ]] && printf '%s' "$e7" | grep -q "usage: 5dive task set-body" \
   && ok_t "set-body with no text errors" || bad_t "set-body with no text errors" "rc=$rc $e7"
+
+# --- T8: boolean --append=<payload> fails safely without echoing the payload
+payload="ZZPAYLOADZZ this must not look acknowledged"
+before8=$(bodyof "$id1")
+e8=$(run set_body "$id1" "--append=$payload"); rc=$?
+err8=$(<"$TMP/err")
+[[ $rc -eq "$E_USAGE" \
+   && "$e8" == *"--append is a boolean flag"* \
+   && "$e8" != *"$payload"* \
+   && "$err8" != *"$payload"* ]] \
+  && ok_t "set-body rejects --append=<payload> without echoing the payload" \
+  || bad_t "set-body payload-safe boolean error" "rc=$rc stdout=$e8 stderr=$err8"
+[[ "$(bodyof "$id1")" == "$before8" ]] \
+  && ok_t "rejected --append=<payload> leaves the body untouched" \
+  || bad_t "rejected --append=<payload> changed the body" "got: $(bodyof "$id1")"
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [[ $FAIL -eq 0 ]]
