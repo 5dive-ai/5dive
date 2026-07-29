@@ -34,6 +34,10 @@ set +e
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"
 SRC="$ROOT/src/cmd_agent_runtime.sh"
+# auto_sender_from_sudo is the SHARED actor resolver and lives in lib/validation.sh, not
+# here. Naming it explicitly because extracting it from $SRC silently yields NOTHING —
+# which is how the first cut of T6b "passed" its own rig while proving nothing.
+VSRC="$ROOT/src/lib/validation.sh"
 
 pass=0; fail=0
 ok_t()  { printf 'ok   - %s\n' "$1"; pass=$((pass+1)); }
@@ -46,6 +50,10 @@ FN="$(awk '/^_envelope_sender_fallback\(\) \{/,/^\}/' "$SRC")"
   && ok_t 'T0 the helper is present and extractable' \
   || bad_t 'T0 helper not found — every arm below is vacuous' "src=$SRC"
 eval "$FN"
+[[ -s "$VSRC" ]] \
+  && ok_t 'T0b the shared resolver source is present — the T6 rigs are not extracting from an empty file' \
+  || bad_t 'T0b lib/validation.sh missing — T6a/T6b would pass vacuously' "vsrc=$VSRC"
+
 
 # --- T1 both real branches, no mocking, no skip ------------------------------
 REAL_UID="$(grep -m1 '^Uid:' /proc/self/status | awk '{print $2}')"
@@ -88,17 +96,68 @@ printf '%s' "$FN" | grep -q 'done < /etc/passwd' \
 # Before the fix the header recomputed auto_sender_from_sudo inline, so a direct-path
 # send could show a real from= beside tier=unknown:no-caller: two fields disagreeing
 # about one sender.
-if grep -q 'envelope_tier "\$_dcaller"' "$SRC" && grep -q '_dcaller="\$(auto_sender_from_sudo)"' "$SRC"; then
-  ok_t 'T5 tier= is computed from the same resolved caller as from='
+# Updated with the T6 swap: both fields now resolve through _envelope_caller, so the
+# constraint is unchanged and only the spelling moved. Asserted as the ABSENCE of the
+# defect shape rather than the presence of one spelling — an inline
+# `envelope_tier "$(...)"` is the bug, whatever function sits inside it.
+if grep -q 'envelope_tier "\$_dcaller"' "$SRC" && grep -q '_dcaller="\$(_envelope_caller)"' "$SRC"; then
+  ok_t 'T5 tier= is computed from the same resolved caller as from= (both via _envelope_caller)'
 else
   bad_t 'T5 tier= recomputes its own caller — from= and tier= can disagree' \
         "$(grep -n 'envelope_tier' "$SRC" | head -3)"
 fi
+if grep -qE 'envelope_tier "\$\([a-z_]+\)"' "$SRC"; then
+  bad_t 'T5b an inline envelope_tier "$(resolver)" is back — that IS the disagreeing-fields defect' \
+        "$(grep -nE 'envelope_tier "\$\([a-z_]+\)"' "$SRC" | head -3)"
+else
+  ok_t 'T5b no inline envelope_tier "$(resolver)" anywhere — the caller is always resolved to a variable first'
+fi
 
-# --- T6 the fallback is ONLY reached when sudo yields nothing -----------------
-grep -q '\[\[ -n "\$sender" \]\] || sender="\$(_envelope_sender_fallback)"' "$SRC" \
-  && ok_t 'T6 fallback runs ONLY when auto_sender_from_sudo is empty (sudo path unchanged)' \
-  || bad_t 'T6 the fallback is not gated behind the sudo resolver' ''
+# --- T6 PRECEDENCE: the unforgeable source WINS over the forgeable one --------
+# Rewritten after dev's review. The previous T6 grepped for the fallback being gated
+# BEHIND auto_sender_from_sudo, which pinned the wrong order: $SUDO_USER is a plain env
+# var on the direct path, so asking it first meant the composition preferred the
+# FORGEABLE source. T6's stated justification — "sudo path unchanged" — is satisfied by
+# BOTH orderings (T6c proves it), so the constraint survives and only the assertion moved.
+#
+# Graded BEHAVIOURALLY, not by grep: the old arm would have stayed green through the
+# actual defect, since it asserted the presence of a line rather than an outcome.
+eval "$(awk '/^auto_sender_from_sudo\(\) \{/,/^\}/' "$VSRC")"
+eval "$(awk '/^_envelope_caller\(\) \{/,/^\}/' "$SRC")"
+
+# T6a — THE FORGERY. A caller who exports SUDO_USER must not be able to choose the name.
+# Only meaningful when the runner IS an agent-* user; otherwise both sources are empty
+# and the arm would pass vacuously, so say which case ran rather than reporting green.
+if [[ "$REAL_NAME" == agent-* ]]; then
+  forged="$(SUDO_USER=agent-notme _envelope_caller)"
+  [[ "$forged" == "${REAL_NAME#agent-}" ]] \
+    && ok_t "T6a forged SUDO_USER is IGNORED on the direct path (got '$forged', the real EUID label)" \
+    || bad_t 'T6a a forged SUDO_USER chose the envelope sender' "got='$forged' want='${REAL_NAME#agent-}'"
+  # T6b — and the old ordering really does produce the forgery, so T6a is not vacuous.
+  _legacy_rig="$(mktemp)"
+  {
+    awk '/^auto_sender_from_sudo\(\) \{/,/^\}/'   "$VSRC"
+    awk '/^_envelope_sender_fallback\(\) \{/,/^\}/' "$SRC"
+    printf 'x="$(auto_sender_from_sudo)"; [[ -n "$x" ]] || x="$(_envelope_sender_fallback)"; printf "%%s" "$x"\n'
+  } > "$_legacy_rig"
+  legacy="$(SUDO_USER=agent-notme bash "$_legacy_rig")"
+  rm -f "$_legacy_rig"
+  [[ "$legacy" == "notme" ]] \
+    && ok_t 'T6b ANCHOR: the sudo-first ordering DOES forge (returns the exported name) — T6a is not vacuous' \
+    || bad_t 'T6b anchor did not reproduce the forgery — T6a proves nothing' "legacy='$legacy'"
+else
+  bad_t 'T6a/T6b need an agent-* runner to mean anything' "runner='$REAL_NAME' — NOT-REACHED, not a pass"
+fi
+
+# T6c — THE SCOPED PATH IS UNCHANGED BY THE SWAP, which is what makes it free. As root
+# the EUID branch returns empty (root is not agent-*), so SUDO_USER — written by sudo
+# under env_reset, not by the caller — still answers. Asserted against the real function
+# with EUID forced to 0 via a subshell that cannot actually setuid, so grade the
+# COMPONENT: _envelope_sender_fallback must yield empty for uid 0.
+root_side="$(awk -F: '$3==0{print $1; exit}' /etc/passwd)"
+[[ "$root_side" != agent-* ]] \
+  && ok_t "T6c uid 0 ('$root_side') is not agent-* — EUID branch yields empty as root, so _deliver still resolves via SUDO_USER" \
+  || bad_t 'T6c uid 0 resolves as an agent — the scoped path would change behaviour' "root_side='$root_side'"
 
 echo "-----"
 echo "envelope_sender_fallback_unit: $pass passed, $fail failed"

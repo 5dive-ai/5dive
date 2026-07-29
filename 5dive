@@ -15846,6 +15846,41 @@ _envelope_sender_fallback() {
   printf ''
 }
 
+# DIVE-2281 — WHO the envelope says you are. The PRECEDENCE is the security property,
+# so it lives here once instead of being re-composed at each call site.
+#
+# $EUID FIRST, $SUDO_USER SECOND, and that order is the entire point. Both answer "who
+# is calling"; only one is unforgeable BY THE CALLER:
+#   * $EUID is a bash builtin reflecting the kernel's view of the process. A caller
+#     cannot lie about it without already being that user.
+#   * $SUDO_USER is A PLAIN ENVIRONMENT VARIABLE. On the SCOPED path sudo sets it under
+#     env_reset, so it is trustworthy THERE. On the DIRECT path nothing sanitises it, so
+#     a full-trust agent can simply export it.
+#
+# The first cut asked SUDO_USER first and fell back to EUID, i.e. it preferred the
+# FORGEABLE source over the unforgeable one. MEASURED on this host, real EUID=agent-main
+# with SUDO_USER=agent-olivia exported:
+#     caller resolved to 'olivia'  ->  envelope would read from=olivia at olivia's tier
+# and since this change is what MINTS an envelope on the direct path at all, that
+# ordering would have newly created a FORGEABLE envelope where there was previously NO
+# envelope — and a reader trusts an envelope more than its absence. Different failure
+# from the one being closed, introduced by the fix for it. Caught by dev on review.
+#
+# THE SCOPED PATH IS INDIFFERENT TO THE ORDER, which is why the swap costs nothing:
+# `_deliver` runs as root, EUID=0 resolves to `root` in /etc/passwd, `root` is not
+# `agent-*`, so the EUID branch returns empty and SUDO_USER — written by sudo, not by
+# the caller — still answers. Measured: EUID=0 + SUDO_USER=agent-main still yields 'main'.
+#
+# NOT CLOSED: $SUDO_USER remains forgeable wherever it is still consulted, which is now
+# only the root/_deliver path where sudo wrote it. DIVE-2330 owns that vector where it
+# feeds AUTHORIZATION rather than display.
+_envelope_caller() {
+  local who
+  who="$(_envelope_sender_fallback)"
+  [[ -n "$who" ]] || who="$(auto_sender_from_sudo)"
+  printf '%s' "$who"
+}
+
 cmd_send() {
   local name="" message="" from="" from_set=0 raw=0
   local reply_to_chat="" reply_to_msg=""
@@ -15935,10 +15970,9 @@ cmd_send() {
     if (( from_set )); then
       sender="$from"
     else
-      sender="$(auto_sender_from_sudo)"
-      # DIVE-2281: no sudo identity means the process IS the sender. Without this the
+      # DIVE-2281: EUID first (see _envelope_caller). Without any derivation here the
       # envelope is skipped entirely and the inject is indistinguishable from a human.
-      [[ -n "$sender" ]] || sender="$(_envelope_sender_fallback)"
+      sender="$(_envelope_caller)"
     fi
     if [[ -z "$sender" && -n "$reply_to_chat" ]]; then
       sender="human"
@@ -15956,10 +15990,9 @@ cmd_send() {
       # untiered send, so the forgeable field survived and the unforgeable one
       # silently vanished. Now it reads tier=unknown:no-caller.
       local _caller _tier=""
-      _caller="$(auto_sender_from_sudo)"
-      # DIVE-2281: same fallback as cmd_send — without it the tier stays
-      # unknown:no-caller on the direct path even once the envelope appears.
-      [[ -n "$_caller" ]] || _caller="$(_envelope_sender_fallback)"
+      # DIVE-2281: same resolver as the sender above, so from= and tier= cannot
+      # disagree, and the tier stops reading unknown:no-caller on the direct path.
+      _caller="$(_envelope_caller)"
       _tier="$(envelope_tier "$_caller")"
       local header="[5dive-msg from=${sender} id=${msg_id}"
       header+=" tier=${_tier}"
@@ -16143,8 +16176,7 @@ cmd_ask() {
     # describe the same process. Previously this recomputed auto_sender_from_sudo
     # inline, so a direct-path send could show a real from= beside
     # tier=unknown:no-caller — two fields disagreeing about one sender.
-    local _dcaller; _dcaller="$(auto_sender_from_sudo)"
-    [[ -n "$_dcaller" ]] || _dcaller="$(_envelope_sender_fallback)"
+    local _dcaller; _dcaller="$(_envelope_caller)"
     local header="[5dive-msg from=${sender} id=${msg_id} tier=$(envelope_tier "$_dcaller")"
     [[ -n "$reply_to_chat" ]] && header+=" reply-to-chat=${reply_to_chat}"
     [[ -n "$reply_to_msg" ]] && header+=" reply-to-msg=${reply_to_msg}"
