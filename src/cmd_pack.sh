@@ -1187,6 +1187,18 @@ cmd_import() {
   [[ -n "$p_type" ]]   && type="$p_type"
   [[ -n "$p_model" ]]  && model="$p_model"
   [[ -n "$p_effort" ]] && effort="$p_effort"
+  # DIVE-2303: resolve a family ALIAS to the full current id before it reaches
+  # settings.json. A pack may legitimately carry model:"opus" — that is the whole
+  # point, so a published character does not freeze on the id that was current the
+  # day it was packed — but the value below is written RAW into a brand-new agent's
+  # settings.json, and per src/lib/models.sh (DIVE-506/536) Claude Code >= 2.1.181
+  # runs a startup migration that STRIPS a bare alias from a FRESH config dir. An
+  # imported agent's config dir is always fresh, so without this the agent would
+  # silently lose its pin on first boot and fall back to the runtime default —
+  # while the manifest still read correctly, which is what makes it hard to see.
+  # A full id passes through resolve_model_alias untouched, so this is a no-op for
+  # packs that deliberately pin.
+  [[ -n "$model" ]] && model=$(resolve_model_alias "$model")
   [[ -n "$type" ]] || { rm -rf "$stage"; fail "$E_VALIDATION" "manifest has no agent type"; }
   is_known_type "$type" || { rm -rf "$stage"; fail "$E_NOT_FOUND" "unknown --type '$type' (known: ${!TYPE_BIN[*]})"; }
   [[ -n "$workdir" ]] || workdir="$m_workdir"
