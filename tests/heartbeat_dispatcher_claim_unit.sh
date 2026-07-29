@@ -219,6 +219,54 @@ read -r RC_N _ < <(_hb_reclaim dev 30)
   && ok_t "claim -> aged past budget -> reaper requeues to todo (end-to-end, no hand-written state)" \
   || bad_t "claim -> aged -> reaper requeues" "reachedInProgress=$REACHED_INPROG row=$(row "$R1") reclaimed=${RC_N:-?}"
 
+# --- 5b) The hard cap does NOT depend on the liveness probe ------------------
+# The claim is stamped on DELIVERY, not acceptance — _hb_wake succeeding means
+# the nudge was SENT, not that the agent began. That is only safe because the
+# net behind it is not computed from the same unreliable read. Before this
+# change an abandoned task was re-nudged every everyMin unconditionally; now it
+# is held by the busy guard until a reclaim rule fires. If BOTH reclaim rules
+# consulted _hb_agent_idle, a probe that is wrong in the busy direction (a hung
+# process that still reads alive) would leave a task neither re-nudged NOR
+# reclaimed, indefinitely, while the board shows it in_progress — a silent
+# permanent stall, introduced by a change whose purpose is stall recovery.
+#
+# So drive the hostile case: idle probe insists the agent is BUSY (rc 1, rule
+# (b) can never fire) and the pane is dead so `/goal clear` fails. Rule (c) must
+# still requeue on arithmetic alone.
+db "DELETE FROM tasks;"
+H1=$(mk "hung but looks alive")
+seed_reg 0; WAKE_CALLS=0
+cmd_heartbeat_tick >/dev/null 2>&1
+H_CLAIMED=0; [[ "$(row "$H1")" == in_progress\|* ]] && H_CLAIMED=1
+db "UPDATE tasks SET started_at=datetime('now','-200 minutes') WHERE id=${H1} AND status='in_progress';"
+_hb_agent_idle() { return 1; }   # confident BUSY — rule (b) is disabled
+_hb_send_line()  { return 1; }   # dead pane — the /goal clear cannot land
+read -r HRC_N _ < <(_hb_reclaim dev 30)
+(( H_CLAIMED == 1 )) && [[ "$(row "$H1")" == "todo|NULL" ]] && (( ${HRC_N:-0} == 1 )) \
+  && ok_t "hard cap (c) requeues with the idle probe saying BUSY and the pane DEAD — unconditional" \
+  || bad_t "hard cap (c) is unconditional" "claimed=$H_CLAIMED row=$(row "$H1") reclaimed=${HRC_N:-?}"
+# Differential: the same hostile stubs at the same call, but UNDER the budget.
+# If (c) were firing on something other than age the assertion above would be
+# vacuous. Note the stubs are restored for the TICK and re-applied only for the
+# _hb_reclaim call — a "busy" idle reading makes the tick active-defer, so
+# leaving them hostile across the wake would starve this arm of its claim and
+# grade a row that was never in_progress (the first draft did exactly that).
+db "DELETE FROM tasks;"
+_hb_agent_idle() { return 0; }
+_hb_send_line()  { return 0; }
+H2=$(mk "hung but young")
+seed_reg 0
+cmd_heartbeat_tick >/dev/null 2>&1
+db "UPDATE tasks SET started_at=datetime('now','-40 minutes') WHERE id=${H2} AND status='in_progress';"
+_hb_agent_idle() { return 1; }
+_hb_send_line()  { return 1; }
+read -r HRC2_N _ < <(_hb_reclaim dev 30)
+[[ "$(row "$H2")" == in_progress\|* ]] && (( ${HRC2_N:-0} == 0 )) \
+  && ok_t "same hostile stubs UNDER the 90m budget => no reclaim (the cap fires on AGE, not on the probe)" \
+  || bad_t "under-budget control" "row=$(row "$H2") reclaimed=${HRC2_N:-?}"
+_hb_agent_idle() { return 0; }   # restore
+_hb_send_line()  { return 0; }
+
 # --- 6) MUTATION ARM: neuter the claim, both arms must go RED ----------------
 _hb_claim_task_REAL() { :; }   # placeholder so the name exists before we save it
 eval "$(declare -f _hb_claim_task | sed '1s/^_hb_claim_task/_hb_claim_task_REAL/')"

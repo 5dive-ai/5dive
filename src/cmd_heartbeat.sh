@@ -1036,6 +1036,28 @@ _hb_ident() {
 # The heartbeat already knows the exact task it woke the agent for, so the claim
 # belongs here.
 #
+# KNOWN PROPERTY, not an accident of where the UPDATE landed: THIS CLAIMS ON
+# DELIVERY, NOT ON ACCEPTANCE. _hb_wake succeeding means the nudge was SENT into
+# the pane. It does not mean the agent read it, understood it, or began. So a
+# nudge that lands in a wedged pane produces a row that reads "someone is on
+# this" while nobody is — the board asserts work-in-progress from a send. There
+# is no acceptance signal available at this layer to claim on instead (the agent
+# reading its own nudge is unobservable from here), so delivery is the honest
+# ceiling of what the dispatcher can know, and it is stated rather than implied.
+#
+# What keeps that from becoming a silent permanent stall is that the recovery
+# net behind it does NOT depend on the same unreliable liveness read. Of the
+# three reclaim rules in _hb_reclaim, rule (c) — the hard cap at
+# everyMin*_HB_STALE_MULT — is UNCONDITIONAL: pure arithmetic on age_min, no
+# _hb_agent_idle call, and its `/goal clear` is best-effort (`|| true`) so a dead
+# pane cannot gate the requeue. Only rule (b) consults the idle probe. So if the
+# probe is wrong in the busy direction (a hung process that still reads alive),
+# rule (b) misses and the worst case is a BOUNDED stall to the budget, then a
+# requeue; a second overrun blocks + escalates to a human rather than churning.
+# A wrong probe cannot produce a task that is neither re-nudged nor reclaimed.
+# tests/heartbeat_dispatcher_claim_unit.sh fences this directly rather than
+# leaving it to a reading of the code.
+#
 # NARROW BY CONSTRUCTION — this must not become a way for a tick to rewrite rows:
 #   * called ONLY inside the _hb_wake success branch, so a tick that wakes nobody
 #     (not due / busy / no work / spread-deferred / wake failed) mutates nothing;
