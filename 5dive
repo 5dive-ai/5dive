@@ -988,18 +988,78 @@ gen_msg_id() {
 # Root/cron keep returning empty deliberately: `id -un` = root is not an agent, so
 # `_deliver` (which runs as root with SUDO_USER=agent-X) still resolves via the
 # SUDO_USER branch exactly as before. No path that worked changes.
+# Resolve a NUMERIC uid to its `agent-<label>` suffix, or empty for any non-agent.
+# Pure bash over /etc/passwd: no external command, so nothing here is PATH-resolved.
+# The passwd path is a positional arg (default /etc/passwd) rather than an env var
+# ON PURPOSE — an env-driven override would reintroduce exactly the forgery this
+# function exists to close. Tests pass a fixture explicitly.
+# LIMIT: local passwd only. An LDAP/SSSD-backed agent user would not resolve and
+# would return empty (fail-closed to "no envelope"), which is the safe direction.
+_agent_label_from_uid() {
+  local want="$1" passwd="${2:-/etc/passwd}" name _x uid
+  [[ "$want" =~ ^[0-9]+$ ]] || { echo ""; return; }
+  while IFS=: read -r name _x uid _; do
+    [[ "$uid" == "$want" ]] || continue
+    [[ "$name" == agent-* ]] || { echo ""; return; }
+    echo "${name#agent-}"; return
+  done < "$passwd"
+  echo ""
+}
+
+# DIVE-2281 — derive the sender from an identity the CALLER CANNOT CHOOSE.
+#
+# TWO FORGERY VECTORS, both demonstrated by running them (2026-07-29):
+#
+#   1. A bare `id -un` resolves through the caller's PATH. An agent controlling its
+#      own environment drops a fake `id` earlier in PATH and names itself anything:
+#        PATH=/tmp/fake:$PATH  ->  auto_sender_from_sudo returned "olivia"
+#      Flagged by olivia from DIVE-1401, where she retracted a PASS over precisely
+#      this. She was right, and the first cut of this fix had the bug: worse, its
+#      OWN HARNESS stubbed `id` via a PATH shim, which is the attack — the test
+#      demonstrated the vector while asserting the function was sound.
+#
+#   2. $SUDO_USER is JUST AN ENVIRONMENT VARIABLE, and this is PRE-EXISTING:
+#        SUDO_USER=agent-olivia 5dive agent send …  ->  returned "olivia"
+#      On the SCOPED path that is safe, because sudo sets SUDO_USER itself under
+#      env_reset — the value there was written by sudo, not by the caller. On the
+#      DIRECT path nothing sanitises it. So `tier=`, documented as "the one
+#      unforgeable field in [5dive-msg …]", was ALREADY forgeable by any caller who
+#      could set an env var. That is the same inversion the row is about, one level
+#      deeper: the privileged direct path is the one with no trustworthy input.
+#
+# WHAT IS ACTUALLY TRUSTWORTHY: $EUID. It is a bash BUILTIN — not PATH-resolved,
+# not settable from the environment, and it reflects the kernel's view of the
+# process. A caller cannot lie about it without already being that user.
+#
+# THE RULE:
+#   * EUID != 0 — the process IS the sender. Derive from EUID and IGNORE SUDO_USER
+#     entirely: it is forgeable and irrelevant, because an unprivileged process
+#     cannot have been elevated by sudo.
+#   * EUID == 0 — we are root, and a non-root caller can only have reached root
+#     THROUGH sudo, so SUDO_UID/SUDO_USER here were set BY sudo. Prefer the numeric
+#     SUDO_UID. This is the `_deliver` path and it keeps working byte-identically.
+#
+# Humans (`claude`), build bots, and bare root/cron still resolve to EMPTY, so the
+# unenveloped shape they have always produced is preserved deliberately.
+#
+# NOT CLOSED, and stated rather than glossed: an agent holding NOPASSWD:ALL can run
+# `sudo -u agent-other 5dive agent send …` and genuinely IS agent-other for that
+# call. That is real privilege, not forgery — the same agent could read that user's
+# keys — and no envelope field can or should paper over it.
 auto_sender_from_sudo() {
-  local u="${SUDO_USER:-}"
-  if [[ -n "$u" && "$u" == agent-* ]]; then
-    echo "${u#agent-}"
+  if [[ "${EUID}" -ne 0 ]]; then
+    _agent_label_from_uid "$EUID"
     return
   fi
-  # No sudo in play: the process IS the sender. Only an `agent-*` identity counts;
-  # anything else stays empty so humans and build bots keep the unenveloped shape.
-  local self=""
-  self="$(id -un 2>/dev/null || true)"
-  [[ -n "$self" && "$self" == agent-* ]] || { echo ""; return; }
-  echo "${self#agent-}"
+  # Root. Only sudo can have produced this from a non-root caller.
+  local su="${SUDO_UID:-}"
+  if [[ "$su" =~ ^[0-9]+$ ]]; then
+    _agent_label_from_uid "$su"
+    return
+  fi
+  local u="${SUDO_USER:-}"
+  [[ -n "$u" && "$u" == agent-* ]] || { echo ""; return; }
+  echo "${u#agent-}"
 }
 
 # Same regex the marketplace plugin validates against. Telegram bot tokens
