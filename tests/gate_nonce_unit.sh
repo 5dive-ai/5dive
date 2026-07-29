@@ -64,6 +64,35 @@ audit_log() { :; }
 # SUDO_UID we set per-case. `command id` is used for actual uid lookups.
 FAKE_CALLER="root"
 id() { if [[ "${1:-}" == -un ]]; then echo "$FAKE_CALLER"; else command id "$@"; fi; }
+# DIVE-2330: identity no longer comes from `id` — it is $EUID resolved in pure
+# bash, precisely so a PATH shim cannot answer. Override the SEAMS instead, the
+# same way this file already overrides _gate_is_root.
+#
+# ITERATION 2 — the previous override was INERT for T8 (dev). It did
+# `command id -u "$FAKE_CALLER" || printf 0`, and there is no `agent-evil` user on
+# any host, so `id -u` failed and the seam returned 0 = ROOT: the arm that exists
+# to prove an AGENT caller is refused was modelling root, and passed or failed for
+# reasons unrelated to its name. Same defect as DIVE-2365 — the precondition came
+# from the host (which uids happen to exist) instead of from the test.
+#
+# Now: a LITERAL uid plus a passwd line the resolver can actually map, so this is
+# true on every host including GitHub's runner. The fixture is PREPENDED to the
+# real /etc/passwd so real uids (AGENT_UID below, the lead-clear paths) still
+# resolve — a fixture that REPLACED it would silently break those instead.
+FAKE_AGENT_UID=424242
+_gate_passwd_stream() {
+  printf 'agent-evil:x:%s:%s::/nonexistent:/bin/false\n' "$FAKE_AGENT_UID" "$FAKE_AGENT_UID"
+  printf '%s\n' "$(</etc/passwd)"
+}
+_gate_caller_uid() { if [[ "$FAKE_CALLER" == agent-* ]]; then printf '%s' "$FAKE_AGENT_UID"; else printf 0; fi; }
+
+# Assert the seam pair actually resolves BEFORE any arm depends on it — an
+# override that silently yields nothing is how T8 became vacuous in the first
+# place, and a vacuous arm prints ok.
+_pin_check=$(FAKE_CALLER=agent-evil; _gate_uid_to_agent "$(_gate_caller_uid)")
+[[ "$_pin_check" == "evil" ]] || { printf 'NOT OK - seam pin is inert: _gate_uid_to_agent returned %s, expected evil\n' "'$_pin_check'"; exit 1; }
+_pin_check=$(FAKE_CALLER=root; _gate_uid_to_agent "$(_gate_caller_uid)")
+[[ -z "$_pin_check" ]] || { printf 'NOT OK - seam pin: root caller resolved to %s, expected empty\n' "'$_pin_check'"; exit 1; }
 
 # DIVE-1413: every SUDO_UID-driven case below models a POST-SUDO / root context
 # (T5 human-on-box, T6 agent-sudo->root, the drop's require_root nested answer) —
@@ -135,7 +164,12 @@ touch "$GATE_PROOF_ENFORCE"   # enforcement ON for T3-T8
 
 # --- T3: (a) valid --human-proof nonce clears; wrong nonce rejected -----------
 seed_gate_known DIVE-301 KNOWNNONCE123
-SUDO_UID="$AGENT_UID" cmd_task_answer DIVE-301 --value=approved --human --human-proof=KNOWNNONCE123 >/dev/null 2>&1
+# rc CAPTURED on purpose (iteration 2): `cmd_task_answer` is a sourced FUNCTION, so
+# a `fail` inside it calls `exit` and kills THIS harness mid-suite rather than
+# failing one arm. That is how the DIVE-2330 guard bug presented — 9/18 arms and
+# exit 6, with the remaining arms never printing at all. A subshell contains it, so
+# the next such regression reds an arm instead of truncating the log.
+(SUDO_UID="$AGENT_UID" cmd_task_answer DIVE-301 --value=approved --human --human-proof=KNOWNNONCE123) >/dev/null 2>&1
 [[ "$(answered DIVE-301)" == "closed" ]] && ok_t "T3 valid --human-proof clears (SUDO_UID=agent)" \
   || bad_t "T3 valid --human-proof clears" "still $(answered DIVE-301)"
 
@@ -174,14 +208,26 @@ SUDO_UID="$AGENT_UID" cmd_task_answer DIVE-700 --value=approved --human >/dev/nu
   || bad_t "T7 enforce OFF clears" "still $(answered DIVE-700)"
 touch "$GATE_PROOF_ENFORCE"
 
-# --- T8: agent immediate-caller (pre-sudo) blocked by the DIVE-394 id-un guard -
+# --- T8: agent immediate-caller (pre-sudo) blocked by the DIVE-394 guard -------
+# DIFFERENTIAL (iteration 2): the same gate, the same answer, ONLY the caller
+# identity changes. Asserting the agent arm alone cannot distinguish "refused
+# because the caller is an agent" from "refused for one of the other reasons a
+# tier-2 manual gate refuses" — which is exactly how the inert version passed.
 FAKE_CALLER="agent-evil"
 seed_task DIVE-800; cmd_task_need DIVE-800 --type=manual --ask="do it" >/dev/null 2>&1
 out=$(cmd_task_answer DIVE-800 --value=done --human 2>&1); rc=$?
 [[ "$(answered DIVE-800)" == "open" && $rc -ne 0 && "$out" == *"only a human"* ]] \
   && ok_t "T8 agent-* immediate caller blocked on manual gate (defense-in-depth)" \
   || bad_t "T8 agent-* caller blocked on manual" "rc=$rc state=$(answered DIVE-800) out=$out"
+
+# T8b: the CONTROL. Non-agent caller, everything else identical — must NOT hit
+# the agent refusal. Without this arm T8 grades a message, not a mechanism.
 FAKE_CALLER="root"
+seed_task DIVE-801; cmd_task_need DIVE-801 --type=manual --ask="do it" >/dev/null 2>&1
+out8b=$(cmd_task_answer DIVE-801 --value=done --human 2>&1); rc8b=$?
+[[ "$out8b" != *"only a human can clear it"* ]] \
+  && ok_t "T8b CONTROL: non-agent caller does NOT hit the agent refusal (rc=$rc8b)" \
+  || bad_t "T8b non-agent caller wrongly hit the agent refusal" "rc=$rc8b out=$out8b"
 
 # --- T9: _gate_sudo_uid_nonagent direct logic --------------------------------
 SUDO_UID=0 _gate_sudo_uid_nonagent && ok_t "T9 SUDO_UID=root -> non-agent" || bad_t "T9 root non-agent" ""

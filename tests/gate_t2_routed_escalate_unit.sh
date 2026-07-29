@@ -63,9 +63,21 @@ last_nonce() { cat "$NONCE_FILE" 2>/dev/null; }
 audit_log() { :; }
 
 # The immediate caller is the agent LEAD (agent-marcus) attempting to clear a gate that
-# was routed to it — the DIVE-1429 shape. id -un is stubbed so _lead_clear resolves.
+# was routed to it — the DIVE-1429 shape.
+#
+# DIVE-2330: this used to stub `id -un`, because the gate's identity resolver READ
+# `id -un` — which is precisely the forgery this row closed. `_gate_authenticated_actor`
+# now resolves `$EUID` in pure bash over a passwd stream, so the pin moves to those two
+# seams. `id()` is kept below for `_gate_sudo_uid_nonagent`, which still reads `id -u`
+# and is not part of this change.
 FAKE_CALLER="agent-marcus"
 id() { if [[ "${1:-}" == -un ]]; then echo "$FAKE_CALLER"; else command id "$@"; fi; }
+MARCUS_UID=4321
+_gate_caller_uid() { printf '%s' "$MARCUS_UID"; }
+_gate_passwd_stream() {
+  printf '%s:x:%s:%s::/home/%s:/bin/bash\n' "$FAKE_CALLER" "$MARCUS_UID" "$MARCUS_UID" "$FAKE_CALLER"
+  printf '%s\n' "$(</etc/passwd)"
+}
 
 seed_task()  { db "INSERT INTO tasks (ident, title, status, created_by) VALUES ('$1','t','todo','main');"; }
 route_to()   { db "UPDATE tasks SET routed_reviewer='$2' WHERE ident='$1';"; }
@@ -98,6 +110,18 @@ agent_caller_on() {
   }
   export SUDO_UID="$AGENT_UID"
 }
+# DIVE-2330 companion to assert_agent_caller: the LEAD identity the clear authorizes on
+# comes from the seams above, so assert it resolves before any arm depends on it. A pin
+# that silently yields '' makes _lead_clear=0 and the arms below grade a refusal.
+assert_lead_identity() { # <label>
+  local got; got=$(_gate_authenticated_actor)
+  if [[ "$got" == "${FAKE_CALLER#agent-}" ]]; then
+    ok_t "$1 precond: the pinned LEAD resolves to '${FAKE_CALLER#agent-}' through the real resolver"
+  else
+    bad_t "$1 precond: pinned LEAD identity" "resolver returned '$got', expected '${FAKE_CALLER#agent-}' — the arms below would grade a refusal, not a lead-clear"
+  fi
+}
+
 assert_agent_caller() { # <label>
   if _gate_sudo_uid_nonagent; then
     bad_t "$1 precond: caller pinned as an AGENT" \
@@ -108,6 +132,7 @@ the opposite behaviour and report ok (DIVE-2365)"
   fi
 }
 agent_caller_on
+assert_lead_identity PIN
 
 # --- E1: THE FIX — a ROUTED tier-2 manual gate, answered by its lead, ESCALATES to the
 #     human instead of dead-ending: routed_reviewer cleared, ping re-armed, fresh nonce
