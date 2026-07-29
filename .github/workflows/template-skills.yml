@@ -1,0 +1,70 @@
+name: template-skills
+
+# DIVE-2367 — put `scripts/check-template-skills.sh` (DIVE-2347) on a rail.
+#
+# Every skill a shipped template names is a reference into a DIFFERENT repository,
+# resolved months later on a customer's box at import time. On 2026-07-29 all three
+# shipped templates referenced skills that were not in the repo — six references —
+# and a customer running an import is what found it.
+#
+# THREE THINGS HERE ARE LOAD-BEARING. Read before editing:
+#
+# 1. THE SCHEDULE IS NOT REDUNDANT WITH THE PR TRIGGER. This reference breaks when
+#    the OTHER repo changes — a skill renamed or deleted in 5dive-ai/skills — with
+#    ZERO commits here. A pull_request/push-only trigger structurally cannot catch
+#    that: there is no event in this repo to fire on. The daily cron is the only
+#    leg that sees cross-repo drift.
+#
+# 2. EXIT 2 MUST FAIL THE JOB. The script exits 0 (all resolve), 1 (one does not),
+#    2 (could not check). Exit 2 is deliberately not 0 — if `gh` is missing or
+#    unauthenticated we cannot tell a good template from a broken one, and
+#    reporting "clean" there reintroduces exactly the silence this check exists to
+#    break. A bare `run:` already fails on 2. NEVER add `|| true`,
+#    `continue-on-error`, or any wrapper that swallows the return code.
+#
+# 3. THIS JOB IS DELIBERATELY NOT A REQUIRED CHECK. Per DIVE-2141, every automated
+#    writer to this repo must be enumerated before a check can gate merges — the
+#    version-assign bot cannot bypass branch protection. Land it non-required,
+#    watch it, promote it separately and on purpose.
+#
+# Auth: 5dive-ai/skills is PUBLIC (verified unauthenticated, 200, private:false), so
+# the automatic GITHUB_TOKEN reads it. No PAT, no new secret, nothing to rotate.
+
+on:
+  pull_request:
+    paths:
+      - 'team-templates/**'
+      - 'scripts/check-template-skills.sh'
+      - '.github/workflows/template-skills.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'team-templates/**'
+      - 'scripts/check-template-skills.sh'
+      - '.github/workflows/template-skills.yml'
+  schedule:
+    # Daily. This is the leg that catches a rename in 5dive-ai/skills.
+    - cron: '31 6 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: template-skills-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      # No `|| true`, no continue-on-error: rc 1 (broken reference) and rc 2
+      # (could not check) must both go red. See note 2 above.
+      - name: Every template skill reference must resolve in 5dive-ai/skills
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: bash scripts/check-template-skills.sh
