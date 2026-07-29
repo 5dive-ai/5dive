@@ -339,20 +339,33 @@ mklaunder() { # v/sha at the assignment, then the failed-assign commit, then N d
   local d="$TMP/launder$RANDOM$RANDOM" i; mkdir -p "$d/src"
   git -C "$d" init -q -b main; git -C "$d" config user.email t@t; git -C "$d" config user.name t
   printf 'readonly FIVE_VERSION="0.16.19"\n' > "$d/src/header.sh"; printf 'aaa  5dive\n' > "$d/5dive.sha256"
+  # DIVE-2091: the signal is a src/ change, not the checksum — same re-key as mk().
+  # This fixture is NOT in 774401b: arms I and J landed on main AFTER the 2091 branch
+  # diverged, so that commit is a complete port of the 07-27 file and an incomplete
+  # one of today's. Nothing in a cherry-pick says so.
+  printf 'aaa\n' > "$d/src/body.sh"
   git -C "$d" add -A; git -C "$d" commit -qm "release: assign 0.16.19"
-  # the merge whose assignment FAILED to push: bundle moved, version did not
-  printf 'bbb  5dive\n' > "$d/5dive.sha256"; git -C "$d" add -A; git -C "$d" commit -qm "feat: bundle moves, assignment never landed"
-  for (( i=0; i<${1:-0}; i++ )); do   # unrelated non-bundle pushes (workflow/doc-only)
+  # the merge whose assignment FAILED to push: src moved, version did not
+  printf 'bbb  5dive\n' > "$d/5dive.sha256"; printf 'bbb\n' > "$d/src/body.sh"
+  git -C "$d" add -A; git -C "$d" commit -qm "feat: src moves, assignment never landed"
+  for (( i=0; i<${1:-0}; i++ )); do   # unrelated non-src pushes (workflow/doc-only)
     printf 'doc %s\n' "$i" > "$d/README.md"; git -C "$d" add -A; git -C "$d" commit -qm "docs: unrelated"
   done
   printf '%s' "$d"; }
 
 # The mutant: one line, restoring exactly the semantics this ticket removed.
+#
+# DIVE-2091 MOVED THE LINE, NOT THE SEMANTICS. The comparison used to be
+# `s_anchor=$(sha_at "$ANCHOR")` and is now `_src_changed "$ANCHOR" "$NEW"`; the
+# mutation is the same one either way — swap ANCHOR for BASE. Re-pointing it was
+# mandatory, not cosmetic: a sed still aiming at the deleted sha_at line would match
+# nothing, and I0 exists precisely to catch that. This is the one harness edit the
+# re-key required, and it keeps the mutant grading the SAME property.
 MUT="$TMP/version-assign.mutant.sh"
-sed 's|^s_anchor=$(sha_at "$ANCHOR")$|s_anchor=$(sha_at "$BASE")|' "$S" > "$MUT"
+sed 's|_src_changed "$ANCHOR" "$NEW"|_src_changed "$BASE" "$NEW"|' "$S" > "$MUT"
 # CONFIRM THE MUTATION LANDED. A sed that silently matched nothing would make every
 # arm below compare the script against ITSELF and report a confident green.
-if ! cmp -s "$S" "$MUT" && grep -q 's_anchor=$(sha_at "$BASE")' "$MUT"; then
+if ! cmp -s "$S" "$MUT" && grep -q '_src_changed "$BASE" "$NEW"' "$MUT"; then
   ok "I0 CONTROL: the mutant differs from the real script and carries the old base-relative line"
 else
   no "I0 mutant" "the mutation did not land — every I arm below would be comparing the script to itself"
