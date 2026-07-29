@@ -39481,7 +39481,7 @@ _hb_wake() {
 # coarse (daily/hourly) recurring jobs; minute granularity finer than the tick
 # interval can also be missed. Both documented in the CHANGELOG.
 _hb_materialize_recurring() {
-  local now="$1" minute_start tid sched last_fired open n_made=0
+  local now="$1" minute_start tid sched last_fired open open_read open_rc n_made=0
   minute_start=$(date -u -d "@${now}" +'%Y-%m-%d %H:%M:00')
   while IFS=$'\t' read -r tid sched last_fired; do
     [[ -n "$tid" ]] || continue
@@ -39491,8 +39491,41 @@ _hb_materialize_recurring() {
     if [[ -n "$last_fired" ]] && ! [[ "$last_fired" < "$minute_start" ]]; then
       continue
     fi
-    open=$(db "SELECT COUNT(*) FROM tasks WHERE from_template_id=${tid} AND status NOT IN ('done','cancelled');" 2>/dev/null || echo 1)
-    if [[ "${open:-1}" != "0" ]]; then
+    # DIVE-2273: "the count is non-zero" and "the count could not be read" are
+    # DIFFERENT STATES and only one of them is a suppression. The old form
+    # (`... 2>/dev/null || echo 1`, plus `${open:-1}`) collapsed the failure
+    # into a legitimate magnitude, so an unreadable DB took the skip branch --
+    # and since DIVE-2237 that branch STAMPS last_skipped_at, writing a
+    # suppression that never happened. The DIVE-2237 reading table defines
+    # "stale last_fired + recent last_skipped" as "a human must close the
+    # blocker"; after this path there IS no blocker to close, so the human is
+    # sent after nothing and learns to distrust the column. An instrument must
+    # not report a cause it did not observe.
+    #
+    # The FIRE/NO-FIRE decision is deliberately unchanged: an unreadable count
+    # still skips. Not spawning is the conservative outcome while every
+    # template is dedup'd, and the error DEFAULT is a policy question that
+    # belongs with --on-overlap (DIVE-2270 decision / DIVE-2272) -- for a
+    # spawn-class template an unreadable count should FIRE. What changes here
+    # is only that the error is recorded AS an error and stamps nothing.
+    #
+    # NOTE FOR DIVE-2272: this branch is where the spawn-class error default
+    # belongs, and the error must NOT fall through to the bound comparison. The
+    # old sentinel 1 is conservative against a boolean test and PERMISSIVE
+    # against a bound of 3, and the bound is spawn's safety valve computed from
+    # the very read it backstops -- a failing read would pin `open` at 1 so the
+    # valve never trips. Keep the failure out of the magnitude entirely.
+    #
+    # 2>&1 (not 2>/dev/null) so the sqlite error itself reaches _hb_log; the
+    # shape check is what keeps that stderr from being mistaken for a count.
+    open_rc=0
+    open_read=$(db "SELECT COUNT(*) FROM tasks WHERE from_template_id=${tid} AND status NOT IN ('done','cancelled');" 2>&1) || open_rc=$?
+    if (( open_rc != 0 )) || [[ ! "$open_read" =~ ^[0-9]+$ ]]; then
+      _hb_log "[materializer] $(_hb_ident "$tid") open-instance count UNREADABLE (rc=${open_rc}: ${open_read//$'\n'/ }) — skipping, NOT recording a suppression"
+      continue
+    fi
+    open="$open_read"
+    if [[ "$open" != "0" ]]; then
       # DIVE-2237: RECORD the skip. The dedup decision is unchanged -- we still
       # skip -- but a skip now leaves a trace on the row itself, not only in
       # _hb_log (which nothing surfaces and nobody reads). Without this, a

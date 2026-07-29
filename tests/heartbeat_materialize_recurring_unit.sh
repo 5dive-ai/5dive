@@ -234,5 +234,113 @@ else
         "was '${skipped_after_skip}', now '$(last_skipped_of "$t_sup")'"
 fi
 
+# ---------------------------------------------------------------------------
+# DIVE-2273: a FAILED count read is NOT a suppression.
+#
+# The materializer decided "an open instance exists" from
+#   open=$(db "SELECT COUNT(*) ..." 2>/dev/null || echo 1)
+# so an unreadable DB was absorbed into the legitimate magnitude 1, took the
+# skip branch, and — since DIVE-2237 — STAMPED last_skipped_at. That forges a
+# suppression the scheduler never observed, and the DIVE-2237 reading table
+# sends a human to close a blocker that does not exist.
+#
+# A healthy DB cannot see any of this, so these arms FORCE THE READ TO FAIL.
+# The stub intercepts by the materializer's own query text keyed to ONE
+# template id, which buys the control below: a second template in the SAME pass
+# reads normally and must still fire. Without that control, "did not spawn"
+# would also be satisfied by a pass that did nothing at all.
+eval "orig_db() $(declare -f db | tail -n +2)"
+DB_FAIL_MATCH=''      # substring of the SQL to intercept; '' disables the stub
+DB_FAIL_MODE='error'  # error = stderr + non-zero rc | empty = rc 0, no output
+db() {
+  if [[ -n "$DB_FAIL_MATCH" && "$1" == *"$DB_FAIL_MATCH"* ]]; then
+    if [[ "$DB_FAIL_MODE" == 'error' ]]; then
+      printf 'Error: database disk image is malformed\n' >&2
+      return 11
+    fi
+    return 0   # the other half of the old collapse: `${open:-1}` made "" mean 1
+  fi
+  orig_db "$1"
+}
+
+t_err=$(mk_template "unreadable-count template" todo)
+t_ctl=$(mk_template "healthy control template"  todo)
+# Park both on the sentinel so "nothing was stamped" is a real observation
+# rather than two writes that happen to land in the same second.
+db "UPDATE tasks SET last_fired_at='${SENTINEL}' WHERE id IN (${t_err}, ${t_ctl});" >/dev/null
+: >"$LOG"
+
+DB_FAIL_MATCH="from_template_id=${t_err} AND status NOT IN"
+DB_FAIL_MODE='error'
+_hb_materialize_recurring "$((t0 + 360))"
+DB_FAIL_MATCH=''
+
+# Grade the guard's own decision first: if the stub never fired, every arm
+# below is vacuous and this one is the only thing that says so.
+if grep -q 'UNREADABLE' "$LOG"; then
+  ok_t "2273 read-error: the failed count is logged AS a failed read"
+else
+  bad_t "2273 read-error: the failed count is logged AS a failed read" "$(cat "$LOG")"
+fi
+if [[ "$(last_skipped_of "$t_err")" == "" ]]; then
+  ok_t "2273 read-error: NO last_skipped_at — an error is not a suppression"
+else
+  bad_t "2273 read-error: NO last_skipped_at — an error is not a suppression" \
+        "forged suppression stamped at '$(last_skipped_of "$t_err")'"
+fi
+if [[ "$(instances_of "$t_err")" == "0" ]]; then
+  ok_t "2273 read-error: still skips (fire decision unchanged, deliberately)"
+else
+  bad_t "2273 read-error: still skips (fire decision unchanged, deliberately)" \
+        "expected 0 instances, got $(instances_of "$t_err")"
+fi
+if [[ "$(last_fired_of "$t_err")" == "$SENTINEL" ]]; then
+  ok_t "2273 read-error: last_fired_at untouched (the tick stamped nothing)"
+else
+  bad_t "2273 read-error: last_fired_at untouched (the tick stamped nothing)" \
+        "sentinel was '${SENTINEL}', now '$(last_fired_of "$t_err")'"
+fi
+# The control. Same pass, same clock, read NOT intercepted.
+if [[ "$(instances_of "$t_ctl")" == "1" && "$(last_fired_of "$t_ctl")" != "$SENTINEL" ]]; then
+  ok_t "2273 control: a healthy template in the SAME pass still fires"
+else
+  bad_t "2273 control: a healthy template in the SAME pass still fires" \
+        "instances=$(instances_of "$t_ctl") last_fired=$(last_fired_of "$t_ctl")"
+fi
+
+# Second forging input: rc 0 with EMPTY output. `${open:-1}` turned that into 1
+# too, so it forged a suppression down a path the rc check alone never touches.
+: >"$LOG"
+DB_FAIL_MATCH="from_template_id=${t_err} AND status NOT IN"
+DB_FAIL_MODE='empty'
+_hb_materialize_recurring "$((t0 + 480))"
+DB_FAIL_MATCH=''
+if grep -q 'UNREADABLE' "$LOG" && [[ "$(last_skipped_of "$t_err")" == "" ]] \
+   && [[ "$(instances_of "$t_err")" == "0" ]]; then
+  ok_t "2273 empty read: rc 0 with no output is also NOT a suppression"
+else
+  bad_t "2273 empty read: rc 0 with no output is also NOT a suppression" \
+        "log=$(cat "$LOG") last_skipped='$(last_skipped_of "$t_err")' instances=$(instances_of "$t_err")"
+fi
+
+# THE DIFFERENTIAL. With the stub off and nothing else changed, the same
+# template must fire. This is what makes the three arms above mean "the read
+# failure suppressed it" instead of "something else made it ineligible" — a
+# wrong-target success looks identical to a right one until you show the target
+# recovers when the injected fault is removed.
+_hb_materialize_recurring "$((t0 + 600))"
+if [[ "$(instances_of "$t_err")" == "1" ]]; then
+  ok_t "2273 differential: the same template fires once the read recovers"
+else
+  bad_t "2273 differential: the same template fires once the read recovers" \
+        "expected 1 instance, got $(instances_of "$t_err")"
+fi
+if [[ "$(last_skipped_of "$t_err")" == "" ]]; then
+  ok_t "2273 differential: no suppression was ever recorded for it"
+else
+  bad_t "2273 differential: no suppression was ever recorded for it" \
+        "got '$(last_skipped_of "$t_err")'"
+fi
+
 echo "-- ${PASS} passed, ${FAIL} failed --"
 [[ $FAIL -eq 0 ]]

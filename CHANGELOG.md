@@ -114,6 +114,35 @@ question instead of asserting the finding. Deliberately a language change and no
 change — requiring a conclusive probe to fire would fail open exactly when panes are
 uncapturable, which is when the fleet is most likely to be genuinely wedged.
 
+## Unreleased — fix(task): a failed open-instance read no longer forges a `last_skipped_at` suppression that never happened (DIVE-2273)
+
+The recurring materializer decided whether an instance was already open with
+
+    open=$(db "SELECT COUNT(*) ... " 2>/dev/null || echo 1)
+
+so a DB read that FAILED was counted as "an instance exists" and the template was skipped.
+The fallback was not careless: somebody chose "on error, do not spawn a duplicate", which is
+correct if the work is fungible. It is the dedup's own premise, restated in the error path
+where nobody re-argued it.
+
+DIVE-2237 made it worse in a way that only shows up one layer down. The skip branch now
+stamps `last_skipped_at`, so a transient read failure WRITES A SUPPRESSION THAT NEVER
+HAPPENED. The reading table DIVE-2237 shipped defines "stale `last_fired` + recent
+`last_skipped`" as suppressed, a human must close the blocker — and after this path there is
+no blocker to close, while `blocked_by` correctly renders `-` because none exists. The
+instrument reported a cause it had not observed, and the human sent to close nothing learns
+to distrust the column.
+
+A failed read and a non-zero count are now different states. The read is checked for both a
+non-zero exit and a non-numeric result (rc 0 with empty output collapsed into `1` the same
+way via `${open:-1}`), and on either the tick stamps NOTHING and logs the sqlite error
+itself, which `2>/dev/null` used to swallow. The fire decision is deliberately unchanged: an
+unreadable count still skips, because not spawning stays the conservative outcome while
+every template is dedup'd. Whether a spawn-class template should FIRE on an unreadable count
+belongs with `--on-overlap` (DIVE-2270 / DIVE-2272), and that ticket now has a place to put
+it: the failure must never reach the bound comparison, because the sentinel `1` is
+conservative against a boolean test and PERMISSIVE against a bound of 3, and the bound is
+spawn's safety valve computed from the very read it backstops.
 ## Unreleased — fix(council): the veto principal is redacted where it is GENERATED, not per-file (DIVE-2278)
 
 `council roster`, the `council init` summary and the veto-exercise line printed the veto
