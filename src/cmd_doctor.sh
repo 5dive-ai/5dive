@@ -750,8 +750,16 @@ cmd_doctor() {
 
     # DIVE-2328: the FIVE_* override report is assembled here but is NOT a check and
     # never enters DOCTOR_CHECKS. See below the summary for why that matters.
-    DOCTOR_ENV_OVERRIDES=$(_env_overrides_json 2>/dev/null || printf '{}')
-    [[ -n "$DOCTOR_ENV_OVERRIDES" ]] || DOCTOR_ENV_OVERRIDES='{}'
+    # DIVE-2336: BOTH arms used to coerce to '{}', which reads as "no overrides set".
+    # The empty-string arm is the one the real failure mode reaches (measured: every jq
+    # failure position cascades to rc!=0 with EMPTY stdout), so fixing only the visible
+    # `|| printf` would have left the live path untouched.
+    DOCTOR_ENV_OVERRIDES=$(_env_overrides_json 2>/dev/null)
+    # One condition covers BOTH old coercions: a non-zero exit and an empty result both
+    # arrive here as empty. The fallback is a CONSTANT, never `_env_ov_unavailable` — that
+    # function ships in the same file as the reporter, so it is missing in exactly the
+    # cases the fallback exists for.
+    [[ -n "$DOCTOR_ENV_OVERRIDES" ]] || DOCTOR_ENV_OVERRIDES="$_5D_ENV_OV_UNAVAILABLE"
   fi
 
   # --- summary + output ---

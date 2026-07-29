@@ -1,5 +1,51 @@
 # Changelog
 
+## Unreleased — fix(doctor): a FAILED env-override report no longer reads as "no overrides set" (DIVE-2336)
+
+Both consumers of `_env_overrides_json` wrapped it twice — `|| printf '{}'` and
+`[[ -n "$X" ]] || X='{}'` — so a hard failure rendered as `{}`: no process list, no
+configured list, no state. Every consumer reads that as **no overrides are set**. That is
+the could-not-check-as-negative shape DIVE-2318 closed in the merge gate and DIVE-2327
+closed for an unreadable `agents.d`, reappearing one level up inside the code that closes
+it. **Four sites, not two** (main, routing the row): the empty-string coercion is the same
+defect as the `|| printf`.
+
+**Which of the four mattered, measured, and it inverts the obvious reading.** Stubbing jq
+to fail at each of the 7 invocations a clean run makes: *every* position produced rc≠0 with
+**empty stdout**. So the visible `|| printf '{}'` arm is not the one the real failure mode
+reaches — the empty-string coercion is. Fixing only the two obvious sites would have left
+the live path untouched and looked complete.
+
+`_env_ov_unavailable` emits a fifth state, `configured_state: "unavailable"`, and uses
+**only `printf`** — the likeliest reason the reporter failed is that jq is gone, so a
+fallback needing jq to say "jq is gone" says nothing. The function now guarantees a
+well-formed payload rather than exiting non-zero with empty stdout: a caller forced to
+invent a payload is a caller that will invent the wrong one, which is what happened at all
+four sites.
+
+**Corrects a claim I made filing the row.** I wrote that a mid-loop jq failure "could drop
+entries and still emit a well-formed partial as if complete". It cannot — an emptied
+accumulator makes the next jq fail on invalid `--argjson`, so the run dies instead of
+shipping a short list. But that safety is **accidental**: it holds only because the poison
+propagates, and one `|| true` downstream converts it into exactly the partial-as-complete
+I wrongly claimed. The rc checks went in anyway, as a guard on a property that is currently
+true by luck rather than by construction.
+
+**A fallback must not live in the file it is a fallback for**, and the first cut of this
+change broke exactly that. `tests/selfcheck_unit.sh` sources only
+`header/error_codes/output/cmd_selfcheck` — not `lib/env_overrides.sh` — so a call-site
+fallback calling `_env_ov_unavailable` found no function, produced an empty string, and
+`jq --argjson eov ""` killed selfcheck's whole `--json` contract (33/0 → 26/7). Caught by
+the full suite, not by the new harness. The fallback is now a constant in `header.sh`
+(`_5D_ENV_OV_UNAVAILABLE`, deliberately not `FIVE_*`-named, which `env_isolation.sh` would
+clear inside every harness), and T8 stands guard over it.
+
+`tests/env_overrides_unavailable_unit.sh` — 16 arms, mutation-graded six ways, **two of my
+four original predictions wrong**: restoring either call-site coercion reds only the
+*structural* arm, because with the function holding its contract the call-site guard is
+unreachable defence-in-depth. That reachability is the finding, and it is why the structural
+arm is a grep rather than a run.
+
 ## Unreleased — feat(doctor): REPORT the FIVE_* knobs in effect and configured (DIVE-2328/2327)
 
 `doctor` and `selfcheck` answer "what is true on this box". A product knob in effect is
