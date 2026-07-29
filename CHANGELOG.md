@@ -1,5 +1,90 @@
 # Changelog
 
+## Unreleased — fix(heartbeat): the dispatcher claims the task it nudges, so the whole stuck-work recovery layer stops reading a dead field (DIVE-2244)
+
+A fleet-stall alarm fired on a fleet that was not stalled. Root-causing it found something more
+expensive than the alarm — and re-measuring at implementation time corrected the diagnosis.
+
+The only writer of `tasks.status='in_progress'` and `started_at` was an instruction. The `/goal`
+nudge text says "claim it with `5dive task start DIVE-N`", and a rule an agent must remember at
+the moment of action is not a control (DIVE-2146). Compliance is partial and erratic: of tasks
+closed per day, the share that ever had `started_at` set ran 23% (14 of 61, 2026-07-28), 51% (35
+of 68, 07-27), 60% (50 of 83, 07-26).
+
+That corrects the filing ticket, which reported 0 of 24 and "0 tasks with `started_at` in 48h".
+Its six named tasks really are NULL, but the aggregate does not hold — 48 rows were claimed in
+that same window, and the board carries in-progress rows right now. `in_progress == 0` is a
+transient, not the permanent condition the ticket diagnosed, and that changes which half of this
+change does which job.
+
+The costly half is silent, and the claim fixes it outright. The same field is what the entire
+stuck-work recovery layer keys on: the deterministic hard cap on the `/goal` loop, the runaway
+reaper, the orphan reclaim for a task whose claiming session is gone, the unwedge rules, and the
+tick's own "already in_progress, skip" busy guard. At 23–60% coverage, most in-flight work was
+invisible to all five. A genuinely runaway or orphaned task in that majority had no recovery
+path at all and would present as a permanently-`todo` row nobody notices. The heartbeat already
+knows exactly which task it woke an agent for, so it now stamps `status='in_progress'` +
+`started_at` at the moment of the nudge — taking coverage of dispatcher-driven work to 100% by
+construction.
+
+The alarm half is smaller than the ticket claimed. `in_progress` was genuinely 0 at 08:15Z on
+2026-07-28 — a real quiet moment, not a dead field. Claiming raises the floor but does not by
+itself make the stall predicate sound; the probe-conclusiveness change below is what addresses
+the reported firing.
+
+The claim is narrow by construction. It runs only inside the wake-success branch, so a tick that
+wakes nobody claims nothing; it matches `WHERE status='todo' AND kind='standard'`, so it never
+stomps a row something else already moved and never starts a recurring template (which would
+silently retire it, DIVE-2055/2059); and `started_at` is COALESCEd, so an agent that does run
+`task start` afterwards is a no-op rather than a re-clock that would restart the reaper budget.
+It confirms from the row rather than from sqlite's exit code, and says so in the log when a
+claim does not land instead of logging one it never made.
+
+Two consequences worth stating rather than discovering later. First, the busy guard is now live:
+an agent with a claimed task is not re-nudged, and a task it abandons is requeued by the
+existing reclaim rules (orphan-by-restart immediately, idle-stall at 20m, hard cap at the
+budget) rather than by a second nudge. Second, the starvation counter now detects a different
+mechanism for the same conclusion — it used to mean "nudged N times and never left todo", and
+now means "claimed and reclaimed N times" — which only works because the claim is stamped after
+`_hb_mark_run`, whose prune keys on "still todo".
+
+The second half — separable in the ticket, load-bearing in fact. The same alarm asserted a
+fleet-wide claim while stating in the same sentence that it could not measure part of its
+population ("5 UNMEASURABLE (pane uncapturable) — this alert did not prove those idle").
+Since `in_progress == 0` turns out to be a real (if brief) reading, this unmeasured probe is the
+part of the predicate that actually turned a quiet moment into a stall claim. That honesty is
+kept and is now reflected in the headline: an
+unmeasured probe downgrades `🛑 fleet-stall` to `❓ possible fleet-stall (UNPROVEN)` and asks the
+question instead of asserting the finding. Deliberately a language change and not a firing
+change — requiring a conclusive probe to fire would fail open exactly when panes are
+uncapturable, which is when the fleet is most likely to be genuinely wedged.
+
+## Unreleased — fix(council): the veto principal is redacted where it is GENERATED, not per-file (DIVE-2278)
+
+`council roster`, the `council init` summary and the veto-exercise line printed the veto
+principal verbatim. Seeded as `tg:<user_id>` — which is what a live install does — that put a
+real Telegram user id into every freshly generated council artifact, and council output is
+quoted verbatim into transcripts and posts. Redacting one transcript was the wrong fix: the
+generator keeps emitting the id into the NEXT artifact, and that is the one nobody re-checks,
+because "we already fixed the PII".
+
+Human-readable output now routes the principal through a display filter. `human:<agent>` passes
+through unchanged (already a name); a numeric id reverse-resolves to the paired agent's name when
+it can, otherwise renders as the opaque handle `tg:#<8 hex>` — digested with host-local salt
+(`/etc/machine-id`, else the hostname), because a ~10-digit id under an UNSALTED digest is
+enumerable end-to-end and would be a redaction in appearance only. With no salt available it
+prints `tg:#redacted` rather than a digest that cannot be defended. The `init` summary no longer
+prints the RESOLVED recipient at all.
+
+Nothing that needs the id loses it: genesis `.veto.resolved`, the `--json` rail, `veto-pings.jsonl`
+and the delivery call are untouched. This is a display filter, not a data change, and no sealed
+canonical bytes change.
+
+`council init --veto=<digits>` now also warns: the principal string is copied into the SEALED
+genesis/lineage/receipt bytes, which are immutable and publishable, and no display filter can
+reach them afterwards. `--veto=human:<agent>` reaches the same recipient with only a name in the
+seal.
+
 ## Unreleased — feat(task): a gate can DECLARE that it needs a human, and stop being answered by whoever is grading the ticket (DIVE-2241)
 
 A gate filed on a task that carries a maker→verifier loop routes to the VERIFIER by kind
@@ -33,6 +118,7 @@ audited at file time, including when it resolved to nothing.
 
 Agent-held capabilities (`gh_push`, `root`, `delegated_push`) are explicitly NOT routable
 this way yet — they need a different source, not a longer wait.
+
 
 ## Unreleased — fix(task): a recurring template that the scheduler SKIPPED now says so, instead of reading exactly like one it never reached (DIVE-2237)
 

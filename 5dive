@@ -33930,6 +33930,54 @@ _council_resolve_principal() {
 # hashes the presented nonce and compares). Empty on a missing sha256sum (fail-closed downstream).
 _council_sha256() { printf '%s' "${1:-}" | sha256sum 2>/dev/null | awk '{print $1}'; }
 
+# DIVE-2278: render a veto principal for HUMAN-READABLE output — roster, init summary, the
+# veto-exercise line. Council output is quoted verbatim into transcripts and posts, so a raw
+# Telegram user id printed here reaches a published artifact by default. Redacting the artifact
+# after the fact is the wrong fix: the generator keeps emitting it into the NEXT one, and that
+# is the one nobody re-checks because "we already fixed the PII".
+#
+# Mapping, in order:
+#   human:<agent>       -> unchanged; it is already a name.
+#   tg:<digits>|<digits> -> the paired agent's name if the id resolves back to one (human:<agent>),
+#                          otherwise the opaque, stable handle tg:#<8 hex of sha256(salt+id)>.
+# The salt matters: a Telegram user id is ~10 digits, so an UNSALTED digest of it is enumerable
+# end-to-end (10^10 hashes) and would be a redaction in appearance only. The salt is host-local
+# state that never travels with the artifact (/etc/machine-id, else the hostname); with no salt
+# available we print `tg:#redacted` rather than a digest we cannot defend.
+# The RAW id is untouched everywhere it is actually needed: genesis .veto.resolved, the --json
+# rail, veto-pings.jsonl, and the delivery call. This is a display filter, not a data change.
+_council_principal_label() {
+  local p="${1:-}" id=""
+  case "$p" in
+    ''|none) printf '%s' "${p:-none}"; return 0 ;;
+    human:*) printf '%s' "$p"; return 0 ;;
+    tg:*) id="${p#tg:}" ;;
+    *) id="$p" ;;
+  esac
+  [[ "$id" =~ ^[0-9]+$ ]] || { printf '%s' "$p"; return 0; }
+  # Reverse-resolve: if this id is the paired human of a known agent, name the agent.
+  local a
+  for a in $(_council_principal_agents); do
+    [[ "$(_council_resolve_principal "human:$a")" == "$id" ]] && { printf 'human:%s' "$a"; return 0; }
+  done
+  local salt="" h=""
+  salt="$(cat /etc/machine-id 2>/dev/null || true)"
+  [[ -n "$salt" ]] || salt="$(hostname 2>/dev/null || true)"
+  [[ -n "$salt" ]] && h="$(_council_sha256 "${salt}:${id}")"
+  if [[ -n "$h" ]]; then printf 'tg:#%s' "${h:0:8}"; else printf 'tg:#redacted'; fi
+}
+
+# Candidate agent names for the reverse-resolve above. Best-effort and cheap: an unreadable or
+# missing registry just means we fall through to the opaque handle, which is still not the id.
+_council_principal_agents() {
+  local d
+  for d in /home/agent-*; do
+    [[ -d "$d" ]] || continue
+    printf '%s\n' "${d#/home/agent-}"
+  done 2>/dev/null
+  printf 'main\n'
+}
+
 # CNCL-9 (main gate amendment 3): durable audit trail for REFUSED veto attempts — a forged
 # `--veto-by` CLI string on convene, or a nonce/recipient mismatch on exercise. "refused + logged"
 # must mean a real line on disk a test can assert, not just an stderr message. The file is
@@ -34190,7 +34238,7 @@ _council_veto() {
   if (( JSON_MODE )); then
     printf '%s' "$vraw" | jq --arg d "$vdigest" --arg p "$rcpt_digest" '{ok:true, data: (. + {sealedDigest:$d, prevDigest:$p})}'
   else
-    echo "veto:         EXERCISED (${tier}) by ${offer_principal}"
+    echo "veto:         EXERCISED (${tier}) by $(_council_principal_label "${offer_principal}")"
     echo "disposition:  blocked  (pass overruled; original verdict left sealed + immutable)"
     [[ "$tier" == "posthoc" ]] && echo "unwind:       REQUIRED — reversible work must be manually unwound (v0.11)"
     echo "chained:      veto ${vdigest:0:16}… -> verdict ${rcpt_digest:0:16}…"
@@ -34411,6 +34459,15 @@ _council_init_or_lineage() {
   local resolved; resolved="$(_council_resolve_principal "$principal")"
   [[ -n "$resolved" ]] || fail "$E_USAGE" "veto principal '$principal' did not resolve to a real recipient — init rejects an unknown principal (fail-closed). Use human:<agent> (a paired agent) or tg:<user_id>."
 
+  # DIVE-2278: a tg:<digits> principal is the ONE form the display filter cannot save. The
+  # principal string is copied verbatim into the canonical bytes that get SEALED into genesis,
+  # the lineage and every convene receipt — records that are deliberately immutable and are the
+  # ones we publish. human:<agent> keeps the same recipient while putting only a NAME in the seal.
+  if [[ "$principal" =~ ^(tg:)?[0-9]+$ ]]; then
+    printf 'warn: --veto=%s puts a raw user id inside the SEALED genesis/receipt bytes, which are\n' "$principal" >&2
+    printf '      immutable and publishable. Prefer --veto=human:<agent> — same recipient, name in the seal.\n' >&2
+  fi
+
   local genesis_exists=0; [[ -f "$COUNCIL_GENESIS" ]] && genesis_exists=1
   # hash-chain head: prevDigest + next seq come from the last lineage line.
   local prev_digest="" seq=0
@@ -34469,7 +34526,10 @@ _council_init_or_lineage() {
     echo "council: initialized (seq $seq)"
     echo "seats:   $seats"
     echo "chair:   $chair"
-    echo "veto:    $principal -> $resolved"
+    # DIVE-2278: the RESOLVED recipient is a raw Telegram id — never print it. It is sealed into
+    # genesis and available on --json for anything that actually delivers; the summary a human
+    # copies into a transcript gets the label only.
+    echo "veto:    $(_council_principal_label "$principal") (recipient resolved, sealed in genesis)"
     echo "const:   v0 sealed (${constitution_digest:0:16}…) -> $cpath"
     echo "genesis: sealed (${digest:0:16}…) + hash-chained into lineage"
   fi
@@ -34689,7 +34749,7 @@ _council_roster() {
     echo "council:   council ($(printf '%s' "$raw" | jq -r '.seatCount') seats)"
     printf '%s' "$raw" | jq -r '.seats[] | "  seat \(.id)\(if .chair then " (chair)" else "" end)"'
     echo "threshold: $(printf '%s' "$raw" | jq -r '.threshold') to pass, quorum $(printf '%s' "$raw" | jq -r '.quorum') (spec: $(printf '%s' "$raw" | jq -c '.thresholdSpec'))"
-    echo "veto:      $vprincipal"
+    echo "veto:      $(_council_principal_label "$vprincipal")"
     echo "lineage:   seq $head_seq, ${hlen} record(s), head ${head_digest:0:16}…"
   fi
 }
@@ -37770,7 +37830,13 @@ JSEOF
 #                           task; piling on a second nudge would interleave work.
 #   * has todo + due      -> ensure the agent is running, optionally /clear it
 #                           for a fresh context, then inject ONE nudge telling
-#                           it to do a single task and then idle.
+#                           it to do a single task and then idle — and CLAIM
+#                           that task (status=in_progress + started_at) in the
+#                           same breath. DIVE-2244: the claim is the dispatcher's
+#                           job, not the agent's. Until it was, the "already
+#                           in_progress" arm above and the entire recovery layer
+#                           (reaper / orphan reclaim / unwedge / stall detector)
+#                           read a field nothing ever wrote — see _hb_claim_task.
 #
 # "One task per tick" is the whole point: 1 nudge = 1 task. The next tick (no
 # sooner than the agent's `everyMin`) picks up the next one. The agent process
@@ -37793,13 +37859,20 @@ _HB_DEFAULT_EVERY=30
 # and was observed to overrun (see _hb_wake). Min floor keeps short everyMin sane.
 _HB_STALE_MULT=3
 _HB_STALE_MIN_MINUTES=45
-# Starvation signal: a todo task that gets nudged this many times but never
-# leaves 'todo' (started_at stays empty) is almost certainly being starved —
-# e.g. the codex/grok listen-loop watchdog yanking the agent off the task before
-# it runs `task start`. The reaper only catches runaway *in_progress* tasks; this
-# catches the opposite silent failure (nudged but never started) and surfaces it
-# instead of re-nudging forever. Per-task nudge counts live in the registry under
-# .agents[<name>].heartbeat.nudges and are pruned once a task leaves todo.
+# Starvation signal: a task nudged this many times without ever reaching 'done'
+# is almost certainly being starved — e.g. the codex/grok listen-loop watchdog
+# yanking the agent off the task right after the nudge. Per-task nudge counts
+# live in the registry under .agents[<name>].heartbeat.nudges and are pruned once
+# a task leaves todo.
+#
+# DIVE-2244 changed the MECHANISM this detects, not the conclusion. Before, the
+# dispatcher never claimed, so a starved task simply sat in 'todo' and got
+# re-nudged every cadence; this counter was the only thing that noticed. Now the
+# dispatcher claims at the nudge, so reaching this count means the task was
+# claimed and then RECLAIMED back to todo (rule a/b/c) that many times. Either
+# way: nudges are not converting into finished work, and re-nudging forever
+# without saying so is the failure. Note the counter still works only because
+# the claim is stamped AFTER _hb_mark_run — see the call site.
 _HB_STARVE_AFTER=3
 
 # A reaped task (in_progress past the budget) is requeued to todo, never
@@ -38742,6 +38815,92 @@ _hb_ident() {
   local id="$1" ident
   ident=$(db "SELECT ident FROM tasks WHERE id=${id};" 2>/dev/null) || ident=""
   echo "${ident:-DIVE-${id}}"
+}
+
+# DIVE-2244 — THE DISPATCHER CLAIMS. Stamp status='in_progress' + started_at at
+# the moment the heartbeat nudges an agent against a specific task.
+#
+# WHY THIS EXISTS. The whole stuck-work recovery layer keys on this one field:
+# the deterministic hard cap, the runaway reaper, orphan reclaim, unwedge, and
+# the busy-guard in the tick all read status='in_progress' / started_at. The
+# only writer was an INSTRUCTION — the /goal nudge text says "claim it with
+# 5dive task start DIVE-N" — and an instruction an agent must remember at the
+# moment of action is not a control (DIVE-2146). The dispatcher is the
+# mechanism; the instruction is a hope.
+#
+# WHAT THE BOARD ACTUALLY SHOWS, re-measured at implementation time rather than
+# inherited from the ticket. Compliance is PARTIAL and erratic, not zero:
+# of tasks closed per day, the share that ever had started_at set ran 23% (14 of
+# 61, 2026-07-28), 51% (35 of 68, 07-27), 60% (50 of 83, 07-26). The filing
+# ticket reported 0 of 24 and "0 tasks with started_at in 48h"; its six NAMED
+# tasks are genuinely NULL, but the aggregate does not hold — 48 rows were
+# claimed in that same window. So `in_progress == 0` is a TRANSIENT, not the
+# permanent condition the ticket diagnosed.
+#
+# That correction moves which half of this fix does which job, so state it
+# plainly rather than let the ticket's ordering stand:
+#   * the false-positive ALARM is only partly a claim problem. in_progress was
+#     genuinely 0 at 08:15Z on 2026-07-28 — a real quiet moment, not a dead
+#     field. Claiming raises the floor (an agent under nudge now holds a row)
+#     but does not by itself make the predicate sound; the probe-conclusiveness
+#     half of DIVE-2244, in _hb_stall_sweep, is what addresses the reported
+#     firing.
+#   * the SILENT half is the one this function fixes outright, and it is the
+#     costly one. At 23-60% coverage, most in-flight work was invisible to
+#     every recovery rule above: a genuinely runaway or orphaned task in that
+#     majority had no recovery path at all and would present as a
+#     permanently-todo row nobody notices. Claiming at the nudge takes coverage
+#     of dispatcher-driven work to 100% by construction.
+#
+# The heartbeat already knows the exact task it woke the agent for, so the claim
+# belongs here.
+#
+# KNOWN PROPERTY, not an accident of where the UPDATE landed: THIS CLAIMS ON
+# DELIVERY, NOT ON ACCEPTANCE. _hb_wake succeeding means the nudge was SENT into
+# the pane. It does not mean the agent read it, understood it, or began. So a
+# nudge that lands in a wedged pane produces a row that reads "someone is on
+# this" while nobody is — the board asserts work-in-progress from a send. There
+# is no acceptance signal available at this layer to claim on instead (the agent
+# reading its own nudge is unobservable from here), so delivery is the honest
+# ceiling of what the dispatcher can know, and it is stated rather than implied.
+#
+# What keeps that from becoming a silent permanent stall is that the recovery
+# net behind it does NOT depend on the same unreliable liveness read. Of the
+# three reclaim rules in _hb_reclaim, rule (c) — the hard cap at
+# everyMin*_HB_STALE_MULT — is UNCONDITIONAL: pure arithmetic on age_min, no
+# _hb_agent_idle call, and its `/goal clear` is best-effort (`|| true`) so a dead
+# pane cannot gate the requeue. Only rule (b) consults the idle probe. So if the
+# probe is wrong in the busy direction (a hung process that still reads alive),
+# rule (b) misses and the worst case is a BOUNDED stall to the budget, then a
+# requeue; a second overrun blocks + escalates to a human rather than churning.
+# A wrong probe cannot produce a task that is neither re-nudged nor reclaimed.
+# tests/heartbeat_dispatcher_claim_unit.sh fences this directly rather than
+# leaving it to a reading of the code.
+#
+# NARROW BY CONSTRUCTION — this must not become a way for a tick to rewrite rows:
+#   * called ONLY inside the _hb_wake success branch, so a tick that wakes nobody
+#     (not due / busy / no work / spread-deferred / wake failed) mutates nothing;
+#   * WHERE status='todo' AND kind='standard' — never stomps a row something else
+#     already moved between the wake and this stamp, and never touches a
+#     recurring TEMPLATE (starting one silently retires it, DIVE-2055/2059);
+#   * started_at=COALESCE(started_at, ...) — same idempotence as `task start`, so
+#     an agent that DOES run `task start` afterwards is a no-op, not a re-clock.
+#
+# Returns nonzero when the claim did not land, so the caller can say so out loud
+# rather than logging a claim it never made. Never exits: the agent is already
+# awake by this point, and a db hiccup must not abort the tick.
+_hb_claim_task() {
+  local name="$1" id="$2" n=""
+  db "UPDATE tasks SET status='in_progress',
+        started_at=COALESCE(started_at, datetime('now')),
+        updated_at=datetime('now')
+      WHERE id=${id} AND status='todo' AND kind='standard';" 2>/dev/null || return 1
+  # Confirm from the ROW, not from the UPDATE's exit code — sqlite exits 0 on an
+  # UPDATE that matched nothing, which is precisely the case we must not report
+  # as a claim.
+  n=$(db "SELECT COUNT(*) FROM tasks WHERE id=${id} AND status='in_progress' AND started_at IS NOT NULL;" 2>/dev/null) || return 1
+  [[ "$n" == "1" ]] || return 1
+  return 0
 }
 
 # Flip one in_progress task back to todo. Clears started_at so its age and the
@@ -39779,11 +39938,39 @@ _hb_stall_sweep() {
           (( _HB_ACT_BLOCKED > 0 )) && _act_detail="${_act_detail}, ${_HB_ACT_BLOCKED} BLOCKED (${_HB_ACT_BLOCKED_NAMES}) — a frozen permission/usage dialog is the usual root and does NOT self-clear"
           (( _HB_ACT_UNKNOWN > 0 )) && _act_detail="${_act_detail}, ${_HB_ACT_UNKNOWN} UNMEASURABLE (pane uncapturable) — this alert did not prove those idle"
           (( _HB_ACT_CHECKED == 0 )) && _act_detail="session probe UNAVAILABLE (no agents readable) — idleness is UNVERIFIED, not measured"
+          # DIVE-2244, second (separable) defect in the SAME alert. The probe arm
+          # is honest about what it could not read — "this alert did not prove
+          # those idle" — and that honesty is right and is kept. But the sentence
+          # it sat inside was still a flat assertion: "🛑 fleet-stall", a
+          # fleet-wide claim, while the same message admitted it could not
+          # measure a third of the population. An alarm may not assert what it
+          # just said it did not measure.
+          #
+          # So the HEADLINE now tracks conclusiveness of the probe. Deliberately
+          # a language change, not a firing change: requiring a conclusive probe
+          # to fire at all would fail OPEN — an uncapturable-pane outage is
+          # exactly when the fleet is most likely to be genuinely wedged, and
+          # suppressing there loses the alarm when it matters most. Downgrading
+          # the claim to a question keeps the signal and drops the overreach.
+          # (This is the ticket's own second option; cf. NOT-REACHED-is-a-third-
+          # state, v0.16 "Fails loud".)
+          #
+          # The in_progress clause is now a real reading, not the permanent
+          # constant it was before the claim above landed — so it is worth
+          # printing. Pre-DIVE-2244 "0 in_progress" was true on every tick
+          # forever and told the reader nothing.
+          local _hdr _tail
+          if (( _HB_ACT_CHECKED > 0 && _HB_ACT_UNKNOWN == 0 )); then
+            _hdr="🛑 fleet-stall"; _tail="Check \`5dive task ls\` / \`5dive task inbox\`"
+          else
+            _hdr="❓ possible fleet-stall (UNPROVEN)"
+            _tail="The session probe could not measure every agent, so this is a QUESTION, not a finding — is the fleet actually stalled? Check \`5dive task ls\` / \`5dive task inbox\`"
+          fi
           ( cmd_send "main" --from="task-engine" \
-              --message="🛑 fleet-stall: ${total_stranded} stranded actionable item(s) (${stranded_todo} unclaimed todo, ${open_gates} open gate(s)) idle $((since_secs / 60))m+ with 0 in_progress and 0 running loops — and ${_act_detail}. Check \`5dive task ls\` / \`5dive task inbox\` (DIVE-1416 gap#3, session probe DIVE-2122)." ) >/dev/null 2>&1 || true
+              --message="${_hdr}: ${total_stranded} stranded actionable item(s) (${stranded_todo} unclaimed todo, ${open_gates} open gate(s)) idle $((since_secs / 60))m+ with 0 in_progress and 0 running loops — and ${_act_detail}. ${_tail} (DIVE-1416 gap#3, session probe DIVE-2122, claim/probe honesty DIVE-2244)." ) >/dev/null 2>&1 || true
           db "INSERT INTO task_prefs (key,value) VALUES ('stall_alerted_at', datetime('now'))
               ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=datetime('now');"
-          _hb_log "[stall-sweep] fleet-idle $((since_secs / 60))m with ${total_stranded} stranded item(s), ${_act_detail} -> alarmed main"
+          _hb_log "[stall-sweep] fleet-idle $((since_secs / 60))m with ${total_stranded} stranded item(s), ${_act_detail} -> sent '${_hdr}' to main"
         fi
       fi
     fi
@@ -40418,14 +40605,30 @@ cmd_heartbeat_tick() {
       with_registry_lock _hb_wake_budget_inc "$name" "$today" >/dev/null 2>&1 || true  # DIVE-1858: count this wake
       with_registry_lock _hb_clear_active_defer "$name" >/dev/null 2>&1 || true  # DIVE-1486: episode over
       local nudge_n
+      # _hb_mark_run FIRST, then the claim. Its prune keys on "still todo", so
+      # claiming first would evict this task's own nudge entry every tick and peg
+      # the counter at 1 — the starvation signal below would never fire again.
       nudge_n=$(with_registry_lock _hb_mark_run "$name" "$now" "$task_id")
-      woke=$((woke + 1)); _hb_log "[$name] nudged (/goal ${task_ident}, nudge #${nudge_n:-?})"
-      # Nudged repeatedly but the task never left todo → it's being starved
-      # (e.g. listen-loop watchdog yanking the agent before `task start` runs).
-      # Surface it instead of silently re-nudging every tick forever.
+      # DIVE-2244: THE DISPATCHER CLAIMS. See _hb_claim_task.
+      local _claimed=0; _hb_claim_task "$name" "$task_id" && _claimed=1
+      woke=$((woke + 1))
+      if (( _claimed == 1 )); then
+        _hb_log "[$name] nudged (/goal ${task_ident}, nudge #${nudge_n:-?}) — claimed in_progress (DIVE-2244)"
+      else
+        # Loud, not silent: an unclaimed nudge is exactly the pre-DIVE-2244 world
+        # for THIS task — reaper, orphan reclaim and unwedge cannot see it, and
+        # the busy-guard will re-nudge it next tick.
+        _hb_log "[$name] WARN: nudged (/goal ${task_ident}, nudge #${nudge_n:-?}) but the CLAIM did not land (row no longer todo, or db write failed) — recovery rules are blind to this task this tick (DIVE-2244)"
+      fi
+      # Nudged repeatedly for the SAME task → it is being starved. Pre-DIVE-2244
+      # this meant "never left todo" (the listen-loop watchdog yanking the agent
+      # before `task start` ran). Now the dispatcher claims, so reaching this
+      # count means the task keeps coming BACK to todo — it was claimed, then
+      # reclaimed by rule (a)/(b)/(c), repeatedly. Different mechanism, same
+      # conclusion: the agent is not converting nudges into finished work.
       if [[ "${nudge_n:-0}" =~ ^[0-9]+$ ]] && (( nudge_n >= _HB_STARVE_AFTER )); then
         starved=$((starved + 1))
-        _hb_log "[$name] WARN: ${task_ident} nudged ${nudge_n}x but still todo (never started) — possible listen-loop starvation; check the agent's task-claim path"
+        _hb_log "[$name] WARN: ${task_ident} nudged ${nudge_n}x and is still not done (claimed then requeued each time) — possible listen-loop starvation; check the agent's task-claim path"
       fi
     else
       sk_fail=$((sk_fail + 1)); _hb_log "[$name] wake failed — will retry next tick"
