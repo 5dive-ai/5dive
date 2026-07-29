@@ -3898,6 +3898,23 @@ _gate_floor_axis() {
 # `agent-lodar` made `id -un` return exactly that, from a process whose real uid
 # was 1004 (agent-main). Same shape as the landed DIVE-2281 fix in
 # `_envelope_sender_fallback`.
+# SEAM for the passwd SOURCE, added iteration 2 (DIVE-2330). A harness needs to
+# model a caller uid that maps to an `agent-*` name; before this it could only
+# pick a uid that happens to exist ON THIS HOST, which is the same
+# precondition-supplied-by-the-host defect DIVE-2365 named — and it is why the
+# T8 arm was vacuous (there is no `agent-evil` here, so `id -u agent-evil` failed
+# and the override fell back to uid 0, i.e. root: T8 modelled no agent at all).
+#
+# A FUNCTION, deliberately NOT `${_GATE_PASSWD_FILE:-/etc/passwd}`. An env-settable
+# source would be a new forgery vector in the field this whole row exists to make
+# unforgeable — the same reasoning `_envelope_sender_fallback` records in
+# cmd_agent_runtime.sh ("NO ENV OVERRIDE for the passwd path, deliberately"). A
+# function cannot be injected: bash imports exported functions at startup, and the
+# script's own definition executes AFTER that import and overwrites it. Same
+# property `_gate_is_root` and `_gate_caller_uid` already rely on.
+# Pure bash — no `cat`, which would be PATH-resolved.
+_gate_passwd_stream() { printf '%s\n' "$(</etc/passwd)"; }
+
 _gate_uid_to_agent() {
   local want="${1:-}" name _x uid
   [[ "$want" =~ ^[0-9]+$ ]] || { printf ''; return; }
@@ -3905,7 +3922,7 @@ _gate_uid_to_agent() {
     [[ "$uid" == "$want" ]] || continue
     [[ "$name" == agent-* ]] || { printf ''; return; }
     printf '%s' "${name#agent-}"; return
-  done < /etc/passwd
+  done < <(_gate_passwd_stream)
   printf ''
 }
 
@@ -7420,10 +7437,10 @@ cmd_task_answer() {
   # returns `--from=<anything>` verbatim — so authorizing on it would let any agent
   # mint `lead:<the reviewer>` for itself. `_gate_authenticated_actor` is the
   # unforgeable half, and it FAILS CLOSED (empty -> no lead-clear).
-# DIVE-2330: that claim was FALSE until this fix — the function read a bare
-# `id -un`, resolved through the caller's PATH, so any agent could mint the
-# routed reviewer's name (measured: a shim made it return `lodar`). It now
-# resolves $EUID in pure bash over /etc/passwd, so the claim is true as written.
+  # DIVE-2330: that claim was FALSE until this fix — the function read a bare
+  # `id -un`, resolved through the caller's PATH, so any agent could mint the
+  # routed reviewer's name (measured: a shim made it return `lodar`). It now
+  # resolves $EUID in pure bash over /etc/passwd, so the claim is true as written.
   local _routed_rev; _routed_rev=$(db "SELECT COALESCE(routed_reviewer,'') FROM tasks WHERE id=${id};")
   local _lead_clear=0 _rc_sealed=0 _rc_deny=""
   if [[ ( "$nt" == "approval" || "$nt" == "manual" || "$nt" == "access" ) && -n "$_routed_rev" ]]; then
@@ -7463,7 +7480,6 @@ cmd_task_answer() {
   # DIVE-2099: the org lead's STANDING authority over ENGINEERING approvals — the
   # same clearance as the routed lead-clear above, but WITHOUT requiring that this
   # gate was routed to them at filing time. Identity is the unforgeable half and
-  # gate was routed to them at filing time. # DIVE-2330: true only because identity now resolves $EUID in pure bash over /etc/passwd. It was FALSE while any of these read `id -un`/`getent`, both PATH-resolved and forgeable by the caller being checked.
   # is checked FIRST: `_gate_authenticated_actor` reads the kernel-enforced unix
   # caller (never --from, which `task_actor` returns verbatim — DIVE-2004), and
   # `_gate_standing_lead` resolves the holder and itself fails closed to EMPTY.
@@ -7503,11 +7519,23 @@ cmd_task_answer() {
   # _lead_clear=0 and a human is required — exactly the intended fall-through.
   if [[ "$nt" == "approval" || "$nt" == "secret" || "$nt" == "manual" || "$nt" == "access" ]]; then
     # DIVE-2330: was `id -un` (PATH-forgeable). This decides whether an agent is
-    # REFUSED, so a caller faking a non-agent name would skip it. EUID-only on
-    # purpose: the old test was `id -un == agent-*`, i.e. the PROCESS is an agent
-    # user. Routing through _gate_authenticated_actor would also fire on a
-    # root+SUDO_UID caller and widen the refusal — a behaviour change, not a fix.
-    local _caller; _caller=$(_gate_uid_to_agent "$EUID")
+    # REFUSED, so a caller faking a non-agent name would skip it.
+    #
+    # ITERATION 2 (dev's finding, and the comment above it used to justify the
+    # bug): this read `$EUID` DIRECTLY, bypassing `_gate_caller_uid`. The
+    # justification conflated two different things — routing through
+    # `_gate_authenticated_actor` WOULD widen the refusal, because that function
+    # adds the root+SUDO_UID branch; routing through `_gate_caller_uid` widens
+    # NOTHING, because the seam's entire body is `printf '%s' "$EUID"`. The
+    # EUID-only semantics live INSIDE the seam, which is the point of the seam.
+    #
+    # What the bypass cost: a harness could not model a non-agent caller here, so
+    # on any `agent-*` runner this guard fired on the RUNNER'S OWN identity and
+    # `fail` exited the sourced harness mid-suite (gate_nonce_unit T3's uncaptured
+    # call, rc=6, 9/18 arms). The outcome of the test suite became a function of
+    # whose uid ran it — the DIVE-2365 host-supplied-precondition shape, which
+    # this branch named in its own body and then reintroduced one function over.
+    local _caller; _caller=$(_gate_uid_to_agent "$(_gate_caller_uid)")
     if [[ -n "$_caller" && "$_lead_clear" != "1" ]]; then
       # No audit_log here: the blocked caller is an agent user that can't write
       # the root-owned audit log anyway (it would only leak a perms error to

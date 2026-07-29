@@ -13,9 +13,12 @@
 # Run: bash tests/gate_actor_path_forgery_unit.sh   (no root, no network)
 set -uo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
-PASS=0; FAIL=0
+PASS=0; FAIL=0; SKIP=0
 ok(){ PASS=$((PASS+1)); printf 'ok   - %s\n' "$1"; }
 no(){ FAIL=$((FAIL+1)); printf 'NOT OK - %s\n' "$1"; }
+# A skip is NOT a pass (iteration 2, dev): on a non-agent runner one of the five
+# "passed" was a skipped arm printed as ok, which inflates a green log.
+skip(){ SKIP=$((SKIP+1)); printf 'skip - %s\n' "$1"; }
 
 # --- ground truth, independent of the code under test -----------------------
 REAL_UID=$(awk '/^Uid:/{print $2; exit}' /proc/self/status)
@@ -23,9 +26,21 @@ REAL_NAME=$(awk -F: -v u="$REAL_UID" '$3==u{print $1; exit}' /etc/passwd)
 EXPECT=""; [[ "$REAL_NAME" == agent-* ]] && EXPECT="${REAL_NAME#agent-}"
 
 # --- load ONLY the resolver pair, not the whole CLI --------------------------
+# `_gate_is_root` and `_gate_passwd_stream` are NOT optional (iteration 2, dev):
+# `_gate_authenticated_actor` calls `_gate_is_root`, and without it the SUDO_UID
+# branch was graded against a missing function — bash printed
+# `_gate_is_root: command not found` twice and the branch was never exercised.
+# `_gate_uid_to_agent` now reads its passwd source through `_gate_passwd_stream`,
+# so that must load too or the resolver returns empty for every uid and arms 1-3
+# pass vacuously.
+eval "$(sed -n '/^_gate_passwd_stream()/,/^}/p'        src/cmd_task.sh)"
+eval "$(sed -n '/^_gate_is_root()/,/^}/p'             src/cmd_task.sh)"
 eval "$(sed -n '/^_gate_uid_to_agent()/,/^}/p'        src/cmd_task.sh)"
 eval "$(sed -n '/^_gate_caller_uid()/,/^}/p'          src/cmd_task.sh)"
 eval "$(sed -n '/^_gate_authenticated_actor()/,/^}/p' src/cmd_task.sh)"
+for _f in _gate_passwd_stream _gate_is_root _gate_uid_to_agent _gate_caller_uid _gate_authenticated_actor; do
+  declare -F "$_f" >/dev/null || { printf 'NOT OK - %s did not load; the arms below would be vacuous\n' "$_f"; exit 1; }
+done
 
 SHIM=$(mktemp -d)
 printf '#!/bin/sh\necho agent-lodar\n'  > "$SHIM/id";     chmod +x "$SHIM/id"
@@ -46,7 +61,7 @@ if [[ -n "$EXPECT" ]]; then
     && ok "under a hostile PATH the resolver still returns the kernel identity ($EXPECT)" \
     || no "expected '$EXPECT' from /proc+/etc/passwd, got '$got_shim'"
 else
-  ok "skipped identity arm — this runner is not an agent-* user (uid $REAL_UID)"
+  skip "identity arm — this runner is not an agent-* user (uid $REAL_UID, name '$REAL_NAME')"
 fi
 
 # 3. It must never return the forged name.
@@ -71,5 +86,6 @@ old_shim=$(PATH="$SHIM:$PATH" _old_actor)
   && ok "a non-numeric uid resolves to empty (fails closed)" \
   || no "non-numeric uid did not fail closed"
 
-printf '\ngate_actor_path_forgery_unit: %d passed, %d failed\n' "$PASS" "$FAIL"
+printf '\ngate_actor_path_forgery_unit: %d passed, %d failed, %d skipped (runner %s, uid %s)\n' \
+  "$PASS" "$FAIL" "$SKIP" "${REAL_NAME:-?}" "$REAL_UID"
 [ "$FAIL" -eq 0 ]

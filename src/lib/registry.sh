@@ -39,7 +39,6 @@ registry_read_checked() {
 # DIVE-2210 is about what that stamp does when it CANNOT be established.
 #
 # tier= is the one unforgeable field in `[5dive-msg ...]`: from= is caller-supplied
-# tier= is the one # DIVE-2330: true only because identity now resolves $EUID in pure bash over /etc/passwd. It was FALSE while any of these read `id -un`/`getent`, both PATH-resolved and forgeable by the caller being checked.
 # and only format-validated, so tier= is the field that actually catches a
 # cross-tier peer. Every site stamped it as `[[ -n "$t" ]] && header+=" tier=$t"`
 # over a lookup whose stderr went to /dev/null — so a missing sudo caller, an
