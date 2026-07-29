@@ -21,57 +21,57 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      # DIVE-2107: regenerate the GENERATED sources BEFORE building, because the
-      # bundle check below cannot see one level up.
-      #
-      # src/cmd_council.sh is itself generated — src/council/gen_cmd.mjs embeds
-      # engine.mjs + cli.mjs into cmd_council.template.sh. build.sh does NOT run
-      # that generator; it only bundles whatever src/ currently contains. So a
-      # COMMITTED hand-edit of src/cmd_council.sh is faithfully carried into the
-      # bundle, `git diff 5dive` is clean, and every existing check passes: the
-      # canonical .mjs carries nothing, the next gen_cmd.mjs run silently reverts
-      # the change, and the node harnesses (which import engine.mjs) never
-      # exercise it.
-      #
-      # Measured on a committed hand-edit, both directions: build.sh + `git diff
-      # 5dive` stays SILENT; regenerating first reports ` M src/cmd_council.sh`.
-      # The edit must be COMMITTED to reproduce — editing only the working tree
-      # is reverted by the generator and proves nothing.
-      #
-      # Found by olivia verifying DIVE-2103, where iteration 1 did exactly this.
-      # sha256sum-vs-5dive.sha256 and a re-seal both pass on such a commit too,
-      # because they grade the artifact against its OWN recorded checksum and
-      # never against what src produces.
-      - name: Regenerate generated sources
-        run: node src/council/gen_cmd.mjs
-      - name: Fail if a GENERATED source was hand-edited
-        run: |
-          if ! git diff --exit-code src/cmd_council.sh; then
-            echo
-            echo "ERROR: src/cmd_council.sh does not match what its generator produces."
-            echo "It is GENERATED from src/council/{engine,cli}.mjs + cmd_council.template.sh."
-            echo "Edit those, then run: node src/council/gen_cmd.mjs && ./build.sh"
-            echo "Editing src/cmd_council.sh directly is silently reverted by the next build."
-            exit 1
-          fi
       - name: Rebuild bundle from src/
         run: ./build.sh
       - name: Syntax-check the rebuilt bundle
         run: bash -n 5dive
-      # DIVE-2107: 5dive.sha256 is graded here too. It was previously checked ONLY
-      # by tests/install_checksum_unit.sh in the unit-tests job, so a stale
-      # committed sha surfaced as unit-tests red rather than drift red — and a
-      # green bundle-drift never meant "the sha is consistent". build.sh writes the
-      # sha immediately after the bundle, so if it is dirty here the committed pair
-      # genuinely disagreed.
-      - name: Fail if the committed bundle or its checksum drifted from src/
+      # DIVE-2091: the bundle is no longer committed, so the old check here
+      # (`git diff --exit-code 5dive`) would pass VACUOUSLY on an untracked file —
+      # a check that cannot fail, which is worse than no check. Two assertions
+      # replace it, and both CAN fail.
+      - name: The bundle must NOT be tracked
         run: |
-          if ! git diff --exit-code 5dive 5dive.sha256; then
-            echo
-            echo "ERROR: the committed 5dive bundle (or 5dive.sha256) does not match src/."
-            echo "Run ./build.sh locally and commit the result."
+          # Re-committing the generated pair re-introduces the whole defect this
+          # ticket removed: every merge to main invalidating every open PR (three
+          # forced rebases in one day, two on an outside contributor). Catch it on
+          # the PR that does it rather than on the next person to rebase.
+          for f in 5dive 5dive.sha256; do
+            if git ls-files --error-unmatch "$f" >/dev/null 2>&1; then
+              echo "::error::$f is TRACKED again. It is generated at tag time by"
+              echo "::error::release-cut.yml and must stay untracked (see .gitignore)."
+              exit 1
+            fi
+          done
+          echo "5dive and 5dive.sha256 are untracked, as required"
+      - name: The build must be REPRODUCIBLE (not a provenance check)
+        run: |
+          # Tag-time generation only works if two builds of the same source agree:
+          # the tag's bundle is built on a runner, and anyone auditing it rebuilds
+          # elsewhere. If that is not reproducible, the published artifact is
+          # unverifiable by anyone but the machine that made it.
+          #
+          # WHAT THIS DOES NOT CATCH, stated so nobody reads it as more than it is
+          # (dev, DIVE-2091): a STALE RECIPE. build.sh is itself a source file, so a
+          # rebuild with a build.sh from one commit against src/ from another emits a
+          # WRONG bundle — and does so DETERMINISTICALLY, then regenerates a matching
+          # .sha256 for it. Measured: 47,779 lines instead of 48,024, the whole of
+          # src/lib/capability.sh absent while its CALL SITES ship, and self-consistent
+          # throughout. Build-twice-and-compare passes on that, because the same wrong
+          # recipe is wrong the same way twice. This is a REPRODUCIBILITY check, not a
+          # PROVENANCE one. Provenance comes from release-cut building in a single
+          # detached checkout, where build.sh and src/ cannot be from different commits.
+          a=$(sha256sum 5dive | cut -d' ' -f1)
+          ./build.sh
+          b=$(sha256sum 5dive | cut -d' ' -f1)
+          if [ "$a" != "$b" ]; then
+            echo "::error::build.sh is NOT deterministic ($a vs $b) — a tag-time bundle could not be independently reproduced."
             exit 1
           fi
+          if [ "$(tr -d '[:space:]' < 5dive.sha256)" != "$b" ]; then
+            echo "::error::5dive.sha256 does not match the bundle build.sh just produced."
+            exit 1
+          fi
+          echo "build is reproducible and self-consistent ($b)"
 
   # DIVE-2065: CI-side twin of scripts/version-bump-guard.sh's push-time check
   # (scripts/git-hooks/pre-push). Catches a version collision that bypassed

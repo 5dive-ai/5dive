@@ -17,17 +17,6 @@
 # needed to exercise them). Never touches the real repo's git state.
 # Run: bash tests/version_bump_guard_unit.sh  (no root, no network).
 set -uo pipefail
-
-# DIVE-2211: name the tree this harness grades (tests/lib/grading_tree.sh).
-# Three-state: if the helper is unreachable (a staged copy that did not carry
-# tests/lib/), the log says NO TREE WAS NAMED rather than falling silent, and a
-# `set -e` harness is not killed by a failed source.
-# NOTE the absence of `2>/dev/null`. The obvious hardening -- redirect the
-# source's stderr so bash's "No such file" does not litter the log -- also
-# swallows the helper's own stderr line, which IS the payload. That silenced all
-# 210 harnesses at once while every other check in this change stayed green.
-. "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh" \
-  || printf 'grading tree: UNRESOLVED (tests/lib/grading_tree.sh not reachable; no tree named)\n' >&2
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BUMP_GUARD="$ROOT/scripts/version-bump-guard.sh"
 UNIQ_SCAN="$ROOT/scripts/version-uniqueness-scan.sh"
@@ -59,7 +48,12 @@ commit_release() {
   printf 'readonly FIVE_VERSION="%s"\n' "$1" > src/header.sh
   printf '#!/usr/bin/env bash\nreadonly FIVE_VERSION="%s"\necho hi\n' "$2" > 5dive
   printf '%s\n' "$3" > 5dive.sha256
-  git add -A >/dev/null
+    # DIVE-2091: the guard now keys on "did src/ or build.sh change" — the committed
+  # 5dive.sha256 it used to compare is generated at tag time and is not in a commit
+  # any more. SHA_CONTENT keeps its MEANING ("a different build") and changes its
+  # EXPRESSION: it lands in src/, where the real signal now is.
+  printf '%s\n' "$3" > src/body.sh
+git add -A >/dev/null
   git commit -q -m "$4"
   git rev-parse HEAD
 }
@@ -112,10 +106,22 @@ assert_exit "bump-guard: blocks the incident shape (bundle changed, version reus
 bash "$BUMP_GUARD" "$c2" "$c1" >/dev/null 2>&1
 assert_exit "bump-guard: allows a genuine forward bump" 0 "$?"
 
-# header/bundle mismatch: version bumped in header.sh but bundle never rebuilt
-c3="$(commit_release 0.1.2 0.1.1 shaD "header bumped, bundle NOT rebuilt")"
-bash "$BUMP_GUARD" "$c3" "$c2" >/dev/null 2>&1
-assert_exit "bump-guard: blocks a bundle whose embedded version doesn't match header.sh" 1 "$?"
+# DIVE-2091: the "committed bundle embeds a version disagreeing with header.sh"
+# assertion is GONE, and deliberately so — it is now UNREACHABLE, not relaxed.
+# There is no committed bundle to disagree with src/header.sh; the bundle that
+# ships is built at tag time FROM that header. The property did not disappear, it
+# MOVED: release-cut.yml refuses when v${FIVE_VERSION} != the tag being cut, and
+# tests/release_cut_bundle_unit.sh drives that refusal against the shipped
+# workflow. Asserting it here would be a check that can never fail.
+#
+# What IS asserted here instead: the guard must not silently regrow a dependency
+# on a committed artifact. If someone re-introduces one, this arm fails and they
+# are told where the property actually lives.
+if grep -qE '^[^#]*(git show[^|]*5dive\.sha256|_sha256file)' "$BUMP_GUARD"; then
+  assert_exit "bump-guard: must NOT read a committed 5dive.sha256 (generated at tag time; see release-cut.yml + release_cut_bundle_unit.sh)" 0 1
+else
+  assert_exit "bump-guard: reads no committed bundle artifact" 0 0
+fi
 
 # no-op push off the clean c2 state: unrelated file only, bundle/version untouched
 git checkout -q "$c2"
