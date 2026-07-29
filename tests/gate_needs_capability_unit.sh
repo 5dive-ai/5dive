@@ -32,6 +32,12 @@
 # differently on a CI runner ($USER=runner) than on a dev box ($USER=agent-*).
 # Repro the runner shape before pushing:
 #   env -u SUDO_USER -u SUDO_UID USER=runner bash tests/gate_needs_capability_unit.sh
+# DIVE-2211: name the tree this harness grades (tests/lib/grading_tree.sh) — a
+# green log from a stale checkout and a green log from origin/main are otherwise
+# byte-identical. Sourced BEFORE the cd, from BASH_SOURCE, so the tree named is the
+# one this FILE lives in rather than whatever $PWD happened to be.
+. "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh" \
+  || printf 'grading tree: UNRESOLVED (tests/lib/grading_tree.sh not reachable; no tree named)\n' >&2
 set -uo pipefail
 cd "$(dirname "$0")/.."
 SRC=src
@@ -110,6 +116,23 @@ _gate_needs_human delegated_push   && bad_t "an AGENT capability must not resolv
 _gate_needs_human ""               && bad_t "empty must not resolve" "empty matched" \
   || ok_t "an EMPTY declaration does not resolve (absent == undeclared, never non-holding)"
 
+# --- 0b. the near-miss class: a typo must not silently WEAKEN the gate --------
+# Exact matching made `--needs=human-tap` fall through to a tier-1, agent-clearable,
+# TTL-auto-appliable gate while the filer believed they had secured a human — and the
+# warn that says so goes to whoever ran the command, which for a headless agent filing
+# programmatically is nobody. Normalising case + separator kills the whole class; edit
+# distance is deliberately NOT attempted (a resolver that guesses is a new thing to be
+# wrong about, and this one decides whether a human is required).
+for v in human-tap HUMAN_TAP Human_Tap HUMAN-TAP spend-authority SECRET-PROVISION; do
+  _gate_needs_human "$v" && ok_t "near-miss '$v' normalises to a human-class constant" \
+    || bad_t "near-miss '$v' resolves" "a typo must not silently weaken the gate"
+done
+# Normalisation must not become a wildcard: it maps case and separator, nothing else.
+for v in humantap human__tap human_tap_x spend_author; do
+  _gate_needs_human "$v" && bad_t "normalisation over-reaches on '$v'" "matched a name that is not one of the three" \
+    || ok_t "'$v' still does NOT resolve — normalisation maps case+separator, it does not guess"
+done
+
 # --- 1. CONTROL: no --needs on a verifier-loop task still routes to the verifier
 # Filed FIRST so a later human-arm pass cannot be read as "this box never routes".
 reset_log; seed_loop DIVE-9001
@@ -151,6 +174,18 @@ grep -qi 'T2 category floor' <<<"$OUT_H$(cat "$TMP/e_h")" \
 grep -q 'discusses' <<<"$OUT_H$(cat "$TMP/e_h")" \
   && bad_t "a filer must not be invited to appeal their OWN declaration" "out: $(cat "$TMP/e_h")" \
   || ok_t "no --discusses appeal is offered against the filer's own declaration"
+
+# --- 2b. the near-miss END TO END, not just at the resolver ------------------
+# The resolver arms above would pass even if cmd_task_need never called it, so file
+# a real gate with the hyphenated spelling on the verifier-loop shape.
+reset_log; seed_loop DIVE-9020
+OUT_N=$(cmd_task_need DIVE-9020 --type=approval --ask="approve the merge of the parser refactor" --recommend="yes" --needs=human-tap --from=dev 2>"$TMP/e_n")
+[[ "$(reviewer_of DIVE-9020)" == "" && "$(tier_of DIVE-9020)" == "2" ]] \
+  && ok_t "--needs=human-tap (hyphenated) reaches the human end to end, not just in the resolver" \
+  || bad_t "hyphenated declaration routes to the human" "reviewer='$(reviewer_of DIVE-9020)' tier=$(tier_of DIVE-9020) err=$(cat "$TMP/e_n")"
+[[ "$(declared_of DIVE-9020)" == "human-tap" ]] \
+  && ok_t "the record keeps what was TYPED (human-tap), not the normalised form — provenance is the declaration, not our reading of it" \
+  || bad_t "record keeps the typed spelling" "needs_capability='$(declared_of DIVE-9020)'"
 
 # --- 3. the other two constants behave identically ---------------------------
 n=9010
@@ -209,7 +244,13 @@ cmd_task_need DIVE-9005 --type=approval --ask="approve the ship: merge and deplo
 # (red) while the control is unchanged (green). If the human arm still stayed off
 # the verifier here, cases 2-3 would be passing for some reason other than the
 # constant, and this whole file would be evidence of nothing.
-_gate_needs_human_REAL() { [[ " $_GATE_HUMAN_CAPABILITIES " == *" ${1:-} "* ]]; }
+# Capture the REAL resolver by reading the live definition, never by hand-copying
+# its body: a transcribed copy is a snapshot that stops tracking the source the
+# moment the source changes, and the restore would then hand every later arm a
+# resolver that differs from production in exactly the way nobody re-reads.
+# (This file already lost one round to that — the normalisation Marcus asked for
+# on #288 would have been silently absent from the restored copy.)
+eval "_gate_needs_human_REAL() $(declare -f _gate_needs_human | sed '1d')"
 _gate_needs_human() { return 1; }                       # the removal
 _gate_needs_human human_tap && bad_t "mutation did not land" "resolver still recognises human_tap" \
   || ok_t "MUTATION LANDED: the resolver now recognises nothing"
@@ -230,6 +271,11 @@ cmd_task_need DIVE-9007 --type=approval --ask="approve the merge of the parser r
 # silently run against the mutated build.
 eval "$(declare -f _gate_needs_human_REAL | sed '1s/_gate_needs_human_REAL/_gate_needs_human/')"
 _gate_needs_human human_tap && ok_t "resolver restored after the mutation arm" || bad_t "resolver restored"
+# ...and restored to the PRODUCTION resolver, not to a weaker snapshot of it. A
+# near-miss is the property most likely to be lost by a hand-copied restore, so it
+# is the one asserted on.
+_gate_needs_human human-tap && ok_t "the restored resolver is the production one (normalisation intact), not a stale transcription" \
+  || bad_t "restore preserves normalisation" "the mutation arm restored a resolver that differs from production"
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" == "0" ]]

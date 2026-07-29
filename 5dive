@@ -23007,9 +23007,28 @@ cmd_task_routing() {
 _GATE_HUMAN_CAPABILITIES='human_tap spend_authority secret_provision'
 # True iff $1 is one of the human-class constants. Whitespace-fenced substring
 # match so no capability can hit by prefix (`human_tap_delegate` must NOT match).
+#
+# NORMALISE FIRST (Marcus, pre-merge read on #288). Exact matching makes a TYPO
+# SILENTLY WEAKER: `--needs=human-tap` / `HUMAN_TAP` fell through to a tier-1,
+# agent-clearable, TTL-auto-appliable gate while the filer believed they had just
+# secured a human. The fall-through is loud — but the warn goes to whoever ran the
+# command, and the common caller is an agent filing programmatically in a headless
+# session: the reader least likely to see it and most likely to believe the
+# declaration held.
+#
+# Why NORMALISE and not REFUSE-on-unknown, which was the other way to close it: an
+# unknown name must keep falling through, because gh_push / root / delegated_push
+# are deliberately unroutable here pending DIVE-2156, and hard-failing them would
+# break a newer capability on an older CLI. Normalising kills the whole near-miss
+# class (case + separator, the only two ways to write these names wrong) while
+# leaving forward-compat intact. Deliberately NOT edit distance: a resolver that
+# guesses what you meant is a new thing to be wrong about, and this one decides
+# whether a human is required.
 _gate_needs_human() {
-  [[ -n "${1:-}" ]] || return 1
-  [[ " $_GATE_HUMAN_CAPABILITIES " == *" $1 "* ]]
+  local c="${1:-}"
+  [[ -n "$c" ]] || return 1
+  c=$(printf '%s' "$c" | tr '[:upper:]-' '[:lower:]_')
+  [[ " $_GATE_HUMAN_CAPABILITIES " == *" $c "* ]]
 }
 
 _GATE_T2_FLOOR_RX='spend|billing|invoice|charge|payment|refund|subscription|price|pricing|\$[0-9]|€[0-9]|publish|public post|announce|launch post|press|customer email|email customers|newsletter|blast|secret|credential|api key|token|password|delete|destroy|teardown|wipe|purge|drop[^.]{0,20}table|truncate|irreversible|revoke|dns|domain transfer'
