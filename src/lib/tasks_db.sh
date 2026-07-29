@@ -273,6 +273,14 @@ CREATE TABLE IF NOT EXISTS tasks (
   ask_shape           TEXT,
   precedent_ref       INTEGER,
   precedent_kind      TEXT,
+  -- DIVE-2241 needs_capability: the capability the FILER DECLARED this ask consumes
+  -- (`task need --needs=<cap>`), verbatim, including an unrecognised one. Three names
+  -- are human-class constants (human_tap / spend_authority / secret_provision) and
+  -- resolve the gate to the paired human instead of the task's verifier or the filer's
+  -- lead; anything else is undeclared-equivalent and changes no routing. DECLARED, never
+  -- inferred from --type or the ask text. The sealed list lives in the shipped source
+  -- (_GATE_HUMAN_CAPABILITIES), NOT here and not in any writable table — see DIVE-2099.
+  needs_capability    TEXT,
   -- DIVE-1140 gate-shipped sweep. Stamped (once) when the heartbeat finds a
   -- commit referencing this OPEN gate's ident on a configured repo's origin/main
   -- — the gate is FLAGGED "likely shipped, verify+close" to its owner. Flag-only
@@ -789,6 +797,7 @@ _tasks_db_migrate() {
            'gate_filed_by TEXT' \
            'secret_key TEXT' 'connector TEXT' 'human_nonce_hash TEXT' \
            'ask_shape TEXT' 'precedent_ref INTEGER' 'precedent_kind TEXT' \
+           'needs_capability TEXT' \
            'shipped_flag_at TEXT' 'routed_reviewer TEXT' \
            'delivery_ref TEXT' 'delivered_at TEXT' \
            'originated_by_objective INTEGER' 'originated_cycle INTEGER' \

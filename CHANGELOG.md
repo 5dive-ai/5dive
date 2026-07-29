@@ -1,5 +1,39 @@
 # Changelog
 
+## Unreleased — feat(task): a gate can DECLARE that it needs a human, and stop being answered by whoever is grading the ticket (DIVE-2241)
+
+A gate filed on a task that carries a maker→verifier loop routes to the VERIFIER by kind
+(DIVE-1495), and that routing reads the task, never the ask. So "may I spend this" and "may
+I have a new token" landed on whichever agent happened to be grading the ticket. Three
+instances in 36 hours across three agents.
+
+`5dive task need` now takes `--needs=<capability>`. Exactly three names — `human_tap`
+(a person's call: brand, strategy, irreversible), `spend_authority` (billing, paid
+accounts) and `secret_provision` (a new token or credential) — resolve to the paired human.
+A gate that declares one is tier 2, is never handed to a lead or a verifier, and cannot be
+agent-cleared or TTL-auto-applied. Anything else changes nothing at all.
+
+DECLARED, never inferred. The tier-2 keyword floor already guesses from the ask's wording;
+this is its sibling with the epistemics reversed — the filer states what the ask consumes,
+and because a statement outranks a guess, a declaration also survives the eng-ship,
+curation, internal-ops and floor-appeal downgrades that classify on an ask's shape.
+
+The three names are CONSTANTS in the shipped source, not rows in a table. This was
+originally sequenced behind a capability registry; that registry is a mirror of
+`/etc/sudoers.d` keyed on an agent account, so it can express `delegated_push` and can never
+express a human at all. A registry derived from a permission system answers who may RUN a
+command, never who may DECIDE a question. And a routing table on a host where every agent
+holds NOPASSWD:ALL is an authority the beneficiary can grant itself in one command, so
+there is deliberately no write path for these — not a guarded one, none.
+
+It never refuses. An unrecognised or misspelt capability warns and falls through to today's
+routing, because a router that hard-fails on an unknown name converts a mis-declared gate
+into a stuck one. The declaration is recorded verbatim on the gate (`needs_capability`) and
+audited at file time, including when it resolved to nothing.
+
+Agent-held capabilities (`gh_push`, `root`, `delegated_push`) are explicitly NOT routable
+this way yet — they need a different source, not a longer wait.
+
 ## Unreleased — fix(task): a recurring template that the scheduler SKIPPED now says so, instead of reading exactly like one it never reached (DIVE-2237)
 
 The materializer's skip-if-open dedup is right for a chore: don't pile up dailies when the
