@@ -87,6 +87,21 @@ stored=$(db "SELECT COALESCE(human_nonce_hash,'') FROM tasks WHERE id=${g2};")
 [[ "$(pinged "$g1")" == "SET" && "$(pinged "$g2")" == "SET" ]] \
   && ok_t "confirmed batch stamps both delivery receipts" || bad_t "batch receipt missing"
 
+# DIVE-2356: the re-nag mint is "hard-human TYPE **or** tier>=2", so g1 — a tier-2
+# DECISION, which minted nothing before — now gets a hash rotated in on a confirmed
+# send. This sweep is the rescue path for the 43 tier-2 decision gates measured
+# nonce-less in DIVE-2355: they acquire evidence on their next reminder instead of
+# waiting to be re-filed. Deliberately asserts the STORED HASH only, not a button:
+# the decision keyboard still carries no nonce in its callback_data (telegram-pi's
+# TNA_RE is greedy and would swallow it), which is why the assertion above for the
+# APPROVAL gate can pair callback_data to the hash and this one cannot.
+[[ "$(db "SELECT COALESCE(human_nonce_hash,'') FROM tasks WHERE id=${g1};")" =~ ^[0-9a-f]{64}$ ]] \
+  && ok_t "tier-2 DECISION gate gets a nonce rotated in by the re-nag (DIVE-2356)" \
+  || bad_t "tier-2 decision re-nag mint" "hash='$(db "SELECT COALESCE(human_nonce_hash,'') FROM tasks WHERE id=${g1};")'"
+# (The tier-1 ANCHOR for this lives at the END of the file: it needs its own
+# `reset`, and resetting here would pull the gates out from under the +24h
+# throttle assertions that follow.)
+
 # Immediate second tick is idempotent; then a 24h-old reminder stamp re-arms.
 : >"$SEND_LOG"
 _hb_gate_renag_sweep
@@ -112,6 +127,17 @@ newhash=$(db "SELECT COALESCE(human_nonce_hash,'') FROM tasks WHERE id=${bad};")
 [[ "$(pinged "$bad")" == "NULL" && "$newhash" == "$oldhash" ]] \
   && ok_t "failed re-nag leaves receipt and nonce unchanged for retry" \
   || bad_t "failed re-nag mutated delivery state" "pinged=$(pinged "$bad") old=$oldhash new=$newhash"
+
+# DIVE-2356 ANCHOR (last, because it needs its own `reset`): a tier-1 decision must
+# NOT acquire a nonce — the widened condition is tier>=2, not "every decision".
+# Green on BOTH the fixed and unfixed tree; red here means the mint over-widened
+# and tier-1 gates started dragging human-gate machinery around.
+reset
+t1d=$(mk_gate DIVE-14 1 decision '-2 hours' '-119 minutes' 'A|B' A '')
+_hb_gate_renag_sweep
+[[ -z "$(db "SELECT COALESCE(human_nonce_hash,'') FROM tasks WHERE id=${t1d};")" ]] \
+  && ok_t "anchor: tier-1 decision gets NO nonce from the re-nag (DIVE-2356)" \
+  || bad_t "anchor: tier-1 decision re-nag mint (DIVE-2356)" "over-widened — got a hash"
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]

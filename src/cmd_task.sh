@@ -5369,14 +5369,61 @@ cmd_task_need() {
   # human-territory) or the org named no distinct lead (the filer IS the lead, who
   # is re-escalating). Both are legitimate human clears, so it needs the same
   # tap-safe nonce as approval/secret/manual for the Telegram tap.
-  local human_nonce=""
-  case "$type" in
-    approval|secret|manual|access)
-      human_nonce=$(_human_nonce_mint)
-      [[ -n "$human_nonce" ]] \
-        && db "UPDATE tasks SET human_nonce_hash=$(sqlq "$(_human_nonce_sha "$human_nonce")") WHERE id=${id};"
-      ;;
-  esac
+  #
+  # DIVE-2356 (from the DIVE-2355 measurement): the mint was gated on gate TYPE
+  # ALONE, and the "decision gates are agent-clearable → no nonce" line above is
+  # true only at tier 0/1. A `decision` FLOORED to tier 2 is by definition NOT
+  # agent-clearable — the DIVE-1117 floor refuses a non-human answer on it — yet
+  # it minted nothing, so it carried no per-gate human evidence at all. Measured
+  # across every answered gate on the live board: approval/manual/secret tier-2
+  # were 40/40 nonce-SET, decision tier-2 was 4/47 (and those 4 came from the
+  # escalate-to-human path below, the one unconditional mint). So the mint
+  # condition is now "hard-human TYPE **or** tier>=2", which is what the DIVE-916
+  # comment always meant by "the types `task answer` enforces as human-only".
+  #
+  # ORDERING, DELIBERATE — this ships ALONE. The companion rule (refuse a tier-2
+  # answer whose human_nonce_hash IS NULL) must NOT land until tier-2 decision
+  # gates have accumulated nonces in the wild: shipped together, it would refuse
+  # the overwhelming majority of tier-2 decision answers, i.e. the dominant
+  # working path. Safe to land alone on the ANSWER side, which is the side that
+  # could break: the tier-2 floor in cmd_task_answer is provenance-only
+  # (`(( ! human ))`), and the DIVE-916 evidence block never fires for `decision`.
+  #
+  # BUT THE HASH IS NOT INERT, AND AN EARLIER DRAFT OF THIS COMMENT SAID IT WAS.
+  # `_proof_ledger` (cmd_proof.sh) counts a done row as an ASK when
+  # `human_nonce_hash IS NOT NULL`, as an OR-arm beside the human-answered test,
+  # and the published zero-human badge is `1 - asks/shipped`. Measured on the live
+  # board when this landed: 704 shipped, 101 asks, of which 20 came from the nonce
+  # arm ALONE — rows with no human answer at all, counted only because a nonce
+  # existed. So widening the mint moves a PUBLISHED METRIC DOWNWARD, and every
+  # future tier-2 decision joins that arm.
+  #
+  # That is intended, not incidental. A tier-2 decision IS a human ask; counting
+  # it is more truthful than not, and the ledger's own header says the arm is
+  # deliberately conservative so the badge understates autonomy rather than
+  # flattering it. Named here because the comment above that query warns against
+  # moving this metric as a SIDE EFFECT — which is a rule about surprise, not
+  # about direction, and so applies to lowering it too.
+  #
+  # If you are here to add a nonce mint somewhere new: check what it does to the
+  # ledger before you assume it is a no-op. This one was assumed to be.
+  #
+  # NOT DONE HERE, on purpose: the minted nonce is not yet reachable by a decision
+  # TAP. `_task_gate_reply_markup` appends `:${nonce}` to callback_data for
+  # approval/secret/manual but not for the decision option buttons, and
+  # telegram-pi's parser is `^tna:(\d+):(.+)$` (greedy) — appending there would
+  # swallow the nonce into the option token and break decision taps on pi
+  # runtimes. That is a plugin-side fix (all four TNA_RE variants) and its own
+  # ticket; until it lands the hash is at-rest evidence only, which is exactly
+  # and only what the refuse-on-NULL rule needs.
+  local human_nonce="" _mint_nonce=0
+  case "$type" in approval|secret|manual|access) _mint_nonce=1 ;; esac
+  [[ "${tier:-}" =~ ^[0-9]+$ ]] && (( tier >= 2 )) && _mint_nonce=1
+  if (( _mint_nonce )); then
+    human_nonce=$(_human_nonce_mint)
+    [[ -n "$human_nonce" ]] \
+      && db "UPDATE tasks SET human_nonce_hash=$(sqlq "$(_human_nonce_sha "$human_nonce")") WHERE id=${id};"
+  fi
   # DIVE-1927: rc 3 = filed and answerable, but NOBODY was pinged. The gate always
   # stands — the dashboard "Needs you" card, `task inbox` and `task answer` need no
   # channel, and a headless/solo/CI box answers gates exactly that way. What must
@@ -6725,31 +6772,36 @@ _task_inbox_send() {
   local shown=$(( total < cap ? total : cap ))
 
   local text="🗂 Gate inbox — waiting on you now:"
-  local kbrows='[]' row id ident prio ntype options recommend ask nonce="" markup="" idlist=""
+  local kbrows='[]' row id ident prio ntype options recommend gtier ask nonce="" markup="" idlist="" _mint_n=0
   local -a nonce_ids=() nonce_hashes=()
   while IFS= read -r row; do
     [[ -n "$row" ]] || continue
-    IFS=$'\x1f' read -r id ident prio ntype options recommend ask <<<"$row"
+    IFS=$'\x1f' read -r id ident prio ntype options recommend gtier ask <<<"$row"
     [[ -n "$id" && -n "$ident" ]] || continue
     idlist+="${idlist:+,}${id}"
     text+=$'\n\n'"• [${ident}] ${ntype}, ${prio} — ${ask} /task_${id}"
     [[ -n "$recommend" ]] && text+=$'\n'"  ✅ Recommended: ${recommend}"
     [[ -n "$options" ]] && text+=$'\n'"  Options: ${options}"
-    nonce=""
-    case "$ntype" in
-      approval|secret|manual)
-        nonce=$(_human_nonce_mint)
-        if [[ -n "$nonce" ]]; then
-          nonce_ids+=("$id")
-          nonce_hashes+=("$(_human_nonce_sha "$nonce")")
-        fi
-        ;;
-    esac
+    # DIVE-2356: same widened condition as the cmd_task_need mint — hard-human
+    # TYPE **or** tier>=2. Without the tier arm a tier-2 `decision` filed before
+    # that change stays nonce-less forever, since this rotation is the only other
+    # write to human_nonce_hash on the non-escalation path. `tier` is now selected
+    # below, spliced in AHEAD of `ask` so `ask` stays the greedy tail of the read.
+    nonce=""; _mint_n=0
+    case "$ntype" in approval|secret|manual) _mint_n=1 ;; esac
+    [[ "${gtier:-}" =~ ^[0-9]+$ ]] && (( gtier >= 2 )) && _mint_n=1
+    if (( _mint_n )); then
+      nonce=$(_human_nonce_mint)
+      if [[ -n "$nonce" ]]; then
+        nonce_ids+=("$id")
+        nonce_hashes+=("$(_human_nonce_sha "$nonce")")
+      fi
+    fi
     markup=$(_task_gate_reply_markup "$id" "$ntype" "$options" "$recommend" "$nonce" "$TASK_CH_TYPE" "$ident")
     if [[ -n "$markup" ]]; then
       kbrows=$(jq -cn --argjson a "$kbrows" --argjson b "$markup" '$a + ($b.inline_keyboard // [])' 2>/dev/null) || kbrows='[]'
     fi
-  done < <(db "SELECT id||x'1f'||ident||x'1f'||priority||x'1f'||need_type||x'1f'||COALESCE(need_options,'')||x'1f'||COALESCE(recommend,'')||x'1f'||substr(replace(COALESCE(ask,''),x'0a',' '),1,240)
+  done < <(db "SELECT id||x'1f'||ident||x'1f'||priority||x'1f'||need_type||x'1f'||COALESCE(need_options,'')||x'1f'||COALESCE(recommend,'')||x'1f'||COALESCE(tier,'')||x'1f'||substr(replace(COALESCE(ask,''),x'0a',' '),1,240)
                FROM tasks WHERE ${where} ${order} LIMIT ${cap};")
   if (( total > cap )); then
     text+=$'\n\n'"…and $(( total - cap )) more — 5dive task inbox on the box or the dashboard."
@@ -7289,12 +7341,26 @@ cmd_task_answer() {
   # genuine human answer is NEVER rejected here (DIVE-525). We gate this on
   # `gate-proof enforce` for the SAME rollout envelope as the evidence block
   # above; enforce is ON fleet-wide (DIVE-950). We deliberately do NOT require the
-  # evidence forms here: a tier-2 `decision` gate mints no per-gate nonce and its
-  # tap runs as SUDO_UID=agent, so demanding evidence would reject a real human
-  # decision tap — provenance is the correct, tap-safe floor. Residual (an agent
-  # sudo->--human-forging human:* on a tier-2 *decision*, which has no nonce
-  # evidence layer) is the forged-human threat DIVE-916/DIVE-1115 own; tracked as
-  # follow-up. NO downgrade path from the answer side by design: an over-fired T2
+  # evidence forms here: a tier-2 `decision` gate's tap runs as SUDO_UID=agent and
+  # its option buttons carry NO nonce in their callback_data, so demanding evidence
+  # would reject a real human decision tap — provenance is the correct, tap-safe
+  # floor. Residual (an agent sudo->--human-forging human:* on a tier-2 *decision*)
+  # is the forged-human threat DIVE-916/DIVE-1115 own; tracked as follow-up.
+  #
+  # DIVE-2356 UPDATED THE FIRST HALF OF THAT REASONING, AND READ THIS BEFORE
+  # TIGHTENING THIS BLOCK. A tier-2 decision now DOES mint a per-gate nonce at
+  # filing — so "it has no nonce" is no longer why evidence is not required here.
+  # The reason is now narrower and entirely about the TAP: the decision option
+  # buttons still do not carry the nonce (telegram-pi's TNA_RE is greedy and would
+  # swallow it), so a real human tap arrives with no proof to offer and an evidence
+  # requirement would reject it — the DIVE-525 trap.
+  #
+  # The sanctioned next step is NOT an evidence requirement. It is the far weaker
+  # "refuse a tier>=2 answer whose human_nonce_hash IS NULL", and it must not land
+  # until tier-2 decision gates filed BEFORE DIVE-2356 have aged out or been
+  # rescued by the digest/re-nag mints: at the time of writing that rule would
+  # refuse 43 of the last 47 tier-2 decision answers. Check the live NULL count
+  # first; do not infer that it has drained. NO downgrade path from the answer side by design: an over-fired T2
   # (the heuristic can over-match) waits for a human — the conservative correct
   # default for a hard floor; re-file at a lower --tier if the floor misfired.
   if [[ "$gtier" == "2" ]] && (( ! human )) && _gate_proof_enforced; then

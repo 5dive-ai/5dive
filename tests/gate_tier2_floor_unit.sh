@@ -69,8 +69,10 @@ export SUDO_UID=0
 
 touch "$GATE_PROOF_ENFORCE"   # enforcement ON for the floor tests
 
-# --- T1: a decision gate EXPLICITLY filed at tier 2 mints no nonce yet is a hard
-#     floor: a bare-agent answer (no --human) is REFUSED under enforcement. --------
+# --- T1: a decision gate EXPLICITLY filed at tier 2 is a hard floor: a bare-agent
+#     answer (no --human) is REFUSED under enforcement. (Since DIVE-2356 such a
+#     gate also MINTS a nonce, but this floor is provenance-based and does not read
+#     it — that independence is what gate_tier2_decision_nonce_unit T6/T7 pin.) ---
 seed_task DIVE-101
 cmd_task_need DIVE-101 --type=decision --ask="ship it?" --options="A|B" --recommend="A" --tier=2 >/dev/null 2>&1
 [[ "$(tierof DIVE-101)" == "2" ]] && ok_t "T1 decision --tier=2 stored as tier 2" \
