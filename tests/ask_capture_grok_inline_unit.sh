@@ -5,7 +5,7 @@
 #
 # The two fixtures here are NOT reconstructions. They are `tmux capture-pane -p`
 # taken verbatim off the live grok seat 'creative' on the council-demo box
-# (49.13.152.195, released 5dive 0.16.32, 2026-07-28), immediately after an
+# (a throwaway Hetzner cx23, released 5dive 0.16.32, 2026-07-28), immediately after an
 # `agent ask` that exited 11 with "the reply fence was OPENED but never
 # completed". The seat had answered. Both captures show the same shape:
 #
