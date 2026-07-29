@@ -275,9 +275,26 @@ _SUP_CLI_CHECKED=0
 _SUP_CLI_LATEST=""
 _SUP_CLI_BEHIND="unknown"
 _SUP_CLI_STALE="unknown"
+_SUP_CLI_FROZEN="unknown"
+_SUP_CLI_FROZEN_DETAIL=""
 _sup_cli_check() {
   (( _SUP_CLI_CHECKED )) && return 0
   _SUP_CLI_CHECKED=1
+
+  # DIVE-2287 — FIRST, and outside every early return below. The staleness
+  # probe answers "am I behind LATEST"; this answers "has my version moved AT
+  # ALL". They fail in opposite conditions, which is the entire reason both
+  # exist: when the release cutter is down the tag stops moving, `behind` is
+  # false for every box in the fleet, and the only remaining evidence that
+  # nothing has shipped in a week is that no box's version has changed in a
+  # week. Ordering matters — every `return 0` in the probe below is a case
+  # where the comparison could not be made and the absolute reading is the
+  # only one left. This tick runs as root, so unlike `update --check` it can
+  # normally write the record.
+  local -a fz=()
+  mapfile -t fz < <(_cli_freeze_observe "$FIVE_VERSION" "${STATE_DIR}/cli-version-seen.json")
+  _SUP_CLI_FROZEN="${fz[0]:-unknown}"
+  _SUP_CLI_FROZEN_DETAIL="${fz[2]:-}"
   # DIVE-2042: the published version is read through _published_cli_probe, which
   # pins both fetches to one immutable sha and verifies the bundle against its
   # own checksum. Anything short of a CONSISTENT read leaves staleness UNKNOWN
@@ -569,7 +586,8 @@ _sup_render_board() {
 # Post-table summary: counts + the box-level CLI probe result.
 _sup_summary_line() {
   local snap="$1"
-  jq -r --arg stale "$_SUP_CLI_STALE" --arg cur "$FIVE_VERSION" --arg lat "$_SUP_CLI_LATEST" '
+  jq -r --arg stale "$_SUP_CLI_STALE" --arg cur "$FIVE_VERSION" --arg lat "$_SUP_CLI_LATEST" \
+        --arg frozen "$_SUP_CLI_FROZEN" --arg frozendet "$_SUP_CLI_FROZEN_DETAIL" '
     "\(length) agents — " +
     "\([.[] | select(.classification == "healthy")]        | length) healthy / " +
     "\([.[] | select(.classification == "slow")]           | length) slow / " +
@@ -581,7 +599,12 @@ _sup_summary_line() {
      then " · ⚠ \([.[] | select(.classification == "verify-challenge")] | length) VERIFY-CHALLENGE" else "" end) +
     (if $stale == "true" then " · CLI \($cur) STALE (latest \($lat))"
      elif $stale == "unknown" then " · CLI staleness unknown (probe unavailable)"
-     else " · CLI \($cur) ok" end)' <<<"$snap"
+     else " · CLI \($cur) ok" end) +
+    # DIVE-2287: appended, never substituted. A frozen fleet reads "CLI ok" on
+    # the staleness half — that IS the failure — so this line has to be able to
+    # say "ok" and "FROZEN" in the same breath.
+    (if $frozen == "frozen" then " · ⚠ FLEET FROZEN: \($frozendet) — no release has reached this box; check the release cutter"
+     else "" end)' <<<"$snap"
 }
 
 # --watch[=secs]: repaint inside the alt-screen (cmd_watch's escape constants),
@@ -880,9 +903,11 @@ cmd_supervisor() {
         printf '%s' "$snap" | jq -c \
           --arg cur "$FIVE_VERSION" --arg lat "$_SUP_CLI_LATEST" \
           --arg beh "$_SUP_CLI_BEHIND" --arg stl "$_SUP_CLI_STALE" \
+          --arg frz "$_SUP_CLI_FROZEN" --arg frzd "$_SUP_CLI_FROZEN_DETAIL" \
           --argjson tstuck "$_SUP_T_STUCK_MIN" --argjson tslow "$_SUP_T_SLOW_MIN" \
           '{ok:true, data:{agents:.,
-             cli:{current:$cur, latest:(if $lat == "" then null else $lat end), behind:$beh, stale:$stl},
+             cli:{current:$cur, latest:(if $lat == "" then null else $lat end), behind:$beh, stale:$stl,
+                  frozen:$frz, frozenDetail:(if $frzd == "" then null else $frzd end)},
              tStuckMin:$tstuck, tSlowMin:$tslow}}'
       else
         _sup_render_board "$snap"
