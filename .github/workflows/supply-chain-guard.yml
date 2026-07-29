@@ -1,0 +1,31 @@
+name: supply-chain-guard
+# DIVE-2279. Surfaces the lines in a diff where a hostile change is
+# indistinguishable from a legitimate one by any other automated means:
+# fetch-to-shell, a new TYPE_INSTALL recipe, or a domain this repo has never
+# contacted. It does not judge — it AIMS a human read, because "review this PR"
+# gets skimmed and "is cli.devln.ai the right domain" gets checked.
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+jobs:
+  supply-chain-guard:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Scan the added surface
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -uo pipefail
+          bash scripts/supply-chain-scan.sh "$BASE_SHA" "$HEAD_SHA" .
+          rc=$?
+          # 0 = nothing to audit. 3 = findings, ANNOTATE but do not block: the
+          # audit is agent-held per lodar's DIVE-2279 answer, not a merge gate.
+          # 2 = could not scan, which MUST fail — a scanner that says clean when
+          # it could not look is the defect this repo spent 07-28 removing.
+          if [ "$rc" = "2" ]; then echo "::error::supply-chain-scan could not scan"; exit 1; fi
+          if [ "$rc" = "3" ]; then echo "::warning::supply-chain surface added — audit the lines above before merge"; fi
+          exit 0
