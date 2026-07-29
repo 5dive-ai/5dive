@@ -24,6 +24,8 @@ _task_usage() {
                                                      # the scheduler is actually still driving (schedule set, status=todo);
                                                      # --recurring --all: every template regardless, incl. stopped ones
   5dive task show <id|DIVE-N>                        # full detail + subtasks + blockers
+  5dive task gate-history <id|DIVE-N>                # displaced gates + retirement reason/time;
+                                                     # distinguishes a true zero from pre-archive blindness
   5dive task assign <id|DIVE-N> <agent>
   5dive task verifier <id|DIVE-N> <agent> [--accept=<criteria>] [--max-iters=<n>]
                                                      # DIVE-1880: attach the maker→verifier rail to an ALREADY-FILED open
@@ -251,6 +253,7 @@ cmd_task() {
     add|new)         cmd_task_add "$@" ;;
     ls|list)         cmd_task_ls "$@" ;;
     show|view)       cmd_task_show "$@" ;;
+    gate-history)    cmd_task_gate_history "$@" ;;
     assign)          cmd_task_assign "$@" ;;
     set-branch)      cmd_task_set_branch "$@" ;;
     set-body)        cmd_task_set_body "$@" ;;
@@ -865,14 +868,16 @@ cmd_task_show() {
   [[ $# -gt 0 ]] || fail "$E_USAGE" "usage: 5dive task show <id|DIVE-N>"
   resolve_task_id "$1"; local id="$RESOLVED_TASK_ID"
   if (( JSON_MODE )); then
-    local task subs deps
+    local task subs deps previous_gates
     task=$(dbfmt -json "SELECT * FROM tasks WHERE id=${id};")
     subs=$(dbfmt -json "SELECT id,ident,title,status FROM tasks WHERE parent_id=${id} ORDER BY id;")
     deps=$(dbfmt -json "SELECT t.id,t.ident,t.title,t.status FROM task_deps d JOIN tasks t ON t.id=d.blocked_by WHERE d.task_id=${id} ORDER BY t.id;")
+    previous_gates=$(_gate_history_summary_json "$id")
     [[ -n "$subs" ]] || subs="[]"
     [[ -n "$deps" ]] || deps="[]"
     jq -cn --argjson t "$task" --argjson s "$subs" --argjson b "$deps" \
-      '{ok:true, data:{task:($t[0]), subtasks:$s, blocked_by:$b}}'
+      --argjson g "$previous_gates" \
+      '{ok:true, data:{task:($t[0]), subtasks:$s, blocked_by:$b, previous_gates:$g}}'
   else
     dbfmt -line "SELECT ident, title, status, priority, assignee, created_by, parent_id, created_at, started_at, done_at, body, result FROM tasks WHERE id=${id};"
     # DIVE-1064: surface the creator's isolation tier (read-time from the
@@ -904,6 +909,7 @@ cmd_task_show() {
       *)                    printf 'created_by_tier = %s
 ' "$_ctier" ;;
     esac
+    _gate_history_show_summary "$id"
     # Human gate (only when set) — mirrors the conditional subtasks/blockers
     # blocks below so an ordinary task's `show` stays clean.
     local gate
@@ -950,6 +956,104 @@ cmd_task_show() {
     deps=$(db "SELECT t.ident||'  ['||t.status||']  '||t.title FROM task_deps d JOIN tasks t ON t.id=d.blocked_by WHERE d.task_id=${id} ORDER BY t.id;")
     [[ -n "$deps" ]] && { echo; echo "blocked by:"; printf '%s\n' "$deps" | indent2; }
   fi
+}
+
+# DIVE-2133 — gate_history was an append-only WRITE path with no reader. Keep
+# the summary logic shared by `task show` and the detailed verb so the compact
+# count can never claim stronger archive coverage than the listing beneath it.
+#
+# gate_history_coverage is a conservative evidence boundary, not a release/
+# version guess. Its single value is prefixed fresh: or inferred: so the boundary
+# and its proof basis commit atomically. Fresh stores stamp before their first
+# task. Existing stores stamp the earliest row they can prove was archived, or
+# migration time when the archive is empty. A task older than that boundary may
+# have displaced gates from the blind era, so zero means "zero recorded", never
+# "none existed". Equality is complete only for a fresh store: SQLite timestamps
+# are second-granular, so an upgraded task stamped in the boundary second may
+# still predate the migration.
+_gate_history_facts() {
+  local id="$1" count raw coverage="" basis="unknown" created state="unknown"
+  count=$(db "SELECT COUNT(*) FROM gate_history WHERE task_id=${id};")
+  raw=$(_task_pref_get gate_history_coverage)
+  case "$raw" in
+    fresh:*)    basis="fresh"; coverage="${raw#*:}" ;;
+    inferred:*) basis="inferred"; coverage="${raw#*:}" ;;
+  esac
+  created=$(db "SELECT created_at FROM tasks WHERE id=${id};")
+  if [[ -n "$coverage" ]]; then
+    state="partial"
+    if [[ "$created" > "$coverage" || ( "$basis" == "fresh" && "$created" == "$coverage" ) ]]; then
+      state="complete"
+    fi
+  fi
+  printf '%s|%s|%s|%s\n' "$count" "$coverage" "$state" "$basis"
+}
+
+_gate_history_summary_json() {
+  local id="$1" count coverage state basis complete="null"
+  IFS='|' read -r count coverage state basis < <(_gate_history_facts "$id")
+  case "$state" in
+    complete) complete="true" ;;
+    partial)  complete="false" ;;
+  esac
+  jq -cn --argjson n "${count:-0}" --arg started "$coverage" --arg state "$state" --arg basis "$basis" \
+    --argjson complete "$complete" \
+    '{recorded:$n, coverage_state:$state, coverage_basis:$basis, coverage_complete_for_task:$complete,
+      coverage_started_at:(if $started=="" then null else $started end),
+      history_before_coverage:(if $state=="complete" then "none" else "unknown" end)}'
+}
+
+_gate_history_show_summary() {
+  local id="$1" count coverage state basis
+  IFS='|' read -r count coverage state basis < <(_gate_history_facts "$id")
+  case "$state" in
+    complete) printf 'previous gates = %s\n' "$count" ;;
+    partial)  printf 'previous gates = %s recorded (earlier history unknown; coverage begins %s)\n' "$count" "$coverage" ;;
+    *)        printf 'previous gates = %s recorded (archive coverage NOT measured)\n' "$count" ;;
+  esac
+}
+
+cmd_task_gate_history() {
+  tasks_db_init
+  [[ $# -eq 1 ]] || fail "$E_USAGE" "usage: 5dive task gate-history <id|DIVE-N>"
+  resolve_task_id "$1"
+  local id="$RESOLVED_TASK_ID" ident="$RESOLVED_TASK_IDENT"
+  local summary rows count coverage state basis
+  summary=$(_gate_history_summary_json "$id")
+  if (( JSON_MODE )); then
+    # Deliberately omit need_answer_sig and human_nonce_hash: they prove the
+    # archive internally but are not reader payload. Secret answers are always
+    # redacted on both output paths, matching the live gate in `task show`.
+    rows=$(dbfmt -json "SELECT id, ident, need_type, ask, need_options, recommend, tier,
+          need_asked_at,
+          CASE WHEN need_type='secret' AND need_answer IS NOT NULL
+               THEN '(provided - redacted)' ELSE need_answer END AS need_answer,
+          need_answered_at, need_answered_by, need_answered_uid,
+          CASE WHEN need_answer_sig IS NOT NULL THEN 1 ELSE 0 END AS answer_attested,
+          retired_by, retired_at
+        FROM gate_history WHERE task_id=${id} ORDER BY id;")
+    [[ -n "$rows" ]] || rows="[]"
+    jq -cn --arg id "$ident" --argjson s "$summary" --argjson rows "$rows" \
+      '{ok:true, data:{ident:$id, summary:$s, gates:$rows}}'
+    return
+  fi
+
+  IFS='|' read -r count coverage state basis < <(_gate_history_facts "$id")
+  case "$state" in
+    complete) printf '%s previous gates: %s\n' "$ident" "$count" ;;
+    partial)  printf '%s previous gates: %s recorded — history before %s is unknown\n' "$ident" "$count" "$coverage" ;;
+    *)        printf '%s previous gates: %s recorded — archive coverage is NOT measured\n' "$ident" "$count" ;;
+  esac
+  (( count > 0 )) || return 0
+  dbfmt -box "SELECT id AS seq, need_type AS type, COALESCE(tier,'-') AS tier,
+      COALESCE(need_asked_at,'-') AS asked_at, COALESCE(ask,'-') AS ask,
+      COALESCE(need_options,'-') AS options, COALESCE(recommend,'-') AS recommend,
+      CASE WHEN need_type='secret' AND need_answer IS NOT NULL
+           THEN '(provided - redacted)' ELSE COALESCE(need_answer,'-') END AS answer,
+      COALESCE(need_answered_at,'-') AS answered_at,
+      COALESCE(need_answered_by,'-') AS answered_by,
+      retired_by, retired_at
+    FROM gate_history WHERE task_id=${id} ORDER BY id;"
 }
 
 cmd_task_assign() {

@@ -183,7 +183,7 @@ Auth (lower-level; the dashboard uses these — prefer 'account' for human-drive
 Tasks (shared queue, sqlite — any agent, no sudo):
   5dive task add <title...> [--priority=low|medium|high|urgent] [--assignee=<agent>] [--parent=<id>] [--project=<key>]
   5dive task ls [--mine] [--status=<s>] [--all] [--project=<key>]   # open work, priority-ordered
-  5dive task show|start|done|cancel|rm <id|PREFIX-N>
+  5dive task show|gate-history|start|done|cancel|rm <id|PREFIX-N>
   5dive task assign <id|PREFIX-N> <agent>
   5dive task block <id|PREFIX-N> --by=<id|PREFIX-N>
   # full surface: 5dive task --help

@@ -1,5 +1,22 @@
 # Changelog
 
+## Unreleased — feat(task): displaced gates have a reader with an honest coverage boundary (DIVE-2133)
+
+`gate_history` stopped gate retirement from destroying the previous ask, answer and
+provenance, but nothing could read the table. `task show` now carries a compact previous-gate
+count and `task gate-history <id>` lists the archived ask/answer plus `retired_by` and
+`retired_at`; both human and JSON paths redact secret answers.
+
+An empty archive on an upgraded store is not evidence that no gate was displaced before the
+archive existed. Every store now stamps a conservative `gate_history_coverage` boundary once:
+before the first task on a fresh store, the earliest already-archived row on an upgraded store
+that has evidence, or migration time when it has none. The same value records whether the basis
+is fresh or inferred, so a second-granular timestamp equality is trusted only on a fresh store.
+Readers therefore say a bare `0` only when coverage reaches the task's creation; older tasks
+say `0 recorded` and name the unknown earlier era. `tests/gate_history_unit.sh` covers the detailed
+reader, both `task show` surfaces, secret redaction, complete-vs-partial zero, and the one-time
+migration stamp.
+
 ## Unreleased — fix(up): a skill that FAILED to install is no longer summarised as `errors=0` (DIVE-2347)
 
 `agent create` does not fail when a preseeded skill won't install, and that is the right
