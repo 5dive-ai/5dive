@@ -284,7 +284,21 @@ else
   printf 'SKIP - snapshot-rails mutation needs a readable crontab-snapshot.sh and `sudo -n crontab -l`; this probe is UNPROVEN in this run\n'
 fi
 
-# ── rail 8: the sealed lead-clear allowlist (DIVE-2233) ──────────────────────
+# ── cancel durability across task snapshots (DIVE-2151) ─────────────────────
+# Keep both controlled snapshots and reverse the real newest-first selector. If the
+# probe does not go red, its post-cancel half is a fixed string rather than evidence
+# that recovery selected the snapshot carrying the cancellation.
+mut_cancel_snapshot_order() {
+  local f="$WORK/src/lib/tasks_db.sh"
+  grep -Fq 'ls -1t "$(_tasks_backup_dir)"/tasks-*.db.gz' "$f" || return 1
+  sed -i 's/ls -1t /ls -1tr /' "$f"
+  rebuild
+}
+assert_mutation cancel-snapshot-durability \
+  "tasks-db recovery selects the oldest snapshot instead of the newest" \
+  mut_cancel_snapshot_order "newest post-cancel snapshot restored"
+
+# ── the sealed lead-clear allowlist (DIVE-2233) ──────────────────────────────
 # This probe cannot be proven the way the others are. Its mutation is not a code edit:
 # the rail it grades is a SEALED DOCUMENT, so the only breakage that matters is the
 # document ceasing to match the digest sealed into the council lineage. And the ARMED

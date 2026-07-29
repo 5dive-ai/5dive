@@ -34,7 +34,8 @@
 # FIVEDIVE_NO_HUMAN_SEND plus a non-prod TASKS_DB (the DIVE-1506 positive allowlist).
 #
 # PROVEN BY MUTATION, NOT BY A GREEN RUN. A green run cannot tell a working probe from
-# a probe that asserts nothing. tests/selfcheck_mutation_e2e.sh breaks ALL SEVEN rails
+# a probe that asserts nothing. tests/selfcheck_mutation_e2e.sh breaks every rail in
+# the corpus
 # for real and requires selfcheck to go red AND name the breakage, then restores and
 # requires green. "It passed" is not evidence here; "it failed when I broke it" is.
 #
@@ -65,6 +66,7 @@ SELFCHECK_PROBES=(
   harness-verdicts
   bundle-integrity
   snapshot-rails
+  cancel-snapshot-durability
   scorecard-honesty
 )
 
@@ -77,6 +79,8 @@ _sc_title() {
     harness-verdicts)  echo "every test harness's exit status is wired to its own verdict" ;;
     bundle-integrity)  echo "the installed bundle's sha256 matches the commit it claims" ;;
     snapshot-rails)    echo "the crontab snapshot committed what it says it saved" ;;
+    cancel-snapshot-durability)
+      echo "a newer cancelled snapshot survives auto-restore while an older snapshot demonstrably does not" ;;
     scorecard-honesty) echo "a partial read renders as NO DATA, never as a number" ;;
     *)                 echo "$1" ;;
   esac
@@ -536,7 +540,114 @@ _sc_probe_snapshot_rails() {
   else _sc_pass "committed snapshots match the live crontabs for ${checked[*]}, and a save-nothing run exits non-zero"; fi
 }
 
-# --- probe 7: scorecard honesty -----------------------------------------------
+# --- probe: cancel durability across tasks-db snapshots (DIVE-2151) ----------
+# `task cancel` commits intent to the live database, but DIVE-1479 recovery can only
+# restore intent present in the snapshot it selects. That makes two distinct effects
+# worth proving: restoring a pre-cancel snapshot really does resurrect the old active
+# template, and selecting the newer post-cancel snapshot preserves the cancellation.
+#
+# This is deliberately NOT a liveness check of the production backup timer. Such a
+# check is unreachable anywhere except the host running that timer and would become a
+# permanently green NOT-REACHED. The durability property is deterministic here: both
+# snapshots, their ordering and the database wipe are controlled under one throwaway
+# STATE_DIR. The real cancel and auto-restore functions are used; no production task,
+# snapshot, audit log or privileged fallback is reachable from the probe.
+_sc_probe_cancel_snapshot_durability() {
+  command -v sqlite3 >/dev/null 2>&1 \
+    || { _sc_notreached "no-sqlite3" "sqlite3 is required to build and inspect the isolated task store"; return; }
+  command -v gzip >/dev/null 2>&1 \
+    || { _sc_notreached "no-gzip" "gzip is required to create the same snapshot shape used by tasks-db recovery"; return; }
+  command -v gunzip >/dev/null 2>&1 \
+    || { _sc_notreached "no-gunzip" "gunzip is required by the tasks-db recovery rail"; return; }
+  local fn
+  for fn in tasks_db_init db cmd_task_cancel _tasks_newest_backup _tasks_board_recover; do
+    declare -F "$fn" >/dev/null 2>&1 \
+      || { _sc_notreached "no-tasks-restore-rail" "$fn is not defined in this build"; return; }
+  done
+
+  local d; d=$(_sc_tmp) \
+    || { _sc_notreached "no-tmpdir" "could not create an isolated task and snapshot store"; return; }
+  local out; out=$(
+    set +e
+    STATE_DIR="$d"
+    TASKS_DIR="$d/tasks"
+    TASKS_DB="$TASKS_DIR/tasks.db"
+    TASKS_BACKUP_DIR="$d/tasks-backups"
+    TASKS_SENTINEL="$TASKS_DIR/.board-initialized"
+    AUDIT_LOG="$d/log/agent-audit.log"
+    export STATE_DIR TASKS_DIR TASKS_DB TASKS_BACKUP_DIR TASKS_SENTINEL AUDIT_LOG
+    export FIVEDIVE_NO_HUMAN_SEND=1 FIVEDIVE_NOTIFY_DRYRUN=1
+    mkdir -p "$TASKS_DIR" "$TASKS_BACKUP_DIR" "$d/log/notify"
+    : > "$AUDIT_LOG"
+
+    # No helper reached from a self-test may fall back into privileged host state.
+    sudo() { return 1; }
+    snapshot() {
+      local path="$1" stamp="$2"
+      sqlite3 "$TASKS_DB" ".backup '$path'" >/dev/null 2>&1 || return 1
+      gzip -f "$path" || return 1
+      touch -t "$stamp" "$path.gz" || return 1
+    }
+    wipe_tasks_table() {
+      sqlite3 "$TASKS_DB" "DROP TABLE tasks;" >/dev/null 2>&1
+      rm -f "${TASKS_DB}-wal" "${TASKS_DB}-shm" 2>/dev/null || true
+    }
+
+    tasks_db_init >/dev/null 2>&1
+    db "INSERT INTO tasks(title,status,kind,schedule,assignee,created_by)
+        VALUES('selfcheck recurring fixture','todo','recurring','0 3 * * *','selfcheck','selfcheck');" >/dev/null 2>&1
+    ident=$(db "SELECT ident FROM tasks WHERE title='selfcheck recurring fixture' LIMIT 1;")
+    pre="$TASKS_BACKUP_DIR/tasks-20200101T000000Z.db"
+    post="$TASKS_BACKUP_DIR/tasks-20200102T000000Z.db"
+
+    snapshot "$pre" 202001010000
+    cmd_task_cancel "$ident" --result="selfcheck cancel fixture" --keep-worktree >/dev/null 2>&1
+    printf 'live=%s|%s\n' \
+      "$(db "SELECT status FROM tasks WHERE ident=$(sqlq "$ident");")" \
+      "$(db "SELECT schedule FROM tasks WHERE ident=$(sqlq "$ident");")"
+
+    # An older snapshot must expose the gap rather than being mistaken for durable.
+    wipe_tasks_table
+    tasks_db_init >/dev/null 2>&1
+    printf 'pre=%s|%s\n' \
+      "$(db "SELECT status FROM tasks WHERE ident=$(sqlq "$ident");")" \
+      "$(db "SELECT schedule FROM tasks WHERE ident=$(sqlq "$ident");")"
+
+    # Cancel again, retain BOTH snapshots, and prove newest-selection is load-bearing.
+    cmd_task_cancel "$ident" --result="selfcheck cancel fixture" --keep-worktree >/dev/null 2>&1
+    snapshot "$post" 202001020000
+    printf 'selected=%s\n' "$(basename "$(_tasks_newest_backup)")"
+    wipe_tasks_table
+    tasks_db_init >/dev/null 2>&1
+    printf 'post=%s|%s\n' \
+      "$(db "SELECT status FROM tasks WHERE ident=$(sqlq "$ident");")" \
+      "$(db "SELECT schedule FROM tasks WHERE ident=$(sqlq "$ident");")"
+  )
+  rm -rf "$d"
+
+  local live pre selected post
+  live=$(sed -n 's/^live=//p' <<<"$out" | tail -1)
+  pre=$(sed -n 's/^pre=//p' <<<"$out" | tail -1)
+  selected=$(sed -n 's/^selected=//p' <<<"$out" | tail -1)
+  post=$(sed -n 's/^post=//p' <<<"$out" | tail -1)
+  local -a bad=()
+  [[ "$live" == "cancelled|0 3 * * *" ]] \
+    || bad+=("the real cancel path left live state ${live:-missing}, not cancelled with its schedule retained")
+  [[ "$pre" == "todo|0 3 * * *" ]] \
+    || bad+=("the pre-cancel snapshot restored ${pre:-missing}, so the resurrection exposure was not demonstrated")
+  [[ "$selected" == "tasks-20200102T000000Z.db.gz" ]] \
+    || bad+=("recovery selected ${selected:-no snapshot}, not the newer post-cancel snapshot")
+  [[ "$post" == "cancelled|0 3 * * *" ]] \
+    || bad+=("the newest post-cancel snapshot restored ${post:-missing}, not cancelled with its schedule retained")
+
+  if (( ${#bad[@]} )); then
+    _sc_fail "$(printf '%s; ' "${bad[@]}")"
+  else
+    _sc_pass "isolated real cancel + restore: pre-cancel snapshot resurrected todo|0 3 * * *, then the newer post-cancel snapshot restored cancelled|0 3 * * *"
+  fi
+}
+
+# --- scorecard honesty --------------------------------------------------------
 # DIVE-1929/1937/1923. A metric with no source must render NO DATA naming what was
 # missed; the failure being guarded is a partial read rendering as a NUMBER, which is
 # unfalsifiable downstream — the published autonomy badge is computed from these rows.
@@ -612,6 +723,7 @@ _sc_dispatch() {
     harness-verdicts)  _sc_probe_harness_verdicts ;;
     bundle-integrity)  _sc_probe_bundle_integrity ;;
     snapshot-rails)    _sc_probe_snapshot_rails ;;
+    cancel-snapshot-durability) _sc_probe_cancel_snapshot_durability ;;
     scorecard-honesty) _sc_probe_scorecard_honesty ;;
     *)                 _sc_error "unknown probe: $1" ;;
   esac
