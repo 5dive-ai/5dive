@@ -455,9 +455,38 @@ _mirror_follow_migration() {
 _agent_pane_input_ready() {
   grep -qE '❯|›|Ask Devin|Guide Devin|\? for shortcuts|esc to cancel' <<<"${1:-}"
 }
+# DIVE-2277: the types whose prompt is DETECTABLE — exactly the types with a marker
+# in _agent_pane_input_ready above. KEEP IN LOCKSTEP with that predicate.
+#
+# WHY A LIST AND NOT ANOTHER MARKER. opencode and pi present no detectable prompt at
+# all, so the poll below could never succeed for them: it ran the full 45s, returned 1,
+# and the caller sent anyway. The wait was PROVABLY DEAD TIME — same send, 45s later,
+# plus a false "input prompt not detected" warning. Measured on the council-demo box:
+# 49s per send to root(opencode)/dario(pi) against 2-3s to a grok control doing the
+# identical operation, deterministic across trials.
+#
+# Adding a third marker was the obvious move and is the wrong one. DIVE-348 added
+# antigravity's footer, DIVE-1528 added codex's "›" — each fixed one harness and left
+# the next one to pay 45s until somebody noticed. opencode and pi are the third and
+# fourth. This inverts the default instead: a type we cannot detect does not wait.
+# A NEW harness type therefore costs nothing by default, and the tax cannot silently
+# reappear on harness number five.
+declare -A _AGENT_PROMPT_DETECTABLE=(
+  [claude]=1 [codex]=1 [devin]=1 [antigravity]=1 [grok]=1
+)
+
 wait_agent_input_ready() {
   local name="$1" timeout="${2:-45}"
   local user="agent-${name}" waited=0 pane
+  # Skip the poll for a harness with no marker. Returns 0 (proceed) rather than 1:
+  # for these types the 1 never meant "not ready", it meant "undetectable", and the
+  # warning it triggered was false — DIVE-348 called that warning out by name.
+  # An UNKNOWN type (empty lookup) falls through to the poll deliberately: paying a
+  # bounded wait beats skipping a real readiness check on a type we have not classified.
+  local _atype; _atype=$(agent_type "$name" 2>/dev/null || true)
+  if [[ -n "$_atype" && -z "${_AGENT_PROMPT_DETECTABLE[$_atype]+x}" ]]; then
+    return 0
+  fi
   while (( waited < timeout )); do
     pane=$(sudo -u "$user" tmux capture-pane -p -t "agent-${name}" 2>/dev/null || true)
     _agent_pane_input_ready "$pane" && return 0
