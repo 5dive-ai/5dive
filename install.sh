@@ -173,6 +173,82 @@ say() { echo "→ $*"; }
 
 [[ $EUID -eq 0 ]] || die "run as root: curl -fsSL ... | sudo bash"
 
+# >>> DIVE-2243 monotonicity guard (extracted verbatim by tests/install_monotonicity_unit.sh)
+# DIVE-2243: the DIVE-2144 cutover moved publishing from mutable `main` HEAD to
+# the newest release TAG. For ~23h the newest tag (v0.16.32) sat BELOW what the
+# fleet was running (0.16.33, .34, .36, then 0.17.0) because release-cut.yml had
+# never once succeeded (DIVE-2238). Every box that self-updated inside that
+# window rolled BACKWARDS — and printed `5dive upgraded: 0.16.33 -> 0.16.32`
+# while doing it.
+#
+# Nothing here noticed, because nothing here could: the only version comparison
+# on the upgrade path was `!=`, and its only job was choosing which of two report
+# strings to print. `sort -V` appears above to pick the newest TAG, and never
+# once to compare that tag's payload against what is already installed. So the
+# old version's sole purpose was a printed string, and that string asserted the
+# one thing the code never checked.
+#
+# A cutover that STALLS is loud — nothing updates, someone notices staleness. A
+# cutover that REVERSES presents as success: an update ran, it exited 0, and it
+# said "upgraded". Every signal a monitor watches says the system worked. It was
+# caught only because a human happened to read the same version number twice.
+#
+# So make DIRECTION a first-class assertion, separate from the action:
+#
+#   - Refuse a strictly-lower candidate by default, naming both versions and the
+#     tag/sha it came from. Same fail-closed posture the tag resolver above takes
+#     for "no tag resolves", and equally a no-op rather than a brick: the box
+#     keeps the CLI it already has, exactly as it does every hour nothing is
+#     published.
+#   - A real rollback is a legitimate operation, so it stays possible — but it
+#     must be ASKED FOR (FIVE_ALLOW_DOWNGRADE=1), never a side effect of tag
+#     resolution.
+#   - Refuse only on versions we can actually ORDER. An unreadable installed or
+#     candidate version is not evidence of a backwards move, and bricking an
+#     upgrade over a grep that came back empty would be a worse failure than the
+#     one this guards. Those cases WARN, name which side was unreadable, and
+#     proceed.
+
+# version_lt A B — true when semver A sorts strictly below B. Equal → false.
+# `sort -V`, never `sort`: lexically "0.16.10" sorts BELOW "0.16.9", so a plain
+# sort here would refuse ordinary forward upgrades roughly one patch in ten.
+version_lt() {
+  [[ "$1" != "$2" ]] && [[ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | head -1)" == "$1" ]]
+}
+
+# assert_version_monotonic <installed-bin> <candidate-bundle>
+# 0 = proceed, 1 = refuse (message already on stderr; caller cleans up + exits).
+# Deliberately does NOT call die(): the caller holds a temp bundle in $BIN_DIR
+# that must be removed before we exit, and a guard that leaves debris in the
+# directory it just refused to touch is its own small mess.
+assert_version_monotonic() {
+  local _inst_bin="$1" _cand_file="$2" _inst="" _cand="" _src=""
+  # Fresh install: nothing to move backwards from.
+  [[ -f "$_inst_bin" ]] || return 0
+  _inst="$(grep -m1 'readonly FIVE_VERSION=' "$_inst_bin" 2>/dev/null | sed -E 's/.*="([^"]+)".*/\1/')" || _inst=""
+  _cand="$(grep -m1 'readonly FIVE_VERSION=' "$_cand_file" 2>/dev/null | sed -E 's/.*="([^"]+)".*/\1/')" || _cand=""
+  if [[ -z "$_inst" || -z "$_cand" ]]; then
+    echo "  ! version not comparable (installed='${_inst:-unreadable}', candidate='${_cand:-unreadable}') — direction unchecked, proceeding" >&2
+    return 0
+  fi
+  version_lt "$_cand" "$_inst" || return 0
+  # Name where the lower version came from — the whole point is that a backwards
+  # move is traceable to the thing that resolved it.
+  _src="${GH_PINNED_TAG:-}"
+  [[ -n "$_src" ]] || _src="${GH_PINNED_SHA:-}"
+  [[ -n "$_src" ]] || _src="${REPO:-}"
+  if [[ "${FIVE_ALLOW_DOWNGRADE:-0}" == "1" ]]; then
+    echo "  ! DOWNGRADE ${_inst} -> ${_cand}${_src:+ (from ${_src})} — allowed by FIVE_ALLOW_DOWNGRADE=1" >&2
+    return 0
+  fi
+  printf 'error: refusing to DOWNGRADE 5dive: installed %s, candidate %s%s — this would move the box BACKWARDS.\n' \
+    "$_inst" "$_cand" "${_src:+, resolved from ${_src}}" >&2
+  printf '       Nothing was changed; the box keeps %s. If the rollback is deliberate, re-run with FIVE_ALLOW_DOWNGRADE=1.\n' \
+    "$_inst" >&2
+  return 1
+}
+# <<< DIVE-2243 monotonicity guard
+
 # Refresh CLI binaries, systemd unit, hooks, and skills from $REPO. Shared by
 # the default install path and `--upgrade`. Never touches state, auth profiles,
 # the claude user, apt packages, nvm, or bun — so it's safe to rerun on a
@@ -211,6 +287,13 @@ refresh_managed_files() {
     fi
   else
     echo "  ! no published 5dive.sha256 (or fetch failed) — skipping integrity check" >&2
+  fi
+  # DIVE-2243: direction is a separate assertion from the action. Checked HERE —
+  # after integrity, before the swap — so a refusal leaves the installed binary
+  # untouched and the box keeps running the version it already has.
+  if ! assert_version_monotonic "$BIN_DIR/5dive" "$_bundle_tmp"; then
+    rm -f "$_bundle_tmp"
+    exit 1
   fi
   chmod 755 "$_bundle_tmp"
   mv -f "$_bundle_tmp" "$BIN_DIR/5dive"
@@ -808,11 +891,19 @@ if [[ "${1:-}" == "--upgrade" ]]; then
   echo
   # DIVE-1260: report the version actually swapped in, read from the new bundle.
   _new_ver="$(grep -m1 'readonly FIVE_VERSION=' "$BIN_DIR/5dive" 2>/dev/null | sed -E 's/.*="([^"]+)".*/\1/')"
-  if [[ -n "${_old_ver:-}" && "${_old_ver}" != "${_new_ver:-}" ]]; then
+  # >>> DIVE-2243 upgrade report (extracted verbatim by tests/install_monotonicity_unit.sh)
+  # DIVE-2243: never call a backwards move an upgrade. Reachable only via
+  # FIVE_ALLOW_DOWNGRADE=1 now that the guard above refuses otherwise — but this
+  # line is what made the fleet-wide downgrade invisible, so it states the
+  # direction it actually measured rather than the one it assumed.
+  if [[ -n "${_old_ver:-}" && -n "${_new_ver:-}" ]] && version_lt "$_new_ver" "$_old_ver"; then
+    echo "5dive DOWNGRADED: ${_old_ver} -> ${_new_ver}"
+  elif [[ -n "${_old_ver:-}" && "${_old_ver}" != "${_new_ver:-}" ]]; then
     echo "5dive upgraded: ${_old_ver} -> ${_new_ver:-unknown}"
   else
     echo "5dive upgraded (now ${_new_ver:-unknown})"
   fi
+  # <<< DIVE-2243 upgrade report
   exit 0
 fi
 
