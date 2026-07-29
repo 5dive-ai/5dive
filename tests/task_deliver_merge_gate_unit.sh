@@ -60,6 +60,22 @@ cat >"$TMP/bin/gh" <<'STUB'
 #   gh pr list --head <b> --state merged --json ...      -q '.[0].mergedAt'  (DIVE-1830 branch path)
 #   gh pr list --state open --limit 200 --json ...       -q '[.[]|select(...)]...'  (DIVE-1835 auto-detect)
 argv="$*"; q=""; state=""
+# DIVE-2318: the DIVE-2120 attribution scan (`gh api repos/<slug>/commits?sha=main`)
+# had no arm here at all, so it fell to the field-keyed default below, got an
+# unparseable payload, and read as UNREACHABLE. That was invisible while every
+# not-reached answer rendered as "not merged"; it is not invisible now, and Tc2's
+# fixture INTENDS "no PR for this head", not "the scan never ran". Emit the raw TSV
+# the gate's own -q expression would produce: <walked>\t<hits>. 1 walked with 0 hits
+# is a page SHORTER than the one requested, i.e. main's history EXHAUSTED inside the
+# window with nothing naming the ident — a MEASURED miss, which is what these arms
+# are about. Anything else (compare/... for ancestry) stays unreachable, which is
+# harmless: ancestry is diagnostic-only since DIVE-2120.
+if [[ "$1" == "api" ]]; then
+  case "$2" in
+    */commits\?*) printf '%s\n' "${GH_STUB_COMMITS_TSV:-$'1\t0'}"; exit 0 ;;
+    *) exit 1 ;;
+  esac
+fi
 while [[ $# -gt 0 ]]; do
   case "$1" in
     -q) q="$2"; shift 2 ;;

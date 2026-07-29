@@ -1,5 +1,43 @@
 # Changelog
 
+## Unreleased — fix(gate): the merge gate stops reporting COULD-NOT-CHECK as NOT-MERGED (DIVE-2318)
+
+`task done`'s merge gate makes four GitHub queries. Every one of them can come back
+empty for reasons that have nothing to do with the merge, and all four empties were
+rendered as a merge verdict. On DIVE-2286 it printed *"its delivery PR is not merged to
+main yet (pull/295, state=unknown)"* about a PR that had merged 90 minutes earlier. That
+sentence is false about the world, and two agents misdiagnosed from it in sequence: dev2
+went hunting a deleted branch, then a confident wrong mechanism (squash/ancestry) was
+filed on top of dev2's reading.
+
+`task merge-audit` already gets this right on the SAME fault — it names the missing
+credential and tells you to authenticate. Two verbs, one cause, opposite diagnostics.
+Four refusal sites now follow the correct one:
+
+* **no gh credential resolved** — `done-merge-gate-no-credential`. No query ran at all,
+  so the refusal says so and names the resolution order. Which callers hit this is a
+  property of the CALLER'S OWN SUDOERS, not of being a builder: `_gate_gh_token`'s last
+  resort is `sudo -n -u claude gh auth token`, so an agent with `ALL=(ALL) NOPASSWD: ALL`
+  resolves one and an agent scoped to `/usr/local/bin/5dive *` cannot.
+* **PR-state query returned nothing** — `done-pr-state-unresolved`, distinct from a
+  measured OPEN.
+* **attribution scan unreachable in any searched repo** — `done-attribution-unresolved`,
+  reported as PARTIAL COVERAGE. A negative over a set that was not fully covered is not
+  a negative.
+* **the branch refusal no longer offers ANCESTRY as a way to satisfy the gate.** It has
+  accepted nothing since DIVE-2120/2184, and under our default squash merge it is
+  unsatisfiable by construction (measured on PR #300: the branch tip is not an ancestor
+  of main while the content diff over the changed paths is empty). An error naming an
+  impossible condition is what sent dev2 and dev3 looking for a missing branch. It now
+  names the two roads that can accept — attribution on main, a merged PR for the head —
+  and says why ancestry is not one of them.
+
+**ACCEPTANCE IS UNCHANGED.** Every close that passed before still passes and every
+refusal is still a refusal; the credential guard sits ahead of probes that all returned
+empty anyway. What changed is which cause the refusal names. `tests/task_merge_gate_diagnostic_unit.sh`
+pins both directions, with anchor arms on the accepting side so a guard that simply
+refused everything would go red.
+
 ## Unreleased — fix(loop): a spend read that FAILED is NOT-REACHED, not zero — and no longer clobbers the running total (DIVE-2304)
 
 `_loop_refresh_spend` had three fail-open sites feeding one control decision: a missing
