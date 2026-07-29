@@ -540,7 +540,9 @@ _gate_route_reviewer() {
 #     agent id from SUDO_USER (auto_sender_from_sudo) and the human signal from a
 #     non-agent SUDO_UID (_gate_sudo_uid_nonagent), mirroring cmd_task_answer.
 #   - non-root: SUDO_* are UNTRUSTED (forgeable) — ignore them entirely and judge
-#     by the real `id -un` unix login, which a process cannot spoof.
+#     by $EUID resolved against /etc/passwd in pure bash. DIVE-2330: this line used
+#     to say `id -un` "which a process cannot spoof" — it could, because `id`
+#     resolves through the CALLER'S PATH and a shim printing any name won.
 # Prints one of: "agent <name>" | "human" | "none". Never reads --from ($from stays
 # ATTRIBUTION-only) nor $USER (also env-spoofable). The determined root-sudo residual
 # (an agent that truly sudo's then forges) is shared with the whole gate system and
@@ -554,10 +556,12 @@ _gate_withdraw_actor() {
     _gate_sudo_uid_nonagent && { printf 'human'; return; }
     printf 'none'; return
   fi
-  local idun; idun=$(id -un 2>/dev/null || echo "")
-  if [[ "$idun" == agent-* ]]; then printf 'agent %s' "${idun#agent-}"
-  elif [[ -n "$idun" ]]; then printf 'human'
-  else printf 'none'; fi
+  local _a; _a=$(_gate_uid_to_agent "$EUID")
+  if [[ -n "$_a" ]]; then printf 'agent %s' "$_a"; return; fi
+  local _n _x _u; while IFS=: read -r _n _x _u _; do
+    [[ "$_u" == "$EUID" ]] && { printf 'human'; return; }
+  done < /etc/passwd
+  printf 'none'
 }
 
 # DIVE-980: shared org-chart assignee resolution. Resolve an assignee TOKEN to a
@@ -3888,12 +3892,44 @@ _gate_floor_axis() {
 # The dashboard path is unaffected and needs no marker: shelld runs as `claude`
 # (a NON-agent user) and sends `--human`, so those answers are `human:*` — already
 # authorized everywhere `lead:*` is, and never in want of a lead stamp.
+# DIVE-2330: resolve a uid to an agent name in PURE BASH over /etc/passwd. No
+# `id`, no `getent` — both resolve through the CALLER'S PATH, and every agent can
+# set its own PATH. Measured on this host before the fix: a shim on PATH printing
+# `agent-lodar` made `id -un` return exactly that, from a process whose real uid
+# was 1004 (agent-main). Same shape as the landed DIVE-2281 fix in
+# `_envelope_sender_fallback`.
+_gate_uid_to_agent() {
+  local want="${1:-}" name _x uid
+  [[ "$want" =~ ^[0-9]+$ ]] || { printf ''; return; }
+  while IFS=: read -r name _x uid _; do
+    [[ "$uid" == "$want" ]] || continue
+    [[ "$name" == agent-* ]] || { printf ''; return; }
+    printf '%s' "${name#agent-}"; return
+  done < /etc/passwd
+  printf ''
+}
+
+# `$EUID` is a bash BUILTIN reflecting the kernel's view of this process. It is not
+# PATH-resolved and cannot be set from the environment, which is the whole property
+# an authorization check needs. SUDO_UID is consulted only when EUID is 0, exactly
+# as before: sudo writes it, the caller does not.
+# SEAM (mirrors _gate_is_root): the harness overrides THIS to exercise both
+# branches with the real resolver. An external caller cannot — invoking `5dive`
+# starts a fresh bash that defines the function itself, so there is nothing in the
+# environment to override. That is the difference between a seam and a hole: the
+# old code let a PATH shim answer, which any agent could set.
+_gate_caller_uid() { printf '%s' "$EUID"; }
+
 _gate_authenticated_actor() {
-  local u; u=$(id -un 2>/dev/null || echo '')
-  if [[ "$u" == agent-* ]]; then printf '%s' "${u#agent-}"; return; fi
-  if [[ "$(id -u 2>/dev/null || echo 1)" == "0" && -n "${SUDO_UID:-}" ]]; then
-    local su; su=$(getent passwd "$SUDO_UID" 2>/dev/null | cut -d: -f1)
-    [[ "$su" == agent-* ]] && { printf '%s' "${su#agent-}"; return; }
+  local a; a=$(_gate_uid_to_agent "$(_gate_caller_uid)")
+  if [[ -n "$a" ]]; then printf '%s' "$a"; return; fi
+  # The SUDO_UID branch stays gated on the REAL root check (_gate_is_root, itself
+  # the pre-existing seam), NOT on _gate_caller_uid. Routing it through the seam
+  # would let a harness modelling "caller is root" also unlock the SUDO_UID path
+  # and widen who resolves to an agent — a behaviour change, not a fix.
+  if _gate_is_root && [[ -n "${SUDO_UID:-}" ]]; then
+    a=$(_gate_uid_to_agent "$SUDO_UID")
+    [[ -n "$a" ]] && { printf '%s' "$a"; return; }
   fi
   printf ''
 }
@@ -3903,9 +3939,9 @@ _gate_authenticated_actor() {
 # invoker) against a claimed `need_answered_by`, so a `--from` spoof is visible
 # after the fact and not only at answer time.
 _gate_agent_for_uid() {
-  local uid="${1:-}"; [[ "$uid" =~ ^[0-9]+$ ]] || { printf ''; return; }
-  local u; u=$(getent passwd "$uid" 2>/dev/null | cut -d: -f1)
-  [[ "$u" == agent-* ]] && printf '%s' "${u#agent-}" || printf ''
+  # DIVE-2330: was `getent passwd`, which is PATH-resolved and therefore forgeable
+  # by the caller it is meant to check. Same pure-bash resolver as above.
+  _gate_uid_to_agent "${1:-}"
 }
 
 _GATE_ENG_SHIP_RX='\bmerg(e|es|ed|ing)\b|pull request|\bpr\b|\bdiff\b|ship it|ship the|ship this|\bship(ping|ped)\b|deploy|redeploy|roll ?out|\broll(ing|ed)? out\b|land the|land it|land this|\bland(ing|ed)\b|rebase|hotfix|cut a branch|cut the release|push(es|ed|ing)? to (main|prod|production|origin)|push[^.]*github|delegated push|push[- ]for[- ]review|push .*(branch|for review|for a? ?pr|for code review)|5dive push|roll[^.]*fleet|fleet[- ]?roll|code review|approve the (merge|diff|change|pr|build|deploy|ship|commit)|build\.sh|smoke test|ci\b'
@@ -7384,6 +7420,10 @@ cmd_task_answer() {
   # returns `--from=<anything>` verbatim — so authorizing on it would let any agent
   # mint `lead:<the reviewer>` for itself. `_gate_authenticated_actor` is the
   # unforgeable half, and it FAILS CLOSED (empty -> no lead-clear).
+# DIVE-2330: that claim was FALSE until this fix — the function read a bare
+# `id -un`, resolved through the caller's PATH, so any agent could mint the
+# routed reviewer's name (measured: a shim made it return `lodar`). It now
+# resolves $EUID in pure bash over /etc/passwd, so the claim is true as written.
   local _routed_rev; _routed_rev=$(db "SELECT COALESCE(routed_reviewer,'') FROM tasks WHERE id=${id};")
   local _lead_clear=0 _rc_sealed=0 _rc_deny=""
   if [[ ( "$nt" == "approval" || "$nt" == "manual" || "$nt" == "access" ) && -n "$_routed_rev" ]]; then
@@ -7423,6 +7463,7 @@ cmd_task_answer() {
   # DIVE-2099: the org lead's STANDING authority over ENGINEERING approvals — the
   # same clearance as the routed lead-clear above, but WITHOUT requiring that this
   # gate was routed to them at filing time. Identity is the unforgeable half and
+  # gate was routed to them at filing time. # DIVE-2330: true only because identity now resolves $EUID in pure bash over /etc/passwd. It was FALSE while any of these read `id -un`/`getent`, both PATH-resolved and forgeable by the caller being checked.
   # is checked FIRST: `_gate_authenticated_actor` reads the kernel-enforced unix
   # caller (never --from, which `task_actor` returns verbatim — DIVE-2004), and
   # `_gate_standing_lead` resolves the holder and itself fails closed to EMPTY.
@@ -7461,8 +7502,13 @@ cmd_task_answer() {
   # through to a human (T2 floor / no distinct lead), routed_reviewer is NULL, so
   # _lead_clear=0 and a human is required — exactly the intended fall-through.
   if [[ "$nt" == "approval" || "$nt" == "secret" || "$nt" == "manual" || "$nt" == "access" ]]; then
-    local _caller; _caller=$(id -un 2>/dev/null || echo '?')
-    if [[ "$_caller" == agent-* && "$_lead_clear" != "1" ]]; then
+    # DIVE-2330: was `id -un` (PATH-forgeable). This decides whether an agent is
+    # REFUSED, so a caller faking a non-agent name would skip it. EUID-only on
+    # purpose: the old test was `id -un == agent-*`, i.e. the PROCESS is an agent
+    # user. Routing through _gate_authenticated_actor would also fire on a
+    # root+SUDO_UID caller and widen the refusal — a behaviour change, not a fix.
+    local _caller; _caller=$(_gate_uid_to_agent "$EUID")
+    if [[ -n "$_caller" && "$_lead_clear" != "1" ]]; then
       # No audit_log here: the blocked caller is an agent user that can't write
       # the root-owned audit log anyway (it would only leak a perms error to
       # stderr). The fail + non-zero exit is the record.

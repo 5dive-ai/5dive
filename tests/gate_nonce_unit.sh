@@ -64,6 +64,11 @@ audit_log() { :; }
 # SUDO_UID we set per-case. `command id` is used for actual uid lookups.
 FAKE_CALLER="root"
 id() { if [[ "${1:-}" == -un ]]; then echo "$FAKE_CALLER"; else command id "$@"; fi; }
+# DIVE-2330: identity no longer comes from `id` — it is $EUID resolved in pure
+# bash, precisely so a PATH shim cannot answer. Override the SEAM instead, the
+# same way this file already overrides _gate_is_root. FAKE_CALLER=root models a
+# non-agent immediate caller, so point the seam at uid 0.
+_gate_caller_uid() { if [[ "$FAKE_CALLER" == agent-* ]]; then command id -u "$FAKE_CALLER" 2>/dev/null || printf 0; else printf 0; fi; }
 
 # DIVE-1413: every SUDO_UID-driven case below models a POST-SUDO / root context
 # (T5 human-on-box, T6 agent-sudo->root, the drop's require_root nested answer) —
