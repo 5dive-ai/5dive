@@ -748,38 +748,10 @@ cmd_doctor() {
       fi
     fi
 
-    # DIVE-2327: REPORT the FIVE_* knobs in effect and configured. Facts only — see
-    # src/lib/env_overrides.sh for why this must never warn.
-    #
-    # SEVERITY IS ALWAYS `ok`, and that is a deliberate reading of a required field
-    # rather than a claim that everything is fine. doctor_add's schema demands a
-    # severity; `ok` is the only value that adds NO verdict to summary.warnings /
-    # summary.errors, which is what keeps this surface a report. A `warn` here would
-    # fire on lodar's deliberate policy on sixteen agents every single run.
-    #
-    # NOTHING IS EMITTED WHEN NOTHING IS SET — no "no overrides" line. That makes the
-    # negative unobservable by design, which is why DIVE-2327 requires the negative arm
-    # to be graded by MUTATION rather than by reading empty output.
-    local _eov; _eov=$(_env_overrides_json 2>/dev/null || printf '')
-    if [[ -n "$_eov" ]]; then
-      local _n _v _f _st
-      while IFS=$'\t' read -r _n _v; do
-        [[ -n "$_n" ]] && doctor_add policy "env-in-effect/$_n" ok "in effect (process env): $_n=$_v"
-      done < <(jq -r '.process[]? | [.name, .value] | @tsv' <<<"$_eov" 2>/dev/null)
-      while IFS=$'\t' read -r _n _v _f; do
-        [[ -n "$_n" ]] && doctor_add policy "env-configured/$_n" ok "configured ($_f): $_n=$_v"
-      done < <(jq -r '.configured[]? | [.name, .value, .file] | @tsv' <<<"$_eov" 2>/dev/null)
-      # UNREADABLE IS ITS OWN LINE. Without it a caller outside group `claude` sees the
-      # same empty policy section as a box with no overrides configured, and reads
-      # "none are set" off a directory nobody could open.
-      _st=$(jq -r '.configured_state // ""' <<<"$_eov" 2>/dev/null)
-      if [[ "$_st" == "unreadable" ]]; then
-        while IFS= read -r _f; do
-          [[ -n "$_f" ]] && doctor_add policy "env-configured-unreadable" ok \
-            "could not read $_f — configured overrides NOT determined (this is a limit of the read, not a finding that none are set)"
-        done < <(jq -r '.configured_unreadable[]?' <<<"$_eov" 2>/dev/null)
-      fi
-    fi
+    # DIVE-2328: the FIVE_* override report is assembled here but is NOT a check and
+    # never enters DOCTOR_CHECKS. See below the summary for why that matters.
+    DOCTOR_ENV_OVERRIDES=$(_env_overrides_json 2>/dev/null || printf '{}')
+    [[ -n "$DOCTOR_ENV_OVERRIDES" ]] || DOCTOR_ENV_OVERRIDES='{}'
   fi
 
   # --- summary + output ---
@@ -792,9 +764,21 @@ cmd_doctor() {
     repaired: [.[] | select(.repaired == true)]    | length
   }' <<<"$DOCTOR_CHECKS")
 
+  # DIVE-2328: env_overrides is a REPORT and rides ALONGSIDE the checks, never inside
+  # them. The first cut used doctor_add with severity=ok, reasoning that `ok` is the
+  # schema's neutral member because it feeds no warning/error count. True of the PAYLOAD
+  # and false at the READER, which is where it matters: the dashboard computes
+  # `passing = checks.filter(c => c.severity === "ok").length` and renders that in green,
+  # so sixteen configured-knob lines became sixteen PASSED CHECKS — an assertion of health
+  # nobody made. Worse, its default view is `checks.filter(c => c.severity !== "ok")`, so
+  # the surface built to make an unintended knob FINDABLE was hidden unless you clicked
+  # "show all". A neutral value in the payload is not neutral once a consumer sums it.
+  # selfcheck already had this right (env_overrides is a sibling of probes/summary and
+  # touches no count); this makes doctor agree with it.
   local payload
   payload=$(jq -cn --argjson checks "$DOCTOR_CHECKS" --argjson summary "$summary" \
-    '{summary: $summary, checks: $checks}')
+    --argjson eov "${DOCTOR_ENV_OVERRIDES:-{\}}" \
+    '{summary: $summary, checks: $checks, env_overrides: $eov}')
 
   if (( JSON_MODE )); then
     jq -c '{ok:true, data: .}' <<<"$payload"
@@ -808,6 +792,17 @@ cmd_doctor() {
     jq -r '.summary |
       "summary: \(.total) checks, \(.passed) ok, \(.warnings) warn, \(.errors) error" +
       (if .repaired > 0 then ", \(.repaired) repaired" else "" end)
+    ' <<<"$payload"
+    # Its own section, below the summary, so it reads as a report rather than as results.
+    # Prints NOTHING when there is nothing to say — which is why the negative is graded by
+    # mutation and not by looking at empty output.
+    jq -r '
+      .env_overrides // {} |
+      ( (.process // [])    | map("  in effect (process env): \(.name)=\(.value)") ) +
+      ( (.configured // []) | map("  configured (\(.file)): \(.name)=\(.value)") ) +
+      ( (.configured_unreadable // []) | map("  could not read \(.) — configured overrides NOT determined there") )
+      | if length > 0 then ["", "── env overrides (report, not checks) ──"] + . else [] end
+      | .[]
     ' <<<"$payload"
   fi
   # Always exit 0 — the envelope carries the real state via summary.errors.

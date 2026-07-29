@@ -46,7 +46,17 @@ Also fixes a pre-existing defect this surface would otherwise sit behind:
 dispatched it and the usage error text advertised it — so anyone who read the error and
 did what it said got a usage failure.
 
-`tests/env_overrides_report_unit.sh` — 17 arms, mutation-graded five ways with the measured
+**The report is not a check.** `env_overrides` rides alongside `checks` in doctor's
+payload, never inside it. The first cut used `doctor_add` with `severity=ok`, reasoning
+that `ok` is the schema's neutral member because it feeds no warning/error count. True of
+the payload and false at the reader: the dashboard computes
+`passing = checks.filter(c => c.severity === "ok").length` and renders it green, so sixteen
+configured-knob lines became sixteen *passed checks* — `--category=policy` reported
+"17 checks, 17 ok" where one check had run. Its default view is
+`checks.filter(c => c.severity !== "ok")`, so the surface built to make an unintended knob
+findable was hidden behind "show all". `selfcheck` already had this right; doctor now agrees.
+
+`tests/env_overrides_report_unit.sh` — 20 arms, mutation-graded six ways with the measured
 results in its header. Two harness defects are recorded there too, because both are the
 kind that ship green: T10 was green **and vacuous** (`require_root` fires before argv is
 parsed, so both branches died at the permission check; only the anchor went red), and the

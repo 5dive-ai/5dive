@@ -36,6 +36,17 @@
 #   * drop redaction on the configured path            -> 15/2. Both T6 file arms; the
 #     process-side redaction arm stays green, so they are not one assertion twice.
 #   * widen the file grep to ALL assignments           -> 16/1. T7, the no-dump arm.
+#   * put the report back INSIDE .checks via doctor_add -> 18/2. Both T11 count arms; the
+#     T11 anchor stays green, because the key is still emitted — the defect was never
+#     absence, it was being COUNTED.
+#
+# AND ONE DEFECT IN THE PRODUCT THAT ONLY A REVIEWER'S QUESTION CAUGHT, which is why T11
+# exists: every arm above grades the PAYLOAD, and "no judgement language" was true of the
+# payload while false at the READER. severity=ok is the schema's neutral member because it
+# feeds no warning/error count — and the dashboard sums `severity === "ok"` into a green
+# "Passed" stat and hides everything else by default. So sixteen configured knobs became
+# sixteen passed checks, and the surface built to make a knob FINDABLE was behind a
+# "show all" toggle. A value that is neutral in a payload is not neutral once summed.
 #
 # TWO DEFECTS IN THIS HARNESS THAT ONLY ITS OWN ANCHORS AND A MISSING SUMMARY CAUGHT,
 # recorded because both are the kind that ship green:
@@ -233,6 +244,38 @@ else
   [[ "$o5" == *"unknown --category"* ]] \
     && ok_t 'T10 ANCHOR: a genuinely bogus category still errors — T10 is not vacuous' \
     || bad_t 'T10 anchor' "o5=$(head -c 200 <<<"$o5")"
+fi
+
+# --- T11: THE CONSUMER PROPERTY. A report must not be counted as a result.
+#     Found by main asking the right question during review: my claim ("no judgement
+#     language") was about the PAYLOAD, and the risk lives at the READER. Measured — the
+#     first cut used doctor_add with severity=ok, and the dashboard does
+#       passing = checks.filter(c => c.severity === "ok").length
+#     rendered in green, so sixteen configured-knob lines became sixteen PASSED CHECKS:
+#     an assertion of health nobody made. `--category=policy` reported "17 checks, 17 ok"
+#     where exactly ONE check had run. And its default view is
+#       visible = checks.filter(c => c.severity !== "ok")
+#     so the surface built to make an unintended knob FINDABLE was hidden unless you
+#     clicked "show all". `ok` is neutral in the payload and NOT neutral once summed.
+#     So env_overrides rides alongside .checks, never inside it — which is what selfcheck
+#     already did, and this arm is what stops doctor drifting back.
+if [[ -x ./5dive ]] && sudo -n true 2>/dev/null; then
+  dj=$(sudo -n ./5dive --json doctor --category=policy 2>/dev/null)
+  n_in_checks=$(jqf '[.data.checks[]? | select(.name|startswith("env-"))] | length' "$dj")
+  passed=$(jqf '.data.summary.passed' "$dj"); total=$(jqf '.data.summary.total' "$dj")
+  [[ "$n_in_checks" == "0" ]] \
+    && ok_t 'T11 the env report is NOT in .checks — no green badge, not hidden by the ok-filter' \
+    || bad_t 'T11 report leaked into checks' "n=$n_in_checks"
+  [[ "$passed" == "$total" && "$total" -le 2 ]] \
+    && ok_t "T11 summary counts only real checks (total=$total) — the report inflates nothing" \
+    || bad_t 'T11 summary inflated by the report' "passed=$passed total=$total"
+  [[ -n "$(jqf '.data.env_overrides.configured_state' "$dj")" ]] \
+    && ok_t 'T11 ANCHOR: env_overrides IS present as its own key — T11 is not passing by absence' \
+    || bad_t 'T11 anchor: the report vanished entirely' "dj=$(head -c 200 <<<"$dj")"
+else
+  skip_t 'T11 report is not counted as a result' 'needs the built bundle and passwordless sudo (doctor require_root)'
+  skip_t 'T11 summary not inflated' 'see above'
+  skip_t 'T11 anchor' 'see above'
 fi
 
 echo "-----"
