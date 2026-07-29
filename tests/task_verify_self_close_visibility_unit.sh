@@ -3,6 +3,12 @@
 # with `task verify --cmd`, but the permitted self-close must be visible in the
 # task record, the audit log, and stderr. No policy refusal is expected.
 #
+# DEPENDENCY: the identity arms assume DIVE-2330's resolver contract:
+# `_gate_authenticated_actor` obtains its uid from `_gate_caller_uid` and maps it
+# only through `_gate_passwd_stream`. Keep this branch atop DIVE-2330 until that
+# resolver lands on main; pinning these function seams is what keeps the arms from
+# silently grading the harness runner when the production implementation changes.
+#
 # Same isolation contract as the other task harnesses: source src/ directly,
 # use a throwaway TASKS_DB, stub the task-store audit sink, and touch neither the
 # live board nor the fleet audit log.
@@ -38,8 +44,27 @@ PASS=0; FAIL=0
 ok_t()  { PASS=$((PASS+1)); printf 'ok   - %s\n' "$1"; }
 bad_t() { FAIL=$((FAIL+1)); printf 'FAIL - %s\n   %s\n' "$1" "${2:-}"; }
 run()   { local verb="$1"; shift; ( JSON_MODE=1; "cmd_task_$verb" "$@" ) 2>"$TMP/err"; }
+# Drive the real authenticated-actor resolver through the DIVE-2330 uid/passwd
+# seams while varying caller provenance independently. These are function seams,
+# not PATH-resolved commands: production defines them after imported functions are
+# loaded, while this already-sourced harness can pin them without teaching a caller
+# how to override the live resolver.
+run_with_identity() { local authenticated="$1" claimed_user="$2" verb="$3"; shift 3
+  (
+    local pinned_uid=987654
+    _gate_caller_uid() { printf '%s' "$pinned_uid"; }
+    _gate_passwd_stream() {
+      [[ -n "$authenticated" ]] \
+        && printf 'agent-%s:x:%s:%s::/nonexistent:/bin/false\n' \
+             "$authenticated" "$pinned_uid" "$pinned_uid"
+      printf '%s\n' "$(</etc/passwd)"
+    }
+    USER="$claimed_user"; SUDO_UID=""; SUDO_USER=""; JSON_MODE=1
+    "cmd_task_$verb" "$@"
+  ) 2>"$TMP/err"
+}
 run_as() { local who="$1" verb="$2"; shift 2
-  ( USER="agent-${who}"; SUDO_UID=""; SUDO_USER=""; JSON_MODE=1; "cmd_task_$verb" "$@" ) 2>"$TMP/err"
+  run_with_identity "$who" "agent-${who}" "$verb" "$@"
 }
 jf() { jq -r "$1" 2>/dev/null; }
 col() { db "SELECT COALESCE($2,'') FROM tasks WHERE id=$1;"; }
@@ -79,6 +104,39 @@ audit_row=$(tail -n 1 "$AUDIT_CALLS")
 [[ "$audit_row" == "task.verify-self-close self-verified-close 0 -- task=${maker_ident} maker=alice verifier=boss iteration=1" ]] \
   && ok_t "distinct audit verb/result attributes the maker close" \
   || bad_t "audit receipt wrong" "$audit_row"
+
+# Regression arm: provenance is forgeable, authenticated identity is not. The
+# recorded maker still receives all three visibility marks when USER and the old
+# resolver's PATH commands both claim a non-maker identity. On the pre-DIVE-2330
+# resolver this shim suppresses the mark; the uid/passwd resolver must ignore it.
+FORGED_PATH="$TMP/forged-path"
+mkdir -p "$FORGED_PATH"
+printf '#!/bin/bash\n[[ "${1:-}" == "-u" ]] && printf "1000\\n" || printf "agent-nobody\\n"\n' >"$FORGED_PATH/id"
+printf '#!/bin/bash\nprintf "agent-nobody:x:1000:1000::/nonexistent:/bin/false\\n"\n' >"$FORGED_PATH/getent"
+chmod +x "$FORGED_PATH/id" "$FORGED_PATH/getent"
+P=$(make_delivered "maker forged provenance visibility")
+before=$(wc -l <"$AUDIT_CALLS")
+forged_out=$(PATH="$FORGED_PATH:$PATH" run_with_identity alice nobody verify "$P" --cmd=true); forged_rc=$?
+after=$(wc -l <"$AUDIT_CALLS")
+[[ $forged_rc -eq 0 && "$(col "$P" status)" == "done" \
+   && "$(col "$P" result)" == *"self-verified-close: maker=alice; verifier=boss never graded; iteration=1"* \
+   && "$after" -eq $((before+1)) && "$(cat "$TMP/err")" == *"self-verified-close"* ]] \
+  && ok_t "forged USER/PATH cannot suppress an authenticated maker self-close mark" \
+  || bad_t "forged USER/PATH bypass remains" "rc=$forged_rc status=$(col "$P" status) audit=$before/$after out=$forged_out err=$(cat "$TMP/err")"
+
+# Fail closed when the kernel identity resolver cannot attribute a caller. The
+# passing command remains useful evidence, but an unclassifiable caller cannot
+# create the exact silent-close shape this visibility rail exists to prevent.
+U=$(make_delivered "unidentified caller control")
+before=$(wc -l <"$AUDIT_CALLS")
+unknown_out=$(run_with_identity "" nobody verify "$U" --cmd=true); unknown_rc=$?
+after=$(wc -l <"$AUDIT_CALLS")
+[[ $unknown_rc -ne 0 && "$(col "$U" status)" == "todo" \
+   && "$(col "$U" result)" == "✅ verify PASS (exit 0): true"* \
+   && "$(col "$U" result)" != *"self-verified-close"* && "$before" == "$after" \
+   && "$(cat "$TMP/err")" == *"caller identity could not be authenticated"* ]] \
+  && ok_t "unidentified caller records PASS evidence but cannot close a delivered loop" \
+  || bad_t "unidentified caller did not fail closed" "rc=$unknown_rc status=$(col "$U" status) result=$(col "$U" result) audit=$before/$after out=$unknown_out err=$(cat "$TMP/err")"
 
 # Control: the assigned verifier's same PASS is an ordinary independent grade.
 V=$(make_delivered "verifier grade control")
