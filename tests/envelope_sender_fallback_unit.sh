@@ -125,28 +125,69 @@ fi
 eval "$(awk '/^auto_sender_from_sudo\(\) \{/,/^\}/' "$VSRC")"
 eval "$(awk '/^_envelope_caller\(\) \{/,/^\}/' "$SRC")"
 
-# T6a — THE FORGERY. A caller who exports SUDO_USER must not be able to choose the name.
-# Only meaningful when the runner IS an agent-* user; otherwise both sources are empty
-# and the arm would pass vacuously, so say which case ran rather than reporting green.
+# T6a/T6b — THE PRECEDENCE, GRADED WITHOUT DEPENDING ON WHO RUNS THE SUITE.
+#
+# The first cut of these arms keyed off the real runner ($REAL_NAME == agent-*) and called
+# bad_t otherwise, on the reasoning that a skip is NOT-REACHED and must not read as green.
+# That reasoning is right and the implementation was wrong: CI runs as `runner`, never as
+# an agent-* user, so the arm could NEVER pass in the only environment that gates a merge.
+# Measured: 11/0 on this host, 9/1 on CI, failing on the arm asserting the fix. A control
+# that cannot pass where it is enforced is worse than one that is skipped there — it
+# trains people to merge past it.
+#
+# So grade the ORDER itself, which is the actual security property, by substituting the
+# EUID source with a stub. _envelope_caller is tiny and calls exactly two things, so a
+# stubbed _envelope_sender_fallback exercises the real composition without needing the
+# process to BE an agent. The real-identity check stays below as a bonus arm, and is a
+# pass either way because T1 already grades the live resolver against /proc/self/status.
+_precedence_rig() {                      # <euid-stub-output> <sudo_user> -> resolved caller
+  local rig; rig="$(mktemp)"
+  {
+    awk '/^auto_sender_from_sudo\(\) \{/,/^\}/' "$VSRC"
+    printf '_envelope_sender_fallback() { printf %%s %s; }\n' "'$1'"
+    awk '/^_envelope_caller\(\) \{/,/^\}/' "$SRC"
+    printf '_envelope_caller\n'
+  } > "$rig"
+  SUDO_USER="$2" bash "$rig"; rm -f "$rig"
+}
+
+got="$(_precedence_rig euidname agent-forged)"
+[[ "$got" == "euidname" ]] \
+  && ok_t "T6a a forged SUDO_USER is IGNORED when EUID resolves (got '$got', not 'forged')" \
+  || bad_t 'T6a forged SUDO_USER chose the envelope sender — precedence is inverted' \
+           "got='$got' want='euidname'"
+
+# T6b ANCHOR — the same rig with an EMPTY EUID source must fall THROUGH to SUDO_USER.
+# Two jobs: it proves the sudo path still answers (so the swap did not break _deliver),
+# and it proves T6a is not passing because the rig ignores SUDO_USER entirely.
+got="$(_precedence_rig '' agent-forged)"
+[[ "$got" == "forged" ]] \
+  && ok_t 'T6b ANCHOR: an empty EUID source falls through to SUDO_USER — T6a is not vacuous, sudo path intact' \
+  || bad_t 'T6b anchor failed — either the fallback is dead or the rig never consults SUDO_USER' \
+           "got='$got' want='forged'"
+
+# T6b2 — and the OLD ordering really does forge, so the fix is not cosmetic.
+_legacy_rig="$(mktemp)"
+{
+  awk '/^auto_sender_from_sudo\(\) \{/,/^\}/' "$VSRC"
+  printf '_envelope_sender_fallback() { printf %%s "euidname"; }\n'
+  printf 'x="$(auto_sender_from_sudo)"; [[ -n "$x" ]] || x="$(_envelope_sender_fallback)"; printf "%%s" "$x"\n'
+} > "$_legacy_rig"
+legacy="$(SUDO_USER=agent-forged bash "$_legacy_rig")"; rm -f "$_legacy_rig"
+[[ "$legacy" == "forged" ]] \
+  && ok_t 'T6b2 ANCHOR: the sudo-first ordering DOES forge (returns the exported name) — the swap is load-bearing' \
+  || bad_t 'T6b2 anchor did not reproduce the forgery — T6a proves nothing' "legacy='$legacy'"
+
+# T6d — BONUS, real identity. Only meaningful when the runner is an agent; reported as a
+# pass either way with the case NAMED, because T1 already grades the live resolver and
+# these arms no longer depend on it.
 if [[ "$REAL_NAME" == agent-* ]]; then
   forged="$(SUDO_USER=agent-notme _envelope_caller)"
   [[ "$forged" == "${REAL_NAME#agent-}" ]] \
-    && ok_t "T6a forged SUDO_USER is IGNORED on the direct path (got '$forged', the real EUID label)" \
-    || bad_t 'T6a a forged SUDO_USER chose the envelope sender' "got='$forged' want='${REAL_NAME#agent-}'"
-  # T6b — and the old ordering really does produce the forgery, so T6a is not vacuous.
-  _legacy_rig="$(mktemp)"
-  {
-    awk '/^auto_sender_from_sudo\(\) \{/,/^\}/'   "$VSRC"
-    awk '/^_envelope_sender_fallback\(\) \{/,/^\}/' "$SRC"
-    printf 'x="$(auto_sender_from_sudo)"; [[ -n "$x" ]] || x="$(_envelope_sender_fallback)"; printf "%%s" "$x"\n'
-  } > "$_legacy_rig"
-  legacy="$(SUDO_USER=agent-notme bash "$_legacy_rig")"
-  rm -f "$_legacy_rig"
-  [[ "$legacy" == "notme" ]] \
-    && ok_t 'T6b ANCHOR: the sudo-first ordering DOES forge (returns the exported name) — T6a is not vacuous' \
-    || bad_t 'T6b anchor did not reproduce the forgery — T6a proves nothing' "legacy='$legacy'"
+    && ok_t "T6d live process: forged SUDO_USER ignored, resolved '$forged' from the real EUID" \
+    || bad_t 'T6d live process: a forged SUDO_USER chose the sender' "got='$forged'"
 else
-  bad_t 'T6a/T6b need an agent-* runner to mean anything' "runner='$REAL_NAME' — NOT-REACHED, not a pass"
+  ok_t "T6d live-identity arm N/A here (runner '$REAL_NAME' is not agent-*) — precedence graded by T6a/T6b above, not by this"
 fi
 
 # T6c — THE SCOPED PATH IS UNCHANGED BY THE SWAP, which is what makes it free. As root
