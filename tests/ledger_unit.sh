@@ -272,6 +272,58 @@ else
   fi
 fi
 
+# ---------------------------------------------------------------------------
+# Case 7: THE FUNNEL. Drive the real bundle through the maker→verifier rail and
+# assert the DELIVERY was recorded as a delivery.
+#
+# This case exists because the first cut of the change got it wrong. The emit was
+# placed in _task_status_cmd on the assumption that every `task done` funnels
+# through it; a `done` that DELIVERS forks earlier, into the handoff write, so
+# the single event the verifier rail is entirely about was absent from the ledger
+# and nothing said so. An absent row is the one shape a ledger cannot
+# self-report, so it needs a test that asserts presence AND kind.
+#
+# Also asserts the negative: a delivery must NOT appear as task.done. Recording
+# it as a close would have the ledger attest that work was finished while it is
+# still waiting to be graded — our own evidence base overstating autonomy, which
+# is worse than a missing row.
+# ---------------------------------------------------------------------------
+BUNDLE=./5dive
+if [[ ! -x "$BUNDLE" ]]; then
+  bad_t "funnel case: bundle not built" "run bash build.sh first"
+else
+  E2E="$TMP/e2e"
+  (
+    set +e
+    export STATE_DIR="$E2E" TASKS_DIR="$E2E/tasks" TASKS_DB="$E2E/tasks/tasks.db"
+    mkdir -p "$TASKS_DIR"
+    "$BUNDLE" task add "funnel case" --project=DIVE --assignee=dev --verifier=main
+    "$BUNDLE" task start DIVE-1 --no-preflight
+    "$BUNDLE" task done DIVE-1 --result="delivered, not closed"
+  ) >/dev/null 2>&1
+  E2EDB="$TMP/e2e/tasks/tasks.db"
+  kinds=$(sqlite3 "$E2EDB" "SELECT GROUP_CONCAT(kind, ',') FROM (SELECT kind FROM lifecycle_events ORDER BY id);" 2>/dev/null)
+  if [[ "$kinds" == *task.delivered* ]]; then
+    ok_t "funnel: the maker→verifier delivery emitted task.delivered ($kinds)"
+  else
+    bad_t "funnel: no task.delivered row (kinds: ${kinds:-<none>})" \
+          "a 'task done' that delivers forks before _task_status_cmd — emit at the handoff write too"
+  fi
+  if [[ "$kinds" != *task.done* ]]; then
+    ok_t "funnel: the delivery was NOT recorded as task.done"
+  else
+    bad_t "funnel: a delivery was recorded as task.done" \
+          "the ledger would attest work was finished while it is still awaiting a grade"
+  fi
+  # Liveness for the negative above: prove this store recorded ANYTHING, so the
+  # "no task.done" assertion is not passing because the ledger is simply empty.
+  if [[ -n "$kinds" ]]; then
+    ok_t "funnel: the e2e store recorded rows at all (the negative above is not vacuous)"
+  else
+    bad_t "funnel: the e2e ledger is empty" "every assertion in this case is vacuous"
+  fi
+fi
+
 echo "-----"
 echo "ledger_unit: $PASS passed, $FAIL failed"
 (( FAIL == 0 ))

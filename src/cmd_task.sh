@@ -2445,12 +2445,14 @@ $_body"
   # anything a maker typed, and the ledger must stay safe to read at a lower
   # privilege than the board it describes.
   #
-  # A `done` that DELIVERS (maker→verifier handoff) is not a close, and recording
-  # it as one would make the ledger claim work was finished that is still waiting
-  # to be graded — the exact overstatement the verifier rail exists to prevent.
+  # A `done` that DELIVERS never gets here — it forks earlier into the handoff
+  # write, which emits task.delivered itself. What CAN arrive here carrying a
+  # handoff_ack is the verifier picking the review up, and that is `task.review`,
+  # a third state distinct from both delivered and done. Conflating it with
+  # either would put a claim in the ledger that the rail was built to refuse.
   local _lk="task.${newstatus}"
   [[ "$newstatus" == "in_progress" ]] && _lk="task.started"
-  [[ -n "$handoff_ack" ]] && _lk="task.delivered"
+  [[ -n "$handoff_ack" ]] && _lk="task.review"
   #
   # actor= is the BOARD identity (task_actor), not the OS user the default
   # resolver would supply. The smoke run that caught this had task.created say
@@ -2686,6 +2688,20 @@ _task_route_to_verifier() {
       WHERE id=${id};"
   local iter; iter=$(db "SELECT iteration FROM tasks WHERE id=${id};")
   local ident; ident=$(ident_of "$id")
+  # INST-4: the maker→verifier DELIVERY.
+  #
+  # Emitted here and not from _task_status_cmd, because a `task done` that
+  # delivers never reaches _task_status_cmd — it forks earlier, into this
+  # handoff write. The first cut of this change assumed one funnel and shipped a
+  # ledger with no delivered event at all; the e2e caught it because the row was
+  # simply absent, which is the one shape a ledger cannot self-report.
+  #
+  # The distinction is load-bearing, not cosmetic: a delivery is NOT a close. A
+  # ledger that recorded it as `task.done` would attest that work was finished
+  # while it is still waiting to be graded — the precise overstatement the
+  # verifier rail exists to prevent, asserted by our own evidence base.
+  ledger_emit task.delivered ident="$ident" task_id="$id" actor="$(task_actor "")" \
+    out="${result:-}" detail="delivered to verifier ${vfier} (iteration ${iter}; awaiting ACK)"
   ok "$ident ready for review — delivered to verifier '$vfier' (iteration $iter; awaiting ACK)" \
      '{id:($i|tonumber), ident:$id, status:"todo", routedTo:$v, role:"verifier", handoff:"delivered", acknowledged:false, iteration:($n|tonumber)}' \
      --arg i "$id" --arg id "$ident" --arg v "$vfier" --arg n "$iter"
