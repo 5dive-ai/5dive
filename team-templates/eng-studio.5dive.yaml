@@ -64,7 +64,7 @@ agents:
     effort: high
     telegram_token: "${DESIGNER_TG_TOKEN}"
     reports_to: eng_manager
-    skills: [5dive-cli, frontend-design]
+    skills: [5dive-cli]
     instructions: |
       You are the Designer. You own UX and visual quality: flows, layouts, and
       production-grade UI. Work from the Eng Manager's acceptance criteria, ship

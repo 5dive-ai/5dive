@@ -82,7 +82,7 @@ agents:
     effort: medium
     telegram_token: "${CREATIVE_TG_TOKEN}"
     reports_to: cmo
-    skills: [5dive-cli, frontend-design]
+    skills: [5dive-cli]
     instructions: |
       You are Creative. You produce visual and written assets for campaigns the CMO
       directs: landing sections, ad creative, post art. Match the brand voice; ship
