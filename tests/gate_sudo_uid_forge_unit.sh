@@ -91,6 +91,15 @@ id() {
     *)   command id "$@" ;;
   esac
 }
+# DIVE-2330: the gate's identity resolver no longer reads `id` at all — `id -un` was
+# PATH-forgeable, which is the vulnerability that row closed. So the same REAL_UID /
+# REAL_UN pin now also has to drive the two seams the resolver DOES read. `id()` above
+# stays for `_gate_sudo_uid_nonagent`, which still uses `id -u` and is untouched here.
+_gate_caller_uid() { printf '%s' "${REAL_UID:-0}"; }
+_gate_passwd_stream() {
+  [[ -n "$REAL_UID" && -n "$REAL_UN" ]] && printf '%s:x:%s:%s::/home/%s:/bin/bash\n' "$REAL_UN" "$REAL_UID" "$REAL_UID" "$REAL_UN"
+  printf '%s\n' "$(</etc/passwd)"
+}
 
 seed_gate() {   # ident type
   db "INSERT INTO tasks (ident, title, status, created_by) VALUES ('$1','t','todo','main');"
