@@ -138,8 +138,21 @@ _actor_identity() {
 #   root        EUID 0 with no invoking user (cron, systemd, the privileged rails)
 #   sudo:<who>  EUID 0 reached by elevation from <who>
 #   self        unelevated — the agent acting as itself
+#
+# Goes through _audit_is_root, NOT a bare `[[ $EUID -eq 0 ]]`.
+#
+# $EUID is READONLY in bash, so a direct read makes the root and sudo: branches
+# unreachable from a unit harness — and the first cut of this function did read it
+# directly, which meant the only branch any test could ever observe was `self`.
+# Two of the three values this function exists to produce would have shipped
+# unexercised, on the column that carries the whole authority claim. Same defect
+# main hit in _gate_withdraw_actor on DIVE-2330 the same evening: a seam added so
+# a harness can model the caller, then bypassed by the guard that actually
+# decides. The comment eight lines above this one already says it — a check
+# nobody can exercise is a check nobody can trust — and the fix is to route
+# through the seam that exists rather than add a second one.
 _actor_authority() {
-  if [[ $EUID -eq 0 ]]; then
+  if _audit_is_root; then
     if [[ -n "${SUDO_USER:-}" ]]; then printf 'sudo:%s' "$SUDO_USER"; else printf 'root'; fi
   else
     printf 'self'

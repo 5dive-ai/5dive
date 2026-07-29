@@ -203,12 +203,65 @@ else
         "'they kept trying' would render as 'they tried once'"
 fi
 
-# Case 4c: authority is recorded and is not a constant. Unelevated -> 'self'.
+# Case 4c: authority, ALL THREE branches.
+#
+# The obvious version of this assertion — "authority is one of self|root|sudo:*" —
+# passes on whatever branch the runner happens to be on and grades nothing. On
+# this box that is always `self`, so the two values the column exists to
+# distinguish would ship unexercised. $EUID is READONLY in bash, so the root and
+# sudo: branches are reachable ONLY through the _audit_is_root seam; a
+# _actor_authority that reads $EUID directly cannot be tested here at all, which
+# is the point of routing it through the seam.
 auth=$(sqlite3 "$DB" "SELECT authority FROM lifecycle_events WHERE ident='TEST-1';" 2>/dev/null)
-if [[ "$auth" == "self" || "$auth" == root || "$auth" == sudo:* ]]; then
-  ok_t "authority: recorded as '$auth' (an elevation state, not a placeholder)"
+if [[ "$auth" == "self" ]]; then
+  ok_t "authority: unelevated caller recorded as 'self'"
 else
-  bad_t "authority: '$auth' is not one of self|root|sudo:<who>"
+  bad_t "authority: unelevated caller recorded as '$auth', expected 'self'"
+fi
+
+# root: elevated with NO invoking user (cron, systemd, the privileged rails).
+auth_root=$(
+  set +e
+  emit_env
+  _audit_is_root() { return 0; }
+  unset SUDO_USER
+  ledger_emit task.done ident=AUTH-ROOT task_id=91 actor=cron detail=x >/dev/null 2>&1
+  sqlite3 "$DB" "SELECT authority FROM lifecycle_events WHERE ident='AUTH-ROOT';" 2>/dev/null
+)
+if [[ "$auth_root" == "root" ]]; then
+  ok_t "authority: elevated with no invoking user recorded as 'root'"
+else
+  bad_t "authority: got '$auth_root', expected 'root'" \
+        "the root branch is unreachable — _actor_authority is not going through _audit_is_root"
+fi
+
+# sudo:<who>: elevated FROM someone. The branch that carries the whole point of
+# the column, since identity alone cannot distinguish it from 'self'.
+auth_sudo=$(
+  set +e
+  emit_env
+  _audit_is_root() { return 0; }
+  SUDO_USER=claude
+  ledger_emit task.done ident=AUTH-SUDO task_id=92 actor=dev detail=x >/dev/null 2>&1
+  sqlite3 "$DB" "SELECT authority FROM lifecycle_events WHERE ident='AUTH-SUDO';" 2>/dev/null
+)
+if [[ "$auth_sudo" == "sudo:claude" ]]; then
+  ok_t "authority: elevation from claude recorded as 'sudo:claude'"
+else
+  bad_t "authority: got '$auth_sudo', expected 'sudo:claude'" \
+        "the sudo: branch is unreachable, or SUDO_USER is not being read"
+fi
+
+# And the three are DISTINCT. Without this, a function that returned the same
+# constant for every branch would pass each arm above only if that constant
+# happened to match — but a function returning 'root' unconditionally would pass
+# the root arm and fail the others, whereas asserting distinctness states the
+# property the column actually needs.
+if [[ "$auth" != "$auth_root" && "$auth_root" != "$auth_sudo" && "$auth" != "$auth_sudo" ]]; then
+  ok_t "authority: the three branches produce three DISTINCT values"
+else
+  bad_t "authority: branches collapsed (self='$auth' root='$auth_root' sudo='$auth_sudo')" \
+        "a column that cannot distinguish elevation states records no authority"
 fi
 
 # Case 5: NEVER fails the caller, even when the store is unusable.
