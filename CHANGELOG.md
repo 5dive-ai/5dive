@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased — fix(task): pronoun options resolve to an account frame (DIVE-2212)
+
+Two parties can no longer select the same second-person gate option and receive
+only a confirmation whose actor silently changes with the reader. `task need`
+now warns when a decision option contains `you`/`your`-family wording and asks
+the filer to name accounts, while remaining backward-compatible with free text.
+
+When such an option is answered, the prose receipt names the filer and answerer
+and declares that second-person terms use the filer-addressing-answerer frame;
+JSON callers receive the same mapping in `option_account_frame` while retaining
+the raw `need_answer`. `tests/gate_option_account_frame_unit.sh` reproduces the
+dev3-to-main incident, checks prose and JSON receipts, and guards word boundaries.
+
 ## Unreleased — feat(task): displaced gates have a reader with an honest coverage boundary (DIVE-2133)
 
 `gate_history` stopped gate retirement from destroying the previous ask, answer and

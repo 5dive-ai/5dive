@@ -91,6 +91,7 @@ _task_usage() {
                                                      # --type=access: manager-clearable "grant me X" gate — routes to the org lead first (any tier), lead-clearable; add --probe='test -w /path' to self-check the block
   5dive task need <id|DIVE-N> --withdraw            # DIVE-1401: cancel a still-pending gate the team filed but that's now moot — filer or org lead, no human tap. NOT a grant (never records a secret/approval); genuine clears stay human-only.
     --ask: ONE crisp question + ~1 line essential context, recommendation up front. Heavy detail goes in the task BODY, not the ask.
+    --options: name accounts/actors, not "you/your". Pronoun-bearing choices warn at filing and their answer receipt renders the filer/answerer account frame.
     --discusses="<why>" (DIVE-2089, --type=decision ONLY): appeal a T2 floor that fired on SUBJECT MATTER. A design question that merely NAMES secrets/publishing/deletion performs none of them; declare that and the gate goes to your lead at tier 1 instead of the human. The declaration is recorded on the gate, shown to the reviewer, and audited — unlike rewording the ask, which reaches the same audience with no record of how. Refused, loudly, for money / customer comms / irreversible infra, for a pinned --tier=2, and when no lead sits above you.
     --needs=<capability> (DIVE-2241): DECLARE what this ask consumes. human_tap (a person's call: brand, strategy, irreversible), spend_authority (billing, paid accounts), secret_provision (a new token/credential) resolve to the paired human as CONSTANTS — the gate skips lead- AND verifier-routing and cannot be agent-cleared. Fixes: a gate on a verifier-loop task otherwise routes to whoever is GRADING the ticket, whatever it asks. Declared, never guessed from your wording; any other value is undeclared-equivalent and changes nothing (it never refuses).
     --recommend: your advised choice (strongly encouraged for decision/approval). Leads the alert as '✅ Recommended: <X>' and ⭐-marks its button. For a decision it must match one of --options.
@@ -4446,6 +4447,15 @@ _gate_shape_jaccard() {
     }'
 }
 
+# DIVE-2212: decision options are authored by the filer but read and selected by
+# the answerer. Second-person wording therefore has two natural frames on the
+# same bytes ("you" can be read as either side). Keep options free-form, but make
+# that risky shape observable at filing and render the concrete account frame on
+# answer. Boundaries deliberately exclude innocent substrings such as "youtube".
+_gate_option_has_second_person() {
+  LC_ALL=C grep -Eiq '(^|[^[:alnum:]_])(you|your|yours|yourself|yourselves)([^[:alnum:]_]|$)' <<<"${1:-}"
+}
+
 cmd_task_need() {
   tasks_db_init
   local type="" ask="" options="" recommend="" from="" tier="" secret_key="" connector="" probe="" withdraw="" discusses="" needs=""
@@ -5039,6 +5049,9 @@ cmd_task_need() {
   # `task answer` knows who to ping to resume. The inbox is defined by the gate
   # (need_type set), not by assignee, so it still surfaces to the human.
   local actor; actor=$(task_actor "$from")
+  if [[ "$type" == "decision" ]] && _gate_option_has_second_person "$options"; then
+    warn "--options contains second-person wording whose referent can invert between filer and answerer. Prefer account names (for example, main-runs-task-done|dev3-gets-a-credential). Filing continues; the answer receipt will name filer ${actor} and the concrete answerer (DIVE-2212)."
+  fi
   # DIVE-2196: filing a gate on a task DELIVERED to you IS an act of review — the
   # verifier demonstrably opened it and escalated. Stamp the handoff ACK in the same
   # transaction, so "reviewed it and escalated to a human" stops being byte-identical
@@ -7867,9 +7880,28 @@ cmd_task_answer() {
 
   local note=""
   [[ $pinged -eq 1 ]] && note=" + pinged $owner"
-  ok "$ident answered ($nt) — now ${newstatus}${note}" \
-     '{id:($i|tonumber), status:$st, need_type:$nt, provided:true, need_answer:(if $nt=="secret" then null else $v end), owner:(($o|select(length>0)) // null), pinged:($p=="1")}' \
-     --arg i "$id" --arg st "$newstatus" --arg nt "$nt" --arg v "$value" --arg o "$owner" --arg p "$pinged"
+  # DIVE-2212: do not make the answerer re-read the ambiguous option as the only
+  # confirmation. Name both accounts and declare the authored frame. The raw
+  # value remains in the structured need_answer field for compatibility, but the
+  # human receipt does not merely echo it back and leave both readings intact.
+  local _account_frame=0 _frame_filer="" _frame_answerer="" _frame_note=""
+  if [[ "$nt" == "decision" ]] && _gate_option_has_second_person "$value"; then
+    _account_frame=1
+    _frame_filer=$(db "SELECT COALESCE(NULLIF(gate_filed_by,''), NULLIF(assignee,''), NULLIF(created_by,''), 'unknown') FROM tasks WHERE id=${id};")
+    case "$answered_by" in
+      human:*)         _frame_answerer="${answered_by#human:}" ;;
+      lead:standing:*) _frame_answerer="${answered_by#lead:standing:}" ;;
+      lead:*)          _frame_answerer="${answered_by#lead:}" ;;
+      auto:*)          _frame_answerer="${answered_by#auto:}" ;;
+      *)               _frame_answerer="$answered_by" ;;
+    esac
+    [[ -n "$_frame_answerer" ]] || _frame_answerer="unknown"
+    _frame_note=" — account frame: filer=${_frame_filer}, answerer=${_frame_answerer}; second-person terms in the selected filer-authored option refer to ${_frame_answerer}"
+  fi
+  ok "$ident answered ($nt) — now ${newstatus}${note}${_frame_note}" \
+     '{id:($i|tonumber), status:$st, need_type:$nt, provided:true, need_answer:(if $nt=="secret" then null else $v end), owner:(($o|select(length>0)) // null), pinged:($p=="1"), option_account_frame:(if $af=="1" then {filer:$gf, answerer:$ga, second_person_refers_to:$ga} else null end)}' \
+     --arg i "$id" --arg st "$newstatus" --arg nt "$nt" --arg v "$value" --arg o "$owner" --arg p "$pinged" \
+     --arg af "$_account_frame" --arg gf "$_frame_filer" --arg ga "$_frame_answerer"
 }
 
 # cmd_task_escalate — DIVE-449: the /task_<id> Telegram "Escalate" button (and a
