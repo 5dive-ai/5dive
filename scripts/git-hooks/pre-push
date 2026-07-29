@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Fleet-wide pre-push guards: PII (DIVE-1797, enforcement follow-up to
-# DIVE-1774) and release version-bump (DIVE-2065).
+# DIVE-1774), release version-bump (DIVE-2065), and new-harness tree-naming
+# (DIVE-2286).
 #
 # WHY a local hook and not GitHub branch protection: our landing account is the
 # repo admin, so a required status check only gates EXTERNAL PRs, never our own
@@ -25,11 +26,23 @@
 # up the follow-up fix. Fixed after the fact by renumbering the follow-up to
 # 0.16.4 (CHANGELOG); this guard stops the next one from landing at all.
 #
+# WHAT the harness-tree guard does (DIVE-2286): for each tests/*.sh file ADDED
+# by the push, requires a line sourcing tests/lib/grading_tree.sh (the
+# DIVE-2211 corpus invariant -- see tests/names_the_tree_contract_unit.sh,
+# this guard's whole-corpus CI twin). Measured cost of skipping this locally:
+# four harnesses across three authors in one day, each caught only after a
+# full CI round trip (~27 min on gh#290). Only fires on ADDED files; a
+# harness that later removes the line stays CI-only, which the contract test
+# already owns.
+#
 # DESIGN NOTES:
-#   - Calls scripts/pii-scan.sh and scripts/version-bump-guard.sh DIRECTLY. No
-#     forked scan logic here, so neither can drift from its CI/README twin
-#     (DIVE-1797 requirement c; scripts/version-uniqueness-scan.sh is the
-#     version-bump guard's own CI-side twin, see bundle-drift.yml).
+#   - Calls scripts/pii-scan.sh, scripts/version-bump-guard.sh and
+#     scripts/harness-tree-guard.sh DIRECTLY. No forked scan logic here, so
+#     none can drift from its CI/README twin (DIVE-1797 requirement c;
+#     scripts/version-uniqueness-scan.sh is the version-bump guard's own
+#     CI-side twin, see bundle-drift.yml; tests/names_the_tree_contract_unit.sh
+#     is the harness-tree guard's, over the whole corpus rather than just the
+#     push's added files).
 #   - Installed fleet-wide via core.hooksPath=scripts/git-hooks, set once on the
 #     shared clone config so every linked worktree (and every future one)
 #     inherits it. See scripts/install-pii-push-guard.sh.
@@ -42,6 +55,7 @@ set -uo pipefail
 TOP="$(git rev-parse --show-toplevel 2>/dev/null)" || exit 0
 SCAN="$TOP/scripts/pii-scan.sh"
 VERSION_GUARD="$TOP/scripts/version-bump-guard.sh"
+HARNESS_TREE_GUARD="$TOP/scripts/harness-tree-guard.sh"
 EMPTY_TREE=4b825dc642cb6eb9a060e54bf8d69288fbee4904
 Z40=0000000000000000000000000000000000000000
 
@@ -92,6 +106,14 @@ while read -r local_ref local_oid remote_ref remote_oid; do
     printf '%s\n' "$added" | bash "$SCAN" >/dev/null || rc=1
   fi
 
+  # DIVE-2286: fires on every ref (new harnesses can land on any branch, not
+  # just main), scoped to files THIS push adds.
+  if [[ -f "$HARNESS_TREE_GUARD" ]]; then
+    bash "$HARNESS_TREE_GUARD" "$local_oid" "$base" || rc=1
+  else
+    echo "harness-tree-guard: script not found ($HARNESS_TREE_GUARD); skipping (the CI contract test is the net)." >&2
+  fi
+
   # DIVE-2065: only fires on a push to main with an EXISTING remote main
   # (skip branch deletion, already `continue`d above; skip first-ever-push of
   # a new branch — main always already exists so $remote_oid is never Z40 for
@@ -110,6 +132,7 @@ if [[ $rc -ne 0 ]]; then
   echo "pre-push: BLOCKED — see the specific guard message(s) above." >&2
   echo "  pii-push-guard: scrub the real id/email/phone (use placeholders like <user-id>, 1234567890) and re-commit." >&2
   echo "  version-bump-guard: bump FIVE_VERSION in src/header.sh, rebuild with ./build.sh, and recommit." >&2
+  echo "  harness-tree-guard: paste the printed source-line snippet into the named harness and recommit." >&2
   echo "  Emergency override (discouraged; the matching CI job is still the net): git push --no-verify" >&2
   exit 1
 fi

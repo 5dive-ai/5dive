@@ -31,6 +31,12 @@ cd "$(dirname "$0")/.."
 . "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh" \
   || printf 'grading tree: UNRESOLVED (tests/lib/grading_tree.sh not reachable; no tree named)\n' >&2
 
+# DIVE-2286: the detection regex below is shared with the push-time guard
+# (scripts/harness-tree-guard.sh) via this one file, so the two cannot drift
+# into checking two different things under the same name.
+# shellcheck source=lib/grading_tree_source_re.sh
+. "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree_source_re.sh"
+
 PASS=0; FAIL=0
 ok()  { PASS=$((PASS+1)); printf 'ok   - %s\n' "$1"; }
 nok() { FAIL=$((FAIL+1)); printf 'FAIL - %s\n' "$1"; }
@@ -66,7 +72,7 @@ MISSING=(); PRESENT=()
 for t in "${CORPUS[@]}"; do
   # The source line, whatever spelling: what matters is that this harness pulls
   # in the helper, so its log cannot be silent about which tree it graded.
-  if grep -qE '(^|[[:space:]])(\.|source)[[:space:]].*lib/grading_tree\.sh' "$t"; then
+  if grep -qE "$GRADING_TREE_SOURCE_RE" "$t"; then
     PRESENT+=("$t")
     continue
   fi
