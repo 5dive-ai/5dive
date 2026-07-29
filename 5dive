@@ -16987,6 +16987,7 @@ timeout 180 npx -y skills add "https://github.com/$SOURCE" --skill "$SKILL" --ag
 # best-effort over the network; an empty sha never fails the install. Absolute
 # tool paths so this doesn't depend on what nvm put on PATH.
 RESOLVED_SHA=$(timeout 20 /usr/bin/git ls-remote "https://github.com/$SOURCE.git" HEAD 2>/dev/null | cut -f1 || echo "")
+# >>> DIVE-2282 skill manifest block (extracted verbatim by tests/skill_manifest_unit.sh)
 MANIFEST="$HOME/$INSTALL_DIR/.skills-manifest.json"
 if ! /usr/bin/jq -e . "$MANIFEST" >/dev/null 2>&1; then echo '{}' > "$MANIFEST" 2>/dev/null || true; fi
 PREV_SHA=$(/usr/bin/jq -r --arg k "$SKILL" '.[$k].content_sha256 // ""' "$MANIFEST" 2>/dev/null || echo "")
@@ -17007,6 +17008,7 @@ fi
   --arg p "$PREV_SHA" --argjson ch "$CHANGED" \
   '{source:$s, resolved_sha:$r, content_sha256:$c, previous_content_sha256:$p, changed:$ch}' \
   > "$RESULT_FILE" 2>/dev/null || true
+# <<< DIVE-2282 skill manifest block
 SKILL_ADD
     then
       rm -f "$result_file"
