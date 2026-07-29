@@ -2105,7 +2105,7 @@ _task_status_cmd() {
         # a squash rewrites the sha, so the branch tip is NOT an ancestor of main even
         # though the content is in. Attribution finds it anyway, because the squash
         # commit subject carries the ident.
-        local _slug _bmerged="" _searched="" _attr_slug="" _anc="" _attr="" _anc_novac="" _attr_bound="" _attr_walked="" _attr_unreach=""
+        local _slug _bmerged="" _searched="" _attr_slug="" _anc="" _attr="" _anc_novac="" _attr_bound="" _attr_unreach=""
         while IFS= read -r _slug; do
           [[ -n "$_slug" ]] || continue
           _searched="${_searched:+$_searched, }$_slug"
@@ -2117,10 +2117,11 @@ _task_status_cmd() {
           # guarded — an empty branch contributes no such commit.
           _attr=$(_gate_branch_ident_on_main "$_slug" "$_branch" "$_ghtok" "$ident")
           if [[ "$_attr" == "1" ]]; then _attr_slug="$_slug"; break; fi
-          # bound:<walked> — carry the MEASURED count into the refusal. The number in
-          # that message is the one thing a reader acts on, so it must be what the scan
-          # actually walked and not what it was configured to want.
-          [[ "$_attr" == bound:* ]] && { _attr_bound="$_slug"; _attr_walked="${_attr#bound:}"; }
+          # bound:<walked> — carry every bound-hit repo and ITS OWN measured count into
+          # the refusal. DIVE-2266: overwriting this on each pass named only the last
+          # member of a set search, and a detached count cannot describe multiple repos.
+          [[ "$_attr" == bound:* ]] \
+            && _attr_bound="${_attr_bound:+$_attr_bound, }$_slug:${_attr#bound:} COMMITS WALKED"
           # Ancestry is kept ONLY to name the vacuous shape in the refusal; it can no longer
           # accept anything by itself (that was the DIVE-2101 bug).
           _anc=$(_gate_branch_ancestry "$_slug" "$_branch" "$_ghtok")
@@ -2155,8 +2156,10 @@ _task_status_cmd() {
           # DIVE-2120: the scan stopped AT THE BOUND without finding the ident. That is NOT
           # a miss and must not read as one — a bounded search whose negative looks like an
           # exhaustive one asserts something it never measured. Own slug, so the durable
-          # record says which of the two actually happened.
-          policy_refuse "$E_CONFLICT" done-ident-not-found-within-scan-bound DIVE-2120 "$ident" "$ident cannot close: NOT FOUND IN THE $_attr_walked COMMITS WALKED on ${FIVE_GATE_MAIN_BRANCH:-main} in $_attr_bound — the scan stopped at its bound with main's history NOT exhausted, so this is INCONCLUSIVE, not a finding that the work is absent. TWO explanations survive and this scan cannot separate them: (a) the delivery landed more than $_attr_walked commits ago, or (b) nothing on main ever named $ident in a commit SUBJECT — which is what an EMPTY branch looks like, and a delivery whose subject omits the ident looks the same. For (a) raise the bound and retry (FIVE_GATE_ANCESTRY_SCAN=<n>, paginated since DIVE-2120, so n>100 really does walk n). For (b) land a commit whose SUBJECT names $ident (`5dive push $ident`) or bind the branch that carries it. A merged PR for '$_branch' also satisfies the gate."
+          # record names the whole set that hit a bound, with each repo's own count.
+          # DIVE-2266: a repo outside the searched set is a third live explanation; a
+          # larger bound cannot find it, so give the binding remedies that can terminate.
+          policy_refuse "$E_CONFLICT" done-ident-not-found-within-scan-bound DIVE-2120 "$ident" "$ident cannot close: NOT FOUND WITHIN THE COMMIT SCAN BOUNDS on ${FIVE_GATE_MAIN_BRANCH:-main} in $_attr_bound (repo:commits-walked) — every named repo stopped at its own bound with main's history NOT exhausted, so this is INCONCLUSIVE, not a finding that the work is absent. THREE explanations survive and this scan cannot separate them: (a) the delivery landed before the scanned window in one of those repos, (b) nothing on main ever named $ident in a commit SUBJECT — which is what an EMPTY branch looks like, and a delivery whose subject omits the ident looks the same, or (c) the branch lives in a repo that was NEVER SCANNED. For (a) raise the bound and retry (FIVE_GATE_ANCESTRY_SCAN=<n>, paginated since DIVE-2120, so n>100 really does walk n). For (b) land a commit whose SUBJECT names $ident (\`5dive push $ident\`) or bind the branch that carries it. For (c) add a \`Repo: <owner/repo>\` line to the task body or bind the full delivery_ref (\`task deliver $ident --pr=https://github.com/<owner>/<repo>/pull/N\`). A merged PR for '$_branch' also satisfies the gate."
         elif [[ -n "$_anc_novac" && -z "$_bmerged" ]]; then
           # The vacuous shape, named as itself: an ancestor tip carrying nothing
           # attributable is exactly what an EMPTY branch looks like, and a generic
