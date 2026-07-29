@@ -38,8 +38,13 @@ no(){ F=$((F+1)); echo "FAIL - $1"; [ -n "${2:-}" ] && echo "   $2"; }
 mk() { local d="$TMP/$RANDOM$RANDOM"; mkdir -p "$d/src"; git -C "$d" init -q -b main
   git -C "$d" config user.email t@t; git -C "$d" config user.name t
   printf 'readonly FIVE_VERSION="%s"\n' "$1" > "$d/src/header.sh"; printf '%s  5dive\n' "$2" > "$d/5dive.sha256"
+  # DIVE-2091: version-assign keys on "did src/ or build.sh change" now — the
+  # committed 5dive.sha256 is generated at tag time and absent from commits. The
+  # sha params keep their MEANING ("a different build") via the real signal.
+  printf '%s\n' "$2" > "$d/src/body.sh"
   git -C "$d" add -A; git -C "$d" commit -qm base
   printf 'readonly FIVE_VERSION="%s"\n' "$3" > "$d/src/header.sh"; printf '%s  5dive\n' "$4" > "$d/5dive.sha256"
+  printf '%s\n' "$4" > "$d/src/body.sh"
   # ALWAYS make the second commit non-empty: case C deliberately leaves version and
   # bundle identical, and an empty commit fails, which made mk() return git's error
   # text as the fixture path and reported a SCRIPT failure for a HARNESS bug.
@@ -67,7 +72,7 @@ grep -q 'no assignment needed' <<<"$out" && grep -q '0.16.20 was assigned at' <<
 
 # C: bundle unchanged (workflow/doc-only push) -> exempt.
 d=$(mk 0.16.19 aaa 0.16.19 aaa); out=$(run "$d")
-grep -q 'bundle is unchanged' <<<"$out" && ok "C doc-only push is exempt" || no "C" "$out"
+grep -q 'src/ and build.sh are unchanged' <<<"$out" && ok "C doc-only push is exempt" || no "C" "$out"
 
 # D: NON-SEMVER must refuse to guess, not invent a successor.
 d=$(mk 0.16.19 aaa 0.16.19-rc1 bbb); out=$(run "$d")
@@ -111,7 +116,13 @@ SNAP="$TMP/version-assign.snapshot.sh"; cp "$S" "$SNAP"
 # destroyed the operator's work, which turns "stash first" into "the harness says I do
 # not need to". So this arm now REFUSES to run when a probe file is dirty, F0 grades
 # that refusal, and the README sentinel says out loud what it does and does not cover.
-PROBE_FILES=(src/cmd_task.sh src/header.sh 5dive 5dive.sha256)
+# DIVE-2091: 5dive and 5dive.sha256 are gitignored and untracked now, so naming
+# them in a path-limited `git commit --` aborts the whole commit and nothing lands
+# — which reads as "src unchanged" rather than as a harness error. Same removal as
+# scripts/version-assign-push-loop.sh's `git add`. This ALSO makes the -uno below
+# load-bearing rather than merely careful: the bundle is now permanently untracked,
+# so a guard that counted untracked paths would refuse every run forever.
+PROBE_FILES=(src/cmd_task.sh src/header.sh)
 
 # One dirty PROBE_FILE per line, staged or worktree. -uno on purpose: an UNTRACKED
 # path is not in HEAD and so cannot be destroyed by a restore from HEAD, and refusing
@@ -197,6 +208,23 @@ else
   git -C "$REPO" checkout -q - 2>/dev/null; git -C "$REPO" branch -qD "$B" 2>/dev/null
   [[ "$(grep -m1 -oE 'FIVE_VERSION="[^"]+"' "$REPO/src/header.sh")" == "$v0" ]] \
     && ok "F the probe left the working tree at its original version" || no "F cleanup" "tree not restored"
+  # DIVE-2091 + DIVE-2322: REBUILD, because the restore no longer reaches the bundle.
+  # Before #253, 5dive/5dive.sha256 were IN PROBE_FILES, so the restore above reverted
+  # the probe's rebuild for free. Untracked, they are outside every path list here: the
+  # arm bumps the header, rebuilds, then restores src/ — and walks away leaving a bundle
+  # built from a version that no longer exists in src. Gitignored, so it cannot be
+  # committed (that half is genuinely closed), but anything reading ./5dive after the
+  # suite reads a bundle that does not match ./src. That is the DIVE-2322 shape exactly:
+  # an arm leaving a tree that looks fine. One rebuild closes it; the assertion below
+  # keeps the rebuild from silently becoming a no-op.
+  ( cd "$REPO" && ./build.sh >/dev/null 2>&1 )
+  if [[ -f "$REPO/5dive" ]]; then
+    grep -q "FIVE_VERSION=\"$cur\"" "$REPO/5dive" \
+      && ok "F the untracked bundle was rebuilt back to $cur — no stale bundle left behind (DIVE-2091)" \
+      || no "F rebuild" "./5dive still embeds a version other than the restored $cur — a stale bundle survived the arm"
+  else
+    no "F rebuild" "./build.sh produced no 5dive — cannot show the arm left a consistent tree (this is NOT a pass)"
+  fi
   # SCOPE, not safety. This grades the probe set's OUTER edge only — that no `commit -a`
   # and no `reset --hard` crept back in. It says NOTHING about edits to PROBE_FILES
   # themselves, which the restore still discards; that is the refusal's job above and
@@ -239,7 +267,8 @@ mkapply() { # $1 = honest|badsha
     fi
   } > "$d/build.sh"; chmod +x "$d/build.sh"
   git -C "$d" add -A; git -C "$d" commit -qm base
-  printf 'bbb  5dive\n' > "$d/5dive.sha256"   # bundle moved, version did not
+  printf 'bbb  5dive\n' > "$d/5dive.sha256"
+  printf 'bbb\n' > "$d/src/body.sh"   # DIVE-2091: src moved, version did not
   git -C "$d" add -A; git -C "$d" commit -qm new
   printf '%s' "$d"; }
 
