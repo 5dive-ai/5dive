@@ -3871,6 +3871,127 @@ registry_write() {
 TASKS_DIR="${TASKS_DIR:-${STATE_DIR}/tasks}"
 TASKS_DB="${TASKS_DB:-${TASKS_DIR}/tasks.db}"
 
+# -------- DIVE-2249: the STORE FENCE on the prod task board --------
+#
+# The production board may only be WRITTEN by a process that entered through the
+# real CLI entrypoint. A sourced-library caller aiming a write at the prod path is
+# refused, loudly, before sqlite sees it.
+#
+# WHY. On 2026-07-27 18:10:58 a run of tests/gate_verifier_route_unit.sh appended
+# six fixture rows (DIVE-501..506, created_by=dev) to the LIVE board. They were not
+# inert: `5dive trace DIVE-503` shows two real gate deliveries and a human-facing
+# gate that agent-main then had to withdraw by hand. Reproduced under DIVE-2249 in
+# a private mount namespace with /var/lib/5dive bound onto a decoy copy — with the
+# harness's single STATE_DIR line removed, the same six idents land with the same
+# created_by/verifier/maker_agent values, and NOTHING refuses them.
+#
+# This is the FOURTH instance of one class. The gate-notify send (DIVE-1500), the
+# human DM relay (DIVE-1506) and audit_log (DIVE-2010) were each fenced in turn,
+# and all three are OUTBOUND rails. The tasks table is the store those rails read
+# FROM, so it is the one that most needed a fence and the only one that had none.
+#
+# WHY ENTRYPOINT, and not an env var. Every legitimate prod write comes from the
+# built bundle, whose last line is `main "$@"`; build.sh is the only non-test file
+# in the repo that sources this library. A caller that sourced src/lib/*.sh and
+# then aimed a write at the prod path is therefore a mistake BY CONSTRUCTION —
+# there is no correct caller with that shape — which is what makes this structural
+# rather than a rule every harness has to remember. Deliberately NOT an opt-out
+# marker a harness sets: a forgotten opt-out fails silently INTO prod, which is the
+# exact defect being removed here, and DIVE-1968/DIVE-2010 already record that
+# reasoning ("do not fix an opt-out failure with a different opt-in"). A harness
+# that sets nothing is fenced, including harnesses nobody has written yet.
+#
+# SCOPE, stated plainly: this fences the shell library's writers (db, dbfmt,
+# tasks_db_init). It does NOT fence a process that opens the .db file with its own
+# sqlite3/node client — the dashboard API reads the board that way. Closing that
+# needs file-level perms, not a function guard, and is out of scope here.
+_TASKS_STORE_ENTRY="${_TASKS_STORE_ENTRY:-}"
+
+# Is the ACTIVE store the production board?
+#
+# DELIBERATELY NOT keyed on FIVEDIVE_PROD_TASKS_DB, even though that is the
+# existing "which store is prod" knob (DIVE-1506). 23 harnesses already export it
+# pointing at their OWN throwaway store — that is how they get the human-send
+# allowlist to let their gate-delivery assertions run — so a fence that read it
+# would fence 23 correctly-isolated suites and fence NOTHING on the real board.
+# Measured, not predicted: a full-suite run under a bind-mounted decoy fired this
+# fence in 5 suites before the sweep was stopped, all of them properly isolated.
+# One name cannot carry two opposite consequences.
+#
+# So the prod path is HARDCODED and unconditional: no environment can remove it.
+# FIVEDIVE_FENCE_EXTRA_STORE only ADDS a path to the fenced set (the fence's own
+# unit test designates its decoy that way), so the escape hatch cannot become an
+# escape — the worst a caller can do with it is fence themselves.
+#
+# readlink -f prints nothing when a path's PARENT does not exist, so an empty
+# result falls back to the literal path rather than comparing "" == "" and
+# fencing every caller (readlink's three unresolvable states — only one is empty).
+_tasks_store_is_prod() {
+  local active ra p rp
+  active="${TASKS_DB:-${STATE_DIR:-/var/lib/5dive}/tasks/tasks.db}"
+  ra="$(readlink -f "$active" 2>/dev/null)"; [[ -n "$ra" ]] || ra="$active"
+  for p in /var/lib/5dive/tasks/tasks.db "${FIVEDIVE_FENCE_EXTRA_STORE:-}"; do
+    [[ -n "$p" ]] || continue
+    rp="$(readlink -f "$p" 2>/dev/null)"; [[ -n "$rp" ]] || rp="$p"
+    [[ "$ra" == "$rp" ]] && return 0
+  done
+  return 1
+}
+
+# Is this SQL a pure READ? A POSITIVE ALLOWLIST — everything it does not
+# recognise counts as a write.
+#
+# The obvious shape is the other one: list the mutating verbs and refuse those.
+# This repo has already paid for that shape — DIVE-1506 records that a blocklist
+# "is exactly how DIVE-1500's guard missed the gate-notify + /inbox legs". A verb
+# list rots the same way, and it did here under test: the blocklist draft of this
+# function caught a CTE-prefixed `WITH … INSERT` but let `ATTACH DATABASE`
+# through unfenced. Inverting it makes the failure mode a refused READ (loud,
+# immediate, harmless) rather than an admitted WRITE (silent, and the thing being
+# fixed).
+#
+# Word-anchored on both sides so `created_by` / `deleted_at` in a SELECT are not
+# read as CREATE / DELETE. The second test is what catches the CTE case: a
+# statement may OPEN like a read and still mutate further in.
+#
+# This runs ONLY in the already-broken case (prod path + no entrypoint) —
+# production short-circuits on the marker before reaching here — so a false
+# positive costs a legitimate sourced reader one clear error message, and a false
+# negative costs us the incident again.
+_tasks_sql_is_read() {
+  local sql="${1:-}" rc=1
+  shopt -s nocasematch
+  if [[ "$sql" =~ ^[[:space:]]*(--[^$'\n']*$'\n'[[:space:]]*)*(SELECT|WITH|EXPLAIN|PRAGMA[[:space:]]+(table_info|table_xinfo|foreign_key_list|index_list|database_list)|ANALYZE)([[:space:]]|\(|$) ]]; then
+    [[ "$sql" =~ (^|[[:space:];\(,])(INSERT|UPDATE|DELETE|REPLACE|DROP|ALTER|CREATE|TRUNCATE|VACUUM|ATTACH|DETACH|REINDEX)([[:space:]]|\() ]] || rc=0
+  fi
+  shopt -u nocasematch
+  return $rc
+}
+
+# The fence itself. Ordered cheapest-first: the entrypoint marker short-circuits
+# every production call before any path resolution or regex runs.
+_tasks_store_fence() { # <sql>
+  [[ -n "${_TASKS_STORE_ENTRY:-}" ]] && return 0
+  _tasks_store_is_prod || return 0
+  _tasks_sql_is_read "${1:-}" && return 0
+  local msg="refusing a non-READ statement against the production task board from a sourced-library caller (DIVE-2249).
+  store: ${TASKS_DB:-<unset>}
+  This process sourced src/lib/*.sh directly instead of entering through the 5dive
+  CLI, so a write here would append real-looking rows to the live board — the
+  DIVE-501..506 fixture leak. If this is a test: set STATE_DIR (and TASKS_DIR/
+  TASKS_DB) to a throwaway dir BEFORE the first store call. If you are genuinely
+  driving prod, invoke the 5dive binary rather than sourcing its libraries."
+  # `fail` comes from lib/output.sh, which build.sh and every harness source
+  # before this file — but never assume it, or the fence dies silently in the one
+  # context that skipped it.
+  if declare -F fail >/dev/null 2>&1; then
+    fail "${E_PERMISSION:-13}" "$msg"
+  else
+    printf 'error: %s\n' "$msg" >&2
+    exit "${E_PERMISSION:-13}"
+  fi
+}
+
 # Quote an arbitrary string as a SQL literal: double embedded single quotes
 # and wrap. The sqlite3 CLI has no ergonomic bind-parameter path from bash,
 # so this is the safe way to inline a shell value — use it for EVERY
@@ -4582,6 +4703,10 @@ _tasks_board_recover() {
 # one-time bootstrap hint instead of a cryptic failure.
 tasks_db_init() {
   require_sqlite
+  # DIVE-2249: init is a write path in its own right (schema apply + additive
+  # migrations go straight to sqlite3, not through db()), so fence it here rather
+  # than at each of those call sites.
+  _tasks_store_fence "CREATE TABLE"
   umask 0002
   if [[ ! -d "$TASKS_DIR" ]]; then
     if [[ $EUID -eq 0 ]]; then
@@ -5072,6 +5197,7 @@ MIG
 # foreign_keys=ON enables the ON DELETE cascades.
 db() {
   umask 0002
+  _tasks_store_fence "$1"   # DIVE-2249
   sqlite3 -cmd ".timeout 5000" -cmd "PRAGMA foreign_keys=ON" "$TASKS_DB" "$1"
 }
 
@@ -5090,6 +5216,7 @@ _task_pref_set() {
 # Formatted read: dbfmt <sqlite-flag> "<sql>"  (e.g. -box, -json, -line).
 dbfmt() {
   umask 0002
+  _tasks_store_fence "${2:-}"   # DIVE-2249 — named a read, but nothing stops a write being handed to it
   # DIVE-1610: on the -json path, drop null-valued keys before the JSON reaches
   # agent context. sqlite3 -json emits every selected column including the ~70%
   # that are null on a typical task row (41/58 on `task show --json`), and that
@@ -49982,6 +50109,14 @@ USAGE
 }
 
 main() {
+  # DIVE-2249: mark that this process entered through the real CLI entrypoint.
+  # The tasks-store fence (src/lib/tasks_db.sh) allows writes to the PRODUCTION
+  # board only from here — a harness that sources the libraries directly never
+  # runs main, so its writes are refused instead of appending real-looking fixture
+  # rows to the live board. Keep this the FIRST statement in main: anything above
+  # it that touched the store would be fenced against its own entrypoint.
+  _TASKS_STORE_ENTRY=cli
+
   # Global --json: strip every occurrence before dispatch so each subcommand
   # gets the same arg shape regardless of where the flag was placed.
   local -a rest=()
