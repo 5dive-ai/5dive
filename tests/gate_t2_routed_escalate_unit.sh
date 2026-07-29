@@ -78,6 +78,37 @@ tierof()     { db "SELECT COALESCE(tier,'') FROM tasks WHERE ident='$1';"; }
 export SUDO_UID=1234   # an agent-ish uid: not the non-agent (root/claude) evidence form
 touch "$GATE_PROOF_ENFORCE"   # enforcement ON (the floor + escalation are live)
 
+# --- CALLER-IDENTITY PIN (DIVE-2365) ---------------------------------------------------
+# The export above is INERT here. `_gate_sudo_uid_nonagent` reads SUDO_UID only in its
+# root branch (DIVE-1413); unprivileged it reads `id -u` — whoever ran the suite. That is
+# `agent-*` on a 5dive box and `runner` in CI, so E3b's "from an agent" was supplied by
+# the host rather than by this file, and on the runner the forge CLEARED instead. Pin it:
+# seam `_gate_is_root`, stub the passwd lookup for the pinned uid only, leave the
+# resolver's own root-branch / unknown-uid / `agent-*` logic real. Full write-up lives at
+# the top of tests/gate_t2_nonce_proof_unit.sh.
+AGENT_UID=1234
+agent_caller_on() {
+  _gate_is_root() { return 0; }
+  getent() {
+    if [[ "${1:-}" == passwd && "${2:-}" == "$AGENT_UID" ]]; then
+      printf 'agent-fixture:x:%s:%s::/home/agent-fixture:/bin/bash\n' "$AGENT_UID" "$AGENT_UID"
+      return 0
+    fi
+    command getent "$@"
+  }
+  export SUDO_UID="$AGENT_UID"
+}
+assert_agent_caller() { # <label>
+  if _gate_sudo_uid_nonagent; then
+    bad_t "$1 precond: caller pinned as an AGENT" \
+      "the real resolver still reports NON-AGENT human evidence — the arm below would grade \
+the opposite behaviour and report ok (DIVE-2365)"
+  else
+    ok_t "$1 precond: the pinned caller reads as an AGENT to the real resolver"
+  fi
+}
+agent_caller_on
+
 # --- E1: THE FIX — a ROUTED tier-2 manual gate, answered by its lead, ESCALATES to the
 #     human instead of dead-ending: routed_reviewer cleared, ping re-armed, fresh nonce
 #     minted, human ping fired, and the gate stays OPEN (awaiting the human tap). -------
@@ -159,6 +190,7 @@ seed_task DIVE-305
 cmd_task_need DIVE-305 --type=manual --ask="run the physical box swap" >/dev/null 2>&1
 route_to DIVE-305 marcus
 _nf_reset
+assert_agent_caller E3b
 out=$(cmd_task_answer DIVE-305 --value=approved --human 2>&1); rc=$?
 [[ $rc -ne 0 && "$(answered DIVE-305)" == "open" ]] \
   && ok_t "E3b bare --human from an agent (the DIVE-2131 forge) is REFUSED on the same gate" \

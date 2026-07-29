@@ -121,6 +121,55 @@ setrev()    { db "UPDATE tasks SET routed_reviewer=$(sqlq "$2") WHERE ident='$1'
 export SUDO_UID=1234          # agent-ish uid: NOT the non-agent human-evidence form
 touch "$GATE_PROOF_ENFORCE"   # enforcement ON — the human-only floor is live
 
+# ======================================================================================
+# CALLER-IDENTITY PIN (DIVE-2365). The `export SUDO_UID` above is INERT, and every forge
+# arm in this file depends on it.
+#
+# `_gate_sudo_uid_nonagent` reads SUDO_UID **only** in its root branch (DIVE-1413).
+# Unprivileged — which is how this suite runs — it reads `id -u`: whoever launched the
+# harness. On a 5dive box that is an `agent-*` user, so the arms below were handed their
+# "the caller is an agent" precondition by the HOST, for free, and nobody noticed it was
+# never established here. GitHub's runner is `runner`, a name that does not start with
+# `agent-`, so the real resolver correctly reported non-agent human evidence, the forge
+# CLEARED, and S13/S17 (and E3b next door) failed — with S14 falling over behind S13
+# because its gate had already been closed by the answer S13 was supposed to refuse.
+#
+# The inversion is the dangerous half: the identical harness on a box where the caller is
+# non-agent grades the OPPOSITE behaviour and still prints `ok`. So the precondition is
+# pinned here and ASSERTED at each site, never inherited.
+#
+# `_gate_is_root` is the DIVE-1401 seam (S15 uses the same one). The passwd LOOKUP is
+# stubbed for the pinned uid alone; anything else falls through to the real getent. The
+# resolver itself is NOT stubbed — the root branch, the unknown-uid refusal and the
+# `agent-*` prefix test all still run, against a name this file controls rather than one
+# the host happens to supply.
+# ======================================================================================
+AGENT_UID=1234
+agent_caller_on() {
+  _gate_is_root() { return 0; }
+  getent() {
+    if [[ "${1:-}" == passwd && "${2:-}" == "$AGENT_UID" ]]; then
+      printf 'agent-fixture:x:%s:%s::/home/agent-fixture:/bin/bash\n' "$AGENT_UID" "$AGENT_UID"
+      return 0
+    fi
+    command getent "$@"
+  }
+  export SUDO_UID="$AGENT_UID"
+}
+agent_caller_off() { unset -f getent; _gate_is_root() { [[ $EUID -eq 0 ]]; }; }
+# The anchor. Reads the REAL resolver and refuses to let a forge arm run under a caller
+# it would treat as human — that is the exact state in which the arm inverts silently.
+assert_agent_caller() { # <label>
+  if _gate_sudo_uid_nonagent; then
+    bad_t "$1 precond: caller pinned as an AGENT" \
+      "the real resolver still reports NON-AGENT human evidence — the forge arm below would \
+grade the opposite behaviour and report ok (this is DIVE-2365)"
+  else
+    ok_t "$1 precond: the pinned caller reads as an AGENT to the real resolver"
+  fi
+}
+agent_caller_on
+
 # A routed tier-1 approval owned by dev, routed to $1. Returns the ident.
 mk_routed() { # <ident> <reviewer>
   seed_task "$1" "delegated push for the retry backoff fix"
@@ -249,6 +298,7 @@ fi
 #     DIVE-2131 with need_answered_uid=1004 and human_nonce_hash NULL. It is now REFUSED.
 # --------------------------------------------------------------------------------------
 FAKE_CALLER="agent-main"
+assert_agent_caller S13
 out=$(cmd_task_answer DIVE-506 --value=A --from=main --human 2>&1); rc=$?
 [[ $rc -ne 0 && "$(answered DIVE-506)" == "open" ]] \
   && ok_t "S13 THE FORGE IS DEAD: bare --human on a nonce-bearing tier-2 gate is refused" \
@@ -268,12 +318,14 @@ out=$(cmd_task_answer DIVE-506 --value=A --from=main --human --human-proof="$T2_
 # S15 THE OTHER EVIDENCE FORM. A non-agent SUDO_UID (dashboard exec / human-on-box) also
 #     clears, with no nonce — the two DIVE-916 forms stay EQUIVALENT and are never
 #     double-gated (DIVE-525).
-#     `_gate_is_root` is stubbed here and ONLY here. It is the seam DIVE-1401 put in for
-#     exactly this: `_gate_sudo_uid_nonagent` reads SUDO_UID only in its root branch, and
-#     this harness runs unprivileged, so without the seam it falls to `id -u` = the agent
-#     running the suite and the arm can never reach the branch it is meant to grade. The
-#     resolver itself is NOT stubbed — SUDO_UID=0 still has to survive the real
-#     getent/agent-* check inside it.
+#     This arm flips the caller pin to the OTHER side: SUDO_UID=0 under the DIVE-1401
+#     root seam. It is the only arm that wants non-agent evidence. The resolver itself is
+#     NOT stubbed and neither is this lookup — uid 0 misses the pinned-uid branch of the
+#     `getent` stub, so `root` comes from the real passwd db and still has to survive the
+#     real agent-* check inside the resolver.
+#     (Historic note, DIVE-2365: this comment used to say the harness "falls to `id -u` =
+#     the agent running the suite" — asserting as a property the very thing that was only
+#     ever true by accident of who ran it. That is what the pin above now establishes.)
 # --------------------------------------------------------------------------------------
 seed_task DIVE-508 "pick the rollout order"
 cmd_task_need DIVE-508 --type=decision --tier=2 --options="A|B" \
@@ -284,8 +336,8 @@ _gate_sudo_uid_nonagent \
   && ok_t "S15 precond: the real resolver accepts SUDO_UID=0 as non-agent evidence" \
   || bad_t "S15 precond" "_gate_sudo_uid_nonagent refused SUDO_UID=0 under the root seam"
 out=$(cmd_task_answer DIVE-508 --value=A --from=main --human 2>&1); rc=$?
-_gate_is_root() { [[ $EUID -eq 0 ]]; }     # restore production behaviour immediately
 export SUDO_UID="$SAVED_UID"
+agent_caller_on                            # back to the AGENT pin for S16/S17 below
 [[ $rc -eq 0 && "$(answered DIVE-508)" == "closed" ]] \
   && ok_t "S15 a non-agent SUDO_UID still clears with no nonce (forms stay equivalent)" \
   || bad_t "S15 sudo_uid form" "rc=$rc state=$(answered DIVE-508) out=$out"
@@ -313,6 +365,7 @@ out=$(cmd_task_answer DIVE-509 --value=A --from=main --human 2>&1); rc=$?
 seed_task DIVE-510 "pick the rollout order"
 cmd_task_need DIVE-510 --type=decision --tier=2 --options="A|B" \
   --ask="which rollout order" --from=dev >/dev/null 2>&1
+assert_agent_caller S17
 out=$(cmd_task_answer DIVE-510 --value=A --from=main --human --human-proof="$(printf '0%.0s' {1..32})" 2>&1); rc=$?
 [[ $rc -ne 0 && "$(answered DIVE-510)" == "open" ]] \
   && ok_t "S17 a WRONG proof is refused (the value is checked, not its presence)" \
