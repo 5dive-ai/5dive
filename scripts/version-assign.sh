@@ -65,7 +65,21 @@ for a in "$@"; do [[ "$a" == "--apply" ]] && APPLY=1; done
 BASE="${BASE:-${NEW}^}"
 
 ver_at() { git show "$1:src/header.sh" 2>/dev/null | grep -m1 -oE '^readonly FIVE_VERSION="[^"]+"' | sed 's/.*"\(.*\)"/\1/'; }
-sha_at() { git show "$1:5dive.sha256" 2>/dev/null | cut -d' ' -f1; }
+# DIVE-2091: 5dive.sha256 is generated at tag time and no longer committed, so it
+# cannot be read from a commit. It was only ever a proxy for "did the source
+# change" — ask that directly. Same exemption for workflow/doc-only pushes.
+#
+# DIVE-2230 SURVIVES THIS INTACT, and the pairing is the whole point: what changed is
+# the SIGNAL (bundle checksum -> src/build.sh diff), not the THING IT IS MEASURED
+# AGAINST. That is still the ANCHOR — the commit where the current FIVE_VERSION was
+# assigned — never BASE. Re-keying onto the source while quietly reverting to a
+# base-relative comparison would restore the exact fail-open DIVE-2230 removed, and
+# would do it invisibly, because the message would still read "src ... unchanged".
+#
+# Fails CLOSED by construction: `git diff --quiet` exits >1 on error, and `!` turns
+# that into "changed" -> ASSIGNMENT OWED. An unreadable rev is reported as a debt,
+# never as a clean tree.
+_src_changed() { ! git diff --quiet "$1" "$2" -- src build.sh 2>/dev/null; }
 
 if ! git rev-parse --verify --quiet "$NEW" >/dev/null; then
   echo "version-assign: UNDETERMINED — no such rev '$NEW'. This is NOT a pass." >&2; exit 2
@@ -75,14 +89,12 @@ if ! git rev-parse --verify --quiet "$BASE" >/dev/null; then
 fi
 
 v_new=$(ver_at "$NEW")
-s_new=$(sha_at "$NEW")
 
-# Fail-open must be LOUD, and the two unreadable causes must not share a message.
+# Fail-open must be LOUD. The companion check here used to be "could not read
+# 5dive.sha256 at NEW" — deleted with the file it read, not relaxed. _src_changed
+# has no unreadable state to report: it fails closed into ASSIGNMENT OWED instead.
 if [[ -z "$v_new" ]]; then
   echo "version-assign: UNDETERMINED — could not read FIVE_VERSION at '$NEW' (missing src/header.sh, or the 'readonly FIVE_VERSION=' anchor drifted). This is NOT a pass." >&2; exit 2
-fi
-if [[ -z "$s_new" ]]; then
-  echo "version-assign: UNDETERMINED — could not read 5dive.sha256 at '$NEW'. This is NOT a pass." >&2; exit 2
 fi
 
 # THE ANCHOR: walk back over the commits that touched src/header.sh and stop at the
@@ -113,16 +125,11 @@ if [[ "$(git rev-parse --is-shallow-repository 2>/dev/null)" == "true" ]] && [[ 
   echo "version-assign: UNDETERMINED — the history is SHALLOW and the walk ran off its end at '${ANCHOR:0:12}', so '$v_new' may have been assigned before the graft. This is NOT a pass; fetch with depth 0." >&2; exit 2
 fi
 
-s_anchor=$(sha_at "$ANCHOR")
-if [[ -z "$s_anchor" ]]; then
-  echo "version-assign: UNDETERMINED — could not read 5dive.sha256 at the assignment commit '${ANCHOR:0:12}'. This is NOT a pass." >&2; exit 2
+if ! _src_changed "$ANCHOR" "$NEW"; then
+  echo "version-assign: no assignment needed — src/ and build.sh are unchanged since $v_new was assigned at ${ANCHOR:0:12}; main ships the source its version claims."; exit 0
 fi
 
-if [[ "$s_new" == "$s_anchor" ]]; then
-  echo "version-assign: no assignment needed — the bundle is unchanged since $v_new was assigned at ${ANCHOR:0:12}; main ships the bundle its version claims."; exit 0
-fi
-
-# The bundle moved since the version was last assigned, and the version did not
+# The source moved since the version was last assigned, and the version did not
 # follow: this is the assignment nobody performed. Note this is TRUE even when the
 # move happened several commits ago and this push touched nothing — that case is
 # DIVE-2230 itself, and reporting it is the fix.
@@ -131,7 +138,7 @@ if [[ ! "$v_new" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
 fi
 NEXT="${BASH_REMATCH[1]}.${BASH_REMATCH[2]}.$(( BASH_REMATCH[3] + 1 ))"
 
-echo "version-assign: ASSIGNMENT OWED — bundle changed (${s_anchor:0:16} -> ${s_new:0:16}) since $v_new was assigned at ${ANCHOR:0:12}, with FIVE_VERSION still $v_new."
+echo "version-assign: ASSIGNMENT OWED — src/ or build.sh changed since $v_new was assigned at ${ANCHOR:0:12}, with FIVE_VERSION still $v_new."
 echo "version-assign: next = $NEXT"
 (( APPLY )) || { echo "version-assign: --apply not given; nothing written."; exit 0; }
 

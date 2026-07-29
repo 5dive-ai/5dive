@@ -52,13 +52,19 @@ _bundle_ver() {
     | grep -m1 '^readonly FIVE_VERSION=' \
     | sed -E 's/.*"([^"]+)".*/\1/'
 }
-_sha256file() { git show "$1:5dive.sha256" 2>/dev/null; }
+# DIVE-2091: the bundle is generated at TAG time and is no longer committed, so
+# 5dive.sha256 cannot be read from a commit any more. It was only ever a PROXY
+# for "did the source change" — this file's own header says a workflow/doc-only
+# push "leaves 5dive.sha256 unchanged and is exempt". Ask the real question
+# directly instead: did anything build.sh consumes change between BASE and NEW.
+# Same exemption, no generated artifact required.
+_src_changed() { # BASE NEW -> 0 if src/ or build.sh differ
+  ! git diff --quiet "$1" "$2" -- src build.sh 2>/dev/null
+}
 
 new_ver="$(_ver "$NEW")"
-new_bundle_ver="$(_bundle_ver "$NEW")"
 base_ver="$(_ver "$BASE" 2>/dev/null || true)"
-new_sha="$(_sha256file "$NEW")"
-base_sha="$(_sha256file "$BASE" 2>/dev/null || true)"
+src_moved=0; _src_changed "$BASE" "$NEW" && src_moved=1
 
 fail=0
 
@@ -70,25 +76,17 @@ if [[ -z "$new_ver" ]]; then
   echo "version-bump-guard: BLOCKED — could not extract FIVE_VERSION from src/header.sh at $NEW (missing file, or the 'readonly FIVE_VERSION=' anchor no longer matches). Extraction failure is not the same as a clean bundle — investigate before overriding." >&2
   fail=1
 fi
-if [[ -z "$new_bundle_ver" ]]; then
-  echo "version-bump-guard: BLOCKED — could not extract FIVE_VERSION from the committed 5dive bundle at $NEW (missing file, or the anchor no longer matches)." >&2
-  fail=1
-fi
-if [[ -z "$new_sha" ]]; then
-  echo "version-bump-guard: BLOCKED — could not read 5dive.sha256 at $NEW (missing or empty)." >&2
-  fail=1
-fi
+# DIVE-2091: the "bundle embeds the header's version" assertion is GONE, not
+# relaxed — it is structurally impossible to violate now. There is no committed
+# bundle to disagree with src/header.sh, and the bundle that ships is built at
+# tag time FROM that header. release-cut.yml asserts v${FIVE_VERSION} == the tag
+# being cut and refuses otherwise, which is the same property enforced where the
+# artifact is actually produced. Dropping it here rather than leaving a check
+# that can no longer fail (see bundle-drift's old `git diff --exit-code 5dive`).
 
-if [[ -n "$new_ver" && -n "$new_bundle_ver" && "$new_ver" != "$new_bundle_ver" ]]; then
-  echo "version-bump-guard: BLOCKED — src/header.sh declares FIVE_VERSION=$new_ver but the committed 5dive bundle embeds $new_bundle_ver." >&2
-  echo "  Run ./build.sh and commit the rebuilt bundle." >&2
-  fail=1
-fi
-
-if [[ -n "$base_sha" && -n "$new_sha" && "$base_sha" != "$new_sha" \
-      && -n "$base_ver" && "$new_ver" == "$base_ver" ]]; then
-  echo "version-bump-guard: BLOCKED — the 5dive bundle changed (new 5dive.sha256) but FIVE_VERSION is still $new_ver, same as $BASE." >&2
-  echo "  Two different bundles would claim the same release version. Bump FIVE_VERSION in src/header.sh, rebuild, and recommit." >&2
+if [[ "$src_moved" == "1" && -n "$base_ver" && "$new_ver" == "$base_ver" ]]; then
+  echo "version-bump-guard: BLOCKED — src/ (or build.sh) changed but FIVE_VERSION is still $new_ver, same as $BASE." >&2
+  echo "  Two different bundles would claim the same release version. Bump FIVE_VERSION in src/header.sh." >&2
   echo "  Emergency override (discouraged; CI version-uniqueness check is the net): git push --no-verify" >&2
   fail=1
 fi
