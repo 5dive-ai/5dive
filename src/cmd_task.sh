@@ -3162,7 +3162,8 @@ cmd_task_verify() {
     result_txt="❌ verify FAIL (exit ${rc}): ${cmd}"$'\n'"--- output tail ---"$'\n'"${tail_out}"
   fi
 
-  local flipped=0
+  local flipped=0 self_verified_close=0
+  local self_verify_maker="" self_verify_verifier="" self_verify_iteration=""
   if (( rc == 0 )) && (( ! no_done )); then
     # DIVE-2196: this auto-close is a TERMINAL CLOSE reached by raw UPDATE, so it
     # never saw DIVE-555's pending-gate refusal — `task verify --cmd=true` closed a
@@ -3181,8 +3182,42 @@ cmd_task_verify() {
       policy_refuse "$E_CONFLICT" verify-close-over-open-gate DIVE-2196 "$ident" \
         "$ident has a pending '${_vg_t}' gate awaiting a human — the verify verdict is RECORDED, but the auto-close is refused: closing here would drop the human's question out of every open-gate view without anyone answering it, which is DIVE-555's bypass reached by a different verb. Exits: let them answer it ('5dive task answer $ident --value=...'), withdraw it if your result makes it moot ('5dive task need $ident --withdraw'), or re-run with --no-done to record evidence without closing."
     fi
+    # DIVE-2015: a maker is deliberately ALLOWED to rescue a stalled delivered
+    # loop with `task verify --cmd=...`; refusing it would remove the only
+    # zero-human exit when the assigned verifier never runs. Permitted must not
+    # mean invisible, though. When the REAL caller is the recorded maker and the
+    # still-live row is held by its verifier, stamp the durable task result,
+    # emit a separately classifiable audit event, and warn on stderr. The mark
+    # names every fact a later reader needs to weigh the close: maker, verifier
+    # who never recorded a grade, and loop iteration.
+    #
+    # This belongs in audit_log, not policy_refusals: nothing was refused. Route
+    # through the task-store fence so fixture DBs cannot write real-looking task
+    # telemetry into the fleet audit log (DIVE-2010).
+    local _svc_actor _svc_row _svc_assignee _svc_status
+    _svc_actor=$(task_actor)
+    _svc_row=$(db "SELECT COALESCE(maker_agent,'')||x'1f'||
+                        COALESCE(verifier,'')||x'1f'||
+                        COALESCE(assignee,'')||x'1f'||
+                        COALESCE(iteration,0)||x'1f'||status
+                   FROM tasks WHERE id=${id};")
+    IFS=$'\x1f' read -r self_verify_maker self_verify_verifier \
+      _svc_assignee self_verify_iteration _svc_status <<<"$_svc_row"
+    if [[ -n "$self_verify_maker" && -n "$self_verify_verifier" \
+          && "$_svc_actor" == "$self_verify_maker" \
+          && "$_svc_assignee" == "$self_verify_verifier" \
+          && "$_svc_status" != "done" && "$_svc_status" != "cancelled" ]]; then
+      self_verified_close=1
+      result_txt="⚠ self-verified-close: maker=${self_verify_maker}; verifier=${self_verify_verifier} never graded; iteration=${self_verify_iteration}"$'\n'"${result_txt}"
+    fi
     db "UPDATE tasks SET status='done', done_at=datetime('now'), result=$(sqlq "$result_txt") WHERE id=${id};"
     flipped=1
+    if (( self_verified_close )); then
+      _task_store_audit_log "task.verify-self-close" "self-verified-close" 0 -- \
+        "task=$ident" "maker=$self_verify_maker" "verifier=$self_verify_verifier" \
+        "iteration=$self_verify_iteration"
+      warn "$ident self-verified-close: maker '$self_verify_maker' selected the passing verify command; verifier '$self_verify_verifier' never graded iteration $self_verify_iteration. Close allowed and visibly recorded."
+    fi
     # DIVE-1415: `task verify` auto-done is a terminal close like `task done`, so
     # it must release this task's dependents too. DIVE-1355 wired the cascade
     # only into `_task_status_cmd` (the done/cancel verbs); a task closed via
