@@ -54,6 +54,42 @@ doctor_check_cmd() {
   return 1
 }
 
+# doctor_check_audit_drop_dir [path] [expected-group]
+#
+# The audit drop marker is the evidence rail for an audit append that failed.
+# It can only do that job when its parent already exists with the shape
+# audit_init promises: a real, setgid, group-writable directory owned by group
+# claude. Checking the marker file itself is insufficient: before the first
+# drop there is no file, and a missing/regular-file parent is a structural
+# failure rather than a disk-write failure.
+doctor_check_audit_drop_dir() {
+  local dir="${1:-${AUDIT_LOG%/*}/notify}"
+  local expected_group="${2:-claude}"
+  local mode group
+
+  if [[ ! -e "$dir" && ! -L "$dir" ]]; then
+    doctor_add host audit-drop-dir error \
+      "$dir is missing — lost audit rows cannot leave a drop marker (expected directory mode 2770, group $expected_group)"
+    return 0
+  fi
+  if [[ ! -d "$dir" || -L "$dir" ]]; then
+    doctor_add host audit-drop-dir error \
+      "$dir is not a real directory — lost audit rows cannot leave a drop marker (expected mode 2770, group $expected_group)"
+    return 0
+  fi
+
+  mode=$(stat -c '%a' "$dir" 2>/dev/null) || mode="unknown"
+  group=$(stat -c '%G' "$dir" 2>/dev/null) || group="unknown"
+  if [[ "$mode" != "2770" || "$group" != "$expected_group" ]]; then
+    doctor_add host audit-drop-dir error \
+      "$dir has mode $mode and group $group — lost audit rows need a setgid, group-writable directory (expected 2770, group $expected_group)"
+    return 0
+  fi
+
+  doctor_add host audit-drop-dir ok \
+    "$dir is a directory with mode 2770 and group $expected_group; lost audit rows can leave a drop marker"
+}
+
 cmd_doctor() {
   require_root
   local filter="" want_fix=0 dry=0
@@ -549,6 +585,13 @@ cmd_doctor() {
   # apply but services are only LISTED; controlled restarts run on the host/nightly
   # cron. Idempotent conf.d drop-in, same shape harden.sh ships to customer VMs.
   if (( run_host )); then
+    # DIVE-2009: `_audit_note_drop` deliberately never fails its caller, so its
+    # parent directory is the only observable precondition preventing an audit
+    # append failure from becoming a second silent loss. Assert the directory
+    # shape itself; testing a marker path for writability cannot distinguish a
+    # missing parent (partial/hand-built provision) from an actual disk fault.
+    doctor_check_audit_drop_dir
+
     # --- disk headroom (DIVE-1966/1967) ---
     #
     # A full disk never announces itself: it surfaces as a failure in whatever
