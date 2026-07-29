@@ -456,12 +456,41 @@ HELP
     done
   fi
 
+  # DIVE-2347 — A FAILED SKILL INSTALL IS INVISIBLE TO THE `errors` COUNTER.
+  #
+  # `agent create` deliberately does NOT fail when a preseeded skill won't install
+  # (the agent itself is up), so the failure never reaches `errors` and the summary
+  # says `errors=0` over a red line the user just watched scroll past. Measured on
+  # the content-studio template, whose writer and seo roles both request a skill
+  # that is not in the repo the template names: two `error:` lines, then `errors=0`.
+  #
+  # Same shape and same remedy as the asleep row above: re-derive from the INSTALLED
+  # SET (`_skill_list_json`, the same reader `skill list` uses) rather than trusting
+  # the create's exit code, and restate it after the summary. A spec entry may be
+  # `owner/repo:id`, but only the bare id is ever the installed directory name.
+  # Display only — it cannot regress the create path it describes.
+  # >>> DIVE-2347 degraded-skill derivation (extracted verbatim by tests/compose_skill_degraded_unit.sh)
+  local -a _degraded=()
+  local _want _have _miss
+  for _n in "${_brought_up_names[@]+"${_brought_up_names[@]}"}"; do
+    _want=$(jq -r --arg n "$_n" '(.agents[$n].skills // [])[] | sub("^.*:";"")' <<<"$spec" 2>/dev/null || true)
+    [[ -n "$_want" ]] || continue
+    _have=$(_skill_list_json "$_n" 2>/dev/null | jq -r '.[].name' 2>/dev/null || true)
+    while IFS= read -r _miss; do
+      [[ -n "$_miss" ]] || continue
+      grep -qxF -- "$_miss" <<<"$_have" || _degraded+=("$_n $_miss")
+    done <<<"$_want"
+  done
+  # <<< DIVE-2347 degraded-skill derivation
+
   if (( JSON_MODE )); then
-    ok "" '{file:$f, created:($c|tonumber), started:($s|tonumber), skipped:($k|tonumber), errors:($e|tonumber), asleep:$a}' \
+    ok "" '{file:$f, created:($c|tonumber), started:($s|tonumber), skipped:($k|tonumber), errors:($e|tonumber), asleep:$a, skills_failed:($sf|tonumber), degraded:$d}' \
       --arg f "$file" --arg c "$created" --arg s "$started" --arg k "$skipped" --arg e "$errors" \
-      --argjson a "$(printf '%s\n' "${_asleep[@]+"${_asleep[@]}"}" | jq -R . | jq -sc 'map(select(length>0))')"
+      --argjson a "$(printf '%s\n' "${_asleep[@]+"${_asleep[@]}"}" | jq -R . | jq -sc 'map(select(length>0))')" \
+      --arg sf "${#_degraded[@]}" \
+      --argjson d "$(printf '%s\n' "${_degraded[@]+"${_degraded[@]}"}" | jq -R 'select(length>0) | split(" ") | {agent:.[0], skill:.[1]}' | jq -sc .)"
   else
-    echo "OK — applied $file: created=$created started=$started skipped=$skipped errors=$errors asleep=${#_asleep[@]}"
+    echo "OK — applied $file: created=$created started=$started skipped=$skipped errors=$errors asleep=${#_asleep[@]} skills_failed=${#_degraded[@]}"
     if (( ${#_asleep[@]} > 0 )); then
       echo ""
       echo "── ${#_asleep[@]} agent(s) are ASLEEP — created, but they will not self-act on board work:"
@@ -469,6 +498,14 @@ HELP
         echo "     sudo 5dive heartbeat on $_n"
       done
       echo "   (each line above is the exact command; nothing else is needed)"
+    fi
+    if (( ${#_degraded[@]} > 0 )); then
+      echo ""
+      echo "── ${#_degraded[@]} skill(s) FAILED to install — those agents are up but DEGRADED:"
+      for _n in "${_degraded[@]}"; do
+        echo "     sudo 5dive agent skill ${_n%% *} add --skill=${_n##* }"
+      done
+      echo "   (if a skill is missing from its source repo, the spec is wrong — not your box)"
     fi
   fi
   (( errors == 0 )) || return "$E_GENERIC"
