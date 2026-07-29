@@ -66,14 +66,57 @@ gen_msg_id() {
   od -An -N4 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n' | head -c 8
 }
 
-# When --from is omitted, infer it from $SUDO_USER. Agent users follow the
-# `agent-<label>` convention, so we strip the prefix. Anything else (a real
-# human ssh-ing in as `claude`, a build bot, etc.) returns empty — the caller
-# then sends raw text with no envelope, preserving the pre-attribution shape.
+# When --from is omitted, infer the sender from the REAL invoking identity.
+# Agent users follow the `agent-<label>` convention, so we strip the prefix.
+# Anything else (a human ssh-ing in as `claude`, a build bot, root/cron)
+# returns empty — the caller then sends raw text with no envelope, preserving
+# the pre-attribution shape.
+#
+# DIVE-2281 — THE INVERTED TRUST GRADIENT, and $SUDO_USER alone is what caused it.
+#
+# This used to read ONLY $SUDO_USER, which is set only when the caller reached us
+# THROUGH sudo. That is true on the scoped path (`a2a_needs_scoped` execs
+# `sudo -n … agent _deliver`, so _deliver sees SUDO_USER=agent-<caller>) and FALSE
+# on the direct path, because a full-trust (NOPASSWD:ALL) agent runs `5dive agent
+# send` as ITSELF — no sudo, no SUDO_USER. So the gradient ran backwards: the
+# scoped sender, which cannot supply --from at all, arrived with a real tier; the
+# full-trust sender, which CAN supply any --from, arrived with none.
+#
+# MEASURED 2026-07-29 from agent-main (isolation=admin, NOPASSWD:ALL), sending on
+# the direct path with no --from:
+#   id -un = agent-main   SUDO_USER = UNSET   ->  this returned ""
+# and an empty sender skips the envelope block entirely in cmd_send, so the message
+# landed in the receiver's pane as bare text with NO `[5dive-msg …]` header at all —
+# not `tier=unknown:no-caller`, NOTHING. Verified by probe: the receiving pane showed
+# `❯ <message>` and zero occurrences of `5dive-msg`.
+#
+# That is worse than weak attribution, and it is the real defect. An unenveloped
+# inject is byte-indistinguishable from the paired HUMAN typing into that pane, so
+# the most privileged sender on the box produced the most authoritative-looking
+# message. It is also why a DIVE-2279 gate answer could be "announced by a message
+# claiming from=main" and be unattributable: nothing on that path stamps anything.
+#
+# THE FIX IS TO ASK WHO IS ACTUALLY RUNNING, not only who sudo'd. `id -un` is not
+# caller-supplied and not forgeable by an argument, so deriving from it gives the
+# direct path a REAL caller — hence a real tier — and closes the inversion at the
+# source rather than patching the envelope. SUDO_USER stays FIRST and unchanged:
+# on `sudo 5dive …` the meaningful identity is the invoker, not root.
+#
+# Root/cron keep returning empty deliberately: `id -un` = root is not an agent, so
+# `_deliver` (which runs as root with SUDO_USER=agent-X) still resolves via the
+# SUDO_USER branch exactly as before. No path that worked changes.
 auto_sender_from_sudo() {
   local u="${SUDO_USER:-}"
-  [[ -n "$u" && "$u" == agent-* ]] || { echo ""; return; }
-  echo "${u#agent-}"
+  if [[ -n "$u" && "$u" == agent-* ]]; then
+    echo "${u#agent-}"
+    return
+  fi
+  # No sudo in play: the process IS the sender. Only an `agent-*` identity counts;
+  # anything else stays empty so humans and build bots keep the unenveloped shape.
+  local self=""
+  self="$(id -un 2>/dev/null || true)"
+  [[ -n "$self" && "$self" == agent-* ]] || { echo ""; return; }
+  echo "${self#agent-}"
 }
 
 # Same regex the marketplace plugin validates against. Telegram bot tokens
