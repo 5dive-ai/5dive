@@ -471,6 +471,18 @@ _agent_pane_input_ready() {
 # fourth. This inverts the default instead: a type we cannot detect does not wait.
 # A NEW harness type therefore costs nothing by default, and the tax cannot silently
 # reappear on harness number five.
+# GROK IS VERIFIED, NOT INFERRED (olivia's review, DIVE-2277). It was first added
+# here on timing alone (2-3s control vs 49s), which is weak — and _hb_idle_marker in
+# cmd_heartbeat.sh appears to contradict it, returning EMPTY for grok with the comment
+# "grok/opencode/unknown: byte-stability alone". Settled against a live pane on the
+# council-demo box 2026-07-29: agent-creative (grok) renders U+276F "â¯" in its
+# composer (2 occurrences) and _agent_pane_input_ready MATCHES that pane.
+#
+# The two tables are NOT in conflict; they answer different questions. This set asks
+# "can we ever detect an input prompt" — grok: yes. _hb_idle_marker asks "is there a
+# reliable AT-REST idle glyph" — a stricter bar grok has not been verified against.
+# Leave _hb_idle_marker alone; a marker that is present in the composer is not thereby
+# proven to be a trustworthy at-rest signal.
 declare -A _AGENT_PROMPT_DETECTABLE=(
   [claude]=1 [codex]=1 [devin]=1 [antigravity]=1 [grok]=1
 )

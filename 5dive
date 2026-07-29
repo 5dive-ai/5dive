@@ -26,7 +26,7 @@ esac
 
 # Bumped on every public release. `build.sh` checks this line exists; CI fails
 # the bundle-drift check if it's missing or empty.
-readonly FIVE_VERSION="0.17.4"
+readonly FIVE_VERSION="0.17.5"
 
 # GitHub org our repos live under. The org is being renamed
 # 5dive-com -> 5dive-ai (2026-06); fetches must work on either side of the
@@ -14979,6 +14979,18 @@ _agent_pane_input_ready() {
 # fourth. This inverts the default instead: a type we cannot detect does not wait.
 # A NEW harness type therefore costs nothing by default, and the tax cannot silently
 # reappear on harness number five.
+# GROK IS VERIFIED, NOT INFERRED (olivia's review, DIVE-2277). It was first added
+# here on timing alone (2-3s control vs 49s), which is weak — and _hb_idle_marker in
+# cmd_heartbeat.sh appears to contradict it, returning EMPTY for grok with the comment
+# "grok/opencode/unknown: byte-stability alone". Settled against a live pane on the
+# council-demo box 2026-07-29: agent-creative (grok) renders U+276F "â¯" in its
+# composer (2 occurrences) and _agent_pane_input_ready MATCHES that pane.
+#
+# The two tables are NOT in conflict; they answer different questions. This set asks
+# "can we ever detect an input prompt" — grok: yes. _hb_idle_marker asks "is there a
+# reliable AT-REST idle glyph" — a stricter bar grok has not been verified against.
+# Leave _hb_idle_marker alone; a marker that is present in the composer is not thereby
+# proven to be a trustworthy at-rest signal.
 declare -A _AGENT_PROMPT_DETECTABLE=(
   [claude]=1 [codex]=1 [devin]=1 [antigravity]=1 [grok]=1
 )
@@ -29056,13 +29068,21 @@ _goal_job_advance() {
   local killed ceil spent
   killed=$(db "SELECT COALESCE(kill_requested,0) FROM loop_runs WHERE loop_id=$(sqlq "$loop_id");")
   ceil=$(_goal_job_field "$job_id" ceiling)
-  spent=$(_loop_spent "$loop_id" 2>/dev/null || echo 0); [[ "$spent" =~ ^[0-9]+$ ]] || spent=0
+  # DIVE-2304: `|| echo 0` here was the same fail-open as the producer's — an
+  # unreadable spend became "0 tokens used" and the job sailed past its ceiling.
+  # A spend that could not be read is NOT-REACHED and fails the job, because a
+  # ceiling that was never evaluated has not been respected.
+  local spend_ok=1
+  spent=$(_loop_spent "$loop_id") || spend_ok=0
+  [[ "$spent" =~ ^[0-9]+$ ]] || { spend_ok=0; spent=""; }
   if [[ "$killed" == "1" ]] \
-     || { [[ -n "$ceil" && "$ceil" =~ ^[0-9]+$ ]] && (( spent >= ceil )) && [[ "$tstatus" != "done" ]]; } \
+     || { (( ! spend_ok )) && [[ "$tstatus" != "done" ]]; } \
+     || { [[ -n "$ceil" && "$ceil" =~ ^[0-9]+$ ]] && (( spend_ok ? spent >= ceil : 0 )) && [[ "$tstatus" != "done" ]]; } \
      || [[ "$tstatus" == "escalated" || "$tstatus" == "rejected" || "$tstatus" == "cancelled" ]]; then
     local reason="planner did not return a plan (loop ${tstatus:-halted})"
     [[ "$killed" == "1" ]] && reason="planner loop was killed"
-    { [[ -n "$ceil" && "$ceil" =~ ^[0-9]+$ ]] && (( spent >= ceil )); } && reason="planner hit its token ceiling (${spent}/${ceil}tok)"
+    (( spend_ok )) || reason="planner spend NOT-REACHED — token ceiling could not be verified"
+    { (( spend_ok )) && [[ -n "$ceil" && "$ceil" =~ ^[0-9]+$ ]] && (( spent >= ceil )); } && reason="planner hit its token ceiling (${spent}/${ceil}tok)"
     local payload
     payload=$(jq -cn --arg j "$job_id" --arg r "$reason" --arg p "$planner" '{ok:true, data:{job:$j, status:"failed", reason:$r, planner:$p}}')
     db "UPDATE goal_jobs SET status='failed', result_json=$(sqlq "$payload"), updated_at=$(date +%s) WHERE job_id=$(sqlq "$job_id");" >/dev/null 2>&1 || true
@@ -36369,14 +36389,43 @@ _loop_eff_ceiling() {
 # transcript usage of this loop's child tasks; echoes the fresh integer. Heavy
 # (scans transcripts), so callers in the hot --wait poll go through _loop_spent,
 # which throttles; the heartbeat sweep calls this directly (once per tick).
+#
+# DIVE-2304: a spend read that FAILED is a THIRD STATE — NOT-REACHED — and must
+# never be reported as 0. Three fail-open sites in this one producer all coerced
+# a failed read to 0, and 0 is also what a genuinely-idle loop reports, so the
+# two were indistinguishable to `spent >= ceiling`: an unreadable spend silently
+# DISABLED the token ceiling. Worse, the persist below was unconditional and ran
+# on the fail-open path too, so one transient failure CLOBBERED the accumulated
+# running total to 0 in durable state and the throttled fast path then read that
+# 0 back — not a momentary blind spot that self-heals, a destroyed figure.
+# The contract now:
+#   rc 0 -> echoes a real integer, and only then persists it
+#   rc 2 -> echoes NOTHING, persists NOTHING, and names the cause on stderr
+# The stderr is load-bearing: the `2>/dev/null` on the python call is why this
+# was invisible for the whole life of the ceiling. Do not put it back.
+_loop_spend_unreadable() {   # <loop_id> <reason...> — emit + signal NOT-REACHED
+  local lid="$1"; shift
+  _LOOP_SPEND_UNREADABLE="$*"
+  printf 'loop-spend: %s: NOT-REACHED (%s) — ceiling not verified, tokens_spent left intact\n' "$lid" "$*" >&2
+  return 2
+}
+_LOOP_SPEND_UNREADABLE=""
 _loop_refresh_spend() {
   local loop_id="$1"
+  _LOOP_SPEND_UNREADABLE=""
   local row; row=$(db "SELECT COALESCE(child_task_ids,'[]')||'|'||COALESCE(started_at,0) FROM loop_runs WHERE loop_id=$(sqlq "$loop_id");")
-  [[ -n "$row" ]] || { printf '0'; return; }
+  [[ -n "$row" ]] || { _loop_spend_unreadable "$loop_id" "no loop_runs row (absent or unreadable db)"; return 2; }
   local kids="${row%|*}" since="${row##*|}"
-  [[ "$kids" == "[]" || -z "$kids" ]] && { printf '%s' "$(db "SELECT COALESCE(tokens_spent,0) FROM loop_runs WHERE loop_id=$(sqlq "$loop_id");")"; return; }
-  local dbp="${TASKS_DB:-${STATE_DIR}/tasks/tasks.db}" spent
-  spent=$(REGISTRY="$REGISTRY" TASK_DB="$dbp" LOOP_KIDS="$kids" LOOP_SINCE="${since:-0}" python3 - <<'PY' 2>/dev/null || printf '0'
+  if [[ "$kids" == "[]" || -z "$kids" ]]; then
+    # No children yet: the persisted total IS the real answer — but only if we
+    # can read it. An empty read here is the same NOT-REACHED, not a zero.
+    local held; held=$(db "SELECT COALESCE(tokens_spent,0) FROM loop_runs WHERE loop_id=$(sqlq "$loop_id");")
+    [[ "$held" =~ ^[0-9]+$ ]] || { _loop_spend_unreadable "$loop_id" "persisted tokens_spent unreadable ('${held:-}')"; return 2; }
+    printf '%s' "$held"; return 0
+  fi
+  local dbp="${TASKS_DB:-${STATE_DIR}/tasks/tasks.db}" spent prc=0
+  local errf="${TMPDIR:-/tmp}/loop-spend-$$-${RANDOM}.err"
+  spent=$(REGISTRY="$REGISTRY" TASK_DB="$dbp" LOOP_KIDS="$kids" LOOP_SINCE="${since:-0}" python3 - 2>"$errf" <<'PY'
 import os, json, glob, time, sqlite3, datetime as dt, pwd
 since = int(os.environ.get("LOOP_SINCE") or 0)
 now = int(time.time())
@@ -36439,8 +36488,16 @@ for name, ws in wins.items():
     total += sum(w["tok"] for w in ws)
 print(int(total))
 PY
-)
-  [[ "$spent" =~ ^[0-9]+$ ]] || spent=0
+) || prc=$?
+  if (( prc != 0 )) || [[ ! "$spent" =~ ^[0-9]+$ ]]; then
+    local detail=""; [[ -s "$errf" ]] && detail=" — $(tr '\n' ' ' <"$errf" | tail -c 300)"
+    rm -f "$errf"
+    _loop_spend_unreadable "$loop_id" "spend recompute failed (rc=${prc}, out='${spent:-}')${detail}"
+    return 2
+  fi
+  rm -f "$errf"
+  # Persist ONLY a read that succeeded — see the header: this UPDATE used to run
+  # on the fail-open path and overwrite the last good total with a coerced 0.
   db "UPDATE loop_runs SET tokens_spent=${spent}, updated_at=$(date +%s) WHERE loop_id=$(sqlq "$loop_id");" >/dev/null 2>&1 || true
   printf '%s' "$spent"
 }
@@ -36451,13 +36508,39 @@ PY
 # check reads a real number without re-scanning transcripts every poll.
 declare -A _LOOP_SPEND_LAST 2>/dev/null || true
 _loop_spent() {
-  local loop_id="$1" throttle="${LOOP_SPEND_THROTTLE:-20}" now last
+  local loop_id="$1" throttle="${LOOP_SPEND_THROTTLE:-20}" now last rc=0
   now=$(date +%s); last="${_LOOP_SPEND_LAST[$loop_id]:-0}"
   if (( now - last >= throttle )); then
-    _loop_refresh_spend "$loop_id" >/dev/null
+    _loop_refresh_spend "$loop_id" >/dev/null || rc=$?
     _LOOP_SPEND_LAST[$loop_id]=$now
   fi
-  db "SELECT COALESCE(tokens_spent,0) FROM loop_runs WHERE loop_id=$(sqlq "$loop_id");"
+  # DIVE-2304: propagate NOT-REACHED. Falling through to the SELECT here would
+  # re-launder a failed refresh as the (now un-clobbered, but stale) persisted
+  # number, which reads exactly like a fresh one to every caller.
+  (( rc == 0 )) || return 2
+  local v; v=$(db "SELECT COALESCE(tokens_spent,0) FROM loop_runs WHERE loop_id=$(sqlq "$loop_id");")
+  [[ "$v" =~ ^[0-9]+$ ]] || { _loop_spend_unreadable "$loop_id" "persisted tokens_spent unreadable ('${v:-}')"; return 2; }
+  printf '%s' "$v"
+}
+
+# _loop_ceiling_check <loop_id> <ceiling> — DIVE-2304: the three-state budget
+# test every --wait poll goes through.
+#   rc 0 -> under the ceiling; echoes the spend (safe to keep spending)
+#   rc 1 -> at/over the ceiling; echoes the spend (halt reason "ceiling")
+#   rc 2 -> spend NOT-REACHED; echoes nothing  (halt reason "spend-unreadable")
+# The old `[[ "${spent:-0}" -ge "$ceiling" ]]` at each call site could not be
+# fixed in place: an integer cannot carry a third state, so the consumer had no
+# way to tell "0 spent" from "no idea". A budget control that cannot read the
+# budget has not verified anything, so rc 2 halts rather than continues.
+_loop_ceiling_check() {
+  local loop_id="$1" ceiling="$2" spent rc=0
+  spent=$(_loop_spent "$loop_id") || rc=$?
+  (( rc == 0 )) || return 2
+  [[ "$spent" =~ ^[0-9]+$ ]] || return 2
+  printf '%s' "$spent"
+  [[ -n "$ceiling" && "$ceiling" =~ ^[0-9]+$ ]] || return 0
+  (( spent >= ceiling )) && return 1
+  return 0
 }
 
 # DIVE-1349 wake-on-spawn: nudge a freshly loop-spawned task's assignee to START
@@ -36587,14 +36670,14 @@ cmd_loop_spawn() {
   # explicit --wait=<sec> (e.g. the goal planner asks for 150s, still in-window).
   local deadline poll="${LOOP_POLL_SECS:-4}"
   if [[ -n "$wait_secs" ]]; then deadline=$(( now + wait_secs )); else deadline=$(( now + ${LOOP_SPAWN_WAIT_DEFAULT:-120} )); fi
-  local final_status="running" tstatus="" tresult="" killed="" spent="0"
+  local final_status="running" tstatus="" tresult="" killed="" spent="0" crc=0
   while :; do
     local t; t=$(date +%s)
     # kill check (deferred-safe flag flipped by `task loops --kill`)
     killed=$(db "SELECT kill_requested FROM loop_runs WHERE loop_id=$(sqlq "$loop_id");")
     if [[ "$killed" == "1" ]]; then final_status="killed"; break; fi
     # ceiling check
-    spent=$(_loop_spent "$loop_id")
+    spent=$(_loop_ceiling_check "$loop_id" "$eff_ceiling") && crc=0 || crc=$?
     # DIVE-2105 (same shape as DIVE-2083 in cmd_loop_panel): name the ceiling
     # breach as ITSELF. Labelling it "escalated" collapsed it onto the backing
     # task's own 'escalated' terminal state below, and `loop_status` then maps
@@ -36602,7 +36685,10 @@ cmd_loop_spawn() {
     # ceiling halt from a timeout or from a task that escalated on its own.
     # A test asserting status=='escalated' therefore asserts the failure mode's
     # value as well as the success one, which is not an assertion.
-    if [[ "${spent:-0}" -ge "$eff_ceiling" ]]; then final_status="ceiling"; break; fi
+    # DIVE-2304: three states, not two. rc 2 = the spend could not be read at
+    # all, which used to arrive here as a 0 and read as "plenty of budget left".
+    if (( crc == 2 )); then final_status="spend-unreadable"; break; fi
+    if (( crc == 1 )); then final_status="ceiling"; break; fi
     # terminal-state check on the backing task
     tstatus=$(db "SELECT status FROM tasks WHERE id=${task_id};")
     case "$tstatus" in
@@ -36621,7 +36707,7 @@ cmd_loop_spawn() {
     # DIVE-2105: 'ceiling' joins this arm so the WIRE status is unchanged for
     # every existing reader — the new information rides on haltReason, which
     # `status` provably cannot carry (four halt causes, two statuses).
-    ceiling|escalated|rejected|timeout) loop_status="escalated" ;;
+    ceiling|spend-unreadable|escalated|rejected|timeout) loop_status="escalated" ;;
   esac
   local now2; now2=$(date +%s)
   db "UPDATE loop_runs SET status=$(sqlq "$loop_status"), updated_at=${now2},
@@ -36727,17 +36813,20 @@ cmd_loop_verify() {
   # (max-iters exhausted) end the verify loop. Policed by kill + ceiling.
   local deadline poll="${LOOP_POLL_SECS:-4}"
   if [[ -n "$wait_secs" ]]; then deadline=$(( now + wait_secs )); else deadline=$(( now + 1800 )); fi
-  local final_status="running" killed="" spent="0"
+  local final_status="running" killed="" spent="0" crc=0
   while :; do
     local t; t=$(date +%s)
     killed=$(db "SELECT kill_requested FROM loop_runs WHERE loop_id=$(sqlq "$loop_id");")
     if [[ "$killed" == "1" ]]; then final_status="killed"; break; fi
-    spent=$(_loop_spent "$loop_id")
+    spent=$(_loop_ceiling_check "$loop_id" "$eff_ceiling") && crc=0 || crc=$?
     # DIVE-2105: ceiling named as itself — see cmd_loop_spawn. Here the collapse
     # is total: EVERY non-done, non-killed halt falls through the `*)` arm below
     # onto status=escalated/verdict=escalated, so ceiling and timeout were the
     # same two strings on the wire.
-    if [[ "${spent:-0}" -ge "$eff_ceiling" ]]; then final_status="ceiling"; break; fi
+    # DIVE-2304: three states, not two. rc 2 = the spend could not be read at
+    # all, which used to arrive here as a 0 and read as "plenty of budget left".
+    if (( crc == 2 )); then final_status="spend-unreadable"; break; fi
+    if (( crc == 1 )); then final_status="ceiling"; break; fi
     tstatus=$(db "SELECT status FROM tasks WHERE id=${tid};")
     case "$tstatus" in
       done)                final_status="done";     break ;;
@@ -36859,16 +36948,19 @@ cmd_loop_grade() {
   # --wait: block-poll the grader to terminal, policed by kill + ceiling.
   local deadline poll="${LOOP_POLL_SECS:-4}"
   if [[ -n "$wait_secs" ]]; then deadline=$(( now + wait_secs )); else deadline=$(( now + 1800 )); fi
-  local final_status="running" killed="" spent="0"
+  local final_status="running" killed="" spent="0" crc=0
   while :; do
     local t; t=$(date +%s)
     killed=$(db "SELECT kill_requested FROM loop_runs WHERE loop_id=$(sqlq "$loop_id");")
     if [[ "$killed" == "1" ]]; then final_status="killed"; break; fi
-    spent=$(_loop_spent "$loop_id")
+    spent=$(_loop_ceiling_check "$loop_id" "$eff_ceiling") && crc=0 || crc=$?
     # DIVE-2105: ceiling named as itself — see cmd_loop_spawn. grade had the same
     # collapse and, unlike spawn/verify, NO ceiling case in its harness at all,
     # so the branch was not merely vacuously tested but untested.
-    if [[ "${spent:-0}" -ge "$eff_ceiling" ]]; then final_status="ceiling"; break; fi
+    # DIVE-2304: three states, not two. rc 2 = the spend could not be read at
+    # all, which used to arrive here as a 0 and read as "plenty of budget left".
+    if (( crc == 2 )); then final_status="spend-unreadable"; break; fi
+    if (( crc == 1 )); then final_status="ceiling"; break; fi
     local gstatus; gstatus=$(db "SELECT status FROM tasks WHERE id=${gtid};")
     case "$gstatus" in
       done|rejected|escalated|cancelled) final_status="complete"; break ;;
@@ -37017,19 +37109,22 @@ cmd_loop_panel() {
   # --wait: block-poll all graders to terminal, policed by kill + ceiling.
   local deadline poll="${LOOP_POLL_SECS:-4}"
   if [[ -n "$wait_secs" ]]; then deadline=$(( now + wait_secs )); else deadline=$(( now + 1800 )); fi
-  local final_status="running" killed="" spent="0"
+  local final_status="running" killed="" spent="0" crc=0
   local ids_csv; ids_csv=$(IFS=,; printf '%s' "${child_ids[*]}")
   while :; do
     local t; t=$(date +%s)
     killed=$(db "SELECT kill_requested FROM loop_runs WHERE loop_id=$(sqlq "$loop_id");")
     if [[ "$killed" == "1" ]]; then final_status="killed"; break; fi
-    spent=$(_loop_spent "$loop_id")
+    spent=$(_loop_ceiling_check "$loop_id" "$eff_ceiling") && crc=0 || crc=$?
     # DIVE-2083: name the ceiling breach as itself. It used to be labelled
     # "escalated", which is also what a --wait TIMEOUT produces, so the two
     # halts were indistinguishable to every caller — including the harness that
     # is supposed to grade them (a timed-out panel passed the ceiling test for
     # the wrong reason, and no assertion could tell).
-    if [[ "${spent:-0}" -ge "$eff_ceiling" ]]; then final_status="ceiling"; break; fi
+    # DIVE-2304: three states, not two. rc 2 = the spend could not be read at
+    # all, which used to arrive here as a 0 and read as "plenty of budget left".
+    if (( crc == 2 )); then final_status="spend-unreadable"; break; fi
+    if (( crc == 1 )); then final_status="ceiling"; break; fi
     local pending; pending=$(db "SELECT COUNT(*) FROM tasks WHERE id IN (${ids_csv}) AND status NOT IN ('done','rejected','escalated','cancelled');")
     if [[ "${pending:-1}" == "0" ]]; then final_status="complete"; break; fi
     (( t >= deadline )) && { final_status="timeout"; break; }
@@ -37156,13 +37251,14 @@ cmd_loop_map() {
   local -a results=(); local i; for (( i=0; i<n; i++ )); do results[$i]="null"; done
   local -A inflight          # index->tid for currently-live children
   local -a child_ids=()
-  local next=0 completed=0 ok_n=0 failed_n=0 live=0 halt="" spent="0"
+  local next=0 completed=0 ok_n=0 failed_n=0 live=0 halt="" spent="0" crc=0
   local poll="${LOOP_POLL_SECS:-4}"; local deadline=$(( now + ${timeout:-3600} ))
   while (( completed < n )); do
     local nowt; nowt=$(date +%s)
     [[ "$(db "SELECT kill_requested FROM loop_runs WHERE loop_id=$(sqlq "$loop_id");")" == "1" ]] && { halt="killed"; break; }
-    spent=$(_loop_spent "$loop_id")
-    (( ${spent:-0} >= eff_ceiling )) && { halt="escalated"; break; }
+    spent=$(_loop_ceiling_check "$loop_id" "$eff_ceiling") && crc=0 || crc=$?
+    (( crc == 2 )) && { halt="spend-unreadable"; break; }   # DIVE-2304: unreadable spend halts, never continues
+    (( crc == 1 )) && { halt="escalated"; break; }
     # dispatch up to the concurrency cap
     while (( live < eff_conc && next < n )); do
       local elem; elem=$(printf '%s' "$over" | jq -r ".[$next] | if type==\"string\" then . else (.|tojson) end")
@@ -37273,7 +37369,7 @@ cmd_loop_until_dry() {
 
   local seen_keys="[]" accum="[]"      # seen-set (all keys ever) + kept items
   local -a child_ids=()
-  local round_no=0 empty_streak=0 exit_reason="" spent="0"
+  local round_no=0 empty_streak=0 exit_reason="" spent="0" crc=0
   local poll="${LOOP_POLL_SECS:-4}"
   while :; do
     # termination caps (checked before each round)
@@ -37282,8 +37378,9 @@ cmd_loop_until_dry() {
     local elapsed=$(( $(date +%s) - now ))
     [[ -n "$max_runtime" ]] && (( elapsed >= max_runtime )) && { exit_reason="max-runtime"; break; }
     [[ "$(db "SELECT kill_requested FROM loop_runs WHERE loop_id=$(sqlq "$loop_id");")" == "1" ]] && { exit_reason="killed"; break; }
-    spent=$(_loop_spent "$loop_id")
-    (( ${spent:-0} >= eff_ceiling )) && { exit_reason="ceiling"; break; }
+    spent=$(_loop_ceiling_check "$loop_id" "$eff_ceiling") && crc=0 || crc=$?
+    (( crc == 2 )) && { exit_reason="spend-unreadable"; break; }   # DIVE-2304
+    (( crc == 1 )) && { exit_reason="ceiling"; break; }
 
     round_no=$((round_no+1))
     # Spawn one finder for this round; block-poll it to terminal.
@@ -40404,8 +40501,23 @@ _hb_loop_ceiling_sweep() {
     [[ -n "$lrow" ]] || continue
     IFS=$'\x1f' read -r lid ceil sby kids <<<"$lrow"
     [[ -n "$lid" && "$ceil" =~ ^[0-9]+$ ]] || continue
-    spent=$(_loop_refresh_spend "$lid" 2>/dev/null || echo 0)
-    [[ "$spent" =~ ^[0-9]+$ ]] || continue
+    # DIVE-2304: `2>/dev/null || echo 0` turned every failed read into "0 tokens
+    # spent", which is indistinguishable from an idle loop — so the sweep, the
+    # ONLY ceiling enforcement a fire-and-forget loop has, silently passed every
+    # breached loop while its recompute was broken. A read that did not happen
+    # is NOT-REACHED: say so in the log (the producer's stderr is deliberately
+    # not swallowed here either) and verify nothing this tick. tokens_spent is
+    # left at its last good value rather than clobbered to 0. Same shape as the
+    # DIVE-2273 materializer guard above: an instrument must not report a cause
+    # it did not observe.
+    spent=$(_loop_refresh_spend "$lid") || {
+      _hb_log "[loop-ceiling] ${lid} spend NOT-REACHED — ceiling NOT verified this tick (last good total left intact)"
+      continue
+    }
+    [[ "$spent" =~ ^[0-9]+$ ]] || {
+      _hb_log "[loop-ceiling] ${lid} spend NOT-REACHED (non-numeric '${spent}') — ceiling NOT verified this tick"
+      continue
+    }
     (( spent >= ceil )) || continue
     db "UPDATE loop_runs SET status='escalated', kill_requested=1, updated_at=$(date +%s)
         WHERE loop_id=$(sqlq "$lid") AND status='running';"
