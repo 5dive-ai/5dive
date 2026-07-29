@@ -138,7 +138,14 @@ grep -q 'serves a DIFFERENT bundle than this cut verified' "$WF" \
   || bad_t 'a wrong bundle served at the tag sha must be refused' ''
 # The tag deliberately survives a failed probe: auto-deleting it would erase the single
 # occurrence that proves the propagation window is real.
-grep -qE 'git (tag -d|push .*--delete)' "$WF" \
+# WIDENED after dev mutated it: the first cut caught `git tag -d` and
+# `git push --delete` and MISSED `git tag --delete` and `git push origin
+# :refs/tags/<tag>` — i.e. it caught the two forms nobody writes by accident and was
+# blind to the long flag and the classic empty-refspec delete. It is a NEGATIVE
+# assertion, so it passes by ABSENCE, and it was not in the mutation set: re-pointing
+# the probe reds the probe arms and leaves this one green. All four forms are graded
+# below by inserting each into a scratch copy.
+grep -qE 'git (tag (-d|--delete)|push .*(--delete|:refs/tags/))' "$WF" \
   && bad_t 'the cut deletes the tag on failure — that hides the one event worth seeing' '' \
   || ok_t 'a failed servability probe leaves the tag standing for a human to see'
 
