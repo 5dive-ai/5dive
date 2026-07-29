@@ -755,13 +755,21 @@ _goal_job_advance() {
   local killed ceil spent
   killed=$(db "SELECT COALESCE(kill_requested,0) FROM loop_runs WHERE loop_id=$(sqlq "$loop_id");")
   ceil=$(_goal_job_field "$job_id" ceiling)
-  spent=$(_loop_spent "$loop_id" 2>/dev/null || echo 0); [[ "$spent" =~ ^[0-9]+$ ]] || spent=0
+  # DIVE-2304: `|| echo 0` here was the same fail-open as the producer's — an
+  # unreadable spend became "0 tokens used" and the job sailed past its ceiling.
+  # A spend that could not be read is NOT-REACHED and fails the job, because a
+  # ceiling that was never evaluated has not been respected.
+  local spend_ok=1
+  spent=$(_loop_spent "$loop_id") || spend_ok=0
+  [[ "$spent" =~ ^[0-9]+$ ]] || { spend_ok=0; spent=""; }
   if [[ "$killed" == "1" ]] \
-     || { [[ -n "$ceil" && "$ceil" =~ ^[0-9]+$ ]] && (( spent >= ceil )) && [[ "$tstatus" != "done" ]]; } \
+     || { (( ! spend_ok )) && [[ "$tstatus" != "done" ]]; } \
+     || { [[ -n "$ceil" && "$ceil" =~ ^[0-9]+$ ]] && (( spend_ok ? spent >= ceil : 0 )) && [[ "$tstatus" != "done" ]]; } \
      || [[ "$tstatus" == "escalated" || "$tstatus" == "rejected" || "$tstatus" == "cancelled" ]]; then
     local reason="planner did not return a plan (loop ${tstatus:-halted})"
     [[ "$killed" == "1" ]] && reason="planner loop was killed"
-    { [[ -n "$ceil" && "$ceil" =~ ^[0-9]+$ ]] && (( spent >= ceil )); } && reason="planner hit its token ceiling (${spent}/${ceil}tok)"
+    (( spend_ok )) || reason="planner spend NOT-REACHED — token ceiling could not be verified"
+    { (( spend_ok )) && [[ -n "$ceil" && "$ceil" =~ ^[0-9]+$ ]] && (( spent >= ceil )); } && reason="planner hit its token ceiling (${spent}/${ceil}tok)"
     local payload
     payload=$(jq -cn --arg j "$job_id" --arg r "$reason" --arg p "$planner" '{ok:true, data:{job:$j, status:"failed", reason:$r, planner:$p}}')
     db "UPDATE goal_jobs SET status='failed', result_json=$(sqlq "$payload"), updated_at=$(date +%s) WHERE job_id=$(sqlq "$job_id");" >/dev/null 2>&1 || true

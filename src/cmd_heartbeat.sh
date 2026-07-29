@@ -2244,8 +2244,23 @@ _hb_loop_ceiling_sweep() {
     [[ -n "$lrow" ]] || continue
     IFS=$'\x1f' read -r lid ceil sby kids <<<"$lrow"
     [[ -n "$lid" && "$ceil" =~ ^[0-9]+$ ]] || continue
-    spent=$(_loop_refresh_spend "$lid" 2>/dev/null || echo 0)
-    [[ "$spent" =~ ^[0-9]+$ ]] || continue
+    # DIVE-2304: `2>/dev/null || echo 0` turned every failed read into "0 tokens
+    # spent", which is indistinguishable from an idle loop — so the sweep, the
+    # ONLY ceiling enforcement a fire-and-forget loop has, silently passed every
+    # breached loop while its recompute was broken. A read that did not happen
+    # is NOT-REACHED: say so in the log (the producer's stderr is deliberately
+    # not swallowed here either) and verify nothing this tick. tokens_spent is
+    # left at its last good value rather than clobbered to 0. Same shape as the
+    # DIVE-2273 materializer guard above: an instrument must not report a cause
+    # it did not observe.
+    spent=$(_loop_refresh_spend "$lid") || {
+      _hb_log "[loop-ceiling] ${lid} spend NOT-REACHED — ceiling NOT verified this tick (last good total left intact)"
+      continue
+    }
+    [[ "$spent" =~ ^[0-9]+$ ]] || {
+      _hb_log "[loop-ceiling] ${lid} spend NOT-REACHED (non-numeric '${spent}') — ceiling NOT verified this tick"
+      continue
+    }
     (( spent >= ceil )) || continue
     db "UPDATE loop_runs SET status='escalated', kill_requested=1, updated_at=$(date +%s)
         WHERE loop_id=$(sqlq "$lid") AND status='running';"
