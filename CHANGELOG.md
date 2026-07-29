@@ -1,5 +1,33 @@
 # Changelog
 
+## Unreleased — fix(up): a skill that FAILED to install is no longer summarised as `errors=0` (DIVE-2347)
+
+`agent create` does not fail when a preseeded skill won't install, and that is the right
+call — the agent itself is up and a rerun fixes the skill. The consequence was not: the
+failure never reached `5dive up`'s `errors` counter, so the last line the user read
+contradicted the red lines they had just watched scroll past.
+
+Measured on the shipped content-studio template, whose writer and seo roles both request
+a skill that is not in the repo the template names:
+
+```
+error: skill install failed for 'deep-research' on agent 'writer'
+warn:  skill install failed for 'deep-research' from '5dive-ai/skills' (exit 1) — agent is up; rerun: ...
+OK — applied ...: created=5 started=0 skipped=0 errors=0
+```
+
+A first run that reports success while two things failed is worse than one that fails
+loudly: the customer concludes he broke it.
+
+The summary now carries `skills_failed=<n>`, and a consolidated block after it names each
+agent and the exact rerun command. This is the same defect and the same remedy as the
+asleep row (DIVE-2341) — a true statement made once mid-scroll, then overwritten by a
+cheerful one — so it is derived the same way: read back the INSTALLED SET via
+`_skill_list_json` (the reader `skill list` already uses) rather than trusting the create's
+exit code or scraping its render. Display only; it cannot fail a create.
+
+Not fixed here, and deliberately: the templates that request the missing skill. That is a
+separate call about what the templates should ask for — see DIVE-2347.
 ## Unreleased — fix(doctor): a FAILED env-override report no longer reads as "no overrides set" (DIVE-2336)
 
 Both consumers of `_env_overrides_json` wrapped it twice — `|| printf '{}'` and
