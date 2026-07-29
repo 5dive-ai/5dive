@@ -290,6 +290,14 @@ USAGE
 }
 
 main() {
+  # DIVE-2249: mark that this process entered through the real CLI entrypoint.
+  # The tasks-store fence (src/lib/tasks_db.sh) allows writes to the PRODUCTION
+  # board only from here — a harness that sources the libraries directly never
+  # runs main, so its writes are refused instead of appending real-looking fixture
+  # rows to the live board. Keep this the FIRST statement in main: anything above
+  # it that touched the store would be fenced against its own entrypoint.
+  _TASKS_STORE_ENTRY=cli
+
   # Global --json: strip every occurrence before dispatch so each subcommand
   # gets the same arg shape regardless of where the flag was placed.
   local -a rest=()

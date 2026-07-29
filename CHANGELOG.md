@@ -1,5 +1,60 @@
 # Changelog
 
+## Unreleased — fix(tasks): the production task board refuses a write from a sourced-library caller, so a harness cannot leak fixture rows onto it (DIVE-2249)
+
+On 2026-07-27 a run of `tests/gate_verifier_route_unit.sh` appended six fixture rows to the
+LIVE board — DIVE-501 through DIVE-506, `created_by=dev`, empty bodies, all inside a
+four-second window. They were not inert: `5dive trace DIVE-503` shows two real gate
+deliveries and a human-facing gate that agent-main then had to withdraw by hand.
+
+REPRODUCED, not inferred. Inside a private mount namespace with `/var/lib/5dive` bind-mounted
+onto a decoy copy of the board, the current harness leaks nothing (0 rows, 9/9 pass). Remove
+its single `STATE_DIR` line and the same six idents land with the same `created_by`,
+`verifier` and `maker_agent` values, and nothing refuses them. So the isolation works when
+present, it is one line, and its absence is silent.
+
+`db`, `dbfmt` and `tasks_db_init` now refuse a non-READ statement whose active store resolves
+to the production board unless the process entered through the real CLI entrypoint (`main`
+sets a marker). Reads are untouched; an isolated store is untouched. The refusal is loud —
+exit 10 on stderr, and the process stops there, so a fenced harness goes RED rather than
+passing having asserted nothing.
+
+THE FENCE IS NARROW, NOT WEAK. It covers what enters through `main()`; it cannot see a
+foreign client opening the .db directly, which the dashboard API does. Knowing which of those
+two a guard is tells you when to trust it — a weak guard should be strengthened or distrusted,
+a narrow one trusted inside its scope and supplemented outside it. This sentence is here
+rather than only in the residue note below because the note is read once and the name is read
+forever, and "store fence" on its own will be read as "the board is protected from stray
+writes", which is not a claim it makes.
+
+The discriminator is ENTRYPOINT, not an opt-out env var. Every legitimate prod write comes
+from the built bundle, whose last line is `main "$@"`, and `build.sh` is the only non-test
+file in the repo that sources this library — so "sourced the library, then aimed a write at
+the prod path" is a mistake by construction. A harness that sets nothing is fenced, including
+harnesses nobody has written yet. An opt-out is a thing you have to remember, and a forgotten
+one fails silently INTO prod, which is the defect being removed (same reasoning as DIVE-1968
+and DIVE-2010).
+
+This is the fourth instance of one class. Gate-notify (DIVE-1500), the human DM relay
+(DIVE-1506) and audit_log (DIVE-2010) were each fenced in turn, and all three are OUTBOUND
+rails. The tasks table is the store those rails read FROM, so it is the one that most needed
+a fence and the only one that had none.
+
+TWO CORRECTIONS THE CORPUS FORCED, neither of which the fence's own unit test could see.
+The first draft resolved "is this prod" through `FIVEDIVE_PROD_TASKS_DB` — the obvious choice,
+and wrong: 23 harnesses already export it pointing at their own throwaway store, which is how
+they open the DIVE-1506 human-send allowlist. That fence would have refused 23 correctly-
+isolated suites and protected the real board from nothing, while its unit test stayed green.
+Found by running all 223 harnesses against a bind-mounted decoy board. The prod path is now
+hardcoded and unconditional; `FIVEDIVE_FENCE_EXTRA_STORE` only ADDS to the fenced set, so the
+override cannot become an escape. The second: the SQL check was a verb blocklist, which let
+`ATTACH DATABASE` through under differential test. It is now a read allowlist — everything
+unrecognised counts as a write, so the failure mode is a refused read rather than an admitted
+one. A change to shared plumbing is graded by the corpus, not by the arm you wrote for it.
+
+RESIDUE, named rather than implied: this fences the shell library's writers. It does NOT
+fence a process that opens the .db with its own sqlite3 or node client — the dashboard API
+reads the board that way. Closing that needs file-level permissions, not a function guard.
 ## Unreleased — fix(heartbeat): the dispatcher claims the task it nudges, so the whole stuck-work recovery layer stops reading a dead field (DIVE-2244)
 
 A fleet-stall alarm fired on a fleet that was not stalled. Root-causing it found something more
