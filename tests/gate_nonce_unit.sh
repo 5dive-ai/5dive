@@ -2,7 +2,10 @@
 # DIVE-916 isolated unit harness for the per-gate HUMAN nonce that closes the
 # sudo->--human gate-forge, folded into the DIVE-931 secret-drop chain:
 #   * `task need --type=approval|secret|manual` mints human_nonce_hash (hash-only
-#     at rest); decision does NOT (agent-clearable).
+#     at rest); a TIER 0/1 decision does NOT (genuinely agent-clearable). Since
+#     DIVE-2356 the condition is "hard-human TYPE **or** tier>=2", so a tier-2
+#     decision mints too — T2 below pins the tier-1 side of that boundary, and
+#     gate_tier2_decision_nonce_unit.sh owns the tier-2 side.
 #   * the RAW nonce reaches task_need_notify (embedded in the tap callback_data)
 #     and hashes back to the stored value.
 #   * `task answer` clears an approval/secret/manual gate under enforcement iff
@@ -102,13 +105,20 @@ for ty in approval secret manual; do
   else bad_t "T1 $ty raw nonce -> notify hashes to stored" "nonce='$NOTIFY_NONCE' h='$h'"; fi
 done
 
-# --- T2: decision gate mints NO nonce (agent-clearable) -----------------------
+# --- T2: a TIER-1 decision gate mints NO nonce (genuinely agent-clearable) ----
+#     DIVE-2356: the tier is now load-bearing for this assertion, so assert it
+#     rather than relying on "decision defaults to tier 1 and 'pick' trips no
+#     floor". If either ever moves, this gate would land at tier 2 and T2 would
+#     quietly invert from "the boundary holds" to "the mint is broken".
 seed_task DIVE-200
 NOTIFY_NONCE="sentinel"
 cmd_task_need DIVE-200 --type=decision --ask="pick" --options="A|B" --recommend="A" >/dev/null 2>&1
+t=$(db "SELECT COALESCE(tier,'') FROM tasks WHERE ident='DIVE-200';")
+[[ "$t" == "1" ]] && ok_t "T2 precondition: gate landed at tier 1" \
+  || bad_t "T2 precondition: gate landed at tier 1" "got tier '$t' — the no-nonce assertion below is no longer about tier 1"
 h=$(db "SELECT COALESCE(human_nonce_hash,'null') FROM tasks WHERE ident='DIVE-200';")
-[[ "$h" == "null" || -z "$h" ]] && ok_t "T2 decision gate mints no nonce" \
-  || bad_t "T2 decision gate mints no nonce" "got: '$h'"
+[[ "$h" == "null" || -z "$h" ]] && ok_t "T2 tier-1 decision gate mints no nonce" \
+  || bad_t "T2 tier-1 decision gate mints no nonce" "got: '$h'"
 [[ -z "$NOTIFY_NONCE" ]] && ok_t "T2 decision passes empty nonce to notify" \
   || bad_t "T2 decision passes empty nonce to notify" "got: '$NOTIFY_NONCE'"
 

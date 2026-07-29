@@ -1641,31 +1641,37 @@ _hb_gate_renag_batch() { # <recipient_agent> <comma-separated task ids> <route_l
   local text="🔁 Gate reminder — unanswered gates (${route_label}):"
   [[ -n "$_escalated_from" ]] \
     && text+=$'\n'"↑ filed by ${_escalated_from} (no channel of its own) — escalated to you"
-  local rows='[]' row id ident ntype options recommend ask nonce="" markup=""
+  local rows='[]' row id ident ntype options recommend gtier ask nonce="" markup="" _mint_n=0
   local -a nonce_ids=() nonce_hashes=()
   while IFS= read -r row; do
     [[ -n "$row" ]] || continue
-    IFS=$'\x1f' read -r id ident ntype options recommend ask <<<"$row"
+    IFS=$'\x1f' read -r id ident ntype options recommend gtier ask <<<"$row"
     [[ -n "$id" && -n "$ident" ]] || continue
     text+=$'\n\n'"• [${ident}] ${ntype} — ${ask} /task_${id}"
     [[ -n "$recommend" ]] && text+=$'\n'"  ✅ Recommended: ${recommend}"
     [[ -n "$options" ]] && text+=$'\n'"  Options: ${options}"
 
-    nonce=""
-    case "$ntype" in
-      approval|secret|manual)
-        nonce=$(_human_nonce_mint)
-        if [[ -n "$nonce" ]]; then
-          nonce_ids+=("$id")
-          nonce_hashes+=("$(_human_nonce_sha "$nonce")")
-        fi
-        ;;
-    esac
+    # DIVE-2356: hard-human TYPE **or** tier>=2 (matches the cmd_task_need mint).
+    # This sweep is the rescue path for gates filed BEFORE the widened mint — a
+    # tier-2 decision that has been sitting nonce-less picks one up on its first
+    # re-nag rather than waiting to be re-filed. `tier` is now selected below.
+    nonce=""; _mint_n=0
+    case "$ntype" in approval|secret|manual) _mint_n=1 ;; esac
+    [[ "${gtier:-}" =~ ^[0-9]+$ ]] && (( gtier >= 2 )) && _mint_n=1
+    if (( _mint_n )); then
+      nonce=$(_human_nonce_mint)
+      if [[ -n "$nonce" ]]; then
+        nonce_ids+=("$id")
+        nonce_hashes+=("$(_human_nonce_sha "$nonce")")
+      fi
+    fi
     markup=$(_task_gate_reply_markup "$id" "$ntype" "$options" "$recommend" "$nonce" "$TASK_CH_TYPE" "$ident")
     if [[ -n "$markup" ]]; then
       rows=$(jq -cn --argjson a "$rows" --argjson b "$markup" '$a + ($b.inline_keyboard // [])' 2>/dev/null) || rows='[]'
     fi
-  done < <(db "SELECT id||x'1f'||ident||x'1f'||need_type||x'1f'||COALESCE(need_options,'')||x'1f'||COALESCE(recommend,'')||x'1f'||substr(replace(COALESCE(ask,''),x'0a',' '),1,240)
+    # `ask` stays LAST so it remains the greedy tail of the `read`; tier is
+    # spliced in ahead of it rather than appended after it.
+  done < <(db "SELECT id||x'1f'||ident||x'1f'||need_type||x'1f'||COALESCE(need_options,'')||x'1f'||COALESCE(recommend,'')||x'1f'||COALESCE(tier,'')||x'1f'||substr(replace(COALESCE(ask,''),x'0a',' '),1,240)
                FROM tasks WHERE id IN (${idlist}) ORDER BY COALESCE(need_asked_at,updated_at,created_at),id;")
 
   local reply_markup=""
