@@ -12,6 +12,19 @@
 # from `id` and never from the resolver being graded.
 # Run: bash tests/gate_actor_path_forgery_unit.sh   (no root, no network)
 set -uo pipefail
+
+# DIVE-2211 / DIVE-2286: name the tree this harness grades. Sourced BEFORE the cd
+# so ${BASH_SOURCE[0]} still resolves relative to tests/. Three-state on purpose:
+# if the helper is unreachable the log says NO TREE WAS NAMED rather than falling
+# silent. Deliberately NO `2>/dev/null` on the source line — redirecting it also
+# swallows the helper's own stderr line, which IS the payload, and that is what
+# silenced all 210 harnesses at once.
+#
+# This harness shipped WITHOUT this line and names_the_tree_contract_unit caught
+# it in CI (dev, on DIVE-2330 iteration 3). Worth the note: a harness added to fix
+# a naming-blindness defect was itself naming no tree.
+. "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh" \
+  || printf 'grading tree: UNRESOLVED (tests/lib/grading_tree.sh not reachable; no tree named)\n' >&2
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 PASS=0; FAIL=0; SKIP=0
 ok(){ PASS=$((PASS+1)); printf 'ok   - %s\n' "$1"; }
