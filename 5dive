@@ -33958,6 +33958,25 @@ _council_veto_offer_eligible() {
   return 0
 }
 
+# DIVE-2257 iteration 2 — a primary-council convene with NO subject must FAIL LOUDLY, at convene
+# time, before anything seals. Iteration 1 refused only the OFFER (rc 2 -> record the omission and
+# convene anyway): the convene still succeeded, the receipt still sealed, and the founder veto
+# silently did not exist — which is strictly worse than a control that refuses to start, and made
+# DIVE-2221's acceptance ("a veto offer sent with a window still open, and a tap inside it blocked
+# execution") unmeetable because there was nothing to tap.
+# SCOPE: the primary council only — already the only bench eligible for the veto. Ad-hoc panels
+# (`--seats=…`) and alternate benches convene and seal exactly as before, untouched.
+# Pure: no clock, no state, no I/O. rc 0 -> proceed; rc 1 -> refuse, message on stdout.
+_council_convene_subject_check() {
+  local elig_rc="${1:-0}" genesis="${2:-0}"
+  # Without a sealed genesis a primary convene already fails closed downstream (cli.mjs exits 8),
+  # so there is no path on which a subject-less primary convene can SUCCEED.
+  [[ "$genesis" == "1" ]] || return 0
+  [[ "$elig_rc" == "2" ]] || return 0
+  printf '%s' "a primary-council convene needs a SUBJECT: pass --subject=<task ident or one line saying what this decides>. The founder veto is offered on this bench, and an offer that cannot name WHAT is being vetoed is not a governance record — refusing to convene rather than sealing a receipt whose veto silently does not exist."
+  return 1
+}
+
 _council_veto_offer_omitted() {
   local why="${1:-}" line=""
   mkdir -p "$COUNCIL_DIR" 2>/dev/null || true
@@ -34633,7 +34652,9 @@ _council_rot_triage() {
     # Convene the triage question (the guardrail phase1 with --triage builds it). NEVER clears.
     local plan1 q; plan1="$(node "$dir/cli.mjs" gate-map --gate="$gate" --triage)" || continue
     q="$(printf '%s' "$plan1" | jq -r '.question')"
-    local env verdict; env="$(_council_convene_json "$q" --mode=adversarial)" || continue
+    # DIVE-2257: a rot-triage convene runs the PRIMARY council, so it must name its subject — the
+    # gate's own task ident, which is exactly what this convene is deciding about.
+    local env verdict; env="$(_council_convene_json "$q" --mode=adversarial --subject="$it")" || continue
     verdict="$(printf '%s' "$env" | jq -c '.data.verdict')"; [[ -n "$verdict" && "$verdict" != "null" ]] || continue
     local plan2 cmd; plan2="$(node "$dir/cli.mjs" gate-map --gate="$gate" --triage --verdict="$verdict")" || continue
     # Belt-and-suspenders: the pure mapper never emits `task answer` for a triage, but assert it here
@@ -35089,7 +35110,9 @@ _council_schedule_run() {
   if [[ -n "${SCHED_PARSE_TEST:-}" ]]; then
     cp "$SCHED_PARSE_TEST" "$env_out" 2>/dev/null || true
   else
-    local -a cargs=(convene "$question" --mode="$mode" --timeout="$bd" --ballot-deadline="$bd" --json)
+    # DIVE-2257: a scheduled convene on the default (primary) bench must name its subject — the
+    # schedule is what it decides, and without one the convene is now refused up front.
+    local -a cargs=(convene "$question" --mode="$mode" --timeout="$bd" --ballot-deadline="$bd" --subject="schedule:$name" --json)
     [[ -n "$bench" && "$bench" != "council" ]] && cargs+=(--bench="$bench")
     [[ -n "$cls" ]] && cargs+=(--class="$cls")
     5dive council "${cargs[@]}" > "$env_out" 2>"$COUNCIL_SCHED_RUNS/$name-$date.err" || true
@@ -35362,8 +35385,12 @@ cmd_council() {
   # An ad-hoc panel not reaching the founder is NORMAL (cli.mjs already treats an explicit --seats
   # panel as a non-governance thing), so only the anomalous case — the primary council convening
   # with nothing to name as its subject — is written.
-  if (( genesis_exists )) && (( _cv_elig == 2 )); then
-    _council_veto_offer_omitted "no --subject on this convene: a veto offer that cannot say WHAT it is vetoing is not a governance record" || true
+  # ITERATION 2: this is now a LOUD REFUSAL, not a silent omission. The omission row is still
+  # written (an offer the council declines to make stays auditable), then the convene ABORTS.
+  local _cv_refusal=""
+  if ! _cv_refusal="$(_council_convene_subject_check "$_cv_elig" "$genesis_exists")"; then
+    _council_veto_offer_omitted "primary-council convene REFUSED at convene time: no --subject, so its founder-veto offer could not name what it vetoes" || true
+    fail "$E_USAGE" "$_cv_refusal"
   fi
   if (( genesis_exists )) && (( _cv_elig == 0 )) && [[ -n "$offer_subject" ]]; then
     local g_principal g_resolved

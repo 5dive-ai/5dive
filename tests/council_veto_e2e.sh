@@ -63,8 +63,13 @@ EOF
   || { echo "FAIL: council init (cannot seal genesis — no gate-proof rail?)"; exit 1; }
 
 OFFERSINK="$TMP/offer.sink"
+# DIVE-2257: this fixture used to convene an AD-HOC panel (`--seats=a:chair,b,c`) and expect the
+# founder veto to be offered on it. Under the FINDING-2 fence only the PRIMARY (genesis-sealed)
+# council may reach the founder, and under FINDING 3 that bench must NAME ITS SUBJECT — so the
+# fixture now convenes the real bench, with a subject, exactly as a governed convene must.
+# Both halves are load-bearing: drop either and no offer is minted and every leg below goes dark.
 COUNCIL_VETO_NONCE_SINK="$SINK" COUNCIL_VETO_OFFER_SINK="$OFFERSINK" \
-  "$FIVE" council convene "e2e: ship the thing?" --seats="a:chair,b,c" --mode=quick >/dev/null 2>&1 \
+  "$FIVE" council convene "e2e: ship the thing?" --subject="DIVE-2257" --mode=quick >/dev/null 2>&1 \
   || { echo "FAIL: council convene"; exit 1; }
 RCPT="$(ls -1 "$TMP/council/receipts/"*.json 2>/dev/null | head -1)"
 [[ -f "$RCPT" ]] || { echo "FAIL: no sealed receipt produced"; exit 1; }
@@ -201,7 +206,7 @@ grep -q '"event":"forge-attempt-veto-by"' "$TMP/council/veto-audit.jsonl" 2>/dev
   && ok "forge attempt written to the durable veto audit" || no "forge attempt not logged"
 
 # --- hardening: a tampered receipt canonical is refused (re-seal mismatch) -----------------------
-COUNCIL_VETO_NONCE_SINK="$TMP/n2" "$FIVE" council convene "second convene" --seats="a:chair,b,c" --mode=quick >/dev/null 2>&1
+COUNCIL_VETO_NONCE_SINK="$TMP/n2" "$FIVE" council convene "second convene" --subject="DIVE-2257" --mode=quick >/dev/null 2>&1
 RCPT2="$(ls -1t "$TMP/council/receipts/"*.json | grep -v '/veto-' | head -1)"
 DIG2="$(jq -r '.sealedDigest' "$RCPT2")"; N2="$(cat "$TMP/n2")"
 jq '.canonical = (.canonical + " TAMPERED")' "$RCPT2" > "$TMP/rt.json" && cp "$TMP/rt.json" "$RCPT2"
@@ -217,7 +222,7 @@ fi
 # from the SEALED canonical (seal-augment folded it in), so the wrapper edit is ignored and the
 # attacker's nonce fails authentication. .canonical is left INTACT here (re-seal still passes) to
 # prove it is the seal-binding read — not the existing re-seal check — that closes this hole.
-COUNCIL_VETO_NONCE_SINK="$TMP/n3" "$FIVE" council convene "third convene" --seats="a:chair,b,c" --mode=quick >/dev/null 2>&1
+COUNCIL_VETO_NONCE_SINK="$TMP/n3" "$FIVE" council convene "third convene" --subject="DIVE-2257" --mode=quick >/dev/null 2>&1
 RCPT3="$(ls -1t "$TMP/council/receipts/"*.json | grep -v '/veto-' | head -1)"
 DIG3="$(jq -r '.sealedDigest' "$RCPT3")"
 ATT_NONCE="attackerchosennonce0000000000000"
@@ -227,6 +232,25 @@ if "$FIVE" council veto exercise --receipt="$DIG3" --nonce="$ATT_NONCE" --tier=h
 else
   ok "swapped wrapper .vetoNonceDigest refused — exercise reads the digest from the sealed canonical"
 fi
+
+# --- DIVE-2257 iteration 2: a PRIMARY convene with NO subject is REFUSED **at convene time** ------
+# Under the iteration-1 build this convene SUCCEEDED: it sealed a receipt and quietly emitted no
+# veto offer at all, so the founder veto stopped existing without a single red anywhere. A suite
+# that only ever exercises the subject-BEARING path cannot see that class, so grade the bare one.
+# Two-sided by construction: the subject-bearing convenes above must (and do) still seal + offer.
+RCPTS_BEFORE="$(ls -1 "$TMP/council/receipts/"*.json 2>/dev/null | wc -l | tr -d ' ')"
+NOSUBJ="$(COUNCIL_VETO_NONCE_SINK="$TMP/nsubj" "$FIVE" council convene "subject-less convene" --mode=quick 2>&1)"; rcns=$?
+[[ "$rcns" -ne 0 ]] && ok "a primary-council convene with NO --subject is REFUSED (rc=$rcns)" || no "subject-less primary convene was NOT refused (rc=$rcns)"
+printf '%s' "$NOSUBJ" | grep -q -- '--subject' && ok "the refusal names the --subject flag the caller must supply" || no "the refusal does not name --subject (got: $NOSUBJ)"
+RCPTS_AFTER="$(ls -1 "$TMP/council/receipts/"*.json 2>/dev/null | wc -l | tr -d ' ')"
+[[ "$RCPTS_BEFORE" == "$RCPTS_AFTER" ]] && ok "the refused convene sealed NO receipt (receipts $RCPTS_BEFORE -> $RCPTS_AFTER)" || no "a refused convene still sealed a receipt ($RCPTS_BEFORE -> $RCPTS_AFTER)"
+[[ ! -s "$TMP/nsubj" ]] && ok "the refused convene minted no veto nonce" || no "a refused convene still minted a veto nonce"
+grep -q '"kind":"veto-offer-omitted"' "$TMP/council/veto-pings.jsonl" 2>/dev/null \
+  && ok "the refusal is recorded in the veto ledger (auditable, not just an exit code)" || no "no veto-offer-omitted row for the refused convene"
+# ...and the requirement is PRIMARY-BENCH ONLY: an ad-hoc panel (never veto-eligible) is untouched.
+"$FIVE" council convene "ad-hoc, no subject" --seats="a:chair,b,c" --mode=quick >/dev/null 2>&1 \
+  && ok "an AD-HOC panel with no subject still convenes (the requirement is primary-bench only)" \
+  || no "the subject requirement leaked onto ad-hoc panels"
 
 echo "CNCL-9 veto e2e: $pass passed, $fail failed"
 [[ "$fail" -eq 0 ]]
