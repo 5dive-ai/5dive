@@ -151,5 +151,26 @@ else
   bad_t "guard: fail-open case says so, rather than silently exiting 0" "$out"
 fi
 
+# --- fail LOUD (not open) when the detection mechanism itself can't tell ---
+# DIVE-2286 review (main): "could not determine" must not collapse into
+# "nothing to flag" -- that fold IS the DIVE-2274 class this epic exists to
+# catch. An unresolvable BASE makes `git diff` itself fail, which must BLOCK
+# (exit 1) with its own distinct message, not silently report clear the way
+# the old `2>/dev/null || true` collector used to.
+git checkout -q "$c0"
+out="$(bash "$GUARD" "$c0" "not-a-real-rev-at-all" 2>&1)"; rc=$?
+assert_exit "guard: BLOCKS (not silently passes) when git diff itself cannot enumerate added files" 1 "$rc"
+if [[ "$out" == *"could not enumerate"* ]]; then
+  ok_t "guard: names the could-not-enumerate failure distinctly from a real violation"
+else
+  bad_t "guard: names the could-not-enumerate failure distinctly from a real violation" "$out"
+fi
+
+# Sanity: prove the loud-refusal above has teeth and isn't just always-blocking
+# regardless of BASE -- a genuinely valid BASE right next to the bad one above
+# must still pass cleanly when the added harness is compliant.
+bash "$GUARD" "$c2" "$c0" >/dev/null 2>&1
+assert_exit "guard: sanity — a valid BASE right beside the bad one above still passes a compliant add" 0 "$?"
+
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 (( FAIL == 0 ))

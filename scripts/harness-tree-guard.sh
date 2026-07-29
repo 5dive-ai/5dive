@@ -24,6 +24,23 @@
 # this guard and the CI contract cannot independently drift into checking
 # two different things under the same name.
 #
+# WHAT HAPPENS WHEN THIS GUARD CANNOT TELL, stated explicitly rather than left
+# to be inferred from the code (DIVE-2286 review, main): "could not determine"
+# is not the same claim as "nothing to flag", and folding the two together is
+# exactly the DIVE-2274 class this whole epic is about -- a check that cannot
+# run and reports clean. Two different unknowns, two different answers:
+#   - The guard's OWN dependency is unreadable (tests/lib/grading_tree_source_re.sh
+#     missing at NEW -- expected on a branch cut before this guard shipped):
+#     FAILS OPEN, loudly (a message on stderr, exit 0), matching the existing
+#     documented convention for every guard in this hook -- see
+#     scripts/git-hooks/pre-push's own "fail OPEN with a warning if their
+#     script is missing" note. The CI contract test is the net for this case.
+#   - THE DETECTION MECHANISM ITSELF fails (git diff cannot enumerate what
+#     this push added, or git show cannot read a file diff just told us was
+#     added): FAILS LOUD, exit 1, refusing the push rather than silently
+#     reporting clear. Nothing was actually checked in that case, and a guard
+#     that reports clean when it checked nothing is worse than no guard.
+#
 # Usage: harness-tree-guard.sh <new-rev> [<base-rev>=origin/main]
 # Exit 0 = clear to push. Exit 1 = blocked, reason + fix snippet on stderr.
 set -uo pipefail
@@ -44,7 +61,14 @@ if [[ -z "${GRADING_TREE_SOURCE_RE:-}" ]]; then
   exit 0
 fi
 
-mapfile -t ADDED < <(git diff --name-only --diff-filter=A "$BASE" "$NEW" -- 'tests/*.sh' 2>/dev/null || true)
+if ! diff_out="$(git diff --name-only --diff-filter=A "$BASE" "$NEW" -- 'tests/*.sh' 2>&1)"; then
+  echo "harness-tree-guard: BLOCKED -- could not enumerate tests/*.sh files added by this push (git diff --diff-filter=A $BASE $NEW failed: $diff_out). Refusing rather than silently reporting clear, since nothing was actually checked." >&2
+  exit 1
+fi
+ADDED=()
+while IFS= read -r line; do
+  [[ -n "$line" ]] && ADDED+=("$line")
+done <<< "$diff_out"
 (( ${#ADDED[@]} == 0 )) && exit 0
 
 # The exact two functional lines every passing harness carries, plus the
@@ -66,8 +90,11 @@ SNIPPET
 
 fail=0
 for f in "${ADDED[@]}"; do
-  content="$(git show "${NEW}:${f}" 2>/dev/null || true)"
-  [[ -z "$content" ]] && continue
+  if ! content="$(git show "${NEW}:${f}" 2>&1)"; then
+    echo "harness-tree-guard: BLOCKED -- could not read $f at $NEW even though git diff reported it as newly added ($content). Refusing rather than silently skipping a file nothing was actually checked." >&2
+    fail=1
+    continue
+  fi
   if ! printf '%s\n' "$content" | grep -qE "$GRADING_TREE_SOURCE_RE"; then
     echo "harness-tree-guard: BLOCKED -- $f is a new harness that does not source tests/lib/grading_tree.sh (DIVE-2211 contract)." >&2
     echo "  FIX -- paste this immediately after \`set -uo pipefail\` in $f:" >&2
