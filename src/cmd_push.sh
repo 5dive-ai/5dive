@@ -345,6 +345,22 @@ _push_validate_inputs() {
 # guards as a friendly pre-flight (so --dry-run needs no privilege and errors are
 # clear), then hand the actual gated push to the root-only `_push_do`. The agent
 # never receives a token.
+
+# Does <branch> change anything under .github/workflows/ relative to the
+# remote's default branch? Decides whether the delegated-push token needs
+# workflows:write on top of contents:write (gh#250).
+# Echoes "yes" | "no" | "unknown" — unknown when no range can be computed.
+_push_touches_workflows() { # <repopath> <repourl> <branch>
+  local repopath="$1" repourl="$2" branch="$3" b base="" files
+  local -a g=(git -C "$repopath" -c "safe.directory=$repopath")
+  for b in main master; do
+    if "${g[@]}" fetch --quiet "$repourl" "$b" 2>/dev/null; then base="FETCH_HEAD"; break; fi
+  done
+  [[ -n "$base" ]] || { echo "unknown"; return; }
+  files=$("${g[@]}" diff --name-only "${base}...refs/heads/${branch}" 2>/dev/null)     || { echo "unknown"; return; }
+  if grep -qE '^\.github/workflows/' <<<"$files"; then echo "yes"; else echo "no"; fi
+}
+
 cmd_push() {
   tasks_db_init
   local branch="" repo="" dry=0 yes=0
@@ -604,7 +620,24 @@ cmd_push_do() {
   # org repos, and the scoped body caps the permission to the one op we need.
   local reponame body tok
   reponame=$(_push_repo_name "$repourl")
-  body=$(jq -cn --arg r "$reponame" '{repositories:[$r],permissions:{contents:"write"}}')
+  # gh#250: contents:write alone CANNOT push .github/workflows/* — GitHub
+  # refuses the push outright, and the error names the App's permissions rather
+  # than this token's, so the operator chases the wrong thing. Ask for
+  # workflows:write only when the branch actually touches a workflow file, so
+  # the ordinary push keeps the one-permission scope DIVE-1460 intended.
+  #
+  # 'unknown' (no remote default branch reachable, so no range to diff) includes
+  # the permission and says so: match the insurance to the recoverability — a
+  # slightly over-scoped token for one gated push is bounded and visible, a push
+  # that fails after the human already cleared the gate is not.
+  local _wf; _wf=$(_push_touches_workflows "$repopath" "$repourl" "$branch")
+  if [[ "$_wf" == "no" ]]; then
+    body=$(jq -cn --arg r "$reponame" '{repositories:[$r],permissions:{contents:"write"}}')
+  else
+    [[ "$_wf" == "unknown" ]] \
+      && echo "[5dive] cannot diff ${branch} against the remote default branch — requesting workflows:write defensively" >&2
+    body=$(jq -cn --arg r "$reponame" '{repositories:[$r],permissions:{contents:"write",workflows:"write"}}')
+  fi
   tok=$(curl -fsS --max-time 15 -X POST \
         -H "Authorization: Bearer ${jwt}" \
         -H "Accept: application/vnd.github+json" \
