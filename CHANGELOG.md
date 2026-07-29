@@ -1,5 +1,36 @@
 # Changelog
 
+## Unreleased — fix(loop): a spend read that FAILED is NOT-REACHED, not zero — and no longer clobbers the running total (DIVE-2304)
+
+`_loop_refresh_spend` had three fail-open sites feeding one control decision: a missing
+`loop_runs` row returned `0`, a python recompute that exited non-zero returned `0` with its
+stderr sent to `/dev/null`, and any non-numeric output was coerced to `0`. `0` is also what a
+loop that just started legitimately reports, so `spent >= ceiling` could not tell "no budget
+used" from "no idea" — an unreadable spend silently DISABLED the token ceiling.
+
+THE PERSIST WAS THE SEVERITY. The `UPDATE loop_runs SET tokens_spent=...` ran unconditionally,
+on the fail-open path too, so one transient read failure overwrote the accumulated running
+total with `0` in durable state — and the throttled fast path then read that `0` back on every
+later call. That is not a blind spot that self-heals on the next poll; it destroys the figure
+the ceiling exists to test against. Bounded honestly: the loop still halts at its `deadline`,
+so this is "the budget control stopped binding", not unbounded spend.
+
+The producer now has a three-state contract — rc 0 with a real integer (and only then a
+persist), or rc 2 with NOTHING on stdout, no write, and the cause named on stderr. The
+`2>/dev/null` on the python call is gone; it is why this was invisible for the life of the
+ceiling. `_loop_spent` propagates rather than re-laundering the stale row as fresh, and a new
+`_loop_ceiling_check` carries the third state to the six `--wait` polls, which halt with
+haltReason `spend-unreadable` (an integer could not carry it, which is why fixing the call
+sites alone would not have helped). The heartbeat sweep — the only ceiling enforcement a
+fire-and-forget loop has — no longer turns a broken recompute into "0 tokens spent", and
+`goal status` fails the job instead of sailing past a ceiling it never evaluated.
+
+Graded two-sided by `tests/loop_spend_not_reached_unit.sh` (17 assertions): every unreadable
+arm is paired with a healthy arm on the same fixture, and the consumer arms drive the shipped
+`cmd_loop_spawn --wait` through the REAL broken producer rather than a stub. Against pre-fix
+`src/` the harness reds 13 and keeps 4 healthy arms green — including the clobber (60000 -> 0)
+and a `--wait` that ran to its deadline instead of halting.
+
 ## Unreleased — fix(task): the tier-2 category floor stops reading `press` inside `suppression`, without dropping `$500` out of the un-appealable half (DIVE-2301)
 
 The floor terms were a bare alternation with no boundary, which made every one of them a
