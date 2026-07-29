@@ -137,6 +137,38 @@ cmd_trace() {
              WHERE EXISTS (SELECT 1 FROM json_each(loop_runs.child_task_ids)
                            WHERE json_each.value=${id});" 2>/dev/null || true)
 
+  # ---- INST-4: the unified lifecycle ledger ------------------------------
+  # `trace` is the ledger's forcing function and its first consumer. The timeline
+  # above is DERIVED — it reconstructs the story from transition columns on the
+  # tasks row, which means it can only ever show what the current state implies:
+  # one gate (the latest), no authority, no elevation, no idempotency, and
+  # nothing at all about an event that left no column behind. The ledger section
+  # is the RECORDED story, with the full envelope per row.
+  #
+  # The two are shown side by side rather than merged. They are different kinds
+  # of evidence — derived-from-state vs recorded-at-the-time — and a merged view
+  # would let a reader cite a reconstruction as if it were a witness. Where they
+  # disagree, that disagreement is itself the finding.
+  local ledger_json='[]' ledger_started="" ledger_predates=0
+  ledger_json=$(dbfmt -json "
+    SELECT ts, kind, actor, authority, COALESCE(policy_decision,'') AS policy,
+           COALESCE(input_hash,'')  AS in_hash,
+           COALESCE(output_hash,'') AS out_hash,
+           COALESCE(detail,'')      AS detail
+      FROM lifecycle_events WHERE ident=$(sqlq "$ident") ORDER BY id;" 2>/dev/null)
+  [[ -n "$ledger_json" ]] || ledger_json='[]'
+  ledger_started=$(db "SELECT value FROM task_prefs WHERE key='ledger_started';" 2>/dev/null || true)
+  # An empty ledger has TWO meanings and the reader cannot tell them apart from
+  # the rows: "nothing happened" and "this work predates the ledger". Only the
+  # start marker separates them, which is the whole reason it is written at init.
+  # Stating the wrong one is the absent-vs-forbidden conflation this codebase has
+  # paid for repeatedly (DIVE-1989, DIVE-2318) — so we say which it is, or, if
+  # the marker itself is missing, that we could not tell.
+  if [[ -n "$ledger_started" ]]; then
+    local _created; _created=$(db "SELECT COALESCE(created_at,'') FROM tasks WHERE id=${id};" 2>/dev/null)
+    [[ -n "$_created" && "$_created" < "$ledger_started" ]] && ledger_predates=1
+  fi
+
   # ---- audit-log references (best-effort, read-only) ---------------------
   # The tamper-evident agent-audit log (640 root:claude) records mutating verbs
   # with their real caller. Lines mentioning this ident are extra provenance —
@@ -175,6 +207,8 @@ cmd_trace() {
       --arg loop "$loop" \
       --argjson events "$events" --argjson audit "$audit_json" \
       --argjson audit_drops "$audit_drops" \
+      --argjson ledger "$ledger_json" --arg ledger_started "$ledger_started" \
+      --argjson ledger_predates "$ledger_predates" \
       --arg ancestors "$ancestors" \
       '{ok:true, data:{
          ident:$ident, title:$title, status:$status, assignee:$assignee,
@@ -188,6 +222,14 @@ cmd_trace() {
            loop:(if $loop=="" then null else $loop end)
          },
          timeline:$events,
+         ledger:{
+           events:$ledger,
+           started_at:(if $ledger_started=="" then null else $ledger_started end),
+           predates_ledger:($ledger_predates==1),
+           coverage:(if $ledger_started=="" then "unknown — no ledger start marker"
+                     elif $ledger_predates==1 then "partial — task predates the ledger"
+                     else "full — task began after the ledger started" end)
+         },
          audit_refs:$audit,
          audit_drops:$audit_drops
        }}'
@@ -214,6 +256,25 @@ cmd_trace() {
     "  \(.ts)  \(.phase | (. + "            ")[0:13])  \(.actor | (. + "            ")[0:12])  \(.detail)"'
   if [[ -n "$pending_gate" ]]; then
     printf '  %-18s  %-13s  %-12s  %s\n' "(pending)" "gate" "-" "awaiting a human ${pending_gate}"
+  fi
+  echo
+  echo "lifecycle ledger (recorded, with authority envelope):"
+  if [[ "$(printf '%s' "$ledger_json" | jq 'length')" -gt 0 ]]; then
+    printf '%s' "$ledger_json" | jq -r '.[] |
+      "  \(.ts)  \(.kind | (. + "                ")[0:16])  \(.actor | (. + "            ")[0:12])  " +
+      "\(.authority | (. + "            ")[0:12])  \(.detail)" +
+      (if .policy   != "" then "\n      policy: \(.policy)"       else "" end) +
+      (if .in_hash  != "" then "\n      in:  sha256:\(.in_hash)"  else "" end) +
+      (if .out_hash != "" then "\n      out: sha256:\(.out_hash)" else "" end)'
+  elif [[ -z "$ledger_started" ]]; then
+    echo "  (no rows, and no ledger start marker — cannot tell 'nothing happened'"
+    echo "   from 'this store predates the ledger'. Treat as UNKNOWN, not as zero.)"
+  elif (( ledger_predates )); then
+    echo "  (no rows — this task was created before the ledger started ${ledger_started}."
+    echo "   Absence here is expected and is NOT evidence about what happened.)"
+  else
+    echo "  (no rows — the task began after the ledger started ${ledger_started},"
+    echo "   so this genuinely records no lifecycle events yet.)"
   fi
   echo
   if [[ "$(printf '%s' "$audit_json" | jq 'length')" -gt 0 ]]; then
