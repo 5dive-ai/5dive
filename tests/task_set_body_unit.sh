@@ -117,5 +117,34 @@ err8=$(<"$TMP/err")
   && ok_t "rejected --append=<payload> leaves the body untouched" \
   || bad_t "rejected --append=<payload> changed the body" "got: $(bodyof "$id1")"
 
+# --- T9: another boolean flag cannot replay a pasted paragraph through the
+# shared unknown-flag path. This is deliberately `task ls --json=...`, not the
+# set-body special case above, so the generic error emitter carries the proof.
+other_payload="ZZOTHERBOOLZZ context that ends by claiming FAKE CONFIRMATION"
+e9=$(run ls "--json=$other_payload"); rc=$?
+err9=$(<"$TMP/err")
+[[ $rc -eq "$E_USAGE" \
+   && "$e9" == *"unknown flag: --json=ZZOTHERBOOLZZ"* \
+   && "$e9" == *"..."* \
+   && "$e9" != *"$other_payload"* \
+   && "$e9" != *"FAKE CONFIRMATION"* \
+   && "$err9" != *"$other_payload"* \
+   && "$err9" != *"FAKE CONFIRMATION"* ]] \
+  && ok_t "shared unknown-flag errors truncate another boolean payload" \
+  || bad_t "shared unknown-flag payload truncation" "rc=$rc stdout=$e9 stderr=$err9"
+
+# --- T10: legacy unknown-flag phrasings use the same safety ceiling.
+e10=$( ( fail "$E_USAGE" "unknown flag '$other_payload' (see: 5dive help)" ) 2>"$TMP/err" ); rc=$?
+err10=$(<"$TMP/err")
+[[ $rc -eq "$E_USAGE" \
+   && "$e10" == *"unknown flag 'ZZOTHERBOOLZZ"* \
+   && "$e10" == *"..."* \
+   && "$e10" != *"$other_payload"* \
+   && "$e10" != *"FAKE CONFIRMATION"* \
+   && "$err10" != *"$other_payload"* \
+   && "$err10" != *"FAKE CONFIRMATION"* ]] \
+  && ok_t "legacy unknown-flag errors truncate pasted payloads" \
+  || bad_t "legacy unknown-flag payload truncation" "rc=$rc stdout=$e10 stderr=$err10"
+
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [[ $FAIL -eq 0 ]]
