@@ -98,40 +98,115 @@ SNAP="$TMP/version-assign.snapshot.sh"; cp "$S" "$SNAP"
 # modified file in the tree into the probe commit and `reset --hard HEAD~1` then
 # deleted them: running the harness mid-edit silently ate the edits (measured during
 # iteration 2 of this very ticket — it ate this file). The probe now commits and
-# restores ONLY the paths it touches, never -a and never --hard, and the SENTINEL
-# below grades that. A harness that eats your working tree gets run once.
+# restores ONLY the paths it touches, never -a and never --hard.
+#
+# DIVE-2322: THAT NARROWING MOVED THE BLAST RADIUS, IT DID NOT REMOVE IT. Scoping the
+# commit and the restore to PROBE_FILES protects every path OUTSIDE the list and
+# nothing INSIDE it — `restore --source=HEAD --staged --worktree` discards both the
+# staged and the worktree copy of an uncommitted edit to src/cmd_task.sh, the
+# most-edited file in the CLI and the one anybody working on task-gate behaviour has
+# open. It ate a working tree a third time on DIVE-2318. Worse, the SENTINEL that was
+# meant to grade this used README.md, picked *because* it is not a probe file: the arm
+# printed "an unrelated uncommitted edit survived the probe" on the very run that
+# destroyed the operator's work, which turns "stash first" into "the harness says I do
+# not need to". So this arm now REFUSES to run when a probe file is dirty, F0 grades
+# that refusal, and the README sentinel says out loud what it does and does not cover.
 PROBE_FILES=(src/cmd_task.sh src/header.sh 5dive 5dive.sha256)
-SENTINEL=$(cd "$REPO" && ls README.md CONTRIBUTING.md 2>/dev/null | head -1)
-trap 'git -C "$REPO" checkout -q -- "$SENTINEL" 2>/dev/null; rm -rf "$TMP"' EXIT
-printf '\n<!-- version-assign harness sentinel -->\n' >> "$REPO/$SENTINEL"
 
-git -C "$REPO" checkout -q -b "$B" 2>/dev/null
-v0=$(grep -m1 -oE 'FIVE_VERSION="[^"]+"' "$REPO/src/header.sh")
-# Derive the expected successor rather than hardcoding it: this arm asserted a literal
-# 0.16.20 -> 0.16.21, which turns into a false FAIL the moment main moves on, and a
-# harness that fails for calendar reasons teaches people to ignore it.
-cur=$(sed 's/.*"\(.*\)"/\1/' <<<"$v0")
-exp="${cur%.*}.$(( ${cur##*.} + 1 ))"
-printf '\n# version-assign apply probe\n' >> "$REPO/src/cmd_task.sh"
-( cd "$REPO" && ./build.sh >/dev/null 2>&1 )
-git -C "$REPO" -c user.email=t@t -c user.name=t commit -q -m "probe: bundle moves, version does not" -- "${PROBE_FILES[@]}"
-out=$( cd "$REPO" && bash "$SNAP" HEAD HEAD~1 --apply 2>&1 ); rc=$?
-if grep -q "applied $cur -> $exp" <<<"$out"; then ok "F --apply bumps the real repo $cur -> $exp"; else no "F apply" "$out"; fi
-grep -q 'NO TAG' <<<"$out" \
-  && ok "F (MESSAGE ONLY) --apply prints NO TAG — grades the sentence, not the behaviour; arm H grades the behaviour" \
-  || no "F tag msg" "$out"
-if grep -q "FIVE_VERSION=\"$exp\"" "$REPO/5dive"; then ok "F the new version is EMBEDDED in the rebuilt bundle"; else no "F embed" "bundle not rebuilt with the bump"; fi
-built=$(sha256sum "$REPO/5dive" | cut -d' ' -f1)
-[[ "$built" == "$(cut -d' ' -f1 < "$REPO/5dive.sha256")" ]] && ok "F rebuilt bundle matches 5dive.sha256" || no "F sha" "mismatch"
-git -C "$REPO" reset -q --soft HEAD~1
-git -C "$REPO" restore --source=HEAD --staged --worktree -- "${PROBE_FILES[@]}"
-git -C "$REPO" checkout -q - 2>/dev/null; git -C "$REPO" branch -qD "$B" 2>/dev/null
-[[ "$(grep -m1 -oE 'FIVE_VERSION="[^"]+"' "$REPO/src/header.sh")" == "$v0" ]] \
-  && ok "F the probe left the working tree at its original version" || no "F cleanup" "tree not restored"
-tail -1 "$REPO/$SENTINEL" | grep -q 'harness sentinel' \
-  && ok "F SENTINEL: an unrelated uncommitted edit survived the probe (no commit -a, no reset --hard)" \
-  || no "F sentinel" "the probe ate an unrelated working-tree modification — it did exactly this during iteration 2"
-git -C "$REPO" checkout -q -- "$SENTINEL"
+# One dirty PROBE_FILE per line, staged or worktree. -uno on purpose: an UNTRACKED
+# path is not in HEAD and so cannot be destroyed by a restore from HEAD, and refusing
+# to run over a file that was never at risk is how a guard gets deleted.
+probe_dirty() { local r="$1"; shift; git -C "$r" status --porcelain -uno -- "$@" | cut -c4-; }
+
+# F0 GRADES THE REFUSAL, hermetically — it never touches the real repo. Without it the
+# guard is an unexercised branch: on a clean tree (CI, and every honest run) it never
+# fires, so a probe_dirty() that always returned empty would look exactly like this one.
+gd="$TMP/guard$RANDOM$RANDOM"; mkdir -p "$gd/src"
+git -C "$gd" init -q -b main; git -C "$gd" config user.email t@t; git -C "$gd" config user.name t
+GP=(src/cmd_task.sh src/header.sh)
+printf 'clean\n' > "$gd/src/cmd_task.sh"; printf 'clean\n' > "$gd/src/header.sh"
+printf 'outside the probe set\n' > "$gd/README.md"
+git -C "$gd" add -A; git -C "$gd" commit -qm base
+[[ -z "$(probe_dirty "$gd" "${GP[@]}")" ]] \
+  && ok "F0 CONTROL: the guard reports nothing on a clean tree (so a hit below is the edit, not noise)" \
+  || no "F0 clean" "guard fired on a clean tree: $(probe_dirty "$gd" "${GP[@]}")"
+printf 'wip\n' >> "$gd/README.md"
+[[ -z "$(probe_dirty "$gd" "${GP[@]}")" ]] \
+  && ok "F0 the guard is SCOPED: an edit OUTSIDE the probe set does not refuse the run" \
+  || no "F0 scope" "the guard tripped on a path the probe never restores"
+printf 'operator wip\n' >> "$gd/src/cmd_task.sh"
+[[ "$(probe_dirty "$gd" "${GP[@]}")" == "src/cmd_task.sh" ]] \
+  && ok "F0 a WORKTREE edit to a probe file is detected, and the path is named" \
+  || no "F0 worktree" "got: $(probe_dirty "$gd" "${GP[@]}")"
+git -C "$gd" add -- src/cmd_task.sh
+[[ "$(probe_dirty "$gd" "${GP[@]}")" == "src/cmd_task.sh" ]] \
+  && ok "F0 ...and so is a STAGED one — the restore takes --staged too, so both copies are at risk" \
+  || no "F0 staged" "got: $(probe_dirty "$gd" "${GP[@]}")"
+
+# F0b LIVENESS FOR THE GUARD, and the assertion the old SENTINEL should always have
+# been. A refusal is only worth its cost if the thing it refuses really destroys work,
+# so replay the exact sequence — commit -- paths, reset --soft, restore --source=HEAD —
+# over a path list holding an uncommitted edit, and demand the edit is gone. Red here
+# means the sequence became safe and the refusal can be relaxed; it does not mean
+# scripts/version-assign.sh regressed.
+git -C "$gd" -c user.email=t@t -c user.name=t commit -q -m probe -- "${GP[@]}"
+git -C "$gd" reset -q --soft HEAD~1
+git -C "$gd" restore --source=HEAD --staged --worktree -- "${GP[@]}"
+grep -q 'operator wip' "$gd/src/cmd_task.sh" \
+  && no "F0b the probe sequence no longer destroys an uncommitted edit to a PROBE file — the refusal below is now unnecessary and can be relaxed (DIVE-2322)" \
+  || ok "F0b LIVENESS: the probe sequence really does destroy an uncommitted edit INSIDE its path list — the case the README sentinel never graded"
+grep -q 'wip' "$gd/README.md" \
+  && ok "F0b CONTROL: the same sequence leaves a path OUTSIDE the list untouched — that, and only that, is what the README sentinel proves" \
+  || no "F0b outside" "the scoped commit/restore reached beyond its own path list"
+
+# THE REFUSAL. Skip the destructive body entirely and count a FAIL, so the harness
+# exits non-zero: an arm that cannot run safely says so rather than running anyway.
+DIRTY=$(probe_dirty "$REPO" "${PROBE_FILES[@]}")
+if [[ -n "$DIRTY" ]]; then
+  no "F REFUSED: arm F did not run — it would have destroyed uncommitted work in the real repo" \
+"$(printf '%s\n' "$DIRTY" | sed 's/^/       dirty probe file: /')
+       This arm commits those paths, soft-resets, then restores them from HEAD, which
+       discards the staged AND the worktree copy. Commit or stash them and re-run;
+       a clean probe set makes the restore a no-op. Every other arm still ran.
+       (DIVE-2322 — this ate src/cmd_task.sh during DIVE-2318.)"
+else
+  SENTINEL=$(cd "$REPO" && ls README.md CONTRIBUTING.md 2>/dev/null | head -1)
+  trap 'git -C "$REPO" checkout -q -- "$SENTINEL" 2>/dev/null; rm -rf "$TMP"' EXIT
+  printf '\n<!-- version-assign harness sentinel -->\n' >> "$REPO/$SENTINEL"
+
+  git -C "$REPO" checkout -q -b "$B" 2>/dev/null
+  v0=$(grep -m1 -oE 'FIVE_VERSION="[^"]+"' "$REPO/src/header.sh")
+  # Derive the expected successor rather than hardcoding it: this arm asserted a literal
+  # 0.16.20 -> 0.16.21, which turns into a false FAIL the moment main moves on, and a
+  # harness that fails for calendar reasons teaches people to ignore it.
+  cur=$(sed 's/.*"\(.*\)"/\1/' <<<"$v0")
+  exp="${cur%.*}.$(( ${cur##*.} + 1 ))"
+  printf '\n# version-assign apply probe\n' >> "$REPO/src/cmd_task.sh"
+  ( cd "$REPO" && ./build.sh >/dev/null 2>&1 )
+  git -C "$REPO" -c user.email=t@t -c user.name=t commit -q -m "probe: bundle moves, version does not" -- "${PROBE_FILES[@]}"
+  out=$( cd "$REPO" && bash "$SNAP" HEAD HEAD~1 --apply 2>&1 ); rc=$?
+  if grep -q "applied $cur -> $exp" <<<"$out"; then ok "F --apply bumps the real repo $cur -> $exp"; else no "F apply" "$out"; fi
+  grep -q 'NO TAG' <<<"$out" \
+    && ok "F (MESSAGE ONLY) --apply prints NO TAG — grades the sentence, not the behaviour; arm H grades the behaviour" \
+    || no "F tag msg" "$out"
+  if grep -q "FIVE_VERSION=\"$exp\"" "$REPO/5dive"; then ok "F the new version is EMBEDDED in the rebuilt bundle"; else no "F embed" "bundle not rebuilt with the bump"; fi
+  built=$(sha256sum "$REPO/5dive" | cut -d' ' -f1)
+  [[ "$built" == "$(cut -d' ' -f1 < "$REPO/5dive.sha256")" ]] && ok "F rebuilt bundle matches 5dive.sha256" || no "F sha" "mismatch"
+  git -C "$REPO" reset -q --soft HEAD~1
+  git -C "$REPO" restore --source=HEAD --staged --worktree -- "${PROBE_FILES[@]}"
+  git -C "$REPO" checkout -q - 2>/dev/null; git -C "$REPO" branch -qD "$B" 2>/dev/null
+  [[ "$(grep -m1 -oE 'FIVE_VERSION="[^"]+"' "$REPO/src/header.sh")" == "$v0" ]] \
+    && ok "F the probe left the working tree at its original version" || no "F cleanup" "tree not restored"
+  # SCOPE, not safety. This grades the probe set's OUTER edge only — that no `commit -a`
+  # and no `reset --hard` crept back in. It says NOTHING about edits to PROBE_FILES
+  # themselves, which the restore still discards; that is the refusal's job above and
+  # F0b's to grade. The old wording ("an unrelated uncommitted edit survived the probe")
+  # read as "your tree is safe" and was printed by the runs that ate it.
+  tail -1 "$REPO/$SENTINEL" | grep -q 'harness sentinel' \
+    && ok "F SCOPE: an edit OUTSIDE the probe set survived (no commit -a, no reset --hard) — edits INSIDE it are NOT protected, hence the refusal above" \
+    || no "F sentinel" "the probe ate a working-tree modification outside its path list — it did exactly this during iteration 2"
+  git -C "$REPO" checkout -q -- "$SENTINEL"
+fi
 
 # ---------------------------------------------------------------------------
 # G: MUTATION-GRADED APPLY ASSERTIONS.
