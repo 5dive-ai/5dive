@@ -33811,6 +33811,54 @@ _council_resolve_principal() {
 # hashes the presented nonce and compares). Empty on a missing sha256sum (fail-closed downstream).
 _council_sha256() { printf '%s' "${1:-}" | sha256sum 2>/dev/null | awk '{print $1}'; }
 
+# DIVE-2278: render a veto principal for HUMAN-READABLE output — roster, init summary, the
+# veto-exercise line. Council output is quoted verbatim into transcripts and posts, so a raw
+# Telegram user id printed here reaches a published artifact by default. Redacting the artifact
+# after the fact is the wrong fix: the generator keeps emitting it into the NEXT one, and that
+# is the one nobody re-checks because "we already fixed the PII".
+#
+# Mapping, in order:
+#   human:<agent>       -> unchanged; it is already a name.
+#   tg:<digits>|<digits> -> the paired agent's name if the id resolves back to one (human:<agent>),
+#                          otherwise the opaque, stable handle tg:#<8 hex of sha256(salt+id)>.
+# The salt matters: a Telegram user id is ~10 digits, so an UNSALTED digest of it is enumerable
+# end-to-end (10^10 hashes) and would be a redaction in appearance only. The salt is host-local
+# state that never travels with the artifact (/etc/machine-id, else the hostname); with no salt
+# available we print `tg:#redacted` rather than a digest we cannot defend.
+# The RAW id is untouched everywhere it is actually needed: genesis .veto.resolved, the --json
+# rail, veto-pings.jsonl, and the delivery call. This is a display filter, not a data change.
+_council_principal_label() {
+  local p="${1:-}" id=""
+  case "$p" in
+    ''|none) printf '%s' "${p:-none}"; return 0 ;;
+    human:*) printf '%s' "$p"; return 0 ;;
+    tg:*) id="${p#tg:}" ;;
+    *) id="$p" ;;
+  esac
+  [[ "$id" =~ ^[0-9]+$ ]] || { printf '%s' "$p"; return 0; }
+  # Reverse-resolve: if this id is the paired human of a known agent, name the agent.
+  local a
+  for a in $(_council_principal_agents); do
+    [[ "$(_council_resolve_principal "human:$a")" == "$id" ]] && { printf 'human:%s' "$a"; return 0; }
+  done
+  local salt="" h=""
+  salt="$(cat /etc/machine-id 2>/dev/null || true)"
+  [[ -n "$salt" ]] || salt="$(hostname 2>/dev/null || true)"
+  [[ -n "$salt" ]] && h="$(_council_sha256 "${salt}:${id}")"
+  if [[ -n "$h" ]]; then printf 'tg:#%s' "${h:0:8}"; else printf 'tg:#redacted'; fi
+}
+
+# Candidate agent names for the reverse-resolve above. Best-effort and cheap: an unreadable or
+# missing registry just means we fall through to the opaque handle, which is still not the id.
+_council_principal_agents() {
+  local d
+  for d in /home/agent-*; do
+    [[ -d "$d" ]] || continue
+    printf '%s\n' "${d#/home/agent-}"
+  done 2>/dev/null
+  printf 'main\n'
+}
+
 # CNCL-9 (main gate amendment 3): durable audit trail for REFUSED veto attempts — a forged
 # `--veto-by` CLI string on convene, or a nonce/recipient mismatch on exercise. "refused + logged"
 # must mean a real line on disk a test can assert, not just an stderr message. The file is
@@ -34071,7 +34119,7 @@ _council_veto() {
   if (( JSON_MODE )); then
     printf '%s' "$vraw" | jq --arg d "$vdigest" --arg p "$rcpt_digest" '{ok:true, data: (. + {sealedDigest:$d, prevDigest:$p})}'
   else
-    echo "veto:         EXERCISED (${tier}) by ${offer_principal}"
+    echo "veto:         EXERCISED (${tier}) by $(_council_principal_label "${offer_principal}")"
     echo "disposition:  blocked  (pass overruled; original verdict left sealed + immutable)"
     [[ "$tier" == "posthoc" ]] && echo "unwind:       REQUIRED — reversible work must be manually unwound (v0.11)"
     echo "chained:      veto ${vdigest:0:16}… -> verdict ${rcpt_digest:0:16}…"
@@ -34292,6 +34340,15 @@ _council_init_or_lineage() {
   local resolved; resolved="$(_council_resolve_principal "$principal")"
   [[ -n "$resolved" ]] || fail "$E_USAGE" "veto principal '$principal' did not resolve to a real recipient — init rejects an unknown principal (fail-closed). Use human:<agent> (a paired agent) or tg:<user_id>."
 
+  # DIVE-2278: a tg:<digits> principal is the ONE form the display filter cannot save. The
+  # principal string is copied verbatim into the canonical bytes that get SEALED into genesis,
+  # the lineage and every convene receipt — records that are deliberately immutable and are the
+  # ones we publish. human:<agent> keeps the same recipient while putting only a NAME in the seal.
+  if [[ "$principal" =~ ^(tg:)?[0-9]+$ ]]; then
+    printf 'warn: --veto=%s puts a raw user id inside the SEALED genesis/receipt bytes, which are\n' "$principal" >&2
+    printf '      immutable and publishable. Prefer --veto=human:<agent> — same recipient, name in the seal.\n' >&2
+  fi
+
   local genesis_exists=0; [[ -f "$COUNCIL_GENESIS" ]] && genesis_exists=1
   # hash-chain head: prevDigest + next seq come from the last lineage line.
   local prev_digest="" seq=0
@@ -34350,7 +34407,10 @@ _council_init_or_lineage() {
     echo "council: initialized (seq $seq)"
     echo "seats:   $seats"
     echo "chair:   $chair"
-    echo "veto:    $principal -> $resolved"
+    # DIVE-2278: the RESOLVED recipient is a raw Telegram id — never print it. It is sealed into
+    # genesis and available on --json for anything that actually delivers; the summary a human
+    # copies into a transcript gets the label only.
+    echo "veto:    $(_council_principal_label "$principal") (recipient resolved, sealed in genesis)"
     echo "const:   v0 sealed (${constitution_digest:0:16}…) -> $cpath"
     echo "genesis: sealed (${digest:0:16}…) + hash-chained into lineage"
   fi
@@ -34570,7 +34630,7 @@ _council_roster() {
     echo "council:   council ($(printf '%s' "$raw" | jq -r '.seatCount') seats)"
     printf '%s' "$raw" | jq -r '.seats[] | "  seat \(.id)\(if .chair then " (chair)" else "" end)"'
     echo "threshold: $(printf '%s' "$raw" | jq -r '.threshold') to pass, quorum $(printf '%s' "$raw" | jq -r '.quorum') (spec: $(printf '%s' "$raw" | jq -c '.thresholdSpec'))"
-    echo "veto:      $vprincipal"
+    echo "veto:      $(_council_principal_label "$vprincipal")"
     echo "lineage:   seq $head_seq, ${hlen} record(s), head ${head_digest:0:16}…"
   fi
 }
