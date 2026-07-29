@@ -21,6 +21,39 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      # DIVE-2107: regenerate the GENERATED sources BEFORE building, because the
+      # bundle check below cannot see one level up.
+      #
+      # src/cmd_council.sh is itself generated — src/council/gen_cmd.mjs embeds
+      # engine.mjs + cli.mjs into cmd_council.template.sh. build.sh does NOT run
+      # that generator; it only bundles whatever src/ currently contains. So a
+      # COMMITTED hand-edit of src/cmd_council.sh is faithfully carried into the
+      # bundle, `git diff 5dive` is clean, and every existing check passes: the
+      # canonical .mjs carries nothing, the next gen_cmd.mjs run silently reverts
+      # the change, and the node harnesses (which import engine.mjs) never
+      # exercise it.
+      #
+      # Measured on a committed hand-edit, both directions: build.sh + `git diff
+      # 5dive` stays SILENT; regenerating first reports ` M src/cmd_council.sh`.
+      # The edit must be COMMITTED to reproduce — editing only the working tree
+      # is reverted by the generator and proves nothing.
+      #
+      # Found by olivia verifying DIVE-2103, where iteration 1 did exactly this.
+      # sha256sum-vs-5dive.sha256 and a re-seal both pass on such a commit too,
+      # because they grade the artifact against its OWN recorded checksum and
+      # never against what src produces.
+      - name: Regenerate generated sources
+        run: node src/council/gen_cmd.mjs
+      - name: Fail if a GENERATED source was hand-edited
+        run: |
+          if ! git diff --exit-code src/cmd_council.sh; then
+            echo
+            echo "ERROR: src/cmd_council.sh does not match what its generator produces."
+            echo "It is GENERATED from src/council/{engine,cli}.mjs + cmd_council.template.sh."
+            echo "Edit those, then run: node src/council/gen_cmd.mjs && ./build.sh"
+            echo "Editing src/cmd_council.sh directly is silently reverted by the next build."
+            exit 1
+          fi
       - name: Rebuild bundle from src/
         run: ./build.sh
       - name: Syntax-check the rebuilt bundle

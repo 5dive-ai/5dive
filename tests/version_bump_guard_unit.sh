@@ -17,6 +17,17 @@
 # needed to exercise them). Never touches the real repo's git state.
 # Run: bash tests/version_bump_guard_unit.sh  (no root, no network).
 set -uo pipefail
+
+# DIVE-2211: name the tree this harness grades (tests/lib/grading_tree.sh).
+# Three-state: if the helper is unreachable (a staged copy that did not carry
+# tests/lib/), the log says NO TREE WAS NAMED rather than falling silent, and a
+# `set -e` harness is not killed by a failed source.
+# NOTE the absence of `2>/dev/null`. The obvious hardening -- redirect the
+# source's stderr so bash's "No such file" does not litter the log -- also
+# swallows the helper's own stderr line, which IS the payload. That silenced all
+# 210 harnesses at once while every other check in this change stayed green.
+. "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh" \
+  || printf 'grading tree: UNRESOLVED (tests/lib/grading_tree.sh not reachable; no tree named)\n' >&2
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BUMP_GUARD="$ROOT/scripts/version-bump-guard.sh"
 UNIQ_SCAN="$ROOT/scripts/version-uniqueness-scan.sh"
@@ -48,12 +59,12 @@ commit_release() {
   printf 'readonly FIVE_VERSION="%s"\n' "$1" > src/header.sh
   printf '#!/usr/bin/env bash\nreadonly FIVE_VERSION="%s"\necho hi\n' "$2" > 5dive
   printf '%s\n' "$3" > 5dive.sha256
-    # DIVE-2091: the guard now keys on "did src/ or build.sh change" — the committed
+  # DIVE-2091: the guard now keys on "did src/ or build.sh change" — the committed
   # 5dive.sha256 it used to compare is generated at tag time and is not in a commit
   # any more. SHA_CONTENT keeps its MEANING ("a different build") and changes its
   # EXPRESSION: it lands in src/, where the real signal now is.
   printf '%s\n' "$3" > src/body.sh
-git add -A >/dev/null
+  git add -A >/dev/null
   git commit -q -m "$4"
   git rev-parse HEAD
 }

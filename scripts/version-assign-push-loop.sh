@@ -34,11 +34,25 @@ git config user.email 'markounik@gmail.com'
 # scenario this job exists for. So: refetch, recompute against the moved tip, retry,
 # and fail loudly.
 #
-# BASE stays github.event.before across retries, deliberately. If a previous run
-# already assigned, the version HAS moved relative to that base, so the script reports
-# "already moved" and we stop — one version per batch, which is the batching lodar
-# wants. If nobody assigned, we assign once for the whole batch. Both are correct;
-# neither double-bumps.
+# BASE IS NOW INERT (DIVE-2230), and the batching survives it. version-assign.sh no
+# longer decides against the base at all — it compares main's bundle to the bundle
+# recorded at the commit that ASSIGNED the current version, which is an absolute
+# property of the tree and not a delta anyone can launder away. $BEFORE is still
+# passed, and still validated by the script, purely as a truncated-history canary: an
+# unresolvable base means a shallow fetch, and a shallow fetch is what would break the
+# anchor walk.
+#
+# One version per batch still holds, and now holds for a BETTER reason. The loop
+# resets to the freshly-fetched tip before computing, so the assignment it makes
+# covers every merge landed so far. A sibling run then finds the anchor's bundle equal
+# to the tip's and reports nothing owed — not because "the version moved relative to
+# my base", but because main genuinely ships the bundle its version claims.
+#
+# The one deliberate behaviour change: if a further merge lands AFTER that assignment
+# and moves the bundle again, this now assigns a second version instead of stopping.
+# That merge is a real uncovered bundle, and the shared-checkout updater is
+# VERSION-triggered (DIVE-2065) — declining to bump it is not batching, it is the
+# DIVE-2230 debt with a shorter fuse. The tag freeze is on tags; bumps are cheap.
 assigned=""
 for (( try=1; try<=ATTEMPTS; try++ )); do
   git fetch -q origin main
