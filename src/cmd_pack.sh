@@ -569,11 +569,22 @@ cmd_market_show() {
     ok "" '{pack:$p, card:$c}' --argjson p "$pack" --arg c "$card"
     return
   fi
-  jq -r "$_MARKET_JQ"'
+  # DIVE-2303: a pack stores the family ALIAS ("opus"), never a concrete id, so the
+  # catalog entry is still true after the alias moves. Resolve at RENDER instead —
+  # "opus (currently claude-opus-5)" is honest today and honest after opus 6, where
+  # a resolved id baked into index.json would just recreate the drift one layer up.
+  # A pack that deliberately pins shows its id alone (resolve returns it unchanged).
+  local _m _mres _mdisp
+  _m=$(jq -r '.model // ""' <<<"$pack")
+  _mres=$(resolve_model_alias "$_m")
+  if [[ -z "$_m" ]]; then _mdisp="-"
+  elif [[ "$_mres" != "$_m" ]]; then _mdisp="$_m (currently $_mres)"
+  else _mdisp="$_m"; fi
+  jq -r --arg mdisp "$_mdisp" "$_MARKET_JQ"'
     "\(.name)  —  \(.rarity // "unranked") · \(.character // "agent")   ·   completeness \(complete)%",
     "  \(.tagline // "")",
     "",
-    "  model:   \(.model // "-")    effort: \(.effort // "-")",
+    "  model:   \($mdisp)    effort: \(.effort // "-")",
     "  memory:  " + (if .includesMemory then "seasoned — ships pre-trained (distilled lessons)" else "persona-only (no seeded memory)" end),
     "  skills:  " + (distinct | if length==0 then "(baseline only)" else join(", ") end),
     "  identity: \(.did // "-")"' <<<"$pack"

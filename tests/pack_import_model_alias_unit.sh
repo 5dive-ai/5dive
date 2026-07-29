@@ -76,5 +76,24 @@ else
   no "resolve at :$rline happens AFTER the settings write at :$wline"
 fi
 
+echo "== 5. RENDER: the catalog shows the alias AND what it resolves to today =="
+# DIVE-2303 (creative's call): index.json stores "opus", never a concrete id, so
+# the entry stays true after the alias moves. `market show` resolves at render.
+render_model() {                     # mirrors the cmd_pack.sh market-show block
+  local _m="$1" _mres _mdisp
+  _mres=$(resolve_model_alias "$_m")
+  if [[ -z "$_m" ]]; then _mdisp="-"
+  elif [[ "$_mres" != "$_m" ]]; then _mdisp="$_m (currently $_mres)"
+  else _mdisp="$_m"; fi
+  printf '%s' "$_mdisp"
+}
+is "alias shows both"     "$(render_model opus)"   "opus (currently claude-opus-5)"
+is "ward's sonnet"        "$(render_model sonnet)" "sonnet (currently claude-sonnet-5)"
+is "a pin shows bare"     "$(render_model claude-opus-4-8)" "claude-opus-4-8"
+is "empty renders dash"   "$(render_model '')"     "-"
+grep -q 'resolve_model_alias "$_m"' "$ROOT/src/cmd_pack.sh" \
+  && ok "market show still resolves at render" \
+  || no "market show no longer resolves at render (DIVE-2303 regression)"
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [[ $fail -eq 0 ]]

@@ -26,7 +26,7 @@ esac
 
 # Bumped on every public release. `build.sh` checks this line exists; CI fails
 # the bundle-drift check if it's missing or empty.
-readonly FIVE_VERSION="0.17.2"
+readonly FIVE_VERSION="0.17.3"
 
 # GitHub org our repos live under. The org is being renamed
 # 5dive-com -> 5dive-ai (2026-06); fetches must work on either side of the
@@ -23319,7 +23319,32 @@ _gate_tier2_floor_hit() {
       fi
     fi
   fi
-  [[ "$text" =~ $floor_rx ]]
+  # DIVE-2301: the floor terms are a bare alternation with no boundary, so every
+  # one of them is a SUBSTRING matcher: 'press' fires on suppression/expression/
+  # compressed/depression, 'charge' on recharge/supercharge. Both live on the
+  # NON-APPEALABLE list, so an ask that legitimately says "stop forging a
+  # suppression" floored to tier 2 with no appeal path, on a word that has nothing
+  # to do with press or money.
+  #
+  # The boundary is applied HERE, at the match site, and not by writing \b onto
+  # each term in $_GATE_T2_FLOOR_RX. Two reasons, both measured:
+  #
+  #   1. $floor_rx is POLICY DATA and may have been replaced wholesale by a sealed
+  #      constitution.yaml a few lines up. Anchoring the shipped default would
+  #      leave the defect live in exactly the path where the policy is
+  #      authoritative, and an org's own terms would still be substring matchers.
+  #   2. \b CANNOT anchor the money terms. \b asserts a word/non-word transition,
+  #      and '$' is not a word character, so `\b\$[0-9]` never matches: with a
+  #      per-term \b, "approve $500 for ads" and "wire €900 to the vendor" stop
+  #      flooring ALTOGETHER. That trades a false positive for a false NEGATIVE on
+  #      the one class with no escape path. `(^|[^[:alnum:]_])` is a leading
+  #      boundary that a non-word term can also sit behind, and it keeps both.
+  #
+  # LEADING only, deliberately: the terms are unanchored at the tail so inflections
+  # keep matching (revoked, truncated, charges, pressing). Containment inside an
+  # unrelated STEM is the defect; containment at the start of a longer word
+  # (pressure, deleterious) still fires and is the accepted cost of that choice.
+  [[ "$text" =~ (^|[^[:alnum:]_])($floor_rx) ]]
 }
 
 # DIVE-2224: NEVER concatenate two SUBJECTS into one classifier input. The ASK is
@@ -23936,6 +23961,20 @@ _GATE_FLOOR_APPEALABLE_RX='secret|credential|api key|token|password|publish|publ
 # NON-APPEALABLE (everything else in the floor, stated positively so a future
 # edit to the floor regex cannot silently widen what an appeal reaches): money,
 # real outbound comms, and irreversible infra/access. Never carved out.
+#
+# DIVE-2301: this constant is DOCUMENTATION OF RECORD, not a matcher — nothing
+# matches against it (grep the tree: one definition, zero uses). The non-appealable
+# decision is reached by SUBTRACTION: strip the appealable terms and re-test the
+# FULL floor, so the boundary fix at _gate_tier2_floor_hit is what actually stops
+# 'suppression' from being read as the non-appealable 'press' in an appeal refusal.
+# If this list is ever promoted to a live matcher it must go through the same
+# leading-boundary wrapper and NOT per-term \b, which cannot anchor \$[0-9]/€[0-9]
+# and would silently drop the money class out of the un-appealable half.
+#
+# The appeal path depends on an invariant this pair must keep: no APPEALABLE term
+# may be a substring of a NON-APPEALABLE one, or stripping the former would erase
+# the latter and hand an appeal to a class that has none. Asserted in
+# tests/gate_floor_word_boundary_unit.sh rather than left to review.
 _GATE_FLOOR_NONAPPEALABLE_RX='spend|billing|invoice|charge|payment|refund|subscription|price|pricing|\$[0-9]|€[0-9]|press|customer email|email customers|newsletter|blast|teardown|drop[^.]{0,20}table|truncate|irreversible|revoke|dns|domain transfer'
 # _gate_floor_appeal_residual <text>: lower-case <text> and remove ONLY the
 # appealable terms. The caller re-tests the full floor against the result; if it
@@ -23970,7 +24009,12 @@ _gate_tier2_floor_term() {
       fi
     fi
   fi
-  [[ "$text" =~ $rx ]] && printf '%s' "${BASH_REMATCH[0]}"
+  # DIVE-2301: same leading-boundary wrapper as the floor itself — this helper must
+  # never report a term the floor did not use, and that includes never reporting a
+  # term the floor no longer matches. BASH_REMATCH[0] now carries the boundary
+  # character too (" press"), so the TERM is group 2; reporting [0] would print a
+  # leading space into the warn line and into the gate record.
+  [[ "$text" =~ (^|[^[:alnum:]_])($rx) ]] && printf '%s' "${BASH_REMATCH[2]}"
 }
 
 # OSS-11 (DIVE-976) — _gate_ask_shape <ask>: normalize an ask into its "shape
@@ -41221,9 +41265,26 @@ _SUP_CLI_CHECKED=0
 _SUP_CLI_LATEST=""
 _SUP_CLI_BEHIND="unknown"
 _SUP_CLI_STALE="unknown"
+_SUP_CLI_FROZEN="unknown"
+_SUP_CLI_FROZEN_DETAIL=""
 _sup_cli_check() {
   (( _SUP_CLI_CHECKED )) && return 0
   _SUP_CLI_CHECKED=1
+
+  # DIVE-2287 — FIRST, and outside every early return below. The staleness
+  # probe answers "am I behind LATEST"; this answers "has my version moved AT
+  # ALL". They fail in opposite conditions, which is the entire reason both
+  # exist: when the release cutter is down the tag stops moving, `behind` is
+  # false for every box in the fleet, and the only remaining evidence that
+  # nothing has shipped in a week is that no box's version has changed in a
+  # week. Ordering matters — every `return 0` in the probe below is a case
+  # where the comparison could not be made and the absolute reading is the
+  # only one left. This tick runs as root, so unlike `update --check` it can
+  # normally write the record.
+  local -a fz=()
+  mapfile -t fz < <(_cli_freeze_observe "$FIVE_VERSION" "${STATE_DIR}/cli-version-seen.json")
+  _SUP_CLI_FROZEN="${fz[0]:-unknown}"
+  _SUP_CLI_FROZEN_DETAIL="${fz[2]:-}"
   # DIVE-2042: the published version is read through _published_cli_probe, which
   # pins both fetches to one immutable sha and verifies the bundle against its
   # own checksum. Anything short of a CONSISTENT read leaves staleness UNKNOWN
@@ -41515,7 +41576,8 @@ _sup_render_board() {
 # Post-table summary: counts + the box-level CLI probe result.
 _sup_summary_line() {
   local snap="$1"
-  jq -r --arg stale "$_SUP_CLI_STALE" --arg cur "$FIVE_VERSION" --arg lat "$_SUP_CLI_LATEST" '
+  jq -r --arg stale "$_SUP_CLI_STALE" --arg cur "$FIVE_VERSION" --arg lat "$_SUP_CLI_LATEST" \
+        --arg frozen "$_SUP_CLI_FROZEN" --arg frozendet "$_SUP_CLI_FROZEN_DETAIL" '
     "\(length) agents — " +
     "\([.[] | select(.classification == "healthy")]        | length) healthy / " +
     "\([.[] | select(.classification == "slow")]           | length) slow / " +
@@ -41527,7 +41589,12 @@ _sup_summary_line() {
      then " · ⚠ \([.[] | select(.classification == "verify-challenge")] | length) VERIFY-CHALLENGE" else "" end) +
     (if $stale == "true" then " · CLI \($cur) STALE (latest \($lat))"
      elif $stale == "unknown" then " · CLI staleness unknown (probe unavailable)"
-     else " · CLI \($cur) ok" end)' <<<"$snap"
+     else " · CLI \($cur) ok" end) +
+    # DIVE-2287: appended, never substituted. A frozen fleet reads "CLI ok" on
+    # the staleness half — that IS the failure — so this line has to be able to
+    # say "ok" and "FROZEN" in the same breath.
+    (if $frozen == "frozen" then " · ⚠ FLEET FROZEN: \($frozendet) — no release has reached this box; check the release cutter"
+     else "" end)' <<<"$snap"
 }
 
 # --watch[=secs]: repaint inside the alt-screen (cmd_watch's escape constants),
@@ -41826,9 +41893,11 @@ cmd_supervisor() {
         printf '%s' "$snap" | jq -c \
           --arg cur "$FIVE_VERSION" --arg lat "$_SUP_CLI_LATEST" \
           --arg beh "$_SUP_CLI_BEHIND" --arg stl "$_SUP_CLI_STALE" \
+          --arg frz "$_SUP_CLI_FROZEN" --arg frzd "$_SUP_CLI_FROZEN_DETAIL" \
           --argjson tstuck "$_SUP_T_STUCK_MIN" --argjson tslow "$_SUP_T_SLOW_MIN" \
           '{ok:true, data:{agents:.,
-             cli:{current:$cur, latest:(if $lat == "" then null else $lat end), behind:$beh, stale:$stl},
+             cli:{current:$cur, latest:(if $lat == "" then null else $lat end), behind:$beh, stale:$stl,
+                  frozen:$frz, frozenDetail:(if $frzd == "" then null else $frzd end)},
              tStuckMin:$tstuck, tSlowMin:$tslow}}'
       else
         _sup_render_board "$snap"
@@ -48579,11 +48648,22 @@ cmd_market_show() {
     ok "" '{pack:$p, card:$c}' --argjson p "$pack" --arg c "$card"
     return
   fi
-  jq -r "$_MARKET_JQ"'
+  # DIVE-2303: a pack stores the family ALIAS ("opus"), never a concrete id, so the
+  # catalog entry is still true after the alias moves. Resolve at RENDER instead —
+  # "opus (currently claude-opus-5)" is honest today and honest after opus 6, where
+  # a resolved id baked into index.json would just recreate the drift one layer up.
+  # A pack that deliberately pins shows its id alone (resolve returns it unchanged).
+  local _m _mres _mdisp
+  _m=$(jq -r '.model // ""' <<<"$pack")
+  _mres=$(resolve_model_alias "$_m")
+  if [[ -z "$_m" ]]; then _mdisp="-"
+  elif [[ "$_mres" != "$_m" ]]; then _mdisp="$_m (currently $_mres)"
+  else _mdisp="$_m"; fi
+  jq -r --arg mdisp "$_mdisp" "$_MARKET_JQ"'
     "\(.name)  —  \(.rarity // "unranked") · \(.character // "agent")   ·   completeness \(complete)%",
     "  \(.tagline // "")",
     "",
-    "  model:   \(.model // "-")    effort: \(.effort // "-")",
+    "  model:   \($mdisp)    effort: \(.effort // "-")",
     "  memory:  " + (if .includesMemory then "seasoned — ships pre-trained (distilled lessons)" else "persona-only (no seeded memory)" end),
     "  skills:  " + (distinct | if length==0 then "(baseline only)" else join(", ") end),
     "  identity: \(.did // "-")"' <<<"$pack"
@@ -49679,12 +49759,94 @@ version_lt() {
 # anything past ~1.5 days means the auto-update isn't keeping up.
 readonly UPDATE_STALE_AFTER_SECS=$((36 * 3600))
 
+# >>> DIVE-2287 version-freeze observer
+#     (tests/version_freeze_observer_unit.sh extracts this block VERBATIM
+#      between these markers and runs the shipped bytes — keep them.)
+#
+# Every staleness signal we have is a COMPARISON against a published "latest".
+# That family shares one blind spot: when the release process itself stops, the
+# comparand stops moving too, every box compares equal, and the whole fleet
+# reports green while nothing has updated for a week. DIVE-2243's monotonicity
+# guard sharpened this — it converted a silent fleet-wide DOWNGRADE into a loud
+# refusal plus a frozen fleet, and nothing alarms on a frozen fleet. A guard
+# that turns a wrong answer into no answer has moved which silence you live
+# with, not removed it.
+#
+# So this observation is ABSOLUTE and takes no comparand: has the version this
+# box RUNS changed, ever, within N days. It stays true when the cutter is dead,
+# when the tag is frozen, when the probe is offline, and when --check is wrong.
+#
+# WHY IT NEEDS A RECORD AND CANNOT READ ONE OFF THE BOX. The obvious baseline is
+# the installed binary's mtime — "when was 5dive last written". It is WRONG, and
+# silently so: `refresh_managed_files()` swaps the bundle in UNCONDITIONALLY
+# (`mv -f "$_bundle_tmp" "$BIN_DIR/5dive"`), with no already-current branch. The
+# nightly rewrites the file every night whether or not the version moved, so
+# mtime measures the last UPDATE ATTEMPT and never the last version CHANGE — the
+# exact two things this alarm exists to tell apart. A freeze read off mtime
+# would report "moved yesterday" forever, i.e. a monitor that cannot fire.
+#
+# ABSENT RECORD IS UNKNOWN, NOT FRESH (DIVE-2230's rule). A missing record is
+# emitted identically by "first pass on a new box" and "record wiped", so it
+# resolves to neither: we seed it and answer `unknown`. Reporting a green from
+# an absent record would rebuild the fail-open one layer down.
+#
+# Prints exactly three lines (never fails the caller):
+#   1  state       moving | frozen | unknown
+#   2  age_secs    seconds since the running version was first observed ('' if unknown)
+#   3  detail      human phrase — always the OBSERVED claim ("not observed to
+#                  change"), never the stronger unobserved one ("did not change")
+_CLI_FREEZE_AFTER_SECS=$((7 * 86400))
+_cli_freeze_observe() {
+  local cur="${1:-}" record="${2:-}" now="${3:-}"
+  _cfo_out() { printf '%s\n%s\n%s\n' "$1" "$2" "$3"; }
+  [[ -n "$now" ]] || now=$(date +%s)
+  [[ -n "$cur" ]] || { _cfo_out unknown "" "the running version is unreadable"; return 0; }
+  [[ -n "$record" ]] || { _cfo_out unknown "" "no state dir to record version movement in"; return 0; }
+
+  local seen_ver="" seen_at=""
+  if [[ -r "$record" ]]; then
+    seen_ver=$(jq -r '.version // empty' "$record" 2>/dev/null) || seen_ver=""
+    seen_at=$(jq -r '.first_seen_epoch // empty' "$record" 2>/dev/null) || seen_at=""
+    [[ "$seen_at" =~ ^[0-9]+$ ]] || seen_at=""
+  fi
+
+  # A version we have never recorded, or an unusable record, restarts the clock
+  # — and the restart is itself the movement signal on every case but the first.
+  if [[ -z "$seen_ver" || -z "$seen_at" || "$seen_ver" != "$cur" ]]; then
+    # Best-effort write. A read-only STATE_DIR (`update --check` runs as a
+    # non-root operator) must not fail the command — it degrades to `unknown`,
+    # which is what an unrecordable observation honestly is.
+    if [[ -w "$(dirname "$record")" || -w "$record" ]]; then
+      printf '{"version":%s,"first_seen_epoch":%s,"first_seen_at":%s}\n' \
+        "$(printf '%s' "$cur" | jq -R .)" "$now" \
+        "$(date -u -d "@$now" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null | jq -R .)" \
+        > "$record" 2>/dev/null || true
+    fi
+    if [[ -n "$seen_ver" && "$seen_ver" != "$cur" ]]; then
+      _cfo_out moving "0" "version changed ${seen_ver} -> ${cur}"
+    else
+      _cfo_out unknown "" "no prior observation of this box's version — clock starts now"
+    fi
+    return 0
+  fi
+
+  local age=$(( now - seen_at ))
+  (( age < 0 )) && { _cfo_out unknown "" "recorded observation is in the future — clock skew"; return 0; }
+  local days=$(( age / 86400 ))
+  if (( age >= _CLI_FREEZE_AFTER_SECS )); then
+    _cfo_out frozen "$age" "CLI ${cur} has not been observed to change in ${days}d"
+  else
+    _cfo_out moving "$age" "CLI ${cur} first observed ${days}d ago"
+  fi
+}
+# <<< DIVE-2287 version-freeze observer
+
 # >>> DIVE-2042 published-version probe
 #     (tests/update_check_propagation_unit.sh extracts this block VERBATIM
 #      between these markers and runs the shipped bytes — keep them.)
 #
-# _published_cli_probe — read the version main currently publishes, and say how
-# much we trust the read.
+# _published_cli_probe — read the version the installer would actually give
+# this box, and say how much we trust the read.
 #
 # "What does main publish?" is a THREE-state question, not a value.
 # raw.githubusercontent serves the bundle and its `.sha256` as two independent
@@ -49699,14 +49861,38 @@ readonly UPDATE_STALE_AFTER_SECS=$((36 * 3600))
 # yes and is wrong.
 #
 # Two defences, in order:
-#   1. PIN. `git ls-remote` rides the git transport, not the raw CDN, so it has
-#      no split-generation window. Resolve main -> ONE immutable sha and fetch
-#      BOTH objects from raw/<sha>/, where they cannot disagree. Unresolvable
-#      (no git, no network) -> fall back to /main rather than fail shut; a
-#      probe that bricks is worse than the race it avoids.
+#   1. PIN to an IMMUTABLE ref. The split-generation window exists because
+#      `main` MOVES. A release tag does not, so fetching both objects from
+#      raw/<tag>/ closes the same window that pinning main->sha closed, for the
+#      same reason and with one fewer round trip. (Fetch by tag NAME, never by
+#      the sha `git ls-remote` prints for it: 97 of our tags are annotated, and
+#      an annotated tag's own sha is the tag object, which raw.githubusercontent
+#      does not serve. install.sh peels `^{}` for exactly this; the name needs
+#      no peel because GitHub resolves the ref server-side.)
 #   2. VERIFY. Hash the bundle we were ACTUALLY served and compare it to the
-#      `.sha256` we were ACTUALLY served. Their disagreement IS the
-#      propagation signal, and on the unpinned path it is the only one there is.
+#      `.sha256` we were ACTUALLY served. Their disagreement IS the propagation
+#      signal, and it is the only one there is if the CDN ever skews a tag.
+#
+# DIVE-2287 — WHICH REF DEFINES "LATEST". This probe used to read `main`, while
+# `install.sh` installs the newest release TAG. When main runs ahead of the
+# newest tag (the DIVE-2238 cutter outage; 0.17.2 assigned on main, v0.17.1 the
+# newest tag) the two disagree, and the operator gets both halves at once:
+#
+#     5dive update --check   ->  CLI 0.16.32 is behind (latest 0.17.2)
+#     sudo 5dive self-update ->  5dive upgraded: 0.16.32 -> 0.17.1
+#
+# ...then is told they are STILL behind, permanently, by a checker naming a
+# version that does not exist as a tag and that no installer can deliver. Worse
+# with DIVE-2243's monotonicity guard in place: a box that ever lands above the
+# newest tag is REFUSED every subsequent upgrade while --check keeps insisting
+# it is behind, and both messages are correct.
+#
+# So the probe resolves what the INSTALLER would resolve. The rungs below mirror
+# install.sh's `resolve_gh_tag` deliberately — a second resolver that drifts from
+# the first gives two answers to the one question this command exists to answer.
+# NO fallback to main: falling back is precisely the defect, because main's
+# version is not installable. Unresolvable tags => `unavailable`, which is honest
+# and is also what the installer does (it fails CLOSED on the same condition).
 #
 # Prints exactly three lines (never fails the caller):
 #   1  state    consistent | indeterminate | unavailable
@@ -49722,14 +49908,34 @@ _published_cli_probe() {
   command -v sha256sum >/dev/null 2>&1 \
     || { _pcp_out unavailable "" "sha256sum is not installed"; return 0; }
 
-  local org pinned=""
+  local org tags="" ref=""
   org=$(gh_org)
+  # Rung 1: git ls-remote — exact, no API rate limit.
   if command -v git >/dev/null 2>&1; then
-    pinned=$(GIT_TERMINAL_PROMPT=0 timeout 10 git ls-remote \
-      "https://github.com/$org/5dive" main 2>/dev/null | awk 'NR==1{print $1}') || pinned=""
-    [[ "$pinned" =~ ^[0-9a-f]{40}$ ]] || pinned=""
+    tags=$(GIT_TERMINAL_PROMPT=0 timeout 10 git ls-remote --tags --refs \
+      "https://github.com/$org/5dive" 'v*' 2>/dev/null | sed -n 's#.*refs/tags/##p') || tags=""
   fi
-  local ref="${pinned:-main}"
+  # Rung 2: the tags atom feed — unauthenticated, not subject to the 60/hr
+  # api.github.com limit a NAT'd fleet shares. Parse <id>, NOT <title>: the
+  # title carries a human release headline after the tag and matches nothing.
+  if [[ -z "$tags" ]]; then
+    tags=$(curl -fsSL --max-time 10 "https://github.com/$org/5dive/tags.atom" 2>/dev/null \
+      | sed -n 's#.*<id>tag:github.com,[0-9]*:Repository/[0-9]*/\([^<]*\)</id>.*#\1#p') || tags=""
+  fi
+  # Rung 3: the tags API, last before giving up.
+  if [[ -z "$tags" ]]; then
+    tags=$(curl -fsSL --max-time 10 "https://api.github.com/repos/$org/5dive/tags?per_page=100" 2>/dev/null \
+      | sed -n 's/.*"name"[[:space:]]*:[[:space:]]*"\(v[0-9][^"]*\)".*/\1/p') || tags=""
+  fi
+  # `sort -V`, never `sort`. The regex drops anything that is not a plain
+  # vMAJOR.MINOR.PATCH release tag, so an rc or a `nightly` can never become the
+  # thing we advertise — same filter install.sh applies before installing one.
+  [[ -n "$tags" ]] && ref=$(printf '%s\n' "$tags" \
+    | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1)
+  if [[ -z "$ref" ]]; then
+    _pcp_out unavailable "" "no release tag resolves — the installer could not upgrade this box either"
+    return 0
+  fi
 
   local tmp
   tmp=$(mktemp -d) || { _pcp_out unavailable "" "no writable temp dir"; return 0; }
@@ -49749,16 +49955,13 @@ _published_cli_probe() {
   rm -rf "$tmp"
 
   if [[ "$served" != "$published" ]]; then
-    # Branch the explanation on whether we can justify the accusation
-    # (DIVE-1977's rule). PINNED: both objects came from one immutable tree, so
-    # cache skew cannot explain it and something is genuinely wrong. UNPINNED:
-    # two cache generations is by far the likeliest cause, and rendering that
-    # as tampering is an alarm scarier than the fault.
-    if [[ -n "$pinned" ]]; then
-      detail="the bundle published at ${pinned:0:12} does not match its own checksum"
-    else
-      detail="the published bundle and its checksum are from different CDN cache generations (release propagation in progress)"
-    fi
+    # DIVE-1977's rule: name only the cause we can justify. Both objects came
+    # from ONE immutable tag, so this is NOT the mutable-ref cache skew the old
+    # unpinned path suffered — but a freshly cut tag is still being cached for
+    # the first time when a box asks, so "propagation" and "bad bytes" are both
+    # live and we are not entitled to pick. State the fact, name the ref, say
+    # retry; do not accuse an operator's mirror of tampering on a coin flip.
+    detail="the bundle published at $ref does not match its own checksum — either the tag is still propagating or the bytes are bad"
     _pcp_out indeterminate "" "$detail"
     return 0
   fi
@@ -49804,8 +50007,13 @@ cmd_update_check() {
   esac
   [[ -n "$latest" ]] || fail "$E_GENERIC" "could not determine the latest published version"
 
-  local behind=false
+  local behind=false ahead=false
   version_lt "$current" "$latest" && behind=true
+  # DIVE-2287: a box ABOVE the newest release is its own state, not "up to
+  # date". It is the state DIVE-2243's guard REFUSES every upgrade from, so
+  # folding it into the green is how an operator ends up staring at "up to
+  # date" and "refusing to DOWNGRADE" at the same time with no thread to pull.
+  version_lt "$latest" "$current" && ahead=true
 
   # Inspect the last managed nightly soft-update run (managed boxes log to
   # /tmp/claude-soft-updates.log). Best-effort: absent log → unknown.
@@ -49842,13 +50050,23 @@ cmd_update_check() {
     fi
   fi
 
+  # DIVE-2287 freeze observation — absolute, independent of $latest, so it
+  # survives the release process being down (which is exactly when every
+  # comparison-based signal above goes quiet).
+  local -a fz=()
+  mapfile -t fz < <(_cli_freeze_observe "$current" "${STATE_DIR}/cli-version-seen.json")
+  local frozen_state="${fz[0]:-unknown}" frozen_age="${fz[1]:-}" frozen_detail="${fz[2]:-}"
+
   local prose
   if [[ "$behind" == true ]]; then
     prose="CLI $current is behind (latest $latest)"
     [[ "$stale" == true ]] && prose+=" — stale, update recommended"
+  elif [[ "$ahead" == true ]]; then
+    prose="CLI $current is AHEAD of the newest release $latest — the installer will refuse to move it (a release cut is owed)"
   else
     prose="CLI $current is up to date"
   fi
+  [[ "$frozen_state" == frozen ]] && prose+=" · ⚠ $frozen_detail"
 
   # `behind`/`stale` keep their existing meaning and are only ever emitted on
   # the consistent path — the indeterminate branch above exits before here, so
@@ -49856,10 +50074,17 @@ cmd_update_check() {
   # `source` names the ref the answer came from (a 40-char sha when pinned,
   # "main" on the unpinned fallback) so a surprising number can be re-fetched
   # at the exact identity that produced it.
+  # `ahead` and `frozen` are ADDITIVE — `behind`/`stale` keep their exact prior
+  # meaning so the dashboard tile and every existing caller read the same field
+  # they always did. `frozen` is a THREE-state string, not a boolean: an absent
+  # or unwritable record is "unknown", and a caller must not be able to read a
+  # green out of an observation we never made.
   ok "$prose" \
-     '{current:$cur, latest:$lat, behind:$beh, stale:$stl, lastUpdateOk:$luo, lastUpdateAt:$lua, source:$src}' \
+     '{current:$cur, latest:$lat, behind:$beh, ahead:$ahd, stale:$stl, frozen:$fz, frozenAgeSec:$fza, frozenDetail:$fzd, lastUpdateOk:$luo, lastUpdateAt:$lua, source:$src}' \
      --arg cur "$current" --arg lat "$latest" --arg src "$detail" \
-     --argjson beh "$behind" --argjson stl "$stale" \
+     --arg fz "$frozen_state" --arg fzd "$frozen_detail" \
+     --argjson fza "${frozen_age:-null}" \
+     --argjson beh "$behind" --argjson ahd "$ahead" --argjson stl "$stale" \
      --argjson luo "$last_ok_json" --argjson lua "$last_at_json"
 }
 # -------- top-level dispatch --------
