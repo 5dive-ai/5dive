@@ -721,8 +721,12 @@ cmd_selfcheck() {
     # a knob in effect is a fact about this box, not a rail that did or did not act,
     # and folding it into the verdicts would make correct configuration read as a
     # failure. See src/lib/env_overrides.sh.
-    local _eov; _eov=$(_env_overrides_json 2>/dev/null || printf '{}')
-    [[ -n "$_eov" ]] || _eov='{}'
+    # DIVE-2336: see cmd_doctor.sh — both arms coerced a FAILURE into "nothing to report".
+    # See cmd_doctor.sh: the fallback is a CONSTANT from header.sh, because
+    # _env_ov_unavailable is as absent as _env_overrides_json in the case it covers —
+    # which is how this harness's own --json contract got broken.
+    local _eov; _eov=$(_env_overrides_json 2>/dev/null)
+    [[ -n "$_eov" ]] || _eov="$_5D_ENV_OV_UNAVAILABLE"
     printf '%s' "$jarr" | jq -s --arg label "$label" \
       --argjson fails "$fails" --argjson notreached "$notreached" \
       --argjson unexplained "$unexplained" --argjson passes "$passes" --argjson errors "$errors" \

@@ -51,14 +51,31 @@ jobs:
         # CLI shells out to shipped unchecked. Widened rather than adding one file:
         # measured zero findings across scripts/*.sh at -S error, so the broad fix is
         # free today and closes the gap permanently instead of for one script.
-        run: shellcheck -S error install.sh 5dive 5dive-agent-start build.sh scripts/*.sh
+        run: |
+          # DIVE-2091: the bundle is generated at tag time and is no longer
+          # committed on main, so it has to be BUILT before anything reads it
+          # as a file. Without this, removing it from main turns shellcheck
+          # into a "file not found" failure on every PR.
+          ./build.sh
+          shellcheck -S error install.sh 5dive 5dive-agent-start build.sh scripts/*.sh
 
   docker-install:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - name: Build image (runs install.sh against fresh ubuntu:22.04)
-        run: docker build -f docker/Dockerfile -t 5dive-smoke .
+        run: |
+          # DIVE-2091: the bundle is generated at tag time and is no longer
+          # committed on main, so it has to be BUILT before anything reads it
+          # as a file. docker/Dockerfile:52 `COPY 5dive …` is such a reader,
+          # and it is the LAST of five: the other four (shellcheck above, and
+          # three `./5dive selfcheck` sites in unit-tests.yml) were covered
+          # when the bundle came off main. This one sits in the same file as
+          # the shellcheck fix and inherited nothing from it, so it failed as
+          # `"/5dive": not found` at image build — before the two version
+          # assertions below could run at all.
+          ./build.sh
+          docker build -f docker/Dockerfile -t 5dive-smoke .
       - name: Verify CLI is on PATH and reports the expected version
         run: |
           docker run --rm --entrypoint /usr/local/bin/5dive 5dive-smoke --version

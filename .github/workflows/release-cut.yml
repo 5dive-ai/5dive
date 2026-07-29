@@ -162,6 +162,50 @@ jobs:
 
           git config user.name  'lodar'
           git config user.email 'markounik@gmail.com'
+          # >>> DIVE-2091 release-commit block (extracted by tests/release_cut_bundle_unit.sh)
+          # The built bundle is NO LONGER COMMITTED ON MAIN. install.sh fetches
+          # $REPO/5dive and $REPO/5dive.sha256 where $REPO is raw.githubusercontent
+          # at the TAG's sha (DIVE-2144), so the bundle must exist in the tree THIS
+          # TAG POINTS AT — and nowhere else. Main stays clean, which is the whole
+          # point: a generated 47k-line file on main invalidates every open PR on
+          # every merge (three forced rebases in one day, two of them on an outside
+          # contributor).
+          #
+          # So build it here and tag a RELEASE COMMIT whose parent is main's tip.
+          # Pushing the tag carries the commit's objects, so raw.githubusercontent
+          # serves it even though no branch points at it.
+          #
+          # FAIL CLOSED, and this is the requirement that matters: a tag cut WITHOUT
+          # a bundle publishes nothing while looking successful — every box would
+          # keep the version it has and `install.sh` would die on the download. So
+          # the asserts below run BEFORE the tag exists, and any of them aborts the
+          # cut rather than producing a tag we would have to delete.
+          git checkout -q --detach "$sha"
+          ./build.sh || { echo "::error::build.sh failed — refusing to cut ${tag} with no bundle"; exit 1; }
+          [ -s 5dive ] && [ -s 5dive.sha256 ] \
+            || { echo "::error::build.sh produced no bundle/checksum — refusing to cut ${tag}"; exit 1; }
+          bash -n 5dive \
+            || { echo "::error::built bundle is not valid bash — refusing to cut ${tag}"; exit 1; }
+          _built=$(sha256sum 5dive | cut -d" " -f1)
+          _want=$(tr -d "[:space:]" < 5dive.sha256)
+          [ "$_built" = "$_want" ] \
+            || { echo "::error::bundle does not match its own 5dive.sha256 (${_built} vs ${_want}) — refusing to cut ${tag}"; exit 1; }
+          _bundle_ver=$(grep -m1 -oP "(?<=^readonly FIVE_VERSION=\")[^\"]+" 5dive)
+          [ "v${_bundle_ver}" = "$tag" ] \
+            || { echo "::error::built bundle says FIVE_VERSION=${_bundle_ver} but this cut is ${tag} — refusing to publish a bundle that disagrees with its own tag"; exit 1; }
+          git add -f 5dive 5dive.sha256
+          git -c user.name=lodar -c user.email=markounik@gmail.com \
+              commit -q -m "release ${tag}: built bundle (DIVE-2091 — generated at tag time, not carried on main)"
+          sha=$(git rev-parse HEAD)
+          # Prove the TREE BEING TAGGED carries what install.sh will fetch — read it
+          # back out of the object store rather than trusting the working tree.
+          git cat-file -e "${sha}:5dive" 2>/dev/null && git cat-file -e "${sha}:5dive.sha256" 2>/dev/null \
+            || { echo "::error::release commit ${sha} does not carry the bundle — refusing to cut ${tag}"; exit 1; }
+          [ "$(git show "${sha}:5dive" | sha256sum | cut -d" " -f1)" = "$_want" ] \
+            || { echo "::error::bundle in the release commit differs from the one just built — refusing to cut ${tag}"; exit 1; }
+          echo "release commit ${sha} carries bundle ${_want} (FIVE_VERSION=${_bundle_ver})"
+          # <<< DIVE-2091 release-commit block
+
           git tag -a "$tag" "$sha" -m "${tag} — ${note}
 
           Publishes ${sha} as the tree every box installs (DIVE-2144). CI green on
@@ -170,6 +214,73 @@ jobs:
             echo "::error::tag push rejected — ${tag} was NOT published. Nothing changed for any box; they keep installing ${incumbent:-the previous tag}."
             exit 1
           fi
+
+          # DIVE-2091 — PROVE IT IS SERVABLE, do not assert that it is.
+          #
+          # Everything above proves the bundle is in the TAGGED TREE. Nothing proved it
+          # is fetchable from where install.sh actually looks, and that gap got materially
+          # riskier with this change rather than merely staying untested (dev, review):
+          # BEFORE, GH_PINNED_SHA resolved to a commit ON MAIN — branch-reachable,
+          # constantly fetched, warm. AFTER, it resolves to a release commit reachable
+          # ONLY from a tag and on no branch. That is a different object class for
+          # GitHub's read paths, and DIVE-1977 is the row that established those paths
+          # have split-generation and propagation windows — three endpoints, one day.
+          #
+          # WHY IT MUST BE MEASURED HERE AND NOT LEFT TO TRUST: install.sh fails closed
+          # and boxes self-update unattended on the 04:00 cron. If a window exists for
+          # tag-only commits, the symptom is installs dying on the download after EVERY
+          # release, discovered at the NEXT release, on customer boxes. Late and wide.
+          #
+          # This is the REMOTE version of the instinct already used above, where the
+          # bundle is read back out of the object store with `git cat-file` rather than
+          # trusted from the worktree. Same move, one hop further out.
+          #
+          # The tag is NOT deleted on failure. A published tag that cannot be served is
+          # a state a human must see; auto-removing it would hide the one occurrence
+          # that proves the window is real.
+          # PROBE THE MANDATORY OBJECT, NOT THE OPTIONAL ONE (dev, review of #313).
+          # install.sh:264 `curl "$REPO/5dive" || die` is FATAL. install.sh:273
+          # `curl "$REPO/5dive.sha256" || _want=""` is fail-SOFT BY DESIGN — DIVE-1271
+          # made an absent checksum warn rather than brick a box. The first cut of this
+          # probe fetched the .sha256, so it proved the object install.sh treats as
+          # OPTIONAL was servable and said nothing about the one it dies on.
+          #
+          # And they are two INDEPENDENT CDN objects with independent cache generations —
+          # DIVE-1977 exists because they disagreed. Proving one servable is not evidence
+          # about the other; that row's own finding, applied to the probe descended from
+          # it. The bundle is ~2.8MB against a 65-byte checksum, and both are the only
+          # genuinely NEW blobs in the release commit (everything else install.sh fetches
+          # is inherited from main's tree), so object-level lag shows on the bundle first.
+          _base="https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/${sha}"
+          _tmp="$(mktemp)"
+          _got=""
+          for _try in 1 2 3 4 5 6; do
+            curl -fsSL --max-time 60 "${_base}/5dive" -o "$_tmp" 2>/dev/null \
+              && [ -s "$_tmp" ] \
+              && _got="$(sha256sum "$_tmp" | awk '{print $1}')" \
+              && break
+            echo "  attempt ${_try}/6: ${tag} bundle not yet servable at ${sha:0:12} — waiting for propagation"
+            _got=""; sleep 10
+          done
+          if [ -z "$_got" ]; then
+            rm -f "$_tmp"
+            echo "::error::${tag} IS PUBLISHED BUT ITS BUNDLE IS NOT SERVABLE. raw.githubusercontent returned nothing usable for ${_base}/5dive after 6 tries. That is the object install.sh DIES on, so every new install and every unattended self-update fails until this resolves. The tag was deliberately NOT deleted — a human needs to see this."
+            exit 1
+          fi
+          rm -f "$_tmp"
+          if [ "$_got" != "$_want" ]; then
+            echo "::error::${tag} serves a DIFFERENT bundle than this cut verified. ${_base}/5dive hashes to ${_got}; the tagged tree carries ${_want}. Boxes would install bytes nobody checked."
+            exit 1
+          fi
+          # Also confirm the two objects AGREE at this one immutable sha — DIVE-1977's own
+          # prescription. install.sh reads both, and a stale .sha256 against a fresh bundle
+          # is the disagreement that row was filed for.
+          _servedsha="$(curl -fsSL --max-time 10 "${_base}/5dive.sha256" 2>/dev/null | tr -d '[:space:]')" || _servedsha=""
+          if [ -n "$_servedsha" ] && [ "$_servedsha" != "$_want" ]; then
+            echo "::error::${tag}: the served 5dive.sha256 (${_servedsha}) disagrees with the bundle this cut verified (${_want}) at ${sha:0:12}. The two CDN objects are out of step (DIVE-1977)."
+            exit 1
+          fi
+          echo "${tag}: bundle verified SERVABLE and byte-correct at ${sha:0:12} (${_got:0:16}…) — install.sh's FATAL fetch path is proven, not assumed"
 
           gh release create "$tag" --title "$tag" --target "$sha" --notes "${note}
 
