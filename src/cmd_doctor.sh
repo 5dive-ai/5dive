@@ -75,7 +75,12 @@ cmd_doctor() {
   done
   (( want_fix && ! dry )) && DOCTOR_REPAIR=1
   case "$filter" in
-    ""|deps|types|auth|creds|registry|shelld|channels|host|memory) ;;
+    # DIVE-2327: `policy` was MISSING from this allow-list while run_policy below
+    # dispatches it and the usage text right underneath advertises it — so
+    # `--category=policy` failed usage for every caller who read the error message
+    # and did what it said. Pre-existing; fixed here because this change lands its
+    # surface under that category and would otherwise be unreachable by filter.
+    ""|deps|types|auth|creds|registry|shelld|channels|host|memory|policy) ;;
     *) fail "$E_USAGE" "unknown --category (deps|types|auth|creds|registry|shelld|channels|host|memory|policy)" ;;
   esac
 
@@ -740,6 +745,39 @@ cmd_doctor() {
         doctor_add policy precedent-autoclear warn "precedent auto-clear is ON — resolved tier-1 gates with proven human precedent clear without a ping (5dive task precedent off to disable)"
       else
         doctor_add policy precedent-autoclear ok "precedent auto-clear is OFF — every tier-1 gate surfaces to a human"
+      fi
+    fi
+
+    # DIVE-2327: REPORT the FIVE_* knobs in effect and configured. Facts only — see
+    # src/lib/env_overrides.sh for why this must never warn.
+    #
+    # SEVERITY IS ALWAYS `ok`, and that is a deliberate reading of a required field
+    # rather than a claim that everything is fine. doctor_add's schema demands a
+    # severity; `ok` is the only value that adds NO verdict to summary.warnings /
+    # summary.errors, which is what keeps this surface a report. A `warn` here would
+    # fire on lodar's deliberate policy on sixteen agents every single run.
+    #
+    # NOTHING IS EMITTED WHEN NOTHING IS SET — no "no overrides" line. That makes the
+    # negative unobservable by design, which is why DIVE-2327 requires the negative arm
+    # to be graded by MUTATION rather than by reading empty output.
+    local _eov; _eov=$(_env_overrides_json 2>/dev/null || printf '')
+    if [[ -n "$_eov" ]]; then
+      local _n _v _f _st
+      while IFS=$'\t' read -r _n _v; do
+        [[ -n "$_n" ]] && doctor_add policy "env-in-effect/$_n" ok "in effect (process env): $_n=$_v"
+      done < <(jq -r '.process[]? | [.name, .value] | @tsv' <<<"$_eov" 2>/dev/null)
+      while IFS=$'\t' read -r _n _v _f; do
+        [[ -n "$_n" ]] && doctor_add policy "env-configured/$_n" ok "configured ($_f): $_n=$_v"
+      done < <(jq -r '.configured[]? | [.name, .value, .file] | @tsv' <<<"$_eov" 2>/dev/null)
+      # UNREADABLE IS ITS OWN LINE. Without it a caller outside group `claude` sees the
+      # same empty policy section as a box with no overrides configured, and reads
+      # "none are set" off a directory nobody could open.
+      _st=$(jq -r '.configured_state // ""' <<<"$_eov" 2>/dev/null)
+      if [[ "$_st" == "unreadable" ]]; then
+        while IFS= read -r _f; do
+          [[ -n "$_f" ]] && doctor_add policy "env-configured-unreadable" ok \
+            "could not read $_f — configured overrides NOT determined (this is a limit of the read, not a finding that none are set)"
+        done < <(jq -r '.configured_unreadable[]?' <<<"$_eov" 2>/dev/null)
       fi
     fi
   fi

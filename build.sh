@@ -30,6 +30,7 @@ cat \
   src/lib/models.sh \
   src/lib/agent_setup.sh \
   src/lib/state.sh \
+  src/lib/env_overrides.sh \
   src/lib/capability.sh \
   src/lib/disk.sh \
   src/lib/audit.sh \
