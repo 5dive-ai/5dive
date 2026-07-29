@@ -96,4 +96,17 @@ if [[ -z "${_5D_GRADING_TREE_PRINTED:-}" ]]; then
   _5D_GRADING_TREE_PRINTED=1
   _5d_grading_tree_line >&2
 fi
+
+# DIVE-2325: name the tree, then neutralise the ENVIRONMENT. Same class as this
+# file, one axis over — a harness inherits the caller's `FIVE_*` knobs, and a knob
+# set in a shell silently rewrites what the harness measures with no marker in the
+# log. Sourced from HERE rather than added to 235 harnesses because every one of
+# them already sources this file, near the top, before any fixture setup: it is
+# the seam that already exists. See tests/lib/env_isolation.sh for the incident.
+#
+# Same three-state discipline as above — an unreachable helper says so and does
+# NOT kill a `set -e` harness. And no `2>/dev/null`: the helper's stderr line is
+# its payload, exactly as this file's is.
+. "$(dirname -- "${BASH_SOURCE[0]}")/env_isolation.sh" \
+  || printf 'env isolation: UNRESOLVED (tests/lib/env_isolation.sh not reachable; caller FIVE_* knobs NOT cleared)\n' >&2
 :

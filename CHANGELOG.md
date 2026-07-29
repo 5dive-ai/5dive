@@ -1,5 +1,56 @@
 # Changelog
 
+## Unreleased — fix(tests): harnesses no longer inherit the caller's product knobs (DIVE-2325)
+
+`task_core_unit` (28/7) and `task_verifier_rail_unit` (17/6) were red on the control-plane
+host and GREEN in CI at the same commit. It presented as host state — the DIVE-1919 class
+`test-installed-host` exists to catch — and it was not. No amount of seeding a runner would
+have reproduced it.
+
+`FIVE_VERIFY_DEFAULT=0` is in the caller's environment. The DIVE-969 verifier-by-default
+rail reads `${FIVE_VERIFY_DEFAULT:-1}`, so the whole mechanism goes inert: not a wrong
+value, no mechanism at all. Reproduced exactly — with that one export, the two harnesses
+give 28/7 and 17/6, same arm names.
+
+**That knob is deliberate fleet policy. Do not delete it to make a test pass.** lodar set it
+for sixteen agents on 2026-07-29 00:49 via the unit's
+`EnvironmentFile=-/var/lib/5dive/agents.d/%i.env`, and each file carries the decision and
+its own revert instruction. Tasks filed without a rail since then are **policy-conformant,
+not damage** — there is no backlog of broken rows to audit.
+
+That is precisely why the harnesses are the only thing that can move. The configuration is
+not an accident awaiting cleanup; it is correct, intentional and permanent. **A harness
+asserting what DIVE-969 does BY DEFAULT while reading that default from the environment is
+grading fleet policy instead of the code.** It has to supply its own.
+
+This is DIVE-2211 one axis over. That change pinned WHICH TREE a harness grades, because
+"21 passed" was a claim about whatever was on disk. The same sentence was still true of the
+ENVIRONMENT: src reads **14 caller-overridable `FIVE_*` knobs**, every harness inherits the
+caller's, and a green log from a clean shell and a red log from a configured one are
+byte-identical apart from the number.
+
+- New `tests/lib/env_isolation.sh` unsets the whole `FIVE_*` namespace and **says on stderr
+  what it cleared** — the reader needs to know a knob was in effect, not be silently fixed
+  up. Silent on a clean environment, so the line means something when it appears.
+- Applied at `tests/lib/grading_tree.sh`, which all 235 harnesses already source near the
+  top before any fixture setup. One seam, no 235-file diff. Verified no harness assigns a
+  `FIVE_*` variable before that point, so nothing a harness meant to set can be clobbered.
+- Blanket rather than one knob on purpose: `FIVE_GATE_REPOS`, `FIVE_GATE_MAIN_BRANCH` and
+  `FIVE_GATE_ANCESTRY_SCAN` would each silently rewrite what the merge-gate harnesses
+  measure, and knob #15 will be added by someone who has never read this file.
+
+`tests/env_isolation_unit.sh` — 13 arms, mutation-graded five ways. T6 anchors T5 (a
+variable that was never going to be set proves nothing when found unset), T7 reproduces the
+incident end-to-end, and T9 exists because mutation found the helper announcing the same
+readonly knob as *both* stuck and cleared — a report of work that did not happen, which is
+not allowed to live in the reporter for that defect class.
+
+Diagnostic caveat recorded in the helper, because the instrument misled first: a
+`/proc/<pid>/environ` sweep found the knob in one session only and that read as a stray
+export. A live environ reflects the env file as of that session's **last exec**, so the
+sweep measured RESTART ORDER, not configuration. Read the config source, not the running
+processes.
+
 ## Unreleased — fix(gate): the merge gate stops reporting COULD-NOT-CHECK as NOT-MERGED (DIVE-2318)
 
 `task done`'s merge gate makes four GitHub queries. Every one of them can come back
