@@ -356,6 +356,7 @@ cmd_task_set_body() {
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --append)      append=1 ;;
+      --append=*)    fail "$E_USAGE" '--append is a boolean flag; pass the text as a positional argument: task set-body <id> --append "<text>"' ;;
       --)            shift; words+=("$@"); break ;;
       -*)            fail "$E_USAGE" "unknown flag: $1" ;;
       *)             if [[ -z "$task" ]]; then task="$1"; else words+=("$1"); fi ;;
@@ -371,7 +372,11 @@ cmd_task_set_body() {
   [[ "$st" != "done" && "$st" != "cancelled" ]] \
     || fail "$E_VALIDATION" "$ident is already $st — its body is frozen (closed tasks don't get retro-edited; bounce it back first with: 5dive task reject $ident --feedback=\"…\")"
   local body; body=$(db "SELECT COALESCE(body,'') FROM tasks WHERE id=${id};")
-  local prior_len=${#body}
+  local prior_len=${#body} prior_lines=0
+  if [[ -n "$body" ]]; then
+    local prior_without_newlines="${body//$'\n'/}"
+    prior_lines=$(( ${#body} - ${#prior_without_newlines} + 1 ))
+  fi
   local newbody
   if (( append )); then
     if [[ -n "$body" ]]; then
@@ -383,10 +388,30 @@ cmd_task_set_body() {
     newbody="$text"
   fi
   db "UPDATE tasks SET body=$(sqlq "$newbody") WHERE id=${id};"
+  local new_len=${#newbody} new_lines=0
+  if [[ -n "$newbody" ]]; then
+    local new_without_newlines="${newbody//$'\n'/}"
+    new_lines=$(( ${#newbody} - ${#new_without_newlines} + 1 ))
+  fi
   local mode="replaced"; (( append )) && mode="appended"
   _task_store_audit_log "task set-body" "ok" 0 -- \
     "task=$ident" "actor=$(task_actor)" "mode=$mode" "prior_len=$prior_len" || true
-  ok "$ident body $mode" '{ident:$id, mode:$m}' --arg id "$ident" --arg m "$mode"
+  local prose="$ident body $mode"
+  if (( ! append )); then
+    local line_delta=$(( new_lines - prior_lines )) char_delta=$(( new_len - prior_len ))
+    local line_delta_display="$line_delta" char_delta_display="$char_delta"
+    (( line_delta > 0 )) && line_delta_display="+$line_delta"
+    (( char_delta > 0 )) && char_delta_display="+$char_delta"
+    local prior_line_word="lines" new_line_word="lines"
+    (( prior_lines == 1 )) && prior_line_word="line"
+    (( new_lines == 1 )) && new_line_word="line"
+    prose+=" ($prior_lines $prior_line_word -> $new_lines $new_line_word, $line_delta_display; $prior_len chars -> $new_len chars, $char_delta_display)"
+  fi
+  ok "$prose" \
+    '{ident:$id, mode:$m, prior_len:$pl, new_len:$nl, prior_lines:$pls, new_lines:$nls}' \
+    --arg id "$ident" --arg m "$mode" \
+    --argjson pl "$prior_len" --argjson nl "$new_len" \
+    --argjson pls "$prior_lines" --argjson nls "$new_lines"
 }
 
 cmd_task_init() {
