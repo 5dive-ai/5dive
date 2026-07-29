@@ -50,6 +50,37 @@
 # it is a forward guard so a reporting surface can never become an exfil path. Redaction
 # says nothing about whether a knob should be set, so it is not judgement either.
 
+# _env_ov_unavailable — the payload for "the reporter itself did not run" (DIVE-2336).
+#
+# THE DEFECT IT REPLACES. Both consumers wrapped the call as
+#   X=$(_env_overrides_json 2>/dev/null || printf '{}')   and   [[ -n "$X" ]] || X='{}'
+# so a hard failure rendered as `{}` — no process overrides, no configured overrides, no
+# state — which reads as NO OVERRIDES ARE SET. That is the could-not-check-as-negative
+# shape DIVE-2318 closed in the merge gate and DIVE-2327 closed for an unreadable
+# agents.d, reappearing one level up inside the code that closes it. The surface already
+# distinguishes read/partial/unreadable/absent for the FILES and could not distinguish
+# "the reporter failed" from "there is nothing to report".
+#
+# MEASURED, and it decides which of the four sites matters most (2026-07-29, by stubbing
+# jq to fail at each of the 7 invocations a clean run makes): EVERY failure position
+# cascades to rc!=0 with EMPTY STDOUT. So the `|| printf '{}'` arm is NOT the one the real
+# failure mode reaches — the EMPTY-STRING coercion is, which is why fixing only the two
+# obvious sites would have left the live path untouched.
+#
+# NO jq HERE, deliberately: the most likely reason the reporter failed is that jq is gone,
+# so a fallback that needs jq to say "jq is gone" says nothing at all.
+_env_ov_unavailable() {
+  # ONE definition, in header.sh — see there for why it does not live in this file.
+  # NOT `${VAR:-<json>}`: a `}` inside the default TERMINATES the parameter expansion, so
+  # that form emitted the payload plus a stray trailing brace and every consumer got
+  # malformed JSON. T0 now pins the output as parseable, which is what caught it.
+  if [[ -n "${_5D_ENV_OV_UNAVAILABLE:-}" ]]; then
+    printf '%s' "$_5D_ENV_OV_UNAVAILABLE"
+  else
+    printf '{"process":[],"configured":[],"configured_state":"unavailable","configured_unreadable":[]}'
+  fi
+}
+
 # _env_ov_redact <name> <value> — the value, or a placeholder when the NAME is
 # credential-shaped. Name-based on purpose: a value-based heuristic would have to look
 # at the secret to decide, and would leak it through its own logic.
@@ -105,7 +136,13 @@ _env_overrides_json() {
   while IFS= read -r n; do
     [[ -n "$n" ]] || continue
     v=$(_env_ov_redact "$n" "${!n-}")
-    proc=$(jq -c --arg k "$n" --arg v "$v" '. + [{name:$k, value:$v}]' <<<"$proc")
+    # DIVE-2336: rc CHECKED, not assumed. Unchecked, a failed jq here empties $proc and the
+    # NEXT jq then fails on invalid --argjson, so the run happens to die instead of emitting
+    # a short list. Measured true today at all 7 positions — and it is ACCIDENTAL, not
+    # designed: it holds only because the poison propagates. One `|| true` added anywhere
+    # downstream turns the same failure into a well-formed PARTIAL emitted as complete.
+    proc=$(jq -c --arg k "$n" --arg v "$v" '. + [{name:$k, value:$v}]' <<<"$proc") \
+      || { _env_ov_unavailable; return 0; }
   done < <(compgen -e 2>/dev/null | grep '^FIVE_' | sort || true)
 
   while IFS= read -r pat; do
@@ -125,7 +162,8 @@ _env_overrides_json() {
         val="${val%\"}"; val="${val#\"}"; val="${val%\'}"; val="${val#\'}"
         val=$(_env_ov_redact "$name" "$val")
         conf=$(jq -c --arg k "$name" --arg v "$val" --arg f "$f" \
-                 '. + [{name:$k, value:$v, file:$f}]' <<<"$conf")
+                 '. + [{name:$k, value:$v, file:$f}]' <<<"$conf") \
+          || { _env_ov_unavailable; return 0; }
       done < <(grep -E '^[[:space:]]*(export[[:space:]]+)?FIVE_[A-Za-z0-9_]+=' "$f" 2>/dev/null || true)
     done
   done < <(printf '%s\n' "${_paths[@]}")
@@ -153,6 +191,10 @@ _env_overrides_json() {
   else                                state="absent"
   fi
 
+  # Final assembly is checked too, and the function NEVER exits non-zero with empty
+  # stdout: a caller that has to invent a payload is a caller that will invent the wrong
+  # one, which is exactly what happened at all four call sites.
   jq -cn --argjson p "$proc" --argjson c "$conf" --arg s "$state" --argjson u "$unread" \
-    '{process:$p, configured:$c, configured_state:$s, configured_unreadable:$u}'
+    '{process:$p, configured:$c, configured_state:$s, configured_unreadable:$u}' \
+    || { _env_ov_unavailable; return 0; }
 }
