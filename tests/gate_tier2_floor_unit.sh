@@ -63,9 +63,18 @@ provby()  { db "SELECT COALESCE(need_answered_by,'') FROM tasks WHERE ident='$1'
 tierof()  { db "SELECT COALESCE(tier,'') FROM tasks WHERE ident='$1';"; }
 
 # A non-agent SUDO_UID throughout (root) so the DIVE-916 evidence forms are NOT what
-# gates these cases — the tier-2 provenance floor is. (A tier-2 decision mints no
-# nonce anyway; see gate_nonce_unit T2.)
+# gates these cases — the tier-2 provenance floor is.
+#
+# DIVE-2233 item 2: the parenthetical that used to end this comment — "a tier-2 decision
+# mints no nonce anyway" — is no longer true, and it was load-bearing by accident. Tier 2
+# now mints for EVERY type, so T2's --human answer meets the evidence rule, and the
+# SUDO_UID=0 above does not satisfy that on its own: DIVE-1413 only trusts $SUDO_UID at
+# EUID 0, and this harness runs unprivileged. That is the production rule behaving
+# correctly — the caller this harness DESCRIBES (post-sudo root / dashboard-as-claude)
+# really is at EUID 0 — so the root seam is stubbed to put the harness in the world its
+# own header claims, rather than weakening an assertion.
 export SUDO_UID=0
+_gate_is_root() { return 0; }
 
 touch "$GATE_PROOF_ENFORCE"   # enforcement ON for the floor tests
 
@@ -89,7 +98,13 @@ out=$(cmd_task_answer DIVE-101 --value=A 2>&1); rc=$?
 #     (DIVE-525 — a real tap/dashboard answer must never be blocked). --------------
 seed_task DIVE-102
 cmd_task_need DIVE-102 --type=decision --ask="ship it?" --options="A|B" --recommend="A" --tier=2 >/dev/null 2>&1
-cmd_task_answer DIVE-102 --value=A --human >/dev/null 2>&1
+# SUBSHELLED (DIVE-2233). The one bare `cmd_task_answer` in this file whose expected
+# outcome is SUCCESS: T1/T4 capture into `out=$(…)`, already a subshell, so a refusal
+# there returns a code. Here a refusal calls production's `fail`, which `exit`s — in a
+# SOURCED harness that kills the whole script and T2..T5 never run, while the log ends on
+# three green T1 lines. Measured: mutating away the floor's `(( ! human ))` exemption (the
+# over-fire this arm exists to catch) took the run down at exactly this line.
+( cmd_task_answer DIVE-102 --value=A --human ) >/dev/null 2>&1
 [[ "$(answered DIVE-102)" == "closed" ]] \
   && ok_t "T2 --human answer on tier-2 decision CLEARS (trusted path)" \
   || bad_t "T2 --human tier-2 clears" "still $(answered DIVE-102)"

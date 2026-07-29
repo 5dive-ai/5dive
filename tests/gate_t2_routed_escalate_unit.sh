@@ -51,9 +51,15 @@ tasks_db_init
 # File-backed observer: cmd_task_answer runs inside a `$(...)` subshell in the cases
 # that capture its output, so a plain var would be lost — record the ping on disk.
 NOTIFIED_FILE="$TMP/notified"; : > "$NOTIFIED_FILE"
-task_need_notify() { echo "$1:$2" > "$NOTIFIED_FILE"; }   # "<ident>:<type>"
+# DIVE-2233 item 2: also capture the RAW nonce the notifier is handed ($8), in a SEPARATE
+# file so the _nf_reset the arms call between cases cannot clobber it. The notifier is the
+# only place the raw value is ever exposed — it is deliberately never printed to stdout,
+# so the filing agent cannot read it back — and E3 needs it to simulate a REAL human tap.
+NONCE_FILE="$TMP/nonce"; : > "$NONCE_FILE"
+task_need_notify() { echo "$1:$2" > "$NOTIFIED_FILE"; printf '%s' "${8:-}" > "$NONCE_FILE"; }
 _nf()   { cat "$NOTIFIED_FILE" 2>/dev/null; }
 _nf_reset() { : > "$NOTIFIED_FILE"; }
+last_nonce() { cat "$NONCE_FILE" 2>/dev/null; }
 audit_log() { :; }
 
 # The immediate caller is the agent LEAD (agent-marcus) attempting to clear a gate that
@@ -71,6 +77,37 @@ tierof()     { db "SELECT COALESCE(tier,'') FROM tasks WHERE ident='$1';"; }
 
 export SUDO_UID=1234   # an agent-ish uid: not the non-agent (root/claude) evidence form
 touch "$GATE_PROOF_ENFORCE"   # enforcement ON (the floor + escalation are live)
+
+# --- CALLER-IDENTITY PIN (DIVE-2365) ---------------------------------------------------
+# The export above is INERT here. `_gate_sudo_uid_nonagent` reads SUDO_UID only in its
+# root branch (DIVE-1413); unprivileged it reads `id -u` — whoever ran the suite. That is
+# `agent-*` on a 5dive box and `runner` in CI, so E3b's "from an agent" was supplied by
+# the host rather than by this file, and on the runner the forge CLEARED instead. Pin it:
+# seam `_gate_is_root`, stub the passwd lookup for the pinned uid only, leave the
+# resolver's own root-branch / unknown-uid / `agent-*` logic real. Full write-up lives at
+# the top of tests/gate_t2_nonce_proof_unit.sh.
+AGENT_UID=1234
+agent_caller_on() {
+  _gate_is_root() { return 0; }
+  getent() {
+    if [[ "${1:-}" == passwd && "${2:-}" == "$AGENT_UID" ]]; then
+      printf 'agent-fixture:x:%s:%s::/home/agent-fixture:/bin/bash\n' "$AGENT_UID" "$AGENT_UID"
+      return 0
+    fi
+    command getent "$@"
+  }
+  export SUDO_UID="$AGENT_UID"
+}
+assert_agent_caller() { # <label>
+  if _gate_sudo_uid_nonagent; then
+    bad_t "$1 precond: caller pinned as an AGENT" \
+      "the real resolver still reports NON-AGENT human evidence — the arm below would grade \
+the opposite behaviour and report ok (DIVE-2365)"
+  else
+    ok_t "$1 precond: the pinned caller reads as an AGENT to the real resolver"
+  fi
+}
+agent_caller_on
 
 # --- E1: THE FIX — a ROUTED tier-2 manual gate, answered by its lead, ESCALATES to the
 #     human instead of dead-ending: routed_reviewer cleared, ping re-armed, fresh nonce
@@ -123,17 +160,41 @@ out=$(cmd_task_answer DIVE-302 --value=approved 2>&1); rc=$?
 
 # --- E3: a routed tier-2 manual gate cleared by a real HUMAN (--human) clears normally —
 #     escalation only fires for the NON-human refusal path (DIVE-525: taps never break). -
+#
+# DIVE-2233 item 2 CHANGED THIS ARM'S FIXTURE, not its claim. The caller here is a stubbed
+# agent-marcus (line ~62), so the pre-item-2 form — a bare `--human` from an agent process
+# with no proof — IS the DIVE-2131 forge this ships to kill, and it is now refused. What
+# the arm means to grade is that a REAL human clear still works, so it supplies what a real
+# tap actually carries: the minted nonce. E3b withholds ONLY the proof on the same shape.
 seed_task DIVE-303
 cmd_task_need DIVE-303 --type=manual --ask="run the physical box swap" >/dev/null 2>&1
 route_to DIVE-303 marcus
+E3_NONCE="$(last_nonce)"
+[[ -n "$E3_NONCE" ]] \
+  && ok_t "E3 precond: filing a tier-2 manual gate minted a nonce for the tap to carry" \
+  || bad_t "E3 precond nonce minted" "notifier was handed no nonce"
 _nf_reset
-cmd_task_answer DIVE-303 --value=approved --human >/dev/null 2>&1
+out=$(cmd_task_answer DIVE-303 --value=approved --human --human-proof="$E3_NONCE" 2>&1); rc=$?
 [[ "$(answered DIVE-303)" == "closed" ]] \
-  && ok_t "E3 --human answer on a routed tier-2 gate CLEARS (no escalation needed)" \
-  || bad_t "E3 --human clears" "still $(answered DIVE-303)"
+  && ok_t "E3 a REAL human tap (--human + the minted nonce) on a routed tier-2 gate CLEARS" \
+  || bad_t "E3 real tap clears" "rc=$rc still $(answered DIVE-303) out=$out"
 [[ -z "$(_nf)" ]] \
   && ok_t "E3 no re-escalation on a genuine human clear" \
   || bad_t "E3 no re-escalation" "notified='$(_nf)'"
+
+# --- E3b NON-VACUITY FOR E3 (DIVE-2233 item 2): same gate shape, same caller — only the
+#     proof is withheld. This is the exact answer that closed DIVE-2131 with
+#     need_answered_uid=1004 and human_nonce_hash NULL. Without it, an E3 that accepted
+#     anything is indistinguishable from an E3 that verifies. ----------------------------
+seed_task DIVE-305
+cmd_task_need DIVE-305 --type=manual --ask="run the physical box swap" >/dev/null 2>&1
+route_to DIVE-305 marcus
+_nf_reset
+assert_agent_caller E3b
+out=$(cmd_task_answer DIVE-305 --value=approved --human 2>&1); rc=$?
+[[ $rc -ne 0 && "$(answered DIVE-305)" == "open" ]] \
+  && ok_t "E3b bare --human from an agent (the DIVE-2131 forge) is REFUSED on the same gate" \
+  || bad_t "E3b forge refused" "rc=$rc state=$(answered DIVE-305) out=$out"
 
 # --- E4: rollout safety — enforcement OFF => the floor (and thus the escalation) is
 #     dormant; a routed tier-2 manual gate is cleared by its lead directly (DIVE-1182). -

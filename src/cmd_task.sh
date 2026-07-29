@@ -4950,6 +4950,51 @@ cmd_task_need() {
   # SET below overwrites need_type/ask/tier. Without the archive the previous
   # gate leaves nothing but a stale answerer; without the reset the incoming
   # gate wears that answerer's identity, uid and signature (DIVE-2094).
+  # DIVE-2233 item 2 — mint the per-gate human nonce BEFORE the gate is persisted, and
+  # refuse to persist it at all if a tier-2 gate cannot arm itself.
+  #
+  # ORDERING IS THE WHOLE FIX, and getting it wrong was worse than not fixing it. The
+  # refusal originally sat after this UPDATE, so a mint failure aborted the command
+  # having ALREADY written need_type/ask/tier — leaving exactly the half-armed tier-2
+  # gate it refuses to create, while telling the caller it had failed. Caught by arm M2
+  # of gate_t2_nonce_proof_unit ("no half-filed gate is left behind"), which is the arm
+  # I nearly did not write because the refusal "obviously" prevented the state.
+  #
+  # WHY IT MUST FAIL CLOSED. An empty mint used to be silent: no UPDATE, hash NULL, gate
+  # files normally, no warning and no audit row — indistinguishable from a properly
+  # minted gate. Survivable while nothing read the column; NOT survivable once the
+  # tier-2 floor treats a NULL hash as "skip the check", because then a box with a
+  # broken RNG has no floor while every gate on it still LOOKS protected. That is
+  # DIVE-2131 restated. `_human_nonce_verify` already fails closed on a missing hash;
+  # the floor inverted that into a fail-open by skipping, so the refusal belongs HERE,
+  # where the absence is created, not there, where it is only observed.
+  #
+  # Scoped to tier 2 deliberately: for the other human types a NULL hash still means
+  # what it always meant and DIVE-916's verify path fails closed on it unchanged, so
+  # widening this would break gate filing for no security gain. With the /dev/urandom
+  # fallback in `_human_nonce_mint`, reaching this refusal means both the CSPRNG and
+  # openssl are gone — a broken box, not a routine one.
+  # DIVE-2365 (rebase onto DIVE-2356): the condition is "hard-human TYPE **or**
+  # tier>=2", NOT `tier == "2"`. This branch and the persist site below were written
+  # against different mint conditions on two branches; a string compare misses tier
+  # 3+, so the arm-or-refuse decision would cover a NARROWER set than the floor it
+  # exists to protect — the fail-open this commit closes, reintroduced one tier up.
+  # `_t2` is what the refusal keys on, so it tracks the tier arm alone: a hard-human
+  # type at tier 0/1 still files on an empty mint exactly as it always did.
+  local human_nonce="" _mint_nonce=0 _t2=0
+  case "$type" in approval|secret|manual|access) _mint_nonce=1 ;; esac
+  [[ "${tier:-}" =~ ^[0-9]+$ ]] && (( tier >= 2 )) && { _mint_nonce=1; _t2=1; }
+  (( _mint_nonce )) && human_nonce=$(_human_nonce_mint)
+  if (( _t2 )) && [[ -z "$human_nonce" ]]; then
+    # DIVE-2054: DELIBERATELY UNFENCED — a hard gate that could not arm itself is a
+    # fleet-health event, and it must leave evidence even though the caller is told.
+    audit_log "task need nonce-mint-failed" error 0 -- \
+      "task=$ident" "type=$type" "tier=$tier" \
+      "reason=could not mint a per-gate human nonce (openssl and /dev/urandom both unusable)" \
+      2>/dev/null || true
+    fail "$E_GENERIC" "$ident: refusing to file a tier-2 gate that cannot mint its own human proof — openssl and /dev/urandom are both unusable on this box, so the tier-2 human floor could not be enforced on it. Filing it anyway would create a gate that LOOKS hard-gated and is not (DIVE-2131). Fix the box's RNG, or file this at a lower --tier if it genuinely is not a human-only call."
+  fi
+
   db "BEGIN IMMEDIATE;
       $(_gate_archive_and_clear_sql file "id=${id}")
       UPDATE tasks
@@ -5408,22 +5453,27 @@ cmd_task_need() {
   # If you are here to add a nonce mint somewhere new: check what it does to the
   # ledger before you assume it is a no-op. This one was assumed to be.
   #
-  # NOT DONE HERE, on purpose: the minted nonce is not yet reachable by a decision
-  # TAP. `_task_gate_reply_markup` appends `:${nonce}` to callback_data for
-  # approval/secret/manual but not for the decision option buttons, and
-  # telegram-pi's parser is `^tna:(\d+):(.+)$` (greedy) — appending there would
-  # swallow the nonce into the option token and break decision taps on pi
-  # runtimes. That is a plugin-side fix (all four TNA_RE variants) and its own
-  # ticket; until it lands the hash is at-rest evidence only, which is exactly
-  # and only what the refuse-on-NULL rule needs.
-  local human_nonce="" _mint_nonce=0
-  case "$type" in approval|secret|manual|access) _mint_nonce=1 ;; esac
-  [[ "${tier:-}" =~ ^[0-9]+$ ]] && (( tier >= 2 )) && _mint_nonce=1
-  if (( _mint_nonce )); then
-    human_nonce=$(_human_nonce_mint)
-    [[ -n "$human_nonce" ]] \
-      && db "UPDATE tasks SET human_nonce_hash=$(sqlq "$(_human_nonce_sha "$human_nonce")") WHERE id=${id};"
-  fi
+  # THE EMIT HALF NOW LANDS ALONGSIDE THIS (DIVE-2233 item 2). An earlier draft of
+  # this comment said the nonce was "not yet reachable by a decision TAP" and
+  # deferred it as a plugin-side ticket. `_task_gate_reply_markup` now appends
+  # `:${nonce}` to the decision option buttons too, and the answer path verifies it
+  # (see the tier-2 floor in cmd_task_answer). What made that safe rather than a
+  # plugin break is graded in gate_t2_nonce_proof_unit S12b/S12e: the DEPLOYED
+  # TNA_RE accepts the wider callback_data unchanged, and the fork scan reads each
+  # tna.ts variant's OWN on-disk regex rather than assuming. Two forks (opencode,
+  # pi) still parse the option token greedily and would swallow the nonce — they
+  # are named, fenced by that arm, and tracked, not silently shipped past.
+  #
+  # STILL NOT DONE HERE, and this is the part that must stay undone: refuse a
+  # tier-2 answer whose human_nonce_hash IS NULL. The floor is scoped to gates that
+  # HAVE a nonce (S16), so every gate already in flight keeps clearing. See the
+  # ORDERING note above — refuse-on-NULL waits for tier-2 decisions to accumulate
+  # nonces in the wild.
+  # THE MINT ITSELF HAS MOVED UP (DIVE-2054 ordering fix, above the first tasks UPDATE):
+  # a tier-2 gate that cannot arm itself must refuse BEFORE any row is written, not after.
+  # Only the persist survives here.
+  [[ -n "$human_nonce" ]] \
+    && db "UPDATE tasks SET human_nonce_hash=$(sqlq "$(_human_nonce_sha "$human_nonce")") WHERE id=${id};"
   # DIVE-1927: rc 3 = filed and answerable, but NOBODY was pinged. The gate always
   # stands — the dashboard "Needs you" card, `task inbox` and `task answer` need no
   # channel, and a headless/solo/CI box answers gates exactly that way. What must
@@ -6215,14 +6265,26 @@ _task_gate_reply_markup() { # <row_id> <type> <options> <recommend> <nonce> <cha
   local reply_markup=""
   if [[ "$channel_type" =~ ^(claude|codex|grok|antigravity)$ ]]; then
     if [[ "$need_type" == "decision" && -n "$options" ]]; then
-      reply_markup=$(printf '%s' "$options" | jq -Rc --arg id "$numid" --arg r "$recommend" --arg p "$label" '
+      # DIVE-2233: the decision buttons now carry the per-gate nonce suffix too, exactly
+      # like approval/secret/manual. This is what makes a tier-2 decision tap PROVABLE
+      # rather than merely asserted — the raw nonce goes into callback_data, which the
+      # agent LLM never sees, and comes back as --human-proof.
+      #
+      # NO PLUGIN CHANGE IS NEEDED, and that is a measured fact, not an assumption: the
+      # deployed contract is `TNA_RE = /^tna:(\d+):([^:]+)(?::([0-9a-f]{32}))?$/`, whose
+      # nonce group is generic over the token — it was never conditioned on the gate type.
+      # Verified against the INSTALLED artifacts (telegram 0.5.35 and 0.5.36 under
+      # ~/.claude/plugins/cache), not just the plugins repo. The emitter here was the only
+      # type-conditional half of the contract. `$np` is empty for gates that mint no nonce,
+      # so the callback_data is byte-identical to today's for every one of them.
+      reply_markup=$(printf '%s' "$options" | jq -Rc --arg id "$numid" --arg r "$recommend" --arg p "$label" --arg np "$np" '
         ($r | gsub("^\\s+|\\s+$"; "")) as $rr
         | [ split("|")[] | gsub("^\\s+|\\s+$"; "") | select(length > 0) ] as $o
         | ($o | to_entries
            | sort_by(.value == $rr and ($rr|length)>0 | not)
            | reduce .[] as $e ({rows: [], cur: [], w: 0};
                (($e.value | length) + (if $e.value == $rr and ($rr|length)>0 then 2 else 0 end)) as $len
-               | {text: ($p + (if $e.value == $rr and ($rr|length)>0 then "⭐ " + $e.value else $e.value end)), callback_data: ("tna:" + $id + ":" + ($e.key | tostring))} as $btn
+               | {text: ($p + (if $e.value == $rr and ($rr|length)>0 then "⭐ " + $e.value else $e.value end)), callback_data: ("tna:" + $id + ":" + ($e.key | tostring) + $np)} as $btn
                | if (.cur | length) > 0 and ((.cur | length) >= 3 or (.w + $len + 2) > 24)
                  then {rows: (.rows + [.cur]), cur: [$btn], w: $len}
                  else {rows: .rows, cur: (.cur + [$btn]), w: (.w + $len + 2)}
@@ -7410,6 +7472,49 @@ cmd_task_answer() {
       "task=$ident" "type=$nt" "tier=$gtier" "reason=non-human answer on tier-2 floor" \
       "human=$human" "caller=$_caller3" "sudo_uid=${SUDO_UID:-}"
     fail "$E_AUTH_REQUIRED" "$ident is a tier-2 human gate ($nt) — only a human can clear it, so an agent answer is refused. Tap the button in Telegram or use the dashboard. (If the tier-2 floor over-fired on this gate, re-file it at a lower --tier.)"
+  fi
+
+  # DIVE-2233 (second item) — THE TIER-2 HUMAN CLAIM MUST BE PROVED, NOT ASSERTED.
+  #
+  # The floor above only fires when `--human` was NOT passed. That is the entire hole:
+  # every guard on a tier-2 gate is downstream of a flag, and `--human` is a plain CLI
+  # flag any agent that can `sudo` can pass. The gate that closed DIVE-2131 is the
+  # worked example — a tier-2 hard gate whose row recorded need_answered_uid=1004
+  # (agent-main, the plugin's own uid) and human_nonce_hash NULL. Nothing in that row is
+  # non-forgeable. "Hard human floor" was a label on it, not a property of it.
+  #
+  # So when a tier-2 gate HAS a minted nonce, a `--human` answer must carry one of the
+  # two DIVE-916 evidence forms — the per-gate nonce (the tap; its SUDO_UID is the
+  # spawning agent, which is why the nonce exists) or a non-agent SUDO_UID (dashboard
+  # exec, human-on-box login). Both are things an agent cannot produce for itself.
+  #
+  # SCOPED TO "HAS A NONCE" ON PURPOSE, and this is the compatibility hinge rather than
+  # timidity: before this change, tier-2 decision/access gates minted nothing, so a gate
+  # filed by the old code and answered by the new code has no hash to check. Demanding
+  # evidence there would reject real human taps on every gate already in flight — and
+  # those taps genuinely cannot comply, because the button they are attached to was
+  # rendered without a nonce in its callback_data. `human_nonce_hash` non-empty is the
+  # exact, per-row witness that this gate's buttons CAN carry proof.
+  #
+  # Runs under `_gate_proof_enforced` for the same rollout envelope as every other
+  # evidence rule (enforce is ON fleet-wide since DIVE-950).
+  if [[ "$gtier" == "2" ]] && (( human )) && _gate_proof_enforced; then
+    local _t2_hash; _t2_hash=$(db "SELECT COALESCE(human_nonce_hash,'') FROM tasks WHERE id=${id};")
+    if [[ -n "$_t2_hash" ]]; then
+      local _t2_hp=0 _t2_su=0
+      [[ -n "$human_proof" ]] && _human_nonce_verify "$id" "$human_proof" && _t2_hp=1
+      _gate_sudo_uid_nonagent && _t2_su=1
+      local _t2_caller; _t2_caller=$(id -un 2>/dev/null || echo '?')
+      # DIVE-2054: the nonce being scored is task-store state for $ident — fenced.
+      _task_store_audit_log "task answer t2-human-evidence" \
+        "$([[ $(( _t2_hp || _t2_su )) -eq 1 ]] && echo ok || echo error)" 0 -- \
+        "task=$ident" "type=$nt" "tier=$gtier" "nonce_valid=$_t2_hp" "sudo_nonagent=$_t2_su" \
+        "human_proof=$([[ -n "$human_proof" ]] && echo present || echo absent)" \
+        "caller=$_t2_caller" "sudo_uid=${SUDO_UID:-}" 2>/dev/null || true
+      if (( ! _t2_hp && ! _t2_su )); then
+        fail "$E_AUTH_REQUIRED" "$ident is a tier-2 human gate ($nt) and the --human claim is unproven: no valid per-gate proof and no non-agent SUDO_UID. Tap the button in Telegram (it carries the proof) or answer from the dashboard. A bare 'sudo 5dive task answer --human' is exactly the forge this refuses."
+      fi
+    fi
   fi
 
   # Who resumes: the agent that hit the gate (assignee), else the creator.
