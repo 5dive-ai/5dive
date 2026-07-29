@@ -3349,17 +3349,19 @@ cmd_task_verify() {
     # DIVE-2015: a maker is deliberately ALLOWED to rescue a stalled delivered
     # loop with `task verify --cmd=...`; refusing it would remove the only
     # zero-human exit when the assigned verifier never runs. Permitted must not
-    # mean invisible, though. When the REAL caller is the recorded maker and the
-    # still-live row is held by its verifier, stamp the durable task result,
-    # emit a separately classifiable audit event, and warn on stderr. The mark
-    # names every fact a later reader needs to weigh the close: maker, verifier
-    # who never recorded a grade, and loop iteration.
+    # mean invisible, though. When the kernel-authenticated caller is the recorded
+    # maker and the still-live row is held by its verifier, stamp the durable task
+    # result, emit a separately classifiable audit event, and warn on stderr. The
+    # mark names every fact a later reader needs to weigh the close: maker,
+    # verifier who never recorded a grade, and loop iteration. An unidentified
+    # caller cannot safely be classified as maker or verifier, so its passing
+    # evidence is retained but it cannot close a live delivered loop.
     #
     # This belongs in audit_log, not policy_refusals: nothing was refused. Route
     # through the task-store fence so fixture DBs cannot write real-looking task
     # telemetry into the fleet audit log (DIVE-2010).
-    local _svc_actor _svc_row _svc_assignee _svc_status
-    _svc_actor=$(task_actor)
+    local _svc_auth_actor _svc_row _svc_assignee _svc_status
+    _svc_auth_actor=$(_gate_authenticated_actor)
     _svc_row=$(db "SELECT COALESCE(maker_agent,'')||x'1f'||
                         COALESCE(verifier,'')||x'1f'||
                         COALESCE(assignee,'')||x'1f'||
@@ -3368,11 +3370,16 @@ cmd_task_verify() {
     IFS=$'\x1f' read -r self_verify_maker self_verify_verifier \
       _svc_assignee self_verify_iteration _svc_status <<<"$_svc_row"
     if [[ -n "$self_verify_maker" && -n "$self_verify_verifier" \
-          && "$_svc_actor" == "$self_verify_maker" \
           && "$_svc_assignee" == "$self_verify_verifier" \
           && "$_svc_status" != "done" && "$_svc_status" != "cancelled" ]]; then
-      self_verified_close=1
-      result_txt="⚠ self-verified-close: maker=${self_verify_maker}; verifier=${self_verify_verifier} never graded; iteration=${self_verify_iteration}"$'\n'"${result_txt}"
+      if [[ -z "$_svc_auth_actor" ]]; then
+        db "UPDATE tasks SET result=$(sqlq "$result_txt") WHERE id=${id};"
+        fail "$E_PERMISSION" "$ident verify passed and the evidence was recorded, but auto-close was refused: the caller identity could not be authenticated for this live delivered loop"
+      fi
+      if [[ "$_svc_auth_actor" == "$self_verify_maker" ]]; then
+        self_verified_close=1
+        result_txt="⚠ self-verified-close: maker=${self_verify_maker}; verifier=${self_verify_verifier} never graded; iteration=${self_verify_iteration}"$'\n'"${result_txt}"
+      fi
     fi
     db "UPDATE tasks SET status='done', done_at=datetime('now'), result=$(sqlq "$result_txt") WHERE id=${id};"
     flipped=1
