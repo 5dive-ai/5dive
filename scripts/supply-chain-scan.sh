@@ -37,8 +37,24 @@ if ! git rev-parse --verify "$HEAD^{commit}" >/dev/null 2>&1; then
   echo "supply-chain-scan: head '$HEAD' is not a commit here — REFUSING to report clean" >&2; exit 2
 fi
 
+# COMMENT LINES ARE NOT EXECUTABLE SURFACE, and matching them is not a harmless false
+# positive — it is the failure mode that kills the control. Measured: this scanner run
+# against its OWN branch reports its own header prose (the `curl … | bash` and
+# `cli.devln.ai` examples that explain what it looks for) as three findings plus a
+# NEW-DOMAIN. That is why its first CI run went red on exit 3. A guard that fires on
+# documentation of itself teaches the reader its findings are noise, and the next real
+# finding gets skimmed with the same reflex — the "trains everyone to ignore red" shape.
+#
+# Only a line whose FIRST non-blank character is `#` is dropped: `foo # curl|bash` still
+# carries executable code and is still scanned. LIMIT, stated because a silent one is how
+# this class returns: a `#` opening a line inside a multi-line STRING literal is dropped
+# too. Acceptable here — the surface this guards is bash, python and yaml, where `#` is a
+# comment in all three. Defined ABOVE its use on purpose: a function referenced before
+# definition would empty ADDED and make this scanner report "none" on every diff.
+strip_comments() { grep -vE '^[[:space:]]*#' ; }
+
 ADDED="$(git diff "$BASE..$HEAD" -- . ':(exclude)5dive' ':(exclude)5dive.sha256' \
-        | grep -E '^\+' | grep -vE '^\+\+\+' | sed 's/^+//')" || true
+        | grep -E '^\+' | grep -vE '^\+\+\+' | sed 's/^+//' | strip_comments)" || true
 # An empty diff is a real answer; an unreadable one is not, and we exited above.
 
 rc=0
@@ -49,8 +65,18 @@ echo "== supply-chain surface added by this diff =="
 # 1. FETCH-TO-SHELL — code fetched over the network and executed, as root on every box.
 while IFS= read -r line; do
   [[ -z "$line" ]] && continue
-  printf '%s' "$line" | grep -qE '(curl|wget)[^|]*\|[[:space:]]*(sudo[[:space:]]+)?(ba)?sh' \
-    && emit "FETCH-TO-SHELL: $(printf '%s' "$line" | sed 's/^[[:space:]]*//' | cut -c1-140)"
+  _INTERP='(ba|z|k|da)?sh|python[0-9.]*|perl|ruby|node|php'
+  # MEASURED against a synthetic hostile diff rather than reasoned about: the first cut
+  # matched only sh/bash after a pipe, so `curl … | python3` MISSED and `bash <(curl …)`
+  # MISSED. The second is the dangerous one — NEW-DOMAIN is the backstop for an unknown
+  # host, but a fetch-to-shell from a domain ALREADY trusted in the base tree yields no
+  # new domain, so process substitution slipped past BOTH checks and this printed "none".
+  printf '%s' "$line" | grep -qE "(curl|wget)[^|]*\|[[:space:]]*(sudo[[:space:]]+)?($_INTERP)\b" \
+    && { emit "FETCH-TO-SHELL: $(printf '%s' "$line" | sed 's/^[[:space:]]*//' | cut -c1-140)"; continue; }
+  printf '%s' "$line" | grep -qE "($_INTERP|source|\.)[[:space:]]+<\([[:space:]]*(curl|wget)" \
+    && { emit "FETCH-TO-SHELL(procsub): $(printf '%s' "$line" | sed 's/^[[:space:]]*//' | cut -c1-140)"; continue; }
+  printf '%s' "$line" | grep -qE '(eval|exec)[^;]*\$\([[:space:]]*(curl|wget)' \
+    && { emit "FETCH-TO-SHELL(eval): $(printf '%s' "$line" | sed 's/^[[:space:]]*//' | cut -c1-140)"; continue; }
 done <<< "$ADDED"
 
 # 2. NEW TYPE_INSTALL RECIPE — the agent-type install path, which runs as root.
@@ -77,6 +103,13 @@ fi
 
 if (( rc == 0 )); then
   echo "  none — no new fetch-to-shell, install recipe, or domain in this diff"
+  echo
+  # State the blind spots ON THE CLEAN PATH: this is the line that gets acted on, and
+  # limits that live only in the header are not met at the moment of the decision.
+  echo "  NOT A CLEARANCE. Line-oriented heuristic over added lines: it cannot see a"
+  echo "  payload split across lines, fetch-then-exec via a temp file, an indirected host,"
+  echo "  or anything inside the bundle (bundle-drift covers that; it runs on pull_request)."
+  echo "  'none' means nothing MATCHED, not 'this diff is safe'."
 else
   echo
   echo "AUDIT REQUIRED. These lines are where a hostile change is indistinguishable"
