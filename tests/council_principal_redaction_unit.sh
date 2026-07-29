@@ -15,6 +15,8 @@
 # Mutation grade: delete the tg:* arm of _council_principal_label and 1 goes red; drop the
 # filter from any of the three echo lines and 4 goes red.
 set -uo pipefail
+. "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh" \
+  || printf 'grading tree: UNRESOLVED (tests/lib/grading_tree.sh not reachable; no tree named)\n' >&2
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SRC="$HERE/../src/council/cmd_council.template.sh"
