@@ -884,6 +884,17 @@ cmd_task_show() {
                       CASE WHEN precedent_ref IS NOT NULL
                            THEN x'0a'||'precedent: '||COALESCE((SELECT ident FROM tasks p WHERE p.id=tasks.precedent_ref),'#'||precedent_ref) ELSE '' END||x'0a'||
                       'ask:  '||COALESCE(ask,'')||
+                      CASE WHEN floor_provenance IS NOT NULL AND json_valid(floor_provenance)
+                           THEN x'0a'||'floor: '||
+                                CASE WHEN COALESCE(json_extract(floor_provenance,'\$.tier_floored'),0)=1
+                                     THEN CASE WHEN tier=2 THEN 'tier forced to 2'
+                                               ELSE 'tier-2 category matched before appeal' END
+                                     ELSE 'tier-2 category did not fire' END||
+                                CASE WHEN COALESCE(json_extract(floor_provenance,'\$.floor_term'),'')<>''
+                                     THEN '  matched term: '||json_extract(floor_provenance,'\$.floor_term') ELSE '' END||
+                                CASE WHEN COALESCE(json_extract(floor_provenance,'\$.appeal'),'')<>''
+                                     THEN x'0a'||'floor appeal: '||json_extract(floor_provenance,'\$.appeal') ELSE '' END
+                           ELSE '' END||
                       CASE WHEN need_answered_at IS NOT NULL
                            THEN x'0a'||'answer: '||CASE WHEN need_type='secret' THEN '(provided — loaded out-of-band)' ELSE COALESCE(need_answer,'') END||'  ('||need_answered_at||')'
                            ELSE x'0a'||'answer: — pending' END
@@ -3939,16 +3950,23 @@ cmd_task_need() {
   else
     case "$type" in decision|approval) tier=1 ;; *) tier=2 ;; esac  # DIVE-1284
   fi
-  local tier_floored=0
+  local tier_floored=0 floor_was_floored=0 floor_term=""
+  local ttl_title; ttl_title=$(db "SELECT COALESCE(title,'') FROM tasks WHERE id=${id};")
   if [[ "$tier" != "2" ]]; then
     if [[ "$type" == "secret" ]]; then
       tier=2; tier_floored=1
     else
-      local ttl_title; ttl_title=$(db "SELECT COALESCE(title,'') FROM tasks WHERE id=${id};")
       if _gate_tier2_floor_hit "${ask} ${ttl_title}"; then
         tier=2; tier_floored=1
       fi
     fi
+  fi
+  # DIVE-2186: capture the ORIGINAL category-floor decision before any of the
+  # sanctioned carve-outs/appeals below clears tier_floored. The write path used
+  # to persist only the final tier, losing both this fact and its matched term.
+  floor_was_floored="$tier_floored"
+  if (( floor_was_floored )); then
+    floor_term=$(_gate_tier2_floor_term "${ask} ${ttl_title}")
   fi
 
   # DIVE-1381: content-curation carve-out. Mirror of the eng-ship class (DIVE-1359)
@@ -4127,6 +4145,22 @@ cmd_task_need() {
   [[ "$tier" == "0" && -z "$recommend" ]] \
     && fail "$E_USAGE" "--tier=0 auto-applies the recommendation, so --recommend is required"
 
+  # DIVE-2186: one gate-row column carries the complete file-time floor tuple.
+  # Keep it machine-readable for JSON `task show`, while the prose show path
+  # renders it beside the ask. An appeal can leave the effective tier at 1, so
+  # tier_floored records whether the floor ORIGINALLY fired, not the final tier.
+  local floor_appeal="" floor_provenance=""
+  if [[ -n "$discusses" ]]; then
+    if [[ "$_discusses_applied" == "1" ]]; then floor_appeal="appealed"
+    else floor_appeal="refused"
+    fi
+  fi
+  if (( floor_was_floored )) || [[ -n "$floor_appeal" ]]; then
+    floor_provenance=$(jq -cn \
+      --arg f "$floor_was_floored" --arg t "$floor_term" --arg a "$floor_appeal" \
+      '{tier_floored:($f=="1"), floor_term:(($t|select(length>0)) // null), appeal:(($a|select(length>0)) // null)}')
+  fi
+
   # OSS-11 (DIVE-976) decision-memory precedent prefill. This runs AFTER the tier
   # + T2 category floor are settled and the tier-0-requires-recommend check above,
   # so precedent can NEVER satisfy that requirement or change the resolved tier —
@@ -4240,7 +4274,8 @@ cmd_task_need() {
             ask_shape=$(sqlq_or_null "$ask_shape"),
             precedent_ref=${precedent_ref:-NULL},
             precedent_kind=$(sqlq_or_null "$precedent_kind"),
-            tier=${tier}, need_asked_at=datetime('now'), gate_pinged_at=NULL
+            tier=${tier}, floor_provenance=$(sqlq_or_null "$floor_provenance"),
+            need_asked_at=datetime('now'), gate_pinged_at=NULL
       WHERE id=${id};
       COMMIT;"
 
@@ -4583,9 +4618,8 @@ cmd_task_need() {
   # appeal exists — say what the sanctioned appeal is. Stating the appeal here is
   # the anti-laundering lever: the filer who would otherwise re-file with neutral
   # wording is shown an attributable, audited path to the same audience.
-  local floor_note="" floor_term=""
+  local floor_note=""
   if (( tier_floored )); then
-    floor_term=$(_gate_tier2_floor_term "${ask} $(db "SELECT COALESCE(title,'') FROM tasks WHERE id=${id};")")
     floor_note=" [tier forced to 2 — T2 category floor${floor_term:+: matched '$floor_term'}]"
     local _fw="this gate was FORCED to tier 2 (hard human) by the T2 category floor"
     [[ -n "$floor_term" ]] && _fw="$_fw because the ask or the task title contains '${floor_term}'"

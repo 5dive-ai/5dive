@@ -81,6 +81,8 @@ seed()      { db "INSERT INTO tasks(ident,title,status,created_by) VALUES('$1',$
 tierof()    { db "SELECT COALESCE(tier,'') FROM tasks WHERE ident='$1';"; }
 routedof()  { db "SELECT COALESCE(routed_reviewer,'') FROM tasks WHERE ident='$1';"; }
 askof()     { db "SELECT COALESCE(ask,'') FROM tasks WHERE ident='$1';"; }
+floorof()   { db "SELECT COALESCE(floor_provenance,'') FROM tasks WHERE ident='$1';"; }
+showof()    { JSON_MODE=0 cmd_task_show "$1" 2>/dev/null; }
 
 # dev3's real ask on DIVE-2078, trimmed. Names "credentials" and "privileged";
 # requests nothing but a modelling choice.
@@ -333,6 +335,66 @@ jres2=$(cmd_task_need DIVE-424 --type=decision --from=dev \
   --options="priority|age" --recommend="priority" 2>/dev/null)
 [[ "$(jq -r '.data.floor_term' <<<"$jres2" 2>/dev/null)" == "null" ]] \
   && ok_t "json: floor_term is null when nothing floored (not a constant)" || bad_t "json floor_term null" "$jres2"
+
+# 20: DIVE-2186 — THE LATER-SESSION REREAD SURFACE. File-time locals are not
+#     evidence after the command exits: the gate row must carry the original
+#     floor decision, matched term, and appeal outcome, and `task show` must
+#     render them beside the ask. Grade all three meaningful states.
+fp=$(floorof DIVE-403)
+[[ "$(jq -r '.tier_floored' <<<"$fp" 2>/dev/null)" == "true" \
+   && "$(jq -r '.floor_term' <<<"$fp" 2>/dev/null)" == "credential" \
+   && "$(jq -r '.appeal' <<<"$fp" 2>/dev/null)" == "null" ]] \
+  && ok_t "persist/reread: unappealed floor stores (tier_floored, matched term, no appeal)" \
+  || bad_t "persist unappealed tuple" "$fp"
+shown=$(showof DIVE-403)
+grep -q 'floor: tier forced to 2  matched term: credential' <<<"$shown" \
+  && ok_t "task show: later reread explains the forced tier and matched term" \
+  || bad_t "task show forced-floor explanation" "$shown"
+
+fp_applied=$(floorof DIVE-414)
+[[ "$(jq -r '.tier_floored' <<<"$fp_applied" 2>/dev/null)" == "true" \
+   && "$(jq -r '.floor_term' <<<"$fp_applied" 2>/dev/null)" == "credential" \
+   && "$(jq -r '.appeal' <<<"$fp_applied" 2>/dev/null)" == "appealed" ]] \
+  && ok_t "persist/reread: applied appeal retains the floor it overrode" \
+  || bad_t "persist appealed tuple" "$fp_applied"
+shown_applied=$(showof DIVE-414)
+grep -q 'floor: tier-2 category matched before appeal  matched term: credential' <<<"$shown_applied" \
+  && grep -q 'floor appeal: appealed' <<<"$shown_applied" \
+  && ok_t "task show: applied appeal remains attributable after the filer returns" \
+  || bad_t "task show appealed explanation" "$shown_applied"
+
+fp_refused=$(floorof DIVE-415)
+[[ "$(jq -r '.tier_floored' <<<"$fp_refused" 2>/dev/null)" == "true" \
+   && "$(jq -r '.floor_term' <<<"$fp_refused" 2>/dev/null)" == "refund" \
+   && "$(jq -r '.appeal' <<<"$fp_refused" 2>/dev/null)" == "refused" ]] \
+  && ok_t "persist/reread: refused appeal stores the surviving floor decision" \
+  || bad_t "persist refused tuple" "$fp_refused"
+shown_refused=$(showof DIVE-415)
+grep -q 'floor: tier forced to 2  matched term: refund' <<<"$shown_refused" \
+  && grep -q 'floor appeal: refused' <<<"$shown_refused" \
+  && ok_t "task show: refused appeal and its matched term survive file time" \
+  || bad_t "task show refused explanation" "$shown_refused"
+
+[[ -z "$(floorof DIVE-424)" ]] \
+  && ok_t "persist/no-op: an unfloored, unappealed gate stores no provenance" \
+  || bad_t "persist no-op null" "$(floorof DIVE-424)"
+shown_noop=$(showof DIVE-424)
+grep -q '^  floor:' <<<"$shown_noop" \
+  && bad_t "task show/no-op must not invent floor provenance" "$shown_noop" \
+  || ok_t "task show/no-op: ordinary gates gain no floor line"
+
+# Re-filing retires the old gate. Preserve its explanation in gate_history and
+# clear it from the replacement instead of leaving stale WHY on a new gate.
+old_fp="$fp"
+cmd_task_need DIVE-403 --type=decision --from=dev \
+  --ask="Should the dashboard use compact or comfortable rows?" \
+  --options="compact|comfortable" --recommend="compact" >/dev/null 2>&1
+[[ "$(db "SELECT COALESCE(floor_provenance,'') FROM gate_history WHERE ident='DIVE-403' ORDER BY id DESC LIMIT 1;")" == "$old_fp" ]] \
+  && ok_t "history: re-file archives the outgoing floor explanation" \
+  || bad_t "history floor provenance" "$(db "SELECT COALESCE(floor_provenance,'') FROM gate_history WHERE ident='DIVE-403' ORDER BY id DESC LIMIT 1;")"
+[[ -z "$(floorof DIVE-403)" ]] \
+  && ok_t "re-file: replacement gate does not inherit stale floor provenance" \
+  || bad_t "re-file stale floor provenance" "$(floorof DIVE-403)"
 
 printf '\n%s passed, %s failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" == "0" ]]

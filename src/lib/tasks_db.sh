@@ -228,6 +228,13 @@ CREATE TABLE IF NOT EXISTS tasks (
   -- wake_at: a parked task
   -- (task park --wake=...) auto-unparks when the heartbeat passes this time.
   tier                INTEGER,
+  -- DIVE-2186: durable explanation for the gate's T2 category-floor decision.
+  -- JSON object: {tier_floored:boolean, floor_term:string|null,
+  -- appeal:"appealed"|"refused"|null}. These values used to exist only as
+  -- cmd_task_need locals, so `task show` in a later session could render the
+  -- effective tier but not WHY it moved or what happened to a declared appeal.
+  -- NULL means the floor did not participate and no appeal was attempted.
+  floor_provenance    TEXT,
   need_asked_at       TEXT,
   gate_pinged_at      TEXT,
   wake_at             TEXT,
@@ -499,6 +506,7 @@ CREATE TABLE IF NOT EXISTS gate_history (
   need_options      TEXT,
   recommend         TEXT,
   tier              INTEGER,
+  floor_provenance TEXT,
   need_asked_at     TEXT,
   need_answer       TEXT,
   need_answered_at  TEXT,
@@ -767,7 +775,7 @@ _tasks_db_migrate() {
            'acceptance_criteria TEXT' 'verify_command TEXT' 'max_iterations INTEGER' 'verifier TEXT' \
            'iteration INTEGER' 'maker_agent TEXT' 'handoff_ack_at TEXT' 'task_budget TEXT' \
            'handoff_delivered_at TEXT' 'handoff_stale_pinged_at TEXT' \
-           'tier INTEGER' 'need_asked_at TEXT' 'gate_pinged_at TEXT' 'wake_at TEXT' \
+           'tier INTEGER' 'floor_provenance TEXT' 'need_asked_at TEXT' 'gate_pinged_at TEXT' 'wake_at TEXT' \
            'secret_key TEXT' 'connector TEXT' 'human_nonce_hash TEXT' \
            'ask_shape TEXT' 'precedent_ref INTEGER' 'precedent_kind TEXT' \
            'shipped_flag_at TEXT' 'routed_reviewer TEXT' \
@@ -1021,6 +1029,7 @@ CREATE TABLE IF NOT EXISTS gate_history (
   need_options      TEXT,
   recommend         TEXT,
   tier              INTEGER,
+  floor_provenance TEXT,
   need_asked_at     TEXT,
   need_answer       TEXT,
   need_answered_at  TEXT,
@@ -1033,6 +1042,16 @@ CREATE TABLE IF NOT EXISTS gate_history (
 );
 CREATE INDEX IF NOT EXISTS gate_history_task_idx ON gate_history(task_id, id);
 MIG
+  fi
+  # DIVE-2186: gate_history predates the floor-provenance column on existing
+  # stores. Keep retired gates self-explanatory too; this is an additive NULL
+  # backfill and the guarded ALTER is a no-op after the first migration.
+  local gh_cols
+  gh_cols=$(sqlite3 -cmd ".timeout 5000" "$TASKS_DB" \
+            "SELECT name FROM pragma_table_info('gate_history');" 2>/dev/null)
+  if ! printf '%s\n' "$gh_cols" | grep -qx floor_provenance; then
+    sqlite3 -cmd ".timeout 5000" "$TASKS_DB" \
+      "ALTER TABLE gate_history ADD COLUMN floor_provenance TEXT;" >/dev/null 2>&1 || true
   fi
 
   # DIVE-748 — additive scorecard column on already-created loop_runs tables.
@@ -1458,11 +1477,11 @@ _gate_archive_and_clear_sql() {
   # deliberate, so make it explicit instead of exempt.
   printf '%s\n' \
     "INSERT INTO gate_history (task_id, ident, need_type, ask, need_options, recommend," \
-    "                          tier, need_asked_at, need_answer, need_answered_at," \
+    "                          tier, floor_provenance, need_asked_at, need_answer, need_answered_at," \
     "                          need_answered_by, need_answered_uid, need_answer_sig," \
     "                          human_nonce_hash, retired_by)" \
     "  SELECT id, ident, need_type, ask, need_options, recommend," \
-    "         tier, need_asked_at, need_answer, need_answered_at," \
+    "         tier, floor_provenance, need_asked_at, need_answer, need_answered_at," \
     "         need_answered_by, need_answered_uid, need_answer_sig," \
     "         human_nonce_hash, $(sqlq "$verb")" \
     "    FROM tasks" \
@@ -1473,7 +1492,8 @@ _gate_archive_and_clear_sql() {
     "          OR (human_nonce_hash IS NOT NULL AND human_nonce_hash <> ''));" \
     "UPDATE tasks" \
     "   SET need_answer=NULL, need_answered_at=NULL, need_answered_by=NULL," \
-    "       need_answered_uid=NULL, need_answer_sig=NULL, human_nonce_hash=NULL" \
+    "       need_answered_uid=NULL, need_answer_sig=NULL, human_nonce_hash=NULL," \
+    "       floor_provenance=NULL" \
     " WHERE (${pred});"
 }
 
