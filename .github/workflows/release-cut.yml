@@ -238,22 +238,49 @@ jobs:
           # The tag is NOT deleted on failure. A published tag that cannot be served is
           # a state a human must see; auto-removing it would hide the one occurrence
           # that proves the window is real.
-          _raw="https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/${sha}/5dive.sha256"
-          _served=""
+          # PROBE THE MANDATORY OBJECT, NOT THE OPTIONAL ONE (dev, review of #313).
+          # install.sh:264 `curl "$REPO/5dive" || die` is FATAL. install.sh:273
+          # `curl "$REPO/5dive.sha256" || _want=""` is fail-SOFT BY DESIGN — DIVE-1271
+          # made an absent checksum warn rather than brick a box. The first cut of this
+          # probe fetched the .sha256, so it proved the object install.sh treats as
+          # OPTIONAL was servable and said nothing about the one it dies on.
+          #
+          # And they are two INDEPENDENT CDN objects with independent cache generations —
+          # DIVE-1977 exists because they disagreed. Proving one servable is not evidence
+          # about the other; that row's own finding, applied to the probe descended from
+          # it. The bundle is ~2.8MB against a 65-byte checksum, and both are the only
+          # genuinely NEW blobs in the release commit (everything else install.sh fetches
+          # is inherited from main's tree), so object-level lag shows on the bundle first.
+          _base="https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/${sha}"
+          _tmp="$(mktemp)"
+          _got=""
           for _try in 1 2 3 4 5 6; do
-            _served="$(curl -fsSL --max-time 10 "$_raw" 2>/dev/null | tr -d '[:space:]')" && [ -n "$_served" ] && break
-            echo "  attempt ${_try}/6: ${tag} not yet servable at ${sha:0:12} — waiting for propagation"
-            _served=""; sleep 10
+            curl -fsSL --max-time 60 "${_base}/5dive" -o "$_tmp" 2>/dev/null \
+              && [ -s "$_tmp" ] \
+              && _got="$(sha256sum "$_tmp" | awk '{print $1}')" \
+              && break
+            echo "  attempt ${_try}/6: ${tag} bundle not yet servable at ${sha:0:12} — waiting for propagation"
+            _got=""; sleep 10
           done
-          if [ -z "$_served" ]; then
-            echo "::error::${tag} IS PUBLISHED BUT NOT SERVABLE. raw.githubusercontent returned nothing for ${sha:0:12} after 6 tries. install.sh fetches the bundle from exactly this URL and fails closed, so every NEW install and every unattended self-update will die on the download until this resolves. The tag was deliberately NOT deleted — a human needs to see this. URL: ${_raw}"
+          if [ -z "$_got" ]; then
+            rm -f "$_tmp"
+            echo "::error::${tag} IS PUBLISHED BUT ITS BUNDLE IS NOT SERVABLE. raw.githubusercontent returned nothing usable for ${_base}/5dive after 6 tries. That is the object install.sh DIES on, so every new install and every unattended self-update fails until this resolves. The tag was deliberately NOT deleted — a human needs to see this."
             exit 1
           fi
-          if [ "$_served" != "$_want" ]; then
-            echo "::error::${tag} is servable but WRONG. raw.githubusercontent serves ${_served} at ${sha:0:12}; the tagged tree carries ${_want}. Boxes would install a bundle that is not the one this cut verified."
+          rm -f "$_tmp"
+          if [ "$_got" != "$_want" ]; then
+            echo "::error::${tag} serves a DIFFERENT bundle than this cut verified. ${_base}/5dive hashes to ${_got}; the tagged tree carries ${_want}. Boxes would install bytes nobody checked."
             exit 1
           fi
-          echo "${tag}: bundle verified SERVABLE at ${sha:0:12} (${_served:0:16}…) — install.sh's fetch path is proven, not assumed"
+          # Also confirm the two objects AGREE at this one immutable sha — DIVE-1977's own
+          # prescription. install.sh reads both, and a stale .sha256 against a fresh bundle
+          # is the disagreement that row was filed for.
+          _servedsha="$(curl -fsSL --max-time 10 "${_base}/5dive.sha256" 2>/dev/null | tr -d '[:space:]')" || _servedsha=""
+          if [ -n "$_servedsha" ] && [ "$_servedsha" != "$_want" ]; then
+            echo "::error::${tag}: the served 5dive.sha256 (${_servedsha}) disagrees with the bundle this cut verified (${_want}) at ${sha:0:12}. The two CDN objects are out of step (DIVE-1977)."
+            exit 1
+          fi
+          echo "${tag}: bundle verified SERVABLE and byte-correct at ${sha:0:12} (${_got:0:16}…) — install.sh's FATAL fetch path is proven, not assumed"
 
           gh release create "$tag" --title "$tag" --target "$sha" --notes "${note}
 

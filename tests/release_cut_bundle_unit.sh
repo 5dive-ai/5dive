@@ -116,13 +116,24 @@ echo "-- the tag must be proven SERVABLE, not merely pushed (dev, review of #313
 # unattended and install.sh fails closed, so an unservable tag kills installs after EVERY
 # release and is discovered at the NEXT one. Graded structurally because the property is a
 # live network fetch this harness must not perform.
-grep -q 'raw.githubusercontent.com/\${GITHUB_REPOSITORY}/\${sha}/5dive.sha256' "$WF" \
-  && ok_t 'the cut probes install.sh’s ACTUAL fetch URL after pushing the tag' \
-  || bad_t 'nothing verifies the tag is servable from where install.sh looks' ''
-grep -q 'IS PUBLISHED BUT NOT SERVABLE' "$WF" \
+# The arm must follow the probe: it now fetches the BUNDLE, which is the object
+# install.sh:264 DIES on, not the .sha256 that install.sh:273 treats as optional
+# (fail-soft by design since DIVE-1271). Probing the optional object proved the
+# wrong thing — they are independent CDN objects with independent cache
+# generations, which is the whole of DIVE-1977.
+grep -q '"${_base}/5dive" -o "$_tmp"' "$WF" \
+  && ok_t 'the cut fetches the BUNDLE — the object install.sh dies on, not the optional checksum' \
+  || bad_t 'the probe does not fetch the mandatory bundle' "$(grep -n '_base' "$WF" | head -3)"
+grep -q 'sha256sum "$_tmp"' "$WF" \
+  && ok_t 'the FETCHED BYTES are hashed, so a servable-but-wrong bundle cannot pass' \
+  || bad_t 'the probe does not hash what it downloaded' ''
+grep -q 'the two CDN objects are out of step\|disagrees with the bundle this cut verified' "$WF" \
+  && ok_t 'the served .sha256 is cross-checked against the bundle at one immutable sha (DIVE-1977)' \
+  || bad_t 'nothing checks the two objects agree' ''
+grep -q 'IS PUBLISHED BUT ITS BUNDLE IS NOT SERVABLE' "$WF" \
   && ok_t 'an unservable tag is an ERROR, not a warning — the cut fails closed' \
   || bad_t 'unservable tag must fail the cut, not annotate it' ''
-grep -q 'servable but WRONG' "$WF" \
+grep -q 'serves a DIFFERENT bundle than this cut verified' "$WF" \
   && ok_t 'a servable-but-mismatched bundle is refused too (200 is not enough)' \
   || bad_t 'a wrong bundle served at the tag sha must be refused' ''
 # The tag deliberately survives a failed probe: auto-deleting it would erase the single
