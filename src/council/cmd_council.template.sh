@@ -354,7 +354,12 @@ _council_veto_audit() {
 # the plain receipt line, no regression). Shared by BOTH the button rail (`_tg_veto_offer`) and the
 # `_tg_send` fallback so the two legs stay consistent.
 _council_veto_offer_header() {
-  local motion="${1:-}" tally="${2:-}" dissent="${3:-}" h=""
+  local motion="${1:-}" tally="${2:-}" dissent="${3:-}" subject="${4:-}" h=""
+  # DIVE-2257 FINDING 3: carry the SUBJECT (the ident the pass decides) so the founder sees WHAT is
+  # being vetoed. A receipt's fields are stampedAt/sealedDigest/council/question/disposition/verdict/
+  # canonical — there is no subject on the wire unless the convene stamped one, so an offer whose
+  # whole payload is the question string ("ship it?") is unusable even with a real window.
+  [[ -z "$subject" ]] || h+=$'\nSubject: '"$subject"
   [[ -n "$motion" ]]  && h+=$'\nDecision: '"$motion"
   [[ -n "$tally" ]]   && h+=$'\nVote: '"$tally"
   [[ -n "$dissent" && "$dissent" != "none" ]] && h+=$'\nDissent: '"$dissent"
@@ -371,7 +376,7 @@ _council_veto_offer_header() {
 # telegram rail the offer simply lapses (execution proceeds after the hold — fail-safe). Delivery
 # routes through `_mirror_send`, which honors FIVEDIVE_NOTIFY_DRYRUN so a fixture can't DM a human.
 _tg_veto_offer() {
-  local resolved="$1" full_digest="$2" nonce="$3" execute_after="$4" motion="${5:-}" tally="${6:-}" dissent="${7:-}"
+  local resolved="$1" full_digest="$2" nonce="$3" execute_after="$4" motion="${5:-}" tally="${6:-}" dissent="${7:-}" subject="${8:-}"
   [[ -n "$resolved" && -n "$full_digest" && -n "$nonce" ]] || return 0
   local token=""
   if _task_owner_channel 2>/dev/null && [[ -n "${TASK_CH_TOKEN:-}" ]]; then
@@ -387,23 +392,88 @@ _tg_veto_offer() {
   # NB: the raw nonce is ONLY in callback_data above — never in this human-readable text.
   # DIVE-1644: lead with WHAT carried + the tally + any dissent so the founder can decide from the
   # notification alone, then the sealed-receipt handle + hold deadline.
-  local header; header="$(_council_veto_offer_header "$motion" "$tally" "$dissent")"
+  local header; header="$(_council_veto_offer_header "$motion" "$tally" "$dissent" "$subject")"
   local text="Council veto offer${header}"$'\n\n'"A pass sealed (${full_digest:0:12}…). Execution holds until ${execute_after}. Tap 🛑 VETO to block it, or ignore to let it proceed."
   _mirror_send "$token" "$resolved" "" "$text" "$reply_markup" >/dev/null 2>&1 || true
   return 0
 }
 
-_council_veto_ping() {
-  local resolved="$1" digest="$2" execute_after="$3" nonce="$4" motion="${5:-}" tally="${6:-}" dissent="${7:-}"
+# DIVE-2257: an offer the council declines to MAKE is as auditable as one it declines to send.
+# Silent on stdout/stderr (the convene envelope must stay clean) and best-effort on disk: the
+# ledger is root-owned 0600, so a non-root convene simply records nothing, never fails.
+# DIVE-2257 FINDING 2 — may THIS convene offer the founder veto, and on WHAT subject?
+# Mirrors cli.mjs's own `primaryCouncil` predicate (bench === 'council', or no bench and no explicit
+# --seats), then requires an identifiable subject. Pure: no clock, no state, no I/O.
+#   rc 0 -> eligible, echoes the resolved subject
+#   rc 1 -> not the genesis-sealed council (ad-hoc panel or alternate bench) — normal, silent
+#   rc 2 -> the primary council, but nothing to name as the subject — anomalous, recorded
+_council_veto_offer_eligible() {
+  local bench="${1:-}" seats_given="${2:-0}" default_bench="${3:-council}" \
+        subject="${4:-}" msubject="${5:-}" mkind="${6:-}"
+  local primary=0
+  if [[ -n "$bench" ]]; then
+    if [[ "$bench" == "council" ]]; then primary=1; fi
+  elif (( ! seats_given )); then
+    if [[ "$default_bench" == "council" ]]; then primary=1; fi
+  fi
+  (( primary )) || return 1
+  local sj="$subject"
+  [[ -n "$sj" ]] || sj="$msubject"
+  if [[ -z "$sj" && -n "$mkind" ]]; then sj="motion:${mkind}"; fi
+  [[ -n "$sj" ]] || return 2
+  printf '%s' "$sj"
+  return 0
+}
+
+_council_veto_offer_omitted() {
+  local why="${1:-}" line=""
   mkdir -p "$COUNCIL_DIR" 2>/dev/null || true
+  line="$(jq -cn --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg why "$why" \
+    '{ts:$ts, reason:$why, kind:"veto-offer-omitted"}' 2>/dev/null)" || line=""
+  if [[ -n "$line" && -w "$COUNCIL_DIR" ]]; then
+    printf '%s\n' "$line" >> "${COUNCIL_DIR}/veto-pings.jsonl" 2>/dev/null || true
+    chmod 0600 "${COUNCIL_DIR}/veto-pings.jsonl" 2>/dev/null || true
+    [[ "$(id -u)" -eq 0 ]] && chown root:root "${COUNCIL_DIR}/veto-pings.jsonl" 2>/dev/null || true
+  fi
+  return 0
+}
+
+_council_veto_ping() {
+  local resolved="$1" digest="$2" execute_after="$3" nonce="$4" motion="${5:-}" tally="${6:-}" dissent="${7:-}" subject="${8:-}"
+  mkdir -p "$COUNCIL_DIR" 2>/dev/null || true
+  # ── DIVE-2257 INVARIANT (FINDING 1) ─────────────────────────────────────────────────────────────
+  # NO veto-offer may be WRITTEN whose executeAfter is <= its own ts. All six offers ever recorded in
+  # ${COUNCIL_DIR}/veto-pings.jsonl violated this — the hold the message advertises had ALREADY
+  # expired at the moment of sending (-45m, -15m, 0s, -1s, -1s, -1s), so the founder veto has never
+  # once been exercisable. An offer a human cannot act on is worse than no offer: it manufactures the
+  # appearance of a control. Refuse here, at the single write+send choke point — no ledger row, no
+  # delivery on either leg, one auditable refusal row (the branch that declines to act is the branch
+  # that must be auditable, same posture as the DIVE-1869 refusal sink). An unparseable or empty
+  # executeAfter yields epoch 0 and is likewise refused (fail-closed).
+  local _vo_ts _vo_ts_e _vo_ea_e
+  _vo_ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  _vo_ts_e="$(date -u -d "$_vo_ts" +%s 2>/dev/null || echo 0)"
+  _vo_ea_e="$(date -u -d "$execute_after" +%s 2>/dev/null || echo 0)"
+  if (( _vo_ea_e <= _vo_ts_e )); then
+    local _vo_refusal
+    _vo_refusal="$(jq -cn --arg ts "$_vo_ts" --arg r "$resolved" --arg d "$digest" --arg ea "$execute_after" \
+      --arg why "hold window already closed at send time (executeAfter <= ts)" \
+      '{ts:$ts, recipient:$r, receiptDigest:$d, executeAfter:$ea, reason:$why, kind:"veto-offer-refused"}' 2>/dev/null)" || _vo_refusal=""
+    if [[ -n "$_vo_refusal" && -w "$COUNCIL_DIR" ]]; then
+      printf '%s\n' "$_vo_refusal" >> "${COUNCIL_DIR}/veto-pings.jsonl" 2>/dev/null || true
+      chmod 0600 "${COUNCIL_DIR}/veto-pings.jsonl" 2>/dev/null || true
+      [[ "$(id -u)" -eq 0 ]] && chown root:root "${COUNCIL_DIR}/veto-pings.jsonl" 2>/dev/null || true
+    fi
+    return 0
+  fi
   # CNCL-9 (main gate amendment 2): the pings audit records ONLY the nonce DIGEST, never the raw
   # bearer token. The raw nonce leaves this process solely via the structured founder delivery leg
   # (`_tg_veto_offer`, DIVE-1546 rail B) below — never in chat text. The file is additionally locked
   # 0600 root so a group-claude agent cannot read even the digest+recipient trail.
   local nonce_digest; nonce_digest="$(_council_sha256 "$nonce")"
   local line
-  line="$(jq -cn --arg r "$resolved" --arg d "$digest" --arg ea "$execute_after" --arg nd "$nonce_digest" \
-    '{ts:(now|todate? // ""), recipient:$r, receiptDigest:$d, executeAfter:$ea, nonceDigest:$nd, kind:"veto-offer"}' 2>/dev/null)" || line=""
+  line="$(jq -cn --arg ts "$_vo_ts" --arg r "$resolved" --arg d "$digest" --arg ea "$execute_after" --arg nd "$nonce_digest" --arg sj "$subject" \
+    '{ts:$ts, recipient:$r, receiptDigest:$d, executeAfter:$ea, nonceDigest:$nd, subject:$sj, kind:"veto-offer"}' 2>/dev/null)" || line=""
   if [[ -n "$line" && -w "$COUNCIL_DIR" ]]; then
     printf '%s\n' "$line" >> "${COUNCIL_DIR}/veto-pings.jsonl" 2>/dev/null || true
     chmod 0600 "${COUNCIL_DIR}/veto-pings.jsonl" 2>/dev/null || true
@@ -422,14 +492,14 @@ _council_veto_ping() {
   # DIVE-1644: the motion/tally/dissent (sourced from the sealed verdict at the convene site) ride
   # through to BOTH delivery legs so the founder sees WHAT carried, not just a digest.
   if command -v _tg_veto_offer >/dev/null 2>&1 && [[ -z "${COUNCIL_MOCK:-}" ]]; then
-    _tg_veto_offer "$resolved" "$digest" "$nonce" "$execute_after" "$motion" "$tally" "$dissent" >/dev/null 2>&1 || true
+    _tg_veto_offer "$resolved" "$digest" "$nonce" "$execute_after" "$motion" "$tally" "$dissent" "$subject" >/dev/null 2>&1 || true
   elif [[ -n "${COUNCIL_MOCK:-}" && -n "${COUNCIL_VETO_OFFER_SINK:-}" ]]; then
     # Offline-test capture ONLY (double-gated on MOCK + an explicit sink, mirrors COUNCIL_VETO_NONCE_SINK):
     # record the STRUCTURED offer so the bash e2e can assert the raw nonce travels structured (and that
     # no chat-text leg ever carries it). PRODUCTION is never MOCK and never writes this sink.
-    ( umask 077; printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$resolved" "$digest" "$nonce" "$execute_after" "$motion" "$tally" >> "$COUNCIL_VETO_OFFER_SINK" ) 2>/dev/null || true
+    ( umask 077; printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$resolved" "$digest" "$nonce" "$execute_after" "$motion" "$tally" "$subject" >> "$COUNCIL_VETO_OFFER_SINK" ) 2>/dev/null || true
   elif [[ -z "${COUNCIL_MOCK:-}" ]] && command -v _tg_send >/dev/null 2>&1; then
-    local header; header="$(_council_veto_offer_header "$motion" "$tally" "$dissent")"
+    local header; header="$(_council_veto_offer_header "$motion" "$tally" "$dissent" "$subject")"
     _tg_send "$resolved" "Council veto offer${header}"$'\n\n'"A pass sealed (${digest:0:12}…). Execution holds until ${execute_after}. Open /council or the dashboard to VETO within the window, or ignore to let it proceed." >/dev/null 2>&1 || true
   fi
   return 0
@@ -1727,7 +1797,42 @@ cmd_council() {
     fi
   fi
   [[ "$veto_hold" =~ ^[0-9]+$ ]] || veto_hold=900
-  if (( genesis_exists )); then
+  # DIVE-2257 FINDING 2: the offer used to be minted on `genesis_exists` ALONE — the mere PRESENCE of
+  # a sealed genesis file — so an AD-HOC panel (`--seats=alpha,beta,gamma`, canned votes) still
+  # pinged the founder's REAL Telegram DM. Mirror cli.mjs's own `primaryCouncil` predicate here so a
+  # convene that is not running the genesis-sealed roster is STRUCTURALLY incapable of reaching the
+  # real recipient (the DIVE-2010 store-fence shape). Ad-hoc/alternate benches still convene and
+  # still seal — they just carry no founder-veto offer.
+  local _cv_bench="" _cv_seats=0 _cv_subject="" _cv_msubject="" _cv_mkind="" _cv_a
+  for _cv_a in "$@"; do
+    case "$_cv_a" in
+      --bench=*) _cv_bench="${_cv_a#--bench=}" ;;
+      --seats=*) _cv_seats=1 ;;
+      --subject=*) _cv_subject="${_cv_a#--subject=}" ;;
+      --motion-subject=*) _cv_msubject="${_cv_a#--motion-subject=}" ;;
+      --motion-kind=*) _cv_mkind="${_cv_a#--motion-kind=}" ;;
+    esac
+  done
+  local _cv_default_bench="council"
+  if [[ -n "$constitution_json" ]]; then
+    _cv_default_bench="$(printf '%s' "$constitution_json" | jq -r '.council.bench // "council"' 2>/dev/null || echo council)"
+    [[ -n "$_cv_default_bench" ]] || _cv_default_bench="council"
+  fi
+  # FINDING 3 (offer leg): a veto offer with no subject cannot be acted on, so it is not offered.
+  # A governance MOTION is self-identifying (kind+subject), so it supplies its own.
+  local offer_subject="" _cv_elig=0
+  offer_subject="$(_council_veto_offer_eligible "$_cv_bench" "$_cv_seats" "$_cv_default_bench" \
+                    "$_cv_subject" "$_cv_msubject" "$_cv_mkind")" || _cv_elig=$?
+  # NB both omissions are recorded, never PRINTED. `council convene --json` is consumed by callers
+  # that capture 2>&1 (tests/council_capture_e2e.sh, the gate-clear phase-2 read), so a warn on
+  # stderr corrupts the envelope — the omission goes to the same auditable ledger as a refusal.
+  # An ad-hoc panel not reaching the founder is NORMAL (cli.mjs already treats an explicit --seats
+  # panel as a non-governance thing), so only the anomalous case — the primary council convening
+  # with nothing to name as its subject — is written.
+  if (( genesis_exists )) && (( _cv_elig == 2 )); then
+    _council_veto_offer_omitted "no --subject on this convene: a veto offer that cannot say WHAT it is vetoing is not a governance record" || true
+  fi
+  if (( genesis_exists )) && (( _cv_elig == 0 )) && [[ -n "$offer_subject" ]]; then
     local g_principal g_resolved
     g_principal="$(jq -r '.veto.principal // empty' "$COUNCIL_GENESIS" 2>/dev/null)"
     g_resolved="$(jq -r '.veto.resolved // empty' "$COUNCIL_GENESIS" 2>/dev/null)"
@@ -1762,7 +1867,10 @@ cmd_council() {
     # every scheduled convene). mktemp keeps it collision-safe; an empty _pp_tmp on mktemp failure just
     # falls through to the no-pool path below (byte-identical to pre-CNCL-19).
     _pp_tmp="$(mktemp "${TMPDIR:-/tmp}/5dive-precedent-pool.XXXXXX" 2>/dev/null || true)"
-    if jq -s '[.[] | select((.verdict.recommendation // "") != "")
+    # DIVE-2257 FINDING 4: an ad-hoc/test convene must not become PRECEDENT. Today's canonical cited
+    # two 07-26 ad-hoc runs as followed precedent, so demo receipts were seeding the case-law chain
+    # that later real convenes cite. Only receipts sealed by a NAMED (non-ad-hoc) bench qualify.
+    if jq -s '[.[] | select((.verdict.recommendation // "") != "" and (.council // "") != "ad-hoc" and (.council // "") != "")
                 | {digest:(.sealedDigest // ""), question:(.question // ""),
                    recommendation:(.verdict.recommendation // ""),
                    brief:(.verdict.brief // .verdict.dissent // ""), stampedAt:(.stampedAt // "")}]' \
@@ -1806,7 +1914,11 @@ cmd_council() {
     local offer_resolved execute_after="" veto_nonce="" veto_nonce_digest=""
     offer_resolved="$(printf '%s' "$raw" | jq -r '.verdict.vetoOffer.resolved // empty' 2>/dev/null)"
     if [[ -n "$offer_resolved" ]]; then
-      execute_after="$(date -u -d "$stamped + ${veto_hold} seconds" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo "")"
+      # DIVE-2257: was `$stamped + hold`, where $stamped is taken BEFORE the convene runs. A real
+      # 5-seat deliberation takes 30-60 minutes, so a 900s hold was already spent by the time the
+      # receipt sealed and the ping fired (the 07-21 / 07-22 offers expired 15m / 45m before their
+      # own ping). The hold must be measured from the moment the offer is MADE.
+      execute_after="$(date -u -d "+${veto_hold} seconds" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo "")"
       veto_nonce="$(openssl rand -hex 16 2>/dev/null || head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n')"
       veto_nonce_digest="$(_council_sha256 "$veto_nonce")"
       canonical="$(printf '%s' "$base_canonical" | node "$dir/cli.mjs" seal-augment --canonical=- --nonce-digest="$veto_nonce_digest" --execute-after="$execute_after")" || canonical="$base_canonical"
@@ -1854,7 +1966,9 @@ cmd_council() {
             | "carried \($t.approve // 0)/\($tot) approve (\($t.reject // 0) reject, \($t.escalate // 0) escalate)"
           ' 2>/dev/null)"
           ping_dissent="$(printf '%s' "$raw" | jq -r '.verdict.dissent // empty' 2>/dev/null)"
-          _council_veto_ping "$offer_resolved" "$digest" "$execute_after" "$veto_nonce" "$ping_motion" "$ping_tally" "$ping_dissent" || true
+          local ping_subject; ping_subject="$(printf '%s' "$raw" | jq -r '.subject // empty' 2>/dev/null || true)"
+          [[ -n "$ping_subject" ]] || ping_subject="$offer_subject"
+          _council_veto_ping "$offer_resolved" "$digest" "$execute_after" "$veto_nonce" "$ping_motion" "$ping_tally" "$ping_dissent" "$ping_subject" || true
         fi
       fi
     fi
