@@ -1,5 +1,68 @@
 # Changelog
 
+## Unreleased — feat(doctor): REPORT the FIVE_* knobs in effect and configured (DIVE-2328/2327)
+
+`doctor` and `selfcheck` answer "what is true on this box". A product knob in effect is
+true on this box, and no surface said so. That silence is correct for an **intended** knob
+and identical for an accidental one, and nothing distinguished them.
+
+**This reports. It does not warn.** Name and value only — no "unexpected", no severity, no
+advice. The knobs are normally deliberate (lodar's 2026-07-29 policy sets
+`FIVE_VERIFY_DEFAULT=0` for sixteen agents), so alarming on them would be crying wolf on
+correct configuration. Reporting costs nothing when intended and is the only thing that
+makes an unintended one findable.
+
+Two sources, distinctly labelled, and the second is the point:
+
+- **process** — `FIVE_*` exported in the environment of the running command.
+- **configured** — `FIVE_*=` assignments in the `EnvironmentFile` targets systemd injects.
+
+A knob in `configured` but not in `process` binds on the next restart and is invisible to
+any process-side read. That gap cost an hour on DIVE-2325, where a `/proc/<pid>/environ`
+sweep found the knob in one session and was read as one operator's stray export, when
+sixteen agents were configured and fifteen had not restarted. **Where the two disagree,
+both lines print and nothing is concluded** — a difference is a fact about restart order,
+not about correctness.
+
+`configured_state` is four-valued: `read` / `partial` / `unreadable` / `absent`, with the
+missed paths carried in `configured_unreadable`.
+
+- **`unreadable` is not `absent`.** `selfcheck` does not `require_root` and
+  `/var/lib/5dive/agents.d` is `drwxr-s--- root:claude` with 0640 files, so a caller
+  outside group `claude` globs it and gets nothing. Rendering that as an empty list says
+  "none are configured" when the truth is "I could not look".
+- **`partial` was added after measuring**, not from the spec. The unit resolves an
+  `EnvironmentFile` outside `agents.d` that a non-root caller cannot read, so 16 files are
+  read and 1 denied; a single flag rendered that "unreadable", which understates a read
+  that mostly worked exactly as an empty list overstates one that did not.
+
+**Never dumps a file.** Several `agents.d` entries are symlinks into
+`auth-profiles/*/combined.env`, which carry auth material — only `FIVE_*`-named
+assignments are ever extracted, and any knob whose *name* is credential-shaped has its
+*value* replaced. Redaction says nothing about whether a knob should be set.
+
+Also fixes a pre-existing defect this surface would otherwise sit behind:
+`--category=policy` failed usage because the allow-list omitted it while `run_policy`
+dispatched it and the usage error text advertised it — so anyone who read the error and
+did what it said got a usage failure.
+
+**The report is not a check.** `env_overrides` rides alongside `checks` in doctor's
+payload, never inside it. The first cut used `doctor_add` with `severity=ok`, reasoning
+that `ok` is the schema's neutral member because it feeds no warning/error count. True of
+the payload and false at the reader: the dashboard computes
+`passing = checks.filter(c => c.severity === "ok").length` and renders it green, so sixteen
+configured-knob lines became sixteen *passed checks* — `--category=policy` reported
+"17 checks, 17 ok" where one check had run. Its default view is
+`checks.filter(c => c.severity !== "ok")`, so the surface built to make an unintended knob
+findable was hidden behind "show all". `selfcheck` already had this right; doctor now agrees.
+
+`tests/env_overrides_report_unit.sh` — 20 arms, mutation-graded six ways with the measured
+results in its header. Two harness defects are recorded there too, because both are the
+kind that ship green: T10 was green **and vacuous** (`require_root` fires before argv is
+parsed, so both branches died at the permission check; only the anchor went red), and the
+first run stopped mid-file with fifteen `ok`, no `FAIL` and **no summary**, because
+sourcing `src/header.sh` re-enables `errexit`.
+
 ## Unreleased — fix(tests): harnesses no longer inherit the caller's product knobs (DIVE-2325)
 
 `task_core_unit` (28/7) and `task_verifier_rail_unit` (17/6) were red on the control-plane

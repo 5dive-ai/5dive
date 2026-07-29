@@ -75,7 +75,12 @@ cmd_doctor() {
   done
   (( want_fix && ! dry )) && DOCTOR_REPAIR=1
   case "$filter" in
-    ""|deps|types|auth|creds|registry|shelld|channels|host|memory) ;;
+    # DIVE-2327: `policy` was MISSING from this allow-list while run_policy below
+    # dispatches it and the usage text right underneath advertises it — so
+    # `--category=policy` failed usage for every caller who read the error message
+    # and did what it said. Pre-existing; fixed here because this change lands its
+    # surface under that category and would otherwise be unreachable by filter.
+    ""|deps|types|auth|creds|registry|shelld|channels|host|memory|policy) ;;
     *) fail "$E_USAGE" "unknown --category (deps|types|auth|creds|registry|shelld|channels|host|memory|policy)" ;;
   esac
 
@@ -742,6 +747,11 @@ cmd_doctor() {
         doctor_add policy precedent-autoclear ok "precedent auto-clear is OFF — every tier-1 gate surfaces to a human"
       fi
     fi
+
+    # DIVE-2328: the FIVE_* override report is assembled here but is NOT a check and
+    # never enters DOCTOR_CHECKS. See below the summary for why that matters.
+    DOCTOR_ENV_OVERRIDES=$(_env_overrides_json 2>/dev/null || printf '{}')
+    [[ -n "$DOCTOR_ENV_OVERRIDES" ]] || DOCTOR_ENV_OVERRIDES='{}'
   fi
 
   # --- summary + output ---
@@ -754,9 +764,21 @@ cmd_doctor() {
     repaired: [.[] | select(.repaired == true)]    | length
   }' <<<"$DOCTOR_CHECKS")
 
+  # DIVE-2328: env_overrides is a REPORT and rides ALONGSIDE the checks, never inside
+  # them. The first cut used doctor_add with severity=ok, reasoning that `ok` is the
+  # schema's neutral member because it feeds no warning/error count. True of the PAYLOAD
+  # and false at the READER, which is where it matters: the dashboard computes
+  # `passing = checks.filter(c => c.severity === "ok").length` and renders that in green,
+  # so sixteen configured-knob lines became sixteen PASSED CHECKS — an assertion of health
+  # nobody made. Worse, its default view is `checks.filter(c => c.severity !== "ok")`, so
+  # the surface built to make an unintended knob FINDABLE was hidden unless you clicked
+  # "show all". A neutral value in the payload is not neutral once a consumer sums it.
+  # selfcheck already had this right (env_overrides is a sibling of probes/summary and
+  # touches no count); this makes doctor agree with it.
   local payload
   payload=$(jq -cn --argjson checks "$DOCTOR_CHECKS" --argjson summary "$summary" \
-    '{summary: $summary, checks: $checks}')
+    --argjson eov "${DOCTOR_ENV_OVERRIDES:-{\}}" \
+    '{summary: $summary, checks: $checks, env_overrides: $eov}')
 
   if (( JSON_MODE )); then
     jq -c '{ok:true, data: .}' <<<"$payload"
@@ -770,6 +792,17 @@ cmd_doctor() {
     jq -r '.summary |
       "summary: \(.total) checks, \(.passed) ok, \(.warnings) warn, \(.errors) error" +
       (if .repaired > 0 then ", \(.repaired) repaired" else "" end)
+    ' <<<"$payload"
+    # Its own section, below the summary, so it reads as a report rather than as results.
+    # Prints NOTHING when there is nothing to say — which is why the negative is graded by
+    # mutation and not by looking at empty output.
+    jq -r '
+      .env_overrides // {} |
+      ( (.process // [])    | map("  in effect (process env): \(.name)=\(.value)") ) +
+      ( (.configured // []) | map("  configured (\(.file)): \(.name)=\(.value)") ) +
+      ( (.configured_unreadable // []) | map("  could not read \(.) — configured overrides NOT determined there") )
+      | if length > 0 then ["", "── env overrides (report, not checks) ──"] + . else [] end
+      | .[]
     ' <<<"$payload"
   fi
   # Always exit 0 — the envelope carries the real state via summary.errors.
