@@ -33,6 +33,9 @@ ok_t(){ PASS=$((PASS+1)); printf 'ok   - %s\n' "$1"; }
 bad_t(){ FAIL=$((FAIL+1)); printf 'FAIL - %s\n   %s\n' "$1" "${2:-}"; }
 
 SHA_MAIN="a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4"
+# DIVE-2287: the probe resolves the newest release TAG, because that is what
+# install.sh installs. `main` is no longer a ref this block will ever read.
+TAG_NEW="v0.15.35"
 
 block="$(sed -n '/^# >>> DIVE-2042 published-version probe/,/^# <<< DIVE-2042 published-version probe/p' \
   src/cmd_selfupdate.sh)"
@@ -58,12 +61,27 @@ done
 # makes "git is absent" a real condition rather than a simulated one — omitting
 # a stub while /usr/bin is on PATH would still find the host's git.
 TOOLS="$FIX/tools"; mkdir -p "$TOOLS"
-for t in bash mktemp sha256sum awk grep sed rm cp cat timeout sort head date tr tail cut; do
+for t in bash mktemp sha256sum awk grep sed rm cp cat timeout sort head date tr tail cut jq dirname mkdir touch stat; do
   p="$(command -v "$t")" && ln -sf "$p" "$TOOLS/$t"
 done
 
 mk_curl() { # $1=file served as /5dive  $2=file served as /5dive.sha256 ('' both = fail every fetch)
-  if [[ -z "${1:-}" ]]; then printf 'exit 22\n'; return; fi
+            # $3=tags to serve on the atom feed ('' = the feed 404s too)
+  local atom="${3:-}"
+  if [[ -z "${1:-}" ]]; then
+    # Fetches fail, but the atom rung may still resolve a tag — otherwise the
+    # "unreachable bundle" case would be indistinguishable from "no tag".
+    cat <<EOF
+url=""
+for a in "\$@"; do case "\$a" in http*) url="\$a";; esac; done
+case "\$url" in
+  *tags.atom) $( [[ -n "$atom" ]] && printf 'printf "%s"' "$(printf '<id>tag:github.com,2008:Repository/1/%s</id>\\n' $atom)" || printf 'exit 22' ) ;;
+  *) exit 22 ;;
+esac
+exit 0
+EOF
+    return
+  fi
   cat <<EOF
 out=""; url=""
 while [[ \$# -gt 0 ]]; do
@@ -75,6 +93,7 @@ while [[ \$# -gt 0 ]]; do
   esac
 done
 case "\$url" in
+  *tags.atom) $( [[ -n "$atom" ]] && printf 'printf "%s"' "$(printf '<id>tag:github.com,2008:Repository/1/%s</id>\\n' $atom)" || printf 'exit 22' ) ;;
   */5dive.sha256) cp "$2" "\$out" ;;
   */5dive)        cp "$1" "\$out" ;;
   *) exit 22 ;;
@@ -96,7 +115,10 @@ _published_cli_probe"
   local rc=$?; rm -rf "$stubs"; return $rc
 }
 
-GIT_PINS="printf '%s\trefs/heads/main\n' '$SHA_MAIN'"
+# Deliberately UNSORTED and carrying a non-release tag: the block must pick the
+# newest vX.Y.Z by `sort -V`, and must never advertise an rc as "latest" — the
+# same filter install.sh applies before installing one.
+GIT_TAGS="printf '%s\trefs/tags/v0.15.34\n%s\trefs/tags/v0.15.9\n%s\trefs/tags/$TAG_NEW\n%s\trefs/tags/v0.16.0-rc1\n' '$SHA_MAIN' '$SHA_MAIN' '$SHA_MAIN' '$SHA_MAIN'"
 GIT_BROKEN='exit 128'   # git present, cannot reach the remote
 
 line() { sed -n "$2p" <<<"$1"; }
@@ -106,7 +128,7 @@ line() { sed -n "$2p" <<<"$1"; }
 # 1. THE REGRESSION. Stale bundle (0.15.34) beside the FRESH checksum — the
 #    literal bytes raw.githubusercontent served on 2026-07-26. The old code
 #    returned 0.15.34 here and the caller rendered "up to date".
-out="$(run_probe '' "$(mk_curl "$FIX/bundle-old" "$FIX/sum-new")")"
+out="$(run_probe "$GIT_TAGS" "$(mk_curl "$FIX/bundle-old" "$FIX/sum-new")")"
 if [[ "$(line "$out" 1)" == indeterminate ]]; then
   ok_t "stale bundle + fresh checksum => INDETERMINATE (the shipped bug)"
 else
@@ -117,52 +139,91 @@ if [[ "$(line "$out" 2)" != *0.15.34* ]]; then
 else
   bad_t "leaked the stale version" "line 2 was '$(line "$out" 2)'"
 fi
-if [[ "$(line "$out" 3)" == *"different CDN cache generations"* ]]; then
-  ok_t "unpinned mismatch is explained as cache skew, not tampering"
+
+# 2. Mismatch names the REF the claim is about (DIVE-1977's rule: a message may
+#    only assert the cause it can justify). Both objects came from one immutable
+#    tag, so a freshly cut tag mid-propagation and bad bytes are both live and
+#    the message may not pick — but it must be checkable.
+if [[ "$(line "$out" 3)" == *"does not match its own checksum"* && "$(line "$out" 3)" == *"$TAG_NEW"* ]]; then
+  ok_t "mismatch names the tag the bundle came from"
 else
-  bad_t "unpinned mismatch reason is wrong" "'$(line "$out" 3)'"
+  bad_t "mismatch message is wrong" "'$(line "$out" 3)'"
 fi
 
-# 2. Pinned + mismatch. Both objects came from ONE immutable tree, so cache skew
-#    cannot explain it — the message must NOT blame the CDN, and must name the
-#    sha so the claim is checkable (DIVE-1977's branching-message rule).
-out="$(run_probe "$GIT_PINS" "$(mk_curl "$FIX/bundle-old" "$FIX/sum-new")")"
-if [[ "$(line "$out" 1)" == indeterminate && "$(line "$out" 3)" == *"does not match its own checksum"* \
-      && "$(line "$out" 3)" == *"${SHA_MAIN:0:12}"* ]]; then
-  ok_t "pinned mismatch names the sha and does not blame cache generations"
-else
-  bad_t "pinned mismatch message is wrong" "'$(line "$out" 3)'"
-fi
-
-# 3. Pinned + consistent: the normal path. Both fetches must come from raw/<sha>/.
-out="$(run_probe "$GIT_PINS" "$(mk_curl "$FIX/bundle-new" "$FIX/sum-new")")"
+# 3. The normal path. Both fetches come from raw/<tag>/, and the ref reported is
+#    the tag — the same string install.sh resolved to install it.
+out="$(run_probe "$GIT_TAGS" "$(mk_curl "$FIX/bundle-new" "$FIX/sum-new")")"
 if [[ "$(line "$out" 1)" == consistent && "$(line "$out" 2)" == "0.15.35" \
-      && "$(line "$out" 3)" == "$SHA_MAIN" ]]; then
-  ok_t "pinned + consistent => version 0.15.35 sourced from the resolved sha"
+      && "$(line "$out" 3)" == "$TAG_NEW" ]]; then
+  ok_t "consistent read => version 0.15.35 sourced from the newest release tag"
 else
-  bad_t "pinned happy path wrong" "state '$(line "$out" 1)' ver '$(line "$out" 2)' ref '$(line "$out" 3)'"
+  bad_t "happy path wrong" "state '$(line "$out" 1)' ver '$(line "$out" 2)' ref '$(line "$out" 3)'"
 fi
 
-# 4. git absent => unpinned fallback, NOT a failure. A hardened probe that
-#    bricks is worse than the race it avoids.
-out="$(run_probe '' "$(mk_curl "$FIX/bundle-new" "$FIX/sum-new")")"
-if [[ "$(line "$out" 1)" == consistent && "$(line "$out" 3)" == "main" ]]; then
-  ok_t "git absent falls back to /main and still answers"
+# 3b. DIVE-2287, THE DEFECT ITSELF. `main` is not a ref this block may read: it
+#     is where the untagged 0.17.2 lived while the newest tag was v0.17.1, and
+#     reading it is what told an operator they were behind a version no
+#     installer could deliver. The stub serves ONLY the tag path — any fetch
+#     from /main 404s — so a regression to main cannot resolve at all.
+grep_main_free=1
+out="$(run_probe "$GIT_TAGS" "$(cat <<EOF
+out=""; url=""
+while [[ \$# -gt 0 ]]; do
+  case "\$1" in -o) out="\$2"; shift 2;; --max-time) shift 2;; -*) shift;; *) url="\$1"; shift;; esac
+done
+case "\$url" in
+  */$TAG_NEW/5dive.sha256) cp "$FIX/sum-new" "\$out" ;;
+  */$TAG_NEW/5dive)        cp "$FIX/bundle-new" "\$out" ;;
+  *) exit 22 ;;
+esac
+exit 0
+EOF
+)")"
+if [[ "$(line "$out" 1)" == consistent && "$(line "$out" 3)" == "$TAG_NEW" ]]; then
+  ok_t "the probe fetches from raw/<tag>/ only — a read of main cannot resolve"
 else
-  bad_t "unpinned fallback broken" "state '$(line "$out" 1)' ref '$(line "$out" 3)'"
+  bad_t "probe did not fetch from the tag path" "state '$(line "$out" 1)' ref '$(line "$out" 3)' — is it still reading main?"
+fi
+
+# 3c. `sort -V`, never lexical, and release tags only. v0.15.9 must not beat
+#     v0.15.35, and v0.16.0-rc1 must never become the advertised latest.
+if [[ "$(line "$out" 3)" == "$TAG_NEW" ]]; then
+  ok_t "newest tag chosen by version sort; a pre-release tag is not advertised"
+else
+  bad_t "tag selection wrong" "'$(line "$out" 3)'"
+fi
+
+# 4. git absent => the atom rung resolves the tag. A hardened probe that bricks
+#    is worse than the race it avoids — but the fallback is another way to the
+#    SAME question, never a fallback to main, which answers a different one.
+out="$(run_probe '' "$(mk_curl "$FIX/bundle-new" "$FIX/sum-new" "v0.15.34 $TAG_NEW")")"
+if [[ "$(line "$out" 1)" == consistent && "$(line "$out" 3)" == "$TAG_NEW" ]]; then
+  ok_t "git absent => the tags atom feed resolves the same tag"
+else
+  bad_t "atom fallback broken" "state '$(line "$out" 1)' ref '$(line "$out" 3)'"
 fi
 
 # 5. git present but unable to resolve => same fallback, no hang, no failure.
-out="$(run_probe "$GIT_BROKEN" "$(mk_curl "$FIX/bundle-new" "$FIX/sum-new")")"
-if [[ "$(line "$out" 1)" == consistent && "$(line "$out" 3)" == "main" ]]; then
-  ok_t "unresolvable git ls-remote falls back to /main"
+out="$(run_probe "$GIT_BROKEN" "$(mk_curl "$FIX/bundle-new" "$FIX/sum-new" "$TAG_NEW")")"
+if [[ "$(line "$out" 1)" == consistent && "$(line "$out" 3)" == "$TAG_NEW" ]]; then
+  ok_t "unresolvable git ls-remote falls through to the atom feed"
 else
   bad_t "broken-git fallback wrong" "state '$(line "$out" 1)' ref '$(line "$out" 3)'"
 fi
 
+# 5b. NO tag resolves on any rung => UNAVAILABLE, and it must NOT quietly answer
+#     from main. install.sh fails CLOSED on exactly this condition; a checker
+#     that stayed open here would be advertising the uninstallable again.
+out="$(run_probe "$GIT_BROKEN" "$(mk_curl "$FIX/bundle-new" "$FIX/sum-new")")"
+if [[ "$(line "$out" 1)" == unavailable && "$(line "$out" 3)" == *"no release tag"* ]]; then
+  ok_t "no resolvable release tag => UNAVAILABLE, never a fallback to main"
+else
+  bad_t "no-tag case did not fail closed" "state '$(line "$out" 1)' ver '$(line "$out" 2)' detail '$(line "$out" 3)'"
+fi
+
 # 6. Cannot fetch at all => UNAVAILABLE, distinct from indeterminate: one means
 #    "the source disagrees with itself", the other "I never reached it".
-out="$(run_probe "$GIT_PINS" "$(mk_curl '')")"
+out="$(run_probe "$GIT_TAGS" "$(mk_curl '')")"
 if [[ "$(line "$out" 1)" == unavailable && -n "$(line "$out" 3)" ]]; then
   ok_t "unreachable source => UNAVAILABLE with a reason"
 else
@@ -170,7 +231,7 @@ else
 fi
 
 # 7. Internally consistent but carrying no version => still cannot answer.
-out="$(run_probe "$GIT_PINS" "$(mk_curl "$FIX/bundle-nover" "$FIX/sum-nover")")"
+out="$(run_probe "$GIT_TAGS" "$(mk_curl "$FIX/bundle-nover" "$FIX/sum-nover")")"
 if [[ "$(line "$out" 1)" == indeterminate && "$(line "$out" 3)" == *"no FIVE_VERSION"* ]]; then
   ok_t "consistent bundle with no FIVE_VERSION => INDETERMINATE"
 else
@@ -179,7 +240,7 @@ fi
 
 # 8. The probe never fails its caller — every state is a normal return, so a
 #    supervisor pass cannot be aborted by a flaky CDN.
-run_probe "$GIT_PINS" "$(mk_curl '')" >/dev/null; rc=$?
+run_probe "$GIT_TAGS" "$(mk_curl '')" >/dev/null; rc=$?
 if (( rc == 0 )); then ok_t "probe returns 0 in every state (callers branch on line 1)"
 else bad_t "probe failed its caller" "exit $rc"; fi
 
@@ -192,19 +253,25 @@ else bad_t "probe failed its caller" "exit $rc"; fi
 # every negative assertion while proving nothing. That is not hypothetical: the
 # first cut of this harness passed those three exactly that way.
 CHECK_SRC="$(sed -n '/^cmd_update_check()/,/^}/p' src/cmd_selfupdate.sh)"
+# DIVE-2287: cmd_update_check also calls the freeze observer now. Extracted
+# VERBATIM from the same file rather than shimmed — a stub here would let every
+# render assertion below pass over a broken observer.
+FREEZE_SRC="$(sed -n '/^# >>> DIVE-2287 version-freeze observer/,/^# <<< DIVE-2287 version-freeze observer/p' src/cmd_selfupdate.sh)"
 render_check() { # $1=local version  $2=bundle file  $3=sha256 file -> prints output, returns rc
   local stubs; stubs="$(mktemp -d)"
-  printf '#!/usr/bin/env bash\n%s\n' "$(mk_curl "$2" "$3")" > "$stubs/curl"; chmod +x "$stubs/curl"
+  printf '#!/usr/bin/env bash\n%s\n' "$(mk_curl "$2" "$3" "$TAG_NEW")" > "$stubs/curl"; chmod +x "$stubs/curl"
   # Shims for the three helpers cmd_update_check takes from elsewhere in the
   # bundle; everything else is the shipped body, extracted verbatim.
   env -i PATH="$stubs:$TOOLS" HOME="$stubs" bash -c "set -euo pipefail
 E_USAGE=2; E_GENERIC=1; E_NOT_FOUND=4; FIVE_VERSION='$1'
+STATE_DIR='$stubs'
 readonly UPDATE_STALE_AFTER_SECS=\$((36 * 3600))
 gh_org() { printf 'testorg\n'; }
 fail() { local c=\"\$1\"; shift; printf 'error: %s\n' \"\$*\"; exit \"\$c\"; }
 ok() { printf 'OK — %s\n' \"\$1\"; }
 version_lt() { [[ \"\$1\" != \"\$2\" && \"\$(printf '%s\n%s\n' \"\$1\" \"\$2\" | sort -V | head -n1)\" == \"\$1\" ]]; }
 $block
+$FREEZE_SRC
 $CHECK_SRC
 cmd_update_check" 2>&1
   local rc=$?; rm -rf "$stubs"; return $rc
@@ -253,6 +320,30 @@ else
     ok_t "update --check says it cannot determine, and to retry"
   else
     bad_t "indeterminate prose is unhelpful" "output: $render"
+  fi
+
+  # DIVE-2287 — THE FOURTH STATE. A box ABOVE the newest release tag. Before
+  # this change it fell into the `up to date` else-branch, which is how an
+  # operator ended up holding two correct and contradictory messages: "up to
+  # date" from the checker and "refusing to DOWNGRADE" from the installer. It
+  # must name the condition and say who owes what.
+  render="$(render_check 0.15.36 "$FIX/bundle-new" "$FIX/sum-new")"; rc=$?
+  if (( rc == 0 )) && [[ "$render" == *AHEAD* && "$render" == *"0.15.35"* ]]; then
+    ok_t "local version above the newest release => AHEAD, naming the release it is ahead of"
+  else
+    bad_t "ahead-of-release path did not render" "rc=$rc output: $render"
+  fi
+  # And it must not read as a pass. This is the whole failure mode: the state
+  # where the installer refuses every upgrade must not be spelled "up to date".
+  if [[ "$render" != *"up to date"* ]]; then
+    ok_t "the ahead state is not spelled 'up to date'"
+  else
+    bad_t "a box the installer will refuse is being reported as up to date" "output: $render"
+  fi
+  if [[ "$render" == *"refuse"* ]]; then
+    ok_t "the ahead line says the installer will refuse to move it"
+  else
+    bad_t "ahead prose does not explain the consequence" "output: $render"
   fi
 fi
 
