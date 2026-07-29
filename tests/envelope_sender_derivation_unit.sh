@@ -24,6 +24,14 @@
 # to come back anyway.
 set -uo pipefail
 
+# DIVE-2211: name the tree this harness grades (tests/lib/grading_tree.sh).
+# The corpus invariant is enforced by tests/names_the_tree_contract_unit.sh, which
+# is what caught this file's first two revisions — a new harness that omits this
+# reds the whole suite, and correctly so: a harness that does not say WHICH tree it
+# graded is a result nobody can place.
+. "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh" \
+  || printf 'grading tree: UNRESOLVED (tests/lib/grading_tree.sh not reachable; no tree named)\n' >&2
+
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"
 LIB="$ROOT/src/lib/validation.sh"
