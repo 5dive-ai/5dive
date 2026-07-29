@@ -328,6 +328,20 @@ _task_pref_set gate_builder_routing off
 _gate_proof_enforced() { return 1; }   # keep evidence block inert for this unit
 # Non-reviewer agent (dev) must STILL be blocked on the routed approval gate.
 id() { if [[ "${1:-}" == "-un" ]]; then echo "agent-dev"; else command id "$@"; fi; }
+
+# DIVE-2330: src no longer reads `id -un` — it was PATH-resolved and therefore forgeable
+# by the very caller it was authorizing. This harness pins identity through its own
+# `id()` stub, so bridge that pin onto the two seams the resolver DOES read. The lookup
+# is DYNAMIC (`$(id -un)` at call time), so re-pointing the stub mid-file keeps working.
+# Production is unaffected: nothing in src consults `id` any more, and these two
+# functions are defined by src itself on every real invocation.
+_PIN_UID=987654
+_gate_caller_uid() { printf '%s' "$_PIN_UID"; }
+_gate_passwd_stream() {
+  printf '%s:x:%s:%s::/nonexistent:/bin/false\n' "$(id -un)" "$_PIN_UID" "$_PIN_UID"
+  printf '%s\n' "$(</etc/passwd)"
+}
+
 ( cmd_task_answer DIVE-4 --value=approved --from=dev ) >/dev/null 2>&1; rc_dev=$?
 [[ "$rc_dev" != "0" && "$(answered DIVE-4)" == "open" ]] && ok_t "non-reviewer agent (dev) still blocked on routed approval" || bad_t "dev blocked" "rc=$rc_dev ans=$(answered DIVE-4)"
 # Designated lead (main) CAN clear it.

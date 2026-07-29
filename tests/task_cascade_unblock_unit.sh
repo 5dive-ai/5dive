@@ -207,6 +207,20 @@ a=$(addt --assignee=dev -- "A manual-gate done"); b=$(addt --assignee=bob -- "B 
 ( cmd_task_block "$b" --by="$a" ) >/dev/null 2>&1
 ( cmd_task_need "$a" --type=manual --ask="handle it" ) >/dev/null 2>&1
 id() { case "$1" in -un) echo "lodar";; -u) echo "1000";; *) echo "lodar";; esac; }  # human caller
+
+# DIVE-2330: src no longer reads `id -un` — it was PATH-resolved and therefore forgeable
+# by the very caller it was authorizing. This harness pins identity through its own
+# `id()` stub, so bridge that pin onto the two seams the resolver DOES read. The lookup
+# is DYNAMIC (`$(id -un)` at call time), so re-pointing the stub mid-file keeps working.
+# Production is unaffected: nothing in src consults `id` any more, and these two
+# functions are defined by src itself on every real invocation.
+_PIN_UID=987654
+_gate_caller_uid() { printf '%s' "$_PIN_UID"; }
+_gate_passwd_stream() {
+  printf '%s:x:%s:%s::/nonexistent:/bin/false\n' "$(id -un)" "$_PIN_UID" "$_PIN_UID"
+  printf '%s\n' "$(</etc/passwd)"
+}
+
 ( cmd_task_answer "$a" --value=done --human ) >/dev/null 2>&1
 unset -f id
 [[ "$(st "$a")" == "done" && "$(st "$b")" == "todo" && "$(edges "$b")" == "0" ]] \

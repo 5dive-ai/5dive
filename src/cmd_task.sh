@@ -556,11 +556,19 @@ _gate_withdraw_actor() {
     _gate_sudo_uid_nonagent && { printf 'human'; return; }
     printf 'none'; return
   fi
-  local _a; _a=$(_gate_uid_to_agent "$EUID")
+  # DIVE-2330 iteration 2: route BOTH the uid and the passwd source through the seams.
+  # This is the SAME defect dev found in the refusal guard, a second time in this
+  # function: reading $EUID and /etc/passwd inline made the non-root branch resolve the
+  # REAL runner, so gate_withdraw_unit's IDUN pin could not reach it and two arms graded
+  # the runner's identity instead of the one under test. Semantics are unchanged —
+  # _gate_caller_uid's whole body is `printf '%s' "$EUID"` and _gate_passwd_stream's is
+  # /etc/passwd — which is exactly why routing through them widens nothing.
+  local _cuid; _cuid=$(_gate_caller_uid)
+  local _a; _a=$(_gate_uid_to_agent "$_cuid")
   if [[ -n "$_a" ]]; then printf 'agent %s' "$_a"; return; fi
   local _n _x _u; while IFS=: read -r _n _x _u _; do
-    [[ "$_u" == "$EUID" ]] && { printf 'human'; return; }
-  done < /etc/passwd
+    [[ "$_u" == "$_cuid" ]] && { printf 'human'; return; }
+  done < <(_gate_passwd_stream)
   printf 'none'
 }
 
