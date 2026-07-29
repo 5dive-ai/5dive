@@ -1,5 +1,31 @@
 # Changelog
 
+## Unreleased — fix(council): the veto principal is redacted where it is GENERATED, not per-file (DIVE-2278)
+
+`council roster`, the `council init` summary and the veto-exercise line printed the veto
+principal verbatim. Seeded as `tg:<user_id>` — which is what a live install does — that put a
+real Telegram user id into every freshly generated council artifact, and council output is
+quoted verbatim into transcripts and posts. Redacting one transcript was the wrong fix: the
+generator keeps emitting the id into the NEXT artifact, and that is the one nobody re-checks,
+because "we already fixed the PII".
+
+Human-readable output now routes the principal through a display filter. `human:<agent>` passes
+through unchanged (already a name); a numeric id reverse-resolves to the paired agent's name when
+it can, otherwise renders as the opaque handle `tg:#<8 hex>` — digested with host-local salt
+(`/etc/machine-id`, else the hostname), because a ~10-digit id under an UNSALTED digest is
+enumerable end-to-end and would be a redaction in appearance only. With no salt available it
+prints `tg:#redacted` rather than a digest that cannot be defended. The `init` summary no longer
+prints the RESOLVED recipient at all.
+
+Nothing that needs the id loses it: genesis `.veto.resolved`, the `--json` rail, `veto-pings.jsonl`
+and the delivery call are untouched. This is a display filter, not a data change, and no sealed
+canonical bytes change.
+
+`council init --veto=<digits>` now also warns: the principal string is copied into the SEALED
+genesis/lineage/receipt bytes, which are immutable and publishable, and no display filter can
+reach them afterwards. `--veto=human:<agent>` reaches the same recipient with only a name in the
+seal.
+
 ## Unreleased — feat(task): a gate can DECLARE that it needs a human, and stop being answered by whoever is grading the ticket (DIVE-2241)
 
 A gate filed on a task that carries a maker→verifier loop routes to the VERIFIER by kind
@@ -33,6 +59,7 @@ audited at file time, including when it resolved to nothing.
 
 Agent-held capabilities (`gh_push`, `root`, `delegated_push`) are explicitly NOT routable
 this way yet — they need a different source, not a longer wait.
+
 
 ## Unreleased — fix(task): a recurring template that the scheduler SKIPPED now says so, instead of reading exactly like one it never reached (DIVE-2237)
 
