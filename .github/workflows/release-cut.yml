@@ -215,6 +215,46 @@ jobs:
             exit 1
           fi
 
+          # DIVE-2091 — PROVE IT IS SERVABLE, do not assert that it is.
+          #
+          # Everything above proves the bundle is in the TAGGED TREE. Nothing proved it
+          # is fetchable from where install.sh actually looks, and that gap got materially
+          # riskier with this change rather than merely staying untested (dev, review):
+          # BEFORE, GH_PINNED_SHA resolved to a commit ON MAIN — branch-reachable,
+          # constantly fetched, warm. AFTER, it resolves to a release commit reachable
+          # ONLY from a tag and on no branch. That is a different object class for
+          # GitHub's read paths, and DIVE-1977 is the row that established those paths
+          # have split-generation and propagation windows — three endpoints, one day.
+          #
+          # WHY IT MUST BE MEASURED HERE AND NOT LEFT TO TRUST: install.sh fails closed
+          # and boxes self-update unattended on the 04:00 cron. If a window exists for
+          # tag-only commits, the symptom is installs dying on the download after EVERY
+          # release, discovered at the NEXT release, on customer boxes. Late and wide.
+          #
+          # This is the REMOTE version of the instinct already used above, where the
+          # bundle is read back out of the object store with `git cat-file` rather than
+          # trusted from the worktree. Same move, one hop further out.
+          #
+          # The tag is NOT deleted on failure. A published tag that cannot be served is
+          # a state a human must see; auto-removing it would hide the one occurrence
+          # that proves the window is real.
+          _raw="https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/${sha}/5dive.sha256"
+          _served=""
+          for _try in 1 2 3 4 5 6; do
+            _served="$(curl -fsSL --max-time 10 "$_raw" 2>/dev/null | tr -d '[:space:]')" && [ -n "$_served" ] && break
+            echo "  attempt ${_try}/6: ${tag} not yet servable at ${sha:0:12} — waiting for propagation"
+            _served=""; sleep 10
+          done
+          if [ -z "$_served" ]; then
+            echo "::error::${tag} IS PUBLISHED BUT NOT SERVABLE. raw.githubusercontent returned nothing for ${sha:0:12} after 6 tries. install.sh fetches the bundle from exactly this URL and fails closed, so every NEW install and every unattended self-update will die on the download until this resolves. The tag was deliberately NOT deleted — a human needs to see this. URL: ${_raw}"
+            exit 1
+          fi
+          if [ "$_served" != "$_want" ]; then
+            echo "::error::${tag} is servable but WRONG. raw.githubusercontent serves ${_served} at ${sha:0:12}; the tagged tree carries ${_want}. Boxes would install a bundle that is not the one this cut verified."
+            exit 1
+          fi
+          echo "${tag}: bundle verified SERVABLE at ${sha:0:12} (${_served:0:16}…) — install.sh's fetch path is proven, not assumed"
+
           gh release create "$tag" --title "$tag" --target "$sha" --notes "${note}
 
           Installed by every box via install.sh's tag resolver (DIVE-2144). Previous published tag: ${incumbent:-none}." \

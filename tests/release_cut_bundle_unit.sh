@@ -108,5 +108,28 @@ for f in 5dive 5dive.sha256; do
     || bad_t "$f must be gitignored" ""
 done
 
+echo "-- the tag must be proven SERVABLE, not merely pushed (dev, review of #313)"
+# Everything above proves the bundle is in the TAGGED TREE. install.sh fetches it from
+# raw.githubusercontent at the tag's sha, and after this change that sha is reachable ONLY
+# from a tag — a different object class for GitHub's read paths than the branch-reachable
+# commit it used to be (DIVE-1977: split-generation, propagation windows). Boxes self-update
+# unattended and install.sh fails closed, so an unservable tag kills installs after EVERY
+# release and is discovered at the NEXT one. Graded structurally because the property is a
+# live network fetch this harness must not perform.
+grep -q 'raw.githubusercontent.com/\${GITHUB_REPOSITORY}/\${sha}/5dive.sha256' "$WF" \
+  && ok_t 'the cut probes install.sh’s ACTUAL fetch URL after pushing the tag' \
+  || bad_t 'nothing verifies the tag is servable from where install.sh looks' ''
+grep -q 'IS PUBLISHED BUT NOT SERVABLE' "$WF" \
+  && ok_t 'an unservable tag is an ERROR, not a warning — the cut fails closed' \
+  || bad_t 'unservable tag must fail the cut, not annotate it' ''
+grep -q 'servable but WRONG' "$WF" \
+  && ok_t 'a servable-but-mismatched bundle is refused too (200 is not enough)' \
+  || bad_t 'a wrong bundle served at the tag sha must be refused' ''
+# The tag deliberately survives a failed probe: auto-deleting it would erase the single
+# occurrence that proves the propagation window is real.
+grep -qE 'git (tag -d|push .*--delete)' "$WF" \
+  && bad_t 'the cut deletes the tag on failure — that hides the one event worth seeing' '' \
+  || ok_t 'a failed servability probe leaves the tag standing for a human to see'
+
 printf '\n%s passed, %s failed\n' "$PASS" "$FAIL"
 [[ $FAIL -eq 0 ]]
