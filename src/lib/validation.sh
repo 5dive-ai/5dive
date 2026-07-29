@@ -66,114 +66,11 @@ gen_msg_id() {
   od -An -N4 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n' | head -c 8
 }
 
-# When --from is omitted, infer the sender from the REAL invoking identity.
-# Agent users follow the `agent-<label>` convention, so we strip the prefix.
-# Anything else (a human ssh-ing in as `claude`, a build bot, root/cron)
-# returns empty — the caller then sends raw text with no envelope, preserving
-# the pre-attribution shape.
-#
-# DIVE-2281 — THE INVERTED TRUST GRADIENT, and $SUDO_USER alone is what caused it.
-#
-# This used to read ONLY $SUDO_USER, which is set only when the caller reached us
-# THROUGH sudo. That is true on the scoped path (`a2a_needs_scoped` execs
-# `sudo -n … agent _deliver`, so _deliver sees SUDO_USER=agent-<caller>) and FALSE
-# on the direct path, because a full-trust (NOPASSWD:ALL) agent runs `5dive agent
-# send` as ITSELF — no sudo, no SUDO_USER. So the gradient ran backwards: the
-# scoped sender, which cannot supply --from at all, arrived with a real tier; the
-# full-trust sender, which CAN supply any --from, arrived with none.
-#
-# MEASURED 2026-07-29 from agent-main (isolation=admin, NOPASSWD:ALL), sending on
-# the direct path with no --from:
-#   id -un = agent-main   SUDO_USER = UNSET   ->  this returned ""
-# and an empty sender skips the envelope block entirely in cmd_send, so the message
-# landed in the receiver's pane as bare text with NO `[5dive-msg …]` header at all —
-# not `tier=unknown:no-caller`, NOTHING. Verified by probe: the receiving pane showed
-# `❯ <message>` and zero occurrences of `5dive-msg`.
-#
-# That is worse than weak attribution, and it is the real defect. An unenveloped
-# inject is byte-indistinguishable from the paired HUMAN typing into that pane, so
-# the most privileged sender on the box produced the most authoritative-looking
-# message. It is also why a DIVE-2279 gate answer could be "announced by a message
-# claiming from=main" and be unattributable: nothing on that path stamps anything.
-#
-# THE FIX IS TO ASK WHO IS ACTUALLY RUNNING, not only who sudo'd. `id -un` is not
-# caller-supplied and not forgeable by an argument, so deriving from it gives the
-# direct path a REAL caller — hence a real tier — and closes the inversion at the
-# source rather than patching the envelope. SUDO_USER stays FIRST and unchanged:
-# on `sudo 5dive …` the meaningful identity is the invoker, not root.
-#
-# Root/cron keep returning empty deliberately: `id -un` = root is not an agent, so
-# `_deliver` (which runs as root with SUDO_USER=agent-X) still resolves via the
-# SUDO_USER branch exactly as before. No path that worked changes.
-# Resolve a NUMERIC uid to its `agent-<label>` suffix, or empty for any non-agent.
-# Pure bash over /etc/passwd: no external command, so nothing here is PATH-resolved.
-# The passwd path is a positional arg (default /etc/passwd) rather than an env var
-# ON PURPOSE — an env-driven override would reintroduce exactly the forgery this
-# function exists to close. Tests pass a fixture explicitly.
-# LIMIT: local passwd only. An LDAP/SSSD-backed agent user would not resolve and
-# would return empty (fail-closed to "no envelope"), which is the safe direction.
-_agent_label_from_uid() {
-  local want="$1" passwd="${2:-/etc/passwd}" name _x uid
-  [[ "$want" =~ ^[0-9]+$ ]] || { echo ""; return; }
-  while IFS=: read -r name _x uid _; do
-    [[ "$uid" == "$want" ]] || continue
-    [[ "$name" == agent-* ]] || { echo ""; return; }
-    echo "${name#agent-}"; return
-  done < "$passwd"
-  echo ""
-}
-
-# DIVE-2281 — derive the sender from an identity the CALLER CANNOT CHOOSE.
-#
-# TWO FORGERY VECTORS, both demonstrated by running them (2026-07-29):
-#
-#   1. A bare `id -un` resolves through the caller's PATH. An agent controlling its
-#      own environment drops a fake `id` earlier in PATH and names itself anything:
-#        PATH=/tmp/fake:$PATH  ->  auto_sender_from_sudo returned "olivia"
-#      Flagged by olivia from DIVE-1401, where she retracted a PASS over precisely
-#      this. She was right, and the first cut of this fix had the bug: worse, its
-#      OWN HARNESS stubbed `id` via a PATH shim, which is the attack — the test
-#      demonstrated the vector while asserting the function was sound.
-#
-#   2. $SUDO_USER is JUST AN ENVIRONMENT VARIABLE, and this is PRE-EXISTING:
-#        SUDO_USER=agent-olivia 5dive agent send …  ->  returned "olivia"
-#      On the SCOPED path that is safe, because sudo sets SUDO_USER itself under
-#      env_reset — the value there was written by sudo, not by the caller. On the
-#      DIRECT path nothing sanitises it. So `tier=`, documented as "the one
-#      unforgeable field in [5dive-msg …]", was ALREADY forgeable by any caller who
-#      could set an env var. That is the same inversion the row is about, one level
-#      deeper: the privileged direct path is the one with no trustworthy input.
-#
-# WHAT IS ACTUALLY TRUSTWORTHY: $EUID. It is a bash BUILTIN — not PATH-resolved,
-# not settable from the environment, and it reflects the kernel's view of the
-# process. A caller cannot lie about it without already being that user.
-#
-# THE RULE:
-#   * EUID != 0 — the process IS the sender. Derive from EUID and IGNORE SUDO_USER
-#     entirely: it is forgeable and irrelevant, because an unprivileged process
-#     cannot have been elevated by sudo.
-#   * EUID == 0 — we are root, and a non-root caller can only have reached root
-#     THROUGH sudo, so SUDO_UID/SUDO_USER here were set BY sudo. Prefer the numeric
-#     SUDO_UID. This is the `_deliver` path and it keeps working byte-identically.
-#
-# Humans (`claude`), build bots, and bare root/cron still resolve to EMPTY, so the
-# unenveloped shape they have always produced is preserved deliberately.
-#
-# NOT CLOSED, and stated rather than glossed: an agent holding NOPASSWD:ALL can run
-# `sudo -u agent-other 5dive agent send …` and genuinely IS agent-other for that
-# call. That is real privilege, not forgery — the same agent could read that user's
-# keys — and no envelope field can or should paper over it.
+# When --from is omitted, infer it from $SUDO_USER. Agent users follow the
+# `agent-<label>` convention, so we strip the prefix. Anything else (a real
+# human ssh-ing in as `claude`, a build bot, etc.) returns empty — the caller
+# then sends raw text with no envelope, preserving the pre-attribution shape.
 auto_sender_from_sudo() {
-  if [[ "${EUID}" -ne 0 ]]; then
-    _agent_label_from_uid "$EUID"
-    return
-  fi
-  # Root. Only sudo can have produced this from a non-root caller.
-  local su="${SUDO_UID:-}"
-  if [[ "$su" =~ ^[0-9]+$ ]]; then
-    _agent_label_from_uid "$su"
-    return
-  fi
   local u="${SUDO_USER:-}"
   [[ -n "$u" && "$u" == agent-* ]] || { echo ""; return; }
   echo "${u#agent-}"

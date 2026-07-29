@@ -1289,6 +1289,55 @@ a2a_needs_scoped() {
   return 0
 }
 
+# DIVE-2281 — the ENVELOPE's sender, and deliberately NOT a change to
+# auto_sender_from_sudo.
+#
+# THE GAP: auto_sender_from_sudo resolves from $SUDO_USER, which is set only when the
+# caller reached the CLI THROUGH sudo. The scoped a2a path always does
+# (`a2a_needs_scoped` execs `sudo -n … agent _deliver`); a full-trust NOPASSWD:ALL
+# agent running `5dive agent send` as ITSELF does not, so it resolved to "". An empty
+# sender skips the envelope block below ENTIRELY — so the message arrived with NO
+# `[5dive-msg …]` header at all, not `tier=unknown:no-caller`. Measured against a live
+# pane: the receiver showed `❯ <message>` with zero occurrences of `5dive-msg`. An
+# unenveloped inject is byte-indistinguishable from the paired HUMAN typing into that
+# pane, which is how a DIVE-2279 gate answer could be "announced by a message claiming
+# from=main" and be unattributable.
+#
+# WHY THIS IS A SEPARATE HELPER AND NOT A FIX TO auto_sender_from_sudo: that function
+# is the SHARED ACTOR RESOLVER for the whole task system — 12 call sites, including
+# _gate_withdraw_actor and the objective/task actor paths. Changing it changes WHO THE
+# CLI THINKS YOU ARE everywhere, not just on the wire. Measured, when attempted:
+# 9 harnesses that pass on main went red, because on this host the caller genuinely IS
+# an agent-* user and every one of those paths started resolving an identity where it
+# previously resolved none. The envelope gap does not justify moving the actor model,
+# so the fallback lives HERE, where its blast radius is the wire format.
+#
+# $EUID, never `id -un`: `id` resolves through the caller's PATH and is forgeable by an
+# agent controlling its own environment (olivia, DIVE-1401 — caught exactly that in an
+# earlier cut of this fix). $EUID is a bash builtin; resolution is pure bash over
+# /etc/passwd, so no external command is consulted.
+#
+# NO ENV OVERRIDE for the passwd path, deliberately: this value feeds envelope_tier
+# below, so an env-settable source would be a NEW forgery vector in the one field the
+# design treats as unforgeable. Tests assert BOTH real branches (agent runner -> label,
+# non-agent runner -> empty) rather than mocking either, so nothing is skipped.
+#
+# NOT FIXED HERE, and not implied to be: $SUDO_USER is a plain env var that nothing
+# sanitises below root, so a caller can still choose the name auto_sender_from_sudo
+# returns. That is pre-existing, live on main, and means `tier=` is not the
+# "unforgeable field" lib/registry.sh claims. It is DIVE-2330's, which owns the same
+# vector where it feeds AUTHORIZATION rather than display.
+_envelope_sender_fallback() {
+  local want="$EUID" name _x uid
+  [[ "$want" =~ ^[0-9]+$ ]] || { printf ''; return; }
+  while IFS=: read -r name _x uid _; do
+    [[ "$uid" == "$want" ]] || continue
+    [[ "$name" == agent-* ]] || { printf ''; return; }
+    printf '%s' "${name#agent-}"; return
+  done < /etc/passwd
+  printf ''
+}
+
 cmd_send() {
   local name="" message="" from="" from_set=0 raw=0
   local reply_to_chat="" reply_to_msg=""
@@ -1379,6 +1428,9 @@ cmd_send() {
       sender="$from"
     else
       sender="$(auto_sender_from_sudo)"
+      # DIVE-2281: no sudo identity means the process IS the sender. Without this the
+      # envelope is skipped entirely and the inject is indistinguishable from a human.
+      [[ -n "$sender" ]] || sender="$(_envelope_sender_fallback)"
     fi
     if [[ -z "$sender" && -n "$reply_to_chat" ]]; then
       sender="human"
@@ -1397,6 +1449,9 @@ cmd_send() {
       # silently vanished. Now it reads tier=unknown:no-caller.
       local _caller _tier=""
       _caller="$(auto_sender_from_sudo)"
+      # DIVE-2281: same fallback as cmd_send — without it the tier stays
+      # unknown:no-caller on the direct path even once the envelope appears.
+      [[ -n "$_caller" ]] || _caller="$(_envelope_sender_fallback)"
       _tier="$(envelope_tier "$_caller")"
       local header="[5dive-msg from=${sender} id=${msg_id}"
       header+=" tier=${_tier}"
@@ -1576,7 +1631,13 @@ cmd_ask() {
     # no tier= is exactly the ambiguity this ticket closes, so `ask` now stamps
     # the same field from the same resolver. (The scoped branch above already
     # inherits it: `_deliver` builds that envelope.)
-    local header="[5dive-msg from=${sender} id=${msg_id} tier=$(envelope_tier "$(auto_sender_from_sudo)")"
+    # DIVE-2281: resolve the caller ONCE, with the same fallback, so from= and tier=
+    # describe the same process. Previously this recomputed auto_sender_from_sudo
+    # inline, so a direct-path send could show a real from= beside
+    # tier=unknown:no-caller — two fields disagreeing about one sender.
+    local _dcaller; _dcaller="$(auto_sender_from_sudo)"
+    [[ -n "$_dcaller" ]] || _dcaller="$(_envelope_sender_fallback)"
+    local header="[5dive-msg from=${sender} id=${msg_id} tier=$(envelope_tier "$_dcaller")"
     [[ -n "$reply_to_chat" ]] && header+=" reply-to-chat=${reply_to_chat}"
     [[ -n "$reply_to_msg" ]] && header+=" reply-to-msg=${reply_to_msg}"
     header+="]"
