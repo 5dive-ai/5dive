@@ -375,6 +375,11 @@ HELP
   reg=$(registry_read)
 
   local names created=0 started=0 skipped=0 errors=0
+  # DIVE-2341: names of agents this run brought up, so the end-of-run block can
+  # re-derive their self-check state. Collected here rather than parsed out of the
+  # child `agent create` output — that output is a clack render and parsing it would
+  # break the moment the renderer changes.
+  local -a _brought_up_names=()
   mapfile -t names < <(jq -r '.agents | keys[]' <<<"$spec")
   if (( ${#names[@]} == 0 )); then
     warn "spec has no agents declared"
@@ -418,6 +423,7 @@ HELP
     fi
     if (( brought_up )); then
       ((created++)) || true
+      _brought_up_names+=("$name")
       # v2 role wiring (model/effort/org/instructions/goals). Best-effort: a
       # wiring hiccup must not fail the create/import that already succeeded.
       _compose_wire_role "$spec" "$name" "$spec_dir" "$self" || true
@@ -427,11 +433,43 @@ HELP
     fi
   done
 
+  # DIVE-2341 — SAY IT LAST, OR IT WAS NOT SAID.
+  #
+  # `agent create` already emits a correct self-check warning per agent ("no heartbeat
+  # (agent is ASLEEP — won't self-act on board work)"). This row is not about its wording.
+  # It is about WHERE it lands: each create prints a full skill-install render, so the
+  # warning is buried mid-scroll and then followed by a cheerful summary. On a five-role
+  # `team import` the user gets five buried warnings and one green `errors=0`, and the
+  # last thing they read says nothing is wrong. Measured on the content-studio template:
+  # five agents created, five asleep, summary `created=5 started=0 skipped=0 errors=0`.
+  #
+  # So re-derive the state from the REGISTRY (the thing that defines it) and restate it
+  # after the summary. Nothing new is computed and nothing can fail a create — this is
+  # display only, deliberately, so it cannot regress the path it describes.
+  local -a _asleep=()
+  local _n _hb _reg_now=""
+  if (( ${#_brought_up_names[@]} > 0 )); then
+    _reg_now="$(registry_read 2>/dev/null || echo '{}')"
+    for _n in "${_brought_up_names[@]}"; do
+      _hb=$(jq -r --arg n "$_n" '.agents[$n].heartbeat.enabled // false' <<<"$_reg_now" 2>/dev/null || echo false)
+      [[ "$_hb" == "true" ]] || _asleep+=("$_n")
+    done
+  fi
+
   if (( JSON_MODE )); then
-    ok "" '{file:$f, created:($c|tonumber), started:($s|tonumber), skipped:($k|tonumber), errors:($e|tonumber)}' \
-      --arg f "$file" --arg c "$created" --arg s "$started" --arg k "$skipped" --arg e "$errors"
+    ok "" '{file:$f, created:($c|tonumber), started:($s|tonumber), skipped:($k|tonumber), errors:($e|tonumber), asleep:$a}' \
+      --arg f "$file" --arg c "$created" --arg s "$started" --arg k "$skipped" --arg e "$errors" \
+      --argjson a "$(printf '%s\n' "${_asleep[@]+"${_asleep[@]}"}" | jq -R . | jq -sc 'map(select(length>0))')"
   else
-    echo "OK — applied $file: created=$created started=$started skipped=$skipped errors=$errors"
+    echo "OK — applied $file: created=$created started=$started skipped=$skipped errors=$errors asleep=${#_asleep[@]}"
+    if (( ${#_asleep[@]} > 0 )); then
+      echo ""
+      echo "── ${#_asleep[@]} agent(s) are ASLEEP — created, but they will not self-act on board work:"
+      for _n in "${_asleep[@]}"; do
+        echo "     sudo 5dive heartbeat on $_n"
+      done
+      echo "   (each line above is the exact command; nothing else is needed)"
+    fi
   fi
   (( errors == 0 )) || return "$E_GENERIC"
 }
