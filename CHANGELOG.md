@@ -119,6 +119,48 @@ audited at file time, including when it resolved to nothing.
 Agent-held capabilities (`gh_push`, `root`, `delegated_push`) are explicitly NOT routable
 this way yet — they need a different source, not a longer wait.
 
+## Unreleased — fix(council): the founder veto has never been exercisable — the hold window had already closed on all six offers ever sent (DIVE-2257)
+
+lodar forwarded two veto offers on 2026-07-28 and asked "why two? why no details?". Both
+questions had answers and both were defects. Measured against
+`${STATE_DIR}/council/veto-pings.jsonl`, comparing each ping's `ts` to the `executeAfter` its
+own message advertised: `-15m`, `-45m`, `0s`, `-1s`, `-1s`, `-1s`. Six for six. The message
+says "Execution holds until <T>. Tap VETO to block it" with T already in the PAST at the moment
+of sending, so the founder veto is not a slow control or a racy one — it has never once been
+exercisable. Four fixes, each with its own graded leg in the new
+`tests/council_veto_window_unit.sh` (23, offline + root-free, so it gates on every runner
+rather than self-skipping like the veto e2e):
+
+- **The hold is now measured from when the offer is MADE.** `executeAfter` was
+  `$stamped + veto_hold`, where `$stamped` is taken BEFORE the convene runs. A real five-seat
+  deliberation takes 30-60 minutes, so a 900s hold was already spent by the time the receipt
+  sealed and the ping fired — exactly the `-15m` / `-45m` on the 07-21 and 07-22 offers.
+- **The invariant, asserted at write time:** no veto-offer may be written whose `executeAfter`
+  is `<=` its own `ts`. `_council_veto_ping` refuses at the single write+send choke point — no
+  ledger row, no delivery on either leg, one auditable `veto-offer-refused` row instead. An
+  empty or unparseable `executeAfter` is likewise refused (fail-closed). Graded by replaying all
+  six recorded offers: each one's signed ts→executeAfter offset re-based onto the write moment,
+  all six refused, a genuine +900s window still written AND delivered, and a mutant with the
+  window check neutered re-sending all six.
+- **Ad-hoc panels can no longer reach the founder.** The offer was minted on `genesis_exists`
+  alone — the mere PRESENCE of a sealed genesis file — so both 07-28 offers came from ad-hoc
+  TEST convenes (`--seats=alpha,beta,gamma`, every vote the identical string "fine by me") and
+  still landed in lodar's real DM. That is the DIVE-1506 class again. The new pure
+  `_council_veto_offer_eligible` mirrors `cli.mjs`'s own `primaryCouncil` predicate, so a convene
+  that is not running the genesis-sealed roster is structurally incapable of offering the veto.
+- **A veto offer now names its SUBJECT, and is not made without one.** A receipt carries
+  `stampedAt/sealedDigest/council/question/disposition/verdict/canonical` — no subject, no task
+  id, no convened-by. "ship it?" WAS the whole payload; the Telegram message was not truncating
+  context, none was ever captured. The subject now rides both delivery legs and the ledger row,
+  and the primary council convening with nothing to name refuses the offer and records
+  `veto-offer-omitted`.
+- **Ad-hoc receipts no longer become case law.** Today's canonical cited the two 07-26 ad-hoc
+  runs as followed precedent, so demo receipts were seeding the chain real convenes cite. The
+  precedent pool now admits only receipts sealed by a named (non-ad-hoc) bench.
+
+Both omission and refusal are RECORDED, never printed: `council convene --json` is consumed by
+callers that capture `2>&1`, so a warn on stderr corrupts the envelope (caught by
+`council_capture_e2e.sh` during this build). Regenerated `cmd_council.sh` via gen_cmd.
 
 ## Unreleased — fix(task): a recurring template that the scheduler SKIPPED now says so, instead of reading exactly like one it never reached (DIVE-2237)
 
