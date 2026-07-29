@@ -21710,6 +21710,37 @@ _task_status_cmd() {
       # the branch-path query is CWD-independent (was `gh pr list` with no --repo,
       # which errors outside a repo checkout).
       local _ghtok; _ghtok=$(_gate_gh_token)
+      # DIVE-2318: NO CREDENTIAL IS NOT A NEGATIVE VERDICT, and until now this gate
+      # rendered it as one. Every probe below this line — `gh pr view`, `gh pr list`,
+      # the attribution scan, the ancestry probe — is a GitHub API call. With an empty
+      # token every one of them returns empty, and the refusals downstream read those
+      # empties as "not merged" and blamed the PR or the branch. Measured on DIVE-2286:
+      # the gate printed "its delivery PR is not merged to main yet (pull/295,
+      # state=unknown)" about a PR that had merged 90 minutes earlier. That sentence is
+      # FALSE about the world, and two agents burned a night misdiagnosing from it —
+      # dev2 went hunting a deleted branch, then main filed a confident wrong mechanism
+      # (squash/ancestry) on top of dev2's reading.
+      #
+      # `task merge-audit` already gets this right on the SAME missing credential: it
+      # names the credential, refuses, and tells you to authenticate. Two verbs, one
+      # fault, opposite diagnostics. This copies the one that is correct.
+      #
+      # THIS CHANGES NO ACCEPTANCE, only attribution. With an empty token both paths
+      # already refused 100% of the time (all probes empty => _state empty on the
+      # declared path, _bmerged/_attr empty on the branch path). No close that passes
+      # today starts failing; a refusal that named the wrong cause now names the right
+      # one. That is the whole change on this line.
+      #
+      # WHY A CALLER HAS NO TOKEN, since the refusal has to say something actionable:
+      # _gate_gh_token's last resort is `sudo -n -u claude gh auth token`, and whether
+      # that resolves is a property of the CALLER'S OWN SUDOERS, not of being a builder.
+      # Measured 2026-07-29: agent-dev (`ALL=(ALL) NOPASSWD: ALL`) resolves a token;
+      # agent-dev2/dev3 (`ALL=(root) NOPASSWD: /usr/local/bin/5dive *`) cannot run
+      # anything as `claude`, so they resolve EMPTY. "Builders hold no gh token" is the
+      # right conclusion for the wrong reason — it is scoped sudo, and it is per-agent.
+      if [[ -z "$_ghtok" ]]; then
+        policy_refuse "$E_CONFLICT" done-merge-gate-no-credential DIVE-2318 "$ident" "$ident cannot close: the merge gate COULD NOT CHECK whether ${_dref:-branch '$_branch'} landed — no gh credential resolved in this caller's environment, so no query ran at all. This says NOTHING about the merge; do not read it as 'not merged'. Resolution order is GH_TOKEN/GITHUB_TOKEN in env, then \`gh auth token\` for the sudo invoker, then your own, then \`sudo -n -u claude gh auth token\` — the last needs sudoers scope most agents do not have. Either re-run with a token (\`GH_TOKEN=\$(sudo -u claude gh auth token) 5dive task done $ident ...\`) or hand the close to an agent that holds one (agent-main); a maker who cannot query GitHub cannot satisfy done=merged-to-main (DIVE-1830) and this gate defers to a token-holding closer by design. Verify with \`5dive task merge-audit --limit=1\`, which reports the same missing credential."
+      fi
       if [[ -n "$_dref" ]]; then
         # DIVE-1955: a delivery_ref that is a full pull URL carries its own repo and
         # `gh pr view <url>` needs no --repo. A BARE delivery_ref (`#6`, `6`) does
@@ -21729,8 +21760,18 @@ _task_status_cmd() {
         local _state _merged
         _state=$(GH_TOKEN="$_ghtok" gh pr view "$_dref" --json state,mergedAt -q '.state' 2>/dev/null || echo "")
         _merged=$(GH_TOKEN="$_ghtok" gh pr view "$_dref" --json state,mergedAt -q '.mergedAt' 2>/dev/null || echo "")
+        # DIVE-2318: an EMPTY state is "the question was not answered", not "the answer
+        # was no". A token is present by here (guarded above), so an empty state means
+        # the query itself failed — network, timeout, a PR/repo this token cannot see,
+        # a deleted PR, an unparseable payload. The old single branch collapsed that
+        # into "not merged to main yet ... state=unknown", which asserts a merge verdict
+        # nobody measured. Own slug, because a refusal record that cannot answer WHICH
+        # of the two happened is the same defect one level down.
+        if [[ -z "$_state" ]]; then
+          policy_refuse "$E_CONFLICT" done-pr-state-unresolved DIVE-2318 "$ident" "$ident cannot close: the merge gate COULD NOT READ the state of $_dref — a gh credential resolved, but the query returned nothing. This is NOT a finding that the PR is unmerged; it was never answered. Likely: the PR/repo is not visible to this token, the ref is wrong or deleted, or gh/the network failed. Check by hand (\`gh pr view $_dref --json state,mergedAt\`); if it IS merged, re-run \`task done\` from an environment whose token can see it. Use \`task cancel\` to abandon."
+        fi
         if [[ "$_state" != "MERGED" || -z "$_merged" || "$_merged" == "null" ]]; then
-          policy_refuse "$E_CONFLICT" done-before-pr-merged DIVE-1830 "$ident" "$ident cannot close: its delivery PR is not merged to main yet ($_dref, state=${_state:-unknown}). done=merged-to-main (DIVE-1830) — merge the PR, then run task done. Use \`task cancel\` to abandon."
+          policy_refuse "$E_CONFLICT" done-before-pr-merged DIVE-1830 "$ident" "$ident cannot close: its delivery PR is not merged to main yet ($_dref, state=$_state — MEASURED, not assumed). done=merged-to-main (DIVE-1830) — merge the PR, then run task done. Use \`task cancel\` to abandon."
         fi
         # DIVE-1935: MERGED is not the same as GREEN.
         # Slug pairing: this DECLARED-binding site is `done-after-red-merge`; the
@@ -21808,7 +21849,7 @@ _task_status_cmd() {
         # a squash rewrites the sha, so the branch tip is NOT an ancestor of main even
         # though the content is in. Attribution finds it anyway, because the squash
         # commit subject carries the ident.
-        local _slug _bmerged="" _searched="" _attr_slug="" _anc="" _attr="" _anc_novac="" _attr_bound="" _attr_walked=""
+        local _slug _bmerged="" _searched="" _attr_slug="" _anc="" _attr="" _anc_novac="" _attr_bound="" _attr_walked="" _attr_unreach=""
         while IFS= read -r _slug; do
           [[ -n "$_slug" ]] || continue
           _searched="${_searched:+$_searched, }$_slug"
@@ -21828,6 +21869,12 @@ _task_status_cmd() {
           # accept anything by itself (that was the DIVE-2101 bug).
           _anc=$(_gate_branch_ancestry "$_slug" "$_branch" "$_ghtok")
           [[ "$_anc" == "1" && "$_attr" == "0" ]] && _anc_novac="$_slug"
+          # DIVE-2318: attribution returning EMPTY is "unreachable", documented as such
+          # on _gate_branch_ident_on_main and then discarded here — every non-"1" answer
+          # fell through to the same generic "branch is NOT on main" refusal, so an API
+          # failure and an exhaustive miss printed the identical sentence. Only one of
+          # them is a finding. Carry it so the refusal below can tell them apart.
+          [[ -z "$_attr" ]] && _attr_unreach="$_slug"
           _bmerged=$(GH_TOKEN="$_ghtok" gh pr list --repo "$_slug" --head "$_branch" --state merged --json number,mergedAt -q '.[0].mergedAt' 2>/dev/null || echo "")
           [[ -n "$_bmerged" && "$_bmerged" != "null" ]] && break
           _bmerged=""
@@ -21860,8 +21907,35 @@ _task_status_cmd() {
           # "not merged" here would send the reader off to merge something that is
           # already in.
           policy_refuse "$E_CONFLICT" done-on-vacuous-branch-ancestry DIVE-2101 "$ident" "$ident cannot close: branch '$_branch' points at a commit that IS on ${FIVE_GATE_MAIN_BRANCH:-main} in $_anc_novac, but NO commit reachable from it names $ident — which is what an EMPTY branch (created, never committed to) looks like, and is indistinguishable from one here. done=merged-to-main (DIVE-1830/2101) needs work ON main, not a tip on main: commit the work naming $ident and land it (\`5dive push $ident\`), or bind the branch that actually carries it (\`task set-branch $ident <branch>\`). A merged PR for the branch also satisfies the gate. Use \`task cancel\` to abandon."
+        elif [[ -n "$_attr_unreach" && -z "$_bmerged" ]]; then
+          # DIVE-2318: at least one repo in the search set never ANSWERED, so the
+          # negative below it is not exhaustive over the set it claims to cover. A
+          # refusal here must describe the SCAN, not the branch — nothing about the
+          # branch was measured in $_attr_unreach.
+          #
+          # ORDERED LAST AMONG THE INCONCLUSIVE ARMS, deliberately. `bound:` and the
+          # vacuous-ancestry shape above are both MEASURED, concrete and actionable in
+          # a NAMED repo; an unreachable sibling repo must not shout over either of
+          # them. It sits directly ahead of the pure negative because that is the one
+          # arm that would otherwise launder partial coverage into a clean absence.
+          policy_refuse "$E_CONFLICT" done-attribution-unresolved DIVE-2318 "$ident" "$ident cannot close: the merge gate COULD NOT SCAN ${FIVE_GATE_MAIN_BRANCH:-main} in $_attr_unreach for a commit naming $ident — that query returned nothing, so the question was never answered there. The search covered $_searched, so this is PARTIAL COVERAGE, not a finding that '$_branch' is absent. Likely gh/network/timeout, or a repo this token cannot read. Re-run when the API is reachable, hand the close to an agent whose token can see $_attr_unreach, or narrow the search with a \`Repo: <owner>/<repo>\` line in the body. Use \`task cancel\` to abandon."
         elif [[ -z "$_bmerged" ]]; then
-          policy_refuse "$E_CONFLICT" done-before-branch-merged DIVE-1830 "$ident" "$ident cannot close: branch '$_branch' is NOT on ${FIVE_GATE_MAIN_BRANCH:-main} — it is neither an ancestor of it nor the head of a MERGED PR in $_searched. done=merged-to-main (DIVE-1830) — land the branch (delegated push: \`5dive push $ident\`, or open and merge a PR), then run task done. If the branch lives in a repo not listed there, add a \`Repo: <owner>/<repo>\` line to the body. Use \`task cancel\` to abandon."
+          # DIVE-2318: this message used to say the branch "is neither an ancestor of
+          # [main] nor the head of a MERGED PR". Both halves were wrong to state as
+          # acceptance criteria:
+          #   * ANCESTRY has not accepted anything since DIVE-2120/2184 — attribution is
+          #     the sole acceptance on this path, measured by olivia's stub arms. Naming
+          #     ancestry told the reader to satisfy a condition that closes nothing.
+          #   * Worse, it is UNSATISFIABLE by construction under our default merge
+          #     strategy. Measured on PR #300 (DIVE-2301): `merge-base --is-ancestor
+          #     8068061 origin/main` FALSE while `git diff 8068061 origin/main` over the
+          #     changed paths was EMPTY. A squash rewrites the sha, so the branch tip is
+          #     never an ancestor of main, for any squash-merged PR, ever.
+          # An error naming a condition that cannot be satisfied sends people looking for
+          # a missing branch. It did exactly that to dev2 on DIVE-2286 and to dev3 on
+          # DIVE-2301. So: state what was actually measured (no commit subject on main
+          # names the ident, no merged PR for the branch) and give the remedy that works.
+          policy_refuse "$E_CONFLICT" done-before-branch-merged DIVE-1830 "$ident" "$ident cannot close: nothing on ${FIVE_GATE_MAIN_BRANCH:-main} in $_searched shows branch '$_branch' landed. MEASURED, both ways that can accept: (a) no commit SUBJECT on main names $ident (attribution, DIVE-2120 — the only test that accepts here), and (b) no MERGED PR has '$_branch' as its head. Ancestry is NOT one of the ways: a squash rewrites the sha, so a branch tip is never an ancestor of a squash-merged main — do not go looking for the branch. done=merged-to-main (DIVE-1830) — land it (delegated push: \`5dive push $ident\`, or open and merge a PR) with the ident in the commit SUBJECT, then run task done. If it lives in a repo not listed there, add a \`Repo: <owner>/<repo>\` line to the body. Use \`task cancel\` to abandon."
         fi
       fi
     fi

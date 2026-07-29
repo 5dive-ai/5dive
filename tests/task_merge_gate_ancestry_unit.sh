@@ -231,6 +231,14 @@ fi
 
 # --- 3. NON-VACUITY: genuinely unmerged commits, no PR -> STILL REFUSES --------
 clear_fx; export GH_STUB_CMP_5dive_dive_2101_wip="$AHEAD"
+# DIVE-2318: this case had NO commits fixture, so the attribution scan was
+# UNREACHABLE, not answered-no. It graded as "genuinely unmerged" only because every
+# not-reached answer used to render as "not merged" — the exact conflation this
+# ticket deletes. Give main a history that ANSWERS: one commit, naming nothing of
+# ours, and a page shorter than the one requested, which is main's history exhausted
+# inside the window. Now the refusal below is a MEASURED absence, which is what this
+# arm always claimed to be testing.
+export GH_STUB_COMMITS_5dive_main="$(commits 'chore(deps): bump something (DIVE-1)')"
 seed UNM-1 'Branch: dive-2101-wip'
 run_done UNM-1 --result='I think it is fine'
 if [[ $RC -ne 0 && "$(statusof UNM-1)" == "in_progress" && "$(refusals UNM-1)" == "1" ]]; then
@@ -238,9 +246,18 @@ if [[ $RC -ne 0 && "$(statusof UNM-1)" == "in_progress" && "$(refusals UNM-1)" =
 else
   bad_t 'unmerged must still refuse' "rc=$RC status=$(statusof UNM-1) refusals=$(refusals UNM-1) out=$OUT"
 fi
-[[ "$OUT" == *"ancestor"* && "$OUT" == *"MERGED PR"* && "$OUT" == *"dive-2101-wip"* ]] \
-  && ok_t 'the refusal names BOTH roads it tried, so the reader knows what would fix it' \
-  || bad_t 'refusal text must name both roads' "out=$OUT"
+# DIVE-2318: this used to assert the refusal named "ancestor" and "MERGED PR" as the
+# two roads tried. Ancestry is NOT a road — it has accepted nothing since DIVE-2120,
+# and a squash merge makes it unsatisfiable by construction. Naming it sent dev2
+# (DIVE-2286) and dev3 (DIVE-2301) hunting a missing branch. Assert the roads that can
+# ACCEPT (attribution on main, a merged PR for the head), and assert that ancestry is
+# presented as the dead end it is rather than as something to go satisfy.
+[[ "$OUT" == *"attribution"* && "$OUT" == *"MERGED PR"* && "$OUT" == *"dive-2101-wip"* ]] \
+  && ok_t 'the refusal names the two roads that can ACCEPT, so the reader knows what would fix it' \
+  || bad_t 'refusal text must name the accepting roads' "out=$OUT"
+[[ "$OUT" == *"Ancestry is NOT one of the ways"* && "$OUT" == *"squash"* ]] \
+  && ok_t 'and it says ancestry is NOT one of them, naming squash as why (DIVE-2318)' \
+  || bad_t 'refusal must not leave ancestry looking satisfiable' "out=$OUT"
 
 # --- 3b. VACUITY (main, pre-merge): an ancestor tip is NOT delivered work --------
 # A branch with ZERO commits has a tip that IS a commit on main, so ancestry alone
