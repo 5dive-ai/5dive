@@ -32,6 +32,8 @@
 #   6. _proof_ledger's need_answered_by arm no longer counts re-file residue,
 #      while its human_nonce_hash arm still counts a delivered-but-unanswered
 #      gate (the deliberate asymmetry — see cmd_proof.sh).
+#   7. the archive is READABLE through task show + task gate-history, with
+#      secret answers redacted and pre-archive blindness stated explicitly.
 # Run: bash tests/gate_history_unit.sh   (no root, no network)
 set -uo pipefail
 
@@ -295,6 +297,115 @@ if [[ "$(led_asks)" == "1" ]]; then
   ok_t "the nonce arm still counts a delivered-but-unanswered gate (conservative)"
 else
   bad_t "the nonce arm must keep its delivered semantics" "asks=$(led_asks)"
+fi
+
+# --- 8. reader: detailed rows + compact task-show summary --------------------
+JSON_MODE=1
+HJSON=$(cmd_task_gate_history "$t1" 2>"$TMP/history-json.err")
+if jq -e '.ok == true and .data.summary.recorded == 1 and
+          .data.summary.coverage_state == "complete" and
+          .data.gates[0].need_answer == "B" and
+          .data.gates[0].retired_by == "file" and
+          (.data.gates[0].retired_at | length > 0)' <<<"$HJSON" >/dev/null; then
+  ok_t "gate-history JSON reads the displaced answer plus retirement reason/time"
+else
+  bad_t "gate-history JSON must expose the archived gate" "$HJSON"
+fi
+
+SHOWJSON=$(cmd_task_show "$t1" 2>"$TMP/show-json.err")
+if jq -e '.data.previous_gates.recorded == 1 and
+          .data.previous_gates.coverage_complete_for_task == true' <<<"$SHOWJSON" >/dev/null; then
+  ok_t "task show JSON carries the compact previous-gate count and coverage state"
+else
+  bad_t "task show JSON must surface the archive summary" "$SHOWJSON"
+fi
+
+JSON_MODE=0
+HSHOW=$(cmd_task_show "$t1" 2>"$TMP/show-human.err")
+if grep -Fq 'previous gates = 1' <<<"$HSHOW"; then
+  ok_t "task show human output surfaces the compact previous-gate count"
+else
+  bad_t "task show human output must surface previous gates" "$HSHOW"
+fi
+
+# --- 9. secret answers never cross the new reader ----------------------------
+JSON_MODE=1
+t8=$(addt --assignee=dev -- "fixture: archived secret is redacted")
+db "INSERT INTO gate_history(task_id,ident,need_type,ask,need_answer,retired_by)
+      SELECT id,ident,'secret','provide fixture secret','DO-NOT-PRINT','withdraw'
+      FROM tasks WHERE id=${t8};"
+SECRET_JSON=$(cmd_task_gate_history "$t8" 2>"$TMP/secret-json.err")
+JSON_MODE=0
+SECRET_HUMAN=$(cmd_task_gate_history "$t8" 2>"$TMP/secret-human.err")
+if [[ "$SECRET_JSON" != *"DO-NOT-PRINT"* && "$SECRET_HUMAN" != *"DO-NOT-PRINT"* ]] \
+   && grep -Fq '(provided - redacted)' <<<"$SECRET_JSON" \
+   && grep -Fq '(provided - redacted)' <<<"$SECRET_HUMAN"; then
+  ok_t "gate-history redacts secret answers in JSON and human output"
+else
+  bad_t "a secret answer crossed the reader" "json=$SECRET_JSON human=$SECRET_HUMAN"
+fi
+
+# --- 10. zero rows: complete evidence vs pre-archive blindness ---------------
+# t5 was created after the fresh-store coverage stamp, so zero is a truthful
+# complete zero. A task moved before the boundary must instead say only zero
+# RECORDED and mark its earlier era unknown.
+JSON_MODE=1
+FRESH_STAMP=$(_task_pref_get gate_history_coverage)
+FRESH_TIME="${FRESH_STAMP#fresh:}"
+db "UPDATE tasks SET created_at=$(sqlq "$FRESH_TIME") WHERE id=${t5};"
+COMPLETE_ZERO=$(cmd_task_gate_history "$t5" 2>"$TMP/complete-zero.err")
+t9=$(addt --assignee=dev -- "fixture: task predates archive coverage")
+db "UPDATE tasks SET created_at='2000-01-01 00:00:00' WHERE id=${t9};"
+PARTIAL_ZERO=$(cmd_task_gate_history "$t9" 2>"$TMP/partial-zero.err")
+if jq -e '.data.summary.recorded == 0 and
+          .data.summary.coverage_complete_for_task == true and
+          .data.summary.coverage_basis == "fresh" and
+          .data.summary.history_before_coverage == "none"' <<<"$COMPLETE_ZERO" >/dev/null; then
+  ok_t "a fresh-store task exactly on the second-granular boundary reports a complete zero"
+else
+  bad_t "fresh-boundary equality must be distinguishable" "$COMPLETE_ZERO"
+fi
+if jq -e '.data.summary.recorded == 0 and
+          .data.summary.coverage_complete_for_task == false and
+          .data.summary.history_before_coverage == "unknown"' <<<"$PARTIAL_ZERO" >/dev/null; then
+  ok_t "a pre-boundary task reports zero recorded with earlier history unknown"
+else
+  bad_t "pre-archive blindness must not render as no displaced gates" "$PARTIAL_ZERO"
+fi
+
+JSON_MODE=0
+PARTIAL_SHOW=$(cmd_task_show "$t9" 2>"$TMP/partial-show.err")
+if grep -Fq 'previous gates = 0 recorded (earlier history unknown; coverage begins ' <<<"$PARTIAL_SHOW"; then
+  ok_t "task show states the blind era on a pre-boundary zero"
+else
+  bad_t "task show must not assert the pre-archive era was quiet" "$PARTIAL_SHOW"
+fi
+
+# --- 11. upgraded store marker: earliest provable row, stamped once ----------
+EARLIEST=$(db "SELECT MIN(retired_at) FROM gate_history;")
+db "DELETE FROM task_prefs WHERE key='gate_history_coverage';"
+tasks_db_init
+STAMPED=$(_task_pref_get gate_history_coverage)
+if [[ -n "$EARLIEST" && "$STAMPED" == "inferred:$EARLIEST" ]]; then
+  ok_t "migration stamps the earliest provable archived row as the coverage boundary"
+else
+  bad_t "migration must use evidence, not a release-date guess" "earliest=$EARLIEST stamped=$STAMPED"
+fi
+tasks_db_init
+if [[ "$(_task_pref_get gate_history_coverage)" == "$STAMPED" ]]; then
+  ok_t "the coverage boundary is immutable after its one-time stamp"
+else
+  bad_t "coverage boundary drifted on a second init"
+fi
+db "UPDATE tasks SET created_at=$(sqlq "$EARLIEST") WHERE id=${t9};"
+JSON_MODE=1
+INFERRED_EQUAL=$(cmd_task_gate_history "$t9" 2>"$TMP/inferred-equal.err")
+if jq -e '.data.summary.coverage_basis == "inferred" and
+          .data.summary.coverage_complete_for_task == false and
+          .data.summary.history_before_coverage == "unknown"' <<<"$INFERRED_EQUAL" >/dev/null; then
+  ok_t "inferred-boundary equality stays partial (timestamps are only second-granular)"
+else
+  bad_t "an inferred same-second task must not be overstated as covered" "$INFERRED_EQUAL"
 fi
 
 printf -- '-----\n'

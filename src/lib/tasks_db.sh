@@ -670,6 +670,13 @@ CREATE TABLE IF NOT EXISTS task_prefs (
   updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
+-- DIVE-2133: evidence boundary for the gate_history reader. A fresh store
+-- stamps this before its first task, so zero archived rows can truthfully mean
+-- zero displaced gates. Existing stores stamp conservatively in migration: the
+-- earliest row already present, or migration time when the archive is empty.
+INSERT OR IGNORE INTO task_prefs(key,value)
+  SELECT 'gate_history_coverage', 'fresh:'||datetime('now');
+
 -- OSS-19 (OSS-26, phase A1): outcome-loop objectives. An objective is a standing
 -- goal bound to a READ-ONLY metric command (metric_cmd: stdout -> one number).
 -- The metric is run ONLY by `objective tick` and the digest — NEVER by a planner
@@ -1218,6 +1225,22 @@ CREATE TABLE IF NOT EXISTS task_prefs (
   updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 MIG
+  fi
+
+  # DIVE-2133: do not let an empty archive assert that the pre-DIVE-2119 era
+  # was quiet. Stamp the earliest PROVEN coverage boundary once. If this store
+  # already archived rows, the first retirement proves the writer was live by
+  # then; otherwise only this migration time is knowable. The read guard avoids
+  # taking a write lock on every command after the one-time stamp.
+  local gate_history_coverage
+  gate_history_coverage=$(sqlite3 -cmd ".timeout 5000" "$TASKS_DB" \
+    "SELECT value FROM task_prefs WHERE key='gate_history_coverage';" 2>/dev/null)
+  if [[ -z "$gate_history_coverage" ]]; then
+    sqlite3 -cmd ".timeout 5000" "$TASKS_DB" \
+      "INSERT OR IGNORE INTO task_prefs(key,value)
+         SELECT 'gate_history_coverage',
+                'inferred:'||COALESCE((SELECT MIN(retired_at) FROM gate_history), datetime('now'));" \
+      >/dev/null 2>&1 || true
   fi
 
   # OSS-19 (OSS-26) objectives + objective_readings — additive, gated on the
