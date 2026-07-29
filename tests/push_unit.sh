@@ -719,6 +719,44 @@ else
   printf 'skip - visudo not available (rendering syntax not machine-validated here)\n'
 fi
 
+# --- gh#250: the minted token's permission set must follow the branch --------
+# contents:write alone cannot push .github/workflows/*; GitHub refuses and the
+# error blames the App's grants rather than this token's, so the operator
+# chases the wrong thing. _push_touches_workflows decides, and these grade the
+# decision (no token is ever minted here — the predicate is pure git).
+WFREPO="$TMP/wfrepo"; mkdir -p "$WFREPO"
+( cd "$WFREPO"
+  git init -q -b main
+  git config user.name test; git config user.email test@example.test
+  mkdir -p .github/workflows src
+  printf 'name: ci\n' > .github/workflows/ci.yml
+  printf 'x\n' > src/a.txt
+  git add -A; git commit -q -m base
+  git checkout -q -b code-only;  printf 'y\n' >> src/a.txt;                git commit -qam "code"
+  git checkout -q main
+  git checkout -q -b touches-ci; printf '# edit\n' >> .github/workflows/ci.yml; git commit -qam "ci"
+  git checkout -q main
+) >/dev/null 2>&1
+
+wf() { ( _push_touches_workflows "$WFREPO" "$WFREPO" "$1" ) 2>/dev/null; }
+
+[[ "$(wf code-only)"  == "no"  ]] \
+  && ok_t "workflows scope: a code-only branch keeps contents:write alone" \
+  || bad_t "workflows scope: code-only branch" "got '$(wf code-only)', want 'no'"
+[[ "$(wf touches-ci)" == "yes" ]] \
+  && ok_t "workflows scope: a branch touching .github/workflows/ needs workflows:write" \
+  || bad_t "workflows scope: workflow-touching branch" "got '$(wf touches-ci)', want 'yes'"
+# No reachable default branch -> no range to diff. Must be 'unknown' (which the
+# caller treats as "include the permission and say so"), never a silent 'no' —
+# a false 'no' is a push that fails AFTER the human cleared the gate.
+[[ "$( ( _push_touches_workflows "$WFREPO" "/nonexistent/remote.git" touches-ci ) 2>/dev/null )" == "unknown" ]] \
+  && ok_t "workflows scope: unreachable remote -> unknown (fails open, loudly)" \
+  || bad_t "workflows scope: unreachable remote" "want 'unknown'"
+# And the caller wires it: the wide body is reachable only when not 'no'.
+grep -q 'workflows:"write"' "$SRC/cmd_push.sh" \
+  && ok_t "workflows scope: _push_do can request workflows:write" \
+  || bad_t "workflows scope: _push_do can request workflows:write" "no workflows grant in the token body"
+
 echo "-----"
 printf 'push_unit: %d passed, %d failed\n' "$PASS" "$FAIL"
 [[ $FAIL -eq 0 ]]
