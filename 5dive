@@ -4128,6 +4128,14 @@ CREATE TABLE IF NOT EXISTS tasks (
   ask_shape           TEXT,
   precedent_ref       INTEGER,
   precedent_kind      TEXT,
+  -- DIVE-2241 needs_capability: the capability the FILER DECLARED this ask consumes
+  -- (`task need --needs=<cap>`), verbatim, including an unrecognised one. Three names
+  -- are human-class constants (human_tap / spend_authority / secret_provision) and
+  -- resolve the gate to the paired human instead of the task's verifier or the filer's
+  -- lead; anything else is undeclared-equivalent and changes no routing. DECLARED, never
+  -- inferred from --type or the ask text. The sealed list lives in the shipped source
+  -- (_GATE_HUMAN_CAPABILITIES), NOT here and not in any writable table — see DIVE-2099.
+  needs_capability    TEXT,
   -- DIVE-1140 gate-shipped sweep. Stamped (once) when the heartbeat finds a
   -- commit referencing this OPEN gate's ident on a configured repo's origin/main
   -- — the gate is FLAGGED "likely shipped, verify+close" to its owner. Flag-only
@@ -4644,6 +4652,7 @@ _tasks_db_migrate() {
            'gate_filed_by TEXT' \
            'secret_key TEXT' 'connector TEXT' 'human_nonce_hash TEXT' \
            'ask_shape TEXT' 'precedent_ref INTEGER' 'precedent_kind TEXT' \
+           'needs_capability TEXT' \
            'shipped_flag_at TEXT' 'routed_reviewer TEXT' \
            'delivery_ref TEXT' 'delivered_at TEXT' \
            'originated_by_objective INTEGER' 'originated_cycle INTEGER' \
@@ -19662,6 +19671,7 @@ _task_usage() {
   5dive task need <id|DIVE-N> --withdraw            # DIVE-1401: cancel a still-pending gate the team filed but that's now moot — filer or org lead, no human tap. NOT a grant (never records a secret/approval); genuine clears stay human-only.
     --ask: ONE crisp question + ~1 line essential context, recommendation up front. Heavy detail goes in the task BODY, not the ask.
     --discusses="<why>" (DIVE-2089, --type=decision ONLY): appeal a T2 floor that fired on SUBJECT MATTER. A design question that merely NAMES secrets/publishing/deletion performs none of them; declare that and the gate goes to your lead at tier 1 instead of the human. The declaration is recorded on the gate, shown to the reviewer, and audited — unlike rewording the ask, which reaches the same audience with no record of how. Refused, loudly, for money / customer comms / irreversible infra, for a pinned --tier=2, and when no lead sits above you.
+    --needs=<capability> (DIVE-2241): DECLARE what this ask consumes. human_tap (a person's call: brand, strategy, irreversible), spend_authority (billing, paid accounts), secret_provision (a new token/credential) resolve to the paired human as CONSTANTS — the gate skips lead- AND verifier-routing and cannot be agent-cleared. Fixes: a gate on a verifier-loop task otherwise routes to whoever is GRADING the ticket, whatever it asks. Declared, never guessed from your wording; any other value is undeclared-equivalent and changes nothing (it never refuses).
     --recommend: your advised choice (strongly encouraged for decision/approval). Leads the alert as '✅ Recommended: <X>' and ⭐-marks its button. For a decision it must match one of --options.
     --tier (DIVE-891 risk tiers): 0 = auto-clear (rec applies NOW, no ping, digest line; requires --recommend)
              1 = agent-clearable; unanswered 48h -> the heartbeat applies the rec   2 = hard human gate (default for approval/secret/manual)
@@ -22964,6 +22974,44 @@ cmd_task_routing() {
 # same posture as gate-proof (a determined agent can still word around it —
 # but only by loudly not-naming what it's asking for, which the ask text then
 # fails to justify).
+# DIVE-2241: the HUMAN-CLASS capability constants. A gate may DECLARE the
+# capability its ask consumes with `--needs=<capability>`; exactly three names
+# resolve to the paired human, and they resolve as CONSTANTS, not as a lookup.
+#
+# Why a constant and not the DIVE-2102 capability registry this was originally
+# sequenced behind: that registry is a SUDOERS MIRROR — its vocabulary is five
+# command grants and its holder key is `holder_agent`. lodar has no agent account
+# and no sudoers entry, so these three are not "undeclared, pending declaration",
+# they are INEXPRESSIBLE in that schema and always will be. A registry derived
+# from a permission system answers "who may RUN this", never "who may DECIDE
+# this". See community/wiki/an-oracle-that-mirrors-sudoers-answers-permission-\
+# not-authority.md.
+#
+# Why a shipped shell constant is the DIVE-2099 anchor and a routing table is not:
+# agents here hold NOPASSWD:ALL, so any table an agent can `sudo 5dive ... set` is
+# an authority the beneficiary can grant itself — naming itself the holder of
+# human_tap is one command. This list is a name sealed into the release artifact:
+# changing it means changing the code that ships and passes review, and the
+# installed binary's sha256 (5dive.sha256) no longer matches. There is deliberately
+# NO write path — not root-guarded, ABSENT — because `require_root` answers "can
+# this principal write here", which on this host is always yes (DIVE-2131).
+#
+#   human_tap        — a person's call: brand, strategy, an irreversible choice.
+#   spend_authority  — billing / paid accounts. NOT smoke runs: lodar pre-approved
+#                      those 2026-07-27, so a smoke gate declares nothing here.
+#   secret_provision — a new token / credential must come FROM a human.
+#
+# Anything else — including a typo, and including a real agent capability like
+# delegated_push — is UNRECOGNISED and falls through to today's routing untouched
+# (see _gate_needs_human below). Absence means UNDECLARED, never non-holding.
+_GATE_HUMAN_CAPABILITIES='human_tap spend_authority secret_provision'
+# True iff $1 is one of the human-class constants. Whitespace-fenced substring
+# match so no capability can hit by prefix (`human_tap_delegate` must NOT match).
+_gate_needs_human() {
+  [[ -n "${1:-}" ]] || return 1
+  [[ " $_GATE_HUMAN_CAPABILITIES " == *" $1 "* ]]
+}
+
 _GATE_T2_FLOOR_RX='spend|billing|invoice|charge|payment|refund|subscription|price|pricing|\$[0-9]|€[0-9]|publish|public post|announce|launch post|press|customer email|email customers|newsletter|blast|secret|credential|api key|token|password|delete|destroy|teardown|wipe|purge|drop[^.]{0,20}table|truncate|irreversible|revoke|dns|domain transfer'
 _gate_tier2_floor_hit() {
   local text floor_rx="$_GATE_T2_FLOOR_RX" loaded_rx="" constitution_path="" ere_rc=0
@@ -23705,7 +23753,7 @@ _gate_shape_jaccard() {
 
 cmd_task_need() {
   tasks_db_init
-  local type="" ask="" options="" recommend="" from="" tier="" secret_key="" connector="" probe="" withdraw="" discusses=""
+  local type="" ask="" options="" recommend="" from="" tier="" secret_key="" connector="" probe="" withdraw="" discusses="" needs=""
   local -a positional=()
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -23732,13 +23780,17 @@ cmd_task_need() {
       # _GATE_FLOOR_APPEALABLE_RX — decision-type only, floor-over-fire only,
       # non-appealable core excepted, lead-routed, audited.
       --discusses=*) discusses="${1#*=}" ;;
+      # DIVE-2241: DECLARE the capability this ask consumes. Declared, never
+      # inferred — inferring it from --type or from the ask text would be the
+      # DIVE-2089 mistake one layer up (reading subject matter to guess intent).
+      --needs=*)     needs="${1#*=}" ;;
       --)          shift; positional+=("$@"); break ;;
       -*)          fail "$E_USAGE" "unknown flag: $1" ;;
       *)           positional+=("$1") ;;
     esac
     shift
   done
-  [[ ${#positional[@]} -gt 0 ]] || fail "$E_USAGE" "usage: 5dive task need <id|DIVE-N> --type=decision|secret|approval|manual --ask=\"...\" [--options=A|B] [--recommend=\"A\"] [--discusses=\"why this decision only DISCUSSES a floored category\"]  (or --withdraw to cancel a moot pending gate)"
+  [[ ${#positional[@]} -gt 0 ]] || fail "$E_USAGE" "usage: 5dive task need <id|DIVE-N> --type=decision|secret|approval|manual --ask=\"...\" [--options=A|B] [--recommend=\"A\"] [--needs=human_tap|spend_authority|secret_provision] [--discusses=\"why this decision only DISCUSSES a floored category\"]  (or --withdraw to cancel a moot pending gate)"
   resolve_task_id "${positional[0]}"; local id="$RESOLVED_TASK_ID" ident="$RESOLVED_TASK_IDENT"
 
   # DIVE-1401: --withdraw path. Secret/approval/manual gates are human-only to
@@ -23750,7 +23802,7 @@ cmd_task_need() {
   # coordinator, or a human caller (non-agent unix id). Genuine GRANT-clears stay
   # human-only via cmd_task_answer — this branch never touches that path.
   if [[ -n "$withdraw" ]]; then
-    [[ -z "$type$ask$options$recommend$tier$secret_key$connector$probe$discusses" ]] \
+    [[ -z "$type$ask$options$recommend$tier$secret_key$connector$probe$discusses$needs" ]] \
       || fail "$E_USAGE" "--withdraw takes no other gate flags (it cancels the existing gate, not re-files one)"
     local w_type w_ans w_status
     w_type=$(db "SELECT COALESCE(need_type,'')        FROM tasks WHERE id=${id};")
@@ -23797,6 +23849,7 @@ cmd_task_need() {
           SET need_type=NULL, ask=NULL, need_options=NULL, recommend=NULL,
               secret_key=NULL, connector=NULL, ask_shape=NULL,
               precedent_ref=NULL, precedent_kind=NULL, routed_reviewer=NULL,
+              needs_capability=NULL,
               need_asked_at=NULL, gate_pinged_at=NULL, gate_filed_by=NULL
         WHERE id=${id};
         UPDATE tasks SET status='todo'
@@ -23953,6 +24006,38 @@ cmd_task_need() {
           warn "gate NOT floored: the tier-2 category term is in the TASK TITLE, not in the ask (DIVE-2224 answer A). Routed to the lead, stamped floored_by=title — escalate it if the ask really is asking for that."
           ;;
       esac
+    fi
+  fi
+
+  # DIVE-2241: the DECLARED human-class capability. This is the sibling of the
+  # keyword floor directly above — same destination, opposite epistemics. The
+  # floor READS the ask and guesses ("this says 'billing', so it is probably
+  # money"); `--needs` is the filer STATING what the ask consumes. A declaration
+  # is the stronger signal, so it is applied AFTER the floor and simply overrides:
+  # a human-class capability is tier-2 by definition (never auto-applies, always
+  # reaches the person), and marking it tier_floored=1 puts it in the same bucket
+  # every downstream reader already treats as true-human.
+  #
+  # THE DEFECT THIS CLOSES: a gate on a verifier-loop task routes to the VERIFIER
+  # regardless of what is being ASKED — so "may I spend $X" landed on whichever
+  # agent happened to be grading the ticket. Three instances in 36h across three
+  # agents (dev3/DIVE-2084, main/DIVE-2146, olivia immediately after). The routing
+  # veto is at the _routable backstop below, next to the DIVE-1957 tier-2 one, so
+  # it holds against every KIND-based override by construction rather than
+  # per-branch.
+  #
+  # FALL THROUGH, NEVER REFUSE (scope item 4): an unrecognised capability warns
+  # and resolves to today's routing. A router that hard-fails on an unknown name
+  # turns a mis-declared gate into a STUCK one, and the whole point of the class
+  # is that a mis-declaration should cost a re-file, not a block. `--needs=`
+  # (empty) is the same as absent: undeclared, never non-holding.
+  local _needs_human=0
+  if [[ -n "$needs" ]]; then
+    if _gate_needs_human "$needs"; then
+      _needs_human=1
+      tier=2; tier_floored=1
+    else
+      warn "--needs='${needs}' is not a human-class capability, so it changes nothing about where this gate goes (routing is unchanged). The three that resolve to the paired human are: ${_GATE_HUMAN_CAPABILITIES// /, }. Agent capabilities (delegated_push, root, gh_push) are NOT routable this way yet — see DIVE-2156."
     fi
   fi
 
@@ -24292,6 +24377,11 @@ cmd_task_need() {
             ask_shape=$(sqlq_or_null "$ask_shape"),
             precedent_ref=${precedent_ref:-NULL},
             precedent_kind=$(sqlq_or_null "$precedent_kind"),
+            -- DIVE-2241: the capability the filer DECLARED, recorded verbatim —
+            -- including one that resolved to nothing. What was claimed is the
+            -- provenance; whether it resolved is recomputable from the sealed
+            -- list, and a mis-declaration you cannot see is one you cannot correct.
+            needs_capability=$(sqlq_or_null "$needs"),
             tier=${tier}, need_asked_at=datetime('now'), gate_pinged_at=NULL,
             gate_filed_by=$(sqlq "$actor")
       WHERE id=${id};
@@ -24502,6 +24592,18 @@ cmd_task_need() {
   # the filer IS the verifier (self-route — e.g. the max_iters escalation files
   # its manual gate --from the verifier) or on secret/manual/access. We still guard
   # tier!=2 so a money/brand/destructive decision stays human even inside a loop.
+  # DIVE-2241: re-assert the declared human class AFTER every downgrade kind has
+  # had its turn. eng-ship / curation / internal-ops / --discusses each force a
+  # floored gate back down to a lead-routed tier-1, and they classify on the ask's
+  # SHAPE ("this looks like a ship") — which a declared capability outranks, because
+  # it states what the ask CONSUMES. One re-assert here rather than a veto bolted
+  # onto each of the four guards: the DIVE-1957 lesson is that a promise held
+  # per-branch is a promise that breaks when branch five is added.
+  if [[ "$_needs_human" == "1" && "$tier" != "2" ]]; then
+    warn "--needs=${needs} restored this gate to tier 2: a downgrade kind (eng-ship / curation / internal-ops / floor appeal) classified it as lead-clearable off the ask's shape, but you declared it consumes a human-held capability, and the declaration wins."
+    tier=2; tier_floored=1
+  fi
+
   local _verifier_route=0 _route_target=""
   if [[ ( "$type" == "decision" || "$type" == "approval" ) && "$tier" != "2" ]]; then
     local _vf; _vf=$(db "SELECT COALESCE(verifier,'') FROM tasks WHERE id=${id};")
@@ -24559,6 +24661,24 @@ cmd_task_need() {
   # vetoed at the downgrade sites above; `access` is routable regardless of tier by
   # DIVE-1243 and was the last path a pinned gate could still reach an agent through.
   [[ "$tier_arg" == "2" ]] && _routable=0
+  # DIVE-2241: THE constant resolution. A declared human-class capability resolves
+  # to lodar — and "lodar" is not a name this router looks up, it is the human path
+  # itself: refuse to hand the gate to ANY agent and let it fall through to
+  # task_need_notify's human ping. That is what makes it a constant rather than a
+  # row. It sits at the backstop with the DIVE-1957 tier-2 veto so no KIND-based
+  # override above (eng-ship / curation / internal-ops / access / verifier-route)
+  # can cross it — the verifier-route being the one this ticket exists to stop.
+  [[ "$_needs_human" == "1" ]] && _routable=0
+  # Record the declaration and what it did, at the moment it did it. DIVE-2093 will
+  # PRINT the routing decision at file time; until it lands this row is the only
+  # place a mis-declared gate is visible without diffing where it ended up.
+  # DIVE-2054: task-store state for $ident, no channel proof — fenced.
+  if [[ -n "$needs" ]]; then
+    _task_store_audit_log "task need declared-capability" \
+      "$( ((_needs_human)) && echo human-class || echo unrecognised )" 0 -- \
+      "task=$ident" "type=$type" "declared=$needs" "filer=$actor" \
+      "resolved=$( ((_needs_human)) && echo human || echo unchanged )" || true
+  fi
   if [[ "$_routable" == "1" ]]; then
     # DIVE-1243: `access` routing is intrinsic to the TYPE, so it does NOT wait on
     # the gate_builder_routing pref (which ship-gates the decision/approval/manual
@@ -24700,7 +24820,16 @@ cmd_task_need() {
   # the anti-laundering lever: the filer who would otherwise re-file with neutral
   # wording is shown an attributable, audited path to the same audience.
   local floor_note="" floor_term=""
-  if (( tier_floored )); then
+  # DIVE-2241: a DECLARED human-class gate is also tier_floored, but it did not get
+  # there by the keyword floor — so it must not wear the floor's explanation. Saying
+  # "the T2 category floor fired" over a declaration is wrong twice: it credits a
+  # match that may not exist (floor_term comes back empty and the note degrades to a
+  # bare claim), and it hands the filer the --discusses appeal for a category call
+  # they made THEMSELVES. Nobody should be invited to appeal their own declaration.
+  if [[ "$_needs_human" == "1" ]]; then
+    floor_note=" [tier 2 — DECLARED --needs=${needs}, a human-held capability; routed to the paired human, not to a lead or verifier]"
+    warn "this gate is hard-human because you DECLARED --needs=${needs}. It bypasses lead- and verifier-routing by constant, and only the paired human can answer it. If the ask does not actually consume that capability, withdraw and re-file without --needs — do not appeal it, the declaration is yours."
+  elif (( tier_floored )); then
     floor_term=$(_gate_tier2_floor_term "${ask} $(db "SELECT COALESCE(title,'') FROM tasks WHERE id=${id};")")
     floor_note=" [tier forced to 2 — T2 category floor${floor_term:+: matched '$floor_term'}]"
     local _fw="this gate was FORCED to tier 2 (hard human) by the T2 category floor"
@@ -24722,8 +24851,8 @@ cmd_task_need() {
     unnotified_note=" [UNNOTIFIED — nobody was pinged; answer on the dashboard or: 5dive task answer ${ident}]"
   fi
   ok "$ident needs a human ($type, tier $tier)${floor_note}${prec_note}${unnotified_note} — $ask" \
-     '{id:($i|tonumber), ident:$id, status:"blocked", need_type:$ty, tier:($tr|tonumber), tier_floored:($fl=="1"), floor_term:(($ft|select(length>0)) // null), notified:($nf=="1"), ask:$ak, need_options:(($op|select(length>0)) // null), recommend:(($rc|select(length>0)) // null), precedent_ref:(($pr|select(length>0)|tonumber?) // null), assignee:$ac}' \
-     --arg i "$id" --arg id "$ident" --arg ty "$type" --arg tr "$tier" --arg fl "$tier_floored" --arg ft "$floor_term" --arg nf "$notified" --arg ak "$ask" --arg op "$options" --arg rc "$recommend" --arg pr "$precedent_ref" --arg ac "$actor"
+     '{id:($i|tonumber), ident:$id, status:"blocked", need_type:$ty, tier:($tr|tonumber), tier_floored:($fl=="1"), floor_term:(($ft|select(length>0)) // null), needs_capability:(($nc|select(length>0)) // null), needs_human:($nh=="1"), notified:($nf=="1"), ask:$ak, need_options:(($op|select(length>0)) // null), recommend:(($rc|select(length>0)) // null), precedent_ref:(($pr|select(length>0)|tonumber?) // null), assignee:$ac}' \
+     --arg i "$id" --arg id "$ident" --arg ty "$type" --arg tr "$tier" --arg fl "$tier_floored" --arg ft "$floor_term" --arg nc "$needs" --arg nh "$_needs_human" --arg nf "$notified" --arg ak "$ask" --arg op "$options" --arg rc "$recommend" --arg pr "$precedent_ref" --arg ac "$actor"
 }
 
 # _task_owner_channel — resolve the filing agent's bot token + the per-type
