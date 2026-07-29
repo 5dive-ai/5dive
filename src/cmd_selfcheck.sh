@@ -716,11 +716,19 @@ cmd_selfcheck() {
                 '{probe:$p, verdict:$v, reason:(if $r=="" then null else $r end), asserts:$t, detail:$d}')
       jarr+=$'\n'
     done
+    # DIVE-2327: env_overrides is a REPORT carried alongside the verdicts, never a
+    # probe. It has no pass/fail and deliberately does not touch the summary counts —
+    # a knob in effect is a fact about this box, not a rail that did or did not act,
+    # and folding it into the verdicts would make correct configuration read as a
+    # failure. See src/lib/env_overrides.sh.
+    local _eov; _eov=$(_env_overrides_json 2>/dev/null || printf '{}')
+    [[ -n "$_eov" ]] || _eov='{}'
     printf '%s' "$jarr" | jq -s --arg label "$label" \
       --argjson fails "$fails" --argjson notreached "$notreached" \
       --argjson unexplained "$unexplained" --argjson passes "$passes" --argjson errors "$errors" \
+      --argjson eov "$_eov" \
       '{label:$label, probes:., summary:{pass:$passes, fail:$fails, "not-reached":$notreached,
-        unexplained_not_reached:$unexplained, error:$errors}}'
+        unexplained_not_reached:$unexplained, error:$errors}, env_overrides:$eov}'
   else
     printf '5dive selfcheck — do the rails ACT? (label=%s)\n\n' "$label"
     for i in "${!v_id[@]}"; do
