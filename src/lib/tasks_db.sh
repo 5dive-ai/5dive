@@ -1004,7 +1004,26 @@ _tasks_db_migrate() {
            'delivery_ref TEXT' 'delivered_at TEXT' \
            'originated_by_objective INTEGER' 'originated_cycle INTEGER' \
            'verify_unavailable INTEGER' 'last_skipped_at TEXT'; do
-    if ! printf '%s\n' "$cols" | grep -qx "${c%% *}"; then
+    # DIVE-2418: herestring, NOT a pipe. `printf | grep -q` lets grep exit on its
+    # first match while printf is still writing, and printf then takes SIGPIPE and
+    # emits "write error: Broken pipe" on stderr. This runs from tasks_db_init on
+    # essentially every `5dive task` invocation, so the stray line can surface
+    # anywhere — it is not test-only. It reddened CI on 0efcd66 by landing INSIDE a
+    # harness's captured stream (loop_panel_unit T6 redirects 2>&1 into the file it
+    # then jq-parses), so the assertion failed while the subject under test had
+    # succeeded. A herestring has no pipe, so no SIGPIPE is possible.
+    #
+    # THE MECHANISM IS NOT ESTABLISHED AND THIS FIX DOES NOT DEPEND ON IT. olivia
+    # built the exact shape at the real payload size (~70 short strings, far under
+    # the 64KB pipe buffer) with the match on line one and got ZERO broken pipes in
+    # 400 runs, so the obvious early-exit story does not reproduce where it actually
+    # occurs; CI under load is the untested variable. Removing the pipe removes the
+    # class regardless of which race fires. Semantics verified equivalent over five
+    # probes including the prefix case `grep -x` must reject (need_ty vs need_type).
+    #
+    # If anyone adds `set -o pipefail` on this path, the SIGPIPE stops being
+    # cosmetic and becomes a hard failure in schema migration.
+    if ! grep -qx "${c%% *}" <<<"$cols"; then
       sqlite3 -cmd ".timeout 5000" "$TASKS_DB" \
         "ALTER TABLE tasks ADD COLUMN ${c};" >/dev/null 2>&1 || true
     fi
@@ -1273,7 +1292,7 @@ MIG
     local lr_cols
     lr_cols=$(sqlite3 -cmd ".timeout 5000" "$TASKS_DB" \
               "SELECT name FROM pragma_table_info('loop_runs');" 2>/dev/null)
-    if ! printf '%s\n' "$lr_cols" | grep -qx "scorecard_json"; then
+    if ! grep -qx "scorecard_json" <<<"$lr_cols"; then
       sqlite3 -cmd ".timeout 5000" "$TASKS_DB" \
         "ALTER TABLE loop_runs ADD COLUMN scorecard_json TEXT;" >/dev/null 2>&1 || true
     fi
@@ -1439,11 +1458,11 @@ MIG
     local oc_cols
     oc_cols=$(sqlite3 -cmd ".timeout 5000" "$TASKS_DB" \
               "SELECT name FROM pragma_table_info('objective_cycles');" 2>/dev/null)
-    if ! printf '%s\n' "$oc_cols" | grep -qx "planner_loop_id"; then
+    if ! grep -qx "planner_loop_id" <<<"$oc_cols"; then
       sqlite3 -cmd ".timeout 5000" "$TASKS_DB" \
         "ALTER TABLE objective_cycles ADD COLUMN planner_loop_id TEXT;" >/dev/null 2>&1 || true
     fi
-    if ! printf '%s\n' "$oc_cols" | grep -qx "planner_task_id"; then
+    if ! grep -qx "planner_task_id" <<<"$oc_cols"; then
       sqlite3 -cmd ".timeout 5000" "$TASKS_DB" \
         "ALTER TABLE objective_cycles ADD COLUMN planner_task_id INTEGER;" >/dev/null 2>&1 || true
     fi
@@ -1462,7 +1481,7 @@ MIG
     local obj_cols
     obj_cols=$(sqlite3 -cmd ".timeout 5000" "$TASKS_DB" \
               "SELECT name FROM pragma_table_info('objectives');" 2>/dev/null)
-    if ! printf '%s\n' "$obj_cols" | grep -qx "run_mode"; then
+    if ! grep -qx "run_mode" <<<"$obj_cols"; then
       sqlite3 -cmd ".timeout 5000" "$TASKS_DB" \
         "ALTER TABLE objectives ADD COLUMN run_mode TEXT NOT NULL DEFAULT 'live';" >/dev/null 2>&1 || true
     fi
