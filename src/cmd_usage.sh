@@ -393,6 +393,19 @@ USAGE_JQ_HELPERS='
             elif . >= 1000 then ((. / 1000 * 10 | floor) / 10 | tostring) + "k"
             else (. | tostring) end;
   def pct(x): if x == null then "-" else ((x | floor | tostring) + "%") end;
+  # DIVE-2312: a figure the collector has ALREADY flagged unverified must not
+  # render as a bare number a reader can lift. DIVE-2058 put a ⚠ beside the
+  # ident and a caveat under the table; both render correctly and three readers
+  # in a row still quoted the number as fact — one of them the author of the
+  # note warning about it. A marker cannot make a reader read it, so the
+  # uncertainty has to travel INSIDE the value. The qualifier is ATTACHED with
+  # no whitespace, which is the load-bearing part: the number then never
+  # appears as a standalone whitespace-delimited field anywhere in the output,
+  # so lifting the cell carries the word "unverified" with it.
+  # Pass the flag as a bound $variable, not a bare filter — inside a jq
+  # function body `.` is the value being formatted (a number), so `.dispatched`
+  # would be evaluated against it and error.
+  def qtok($unv): if $unv then "~" + htok + "(unverified)" else htok end;
   def shortmodel: if . == null then "-"
                   else (sub("^claude-";"") | sub("-20[0-9]+$";"")) end;
 '
@@ -519,19 +532,23 @@ usage_render_board() {
     else
       (["TASK","AGENT","ITER","OUTPUT","TOTAL","TITLE"] | @tsv),
       (.tasks | sort_by(-.total)[:12][] |
-        [ (.ident + (if .dispatched == false then " ⚠" else "" end)), .assignee,
+        (.dispatched == false) as $unv |
+        [ (.ident + (if $unv then " ⚠" else "" end)), .assignee,
           (if (.iteration // 0) > 0 then (.iteration|tostring) else "-" end),
-          (.output|htok), (.total|htok),
+          (.output|qtok($unv)), (.total|qtok($unv)),
           (.title | if length > 42 then .[:41] + "…" else . end) ] | @tsv)
     end' <<<"$data" | column -t -s $'\t' | sed 's/^/  /'
 
   # DIVE-2058: rows with dispatched==false attribute tokens to a task with no
   # /goal dispatch found in its window — flag rather than let a misattributed
   # number stand unqualified (the DIVE-1817 13.8M incident).
+  # DIVE-2312: this footnote is no longer what carries the caveat — the figures
+  # themselves do. It stays as the explanation of the `~…(unverified)` form and
+  # the pointer to why, not as the only place the reader can learn it.
   local flagged
   flagged=$(jq -r '[.tasks[] | select(.dispatched == false)] | length' <<<"$data" 2>/dev/null)
   if [[ "${flagged:-0}" -gt 0 ]]; then
-    echo "  ⚠ ${flagged} row(s) above show tokens attributed to a task with no /goal dispatch found in its window — likely misattributed, treat as unverified (see DIVE-2058)."
+    echo "  ⚠ ${flagged} row(s) above are marked ~N(unverified): tokens attributed to a task with no /goal dispatch found in its window — likely misattributed. Do not quote those figures as fact (see DIVE-2058, DIVE-2312)."
   fi
 
   # over-budget callout: ⚠ at the soft cap, ⛔ at the ceiling (see `5dive cost`).
@@ -597,7 +614,8 @@ usage_render_agent() {
   jq -r "$USAGE_JQ_HELPERS"'
     if (.tasks | map(select(.assignee==$n)) | length) == 0 then "    (none attributed)"
     else (.tasks | map(select(.assignee==$n)) | sort_by(-.total)[] |
-      "    " + .ident + (if .dispatched == false then " ⚠" else "" end) + "  " + (.total|htok) + "  " + .title) end
+      (.dispatched == false) as $unv |
+      "    " + .ident + (if $unv then " ⚠" else "" end) + "  " + (.total|qtok($unv)) + "  " + .title) end
     ' --arg n "$agent" <<<"$data"
 }
 
