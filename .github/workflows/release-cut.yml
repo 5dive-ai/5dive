@@ -261,6 +261,11 @@ jobs:
           git add -f 5dive 5dive.sha256 src/header.sh
           git -c user.name=lodar -c user.email=markounik@gmail.com \
               commit -q -m "release ${tag}: assign ${version} + built bundle (DIVE-2091 bundle-at-tag-time, DIVE-2247 version-at-tag-time)"
+          # DIVE-2433: `sha` is about to stop meaning "the commit whose check-runs we
+          # read". Keep the graded one under its own name so the tag can say which
+          # object each claim is about instead of silently attributing the parent's
+          # CI to the release commit.
+          parent_sha="$sha"
           sha=$(git rev-parse HEAD)
           # Prove the TREE BEING TAGGED carries what install.sh will fetch — read it
           # back out of the object store rather than trusting the working tree.
@@ -271,10 +276,65 @@ jobs:
           echo "release commit ${sha} carries bundle ${_want} (FIVE_VERSION=${_bundle_ver})"
           # <<< DIVE-2091 release-commit block
 
+          # ── DIVE-2433: GRADE THE RELEASE COMMIT ──────────────────────────────
+          #
+          # THE GAP. Everything above proves the bundle is INTACT — it matches its own
+          # sha256, it is in the tagged tree, it is byte-correct over the CDN. Not one
+          # of those runs it. The release commit is pushed detached and carries ZERO
+          # check-runs (measured on v0.17.10: release commit d7db754 = 0, parent
+          # 2e36516 = 10), so `test`, `install-smoke` and `docker-install` never touch
+          # the exact artifact customers install. Integrity is not function: a bundle
+          # can hash correctly and still be broken.
+          #
+          # AND THE GRADE CI *DOES* PERFORM IS OF A DIFFERENT OBJECT. unit-tests.yml
+          # runs `./build.sh` first, because main carries no bundle (DIVE-2091) — so it
+          # grades a REBUILD, never the released artifact. Here the bundle in the tree
+          # IS the artifact, which makes this the only place the real one can be run.
+          #
+          # WHY NOT JUST TRIGGER THE EXISTING WORKFLOWS ON THE TAG — the obvious fix,
+          # and it is a NO-OP. A push authenticated with GITHUB_TOKEN does not trigger
+          # workflows (GitHub's recursion guard; this file already says so at the
+          # CI-NOT-REACHED refusal above). Adding `push: tags:` to unit-tests.yml would
+          # look like coverage and fire never. Grading here, BEFORE the tag is pushed,
+          # is also strictly better than a post-hoc check-run: a red after publication
+          # is a red on bytes boxes are already installing.
+          # The grade itself lives in scripts/grade-release-commit.sh — a workflow body
+          # cannot be unit-tested and .github/workflows/ needs a credential most agents
+          # do not hold, so the logic sits where it can be graded and repaired on the
+          # normal rail (tests/grade_release_commit_unit.sh, 20 assertions). Same split
+          # as scripts/pii-scan-range.sh (DIVE-2267).
+          echo "--- grading the release commit ${sha:0:12} (DIVE-2433) ---"
+          bash scripts/grade-release-commit.sh "${version}"
+          _grc=$?
+          case "$_grc" in
+            0) echo "release commit ${sha:0:12}: PASS on the exact artifact (DIVE-2433)" ;;
+            1) echo "::error::${tag} was NOT published — the release commit FAILED its own grade. Boxes keep installing ${incumbent:-the previous tag}."
+               exit 1 ;;
+            # UNDETERMINED must refuse exactly as hard as a failure. A grader that could
+            # not run tells us nothing about the artifact, and treating "could not look"
+            # as "looks fine" is the defect this row exists to close.
+            *) echo "::error::${tag} was NOT published — the release-commit grade could not RUN (rc=${_grc}), so this artifact is UNGRADED. That is not a pass. Boxes keep installing ${incumbent:-the previous tag}."
+               exit 1 ;;
+          esac
+          # ── end DIVE-2433 ────────────────────────────────────────────────────
+
+          # DIVE-2433: this message used to read "CI green on this exact sha:
+          # ${total} completed check-runs" — and that was FALSE about the object it
+          # names. `sha` is reassigned to the release commit above, while `total`
+          # counts check-runs on the PARENT, so the tag asserted a measurement that
+          # was never taken on the commit it publishes. v0.17.10 carries that claim
+          # verbatim about a sha with zero check-runs. An ungraded object is a gap;
+          # an ungraded object carrying a permanent, published claim that it WAS
+          # graded is what stops anyone finding the gap. Say which sha was measured
+          # by whom, and name the grade this job performed rather than borrowing the
+          # parent's.
           git tag -a "$tag" "$sha" -m "${tag} — ${note}
 
-          Publishes ${sha} as the tree every box installs (DIVE-2144). CI green on
-          this exact sha: ${total} completed check-runs, none failing."
+          Publishes ${sha} as the tree every box installs (DIVE-2144).
+          Parent ${parent_sha} carried ${total} completed check-runs, none failing.
+          This release commit is not graded by GitHub CI (a GITHUB_TOKEN push does not
+          trigger workflows); it was graded IN THIS JOB before publication — tests/*.sh,
+          \`5dive selfcheck\`, and --version/--help run against this exact bundle."
           if ! git push origin "refs/tags/${tag}"; then
             echo "::error::tag push rejected — ${tag} was NOT published. Nothing changed for any box; they keep installing ${incumbent:-the previous tag}."
             exit 1
