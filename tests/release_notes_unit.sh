@@ -213,16 +213,17 @@ grep -q 'release-notes.sh' <<<"$BLOCK" \
 # actually have sent to GitHub.
 mkdir -p "$R/scripts"
 cp "$SCRIPTS/release-notes.sh" "$R/scripts/release-notes.sh"
+# shellcheck disable=SC2034  # incumbent/sha/version/tag/note are read by `eval "$BLOCK"`
 run_block() { # <incumbent> <sha> <version>
   rm -f "$TMP/ghargs" "$TMP/ghbody"
   ( cd "$R" || exit 9
     # These five ARE the job's variables at that point — the extracted block reads
-    # them via `eval` below, which shellcheck cannot follow. Standing them up here
-    # is the whole point of the arm: it is what proves the block references names
-    # that exist in the job rather than names that merely look plausible.
-    # shellcheck disable=SC2034
+    # them via `eval` below, which shellcheck cannot follow, so it calls all five
+    # unused. Standing them up is the whole point of the arm: it is what proves the
+    # block references names that exist in the job rather than names that merely
+    # look plausible. The directive sits on the subshell so it covers every one
+    # (a per-line disable only covers the first command on that line).
     incumbent="$1"; sha="$2"; version="$3"; tag="v$3"
-    # shellcheck disable=SC2034
     note="nightly auto-cut: main changed and CI is green"
     gh() {
       printf '%s\n' "$*" > "$TMP/ghargs"
