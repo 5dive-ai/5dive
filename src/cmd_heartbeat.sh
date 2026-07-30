@@ -2343,7 +2343,7 @@ _hb_budget_sweep() {
 # wait_for_message loop with their own liveness, so they are skipped. Only PAIRED
 # agents matter — an unpaired bot has no human whose taps could be dropped.
 _hb_poller_verdict() {
-  local type="$1" mtime="$2" now="$3" allowfrom="$4" thresh="$5" supposed="${6:-1}"
+  local type="$1" mtime="$2" now="$3" allowfrom="$4" thresh="$5" supposed="${6:-1}" uptime="${7:-}"
   [[ "$type" == "claude" ]] || return 0            # non-poller runtime — skip
   [[ "${allowfrom:-0}" -ge 1 ]] || return 0        # unpaired — no human to deafen
   # An operator-stopped agent (desiredState=stopped) or a unit that isn't active
@@ -2352,6 +2352,26 @@ _hb_poller_verdict() {
   # there), not ours; alarming here too would just fuel alarm-blindness. Caller
   # passes supposed=0 for either condition.
   [[ "${supposed}" == "1" ]] || return 0
+  # DIVE-2384 restart grace. thresh carries the author's intent ("rides a
+  # restart") but a restart could never reach it: the plugin's shutdown() UNLINKS
+  # bot.heartbeat (telegram-pi/server.ts, telegram-codex/server.ts) and systemd
+  # still reports the unit ACTIVE across the bounce, so a tick landing in the
+  # unlink->first-bump gap fell into the mtime==0 branch below and returned
+  # BEFORE thresh was ever read. Beacon age cannot measure a beacon that does not
+  # exist — so grace on how long the UNIT has been active instead. Inside thresh
+  # seconds of ActiveEnterTimestamp the poller has not had a fair chance to bump,
+  # whether the beacon is absent (restart) or stale (rough kill left the file).
+  # A genuinely dead poller keeps its unit active well past thresh and still
+  # alarms, just one grace window later.
+  #
+  # uptime unresolvable (empty / non-numeric / clock skew) is NOT graced: the
+  # caller passes "" and we fall through to alarm. A broken probe degrades to
+  # the pre-fix behaviour and can never silently delete detection — the failure
+  # this canary guards (a deaf channel = gates unclearable from the phone) is
+  # real, so the safe default is a false alarm, not a missed death.
+  if [[ "$uptime" =~ ^[0-9]+$ ]] && (( uptime <= thresh )); then
+    return 0
+  fi
   if [[ -z "$mtime" || "$mtime" == "0" ]]; then
     echo "no beacon (poller never started)"; return 0
   fi
@@ -2365,7 +2385,7 @@ _hb_poller_liveness_sweep() {
   local now; now=$(date +%s)
   local thresh=120                                 # >> 3s beat; rides a restart/GC pause
   local -a dead=()
-  local name type allowfrom beacon mtime verdict
+  local name type allowfrom beacon mtime verdict uptime
   while IFS= read -r name; do
     [[ -n "$name" ]] || continue
     type=$(jq -r --arg n "$name" '.agents[$n].type // "claude"' <<<"$reg")
@@ -2383,7 +2403,21 @@ _hb_poller_liveness_sweep() {
       [[ "$desired" == "stopped" ]] && supposed=0
       (( supposed )) && ! systemctl is-active --quiet "5dive-agent@${name}.service" 2>/dev/null && supposed=0
     fi
-    verdict=$(_hb_poller_verdict "$type" "$mtime" "$now" "$allowfrom" "$thresh" "$supposed")
+    # DIVE-2384: seconds since the unit last entered ACTIVE, for the verdict's
+    # restart grace. Left EMPTY when unresolvable (no such unit, systemd
+    # unreachable, unparseable stamp, or a stamp in the future) — the verdict
+    # reads empty as "not in grace" and alarms, so a broken probe never mutes a
+    # real death.
+    local aet aet_epoch
+    uptime=""
+    if [[ "$type" == "claude" ]] && (( supposed )); then
+      aet=$(systemctl show -p ActiveEnterTimestamp --value "5dive-agent@${name}.service" 2>/dev/null)
+      if [[ -n "$aet" ]] && aet_epoch=$(date -d "$aet" +%s 2>/dev/null) \
+         && [[ "$aet_epoch" =~ ^[0-9]+$ ]] && (( aet_epoch <= now )); then
+        uptime=$(( now - aet_epoch ))
+      fi
+    fi
+    verdict=$(_hb_poller_verdict "$type" "$mtime" "$now" "$allowfrom" "$thresh" "$supposed" "$uptime")
     [[ -n "$verdict" ]] && dead+=("${name}: ${verdict}")
   done < <(jq -r '.agents | keys[]?' <<<"$reg")
 
@@ -2403,7 +2437,14 @@ _hb_poller_liveness_sweep() {
   : > "$flag" 2>/dev/null || true
   local coord; coord=$(_task_resolve_coordinator 2>/dev/null)
   if [[ -n "$coord" ]]; then
-    ( cmd_send "$coord" --message="🔴 Telegram poller DEAD on: ${dead[*]}. Gate-ping tap buttons still SEND but the human's TAP won't land (getUpdates slot not held) — those gates can't be cleared from the phone. Fix: restart the agent(s) (systemctl restart 5dive-agent@<name>.service) and check the DIVE-818 slot. (DIVE-1434 canary; re-pings hourly until healthy.)" ) >/dev/null 2>&1 || true
+    # The remedy must NOT say "restart the agent(s)" (DIVE-2384): a restart is the
+    # action that CREATES this condition — shutdown() unlinks the beacon — so
+    # anyone who believed the alarm and followed it re-armed it within seconds and
+    # wiped every agent's running context on each pass. Confirm first, restart the
+    # ONE agent only if the poller process is genuinely gone. DIVE-818 / DIVE-1434
+    # are provenance refs from code comments, NOT board rows — say so, or the
+    # reader looks them up and hits "no such task".
+    ( cmd_send "$coord" --message="🔴 Telegram poller DEAD on: ${dead[*]}. Gate-ping tap buttons still SEND but the human's TAP won't land (getUpdates slot not held) — those gates can't be cleared from the phone. CONFIRM BEFORE ACTING — do NOT blanket-restart: a restart deletes the beacon and re-arms this alarm. Check the named agent's channel dir: is bot.pid's process alive, and is bot.heartbeat's mtime advancing? Only if the poller is genuinely gone, restart THAT ONE agent (systemctl restart 5dive-agent@<name>.service). (Canary provenance — code refs, not board rows: DIVE-1434 canary, DIVE-818 single-getUpdates-slot incident, DIVE-2384 restart grace. Re-pings hourly until healthy.)" ) >/dev/null 2>&1 || true
   fi
   return 0
 }

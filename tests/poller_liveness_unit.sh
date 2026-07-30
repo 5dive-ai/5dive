@@ -75,5 +75,98 @@ check "stopped/inactive agent skipped" "" "$(_hb_poller_verdict claude $((NOW-99
 r=$(_hb_poller_verdict claude $((NOW-999)) "$NOW" 1 "$THRESH" 1); [[ -n "$r" ]] && r=DEAD || r=OK
 check "running agent still flagged dead" "DEAD" "$r"
 
+# ---------------------------------------------------------------------------
+# DIVE-2384: restart grace on UNIT uptime (7th param).
+#
+# The bug: the plugin's shutdown() UNLINKS bot.heartbeat, and systemd reports the
+# unit ACTIVE across a bounce, so a tick landing in the unlink->first-bump gap hit
+# case 4 above and returned "no beacon" WITHOUT ever reading thresh. The 120s
+# restart tolerance was unreachable on the path a restart actually takes.
+#
+# Both halves are graded below and BOTH are required. The cheap wrong fix is to
+# mute the missing-beacon branch, which silently deletes real detection and leaves
+# a canary that can never fire — case 21 is the half that forbids it.
+uv() { _hb_poller_verdict claude "$1" "$NOW" 1 "$THRESH" 1 "$2"; }   # mtime uptime
+dead_or_ok() { [[ -n "$1" ]] && printf DEAD || printf OK; }
+
+# 20. RESTART RACE — the reported defect. Beacon unlinked (mtime 0), unit active
+#     for 6s (measured: the fleet-wide fire ran 1s before the new pollers existed).
+#     -> NO verdict.
+check "restart race (no beacon, unit up 6s) not flagged" "" "$(uv 0 6)"
+
+# 21. GENUINELY DEAD poller — beacon absent and the unit has been active an hour.
+#     -> STILL alarms. Detection must survive the fix.
+check "no beacon on a long-active unit still flagged dead" "DEAD" "$(dead_or_ok "$(uv 0 3600)")"
+
+# 22/23. Grace boundary is thresh itself (<=, so 120 is graced, 121 is not) —
+#     the same constant the author wrote for riding a restart, now reachable.
+check "uptime AT thresh graced"          ""     "$(uv 0 "$THRESH")"
+check "uptime one past thresh flagged"   "DEAD" "$(dead_or_ok "$(uv 0 $((THRESH+1)))")"
+
+# 24/25/26. UNRESOLVABLE uptime is NOT graced. Empty (no such unit / systemd
+#     unreachable), non-numeric, and negative (clock skew) all fall through to the
+#     alarm, so a broken probe degrades to the pre-fix behaviour rather than
+#     silently muting the canary.
+check "empty uptime still flagged"       "DEAD" "$(dead_or_ok "$(uv 0 '')")"
+check "non-numeric uptime still flagged" "DEAD" "$(dead_or_ok "$(uv 0 'n/a')")"
+check "negative uptime still flagged"    "DEAD" "$(dead_or_ok "$(uv 0 -5)")"
+
+# 27/28. The grace is on the whole verdict, not just the missing-beacon branch: a
+#     rough kill (SIGKILL, no shutdown handler) leaves the file STALE instead of
+#     absent, which is the same race with a different symptom.
+check "stale beacon inside grace not flagged" "" "$(_hb_poller_verdict claude $((NOW-999)) "$NOW" 1 "$THRESH" 1 6)"
+check "stale beacon past grace still flagged" "DEAD" \
+  "$(dead_or_ok "$(_hb_poller_verdict claude $((NOW-999)) "$NOW" 1 "$THRESH" 1 3600)")"
+
+# 29. Back-compat: the 7th param is optional and its absence means "not graced",
+#     so any caller still passing 6 args behaves exactly as before.
+check "omitted uptime arg still flagged" "DEAD" "$(dead_or_ok "$(_hb_poller_verdict claude 0 "$NOW" 1 "$THRESH" 1)")"
+
+# ---------------------------------------------------------------------------
+# MUTATION ARM (DIVE-2384). Cases 20 and 27 assert an ABSENCE (empty output) and
+# those pass trivially — a verdict that returned early for any unrelated reason,
+# or a function that failed to eval at all, would satisfy them. So neutralize the
+# fix two ways and require the paired assertion to go RED. A mutation that changes
+# nothing is reported as a harness failure, not skipped.
+MUT_FAIL=0
+mut_check() { # desc expected actual
+  if [[ "$2" == "$3" ]]; then PASS=$((PASS+1)); else FAIL=$((FAIL+1)); MUT_FAIL=1
+    printf 'FAIL (mutation): %s\n  expected: [%s]\n  actual:   [%s]\n' "$1" "$2" "$3"; fi
+}
+DEF=$(awk '/^_hb_poller_verdict\(\) \{/,/^\}/' "$SRC/cmd_heartbeat.sh")
+if [[ -z "$DEF" ]]; then
+  printf 'FAIL (mutation): could not extract _hb_poller_verdict from %s/cmd_heartbeat.sh\n' "$SRC"
+  FAIL=$((FAIL+1)); MUT_FAIL=1
+fi
+# Run <mutated-source> against args in a subshell, under a different name so the
+# real definition above is never clobbered.
+run_mut() { local d="$1"; shift; ( eval "$(sed 's/^_hb_poller_verdict() {/_mut() {/' <<<"$d")"; _mut "$@" ); }
+
+# Mutation A — REVERT the fix: make the grace window unreachable. Case 20 (the
+# restart race) must come back DEAD. This proves the grace guard is what silences
+# it, not some unrelated early return.
+MUT_A=$(sed 's/(( uptime <= thresh ))/(( uptime <= -1 ))/' <<<"$DEF")
+mut_check "mutation A landed (grace neutralized)" "changed" \
+  "$([[ "$MUT_A" != "$DEF" ]] && printf changed || printf UNCHANGED)"
+mut_check "mutation A: restart race goes RED" "DEAD" "$(dead_or_ok "$(run_mut "$MUT_A" claude 0 "$NOW" 1 "$THRESH" 1 6)")"
+# ...and A must NOT disturb the detection half, or it is not a targeted mutation.
+mut_check "mutation A: real death still detected" "DEAD" "$(dead_or_ok "$(run_mut "$MUT_A" claude 0 "$NOW" 1 "$THRESH" 1 3600)")"
+
+# Mutation B — the CHEAP WRONG FIX: mute the missing-beacon branch outright. Case
+# 21 (a genuinely dead poller) must come back OK. This is the whole risk of this
+# change: if B fails to flip, the canary can no longer fire at all and the real
+# failure it guards — a deaf channel, gates unclearable from the phone — goes
+# unwatched.
+MUT_B=$(sed 's/echo "no beacon (poller never started)"/:/' <<<"$DEF")
+mut_check "mutation B landed (detection deleted)" "changed" \
+  "$([[ "$MUT_B" != "$DEF" ]] && printf changed || printf UNCHANGED)"
+mut_check "mutation B: real death goes RED (undetected)" "OK" "$(dead_or_ok "$(run_mut "$MUT_B" claude 0 "$NOW" 1 "$THRESH" 1 3600)")"
+# ...and B must leave the restart race silent, so the two mutations are distinct.
+mut_check "mutation B: restart race still silent" "OK" "$(dead_or_ok "$(run_mut "$MUT_B" claude 0 "$NOW" 1 "$THRESH" 1 6)")"
+
+if (( MUT_FAIL )); then
+  printf '\nMUTATION ARM FAILED — the green above is NOT evidence.\n'
+fi
+
 printf '\npoller-liveness unit: %d passed, %d failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]
