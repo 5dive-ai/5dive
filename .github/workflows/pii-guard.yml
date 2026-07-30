@@ -23,21 +23,35 @@ jobs:
           PR_BODY: ${{ github.event.pull_request.body }}
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          # DIVE-2267: the push path needs a range anchor. Passed through env
+          # rather than interpolated into the run body, matching PR_TITLE above --
+          # a bare ${{ }} expansion inside `run:` is a script-injection site.
+          PUSH_BEFORE: ${{ github.event.before }}
         run: |
           rc=0
-          scan() { bash scripts/pii-scan.sh || rc=1; }
 
-          # 1. PR title + body
           if [ -n "${HEAD_SHA:-}" ]; then
+            # 1. PR title + body
             printf '%s\n%s\n' "$PR_TITLE" "$PR_BODY" | bash scripts/pii-scan.sh || rc=1
-            # 2. commit messages in the PR range
-            git log --format='%B' "$BASE_SHA..$HEAD_SHA" | bash scripts/pii-scan.sh || rc=1
-            # 3. added lines of the diff only (drop +++ file headers)
-            git diff "$BASE_SHA..$HEAD_SHA" | grep -E '^\+' | grep -vE '^\+\+\+' \
-              | sed 's/^+//' | bash scripts/pii-scan.sh || rc=1
+            # 2 + 3. commit messages AND the added lines of the diff, across the
+            # PR range. Moved into pii-scan-range.sh so the same code serves both
+            # paths: inline, a failing `git log`/`git diff` left rc at 0 because
+            # this step does not set pipefail and the scanner sat at the end of
+            # the pipe, so the pipeline reported the verdict of a scan of nothing.
+            bash scripts/pii-scan-range.sh "$BASE_SHA" "$HEAD_SHA" || rc=1
           else
-            # push to main: scan the head commit message
-            git log -1 --format='%B' | bash scripts/pii-scan.sh || rc=1
+            # PUSH TO MAIN (DIVE-2267). This was `git log -1 --format='%B'` and
+            # NOTHING else: content was never scanned on this path, so a
+            # denylisted id in an added line reached public main with a green
+            # pii-guard. The pre-push hook that does scan content is per-checkout
+            # and absent from a fresh clone (DIVE-2255) -- which is the route
+            # admin and bot pushes actually take -- so neither side looked.
+            #
+            # pii-scan-range.sh scans the pushed CONTENT and fails CLOSED when it
+            # cannot (DIVE-2264): an unusable `before` narrows to the head commit
+            # and says so, and no path there reports clean without reading
+            # content.
+            bash scripts/pii-scan-range.sh "$PUSH_BEFORE" HEAD || rc=1
           fi
 
           # 4. release-notes gate (always)
