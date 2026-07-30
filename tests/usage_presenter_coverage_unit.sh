@@ -214,5 +214,48 @@ OUT="$(run_digest "$TMP/u_full.json")"
   && ok_t "digest: a COMPLETE read still gets the plain healthy line (no new noise)" \
   || bad_t "digest complete read" "$OUT"
 
+
+# --- DIVE-2312: an UNVERIFIED value must not render as a bare, liftable number ---
+# The ⚠ on the ident was not enough: three readers in a row lifted a flagged figure
+# as fact, one of them the author of the warning note. A caveat cannot make a reader
+# read it, so the qualification has to travel WITH the value when the cell is copied.
+# EXTRACT THE SHIPPED BLOCK VERBATIM — do not re-implement it here. My first version
+# of this harness carried its own copy of the jq and scored 30/0 with the ? suffix
+# DELETED FROM src/: it graded a copy, so it could not fail. Same pattern
+# release_cut_assign_unit.sh uses for the workflow.
+_P2312_SRC=$(sed -n '/(\.tasks | sort_by(-\.total)\[:12\]\[\] |/,/| @tsv)/p' src/cmd_usage.sh)
+grep -q 'sort_by(-.total)' <<<"$_P2312_SRC" \
+  || { echo "FATAL: could not extract the TOP TASKS row block from src/cmd_usage.sh — refusing to grade a copy" >&2; exit 2; }
+_p2312() {
+  jq -r "$USAGE_JQ_HELPERS"'
+    (["TASK","AGENT","ITER","OUTPUT","TOTAL","TITLE"] | @tsv),
+    '"$_P2312_SRC" <<<"$1"
+}
+_FX2312='{"tasks":[
+  {"ident":"DIVE-90101","assignee":"main","iteration":0,"output":37500000,"total":40000000,"title":"unverified row","dispatched":false},
+  {"ident":"DIVE-90102","assignee":"main","iteration":0,"output":253000,"total":300000,"title":"verified row","dispatched":true},
+  {"ident":"DIVE-90103","assignee":"main","iteration":0,"output":1000,"total":2000,"title":"unknown row","dispatched":null}]}'
+_out2312=$(_p2312 "$_FX2312")
+
+grep -q '37.5M?' <<<"$_out2312" \
+  && ok_t "DIVE-2312: an unverified OUTPUT renders as 37.5M? — the mark travels with the value" \
+  || bad_t "DIVE-2312: unverified OUTPUT must carry the ? suffix" "$_out2312"
+grep -q '40M?' <<<"$_out2312" \
+  && ok_t "DIVE-2312: the unverified TOTAL is qualified too, not just OUTPUT" \
+  || bad_t "DIVE-2312: unverified TOTAL must carry the ? suffix" "$_out2312"
+# The control that makes the two arms above non-vacuous: a VERIFIED row must stay clean.
+# Without it, appending ? unconditionally would score green on both.
+if grep -q 'DIVE-90102' <<<"$_out2312" && ! grep 'DIVE-90102' <<<"$_out2312" | grep -q '?'; then
+  ok_t "DIVE-2312 CONTROL: a dispatched=true row carries NO ?, so the mark is not unconditional"
+else
+  bad_t "DIVE-2312 CONTROL: verified row must render a bare number" "$(grep 'DIVE-90102' <<<"$_out2312")"
+fi
+# dispatched=null is UNKNOWN, not accused — same three-state rule DIVE-2058 established.
+if grep 'DIVE-90103' <<<"$_out2312" | grep -q '?'; then
+  bad_t "DIVE-2312: dispatched=null must NOT be marked unverified (unknown is not a negative)" "$(grep 'DIVE-90103' <<<"$_out2312")"
+else
+  ok_t "DIVE-2312: dispatched=null renders unqualified — unknown is not accused"
+fi
+
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]

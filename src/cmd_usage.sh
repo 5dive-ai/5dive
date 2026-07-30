@@ -519,19 +519,44 @@ usage_render_board() {
     else
       (["TASK","AGENT","ITER","OUTPUT","TOTAL","TITLE"] | @tsv),
       (.tasks | sort_by(-.total)[:12][] |
-        [ (.ident + (if .dispatched == false then " ⚠" else "" end)), .assignee,
+        (.dispatched == false) as $unver |
+        [ (.ident + (if $unver then " ⚠" else "" end)), .assignee,
           (if (.iteration // 0) > 0 then (.iteration|tostring) else "-" end),
-          (.output|htok), (.total|htok),
+          ((.output|htok) + (if $unver then "?" else "" end)),
+          ((.total|htok)  + (if $unver then "?" else "" end)),
           (.title | if length > 42 then .[:41] + "…" else . end) ] | @tsv)
     end' <<<"$data" | column -t -s $'\t' | sed 's/^/  /'
 
   # DIVE-2058: rows with dispatched==false attribute tokens to a task with no
   # /goal dispatch found in its window — flag rather than let a misattributed
   # number stand unqualified (the DIVE-1817 13.8M incident).
-  local flagged
-  flagged=$(jq -r '[.tasks[] | select(.dispatched == false)] | length' <<<"$data" 2>/dev/null)
+  #
+  # DIVE-2312: the ⚠ on the IDENT was not enough, and the evidence is unusually
+  # strong — THREE readers in a row lifted a flagged figure as fact, one of them
+  # the author of the note warning about it, and one inference built on a lifted
+  # 37.5M reached a live cost decision. The marker rendered correctly every time.
+  # A caveat cannot make a reader read it, so a better caveat is not the fix.
+  # The number itself now carries a `?` suffix, so the uncertainty TRAVELS WITH
+  # THE VALUE when someone copies the cell out of the table — which is the only
+  # place the qualification survives a quote. `?` and not `~`: a tilde reads as
+  # ordinary rounding, which htok already does, and would weaken the signal.
+  #
+  # AND COUNT WHAT IS ACTUALLY ABOVE. This said "N row(s) above" while counting
+  # every flagged task in the window, not the 12 the table renders — live read
+  # 2026-07-30: "13 row(s) above" printed under a table showing 3. A reader who
+  # counts is misled by the very sentence warning them not to trust a number,
+  # which is this ticket's own defect one line lower. Count within the slice and
+  # report the remainder separately.
+  local flagged flagged_total hidden
+  flagged=$(jq -r '[.tasks | sort_by(-.total)[:12][] | select(.dispatched == false)] | length' <<<"$data" 2>/dev/null)
+  flagged_total=$(jq -r '[.tasks[] | select(.dispatched == false)] | length' <<<"$data" 2>/dev/null)
+  hidden=$(( ${flagged_total:-0} - ${flagged:-0} ))
   if [[ "${flagged:-0}" -gt 0 ]]; then
     echo "  ⚠ ${flagged} row(s) above show tokens attributed to a task with no /goal dispatch found in its window — likely misattributed, treat as unverified (see DIVE-2058)."
+    echo "     Their OUTPUT/TOTAL are printed with a trailing \`?\` (e.g. 37.5M?) — that mark is part of the value. Do not quote one of these figures without it (DIVE-2312)."
+    [[ "$hidden" -gt 0 ]] && echo "     ${hidden} further flagged row(s) fall outside this top-12 and are not shown."
+  elif [[ "${flagged_total:-0}" -gt 0 ]]; then
+    echo "  ⚠ ${flagged_total} flagged row(s) exist in this window but none are in the top 12 shown above (DIVE-2058)."
   fi
 
   # over-budget callout: ⚠ at the soft cap, ⛔ at the ceiling (see `5dive cost`).
