@@ -39,10 +39,16 @@
 #   - Calls scripts/pii-scan.sh, scripts/version-bump-guard.sh and
 #     scripts/harness-tree-guard.sh DIRECTLY. No forked scan logic here, so
 #     none can drift from its CI/README twin (DIVE-1797 requirement c;
-#     scripts/version-uniqueness-scan.sh is the version-bump guard's own
-#     CI-side twin, see bundle-drift.yml; tests/names_the_tree_contract_unit.sh
-#     is the harness-tree guard's, over the whole corpus rather than just the
-#     push's added files).
+#     tests/names_the_tree_contract_unit.sh is the harness-tree guard's, over
+#     the whole corpus rather than just the push's added files).
+#     DIVE-2247: the version-bump guard no longer HAS a CI-side twin, and is
+#     itself inert. Its rule is "if the bundle moved, FIVE_VERSION must move";
+#     the bundle is not tracked on main (DIVE-2091) and FIVE_VERSION is now
+#     assigned at tag time onto the release commit, so main's header never
+#     moves and the guard's trigger cannot fire. Left wired deliberately —
+#     it fails closed if a bundle is ever committed to main again — but do
+#     NOT read its advice as current: nothing should bump FIVE_VERSION by
+#     hand any more (see CONTRIBUTING).
 #   - Installed fleet-wide via core.hooksPath=scripts/git-hooks, set once on the
 #     shared clone config so every linked worktree (and every future one)
 #     inherits it. See scripts/install-pii-push-guard.sh.
@@ -131,7 +137,7 @@ if [[ $rc -ne 0 ]]; then
   echo "" >&2
   echo "pre-push: BLOCKED — see the specific guard message(s) above." >&2
   echo "  pii-push-guard: scrub the real id/email/phone (use placeholders like <user-id>, 1234567890) and re-commit." >&2
-  echo "  version-bump-guard: bump FIVE_VERSION in src/header.sh, rebuild with ./build.sh, and recommit." >&2
+  echo "  version-bump-guard: this should be unreachable since DIVE-2247 — the bundle is not tracked on main and FIVE_VERSION is assigned at tag time. If you are seeing this, a bundle has been committed to main; remove it rather than bumping the version by hand." >&2
   echo "  harness-tree-guard: paste the printed source-line snippet into the named harness and recommit." >&2
   echo "  Emergency override (discouraged; the matching CI job is still the net): git push --no-verify" >&2
   exit 1

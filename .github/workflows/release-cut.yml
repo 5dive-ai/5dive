@@ -15,9 +15,15 @@
 # ASSERTS the result actually sorts above the incumbent rather than trusting that it
 # does. That assertion is the one that catches a divergence between the two copies.
 #
-# WHAT THIS JOB DOES NOT DO: it does not bump FIVE_VERSION. version-assign.yml owns
-# the bump at merge; this job only publishes a version that already exists on main.
-# The two must not both write versions or they will race for the same number.
+# WHAT THIS JOB NOW ALSO DOES (DIVE-2247): it ASSIGNS FIVE_VERSION. It used not to —
+# version-assign.yml owned the bump at merge and this job only published a version
+# that already existed on main. That merge-time push targets a PROTECTED branch under
+# github.token, which branch protection rejects and no retry can repair, so from 07-27
+# to 07-30 the bot assigned nothing and eight versions were assigned by hand. Moving
+# the assignment here removes the protected-main push instead of buying a credential
+# that can defeat protection. version-assign.yml is retired; this job is now the ONLY
+# writer of a version anywhere in the repo, which is also what retires the collision
+# race it used to be possible to lose (see the derivation block below).
 name: release-cut
 on:
   schedule:
@@ -55,13 +61,6 @@ jobs:
           set -uo pipefail
 
           sha=$(git rev-parse HEAD)
-          version=$(grep -m1 -oE 'FIVE_VERSION="[^"]+"' src/header.sh | sed 's/.*"\(.*\)"/\1/')
-          if [[ -z "$version" ]]; then
-            echo "::error::could not read FIVE_VERSION from src/header.sh on main — refusing to cut."
-            exit 1
-          fi
-          tag="v${version}"
-          echo "main tip ${sha:0:12} carries FIVE_VERSION=${version} -> candidate tag ${tag}"
 
           # --- the incumbent, resolved by install.sh's OWN rule -------------------
           # Same filter and same `sort -V` as resolve_gh_tag(). If these two ever
@@ -70,20 +69,76 @@ jobs:
           incumbent=$(git tag -l | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1)
           echo "incumbent published tag (install.sh's rule): ${incumbent:-<none>}"
 
-          # --- has main actually moved? ------------------------------------------
-          if git rev-parse -q --verify "refs/tags/${tag}" >/dev/null; then
-            existing=$(git rev-list -n1 "refs/tags/${tag}")
-            if [[ "$existing" == "$sha" ]]; then
-              echo "::notice::${tag} already points at main's tip ${sha:0:12} — main has not moved since the last cut. Nothing to publish."
-              exit 0
-            fi
-            # A version published against one tree and now claimed by another is the
-            # DIVE-2118 failure class. Never move a published tag: boxes that already
-            # took it would silently receive different bytes under a version they
-            # already have, and nothing downstream would ever ask again.
-            echo "::error::${tag} EXISTS at ${existing:0:12} but main's tip is ${sha:0:12}. A published version is being claimed by a second tree. NOT re-pointing the tag. Bump FIVE_VERSION on main (scripts/version-assign.sh) so the new tree gets its own version."
+          # >>> DIVE-2247 cut-time version derivation
+          #     (extracted verbatim by tests/release_cut_assign_unit.sh — keep the fences.)
+          # WHY THE VERSION IS NO LONGER READ OFF MAIN. It used to be: main carried
+          # FIVE_VERSION, version-assign.yml bumped it on every merge, and this job
+          # read it. That push is to a PROTECTED branch under github.token, which
+          # branch protection rejects and no retry can fix (DIVE-2247) — so between
+          # 07-27 and 07-30 EIGHT versions were assigned by hand and the bot assigned
+          # none. The fix is not a credential that can defeat protection; it is to
+          # stop needing the push. Nothing writes a version to main any more. main's
+          # header carries the 0.0.0-dev SENTINEL and this job assigns the real one
+          # onto the detached release commit, below, before build.sh runs.
+          #
+          # THE COLLISION INVARIANT SURVIVES BY CONSTRUCTION, not by a detector. Two
+          # bundles could claim one version (DIVE-2118) because assignment had many
+          # racing writers on a shared branch. Here there is exactly ONE writer, it
+          # runs once per cut, and it derives strictly upward from refs that already
+          # exist. version-uniqueness was the post-hoc detector for that race; the
+          # race is gone, so it goes with it rather than being relaxed (the DIVE-2185
+          # rule: delete the hazard at the source rather than surrender the guard).
+          #
+          # THE FLOOR IS NOT DECORATION. Deriving purely from the newest TAG would
+          # cut v0.17.2 next — and 0.17.2 through 0.17.8 were already assigned BY HAND
+          # on main against different trees, one of which is installed on a live box.
+          # Re-issuing one of those numbers is the exact DIVE-2118 failure it looks
+          # like it avoids. .release-floor records that high-water mark once, at the
+          # transition; after the first cut clears it the file is inert history and is
+          # never edited again. Read it, never write it.
+          floor=$(tr -d '[:space:]' < .release-floor 2>/dev/null) || floor=""
+          if [[ ! "$floor" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::.release-floor is missing or is not MAJOR.MINOR.PATCH (read '${floor}') — refusing to cut. The floor is the only thing between a fresh cut and a version already claimed by a different tree, so an unreadable floor is not a reason to guess (DIVE-2247)."
             exit 1
           fi
+          base=$(printf '%s\n%s\n' "$floor" "${incumbent#v}" | sort -V | tail -1)
+          if [[ ! "$base" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+            echo "::error::could not derive a successor from floor='${floor}' incumbent='${incumbent}' — refusing to cut."
+            exit 1
+          fi
+          version="${BASH_REMATCH[1]}.${BASH_REMATCH[2]}.$(( BASH_REMATCH[3] + 1 ))"
+          tag="v${version}"
+          echo "cut-time assignment: floor ${floor}, incumbent ${incumbent:-<none>} -> ${tag} (DIVE-2247)"
+
+          # A derived version that ALREADY EXISTS as a tag means the derivation is
+          # wrong, not that the cut should proceed — assert rather than assume, because
+          # every later guard here is about the bundle, not about the number.
+          if git rev-parse -q --verify "refs/tags/${tag}" >/dev/null; then
+            echo "::error::${tag} already exists but was just derived as the NEXT version. The floor/incumbent derivation is broken — refusing to cut rather than re-point a published tag (DIVE-2118)."
+            exit 1
+          fi
+          # <<< DIVE-2247 cut-time version derivation
+
+          # --- has main actually moved? ------------------------------------------
+          # The tag no longer answers this: every cut mints a NEW version, so a tag
+          # equal to main's tip can never exist. What the incumbent tag does carry is
+          # its release commit's PARENT — the main sha it was cut from. That is the
+          # comparand, and it is the same question as before ("is there anything new
+          # to publish?") asked of a ref that still moves.
+          # >>> DIVE-2247 main-moved check
+          #     (extracted verbatim by tests/release_cut_assign_unit.sh — keep the fences.)
+          # Getting this wrong in the permissive direction is expensive and quiet: the
+          # cut would mint a NEW version every night on an unchanged main, burning a
+          # number per night and republishing identical bytes under each. So the arm
+          # that matters is the one asserting it DOES stop.
+          if [[ -n "$incumbent" ]]; then
+            cut_from=$(git rev-parse -q --verify "refs/tags/${incumbent}^{commit}^" 2>/dev/null || true)
+            if [[ -n "$cut_from" && "$cut_from" == "$sha" ]]; then
+              echo "::notice::${incumbent} was cut from main's current tip ${sha:0:12} — main has not moved since the last cut. Nothing to publish."
+              exit 0
+            fi
+          fi
+          # <<< DIVE-2247 main-moved check
 
           # --- CI verdict on THAT EXACT SHA, and it must be non-vacuous ----------
           # "no failing checks" is satisfied by "no checks at all", which is exactly
@@ -181,6 +236,16 @@ jobs:
           # the asserts below run BEFORE the tag exists, and any of them aborts the
           # cut rather than producing a tag we would have to delete.
           git checkout -q --detach "$sha"
+          # DIVE-2247: ASSIGN THE VERSION HERE, and it must be BEFORE build.sh.
+          # build.sh copies src/header.sh into the bundle, and the assert further down
+          # refuses to publish a bundle whose FIVE_VERSION disagrees with its tag. So
+          # the ordering is not stylistic: bump after build and every cut fails that
+          # assert; bump before build and the assert holds by construction. This write
+          # lands ONLY on the detached release commit — main is never pushed to, which
+          # is the whole of DIVE-2247.
+          sed -i -E "s/^readonly FIVE_VERSION=\"[^\"]+\"/readonly FIVE_VERSION=\"${version}\"/" src/header.sh
+          [ "$(grep -m1 -oE '^readonly FIVE_VERSION="[^"]+"' src/header.sh)" = "readonly FIVE_VERSION=\"${version}\"" ] \
+            || { echo "::error::could not write FIVE_VERSION=${version} into src/header.sh (the 'readonly FIVE_VERSION=' anchor drifted?) — refusing to cut ${tag} rather than publish the sentinel"; exit 1; }
           ./build.sh || { echo "::error::build.sh failed — refusing to cut ${tag} with no bundle"; exit 1; }
           [ -s 5dive ] && [ -s 5dive.sha256 ] \
             || { echo "::error::build.sh produced no bundle/checksum — refusing to cut ${tag}"; exit 1; }
@@ -193,9 +258,9 @@ jobs:
           _bundle_ver=$(grep -m1 -oP "(?<=^readonly FIVE_VERSION=\")[^\"]+" 5dive)
           [ "v${_bundle_ver}" = "$tag" ] \
             || { echo "::error::built bundle says FIVE_VERSION=${_bundle_ver} but this cut is ${tag} — refusing to publish a bundle that disagrees with its own tag"; exit 1; }
-          git add -f 5dive 5dive.sha256
+          git add -f 5dive 5dive.sha256 src/header.sh
           git -c user.name=lodar -c user.email=markounik@gmail.com \
-              commit -q -m "release ${tag}: built bundle (DIVE-2091 — generated at tag time, not carried on main)"
+              commit -q -m "release ${tag}: assign ${version} + built bundle (DIVE-2091 bundle-at-tag-time, DIVE-2247 version-at-tag-time)"
           sha=$(git rev-parse HEAD)
           # Prove the TREE BEING TAGGED carries what install.sh will fetch — read it
           # back out of the object store rather than trusting the working tree.

@@ -140,14 +140,18 @@ caught.
   on the *why* if it isn't obvious.
 - No `--no-verify` on commits — CI runs the same checks anyway, you'll
   just learn about the failure later.
-- Don't bump the version in your PR. `FIVE_VERSION` is bumped at release
-  time, not per-merge. Still rebuild the bundle (`bash build.sh`) and commit
-  it — `bundle-drift` CI checks `bundle == build(src)`, which is unaffected
-  by the version; only `version-bump-guard` cares about `FIVE_VERSION`, and
-  it fires solely on a push to `refs/heads/main`, never on a branch/PR. So a
-  PR with a rebuilt-but-unbumped bundle is exactly what both checks want —
-  don't reach for a version bump to placate `bundle-drift`, it isn't asking
-  for one.
+- Never bump the version — not in your PR, and not on `main` either. Since
+  DIVE-2247 `FIVE_VERSION` is assigned at **tag time**, by `release-cut.yml`,
+  onto the release commit it builds. `main` carries the sentinel
+  `0.0.0-dev` and no branch ever carries a real version. This replaced
+  assignment-at-merge, which needed a bot push to protected `main` that
+  branch protection rejects — so for three days every version was assigned by
+  hand. If you find yourself editing `FIVE_VERSION`, something is wrong;
+  nothing outside `release-cut.yml` should write it.
+- You also don't commit the bundle. `5dive` and `5dive.sha256` are generated
+  at tag time (DIVE-2091) and are not tracked on `main`; `bundle-drift` CI
+  checks that `build.sh` is reproducible from `src/`, not that a committed
+  bundle matches.
 
 ## Reporting bugs / requesting features
 
