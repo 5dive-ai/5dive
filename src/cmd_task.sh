@@ -4689,31 +4689,41 @@ cmd_task_need() {
     [[ -n "$w_type" ]] || fail "$E_CONFLICT" "$ident has no gate to withdraw"
     [[ -z "$w_ans" ]]  || fail "$E_CONFLICT" "$ident's gate is already answered — --withdraw only applies to a still-pending gate (need_answered_at IS NULL)"
     # Authorize on the TRUSTED caller identity from _gate_withdraw_actor (EUID-gated
-    # SUDO_* or the real id -un — see its comment), NEVER on --from. The gate's filer
-    # is its assignee of record; the filer's routed lead / org coordinator may also
-    # withdraw, as may a genuine human. An agent that is none of these is refused.
-    local w_filer w_id w_kind w_name="" w_lead w_coord w_ok=0 w_by w_who
-    w_filer=$(db "SELECT COALESCE(assignee,'') FROM tasks WHERE id=${id};")
-    # DIVE-2382: the ORIGINAL filer-of-record, for the refusal text ONLY — this change
-    # does NOT move authorization. The old refusal called the assignee "the gate's filer",
-    # which on a handed-off or auto-created row names as filer someone who never filed it.
-    # Name both, and say which one authorizes.
+    # SUDO_* or the real id -un — see its comment), NEVER on --from. The gate's FILER OF
+    # RECORD, their routed lead, or the org coordinator may withdraw, as may a genuine
+    # human. An agent that is none of these is refused.
     #
-    # WHOSE ASK IT IS AND WHO MAY WITHDRAW IT ARE STILL DIFFERENT ANSWERS HERE, and that
-    # is an OPEN question, not a settled one — do not read the text below as ratifying it.
-    # gate_filed_by exists (DIVE-1945) precisely because assignee is not a reliable record
-    # of whose ask a gate is: per its own schema comment, "assignee is rewritten to the
-    # filer only on the human lane, so a gate one agent files on another's task had no
-    # record of whose ask it is". Every other reader honours that (:2857, :6127, the
-    # heartbeat's T1 routing); this site does not, so an agent who filed a gate on someone
-    # else's task cannot withdraw their own ask while the holder can. Latent today (the
-    # live rows where they differ are all answered, and --withdraw refuses an answered
-    # gate). Widening authorization is a policy call and is deliberately NOT bundled into
-    # this text fix — see community/wiki/a-refusal-that-names-a-smaller-set-than-the-code-checked.md.
-    w_by=$(db "SELECT COALESCE(NULLIF(gate_filed_by,''),NULLIF(created_by,''),'') FROM tasks WHERE id=${id};")
+    # DIVE-2382 (approved by olivia as org coordinator; main ruled the shape): this site
+    # used to authorize on COALESCE(assignee,'') — the HOLDER. That was the bigger half of
+    # the defect this ticket was filed about, and it was wrong in BOTH directions at once:
+    #   under-permissive — an agent who files a gate on someone else's task could not
+    #                      withdraw their OWN ask (DIVE-2015: gate_filed_by=codex,
+    #                      assignee=main, so main could and codex could not);
+    #   over-permissive  — a reassigned holder could retire a question they never asked,
+    #                      which is precisely the DIVE-2133 shape.
+    # A fifth authorizer would have fixed only the first, so this REPLACES the principal.
+    #
+    # THE SHAPE IS DELIBERATELY STRICTER THAN :6154's, which is the one amendment olivia
+    # made to the proposal. :6154 (display/routing) ends its COALESCE on `assignee`;
+    # authorizing on that would silently RE-ADMIT the reassigned-holder route in exactly
+    # the state where both other columns are empty — the route we are removing. So the
+    # authorization site stops at created_by. Two shapes for two jobs, deliberately: the
+    # display readers keep their assignee rung, and what this ticket retires is THREE
+    # shapes for ONE job. Authorizer-existence does not rest on that rung anyway —
+    # conditions 1 (human) and 4 (coordinator) never consult the filer at all, probed
+    # against an all-columns-empty row.
+    local w_filer w_id w_kind w_name="" w_lead w_coord w_ok=0 w_holder w_who
+    w_filer=$(db "SELECT COALESCE(NULLIF(gate_filed_by,''),NULLIF(created_by,''),'') FROM tasks WHERE id=${id};")
+    # The HOLDER, for the refusal text only — it no longer authorizes anything. Named
+    # when it differs so a refused holder learns why, rather than reading a list that
+    # simply omits them.
+    w_holder=$(db "SELECT COALESCE(assignee,'') FROM tasks WHERE id=${id};")
     w_id=$(_gate_withdraw_actor)                          # "agent <name>" | "human" | "none"
     w_kind="${w_id%% *}"
     [[ "$w_kind" == "agent" ]] && w_name="${w_id#agent }"
+    # The lead route follows the PRINCIPAL, so it moves with it: condition 3 is "the
+    # filer's lead", and resolving it from the holder would leave a second copy of the
+    # same defect one rung up.
     w_lead=$(_gate_route_reviewer "$w_filer")
     w_coord=$(_task_resolve_coordinator)
     [[ "$w_kind" == "human" ]] && w_ok=1                                    # a genuine human caller
@@ -4728,8 +4738,13 @@ cmd_task_need() {
     # retired; both were wrong, and that is the mechanism behind the stale-gate class.
     # Unresolvable conditions render as "none" rather than vanishing, so a reader can
     # tell "this route does not exist here" from "this route was never offered".
-    w_who="the gate's holder (assignee ${w_filer:-?})"
-    [[ -n "$w_by" && "$w_by" != "$w_filer" ]] && w_who+=" — filed by ${w_by}, but withdraw authorizes on the HOLDER, not the filer"
+    # DIVE-2382: "unrecorded" rather than "?" — the placeholder shipped in the first pass
+    # and reads as a rendering bug rather than as a fact about the row (olivia approved
+    # the swap in the same pass). An empty principal is reachable by CONFIGURATION, not by
+    # data: created_by is nullable, so a row with neither column set resolves to nothing,
+    # and the reader needs to see that as a stated absence.
+    w_who="the gate's filer (${w_filer:-unrecorded})"
+    [[ -n "$w_holder" && "$w_holder" != "$w_filer" ]] && w_who+=" — held by ${w_holder}, who does NOT authorize a withdraw since they did not file it"
     (( w_ok )) || policy_refuse "$E_AUTH_REQUIRED" gate-withdraw-not-authorized DIVE-1401 "$ident" "only ${w_who}, their lead (${w_lead:-none}), the org coordinator (${w_coord:-none}), or a human can withdraw $ident's gate"
     # Clear every gate field and unblock back to todo when no dependency edge
     # still holds it. The withdrawn gate is archived to gate_history first, in
