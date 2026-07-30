@@ -1584,6 +1584,12 @@ cmd_send() {
 
   require_agent "$name"
   local woken=0
+  # Reset at entry, like AGENT_WAKE_FAIL_REASON and AGENT_WAKE_ELAPSED do in
+  # agent_wake_for_send. Today cmd_send has exactly one in-process caller (main.sh's
+  # dispatch), so a stale value cannot be reached — but `ready` is a claim about what
+  # this send PROVED, and a claim carried over from a previous call is a false one.
+  # That is the defect class this ticket is about; do not leave it to a call-count.
+  AGENT_WAKE_READY=""
   if ! sudo -u "agent-${name}" tmux has-session -t "agent-${name}" 2>/dev/null; then
     # DIVE-2385: default behaviour is unchanged — same code, same message, same
     # sub-second latency that _task_need_route_deliver's rc poll depends on.
