@@ -7528,6 +7528,14 @@ cmd_task_answer() {
   fi
   (( _cp_ok )) && human=1
 
+  # DIVE-2406: the two PER-GATE human-evidence forms (valid nonce, non-agent
+  # SUDO_UID) are computed inside the hard-gate block below, but the provenance
+  # stamp near the end of this function needs them too — a `--human` claim with
+  # no evidence behind it must not be labelled `human:*`. Declared at function
+  # scope so that stamp reads an initialized 0 on the gate types that never enter
+  # that block, rather than an unset variable. Values are still set there, once.
+  local _hp=0 _su=0
+
   # DIVE-394: approval/secret are HUMAN-ONLY gates. Reject answers that come from
   # an agent acting as itself — that's the DIVE-391 incident, where an Olivia
   # endorsement (running as agent-<name>) silently cleared a human approval gate.
@@ -7711,7 +7719,7 @@ cmd_task_answer() {
     # raised the bar no higher than the sudo it already required. This still
     # supersedes the DIVE-519 "proof OR bare --human" rule: a bare --human is NOT
     # sufficient — that was the sudo→--human forge (DIVE-916 threat).
-    local _hp=0 _su=0
+    # (_hp/_su declared at function scope above — DIVE-2406 reads them at the stamp.)
     [[ -n "$human_proof" ]] && _human_nonce_verify "$id" "$human_proof" && _hp=1
     _gate_sudo_uid_nonagent && _su=1
     # DIVE-1305: a verified paired-human channel proof is the fourth evidence
@@ -7877,6 +7885,43 @@ cmd_task_answer() {
   # DIVE-394 provenance: record WHO answered. `human:` prefix when a trusted path
   # passed --human; otherwise the resolved actor label.
   local answered_by; answered_by=$(task_actor "$from")
+  # DIVE-2406: `--human` is a SELF-ASSERTED flag — it is argv and nothing more. On
+  # a lead-clearable gate it is the label, never the authority: the DIVE-1182/1243
+  # routed lead-clear (or the DIVE-2099 standing clear) is what authorized the
+  # answer, and that is an AGENT clear by construction. Before this, a lead who
+  # also passed --human was stamped `human:<lead>` — and the `(( ! human ))`
+  # guards just below, written on the assumption that human=1 meant a real human,
+  # suppressed the honest `lead:` label that was already sitting right there.
+  #
+  # DIVE-2400 is the live case, and the cost was not cosmetic: the row read
+  # `answered_by=human:marketing` with channel_proof absent, nonce_valid=0 and
+  # sudo_nonagent=0 — every evidence form of a human absent — and the task's
+  # result text then asserted "lodar approved all 7" when he had never answered.
+  # The AUTHORITY was correct by design (the DIVE-1381 curation carve-out routes
+  # a persona batch to the lead on purpose); it is the stamp that lied about who
+  # exercised it, to `human:%` consumers that count human touches (cmd_trace,
+  # cmd_digest, cmd_proof) and to the precedent engine, which auto-applies a
+  # PRIOR HUMAN ANSWER to later gates and had a lead-clear to hand it.
+  #
+  # So an UNCORROBORATED --human on a lead-cleared gate is demoted here. Note
+  # what is deliberately NOT in _human_evid: `_lead_clear`. It is a legitimate
+  # AUTHORIZATION form for the block above (a lead-clear must not be refused for
+  # lacking human evidence) and is precisely NOT evidence of a human here — that
+  # conflation is the whole bug. A corroborated --human (valid per-gate nonce,
+  # non-agent SUDO_UID, or verified channel proof) is untouched, so no genuine
+  # Telegram tap, dashboard answer or human-on-box login is ever relabelled.
+  # Conditioned on `_lead_clear` ALONE, and that is not an oversight about the
+  # DIVE-2099 standing path: an eligible standing clear sets `_lead_clear=1` too
+  # (see that block above), so one condition covers both and a second `||
+  # _lead_standing` clause would be dead — untestable by mutation and green
+  # forever. `_lead_clear=1` also implies nt is approval|manual|access, the types
+  # that always enter the evidence block, so _hp/_su are measured values here and
+  # never their declaration defaults.
+  local _human_evid=$(( _hp || _su || _cp_ok ))
+  local _human_claim="$human"
+  if (( human && ! _human_evid )) && [[ "$_lead_clear" == "1" ]]; then
+    human=0
+  fi
   (( human )) && answered_by="human:${answered_by}"
   # DIVE-1182: a routed builder gate cleared by its designated lead is recorded as
   # lead-sourced provenance (NOT human:*) — honest that an agent lead, not a human,
@@ -8008,6 +8053,7 @@ cmd_task_answer() {
     "task=$ident" "type=$nt" "tier=${gtier:-}" "answered_by=$answered_by" \
     "uid=${_uid:-}" "sig=$([[ -n "$_sig" ]] && echo present || echo absent)" \
     "human=$human" "lead_clear=$_lead_clear" "cp_ok=$_cp_ok" \
+    "human_claim=$_human_claim" \
     "caller=$_caller4" "sudo_uid=${SUDO_UID:-}" || true
 
   # DIVE-909: a standalone MANUAL gate answered "done" is the human saying "this
@@ -8059,6 +8105,18 @@ cmd_task_answer() {
   # simply doesn't advance. manual gates stay agent-answerable (agents
   # legitimately resolve those), so they're exempt. Falling through here without
   # advancing still records the answer + emits the success output below.
+  # DIVE-2406 made this branch REACHABLE for a case that used to slip past it: a
+  # lead-cleared loop approval gate whose clearer also passed `--human` was
+  # stamped `human:<lead>` and advanced the relay. It is now stamped `lead:<lead>`
+  # and does NOT advance — which is what the paragraph above always said should
+  # happen ("if a non-human path ever clears it ... the relay simply doesn't
+  # advance"); the advance was previously bought with a label that was not true.
+  # Deliberately NOT widened to `lead:*`: that would hand a lead the loop-advance
+  # authority DIVE-560 reserves for the human, which is a grant, not a relabel.
+  # Measured before shipping: 2 answers fleet-wide have ever carried
+  # lead_clear=1 + human=1 (DIVE-2121, DIVE-2400) and neither was a loop step, so
+  # no live loop changes behaviour — but a future routed loop gate will stall here
+  # rather than advance, and that is the intended reading of DIVE-560.
   local _gate_may_advance=1
   if [[ "$_lk" == "gate:approval" ]]; then
     local _ab; _ab=$(db "SELECT COALESCE(need_answered_by,'') FROM tasks WHERE id=${id};")
