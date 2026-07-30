@@ -4692,8 +4692,14 @@ cmd_task_need() {
     # SUDO_* or the real id -un — see its comment), NEVER on --from. The gate's filer
     # is its assignee of record; the filer's routed lead / org coordinator may also
     # withdraw, as may a genuine human. An agent that is none of these is refused.
-    local w_filer w_id w_kind w_name="" w_lead w_coord w_ok=0
+    local w_filer w_id w_kind w_name="" w_lead w_coord w_ok=0 w_by w_who
     w_filer=$(db "SELECT COALESCE(assignee,'') FROM tasks WHERE id=${id};")
+    # DIVE-2382: the ORIGINAL filer-of-record, for the refusal text ONLY. Authorization
+    # stays on the assignee by DIVE-1945's decision (withdraw rights follow the HOLDER,
+    # so a handoff moves the ask away from whoever first filed it) — but the old refusal
+    # called the assignee "the gate's filer", which on a handed-off or auto-created row
+    # names as filer someone who never filed it. Name both, and say which one authorizes.
+    w_by=$(db "SELECT COALESCE(NULLIF(gate_filed_by,''),NULLIF(created_by,''),'') FROM tasks WHERE id=${id};")
     w_id=$(_gate_withdraw_actor)                          # "agent <name>" | "human" | "none"
     w_kind="${w_id%% *}"
     [[ "$w_kind" == "agent" ]] && w_name="${w_id#agent }"
@@ -4703,7 +4709,17 @@ cmd_task_need() {
     [[ -n "$w_name" && "$w_name" == "$w_filer" ]] && w_ok=1                # the filer
     [[ -n "$w_name" && -n "$w_lead"  && "$w_name" == "$w_lead"  ]] && w_ok=1  # filer's lead
     [[ -n "$w_name" && -n "$w_coord" && "$w_name" == "$w_coord" ]] && w_ok=1  # org coordinator
-    (( w_ok )) || policy_refuse "$E_AUTH_REQUIRED" gate-withdraw-not-authorized DIVE-1401 "$ident" "only the gate's filer (${w_filer:-?}), their lead, or a human can withdraw $ident's gate"
+    # DIVE-2382: name EVERY identity the block above actually walked, with its resolved
+    # value. The old text named only "the gate's filer, their lead, or a human" and
+    # silently dropped the org coordinator — a FILER-INDEPENDENT condition — so a caller
+    # who WAS the coordinator, and was authorized, read a message saying they were not.
+    # Two agents independently concluded from that text that DIVE-2106 could never be
+    # retired; both were wrong, and that is the mechanism behind the stale-gate class.
+    # Unresolvable conditions render as "none" rather than vanishing, so a reader can
+    # tell "this route does not exist here" from "this route was never offered".
+    w_who="the gate's holder (assignee ${w_filer:-?})"
+    [[ -n "$w_by" && "$w_by" != "$w_filer" ]] && w_who+=" — filed by ${w_by}, who cannot withdraw it since the handoff"
+    (( w_ok )) || policy_refuse "$E_AUTH_REQUIRED" gate-withdraw-not-authorized DIVE-1401 "$ident" "only ${w_who}, their lead (${w_lead:-none}), the org coordinator (${w_coord:-none}), or a human can withdraw $ident's gate"
     # Clear every gate field and unblock back to todo when no dependency edge
     # still holds it. The withdrawn gate is archived to gate_history first, in
     # the same transaction (DIVE-2119).
