@@ -487,18 +487,36 @@ declare -A _AGENT_PROMPT_DETECTABLE=(
   [claude]=1 [codex]=1 [devin]=1 [antigravity]=1 [grok]=1
 )
 
+# DIVE-2385 (iteration 2) — extracted verbatim out of wait_agent_input_ready so the
+# WAKE path can tell apart the TWO reasons that function returns 0: "the prompt
+# rendered" and "this runtime has no prompt to detect". Both are `return 0` there
+# and always were; only the wake path needs to distinguish them, and it must read
+# the SAME table rather than a second copy that can drift.
+#
+# An UNKNOWN type (empty lookup) counts as detectable deliberately: paying a bounded
+# wait beats skipping a real readiness check on a type we have not classified.
+agent_prompt_detectable() {
+  local _atype; _atype=$(agent_type "$1" 2>/dev/null || true)
+  [[ -z "$_atype" || -n "${_AGENT_PROMPT_DETECTABLE[$_atype]+x}" ]]
+}
+
 wait_agent_input_ready() {
   local name="$1" timeout="${2:-45}"
   local user="agent-${name}" waited=0 pane
   # Skip the poll for a harness with no marker. Returns 0 (proceed) rather than 1:
   # for these types the 1 never meant "not ready", it meant "undetectable", and the
   # warning it triggered was false — DIVE-348 called that warning out by name.
-  # An UNKNOWN type (empty lookup) falls through to the poll deliberately: paying a
-  # bounded wait beats skipping a real readiness check on a type we have not classified.
-  local _atype; _atype=$(agent_type "$name" 2>/dev/null || true)
-  if [[ -n "$_atype" && -z "${_AGENT_PROMPT_DETECTABLE[$_atype]+x}" ]]; then
-    return 0
-  fi
+  #
+  # ONLY rc 1 means "undetectable". This test used to be an inline [[ ]] that could
+  # not fail; a function CALL can (unavailable, extracted without its helper, a
+  # future error path), and `|| return 0` would have turned the predicate's own
+  # breakage into a blanket skip of the readiness check for EVERY agent — fail-open
+  # in the worst direction, and silent. Measured: extracting this function without
+  # its new helper made claude and codex skip the poll in 0s. Anything other than a
+  # clean 1 falls through to the poll, which is the same call the UNKNOWN-type case
+  # already makes: pay a bounded wait rather than skip a real check.
+  local _det=0; agent_prompt_detectable "$name" || _det=$?
+  (( _det == 1 )) && return 0
   while (( waited < timeout )); do
     pane=$(sudo -u "$user" tmux capture-pane -p -t "agent-${name}" 2>/dev/null || true)
     _agent_pane_input_ready "$pane" && return 0
@@ -1373,8 +1391,144 @@ _envelope_caller() {
   printf '%s' "$who"
 }
 
+# DIVE-2385 — WAKE-THEN-SEND, so deferred work does not depend on the recipient
+# being awake at the instant the scheduler fires.
+#
+# `agent send` needs the target to have a LIVE tmux session. Send to an agent that
+# simply is not running and it fails in ~190ms with E_NOT_RUNNING: no queue, no
+# retry, no persistence. Survivable when a human is watching a terminal; load-
+# bearing when the caller is SYSTEMD.
+#
+# MEASURED, 2026-07-30 (marketing). An approved blog post was scheduled the
+# documented way — a transient unit whose ExecStart was
+#   systemd-run --on-calendar=... 5dive agent send marketing '<publish pointer>'
+# The timer fired exactly on time at 23:45:02 UTC and the unit died on the spot
+# (status=8) because marketing was asleep. Three properties then compounded: the
+# message was dropped unqueued and unalarmed; a one-shot .timer is CONSUMED once
+# it fires, so there was no second attempt; and the only surviving evidence was a
+# .service in `failed` state under /run/systemd/transient/, a path nobody greps.
+# The approved post silently did not publish. It was caught 17 minutes later
+# because an unrelated cron woke marketing and a same-day guard tripped over the
+# uncommitted .mdx — luck, not a mechanism. This is NOT the known
+# transient-units-die-on-reboot caveat: the host had been up 7+ weeks. It needs
+# nothing to go wrong except the target being asleep at one instant.
+#
+# WHY OPT-IN AND NOT THE NEW DEFAULT. E_NOT_RUNNING is load-bearing elsewhere
+# precisely BECAUSE it is a sub-second failure: _task_need_route_deliver
+# (DIVE-2011) polls a detached send's own rc for exactly this shape to decide
+# whether a gate handoff was observed to fail, and it can only do that because a
+# dead session is decided long before the 45s readiness wait. Waking on every
+# send would turn those observed failures into a 30s+ boot wait and then report
+# them as delivered — re-manufacturing the DIVE-1968 mis-measurement in the one
+# rail that was cleaned up. So the default path keeps its rc and its latency byte
+# for byte, and a caller that is scheduling DEFERRED work asks for the wake.
+#
+# REFUSES on desiredState=stopped. That field is the operator's recorded intent
+# (cmd_stop writes it; the supervisor reads it when it decides whether a dead unit
+# is a crash or a deliberate stop), so waking past it would let a scheduler
+# override a human's explicit stop — and the supervisor would then be entitled to
+# stop the agent back, mid-turn. ABSENT is NOT stopped (DIVE-2318: unknown is not
+# a negative): an agent that has never been start/stop'd through the CLI carries
+# no field at all, which is the common case, so absent wakes.
+#
+# It never reports a send it did not make: if the unit starts but no session
+# appears inside the budget, the caller still gets E_NOT_RUNNING — with the reason
+# named, rather than the bare "is the agent running?" that was true but useless to
+# a systemd unit.
+#
+# ONE DEADLINE, NOT TWO STACKED ONES (iteration 2). Waking and then waiting for the
+# prompt are two waits on the same send, and a caller sizing a systemd
+# TimeoutStartSec should not have to discover that by adding 60 and 45 out of two
+# different functions. AGENT_WAKE_BUDGET_SECS is the ONLY number a scheduler needs:
+# the wake half spends what it needs (capped at 60 so a hung session-appear cannot
+# starve the readiness wait of the 45s it had), records it in AGENT_WAKE_ELAPSED, and
+# the readiness wait gets the REMAINDER. A fast wake therefore buys the prompt more
+# time rather than throwing it away, and the pair can never exceed the budget.
+AGENT_WAKE_BUDGET_SECS="${AGENT_WAKE_BUDGET_SECS:-105}"
+AGENT_WAKE_FAIL_REASON=""
+AGENT_WAKE_ELAPSED=0
+agent_wake_for_send() {
+  local name="$1" timeout="${2:-60}"
+  AGENT_WAKE_FAIL_REASON=""
+  AGENT_WAKE_ELAPSED=0
+  local desired
+  desired=$(registry_read | jq -r --arg n "$name" '.agents[$n].desiredState // ""' 2>/dev/null) || desired=""
+  if [[ "$desired" == "stopped" ]]; then
+    AGENT_WAKE_FAIL_REASON="agent '$name' is stopped by operator intent (desiredState=stopped), so --wake will not start it; clear that intent with '5dive agent start $name' if it is stale"
+    return 1
+  fi
+  if ! systemctl start "5dive-agent@${name}.service" >&2; then
+    AGENT_WAKE_FAIL_REASON="systemctl start 5dive-agent@${name}.service failed"
+    return 1
+  fi
+  local waited=0
+  while (( waited < timeout )); do
+    if sudo -u "agent-${name}" tmux has-session -t "agent-${name}" 2>/dev/null; then
+      AGENT_WAKE_ELAPSED="$waited"
+      return 0
+    fi
+    sleep 1; waited=$((waited+1))
+  done
+  AGENT_WAKE_ELAPSED="$waited"
+  AGENT_WAKE_FAIL_REASON="started 5dive-agent@${name}.service but its tmux session did not appear within ${timeout}s"
+  return 1
+}
+
+# DIVE-2385 (iteration 2) — ON THE WAKE PATH, READINESS IS FATAL.
+#
+# The default path's readiness wait is deliberately NON-fatal: on timeout it warns
+# and delivers best-effort, because a busy-but-healthy agent that never parks at a
+# prompt should still get its message. That is the right trade for a caller who is
+# watching a terminal. It is the WRONG trade for the only caller --wake exists for.
+#
+# THE DEFECT THIS REMOVES, and it was introduced by --wake itself. `wait_agent_input_ready`
+# is a tail that cmd_send already had; adding a new ENTRY into that tail silently
+# inherited its best-effort contract. agent_wake_for_send returns the instant
+# `tmux has-session` succeeds — the EARLIEST moment of a cold boot, long before the
+# TUI renders an input prompt. On a cold boot slower than the readiness budget —
+# the common cold-boot outcome — the old code warned, fired keystrokes into a
+# booting TUI (which its own comment says are dropped and the message lost), and
+# then ended at `sent:true`, exit 0. That is strictly WORSE than the incident this
+# ticket was filed for: there, the send failed in 190ms and left a unit in `failed`
+# state that something could see. A scheduler with no reader needs a truthful rc far
+# more than a delivered-maybe keystroke, and the hard rc is precisely what puts the
+# transient unit into failed state where it is observable at all.
+#
+# Gated on `woken` by its caller, so the DEFAULT path keeps its behaviour, its
+# warning and its best-effort delivery byte for byte.
+#
+# THE HOLE THIS DOES NOT CLOSE, named rather than papered over. For a runtime with
+# no prompt marker (anything outside _AGENT_PROMPT_DETECTABLE — see
+# agent_prompt_detectable) readiness is not slow, it is UNOBSERVABLE: the poll is
+# skipped and 0 means "nothing to detect", never "ready". Failing there would refuse
+# every delivery that would in fact have worked; passing silently would re-create
+# exactly the green-on-a-dropped-message this function exists to remove. So it
+# proceeds and SAYS SO — on stderr, and as ready:"unprovable" in the --json payload,
+# so a scheduler can tell a proven delivery from an assumed one instead of reading
+# one `sent:true` for both.
+#
+# It computes the remaining deadline ITSELF, from AGENT_WAKE_ELAPSED, rather than
+# taking it from the caller. One function owns the budget arithmetic, so there is no
+# second place for a plain 45 to reappear and quietly double the worst case back to
+# 105+45.
+AGENT_WAKE_READY=""
+agent_wake_gate_ready() {
+  local name="$1"
+  local budget=$(( AGENT_WAKE_BUDGET_SECS - AGENT_WAKE_ELAPSED ))
+  (( budget > 0 )) || budget=1
+  if ! agent_prompt_detectable "$name"; then
+    AGENT_WAKE_READY="unprovable"
+    step "agent '$name' woke, but this runtime has no detectable input prompt — delivering WITHOUT proof it is ready (reported as ready=unprovable)"
+    return 0
+  fi
+  if ! wait_agent_input_ready "$name" "$budget"; then
+    fail "$E_NOT_RUNNING" "woke agent '$name' but its input prompt never rendered within ${budget}s — refusing to type into a booting TUI and report a send that would be lost. --wake budgets ${AGENT_WAKE_BUDGET_SECS}s in total for the wake and this wait; size a scheduler's timeout against that."
+  fi
+  AGENT_WAKE_READY="proven"
+}
+
 cmd_send() {
-  local name="" message="" from="" from_set=0 raw=0
+  local name="" message="" from="" from_set=0 raw=0 wake=0
   local reply_to_chat="" reply_to_msg=""
   local -a positional=()
   while [[ $# -gt 0 ]]; do
@@ -1382,6 +1536,7 @@ cmd_send() {
       --message=*)        message="${1#--message=}" ;;
       --from=*)           from="${1#--from=}"; from_set=1 ;;
       --raw)              raw=1 ;;
+      --wake)             wake=1 ;;
       --reply-to-chat=*)  reply_to_chat="${1#--reply-to-chat=}" ;;
       --reply-to-msg=*)   reply_to_msg="${1#--reply-to-msg=}" ;;
       --)                 shift; positional+=("$@"); break ;;
@@ -1394,7 +1549,7 @@ cmd_send() {
     name="${positional[0]}"
     positional=("${positional[@]:1}")
   fi
-  [[ -n "$name" ]] || fail "$E_USAGE" "usage: 5dive agent send <name> <text...> | --message=<text> [--from=<sender>] [--raw] [--reply-to-chat=<id> [--reply-to-msg=<id>]]"
+  [[ -n "$name" ]] || fail "$E_USAGE" "usage: 5dive agent send <name> <text...> | --message=<text> [--from=<sender>] [--raw] [--wake] [--reply-to-chat=<id> [--reply-to-msg=<id>]]"
   if [[ -z "$message" && ${#positional[@]} -gt 0 ]]; then
     message="${positional[*]}"
   fi
@@ -1414,13 +1569,37 @@ cmd_send() {
   # (NOPASSWD:ALL) and root/internal callers keep the direct path below (and their
   # --from/--reply-to-chat plumbing). A scoped a2a send is peer-to-peer, so it
   # carries no channel plumbing. sudo -n = fail-closed, never prompts.
+  # DIVE-2385: --wake starts a systemd unit, which a scoped a2a caller cannot do —
+  # its whole grant is `/usr/local/bin/5dive agent _deliver *`, and _deliver
+  # deliberately carries no lifecycle powers. REFUSE rather than exec into
+  # `_deliver` and drop the flag: a silently-ignored --wake is the same lost
+  # message the flag exists to prevent, with an exit 0 printed over it. Checked
+  # BEFORE the exec for that reason.
+  if (( wake )) && a2a_needs_scoped "$name"; then
+    fail "$E_PERMISSION" "--wake starts the target's systemd unit and needs admin/root; this caller only holds the scoped a2a delivery grant. Re-run via sudo, or schedule the work as a task row instead."
+  fi
   if a2a_needs_scoped "$name"; then
     exec sudo -n /usr/local/bin/5dive agent _deliver "$name" "$message"
   fi
 
   require_agent "$name"
-  sudo -u "agent-${name}" tmux has-session -t "agent-${name}" 2>/dev/null \
-    || fail "$E_NOT_RUNNING" "tmux session 'agent-${name}' not found (is the agent running?)"
+  local woken=0
+  # Reset at entry, like AGENT_WAKE_FAIL_REASON and AGENT_WAKE_ELAPSED do in
+  # agent_wake_for_send. Today cmd_send has exactly one in-process caller (main.sh's
+  # dispatch), so a stale value cannot be reached — but `ready` is a claim about what
+  # this send PROVED, and a claim carried over from a previous call is a false one.
+  # That is the defect class this ticket is about; do not leave it to a call-count.
+  AGENT_WAKE_READY=""
+  if ! sudo -u "agent-${name}" tmux has-session -t "agent-${name}" 2>/dev/null; then
+    # DIVE-2385: default behaviour is unchanged — same code, same message, same
+    # sub-second latency that _task_need_route_deliver's rc poll depends on.
+    (( wake )) \
+      || fail "$E_NOT_RUNNING" "tmux session 'agent-${name}' not found (is the agent running?)"
+    step "agent '$name' is not running — starting it to deliver (--wake)"
+    agent_wake_for_send "$name" \
+      || fail "$E_NOT_RUNNING" "tmux session 'agent-${name}' not found and --wake could not bring it up: ${AGENT_WAKE_FAIL_REASON}"
+    woken=1
+  fi
 
   # Optional reply-target hint. If present, it tells the receiver: "the user is
   # reachable in this chat — reply there directly via your own bot rather than
@@ -1498,7 +1677,15 @@ cmd_send() {
   # Don't fire keystrokes into a still-booting TUI — they'd be dropped and the
   # message lost. Wait for the input prompt to render (fast no-op when already
   # up). On timeout we still send best-effort and warn, rather than hang.
-  if ! wait_agent_input_ready "$name"; then
+  #
+  # DIVE-2385 (iteration 2): the WAKE path takes a different branch, because on it
+  # "still booting" is the EXPECTED state rather than a surprise, and its caller is
+  # a scheduler that will never read the warning. See agent_wake_gate_ready. The
+  # elif keeps the default branch — its condition, its message, its best-effort
+  # fallthrough — exactly as it was.
+  if (( woken )); then
+    agent_wake_gate_ready "$name"
+  elif ! wait_agent_input_ready "$name"; then
     step "agent '$name' input prompt not detected after 45s — sending best-effort (may be lost if still booting)"
   fi
 
@@ -1514,9 +1701,19 @@ cmd_send() {
   # real envelope: a raw/anonymous send has no sender identity to mirror under.
   (( raw )) || mirror_interagent_outbound "$name" "$message"
 
+  # DIVE-2385: `woken` distinguishes "delivered to a live agent" from "started the
+  # agent in order to deliver". A scheduled caller that logs this line can tell,
+  # after the fact, that its wake was needed — the fact the failed transient unit
+  # could not tell anyone.
+  #
+  # `ready` appears on the WAKE path only, and exists so `sent:true` does not have to
+  # carry two different meanings. "proven" = the input prompt was observed before a
+  # key was typed. "unprovable" = this runtime has no prompt marker, so the delivery
+  # is an assumption. A scheduler that treats those the same is making the exact
+  # mistake this ticket is about.
   ok "sent to agent '$name'." \
-     '{name:$n, sent:true, bytes:($p|length), from:($s|select(length>0)), msg_id:($i|select(length>0)), reply_to_chat:($rc|select(length>0)), reply_to_msg:($rm|select(length>0))}' \
-     --arg n "$name" --arg p "$payload" --arg s "$sender" --arg i "$msg_id" --arg rc "$reply_to_chat" --arg rm "$reply_to_msg"
+     '{name:$n, sent:true, bytes:($p|length), woken:($w=="1"), ready:($rd|select(length>0)), from:($s|select(length>0)), msg_id:($i|select(length>0)), reply_to_chat:($rc|select(length>0)), reply_to_msg:($rm|select(length>0))}' \
+     --arg n "$name" --arg p "$payload" --arg s "$sender" --arg i "$msg_id" --arg rc "$reply_to_chat" --arg rm "$reply_to_msg" --arg w "$woken" --arg rd "$AGENT_WAKE_READY"
 }
 
 # Synchronous send + wait — the inter-agent counterpart to cmd_send. Drops the

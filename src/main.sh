@@ -135,7 +135,7 @@ Agents:
                                                      # handle instead of numeric id.
   5dive agent <name> tui                             # attach your terminal to the agent's tmux session
   5dive agent logs <name> [--follow] [--lines=N] [--tmux]
-  5dive agent send <name> <text...> [--from=<sender>] [--raw]
+  5dive agent send <name> <text...> [--from=<sender>] [--raw] [--wake]
                                     [--reply-to-chat=<id> [--reply-to-msg=<id>]]
                                                      # inject a message (tmux send-keys + Enter).
                                                      # When called from another agent, auto-wraps as
@@ -144,6 +144,23 @@ Agents:
                                                      # --reply-to-chat adds a hint telling the receiver
                                                      # to reply directly in that Telegram/Discord chat
                                                      # via its own bot (see SKILL.md).
+                                                     # --wake: if the target is NOT running, start its unit
+                                                     # and deliver once its session is up, instead of
+                                                     # failing with exit 8. Use it for SCHEDULED work
+                                                     # (cron / systemd timers), where a send into a
+                                                     # sleeping agent is dropped with no queue and no
+                                                     # retry. Needs root; refuses if the agent was
+                                                     # deliberately stopped (desiredState=stopped).
+                                                     # WORST CASE 105s: the wake and the wait for the
+                                                     # agent's input prompt share ONE budget, so size a
+                                                     # timer's TimeoutStartSec above that (override with
+                                                     # AGENT_WAKE_BUDGET_SECS). On this path a prompt that
+                                                     # never renders is FATAL (exit 8) rather than
+                                                     # best-effort: a scheduler with nobody reading its
+                                                     # output needs a truthful exit code more than a
+                                                     # keystroke that may have been dropped. --json then
+                                                     # reports ready=proven, or ready=unprovable for a
+                                                     # runtime whose prompt cannot be detected at all.
   5dive agent ask <name> <text...> [--from=<sender>] [--timeout=120] [--idle-secs=5] [--poll-secs=2]
                                    [--reply-to-chat=<id> [--reply-to-msg=<id>]]
                                                      # synchronous send + wait. Polls scrollback after
