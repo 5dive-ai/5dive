@@ -1,12 +1,23 @@
 # DIVE-2144, scope item 4: put the root-path diff in front of a human on every PR.
 #
-# After the tag cutover, install.sh is the only file still fetched from mutable main
-# and executed AS ROOT on every box (cmd_selfupdate.sh re-fetches and runs it on each
-# upgrade). A change to it is live on the whole fleet the moment it merges, with no
-# tag in between. This job does not block that — CODEOWNERS plus branch protection is
-# what blocks it. This job makes it IMPOSSIBLE TO MERGE ONE WITHOUT HAVING SEEN IT:
-# the full diff lands in the job summary, so "I didn't realise that PR touched the
-# root path" stops being available as an explanation.
+# After the tag cutover, install.sh is the only file IN THIS REPO still fetched from
+# mutable main and executed AS ROOT on every box (cmd_selfupdate.sh re-fetches and runs
+# it on each upgrade). A change to it is live on the whole fleet the moment it merges,
+# with no tag in between. This job does not block that — CODEOWNERS plus branch
+# protection is what blocks it. This job makes it IMPOSSIBLE TO MERGE ONE WITHOUT
+# HAVING SEEN IT: the full diff lands in the job summary, so "I didn't realise that PR
+# touched the root path" stops being available as an explanation.
+#
+# DIVE-2288/DIVE-2308 — READ THE SCOPE OF THE SENTENCE ABOVE. "The only file in this
+# repo" is TRUE and it is a SAMPLE, not the population. The risk this job exists to
+# bound is what reaches a customer BOX without a tag, and by that boundary install.sh
+# is 1 of 7 live merge-deploys sites. The other six are BRANCH TARBALLS of
+# 5dive-ai/skills and 5dive-ai/5dive-plugins, fetched by install.sh and root-installed
+# on every --upgrade. NO PATH FILTER IN THIS REPO CAN EVER SEE THEM, because a path
+# filter is scoped to the artifact you are editing while the hazard is scoped to where
+# the bytes land. So this job cannot be widened to cover them — it can only SAY SO,
+# which the summary below now does. A guard that names its own blind spot is worth more
+# than one that reads as exhaustive.
 name: install-guard
 on:
   pull_request:
@@ -45,6 +56,24 @@ jobs:
             echo "at merge, with no release tag in between (DIVE-2144)."
             echo
             echo "Changed: \`$(tr '\n' ' ' <<<"$files")\`"
+            echo
+            echo "### What this job CANNOT see (DIVE-2288 / DIVE-2308)"
+            echo
+            echo "install.sh is **1 of 7** live merge-deploys sites that reach a box without a tag."
+            echo "The other six are branch tarballs of **other repos**, fetched by install.sh and"
+            echo "root-installed on every \`--upgrade\`. A path filter here is blind to all of them:"
+            echo
+            echo "| what lands | from | pinnable via |"
+            echo "|---|---|---|"
+            echo "| the \`5dive-cli\` skill | \`5dive-ai/skills@refs/heads/main\` | \`SKILLS_REPO_TARBALL\` |"
+            echo "| telegram-codex | \`5dive-ai/5dive-plugins@refs/heads/main\` | \`CODEX_PLUGIN_TARBALL\` |"
+            echo "| telegram-grok | same | \`GROK_PLUGIN_TARBALL\` |"
+            echo "| telegram-agy | same | \`AGY_PLUGIN_TARBALL\` |"
+            echo "| telegram-opencode | same | \`OPENCODE_PLUGIN_TARBALL\` |"
+            echo "| telegram-pi | same | \`PI_PLUGIN_TARBALL\` |"
+            echo
+            echo "Each site is marked \`MERGE-DEPLOYS\` in install.sh. A merge in either of those"
+            echo "repos ships to the fleet with no tag, no cut, and no review in this repo."
             echo
             echo '```diff'
             git diff "$base" "$head" -- install.sh src/cmd_selfupdate.sh

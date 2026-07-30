@@ -1,5 +1,29 @@
 #!/usr/bin/env bash
 # 5dive CLI installer / uninstaller
+#
+# ============================================================================
+#  THIS FILE DEPLOYS ON MERGE. THERE IS NO TAG BETWEEN YOU AND THE FLEET.
+# ============================================================================
+# Everywhere else in this repo, merging is STAGING and the release cut is the
+# publish act. Not here. This file is fetched from `refs/heads/main` and run AS
+# ROOT on every box's next `--upgrade` (`src/cmd_selfupdate.sh`, `5dive uninstall`,
+# and the public `curl … | sudo bash`). A merge to it is live fleet-wide within
+# one upgrade cycle, with no tag, no cut, and no rollback point.
+#
+# So the rule everyone was taught — "merging is safe, the cut is the risky part" —
+# is EXACTLY BACKWARDS in this file, and nothing in a diff or a PR title says so.
+# That inversion is DIVE-2288; this comment is the fix for it.
+#
+# The same property holds for the six BRANCH-TARBALL fetches below (skills and
+# 5dive-plugins, marked `MERGE-DEPLOYS` at each site) — those land root-installed
+# from ANOTHER repo's mutable main, where no control in this repo can see them.
+# Full enumeration, 9 sites across 4 repos (DIVE-2308):
+#   community/wiki/the-merge-deploys-population-is-scoped-to-the-box-not-to-the-repo.md
+#
+# Everything else the installer places comes through `$REPO`, which DIVE-2144
+# pins to the newest release TAG. If you are adding a fetch, decide which of the
+# two you are in and say so at the site.
+# ============================================================================
 # Install:   curl -fsSL https://install.5dive.ai | sudo bash
 # Upgrade:   curl -fsSL https://install.5dive.ai | sudo bash -s -- --upgrade
 # Uninstall: curl -fsSL https://install.5dive.ai | sudo bash -s -- --uninstall
@@ -407,6 +431,10 @@ JOURNALD
   # in one shot. update.sh's per-agent refresh loop syncs from here, so an
   # existing agent's 5dive-cli skill picks up upstream changes on the daily
   # 03:00 cron instead of being frozen at agent-create time.
+  # MERGE-DEPLOYS (DIVE-2288): a BRANCH tarball, not $REPO. Merging to that
+  # repo's main puts the 5dive-cli skill, from 5dive-ai/skills on every box at its
+  # next --upgrade, root-installed, with no tag and no review in THIS repo.
+  # The SKILLS_REPO_TARBALL override exists to pin it; the DEFAULT is mutable.
   SKILLS_REPO_TARBALL="${SKILLS_REPO_TARBALL:-https://github.com/$GH_ORG/skills/archive/refs/heads/main.tar.gz}"
   install -d -m 755 "$LIB_DIR/skills/5dive-cli"
   _skill_tmp=$(mktemp -d)
@@ -434,6 +462,10 @@ JOURNALD
   # the runtime deps (grammy) so the hooks/server actually run. cp -a overlays
   # the source onto any existing copy so node_modules survives across --upgrade
   # refreshes; bun reconciles deps against the (possibly updated) lockfile.
+  # MERGE-DEPLOYS (DIVE-2288): a BRANCH tarball, not $REPO. Merging to that
+  # repo's main puts telegram-codex, from 5dive-ai/5dive-plugins on every box at its
+  # next --upgrade, root-installed, with no tag and no review in THIS repo.
+  # The CODEX_PLUGIN_TARBALL override exists to pin it; the DEFAULT is mutable.
   CODEX_PLUGIN_TARBALL="${CODEX_PLUGIN_TARBALL:-https://github.com/$GH_ORG/5dive-plugins/archive/refs/heads/main.tar.gz}"
   _cdx_tmp=$(mktemp -d)
   if curl -fsSL "$CODEX_PLUGIN_TARBALL" \
@@ -466,6 +498,10 @@ JOURNALD
   # this one shared checkout via absolute paths written into ~/.grok/config.toml
   # by 5dive-agent-start. Override the tarball with GROK_PLUGIN_TARBALL for
   # offline / test installs.
+  # MERGE-DEPLOYS (DIVE-2288): a BRANCH tarball, not $REPO. Merging to that
+  # repo's main puts telegram-grok, from 5dive-ai/5dive-plugins on every box at its
+  # next --upgrade, root-installed, with no tag and no review in THIS repo.
+  # The GROK_PLUGIN_TARBALL override exists to pin it; the DEFAULT is mutable.
   GROK_PLUGIN_TARBALL="${GROK_PLUGIN_TARBALL:-https://github.com/$GH_ORG/5dive-plugins/archive/refs/heads/main.tar.gz}"
   _grk_tmp=$(mktemp -d)
   if curl -fsSL "$GROK_PLUGIN_TARBALL" \
@@ -494,6 +530,10 @@ JOURNALD
   # ~/.gemini/config/{mcp_config.json,hooks.json} by 5dive-agent-start (agy
   # doesn't auto-load a plugin's mcp_config/hooks — only skills/agents).
   # Override the tarball with AGY_PLUGIN_TARBALL for offline / pinned installs.
+  # MERGE-DEPLOYS (DIVE-2288): a BRANCH tarball, not $REPO. Merging to that
+  # repo's main puts telegram-agy, from 5dive-ai/5dive-plugins on every box at its
+  # next --upgrade, root-installed, with no tag and no review in THIS repo.
+  # The AGY_PLUGIN_TARBALL override exists to pin it; the DEFAULT is mutable.
   AGY_PLUGIN_TARBALL="${AGY_PLUGIN_TARBALL:-https://github.com/$GH_ORG/5dive-plugins/archive/refs/heads/main.tar.gz}"
   _agy_tmp="$(mktemp -d)"
   if curl -fsSL "$AGY_PLUGIN_TARBALL" \
@@ -526,6 +566,10 @@ JOURNALD
   # opencode_agent's plugin-dir check fails) — i.e. opencode telegram is a
   # no-op on customer boxes until staged. Override with OPENCODE_PLUGIN_TARBALL
   # for offline / pinned installs.
+  # MERGE-DEPLOYS (DIVE-2288): a BRANCH tarball, not $REPO. Merging to that
+  # repo's main puts telegram-opencode, from 5dive-ai/5dive-plugins on every box at its
+  # next --upgrade, root-installed, with no tag and no review in THIS repo.
+  # The OPENCODE_PLUGIN_TARBALL override exists to pin it; the DEFAULT is mutable.
   OPENCODE_PLUGIN_TARBALL="${OPENCODE_PLUGIN_TARBALL:-https://github.com/$GH_ORG/5dive-plugins/archive/refs/heads/main.tar.gz}"
   _ocode_tmp="$(mktemp -d)"
   if curl -fsSL "$OPENCODE_PLUGIN_TARBALL" \
@@ -557,6 +601,10 @@ JOURNALD
   # agent's plugin-dir check fails) — i.e. pi telegram is a no-op on customer
   # boxes until staged. Override with PI_PLUGIN_TARBALL for offline / pinned
   # installs.
+  # MERGE-DEPLOYS (DIVE-2288): a BRANCH tarball, not $REPO. Merging to that
+  # repo's main puts telegram-pi, from 5dive-ai/5dive-plugins on every box at its
+  # next --upgrade, root-installed, with no tag and no review in THIS repo.
+  # The PI_PLUGIN_TARBALL override exists to pin it; the DEFAULT is mutable.
   PI_PLUGIN_TARBALL="${PI_PLUGIN_TARBALL:-https://github.com/$GH_ORG/5dive-plugins/archive/refs/heads/main.tar.gz}"
   _pi_tmp="$(mktemp -d)"
   if curl -fsSL "$PI_PLUGIN_TARBALL" \
