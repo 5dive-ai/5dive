@@ -56,11 +56,17 @@ RESIDUAL, stated rather than buried: a human message naming this ident and this 
 inside the hour, cited for this gate, is taken as the human answering this gate. Only a per-gate
 nonce ties the two harder, and that nonce is the tap this exists to avoid.
 
-Graded by `tests/gate_channel_session_t2_unit.sh` (19 arms) plus
+Graded by `tests/gate_channel_session_t2_unit.sh` (33 arms) plus
 `tests/gate_channel_session_t2_mutation.sh`, which deletes each condition in turn and requires
-the named arm to go red - 9 mutants, 9 killed. Two arms were rewritten because that pass showed
-they graded nothing: the hidden-origin fixture was being caught by the sender check one
-condition down, and the "invented message id" refusal was passing on rc alone.
+the named arm to go red - 14 mutants, 14 killed. Three arms were rewritten because that pass, and
+then CI, showed they graded nothing: the hidden-origin fixture was being caught by the sender
+check one condition down, the "invented message id" refusal was passing on rc alone, and the two
+`human_evidence` arms were grading THE RUNNER. `_gate_sudo_uid_nonagent` answers "is this a
+human?" by asking the host's passwd database whether the account is named `agent-*`, so on an
+agent box the column read `channel-session` and on a CI runner the identical code appended
+`+sudo-uid` and the exact-string arms went red. The seam is now pinned to the agent caller that
+is this feature's whole premise, and CS13 flips the pin both ways so the pin is differential
+rather than a way to keep the harness quiet.
 
 Consumers are NOT wired yet and this ships inert until they are: the telegram plugin does not
 pass `--channel-msg`, and the dashboard (DIVE-2371) is the second surface on the same rail.

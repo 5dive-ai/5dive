@@ -61,9 +61,27 @@ tasks_db_init
 task_need_notify() { :; }
 audit_log() { :; }
 # Post-sudo human context: the immediate caller is root, which passes the
-# DIVE-394 agent-uid block. `id -u` is NOT stubbed, so _gate_sudo_uid_nonagent
-# still resolves this harness's real (agent-*) uid and stays 0 — the accept arm
-# below therefore cannot pass through the sudo-uid form by accident.
+# DIVE-394 agent-uid block.
+#
+# THE SUDO-UID SEAM IS PINNED, and iteration 2 is where that stopped being
+# optional. `_gate_sudo_uid_nonagent` (src/lib/tasks_db.sh) resolves the caller's
+# uid through the HOST's passwd database and answers "is this a human?" with
+# "the account is not named agent-*". Leaving it unstubbed did not model an agent
+# caller — it modelled WHOEVER RAN THE SUITE. On an agent-* box it returned false
+# and the evform arms read `channel-session` / `nonce` exactly; on a CI runner
+# (account `runner`) the very same code returns TRUE, `_su=1`, and every human
+# form silently gains `+sudo-uid`. Measured, not reasoned: run 30542542143 failed
+# exactly the two exact-string arms with `sudo-uid+channel-session` and
+# `nonce+sudo-uid`, and `sudo -u claude` on this box reproduces both. That is
+# tests/test_that_needs_the_host_is_not_a_test — the arm graded the runner.
+#
+# So the answer is a pin, not a looser assertion: an agent-* caller is the
+# PREMISE of this whole feature (the tier-2 citation exists because the caller is
+# an agent that cannot speak for the human), and CS13 below flips the pin to the
+# non-agent case so the pin is differential rather than a way to keep quiet.
+# 1 = false = an agent-* caller contributes no sudo-uid evidence.
+_PIN_SUDO_HUMAN=1
+_gate_sudo_uid_nonagent() { return "$_PIN_SUDO_HUMAN"; }
 FAKE_CALLER="root"
 id() { if [[ "${1:-}" == -un ]]; then echo "$FAKE_CALLER"; else command id "$@"; fi; }
 # ...and the UID SEAM, which is what the human-only block actually reads since
@@ -74,8 +92,8 @@ id() { if [[ "${1:-}" == -un ]]; then echo "$FAKE_CALLER"; else command id "$@";
 # sibling harnesses do (gate_channel_proof_unit, gate_nonce_unit). 0 is the
 # root-side invocation the channel forms run under: `task inbox --send` and the
 # plugin's clear path are root-side, as the DIVE-1305 help line says. It grants
-# nothing on its own — SUDO_UID is unset here, so _gate_sudo_uid_nonagent stays 0
-# and the CS1 evform arm below still requires channel-session ALONE.
+# nothing on its own — the sudo-uid form is pinned off above, so the CS1 evform
+# arm below still requires channel-session ALONE.
 _PIN_UID=0
 _gate_caller_uid() { printf '%s' "$_PIN_UID"; }
 
@@ -368,6 +386,33 @@ unset GATE_CHANNEL_SESSION_MAX_AGE
 [[ $rc -eq 0 && "$(answered DIVE-2412020)" == "closed" ]] \
   && ok_t "CS12 a NON-NUMERIC window falls back to the ceiling (neither wider nor bricked)" \
   || bad_t "CS12 a NON-NUMERIC window falls back to the ceiling (neither wider nor bricked)" "rc=$rc state=$(answered DIVE-2412020) out=$out"
+
+# ── CS13 the sudo-uid pin is DIFFERENTIAL, not a way to keep the harness quiet ─
+# Every exact-string evform arm above depends on `_PIN_SUDO_HUMAN=1`. A pin that
+# is never flipped is indistinguishable from deleting the condition it pins, so
+# flip it: model the non-agent caller (the CI runner, a dashboard exec) and
+# require the column to GAIN the sudo-uid term and keep the citation term. This
+# is the state run 30542542143 was actually in, so the arm doubles as the
+# regression the iteration-2 CI red is named after: if the pin ever stops
+# controlling this, one of the two directions goes red instead of the host
+# deciding which.
+seed_t2_approval DIVE-2412021
+CS_RESP=$(fwd user "$HUMAN_CHAT" 30 "DIVE-2412021 approved")
+_PIN_SUDO_HUMAN=0
+out=$(cmd_task_answer DIVE-2412021 --value=approved --channel-proof=$HUMAN_CHAT --channel-msg=15510 2>&1); rc=$?
+_PIN_SUDO_HUMAN=1
+[[ $rc -eq 0 && "$(evform DIVE-2412021)" == "sudo-uid+channel-session" ]] \
+  && ok_t "CS13 a NON-agent caller records sudo-uid ALONGSIDE channel-session (the pin is live)" \
+  || bad_t "CS13 a NON-agent caller records sudo-uid ALONGSIDE channel-session (the pin is live)" "rc=$rc form='$(evform DIVE-2412021)' out=$out"
+
+# ...and the agent-caller direction re-asserted on a FRESH gate, so the pair is a
+# genuine A/B on one seam rather than one measurement and one memory.
+seed_t2_approval DIVE-2412022
+CS_RESP=$(fwd user "$HUMAN_CHAT" 30 "DIVE-2412022 approved")
+out=$(cmd_task_answer DIVE-2412022 --value=approved --channel-proof=$HUMAN_CHAT --channel-msg=15511 2>&1); rc=$?
+[[ $rc -eq 0 && "$(evform DIVE-2412022)" == "channel-session" ]] \
+  && ok_t "CS13 the SAME citation as an agent-* caller records channel-session ALONE" \
+  || bad_t "CS13 the SAME citation as an agent-* caller records channel-session ALONE" "rc=$rc form='$(evform DIVE-2412022)' out=$out"
 
 printf '\ngate_channel_session_t2_unit: %d passed, %d failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]
