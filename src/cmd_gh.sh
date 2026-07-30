@@ -249,7 +249,11 @@ cmd_gh_whoami() {
   caller=$(gh api user --jq .login 2>/dev/null || true)
   printf 'caller : %s\n' "${caller:-UNRESOLVED (no gh credential in this environment)}"
   bot=$(printf '%s\0' api user --jq .login | sudo -n /usr/local/bin/5dive _gh_do 2>/dev/null || true)
-  printf 'bot    : %s\n' "${bot:-UNRESOLVED (no _gh_do grant here, or the github-bot connector is not provisioned)}"
+  # Three causes, and naming only the first two would send a reader hunting a
+  # grant that is fine: `_gh_do` is reached through the INSTALLED /usr/local/bin/5dive,
+  # so a box that has not rolled this version yet resolves UNRESOLVED with
+  # everything else correct.
+  printf 'bot    : %s\n' "${bot:-UNRESOLVED (the installed 5dive predates this verb, this account has no _gh_do grant, or the github-bot connector is not provisioned)}"
   if [[ -n "$caller" && -n "$bot" && "$caller" == "$bot" ]]; then
     warn "caller and bot resolve to the SAME login (${caller}) — routing would change nothing, so attribution is not fixed on this box."
   fi
