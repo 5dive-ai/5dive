@@ -1,5 +1,30 @@
 # Changelog
 
+## Unreleased — fix(release): the release page says WHAT shipped, and the tag stamps the CHANGELOG (DIVE-2452)
+
+Every release published a body describing how it was cut. v0.17.9 carried 256 characters of
+dispatch reason for 76 commits; v0.17.0 and v0.17.1 were the same shape. `gh release create` was
+passed `--notes "${note}"`, and `note` is the cut reason.
+
+The body is now derived from the git range: the lines CHANGELOG.md gained between the commit the
+incumbent tag was cut from and the commit being cut, falling back to commit subjects grouped by
+type, and **refusing the release page** if neither yields anything. The obvious implementation —
+collect the sections headed `## Unreleased` — is wrong here and quietly so: nothing stamps
+CHANGELOG.md on main, so every section on main carries that heading forever and a heading-based
+reader would republish the whole file every time. The range needs no state and cannot drift.
+
+The cut also stamps the CHANGELOG onto the release commit, so `git show <tag>:CHANGELOG.md`
+answers "what shipped in this version" — which nothing could before, with eight `## Unreleased`
+headings in the first 300 lines at v0.17.9. Like the `FIVE_VERSION` write beside it, the stamp
+lands on the detached release commit and never on main: DIVE-2247 removed this job's ability to
+push a protected branch, and the fix was to stop needing it.
+
+Both halves live in `scripts/release-notes.sh` and `scripts/stamp-changelog.sh` rather than
+inline in the workflow, for the reason this file already gives for `grade-release-commit.sh` — a
+workflow body cannot be unit-tested. `tests/release_notes_unit.sh` covers them against a real
+throwaway repo (27 assertions), including the arm that matters: an underivable body exits 1
+rather than publishing the cut reason again.
+
 ## Unreleased — feat(gh): route agent GitHub writes through the machine account (DIVE-2448)
 
 An agent `gh` write authenticated as the human account, so no field anywhere could tell an
