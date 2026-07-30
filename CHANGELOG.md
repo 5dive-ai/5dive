@@ -1,5 +1,71 @@
 # Changelog
 
+## Unreleased — feat(task): CHANNEL PROOF of the human's answer clears a tier-2 gate, so a decision already made in chat is not re-entered as a button tap (DIVE-2412)
+
+DIVE-2382 fix #4, approved 2026-07-30 04:27. A tier-2 gate could be cleared by exactly two
+things: a per-gate nonce (the Telegram button) or a non-agent SUDO_UID (the dashboard exec).
+Neither is what the human usually produces. The live illustration is DIVE-2247: the answer
+`hold-schedule` was recorded at 05:14:26 with `human_nonce_hash=NULL`, and the only reason it
+was credible at all was lodar's own chat message 27 seconds later saying he pressed it. Grading
+that took a human-judgement pass, and the alternative on offer was asking him to re-enter as a
+tap a decision he had already made in prose - the rubber-stamping he refused on 2026-07-29.
+
+`task answer` now takes `--channel-msg=<message_id>` alongside `--channel-proof=<chat_id>`, and
+that pair is a fourth evidence form that a TIER-2 gate accepts.
+
+WHAT MAKES IT EVIDENCE RATHER THAN A CLAIM, because that boundary is the whole design. The
+chat id on its own is not evidence and stays tier<2 exactly as DIVE-1305 scoped it: the calling
+agent's session already knows that number, so alone it proves only that this bot has a paired
+human. A citation is different in kind. The message id is checked against TELEGRAM, via
+`forwardMessage` on the cited id, and the forwarded copy is deleted immediately - it is a probe,
+not a post. Four conditions must all hold: the chat is the paired human's verified DM, the
+message is live, its `forward_origin` is a USER whose id is that human (a bot's own message, a
+third party and a privacy-hidden origin are all refused), and it is fresh and names BOTH the
+task ident and the answer. Anything unresolvable - no readable token, no response, no attribution - REFUSES. An agent
+asserting that a human answered is refused with the gate left open, because `--from` and a
+quoted line are caller-supplied and are not evidence.
+
+The reason the check is remote is that no local one exists: the plugin and the agent share a
+unix user, so no file, uid or cgroup separates them. What an agent cannot do is make Telegram's
+servers report a message that was never sent.
+
+WHERE IT IS ADMITTED, because a tier-2 clear passes two guards and not one. Raising the human
+flag only clears the first (the DIVE-1117 provenance floor). The second is DIVE-2233's evidence
+site, which refuses a tier-2 `--human` claim that carries neither a valid per-gate nonce nor a
+non-agent `SUDO_UID` - and it is scoped to gates that HAVE a minted nonce, which is every
+approval and manual gate, i.e. exactly the ones this feature is for. The citation is therefore
+listed there as a third evidence form, on the same footing: the other two are local to the box,
+while this one is attested by Telegram, the party the caller cannot speak for. Its refusal
+message and audit row now name it (`channel_session=`).
+
+The row now carries `human_evidence`, so `nonce` (a tap), `sudo-uid` (dashboard/on-box),
+`channel-chat` (the tier<2 form) and `channel-session` (this one) stay tellable apart after the
+fact - all four persist as `need_answered_by=human:*`, and only the last cleared a tier-2 gate
+with nobody touching a button. Stored on the row rather than derived from a log, per DIVE-2090.
+
+THE FRESHNESS BOUND IS NOT THE CALLER'S TO SET. `task answer` is run by the agent, so the
+freshness window may not be read from its environment - and the first cut of this change did
+exactly that, then named that window as what bounded a replay of a non-unique answer value. Both
+halves are fixed: the ceiling is hardcoded at 3600s and `GATE_CHANNEL_SESSION_MAX_AGE` can only
+TIGHTEN it (wider, zero, negative and non-numeric all fall back to the ceiling), and the cited
+message must name the task IDENT as well as the answer. An ident is unique to one gate; a value
+is unique to none, and an ident on its own would attest only that the human spoke about the gate
+while `--value` still came from the agent.
+
+RESIDUAL, stated rather than buried: a human message naming this ident and this answer, sent
+inside the hour, cited for this gate, is taken as the human answering this gate. Only a per-gate
+nonce ties the two harder, and that nonce is the tap this exists to avoid.
+
+Graded by `tests/gate_channel_session_t2_unit.sh` (19 arms) plus
+`tests/gate_channel_session_t2_mutation.sh`, which deletes each condition in turn and requires
+the named arm to go red - 9 mutants, 9 killed. Two arms were rewritten because that pass showed
+they graded nothing: the hidden-origin fixture was being caught by the sender check one
+condition down, and the "invented message id" refusal was passing on rc alone.
+
+Consumers are NOT wired yet and this ships inert until they are: the telegram plugin does not
+pass `--channel-msg`, and the dashboard (DIVE-2371) is the second surface on the same rail.
+DIVE-2371's fail-closed prefix change must still land AFTER them, or the dashboard's tier-2
+clear goes offline with it.
 ## Unreleased — fix(task): pronoun options resolve to an account frame (DIVE-2212)
 
 Two parties can no longer select the same second-person gate option and receive

@@ -108,6 +108,12 @@ _task_usage() {
   5dive task inbox --send [--channel-proof=<chat>]   # DM the owner ONE tap-button digest of those gates (root-side; nonce never printed)
   5dive task coordinator [--json]                     # print the resolved org coordinator (DIVE-333/1568) — the one agent that fronts the pinned needs-you banner
   5dive task answer <id|DIVE-N> --value="..."        # record the human's answer, unblock, ping the owning agent
+  5dive task answer <id|DIVE-N> --value="..." --channel-proof=<chat_id> [--channel-msg=<message_id>]
+                                                     # the CHANNEL forms. --channel-proof alone is the DIVE-1305 paired-human DM proof: clears tier<2 gates only.
+                                                     # ADD --channel-msg (the id of the human's OWN message in that DM) and a TIER-2 gate clears with NO button tap
+                                                     # (DIVE-2412): the citation is checked against Telegram itself - the message must be live, sent by that human,
+                                                     # fresh (<=3600s, a hardcoded ceiling GATE_CHANNEL_SESSION_MAX_AGE can only TIGHTEN) and name BOTH the task ident and the answer.
+                                                     # An agent ASSERTING that a human answered is not evidence and is refused. The row records which form cleared it.
   5dive task clear-recs --channel-proof=<chat_id> [--only=<id|DIVE-N>]
                                                      # DIVE-1305: paired-human bulk-clear — apply each pending gate's --recommend as a HUMAN clear,
                                                      # driven by the human's own verified DM ("go with recs"). Clears only tier<2 (agent-clearable) gates;
@@ -6290,6 +6296,163 @@ _gate_channel_proof_ok() {
   jq -e --arg c "$chat" '(.allowFrom // []) | index($c) != null' "$TASK_CH_ACCESS" >/dev/null 2>&1
 }
 
+# DIVE-2412: the Bot API seam for a channel citation, isolated in ONE function so
+# a unit harness can drive every branch of the verifier below with no network and
+# no bot token. Every attestation call goes through here.
+_gate_channel_api() { # <token> <method> [curl -d args...]
+  local token="$1" method="$2"; shift 2
+  curl -sS --max-time 15 "https://api.telegram.org/bot${token}/${method}" "$@" 2>/dev/null
+}
+
+# DIVE-2412 (DIVE-2382 fix #4): CITED-MESSAGE channel proof — the evidence form a
+# TIER-2 gate accepts, so a decision the human already made in prose clears
+# WITHOUT re-entering it as a button tap (the rubber-stamp lodar refused
+# 2026-07-29 01:06).
+#
+# WHY THE DIVE-1305 FORM IS NOT ENOUGH HERE, said plainly because the ticket's
+# premise reads the other way: _gate_channel_proof_ok proves the cited CHAT is the
+# paired human's own verified DM. It does NOT prove the human said anything. The
+# chat id is a number the calling agent's own session already knows, so on its own
+# it is exactly the agent-relayed assertion this must refuse ("he told me").
+# At tier<2 that weaker bar is lodar's deliberate scope; at tier 2 it is not
+# evidence, so tier 2 requires a CITATION on top: the message_id of the human's
+# OWN message, attested by TELEGRAM rather than by us.
+#
+# THE ATTESTATION IS REMOTE, which is the entire reason the caller cannot forge
+# it. The plugin and the agent share a unix user, so NO local artifact separates
+# them — same uid, same cgroup, same files (community/wiki/
+# the-dashboard-t2-clear-and-the-t2-forge-are-one-path.md). What an agent cannot do
+# is make Telegram's servers claim a message exists that does not: forwardMessage
+# on the cited id returns the message's forward_origin (who really sent it) and its
+# original date. The forwarded echo is deleted immediately — this is a probe, not a
+# post.
+#
+# FOUR CONDITIONS, all required, each with its own refusal reason:
+#   1. the chat is the paired human's verified DM (the DIVE-1305 anchor),
+#   2. Telegram confirms the cited message EXISTS in that chat,
+#   3. its forward origin is a USER whose id is that chat's human — a bot's own
+#      message and a third party both refuse (in a DM the human's user id IS the
+#      chat id), and a privacy-HIDDEN origin refuses because it attests nobody,
+#   4. it is FRESH (<= 3600s, a HARDCODED ceiling — see below) and it NAMES BOTH
+#      this task's ident and this answer, so neither a stale "yes" nor a live one
+#      about another gate can be replayed onto this one.
+# Anything unresolvable — no token, no response, malformed JSON — REFUSES. The
+# ticket's rule is explicit and is the whole boundary: if a verified-session
+# message cannot be told apart from an agent's report of one, refuse.
+#
+# THE FRESHNESS BOUND IS NOT THE CALLER'S TO SET, and the shared-value replay is
+# closed by BINDING, not by the window. Iteration 1 shipped both the other way
+# round and olivia's reject measured the consequence: the window was read from
+# GATE_CHANNEL_SESSION_MAX_AGE in the environment of the agent that runs
+# `task answer`, and the residual note named that window as what bounded a replay
+# of a non-unique value — a mitigation set by the party it defends against. Now
+# the ident is REQUIRED (a value is unique to no gate; an ident is unique to one)
+# and the env knob can only TIGHTEN a hardcoded 3600s ceiling. What remains is
+# genuinely residual: a human message naming this ident and this value, inside the
+# hour, cited for this gate, is the human answering this gate.
+#
+# Sets TASK_CS_REASON (why refused), TASK_CS_ORIGIN, TASK_CS_AGE. Returns 0 only
+# when all four conditions hold.
+_gate_channel_session_ok() { # <chat_id> <message_id> <answer_value> <ident>
+  local chat="$1" msg="$2" bind="$3" ident="$4"
+  TASK_CS_REASON="" TASK_CS_ORIGIN="" TASK_CS_AGE=""
+  # (1) same trust anchor as DIVE-1305 — and it resolves TASK_CH_TOKEN for us.
+  if ! _gate_channel_proof_ok "$chat"; then
+    TASK_CS_REASON="chat $chat is not this bot's paired-human DM (not in access.json allowFrom)"
+    return 1
+  fi
+  if [[ ! "$msg" =~ ^[0-9]+$ ]]; then
+    TASK_CS_REASON="--channel-msg is not a numeric Telegram message id"
+    return 1
+  fi
+  if [[ -z "${TASK_CH_TOKEN:-}" ]]; then
+    TASK_CS_REASON="no readable bot token for this channel, so the citation cannot be attested — refused rather than assumed (fail closed)"
+    return 1
+  fi
+  # (2) does Telegram say this message exists in that chat? The forward is the
+  # probe; its own copy is deleted right after, whatever the verdict below.
+  local resp; resp=$(_gate_channel_api "$TASK_CH_TOKEN" forwardMessage     -d "chat_id=${chat}" -d "from_chat_id=${chat}" -d "message_id=${msg}" -d "disable_notification=true")
+  if [[ -z "$resp" ]]; then
+    TASK_CS_REASON="the Bot API returned nothing for forwardMessage (unreachable) — the citation is UNVERIFIED, not accepted"
+    return 1
+  fi
+  local _echo_id; _echo_id=$(jq -r '.result.message_id // empty' <<<"$resp" 2>/dev/null)
+  if [[ -n "$_echo_id" ]]; then
+    _gate_channel_api "$TASK_CH_TOKEN" deleteMessage -d "chat_id=${chat}" -d "message_id=${_echo_id}" >/dev/null 2>&1 || true
+  fi
+  if ! jq -e '.ok == true' <<<"$resp" >/dev/null 2>&1; then
+    local _desc; _desc=$(jq -r '.description // "no description"' <<<"$resp" 2>/dev/null || echo "unparseable response")
+    TASK_CS_REASON="Telegram refused the citation (${_desc}) — message ${msg} is not a live message in chat ${chat}"
+    return 1
+  fi
+  # (3) WHO sent it. forward_origin is Telegram's attribution, not the caller's.
+  local otype osender odate otext
+  otype=$(jq -r '.result.forward_origin.type // empty' <<<"$resp" 2>/dev/null)
+  osender=$(jq -r '.result.forward_origin.sender_user.id // empty' <<<"$resp" 2>/dev/null)
+  odate=$(jq -r '.result.forward_origin.date // empty' <<<"$resp" 2>/dev/null)
+  otext=$(jq -r '.result.text // .result.caption // ""' <<<"$resp" 2>/dev/null)
+  TASK_CS_ORIGIN="${otype:-none}:${osender:-none}"
+  if [[ "$otype" != "user" ]]; then
+    TASK_CS_REASON="the cited message's forward origin is '${otype:-absent}', not a named user — no human sender is attested (a hidden-origin forward attests nobody)"
+    return 1
+  fi
+  if [[ "$osender" != "$chat" ]]; then
+    TASK_CS_REASON="the cited message was sent by user ${osender:-unknown}, not by the paired human of chat ${chat} — the bot's own messages and any third party are refused"
+    return 1
+  fi
+  # (4) FRESH, and about THIS gate.
+  if [[ ! "$odate" =~ ^[0-9]+$ ]]; then
+    TASK_CS_REASON="the cited message carries no usable timestamp, so its freshness cannot be established"
+    return 1
+  fi
+  # THE BOUND MUST NOT COME FROM THE CALLER (olivia, iteration-1 reject). This
+  # window is what stops a stale human line being replayed onto a newer gate, and
+  # the caller of `task answer` IS the agent — so reading it straight from the
+  # environment made the mitigation settable by the party it defends against, with
+  # no forgery needed. Measured on 8312851: a 400-day-old "approved" in the human's
+  # own chat refused at the default (rc=6, gate open) and CLEARED under
+  # GATE_CHANNEL_SESSION_MAX_AGE=999999999 (rc=0, human_evidence=channel-session) —
+  # a row affirmatively attesting a human cleared a tier-2 gate nobody touched.
+  # So the ceiling is hardcoded here and the env knob may only TIGHTEN it: a
+  # deployment that wants a stricter window still gets one, while wider, zero,
+  # negative and non-numeric all fall back to the ceiling itself.
+  local _ceil=3600 _max="${GATE_CHANNEL_SESSION_MAX_AGE:-}"
+  if [[ ! "$_max" =~ ^[0-9]+$ ]] || (( _max <= 0 || _max > _ceil )); then _max=$_ceil; fi
+  local _now _age
+  _now=$(date +%s)
+  _age=$(( _now - odate )); (( _age < 0 )) && _age=0
+  TASK_CS_AGE="$_age"
+  if (( _age > _max )); then
+    TASK_CS_REASON="the cited message is ${_age}s old (limit ${_max}s) — a stale human message must not be replayed onto a newer gate"
+    return 1
+  fi
+  # WHICH GATE, AND WHICH ANSWER — both, not either (olivia, iteration-1 reject).
+  # The first cut cleared on the answer value OR the ident, and each alone leaves a
+  # hole: the VALUE is not unique (an ordinary "approved"/"yes" fits any number of
+  # open gates, which is the shared-value replay the window was wrongly asked to
+  # bound), and the IDENT alone attests only that the human spoke ABOUT this gate —
+  # `--value` still comes from the agent, so a human writing "DIVE-x, no" would
+  # clear it with value=yes. The ident is unique per gate and the value is the
+  # decision, so tier 2 requires the message to carry both. An empty `--value`
+  # (a bare approval) requires the ident alone, because there is no answer string
+  # to corroborate. tier<2 callers who want the loose form already have the
+  # citation-free DIVE-1305 chat-only path, so nothing is lost by making this one
+  # strict for everybody.
+  local _hay _nv _ni
+  _hay=$(printf '%s' "$otext" | tr '[:upper:]' '[:lower:]')
+  _nv=$(printf '%s' "$bind" | tr '[:upper:]' '[:lower:]' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+  _ni=$(printf '%s' "$ident" | tr '[:upper:]' '[:lower:]')
+  if [[ -z "$_ni" || "$_hay" != *"$_ni"* ]]; then
+    TASK_CS_REASON="the cited message does not name ${ident}, so it is not attributable to THIS gate — the answer value alone is not unique to one gate"
+    return 1
+  fi
+  if [[ -n "$_nv" && "$_hay" != *"$_nv"* ]]; then
+    TASK_CS_REASON="the cited message names ${ident} but not the answer ('${bind}'), so it does not attest WHICH answer the human gave"
+    return 1
+  fi
+  return 0
+}
+
 # DIVE-1490: append a queryable delivery event for a gate alert. The purpose-
 # built notify log is group-writable for agent-filed gates (DIVE-1345), while
 # audit_log provides the tamper-evident event stream. Failures are ALSO loud on
@@ -7476,7 +7639,7 @@ cmd_task_clear_recs() {
 
 cmd_task_answer() {
   tasks_db_init
-  local value="" value_set=0 from="" human=0 human_proof="" channel_proof=""
+  local value="" value_set=0 from="" human=0 human_proof="" channel_proof="" channel_msg=""
   local -a positional=()
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -7506,6 +7669,11 @@ cmd_task_answer() {
       # per-gate button tap. This is the "go with recs from your own channel"
       # clear (lodar's chosen scope, DIVE-1305 decision 2026-07-16).
       --channel-proof=*) channel_proof="${1#*=}" ;;
+      # DIVE-2412: the message_id of the human's OWN message in that verified DM.
+      # This is the citation the tier-2 form is built on: the chat id above says
+      # WHICH conversation, and only this says the human actually spoke in it —
+      # and it is checked against Telegram, not against the caller's word.
+      --channel-msg=*) channel_msg="${1#*=}" ;;
       --)        shift; positional+=("$@"); break ;;
       -*)        fail "$E_USAGE" "unknown flag: $1" ;;
       *)         positional+=("$1") ;;
@@ -7597,6 +7765,37 @@ cmd_task_answer() {
   # scope so that stamp reads an initialized 0 on the gate types that never enter
   # that block, rather than an unset variable. Values are still set there, once.
   local _hp=0 _su=0
+
+  # DIVE-2412 (DIVE-2382 fix #4): the CITED-MESSAGE form, which a tier-2 gate DOES
+  # accept. The chat-only proof above stays tier<2 for the reason lodar scoped it
+  # that way — an agent's session already knows the chat id, so alone it proves
+  # only that this bot has a paired human. A citation is different in kind: the
+  # message_id is checked against TELEGRAM (_gate_channel_session_ok), which is the
+  # one party in this system the caller cannot speak for. So the tier-2 floor below
+  # is satisfied by CHANNEL PROOF of the answer, not only by a button tap.
+  #
+  # Order matters: this runs BEFORE the evidence block and the tier-2 floor, and it
+  # is the only thing here that can raise `human` on a tier-2 gate.
+  local _cs_ok=0
+  if [[ -n "$channel_msg" ]]; then
+    [[ -n "$channel_proof" ]] || fail "$E_USAGE" "--channel-msg=<message_id> also needs --channel-proof=<chat_id> — the verified DM the message was sent in"
+    if _gate_channel_session_ok "$channel_proof" "$channel_msg" "${value:-}" "$ident"; then
+      _cs_ok=1
+    else
+      # FAIL CLOSED, AND NAME THE CONDITION. A citation that does not attest must
+      # never fall through to the weaker chat-only form, nor to the generic floor
+      # message below: the caller asserted a human answer and the assertion did
+      # not hold, which is the refusal this ticket is graded on. Nothing above
+      # this point writes to the row, so the gate is still unanswered — that is
+      # the property the refusal arm checks, not merely a non-zero rc.
+      _task_store_audit_log "task answer gate" error 0 -- \
+        "task=$ident" "type=$nt" "tier=$gtier" "reason=channel-session citation did not attest" \
+        "channel_proof=${channel_proof}" "channel_msg=${channel_msg}" "origin=${TASK_CS_ORIGIN:-none}" \
+        "age=${TASK_CS_AGE:-unknown}" "detail=${TASK_CS_REASON:-unknown}" 2>/dev/null || true
+      fail "$E_AUTH_REQUIRED" "$ident: the cited channel message is not usable as the human's answer — ${TASK_CS_REASON:-unattested}. An agent's report of a human answer is not evidence (DIVE-2412), so the gate is still open."
+    fi
+  fi
+  (( _cs_ok )) && human=1
 
   # DIVE-394: approval/secret are HUMAN-ONLY gates. Reject answers that come from
   # an agent acting as itself — that's the DIVE-391 incident, where an Olivia
@@ -7794,13 +7993,16 @@ cmd_task_answer() {
     # "no human evidence ⇒ reject" rule) does not block the very exception granted
     # by the uid block above. Scoped to approval/manual with a matching
     # routed_reviewer (never secret), so no un-routed human gate is affected.
-    local _evid=$(( _hp || _su || _lead_clear || _cp_ok ))
+    # DIVE-2412: _cs_ok is the attested cited-message form. Unlike _cp_ok it is
+    # NOT tier-fenced, so it satisfies the evidence rule on a tier-2 approval too.
+    local _evid=$(( _hp || _su || _lead_clear || _cp_ok || _cs_ok ))
     local _caller2; _caller2=$(id -un 2>/dev/null || echo '?')
     # DIVE-2054: the human-proof/nonce evidence being scored here is stored
     # against $ident in TASKS_DB (not an independent channel/delivery fact like
     # the 3 named exemptions) — fenced.
     _task_store_audit_log "task answer gate" "$([[ $_evid -eq 1 ]] && echo ok || echo error)" 0 -- \
       "task=$ident" "type=$nt" "channel_proof=$([[ -n "$channel_proof" ]] && echo present || echo absent)" "cp_ok=$_cp_ok" \
+      "channel_msg=${channel_msg:-none}" "cs_ok=$_cs_ok" "cs_origin=${TASK_CS_ORIGIN:-none}" "cs_age=${TASK_CS_AGE:-none}" \
       "human_proof=$([[ -n "$human_proof" ]] && echo present || echo absent)" "nonce_valid=$_hp" \
       "sudo_nonagent=$_su" "human=$human" "caller=$_caller2" "sudo_uid=${SUDO_UID:-}" \
       "enforce=$(_gate_proof_enforced && echo on || echo off)"
@@ -7929,15 +8131,28 @@ cmd_task_answer() {
       local _t2_hp=0 _t2_su=0
       [[ -n "$human_proof" ]] && _human_nonce_verify "$id" "$human_proof" && _t2_hp=1
       _gate_sudo_uid_nonagent && _t2_su=1
+      # DIVE-2412: THE CITATION IS THE THIRD EVIDENCE FORM, and it has to be named
+      # HERE rather than only in the `human` flag it also raises. This site is what
+      # decides whether a tier-2 `--human` claim was PROVED, and it is scoped to
+      # gates that HAVE a minted nonce — which is every approval and manual gate,
+      # i.e. exactly the ones this feature exists for. Omitted from this list, the
+      # citation would raise `human`, clear the floor above, and then be refused
+      # here as an unproven claim: the feature would be dead on its main case.
+      # It is admitted on the same footing as the other two because it is not
+      # weaker in kind — the nonce and the non-agent SUDO_UID are both local to
+      # this box, while the citation is attested by Telegram, the one party the
+      # caller cannot speak for (_gate_channel_session_ok).
+      local _t2_cs="${_cs_ok:-0}"
       local _t2_caller; _t2_caller=$(id -un 2>/dev/null || echo '?')
       # DIVE-2054: the nonce being scored is task-store state for $ident — fenced.
       _task_store_audit_log "task answer t2-human-evidence" \
-        "$([[ $(( _t2_hp || _t2_su )) -eq 1 ]] && echo ok || echo error)" 0 -- \
+        "$([[ $(( _t2_hp || _t2_su || _t2_cs )) -eq 1 ]] && echo ok || echo error)" 0 -- \
         "task=$ident" "type=$nt" "tier=$gtier" "nonce_valid=$_t2_hp" "sudo_nonagent=$_t2_su" \
+        "channel_session=$_t2_cs" \
         "human_proof=$([[ -n "$human_proof" ]] && echo present || echo absent)" \
         "caller=$_t2_caller" "sudo_uid=${SUDO_UID:-}" 2>/dev/null || true
-      if (( ! _t2_hp && ! _t2_su )); then
-        fail "$E_AUTH_REQUIRED" "$ident is a tier-2 human gate ($nt) and the --human claim is unproven: no valid per-gate proof and no non-agent SUDO_UID. Tap the button in Telegram (it carries the proof) or answer from the dashboard. A bare 'sudo 5dive task answer --human' is exactly the forge this refuses."
+      if (( ! _t2_hp && ! _t2_su && ! _t2_cs )); then
+        fail "$E_AUTH_REQUIRED" "$ident is a tier-2 human gate ($nt) and the --human claim is unproven: no valid per-gate proof, no non-agent SUDO_UID and no attested channel citation. Tap the button in Telegram (it carries the proof), cite the human's own message with --channel-msg, or answer from the dashboard. A bare 'sudo 5dive task answer --human' is exactly the forge this refuses."
       fi
     fi
   fi
@@ -8053,6 +8268,27 @@ cmd_task_answer() {
   ledger_emit gate.answered ident="$ident" task_id="$id" actor="${_lg_prov:-unknown}" \
     policy="tier${gtier}:${nt}" out="$_vfs" \
     detail="${nt} gate cleared by ${_lg_prov:-<unrecorded>}$([[ "$_lg_prov" == human:* ]] && echo ' (human touchpoint)')"
+
+  # DIVE-2412 acceptance: WHICH evidence form cleared this gate must be
+  # recoverable FROM THE ROW, not only from a log line that can rotate or diverge
+  # from it (DIVE-2090). A tap (`nonce`), a dashboard/on-box exec (`sudo-uid`), the
+  # tier<2 chat-only proof (`channel-chat`) and the tier-2 citation
+  # (`channel-session`) all persist as need_answered_by=human:*, so without this
+  # column the four are indistinguishable afterwards — and `channel-session` is the
+  # only one that cleared a tier-2 gate with nobody touching a button. That
+  # distinction is the audit question this feature creates, so it is stored, not
+  # derived. `+`-joined when more than one form was present; `none` when a
+  # non-human path (a decision gate, an auto-answer) wrote the row.
+  # _hp/_su are function-scope locals initialized to 0 since DIVE-2406, and the
+  # other flags are set only on the paths that raise them — hence the :-0
+  # defaults, which are belt-and-braces rather than a guess.
+  local _evform=""
+  [[ "${_hp:-0}" == "1" ]] && _evform="${_evform:+$_evform+}nonce"
+  [[ "${_su:-0}" == "1" ]] && _evform="${_evform:+$_evform+}sudo-uid"
+  [[ "${_cs_ok:-0}" == "1" ]] && _evform="${_evform:+$_evform+}channel-session"
+  [[ "${_cp_ok:-0}" == "1" ]] && _evform="${_evform:+$_evform+}channel-chat"
+  [[ "${_lead_clear:-0}" == "1" ]] && _evform="${_evform:+$_evform+}lead"
+  db "UPDATE tasks SET human_evidence=$(sqlq "${_evform:-none}") WHERE id=${id};"
 
   # DIVE-2099: the authoritative record of a STANDING-authority clear. Emitted
   # AFTER the write and reading `need_answered_by` BACK OUT of the row, so it
