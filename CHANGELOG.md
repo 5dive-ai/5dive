@@ -1,5 +1,34 @@
 # Changelog
 
+## Unreleased — fix(release-cut): move the nightly off the contended top-of-hour and poll for CI to settle (DIVE-2466)
+
+The nightly cut has never once run on time. `- cron: '0 3 * * *'` was byte-identical across all six
+revisions of this file, and the top of the hour is the slot GitHub documents as worst for
+`schedule` — it delays under load and sometimes drops. Both of our schedule runs started ~2h45m
+late (05:43:31 and 05:47:58) and the third night produced no run at all.
+
+That delay also silently voided the slot's own stated rationale: the comment justified 03:00 as
+"an hour ahead of the fleet's 04:00 self-update, so a nightly cut is available to the boxes that
+same night", and at +163 min the cut landed *after* the fleet had already updated. The reason for
+the slot had never held in practice. It now runs at 02:37 with a 03:43 re-arm for the dropped-run
+case — safe by construction rather than by a new guard, since the job already exits 0 early when
+the incumbent tag was cut from main's current tip, and the existing `concurrency` group means the
+re-arm cannot race the primary.
+
+Second arm: the CI verdict polled instead of refusing on the first look. A nightly landing while
+CI on the newest merge is still running used to skip the whole day, leaving every box on the
+previous tag for 24h. It now re-reads the check-runs every 60s up to a 45-minute ceiling. The
+fail-closed property is untouched and only the number of looks changed — RED still refuses
+immediately and is never waited out, an expiry still exits non-zero with the same two messages,
+and absence of check-runs is still never green. The `CI NOT REACHED` branch is included for the
+same reason, and it was the easy one to miss: its own error text told a human to "let it complete,
+then re-run this job", which is exactly the retry the job declined to do itself.
+
+The poll budget is a hardcoded ceiling the env knob can only tighten; a larger or non-numeric
+value falls back to the ceiling. `tests/release_cut_guards_unit.sh` grows from 23 to 37 assertions,
+driving the extracted block with a stubbed fetch that returns a different board per look, plus a
+mutant that drops the re-read and must turn the in-flight-then-green arm red.
+
 ## Unreleased — fix(release): the release page says WHAT shipped, and the tag stamps the CHANGELOG (DIVE-2452)
 
 Every release published a body describing how it was cut. v0.17.9 carried 256 characters of

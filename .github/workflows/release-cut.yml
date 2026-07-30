@@ -27,9 +27,30 @@
 name: release-cut
 on:
   schedule:
-    # 03:00 UTC. Deliberately an hour ahead of the fleet's 04:00 self-update cron, so
-    # a nightly cut is available to the boxes that same night rather than a day later.
-    - cron: '0 3 * * *'
+    # DIVE-2466 ARM 1 — OFF THE TOP OF THE HOUR, AND ARMED TWICE.
+    #
+    # This was `0 3 * * *` in all six revisions of this file, and the top of the hour
+    # is the slot GitHub documents as worst for `schedule`: it delays, and sometimes
+    # drops, under load. Our own two schedule runs are the signature —
+    #   cron 03:00Z -> actually started 2026-07-28 05:43:31Z  (+163 min)
+    #   cron 03:00Z -> actually started 2026-07-29 05:47:58Z  (+168 min)
+    #   2026-07-30  -> no run created at all
+    #
+    # The delay also silently voided this slot's OWN rationale, which used to read
+    # "an hour ahead of the fleet's 04:00 self-update, so a nightly cut is available
+    # to the boxes that same night". At +163 min the cut landed 05:43 — AFTER the
+    # fleet had already self-updated. The stated reason for 03:00 had never once held
+    # in practice, so moving the slot repairs the rationale as well as the schedule.
+    #
+    # 02:37 keeps the cut comfortably ahead of 04:00 even after the polling window
+    # below (worst case ~03:22). The 03:43 re-arm exists for the DROPPED-run case, not
+    # the delayed one, and is safe BY CONSTRUCTION rather than by a new guard: this job
+    # already exits 0 early when the incumbent tag was cut from main's current tip
+    # ("main has not moved since the last cut"), so a redundant run is a cheap no-op.
+    # The `concurrency` group below (cancel-in-progress: false) means the re-arm can
+    # never race the primary — at worst it queues behind it and then no-ops.
+    - cron: '37 2 * * *'
+    - cron: '43 3 * * *'
   workflow_dispatch:
     inputs:
       reason:
@@ -146,8 +167,16 @@ jobs:
           # workflows — see version-assign.yml). Treating that as green would publish
           # an ungraded tree at precisely the moment our grading is broken, which is
           # the failure this whole ticket exists to retire. So: count first.
-          runs=$(gh api --paginate "repos/${GITHUB_REPOSITORY}/commits/${sha}/check-runs" \
-                   --jq '.check_runs[] | [.name, .status, (.conclusion // "pending"), (.details_url // "")] | @tsv' 2>/dev/null)
+          # DIVE-2466: the read is a FUNCTION because the guard below now looks more
+          # than once. Defined outside the fenced block on purpose — the block is
+          # extracted and executed by tests/release_cut_guards_unit.sh, which supplies
+          # its own `_ci_fetch_runs` stub, so a poll cannot reach the network there and
+          # a deleted stub fails loudly instead of grading nothing.
+          _ci_fetch_runs() {
+            gh api --paginate "repos/${GITHUB_REPOSITORY}/commits/${sha}/check-runs" \
+              --jq '.check_runs[] | [.name, .status, (.conclusion // "pending"), (.details_url // "")] | @tsv' 2>/dev/null
+          }
+          runs=$(_ci_fetch_runs)
           # >>> DIVE-2144 release-cut guard block (extracted verbatim by tests/release_cut_guards_unit.sh)
           # DIVE-2238: DROP THIS RUN'S OWN CHECK-RUNS BEFORE COUNTING ANYTHING.
           # This job runs against main's tip, so its own `cut` job is a check-run on
@@ -163,33 +192,69 @@ jobs:
           # run rather than just this job is the correct rule — no job of this run can
           # be a precondition for this run. Everything below is unchanged, and still
           # sees a genuinely in-flight OTHER run.
-          if [[ -n "${GITHUB_RUN_ID:-}" ]]; then
-            runs=$(awk -F'\t' -v self="/actions/runs/${GITHUB_RUN_ID}/" 'index($4, self) == 0' <<<"$runs")
-          fi
-          total=$(printf '%s' "$runs" | grep -c . || true)
+          # DIVE-2466 ARM 2 — POLL, DO NOT REFUSE ON THE FIRST LOOK.
+          #
+          # Both refusals below used to fire on a single read, which turns a TRANSIENT
+          # into a SKIPPED DAY: a nightly that lands while CI on the newest merge is
+          # still running publishes nothing, and every box keeps the previous tag for
+          # 24h. The 07-29 refusal was CORRECT on an unverified tree — that property is
+          # not being traded away here. ONLY THE NUMBER OF LOOKS CHANGES:
+          #   * RED still refuses IMMEDIATELY and is never waited out.
+          #   * a deadline expiry still exits non-zero, with the same two messages.
+          #   * green still requires at least one check-run — absence is never green.
+          # The `CI NOT REACHED` branch is in scope for the same reason, and it is easy
+          # to miss: its own error text told a human to "let it complete, then re-run
+          # this job", which is precisely the retry the job declined to do itself.
+          #
+          # THE BOUND IS A HARDCODED CEILING THE ENV KNOB CAN ONLY TIGHTEN (the DIVE-2412
+          # shape). A caller that could WIDEN it could park this job on a runner for
+          # hours; a caller that tightens it only makes the guard refuse sooner, which is
+          # the safe direction. A non-numeric or over-ceiling value falls back to the
+          # ceiling rather than being trusted.
+          _POLL_CEILING=2700          # 45 min, not caller-settable
+          _poll_max="${RELEASE_CUT_POLL_SECONDS:-$_POLL_CEILING}"
+          [[ "$_poll_max" =~ ^[0-9]+$ ]] || _poll_max="$_POLL_CEILING"
+          (( _poll_max > _POLL_CEILING )) && _poll_max="$_POLL_CEILING"
+          _poll_int="${RELEASE_CUT_POLL_INTERVAL:-60}"
+          [[ "$_poll_int" =~ ^[1-9][0-9]*$ ]] || _poll_int=60
+          _poll_started=$SECONDS
+          _look=0
+          while :; do
+            _look=$(( _look + 1 ))
+            if [[ -n "${GITHUB_RUN_ID:-}" ]]; then
+              runs=$(awk -F'\t' -v self="/actions/runs/${GITHUB_RUN_ID}/" 'index($4, self) == 0' <<<"$runs")
+            fi
+            total=$(printf '%s' "$runs" | grep -c . || true)
+            incomplete=$(awk -F'\t' '$2 != "completed"' <<<"$runs")
+            bad=$(awk -F'\t' '$3 != "success" && $3 != "skipped" && $3 != "neutral"' <<<"$runs" | awk -F'\t' '$2 == "completed"')
 
-          if (( total == 0 )); then
-            echo "::error::CI NOT REACHED on ${sha:0:12} — ZERO check-runs exist for this commit, which is NOT the same as green. Refusing to cut ${tag}. (A GITHUB_TOKEN push does not trigger workflows; dispatch bundle-drift against main, let it complete, then re-run this job.)"
-            exit 1
-          fi
+            echo "CI on ${sha:0:12}: ${total} check-run(s) (excluding this run's own) [look ${_look}]"
+            printf '%s\n' "$runs" | cut -f1-3 | sed 's/^/  /'
 
-          incomplete=$(awk -F'\t' '$2 != "completed"' <<<"$runs")
-          bad=$(awk -F'\t' '$3 != "success" && $3 != "skipped" && $3 != "neutral"' <<<"$runs" | awk -F'\t' '$2 == "completed"')
-
-          echo "CI on ${sha:0:12}: ${total} check-run(s) (excluding this run's own)"
-          printf '%s\n' "$runs" | cut -f1-3 | sed 's/^/  /'
-
-          if [[ -n "$incomplete" ]]; then
-            echo "::error::CI still IN FLIGHT on ${sha:0:12} — refusing to cut ${tag}. Unfinished:"
-            printf '%s\n' "$incomplete" | sed 's/^/  /'
-            exit 1
-          fi
-          if [[ -n "$bad" ]]; then
-            echo "::error::CI is RED on ${sha:0:12} — refusing to cut ${tag}. Failing:"
-            printf '%s\n' "$bad" | sed 's/^/  /'
-            exit 1
-          fi
-          echo "CI green on ${sha:0:12}: ${total}/${total} completed, none failing."
+            # RED FIRST, and it exits before any deadline arithmetic — a red verdict is
+            # final, so waiting on it could only delay a refusal that is already correct.
+            if [[ -n "$bad" ]]; then
+              echo "::error::CI is RED on ${sha:0:12} — refusing to cut ${tag}. Failing:"
+              printf '%s\n' "$bad" | sed 's/^/  /'
+              exit 1
+            fi
+            if (( total > 0 )) && [[ -z "$incomplete" ]]; then
+              echo "CI green on ${sha:0:12}: ${total}/${total} completed, none failing."
+              break
+            fi
+            _elapsed=$(( SECONDS - _poll_started ))
+            if (( _elapsed >= _poll_max )); then
+              if (( total == 0 )); then
+                echo "::error::CI NOT REACHED on ${sha:0:12} — ZERO check-runs exist for this commit after ${_elapsed}s of polling, which is NOT the same as green. Refusing to cut ${tag}. (A GITHUB_TOKEN push does not trigger workflows; dispatch bundle-drift against main, let it complete, then re-run this job.)"
+                exit 1
+              fi
+              echo "::error::CI still IN FLIGHT on ${sha:0:12} after ${_elapsed}s of polling — refusing to cut ${tag}. Unfinished:"
+              printf '%s\n' "$incomplete" | sed 's/^/  /'
+              exit 1
+            fi
+            sleep "$_poll_int"
+            runs=$(_ci_fetch_runs)
+          done
           # <<< DIVE-2144 release-cut guard block
 
           # --- the candidate must WIN install.sh's sort, not merely exist ---------
