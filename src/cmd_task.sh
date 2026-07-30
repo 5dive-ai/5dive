@@ -3384,6 +3384,43 @@ cmd_task_verify() {
         result_txt="⚠ self-verified-close: maker=${self_verify_maker}; verifier=${self_verify_verifier} never graded; iteration=${self_verify_iteration}"$'\n'"${result_txt}"
       fi
     fi
+    # DIVE-2067: `task verify --cmd` had NO guard against closing an ALREADY-CLOSED task,
+    # so a second close REPLACED the result field outright. Measured on DIVE-2059: the
+    # verifier closed it with the ACK at 10:22:37, the MAKER closed it again 39s later via
+    # `verify --cmd`, and the ACK — two operational caveats, the red-team evidence, and a
+    # follow-up split — was silently discarded. It survived only because the verifier had
+    # also compiled it to the wiki.
+    #
+    # Note this path is a SANCTIONED escape: the DIVE-2007 refusal message names
+    # `task verify --cmd` as a real exit for a maker whose delivery was refused. So the fix
+    # must NOT close that door — it blocks only the case where there is nothing to escape
+    # FROM, i.e. the task is already done and the closer is not the recorded verifier.
+    #
+    # RE-LAND NOTE (main, DIVE-2389): this compares `task_actor`, a PROVENANCE string the
+    # caller can set, and not the kernel-authenticated identity DIVE-2330 introduced after
+    # this fix was written. That is deliberate and it is a real limitation, so read it
+    # before extending this guard. The measured incident was an ACCIDENTAL clobber (a maker
+    # re-closing 39s later), not a forgery, and the cost of the two failure modes is not
+    # symmetric here: a forged actor loses one result field, whereas keying on the
+    # authenticated actor breaks every harness that models a verifier by setting USER —
+    # exactly what DIVE-2330 did to the gate suite. I tried the authenticated form first
+    # ($_svc_auth_actor is already in scope three lines up) and it takes C1 red for that
+    # reason. Hardening it needs a caller-uid seam in this harness, which is its own row,
+    # not a re-land.
+    local _v_st _v_vfier _v_actor _v_prev
+    _v_st=$(db "SELECT COALESCE(status,'') FROM tasks WHERE id=${id};")
+    _v_vfier=$(db "SELECT COALESCE(verifier,'') FROM tasks WHERE id=${id};")
+    _v_actor=$(task_actor "")
+    if [[ "$_v_st" == 'done' && -n "$_v_vfier" && "$_v_actor" != "$_v_vfier" ]]; then
+      policy_refuse "$E_CONFLICT" verify-over-closed DIVE-2067 "$ident" \
+        "$ident is ALREADY done and its recorded verifier is '${_v_vfier}', not '${_v_actor}'. A second close here would REPLACE the verifier's result field and silently discard their ACK (DIVE-2067). There is nothing to escape from: the grade already exists. To ADD evidence, send it to '${_v_vfier}' (5dive agent send ${_v_vfier} \"...\") and let them fold it in; to reopen, '5dive task reject $ident --feedback=...'."
+    fi
+    # DIVE-2067 rec 3: never silently discard. If a close still lands on an already-done
+    # task (the verifier re-closing their own), PRESERVE the prior result by appending.
+    if [[ "$_v_st" == 'done' ]]; then
+      _v_prev=$(db "SELECT COALESCE(result,'') FROM tasks WHERE id=${id};")
+      [[ -n "$_v_prev" ]] && result_txt="${result_txt}"$'\n'"--- superseded result (DIVE-2067, preserved) ---"$'\n'"${_v_prev}"
+    fi
     db "UPDATE tasks SET status='done', done_at=datetime('now'), result=$(sqlq "$result_txt") WHERE id=${id};"
     flipped=1
     if (( self_verified_close )); then
