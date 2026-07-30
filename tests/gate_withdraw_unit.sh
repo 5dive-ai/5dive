@@ -135,7 +135,7 @@ out=$(wd DIVE-201 ROOT SU=agent-creative); rc=$?
 # T2: an unrelated agent (SUDO_USER=agent-grok) is REFUSED.
 file_secret_gate DIVE-202
 out=$(wd DIVE-202 ROOT SU=agent-grok); rc=$?
-[[ $rc -ne 0 && "$(gate_open DIVE-202)" == "open" && "$out" == *"only the gate's holder"* ]] \
+[[ $rc -ne 0 && "$(gate_open DIVE-202)" == "open" && "$out" == *"only the gate's filer"* ]] \
   && ok_t "T2 unrelated agent REFUSED (gate untouched, actionable msg)" \
   || bad_t "T2 unrelated refused" "rc=$rc open=$(gate_open DIVE-202) out=$out"
 
@@ -227,7 +227,7 @@ out=$(wd DIVE-207 ROOT SU=agent-creative); rc=$?
 # text left behind — the exact shape that shipped. So the message arms are paired with a
 # LIVENESS arm that actually withdraws AS the coordinator, which goes RED on that
 # mutation, and with a DISTINCTNESS arm proving the coordinator is not reachable through
-# the lead condition (in the org above, main is BOTH creative's lead and the coordinator,
+# the lead condition (in the org above, main is BOTH creative's lead AND the coordinator,
 # so T3 cannot tell the two conditions apart and grades neither of them alone).
 db "INSERT INTO agents_org (name, role, reports_to) VALUES ('pi',NULL,'grok');"
 file_pi_gate() { seed_task "$1"; IS_ROOT=1 IDUN=root cmd_task_need "$1" --type=secret --ask="drop the fixture key" --from=pi >/dev/null 2>&1; }
@@ -236,14 +236,14 @@ z_lead=$(_gate_route_reviewer pi); z_coord=$(_task_resolve_coordinator)
   && ok_t "T-2382-DISTINCT pi's lead (grok) is NOT the coordinator (main) — the coordinator arm cannot pass through the lead condition" \
   || bad_t "T-2382-DISTINCT" "lead='$z_lead' coord='$z_coord'"
 
-# T-2382a LIVENESS / mutation-decisive: the coordinator withdraws a gate held by an agent
-# who does NOT report to them. Only condition 4 can authorize this. Delete condition 4
-# from src/cmd_task.sh and this arm goes RED.
+# T-2382a LIVENESS / mutation-decisive: the coordinator withdraws a gate whose filer does
+# NOT report to them. Only condition 4 can authorize this. Delete condition 4 from
+# src/cmd_task.sh and this arm goes RED.
 file_pi_gate DIVE-240
 [[ "$(gate_open DIVE-240)" == "open" ]] || bad_t "T-2382a precond" "open=$(gate_open DIVE-240)"
 out=$(wd DIVE-240 ROOT SU=agent-main); rc=$?
 [[ $rc -eq 0 && "$(gate_open DIVE-240)" == "cleared" ]] \
-  && ok_t "T-2382a org coordinator withdraws a gate held OUTSIDE their reporting line (condition 4 is live)" \
+  && ok_t "T-2382a org coordinator withdraws a gate filed OUTSIDE their reporting line (condition 4 is live)" \
   || bad_t "T-2382a coordinator withdraw" "rc=$rc open=$(gate_open DIVE-240) out=$out"
 
 # T-2382b/c/d: the refusal on the SAME row, from a caller who is none of the four
@@ -252,7 +252,7 @@ out=$(wd DIVE-240 ROOT SU=agent-main); rc=$?
 file_pi_gate DIVE-241
 out=$(wd DIVE-241 ROOT SU=agent-creative); rc=$?
 [[ $rc -ne 0 && "$(gate_open DIVE-241)" == "open" ]] \
-  && ok_t "T-2382b unauthorized caller still refused (the fix is the message, not the policy)" \
+  && ok_t "T-2382b unauthorized caller still refused" \
   || bad_t "T-2382b still refused" "rc=$rc open=$(gate_open DIVE-241) out=$out"
 [[ "$out" == *"the org coordinator (main)"* ]] \
   && ok_t "T-2382c refusal names the ORG COORDINATOR by resolved value (was omitted entirely)" \
@@ -261,37 +261,113 @@ out=$(wd DIVE-241 ROOT SU=agent-creative); rc=$?
   && ok_t "T-2382d refusal names the LEAD by resolved value, not the bare word 'lead'" \
   || bad_t "T-2382d names lead" "out=$out"
 
-# T-2382e: on a row where nothing was handed off, holder IS the filer-of-record — the
-# "filed by" clause must NOT appear. Grading the clause's presence is worthless without
-# this arm: a build that appends it unconditionally would pass every arm below.
-[[ "$(db "SELECT COALESCE(gate_filed_by,'') FROM tasks WHERE ident='DIVE-241';")" == "pi" ]] \
+# T-2382e: filer == holder, so the "held by" clause must be ABSENT. Grading the clause's
+# presence is worthless without this arm: a build that appends it unconditionally would
+# pass every arm below.
+[[ "$(db "SELECT COALESCE(gate_filed_by,'') FROM tasks WHERE ident='DIVE-241';")" == "pi" \
+   && "$(db "SELECT COALESCE(assignee,'') FROM tasks WHERE ident='DIVE-241';")" == "pi" ]] \
   && ok_t "T-2382e precond: DIVE-241 was filed BY its holder (gate_filed_by=assignee=pi)" \
-  || bad_t "T-2382e precond" "gate_filed_by=$(db "SELECT COALESCE(gate_filed_by,'') FROM tasks WHERE ident='DIVE-241';")"
-[[ "$out" == *"holder (assignee pi)"* && "$out" != *"filed by"* ]] \
-  && ok_t "T-2382e no handoff -> refusal names the holder and omits the filer clause (clause is conditional, not decorative)" \
+  || bad_t "T-2382e precond" "filed_by=$(db "SELECT COALESCE(gate_filed_by,'') FROM tasks WHERE ident='DIVE-241';") assignee=$(db "SELECT COALESCE(assignee,'') FROM tasks WHERE ident='DIVE-241';")"
+[[ "$out" == *"the gate's filer (pi)"* && "$out" != *"held by"* ]] \
+  && ok_t "T-2382e no handoff -> names the filer and omits the holder clause (clause is conditional, not decorative)" \
   || bad_t "T-2382e no-handoff clause" "out=$out"
 
-# T-2382f HANDOFF (DIVE-1945's case): pi files, the row is then reassigned to creative, so
-# withdraw rights MOVE to creative and pi — who actually filed it — no longer holds them.
-# The old text called creative "the gate's filer", naming as filer someone who never filed
-# it, and gave pi no hint their own ask had left them.
-file_pi_gate DIVE-242
-db "UPDATE tasks SET assignee='creative' WHERE ident='DIVE-242';"   # what a reassign does
-out=$(wd DIVE-242 ROOT SU=agent-grok); rc=$?
-[[ $rc -ne 0 && "$out" == *"holder (assignee creative)"* && "$out" == *"filed by pi"* ]] \
-  && ok_t "T-2382f handoff -> refusal names the HOLDER (creative) and the FILER-OF-RECORD (pi) separately" \
-  || bad_t "T-2382f handoff naming" "rc=$rc out=$out"
+# ══ DIVE-2382 PRINCIPAL REPLACE — the authorization site reads the FILER OF RECORD ══
+# Approved by olivia (org coordinator); shape ruled by main. The site used to authorize on
+# COALESCE(assignee,'') and now reads COALESCE(NULLIF(gate_filed_by,''),NULLIF(created_by,''),'').
+# It was wrong in BOTH directions, so the suite must grade BOTH. The pair below is what
+# makes this a NARROWING rather than a widening — an additive fifth authorizer would pass
+# arm P1 and FAIL arm P2, and P2 is the one that was green before this change.
+#
+# Every arm PERFORMS a withdraw as a DISTINCT agent: filer=pi, holder=creative,
+# filer's lead=grok, coordinator=main, human. A fixture that shares one name across two
+# routes tests their union and neither (see T-2382-DISTINCT).
+handoff_gate() {   # pi files it, then the row is REASSIGNED to creative
+  file_pi_gate "$1"
+  db "UPDATE tasks SET assignee='creative' WHERE ident='$1';"
+}
+handoff_gate DIVE-250
+[[ "$(db "SELECT COALESCE(gate_filed_by,'')||'/'||COALESCE(assignee,'') FROM tasks WHERE ident='DIVE-250';")" == "pi/creative" ]] \
+  && ok_t "T-2382-P precond: filer-of-record (pi) and holder (creative) are DISTINCT on the handoff row" \
+  || bad_t "T-2382-P precond" "$(db "SELECT COALESCE(gate_filed_by,'')||'/'||COALESCE(assignee,'') FROM tasks WHERE ident='DIVE-250';")"
+
+# P1 — UNDER-PERMISSIVE half, RED before this change: the agent who actually filed the
+# gate can retire their own ask after the row was handed off.
+out=$(wd DIVE-250 ROOT SU=agent-pi); rc=$?
+[[ $rc -eq 0 && "$(gate_open DIVE-250)" == "cleared" ]] \
+  && ok_t "T-2382-P1 the FILER OF RECORD withdraws their own ask after a handoff (was REFUSED before the replace)" \
+  || bad_t "T-2382-P1 filer withdraw" "rc=$rc open=$(gate_open DIVE-250) out=$out"
+
+# P2 — OVER-PERMISSIVE half, GREEN before this change and it MUST FLIP. This is the arm
+# that makes the suite grade a narrowing: a build that merely ADDED gate_filed_by as a
+# fifth authorizer leaves this passing-as-authorized, i.e. passes on a widening.
+handoff_gate DIVE-251
+out=$(wd DIVE-251 ROOT SU=agent-creative); rc=$?
+[[ $rc -ne 0 && "$(gate_open DIVE-251)" == "open" ]] \
+  && ok_t "T-2382-P2 the reassigned HOLDER can NO LONGER retire a question they never asked (the DIVE-2133 shape; flipped by the replace)" \
+  || bad_t "T-2382-P2 holder refused" "rc=$rc open=$(gate_open DIVE-251) out=$out"
+[[ "$out" == *"the gate's filer (pi)"* && "$out" == *"held by creative"* && "$out" == *"does NOT authorize"* ]] \
+  && ok_t "T-2382-P3 the refused holder is TOLD they hold it and that holding does not authorize (not omitted from the list)" \
+  || bad_t "T-2382-P3 holder told why" "out=$out"
+
+# P4 — the LEAD route follows the PRINCIPAL. grok is pi's lead and NOT creative's; before
+# the replace this was refused, because the lead was resolved from the holder. Leaving it
+# on the holder would have left a second copy of the same defect one rung up.
+handoff_gate DIVE-252
+out=$(wd DIVE-252 ROOT SU=agent-grok); rc=$?
+[[ $rc -eq 0 && "$(gate_open DIVE-252)" == "cleared" ]] \
+  && ok_t "T-2382-P4 the FILER's lead (grok) withdraws; the lead route moved with the principal" \
+  || bad_t "T-2382-P4 filer lead withdraw" "rc=$rc open=$(gate_open DIVE-252) out=$out"
+
+# P5/P6 — the two FILER-INDEPENDENT routes still work on the same handoff shape, which is
+# what guarantees no gate can be left with no authorizer.
+handoff_gate DIVE-253
+out=$(wd DIVE-253 ROOT SU=agent-main); rc=$?
+[[ $rc -eq 0 && "$(gate_open DIVE-253)" == "cleared" ]] \
+  && ok_t "T-2382-P5 coordinator withdraws a handed-off gate (filer-independent route survives the replace)" \
+  || bad_t "T-2382-P5 coordinator handoff" "rc=$rc open=$(gate_open DIVE-253) out=$out"
+handoff_gate DIVE-254
+out=$(wd DIVE-254 ROOT SD=0); rc=$?
+[[ $rc -eq 0 && "$(gate_open DIVE-254)" == "cleared" ]] \
+  && ok_t "T-2382-P6 human withdraws a handed-off gate (filer-independent route survives the replace)" \
+  || bad_t "T-2382-P6 human handoff" "rc=$rc open=$(gate_open DIVE-254) out=$out"
+
+# P7 — olivia's AMENDMENT, and the arm that pins it. The authorization shape stops at
+# created_by; it does NOT end on `assignee` the way :6154's display shape does. If it did,
+# a row with BOTH gate_filed_by and created_by empty would silently RE-ADMIT the holder —
+# the exact route being removed. Constructed by emptying both columns on a handoff row.
+handoff_gate DIVE-255
+db "UPDATE tasks SET gate_filed_by=NULL, created_by=NULL WHERE ident='DIVE-255';"
+out=$(wd DIVE-255 ROOT SU=agent-creative); rc=$?
+[[ $rc -ne 0 && "$(gate_open DIVE-255)" == "open" ]] \
+  && ok_t "T-2382-P7 filer AND created_by empty -> the HOLDER is still refused (authorization does not fall back to assignee)" \
+  || bad_t "T-2382-P7 no assignee fallback" "rc=$rc open=$(gate_open DIVE-255) out=$out"
+[[ "$out" == *"the gate's filer (unrecorded)"* ]] \
+  && ok_t "T-2382-P8 an unresolvable principal renders as 'unrecorded', a stated absence rather than a '?' placeholder" \
+  || bad_t "T-2382-P8 unrecorded" "out=$out"
+# P9 — and the gate is still retirable, which is why removing the rung costs nothing:
+# conditions 1 and 4 never consult the filer. Reachable by CONFIGURATION, not by data.
+out=$(wd DIVE-255 ROOT SU=agent-main); rc=$?
+[[ $rc -eq 0 && "$(gate_open DIVE-255)" == "cleared" ]] \
+  && ok_t "T-2382-P9 the same all-empty row is STILL retirable by the coordinator (no gate is left with no authorizer)" \
+  || bad_t "T-2382-P9 still retirable" "rc=$rc open=$(gate_open DIVE-255) out=$out"
 
 # T-2382g the DIVE-2106 shape: a carrier row with NO gate_filed_by, created by someone who
 # is not the holder. This is the row two agents read the old refusal on and concluded
-# nobody could ever retire it. The message must now fall back to created_by AND name the
-# coordinator, which is who could in fact have retired it all along.
+# nobody could ever retire it. The principal now falls back to created_by — so on the
+# EXISTING population (gate_filed_by empty in 965 of 990 live rows) the authorizer is the
+# CREATOR, a proxy for the filer, not the filer itself. Stated so nobody reads uniform
+# filer semantics across the whole board.
 file_pi_gate DIVE-243
-db "UPDATE tasks SET gate_filed_by=NULL WHERE ident='DIVE-243';"    # legacy / auto-created row
+db "UPDATE tasks SET gate_filed_by=NULL, created_by='main' WHERE ident='DIVE-243';"
 out=$(wd DIVE-243 ROOT SU=agent-creative); rc=$?
-[[ $rc -ne 0 && "$out" == *"filed by main"* && "$out" == *"the org coordinator (main)"* ]] \
-  && ok_t "T-2382g no gate_filed_by -> falls back to created_by AND still names the coordinator (the DIVE-2106 dead-end)" \
+[[ $rc -ne 0 && "$out" == *"the gate's filer (main)"* && "$out" == *"the org coordinator (main)"* ]] \
+  && ok_t "T-2382g no gate_filed_by -> principal falls back to created_by AND the coordinator is still named (the DIVE-2106 dead-end)" \
   || bad_t "T-2382g legacy row naming" "rc=$rc out=$out"
+out=$(wd DIVE-243 ROOT SU=agent-main); rc=$?
+[[ $rc -eq 0 ]] \
+  && ok_t "T-2382g-live the created_by proxy actually authorizes on a legacy row (not just rendered)" \
+  || bad_t "T-2382g-live" "rc=$rc out=$out"
 
 echo "----"
 echo "PASS=$PASS FAIL=$FAIL"
