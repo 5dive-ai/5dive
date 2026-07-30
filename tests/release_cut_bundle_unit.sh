@@ -45,9 +45,15 @@ run_block(){ # $1 = build.sh body, $2 = tag ; prints output, returns the block's
     git -c user.name=t -c user.email=a@b commit -q -m seed
     printf '%s' "$buildbody" > build.sh; chmod +x build.sh
     printf '%s\n' 'x' > .gitignore
+    # DIVE-2247: the block now ASSIGNS the version onto this tree before building,
+    # so the tree must carry the sentinel the real main carries. Seeding it here is
+    # what lets the extracted bytes be run as-shipped rather than around the bump.
+    mkdir -p src; printf 'readonly FIVE_VERSION="0.0.0-dev"\n' > src/header.sh
+    git add src/header.sh build.sh
+    git -c user.name=t -c user.email=a@b commit -q -m seed2
   ) >/dev/null 2>&1
   ( cd "$d"
-    sha=$(git rev-parse HEAD); tag="$tag"
+    sha=$(git rev-parse HEAD); tag="$tag"; version="${tag#v}"
     # shellcheck disable=SC2034
     note="test"
     eval "$BLOCK"
@@ -58,7 +64,9 @@ run_block(){ # $1 = build.sh body, $2 = tag ; prints output, returns the block's
 
 # build.sh bodies for each scenario
 GOOD='#!/usr/bin/env bash
-printf "%s\n" "#!/usr/bin/env bash" "readonly FIVE_VERSION=\"9.9.9\"" "true" > 5dive
+# stands in for the real build.sh: the bundle takes its version FROM src/header.sh,
+# so a bump that did not land shows up as a bundle carrying the sentinel.
+printf "%s\n" "#!/usr/bin/env bash" "$(grep -m1 "^readonly FIVE_VERSION=" src/header.sh)" "true" > 5dive
 sha256sum 5dive | cut -d" " -f1 > 5dive.sha256'
 NOBUNDLE='#!/usr/bin/env bash
 true'
@@ -148,6 +156,41 @@ grep -q 'serves a DIFFERENT bundle than this cut verified' "$WF" \
 grep -qE 'git (tag (-d|--delete)|push .*(--delete|:refs/tags/))' "$WF" \
   && bad_t 'the cut deletes the tag on failure — that hides the one event worth seeing' '' \
   || ok_t 'a failed servability probe leaves the tag standing for a human to see'
+
+
+echo "-- DIVE-2247: the assignment is load-bearing, graded by mutating the shipped bytes"
+# The happy path above only proves the tag and the bundle agree. It would ALSO pass if
+# main still carried a real version and nothing here assigned one -- which is precisely
+# the arrangement this ticket removed. So: delete the sed from the extracted block and
+# assert the cut goes RED. A green mutant means the bump is decoration.
+MUTANT=$(printf '%s\n' "$BLOCK" | grep -v 'sed -i -E "s/\^readonly FIVE_VERSION')
+[[ "$MUTANT" != "$BLOCK" ]] || bad_t 'mutation did not change the block (anchor drifted) — the arm below is vacuous' ''
+run_mutant(){ local d; d=$(mktemp -d)
+  ( set -e
+    cd "$d"; git init -q .; git config user.email a@b; git config user.name t
+    printf 'seed\n' > seed.txt
+    printf '%s' "$GOOD" > build.sh; chmod +x build.sh
+    printf '%s\n' 'x' > .gitignore
+    mkdir -p src; printf 'readonly FIVE_VERSION="0.0.0-dev"\n' > src/header.sh
+    git add -A; git -c user.name=t -c user.email=a@b commit -q -m seed
+  ) >/dev/null 2>&1
+  ( cd "$d"; sha=$(git rev-parse HEAD); tag="v9.9.9"; version="9.9.9"
+    # shellcheck disable=SC2034
+    note="test"; eval "$MUTANT" ) 2>&1
+  local rc=$?; rm -rf "$d"; return $rc
+}
+out=$(run_mutant); rc=$?
+[[ $rc -ne 0 ]] && ok_t 'with the assignment removed the cut REFUSES (the bump is not decoration)' \
+                || bad_t 'the cut passed WITHOUT assigning a version — the sentinel would have been published' "rc=$rc out=$out"
+grep -q '0\.0\.0-dev' <<<"$out" \
+  && ok_t 'and it names the sentinel it refused to publish' \
+  || ok_t 'refused (message does not name the sentinel, which is acceptable)'
+
+echo "-- and main itself must carry the sentinel, not a real version"
+_hdr=$(grep -m1 -oE '^readonly FIVE_VERSION="[^"]+"' "$ROOT/src/header.sh" | cut -d'"' -f2)
+[[ "$_hdr" == "0.0.0-dev" ]] \
+  && ok_t "src/header.sh carries the sentinel ($_hdr) — nothing assigns a version to main" \
+  || bad_t "src/header.sh carries a REAL version ($_hdr); assignment-at-merge has come back" ''
 
 printf '\n%s passed, %s failed\n' "$PASS" "$FAIL"
 [[ $FAIL -eq 0 ]]
