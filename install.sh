@@ -17,7 +17,21 @@
 # The same property holds for the six BRANCH-TARBALL fetches below (skills and
 # 5dive-plugins, marked `MERGE-DEPLOYS` at each site) — those land root-installed
 # from ANOTHER repo's mutable main, where no control in this repo can see them.
-# Full enumeration, 9 sites across 4 repos (DIVE-2308):
+#
+# THE COUNT, WITH ITS SCOPE AND ITS DATE, because a bare figure at an edit site is
+# the very thing this comment exists to prevent:
+#   7 live sites ON THE ROOT-INSTALLED-ON-UPGRADE RAIL — this file plus the six
+#   branch tarballs below — as of 2026-07-30, measured against 6f5e5c9.
+#   DIVE-2308 enumerated 9 on 2026-07-29 against 44e612f. Row 8 (the version probe
+#   calling main HEAD "published") is CLOSED: `_published_cli_probe` now resolves
+#   the newest release tag and fails closed. Row 9 (the `status` badge branch) is
+#   public-by-design and off the install path.
+#   ADJACENT AND DELIBERATELY NOT IN THE 7 — a different rail, named so the number
+#   cannot be mistaken for the whole population: `_marketplace_base`
+#   (src/cmd_pack.sh) and `_loops_base` (src/cmd_loop_pack.sh) each fetch another
+#   repo's mutable main, but ON DEMAND when a user runs the verb, not root-installed
+#   on every upgrade.
+# Full enumeration and its negative space (DIVE-2308, corrected 2026-07-30):
 #   community/wiki/the-merge-deploys-population-is-scoped-to-the-box-not-to-the-repo.md
 #
 # Everything else the installer places comes through `$REPO`, which DIVE-2144

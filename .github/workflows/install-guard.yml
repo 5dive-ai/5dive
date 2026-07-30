@@ -11,7 +11,11 @@
 # DIVE-2288/DIVE-2308 — READ THE SCOPE OF THE SENTENCE ABOVE. "The only file in this
 # repo" is TRUE and it is a SAMPLE, not the population. The risk this job exists to
 # bound is what reaches a customer BOX without a tag, and by that boundary install.sh
-# is 1 of 7 live merge-deploys sites. The other six are BRANCH TARBALLS of
+# is 1 of 7 live merge-deploys sites ON THE ROOT-INSTALLED-ON-UPGRADE RAIL, measured
+# 2026-07-30 against 6f5e5c9. (DIVE-2308 enumerated 9 on 07-29; row 8 is now closed and
+# row 9 is the by-design `status` badge branch. Two further sites — `_marketplace_base`
+# and `_loops_base` — fetch another repo's mutable main ON DEMAND rather than on
+# upgrade, so they are a different rail and deliberately not in the 7.) The other six are BRANCH TARBALLS of
 # 5dive-ai/skills and 5dive-ai/5dive-plugins, fetched by install.sh and root-installed
 # on every --upgrade. NO PATH FILTER IN THIS REPO CAN EVER SEE THEM, because a path
 # filter is scoped to the artifact you are editing while the hazard is scoped to where
@@ -59,7 +63,9 @@ jobs:
             echo
             echo "### What this job CANNOT see (DIVE-2288 / DIVE-2308)"
             echo
-            echo "install.sh is **1 of 7** live merge-deploys sites that reach a box without a tag."
+            echo "install.sh is **1 of 7** live merge-deploys sites on the root-installed-on-upgrade"
+            echo "rail — measured 2026-07-30 against \`6f5e5c9\`. DIVE-2308 enumerated 9 on 07-29; row 8"
+            echo "(the version probe) is now closed and row 9 is the by-design \`status\` branch."
             echo "The other six are branch tarballs of **other repos**, fetched by install.sh and"
             echo "root-installed on every \`--upgrade\`. A path filter here is blind to all of them:"
             echo
