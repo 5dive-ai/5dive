@@ -24,8 +24,16 @@ case ":$PATH:" in
   *) export PATH="/usr/local/sbin:/usr/sbin:/sbin:$PATH" ;;
 esac
 
-# Bumped on every public release. `build.sh` checks this line exists; CI fails
+# NOT A VERSION, AND NOT BUMPED HERE (DIVE-2247). Since assignment moved to tag
+# time, main carries this sentinel and release-cut.yml writes the real version onto
+# the detached release commit it builds. `build.sh` checks the line exists; CI fails
 # the bundle-drift check if it's missing or empty.
+#
+# IF YOU ARE RESOLVING A MERGE CONFLICT ON THIS LINE, read this first: the other
+# side is a hand-assigned version from the era this ticket ended. Keeping the
+# sentinel is correct — but that version was CLAIMED, and possibly installed
+# somewhere, so it must not be re-issued. Check it is <= .release-floor and raise
+# the floor if it is not. Graded by tests/release_cut_assign_unit.sh.
 readonly FIVE_VERSION="0.0.0-dev"
 
 # GitHub org our repos live under. The org is being renamed
