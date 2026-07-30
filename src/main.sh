@@ -267,7 +267,7 @@ Actor-routed gh (DIVE-2448):
   5dive gh <gh args...>                    # writes go out as the machine account; admin + reads stay on your credential
   5dive gh --as=bot|caller <gh args...>    # force one identity | --explain prints the decision and runs nothing
   5dive gh whoami                          # resolve BOTH identities, so "who did that write go out as" is measurable
-  # An agent `gh` write authenticates as the HUMAN account, so the audit trail cannot tell agent from human
+  # An agent gh write authenticates as the HUMAN account, so the audit trail cannot tell agent from human
   # (DIVE-2232). The PAT stays root-side in /etc/5dive/connectors/github-bot.env — the agent never holds it.
 
 Models:
