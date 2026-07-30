@@ -246,6 +246,23 @@ jobs:
           sed -i -E "s/^readonly FIVE_VERSION=\"[^\"]+\"/readonly FIVE_VERSION=\"${version}\"/" src/header.sh
           [ "$(grep -m1 -oE '^readonly FIVE_VERSION="[^"]+"' src/header.sh)" = "readonly FIVE_VERSION=\"${version}\"" ] \
             || { echo "::error::could not write FIVE_VERSION=${version} into src/header.sh (the 'readonly FIVE_VERSION=' anchor drifted?) — refusing to cut ${tag} rather than publish the sentinel"; exit 1; }
+          # DIVE-2452: STAMP THE CHANGELOG onto this release commit, same rule as the
+          # FIVE_VERSION write above — the detached release tree only, never main
+          # (DIVE-2247 removed this job's ability to push a protected branch, and the
+          # fix was to stop needing it). At the release commit "pending" is empty by
+          # construction: every section in this tree ships in this tag, so rewriting
+          # every `## Unreleased` heading is correct HERE in a way it would not be on
+          # main. Effect: `git show ${tag}:CHANGELOG.md` can answer "what shipped in
+          # this version", which nothing could before — every heading at v0.17.9 read
+          # `Unreleased`, eight of them in the first 300 lines.
+          # Not fatal: a cut with an unstampable CHANGELOG is worse published with a
+          # warning than not published at all, and the release BODY (below) does not
+          # depend on the stamp — it is derived from the range.
+          if _stamped=$(bash scripts/stamp-changelog.sh "${version}" 2>&1); then
+            echo "CHANGELOG stamped for ${tag}: ${_stamped} heading(s) (DIVE-2452)"
+          else
+            echo "::warning::CHANGELOG could not be stamped for ${tag} (${_stamped}) — publishing anyway; the release BODY is derived from the git range and is unaffected."
+          fi
           ./build.sh || { echo "::error::build.sh failed — refusing to cut ${tag} with no bundle"; exit 1; }
           [ -s 5dive ] && [ -s 5dive.sha256 ] \
             || { echo "::error::build.sh produced no bundle/checksum — refusing to cut ${tag}"; exit 1; }
@@ -259,6 +276,11 @@ jobs:
           [ "v${_bundle_ver}" = "$tag" ] \
             || { echo "::error::built bundle says FIVE_VERSION=${_bundle_ver} but this cut is ${tag} — refusing to publish a bundle that disagrees with its own tag"; exit 1; }
           git add -f 5dive 5dive.sha256 src/header.sh
+          # DIVE-2452: the stamped CHANGELOG rides in the release commit. Guarded
+          # rather than appended to the line above: `git add` fails the whole step on
+          # a pathspec that matches nothing, and the stamp is explicitly non-fatal —
+          # a cut must not die because a repo has no CHANGELOG.md.
+          if [ -f CHANGELOG.md ]; then git add -f CHANGELOG.md; fi
           git -c user.name=lodar -c user.email=markounik@gmail.com \
               commit -q -m "release ${tag}: assign ${version} + built bundle (DIVE-2091 bundle-at-tag-time, DIVE-2247 version-at-tag-time)"
           # DIVE-2433: `sha` is about to stop meaning "the commit whose check-runs we
@@ -407,9 +429,34 @@ jobs:
           fi
           echo "${tag}: bundle verified SERVABLE and byte-correct at ${sha:0:12} (${_got:0:16}…) — install.sh's FATAL fetch path is proven, not assumed"
 
-          gh release create "$tag" --title "$tag" --target "$sha" --notes "${note}
-
-          Installed by every box via install.sh's tag resolver (DIVE-2144). Previous published tag: ${incumbent:-none}." \
+          # DIVE-2452: THE RELEASE BODY SAYS WHAT SHIPPED, not how it was cut.
+          # This used to be `--notes "${note}"`, where `note` is the CUT REASON, so
+          # v0.17.0/0.17.1/0.17.9 each published 200-600 characters describing the
+          # dispatch and nothing about the 76 commits inside. Derivation, its source
+          # order, and why the git RANGE rather than the `Unreleased` heading text is
+          # the boundary all live in scripts/release-notes.sh — where they can be
+          # unit-graded (tests/release_notes_unit.sh), the same split this file
+          # already uses for grade-release-commit.sh.
+          #
+          # `cut_from` is the main sha the incumbent tag was cut from — the same
+          # comparand the main-moved check above uses, recomputed here because that
+          # block returns early on the no-move path and never reaches this point.
+          _notes_from=""
+          if [[ -n "$incumbent" ]]; then
+            _notes_from=$(git rev-parse -q --verify "refs/tags/${incumbent}^{commit}^" 2>/dev/null || true)
+          fi
+          _notes_file="$(mktemp)"
+          if ! bash scripts/release-notes.sh "$_notes_from" "$sha" "$version" > "$_notes_file"; then
+            echo "::error::${tag} IS PUBLISHED as a tag, but its release notes could not be derived from ${_notes_from:-<root>}..${sha:0:12} — refusing to create a release page whose body would describe only how the cut was dispatched (DIVE-2452). Boxes are unaffected; write the notes by hand and create the release page."
+            exit 1
+          fi
+          {
+            printf '\n---\n\n'
+            printf '%s\n\n' "$note"
+            printf "Installed by every box via install.sh's tag resolver (DIVE-2144). Previous published tag: %s.\n" "${incumbent:-none}"
+          } >> "$_notes_file"
+          gh release create "$tag" --title "$tag" --target "$sha" --notes-file "$_notes_file" \
             || echo "::warning::THE TAG IS PUBLISHED and boxes will take ${tag} — only the release PAGE failed to create. Not an error in the publish; create the release by hand if you want the notes."
+          rm -f "$_notes_file"
 
           echo "::notice::published ${tag} at ${sha:0:12} (was ${incumbent:-none}) — this is what every box now installs"
