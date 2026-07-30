@@ -263,6 +263,13 @@ Delegated push (bring your own GitHub App — DIVE-1376):
   # (contents:write, installed on your ship repos), held root-side in /etc/5dive/connectors — never a human token.
   # Full setup walkthrough: docs/delegated-push.md
 
+Actor-routed gh (DIVE-2448):
+  5dive gh <gh args...>                    # writes go out as the machine account; admin + reads stay on your credential
+  5dive gh --as=bot|caller <gh args...>    # force one identity | --explain prints the decision and runs nothing
+  5dive gh whoami                          # resolve BOTH identities, so "who did that write go out as" is measurable
+  # An agent gh write authenticates as the HUMAN account, so the audit trail cannot tell agent from human
+  # (DIVE-2232). The PAT stays root-side in /etc/5dive/connectors/github-bot.env — the agent never holds it.
+
 Models:
   5dive models [--json]
     Current Claude model id per short alias (opus / sonnet / fable / haiku).
@@ -368,6 +375,24 @@ main() {
         >> "$AUDIT_LOG" 2>/dev/null || true
       exit 0
       ;;
+    gh)
+      # DIVE-2448 (last mile of DIVE-2232): actor-routed `gh`. A WRITE goes out as
+      # the machine account so the actor field means something; admin-class and
+      # read operations stay on the caller's own credential (the bot is
+      # admin=false everywhere, and a read has no actor field to attribute). The
+      # decision is printed on every call. Credential-bearing → audited; the
+      # token is read root-side in _gh_do and never lands in argv.
+      AUDIT_CMD="gh"; AUDIT_ARGS=("$@")
+      cmd_gh "$@" ;;
+    _gh_do)
+      # DIVE-2448: hidden, privileged. Reachable ONLY via NOPASSWD sudo. Reads the
+      # gh argv NUL-separated on STDIN (never argv, so the grant stays exact-path
+      # / sudo-rs safe), re-derives the routing class authoritatively, reads the
+      # machine account's PAT from the root-only connector and execs gh with it as
+      # an environment prefix. The agent process never holds the token. Not
+      # audited itself (the parent `gh` verb is) and never advertised.
+      cmd_gh_do "$@"
+      exit $? ;;
     _push_do)
       # DIVE-1376/1460: hidden, privileged, ATOMIC delegated push. Reachable ONLY
       # via NOPASSWD sudo. Reads <ident> <repo-path> <branch> <repo-url> on STDIN

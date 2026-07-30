@@ -1,5 +1,29 @@
 # Changelog
 
+## Unreleased — feat(gh): route agent GitHub writes through the machine account (DIVE-2448)
+
+An agent `gh` write authenticated as the human account, so no field anywhere could tell an
+agent action from a human one — measured across the PR actor field, the org audit log and the
+merge commit, three no-answers (DIVE-2232). A machine account now exists and holds push on every
+shipping repo, but nothing routed to it: acting as the bot meant an agent remembering to type
+`GH_TOKEN=` by hand, which is the same self-declared shape that ticket rejected for attribution
+markers.
+
+`5dive gh` makes it configuration. Writes go out as the machine account; admin-class operations
+and reads stay on the caller's credential, because the bot is `admin=false` on every repo and a
+read leaves no actor field to attribute. The decision and its reason are printed on every call,
+`--as=bot|caller` forces one identity, `--explain` runs nothing, and `5dive gh whoami` resolves
+both identities so "who did that write go out as" is measurable rather than inferred.
+
+An operation the router does not recognise goes to the caller — today's behaviour, unchanged, and
+it says so, so an unrecognised write is a visible gap rather than a silent 403 on a path that
+used to work. The credential keeps the delegated-push posture: the PAT is read inside the
+root-only `_gh_do`, argv travels NUL-separated on stdin, the token is only ever an environment
+prefix, and the agent process never holds it. `_gh_do` re-derives the routing class itself, so a
+caller cannot talk the bot into an operation it must not perform. The sudoers grant rides the
+existing `--can-push` builder capability. `tests/gh_actor_routing_unit.sh` covers the whole
+non-credential surface (62 assertions).
+
 ## Unreleased — feat(task): CHANNEL PROOF of the human's answer clears a tier-2 gate, so a decision already made in chat is not re-entered as a button tap (DIVE-2412)
 
 DIVE-2382 fix #4, approved 2026-07-30 04:27. A tier-2 gate could be cleared by exactly two
