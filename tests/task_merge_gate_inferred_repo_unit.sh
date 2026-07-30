@@ -150,12 +150,26 @@ slug_case 'a `Repo:` line given as a URL still declares' \
 # leave the claim resting on an env var the suite itself set. Assert the DEFAULT with
 # the variable cleared, so the claim is pinned rather than assumed. A box that exports
 # a narrower list narrows the sweep with it; that is a config choice, stated here.
+#
+# DIVE-2431 widened this set from three to eleven, and this canary is what forced the
+# change to be deliberate rather than incidental — it went red the moment the list moved,
+# which is the whole reason to pin a default. Updated, not relaxed: the superset claim
+# above is STRONGER with a bigger set, so the precondition still holds; what must not
+# happen is the pin being deleted so the next widening lands unannounced.
 want_default='5dive-ai/5dive
 lodar/5dive-api
-lodar/5dive-frontend'
+lodar/5dive-frontend
+5dive-ai/character-packs
+5dive-ai/skills
+5dive-ai/5dive-plugins
+5dive-ai/5dive-mcp
+5dive-ai/openagent
+5dive-ai/ops
+lodar/5dive-blog
+lodar/5dive-mobile'
 got_default=$(FIVE_GATE_REPOS='' _gate_repo_slugs)
 [[ "$got_default" == "$want_default" ]] \
-  && ok_t 'with FIVE_GATE_REPOS unset the sweep really is all three repos (the superset precondition)' \
+  && ok_t 'with FIVE_GATE_REPOS unset the sweep really is every shipping repo (the superset precondition)' \
   || bad_t 'default repo set changed' "want [$want_default] got [$got_default]"
 
 # --- 1c. the lookup and the sentence share ONE definition --------------------

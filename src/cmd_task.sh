@@ -1453,10 +1453,38 @@ _gate_text_names_a_ref() {
 # coverage AND — worse — an api task naming "PR #6" got a CONFIDENT verdict about an
 # unrelated CLI pull request. Overridable so a new repo is config, not a patch, and
 # so the tests can point the whole gate at fixtures.
+# DIVE-2431: the default was exactly those three, and a delivery to any OTHER repo we
+# ship from was graded by a set that never contained it. Both directions were live and
+# both were measured on DIVE-2303, whose delivery landed in 5dive-ai/character-packs:
+#   FALSE ACCEPT  — the gate found the ident in 5dive-ai/5dive (step 1 of the same
+#                   ticket, days earlier) and closed clean having never looked at
+#                   character-packs. Correct by luck.
+#   FALSE REFUSE  — strip that coincidence and genuinely-landed work is refused with
+#                   "nothing on main in <3 slugs> shows branch ... landed", whose remedy
+#                   is an audited `--force-merge-gate` override for a gate that was
+#                   simply looking in the wrong place.
+#
+# WHY A LIST AND NOT A DERIVATION. Deriving the set from the git remotes on the box, or
+# from the org's repo list, removes the drift but buys a worse property: the gate's
+# verdict would then depend on host filesystem state or on network reachability at close
+# time. A gate that answers differently on two boxes, or refuses when offline, is not a
+# gate. The list is deterministic and auditable; drift is the price.
+#
+# WHAT PAYS FOR THE DRIFT: every verdict names the set it searched — the refusals always
+# did, and DIVE-2431 added it to the ACCEPT, which was the silent half. A stale list now
+# announces itself at the exact moment it matters, to the person it is failing. That is
+# the property to preserve if this list is ever edited; adding a repo without it just
+# moves the blind spot.
 _gate_repo_slugs() {
   local raw="${FIVE_GATE_REPOS:-}"
   if [[ -z "$raw" ]]; then
+    # The repos task deliveries actually land in. Kept to ACTIVE product repos rather
+    # than every repo we own — an inactive repo costs a lookup on every close and has
+    # never received a delivery.
     raw="$(_push_repo_slug "$_PUSH_DEFAULT_REPO") lodar/5dive-api lodar/5dive-frontend"
+    raw="$raw 5dive-ai/character-packs 5dive-ai/skills 5dive-ai/5dive-plugins"
+    raw="$raw 5dive-ai/5dive-mcp 5dive-ai/openagent 5dive-ai/ops"
+    raw="$raw lodar/5dive-blog lodar/5dive-mobile"
   fi
   printf '%s' "$raw" | tr ',' ' ' | tr -s '[:space:]' '\n' | awk 'NF && !seen[$0]++'
 }
@@ -2131,7 +2159,7 @@ _task_status_cmd() {
         # a squash rewrites the sha, so the branch tip is NOT an ancestor of main even
         # though the content is in. Attribution finds it anyway, because the squash
         # commit subject carries the ident.
-        local _slug _bmerged="" _merged_slug="" _searched="" _attr_slug="" _anc="" _attr="" _anc_novac="" _attr_bound="" _attr_unreach=""
+        local _slug _bmerged="" _merged_slug="" _searched="" _attr_slug="" _anc="" _attr="" _anc_novac="" _attr_bound="" _attr_unreach="" _attr_scope=""
         while IFS= read -r _slug; do
           [[ -n "$_slug" ]] || continue
           _searched="${_searched:+$_searched, }$_slug"
@@ -2180,7 +2208,19 @@ _task_status_cmd() {
           # Attribution CANNOT distinguish a delegated push from a squash-merged PR — a
           # squash rewrites the sha, so both look identical to a subject scan. So this
           # states what was measured and claims neither route.
-          warn "$ident: a commit on ${FIVE_GATE_MAIN_BRANCH:-main} in $_attr_slug names $ident in its SUBJECT — the work is on main (attribution, DIVE-2120). This does NOT establish HOW it landed: a delegated push and a squash-merged PR are indistinguishable to a subject scan, because a squash rewrites the sha. done=merged-to-main satisfied."
+          # DIVE-2431: name the SCOPE on the accept, not only on the refusals. The
+          # refusals already said which repos they searched; this line did not, and it
+          # is the half that fails silently — an accept sourced from a repo that is not
+          # where the delivery went reads as a clean close and nothing invites a second
+          # look. Measured on DIVE-2303: accepted on a commit in 5dive-ai/5dive while
+          # the delivery sat in character-packs, which was not in the searched set at
+          # all. Only stated when the task DECLARED no repo, because a declared repo
+          # narrows the scan to itself and there is no unsearched remainder to warn about.
+          _attr_scope=""
+          if [[ -z "$_task_slug" ]]; then
+            _attr_scope=" SCOPE: this task declares no repo, so the gate searched $_searched and stopped at the first hit — repos outside that set were NOT looked at. If the delivery landed somewhere else, this accept is about a DIFFERENT repo's commit; declare it with a \`Repo: <owner>/<repo>\` line or bind the delivery_ref, and re-check."
+          fi
+          warn "$ident: a commit on ${FIVE_GATE_MAIN_BRANCH:-main} in $_attr_slug names $ident in its SUBJECT — the work is on main (attribution, DIVE-2120). This does NOT establish HOW it landed: a delegated push and a squash-merged PR are indistinguishable to a subject scan, because a squash rewrites the sha. done=merged-to-main satisfied.$_attr_scope"
         elif [[ -n "$_attr_bound" && -z "$_bmerged" ]]; then
           # DIVE-2120: the scan stopped AT THE BOUND without finding the ident. That is NOT
           # a miss and must not read as one — a bounded search whose negative looks like an
