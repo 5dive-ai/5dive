@@ -975,6 +975,12 @@ export function canonicalTranscript(rec) {
     const r1 = rec.round1Votes.slice().sort((a, b) => (norm(a.seat) < norm(b.seat) ? -1 : 1))
     for (const v of r1) L.push(`round1 ${norm(v.seat)}: ${norm(v.vote != null ? v.vote : v.choice)} :: ${norm(v.rationale)}`)
   }
+  // DIVE-2103: CONDITIONAL on the CNCL-19 precedent — emitted ONLY when some round returned
+  // zero substantive votes, so a healthy convene seals BYTE-IDENTICALLY.
+  if (Array.isArray(rec.roundStats) && rec.roundStats.some(r => r && r.substantive === 0)) {
+    for (const r of rec.roundStats) L.push(`round${norm(r.round)} participation: dispatched=${norm(r.dispatched)} substantive=${norm(r.substantive)} abstains=${norm(r.abstains)} unreached=${norm(r.unreached)}`)
+    if (rec.degradedToSingleRound) L.push('degraded: adversarial round 1 returned zero substantive votes — the rebuttal had nothing to rebut')
+  }
   // DIVE-1869: SEAL which seats we never REACHED. The abstain/capture-failure distinction has to
   // survive on the DURABLE record, not just in the run — a later reader of a receipt is otherwise
   // back to guessing whether "0 of 6 voted" was a council that said nothing or a rail that was
@@ -1550,6 +1556,18 @@ function log(on, msg) { if (on) process.stderr.write(`[council] ${msg}\n`) }
 // round1Votes + rebuttalVotes stay recorded raw alongside the merged `votes`, so the full two-round
 // record is auditable. Deterministic + pure (unit-tested). A seat that never cast a substantive vote
 // in either round stays an abstain; a convene where every seat re-casts is byte-identical to before.
+// DIVE-2103: per-round participation, so an EMPTY round is VISIBLE instead of being absorbed
+// by the merged tally. Both existing guards read only the MERGED votes — quorum in
+// countConveneVotes, and the DIVE-1869 outage refusal — so a round returning nothing escapes
+// both. Measured n=2 on OPPOSITE rounds (2026-07-20 round 2; 2026-07-21 seq 1 round 1).
+// Surfaced, NEVER fatal: a degenerate round does not invalidate a verdict that met quorum.
+export function roundParticipation(round, votes) {
+  const v = Array.isArray(votes) ? votes : []
+  const substantive = v.filter(x => x && x.vote !== 'abstain').length
+  const unreached = v.filter(x => x && x.capture === false).length
+  return { round, dispatched: v.length, substantive, abstains: v.length - substantive, unreached }
+}
+
 export function carryForwardVotes(round1Votes, rebuttalVotes) {
   const SUBSTANTIVE = new Set(['approve', 'reject', 'escalate'])
   const r1By = new Map((round1Votes || []).map(v => [String(v.seat), v]))
@@ -1664,6 +1682,7 @@ async function runConvene(input, deps, h) {
   // retrieval is deterministic + key-free; the pool is passed in by the CLI (which reads the log).
   const precedents = selectPrecedents(question, input.precedentPool || [], input.precedentK != null ? input.precedentK : 3)
   let round1Votes, finalVotes, rebuttalVotes = null, verdict
+  let _roundStats = null, _degraded = false   // DIVE-2103
   if (seatVote) {
     log(verbose, `dispatching ${seats.length} real seats (blind round 1, ${mode})${precedents.length ? `, ${precedents.length} precedent(s)` : ''}`)
     round1Votes = await dispatchRound(seats, { question, role, mode, round: 1, precedents }, seatVote)
@@ -1673,6 +1692,11 @@ async function runConvene(input, deps, h) {
       rebuttalVotes = await dispatchRound(seats, { question, role, mode, round: 2, priorVotes: round1Votes, precedents }, seatVote)
       finalVotes = carryForwardVotes(round1Votes, rebuttalVotes)
     }
+    _roundStats = [roundParticipation(1, round1Votes)]   // DIVE-2103
+    if (rebuttalVotes) _roundStats.push(roundParticipation(2, rebuttalVotes))
+    _degraded = mode === 'adversarial' && _roundStats[0].substantive === 0
+    for (const _r of _roundStats) if (_r.substantive === 0) process.stderr.write(`council: WARNING round ${_r.round} returned ZERO substantive votes (${_r.dispatched} dispatched, ${_r.abstains} abstained, ${_r.unreached} unreached) — the verdict stands; the deliberation for that round does not\n`)
+    if (_degraded) process.stderr.write('council: WARNING adversarial run DEGRADED TO SINGLE ROUND — round 1 was empty\n')
     const counted = tallyVotes(finalVotes, tallyOpts)
     verdict = buildConveneVerdict(counted, synthesizeNarrative(finalVotes, counted), finalVotes)
   } else {
@@ -1686,6 +1710,11 @@ async function runConvene(input, deps, h) {
       rebuttalVotes = await Promise.all(seats.map(s => askSeam(s, { question, round: 2, priorVotes: round1Votes, precedents })))
       finalVotes = carryForwardVotes(round1Votes, rebuttalVotes)
     }
+    _roundStats = [roundParticipation(1, round1Votes)]   // DIVE-2103
+    if (rebuttalVotes) _roundStats.push(roundParticipation(2, rebuttalVotes))
+    _degraded = mode === 'adversarial' && _roundStats[0].substantive === 0
+    for (const _r of _roundStats) if (_r.substantive === 0) process.stderr.write(`council: WARNING round ${_r.round} returned ZERO substantive votes (${_r.dispatched} dispatched, ${_r.abstains} abstained, ${_r.unreached} unreached) — the verdict stands; the deliberation for that round does not\n`)
+    if (_degraded) process.stderr.write('council: WARNING adversarial run DEGRADED TO SINGLE ROUND — round 1 was empty\n')
     const counted = tallyVotes(finalVotes, tallyOpts)
     const narr = await chairNarrative(modelCall, question, finalVotes)
     verdict = buildConveneVerdict(counted, narr, finalVotes)
@@ -1703,7 +1732,7 @@ async function runConvene(input, deps, h) {
   verdict = attachVetoOffer(verdict, input.vetoOffer)
   return finish(role, input, {
     question, mode, seats, guardrail: null, convened: true,
-    takes: [], votes: finalVotes, round1Votes, rebuttalVotes, verdict,
+    takes: [], votes: finalVotes, round1Votes, rebuttalVotes, verdict, roundStats: _roundStats, degradedToSingleRound: _degraded,
   })
 }
 
@@ -1767,6 +1796,7 @@ function finish(role, input, base) {
       // Seal round-1 history ONLY when a rebuttal round ran (adversarial); a single-round receipt
       // omits it and stays byte-identical to CNCL-6. Makes the between-round record tamper-evident.
       ...(base.rebuttalVotes ? { round1Votes: base.round1Votes } : {}),
+      ...(base.roundStats ? { roundStats: base.roundStats, degradedToSingleRound: !!base.degradedToSingleRound } : {}),
     }
     out.receipt = { canonical: canonicalTranscript(rec), ...sealCommands() }
   }
