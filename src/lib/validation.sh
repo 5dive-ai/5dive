@@ -225,3 +225,52 @@ require_node() {
   sudo env PATH=\"\$(dirname \"\$(readlink -f \"\$(command -v node)\")\"):\$PATH\" 5dive <cmd>   # run the inner part as the user who HAS node
   sudo ln -s \"\$(command -v node)\" /usr/local/bin/node                                    # make it permanent for every sudo-gated op"
 }
+
+# ======== skill id -> path containment (DIVE-2338, generalised DIVE-2370) ========
+# Moved here from cmd_skill.sh because the guard is not verb-local: cmd_pack.sh
+# (_install_bundled_skill, the manifest skills[] download) and lib/agent_setup.sh
+# (install_default_skill_for_agent) build the same "<install_dir>/<id>" string.
+# ONE implementation on purpose — skill_id_traversal_unit T6d asserts there is no
+# second copy, and DIVE-2080 is the standing lesson that fixing the visible call
+# site is not fixing the class.
+# Validate skill id (the directory name that will end up under the per-type
+# skills dir, e.g. .claude/skills/<id>). Same character class skills.sh uses.
+#
+# DIVE-2338 — THE CHARACTER CLASS IS NOT THE CHECK. `^[A-Za-z0-9._-]+$` rejects a
+# SLASH, which is what made it look safe, and accepts `.` and `..`, which are the whole
+# traversal token. No slash is needed because the CALLER supplies the separator:
+# cmd_skill_rm builds `target="$INSTALL_DIR/$SKILL"` and then `rm -rf "$target"`, so
+#   SKILL=..  ->  .claude/skills/..  ->  ~/.claude       (settings, creds, projects, memory)
+#   SKILL=.   ->  .claude/skills/.   ->  every installed skill
+# and the verb is reachable from the dashboard exec tunnel (`skill` is allowlisted in
+# 5dive-api routes/agents.ts and `..` passes AGENT_ARG_RE).
+#
+# `.` is a LEGITIMATE character in a skill id and simultaneously the entire attack, so a
+# character-class allowlist cannot separate the two — the predicate that matters is not
+# "which characters" but "can the resulting NAME escape its directory". Hence both checks
+# below: refusing the two tokens is exact, and refusing any all-dots name covers `...`
+# and friends that some resolvers also normalise upward.
+#
+# This function only decides the NAME. Containment of the resulting PATH is asserted
+# separately at the use site (skill_target_within), because a name-level check cannot see
+# what the name is later concatenated to. The token refusal alone would be a two-token
+# BLOCKLIST — the exact shape this codebase argues against — so it is the belt, and
+# skill_target_within is the braces.
+valid_skill_id() {
+  [[ "$1" =~ ^[A-Za-z0-9._-]+$ ]] || return 1
+  # No dot-only name: covers "." ".." and any "..." a normaliser might walk up.
+  [[ "$1" =~ ^\.+$ ]] && return 1
+  return 0
+}
+
+# DIVE-2338 — the STRUCTURAL half, and the one that survives a future edit to the regex.
+# Re-derive the concatenated path and assert it is still strictly inside the install dir.
+# `readlink -m` normalises `..` without requiring the path to exist, so this is decided on
+# the resolved location rather than on the spelling of the input.
+# skill_target_within <base_dir> <skill_id> -> 0 if <base_dir>/<id> stays under <base_dir>
+skill_target_within() {
+  local base="$1" id="$2" rbase rtarget
+  rbase="$(readlink -m -- "$base")"    || return 1
+  rtarget="$(readlink -m -- "$base/$id")" || return 1
+  [[ "$rtarget" == "$rbase"/?* ]]
+}

@@ -32,47 +32,12 @@ parse_skill_spec() {
   fi
 }
 
-# Validate skill id (the directory name that will end up under the per-type
-# skills dir, e.g. .claude/skills/<id>). Same character class skills.sh uses.
-#
-# DIVE-2338 — THE CHARACTER CLASS IS NOT THE CHECK. `^[A-Za-z0-9._-]+$` rejects a
-# SLASH, which is what made it look safe, and accepts `.` and `..`, which are the whole
-# traversal token. No slash is needed because the CALLER supplies the separator:
-# cmd_skill_rm builds `target="$INSTALL_DIR/$SKILL"` and then `rm -rf "$target"`, so
-#   SKILL=..  ->  .claude/skills/..  ->  ~/.claude       (settings, creds, projects, memory)
-#   SKILL=.   ->  .claude/skills/.   ->  every installed skill
-# and the verb is reachable from the dashboard exec tunnel (`skill` is allowlisted in
-# 5dive-api routes/agents.ts and `..` passes AGENT_ARG_RE).
-#
-# `.` is a LEGITIMATE character in a skill id and simultaneously the entire attack, so a
-# character-class allowlist cannot separate the two — the predicate that matters is not
-# "which characters" but "can the resulting NAME escape its directory". Hence both checks
-# below: refusing the two tokens is exact, and refusing any all-dots name covers `...`
-# and friends that some resolvers also normalise upward.
-#
-# This function only decides the NAME. Containment of the resulting PATH is asserted
-# separately at the use site (skill_target_within), because a name-level check cannot see
-# what the name is later concatenated to. The token refusal alone would be a two-token
-# BLOCKLIST — the exact shape this codebase argues against — so it is the belt, and
-# skill_target_within is the braces.
-valid_skill_id() {
-  [[ "$1" =~ ^[A-Za-z0-9._-]+$ ]] || return 1
-  # No dot-only name: covers "." ".." and any "..." a normaliser might walk up.
-  [[ "$1" =~ ^\.+$ ]] && return 1
-  return 0
-}
-
-# DIVE-2338 — the STRUCTURAL half, and the one that survives a future edit to the regex.
-# Re-derive the concatenated path and assert it is still strictly inside the install dir.
-# `readlink -m` normalises `..` without requiring the path to exist, so this is decided on
-# the resolved location rather than on the spelling of the input.
-# skill_target_within <base_dir> <skill_id> -> 0 if <base_dir>/<id> stays under <base_dir>
-skill_target_within() {
-  local base="$1" id="$2" rbase rtarget
-  rbase="$(readlink -m -- "$base")"    || return 1
-  rtarget="$(readlink -m -- "$base/$id")" || return 1
-  [[ "$rtarget" == "$rbase"/?* ]]
-}
+# DIVE-2370: valid_skill_id and skill_target_within MOVED to src/lib/validation.sh.
+# They are not skill-verb-local — five sibling id->path sites in cmd_pack.sh and
+# lib/agent_setup.sh build the identical string, and one of them (_install_bundled_skill)
+# `rm -rf`s the result. validation.sh is concatenated BEFORE agent_setup.sh and every
+# cmd_*.sh in build.sh, so a single definition there is visible to all of them. The
+# DIVE-2338 rationale travels WITH the functions rather than staying at this call site.
 
 # cmd_skill <agent-name>|--all <action> [args...]
 # Dispatcher mirrors the auth subcommand shape so main()'s case stays flat.

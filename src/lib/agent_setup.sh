@@ -457,13 +457,25 @@ install_default_skill_for_agent() {
   local user="agent-${name}" home="/home/agent-${name}"
   local agent_id="${SKILLS_AGENT_ID[$type]:-claude-code}"
   local install_dir="${SKILLS_INSTALL_DIR[$type]:-.claude/skills}"
+  # DIVE-2370: today every caller passes an internal template constant, so this is a
+  # pre-emptive guard rather than a fix for a live hole HERE — recorded as such so nobody
+  # reads it as an incident. It is still the right place for it: the sibling site in
+  # cmd_pack.sh WAS live, and the way DIVE-2338 happened is that a validator stayed
+  # reasonable right up until someone added a flag that fed it user input.
+  valid_skill_id "$skill" || { warn "refusing skill id '$skill' (invalid)"; return 1; }
+  skill_target_within "$home/$install_dir" "$skill" \
+    || { warn "refusing skill id '$skill' — escapes $install_dir (DIVE-2370)"; return 1; }
   [[ -d "$home" ]] || return 1
   id -u "$user" &>/dev/null || return 1
   if sudo -u "$user" test -d "$home/$install_dir/$skill"; then
     return 0
   fi
   if _skill_needs_manual_install "$type"; then
-    sudo -u "$user" -H env SOURCE="$source" SKILL="$skill" INSTALL_DIR="$install_dir" bash -s >&2 <<'MANUAL_SKILL' \
+    # DIVE-2370: ship the REAL predicate in, exactly as cmd_skill_rm does — `declare -f`
+    # emits skill_target_within's own source, so the sub-shell re-asserts with the SAME
+    # function and a revert reds both arms together instead of leaving the inner one green.
+    sudo -u "$user" -H env SOURCE="$source" SKILL="$skill" INSTALL_DIR="$install_dir" \
+      CONTAINMENT_FN="$(declare -f skill_target_within)" bash -s >&2 <<'MANUAL_SKILL' \
       || { warn "default skill '$skill' install failed for agent '$name' (continuing)"; return 1; }
 set -uo pipefail
 unset CLAUDE_CONFIG_DIR
@@ -477,6 +489,11 @@ for d in "$TMPDIR/repo/$SKILL" "$TMPDIR/repo/skills/$SKILL"; do
 done
 [ -n "$SRC_DIR" ] || { echo "ERROR: skill '$SKILL' not found in $SOURCE (looked at top-level and skills/)" >&2; exit 1; }
 mkdir -p "$HOME/$INSTALL_DIR"
+# DIVE-2370: re-assert containment where the write actually happens. Not a second copy of
+# the predicate — $CONTAINMENT_FN carries the caller's own skill_target_within source.
+eval "${CONTAINMENT_FN:?containment predicate not supplied — refusing to install}"
+skill_target_within "$HOME/$INSTALL_DIR" "$SKILL" \
+  || { echo "refusing: '$SKILL' resolves outside $HOME/$INSTALL_DIR" >&2; exit 3; }
 cp -r "$SRC_DIR" "$HOME/$INSTALL_DIR/$SKILL"
 echo "manual-installed $SKILL → $HOME/$INSTALL_DIR/$SKILL"
 MANUAL_SKILL
