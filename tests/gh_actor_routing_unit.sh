@@ -177,6 +177,24 @@ BLD=$(render_standard_sudoers agent-testy 1)
 [[ "$BLD" == *"5dive _gh_do *"* ]] \
   && bad_t "sudoers: builder _gh_do has no arg wildcard" "wildcard present -> not sudo-rs safe" \
   || ok_t "sudoers: builder _gh_do has no arg wildcard"
+# The grant CLASSIFIER has to learn the new line too, and this is not cosmetic:
+# an unrecognised entry sets `extra=1`, which is the signal that a drifted grant
+# is present — so a new capability line reads as DRIFT until it is declared. This
+# is what agent_sudo_grant_unit.sh caught on the first push of this change.
+# The rendered grant must contain NOTHING but comments and rules. This is not
+# paranoia: the heredoc that renders it is UNQUOTED (it interpolates ${user}), so
+# a backtick in a COMMENT is command substitution — a backtick-quoted word in the
+# first draft of this change EXECUTED gh and pasted its help text into the
+# sudoers file. `visudo -c` catches it, but only on a rig that has both visudo
+# AND the substituted binary installed, and CI had neither, so it went green.
+# This assertion needs neither.
+stray=$(printf '%s\n' "$BLD" | grep -vE '^\s*(#|$)' | grep -vE '^agent-testy ALL=' | head -1)
+[[ -z "$stray" ]] \
+  && ok_t "sudoers: the rendered grant is comments and rules only (no substituted output)" \
+  || bad_t "sudoers: the rendered grant is comments and rules only" "stray line: ${stray}"
+[[ "$(printf '%s\n' "$BLD" | classify_sudo_grant)" == "cli-scoped|root|0" ]] \
+  && ok_t "sudoers: classify_sudo_grant RECOGNISES _gh_do (no drift flag)" \
+  || bad_t "sudoers: classify_sudo_grant recognises _gh_do" "got '$(printf '%s\n' "$BLD" | classify_sudo_grant)', want 'cli-scoped|root|0'"
 
 # --- Wiring: the verb is dispatchable, the hidden helper is reachable, and the
 # bundle actually carries the file. A routing rule nobody can call is not a fix.

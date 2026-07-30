@@ -413,7 +413,8 @@ classify_sudo_grant() {
         "/usr/local/bin/5dive"|"/usr/local/bin/5dive *") has_cli=1 ;;
         "/usr/local/bin/5dive agent _deliver"*|"/usr/local/bin/5dive agent _capture"*|\
         "/usr/local/bin/5dive agent _self_restart"*|"/usr/local/bin/5dive _audit_append"*|\
-        "/usr/local/bin/5dive _push_do"*)                has_a2a=1 ;;
+        "/usr/local/bin/5dive _push_do"*|\
+        "/usr/local/bin/5dive _gh_do"*)                  has_a2a=1 ;;
         *)                                              has_other=1 ;;
       esac
     done
@@ -530,12 +531,16 @@ SUDOERS
 # path; params travel over stdin (never argv), so no arg wildcard is needed and
 # the grant is sudo-rs-safe. Gates re-verified authoritatively inside _push_do.
 ${user} ALL=(root) NOPASSWD: /usr/local/bin/5dive _push_do
-# DIVE-2448: the same builder capability, one surface over — actor-routed `gh`.
+# DIVE-2448: the same builder capability, one surface over -- actor-routed gh.
 # A builder that may ship must also be able to have its WRITES recorded as the
 # machine account rather than the human's (DIVE-2232), or attribution stays a
 # thing each agent has to remember. Exact command path, args over stdin; _gh_do
 # re-derives the routing class as root and refuses admin-class calls, so this
 # grant cannot become a general "act as the bot" capability.
+# NOTE FOR THE NEXT EDITOR: this heredoc is UNQUOTED (it interpolates ${user}),
+# so a backtick or $ in a COMMENT is executed and its output lands in the
+# sudoers file. A backtick-quoted word here once injected gh's help text and
+# visudo rejected the result. Keep this block free of backticks and $.
 ${user} ALL=(root) NOPASSWD: /usr/local/bin/5dive _gh_do
 SUDOERS
   fi
