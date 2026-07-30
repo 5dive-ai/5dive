@@ -68,6 +68,24 @@ agent box the column read `channel-session` and on a CI runner the identical cod
 is this feature's whole premise, and CS13 flips the pin both ways so the pin is differential
 rather than a way to keep the harness quiet.
 
+AND THE MUTATION GRADER ITSELF WAS UNGRADED, which `harness-verdict-union` caught and reded the
+build for. A mutation grader re-runs its whole unit suite once per mutant, so this one costs
+~14 x 23s and the probe's 180s per-harness `timeout` killed it before its verdict line ever
+executed - `not-reached` on BOTH the pristine and installed-host lanes, i.e. probed in no
+environment at all. That is the permanently-unprobed limit case the union job was written for,
+arriving on a harness whose own job is to catch tests that grade nothing.
+
+It is fixed with a lane, not an exemption. `ALLOW_UNPROBEABLE` means "no identifiable verdict
+variable" and this harness has one - measured `wired` at `PROBE_TIMEOUT=900` - so allowlisting it
+would have put a false reason on the record and excused the coverage it was claiming. Instead a
+`harness-verdict-slow` job probes the named slow harnesses with `--only` at 900s, and the union
+consumes its report as a third environment. `--only` is deliberate: raising `PROBE_TIMEOUT` for
+the whole 255-file sweep would also raise how long a genuinely hung harness can stall CI, which
+is the property the 180s default buys. `probe-slow.txt` is named explicitly in the union call
+rather than globbed, so a slow lane that dies reds the union instead of silently dropping back to
+the two-environment corpus. Verified differentially against the real CI reports from the red run:
+with the third report 252 probed / 0 NEVER PROBED / rc 0, without it 1 NEVER PROBED / rc 1.
+
 Consumers are NOT wired yet and this ships inert until they are: the telegram plugin does not
 pass `--channel-msg`, and the dashboard (DIVE-2371) is the second surface on the same rail.
 DIVE-2371's fail-closed prefix change must still land AFTER them, or the dashboard's tier-2
