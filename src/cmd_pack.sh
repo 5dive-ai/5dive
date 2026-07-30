@@ -65,7 +65,14 @@ _marketplace_fetch_pack() {
   while IFS= read -r id; do
     [[ -z "$id" ]] && continue
     id="${id##*#}"; id="${id##*/}"
-    [[ "$id" =~ ^[A-Za-z0-9._-]+$ ]] || continue
+    # DIVE-2370: this WAS a bare `[[ "$id" =~ ^[A-Za-z0-9._-]+$ ]]` — the same character
+    # class DIVE-2338 proved insufficient, because it accepts "." and ".." and the caller
+    # supplies the separator. It matters here and not only cosmetically: `mkdir -p
+    # "$dl/skills/.."` resolves to $dl itself and the mv then plants $dl/SKILL.md, which is
+    # exactly the file the import step at _install_bundled_skill probes for. Refusing the id
+    # here breaks the chain at its first link.
+    valid_skill_id "$id" || continue
+    skill_target_within "$dl/skills" "$id" || continue
     if curl -fsSL --max-time 20 "$base/$path/skills/$id/SKILL.md" -o "$dl/.probe" 2>/dev/null; then
       mkdir -p "$dl/skills/$id"; mv "$dl/.probe" "$dl/skills/$id/SKILL.md"
     fi
@@ -97,6 +104,15 @@ _install_bundled_skill() {
   local user="agent-${name}" home="/home/agent-${name}" type install_dir
   type=$(agent_type "$name"); [[ -n "$type" ]] || return 1
   install_dir="${SKILLS_INSTALL_DIR[$type]:-.claude/skills}"
+  # DIVE-2370 — THE DESTRUCTIVE SITE. $id reaches here from the pack manifest's skills[]
+  # (jq over $stage/manifest.json, i.e. third-party content) via parse_skill_spec, which
+  # splits on ":" and validates NOTHING. With id="..", dest resolves to $home/.claude and
+  # the next line is `rm -rf` — settings, credentials, projects and memory, followed by a
+  # cp -r + chown -R that leaves a plausible-looking directory behind. Same predicate as
+  # cmd_skill_rm, one definition, in validation.sh.
+  valid_skill_id "$id" || { warn "refusing bundled skill id '$id' (invalid)"; return 1; }
+  skill_target_within "$home/$install_dir" "$id" \
+    || { warn "refusing bundled skill id '$id' — escapes $install_dir (DIVE-2370)"; return 1; }
   local dest="$home/$install_dir/$id"
   rm -rf "$dest"; mkdir -p "$home/$install_dir" || return 1
   cp -r "$srcdir" "$dest" || return 1
@@ -1394,6 +1410,9 @@ cmd_import() {
     [[ -z "$sk" ]] && continue
     pair=$(parse_skill_spec "$sk" 2>/dev/null) || { skipped+=("$sk"); continue; }
     src="${pair% *}"; id="${pair#* }"
+    # DIVE-2370: parse_skill_spec is a splitter, not a validator. Guard before the -f probe
+    # so a traversal id is skipped-and-reported rather than reaching either install path.
+    if ! valid_skill_id "$id"; then skipped+=("$sk"); continue; fi
     # Prefer a skill body bundled in the pack (self-contained); fall back to the
     # recorded source ref (resolved from a published repo).
     if [[ -f "$stage/skills/$id/SKILL.md" ]] && _install_bundled_skill "$as" "$id" "$stage/skills/$id"; then
