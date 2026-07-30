@@ -1373,8 +1373,75 @@ _envelope_caller() {
   printf '%s' "$who"
 }
 
+# DIVE-2385 — WAKE-THEN-SEND, so deferred work does not depend on the recipient
+# being awake at the instant the scheduler fires.
+#
+# `agent send` needs the target to have a LIVE tmux session. Send to an agent that
+# simply is not running and it fails in ~190ms with E_NOT_RUNNING: no queue, no
+# retry, no persistence. Survivable when a human is watching a terminal; load-
+# bearing when the caller is SYSTEMD.
+#
+# MEASURED, 2026-07-30 (marketing). An approved blog post was scheduled the
+# documented way — a transient unit whose ExecStart was
+#   systemd-run --on-calendar=... 5dive agent send marketing '<publish pointer>'
+# The timer fired exactly on time at 23:45:02 UTC and the unit died on the spot
+# (status=8) because marketing was asleep. Three properties then compounded: the
+# message was dropped unqueued and unalarmed; a one-shot .timer is CONSUMED once
+# it fires, so there was no second attempt; and the only surviving evidence was a
+# .service in `failed` state under /run/systemd/transient/, a path nobody greps.
+# The approved post silently did not publish. It was caught 17 minutes later
+# because an unrelated cron woke marketing and a same-day guard tripped over the
+# uncommitted .mdx — luck, not a mechanism. This is NOT the known
+# transient-units-die-on-reboot caveat: the host had been up 7+ weeks. It needs
+# nothing to go wrong except the target being asleep at one instant.
+#
+# WHY OPT-IN AND NOT THE NEW DEFAULT. E_NOT_RUNNING is load-bearing elsewhere
+# precisely BECAUSE it is a sub-second failure: _task_need_route_deliver
+# (DIVE-2011) polls a detached send's own rc for exactly this shape to decide
+# whether a gate handoff was observed to fail, and it can only do that because a
+# dead session is decided long before the 45s readiness wait. Waking on every
+# send would turn those observed failures into a 30s+ boot wait and then report
+# them as delivered — re-manufacturing the DIVE-1968 mis-measurement in the one
+# rail that was cleaned up. So the default path keeps its rc and its latency byte
+# for byte, and a caller that is scheduling DEFERRED work asks for the wake.
+#
+# REFUSES on desiredState=stopped. That field is the operator's recorded intent
+# (cmd_stop writes it; the supervisor reads it when it decides whether a dead unit
+# is a crash or a deliberate stop), so waking past it would let a scheduler
+# override a human's explicit stop — and the supervisor would then be entitled to
+# stop the agent back, mid-turn. ABSENT is NOT stopped (DIVE-2318: unknown is not
+# a negative): an agent that has never been start/stop'd through the CLI carries
+# no field at all, which is the common case, so absent wakes.
+#
+# It never reports a send it did not make: if the unit starts but no session
+# appears inside the budget, the caller still gets E_NOT_RUNNING — with the reason
+# named, rather than the bare "is the agent running?" that was true but useless to
+# a systemd unit.
+AGENT_WAKE_FAIL_REASON=""
+agent_wake_for_send() {
+  local name="$1" timeout="${2:-60}"
+  AGENT_WAKE_FAIL_REASON=""
+  local desired
+  desired=$(registry_read | jq -r --arg n "$name" '.agents[$n].desiredState // ""' 2>/dev/null) || desired=""
+  if [[ "$desired" == "stopped" ]]; then
+    AGENT_WAKE_FAIL_REASON="agent '$name' is stopped by operator intent (desiredState=stopped), so --wake will not start it; clear that intent with '5dive agent start $name' if it is stale"
+    return 1
+  fi
+  if ! systemctl start "5dive-agent@${name}.service" >&2; then
+    AGENT_WAKE_FAIL_REASON="systemctl start 5dive-agent@${name}.service failed"
+    return 1
+  fi
+  local waited=0
+  while (( waited < timeout )); do
+    sudo -u "agent-${name}" tmux has-session -t "agent-${name}" 2>/dev/null && return 0
+    sleep 1; waited=$((waited+1))
+  done
+  AGENT_WAKE_FAIL_REASON="started 5dive-agent@${name}.service but its tmux session did not appear within ${timeout}s"
+  return 1
+}
+
 cmd_send() {
-  local name="" message="" from="" from_set=0 raw=0
+  local name="" message="" from="" from_set=0 raw=0 wake=0
   local reply_to_chat="" reply_to_msg=""
   local -a positional=()
   while [[ $# -gt 0 ]]; do
@@ -1382,6 +1449,7 @@ cmd_send() {
       --message=*)        message="${1#--message=}" ;;
       --from=*)           from="${1#--from=}"; from_set=1 ;;
       --raw)              raw=1 ;;
+      --wake)             wake=1 ;;
       --reply-to-chat=*)  reply_to_chat="${1#--reply-to-chat=}" ;;
       --reply-to-msg=*)   reply_to_msg="${1#--reply-to-msg=}" ;;
       --)                 shift; positional+=("$@"); break ;;
@@ -1394,7 +1462,7 @@ cmd_send() {
     name="${positional[0]}"
     positional=("${positional[@]:1}")
   fi
-  [[ -n "$name" ]] || fail "$E_USAGE" "usage: 5dive agent send <name> <text...> | --message=<text> [--from=<sender>] [--raw] [--reply-to-chat=<id> [--reply-to-msg=<id>]]"
+  [[ -n "$name" ]] || fail "$E_USAGE" "usage: 5dive agent send <name> <text...> | --message=<text> [--from=<sender>] [--raw] [--wake] [--reply-to-chat=<id> [--reply-to-msg=<id>]]"
   if [[ -z "$message" && ${#positional[@]} -gt 0 ]]; then
     message="${positional[*]}"
   fi
@@ -1414,13 +1482,31 @@ cmd_send() {
   # (NOPASSWD:ALL) and root/internal callers keep the direct path below (and their
   # --from/--reply-to-chat plumbing). A scoped a2a send is peer-to-peer, so it
   # carries no channel plumbing. sudo -n = fail-closed, never prompts.
+  # DIVE-2385: --wake starts a systemd unit, which a scoped a2a caller cannot do —
+  # its whole grant is `/usr/local/bin/5dive agent _deliver *`, and _deliver
+  # deliberately carries no lifecycle powers. REFUSE rather than exec into
+  # `_deliver` and drop the flag: a silently-ignored --wake is the same lost
+  # message the flag exists to prevent, with an exit 0 printed over it. Checked
+  # BEFORE the exec for that reason.
+  if (( wake )) && a2a_needs_scoped "$name"; then
+    fail "$E_PERMISSION" "--wake starts the target's systemd unit and needs admin/root; this caller only holds the scoped a2a delivery grant. Re-run via sudo, or schedule the work as a task row instead."
+  fi
   if a2a_needs_scoped "$name"; then
     exec sudo -n /usr/local/bin/5dive agent _deliver "$name" "$message"
   fi
 
   require_agent "$name"
-  sudo -u "agent-${name}" tmux has-session -t "agent-${name}" 2>/dev/null \
-    || fail "$E_NOT_RUNNING" "tmux session 'agent-${name}' not found (is the agent running?)"
+  local woken=0
+  if ! sudo -u "agent-${name}" tmux has-session -t "agent-${name}" 2>/dev/null; then
+    # DIVE-2385: default behaviour is unchanged — same code, same message, same
+    # sub-second latency that _task_need_route_deliver's rc poll depends on.
+    (( wake )) \
+      || fail "$E_NOT_RUNNING" "tmux session 'agent-${name}' not found (is the agent running?)"
+    step "agent '$name' is not running — starting it to deliver (--wake)"
+    agent_wake_for_send "$name" \
+      || fail "$E_NOT_RUNNING" "tmux session 'agent-${name}' not found and --wake could not bring it up: ${AGENT_WAKE_FAIL_REASON}"
+    woken=1
+  fi
 
   # Optional reply-target hint. If present, it tells the receiver: "the user is
   # reachable in this chat — reply there directly via your own bot rather than
@@ -1514,9 +1600,13 @@ cmd_send() {
   # real envelope: a raw/anonymous send has no sender identity to mirror under.
   (( raw )) || mirror_interagent_outbound "$name" "$message"
 
+  # DIVE-2385: `woken` distinguishes "delivered to a live agent" from "started the
+  # agent in order to deliver". A scheduled caller that logs this line can tell,
+  # after the fact, that its wake was needed — the fact the failed transient unit
+  # could not tell anyone.
   ok "sent to agent '$name'." \
-     '{name:$n, sent:true, bytes:($p|length), from:($s|select(length>0)), msg_id:($i|select(length>0)), reply_to_chat:($rc|select(length>0)), reply_to_msg:($rm|select(length>0))}' \
-     --arg n "$name" --arg p "$payload" --arg s "$sender" --arg i "$msg_id" --arg rc "$reply_to_chat" --arg rm "$reply_to_msg"
+     '{name:$n, sent:true, bytes:($p|length), woken:($w=="1"), from:($s|select(length>0)), msg_id:($i|select(length>0)), reply_to_chat:($rc|select(length>0)), reply_to_msg:($rm|select(length>0))}' \
+     --arg n "$name" --arg p "$payload" --arg s "$sender" --arg i "$msg_id" --arg rc "$reply_to_chat" --arg rm "$reply_to_msg" --arg w "$woken"
 }
 
 # Synchronous send + wait — the inter-agent counterpart to cmd_send. Drops the
