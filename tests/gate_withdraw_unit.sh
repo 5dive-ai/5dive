@@ -379,6 +379,21 @@ out=$(wd DIVE-243 ROOT SU=agent-main); rc=$?
   && ok_t "T-2382g-live the created_by proxy actually authorizes on a legacy row (not just rendered)" \
   || bad_t "T-2382g-live" "rc=$rc out=$out"
 
+# ── DIVE-2382 red-team: --from is ATTRIBUTION ONLY on this path ────────────────────
+# main's acceptance criterion. _gate_withdraw_actor judges by EUID-gated SUDO_* or the
+# real id -un and NEVER by --from, so an unauthorized agent naming the filer must still
+# be refused. Asserted here rather than left to the code comment.
+handoff_gate DIVE-260
+WD_EXTRA=(--from=pi); out=$(wd DIVE-260 NONROOT ID=agent-creative); rc=$?; WD_EXTRA=()
+[[ $rc -ne 0 && "$(gate_open DIVE-260)" == "open" ]] \
+  && ok_t "T-2382-R1 --from=<filer> spoof by an unauthorized agent REFUSED (--from is attribution, never authorization)" \
+  || bad_t "T-2382-R1 from-spoof refused" "rc=$rc open=$(gate_open DIVE-260) out=$out"
+handoff_gate DIVE-261
+WD_EXTRA=(--from=pi); out=$(wd DIVE-261 ROOT SU=agent-creative); rc=$?; WD_EXTRA=()
+[[ $rc -ne 0 && "$(gate_open DIVE-261)" == "open" ]] \
+  && ok_t "T-2382-R2 same spoof at EUID0 with a real SUDO_USER of the HOLDER still REFUSED" \
+  || bad_t "T-2382-R2 from-spoof root refused" "rc=$rc open=$(gate_open DIVE-261) out=$out"
+
 echo "----"
 echo "PASS=$PASS FAIL=$FAIL"
 [[ $FAIL -eq 0 ]]
