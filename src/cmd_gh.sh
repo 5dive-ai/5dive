@@ -235,8 +235,12 @@ cmd_gh() {
   # table. The helper re-derives the class and reads the token itself.
   local rc=0
   printf '%s\0' "$@" | sudo -n /usr/local/bin/5dive _gh_do || rc=$?
-  if [[ $rc -eq 127 ]]; then
-    fail "$E_GENERIC" "routing to 5dive-bot needs the NOPASSWD grant for '/usr/local/bin/5dive _gh_do', which this account does not have. A builder agent gets it with 'agent create --can-push'; meanwhile re-run with --as=caller (the write will be recorded as the human account)."
+  # Distinguish "you may not route" from "the routed call failed". sudo exits 1
+  # for a missing grant, which is indistinguishable from gh's own 1 by rc alone —
+  # so ask sudo directly, and only after a failure (the probe costs nothing on the
+  # happy path). `sudo -n -l <cmd>` is 0 exactly when this account may run it.
+  if [[ $rc -ne 0 ]] && ! sudo -n -l /usr/local/bin/5dive _gh_do >/dev/null 2>&1; then
+    fail "$E_GENERIC" "routing to 5dive-bot needs the NOPASSWD grant for '/usr/local/bin/5dive _gh_do', which this account does not have — so nothing ran and this says NOTHING about the gh call itself. A builder agent gets the grant with 'agent create --can-push'; meanwhile re-run with --as=caller, which works today and records the write as the human account."
   fi
   return $rc
 }

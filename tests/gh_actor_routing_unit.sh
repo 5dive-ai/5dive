@@ -158,6 +158,17 @@ grep -q "printf '%s\\\\0' \"\$@\" | sudo -n /usr/local/bin/5dive _gh_do" "$SRC/c
 grep -q 'GH_TOKEN="$tok" GITHUB_TOKEN="" gh "${args\[@\]}"' "$SRC/cmd_gh.sh" \
   && ok_t "_gh_do passes the token as an env prefix, never in argv" \
   || bad_t "_gh_do passes the token as an env prefix" "token not applied as an environment prefix"
+# A missing sudo grant must be told apart from a failed gh call. sudo exits 1 for
+# a denial, which is indistinguishable from gh's own 1 by rc alone — the first
+# draft keyed on 127 (command-not-found) and was therefore dead code that could
+# never fire. Measured on this box: a denial returns 1, and `sudo -n -l <cmd>`
+# returns 0 for an account holding the grant and non-zero for one that does not.
+grep -q 'sudo -n -l /usr/local/bin/5dive _gh_do' "$SRC/cmd_gh.sh" \
+  && ok_t "cmd_gh distinguishes a missing grant from a failed call (sudo -l probe)" \
+  || bad_t "cmd_gh distinguishes a missing grant from a failed call" "no sudo -l probe"
+grep -q 'rc -eq 127' "$SRC/cmd_gh.sh" \
+  && bad_t "cmd_gh does not key the grant check on rc=127" "127 is command-not-found; a sudo denial is 1, so that branch is dead" \
+  || ok_t "cmd_gh does not key the grant check on rc=127 (dead branch)"
 grep -q 'echo .*\$tok\|printf .*\$tok' "$SRC/cmd_gh.sh" \
   && bad_t "_gh_do never prints the token" "found a print of \$tok" \
   || ok_t "_gh_do never prints the token"
