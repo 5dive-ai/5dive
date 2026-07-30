@@ -60,7 +60,7 @@ RT=src/cmd_agent_runtime.sh
 # envelope_tier_provenance_unit.sh / agent_send_credential_guard_unit.sh: from the
 # function's opening line to the first line that is exactly "}". The declare -F
 # guard is what turns a silently-empty extraction into a hard failure.
-for fn in agent_wake_for_send; do
+for fn in agent_wake_for_send agent_prompt_detectable agent_wake_gate_ready; do
   eval "$(awk -v f="^${fn}\\\\(\\\\) \\\\{$" '$0 ~ f { on=1 } on { print } on && $0 == "}" { exit }' "$RT")"
   declare -F "$fn" >/dev/null \
     || { printf 'FATAL - could not extract %s from %s\n' "$fn" "$RT"; exit 1; }
@@ -193,6 +193,149 @@ if grep -q 'woken:(\$w=="1")' "$RT"; then
   ok_t "the send's ok payload reports woken"
 else
   bad_t "the send's ok payload does not carry a woken field"
+fi
+
+
+# ---------------------------------------------------------------------------
+# ITERATION 2 — THE POST-WAKE DELIVERY HALF.
+#
+# Every arm above stops at agent_wake_for_send, which returns the instant
+# `tmux has-session` succeeds: the EARLIEST moment of a cold boot, well before the
+# TUI renders an input prompt. Delivery then continued into wait_agent_input_ready,
+# which is NON-FATAL by design — on timeout it warns and types anyway — and the run
+# ended at `sent:true`, exit 0. So a --wake send to an agent whose cold boot outran
+# the readiness budget reported success on a message its own comment says was
+# dropped: the defect this ticket exists to remove, made quieter than the 190ms
+# failure it replaced. The reason the 15 arms above could not see it is that ZERO of
+# them reference wait_agent_input_ready and both live ones terminate BEFORE
+# delivery. These arms are that missing half.
+#
+# The real `fail` exits, so stubbing it as an exit is faithful, and running the gate
+# in a SUBSHELL lets the arm read the rc a scheduler would actually get.
+# ---------------------------------------------------------------------------
+E_NOT_RUNNING=8   # src/lib/error_codes.sh
+
+# The real detectability table, extracted from source for the same
+# cannot-drift reason as the functions.
+eval "$(awk '/^declare -A _AGENT_PROMPT_DETECTABLE=\(/ { on=1 } on { print } on && /^\)/ { exit }' "$RT")"
+[[ -n "${_AGENT_PROMPT_DETECTABLE[claude]+x}" ]] \
+  || { printf 'FATAL - could not extract _AGENT_PROMPT_DETECTABLE from %s\n' "$RT"; exit 1; }
+
+ATYPE="claude"      # what agent_type reports for the target
+READY_RC=0          # what wait_agent_input_ready returns
+READY_BUDGET_SEEN="" # the timeout it was handed — the budget instrument
+agent_type()             { printf '%s' "$ATYPE"; }
+wait_agent_input_ready() { READY_BUDGET_SEEN="${2:-}"; return "$READY_RC"; }
+step()                   { :; }
+
+# Run the gate in a subshell with `fail` stubbed to exit, exactly as the real one
+# does. Echoes the reason on stdout so an arm can grade the message too.
+run_gate() { ( fail() { printf '%s' "$2"; exit "$1"; }; agent_wake_gate_ready "$1" ); }
+
+# --- ARM A (THE MISSING ARM olivia named): session appears, prompt NEVER renders.
+# This is the likeliest real cold-boot shape and the one the suite lacked. It must
+# be FATAL — not a warning followed by keystrokes and sent:true.
+AGENT_WAKE_BUDGET_SECS=105; AGENT_WAKE_ELAPSED=0; ATYPE="claude"; READY_RC=1
+_msg=$(run_gate marketing); rc=$?
+eq_t "woke but prompt never rendered => FATAL E_NOT_RUNNING" "$E_NOT_RUNNING" "$rc"
+if [[ "$_msg" == *"input prompt never rendered"* && "$_msg" == *"105s"* ]]; then
+  ok_t "the fatal reason names the unrendered prompt AND the total budget"
+else
+  bad_t "fatal reason is uninformative (got '$_msg')"
+fi
+
+# --- ARM B: LIVENESS, the differential half of ARM A. Same call, prompt DOES
+# render: it must proceed (rc 0) and record proof. Without this arm, a build that
+# fails the wake path unconditionally scores identically on ARM A.
+AGENT_WAKE_READY=""; READY_RC=0
+agent_wake_gate_ready marketing >/dev/null 2>&1; rc=$?
+eq_t "prompt renders => gate proceeds" "0" "$rc"
+eq_t "a proven-ready delivery is recorded as proven" "proven" "$AGENT_WAKE_READY"
+
+# --- ARM C: the hole, made OBSERVABLE rather than silent. A runtime with no prompt
+# marker cannot be proven ready at all (wait_agent_input_ready returns 0 meaning
+# "nothing to detect", never "ready"). Failing would refuse deliveries that work;
+# passing silently would re-create the very green-on-a-dropped-message ARM A
+# removes. So it proceeds AND says so.
+AGENT_WAKE_READY=""; ATYPE="opencode"; READY_RC=1   # RC=1 proves the poll is not even consulted
+agent_wake_gate_ready marketing >/dev/null 2>&1; rc=$?
+eq_t "undetectable runtime still delivers (refusing would break working sends)" "0" "$rc"
+eq_t "...but is reported unprovable, not proven" "unprovable" "$AGENT_WAKE_READY"
+
+# --- ARM D: DISTINCTNESS. proven and unprovable must not collapse into one value —
+# a build that hardcodes either passes ARM B or ARM C but never both, and this arm
+# is what states the requirement directly.
+AGENT_WAKE_READY=""; ATYPE="claude"; READY_RC=0
+agent_wake_gate_ready marketing >/dev/null 2>&1; _proven="$AGENT_WAKE_READY"
+AGENT_WAKE_READY=""; ATYPE="opencode"
+agent_wake_gate_ready marketing >/dev/null 2>&1; _unprov="$AGENT_WAKE_READY"
+if [[ -n "$_proven" && -n "$_unprov" && "$_proven" != "$_unprov" ]]; then
+  ok_t "proven and unprovable are distinguishable in the payload"
+else
+  bad_t "ready values collapse ('$_proven' vs '$_unprov')"
+fi
+
+# --- ARM E: ONE budget, not two stacked ones. The readiness wait must get the
+# REMAINDER of AGENT_WAKE_BUDGET_SECS after the wake spent its share. A build that
+# hands it a fresh 45 (or the whole budget) silently doubles the worst case a
+# scheduler is sizing TimeoutStartSec against.
+ATYPE="claude"; READY_RC=0; AGENT_WAKE_BUDGET_SECS=105; AGENT_WAKE_ELAPSED=40
+READY_BUDGET_SEEN=""
+agent_wake_gate_ready marketing >/dev/null 2>&1
+eq_t "readiness gets the REMAINING budget, not a second fresh one" "65" "$READY_BUDGET_SEEN"
+
+# --- ARM F: a wake that burned the whole budget must not hand the poll a zero or
+# negative timeout (`while (( waited < 0 ))` never runs, and a negative reads as a
+# bug rather than a deadline).
+AGENT_WAKE_ELAPSED=105; READY_BUDGET_SEEN=""
+agent_wake_gate_ready marketing >/dev/null 2>&1
+if [[ -n "$READY_BUDGET_SEEN" ]] && (( READY_BUDGET_SEEN >= 1 )); then
+  ok_t "an exhausted budget floors at 1s rather than going 0 or negative"
+else
+  bad_t "exhausted budget produced a non-positive timeout ('$READY_BUDGET_SEEN')"
+fi
+AGENT_WAKE_ELAPSED=0
+
+# --- ARM G: agent_wake_for_send must RECORD what it spent, or the budget above is
+# arithmetic over a constant. Graded differentially: a wake that returns late must
+# report more elapsed than one that returns immediately.
+reset_stubs; DESIRED="running"; SESSION_UP=0; AGENT_WAKE_ELAPSED=-1
+agent_wake_for_send marketing 5 >/dev/null 2>&1
+_fast="$AGENT_WAKE_ELAPSED"
+reset_stubs; DESIRED="running"; SESSION_UP=1; AGENT_WAKE_ELAPSED=-1
+agent_wake_for_send marketing 5 >/dev/null 2>&1
+_slow="$AGENT_WAKE_ELAPSED"
+if [[ "$_fast" == "0" ]] && (( _slow > _fast )); then
+  ok_t "the wake records the time it actually spent (fast=$_fast slow=$_slow)"
+else
+  bad_t "AGENT_WAKE_ELAPSED does not track the wake (fast='$_fast' slow='$_slow')"
+fi
+
+# --- ARM H: ORDER. The gate must sit BEFORE inject_and_submit, or it grades nothing:
+# keystrokes already fired cannot be un-fired by a later refusal. Same technique as
+# the scoped-refusal order arm above — presence alone stays green on the broken build.
+_gate_line=$(grep -n 'agent_wake_gate_ready "\$name"$' "$RT" | head -1 | cut -d: -f1)
+_inject_line=$(grep -n 'inject_and_submit "\$name" "\$payload"' "$RT" | head -1 | cut -d: -f1)
+if [[ -n "$_gate_line" && -n "$_inject_line" ]] && (( _gate_line < _inject_line )); then
+  ok_t "the readiness gate runs BEFORE inject_and_submit"
+else
+  bad_t "readiness gate is missing or sits after inject_and_submit (gate=$_gate_line inject=$_inject_line)"
+fi
+
+# --- ARM I: the DEFAULT path keeps its best-effort readiness byte for byte. The
+# fatal branch is gated on `woken`; the original warn-and-send-anyway must survive
+# as the else. A busy-but-healthy live agent that never parks at a prompt still gets
+# its message, and _task_need_route_deliver's contract is untouched.
+if grep -q 'elif ! wait_agent_input_ready "\$name"; then' "$RT" \
+   && grep -q "input prompt not detected after 45s — sending best-effort" "$RT"; then
+  ok_t "the default path keeps its non-fatal readiness warning verbatim"
+else
+  bad_t "the default path's best-effort readiness branch was altered or removed"
+fi
+if grep -q 'if (( woken )); then' "$RT"; then
+  ok_t "the fatal readiness branch is gated on woken, not applied to every send"
+else
+  bad_t "no (( woken )) gate found in front of the fatal readiness branch"
 fi
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"

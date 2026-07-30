@@ -487,18 +487,26 @@ declare -A _AGENT_PROMPT_DETECTABLE=(
   [claude]=1 [codex]=1 [devin]=1 [antigravity]=1 [grok]=1
 )
 
+# DIVE-2385 (iteration 2) — extracted verbatim out of wait_agent_input_ready so the
+# WAKE path can tell apart the TWO reasons that function returns 0: "the prompt
+# rendered" and "this runtime has no prompt to detect". Both are `return 0` there
+# and always were; only the wake path needs to distinguish them, and it must read
+# the SAME table rather than a second copy that can drift.
+#
+# An UNKNOWN type (empty lookup) counts as detectable deliberately: paying a bounded
+# wait beats skipping a real readiness check on a type we have not classified.
+agent_prompt_detectable() {
+  local _atype; _atype=$(agent_type "$1" 2>/dev/null || true)
+  [[ -z "$_atype" || -n "${_AGENT_PROMPT_DETECTABLE[$_atype]+x}" ]]
+}
+
 wait_agent_input_ready() {
   local name="$1" timeout="${2:-45}"
   local user="agent-${name}" waited=0 pane
   # Skip the poll for a harness with no marker. Returns 0 (proceed) rather than 1:
   # for these types the 1 never meant "not ready", it meant "undetectable", and the
   # warning it triggered was false — DIVE-348 called that warning out by name.
-  # An UNKNOWN type (empty lookup) falls through to the poll deliberately: paying a
-  # bounded wait beats skipping a real readiness check on a type we have not classified.
-  local _atype; _atype=$(agent_type "$name" 2>/dev/null || true)
-  if [[ -n "$_atype" && -z "${_AGENT_PROMPT_DETECTABLE[$_atype]+x}" ]]; then
-    return 0
-  fi
+  agent_prompt_detectable "$name" || return 0
   while (( waited < timeout )); do
     pane=$(sudo -u "$user" tmux capture-pane -p -t "agent-${name}" 2>/dev/null || true)
     _agent_pane_input_ready "$pane" && return 0
@@ -1417,10 +1425,22 @@ _envelope_caller() {
 # appears inside the budget, the caller still gets E_NOT_RUNNING — with the reason
 # named, rather than the bare "is the agent running?" that was true but useless to
 # a systemd unit.
+#
+# ONE DEADLINE, NOT TWO STACKED ONES (iteration 2). Waking and then waiting for the
+# prompt are two waits on the same send, and a caller sizing a systemd
+# TimeoutStartSec should not have to discover that by adding 60 and 45 out of two
+# different functions. AGENT_WAKE_BUDGET_SECS is the ONLY number a scheduler needs:
+# the wake half spends what it needs (capped at 60 so a hung session-appear cannot
+# starve the readiness wait of the 45s it had), records it in AGENT_WAKE_ELAPSED, and
+# the readiness wait gets the REMAINDER. A fast wake therefore buys the prompt more
+# time rather than throwing it away, and the pair can never exceed the budget.
+AGENT_WAKE_BUDGET_SECS="${AGENT_WAKE_BUDGET_SECS:-105}"
 AGENT_WAKE_FAIL_REASON=""
+AGENT_WAKE_ELAPSED=0
 agent_wake_for_send() {
   local name="$1" timeout="${2:-60}"
   AGENT_WAKE_FAIL_REASON=""
+  AGENT_WAKE_ELAPSED=0
   local desired
   desired=$(registry_read | jq -r --arg n "$name" '.agents[$n].desiredState // ""' 2>/dev/null) || desired=""
   if [[ "$desired" == "stopped" ]]; then
@@ -1433,11 +1453,68 @@ agent_wake_for_send() {
   fi
   local waited=0
   while (( waited < timeout )); do
-    sudo -u "agent-${name}" tmux has-session -t "agent-${name}" 2>/dev/null && return 0
+    if sudo -u "agent-${name}" tmux has-session -t "agent-${name}" 2>/dev/null; then
+      AGENT_WAKE_ELAPSED="$waited"
+      return 0
+    fi
     sleep 1; waited=$((waited+1))
   done
+  AGENT_WAKE_ELAPSED="$waited"
   AGENT_WAKE_FAIL_REASON="started 5dive-agent@${name}.service but its tmux session did not appear within ${timeout}s"
   return 1
+}
+
+# DIVE-2385 (iteration 2) — ON THE WAKE PATH, READINESS IS FATAL.
+#
+# The default path's readiness wait is deliberately NON-fatal: on timeout it warns
+# and delivers best-effort, because a busy-but-healthy agent that never parks at a
+# prompt should still get its message. That is the right trade for a caller who is
+# watching a terminal. It is the WRONG trade for the only caller --wake exists for.
+#
+# THE DEFECT THIS REMOVES, and it was introduced by --wake itself. `wait_agent_input_ready`
+# is a tail that cmd_send already had; adding a new ENTRY into that tail silently
+# inherited its best-effort contract. agent_wake_for_send returns the instant
+# `tmux has-session` succeeds — the EARLIEST moment of a cold boot, long before the
+# TUI renders an input prompt. On a cold boot slower than the readiness budget —
+# the common cold-boot outcome — the old code warned, fired keystrokes into a
+# booting TUI (which its own comment says are dropped and the message lost), and
+# then ended at `sent:true`, exit 0. That is strictly WORSE than the incident this
+# ticket was filed for: there, the send failed in 190ms and left a unit in `failed`
+# state that something could see. A scheduler with no reader needs a truthful rc far
+# more than a delivered-maybe keystroke, and the hard rc is precisely what puts the
+# transient unit into failed state where it is observable at all.
+#
+# Gated on `woken` by its caller, so the DEFAULT path keeps its behaviour, its
+# warning and its best-effort delivery byte for byte.
+#
+# THE HOLE THIS DOES NOT CLOSE, named rather than papered over. For a runtime with
+# no prompt marker (anything outside _AGENT_PROMPT_DETECTABLE — see
+# agent_prompt_detectable) readiness is not slow, it is UNOBSERVABLE: the poll is
+# skipped and 0 means "nothing to detect", never "ready". Failing there would refuse
+# every delivery that would in fact have worked; passing silently would re-create
+# exactly the green-on-a-dropped-message this function exists to remove. So it
+# proceeds and SAYS SO — on stderr, and as ready:"unprovable" in the --json payload,
+# so a scheduler can tell a proven delivery from an assumed one instead of reading
+# one `sent:true` for both.
+#
+# It computes the remaining deadline ITSELF, from AGENT_WAKE_ELAPSED, rather than
+# taking it from the caller. One function owns the budget arithmetic, so there is no
+# second place for a plain 45 to reappear and quietly double the worst case back to
+# 105+45.
+AGENT_WAKE_READY=""
+agent_wake_gate_ready() {
+  local name="$1"
+  local budget=$(( AGENT_WAKE_BUDGET_SECS - AGENT_WAKE_ELAPSED ))
+  (( budget > 0 )) || budget=1
+  if ! agent_prompt_detectable "$name"; then
+    AGENT_WAKE_READY="unprovable"
+    step "agent '$name' woke, but this runtime has no detectable input prompt — delivering WITHOUT proof it is ready (reported as ready=unprovable)"
+    return 0
+  fi
+  if ! wait_agent_input_ready "$name" "$budget"; then
+    fail "$E_NOT_RUNNING" "woke agent '$name' but its input prompt never rendered within ${budget}s — refusing to type into a booting TUI and report a send that would be lost. --wake budgets ${AGENT_WAKE_BUDGET_SECS}s in total for the wake and this wait; size a scheduler's timeout against that."
+  fi
+  AGENT_WAKE_READY="proven"
 }
 
 cmd_send() {
@@ -1584,7 +1661,15 @@ cmd_send() {
   # Don't fire keystrokes into a still-booting TUI — they'd be dropped and the
   # message lost. Wait for the input prompt to render (fast no-op when already
   # up). On timeout we still send best-effort and warn, rather than hang.
-  if ! wait_agent_input_ready "$name"; then
+  #
+  # DIVE-2385 (iteration 2): the WAKE path takes a different branch, because on it
+  # "still booting" is the EXPECTED state rather than a surprise, and its caller is
+  # a scheduler that will never read the warning. See agent_wake_gate_ready. The
+  # elif keeps the default branch — its condition, its message, its best-effort
+  # fallthrough — exactly as it was.
+  if (( woken )); then
+    agent_wake_gate_ready "$name"
+  elif ! wait_agent_input_ready "$name"; then
     step "agent '$name' input prompt not detected after 45s — sending best-effort (may be lost if still booting)"
   fi
 
@@ -1604,9 +1689,15 @@ cmd_send() {
   # agent in order to deliver". A scheduled caller that logs this line can tell,
   # after the fact, that its wake was needed — the fact the failed transient unit
   # could not tell anyone.
+  #
+  # `ready` appears on the WAKE path only, and exists so `sent:true` does not have to
+  # carry two different meanings. "proven" = the input prompt was observed before a
+  # key was typed. "unprovable" = this runtime has no prompt marker, so the delivery
+  # is an assumption. A scheduler that treats those the same is making the exact
+  # mistake this ticket is about.
   ok "sent to agent '$name'." \
-     '{name:$n, sent:true, bytes:($p|length), woken:($w=="1"), from:($s|select(length>0)), msg_id:($i|select(length>0)), reply_to_chat:($rc|select(length>0)), reply_to_msg:($rm|select(length>0))}' \
-     --arg n "$name" --arg p "$payload" --arg s "$sender" --arg i "$msg_id" --arg rc "$reply_to_chat" --arg rm "$reply_to_msg" --arg w "$woken"
+     '{name:$n, sent:true, bytes:($p|length), woken:($w=="1"), ready:($rd|select(length>0)), from:($s|select(length>0)), msg_id:($i|select(length>0)), reply_to_chat:($rc|select(length>0)), reply_to_msg:($rm|select(length>0))}' \
+     --arg n "$name" --arg p "$payload" --arg s "$sender" --arg i "$msg_id" --arg rc "$reply_to_chat" --arg rm "$reply_to_msg" --arg w "$woken" --arg rd "$AGENT_WAKE_READY"
 }
 
 # Synchronous send + wait — the inter-agent counterpart to cmd_send. Drops the
