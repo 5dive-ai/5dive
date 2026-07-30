@@ -135,7 +135,7 @@ out=$(wd DIVE-201 ROOT SU=agent-creative); rc=$?
 # T2: an unrelated agent (SUDO_USER=agent-grok) is REFUSED.
 file_secret_gate DIVE-202
 out=$(wd DIVE-202 ROOT SU=agent-grok); rc=$?
-[[ $rc -ne 0 && "$(gate_open DIVE-202)" == "open" && "$out" == *"only the gate's filer"* ]] \
+[[ $rc -ne 0 && "$(gate_open DIVE-202)" == "open" && "$out" == *"only the gate's holder"* ]] \
   && ok_t "T2 unrelated agent REFUSED (gate untouched, actionable msg)" \
   || bad_t "T2 unrelated refused" "rc=$rc open=$(gate_open DIVE-202) out=$out"
 
@@ -215,6 +215,83 @@ out=$(wd DIVE-207 ROOT SU=agent-creative); rc=$?
 [[ $rc -ne 0 && "$out" == *"no gate to withdraw"* ]] \
   && ok_t "T7 no-gate task refuses --withdraw" \
   || bad_t "T7 no-gate" "rc=$rc out=$out"
+
+# ── DIVE-2382: the refusal must name EVERY identity the authorizing block walked ──
+# The shipped text named "the gate's filer, their lead, or a human" and dropped the ORG
+# COORDINATOR — condition 4, which does not consult the filer at all. So a coordinator
+# who WAS authorized read a message saying they were not, and two agents independently
+# concluded from that text that a gate could never be retired. Both were wrong.
+#
+# Grading note, and it is the whole point: an assertion that merely greps the word
+# "coordinator" in the message PASSES on a build where condition 4 was deleted and the
+# text left behind — the exact shape that shipped. So the message arms are paired with a
+# LIVENESS arm that actually withdraws AS the coordinator, which goes RED on that
+# mutation, and with a DISTINCTNESS arm proving the coordinator is not reachable through
+# the lead condition (in the org above, main is BOTH creative's lead and the coordinator,
+# so T3 cannot tell the two conditions apart and grades neither of them alone).
+db "INSERT INTO agents_org (name, role, reports_to) VALUES ('pi',NULL,'grok');"
+file_pi_gate() { seed_task "$1"; IS_ROOT=1 IDUN=root cmd_task_need "$1" --type=secret --ask="drop the fixture key" --from=pi >/dev/null 2>&1; }
+z_lead=$(_gate_route_reviewer pi); z_coord=$(_task_resolve_coordinator)
+[[ "$z_lead" == "grok" && "$z_coord" == "main" && "$z_lead" != "$z_coord" ]] \
+  && ok_t "T-2382-DISTINCT pi's lead (grok) is NOT the coordinator (main) — the coordinator arm cannot pass through the lead condition" \
+  || bad_t "T-2382-DISTINCT" "lead='$z_lead' coord='$z_coord'"
+
+# T-2382a LIVENESS / mutation-decisive: the coordinator withdraws a gate held by an agent
+# who does NOT report to them. Only condition 4 can authorize this. Delete condition 4
+# from src/cmd_task.sh and this arm goes RED.
+file_pi_gate DIVE-240
+[[ "$(gate_open DIVE-240)" == "open" ]] || bad_t "T-2382a precond" "open=$(gate_open DIVE-240)"
+out=$(wd DIVE-240 ROOT SU=agent-main); rc=$?
+[[ $rc -eq 0 && "$(gate_open DIVE-240)" == "cleared" ]] \
+  && ok_t "T-2382a org coordinator withdraws a gate held OUTSIDE their reporting line (condition 4 is live)" \
+  || bad_t "T-2382a coordinator withdraw" "rc=$rc open=$(gate_open DIVE-240) out=$out"
+
+# T-2382b/c/d: the refusal on the SAME row, from a caller who is none of the four
+# (creative is neither pi's lead nor the coordinator), names each route by its RESOLVED
+# value — so a reader can act on it instead of deriving "nobody can retire this".
+file_pi_gate DIVE-241
+out=$(wd DIVE-241 ROOT SU=agent-creative); rc=$?
+[[ $rc -ne 0 && "$(gate_open DIVE-241)" == "open" ]] \
+  && ok_t "T-2382b unauthorized caller still refused (the fix is the message, not the policy)" \
+  || bad_t "T-2382b still refused" "rc=$rc open=$(gate_open DIVE-241) out=$out"
+[[ "$out" == *"the org coordinator (main)"* ]] \
+  && ok_t "T-2382c refusal names the ORG COORDINATOR by resolved value (was omitted entirely)" \
+  || bad_t "T-2382c names coordinator" "out=$out"
+[[ "$out" == *"their lead (grok)"* ]] \
+  && ok_t "T-2382d refusal names the LEAD by resolved value, not the bare word 'lead'" \
+  || bad_t "T-2382d names lead" "out=$out"
+
+# T-2382e: on a row where nothing was handed off, holder IS the filer-of-record — the
+# "filed by" clause must NOT appear. Grading the clause's presence is worthless without
+# this arm: a build that appends it unconditionally would pass every arm below.
+[[ "$(db "SELECT COALESCE(gate_filed_by,'') FROM tasks WHERE ident='DIVE-241';")" == "pi" ]] \
+  && ok_t "T-2382e precond: DIVE-241 was filed BY its holder (gate_filed_by=assignee=pi)" \
+  || bad_t "T-2382e precond" "gate_filed_by=$(db "SELECT COALESCE(gate_filed_by,'') FROM tasks WHERE ident='DIVE-241';")"
+[[ "$out" == *"holder (assignee pi)"* && "$out" != *"filed by"* ]] \
+  && ok_t "T-2382e no handoff -> refusal names the holder and omits the filer clause (clause is conditional, not decorative)" \
+  || bad_t "T-2382e no-handoff clause" "out=$out"
+
+# T-2382f HANDOFF (DIVE-1945's case): pi files, the row is then reassigned to creative, so
+# withdraw rights MOVE to creative and pi — who actually filed it — no longer holds them.
+# The old text called creative "the gate's filer", naming as filer someone who never filed
+# it, and gave pi no hint their own ask had left them.
+file_pi_gate DIVE-242
+db "UPDATE tasks SET assignee='creative' WHERE ident='DIVE-242';"   # what a reassign does
+out=$(wd DIVE-242 ROOT SU=agent-grok); rc=$?
+[[ $rc -ne 0 && "$out" == *"holder (assignee creative)"* && "$out" == *"filed by pi"* ]] \
+  && ok_t "T-2382f handoff -> refusal names the HOLDER (creative) and the FILER-OF-RECORD (pi) separately" \
+  || bad_t "T-2382f handoff naming" "rc=$rc out=$out"
+
+# T-2382g the DIVE-2106 shape: a carrier row with NO gate_filed_by, created by someone who
+# is not the holder. This is the row two agents read the old refusal on and concluded
+# nobody could ever retire it. The message must now fall back to created_by AND name the
+# coordinator, which is who could in fact have retired it all along.
+file_pi_gate DIVE-243
+db "UPDATE tasks SET gate_filed_by=NULL WHERE ident='DIVE-243';"    # legacy / auto-created row
+out=$(wd DIVE-243 ROOT SU=agent-creative); rc=$?
+[[ $rc -ne 0 && "$out" == *"filed by main"* && "$out" == *"the org coordinator (main)"* ]] \
+  && ok_t "T-2382g no gate_filed_by -> falls back to created_by AND still names the coordinator (the DIVE-2106 dead-end)" \
+  || bad_t "T-2382g legacy row naming" "rc=$rc out=$out"
 
 echo "----"
 echo "PASS=$PASS FAIL=$FAIL"
