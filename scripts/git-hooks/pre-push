@@ -21,10 +21,21 @@
 # incident: c97a4f9 bumped to 0.16.3; a same-day follow-up (2472df2) rebuilt
 # the bundle again (real content change) but its own bump step failed
 # silently on a permissions error, so it reused 0.16.3 with different bundle
-# content. The shared-checkout updater is version-triggered, not content-hash
-# triggered, so a box that had already pulled 0.16.3 would never have picked
-# up the follow-up fix. Fixed after the fact by renumbering the follow-up to
-# 0.16.4 (CHANGELOG); this guard stops the next one from landing at all.
+# content. The CONTROL-PLANE host's nightly updater (5dive-api
+# scripts/control-plane/5dive-host-updates.sh) compares VERSIONS, not bundle
+# content, so it would not have re-installed 0.16.3 to pick up the follow-up
+# fix. Fixed after the fact by renumbering the follow-up to 0.16.4 (CHANGELOG);
+# this guard stops the next one from landing at all.
+#
+# SCOPED DELIBERATELY, and the scope is the point (DIVE-2398): that sentence
+# describes ONE host. Customer boxes are a DIFFERENT rail — install.sh resolves
+# the newest release TAG and pins its sha (DIVE-2144), so a re-cut tag moves
+# them by content, not by version. An earlier wording of this claim said
+# "every box", was never measured, and travelled from a hardcoded string into
+# a tier-2 human decision gate as a cost input before it was retracted. A
+# causal "because X" inside a guard's own prose has code's authority and none
+# of its tests — no test asserts a comment. See
+# community/wiki/a-causal-claim-inside-an-error-string-has-code-authority-and-no-tests.md.
 #
 # WHAT the harness-tree guard does (DIVE-2286): for each tests/*.sh file ADDED
 # by the push, requires a line sourcing tests/lib/grading_tree.sh (the
