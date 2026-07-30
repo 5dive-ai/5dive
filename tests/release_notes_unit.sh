@@ -67,6 +67,7 @@ Body of the already-released section.
 EOF
 git -C "$R" add CHANGELOG.md
 git -C "$R" commit -q -m "feat(gh): route agent writes through the machine account"
+FEAT=$(git -C "$R" rev-parse HEAD)   # parent is CUT_FROM — an incumbent tag here exercises the block's ^{commit}^ lookup
 commit other.txt "x" "fix(cut): stop publishing an empty release body"
 TO=$(git -C "$R" rev-parse HEAD)
 
@@ -189,6 +190,75 @@ n2=$( ( cd "$S" && bash "$SCRIPTS/stamp-changelog.sh" 1.2.3 ) 2>/dev/null ); rc=
 [[ $? -eq 2 ]] \
   && ok_t "stamp: refuses a missing changelog rather than creating one" \
   || bad_t "stamp: refuses a missing changelog" "accepted a missing file"
+
+# --- the workflow block, EXTRACTED AND RUN ------------------------------------
+# The grep-level wiring assertions (below) prove the scripts are referenced. They
+# cannot see a variable that is out of scope at that point in the job, and a wrong
+# name there surfaces only at the next nightly cut — the one path nobody can re-run.
+# So the block is extracted and executed, the same shape release_cut_bundle_unit.sh
+# uses for the release-commit block, which is exactly how the unconditional
+# `git add CHANGELOG.md` in the first cut of this change was caught.
+WF=.github/workflows/release-cut.yml
+extract_notes(){ sed -n '/# >>> DIVE-2452 release-notes block/,/# <<< DIVE-2452 release-notes block/p' "$WF" | sed '1,2d;$d' | sed 's/^          //'; }
+BLOCK=$(extract_notes)
+[[ -n "$BLOCK" ]] \
+  && ok_t "block: the release-notes block is extractable (fences intact)" \
+  || bad_t "block: extractable" "empty extraction — the fence drifted and every arm below would grade nothing"
+grep -q 'release-notes.sh' <<<"$BLOCK" \
+  && ok_t "block: the extracted bytes are the right ones" \
+  || bad_t "block: right fence" "extracted block does not call release-notes.sh"
+
+# Run it against the throwaway repo with `gh` stubbed to RECORD its argv. The stub
+# writes to files rather than echoing, so the assertions read what the job would
+# actually have sent to GitHub.
+mkdir -p "$R/scripts"
+cp "$SCRIPTS/release-notes.sh" "$R/scripts/release-notes.sh"
+run_block() { # <incumbent> <sha> <version>
+  rm -f "$TMP/ghargs" "$TMP/ghbody"
+  ( cd "$R" || exit 9
+    incumbent="$1"; sha="$2"; version="$3"; tag="v$3"
+    note="nightly auto-cut: main changed and CI is green"
+    gh() {
+      printf '%s\n' "$*" > "$TMP/ghargs"
+      local prev="" a
+      for a in "$@"; do [[ "$prev" == "--notes-file" ]] && cp "$a" "$TMP/ghbody"; prev="$a"; done
+    }
+    eval "$BLOCK"
+  )
+}
+
+# Tag an incumbent whose release commit's PARENT is the previous cut point, so the
+# block's own `refs/tags/<incumbent>^{commit}^` expression is exercised rather than
+# bypassed with an empty incumbent. That expression is the part most likely to be
+# wrong, and grep cannot see it at all.
+git -C "$R" tag -f v0.0.8 "$FEAT" >/dev/null 2>&1
+run_block "v0.0.8" "$TO" "1.3.0"; rc=$?
+[[ $rc -eq 0 ]] \
+  && ok_t "block: runs to completion on a derivable range (rc=0)" \
+  || bad_t "block: runs to completion" "rc=$rc"
+grep -q -- '--notes-file' "$TMP/ghargs" 2>/dev/null \
+  && ok_t "block: calls gh release create with --notes-file" \
+  || bad_t "block: calls gh with --notes-file" "argv=$(cat "$TMP/ghargs" 2>/dev/null)"
+grep -q 'machine account' "$TMP/ghbody" 2>/dev/null \
+  && ok_t "block: the body GitHub would receive carries the derived notes" \
+  || bad_t "block: body carries derived notes" "$(head -3 "$TMP/ghbody" 2>/dev/null)"
+grep -q 'nightly auto-cut' "$TMP/ghbody" 2>/dev/null \
+  && ok_t "block: the cut provenance is kept as a footer, not lost" \
+  || bad_t "block: cut provenance kept" "$(tail -3 "$TMP/ghbody" 2>/dev/null)"
+
+# The refusal arm, run for real: an empty range must abort, and abort BEFORE gh is
+# called. A release page created with an underivable body is the bug being closed.
+# An EMPTY range means from == to. Build it the way the block will see it: a tag
+# whose commit's parent IS the sha being cut, so `_notes_from` resolves to `sha`.
+git -C "$R" commit -q --allow-empty -m "chore: synthetic release commit"
+git -C "$R" tag -f v0.0.9 HEAD >/dev/null 2>&1
+run_block "v0.0.9" "$EMPTY" "1.3.1" >/dev/null 2>&1; rc=$?
+[[ $rc -ne 0 ]] \
+  && ok_t "block: an underivable body ABORTS the cut (rc!=0)" \
+  || bad_t "block: underivable body aborts" "rc=$rc — the block continued"
+[[ ! -s "$TMP/ghargs" ]] \
+  && ok_t "block: gh release create is never reached on refusal" \
+  || bad_t "block: gh not reached on refusal" "gh was called: $(cat "$TMP/ghargs")"
 
 # --- wiring: the workflow must actually CALL both, and fail the cut on refusal --
 WF=.github/workflows/release-cut.yml

@@ -429,6 +429,8 @@ jobs:
           fi
           echo "${tag}: bundle verified SERVABLE and byte-correct at ${sha:0:12} (${_got:0:16}…) — install.sh's FATAL fetch path is proven, not assumed"
 
+          # >>> DIVE-2452 release-notes block
+          #     (extracted verbatim by tests/release_notes_unit.sh — keep the fences.)
           # DIVE-2452: THE RELEASE BODY SAYS WHAT SHIPPED, not how it was cut.
           # This used to be `--notes "${note}"`, where `note` is the CUT REASON, so
           # v0.17.0/0.17.1/0.17.9 each published 200-600 characters describing the
@@ -458,5 +460,6 @@ jobs:
           gh release create "$tag" --title "$tag" --target "$sha" --notes-file "$_notes_file" \
             || echo "::warning::THE TAG IS PUBLISHED and boxes will take ${tag} — only the release PAGE failed to create. Not an error in the publish; create the release by hand if you want the notes."
           rm -f "$_notes_file"
+          # <<< DIVE-2452 release-notes block
 
           echo "::notice::published ${tag} at ${sha:0:12} (was ${incumbent:-none}) — this is what every box now installs"
