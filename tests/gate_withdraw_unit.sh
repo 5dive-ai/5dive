@@ -342,15 +342,25 @@ out=$(wd DIVE-255 ROOT SU=agent-creative); rc=$?
 [[ $rc -ne 0 && "$(gate_open DIVE-255)" == "open" ]] \
   && ok_t "T-2382-P7 filer AND created_by empty -> the HOLDER is still refused (authorization does not fall back to assignee)" \
   || bad_t "T-2382-P7 no assignee fallback" "rc=$rc open=$(gate_open DIVE-255) out=$out"
-[[ "$out" == *"the gate's filer (unrecorded)"* ]] \
+# P8/P9 get their OWN rows on purpose. Reading them off P7's row made them CASCADE:
+# under a mutation where the holder is authorized, P7's withdraw SUCCEEDS, so $out holds a
+# success payload and the row has no gate left — P8 and P9 then red as consequences of P7
+# rather than as independent signals, and three reds read as three findings when they are
+# one. Each arm now constructs its own row.
+handoff_gate DIVE-256
+db "UPDATE tasks SET gate_filed_by=NULL, created_by=NULL WHERE ident='DIVE-256';"
+out=$(wd DIVE-256 ROOT SU=agent-grok); rc=$?   # grok: not the holder, so refused either way
+[[ $rc -ne 0 && "$out" == *"the gate's filer (unrecorded)"* ]] \
   && ok_t "T-2382-P8 an unresolvable principal renders as 'unrecorded', a stated absence rather than a '?' placeholder" \
-  || bad_t "T-2382-P8 unrecorded" "out=$out"
-# P9 — and the gate is still retirable, which is why removing the rung costs nothing:
+  || bad_t "T-2382-P8 unrecorded" "rc=$rc out=$out"
+# P9 — the gate is still retirable, which is why removing the assignee rung costs nothing:
 # conditions 1 and 4 never consult the filer. Reachable by CONFIGURATION, not by data.
-out=$(wd DIVE-255 ROOT SU=agent-main); rc=$?
-[[ $rc -eq 0 && "$(gate_open DIVE-255)" == "cleared" ]] \
-  && ok_t "T-2382-P9 the same all-empty row is STILL retirable by the coordinator (no gate is left with no authorizer)" \
-  || bad_t "T-2382-P9 still retirable" "rc=$rc open=$(gate_open DIVE-255) out=$out"
+handoff_gate DIVE-257
+db "UPDATE tasks SET gate_filed_by=NULL, created_by=NULL WHERE ident='DIVE-257';"
+out=$(wd DIVE-257 ROOT SU=agent-main); rc=$?
+[[ $rc -eq 0 && "$(gate_open DIVE-257)" == "cleared" ]] \
+  && ok_t "T-2382-P9 an all-empty row is STILL retirable by the coordinator (no gate is left with no authorizer)" \
+  || bad_t "T-2382-P9 still retirable" "rc=$rc open=$(gate_open DIVE-257) out=$out"
 
 # T-2382g the DIVE-2106 shape: a carrier row with NO gate_filed_by, created by someone who
 # is not the holder. This is the row two agents read the old refusal on and concluded
