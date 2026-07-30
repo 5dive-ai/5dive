@@ -530,6 +530,13 @@ SUDOERS
 # path; params travel over stdin (never argv), so no arg wildcard is needed and
 # the grant is sudo-rs-safe. Gates re-verified authoritatively inside _push_do.
 ${user} ALL=(root) NOPASSWD: /usr/local/bin/5dive _push_do
+# DIVE-2448: the same builder capability, one surface over — actor-routed `gh`.
+# A builder that may ship must also be able to have its WRITES recorded as the
+# machine account rather than the human's (DIVE-2232), or attribution stays a
+# thing each agent has to remember. Exact command path, args over stdin; _gh_do
+# re-derives the routing class as root and refuses admin-class calls, so this
+# grant cannot become a general "act as the bot" capability.
+${user} ALL=(root) NOPASSWD: /usr/local/bin/5dive _gh_do
 SUDOERS
   fi
 }

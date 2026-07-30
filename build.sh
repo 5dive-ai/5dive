@@ -73,6 +73,7 @@ cat \
   src/cmd_proof.sh \
   src/cmd_selfcheck.sh \
   src/cmd_push.sh \
+  src/cmd_gh.sh \
   src/cmd_memory.sh \
   src/cmd_pack.sh \
   src/cmd_secret.sh \
