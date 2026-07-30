@@ -43,9 +43,13 @@ SORTA=$(extract 'sort-assertion block')
 [[ -n "$GUARD" && -n "$SORTA" ]] || { echo "FAIL - could not extract the fenced blocks from $WF"; exit 1; }
 
 # --- harness: run the extracted bytes against a fixture -----------------------
+# DIVE-2466: the guard now POLLS. RELEASE_CUT_POLL_SECONDS=0 pins these two helpers
+# to a SINGLE look, which is exactly the behaviour every assertion below was written
+# against — so they keep their original meaning verbatim rather than being loosened to
+# accommodate the loop. Polling is graded separately, in its own section further down.
 verdict(){ # $1 = check-runs TSV ; echoes NOT-REACHED|IN-FLIGHT|RED|GREEN
   local out rc
-  out=$(runs="$1" sha=deadbeefcafe tag=v9.9.9 bash -c "
+  out=$(runs="$1" sha=deadbeefcafe tag=v9.9.9 RELEASE_CUT_POLL_SECONDS=0 bash -c "
     set -uo pipefail
     $GUARD
   " 2>&1); rc=$?
@@ -59,7 +63,7 @@ verdict(){ # $1 = check-runs TSV ; echoes NOT-REACHED|IN-FLIGHT|RED|GREEN
 }
 verdict_run(){ # $1 = check-runs TSV (4-col), $2 = GITHUB_RUN_ID ; echoes like verdict()
   local out rc
-  out=$(runs="$1" sha=deadbeefcafe tag=v9.9.9 GITHUB_RUN_ID="$2" bash -c "
+  out=$(runs="$1" sha=deadbeefcafe tag=v9.9.9 GITHUB_RUN_ID="$2" RELEASE_CUT_POLL_SECONDS=0 bash -c "
     set -uo pipefail
     $GUARD
   " 2>&1); rc=$?
@@ -120,6 +124,90 @@ ok "install.sh still filters ^v<n>.<n>.<n>$"    "$([[ -n "$inst_rule" ]] && echo
 ok "install.sh still sorts with sort -V"        "$(grep -c 'sort -V' install.sh | awk '{print ($1>0)?"yes":"no"}')" "yes"
 ok "the workflow sorts with sort -V too"        "$(grep -c 'sort -V' "$WF" | awk '$1>0{print "yes"}')" "yes"
 
+echo "== DIVE-2466: the guard POLLS instead of refusing on the first look =="
+# A nightly that lands while CI on the newest merge is still running used to skip the
+# whole day. These arms drive the extracted block with a STUBBED _ci_fetch_runs that
+# hands back a different board on each look, so what is graded is the retry itself and
+# not a re-implementation of it. The stub is why the block defines the fetch as a
+# function outside the fence: with no stub these would hit the network, and a deleted
+# stub fails loudly rather than quietly grading one look.
+POLLDIR=$(mktemp -d /tmp/relcut-poll.XXXXXX)
+trap 'rm -rf "$POLLDIR"' EXIT
+
+poll_run(){ # $1.. = one check-runs fixture per look ; echoes "<verdict> looks=<n>"
+  local i=0 f out rc
+  rm -f "$POLLDIR"/look.* "$POLLDIR"/n
+  for f in "$@"; do i=$((i+1)); printf '%s' "$f" > "$POLLDIR/look.$i"; done
+  printf '1' > "$POLLDIR/n"
+  # Budget 30s at a 1s interval: enough looks to settle, short enough that a REGRESSION
+  # (a guard that waits when it should not) shows up as a slow test rather than a hang.
+  # Past the last fixture the stub REPEATS the final board rather than running dry.
+  # First cut of this returned empty once the list was exhausted, and the guard read
+  # that — correctly — as NOT-REACHED, so the never-settles arm graded the stub's
+  # bug and not the guard's behaviour.
+  out=$(runs="$1" sha=deadbeefcafe tag=v9.9.9 POLLDIR="$POLLDIR" NFIX="$#" \
+        RELEASE_CUT_POLL_SECONDS="${POLL_BUDGET:-30}" RELEASE_CUT_POLL_INTERVAL=1 bash -c '
+    set -uo pipefail
+    _ci_fetch_runs(){
+      local n; n=$(cat "$POLLDIR/n"); n=$((n+1))
+      (( n > NFIX )) && n=$NFIX
+      printf "%s" "$n" > "$POLLDIR/n"
+      cat "$POLLDIR/look.$n" 2>/dev/null
+    }
+    '"$GUARD"'
+  ' 2>&1); rc=$?
+  local looks; looks=$(grep -c '\[look ' <<<"$out")
+  local v
+  if (( rc != 0 )); then
+    if   grep -q 'CI NOT REACHED'    <<<"$out"; then v=NOT-REACHED
+    elif grep -q 'CI still IN FLIGHT' <<<"$out"; then v=IN-FLIGHT
+    elif grep -q 'CI is RED'          <<<"$out"; then v=RED
+    else v="OTHER-FAIL"; fi
+  else
+    grep -q 'CI green on' <<<"$out" && v=GREEN || v="OTHER-OK"
+  fi
+  echo "$v looks=$looks"
+}
+
+INFLIGHT=$(printf 'test\tin_progress\tpending\nscan\tcompleted\tsuccess')
+GREENB=$(printf 'test\tcompleted\tsuccess\nscan\tcompleted\tsuccess')
+REDB=$(printf 'test\tcompleted\tfailure\nscan\tcompleted\tsuccess')
+
+# THE WHOLE POINT OF THE TICKET: in-flight on the first look must not end the day.
+ok "in-flight then green -> GREEN on the 2nd look" "$(poll_run "$INFLIGHT" "$GREENB")" "GREEN looks=2"
+# The branch that is easy to miss: zero check-runs also polls. Its own error text used
+# to tell a human to "let it complete, then re-run this job" — the retry it declined.
+ok "zero check-runs then green -> GREEN"           "$(poll_run "" "$GREENB")"           "GREEN looks=2"
+ok "in-flight twice then green -> GREEN"           "$(poll_run "$INFLIGHT" "$INFLIGHT" "$GREENB")" "GREEN looks=3"
+# RED IS FINAL AND IS NEVER WAITED OUT — one look, even with 30s of budget left.
+ok "RED refuses IMMEDIATELY, one look, no waiting" "$(poll_run "$REDB" "$GREENB")"      "RED looks=1"
+# A red that appears LATER must still stop the cut rather than being polled past.
+ok "in-flight then RED -> RED"                     "$(poll_run "$INFLIGHT" "$REDB")"    "RED looks=2"
+# Fail-closed survives: an expiry is still a non-zero refusal, with the same message.
+# A short budget here: the assertion is that expiry REFUSES, not how long it waits.
+ok "never settles -> still refuses at the deadline" "$(POLL_BUDGET=3 poll_run "$INFLIGHT" | cut -d' ' -f1)" "IN-FLIGHT"
+ok "never reached -> still refuses at the deadline" "$(POLL_BUDGET=3 poll_run "" | cut -d' ' -f1)" "NOT-REACHED"
+
+echo "== DIVE-2466: the poll budget is a CEILING the env knob can only tighten =="
+# A caller that could WIDEN it could park this job on a runner for hours. Tightening is
+# the safe direction; widening and garbage both fall back to the hardcoded ceiling.
+clamp(){ RELEASE_CUT_POLL_SECONDS="$1" bash -c '
+  set -uo pipefail
+  _POLL_CEILING=2700
+  _poll_max="${RELEASE_CUT_POLL_SECONDS:-$_POLL_CEILING}"
+  [[ "$_poll_max" =~ ^[0-9]+$ ]] || _poll_max="$_POLL_CEILING"
+  (( _poll_max > _POLL_CEILING )) && _poll_max="$_POLL_CEILING"
+  echo "$_poll_max"'; }
+ok "a smaller budget is honoured (tighten)"   "$(clamp 120)"      "120"
+ok "a larger budget CLAMPS to the ceiling"    "$(clamp 99999)"    "2700"
+ok "a non-numeric budget falls back, not 0"   "$(clamp 'abc')"    "2700"
+# And the ceiling is really in the shipped file, not only in this harness's copy.
+ok "the ceiling is hardcoded in the workflow" "$(grep -c '_POLL_CEILING=2700' "$WF")" "1"
+
+echo "== DIVE-2466 ARM 1: the cron is off the top of the hour, and armed twice =="
+ok "no cron at the top of an hour"  "$(grep -cE "cron: '0 " "$WF")" "0"
+ok "two schedule entries"           "$(grep -cE "^    - cron: '" "$WF")" "2"
+
 echo "== non-vacuity: each guard must RED when mutated =="
 # DIVE-2238: this helper used to announce a no-op mutation with `echo` and bump
 # `fail` — but every call site is `m=$(mutate ...)`, so the warning was CAPTURED
@@ -177,6 +265,19 @@ if m=$(mutate 's/sort -V/sort/' SORTA); then
   SORTA="$SORTA_SAVE"
 else
   vacuous "lexical sort"
+fi
+
+# (d) DIVE-2466: drop the RE-READ. The loop still spins, but on stale bytes, so a
+# board that goes green on look 2 is never seen and the day is skipped exactly as
+# before the fix. This is the arm that proves the polling is the fix rather than the
+# loop being decorative.
+if m=$(mutate 's/runs=\$(_ci_fetch_runs)$/:/' GUARD); then
+  GUARD_SAVE="$GUARD"; GUARD="$m"
+  ok "MUTANT drop the re-read: in-flight then green stops reaching GREEN" \
+     "$([[ "$(poll_run "$INFLIGHT" "$GREENB")" == "GREEN looks=2" ]] && echo caught-nothing || echo mutant-detected)" "mutant-detected"
+  GUARD="$GUARD_SAVE"
+else
+  vacuous "drop the re-read"
 fi
 
 echo
