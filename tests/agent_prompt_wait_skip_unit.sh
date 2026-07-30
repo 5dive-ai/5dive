@@ -31,6 +31,25 @@ agent_type(){ printf '%s' "$want_type"; }
 sudo(){ :; }
 $(sed -n '/^_agent_pane_input_ready()/,/^}/p'                      "$SRC/src/cmd_agent_runtime.sh")
 $(sed -n '/^declare -A _AGENT_PROMPT_DETECTABLE=(/,/^)/p'          "$SRC/src/cmd_agent_runtime.sh")
+$(sed -n '/^agent_prompt_detectable()/,/^}/p'                      "$SRC/src/cmd_agent_runtime.sh")
+$(sed -n '/^wait_agent_input_ready()/,/^}/p'                       "$SRC/src/cmd_agent_runtime.sh")
+SH
+}
+
+# DIVE-2385: the skip predicate moved out of wait_agent_input_ready into
+# agent_prompt_detectable so the wake path could tell "prompt rendered" from
+# "nothing to detect" — both of which are rc 0 there. A function call can fail in
+# ways an inline [[ ]] could not, and `|| return 0` would read that failure as
+# "undetectable" and skip the readiness check for EVERY agent. This harness omits
+# the helper on purpose, so the arm below grades the direction that fail resolves
+# in. It must be TOWARD the poll.
+harness_without_predicate() {
+  local want_type="$1"
+  cat <<SH
+agent_type(){ printf '%s' "$want_type"; }
+sudo(){ :; }
+$(sed -n '/^_agent_pane_input_ready()/,/^}/p'                      "$SRC/src/cmd_agent_runtime.sh")
+$(sed -n '/^declare -A _AGENT_PROMPT_DETECTABLE=(/,/^)/p'          "$SRC/src/cmd_agent_runtime.sh")
 $(sed -n '/^wait_agent_input_ready()/,/^}/p'                       "$SRC/src/cmd_agent_runtime.sh")
 SH
 }
@@ -74,5 +93,31 @@ for t in $set_types; do
 done
 grep -qE '\[opencode\]|\[pi\]|\[hermes\]|\[openclaw\]' <<<"$(sed -n '/^declare -A _AGENT_PROMPT_DETECTABLE=(/,/^)/p' "$SRC/src/cmd_agent_runtime.sh")" \
   && no "a markerless type is listed as detectable" || ok "no markerless type claims detectability"
+
+
+echo "== 5. DIRECTION OF FAILURE: an unavailable predicate must not become a blanket skip =="
+# The skip is `agent_prompt_detectable ... || return 0`-shaped, so any non-zero rc
+# from the predicate would read as "undetectable". Only a clean rc 1 may skip.
+# claude is DETECTABLE, so a correct build ignores the broken predicate and polls
+# (rc 1 after the timeout); a fail-open build returns 0 instantly, exactly as it did
+# when this helper was first extracted without updating the harness above.
+start=$(date +%s)
+bash -c "$(harness_without_predicate claude); wait_agent_input_ready x 3" >/dev/null 2>&1; rc=$?
+el=$(( $(date +%s) - start ))
+if (( rc == 1 && el >= 2 )); then
+  ok "a broken predicate falls through to the poll rather than skipping it"
+else
+  no "predicate failure fails OPEN — readiness skipped for a detectable type (rc=$rc ${el}s)"
+fi
+# LIVENESS for the arm above: with the predicate PRESENT the same undetectable type
+# still skips, so arm 5 is not just asserting "everything polls".
+start=$(date +%s)
+bash -c "$(harness opencode); wait_agent_input_ready x 3" >/dev/null 2>&1; rc=$?
+el=$(( $(date +%s) - start ))
+if (( rc == 0 && el <= 1 )); then
+  ok "and a working predicate still skips a genuinely undetectable type"
+else
+  no "the real skip stopped working (rc=$rc ${el}s)"
+fi
 
 echo; echo "$pass passed, $fail failed"; (( fail == 0 ))

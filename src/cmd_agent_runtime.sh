@@ -506,7 +506,17 @@ wait_agent_input_ready() {
   # Skip the poll for a harness with no marker. Returns 0 (proceed) rather than 1:
   # for these types the 1 never meant "not ready", it meant "undetectable", and the
   # warning it triggered was false — DIVE-348 called that warning out by name.
-  agent_prompt_detectable "$name" || return 0
+  #
+  # ONLY rc 1 means "undetectable". This test used to be an inline [[ ]] that could
+  # not fail; a function CALL can (unavailable, extracted without its helper, a
+  # future error path), and `|| return 0` would have turned the predicate's own
+  # breakage into a blanket skip of the readiness check for EVERY agent — fail-open
+  # in the worst direction, and silent. Measured: extracting this function without
+  # its new helper made claude and codex skip the poll in 0s. Anything other than a
+  # clean 1 falls through to the poll, which is the same call the UNKNOWN-type case
+  # already makes: pay a bounded wait rather than skip a real check.
+  local _det=0; agent_prompt_detectable "$name" || _det=$?
+  (( _det == 1 )) && return 0
   while (( waited < timeout )); do
     pane=$(sudo -u "$user" tmux capture-pane -p -t "agent-${name}" 2>/dev/null || true)
     _agent_pane_input_ready "$pane" && return 0
