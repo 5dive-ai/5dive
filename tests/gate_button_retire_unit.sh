@@ -234,5 +234,40 @@ done
 chk "the resume ping went through the stub (containment is live, not rotted)" "1" \
     "$([[ -s "$PINGLOG" ]] && echo 1 || echo 0)"
 
+# A RE-FILED gate replaces the old one, so the outgoing gate's button asks a question
+# the task no longer holds. Ordering is the correctness condition: retirement must
+# run BEFORE the new delivery, or the fresh button is stripped by its own filing.
+ident=$(seed_gate "DIVE-2410 wiring arm: refile")
+if [[ -z "$ident" ]]; then chk "wiring/refile: seeded a gate" "yes" "no"; else
+  reset_edits
+  ( cmd_task_need "$ident" --type=approval --ask="really proceed?" ) >/dev/null 2>&1
+  chk "wiring/refile: the outgoing gate's button was retired" \
+      "tok-marketing|1234567890|15491" "$(edits)"
+  chk "wiring/refile: and the REPLACEMENT gate's own button survives its filing" "1" \
+      "$(_task_gate_deliveries "$ident" | grep -c '15491')"
+fi
+
+# ------------------------------------------------- blind-log observability ---
+# The delivery log is the ONLY record of which messages a gate put in a chat, so an
+# unreadable one makes retirement a total silent no-op. Absence and denial must not
+# share an answer: a MISSING log is silent (nothing was ever delivered), an
+# EXISTING-but-unreadable one warns.
+reset_edits
+out=$(FIVEDIVE_GATE_NOTIFY_LOG="$TMP/never-written.log" _task_gate_retire_buttons DIVE-A x 2>&1)
+chk "a MISSING delivery log is silent (nothing was delivered — not a fault)" "0" \
+    "$(grep -c 'cannot read the gate-delivery log' <<<"$out")"
+
+# chmod is inert against root, so this arm cannot be arranged as uid 0. Skip it
+# LOUDLY rather than let it pass vacuously — a silent skip reads as coverage.
+BLIND="$TMP/blind.log"; printf 'x\n' >"$BLIND"; chmod 000 "$BLIND"
+if [[ "$(id -u)" == "0" ]] || [[ -r "$BLIND" ]]; then
+  printf 'SKIP an unreadable delivery log warns — cannot make a file unreadable as uid %s\n' "$(id -u)"
+else
+  _TASK_GATE_RETIRE_BLIND=""
+  out=$(FIVEDIVE_GATE_NOTIFY_LOG="$BLIND" _task_gate_retire_buttons DIVE-A x 2>&1)
+  chk "an EXISTING but unreadable delivery log warns (the no-op is observable)" "1" \
+      "$(grep -c 'cannot read the gate-delivery log' <<<"$out")"
+fi
+
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" == "0" ]]

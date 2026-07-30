@@ -5616,6 +5616,14 @@ cmd_task_need() {
     fail "$E_GENERIC" "$ident: refusing to file a tier-2 gate that cannot mint its own human proof — openssl and /dev/urandom are both unusable on this box, so the tier-2 human floor could not be enforced on it. Filing it anyway would create a gate that LOOKS hard-gated and is not (DIVE-2131). Fix the box's RNG, or file this at a lower --tier if it genuinely is not a human-only call."
   fi
 
+  # DIVE-2410: filing REPLACES any gate already on this task (that is what the
+  # archive-and-clear is for), so whatever button the OUTGOING gate put in a human
+  # chat now asks a question this task no longer holds. Retire BEFORE the new
+  # delivery, not after: the delivery log is the input, so once task_need_notify
+  # has run, the gate's own fresh button is in there too and would be stripped by
+  # its own filing. Order is the correctness condition here, not a preference.
+  _task_gate_retire_buttons "$ident" "superseded by a re-filed gate" || true
+
   db "BEGIN IMMEDIATE;
       $(_gate_archive_and_clear_sql file "id=${id}")
       UPDATE tasks
@@ -6888,7 +6896,19 @@ _task_gate_deliveries() { # <ident>
   local ident="$1"
   local logf="${FIVEDIVE_GATE_NOTIFY_LOG:-}"
   [[ -n "$logf" ]] || logf=/var/log/5dive/notify/gate-notify.log
-  [[ -r "$logf" ]] || return 0
+  if [[ ! -r "$logf" ]]; then
+    # Make the absence observable ONCE per process. This log is the ONLY record of
+    # which messages a gate put in a human's chat, so if it cannot be read the
+    # retirement is a total silent no-op — every settled button stays tappable and
+    # nothing anywhere says so. It is 0664 today, but "unreadable" and "no
+    # deliveries" must never share an answer in a function whose failure mode is
+    # invisible (the DIVE-1927 absent-vs-forbidden rule, one layer over).
+    if [[ -e "$logf" && -z "${_TASK_GATE_RETIRE_BLIND:-}" ]]; then
+      _TASK_GATE_RETIRE_BLIND=1
+      warn "cannot read the gate-delivery log ($logf) — settled gates' buttons cannot be retired from this process, so a closed gate may keep showing a live approve button (DIVE-2410)."
+    fi
+    return 0
+  fi
   awk -v want="$ident" '
     /gate-delivery result=ok/ {
       tasks=""; chat=""; mid=""; via=""
