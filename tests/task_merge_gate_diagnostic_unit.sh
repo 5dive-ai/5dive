@@ -249,11 +249,30 @@ run_done B-5 --result='landed'
 # ---------------------------------------------------------------------------
 clear_fx; a_token
 # EVERY repo in the default search set must answer, or this is T5b's partial-coverage
-# case rather than a genuine miss. _gate_repo_slugs = 5dive-ai/5dive, lodar/5dive-api,
-# lodar/5dive-frontend; the stub keys on the repo NAME.
-export GH_STUB_COMMITS_5dive_main="$(commits 'chore(deps): bump something (DIVE-1)')"
-export GH_STUB_COMMITS_5dive_api_main="$(commits 'chore(deps): bump something else (DIVE-2)')"
-export GH_STUB_COMMITS_5dive_frontend_main="$(commits 'chore(deps): and again (DIVE-3)')"
+# case rather than a genuine miss.
+#
+# DIVE-2431: this used to hardcode the three slugs the default set happened to contain.
+# When the default went 3 -> 11, the eight new repos had no stub, read as UNREACHABLE,
+# and this arm stopped testing what it says it tests — a genuine miss became T5b's
+# partial-coverage refusal and T6 went red for a reason unrelated to its subject. A
+# fixture that names a set the CODE owns is a second copy of that set, and the copy is
+# the one nobody updates. So derive it: whatever `_gate_repo_slugs` returns is what gets
+# stubbed, and this arm keeps its meaning through the next widening without an edit.
+stub_every_default_repo() {
+  local slug name n=0
+  while read -r slug; do
+    [[ -n "$slug" ]] || continue
+    n=$((n+1))
+    name="${slug##*/}"; name="${name//[^A-Za-z0-9]/_}"
+    # A page SHORTER than per_page = history exhausted, which is what makes this a
+    # genuine miss rather than a bounded scan. Distinct idents so no stub can
+    # accidentally name the ident under test.
+    eval "export GH_STUB_COMMITS_${name}_main=\"\$(commits 'chore(deps): bump ${name} (DIVE-90${n})')\""
+  done < <(FIVE_GATE_REPOS='' _gate_repo_slugs)
+  # An empty set would stub nothing and the arm would pass for the wrong reason.
+  (( n >= 3 )) || { echo "T6 fixture: _gate_repo_slugs returned $n repos — refusing to assert a genuine miss against a set that small" >&2; return 1; }
+}
+stub_every_default_repo || bad_t 'T6 fixture could not stub the default repo set' 'see stderr'
 seed B-3 'Branch: dive-2318-genuinely-absent'
 run_done B-3 --result='landed'
 [[ $RC -eq $E_CONFLICT && "$(slugof B-3)" == "done-before-branch-merged" ]] \
