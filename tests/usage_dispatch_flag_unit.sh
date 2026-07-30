@@ -20,6 +20,14 @@
 # in the window => dispatched=false => the CLI flags the row (⚠) instead of
 # printing it as a confident number.
 #
+# DIVE-2312 (second half of this harness): flagging the ROW turned out not to be
+# enough — the ⚠ and the footer caveat both rendered correctly and three readers
+# in a row still lifted the number beside them as fact, one of them the author of
+# the note warning about it. So the figure itself is now qualified in-cell
+# (`~5.1M(unverified)`), and the assertions at the bottom grade the property that
+# actually matters: a flagged figure never appears as a standalone
+# whitespace-delimited field, which is the token a reader quotes.
+#
 # Isolation (rewritten, DIVE-2069): tasks.db AND the agent-home tree both live in
 # a throwaway dir. The premise of the original note here — "the transcript scan
 # can't be redirected via env" — was FALSE: home_of() has honoured USAGE_HOME_ROOT
@@ -216,6 +224,77 @@ fi
 d4=$(jq -r '.tasks[] | select(.ident=="DIVE-90004") | .dispatched' <<<"$data4")
 [[ "$d4" == "null" ]] && ok_t "in_progress task with zero pins reads dispatched=null, NOT flagged false (verified against a proven-live read)" \
   || bad_t "expected DIVE-90004 dispatched=null (unknown, not accused)" "got $d4"
+
+# =============================================================================
+# DIVE-2312 — the flagged VALUE must not be liftable, not merely marked.
+#
+# The assertions above prove the ⚠ and the caveat render. They rendered
+# correctly for three straight readers who then quoted the number as fact, one
+# of them the author of the note warning about it. So the property to grade is
+# not "does the caveat appear" but "can a reader still lift a bare number".
+#
+# Falsifiable form: for a flagged row, the humanized figure must never appear
+# as a STANDALONE whitespace-delimited field in the TOP TASKS block. That is
+# exactly the token a reader's eye lands on and a copy-paste picks up, and it
+# is only satisfiable if the qualifier is attached with no space.
+#
+# Scope is TOP TASKS (and the per-agent `tasks (...)` list) deliberately. The
+# TOP AGENTS row for this same agent prints the same 5.1M bare and SHOULD: the
+# agent really did burn those tokens. DIVE-2058 misattributes which TASK owns
+# them, not how many there were. Asserting over the whole board would be
+# asserting something the defect never claimed.
+# NOTE the argument order: jq takes the first non-flag word as the PROGRAM, so
+# `jq -rn "$USAGE_JQ_HELPERS" --argjson v ... '$v|htok'` compiles the helper
+# block alone (no top-level expression) and treats the real program as a
+# filename. It fails to stderr and leaves $bare_total EMPTY — under which the
+# "no bare liftable figure" assertion passes for a reason that has nothing to
+# do with the fix. The flags go first; the program is one concatenated word.
+htok_of() { jq -rn --argjson v "$1" "$USAGE_JQ_HELPERS"'$v|htok'; }
+bare_total=$(htok_of "$(jq -r '.total' <<<"$row")")
+bare_out=$(htok_of "$(jq -r '.output' <<<"$row")")
+# Abort rather than assert on empty needles: "the number 5.1M never appears as a
+# standalone field" and "the number '' never appears" are the same assertion to
+# awk, and only one of them is about the fix.
+[[ "$bare_total" =~ ^[0-9] && "$bare_out" =~ ^[0-9] ]] \
+  || { bad_t "humanized figures derived for the assertions below" "bare_total='$bare_total' bare_out='$bare_out' — an empty needle makes every check below vacuous"; printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"; exit 1; }
+
+# `rendered` is the board built from $data, where DIVE-90001 is the flagged row.
+tasks_block=$(printf '%s\n' "$rendered" | sed -n '/^TOP TASKS/,$p')
+[[ -n "$tasks_block" ]] || { bad_t "TOP TASKS block located in rendered board" "sed range matched nothing"; printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"; exit 1; }
+
+lift=$(printf '%s\n' "$tasks_block" | awk -v a="$bare_total" -v b="$bare_out" \
+  '{for(i=1;i<=NF;i++) if($i==a || $i==b) print "  line "NR": "$0}')
+[[ -z "$lift" ]] && ok_t "flagged row prints NO bare liftable figure in TOP TASKS ($bare_total / $bare_out never stand alone)" \
+  || bad_t "a flagged figure is still quotable as a bare number" "$lift"
+
+printf '%s\n' "$tasks_block" | grep -qF "~${bare_total}(unverified)" \
+  && ok_t "flagged TOTAL renders qualified in-cell as ~${bare_total}(unverified)" \
+  || bad_t "expected ~${bare_total}(unverified) in TOP TASKS" "$(printf '%s\n' "$tasks_block" | grep DIVE-90001)"
+printf '%s\n' "$tasks_block" | grep -qF "~${bare_out}(unverified)" \
+  && ok_t "flagged OUTPUT renders qualified in-cell as ~${bare_out}(unverified)" \
+  || bad_t "expected ~${bare_out}(unverified) in TOP TASKS" "$(printf '%s\n' "$tasks_block" | grep DIVE-90001)"
+
+# Same rule on the per-agent view — it is a second render site with its own
+# format string, and a fix applied to only one of them leaves the other lifting.
+agent_view=$(JSON_MODE=0 usage_render_agent "$data" "$AGENT" "24h")
+agent_tasks=$(printf '%s\n' "$agent_view" | sed -n '/^  tasks (/,$p')
+lift2=$(printf '%s\n' "$agent_tasks" | awk -v a="$bare_total" '{for(i=1;i<=NF;i++) if($i==a) print "  line "NR": "$0}')
+[[ -z "$lift2" ]] && ok_t "per-agent 'tasks' list prints no bare liftable figure for the flagged row" \
+  || bad_t "usage_render_agent still prints the flagged total bare" "$lift2"
+
+# CONTROL — without this the assertions above are satisfiable by a render that
+# prints no figures at all, or one that qualifies every row indiscriminately.
+# An UNFLAGGED row must still print its number bare and quotable: that is the
+# whole point of only qualifying what the collector actually doubts.
+rendered4=$(JSON_MODE=0 usage_render_board "$data4" "24h" "{}")
+tasks_block4=$(printf '%s\n' "$rendered4" | sed -n '/^TOP TASKS/,$p')
+ctl_total=$(htok_of "$(jq -r '.tasks[] | select(.ident=="DIVE-90003") | .total' <<<"$data4")")
+ctl_hit=$(printf '%s\n' "$tasks_block4" | awk -v a="$ctl_total" '{for(i=1;i<=NF;i++) if($i==a) print NR}')
+[[ -n "$ctl_hit" ]] && ok_t "control: dispatched=true row still prints its figure bare ($ctl_total) — the qualifier tracks doubt, not every row" \
+  || bad_t "expected DIVE-90003's $ctl_total as a standalone field" "$(printf '%s\n' "$tasks_block4" | grep DIVE-90003)"
+printf '%s\n' "$tasks_block4" | grep -q "DIVE-90003.*(unverified)" \
+  && bad_t "control: an unflagged row was wrongly qualified" "$(printf '%s\n' "$tasks_block4" | grep DIVE-90003)" \
+  || ok_t "control: unflagged row carries no (unverified) marker"
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]
