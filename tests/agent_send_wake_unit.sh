@@ -77,9 +77,20 @@ DESIRED=""          # registry desiredState for the target
 
 systemctl() { SYSTEMCTL_CALLS+="$* "; return "$SYSTEMCTL_RC"; }
 sleep()     { :; }   # the timeout loop must not actually wait
+SESSION_UP_AFTER=""  # when set, has-session is ABSENT for this many polls, then UP
+HAS_SESSION_CALLS=0
 sudo()      {        # only shape used by the function: sudo -u agent-X tmux has-session -t ...
   local a
-  for a in "$@"; do [[ "$a" == "has-session" ]] && return "$SESSION_UP"; done
+  for a in "$@"; do
+    if [[ "$a" == "has-session" ]]; then
+      HAS_SESSION_CALLS=$((HAS_SESSION_CALLS+1))
+      if [[ -n "$SESSION_UP_AFTER" ]]; then
+        (( HAS_SESSION_CALLS > SESSION_UP_AFTER )) && return 0
+        return 1
+      fi
+      return "$SESSION_UP"
+    fi
+  done
   return 0
 }
 registry_read() {
@@ -90,7 +101,8 @@ registry_read() {
   fi
 }
 
-reset_stubs() { SYSTEMCTL_CALLS=""; SYSTEMCTL_RC=0; AGENT_WAKE_FAIL_REASON=""; }
+reset_stubs() { SYSTEMCTL_CALLS=""; SYSTEMCTL_RC=0; AGENT_WAKE_FAIL_REASON=""
+                SESSION_UP_AFTER=""; HAS_SESSION_CALLS=0; }
 
 # --- ARM 1: operator intent. desiredState=stopped must REFUSE, and must not have
 # touched the unit. The "did not start it" half is the load-bearing one: without
@@ -228,9 +240,22 @@ agent_type()             { printf '%s' "$ATYPE"; }
 wait_agent_input_ready() { READY_BUDGET_SEEN="${2:-}"; return "$READY_RC"; }
 step()                   { :; }
 
-# Run the gate in a subshell with `fail` stubbed to exit, exactly as the real one
-# does. Echoes the reason on stdout so an arm can grade the message too.
-run_gate() { ( fail() { printf '%s' "$2"; exit "$1"; }; agent_wake_gate_ready "$1" ); }
+# EVERY gate arm goes through this, and that is deliberate. Called in the test's own
+# scope, `fail` is undefined: bash returns 127 and EXECUTION CONTINUES to the
+# function's tail, so an arm asserting rc=0 would pass on a build whose refusal
+# fired. That is the vacuous-refusal shape, arrived at from the other direction —
+# measured here, it hid a mutant that made the undetectable path fatal. So the gate
+# runs in a SUBSHELL where `fail` exits, exactly as the real one does, and the arm
+# reads the rc a scheduler would actually get.
+#
+# On failure it prints the reason; on success, the state the arm needs to inspect
+# (a subshell's variables do not survive, so they come back over stdout).
+run_gate() {
+  ( fail() { printf 'FAILMSG:%s' "$2"; exit "$1"; }
+    AGENT_WAKE_READY=""; READY_BUDGET_SEEN=""
+    agent_wake_gate_ready "$1"
+    printf 'READY:%s BUDGET:%s' "$AGENT_WAKE_READY" "$READY_BUDGET_SEEN" ) 2>/dev/null
+}
 
 # --- ARM A (THE MISSING ARM olivia named): session appears, prompt NEVER renders.
 # This is the likeliest real cold-boot shape and the one the suite lacked. It must
@@ -247,29 +272,28 @@ fi
 # --- ARM B: LIVENESS, the differential half of ARM A. Same call, prompt DOES
 # render: it must proceed (rc 0) and record proof. Without this arm, a build that
 # fails the wake path unconditionally scores identically on ARM A.
-AGENT_WAKE_READY=""; READY_RC=0
-agent_wake_gate_ready marketing >/dev/null 2>&1; rc=$?
+READY_RC=0
+_out=$(run_gate marketing); rc=$?
 eq_t "prompt renders => gate proceeds" "0" "$rc"
-eq_t "a proven-ready delivery is recorded as proven" "proven" "$AGENT_WAKE_READY"
+eq_t "a proven-ready delivery is recorded as proven" "READY:proven BUDGET:105" "$_out"
 
 # --- ARM C: the hole, made OBSERVABLE rather than silent. A runtime with no prompt
 # marker cannot be proven ready at all (wait_agent_input_ready returns 0 meaning
-# "nothing to detect", never "ready"). Failing would refuse deliveries that work;
+# "nothing to detect", never "ready"). Failing would refuse deliveries that WORK;
 # passing silently would re-create the very green-on-a-dropped-message ARM A
-# removes. So it proceeds AND says so.
-AGENT_WAKE_READY=""; ATYPE="opencode"; READY_RC=1   # RC=1 proves the poll is not even consulted
-agent_wake_gate_ready marketing >/dev/null 2>&1; rc=$?
+# removes. So it proceeds AND says so. READY_RC=1 proves the poll is not consulted:
+# a build that dropped this branch would fall into ARM A's fatal refusal.
+ATYPE="opencode"; READY_RC=1
+_out=$(run_gate marketing); rc=$?
 eq_t "undetectable runtime still delivers (refusing would break working sends)" "0" "$rc"
-eq_t "...but is reported unprovable, not proven" "unprovable" "$AGENT_WAKE_READY"
+eq_t "...but is reported unprovable, not proven" "READY:unprovable BUDGET:" "$_out"
 
 # --- ARM D: DISTINCTNESS. proven and unprovable must not collapse into one value —
 # a build that hardcodes either passes ARM B or ARM C but never both, and this arm
 # is what states the requirement directly.
-AGENT_WAKE_READY=""; ATYPE="claude"; READY_RC=0
-agent_wake_gate_ready marketing >/dev/null 2>&1; _proven="$AGENT_WAKE_READY"
-AGENT_WAKE_READY=""; ATYPE="opencode"
-agent_wake_gate_ready marketing >/dev/null 2>&1; _unprov="$AGENT_WAKE_READY"
-if [[ -n "$_proven" && -n "$_unprov" && "$_proven" != "$_unprov" ]]; then
+ATYPE="claude"; READY_RC=0; _proven=$(run_gate marketing)
+ATYPE="opencode";            _unprov=$(run_gate marketing)
+if [[ "$_proven" == READY:?* && "$_unprov" == READY:?* && "$_proven" != "$_unprov" ]]; then
   ok_t "proven and unprovable are distinguishable in the payload"
 else
   bad_t "ready values collapse ('$_proven' vs '$_unprov')"
@@ -280,36 +304,40 @@ fi
 # hands it a fresh 45 (or the whole budget) silently doubles the worst case a
 # scheduler is sizing TimeoutStartSec against.
 ATYPE="claude"; READY_RC=0; AGENT_WAKE_BUDGET_SECS=105; AGENT_WAKE_ELAPSED=40
-READY_BUDGET_SEEN=""
-agent_wake_gate_ready marketing >/dev/null 2>&1
-eq_t "readiness gets the REMAINING budget, not a second fresh one" "65" "$READY_BUDGET_SEEN"
+eq_t "readiness gets the REMAINING budget, not a second fresh one" \
+     "READY:proven BUDGET:65" "$(run_gate marketing)"
 
 # --- ARM F: a wake that burned the whole budget must not hand the poll a zero or
 # negative timeout (`while (( waited < 0 ))` never runs, and a negative reads as a
 # bug rather than a deadline).
-AGENT_WAKE_ELAPSED=105; READY_BUDGET_SEEN=""
-agent_wake_gate_ready marketing >/dev/null 2>&1
-if [[ -n "$READY_BUDGET_SEEN" ]] && (( READY_BUDGET_SEEN >= 1 )); then
+AGENT_WAKE_ELAPSED=105
+_seen=$(run_gate marketing); _seen="${_seen##*BUDGET:}"
+if [[ "$_seen" =~ ^[0-9]+$ ]] && (( _seen >= 1 )); then
   ok_t "an exhausted budget floors at 1s rather than going 0 or negative"
 else
-  bad_t "exhausted budget produced a non-positive timeout ('$READY_BUDGET_SEEN')"
+  bad_t "exhausted budget produced a non-positive timeout ('$_seen')"
 fi
 AGENT_WAKE_ELAPSED=0
 
-# --- ARM G: agent_wake_for_send must RECORD what it spent, or the budget above is
-# arithmetic over a constant. Graded differentially: a wake that returns late must
-# report more elapsed than one that returns immediately.
-reset_stubs; DESIRED="running"; SESSION_UP=0; AGENT_WAKE_ELAPSED=-1
-agent_wake_for_send marketing 5 >/dev/null 2>&1
-_fast="$AGENT_WAKE_ELAPSED"
-reset_stubs; DESIRED="running"; SESSION_UP=1; AGENT_WAKE_ELAPSED=-1
-agent_wake_for_send marketing 5 >/dev/null 2>&1
-_slow="$AGENT_WAKE_ELAPSED"
-if [[ "$_fast" == "0" ]] && (( _slow > _fast )); then
-  ok_t "the wake records the time it actually spent (fast=$_fast slow=$_slow)"
+# --- ARM G: agent_wake_for_send must RECORD what it spent, or ARM E is arithmetic
+# over a constant. Graded DIFFERENTIALLY, and the session must appear on a LATER
+# poll rather than the first: at waited=0 a build that never assigns is
+# indistinguishable from one that does, because the function zeroes the field on
+# entry. Measured — that is exactly the mutant an appears-immediately arm missed.
+reset_stubs; DESIRED="running"; SESSION_UP_AFTER=0     # up on the first poll
+agent_wake_for_send marketing 9 >/dev/null 2>&1; _fast="$AGENT_WAKE_ELAPSED"
+reset_stubs; DESIRED="running"; SESSION_UP_AFTER=3     # up on the fourth
+agent_wake_for_send marketing 9 >/dev/null 2>&1; _slow="$AGENT_WAKE_ELAPSED"
+if [[ "$_fast" == "0" && "$_slow" == "3" ]]; then
+  ok_t "the wake records the polls it actually spent (fast=$_fast slow=$_slow)"
 else
-  bad_t "AGENT_WAKE_ELAPSED does not track the wake (fast='$_fast' slow='$_slow')"
+  bad_t "AGENT_WAKE_ELAPSED does not track a slow wake (fast='$_fast' slow='$_slow', want 0 and 3)"
 fi
+# ...and on the timeout path too, or a wake that burned its whole share reports 0
+# and hands the readiness wait the full budget on top of it.
+reset_stubs; DESIRED="running"; SESSION_UP=1
+agent_wake_for_send marketing 7 >/dev/null 2>&1
+eq_t "a timed-out wake reports its full spend" "7" "$AGENT_WAKE_ELAPSED"
 
 # --- ARM H: ORDER. The gate must sit BEFORE inject_and_submit, or it grades nothing:
 # keystrokes already fired cannot be un-fired by a later refusal. Same technique as
