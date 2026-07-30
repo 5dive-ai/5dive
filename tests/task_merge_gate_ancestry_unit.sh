@@ -42,6 +42,9 @@
 #     -> case 3b FAILS (an empty branch closes).
 #   * neuter the refusal — delete/short-circuit the `policy_refuse` in the branch
 #     path -> case 3 FAILS (closes genuinely unmerged work).
+#   * DIVE-2266: change the bound-hit accumulator back to last-write-wins
+#     (`_attr_bound="$_slug:${_attr#bound:}"`) -> ANC-2266 FAILS because the first two
+#     bound-hit repos and their own walked counts disappear from the refusal.
 # Isolation matches the sibling gate harnesses: source src/ into a throwaway
 # STATE_DIR (the live tasks.db is NEVER touched); gh is STUBBED on PATH.
 # Run: bash tests/task_merge_gate_ancestry_unit.sh  (no root, no network).
@@ -360,6 +363,38 @@ slug=$(db "SELECT COALESCE(policy,'') FROM policy_refusals WHERE ident='ANC-8' O
 [[ "$OUT" == *INCONCLUSIVE* ]] \
   && ok_t 'the bound refusal says INCONCLUSIVE, not that the work is absent' \
   || bad_t 'bound message must not read as a miss' "out=$OUT"
+
+# --- DIVE-2266: A SET-BOUND REFUSAL NAMES THE WHOLE SET -----------------------
+# The branch has no Repo: line and no delivery_ref, so every configured repo is
+# searched. Stub the attribution seam directly to give each repo a distinct measured
+# count: that makes both membership and count attachment observable. The old overwrite
+# leaves only the frontend entry and MUST score red here.
+attr_impl=$(declare -f _gate_branch_ident_on_main)
+_gate_branch_ident_on_main() {
+  case "$1" in
+    5dive-ai/5dive)       printf 'bound:2' ;;
+    lodar/5dive-api)      printf 'bound:7' ;;
+    lodar/5dive-frontend) printf 'bound:11' ;;
+  esac
+}
+clear_fx
+seed ANC-2266 'Branch: lives-somewhere-in-the-set'
+FIVE_GATE_REPOS='5dive-ai/5dive,lodar/5dive-api,lodar/5dive-frontend' \
+  run_done ANC-2266 --result='landed somewhere'
+eval "$attr_impl"
+if [[ $RC -ne 0 && "$OUT" == *"5dive-ai/5dive:2"* \
+      && "$OUT" == *"lodar/5dive-api:7"* \
+      && "$OUT" == *"lodar/5dive-frontend:11"* ]]; then
+  ok_t 'a bound-hit refusal names EVERY repo in the searched set with its OWN walked count'
+else
+  bad_t 'bound-hit set must not collapse to its last repo' "rc=$RC out=$OUT"
+fi
+if [[ "$OUT" == *"NEVER SCANNED"* && "$OUT" == *'Repo: <owner/repo>'* \
+      && "$OUT" == *'task deliver ANC-2266 --pr=https://github.com/<owner>/<repo>/pull/N'* ]]; then
+  ok_t 'the bound refusal names the unscanned-repo case and both terminating bindings'
+else
+  bad_t 'bound remediation must cover work outside the searched set' "out=$OUT"
+fi
 
 # --- DIVE-2120: AN INCIDENTAL MENTION IS NOT A DELIVERY -------------------------
 # Searching main widened the attribution set: every commit reachable from a branch tip
