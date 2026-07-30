@@ -2130,7 +2130,7 @@ _task_status_cmd() {
         # a squash rewrites the sha, so the branch tip is NOT an ancestor of main even
         # though the content is in. Attribution finds it anyway, because the squash
         # commit subject carries the ident.
-        local _slug _bmerged="" _searched="" _attr_slug="" _anc="" _attr="" _anc_novac="" _attr_bound="" _attr_unreach=""
+        local _slug _bmerged="" _merged_slug="" _searched="" _attr_slug="" _anc="" _attr="" _anc_novac="" _attr_bound="" _attr_unreach=""
         while IFS= read -r _slug; do
           [[ -n "$_slug" ]] || continue
           _searched="${_searched:+$_searched, }$_slug"
@@ -2158,7 +2158,10 @@ _task_status_cmd() {
           # them is a finding. Carry it so the refusal below can tell them apart.
           [[ -z "$_attr" ]] && _attr_unreach="$_slug"
           _bmerged=$(GH_TOKEN="$_ghtok" gh pr list --repo "$_slug" --head "$_branch" --state merged --json number,mergedAt -q '.[0].mergedAt' 2>/dev/null || echo "")
-          [[ -n "$_bmerged" && "$_bmerged" != "null" ]] && break
+          if [[ -n "$_bmerged" && "$_bmerged" != "null" ]]; then
+            _merged_slug="$_slug"
+            break
+          fi
           _bmerged=""
         done < <(if [[ -n "$_task_slug" ]]; then printf '%s\n' "$_task_slug"; else _gate_repo_slugs; fi)
         if [[ -n "$_attr_slug" ]]; then
@@ -2220,6 +2223,12 @@ _task_status_cmd() {
           # DIVE-2301. So: state what was actually measured (no commit subject on main
           # names the ident, no merged PR for the branch) and give the remedy that works.
           policy_refuse "$E_CONFLICT" done-before-branch-merged DIVE-1830 "$ident" "$ident cannot close: nothing on ${FIVE_GATE_MAIN_BRANCH:-main} in $_searched shows branch '$_branch' landed. MEASURED, both ways that can accept: (a) no commit SUBJECT on main names $ident (attribution, DIVE-2120 — the only test that accepts here), and (b) no MERGED PR has '$_branch' as its head. Ancestry is NOT one of the ways: a squash rewrites the sha, so a branch tip is never an ancestor of a squash-merged main — do not go looking for the branch. done=merged-to-main (DIVE-1830) — land it (delegated push: \`5dive push $ident\`, or open and merge a PR) with the ident in the commit SUBJECT, then run task done. If it lives in a repo not listed there, add a \`Repo: <owner>/<repo>\` line to the body. Use \`task cancel\` to abandon."
+        else
+          # DIVE-2217: this is the OTHER accepting arm. Keep its repo in a variable
+          # named for the evidence that assigned it, just as _attr_slug is owned by
+          # _gate_branch_ident_on_main above. A silent success here made a merged-PR
+          # close indistinguishable from attribution in the durable operator record.
+          warn "$ident: branch '$_branch' is the head of a MERGED PR in $_merged_slug (merged at $_bmerged) — GitHub's merged-PR record is the accepting evidence. done=merged-to-main satisfied."
         fi
       fi
     fi

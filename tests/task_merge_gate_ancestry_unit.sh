@@ -25,10 +25,11 @@
 #   4. ancestry UNREACHABLE (gh/network/token) is not "no": with a merged PR it still
 #      closes, and WITHOUT one it still refuses — an outage can never invent either
 #      verdict.
-#   5. the ATTRIBUTION pass is AUDIBLE in the close (which evidence closed it), and
-#      the refusal text names both roads it tried. DIVE-2184: it said "ancestry pass"
-#      and the close line said ANCESTOR, so the assertion and the message agreed with
-#      each other and with nothing else.
+#   5. EACH accepting pass is AUDIBLE in the close (which evidence closed it):
+#      attribution names its subject scan and a merged PR names its own repo, branch,
+#      and merged_at receipt. DIVE-2184: attribution said "ancestry pass" and the close
+#      line said ANCESTOR, so the assertion and the message agreed with each other and
+#      with nothing else. DIVE-2217: the separate merged-PR pass remained silent.
 #
 # MUTATION GRADE (run by hand against src/cmd_task.sh, both must go red):
 #   * neuter the ATTRIBUTION acceptance — `_gate_branch_ident_on_main() { printf '0'; }`
@@ -45,6 +46,8 @@
 #   * DIVE-2266: change the bound-hit accumulator back to last-write-wins
 #     (`_attr_bound="$_slug:${_attr#bound:}"`) -> ANC-2266 FAILS because the first two
 #     bound-hit repos and their own walked counts disappear from the refusal.
+#   * delete the merged-PR acceptance warning -> case 2's receipt assertion FAILS
+#     while the state transition still passes (the silent record defect reproduced).
 # Isolation matches the sibling gate harnesses: source src/ into a throwaway
 # STATE_DIR (the live tasks.db is NEVER touched); gh is STUBBED on PATH.
 # Run: bash tests/task_merge_gate_ancestry_unit.sh  (no root, no network).
@@ -231,6 +234,12 @@ fi
 [[ "$OUT" != *ANCESTOR* ]] \
   && ok_t 'the squash close does NOT claim ancestry evidence it does not have' \
   || bad_t 'squash close must not claim ancestry' "out=$OUT"
+[[ "$OUT" == *"branch 'dive-1999-squashed' is the head of a MERGED PR"* \
+   && "$OUT" == *"in 5dive-ai/5dive"* \
+   && "$OUT" == *"merged at 2026-07-26T09:00:00Z"* \
+   && "$OUT" != *"names SQ-1 in its SUBJECT"* ]] \
+  && ok_t 'the squash close names only its MERGED-PR evidence, repo, branch, and timestamp' \
+  || bad_t 'merged-PR pass must emit its own receipt' "out=$OUT"
 
 # --- 3. NON-VACUITY: genuinely unmerged commits, no PR -> STILL REFUSES --------
 clear_fx; export GH_STUB_CMP_5dive_dive_2101_wip="$AHEAD"
