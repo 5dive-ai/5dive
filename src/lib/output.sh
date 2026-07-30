@@ -29,6 +29,28 @@ JSON_MODE=0
 fail() {
   local code="$1"; shift
   local msg="$*"
+  # DIVE-2121: an invalid flag is often one shell token containing a pasted
+  # paragraph (for example --json="<text>"). Echoing that token verbatim can
+  # make the paragraph's closing sentence look like an acknowledgement. Keep
+  # enough of the token to identify the typo, but never replay the whole input.
+  local unknown_flag_marker='unknown flag: '
+  if [[ "$msg" == *"$unknown_flag_marker"* ]]; then
+    local unknown_flag_lead="${msg%%"$unknown_flag_marker"*}"
+    local unknown_flag_token="${msg#*"$unknown_flag_marker"}"
+    if (( ${#unknown_flag_token} > 40 )); then
+      msg="${unknown_flag_lead}${unknown_flag_marker}${unknown_flag_token:0:40}..."
+    fi
+  elif [[ "$msg" == *"unknown flag"* ]]; then
+    # A few older parsers say "unknown flag '<token>'" or "unknown flag for
+    # <verb>: <token>". They share the same payload risk even though they do
+    # not use the prevailing colon form above.
+    local unknown_flag_phrase='unknown flag'
+    local unknown_flag_lead="${msg%%"$unknown_flag_phrase"*}"
+    local unknown_flag_tail="${msg#*"$unknown_flag_phrase"}"
+    if (( ${#unknown_flag_tail} > 40 )); then
+      msg="${unknown_flag_lead}${unknown_flag_phrase}${unknown_flag_tail:0:40}..."
+    fi
+  fi
   if (( JSON_MODE )); then
     local class
     class=$(err_class_for "$code")
@@ -69,4 +91,3 @@ ok() {
   fi
   return 0
 }
-
