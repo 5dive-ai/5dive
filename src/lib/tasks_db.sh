@@ -1003,7 +1003,8 @@ _tasks_db_migrate() {
            'shipped_flag_at TEXT' 'routed_reviewer TEXT' \
            'delivery_ref TEXT' 'delivered_at TEXT' \
            'originated_by_objective INTEGER' 'originated_cycle INTEGER' \
-           'verify_unavailable INTEGER' 'last_skipped_at TEXT'; do
+           'verify_unavailable INTEGER' 'last_skipped_at TEXT' \
+           'human_evidence TEXT'; do
     # DIVE-2418: herestring, NOT a pipe. `printf | grep -q` lets grep exit on its
     # first match while printf is still writing, and printf then takes SIGPIPE and
     # emits "write error: Broken pipe" on stderr. This runs from tasks_db_init on

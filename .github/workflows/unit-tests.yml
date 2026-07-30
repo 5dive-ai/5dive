@@ -177,12 +177,54 @@ jobs:
   # environment ever does.
   #
   # This job owns the invariant that survives that: every harness in tests/*.sh is
+  # DIVE-2412: A HARNESS CAN BE UNPROBED FOR TIME RATHER THAN FOR SHAPE, and the
+  # two want different answers. The probe's per-harness `timeout` is 180s, which is
+  # what stops one hung harness from stalling a 255-file sweep. A mutation grader
+  # re-runs its whole unit suite once per mutant, so this one costs ~14 x 23s and is
+  # killed by that timeout in EVERY environment — canary never printed, so
+  # `not-reached` everywhere, which is precisely the permanently-unprobed limit case
+  # the union job exists to catch. It caught it.
+  #
+  # The allowlist is the WRONG instrument here and using it would have been a false
+  # reason on the record: ALLOW_UNPROBEABLE means "no identifiable verdict variable",
+  # and this harness has one — measured `wired` at PROBE_TIMEOUT=900. It is probeable
+  # and slow, not unprobeable. So it gets a lane that pays the time instead of an
+  # exemption that excuses the coverage, and the union still asserts the same
+  # invariant over the same corpus.
+  #
+  # Scoped with --only on purpose: raising PROBE_TIMEOUT for the whole sweep would
+  # also raise how long a genuinely hung harness can stall CI, which is the property
+  # the 180s default is buying. Named harnesses pay 900s; nothing else changes.
+  harness-verdict-slow:
+    runs-on: ubuntu-latest
+    needs: test
+    env:
+      # One name per slow harness, comma-separated — the probe's own --only format.
+      # Keep this list SHORT and justified; a harness landing here is saying its
+      # verdict costs minutes, not that it may go ungraded.
+      SLOW_HARNESSES: gate_channel_session_t2_mutation.sh
+    steps:
+      # DIVE-2229: full history — pinned baselines must resolve here too.
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - name: Slow harnesses must be able to FAIL too (long lane)
+        env: { PROBE_TIMEOUT: '900' }
+        run: |
+          bash tests/meta/harness-verdict-probe.sh --assume-clean \
+            --only="$SLOW_HARNESSES" --label=slow --report=probe-slow.txt
+      # `if: always()` for the same reason as the pristine lane: a run that found
+      # UNWIRED still made a valid coverage observation, and losing the report would
+      # let a red probe silently shrink the union instead of reddening it.
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: { name: probe-slow, path: probe-slow.txt, if-no-files-found: error }
+
   # probed in AT LEAST ONE environment, or is allowlisted by name with a reason.
   # A skip in one environment is still not an accusation; a skip in all of them is
   # now a failure.
   harness-verdict-union:
     runs-on: ubuntu-latest
-    needs: [harness-verdict, test-installed-host]
+    needs: [harness-verdict, test-installed-host, harness-verdict-slow]
     steps:
       # DIVE-2229: full history — pinned baselines must resolve here too.
       - uses: actions/checkout@v4
@@ -194,7 +236,11 @@ jobs:
       # we claim to cover — the check would otherwise have the same shape of hole
       # it exists to close.
       - name: Every harness must be probed in SOME environment
-        run: bash tests/meta/harness-verdict-union.sh probe-pristine.txt probe-installed.txt
+        # probe-slow.txt is named EXPLICITLY, not globbed: union fails closed on a
+        # missing or unreadable report, so a slow lane that died has to red this job
+        # rather than quietly drop back to the two-environment corpus it used to
+        # cover — the same shrink-in-silence hole this check exists to close.
+        run: bash tests/meta/harness-verdict-union.sh probe-pristine.txt probe-installed.txt probe-slow.txt
 
   # DIVE-2039: the same invariant one level out, over the RAILS rather than the
   # harnesses. `5dive selfcheck` reports pass | fail | NOT-REACHED and NOT-REACHED
