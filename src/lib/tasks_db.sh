@@ -1292,7 +1292,7 @@ MIG
     local lr_cols
     lr_cols=$(sqlite3 -cmd ".timeout 5000" "$TASKS_DB" \
               "SELECT name FROM pragma_table_info('loop_runs');" 2>/dev/null)
-    if ! printf '%s\n' "$lr_cols" | grep -qx "scorecard_json"; then
+    if ! grep -qx "scorecard_json" <<<"$lr_cols"; then
       sqlite3 -cmd ".timeout 5000" "$TASKS_DB" \
         "ALTER TABLE loop_runs ADD COLUMN scorecard_json TEXT;" >/dev/null 2>&1 || true
     fi
@@ -1458,11 +1458,11 @@ MIG
     local oc_cols
     oc_cols=$(sqlite3 -cmd ".timeout 5000" "$TASKS_DB" \
               "SELECT name FROM pragma_table_info('objective_cycles');" 2>/dev/null)
-    if ! printf '%s\n' "$oc_cols" | grep -qx "planner_loop_id"; then
+    if ! grep -qx "planner_loop_id" <<<"$oc_cols"; then
       sqlite3 -cmd ".timeout 5000" "$TASKS_DB" \
         "ALTER TABLE objective_cycles ADD COLUMN planner_loop_id TEXT;" >/dev/null 2>&1 || true
     fi
-    if ! printf '%s\n' "$oc_cols" | grep -qx "planner_task_id"; then
+    if ! grep -qx "planner_task_id" <<<"$oc_cols"; then
       sqlite3 -cmd ".timeout 5000" "$TASKS_DB" \
         "ALTER TABLE objective_cycles ADD COLUMN planner_task_id INTEGER;" >/dev/null 2>&1 || true
     fi
@@ -1481,7 +1481,7 @@ MIG
     local obj_cols
     obj_cols=$(sqlite3 -cmd ".timeout 5000" "$TASKS_DB" \
               "SELECT name FROM pragma_table_info('objectives');" 2>/dev/null)
-    if ! printf '%s\n' "$obj_cols" | grep -qx "run_mode"; then
+    if ! grep -qx "run_mode" <<<"$obj_cols"; then
       sqlite3 -cmd ".timeout 5000" "$TASKS_DB" \
         "ALTER TABLE objectives ADD COLUMN run_mode TEXT NOT NULL DEFAULT 'live';" >/dev/null 2>&1 || true
     fi
