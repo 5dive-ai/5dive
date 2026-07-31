@@ -284,6 +284,60 @@ if [[ -z "$ident" ]]; then chk "wiring/reject: seeded a gate" "yes" "no"; else
       "$(db "SELECT COALESCE(need_answered_by,'') FROM tasks WHERE ident=$(sqlq "$ident");")"
 fi
 
+# ------------------------------------------ file-time settle site: tier-0 ----
+# olivia's open question on iteration 1: cmd_task_need can itself SETTLE a gate at
+# FILE time — the DIVE-891 tier-0 auto-clear — and it is wired to no retire. That is
+# correct only because such a gate never DELIVERS: it self-answers and returns before
+# task_need_notify, so there is no button of its own to retire, and any button the
+# OUTGOING gate left is already stripped by the re-file retire that runs first. If
+# that stops holding it becomes a seventh settle path closing a delivered gate with
+# no retire — a silent no-op, which is the whole failure mode of this ticket.
+#
+# Graded behaviourally on purpose, and the observable was chosen the hard way — TWO
+# drafts of this arm passed against a file whose tier-0 return had been deleted:
+#   1. Static (assert the `return` sits above the first notify). `the first bare
+#      return after the write` just re-resolved to the NEXT branch's return, still
+#      above the notify. A reachability claim needs the run, not the line order.
+#   2. Behavioural but reading `_task_gate_deliveries`. That view DEDUPES identical
+#      lines (see the first arm in this file), and the mock Bot API hands back the
+#      same message_id every time — so a genuine SECOND delivery collapsed into the
+#      first and the count never moved. A deduped view cannot count deliveries.
+# Measured 2026-07-31 by deleting src/cmd_task.sh:5533: task_need_notify calls go
+# 1 -> 2 and the RAW log goes 1 -> 2, while the deduped view stays 1 either way. So
+# the raw undeduped log below is the differential observable, and the tier-0 return
+# is confirmed load-bearing — deleting it puts a real second button in the chat.
+ident=$(seed_gate "DIVE-2410 file-time arm: tier0")
+if [[ -z "$ident" ]]; then chk "file-time/tier-0: seeded a gate" "yes" "no"; else
+  reset_edits
+  ( cmd_task_need "$ident" --type=decision --ask="t0 proceed?" \
+      --options="A|B" --recommend=A --tier=0 ) >/dev/null 2>&1
+  chk "file-time/tier-0: the OUTGOING gate's button was retired by the re-file retire" \
+      "tok-marketing|1234567890|15491" "$(edits)"
+  chk "file-time/tier-0: and the auto-cleared gate delivered NO button of its own" "1" \
+      "$(grep -c 'gate-delivery result=ok' "$LOG")"
+  chk "file-time/tier-0: it really did auto-clear (the arm graded a settle, not a refusal)" \
+      "auto:t0" \
+      "$(db "SELECT COALESCE(need_answered_by,'') FROM tasks WHERE ident=$(sqlq "$ident");")"
+fi
+
+# The OSS-21 tier-1 precedent auto-clear is the OTHER file-time settle site and is
+# NOT graded here — say so rather than let its absence read as coverage. It needs two
+# distinct nonce-bearing prior gates on an identical ask_shape to qualify, which this
+# harness cannot seed cheaply. What bounds it today is that it is pref-gated and the
+# pref defaults OFF, so in the default fleet posture it cannot fire at all; that
+# default IS graded, because it is the thing that makes the gap survivable.
+chk "file-time/precedent: OSS-21 auto-clear is inert by default (ungraded path, fenced)" \
+    "off" "$(_p=$(_task_pref_get precedent_autoclear); printf '%s' "${_p:-off}")"
+# LIVENESS for the arm above. Its `${_p:-off}` fallback is exactly the shape that
+# passes when the reader is broken: a _task_pref_get that errored, was renamed, or
+# returned nothing collapses to "off" and the inertness arm stays green while
+# grading nothing. So prove the reader can report the OTHER value before trusting it
+# to report this one — without this arm, the fence claim above is unfalsifiable.
+_task_pref_set precedent_autoclear on >/dev/null 2>&1
+chk "file-time/precedent: liveness — the pref reader really reads (not a stuck default)" \
+    "on" "$(_p=$(_task_pref_get precedent_autoclear); printf '%s' "${_p:-off}")"
+_task_pref_set precedent_autoclear off >/dev/null 2>&1
+
 # ------------------------------------------------- blind-log observability ---
 # The delivery log is the ONLY record of which messages a gate put in a chat, so an
 # unreadable one makes retirement a total silent no-op. Absence and denial must not
