@@ -390,6 +390,36 @@ _mirror_send() {
   curl -s --connect-timeout 5 --max-time 10 -X POST "https://api.telegram.org/bot${token}/sendMessage" "${args[@]}" 2>/dev/null
 }
 
+# _mirror_edit_markup — DIVE-2410: change (by default REMOVE) the inline keyboard
+# on a message that was ALREADY delivered. Sibling of _mirror_send, deliberately
+# next to it and under the SAME dry-run guard, because an edit lands in the same
+# human's chat a send does: a fixture harness that can edit a real message can
+# rewrite a real conversation, which is the DIVE-1500 risk shape verbatim.
+# Bot API: editMessageReplyMarkup with reply_markup OMITTED removes the keyboard.
+#
+# Two Bot API refusals are BENIGN here and callers must not read them as breakage:
+# "message is not modified" (the keyboard is already gone — the desired end state)
+# and "message to edit not found" (deleted, or older than Telegram will let a bot
+# edit). Both mean the button can no longer be tapped, which is the whole point.
+_mirror_edit_markup() { # <token> <chat> <message_id> [reply_markup]
+  local token="$1" chat="$2" mid="$3" reply_markup="${4:-}"
+  if [[ -n "${FIVEDIVE_NOTIFY_DRYRUN:-}" && "${FIVEDIVE_NOTIFY_DRYRUN}" != "0" ]]; then
+    local dry_line
+    dry_line=$(printf 'notify-dryrun edit_markup chat=%s message_id=%s markup=%s' \
+      "$chat" "$mid" "$([[ -n "$reply_markup" ]] && echo replace || echo strip)")
+    if [[ -n "${FIVEDIVE_NOTIFY_DRYRUN_LOG:-}" ]]; then
+      printf '%s\n' "$dry_line" >>"$FIVEDIVE_NOTIFY_DRYRUN_LOG" 2>/dev/null || true
+    fi
+    printf '%s\n' "$dry_line" >&2 || true
+    printf '%s' '{"ok":true,"dry_run":true}'
+    return 0
+  fi
+  local args=(--data-urlencode "chat_id=${chat}" --data-urlencode "message_id=${mid}")
+  [[ -n "$reply_markup" ]] && args+=(--data-urlencode "reply_markup=${reply_markup}")
+  curl -s --connect-timeout 5 --max-time 10 -X POST \
+    "https://api.telegram.org/bot${token}/editMessageReplyMarkup" "${args[@]}" 2>/dev/null
+}
+
 # Rename a migrated group's key (old→new) in access.json, preserving the policy
 # value (incl. message_thread_id) and the file's owner/mode. Runs as root (the
 # mirror only fires under sudo), so chowning back to the agent owner is required

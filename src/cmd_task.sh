@@ -2676,6 +2676,17 @@ $_body"
   # recap; only the redundant live ping is dropped. Manual/delegated closes
   # (no template parent) still notify. Cheap single-column read, fail-open to
   # "notify" so a DB hiccup never silently swallows a real finish line.
+  # DIVE-2410: closing a task MOOTS any gate still open on it — the question can
+  # never be answered now, so its button must stop looking answerable. Conditional
+  # on the gate being UNANSWERED on purpose: an answered gate had its buttons
+  # retired at answer time, and re-editing would only add a "not modified" row.
+  # Independent of --notify (that flag governs the human's ✅/⚠️ ping, a different
+  # question from whether a dead control is still on their screen).
+  if [[ "$verb" == "done" || "$verb" == "cancel" ]]; then
+    local _open_gate
+    _open_gate=$(db "SELECT 1 FROM tasks WHERE id=${id} AND need_type IS NOT NULL AND need_answered_at IS NULL;" 2>/dev/null || echo "")
+    [[ -n "$_open_gate" ]] && { _task_gate_retire_buttons "$ident" "task ${verb} with the gate still open" || true; }
+  fi
   if (( notify )) && [[ "$verb" == "done" || "$verb" == "cancel" ]]; then
     local from_tmpl
     from_tmpl=$(db "SELECT COALESCE(from_template_id,'') FROM tasks WHERE id=${id};" 2>/dev/null || echo "")
@@ -3076,6 +3087,11 @@ cmd_task_reject() {
         WHERE id=${id} AND need_answered_at IS NULL;"
     # DIVE-2054: task-store state — fenced.
     _task_store_audit_log "task reject gate-supersede" "ok" 0 -- "task=$ident" || true
+    # DIVE-2410: superseded is settled. This one is the worst stale button of the
+    # set — the gate now reads '(superseded ...)' with provenance auto:reject, so
+    # a human tapping it would believe they authorized something an agent already
+    # closed on their behalf.
+    _task_gate_retire_buttons "$ident" "superseded by auto:reject" || true
   fi
   # max_iterations reached -> stop bouncing, park it on a human to decide.
   if (( maxi > 0 && iter >= maxi )); then
@@ -3839,6 +3855,9 @@ cmd_task_park() {
             need_type=NULL, ask=NULL, need_options=NULL, recommend=NULL
       WHERE id=${tid} AND status NOT IN ('done','cancelled');
       COMMIT;"
+  # DIVE-2410: park clears the gate columns, so whatever button that gate put in a
+  # human's chat now points at a question the task no longer holds.
+  _task_gate_retire_buttons "$tident" "parked" || true
   local wake_note=""; [[ "$wake_sql" != "NULL" ]] && wake_note=" — wakes $(db "SELECT wake_at FROM tasks WHERE id=${tid};") UTC"
   ok "$tident parked (no action needed)${reason:+ — $reason}${wake_note}" \
      '{task:($t|tonumber), task_ident:$ti, parked:true, reason:$r, wake_at:(($w|select(length>0)) // null)}' \
@@ -4998,6 +5017,11 @@ cmd_task_need() {
     # suppress it (fencing here would trade a contamination bug for an
     # evidence-suppression bug, the DIVE-1968 fail-open family). See DIVE-2054 wiki.
     audit_log "task need withdraw" "ok" 0 -- "task=$ident" "type=$w_type" "by=${w_name:-$w_kind}" "asserted_from=${from:-}" || true
+    # DIVE-2410: a withdrawn gate is a settled gate from the human's side — the
+    # question is gone, so the button must go with it. A withdrawal is the path
+    # most likely to leave a stale button standing, because unlike an answer
+    # nothing about it ever reaches the human's chat.
+    _task_gate_retire_buttons "$ident" "withdrawn by ${w_name:-$w_kind}" || true
     local w_new; w_new=$(db "SELECT status FROM tasks WHERE id=${id};")
     ok "$ident gate withdrawn (${w_type}) — moot request cleared, no secret/grant recorded; task now ${w_new}" \
        '{ident:$id, withdrawn:true, was_type:$wt, status:$st}' \
@@ -5591,6 +5615,14 @@ cmd_task_need() {
       2>/dev/null || true
     fail "$E_GENERIC" "$ident: refusing to file a tier-2 gate that cannot mint its own human proof — openssl and /dev/urandom are both unusable on this box, so the tier-2 human floor could not be enforced on it. Filing it anyway would create a gate that LOOKS hard-gated and is not (DIVE-2131). Fix the box's RNG, or file this at a lower --tier if it genuinely is not a human-only call."
   fi
+
+  # DIVE-2410: filing REPLACES any gate already on this task (that is what the
+  # archive-and-clear is for), so whatever button the OUTGOING gate put in a human
+  # chat now asks a question this task no longer holds. Retire BEFORE the new
+  # delivery, not after: the delivery log is the input, so once task_need_notify
+  # has run, the gate's own fresh button is in there too and would be stripped by
+  # its own filing. Order is the correctness condition here, not a preference.
+  _task_gate_retire_buttons "$ident" "superseded by a re-filed gate" || true
 
   db "BEGIN IMMEDIATE;
       $(_gate_archive_and_clear_sql file "id=${id}")
@@ -6791,6 +6823,159 @@ _task_gate_delivery_log() { # <ok|error> <task_ids> <chat> <message_id> <detail>
     warn "gate-delivery telemetry withheld: TASKS_DB is not the production store, so these rows are NOT written to the fleet log or audit (DIVE-1968). Set FIVEDIVE_GATE_NOTIFY_LOG to capture them locally."
   fi
   [[ "$result" == "ok" ]] || warn "$idents: gate alert delivery FAILED for chat ${chat:-none} (${detail:-unknown}); ${next_step}"
+}
+
+# ---- DIVE-2410: retire a settled gate's buttons -----------------------------
+#
+# THE DEFECT. A gate's approve button outlived its gate. Confirmed on DIVE-2400:
+# two buttons delivered (03:20:02Z message_id=15491, 04:05:02Z message_id=15492,
+# both via=marketing), gate closed 04:28:41Z, and NOTHING edited, disabled or
+# expired either keyboard. From the close onward there were two live-LOOKING
+# approve buttons in the human's chat for a question already settled.
+#
+# WHY THAT IS A DEFECT AND NOT COSMETIC. A tap on a closed gate correctly records
+# nothing. But the human gets no error, no "already closed", no visual change, so
+# the only conclusion available to them is that they approved. The record and the
+# human's belief diverge, and the human has no way to see it — the same class of
+# harm as DIVE-2406 approached from the other side (there the record claimed an
+# approval nobody gave; here the human believes an approval the record lacks).
+# Read a human's frustration with a control as data about the control: lodar's
+# "I tap the approve again. wtf is the human gate. I hate it" is the symptom.
+#
+# The plugin's `tna:` handler ALREADY answers a stale tap with a toast and strips
+# the keyboard (server.ts, resolveTnaAnswer -> already/nogate). That is the wrong
+# layer to rely on alone, for two reasons: it fires only if the human taps (so
+# until then the chat keeps showing a live control), and a toast is a 2-second
+# mobile banner that is genuinely easy to miss. The button must stop LOOKING
+# tappable at CLOSE time, from the process that did the closing.
+#
+# WHY THIS LIVES IN THE CLI. Gates close from paths with no Telegram session at
+# all: `task answer` on the dashboard, a lead-clear, `task need --withdraw`,
+# `task park`, the verifier's auto:reject, a done/cancel that moots an open gate.
+# Every one of those runs here. A plugin-side fix cannot cover any of them.
+
+# The token for the bot that CARRIED a delivery. Deliberately NOT
+# _task_agent_channel: that clobbers TASK_CH_* (token, access, type, agent),
+# which live callers are mid-flight on — _task_close_notify sends through those
+# globals and retirement can run beside it. We need only the token, and
+# connector files are the same group-claude-readable source _task_agent_channel
+# reads, so read it directly and leave the globals alone.
+# via=<agent> matters and is not decorative: message_id is scoped to a bot-chat
+# PAIR, so editing 15491 with the wrong bot's token edits a different message or
+# nothing (DIVE-2073 is why the delivery row carries `via` at all).
+_task_gate_bot_token() { # <agent-name> -> token on stdout
+  local name="${1:-}" token="" f
+  if [[ -n "$name" && "$name" != "none" ]]; then
+    f="${CONNECTORS_DIR}/telegram-${name}.env"
+    [[ -r "$f" ]] && token=$(sed -n 's/^TELEGRAM_BOT_TOKEN=//p' "$f" | head -1)
+  fi
+  [[ -n "$token" ]] || token="${TELEGRAM_BOT_TOKEN:-}"
+  printf '%s' "$token"
+}
+
+# Every button-bearing message this task's gate put in a human chat, as
+# chat<TAB>message_id<TAB>via, deduped. The set is already knowable: the
+# gate-delivery log records chat + message_id + via per delivery, which is
+# exactly what DIVE-2410 needs and nobody had read back yet.
+#
+# Four exclusions, each for its own reason — a wrong row here edits a message
+# that was never this gate's:
+#   result=error rows      no message exists to edit (message_id is empty).
+#   message_id 0 / none    a dry-run receipt or an ok-without-id; not a real message.
+#   chat=agent:<name>      the maker->verifier handoff leg (see the reviewer-ping
+#                          delivery rows). An agent inbox, not a Telegram chat.
+#   another task's ident   `tasks=` is a COMMA LIST — the re-nag batches several
+#                          gates into one message. Match a whole field, never a
+#                          substring, or DIVE-24 retires DIVE-2410's button.
+# A batched message covering a still-open gate is retired too, and that is
+# correct-but-blunt: its keyboard carries a button per task, and the Bot API
+# cannot remove one button without rebuilding the whole markup. Losing a live
+# button is recoverable — the re-nag re-delivers pending gates — while leaving a
+# settled one tappable is the bug being fixed. Noted, not silently accepted.
+_task_gate_deliveries() { # <ident>
+  local ident="$1"
+  local logf="${FIVEDIVE_GATE_NOTIFY_LOG:-}"
+  [[ -n "$logf" ]] || logf=/var/log/5dive/notify/gate-notify.log
+  if [[ ! -r "$logf" ]]; then
+    # Make the absence observable ONCE per process. This log is the ONLY record of
+    # which messages a gate put in a human's chat, so if it cannot be read the
+    # retirement is a total silent no-op — every settled button stays tappable and
+    # nothing anywhere says so. It is 0664 today, but "unreadable" and "no
+    # deliveries" must never share an answer in a function whose failure mode is
+    # invisible (the DIVE-1927 absent-vs-forbidden rule, one layer over).
+    if [[ -e "$logf" && -z "${_TASK_GATE_RETIRE_BLIND:-}" ]]; then
+      _TASK_GATE_RETIRE_BLIND=1
+      warn "cannot read the gate-delivery log ($logf) — settled gates' buttons cannot be retired from this process, so a closed gate may keep showing a live approve button (DIVE-2410)."
+    fi
+    return 0
+  fi
+  awk -v want="$ident" '
+    /gate-delivery result=ok/ {
+      tasks=""; chat=""; mid=""; via=""
+      for (i = 1; i <= NF; i++) {
+        if      (substr($i, 1, 6)  == "tasks=")      tasks = substr($i, 7)
+        else if (substr($i, 1, 5)  == "chat=")       chat  = substr($i, 6)
+        else if (substr($i, 1, 11) == "message_id=") mid   = substr($i, 12)
+        else if (substr($i, 1, 4)  == "via=")        via   = substr($i, 5)
+      }
+      if (chat == "" || chat == "none" || chat ~ /^agent:/) next
+      if (mid == "" || mid == "none" || mid == "0") next
+      n = split(tasks, T, ",")
+      for (j = 1; j <= n; j++) if (T[j] == want) { print chat "\t" mid "\t" via; next }
+    }
+  ' "$logf" 2>/dev/null | awk -F'\t' '!seen[$1 FS $2]++'
+}
+
+# Strip the inline keyboard off every message that delivered this gate. Call it
+# AFTER the settling write has committed, always best-effort: a gate is settled
+# by the DB row, and a Telegram edit that fails must never unsettle it or fail
+# the caller's command.
+#
+# FENCE. Same rail as the send whose message it edits — refuse unless the active
+# store is the prod store (_task_human_send_allowed, the DIVE-1506 positive
+# allowlist), EXCEPT when the dry-run quarantine is on, which is the one case a
+# harness can exercise this end to end while being physically unable to reach
+# Telegram (_mirror_edit_markup enforces that itself). An opt-in-only fence is
+# the mistake DIVE-1968 removed; this is store identity first, as there.
+_task_gate_retire_buttons() { # <ident> <why>
+  local ident="$1" why="${2:-gate closed}"
+  local _dry=0
+  [[ -n "${FIVEDIVE_NOTIFY_DRYRUN:-}" && "${FIVEDIVE_NOTIFY_DRYRUN}" != "0" ]] && _dry=1
+  if ! _task_human_send_allowed && (( ! _dry )); then
+    return 0
+  fi
+  local rows; rows=$(_task_gate_deliveries "$ident") || return 0
+  [[ -n "$rows" ]] || return 0
+  local chat mid via token resp ok desc result
+  while IFS=$'\t' read -r chat mid via; do
+    [[ -n "$chat" && -n "$mid" ]] || continue
+    token=$(_task_gate_bot_token "$via")
+    if [[ -z "$token" ]]; then
+      # Name the miss. A retirement that cannot resolve the delivering bot leaves
+      # a tappable button behind, which is the defect — so it is a row, not a
+      # shrug. (Reachable when the delivering agent was torn down after filing.)
+      _task_store_audit_log "gate button retire" "error" 1 -- \
+        "task=$ident" "chat=$chat" "message_id=$mid" "via=${via:-none}" \
+        "detail=no bot token for delivering agent; button left live" || true
+      continue
+    fi
+    resp=$(_mirror_edit_markup "$token" "$chat" "$mid") || resp="${resp:-}"
+    ok=$(jq -r '.ok // false' <<<"$resp" 2>/dev/null) || ok=false
+    desc=$(jq -r '.description // empty' <<<"$resp" 2>/dev/null) || desc=""
+    result=error
+    if [[ "$ok" == "true" ]]; then
+      result=ok; desc="keyboard removed"
+    elif [[ "$desc" == *"not modified"* || "$desc" == *"message to edit not found"* ]]; then
+      # Already un-tappable — the end state we wanted, reached without us.
+      result=ok
+    fi
+    _task_store_audit_log "gate button retire" "$result" \
+      "$([[ "$result" == "ok" ]] && echo 0 || echo 1)" -- \
+      "task=$ident" "chat=$chat" "message_id=$mid" "via=${via:-none}" \
+      "why=$why" "detail=${desc:-unconfirmed Bot API edit}" || true
+    [[ "$result" == "ok" ]] || warn "$ident: could not retire the gate button on message $mid in chat $chat (${desc:-unknown}) — a settled gate may still show a live approve button there."
+  done <<<"$rows"
+  return 0
 }
 
 # DIVE-1506 — fail-closed guard: a gate alert (task_need_notify) or an /inbox digest
@@ -8539,6 +8724,12 @@ cmd_task_answer() {
     (( value_set )) || fail "$E_USAGE" "--value is required (the human's answer)"
     db "UPDATE tasks SET need_answer=$(sqlq "$value"), need_answered_at=$(sqlq "$_ts"), need_answered_by=$(sqlq "$answered_by"), need_answered_uid=${_uidsql}, need_answer_sig=$(sqlq "$_sig") WHERE id=${id};"
   fi
+
+  # DIVE-2410: the gate is settled, so its buttons must stop looking tappable.
+  # AFTER the write, never before — the settled state is the DB row, and a
+  # Telegram edit is best-effort. Covers the human tap, a lead-clear, and a
+  # dashboard/CLI answer, since all three land in this one function.
+  _task_gate_retire_buttons "$ident" "answered by ${answered_by}" || true
 
   # INST-4: the gate CLEAR — the row that decides whether this task's timeline
   # reads "zero-human" or "a human authorized it", so it is worth more care than
