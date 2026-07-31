@@ -320,13 +320,16 @@ if [[ -z "$ident" ]]; then chk "file-time/tier-0: seeded a gate" "yes" "no"; els
       "$(db "SELECT COALESCE(need_answered_by,'') FROM tasks WHERE ident=$(sqlq "$ident");")"
 fi
 
-# The OSS-21 tier-1 precedent auto-clear is the OTHER file-time settle site and is
-# NOT graded here — say so rather than let its absence read as coverage. It needs two
-# distinct nonce-bearing prior gates on an identical ask_shape to qualify, which this
-# harness cannot seed cheaply. What bounds it today is that it is pref-gated and the
-# pref defaults OFF, so in the default fleet posture it cannot fire at all; that
-# default IS graded, because it is the thing that makes the gap survivable.
-chk "file-time/precedent: OSS-21 auto-clear is inert by default (ungraded path, fenced)" \
+# ---------------------------------------- file-time settle site: precedent ---
+# The OSS-21 tier-1 precedent auto-clear is the OTHER file-time settle site. It is
+# pref-gated OFF by default, and an earlier draft of this file leaned on that and left
+# the path ungraded. A default is a posture, not a proof: the pref is fleet-settable,
+# so "cannot fire today" is not "cannot deliver an unretired button". Graded properly.
+#
+# Enumerated by target, not by line: the two writes of need_answered_by inside
+# cmd_task_need are 'auto:t0' and 'auto:precedent' — those are the only file-time
+# settle sites, so with both graded there is no seventh settle path.
+chk "file-time/precedent: OSS-21 auto-clear is inert by default (the shipped posture)" \
     "off" "$(_p=$(_task_pref_get precedent_autoclear); printf '%s' "${_p:-off}")"
 # LIVENESS for the arm above. Its `${_p:-off}` fallback is exactly the shape that
 # passes when the reader is broken: a _task_pref_get that errored, was renamed, or
@@ -336,6 +339,36 @@ chk "file-time/precedent: OSS-21 auto-clear is inert by default (ungraded path, 
 _task_pref_set precedent_autoclear on >/dev/null 2>&1
 chk "file-time/precedent: liveness — the pref reader really reads (not a stuck default)" \
     "on" "$(_p=$(_task_pref_get precedent_autoclear); printf '%s' "${_p:-off}")"
+
+# Now turn the fence OFF and actually drive the path. Two prior gates on an IDENTICAL
+# ask_shape, each answered by a nonce-verified human with the SAME answer, is what
+# qualifies a precedent; the harness files them for real and then stamps the human
+# provenance the human rail would have written. ask_shape is copied off a real filed
+# gate rather than recomputed, so the arm cannot drift from the CLI's own hashing.
+_pshape=""
+for _i in 1 2; do
+  _pid=$(seed_gate "DIVE-2410 precedent seed $_i")
+  [[ -n "$_pid" ]] || continue
+  db "UPDATE tasks SET need_answer='A', need_answered_at=datetime('now','-1 day'),
+        need_answered_by='human:1234567890', human_nonce_hash='deadbeef',
+        precedent_kind=NULL, tier=1 WHERE ident=$(sqlq "$_pid");"
+  _pshape=$(db "SELECT COALESCE(ask_shape,'') FROM tasks WHERE ident=$(sqlq "$_pid");")
+done
+_tid=$( ( JSON_MODE=1 cmd_task_add "DIVE-2410 precedent target" ) 2>/dev/null | jq -r '.data.id // empty')
+_tident=$(db "SELECT ident FROM tasks WHERE id=${_tid};" 2>/dev/null)
+if [[ -z "$_pshape" || -z "$_tident" ]]; then
+  chk "file-time/precedent: seeded two nonce-verified precedents" "yes" "no"
+else
+  : >"$LOG"          # fresh target, never gated before: ANY delivery here is its own
+  reset_edits
+  ( cmd_task_need "$_tident" --type=decision --ask="proceed?" \
+      --options="A|B" --recommend=A --tier=1 ) >/dev/null 2>&1
+  chk "file-time/precedent: it really did auto-clear (the arm graded a settle, not a refusal)" \
+      "auto:precedent" \
+      "$(db "SELECT COALESCE(need_answered_by,'') FROM tasks WHERE ident=$(sqlq "$_tident");")"
+  chk "file-time/precedent: and the auto-cleared gate delivered NO button of its own" "0" \
+      "$(grep -c 'gate-delivery result=ok' "$LOG")"
+fi
 _task_pref_set precedent_autoclear off >/dev/null 2>&1
 
 # ------------------------------------------------- blind-log observability ---
