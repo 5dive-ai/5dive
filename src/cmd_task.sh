@@ -1528,6 +1528,18 @@ _gate_text_names_a_ref() {
 # as the subject retires a live human question, reading the subject as a citation
 # costs ONE nudge. Line-scoped, negations rejected, `tolower` for matching only so
 # offsets still index the original line (a URL keeps its owner/repo case).
+#
+# THE VERB LIST IS A CLOSED VOCABULARY, AND THAT IS THE DESIGN, not an oversight
+# left for the next person to finish (Marcus, verifying DIVE-2414). An ask phrased
+# outside it — "can you OK PR #123" — yields NO subject, and a gate with no subject
+# withholds the flag. That is the fail-closed direction and it costs a nudge.
+# Widening the vocabulary is how the pinned negatives come back: E3 (DIVE-2382's
+# "already in review as PR #335"), E4 (a bare mention) and E8 ("shipped as PR #N")
+# in tests/gate_subject_state_unit.sh each pass only because some phrasing is
+# OUTSIDE the set. If you add a verb, add it with the arm that proves the
+# citations still miss — and note that the two halves are pinned by mutations the
+# other survives: subject:=any-mention reds E3/E4/E5/E8, subject:=nothing reds
+# E1/E2/E6/E7, a clean 4/4 partition with no overlap. Keep that property.
 _gate_subject_refs_from_text() {
   printf '%s' "$1" | awk '
     BEGIN {
