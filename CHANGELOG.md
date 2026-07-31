@@ -27,10 +27,30 @@ stderr, and writes the overwritten text (not its hash) to the audit log.
 The guard is deliberately narrow, so nothing idempotent changed: it fires only when `--result=`
 was actually passed, the stored result is non-empty, and the new text differs. A bare re-close, a
 replay with identical text, an empty prior result, and any first close of an open row all behave
-exactly as before. `tests/task_done_over_closed_result_unit.sh` grades both halves, and its arms
-were checked against the pristine tree — the defect (prior result destroyed) reproduces there,
-and the four idempotence arms pass on both trees, which is what makes them regression guards
-rather than evidence for the fix.
+exactly as before.
+
+A second change was needed, and review is what found it: the DIVE-477 verifier-routing branch
+`return`s early and does its own unconditional result write, so on a row where `verifier` is set
+and differs from `assignee` the guard was never reached at all and the clobber survived — plus
+`_task_route_to_verifier` sets `status='todo'`, so a closed row was also **resurrected** and
+re-delivered. A closed row is now stopped from routing in the first place, which is right on its
+own merits, and the guard sits above that branch.
+
+Their division of labour was measured by mutating each independently rather than assumed, and the
+answer is not the intuitive one: removing the routing exclusion reds only the resurrection arms,
+while reverting the guard's position reds **nothing** — the exclusion subsumes the ordering for
+the result clobber. So no test arm pins the block's position; it is kept as defence-in-depth and
+said so in the source rather than presented as coverage. The resurrection is a separate harm, not
+a second symptom: it fires on a bare re-close where there is no result to protect.
+
+Two adjacent clobbers on the same column are **not** fixed here and are named rather than left to
+be discovered: `task deliver --result=` over a closed row (DIVE-2476), and
+`_task_route_to_verifier` writing over an **open** row's existing result.
+
+`tests/task_done_over_closed_result_unit.sh` — 29 arms. Checked against the pristine tree: the
+defect (prior result destroyed) reproduces there, and the idempotence and DIVE-477-still-routes
+arms pass on both trees, which is what makes them regression guards rather than evidence for the
+fix.
 
 ## Unreleased — fix(release-cut): move the nightly off the contended top-of-hour and poll for CI to settle (DIVE-2466)
 

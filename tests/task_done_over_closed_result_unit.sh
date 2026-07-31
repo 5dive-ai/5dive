@@ -58,13 +58,27 @@ P=0; F=0
 ok(){ P=$((P+1)); echo "ok   - $1"; }
 no(){ F=$((F+1)); echo "FAIL - $1"; [ -n "${2:-}" ] && echo "   ${2:0:260}"; }
 
-# verifier and maker_agent are left NULL on purpose: a row carrying a live
-# maker/verifier pair is the DIVE-2007 / DIVE-477 rail's business, and seeding one
-# here would let THAT guard produce the refusal and fake a green for this one.
-seed() { # $1=status $2=result -> echoes the row id
+# seed() leaves verifier NULL; seedv() sets it. BOTH shapes are graded, and the F
+# arms below are why.
+#
+# The first version of this harness had only seed(), justified in a comment saying a
+# row carrying a live maker/verifier pair "is the DIVE-2007 / DIVE-477 rail's
+# business". That reasoning was WRONG and main's review caught it by probe. DIVE-477
+# is not a guard, it is a different WRITE PATH — it `return`s early and does its own
+# unconditional result write — and the DIVE-2007 guard says in its own comment that
+# already-closed rows pass through. So the excluded shape was the one shape where
+# NOTHING caught the clobber, excluded on the grounds that something else did.
+#
+# That is this ticket's own defect wearing a different hat, so it is recorded here
+# rather than quietly fixed: a harness that omits a shape because another rail
+# "handles" it is asserting coverage it never measured.
+seed() { # $1=status $2=result -> echoes the row id (verifier NULL)
+  seedv "$1" "$2" olivia ""
+}
+seedv() { # $1=status $2=result $3=assignee $4=verifier -> echoes the row id
   tasks_db_init >/dev/null 2>&1
-  db "INSERT INTO tasks (title,status,assignee,result,kind,priority,created_by,done_at)
-      VALUES ('t','$1','olivia',$(sqlq "$2"),'standard','medium','main',
+  db "INSERT INTO tasks (title,status,assignee,verifier,result,kind,priority,created_by,done_at)
+      VALUES ('t','$1','$3',$(sqlq "$4"),$(sqlq "$2"),'standard','medium','main',
               CASE WHEN '$1' IN ('done','cancelled') THEN '2026-07-30 21:08:59' ELSE NULL END);" >/dev/null 2>&1
   db "SELECT id FROM tasks ORDER BY id DESC LIMIT 1;"
 }
@@ -132,6 +146,60 @@ out=$( cmd_task_cancel "$id" --result="abandoning" 2>&1 ); rc=$?
 res=$(db "SELECT COALESCE(result,'') FROM tasks WHERE id=$id;")
 [ "$rc" -ne 0 ] && ok "E1 'task cancel --result=' over a closed row is REFUSED too" || no "E1 cancel over closed refused" "rc=$rc $out"
 [ "$res" = "$THEIRS" ] && ok "E2 the prior result is INTACT after the cancel refusal" || no "E2 prior result intact after cancel" "$res"
+
+# --- F. the shape the first version MISSED: verifier != assignee --------------
+# The DIVE-477 routing branch `return`s early and writes the result itself, so a
+# guard placed BELOW it was unreachable on this shape and the clobber survived.
+#
+# THESE ARMS DO NOT PIN THE PLACEMENT, and the first draft of this comment claimed
+# they did. Measured: with the block moved back BELOW the routing branch, all 29
+# arms stay green — because the closed-row exclusion added to that branch means a
+# closed row never reaches it, so the block catches the clobber from either
+# position. The exclusion SUBSUMES the ordering for this shape. Stated plainly
+# because an unpinned property described as pinned is precisely the defect under
+# review here, and it would have shipped a second time.
+# What these arms do pin: that SOMETHING refuses the clobber on the routed shape.
+# The mutation that reds them is removing the exclusion AND moving the block down.
+id=$(seedv done "$THEIRS" olivia main)
+out=$( cmd_task_done "$id" --result="$MINE" 2>&1 ); rc=$?
+res=$(db "SELECT COALESCE(result,'') FROM tasks WHERE id=$id;")
+st=$(db  "SELECT status FROM tasks WHERE id=$id;")
+[ "$rc" -ne 0 ] && ok "F1 a closed row with verifier != assignee is REFUSED, not routed" || no "F1 closed+routed row refused" "rc=$rc $out"
+[ "$res" = "$THEIRS" ] && ok "F2 its prior result is INTACT (guard is reached before routing)" || no "F2 prior result intact on routed shape" "$res"
+[ "$st" = "done" ] && ok "F3 it is STILL done — not resurrected to todo" || no "F3 still done" "status=$st"
+
+id=$(seedv cancelled "$THEIRS" olivia main)
+out=$( cmd_task_done "$id" --result="$MINE" 2>&1 ); rc=$?
+res=$(db "SELECT COALESCE(result,'') FROM tasks WHERE id=$id;")
+st=$(db  "SELECT status FROM tasks WHERE id=$id;")
+[ "$res" = "$THEIRS" ] && ok "F4 same on a CANCELLED row: prior result INTACT" || no "F4 cancelled prior result intact" "$res"
+[ "$st" = "cancelled" ] && ok "F5 the cancelled row is not resurrected either" || no "F5 cancelled not resurrected" "status=$st"
+
+# --- G. the SECOND harm: status resurrection on a BARE re-close ----------------
+# Ordering alone does not cover this. With no --result there is nothing for the
+# DIVE-2464 guard to protect, so it stays silent (correctly) and the routing branch
+# would still have fired and set status='todo'. The closed-row exclusion added to
+# that branch is what these arms grade, and they are separate on purpose: the first
+# version of this change claimed the move fixed the resurrection too.
+id=$(seedv done "$THEIRS" olivia main)
+out=$( cmd_task_done "$id" 2>&1 ); rc=$?
+st=$(db  "SELECT status FROM tasks WHERE id=$id;")
+res=$(db "SELECT COALESCE(result,'') FROM tasks WHERE id=$id;")
+asg=$(db "SELECT COALESCE(assignee,'') FROM tasks WHERE id=$id;")
+[ "$st" = "done" ] && ok "G1 a BARE re-close of a closed+routed row does NOT resurrect it to todo" || no "G1 bare re-close resurrection" "status=$st $out"
+[ "$res" = "$THEIRS" ] && ok "G2 and its result is untouched" || no "G2 bare re-close result untouched" "$res"
+[ "$rc" -eq 0 ] && ok "G3 and it stays a rc=0 no-op (no NEW error introduced)" || no "G3 bare re-close still rc=0" "rc=$rc $out"
+[ "$asg" = "olivia" ] && ok "G4 and it is not re-delivered to the verifier" || no "G4 not re-delivered" "assignee=$asg"
+
+# --- H. routing on an OPEN row is untouched (the DIVE-477 rail still works) ----
+# The regression arm for the exclusion above. If this reds, the closed-row check is
+# too broad and the maker->verifier handoff is broken.
+id=$(seedv in_progress "" dev2 main)
+out=$( cmd_task_done "$id" --result="delivering" 2>&1 ); rc=$?
+st=$(db  "SELECT status FROM tasks WHERE id=$id;")
+asg=$(db "SELECT COALESCE(assignee,'') FROM tasks WHERE id=$id;")
+[ "$asg" = "main" ] && ok "H1 an OPEN row still ROUTES to its verifier (DIVE-477 intact)" || no "H1 open row still routes" "assignee=$asg st=$st rc=$rc $out"
+[ "$st" != "done" ] && ok "H2 and routing did not close it" || no "H2 routing did not close it" "status=$st"
 
 echo; echo "DIVE-2464 done-over-closed-result guard: passed: $P  failed: $F"
 [ "$F" -eq 0 ]
