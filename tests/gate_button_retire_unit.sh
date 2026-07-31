@@ -302,10 +302,14 @@ fi
 #      lines (see the first arm in this file), and the mock Bot API hands back the
 #      same message_id every time — so a genuine SECOND delivery collapsed into the
 #      first and the count never moved. A deduped view cannot count deliveries.
-# Measured 2026-07-31 by deleting src/cmd_task.sh:5533: task_need_notify calls go
-# 1 -> 2 and the RAW log goes 1 -> 2, while the deduped view stays 1 either way. So
-# the raw undeduped log below is the differential observable, and the tier-0 return
-# is confirmed load-bearing — deleting it puts a real second button in the chat.
+# Measured 2026-07-31 by deleting the `return` that closes cmd_task_need's
+# `if [[ "$tier" == "0" ]]` auto-clear block (named by target, not by line: a cited
+# line number rots the moment anything above it moves, which is how olivia's :5437
+# ended up pointing at unrelated code by the time this was written). Deleting it
+# takes task_need_notify calls 1 -> 2 and the RAW log 1 -> 2, while the deduped view
+# stays 1 either way. So the raw undeduped log below is the differential observable,
+# and the tier-0 return is confirmed load-bearing — deleting it puts a real second
+# button in the chat.
 ident=$(seed_gate "DIVE-2410 file-time arm: tier0")
 if [[ -z "$ident" ]]; then chk "file-time/tier-0: seeded a gate" "yes" "no"; else
   reset_edits
