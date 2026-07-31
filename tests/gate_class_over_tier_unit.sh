@@ -242,7 +242,10 @@ done
 seed_task DIVE-2320
 # $TMP, never a fixed /tmp path — see the ∅ note above. This one line is what
 # made the harness pass for its author and fail for main, root and claude.
-( cmd_task_need DIVE-2320 --type=secret --tier=0 --ask="drop the api key" ) >"$TMP/t0-secret.out" 2>&1
+# DIVE-2411: a secret gate must name a delivery path to file at all, so this one
+# carries a drop target. Unrelated to what the arm grades (the tier floor), but
+# without it cmd_task_need refuses and every assertion below grades the refusal.
+( cmd_task_need DIVE-2320 --type=secret --tier=0 --ask="drop the api key" --secret-key=API_KEY --connector=demo ) >"$TMP/t0-secret.out" 2>&1
 exists_t DIVE-2320 "T0: secret task row exists"
 eq_t "T0: secret gate was actually filed (cmd_task_need ran)" \
      "$(field DIVE-2320 need_type)" "secret"

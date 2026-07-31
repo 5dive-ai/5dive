@@ -89,6 +89,7 @@ _task_usage() {
   # Human Task Inbox — park a task on a human and clear it
   5dive task need <id|DIVE-N> --type=decision|secret|approval|manual|access --ask="..." [--options=A|B] [--recommend="A"] [--tier=0|1|2]
                                                      # --type=access: manager-clearable "grant me X" gate — routes to the org lead first (any tier), lead-clearable; add --probe='test -w /path' to self-check the block
+                                                     # --type=secret MUST name a delivery path (DIVE-2411): --secret-key=<ENV_NAME> --connector=<stem> mints a one-time drop link, or --out-of-band="<where the value lands>" declares out-of-band delivery explicitly. Neither = refused at filing (the ask would read complete with nowhere for the value to go).
   5dive task need <id|DIVE-N> --withdraw            # DIVE-1401: cancel a still-pending gate the team filed but that's now moot — filer or org lead, no human tap. NOT a grant (never records a secret/approval); genuine clears stay human-only.
     --ask: ONE crisp question + ~1 line essential context, recommendation up front. Heavy detail goes in the task BODY, not the ask.
     --options: name accounts/actors, not "you/your". Pronoun-bearing choices warn at filing and their answer receipt renders the filer/answerer account frame.
@@ -4694,7 +4695,7 @@ _gate_option_has_second_person() {
 
 cmd_task_need() {
   tasks_db_init
-  local type="" ask="" options="" recommend="" from="" tier="" secret_key="" connector="" probe="" withdraw="" discusses="" needs=""
+  local type="" ask="" options="" recommend="" from="" tier="" secret_key="" connector="" probe="" withdraw="" discusses="" needs="" oob=""
   local -a positional=()
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -4713,6 +4714,10 @@ cmd_task_need() {
       # Both together enable the burnable drop link in the gate message.
       --secret-key=*) secret_key="${1#*=}" ;;
       --connector=*)  connector="${1#*=}" ;;
+      # DIVE-2411: the explicit opt-in to out-of-band delivery, and it must NAME
+      # the channel. A secret gate with no drop target used to be the DEFAULT
+      # (both flags omitted) — see the refusal below.
+      --out-of-band=*) oob="${1#*=}" ;;
       # DIVE-1243: opt-in self-check for --type=access. The command MUST FAIL
       # (non-zero) for the gate to file; if it SUCCEEDS the block isn't real.
       --probe=*)     probe="${1#*=}" ;;
@@ -4731,7 +4736,7 @@ cmd_task_need() {
     esac
     shift
   done
-  [[ ${#positional[@]} -gt 0 ]] || fail "$E_USAGE" "usage: 5dive task need <id|DIVE-N> --type=decision|secret|approval|manual --ask=\"...\" [--options=A|B] [--recommend=\"A\"] [--needs=human_tap|spend_authority|secret_provision] [--discusses=\"why this decision only DISCUSSES a floored category\"]  (or --withdraw to cancel a moot pending gate)"
+  [[ ${#positional[@]} -gt 0 ]] || fail "$E_USAGE" "usage: 5dive task need <id|DIVE-N> --type=decision|secret|approval|manual --ask=\"...\" [--options=A|B] [--recommend=\"A\"] [--needs=human_tap|spend_authority|secret_provision] [--discusses=\"why this decision only DISCUSSES a floored category\"]  (--type=secret also needs a delivery path: --secret-key=<ENV_NAME> --connector=<stem>, or --out-of-band=\"<where the value lands>\"; or --withdraw to cancel a moot pending gate)"
   resolve_task_id "${positional[0]}"; local id="$RESOLVED_TASK_ID" ident="$RESOLVED_TASK_IDENT"
 
   # DIVE-1401: --withdraw path. Secret/approval/manual gates are human-only to
@@ -4743,7 +4748,7 @@ cmd_task_need() {
   # coordinator, or a human caller (non-agent unix id). Genuine GRANT-clears stay
   # human-only via cmd_task_answer — this branch never touches that path.
   if [[ -n "$withdraw" ]]; then
-    [[ -z "$type$ask$options$recommend$tier$secret_key$connector$probe$discusses$needs" ]] \
+    [[ -z "$type$ask$options$recommend$tier$secret_key$connector$oob$probe$discusses$needs" ]] \
       || fail "$E_USAGE" "--withdraw takes no other gate flags (it cancels the existing gate, not re-files one)"
     local w_type w_ans w_status
     w_type=$(db "SELECT COALESCE(need_type,'')        FROM tasks WHERE id=${id};")
@@ -4830,7 +4835,7 @@ cmd_task_need() {
         $(_gate_archive_and_clear_sql withdraw "id=${id}")
         UPDATE tasks
           SET need_type=NULL, ask=NULL, need_options=NULL, recommend=NULL,
-              secret_key=NULL, connector=NULL, ask_shape=NULL,
+              secret_key=NULL, connector=NULL, secret_oob=NULL, ask_shape=NULL,
               precedent_ref=NULL, precedent_kind=NULL, routed_reviewer=NULL,
               needs_capability=NULL,
               need_asked_at=NULL, gate_pinged_at=NULL, gate_filed_by=NULL
@@ -4909,7 +4914,55 @@ cmd_task_need() {
   # on a secret gate. Require them together (a key with no connector has nowhere
   # to land, and vice versa) and validate against the same charsets the box-side
   # `secret write` + the api /drop/mint enforce, so a bad value fails here rather
-  # than at mint time. Both omitted = legacy secret gate (out-of-band delivery).
+  # than at mint time.
+  #
+  # DIVE-2411: both omitted used to mean "legacy secret gate, out-of-band
+  # delivery" — a DEFAULT nobody chose. Measured on DIVE-2232: the gate pinged
+  # correctly, the ask read as complete, and there was NO PATH for the value to
+  # reach the box, so the only remaining answer was pasting a live credential
+  # into a persistent chat log. main nearly received one.
+  #
+  # WHY THE REFUSAL BELONGS AT FILING TIME. The gate is complete in APPEARANCE and
+  # only the delivery MECHANISM is missing. A human staring at the ask cannot see
+  # that the drop is absent — nothing in the message is about the drop. Only the
+  # filer can see it, and only here. So an omission must not select the shape with
+  # no delivery path: name a drop target (DIVE-931) or declare the out-of-band
+  # channel explicitly.
+  # DIVE-2411: a RE-FILE inherits the delivery path the row already carries. A
+  # re-file otherwise DESTROYS it (DIVE-2119 resets the gate columns from the
+  # flags given), and the programmatic re-filers pass no delivery flags at all:
+  # the council escalation builds `task need <ident> --type=secret --tier=2
+  # --ask=...` (src/council/engine.mjs, preserving the TYPE and nothing else). So
+  # before this ticket, escalating a properly-targeted secret gate through the
+  # council silently converted it into the DIVE-2232 shape — the defect had a
+  # generator, not just an author. Inheriting is not "defaulting into no delivery
+  # path": it carries forward a path a filer CHOSE, and a row with nothing to
+  # inherit still falls through to the refusal below.
+  if [[ "$type" == "secret" && -z "$secret_key$connector$oob" ]]; then
+    local _pv; _pv=$(db "SELECT COALESCE(secret_key,'')||x'1f'||COALESCE(connector,'')||x'1f'||COALESCE(secret_oob,'') FROM tasks WHERE id=${id};")
+    local _pv_sk="${_pv%%$'\x1f'*}" _pv_rest="${_pv#*$'\x1f'}"
+    local _pv_conn="${_pv_rest%%$'\x1f'*}" _pv_oob="${_pv_rest#*$'\x1f'}"
+    if [[ -n "$_pv_sk" && -n "$_pv_conn" ]]; then
+      secret_key="$_pv_sk"; connector="$_pv_conn"
+      warn "$ident: re-filed secret gate inherits the existing drop target (${secret_key} -> ${connector}); pass --secret-key/--connector to change it (DIVE-2411)"
+    elif [[ -n "$_pv_oob" ]]; then
+      oob="$_pv_oob"
+      warn "$ident: re-filed secret gate inherits the declared out-of-band delivery (${oob}); pass --secret-key/--connector for a drop target instead (DIVE-2411)"
+    fi
+  fi
+  if [[ -n "$oob" ]]; then
+    [[ "$type" == "secret" ]] \
+      || fail "$E_VALIDATION" "--out-of-band only applies to --type=secret (it declares how a CREDENTIAL will reach the box)"
+    [[ -z "$secret_key$connector" ]] \
+      || fail "$E_VALIDATION" "--out-of-band is mutually exclusive with --secret-key/--connector — a gate has ONE delivery path; the drop target already is one"
+    # Must NAME the channel: the whole point is that the human (and the reader of
+    # the answered row six months out) can see where the value was meant to land.
+    # A bare "yes" opt-in would restore the defect with a flag in front of it.
+    [[ ${#oob} -ge 12 ]] \
+      || fail "$E_VALIDATION" "--out-of-band must NAME where the value will land (e.g. --out-of-band=\"already in my .env on this box\") — it is shown to the human and is the only record of the delivery path"
+  elif [[ "$type" == "secret" && -z "$secret_key$connector" ]]; then
+    fail "$E_VALIDATION" "a secret gate must name a delivery path — pass --secret-key=<ENV_NAME> --connector=<stem> to mint a one-time drop link (DIVE-931), or --out-of-band=\"<where the value will land>\" to declare out-of-band delivery explicitly. With neither, the ask reads as complete while the value has nowhere to go, and the only answer left is pasting a live credential into chat (DIVE-2232)."
+  fi
   if [[ -n "$secret_key" || -n "$connector" ]]; then
     [[ "$type" == "secret" ]] || fail "$E_VALIDATION" "--secret-key/--connector only apply to --type=secret"
     [[ -n "$secret_key" && -n "$connector" ]] \
@@ -5405,6 +5458,7 @@ cmd_task_need() {
             recommend=$(sqlq_or_null "$recommend"),
             secret_key=$(sqlq_or_null "$secret_key"),
             connector=$(sqlq_or_null "$connector"),
+            secret_oob=$(sqlq_or_null "$oob"),
             ask_shape=$(sqlq_or_null "$ask_shape"),
             precedent_ref=${precedent_ref:-NULL},
             precedent_kind=$(sqlq_or_null "$precedent_kind"),
@@ -6817,6 +6871,38 @@ _task_mint_drop_link() {
 # Render the canonical tap keyboard for one gate. Kept separate from the alert
 # prose so heartbeat re-nags can combine N gates into one message without
 # drifting from the callback contract used by the initial task-need alert.
+# _task_secret_gate_cta <ident> <row_id> <secret_key> <connector> <drop> — DIVE-2411.
+# The "how do I clear this" instruction for a secret gate, extracted from the
+# notify body so the PROSE is testable. Four shapes, in order of how directly the
+# value can land: a minted burnable drop link, the on-box `secret write` (link
+# unavailable / tokenless box), an explicitly declared out-of-band channel, and —
+# for rows filed before this ticket — no delivery path at all, where the only
+# honest instruction is that the gate must be re-filed. That last branch used to
+# read "put the key where I expect it (my .env / our channel), then tap ✅
+# Provided", which on a gate that never named a target asks the human to do
+# something undefined and then attest to it; that attestation is what produced
+# the DIVE-2232 record — signed, nonced, human-attested, empty.
+_task_secret_gate_cta() {
+  local ident="$1" numid="$2" secret_key="$3" connector="$4" _drop="$5"
+  if [[ "$_drop" == "ONBOX" ]]; then
+    printf '%s' "🔑 [${ident}] needs the ${secret_key} credential. On the box, drop it straight in (never paste it here):"$'\n'"  echo -n \"\$SECRET\" | sudo 5dive secret write ${secret_key} --connector=${connector} --task=${ident}"$'\n'"That writes it and clears this gate. Or tap ✅ Provided once it is done."
+  elif [[ -n "$_drop" ]]; then
+    local _url="${_drop%%|*}" _ttl="${_drop##*|}"
+    printf '%s' "🔑 [${ident}] needs the ${secret_key} credential. Drop it securely (single-use, expires in ${_ttl}m):"$'\n'"${_url}"$'\n'"The value goes straight onto your box and is never shown in chat. Prefer the box? echo -n \"\$SECRET\" | sudo 5dive secret write ${secret_key} --connector=${connector} --task=${ident}"
+  elif [[ -n "$secret_key" && -n "$connector" ]]; then
+    # Target named, mint unavailable (api unreachable / tokenless): still name the
+    # target, because the box-side write is a real delivery path.
+    printf '%s' "🔑 [${ident}] needs the ${secret_key} credential. The drop link could not be minted right now, so put it in on the box (never paste it here):"$'\n'"  echo -n \"\$SECRET\" | sudo 5dive secret write ${secret_key} --connector=${connector} --task=${ident}"$'\n'"That writes it and clears this gate. Or tap ✅ Provided once it is done."
+  else
+    local _oob; _oob=$(db "SELECT COALESCE(secret_oob,'') FROM tasks WHERE id=${numid};" 2>/dev/null || echo "")
+    if [[ -n "$_oob" ]]; then
+      printf '%s' "🔑 [${ident}] needs a credential, delivered out-of-band: ${_oob}. Put it there, then tap ✅ Provided below — never paste it in this chat. Tap not working? On the box: sudo 5dive task answer ${ident}"
+    else
+      printf '%s' "⚠️ [${ident}] asks for a credential but names NO delivery path (no drop target, no declared out-of-band channel), so there is nowhere for the value to go and this gate cannot be cleared as it stands. Do NOT paste the credential here. It has to be re-filed with a delivery path: 5dive task need ${ident} --type=secret --secret-key=<ENV_NAME> --connector=<stem> --ask=\"…\" (DIVE-2411)."
+    fi
+  fi
+}
+
 _task_gate_reply_markup() { # <row_id> <type> <options> <recommend> <nonce> <channel_type> [label]
   local numid="$1" need_type="$2" options="$3" recommend="$4" human_nonce="$5" channel_type="$6" label="${7:-}"
   [[ -n "$label" ]] && label="[${label}] "
@@ -6862,7 +6948,32 @@ _task_gate_reply_markup() { # <row_id> <type> <options> <recommend> <nonce> <cha
         *)                reply_markup='{"inline_keyboard":[['"$appr"','"$deny"']]}' ;;
       esac
     elif [[ "$need_type" == "secret" ]]; then
-      reply_markup='{"inline_keyboard":[[{"text":"'"${label}"'✅ Provided","callback_data":"tna:'"${numid}"':provided'"${np}"'"}]]}'
+      # DIVE-2411: the ✅ Provided affordance is offered ONLY on a secret gate that
+      # names a delivery path — a drop target (secret_key+connector) or an explicit
+      # --out-of-band declaration. On a gate with neither, the button MEANS
+      # something the message never asked for: "I already put it where you said",
+      # on a gate that never said where. Measured on DIVE-2232 — a real human
+      # holding the raw nonce tapped it, and the row came back answered, signed,
+      # nonced and uid-stamped over an EMPTY payload. Nothing had landed anywhere.
+      #
+      # THE FIX IS HERE, at the mint/affordance layer, and that placement is the
+      # point: the tap that produced the false record landed on a BATCHED six-gate
+      # message, and the batcher has no idea what any of the six drops targeted. It
+      # could not have known to withhold the button, so it cannot be the layer that
+      # decides. This function is called by BOTH the single-gate notify and the
+      # batch re-send, and it reads the row, so both are covered without either
+      # caller changing.
+      #
+      # Read from the ROW, not from a parameter: the state that decides is the
+      # persisted gate, not what a caller happens to be holding (DIVE-2090).
+      local _sk_row _oob_row
+      _sk_row=$(db "SELECT COALESCE(secret_key,'')||COALESCE(connector,'') FROM tasks WHERE id=${numid};" 2>/dev/null || echo "")
+      _oob_row=$(db "SELECT COALESCE(secret_oob,'') FROM tasks WHERE id=${numid};" 2>/dev/null || echo "")
+      if [[ -n "$_sk_row" || -n "$_oob_row" ]]; then
+        reply_markup='{"inline_keyboard":[[{"text":"'"${label}"'✅ Provided","callback_data":"tna:'"${numid}"':provided'"${np}"'"}]]}'
+      else
+        reply_markup=""
+      fi
     elif [[ "$need_type" == "manual" ]]; then
       reply_markup='{"inline_keyboard":[[{"text":"'"${label}"'✅ Done","callback_data":"tna:'"${numid}"':done'"${np}"'"}]]}'
     fi
@@ -7246,14 +7357,14 @@ _task_need_notify_deliver() {
       if [[ -n "$secret_key" && -n "$connector" ]]; then
         _drop=$(_task_mint_drop_link "$ident" "$secret_key" "$connector")
       fi
-      if [[ "$_drop" == "ONBOX" ]]; then
-        text+=$'\n\n'"🔑 [${ident}] needs the ${secret_key} credential. On the box, drop it straight in (never paste it here):"$'\n'"  echo -n \"\$SECRET\" | sudo 5dive secret write ${secret_key} --connector=${connector} --task=${ident}"$'\n'"That writes it and clears this gate. Or tap ✅ Provided once it is done."
-      elif [[ -n "$_drop" ]]; then
-        local _url="${_drop%%|*}" _ttl="${_drop##*|}"
-        text+=$'\n\n'"🔑 [${ident}] needs the ${secret_key} credential. Drop it securely (single-use, expires in ${_ttl}m):"$'\n'"${_url}"$'\n'"The value goes straight onto your box and is never shown in chat. Prefer the box? echo -n \"\$SECRET\" | sudo 5dive secret write ${secret_key} --connector=${connector} --task=${ident}"
-      else
-        text+=$'\n\n'"🔑 Put the key where I expect it (my .env / our channel), then tap ✅ Provided below. Don't paste the key here. Tap not working? On the box: sudo 5dive task answer ${ident}"
-      fi
+      # DIVE-2411: the CTA text is a FUNCTION (_task_secret_gate_cta) rather than
+      # four inline branches, so the prose can be graded. The remedy half of a fix
+      # normally ships with the zero coverage that let the bug in — and here the
+      # prose IS half the fix: on a gate with no delivery path the old copy said
+      # "put the key where I expect it, then tap ✅ Provided", which is an
+      # instruction to do the impossible followed by the button that files the
+      # false record. See tests/secret_gate_delivery_path_unit.sh arms T8/T8b.
+      text+=$'\n\n'"$(_task_secret_gate_cta "$ident" "$numid" "$secret_key" "$connector" "$_drop")"
       ;;
     manual) text+=$'\n\n'"✋ Tap ✅ Done below once it is handled, which closes this out. Or on the box: sudo 5dive task answer ${ident} --value=done" ;;
     # DIVE-1243: an `access` gate normally clears via the org lead; it only reaches
@@ -7686,6 +7797,35 @@ cmd_task_answer() {
   local nt
   nt=$(db "SELECT CASE WHEN need_type IS NOT NULL AND need_answered_at IS NULL THEN need_type ELSE '' END FROM tasks WHERE id=${id};")
   [[ -n "$nt" ]] || fail "$E_CONFLICT" "$ident has no pending human gate (nothing to answer)"
+
+  # DIVE-2411: refuse to STAMP a secret gate that names no delivery path, before
+  # any write. This is the same defect as the filing refusal in cmd_task_need, one
+  # step later and strictly worse: the filing gap leaves a gate visibly stuck,
+  # while this one CLOSES the loop with full provenance over nothing.
+  #
+  # MEASURED on DIVE-2232: need_answered_at set, need_answered_by=human:main,
+  # uid 1004, need_answer_sig VALID, human_nonce_hash SET — a real human holding
+  # the raw nonce tapped ✅ Provided — and no connector file was written that day,
+  # no drop was ever minted, no value reached any channel. The record reads
+  # "credential provided, human-attested, signed, nonced" and no credential exists.
+  # Provenance and payload are INDEPENDENT and we only ever verified provenance.
+  #
+  # WHY THE AFFORDANCE FIX IS NOT ENOUGH ON ITS OWN. Withholding the button (see
+  # _task_gate_reply_markup) only changes messages sent FROM NOW ON. Telegram inline
+  # buttons on already-delivered messages never expire — the same fact DIVE-2228
+  # turns on — so every legacy secret gate already in someone's chat history keeps a
+  # live ✅ Provided button, and any of those taps still lands here. This is the
+  # durable half; the affordance removal is the half that stops NEW ones.
+  #
+  # The predicate is the ROW's shape only — no caller-supplied input can satisfy it,
+  # so there is nothing to forge. A gate that named a drop target still answers
+  # normally (that is the legitimate "I ran `5dive secret write` myself" case), and
+  # an explicitly out-of-band gate still answers, because its ask NAMED where the
+  # value goes. Only "asks for a credential, names nowhere" is refused.
+  if [[ "$nt" == "secret" ]]; then
+    local _paths; _paths=$(db "SELECT COALESCE(secret_key,'')||COALESCE(connector,'')||COALESCE(secret_oob,'') FROM tasks WHERE id=${id};")
+    [[ -n "$_paths" ]] || fail "$E_CONFLICT" "$ident is a secret gate that names NO delivery path (no --secret-key/--connector drop target, no --out-of-band declaration), so nothing can have landed and marking it provided would record a signed, human-attested answer over an empty payload (DIVE-2232). Re-file it with a delivery path: 5dive task need $ident --type=secret --secret-key=<ENV_NAME> --connector=<stem> --ask=\"…\" (DIVE-931), or --out-of-band=\"<where the value lands>\" if delivery really is out-of-band."
+  fi
 
   # DIVE-1117: resolve the gate's stored risk tier now — the human-only + evidence
   # blocks below key on need_type (approval/secret/manual), but tier 2 is the true

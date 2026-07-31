@@ -128,7 +128,7 @@ _rt=$(db "SELECT need_type FROM tasks WHERE ident='DIVE-4';")
 # would `exit` mid-harness — and the drop target is irrelevant to the routing
 # exclusion under test, so file it plain.
 seed DIVE-7; HUMAN_PINGED=0; route_reset
-cmd_task_need DIVE-7 --type=secret --ask="paste the deploy key" --from=dev >/dev/null 2>&1
+cmd_task_need DIVE-7 --type=secret --ask="paste the deploy key" --secret-key=DEPLOY_KEY --connector=fixture --from=dev >/dev/null 2>&1
 [[ "$HUMAN_PINGED" == "1" ]] && ok_t "route on: secret stays human-directed (never routed)" || bad_t "secret → human" "HUMAN_PINGED=$HUMAN_PINGED"
 [[ -z "$(db "SELECT COALESCE(routed_reviewer,'') FROM tasks WHERE ident='DIVE-7';")" ]] && ok_t "secret leaves routed_reviewer NULL" || bad_t "secret routed_reviewer NULL" "got '$(db "SELECT COALESCE(routed_reviewer,'') FROM tasks WHERE ident='DIVE-7';")'"
 

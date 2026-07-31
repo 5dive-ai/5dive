@@ -374,11 +374,18 @@ CREATE TABLE IF NOT EXISTS tasks (
   -- value should land — secret_key is the env-var name, connector the
   -- /etc/5dive/connectors/<connector>.env stem. When both are set, the gate
   -- notify mints a burnable drop link (api /drop/mint) instead of the legacy
-  -- "put it where I expect it" text. NULL on non-secret gates and on secret
-  -- gates filed without a target (legacy behavior preserved). The VALUE is never
-  -- stored here — only the destination coordinates.
+  -- "put it where I expect it" text. NULL on non-secret gates. The VALUE is
+  -- never stored here — only the destination coordinates.
   secret_key          TEXT,
   connector           TEXT,
+  -- DIVE-2411: the EXPLICIT out-of-band delivery declaration. A secret gate must
+  -- name a delivery path or it cannot be filed: either the drop target above, or
+  -- this — free text naming WHERE the human should put the value (".env on the
+  -- box", "our shared channel"). Before DIVE-2411 both-NULL was the DEFAULTED
+  -- legacy shape, which is how DIVE-2232 shipped a gate whose only answer path
+  -- was pasting a live token into chat. Now both-NULL is unfilable and
+  -- unanswerable; the legacy shape survives only when CHOSEN via --out-of-band.
+  secret_oob          TEXT,
   -- OSS-11 (DIVE-976) decision-memory precedent prefill. ask_shape is the
   -- normalized "shape key" of the ask (idents/nums/amounts/dates/hosts/names
   -- collapsed to typed placeholders) computed at gate-file time; precedent_ref
@@ -997,7 +1004,7 @@ _tasks_db_migrate() {
            'handoff_delivered_at TEXT' 'handoff_stale_pinged_at TEXT' \
            'tier INTEGER' 'need_asked_at TEXT' 'gate_pinged_at TEXT' 'wake_at TEXT' \
            'gate_filed_by TEXT' \
-           'secret_key TEXT' 'connector TEXT' 'human_nonce_hash TEXT' \
+           'secret_key TEXT' 'connector TEXT' 'secret_oob TEXT' 'human_nonce_hash TEXT' \
            'ask_shape TEXT' 'precedent_ref INTEGER' 'precedent_kind TEXT' \
            'needs_capability TEXT' \
            'shipped_flag_at TEXT' 'routed_reviewer TEXT' \
