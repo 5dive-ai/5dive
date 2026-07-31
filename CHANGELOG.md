@@ -1,5 +1,57 @@
 # Changelog
 
+## Unreleased — fix(task): refuse a close that would REPLACE an already-closed row's result (DIVE-2464)
+
+`5dive task done <id> --result=...` on a row that was already done overwrote the result column and
+said nothing about it — no warning, no refusal, no merge, exit 0. It happened on DIVE-2451: one
+agent closed at 21:08:59, another closed again at 21:11:43, and the first record was gone from the
+board. The ledger does not cover this. `5dive trace` shows both `task.done` events with an
+authority envelope and an `out:` field, but that field is a sha256 *of* the result, not the text —
+it proves the record changed and cannot restore it. An integrity hash is not a backup. What
+actually recovered the text was a `/var/lib/5dive/tasks-backups/` snapshot that happened to fall
+between the two writes; a 3-minute window landing inside a 5-minute cron is luck, not a path.
+
+The check has to live in the verb. "Read the status first" was already being done — the
+overwriting invocation printed the row's status in the same call as the write, so the read could
+not gate anything. DIVE-2067 had fixed exactly this clobber in `task verify`; `task done` was left
+unguarded, and the DIVE-2007 guard above it deliberately falls through for closed rows because "a
+repeat done stays idempotent" — true of the status write, false of the result write.
+
+A close (`done` or `cancel`) that lands on an already-closed row carrying a result is now refused,
+naming the close timestamp and the row's recorded holders, and pointing at `5dive trace` for the
+actor the row itself does not store. Two flags answer it. `--append-result` is the common
+legitimate case — a maker closes, then the owner of the other half adds theirs — and keeps the
+prior text verbatim and first, with the addition beneath it. `--force-result` replaces, warns on
+stderr, and writes the overwritten text (not its hash) to the audit log.
+
+The guard is deliberately narrow, so nothing idempotent changed: it fires only when `--result=`
+was actually passed, the stored result is non-empty, and the new text differs. A bare re-close, a
+replay with identical text, an empty prior result, and any first close of an open row all behave
+exactly as before.
+
+A second change was needed, and review is what found it: the DIVE-477 verifier-routing branch
+`return`s early and does its own unconditional result write, so on a row where `verifier` is set
+and differs from `assignee` the guard was never reached at all and the clobber survived — plus
+`_task_route_to_verifier` sets `status='todo'`, so a closed row was also **resurrected** and
+re-delivered. A closed row is now stopped from routing in the first place, which is right on its
+own merits, and the guard sits above that branch.
+
+Their division of labour was measured by mutating each independently rather than assumed, and the
+answer is not the intuitive one: removing the routing exclusion reds only the resurrection arms,
+while reverting the guard's position reds **nothing** — the exclusion subsumes the ordering for
+the result clobber. So no test arm pins the block's position; it is kept as defence-in-depth and
+said so in the source rather than presented as coverage. The resurrection is a separate harm, not
+a second symptom: it fires on a bare re-close where there is no result to protect.
+
+Two adjacent clobbers on the same column are **not** fixed here and are named rather than left to
+be discovered: `task deliver --result=` over a closed row (DIVE-2476), and
+`_task_route_to_verifier` writing over an **open** row's existing result.
+
+`tests/task_done_over_closed_result_unit.sh` — 29 arms. Checked against the pristine tree: the
+defect (prior result destroyed) reproduces there, and the idempotence and DIVE-477-still-routes
+arms pass on both trees, which is what makes them regression guards rather than evidence for the
+fix.
+
 ## Unreleased — fix(release-cut): move the nightly off the contended top-of-hour and poll for CI to settle (DIVE-2466)
 
 The nightly cut has never once run on time. `- cron: '0 3 * * *'` was byte-identical across all six

@@ -75,6 +75,10 @@ _task_usage() {
   5dive task done|cancel ... [--keep-worktree]       # DIVE-1967: a close RECLAIMS node_modules from that task's worktrees (gitignored,
                                                      # 'npm ci'-regenerable -> structurally data-loss-free). --keep-worktree opts out.
                                                      # The worktree DIRECTORY is never deleted — it may hold unpushed commits.
+  5dive task done|cancel ... [--append-result]       # DIVE-2464: a close on an ALREADY-closed row that carries a result is REFUSED —
+                     [--force-result]                # it used to silently REPLACE it, and the ledger stores only a sha256, so the prior
+                                                     # text was unrecoverable. --append-result keeps theirs verbatim and adds yours under
+                                                     # it (the common case: two closers, one task). --force-result replaces (audited).
   5dive task reclaim <id|DIVE-N>|--all [--dry-run]   # reclaim node_modules from closed tasks' worktrees. --all sweeps every worktree whose
                                                      # task is done/cancelled/absent and SKIPS in_progress/blocked. Also REPORTS which
                                                      # worktree dirs look prunable (nothing unpushed) — pruning itself stays a human call.
@@ -1826,6 +1830,7 @@ _task_status_cmd() {
   local newstatus="$1" extra="$2" verb="$3"; shift 3
   tasks_db_init
   local result="" want_result=0 notify=0 no_preflight=0 force_merge_gate=0 keep_wt=0
+  local append_result=0 force_result=0   # DIVE-2464
   # DIVE-1955 (review, Marcus): every reason the merge-gate could NOT reach an answer,
   # accumulated so the close can be stamped UNVERIFIED in the DURABLE RECORD. A stderr
   # warn and an audit row are necessary and not sufficient: the task row is what a
@@ -1847,6 +1852,12 @@ _task_status_cmd() {
       # DIVE-1967: opt OUT of the node_modules reclaim a close performs (you are
       # about to reuse the worktree and do not want to pay for another npm ci).
       --keep-worktree) keep_wt=1 ;;
+      # DIVE-2464: the two sanctioned answers to the already-closed-row refusal
+      # below. --append-result is the COMMON legitimate case (a second closer
+      # adds their half); --force-result is the rare "the prior text was wrong"
+      # replace, and it is audited because it is the only lossy one.
+      --append-result) append_result=1 ;;
+      --force-result)  force_result=1 ;;
       --)         shift; positional+=("$@"); break ;;
       -*)         fail "$E_USAGE" "unknown flag: $1" ;;
       *)          positional+=("$1") ;;
@@ -1922,6 +1933,124 @@ _task_status_cmd() {
       extra+=", handoff_ack_at=COALESCE(handoff_ack_at, datetime('now'))"
     fi
   fi
+  # DIVE-2464: a close landing on an ALREADY-CLOSED row silently REPLACED its
+  # result. Hit live 2026-07-30 21:11 on DIVE-2451 — main2 closed at 21:08:59,
+  # main ran `task done --result=...` at 21:11:43, and the verb accepted it,
+  # overwrote the result column, printed nothing, exited 0. The prior record was
+  # gone from the board.
+  #
+  # WHY THE LEDGER DOES NOT COVER THIS: `5dive trace` shows both task.done events
+  # with an authority envelope and an `out:` field — but that field is a sha256 OF
+  # the result, not the text. It proves the record changed and cannot restore it.
+  # An integrity hash is not a backup. What actually recovered DIVE-2451 was a
+  # /var/lib/5dive/tasks-backups/ snapshot that happened to fall between the two
+  # writes (5-minute cadence, 3-minute window) — luck about a cron, not a path.
+  #
+  # WHY THE CHECK HAS TO LIVE IN THE VERB: "read the status first" does not work.
+  # The overwriting invocation PRINTED the row's status in the same call as the
+  # write, so the read could not gate anything. A check that cannot stop the
+  # action is decoration.
+  #
+  # This is DIVE-2067 rec 1, ported to the verb that was left unguarded. DIVE-2067
+  # fixed the same clobber in `task verify` (verify-over-closed refusal + the
+  # preserve-by-appending fallback further down that function); `task done` kept
+  # the destructive behaviour, and the DIVE-2007 guard above explicitly falls
+  # THROUGH for closed rows ("a repeat done stays idempotent") — true of the
+  # status write, false of the result write.
+  #
+  # SCOPE, deliberately narrow so nothing idempotent regresses:
+  #   * only a close verb (done/cancel) landing on status done|cancelled;
+  #   * only when --result= was actually PASSED (a bare re-close writes no result);
+  #   * only when the stored result is NON-EMPTY (nothing to destroy otherwise);
+  #   * only when the new text DIFFERS (a replay with identical text is a no-op).
+  # Everything else keeps working exactly as before.
+  #
+  # PLACEMENT IS PART OF THE FIX, and the first version of this change got it
+  # wrong in a way worth recording. This block originally sat BELOW the DIVE-477
+  # verifier-routing branch, which `return`s early — so on any row where
+  # `verifier` is set and differs from `assignee` the guard was never reached,
+  # `_task_route_to_verifier` performed its own unconditional
+  # `(( want_result )) && set_result=`, and the clobber survived untouched on that
+  # shape. The scope list above then read as sufficient while an unstated fourth
+  # condition ("...and the row does not route to a distinct verifier") was doing
+  # real work. Caught in review by main, measured on a clean detached worktree
+  # rather than argued.
+  #
+  # TWO CHANGES ANSWER IT, and their division of labour was MEASURED by mutating
+  # each independently rather than inferred — the result is not what either of us
+  # expected:
+  #   * this block moved ABOVE the routing branch;
+  #   * a closed row additionally stopped from routing at all (note there).
+  # Mutation A (exclusion removed, placement kept): the routed-shape arms stay
+  # GREEN, the resurrection arms RED. Mutation B (placement reverted, exclusion
+  # kept): EVERYTHING stays green. So the exclusion SUBSUMES the ordering for the
+  # result clobber and the ordering is redundant given it — no test arm pins this
+  # block's position, and a future refactor could move it back down with no red.
+  # Kept anyway as defence-in-depth: it is the only thing left standing if the
+  # exclusion is relaxed, and a closed row not routing is right on its own merits.
+  # Written down rather than sold as belt-and-braces coverage, because the first
+  # version of this change asserted coverage it had not measured and that is the
+  # entire reason it came back.
+  #
+  # The resurrection is a genuinely SEPARATE harm, not a second symptom of this
+  # one: it fires on a BARE re-close where there is no result to protect and this
+  # block correctly stays silent. Ordering alone does not reach it.
+  #
+  # NOT FIXED HERE, named so none of it is mistaken for covered:
+  #   * `task deliver --result=` clobbers a closed row the same way (main's probe
+  #     P4, filed as DIVE-2476);
+  #   * `_task_route_to_verifier` still writes unconditionally over an OPEN row's
+  #     existing result — a different population than this ticket measured;
+  #   * a BARE re-close still REFRESHES done_at (both close verbs pass
+  #     `done_at=datetime('now')` unconditionally), measured: 2026-07-30 21:08:59
+  #     -> now. Pre-existing on the non-routed shape and unchanged by this ticket;
+  #     NEW on the routed shape only because the exclusion above now lets it fall
+  #     through here instead of resurrecting the row, which is strictly the better
+  #     of the two. It matters slightly more than it looks, because the refusal
+  #     message quotes done_at as evidence of who closed when — so the honest fix
+  #     is `COALESCE(done_at, datetime('now'))` at the two call sites, which is a
+  #     change to EVERY close and therefore its own row (DIVE-2477), not a rider
+  #     on this one.
+  #
+  # The general lesson, since it is this ticket's own defect wearing a different
+  # hat: a guard's scope is bounded by every early `return` above it, and "the
+  # other rail handles that shape" is a claim about a GUARD when the thing above
+  # you may be a different WRITE PATH. Enumerate the writers, do not reason from
+  # the neighbouring comment.
+  #
+  # The refusal names the row's recorded holders and the close timestamp, not the
+  # invoking actor of the earlier write — the tasks row does not store that. The
+  # actor lives in the audit trail, so the message sends the reader to `5dive
+  # trace` for it rather than implying the row knows.
+  if [[ "$verb" == "done" || "$verb" == "cancel" ]] && (( want_result )); then
+    local _cl_st _cl_prev
+    _cl_st=$(db "SELECT COALESCE(status,'') FROM tasks WHERE id=${id};")
+    if [[ "$_cl_st" == "done" || "$_cl_st" == "cancelled" ]]; then
+      _cl_prev=$(db "SELECT COALESCE(result,'') FROM tasks WHERE id=${id};")
+      if [[ -n "$_cl_prev" && "$_cl_prev" != "$result" ]]; then
+        if (( append_result )); then
+          # Prior text FIRST and untouched: the existing record is the one that
+          # must survive verbatim, and the addition is what is new.
+          result="${_cl_prev}"$'\n\n'"--- appended by a later close (DIVE-2464) ---"$'\n'"${result}"
+        elif (( force_result )); then
+          # The only lossy path, so it is the only one that leaves a row behind.
+          # The overwritten text goes in the audit args, not just its hash — the
+          # whole point of this ticket is that a hash is not a backup.
+          _task_store_audit_log "task.force-result-over-closed" ok 0 -- \
+            "$ident" "closed_status=$_cl_st" "overwritten_result=$_cl_prev"
+          warn "$ident: --force-result REPLACED the result recorded at close. The overwritten text is in the audit log (task.force-result-over-closed); the board copy is gone (DIVE-2464)."
+        else
+          local _cl_at _cl_asg _cl_vf _cl_mk
+          _cl_at=$(db  "SELECT COALESCE(done_at,'unknown')     FROM tasks WHERE id=${id};")
+          _cl_asg=$(db "SELECT COALESCE(assignee,'unassigned') FROM tasks WHERE id=${id};")
+          _cl_vf=$(db  "SELECT COALESCE(verifier,'')           FROM tasks WHERE id=${id};")
+          _cl_mk=$(db  "SELECT COALESCE(maker_agent,'')        FROM tasks WHERE id=${id};")
+          policy_refuse "$E_CONFLICT" done-over-closed-result DIVE-2464 "$ident" \
+            "$ident is ALREADY ${_cl_st} (closed ${_cl_at}; assignee '${_cl_asg}'${_cl_vf:+, verifier '${_cl_vf}'}${_cl_mk:+, maker '${_cl_mk}'}) and carries a result — a bare '5dive task ${verb} --result=' here would REPLACE that record with no warning, and the ledger keeps only a sha256 of it, so it could not be restored (DIVE-2464). Run '5dive trace $ident' to see who wrote it. If you are ADDING your half of the work, say so: '5dive task ${verb} $ident --append-result --result=<your text>' (keeps theirs verbatim, adds yours under it). Only if the recorded text is genuinely WRONG: '--force-result' (replaces it, audited with the overwritten text)."
+        fi
+      fi
+    fi
+  fi
   # DIVE-477: maker→verifier routing. A `task done` on a task that carries a
   # `verifier` distinct from its current assignee is NOT a close — it's a handoff.
   # The maker is claiming the work is ready; the verifier must grade it before the
@@ -1931,10 +2060,30 @@ _task_status_cmd() {
   # rejects it (`task reject` → bounce back to the maker). Opt-in: ordinary tasks
   # (verifier NULL) and the verifier's own close are untouched.
   if [[ "$verb" == "done" ]]; then
-    local _vfier _asignee
+    local _vfier _asignee _route_st
     _vfier=$(db "SELECT COALESCE(verifier,'')  FROM tasks WHERE id=${id};")
     _asignee=$(db "SELECT COALESCE(assignee,'') FROM tasks WHERE id=${id};")
-    if [[ -n "$_vfier" && "$_vfier" != "$_asignee" ]]; then
+    # DIVE-2464 (review, main): a row that is ALREADY CLOSED must not route. The
+    # routing predicate is purely positional (`verifier != assignee`) and never
+    # read status, so a second `task done` on a closed handoff row was routed
+    # again — and `_task_route_to_verifier` sets status='todo', so the close was
+    # RESURRECTED and re-delivered. Measured on a closed row with verifier='main',
+    # assignee='olivia': status done -> todo, rc=0, and (before the guard above
+    # moved ahead of this branch) the result destroyed on the way through.
+    #
+    # This is the SECOND harm on the path and it is not the result clobber: it
+    # fires on a BARE re-close too, where there is no result to protect and the
+    # DIVE-2464 guard above correctly stays silent. So ordering alone does not
+    # cover it and this condition is doing separate work — stated because the
+    # first version of this change asserted coverage it did not have, which is
+    # what the review caught.
+    #
+    # Falling through (rather than refusing) is deliberate: the normal close path
+    # below is idempotent on an already-closed row, so a bare repeat `task done`
+    # keeps its long-standing rc=0 no-op behaviour instead of newly erroring.
+    _route_st=$(db "SELECT COALESCE(status,'') FROM tasks WHERE id=${id};")
+    if [[ -n "$_vfier" && "$_vfier" != "$_asignee" \
+          && "$_route_st" != "done" && "$_route_st" != "cancelled" ]]; then
       _task_route_to_verifier "$id" "$_vfier" "$_asignee" "$result" "$want_result"
       return
     fi
