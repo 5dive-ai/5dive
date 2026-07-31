@@ -247,13 +247,22 @@ jobs:
             # door over. So the self row is looked up by run id (unforgeable) and its
             # NAME is read off that row; siblings are then dropped by that name. A
             # rename changes both sides at once and cannot desync them.
-            # ${GITHUB_JOB} is the fallback for the one look where our own check-run
-            # has not yet surfaced in the API. If both are empty nothing is dropped,
-            # which is the pre-existing behaviour and still fails closed.
+            # EVIDENCE ONLY, NO ${GITHUB_JOB} FALLBACK. An earlier revision of this
+            # fell back to ${GITHUB_JOB} when the self row was not yet in the API
+            # response. That was wrong twice over. Principle: it drops rows on a
+            # GUESS at our name, and it fires precisely in the case where we have no
+            # evidence for that guess — so the one situation it exists for is the one
+            # situation it cannot be trusted in. Practice: it made this block read an
+            # AMBIENT env var, and on a GitHub runner ${GITHUB_JOB} is set to the
+            # CALLING job's name. tests/release_cut_guards_unit.sh went 40/0 locally
+            # and 30/10 in CI, because the unit-tests job is named `test`, the
+            # fixtures contain rows named `test`, and this line deleted them.
+            # If our own row is absent we drop nothing extra and behave exactly as
+            # before this change (run-id filter only). In real execution the check-run
+            # exists before the step runs, so the fallback bought nothing.
             if [[ -n "${GITHUB_RUN_ID:-}" ]]; then
               _self_name=$(awk -F'\t' -v self="/actions/runs/${GITHUB_RUN_ID}/" 'index($4, self) { print $1; exit }' <<<"$runs")
               runs=$(awk -F'\t' -v self="/actions/runs/${GITHUB_RUN_ID}/" 'index($4, self) == 0' <<<"$runs")
-              [[ -n "$_self_name" ]] || _self_name="${GITHUB_JOB:-}"
               if [[ -n "$_self_name" ]]; then
                 runs=$(awk -F'\t' -v jn="$_self_name" '$1 != jn' <<<"$runs")
               fi

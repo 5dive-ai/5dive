@@ -61,6 +61,15 @@ verdict(){ # $1 = check-runs TSV ; echoes NOT-REACHED|IN-FLIGHT|RED|GREEN
   fi
   grep -q 'CI green on' <<<"$out" && echo GREEN || echo "OTHER-OK:$out"
 }
+# DIVE-2466 iter3: PIN the GitHub-provided env, never inherit it. On a real runner
+# GITHUB_JOB and GITHUB_RUN_ID are both set, and the guard block under test reads
+# them — so without this the harness grades the RUNNER's environment instead of its
+# own fixtures. It went 40/0 here and 30/10 in CI for exactly that reason: the
+# unit-tests job is named `test`, several fixtures carry a row named `test`, and the
+# guard deleted them. Any helper that drives the block must neutralise both.
+export GITHUB_JOB=""
+export GITHUB_RUN_ID=""
+
 verdict_run(){ # $1 = check-runs TSV (4-col), $2 = GITHUB_RUN_ID ; echoes like verdict()
   local out rc
   out=$(runs="$1" sha=deadbeefcafe tag=v9.9.9 GITHUB_RUN_ID="$2" RELEASE_CUT_POLL_SECONDS=0 bash -c "
