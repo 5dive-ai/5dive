@@ -247,6 +247,43 @@ if [[ -z "$ident" ]]; then chk "wiring/refile: seeded a gate" "yes" "no"; else
       "$(_task_gate_deliveries "$ident" | grep -c '15491')"
 fi
 
+# park and verifier-reject are the two wirings the first pass shipped UNGRADED
+# (olivia, iteration 1: deleting either call left 26/26 green). Both need setup the
+# loop above cannot express — park REFUSES a live gate, and reject needs a
+# maker→verifier loop — so they get their own arms rather than a fourth loop case.
+#
+# park: the gate must already be ANSWERED (cmd_task_park refuses to park over a live
+# one, DIVE-1453), so the answer retires the button first. reset_edits AFTER that, so
+# what this arm sees is park's OWN retire re-reading the same delivery log — not the
+# answer's edit leaking forward.
+ident=$(seed_gate "DIVE-2410 wiring arm: park")
+if [[ -z "$ident" ]]; then chk "wiring/park: seeded a gate" "yes" "no"; else
+  ( cmd_task_answer "$ident" --value=A ) >/dev/null 2>&1
+  reset_edits
+  ( cmd_task_park "$ident" --reason="fixture park" --wake=+7d ) >/dev/null 2>&1
+  chk "wiring/park: park NULLs the gate columns and retires the delivered button" \
+      "tok-marketing|1234567890|15491" "$(edits)"
+fi
+
+# verifier auto:reject: the gate is still OPEN and the reject stamps it
+# '(superseded — task rejected, bounced to maker)' with provenance 'auto:reject'.
+# Worst stale button of the set: a human tapping it would believe they authorized
+# something an agent closed on their behalf. The maker must NOT be this harness's
+# actor — a maker reject is refused as self-grading (DIVE-2112), which would make
+# the arm pass on a refusal instead of on the retire.
+ident=$(seed_gate "DIVE-2410 wiring arm: reject")
+if [[ -z "$ident" ]]; then chk "wiring/reject: seeded a gate" "yes" "no"; else
+  db "UPDATE tasks SET maker_agent='fixture-maker', verifier=$(sqlq "$(task_actor "")"),
+        status='todo' WHERE ident=$(sqlq "$ident");"
+  reset_edits
+  ( cmd_task_reject "$ident" --feedback="fixture bounce" ) >/dev/null 2>&1
+  chk "wiring/reject: auto:reject supersedes the gate and retires its button" \
+      "tok-marketing|1234567890|15491" "$(edits)"
+  chk "wiring/reject: and the gate really was superseded (the arm graded the retire, not a refusal)" \
+      "auto:reject" \
+      "$(db "SELECT COALESCE(need_answered_by,'') FROM tasks WHERE ident=$(sqlq "$ident");")"
+fi
+
 # ------------------------------------------------- blind-log observability ---
 # The delivery log is the ONLY record of which messages a gate put in a chat, so an
 # unreadable one makes retirement a total silent no-op. Absence and denial must not
