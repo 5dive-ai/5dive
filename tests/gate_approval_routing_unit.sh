@@ -110,7 +110,7 @@ cmd_task_need DIVE-206 --type=approval --ask="approve teardown of the prod datab
 
 # --- A7: SAFETY BACKSTOP (secret type) — a `secret` gate is always tier 2. ----------
 seed_task DIVE-207
-cmd_task_need DIVE-207 --type=secret --ask="drop the deploy key" >/dev/null 2>&1
+cmd_task_need DIVE-207 --type=secret --ask="drop the deploy key" --secret-key=DEPLOY_KEY --connector=fixture >/dev/null 2>&1
 [[ "$(tierof DIVE-207)" == "2" ]] \
   && ok_t "A7 secret type still tier 2 (unchanged)" \
   || bad_t "A7 secret type tier 2" "got tier '$(tierof DIVE-207)'"

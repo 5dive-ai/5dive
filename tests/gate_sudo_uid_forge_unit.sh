@@ -103,7 +103,12 @@ _gate_passwd_stream() {
 
 seed_gate() {   # ident type
   db "INSERT INTO tasks (ident, title, status, created_by) VALUES ('$1','t','todo','main');"
-  cmd_task_need "$1" --type="$2" --ask="need it" >/dev/null 2>&1
+  # DIVE-2411: a secret gate must name a delivery path to file at all — and the
+  # arm that seeds one here is T-DROP, the DIVE-931 drop context, so a drop target
+  # is the right shape for it. Without this, `task need` refuses, `fail` exits this
+  # sourced harness mid-suite, and the arms below it grade nothing.
+  local _dp=(); [[ "$2" == "secret" ]] && _dp=(--secret-key=FIXTURE_TOKEN --connector=fixture)
+  cmd_task_need "$1" --type="$2" --ask="need it" "${_dp[@]+"${_dp[@]}"}" >/dev/null 2>&1
 }
 answered() { db "SELECT CASE WHEN need_answered_at IS NULL THEN 'open' ELSE 'closed' END FROM tasks WHERE ident='$1';"; }
 

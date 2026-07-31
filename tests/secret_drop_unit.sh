@@ -56,12 +56,25 @@ got=$(db "SELECT need_type||'|'||COALESCE(secret_key,'')||'|'||COALESCE(connecto
 [[ "$got" == "secret|PYPI_TOKEN|pypi" ]] && ok_t "T1 secret gate stores secret_key+connector" \
   || bad_t "T1 secret gate stores secret_key+connector" "got: $got"
 
-# --- T2: a legacy secret gate (no target) leaves the columns NULL -------------
+# --- T2: DIVE-2411 — the no-target secret gate is no longer FILABLE -----------
+# This arm asserted the opposite until DIVE-2411 ("legacy secret gate keeps target
+# NULL"): both flags omitted was the DEFAULTED out-of-band shape. DIVE-2232 shipped
+# on that default and had no path for the value to reach the box at all. The shape
+# survives only when CHOSEN (--out-of-band, T2b). Full negative/positive/mutation
+# coverage lives in tests/secret_gate_delivery_path_unit.sh.
 seed_task DIVE-902
-cmd_task_need DIVE-902 --type=secret --ask="drop it somewhere" >/dev/null 2>&1
-got=$(db "SELECT COALESCE(secret_key,'null')||'|'||COALESCE(connector,'null') FROM tasks WHERE ident='DIVE-902';")
-[[ "$got" == "null|null" ]] && ok_t "T2 legacy secret gate keeps target NULL" \
-  || bad_t "T2 legacy secret gate keeps target NULL" "got: $got"
+out=$(cmd_task_need DIVE-902 --type=secret --ask="drop it somewhere" 2>&1); rc=$?
+got=$(db "SELECT COALESCE(need_type,'null') FROM tasks WHERE ident='DIVE-902';")
+[[ $rc -ne 0 && "$out" == *"must name a delivery path"* && "$got" == "null" ]] \
+  && ok_t "T2 secret gate with no delivery path is refused at filing (no row written)" \
+  || bad_t "T2 secret gate with no delivery path is refused at filing (no row written)" "rc=$rc need_type=$got out=$out"
+
+# --- T2b: the out-of-band shape stays reachable when explicitly chosen ---------
+seed_task DIVE-904
+cmd_task_need DIVE-904 --type=secret --ask="drop it somewhere" --out-of-band="already in my .env on this box" >/dev/null 2>&1
+got=$(db "SELECT need_type||'|'||COALESCE(secret_key,'null')||'|'||COALESCE(secret_oob,'') FROM tasks WHERE ident='DIVE-904';")
+[[ "$got" == "secret|null|already in my .env on this box" ]] && ok_t "T2b explicit --out-of-band files and records the declared channel" \
+  || bad_t "T2b explicit --out-of-band files and records the declared channel" "got: $got"
 
 # --- T3: validation rejections ------------------------------------------------
 seed_task DIVE-903

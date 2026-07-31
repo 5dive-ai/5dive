@@ -116,7 +116,7 @@ db "CREATE TABLE IF NOT EXISTS agents_org (name TEXT PRIMARY KEY, role TEXT, tit
 db "INSERT INTO agents_org (name, role, reports_to) VALUES ('main','coordinator',NULL);"
 db "INSERT INTO agents_org (name, role, reports_to) VALUES ('creative',NULL,'main');"
 db "INSERT INTO agents_org (name, role, reports_to) VALUES ('grok',NULL,NULL);"
-file_secret_gate() { seed_task "$1"; IS_ROOT=1 IDUN=root cmd_task_need "$1" --type=secret --ask="drop the fixture key" --from=creative >/dev/null 2>&1; }
+file_secret_gate() { seed_task "$1"; IS_ROOT=1 IDUN=root cmd_task_need "$1" --type=secret --ask="drop the fixture key" --secret-key=FIXTURE_TOKEN --connector=fixture --from=creative >/dev/null 2>&1; }
 
 # ── Root/sudo branch (agents commonly run `sudo 5dive ...`, EUID 0, SUDO_USER set) ──
 # T1: the FILER (real SUDO_USER=agent-creative) withdraws its own secret gate. Gate
@@ -230,7 +230,7 @@ out=$(wd DIVE-207 ROOT SU=agent-creative); rc=$?
 # the lead condition (in the org above, main is BOTH creative's lead AND the coordinator,
 # so T3 cannot tell the two conditions apart and grades neither of them alone).
 db "INSERT INTO agents_org (name, role, reports_to) VALUES ('pi',NULL,'grok');"
-file_pi_gate() { seed_task "$1"; IS_ROOT=1 IDUN=root cmd_task_need "$1" --type=secret --ask="drop the fixture key" --from=pi >/dev/null 2>&1; }
+file_pi_gate() { seed_task "$1"; IS_ROOT=1 IDUN=root cmd_task_need "$1" --type=secret --ask="drop the fixture key" --secret-key=FIXTURE_TOKEN --connector=fixture --from=pi >/dev/null 2>&1; }
 z_lead=$(_gate_route_reviewer pi); z_coord=$(_task_resolve_coordinator)
 [[ "$z_lead" == "grok" && "$z_coord" == "main" && "$z_lead" != "$z_coord" ]] \
   && ok_t "T-2382-DISTINCT pi's lead (grok) is NOT the coordinator (main) — the coordinator arm cannot pass through the lead condition" \

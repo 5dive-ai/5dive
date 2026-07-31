@@ -289,7 +289,7 @@ ASK_SEC="load the staging deploy key"; SHAPE_SEC="$(_gate_ask_shape "$ASK_SEC")"
 seed_prec_by DIVE-1250 secret 1 "$SHAPE_SEC" done "human:mark"
 seed_prec_by DIVE-1251 secret 1 "$SHAPE_SEC" done "human:mark"
 seed_task DIVE-1252
-cmd_task_need DIVE-1252 --type=secret --ask="$ASK_SEC" >/dev/null 2>&1
+cmd_task_need DIVE-1252 --type=secret --ask="$ASK_SEC" --secret-key=FIXTURE_TOKEN --connector=fixture >/dev/null 2>&1
 eq_t "autoclear A6: secret stays blocked"     "$(field DIVE-1252 status)"           "blocked"
 eq_t "autoclear A6: secret unanswered"        "$(field DIVE-1252 need_answered_at)" "∅"
 

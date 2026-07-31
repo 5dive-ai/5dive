@@ -124,7 +124,10 @@ for ty in approval secret manual; do
   _t1n=$((_t1n+1)); ident="DIVE-$_t1n"
   seed_task "$ident"
   NOTIFY_NONCE=""
-  cmd_task_need "$ident" --type="$ty" --ask="need it" >/dev/null 2>&1
+  # DIVE-2411: a secret gate must name a delivery path to file at all. Without
+  # this the secret iteration is refused and its two arms grade the refusal.
+  _t1extra=(); [[ "$ty" == "secret" ]] && _t1extra=(--secret-key=FIXTURE_TOKEN --connector=fixture)
+  cmd_task_need "$ident" --type="$ty" --ask="need it" "${_t1extra[@]+"${_t1extra[@]}"}" >/dev/null 2>&1
   h=$(db "SELECT COALESCE(human_nonce_hash,'') FROM tasks WHERE ident='$ident';")
   if [[ "$h" =~ ^[0-9a-f]{64}$ ]]; then ok_t "T1 $ty gate mints human_nonce_hash"
   else bad_t "T1 $ty gate mints human_nonce_hash" "got: '$h'"; fi
@@ -187,7 +190,7 @@ out=$(SUDO_UID="$AGENT_UID" cmd_task_answer DIVE-400 --value=approved --human --
   || bad_t "T4 --proof dropped" "rc=$rc state=$(answered DIVE-400) out=$out"
 
 # --- T5: (c) non-agent SUDO_UID clears with NO proof (drop / human-on-box) ----
-seed_task DIVE-500; cmd_task_need DIVE-500 --type=secret --ask="drop key" >/dev/null 2>&1
+seed_task DIVE-500; cmd_task_need DIVE-500 --type=secret --ask="drop key" --secret-key=FIXTURE_TOKEN --connector=fixture >/dev/null 2>&1
 SUDO_UID=0 cmd_task_answer DIVE-500 --human --from=drop >/dev/null 2>&1
 [[ "$(answered DIVE-500)" == "closed" ]] && ok_t "T5 non-agent SUDO_UID (root) clears, no proof (drop path)" \
   || bad_t "T5 non-agent SUDO_UID clears" "still $(answered DIVE-500)"
