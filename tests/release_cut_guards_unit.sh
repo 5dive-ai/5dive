@@ -110,6 +110,31 @@ ok "only our own rows -> NOT-REACHED, not GREEN" "$(verdict_run "$ONLY_SELF"    
 # behaviour stands, so the filter can never silently swallow a real in-flight run.
 ok "no GITHUB_RUN_ID -> nothing filtered"       "$(verdict_run "$SELF_INFLIGHT"  '')"          "IN-FLIGHT"
 
+# --- DIVE-2466 iter2: a SIBLING release-cut must not be graded either ----------
+# olivia's reject (07-31) named the gap this closes and the gap in the OLD coverage.
+# The `MUTANT drop self-filter` arm below only ever proved the job ignores ITSELF;
+# nothing proved it ignores ANOTHER run of the same workflow on the same sha. The
+# live failure was exactly that: the 02:37 primary died after its check-run named
+# `cut` had already completed FAILED, and the 03:43 re-arm read that corpse as a
+# third-party red and refused in 9s. So an all-green sha was declared RED by the
+# residue of a previous attempt, permanently, because the RED branch exits before
+# polling and cannot be waited out.
+#
+# SIB_URL is a DIFFERENT run id from SELF_URL on purpose — that difference is the
+# entire bug. Matching on run id alone lets this row through.
+SIB_URL='https://github.com/5dive-ai/5dive/actions/runs/30607923668/job/2'
+FOREIGN_CUT=$(printf 'test\tcompleted\tsuccess\t%s\ncut\tcompleted\tfailure\t%s\ncut\tin_progress\tpending\t%s' \
+  "$OTHER_URL" "$SIB_URL" "$SELF_URL")
+ok "sibling release-cut failure is NOT graded (the 07-31 poisoned re-arm)" \
+   "$(verdict_run "$FOREIGN_CUT" '30332498204')" "GREEN"
+
+# The same fixture with a NON-release-cut red must still refuse — the exclusion is
+# scoped to this workflow and must not have widened into "ignore reds".
+POISON_PLUS_REAL_RED=$(printf 'test\tcompleted\tfailure\t%s\ncut\tcompleted\tfailure\t%s\ncut\tin_progress\tpending\t%s' \
+  "$OTHER_URL" "$SIB_URL" "$SELF_URL")
+ok "a genuine third-party red still REFUSES with the sibling filter on" \
+   "$(verdict_run "$POISON_PLUS_REAL_RED" '30332498204')" "RED"
+
 echo "== guard B: the candidate must WIN install.sh's sort, not merely exist =="
 ok "v0.16.32 over v0.15.34 -> CUT"              "$(cut_decision v0.15.34 v0.16.32)" "CUT"
 ok "no incumbent -> CUT"                        "$(cut_decision '' v0.16.32)"       "CUT"
@@ -237,6 +262,16 @@ if m=$(mutate 's/if (( total == 0 )); then/if false; then/' GUARD); then
 else
   vacuous "drop zero-check"
 fi
+# (a2b) DIVE-2466: drop the SIBLING filter — the poisoned re-arm must come back.
+# Without this arm the sibling exclusion is unpinned and a refactor removes it silently,
+# which is how the original gap survived a 37/0 suite.
+if m=$(mutate 's|runs=$(awk -F.\\t. -v jn="$_self_name" ..1 != jn. <<<"$runs")|:|' GUARD); then
+  ok "MUTANT drop sibling filter: poisoned re-arm returns" \
+     "$(GUARD="$m" verdict_run "$FOREIGN_CUT" '30332498204')" "RED"
+else
+  vacuous "drop sibling filter"
+fi
+
 # (a2) DIVE-2238: drop the self-filter — the job must go back to blocking on itself.
 # This is the arm that proves the fix is load-bearing rather than decorative: before
 # the fix this fixture returned IN-FLIGHT and the job could never publish.
