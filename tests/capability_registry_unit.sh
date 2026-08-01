@@ -211,6 +211,22 @@ want "C: confirmed BEFORE"          'capability_confirmed_holder a2a_deliver rvC
 capability_reverify_from_sudoers rvC
 want "C: ALL rows gone after"       '! capability_confirmed_holder a2a_deliver rvC && ! capability_confirmed_holder delegated_push rvC'
 
+# INST-5 / E. the SECOND brokered surface must reverify from the artifact too.
+# Iteration-1 coverage stopped at push, so a deploy grant could have been
+# installed and never recorded — an authority the sudoers file gives out and
+# the registry answers "not confirmed" about. Both directions, because the
+# dangerous one is the DROP: a pulled deploy grant that stays confirmed hands a
+# revoked production-ship capability to a router as a live fact.
+reset_rv rvE; capability_forget_agent rvE
+render_standard_sudoers rvE 0 1 > "$sudoers_dir/rvE"
+capability_reverify_from_sudoers rvE
+want "E: deploy confirmed from a deploy-only policy" 'capability_confirmed_holder delegated_deploy rvE'
+want "E: …and push is NOT claimed from it"           '! capability_confirmed_holder delegated_push rvE'
+render_standard_sudoers rvE 1 0 > "$sudoers_dir/rvE"
+capability_reverify_from_sudoers rvE
+want "E: policy loses deploy -> row DROPPED"         '! capability_confirmed_holder delegated_deploy rvE'
+want "E: …and push is picked up in the same pass"    'capability_confirmed_holder delegated_push rvE'
+
 # D. a policy that is NOT a standard policy -> decline, do not claim standard caps
 reset_rv rvD
 printf 'rvD ALL=(ALL) NOPASSWD: ALL\n' > "$sudoers_dir/rvD"
