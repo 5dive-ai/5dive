@@ -212,6 +212,29 @@ want "require_loaded is not defined in lib/broker.sh" \
 want "require_loaded is defined in header.sh (always first in the bundle)" \
      'grep -q "^require_loaded()" "$ROOT/src/header.sh"'
 
+# == 7. no harness loads a broker CONSUMER without lib/broker.sh (INST-5).
+# This is how the branch broke: tests/ harnesses hand-maintain a source list
+# mirroring build.sh, and a new lib is invisible to every one of them. push_unit
+# and gate_lead_standing failed loudly because they CALL cmd_push; 18 others
+# sourced cmd_push.sh and stayed green only because they never called it —
+# latent, and the next arm added to any of them would have graded through a
+# missing predicate. Derived from the tree, so it also covers surface N+1.
+echo "== 7. every harness sourcing a broker consumer also sources lib/broker.sh"
+_bad=""
+for _t in "$ROOT"/tests/*.sh; do
+  awk '/for f in/,/; do/' "$_t" | grep -qE 'cmd_push\.sh|cmd_deploy\.sh' || continue
+  grep -q 'lib/broker.sh' "$_t" || _bad="$_bad $(basename "$_t")"
+done
+want "no harness sources a broker consumer without lib/broker.sh" '[[ -z "$_bad" ]]'
+[[ -n "$_bad" ]] && echo "    missing:$_bad"
+# Non-vacuity: the sweep must actually be finding harnesses to check, or it
+# passes by inspecting nothing — the exact way this check could rot silently.
+_seen=$(for _t in "$ROOT"/tests/*.sh; do
+          awk '/for f in/,/; do/' "$_t" | grep -qE 'cmd_push\.sh|cmd_deploy\.sh' && echo x
+        done | grep -c x)
+want "non-vacuity: the harness sweep inspected at least 15 harnesses (saw $_seen)" \
+     '[[ "$_seen" -ge 15 ]]'
+
 echo
 echo "broker surface unit: ${PASS} passed, ${FAIL} failed"
 [[ $FAIL -eq 0 ]]
