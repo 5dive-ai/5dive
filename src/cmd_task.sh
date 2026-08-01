@@ -1909,6 +1909,77 @@ _task_status_cmd() {
       _cd=$(db "SELECT COALESCE(done_at,'unknown') FROM tasks WHERE id=${id};")
       policy_refuse "$E_CONFLICT" start-on-closed-task DIVE-2113 "$ident" "$ident is CLOSED (status='${_cs}', closed ${_cd}) — 'task start' would silently reopen it to in_progress while LEAVING done_at set, so the row contradicts itself and any recorded grade would describe a task the board shows as open. If it genuinely must be reopened, that is a deliberate decision and belongs on the record; no alternative verb is named here on purpose, because a refusal that lists exits publishes a route around itself (DIVE-2067)."
     fi
+    # DIVE-2510: `task start` was the LAST status writer with no delivered-loop
+    # guard. `task done` refuses a non-verifier over a live delivery (DIVE-2007),
+    # `task reject` refuses the maker (DIVE-2112), `task start` refuses a closed
+    # row (DIVE-2113) — but a delivered row could still be re-claimed by its own
+    # maker, and the /goal prompt instructs exactly that ("claim it with
+    # `task start`"). So the documented workflow walks a maker into it: any
+    # delivered row a goal is re-issued over gets silently taken back out of the
+    # delivered shape by an agent following instructions correctly.
+    #
+    # THE HARM IS A MISREPRESENTED STATE. Measured on an isolated fixture, not
+    # inferred, and scoped narrowly on purpose because the exact scope is what
+    # the reader needs:
+    #   * status flips todo -> in_progress, and started_at (which the handoff set
+    #     to NULL) is re-stamped with the re-claim time. That is the whole write.
+    #   * `task show` keeps printing `handoff: delivered (awaiting verifier ACK)`
+    #     throughout — the render keys on `assignee=verifier AND status NOT IN
+    #     ('done','cancelled')`, and in_progress passes that. `task reject` is
+    #     what moves assignee back to the maker and (correctly) drops the line.
+    # So the board shows in_progress on a row nobody is working — it is sitting
+    # in the verifier's queue — and `status='todo' AND assignee=verifier`, the
+    # predicate the delivered state is documented as, stops matching. A false
+    # record either way, which is reason enough to refuse.
+    #
+    # DO NOT go looking for cleared delivery columns; there are none, and a
+    # reading of this rail that expects them is wrong at the schema level.
+    # `delivered_at` and `delivery_ref` have exactly ONE writer — cmd_task_deliver,
+    # the `task deliver --pr=` flow — so on a loop delivered by `task done` they
+    # are NULL and always were. `handoff_ack_at` is set to NULL by
+    # _task_route_to_verifier as PART of delivering. All three are therefore NULL
+    # *while the row is legitimately delivered*, which is why observing them NULL
+    # after a stray `task start` says nothing about that start. T6 of the harness
+    # measures the columns a loop delivery actually populates
+    # (handoff_delivered_at, maker_agent, iteration, result) and pins that they
+    # are untouched, rather than restating survival of columns that were never
+    # set — a "survives" claim over a NULL column is vacuously true and misleads.
+    #
+    # Keyed on the ACTOR, exactly like DIVE-2007, not on who the row is assigned
+    # to: delivery flips assignee TO the verifier, so an assignee test would read
+    # the maker's re-claim as a stranger's. The verifier's own start is the
+    # DIVE-1378 ACK further down and is excluded HERE by the actor comparison —
+    # the SQL only yields a verifier name when that verifier is not the caller.
+    # `cli` is task_actor's "could not attribute this invocation" sentinel
+    # (non-agent user, root cron, CI) and is EXEMPT for the same reason DIVE-2007
+    # exempts it — the threat model is a resolvable agent re-claiming its own
+    # delivery, and CI is where an over-broad version of that guard breaks
+    # unrelated harnesses.
+    #
+    # NOT an iteration fix, and it was proposed as one — measured instead of
+    # assumed, see T7. A maker's re-claim cannot inflate `iteration`: the only
+    # writer is _task_route_to_verifier, reached only by a `task done` that was
+    # NOT refused, and DIVE-2007 refuses the maker's done whatever status a stray
+    # start left behind. A climbing iteration on a delivered row means real
+    # reject/re-deliver cycles (or the exempt `cli`/verifier actor), not this bug.
+    #
+    # Placed BEFORE _task_start_preflight, alongside the DIVE-2059 and DIVE-2113
+    # refusals, so a start that is going to be refused does not first print three
+    # advisory heads-up warnings about work it will not be allowed to do.
+    local _sd_actor; _sd_actor=$(task_actor)
+    local _sd_vfier _sd_maker _sd_iter
+    IFS='|' read -r _sd_vfier _sd_maker _sd_iter <<<"$(db "SELECT
+            CASE WHEN maker_agent IS NOT NULL AND verifier IS NOT NULL
+                      AND assignee=verifier AND verifier IS NOT $(sqlq "$_sd_actor")
+                      AND handoff_ack_at IS NULL
+                      AND status NOT IN ('done','cancelled')
+                 THEN verifier ELSE '' END
+            ||'|'||COALESCE(maker_agent,'')||'|'||COALESCE(iteration,0)
+          FROM tasks WHERE id=${id};")"
+    if [[ -n "$_sd_vfier" && "$_sd_actor" != "cli" ]]; then
+        policy_refuse "$E_CONFLICT" start-over-delivered-loop DIVE-2510 "$ident" \
+          "$ident is DELIVERED to verifier '${_sd_vfier}' (iteration ${_sd_iter}, maker '${_sd_maker}') and has NOT been graded — a 'task start' from '${_sd_actor}' would flip it to in_progress, so the board would show someone working a row that is actually sitting in '${_sd_vfier}''s review queue, and the delivered predicate (status='todo' AND assignee=verifier) would stop matching it. Nothing is yours to claim here until it comes back: '${_sd_vfier}' either closes it or bounces it with '5dive task reject $ident --feedback=...' — that bounce reassigns it to you and 'task start' works again. If you have a CORRECTION to the delivery, send it to '${_sd_vfier}' (5dive agent send ${_sd_vfier} \"...\") rather than taking the row back."
+    fi
   fi
   # DIVE-1375: fail-loud preflight — surface identity/auth/repo gaps at `start`
   # BEFORE the agent burns a turn discovering them mid-task. Advisory only
