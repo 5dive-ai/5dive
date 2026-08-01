@@ -221,14 +221,57 @@ jobs:
           _look=0
           while :; do
             _look=$(( _look + 1 ))
+            # DIVE-2466 iter2 (olivia's reject): dropping only THIS RUN's check-runs
+            # is not enough — a SIBLING release-cut on the same sha poisons this one.
+            # Measured 07-31: the 02:37 primary failed its release-commit self-grade
+            # and left a COMPLETED, FAILED check-run named `cut` on the sha. The 03:43
+            # re-arm read 13 rows instead of 12, the extra one being that corpse, and
+            # refused in 9s with "CI is RED — Failing: cut". So the re-arm is a no-op
+            # when it is not needed and a GUARANTEED hard-fail when it is, and it is
+            # SELF-LATCHING: the RED branch exits before any polling (correct for a
+            # real red), so it cannot be waited out, and the poison persists on that
+            # sha for every later run. One failed cut permanently reds the sha against
+            # its own workflow. The ticket's "safe BY CONSTRUCTION" claim for the
+            # re-arm assumed the primary SUCCEEDED — the negation of the only case the
+            # re-arm exists for.
+            #
+            # THE RULE: no run of THIS workflow is ever a precondition for this one.
+            # Self OR sibling, a release-cut never grades a release-cut. Everything
+            # else keeps failing closed exactly as before.
+            #
+            # WHY THE NAME IS LEARNED FROM THE API AND NOT HARDCODED. DIVE-2238 chose
+            # run-id matching precisely so renaming the job could not silently
+            # re-introduce the self-reference, and that concern is right — a literal
+            # `cut` here would rot the moment someone renames the job or adds a `name:`
+            # to it, and it would rot SILENTLY, which is the same failure shape one
+            # door over. So the self row is looked up by run id (unforgeable) and its
+            # NAME is read off that row; siblings are then dropped by that name. A
+            # rename changes both sides at once and cannot desync them.
+            # EVIDENCE ONLY, NO ${GITHUB_JOB} FALLBACK. An earlier revision of this
+            # fell back to ${GITHUB_JOB} when the self row was not yet in the API
+            # response. That was wrong twice over. Principle: it drops rows on a
+            # GUESS at our name, and it fires precisely in the case where we have no
+            # evidence for that guess — so the one situation it exists for is the one
+            # situation it cannot be trusted in. Practice: it made this block read an
+            # AMBIENT env var, and on a GitHub runner ${GITHUB_JOB} is set to the
+            # CALLING job's name. tests/release_cut_guards_unit.sh went 40/0 locally
+            # and 30/10 in CI, because the unit-tests job is named `test`, the
+            # fixtures contain rows named `test`, and this line deleted them.
+            # If our own row is absent we drop nothing extra and behave exactly as
+            # before this change (run-id filter only). In real execution the check-run
+            # exists before the step runs, so the fallback bought nothing.
             if [[ -n "${GITHUB_RUN_ID:-}" ]]; then
+              _self_name=$(awk -F'\t' -v self="/actions/runs/${GITHUB_RUN_ID}/" 'index($4, self) { print $1; exit }' <<<"$runs")
               runs=$(awk -F'\t' -v self="/actions/runs/${GITHUB_RUN_ID}/" 'index($4, self) == 0' <<<"$runs")
+              if [[ -n "$_self_name" ]]; then
+                runs=$(awk -F'\t' -v jn="$_self_name" '$1 != jn' <<<"$runs")
+              fi
             fi
             total=$(printf '%s' "$runs" | grep -c . || true)
             incomplete=$(awk -F'\t' '$2 != "completed"' <<<"$runs")
             bad=$(awk -F'\t' '$3 != "success" && $3 != "skipped" && $3 != "neutral"' <<<"$runs" | awk -F'\t' '$2 == "completed"')
 
-            echo "CI on ${sha:0:12}: ${total} check-run(s) (excluding this run's own) [look ${_look}]"
+            echo "CI on ${sha:0:12}: ${total} check-run(s) (excluding every run of this workflow) [look ${_look}]"
             printf '%s\n' "$runs" | cut -f1-3 | sed 's/^/  /'
 
             # RED FIRST, and it exits before any deadline arithmetic — a red verdict is
