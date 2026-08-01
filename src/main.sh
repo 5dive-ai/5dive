@@ -393,6 +393,17 @@ main() {
       # audited itself (the parent `gh` verb is) and never advertised.
       cmd_gh_do "$@"
       exit $? ;;
+    _deploy_do)
+      # INST-5: hidden, privileged, ATOMIC delegated deploy — the capability
+      # broker's SECOND surface, same template as _push_do. Reachable ONLY via
+      # NOPASSWD sudo. Reads <ident> <project> <ref> <env> on STDIN (never argv,
+      # so the grant stays exact-path / sudo-rs safe), re-verifies the cleared
+      # gate under signature, re-binds the target to the task's own Deploy line,
+      # reads VERCEL_TOKEN root-only and fires ONE deployment of the repo the
+      # project is ALREADY linked to. The agent process never holds the token.
+      # Not audited itself (the parent `deploy` verb is) and never advertised.
+      cmd_deploy_do "$@"
+      exit $? ;;
     _push_do)
       # DIVE-1376/1460: hidden, privileged, ATOMIC delegated push. Reachable ONLY
       # via NOPASSWD sudo. Reads <ident> <repo-path> <branch> <repo-url> on STDIN
@@ -783,6 +794,15 @@ main() {
         AUDIT_CMD="push"; AUDIT_ARGS=("$@")
         cmd_push "$@"
       fi ;;
+    deploy)
+      # INST-5: delegated PRODUCTION deploy — the capability broker generalized
+      # off delegated push. Deploys ONLY the project@ref the task declares, ONLY
+      # after that task's gate clears, and only into the repo the Vercel project
+      # is already linked to. The privileged gate+bind+credential+deploy runs
+      # atomically in the root-only _deploy_do helper; the agent never holds the
+      # token. Mutating + credential-bearing -> audited.
+      AUDIT_CMD="deploy"; AUDIT_ARGS=("$@")
+      cmd_deploy "$@" ;;
     proof)
       # OSS-17: publish this box's zero-human proof (badge.json/zero-human.json/
       # history.jsonl) to a git status branch, computed verbatim from `digest`.
