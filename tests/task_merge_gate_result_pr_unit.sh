@@ -85,6 +85,27 @@ exit 1
 SUDOSTUB
 chmod +x "$TMP/bin/sudo"
 : >"$TMP/sudo.calls"
+
+# --- stub id: DIVE-2484. The token resolver's last branch is guarded on
+# `id -un != claude` (it must not borrow a credential from the account it is
+# already running as). This harness stubbed `gh` and `sudo` but NOT `id`, so that
+# arm inherited the HOST's identity and graded the running user rather than the
+# code: red as `claude`, green as anyone else. Since this repo's own convention is
+# to run local tests via `sudo -u claude`, the conventional local run was the red
+# one, while CI — where no `claude` account exists — was permanently green. Same
+# tree, two verdicts, and neither was about the tree. Opt-in override so a test
+# CONSTRUCTS the identity its scenario needs; everything else passes through to
+# the real binary, which keeps the other arms reading the true host.
+REAL_ID=$(command -v id)
+cat >"$TMP/bin/id" <<IDSTUB
+#!/usr/bin/env bash
+if [[ -n "\${ID_STUB_UN:-}" && "\$*" == "-un" ]]; then
+  printf '%s\n' "\$ID_STUB_UN"; exit 0
+fi
+exec $REAL_ID "\$@"
+IDSTUB
+chmod +x "$TMP/bin/id"
+
 export PATH="$TMP/bin:$PATH"
 export GH_ARGS_LOG="$TMP/gh.args"; : >"$GH_ARGS_LOG"
 
@@ -260,13 +281,48 @@ fi
 # --- 8. the token resolver reaches `claude` for a NON-root caller -------------
 # The whole gate was inert for the agent fleet because this fallback was gated on
 # `id -un == root`; every agent-* closes tasks as itself, unauthed.
+#
+# DIVE-2484: the two arms below are a DIFFERENTIAL PAIR. They hold every variable
+# equal and change only the caller's identity, because the identity is the whole
+# subject: the fallback must fire for an agent-* caller and must NOT fire for
+# `claude` itself. `ID_STUB_UN` is what makes each one construct its own
+# precondition — before it existed this arm read the host's identity and its
+# verdict tracked whoever ran it.
 : >"$TMP/sudo.calls"
-got=$(GH_TOKEN="" GITHUB_TOKEN="" SUDO_USER="" GH_STUB_AUTH_TOKEN="" \
+got=$(ID_STUB_UN="agent-fixture" GH_TOKEN="" GITHUB_TOKEN="" SUDO_USER="" GH_STUB_AUTH_TOKEN="" \
       SUDO_STUB_TOKEN="claude-token" _gate_gh_token)
 if [[ "$got" == "claude-token" ]] && grep -q -- "-u claude gh auth token" "$TMP/sudo.calls"; then
-  ok_t "non-root caller resolves the gh token via claude (gate is live for agents)"
+  ok_t "a non-root NON-claude caller resolves the gh token via claude (gate is live for agents)"
 else
   bad_t "non-root token resolution via claude" "got=[$got] sudo=$(cat "$TMP/sudo.calls")"
+fi
+
+# The negative half, and the case this suite never covered at all: when the caller
+# IS `claude`, the fallback must not borrow from the account it is already running
+# as. Empty resolution is the CORRECT answer here — `claude`'s own credential is
+# the arm above this one's business (`gh auth token`, line ~1257), not this branch.
+# Liveness for the negative: the arm directly above differs from this one ONLY in
+# ID_STUB_UN and DOES record a sudo call, so a silent sudo.calls here is a real
+# absence and not a dead stub.
+: >"$TMP/sudo.calls"
+got=$(ID_STUB_UN="claude" GH_TOKEN="" GITHUB_TOKEN="" SUDO_USER="" GH_STUB_AUTH_TOKEN="" \
+      SUDO_STUB_TOKEN="claude-token" _gate_gh_token)
+if [[ -z "$got" ]] && ! grep -q -- "-u claude gh auth token" "$TMP/sudo.calls"; then
+  ok_t "a caller who IS claude never borrows a token from itself"
+else
+  bad_t "claude caller must not self-borrow" "got=[$got] sudo=$(cat "$TMP/sudo.calls")"
+fi
+
+# ...and that refusal to self-borrow costs `claude` nothing, because its OWN login
+# resolves one branch earlier. This is the arm that proves the empty result above
+# is a scoped no-op rather than a broken resolver for the claude account.
+: >"$TMP/sudo.calls"
+got=$(ID_STUB_UN="claude" GH_TOKEN="" GITHUB_TOKEN="" SUDO_USER="" GH_STUB_AUTH_TOKEN="own-login-tok" \
+      SUDO_STUB_TOKEN="claude-token" _gate_gh_token)
+if [[ "$got" == "own-login-tok" ]] && ! grep -q -- "-u claude gh auth token" "$TMP/sudo.calls"; then
+  ok_t "claude resolves via its OWN gh login, not the borrow branch"
+else
+  bad_t "claude own-login resolution" "got=[$got] sudo=$(cat "$TMP/sudo.calls")"
 fi
 # an explicit env token still wins, and a real SUDO_USER is still tried first.
 got=$(GH_TOKEN="env-tok" SUDO_STUB_TOKEN="claude-token" _gate_gh_token)
