@@ -258,6 +258,8 @@ Zero-human proof (publish your own badge — OSS-17):
 
 Delegated push (bring your own GitHub App — DIVE-1376):
   5dive push <id|DIVE-N> [--branch=<b>] [--dry-run]  # push ONLY the task's branch, ONLY after its gate clears; author enforced
+  5dive deploy <id|DIVE-N> [--target=<project@ref>] [--env=production|preview] [--dry-run]
+                                                     # INST-5: deploy ONLY the project@ref the task declares, ONLY after its gate clears
   5dive push setup                                   # scaffold + check the GitHub App credential (bring-your-own; root)
   # Branch comes from --branch or a 'Branch: <name>' line in the task body. The credential is YOUR GitHub App
   # (contents:write, installed on your ship repos), held root-side in /etc/5dive/connectors — never a human token.
