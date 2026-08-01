@@ -279,6 +279,7 @@ _push_touches_workflows() { # <repopath> <repourl> <branch>
 }
 
 cmd_push() {
+  require_loaded push broker_gate_check broker_bind_target broker_task_target
   tasks_db_init
   local branch="" repo="" dry=0 yes=0
   local -a positional=()
@@ -465,6 +466,7 @@ _push_record_ship_ledger() {
 }
 
 cmd_push_do() {
+  require_loaded push broker_gate_check broker_bind_target broker_task_target
   [[ "$(id -u)" -eq 0 ]] || fail "$E_PERMISSION" "_push_do is root-only"
   local ident repopath branch repourl
   IFS= read -r ident    || true

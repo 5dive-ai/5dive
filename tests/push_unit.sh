@@ -37,8 +37,9 @@ trap 'rm -rf "$TMP"' EXIT
 
 # shellcheck disable=SC1090
 for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh \
-         lib/agent_setup.sh lib/state.sh lib/audit.sh lib/registry.sh \
-         lib/tasks_db.sh cmd_task.sh cmd_push.sh cmd_agent_create.sh; do
+         lib/agent_setup.sh lib/state.sh lib/broker.sh lib/audit.sh \
+         lib/registry.sh lib/tasks_db.sh cmd_task.sh cmd_push.sh \
+         cmd_agent_create.sh; do
   # shellcheck source=/dev/null
   source "$SRC/$f"
 done
@@ -165,6 +166,26 @@ seed_task DIVE-907 "Branch: feature-ok" approval "2026-07-18 00:00:00" "yes ship
 out=$(run_push DIVE-907 --dry-run); rc=$?
 { [[ $rc -eq 0 ]] && grep -qi "dry-run: would push" <<<"$out"; } \
   && ok_t "happy dry-run -> ok" || bad_t "happy dry-run -> ok" "rc=$rc :: $out"
+
+# 7b) INST-5 FAIL-CLOSED ON A MISSING PREDICATE. Extracting push's gate check into
+# lib/broker.sh created a failure mode the inline code could not have: if the lib
+# is not loaded the call is merely "command not found" (rc 127) and, as a bare
+# statement, execution CONTINUES — CI caught exactly this, with push printing
+# "would push ... (gate cleared)" for a task whose gate it never read. The control
+# is arm 7 directly above: the SAME fixture, the SAME command, one predicate
+# removed. If this pair ever stops differing, the guard has gone vacuous.
+for _pred in broker_gate_check broker_bind_target; do
+  out=$( cd "$REPO"; unset -f "$_pred"; cmd_push DIVE-907 --repo="file://$REPO" --dry-run 2>&1 ); rc=$?
+  # The ACTION must not have happened — an rc alone would also pass on the wrong refusal.
+  { [[ $rc -ne 0 ]] && ! grep -qi "would push" <<<"$out"; } \
+    && ok_t "missing $_pred -> refuses, and no push is reported" \
+    || bad_t "missing $_pred -> refuses, and no push is reported" "rc=$rc :: $out"
+  # …and the refusal NAMES the absent predicate, so the operator is not left guessing.
+  grep -q "$_pred" <<<"$out" \
+    && ok_t "…and the refusal names '$_pred' as the missing predicate" \
+    || bad_t "…and the refusal names '$_pred' as the missing predicate" "$out"
+done
+unset _pred
 
 # 8) DIVE-1462 branch binding: a --branch that DISAGREES with the task's declared
 # branch is refused — the cleared gate binds to the task's own branch, so an agent

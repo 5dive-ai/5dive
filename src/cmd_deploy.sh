@@ -82,6 +82,7 @@ _deploy_validate_target() {
 # needs no privilege and the errors are readable), then hand the actual gated
 # deploy to the root-only `_deploy_do`. The agent never receives a token.
 cmd_deploy() {
+  require_loaded deploy broker_gate_check broker_bind_target broker_task_target broker_connector_read
   tasks_db_init
   local target="" env="production" dry=0
   local -a positional=()
@@ -150,6 +151,7 @@ cmd_deploy() {
 # parent `deploy` verb is).
 cmd_deploy_do() {
   [[ "$(id -u)" -eq 0 ]] || fail "$E_PERMISSION" "_deploy_do is root-only"
+  require_loaded deploy broker_gate_check broker_bind_target broker_task_target broker_connector_read
   local ident proj ref env
   IFS= read -r ident || true
   IFS= read -r proj  || true

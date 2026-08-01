@@ -190,6 +190,28 @@ want "unknown surface fails loudly" '[[ "$u" == *"unknown surface/field"* ]]'
 want "every surface in broker_surfaces resolves every field" \
      '( for s in $(broker_surfaces); do for f in noun Noun cap verb key target ask ticket; do [[ -n "$(broker_surface "$s" "$f")" ]] || exit 1; done; done )'
 
+# == 6. every consumer of the broker asserts the broker is LOADED (INST-5).
+# The consumer list is DERIVED from the tree, never hand-written: a seventh
+# surface folded in later gets swept automatically, which is the whole point —
+# a hand list would go stale exactly when a new surface is added. A consumer
+# that calls a broker predicate without require_loaded is the fail-open shape
+# CI caught on this branch (push reporting "gate cleared" on an unread gate).
+echo "== 6. brokered surfaces fail closed when lib/broker.sh is absent"
+_consumers=$(grep -rlE '(^|[^_[:alnum:]])broker_(gate_check|bind_target|task_target)\b' \
+               "$ROOT/src" --include='cmd_*.sh' | sort)
+want "the derived consumer sweep is non-vacuous (found at least push + deploy)" \
+     '[[ "$(printf "%s\n" "$_consumers" | grep -c .)" -ge 2 ]]'
+for _c in $_consumers; do
+  want "$(basename "$_c") guards its broker calls with require_loaded" \
+       'grep -q "require_loaded" "$_c"'
+done
+# And the guard itself must live OUTSIDE lib/broker.sh — a check for a missing
+# file cannot be defined in the file that might be missing.
+want "require_loaded is not defined in lib/broker.sh" \
+     '! grep -q "^require_loaded()" "$ROOT/src/lib/broker.sh"'
+want "require_loaded is defined in header.sh (always first in the bundle)" \
+     'grep -q "^require_loaded()" "$ROOT/src/header.sh"'
+
 echo
 echo "broker surface unit: ${PASS} passed, ${FAIL} failed"
 [[ $FAIL -eq 0 ]]
