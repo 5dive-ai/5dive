@@ -197,19 +197,32 @@ out=$(run_deploy DIVE-807 --target=app@feat/a --dry-run); rc=$?
 # STUB the uid the code READS. An unstubbed `id -u` grades the RUNNER, not the
 # code: red under our `sudo -u claude` convention and green in a root container,
 # so both readings would be "true" and neither would be about cmd_deploy.sh.
+#
+# ASSERT THE EXACT MESSAGE, not the substring "root-only". This is a guard
+# behind a guard: delete cmd_deploy_do's own uid check and the call still
+# refuses, because broker_connector_read (B1) is independently root-only and
+# says so in the same words. Graded on the substring, this arm stayed GREEN with
+# the check deleted — it was reading the second layer. Only the exact string
+# "_deploy_do is root-only" isolates the layer this arm claims to be about.
 id() { if [[ "${1:-}" == "-u" ]]; then printf '%s' "$FAKE_UID"; else command id "$@"; fi; }
 FAKE_UID=1000
 out=$( printf 'DIVE-807\napp\nfeat/a\nproduction\n' | cmd_deploy_do 2>&1 ); rc=$?
-{ [[ $rc -ne 0 ]] && grep -q "root-only" <<<"$out"; } \
+{ [[ $rc -ne 0 ]] && grep -q "_deploy_do is root-only" <<<"$out"; } \
   && ok_t "_deploy_do as non-root -> refuse (stubbed uid 1000)" \
   || bad_t "_deploy_do as non-root -> refuse" "rc=$rc :: $out"
+# The second layer, named as its own property rather than left to be mistaken
+# for the first: even reached directly, the credential read refuses non-root.
+out=$( broker_connector_read "$VERCEL_ENV_FILE" "the Vercel" 2>&1 ); rc=$?
+{ [[ $rc -ne 0 ]] && grep -q "broker_connector_read is root-only" <<<"$out"; } \
+  && ok_t "B1 defence in depth: the credential read is independently root-only" \
+  || bad_t "B1 defence in depth: the credential read is independently root-only" "rc=$rc :: $out"
 # Differential: as uid 0 the SAME call gets past the root check. It must not
 # succeed — there is no credential here — but it must fail for a LATER reason,
 # which is what proves the arm above graded the root check and not some
 # unrelated refusal that would fire either way.
 FAKE_UID=0
 out=$( printf 'DIVE-807\napp\nfeat/a\nproduction\n' | cmd_deploy_do 2>&1 ); rc=$?
-{ [[ $rc -ne 0 ]] && ! grep -q "root-only" <<<"$out"; } \
+{ [[ $rc -ne 0 ]] && ! grep -q "_deploy_do is root-only" <<<"$out"; } \
   && ok_t "…and as uid 0 it passes the root check and fails LATER (arm is differential)" \
   || bad_t "…and as uid 0 it passes the root check and fails later" "rc=$rc :: $out"
 # The credential is absent, so the failure must be the connector — never a
