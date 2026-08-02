@@ -69,6 +69,15 @@ on:
         description: 'Why this cut is being made by hand (hotfix, incident, first cut)'
         required: true
         type: string
+      level:
+        description: 'Which component to increment'
+        required: false
+        default: patch
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
 
 concurrency:
   group: release-cut
