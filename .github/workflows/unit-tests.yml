@@ -190,6 +190,16 @@ jobs:
       # DIVE-2229: full history — pinned baselines must resolve here too.
       - uses: actions/checkout@v4
         with: { fetch-depth: 0 }
+      # TEMPORARY DIAGNOSTIC (DIVE-2525) — remove before merge. The nightly union
+      # reports council_record_e2e.sh NOT PROBED in either environment; it probes
+      # `wired` on the control plane, so the differing condition is in CI and I am
+      # measuring it rather than guessing at it.
+      - name: DIAGNOSTIC council_record_e2e
+        run: |
+          ./build.sh
+          command -v node jq sqlite3 || true
+          sudo -n true && echo "passwordless sudo: yes" || echo "passwordless sudo: NO"
+          bash tests/council_record_e2e.sh; echo "rc=$?"
       # DIVE-2039: the rail prover, from the pristine side. `snapshot-rails` is
       # allowlisted because GitHub CI has no ops checkout — that exemption can
       # never be earned here by adding another job, which is the difference
