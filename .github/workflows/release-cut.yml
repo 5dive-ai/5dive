@@ -74,7 +74,10 @@ on:
         required: false
         default: patch
         type: choice
-        options: [patch, minor, major]
+        options:
+          - patch
+          - minor
+          - major
 
 concurrency:
   group: release-cut
