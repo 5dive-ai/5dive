@@ -41,6 +41,34 @@ decision to add one is ever wrong on its own merits. See
   re-sums the shards and prints the **un-sharded** total, because that total is the
   number the tiering exists to make legible and sharding is how you lose it.
 
+## Workflow files are linted, and the linter proves it fired (DIVE-2540)
+
+`yaml.safe_load` **accepts** a workflow file that GitHub cannot parse — expression
+substitution is a second layer on top of YAML, and it happens **before the shell
+exists**, so an Actions expression template inside a `#` comment in a `run:` block
+is still parsed.
+That made `release-cut.yml` — the only writer of a version in this repo —
+unparseable for 45 minutes on 2026-08-02 (DIVE-2539), and the run it produced said
+only *"This run likely failed because of a workflow file issue"*.
+
+- **`actionlint` is the only instrument that names it.** `.github/workflows/actionlint.yml`
+  runs it on every PR and every push to main; `scripts/git-hooks/pre-push` runs the
+  same script over the pushed revision when a push touches `.github/workflows`.
+- Locally: `bash scripts/actionlint-scan.sh` (exit **0** clean, **1** findings,
+  **2** *could not scan* — which is never a pass).
+- **The scan self-tests before it trusts a clean result.** Every way this gate can
+  break — missing binary, wrong flags, empty target set, a checker whose rule moved —
+  presents as "no findings", so the same binary with the same flags must first reject
+  `tests/fixtures/actionlint/canary-expression-in-run-comment.yml` *as an
+  `[expression]` error* and accept the known-good fixture next to it. If it does not,
+  the scan exits 2.
+- **shellcheck integration is off for now** (`--with-shellcheck` turns it on). The
+  tree emits three INFO findings today; a gate that is red on arrival gets disabled.
+- **Never write the expression delimiter literally inside a `run:` block**, including
+  in comments and error strings. At YAML level (`env:`, `with:`) it is a real comment
+  and harmless. Full write-up:
+  `community/wiki/an-actions-expression-is-parsed-inside-shell-comments.md`.
+
 ## Hard rule: no real PII in public artifacts (DIVE-1774)
 
 Never put real user ids, emails, phone numbers, or customer PII in anything that

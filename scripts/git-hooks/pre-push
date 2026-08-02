@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Fleet-wide pre-push guards: PII (DIVE-1797, enforcement follow-up to
-# DIVE-1774), release version-bump (DIVE-2065), and new-harness tree-naming
-# (DIVE-2286).
+# DIVE-1774), release version-bump (DIVE-2065), new-harness tree-naming
+# (DIVE-2286), and workflow-file parseability (DIVE-2540).
 #
 # WHY a local hook and not GitHub branch protection: our landing account is the
 # repo admin, so a required status check only gates EXTERNAL PRs, never our own
@@ -46,9 +46,18 @@
 # harness that later removes the line stays CI-only, which the contract test
 # already owns.
 #
+# WHAT the actionlint guard does (DIVE-2540): when the push touches
+# .github/workflows, runs scripts/actionlint-scan.sh over those files AS THEY
+# EXIST IN THE PUSHED REVISION. An Actions expression delimiter inside a shell
+# COMMENT made release-cut.yml unparseable for 45 minutes on 2026-08-02
+# (DIVE-2539) and yaml.safe_load accepted the file — expression parsing is a
+# second layer that only actionlint reads. Same script the CI job runs, so
+# neither can drift.
+#
 # DESIGN NOTES:
-#   - Calls scripts/pii-scan.sh, scripts/version-bump-guard.sh and
-#     scripts/harness-tree-guard.sh DIRECTLY. No forked scan logic here, so
+#   - Calls scripts/pii-scan.sh, scripts/version-bump-guard.sh,
+#     scripts/harness-tree-guard.sh and scripts/actionlint-scan.sh DIRECTLY.
+#     No forked scan logic here, so
 #     none can drift from its CI/README twin (DIVE-1797 requirement c;
 #     tests/names_the_tree_contract_unit.sh is the harness-tree guard's, over
 #     the whole corpus rather than just the push's added files).
@@ -60,19 +69,27 @@
 #     it fails closed if a bundle is ever committed to main again — but do
 #     NOT read its advice as current: nothing should bump FIVE_VERSION by
 #     hand any more (see CONTRIBUTING).
+#     DIVE-2540: the actionlint guard's CI twin is
+#     .github/workflows/actionlint.yml, which runs the same script — so the hook
+#     and the merge gate cannot disagree about what a valid workflow file is —
+#     and tests/actionlint_scan_unit.sh grades the script both call.
 #   - Installed fleet-wide via core.hooksPath=scripts/git-hooks, set once on the
 #     shared clone config so every linked worktree (and every future one)
 #     inherits it. See scripts/install-pii-push-guard.sh.
 #   - Threat model for PII is ACCIDENTAL fixture/log PII, not a malicious actor.
-#     Both guards fail OPEN with a warning if their script is missing (e.g. a
+#     Every guard here fails OPEN with a warning if its script is missing (e.g. a
 #     stale branch predating the guard) rather than blocking legitimate work;
 #     the matching CI job remains the post-hoc net for anything that slips past.
+#     The actionlint guard additionally fails open when the binary is not
+#     installed locally, which is the normal state of a fresh checkout — a guard
+#     that blocks every push on a tool nobody has is a guard that gets removed.
 set -uo pipefail
 
 TOP="$(git rev-parse --show-toplevel 2>/dev/null)" || exit 0
 SCAN="$TOP/scripts/pii-scan.sh"
 VERSION_GUARD="$TOP/scripts/version-bump-guard.sh"
 HARNESS_TREE_GUARD="$TOP/scripts/harness-tree-guard.sh"
+ACTIONLINT_SCAN="$TOP/scripts/actionlint-scan.sh"
 EMPTY_TREE=4b825dc642cb6eb9a060e54bf8d69288fbee4904
 Z40=0000000000000000000000000000000000000000
 
@@ -131,6 +148,55 @@ while read -r local_ref local_oid remote_ref remote_oid; do
     echo "harness-tree-guard: script not found ($HARNESS_TREE_GUARD); skipping (the CI contract test is the net)." >&2
   fi
 
+  # DIVE-2540: workflow files, scanned FROM THE PUSHED REVISION rather than the
+  # working tree — a hook that grades whatever happens to be on disk is making a
+  # claim about a different artifact than the one being published
+  # (tests/lib/grading_tree.sh, one level out).
+  #
+  # WHY A LOCAL HOOK EARNS ITS KEEP HERE SPECIFICALLY, and it is not "defence in
+  # depth": this repo's landing account is the repo ADMIN, so a required status
+  # check gates external PRs and NOT our own pushes to main. The DIVE-2539
+  # breakage took exactly that route. .github/workflows/actionlint.yml does run
+  # on push to main, but it can only redden AFTER the unparseable file is on
+  # main, which is where the 45 minutes went. This is the only stage that runs
+  # BEFORE it lands on that path.
+  if [[ -f "$ACTIONLINT_SCAN" ]] \
+     && [[ -n "$(git diff --name-only "$base" "$local_oid" -- .github/workflows 2>/dev/null)" ]]; then
+    wf_tmp="$(mktemp -d)"
+    if git archive "$local_oid" .github/workflows tests/fixtures/actionlint 2>/dev/null \
+         | tar -x -C "$wf_tmp" 2>/dev/null; then
+      # Run FROM the extracted root so findings print `.github/workflows/x.yml`
+      # rather than a path relative to a temp dir the author has never seen —
+      # the file name is the only part of the message that tells them where to
+      # look. Subshell: the scanner's own ROOT is unused here (both the targets
+      # and the canary fixtures are named explicitly, all from the pushed rev).
+      (
+        cd "$wf_tmp" || exit 2
+        shopt -s nullglob
+        wf_files=(.github/workflows/*.yml .github/workflows/*.yaml)
+        shopt -u nullglob
+        (( ${#wf_files[@]} )) || exit 0
+        ACTIONLINT_CANARY_BAD="$wf_tmp/tests/fixtures/actionlint/canary-expression-in-run-comment.yml" \
+        ACTIONLINT_CANARY_GOOD="$wf_tmp/tests/fixtures/actionlint/known-good-yaml-level-comment.yml" \
+          bash "$ACTIONLINT_SCAN" "${wf_files[@]}"
+      )
+      al_rc=$?
+      case "$al_rc" in
+        0) ;;
+        1) echo "actionlint-push-guard: the workflow files in this push do not parse (findings above)." >&2; rc=1 ;;
+        # FAILS OPEN, deliberately and narrowly. Exit 2 here is overwhelmingly
+        # "actionlint is not installed on this box", which is the normal state of
+        # a fresh checkout; blocking every push on a tool nobody has installed is
+        # how a guard gets removed. Said out loud rather than silently, and the
+        # CI job — which installs a pinned copy — is the hard gate.
+        *) echo "actionlint-push-guard: could not scan (exit $al_rc); skipping. Install actionlint locally to gate this before it lands; the CI actionlint job is the net." >&2 ;;
+      esac
+    else
+      echo "actionlint-push-guard: could not materialise the pushed workflow files; skipping (CI actionlint is the net)." >&2
+    fi
+    rm -rf "$wf_tmp"
+  fi
+
   # DIVE-2065: only fires on a push to main with an EXISTING remote main
   # (skip branch deletion, already `continue`d above; skip first-ever-push of
   # a new branch — main always already exists so $remote_oid is never Z40 for
@@ -150,6 +216,7 @@ if [[ $rc -ne 0 ]]; then
   echo "  pii-push-guard: scrub the real id/email/phone (use placeholders like <user-id>, 1234567890) and re-commit." >&2
   echo "  version-bump-guard: this should be unreachable since DIVE-2247 — the bundle is not tracked on main and FIVE_VERSION is assigned at tag time. If you are seeing this, a bundle has been committed to main; remove it rather than bumping the version by hand." >&2
   echo "  harness-tree-guard: paste the printed source-line snippet into the named harness and recommit." >&2
+  echo "  actionlint-push-guard: the named workflow file does not parse. Run: bash scripts/actionlint-scan.sh" >&2
   echo "  Emergency override (discouraged; the matching CI job is still the net): git push --no-verify" >&2
   exit 1
 fi
