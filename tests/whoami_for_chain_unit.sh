@@ -26,6 +26,7 @@
 #   J  a bad subject is exit 4, not a green empty chain
 #   K  DIVE-2518 divergent --from claim  -> measured, DERIVED actor + claimed_by
 #   L  divergent claim onto a placeholder-> unmeasurable  <-- K's differential
+#   M  lead:<agent> vs human:<agent>     -> measured vs unmeasurable, as a PAIR
 #
 # Run: bash tests/whoami_for_chain_unit.sh
 set -uo pipefail
@@ -283,6 +284,46 @@ l=$(run_json "$L")
 [[ "$(rc_of "$L")" == "1" ]] \
   && ok_t "L/DIFFERENTIAL: exit 1 — a clean-looking claim over a failed derivation is still a hole" \
   || bad_t "L/DIFFERENTIAL: expected exit 1" "got $(rc_of "$L")"
+
+# ── M: `lead:<agent>` is MEASURED where `human:<agent>` is not ───────────────
+# This distinction is LIVE, not hypothetical: DIVE-2517's gate.answered row on
+# this very board carries actor `lead:olivia`. It is also entirely a judgement,
+# so it gets an arm rather than an inference from the placeholder list.
+#
+# WHY THEY DIFFER. `human:<x>` is unmeasurable because NO field separates an
+# authorised human tap from an agent self-clear — `human=1` is a self-assertable
+# flag (gate-record-cannot-distinguish-tap-from-selfclear.md), and every `human:*`
+# name on the live board is an agent short-name. `lead:<x>` claims something
+# weaker and checkable: an AGENT cleared this in a lead role. The principal named
+# is a real board agent, so the chain can attribute it. Nothing about the ROLE is
+# verified here and this arm does not claim otherwise — only that the ACTOR is an
+# identity, which is the question --for asks.
+#
+# Asserted as a PAIR on the same fixture shape. Alone, the lead arm passes for a
+# verb that grades nothing at all; the human arm is what proves the two names take
+# genuinely different paths through the same check.
+M=$(add "M lead vs human on the same link" --assignee=dev)
+state "$M" created_at       '2026-07-31 15:00:00'
+state "$M" need_answered_at '2026-07-31 15:30:00'
+ev "$M" task.created  main          self '2026-07-31 15:00:00'
+ev "$M" gate.answered 'lead:olivia' self '2026-07-31 15:30:00'
+m=$(run_json "$M")
+[[ "$(v_of "$m" answered)" == "measured" ]] \
+  && ok_t "M: lead:<agent> is MEASURED — the actor is a real board identity, whatever the role claims" \
+  || bad_t "M: expected measured for lead:olivia" "got '$(v_of "$m" answered)'/'$(r_of "$m" answered)'"
+[[ "$(a_of "$m" answered)" == "lead:olivia" ]] \
+  && ok_t "M: the lead: prefix is preserved in the render, not silently stripped to a bare agent name" \
+  || bad_t "M: lead prefix lost" "got '$(a_of "$m" answered)'"
+
+MH=$(add "M/pair human on the same link" --assignee=dev)
+state "$MH" created_at       '2026-07-31 15:00:00'
+state "$MH" need_answered_at '2026-07-31 15:30:00'
+ev "$MH" task.created  main           self '2026-07-31 15:00:00'
+ev "$MH" gate.answered 'human:olivia' self '2026-07-31 15:30:00'
+mh=$(run_json "$MH")
+[[ "$(v_of "$mh" answered)" == "unmeasurable" && "$(v_of "$m" answered)" == "measured" ]] \
+  && ok_t "M/PAIR: the SAME name under human: is unmeasurable and under lead: is measured — the prefix is what moves the verdict" \
+  || bad_t "M/PAIR: the two prefixes did not diverge" "lead='$(v_of "$m" answered)' human='$(v_of "$mh" answered)' — one of them is grading nothing"
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]
