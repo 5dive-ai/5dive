@@ -38,6 +38,9 @@ set -uo pipefail
 . "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh" \
   || printf 'grading tree: UNRESOLVED (tests/lib/grading_tree.sh not reachable; no tree named)\n' >&2
 cd "$(dirname "$0")/.."
+# DIVE-2518: `--from` is provenance; TIER and ROUTING read the uid derivation, so an
+# arm impersonating a filer must DERIVE as them. tests/lib/actor_seam.sh.
+. "$(dirname "${BASH_SOURCE[0]}")/lib/actor_seam.sh"
 SRC=src
 TMP="$(mktemp -d /tmp/gate-route-delivery-unit.XXXXXX)"
 trap 'rm -rf "$TMP"' EXIT
@@ -220,7 +223,7 @@ eval "$_real_route"
 # re-nag sweep, the privileged re-send, a plain human gate) can fall into the
 # routed deliverer.
 reset_log; seed DIVE-13; HUMAN_PINGED=0; SEND_RC=0
-cmd_task_need DIVE-13 --type=decision --ask="ship?" --from=main >/dev/null 2>&1   # lead files → human
+actor_seam_as main; cmd_task_need DIVE-13 --type=decision --ask="ship?" --from=main >/dev/null 2>&1   # lead files → human
 [[ "$HUMAN_PINGED" == "1" ]] && ok_t "an UNROUTED gate still runs the human deliverer (dispatch is per-call)" \
   || bad_t "unrouted → human deliverer" "HUMAN_PINGED=$HUMAN_PINGED"
 # The stubbed human deliverer writes no row of its own, so the DIVE-1968 assertion
