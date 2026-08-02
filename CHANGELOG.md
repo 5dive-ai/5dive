@@ -1,5 +1,26 @@
 # Changelog
 
+## Unreleased — feat(actor): `5dive whoami`, one sealed actor derivation (DIVE-2517)
+
+The CLI had **six** actor derivations and they disagreed. Only one failed closed;
+the rest resolved identity from something the caller can set — `--from` on argv,
+`$USER`, `$SUDO_USER`, `FIVEDIVE_AUDIT_USER`, or an `agent-` username prefix —
+and none of them refused when they could not measure.
+
+`src/lib/actor.sh` promotes the uid-first resolver into the single derivation.
+Identity comes from `$EUID`, a kernel-backed bash builtin, mapped through
+`/etc/passwd` in pure bash — no `id`, no `getent`, both of which resolve through
+the caller's `PATH` (DIVE-2330). `$SUDO_UID` is honoured only at real EUID 0,
+where forging it would require already being root. Agent-ness is the registry's
+answer, never a username prefix. Authority is not redefined here: `_actor_authority`
+in `lib/audit.sh` already single-sources `root` / `sudo:<who>` / `self`, and the
+verb wires it.
+
+`5dive whoami` reports actor, authority and tier **with the source of each**, plus
+`--json`. An actor it cannot measure is an **exit 6**, not the word `unknown`
+printed with `rc=0` — that refusal is the point of the verb, and it is
+mutation-graded rather than asserted.
+
 ## Unreleased — fix(task): refuse a close that would REPLACE an already-closed row's result (DIVE-2464)
 
 `5dive task done <id> --result=...` on a row that was already done overwrote the result column and
