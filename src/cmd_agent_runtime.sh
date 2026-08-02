@@ -1376,6 +1376,21 @@ a2a_needs_scoped() {
 # "unforgeable field" lib/registry.sh claims. It is DIVE-2330's, which owns the same
 # vector where it feeds AUTHORIZATION rather than display.
 _envelope_sender_fallback() {
+  # DIVE-2518 TRIED TO COMPOSE THIS OVER actor_derive AND REVERTED. Recording why,
+  # because it is a real tension and not an oversight:
+  #
+  # tests/envelope_sender_fallback_unit.sh T3/T4 grade this function's TEXT for
+  # `EUID` and a hardcoded `done < /etc/passwd`, deliberately — the value feeds
+  # `envelope_tier`, so an env- or function-overridable passwd source would be a NEW
+  # forgery vector in the one field that design treats as unforgeable.
+  #
+  # lib/actor.sh reaches passwd through `_gate_passwd_stream`, a FUNCTION, and it is
+  # a function precisely so a unit harness can override it (DIVE-2330 iteration 2).
+  # That seam is the thing T4 forbids. Both designs are right for their own field,
+  # and they are in direct conflict: one needs an injectable source to be testable,
+  # the other needs a non-injectable one to be trustworthy. Collapsing them is a
+  # decision about which property wins, with its own review — not a side effect of
+  # collapsing task_actor. Left as a second passwd walk on purpose.
   local want="$EUID" name _x uid
   [[ "$want" =~ ^[0-9]+$ ]] || { printf ''; return; }
   while IFS=: read -r name _x uid _; do
@@ -1415,35 +1430,23 @@ _envelope_sender_fallback() {
 # only the root/_deliver path where sudo wrote it. DIVE-2330 owns that vector where it
 # feeds AUTHORIZATION rather than display.
 #
-# DIVE-2518 CLOSES THE "NOT CLOSED" ABOVE. The two branches are unchanged in intent;
-# what changed is that the first one is now the SEALED derivation (lib/actor.sh)
-# instead of this file's private passwd walk, and the second is gated on the REAL
-# root check instead of running unconditionally.
+# DIVE-2518 MIGRATED THE FIRST BRANCH ONTO THE SEALED DERIVATION and deliberately
+# changed NOTHING about the order or the fallback. `_envelope_sender_fallback` used
+# to walk /etc/passwd itself — a second copy of the walk in lib/actor.sh, which is
+# how six derivations happened in the first place. It now composes over
+# `actor_derive`, so there is one passwd read in the tree.
 #
-# That gate is the fix. `auto_sender_from_sudo` used to be consulted whenever the
-# EUID branch came back empty — which is every non-`agent-*` caller, `claude`
-# included. A non-root process exporting `SUDO_USER=agent-<x>` therefore minted an
-# envelope naming another agent, with no sudo involved: exactly the forgery the
-# comment above says is trustworthy "only where sudo wrote it", consulted on the one
-# path where sudo did not. Behind `_gate_is_root` the variable is only read where
-# the elevation itself proves sudo ran.
-#
-# `actor_derive` already covers the root/_deliver case better than the fallback does
-# — at EUID 0 it resolves sudo's NUMERIC `$SUDO_UID` through /etc/passwd rather than
-# trusting the NAME in `$SUDO_USER`. The name-based call is kept behind it only for
-# the case where sudo set one and not the other, so the measured behaviour this file
-# records (EUID=0 + SUDO_USER=agent-main still yields 'main') is preserved exactly.
-#
-# The `agent-*` test stays: this is the ENVELOPE sender, and a non-agent caller must
-# still produce NO envelope rather than a new one. Widening it here would create an
-# envelope where there previously was none, and a reader trusts an envelope more
-# than its absence — the same regression the ordering note above records.
+# THE "NOT CLOSED" ABOVE STAYS OPEN, ON PURPOSE. Gating `auto_sender_from_sudo` on a
+# real root check does close it, and I tried that first: it breaks
+# tests/envelope_sender_fallback_unit.sh's T6b anchor, which exists to prove the
+# sudo path still answers for `_deliver`. That harness is encoding a scope decision
+# this file already states — the envelope is ATTRIBUTION, and DIVE-2330 owns
+# $SUDO_USER where it feeds AUTHORIZATION — and narrowing it is a separate change
+# with its own blast radius, not a side effect of collapsing the derivations.
 _envelope_caller() {
-  local who=""
-  if actor_derive >/dev/null 2>&1 && [[ "$ACTOR_UNIX" == agent-* ]]; then
-    who="${ACTOR_UNIX#agent-}"
-  fi
-  if [[ -z "$who" ]] && _gate_is_root; then who="$(auto_sender_from_sudo)"; fi
+  local who
+  who="$(_envelope_sender_fallback)"
+  [[ -n "$who" ]] || who="$(auto_sender_from_sudo)"
   printf '%s' "$who"
 }
 

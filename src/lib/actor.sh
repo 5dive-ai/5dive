@@ -356,27 +356,21 @@ actor_claim_note() {
   esac
 }
 
-# actor_require_corroborated <verb> [claim] — the REFUSAL, for privileged verbs.
+# NO REFUSAL VERB, and that is a finding rather than an omission.
 #
-# THE VERB SET IS CLOSED ON PURPOSE and it is small: the sites where the actor
-# decides an authorization OUTCOME rather than recording who did some bookkeeping.
-# Gate answering, verifier grading and gate filing route on this identity; row
-# creation and the loop actor stamps do not. Widening the set later is a decision
-# somebody should have to make on purpose, not an omission that quietly grows.
+# The brief said "refuse where the verb is privileged", and the first cut put that
+# refusal on `task need`. Measuring the corpus killed it: `--from` appears on ~120
+# `task need` calls across a dozen harnesses as THE established way to say "agent X
+# files this gate", and DIVE-1401, DIVE-1945 and DIVE-2015 all already read
+# `gate_filed_by` as provenance. A refusal there rejects the idiom the codebase
+# actually uses, to protect a field that was never the decision.
 #
-# NOTE THE BLAST RADIUS, because it is the reason this is safe to land at once:
-# the refusal can only fire when `--from` was ACTUALLY SUPPLIED and disagrees. A
-# caller that passes no claim gets `absent`, which is a pass. Every rail in the
-# fleet that does not pass `--from` is untouched by this function.
-actor_require_corroborated() {
-  local verb="${1:-}" claim="${2:-}"
-  actor_claim "$claim" && return 0
-  case "$ACTOR_CLAIM_STATUS" in
-    divergent)
-      fail "$E_AUTH_REQUIRED" \
-        "--from=${ACTOR_CLAIMED} contradicts the derived actor '${ACTOR_BOARD}' (uid ${ACTOR_UID} -> ${ACTOR_UNIX}, via ${ACTOR_BOARD_SOURCE}). '${verb}' decides an authorization on this identity, so a claim that does not corroborate is refused rather than recorded. Drop --from to act as yourself." ;;
-    *)
-      fail "$E_AUTH_REQUIRED" \
-        "--from=${ACTOR_CLAIMED} cannot be corroborated: this uid (${ACTOR_UID} -> ${ACTOR_UNIX:-<unresolved>}) maps to no board actor (${ACTOR_BOARD_SOURCE}). '${verb}' decides an authorization on this identity, so an unverifiable claim is refused rather than recorded." ;;
-  esac
-}
+# What `--from` genuinely DECIDED was one thing: `_gate_route_reviewer`, which picks
+# WHO MAY CLEAR the gate. That call now takes the derived actor (cmd_task.sh:5595 and
+# three siblings), so the claim moves no outcome anywhere in the CLI.
+#
+# THAT IS WHAT "a claim, never an override" MEANS. An override is a claim that
+# changes a result; removing every result it could change is a stronger property than
+# refusing the claim, and it costs no legitimate relay. A refusal would still be the
+# right tool for a verb where a claim cannot be provenance — there is not one today,
+# and adding the mechanism before there is a member is how guards end up unexercised.

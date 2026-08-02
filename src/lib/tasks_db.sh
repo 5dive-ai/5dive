@@ -213,6 +213,18 @@ CREATE TABLE IF NOT EXISTS tasks (
   priority    TEXT NOT NULL DEFAULT 'medium',
   assignee    TEXT,
   created_by  TEXT,
+  -- DIVE-2518: the uid-derived actor, recorded ONLY when it differs from
+  -- created_by. `created_by` can legitimately name a principal with no uid at all
+  -- (`council`, `telegram`), so this is what makes a `--from` claim falsifiable
+  -- after the fact rather than the only identity on file.
+  --
+  -- MUST BE ADDED HERE **AND** in _tasks_db_migrate's array. A fresh store is built
+  -- from this schema and NEVER runs the migration (see tasks_db_init's if/else), so
+  -- a column added only to the array exists on every EXISTING board and on no NEW
+  -- one — and the failure lands on the first write to a brand-new store, which is
+  -- the one case a developer with a working board never exercises. Caught by
+  -- council_schedule_e2e, whose rig starts from an empty dir.
+  derived_actor TEXT,
   parent_id   INTEGER REFERENCES tasks(id) ON DELETE CASCADE,
   created_at  TEXT NOT NULL DEFAULT (datetime('now')),
   started_at  TEXT,
@@ -1020,7 +1032,7 @@ _tasks_db_migrate() {
            'originated_by_objective INTEGER' 'originated_cycle INTEGER' \
            'verify_unavailable INTEGER' 'last_skipped_at TEXT' \
            'human_evidence TEXT' \
-           'claimed_by TEXT'; do
+           'derived_actor TEXT'; do
     # DIVE-2418: herestring, NOT a pipe. `printf | grep -q` lets grep exit on its
     # first match while printf is still writing, and printf then takes SIGPIPE and
     # emits "write error: Broken pipe" on stderr. This runs from tasks_db_init on
@@ -1605,12 +1617,35 @@ ident_of() {
 # sites inherit the derivation without individually changing.
 #
 # The claim is NOT discarded. It is graded (`actor_claim`) and recorded where it
-# disagrees; privileged verbs refuse it outright via `actor_require_corroborated`.
+# disagrees, and no decision anywhere reads it (see the note at the end of
+# lib/actor.sh for why that replaced an outright refusal).
 # But this accessor runs inside `$( )` at nearly every call site, so the status it
 # sets dies with the subshell — a caller that needs the grade must use
 # `task_actor_claim` below, in its OWN shell.
 task_actor() {
   actor_claim "${1:-}" || true
+  # A SUPPLIED CLAIM IS STILL WHAT GETS STAMPED, and that is a correction to this
+  # ticket's first cut, forced by measurement rather than preference.
+  #
+  # The first cut returned the derivation unconditionally, so `--from` stamped
+  # nothing. That breaks relay for every principal WITHOUT A UID: `council` files
+  # board rows as `--from=council` and `cmd_task_clear_recs` answers as
+  # `--from=telegram`, and no /etc/passwd walk can ever produce either name. The
+  # derived value is not a better answer there — it is the wrong entity, and it
+  # silently reattributes the row to whoever happened to run the process.
+  #
+  # WHAT ACTUALLY CLOSED IS THE ENV PATH, which is the hole that was measured:
+  # `SUDO_USER=agent-olivia 5dive task ls --mine` acted as another agent with no
+  # privilege and left NO trace, because $SUDO_USER is an ordinary variable nothing
+  # verifies. `--from` is argv: deliberate, visible in the audit log, and the only
+  # way a uid-less principal can be named at all. Those are different threats and
+  # they do not get the same answer.
+  #
+  # So: no claim -> the DERIVATION (never $USER, never $SUDO_USER). A claim -> the
+  # claim, PROVENANCE, now always accompanied by the measured actor (`derived_actor`)
+  # so the row records who really ran it and a forged claim is falsifiable after the
+  # fact. Sites that DECIDE rather than record call `task_actor ""` explicitly.
+  [[ -n "${1:-}" ]] && { printf '%s' "$1"; return; }
   printf '%s' "$ACTOR_BOARD"
 }
 
@@ -2064,14 +2099,14 @@ ledger_emit() {
       claimed_by=*) claimed="${kv#*=}" ;;
     esac
   done
-  # DIVE-2518: a `--from` that did NOT corroborate the derived actor rides in the
-  # DETAIL, not in `actor`. `actor` stays the derived value so the column keeps one
-  # meaning across every row ever written; the claim is appended so a reader can see
-  # that this invocation asserted a different identity and the assertion lost.
+  # DIVE-2518: when the stamped actor is a CLAIM that the uid does not corroborate,
+  # the measured actor rides in the DETAIL. `actor` keeps its existing meaning (who
+  # the row is attributed to), and the reader gains the one thing the ledger could
+  # never say before: who actually ran it.
   # Folded into detail rather than a new column on purpose — lifecycle_events is
   # append-only history and an ALTER on it would leave every pre-existing row with a
   # NULL that reads as "no claim" when it actually means "not recorded yet".
-  if [[ -n "$claimed" ]]; then detail="${detail:+$detail }claimed_by=${claimed}"; fi
+  if [[ -n "$claimed" ]]; then detail="${detail:+$detail }derived_actor=${claimed}"; fi
   local in_hash out_hash
   in_hash=$(ledger_hash "$raw_in")
   out_hash=$(ledger_hash "$raw_out")

@@ -44,6 +44,9 @@ set -uo pipefail
 . "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh" \
   || printf 'grading tree: UNRESOLVED (tests/lib/grading_tree.sh not reachable; no tree named)\n' >&2
 cd "$(dirname "$0")/.."
+# DIVE-2518: `--from` no longer moves the actor — derive as the agent each arm
+# is impersonating. tests/lib/actor_seam.sh.
+. "$(dirname "${BASH_SOURCE[0]}")/lib/actor_seam.sh"
 SRC=src
 TMP="$(mktemp -d /tmp/gate-lead-clear-stamp.XXXXXX)"
 trap 'rm -rf "$TMP"' EXIT
@@ -109,7 +112,7 @@ mkgate() {
 reset
 SUDO_NONAGENT=1
 t1=$(mkgate "ship the persona batch" "fixture routed approval $FIXTURE_MARK")
-cmd_task_answer "$t1" --value="approved" --human --from=main >/dev/null 2>&1
+( actor_seam_as main; cmd_task_answer "$t1" --value="approved" --human --from=main >/dev/null 2>&1 )
 BY1=$(nby "$t1"); ROW1=$(row)
 if [[ "$BY1" == "lead:main" ]]; then
   ok_t "an uncorroborated --human on a lead-cleared gate stamps lead:main"
@@ -133,7 +136,7 @@ fi
 reset
 SUDO_NONAGENT=0            # non-agent SUDO_UID: a real human-evidence form
 t2=$(mkgate "ship the persona batch" "fixture routed approval, real human $FIXTURE_MARK")
-cmd_task_answer "$t2" --value="approved" --human --from=main >/dev/null 2>&1
+( actor_seam_as main; cmd_task_answer "$t2" --value="approved" --human --from=main >/dev/null 2>&1 )
 BY2=$(nby "$t2")
 if [[ "$BY2" == "human:main" ]]; then
   ok_t "a CORROBORATED --human still stamps human:main (no genuine tap relabelled)"
@@ -163,7 +166,7 @@ AUTH="nobody"
 t4=$(addt --assignee=dev -- "fixture unrouted decision $FIXTURE_MARK")
 cmd_task_need "$t4" --type=decision --options="A|B" --recommend="A" \
   --ask="pick one" --tier=1 >/dev/null 2>&1
-cmd_task_answer "$t4" --value="A" --human --from=lodar >/dev/null 2>&1
+( actor_seam_as lodar; cmd_task_answer "$t4" --value="A" --human --from=lodar >/dev/null 2>&1 )
 BY4=$(nby "$t4")
 if [[ "$BY4" == "human:lodar" ]]; then
   ok_t "a non-lead human answer keeps its human: stamp (fix is scoped to leads)"
@@ -183,7 +186,7 @@ SUDO_NONAGENT=1
 _gate_standing_lead() { printf 'main'; }
 t5=$(addt --assignee=dev -- "fixture standing approval $FIXTURE_MARK")
 cmd_task_need "$t5" --type=approval --ask="merge the CLI fix to main" --tier=1 >/dev/null 2>&1
-cmd_task_answer "$t5" --value="approved" --human --from=main >/dev/null 2>&1
+( actor_seam_as main; cmd_task_answer "$t5" --value="approved" --human --from=main >/dev/null 2>&1 )
 BY5=$(nby "$t5"); ROW5=$(row)
 if [[ "$BY5" == "lead:standing:main" ]]; then
   ok_t "a standing clear with no human evidence stamps lead:standing:main"

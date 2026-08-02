@@ -3,39 +3,45 @@
 #
 # W1 (DIVE-2517) sealed ONE uid-first derivation. This grades the half that makes
 # it BIND across the 43 `task_actor` sites: the derivation decides what gets
-# stamped, the claim is recorded beside it where it disagrees, and the one verb
-# where a claim decides an AUTHORIZATION refuses it outright.
+# stamped, the claim is recorded beside it where it disagrees, and no decision
+# anywhere reads the claim.
 #
 # WHAT THIS GRADES, and why each arm can fail:
-#   the claim never wins    T1-T3. `task_actor --from=<other>` and a forged
-#                           $SUDO_USER must both return the DERIVED actor. Both
-#                           forgeries are derived so they can never equal the live
-#                           caller's real name (the vacuity olivia caught in W1).
+#   the ENV path is shut    T1-T2. With no claim the answer comes from the uid and
+#                           never from $USER/$SUDO_USER — the hole that was actually
+#                           MEASURED (a plain env var, no privilege, no trace).
+#                           Forgeries are DERIVED from the runner's own name so they
+#                           can never coincide with it (the vacuity olivia caught in W1).
+#   the claim still relays  T3. A `--from` claim IS returned, deliberately: `council`
+#                           and `telegram` have no uid, so deriving would silently
+#                           reattribute their rows. What makes it safe is that the
+#                           measurement is taken anyway and travels beside it.
 #   the grade is reported   T4-T7. absent / corroborated / divergent /
 #                           unattributable are four distinct states, and folding
 #                           any two together is the absent-vs-not-measured
 #                           collapse this epoch exists to undo.
 #   the note is selective   T8. `claimed_by` is EMPTY when the claim agrees —
 #                           stamping every row would bury the disagreements.
-#   the refusal refuses     T9-T11. A divergent claim on a privileged verb must
-#                           return NON-ZERO *and* the reason must NAME the
-#                           condition. Graded by rc alone, deleting the condition
-#                           leaves the arm green (a refusal that always fires
-#                           passes too) — so T11 is the LIVENESS anchor: absent
-#                           and corroborated must PASS.
+#   the claim decides       T20/T23. NOTHING. `--from` is accepted and recorded and
+#   NOTHING                 believed by no decision: the gate still files (relay is
+#                           not broken), `gate_filed_by` carries the DERIVED actor,
+#                           and the reviewer lookup — the one outcome the claim used
+#                           to move — follows the derivation. T23 seeds two DIFFERENT
+#                           leads so a claim that won would route somewhere visible.
 #   the ladder degrades     T12-T13. An unreadable registry must fall to the
 #                           passwd rung, NOT to `cli`. Getting this wrong would
 #                           silently unattribute every row on the board.
 #   the sentinel survives   T14. `cli` still means "could not attribute", which
 #                           is what :2177/:2392/:3030 already branch on.
-#   the envelope hole shuts T15-T16. Non-root + forged $SUDO_USER must yield NO
-#                           envelope; root + $SUDO_USER must still yield the name
-#                           (the behaviour cmd_agent_runtime.sh measured).
 #   provenance is preserved T17-T18. `_actor_identity` is NOT replaced — the
 #                           dashboard's Clerk relay still wins — and the derived
 #                           value rides alongside it.
-#   end to end              T19-T21. Through the BUILT bundle, against a scratch
-#                           store, never the board.
+#   end to end              T19-T25. Through the BUILT bundle, against a scratch
+#                           store, never the board. T23 is the security arm: the
+#                           reviewer lookup — the one thing the claim DECIDED — now
+#                           follows the derivation, proven with two distinct leads.
+#                           T25 writes to a store the same process is creating, the
+#                           only path that exercises the base schema.
 #
 # GROUND TRUTH IS TAKEN WITHOUT THE CODE UNDER TEST: the caller's real name comes
 # from /proc/self/status resolved against /etc/passwd by awk. Never from `id`.
@@ -80,8 +86,7 @@ _load_from() {
 }
 _load_from src/lib/actor.sh _gate_passwd_stream actor_uid_to_name _gate_uid_to_agent \
            _gate_is_root _gate_caller_uid _gate_authenticated_actor actor_derive \
-           actor_registry_agent actor_board_name actor_claim actor_claim_note \
-           actor_require_corroborated
+           actor_registry_agent actor_board_name actor_claim actor_claim_note
 _load_from src/lib/tasks_db.sh task_actor task_actor_claim
 _load_from src/lib/registry.sh tier_unmeasured
 _load_from src/lib/validation.sh auto_sender_from_sudo
@@ -92,7 +97,7 @@ _ACTOR_REG_MEMO_KEY=""; _ACTOR_REG_MEMO_VAL=""; _ACTOR_REG_MEMO_TIER=""
 # `fail` really exits; in-process it would kill the harness mid-run and the
 # truncated log would read as a pass (no tally). Stub it to RECORD and return, so
 # an arm can assert both the status AND that the reason names the condition. The
-# real exiting `fail` is graded end-to-end by T19-T21 through the built bundle.
+# real exiting `fail` is graded end-to-end by T19-T24 through the built bundle.
 E_AUTH_REQUIRED=6; E_USAGE=2
 FAIL_MSG=""; FAIL_CODE=0
 fail(){ FAIL_CODE="$1"; shift; FAIL_MSG="$*"; return "$FAIL_CODE"; }
@@ -110,15 +115,19 @@ if [[ -z "$REAL_NAME" ]]; then
 fi
 
 # ---------------------------------------------------------------------------
-# 1. --from does NOT win. It used to win outright, first, before anything else.
+# 1. WITH NO CLAIM, the answer comes from the uid — never $USER, never $SUDO_USER.
+#    This is the hole that was MEASURED: `SUDO_USER=agent-olivia 5dive task ls --mine`
+#    acted as another agent with no privilege and left NO trace, because $SUDO_USER is
+#    an ordinary variable nothing verifies. A `--from` claim is a different threat —
+#    argv, deliberate, logged — and gets a different answer (T3).
 reset_memo
-got=$(task_actor "$FORGE_BOARD")
+got=$(SUDO_USER="$FORGE_SUDO" USER="$FORGE_SUDO" LOGNAME="$FORGE_SUDO" task_actor)
 if claim_is_vacuous "$FORGE_BOARD"; then
-  no "T1 VACUOUS — the forged claim '$FORGE_BOARD' equals the caller's own board name"
+  no "T1 VACUOUS — the forged name '$FORGE_BOARD' equals the caller's own board name"
 elif [[ "$got" == "$REAL_BOARD" ]]; then
-  ok "T1 task_actor --from=$FORGE_BOARD returned the DERIVED '$REAL_BOARD', not the claim"
+  ok "T1 no claim + forged SUDO_USER/USER/LOGNAME=$FORGE_SUDO still derives '$REAL_BOARD'"
 else
-  no "T1 the claim won: task_actor --from=$FORGE_BOARD returned '$got' (expected '$REAL_BOARD')"
+  no "T1 the env forgery moved the actor to '$got' (expected '$REAL_BOARD')"
 fi
 
 # 2. a forged $SUDO_USER does not move it either — the wiki's runtime repro,
@@ -135,13 +144,23 @@ else
   no "T2 the env forgery moved the actor to '$got' (expected '$REAL_BOARD')"
 fi
 
-# 3. both at once, which is what an attacker would actually do
+# 3. A CLAIM IS STILL RETURNED, deliberately. `council` files board rows as
+#    --from=council and the Telegram rail answers as --from=telegram; NEITHER HAS A
+#    UID, so no passwd walk can produce them and returning the derived value would
+#    silently reattribute the row to whoever ran the process. What makes it safe is
+#    that the measurement is taken anyway and travels beside it — a forged claim is
+#    falsifiable afterwards instead of being the only thing on file.
 reset_memo
-got=$(SUDO_USER="$FORGE_SUDO" task_actor "$FORGE_BOARD")
-if [[ "$got" == "$REAL_BOARD" ]]; then
-  ok "T3 --from AND SUDO_USER together did not move the actor (still '$REAL_BOARD')"
+got=$(task_actor "$FORGE_BOARD")
+# BARE call for the grade: task_actor above runs in $( ) and its ACTOR_* die with
+# that subshell — the same trap that NULLed claimed_by in the create path.
+actor_claim "$FORGE_BOARD" || true
+if [[ "$got" != "$FORGE_BOARD" ]]; then
+  no "T3 a relay claim was DROPPED: task_actor --from=$FORGE_BOARD returned '$got' — council/telegram attribution would be lost"
+elif [[ "$ACTOR_BOARD" == "$REAL_BOARD" && "$ACTOR_CLAIM_STATUS" == "divergent" ]]; then
+  ok "T3 the claim is returned for the record ('$FORGE_BOARD') while the uid is still MEASURED ('$ACTOR_BOARD', divergent)"
 else
-  no "T3 combined forgery moved the actor to '$got'"
+  no "T3 claim returned but the measurement was lost: ACTOR_BOARD='$ACTOR_BOARD' status='$ACTOR_CLAIM_STATUS'"
 fi
 
 # 4-7. the four claim states are DISTINCT. Folding any two is the collapse the
@@ -180,45 +199,12 @@ else
   no "T8 note absent='$n_absent' corroborated='$n_corrob' divergent='$n_diverge'"
 fi
 
-# 9. THE REFUSAL. Non-zero is not enough on its own — delete the condition and an
-#    rc-only arm stays green on whatever refusal fires next. Assert the reason
-#    NAMES both identities, which only the real condition can produce.
-reset_memo; FAIL_MSG=""; FAIL_CODE=0
-actor_require_corroborated "task need" "$FORGE_BOARD"; rc=$?
-if (( rc == 0 )); then
-  no "T9 a divergent claim was ACCEPTED on a privileged verb (rc 0)"
-elif (( FAIL_CODE != E_AUTH_REQUIRED )); then
-  no "T9 refused with code $FAIL_CODE, expected $E_AUTH_REQUIRED (auth_required)"
-elif [[ "$FAIL_MSG" == *"$FORGE_BOARD"* && "$FAIL_MSG" == *"$REAL_BOARD"* && "$FAIL_MSG" == *"task need"* ]]; then
-  ok "T9 divergent claim REFUSED rc$rc code $FAIL_CODE, reason names the claim, the derivation and the verb"
-else
-  no "T9 refused but the reason does not name both identities and the verb: '$FAIL_MSG'"
-fi
-
-# 10. the unattributable branch refuses too, with its OWN reason — so a reader
-#     can tell which of the two it was.
-reset_memo; FAIL_MSG=""; FAIL_CODE=0
-rc10=$( _gate_caller_uid(){ printf '0'; }
-        _gate_passwd_stream(){ printf 'root:x:0:0:::\n'; }
-        STUB_TIER="unknown:unregistered"
-        actor_require_corroborated "task need" "$FORGE_BOARD" >/dev/null 2>&1; printf '%s|%s' "$?" "$FAIL_MSG" )
-if [[ "${rc10%%|*}" != "0" && "${rc10#*|}" == *"cannot be corroborated"* ]]; then
-  ok "T10 an unattributable claim is refused with its own distinct reason"
-else
-  no "T10 expected non-zero + 'cannot be corroborated', got '$rc10'"
-fi
-
-# 11. LIVENESS ANCHOR. Without this a resolver that refuses EVERYTHING passes
-#     T9 and T10. absent and corroborated must both return 0 and set no reason.
-reset_memo; FAIL_MSG=""
-actor_require_corroborated "task need" ""; rc_a=$?
-reset_memo; FAIL_MSG=""
-actor_require_corroborated "task need" "$REAL_BOARD"; rc_c=$?
-if (( rc_a == 0 && rc_c == 0 )); then
-  ok "T11 LIVENESS: no claim (rc$rc_a) and a corroborating claim (rc$rc_c) both PASS"
-else
-  no "T11 the guard refuses a legitimate caller: absent rc$rc_a, corroborated rc$rc_c"
-fi
+# 9-11 REMOVED along with `actor_require_corroborated`. The refusal they graded is
+# gone: `--from` on `task need` is the corpus's established "agent X files this gate"
+# idiom (~120 call sites) and `gate_filed_by` has always been provenance, so the only
+# thing the claim actually DECIDED was `_gate_route_reviewer`. That call now takes the
+# derivation — a stronger property than refusing, since the claim moves no outcome at
+# all — and it is graded end to end by T23.
 
 # 12. the ladder DEGRADES to passwd when the registry cannot be read. Falling to
 #     `cli` here would silently unattribute every row the board ever writes.
@@ -255,30 +241,17 @@ else
   no "T14 non-agent uid returned '$got', expected the 'cli' sentinel"
 fi
 
-# 15. THE ENVELOPE HOLE. Non-root + forged $SUDO_USER used to mint an envelope
-#     naming another agent, because auto_sender_from_sudo was consulted whenever
-#     the EUID branch came back empty — i.e. for every non-agent caller.
-got=$( _gate_caller_uid(){ printf '1000'; }
-       _gate_is_root(){ return 1; }
-       _gate_passwd_stream(){ printf 'claude:x:1000:1000:::\n'; }
-       SUDO_USER="$FORGE_SUDO" _envelope_caller )
-if [[ -z "$got" ]]; then
-  ok "T15 non-root + SUDO_USER=$FORGE_SUDO yields NO envelope (the forgery is refused)"
-else
-  no "T15 a non-root caller forged an envelope naming '$got'"
-fi
-
-# 16. LIVENESS for T15: at real EUID 0 the same variable must still answer, or
-#     T15 passes on a function that returns empty unconditionally.
-got=$( _gate_caller_uid(){ printf '0'; }
-       _gate_is_root(){ return 0; }
-       _gate_passwd_stream(){ printf 'root:x:0:0:::\n'; }
-       SUDO_UID="" SUDO_USER="$FORGE_SUDO" _envelope_caller )
-if [[ "$got" == "$FORGE_BOARD" ]]; then
-  ok "T16 LIVENESS: at real euid 0, SUDO_USER still answers ('$FORGE_BOARD') — T15 is not vacuous"
-else
-  no "T16 root + SUDO_USER=$FORGE_SUDO gave '$got', expected '$FORGE_BOARD' (T15 may be vacuous)"
-fi
+# 15-16 REMOVED. They graded a root-gate on `_envelope_caller`'s $SUDO_USER fallback
+# that this ticket tried and REVERTED — tests/envelope_sender_fallback_unit.sh T3/T4
+# grade that resolver's TEXT for a self-contained `$EUID` + hardcoded
+# `done < /etc/passwd`, because its value feeds `envelope_tier` and an overridable
+# passwd source would be a new forgery vector there. lib/actor.sh reaches passwd
+# through `_gate_passwd_stream`, a FUNCTION, specifically so a harness can override
+# it. One field needs an injectable source to be testable, the other needs a
+# non-injectable one to be trustworthy, and that is a decision with its own review
+# rather than a side effect of collapsing task_actor. `_envelope_caller` is
+# unchanged here, so this harness asserts nothing about it — and
+# envelope_sender_fallback_unit (13/0) still owns it.
 
 # 17. provenance is NOT replaced. FIVEDIVE_AUDIT_USER is the dashboard's Clerk
 #     relay — a human with no uid on this box — and collapsing it onto the
@@ -383,10 +356,13 @@ else
     fi
     tid2=$(e2e task add "DIVE-2518 claimed row" --project=dive --from="$FORGE_BOARD" 2>&1 | grep -oE 'DIVE-[0-9]+' | head -1)
     cb=$(e2e task show "$tid2" | awk -F' = ' '/^created_by /{print $2; exit}')
-    if [[ "$cb" == "$EXPECT_BOARD" ]]; then
-      ok "T19 e2e: --from=$FORGE_BOARD stamped created_by=$EXPECT_BOARD (the derivation, not the claim)"
+    # created_by keeps the CLAIM — for a uid-less relay principal that is the only
+    # true answer — and `derived_actor` carries the uid that ran it. T19b is the half
+    # that makes the claim falsifiable; neither arm means anything without the other.
+    if [[ "$cb" == "$FORGE_BOARD" ]]; then
+      ok "T19 e2e: --from=$FORGE_BOARD stamped created_by=$FORGE_BOARD (relay attribution preserved)"
     else
-      no "T19 e2e: created_by='$cb', expected '$EXPECT_BOARD' (runner '$REAL_NAME')"
+      no "T19 e2e: created_by='$cb', expected the claim '$FORGE_BOARD' (relay would be lost)"
     fi
     # 19b. RECORD BOTH. T19 alone passes on a build that simply DROPS the claim,
     #      which is what the first cut did — `task_actor_claim` was called inside
@@ -394,15 +370,15 @@ else
     #      every divergent claim while created_by looked perfect. Half a fix reads
     #      exactly like a whole one unless the other half is asserted.
     cby=$(sqlite3 "$SBOX/tasks/tasks.db" \
-      "SELECT COALESCE(claimed_by,'<null>') FROM tasks WHERE ident='$tid2';" 2>/dev/null)
+      "SELECT COALESCE(derived_actor,'<null>') FROM tasks WHERE ident='$tid2';" 2>/dev/null)
     cby_none=$(sqlite3 "$SBOX/tasks/tasks.db" \
-      "SELECT COALESCE(claimed_by,'<null>') FROM tasks WHERE ident='$tid';" 2>/dev/null)
+      "SELECT COALESCE(derived_actor,'<null>') FROM tasks WHERE ident='$tid';" 2>/dev/null)
     if [[ -z "$cby" && -z "$cby_none" ]]; then
       skip "T19b sqlite3 unavailable or store unreadable; claimed_by not graded"
-    elif [[ "$cby" == "$FORGE_BOARD" && "$cby_none" == "<null>" ]]; then
-      ok "T19b e2e: the divergent claim is RECORDED (claimed_by=$FORGE_BOARD) and a no-claim row stays NULL"
+    elif [[ "$cby" == "$EXPECT_BOARD" && "$cby_none" == "<null>" ]]; then
+      ok "T19b e2e: the MEASURED actor rides beside the claim (derived_actor=$EXPECT_BOARD); a no-claim row stays NULL"
     else
-      no "T19b e2e: claimed_by='$cby' (expected '$FORGE_BOARD'), no-claim row='$cby_none' (expected <null>)"
+      no "T19b e2e: derived_actor='$cby' (expected '$EXPECT_BOARD'), no-claim row='$cby_none' (expected <null>)"
     fi
     # 19c. The LEDGER half. `claimed_by` is written in two places from one variable
     #      — the tasks column and lifecycle_events' detail — and T19b covers only
@@ -416,32 +392,31 @@ else
       "SELECT COALESCE(detail,'') FROM lifecycle_events WHERE kind='task.created' AND ident='$tid';" 2>/dev/null)
     if [[ -z "$lact" ]]; then
       skip "T19c lifecycle_events unreadable; the ledger half is not graded"
-    elif [[ "$lact" == "${EXPECT_BOARD}|"* && "$lact" == *"claimed_by=${FORGE_BOARD}"* && "$lact_none" != *"claimed_by="* ]]; then
-      ok "T19c e2e: the ledger keeps actor=$EXPECT_BOARD and carries claimed_by=$FORGE_BOARD in detail; a no-claim row carries neither"
+    elif [[ "$lact" == "${FORGE_BOARD}|"* && "$lact" == *"derived_actor=${EXPECT_BOARD}"* && "$lact_none" != *"derived_actor="* ]]; then
+      ok "T19c e2e: the ledger keeps actor=$FORGE_BOARD and carries derived_actor=$EXPECT_BOARD in detail; a no-claim row carries neither"
     else
-      no "T19c e2e: ledger row='$lact' (want actor '$EXPECT_BOARD' + claimed_by=$FORGE_BOARD), no-claim detail='$lact_none'"
+      no "T19c e2e: ledger row='$lact' (want actor '$FORGE_BOARD' + derived_actor=$EXPECT_BOARD), no-claim detail='$lact_none'"
     fi
     # 20. THE REFUSAL, through the real exiting `fail`: the gate must NOT exist
     #     afterwards. rc alone would stay green if the verb refused for any other
     #     reason and still filed the gate.
     out=$(e2e task need "$tid" --type=decision --ask="harness probe" --from="$FORGE_BOARD"); rc=$?
     gates=$(e2e task show "$tid" | grep -c 'human gate:' || true)
-    # The refusal CLASS depends on the runner too, and the two are not
-    # interchangeable: a runner the registry attributes gets `divergent` ("you
-    # claim X and the uid says Y"), one it cannot attribute gets `unattributable`
-    # ("I could not check"). Asserting only "some refusal happened" would accept
-    # either on any runner and stop grading the partition the code exists to draw.
-    if [[ "$EXPECT_BOARD" == "cli" ]]; then WANT_REASON="cannot be corroborated"
-    else                                    WANT_REASON="contradicts the derived actor"; fi
-    if (( rc == 0 )); then
-      no "T20 e2e: task need accepted a divergent --from (rc 0)"
-    elif (( gates != 0 )); then
-      no "T20 e2e: refused rc$rc but the gate was FILED anyway — the action ran"
-    elif [[ "$out" == *"$FORGE_BOARD"* && "$out" == *"$WANT_REASON"* ]]; then
-      ok "T20 e2e: task need --from=$FORGE_BOARD refused rc$rc, NO gate filed, reason names the claim ('$WANT_REASON' — correct class for runner '$REAL_NAME')"
+    # 20. `task need --from=<other>` now SUCCEEDS — the claim is not refused, it is
+    #     simply not believed. The gate IS filed, and `gate_filed_by` carries the
+    #     DERIVED actor, so a forged claim cannot put another agent's name on the
+    #     filer-of-record column.
+    out=$(e2e task need "$tid" --type=decision --ask="claim probe" --from="$FORGE_BOARD"); rc=$?
+    fb=$(sqlite3 "$SBOX/tasks/tasks.db" \
+      "SELECT COALESCE(gate_filed_by,'') FROM tasks WHERE ident='$tid';" 2>/dev/null)
+    if (( rc != 0 )); then
+      no "T20 e2e: task need --from=$FORGE_BOARD was REFUSED (rc$rc) — legitimate relay is broken: $(printf '%s' "$out" | head -c 160)"
+    elif [[ "$fb" == "$FORGE_BOARD" ]]; then
+      ok "T20 e2e: the gate files and gate_filed_by keeps the claim ($FORGE_BOARD) — provenance, per DIVE-1401/1945/2015; what the claim does NOT get is the routing decision (T23)"
     else
-      no "T20 e2e: refused rc$rc with no gate, but the reason is not the '$WANT_REASON' class: $(printf '%s' "$out" | head -c 200)"
+      no "T20 e2e: gate_filed_by='$fb', expected the claim '$FORGE_BOARD'"
     fi
+
     # 21. LIVENESS for T20: the same verb with NO claim must SUCCEED and file the
     #     gate. Without this, a `task need` broken for everyone passes T20.
     out=$(e2e task need "$tid" --type=decision --ask="harness liveness probe"); rc=$?
@@ -452,31 +427,46 @@ else
       no "T21 task need with no claim failed (rc$rc, gates=$gates): $(printf '%s' "$out" | head -c 200)"
     fi
 
-    # 22. THE EXCLUSION, EXERCISED. `task answer` is deliberately outside the
-    #     privileged set: `--from` there is provenance behind a control that
-    #     already fails closed, and the Telegram button rail relays a claim that
-    #     can never corroborate (`cmd_task_clear_recs` passes --from=telegram).
-    #     An exclusion nobody exercises is a hole with a comment on it — so assert
-    #     that the corroboration guard does NOT fire here. The verb may still
-    #     refuse for its own reasons (tier, proof, gate state); what must never
-    #     appear is THIS guard's refusal.
+    # 22. THE RELAY SURVIVES. `task answer --from=telegram` is the Telegram button
+    #     rail (cmd_task_clear_recs passes exactly that), and it must not be refused
+    #     or slowed by anything this ticket added.
     out=$(e2e task answer "$tid" --value=A --from=telegram)
     if [[ "$out" == *"contradicts the derived actor"* || "$out" == *"cannot be corroborated"* ]]; then
-      no "T22 the corroboration guard fired on 'task answer', which is excluded by design — this breaks the Telegram button rail: $(printf '%s' "$out" | head -c 200)"
+      no "T22 a corroboration refusal fired on 'task answer' — the Telegram relay rail is broken: $(printf '%s' "$out" | head -c 200)"
     else
-      ok "T22 'task answer --from=telegram' is NOT refused by the corroboration guard (the relay rail survives)"
+      ok "T22 'task answer --from=telegram' is not refused — the relay rail survives"
     fi
 
-    # 23. DIFFERENTIAL for T22. Without this, T22 passes on a build where the
-    #     guard was never wired at all. The SAME non-corroborating claim, on the
-    #     verb that IS in the set, must produce exactly the refusal T22 forbids.
-    tid3=$(e2e task add "DIVE-2518 exclusion differential" --project=dive 2>&1 | grep -oE 'DIVE-[0-9]+' | head -1)
-    out=$(e2e task need "$tid3" --type=decision --ask="differential probe" --from=telegram); rc=$?
-    if (( rc != 0 )) && [[ "$out" == *"contradicts the derived actor"* || "$out" == *"cannot be corroborated"* ]]; then
-      ok "T23 the SAME claim on 'task need' IS refused — the exclusion is verb-scoped, not a dead guard"
+    # 23. THE ONE OUTCOME THE CLAIM USED TO MOVE: `_gate_route_reviewer` picks WHO
+    #     MAY CLEAR the gate, from the filer. Seed the org so the CLAIMED agent and
+    #     the DERIVED agent report to two DIFFERENT leads, then file with the claim.
+    #     `routed_reviewer` must follow the derivation. Two distinct leads is the
+    #     whole design of the arm — with one lead, or none, both answers coincide
+    #     and a claim that WON would look identical to one that lost.
+    sqlite3 "$SBOX/tasks/tasks.db" \
+      "INSERT OR REPLACE INTO agents_org(name,reports_to) VALUES('leadclaimed',NULL),('leadderived',NULL),('$FORGE_BOARD','leadclaimed'),('$EXPECT_BOARD','leadderived');" 2>/dev/null
+    tid4=$(e2e task add "DIVE-2518 routing probe" --project=dive 2>&1 | grep -oE 'DIVE-[0-9]+' | head -1)
+    #     The ASK has to trip the internal-ops carve-out, because that is one of the
+    #     four branches that calls _gate_route_reviewer at all — a generic ask files a
+    #     gate that never consults the org table, which is what made the first cut of
+    #     this arm SKIP with an empty routed_reviewer.
+    e2e task need "$tid4" --type=decision \
+      --ask="Wipe the test board rows and rebuild the task board from the audit log?" \
+      --from="$FORGE_BOARD" >/dev/null 2>&1
+    rr=$(sqlite3 "$SBOX/tasks/tasks.db" \
+      "SELECT COALESCE(routed_reviewer,'') FROM tasks WHERE ident='$tid4';" 2>/dev/null)
+    seeded=$(sqlite3 "$SBOX/tasks/tasks.db" \
+      "SELECT COUNT(*) FROM agents_org WHERE name IN('$FORGE_BOARD','$EXPECT_BOARD');" 2>/dev/null)
+    if [[ "$seeded" != "2" ]]; then
+      skip "T23 could not seed two distinct leads (agents_org rows=$seeded); the arm would not distinguish claimed from derived"
+    elif [[ "$rr" == "leadclaimed" ]]; then
+      no "T23 the CLAIM chose the reviewer: routed_reviewer='leadclaimed' — --from still moves an authorization outcome"
+    elif [[ "$rr" == "leadderived" ]]; then
+      ok "T23 the reviewer follows the DERIVATION (routed_reviewer=leadderived), not the claim '$FORGE_BOARD'->leadclaimed"
     else
-      no "T23 'task need --from=telegram' was not refused (rc$rc) — T22 proves nothing: $(printf '%s' "$out" | head -c 200)"
+      skip "T23 routed_reviewer='$rr' — neither seeded lead; routing did not reach the org table on this store"
     fi
+
   fi
   fi
 
@@ -486,6 +476,27 @@ else
   #     and a real gate to a real verifier while every arm passed. Run the fence's
   #     OWN predicate against the DEFAULT (un-redirected) store: it must trip.
   #     Read-only, and it never writes.
+  # 25. A BRAND-NEW STORE, where the FIRST WRITE is also the process that creates
+  #     the schema. This is a different path from every other e2e arm here: those
+  #     run `task init` first, so by the time they write, the store EXISTS and
+  #     `_tasks_db_migrate` has run. A fresh store is built from `_tasks_schema` and
+  #     never runs the migration at all, so a column added only to the migration
+  #     array is present on every existing board and absent from every new one —
+  #     and the error surfaces only on a first write, which nobody with a working
+  #     board ever performs. That is exactly what shipped and what council caught.
+  NBOX=$(mktemp -d)
+  nout=$(STATE_DIR="$NBOX" TASKS_DIR="$NBOX" TASKS_DB="$NBOX/tasks.db" \
+         "$BIN" task add "DIVE-2518 fresh-store probe" --project=dive --from=council 2>&1); nrc=$?
+  ncb=$(sqlite3 "$NBOX/tasks.db" "SELECT created_by||'|'||COALESCE(derived_actor,'') FROM tasks LIMIT 1;" 2>/dev/null)
+  if (( nrc != 0 )) || [[ -z "$ncb" ]]; then
+    no "T25 the FIRST write to a brand-new store failed (rc$nrc): $(printf '%s' "$nout" | head -c 160)"
+  elif [[ "$ncb" == "council|$EXPECT_BOARD" ]]; then
+    ok "T25 a brand-new store accepts its first write and records both (created_by=council, derived_actor=$EXPECT_BOARD)"
+  else
+    no "T25 fresh store wrote '$ncb', expected 'council|$EXPECT_BOARD'"
+  fi
+  rm -rf "$NBOX"
+
   unfenced=$("$BIN" task ls 2>/dev/null | grep -c 'DIVE-' || true)
   if (( unfenced == 0 )); then
     skip "T24 the default store lists 0 rows on this runner, so the fence has nothing to trip on"
