@@ -180,6 +180,7 @@ poll_run(){ # $1.. = one check-runs fixture per look ; echoes "<verdict> looks=<
   # that — correctly — as NOT-REACHED, so the never-settles arm graded the stub's
   # bug and not the guard's behaviour.
   out=$(runs="$1" sha=deadbeefcafe tag=v9.9.9 POLLDIR="$POLLDIR" NFIX="$#" \
+        GITHUB_RUN_ID="${POLL_RUNID:-}" \
         RELEASE_CUT_POLL_SECONDS="${POLL_BUDGET:-30}" RELEASE_CUT_POLL_INTERVAL=1 bash -c '
     set -uo pipefail
     _ci_fetch_runs(){
@@ -221,6 +222,28 @@ ok "in-flight then RED -> RED"                     "$(poll_run "$INFLIGHT" "$RED
 # A short budget here: the assertion is that expiry REFUSES, not how long it waits.
 ok "never settles -> still refuses at the deadline" "$(POLL_BUDGET=3 poll_run "$INFLIGHT" | cut -d' ' -f1)" "IN-FLIGHT"
 ok "never reached -> still refuses at the deadline" "$(POLL_BUDGET=3 poll_run "" | cut -d' ' -f1)" "NOT-REACHED"
+
+echo "== DIVE-2466: an UNATTRIBUTABLE red is deferred, not acted on =="
+# The window nobody had exercised. Every poll arm above runs with GITHUB_RUN_ID UNSET,
+# so the self/sibling filter never engages in them; every sibling arm above hands the
+# board over in ONE look, so the filter always has the self row. The race lives in the
+# intersection: filter ON, self row NOT YET in the board. Then `_self_name` is empty,
+# sibling `cut` rows are not dropped, and the RED branch used to exit on look 1 before
+# any re-fetch could find the self row — the self-latching poison this ticket exists to
+# kill, alive in the one place the suite could not see.
+# MEASURED against the pristine block 2026-08-02: RED, looks=1, rc=1.
+RACE_L1=$(printf 'scan\tcompleted\tsuccess\t%s\ncut\tcompleted\tfailure\t%s' "$OTHER_URL" "$SIB_URL")
+RACE_L2=$(printf 'scan\tcompleted\tsuccess\t%s\ncut\tcompleted\tfailure\t%s\ncut\tin_progress\tpending\t%s' "$OTHER_URL" "$SIB_URL" "$SELF_URL")
+ok "self row absent on look 1 -> defer the red, drop the sibling on look 2" \
+   "$(POLL_RUNID=30332498204 poll_run "$RACE_L1" "$RACE_L2")" "GREEN looks=2"
+# The deferral must NOT have widened into "ignore reds while unattributable forever":
+# once our own row is present the sibling is droppable and a THIRD-PARTY red still bites.
+RACE_REAL=$(printf 'test\tcompleted\tfailure\t%s\ncut\tin_progress\tpending\t%s' "$OTHER_URL" "$SELF_URL")
+ok "a third-party red still REFUSES once the self row is visible" \
+   "$(POLL_RUNID=30332498204 poll_run "$RACE_REAL" "$RACE_REAL")" "RED looks=1"
+# And with no run id at all the deferral is inert — unchanged behaviour for that path.
+ok "no GITHUB_RUN_ID -> a red is still immediate" \
+   "$(poll_run "$REDB" "$GREENB")" "RED looks=1"
 
 echo "== DIVE-2466: the poll budget is a CEILING the env knob can only tighten =="
 # A caller that could WIDEN it could park this job on a runner for hours. Tightening is
@@ -315,6 +338,18 @@ fi
 # board that goes green on look 2 is never seen and the day is skipped exactly as
 # before the fix. This is the arm that proves the polling is the fix rather than the
 # loop being decorative.
+# (a4) DIVE-2466: remove the unattributable-red deferral — the latch must return.
+# Without this arm the deferral is unpinned and the next refactor re-introduces a
+# permanent self-latch that only fires on a race nobody reproduces by hand.
+if m=$(mutate 's|if \[\[ -n "$bad" && -n "${GITHUB_RUN_ID:-}" && -z "$_self_name" \]\]; then|if false; then|' GUARD); then
+  GUARD_SAVE="$GUARD"; GUARD="$m"
+  ok "MUTANT drop the unattributable-red deferral: the latch returns" \
+     "$(POLL_RUNID=30332498204 poll_run "$RACE_L1" "$RACE_L2")" "RED looks=1"
+  GUARD="$GUARD_SAVE"
+else
+  vacuous "drop the unattributable-red deferral"
+fi
+
 if m=$(mutate 's/runs=\$(_ci_fetch_runs)$/:/' GUARD); then
   GUARD_SAVE="$GUARD"; GUARD="$m"
   ok "MUTANT drop the re-read: in-flight then green stops reaching GREEN" \
