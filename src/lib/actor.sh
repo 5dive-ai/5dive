@@ -163,9 +163,23 @@ actor_derive() {
 # `agent-` strip is a LOOKUP CANDIDATE, not the decision. The registry answers.
 #
 # agent_tier's three-way split is load-bearing here:
-#   a real tier / unknown:no-tier   the key IS under .agents  -> registered
+#   a real tier                     registered, tier usable
+#   unknown:no-tier                 the key IS under .agents, isolation absent
+#   unknown:malformed-tier          the key IS under .agents, isolation unusable
 #   unknown:unregistered            the key is NOT            -> a MEASUREMENT, try next
 #   any other unknown:*             we could not look at all  -> report it, claim nothing
+#
+# no-tier and malformed-tier both NAME THE AGENT and flag the tier as not measured.
+# Both mean the registry answered "yes, this is an agent" and then failed only on the
+# tier value; dropping the agent name because its tier was unusable would throw away
+# the half that WAS measured — the same two-things-in-one-bucket collapse agent_tier
+# itself exists to undo.
+#
+# The residual `unknown:*` branch RETURNS rather than trying the next candidate, and
+# that is load-bearing. A registry we could not read is not an invitation to guess
+# again with a different name: `continue` there would let a second candidate's
+# success paper over the first candidate's failed lookup and report a confident
+# agent identity built on a read that did not happen. Graded by T17.
 actor_registry_agent() {
   local unix="${1:-}" cand t
   ACTOR_AGENT=""; ACTOR_TIER="unknown:no-caller"
@@ -174,10 +188,10 @@ actor_registry_agent() {
     [[ -n "$cand" ]] || continue
     t=$(agent_tier "$cand")
     case "$t" in
-      unknown:unregistered) ACTOR_TIER="$t"; continue ;;
-      unknown:no-tier)      ACTOR_AGENT="$cand"; ACTOR_TIER="$t"; return 0 ;;
-      unknown:*)            ACTOR_TIER="$t"; return 0 ;;   # registry unreadable — claim nothing
-      *)                    ACTOR_AGENT="$cand"; ACTOR_TIER="$t"; return 0 ;;
+      unknown:unregistered)                 ACTOR_TIER="$t"; continue ;;
+      unknown:no-tier|unknown:malformed-tier) ACTOR_AGENT="$cand"; ACTOR_TIER="$t"; return 0 ;;
+      unknown:*)                            ACTOR_TIER="$t"; return 0 ;;   # could not look — claim nothing
+      *)                                    ACTOR_AGENT="$cand"; ACTOR_TIER="$t"; return 0 ;;
     esac
   done
   return 0
