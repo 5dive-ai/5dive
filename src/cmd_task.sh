@@ -56,8 +56,8 @@ _task_usage() {
                                                      # rather than guess, because #N means a different PR in each repo.
   5dive task merge-audit [--limit=N] [--json]         # DIVE-1935: retrospective sweep — DONE tasks whose own record names a PR
                                                      # that never merged (or merged red). Read-only; reports, never reopens.
-                                                     # DIVE-1975: each finding is LABELLED `delivered` (the task claims it as
-                                                     # its own) or `cited` (it only writes about it). A label, never a filter.
+                                                     # DIVE-1975: each finding is LABELLED 'delivered' (the task claims it as
+                                                     # its own) or 'cited' (it only writes about it). A label, never a filter.
                                                      # DIVE-1955: sweeps every repo in FIVE_GATE_REPOS (default: the CLI,
                                                      # 5dive-api and 5dive-frontend), not just the CLI one.
   5dive task verify <id|DIVE-N> [--cmd="<command>"] [--no-done] [--timeout=<s>]
