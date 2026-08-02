@@ -127,6 +127,44 @@ _actor_identity() {
   printf '%s' "$user"
 }
 
+# _actor_identity_derived — the same question, answered from the UID (DIVE-2518).
+#
+# `_actor_identity` above is DELIBERATELY NOT REPLACED, and that is a decision, not
+# an omission. It is the audit log's PROVENANCE field: "who does this invocation say
+# it is". `FIVEDIVE_AUDIT_USER` is the dashboard's Clerk relay (see header.sh) — a
+# real human acting through the API has no uid on this box, and collapsing that onto
+# the process's uid would replace the only record of which human it was with the
+# service account that carried the request. The wiki inventory names the split
+# exactly: provenance is the right answer for an audit record and the wrong one for
+# an authorization check.
+#
+# What was missing is the OTHER half. A row carrying only the asserted identity
+# cannot be falsified afterwards — nothing in it says whether the value was measured
+# or announced. This returns the derived unix name so `audit_log` can carry both and
+# a reader can see when they disagree.
+#
+# Pure bash by construction: it goes through `actor_derive`, which reads `$EUID` and
+# walks /etc/passwd without `id`, `getent` or jq. audit_log is a best-effort writer on
+# every command path, so it must not gain a jq dependency or a registry read here.
+_actor_identity_derived() {
+  actor_derive >/dev/null 2>&1 || { printf ''; return; }
+  printf '%s' "$ACTOR_UNIX"
+}
+
+# _actor_identity_claim — the provenance string, but ONLY when it disagrees with the
+# derivation. Empty when they agree, when nothing was derived, or when the provenance
+# is just the derived name with the `agent-` prefix intact — that last case is the
+# same principal spelled two ways, not a conflict, and stamping it would bury the
+# real disagreements in noise.
+_actor_identity_claim() {
+  local claimed derived
+  claimed=$(_actor_identity); derived=$(_actor_identity_derived)
+  [[ -n "$derived" ]] || { printf ''; return; }
+  [[ "$claimed" == "$derived" ]] && { printf ''; return; }
+  [[ "$claimed" == "${derived#agent-}" ]] && { printf ''; return; }
+  printf '%s' "$claimed"
+}
+
 # _actor_authority — under WHOSE authority the current process is acting.
 #
 # Distinct from _actor_identity on purpose. Identity answers "who"; authority
@@ -195,13 +233,24 @@ audit_log() {
   # failure — a NON-root process whose USER we could not read — and a reader
   # seeing it should treat it as a defect, not as routine.
   local user; user=$(_actor_identity)
+  # DIVE-2518: `user` above is what this invocation SAYS it is. `derived` is what
+  # the uid measures. Carrying both is the point — one field cannot record a
+  # disagreement, and a row that cannot record one is a row where a forged
+  # $SUDO_USER leaves no trace at all. `claimed` is populated ONLY when they
+  # disagree, so the common case adds one key and no noise, and a reader grepping
+  # for `.claimed` gets exactly the rows worth looking at.
+  local derived; derived=$(_actor_identity_derived)
+  local claimed; claimed=$(_actor_identity_claim)
   local ts
   ts=$(date -Iseconds)
   local line
   line=$(jq -cn \
     --arg ts "$ts" --arg u "$user" --arg c "$cmd" \
+    --arg dv "$derived" --arg cl "$claimed" \
     --arg r "$result" --argjson code "$code" \
-    --args '{ts:$ts, user:$u, cmd:$c, result:$r, code:($code|tonumber? // 0), args:$ARGS.positional}' \
+    --args '{ts:$ts, user:$u, cmd:$c, result:$r, code:($code|tonumber? // 0), args:$ARGS.positional}
+            + (if $dv == "" then {} else {derived:$dv} end)
+            + (if $cl == "" then {} else {claimed:$cl} end)' \
     "${sanitized[@]+"${sanitized[@]}"}" 2>/dev/null) || return 0
   _emit_audit_line "$line"
 }

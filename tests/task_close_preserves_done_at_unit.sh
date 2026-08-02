@@ -33,6 +33,10 @@ set -uo pipefail
   || printf 'grading tree: UNRESOLVED (tests/lib/grading_tree.sh not reachable; no tree named)\n' >&2
 
 cd "$(dirname "$0")/.."
+# DIVE-2518: impersonate through the SEALED seam. `USER=agent-x` no longer moves
+# the actor — that env path WAS the forgery this ticket closed, and these arms
+# were leaning on it. tests/lib/actor_seam.sh explains the migration.
+. "$(dirname "${BASH_SOURCE[0]}")/lib/actor_seam.sh"
 
 SRC=src
 TMP="$(mktemp -d /tmp/task-doneat-preserve-unit.XXXXXX)"
@@ -54,7 +58,7 @@ ok_t()  { PASS=$((PASS+1)); printf 'ok   - %s\n' "$1"; }
 bad_t() { FAIL=$((FAIL+1)); printf 'FAIL - %s\n       %s\n' "$1" "${2:-}"; }
 
 tasks_db_init
-as() { local who="$1"; shift; ( USER="agent-${who}"; SUDO_UID=""; SUDO_USER=""; "$@" ) 2>"$TMP"/err; }
+as() { local who="$1"; shift; ( actor_seam_as "${who}"; "$@" ) 2>"$TMP"/err; }
 
 status_of() { db "SELECT status                 FROM tasks WHERE ident=$(sqlq "$1");"; }
 doneat_of() { db "SELECT COALESCE(done_at,'')   FROM tasks WHERE ident=$(sqlq "$1");"; }
@@ -66,7 +70,7 @@ backdate() { db "UPDATE tasks SET done_at=$(sqlq "$SENTINEL") WHERE ident=$(sqlq
 add() { JSON_MODE=1 cmd_task_add "$@" 2>"$TMP"/err | jq -r '.data.ident // empty'; }
 
 # ── instrument: without impersonation the actor-scoped guards make cases vacuous
-actor_is() { ( USER="agent-$1"; SUDO_UID=""; SUDO_USER=""; task_actor ); }
+actor_is() { ( actor_seam_as "$1"; task_actor ); }
 [[ "$(actor_is dev2)" == "dev2" ]] \
   && ok_t "INSTRUMENT: harness impersonates an actor (task_actor -> dev2)" \
   || bad_t "INSTRUMENT: actor impersonation broken" "got '$(actor_is dev2)' — cases are vacuous"

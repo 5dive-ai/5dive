@@ -52,6 +52,10 @@ set -uo pipefail
 . "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh" \
   || printf 'grading tree: UNRESOLVED (tests/lib/grading_tree.sh not reachable; no tree named)\n' >&2
 cd "$(dirname "$0")/.."
+# DIVE-2518: impersonate through the SEALED seam. `USER=agent-x` no longer moves
+# the actor — that env path WAS the forgery this ticket closed, and these arms
+# were leaning on it. tests/lib/actor_seam.sh explains the migration.
+. "$(dirname "${BASH_SOURCE[0]}")/lib/actor_seam.sh"
 SRC=src
 TMP="$(mktemp -d /tmp/task-start-delivered-unit.XXXXXX)"
 trap 'rm -rf "$TMP"' EXIT
@@ -75,10 +79,10 @@ bad_t() { FAIL=$((FAIL+1)); printf 'FAIL - %s\n   %s\n' "$1" "${2:-}"; }
 # The guard reads the ACTOR, so every arm has to SAY who is calling. task_actor()
 # falls back to $USER when there is no sudo mapping and no --from.
 run_as() { local who="$1" verb="$2"; shift 2
-           ( USER="agent-${who}"; SUDO_UID=""; SUDO_USER=""; JSON_MODE=1; "cmd_task_$verb" "$@" ) 2>"$TMP"/err; }
+           ( actor_seam_as "${who}"; JSON_MODE=1; "cmd_task_$verb" "$@" ) 2>"$TMP"/err; }
 rc_of()  { local who="$1" verb="$2"; shift 2
-           ( USER="agent-${who}"; SUDO_UID=""; SUDO_USER=""; JSON_MODE=1; "cmd_task_$verb" "$@" ) >/dev/null 2>"$TMP"/err; printf '%s' "$?"; }
-show_of() { ( USER="agent-nobody"; SUDO_UID=""; SUDO_USER=""; JSON_MODE=0; cmd_task_show "$1" ) 2>&1; }
+           ( actor_seam_as "${who}"; JSON_MODE=1; "cmd_task_$verb" "$@" ) >/dev/null 2>"$TMP"/err; printf '%s' "$?"; }
+show_of() { ( actor_seam_as nobody; JSON_MODE=0; cmd_task_show "$1" ) 2>&1; }
 jf()   { jq -r "$1" 2>/dev/null; }
 has()  { [[ "$1" == *"$2"* ]]; }
 st()   { db "SELECT status FROM tasks WHERE id=$1;"; }
@@ -173,8 +177,8 @@ before=$(db "SELECT COALESCE(handoff_delivered_at,'')||'|'||COALESCE(maker_agent
 # `id -un`, so an EMPTY $USER resolves to whoever is running the harness (an
 # agent-* box yields a real agent name and this arm would grade the runner, not
 # the sentinel). A non-agent $USER is the shape that actually reaches 'cli'.
-t6_rc=$( ( USER="root"; SUDO_UID=""; SUDO_USER=""; JSON_MODE=1; cmd_task_start "$t6" ) >/dev/null 2>"$TMP"/err; printf '%s' "$?" )
-t6_actor=$( USER="root"; SUDO_UID=""; SUDO_USER=""; task_actor )
+t6_rc=$( ( actor_seam_as root; JSON_MODE=1; cmd_task_start "$t6" ) >/dev/null 2>"$TMP"/err; printf '%s' "$?" )
+t6_actor=$( actor_seam_as root; task_actor )
 if [[ "$t6_actor" != "cli" ]]; then
   # Do not silently grade a carve-out we could not construct.
   bad_t "T6 precondition: a non-agent \$USER must resolve to the 'cli' sentinel" "task_actor=$t6_actor"

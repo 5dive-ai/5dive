@@ -30,6 +30,9 @@
 # Run: bash tests/task_verify_over_closed_unit.sh
 set -uo pipefail
 cd "$(dirname "$0")/.."
+# DIVE-2518: `USER=agent-x` no longer moves the actor; derive as them instead.
+. "$(dirname "${BASH_SOURCE[0]}")/lib/actor_seam.sh"
+as_agent() { local _w="$1"; shift; ( actor_seam_as "$_w"; "$@" ); }
 SRC=src
 
 TMP="$(mktemp -d /tmp/task-verify-closed-unit.XXXXXX)"
@@ -68,7 +71,7 @@ ACK="ACK: accepted — c97a4f9 was ALREADY merged with a version bump; red-team 
 
 # --- A. the defect: maker verify-closes an already-done task -------------------
 id=$(seed done olivia "$ACK")
-out=$( FIVE_SENDER=dev2 USER=agent-dev2 cmd_task_verify "$id" --cmd=true 2>&1 ); rc=$?
+out=$( FIVE_SENDER=dev2 as_agent dev2 cmd_task_verify "$id" --cmd=true 2>&1 ); rc=$?
 res=$(db "SELECT COALESCE(result,'') FROM tasks WHERE id=$id;")
 [ "$rc" -ne 0 ] && ok "A1 maker's verify --cmd over a done task is REFUSED (rc=$rc)" || no "A1 maker's verify --cmd over a done task is REFUSED" "rc=$rc $out"
 grep -q 'DIVE-2067' <<<"$out" && ok "A2 the refusal cites DIVE-2067" || no "A2 the refusal cites DIVE-2067" "$out"
@@ -90,21 +93,21 @@ if [[ -z "$(_gate_authenticated_actor 2>/dev/null)" ]]; then
   skip "B1 escape preserved — NOT REACHED: this runner has no kernel-authenticable agent identity, so DIVE-2015 refuses the live-loop auto-close before the escape is exercised"
 else
   id=$(seed todo olivia "")
-  out=$( FIVE_SENDER=dev2 USER=agent-dev2 cmd_task_verify "$id" --cmd=true 2>&1 ); rc=$?
+  out=$( FIVE_SENDER=dev2 as_agent dev2 cmd_task_verify "$id" --cmd=true 2>&1 ); rc=$?
   st=$(db "SELECT status FROM tasks WHERE id=$id;")
   [ "$st" = done ] && ok "B1 verify --cmd still closes a NOT-done task (escape preserved)" || no "B1 escape preserved" "rc=$rc st=$st $out"
 fi
 
 # --- C. the verifier's own re-close preserves the prior record (rec 3) ---------
 id=$(seed done olivia "$ACK")
-out=$( FIVE_SENDER=olivia USER=agent-olivia cmd_task_verify "$id" --cmd=true 2>&1 ); rc=$?
+out=$( FIVE_SENDER=olivia as_agent olivia cmd_task_verify "$id" --cmd=true 2>&1 ); rc=$?
 res=$(db "SELECT COALESCE(result,'') FROM tasks WHERE id=$id;")
 grep -q 'superseded result' <<<"$res" && ok "C1 a re-close PRESERVES the prior result rather than replacing it" || no "C1 prior result preserved" "$res"
 grep -q 'ALREADY merged with a version bump' <<<"$res" && ok "C2 the original ACK text survives in full" || no "C2 original ACK survives" "$res"
 
 # --- D. no verifier recorded => no guard (nothing to protect) ------------------
 id=$(seed done "" "prior")
-out=$( FIVE_SENDER=dev2 USER=agent-dev2 cmd_task_verify "$id" --cmd=true 2>&1 ); rc=$?
+out=$( FIVE_SENDER=dev2 as_agent dev2 cmd_task_verify "$id" --cmd=true 2>&1 ); rc=$?
 [ "$rc" -eq 0 ] && ok "D1 a task with no recorded verifier is not blocked" || no "D1 no-verifier task not blocked" "rc=$rc $out"
 
 echo; echo "DIVE-2067 verify-over-closed guard: passed: $P  failed: $F  skipped: $S"

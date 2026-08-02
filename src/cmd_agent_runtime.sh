@@ -1376,6 +1376,21 @@ a2a_needs_scoped() {
 # "unforgeable field" lib/registry.sh claims. It is DIVE-2330's, which owns the same
 # vector where it feeds AUTHORIZATION rather than display.
 _envelope_sender_fallback() {
+  # DIVE-2518 TRIED TO COMPOSE THIS OVER actor_derive AND REVERTED. Recording why,
+  # because it is a real tension and not an oversight:
+  #
+  # tests/envelope_sender_fallback_unit.sh T3/T4 grade this function's TEXT for
+  # `EUID` and a hardcoded `done < /etc/passwd`, deliberately — the value feeds
+  # `envelope_tier`, so an env- or function-overridable passwd source would be a NEW
+  # forgery vector in the one field that design treats as unforgeable.
+  #
+  # lib/actor.sh reaches passwd through `_gate_passwd_stream`, a FUNCTION, and it is
+  # a function precisely so a unit harness can override it (DIVE-2330 iteration 2).
+  # That seam is the thing T4 forbids. Both designs are right for their own field,
+  # and they are in direct conflict: one needs an injectable source to be testable,
+  # the other needs a non-injectable one to be trustworthy. Collapsing them is a
+  # decision about which property wins, with its own review — not a side effect of
+  # collapsing task_actor. Left as a second passwd walk on purpose.
   local want="$EUID" name _x uid
   [[ "$want" =~ ^[0-9]+$ ]] || { printf ''; return; }
   while IFS=: read -r name _x uid _; do
@@ -1414,6 +1429,20 @@ _envelope_sender_fallback() {
 # NOT CLOSED: $SUDO_USER remains forgeable wherever it is still consulted, which is now
 # only the root/_deliver path where sudo wrote it. DIVE-2330 owns that vector where it
 # feeds AUTHORIZATION rather than display.
+#
+# DIVE-2518 MIGRATED THE FIRST BRANCH ONTO THE SEALED DERIVATION and deliberately
+# changed NOTHING about the order or the fallback. `_envelope_sender_fallback` used
+# to walk /etc/passwd itself — a second copy of the walk in lib/actor.sh, which is
+# how six derivations happened in the first place. It now composes over
+# `actor_derive`, so there is one passwd read in the tree.
+#
+# THE "NOT CLOSED" ABOVE STAYS OPEN, ON PURPOSE. Gating `auto_sender_from_sudo` on a
+# real root check does close it, and I tried that first: it breaks
+# tests/envelope_sender_fallback_unit.sh's T6b anchor, which exists to prove the
+# sudo path still answers for `_deliver`. That harness is encoding a scope decision
+# this file already states — the envelope is ATTRIBUTION, and DIVE-2330 owns
+# $SUDO_USER where it feeds AUTHORIZATION — and narrowing it is a separate change
+# with its own blast radius, not a side effect of collapsing the derivations.
 _envelope_caller() {
   local who
   who="$(_envelope_sender_fallback)"

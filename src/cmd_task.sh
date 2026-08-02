@@ -791,12 +791,36 @@ cmd_task_add() {
       verify_unavailable=1
     fi
   fi
-  local creator; creator=$(task_actor "$from")
+  # DIVE-2518: `task_actor_claim`, not `task_actor` — this site WRITES the row, so
+  # it needs the claim GRADE and not just the name, and a `$( )` would lose it. The
+  # stamped `created_by` is the derived actor; a `--from` that did not corroborate
+  # is preserved beside it in `claimed_by` rather than replacing it. Recording both
+  # is what keeps the row falsifiable later: `created_by` alone cannot distinguish
+  # a measured identity from an asserted one.
+  # BARE call, not `$( )` — the grade must survive into this shell. See the
+  # contract note on task_actor_claim; a command substitution here silently
+  # NULLs claimed_by for every divergent claim.
+  task_actor_claim "$from"
+  local creator="${from:-$ACTOR_BOARD}"
+  # RECORD BOTH, with the columns the right way round. `created_by` keeps its
+  # meaning — who this row is attributed to, which for a uid-less relay principal
+  # (`council`, `telegram`) can only ever be the claim. `derived_actor` carries the
+  # uid that actually ran it.
+  #
+  # ALWAYS POPULATED, never only-on-divergence (olivia, DIVE-2518 review). A
+  # conditionally written column makes NULL mean three different things at read
+  # time — the claim agreed, the row predates the column, or the row came through a
+  # path that does not populate it — which is the exact absent-vs-not-measured
+  # collapse lib/actor.sh's own header says this epoch exists to end. It costs one
+  # column write, and AGREEMENT IS EVIDENCE TOO: a row where the two match is a
+  # positive record that the uid was measured and corroborated the claim, which is
+  # not something a NULL can ever say.
+  local derived_actor="$ACTOR_BOARD"
   local id
-  id=$(db "INSERT INTO tasks (title, body, priority, assignee, created_by, parent_id, project_key, kind, schedule, fresh,
+  id=$(db "INSERT INTO tasks (title, body, priority, assignee, created_by, derived_actor, parent_id, project_key, kind, schedule, fresh,
                               acceptance_criteria, verify_command, max_iterations, verifier, task_budget, verify_unavailable)
            VALUES ($(sqlq "$title"), $(sqlq_or_null "$body"), $(sqlq "$priority"),
-                   $(sqlq_or_null "$assignee"), $(sqlq "$creator"), ${parent_sql}, $(sqlq "$project"),
+                   $(sqlq_or_null "$assignee"), $(sqlq "$creator"), $(sqlq_or_null "$derived_actor"), ${parent_sql}, $(sqlq "$project"),
                    $(sqlq "$kind"), ${schedule_sql}, ${fresh_sql},
                    $(sqlq_or_null "$accept"), $(sqlq_or_null "$verify_cmd"), ${max_iters:-NULL}, $(sqlq_or_null "$verifier"), $(sqlq_or_null "$task_budget"), $([[ $verify_unavailable == 1 ]] && echo 1 || echo NULL));
            SELECT last_insert_rowid();")
@@ -809,7 +833,7 @@ cmd_task_add() {
   # edited after the fact.
   ledger_emit task.created ident="$ident" task_id="$id" \
     parent="$(db "SELECT COALESCE(p.ident,'') FROM tasks t LEFT JOIN tasks p ON p.id=t.parent_id WHERE t.id=${id};" 2>/dev/null)" \
-    actor="$creator" in="$title" \
+    actor="$creator" claimed_by="$derived_actor" in="$title" \
     detail="${priority} → ${assignee:-unassigned}${verifier:+ (verifier ${verifier})}"
   if [[ "$kind" == "recurring" ]]; then
     ok "created recurring ${ident} (${recurring}, fresh=$([[ "$fresh_sql" == "1" ]] && echo on || echo off)) — $title" \
@@ -5197,6 +5221,7 @@ cmd_task_need() {
   [[ ${#positional[@]} -gt 0 ]] || fail "$E_USAGE" "usage: 5dive task need <id|DIVE-N> --type=decision|secret|approval|manual --ask=\"...\" [--options=A|B] [--recommend=\"A\"] [--needs=human_tap|spend_authority|secret_provision] [--discusses=\"why this decision only DISCUSSES a floored category\"]  (--type=secret also needs a delivery path: --secret-key=<ENV_NAME> --connector=<stem>, or --out-of-band=\"<where the value lands>\"; or --withdraw to cancel a moot pending gate)"
   resolve_task_id "${positional[0]}"; local id="$RESOLVED_TASK_ID" ident="$RESOLVED_TASK_IDENT"
 
+
   # DIVE-1401: --withdraw path. Secret/approval/manual gates are human-only to
   # CLEAR by deliberate security scope (an agent can't fake a secret grant). But
   # WITHDRAWING a still-pending request the team itself filed is not a grant — it
@@ -5572,7 +5597,17 @@ cmd_task_need() {
       | tr '[:upper:]' '[:lower:]' | sed -E "s/(${_GATE_CONTENT_PUBLISH_RX})//g")
     if _gate_hit_either _gate_content_curation_hit "$ask" "$_cc_title" \
        && ! _gate_hit_either _gate_tier2_floor_hit "$_cc_res_ask" "$_cc_res_title"; then
-      local _cc_reviewer; _cc_reviewer=$(_gate_route_reviewer "$(task_actor "$from")")
+      # DIVE-2518: `task_actor ""` rather than `task_actor "$from"`, and the two are
+      # now IDENTICAL — task_actor ignores the claim entirely. The empty argument is
+      # documentation, not a fix: it says at the call site that no claim is consulted.
+      #
+      # THIS IS NOT THE ROUTING DECISION, despite the variable name. All four
+      # `_*_reviewer` locals in this function only test whether a lead EXISTS, to
+      # decide `tier=1`; the reviewer actually persisted to `routed_reviewer` is
+      # computed once at the `_routable` block below from `$actor`. I changed these
+      # four first believing they were the decision, and a mutant that reverted all
+      # four left the T23 arm green — which is how the mistake surfaced.
+      local _cc_reviewer; _cc_reviewer=$(_gate_route_reviewer "$(task_actor "")")
       if [[ -n "$_cc_reviewer" ]]; then
         tier=1; tier_floored=0; _curation=1
       fi
@@ -5616,7 +5651,7 @@ cmd_task_need() {
     _io_res_title=$(_gate_internal_residual "$_io_title")
     if _gate_hit_either _gate_internal_ops_hit "$ask" "$_io_title" \
        && ! _gate_hit_either _gate_tier2_floor_hit "$_io_res_ask" "$_io_res_title"; then
-      local _io_reviewer; _io_reviewer=$(_gate_route_reviewer "$(task_actor "$from")")
+      local _io_reviewer; _io_reviewer=$(_gate_route_reviewer "$(task_actor "")")   # DIVE-2518: tier-flag only; see note above
       if [[ -n "$_io_reviewer" ]]; then
         tier=1; tier_floored=0; _internal_ops=1
       fi
@@ -5657,7 +5692,7 @@ cmd_task_need() {
         local _dd_term; _dd_term=$(_gate_tier2_floor_term "$_dd_residual")
         warn "--discusses REFUSED: this gate names a non-appealable category (matched '${_dd_term}'). Money, outbound customer comms and irreversible infra/access stay hard-human however they are framed. Staying at tier 2."
       else
-        local _dd_reviewer; _dd_reviewer=$(_gate_route_reviewer "$(task_actor "$from")")
+        local _dd_reviewer; _dd_reviewer=$(_gate_route_reviewer "$(task_actor "")")   # DIVE-2518: tier-flag only; see note above
         if [[ -z "$_dd_reviewer" ]]; then
           # Rule 4: the appeal replaces a human with a REVIEWER, never with nobody.
           warn "--discusses REFUSED: no lead sits above you in the org chart, so there is nobody to route the appeal to (a lead cannot self-appeal). Staying at tier 2."
@@ -5689,7 +5724,7 @@ cmd_task_need() {
   if [[ "$tier_floored" == "0" && ( "$type" == "decision" || "$type" == "approval" || "$type" == "manual" ) ]]; then
     local _es_title; _es_title=$(db "SELECT COALESCE(title,'') FROM tasks WHERE id=${id};")
     if _gate_hit_either _gate_eng_ship_hit "$ask" "$_es_title"; then   # DIVE-2224: per-field
-      local _es_reviewer; _es_reviewer=$(_gate_route_reviewer "$(task_actor "$from")")
+      local _es_reviewer; _es_reviewer=$(_gate_route_reviewer "$(task_actor "")")   # DIVE-2518: tier-flag only; see note above
       # DIVE-1738: builder ship-handoff nudge. approval/manual gates are
       # HUMAN-ONLY (cmd_task_answer's provenance floor) UNLESS routed — they
       # lean on routed_reviewer + the designated-reviewer exception, and manual
@@ -6257,7 +6292,14 @@ cmd_task_need() {
       # DIVE-1495: a verifier-route targets the task's verifier directly; every
       # other kind resolves the filer's lead via the org chart.
       local _reviewer
-      if [[ "$_verifier_route" == "1" ]]; then _reviewer="$_route_target"; else _reviewer=$(_gate_route_reviewer "$actor"); fi
+      # DIVE-2518: THIS is the routing decision — the one thing `--from` DECIDED
+      # rather than recorded, since routed_reviewer is who may later CLEAR the gate.
+      # It takes `task_actor ""` (the derivation) and NOT `$actor`, which carries the
+      # claim so that `gate_filed_by` can keep naming a uid-less relay principal.
+      # Recording the claim and obeying it are different things, and this is the line
+      # where they part. Graded by T23, which seeds two DIFFERENT leads so a claim
+      # that won would route somewhere visible.
+      if [[ "$_verifier_route" == "1" ]]; then _reviewer="$_route_target"; else _reviewer=$(_gate_route_reviewer "$(task_actor "")"); fi
       if [[ -n "$_reviewer" ]]; then
         # Persist the designated reviewer on the row. For approval/manual this is
         # what authorizes agent-<_reviewer> to clear the gate later; for decision
@@ -8978,7 +9020,24 @@ cmd_task_answer() {
   # the `standing:` infix is the new, additive fact. `need_answered_by` is inside
   # the DIVE-756 signed closure, so this marker is tamper-evident: a raw DB edit
   # that downgrades `lead:standing:main` to `lead:main` fails `gate-proof verify`.
-  [[ "$_lead_standing" == "1" ]] && (( ! human )) && answered_by="lead:standing:$(task_actor "$from")"
+  # DIVE-2518: name the actor the standing check AUTHENTICATED, not the one the
+  # caller claimed. `_lead_standing` is decided above by `_gate_authenticated_actor`
+  # == `_gate_standing_lead` — the sealed uid-first derivation — while this label
+  # was built from `task_actor "$from"`, which took `--from` verbatim. The two can
+  # name DIFFERENT agents, and the row would then read `lead:standing:<claimed>`
+  # for a standing that was granted to <derived>: a proof string asserting exactly
+  # what the check did not verify. The label now comes from the same resolver as
+  # the decision, which is the property `gate-proof verify` is reading it for.
+  # `_gate_authenticated_actor` returns EMPTY for a caller it cannot resolve to an
+  # agent, and an empty name here would stamp the bare string `lead:standing:` —
+  # a proof label naming nobody, which `gate-proof verify` and the human:* demotion
+  # both then read as a malformed grant. Fall back to the uid-derived board actor,
+  # which is the same derivation and never empty.
+  if [[ "$_lead_standing" == "1" ]] && (( ! human )); then
+    local _ls_who; _ls_who=$(_gate_authenticated_actor)
+    [[ -n "$_ls_who" ]] || _ls_who=$(task_actor "")
+    answered_by="lead:standing:${_ls_who}"
+  fi
 
   # DIVE-756: stamp the REAL invoker uid ($SUDO_UID survives `sudo -u agent-X`,
   # unlike need_answered_by) and a tamper-evidence signature over the closure

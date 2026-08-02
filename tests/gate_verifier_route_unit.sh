@@ -41,9 +41,23 @@ done
 # being an input. Wrapping the REAL resolver (rather than reimplementing it) keeps the --from
 # precedence under test instead of under simulation, and keeps the override inside this shell —
 # there is deliberately no env var that could forge an actor in production.
-eval "task_actor_REAL() $(declare -f task_actor | tail -n +2)"
+#
+# DIVE-2518 MOVED THE PIN, and had to. Setting $USER no longer moves the actor —
+# that env path WAS the forgery this ticket closed — and wrapping `task_actor`
+# cannot pin identity any more either, because cmd_task_need's corroboration guard
+# reads the derivation DIRECTLY rather than through that accessor. The pin now goes
+# through the sealed seam (tests/lib/actor_seam.sh), which is the same
+# _gate_caller_uid/_gate_passwd_stream pair DIVE-2330 kept for exactly this.
+#
+# `--from` stays under test rather than under simulation, as the note above wants —
+# but it is now a CLAIM that must corroborate, so each step DERIVES as the agent it
+# files as. A step that derived as one agent and filed as another is refused by
+# design, and before this migration that refusal exited the harness mid-run: the
+# suite stopped after arm 3 and still reported status 0, which is the truncated-run-
+# reads-as-a-pass shape. It went from 9/0 to a silent 3-arm stub.
+. "$(dirname "${BASH_SOURCE[0]}")/lib/actor_seam.sh"
 FIXTURE_ACTOR=fixture-runner   # not a real agent; set per-step to impersonate one on purpose
-task_actor() { USER="agent-${FIXTURE_ACTOR}" SUDO_USER='' task_actor_REAL "$@"; }
+fixture_actor() { FIXTURE_ACTOR="$1"; actor_seam_as "$1"; }
 
 STATE_DIR="$TMP"; TASKS_DIR="$STATE_DIR/tasks"; TASKS_DB="$TASKS_DIR/tasks.db"
 JSON_MODE=1
@@ -83,7 +97,7 @@ seed_loop() {
 }
 
 # ---- 1. maker's decision gate routes to the verifier agent, not the human ----
-route_reset; seed_loop DIVE-501
+route_reset; seed_loop DIVE-501; fixture_actor dev
 cmd_task_need DIVE-501 --type=decision --options='A|B' --recommend='A' \
   --ask='Which schema for the field?' --from=dev >/dev/null 2>&1
 [[ "$(route_last)" == "main" ]] \
@@ -94,14 +108,14 @@ cmd_task_need DIVE-501 --type=decision --options='A|B' --recommend='A' \
   || bad_t "routed_reviewer persisted as verifier" "got=$(db "SELECT routed_reviewer FROM tasks WHERE ident='DIVE-501';")"
 
 # ---- 2. approval gate on the loop also routes to the verifier ----
-route_reset; seed_loop DIVE-502
-cmd_task_need DIVE-502 --type=approval --ask='OK to merge the refactor?' --from=dev >/dev/null 2>&1
+route_reset; seed_loop DIVE-502; fixture_actor dev
+actor_seam_as dev; cmd_task_need DIVE-502 --type=approval --ask='OK to merge the refactor?' --from=dev >/dev/null 2>&1
 [[ "$(route_last)" == "main" ]] \
   && ok_t "maker approval gate routes to verifier 'main'" \
   || bad_t "maker approval gate routes to verifier 'main'" "route_last=$(route_last) human=$HUMAN_PINGED"
 
 # ---- 3. filer IS the verifier -> no self-route (max-iters escalation stays human) ----
-route_reset; seed_loop DIVE-503
+route_reset; seed_loop DIVE-503; fixture_actor main
 cmd_task_need DIVE-503 --type=decision --options='A|B' --recommend='A' \
   --ask='pick one' --from=main >/dev/null 2>&1
 [[ "$(route_last)" != "main" ]] \
@@ -109,7 +123,7 @@ cmd_task_need DIVE-503 --type=decision --options='A|B' --recommend='A' \
   || bad_t "verifier's own gate does not self-route to itself" "route_last=$(route_last)"
 
 # ---- 4. tier-2 category floor (money) stays human even on a loop ----
-route_reset; seed_loop DIVE-504
+route_reset; seed_loop DIVE-504; fixture_actor dev
 cmd_task_need DIVE-504 --type=decision --options='A|B' --recommend='A' \
   --ask='Approve the $5000 refund to the customer?' --from=dev >/dev/null 2>&1
 [[ "$HUMAN_PINGED" == "1" && "$(route_sent)" == "0" ]] \
@@ -121,6 +135,13 @@ cmd_task_need DIVE-504 --type=decision --options='A|B' --recommend='A' \
 db "INSERT INTO tasks(ident,title,status,created_by,assignee,verifier,maker_agent,iteration,max_iterations,
       need_type,ask,need_answered_at)
     VALUES('DIVE-505','loop','blocked','dev','dev','main','dev',1,5,'manual','pending human thing',NULL);"
+# Back to the NEUTRAL fixture identity. Step 4 pinned `dev` to file its gate, and
+# `dev` is DIVE-505's maker — so leaving the pin there makes step 5's reject a
+# self-grade and the DIVE-2112 guard correctly ends the run. Under the old global
+# $USER pin this reset was implicit (nothing moved the actor per step); with a real
+# per-step derivation it has to be written down. Step 6 re-pins `dev` on purpose,
+# which is exactly the negative control for this line.
+fixture_actor fixture-runner
 # DIVE-2190: stdout only. This call can END the harness (cmd_* refusals go through fail()),
 # and `2>&1` sent the one line explaining WHY straight to /dev/null — the failure erased its
 # own reason. Redirect noise, never diagnosis.
@@ -142,9 +163,9 @@ answered_by=$(db "SELECT COALESCE(need_answered_by,'') FROM tasks WHERE ident='D
 db "INSERT INTO tasks(ident,title,status,created_by,assignee,verifier,maker_agent,iteration,max_iterations,
       need_type,ask,need_answered_at)
     VALUES('DIVE-506','loop','blocked','dev','dev','main','dev',1,5,'manual','pending human thing',NULL);"
-FIXTURE_ACTOR=dev
+fixture_actor dev
 rj_out=$(cmd_task_reject DIVE-506 --feedback='maker grading itself' 2>&1); rj_rc=$?
-FIXTURE_ACTOR=fixture-runner
+fixture_actor fixture-runner
 [[ "$rj_rc" != "0" && "$rj_out" == *MAKER* ]] \
   && ok_t "maker impersonation is still refused (identity pin does not disarm DIVE-2112)" \
   || bad_t "maker impersonation is still refused" "rc=$rj_rc out=${rj_out//$'\n'/ }"
