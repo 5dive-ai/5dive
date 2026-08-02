@@ -1488,6 +1488,201 @@ _gate_text_names_a_ref() {
 # announces itself at the exact moment it matters, to the person it is failing. That is
 # the property to preserve if this list is ever edited; adding a repo without it just
 # moves the blind spot.
+# ---------------------------------------------------------------------------
+# DIVE-2414 — THE SUBJECT-STATE READER. ONE reader, pointed TWO directions.
+#
+# THE DEFECT IT REPLACES. "A gate whose task looks shipped retires with it" reads
+# the ROW's own commit stream (`git log --grep=<ident>`, _hb_repo_grep_ident) and
+# calls that evidence about the GATE. It is not. A row carrying a six-item program
+# gets one commit for item #5 and reads as complete: DIVE-2382 was flagged
+# "likely shipped, verify+close" while its live human gate asked about a
+# completely different item. On a ticket that lands in pieces that nudge points
+# the right way for the wrong reason and arrives with the authority of an
+# automatic check. So the rule this file now enforces:
+#
+#   THE READER RESOLVES WHAT THE GATE IS ABOUT — the pull request it NAMES — and
+#   NEVER inherits the row's commit stream as evidence. A gate that names NO
+#   subject does not auto-retire; it stays open and SAYS so.
+#
+# TWO DIRECTIONS, ONE READER (olivia's scope, and it is a correctness argument,
+# not just anti-duplication — built as two rows it repeats DIVE-2382's own defect):
+#   (a) retire/flag a gate when the PR its ASK names has merged   — _gate_subject_verdict
+#   (b) the DIVE-1830 merge-gate's cited-not-delivered gap, where a PR named in
+#       prose is never read for its state AT ALL                 — _gate_cited_state_note
+# Same blindness, opposite directions: one asks "is my subject resolved?", the
+# other "what state is the thing you are citing actually in?".
+#
+# _gate_subject_refs_from_text <text> — of the refs this text names, which ones is
+# it ASKING ABOUT? Emits the qualified `<slug>|<n>` subset, same shape as
+# _gate_delivery_refs_from_text (DIVE-1965), and for the same reason: the subject
+# must come from a STRUCTURED, INTENTIONAL signal, never from "a number appeared in
+# the text". DIVE-2382's own ask is the pinned negative — it says "fix #5 is
+# already in review as PR #335", a PR it is NOT about, and a mention-predicate
+# would have retired a live approval on the strength of it.
+#   Accepted: a `Subject:` / `Gate-subject:` / `Blocked-on:` line, or an
+# ACTION-REQUEST verb adjacent to the ref (approve / merge / land / sign off) —
+# the ask wants something DONE to that PR. Report verbs (review, shipped, cited)
+# are deliberately NOT in the set: "in review as PR #335" is the exact shape that
+# must miss, and "shipped as PR #N" describes a PR rather than asking about it.
+# The asymmetry is deliberate and is the whole safety argument: reading a citation
+# as the subject retires a live human question, reading the subject as a citation
+# costs ONE nudge. Line-scoped, negations rejected, `tolower` for matching only so
+# offsets still index the original line (a URL keeps its owner/repo case).
+#
+# THE VERB LIST IS A CLOSED VOCABULARY, AND THAT IS THE DESIGN, not an oversight
+# left for the next person to finish (Marcus, verifying DIVE-2414). An ask phrased
+# outside it — "can you OK PR #123" — yields NO subject, and a gate with no subject
+# withholds the flag. That is the fail-closed direction and it costs a nudge.
+# Widening the vocabulary is how the pinned negatives come back: E3 (DIVE-2382's
+# "already in review as PR #335"), E4 (a bare mention) and E8 ("shipped as PR #N")
+# in tests/gate_subject_state_unit.sh each pass only because some phrasing is
+# OUTSIDE the set. If you add a verb, add it with the arm that proves the
+# citations still miss — and note that the two halves are pinned by mutations the
+# other survives: subject:=any-mention reds E3/E4/E5/E8, subject:=nothing reds
+# E1/E2/E6/E7, a clean 4/4 partition with no overlap. Keep that property.
+_gate_subject_refs_from_text() {
+  printf '%s' "$1" | awk '
+    BEGIN {
+      RE   = "(https://github\\.com/[a-z0-9._-]+/[a-z0-9._-]+/pull/[0-9]+[a-z0-9]*)|((^|[^a-z0-9])(prs?|pull request)[[:space:]]*#?[[:space:]]*[0-9]+[a-z0-9]*)"
+      VERB = "(approve|approves|approved|approval|merge|merges|merging|land|lands|landing|sign[- ]?off|signs[- ]?off|signed[- ]?off)"
+      CONN = "([[:space:]]+(as|in|on|of|to|into|via|by|the|this|that|is|was|it))*"
+      PRE  = "(^|[^a-z0-9])" VERB CONN "[^[:alnum:]]*$"
+      NEG  = "(^|[^a-z0-9])(not|never|no|un|cannot|can[[:space:]]not|dont|do[[:space:]]not)[- ]?" VERB CONN "[^[:alnum:]]*$"
+      POST = "^[[:space:]]*(is|was|needs|need)[[:space:]]+(your[[:space:]]+|a[[:space:]]+)?(approval|approving|sign[- ]?off|merging|merged|landing)"
+    }
+    function refkey(m,   n, k, p) {
+      n = m; sub(/^.*[^0-9]/, "", n)
+      if (n !~ /^[0-9]{1,6}$/) return ""
+      if (tolower(m) ~ /https:\/\/github\.com\//) {
+        k = m; sub(/^.*https:\/\/github\.com\//, "", k)
+        split(k, p, "/"); return p[1] "/" p[2] "|" n
+      }
+      return "|" n
+    }
+    {
+      line = $0; low = tolower(line)
+      sline = (low ~ /^[[:space:]]*(subject|gate-subject|gate subject|blocked-on|blocked on)[[:space:]]*:/)
+      pos = 1
+      while (match(substr(low, pos), RE)) {
+        st = pos + RSTART - 1; ln = RLENGTH
+        key = refkey(substr(line, st, ln))
+        if (key != "") {
+          pre = tolower(substr(line, 1, st - 1)); post = tolower(substr(line, st + ln))
+          if (sline || (pre ~ PRE && pre !~ NEG) || post ~ POST)
+            if (!seen[key]++) print key
+        }
+        pos = st + ln
+      }
+    }'
+}
+
+# _gate_ref_states <tok> <ident> <task_slug> — THE READER. Qualified refs on
+# STDIN, one MEASURED state line per ref on stdout:
+#
+#   <number>|<STATE>|<where>     STATE ∈ MERGED | MERGED-RED | OPEN | CLOSED
+#                                        | AMBIGUOUS | UNRESOLVED
+#
+# Every state comes from `gh pr view` on the ref ITSELF, through the DIVE-1955
+# qualified resolver (a bare `#N` is looked up in the declared repo, or bound by
+# ident evidence, or reported AMBIGUOUS — never guessed against a default slug).
+# There is deliberately NO git call anywhere in this path: the moment this reader
+# can reach the row's commit stream, the defect it exists to delete is back.
+# MERGED-RED is kept DISTINCT from MERGED because "merged" is not the same claim
+# as "landed and green" (DIVE-1935), and a caller retiring a human ask must not
+# collapse them.
+_gate_ref_states() {
+  local tok="$1" ident="$2" task_slug="$3" qref st rslug
+  while IFS= read -r qref; do
+    [[ -n "$qref" ]] || continue
+    st=$(_gate_resolve_qualified "$qref" "$tok" "$ident" "$task_slug")
+    rslug="${st%%|*}"; st="${st#*|}"
+    case "$rslug|$st" in
+      AMBIGUOUS\|*)          printf '%s|AMBIGUOUS|%s\n' "${qref#*|}" "$st" ;;
+      \|)                    printf '%s|UNRESOLVED|%s\n' "${qref#*|}" "$(_gate_search_scope "$qref" "$task_slug")" ;;
+      *\|MERGED\|*\|FAILURE) printf '%s|MERGED-RED|%s\n' "${qref#*|}" "$rslug" ;;
+      *\|MERGED\|*)          printf '%s|MERGED|%s\n' "${qref#*|}" "$rslug" ;;
+      *\|OPEN\|*)            printf '%s|OPEN|%s\n' "${qref#*|}" "$rslug" ;;
+      *)                     printf '%s|%s|%s\n' "${qref#*|}" "${st%%|*}" "$rslug" ;;
+    esac
+  done
+}
+_GATE_SUBJECT_CAP=5
+
+# _gate_subject_verdict <ask-text> <tok> <ident> <task_slug> — DIRECTION (a).
+# One line: `NO-SUBJECT` | `UNKNOWN|<why>` | `OPEN|<detail>` | `MERGED|<detail>`.
+#
+# Feed it the gate's own ASK and nothing else. NOT the row body: the body carries
+# the whole program and every PR it cites, which is exactly how a row-level signal
+# gets read as a gate-level one — the DIVE-2382 misread, one input earlier.
+#
+# Precedence, strictest first, because these are answers to "may this ask be
+# retired without a human":
+#   OPEN     — a subject is still open. Nothing else matters; the ask is live.
+#   UNKNOWN  — a subject exists and its state could not be READ (no gh, no token,
+#              dead parser, unresolvable, ambiguous, merged-but-red). A non-verdict
+#              is not a negative (DIVE-2318) and must never read as "resolved".
+#   MERGED   — every subject named resolved, and all of them merged green.
+#   NO-SUBJECT — the ask names no pull request AT ALL. Not a failure: most gates
+#              ask for a decision, not for a merge. Nothing can retire them
+#              automatically and the caller has to say that out loud.
+_gate_subject_verdict() {
+  local text="$1" tok="$2" ident="$3" task_slug="$4"
+  local refs n
+  refs=$(_gate_subject_refs_from_text "$text")
+  refs=$(printf '%s\n' "$refs" | grep . || true)
+  [[ -n "$refs" ]] || { printf 'NO-SUBJECT'; return 0; }
+  # A ref was named, so from here on silence is never an accept. An unrunnable
+  # parser or a missing credential is UNKNOWN — the same distinction DIVE-1955
+  # drew between "I looked and could not tell" and "there was nothing to look at".
+  _gate_pr_refs_engine_ok || { printf 'UNKNOWN|ref-parser-broken'; return 0; }
+  command -v gh >/dev/null 2>&1 || { printf 'UNKNOWN|gh-absent'; return 0; }
+  [[ -n "$tok" ]] || { printf 'UNKNOWN|no-gh-token'; return 0; }
+  n=$(printf '%s\n' "$refs" | grep -c .)
+  local states open="" merged="" unk=""
+  states=$(printf '%s\n' "$refs" | head -n "$_GATE_SUBJECT_CAP" | _gate_ref_states "$tok" "$ident" "$task_slug")
+  local num st where
+  while IFS='|' read -r num st where; do
+    [[ -n "$num" ]] || continue
+    case "$st" in
+      OPEN)   open="${open:+$open, }#${num} in ${where}" ;;
+      MERGED) merged="${merged:+$merged, }#${num} in ${where}" ;;
+      *)      unk="${unk:+$unk; }#${num} ${st} (${where})" ;;
+    esac
+  done <<<"$states"
+  (( n > _GATE_SUBJECT_CAP )) && unk="${unk:+$unk; }only the first ${_GATE_SUBJECT_CAP} of ${n} named refs were checked"
+  [[ -n "$open" ]] && { printf 'OPEN|%s' "$open"; return 0; }
+  [[ -n "$unk"  ]] && { printf 'UNKNOWN|%s' "$unk"; return 0; }
+  [[ -n "$merged" ]] && { printf 'MERGED|%s' "$merged"; return 0; }
+  printf 'UNKNOWN|no state read for any named subject'
+}
+
+# _gate_cited_state_note <qualified-refs> <tok> <ident> <task_slug> — DIRECTION (b).
+# The DIVE-1830 merge-gate sets CITED refs aside and, until now, did not read them
+# at all: "nothing binds them to this task, so their merge state was NOT checked".
+# The set-aside is right — a cited PR is another task's delivery and must never
+# gate this close (DIVE-1965 deleted that fleet-wide blocker on purpose). Reading
+# it is a different act from judging it. DIVE-2382's own close cited PR #337 while
+# it was OPEN and nothing said so; the same open PR then outlived the row that was
+# its only tracker. This returns the MEASURED state as a note. It never refuses,
+# never stamps UNVERIFIED, and never changes a verdict — it is disclosure only.
+# Bounded to 3 (a close that cites ten PRs must not pay ten round-trips) and the
+# cap is named in the note, because a silent cap reads as "all of them checked".
+_gate_cited_state_note() {
+  local qrefs="$1" tok="$2" ident="$3" task_slug="$4"
+  local refs n out="" num st where
+  refs=$(printf '%s\n' "$qrefs" | grep . || true)
+  [[ -n "$refs" ]] || { printf 'no cited reference resolved to read'; return 0; }
+  [[ -n "$tok" ]] || { printf 'state NOT read (no gh credential resolved)'; return 0; }
+  n=$(printf '%s\n' "$refs" | grep -c .)
+  while IFS='|' read -r num st where; do
+    [[ -n "$num" ]] || continue
+    out="${out:+$out; }#${num} ${st} in ${where}"
+  done < <(printf '%s\n' "$refs" | head -n 3 | _gate_ref_states "$tok" "$ident" "$task_slug")
+  [[ -n "$out" ]] || out="state NOT read"
+  (( n > 3 )) && out="$out (first 3 of $n cited refs read)"
+  printf '%s' "$out"
+}
+
 _gate_repo_slugs() {
   local raw="${FIVE_GATE_REPOS:-}"
   if [[ -z "$raw" ]]; then
@@ -2581,6 +2776,11 @@ _task_status_cmd() {
     # make a task unclosable, per DIVE-1835), and an unresolvable ref is a loud note
     # rather than a block, so a non-PR "#12" and an offline box both stay closable.
     local _txt_open="" _txt_open_slug="" _txt_red="" _txt_unres="" _txt_amb="" _txt_cited=""
+    # DIVE-2414: the cited set kept QUALIFIED as well as by number. `_txt_cited`
+    # is the number-only list the warning and the audit row have always printed;
+    # the subject-state reader needs the slug that travelled with the ref, or a
+    # bare "#6" gets read against whichever repo answers first (DIVE-1955).
+    local _txt_cited_q=""
     # DIVE-1955 (review, Marcus): decide "was a PR mentioned at all" UNCONDITIONALLY,
     # before the token/parser checks below, because those are exactly the paths that
     # cannot answer it later. Without this, a no-token close cannot distinguish a
@@ -2621,6 +2821,7 @@ $_body"
         # Skipped BEFORE the cap so five cited PRs cannot crowd out the real one.
         if ! printf '%s\n' "$_deliv" | grep -qxF -e "$_qref" -e "|${_qref#*|}"; then
           _txt_cited="${_txt_cited:+$_txt_cited,}${_qref#*|}"
+          _txt_cited_q="${_txt_cited_q:+$_txt_cited_q$'\n'}${_qref}"
           continue
         fi
         # Bounded: 5 refs max per close, and the drop is announced — a silent cap
@@ -2659,9 +2860,16 @@ $_body"
       # also the guard on this ticket's one coverage cost: if the maker's own
       # delivery landed in here, this line is where they see it.
       if [[ -n "$_txt_cited" ]]; then
-        warn "$ident: merge-gate treated PR reference(s) #${_txt_cited//,/, #} as CITED, not delivered — nothing binds them to this task, so their merge state was NOT checked (DIVE-1965). If one of them IS this task's delivery, bind it (\`task deliver $ident --pr=<url>\`) or say so (\"merged as PR #N\", or a \`Delivered: <url>\` line)."
+        # DIVE-2414: SET ASIDE IS NOT THE SAME ACT AS NOT LOOKED AT. These refs
+        # still do not gate this close — restoring that would re-create the
+        # fleet-wide blocker DIVE-1965 deleted — but their state is now READ and
+        # DISCLOSED through the same subject-state reader the gate sweep uses.
+        # DIVE-2382 closed while citing its own PR #337 as OPEN and nothing said
+        # so; that open PR then outlived the only row pointing at it.
+        local _cited_note; _cited_note=$(_gate_cited_state_note "$_txt_cited_q" "$_ghtok2" "$ident" "$_task_slug")
+        warn "$ident: merge-gate treated PR reference(s) #${_txt_cited//,/, #} as CITED, not delivered — nothing binds them to this task, so they do NOT gate this close (DIVE-1965). Their state, MEASURED anyway and reported only (DIVE-2414): ${_cited_note}. If one of them IS this task's delivery, bind it (\`task deliver $ident --pr=<url>\`) or say so (\"merged as PR #N\", or a \`Delivered: <url>\` line)."
         # DIVE-2054 (judgment call): same merge-gate family as -ambiguous above — fenced.
-        _task_store_audit_log "task.merge-gate-reported-on" ok 0 -- "$ident" "refs=$_txt_cited"
+        _task_store_audit_log "task.merge-gate-reported-on" ok 0 -- "$ident" "refs=$_txt_cited" "states=$_cited_note"
       fi
     fi
     if [[ -n "$_txt_open" && $force_merge_gate -eq 0 ]]; then
