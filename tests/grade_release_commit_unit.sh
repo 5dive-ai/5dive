@@ -313,4 +313,25 @@ ok "SHIPPED-LIST: every harness the release grade names still EXISTS (${_dn} nam
 ok "SHIPPED-LIST: the excluded main-tree harness is NAMED in it, so its SKIP shows up in the release log" \
   "grep -q 'tests/release_cut_bundle_unit.sh' <<<\"\$_defaults\""
 
+# ---- 11. THE ALLOWED-PATH SET STILL MATCHES WHAT THE CUT ACTUALLY WRITES ----
+# GRC_DELTA_PATHS is a hardcoded copy of a fact that lives in release-cut.yml: the set
+# of paths the DIVE-2091 release-commit block stages. The copy is the risk. Add a
+# fifth path there — another generated artifact, another stamp — and delta mode goes
+# UNDETERMINED and the cut REFUSES. That is the safe direction and it is still a
+# 02:37Z outage discovered by nobody being paged. Derive the truth from the workflow
+# and fail HERE, at PR time, instead.
+_wf="$_repo/.github/workflows/release-cut.yml"
+_pathset=$(GRC_DELTA_PATHS= bash -c '. /dev/stdin <<< "$(sed -n "/^GRC_DELTA_PATHS=/p" "$1")"; echo "$GRC_DELTA_PATHS"' _ "$GRADE" 2>/dev/null)
+# Every pathspec the cut stages, read out of the `git add -f` lines themselves.
+_staged=$(grep -oE '^\s*(if \[ -f [^]]+\]; then )?git add -f [^;|&]+' "$_wf" 2>/dev/null \
+          | sed -E 's/.*git add -f //' | tr ' ' '\n' | sed '/^$/d' | sort -u)
+_drift=(); _sn=0
+for _s in $_staged; do _sn=$((_sn+1)); grep -qw -- "$_s" <<< "$_pathset" || _drift+=("$_s"); done
+ok "PATHSET: the workflow's release-commit block was found and stages something" \
+  "[[ -f \"\$_wf\" && $_sn -gt 0 ]]"
+ok "PATHSET: every path release-cut.yml stages is ALLOWED by GRC_DELTA_PATHS (${_sn} staged, ${#_drift[@]} unlisted: ${_drift[*]:-none})" \
+  "[[ ${#_drift[@]} -eq 0 ]]"
+ok "PATHSET: the required-path guard names a path the cut actually writes" \
+  "grep -qw -- 'src/header.sh' <<<\"\$_staged\""
+
 echo; echo "$pass passed, $fail failed"; [[ $fail -eq 0 ]]
