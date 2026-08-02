@@ -244,3 +244,139 @@ actor_ignored_identity_env() {
   done
   printf '%s' "$out"
 }
+
+# ---------------------------------------------------------------------------
+# THE CLAIM DISCIPLINE (DIVE-2518, v0.18 "Proof of who")
+#
+# W1 sealed the derivation. This is the half that makes it BIND: `--from` stops
+# being an override and becomes a CLAIM that must corroborate.
+#
+# Measured on origin/main 51bc5c6: `task_actor` had 43 references — `created_by`
+# on every row, `assignee` under `--mine`, `actor=` on every ledger emit, and the
+# actor of all six loop rails — and it read a caller-supplied argv string FIRST,
+# then `$SUDO_USER`, which is an ordinary environment variable that nothing checks
+# sudo ever set. One uid therefore acted as any agent, with no privilege at all,
+# on the field the whole board later reads as ground truth.
+#
+# --from IS NOT DELETED, and that is deliberate. It is load-bearing for legitimate
+# relay: a scheduler, a plugin or the dashboard acting FOR an agent has no other
+# way to say whose work this is. What changes is its STATUS. The derivation
+# decides what gets stamped; the claim is recorded next to it; and where the actor
+# decides an AUTHORIZATION rather than bookkeeping, a claim that contradicts the
+# derivation is refused outright.
+#
+# The asymmetry is the point. A silent override leaves a record that cannot be
+# falsified afterwards — the row says `dev` and nothing anywhere says it was
+# asserted rather than measured. Recording both makes the disagreement visible to
+# a reader who was not present, which is the only property an audit trail has.
+
+# actor_board_name — the BOARD name for the acting uid, derived, never claimed.
+#
+# Sets ACTOR_BOARD (always non-empty) and ACTOR_BOARD_SOURCE (which layer answered).
+# Returns 0 when the uid maps to an attributable board actor, non-zero when it does
+# not — and in that case ACTOR_BOARD is the pre-existing `cli` sentinel, which
+# cmd_task.sh already reads as "could not attribute this invocation" (:2177, :2392,
+# :3030). Keeping that sentinel is what lets 43 call sites inherit the derivation
+# without each one learning a new vocabulary.
+#
+# THE LADDER, and why each rung is where it is:
+#   registry   the registry names this unix principal -> that name. The registry is
+#              the authority on agent-ness (DIVE-2371: a username PREFIX is not).
+#   passwd     the registry could not answer but the unix name is `agent-*` -> strip
+#              the prefix. This rung exists so an unreadable or half-written registry
+#              DEGRADES to today's answer instead of silently unattributing every row
+#              on the board. It is a naming convention, not an authority claim: the
+#              name still comes from the uid, and nothing here consults argv or env.
+#   cli        measured, and not an attributable board actor (root, a build bot).
+#
+# The REGISTRY lookup is memoised per unix name, not per process. `task_actor` is
+# called up to a dozen times in one verb and `agent_tier` shells out to jq each
+# time. Keying the memo on ACTOR_UNIX rather than on "have we run yet" keeps a unit
+# harness that swaps `_gate_passwd_stream` mid-run honest — a different uid resolves
+# to a different name, which misses the memo.
+_ACTOR_REG_MEMO_KEY=""; _ACTOR_REG_MEMO_VAL=""; _ACTOR_REG_MEMO_TIER=""
+actor_board_name() {
+  ACTOR_BOARD=""; ACTOR_BOARD_SOURCE=""
+  if ! actor_derive; then
+    ACTOR_BOARD="cli"; ACTOR_BOARD_SOURCE="unmeasurable:${ACTOR_REASON}"
+    printf '%s' "$ACTOR_BOARD"; return 1
+  fi
+  if [[ "$_ACTOR_REG_MEMO_KEY" == "$ACTOR_UNIX" ]]; then
+    ACTOR_AGENT="$_ACTOR_REG_MEMO_VAL"; ACTOR_TIER="$_ACTOR_REG_MEMO_TIER"
+  else
+    actor_registry_agent "$ACTOR_UNIX"
+    _ACTOR_REG_MEMO_KEY="$ACTOR_UNIX"; _ACTOR_REG_MEMO_VAL="$ACTOR_AGENT"; _ACTOR_REG_MEMO_TIER="$ACTOR_TIER"
+  fi
+  if [[ -n "$ACTOR_AGENT" ]]; then
+    ACTOR_BOARD="$ACTOR_AGENT"; ACTOR_BOARD_SOURCE="registry"
+    printf '%s' "$ACTOR_BOARD"; return 0
+  fi
+  if [[ "$ACTOR_UNIX" == agent-* ]]; then
+    ACTOR_BOARD="${ACTOR_UNIX#agent-}"; ACTOR_BOARD_SOURCE="passwd"
+    printf '%s' "$ACTOR_BOARD"; return 0
+  fi
+  ACTOR_BOARD="cli"; ACTOR_BOARD_SOURCE="not-an-agent:${ACTOR_UNIX}"
+  printf '%s' "$ACTOR_BOARD"; return 1
+}
+
+# actor_claim [claim] — derive, then GRADE the caller's claim against the derivation.
+#
+# Sets, and never leaves stale:
+#   ACTOR_BOARD         what to stamp. ALWAYS the derived value. A claim never
+#                       becomes this, which is the whole change.
+#   ACTOR_CLAIMED       the claim verbatim, or empty
+#   ACTOR_CLAIM_STATUS  absent | corroborated | divergent | unattributable
+#
+# Returns 0 for absent and corroborated, non-zero for the two that disagree.
+#
+# `unattributable` is NOT folded into `divergent`, for the same absent-vs-not-
+# measured reason `tier_unmeasured` exists: "you claim dev and the uid says main"
+# is a contradiction, while "you claim dev and the uid resolves to no board actor
+# at all" is an unverifiable assertion. They read the same to a rule that refuses
+# both, and completely differently to a human reading the audit row afterwards.
+actor_claim() {
+  local claim="${1:-}" rc=0
+  actor_board_name >/dev/null || rc=1
+  ACTOR_CLAIMED="$claim"
+  if [[ -z "$claim" ]]; then ACTOR_CLAIM_STATUS="absent"; return 0; fi
+  if [[ "$claim" == "$ACTOR_BOARD" ]]; then ACTOR_CLAIM_STATUS="corroborated"; return 0; fi
+  if (( rc != 0 )); then ACTOR_CLAIM_STATUS="unattributable"; return 1; fi
+  ACTOR_CLAIM_STATUS="divergent"; return 1
+}
+
+# actor_claim_note — the `claimed_by=...` fragment for a record, or EMPTY.
+#
+# Empty for absent AND for corroborated: a claim that agrees with the derivation
+# adds nothing a reader needs, and stamping it on every row would bury the ones
+# that disagree in noise. Only a disagreement is worth recording.
+actor_claim_note() {
+  case "${ACTOR_CLAIM_STATUS:-absent}" in
+    divergent|unattributable) printf '%s' "$ACTOR_CLAIMED" ;;
+    *)                        printf '' ;;
+  esac
+}
+
+# actor_require_corroborated <verb> [claim] — the REFUSAL, for privileged verbs.
+#
+# THE VERB SET IS CLOSED ON PURPOSE and it is small: the sites where the actor
+# decides an authorization OUTCOME rather than recording who did some bookkeeping.
+# Gate answering, verifier grading and gate filing route on this identity; row
+# creation and the loop actor stamps do not. Widening the set later is a decision
+# somebody should have to make on purpose, not an omission that quietly grows.
+#
+# NOTE THE BLAST RADIUS, because it is the reason this is safe to land at once:
+# the refusal can only fire when `--from` was ACTUALLY SUPPLIED and disagrees. A
+# caller that passes no claim gets `absent`, which is a pass. Every rail in the
+# fleet that does not pass `--from` is untouched by this function.
+actor_require_corroborated() {
+  local verb="${1:-}" claim="${2:-}"
+  actor_claim "$claim" && return 0
+  case "$ACTOR_CLAIM_STATUS" in
+    divergent)
+      fail "$E_AUTH_REQUIRED" \
+        "--from=${ACTOR_CLAIMED} contradicts the derived actor '${ACTOR_BOARD}' (uid ${ACTOR_UID} -> ${ACTOR_UNIX}, via ${ACTOR_BOARD_SOURCE}). '${verb}' decides an authorization on this identity, so a claim that does not corroborate is refused rather than recorded. Drop --from to act as yourself." ;;
+    *)
+      fail "$E_AUTH_REQUIRED" \
+        "--from=${ACTOR_CLAIMED} cannot be corroborated: this uid (${ACTOR_UID} -> ${ACTOR_UNIX:-<unresolved>}) maps to no board actor (${ACTOR_BOARD_SOURCE}). '${verb}' decides an authorization on this identity, so an unverifiable claim is refused rather than recorded." ;;
+  esac
+}

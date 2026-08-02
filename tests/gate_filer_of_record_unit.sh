@@ -32,6 +32,9 @@ set -uo pipefail
 . "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh" \
   || printf 'grading tree: UNRESOLVED (tests/lib/grading_tree.sh not reachable; no tree named)\n' >&2
 cd "$(dirname "$0")/.."
+# DIVE-2518: `--from` is a CLAIM that must corroborate the uid-derived actor,
+# so filing a gate AS dev3 now means DERIVING as dev3. tests/lib/actor_seam.sh.
+. "$(dirname "${BASH_SOURCE[0]}")/lib/actor_seam.sh"
 SRC=src
 TMP="$(mktemp -d /tmp/gate-filer-record.XXXXXX)"
 trap 'rm -rf "$TMP"' EXIT
@@ -108,7 +111,7 @@ run_esc() { : >"$TMP/out"; cmd_task_gate_escalate "$1" >"$TMP/out" 2>&1; local r
 db "INSERT INTO tasks (ident,title,priority,assignee,created_by,kind,status)
     VALUES ('DIVE-9101','creators task','high','main','main','standard','todo');"
 FILER_SELF=""; READABLE=""; PAIRED=""
-out=$( (cmd_task_need DIVE-9101 --type=decision --ask="which way?" --options="A|B" --recommend="A" --from=dev3) 2>&1 )
+out=$( (actor_seam_as dev3; cmd_task_need DIVE-9101 --type=decision --ask="which way?" --options="A|B" --recommend="A" --from=dev3) 2>&1 )
 row=$(db "SELECT COALESCE(gate_filed_by,'NULL')||'|'||COALESCE(created_by,'NULL')||'|'||COALESCE(assignee,'NULL')
           FROM tasks WHERE ident='DIVE-9101';")
 [[ "$row" == "dev3|main|dev3" ]] \
@@ -162,7 +165,7 @@ run_esc DIVE-9102; rc=$?
 
 # ---- 4. withdraw clears the stamp with the rest of the provenance ------------
 FILER_SELF=""; READABLE="qa olivia main"; PAIRED="qa olivia main"
-out=$( (cmd_task_need DIVE-9101 --withdraw --from=dev3) 2>&1 ); rc=$?
+out=$( (actor_seam_as dev3; cmd_task_need DIVE-9101 --withdraw --from=dev3) 2>&1 ); rc=$?
 left=$(db "SELECT COALESCE(gate_filed_by,'NULL')||'|'||COALESCE(need_type,'NULL') FROM tasks WHERE ident='DIVE-9101';")
 [[ "$left" == "NULL|NULL" ]] \
   && ok_t "task need --withdraw clears gate_filed_by with the gate" \

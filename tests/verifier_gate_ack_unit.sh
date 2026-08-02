@@ -37,6 +37,10 @@ set -uo pipefail
 . "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh" \
   || printf 'grading tree: UNRESOLVED (tests/lib/grading_tree.sh not reachable; no tree named)\n' >&2
 cd "$(dirname "$0")/.."
+# DIVE-2518: impersonate through the SEALED seam. `USER=agent-x` no longer moves
+# the actor — that env path WAS the forgery this ticket closed, and these arms
+# were leaning on it. tests/lib/actor_seam.sh explains the migration.
+. "$(dirname "${BASH_SOURCE[0]}")/lib/actor_seam.sh"
 SRC=src
 
 TMP="$(mktemp -d /tmp/verifier-gate-ack.XXXXXX)"
@@ -81,8 +85,8 @@ _gate_withdraw_actor() { printf '%s' "$GATE_ACTOR"; }
 
 tasks_db_init
 
-as() { local who="$1"; shift; ( USER="agent-${who}"; SUDO_UID=""; SUDO_USER=""; "$@" ) 2>"$TMP/err"; }
-[[ "$( ( USER=agent-reviewer; SUDO_UID=""; SUDO_USER=""; task_actor ) )" == "reviewer" ]] \
+as() { local who="$1"; shift; ( actor_seam_as "${who}"; "$@" ) 2>"$TMP/err"; }
+[[ "$( ( actor_seam_as reviewer; task_actor ) )" == "reviewer" ]] \
   && ok_t "harness can impersonate an actor (task_actor → reviewer)" \
   || bad_t "actor impersonation broken" "every case below would be vacuous"
 

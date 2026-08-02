@@ -1414,10 +1414,36 @@ _envelope_sender_fallback() {
 # NOT CLOSED: $SUDO_USER remains forgeable wherever it is still consulted, which is now
 # only the root/_deliver path where sudo wrote it. DIVE-2330 owns that vector where it
 # feeds AUTHORIZATION rather than display.
+#
+# DIVE-2518 CLOSES THE "NOT CLOSED" ABOVE. The two branches are unchanged in intent;
+# what changed is that the first one is now the SEALED derivation (lib/actor.sh)
+# instead of this file's private passwd walk, and the second is gated on the REAL
+# root check instead of running unconditionally.
+#
+# That gate is the fix. `auto_sender_from_sudo` used to be consulted whenever the
+# EUID branch came back empty — which is every non-`agent-*` caller, `claude`
+# included. A non-root process exporting `SUDO_USER=agent-<x>` therefore minted an
+# envelope naming another agent, with no sudo involved: exactly the forgery the
+# comment above says is trustworthy "only where sudo wrote it", consulted on the one
+# path where sudo did not. Behind `_gate_is_root` the variable is only read where
+# the elevation itself proves sudo ran.
+#
+# `actor_derive` already covers the root/_deliver case better than the fallback does
+# — at EUID 0 it resolves sudo's NUMERIC `$SUDO_UID` through /etc/passwd rather than
+# trusting the NAME in `$SUDO_USER`. The name-based call is kept behind it only for
+# the case where sudo set one and not the other, so the measured behaviour this file
+# records (EUID=0 + SUDO_USER=agent-main still yields 'main') is preserved exactly.
+#
+# The `agent-*` test stays: this is the ENVELOPE sender, and a non-agent caller must
+# still produce NO envelope rather than a new one. Widening it here would create an
+# envelope where there previously was none, and a reader trusts an envelope more
+# than its absence — the same regression the ordering note above records.
 _envelope_caller() {
-  local who
-  who="$(_envelope_sender_fallback)"
-  [[ -n "$who" ]] || who="$(auto_sender_from_sudo)"
+  local who=""
+  if actor_derive >/dev/null 2>&1 && [[ "$ACTOR_UNIX" == agent-* ]]; then
+    who="${ACTOR_UNIX#agent-}"
+  fi
+  if [[ -z "$who" ]] && _gate_is_root; then who="$(auto_sender_from_sudo)"; fi
   printf '%s' "$who"
 }
 

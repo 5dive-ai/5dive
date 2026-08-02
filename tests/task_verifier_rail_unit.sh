@@ -29,6 +29,10 @@ set -uo pipefail
 . "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh" \
   || printf 'grading tree: UNRESOLVED (tests/lib/grading_tree.sh not reachable; no tree named)\n' >&2
 cd "$(dirname "$0")/.."
+# DIVE-2518: impersonate through the SEALED seam. `USER=agent-x` no longer moves
+# the actor — that env path WAS the forgery this ticket closed, and these arms
+# were leaning on it. tests/lib/actor_seam.sh explains the migration.
+. "$(dirname "${BASH_SOURCE[0]}")/lib/actor_seam.sh"
 SRC=src
 TMP="$(mktemp -d /tmp/task-verifier-rail-unit.XXXXXX)"
 trap 'rm -rf "$TMP"' EXIT
@@ -55,7 +59,7 @@ runt() { local verb="$1"; shift; ( JSON_MODE=0; "cmd_task_$verb" "$@" ) 2>"$TMP"
 # may close has to say who is calling. task_actor() falls back to $USER when there
 # is no sudo mapping and no --from.
 run_as() { local who="$1" verb="$2"; shift 2
-           ( USER="agent-${who}"; SUDO_UID=""; SUDO_USER=""; JSON_MODE=1; "cmd_task_$verb" "$@" ) 2>"$TMP"/err; }
+           ( actor_seam_as "${who}"; JSON_MODE=1; "cmd_task_$verb" "$@" ) 2>"$TMP"/err; }
 jf()   { jq -r "$1" 2>/dev/null; }
 has()  { [[ "$1" == *"$2"* ]]; }
 

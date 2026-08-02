@@ -61,7 +61,30 @@ if [[ -z "${GRADING_TREE_SOURCE_RE:-}" ]]; then
   exit 0
 fi
 
-if ! diff_out="$(git diff --name-only --diff-filter=A "$BASE" "$NEW" -- 'tests/*.sh' 2>&1)"; then
+# SCOPE MUST MATCH THE CONTRACT TEST'S, and it did not (DIVE-2518).
+#
+# The contract enumerates the corpus as `CORPUS=(tests/*.sh)` — a SHELL glob, which
+# does not descend into `tests/lib/`. This guard used the git pathspec `tests/*.sh`,
+# and git's wildmatch runs WITHOUT WM_PATHNAME by default, so its `*` DOES cross `/`
+# and the pathspec silently also matched `tests/lib/*.sh`.
+#
+# So the guard and the contract it exists to front-run disagreed about what a
+# harness IS — the exact drift this file's header says the shared
+# GRADING_TREE_SOURCE_RE prevents. Sharing the regex was never enough: two checks
+# can apply an identical predicate to different populations and still diverge.
+#
+# It fires on the first `tests/lib/` helper added since the guard shipped, and the
+# fix it prints is actively WRONG there: the snippet resolves
+# `$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh`, which from inside tests/lib/
+# is `tests/lib/lib/grading_tree.sh` — a path that cannot exist. Following the
+# instruction would have made every harness sourcing that helper print
+# "grading tree: UNRESOLVED" forever. `tests/lib/pinned_baseline.sh` and
+# `tests/lib/grading_tree.sh` itself are both already in the tree without the line,
+# because they predate the guard rather than because they were exempted.
+#
+# A helper is not a harness: it has no arms, it names no tree, and it is sourced BY
+# the harness that does.
+if ! diff_out="$(git diff --name-only --diff-filter=A "$BASE" "$NEW" -- 'tests/*.sh' ':(exclude)tests/lib/*' 2>&1)"; then
   echo "harness-tree-guard: BLOCKED -- could not enumerate tests/*.sh files added by this push (git diff --diff-filter=A $BASE $NEW failed: $diff_out). Refusing rather than silently reporting clear, since nothing was actually checked." >&2
   exit 1
 fi

@@ -791,12 +791,23 @@ cmd_task_add() {
       verify_unavailable=1
     fi
   fi
-  local creator; creator=$(task_actor "$from")
+  # DIVE-2518: `task_actor_claim`, not `task_actor` — this site WRITES the row, so
+  # it needs the claim GRADE and not just the name, and a `$( )` would lose it. The
+  # stamped `created_by` is the derived actor; a `--from` that did not corroborate
+  # is preserved beside it in `claimed_by` rather than replacing it. Recording both
+  # is what keeps the row falsifiable later: `created_by` alone cannot distinguish
+  # a measured identity from an asserted one.
+  # BARE call, not `$( )` — the grade must survive into this shell. See the
+  # contract note on task_actor_claim; a command substitution here silently
+  # NULLs claimed_by for every divergent claim.
+  task_actor_claim "$from"
+  local creator="$ACTOR_BOARD"
+  local claimed_by; claimed_by=$(actor_claim_note)
   local id
-  id=$(db "INSERT INTO tasks (title, body, priority, assignee, created_by, parent_id, project_key, kind, schedule, fresh,
+  id=$(db "INSERT INTO tasks (title, body, priority, assignee, created_by, claimed_by, parent_id, project_key, kind, schedule, fresh,
                               acceptance_criteria, verify_command, max_iterations, verifier, task_budget, verify_unavailable)
            VALUES ($(sqlq "$title"), $(sqlq_or_null "$body"), $(sqlq "$priority"),
-                   $(sqlq_or_null "$assignee"), $(sqlq "$creator"), ${parent_sql}, $(sqlq "$project"),
+                   $(sqlq_or_null "$assignee"), $(sqlq "$creator"), $(sqlq_or_null "$claimed_by"), ${parent_sql}, $(sqlq "$project"),
                    $(sqlq "$kind"), ${schedule_sql}, ${fresh_sql},
                    $(sqlq_or_null "$accept"), $(sqlq_or_null "$verify_cmd"), ${max_iters:-NULL}, $(sqlq_or_null "$verifier"), $(sqlq_or_null "$task_budget"), $([[ $verify_unavailable == 1 ]] && echo 1 || echo NULL));
            SELECT last_insert_rowid();")
@@ -809,7 +820,7 @@ cmd_task_add() {
   # edited after the fact.
   ledger_emit task.created ident="$ident" task_id="$id" \
     parent="$(db "SELECT COALESCE(p.ident,'') FROM tasks t LEFT JOIN tasks p ON p.id=t.parent_id WHERE t.id=${id};" 2>/dev/null)" \
-    actor="$creator" in="$title" \
+    actor="$creator" claimed_by="$claimed_by" in="$title" \
     detail="${priority} → ${assignee:-unassigned}${verifier:+ (verifier ${verifier})}"
   if [[ "$kind" == "recurring" ]]; then
     ok "created recurring ${ident} (${recurring}, fresh=$([[ "$fresh_sql" == "1" ]] && echo on || echo off)) — $title" \
@@ -5197,6 +5208,29 @@ cmd_task_need() {
   [[ ${#positional[@]} -gt 0 ]] || fail "$E_USAGE" "usage: 5dive task need <id|DIVE-N> --type=decision|secret|approval|manual --ask=\"...\" [--options=A|B] [--recommend=\"A\"] [--needs=human_tap|spend_authority|secret_provision] [--discusses=\"why this decision only DISCUSSES a floored category\"]  (--type=secret also needs a delivery path: --secret-key=<ENV_NAME> --connector=<stem>, or --out-of-band=\"<where the value lands>\"; or --withdraw to cancel a moot pending gate)"
   resolve_task_id "${positional[0]}"; local id="$RESOLVED_TASK_ID" ident="$RESOLVED_TASK_IDENT"
 
+  # DIVE-2518 — THE REFUSAL. On the filing path `--from` does not label a record:
+  # it feeds `_gate_route_reviewer` (four sites below) which picks WHO IS ALLOWED
+  # TO CLEAR this gate. That is an authorization outcome, and this is the one
+  # task_actor site where a claim decides one with no independent uid check in
+  # front of it. A claim that does not corroborate the derivation is refused here
+  # rather than recorded.
+  #
+  # THE VERB SET IS CLOSED AND THIS IS ITS ONLY MEMBER, deliberately:
+  #   task answer  EXCLUDED. `--from` there is PROVENANCE sitting behind a control
+  #                that already fails closed (`_gate_authenticated_actor` plus the
+  #                tier-2 channel proof), and the Telegram button rail legitimately
+  #                relays a claim that cannot corroborate — `cmd_task_clear_recs`
+  #                passes `--from=telegram` straight into it. Refusing there would
+  #                break a live rail in order to duplicate an existing guard.
+  #   --withdraw   EXCLUDED. `_gate_withdraw_actor` already ignores `--from` for
+  #                authorization (DIVE-1401), so a claim is inert on that path.
+  #   everything else (row creation, the six loop actors, the ledger stamps) is
+  #                bookkeeping: the claim is RECORDED beside the derived actor.
+  #
+  # Blast radius: this can only fire when `--from` was actually supplied AND
+  # disagrees. No claim means `absent`, which passes.
+  [[ -n "$withdraw" ]] || actor_require_corroborated "task need" "$from"
+
   # DIVE-1401: --withdraw path. Secret/approval/manual gates are human-only to
   # CLEAR by deliberate security scope (an agent can't fake a secret grant). But
   # WITHDRAWING a still-pending request the team itself filed is not a grant — it
@@ -8978,7 +9012,15 @@ cmd_task_answer() {
   # the `standing:` infix is the new, additive fact. `need_answered_by` is inside
   # the DIVE-756 signed closure, so this marker is tamper-evident: a raw DB edit
   # that downgrades `lead:standing:main` to `lead:main` fails `gate-proof verify`.
-  [[ "$_lead_standing" == "1" ]] && (( ! human )) && answered_by="lead:standing:$(task_actor "$from")"
+  # DIVE-2518: name the actor the standing check AUTHENTICATED, not the one the
+  # caller claimed. `_lead_standing` is decided above by `_gate_authenticated_actor`
+  # == `_gate_standing_lead` — the sealed uid-first derivation — while this label
+  # was built from `task_actor "$from"`, which took `--from` verbatim. The two can
+  # name DIFFERENT agents, and the row would then read `lead:standing:<claimed>`
+  # for a standing that was granted to <derived>: a proof string asserting exactly
+  # what the check did not verify. The label now comes from the same resolver as
+  # the decision, which is the property `gate-proof verify` is reading it for.
+  [[ "$_lead_standing" == "1" ]] && (( ! human )) && answered_by="lead:standing:$(_gate_authenticated_actor)"
 
   # DIVE-756: stamp the REAL invoker uid ($SUDO_UID survives `sudo -u agent-X`,
   # unlike need_answered_by) and a tamper-evidence signature over the closure
