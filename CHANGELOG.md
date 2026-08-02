@@ -1,5 +1,35 @@
 # Changelog
 
+## Unreleased — feat(task): merge-audit LABELS findings delivered-vs-cited, and never filters them (DIVE-1975)
+
+DIVE-1965 taught the merge *gate* to tell "I shipped this PR" from "I am writing about this PR",
+and to skip the second. `task merge-audit` is the same predicate over the same data feeding a
+different consumer, and it never learned the split: the retrospective sweep still reported a PR
+that a done task merely CITED as if it were that task's own unmerged work.
+
+Every finding now carries `delivered` or `cited`, in the columns and in `--json` (`origin` per row,
+plus `delivered` / `cited` totals in the summary). Nothing is dropped.
+
+The label is the whole change, and the refusal to filter is the load-bearing half. A blocking gate
+and a non-blocking sweep want OPPOSITE safe defaults on the same predicate. The gate blocks a
+close, so over-judging stalls the fleet and its default is CITED with delivery asserted. The sweep
+blocks nothing and a human reads it, so over-reporting costs one line to dismiss while
+under-reporting hides real unmerged work. Filtering to "delivered only" would rebuild the
+blindness DIVE-1955 existed to remove, one layer down and harder to see: the sweep would come back
+clean while the work it was built to find sat unmerged behind a maker's phrasing. DIVE-1965's own
+known coverage seam, an own delivery phrased outside the shipping-verb vocabulary, lands exactly
+there.
+
+Two deliberate widenings of `delivered`, both harmless because nothing is dropped: the
+`delivery_ref` column folds in (it never reaches the gate's prose classifier, but a bound
+delivery_ref is the strongest delivery assertion there is), and the audit row arrives with
+newlines collapsed, so the classifier's line-scoping degrades to text-scoping.
+
+Seven arms added to `tests/task_merge_gate_delivered_vs_cited_unit.sh` (39 total), each
+differential on the same PR number in the same repo so a hardcoded label fails at least one.
+Graded by mutation: always-cited, always-delivered, filter-cited-out, and drop-the-column each
+turn arms red.
+
 ## Unreleased — fix(task): refuse a close that would REPLACE an already-closed row's result (DIVE-2464)
 
 `5dive task done <id> --result=...` on a row that was already done overwrote the result column and

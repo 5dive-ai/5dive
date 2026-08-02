@@ -310,5 +310,87 @@ run_done DREF-1 --result='Also reviewed PR #10, still open.'
   && ok_t 'a declared delivery_ref closes over a cited OPEN PR without consulting the prose' \
   || bad_t 'declared path must ignore citations' "rc=$RC status=$(statusof DREF-1) out=$OUT"
 
+# --- 12. DIVE-1975: the OTHER consumer of the same predicate -----------------
+# `task merge-audit` reads delivery_ref + result + body exactly like the gate above,
+# but it BLOCKS NOTHING — a human reads it. So the safe default inverts: the gate
+# skips what it cannot bind to this task, the sweep must still PRINT it and merely
+# label it. A filter here would rebuild the DIVE-1955 blindness one layer down and
+# harder to see, because the sweep would come back clean while the work it exists to
+# find sat unmerged behind a maker's phrasing.
+#
+# Every arm below is DIFFERENTIAL — the same PR number, in the same repo, resolved
+# by the same stub — so a hardcoded label (either one) fails at least one of them.
+# The audit scans the whole store, so the earlier arms' rows are cleared first and
+# only these five exist while it runs.
+clear_fx
+db "DELETE FROM tasks;"
+export GH_STUB_PR_5dive_api_10="$OPEN_X"
+export GH_STUB_PR_5dive_168="$MERGED_OK"
+seed_done() { # <ident> <result> [delivery_ref]
+  db "DELETE FROM tasks WHERE ident='$1';
+      INSERT INTO tasks (ident, title, body, result, delivery_ref, status, created_by, assignee, done_at)
+        VALUES ('$1','t','',$(sqlq "$2"),$(sqlq_or_null "${3:-}"),'done','main','main',datetime('now'));"
+}
+audit_line() { printf '%s\n' "$AUD_OUT" | grep -E "^$1[[:space:]]"; }
+
+seed_done AUD-CITE  'Fixes the crash reported in https://github.com/lodar/5dive-api/pull/10.'
+seed_done AUD-SHIP  'Shipped as https://github.com/lodar/5dive-api/pull/10.'
+seed_done AUD-COL   'Closed out the follow-ups.' 'https://github.com/lodar/5dive-api/pull/10'
+seed_done AUD-PLAIN 'Closed out the follow-ups. https://github.com/lodar/5dive-api/pull/10'
+seed_done AUD-GREEN 'Merged as https://github.com/5dive-ai/5dive/pull/168.'
+AUD_OUT=$(cmd_task_merge_audit --limit=50 2>&1); AUD_RC=$?
+
+# THE LOAD-BEARING HALF: a citation of another task's OPEN PR is REPORTED, not
+# dropped — and it is not reported as this task's own unmerged work either.
+if [[ "$(audit_line AUD-CITE)" == *"#10"*"OPEN"*"cited"* ]]; then
+  ok_t 'merge-audit: a cited OPEN PR is REPORTED and labelled `cited` — never filtered out'
+else
+  bad_t 'a cited ref must still appear in the sweep' "rc=$AUD_RC line=[$(audit_line AUD-CITE)]"
+fi
+# ...and the same ref, same repo, same stub, asserted as a delivery, labels the
+# other way. This pair is what makes the arm above mean something.
+if [[ "$(audit_line AUD-SHIP)" == *"#10"*"OPEN"*"delivered"* ]]; then
+  ok_t 'merge-audit: the same PR asserted with a shipping verb labels `delivered`'
+else
+  bad_t 'an asserted delivery must label delivered' "line=[$(audit_line AUD-SHIP)]"
+fi
+# The delivery_ref COLUMN never reaches the gate's prose classifier (a declared ref
+# routes to the declared gate), but it is the strongest delivery assertion we have
+# and it IS part of this row's text. AUD-COL and AUD-PLAIN carry byte-identical
+# prose and differ ONLY in the column, so this cannot pass on the phrasing.
+if [[ "$(audit_line AUD-COL)" == *delivered* && "$(audit_line AUD-PLAIN)" == *cited* ]]; then
+  ok_t 'merge-audit: a bound delivery_ref labels `delivered` where identical prose alone labels `cited`'
+else
+  bad_t 'the delivery_ref column must fold into the delivered set' \
+        "col=[$(audit_line AUD-COL)] plain=[$(audit_line AUD-PLAIN)]"
+fi
+# Labelling must not change WHAT is reported: a merged+green ref is still no finding.
+[[ -z "$(audit_line AUD-GREEN)" ]] \
+  && ok_t 'merge-audit: labelling did not turn a merged+green delivery into a finding' \
+  || bad_t 'merged+green must stay silent' "line=[$(audit_line AUD-GREEN)]"
+# The summary counts both populations, so "4 findings" cannot hide a 3/1 split.
+[[ "$AUD_OUT" == *"2 delivered by the task, 2 only cited"* ]] \
+  && ok_t 'merge-audit: the summary line reports the delivered/cited split' \
+  || bad_t 'summary must carry both counts' "out=$AUD_OUT"
+# A `cited` label that reads as "already dismissed" is the filter we refused to
+# write, executed by the reader. The note has to say it is a label.
+[[ "$AUD_OUT" == *"It is a LABEL, not a"*filter* ]] \
+  && ok_t 'merge-audit: the note tells the reader `cited` is a label and not a filter' \
+  || bad_t 'the label must be announced as a label' "out=$AUD_OUT"
+
+# --json carries the same split, per row and in the totals — the dashboard and any
+# scripted consumer read this, not the columns.
+JSON_MODE=0
+AUD_JSON=$(cmd_task_merge_audit --limit=50 --json 2>/dev/null); JSON_MODE=0
+j() { printf '%s' "$AUD_JSON" | jq -r ".data|$1" 2>/dev/null; }
+[[ "$(j '.rows[]|select(.ident=="AUD-CITE").origin')" == "cited" \
+&& "$(j '.rows[]|select(.ident=="AUD-SHIP").origin')" == "delivered" \
+&& "$(j '.rows[]|select(.ident=="AUD-COL").origin')"  == "delivered" ]] \
+  && ok_t 'merge-audit --json: every row carries its own `origin`' \
+  || bad_t '--json rows must carry origin' "json=$AUD_JSON"
+[[ "$(j '.delivered')" == "2" && "$(j '.cited')" == "2" && "$(j '.findings')" == "4" ]] \
+  && ok_t 'merge-audit --json: delivered + cited are totalled and sum to findings' \
+  || bad_t '--json totals must carry the split' "json=$AUD_JSON"
+
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [[ $FAIL -eq 0 ]]
