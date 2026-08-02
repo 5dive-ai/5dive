@@ -366,12 +366,27 @@ else
     skip "T19-T21 could not create a scratch row in the (proven-isolated) store"
   else
     # 19. created_by is the DERIVED actor even when --from claims otherwise.
+    # DERIVE the expected board name; do NOT assume the runner is a registered
+    # agent. The in-process arms above stub `agent_tier` (registry.sh owns whether
+    # the file is read correctly), so they see every caller as registered — but
+    # these arms go through the REAL registry, and a principal it does not list is
+    # the `cli` sentinel by design. Hardcoding `$REAL_BOARD` here made T19/T20 red
+    # for `claude` (uid 1000, not a registered agent) while the product was behaving
+    # exactly as specified. Ground truth is the registry FILE, read directly, not
+    # `actor_registry_agent` — that is the function under test.
+    EXPECT_BOARD="cli"
+    if jq -e --arg n "$REAL_BOARD" '(.agents|type=="object") and (.agents|has($n))' \
+         /var/lib/5dive/agents.json >/dev/null 2>&1; then
+      EXPECT_BOARD="$REAL_BOARD"
+    elif [[ "$REAL_NAME" == agent-* ]]; then
+      EXPECT_BOARD="$REAL_BOARD"     # the passwd rung: registry silent, name is agent-*
+    fi
     tid2=$(e2e task add "DIVE-2518 claimed row" --project=dive --from="$FORGE_BOARD" 2>&1 | grep -oE 'DIVE-[0-9]+' | head -1)
     cb=$(e2e task show "$tid2" | awk -F' = ' '/^created_by /{print $2; exit}')
-    if [[ "$cb" == "$REAL_BOARD" ]]; then
-      ok "T19 e2e: --from=$FORGE_BOARD stamped created_by=$REAL_BOARD (the derivation, not the claim)"
+    if [[ "$cb" == "$EXPECT_BOARD" ]]; then
+      ok "T19 e2e: --from=$FORGE_BOARD stamped created_by=$EXPECT_BOARD (the derivation, not the claim)"
     else
-      no "T19 e2e: created_by='$cb', expected '$REAL_BOARD'"
+      no "T19 e2e: created_by='$cb', expected '$EXPECT_BOARD' (runner '$REAL_NAME')"
     fi
     # 19b. RECORD BOTH. T19 alone passes on a build that simply DROPS the claim,
     #      which is what the first cut did — `task_actor_claim` was called inside
@@ -394,14 +409,21 @@ else
     #     reason and still filed the gate.
     out=$(e2e task need "$tid" --type=decision --ask="harness probe" --from="$FORGE_BOARD"); rc=$?
     gates=$(e2e task show "$tid" | grep -c 'human gate:' || true)
+    # The refusal CLASS depends on the runner too, and the two are not
+    # interchangeable: a runner the registry attributes gets `divergent` ("you
+    # claim X and the uid says Y"), one it cannot attribute gets `unattributable`
+    # ("I could not check"). Asserting only "some refusal happened" would accept
+    # either on any runner and stop grading the partition the code exists to draw.
+    if [[ "$EXPECT_BOARD" == "cli" ]]; then WANT_REASON="cannot be corroborated"
+    else                                    WANT_REASON="contradicts the derived actor"; fi
     if (( rc == 0 )); then
       no "T20 e2e: task need accepted a divergent --from (rc 0)"
     elif (( gates != 0 )); then
       no "T20 e2e: refused rc$rc but the gate was FILED anyway — the action ran"
-    elif [[ "$out" == *"$FORGE_BOARD"* && "$out" == *"contradicts"* ]]; then
-      ok "T20 e2e: task need --from=$FORGE_BOARD refused rc$rc, NO gate filed, reason names the claim"
+    elif [[ "$out" == *"$FORGE_BOARD"* && "$out" == *"$WANT_REASON"* ]]; then
+      ok "T20 e2e: task need --from=$FORGE_BOARD refused rc$rc, NO gate filed, reason names the claim ('$WANT_REASON' — correct class for runner '$REAL_NAME')"
     else
-      no "T20 e2e: refused rc$rc with no gate, but the reason is unrecognisable: $(printf '%s' "$out" | head -c 200)"
+      no "T20 e2e: refused rc$rc with no gate, but the reason is not the '$WANT_REASON' class: $(printf '%s' "$out" | head -c 200)"
     fi
     # 21. LIVENESS for T20: the same verb with NO claim must SUCCEED and file the
     #     gate. Without this, a `task need` broken for everyone passes T20.
@@ -412,7 +434,46 @@ else
     else
       no "T21 task need with no claim failed (rc$rc, gates=$gates): $(printf '%s' "$out" | head -c 200)"
     fi
+
+    # 22. THE EXCLUSION, EXERCISED. `task answer` is deliberately outside the
+    #     privileged set: `--from` there is provenance behind a control that
+    #     already fails closed, and the Telegram button rail relays a claim that
+    #     can never corroborate (`cmd_task_clear_recs` passes --from=telegram).
+    #     An exclusion nobody exercises is a hole with a comment on it — so assert
+    #     that the corroboration guard does NOT fire here. The verb may still
+    #     refuse for its own reasons (tier, proof, gate state); what must never
+    #     appear is THIS guard's refusal.
+    out=$(e2e task answer "$tid" --value=A --from=telegram)
+    if [[ "$out" == *"contradicts the derived actor"* || "$out" == *"cannot be corroborated"* ]]; then
+      no "T22 the corroboration guard fired on 'task answer', which is excluded by design — this breaks the Telegram button rail: $(printf '%s' "$out" | head -c 200)"
+    else
+      ok "T22 'task answer --from=telegram' is NOT refused by the corroboration guard (the relay rail survives)"
+    fi
+
+    # 23. DIFFERENTIAL for T22. Without this, T22 passes on a build where the
+    #     guard was never wired at all. The SAME non-corroborating claim, on the
+    #     verb that IS in the set, must produce exactly the refusal T22 forbids.
+    tid3=$(e2e task add "DIVE-2518 exclusion differential" --project=dive 2>&1 | grep -oE 'DIVE-[0-9]+' | head -1)
+    out=$(e2e task need "$tid3" --type=decision --ask="differential probe" --from=telegram); rc=$?
+    if (( rc != 0 )) && [[ "$out" == *"contradicts the derived actor"* || "$out" == *"cannot be corroborated"* ]]; then
+      ok "T23 the SAME claim on 'task need' IS refused — the exclusion is verb-scoped, not a dead guard"
+    else
+      no "T23 'task need --from=telegram' was not refused (rc$rc) — T22 proves nothing: $(printf '%s' "$out" | head -c 200)"
+    fi
   fi
+  fi
+
+  # 24. THE ISOLATION FENCE MUST BE ABLE TO GO RED. A fence that passes whether or
+  #     not the store is isolated is the same defect one layer up — and this exact
+  #     harness shipped an iteration that wrote two real rows to the shared board
+  #     and a real gate to a real verifier while every arm passed. Run the fence's
+  #     OWN predicate against the DEFAULT (un-redirected) store: it must trip.
+  #     Read-only, and it never writes.
+  unfenced=$("$BIN" task ls 2>/dev/null | grep -c 'DIVE-' || true)
+  if (( unfenced == 0 )); then
+    skip "T24 the default store lists 0 rows on this runner, so the fence has nothing to trip on"
+  elif (( unfenced != 0 )); then
+    ok "T24 the isolation fence's predicate TRIPS on the un-redirected store ($unfenced rows) — it is not a fence that passes either way"
   fi
   rm -rf "$SBOX"
 fi
