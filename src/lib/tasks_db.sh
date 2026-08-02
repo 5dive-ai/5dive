@@ -2099,10 +2099,11 @@ ledger_emit() {
       claimed_by=*) claimed="${kv#*=}" ;;
     esac
   done
-  # DIVE-2518: when the stamped actor is a CLAIM that the uid does not corroborate,
-  # the measured actor rides in the DETAIL. `actor` keeps its existing meaning (who
-  # the row is attributed to), and the reader gains the one thing the ledger could
-  # never say before: who actually ran it.
+  # DIVE-2518: the MEASURED actor rides in the DETAIL whenever it is known. `actor`
+  # keeps its existing meaning (who the row is attributed to) and the reader gains
+  # the one thing the ledger could never say before: who actually ran it. Emitted
+  # for agreement as well as divergence — a ledger row that records only conflicts
+  # cannot distinguish "they matched" from "nobody looked".
   # Folded into detail rather than a new column on purpose — lifecycle_events is
   # append-only history and an ALTER on it would leave every pre-existing row with a
   # NULL that reads as "no claim" when it actually means "not recorded yet".

@@ -805,11 +805,17 @@ cmd_task_add() {
   # RECORD BOTH, with the columns the right way round. `created_by` keeps its
   # meaning — who this row is attributed to, which for a uid-less relay principal
   # (`council`, `telegram`) can only ever be the claim. `derived_actor` carries the
-  # uid that actually ran it, and ONLY when the two differ, so a forged `--from` is
-  # falsifiable afterwards instead of leaving a row that cannot be questioned.
-  # Empty when they agree: stamping every row would bury the disagreements.
-  local derived_actor=""
-  [[ "$creator" != "$ACTOR_BOARD" ]] && derived_actor="$ACTOR_BOARD"
+  # uid that actually ran it.
+  #
+  # ALWAYS POPULATED, never only-on-divergence (olivia, DIVE-2518 review). A
+  # conditionally written column makes NULL mean three different things at read
+  # time — the claim agreed, the row predates the column, or the row came through a
+  # path that does not populate it — which is the exact absent-vs-not-measured
+  # collapse lib/actor.sh's own header says this epoch exists to end. It costs one
+  # column write, and AGREEMENT IS EVIDENCE TOO: a row where the two match is a
+  # positive record that the uid was measured and corroborated the claim, which is
+  # not something a NULL can ever say.
+  local derived_actor="$ACTOR_BOARD"
   local id
   id=$(db "INSERT INTO tasks (title, body, priority, assignee, created_by, derived_actor, parent_id, project_key, kind, schedule, fresh,
                               acceptance_criteria, verify_command, max_iterations, verifier, task_budget, verify_unavailable)

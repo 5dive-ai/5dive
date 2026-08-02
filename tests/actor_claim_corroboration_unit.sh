@@ -163,6 +163,23 @@ else
   no "T3 claim returned but the measurement was lost: ACTOR_BOARD='$ACTOR_BOARD' status='$ACTOR_CLAIM_STATUS'"
 fi
 
+# 3b. THE ASYMMETRY ITSELF, in one arm, because it is the whole design and a
+#     refactor that "tidies" the two paths into one would otherwise red nothing.
+#     The SAME name, offered two ways, must produce two DIFFERENT answers:
+#       via $SUDO_USER (env, no privilege, no trace)  -> IGNORED
+#       via --from     (argv, deliberate, logged)     -> HONOURED
+#     If these ever agree, one of the two threats has been silently reclassified.
+reset_memo
+via_env=$(SUDO_USER="$FORGE_SUDO" task_actor)
+via_argv=$(task_actor "$FORGE_BOARD")
+if [[ "$via_env" == "$via_argv" ]]; then
+  no "T3b the env and argv paths now AGREE (both '$via_env') — the two threats have been collapsed into one answer"
+elif [[ "$via_env" == "$REAL_BOARD" && "$via_argv" == "$FORGE_BOARD" ]]; then
+  ok "T3b env is ignored ('$via_env') while argv is honoured ('$via_argv') — the asymmetry the design rests on"
+else
+  no "T3b unexpected: via_env='$via_env' (want '$REAL_BOARD'), via_argv='$via_argv' (want '$FORGE_BOARD')"
+fi
+
 # 4-7. the four claim states are DISTINCT. Folding any two is the collapse the
 #      epoch exists to undo, and each is what a different reader needs.
 reset_memo; actor_claim ""            ; s_absent="$ACTOR_CLAIM_STATUS"; rc_absent=$?
@@ -375,10 +392,14 @@ else
       "SELECT COALESCE(derived_actor,'<null>') FROM tasks WHERE ident='$tid';" 2>/dev/null)
     if [[ -z "$cby" && -z "$cby_none" ]]; then
       skip "T19b sqlite3 unavailable or store unreadable; claimed_by not graded"
-    elif [[ "$cby" == "$EXPECT_BOARD" && "$cby_none" == "<null>" ]]; then
-      ok "T19b e2e: the MEASURED actor rides beside the claim (derived_actor=$EXPECT_BOARD); a no-claim row stays NULL"
+    # ALWAYS POPULATED, both rows. A column written only on divergence makes NULL
+    # mean three things — the claim agreed, the row predates the column, or the path
+    # does not populate it — and agreement is evidence in its own right: it says the
+    # uid WAS measured and DID corroborate, which a NULL can never say.
+    elif [[ "$cby" == "$EXPECT_BOARD" && "$cby_none" == "$EXPECT_BOARD" ]]; then
+      ok "T19b e2e: derived_actor=$EXPECT_BOARD on BOTH rows — divergent and agreeing alike; NULL keeps exactly one meaning"
     else
-      no "T19b e2e: derived_actor='$cby' (expected '$EXPECT_BOARD'), no-claim row='$cby_none' (expected <null>)"
+      no "T19b e2e: derived_actor='$cby' (claimed row) / '$cby_none' (no-claim row); both must be '$EXPECT_BOARD'"
     fi
     # 19c. The LEDGER half. `claimed_by` is written in two places from one variable
     #      — the tasks column and lifecycle_events' detail — and T19b covers only
@@ -392,10 +413,10 @@ else
       "SELECT COALESCE(detail,'') FROM lifecycle_events WHERE kind='task.created' AND ident='$tid';" 2>/dev/null)
     if [[ -z "$lact" ]]; then
       skip "T19c lifecycle_events unreadable; the ledger half is not graded"
-    elif [[ "$lact" == "${FORGE_BOARD}|"* && "$lact" == *"derived_actor=${EXPECT_BOARD}"* && "$lact_none" != *"derived_actor="* ]]; then
-      ok "T19c e2e: the ledger keeps actor=$FORGE_BOARD and carries derived_actor=$EXPECT_BOARD in detail; a no-claim row carries neither"
+    elif [[ "$lact" == "${FORGE_BOARD}|"* && "$lact" == *"derived_actor=${EXPECT_BOARD}"* && "$lact_none" == *"derived_actor=${EXPECT_BOARD}"* ]]; then
+      ok "T19c e2e: the ledger keeps actor=$FORGE_BOARD and carries derived_actor=$EXPECT_BOARD — on the agreeing row too"
     else
-      no "T19c e2e: ledger row='$lact' (want actor '$FORGE_BOARD' + derived_actor=$EXPECT_BOARD), no-claim detail='$lact_none'"
+      no "T19c e2e: ledger row='$lact' (want actor '$FORGE_BOARD' + derived_actor=$EXPECT_BOARD), no-claim detail='$lact_none' (want derived_actor=$EXPECT_BOARD)"
     fi
     # 20. THE REFUSAL, through the real exiting `fail`: the gate must NOT exist
     #     afterwards. rc alone would stay green if the verb refused for any other
@@ -410,7 +431,7 @@ else
     fb=$(sqlite3 "$SBOX/tasks/tasks.db" \
       "SELECT COALESCE(gate_filed_by,'') FROM tasks WHERE ident='$tid';" 2>/dev/null)
     if (( rc != 0 )); then
-      no "T20 e2e: task need --from=$FORGE_BOARD was REFUSED (rc$rc) — legitimate relay is broken: $(printf '%s' "$out" | head -c 160)"
+      no "T20 e2e: task need --from=$FORGE_BOARD was REFUSED (rc$rc) — this is the ~120-call-site filing idiom; refusing it truncates unsubshelled callers rather than failing them: $(printf '%s' "$out" | head -c 160)"
     elif [[ "$fb" == "$FORGE_BOARD" ]]; then
       ok "T20 e2e: the gate files and gate_filed_by keeps the claim ($FORGE_BOARD) — provenance, per DIVE-1401/1945/2015; what the claim does NOT get is the routing decision (T23)"
     else
@@ -476,6 +497,25 @@ else
   #     and a real gate to a real verifier while every arm passed. Run the fence's
   #     OWN predicate against the DEFAULT (un-redirected) store: it must trip.
   #     Read-only, and it never writes.
+  # 26. THE UID-LESS PRINCIPAL, which is the measurement that killed design 1.
+  #     `council` and `telegram` are not unix users and never will be, so NO
+  #     derivation can produce them. A build that returns the derived value here
+  #     does not harden the row — it reattributes it to whoever ran the process, and
+  #     `created_by` is what the whole board reads as ground truth. Deliberately
+  #     uses a name that CANNOT be a passwd entry on any runner, so the arm is not
+  #     quietly satisfied by a coincidence of naming.
+  cout=$(e2e task add "DIVE-2518 uid-less relay probe" --project=dive --from=council 2>&1)
+  ctid=$(printf '%s' "$cout" | grep -oE 'DIVE-[0-9]+' | head -1)
+  ccb=$(sqlite3 "$SBOX/tasks/tasks.db" \
+    "SELECT created_by||'|'||COALESCE(derived_actor,'<NULL>') FROM tasks WHERE ident='$ctid';" 2>/dev/null)
+  if [[ -z "$ctid" ]]; then
+    no "T26 the uid-less relay add failed outright: $(printf '%s' "$cout" | head -c 160)"
+  elif [[ "$ccb" == "council|$EXPECT_BOARD" ]]; then
+    ok "T26 a principal with NO uid keeps its name (created_by=council) and the runner is still measured beside it (derived_actor=$EXPECT_BOARD)"
+  else
+    no "T26 uid-less relay wrote '$ccb', expected 'council|$EXPECT_BOARD' — relay attribution is lost"
+  fi
+
   # 25. A BRAND-NEW STORE, where the FIRST WRITE is also the process that creates
   #     the schema. This is a different path from every other e2e arm here: those
   #     run `task init` first, so by the time they write, the store EXISTS and
