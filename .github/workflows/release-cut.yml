@@ -158,7 +158,14 @@ jobs:
           # copied verbatim from the base, so 0.18.0 was unreachable from any path, and the
           # fleet would have kept installing 0.17.x builds that already contained the work.
           #
-          # RELEASE_LEVEL comes from the dispatch input via env, NOT from a ${{ }} template,
+          # RELEASE_LEVEL reaches this block through `env:` rather than through an
+          # Actions expression template. That is deliberate and it is also load-bearing
+          # for the harness: tests/release_cut_assign_unit.sh extracts these bytes and
+          # runs them, so anything the runner substitutes before bash sees it would be
+          # ungradeable. NOTE FOR ANYONE EDITING THIS COMMENT: do NOT write an Actions
+          # expression delimiter literally anywhere in a `run:` block, not even inside a
+          # shell comment — substitution happens before the shell exists, so an empty or
+          # malformed one makes the whole workflow unparseable (it did, DIVE-2539).
           # so this block stays pure bash and tests/release_cut_assign_unit.sh can keep
           # extracting and RUNNING these exact bytes rather than grading a copy.
           # Unset (the nightly schedule, which declares no input) means patch, so the
