@@ -36,6 +36,7 @@ cat \
   src/lib/audit.sh \
   src/lib/registry.sh \
   src/lib/tasks_db.sh \
+  src/lib/actor.sh \
   src/cmd_auth.sh \
   src/cmd_account.sh \
   src/cmd_agent.sh \
@@ -52,6 +53,7 @@ cat \
   src/cmd_doctor.sh \
   src/cmd_watch.sh \
   src/cmd_compose.sh \
+  src/cmd_whoami.sh \
   src/cmd_task.sh \
   src/cmd_trace.sh \
   src/cmd_org.sh \

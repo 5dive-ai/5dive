@@ -585,7 +585,8 @@ _gate_route_reviewer() {
 # (an agent that truly sudo's then forges) is shared with the whole gate system and
 # out of scope here — same boundary cmd_task_answer draws. _gate_is_root is a seam so
 # the unit harness can exercise BOTH branches with the REAL resolver (not stubbed).
-_gate_is_root() { [[ $EUID -eq 0 ]]; }
+# _gate_is_root now lives in src/lib/actor.sh alongside the rest of the sealed
+# derivation (DIVE-2517). Unchanged body, unchanged seam contract.
 _gate_withdraw_actor() {
   if _gate_is_root; then
     local a; a=$(auto_sender_from_sudo)
@@ -4253,89 +4254,11 @@ _gate_floor_axis() {
 # `fleet roll` so a tested-code push+fleet-roll files as a lead-routed tier-1. The
 # true-human floor still runs FIRST and wins (a "push the pricing change" gate
 # stays human), so these can only ever cost the lead one clear.
-# _gate_authenticated_actor — DIVE-2004. The agent identity the KERNEL enforced for
-# this invocation, or EMPTY when it cannot be established. This is deliberately NOT
-# `task_actor`: that resolves `--from=<who>` verbatim, so it answers "who does the
-# caller SAY they are" (provenance, right for the audit record) and must never be
-# asked "who is the caller" (authentication). Two trustworthy sources:
-#   1. the real process user — `agent-X` can only be reached by actually being X.
-#   2. `$SUDO_UID`, but ONLY at EUID 0 (DIVE-1413): sudo sets it, and a non-root
-#      process forging it cannot also become root. Below EUID 0 it is a plain env
-#      var, which is why DIVE-950 dropped the agent-forgeable `--proof` form.
-# FAILS CLOSED by design: neither source resolving means "unidentified", never
-# "trusted". The cost of a false empty is re-filing a gate; the cost of a false
-# identity is a self-authorized delegated push.
-# The dashboard path is unaffected and needs no marker: shelld runs as `claude`
-# (a NON-agent user) and sends `--human`, so those answers are `human:*` — already
-# authorized everywhere `lead:*` is, and never in want of a lead stamp.
-# DIVE-2330: resolve a uid to an agent name in PURE BASH over /etc/passwd. No
-# `id`, no `getent` — both resolve through the CALLER'S PATH, and every agent can
-# set its own PATH. Measured on this host before the fix: a shim on PATH printing
-# `agent-lodar` made `id -un` return exactly that, from a process whose real uid
-# was 1004 (agent-main). Same shape as the landed DIVE-2281 fix in
-# `_envelope_sender_fallback`.
-# SEAM for the passwd SOURCE, added iteration 2 (DIVE-2330). A harness needs to
-# model a caller uid that maps to an `agent-*` name; before this it could only
-# pick a uid that happens to exist ON THIS HOST, which is the same
-# precondition-supplied-by-the-host defect DIVE-2365 named — and it is why the
-# T8 arm was vacuous (there is no `agent-evil` here, so `id -u agent-evil` failed
-# and the override fell back to uid 0, i.e. root: T8 modelled no agent at all).
-#
-# A FUNCTION, deliberately NOT `${_GATE_PASSWD_FILE:-/etc/passwd}`. An env-settable
-# source would be a new forgery vector in the field this whole row exists to make
-# unforgeable — the same reasoning `_envelope_sender_fallback` records in
-# cmd_agent_runtime.sh ("NO ENV OVERRIDE for the passwd path, deliberately"). A
-# function cannot be injected: bash imports exported functions at startup, and the
-# script's own definition executes AFTER that import and overwrites it. Same
-# property `_gate_is_root` and `_gate_caller_uid` already rely on.
-# Pure bash — no `cat`, which would be PATH-resolved.
-_gate_passwd_stream() { printf '%s\n' "$(</etc/passwd)"; }
-
-_gate_uid_to_agent() {
-  local want="${1:-}" name _x uid
-  [[ "$want" =~ ^[0-9]+$ ]] || { printf ''; return; }
-  while IFS=: read -r name _x uid _; do
-    [[ "$uid" == "$want" ]] || continue
-    [[ "$name" == agent-* ]] || { printf ''; return; }
-    printf '%s' "${name#agent-}"; return
-  done < <(_gate_passwd_stream)
-  printf ''
-}
-
-# `$EUID` is a bash BUILTIN reflecting the kernel's view of this process. It is not
-# PATH-resolved and cannot be set from the environment, which is the whole property
-# an authorization check needs. SUDO_UID is consulted only when EUID is 0, exactly
-# as before: sudo writes it, the caller does not.
-# SEAM (mirrors _gate_is_root): the harness overrides THIS to exercise both
-# branches with the real resolver. An external caller cannot — invoking `5dive`
-# starts a fresh bash that defines the function itself, so there is nothing in the
-# environment to override. That is the difference between a seam and a hole: the
-# old code let a PATH shim answer, which any agent could set.
-_gate_caller_uid() { printf '%s' "$EUID"; }
-
-_gate_authenticated_actor() {
-  local a; a=$(_gate_uid_to_agent "$(_gate_caller_uid)")
-  if [[ -n "$a" ]]; then printf '%s' "$a"; return; fi
-  # The SUDO_UID branch stays gated on the REAL root check (_gate_is_root, itself
-  # the pre-existing seam), NOT on _gate_caller_uid. Routing it through the seam
-  # would let a harness modelling "caller is root" also unlock the SUDO_UID path
-  # and widen who resolves to an agent — a behaviour change, not a fix.
-  if _gate_is_root && [[ -n "${SUDO_UID:-}" ]]; then
-    a=$(_gate_uid_to_agent "$SUDO_UID")
-    [[ -n "$a" ]] && { printf '%s' "$a"; return; }
-  fi
-  printf ''
-}
-
-# _gate_agent_for_uid <uid> — the agent name owning a numeric uid, or EMPTY. Used
-# to re-check a STORED `need_answered_uid` (DIVE-756 stamps the real pre-sudo
-# invoker) against a claimed `need_answered_by`, so a `--from` spoof is visible
-# after the fact and not only at answer time.
-_gate_agent_for_uid() {
-  # DIVE-2330: was `getent passwd`, which is PATH-resolved and therefore forgeable
-  # by the caller it is meant to check. Same pure-bash resolver as above.
-  _gate_uid_to_agent "${1:-}"
-}
+# _gate_authenticated_actor, _gate_uid_to_agent, _gate_caller_uid, _gate_is_root,
+# _gate_passwd_stream and _gate_agent_for_uid MOVED to src/lib/actor.sh (DIVE-2517,
+# v0.18 "Proof of who"). Same names, same semantics, one definition — the strict
+# uid-first derivation is now the shared one in lib/ rather than a local helper in
+# the file that happened to need it first. Call sites here are unchanged.
 
 _GATE_ENG_SHIP_RX='\bmerg(e|es|ed|ing)\b|pull request|\bpr\b|\bdiff\b|ship it|ship the|ship this|\bship(ping|ped)\b|deploy|redeploy|roll ?out|\broll(ing|ed)? out\b|land the|land it|land this|\bland(ing|ed)\b|rebase|hotfix|cut a branch|cut the release|push(es|ed|ing)? to (main|prod|production|origin)|push[^.]*github|delegated push|push[- ]for[- ]review|push .*(branch|for review|for a? ?pr|for code review)|5dive push|roll[^.]*fleet|fleet[- ]?roll|code review|approve the (merge|diff|change|pr|build|deploy|ship|commit)|build\.sh|smoke test|ci\b'
 _gate_eng_ship_hit() {
