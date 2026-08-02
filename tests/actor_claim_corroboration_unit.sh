@@ -404,6 +404,23 @@ else
     else
       no "T19b e2e: claimed_by='$cby' (expected '$FORGE_BOARD'), no-claim row='$cby_none' (expected <null>)"
     fi
+    # 19c. The LEDGER half. `claimed_by` is written in two places from one variable
+    #      — the tasks column and lifecycle_events' detail — and T19b covers only
+    #      the first. They share a variable today, which is exactly why the second
+    #      needs its own arm: a refactor that splits them breaks one silently.
+    #      `actor` must stay the DERIVED value, so the column keeps one meaning
+    #      across every row ever written, with the claim beside it and not in it.
+    lact=$(sqlite3 "$SBOX/tasks/tasks.db" \
+      "SELECT actor||'|'||COALESCE(detail,'') FROM lifecycle_events WHERE kind='task.created' AND ident='$tid2';" 2>/dev/null)
+    lact_none=$(sqlite3 "$SBOX/tasks/tasks.db" \
+      "SELECT COALESCE(detail,'') FROM lifecycle_events WHERE kind='task.created' AND ident='$tid';" 2>/dev/null)
+    if [[ -z "$lact" ]]; then
+      skip "T19c lifecycle_events unreadable; the ledger half is not graded"
+    elif [[ "$lact" == "${EXPECT_BOARD}|"* && "$lact" == *"claimed_by=${FORGE_BOARD}"* && "$lact_none" != *"claimed_by="* ]]; then
+      ok "T19c e2e: the ledger keeps actor=$EXPECT_BOARD and carries claimed_by=$FORGE_BOARD in detail; a no-claim row carries neither"
+    else
+      no "T19c e2e: ledger row='$lact' (want actor '$EXPECT_BOARD' + claimed_by=$FORGE_BOARD), no-claim detail='$lact_none'"
+    fi
     # 20. THE REFUSAL, through the real exiting `fail`: the gate must NOT exist
     #     afterwards. rc alone would stay green if the verb refused for any other
     #     reason and still filed the gate.
