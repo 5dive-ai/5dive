@@ -183,7 +183,20 @@ _hb_repo_grep_ident() { printf '5dive-cli abc1234 %s subject naming %s\n' "$(dat
 g1=$(mkgate DIVE-9001 'Approve PR #102 before we merge?')   # subject OPEN
 _hb_gate_shipped_sweep >/dev/null 2>&1
 is "H1 open subject VETOES the row-commit flag" "$(flagged DIVE-9001)" "no"
+# H1a (DIVE-2530): the OUTCOME above is reachable by two paths — vetoed-because-OPEN
+# and withheld-because-UNREADABLE both leave flagged=no. On the tokenless runner H1
+# went green while the state it exists to prove was never reached. Assert the REASON,
+# so the arm can only pass on the path it names.
+has "H1a and the veto names the OPEN subject, not an unreadable one" "$(cat "$HB_LOG")" "#102"
+hasnt "H1a2 and it is NOT the unreadable path" "$(cat "$HB_LOG")" "no-gh-token"
 has "H1b and says the row's commits are not evidence" "$(cat "$HB_LOG")" "NOT evidence about this gate"
+# H1c is an ABSENCE assertion and absence assertions pass on EMPTY output (olivia,
+# DIVE-2530): it cannot fail even if the sweep produced nothing at all, which makes it
+# strictly weaker than H1 — H1 needs a wrong-but-present value, H1c needs nothing.
+# The positive companion is what stops it staying green through a future breakage that
+# SILENCES the sweep rather than mis-answering it.
+is "H1c0 the sweep actually ran (positive companion for the absence arm)" \
+   "$([[ -s "$HB_LOG" ]] && echo produced || echo empty)" "produced"
 hasnt "H1c owner NOT nudged" "$(cat "$SEND_LOG")" "DIVE-9001"
 
 : >"$HB_LOG"; : >"$SEND_LOG"
