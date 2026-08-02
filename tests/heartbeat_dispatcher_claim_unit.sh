@@ -313,5 +313,41 @@ cmd_heartbeat_tick >/dev/null 2>&1
   && ok_t "[restore] claim reinstated => green again (the mutation was the cause)" \
   || bad_t "[restore] claim reinstated => green again" "got $(row "$G1")"
 
+# --- 8) DIVE-2541: the claim must reach the LEDGER, not just the row ---------
+# DIVE-2244 moved the authoritative start from `task start` to the dispatcher and
+# the ledger emit stayed on the verb. Measured on the live board over the ledger's
+# whole life: 94 distinct tasks claimed by the dispatcher, 85 with NO task.started
+# event, against 13 emitted by the verb. Every reader of that ledger — `trace`,
+# `whoami --for` — was therefore reading a ~90% empty chain while looking healthy,
+# because a timeline cannot render an absence.
+ev_count() { db "SELECT COUNT(*) FROM lifecycle_events WHERE kind='task.started' AND task_id=$1;"; }
+ev_auth()  { db "SELECT actor||'|'||authority FROM lifecycle_events WHERE kind='task.started' AND task_id=$1;"; }
+
+# G1 was claimed by the restore arm above, so it is a REAL dispatcher claim.
+(( $(ev_count "$G1") == 1 )) \
+  && ok_t "[2541] a dispatcher claim writes a task.started event" \
+  || bad_t "[2541] a dispatcher claim writes a task.started event" "count=$(ev_count "$G1")"
+
+# THE DISCRIMINATOR, and the reason the arm above is not enough. An emit that
+# recorded authority='self' would satisfy "an event exists" while asserting the
+# agent started its own task — which it did not; the dispatcher moved the row on
+# its behalf. That is the false-claim shape v0.18 exists to delete, so the arm
+# has to pin the authority and not merely the existence.
+[[ "$(ev_auth "$G1")" == "dev|dispatcher" ]] \
+  && ok_t "[2541] the event says actor=dev authority=DISPATCHER — not a self-start" \
+  || bad_t "[2541] claim must record authority=dispatcher, never self" "got $(ev_auth "$G1")"
+
+# NEGATIVE CONTROL: without it, "an event exists" passes for an emit that fires on
+# every tick regardless of whether anything was claimed. A tick that wakes NOBODY
+# must write nothing.
+db "DELETE FROM tasks;"; db "DELETE FROM lifecycle_events;"
+N1=$(mk "never claimed")
+seed_reg "$(date +%s)"          # just ran => not due => no wake, no claim
+WAKE_CALLS=0
+cmd_heartbeat_tick >/dev/null 2>&1
+(( $(ev_count "$N1") == 0 && WAKE_CALLS == 0 )) \
+  && ok_t "[2541] NEGATIVE CONTROL: a tick that claims nothing emits nothing" \
+  || bad_t "[2541] a tick that claims nothing must emit nothing" "count=$(ev_count "$N1") wakes=$WAKE_CALLS"
+
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]
