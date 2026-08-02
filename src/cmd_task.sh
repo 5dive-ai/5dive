@@ -8760,7 +8760,7 @@ cmd_task_answer() {
     # DIVE-2412: _cs_ok is the attested cited-message form. Unlike _cp_ok it is
     # NOT tier-fenced, so it satisfies the evidence rule on a tier-2 approval too.
     local _evid=$(( _hp || _su || _lead_clear || _cp_ok || _cs_ok ))
-    local _caller2; _caller2=$(id -un 2>/dev/null || echo '?')
+    local _caller2; _caller2=$(_gate_caller_user)
     # DIVE-2054: the human-proof/nonce evidence being scored here is stored
     # against $ident in TASKS_DB (not an independent channel/delivery fact like
     # the 3 named exemptions) — fenced.
@@ -8817,7 +8817,7 @@ cmd_task_answer() {
   # (the heuristic can over-match) waits for a human — the conservative correct
   # default for a hard floor; re-file at a lower --tier if the floor misfired.
   if [[ "$gtier" == "2" ]] && (( ! human )) && _gate_proof_enforced; then
-    local _caller3; _caller3=$(id -un 2>/dev/null || echo '?')
+    local _caller3; _caller3=$(_gate_caller_user)
     # DIVE-1437: a tier-2 gate that was LEAD-ROUTED (routed_reviewer set) but is an
     # approval/manual builder gate is the DIVE-1429 stall — the DIVE-1145/1182
     # routing sent it to the org lead, but the T2 hard-human floor here refuses the
@@ -8907,7 +8907,7 @@ cmd_task_answer() {
       # this box, while the citation is attested by Telegram, the one party the
       # caller cannot speak for (_gate_channel_session_ok).
       local _t2_cs="${_cs_ok:-0}"
-      local _t2_caller; _t2_caller=$(id -un 2>/dev/null || echo '?')
+      local _t2_caller; _t2_caller=$(_gate_caller_user)
       # DIVE-2054: the nonce being scored is task-store state for $ident — fenced.
       _task_store_audit_log "task answer t2-human-evidence" \
         "$([[ $(( _t2_hp || _t2_su || _t2_cs )) -eq 1 ]] && echo ok || echo error)" 0 -- \
@@ -8988,7 +8988,7 @@ cmd_task_answer() {
   # the non-root trusted path (dashboard exec as claude) we re-exec the root-only
   # `gate-proof sign` over sudo. Best-effort — a box that can't sign just stores
   # an empty sig (verify reports "unsigned"); the answer NEVER fails on this.
-  local _uid="${SUDO_UID:-$(id -u 2>/dev/null || echo "")}"
+  local _uid; _uid=$(_gate_closure_subject_uid)
   local _ts; _ts=$(date -u '+%Y-%m-%d %H:%M:%S')
   local _vfs=""; [[ "$nt" != "secret" ]] && _vfs="$value"
   local _sig=""
@@ -9116,7 +9116,7 @@ cmd_task_answer() {
   # worse, and the caller has no way to retry a half-applied answer). NEVER logs
   # $value: a secret gate stores nothing, and a decision answer is the human's
   # prose, neither of which belongs in the fleet log.
-  local _caller4; _caller4=$(id -un 2>/dev/null || echo '?')
+  local _caller4; _caller4=$(_gate_caller_user)
   _task_store_audit_log "task answer gate" ok 0 -- \
     "task=$ident" "type=$nt" "tier=${gtier:-}" "answered_by=$answered_by" \
     "uid=${_uid:-}" "sig=$([[ -n "$_sig" ]] && echo present || echo absent)" \
