@@ -160,6 +160,14 @@ jobs:
           # extracting and RUNNING these exact bytes rather than grading a copy.
           # Unset (the nightly schedule, which declares no input) means patch, so the
           # scheduled path is behaviourally identical to before this change.
+          # DO NOT ADD `set -e` TO THIS STEP. It runs under `set -uo pipefail` on purpose,
+          # which is why every refusal below is an EXPLICIT `exit 1` rather than a bare
+          # failing command. tests/release_cut_assign_unit.sh evals these same bytes, and
+          # its mutation grade depends on it: removing the explicit exit on an unknown
+          # level turns a refusal into a silent patch derivation and reddens exactly ONE
+          # arm. Under `set -e` that arm would still pass for the wrong reason, and the
+          # refusal would look pinned when it was only incidentally covered. (olivia,
+          # DIVE-2539.)
           _level="${RELEASE_LEVEL:-patch}"
           case "$_level" in
             patch) version="${_maj}.${_min}.$(( _pat + 1 ))" ;;
