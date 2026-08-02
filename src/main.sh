@@ -283,7 +283,9 @@ Actor-routed gh (DIVE-2448):
   # (DIVE-2232). The PAT stays root-side in /etc/5dive/connectors/github-bot.env — the agent never holds it.
 
 Identity:
-  5dive whoami [--json]
+  5dive whoami [--json]                    # the CURRENT process: actor, authority, tier + the SOURCE of each; exit 6 if unmeasurable
+  5dive whoami --for=<id|DIVE-N> [--json]  # the RECORDED authority chain for one row; EXIT 1 when a link that HAPPENED is unmeasurable
+                                           # scope it: --for=task:DIVE-N | gate:DIVE-N | action:DIVE-N
     Who is acting, under whose authority, at what tier — and the SOURCE of each.
     Identity is uid-first: \$EUID (or sudo's \$SUDO_UID at real root) resolved
     against /etc/passwd in pure bash. Never argv/--from, \$USER, \$SUDO_USER or
