@@ -31,7 +31,7 @@ cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." || exit 2
 # shellcheck source=tests/lib/tier.sh
 . tests/lib/tier.sh
 
-TIER=""; BUDGET=""; LABEL=""; REPORT=""; TOP=10; CORPUS_DIR="tests"
+TIER=""; BUDGET=""; LABEL=""; REPORT=""; TOP=10; CORPUS_DIR="tests"; SHARD=""
 for a in "$@"; do case "$a" in
   --tier=*)   TIER="${a#--tier=}" ;;
   # The seam that lets tests/corpus_tier_budget_unit.sh grade THIS script against a
@@ -45,6 +45,22 @@ for a in "$@"; do case "$a" in
   --budget=*) BUDGET="${a#--budget=}" ;;
   --label=*)  LABEL="${a#--label=}" ;;   # names the environment in the summary line
   --report=*) REPORT="${a#--report=}" ;; # TSV: ms<TAB>rc<TAB>path, for the trend
+  # DIVE-2525 (main, reviewing #376): the cap is PER JOB, so splitting the sweep
+  # across N jobs cuts each job's wall-clock WITHOUT relaxing the constraint. Raising
+  # the ceiling buys three days and re-installs the ratchet; sharding buys headroom
+  # that scales with the corpus. Round-robin, not contiguous blocks: the cost
+  # distribution has a long tail (one harness is 300s, the median is under a second),
+  # and contiguous blocks would put a whole alphabetical neighbourhood of expensive
+  # e2e files in one shard.
+  #
+  # WHAT SHARDING DOES NOT DO, said here because it is the thing to watch: it does not
+  # reduce the corpus's TOTAL cost, only the wall-clock of any one job. Aggregate
+  # nightly capacity is now N x the budget, and N is fixed in the workflow — so adding
+  # a shard is exactly as visible, and exactly as much a policy decision, as raising
+  # the number. The budget-report job re-sums the shards and prints the UN-SHARDED
+  # total, because that total is the number this whole row exists to make legible and
+  # sharding is the obvious way to lose it.
+  --shard=*)  SHARD="${a#--shard=}" ;;   # i/N, 1-based
   --top=*)    TOP="${a#--top=}" ;;
   *) printf 'unknown arg: %s\n' "$a" >&2; exit 2 ;;
 esac; done
@@ -67,6 +83,26 @@ if (( ${#CORPUS[@]} == 0 )); then
   exit 1
 fi
 
+if [[ -n "$SHARD" ]]; then
+  if [[ ! "$SHARD" =~ ^([0-9]+)/([0-9]+)$ ]]; then
+    printf 'run-harnesses: --shard must be i/N (1-based), got %s\n' "$SHARD" >&2; exit 2
+  fi
+  si="${BASH_REMATCH[1]}"; sn="${BASH_REMATCH[2]}"
+  if (( si < 1 || sn < 1 || si > sn )); then
+    printf 'run-harnesses: --shard=%s is out of range\n' "$SHARD" >&2; exit 2
+  fi
+  picked=()
+  for i in "${!CORPUS[@]}"; do (( i % sn == si - 1 )) && picked+=("${CORPUS[$i]}"); done
+  CORPUS=("${picked[@]}")
+  LABEL="$LABEL-s$si"
+  # A shard that selected nothing is UNDETERMINED for the same reason an empty tier
+  # is: it reports green having graded none of the corpus it names.
+  if (( ${#CORPUS[@]} == 0 )); then
+    printf 'run-harnesses: FAIL — shard %s of tier %s selected 0 harnesses.\n' "$SHARD" "$TIER" >&2
+    exit 1
+  fi
+fi
+
 declare -a MS=() RC=() NAME=()
 failed=(); total_ms=0
 for t in "${CORPUS[@]}"; do
@@ -84,8 +120,8 @@ pct=0; (( BUDGET > 0 )) && pct=$(( total_s * 100 / BUDGET ))
 
 if [[ -n "$REPORT" ]]; then
   {
-    printf '# run-harnesses report\n# tier=%s\n# label=%s\n# harnesses=%d\n# wall_clock_s=%d\n# budget_s=%d\n# pct_of_budget=%d\n' \
-      "$TIER" "$LABEL" "${#CORPUS[@]}" "$total_s" "$BUDGET" "$pct"
+    printf '# run-harnesses report\n# tier=%s\n# label=%s\n# shard=%s\n# harnesses=%d\n# wall_clock_s=%d\n# budget_s=%d\n# pct_of_budget=%d\n' \
+      "$TIER" "$LABEL" "${SHARD:-1/1}" "${#CORPUS[@]}" "$total_s" "$BUDGET" "$pct"
     for i in "${!NAME[@]}"; do printf '%s\t%s\t%s\n' "${MS[$i]}" "${RC[$i]}" "${NAME[$i]}"; done
   } > "$REPORT"
 fi

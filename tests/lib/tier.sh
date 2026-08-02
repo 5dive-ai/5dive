@@ -45,13 +45,18 @@
 # above. It is per-job, and both PR environments (pristine and installed-host) are
 # held to it separately.
 #
-# FULL = 1320s (22 min). MEASURED, not aspirational: release-cut.yml's own published
-# figure is 3.79s per harness (164 harnesses in 10m21s, 168 in 10m37s), and an
-# independent serial timing of the whole corpus on the control plane agreed with it
-# to within 1%. Today's 267-harness corpus is therefore ~1010s of pure harness time.
-# 1320 is that plus ~30% — which is RUNNER VARIANCE, not growth room. At the observed
-# +13/day it is roughly three weeks of headroom, and the run prints its
-# percentage-of-budget every time so the trend is legible before it reds, not after.
+# FULL = 1320s (22 min). MEASURED IN CI ON THIS PR, not extrapolated: 268 harnesses
+# in 1097s pristine and 1146s installed-host (gh run 30761800471). The estimate this
+# number was first set from — release-cut.yml's published 3.79s/harness — agreed with
+# it to within 6%, and is now superseded by the direct reading.
+#
+# So the sweep starts at 83-86% OF ITS OWN CAP, and that is the finding, not a
+# mis-set number: the corpus is ALREADY at the cost a nightly job can carry. 1320 is
+# today plus ~15-20%, which is runner variance and roughly 30 more harnesses — about
+# three days at the observed +13/day. Raising it to buy comfortable headroom would be
+# re-installing the ratchet this row exists to remove. The run prints its
+# percentage-of-budget every time, so the trend is legible in the number rather than
+# only in the red.
 TIER_BUDGET_CORE=300
 TIER_BUDGET_FULL=1320
 

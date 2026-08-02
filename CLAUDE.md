@@ -11,7 +11,7 @@ decision to add one is ever wrong on its own merits. See
 | tier | runs | budget |
 |---|---|---|
 | `core` (**the default**) | every PR, both CI environments | **300s** per job |
-| `nightly` | `full-sweep.yml` (03:17 UTC + dispatch) | **1320s** per job, whole corpus |
+| `nightly` | `full-sweep.yml` (03:17 UTC + dispatch) | **1320s** per job, corpus split across 3 shards |
 
 - **A new harness is `core` unless you say otherwise.** Nothing to write.
 - **Over budget, CI FAILS** (`exit 4`, distinct from a test failure's `exit 1`) and
@@ -34,6 +34,12 @@ decision to add one is ever wrong on its own merits. See
   a default, and a default loses to an explicit signal.
 - Locally: `bash scripts/run-harnesses.sh --tier=core` (or `--tier=full`). Both
   budgets and the tier marker live in `tests/lib/tier.sh`, one place.
+- **The nightly is sharded, not given a bigger number.** The cap is per job, so
+  splitting the sweep cuts each job's wall-clock without relaxing it. Aggregate
+  capacity is 3 x 1320s and the shard count is fixed in the matrix, so adding a
+  shard is as visible a policy decision as raising the ceiling. `budget-report`
+  re-sums the shards and prints the **un-sharded** total, because that total is the
+  number the tiering exists to make legible and sharding is how you lose it.
 
 ## Hard rule: no real PII in public artifacts (DIVE-1774)
 

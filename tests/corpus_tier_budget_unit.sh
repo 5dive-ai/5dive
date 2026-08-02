@@ -220,5 +220,42 @@ for wf in .github/workflows/unit-tests.yml .github/workflows/full-sweep.yml; do
   fi
 done
 
+# ---------------------------------------------------- 17-20 sharding is a PARTITION
+# main's call reviewing #376: the first measured sweep came in at 83-86% of its own
+# cap, so the sweep is SHARDED rather than given a bigger number — the cap is per job,
+# and splitting cuts each job's wall-clock without relaxing the constraint.
+#
+# That is only sound if the shards PARTITION the corpus. A split that drops a harness
+# is a corpus that shrank silently, which is the failure this whole file is about;
+# a split that duplicates one just wastes the budget it exists to protect. So: union
+# equals the full tier, no overlap, and nothing selects an empty set in silence.
+rm -f "$TMP"/*.sh
+for i in 1 2 3 4 5 6 7; do mk "s$i.sh" '#!/usr/bin/env bash
+exit 0'; done
+ran() { bash "$RUNNER" --corpus-dir="$TMP" --tier=full --budget=600 "$@" 2>&1 \
+          | sed -n 's|^=== .*/||p' | sort; }
+u="$(for i in 1 2 3; do ran --shard=$i/3; done | sort)"
+flat() { tr '\n' ' ' | sed 's/ *$//'; }
+want "the shards' union is the whole tier" \
+  "$(ran | flat)" "$(printf '%s\n' "$u" | flat)"
+want "no harness runs twice across the shards" \
+  "$(printf '%s\n' "$u" | wc -l)" "$(printf '%s\n' "$u" | sort -u | wc -l)"
+# Round-robin, not contiguous blocks: with a long-tailed cost distribution (one
+# harness is 300s, the median is under a second) contiguous blocks put a whole
+# alphabetical neighbourhood of expensive e2e files in one shard.
+want "shard 1 of 3 takes every third harness, not the first third" \
+  "s1.sh s4.sh s7.sh" "$(ran --shard=1/3 | tr '\n' ' ' | sed 's/ $//')"
+
+OUT="$(bash "$RUNNER" --corpus-dir="$TMP" --tier=full --shard=4/3 2>&1)"; RC=$?
+if (( RC == 2 )) && [[ "$OUT" == *"out of range"* ]]; then
+  ok "an out-of-range shard REFUSES"
+else bad "an out-of-range shard REFUSES" "rc=$RC out=$OUT"; fi
+
+# 9 shards over 7 files: shard 8 selects nothing. Green-over-nothing, per shard.
+OUT="$(bash "$RUNNER" --corpus-dir="$TMP" --tier=full --shard=8/9 2>&1)"; RC=$?
+if (( RC == 1 )) && [[ "$OUT" == *"selected 0 harnesses"* ]]; then
+  ok "a shard that selects nothing FAILS rather than reporting green over nothing"
+else bad "a shard that selects nothing FAILS rather than reporting green over nothing" "rc=$RC out=$OUT"; fi
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 (( fail == 0 ))

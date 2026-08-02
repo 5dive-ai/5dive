@@ -38,9 +38,28 @@ on:
       - '.github/workflows/full-sweep.yml'
 
 jobs:
+  # DIVE-2525 (main, reviewing #376): SHARDED, not given a bigger number. The first
+  # measured sweep came in at 1097s/1146s against the 1320s cap — 83-86%, which at
+  # +13 harnesses/day is not a budget, it is a countdown with about three days on it.
+  # Raising the ceiling buys those three days and re-installs the ratchet the row
+  # exists to remove. The cap is PER JOB, so splitting the sweep across the matrix
+  # cuts each job's wall-clock without relaxing the constraint, and the headroom
+  # scales with the corpus instead of being spent once.
+  #
+  # `${{ strategy.job-total }}` rather than a literal 3: the shard count is the matrix
+  # length, spelled once, so adding a shard cannot silently leave the runner splitting
+  # the corpus a different number of ways than the matrix runs it.
+  #
+  # AGGREGATE capacity is now N x 1320s and N is fixed here — adding a shard is
+  # exactly as visible, and exactly as much a policy decision, as raising the number.
+  # `budget-report` re-sums the shards and prints the UN-SHARDED total, because that
+  # total is what this row exists to make legible and sharding is how you lose it.
   full-pristine:
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix: { shard: [1, 2, 3] }
     steps:
       # DIVE-2229: full history — pinned baselines must resolve here too.
       - uses: actions/checkout@v4
@@ -58,18 +77,27 @@ jobs:
       # dependency true by construction instead of by alphabetical accident.
       - name: Build the bundle (harness precondition, not an accident of ordering)
         run: ./build.sh
-      - name: Run the FULL corpus (budgeted)
-        run: bash scripts/run-harnesses.sh --tier=full --label=pristine --report=full-pristine.txt
+      - name: Run the FULL corpus (budgeted, shard ${{ matrix.shard }})
+        run: |
+          bash scripts/run-harnesses.sh --tier=full \
+            --shard=${{ matrix.shard }}/${{ strategy.job-total }} \
+            --label=pristine --report=full-pristine-${{ matrix.shard }}.txt
       # if: always() — an over-budget or red run is exactly the run whose timings
       # somebody needs, and losing the report would leave the trend with a hole
       # precisely where it changed.
       - uses: actions/upload-artifact@v4
         if: always()
-        with: { name: full-pristine, path: full-pristine.txt, if-no-files-found: error }
+        with:
+          name: "full-pristine-${{ matrix.shard }}"
+          path: "full-pristine-${{ matrix.shard }}.txt"
+          if-no-files-found: error
 
   full-installed-host:
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix: { shard: [1, 2, 3] }
     steps:
       - uses: actions/checkout@v4
         with: { fetch-depth: 0 }
@@ -102,11 +130,17 @@ jobs:
       # dependency true by construction instead of by alphabetical accident.
       - name: Build the bundle (harness precondition, not an accident of ordering)
         run: ./build.sh
-      - name: Run the FULL corpus (installed host, budgeted)
-        run: bash scripts/run-harnesses.sh --tier=full --label=installed-host --report=full-installed.txt
+      - name: Run the FULL corpus (installed host, budgeted, shard ${{ matrix.shard }})
+        run: |
+          bash scripts/run-harnesses.sh --tier=full \
+            --shard=${{ matrix.shard }}/${{ strategy.job-total }} \
+            --label=installed-host --report=full-installed-${{ matrix.shard }}.txt
       - uses: actions/upload-artifact@v4
         if: always()
-        with: { name: full-installed, path: full-installed.txt, if-no-files-found: error }
+        with:
+          name: "full-installed-${{ matrix.shard }}"
+          path: "full-installed-${{ matrix.shard }}.txt"
+          if-no-files-found: error
 
   # DIVE-2013: the sweeps above grade every harness on its EXIT STATUS, so a harness
   # whose status is not wired to its own assertions is invisible to them — it prints
@@ -299,28 +333,50 @@ jobs:
         with: { pattern: 'full-*', merge-multiple: true }
       - name: Report the sweep's wall-clock
         run: |
+          # RE-SUM THE SHARDS. Sharding is the obvious way to lose the very number
+          # this row exists to surface: three jobs each reporting 370s reads as
+          # comfortable, and the corpus still costs 1110s a night. The per-shard
+          # figures are what the BUDGET is enforced on; the total is what the TREND
+          # is read from, and both belong on the page.
+          total_row() {   # <label> <glob>
+            local label="$1" pat="$2" n=0 s=0 b=0 shards=0 f
+            for f in $pat; do
+              [[ -r "$f" ]] || continue
+              shards=$(( shards + 1 ))
+              n=$(( n + $(sed -n 's/^# harnesses=//p' "$f" | head -1) ))
+              s=$(( s + $(sed -n 's/^# wall_clock_s=//p' "$f" | head -1) ))
+              b=$(sed -n 's/^# budget_s=//p' "$f" | head -1)
+            done
+            # A missing shard is not a smaller corpus. Say the count, so a report
+            # assembled from two of three shards cannot read as a faster sweep.
+            printf '| %s | %d | %d | %ds | %ds per shard |\n' "$label" "$shards" "$n" "$s" "${b:-0}"
+          }
           {
             echo "## Full-sweep wall-clock"
             echo
-            echo "| environment | harnesses | wall-clock | budget | % of budget |"
+            echo "| environment | shards reporting | harnesses | TOTAL wall-clock | budget |"
             echo "|---|---:|---:|---:|---:|"
-            for f in full-pristine.txt full-installed.txt; do
-              [[ -r "$f" ]] || { echo "| \`$f\` | — | **report missing** | — | — |"; continue; }
-              lbl=$(sed -n 's/^# label=//p' "$f" | head -1)
-              n=$(sed -n 's/^# harnesses=//p' "$f" | head -1)
-              s=$(sed -n 's/^# wall_clock_s=//p' "$f" | head -1)
-              b=$(sed -n 's/^# budget_s=//p' "$f" | head -1)
-              p=$(sed -n 's/^# pct_of_budget=//p' "$f" | head -1)
-              printf '| %s | %s | %ss | %ss | %s%% |\n' "$lbl" "$n" "$s" "$b" "$p"
-            done
+            total_row pristine 'full-pristine-*.txt'
+            total_row installed-host 'full-installed-*.txt'
             echo
-            echo "Slowest 15 harnesses (pristine) — the merge/retire shortlist:"
+            echo "Per-shard (this is what the budget is enforced on):"
             echo '```'
-            if [[ -r full-pristine.txt ]]; then
-              grep -v '^#' full-pristine.txt | sort -rn | head -15 \
+            for f in full-pristine-*.txt full-installed-*.txt; do
+              [[ -r "$f" ]] || continue
+              printf '%-28s %4ss / %ss  (%s%%)\n' "$(sed -n 's/^# label=//p' "$f" | head -1)" \
+                "$(sed -n 's/^# wall_clock_s=//p' "$f" | head -1)" \
+                "$(sed -n 's/^# budget_s=//p' "$f" | head -1)" \
+                "$(sed -n 's/^# pct_of_budget=//p' "$f" | head -1)"
+            done
+            echo '```'
+            echo
+            echo "Slowest 15 harnesses across all pristine shards — the merge/retire shortlist:"
+            echo '```'
+            if compgen -G 'full-pristine-*.txt' >/dev/null; then
+              grep -hv '^#' full-pristine-*.txt | sort -rn | head -15 \
                 | awk -F'\t' '{printf "%7.1fs  %s\n", $1/1000, $3}'
             else
-              echo "(no report — the pristine sweep did not finish)"
+              echo "(no reports — no pristine shard finished)"
             fi
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
