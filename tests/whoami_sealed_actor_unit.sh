@@ -309,6 +309,42 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# 20. THE AUTHORITY AXIS, which nothing here graded until now. The ticket asks the
+#     verb to report actor + authority + tier, and arms 1-15 cover only actor and
+#     tier — so dropping authority, or collapsing sudo:<who> into root, passed every
+#     one of them. This row does not own _actor_authority (lib/audit.sh does, and it
+#     is WIRED not rewritten), but it is the first caller to render all three values,
+#     so it owes the proof that they stay distinguishable.
+#     Exercised through audit.sh's OWN seam, `_audit_is_root` — the same reason
+#     _gate_is_root exists over there: $EUID is READONLY in bash, so a direct read
+#     makes two of the three branches unreachable from any test. No second seam.
+eval "$(sed -n '/^_actor_authority()/,/^}/p' src/lib/audit.sh)"
+declare -F _actor_authority >/dev/null || { printf 'NOT OK - _actor_authority did not load\n'; exit 1; }
+a_sudo=$( _audit_is_root() { return 0; }; SUDO_USER=lodar _actor_authority )
+a_root=$( _audit_is_root() { return 0; }; unset SUDO_USER;  _actor_authority )
+a_self=$( _audit_is_root() { return 1; }; SUDO_USER=lodar _actor_authority )
+if [[ "$a_sudo" == "$a_root" || "$a_root" == "$a_self" || "$a_sudo" == "$a_self" ]]; then
+  no "T20 COLLAPSED — two authority values render identically (sudo=$a_sudo root=$a_root self=$a_self)"
+elif [[ "$a_sudo" == "sudo:lodar" && "$a_root" == "root" && "$a_self" == "self" ]]; then
+  ok "T20 authority is three distinct values through audit.sh's seam: sudo:lodar / root / self"
+else
+  no "T20 expected sudo:lodar/root/self, got $a_sudo/$a_root/$a_self"
+fi
+
+# 21. and the verb must actually RENDER what it derived. A value computed and then
+#     dropped from both surfaces is the same defect as never computing it.
+if [[ -x ./5dive ]]; then
+  v_txt=$(./5dive whoami 2>/dev/null)
+  v_val=$(./5dive whoami --json 2>/dev/null | jq -r '.data.authority.value // "<missing>"')
+  v_src=$(./5dive whoami --json 2>/dev/null | jq -r '.data.authority.source // "<missing>"')
+  if grep -q '^authority' <<<"$v_txt" && [[ "$v_val" == "self" && "$v_src" != "<missing>" && -n "$v_src" ]]; then
+    ok "T21 authority is rendered in BOTH surfaces with its source (value=$v_val)"
+  else
+    no "T21 prose has authority line: $(grep -q '^authority' <<<"$v_txt" && echo yes || echo NO); json value=$v_val source=$v_src"
+  fi
+fi
+
+# ---------------------------------------------------------------------------
 # END TO END, through the BUILT bundle.
 BIN=./5dive
 if [[ ! -x "$BIN" ]]; then
