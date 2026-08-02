@@ -37,6 +37,9 @@ set -uo pipefail
 . "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh" \
   || printf 'grading tree: UNRESOLVED (tests/lib/grading_tree.sh not reachable; no tree named)\n' >&2
 cd "$(dirname "$0")/.."
+# DIVE-2518: `--from` is provenance; TIER/ROUTING read the uid derivation, so an arm
+# impersonating a filer must DERIVE as them. tests/lib/actor_seam.sh.
+. "$(dirname "${BASH_SOURCE[0]}")/lib/actor_seam.sh"
 SRC=src
 TMP="$(mktemp -d /tmp/gate-t2pin-unit.XXXXXX)"
 trap 'rm -rf "$TMP"' EXIT
@@ -113,7 +116,7 @@ assert_downgraded() { # <ident> <label>
 
 # 1: keyword in the ASK — the original repro (`--tier=2` + "Ship it to prod").
 route_reset; seed DIVE-901 'DIVE-1690 council page'
-cmd_task_need DIVE-901 --type=decision --tier=2 --from=dev \
+actor_seam_as dev; cmd_task_need DIVE-901 --type=decision --tier=2 --from=dev \
   --ask="Ship it to prod: which council page copy goes live?" \
   --options="A|B" --recommend="A" >/dev/null 2>&1
 assert_pin_held DIVE-901 "eng-ship in ASK: explicit --tier=2 survives (stays hard-human)"
@@ -123,7 +126,7 @@ assert_pin_held DIVE-901 "eng-ship in ASK: explicit --tier=2 survives (stays har
 #    flags + ask, the only variable is the title, and the title alone downgraded
 #    the gate. A fix that only reads the ask cannot pass this case.
 route_reset; seed DIVE-902 'LAND the DIVE-1672 council-rules branch: rebase package.json + settle MERGE order vs dive-1690'
-cmd_task_need DIVE-902 --type=decision --tier=2 --from=dev \
+actor_seam_as dev; cmd_task_need DIVE-902 --type=decision --tier=2 --from=dev \
   --ask="Which of these two wordings should the public page use?" \
   --options="A|B" --recommend="A" >/dev/null 2>&1
 assert_pin_held DIVE-902 "eng-ship in TITLE: explicit --tier=2 survives (the axis the filer cannot reword)"
@@ -132,14 +135,14 @@ assert_pin_held DIVE-902 "eng-ship in TITLE: explicit --tier=2 survives (the axi
 #    explicit pin skips the floor evaluation entirely (tier_floored stays 0), so
 #    before the fix this was downgraded despite carrying a floor keyword.
 route_reset; seed DIVE-903 'Council page polish'
-cmd_task_need DIVE-903 --type=decision --tier=2 --from=dev \
+actor_seam_as dev; cmd_task_need DIVE-903 --type=decision --tier=2 --from=dev \
   --ask="BRAND call on the public 5dive.ai /council page before we ship it" \
   --options="A|B" --recommend="A" >/dev/null 2>&1
 assert_pin_held DIVE-903 "eng-ship + floor term ('brand'+'ship') with --tier=2 stays hard-human"
 
 # 4: approval flavour, keyword in TITLE only.
 route_reset; seed DIVE-904 'Merge the pricing-page redesign PR'
-cmd_task_need DIVE-904 --type=approval --tier=2 --from=dev \
+actor_seam_as dev; cmd_task_need DIVE-904 --type=approval --tier=2 --from=dev \
   --ask="Sign off the final pricing numbers on the public page?" --recommend="yes" >/dev/null 2>&1
 assert_pin_held DIVE-904 "eng-ship TITLE + --type=approval --tier=2 survives"
 
@@ -147,13 +150,13 @@ assert_pin_held DIVE-904 "eng-ship TITLE + --type=approval --tier=2 survives"
 #    overridden and the builder ship-gate is lead-routed. If this ever fails the
 #    "fix" is just a disabled carve-out.
 route_reset; seed DIVE-905 'LAND the dive-1957 branch: settle MERGE order'
-cmd_task_need DIVE-905 --type=approval --from=dev \
+actor_seam_as dev; cmd_task_need DIVE-905 --type=approval --from=dev \
   --ask="Approve landing the verified fix and pushing to origin?" --recommend="yes" >/dev/null 2>&1
 assert_downgraded DIVE-905 "eng-ship with NO --tier: type default STILL downgraded + lead-routed (DIVE-1359 intact)"
 
 # 6: UNCHANGED — an explicit --tier=1 is not a hard-human pin; nothing to veto.
 route_reset; seed DIVE-906 'Ship the dive-1957 fix'
-cmd_task_need DIVE-906 --type=decision --tier=1 --from=dev \
+actor_seam_as dev; cmd_task_need DIVE-906 --type=decision --tier=1 --from=dev \
   --ask="ship it now or after the release?" --options="now|after" --recommend="now" >/dev/null 2>&1
 [[ "$(tierof DIVE-906)" == "1" && "$(routedof DIVE-906)" == "main" ]] \
   && ok_t "explicit --tier=1 eng-ship still lead-routed (only a =2 pin vetoes)" \
@@ -165,20 +168,20 @@ cmd_task_need DIVE-906 --type=decision --tier=1 --from=dev \
 
 # 7: keyword in the ASK.
 route_reset; seed DIVE-910 'Character pack drip'
-cmd_task_need DIVE-910 --type=approval --tier=2 --from=dev \
+actor_seam_as dev; cmd_task_need DIVE-910 --type=approval --tier=2 --from=dev \
   --ask="approve persona 'doc' as ready to publish to the character-pack drip queue?" --recommend="yes" >/dev/null 2>&1
 assert_pin_held DIVE-910 "curation in ASK: explicit --tier=2 survives"
 
 # 8: TITLE AXIS — curation vocabulary only in the title.
 route_reset; seed DIVE-911 'Approve the persona pack for the character-packs publish queue'
-cmd_task_need DIVE-911 --type=decision --tier=2 --from=dev \
+actor_seam_as dev; cmd_task_need DIVE-911 --type=decision --tier=2 --from=dev \
   --ask="Which of the two brand palettes should we commit to?" \
   --options="A|B" --recommend="A" >/dev/null 2>&1
 assert_pin_held DIVE-911 "curation in TITLE: explicit --tier=2 survives"
 
 # 9: UNCHANGED — no pin ⇒ the curation carve-out still beats the 'publish' floor.
 route_reset; seed DIVE-912 'Character pack drip'
-cmd_task_need DIVE-912 --type=approval --from=dev \
+actor_seam_as dev; cmd_task_need DIVE-912 --type=approval --from=dev \
   --ask="approve persona 'doc' as ready to publish to the character-pack drip queue?" --recommend="yes" >/dev/null 2>&1
 assert_downgraded DIVE-912 "curation with NO --tier: still downgraded + lead-routed (DIVE-1381 intact)"
 
@@ -188,20 +191,20 @@ assert_downgraded DIVE-912 "curation with NO --tier: still downgraded + lead-rou
 
 # 10: keyword in the ASK (the STEER-1 board-wipe repro).
 route_reset; seed DIVE-920 'Board recovery'
-cmd_task_need DIVE-920 --type=decision --tier=2 --from=dev \
+actor_seam_as dev; cmd_task_need DIVE-920 --type=decision --tier=2 --from=dev \
   --ask="The task board was wiped/destroyed at 04:20 — keep or discard my uncommitted work and rebuild the board from the audit log?" \
   --options="keep|discard" --recommend="keep" >/dev/null 2>&1
 assert_pin_held DIVE-920 "internal-ops in ASK: explicit --tier=2 survives"
 
 # 11: TITLE AXIS.
 route_reset; seed DIVE-921 'Rebuild the wiped task board from the audit log'
-cmd_task_need DIVE-921 --type=decision --tier=2 --from=dev \
+actor_seam_as dev; cmd_task_need DIVE-921 --type=decision --tier=2 --from=dev \
   --ask="keep or discard the in-flight work?" --options="keep|discard" --recommend="keep" >/dev/null 2>&1
 assert_pin_held DIVE-921 "internal-ops in TITLE: explicit --tier=2 survives"
 
 # 12: UNCHANGED — no pin ⇒ the over-fired destructive floor is still carved out.
 route_reset; seed DIVE-922 'Board recovery'
-cmd_task_need DIVE-922 --type=decision --from=dev \
+actor_seam_as dev; cmd_task_need DIVE-922 --type=decision --from=dev \
   --ask="The task board was wiped/destroyed at 04:20 — keep or discard my uncommitted work and rebuild the board from the audit log?" \
   --options="keep|discard" --recommend="keep" >/dev/null 2>&1
 assert_downgraded DIVE-922 "internal-ops with NO --tier: still downgraded + lead-routed (DIVE-1480 intact)"
@@ -212,13 +215,13 @@ assert_downgraded DIVE-922 "internal-ops with NO --tier: still downgraded + lead
 
 # 13: an access gate filed with an explicit --tier=2 is NOT routed to the lead.
 route_reset; seed DIVE-930 'Grant prod DB access'
-cmd_task_need DIVE-930 --type=access --tier=2 --from=dev \
+actor_seam_as dev; cmd_task_need DIVE-930 --type=access --tier=2 --from=dev \
   --ask="grant me the prod read-replica credentials?" >/dev/null 2>&1
 assert_pin_held DIVE-930 "access + explicit --tier=2 is NOT lead-routed (DIVE-1145 invariant backstop)"
 
 # 14: UNCHANGED — an un-pinned access gate still routes to the lead by type.
 route_reset; seed DIVE-931 'Grant staging box access'
-cmd_task_need DIVE-931 --type=access --from=dev \
+actor_seam_as dev; cmd_task_need DIVE-931 --type=access --from=dev \
   --ask="grant me shell on the staging box?" >/dev/null 2>&1
 [[ "$(routedof DIVE-931)" == "main" ]] \
   && ok_t "access with NO --tier: still lead-routed by type (DIVE-1243 intact)" \
@@ -250,7 +253,7 @@ audit_reset() { : >"$AUDIT_FILE"; }
 
 # 16: a pinned eng-ship gate that escalates past the lead records the row.
 route_reset; audit_reset; seed DIVE-950 'LAND the dive-1957 branch: settle MERGE order'
-cmd_task_need DIVE-950 --type=decision --tier=2 --from=dev \
+actor_seam_as dev; cmd_task_need DIVE-950 --type=decision --tier=2 --from=dev \
   --ask="Which wording ships on the public page?" --options="A|B" --recommend="A" >/dev/null 2>&1
 grep -q '^task.gate-tier2-pin-escalated$' "$AUDIT_FILE" \
   && ok_t "pinned eng-ship escalation records an audit row (measurable, not just a warn)" \
@@ -259,7 +262,7 @@ grep -q '^task.gate-tier2-pin-escalated$' "$AUDIT_FILE" \
 # 17: the un-pinned downgrade does NOT record it — the row means "a pin escalated
 #     past a lead", so it must not fire on the normal lead-routed path.
 route_reset; audit_reset; seed DIVE-951 'LAND the dive-1957 branch: settle MERGE order'
-cmd_task_need DIVE-951 --type=decision --from=dev \
+actor_seam_as dev; cmd_task_need DIVE-951 --type=decision --from=dev \
   --ask="Which wording ships on the public page?" --options="A|B" --recommend="A" >/dev/null 2>&1
 grep -q '^task.gate-tier2-pin-escalated$' "$AUDIT_FILE" \
   && bad_t "no audit row on the un-pinned downgrade" "rows='$(tr '\n' ',' <"$AUDIT_FILE")'" \

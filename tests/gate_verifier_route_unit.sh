@@ -109,7 +109,7 @@ cmd_task_need DIVE-501 --type=decision --options='A|B' --recommend='A' \
 
 # ---- 2. approval gate on the loop also routes to the verifier ----
 route_reset; seed_loop DIVE-502; fixture_actor dev
-cmd_task_need DIVE-502 --type=approval --ask='OK to merge the refactor?' --from=dev >/dev/null 2>&1
+actor_seam_as dev; cmd_task_need DIVE-502 --type=approval --ask='OK to merge the refactor?' --from=dev >/dev/null 2>&1
 [[ "$(route_last)" == "main" ]] \
   && ok_t "maker approval gate routes to verifier 'main'" \
   || bad_t "maker approval gate routes to verifier 'main'" "route_last=$(route_last) human=$HUMAN_PINGED"

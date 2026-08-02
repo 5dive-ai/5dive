@@ -20,6 +20,9 @@ set -uo pipefail
 . "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh" \
   || printf 'grading tree: UNRESOLVED (tests/lib/grading_tree.sh not reachable; no tree named)\n' >&2
 cd "$(dirname "$0")/.."
+# DIVE-2518: identity comes from the uid now; `USER=agent-x` / `--from=x` no longer
+# move it. Impersonate through the sealed seam. tests/lib/actor_seam.sh.
+. "$(dirname "${BASH_SOURCE[0]}")/lib/actor_seam.sh"
 SRC=src
 TMP="$(mktemp -d /tmp/gate-route-unit.XXXXXX)"
 trap 'rm -rf "$TMP"' EXIT
@@ -85,21 +88,21 @@ answered(){ db "SELECT CASE WHEN need_answered_at IS NULL THEN 'open' ELSE 'clos
 
 # --- pref OFF: decision gate still pings the human (unchanged behavior) ------
 seed DIVE-1; HUMAN_PINGED=0
-cmd_task_need DIVE-1 --type=decision --ask="ship A or B?" --options="A|B" --recommend="A" --from=dev >/dev/null 2>&1
+actor_seam_as dev; cmd_task_need DIVE-1 --type=decision --ask="ship A or B?" --options="A|B" --recommend="A" --from=dev >/dev/null 2>&1
 [[ "$HUMAN_PINGED" == "1" ]] && ok_t "pref off: decision pings human" || bad_t "pref off pings human" "HUMAN_PINGED=$HUMAN_PINGED"
 
 _task_pref_set gate_builder_routing on
 
 # --- pref ON: builder decision routes to lead, NO human ping ----------------
 seed DIVE-2; HUMAN_PINGED=0; route_reset
-cmd_task_need DIVE-2 --type=decision --ask="ship A or B?" --options="A|B" --recommend="A" --from=dev >/dev/null 2>&1
+actor_seam_as dev; cmd_task_need DIVE-2 --type=decision --ask="ship A or B?" --options="A|B" --recommend="A" --from=dev >/dev/null 2>&1
 [[ "$HUMAN_PINGED" == "0" ]] && ok_t "route on: builder decision does NOT ping human" || bad_t "route suppresses human" "HUMAN_PINGED=$HUMAN_PINGED"
 [[ "$(statusof DIVE-2)" == "blocked" && "$(answered DIVE-2)" == "open" ]] && ok_t "routed gate stays blocked+open for lead" || bad_t "routed gate blocked+open" "status=$(statusof DIVE-2) ans=$(answered DIVE-2)"
 R2=$(route_sent); [[ "$R2" == "1" && "$(route_last)" == "main" ]] && ok_t "routed send hit lead (main), stubbed — no live network" || bad_t "routed send → main via stub" "sent=$R2 last='$(route_last)'"
 
 # --- pref ON: gate filed BY the lead escalates to human ----------------------
 seed DIVE-3; HUMAN_PINGED=0
-cmd_task_need DIVE-3 --type=decision --ask="ship A or B?" --options="A|B" --recommend="A" --from=main >/dev/null 2>&1
+actor_seam_as main; cmd_task_need DIVE-3 --type=decision --ask="ship A or B?" --options="A|B" --recommend="A" --from=main >/dev/null 2>&1
 [[ "$HUMAN_PINGED" == "1" ]] && ok_t "route on: lead's own decision goes to human" || bad_t "lead decision → human" "HUMAN_PINGED=$HUMAN_PINGED"
 
 # --- DIVE-1182: pref ON — builder APPROVAL (ship-gate) routes to lead ---------
@@ -107,7 +110,7 @@ cmd_task_need DIVE-3 --type=decision --ask="ship A or B?" --options="A|B" --reco
 # (pinged lodar). Now they route to the org lead like decision, persist
 # routed_reviewer, and are clearable by that lead (below).
 seed DIVE-4; HUMAN_PINGED=0; route_reset
-cmd_task_need DIVE-4 --type=approval --ask="approve the prod push?" --from=dev >/dev/null 2>&1
+actor_seam_as dev; cmd_task_need DIVE-4 --type=approval --ask="approve the prod push?" --from=dev >/dev/null 2>&1
 [[ "$HUMAN_PINGED" == "0" ]] && ok_t "route on: builder approval does NOT ping human (DIVE-1182)" || bad_t "approval routed not human" "HUMAN_PINGED=$HUMAN_PINGED"
 [[ "$(statusof DIVE-4)" == "blocked" && "$(answered DIVE-4)" == "open" ]] && ok_t "routed approval stays blocked+open for lead" || bad_t "routed approval blocked+open" "status=$(statusof DIVE-4) ans=$(answered DIVE-4)"
 [[ "$(db "SELECT COALESCE(routed_reviewer,'') FROM tasks WHERE ident='DIVE-4';")" == "main" ]] && ok_t "routed approval persists routed_reviewer=main" || bad_t "routed_reviewer=main" "got '$(db "SELECT COALESCE(routed_reviewer,'') FROM tasks WHERE ident='DIVE-4';")'"
@@ -128,20 +131,20 @@ _rt=$(db "SELECT need_type FROM tasks WHERE ident='DIVE-4';")
 # would `exit` mid-harness — and the drop target is irrelevant to the routing
 # exclusion under test, so file it plain.
 seed DIVE-7; HUMAN_PINGED=0; route_reset
-cmd_task_need DIVE-7 --type=secret --ask="paste the deploy key" --secret-key=DEPLOY_KEY --connector=fixture --from=dev >/dev/null 2>&1
+actor_seam_as dev; cmd_task_need DIVE-7 --type=secret --ask="paste the deploy key" --secret-key=DEPLOY_KEY --connector=fixture --from=dev >/dev/null 2>&1
 [[ "$HUMAN_PINGED" == "1" ]] && ok_t "route on: secret stays human-directed (never routed)" || bad_t "secret → human" "HUMAN_PINGED=$HUMAN_PINGED"
 [[ -z "$(db "SELECT COALESCE(routed_reviewer,'') FROM tasks WHERE ident='DIVE-7';")" ]] && ok_t "secret leaves routed_reviewer NULL" || bad_t "secret routed_reviewer NULL" "got '$(db "SELECT COALESCE(routed_reviewer,'') FROM tasks WHERE ident='DIVE-7';")'"
 
 # --- DIVE-1182: a true-human-category APPROVAL (money) is NOT routed ----------
 seed DIVE-8; HUMAN_PINGED=0; route_reset
-cmd_task_need DIVE-8 --type=approval --ask="approve the \$5000 ad spend budget?" --from=dev >/dev/null 2>&1
+actor_seam_as dev; cmd_task_need DIVE-8 --type=approval --ask="approve the \$5000 ad spend budget?" --from=dev >/dev/null 2>&1
 [[ "$HUMAN_PINGED" == "1" ]] && ok_t "route on: money approval → human (category floor, not routed)" || bad_t "money approval → human" "HUMAN_PINGED=$HUMAN_PINGED"
 [[ -z "$(db "SELECT COALESCE(routed_reviewer,'') FROM tasks WHERE ident='DIVE-8';")" ]] && ok_t "money approval leaves routed_reviewer NULL" || bad_t "money approval routed_reviewer NULL" "got '$(db "SELECT COALESCE(routed_reviewer,'') FROM tasks WHERE ident='DIVE-8';")'"
 
 # --- DIVE-1182: explicit --tier=2 approval is NOT routed (hard-human contract) -
 # NB: ask must NOT name an eng-ship action, else DIVE-1359 downgrades it (below).
 seed DIVE-9; HUMAN_PINGED=0; route_reset
-cmd_task_need DIVE-9 --type=approval --tier=2 --ask="make the final go/no-go call on this?" --from=dev >/dev/null 2>&1
+actor_seam_as dev; cmd_task_need DIVE-9 --type=approval --tier=2 --ask="make the final go/no-go call on this?" --from=dev >/dev/null 2>&1
 [[ "$HUMAN_PINGED" == "1" ]] && ok_t "route on: explicit --tier=2 approval → human (not routed)" || bad_t "explicit T2 approval → human" "HUMAN_PINGED=$HUMAN_PINGED"
 
 # --- DIVE-1359: eng-ship class — a builder CANNOT hard-human-gate an eng ship/ --
@@ -153,7 +156,7 @@ cmd_task_need DIVE-9 --type=approval --tier=2 --ask="make the final go/no-go cal
 # of this class; overriding the caller's hard-human pin was the bug. This case
 # therefore files with NO --tier flag, which is the real builder shape anyway.
 seed DIVE-30; HUMAN_PINGED=0; route_reset
-cmd_task_need DIVE-30 --type=approval --ask="approve the prod push?" --from=dev >/dev/null 2>&1
+actor_seam_as dev; cmd_task_need DIVE-30 --type=approval --ask="approve the prod push?" --from=dev >/dev/null 2>&1
 [[ "$HUMAN_PINGED" == "0" ]] && ok_t "DIVE-1359: eng-ship approval --tier=2 NOT pinged to human" || bad_t "eng-ship T2 → not human" "HUMAN_PINGED=$HUMAN_PINGED"
 [[ "$(db "SELECT tier FROM tasks WHERE ident='DIVE-30';")" == "1" ]] && ok_t "DIVE-1359: eng-ship type-default tier-2 downgraded to lead-routed tier-1" || bad_t "eng-ship downgrade to tier-1" "got tier '$(db "SELECT tier FROM tasks WHERE ident='DIVE-30';")'"
 [[ "$(db "SELECT COALESCE(routed_reviewer,'') FROM tasks WHERE ident='DIVE-30';")" == "main" ]] && ok_t "DIVE-1359: eng-ship approval routed_reviewer=main (lead-clearable)" || bad_t "eng-ship routed to lead" "got '$(db "SELECT COALESCE(routed_reviewer,'') FROM tasks WHERE ident='DIVE-30';")'"
@@ -161,15 +164,15 @@ cmd_task_need DIVE-30 --type=approval --ask="approve the prod push?" --from=dev 
 # --- DIVE-1359: eng-ship routes even with pref OFF (intrinsic to the kind) ----
 _task_pref_set gate_builder_routing off
 seed DIVE-31; HUMAN_PINGED=0; route_reset
-cmd_task_need DIVE-31 --type=approval --ask="ship the DIVE-1359 branch to main?" --from=dev >/dev/null 2>&1
+actor_seam_as dev; cmd_task_need DIVE-31 --type=approval --ask="ship the DIVE-1359 branch to main?" --from=dev >/dev/null 2>&1
 [[ "$HUMAN_PINGED" == "0" && "$(db "SELECT COALESCE(routed_reviewer,'') FROM tasks WHERE ident='DIVE-31';")" == "main" ]] && ok_t "DIVE-1359: eng-ship routes to lead even with pref OFF" || bad_t "eng-ship pref-OFF route" "human=$HUMAN_PINGED reviewer='$(db "SELECT COALESCE(routed_reviewer,'') FROM tasks WHERE ident='DIVE-31';")'"
 # a genuine money approval with pref OFF still pings the human (floor wins over eng-ship)
 seed DIVE-32; HUMAN_PINGED=0; route_reset
-cmd_task_need DIVE-32 --type=approval --ask="approve the deploy AND the \$900 vercel invoice?" --from=dev >/dev/null 2>&1
+actor_seam_as dev; cmd_task_need DIVE-32 --type=approval --ask="approve the deploy AND the \$900 vercel invoice?" --from=dev >/dev/null 2>&1
 [[ "$HUMAN_PINGED" == "1" ]] && ok_t "DIVE-1359: floor beats eng-ship (deploy+\$invoice stays human)" || bad_t "floor beats eng-ship" "HUMAN_PINGED=$HUMAN_PINGED"
 # a lead's OWN eng-ship gate is NOT downgraded (no distinct reviewer → human)
 seed DIVE-33; HUMAN_PINGED=0; route_reset
-cmd_task_need DIVE-33 --type=approval --tier=2 --ask="approve the prod push?" --from=main >/dev/null 2>&1
+actor_seam_as main; cmd_task_need DIVE-33 --type=approval --tier=2 --ask="approve the prod push?" --from=main >/dev/null 2>&1
 [[ "$HUMAN_PINGED" == "1" && "$(db "SELECT tier FROM tasks WHERE ident='DIVE-33';")" == "2" ]] && ok_t "DIVE-1359: a lead's own eng-ship --tier=2 stays hard-human" || bad_t "lead eng-ship not downgraded" "human=$HUMAN_PINGED tier='$(db "SELECT tier FROM tasks WHERE ident='DIVE-33';")'"
 
 # --- DIVE-1555: a delegated PUSH-FOR-REVIEW (5dive push / DIVE-1376) is eng-ship. A
@@ -183,7 +186,7 @@ for _c in \
   "DIVE-36|clear this so 5dive push can run"; do
   _id="${_c%%|*}"; _ask="${_c#*|}"
   seed "$_id"; HUMAN_PINGED=0; route_reset
-  cmd_task_need "$_id" --type=approval --ask="$_ask" --from=dev >/dev/null 2>&1
+  actor_seam_as dev; cmd_task_need "$_id" --type=approval --ask="$_ask" --from=dev >/dev/null 2>&1
   [[ "$HUMAN_PINGED" == "0" \
      && "$(db "SELECT tier FROM tasks WHERE ident='$_id';")" == "1" \
      && "$(db "SELECT COALESCE(routed_reviewer,'') FROM tasks WHERE ident='$_id';")" == "main" ]] \
@@ -194,7 +197,7 @@ done
 # DIVE-1555: the true-human floor still wins — a push-for-review that ALSO names
 # money stays a tier-2 human call (not lead-routed).
 seed DIVE-37; HUMAN_PINGED=0; route_reset
-cmd_task_need DIVE-37 --type=approval --ask="approve delegated push for review AND the \$500 vercel invoice?" --from=dev >/dev/null 2>&1
+actor_seam_as dev; cmd_task_need DIVE-37 --type=approval --ask="approve delegated push for review AND the \$500 vercel invoice?" --from=dev >/dev/null 2>&1
 [[ "$HUMAN_PINGED" == "1" && "$(db "SELECT tier FROM tasks WHERE ident='DIVE-37';")" == "2" ]] \
   && ok_t "DIVE-1555: money floor beats push-for-review (stays tier-2 human)" \
   || bad_t "DIVE-1555: money floor beats push-for-review" "human=$HUMAN_PINGED tier='$(db "SELECT tier FROM tasks WHERE ident='DIVE-37';")'"
@@ -211,7 +214,7 @@ for _c in \
   "DIVE-45|clear this fleet roll of the verified build"; do
   _id="${_c%%|*}"; _ask="${_c#*|}"
   seed "$_id"; HUMAN_PINGED=0; route_reset
-  cmd_task_need "$_id" --type=approval --ask="$_ask" --from=dev >/dev/null 2>&1
+  actor_seam_as dev; cmd_task_need "$_id" --type=approval --ask="$_ask" --from=dev >/dev/null 2>&1
   [[ "$HUMAN_PINGED" == "0" \
      && "$(db "SELECT tier FROM tasks WHERE ident='$_id';")" == "1" \
      && "$(db "SELECT COALESCE(routed_reviewer,'') FROM tasks WHERE ident='$_id';")" == "main" ]] \
@@ -222,7 +225,7 @@ done
 # DIVE-1698: the true-human floor still wins — a push+fleet-roll that ALSO names a
 # secret/credential stays a tier-2 human call (not lead-routed).
 seed DIVE-46; HUMAN_PINGED=0; route_reset
-cmd_task_need DIVE-46 --type=approval --ask="push to github + roll the new api key to the fleet?" --from=dev >/dev/null 2>&1
+actor_seam_as dev; cmd_task_need DIVE-46 --type=approval --ask="push to github + roll the new api key to the fleet?" --from=dev >/dev/null 2>&1
 [[ "$HUMAN_PINGED" == "1" && "$(db "SELECT tier FROM tasks WHERE ident='DIVE-46';")" == "2" ]] \
   && ok_t "DIVE-1698: secret floor beats push+fleet-roll (stays tier-2 human)" \
   || bad_t "DIVE-1698: secret floor beats push+fleet-roll" "human=$HUMAN_PINGED tier='$(db "SELECT tier FROM tasks WHERE ident='DIVE-46';")'"
@@ -237,7 +240,7 @@ cmd_task_need DIVE-46 --type=approval --ask="push to github + roll the new api k
 # (DIVE-1957: filed with NO --tier — approval already DEFAULTS to tier 2, which is
 # the leak's real shape; an explicit pin is now honored and vetoes the downgrade.)
 seed DIVE-38; HUMAN_PINGED=0; route_reset
-cmd_task_need DIVE-38 --type=approval --ask="Approve landing the verified CLI/plugin fix and pushing to origin?" --from=dev >/dev/null 2>&1
+actor_seam_as dev; cmd_task_need DIVE-38 --type=approval --ask="Approve landing the verified CLI/plugin fix and pushing to origin?" --from=dev >/dev/null 2>&1
 [[ "$HUMAN_PINGED" == "0" ]] && ok_t "DIVE-1605: 'landing...pushing' eng-ship NOT pinged to human" || bad_t "DIVE-1605 gerund eng-ship -> human" "HUMAN_PINGED=$HUMAN_PINGED"
 [[ "$(db "SELECT tier FROM tasks WHERE ident='DIVE-38';")" == "1" ]] && ok_t "DIVE-1605: 'landing...pushing' downgraded to tier-1" || bad_t "DIVE-1605 gerund downgrade" "got tier '$(db "SELECT tier FROM tasks WHERE ident='DIVE-38';")'"
 [[ "$(db "SELECT COALESCE(routed_reviewer,'') FROM tasks WHERE ident='DIVE-38';")" == "main" ]] && ok_t "DIVE-1605: 'landing...pushing' routed_reviewer=main (lead-clearable)" || bad_t "DIVE-1605 gerund route to lead" "got '$(db "SELECT COALESCE(routed_reviewer,'') FROM tasks WHERE ident='DIVE-38';")'"
@@ -249,55 +252,55 @@ cmd_task_need DIVE-38 --type=approval --ask="Approve landing the verified CLI/pl
 # regardless of pref. pref stays OFF here (set above) to prove the routing is
 # intrinsic to the kind.
 seed DIVE-40; HUMAN_PINGED=0; route_reset
-cmd_task_need DIVE-40 --type=approval --ask="approve persona 'doc' as ready to publish to the character-pack drip queue?" --from=dev >/dev/null 2>&1
+actor_seam_as dev; cmd_task_need DIVE-40 --type=approval --ask="approve persona 'doc' as ready to publish to the character-pack drip queue?" --from=dev >/dev/null 2>&1
 [[ "$HUMAN_PINGED" == "0" ]] && ok_t "DIVE-1381: curation 'publish' approval NOT pinged to human" || bad_t "curation → not human" "HUMAN_PINGED=$HUMAN_PINGED"
 [[ "$(db "SELECT tier FROM tasks WHERE ident='DIVE-40';")" == "1" ]] && ok_t "DIVE-1381: curation gate downgraded from T2-floor to lead-routed tier-1" || bad_t "curation downgrade to tier-1" "got tier '$(db "SELECT tier FROM tasks WHERE ident='DIVE-40';")'"
 [[ "$(db "SELECT COALESCE(routed_reviewer,'') FROM tasks WHERE ident='DIVE-40';")" == "main" ]] && ok_t "DIVE-1381: curation approval routed_reviewer=main (lead-clearable), pref OFF" || bad_t "curation routed to lead" "got '$(db "SELECT COALESCE(routed_reviewer,'') FROM tasks WHERE ident='DIVE-40';")'"
 
 # curation-shaped WITHOUT a floor word is still intrinsically lead-routed (pref OFF)
 seed DIVE-41; HUMAN_PINGED=0; route_reset
-cmd_task_need DIVE-41 --type=approval --ask="approve the persona skill-set for 'doc' before it enters the drip queue?" --from=dev >/dev/null 2>&1
+actor_seam_as dev; cmd_task_need DIVE-41 --type=approval --ask="approve the persona skill-set for 'doc' before it enters the drip queue?" --from=dev >/dev/null 2>&1
 [[ "$HUMAN_PINGED" == "0" && "$(db "SELECT COALESCE(routed_reviewer,'') FROM tasks WHERE ident='DIVE-41';")" == "main" ]] && ok_t "DIVE-1381: curation (no floor word) routes to lead, pref OFF" || bad_t "curation no-floor route" "human=$HUMAN_PINGED reviewer='$(db "SELECT COALESCE(routed_reviewer,'') FROM tasks WHERE ident='DIVE-41';")'"
 
 # DIVE-1492: brand alone is no longer a hard-human floor. A brand decision that
 # also names a persona stays lead-clearable through the curation route.
 seed DIVE-42; HUMAN_PINGED=0; route_reset
-cmd_task_need DIVE-42 --type=approval --ask="approve the brand palette for the persona pack?" --from=dev >/dev/null 2>&1
+actor_seam_as dev; cmd_task_need DIVE-42 --type=approval --ask="approve the brand palette for the persona pack?" --from=dev >/dev/null 2>&1
 [[ "$HUMAN_PINGED" == "0" && "$(db "SELECT tier FROM tasks WHERE ident='DIVE-42';")" == "1" && "$(db "SELECT COALESCE(routed_reviewer,'') FROM tasks WHERE ident='DIVE-42';")" == "main" ]] \
   && ok_t "DIVE-1492: brand persona approval routes to lead at tier-1" \
   || bad_t "brand persona approval should route to lead" "human=$HUMAN_PINGED tier='$(db "SELECT tier FROM tasks WHERE ident='DIVE-42';")' reviewer='$(db "SELECT COALESCE(routed_reviewer,'') FROM tasks WHERE ident='DIVE-42';")'"
 
 # floor WINS over curation: MONEY in a curation ask stays hard-human.
 seed DIVE-43; HUMAN_PINGED=0; route_reset
-cmd_task_need DIVE-43 --type=approval --ask="approve the \$200 spend to publish the persona pack?" --from=dev >/dev/null 2>&1
+actor_seam_as dev; cmd_task_need DIVE-43 --type=approval --ask="approve the \$200 spend to publish the persona pack?" --from=dev >/dev/null 2>&1
 [[ "$HUMAN_PINGED" == "1" ]] && ok_t "DIVE-1381: floor beats curation (\$spend to publish persona → human)" || bad_t "money beats curation" "HUMAN_PINGED=$HUMAN_PINGED"
 
 # floor WINS over curation: customer-comms (newsletter) stays hard-human.
 seed DIVE-44; HUMAN_PINGED=0; route_reset
-cmd_task_need DIVE-44 --type=approval --ask="approve the persona pack newsletter blast to customers?" --from=dev >/dev/null 2>&1
+actor_seam_as dev; cmd_task_need DIVE-44 --type=approval --ask="approve the persona pack newsletter blast to customers?" --from=dev >/dev/null 2>&1
 [[ "$HUMAN_PINGED" == "1" ]] && ok_t "DIVE-1381: floor beats curation (persona newsletter blast → human)" || bad_t "newsletter beats curation" "HUMAN_PINGED=$HUMAN_PINGED"
 
 # a lead's OWN curation gate is NOT downgraded (no distinct reviewer → human)
 seed DIVE-45; HUMAN_PINGED=0; route_reset
-cmd_task_need DIVE-45 --type=approval --tier=2 --ask="approve persona 'doc' ready to publish to the drip queue?" --from=main >/dev/null 2>&1
+actor_seam_as main; cmd_task_need DIVE-45 --type=approval --tier=2 --ask="approve persona 'doc' ready to publish to the drip queue?" --from=main >/dev/null 2>&1
 [[ "$HUMAN_PINGED" == "1" && "$(db "SELECT tier FROM tasks WHERE ident='DIVE-45';")" == "2" ]] && ok_t "DIVE-1381: a lead's own curation --tier=2 stays hard-human" || bad_t "lead curation not downgraded" "human=$HUMAN_PINGED tier='$(db "SELECT tier FROM tasks WHERE ident='DIVE-45';")'"
 
 # substring guard: 'accurate' / 'personalize' must NOT trip the curation class, so
 # a non-curation ask that merely contains those substrings + 'publish' still floors.
 seed DIVE-47; HUMAN_PINGED=0; route_reset
-cmd_task_need DIVE-47 --type=approval --ask="approve the accurate personalized copy before we publish it?" --from=dev >/dev/null 2>&1
+actor_seam_as dev; cmd_task_need DIVE-47 --type=approval --ask="approve the accurate personalized copy before we publish it?" --from=dev >/dev/null 2>&1
 [[ "$HUMAN_PINGED" == "1" ]] && ok_t "DIVE-1381: 'accurate'/'personalized'+publish does NOT match curation (still floors)" || bad_t "substring guard" "HUMAN_PINGED=$HUMAN_PINGED"
 
 # a NON-curation 'publish' ask still floors to the human — proves the carve-out is
 # scoped to the curation KIND, not to any ask that merely names 'publish'. (No
 # other floor word here: 'publish' is the ONLY trigger, and it must still floor.)
 seed DIVE-46; HUMAN_PINGED=0; route_reset
-cmd_task_need DIVE-46 --type=approval --ask="approve the publish of the homepage hero copy?" --from=dev >/dev/null 2>&1
+actor_seam_as dev; cmd_task_need DIVE-46 --type=approval --ask="approve the publish of the homepage hero copy?" --from=dev >/dev/null 2>&1
 [[ "$HUMAN_PINGED" == "1" ]] && ok_t "DIVE-1381: non-curation 'publish' still floors (carve-out scoped)" || bad_t "non-curation publish floors" "HUMAN_PINGED=$HUMAN_PINGED"
 
 # --- pref ON: tier-2-floored decision (money) is NOT routed ------------------
 seed DIVE-5; HUMAN_PINGED=0; route_reset
-cmd_task_need DIVE-5 --type=decision --ask="approve the \$5000 ad spend budget?" --options="yes|no" --recommend="no" --from=dev >/dev/null 2>&1
+actor_seam_as dev; cmd_task_need DIVE-5 --type=decision --ask="approve the \$5000 ad spend budget?" --options="yes|no" --recommend="no" --from=dev >/dev/null 2>&1
 [[ "$HUMAN_PINGED" == "1" ]] && ok_t "route on: T2-floored decision (money) → human" || bad_t "T2 floor → human" "HUMAN_PINGED=$HUMAN_PINGED"
 [[ ! -s "$ROUTE_FILE" ]] && ok_t "T2-floored decision: no lead route fired" || bad_t "T2 floor no route" "sent=$(route_last)"
 
@@ -305,7 +308,7 @@ cmd_task_need DIVE-5 --type=decision --ask="approve the \$5000 ad spend budget?"
 # Guards the hard-human contract: 2 = never auto-applies, always pings. Before
 # the effective-tier fix this left tier_floored=0 and silently routed to the lead.
 seed DIVE-6; HUMAN_PINGED=0; route_reset
-cmd_task_need DIVE-6 --type=decision --tier=2 --ask="pick the launch date?" --options="mon|tue" --recommend="mon" --from=dev >/dev/null 2>&1
+actor_seam_as dev; cmd_task_need DIVE-6 --type=decision --tier=2 --ask="pick the launch date?" --options="mon|tue" --recommend="mon" --from=dev >/dev/null 2>&1
 [[ "$HUMAN_PINGED" == "1" ]] && ok_t "route on: explicit --tier=2 decision → human (not routed)" || bad_t "explicit T2 decision → human" "HUMAN_PINGED=$HUMAN_PINGED"
 [[ ! -s "$ROUTE_FILE" ]] && ok_t "explicit --tier=2 decision: no lead route fired" || bad_t "explicit T2 no route" "sent=$(route_last)"
 
@@ -360,7 +363,7 @@ unset -f id
 nudge_of() { local c; c=$(grep -c 'Prefer --type=decision' "$1" 2>/dev/null); echo "${c:-0}"; }
 # builder eng-ship approval → nudged AND still lead-routed tier-1 (behavior kept)
 seed DIVE-50; HUMAN_PINGED=0; route_reset
-cmd_task_need DIVE-50 --type=approval --ask="approve the prod push?" --from=dev >/dev/null 2>"$TMP/n50"
+actor_seam_as dev; cmd_task_need DIVE-50 --type=approval --ask="approve the prod push?" --from=dev >/dev/null 2>"$TMP/n50"
 [[ "$(nudge_of "$TMP/n50")" -ge 1 \
    && "$(db "SELECT tier FROM tasks WHERE ident='DIVE-50';")" == "1" \
    && "$(db "SELECT COALESCE(routed_reviewer,'') FROM tasks WHERE ident='DIVE-50';")" == "main" ]] \
@@ -368,19 +371,19 @@ cmd_task_need DIVE-50 --type=approval --ask="approve the prod push?" --from=dev 
   || bad_t "DIVE-1738 approval nudge" "nudge=$(nudge_of "$TMP/n50") tier='$(db "SELECT tier FROM tasks WHERE ident='DIVE-50';")' rr='$(db "SELECT COALESCE(routed_reviewer,'') FROM tasks WHERE ident='DIVE-50';")'"
 # builder eng-ship MANUAL → nudged (manual is NOT downgraded, so this is its only treatment)
 seed DIVE-51; HUMAN_PINGED=0; route_reset
-cmd_task_need DIVE-51 --type=manual --ask="merge the dive-1738 PR and roll to the fleet?" --from=dev >/dev/null 2>"$TMP/n51"
+actor_seam_as dev; cmd_task_need DIVE-51 --type=manual --ask="merge the dive-1738 PR and roll to the fleet?" --from=dev >/dev/null 2>"$TMP/n51"
 [[ "$(nudge_of "$TMP/n51")" -ge 1 ]] && ok_t "DIVE-1738: builder eng-ship manual is nudged to decision" || bad_t "DIVE-1738 manual nudge" "nudge=$(nudge_of "$TMP/n51")"
 # a lead's OWN eng-ship gate is NOT nudged (no reviewer above them)
 seed DIVE-52; HUMAN_PINGED=0; route_reset
-cmd_task_need DIVE-52 --type=approval --ask="approve the prod push?" --from=main >/dev/null 2>"$TMP/n52"
+actor_seam_as main; cmd_task_need DIVE-52 --type=approval --ask="approve the prod push?" --from=main >/dev/null 2>"$TMP/n52"
 [[ "$(nudge_of "$TMP/n52")" == "0" ]] && ok_t "DIVE-1738: lead's own eng-ship gate is NOT nudged" || bad_t "DIVE-1738 lead not nudged" "nudge=$(nudge_of "$TMP/n52")"
 # a plain (non-eng-ship) builder approval is NOT nudged
 seed DIVE-53; HUMAN_PINGED=0; route_reset
-cmd_task_need DIVE-53 --type=approval --ask="make the final go/no-go call on this?" --from=dev >/dev/null 2>"$TMP/n53"
+actor_seam_as dev; cmd_task_need DIVE-53 --type=approval --ask="make the final go/no-go call on this?" --from=dev >/dev/null 2>"$TMP/n53"
 [[ "$(nudge_of "$TMP/n53")" == "0" ]] && ok_t "DIVE-1738: non-eng-ship approval is NOT nudged" || bad_t "DIVE-1738 non-eng-ship not nudged" "nudge=$(nudge_of "$TMP/n53")"
 # a floored (money) eng-ship approval is NOT nudged (floor wins → stays hard-human)
 seed DIVE-54; HUMAN_PINGED=0; route_reset
-cmd_task_need DIVE-54 --type=approval --ask="approve the deploy AND the \$900 vercel invoice?" --from=dev >/dev/null 2>"$TMP/n54"
+actor_seam_as dev; cmd_task_need DIVE-54 --type=approval --ask="approve the deploy AND the \$900 vercel invoice?" --from=dev >/dev/null 2>"$TMP/n54"
 [[ "$(nudge_of "$TMP/n54")" == "0" && "$HUMAN_PINGED" == "1" ]] && ok_t "DIVE-1738: floored money eng-ship is NOT nudged (stays human)" || bad_t "DIVE-1738 floored not nudged" "nudge=$(nudge_of "$TMP/n54") human=$HUMAN_PINGED"
 
 # --- DIVE-2004: LOUD AT FILE TIME ---------------------------------------------
@@ -395,19 +398,19 @@ cmd_task_need DIVE-54 --type=approval --ask="approve the deploy AND the \$900 ve
 w2004_of() { grep -c "will REFUSE it" "$1" 2>/dev/null | head -1; }
 # filed by the lead: `_gate_route_reviewer` finds nobody above them -> unrouted.
 seed DIVE-55; HUMAN_PINGED=0; route_reset
-cmd_task_need DIVE-55 --type=decision --ask="cherry-pick, or re-file the delegated push for review after #16?" --from=main >/dev/null 2>"$TMP/n55"
+actor_seam_as main; cmd_task_need DIVE-55 --type=decision --ask="cherry-pick, or re-file the delegated push for review after #16?" --from=main >/dev/null 2>"$TMP/n55"
 [[ "$(w2004_of "$TMP/n55")" -ge 1 ]] \
   && ok_t "DIVE-2004: unrouted eng-ship decision warns at FILE time that push will refuse it" \
   || bad_t "DIVE-2004 file-time warning" "warn=$(w2004_of "$TMP/n55") rr='$(db "SELECT COALESCE(routed_reviewer,'') FROM tasks WHERE ident='DIVE-55';")'"
 # the SAME ask from a builder DOES route -> push accepts it -> must stay silent.
 seed DIVE-56; HUMAN_PINGED=0; route_reset
-cmd_task_need DIVE-56 --type=decision --ask="cherry-pick, or re-file the delegated push for review after #16?" --from=dev >/dev/null 2>"$TMP/n56"
+actor_seam_as dev; cmd_task_need DIVE-56 --type=decision --ask="cherry-pick, or re-file the delegated push for review after #16?" --from=dev >/dev/null 2>"$TMP/n56"
 { [[ "$(w2004_of "$TMP/n56")" == "0" ]] && [[ -n "$(db "SELECT COALESCE(routed_reviewer,'') FROM tasks WHERE ident='DIVE-56';")" ]]; } \
   && ok_t "DIVE-2004: a ROUTED eng-ship decision does NOT warn (push accepts it)" \
   || bad_t "DIVE-2004 routed must not warn" "warn=$(w2004_of "$TMP/n56") rr='$(db "SELECT COALESCE(routed_reviewer,'') FROM tasks WHERE ident='DIVE-56';")'"
 # an ordinary unrouted decision is not a push ask -> silent, or the warning is noise.
 seed DIVE-57; HUMAN_PINGED=0; route_reset
-cmd_task_need DIVE-57 --type=decision --ask="which copy variant should we use on the pricing page?" --from=main >/dev/null 2>"$TMP/n57"
+actor_seam_as main; cmd_task_need DIVE-57 --type=decision --ask="which copy variant should we use on the pricing page?" --from=main >/dev/null 2>"$TMP/n57"
 [[ "$(w2004_of "$TMP/n57")" == "0" ]] \
   && ok_t "DIVE-2004: a non-eng-ship unrouted decision does NOT warn (no wallpaper)" \
   || bad_t "DIVE-2004 non-eng-ship must not warn" "warn=$(w2004_of "$TMP/n57")"
