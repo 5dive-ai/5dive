@@ -97,6 +97,13 @@ jobs:
   # makes that flag unnecessary rather than merely omitted.
   changed-harnesses:
     runs-on: ubuntu-latest
+    # This job's cost is set by the DIFF, not by the corpus, so it has no budget of
+    # its own — but it is not unbounded either. Measured on this row's own PR, which
+    # adds a `# TIER:` line to 73 files: 77 changed harnesses, each run once and
+    # probed (clean + mutated) is ~3 passes including the 300s mutation harness. A
+    # normal PR touches one to three. The ceiling is here so a pathological diff
+    # cannot sit in the queue for an hour with nobody able to say why.
+    timeout-minutes: 45
     steps:
       # DIVE-2229: full history — pinned baselines must resolve here too, and the
       # diff below needs the base commit to exist at all.
@@ -128,8 +135,20 @@ jobs:
           printf 'base=%s\n' "$base"
           printf 'changed harnesses: %d\n' "${#files[@]}"
           printf '  %s\n' "${files[@]:-（none）}"
+          # THE PROBE IS CAPPED, AND THE CAP SAYS WHAT IT DROPPED. Probing is the
+          # expensive half (a clean run plus a mutated run per file); running is one
+          # pass and stays uncapped, because "the harness you touched runs" is the
+          # promise. A silent truncation here would read as "all of it was probed",
+          # which is the shape of hole this whole workflow exists to close — so the
+          # names of the unprobed remainder go in the log, not a count.
+          PROBE_CAP=25
+          probe=("${files[@]:0:$PROBE_CAP}")
+          if (( ${#files[@]} > PROBE_CAP )); then
+            printf 'changed-harnesses: NOT PROBED (over the %d-file cap) — these ran, but their verdict wiring was not graded here; the nightly union covers them:\n' "$PROBE_CAP"
+            printf '  %s\n' "${files[@]:$PROBE_CAP}"
+          fi
           { printf 'files=%s\n' "${files[*]:-}"
-            printf 'names=%s\n' "$(printf '%s\n' "${files[@]:-}" | xargs -r -n1 basename | paste -sd, -)"
+            printf 'names=%s\n' "$(printf '%s\n' "${probe[@]:-}" | xargs -r -n1 basename | paste -sd, -)"
           } >> "$GITHUB_OUTPUT"
       # DIVE-2525: BUILD THE BUNDLE FIRST, EXPLICITLY. Three harnesses
       # (install_checksum, ledger, policy_refusals) need ./5dive and ./5dive.sha256
