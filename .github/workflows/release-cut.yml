@@ -69,6 +69,12 @@ on:
         description: 'Why this cut is being made by hand (hotfix, incident, first cut)'
         required: true
         type: string
+      level:
+        description: 'Which component to increment. patch = the nightly behaviour. minor/major DECLARE AN EPOCH and are only correct when the headline capability has landed.'
+        required: false
+        default: patch
+        type: choice
+        options: [patch, minor, major]
 
 concurrency:
   group: release-cut
@@ -90,6 +96,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           MANUAL_REASON: ${{ inputs.reason }}
+          RELEASE_LEVEL: ${{ inputs.level }}
         run: |
           set -uo pipefail
 
@@ -139,7 +146,43 @@ jobs:
             echo "::error::could not derive a successor from floor='${floor}' incumbent='${incumbent}' — refusing to cut."
             exit 1
           fi
-          version="${BASH_REMATCH[1]}.${BASH_REMATCH[2]}.$(( BASH_REMATCH[3] + 1 ))"
+          _maj="${BASH_REMATCH[1]}" _min="${BASH_REMATCH[2]}" _pat="${BASH_REMATCH[3]}"
+          # DIVE-2539: WHICH COMPONENT MOVES. This used to be patch-only, unconditionally,
+          # and that was invisible for its whole life because every cut since DIVE-2247 has
+          # been a patch — a capability that was never built reads exactly like one that
+          # works until the day it has different work. v0.18's headline verb (whoami,
+          # DIVE-2517) landed and the epoch could not be declared: major and minor were
+          # copied verbatim from the base, so 0.18.0 was unreachable from any path, and the
+          # fleet would have kept installing 0.17.x builds that already contained the work.
+          #
+          # RELEASE_LEVEL comes from the dispatch input via env, NOT from a ${{ }} template,
+          # so this block stays pure bash and tests/release_cut_assign_unit.sh can keep
+          # extracting and RUNNING these exact bytes rather than grading a copy.
+          # Unset (the nightly schedule, which declares no input) means patch, so the
+          # scheduled path is behaviourally identical to before this change.
+          # DO NOT ADD `set -e` TO THIS STEP. It runs under `set -uo pipefail` on purpose,
+          # which is why every refusal below is an EXPLICIT `exit 1` rather than a bare
+          # failing command. tests/release_cut_assign_unit.sh evals these same bytes, and
+          # its mutation grade depends on it: removing the explicit exit on an unknown
+          # level turns a refusal into a silent patch derivation and reddens exactly ONE
+          # arm. Under `set -e` that arm would still pass for the wrong reason, and the
+          # refusal would look pinned when it was only incidentally covered. (olivia,
+          # DIVE-2539.)
+          _level="${RELEASE_LEVEL:-patch}"
+          case "$_level" in
+            patch) version="${_maj}.${_min}.$(( _pat + 1 ))" ;;
+            minor) version="${_maj}.$(( _min + 1 )).0" ;;
+            major) version="$(( _maj + 1 )).0.0" ;;
+            *) echo "::error::RELEASE_LEVEL='${_level}' is not patch|minor|major — refusing to guess which component to move."; exit 1 ;;
+          esac
+          # The floor/incumbent base is the highest version ALREADY CLAIMED, so a successor
+          # that does not sort strictly above it would re-issue a number against a different
+          # tree (DIVE-2118). patch cannot fail this; a wrong minor/major arithmetic can, and
+          # this is the arm that catches it before a tag exists rather than after.
+          if [[ "$(printf '%s\n%s\n' "$base" "$version" | sort -V | tail -1)" != "$version" || "$version" == "$base" ]]; then
+            echo "::error::derived ${version} does not sort strictly above the claimed base ${base} at level '${_level}' — refusing to cut (DIVE-2118)."
+            exit 1
+          fi
           tag="v${version}"
           echo "cut-time assignment: floor ${floor}, incumbent ${incumbent:-<none>} -> ${tag} (DIVE-2247)"
 
