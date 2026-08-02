@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# TIER: nightly — 6.3s measured (DIVE-2525): does not fit the 300s PR core; the nightly sweep runs it.
 # DIVE-1117 isolated unit harness for the tier-2 PROVENANCE FLOOR in cmd_task_answer
 # (companion to DIVE-1115, CLI side / defense in depth). The DIVE-916/950 human-only
 # + evidence blocks key on need_type (approval/secret/manual); a `decision` gate

@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# TIER: nightly — 11.9s measured (DIVE-2525): does not fit the 300s PR core; the nightly sweep runs it.
 # DIVE-1376 isolated unit harness for `5dive push` — the delegated-push verb.
 # Covers every NON-CREDENTIAL path (the live token-mint + real push is smoked
 # separately against the control-plane GitHub App). Same isolation posture as

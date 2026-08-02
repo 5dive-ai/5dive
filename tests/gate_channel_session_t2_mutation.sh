@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# TIER: nightly — 300.0s measured (DIVE-2525): does not fit the 300s PR core; the nightly sweep runs it.
 # DIVE-2412 mutation grader for tests/gate_channel_session_t2_unit.sh.
 #
 # WHY THIS FILE EXISTS. Most of what DIVE-2412 ships is REFUSALS, and "it must

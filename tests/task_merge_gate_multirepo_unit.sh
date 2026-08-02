@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# TIER: nightly — 12.5s measured (DIVE-2525): does not fit the 300s PR core; the nightly sweep runs it.
 # DIVE-1955 isolated unit harness — the merge-gate across MORE THAN ONE REPO.
 #
 # DIVE-1935 made the gate live, for one repo. `_PUSH_DEFAULT_REPO` is a readonly

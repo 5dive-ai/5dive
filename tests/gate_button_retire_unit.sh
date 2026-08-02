@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# TIER: nightly — 23.1s measured (DIVE-2525): does not fit the 300s PR core; the nightly sweep runs it.
 # DIVE-2410: a settled gate must stop showing a live-looking approve button.
 #
 # WHAT THIS GRADES, and why each arm exists rather than just "it edits something":

@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# TIER: nightly — 10.0s measured (DIVE-2525): does not fit the 300s PR core; the nightly sweep runs it.
 # DIVE-2233 ITEM 2 — the tier-2 human claim, proved instead of asserted.
 #
 # Cut onto its own branch at Marcus's direction, and the reason is the point: the tier-2

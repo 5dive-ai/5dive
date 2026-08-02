@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# TIER: nightly — 21.6s measured (DIVE-2525): does not fit the 300s PR core; the nightly sweep runs it.
 # DIVE-595 isolated unit harness for `5dive loop panel` (N diverse-lens graders
 # + quorum vote + cost-dial config).
 #

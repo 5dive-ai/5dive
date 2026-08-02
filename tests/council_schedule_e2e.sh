@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# TIER: nightly — 6.2s measured (DIVE-2525): does not fit the 300s PR core; the nightly sweep runs it.
 # CNCL-23 schedule E2E — proves `5dive council schedule {add,ls,show,rm,run}` are REACHABLE
 # through the real BASH dispatcher (src/cmd_council.sh) on the BUILT binary, and that the
 # deterministic RUNNER generalizes the CNCL-21/22 ops scripts correctly:

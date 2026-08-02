@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# TIER: nightly — 18.1s measured (DIVE-2525): does not fit the 300s PR core; the nightly sweep runs it.
 # DIVE-2083 — the loop_id handle must be collision-PROOF, not collision-unlikely.
 #
 # `loop_runs.loop_id` is a PRIMARY KEY, so a repeated handle is not a cosmetic

@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# TIER: nightly — 13.6s measured (DIVE-2525): does not fit the 300s PR core; the nightly sweep runs it.
 # CNCL-11 bash e2e — the GOVERNANCE SURFACE wiring (roster / log / verify / promote / demote),
 # not just the node engine. Drives the real `5dive council {init,roster,promote,demote,log,verify}`
 # bundle against an isolated STATE_DIR + a self-provisioned gate-proof key, and asserts the

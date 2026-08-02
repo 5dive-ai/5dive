@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# TIER: nightly — 12.4s measured (DIVE-2525): does not fit the 300s PR core; the nightly sweep runs it.
 # DIVE-1416 isolated unit harness for _hb_stall_sweep (cmd_heartbeat.sh) —
 # fleet-stall self-heal gaps #2 and #3 (gap #1 is _hb_blocked_sweep, covered by
 # tests/task_cascade_unblock_unit.sh):

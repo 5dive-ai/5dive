@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# TIER: nightly — 60.9s measured (DIVE-2525): does not fit the 300s PR core; the nightly sweep runs it.
 # DIVE-1835 isolated unit harness for the MANDATORY auto-detect merge-gate.
 # The DIVE-1830 gate only fired when the maker DECLARED a binding
 # (delivery_ref / Branch:); 8 code-tasks closed with NEITHER and slipped past it.

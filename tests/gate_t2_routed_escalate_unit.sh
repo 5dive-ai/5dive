@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# TIER: nightly — 5.8s measured (DIVE-2525): does not fit the 300s PR core; the nightly sweep runs it.
 # DIVE-1437 isolated unit harness for the T2-floor-refused ROUTED-gate escalation in
 # cmd_task_answer. ROOT (DIVE-1429): a builder gate that DIVE-1145/1182 lead-routed
 # (routed_reviewer set) but whose effective tier is 2 (a non-floored `manual` gate —

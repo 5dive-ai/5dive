@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# TIER: nightly — 44.1s measured (DIVE-2525): does not fit the 300s PR core; the nightly sweep runs it.
 # DIVE-1355 isolated unit harness for the task-engine self-dispatch fix:
 #   * _task_cascade_unblock — on `task done`/`task cancel`, drop the satisfied
 #     blocking edge and flip a dependent with no edges left blocked->todo, UNLESS

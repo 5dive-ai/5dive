@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# TIER: nightly — 18.0s measured (DIVE-2525): does not fit the 300s PR core; the nightly sweep runs it.
 # DIVE-2241 isolated unit harness for the DECLARED human-class capability
 # (`5dive task need --needs=<capability>`).
 #

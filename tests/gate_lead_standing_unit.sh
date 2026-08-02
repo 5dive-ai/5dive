@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# TIER: nightly — 26.4s measured (DIVE-2525): does not fit the 300s PR core; the nightly sweep runs it.
 # DIVE-2099 isolated unit harness for the ORG LEAD's STANDING authority to clear an
 # ENGINEERING approval gate (lodar granted it 2026-07-26; main filed rather than
 # implemented it because the requester is the beneficiary).

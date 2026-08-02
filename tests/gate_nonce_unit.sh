@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# TIER: nightly — 11.0s measured (DIVE-2525): does not fit the 300s PR core; the nightly sweep runs it.
 # DIVE-916 isolated unit harness for the per-gate HUMAN nonce that closes the
 # sudo->--human gate-forge, folded into the DIVE-931 secret-drop chain:
 #   * `task need --type=approval|secret|manual` mints human_nonce_hash (hash-only

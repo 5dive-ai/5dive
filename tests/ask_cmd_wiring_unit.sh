@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# TIER: nightly — 10.1s measured (DIVE-2525): does not fit the 300s PR core; the nightly sweep runs it.
 # DIVE-1901 iteration 2 — drive cmd_ask ITSELF, both dispatch branches, under set -u.
 #
 # WHY THIS FILE EXISTS. The other two ask suites test the pure helpers

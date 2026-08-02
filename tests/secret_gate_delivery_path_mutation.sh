@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# TIER: nightly — 55.7s measured (DIVE-2525): does not fit the 300s PR core; the nightly sweep runs it.
 # DIVE-2411 mutation grader for tests/secret_gate_delivery_path_unit.sh.
 #
 # WHY THIS FILE EXISTS. What DIVE-2411 ships is two REFUSALS and one WITHHELD

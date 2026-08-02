@@ -336,6 +336,22 @@ else
   # rows in the same breath that the redirected one lists none. Both reads are
   # read-only, and the db file cannot be checked first: `task ls` never creates
   # one, so a file-existence precondition skips every run (iteration 2 did that).
+  # DIVE-2525: DERIVED HERE, NOT INSIDE THE T19-T21 BRANCH. This was set only on the
+  # path where the isolation fence proved out, and T25/T26 below read it on the path
+  # where the fence SKIPS — so under `set -u` a skip 150 lines earlier killed the
+  # harness outright ("line 513: EXPECT_BOARD: unbound variable") instead of skipping
+  # two arms. It never fired because the branch had never executed in CI: the arms
+  # below need ./5dive, nothing built it, and the harness died earlier. Building the
+  # bundle explicitly (DIVE-2525) reached this code for the first time. A variable
+  # derived inside the branch that happens to use it first is a precondition nobody
+  # declared, which is the same defect one layer down.
+  EXPECT_BOARD="cli"
+  if jq -e --arg n "$REAL_BOARD" '(.agents|type=="object") and (.agents|has($n))' \
+       /var/lib/5dive/agents.json >/dev/null 2>&1; then
+    EXPECT_BOARD="$REAL_BOARD"
+  elif [[ "$REAL_NAME" == agent-* ]]; then
+    EXPECT_BOARD="$REAL_BOARD"     # the passwd rung: registry silent, name is agent-*
+  fi
   live_rows=$("$BIN" task ls 2>/dev/null | grep -c 'DIVE-' || true)
   probe_rows=$(e2e task ls 2>/dev/null | grep -c 'DIVE-' || true)
   if (( live_rows == 0 )); then
@@ -364,13 +380,6 @@ else
     # for `claude` (uid 1000, not a registered agent) while the product was behaving
     # exactly as specified. Ground truth is the registry FILE, read directly, not
     # `actor_registry_agent` — that is the function under test.
-    EXPECT_BOARD="cli"
-    if jq -e --arg n "$REAL_BOARD" '(.agents|type=="object") and (.agents|has($n))' \
-         /var/lib/5dive/agents.json >/dev/null 2>&1; then
-      EXPECT_BOARD="$REAL_BOARD"
-    elif [[ "$REAL_NAME" == agent-* ]]; then
-      EXPECT_BOARD="$REAL_BOARD"     # the passwd rung: registry silent, name is agent-*
-    fi
     tid2=$(e2e task add "DIVE-2518 claimed row" --project=dive --from="$FORGE_BOARD" 2>&1 | grep -oE 'DIVE-[0-9]+' | head -1)
     cb=$(e2e task show "$tid2" | awk -F' = ' '/^created_by /{print $2; exit}')
     # created_by keeps the CLAIM — for a uid-less relay principal that is the only

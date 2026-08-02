@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# TIER: nightly — 8.6s measured (DIVE-2525): does not fit the 300s PR core; the nightly sweep runs it.
 # DIVE-1921 mutation runner for tests/digest_window_30d_unit.sh.
 #
 # WHY THIS IS COMMITTED RATHER THAN DESCRIBED. The PR for DIVE-1921 claimed

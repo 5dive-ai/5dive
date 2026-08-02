@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# TIER: nightly — 17.0s measured (DIVE-2525): does not fit the 300s PR core; the nightly sweep runs it.
 # DIVE-984 isolated unit harness for `5dive goal add` (goal decomposition v1).
 #
 # Sources the src/ libs directly and points STATE_DIR at a throwaway temp dir so

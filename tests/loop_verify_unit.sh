@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# TIER: nightly — 7.5s measured (DIVE-2525): does not fit the 300s PR core; the nightly sweep runs it.
 # DIVE-594 isolated unit harness for `5dive loop verify` (maker→verifier wrapper).
 # Same isolation as loop_spawn_unit.sh: sources src/ directly, points STATE_DIR
 # at a throwaway temp dir → never touches the live shared tasks.db. Asserts:

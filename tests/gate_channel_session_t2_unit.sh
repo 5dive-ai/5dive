@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# TIER: nightly — 26.7s measured (DIVE-2525): does not fit the 300s PR core; the nightly sweep runs it.
 # DIVE-2412 (DIVE-2382 fix #4) isolated unit harness: a TIER-2 gate cleared by
 # CHANNEL PROOF of the human's answer instead of a button tap.
 #

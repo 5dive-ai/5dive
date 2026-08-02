@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# TIER: nightly — 6.5s measured (DIVE-2525): does not fit the 300s PR core; the nightly sweep runs it.
 # DIVE-1357 isolated unit harness for the block-anchor enforcement (fast-follow
 # to DIVE-1355): a task can only enter 'blocked' via one of three anchors, each
 # carrying a built-in revisit — a dependency edge, a human need-gate, or a park

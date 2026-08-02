@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# TIER: nightly — 11.6s measured (DIVE-2525): does not fit the 300s PR core; the nightly sweep runs it.
 # DIVE-1305 isolated unit harness for the paired-human channel-proof clear and
 # the `task clear-recs` bulk-apply-recommendations verb:
 #   * _gate_channel_proof_ok verifies a chat_id against the bot's access.json

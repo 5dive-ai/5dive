@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# TIER: nightly — 9.0s measured (DIVE-2525): does not fit the 300s PR core; the nightly sweep runs it.
 # OSS-33 isolated unit harness for objective PREFLIGHT + explicit STOP-CONDITIONS
 # (cmd_objective.sh, MVP-bar items 4 & 5). No root, no network — drives the pure
 # helpers + the resume/replan wiring against a temp db. Asserts:
