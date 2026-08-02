@@ -50,6 +50,28 @@ REAL_UID=$(awk '/^Uid:/{print $2; exit}' /proc/self/status)
 REAL_GID=$(awk '/^Gid:/{print $2; exit}' /proc/self/status)
 REAL_NAME=$(awk -F: -v u="$REAL_UID" '$3==u{print $1; exit}' /etc/passwd)
 
+# --- forged identities, DERIVED so they can never equal the live caller ------
+# A forgery arm compares the forged value against the caller's REAL name. If the
+# two can ever be the same string, the arm passes even when the forgery WINS.
+# Iteration 1 shipped exactly that, and olivia caught it by running the suite as
+# the principal it named: T3 hardcoded `SUDO_USER=agent-olivia`, so under
+# agent-olivia the forged and expected values were identical and a mutant that
+# made $SUDO_USER win still reported "did not move the identity".
+# The same trap sat on the other three vars, unnamed: T3 forged `USER=claude`
+# and `LOGNAME=claude`, and `claude` is both a real user on this host and our
+# documented way to run tests (`sudo -u claude`) — so that axis was vacuous for
+# the principal we run as MOST often, including every local pre-push run.
+# Prepending a non-empty prefix makes each forgery strictly longer than REAL_NAME
+# and therefore different from it for EVERY caller, present and future. Distinct
+# prefixes per variable so a failure names WHICH variable the identity followed.
+forge(){ printf 'agent-%sforge-%s' "$1" "${REAL_NAME:-nobody}"; }
+FORGE_PATH=$(forge path); FORGE_SUDO=$(forge sudo); FORGE_USER=$(forge user)
+FORGE_LOGN=$(forge logn); FORGE_AUDIT=$(forge audit)
+# By construction none of these can equal REAL_NAME, so this guard should never
+# fire. It exists so that a future edit reintroducing a FIXED name fails loudly
+# instead of silently going green again.
+forgery_is_vacuous(){ local v; for v in "$@"; do [[ "$v" == "$REAL_NAME" ]] && return 0; done; return 1; }
+
 # --- load the sealed derivation, and NOTHING else ---------------------------
 # One-liner bodies included: `sed '/^f()/,/^}/p'` over `f() { ...; }` on a single
 # line captures that line and then runs to the NEXT `^}` in the file, swallowing
@@ -85,8 +107,8 @@ fi
 
 # 2. a PATH shim for `id` and `getent` must change nothing
 SHIM=$(mktemp -d)
-printf '#!/bin/sh\necho agent-lodar\n'          > "$SHIM/id";     chmod +x "$SHIM/id"
-printf '#!/bin/sh\necho agent-lodar:x:0:0:::\n' > "$SHIM/getent"; chmod +x "$SHIM/getent"
+printf '#!/bin/sh\necho %s\n'          "$FORGE_PATH" > "$SHIM/id";     chmod +x "$SHIM/id"
+printf '#!/bin/sh\necho %s:x:0:0:::\n' "$FORGE_PATH" > "$SHIM/getent"; chmod +x "$SHIM/getent"
 if [[ -z "$REAL_NAME" ]]; then
   skip "T2 no passwd row for the caller; the forgery has nothing to displace"
 else
@@ -94,10 +116,12 @@ else
   got=$(<"$SHIM/out")
   # Non-vacuity: the shim must actually be winning PATH, or this arm proves nothing.
   shimmed=$(PATH="$SHIM:$PATH" id -un 2>/dev/null)
-  if [[ "$shimmed" != "agent-lodar" ]]; then
+  if forgery_is_vacuous "$FORGE_PATH"; then
+    no "T2 VACUOUS — the shim name '$FORGE_PATH' equals the caller's real name; a shim that WON would still look unmoved"
+  elif [[ "$shimmed" != "$FORGE_PATH" ]]; then
     no "T2 VACUOUS — the PATH shim never took effect (\`id -un\` returned '$shimmed')"
   elif [[ "$got" == "$REAL_NAME" ]]; then
-    ok "T2 PATH shim printing agent-lodar did not move the identity (still $REAL_NAME)"
+    ok "T2 PATH shim printing $FORGE_PATH did not move the identity (still $REAL_NAME)"
   else
     no "T2 PATH shim moved the identity to '$got'"
   fi
@@ -109,13 +133,17 @@ if [[ -z "$REAL_NAME" ]]; then
 else
   # In-process, not `bash -c`: a fresh shell would not have the function loaded and
   # the arm would grade an empty string against an empty string.
-  ( export SUDO_USER=agent-olivia USER=claude LOGNAME=claude FIVEDIVE_AUDIT_USER=lodar
+  ( export SUDO_USER="$FORGE_SUDO" USER="$FORGE_USER" LOGNAME="$FORGE_LOGN" \
+           FIVEDIVE_AUDIT_USER="$FORGE_AUDIT"
     actor_derive; printf '%s' "$ACTOR_UNIX" ) > "$SHIM/out3"
   got=$(<"$SHIM/out3")
-  if [[ "$got" == "$REAL_NAME" ]]; then
-    ok "T3 SUDO_USER/USER/LOGNAME/FIVEDIVE_AUDIT_USER=<other> did not move the identity"
+  if forgery_is_vacuous "$FORGE_SUDO" "$FORGE_USER" "$FORGE_LOGN" "$FORGE_AUDIT"; then
+    no "T3 VACUOUS — a forged value equals the caller's real name '$REAL_NAME'; the arm would pass even if the forgery won"
+  elif [[ "$got" == "$REAL_NAME" ]]; then
+    ok "T3 SUDO_USER/USER/LOGNAME/FIVEDIVE_AUDIT_USER=<other> did not move the identity (forgeries distinct from '$REAL_NAME' by construction)"
   else
-    no "T3 env forgery moved the identity to '$got'"
+    # Each var carries a distinct forgery, so the value names the culprit.
+    no "T3 env forgery moved the identity to '$got' (SUDO_USER=$FORGE_SUDO USER=$FORGE_USER LOGNAME=$FORGE_LOGN FIVEDIVE_AUDIT_USER=$FORGE_AUDIT)"
   fi
 fi
 
