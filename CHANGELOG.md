@@ -20,6 +20,7 @@ verb wires it.
 `--json`. An actor it cannot measure is an **exit 6**, not the word `unknown`
 printed with `rc=0` — that refusal is the point of the verb, and it is
 mutation-graded rather than asserted.
+
 ## Unreleased — feat(task): merge-audit LABELS findings delivered-vs-cited, and never filters them (DIVE-1975)
 
 DIVE-1965 taught the merge *gate* to tell "I shipped this PR" from "I am writing about this PR",
