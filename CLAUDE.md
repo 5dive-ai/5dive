@@ -1,5 +1,40 @@
 # 5dive CLI — contributor rules
 
+## The test corpus is TIERED and BUDGETED IN WALL-CLOCK (DIVE-2525)
+
+`tests/*.sh` went 96 → 267 harnesses in 13 days against four harness deletions
+ever. A guard is bought once and paid for on **every future change, forever**,
+while its benefit stays fixed — so the ledger tilts by construction and no single
+decision to add one is ever wrong on its own merits. See
+`community/wiki/guards-compound-in-cost-and-nothing-ever-retires-one.md`.
+
+| tier | runs | budget |
+|---|---|---|
+| `core` (**the default**) | every PR, both CI environments | **300s** per job |
+| `nightly` | `full-sweep.yml` (03:17 UTC + dispatch) | **1320s** per job, whole corpus |
+
+- **A new harness is `core` unless you say otherwise.** Nothing to write.
+- **Over budget, CI FAILS** (`exit 4`, distinct from a test failure's `exit 1`) and
+  names the slowest files in the tier. Past the cap a new guard **replaces or
+  merges** an existing one — that is the reverse gear, and it is the point.
+- **Three ways out, in order:** merge by subject (hundreds of harness *files* for
+  one CLI means the unit of organisation is the incident, not the subject —
+  folding two files about one subject reclaims their setup cost and drops no
+  assertion); retire a guard whose class can no longer occur; or demote:
+
+  ```sh
+  # TIER: nightly — 14.3s measured: does not fit the 300s PR core; the nightly sweep runs it.
+  ```
+
+  In the harness header (first 40 lines). **The reason is mandatory** — a bare
+  `# TIER: nightly` is a refusal, not a default. Demotion moves the cost, it does
+  not delete it, which is why it is third and why it must be argued in the diff.
+- **Editing a harness always runs it**, whatever its tier: the `changed-harnesses`
+  job runs and verdict-probes every harness your diff touches. Tier membership is
+  a default, and a default loses to an explicit signal.
+- Locally: `bash scripts/run-harnesses.sh --tier=core` (or `--tier=full`). Both
+  budgets and the tier marker live in `tests/lib/tier.sh`, one place.
+
 ## Hard rule: no real PII in public artifacts (DIVE-1774)
 
 Never put real user ids, emails, phone numbers, or customer PII in anything that

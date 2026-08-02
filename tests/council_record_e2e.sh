@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# TIER: nightly — 9.9s measured (DIVE-2525): does not fit the 300s PR core; the nightly sweep runs it.
 # CNCL-17 bash e2e — the seat TRACK RECORD wiring (not just the pure scorer). Drives the real
 # `5dive council record` bundle end-to-end against an isolated STATE_DIR + TASKS_DB:
 #   - seeds two decided tasks (one DONE → good outcome, one CANCELLED → bad outcome) + one still-open,

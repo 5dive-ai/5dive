@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# TIER: nightly — 14.0s measured (DIVE-2525): does not fit the 300s PR core; the nightly sweep runs it.
 # DIVE-2119 isolated unit harness — retiring a gate must ARCHIVE it and then
 # reset ALL SIX provenance columns, at EVERY path that retires one.
 #

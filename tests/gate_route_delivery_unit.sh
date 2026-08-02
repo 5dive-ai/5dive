@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# TIER: nightly — 23.6s measured (DIVE-2525): does not fit the 300s PR core; the nightly sweep runs it.
 # DIVE-2011 isolated unit harness for LEAD-ROUTE DELIVERY TELEMETRY.
 #
 # What this pins, and why each assertion exists rather than being obvious:

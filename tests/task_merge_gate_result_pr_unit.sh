@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# TIER: nightly — 9.4s measured (DIVE-2525): does not fit the 300s PR core; the nightly sweep runs it.
 # DIVE-1935 isolated unit harness. DIVE-1922 reached status=done while its PR was
 # OPEN, unmerged AND red on its own new unit test — both declared bindings were
 # empty (no delivery_ref, no 'Branch:' line) and the DIVE-1835 repo-wide scan

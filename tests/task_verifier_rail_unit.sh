@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# TIER: nightly — 18.0s measured (DIVE-2525): does not fit the 300s PR core; the nightly sweep runs it.
 # DIVE-1880 unit harness — the verifier rail's VISIBILITY + its retro-attach verb.
 #
 # The defect: `task add --priority=low` silently declined the DIVE-969 verifier

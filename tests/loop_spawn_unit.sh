@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# TIER: nightly — 10.2s measured (DIVE-2525): does not fit the 300s PR core; the nightly sweep runs it.
 # DIVE-593 isolated unit harness for `5dive loop spawn` (the atom).
 #
 # Sources the src/ libs directly and points STATE_DIR at a throwaway temp dir,

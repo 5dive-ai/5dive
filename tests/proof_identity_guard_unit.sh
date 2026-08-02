@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# TIER: nightly — 8.1s measured (DIVE-2525): does not fit the 300s PR core; the nightly sweep runs it.
 # DIVE-2051 isolated unit harness for the `proof publish` IDENTITY guard: the
 # publisher authors PUBLIC commits, so it must never infer the author. Sources
 # cmd_proof.sh with stubbed deps against a temp state dir and a temp HOME (so

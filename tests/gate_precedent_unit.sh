@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# TIER: nightly — 15.1s measured (DIVE-2525): does not fit the 300s PR core; the nightly sweep runs it.
 # OSS-11 (DIVE-976) isolated unit harness for decision-memory precedent prefill.
 # Two halves:
 #   * _gate_ask_shape() normalizer — idents/dates/amounts/hosts/nums/quoted-names

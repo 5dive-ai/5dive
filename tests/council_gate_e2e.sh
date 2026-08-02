@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# TIER: nightly — 13.0s measured (DIVE-2525): does not fit the 300s PR core; the nightly sweep runs it.
 # CNCL-12 bash e2e — the gate-rot WIRING (not just the pure mapper). Drives the real
 # `5dive council {gate-clear,rot-triage}` bundle end-to-end against an isolated STATE_DIR +
 # TASKS_DB + a self-provisioned gate-proof key, and asserts the three load-bearing legs the

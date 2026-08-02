@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# TIER: nightly — 24.2s measured (DIVE-2525): does not fit the 300s PR core; the nightly sweep runs it.
 # DIVE-2089 isolated unit harness for the DECLARED-DISCUSSION floor appeal.
 #
 # THE DEFECT. The T2 category floor reads SUBJECT MATTER as risk and picks the

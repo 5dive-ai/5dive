@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# TIER: nightly — 17.7s measured (DIVE-2525): does not fit the 300s PR core; the nightly sweep runs it.
 # DIVE-2325 — a harness must not inherit the caller's product knobs.
 #
 # THE INCIDENT. task_core_unit (28/7) and task_verifier_rail_unit (17/6) were red on

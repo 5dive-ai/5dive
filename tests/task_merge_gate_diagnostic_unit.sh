@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# TIER: nightly — 5.8s measured (DIVE-2525): does not fit the 300s PR core; the nightly sweep runs it.
 # DIVE-2318 — the merge gate's REFUSALS must not assert things nobody measured.
 #
 # THE DEFECT THIS GRADES IS THE DIAGNOSTIC, NOT THE CHECK. The gate's acceptance

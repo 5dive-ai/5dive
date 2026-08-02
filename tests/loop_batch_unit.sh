@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# TIER: nightly — 16.5s measured (DIVE-2525): does not fit the 300s PR core; the nightly sweep runs it.
 # DIVE-596 isolated unit harness for `5dive loop map | until-dry | collect`.
 #
 # Same isolation contract as loop_spawn_unit.sh: source src/ libs directly, point

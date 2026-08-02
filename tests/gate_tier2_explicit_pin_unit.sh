@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# TIER: nightly — 13.1s measured (DIVE-2525): does not fit the 300s PR core; the nightly sweep runs it.
 # DIVE-1957 isolated unit harness: an EXPLICIT `--tier=2` (the caller's hard-human
 # contract) must survive every KIND-based downgrade/route carve-out.
 #

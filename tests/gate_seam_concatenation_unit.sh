@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# TIER: nightly — 14.3s measured (DIVE-2525): does not fit the 300s PR core; the nightly sweep runs it.
 # DIVE-2224 isolated unit harness: PART 1, a gate classifier must never read the ASK
 # and the TITLE as ONE string; PART 2 (lodar answered A, 2026-07-28), the floor's
 # SUBJECT is the ASK, with a fail-closed fallback to the title when the ask states

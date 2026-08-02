@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# TIER: nightly — 20.0s measured (DIVE-2525): does not fit the 300s PR core; the nightly sweep runs it.
 # DIVE-2196 isolated unit harness: a verifier who filed a human gate has ACTED.
 #
 # The bug (fired live on DIVE-2146): the heartbeat stall-sweep selects delivered

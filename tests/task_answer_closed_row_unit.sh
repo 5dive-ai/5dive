@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# TIER: nightly — 39.5s measured (DIVE-2525): does not fit the 300s PR core; the nightly sweep runs it.
 # DIVE-2228 — `task answer` on a CLOSED row. The last open cell of the
 # closed-task writer matrix (DIVE-2112 / DIVE-2113 / DIVE-2116 are the others).
 #

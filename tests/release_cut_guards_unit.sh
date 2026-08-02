@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# TIER: nightly — 42.8s measured (DIVE-2525): does not fit the 300s PR core; the nightly sweep runs it.
 # DIVE-2144 — grade the two guards in .github/workflows/release-cut.yml.
 #
 # SHAPE, and it is deliberate (same as tests/install_pin_sha_unit.sh): this extracts

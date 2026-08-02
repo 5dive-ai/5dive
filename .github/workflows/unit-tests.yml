@@ -1,8 +1,36 @@
 name: unit-tests
 
-# Run every isolated unit harness in tests/. Each harness sources src/ directly
-# into a throwaway STATE_DIR (no root, no network, never the live tasks.db) and
-# exits non-zero on any failed assertion.
+# Run the CORE tier of the harness corpus in tests/. Each harness sources src/
+# directly into a throwaway STATE_DIR (no root, no network, never the live
+# tasks.db) and exits non-zero on any failed assertion.
+#
+# DIVE-2525 — WHY THIS IS NO LONGER `for t in tests/*.sh`. Measured 2026-08-02:
+# the corpus went 96 -> 267 harnesses in 13 days (~+13/day) against FOUR harness
+# deletions ever, and at release-cut's own published 3.79s/harness that is ~17
+# minutes of pure harness time charged to every contributor on every push. A
+# guard's benefit is fixed; its cost is paid on every future change forever, so
+# the ledger tilts by construction. See
+# community/wiki/guards-compound-in-cost-and-nothing-ever-retires-one.md.
+#
+# So the corpus is TIERED and BUDGETED IN WALL-CLOCK, not in count ("do not add
+# too many tests" is unenforceable and reads as an argument against testing):
+#
+#   this workflow (every PR, every push to main)  CORE tier,   <= 300s per job
+#   full-sweep.yml (nightly + dispatch)           FULL corpus, <= 1320s per job
+#
+# The tier of a harness and both budgets live in ONE place, tests/lib/tier.sh.
+# Core is the DEFAULT: a new harness is charged to this workflow unless its own
+# header demotes it with a written reason. Over budget, the run FAILS and names
+# what to merge, retire or demote — a warning would be worthless here, since the
+# growth was already visible for two weeks in a number nobody read.
+#
+# WHAT THE PR PATH GIVES UP, said plainly rather than left to be discovered: the
+# harness-verdict PROBE and its UNION (DIVE-2013/2018) cost a second full pass
+# over the corpus and now run nightly. The case that actually arises on a PR —
+# a harness ADDED or EDITED here whose exit status is not wired to its own
+# assertions — is closed by the `changed-harnesses` job below, at the moment of
+# introduction. The union's invariant is a whole-corpus, cross-environment
+# property; it is graded nightly and at release-cut, and it blocks a release.
 on:
   pull_request:
   push:
@@ -21,17 +49,14 @@ jobs:
       # this workflow was written; a skip count is not a green count.
       - uses: actions/checkout@v4
         with: { fetch-depth: 0 }
-      - name: Run unit harnesses
-        run: |
-          rc=0
-          for t in tests/*.sh; do
-            echo "=== $t"
-            if ! bash "$t"; then
-              echo "FAILED: $t"
-              rc=1
-            fi
-          done
-          exit $rc
+      # DIVE-2525: the budget is NOT passed here. It lives in tests/lib/tier.sh next
+      # to the tier definition, because a budget spelled in the caller is raised by
+      # a one-line YAML edit that nobody reviews as the policy change it is.
+      - name: Run core harnesses (budgeted)
+        run: bash scripts/run-harnesses.sh --tier=core --label=pristine --report=core-pristine.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: { name: core-pristine, path: core-pristine.txt, if-no-files-found: warn }
 
   # DIVE-1919: the bare runner above is a PRISTINE box — no /var/lib/5dive, no
   # installed plugins. That is NOT the environment any agent actually runs the
@@ -42,39 +67,84 @@ jobs:
   # everyone to ignore red, and then a real failure reads as the usual noise.
   # This job seeds the host state that actually differs and reruns the same
   # suite, so that class reds in CI instead of only under an agent's nose.
-  # DIVE-2013: the suite above grades every harness on its EXIT STATUS, so a
-  # harness whose status is not wired to its own assertions is invisible to it —
-  # it prints FAIL and exits 0 and CI calls it green. That shipped for three
-  # consecutive releases (heartbeat_gate_shipped_unit.sh, 0.15.26-28). Static
-  # analysis cannot close it, so this job is EMPIRICAL: it injects a failure into
-  # each harness and demands the harness report it through $?.
+  # DIVE-2525: the one thing the moved-to-nightly probe was actually catching on a
+  # PR — a harness ADDED or EDITED in THIS diff whose exit status is not wired to its
+  # own assertions (DIVE-2013; that shipped for three consecutive releases). Scoped
+  # to the changed files, it costs a handful of harness runs instead of a second full
+  # pass over 267 of them.
   #
-  # `needs: test` is load-bearing, not just ordering — it is what establishes the
-  # clean-green baseline, which lets this job skip its own clean run (halving it)
-  # WITHOUT becoming unsound. Run standalone (no --assume-clean) the script does
-  # the clean run itself, so it is never unsound locally either.
-  harness-verdict:
+  # It also RUNS those harnesses whatever their tier, which closes the gap the tiering
+  # would otherwise open: you edit a nightly harness, the core suite does not include
+  # it, and nothing grades your edit until 03:17. Tier membership decides what runs by
+  # DEFAULT, never what runs when you touched it.
+  #
+  # NO --assume-clean here, deliberately: a changed harness may be a nightly one that
+  # the core jobs never ran, so there is no clean-green baseline in this workflow to
+  # assume. The probe does its own clean run for the few files named, which is what
+  # makes that flag unnecessary rather than merely omitted.
+  changed-harnesses:
     runs-on: ubuntu-latest
-    needs: test
+    steps:
+      # DIVE-2229: full history — pinned baselines must resolve here too, and the
+      # diff below needs the base commit to exist at all.
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - name: Which harnesses did this change touch?
+        id: changed
+        env:
+          BASE: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          # A base we cannot resolve is NOT "nothing changed" — that is the failure
+          # mode where a check reports clean on what it never looked at. Fall back to
+          # the whole corpus's changed set against origin/main, and if THAT cannot be
+          # resolved either, say so and fail.
+          base="$BASE"
+          if [[ -z "$base" || "$base" == 0000000000000000000000000000000000000000 ]] \
+             || ! git cat-file -e "$base^{commit}" 2>/dev/null; then
+            base="$(git rev-parse origin/main 2>/dev/null || true)"
+          fi
+          if [[ -z "$base" ]]; then
+            echo "changed-harnesses: BLOCKED — could not resolve a base commit to diff against; refusing to report 'no harnesses changed' on the strength of a diff that never ran." >&2
+            exit 1
+          fi
+          # tests/*.sh only, never tests/lib/ or tests/meta/ — the same corpus shape
+          # the shell glob in tier.sh selects. Deleted files are excluded (ACMR): a
+          # harness that is gone cannot be run, and a deletion is the one direction
+          # this whole row is trying to make easier.
+          mapfile -t files < <(git diff --name-only --diff-filter=ACMR "$base" HEAD -- 'tests/*.sh' ':(exclude)tests/lib/*' ':(exclude)tests/meta/*')
+          printf 'base=%s\n' "$base"
+          printf 'changed harnesses: %d\n' "${#files[@]}"
+          printf '  %s\n' "${files[@]:-（none）}"
+          { printf 'files=%s\n' "${files[*]:-}"
+            printf 'names=%s\n' "$(printf '%s\n' "${files[@]:-}" | xargs -r -n1 basename | paste -sd, -)"
+          } >> "$GITHUB_OUTPUT"
+      - name: Run them (any tier)
+        if: steps.changed.outputs.files != ''
+        run: |
+          rc=0
+          for t in ${{ steps.changed.outputs.files }}; do
+            echo "=== $t"
+            if ! bash "$t"; then echo "FAILED: $t"; rc=1; fi
+          done
+          exit $rc
+      - name: They must be able to FAIL
+        if: steps.changed.outputs.names != ''
+        run: |
+          bash tests/meta/harness-verdict-probe.sh \
+            --only='${{ steps.changed.outputs.names }}' --label=changed
+
+  # DIVE-2525: this job used to open with the harness-verdict PROBE (DIVE-2013),
+  # which runs the whole corpus a SECOND time — the single most expensive thing on
+  # the PR path. It moved to full-sweep.yml. What survives here is the DIVE-2039
+  # rail prover, which is ~10s and grades the shipped rails rather than the corpus.
+  # The PR-shaped case the probe existed to catch (a harness added or edited in
+  # THIS diff whose exit status is not wired) is caught by `changed-harnesses`.
+  rails-pristine:
+    runs-on: ubuntu-latest
     steps:
       # DIVE-2229: full history — pinned baselines must resolve here too.
       - uses: actions/checkout@v4
         with: { fetch-depth: 0 }
-      - name: Every harness must be able to FAIL
-        run: |
-          bash tests/meta/harness-verdict-probe.sh --assume-clean \
-            --label=pristine --report=probe-pristine.txt
-      # DIVE-2018: this run's `not-reached` set is not a failure and must not be —
-      # a harness that skips before its verdict has not been shown to be unwired,
-      # and three correctly-wired files were falsely accused that way. Which is
-      # exactly why THIS job cannot establish coverage: it can only report what it
-      # saw. The report goes to the union job, which asserts the invariant that
-      # does hold across environments. `if: always()` because a run that found
-      # UNWIRED still made a valid coverage observation, and losing it would let a
-      # red probe silently shrink the union.
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with: { name: probe-pristine, path: probe-pristine.txt, if-no-files-found: error }
       # DIVE-2039: the rail prover, from the pristine side. `snapshot-rails` is
       # allowlisted because GitHub CI has no ops checkout — that exemption can
       # never be earned here by adding another job, which is the difference
@@ -120,32 +190,15 @@ jobs:
           sudo useradd -M -N -s /usr/sbin/nologin claude 2>/dev/null || true
           sudo useradd -M -N -s /usr/sbin/nologin agent-dev 2>/dev/null || true
           getent passwd claude agent-dev
-      - name: Run unit harnesses (installed host)
-        run: |
-          rc=0
-          for t in tests/*.sh; do
-            echo "=== $t"
-            if ! bash "$t"; then
-              echo "FAILED: $t"
-              rc=1
-            fi
-          done
-          exit $rc
-      # DIVE-2018: the probe used to run ONLY on the pristine runner, so the
-      # harnesses CI never probed were precisely the ones that skip without live
-      # state — the gate and install paths, i.e. the most environment-sensitive
-      # code we have. Probing here too is what makes the union non-trivial: this
-      # environment reaches harnesses the pristine one cannot. `--assume-clean` is
-      # sound for the same reason it is in the pristine job — the step above just
-      # established the clean-green baseline IN THIS ENVIRONMENT, and if it went
-      # red this step does not run and the union job never reports coverage.
-      - name: Every harness must be able to FAIL (installed host)
-        run: |
-          bash tests/meta/harness-verdict-probe.sh --assume-clean \
-            --label=installed-host --report=probe-installed.txt
+      # DIVE-2525: core tier, held to the SAME 300s budget as the pristine job. This
+      # environment is slower per harness (real sudo, seeded host state), and that is
+      # a cost of the corpus too — hiding it under a laxer cap here would just move
+      # the growth to the job that is already the longest on the PR path.
+      - name: Run core harnesses (installed host, budgeted)
+        run: bash scripts/run-harnesses.sh --tier=core --label=installed-host --report=core-installed.txt
       - uses: actions/upload-artifact@v4
         if: always()
-        with: { name: probe-installed, path: probe-installed.txt, if-no-files-found: error }
+        with: { name: core-installed, path: core-installed.txt, if-no-files-found: warn }
       # DIVE-2039: TWICE, and that is the point. DIVE-1989 stayed invisible for as
       # long as the audit log was measured from one side — the same command wrote 0
       # rows as an agent and 1 row under sudo. `audit-root` is honestly NOT-REACHED
@@ -168,80 +221,6 @@ jobs:
         if: always()
         with: { name: selfcheck-installed, path: "selfcheck-*.txt", if-no-files-found: error }
 
-  # DIVE-2018: NOT-REACHED is correctly not a failure in any single run, so no
-  # single run can establish that a harness has EVER been probed. On the control
-  # plane the probe read 135 wired / 16 not-reached; on the pristine runner 151
-  # wired / 0 not-reached. Both green, both 154 with the allowlist, probing
-  # DIFFERENT CORPORA, and nothing said so. The limit case is a harness that skips
-  # in every environment: reported "probed in an environment where it runs", and no
-  # environment ever does.
-  #
-  # This job owns the invariant that survives that: every harness in tests/*.sh is
-  # DIVE-2412: A HARNESS CAN BE UNPROBED FOR TIME RATHER THAN FOR SHAPE, and the
-  # two want different answers. The probe's per-harness `timeout` is 180s, which is
-  # what stops one hung harness from stalling a 255-file sweep. A mutation grader
-  # re-runs its whole unit suite once per mutant, so this one costs ~14 x 23s and is
-  # killed by that timeout in EVERY environment — canary never printed, so
-  # `not-reached` everywhere, which is precisely the permanently-unprobed limit case
-  # the union job exists to catch. It caught it.
-  #
-  # The allowlist is the WRONG instrument here and using it would have been a false
-  # reason on the record: ALLOW_UNPROBEABLE means "no identifiable verdict variable",
-  # and this harness has one — measured `wired` at PROBE_TIMEOUT=900. It is probeable
-  # and slow, not unprobeable. So it gets a lane that pays the time instead of an
-  # exemption that excuses the coverage, and the union still asserts the same
-  # invariant over the same corpus.
-  #
-  # Scoped with --only on purpose: raising PROBE_TIMEOUT for the whole sweep would
-  # also raise how long a genuinely hung harness can stall CI, which is the property
-  # the 180s default is buying. Named harnesses pay 900s; nothing else changes.
-  harness-verdict-slow:
-    runs-on: ubuntu-latest
-    needs: test
-    env:
-      # One name per slow harness, comma-separated — the probe's own --only format.
-      # Keep this list SHORT and justified; a harness landing here is saying its
-      # verdict costs minutes, not that it may go ungraded.
-      SLOW_HARNESSES: gate_channel_session_t2_mutation.sh
-    steps:
-      # DIVE-2229: full history — pinned baselines must resolve here too.
-      - uses: actions/checkout@v4
-        with: { fetch-depth: 0 }
-      - name: Slow harnesses must be able to FAIL too (long lane)
-        env: { PROBE_TIMEOUT: '900' }
-        run: |
-          bash tests/meta/harness-verdict-probe.sh --assume-clean \
-            --only="$SLOW_HARNESSES" --label=slow --report=probe-slow.txt
-      # `if: always()` for the same reason as the pristine lane: a run that found
-      # UNWIRED still made a valid coverage observation, and losing the report would
-      # let a red probe silently shrink the union instead of reddening it.
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with: { name: probe-slow, path: probe-slow.txt, if-no-files-found: error }
-
-  # probed in AT LEAST ONE environment, or is allowlisted by name with a reason.
-  # A skip in one environment is still not an accusation; a skip in all of them is
-  # now a failure.
-  harness-verdict-union:
-    runs-on: ubuntu-latest
-    needs: [harness-verdict, test-installed-host, harness-verdict-slow]
-    steps:
-      # DIVE-2229: full history — pinned baselines must resolve here too.
-      - uses: actions/checkout@v4
-        with: { fetch-depth: 0 }
-      - uses: actions/download-artifact@v4
-        with: { pattern: probe-*, merge-multiple: true }
-      # The union script fails closed on a missing, headerless, or different-corpus
-      # report, so a job that died before writing one cannot silently shrink what
-      # we claim to cover — the check would otherwise have the same shape of hole
-      # it exists to close.
-      - name: Every harness must be probed in SOME environment
-        # probe-slow.txt is named EXPLICITLY, not globbed: union fails closed on a
-        # missing or unreadable report, so a slow lane that died has to red this job
-        # rather than quietly drop back to the two-environment corpus it used to
-        # cover — the same shrink-in-silence hole this check exists to close.
-        run: bash tests/meta/harness-verdict-union.sh probe-pristine.txt probe-installed.txt probe-slow.txt
-
   # DIVE-2039: the same invariant one level out, over the RAILS rather than the
   # harnesses. `5dive selfcheck` reports pass | fail | NOT-REACHED and NOT-REACHED
   # is deliberately not a failure in any single run — a probe whose precondition is
@@ -252,7 +231,7 @@ jobs:
   # exactly, which is why it is closed here on day one instead of after it bites.
   selfcheck-union:
     runs-on: ubuntu-latest
-    needs: [harness-verdict, test-installed-host]
+    needs: [rails-pristine, test-installed-host]
     steps:
       # DIVE-2229: full history — pinned baselines must resolve here too.
       - uses: actions/checkout@v4

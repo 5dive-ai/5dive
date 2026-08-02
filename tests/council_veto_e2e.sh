@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# TIER: nightly — 10.0s measured (DIVE-2525): does not fit the 300s PR core; the nightly sweep runs it.
 # CNCL-9 bash e2e — the authenticated founder veto WIRING (not just the node engine). Drives the
 # real `5dive council {init,convene,veto exercise,lineage verify}` bundle against an isolated
 # STATE_DIR + a self-provisioned gate-proof key, and asserts the four legs main's hard gate

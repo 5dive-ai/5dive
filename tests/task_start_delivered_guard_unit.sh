@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# TIER: nightly — 14.4s measured (DIVE-2525): does not fit the 300s PR core; the nightly sweep runs it.
 # DIVE-2510 unit harness — `task start` over a LIVE DELIVERED maker→verifier loop.
 #
 # THE DEFECT: `task start` was the last status writer with no delivered-loop

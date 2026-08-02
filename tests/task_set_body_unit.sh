@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# TIER: nightly — 9.8s measured (DIVE-2525): does not fit the 300s PR core; the nightly sweep runs it.
 # DIVE-1920 unit harness for `task set-body`. Same isolation contract as
 # task_set_branch_unit.sh: source src/ directly, point STATE_DIR at a
 # throwaway temp dir so the live shared tasks.db is NEVER touched.

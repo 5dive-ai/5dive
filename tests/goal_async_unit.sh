@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# TIER: nightly — 14.9s measured (DIVE-2525): does not fit the 300s PR core; the nightly sweep runs it.
 # DIVE-1349 isolated unit harness for ASYNC `5dive goal add` + `goal status`.
 #
 # Sources src/ directly against a throwaway STATE_DIR (never touches the live

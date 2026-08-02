@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# TIER: nightly — 6.2s measured (DIVE-2525): does not fit the 300s PR core; the nightly sweep runs it.
 # DIVE-2062 isolated unit harness for `5dive task need --tier=0` (DIVE-891
 # auto-clear: the recommendation applies immediately, provenance 'auto:t0', no
 # human ping — cmd_task_need, cmd_task.sh). Per the DIVE-2054 verifier pass

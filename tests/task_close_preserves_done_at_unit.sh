@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# TIER: nightly — 52.4s measured (DIVE-2525): does not fit the 300s PR core; the nightly sweep runs it.
 # DIVE-2477 — a re-close must not REFRESH done_at.
 #
 # Every close writer passed ", done_at=datetime('now')" unconditionally, so any

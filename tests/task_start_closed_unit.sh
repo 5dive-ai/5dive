@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# TIER: nightly — 5.5s measured (DIVE-2525): does not fit the 300s PR core; the nightly sweep runs it.
 # DIVE-2113 — `task start` must REFUSE a closed task, and must not refuse anything else.
 #
 # The defect: `task start` on a done/cancelled row silently reopened it to

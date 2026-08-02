@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# TIER: nightly — 9.0s measured (DIVE-2525): does not fit the 300s PR core; the nightly sweep runs it.
 # DIVE-2101 isolated unit harness — ANCESTRY satisfies the DIVE-1830 merge-gate.
 #
 # The gate demanded a MERGED PR for a `Branch:` binding. The delegated-push path

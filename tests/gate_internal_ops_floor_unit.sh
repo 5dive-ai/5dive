@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# TIER: nightly — 9.9s measured (DIVE-2525): does not fit the 300s PR core; the nightly sweep runs it.
 # DIVE-1480 isolated unit harness for the INTERNAL-OPS / recovery floor carve-out.
 #
 # The T2 destructive floor (delete|destroy|wipe|purge|…) is deliberately biased to

@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# TIER: nightly — 37.4s measured (DIVE-2525): does not fit the 300s PR core; the nightly sweep runs it.
 # DIVE-2007 isolated unit harness for the delivered-loop `task done` guard.
 #
 # The bug: on a maker→verifier loop the FIRST `task done` delivers (assignee flips

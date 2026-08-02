@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# TIER: nightly — 46.2s measured (DIVE-2525): does not fit the 300s PR core; the nightly sweep runs it.
 # DIVE-2211 / DIVE-2286: name the tree this harness grades. Sourced BEFORE any cd so
 # ${BASH_SOURCE[0]} still resolves relative to tests/. Three-state on purpose: if the
 # helper is unreachable the log says NO TREE WAS NAMED rather than falling silent.

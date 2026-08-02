@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# TIER: nightly — 27.5s measured (DIVE-2525): does not fit the 300s PR core; the nightly sweep runs it.
 # DIVE-1145 isolated unit harness for ship-gating gate ROUTING in cmd_task_need.
 # Policy: a builder's (non-lead) DECISION gate routes to the org lead first
 # (status stays blocked, need_answered_at NULL, human ping SUPPRESSED) instead of

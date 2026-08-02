@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# TIER: nightly — 10.9s measured (DIVE-2525): does not fit the 300s PR core; the nightly sweep runs it.
 # DIVE-2015 isolated unit harness: a maker may rescue a stalled delivered loop
 # with `task verify --cmd`, but the permitted self-close must be visible in the
 # task record, the audit log, and stderr. No policy refusal is expected.

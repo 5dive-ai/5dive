@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# TIER: nightly — 8.2s measured (DIVE-2525): does not fit the 300s PR core; the nightly sweep runs it.
 # DIVE-1743 e2e — `5dive constitution set` / `edit` WRITE path on the BUILT binary. Proves the two
 # routes off ONE shared parser:
 #   SOLO  (no genesis, or a single-principal genesis) -> DIRECT-seal via a single-principal `council

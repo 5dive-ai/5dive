@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# TIER: nightly — 10.0s measured (DIVE-2525): does not fit the 300s PR core; the nightly sweep runs it.
 # DIVE-1965 isolated unit harness — a PR the task DELIVERED vs a PR it REPORTS ON.
 #
 # The merge-gate's subject was "a PR mentioned in the result/body". That predicate
