@@ -2876,8 +2876,21 @@ _task_start_preflight() {
 }
 
 cmd_task_start()  { _task_status_cmd in_progress ", started_at=COALESCE(started_at, datetime('now'))" start "$@"; }
-cmd_task_done()   { _task_status_cmd done ", done_at=datetime('now')" done "$@"; }
-cmd_task_cancel() { _task_status_cmd cancelled ", done_at=datetime('now')" cancel "$@"; }
+# DIVE-2477: COALESCE, not a bare stamp — FIRST close wins. These wrote
+# done_at=datetime('now') unconditionally, so any second close silently moved the
+# original close timestamp forward: measured on a fixture, a row closed at T then
+# a BARE `task done` (no --result, the one shape DIVE-2464's result guard
+# correctly stays silent on) had done_at rewritten to 'now'. That matters because
+# DIVE-2464's own refusal quotes done_at as the evidence of who closed when
+# ("is ALREADY done (closed <done_at>; ...)") — a bare re-close in between made
+# the refusal cite a time that was not the close it was protecting.
+# `task start` next to them has always COALESCEd started_at; this is that rule
+# applied to the close clock. Correct only because the one verb that REOPENS a
+# closed row (`task reject`) now clears done_at — otherwise this would preserve a
+# stale value as the real close time. tests/task_close_preserves_done_at_unit.sh
+# grades both directions.
+cmd_task_done()   { _task_status_cmd done ", done_at=COALESCE(done_at, datetime('now'))" done "$@"; }
+cmd_task_cancel() { _task_status_cmd cancelled ", done_at=COALESCE(done_at, datetime('now'))" cancel "$@"; }
 
 # DIVE-1830: `task deliver` — the maker records the PR that delivers this task,
 # then hands off to the verifier for review. This is the OPT-IN half of the
@@ -3218,6 +3231,16 @@ cmd_task_reject() {
     _task_gate_retire_buttons "$ident" "superseded by auto:reject" || true
   fi
   # max_iterations reached -> stop bouncing, park it on a human to decide.
+  # DIVE-2477 considered clearing done_at here too, by symmetry with the
+  # bounce-back below, and MEASURED that it would be wrong: this branch does not
+  # reopen the row, it files a gate — and on a row that was CLOSED, `task need`
+  # refuses (rc=5, "is done — reopen it before gating on a human"), so the status
+  # stays 'done'. Clearing done_at would leave a done row with no close clock: a
+  # NEW contradiction, not a fix. That refusal also means a reject at
+  # max_iterations over a closed row cannot escalate at all (it writes the
+  # feedback, then fails) — a separate pre-existing defect, deliberately not
+  # ridden along here; graded as a documented control in
+  # tests/task_close_preserves_done_at_unit.sh (arm G).
   if (( maxi > 0 && iter >= maxi )); then
     db "UPDATE tasks SET result=$(sqlq "$fb_txt") WHERE id=${id};"
     warn "$ident hit max_iterations ($maxi) — escalating to human review"
@@ -3226,8 +3249,15 @@ cmd_task_reject() {
     return
   fi
   # Otherwise bounce back to the maker for another pass.
+  # DIVE-2477: clear done_at. `task reject` is the one verb that REOPENS a closed
+  # row (DIVE-2112 allows it for the recorded verifier withdrawing their own
+  # grade, and refuses everyone else), and it left the close timestamp in place —
+  # status='todo' on a row carrying a done_at, the same self-contradiction
+  # DIVE-2113 refuses `task start` for. Latent before; load-bearing now that the
+  # close verbs COALESCE, because a stale done_at would be PRESERVED as the real
+  # close time on the next pass instead of stamped fresh.
   db "UPDATE tasks SET status='todo', assignee=$(sqlq "$maker"), started_at=NULL, handoff_ack_at=NULL,
-        result=$(sqlq "$fb_txt") WHERE id=${id};"
+        done_at=NULL, result=$(sqlq "$fb_txt") WHERE id=${id};"
   ok "$ident rejected — bounced back to maker '$maker' (iteration $iter${maxi:+/$maxi})" \
      '{id:($i|tonumber), ident:$id, status:"todo", bouncedTo:$m, role:"maker", iteration:($n|tonumber)}' \
      --arg i "$id" --arg id "$ident" --arg m "$maker" --arg n "$iter"
@@ -3792,7 +3822,12 @@ cmd_task_verify() {
       _v_prev=$(db "SELECT COALESCE(result,'') FROM tasks WHERE id=${id};")
       [[ -n "$_v_prev" ]] && result_txt="${result_txt}"$'\n'"--- superseded result (DIVE-2067, preserved) ---"$'\n'"${_v_prev}"
     fi
-    db "UPDATE tasks SET status='done', done_at=datetime('now'), result=$(sqlq "$result_txt") WHERE id=${id};"
+    # DIVE-2477: the THIRD close writer. DIVE-2067 taught this lesson one column
+    # over — when you guard one verb, ask which OTHERS write the field. A
+    # verifier re-verifying their own already-done row (the case DIVE-2067's
+    # refusal deliberately allows) refreshed done_at here, same as the close
+    # verbs did. COALESCE for the same reason and by the same rule: first close wins.
+    db "UPDATE tasks SET status='done', done_at=COALESCE(done_at, datetime('now')), result=$(sqlq "$result_txt") WHERE id=${id};"
     flipped=1
     if (( self_verified_close )); then
       _task_store_audit_log "task.verify-self-close" "self-verified-close" 0 -- \
