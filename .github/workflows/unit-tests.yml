@@ -200,6 +200,11 @@ jobs:
           command -v node jq sqlite3 || true
           sudo -n true && echo "passwordless sudo: yes" || echo "passwordless sudo: NO"
           bash tests/council_record_e2e.sh; echo "rc=$?"
+          echo "--- what does task init actually say?"
+          T=$(mktemp -d)
+          sudo -n env PATH="$PATH" STATE_DIR="$T" TASKS_DB="$T/tasks.db" \
+            FIVEDIVE_PROD_TASKS_DB="$T/tasks.db" ./5dive task init; echo "init rc=$?"
+          ls -la /var/lib/5dive 2>&1 | head -5
       # DIVE-2039: the rail prover, from the pristine side. `snapshot-rails` is
       # allowlisted because GitHub CI has no ops checkout — that exemption can
       # never be earned here by adding another job, which is the difference
