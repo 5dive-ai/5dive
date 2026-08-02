@@ -111,6 +111,42 @@ _gate_authenticated_actor() {
 # after the fact and not only at answer time.
 _gate_agent_for_uid() { _gate_uid_to_agent "${1:-}"; }
 
+# DIVE-2383: the caller's real username, for the audit log's `caller=` field. Was a
+# bare `id -un` at four sites in cmd_task.sh, which resolves through the CALLER'S
+# PATH — so the one field a forensic reader uses to attribute an action was writable
+# by the party being attributed. None of these feeds a predicate (grepped every use),
+# which is why DIVE-2330 correctly left them alone; but the audit log is our
+# NON-REFUSAL sink, and a forgeable `caller=` poisons the only record of the things
+# that did not refuse.
+#
+# Composed over `actor_uid_to_name`, NOT over `_gate_uid_to_agent`: the latter fails
+# closed to EMPTY for a non-agent uid, which is right for an authorization check and
+# wrong here — `claude` and `root` are real callers and the forensic record has to
+# name them. DIVE-2517 moved that passwd walk here and its own comment gives the
+# reason to reuse it rather than add a second one: "one passwd walk in the tree
+# rather than two that can drift."
+# Falls back to `?` — the same unknown marker the old `|| echo '?'` emitted — so a
+# uid missing from passwd still writes a row rather than an empty field.
+_gate_caller_user() {
+  local u; u=$(actor_uid_to_name "$(_gate_caller_uid)")
+  [[ -n "$u" ]] && { printf '%s' "$u"; return; }
+  printf '?'
+}
+
+# DIVE-2383: the uid stamped into — and SIGNED over — the DIVE-756 closure payload.
+# Was `${SUDO_UID:-$(id -u 2>/dev/null || echo "")}`: it trusted SUDO_UID
+# unconditionally and fell back to a PATH-resolved `id -u`. Both are caller-writable
+# below EUID 0, so a forged subject landed inside a tamper-EVIDENT record and the
+# signature then attested the lie. That is strictly worse than an unsigned wrong
+# value, because `gate-proof verify` reports the forgery as INTACT.
+# SUDO_UID is honoured ONLY at EUID 0 — the same fence `_gate_authenticated_actor`
+# above already documents: sudo writes it, and a non-root process that forges it
+# cannot also become root. Below root the answer is $EUID, which the kernel owns.
+_gate_closure_subject_uid() {
+  if _gate_is_root && [[ -n "${SUDO_UID:-}" ]]; then printf '%s' "$SUDO_UID"; return; fi
+  _gate_caller_uid
+}
+
 # ---------------------------------------------------------------------------
 # actor_derive — the same uid-first derivation, but it REPORTS its work.
 #
