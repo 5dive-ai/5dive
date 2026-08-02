@@ -1081,6 +1081,30 @@ _hb_claim_task() {
   # as a claim.
   n=$(db "SELECT COUNT(*) FROM tasks WHERE id=${id} AND status='in_progress' AND started_at IS NOT NULL;" 2>/dev/null) || return 1
   [[ "$n" == "1" ]] || return 1
+  # DIVE-2541: THE CLAIM IS A START, SO IT GOES ON THE LEDGER.
+  #
+  # DIVE-2244 moved the authoritative start from `task start` to this function, and
+  # the ledger emit stayed behind on the verb. Measured 2026-08-02 over the ledger's
+  # whole life: the dispatcher claimed 94 distinct tasks and 85 of them carry NO
+  # task.started event, while the verb fired 13 times. The instrumentation was still
+  # attached to the path that had stopped being the main one, and it fired often
+  # enough to look alive — which is why nobody caught it for four days.
+  #
+  # authority=dispatcher, NOT self. The agent has not acted at this point; the
+  # dispatcher moved the row on its behalf. Writing `self` here would be a false
+  # claim of exactly the kind v0.18 exists to delete — actor keeps its meaning
+  # (whose queue this is) and authority says who actually moved it, so a reader can
+  # tell a dispatcher claim from an agent that ran the verb.
+  #
+  # The DEFAULT idem_key (kind|ident|task_id|hash(detail)) is deliberate: it is
+  # constant per task, so a task reclaimed to todo and re-claimed records its FIRST
+  # claim only. The chain reader asks "was this started, and under whose authority",
+  # not "how many times" — and a UNIQUE collision is a silent no-op, so this can
+  # never inflate the ledger. Losing re-claim COUNT is the safe direction; a
+  # per-claim key would let a nudge loop write unbounded rows.
+  ledger_emit "task.started" ident="$(_hb_ident "$id")" task_id="$id" \
+    actor="$name" authority="dispatcher" \
+    detail="heartbeat claim (DIVE-2244)" || true
   return 0
 }
 
