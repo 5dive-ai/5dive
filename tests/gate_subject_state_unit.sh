@@ -88,6 +88,22 @@ gh() {
   printf '%s|%s|%s\n' "$st" "$merged" "$roll"
 }
 timeout() { shift; "$@"; }   # strip the timeout wrapper, run the stub
+# CREDENTIAL STUB (DIVE-2530). The gh COMMAND above is stubbed; the CREDENTIAL was
+# not, and that is a different thing. `_gate_subject_verdict` takes the token as a
+# PARAMETER, so the V arms below are deterministic — they pass `tok` or `''` by hand.
+# The H arms do not: they go through `_hb_gate_shipped_sweep`, which resolves the
+# token itself via `_gate_gh_token`. That made them read whatever credential the
+# HOST happened to have.
+# MEASURED 2026-07-31 (CI job 91163957248): identical commit, identical command,
+# 34/0 on the control-plane host and 30/4 on the pristine runner, every failure
+# carrying `subject=no-gh-token`. cmd_task.sh short-circuits on an empty token
+# BEFORE gh is called, so the stub above was never reached and the H2 family could
+# not arrive at the state it asserts. A harness that reads an ambient credential is
+# measuring the environment, not the subject (DIVE-1919).
+# Non-empty on purpose, and the same literal the V arms pass, so both halves of the
+# file agree about what "has a token" means. The no-token path keeps its own
+# coverage at V5, where the empty value is passed EXPLICITLY rather than inherited.
+_gate_gh_token() { printf 'tok'; }
 command() { builtin command "$@"; }
 export -f 2>/dev/null || true
 
