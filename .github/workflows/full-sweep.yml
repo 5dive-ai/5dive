@@ -114,6 +114,16 @@ jobs:
             echo '// stub for the installed-host CI matrix' \
               | sudo tee "/usr/local/lib/5dive/$p/server.ts" >/dev/null
           done
+          # DIVE-2525: the GROUP, not just the users. `task init` chowns the store to
+          # root:claude, and `useradd -N` deliberately does NOT create a like-named
+          # group — so on a runner seeded with users alone the chown dies with
+          # "chown: invalid group: 'root:claude'", `task init` fails, and
+          # council_record_e2e.sh takes its own `|| exit 0` and skips. That skip is
+          # what the nightly union reported as NEVER PROBED in EITHER environment.
+          # It had been getting the group by accident from a corpus run earlier in
+          # the same job; splitting the probe into its own job removed the accident
+          # and the union said so immediately, which is the rail working.
+          sudo groupadd -f claude
           sudo useradd -M -N -s /usr/sbin/nologin claude 2>/dev/null || true
           sudo useradd -M -N -s /usr/sbin/nologin agent-dev 2>/dev/null || true
           getent passwd claude agent-dev
@@ -210,6 +220,16 @@ jobs:
             echo '// stub for the installed-host CI matrix' \
               | sudo tee "/usr/local/lib/5dive/$p/server.ts" >/dev/null
           done
+          # DIVE-2525: the GROUP, not just the users. `task init` chowns the store to
+          # root:claude, and `useradd -N` deliberately does NOT create a like-named
+          # group — so on a runner seeded with users alone the chown dies with
+          # "chown: invalid group: 'root:claude'", `task init` fails, and
+          # council_record_e2e.sh takes its own `|| exit 0` and skips. That skip is
+          # what the nightly union reported as NEVER PROBED in EITHER environment.
+          # It had been getting the group by accident from a corpus run earlier in
+          # the same job; splitting the probe into its own job removed the accident
+          # and the union said so immediately, which is the rail working.
+          sudo groupadd -f claude
           sudo useradd -M -N -s /usr/sbin/nologin claude 2>/dev/null || true
           sudo useradd -M -N -s /usr/sbin/nologin agent-dev 2>/dev/null || true
           getent passwd claude agent-dev

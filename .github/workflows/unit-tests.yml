@@ -190,21 +190,6 @@ jobs:
       # DIVE-2229: full history — pinned baselines must resolve here too.
       - uses: actions/checkout@v4
         with: { fetch-depth: 0 }
-      # TEMPORARY DIAGNOSTIC (DIVE-2525) — remove before merge. The nightly union
-      # reports council_record_e2e.sh NOT PROBED in either environment; it probes
-      # `wired` on the control plane, so the differing condition is in CI and I am
-      # measuring it rather than guessing at it.
-      - name: DIAGNOSTIC council_record_e2e
-        run: |
-          ./build.sh
-          command -v node jq sqlite3 || true
-          sudo -n true && echo "passwordless sudo: yes" || echo "passwordless sudo: NO"
-          bash tests/council_record_e2e.sh; echo "rc=$?"
-          echo "--- what does task init actually say?"
-          T=$(mktemp -d)
-          sudo -n env PATH="$PATH" STATE_DIR="$T" TASKS_DB="$T/tasks.db" \
-            FIVEDIVE_PROD_TASKS_DB="$T/tasks.db" ./5dive task init; echo "init rc=$?"
-          ls -la /var/lib/5dive 2>&1 | head -5
       # DIVE-2039: the rail prover, from the pristine side. `snapshot-rails` is
       # allowlisted because GitHub CI has no ops checkout — that exemption can
       # never be earned here by adding another job, which is the difference
@@ -247,6 +232,16 @@ jobs:
           # the probe could not reach in ANY environment — and they are the gate
           # identity and SUDO_UID forge tests, i.e. exactly the coverage whose absence
           # matters most. Two throwaway system users, no shell, no home.
+          # DIVE-2525: the GROUP, not just the users. `task init` chowns the store to
+          # root:claude, and `useradd -N` deliberately does NOT create a like-named
+          # group — so on a runner seeded with users alone the chown dies with
+          # "chown: invalid group: 'root:claude'", `task init` fails, and
+          # council_record_e2e.sh takes its own `|| exit 0` and skips. That skip is
+          # what the nightly union reported as NEVER PROBED in EITHER environment.
+          # It had been getting the group by accident from a corpus run earlier in
+          # the same job; splitting the probe into its own job removed the accident
+          # and the union said so immediately, which is the rail working.
+          sudo groupadd -f claude
           sudo useradd -M -N -s /usr/sbin/nologin claude 2>/dev/null || true
           sudo useradd -M -N -s /usr/sbin/nologin agent-dev 2>/dev/null || true
           getent passwd claude agent-dev
