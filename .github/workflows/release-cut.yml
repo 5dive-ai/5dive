@@ -272,6 +272,7 @@ jobs:
             # If our own row is absent we drop nothing extra and behave exactly as
             # before this change (run-id filter only). In real execution the check-run
             # exists before the step runs, so the fallback bought nothing.
+            _self_name=""
             if [[ -n "${GITHUB_RUN_ID:-}" ]]; then
               _self_name=$(awk -F'\t' -v self="/actions/runs/${GITHUB_RUN_ID}/" 'index($4, self) { print $1; exit }' <<<"$runs")
               runs=$(awk -F'\t' -v self="/actions/runs/${GITHUB_RUN_ID}/" 'index($4, self) == 0' <<<"$runs")
@@ -288,7 +289,29 @@ jobs:
 
             # RED FIRST, and it exits before any deadline arithmetic — a red verdict is
             # final, so waiting on it could only delay a refusal that is already correct.
-            if [[ -n "$bad" ]]; then
+            # DIVE-2466: A RED WE CANNOT ATTRIBUTE IS NOT A RED WE CAN ACT ON.
+            # The sibling drop above is conditional on learning our own job's NAME off
+            # our own check-run row. If that row is not in the board yet, `_self_name`
+            # is empty, sibling release-cut rows are NOT dropped — and the RED branch
+            # below used to exit on look 1, before any re-fetch could have found it.
+            # MEASURED 2026-08-02 against the pristine block, self row absent on look 1
+            # and present on look 2 with a poisoned sibling `cut` throughout: RED at
+            # look 1, rc=1, one look. That is the self-latching poison this ticket
+            # exists to kill, surviving in the one window nobody had exercised — the
+            # existing poll arms all run with GITHUB_RUN_ID UNSET, so the filter never
+            # engaged in them. The comment above ("in real execution the check-run
+            # exists before the step runs") may well hold; it was never measured, and
+            # it is load-bearing, so the code no longer relies on it.
+            # DELIBERATELY COARSE: with `_self_name` unknown we cannot tell a sibling
+            # row from a third-party one, so we defer EVERY red until our own row has
+            # been seen once. That delays a genuine third-party refusal by one poll
+            # interval and never suppresses it — the deadline still refuses, fail-closed,
+            # with the same message. Trading one interval of latency for the removal of
+            # a permanent latch is the right side of that exchange.
+            if [[ -n "$bad" && -n "${GITHUB_RUN_ID:-}" && -z "$_self_name" ]]; then
+              echo "CI shows red on ${sha:0:12}, but our OWN check-run row is not visible yet, so sibling release-cut rows could not be dropped — NOT acting on an unattributable red; re-looking (DIVE-2466) [look ${_look}]"
+              printf '%s\n' "$bad" | sed 's/^/  deferred: /'
+            elif [[ -n "$bad" ]]; then
               echo "::error::CI is RED on ${sha:0:12} — refusing to cut ${tag}. Failing:"
               printf '%s\n' "$bad" | sed 's/^/  /'
               exit 1
