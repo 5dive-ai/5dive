@@ -49,6 +49,19 @@ jobs:
       # this workflow was written; a skip count is not a green count.
       - uses: actions/checkout@v4
         with: { fetch-depth: 0 }
+      # DIVE-2525: BUILD THE BUNDLE FIRST, EXPLICITLY. Three harnesses
+      # (install_checksum, ledger, policy_refusals) need ./5dive and ./5dive.sha256
+      # to exist and say so in their own failure text — and nothing ever built them
+      # for this job. They passed anyway because SOME EARLIER HARNESS in the 267-file
+      # glob runs ./build.sh as a side effect, leaving the artifact in the working
+      # tree for everything after it. That made the corpus ORDER-DEPENDENT through a
+      # shared file, and running a SUBSET is what exposed it: the same code, the same
+      # runner, three reds, because the harness that used to build the bundle is not
+      # in this tier. An implicit precondition that a full sweep happens to satisfy is
+      # not satisfied — it is unobserved. Declaring it here costs 40ms and makes the
+      # dependency true by construction instead of by alphabetical accident.
+      - name: Build the bundle (harness precondition, not an accident of ordering)
+        run: ./build.sh
       # DIVE-2525: the budget is NOT passed here. It lives in tests/lib/tier.sh next
       # to the tier definition, because a budget spelled in the caller is raised by
       # a one-line YAML edit that nobody reviews as the policy change it is.
@@ -118,6 +131,19 @@ jobs:
           { printf 'files=%s\n' "${files[*]:-}"
             printf 'names=%s\n' "$(printf '%s\n' "${files[@]:-}" | xargs -r -n1 basename | paste -sd, -)"
           } >> "$GITHUB_OUTPUT"
+      # DIVE-2525: BUILD THE BUNDLE FIRST, EXPLICITLY. Three harnesses
+      # (install_checksum, ledger, policy_refusals) need ./5dive and ./5dive.sha256
+      # to exist and say so in their own failure text — and nothing ever built them
+      # for this job. They passed anyway because SOME EARLIER HARNESS in the 267-file
+      # glob runs ./build.sh as a side effect, leaving the artifact in the working
+      # tree for everything after it. That made the corpus ORDER-DEPENDENT through a
+      # shared file, and running a SUBSET is what exposed it: the same code, the same
+      # runner, three reds, because the harness that used to build the bundle is not
+      # in this tier. An implicit precondition that a full sweep happens to satisfy is
+      # not satisfied — it is unobserved. Declaring it here costs 40ms and makes the
+      # dependency true by construction instead of by alphabetical accident.
+      - name: Build the bundle (harness precondition, not an accident of ordering)
+        run: ./build.sh
       - name: Run them (any tier)
         if: steps.changed.outputs.files != ''
         run: |
@@ -194,6 +220,19 @@ jobs:
       # environment is slower per harness (real sudo, seeded host state), and that is
       # a cost of the corpus too — hiding it under a laxer cap here would just move
       # the growth to the job that is already the longest on the PR path.
+      # DIVE-2525: BUILD THE BUNDLE FIRST, EXPLICITLY. Three harnesses
+      # (install_checksum, ledger, policy_refusals) need ./5dive and ./5dive.sha256
+      # to exist and say so in their own failure text — and nothing ever built them
+      # for this job. They passed anyway because SOME EARLIER HARNESS in the 267-file
+      # glob runs ./build.sh as a side effect, leaving the artifact in the working
+      # tree for everything after it. That made the corpus ORDER-DEPENDENT through a
+      # shared file, and running a SUBSET is what exposed it: the same code, the same
+      # runner, three reds, because the harness that used to build the bundle is not
+      # in this tier. An implicit precondition that a full sweep happens to satisfy is
+      # not satisfied — it is unobserved. Declaring it here costs 40ms and makes the
+      # dependency true by construction instead of by alphabetical accident.
+      - name: Build the bundle (harness precondition, not an accident of ordering)
+        run: ./build.sh
       - name: Run core harnesses (installed host, budgeted)
         run: bash scripts/run-harnesses.sh --tier=core --label=installed-host --report=core-installed.txt
       - uses: actions/upload-artifact@v4

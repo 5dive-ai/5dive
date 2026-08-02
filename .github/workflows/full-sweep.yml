@@ -45,6 +45,19 @@ jobs:
       # DIVE-2229: full history — pinned baselines must resolve here too.
       - uses: actions/checkout@v4
         with: { fetch-depth: 0 }
+      # DIVE-2525: BUILD THE BUNDLE FIRST, EXPLICITLY. Three harnesses
+      # (install_checksum, ledger, policy_refusals) need ./5dive and ./5dive.sha256
+      # to exist and say so in their own failure text — and nothing ever built them
+      # for this job. They passed anyway because SOME EARLIER HARNESS in the 267-file
+      # glob runs ./build.sh as a side effect, leaving the artifact in the working
+      # tree for everything after it. That made the corpus ORDER-DEPENDENT through a
+      # shared file, and running a SUBSET is what exposed it: the same code, the same
+      # runner, three reds, because the harness that used to build the bundle is not
+      # in this tier. An implicit precondition that a full sweep happens to satisfy is
+      # not satisfied — it is unobserved. Declaring it here costs 40ms and makes the
+      # dependency true by construction instead of by alphabetical accident.
+      - name: Build the bundle (harness precondition, not an accident of ordering)
+        run: ./build.sh
       - name: Run the FULL corpus (budgeted)
         run: bash scripts/run-harnesses.sh --tier=full --label=pristine --report=full-pristine.txt
       # if: always() — an over-budget or red run is exactly the run whose timings
@@ -76,6 +89,19 @@ jobs:
           sudo useradd -M -N -s /usr/sbin/nologin claude 2>/dev/null || true
           sudo useradd -M -N -s /usr/sbin/nologin agent-dev 2>/dev/null || true
           getent passwd claude agent-dev
+      # DIVE-2525: BUILD THE BUNDLE FIRST, EXPLICITLY. Three harnesses
+      # (install_checksum, ledger, policy_refusals) need ./5dive and ./5dive.sha256
+      # to exist and say so in their own failure text — and nothing ever built them
+      # for this job. They passed anyway because SOME EARLIER HARNESS in the 267-file
+      # glob runs ./build.sh as a side effect, leaving the artifact in the working
+      # tree for everything after it. That made the corpus ORDER-DEPENDENT through a
+      # shared file, and running a SUBSET is what exposed it: the same code, the same
+      # runner, three reds, because the harness that used to build the bundle is not
+      # in this tier. An implicit precondition that a full sweep happens to satisfy is
+      # not satisfied — it is unobserved. Declaring it here costs 40ms and makes the
+      # dependency true by construction instead of by alphabetical accident.
+      - name: Build the bundle (harness precondition, not an accident of ordering)
+        run: ./build.sh
       - name: Run the FULL corpus (installed host, budgeted)
         run: bash scripts/run-harnesses.sh --tier=full --label=installed-host --report=full-installed.txt
       - uses: actions/upload-artifact@v4
@@ -100,6 +126,19 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with: { fetch-depth: 0 }
+      # DIVE-2525: BUILD THE BUNDLE FIRST, EXPLICITLY. Three harnesses
+      # (install_checksum, ledger, policy_refusals) need ./5dive and ./5dive.sha256
+      # to exist and say so in their own failure text — and nothing ever built them
+      # for this job. They passed anyway because SOME EARLIER HARNESS in the 267-file
+      # glob runs ./build.sh as a side effect, leaving the artifact in the working
+      # tree for everything after it. That made the corpus ORDER-DEPENDENT through a
+      # shared file, and running a SUBSET is what exposed it: the same code, the same
+      # runner, three reds, because the harness that used to build the bundle is not
+      # in this tier. An implicit precondition that a full sweep happens to satisfy is
+      # not satisfied — it is unobserved. Declaring it here costs 40ms and makes the
+      # dependency true by construction instead of by alphabetical accident.
+      - name: Build the bundle (harness precondition, not an accident of ordering)
+        run: ./build.sh
       - name: Every harness must be able to FAIL
         run: |
           bash tests/meta/harness-verdict-probe.sh --assume-clean \
@@ -144,6 +183,19 @@ jobs:
       # full-installed-host just established the clean-green baseline IN THIS
       # ENVIRONMENT, and if it went red this job does not run and the union never
       # reports coverage.
+      # DIVE-2525: BUILD THE BUNDLE FIRST, EXPLICITLY. Three harnesses
+      # (install_checksum, ledger, policy_refusals) need ./5dive and ./5dive.sha256
+      # to exist and say so in their own failure text — and nothing ever built them
+      # for this job. They passed anyway because SOME EARLIER HARNESS in the 267-file
+      # glob runs ./build.sh as a side effect, leaving the artifact in the working
+      # tree for everything after it. That made the corpus ORDER-DEPENDENT through a
+      # shared file, and running a SUBSET is what exposed it: the same code, the same
+      # runner, three reds, because the harness that used to build the bundle is not
+      # in this tier. An implicit precondition that a full sweep happens to satisfy is
+      # not satisfied — it is unobserved. Declaring it here costs 40ms and makes the
+      # dependency true by construction instead of by alphabetical accident.
+      - name: Build the bundle (harness precondition, not an accident of ordering)
+        run: ./build.sh
       - name: Every harness must be able to FAIL (installed host)
         run: |
           bash tests/meta/harness-verdict-probe.sh --assume-clean \
@@ -181,6 +233,19 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with: { fetch-depth: 0 }
+      # DIVE-2525: BUILD THE BUNDLE FIRST, EXPLICITLY. Three harnesses
+      # (install_checksum, ledger, policy_refusals) need ./5dive and ./5dive.sha256
+      # to exist and say so in their own failure text — and nothing ever built them
+      # for this job. They passed anyway because SOME EARLIER HARNESS in the 267-file
+      # glob runs ./build.sh as a side effect, leaving the artifact in the working
+      # tree for everything after it. That made the corpus ORDER-DEPENDENT through a
+      # shared file, and running a SUBSET is what exposed it: the same code, the same
+      # runner, three reds, because the harness that used to build the bundle is not
+      # in this tier. An implicit precondition that a full sweep happens to satisfy is
+      # not satisfied — it is unobserved. Declaring it here costs 40ms and makes the
+      # dependency true by construction instead of by alphabetical accident.
+      - name: Build the bundle (harness precondition, not an accident of ordering)
+        run: ./build.sh
       - name: Slow harnesses must be able to FAIL too (long lane)
         env: { PROBE_TIMEOUT: '900' }
         run: |

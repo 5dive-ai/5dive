@@ -177,5 +177,48 @@ else
   bad "an empty corpus FAILS rather than passing over nothing" "rc=$RC out=$OUT"
 fi
 
+# --------------------------------------------- 15-16 the precondition tiering exposed
+# MEASURED on this row's own first CI run: install_checksum_unit.sh, ledger_unit.sh and
+# policy_refusals_unit.sh went red in BOTH core jobs. They need ./5dive and
+# ./5dive.sha256 and say so in their own failure text — and no job ever built them.
+# They passed for months because SOME EARLIER HARNESS in the 267-file glob runs
+# ./build.sh as a side effect and leaves the artifact in the working tree for
+# everything after it. The corpus was ORDER-DEPENDENT through a shared file, and
+# running a SUBSET is what exposed it: same code, same runner, three reds.
+#
+# An implicit precondition that a full sweep happens to satisfy is not satisfied, it
+# is UNOBSERVED. So every job that runs harnesses declares it, and this arm holds that
+# open — it is the cheapest possible check (a grep over two YAML files, no runtime) and
+# it guards the exact defect that cost this PR a CI round trip.
+jobs_missing_build() {   # <workflow> -> job names that run harnesses without building
+  # Only below `jobs:` — the `on:` block has two-space keys too, and full-sweep.yml
+  # lists scripts/run-harnesses.sh among its pull_request paths, which read as a
+  # harness-running "job" named `schedule`. First version of this arm did exactly
+  # that and was red for a reason with nothing to do with the invariant.
+  awk '
+    /^jobs:[[:space:]]*$/ { injobs=1; next }
+    !injobs { next }
+    /^  [a-z][a-z0-9-]*:[[:space:]]*$/ { if (job != "" ) emit(); job=$1; sub(/:$/,"",job); runs=0; built=0; next }
+    # COMMENTS ARE NOT STEPS. Second version of this arm matched the prose — the
+    # comment above the build step names ./build.sh, so deleting the step left the
+    # explanation of the step behind and the check stayed green. Both mutations
+    # passed. A guard that reads the sentence describing the mechanism instead of
+    # the mechanism is the vacuity this corpus keeps re-learning.
+    /^[[:space:]]*#/ { next }
+    /run-harnesses\.sh|harness-verdict-probe\.sh/ { runs=1 }
+    /^[[:space:]]*(run:[[:space:]]*)?\.\/build\.sh/ { built=1 }
+    END { emit() }
+    function emit() { if (job != "" && runs && !built) print job }
+  ' "$1"
+}
+for wf in .github/workflows/unit-tests.yml .github/workflows/full-sweep.yml; do
+  miss="$(jobs_missing_build "$wf" | paste -sd, -)"
+  if [[ -z "$miss" ]]; then
+    ok "every harness-running job in ${wf##*/} builds the bundle first"
+  else
+    bad "every harness-running job in ${wf##*/} builds the bundle first" "missing in: $miss"
+  fi
+done
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 (( fail == 0 ))
