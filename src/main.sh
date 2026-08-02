@@ -273,11 +273,11 @@ Actor-routed gh (DIVE-2448):
 Identity:
   5dive whoami [--json]
     Who is acting, under whose authority, at what tier — and the SOURCE of each.
-    Identity is uid-first: $EUID (or sudo's $SUDO_UID at real root) resolved
-    against /etc/passwd in pure bash. Never argv/--from, $USER, $SUDO_USER or
-    $FIVEDIVE_AUDIT_USER, and never `id`/`getent` (both PATH-resolved).
+    Identity is uid-first: \$EUID (or sudo's \$SUDO_UID at real root) resolved
+    against /etc/passwd in pure bash. Never argv/--from, \$USER, \$SUDO_USER or
+    \$FIVEDIVE_AUDIT_USER, and never \`id\`/\`getent\` (both PATH-resolved).
     An UNMEASURABLE actor exits 6 (auth_required) — it is never printed as
-    `unknown` with a success status.
+    \`unknown\` with a success status.
 
 Models:
   5dive models [--json]

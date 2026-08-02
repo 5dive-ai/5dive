@@ -377,6 +377,23 @@ else
   else
     no "T16 bad-flag rc=$bad_rc (want 2), help rc=$help_rc (want 0), help names exit status: $(grep -qi 'exit status' <<<"$helptxt" && echo yes || echo NO)"
   fi
+
+  # 19. TOP-LEVEL `5dive --help` must survive a stripped environment. usage() is an
+  #     UNQUOTED heredoc (`cat <<USAGE`), so every $VAR in the help text is expanded
+  #     and every `backtick` is COMMAND SUBSTITUTION. This row's own help block names
+  #     the env vars it refuses to trust ($SUDO_UID, $SUDO_USER, $FIVEDIVE_AUDIT_USER)
+  #     and quotes `id`/`getent` — unescaped, that is an unbound-variable abort under
+  #     `set -u` and two spawned processes. It shipped in the feature commit: --help
+  #     died at line 1 while `whoami` itself was fine, so no arm here saw it (DIVE-2005).
+  #     Graded under `env -u` so the runner's own sudo context cannot mask it, and the
+  #     text is asserted LITERAL — a passing exit alone would not prove no expansion.
+  h2=$(env -u SUDO_UID -u SUDO_USER -u FIVEDIVE_AUDIT_USER "$BIN" --help 2>&1); h2rc=$?
+  if (( h2rc == 0 )) && grep -q '\$SUDO_UID' <<<"$h2" && grep -q '`id`' <<<"$h2" \
+     && ! grep -qi 'unbound variable' <<<"$h2"; then
+    ok "T19 top-level --help survives a stripped env and keeps \$VARs/backticks literal"
+  else
+    no "T19 --help rc=$h2rc (want 0); literal \$SUDO_UID: $(grep -q '\$SUDO_UID' <<<"$h2" && echo yes || echo NO); literal \`id\`: $(grep -q '`id`' <<<"$h2" && echo yes || echo NO); unbound: $(grep -qi 'unbound variable' <<<"$h2" && echo YES || echo no)"
+  fi
 fi
 
 rm -rf "$SHIM" "${FIX%/passwd}"
