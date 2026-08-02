@@ -160,5 +160,52 @@ grep -q 'PROCEEDED' <<<"$out" \
   && ok_t 'no incumbent tag at all -> proceeds (first cut is not blocked)' \
   || bad_t 'the very first cut must not be blocked by a missing incumbent' "$out"
 
+echo "-- DIVE-2539: WHICH COMPONENT MOVES. patch-only was invisible for its whole life"
+# Every cut since DIVE-2247 has been a patch, so a patch-only derivation and a correct one
+# were indistinguishable until an epoch completed and 0.18.0 turned out to be unreachable.
+# The arm that matters most is the DEFAULT one: the nightly schedule passes no input, so if
+# an unset RELEASE_LEVEL ever stopped meaning patch, every scheduled cut would change shape.
+
+out=$(run_block '0.17.8' v0.17.1 v0.17.11); rc=$?
+grep -q '^DERIVED=v0\.17\.12$' <<<"$out" \
+  && ok_t 'RELEASE_LEVEL UNSET (the scheduled path) still derives a PATCH — v0.17.11 -> v0.17.12' \
+  || bad_t 'the default changed; the nightly cut is no longer patch' "rc=$rc out=$out"
+
+out=$(RELEASE_LEVEL=patch run_block '0.17.8' v0.17.1 v0.17.11); rc=$?
+grep -q '^DERIVED=v0\.17\.12$' <<<"$out" \
+  && ok_t 'RELEASE_LEVEL=patch agrees with unset (explicit and default are the same path)' \
+  || bad_t 'explicit patch disagrees with the default' "rc=$rc out=$out"
+
+# THE LIVE CASE this ticket exists for: floor 0.17.8, incumbent v0.17.11, v0.18 code merged.
+out=$(RELEASE_LEVEL=minor run_block '0.17.8' v0.17.1 v0.17.11); rc=$?
+grep -q '^DERIVED=v0\.18\.0$' <<<"$out" \
+  && ok_t 'RELEASE_LEVEL=minor -> v0.18.0, and the PATCH RESETS TO 0 rather than carrying 11' \
+  || bad_t 'a minor is still unreachable, which is the whole defect' "rc=$rc out=$out"
+
+out=$(RELEASE_LEVEL=major run_block '0.17.8' v0.17.1 v0.17.11); rc=$?
+grep -q '^DERIVED=v1\.0\.0$' <<<"$out" \
+  && ok_t 'RELEASE_LEVEL=major -> v1.0.0 (minor AND patch both reset)' \
+  || bad_t 'major does not reset both lower components' "rc=$rc out=$out"
+
+echo "-- a minor must still obey the floor, or it re-issues a hand-assigned number"
+# The floor is the only thing between a fresh cut and a version already installed on a live
+# box. A new level arm is exactly where that invariant would get dropped by accident.
+out=$(RELEASE_LEVEL=minor run_block '0.19.3' v0.17.1 v0.17.11); rc=$?
+grep -q '^DERIVED=v0\.20\.0$' <<<"$out" \
+  && ok_t 'floor 0.19.3 above the incumbent -> minor derives v0.20.0, not v0.18.0' \
+  || bad_t 'the minor path ignored the floor and would re-issue a claimed number' "rc=$rc out=$out"
+
+echo "-- an unknown level REFUSES rather than guessing which component to move"
+out=$(RELEASE_LEVEL=mnior run_block '0.17.8' v0.17.11); rc=$?
+[[ $rc -ne 0 ]] && ok_t 'a typo\u2019d level refuses (never silently falls back to patch)' \
+               || bad_t 'an unknown level must refuse; falling back to patch would silently not cut the epoch asked for' "rc=$rc out=$out"
+
+echo "-- and the derived version must sort STRICTLY ABOVE the claimed base"
+# patch cannot fail this; a wrong minor/major arithmetic can, and this assert is what
+# catches it BEFORE a tag exists rather than after (DIVE-2118).
+grep -q 'does not sort strictly above the claimed base' "$WF" \
+  && ok_t 'the sorts-strictly-above assertion is present in the shipped workflow' \
+  || bad_t 'the sorts-above guard is missing; a bad level arithmetic could re-issue a number' ""
+
 printf '\n%s passed, %s failed\n' "$PASS" "$FAIL"
 [[ $FAIL -eq 0 ]]
