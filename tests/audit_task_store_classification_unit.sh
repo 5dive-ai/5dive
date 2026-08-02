@@ -44,7 +44,7 @@ ok_t()  { PASS=$((PASS+1)); printf 'ok   - %s\n' "$1"; }
 bad_t() { FAIL=$((FAIL+1)); printf 'FAIL - %s\n   %s\n' "$1" "${2:-}"; }
 
 UNCLASSIFIED=""
-for f in "$SRC/cmd_task.sh" "$SRC/cmd_heartbeat.sh"; do
+for f in "$SRC/lib/actor.sh" "$SRC/cmd_task.sh" "$SRC/cmd_heartbeat.sh"; do
   [[ -r "$f" ]] || { bad_t "file readable: $f" "missing"; continue; }
   # Join `\`-continuations into one logical line, keeping a parallel array of
   # the FIRST physical line number each logical line started on (so a failure
