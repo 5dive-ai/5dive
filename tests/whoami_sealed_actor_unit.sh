@@ -56,13 +56,19 @@ REAL_NAME=$(awk -F: -v u="$REAL_UID" '$3==u{print $1; exit}' /etc/passwd)
 # whatever sits between. Anchor each extraction to its own definition and verify
 # the function loaded rather than trusting the range.
 for _fn in _gate_passwd_stream actor_uid_to_name _gate_uid_to_agent _gate_is_root \
-           _gate_caller_uid _gate_authenticated_actor actor_derive; do
+           _gate_caller_uid _gate_authenticated_actor actor_derive actor_registry_agent; do
   eval "$(awk -v f="^${_fn}\\\\(\\\\)" '$0 ~ f {p=1} p {print} p && /^}$/ {exit} p && /^[a-z_]+\(\)[[:space:]]*\{.*\}$/ {exit}' src/lib/actor.sh)"
 done
 for _f in _gate_passwd_stream actor_uid_to_name _gate_uid_to_agent _gate_is_root \
-          _gate_caller_uid _gate_authenticated_actor actor_derive; do
+          _gate_caller_uid _gate_authenticated_actor actor_derive actor_registry_agent; do
   declare -F "$_f" >/dev/null || { printf 'NOT OK - %s did not load; every arm below would be vacuous\n' "$_f"; exit 1; }
 done
+# tier_unmeasured is registry.sh's, not this file's — arms 13-15 grade
+# actor_registry_agent's PARTITION over it, with agent_tier stubbed. Stubbing the
+# lookup is deliberate: registry.sh already owns whether agent_tier reads the file
+# correctly, and what is untested is what actor_registry_agent DOES with each verdict.
+eval "$(sed -n '/^tier_unmeasured()/,/^}/p' src/lib/registry.sh)"
+declare -F tier_unmeasured >/dev/null || { printf 'NOT OK - tier_unmeasured did not load\n'; exit 1; }
 
 # ---------------------------------------------------------------------------
 # 1. identity is the uid's passwd name, taken from the kernel
@@ -221,6 +227,88 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# 13. the THREE registry verdicts must stay distinguishable in the report. This is
+#     the absent-vs-not-measured line DIVE-2213 drew for tiers, re-drawn one layer
+#     up: `not an agent` is an ANSWER, `could not read the registry` is not, and a
+#     registered agent with no isolation is a hole that must still name the agent.
+#     The arm FAILS if any two of the three collapse.
+probe13() {  # $1 = stubbed agent_tier verdict; prints "<agent>|<tier>|<measured>"
+  local verdict="$1"
+  ( agent_tier() { printf '%s' "$verdict"; }
+    actor_registry_agent "agent-dev"
+    tier_unmeasured "$ACTOR_TIER" && m=no || m=yes
+    printf '%s|%s|%s' "${ACTOR_AGENT:-<none>}" "$ACTOR_TIER" "$m" )
+}
+r_unreg=$(probe13 'unknown:unregistered')
+r_notier=$(probe13 'unknown:no-tier')
+r_noreg=$(probe13 'unknown:no-registry')
+r_real=$(probe13 'shared')
+if [[ "$r_unreg" == "$r_noreg" || "$r_unreg" == "$r_notier" || "$r_notier" == "$r_noreg" ]]; then
+  no "T13 COLLAPSED — two registry verdicts render identically (unreg=$r_unreg no-tier=$r_notier no-registry=$r_noreg)"
+elif [[ "$r_unreg" == "<none>|unknown:unregistered|yes" \
+     && "$r_notier" == "dev|unknown:no-tier|no" \
+     && "$r_noreg"  == "<none>|unknown:no-registry|no" \
+     && "$r_real"   == "dev|shared|yes" ]]; then
+  ok "T13 unregistered=MEASURED/no agent, no-tier=agent named/NOT measured, no-registry=claims nothing, shared=dev"
+else
+  no "T13 unreg=$r_unreg no-tier=$r_notier no-registry=$r_noreg real=$r_real"
+fi
+
+# 17. a FAILED LOOKUP must not be rescued by the next candidate. The stub answers
+#     differently per name — lookup-failed for the stripped one, a real tier for the
+#     full one — which is the only shape that separates `return` from `continue` on
+#     the residual unknown:* branch. Continuing there launders a read that did not
+#     happen into a confident agent identity.
+f_out=$( agent_tier() { [[ "$1" == dev ]] && printf 'unknown:lookup-failed' || printf 'shared'; }
+         actor_registry_agent "agent-dev"; printf '%s|%s' "${ACTOR_AGENT:-<none>}" "$ACTOR_TIER" )
+if [[ "$f_out" == "<none>|unknown:lookup-failed" ]]; then
+  ok "T17 a failed registry lookup stops the search and claims no agent (not rescued by candidate 2)"
+elif [[ "$f_out" == "agent-dev|shared" ]]; then
+  no "T17 a failed lookup on candidate 1 was papered over by candidate 2 -> reported agent-dev/shared"
+else
+  no "T17 expected <none>|unknown:lookup-failed, got $f_out"
+fi
+
+# 18. malformed-tier means REGISTERED with an unusable tier: name the agent, flag the
+#     tier. It must NOT render like an unreadable registry, which names nobody.
+m_out=$( agent_tier() { printf 'unknown:malformed-tier'; }
+         actor_registry_agent "agent-dev"; printf '%s|%s' "${ACTOR_AGENT:-<none>}" "$ACTOR_TIER" )
+u_out=$( agent_tier() { printf 'unknown:registry-unreadable'; }
+         actor_registry_agent "agent-dev"; printf '%s|%s' "${ACTOR_AGENT:-<none>}" "$ACTOR_TIER" )
+if [[ "$m_out" == "$u_out" ]]; then
+  no "T18 COLLAPSED — malformed-tier and registry-unreadable render identically ($m_out)"
+elif [[ "$m_out" == "dev|unknown:malformed-tier" && "$u_out" == "<none>|unknown:registry-unreadable" ]]; then
+  ok "T18 malformed-tier names the agent (dev) while an unreadable registry names nobody"
+else
+  no "T18 expected dev|unknown:malformed-tier vs <none>|unknown:registry-unreadable, got $m_out vs $u_out"
+fi
+
+# 14. DIVE-2371: agent-ness is the REGISTRY's answer, not a username prefix. Under a
+#     registry where only `claude` is an agent, the non-prefixed unix user resolves
+#     to an agent and the `agent-`-prefixed one does NOT. Same stub, opposite result
+#     — a prefix rule anywhere on this path cannot produce that pair.
+stub_only_claude() { agent_tier() { [[ "$1" == claude ]] && printf 'shared' || printf 'unknown:unregistered'; }; }
+c_out=$( stub_only_claude; actor_registry_agent "claude";    printf '%s' "${ACTOR_AGENT:-<none>}" )
+d_out=$( stub_only_claude; actor_registry_agent "agent-dev"; printf '%s' "${ACTOR_AGENT:-<none>}" )
+if [[ "$c_out" == "claude" && "$d_out" == "<none>" ]]; then
+  ok "T14 registry decides agent-ness: claude=agent, agent-dev=<none> under the same stub (DIVE-2371)"
+elif [[ "$c_out" == "$d_out" ]]; then
+  no "T14 VACUOUS — both names resolved the same ('$c_out'); the registry is not deciding"
+else
+  no "T14 expected claude/<none>, got '$c_out'/'$d_out'"
+fi
+
+# 15. the `agent-` strip is a LOOKUP CANDIDATE, not the decision: with only the
+#     stripped name registered, the board name is the stripped one.
+s_out=$( agent_tier() { [[ "$1" == dev ]] && printf 'admin' || printf 'unknown:unregistered'; }
+         actor_registry_agent "agent-dev"; printf '%s|%s' "$ACTOR_AGENT" "$ACTOR_TIER" )
+if [[ "$s_out" == "dev|admin" ]]; then
+  ok "T15 agent-dev -> board name dev via the stripped lookup candidate (tier admin)"
+else
+  no "T15 expected dev|admin, got $s_out"
+fi
+
+# ---------------------------------------------------------------------------
 # END TO END, through the BUILT bundle.
 BIN=./5dive
 if [[ ! -x "$BIN" ]]; then
@@ -277,6 +365,17 @@ else
     else
       no "T12 expected exit 6 + ok:false + uid-not-in-passwd, got rc=$e2erc ok=$e2e_ok code=$e2e_code reason=$e2e_reason"
     fi
+  fi
+
+  # 16. the other two exit contracts, which are just as much part of the verb: an
+  #     unknown flag is a usage error (2), and --help succeeds and STATES the
+  #     exit-status rule rather than leaving it to be discovered from source.
+  "$BIN" whoami --nope >/dev/null 2>&1; bad_rc=$?
+  helptxt=$("$BIN" whoami --help 2>&1); help_rc=$?
+  if (( bad_rc == 2 )) && (( help_rc == 0 )) && grep -qi 'exit status' <<<"$helptxt"; then
+    ok "T16 unknown flag -> 2, --help -> 0 and documents the exit-status contract"
+  else
+    no "T16 bad-flag rc=$bad_rc (want 2), help rc=$help_rc (want 0), help names exit status: $(grep -qi 'exit status' <<<"$helptxt" && echo yes || echo NO)"
   fi
 fi
 
