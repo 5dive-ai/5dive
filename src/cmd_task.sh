@@ -56,6 +56,8 @@ _task_usage() {
                                                      # rather than guess, because #N means a different PR in each repo.
   5dive task merge-audit [--limit=N] [--json]         # DIVE-1935: retrospective sweep — DONE tasks whose own record names a PR
                                                      # that never merged (or merged red). Read-only; reports, never reopens.
+                                                     # DIVE-1975: each finding is LABELLED `delivered` (the task claims it as
+                                                     # its own) or `cited` (it only writes about it). A label, never a filter.
                                                      # DIVE-1955: sweeps every repo in FIVE_GATE_REPOS (default: the CLI,
                                                      # 5dive-api and 5dive-frontend), not just the CLI one.
   5dive task verify <id|DIVE-N> [--cmd="<command>"] [--no-done] [--timeout=<s>]
@@ -2930,6 +2932,9 @@ cmd_task_deliver() {
 # result + body, resolves each, and prints the ones that are NOT merged. An
 # unresolvable ref is reported as `unverified`, never counted as clean, so the
 # sweep can't answer "all good" out of a broken token (the DIVE-1935 defect).
+# DIVE-1975: every finding also carries `delivered` or `cited` — the DIVE-1965
+# split, as a LABEL. See the long note at the classification site for why this
+# consumer labels where the gate skips.
 cmd_task_merge_audit() {
   tasks_db_init
   local limit=200
@@ -2947,10 +2952,10 @@ cmd_task_merge_audit() {
   local tok slugs; tok=$(_gate_gh_token); slugs=$(_gate_repo_slugs | paste -sd, -)
   [[ -n "$tok" ]] || fail "$E_GENERIC" "task merge-audit could not resolve a gh token — every PR would report 'unverified', which is not an audit. Authenticate gh (or export GH_TOKEN) and re-run."
   _gate_pr_refs_engine_ok || fail "$E_GENERIC" "task merge-audit cannot parse PR references on this host (grep -oE unusable) — it would report a clean sweep by finding nothing at all. Fix grep and re-run."
-  local rows findings=0 unver=0 amb=0 json_rows=""
+  local rows findings=0 unver=0 amb=0 deliv_n=0 cited_n=0 json_rows=""
   rows=$(db "SELECT ident || '|' || COALESCE(delivery_ref,'') || '|' || REPLACE(REPLACE(COALESCE(delivery_ref,'') || ' ' || COALESCE(result,'') || ' ' || COALESCE(body,''), char(10), ' '), '|', ' ')
                FROM tasks WHERE status='done' ORDER BY COALESCE(done_at, created_at) DESC LIMIT ${limit};")
-  local line tident tdref ttext qref st state rslug tslug
+  local line tident tdref ttext qref st state rslug tslug tdeliv origin
   while IFS= read -r line; do
     [[ -n "$line" ]] || continue
     tident="${line%%|*}"; line="${line#*|}"
@@ -2962,6 +2967,39 @@ cmd_task_merge_audit() {
     # an old CLI one — a resolved-looking verdict about the wrong PR, which the
     # footnote excused only for `unverified`.
     tslug=$(_gate_task_repo_slug "$tdref" "$ttext")
+    # DIVE-1975: LABEL each finding delivered-vs-cited. NEVER filter on it.
+    #
+    # DIVE-1965 split "a PR this task DELIVERED" from "a PR this task WRITES ABOUT"
+    # and taught the gate to skip the second. This sweep is the SAME predicate over
+    # the SAME data feeding a DIFFERENT consumer, and the two want OPPOSITE safe
+    # defaults:
+    #   * the GATE blocks a close. Over-judging stalls the fleet — the exact
+    #     fleet-wide blocker DIVE-1965 exists to prevent — so its default is CITED
+    #     and delivery must be asserted.
+    #   * this SWEEP blocks nothing; a human reads it. Over-reporting costs one line
+    #     to dismiss. Under-reporting HIDES REAL UNMERGED WORK, which is the whole
+    #     job. So it reports every ref and annotates the ones it cannot bind.
+    # Filtering to `delivered` here would rebuild the DIVE-1955 blindness one layer
+    # down and HARDER TO SEE: the sweep would come back clean while the work it was
+    # built to find sat unmerged behind a maker's phrasing. DIVE-1965's own known
+    # coverage seam (an own delivery phrased outside the shipping-verb vocabulary)
+    # lands precisely there. Same shape as DIVE-1955's `ambiguous` branch: report
+    # the non-answer, do not manufacture one and do not swallow it. A label lets the
+    # reader triage; a filter decides for them with the gate's risk model.
+    #
+    # Two deliberate differences from the gate's classification, both widening
+    # `delivered`, which is the harmless direction when nothing is dropped:
+    #   1. the `delivery_ref` COLUMN is folded in. It never reaches the gate's prose
+    #      classifier (a declared ref routes to the declared gate) but it IS part of
+    #      this row's text, and a bound delivery_ref is the strongest delivery
+    #      assertion we have — classifying it as a citation would be plainly wrong.
+    #   2. the row arrives with newlines collapsed to spaces (the reader loop is
+    #      line-based), so the classifier's line-scoping degrades to text-scoping and
+    #      a shipping verb can reach across an original line break. Cosmetic here:
+    #      it can only move a row from `cited` to `delivered` in a report where both
+    #      are printed.
+    tdeliv=$( _gate_pr_refs_qualified_from_text "$tdref"
+              _gate_delivery_refs_from_text "$ttext" )
     while IFS= read -r qref; do
       [[ -n "$qref" ]] || continue
       st=$(_gate_resolve_qualified "$qref" "$tok" "$tident" "$tslug")
@@ -2977,18 +3015,33 @@ cmd_task_merge_audit() {
         esac
       fi
       findings=$((findings+1))
-      json_rows+=$(jq -nc --arg t "$tident" --arg p "${qref#*|}" --arg r "$rslug" --arg s "$state" \
-                     '{ident:$t,pr:("#"+$p),repo:$r,state:$s}')$'\n'
-      [[ "${JSON_MODE:-0}" == "1" ]] || printf '%-12s %-22s PR #%-6s %s\n' "$tident" "$rslug" "${qref#*|}" "$state"
+      # The gate's membership rule, verbatim (DIVE-1965): an exact qualified match,
+      # OR the same number asserted BARE — the extractor may have upgraded a bare
+      # "PR #N" to `slug|N` off a URL elsewhere in the same text, so a number-only
+      # match on the cited side would be too loose and an exact-only match too tight.
+      if printf '%s\n' "$tdeliv" | grep -qxF -e "$qref" -e "|${qref#*|}"; then
+        origin="delivered"; deliv_n=$((deliv_n+1))
+      else
+        origin="cited"; cited_n=$((cited_n+1))
+      fi
+      json_rows+=$(jq -nc --arg t "$tident" --arg p "${qref#*|}" --arg r "$rslug" --arg s "$state" --arg o "$origin" \
+                     '{ident:$t,pr:("#"+$p),repo:$r,state:$s,origin:$o}')$'\n'
+      [[ "${JSON_MODE:-0}" == "1" ]] || printf '%-12s %-22s PR #%-6s %-11s %s\n' "$tident" "$rslug" "${qref#*|}" "$state" "$origin"
     done < <(_gate_pr_refs_qualified_from_text "$ttext")
   done <<<"$rows"
   local payload; payload=$(printf '%s' "$json_rows" | jq -sc '.')
   if [[ "${JSON_MODE:-0}" != "1" ]] && (( unver + amb > 0 )); then
     printf 'note: `unverified` = the number resolves to no PR in the repo(s) searched FOR THAT\n      TASK — the one its own record DECLARES (a delivery_ref URL or a `Repo:` line) when it\n      declares one, else all of %s (DIVE-1963).\n      `ambiguous` = a bare "PR #N" that exists in more than one of them and the task\n      declares no repo, so no single verdict is defensible. NEITHER is evidence of an\n      unmerged PR, and neither is evidence of a clean one. Cite the full pull URL, or\n      add a `Repo: <owner>/<repo>` line to the task body, to have them resolved.\n' "$slugs"
   fi
-  ok "merge-audit: scanned the newest $limit done task(s) across $slugs — $findings PR reference(s) not merged-and-green ($unver unverified, $amb ambiguous)" \
-     '{scanned:($n|tonumber), repos:($rp|split(",")), findings:($f|tonumber), unverified:($u|tonumber), ambiguous:($a|tonumber), rows:($r|fromjson)}' \
-     --arg n "$limit" --arg rp "$slugs" --arg f "$findings" --arg u "$unver" --arg a "$amb" --arg r "$payload"
+  # DIVE-1975: the label is only useful if the reader knows it is a LABEL and not a
+  # filter — otherwise `cited` reads as "already dismissed" and the rows it marks get
+  # skipped, which is the filter we refused to write, executed by the human instead.
+  if [[ "${JSON_MODE:-0}" != "1" ]] && (( findings > 0 )); then
+    printf 'note: `delivered` = the task ASSERTS this PR as its own delivery (a bound delivery_ref,\n      a `Delivered:` line, or a shipping verb next to the ref — DIVE-1965).\n      `cited` = the task names the PR but claims no delivery. It is a LABEL, not a\n      filter: every reference found is listed either way, because a maker who shipped\n      without the phrasing would otherwise vanish from this sweep entirely (DIVE-1975).\n      Triage `delivered` first; `cited` rows are usually another task'"'"'s to answer for.\n'
+  fi
+  ok "merge-audit: scanned the newest $limit done task(s) across $slugs — $findings PR reference(s) not merged-and-green ($deliv_n delivered by the task, $cited_n only cited; $unver unverified, $amb ambiguous)" \
+     '{scanned:($n|tonumber), repos:($rp|split(",")), findings:($f|tonumber), delivered:($d|tonumber), cited:($c|tonumber), unverified:($u|tonumber), ambiguous:($a|tonumber), rows:($r|fromjson)}' \
+     --arg n "$limit" --arg rp "$slugs" --arg f "$findings" --arg d "$deliv_n" --arg c "$cited_n" --arg u "$unver" --arg a "$amb" --arg r "$payload"
 }
 
 # DIVE-477: hand a maker-completed task to its verifier instead of closing it.
