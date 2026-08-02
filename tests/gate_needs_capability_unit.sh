@@ -47,7 +47,7 @@ trap 'rm -rf "$TMP"' EXIT
 # shellcheck disable=SC1090
 for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh \
          lib/agent_setup.sh lib/state.sh lib/audit.sh lib/registry.sh \
-         lib/tasks_db.sh cmd_task.sh; do
+         lib/tasks_db.sh lib/actor.sh cmd_task.sh; do
   # shellcheck source=/dev/null
   source "$SRC/$f"
 done
