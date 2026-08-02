@@ -46,12 +46,19 @@ EXPECT=""; [[ "$REAL_NAME" == agent-* ]] && EXPECT="${REAL_NAME#agent-}"
 # `_gate_uid_to_agent` now reads its passwd source through `_gate_passwd_stream`,
 # so that must load too or the resolver returns empty for every uid and arms 1-3
 # pass vacuously.
-eval "$(sed -n '/^_gate_passwd_stream()/,/^}/p'        src/cmd_task.sh)"
-eval "$(sed -n '/^_gate_is_root()/,/^}/p'             src/cmd_task.sh)"
-eval "$(sed -n '/^_gate_uid_to_agent()/,/^}/p'        src/cmd_task.sh)"
-eval "$(sed -n '/^_gate_caller_uid()/,/^}/p'          src/cmd_task.sh)"
-eval "$(sed -n '/^_gate_authenticated_actor()/,/^}/p' src/cmd_task.sh)"
-for _f in _gate_passwd_stream _gate_is_root _gate_uid_to_agent _gate_caller_uid _gate_authenticated_actor; do
+# DIVE-2517: these six MOVED from src/cmd_task.sh to src/lib/actor.sh when the
+# strict uid-first derivation was promoted to the single one. Same names, same
+# bodies — only the file changed. `actor_uid_to_name` is NOT optional: it is the
+# passwd walk `_gate_uid_to_agent` now composes over, and without it the resolver
+# returns empty for every uid and arms 1-3 pass vacuously (the same way
+# `_gate_passwd_stream` had to be added in iteration 2).
+eval "$(sed -n '/^_gate_passwd_stream()/,/^}/p'        src/lib/actor.sh)"
+eval "$(sed -n '/^_gate_is_root()/,/^}/p'             src/lib/actor.sh)"
+eval "$(sed -n '/^actor_uid_to_name()/,/^}/p'         src/lib/actor.sh)"
+eval "$(sed -n '/^_gate_uid_to_agent()/,/^}/p'        src/lib/actor.sh)"
+eval "$(sed -n '/^_gate_caller_uid()/,/^}/p'          src/lib/actor.sh)"
+eval "$(sed -n '/^_gate_authenticated_actor()/,/^}/p' src/lib/actor.sh)"
+for _f in _gate_passwd_stream _gate_is_root actor_uid_to_name _gate_uid_to_agent _gate_caller_uid _gate_authenticated_actor; do
   declare -F "$_f" >/dev/null || { printf 'NOT OK - %s did not load; the arms below would be vacuous\n' "$_f"; exit 1; }
 done
 
