@@ -55,13 +55,27 @@ run_block(){
   rm -rf "$d"; return $rc
 }
 
+# THE SCHEDULED PATH, and it must be spelled rather than assumed.
+#
+# DIVE-2539, second defect, found by the cut REFUSING: this harness runs in TWO jobs with
+# different environments. unit-tests.yml's `test` job has no RELEASE_LEVEL, so a bare
+# run_block there really is the unset case. The `cut` job's grade-release-commit step runs
+# the same corpus with RELEASE_LEVEL set from the dispatch input — so every bare call
+# inherited `minor` and the arm asserting "unset still means patch" derived v0.18.0 and
+# failed. 21/0 in one job, 16/5 in the other, on identical bytes.
+#
+# A harness that reads an environment variable it does not set is graded by its CALLER.
+# Neutralising per call site rather than once at the top is deliberate: it keeps the
+# ambient value observable, which is what lets the leak arm at the end be a real test.
+run_default(){ ( unset RELEASE_LEVEL; run_block "$@" ); }
+
 echo "-- the floor is what stops a hand-assigned number being re-issued"
 # The live case, and the reason .release-floor exists at all: main's newest TAG is
 # v0.17.1, but 0.17.2..0.17.8 were assigned BY HAND on main against different trees
 # between 07-28 and 07-29, and 0.17.2 is installed on a live box right now. Deriving
 # from the tag alone yields v0.17.2 -> two different bundles claiming one version, and
 # the box that has it would compare EQUAL and never update.
-out=$(run_block '0.17.8' v0.16.32 v0.17.0 v0.17.1); rc=$?
+out=$(run_default '0.17.8' v0.16.32 v0.17.0 v0.17.1); rc=$?
 [[ $rc -eq 0 ]] && ok_t 'a well-formed floor + tag set is accepted' \
                 || bad_t 'happy path must be accepted (the refusals below prove nothing otherwise)' "rc=$rc out=$out"
 grep -q '^DERIVED=v0\.17\.9$' <<<"$out" \
@@ -71,13 +85,13 @@ grep -q '^DERIVED=v0\.17\.9$' <<<"$out" \
 echo "-- and once the tags overtake the floor, the floor stops mattering"
 # The floor is written ONCE at the transition. This arm is what says so: with a newer
 # tag present the same inert floor must not drag the derivation backwards.
-out=$(run_block '0.17.8' v0.17.1 v0.18.4); rc=$?
+out=$(run_default '0.17.8' v0.17.1 v0.18.4); rc=$?
 grep -q '^DERIVED=v0\.18\.5$' <<<"$out" \
   && ok_t 'incumbent v0.18.4 above the floor -> derives v0.18.5 (the floor is inert history, not a ceiling)' \
   || bad_t 'a stale floor must not pull the derivation below the newest tag' "rc=$rc out=$out"
 
 echo "-- sort -V, not lexical: 0.17.10 is above 0.17.9, and a lexical sort disagrees"
-out=$(run_block '0.0.1' v0.17.9 v0.17.10); rc=$?
+out=$(run_default '0.0.1' v0.17.9 v0.17.10); rc=$?
 grep -q '^DERIVED=v0\.17\.11$' <<<"$out" \
   && ok_t 'v0.17.10 wins over v0.17.9 under sort -V -> derives v0.17.11' \
   || bad_t 'derivation is not version-sorting; a lexical compare would cut v0.17.10 again' "rc=$rc out=$out"
@@ -85,25 +99,25 @@ grep -q '^DERIVED=v0\.17\.11$' <<<"$out" \
 echo "-- an unreadable floor must REFUSE, never guess"
 # A missing floor is indistinguishable from a floor that was deleted, and guessing from
 # the tag alone is exactly the re-issue this file exists to prevent. Refuse.
-out=$(run_block '' v0.17.1); rc=$?
+out=$(run_default '' v0.17.1); rc=$?
 [[ $rc -ne 0 ]] && ok_t 'missing .release-floor -> refuses to cut' \
                 || bad_t 'a missing floor must refuse, not fall back to the tag' "rc=$rc out=$out"
-out=$(run_block 'not-a-version' v0.17.1); rc=$?
+out=$(run_default 'not-a-version' v0.17.1); rc=$?
 [[ $rc -ne 0 ]] && ok_t 'malformed .release-floor -> refuses to cut' \
                 || bad_t 'a malformed floor must refuse' "rc=$rc out=$out"
 
 echo "-- a derived tag that ALREADY EXISTS is a broken derivation, not a green light"
 # Unreachable while the derivation is correct, which is the point: a guard that holds
 # only because of a precondition elsewhere stops holding when someone reorders things.
-out=$(run_block '0.17.1' v0.17.1 v0.17.2); rc=$?
+out=$(run_default '0.17.1' v0.17.1 v0.17.2); rc=$?
 # floor 0.17.1, incumbent v0.17.2 -> derives v0.17.3, which does not exist: must pass.
 grep -q '^DERIVED=v0\.17\.3$' <<<"$out" \
   && ok_t 'control: the exists-check does not fire on a genuinely new number' \
   || bad_t 'control arm failed; the arm below cannot be trusted' "rc=$rc out=$out"
-out=$(run_block '0.17.1' v0.17.1 v0.17.2 v0.17.3); rc=$?
+out=$(run_default '0.17.1' v0.17.1 v0.17.2 v0.17.3); rc=$?
 # incumbent is now v0.17.3 -> derives v0.17.4, still new. Force the collision instead by
 # making the FLOOR the thing that lands on an existing tag.
-out=$(run_block '0.17.1' v0.17.1 v0.17.2); rc=$?
+out=$(run_default '0.17.1' v0.17.1 v0.17.2); rc=$?
 [[ $rc -eq 0 ]] && ok_t 'and it does not fire spuriously' || bad_t 'spurious exists-refusal' "out=$out"
 
 echo "-- the collision invariant has a NAMED home now that the detector is gone"
@@ -166,7 +180,7 @@ echo "-- DIVE-2539: WHICH COMPONENT MOVES. patch-only was invisible for its whol
 # The arm that matters most is the DEFAULT one: the nightly schedule passes no input, so if
 # an unset RELEASE_LEVEL ever stopped meaning patch, every scheduled cut would change shape.
 
-out=$(run_block '0.17.8' v0.17.1 v0.17.11); rc=$?
+out=$(run_default '0.17.8' v0.17.1 v0.17.11); rc=$?
 grep -q '^DERIVED=v0\.17\.12$' <<<"$out" \
   && ok_t 'RELEASE_LEVEL UNSET (the scheduled path) still derives a PATCH — v0.17.11 -> v0.17.12' \
   || bad_t 'the default changed; the nightly cut is no longer patch' "rc=$rc out=$out"
@@ -206,6 +220,25 @@ echo "-- and the derived version must sort STRICTLY ABOVE the claimed base"
 grep -q 'does not sort strictly above the claimed base' "$WF" \
   && ok_t 'the sorts-strictly-above assertion is present in the shipped workflow' \
   || bad_t 'the sorts-above guard is missing; a bad level arithmetic could re-issue a number' ""
+
+echo "-- DIVE-2539 SECOND DEFECT: this harness must not be graded by its CALLER's environment"
+# Measured, not asserted: run 30757981525 (workflow_dispatch, level=minor) reached
+# grade-release-commit and the delta corpus reported 16 passed, 5 failed, on bytes that
+# were 21/0 in unit-tests.yml minutes earlier. The cut REFUSED and published nothing —
+# the fail-closed rail did its job — but the RED was manufactured by the job's own env.
+#
+# The pair is the test. The neutralised arm ALONE passes for a harness that neutralises
+# nothing, because it agrees with the clean-env case; the leak arm is what proves the
+# ambient value genuinely reaches the derivation and is therefore worth neutralising.
+out=$(export RELEASE_LEVEL=minor; run_default '0.17.8' v0.17.1 v0.17.11); rc=$?
+grep -q '^DERIVED=v0\.17\.12$' <<<"$out" \
+  && ok_t 'NEUTRALISED: with RELEASE_LEVEL=minor in the ambient env, the scheduled path still derives a PATCH' \
+  || bad_t 'the ambient RELEASE_LEVEL reached the default arm; this harness is graded by whichever job runs it' "rc=$rc out=$out"
+
+out=$(export RELEASE_LEVEL=minor; run_block '0.17.8' v0.17.1 v0.17.11); rc=$?
+grep -q '^DERIVED=v0\.18\.0$' <<<"$out" \
+  && ok_t 'NEGATIVE CONTROL: an un-neutralised call DOES inherit it (v0.18.0) — so the arm above is not vacuous' \
+  || bad_t 'the ambient value no longer reaches the derivation at all, so the neutralisation arm proves nothing' "rc=$rc out=$out"
 
 printf '\n%s passed, %s failed\n' "$PASS" "$FAIL"
 [[ $FAIL -eq 0 ]]
