@@ -445,8 +445,15 @@ jobs:
           # do not hold, so the logic sits where it can be graded and repaired on the
           # normal rail (tests/grade_release_commit_unit.sh, 20 assertions). Same split
           # as scripts/pii-scan-range.sh (DIVE-2267).
-          echo "--- grading the release commit ${sha:0:12} (DIVE-2433) ---"
-          bash scripts/grade-release-commit.sh "${version}"
+          # DIVE-2524: pass the PARENT. It is what turns a 40-minute re-run of all 264
+          # harnesses into a grade of the delta — the script proves `git diff parent HEAD`
+          # is the release-commit set and nothing else, and only then inherits the
+          # parent's check-runs for the rest. Drop this argument and the script has no
+          # premise to prove, so it falls back to the full corpus rather than trusting
+          # an inheritance it cannot demonstrate. The parent is already the commit whose
+          # check-runs this job polled green, under its own name since DIVE-2433.
+          echo "--- grading the release commit ${sha:0:12} against parent ${parent_sha:0:12} (DIVE-2433, DIVE-2524) ---"
+          bash scripts/grade-release-commit.sh "${version}" "${parent_sha}"
           _grc=$?
           case "$_grc" in
             0) echo "release commit ${sha:0:12}: PASS on the exact artifact (DIVE-2433)" ;;
