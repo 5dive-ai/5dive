@@ -615,6 +615,15 @@ _cred_expiry_epoch() {
   fi
   # No explicit field: fall back to the `exp` claim of a JWT the file carries
   # (codex stores tokens.id_token). base64url -> base64, then pad.
+  #
+  # CREDENTIAL-BEARING LOCALS AHEAD (main, DIVE-1953 push review): `$jwt` is a
+  # live bearer token and `$pay` is its decoded payload. Nothing here prints
+  # them — only `$exp` is echoed, and the whole `$blob` argument is likewise
+  # never emitted — but a `set -x`, a debug echo, or a BASH_XTRACEFD added
+  # anywhere in this function WOULD dump a usable token into whatever the
+  # caller's stderr happens to be (a systemd journal, a dashboard exec tunnel,
+  # a CI log). Read that as a constraint on this function, not a warning: if
+  # you need to trace it, trace around it.
   local jwt
   jwt=$(jq -r 'if type != "object" then empty else
                  first((.tokens.id_token?, .tokens.access_token?, .id_token?, .access_token?)
