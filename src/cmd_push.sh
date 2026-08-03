@@ -570,7 +570,7 @@ cmd_push_do() {
   # org repos, and the scoped body caps the permission to the one op we need.
   local reponame body tok slug
   reponame=$(_push_repo_name "$repourl")
-  # owner/repo, needed by the DIVE-2562 installation lookup below. Declared here
+  # owner/repo, needed by the DIVE-2563 installation lookup below. Declared here
   # rather than at the summary line further down, which ran AFTER the mint.
   slug=$(_push_repo_slug "$repourl")
   # gh#250: contents:write alone CANNOT push .github/workflows/* — GitHub
@@ -591,7 +591,7 @@ cmd_push_do() {
       && echo "[5dive] cannot diff ${branch} against the remote default branch — requesting workflows:write defensively" >&2
     body=$(jq -cn --arg r "$reponame" '{repositories:[$r],permissions:{contents:"write",workflows:"write"}}')
   fi
-  # DIVE-2562: RESOLVE THE INSTALLATION FOR THIS REPO'S OWNER, don't mint against a
+  # DIVE-2563: RESOLVE THE INSTALLATION FOR THIS REPO'S OWNER, don't mint against a
   # single pinned id. GITHUB_APP_INSTALLATION_ID is one number in one env file, so
   # every push on this box minted against whichever account was installed first.
   # A GitHub App gets a SEPARATE installation per account it is installed on, and

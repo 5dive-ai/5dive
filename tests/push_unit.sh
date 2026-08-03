@@ -805,7 +805,7 @@ grep -q 'workflows:"write"' "$SRC/cmd_push.sh" \
   && ok_t "workflows scope: _push_do can request workflows:write" \
   || bad_t "workflows scope: _push_do can request workflows:write" "no workflows grant in the token body"
 
-# --- DIVE-2562: the installation is resolved PER REPO, not pinned -------------
+# --- DIVE-2563: the installation is resolved PER REPO, not pinned -------------
 # A GitHub App gets one installation per ACCOUNT it is installed on, and the token
 # exchange refuses any repo outside the installation it is addressed to. A single
 # pinned GITHUB_APP_INSTALLATION_ID therefore works only while the whole fleet

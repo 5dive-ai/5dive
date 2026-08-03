@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased — fix(push): resolve the App installation PER REPO, not from one pinned id (DIVE-2562)
+## Unreleased — fix(push): resolve the App installation PER REPO, not from one pinned id (DIVE-2563)
 
 `_push_do` minted every installation token against a single `GITHUB_APP_INSTALLATION_ID`
 read from `github-app.env`. A GitHub App gets a **separate installation per account**
