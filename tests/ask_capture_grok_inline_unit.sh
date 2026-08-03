@@ -115,7 +115,7 @@ echo "case 3 — the REAL pane with the reply line DELETED returns NOTHING"
 # only the seat's answer removed. Anything non-empty here is the echo coming
 # back as an answer — the exact fabrication DIVE-1901 removed the scraper for.
 printf 'Reply with exactly: ALIVE-2216 %s' "$(hint $MID)" > "$msg"
-got=$(grep -v 'ALIVE-2216 </5dive-r:' "$F/reply-oneline.txt" | window "$MID")
+got=$(grep -v 'ALIVE-2216 </5dive-r:' "$F/reply-oneline.txt" | window "$MID") || got=""
 [[ -z "$got" ]] || bad "case3: the echoed instruction was returned as a reply: [$got]"
 ok_ "with the answer removed the same pane yields nothing — the echo is not a reply"
 

@@ -210,19 +210,19 @@ _sup_goal_drift() {  # <type> <home> <name> <now> <act_epoch>
   [[ -n "$tx" && -r "$tx" ]] || return 0
   # One JSONL record == one physical line, so a line match == a record match.
   local set_ln clr_ln
-  set_ln=$(grep -n 'session-scoped Stop hook is now active with condition' "$tx" 2>/dev/null | tail -1 | cut -d: -f1)
+  set_ln=$(grep -n 'session-scoped Stop hook is now active with condition' "$tx" 2>/dev/null | tail -1 | cut -d: -f1) || set_ln=""
   [[ -n "$set_ln" ]] || return 0
   # A `/goal clear` record carries the short args tag; set records carry the
   # long condition text, so this exact string never matches a set line.
-  clr_ln=$(grep -n '<command-args>clear</command-args>' "$tx" 2>/dev/null | tail -1 | cut -d: -f1)
+  clr_ln=$(grep -n '<command-args>clear</command-args>' "$tx" 2>/dev/null | tail -1 | cut -d: -f1) || clr_ln=""
   [[ -n "$clr_ln" ]] && (( clr_ln > set_ln )) && return 0
   local setline set_ts set_epoch
   setline=$(sed -n "${set_ln}p" "$tx")
-  set_ts=$(grep -oE '"timestamp":"[^"]+"' <<<"$setline" | head -1 | cut -d'"' -f4)
+  set_ts=$(grep -oE '"timestamp":"[^"]+"' <<<"$setline" | head -1 | cut -d'"' -f4) || set_ts=""
   [[ -n "$set_ts" ]] && set_epoch=$(date -d "$set_ts" +%s 2>/dev/null) || set_epoch=""
   [[ "$set_epoch" =~ ^[0-9]+$ ]] && (( now - set_epoch < _SUP_T_SLOW_MIN * 60 )) && return 0
   local task
-  task=$(grep -oE 'DIVE-[0-9]+' <<<"$setline" | head -1 | grep -oE '[0-9]+')
+  task=$(grep -oE 'DIVE-[0-9]+' <<<"$setline" | head -1 | grep -oE '[0-9]+') || task=""
   [[ -n "$task" ]] || return 0
   local st
   st=$(db "SELECT status FROM tasks WHERE id=${task};" 2>/dev/null || echo "")

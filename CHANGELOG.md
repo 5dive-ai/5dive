@@ -1,5 +1,84 @@
 # Changelog
 
+## Unreleased — fix(cli): 36 unguarded `$( )` probes that killed the caller on the QUIET path (DIVE-2604)
+
+The class that shipped three times in one day — DIVE-2566 (`5dive push`, `curl -f` rc=22),
+DIVE-2603 (`5dive task done`, rc=1 with **zero bytes on both streams**), DIVE-2598 (the
+report of the second) — swept across the whole tree instead of patched instance by instance.
+
+The bundle runs under `set -euo pipefail`. A bare `var=$(… grep …)` therefore **kills the
+caller** when the probe finds nothing: `grep` exits 1, `pipefail` promotes it out of the
+pipeline, and a bare assignment has no `||` to absorb it. The die happens *before* the
+handler that would have explained it, so the caller gets a bare exit code with no reason
+attached — and a caller that reads only output sees success.
+
+`grep -c .` is the nastiest member: on empty input it **prints `0` and exits `1`**. The
+value it computes is correct and the command still kills the caller, so a reader checking
+"does it produce the right number" finds nothing wrong.
+
+**Every one of these is a probe that is ALLOWED to find nothing** — an objective with no
+readings, a task citing no PRs, a `.env` without the key, a selfcheck naming no wired count,
+a supervisor line naming no ident, a memory pack with no leaks. Empty is the *ordinary*
+case, which is why the class fires on the quiet path and why nobody writes a test for it.
+
+**36 sites guarded** — 34 in `src/`, 2 in `tests/` harnesses that themselves run under
+`set -euo pipefail`. Five were named in the ticket; the sweep found the other 31. The ones
+where the guard makes an unreachable handler reachable are the interesting ones:
+`cmd_auth`'s "opencode has no model X — close matches: …" `fail` never printed when there
+were no close matches; `cmd_selfupdate`'s "no release tag resolves" branch was unreachable
+whenever tags existed but none was a plain release tag; `cmd_agent_runtime`'s
+`${reset:-no reset time shown}` fallback could not run. The remedy is `|| var=""` (or `|| var=0` for
+a counter), **not** `|| true`: the empty/zero assignment states the post-condition the code
+below actually reads, where `|| true` leaves the value to the substitution's behaviour and
+reads as noise-suppression to the next person. And **not** `local var=$(…)`, which returns 0
+unconditionally and so trades a loud death for a silent wrong value.
+
+Two of the 24 were previously unreported and neither was in the ticket:
+
+- `_pack_memory_leakscan` (`cmd_pack.sh`) ended `… | grep -vE "$exempt" | awk | sort` inside
+  the substitution, so **a pack with no leaks at all** made the whole subshell exit 1. Latent
+  rather than live: both callers invoke it as `! _pack_memory_leakscan …`, which suppresses
+  `set -e` — one refactor away from taking down `5dive pack export` on its success path.
+- `_agents_md_fence` (`cmd_pack.sh`) died on any memory file containing no `~~~` fence.
+
+**The guard is a scanner, not another guard.** Two fixes in one release did not make the
+third unguarded substitution less likely, because writing `var=$(…)` is normal.
+`scripts/unguarded-probe-scan.sh` walks `src/` and `scripts/` with real paren/quote tracking
+(it must know where a `$( )` ends and whether a `||` sits at the probe's own group level),
+and fails on any bare assignment whose substitution contains a probe — `grep`/`rg`/`jq -e`/
+`curl -f` — with no fallback. shellcheck 0.9 cannot express this and no general checker can:
+whether a non-zero exit is a defect depends on whether the probe is *allowed* to find
+nothing, which is a fact about intent, so the scanner encodes that intent as a command list.
+
+`tests/unguarded_probe_substitution_unit.sh` (37 arms, 3.3s, core tier) grades it by
+**running** the shapes rather than grepping for guards: each of four shapes under the real
+flags with a positive control, the remedy's post-condition, the scanner against synthetic
+bad/good input, and — the load-bearing arm — a **mutation** pass that strips the guard off
+each of twelve fixed sites in a copy of the tree and requires the scanner to name that exact
+`file:line` back. `tests/` is held to the same gate at **zero**.
+
+**The scanner's own three bugs are the transferable part**, because every one of them
+reported the tree CLEAN:
+
+1. A here-**string** in a *comment* (`# <<< DIVE-2287 …`) matched a `<<WORD` heredoc regex
+   at the second `<`, terminator `DIVE`, and the rest of that file was skipped.
+2. `'\''` — a backslash-escaped quote outside quotes — flipped the quote state and lost a
+   real offender inside a `sed` script.
+3. The scanner was anchored at **line start** and so could not see `local n; n=$(… | grep …)`,
+   the recommended split-declaration habit written compactly. **Six live sites wore exactly
+   that form.** Keying a sweep on the shape of the instance you already found is how a class
+   survives its own sweep — the same error the ticket was filed to correct, repeated one
+   level up, in the tool written to prevent it.
+
+A fourth was a false-positive engine rather than a blind spot, and it is the one that
+changed the shape of the deliverable: **the class needs `set -e`.** Without it a failed
+assignment just leaves an empty value and execution continues. 16 of 83 files under
+`scripts/`, and **282 of 303 under `tests/`**, run `set -uo pipefail` with **no `-e`** — so
+the first honest-looking measurement of `tests/` said **128 instances** when the real number
+was **2**. A debt ceiling pinned at 128 would have enshrined 126 non-defects as work owed.
+`src/*.sh` are the exception and must not be judged on their own text: they carry no `set`
+line at all because `build.sh` concatenates them under `src/header.sh`. The harness grades
+that discriminator in **both** directions, plus the `src/` exception.
 ## Unreleased — feat(push,task): a builder opens its own PR and satisfies its own merge gate (DIVE-2605)
 
 Every builder's work funnelled through one agent for two steps that carry no judgement:

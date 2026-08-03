@@ -83,7 +83,7 @@ assert_tail=' && [[ -x /home/claude/.local/bin/codex ]]; }'
 }
 # Second, independent anchor: the -x test must appear TWICE (short-circuit +
 # trailing assert). Counted off the raw string, not a deduped view.
-n_asserts="$(grep -o -F -- '[[ -x /home/claude/.local/bin/codex ]]' <<<"$recipe" | wc -l)"
+n_asserts="$(grep -o -F -- '[[ -x /home/claude/.local/bin/codex ]]' <<<"$recipe" | wc -l)" || n_asserts=0
 (( n_asserts == 2 )) || {
   echo "FAIL: expected 2 occurrences of the -x test (FORCE_INSTALL short-circuit + trailing assert), found $n_asserts" >&2
   exit 1
