@@ -834,6 +834,47 @@ grep -q "message // empty" "$SRC/cmd_push.sh" \
   && ok_t "installation: a failed mint surfaces GitHub's own message" \
   || bad_t "installation: mint failure names the cause" "the API error body is discarded"
 
+
+# DIVE-2566: the installation lookup is a probe that is ALLOWED to fail — a repo
+# outside every installation 404s it, which is precisely the case the pinned-id
+# fallback exists for. `curl -fsS` exits 22 on HTTP>=400, `pipefail` promotes it
+# through the `| jq`, and a bare `var=$(...)` under `set -e` kills the push, so the
+# fallback branch was UNREACHABLE in its own motivating case (delegated push to any
+# lodar/* repo died with a bare rc=22 and no message).
+#
+# STATIC ARM: the assignment must handle its own failure.
+grep -qE "jq -r '\.id // empty'\) \|\| _inst_for_repo=" "$SRC/cmd_push.sh" \
+  && ok_t "installation: the lookup assignment cannot fail the script (DIVE-2566)" \
+  || bad_t "installation: lookup is guarded" "the \$( ) assignment is unguarded — under set -e + pipefail a 404 kills the push and the fallback below is dead code"
+
+# BEHAVIOURAL ARM. The grep above only proves a STRING is present, so this one runs
+# the shape the SOURCE actually carries under a real `set -euo pipefail` against a
+# command that exits non-zero. Deriving the tail FROM cmd_push.sh is the whole point:
+# an inline guarded-vs-unguarded demo would pass no matter what the source says, and
+# a mutation to the source would leave it green. (It did, on the first cut of this
+# arm — caught by mutation-grading the guard away and finding only the static arm
+# reddened.) The unguarded control runs alongside it so the arm cannot pass by the
+# probe simply never failing.
+_probe() {  # $1 = tail to append to the assignment
+  bash -c 'set -euo pipefail
+f() {
+  local _inst_for_repo
+  _inst_for_repo=$(sh -c "exit 22" | jq -r ".id // empty" 2>/dev/null)'"$1"'
+  echo "FALLBACK-REACHED:[${_inst_for_repo}]"
+}
+f' 2>/dev/null
+}
+_src_tail=""
+grep -qE "jq -r '\.id // empty'\) \|\| _inst_for_repo=" "$SRC/cmd_push.sh" && _src_tail=' || _inst_for_repo=""'
+_src_out="$(_probe "$_src_tail")"          # the shape cmd_push.sh actually has
+_unguarded_out="$(_probe "")"              # negative control: no guard at all
+if [[ "$_src_out" == "FALLBACK-REACHED:[]" && -z "$_unguarded_out" ]]; then
+  ok_t "installation: the SOURCE's assignment shape reaches the fallback under set -e (DIVE-2566)"
+else
+  bad_t "installation: source shape survives a failing lookup (DIVE-2566)" \
+        "source shape gave '${_src_out:-<died before the fallback>}', unguarded control gave '${_unguarded_out:-<died, correct>}' — the source's own shape must reach the fallback AND the unguarded control must not"
+fi
+
 echo "-----"
 printf 'push_unit: %d passed, %d failed\n' "$PASS" "$FAIL"
 [[ $FAIL -eq 0 ]]

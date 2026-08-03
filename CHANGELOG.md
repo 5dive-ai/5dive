@@ -31,6 +31,37 @@ Two things keep the badge believable, and both are mutation-covered by
 An unreadable credential is `unknown`, never an alarm — the same rule the deaf check
 follows, and the legend says outright that `ok` means the credential file is present and
 unexpired, not that it was probed.
+## Unreleased — fix(push): the per-repo installation lookup could not fail, so its own fallback was dead code (DIVE-2566)
+
+DIVE-2563 taught `_push_do` to ask GitHub which installation owns the target repo instead of
+minting against one pinned `GITHUB_APP_INSTALLATION_ID`, with a documented fallback to the
+pinned id "when the lookup cannot answer". That fallback was **unreachable in exactly the case
+it was written for.**
+
+`curl -fsS` exits 22 on any HTTP >= 400, `pipefail` promotes that through the `| jq`, and a bare
+`var=$(...)` under the `set -euo pipefail` in `src/header.sh` takes the whole script down. The
+lookup 404s precisely when the repo sits outside every installation — which is the condition the
+fallback exists to survive — so delegated push to any `lodar/*` repo died with a bare `rc=22`,
+curl's exit code, from a namespace that shares no numbers with our own `E_` codes and carries no
+message. dev3 lost an hour to it on DIVE-1560 reading it as a sudo-grant problem.
+
+The fix is `|| _inst_for_repo=""` on the assignment. Empty rather than `|| true` because it
+states the post-condition the fallback branch actually reads.
+
+**The trap worth naming, because the code was written the careful way.** `local _inst_for_repo`
+sits on its own line, split from the assignment — the standard habit, since `local x=$(cmd)`
+always returns 0 and hides the command's failure. Here that correct habit is what made the
+failure fatal: splitting the declaration *stops masking* an error, and this probe is *allowed*
+to fail. **Splitting the declaration is necessary to see a probe's failure and not sufficient to
+handle it**; a probe that may legitimately fail needs the failure handled explicitly.
+
+Graded by mutation rather than by assertion count: removing the guard reddens both new arms
+(92/2), restoring it returns 94/0. `push_unit` 92 -> 94. The behavioural arm derives the shape it
+runs **from `cmd_push.sh` itself** — an inline guarded-vs-unguarded demo stayed green under that
+mutation on the first cut of this test, which is the reason the arm is written the way it is.
+
+This does not make `lodar/*` repos pushable. The App still has no installation on that account
+(DIVE-2033, a human-only step); this converts a silent `rc=22` into the intended named refusal.
 
 ## Unreleased — fix(task): the mandatory merge-gate now catches a branch cited in prose, not just a PR (DIVE-2577)
 

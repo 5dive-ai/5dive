@@ -109,4 +109,28 @@ if ! grep -qE '^readonly FIVE_VERSION="[^"]+"' "$OUT"; then
   exit 1
 fi
 
+# DIVE-2097: src/lib/self.sh must precede every five_self_bundle consumer in the cat
+# list above. Each consumer opens with `declare -F five_self_bundle ||
+# source ".../lib/self.sh"` — dead code in the bundle, load-bearing in the split tree
+# (see src/lib/self.sh and community/wiki/command-v-answers-the-wrong-question.md
+# rule 5). That property only held because the cat list ABOVE was hand-ordered with a
+# prose comment ("Order matters: ... lib/ helpers -> cmd_*"); nothing enforced it. If a
+# future consumer ever lands ahead of lib/self.sh in the list, the guard fires inside
+# the bundle where dirname "$BASH_SOURCE" is the INSTALL dir and lib/self.sh does not
+# exist — the source fails, and `set -euo pipefail` (src/header.sh) takes the whole CLI
+# down. Checked on the built artifact rather than the cat list text so this also catches
+# a future refactor that stops concatenating from a fixed file list.
+def_line="$(grep -n '^five_self_bundle() {' "$OUT" | head -1 | cut -d: -f1)"
+if [[ -z "$def_line" ]]; then
+  echo "error: $OUT has no five_self_bundle definition — check src/lib/self.sh" >&2
+  exit 1
+fi
+guard_line="$(grep -n 'declare -F five_self_bundle' "$OUT" | head -1 | cut -d: -f1)"
+if [[ -n "$guard_line" && "$def_line" -gt "$guard_line" ]]; then
+  echo "error: $OUT defines five_self_bundle at line $def_line, AFTER the first" >&2
+  echo "  consumer guard at line $guard_line. src/lib/self.sh must be cat'd before" >&2
+  echo "  every five_self_bundle consumer — fix the file order in build.sh." >&2
+  exit 1
+fi
+
 echo "built $OUT ($(wc -l < "$OUT") lines, $(grep -oE '^readonly FIVE_VERSION="[^"]+"' "$OUT" | cut -d'"' -f2)) + $OUT.sha256 ($(cut -c1-16 "$OUT.sha256")…)"

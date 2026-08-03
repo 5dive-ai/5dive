@@ -38,6 +38,13 @@ npm-debug.log*
 # leaves them behind, and `git add -A` in the same tree would commit them (it did).
 tests/.probe-*
 
+# DIVE-2097: transient mutated build.sh written by
+# tests/build_bundle_self_order_unit.sh. Can't live under tests/.probe-* above —
+# build.sh does `cd "$(dirname "$0")"`, so the mutant must run from a path that
+# still sees src/, i.e. the repo root — but it is the same "deleted on a clean
+# exit, survives a kill, git add -A would commit it" shape as the probe mutants.
+/.dive2097-mutant-build.sh
+
 # DIVE-2091: the built bundle is generated at TAG time by release-cut.yml,
 # never committed on main — a 47k-line generated file on main invalidates every
 # open PR on every merge. install.sh fetches it from the tag's tree.
