@@ -1,5 +1,45 @@
 # Changelog
 
+## Unreleased — feat(a2a): stamp `via=` when the claimed sender and the measured caller diverge (DIVE-2552)
+
+Every `[5dive-msg ...]` stamp site already held both values and never compared them:
+
+```bash
+sender="$from"                       # CLAIMED  — from --from=, format-validated only
+_caller="$(_envelope_caller)"        # MEASURED — EUID-first, not settable by a flag
+_tier="$(envelope_tier "$_caller")"  # ...the measured one was used for tier=, and nothing else
+```
+
+So `5dive agent send X --from=marcus`, run by dev, rendered
+`[5dive-msg from=marcus id=... tier=admin]` — byte-for-byte identical to a send marcus
+actually made. `tier=` does not catch it: DIVE-1064/2210 built that field against a
+**cross-tier** peer, and dev and marcus are both `admin`, so the unforgeable field agrees
+with the forged one and corroborates it.
+
+Now the two are compared at all three acceptors (`send`, `ask`, `_deliver`) and the result
+is stamped:
+
+```
+[5dive-msg from=marcus id=… tier=admin]                              marcus really sent it
+[5dive-msg from=marcus id=… tier=admin via=dev]                      dev asserted --from=marcus
+[5dive-msg from=marcus id=… tier=unknown:no-caller via=unknown:no-caller]   nothing measured the claim
+```
+
+Not a refusal, deliberately: rejecting a `--from` that is not the caller breaks the
+legitimate synthetic-label senders (`loop`, `task-engine`, `council`, `verifier`, `ask`,
+`comment-watch`, `blocker-push`, `community-heartbeat`), none of which are agent names.
+The marker keeps them working and hands the receiver the fact instead.
+
+`via=` is absent on the ordinary path, and absence is itself a measurement — it is
+produced by exactly one branch (measured, and the claim matched). Every path that could
+not measure stamps a reason (`unknown:no-caller`, `unknown:malformed-caller`) rather than
+nothing, which is DIVE-2210's property carried onto the new field. Reading the output:
+absence of `via=` means "built before this release" **or** "the claim matched" — it does
+not mean "unchecked".
+
+`via=` is exactly as trustworthy as `tier=` and no more: both come from the same
+EUID-first `_envelope_caller` resolver.
+
 ## Unreleased — fix(push): resolve the App installation PER REPO, not from one pinned id (DIVE-2563)
 
 `_push_do` minted every installation token against a single `GITHUB_APP_INSTALLATION_ID`

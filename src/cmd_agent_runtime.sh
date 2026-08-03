@@ -1141,6 +1141,13 @@ cmd_deliver() {
   local header="[5dive-msg from=${s}"
   [[ -n "$msgid" ]] && header+=" id=${msgid}"
   header+=" tier=${tier}"
+  # DIVE-2552: _deliver accepts no --from, so from= is DERIVED and normally
+  # matches by construction — via= stays absent and this path is unchanged. The
+  # one case it is not: a non-agent caller renders the synthetic `from=human`
+  # with nothing measured behind it, which is the same unchecked claim as a
+  # spoofed --from. Stamped through the same resolver so all three sites agree.
+  local _via; _via="$(envelope_via "$s" "$_caller")"
+  [[ -n "$_via" ]] && header+=" via=${_via}"
   header+="]"
   local payload="${header} ${message}"
 
@@ -1726,6 +1733,12 @@ cmd_send() {
       _tier="$(envelope_tier "$_caller")"
       local header="[5dive-msg from=${sender} id=${msg_id}"
       header+=" tier=${_tier}"
+      # DIVE-2552: `sender` (claimed) and `_caller` (measured) have both been in
+      # hand here since 2281 and were never compared, so a same-tier `--from`
+      # spoof had no tell. Stamped only when they DIVERGE, so the ordinary send
+      # is unchanged; an unmeasurable caller stamps a reason rather than nothing.
+      local _via; _via="$(envelope_via "$sender" "$_caller")"
+      [[ -n "$_via" ]] && header+=" via=${_via}"
       [[ -n "$reply_to_chat" ]] && header+=" reply-to-chat=${reply_to_chat}"
       [[ -n "$reply_to_msg" ]] && header+=" reply-to-msg=${reply_to_msg}"
       header+="]"
@@ -1926,6 +1939,11 @@ cmd_ask() {
     # tier=unknown:no-caller — two fields disagreeing about one sender.
     local _dcaller; _dcaller="$(_envelope_caller)"
     local header="[5dive-msg from=${sender} id=${msg_id} tier=$(envelope_tier "$_dcaller")"
+    # DIVE-2552: the weaker of the two acceptors — `ask` falls back to the literal
+    # label "ask" when no caller can be derived, so `from=ask` reads the same
+    # whether it was measured or invented. Compare and stamp, as `send` does.
+    local _dvia; _dvia="$(envelope_via "$sender" "$_dcaller")"
+    [[ -n "$_dvia" ]] && header+=" via=${_dvia}"
     [[ -n "$reply_to_chat" ]] && header+=" reply-to-chat=${reply_to_chat}"
     [[ -n "$reply_to_msg" ]] && header+=" reply-to-msg=${reply_to_msg}"
     header+="]"
