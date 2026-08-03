@@ -123,6 +123,10 @@ done
 # --- T4: THE REPORTED TERM IS THE TERM, not the term plus its boundary char.
 #     The wrapper widens BASH_REMATCH[0] to " press"; the filer reads this string
 #     in the warn line and in the refusal, so it must stay clean. --------------
+_term=$(_gate_tier2_floor_term "press")
+[[ "$_term" == "press" ]] \
+  && ok_t "T4 start-of-string branch reports 'press'" \
+  || bad_t "T4 start-of-string term reported" "got '${_term}'"
 _term=$(_gate_tier2_floor_term "we need a press release")
 [[ "$_term" == "press" ]] \
   && ok_t "T4 reported term is 'press', not ' press' (boundary char not leaked)" \
