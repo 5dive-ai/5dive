@@ -471,7 +471,7 @@ cmd_heartbeat_wake_mode() {
     *) fail "$E_VALIDATION" "bad mode '$mode' (use: always_on | cold)" ;;
   esac
   if [[ "$mode" == "cold" ]] && _hb_wake_protected "$name"; then
-    fail "$E_VALIDATION" "'$name' is a protected always-on agent (customer-facing/critical; e.g. main, marketing) — refusing wake_mode=cold (olivia condition 3)"
+    fail "$E_VALIDATION" "'$name' is a protected always-on agent — refusing wake_mode=cold"
   fi
   [[ -z "$cap" || "$cap" =~ ^[0-9]+$ ]] || fail "$E_VALIDATION" "bad --cap '$cap' (whole number of wakes/day)"
   [[ -z "$sleep_after" || ( "$sleep_after" =~ ^[0-9]+$ && "$sleep_after" -gt 0 ) ]] || fail "$E_VALIDATION" "bad --sleep-after '$sleep_after' (whole number of idle minutes > 0)"

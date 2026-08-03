@@ -65,7 +65,7 @@ out=$(cmd_task_start DIVE-301 --no-preflight 2>&1); rc=$?
 [[ "$(scheduleof DIVE-301)" == "0 2 * * *" ]] \
   && ok_t "T1 schedule survives the refused start" \
   || bad_t "T1 schedule intact" "schedule=$(scheduleof DIVE-301)"
-[[ "$out" == *"DIVE-2059"* && "$out" == *"TEMPLATE"* ]] \
+[[ "$out" == *"task cancel"* && "$out" == *"TEMPLATE"* ]] \
   && ok_t "T1 refusal carries an actionable, attributed message" \
   || bad_t "T1 actionable message" "out=$out"
 

@@ -209,7 +209,7 @@ _goal_validate_plan() {
   while IFS=$'\t' read -r lid risk text; do
     [[ -n "$lid" ]] || continue
     if [[ "$risk" == "low" ]] && _gate_tier2_floor_hit "$text"; then
-      fail "$E_VALIDATION" "task $lid is declared risk=low but its text implies a Tier-2 action (spend/publish/secret/destructive/brand) — the planner cannot lower a tier"
+      fail "$E_VALIDATION" "task $lid is declared risk=low but its text implies a Tier-2 action — the planner cannot lower a tier"
     fi
   done < <(printf '%s' "$plan" | jq -r '.tasks[] | "\(.local_id)\t\(.risk//"low")\t\(.title) \(.body//"")"')
 
@@ -403,9 +403,9 @@ _goal_approve_from_gate() {
   nans=$(db "SELECT COALESCE(need_answer,'')     FROM tasks WHERE id=${id};")
   nby=$(db "SELECT COALESCE(need_answered_by,'') FROM tasks WHERE id=${id};")
   [[ -n "$nt" ]]  || fail "$E_CONFLICT" "$ident carries no gate to approve"
-  [[ -n "$nat" ]] || fail "$E_CONFLICT" "$ident's plan gate is not answered yet — a human must approve it first (tap the button in Telegram / dashboard), then re-run"
+  [[ -n "$nat" ]] || fail "$E_CONFLICT" "$ident's plan gate is not answered yet — a human must approve it first, then re-run"
   [[ "$nby" == human:* ]] \
-    || fail "$E_AUTH_REQUIRED" "$ident's plan gate was not cleared by a human (answered by '${nby:-?}') — a plan may only be materialized on a HUMAN approval (DIVE-916); an agent/TTL-cleared gate cannot build it"
+    || fail "$E_AUTH_REQUIRED" "$ident's plan gate was cleared by '${nby:-?}', not a human — a plan materializes only on a HUMAN approval"
   [[ "$nans" == "approve" ]] \
     || fail "$E_CONFLICT" "$ident's plan gate was answered '${nans}', not 'approve' — nothing materialized (revise via re-planning, DIVE-982)"
 

@@ -210,7 +210,7 @@ cmd_gh() {
       # cannot perform one, so honouring the flag here would trade a clear
       # refusal for a 403 the caller has to decode.
       if [[ "$class" == "admin" ]]; then
-        fail "$E_CONFLICT" "refusing --as=bot for an admin-class operation: 5dive-bot is admin=false on every repo (measured DIVE-2444), so this cannot succeed as the bot. Re-run without --as=bot to use your own credential."
+        fail "$E_CONFLICT" "refusing --as=bot for an admin-class operation: 5dive-bot is admin=false — re-run without --as=bot"
       fi
       actor="bot"; reason="you asked for --as=bot" ;;
     auto)
@@ -240,7 +240,7 @@ cmd_gh() {
   # so ask sudo directly, and only after a failure (the probe costs nothing on the
   # happy path). `sudo -n -l <cmd>` is 0 exactly when this account may run it.
   if [[ $rc -ne 0 ]] && ! sudo -n -l /usr/local/bin/5dive _gh_do >/dev/null 2>&1; then
-    fail "$E_GENERIC" "routing to 5dive-bot needs the NOPASSWD grant for '/usr/local/bin/5dive _gh_do', which this account does not have — so nothing ran and this says NOTHING about the gh call itself. A builder agent gets the grant with 'agent create --can-push'; meanwhile re-run with --as=caller, which works today and records the write as the human account."
+    fail "$E_GENERIC" "routing to 5dive-bot needs a NOPASSWD grant this account lacks, so nothing ran — re-run with --as=caller"
   fi
   return $rc
 }
@@ -282,7 +282,7 @@ cmd_gh_do() {
   [[ "$class" == "admin" ]] && fail "$E_CONFLICT" "_gh_do refuses an admin-class operation: 5dive-bot is admin=false on every repo, so this cannot succeed as the bot."
 
   [[ -r "$_GH_BOT_ENV" ]] \
-    || fail "$E_GENERIC" "machine-account credential is not provisioned: $_GH_BOT_ENV is missing or unreadable. Provision it with '5dive secret write ${_GH_BOT_KEY} --connector=github-bot'."
+    || fail "$E_GENERIC" "machine-account credential missing ($_GH_BOT_ENV) — 5dive secret write ${_GH_BOT_KEY} --connector=github-bot"
   local tok
   # shellcheck disable=SC1090
   tok=$(set -a; . "$_GH_BOT_ENV"; set +a; printf '%s' "${GH_BOT_TOKEN:-}")

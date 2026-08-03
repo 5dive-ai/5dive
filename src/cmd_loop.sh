@@ -892,7 +892,7 @@ cmd_loop_panel() {
   # Escalate-with-proof on any non-clean halt (design §4).
   if [[ "$loop_status" == "escalated" || "$loop_status" == "killed" ]] && [[ "$by_task_sql" != "NULL" ]]; then
     cmd_task_need "$by_task_sql" --type=approval \
-      --ask="loop ${loop_id} panel halted (${final_status}, ~${spent}tok/${eff_ceiling}); ${pass_votes} pass / ${fail_votes} fail so far (quorum ${eff_quorum}). Continue, adjust, or stop?" \
+      --ask="loop ${loop_id} halted (${final_status}, ~${spent}tok/${eff_ceiling}); ${pass_votes} pass / ${fail_votes} fail" \
       >/dev/null 2>&1 || true
   fi
 

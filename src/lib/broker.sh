@@ -103,7 +103,7 @@ broker_gate_check() {
   gsig=$(db "SELECT COALESCE(need_answer_sig,'')      FROM tasks WHERE id=${id};")
   reviewer=$(db "SELECT COALESCE(routed_reviewer,'')  FROM tasks WHERE id=${id};")
   if [[ -z "$gtype" ]]; then
-    fail "$E_VALIDATION" "no gate on ${ident}: file a ${noun}-for-review gate first (5dive task need ${ident} --type=approval --ask='${ask}') — a ${noun}-for-review ask files as a lead-routed tier-1 gate the org lead can clear (not a human-only tier-2 in the human's DM), and ${noun} runs once a human OR that lead clears it."
+    fail "$E_VALIDATION" "no ${noun}-for-review gate on ${ident} — file one: 5dive task need ${ident} --type=approval --ask='${ask}'"
   fi
   if [[ -z "$gansweredat" ]]; then
     fail "$E_VALIDATION" "gate on ${ident} is OPEN (unanswered ${gtype}) — ${noun} refused until it clears (5dive task answer ${ident} ...)."
@@ -163,7 +163,7 @@ broker_gate_check() {
   fi
   if [[ "$require_sig" == "1" ]] \
       && ! _gate_closure_verify "$id" "$gtype" "$ganswer" "$gby" "$gansweredat" "$guid" "$gsig"; then
-    fail "$E_VALIDATION" "gate on ${ident} has no valid signed closure — delegated ${noun} refused (the authoritative gate record may be unsigned or tampered)."
+    fail "$E_VALIDATION" "gate on ${ident} has no valid signed closure — delegated ${noun} refused"
   fi
 }
 
@@ -197,10 +197,10 @@ broker_bind_target() {
   local ticket; ticket=$(broker_surface "$surface" ticket)
   local task_value; task_value=$(broker_task_target "$surface" "$id")
   if [[ -z "$task_value" ]]; then
-    fail "$E_VALIDATION" "task ${ident} declares no ${target} — add a '${key}: <name>' line to its body so the cleared gate binds to a specific ${target} (delegated ${noun} refuses an unbound ${target})."
+    fail "$E_VALIDATION" "task ${ident} declares no ${target} — add a '${key}: <name>' line to its body, then retry"
   fi
   if [[ "$value" != "$task_value" ]]; then
-    fail "$E_VALIDATION" "${target} '${value}' is not the ${target} bound to ${ident}'s cleared gate ('${task_value}') — a cleared gate authorizes only its task's own declared ${target}. ${Noun} refused (${ticket})."
+    fail "$E_VALIDATION" "'${value}' is not the ${target} bound to ${ident}'s cleared gate ('${task_value}') — ${noun} refused"
   fi
 }
 

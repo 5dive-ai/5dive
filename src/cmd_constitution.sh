@@ -147,13 +147,13 @@ _constitution_init() {
   # silently rewrite governed policy — route to the sanctioned amend path. --force does NOT override.
   local sealed; sealed="$(_council_sealed_constitution_digest 2>/dev/null || true)"
   if [[ -n "$sealed" ]]; then
-    fail "$E_VALIDATION" "a Council has SEALED this constitution (digest ${sealed:0:12}…) — 'init' will not clobber governed policy. Amend via 'sudo 5dive council amend --file=…' (org) or 'sudo 5dive constitution edit' (solo re-seal)."
+    fail "$E_VALIDATION" "a Council has SEALED this constitution (${sealed:0:12}…) — amend it: sudo 5dive council amend --file=…"
   fi
 
   # Anti-clobber (soft): an unsealed constitution.yaml already exists — don't blow away hand edits
   # without an explicit --force.
   if [[ -f "$cpath" && $force -eq 0 ]]; then
-    fail "$E_VALIDATION" "$cpath already exists (unsealed) — refusing to overwrite. Pass --force to replace it with the fresh default, or edit it with 'sudo 5dive constitution edit'."
+    fail "$E_VALIDATION" "$cpath already exists (unsealed) — pass --force to replace it, or run: sudo 5dive constitution edit"
   fi
 
   local dir; dir="$(mktemp -d -t 5dive-constitution-init.XXXXXX)" || fail "$E_GENERIC" "mktemp failed"
@@ -239,7 +239,7 @@ _constitution_set() {
   local stdin_write=0
   if [[ "$verb" == "set" && -z "$file" ]] && (( JSON_MODE )); then
     stdin_write=1
-    [[ ! -t 0 ]] || fail "$E_USAGE" "constitution set --json reads a structured-field JSON patch from STDIN — pipe it in (e.g. echo '{\"ship\":{\"require_ci\":true}}' | sudo 5dive constitution set --json). Use 'set --file=' for a full YAML write."
+    [[ ! -t 0 ]] || fail "$E_USAGE" "constitution set --json reads a JSON patch from STDIN — pipe it in, or use 'set --file=' for a full YAML write"
     local cur_path merged="$dir/merged.yaml" merr
     cur_path="$(_council_constitution_path)"
     if ! merr="$(node "$dir/cli.mjs" constitution-merge --path="$cur_path" 2>&1 >"$merged")"; then
@@ -248,7 +248,7 @@ _constitution_set() {
     file="$merged"
   fi
 
-  [[ -n "$file" ]] || fail "$E_USAGE" "constitution $verb needs --file=<proposed constitution.yaml> (or 'set --json' with a structured-field JSON patch on STDIN)"
+  [[ -n "$file" ]] || fail "$E_USAGE" "constitution $verb needs --file=<constitution.yaml>, or 'set --json' with a JSON patch on STDIN"
   [[ -f "$file" ]] || fail "$E_NOT_FOUND" "no such file: $file"
   # ONE parser: validate the proposed doc with the SAME engine normalizer the read verb uses.
   # loadConstitution always exits 0 (it emits {valid, error} in the payload, defaulting when a file
@@ -292,7 +292,7 @@ _constitution_set() {
   local cpath; cpath="$(_council_constitution_path)"
   mkdir -p "$COUNCIL_DIR" 2>/dev/null || true
   if [[ ! -w "$COUNCIL_DIR" ]]; then
-    fail "$E_PERMISSION" "constitution $verb seals the governance file — it writes ${COUNCIL_DIR} + ${cpath} (root-owned) and must be sudo-run: sudo 5dive constitution $verb --file=$file"
+    fail "$E_PERMISSION" "constitution $verb writes root-owned governance files — run: sudo 5dive constitution $verb --file=$file"
   fi
 
   # A solo genesis already present -> re-seal (init --force), inheriting its principal. Otherwise a
@@ -327,7 +327,7 @@ _constitution_set() {
   fi
   local rc=$?
   if (( rc != 0 )); then
-    fail "$E_GENERIC" "solo direct-seal failed (council init returned $rc) — constitution at $cpath may be updated but UNSEALED; re-run once the cause is fixed"
+    fail "$E_GENERIC" "solo direct-seal failed (council init rc=$rc) — $cpath may be updated but UNSEALED; re-run once fixed"
   fi
   # DIVE-1751: the browser-callable structured write emits the `constitution show --json` envelope the
   # dashboard consumes directly (the freshly sealed digest + guardrails, read back through the one parser).

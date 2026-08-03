@@ -147,7 +147,7 @@ if [[ $RC -ne 0 && "$(statusof DIVE-2556)" == "in_progress" && "$(refusals DIVE-
 else
   bad_t 'DIVE-2556 shape must refuse' "rc=$RC status=$(statusof DIVE-2556) refusals=$(refusals DIVE-2556) out=$OUT"
 fi
-[[ "$OUT" == *"dive-2556-maker-credit"* && "$OUT" == *DIVE-2577* ]] \
+[[ "$OUT" == *"dive-2556-maker-credit"* && "$OUT" == *"landed"* ]] \
   && ok_t 'the refusal names the branch and the ticket' \
   || bad_t 'refusal should name branch + DIVE-2577' "out=$OUT"
 

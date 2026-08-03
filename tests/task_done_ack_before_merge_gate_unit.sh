@@ -126,8 +126,8 @@ as_agent maker cmd_task_deliver "$tid" --pr="$PR1" >/dev/null 2>"$TMP/err"
 
 export GH_STUB_STATE="OPEN" GH_STUB_MERGED=""
 out=$(as_agent verifier cmd_task_done "$tid" 2>&1); rc=$?
-[[ $rc -eq "$E_CONFLICT" && "$out" == *"DIVE-1830"* ]] \
-  && ok_t "T2 done-before-start is refused by the merge gate exactly as before (E_CONFLICT, DIVE-1830)" \
+[[ $rc -eq "$E_CONFLICT" && "$out" == *"not merged to main"* ]] \
+  && ok_t "T2 done-before-start is refused by the merge gate exactly as before (E_CONFLICT)" \
   || bad_t "T2 refusal" "rc=$rc (want $E_CONFLICT) out=$out"
 [[ "$(statusof "$tid")" != "done" ]] \
   && ok_t "T2 the task did NOT close" \

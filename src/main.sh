@@ -347,6 +347,10 @@ main() {
   # it that touched the store would be fenced against its own entrypoint.
   _TASKS_STORE_ENTRY=cli
 
+  # The argv this process was invoked with, so require_root's hint can name the
+  # command the caller actually typed instead of a bare `sudo 5dive `.
+  FIVE_ARGV=("$@")
+
   # Global --json: strip every occurrence before dispatch so each subcommand
   # gets the same arg shape regardless of where the flag was placed.
   local -a rest=()

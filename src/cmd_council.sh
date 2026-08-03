@@ -2619,7 +2619,7 @@ function knownRegistryAgents() {
 function preflightSeats(seats) {
   const known = knownRegistryAgents()
   if (known === null) {
-    die("council pre-flight FAILED: could not read the agent registry (`5dive agent list --json`) — refusing to convene rather than silently abstain unreachable seats.", 6)
+    die("council pre-flight FAILED: could not read the agent registry (5dive agent list --json) — refusing to convene", 6)
   }
   const unresolved = seats
     .map(s => ({ id: (s && s.id) || String(s), agent: E.resolveSeatAgent(s) }))
@@ -2648,7 +2648,7 @@ function canDeliver() {
 }
 function preflightDelivery() {
   if (canDeliver()) return
-  die("council pre-flight FAILED: this caller cannot reach the seat-delivery rail — `5dive agent _deliver` is root-scoped and `sudo -n` is denied here, so EVERY seat ballot would fail on delivery and be recorded as an abstain (a permissions outage sealing as a unanimous abstention). Re-run the convene as root (`sudo 5dive council convene ...`), or re-provision this agent so it holds the `_deliver` grant. Refusing to convene.", 6)
+  die("council pre-flight FAILED: no _deliver grant here, so every seat would abstain — re-run as: sudo 5dive council convene", 6)
 }
 
 // DIVE-1739: seat LIVENESS map — registry name -> health {asleep,deaf,...} from `agent list --json`.
@@ -3014,7 +3014,7 @@ function cmdBench() {
   // `sudo bench rm council` would bypass the whole governance layer). Motions land in a later
   // wave; until then the guard is the load-bearing invariant.
   if ((action === 'add' || action === 'rm') && positionals[1] === 'council') {
-    die("'council' is the primary governance body — its seats change ONLY via promote/demote motions, never raw bench add/rm (re-seed the whole roster with: sudo 5dive council init --force).", 7)
+    die("'council' seats change only via promote/demote motions — to re-seed: sudo 5dive council init --force", 7)
   }
   if (action === 'add') {
     const name = positionals[1]; if (!name) die('bench add needs a name')
@@ -3981,7 +3981,7 @@ _council_veto() {
   [[ -n "$rcanon" ]] || fail "$E_GENERIC" "sealed receipt carries no canonical bytes to re-verify (fail-closed)"
   if [[ "$(id -u)" -eq 0 ]]; then rseal="$(printf '%s' "$rcanon" | cmd_gate_proof_sign_stdin 2>/dev/null)" || rseal=""
   else rseal="$(printf '%s' "$rcanon" | sudo -n 5dive gate-proof sign 2>/dev/null)" || rseal=""; fi
-  [[ -n "$rseal" ]] || fail "$E_GENERIC" "cannot re-seal the receipt canonical (need root + an enforce key) — refusing to trust an unverifiable receipt (fail-closed)"
+  [[ -n "$rseal" ]] || fail "$E_GENERIC" "cannot re-seal the receipt canonical (needs root + an enforce key) — refusing an unverifiable receipt"
   [[ "$rseal" == "$rcpt_digest" ]] || { _council_veto_audit "receipt-tampered" "$rcpt_digest"; fail "$E_PERMISSION" "receipt canonical does not re-seal to its sealedDigest — the receipt was tampered (refused + logged, fail-closed)"; }
 
   # AUTHENTICATE the tap: sha256(presented nonce) must equal the nonce DIGEST minted for THIS offer.
@@ -4260,7 +4260,7 @@ _council_init_or_lineage() {
 
   # ---- init (sudo-gated, one-time) ----------------------------------------
   if [[ ! -w "$COUNCIL_DIR" ]]; then
-    fail "$E_PERMISSION" "council init seeds the governance body — it writes ${COUNCIL_DIR} (root-owned) and must be human/sudo-run: sudo 5dive council init $*"
+    fail "$E_PERMISSION" "council init writes root-owned governance files — run: sudo 5dive council init $*"
   fi
   # Resolve the veto principal up front so init refuses an unresolvable one BEFORE any write.
   local principal="" seats_flag="" threshold_flag="" assume_yes=0 forced=0 a
@@ -4290,7 +4290,7 @@ _council_init_or_lineage() {
 
   [[ -n "$principal" ]] || fail "$E_USAGE" "council init needs --veto=<principal> (e.g. human:main)"
   local resolved; resolved="$(_council_resolve_principal "$principal")"
-  [[ -n "$resolved" ]] || fail "$E_USAGE" "veto principal '$principal' did not resolve to a real recipient — init rejects an unknown principal (fail-closed). Use human:<agent> (a paired agent) or tg:<user_id>."
+  [[ -n "$resolved" ]] || fail "$E_USAGE" "veto principal '$principal' did not resolve — use human:<agent> (a paired agent) or tg:<user_id>"
 
   # DIVE-2278: a tg:<digits> principal is the ONE form the display filter cannot save. The
   # principal string is copied verbatim into the canonical bytes that get SEALED into genesis,
@@ -4553,7 +4553,7 @@ _council_seal_stdin() {
 # founder-veto principal (from genesis), and the sealed lineage head (seq + digest).
 _council_roster() {
   local dir="$1"
-  [[ -f "$COUNCIL_GENESIS" ]] || fail "$E_VALIDATION" "the Council has no genesis roster — human-seed it first: sudo 5dive council init --seats=<a:chair,b,c> --threshold=<spec> --veto=<principal>"
+  [[ -f "$COUNCIL_GENESIS" ]] || fail "$E_VALIDATION" "the Council has no genesis roster — seed it: sudo 5dive council init --seats=<a:chair,b,c> --threshold=<spec> --veto=<p>"
   # DIVE-1664: derive the roster VIEW from the ROOT-SEALED lineage — the SAME source `promote`/
   # `demote` mutate — so `roster` can never disagree with `log`/the lineage about membership. The
   # current roster = the LATEST lineage record that carries seats (genesis or a motion; a veto entry
@@ -4721,7 +4721,7 @@ _council_motion() {
   local dir="$1" kind="$2"; shift 2
   mkdir -p "$COUNCIL_DIR" 2>/dev/null || true
   if [[ ! -w "$COUNCIL_DIR" ]]; then
-    fail "$E_PERMISSION" "council $kind mutates the governance roster — it writes ${COUNCIL_DIR} (root-owned) and must be sudo-run: sudo 5dive council $kind $*"
+    fail "$E_PERMISSION" "council $kind writes the root-owned governance roster — run: sudo 5dive council $kind $*"
   fi
   [[ -f "$COUNCIL_GENESIS" && -f "$COUNCIL_LINEAGE" ]] || fail "$E_VALIDATION" "the Council has no genesis roster — seed it first: sudo 5dive council init …"
   local subject="" lens="" mode="adversarial" dry=0 a
@@ -4815,7 +4815,7 @@ _council_amend() {
   local dir="$1"; shift
   mkdir -p "$COUNCIL_DIR" 2>/dev/null || true
   if [[ ! -w "$COUNCIL_DIR" ]]; then
-    fail "$E_PERMISSION" "council amend rewrites the constitution — it writes ${COUNCIL_DIR} + $(_council_constitution_path) (root-owned) and must be sudo-run: sudo 5dive council amend $*"
+    fail "$E_PERMISSION" "council amend rewrites the root-owned constitution — run: sudo 5dive council amend $*"
   fi
   [[ -f "$COUNCIL_GENESIS" && -f "$COUNCIL_LINEAGE" ]] || fail "$E_VALIDATION" "the Council has no genesis roster — seed it first: sudo 5dive council init …"
   local file="" mode="deliberate" dry=0 a
@@ -5085,7 +5085,7 @@ cmd_council() {
   case "$sub" in
     ""|-h|--help|help) _council_help; return 0 ;;
     convene|schedule|bench|init|lineage|veto|gate-clear|rot-triage|roster|log|record|verify|promote|demote|expel|amend|sign-vote|verify-votes|ballot-tap) ;;
-    *) fail "$E_USAGE" "unknown council command: $sub (convene|schedule|bench|init|lineage|roster|log|record|verify|promote|demote|expel|amend|veto|gate-clear|rot-triage|sign-vote|verify-votes|ballot-tap)" ;;
+    *) fail "$E_USAGE" "unknown council command: $sub (try: 5dive council --help)" ;;
   esac
 
   local dir; dir="$(mktemp -d -t 5dive-council.XXXXXX)" || fail "$E_GENERIC" "mktemp failed"
