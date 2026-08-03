@@ -469,8 +469,14 @@ _market_usage() {
   --json                                # machine-readable (dashboard/agent feed)
 
   Then: 5dive hire <role> --from-market --dry-run   (preview a real hire, provisions nothing)
-        5dive agent inspect <slug>                  (full install-time disclosure)
+        5dive agent inspect <slug>                  (full install-time disclosure, incl. which harnesses it lands on)
         5dive agent import <slug> --as=<name>       (clone this exact persona)
+        5dive agent import <slug> --as=<name> --type=codex     (DIVE-2568: onto a non-Claude harness)
+
+  A pack is HARNESS-AGNOSTIC. `type` in the catalog is what it was packed as and
+  is only the import default — the persona, memory, avatar and skills are plain
+  markdown and data, and import renders the identity doc into whichever
+  instruction file the target harness actually reads.
 USAGE
 }
 
@@ -562,6 +568,16 @@ cmd_market() {
           ((complete|tostring) + "%") ]|@tsv)' <<<"$filtered" \
     | column -t -s $'\t' | sed 's/^/  /'
   echo
+  # DIVE-2568: nobody should hire something that will not run. The harness set is
+  # derived per pack, but it is IDENTICAL for every pack that does not narrow
+  # itself — so a per-row column would be the same string repeated N times, which
+  # reads as noise and gets skipped. State it once as a property of the catalog,
+  # and let `market show` carry the per-pack answer for the narrowed case.
+  local _agnostic; _agnostic=$(_pack_targets_from "" | paste -sd, - | sed 's/,/, /g')
+  local _narrowed; _narrowed=$(jq -r '[.[] | select(((.targets // []) | length) > 0) | .slug] | length' <<<"$filtered")
+  echo "  lands on: ${_agnostic:-(no hostable harness on this box)}  — every pack imports onto any of these (5dive agent import <slug> --as=<n> --type=<harness>)"
+  (( _narrowed > 0 )) && echo "  ${_narrowed} pack(s) here narrow that set — see 5dive market show <slug>"
+  echo
   echo "  preview: 5dive market show <slug>    ·    hire: 5dive hire <role> --from-market --dry-run"
 }
 
@@ -581,8 +597,13 @@ cmd_market_show() {
   base=$(_marketplace_base); path=$(jq -r '.path' <<<"$pack")
   card=$(curl -fsSL --max-time 15 "${base}/${path}/card.md" 2>/dev/null || true)
 
+  # DIVE-2568: the per-pack harness answer, derived from THIS CLI and narrowed
+  # only if the catalog entry says so. A pack's `type` in the index is what it was
+  # packed as — the import DEFAULT — never a ceiling, so it is rendered as such.
+  local lands_j; lands_j=$(_pack_targets_from "$(jq -r '(.targets // [])[]? | select(type=="string")' <<<"$pack")" | jq -R . | jq -cs 'map(select(. != ""))')
+
   if (( JSON_MODE )); then
-    ok "" '{pack:$p, card:$c}' --argjson p "$pack" --arg c "$card"
+    ok "" '{pack:$p, card:$c, landsOn:$lands}' --argjson p "$pack" --arg c "$card" --argjson lands "$lands_j"
     return
   fi
   # DIVE-2303: a pack stores the family ALIAS ("opus"), never a concrete id, so the
@@ -596,10 +617,13 @@ cmd_market_show() {
   if [[ -z "$_m" ]]; then _mdisp="-"
   elif [[ "$_mres" != "$_m" ]]; then _mdisp="$_m (currently $_mres)"
   else _mdisp="$_m"; fi
-  jq -r --arg mdisp "$_mdisp" "$_MARKET_JQ"'
+  jq -r --arg mdisp "$_mdisp" --argjson lands "$lands_j" "$_MARKET_JQ"'
     "\(.name)  —  \(.rarity // "unranked") · \(.character // "agent")   ·   completeness \(complete)%",
     "  \(.tagline // "")",
     "",
+    "  lands on: " + (if ($lands|length)>0 then ($lands|join(", ")) else "(no hostable harness on this box)" end)
+                  + (if ((.targets // [])|length) > 0 then "   [narrowed by the pack]" else "" end)
+                  + (if (.type // "") != "" then "   (packed as \(.type))" else "" end),
     "  model:   \($mdisp)    effort: \(.effort // "-")",
     "  memory:  " + (if .includesMemory then "seasoned — ships pre-trained (distilled lessons)" else "persona-only (no seeded memory)" end),
     "  skills:  " + (distinct | if length==0 then "(baseline only)" else join(", ") end),
@@ -611,7 +635,8 @@ cmd_market_show() {
   fi
   echo
   echo "  full disclosure:  5dive agent inspect ${slug}"
-  echo "  clone this one:   5dive agent import ${slug} --as=<name>"
+  echo "  clone this one:   5dive agent import ${slug} --as=<name>            (defaults to the harness it was packed as)"
+  echo "  onto a codex/opencode seat:  5dive agent import ${slug} --as=<name> --type=codex"
   echo "  hire by role:     5dive hire <role> --from-market --dry-run"
 }
 
@@ -623,9 +648,99 @@ cmd_market_show() {
 # new agent's tool events — the agentjacking/prompt-injection surface); the rest
 # (skills/plugins added, system-prompt render, seeded recall, adopted signing
 # key) are lower-risk but still material to an informed install decision.
+# DIVE-2568 — WHICH HARNESSES A PACK CAN LAND ON.
+#
+# Target-agnostic, and DERIVED rather than declared. Nothing in packFormat 1 is
+# Claude-specific: persona.yaml, card.md, the manifest, the avatar and memory/
+# are harness-neutral markdown and data. Exactly two questions are harness-bound
+# — WHERE the identity doc goes and WHERE skills go — and both are already
+# answered per type by TYPE_PERSONA_FILE and SKILLS_INSTALL_DIR. So the target
+# set is "every known type whose persona doc has a probe-verified home", which
+# is the DIVE-2223 invariant, nothing new.
+#
+# The consequence is the point of this row: all 19 shipped packs declare
+# config.type "claude" and not one of them has to be republished to become
+# importable onto codex or opencode. A publisher cannot get compatibility wrong
+# because a publisher does not state it.
+#
+# The optional manifest key config.targets NARROWS the set and can never widen
+# it — a pack that genuinely needs one harness may say so, but no pack may claim
+# a harness this CLI cannot render its persona into.
+#
+# DELIBERATELY NOT WRITTEN BY cmd_export. The set is a property of the CLI, not
+# of the pack; baking it in at pack time freezes it on the day it was packed and
+# recreates precisely the drift DIVE-2303 moved back out of index.json. A pack
+# packed today gets a harness added tomorrow for free.
+_pack_targets_from() {   # _pack_targets_from [<newline-separated declared narrowing>]
+  local declared="${1:-}" t
+  while IFS= read -r t; do
+    [[ -n "$t" ]] || continue
+    # An entry with no persona path (hermes, openclaw) is not a target: the
+    # create would succeed and the persona — the pack's whole payload — would
+    # never reach the model. That is a half-import, not an import.
+    [[ -n "${TYPE_PERSONA_FILE[$t]:-}" ]] || continue
+    is_known_type "$t" || continue
+    if [[ -n "$declared" ]] && ! grep -qxF -- "$t" <<<"$declared"; then continue; fi
+    printf '%s\n' "$t"
+  done < <(printf '%s\n' "${!TYPE_PERSONA_FILE[@]}" | sort -u)
+}
+
+# Same set, read through a pack manifest's optional config.targets narrowing.
+_pack_harness_targets() {   # _pack_harness_targets [<manifest.json>]
+  local mf="${1:-}" declared=""
+  if [[ -n "$mf" && -f "$mf" ]]; then
+    declared=$(jq -r '(.config.targets // [])[]? | select(type=="string")' "$mf" 2>/dev/null || true)
+  fi
+  _pack_targets_from "$declared"
+}
+
+# True when the manifest narrows its own target set (vs. the agnostic default).
+_pack_targets_declared() {   # _pack_targets_declared <manifest.json>
+  [[ -f "${1:-}" ]] || return 1
+  jq -e '((.config.targets // []) | length) > 0' "$1" >/dev/null 2>&1
+}
+
+# DIVE-2568 — WHAT A NON-CLAUDE SEAT CANNOT CARRY, named by value.
+#
+# settings.json is Claude Code's file and it is the ONLY sink 5dive has for a
+# pack's model, effort, hooks and plugins. On a codex or opencode seat those four
+# keys have nowhere to go. That is correct and it is not a reason to refuse the
+# import — the persona, memory, avatar and skills are the payload and they all
+# land. What was wrong is that the drop was SILENT: a pack whose manifest reads
+# model "opus" imported onto codex produced an agent running the harness default
+# while the manifest still read "opus", with nothing on screen either way. Same
+# rule DIVE-2565 set for the three things a text file cannot carry — the drop is
+# fine, the silence is not, and the report must name the VALUE (not just the key)
+# so the operator can set it in the harness's own config.
+#
+# Extracted from cmd_import so it is gradeable without root, a network or an
+# agent user: an assertion on the warn STRING grades the rendering, not the
+# condition, and would pass on a branch that never runs. Emits one item per line;
+# empty output means nothing was dropped. Never fails — a report, not a gate.
+# model/effort are the RESOLVED values the import would have written (manifest,
+# then any explicit --model/--effort override, then resolve_model_alias) — NOT
+# re-read from the manifest here. Reporting the manifest's value would name a
+# model the operator never asked for whenever they passed an override, which is
+# the same class of wrong-but-plausible the report exists to prevent.
+_pack_unapplied_on() {   # _pack_unapplied_on <type> <model> <effort> <hooks-present:0|1> <manifest.json>
+  local type="${1:-}" model="${2:-}" effort="${3:-}" hooks_present="${4:-0}" mf="${5:-}"
+  [[ "$type" == "claude" ]] && return 0
+  [[ -n "$model"  ]] && printf 'model=%s\n'  "$model"
+  [[ -n "$effort" ]] && printf 'effort=%s\n' "$effort"
+  (( hooks_present )) && printf 'hooks\n'
+  if [[ -f "$mf" ]] && jq -e '((.plugins // []) | length) > 0' "$mf" >/dev/null 2>&1; then
+    printf 'plugins\n'
+  fi
+  return 0
+}
+
 _pack_disclosure_json() {
   local stage="$1" mf="$1/manifest.json"
   [[ -f "$mf" ]] || { echo '{}'; return 1; }
+  # DIVE-2568: the harness set is part of the install-time disclosure, not a
+  # separate report — `agent inspect`, the import-time print and the market
+  # preview all read it from here, so there is one answer and three renders.
+  local lands_on; lands_on=$(_pack_harness_targets "$mf" | jq -R . | jq -cs .)
   # A persona.yaml is the canonical identity source, so its presence means the
   # pack (re)renders the agent's system prompt (CLAUDE.md). Pre-strip it may also
   # bundle a private signing key the imported agent would adopt (own its identity).
@@ -634,7 +749,8 @@ _pack_disclosure_json() {
     renders=true
     grep -qF "signing_key" "$stage/persona.yaml" && adopts=true
   fi
-  jq -n --argjson m "$(cat "$mf")" --argjson r "$renders" --argjson a "$adopts" '
+  jq -n --argjson m "$(cat "$mf")" --argjson r "$renders" --argjson a "$adopts" \
+        --argjson lands "$lands_on" '
     ($m.hooks // {}) as $h
     | ($m.plugins // []) as $p
     | [$h | .. | objects | .command? // empty] as $cmds
@@ -656,6 +772,12 @@ _pack_disclosure_json() {
                        present: (($pcmds | length) > 0 or ($pHookBlocks | length) > 0) },
         skills:  ($m.skills  // []),
         plugins: ($m.plugins // []),
+        # DIVE-2568. `landsOn` is DERIVED from this CLI; `declaredType` is what
+        # the pack itself was packed as and is only the import DEFAULT, never a
+        # ceiling. `narrowed` says the publisher restricted the set by hand.
+        landsOn:      $lands,
+        declaredType: ($m.config.type // null),
+        narrowed:     ((($m.config.targets // []) | length) > 0),
         rendersSystemPrompt: $r,
         seedsMemory: (($m.includes.memory // false) != false),
         adoptsSigningKey: $a
@@ -691,7 +813,15 @@ _pack_disclosure_print() {
          elif ($p|type)=="array"  then [$p[] | if type=="object" then (.name // "plugin") else tostring end]
          else [] end) as $names
       | if ($names|length)>0 then ($names|join(", ")) else "none" end' <<<"$d")"
-  echo "     system prompt (CLAUDE.md) re-rendered from persona: $(jq -r '.rendersSystemPrompt' <<<"$d")"
+  # DIVE-2568: state the harness set BEFORE the reader decides to install. "Which
+  # seats does this run on" is an install decision, so it belongs in the same
+  # disclosure as "what does it run", not in a separate command.
+  echo "     lands on: $(jq -r '
+      (.landsOn // []) as $l
+      | (if ($l|length)>0 then ($l|join(", ")) else "(no harness on this box can host it)" end)
+      + (if .narrowed then "   [narrowed by the pack]" else "" end)
+      + (if (.declaredType // "") != "" then "   (packed as \(.declaredType))" else "" end)' <<<"$d")"
+  echo "     system prompt re-rendered from persona: $(jq -r '.rendersSystemPrompt' <<<"$d")"
   echo "     seeds recall memory: $(jq -r '.seedsMemory' <<<"$d")"
   echo "     adopts a bundled signing key (owns identity): $(jq -r '.adoptsSigningKey' <<<"$d")"
   echo "  ─────────────────────────────────────────────────────────────"
@@ -1165,24 +1295,83 @@ _agents_md_render() {
   fi
 
   # Memory: fenced, one section per fact, opt-in and already scoped upstream.
-  if [[ -d "$stage/memory" ]] && find "$stage/memory" -maxdepth 1 -name '*.md' 2>/dev/null | grep -q .; then
-    printf '%s\n' "$AGENTS_MD_S_MEMORY"
-    printf '# Memory\n\n'
-    printf 'Distilled persona memory, one fact per section. `5dive agent import`\n'
-    printf 'writes each back to `memory/<file>`; any other harness just reads them.\n\n'
-    local f base fence
-    while IFS= read -r f; do
-      base=$(basename "$f")
-      fence=$(_agents_md_fence "$f")
-      printf '<!-- 5dive:memory-file: %s -->\n' "$base"
-      printf '## memory/%s\n\n' "$base"
-      printf '%s\n' "$fence"
-      cat "$f"
-      # A fact not ending in a newline would swallow the closing fence.
-      [[ -n "$(tail -c1 "$f")" ]] && printf '\n'
-      printf '%s\n\n' "$fence"
-    done < <(find "$stage/memory" -maxdepth 1 -name '*.md' 2>/dev/null | sort)
+  _agents_md_render_memory "$stage"
+}
+
+# The memory half of the render, extracted VERBATIM so cmd_import can reuse it
+# (DIVE-2568). Emits nothing when the stage carries no facts, so callers can call
+# it unconditionally. tests/pack_agents_md_unit.sh grades the export format and is
+# the check that this extraction changed no output — mutation-confirmed: breaking
+# the delegation below reds 3 of its arms.
+_agents_md_render_memory() {
+  local stage="$1"
+  [[ -d "$stage/memory" ]] || return 0
+  find "$stage/memory" -maxdepth 1 -name '*.md' 2>/dev/null | grep -q . || return 0
+  printf '%s\n' "$AGENTS_MD_S_MEMORY"
+  printf '# Memory\n\n'
+  printf 'Distilled persona memory, one fact per section. `5dive agent import`\n'
+  printf 'writes each back to `memory/<file>`; any other harness just reads them.\n\n'
+  local f base fence
+  while IFS= read -r f; do
+    base=$(basename "$f")
+    fence=$(_agents_md_fence "$f")
+    printf '<!-- 5dive:memory-file: %s -->\n' "$base"
+    printf '## memory/%s\n\n' "$base"
+    printf '%s\n' "$fence"
+    cat "$f"
+    # A fact not ending in a newline would swallow the closing fence.
+    [[ -n "$(tail -c1 "$f")" ]] && printf '\n'
+    printf '%s\n\n' "$fence"
+  done < <(find "$stage/memory" -maxdepth 1 -name '*.md' 2>/dev/null | sort)
+  return 0
+}
+
+# DIVE-2568 — MEMORY HAS TO BE IN EFFECT, NOT MERELY PRESENT.
+#
+# The row's acceptance criterion is that a pack hired onto a codex or opencode
+# seat comes up with the persona AND any distilled memory in effect. cmd_import
+# seeds facts to ~/.claude/projects/<slug>/memory — 5dive's own store, which
+# `5dive memory search` reads for ANY agent, so the facts are reachable. They are
+# not LOADED, though: it is the Claude Code harness that auto-injects that store's
+# index each session. A codex seat reads .codex/AGENTS.md and nothing else, so on
+# a foreign harness the memory would sit one command away from an agent with no
+# reason to run it — present, and not in effect. Same shape as the settings.json
+# drop, one layer up.
+#
+# This is what the DIVE-2565 renderer is FOR, applied to the import direction
+# rather than the export one: inline the facts into the instruction file the
+# target harness actually reads, using the same fenced sections and sentinels the
+# single-file export emits. Claude is deliberately excluded — there the store IS
+# auto-loaded, and duplicating every fact into CLAUDE.md would double the system
+# prompt to fix a problem that harness does not have.
+#
+# Rewrites $stage/CLAUDE.md IN PLACE, before persona_install_doc routes it to the
+# harness's own path. Returns 0 when it inlined, 1 when it did not (either not
+# wanted, or it failed and said so) — so the caller reports the mechanism rather
+# than inferring it. A separate function because the alternative is a branch
+# inside cmd_import that only a live root import can reach: an assertion on its
+# warn STRING grades the rendering, not the condition, and stays green on a
+# branch that never runs.
+_pack_inline_memory_into_doc() {   # _pack_inline_memory_into_doc <stage> <type> <mem_inc>
+  local stage="${1:-}" type="${2:-}" mem_inc="${3:-}"
+  local doc="$stage/CLAUDE.md"
+  [[ -f "$doc" ]] || return 1
+  [[ "$type" != "claude" && "$mem_inc" == "distilled" ]] || return 1
+  [[ -d "$stage/memory" ]] || return 1
+  find "$stage/memory" -maxdepth 1 -name '*.md' 2>/dev/null | grep -q . || return 1
+  local inl="$doc.inline.$$" n
+  n=$(find "$stage/memory" -maxdepth 1 -name '*.md' 2>/dev/null | wc -l)
+  if { cat "$doc"; printf '\n'; _agents_md_render_memory "$stage"; } > "$inl" 2>/dev/null \
+     && [[ -s "$inl" ]]; then
+    mv "$inl" "$doc"
+    step "Inlined $n distilled memory fact(s) into the persona doc — a '$type' seat does not auto-load 5dive's memory store"
+    return 0
   fi
+  rm -f "$inl"
+  # NEVER a silent failure: the facts are still seeded and searchable, but this
+  # harness will not load them, and that difference is the whole point of the row.
+  warn "could not inline distilled memory into the persona doc for this '$type' seat — the facts are still seeded and reachable via '5dive memory search', but this harness will not load them automatically"
+  return 1
 }
 
 # Is <file> a 5dive single-file agent export? Anchored on the frontmatter key we
@@ -1714,6 +1903,23 @@ cmd_import() {
   [[ -n "$model" ]] && model=$(resolve_model_alias "$model")
   [[ -n "$type" ]] || { rm -rf "$stage"; fail "$E_VALIDATION" "manifest has no agent type"; }
   is_known_type "$type" || { rm -rf "$stage"; fail "$E_NOT_FOUND" "unknown --type '$type' (known: ${!TYPE_BIN[*]})"; }
+  # DIVE-2568: a pack is target-agnostic, but "agnostic" is not "unbounded" — the
+  # persona has to have somewhere to land. Refuse an unhostable target HERE,
+  # before cmd_create makes a unix account, a home and a systemd unit for an
+  # agent that would come up with none of the character it was hired for.
+  # is_known_type is not enough on its own: hermes and openclaw pass it and have
+  # no TYPE_PERSONA_FILE entry, so today they provision and then silently drop
+  # the entire payload (persona_install_doc warns and returns 1, import carries
+  # on and reports success).
+  local -a _lands=(); mapfile -t _lands < <(_pack_harness_targets "$stage/manifest.json")
+  if ! printf '%s\n' "${_lands[@]+"${_lands[@]}"}" | grep -qxF -- "$type"; then
+    local _why="this CLI has no probe-verified persona path for a '$type' seat, so the pack's identity doc would never reach the model (DIVE-2223)"
+    if _pack_targets_declared "$stage/manifest.json"; then
+      _why="the pack narrows itself to: $(jq -r '(.config.targets // []) | join(", ")' "$stage/manifest.json")"
+    fi
+    rm -rf "$stage"
+    fail "$E_VALIDATION" "this pack cannot be imported onto a '$type' agent — ${_why}. It lands on: ${_lands[*]:-(nothing on this box)}"
+  fi
   [[ -n "$workdir" ]] || workdir="$m_workdir"
   [[ -n "$profile" ]] || profile="$m_profile"
   # DIVE-620: a dashboard marketplace import passes no --auth-profile and packs
@@ -1773,6 +1979,14 @@ cmd_import() {
 
   local cdir="/home/agent-${as}/.claude"
 
+  # DIVE-2568: put distilled memory IN EFFECT for a harness that does not
+  # auto-load 5dive's store. Must run BEFORE the install below, which routes this
+  # same doc to the harness's own instruction path. See _pack_inline_memory_into_doc.
+  local mem_effect="none"
+  if _pack_inline_memory_into_doc "$stage" "$type" "$mem_inc"; then
+    mem_effect="inlined into the persona doc"
+  fi
+
   # Layer the identity doc into the file THIS harness actually reads (DIVE-2223).
   # persona.yaml / avatar.png / settings.json below stay under ~/.claude because
   # 5dive itself reads those; the persona DOC is the one that has to follow the
@@ -1822,6 +2036,17 @@ cmd_import() {
 
   # Layer model/effort/hooks/plugins into settings.json (claude-only keys; others
   # ignore them). settings.json may not exist until first boot.
+  # DIVE-2568 — THE SILENT DROP THIS ROW EXISTS TO REMOVE. See _pack_unapplied_on
+  # for the reasoning; the predicate lives there so it can be graded offline.
+  local cross_dropped='[]'
+  local _hp=0
+  if (( disc_hooks > 0 )) || [[ "$disc_hooks_nonempty" == "true" || "$disc_plugin_hooks" == "true" ]]; then _hp=1; fi
+  local -a _nc=()
+  mapfile -t _nc < <(_pack_unapplied_on "$type" "$model" "$effort" "$_hp" "$stage/manifest.json")
+  if (( ${#_nc[@]} > 0 )); then
+    warn "NOT applied on this '$type' seat (settings.json is Claude Code's file): ${_nc[*]} — set these in the harness's own config; the persona, memory and skills DID land"
+    cross_dropped=$(printf '%s\n' "${_nc[@]}" | jq -R . | jq -cs .)
+  fi
   if [[ "$type" == "claude" ]]; then
     local sfile="$cdir/settings.json" hooks plugins cur
     hooks=$(jq -c '.hooks // {}'     "$stage/manifest.json")
@@ -1883,6 +2108,11 @@ cmd_import() {
       cp "$stage"/memory/*.md "$mdir/" 2>/dev/null || true
       chown -R "agent-${as}:agent-${as}" "$cdir/projects" 2>/dev/null || true
       mem_seeded="$mdir"
+      # DIVE-2568: on a claude seat the store IS the loading mechanism; elsewhere
+      # it is only the searchable one, and the inline above is what puts the facts
+      # in front of the model. Say which happened rather than leaving the reader
+      # to infer it from the type.
+      [[ "$mem_effect" == "none" && "$type" == "claude" ]] && mem_effect="auto-loaded from $mdir"
     else
       mem_seeded="skipped (no workdir to resolve the memory slug)"
     fi
@@ -1935,13 +2165,21 @@ cmd_import() {
   added_j=$(printf '%s\n'   "${added[@]+"${added[@]}"}"   | jq -R . | jq -cs 'map(select(. != ""))')
   skipped_j=$(printf '%s\n' "${skipped[@]+"${skipped[@]}"}" | jq -R . | jq -cs 'map(select(. != ""))')
   local mem_note="no memory"
-  [[ "$mem_inc" == "distilled" ]] && mem_note="distilled memory -> $mem_seeded"
+  [[ "$mem_inc" == "distilled" ]] && mem_note="distilled memory -> $mem_seeded ($mem_effect)"
   local hooks_note="none"
   if (( disc_hooks > 0 )) || [[ "$disc_hooks_nonempty" == "true" || "$disc_plugin_hooks" == "true" ]]; then
     local _pn=""; [[ "$disc_plugin_hooks" == "true" ]] && _pn="+plugin"
     hooks_note="stripped($disc_hooks$_pn)"; (( allow_hooks )) && hooks_note="allowed($disc_hooks$_pn)"
   fi
-  ok "imported '$as' from pack ($mem_note). Skills added: ${#added[@]}, skipped: ${#skipped[@]}; template: $templated; avatar: $avatar_note; hooks: $hooks_note." \
-     '{name:$n, type:$t, memory:$mem, memorySeeded:$ms, skillsAdded:$a, skillsSkipped:$s, template:$tpl, avatar:$av, reported:$ri, hooks:$hk, disclosure:$disc}' \
-     --arg n "$as" --arg t "$type" --arg mem "$mem_inc" --arg ms "$mem_seeded" --argjson a "$added_j" --argjson s "$skipped_j" --arg tpl "$templated" --arg av "$avatar_note" --arg ri "$reported" --arg hk "$hooks_note" --argjson disc "$disclosure"
+  # DIVE-2568: `persona` is where the identity doc actually landed for THIS
+  # harness, and `notApplied` is the machine-readable half of the warn above —
+  # the dashboard renders a cross-harness hire from these two, so neither the
+  # human nor the UI has to infer "did the persona reach a codex seat" from the
+  # absence of an error.
+  local persona_at; persona_at=$(persona_target "$as" "$type" 2>/dev/null || echo "")
+  local lands_j; lands_j=$(printf '%s\n' "${_lands[@]+"${_lands[@]}"}" | jq -R . | jq -cs 'map(select(. != ""))')
+  ok "imported '$as' from pack onto a '$type' seat ($mem_note). Skills added: ${#added[@]}, skipped: ${#skipped[@]}; template: $templated; avatar: $avatar_note; hooks: $hooks_note." \
+     '{name:$n, type:$t, persona:$pa, landsOn:$lands, notApplied:$nap, memory:$mem, memorySeeded:$ms, memoryInEffect:$me, skillsAdded:$a, skillsSkipped:$s, template:$tpl, avatar:$av, reported:$ri, hooks:$hk, disclosure:$disc}' \
+     --arg n "$as" --arg t "$type" --arg pa "$persona_at" --argjson lands "$lands_j" --argjson nap "$cross_dropped" \
+     --arg mem "$mem_inc" --arg ms "$mem_seeded" --arg me "$mem_effect" --argjson a "$added_j" --argjson s "$skipped_j" --arg tpl "$templated" --arg av "$avatar_note" --arg ri "$reported" --arg hk "$hooks_note" --argjson disc "$disclosure"
 }
