@@ -1,0 +1,76 @@
+name: actionlint
+
+# DIVE-2540. Nothing in this repo could validate a workflow file. On 2026-08-02
+# an Actions expression delimiter inside a SHELL COMMENT made release-cut.yml —
+# the only writer of a version anywhere in this repo — unparseable for 45
+# minutes, and every instrument we had reported nothing: yaml.safe_load ACCEPTS
+# the file, shellcheck does not read `run:` blocks, and the run a broken workflow
+# produces has zero jobs and says only "This run likely failed because of a
+# workflow file issue". See DIVE-2539 and
+# community/wiki/an-actions-expression-is-parsed-inside-shell-comments.md
+#
+# WHAT THIS IS AND IS NOT. There WAS a pre-merge loop already — push the branch
+# and look for a zero-job failure run on that ref, which works even for a
+# workflow with no `push` trigger. It needs a human to remember to do it and it
+# returns a verdict that names nothing. This job is the two halves that were
+# genuinely missing: an instrument that NAMES the defect, and one that runs
+# whether or not anyone remembers.
+#
+# NO `paths:` FILTER, deliberately. A path-filtered required check is skipped
+# rather than green on PRs that do not touch it, which turns a merge gate into a
+# thing people learn to click past — and the whole scan is a few seconds.
+#
+# THE PIN IS THE SUPPLY CHAIN. A linter that gates merges is a binary that runs
+# with the repo checked out, so the version AND its sha256 are written down here
+# and verified before it executes. Upgrading is deliberate: bump both, and expect
+# the canary below to be re-measured.
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  actionlint:
+    runs-on: ubuntu-latest
+    env:
+      ACTIONLINT_VERSION: 1.7.7
+      ACTIONLINT_SHA256: 023070a287cd8cccd71515fedc843f1985bf96c436b7effaecce67290e7e0757
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install pinned actionlint
+        run: |
+          set -euo pipefail
+          url="https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
+          curl -fsSL --retry 3 -o /tmp/actionlint.tgz "$url"
+          echo "${ACTIONLINT_SHA256}  /tmp/actionlint.tgz" | sha256sum -c -
+          tar -xzf /tmp/actionlint.tgz -C /tmp actionlint
+          /tmp/actionlint --version
+
+      # scripts/actionlint-scan.sh proves the binary FIRES before it trusts a
+      # clean scan: it runs the same binary with the same flags against a fixture
+      # carrying the DIVE-2539 defect (must be rejected, as an [expression]
+      # error) and a known-good fixture whose delimiter sits in a YAML-level
+      # comment (must be accepted). Either way round, it exits 2 and this job
+      # goes red rather than green-on-nothing. Every failure mode of a linter
+      # gate — missing binary, wrong flags, an empty target set, a checker that
+      # moved — presents as "no findings", so an unproven green is the default
+      # outcome unless something forces the instrument to speak.
+      - name: Lint every workflow file
+        env:
+          ACTIONLINT_BIN: /tmp/actionlint
+        run: |
+          # set +e is LOAD-BEARING: GitHub runs `run:` under `bash -e`, so a
+          # findings exit would abort the step before rc is read and the
+          # annotations below would never print. Same reason as
+          # supply-chain-guard.yml, which found this out by failing its own PR.
+          set +e
+          bash scripts/actionlint-scan.sh
+          rc=$?
+          set -e
+          case "$rc" in
+            0) echo "actionlint: clean, and the canary fired — the instrument was alive for this run." ;;
+            1) echo "::error::actionlint found problems in .github/workflows — see the findings above" ;;
+            *) echo "::error::actionlint-scan COULD NOT SCAN (exit $rc). This is not a pass: read the reason above." ;;
+          esac
+          exit "$rc"

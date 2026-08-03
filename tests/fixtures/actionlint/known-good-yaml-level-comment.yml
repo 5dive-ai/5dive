@@ -1,0 +1,15 @@
+name: actionlint-known-good
+on: workflow_dispatch
+jobs:
+  good:
+    runs-on: ubuntu-latest
+    steps:
+      - name: The SAFE half of the same distinction
+        env:
+          # a bare ${{ }} expansion inside `run:` is a script-injection site, so
+          # this value is passed through env instead. This `#` is a YAML comment:
+          # the YAML parser strips it before Actions is handed any value, so the
+          # delimiter above is never parsed as an expression.
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          printf '%s\n' "$EVENT_NAME"

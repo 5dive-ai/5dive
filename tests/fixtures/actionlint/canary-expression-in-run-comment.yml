@@ -1,0 +1,12 @@
+name: actionlint-canary
+on: workflow_dispatch
+jobs:
+  canary:
+    runs-on: ubuntu-latest
+    steps:
+      - name: The DIVE-2539 defect, preserved
+        env:
+          RELEASE_LEVEL: patch
+        run: |
+          # RELEASE_LEVEL comes from env, NOT from a ${{ }} template,
+          echo "$RELEASE_LEVEL"
