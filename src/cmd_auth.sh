@@ -697,7 +697,11 @@ agent_auth_health() {
     if [[ -n "$profile" ]]; then
       cands+=("${AUTH_PROFILES_DIR}/${profile}/combined.env")
     elif [[ -n "${TYPE_API_FILE[$type]:-}" ]]; then
-      cands+=("${CONNECTORS_DIR}/${TYPE_API_FILE[$type]}")
+      # `:-` on the READ as well as the guard above: TYPE_API_FILE is an
+      # optional map, and under `set -u` a bare variable-keyed read of a missing
+      # key aborts the whole `agent list` rather than degrading one row
+      # (tests/type_map_registration_contract_unit.sh enforces this shape).
+      cands+=("${CONNECTORS_DIR}/${TYPE_API_FILE[$type]:-}")
     fi
     for _c in "${cands[@]}"; do
       [[ -r "$_c" ]] && continue                  # readable: we looked, it had nothing

@@ -150,5 +150,11 @@ else
   echo "FAIL: agent_auth_health is NOT defined — every check above graded nothing"; fail=1
 fi
 
-if (( fail )); then echo "FAILED"; exit 1; fi
-echo "PASSED"
+echo
+printf 'agent_list_auth_health_unit: %s\n' "$( (( fail == 0 )) && echo PASSED || echo FAILED )"
+# The verdict expression is `(( fail == 0 ))`, not `if (( fail ))` + `exit 1`:
+# tests/meta/harness-verdict-probe.sh identifies the verdict VARIABLE from this
+# line so it can bump it and confirm the harness actually goes red. A literal
+# `exit 1` names no variable, so the probe reports UNPROBEABLE — which is not a
+# pass, and correctly so: an unmutatable harness is one nobody has shown can fail.
+(( fail == 0 ))
