@@ -4578,6 +4578,103 @@ _gate_needs_human() {
   [[ " $_GATE_HUMAN_CAPABILITIES " == *" $c "* ]]
 }
 
+# DIVE-2629: THE FLOOR MUST READ THE ACTION, NOT THE SUBJECT MATTER OF THE CODE.
+#
+# THE DEFECT, measured by main 2026-08-03 by running _gate_tier2_floor_hit on four
+# ask strings that differ by ONE token:
+#
+#   'approve delegated push for review of branch dive-2613-teardown-outcomes-...'  -> T2
+#   'approve delegated push for review of branch dive-2613-outcomes-hetzner-only'  -> T1
+#   'approve delegated push for review of branch dive-XXXX-teardown-foo'           -> T2
+#   'approve delegated push for review of branch dive-2592-budget-variance'        -> T1
+#
+# The word 'teardown' appearing ONLY inside a git branch NAME forces tier 2. The
+# floor exists to catch DESTRUCTIVE ACTIONS; the action here is "push a feature
+# branch to a remote for review" — inert by construction, no merge, no prod touch,
+# reversible. What is destructive-sounding is the SUBJECT of the code on the
+# branch. The floor was reading what the work is ABOUT and grading it as what the
+# gate DOES, so the better a branch name describes the work the likelier it floors:
+# the naming convention we WANT is the one that trips it.
+#
+# WHY THAT IS A RATCHET AND NOT ONE EXTRA TAP. A tier-2 approval is filed with NO
+# routed_reviewer, and cmd_task_answer's designated-reviewer exception requires
+# actor == routed_reviewer. So NO agent can ever clear it — not the filer, not
+# their lead, not the org coordinator — and no agent action hands it back. It is
+# permanently the human's. DIVE-2613 is one of the six eng gates lodar objected to
+# on 2026-08-03 ("can you stop pinging me for dev stuff") and dev2 stayed blocked
+# behind it. The floor's usual "a false positive costs one tap" bias does not hold
+# on this path, because there is no tap that gives it back.
+#
+# THE FIX SCOPES THE MATCH, NOT THE VERDICT (main's shape, adopted). Exempting the
+# individual words would be the tempting non-fix — it keeps the wrong question and
+# tidies the answer, the same way stripping +suffix was the non-fix on DIVE-2594.
+# Instead: when — and only when — the text is recognised as an INERT
+# push-for-review, the git branch IDENTIFIER is removed before the floor reads it.
+# A branch name is a label, never a statement of the action a gate authorises.
+# Everything else in the ask is still read, unchanged: a push ask that ALSO names a
+# spend, a secret or a publish still floors, because those words are in the prose.
+#
+# THREE NARROWINGS, all deliberate, all biased toward KEEPING the floor:
+#
+#   1. NOT the whole eng-ship class. _gate_eng_ship_hit also covers merge, deploy,
+#      roll-to-fleet and push-to-main — those TOUCH PROD and are not inert, so they
+#      must keep flooring on their subject matter. _GATE_PUSH_NOT_INERT_RX kicks
+#      the text back out of this exemption the moment it names one of them, which
+#      is why "push branch X for review, then merge to main" is unchanged.
+#   2. Only BRANCH-SHAPED tokens are redacted, not every hyphenated word. A slug
+#      qualifies on a slash (feat/x), a ticket prefix (dive-2613-...), or two or
+#      more hyphens (a-b-c). So 'auto-teardown' in prose survives and still floors:
+#      one hyphen and no ticket prefix is a WORD, and when the shape is ambiguous
+#      the floor stays on.
+#   3. Applied HERE, at the single match site, so every consumer — cmd_task_need's
+#      filing floor, the approval/manual routing arm, and cmd_goal's low-risk
+#      check — inherits the same verdict from the same inputs, which is the
+#      property _gate_floor_axis exists to preserve.
+#
+# NOT ATTEMPTED, and it is a separate ticket: DIVE-2592 routed to olivia when its
+# filer dev reports_to main. That is _gate_route_reviewer, not the floor, and main
+# explicitly did not diagnose it — do not fold it in here.
+_GATE_PUSH_FOR_REVIEW_RX='delegated push|push[- ]for[- ]review|5dive push|push[^.]*(for review|for a pr|for code review|branch)'
+_GATE_PUSH_NOT_INERT_RX='\bmerg(e|es|ed|ing)\b|deploy|redeploy|\brelease\b|roll ?out|\broll(ing|ed)? out\b|roll[^.]*fleet|fleet[- ]?roll|push(es|ed|ing)? to (main|prod|production)|\bland (the|it|this)\b'
+
+# 0 iff the text describes an INERT push-for-review: a feature branch going to a
+# remote for PR review. Fails closed — anything that also names a prod-touching
+# verb is NOT inert and gets no exemption.
+_gate_push_for_review_hit() {
+  local text; text=$(printf '%s' "${1-}" | tr '[:upper:]' '[:lower:]')
+  [[ "$text" =~ $_GATE_PUSH_FOR_REVIEW_RX ]] || return 1
+  [[ "$text" =~ $_GATE_PUSH_NOT_INERT_RX ]] && return 1
+  return 0
+}
+
+# 0 iff $1 (already lowercased, punctuation trimmed) has the shape of a git ref.
+# Three qualifying shapes; a single-hyphen word with no ticket prefix does NOT
+# qualify, because that is how English compounds are written.
+_gate_branch_slug_token() {
+  local w="${1-}" hy
+  [[ "$w" =~ ^[a-z0-9._/-]+$ ]] || return 1
+  [[ "$w" == */* ]] && return 0
+  [[ "$w" =~ ^[a-z]+-[0-9]+(-|$) ]] && return 0
+  hy=${w//[^-]/}
+  (( ${#hy} >= 2 )) && return 0
+  return 1
+}
+
+# Drop branch-identifier tokens from $1. Globbing is disabled around the split so
+# a ref containing * or ? cannot expand against the cwd.
+_gate_redact_branch_refs() {
+  local out="" w core noglob=0
+  [[ $- == *f* ]] || { noglob=1; set -f; }
+  for w in ${1-}; do
+    core="$w"
+    [[ "$w" =~ ^[^a-z0-9]*([a-z0-9._/-]+)[^a-z0-9]*$ ]] && core="${BASH_REMATCH[1]}"
+    _gate_branch_slug_token "$core" && continue
+    out+="$w "
+  done
+  (( noglob )) && set +f
+  printf '%s' "$out"
+}
+
 _GATE_T2_FLOOR_RX='spend|billing|invoice|charge|payment|refund|subscription|price|pricing|\$[0-9]|€[0-9]|publish|public post|announce|launch post|press|customer email|email customers|newsletter|blast|secret|credential|api key|token|password|delete|destroy|teardown|wipe|purge|drop[^.]{0,20}table|truncate|irreversible|revoke|dns|domain transfer'
 _gate_tier2_floor_hit() {
   local text floor_rx="$_GATE_T2_FLOOR_RX" loaded_rx="" constitution_path="" ere_rc=0
@@ -4645,6 +4742,14 @@ _gate_tier2_floor_hit() {
   # keep matching (revoked, truncated, charges, pressing). Containment inside an
   # unrelated STEM is the defect; containment at the start of a longer word
   # (pressure, deleterious) still fires and is the accepted cost of that choice.
+  #
+  # DIVE-2629: an inert push-for-review ask NAMES A GIT BRANCH, and the branch name
+  # is the subject of the work, not the action being authorised. Redact refs before
+  # matching so the floor grades what the gate DOES. Scoped, not exempted — the
+  # rest of the ask is read exactly as before. Full rationale at the RX above.
+  if _gate_push_for_review_hit "$text"; then
+    text=$(_gate_redact_branch_refs "$text")
+  fi
   [[ "$text" =~ (^|[^[:alnum:]_])($floor_rx) ]]
 }
 
@@ -5286,6 +5391,14 @@ _gate_tier2_floor_term() {
   # term the floor no longer matches. BASH_REMATCH[0] now carries the boundary
   # character too (" press"), so the TERM is group 2; reporting [0] would print a
   # leading space into the warn line and into the gate record.
+  #
+  # DIVE-2629: and that invariant is exactly why the branch-ref redaction has to be
+  # mirrored here. Without it this helper would keep reporting 'teardown' — a term
+  # read out of a git branch name — for a text the floor itself no longer floors,
+  # which is the drift the paragraph above forbids.
+  if _gate_push_for_review_hit "$text"; then
+    text=$(_gate_redact_branch_refs "$text")
+  fi
   [[ "$text" =~ (^|[^[:alnum:]_])($rx) ]] && printf '%s' "${BASH_REMATCH[2]}"
 }
 
