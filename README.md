@@ -250,6 +250,22 @@ sudo 5dive agent import olivia --as=ceo    # spin up a named agent from a pack
 
 `--as` is the agent's name on your box; the pack supplies the persona, model, and skills. Add `--channels=telegram` to wire a bot at import time. Packs live in the [`5dive-ai/character-packs`](https://github.com/5dive-ai/character-packs) registry, and a `5dive.yaml` can reference one with `pack: <slug>`.
 
+### See the org layer: `5dive ui`
+
+The CLI serves its own web UI. No install, no build step, no account:
+
+```sh
+5dive ui                 # http://127.0.0.1:8735
+```
+
+Three views over the box you are on:
+
+- **Org chart** who reports to whom, what each agent is holding, and every live handoff on the board: who gave the work, who holds it, who grades it. The headline counts how many of those handoffs ran agent to agent with no human in the path.
+- **Queue** every open row with its assignee, its verifier, and where a maker-to-verifier handoff has got to.
+- **Gates** what is parked on a person, at which tier, with the asking agent's recommended answer.
+
+It is read-only and binds to loopback (there is no sign-in, so `--host` refuses a routable address unless you set `FIVE_UI_ALLOW_REMOTE=1`). Anything that changes state has a CLI verb. `5dive ui --data` prints the same JSON the views render, so you can pipe it somewhere else.
+
 ### Commands at a glance
 
 ```
@@ -263,6 +279,7 @@ sudo 5dive agent import olivia --as=ceo    # spin up a named agent from a pack
 5dive task      add / ls / assign / start / done / need / inbox / answer
 5dive heartbeat on / off / ls / tick     # wake agents that have queued work
 5dive org       set / tree               # who reports to whom
+5dive ui                                 # the three views in a browser (below)
 
 5dive account   add / login / list / show / usage / rename / remove
 5dive auth      set / login / status     # lower-level; account is the human path
