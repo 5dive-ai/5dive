@@ -1,5 +1,41 @@
 # Changelog
 
+## Unreleased — fix(push): resolve the App installation PER REPO, not from one pinned id (DIVE-2563)
+
+`_push_do` minted every installation token against a single `GITHUB_APP_INSTALLATION_ID`
+read from `github-app.env`. A GitHub App gets a **separate installation per account**
+it is installed on, and the token exchange refuses any repository outside the
+installation it is addressed to — with a message that names the *repository*
+(`There is at least one repository that does not exist or is not accessible to the
+parent installation`), so it reads as a missing repo rather than a wrong installation.
+
+Measured 2026-08-03: the App's only installation is the **5dive-ai org** (20 repos, all
+`5dive-ai/*`), while `5dive-api` and `5dive-frontend` live under a **personal account**.
+So `5dive-ai/5dive` pushed fine and every customer-facing repo 422'd — and had since the
+rail was built. Pinning also means installing the App on the second account would *not*
+fix it alone: that mints a second installation id and the box would keep addressing the
+first.
+
+`_push_do` now asks `GET /repos/{owner}/{repo}/installation` which installation owns the
+target repo, and falls back to the pinned id when the lookup cannot answer — so a box
+with one installation behaves exactly as before.
+
+Two supporting fixes in the same block:
+
+- **The refusal carries GitHub's own words.** `curl -fsS` prints nothing on a 4xx, so the
+  mint failure rendered as a bare `installation token exchange failed` and the operator
+  had to re-run the call by hand to learn the cause (DIVE-2143). It now reports the API
+  `message` and names the owner the App is probably missing from.
+- **`slug` is assigned before the lookup reads it.** The first cut of this change
+  referenced it 40 lines above its assignment, which expands to empty and silently
+  queries `/repos//installation` — a lookup that cannot fail loudly. `push_unit` pins
+  the ordering, not just the presence.
+
+This is the **code** half. Pushing to a repo on another account still requires the App to
+be installed there; that is a human step, tracked separately.
+
+`tests/push_unit.sh` 89 → 92 arms.
+
 ## Unreleased — fix(push): the workflow-scope probe fetched unauthenticated, so every private-repo push demanded `workflows:write` (DIVE-2547)
 
 `_push_touches_workflows` decides whether a delegated push needs `workflows:write`
