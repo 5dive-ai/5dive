@@ -143,7 +143,7 @@ Agents:
                                                      # receiver sees who's pinging it. --raw skips wrapping.
                                                      # --from is a CLAIM. When it does not match the
                                                      # measured caller the envelope also carries
-                                                     # via=<real-caller> (DIVE-2552); an unverifiable
+                                                     # via=<real-caller>; an unverifiable
                                                      # claim reads via=unknown:no-caller.
                                                      # --reply-to-chat adds a hint telling the receiver
                                                      # to reply directly in that Telegram/Discord chat
@@ -214,11 +214,11 @@ Projects (ident namespaces for the queue; default 'dive' = DIVE-N):
   5dive project ls | show <key>
   # tasks then number per project: FROG-1, FROG-2 …
 
-  5dive loop spawn --role=<r> --agent=<a> --prompt="…" [--ceiling=<tok>] [--wait[=<sec>]]  # LOOP-7 orchestration (JSON in/out)
-  5dive goal add "<outcome>" [--dry-run] [--max-tasks=N] [--yes]   # outcome -> validated, guardrailed task graph (DIVE-984)
-  5dive objective add "<name>" --metric-cmd="<cmd>" --target=<n> [--direction=up|down] [--unit=%] [--public]  # standing goal bound to a read-only metric (OSS-19)
-  5dive objective ls | show <name> | tick [<name>] | pause <name> | resume <name> [--force] | rm <name>  # resume preflights the planner role (OSS-33)
-  5dive objective replan <name> [--max-new-per-cycle=N] [--no-progress-limit=N] [--dry-run] [--yes] [--force] [--from-gate=<id>]  # re-plan cycle: preflight -> metric -> guardrailed diff -> gate -> apply; explicit stops (OSS-27/OSS-33)
+  5dive loop spawn --role=<r> --agent=<a> --prompt="…" [--ceiling=<tok>] [--wait[=<sec>]]  # orchestration (JSON in/out)
+  5dive goal add "<outcome>" [--dry-run] [--max-tasks=N] [--yes]   # outcome -> validated, guardrailed task graph
+  5dive objective add "<name>" --metric-cmd="<cmd>" --target=<n> [--direction=up|down] [--unit=%] [--public]  # standing goal bound to a read-only metric
+  5dive objective ls | show <name> | tick [<name>] | pause <name> | resume <name> [--force] | rm <name>  # resume preflights the planner role
+  5dive objective replan <name> [--max-new-per-cycle=N] [--no-progress-limit=N] [--dry-run] [--yes] [--force] [--from-gate=<id>]  # re-plan cycle: preflight -> metric -> guardrailed diff -> gate -> apply; explicit stops (/)
 
 Org chart (who reports to whom):
   5dive org set <agent> --manager=<agent> [--role=<text>] [--title=<text>]
@@ -248,33 +248,33 @@ Usage (per-agent / per-task token burn — subscription tokens, no dollars):
   5dive usage budget set <agent> --daily=<tok> [--ceiling=<tok>] [--hard-stop]  # soft warn + optional hard-stop ceiling
   5dive usage budget ls | clear <agent>              # hard-stop is OFF by default (warn-only); check runs on the heartbeat
 
-Trace (causal timeline for one task, goal → ship — INST-1):
+Trace (causal timeline for one task, goal → ship —):
   5dive trace <id|DIVE-N> [--json] [--no-audit]      # read-only: origin (goal/parent/objective/loop) + lifecycle + gate provenance + verdict
 
-Memory (queryable team memory — read-path, DIVE-726):
+Memory (queryable team memory — read-path,):
   5dive memory search "<query>" [--limit=N] [--max-tokens=T]  # BM25-ranked snippets from the agent's memory stores + wiki, with provenance
 
-Zero-human proof (publish your own badge — OSS-17):
+Zero-human proof (publish your own badge —):
   5dive proof publish [--dry-run] [--repo=<url>] [--branch=<b>]  # push badge/datapoint/history, computed verbatim from digest
   5dive proof on --repo=<url> [--branch=status] [--at=<0-23>]    # save config + install daily root cron
   5dive proof off | status [--json]                             # remove cron (config kept) | report + staleness
   # methodology + self-publish guide: docs/zero-human.md
 
-Delegated push (bring your own GitHub App — DIVE-1376):
+Delegated push (bring your own GitHub App —):
   5dive push <id|DIVE-N> [--branch=<b>] [--dry-run]  # push ONLY the task's branch, ONLY after its gate clears; author enforced
   5dive deploy <id|DIVE-N> [--target=<project@ref>] [--env=production|preview] [--dry-run]
-                                                     # INST-5: deploy ONLY the project@ref the task declares, ONLY after its gate clears
+                                                     # deploy ONLY the project@ref the task declares, ONLY after its gate clears
   5dive push setup                                   # scaffold + check the GitHub App credential (bring-your-own; root)
   # Branch comes from --branch or a 'Branch: <name>' line in the task body. The credential is YOUR GitHub App
   # (contents:write, installed on your ship repos), held root-side in /etc/5dive/connectors — never a human token.
   # Full setup walkthrough: docs/delegated-push.md
 
-Actor-routed gh (DIVE-2448):
+Actor-routed gh:
   5dive gh <gh args...>                    # writes go out as the machine account; admin + reads stay on your credential
   5dive gh --as=bot|caller <gh args...>    # force one identity | --explain prints the decision and runs nothing
   5dive gh whoami                          # resolve BOTH identities, so "who did that write go out as" is measurable
   # An agent gh write authenticates as the HUMAN account, so the audit trail cannot tell agent from human
-  # (DIVE-2232). The PAT stays root-side in /etc/5dive/connectors/github-bot.env — the agent never holds it.
+  #. The PAT stays root-side in /etc/5dive/connectors/github-bot.env — the agent never holds it.
 
 Identity:
   5dive whoami [--json]

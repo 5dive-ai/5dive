@@ -68,7 +68,7 @@ _loop_new_id() {
 
 _loop_help() {
   cat <<'EOF'
-5dive loop — agent-native multi-agent orchestration (LOOP-7)
+5dive loop — agent-native multi-agent orchestration
 
   loop spawn  --role=maker|verifier|worker --agent=<type|name> --prompt="…"
               [--schema=<json>] [--ceiling=<tokens>] [--wait[=<sec>]]

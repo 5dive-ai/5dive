@@ -66,7 +66,7 @@ _goal_usage() {
       [--plan=<json>]       # supply a plan directly (skip the planner)
       [--from-gate=<id>]    # materialize a gated plan AFTER a human approved it:
                             #   recovers the plan from the anchor, requires a
-                            #   HUMAN 'approve' (DIVE-916), re-validates, builds.
+                            #   HUMAN 'approve', re-validates, builds.
                             #   The only path that materializes a T2 plan.
       [--from=<who>]        # actor override
       [--wait[=<sec>]]      # scripts only: block for the plan (bounded), legacy
@@ -81,7 +81,7 @@ _goal_usage() {
   nothing is materialized until a human approves; a T2 plan gates at hard tier 2
   and is materialized only via --from-gate=<id> on a human 'approve'.
 
-  ASYNC (DIVE-1349): by default \`goal add\` returns IMMEDIATELY with a job id
+  ASYNC: by default \`goal add\` returns IMMEDIATELY with a job id
   after spawning the planner (agent-driven planning is inherently async and a
   busy/slow planner must never hold an HTTP request to a gateway 502). Poll
   \`goal status <job>\`. Pass --plan=<json> to skip the planner (synchronous,

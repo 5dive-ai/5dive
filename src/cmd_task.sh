@@ -5,142 +5,50 @@ _task_usage() {
   cat <<USAGE
 5dive task — shared task queue (sqlite at ${STATE_DIR}/tasks/tasks.db)
 
-  5dive task init                                    # one-time root bootstrap of the store
-  5dive task add <title...> [--body=<text>] [--priority=low|medium|high|urgent]
-                            [--assignee=<agent|role:<r>|charter:<kw>>] [--parent=<id|DIVE-N>] [--from=<who>]
-                                                     # --assignee token routes via the org chart (DIVE-980); omit = org lead/coordinator
-                            [--recurring="<cron>"]  # recurring=template (5-field cron, e.g. "0 2 * * *")
-                            [--accept=<criteria>] [--verify=<cmd>] [--max-iters=<n>] [--verifier=<agent>] [--no-verify]
-                                                     # DIVE-969: non-trivial tasks are verifier-graded BY DEFAULT (a grader
-                                                     # !=maker + derived acceptance criteria). --no-verify opts out (plain
-                                                     # 'task done' closes). Trivial/low-priority chores skip it automatically
-                                                     # — the skip is ANNOUNCED on the add line (DIVE-1880), and an explicit
-                                                     # --verifier=<agent> forces the rail ON at ANY priority.
-                            [--task-budget=<tokens|\$cost>]  # per-run spend cap for the on-host loop (DIVE-824)
-                                                     # loop spec: declarative verify loop (DIVE-476). --verify is
-                                                     # the default cmd for 'task verify'; --verifier grades (writer!=grader)
-  5dive task ls [--status=<s>] [--assignee=<agent>] [--mine] [--all] [--recurring]
-                                                     # default: open tasks, priority-ordered; --recurring: templates
-                                                     # the scheduler is actually still driving (schedule set, status=todo);
-                                                     # --recurring --all: every template regardless, incl. stopped ones
-  5dive task show <id|DIVE-N>                        # full detail + subtasks + blockers
-  5dive task gate-history <id|DIVE-N>                # displaced gates + retirement reason/time;
-                                                     # distinguishes a true zero from pre-archive blindness
-  5dive task assign <id|DIVE-N> <agent>
-  5dive task verifier <id|DIVE-N> <agent> [--accept=<criteria>] [--max-iters=<n>]
-                                                     # DIVE-1880: attach the maker→verifier rail to an ALREADY-FILED open
-                                                     # task (grader must differ from the maker). The remedy when the
-                                                     # DIVE-969 auto-skip declined the rail at filing time. On a task
-                                                     # already DELIVERED to a verifier it re-points the review and moves
-                                                     # the task to the new grader. No detach: opting out is add-time only.
-  5dive task set-branch <id|DIVE-N> <branch>         # bind the task to a git branch for delegated push (DIVE-1462/1697);
-                                                     # writes/updates a 'Branch: <name>' line in the body. Also: task add --branch=<name>
-  5dive task set-body <id|DIVE-N> <text...> [--append]
-                                                     # DIVE-1920: edit a task's body after creation (--body was add-time only).
-                                                     # Default OVERWRITES the whole body; --append tacks text on instead (the
-                                                     # common case — a finding/addendum after filing). Works on recurring
-                                                     # templates too. Refused on a closed (done/cancelled) task.
-  5dive task start  <id|DIVE-N>                      # -> in_progress
-  5dive task done   <id|DIVE-N> [--result=<text>]    # -> done; --result captures the agent's response
-  5dive task deliver <id|DIVE-N> --pr=<url> [--result=<text>]
-                                                     # maker: record the delivery PR + hand to verifier; 'task done' stays
-                                                     # BLOCKED until the work is MERGED to main (opt-in merge-gate, DIVE-1830).
-                                                     # The gate honors EITHER binding: a delivery_ref (this PR url) OR an
-                                                     # existing 'Branch: <name>' body line (delegated-push binding, DIVE-1462).
-                                                     # DIVE-1935: a PR number the maker merely TYPES into --result/--body is a
-                                                     # binding too, and merged-but-RED is refused as well as unmerged.
-                                                     # DIVE-1955: every binding carries its REPO. --pr= url is preferred (it
-                                                     # already does); for a 'Branch:' or a bare 'PR #N' add 'Repo: owner/repo'
-                                                     # to the body. A bare #N with no declared repo binds only when exactly one
-                                                     # known repo has a #N naming the ident — else it reports 'ambiguous'
-                                                     # rather than guess, because #N means a different PR in each repo.
-  5dive task merge-audit [--limit=N] [--json]         # DIVE-1935: retrospective sweep — DONE tasks whose own record names a PR
-                                                     # that never merged (or merged red). Read-only; reports, never reopens.
-                                                     # DIVE-1975: each finding is LABELLED 'delivered' (the task claims it as
-                                                     # its own) or 'cited' (it only writes about it). A label, never a filter.
-                                                     # DIVE-1955: sweeps every repo in FIVE_GATE_REPOS (default: the CLI,
-                                                     # 5dive-api and 5dive-frontend), not just the CLI one.
-  5dive task verify <id|DIVE-N> [--cmd="<command>"] [--no-done] [--timeout=<s>]
-                                                     # run a check; exit 0 => proven-done (flips to done,
-                                                     # captures output tail). Verb exits 0/1 = the verdict.
-                                                     # --cmd optional: falls back to the task's stored --verify command.
-  5dive task reject <id|DIVE-N> [--feedback="<what to fix>"]
-                                                     # verifier's FAIL verdict (DIVE-477): bounce back to the maker
-                                                     # for another pass, or escalate to a human at max_iterations.
-  5dive task loops [--stuck] [--all] [--escalate-stuck] [--runs] [--watch[=secs]] [--kill <loopId>]
-                                                     # observability (DIVE-478/597): maker→verifier board + LOOP-7
-                                                     # loop_runs control window (topology/stage/iter/tokens-ceiling/
-                                                     # status/⚠stuck). --runs=only loop_runs; --watch repaints;
-                                                     # --kill flips kill_requested (deferred-safe). Cost: 'usage loops'.
-                                                     # Tokens/cost per loop: see '5dive usage' (same task ids).
-  5dive task cancel <id|DIVE-N> [--result=<text>]    # -> cancelled; --result captures why
-  5dive task done|cancel ... [--keep-worktree]       # DIVE-1967: a close RECLAIMS node_modules from that task's worktrees (gitignored,
-                                                     # 'npm ci'-regenerable -> structurally data-loss-free). --keep-worktree opts out.
-                                                     # The worktree DIRECTORY is never deleted — it may hold unpushed commits.
-  5dive task done|cancel|deliver ... [--append-result]  # DIVE-2464/DIVE-2476: a close, or a 'deliver --result=', on an ALREADY-closed row that carries a result is REFUSED —
-                     [--force-result]                # it used to silently REPLACE it, and the ledger stores only a sha256, so the prior
-                                                     # text was unrecoverable. --append-result keeps theirs verbatim and adds yours under
-                                                     # it (the common case: two closers, one task). --force-result replaces (audited).
-  5dive task reclaim <id|DIVE-N>|--all [--dry-run]   # reclaim node_modules from closed tasks' worktrees. --all sweeps every worktree whose
-                                                     # task is done/cancelled/absent and SKIPS in_progress/blocked. Also REPORTS which
-                                                     # worktree dirs look prunable (nothing unpushed) — pruning itself stays a human call.
-  5dive task block   <id|DIVE-N> --by=<id|DIVE-N>    # add a blocks edge, mark blocked
-                                                     # Attempt first — blocking is the exception you must justify. Every block MUST carry a revisit anchor:
-                                                     #   --by=<id> (dependency, auto-clears on the blocker's done), OR route a timed hold via 'task park --reason --wake', OR a human 'task need'.
-                                                     # A bare reasonless/dateless block is refused (DIVE-1357).
-  5dive task unblock <id|DIVE-N> [--by=<id|DIVE-N>]  # drop edge(s); back to todo if clear
-  5dive task rm <id|DIVE-N>                          # delete (cascades subtasks + edges)
-  5dive task escalate <id|DIVE-N> [--from=<who>]     # flag for attention: bump priority a tier (cap urgent) + ping owning agent & paired human
+  init                                          one-time root bootstrap of the store
+  add <title...> [--body=] [--priority=low|medium|high|urgent] [--from=<who>] [--parent=<id>]
+      [--assignee=<agent|role:<r>|charter:<kw>>] [--branch=<name>] [--recurring="<5-field cron>"]
+      [--accept=<criteria>] [--verify=<cmd>] [--verifier=<agent>] [--max-iters=<n>] [--no-verify]
+      [--task-budget=<tokens|\$cost>]
+  ls [--status=] [--assignee=] [--mine] [--all] [--recurring]   open rows, priority-ordered
+  show <id|DIVE-N>                              full detail + subtasks + blockers
+  assign <id> <agent>                           reassign
+  verifier <id> <agent> [--accept=] [--max-iters=]   attach or re-point the verifier rail
+  set-body <id> <text...> [--append]            replace the body, or append to it
+  set-branch <id> <branch>                      bind the row to a git branch
 
-  # Human Task Inbox — park a task on a human and clear it
-  5dive task need <id|DIVE-N> --type=decision|secret|approval|manual|access --ask="..." [--options=A|B] [--recommend="A"] [--tier=0|1|2]
-                                                     # --type=access: manager-clearable "grant me X" gate — routes to the org lead first (any tier), lead-clearable; add --probe='test -w /path' to self-check the block
-                                                     # --type=secret MUST name a delivery path (DIVE-2411): --secret-key=<ENV_NAME> --connector=<stem> mints a one-time drop link, or --out-of-band="<where the value lands>" declares out-of-band delivery explicitly. Neither = refused at filing (the ask would read complete with nowhere for the value to go).
-  5dive task need <id|DIVE-N> --withdraw            # DIVE-1401: cancel a still-pending gate the team filed but that's now moot — filer or org lead, no human tap. NOT a grant (never records a secret/approval); genuine clears stay human-only.
-    --ask: ONE crisp question + ~1 line essential context, recommendation up front. Heavy detail goes in the task BODY, not the ask.
-    --options: name accounts/actors, not "you/your". Pronoun-bearing choices warn at filing and their answer receipt renders the filer/answerer account frame.
-    --discusses="<why>" (DIVE-2089, --type=decision ONLY): appeal a T2 floor that fired on SUBJECT MATTER. A design question that merely NAMES secrets/publishing/deletion performs none of them; declare that and the gate goes to your lead at tier 1 instead of the human. The declaration is recorded on the gate, shown to the reviewer, and audited — unlike rewording the ask, which reaches the same audience with no record of how. Refused, loudly, for money / customer comms / irreversible infra, for a pinned --tier=2, and when no lead sits above you.
-    --needs=<capability> (DIVE-2241): DECLARE what this ask consumes. human_tap (a person's call: brand, strategy, irreversible), spend_authority (billing, paid accounts), secret_provision (a new token/credential) resolve to the paired human as CONSTANTS — the gate skips lead- AND verifier-routing and cannot be agent-cleared. Fixes: a gate on a verifier-loop task otherwise routes to whoever is GRADING the ticket, whatever it asks. Declared, never guessed from your wording; any other value is undeclared-equivalent and changes nothing (it never refuses).
-    --recommend: your advised choice (strongly encouraged for decision/approval). Leads the alert as '✅ Recommended: <X>' and ⭐-marks its button. For a decision it must match one of --options.
-    --tier (DIVE-891 risk tiers): 0 = auto-clear (rec applies NOW, no ping, digest line; requires --recommend)
-             1 = agent-clearable; unanswered 48h -> the heartbeat applies the rec   2 = hard human gate (default for approval/secret/manual)
-             Money, public comms, secrets and destructive asks are FLOORED to tier 2 no matter what you pass; secret is always tier 2.
-                                                     # -> blocked, awaiting a human (decision/secret/approval/manual)
-  5dive task park <id|DIVE-N> --reason="..." --wake=<YYYY-MM-DD[ HH:MM]|+Nd|+Nh>
-                                                     # QUIET timed wait (no ping, not in the inbox); the heartbeat auto-unparks at --wake.
-                                                     # --reason AND --wake are REQUIRED (DIVE-1357): a park with no revisit date is the block graveyard. Unknown date? pick a re-check (+7d). Waiting on a person? use 'task need'.
-                                                     # back to todo when the time passes (heartbeat sweep, DIVE-891)
-  5dive task unpark <id|DIVE-N>                      # clear a park early -> todo (unless task-deps still block it)
-  5dive task inbox                                   # list ONLY human-gated tasks, priority-ordered
-  5dive task inbox --send [--channel-proof=<chat>]   # DM the owner ONE tap-button digest of those gates (root-side; nonce never printed)
-  5dive task coordinator [--json]                     # print the resolved org coordinator (DIVE-333/1568) — the one agent that fronts the pinned needs-you banner
-  5dive task answer <id|DIVE-N> --value="..."        # record the human's answer, unblock, ping the owning agent
-  5dive task answer <id|DIVE-N> --value="..." --channel-proof=<chat_id> [--channel-msg=<message_id>]
-                                                     # the CHANNEL forms. --channel-proof alone is the DIVE-1305 paired-human DM proof: clears tier<2 gates only.
-                                                     # ADD --channel-msg (the id of the human's OWN message in that DM) and a TIER-2 gate clears with NO button tap
-                                                     # (DIVE-2412): the citation is checked against Telegram itself - the message must be live, sent by that human,
-                                                     # fresh (<=3600s, a hardcoded ceiling GATE_CHANNEL_SESSION_MAX_AGE can only TIGHTEN) and name BOTH the task ident and the answer.
-                                                     # An agent ASSERTING that a human answered is not evidence and is refused. The row records which form cleared it.
-  5dive task clear-recs --channel-proof=<chat_id> [--only=<id|DIVE-N>]
-                                                     # DIVE-1305: paired-human bulk-clear — apply each pending gate's --recommend as a HUMAN clear,
-                                                     # driven by the human's own verified DM ("go with recs"). Clears only tier<2 (agent-clearable) gates;
-                                                     # tier-2 hard gates (money/destructive/secret) are SKIPPED and keep their per-gate button tap.
-                                                     # --only limits it to one named gate. Invoked by the telegram plugin, which supplies the verified chat_id.
-                                                     # approval/secret gates are human-only: blocked for agent-* callers,
-                                                     # and (DIVE-519) require --proof=<token from '5dive gate-proof'> once
-                                                     # '5dive gate-proof enforce on' is set. Trusted paths attach it automatically.
+  start <id>                                    -> in_progress
+  done <id> [--result=<text>]                   -> done, or hand to the verifier if one is set
+  deliver <id> --pr=<url> [--result=]           record the delivery PR, hand to the verifier
+  verify <id> [--cmd=] [--no-done] [--timeout=] run the check; exit 0 = pass
+  reject <id> [--feedback=<what to fix>]        verifier FAIL: bounce back to the maker
+  cancel <id> [--result=<text>]                 -> cancelled
+  done|cancel [--keep-worktree]                 keep node_modules in that row's worktrees
+  done|cancel|deliver [--append-result|--force-result]   close a row that already has a result
+
+  block <id> --by=<id>                          add a blocks edge
+  unblock <id> [--by=<id>]                      drop edge(s); back to todo if clear
+  park <id> --reason="..." --wake=<date|+Nd>    quiet timed wait; auto-unparks at --wake
+  unpark <id>                                   clear a park early
+  escalate <id> [--from=<who>]                  bump priority a tier, ping the owner
+  rm <id>                                       delete (cascades subtasks + edges)
+
+  need <id> --type=decision|secret|approval|manual|access --ask="..."
+      [--options=A|B] [--recommend=<A>] [--tier=0|1|2] [--needs=<capability>] [--discusses=<why>]
+      [--secret-key=<ENV> --connector=<stem> | --out-of-band="<where>"]   (--type=secret needs one)
+  need <id> --withdraw                          cancel a pending gate that is now moot
+  answer <id> --value="..." [--channel-proof=<chat_id> [--channel-msg=<message_id>]]
+  clear-recs --channel-proof=<chat_id> [--only=<id>]     apply pending recommendations
+  inbox [--send [--channel-proof=<chat>]]       human-gated rows; --send DMs the owner
+  coordinator [--json]                          the agent fronting the needs-you banner
+
+  loops [--stuck] [--all] [--runs] [--watch[=secs]] [--kill <loopId>]   maker->verifier board
+  merge-audit [--limit=N] [--json]              closed rows whose named PR never merged
+  gate-history <id>                             displaced gates + when they retired
+  reclaim <id>|--all [--dry-run]                reclaim node_modules from closed worktrees
 
   status: todo | in_progress | blocked | done | cancelled
-
-  Maker→verifier loop (DIVE-477): give a task a --verifier (≠ its assignee) and the
-  maker's 'task done' does NOT close it — it hands off to the verifier (re-queued as
-  their todo; the heartbeat wakes them). The verifier grades against acceptance_criteria
-  / runs 'task verify', then closes it ('task done', which closes for real since
-  verifier==assignee) on PASS or 'task reject --feedback=' on FAIL (bounce back to the
-  maker, or escalate to a human at max_iterations). Writer never grades itself:
-  once delivered, a 'task done' from anyone but the verifier is REFUSED (DIVE-2007) —
-  to amend a delivered result, send the correction to the verifier, don't re-run done.
-
+  A verifier (!= the assignee) makes 'done' a handoff, not a close.
   Any agent (group claude) can run these without sudo. Add --json for machine output.
 USAGE
 }

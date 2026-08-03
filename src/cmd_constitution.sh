@@ -22,7 +22,7 @@ cmd_constitution() {
 5dive constitution — view + amend the machine-enforced constitution (guardrails, thresholds, veto, seal state)
 
   sudo 5dive constitution init [--force] [--json]
-      SEED path (DIVE-1701). Write the full default constitution.yaml — GUARDRAILS first
+      SEED path. Write the full default constitution.yaml — GUARDRAILS first
       (hard_gates / ship / comms, what a solo user edits), then the Council keys present but
       DORMANT and commented as optional. Creates NO council genesis/lineage: a one-agent user
       seeds + edits guardrails with zero Council. UNSEALED — edit it, then 'constitution edit' to
@@ -36,9 +36,9 @@ cmd_constitution() {
       root. --json emits the machine envelope the dashboard consumes.
 
   echo '{"hard_gates":{...},"ship":{"require_ci":true},"comms":{"public_requires_human":true}}' | sudo 5dive constitution set --json
-      BROWSER-callable STRUCTURED write (DIVE-1751 — the dashboard EDIT contract). Reads a JSON patch
+      BROWSER-callable STRUCTURED write (the dashboard EDIT contract). Reads a JSON patch
       of the SOLO-editable guardrail fields from STDIN, MERGES it into the CURRENT constitution, and
-      re-serializes + validates the YAML entirely in the CLI (no browser YAML: DIVE-1700). Only
+      re-serializes + validates the YAML entirely in the CLI (no browser YAML:). Only
       hard_gates / ship / comms are settable — governance keys (council/quorum/veto/thresholds) are
       unreachable here (amend those via 'council amend'). Seals via the SAME routing as 'set --file='
       and emits the 'constitution show --json' envelope on success. A multi-seat council -> returns the
@@ -51,13 +51,13 @@ cmd_constitution() {
         · SOLO (no council, or a single-principal genesis) -> direct-seal via a single-principal
           genesis (no convene, no quorum/liveness). --principal names the solo authority the first
           time (default human:<you>); re-seals inherit it. Root-owned write, so run under sudo.
-      Honors DIVE-1695: the sealed digest is the authority; a later hand-edit drifts + fails closed.
+      Honors the sealed digest is the authority; a later hand-edit drifts + fails closed.
 
   sudo 5dive constitution edit [--json]
       Open the current constitution (or the v0 default) in $EDITOR, then seal the edited bytes via
       the same routing as `set`. No-op if you exit without changes.
 
-  (init → DIVE-1701 seeds the full default; today `set`/`edit` seal a proposed file.)
+  (init → seeds the full default; today `set`/`edit` seal a proposed file.)
 CONSTITUTION_HELP
       ;;
     *) fail "$E_USAGE" "unknown: 5dive constitution $action (want: show)" ;;

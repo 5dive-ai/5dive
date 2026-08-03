@@ -55,7 +55,7 @@ readonly _GH_BOT_KEY="GH_BOT_TOKEN"
 
 _gh_usage() {
   cat >&2 <<'EOF'
-5dive gh — run `gh` as the right identity (DIVE-2448)
+5dive gh — run `gh` as the right identity
 
   5dive gh <gh args...>              Route by operation: writes go out as the
                                      machine account, admin + read stay on your
@@ -68,7 +68,7 @@ _gh_usage() {
   5dive gh whoami                    Resolve BOTH identities (caller and bot).
 
 Why: an agent `gh` write authenticates as the human account, so the audit trail
-cannot tell an agent action from a human one (DIVE-2232). Routing writes here
+cannot tell an agent action from a human one. Routing writes here
 makes the actor field mean something again.
 EOF
 }

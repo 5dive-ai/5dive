@@ -398,7 +398,7 @@ _proof_identity_help() {
   local as="${1:-$(id -un 2>/dev/null)}"
   cat <<HELP
 proof publish: NO GIT IDENTITY CONFIGURED — refusing to author public commits
-  as an inferred identity (DIVE-2051). Nothing was published.
+  as an inferred identity. Nothing was published.
   Whatever address this box happens to have lying around would otherwise become
   the permanent, public author of the badge history. Pin one explicitly:
 
