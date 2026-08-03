@@ -33,6 +33,12 @@ fail_t() { FAIL=$((FAIL+1)); printf 'FAIL - %s\n' "$1"; }
 chk()    { if [[ "$2" == "$3" ]]; then ok_t "$1"; else fail_t "$1 (expected '$2', got '$3')"; fi }
 
 # ── 1. the allowlist shape, on a clean fixture ─────────────────────────────────
+# THIS is the key-set pin: a literal expected list, so ANY new top-level field
+# fails here, on purpose, even one wired in only via jq -cn --arg without also
+# touching the object literal below (which is a silent no-op on the emitted
+# bytes, not a leak — confirmed by diff during DIVE-2323 gate review, since an
+# --arg that no field in the final `{...}` construction references never
+# reaches the payload at all).
 _sc_dispatch() { printf '%s\n' "pass||clean detail line, nothing sensitive"; }
 
 payload=$(_bug_render_payload "doctor" "3" 1)
