@@ -90,6 +90,121 @@ doctor_check_audit_drop_dir() {
     "$dir is a directory with mode 2770 and group $expected_group; lost audit rows can leave a drop marker"
 }
 
+# doctor_marketplace_reference_sha [remote-url] [branch]
+#
+# The PUBLISHED head of the plugin marketplace, read from the remote rather than
+# from any local checkout: a shared clone on this box can sit arbitrarily far
+# behind and would make every reader look current against it. Prints a 40-hex
+# sha, or nothing with rc 1 when it could not be resolved (no network, renamed
+# branch, unauthenticated remote). The caller must treat rc 1 as UNKNOWN.
+doctor_marketplace_reference_sha() {
+  local url="${1:-https://github.com/5dive-ai/5dive-plugins.git}"
+  local branch="${2:-main}" out
+  out=$(git ls-remote --heads "$url" "$branch" 2>/dev/null) || return 1
+  out="${out%%[!0-9a-f]*}"
+  [[ "$out" =~ ^[0-9a-f]{40}$ ]] || return 1
+  printf '%s\n' "$out"
+}
+
+# doctor_check_marketplace_clones [homes-root] [reference-sha] [clone-relpath]
+#
+# DIVE-2642 / DIVE-2621 item (d). The reader of a merged marketplace change is a
+# CLONED AGENT, not a git tree — and the clone lives under each agent's own
+# $HOME, so "is this deployed?" has a DIFFERENT ANSWER PER AGENT. On 2026-08-03
+# one merged commit had five distinct shas live on this box at once and nothing
+# reported it. A boolean would have been a lie: four agents on four shas have no
+# single refresh.
+#
+# So this check reports a POPULATION — N of M, every sha named — and never a
+# yes/no. Three rules it must not break:
+#
+#   1. Never green when it could not run. A missing reference, an unreadable
+#      clone, or a home root with no agents in it reads UNKNOWN. An absence of
+#      complaint is not evidence.
+#   2. Never infer freshness from presence. The sha a clone's HEAD resolves to is
+#      what that agent EXECUTES; a file existing under the clone is not.
+#   3. A path we could not LOOK at is not a path we know is absent. Denial and
+#      absence are indistinguishable from outside the permission boundary, so a
+#      home whose plugins dir we cannot read counts as UNKNOWN, not as "no clone".
+doctor_check_marketplace_clones() {
+  local homes_root="${1:-/home}"
+  local ref_sha="${2:-}"
+  local rel="${3:-.claude/plugins/marketplaces/5dive-plugins}"
+  local home name clone sha behind total msg sev
+  local -a current=() stale=() unknown=() absent=()
+
+  for home in "$homes_root"/*/; do
+    home="${home%/}"
+    name="${home##*/}"
+    [[ -d "$home/.claude" ]] || continue   # not an agent home; not part of M
+    clone="$home/$rel"
+    if [[ ! -d "$clone" ]]; then
+      if [[ -e "$home/.claude/plugins" && ! -r "$home/.claude/plugins" ]]; then
+        unknown+=("$name:unreadable-home")
+      else
+        absent+=("$name")
+      fi
+      continue
+    fi
+    sha=$(git -C "$clone" rev-parse HEAD 2>/dev/null) || sha=""
+    if [[ -z "$sha" ]]; then
+      unknown+=("$name:unreadable-clone")
+    elif [[ -z "$ref_sha" ]]; then
+      unknown+=("$name:${sha:0:7}")
+    elif [[ "$sha" == "$ref_sha" ]]; then
+      current+=("$name:${sha:0:7}")
+    else
+      # Distance is only computable when the published commit is in THIS clone's
+      # object store; a clone that never fetched it can still be graded stale.
+      behind=""
+      if git -C "$clone" cat-file -e "${ref_sha}^{commit}" 2>/dev/null; then
+        behind=$(git -C "$clone" rev-list --count "HEAD..$ref_sha" 2>/dev/null)
+      fi
+      if [[ -n "$behind" ]]; then
+        stale+=("$name:${sha:0:7} (behind by $behind)")
+      else
+        stale+=("$name:${sha:0:7} (distance unknown)")
+      fi
+    fi
+  done
+
+  total=$(( ${#current[@]} + ${#stale[@]} + ${#unknown[@]} + ${#absent[@]} ))
+
+  if (( total == 0 )); then
+    doctor_add plugins marketplace-freshness warn \
+      "UNKNOWN: no agent home found under $homes_root — nothing was measured, which is not the same as fresh"
+    return 0
+  fi
+
+  if [[ -z "$ref_sha" ]]; then
+    doctor_add plugins marketplace-freshness warn \
+      "UNKNOWN: the published marketplace head could not be resolved (git ls-remote), so none of the $total agent clone(s) can be graded — UNKNOWN, not fresh$(doctor_mp_list ' | running:' "${unknown[@]}")"
+    return 0
+  fi
+
+  msg="${#current[@]} of $total agent clones run published main ${ref_sha:0:7}"
+  sev=ok
+  if (( ${#stale[@]} || ${#unknown[@]} )); then
+    sev=warn
+    msg="STALE: $msg"
+  fi
+  msg+="$(doctor_mp_list ' | behind:' "${stale[@]}")"
+  msg+="$(doctor_mp_list ' | UNKNOWN:' "${unknown[@]}")"
+  msg+="$(doctor_mp_list ' | no clone:' "${absent[@]}")"
+  if [[ "$sev" == warn ]]; then
+    msg+=" — a clone's version is per-AGENT, so one refresh does not fix the fleet; each listed clone is its own git checkout under that agent's \$HOME/$rel"
+  fi
+  doctor_add plugins marketplace-freshness "$sev" "$msg"
+}
+
+# doctor_mp_list <label> [item...]  — " label a, b", or "" when there are none.
+doctor_mp_list() {
+  local label="$1"; shift
+  (( $# )) || return 0
+  local IFS=', '
+  printf '%s %s' "$label" "$*"
+}
+
 # doctor_check_reaped_homes [dir]
 #
 # DIVE-2138 quarantines a removed agent's home under REAPED_DIR instead of
@@ -167,11 +282,12 @@ cmd_doctor() {
     # `--category=policy` failed usage for every caller who read the error message
     # and did what it said. Pre-existing; fixed here because this change lands its
     # surface under that category and would otherwise be unreachable by filter.
-    ""|deps|types|auth|creds|registry|shelld|channels|host|memory|policy) ;;
-    *) fail "$E_USAGE" "unknown --category (deps|types|auth|creds|registry|shelld|channels|host|memory|policy)" ;;
+    ""|deps|types|auth|creds|registry|shelld|channels|host|memory|policy|plugins) ;;
+    *) fail "$E_USAGE" "unknown --category (deps|types|auth|creds|registry|shelld|channels|host|memory|policy|plugins)" ;;
   esac
 
   local run_deps=0 run_types=0 run_auth=0 run_creds=0 run_registry=0 run_shelld=0 run_channels=0 run_host=0 run_memory=0 run_policy=0
+  local run_plugins=0
   [[ -z "$filter" || "$filter" == "deps"     ]] && run_deps=1
   [[ -z "$filter" || "$filter" == "types"    ]] && run_types=1
   [[ -z "$filter" || "$filter" == "auth"     ]] && run_auth=1
@@ -182,6 +298,7 @@ cmd_doctor() {
   [[ -z "$filter" || "$filter" == "host"     ]] && run_host=1
   [[ -z "$filter" || "$filter" == "memory"   ]] && run_memory=1
   [[ -z "$filter" || "$filter" == "policy"   ]] && run_policy=1
+  [[ -z "$filter" || "$filter" == "plugins"  ]] && run_plugins=1
 
   # --- deps ---
   if (( run_deps )); then
@@ -758,6 +875,17 @@ cmd_doctor() {
   # store (kept coarse so a rotting store doesn't flood the dashboard with rows);
   # `5dive memory doctor --json` gives the itemized list. Non-fatal: a scan
   # failure (e.g. no python) degrades to a single warn, never aborts doctor.
+  # --- plugins (marketplace clone freshness, DIVE-2642) ---
+  #
+  # Per AGENT, never per host: the clone lives under each agent's own $HOME, so a
+  # single verdict for "this box" cannot exist. The reference is read from the
+  # REMOTE; if that fails the whole check reads UNKNOWN rather than green.
+  if (( run_plugins )); then
+    local _mp_ref=""
+    _mp_ref=$(doctor_marketplace_reference_sha) || _mp_ref=""
+    doctor_check_marketplace_clones /home "$_mp_ref"
+  fi
+
   if (( run_memory )); then
     local mem_roots=() code_root=""
     for d in /home/claude/projects/5dive /home/claude/projects; do

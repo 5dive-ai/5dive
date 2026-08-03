@@ -313,7 +313,7 @@ Health:
     create\`, so it lands as 5dive-bot); a TTY also gets an interactive y/N.
     Agents take the same --file flag a human does — no separate unattended path.
 
-  5dive doctor [--fix] [--dry-run] [--category=deps|types|auth|creds|registry|shelld|channels|host|memory]
+  5dive doctor [--fix] [--dry-run] [--category=deps|types|auth|creds|registry|shelld|channels|host|memory|policy|plugins]
     Walks deps (tmux/jq/bun/python3/nvm/node/npm), type bins, live auth
     probes, stale shadow-credential heal (creds), registry integrity, channel
     health (allowlist + dead inbound telegram poller), host safety (needrestart
