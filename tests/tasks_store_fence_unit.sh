@@ -25,7 +25,12 @@ SRC=src
 TMP="$(mktemp -d /tmp/tasks-store-fence.XXXXXX)"
 SUMMARY_PRINTED=0
 # shellcheck disable=SC2154
-trap 'rc=$?; rm -rf "$TMP" "$PWD/tests/.dive2249-mutant.sh"; [[ "$SUMMARY_PRINTED" == 1 ]] || printf "ABORTED - tasks_store_fence_unit exited early (rc=%s) before its summary; every assertion after the last ok above was SKIPPED, not passed\n" "$rc" >&2' EXIT
+# DIVE-2610: fd 8 is a dup of the REAL stderr, taken before any arm runs. The marker
+# must NOT go to `>&2`: a refusal that exits from inside `cmd_x ... >/dev/null 2>&1`
+# kills the shell while that redirect is live, so a trap printing to fd 2 lands in
+# /dev/null and the truncation is silent again. Graded by tests/truncation_marker_guard_unit.sh.
+exec 8>&2
+trap 'rc=$?; rm -rf "$TMP" "$PWD/tests/.dive2249-mutant.sh"; [[ "$SUMMARY_PRINTED" == 1 ]] || printf "ABORTED - tasks_store_fence_unit exited early (rc=%s) before its summary; every assertion after the last ok above was SKIPPED, not passed\n" "$rc" >&8' EXIT
 
 PASS=0; FAIL=0
 ok_t()  { PASS=$((PASS+1)); printf 'ok   - %s\n' "$1"; }
