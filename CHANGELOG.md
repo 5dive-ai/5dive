@@ -1,5 +1,36 @@
 # Changelog
 
+## Unreleased — fix(task): `task done` died with empty output when the result named no branch (DIVE-2603)
+
+v0.18.3 shipped DIVE-2577's merge-gate extractor with an **unguarded** command substitution:
+
+```sh
+local _br_cands; _br_cands=$(_gate_branch_refs_from_text "$_mg_txt" "$ident")
+```
+
+`_gate_branch_refs_from_text` is a **probe that legitimately finds nothing** — most results
+name no branch. Its pipeline ends in `grep`, which exits 1 on no-match; `pipefail` promotes
+that through `sed | tr | sort`, and `set -euo pipefail` kills the caller. So `task done`
+exited **1 with empty stdout AND empty stderr** — the die happens before anything prints,
+which is why it presented as a silent failure rather than an error.
+
+Scope: callers holding a gh token (the block is guarded on `-n "$_ghtok2"`) whose result text
+names no `<ident>-slug`. `task reject` was unaffected.
+
+Fix is `|| _br_cands=""` — empty rather than `|| true`, because it states the post-condition
+the `[[ -z "$_br_cands" ]]` test below actually reads.
+
+**This is the same defect and the same fix as DIVE-2566, one file over and in the same
+release.** An unguarded `$( )` around a probe that is *allowed* to fail, under `set -e` +
+`pipefail`, with `local` split onto its own line so the failure is not masked. Splitting the
+declaration is the correct habit for *seeing* a failure and is not sufficient for *handling*
+one. Worth grepping the tree for the pattern rather than waiting for the third instance.
+
+Regression arms are a PAIR, mutation-graded: one asserts the extractor really does exit 1 on
+no-match (so the hazard is measured, not assumed), one is a positive control proving it still
+finds a real branch, and one greps the call site for the guard. Reverting the guard reddens
+the call-site arm (12/1); restoring returns 13/0.
+
 ## Unreleased — feat(agent): `agent list` reports credential health, so a lapsed seat stops rendering live (DIVE-1953)
 
 On the DIVE-1868 flagship demo a grok seat's credential lapsed. The systemd unit stayed

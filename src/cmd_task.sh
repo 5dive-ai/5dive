@@ -2970,7 +2970,17 @@ $_body"
     # close that names no branch at all (the overwhelming majority) never enters
     # this block.
     if [[ -z "$_auto_hit" && $force_merge_gate -eq 0 && -n "$_ghtok2" ]]; then
-      local _br_cands; _br_cands=$(_gate_branch_refs_from_text "$_mg_txt" "$ident")
+      # DIVE-2603: the extractor is a PROBE that legitimately finds nothing — most
+      # results name no branch at all. Its pipeline ends in `grep`, which exits 1 on
+      # no-match; `pipefail` promotes that through `sed | tr | sort`, and a bare
+      # `var=$(...)` under `set -euo pipefail` (src/header.sh) kills the whole close.
+      # Shipped in v0.18.3 and it broke `task done` for every caller holding a gh
+      # token whose result text named no `<ident>-slug` branch — exit 1, empty stdout
+      # AND empty stderr, because the die happens before anything is printed.
+      # `|| _br_cands=""` rather than `|| true`: it states the post-condition the
+      # `[[ -z ]]` test below actually reads. Same defect and same fix as DIVE-2566
+      # one file over — an unguarded substitution around a probe allowed to fail.
+      local _br_cands; _br_cands=$(_gate_branch_refs_from_text "$_mg_txt" "$ident") || _br_cands=""
       if [[ -n "$_br_cands" ]]; then
         _mg_had_subject=1
         local _cand _slug3 _attr3 _bm3 _bl_hit="" _bl_hit_slug="" _bl_hit_how="" _bl_searched2="" _bl_any_unreach=0
