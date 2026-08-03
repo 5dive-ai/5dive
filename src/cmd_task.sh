@@ -3312,9 +3312,19 @@ cmd_task_deliver() {
   # No distinct verifier: record the delivery but do NOT close — a verifier must
   # confirm the merge and close it. Leave the task in_progress.
   (( want_result )) && db "UPDATE tasks SET result=$(sqlq_or_null "$result") WHERE id=${id};"
-  ok "$ident delivered ($pr) — recorded; it has no distinct verifier, so have a verifier close it via 'task done' AFTER the PR is merged (done stays blocked until then — DIVE-1830)" \
-     '{id:($i|tonumber), ident:$id, deliveryRef:$p, delivered:true, routedTo:null, status:"in_progress"}' \
-     --arg i "$id" --arg id "$ident" --arg p "$pr"
+  # DIVE-2204: the two rows that land here are NOT the same claim. verifier=='' has
+  # no verifier at all; verifier==assignee HAS one, just not distinct from the
+  # assignee. Saying "no distinct verifier" for the latter reads as "unverified" to
+  # an agent deciding whether it's safe to self-close — say what's actually true.
+  if [[ -n "$_vfier" ]]; then
+    ok "$ident delivered ($pr) — recorded; verifier is the current assignee, so nothing to hand off (a verifier still must close it via 'task done' AFTER the PR is merged — DIVE-1830)" \
+       '{id:($i|tonumber), ident:$id, deliveryRef:$p, delivered:true, routedTo:null, status:"in_progress"}' \
+       --arg i "$id" --arg id "$ident" --arg p "$pr"
+  else
+    ok "$ident delivered ($pr) — recorded; no verifier is set, so have a verifier close it via 'task done' AFTER the PR is merged (done stays blocked until then — DIVE-1830)" \
+       '{id:($i|tonumber), ident:$id, deliveryRef:$p, delivered:true, routedTo:null, status:"in_progress"}' \
+       --arg i "$id" --arg id "$ident" --arg p "$pr"
+  fi
 }
 
 # `5dive task merge-audit [--limit=N] [--json]` — DIVE-1935 retrospective sweep.
