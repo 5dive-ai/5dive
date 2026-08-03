@@ -7,6 +7,7 @@
 # (only WRITE/verify do), so a hand-synthesized lineage exercises the sealed case root-free — this
 # GATES in CI. SKIPs green when node/jq missing or the build fails. Exit 0 == green.
 set -uo pipefail
+trap 'rc=$?; rm -rf "${TMP:-}"; echo "HARNESS-RC=$rc"' EXIT   # DIVE-2573: fires on every exit path (incl. SKIP/precondition-fail early-exits); folds in tempdir cleanup so the two EXIT traps don't clobber each other.
 
 # DIVE-2211: name the tree this harness grades (tests/lib/grading_tree.sh).
 # Three-state: if the helper is unreachable (a staged copy that did not carry
@@ -23,7 +24,7 @@ for b in node jq; do
   command -v "$b" >/dev/null 2>&1 || { echo "SKIP: $b not on PATH (constitution show e2e needs it)"; exit 0; }
 done
 
-TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
+TMP="$(mktemp -d)"
 FIVE="$TMP/5dive"
 if ! BUILD_OUT="$FIVE" bash "$ROOT/build.sh" >/dev/null 2>&1 || [[ ! -x "$FIVE" ]]; then
   echo "SKIP: could not build a throwaway ./5dive (build.sh failed)"; exit 0
@@ -106,7 +107,4 @@ chk "D sealedDigest unchanged" "$DIG"   "$(jq -r '.data.sealedDigest' <<<"$D")"
 
 echo "DIVE-1742 constitution show e2e: $P passed, $F failed"
 rc=0; [ "$F" -eq 0 ] || rc=1
-# DIVE-2573: last stdout line carries the real rc, so a caller who pipes this
-# harness through tail/head still sees the true verdict instead of the pipe's.
-echo "HARNESS-RC=$rc"
 exit "$rc"

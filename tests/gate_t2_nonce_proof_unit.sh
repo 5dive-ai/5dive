@@ -27,10 +27,10 @@
 . "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh" \
   || printf 'grading tree: UNRESOLVED (tests/lib/grading_tree.sh not reachable; no tree named)\n' >&2
 set -o pipefail
+trap 'rc=$?; rm -rf "${TMP:-}"; echo "HARNESS-RC=$rc"' EXIT   # DIVE-2573: fires on every exit path (incl. SKIP/precondition-fail early-exits); folds in tempdir cleanup so the two EXIT traps don't clobber each other.
 cd "$(dirname "$0")/.."
 SRC=src
 TMP="$(mktemp -d /tmp/gate-t2-nonce-proof.XXXXXX)"
-trap 'rm -rf "$TMP"' EXIT
 
 # STATE_DIR must be set BEFORE cmd_council.sh is sourced (COUNCIL_DIR/COUNCIL_LINEAGE are
 # source-time globals derived from it).
@@ -433,7 +433,4 @@ out=$(cmd_task_need DIVE-522 --type=decision --tier=2 --options="A|B" \
 printf '\n%s\n' "-----------------------------------------------"
 printf 'DIVE-2233 item 2 — tier-2 nonce: mint, emit, verify: %d passed, %d failed\n' "$PASS" "$FAIL"
 rc=0; [[ $FAIL -eq 0 ]] || rc=1
-# DIVE-2573: last stdout line carries the real rc, so a caller who pipes this
-# harness through tail/head still sees the true verdict instead of the pipe's.
-echo "HARNESS-RC=$rc"
 exit "$rc"

@@ -24,6 +24,7 @@
 . "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh" \
   || printf 'grading tree: UNRESOLVED (tests/lib/grading_tree.sh not reachable; no tree named)\n' >&2
 set +e -o pipefail
+trap 'rc=$?; rm -rf "${TMP:-}"; echo "HARNESS-RC=$rc"' EXIT   # DIVE-2573: fires on every exit path (incl. SKIP/precondition-fail early-exits); folds in tempdir cleanup so the two EXIT traps don't clobber each other.
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"
@@ -95,7 +96,4 @@ fi
 echo "-----"
 echo "compose_asleep_report_unit: $pass passed, $fail failed"
 rc=0; [[ $fail -eq 0 ]] || rc=1
-# DIVE-2573: last stdout line carries the real rc, so a caller who pipes this
-# harness through tail/head still sees the true verdict instead of the pipe's.
-echo "HARNESS-RC=$rc"
 exit "$rc"
