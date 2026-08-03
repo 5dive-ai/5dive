@@ -226,7 +226,7 @@ Org chart (who reports to whom):
   # full surface: 5dive org --help
 
 Heartbeat (wake an agent only when it has queued tasks, one per tick):
-  5dive heartbeat on  <name> [--every=<dur>] [--no-fresh]   # enrol (default 30m, /clear before each task)
+  5dive heartbeat on  <name> [--every=<dur>] [--fresh]      # enrol (default 30m, fresh off: no /clear between tasks)
   5dive heartbeat off <name>
   5dive heartbeat ls                                        # enrolled agents + next-wake + queued count
   5dive heartbeat tick                                      # cron driver (root); wakes due agents that have work
