@@ -2648,7 +2648,7 @@ function canDeliver() {
 }
 function preflightDelivery() {
   if (canDeliver()) return
-  die(`council pre-flight FAILED: no _deliver grant here, so every seat would abstain — re-run as: sudo 5dive council convene`, 6)
+  die(`council pre-flight FAILED: cannot reach the seat-delivery rail — no \`_deliver\` grant here; re-run with sudo`, 6)
 }
 
 // DIVE-1739: seat LIVENESS map — registry name -> health {asleep,deaf,...} from `agent list --json`.
