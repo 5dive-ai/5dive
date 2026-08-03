@@ -131,6 +131,21 @@ cmd_ui() {
 # the canonical inbox predicate, never raw `need_type IS NOT NULL`.
 # ---------------------------------------------------------------------------
 _ui_state_json() {
+  # A box with no task store yet is a REAL state, not an error: `sudo 5dive task
+  # init` is root-only, and refusing here would mean a fresh install cannot open
+  # the UI at all. So it serves the three views with a named empty board rather
+  # than an unnamed one — `store: "absent"` is the difference between "nothing is
+  # queued" and "there is nowhere to queue anything", which an empty array alone
+  # cannot say.
+  if [[ ! -d "$TASKS_DIR" ]]; then
+    jq -n --arg host "$(hostname 2>/dev/null || echo localhost)" \
+          --arg now "$(date -u '+%Y-%m-%d %H:%M:%SZ')" \
+      '{ok: true, data: {scope: "single-host", store: "absent", host: $host, generated_at: $now,
+        org: [], queue: [], gates: [], flows: [],
+        stats: {agents: 0, open: 0, gates: 0, delegated: 0, agent_to_agent: 0,
+                human_touch: 0, awaiting_verify: 0, in_review: 0}}}'
+    return 0
+  fi
   tasks_db_init
   local dir; dir="$(mktemp -d "${TMPDIR:-/tmp}/5dive-ui-data.XXXXXX")" || fail "$E_GENERIC" "could not create a temp dir"
 
@@ -185,6 +200,7 @@ _ui_state_json() {
             human: ((($isAgent[(.maker_agent // .assignee)] // false) == false) or ($isAgent[.verifier] // false) == false)} ]) as $flows
     | {ok: true, data: {
         scope: "single-host",
+        store: "ready",
         host: $host,
         generated_at: $now,
         org: $org,
@@ -330,6 +346,10 @@ _ui_html() {
 </header>
 
 <main>
+  <div class="card lede" id="no-store" hidden>
+    <div class="big">There is no task store on this host yet</div>
+    <p>The three views are empty because nothing has been created, not because the board is clear. Run <code class="mono">sudo 5dive task init</code> (or create your first agent) and reload.</p>
+  </div>
   <section id="view-org">
     <div class="card lede">
       <div class="big" id="org-head">…</div>
@@ -571,6 +591,8 @@ _ui_html() {
 
   function render() {
     $("host").textContent = state.host || "localhost";
+    var banner = $("no-store");
+    banner.hidden = (state.store !== "absent");
     $("stamp").textContent = "as of " + (state.generated_at || "");
     $("n-org").textContent = (state.stats && state.stats.agents) || 0;
     $("n-queue").textContent = (state.stats && state.stats.open) || 0;

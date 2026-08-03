@@ -110,7 +110,7 @@ D="$("$FIVE" ui --data 2>"$TMP/data.err")"
 chk "1 ok envelope"        "true"          "$(jq -r '.ok' <<<"$D")"
 chk "1 scope single-host"  "single-host"   "$(jq -r '.data.scope' <<<"$D")"
 chk "1 key set is whole (no fleet surface)" \
-    "flows gates generated_at host org queue scope stats" \
+    "flows gates generated_at host org queue scope stats store" \
     "$(jq -r '.data|keys|sort|join(" ")' <<<"$D")"
 
 # --- 2. org chart ------------------------------------------------------------
@@ -222,6 +222,52 @@ if command -v ss >/dev/null 2>&1; then
 fi
 chk "12 a bad port is refused"          "3" \
     "$("$FIVE" ui --port=99999 >/dev/null 2>&1; echo $?)"
+
+# --- 14. a box with NO task store still serves the views ---------------------
+# `task init` is root-only, so a fresh install would otherwise be refused the UI
+# entirely. The board must come back EMPTY AND NAMED: three empty arrays alone
+# would read as "nothing is queued" on a host that cannot queue anything.
+FRESH="$TMP/fresh"; mkdir -p "$FRESH"
+FD="$(STATE_DIR="$FRESH" "$FIVE" ui --data 2>"$TMP/fresh.err")"
+chk "14 fresh box still answers"      "true"     "$(jq -r '.ok' <<<"$FD")"
+chk "14 the empty board is NAMED"     "absent"   "$(jq -r '.data.store' <<<"$FD")"
+chk "14 seeded board says ready"      "ready"    "$(jq -r '.data.store' <<<"$D")"
+chk "14 org empty"                    "0"        "$(jq -r '.data.org|length' <<<"$FD")"
+chk "14 queue empty"                  "0"        "$(jq -r '.data.queue|length' <<<"$FD")"
+chk "14 gates empty"                  "0"        "$(jq -r '.data.gates|length' <<<"$FD")"
+chk "14 it did not create a store"    "1"        "$([[ -d "$FRESH/tasks" ]] && echo 0 || echo 1)"
+chk "14 the page names the fix"       "1"        "$(grep -c '5dive task init' "$TMP/page.html" || true)"
+
+# --- 15. --once serves exactly one request, then exits -----------------------
+# A documented flag nobody runs is a claim, not a feature. Both halves are
+# graded: the one request IS answered, and the process is gone afterwards.
+PORT2="$(python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1]);s.close()')"
+"$FIVE" ui --port="$PORT2" --once >"$TMP/once.log" 2>&1 &
+ONCE_PID=$!
+once_up=0
+for _ in $(seq 1 40); do
+  ss -ltn 2>/dev/null | grep -q "127\.0\.0\.1:$PORT2" && { once_up=1; break; }
+  sleep 0.25
+done
+chk "15 --once came up" "1" "$once_up"
+if (( once_up )); then
+  first="$(PORT="$PORT2" python3 - "$PORT2" GET /healthz <<'PY2'
+import sys, urllib.request
+port, method, path = sys.argv[1], sys.argv[2], sys.argv[3]
+req = urllib.request.Request("http://127.0.0.1:%s%s" % (port, path), method=method)
+with urllib.request.urlopen(req, timeout=10) as r:
+    print(r.status)
+PY2
+)"
+  chk "15 the one request is answered" "200" "$first"
+  gone=0
+  for _ in $(seq 1 40); do
+    kill -0 "$ONCE_PID" 2>/dev/null || { gone=1; break; }
+    sleep 0.25
+  done
+  chk "15 it exited after that request" "1" "$gone"
+fi
+kill "$ONCE_PID" 2>/dev/null
 
 # --- 13. wired into the CLI --------------------------------------------------
 chk "13 ui --help exits 0" "0" "$("$FIVE" ui --help >/dev/null 2>&1; echo $?)"

@@ -27,6 +27,11 @@ absolute URL in it, so it renders on a box with no egress. python3 (stdlib only)
 because bash cannot, and the server script is generated at runtime into a private temp dir, so the
 shipped artifact is still exactly one file.
 
+A box whose task store has not been initialised yet still gets all three views: `task init` is
+root-only, so refusing there would mean a fresh install cannot open the UI at all. The empty board
+is NAMED (`store: "absent"`) and the page says which command fixes it, because three empty arrays
+on their own read as "nothing is queued" on a host that cannot queue anything.
+
 `5dive ui --data` prints the JSON both the page and any other consumer render. Every field in it
 comes from the predicates the CLI already uses (`handoff_state` and `gate_live` are the `task ls`
 expressions verbatim), so a view cannot tell a different story than the queue it is showing.
