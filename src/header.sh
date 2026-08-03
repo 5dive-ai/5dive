@@ -432,11 +432,23 @@ declare -A SKILLS_AGENT_ID=(
 declare -A SKILLS_INSTALL_DIR=(
   [claude]=".claude/skills"
   # codex/opencode: the upstream `npx skills --agent {codex,opencode}` install
-  # path. UNMEASURED, DIVE-2583: whether either binary then SCANS ~/.agents/skills
-  # has never been checked on a live seat — codex is not installed on this box and
-  # its installer fails partway. So a body we land here is landed, not proven
-  # loaded. State the mechanism ("import installs to <dir>"), never the outcome
-  # ("the agent has the skill"), until someone measures it.
+  # path.
+  #
+  # codex: MEASURED 2026-08-03 (DIVE-2583), codex-cli 0.146.0 — it DOES scan
+  # $HOME/.agents/skills. Method, because it matters: two canary SKILL.md files
+  # in one throwaway HOME, one under .agents/skills and one under .codex/skills,
+  # then `codex debug prompt-input` — BOTH appear in the injected
+  # <skills_instructions> block with their real paths. The .codex one is the
+  # positive control (it proves the probe can see a skill at all), so the
+  # .agents one is a discovery, not an absence.
+  #
+  # THE TRAP, worth more than the result: `strings` on the real binary shows
+  # $CODEX_HOME/skills everywhere and ZERO hits for "agents/skills". Grepping the
+  # binary for the path constant would have concluded the exact opposite of the
+  # truth. That is the same method the antigravity note below rests on — treat it
+  # as a hint, never as the measurement.
+  #
+  # opencode: still UNMEASURED. Not installed on this box, so nothing to run.
   [codex]=".agents/skills"
   [hermes]=".hermes/skills"
   [openclaw]="skills"
@@ -445,6 +457,10 @@ declare -A SKILLS_INSTALL_DIR=(
   # by grepping the antigravity binary for the path constant. Earlier map said
   # .gemini/antigravity-cli/skills (matching its state dir), which was a guess
   # — wrong. Upstream npx skills fallback already lands at .agents/skills.
+  #
+  # ...and per the codex entry above, a binary grep is NOT a measurement: codex
+  # scans a root whose constant does not appear in its binary at all. So read the
+  # claim below as an open question, not as a finding.
   #
   # DIVE-2583, the unreconciled half of that note: {workspace} is NOT $HOME for a
   # 5dive agy seat (workdir is a project dir under /home/claude/projects), while
