@@ -257,5 +257,104 @@ if (( RC == 1 )) && [[ "$OUT" == *"selected 0 harnesses"* ]]; then
   ok "a shard that selects nothing FAILS rather than reporting green over nothing"
 else bad "a shard that selects nothing FAILS rather than reporting green over nothing" "rc=$RC out=$OUT"; fi
 
+
+# ------------------------------------------- 17-22 DIVE-2555: the CLOCK vs the CLAIM
+# MERGED HERE, NOT GIVEN A NEW FILE. This row's own rule is that past the cap a new
+# guard replaces or merges an existing one, and the subject is the same subject: what
+# the corpus's clock is allowed to be reported as. Two claims about a reading of it —
+# a HEADER's "Ns measured" and the probe's TIMEOUT KILL — and neither may be reported
+# as something it is not.
+#
+# WHY THIS EXISTS (DIVE-2555, measured 2026-08-03): a demotion is argued in the diff
+# with a number, and gate_channel_session_t2_mutation.sh claimed 300.0s while running
+# 335s on the control plane. Nothing had ever re-read that number. The runner already
+# times every harness, so grading the claim against the measurement is free.
+rm -f "$TMP"/*.sh
+mk truthful.sh '#!/usr/bin/env bash
+# TIER: nightly — 10.0s measured (DIVE-2555): does not fit the 300s PR core; the nightly sweep runs it.
+exit 0'
+mk stale_claim.sh '#!/usr/bin/env bash
+# TIER: nightly — 0.5s measured (DIVE-2555): does not fit the 300s PR core; the nightly sweep runs it.
+sleep 2
+exit 0'
+run --tier=full --budget=600 --label=t
+want "a header the clock only mildly refutes is REPORTED, not red (that band is runner variance)" "0" "$RC"
+if [[ "$OUT" == *"HEADER MEASUREMENT"* && "$OUT" == *"stale"* && "$OUT" == *"stale_claim.sh"* ]]; then
+  ok "the drifted header is named, with its severity"
+else bad "the drifted header is named, with its severity" "$OUT"; fi
+# The remedy half again: a drift report that does not print the replacement line is a
+# number nobody can act on, which is the finding this whole row descends from.
+if [[ "$OUT" == *"# TIER: nightly —"* && "$OUT" == *"measured (t,"* ]]; then
+  ok "the drift report prints the REPLACEMENT header line, with the environment in it"
+else bad "the drift report prints the REPLACEMENT header line, with the environment in it" "$OUT"; fi
+# Scoped to the DRIFT BLOCK, not to the whole output: the runner echoes every harness
+# path as it runs it, so "truthful.sh appears somewhere in stdout" is true of every
+# run and asserting on it grades nothing. First version of this arm did exactly that.
+DRIFT_BLOCK="$(printf '%s\n' "$OUT" | sed -n '/HEADER MEASUREMENT/,$p')"
+if [[ -n "$DRIFT_BLOCK" && "$DRIFT_BLOCK" != *"truthful.sh"* ]]; then
+  ok "a header the clock AGREES with is not accused"
+else bad "a header the clock AGREES with is not accused" "$DRIFT_BLOCK"; fi
+
+# >= 50% AND >= 3s under is not variance: exit 5, its own code, because the remedy is
+# neither "fix a test" (1) nor "retire a guard" (4) but "correct a number in a header".
+mk wrong_claim.sh '#!/usr/bin/env bash
+# TIER: nightly — 0.5s measured (DIVE-2555): does not fit the 300s PR core; the nightly sweep runs it.
+sleep 4
+exit 0'
+rm -f "$TMP/stale_claim.sh"
+run --tier=full --budget=600 --label=t
+want "a header the clock flatly refutes exits 5 (not 1, not 4)" "5" "$RC"
+if [[ "$OUT" == *"WRONG"* && "$OUT" == *"not runner variance"* ]]; then
+  ok "the refuted header is called WRONG and the message says why it is not variance"
+else bad "the refuted header is called WRONG and the message says why it is not variance" "$OUT"; fi
+
+# A harness that FAILED is not accused of drift: an aborted run's wall-clock is not a
+# measurement of what it costs, and the failure is the thing to fix first (exit 1).
+rm -f "$TMP/wrong_claim.sh"
+mk red_claim.sh '#!/usr/bin/env bash
+# TIER: nightly — 0.5s measured (DIVE-2555): does not fit the 300s PR core; the nightly sweep runs it.
+sleep 4
+exit 1'
+run --tier=full --budget=600 --label=t
+if (( RC == 1 )) && [[ "$OUT" != *"red_claim.sh"*"claims"* ]]; then
+  ok "a FAILING harness is not also accused of header drift"
+else bad "a FAILING harness is not also accused of header drift" "rc=$RC out=$OUT"; fi
+
+# ------------------------------------ 23-25 DIVE-2555: a TIMEOUT KILL is not a verdict
+# tests/meta/harness-verdict-probe.sh runs every harness under `timeout`. A kill used
+# to be laundered into two verdicts that are about the harness rather than the clock:
+# a killed CLEAN run became `already-red` ("failed its own clean run" — an accusation
+# about assertions, on evidence entirely about time), and a killed MUTANT became
+# `wired` whenever the canary had already printed, which is a FALSE PASS in the
+# coverage direction: the non-zero exit came from the KILL, not from the harness's
+# verdict. DIVE-2412 paid for this once already — 300s of mutation grader killed at
+# the 180s cap in every environment, reported as `not-reached`, i.e. "skips early
+# here", which it never did.
+#
+# Graded with a 1s cap against ONE real harness (`--only`), because the probe globs
+# tests/*.sh and has no --corpus-dir seam. Cost: two kills, ~2s.
+# LIMIT, stated rather than implied: this forces the kill BEFORE the canary prints.
+# The killed-after-the-canary shape (the false `wired`) shares the same guard — it is
+# placed ahead of the canary grep precisely so both land in one class — but forcing it
+# live would need a harness that hangs after its verdict line, and inventing one is a
+# corpus file added by a row about not adding corpus files.
+PROBE="tests/meta/harness-verdict-probe.sh"
+VICTIM="gate_nonce_unit.sh"
+if [[ -r "$PROBE" && -r "tests/$VICTIM" ]]; then
+  POUT="$(PROBE_TIMEOUT=1 bash "$PROBE" --only="$VICTIM" --label=cap1 --report="$TMP/probe.txt" 2>/dev/null)"; PRC=$?
+  want "a harness killed by the cap does not fail the probe (a kill is not a verdict)" "0" "$PRC"
+  if [[ "$POUT" == *"timed-out"* && "$POUT" == *"$VICTIM"* && "$POUT" != *"ALREADY-RED"* ]]; then
+    ok "the kill is reported as timed-out, NOT as a harness that failed its own clean run"
+  else bad "the kill is reported as timed-out, NOT as a harness that failed its own clean run" "$POUT"; fi
+  # The report is what the union reads, and `timed-out` is deliberately absent from
+  # its probed set: a harness killed in EVERY environment must red the union as NEVER
+  # PROBED rather than bank coverage it never earned.
+  if grep -q "^timed-out	$VICTIM$" "$TMP/probe.txt" && ! grep -qE "^(wired|UNWIRED)	$VICTIM$" "$TMP/probe.txt"; then
+    ok "the report row is timed-out and is NOT in the union's probed set"
+  else bad "the report row is timed-out and is NOT in the union's probed set" "$(cat "$TMP/probe.txt")"; fi
+else
+  bad "probe timeout arms" "NOT REACHED: $PROBE or tests/$VICTIM missing — arms 23-25 graded nothing"
+fi
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 (( fail == 0 ))

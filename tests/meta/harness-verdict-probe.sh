@@ -59,6 +59,11 @@ esac; done
 ALLOW_UNPROBEABLE="council_amend_e2e.sh council_roster_lineage_e2e.sh schema_sync_unit.sh"
 
 WIRED=(); UNWIRED=(); UNPROBEABLE=(); ALREADY_RED=(); ALLOWED=(); NOT_REACHED=()
+# DIVE-2555: killed by the time cap. Its own class, because it is neither of the two
+# it used to be folded into: not a failed assertion (already-red) and not an early
+# skip (not-reached), and above all not a verdict (a non-zero exit produced by the
+# KILL is not evidence that the harness's exit status is wired to anything).
+TIMED_OUT=()
 
 # Extract the verdict variable from a harness's last executable line.
 # Prints "<var>\t<lineno>" or nothing. Handles the shapes olivia's census found:
@@ -153,7 +158,21 @@ for t in tests/*.sh; do
   PROBED_N=$(( PROBED_N + 1 ))
   printf '  probing %d/%d %s\n' "$PROBED_N" "$CORPUS_N" "$b" >&2
   if (( ! ASSUME_CLEAN )); then
-    if ! timeout "$TIMEOUT" bash "$t" >/dev/null 2>&1; then ALREADY_RED+=("$b"); continue; fi
+    timeout "$TIMEOUT" bash "$t" >/dev/null 2>&1; rc=$?
+    # DIVE-2555: A KILL IS NOT A FAILURE. `timeout` exits 124 when it has to signal
+    # the child (137 when the child needed SIGKILL), and folding either into
+    # already-red publishes "failed its own clean run" — a statement about the
+    # harness's ASSERTIONS, made on evidence that is entirely about the CLOCK. The
+    # remedy the label implies (find the broken assertion) does not exist, and the
+    # one that does (the long lane, or a slower harness to merge or retire) is not
+    # named anywhere. Same shape as the exit-code split this corpus already carries:
+    # over-budget is exit 4 and a red test is exit 1, because a red that could mean
+    # either gets triaged as neither.
+    if (( rc == 124 || rc == 137 )); then
+      TIMED_OUT+=("$b (clean run killed at ${TIMEOUT}s — over the probe's time cap, NOT a failed assertion)")
+      continue
+    fi
+    if (( rc != 0 )); then ALREADY_RED+=("$b"); continue; fi
   fi
   if spec=$(counter_verdict "$t"); then
     IFS=$'\t' read -r var ln pos <<<"$spec"
@@ -190,6 +209,26 @@ if [[ " $ALLOW_UNPROBEABLE " == *" $b "* ]]; then ALLOWED+=("$b"); else UNPROBEA
   awk -v n="$ln" -v inj="$inject" 'NR==n{print "printf \x27__PROBE_REACHED__\\n\x27 >&2"; print inj} {print}' "$t" > "$mutant"
   out=$(timeout "$TIMEOUT" bash "$mutant" 2>&1 >/dev/null); rc=$?
   rm -f "$mutant"
+  # DIVE-2555: THE KILL MUST BE CLASSIFIED BEFORE THE VERDICT IS READ, because a
+  # killed mutant produces BOTH of this loop's outcomes for reasons that have
+  # nothing to do with wiring:
+  #   * killed after the canary printed -> rc 124, non-zero, counted WIRED. That is
+  #     a FALSE PASS in the coverage direction, and the worst one available here: an
+  #     unwired harness earns a `wired` row, the union counts it as probed, and the
+  #     one check that exists to find harnesses that cannot fail CI says it can.
+  #   * killed before the canary printed -> not-reached, whose message says the
+  #     harness "exits early in this environment". It did not exit; it was killed.
+  #     A true classification with a false explanation sends the reader to look for
+  #     a skip guard that is not there (DIVE-2412 spent exactly that trip before
+  #     landing the 900s lane).
+  # Neither is a failure and neither is coverage: `timed-out` is reported, carried
+  # into the report, and NOT in the union's probed set — so a harness timed out in
+  # EVERY environment reds the union as NEVER PROBED, which is true and is the
+  # signal that its lane needs the time.
+  if (( rc == 124 || rc == 137 )); then
+    TIMED_OUT+=("$b (mutant killed at ${TIMEOUT}s — no verdict was observed; raise PROBE_TIMEOUT for it or make it faster)")
+    continue
+  fi
   if ! grep -q '__PROBE_REACHED__' <<<"$out"; then
     NOT_REACHED+=("$b (verdict line $ln never executed — harness exits early in this environment)")
     continue
@@ -199,13 +238,14 @@ if [[ " $ALLOW_UNPROBEABLE " == *" $b "* ]]; then ALLOWED+=("$b"); else UNPROBEA
   else WIRED+=("$b"); fi
 done
 
-printf 'harness-verdict-probe: %d wired, %d UNWIRED, %d UNPROBEABLE, %d allowlisted, %d not-reached, %d already-red\n' \
-  "${#WIRED[@]}" "${#UNWIRED[@]}" "${#UNPROBEABLE[@]}" "${#ALLOWED[@]}" "${#NOT_REACHED[@]}" "${#ALREADY_RED[@]}"
+printf 'harness-verdict-probe: %d wired, %d UNWIRED, %d UNPROBEABLE, %d allowlisted, %d not-reached, %d already-red, %d timed-out (cap %ss)\n' \
+  "${#WIRED[@]}" "${#UNWIRED[@]}" "${#UNPROBEABLE[@]}" "${#ALLOWED[@]}" "${#NOT_REACHED[@]}" "${#ALREADY_RED[@]}" "${#TIMED_OUT[@]}" "$TIMEOUT"
 for x in "${UNWIRED[@]:-}";     do [[ -n "$x" ]] && printf 'UNWIRED      %s — exit status is NOT wired to its assertions; it cannot fail CI\n' "$x"; done
 for x in "${UNPROBEABLE[@]:-}"; do [[ -n "$x" ]] && printf 'UNPROBEABLE  %s — no identifiable verdict variable; NOT counted clean\n' "$x"; done
 for x in "${NOT_REACHED[@]:-}";  do [[ -n "$x" ]] && printf 'not-reached  %s — skipped before the verdict here; probed in an environment where it runs\n' "$x"; done
 for x in "${ALLOWED[@]:-}";     do [[ -n "$x" ]] && printf 'allowlisted  %s — unprobeable, permitted by name with a recorded reason\n' "$x"; done
 for x in "${ALREADY_RED[@]:-}"; do [[ -n "$x" ]] && printf 'ALREADY-RED  %s — failed its own clean run; reported, not probed\n' "$x"; done
+for x in "${TIMED_OUT[@]:-}";   do [[ -n "$x" ]] && printf 'timed-out    %s — the CLOCK ran out, not an assertion; not counted as probed, so the union will say so if every environment times it out\n' "$x"; done
 
 # DIVE-2018: the machine-readable half. `not-reached` is still not a failure HERE
 # — a skip is not an accusation — so this run cannot establish coverage on its own.
@@ -227,6 +267,7 @@ if [[ -n "$REPORT" ]]; then
     for x in "${ALLOWED[@]:-}";     do [[ -n "$x" ]] && printf 'allowlisted\t%s\n'  "${x%% *}"; done
     for x in "${NOT_REACHED[@]:-}"; do [[ -n "$x" ]] && printf 'not-reached\t%s\n'  "${x%% *}"; done
     for x in "${ALREADY_RED[@]:-}"; do [[ -n "$x" ]] && printf 'already-red\t%s\n'  "${x%% *}"; done
+    for x in "${TIMED_OUT[@]:-}";   do [[ -n "$x" ]] && printf 'timed-out\t%s\n'    "${x%% *}"; done
     # Terminating `:` is load-bearing. A brace group's status is its LAST command's,
     # and every loop above ends on `[[ -n "$x" ]] && printf` — which is FALSE, not an
     # error, whenever that category is empty. Without this the guard below fired on a
@@ -240,7 +281,7 @@ if [[ -n "$REPORT" ]]; then
   # (full disk) leaves a truncated file that the redirect status cannot see. The row
   # count must match what we classified, or the report is not usable as evidence.
   rows=$(grep -cv '^#' "$REPORT")
-  want=$(( ${#WIRED[@]} + ${#UNWIRED[@]} + ${#UNPROBEABLE[@]} + ${#ALLOWED[@]} + ${#NOT_REACHED[@]} + ${#ALREADY_RED[@]} ))
+  want=$(( ${#WIRED[@]} + ${#UNWIRED[@]} + ${#UNPROBEABLE[@]} + ${#ALLOWED[@]} + ${#NOT_REACHED[@]} + ${#ALREADY_RED[@]} + ${#TIMED_OUT[@]} ))
   if (( rows != want )); then
     printf 'probe: report %s has %d rows, classified %d — refusing to emit a partial report\n' "$REPORT" "$rows" "$want" >&2
     exit 1

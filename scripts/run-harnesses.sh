@@ -25,6 +25,9 @@
 #      because the failing harness is the thing to fix first)
 #   4  every harness passed, run is OVER BUDGET
 #   3  the corpus could not be classified into tiers (see tests/lib/tier.sh)
+#   5  every harness passed and the run is inside budget, but a harness HEADER
+#      claims a measured time the clock just refuted by >= 50% (DIVE-2555). Same
+#      reason 4 is not 1: the remedy is different, so the code is different.
 #   2  usage
 set -uo pipefail
 cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." || exit 2
@@ -118,10 +121,42 @@ done
 total_s=$(( (total_ms + 999) / 1000 ))
 pct=0; (( BUDGET > 0 )) && pct=$(( total_s * 100 / BUDGET ))
 
+# DIVE-2555: GRADE EACH HEADER'S OWN NUMBER AGAINST THE CLOCK THAT JUST RAN IT.
+#
+# `# TIER: nightly — 14.3s measured` is the entire argument a reviewer gets that a
+# cost was MOVED rather than hidden, and nothing has ever re-read it: it is a
+# comment, written once, in a file whose runtime nobody measures again. Measured
+# 2026-08-03, gate_channel_session_t2_mutation.sh claimed 300.0s and ran 335s on the
+# control plane, and neither figure carried an environment or a date, so no reading
+# could refute another.
+#
+# This costs nothing: MS[] is already the measurement, taken in the run that had to
+# happen anyway. It is the same principle as the budget itself (enforce on the number
+# you MEASURE, never on a table of per-file costs) turned on the table.
+#
+# A harness that FAILED is skipped — an aborted run's wall-clock is not a measurement
+# of what the harness costs, and accusing its header of drift on that evidence is the
+# same error, inverted.
+drift=(); drift_fatal=0
+for i in "${!NAME[@]}"; do
+  (( RC[i] == 0 )) || continue
+  claim="$(tier_claim "${NAME[$i]}")"
+  [[ -n "$claim" ]] || continue
+  claim_ms=$(awk -v c="$claim" 'BEGIN{printf "%d", c*1000 + 0.5}')
+  (( claim_ms > 0 && MS[i] > claim_ms )) || continue
+  gap_ms=$(( MS[i] - claim_ms )); over_pct=$(( gap_ms * 100 / claim_ms ))
+  (( gap_ms >= TIER_CLAIM_DRIFT_WARN_S * 1000 && over_pct >= TIER_CLAIM_DRIFT_WARN_PCT )) || continue
+  sev="stale"
+  if (( over_pct >= TIER_CLAIM_DRIFT_FAIL_PCT && gap_ms >= TIER_CLAIM_DRIFT_FAIL_S * 1000 )); then
+    sev="WRONG"; drift_fatal=1
+  fi
+  drift+=("$(printf '%s\t%s\t%s\t%s' "$sev" "${NAME[$i]}" "$claim" "${MS[$i]}")")
+done
+
 if [[ -n "$REPORT" ]]; then
   {
-    printf '# run-harnesses report\n# tier=%s\n# label=%s\n# shard=%s\n# harnesses=%d\n# wall_clock_s=%d\n# budget_s=%d\n# pct_of_budget=%d\n' \
-      "$TIER" "$LABEL" "${SHARD:-1/1}" "${#CORPUS[@]}" "$total_s" "$BUDGET" "$pct"
+    printf '# run-harnesses report\n# tier=%s\n# label=%s\n# shard=%s\n# harnesses=%d\n# wall_clock_s=%d\n# budget_s=%d\n# pct_of_budget=%d\n# header_drift=%d\n' \
+      "$TIER" "$LABEL" "${SHARD:-1/1}" "${#CORPUS[@]}" "$total_s" "$BUDGET" "$pct" "${#drift[@]}"
     for i in "${!NAME[@]}"; do printf '%s\t%s\t%s\n' "${MS[$i]}" "${RC[$i]}" "${NAME[$i]}"; done
   } > "$REPORT"
 fi
@@ -162,10 +197,35 @@ elif (( pct >= 80 )); then
   printf 'The %d slowest in this tier:\n' "$TOP"; slowest "$TOP"
 fi
 
+# DIVE-2555. Printed whatever else happened, because a header that no longer matches
+# the clock is exactly as wrong in a run that went red for another reason.
+if (( ${#drift[@]} )); then
+  printf '\nharness-budget[%s/%s]: %d HEADER MEASUREMENT(S) THE CLOCK JUST REFUTED.\n' \
+    "$TIER" "$LABEL" "${#drift[@]}"
+  printf 'A demotion is argued in the diff with its own number, and that number is the only\n'
+  printf 'evidence a reviewer has that a cost was MOVED rather than hidden. An optimistic one\n'
+  printf 'is a demotion argued on a figure nobody grades. Replace the header line with the\n'
+  printf 'measurement below, and say WHERE it was taken — a figure with no environment on it\n'
+  printf 'cannot be refuted by the next reading, only silently disagreed with:\n'
+  for d in "${drift[@]}"; do
+    IFS=$'\t' read -r sev nm claim ms <<<"$d"
+    printf '  %-5s %s\n' "$sev" "$nm"
+    printf '        claims %ss measured, ran %.1fs here (+%d%%) on %s\n' \
+      "$claim" "$(awk -v m="$ms" 'BEGIN{print m/1000}')" \
+      "$(( ( ms - $(awk -v c="$claim" 'BEGIN{printf "%d", c*1000 + 0.5}') ) * 100 / $(awk -v c="$claim" 'BEGIN{printf "%d", c*1000 + 0.5}') ))" \
+      "$LABEL"
+    printf '        # TIER: nightly — %.1fs measured (%s, <date>): <why this cannot be in the %ds PR core>\n' \
+      "$(awk -v m="$ms" 'BEGIN{print m/1000}')" "$LABEL" "$TIER_BUDGET_CORE"
+  done
+  (( drift_fatal )) && printf 'At least one is marked WRONG (>= %d%% and >= %ds under): that is not runner variance.\n' \
+    "$TIER_CLAIM_DRIFT_FAIL_PCT" "$TIER_CLAIM_DRIFT_FAIL_S"
+fi
+
 if (( ${#failed[@]} )); then
   printf '\n%d harness(es) FAILED:\n' "${#failed[@]}"
   printf '  %s\n' "${failed[@]}"
   exit 1
 fi
 (( over == 0 )) || exit 4
+(( drift_fatal == 0 )) || exit 5
 exit 0
