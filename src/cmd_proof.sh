@@ -618,8 +618,24 @@ if graded_db:
         "graded": graded_db,
     }
     if shipped_db:
-        fp_entry["shipped"] = shipped_db
+        # DIVE-2654 review (main2): NOT named "shipped" — this datapoint's own
+        # week.shipped above is a DIVE-1552 FROZEN SUM over the last 7
+        # PUBLISHED daily datapoints (overwritten in from `hist[-7:]` after
+        # `row` is built), while this is a LIVE datetime('now','-7 days') SQL
+        # count. Two instruments both labelled "7d" in the same file is
+        # exactly the defect this row exists to prevent, and the gap between
+        # them WIDENS for as long as publishing stays paused (hist[-7:] then
+        # spans more than 7 calendar days while this SQL span stays exactly
+        # 7) — so the name and basis travel with the number rather than
+        # trusting a shared label.
+        fp_entry["shippedStandardTasks"] = shipped_db
         fp_entry["coveragePct"] = round(graded_db / shipped_db * 100, 1)
+        fp_entry["basis"] = ("live tasks.db query: status='done' AND kind='standard' AND done_at "
+                              "within the last 7 calendar days from datetime('now') — a DIFFERENT "
+                              "instrument from this datapoint's own week.shipped above (a frozen sum "
+                              "of the last 7 PUBLISHED daily datapoints, DIVE-1552, which can span "
+                              "more than 7 calendar days while publishing is paused). Do not read "
+                              "the two as the same number.")
     if iter_null_db:
         fp_entry["iterationNullGraded"] = iter_null_db
         fp_entry["iterationNullBiasPctPtsMax"] = round(iter_null_db / graded_db * 100, 1)

@@ -190,6 +190,11 @@ OUT7="$( cd "$W7" && \
   && ok_t "LEAD: verifier first-pass rate = 124/192 = 64.6%" || bad_t "first-pass value" "$(cat "$W7/zero-human.json")"
 [[ "$(jget "$W7/zero-human.json" "['corroborators']['verifierFirstPassRate']['coveragePct']")" == "59.1" ]] \
   && ok_t "LEAD carries its own coverage: 192 of 325 shipped = 59.1%" || bad_t "coveragePct"
+[[ "$(jget "$W7/zero-human.json" "['corroborators']['verifierFirstPassRate']['shippedStandardTasks']")" == "325" ]] \
+  && ok_t "LEAD names its denominator shippedStandardTasks (NOT the bare key 'shipped', DIVE-2654 review)" || bad_t "shippedStandardTasks key"
+[[ "$(jget "$W7/zero-human.json" "['corroborators']['verifierFirstPassRate']['basis']")" == *"week.shipped"* \
+   && "$(jget "$W7/zero-human.json" "['corroborators']['verifierFirstPassRate']['basis']")" == *"DIVE-1552"* ]] \
+  && ok_t "LEAD discloses it is a DIFFERENT instrument from week.shipped (frozen sum, DIVE-1552)" || bad_t "basis disclosure" "$(jget "$W7/zero-human.json" "['corroborators']['verifierFirstPassRate']['basis']")"
 [[ "$(jget "$W7/zero-human.json" "['corroborators']['verifierFirstPassRate']['iterationNullBiasPctPtsMax']")" == "1.6" ]] \
   && ok_t "LEAD discloses the iteration-NULL upward bias (3/192 <= 1.6pp)" || bad_t "iterationNullBiasPctPtsMax"
 [[ "$(jget "$W7/zero-human.json" "['corroborators']['policyBlockedAttempts']['value']")" == "126" ]] \
@@ -225,6 +230,35 @@ W8="$TMP/w8"; mkdir -p "$W8"
    && "$(jget "$W8/zero-human.json" "['corroborators']['policyBlockedAttempts']['nodata']")" != "" ]] \
   && ok_t "no CORR_REFUSALS/CORR_SITES -> policy-blocked degrades to NO DATA with a reason, never 0" \
   || bad_t "policy-blocked no-data" "$(cat "$W8/zero-human.json")"
+
+# --- Case 9 (DIVE-2654 review, main2): a fixture that CANNOT agree for the
+# wrong reason. Case 7 seeded no prior history, so week.shipped (frozen sum)
+# and shippedStandardTasks (live SQL) both landed on whatever the single fresh
+# day supplied and collapsed to the SAME value — a fixture in that shape is
+# structurally incapable of telling the two instruments apart
+# (community/wiki/an-empty-fixture-makes-a-frozen-sum-impersonate-a-live-count.md).
+# Seed >=7 prior daily datapoints so the frozen week.shipped sum is a real,
+# different number from the live shippedStandardTasks the corroborator reports,
+# and assert they stay visibly distinguishable in the same emitted file.
+W9="$TMP/w9"; mkdir -p "$W9"
+: > "$W9/history.jsonl"
+for i in 1 2 3 4 5 6 7; do
+  printf '{"cliVersion":"0.18.0","date":"2026-07-%02d","day":{"humanAsks":1,"shipped":10},"week":{"humanAsks":0,"shipped":0}}\n' "$((3+i))" >> "$W9/history.jsonl"
+done
+( cd "$W9" && \
+  DAY_JSON='{"zeroHuman":{"shipped":12,"humanTouches":2}}' \
+  WEEK_JSON='{"zeroHuman":{"shipped":3,"humanTouches":0}}' \
+  TODAY="2026-07-11" NOW_ISO="2026-07-11T00:00:00Z" \
+  CLI_VERSION="0.18.0" METHODOLOGY_URL="https://example.test/zero-human.md" \
+  CORR_ROWS="325|192|124|3" \
+  CORR_REFUSALS="126" CORR_FIRED_WINDOW="13" CORR_FIRED_LIFETIME="16" CORR_SITES="26" \
+  CORR_LEDGER_SINCE="2026-07-25 12:04:00" \
+  python3 "$TMP/proof.py" ) >/dev/null
+W9_WEEK="$(jget "$W9/zero-human.json" "['week']['shipped']")"                                          # frozen: 6*10+12=72
+W9_CORR="$(jget "$W9/zero-human.json" "['corroborators']['verifierFirstPassRate']['shippedStandardTasks']")"  # live fixture: 325
+[[ -n "$W9_WEEK" && -n "$W9_CORR" && "$W9_WEEK" != "$W9_CORR" ]] \
+  && ok_t "DIVE-2654 point 4: populated history makes frozen week.shipped ($W9_WEEK) and live shippedStandardTasks ($W9_CORR) DISAGREE, proving the fixture can detect the two instruments" \
+  || bad_t "frozen vs live no longer distinguishable" "week.shipped=$W9_WEEK shippedStandardTasks=$W9_CORR"
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [[ $FAIL -eq 0 ]] || exit 1
