@@ -32,6 +32,7 @@ cat \
   src/lib/state.sh \
   src/lib/env_overrides.sh \
   src/lib/capability.sh \
+  src/lib/broker.sh \
   src/lib/disk.sh \
   src/lib/audit.sh \
   src/lib/registry.sh \
@@ -75,6 +76,7 @@ cat \
   src/cmd_proof.sh \
   src/cmd_selfcheck.sh \
   src/cmd_push.sh \
+  src/cmd_deploy.sh \
   src/cmd_gh.sh \
   src/cmd_memory.sh \
   src/cmd_pack.sh \

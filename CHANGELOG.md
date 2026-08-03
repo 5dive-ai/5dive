@@ -51,6 +51,37 @@ differential on the same PR number in the same repo so a hardcoded label fails a
 Graded by mutation: always-cited, always-delivered, filter-cited-out, and drop-the-column each
 turn arms red.
 
+## Unreleased — feat(broker): generalize the capability broker and fold in delegated deploy (INST-5)
+
+`5dive push` was our only brokered capability: a dangerous action an agent can take without ever
+holding a credential, gated on a cleared human/lead decision and executed atomically as root.
+INST-5 asked to extend that template to the next surfaces — email, deploy, DNS, payments, secrets,
+data-export. This lands the primitive and the first new surface.
+
+The counterintuitive part is which half of delegated push generalizes. Its headline security
+property is a repo-SCOPED, SHORT-LIVED token minted per use, and that half does NOT port: it
+exists only because GitHub Apps expose a mint-on-demand API we can drive from the control plane.
+Measured against our own Vercel credential, `POST /v3/user/tokens` returns HTTP 403 — there is no
+equivalent to drive. Defining the broker as "it mints scoped short-lived credentials" would put
+five of six surfaces out of scope by definition. The portable contract is the part that reads as
+plumbing: a policy predicate plus a target binding, feeding a root-only single-action executor
+that takes its parameters on stdin, feeding an audit record and a capability row.
+
+`src/lib/broker.sh` holds that, surface-agnostic, plus the one surface table the sudoers policy,
+the capability registry and every refusal string now derive from. `_push_gate_check` and
+`_push_bind_branch` become one-line bindings of it, and the move is proven inert rather than
+asserted to be: `tests/broker_surface_unit.sh` runs both the new and the pre-refactor
+implementations over the same 13 fixture states and compares refusal text and exit status byte for
+byte.
+
+`5dive deploy <task>` is the first new executor. It deploys only the `Deploy: <project>@<ref>` the
+task itself declares, only after that task's gate clears, with `VERCEL_TOKEN` read root-only and
+never handed to the agent. It also gets a bound push does not have: the git repo is not a
+parameter — it is read from the Vercel project's own link, so a granted agent cannot point one of
+our projects at a repo it chose. The capability is a separate axis from `--can-push`
+(`agent create --can-deploy`), because shipping a branch for review and shipping to production are
+different authorities.
+
 ## Unreleased — fix(task): refuse a close that would REPLACE an already-closed row's result (DIVE-2464)
 
 `5dive task done <id> --result=...` on a row that was already done overwrote the result column and

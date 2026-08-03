@@ -3,6 +3,7 @@ create_agent_user() {
   # tier (cmd_create resolves standard-by-default + bootstrap-admin). The
   # fallback here is 'standard', never 'admin', so no path silently grants root.
   local name="$1" isolation="${2:-standard}" can_push="${3:-0}"
+  local can_deploy="${4:-0}"     # INST-5: the broker's delegated-deploy surface
   local user="agent-${name}"
   if ! id -u "$user" &>/dev/null; then
     adduser --disabled-password --gecos "" "$user" >/dev/null
@@ -33,7 +34,7 @@ create_agent_user() {
   if [[ "$isolation" == "admin" ]]; then
     write_admin_sudoers "$user"
   elif [[ "$isolation" == "standard" ]]; then
-    write_standard_sudoers "$user" "$can_push"
+    write_standard_sudoers "$user" "$can_push" "$can_deploy"
   else
     rm -f "/etc/sudoers.d/${user}"
   fi
@@ -513,6 +514,8 @@ agent_sudo_grant() {
 # visudo-validates + installs it.
 render_standard_sudoers() {
   local user="$1" can_push="${2:-0}"
+  # INST-5: delegated deploy, the broker's second surface, on its own axis.
+  local can_deploy="${3:-0}"
   cat <<SUDOERS
 # Managed by 5dive (DIVE-1065/1074). Scoped inter-agent a2a grants for standard agent ${user}.
 # Do not edit by hand; regenerated on agent create/provision.
@@ -544,12 +547,30 @@ ${user} ALL=(root) NOPASSWD: /usr/local/bin/5dive _push_do
 ${user} ALL=(root) NOPASSWD: /usr/local/bin/5dive _gh_do
 SUDOERS
   fi
+  if [[ "$can_deploy" == "1" ]]; then
+    cat <<SUDOERS
+# INST-5: delegated-deploy capability, the capability broker's SECOND surface.
+# Same template as the push grant: exact command path, params over stdin (no arg
+# wildcard, so it holds identically under classic sudo and sudo-rs), gate
+# re-verified authoritatively inside _deploy_do under signature, and the target
+# bound to the Deploy line the task itself declares.
+# Deliberately a SEPARATE axis from can_push: shipping a branch for review and
+# shipping to PRODUCTION are different authorities, and the capability registry
+# records them under different names.
+# NOTE FOR THE NEXT EDITOR: this heredoc is UNQUOTED (it interpolates the user),
+# so a backtick or a dollar sign in a COMMENT is executed and its output lands
+# in the sudoers file. Keep this block free of both.
+${user} ALL=(root) NOPASSWD: /usr/local/bin/5dive _deploy_do
+SUDOERS
+  fi
 }
 
 write_standard_sudoers() {
-  local user="$1" can_push="${2:-0}" f="/etc/sudoers.d/${user}" tmp
+  local user="$1" can_push="${2:-0}"
+  local can_deploy="${3:-0}"
+  local f="/etc/sudoers.d/${user}" tmp
   tmp=$(mktemp)
-  render_standard_sudoers "$user" "$can_push" > "$tmp"
+  render_standard_sudoers "$user" "$can_push" "$can_deploy" > "$tmp"
   chmod 440 "$tmp"
   if visudo -cf "$tmp" >/dev/null 2>&1; then
     chown root:root "$tmp"
@@ -562,7 +583,7 @@ write_standard_sudoers() {
     # copies minted at different moments IS the drift shape. This is the record
     # OF the authoritative write, taken at the instant it succeeds.
     # Best-effort: it never fails the install (see capability_declare_standard).
-    capability_declare_standard "$user" "$can_push" provisioned
+    capability_declare_standard "$user" "$can_push" provisioned "$can_deploy"
   else
     rm -f "$tmp"
     fail "$E_GENERIC" "generated sudoers for ${user} failed visudo validation; aborting (no partial install)"
@@ -724,6 +745,11 @@ write_agent_env() {
   if [[ -z "$can_push" && -r "$env_file" ]]; then
     can_push=$(sed -n 's/^AGENT_CAN_PUSH=//p' "$env_file" | head -1)
   fi
+  # INST-5: same PRESERVE-unless-overridden discipline for delegated deploy.
+  local can_deploy="${_CAN_DEPLOY_OVERRIDE:-}"
+  if [[ -z "$can_deploy" && -r "$env_file" ]]; then
+    can_deploy=$(sed -n 's/^AGENT_CAN_DEPLOY=//p' "$env_file" | head -1)
+  fi
   {
     printf 'AGENT_NAME=%s\n' "$name"
     printf 'AGENT_TYPE=%s\n' "$type"
@@ -733,6 +759,7 @@ write_agent_env() {
     printf 'AGENT_ISOLATION=%s\n' "$isolation"
     [[ -n "$autonomy" && "$autonomy" != "standard" ]] && printf 'AGENT_AUTONOMY=%s\n' "$autonomy"
     [[ "$can_push" == "1" ]] && printf 'AGENT_CAN_PUSH=1\n'
+    [[ "$can_deploy" == "1" ]] && printf 'AGENT_CAN_DEPLOY=1\n'
     # New telegram agents flow through our 5dive-plugins fork (bundled
     # hooks, richer slash commands). 5dive-agent-start reads this var to
     # build the runtime --channels arg, defaulting to claude-plugins-official
@@ -1164,6 +1191,7 @@ cmd_create() {
   local isolation="" isolation_explicit=0 no_team_bot=0
   local autonomy="standard"   # DIVE-499
   local can_push=0            # DIVE-1462/STEER-4: delegated-push (builder) capability
+  local can_deploy=0          # INST-5: delegated-deploy (production ship) capability
   local inherit_memory=""     # DIVE-990 memory-as-onboarding
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -1189,12 +1217,13 @@ cmd_create() {
       --isolation=*)               isolation="${1#--isolation=}"; isolation_explicit=1 ;;
       --inherit-memory=*)          inherit_memory="${1#--inherit-memory=}" ;;
       --can-push)                  can_push=1 ;;
+      --can-deploy)                can_deploy=1 ;;
       -*)                          fail "$E_USAGE" "unknown flag: $1" ;;
       *)                           [[ -z "$name" ]] && name="$1" || fail "$E_USAGE" "extra arg: $1" ;;
     esac
     shift
   done
-  [[ -n "$name" ]] || fail "$E_USAGE" "usage: 5dive agent create <name> --type=<type> [--channels=none|telegram|discord|dashboard[,ch...]] [--telegram-token=<token|->] [--telegram-cos=<child-username>] [--telegram-cos-avatar=<png>] [--telegram-home-channel=<id>] [--telegram-allowed-users=<csv>] [--discord-token=<token|->] [--workdir=<path>] [--auth-profile=<name>] [--provider=<id> --api-key=<key|->] [--model=<slug>] [--with-skills=<spec>[,...]] [--no-skills] [--no-team-bot] [--defer-auth] [--isolation=admin|standard|sandboxed] [--can-push] [--inherit-memory=wiki|all|team|<agent>[,...]]"
+  [[ -n "$name" ]] || fail "$E_USAGE" "usage: 5dive agent create <name> --type=<type> [--channels=none|telegram|discord|dashboard[,ch...]] [--telegram-token=<token|->] [--telegram-cos=<child-username>] [--telegram-cos-avatar=<png>] [--telegram-home-channel=<id>] [--telegram-allowed-users=<csv>] [--discord-token=<token|->] [--workdir=<path>] [--auth-profile=<name>] [--provider=<id> --api-key=<key|->] [--model=<slug>] [--with-skills=<spec>[,...]] [--no-skills] [--no-team-bot] [--defer-auth] [--isolation=admin|standard|sandboxed] [--can-push] [--can-deploy] [--inherit-memory=wiki|all|team|<agent>[,...]]"
   [[ -n "$type" ]] || fail "$E_USAGE" "--type is required"
   valid_name "$name" || fail "$E_VALIDATION" "invalid name (lowercase letters/digits/hyphens, start letter, <=16 chars)"
   is_known_type "$type" || fail "$E_NOT_FOUND" "unknown type: $type (known: ${!TYPE_BIN[*]})"
@@ -1252,6 +1281,13 @@ cmd_create() {
     case "$isolation" in
       sandboxed) fail "$E_VALIDATION" "--can-push is incompatible with --isolation=sandboxed (a sandboxed agent gets no sudoers, so it cannot be granted delegated push)." ;;
       admin)     can_push=0; warn "--can-push is redundant for an admin agent (admin sudo already permits '5dive _push_do'); ignoring." ;;
+    esac
+  fi
+  # INST-5: --can-deploy, identical posture to --can-push above.
+  if (( can_deploy )); then
+    case "$isolation" in
+      sandboxed) fail "$E_VALIDATION" "--can-deploy is incompatible with --isolation=sandboxed (a sandboxed agent gets no sudoers, so it cannot be granted delegated deploy)." ;;
+      admin)     can_deploy=0; warn "--can-deploy is redundant for an admin agent (admin sudo already permits '5dive _deploy_do'); ignoring." ;;
     esac
   fi
   # DIVE-990: validate every inherit-memory scope token (wiki|all|team|<agent-name>).
@@ -1603,7 +1639,7 @@ cmd_create() {
   fi
 
   step "Creating user agent-${name}"
-  create_agent_user "$name" "$isolation" "$can_push"
+  create_agent_user "$name" "$isolation" "$can_push" "$can_deploy"
 
   if [[ "$isolation" == "sandboxed" ]]; then
     step "Applying sandbox resource limits for agent-${name}"
@@ -1766,7 +1802,7 @@ cmd_create() {
   step "Writing agent env"
   # DIVE-499: stamp the autonomy mode into the env file (yolo/son-of-anton add the
   # approved directive at launch; standard = nothing).
-  _AUTONOMY_OVERRIDE="$autonomy" _CAN_PUSH_OVERRIDE="$can_push" \
+  _AUTONOMY_OVERRIDE="$autonomy" _CAN_PUSH_OVERRIDE="$can_push" _CAN_DEPLOY_OVERRIDE="$can_deploy" \
     write_agent_env "$name" "$type" "$channels" "$workdir" "$profile" "$isolation"
   link_agent_profile "$name" "$profile"
 
