@@ -83,8 +83,10 @@ audit_log() { :; }
 # 1 = false = an agent-* caller contributes no sudo-uid evidence.
 _PIN_SUDO_HUMAN=1
 _gate_sudo_uid_nonagent() { return "$_PIN_SUDO_HUMAN"; }
-FAKE_CALLER="root"
-id() { if [[ "${1:-}" == -un ]]; then echo "$FAKE_CALLER"; else command id "$@"; fi; }
+# DIVE-2601: the `id -un` stub that used to sit here was measured at ZERO
+# invocations across a full run of this file — nothing asks it, so it named a
+# caller nobody read. Deleted rather than left as documentation of a control that
+# is not happening. The UID SEAM below is the whole pin.
 # ...and the UID SEAM, which is what the human-only block actually reads since
 # DIVE-2330 iteration 2 replaced its `id -un` with _gate_caller_uid (EUID). Pinning
 # only the NAME above stopped modelling the caller at that point: on an agent-*

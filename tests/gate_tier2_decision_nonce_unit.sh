@@ -98,6 +98,38 @@ id() {
     *)   command id "$@" ;;
   esac
 }
+#
+# DIVE-2601 + DIVE-2610, RECONCILED: BOTH pins are load-bearing and neither
+# subsumes the other. `_gate_sudo_uid_nonagent` (src/lib/tasks_db.sh) calls
+# `id -u` DIRECTLY and never routes through `_gate_caller_uid`, so the seam
+# override below does NOT cover the T6 answer path — dropping the `id -u` stub
+# reverts DIVE-2610 and reds this harness at rc=6 on any agent-* box. Conversely
+# `_gate_uid_to_agent`/`task_actor` read `_gate_caller_uid`, which the `id` stub
+# does not reach. Keep both; assert both.
+# DIVE-2601: ALSO pinned through the seam the derivation reads ($EUID via
+# `_gate_caller_uid`). The `id -un` stub alone left that derivation unpinned, so
+# the caller's agent-ness on those arms came from the host. (The original DIVE-2601
+# note said the `id` stub was dead here; DIVE-2610 measured it live on the T6 path
+# via `id -u` — it is not dead, it is merely incomplete. Both pins stay.) uid 0 is
+# root on every host and claimed by no agent-*, so no passwd fixture is needed.
+_PIN_UID=0
+_gate_caller_uid() { printf '%s' "$_PIN_UID"; }
+# Assert the pin through the real resolver before any arm depends on it.
+# LIVENESS FIRST. The unclaimed check below FAILS OPEN: an unsourced lib/actor.sh, a
+# renamed resolver, a typo — every one arrives as '', which IS the pass value.
+# Measured on DIVE-2601 iteration 2 in gate_tier2_nonce_evidence_unit.sh, which
+# omitted lib/actor.sh: the assertion reduced to "the empty string is empty" and
+# could not fail. Probe with a SYNTHETIC passwd row in a subshell so the POSITIVE
+# case holds on any host, including a CI runner with no agent-* accounts.
+_probe="$(
+  _gate_passwd_stream() { printf 'agent-probe:x:424242:424242::/nonexistent:/bin/false\n'; }
+  _gate_uid_to_agent 424242
+)"
+[[ "$_probe" == "probe" ]] \
+  || { printf 'NOT OK - the identity resolver is not live: _gate_uid_to_agent returned %s for a synthetic agent-probe row (expected probe). Is lib/actor.sh in the source list?\n' "'$_probe'"; exit 1; }
+_pin_check="$(_gate_uid_to_agent "$(_gate_caller_uid)")"
+[[ -z "$_pin_check" ]] \
+  || { printf 'NOT OK - identity pin is inert: uid %s resolved to agent %s, expected a NON-agent caller\n' "$_PIN_UID" "'$_pin_check'"; exit 1; }
 export SUDO_UID=0
 
 seed_task() { db "INSERT INTO tasks (ident, title, status, created_by) VALUES ('$1','t','todo','main');"; }

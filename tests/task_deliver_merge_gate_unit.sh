@@ -50,6 +50,22 @@ chmod +x "$TMP/bin/sudo"
 # before $USER is ever read. DIVE-2066 recorded this as a $USER leak; measured
 # here it is SUDO_USER that dominates, which is why pinning $USER alone changed
 # nothing (still 9/2, actor still resolved to 'main').
+#
+# DIVE-2601 — AND THEN THAT PIN WENT INERT TOO, which is the whole point of this
+# row. DIVE-2518 sealed the `$USER`/`$SUDO_USER` path: it was never a test seam,
+# it was THE FORGERY (any unprivileged caller could act as another agent through
+# it), and `task_actor` no longer reads either var to decide WHO IS ACTING. So the
+# two exports below stopped pinning anything and the actor fell back to the host
+# again — 9/11 for dev2, and the same four-harness red that cost dev3 an hour on
+# DIVE-1953. Two agents lost an hour each to this exact file, one after the other,
+# because a pin that stops working does not fail: it goes quiet.
+#
+# The pin now goes through the SEALED seam (`tests/lib/actor_seam.sh`, DIVE-2518),
+# below and AFTER the libraries are sourced — `_gate_caller_uid`/`_gate_passwd_stream`
+# are functions, so sourcing lib/actor.sh after an override silently discards it.
+# The old exports are kept ONLY because `auto_sender_from_sudo` still reads them
+# for envelope PROVENANCE; they no longer decide the actor, and nothing below may
+# rely on them for that.
 SUDO_USER=agent-dev
 USER=agent-dev
 export SUDO_USER USER
@@ -109,6 +125,18 @@ for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh \
   # shellcheck source=/dev/null
   source "$SRC/$f"
 done
+# DIVE-2601: the actor pin, through the sealed seam and AFTER the sources above —
+# `_gate_caller_uid` / `_gate_passwd_stream` are FUNCTIONS, so an override placed
+# before `source lib/actor.sh` is redefined out of existence without a word.
+# shellcheck source=/dev/null
+. "$(dirname "${BASH_SOURCE[0]}")/lib/actor_seam.sh" \
+  || { printf 'NOT OK - tests/lib/actor_seam.sh not reachable; the actor cannot be pinned\n'; exit 1; }
+# ASSERT the pin through the real resolver before any arm leans on it. Without this
+# line the file is exactly what it was for two years: green where the host happens
+# to be `dev`, red everywhere else, and silent about which.
+actor_seam_selftest dev \
+  || { printf 'NOT OK - actor seam is inert: task_actor did not resolve to dev under the pin\n'; exit 1; }
+actor_seam_as dev
 STATE_DIR="$TMP"; TASKS_DIR="$STATE_DIR/tasks"; TASKS_DB="$TASKS_DIR/tasks.db"
 JSON_MODE=1
 mkdir -p "$TASKS_DIR"; set +e

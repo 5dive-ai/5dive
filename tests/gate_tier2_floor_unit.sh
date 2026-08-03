@@ -53,10 +53,38 @@ task_need_notify() { :; }
 audit_log() { :; }
 
 # The immediate caller is a non-agent (post-sudo root / dashboard-as-claude). This
-# isolates the tier-2 provenance floor from the DIVE-394 `id -un` agent block so a
-# rejection here proves the FLOOR fired, not the caller-uid guard.
-FAKE_CALLER="root"
-id() { if [[ "${1:-}" == -un ]]; then echo "$FAKE_CALLER"; else command id "$@"; fi; }
+# isolates the tier-2 provenance floor from the DIVE-394 caller-uid agent block so a
+# rejection here proves the FLOOR fired, not that guard.
+#
+# DIVE-2601: that isolation was NOT happening. The lines here used to be
+# `FAKE_CALLER=root` plus an `id()` stub answering `-un`, and since DIVE-2330 the
+# derivation does not read `id` at all — `_gate_caller_uid` reports $EUID and
+# `_gate_passwd_stream` walks /etc/passwd in pure bash, precisely so a PATH-shimmed
+# `id` cannot answer. Measured over a full run of this file the stub took ZERO
+# calls: the "non-agent caller" the comment promised was supplied by whoever ran
+# the suite — an agent uid on a dev box, an unclaimed `runner` uid on CI. Pin the
+# seam the derivation actually reads. uid 0 needs no passwd fixture: it is root on
+# every host and no agent-* account claims it, so this is true on CI too.
+_PIN_UID=0
+_gate_caller_uid() { printf '%s' "$_PIN_UID"; }
+# ...and ASSERT the pin through the real resolver before any arm leans on it. A pin
+# that silently yields nothing would make every refusal below look correct for the
+# wrong reason — the DIVE-2588 shape. Pattern: tests/gate_enforce_env_bypass_unit.sh:127-154.
+# LIVENESS FIRST. The unclaimed check below FAILS OPEN: an unsourced lib/actor.sh, a
+# renamed resolver, a typo — every one arrives as '', which IS the pass value.
+# Measured on DIVE-2601 iteration 2 in gate_tier2_nonce_evidence_unit.sh, which
+# omitted lib/actor.sh: the assertion reduced to "the empty string is empty" and
+# could not fail. Probe with a SYNTHETIC passwd row in a subshell so the POSITIVE
+# case holds on any host, including a CI runner with no agent-* accounts.
+_probe="$(
+  _gate_passwd_stream() { printf 'agent-probe:x:424242:424242::/nonexistent:/bin/false\n'; }
+  _gate_uid_to_agent 424242
+)"
+[[ "$_probe" == "probe" ]] \
+  || { printf 'NOT OK - the identity resolver is not live: _gate_uid_to_agent returned %s for a synthetic agent-probe row (expected probe). Is lib/actor.sh in the source list?\n' "'$_probe'"; exit 1; }
+_pin_check="$(_gate_uid_to_agent "$(_gate_caller_uid)")"
+[[ -z "$_pin_check" ]] \
+  || { printf 'NOT OK - identity pin is inert: uid %s resolved to agent %s, expected a NON-agent caller\n' "$_PIN_UID" "'$_pin_check'"; exit 1; }
 
 seed_task() { db "INSERT INTO tasks (ident, title, status, created_by) VALUES ('$1','t','todo','main');"; }
 answered() { db "SELECT CASE WHEN need_answered_at IS NULL THEN 'open' ELSE 'closed' END FROM tasks WHERE ident='$1';"; }
