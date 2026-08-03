@@ -610,13 +610,30 @@ cmd_push_do() {
   # Ask GitHub which installation owns the repo. Fall back to the pinned id when the
   # lookup cannot answer, so a box with one installation and no extra permission
   # behaves exactly as before.
+  #
+  # DIVE-2566: the assignment MUST NOT be allowed to fail the script. `curl -fsS`
+  # exits 22 on any HTTP >= 400, `pipefail` promotes that through the `| jq`, and a
+  # bare `var=$(...)` under `set -e` (src/header.sh:14) takes the whole push down —
+  # so the `elif [[ -z "$_inst_for_repo" ]]` fallback five lines below was
+  # UNREACHABLE in exactly the case it was written for: a repo outside every
+  # installation, where that endpoint 404s. Delegated push to any lodar/* repo died
+  # with a bare rc=22 and no message of its own.
+  #
+  # The trap is that the code was written the CAREFUL way. `local` is declared on
+  # its own line precisely so the substitution's exit status is not masked — the
+  # standard shellcheck-endorsed habit (`local x=$(cmd)` always returns 0 and hides
+  # failures). Here that correct habit is what makes the failure fatal. When a probe
+  # is ALLOWED to fail, splitting the declaration is not enough; the failure has to
+  # be handled explicitly, which is what the `|| _inst_for_repo=""` below does.
+  # Assigning empty rather than `|| true` is deliberate: it states the post-condition
+  # the fallback branch reads, instead of leaving it to the substitution's behaviour.
   local _inst_for_repo
   _inst_for_repo=$(curl -fsS --max-time 15 \
         -H "Authorization: Bearer ${jwt}" \
         -H "Accept: application/vnd.github+json" \
         -H "X-GitHub-Api-Version: 2022-11-28" \
         "https://api.github.com/repos/${slug}/installation" 2>/dev/null \
-        | jq -r '.id // empty')
+        | jq -r '.id // empty') || _inst_for_repo=""
   if [[ -n "$_inst_for_repo" && "$_inst_for_repo" != "$inst" ]]; then
     echo "[5dive] ${slug} belongs to installation ${_inst_for_repo}, not the pinned ${inst} — minting against the repo's own installation" >&2
     inst="$_inst_for_repo"
