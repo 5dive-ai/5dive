@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# TIER: nightly — 24.2s measured (DIVE-2525): does not fit the 300s PR core; the nightly sweep runs it.
 # DIVE-2089 isolated unit harness for the DECLARED-DISCUSSION floor appeal.
 #
 # THE DEFECT. The T2 category floor reads SUBJECT MATTER as risk and picks the
@@ -48,6 +49,9 @@ set -uo pipefail
 . "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh" \
   || printf 'grading tree: UNRESOLVED (tests/lib/grading_tree.sh not reachable; no tree named)\n' >&2
 cd "$(dirname "$0")/.."
+# DIVE-2518: `--from` is provenance; the TIER and ROUTING decisions read the uid
+# derivation, so an arm impersonating a filer must DERIVE as them.
+. "$(dirname "${BASH_SOURCE[0]}")/lib/actor_seam.sh"
 SRC=src
 TMP="$(mktemp -d /tmp/gate-discusses-unit.XXXXXX)"
 trap 'rm -rf "$TMP"' EXIT
@@ -55,7 +59,7 @@ trap 'rm -rf "$TMP"' EXIT
 # shellcheck disable=SC1090
 for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh \
          lib/agent_setup.sh lib/state.sh lib/audit.sh lib/registry.sh \
-         lib/tasks_db.sh cmd_task.sh cmd_org.sh cmd_project.sh; do
+         lib/tasks_db.sh lib/actor.sh cmd_task.sh cmd_org.sh cmd_project.sh; do
   # shellcheck source=/dev/null
   source "$SRC/$f"
 done
@@ -101,7 +105,7 @@ DESIGN_WHY="this is a data-model sizing question about how to REPRESENT credenti
 # ---------------------------------------------------------------------------
 # 1: THE REPRO, ask axis — a design decision naming 'credential' reaches the LEAD
 route_reset; seed DIVE-401
-cmd_task_need DIVE-401 --type=decision --from=dev \
+actor_seam_as dev; cmd_task_need DIVE-401 --type=decision --from=dev \
   --ask="$DESIGN_ASK" --options="capability|clearance" --recommend="clearance" \
   --discusses="$DESIGN_WHY" >/dev/null 2>&1
 [[ "$(tierof DIVE-401)" == "1" ]] && ok_t "repro/ask: declared design decision downgraded to tier 1" || bad_t "repro/ask tier 1" "got '$(tierof DIVE-401)'"
@@ -112,7 +116,7 @@ cmd_task_need DIVE-401 --type=decision --from=dev \
 # 2: THE REPRO, TITLE axis (DIVE-1957) — the ask is byte-neutral and the floor
 #    keyword lives ONLY in the task title, which the filer cannot reword.
 route_reset; seed DIVE-402 "design the token exchange between the runtime and the broker"
-cmd_task_need DIVE-402 --type=decision --from=dev \
+actor_seam_as dev; cmd_task_need DIVE-402 --type=decision --from=dev \
   --ask="Should the exchange be modelled as a synchronous call or an async queue?" \
   --options="sync|async" --recommend="async" \
   --discusses="a transport-shape design question; the title names the subsystem, nothing is being minted or handled" >/dev/null 2>&1
@@ -123,7 +127,7 @@ cmd_task_need DIVE-402 --type=decision --from=dev \
 #    If these ever pass at tier 1 the suite above is grading a floor that stopped
 #    firing for some other reason, and every arm is vacuous.
 route_reset; seed DIVE-403
-cmd_task_need DIVE-403 --type=decision --from=dev \
+actor_seam_as dev; cmd_task_need DIVE-403 --type=decision --from=dev \
   --ask="$DESIGN_ASK" --options="capability|clearance" --recommend="clearance" >/dev/null 2>&1
 [[ "$(tierof DIVE-403)" == "2" ]] && ok_t "mutation: same ask WITHOUT --discusses still floors to tier 2" || bad_t "mutation ask tier 2" "got '$(tierof DIVE-403)'"
 [[ "$HUMAN_PINGED" == "1" ]] && ok_t "mutation: same ask WITHOUT --discusses still pings the human" || bad_t "mutation ask pings human" "HUMAN_PINGED=$HUMAN_PINGED"
@@ -142,7 +146,7 @@ res404=$( JSON_MODE=0; cmd_task_need DIVE-404 --type=decision --from=dev \
 
 # 4: SAFETY — the non-appealable MONEY core survives any declaration.
 route_reset; seed DIVE-405
-cmd_task_need DIVE-405 --type=decision --from=dev \
+actor_seam_as dev; cmd_task_need DIVE-405 --type=decision --from=dev \
   --ask="How should we model the credential store, and do we refund the affected customers \$500 each?" \
   --options="A|B" --recommend="A" --discusses="mostly a data-model question" >/dev/null 2>&1
 [[ "$(tierof DIVE-405)" == "2" ]] && ok_t "safety: money residual refuses the appeal, stays tier 2" || bad_t "safety money tier 2" "got '$(tierof DIVE-405)'"
@@ -150,7 +154,7 @@ cmd_task_need DIVE-405 --type=decision --from=dev \
 
 # 5: SAFETY — the non-appealable IRREVERSIBLE-INFRA core survives any declaration.
 route_reset; seed DIVE-406
-cmd_task_need DIVE-406 --type=decision --from=dev \
+actor_seam_as dev; cmd_task_need DIVE-406 --type=decision --from=dev \
   --ask="Model the credential lifecycle — and revoke the leaked key + move the dns record while we are here?" \
   --options="A|B" --recommend="A" --discusses="framing it as a lifecycle design question" >/dev/null 2>&1
 [[ "$(tierof DIVE-406)" == "2" ]] && ok_t "safety: revoke/dns residual refuses the appeal, stays tier 2" || bad_t "safety infra tier 2" "got '$(tierof DIVE-406)'"
@@ -197,13 +201,13 @@ _gate_tier2_floor_hit "${SR_ASK_2146} ${SR_TITLE_2146}" \
   && bad_t "precondition: the floor is NOT the self-restart confirm's enforcer" "floor matched '$(_gate_tier2_floor_term "${SR_ASK_2146} ${SR_TITLE_2146}")' — the DIVE-2146 entanglement is now REAL and this ticket must re-open it" \
   || ok_t "precondition REFUTED: the real DIVE-2146 ask+title trip NO floor term — the floor never enforced the self-restart confirm"
 route_reset; seed DIVE-408 "$SR_TITLE_2146"
-cmd_task_need DIVE-408 --type=approval --from=dev --ask="$SR_ASK_2146" >/dev/null 2>&1
+actor_seam_as dev; cmd_task_need DIVE-408 --type=approval --from=dev --ask="$SR_ASK_2146" >/dev/null 2>&1
 sr_tier="$(tierof DIVE-408)"; sr_ping="$HUMAN_PINGED"
 [[ "$sr_ping" == "1" ]] && ok_t "precondition: the self-restart gate still reaches the paired human (tier $sr_tier), unchanged" || bad_t "precondition human reached" "tier=$sr_tier ping=$sr_ping"
 # And the counterfactual olivia actually cares about: hand main its pin back and
 # the gate is hard-human, by the pin, with or without this ticket.
 route_reset; seed DIVE-419 "$SR_TITLE_2146"
-cmd_task_need DIVE-419 --type=approval --from=dev --tier=2 --ask="$SR_ASK_2146" >/dev/null 2>&1
+actor_seam_as dev; cmd_task_need DIVE-419 --type=approval --from=dev --tier=2 --ask="$SR_ASK_2146" >/dev/null 2>&1
 [[ "$(tierof DIVE-419)" == "2" && "$HUMAN_PINGED" == "1" ]] \
   && ok_t "precondition: the pinned re-file (what DIVE-2146 actually did) is hard-human independent of the floor" \
   || bad_t "precondition pinned refile" "tier=$(tierof DIVE-419) ping=$HUMAN_PINGED"
@@ -211,7 +215,7 @@ cmd_task_need DIVE-419 --type=approval --from=dev --tier=2 --ask="$SR_ASK_2146" 
 # 8: SAFETY — an explicit --tier=2 pin is the caller's hard-human contract and
 #    outranks the appeal (DIVE-1957). Warn, do not obey.
 route_reset; seed DIVE-409
-cmd_task_need DIVE-409 --type=decision --from=dev --tier=2 \
+actor_seam_as dev; cmd_task_need DIVE-409 --type=decision --from=dev --tier=2 \
   --ask="$DESIGN_ASK" --options="capability|clearance" --recommend="clearance" \
   --discusses="$DESIGN_WHY" >/dev/null 2>&1
 [[ "$(tierof DIVE-409)" == "2" ]] && ok_t "safety: --tier=2 pin vetoes the appeal" || bad_t "safety pin tier 2" "got '$(tierof DIVE-409)'"
@@ -219,7 +223,7 @@ cmd_task_need DIVE-409 --type=decision --from=dev --tier=2 \
 
 # 9: SAFETY — the LEAD has no reviewer above them, so there is nobody to appeal TO.
 route_reset; seed DIVE-410
-cmd_task_need DIVE-410 --type=decision --from=main \
+actor_seam_as main; cmd_task_need DIVE-410 --type=decision --from=main \
   --ask="$DESIGN_ASK" --options="capability|clearance" --recommend="clearance" \
   --discusses="$DESIGN_WHY" >/dev/null 2>&1
 [[ "$(tierof DIVE-410)" == "2" ]] && ok_t "safety: lead-filed appeal has no reviewer, stays tier 2" || bad_t "safety lead tier 2" "got '$(tierof DIVE-410)'"
@@ -227,7 +231,7 @@ cmd_task_need DIVE-410 --type=decision --from=main \
 # 10: NO-OP — a decision the floor never touched is unchanged by the flag's absence
 #     AND by its presence (the appeal warns rather than silently re-tiering).
 route_reset; seed DIVE-411
-cmd_task_need DIVE-411 --type=decision --from=dev \
+actor_seam_as dev; cmd_task_need DIVE-411 --type=decision --from=dev \
   --ask="Should the dashboard column order be priority-first or age-first?" \
   --options="priority|age" --recommend="priority" >/dev/null 2>&1
 [[ "$(tierof DIVE-411)" == "1" ]] && ok_t "no-op: an unfloored decision is untouched (tier 1)" || bad_t "no-op tier 1" "got '$(tierof DIVE-411)'"
@@ -252,13 +256,13 @@ grep -q -- "--discusses" <<<"$ann2" && bad_t "announce/approval must NOT adverti
 # 13: AUDIT — the declaration is on the record whether it applied or was refused.
 #     That attributability is the whole reason a declaration beats a reworded ask.
 route_reset; seed DIVE-414
-cmd_task_need DIVE-414 --type=decision --from=dev \
+actor_seam_as dev; cmd_task_need DIVE-414 --type=decision --from=dev \
   --ask="$DESIGN_ASK" --options="capability|clearance" --recommend="clearance" \
   --discusses="$DESIGN_WHY" >/dev/null 2>&1
 grep -q "floor-appeal applied" "$AUDIT_FILE" && ok_t "audit: an APPLIED appeal is recorded" || bad_t "audit applied" "$(cat "$AUDIT_FILE")"
 grep -q "declared=" "$AUDIT_FILE" && ok_t "audit: the declared reason is recorded verbatim" || bad_t "audit declared" "$(cat "$AUDIT_FILE")"
 route_reset; seed DIVE-415
-cmd_task_need DIVE-415 --type=decision --from=dev \
+actor_seam_as dev; cmd_task_need DIVE-415 --type=decision --from=dev \
   --ask="Model the store, and refund the customer \$500?" --options="A|B" --recommend="A" \
   --discusses="claiming this is only design" >/dev/null 2>&1
 grep -q "floor-appeal refused" "$AUDIT_FILE" && ok_t "audit: a REFUSED appeal is recorded too (an attempt is evidence)" || bad_t "audit refused" "$(cat "$AUDIT_FILE")"

@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# TIER: nightly — 16.5s measured (DIVE-2525): does not fit the 300s PR core; the nightly sweep runs it.
 # DIVE-596 isolated unit harness for `5dive loop map | until-dry | collect`.
 #
 # Same isolation contract as loop_spawn_unit.sh: source src/ libs directly, point
@@ -28,7 +29,7 @@ trap 'rm -rf "$TMP"; [[ -n "${SIMPID:-}" ]] && kill "$SIMPID" 2>/dev/null' EXIT
 # shellcheck disable=SC1090
 for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh \
          lib/agent_setup.sh lib/state.sh lib/audit.sh lib/registry.sh \
-         lib/tasks_db.sh cmd_task.sh cmd_org.sh cmd_project.sh cmd_loop.sh; do
+         lib/tasks_db.sh lib/actor.sh cmd_task.sh cmd_org.sh cmd_project.sh cmd_loop.sh; do
   # shellcheck source=/dev/null
   source "$SRC/$f"
 done

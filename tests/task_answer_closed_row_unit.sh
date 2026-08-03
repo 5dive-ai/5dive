@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# TIER: nightly — 39.5s measured (DIVE-2525): does not fit the 300s PR core; the nightly sweep runs it.
 # DIVE-2228 — `task answer` on a CLOSED row. The last open cell of the
 # closed-task writer matrix (DIVE-2112 / DIVE-2113 / DIVE-2116 are the others).
 #
@@ -35,6 +36,10 @@ set -uo pipefail
   || printf 'grading tree: UNRESOLVED (tests/lib/grading_tree.sh not reachable; no tree named)\n' >&2
 
 cd "$(dirname "$0")/.."
+# DIVE-2518: impersonate through the SEALED seam. `USER=agent-x` no longer moves
+# the actor — that env path WAS the forgery this ticket closed, and these arms
+# were leaning on it. tests/lib/actor_seam.sh explains the migration.
+. "$(dirname "${BASH_SOURCE[0]}")/lib/actor_seam.sh"
 
 # `manual` is a HUMAN-ONLY gate (DIVE-916) and that boundary reads the REAL unix
 # caller, not $USER/$SUDO_USER. Under an agent-* uid every manual case below is
@@ -51,8 +56,9 @@ TMP="$(mktemp -d /tmp/task-answer-closed-unit.XXXXXX)"
 trap 'rm -rf "$TMP"' EXIT
 
 for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh \
-         lib/agent_setup.sh lib/state.sh lib/broker.sh lib/audit.sh lib/registry.sh \
-         lib/disk.sh lib/tasks_db.sh cmd_task.sh cmd_push.sh cmd_org.sh cmd_project.sh; do
+         lib/agent_setup.sh lib/state.sh lib/broker.sh lib/audit.sh \
+         lib/registry.sh lib/disk.sh lib/tasks_db.sh lib/actor.sh cmd_task.sh \
+         cmd_push.sh cmd_org.sh cmd_project.sh; do
   # shellcheck source=/dev/null
   source "$SRC/$f"
 done
@@ -66,7 +72,7 @@ ok_t()  { PASS=$((PASS+1)); printf 'ok   - %s\n' "$1"; }
 bad_t() { FAIL=$((FAIL+1)); printf 'FAIL - %s\n       %s\n' "$1" "${2:-}"; }
 
 tasks_db_init
-as() { local who="$1"; shift; ( USER="agent-${who}"; SUDO_UID=""; SUDO_USER=""; "$@" ) 2>"$TMP"/err; }
+as() { local who="$1"; shift; ( actor_seam_as "${who}"; "$@" ) 2>"$TMP"/err; }
 # The live human paths (Telegram tap -> `sudo -n 5dive task answer`, dashboard
 # exec as claude) are non-agent unix callers with a non-agent SUDO_UID.
 as_human() { ( SUDO_UID="1000"; SUDO_USER="lodar"; "$@" ) 2>"$TMP"/err; }
@@ -80,7 +86,7 @@ refusals()  { db "SELECT COUNT(*) FROM policy_refusals WHERE policy='task_answer
 ACK="verified PASS — the seal grades the bundle, not that src produces it"
 
 # ── instrument: without impersonation every case below is vacuous ─────────────
-actor_is() { ( USER="agent-$1"; SUDO_UID=""; SUDO_USER=""; task_actor ); }
+actor_is() { ( actor_seam_as "$1"; task_actor ); }
 [[ "$(actor_is dev2)" == "dev2" ]] \
   && ok_t "INSTRUMENT: harness impersonates a third party (task_actor -> dev2)" \
   || bad_t "INSTRUMENT: actor impersonation broken" "got '$(actor_is dev2)' — every case is vacuous"

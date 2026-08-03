@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# TIER: nightly — 21.3s measured (DIVE-2525): does not fit the 300s PR core; the nightly sweep runs it.
 # DIVE-2112 isolated unit harness for `task reject`'s actor + already-done guards.
 #
 # Found by olivia while VERIFYING DIVE-2067, whose refusal text pointed makers at
@@ -26,6 +27,10 @@ set -uo pipefail
 . "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh" \
   || printf 'grading tree: UNRESOLVED (tests/lib/grading_tree.sh not reachable; no tree named)\n' >&2
 cd "$(dirname "$0")/.."
+# DIVE-2518: impersonate through the SEALED seam. `USER=agent-x` no longer moves
+# the actor — that env path WAS the forgery this ticket closed, and these arms
+# were leaning on it. tests/lib/actor_seam.sh explains the migration.
+. "$(dirname "${BASH_SOURCE[0]}")/lib/actor_seam.sh"
 SRC=src
 
 TMP="$(mktemp -d /tmp/task-reject-actor-unit.XXXXXX)"
@@ -33,8 +38,9 @@ trap 'rm -rf "$TMP"' EXIT
 
 # shellcheck disable=SC1090
 for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh \
-         lib/agent_setup.sh lib/state.sh lib/broker.sh lib/audit.sh lib/registry.sh \
-         lib/disk.sh lib/tasks_db.sh cmd_task.sh cmd_push.sh cmd_org.sh cmd_project.sh; do
+         lib/agent_setup.sh lib/state.sh lib/broker.sh lib/audit.sh \
+         lib/registry.sh lib/disk.sh lib/tasks_db.sh lib/actor.sh cmd_task.sh \
+         cmd_push.sh cmd_org.sh cmd_project.sh; do
   # shellcheck source=/dev/null
   source "$SRC/$f"
 done
@@ -48,8 +54,8 @@ ok_t()  { PASS=$((PASS+1)); printf 'ok   - %s\n' "$1"; }
 bad_t() { FAIL=$((FAIL+1)); printf 'FAIL - %s\n   %s\n' "$1" "${2:-}"; }
 
 tasks_db_init
-as() { local who="$1"; shift; ( USER="agent-${who}"; SUDO_UID=""; SUDO_USER=""; "$@" ) 2>"$TMP"/err; }
-actor_is() { ( USER="agent-$1"; SUDO_UID=""; SUDO_USER=""; task_actor ); }
+as() { local who="$1"; shift; ( actor_seam_as "${who}"; "$@" ) 2>"$TMP"/err; }
+actor_is() { ( actor_seam_as "$1"; task_actor ); }
 
 [[ "$(actor_is dev)" == "dev" ]] && ok_t "harness can impersonate an actor (task_actor -> dev)" \
   || bad_t "actor impersonation" "got '$(actor_is dev)' — every case below would be vacuous"

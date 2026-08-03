@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# TIER: nightly — 23.6s measured (DIVE-2525): does not fit the 300s PR core; the nightly sweep runs it.
 # DIVE-2011 isolated unit harness for LEAD-ROUTE DELIVERY TELEMETRY.
 #
 # What this pins, and why each assertion exists rather than being obvious:
@@ -38,6 +39,9 @@ set -uo pipefail
 . "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh" \
   || printf 'grading tree: UNRESOLVED (tests/lib/grading_tree.sh not reachable; no tree named)\n' >&2
 cd "$(dirname "$0")/.."
+# DIVE-2518: `--from` is provenance; TIER and ROUTING read the uid derivation, so an
+# arm impersonating a filer must DERIVE as them. tests/lib/actor_seam.sh.
+. "$(dirname "${BASH_SOURCE[0]}")/lib/actor_seam.sh"
 SRC=src
 TMP="$(mktemp -d /tmp/gate-route-delivery-unit.XXXXXX)"
 trap 'rm -rf "$TMP"' EXIT
@@ -45,7 +49,7 @@ trap 'rm -rf "$TMP"' EXIT
 # shellcheck disable=SC1090
 for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh \
          lib/agent_setup.sh lib/state.sh lib/audit.sh lib/registry.sh \
-         lib/tasks_db.sh cmd_task.sh; do
+         lib/tasks_db.sh lib/actor.sh cmd_task.sh; do
   # shellcheck source=/dev/null
   source "$SRC/$f"
 done
@@ -220,7 +224,7 @@ eval "$_real_route"
 # re-nag sweep, the privileged re-send, a plain human gate) can fall into the
 # routed deliverer.
 reset_log; seed DIVE-13; HUMAN_PINGED=0; SEND_RC=0
-cmd_task_need DIVE-13 --type=decision --ask="ship?" --from=main >/dev/null 2>&1   # lead files → human
+actor_seam_as main; cmd_task_need DIVE-13 --type=decision --ask="ship?" --from=main >/dev/null 2>&1   # lead files → human
 [[ "$HUMAN_PINGED" == "1" ]] && ok_t "an UNROUTED gate still runs the human deliverer (dispatch is per-call)" \
   || bad_t "unrouted → human deliverer" "HUMAN_PINGED=$HUMAN_PINGED"
 # The stubbed human deliverer writes no row of its own, so the DIVE-1968 assertion

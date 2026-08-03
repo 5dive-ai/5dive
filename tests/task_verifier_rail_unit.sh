@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# TIER: nightly — 18.0s measured (DIVE-2525): does not fit the 300s PR core; the nightly sweep runs it.
 # DIVE-1880 unit harness — the verifier rail's VISIBILITY + its retro-attach verb.
 #
 # The defect: `task add --priority=low` silently declined the DIVE-969 verifier
@@ -29,6 +30,10 @@ set -uo pipefail
 . "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh" \
   || printf 'grading tree: UNRESOLVED (tests/lib/grading_tree.sh not reachable; no tree named)\n' >&2
 cd "$(dirname "$0")/.."
+# DIVE-2518: impersonate through the SEALED seam. `USER=agent-x` no longer moves
+# the actor — that env path WAS the forgery this ticket closed, and these arms
+# were leaning on it. tests/lib/actor_seam.sh explains the migration.
+. "$(dirname "${BASH_SOURCE[0]}")/lib/actor_seam.sh"
 SRC=src
 TMP="$(mktemp -d /tmp/task-verifier-rail-unit.XXXXXX)"
 trap 'rm -rf "$TMP"' EXIT
@@ -36,7 +41,7 @@ trap 'rm -rf "$TMP"' EXIT
 # shellcheck disable=SC1090
 for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh \
          lib/agent_setup.sh lib/state.sh lib/audit.sh lib/registry.sh \
-         lib/tasks_db.sh cmd_task.sh cmd_org.sh cmd_project.sh; do
+         lib/tasks_db.sh lib/actor.sh cmd_task.sh cmd_org.sh cmd_project.sh; do
   source "$SRC/$f"
 done
 
@@ -55,7 +60,7 @@ runt() { local verb="$1"; shift; ( JSON_MODE=0; "cmd_task_$verb" "$@" ) 2>"$TMP"
 # may close has to say who is calling. task_actor() falls back to $USER when there
 # is no sudo mapping and no --from.
 run_as() { local who="$1" verb="$2"; shift 2
-           ( USER="agent-${who}"; SUDO_UID=""; SUDO_USER=""; JSON_MODE=1; "cmd_task_$verb" "$@" ) 2>"$TMP"/err; }
+           ( actor_seam_as "${who}"; JSON_MODE=1; "cmd_task_$verb" "$@" ) 2>"$TMP"/err; }
 jf()   { jq -r "$1" 2>/dev/null; }
 has()  { [[ "$1" == *"$2"* ]]; }
 

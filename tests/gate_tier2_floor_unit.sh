@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# TIER: nightly — 6.3s measured (DIVE-2525): does not fit the 300s PR core; the nightly sweep runs it.
 # DIVE-1117 isolated unit harness for the tier-2 PROVENANCE FLOOR in cmd_task_answer
 # (companion to DIVE-1115, CLI side / defense in depth). The DIVE-916/950 human-only
 # + evidence blocks key on need_type (approval/secret/manual); a `decision` gate
@@ -31,7 +32,7 @@ trap 'rm -rf "$TMP"' EXIT
 # shellcheck disable=SC1090
 for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh \
          lib/agent_setup.sh lib/state.sh lib/audit.sh lib/registry.sh \
-         lib/tasks_db.sh cmd_task.sh; do
+         lib/tasks_db.sh lib/actor.sh cmd_task.sh; do
   # shellcheck source=/dev/null
   source "$SRC/$f"
 done

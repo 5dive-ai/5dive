@@ -1,5 +1,56 @@
 # Changelog
 
+## Unreleased — feat(actor): `5dive whoami`, one sealed actor derivation (DIVE-2517)
+
+The CLI had **six** actor derivations and they disagreed. Only one failed closed;
+the rest resolved identity from something the caller can set — `--from` on argv,
+`$USER`, `$SUDO_USER`, `FIVEDIVE_AUDIT_USER`, or an `agent-` username prefix —
+and none of them refused when they could not measure.
+
+`src/lib/actor.sh` promotes the uid-first resolver into the single derivation.
+Identity comes from `$EUID`, a kernel-backed bash builtin, mapped through
+`/etc/passwd` in pure bash — no `id`, no `getent`, both of which resolve through
+the caller's `PATH` (DIVE-2330). `$SUDO_UID` is honoured only at real EUID 0,
+where forging it would require already being root. Agent-ness is the registry's
+answer, never a username prefix. Authority is not redefined here: `_actor_authority`
+in `lib/audit.sh` already single-sources `root` / `sudo:<who>` / `self`, and the
+verb wires it.
+
+`5dive whoami` reports actor, authority and tier **with the source of each**, plus
+`--json`. An actor it cannot measure is an **exit 6**, not the word `unknown`
+printed with `rc=0` — that refusal is the point of the verb, and it is
+mutation-graded rather than asserted.
+
+## Unreleased — feat(task): merge-audit LABELS findings delivered-vs-cited, and never filters them (DIVE-1975)
+
+DIVE-1965 taught the merge *gate* to tell "I shipped this PR" from "I am writing about this PR",
+and to skip the second. `task merge-audit` is the same predicate over the same data feeding a
+different consumer, and it never learned the split: the retrospective sweep still reported a PR
+that a done task merely CITED as if it were that task's own unmerged work.
+
+Every finding now carries `delivered` or `cited`, in the columns and in `--json` (`origin` per row,
+plus `delivered` / `cited` totals in the summary). Nothing is dropped.
+
+The label is the whole change, and the refusal to filter is the load-bearing half. A blocking gate
+and a non-blocking sweep want OPPOSITE safe defaults on the same predicate. The gate blocks a
+close, so over-judging stalls the fleet and its default is CITED with delivery asserted. The sweep
+blocks nothing and a human reads it, so over-reporting costs one line to dismiss while
+under-reporting hides real unmerged work. Filtering to "delivered only" would rebuild the
+blindness DIVE-1955 existed to remove, one layer down and harder to see: the sweep would come back
+clean while the work it was built to find sat unmerged behind a maker's phrasing. DIVE-1965's own
+known coverage seam, an own delivery phrased outside the shipping-verb vocabulary, lands exactly
+there.
+
+Two deliberate widenings of `delivered`, both harmless because nothing is dropped: the
+`delivery_ref` column folds in (it never reaches the gate's prose classifier, but a bound
+delivery_ref is the strongest delivery assertion there is), and the audit row arrives with
+newlines collapsed, so the classifier's line-scoping degrades to text-scoping.
+
+Seven arms added to `tests/task_merge_gate_delivered_vs_cited_unit.sh` (39 total), each
+differential on the same PR number in the same repo so a hardcoded label fails at least one.
+Graded by mutation: always-cited, always-delivered, filter-cited-out, and drop-the-column each
+turn arms red.
+
 ## Unreleased — feat(broker): generalize the capability broker and fold in delegated deploy (INST-5)
 
 `5dive push` was our only brokered capability: a dangerous action an agent can take without ever

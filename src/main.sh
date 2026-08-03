@@ -272,6 +272,15 @@ Actor-routed gh (DIVE-2448):
   # An agent gh write authenticates as the HUMAN account, so the audit trail cannot tell agent from human
   # (DIVE-2232). The PAT stays root-side in /etc/5dive/connectors/github-bot.env — the agent never holds it.
 
+Identity:
+  5dive whoami [--json]
+    Who is acting, under whose authority, at what tier — and the SOURCE of each.
+    Identity is uid-first: \$EUID (or sudo's \$SUDO_UID at real root) resolved
+    against /etc/passwd in pure bash. Never argv/--from, \$USER, \$SUDO_USER or
+    \$FIVEDIVE_AUDIT_USER, and never \`id\`/\`getent\` (both PATH-resolved).
+    An UNMEASURABLE actor exits 6 (auth_required) — it is never printed as
+    \`unknown\` with a success status.
+
 Models:
   5dive models [--json]
     Current Claude model id per short alias (opus / sonnet / fable / haiku).
@@ -664,6 +673,12 @@ main() {
           with_registry_lock cmd_account_set_active_provider "$@" ;;
         *) fail "$E_USAGE" "unknown account command: $acctcmd" ;;
       esac ;;
+    whoami)
+      # DIVE-2517 (v0.18 "Proof of who"): the one sealed actor derivation, printed
+      # with the provenance of every field. Read-only — no state, no lock, and
+      # deliberately NO audit row: a verb whose whole job is to report the caller's
+      # identity must not need the caller's identity to be writable first.
+      cmd_whoami "$@" ;;
     models)
       # DIVE-1883: print the alias -> current model id map (source of truth in
       # src/lib/models.sh). Read-only. The telegram plugin reads

@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# TIER: nightly — 20.0s measured (DIVE-2525): does not fit the 300s PR core; the nightly sweep runs it.
 # DIVE-2196 isolated unit harness: a verifier who filed a human gate has ACTED.
 #
 # The bug (fired live on DIVE-2146): the heartbeat stall-sweep selects delivered
@@ -37,6 +38,10 @@ set -uo pipefail
 . "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh" \
   || printf 'grading tree: UNRESOLVED (tests/lib/grading_tree.sh not reachable; no tree named)\n' >&2
 cd "$(dirname "$0")/.."
+# DIVE-2518: impersonate through the SEALED seam. `USER=agent-x` no longer moves
+# the actor — that env path WAS the forgery this ticket closed, and these arms
+# were leaning on it. tests/lib/actor_seam.sh explains the migration.
+. "$(dirname "${BASH_SOURCE[0]}")/lib/actor_seam.sh"
 SRC=src
 
 TMP="$(mktemp -d /tmp/verifier-gate-ack.XXXXXX)"
@@ -44,8 +49,9 @@ trap 'rm -rf "$TMP"' EXIT
 
 # shellcheck disable=SC1090
 for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh \
-         lib/agent_setup.sh lib/state.sh lib/broker.sh lib/audit.sh lib/registry.sh \
-         lib/disk.sh lib/tasks_db.sh cmd_task.sh cmd_push.sh cmd_org.sh \
+         lib/agent_setup.sh lib/state.sh lib/broker.sh lib/audit.sh \
+         lib/registry.sh lib/disk.sh lib/tasks_db.sh lib/actor.sh cmd_task.sh \
+         cmd_push.sh cmd_org.sh; do
          cmd_project.sh cmd_heartbeat.sh; do
   # shellcheck source=/dev/null
   source "$SRC/$f"
@@ -81,8 +87,8 @@ _gate_withdraw_actor() { printf '%s' "$GATE_ACTOR"; }
 
 tasks_db_init
 
-as() { local who="$1"; shift; ( USER="agent-${who}"; SUDO_UID=""; SUDO_USER=""; "$@" ) 2>"$TMP/err"; }
-[[ "$( ( USER=agent-reviewer; SUDO_UID=""; SUDO_USER=""; task_actor ) )" == "reviewer" ]] \
+as() { local who="$1"; shift; ( actor_seam_as "${who}"; "$@" ) 2>"$TMP/err"; }
+[[ "$( ( actor_seam_as reviewer; task_actor ) )" == "reviewer" ]] \
   && ok_t "harness can impersonate an actor (task_actor → reviewer)" \
   || bad_t "actor impersonation broken" "every case below would be vacuous"
 

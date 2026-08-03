@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# TIER: nightly — 18.0s measured (DIVE-2525): does not fit the 300s PR core; the nightly sweep runs it.
 # DIVE-2241 isolated unit harness for the DECLARED human-class capability
 # (`5dive task need --needs=<capability>`).
 #
@@ -40,6 +41,9 @@
   || printf 'grading tree: UNRESOLVED (tests/lib/grading_tree.sh not reachable; no tree named)\n' >&2
 set -uo pipefail
 cd "$(dirname "$0")/.."
+# DIVE-2518: `--from` is provenance; TIER/ROUTING read the uid derivation, so an arm
+# impersonating a filer must DERIVE as them. tests/lib/actor_seam.sh.
+. "$(dirname "${BASH_SOURCE[0]}")/lib/actor_seam.sh"
 SRC=src
 TMP="$(mktemp -d /tmp/gate-needs-capability-unit.XXXXXX)"
 trap 'rm -rf "$TMP"' EXIT
@@ -47,7 +51,7 @@ trap 'rm -rf "$TMP"' EXIT
 # shellcheck disable=SC1090
 for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh \
          lib/agent_setup.sh lib/state.sh lib/audit.sh lib/registry.sh \
-         lib/tasks_db.sh cmd_task.sh; do
+         lib/tasks_db.sh lib/actor.sh cmd_task.sh; do
   # shellcheck source=/dev/null
   source "$SRC/$f"
 done
@@ -202,7 +206,7 @@ for cap in spend_authority secret_provision; do
   # is what makes it not. Prove the control for THIS type too, so the pass is not
   # inherited from case 1's approval arm.
   n=$((n+1)); reset_log; seed_loop "DIVE-$n"
-  cmd_task_need "DIVE-$n" --type=decision --ask="pick option A or B" --options="A|B" --recommend="A" --from=dev >/dev/null 2>&1
+  actor_seam_as dev; cmd_task_need "DIVE-$n" --type=decision --ask="pick option A or B" --options="A|B" --recommend="A" --from=dev >/dev/null 2>&1
   [[ "$(reviewer_of "DIVE-$n")" == "olivia" ]] \
     && ok_t "CONTROL for $cap's arm: the same decision without --needs still routes to the verifier" \
     || bad_t "decision control routes to verifier" "reviewer='$(reviewer_of "DIVE-$n")'"
@@ -233,7 +237,7 @@ grep -qi 'not a human-class capability' "$TMP/e_u" \
 # regardless of tier. It classifies on the ask's SHAPE; a declaration states what
 # the ask CONSUMES, and must outrank it. Without the re-assert this arm routes.
 reset_log; seed_loop DIVE-9005 "land the branch"
-cmd_task_need DIVE-9005 --type=approval --ask="approve the ship: merge and deploy the release branch to prod" --recommend="yes" --needs=human_tap --from=dev >/dev/null 2>"$TMP/e5"
+actor_seam_as dev; cmd_task_need DIVE-9005 --type=approval --ask="approve the ship: merge and deploy the release branch to prod" --recommend="yes" --needs=human_tap --from=dev >/dev/null 2>"$TMP/e5"
 [[ "$(reviewer_of DIVE-9005)" == "" && "$(tier_of DIVE-9005)" == "2" ]] \
   && ok_t "an eng-ship-shaped ask with --needs=human_tap is NOT downgraded to a lead-routed tier-1" \
   || bad_t "declaration outranks the eng-ship downgrade" "reviewer='$(reviewer_of DIVE-9005)' tier=$(tier_of DIVE-9005)"
@@ -256,13 +260,13 @@ _gate_needs_human human_tap && bad_t "mutation did not land" "resolver still rec
   || ok_t "MUTATION LANDED: the resolver now recognises nothing"
 
 reset_log; seed_loop DIVE-9006
-cmd_task_need DIVE-9006 --type=approval --ask="approve the merge of the parser refactor" --recommend="yes" --needs=human_tap --from=dev >/dev/null 2>&1
+actor_seam_as dev; cmd_task_need DIVE-9006 --type=approval --ask="approve the merge of the parser refactor" --recommend="yes" --needs=human_tap --from=dev >/dev/null 2>&1
 [[ "$(reviewer_of DIVE-9006)" == "olivia" ]] \
   && ok_t "MUTATION: without the constant, --needs=human_tap routes to the VERIFIER — the arm is RED, so the green above was the constant's doing" \
   || bad_t "mutation turns the human arm red" "routed_reviewer='$(reviewer_of DIVE-9006)' — the human arm passes WITHOUT the resolution, so it proves nothing"
 
 reset_log; seed_loop DIVE-9007
-cmd_task_need DIVE-9007 --type=approval --ask="approve the merge of the parser refactor" --recommend="yes" --from=dev >/dev/null 2>&1
+actor_seam_as dev; cmd_task_need DIVE-9007 --type=approval --ask="approve the merge of the parser refactor" --recommend="yes" --from=dev >/dev/null 2>&1
 [[ "$(reviewer_of DIVE-9007)" == "olivia" ]] \
   && ok_t "MUTATION: the CONTROL is unaffected — the mutation is scoped to the declared path, not to routing at large" \
   || bad_t "mutation leaves the control green" "routed_reviewer='$(reviewer_of DIVE-9007)'"

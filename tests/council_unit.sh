@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# TIER: nightly — 76.8s measured (DIVE-2525): does not fit the 300s PR core; the nightly sweep runs it.
 # CI wrapper: run the council node harnesses (engine + CLI contract + dispatch + constitution) under
 # the tests/*.sh runner so they actually GATE in CI (unit-tests.yml globs tests/*.sh, not
 # *.mjs). All three are offline (COUNCIL_MOCK / mock adapters — no key, no network, no live

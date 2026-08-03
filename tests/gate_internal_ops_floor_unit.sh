@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# TIER: nightly — 9.9s measured (DIVE-2525): does not fit the 300s PR core; the nightly sweep runs it.
 # DIVE-1480 isolated unit harness for the INTERNAL-OPS / recovery floor carve-out.
 #
 # The T2 destructive floor (delete|destroy|wipe|purge|…) is deliberately biased to
@@ -25,6 +26,9 @@ set -uo pipefail
 . "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh" \
   || printf 'grading tree: UNRESOLVED (tests/lib/grading_tree.sh not reachable; no tree named)\n' >&2
 cd "$(dirname "$0")/.."
+# DIVE-2518: `--from` is provenance; TIER and ROUTING read the uid derivation, so an
+# arm impersonating a filer must DERIVE as them. tests/lib/actor_seam.sh.
+. "$(dirname "${BASH_SOURCE[0]}")/lib/actor_seam.sh"
 SRC=src
 TMP="$(mktemp -d /tmp/gate-internalops-unit.XXXXXX)"
 trap 'rm -rf "$TMP"' EXIT
@@ -32,7 +36,7 @@ trap 'rm -rf "$TMP"' EXIT
 # shellcheck disable=SC1090
 for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh \
          lib/agent_setup.sh lib/state.sh lib/audit.sh lib/registry.sh \
-         lib/tasks_db.sh cmd_task.sh cmd_org.sh cmd_project.sh; do
+         lib/tasks_db.sh lib/actor.sh cmd_task.sh cmd_org.sh cmd_project.sh; do
   # shellcheck source=/dev/null
   source "$SRC/$f"
 done
@@ -73,7 +77,7 @@ routedof()  { db "SELECT COALESCE(routed_reviewer,'') FROM tasks WHERE ident='$1
 
 # --- 1: THE REPRO — dev's board-wipe keep/discard decision routes to the LEAD, not lodar
 route_reset; seed DIVE-301
-cmd_task_need DIVE-301 --type=decision --from=dev \
+actor_seam_as dev; cmd_task_need DIVE-301 --type=decision --from=dev \
   --ask="The task board was wiped/destroyed at 04:20 and my in-flight work is at risk — keep or discard my uncommitted work and rebuild the board from the audit log?" \
   --options="keep|discard" --recommend="keep" >/dev/null 2>&1
 [[ "$(tierof DIVE-301)" == "1" ]] && ok_t "repro: board-wipe decision downgraded to tier 1 (not hard-human)" || bad_t "repro tier 1" "got '$(tierof DIVE-301)'"
@@ -83,7 +87,7 @@ cmd_task_need DIVE-301 --type=decision --from=dev \
 
 # --- 2: SAFETY — a genuine prod-destructive ask (no internal-ops vocab) stays hard-human
 route_reset; seed DIVE-302
-cmd_task_need DIVE-302 --type=decision --from=dev \
+actor_seam_as dev; cmd_task_need DIVE-302 --type=decision --from=dev \
   --ask="Drop the production customers table to reclaim space — irreversible, confirm?" \
   --options="yes|no" --recommend="no" >/dev/null 2>&1
 [[ "$(tierof DIVE-302)" == "2" ]] && ok_t "safety: prod drop-table stays tier 2 (human)" || bad_t "safety prod tier 2" "got '$(tierof DIVE-302)'"
@@ -91,28 +95,28 @@ cmd_task_need DIVE-302 --type=decision --from=dev \
 
 # --- 3: SAFETY — internal-ops vocab BUT a real residual floor term (revoke) still floors
 route_reset; seed DIVE-303
-cmd_task_need DIVE-303 --type=decision --from=dev \
+actor_seam_as dev; cmd_task_need DIVE-303 --type=decision --from=dev \
   --ask="Rebuild the task board after the wipe AND revoke the leaked API key — proceed?" \
   --options="yes|no" --recommend="yes" >/dev/null 2>&1
 [[ "$(tierof DIVE-303)" == "2" ]] && ok_t "safety: internal-ops + 'revoke' residual stays tier 2 (human)" || bad_t "safety revoke residual" "got '$(tierof DIVE-303)'"
 
 # --- 4: SAFETY — money residual (refund/$) inside an internal-ops ask still floors
 route_reset; seed DIVE-304
-cmd_task_need DIVE-304 --type=decision --from=dev \
+actor_seam_as dev; cmd_task_need DIVE-304 --type=decision --from=dev \
   --ask="Wipe the board test rows after refunding the customer \$500 — go?" \
   --options="yes|no" --recommend="no" >/dev/null 2>&1
 [[ "$(tierof DIVE-304)" == "2" ]] && ok_t "safety: internal-ops + money residual stays tier 2 (human)" || bad_t "safety money residual" "got '$(tierof DIVE-304)'"
 
 # --- 5: SAFETY — the LEAD filing it has no reviewer, so it is NOT downgraded (human)
 route_reset; seed DIVE-305
-cmd_task_need DIVE-305 --type=decision --from=main \
+actor_seam_as main; cmd_task_need DIVE-305 --type=decision --from=main \
   --ask="Board wiped — discard my uncommitted work and rebuild from the audit log?" \
   --options="keep|discard" --recommend="keep" >/dev/null 2>&1
 [[ "$(tierof DIVE-305)" == "2" ]] && ok_t "safety: lead-filed internal-ops stays tier 2 (no reviewer)" || bad_t "safety lead tier 2" "got '$(tierof DIVE-305)'"
 
 # --- 6: NO-OP — a non-floored internal decision is untouched (default tier-1 routing)
 route_reset; seed DIVE-306
-cmd_task_need DIVE-306 --type=decision --from=dev \
+actor_seam_as dev; cmd_task_need DIVE-306 --type=decision --from=dev \
   --ask="Which task board column order should we show, priority-first or age-first?" \
   --options="priority|age" --recommend="priority" >/dev/null 2>&1
 [[ "$(tierof DIVE-306)" == "1" ]] && ok_t "no-op: non-floored internal decision stays tier 1 (unchanged)" || bad_t "no-op tier 1" "got '$(tierof DIVE-306)'"
@@ -120,7 +124,7 @@ cmd_task_need DIVE-306 --type=decision --from=dev \
 
 # --- 7: SAFETY — a plain destructive decision with NO internal-ops vocab still floors
 route_reset; seed DIVE-307
-cmd_task_need DIVE-307 --type=decision --from=dev \
+actor_seam_as dev; cmd_task_need DIVE-307 --type=decision --from=dev \
   --ask="Delete all the old render artifacts to free disk — destroy them permanently?" \
   --options="yes|no" --recommend="yes" >/dev/null 2>&1
 [[ "$(tierof DIVE-307)" == "2" ]] && ok_t "safety: destructive w/o internal-ops vocab stays tier 2 (human)" || bad_t "safety plain destructive" "got '$(tierof DIVE-307)'"
@@ -130,7 +134,7 @@ cmd_task_need DIVE-307 --type=decision --from=dev \
 #        governs the PRODUCTION DATABASE, not the board, so 'delete' is NOT
 #        co-referent to an internal object → survives the residual → stays tier 2.
 route_reset; seed DIVE-308
-cmd_task_need DIVE-308 --type=decision --from=dev \
+actor_seam_as dev; cmd_task_need DIVE-308 --type=decision --from=dev \
   --ask="Delete the production database as part of the board recovery — proceed?" \
   --options="yes|no" --recommend="no" >/dev/null 2>&1
 [[ "$(tierof DIVE-308)" == "2" ]] && ok_t "DIVE-1481: prod-delete in recovery framing stays tier 2 (human)" || bad_t "1481 prod-in-framing tier 2" "got '$(tierof DIVE-308)'"
@@ -140,7 +144,7 @@ cmd_task_need DIVE-308 --type=decision --from=dev \
 #        must not over-tighten). 'wipe' governs 'the board', so it is carved out and
 #        the residual is clean → lead-routed tier 1.
 route_reset; seed DIVE-309
-cmd_task_need DIVE-309 --type=decision --from=dev \
+actor_seam_as dev; cmd_task_need DIVE-309 --type=decision --from=dev \
   --ask="Wipe the task board and rebuild it from the audit log — keep or discard my uncommitted wip first?" \
   --options="keep|discard" --recommend="keep" >/dev/null 2>&1
 [[ "$(tierof DIVE-309)" == "1" ]] && ok_t "DIVE-1481: co-referent 'wipe the board' still downgrades to tier 1" || bad_t "1481 co-referent tier 1" "got '$(tierof DIVE-309)'"
@@ -151,7 +155,7 @@ cmd_task_need DIVE-309 --type=decision --from=dev \
 #         strip would carve 'delete' as co-referent to 'board'; the external-target
 #         guard refuses to strip → residual keeps 'delete' → stays hard-human.
 route_reset; seed DIVE-310
-cmd_task_need DIVE-310 --type=decision --from=dev \
+actor_seam_as dev; cmd_task_need DIVE-310 --type=decision --from=dev \
   --ask="Delete the board and the production database — proceed?" \
   --options="yes|no" --recommend="no" >/dev/null 2>&1
 [[ "$(tierof DIVE-310)" == "2" ]] && ok_t "DIVE-1487: coordinated internal+prod delete stays tier 2 (human)" || bad_t "1487 coordination tier 2" "got '$(tierof DIVE-310)'"
@@ -161,7 +165,7 @@ cmd_task_need DIVE-310 --type=decision --from=dev \
 #         customer records" — the passive branch would strip 'delete' merely because
 #         'board' precedes it within 20 chars, though 'delete' governs prod records.
 route_reset; seed DIVE-311
-cmd_task_need DIVE-311 --type=decision --from=dev \
+actor_seam_as dev; cmd_task_need DIVE-311 --type=decision --from=dev \
   --ask="Wipe the board then delete the prod customer records — go ahead?" \
   --options="yes|no" --recommend="no" >/dev/null 2>&1
 [[ "$(tierof DIVE-311)" == "2" ]] && ok_t "DIVE-1487: passive over-reach (prod customer records) stays tier 2 (human)" || bad_t "1487 passive tier 2" "got '$(tierof DIVE-311)'"
@@ -170,7 +174,7 @@ cmd_task_need DIVE-311 --type=decision --from=dev \
 #         table". Guard keeps 'purge' in the residual (→ floor); and the widened
 #         'drop[^.]{0,20}table' floor term catches 'drop the customers table' too.
 route_reset; seed DIVE-312
-cmd_task_need DIVE-312 --type=decision --from=dev \
+actor_seam_as dev; cmd_task_need DIVE-312 --type=decision --from=dev \
   --ask="Purge the backlog and drop the customers table — confirm?" \
   --options="yes|no" --recommend="no" >/dev/null 2>&1
 [[ "$(tierof DIVE-312)" == "2" ]] && ok_t "DIVE-1487: compound purge+drop-customers-table stays tier 2 (human)" || bad_t "1487 compound tier 2" "got '$(tierof DIVE-312)'"
@@ -178,7 +182,7 @@ cmd_task_need DIVE-312 --type=decision --from=dev \
 # --- 13: DIVE-1487 — floor-vocab: a standalone 'drop the customers table' (no
 #         internal-ops vocab, no delete/purge) now trips the widened floor directly.
 route_reset; seed DIVE-313
-cmd_task_need DIVE-313 --type=decision --from=dev \
+actor_seam_as dev; cmd_task_need DIVE-313 --type=decision --from=dev \
   --ask="Drop the customers table in prod — proceed?" \
   --options="yes|no" --recommend="no" >/dev/null 2>&1
 [[ "$(tierof DIVE-313)" == "2" ]] && ok_t "DIVE-1487: standalone drop-<x>-table trips widened floor (tier 2)" || bad_t "1487 drop-table floor" "got '$(tierof DIVE-313)'"
@@ -186,7 +190,7 @@ cmd_task_need DIVE-313 --type=decision --from=dev \
 # --- 14: DIVE-1487 — NO OVER-TIGHTEN: a purely internal co-referent wipe with NO
 #         external target still downgrades to lead-routed tier 1 (guard not tripped).
 route_reset; seed DIVE-314
-cmd_task_need DIVE-314 --type=decision --from=dev \
+actor_seam_as dev; cmd_task_need DIVE-314 --type=decision --from=dev \
   --ask="Wipe the task board and rebuild from the audit log — discard my uncommitted wip first?" \
   --options="keep|discard" --recommend="keep" >/dev/null 2>&1
 [[ "$(tierof DIVE-314)" == "1" ]] && ok_t "DIVE-1487: purely-internal wipe still downgrades to tier 1 (no over-tighten)" || bad_t "1487 internal still tier 1" "got '$(tierof DIVE-314)'"

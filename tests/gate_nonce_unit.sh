@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# TIER: nightly — 11.0s measured (DIVE-2525): does not fit the 300s PR core; the nightly sweep runs it.
 # DIVE-916 isolated unit harness for the per-gate HUMAN nonce that closes the
 # sudo->--human gate-forge, folded into the DIVE-931 secret-drop chain:
 #   * `task need --type=approval|secret|manual` mints human_nonce_hash (hash-only
@@ -35,7 +36,7 @@ trap 'rm -rf "$TMP"' EXIT
 # shellcheck disable=SC1090
 for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh \
          lib/agent_setup.sh lib/state.sh lib/audit.sh lib/registry.sh \
-         lib/tasks_db.sh cmd_task.sh; do
+         lib/tasks_db.sh lib/actor.sh cmd_task.sh; do
   # shellcheck source=/dev/null
   source "$SRC/$f"
 done

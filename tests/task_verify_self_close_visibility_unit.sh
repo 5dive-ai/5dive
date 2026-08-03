@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# TIER: nightly — 10.9s measured (DIVE-2525): does not fit the 300s PR core; the nightly sweep runs it.
 # DIVE-2015 isolated unit harness: a maker may rescue a stalled delivered loop
 # with `task verify --cmd`, but the permitted self-close must be visible in the
 # task record, the audit log, and stderr. No policy refusal is expected.
@@ -24,7 +25,7 @@ trap 'rm -rf "$TMP"' EXIT
 # shellcheck disable=SC1090
 for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh \
          lib/agent_setup.sh lib/state.sh lib/audit.sh lib/registry.sh \
-         lib/tasks_db.sh cmd_task.sh cmd_org.sh cmd_project.sh; do
+         lib/tasks_db.sh lib/actor.sh cmd_task.sh cmd_org.sh cmd_project.sh; do
   source "$SRC/$f"
 done
 

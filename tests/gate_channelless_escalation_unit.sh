@@ -27,6 +27,9 @@ set -uo pipefail
 . "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh" \
   || printf 'grading tree: UNRESOLVED (tests/lib/grading_tree.sh not reachable; no tree named)\n' >&2
 cd "$(dirname "$0")/.."
+# DIVE-2518: `--from` is a CLAIM that must corroborate the uid-derived actor,
+# so filing a gate AS dev3 now means DERIVING as dev3. tests/lib/actor_seam.sh.
+. "$(dirname "${BASH_SOURCE[0]}")/lib/actor_seam.sh"
 SRC=src
 TMP="$(mktemp -d /tmp/gate-chanless.XXXXXX)"
 trap 'rm -rf "$TMP"' EXIT
@@ -34,7 +37,7 @@ trap 'rm -rf "$TMP"' EXIT
 # shellcheck disable=SC1090
 for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh \
          lib/agent_setup.sh lib/state.sh lib/audit.sh lib/registry.sh \
-         lib/tasks_db.sh cmd_agent_pairing.sh cmd_agent_runtime.sh cmd_task.sh; do
+         lib/tasks_db.sh lib/actor.sh cmd_agent_pairing.sh cmd_agent_runtime.sh cmd_task.sh; do
   # shellcheck source=/dev/null
   source "$SRC/$f"
 done
@@ -169,7 +172,7 @@ db "INSERT INTO tasks (ident,title,priority,assignee,created_by,kind,status)
     VALUES ('DIVE-9004','unnotified','high','dev3','dev3','standard','todo');"
 did=$(db "SELECT id FROM tasks WHERE ident='DIVE-9004';")
 FILER_SELF=dev3 READABLE="" PAIRED=""
-out=$( (cmd_task_need DIVE-9004 --type=decision --ask="which way?" --options="A|B" --recommend="A" --from=dev3) 2>&1 ); rc=$?
+out=$( (actor_seam_as dev3; cmd_task_need DIVE-9004 --type=decision --ask="which way?" --options="A|B" --recommend="A" --from=dev3) 2>&1 ); rc=$?
 [[ "$rc" == "0" ]] && ok_t "cmd_task_need still FILES the gate when nobody can be pinged" \
   || bad_t "unnotified gate still files" "rc=$rc out=${out:0:200}"
 row=$(db "SELECT status||'|'||COALESCE(need_type,'-')||'|'||COALESCE(gate_pinged_at,'NULL') FROM tasks WHERE id=${did};")

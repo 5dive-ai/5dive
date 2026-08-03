@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# TIER: nightly — 25.3s measured (DIVE-2525): does not fit the 300s PR core; the nightly sweep runs it.
 # DIVE-1401 isolated unit harness for `task need --withdraw`: a lead/filer path to
 # cancel a still-pending gate the team itself filed but that is now MOOT (e.g. a
 # secret gate for fixtures never needed). Withdrawing is NOT a grant — it must never
@@ -41,7 +42,7 @@ trap 'rm -rf "$TMP"' EXIT
 # shellcheck disable=SC1090
 for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh \
          lib/agent_setup.sh lib/state.sh lib/audit.sh lib/registry.sh \
-         lib/tasks_db.sh cmd_task.sh; do
+         lib/tasks_db.sh lib/actor.sh cmd_task.sh; do
   # shellcheck source=/dev/null
   source "$SRC/$f"
 done

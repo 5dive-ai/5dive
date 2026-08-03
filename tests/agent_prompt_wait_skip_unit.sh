@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# TIER: nightly — 12.3s measured (DIVE-2525): does not fit the 300s PR core; the nightly sweep runs it.
 # DIVE-2277 — a harness with no prompt marker must not pay the 45s prompt-wait.
 #
 # TWO-SIDED BY CONSTRUCTION:

@@ -46,7 +46,13 @@ bad_t() { FAIL=$((FAIL+1)); printf 'FAIL - %s\n' "$1"; [[ -n "${2:-}" ]] && prin
 TMP="$(mktemp -d /tmp/baseline-pin.XXXXXX)"
 trap 'rm -rf "$TMP"' EXIT
 
-WF=".github/workflows/unit-tests.yml"
+# DIVE-2525: the suite that anchors to pinned commits is no longer run by ONE
+# workflow. unit-tests.yml runs the CORE tier on every PR; full-sweep.yml runs the
+# whole corpus nightly, which is where a DEMOTED pinned-baseline harness now lives.
+# Arm D must sweep both, or it grades the fetch-depth of a workflow that no longer
+# runs the harnesses whose pins it exists to protect — the check would still be
+# green and would have stopped covering the thing that moved.
+WFS=(.github/workflows/unit-tests.yml .github/workflows/full-sweep.yml)
 
 # ---------------------------------------------------------------------------
 # The detector. One function, used on the real corpus AND on synthetic fixtures,
@@ -144,6 +150,7 @@ fi
 
 # --- Arm D: the CI half. Every checkout in the workflow that runs the suite must
 #     ask for full history, or the pins above resolve nowhere that gates a merge.
+for WF in "${WFS[@]}"; do
 if [[ -f "$WF" ]]; then
   n_checkout="$(grep -c 'uses: actions/checkout@' "$WF")"
   n_depth="$(grep -c 'fetch-depth: 0' "$WF")"
@@ -160,6 +167,7 @@ if [[ -f "$WF" ]]; then
 else
   bad_t "$WF is missing" "the CI half of this ticket cannot be asserted"
 fi
+done
 
 # --- Arm E: the helper must FAIL CLOSED. An unresolvable pin returning success
 #     (or an empty file that compares equal to an empty extraction) is how this

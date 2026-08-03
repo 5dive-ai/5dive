@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# TIER: nightly — 9.4s measured (DIVE-2525): does not fit the 300s PR core; the nightly sweep runs it.
 # DIVE-1935 isolated unit harness. DIVE-1922 reached status=done while its PR was
 # OPEN, unmerged AND red on its own new unit test — both declared bindings were
 # empty (no delivery_ref, no 'Branch:' line) and the DIVE-1835 repo-wide scan
@@ -111,8 +112,9 @@ export GH_ARGS_LOG="$TMP/gh.args"; : >"$GH_ARGS_LOG"
 
 # shellcheck disable=SC1090
 for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh \
-         lib/agent_setup.sh lib/state.sh lib/broker.sh lib/audit.sh lib/registry.sh \
-         lib/tasks_db.sh cmd_push.sh cmd_task.sh; do
+         lib/agent_setup.sh lib/state.sh lib/broker.sh lib/audit.sh \
+         lib/registry.sh lib/tasks_db.sh lib/actor.sh cmd_push.sh \
+         cmd_task.sh; do
   source "$SRC/$f"
 done
 STATE_DIR="$TMP"; TASKS_DIR="$STATE_DIR/tasks"; TASKS_DB="$TASKS_DIR/tasks.db"

@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# TIER: nightly — 12.4s measured (DIVE-2525): does not fit the 300s PR core; the nightly sweep runs it.
 # DIVE-1416 isolated unit harness for _hb_stall_sweep (cmd_heartbeat.sh) —
 # fleet-stall self-heal gaps #2 and #3 (gap #1 is _hb_blocked_sweep, covered by
 # tests/task_cascade_unblock_unit.sh):
@@ -34,7 +35,7 @@ trap 'rm -rf "$TMP"' EXIT
 # shellcheck disable=SC1090
 for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh \
          lib/agent_setup.sh lib/state.sh lib/audit.sh lib/registry.sh \
-         lib/tasks_db.sh cmd_task.sh cmd_org.sh cmd_heartbeat.sh; do
+         lib/tasks_db.sh lib/actor.sh cmd_task.sh cmd_org.sh cmd_heartbeat.sh; do
   # shellcheck source=/dev/null
   source "$SRC/$f"
 done

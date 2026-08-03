@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# TIER: nightly — 24.4s measured (DIVE-2525): does not fit the 300s PR core; the nightly sweep runs it.
 # OSS-7 isolated unit harness for the task-core verbs — the most-used surface
 # that had no coverage (only the loop/gate slices were tested). Same isolation
 # contract as the loop harnesses: source src/ directly, point STATE_DIR at a
@@ -27,7 +28,7 @@ trap 'rm -rf "$TMP"' EXIT
 # shellcheck disable=SC1090
 for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh \
          lib/agent_setup.sh lib/state.sh lib/audit.sh lib/registry.sh \
-         lib/tasks_db.sh cmd_task.sh cmd_org.sh cmd_project.sh; do
+         lib/tasks_db.sh lib/actor.sh cmd_task.sh cmd_org.sh cmd_project.sh; do
   source "$SRC/$f"
 done
 

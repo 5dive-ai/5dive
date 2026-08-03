@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# TIER: nightly — 15.1s measured (DIVE-2525): does not fit the 300s PR core; the nightly sweep runs it.
 # OSS-11 (DIVE-976) isolated unit harness for decision-memory precedent prefill.
 # Two halves:
 #   * _gate_ask_shape() normalizer — idents/dates/amounts/hosts/nums/quoted-names
@@ -31,7 +32,7 @@ trap 'rm -rf "$TMP"' EXIT
 # shellcheck disable=SC1090
 for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh \
          lib/agent_setup.sh lib/state.sh lib/audit.sh lib/registry.sh \
-         lib/tasks_db.sh cmd_task.sh; do
+         lib/tasks_db.sh lib/actor.sh cmd_task.sh; do
   # shellcheck source=/dev/null
   source "$SRC/$f"
 done

@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# TIER: nightly — 11.9s measured (DIVE-2525): does not fit the 300s PR core; the nightly sweep runs it.
 # DIVE-1376 isolated unit harness for `5dive push` — the delegated-push verb.
 # Covers every NON-CREDENTIAL path (the live token-mint + real push is smoked
 # separately against the control-plane GitHub App). Same isolation posture as
@@ -38,7 +39,7 @@ trap 'rm -rf "$TMP"' EXIT
 # shellcheck disable=SC1090
 for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh \
          lib/agent_setup.sh lib/state.sh lib/broker.sh lib/audit.sh \
-         lib/registry.sh lib/tasks_db.sh cmd_task.sh cmd_push.sh \
+         lib/registry.sh lib/tasks_db.sh lib/actor.sh cmd_task.sh cmd_push.sh \
          cmd_agent_create.sh; do
   # shellcheck source=/dev/null
   source "$SRC/$f"
@@ -364,7 +365,10 @@ out=$(authoritative_gate_check DIVE-2004C); rc=$?
 
 unset -f _gate_agent_for_uid
 # shellcheck source=/dev/null
-source "$SRC/cmd_task.sh"   # restore the real helper for the cases below
+source "$SRC/lib/actor.sh"  # restore the real helper for the cases below — the
+                            # sealed derivation owns it since DIVE-2517; re-sourcing
+                            # cmd_task.sh would leave it UNDEFINED and every arm below
+                            # would grade an absent function rather than the real one.
 
 # _gate_authenticated_actor: the kernel-enforced identity, EMPTY when unknown.
 # Not `task_actor` — that returns --from verbatim, which is the whole bug.

@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# TIER: nightly — 26.4s measured (DIVE-2525): does not fit the 300s PR core; the nightly sweep runs it.
 # DIVE-2099 isolated unit harness for the ORG LEAD's STANDING authority to clear an
 # ENGINEERING approval gate (lodar granted it 2026-07-26; main filed rather than
 # implemented it because the requester is the beneficiary).
@@ -42,7 +43,7 @@ STATE_DIR="$TMP"
 # shellcheck disable=SC1090
 for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh \
          lib/agent_setup.sh lib/state.sh lib/broker.sh lib/audit.sh \
-         lib/registry.sh lib/tasks_db.sh cmd_task.sh cmd_council.sh; do
+         lib/registry.sh lib/tasks_db.sh lib/actor.sh cmd_task.sh cmd_council.sh; do
   # shellcheck source=/dev/null
   source "$SRC/$f"
 done

@@ -1081,6 +1081,30 @@ _hb_claim_task() {
   # as a claim.
   n=$(db "SELECT COUNT(*) FROM tasks WHERE id=${id} AND status='in_progress' AND started_at IS NOT NULL;" 2>/dev/null) || return 1
   [[ "$n" == "1" ]] || return 1
+  # DIVE-2541: THE CLAIM IS A START, SO IT GOES ON THE LEDGER.
+  #
+  # DIVE-2244 moved the authoritative start from `task start` to this function, and
+  # the ledger emit stayed behind on the verb. Measured 2026-08-02 over the ledger's
+  # whole life: the dispatcher claimed 94 distinct tasks and 85 of them carry NO
+  # task.started event, while the verb fired 13 times. The instrumentation was still
+  # attached to the path that had stopped being the main one, and it fired often
+  # enough to look alive — which is why nobody caught it for four days.
+  #
+  # authority=dispatcher, NOT self. The agent has not acted at this point; the
+  # dispatcher moved the row on its behalf. Writing `self` here would be a false
+  # claim of exactly the kind v0.18 exists to delete — actor keeps its meaning
+  # (whose queue this is) and authority says who actually moved it, so a reader can
+  # tell a dispatcher claim from an agent that ran the verb.
+  #
+  # The DEFAULT idem_key (kind|ident|task_id|hash(detail)) is deliberate: it is
+  # constant per task, so a task reclaimed to todo and re-claimed records its FIRST
+  # claim only. The chain reader asks "was this started, and under whose authority",
+  # not "how many times" — and a UNIQUE collision is a silent no-op, so this can
+  # never inflate the ledger. Losing re-claim COUNT is the safe direction; a
+  # per-claim key would let a nudge loop write unbounded rows.
+  ledger_emit "task.started" ident="$(_hb_ident "$id")" task_id="$id" \
+    actor="$name" authority="dispatcher" \
+    detail="heartbeat claim (DIVE-2244)" || true
   return 0
 }
 
@@ -1846,10 +1870,57 @@ _hb_gate_shipped_sweep() {
   # Normalize the repo allow-list: commas or spaces both separate.
   local repos; repos="${_HB_GATE_SHIPPED_REPOS//,/ }"
   [[ -n "${repos// }" ]] || return 0
+  # DIVE-2414: resolve the read-only gh credential ONCE for the whole sweep, not
+  # per gate — _gate_gh_token can shell out to sudo and the sweep runs every tick.
+  # Empty is a first-class answer: the subject reader returns UNKNOWN, never a
+  # silent accept.
+  local _gs_tok=""
+  command -v gh >/dev/null 2>&1 && _gs_tok=$(_gate_gh_token)
   while IFS= read -r grow; do
     [[ -n "$grow" ]] || continue
     IFS=$'\x1f' read -r gid gident gtype gowner <<<"$grow"
     [[ -n "$gid" && -n "$gident" ]] || continue
+    # DIVE-2414: READ WHAT THE GATE IS ABOUT BEFORE READING THE ROW.
+    # The commit-stream lookup below is row-level evidence: it answers "did
+    # something naming this ROW land", which on a multi-item row is routinely a
+    # different item than the one the ask is about (DIVE-2382 — flagged "likely
+    # shipped, verify+close" while its live approval asked about something else).
+    # So when the ASK names a pull request, that PR's MEASURED state is
+    # authoritative and the row's commits are not consulted at all:
+    #   OPEN     -> withhold the flag even if the row has commits. The ask is live.
+    #   UNKNOWN  -> withhold. A state that could not be read is not a negative
+    #               (DIVE-2318). No stamp, so a later tick retries.
+    #   MERGED   -> flag, with the SUBJECT as the named evidence.
+    # A gate that names NO subject falls through to the row-level path, which
+    # keeps its DIVE-1140 behaviour and now SAYS which evidence class it used.
+    # Fetched per row rather than in the sweep query on purpose: an ask is
+    # multi-line and would break the x'1f' line-per-row read above.
+    local _ask _sbody _sslug _sv _svd
+    _ask=$(db "SELECT COALESCE(ask,'') FROM tasks WHERE id=${gid};")
+    _sbody=$(db "SELECT COALESCE(body,'') FROM tasks WHERE id=${gid};")
+    _sslug=$(_gate_task_repo_slug "" "$_sbody")
+    _sv=$(_gate_subject_verdict "$_ask" "$_gs_tok" "$gident" "$_sslug")
+    _svd="${_sv#*|}"
+    case "${_sv%%|*}" in
+      OPEN)
+        _hb_log "[gate-shipped] ${gident} — the PR its ASK names is still OPEN (${_svd}); NOT flagging, and the row's own commits are NOT evidence about this gate (DIVE-2414). Gate stays eligible."
+        _task_store_audit_log "gate shipped-flag" "skip" 0 -- "task=$gident" "reason=subject-open" "subject=$_svd" || true
+        continue ;;
+      UNKNOWN)
+        _hb_log "[gate-shipped] ${gident} — its ASK names a PR whose state could NOT be read (${_svd}); NOT flagging (a non-verdict is not a negative), no stamp, will retry (DIVE-2414)."
+        _task_store_audit_log "gate shipped-flag" "skip" 0 -- "task=$gident" "reason=subject-unreadable" "subject=$_svd" || true
+        continue ;;
+      MERGED)
+        db "UPDATE tasks SET shipped_flag_at=datetime('now') WHERE id=${gid};"
+        _task_store_audit_log "gate shipped-flag" "ok" 0 -- "task=$gident" "type=$gtype" "evidence=subject-pr" "subject=$_svd" || true
+        _hb_log "[gate-shipped] ${gident} — the PR its ASK names is MERGED (${_svd}) -> flagged on SUBJECT state, not on the row's commits (DIVE-2414)"
+        if [[ -n "$gowner" ]] && _task_agent_channel "$gowner"; then
+          ( cmd_send "$gowner" --message="🚢 ${gident} — the pull request this open ${gtype} gate ASKS ABOUT is now merged (${_svd}). Likely settled: verify and close with \`5dive task show ${gident}\`. Auto-flag only — a merge is not a sign-off (DIVE-555), so it stays open until you clear it." ) >/dev/null 2>&1 || true
+        fi
+        continue ;;
+    esac
+    # NO-SUBJECT from here down: the ask names no pull request, so nothing can
+    # retire it automatically and the row-level nudge has to say what it is.
     hit=""
     for repo in $repos; do
       hit=$(_hb_repo_grep_ident "$repo" "$gident") && [[ -n "$hit" ]] && break
@@ -1896,10 +1967,14 @@ _hb_gate_shipped_sweep() {
     fi
     db "UPDATE tasks SET shipped_flag_at=datetime('now') WHERE id=${gid};"
     # DIVE-2054: same reasoning as the two branches above — fenced.
-    _task_store_audit_log "gate shipped-flag" "ok" 0 -- "task=$gident" "type=$gtype" "commit=$hit" || true
-    _hb_log "[gate-shipped] ${gident} — commit on ${_HB_GATE_SHIPPED_REF} references it: ${hit} -> flagged"
+    _task_store_audit_log "gate shipped-flag" "ok" 0 -- "task=$gident" "type=$gtype" "evidence=row-commit" "commit=$hit" || true
+    _hb_log "[gate-shipped] ${gident} — its ask names NO PR subject; falling back to ROW-level evidence: commit on ${_HB_GATE_SHIPPED_REF} references the row: ${hit} -> flagged"
     if [[ -n "$gowner" ]] && _task_agent_channel "$gowner"; then
-      ( cmd_send "$gowner" --message="🚢 ${gident} — a commit referencing this open ${gtype} gate landed on ${_HB_GATE_SHIPPED_REF} (${hit}). Likely shipped: verify and close with \`5dive task show ${gident}\`. Auto-flag only — a merge is not a sign-off, so it stays open until you clear it." ) >/dev/null 2>&1 || true
+      # DIVE-2414: name the EVIDENCE CLASS in the nudge. This flag says a commit
+      # named the ROW, and the ask names no PR to check instead — so on a row
+      # carrying several items it may well be about a different one (DIVE-2382).
+      # The old wording asserted "likely shipped" with no way to tell the two apart.
+      ( cmd_send "$gowner" --message="🚢 ${gident} — a commit referencing this open ${gtype} gate's ROW landed on ${_HB_GATE_SHIPPED_REF} (${hit}). This ask names no pull request, so the evidence is ROW-level: if the row carries several items, the commit may be about a different one — check before you clear. Verify with \`5dive task show ${gident}\`. Auto-flag only — a merge is not a sign-off, so it stays open until you clear it." ) >/dev/null 2>&1 || true
     fi
   done < <(db "SELECT id||x'1f'||COALESCE(ident,'DIVE-'||id)||x'1f'||need_type||x'1f'||COALESCE(assignee,'')
                FROM tasks

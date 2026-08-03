@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# TIER: nightly — 5.8s measured (DIVE-2525): does not fit the 300s PR core; the nightly sweep runs it.
 # DIVE-1437 isolated unit harness for the T2-floor-refused ROUTED-gate escalation in
 # cmd_task_answer. ROOT (DIVE-1429): a builder gate that DIVE-1145/1182 lead-routed
 # (routed_reviewer set) but whose effective tier is 2 (a non-floored `manual` gate —
@@ -32,7 +33,7 @@ trap 'rm -rf "$TMP"' EXIT
 # shellcheck disable=SC1090
 for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh \
          lib/agent_setup.sh lib/state.sh lib/audit.sh lib/registry.sh \
-         lib/tasks_db.sh cmd_task.sh; do
+         lib/tasks_db.sh lib/actor.sh cmd_task.sh; do
   # shellcheck source=/dev/null
   source "$SRC/$f"
 done

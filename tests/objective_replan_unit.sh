@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# TIER: nightly — 21.5s measured (DIVE-2525): does not fit the 300s PR core; the nightly sweep runs it.
 # OSS-27 isolated unit harness for the objective RE-PLAN cycle (cmd_objective.sh).
 # Feeds diffs via --diff=<json> (the test seam, like goal add --plan) so no live
 # planner agent is needed. Asserts the anti-Goodhart spine inherited from
@@ -34,7 +35,7 @@ trap 'rm -rf "$TMP"' EXIT
 # shellcheck disable=SC1090
 for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh \
          lib/agent_setup.sh lib/state.sh lib/audit.sh lib/registry.sh \
-         lib/tasks_db.sh cmd_task.sh cmd_org.sh cmd_project.sh cmd_goal.sh \
+         lib/tasks_db.sh lib/actor.sh cmd_task.sh cmd_org.sh cmd_project.sh cmd_goal.sh \
          cmd_loop.sh cmd_objective.sh; do
   source "$SRC/$f"
 done

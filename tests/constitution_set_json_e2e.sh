@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# TIER: nightly — 11.6s measured (DIVE-2525): does not fit the 300s PR core; the nightly sweep runs it.
 # DIVE-1751 e2e — `5dive constitution set --json` (browser-callable STRUCTURED-field write) on the
 # BUILT binary. Proves the dashboard EDIT contract (DIVE-1750):
 #   · reads a JSON patch {hard_gates,ship,comms} from STDIN, MERGES it into the CURRENT constitution,
