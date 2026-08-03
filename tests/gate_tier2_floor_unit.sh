@@ -70,6 +70,18 @@ _gate_caller_uid() { printf '%s' "$_PIN_UID"; }
 # ...and ASSERT the pin through the real resolver before any arm leans on it. A pin
 # that silently yields nothing would make every refusal below look correct for the
 # wrong reason — the DIVE-2588 shape. Pattern: tests/gate_enforce_env_bypass_unit.sh:127-154.
+# LIVENESS FIRST. The unclaimed check below FAILS OPEN: an unsourced lib/actor.sh, a
+# renamed resolver, a typo — every one arrives as '', which IS the pass value.
+# Measured on DIVE-2601 iteration 2 in gate_tier2_nonce_evidence_unit.sh, which
+# omitted lib/actor.sh: the assertion reduced to "the empty string is empty" and
+# could not fail. Probe with a SYNTHETIC passwd row in a subshell so the POSITIVE
+# case holds on any host, including a CI runner with no agent-* accounts.
+_probe="$(
+  _gate_passwd_stream() { printf 'agent-probe:x:424242:424242::/nonexistent:/bin/false\n'; }
+  _gate_uid_to_agent 424242
+)"
+[[ "$_probe" == "probe" ]] \
+  || { printf 'NOT OK - the identity resolver is not live: _gate_uid_to_agent returned %s for a synthetic agent-probe row (expected probe). Is lib/actor.sh in the source list?\n' "'$_probe'"; exit 1; }
 _pin_check="$(_gate_uid_to_agent "$(_gate_caller_uid)")"
 [[ -z "$_pin_check" ]] \
   || { printf 'NOT OK - identity pin is inert: uid %s resolved to agent %s, expected a NON-agent caller\n' "$_PIN_UID" "'$_pin_check'"; exit 1; }

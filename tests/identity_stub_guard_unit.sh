@@ -56,29 +56,72 @@ declare -A ALLOW=(
 # that grades tests/ grades the synthetic fixtures in A1-A3 below. A guard that can
 # only be pointed at the real corpus can only be graded by the corpus being clean,
 # which is indistinguishable from the guard being broken.
+# THE POPULATION PROBLEM, and it is why this function grades TWO populations
+# (DIVE-2601 iteration 2). The first cut scanned only files that still carry an
+# `id()` stub — which the remediation REMOVES. So every file this ticket fixed
+# dropped straight out of the guard's view the moment it was fixed, and the
+# remediated set is exactly the set most likely to be one edit away from grading the
+# host again. A checker whose population shrinks as its subject is repaired watches
+# nobody. Population B below is that set: any harness that PINS the seams, stub or no
+# stub. A6 prints both censuses so shrinkage is visible rather than inferred.
 _scan_identity_stubs() {
-  local dir="$1" f base
+  local dir="$1" f base claims_id pins
   for f in "$dir"/*.sh; do
     [[ -e "$f" ]] || continue
     base="$(basename "$f")"
     [[ "$base" == "$SELF" ]] && continue                    # self-exclusion (A3)
     [[ -n "${ALLOW[$base]:-}" ]] && continue
-    # Only an `id()` stub that ANSWERS -un is making an identity claim. A stub that
-    # only handles `id -u` (deploy_unit, agent_git_identity_unit) is pinning a
-    # numeric uid for a different guard and is out of scope.
-    grep -qE '^[[:space:]]*id\(\)' "$f" || continue
-    grep -qE '^[[:space:]]*id\(\).*\-un' "$f" \
-      || grep -qzE 'id\(\)[[:space:]]*\{[^}]*\-un' "$f" || continue
+
+    # Population A — an `id()` stub that ANSWERS -un is making an identity claim. A
+    # stub that only handles `id -u` (deploy_unit, agent_git_identity_unit) is pinning
+    # a numeric uid for a different guard and is out of scope.
+    claims_id=0
+    if grep -qE '^[[:space:]]*id\(\)' "$f" \
+       && { grep -qE '^[[:space:]]*id\(\).*\-un' "$f" \
+            || grep -qzE 'id\(\)[[:space:]]*\{[^}]*\-un' "$f"; }; then claims_id=1; fi
+    # Population B — pins the seams the derivation actually reads.
+    pins=0
+    grep -qE '^[[:space:]]*_gate_(caller_uid|passwd_stream)\(\)|actor_seam_as' "$f" && pins=1
+
+    (( claims_id || pins )) || continue
+
+    # (0) A PIN NEEDS THE FILE IT PINS INTO. The seams and the resolver both live in
+    # src/lib/actor.sh. Without it sourced, the override defines a function nothing
+    # calls, EVERY assertion through the resolver is a command-not-found that yields
+    # '' — so `[[ -z "$pin" ]]` becomes "the empty string is empty" and cannot fail —
+    # and the product code under test runs with its actor derivation missing. All
+    # three symptoms are silent. Measured in gate_tier2_nonce_evidence_unit.sh.
+    if (( pins )) && ! grep -qE 'lib/actor\.sh|actor_seam\.sh' "$f"; then
+      printf '%s\tpins the identity seams but never sources lib/actor.sh — the override lands on nothing, any assertion through the resolver is command-not-found (yields '"''"', which is the PASS value), and the product code runs with its actor derivation missing\n' "$base"
+      continue
+    fi
     # (1) the seams the derivation actually reads must be pinned
-    if ! grep -qE '^[[:space:]]*_gate_(caller_uid|passwd_stream)\(\)|actor_seam_as' "$f"; then
+    if (( claims_id )) && (( ! pins )); then
       printf '%s\tstubs `id -un` but never pins _gate_caller_uid/_gate_passwd_stream — the caller identity comes from the HOST\n' "$base"
       continue
     fi
     # (2) and the pin must be asserted through the real resolver
-    if ! grep -qE '_gate_authenticated_actor|_gate_uid_to_agent|actor_seam_selftest' "$f"; then
+    if (( claims_id )) && ! grep -qE '_gate_authenticated_actor|_gate_uid_to_agent|actor_seam_selftest' "$f"; then
       printf '%s\tpins the identity seams but never asserts the pin through the real resolver (_gate_authenticated_actor / _gate_uid_to_agent / actor_seam_selftest)\n' "$base"
     fi
   done
+}
+
+# _census <dir> — `<A-count> <B-count>` for the graded populations. Same predicates
+# as the scan, deliberately NOT a second implementation of the rules: it counts who
+# is LOOKED AT, which is the number a shrinking guard makes disappear quietly.
+_census() {
+  local dir="$1" f base a=0 b=0
+  for f in "$dir"/*.sh; do
+    [[ -e "$f" ]] || continue
+    base="$(basename "$f")"
+    [[ "$base" == "$SELF" || -n "${ALLOW[$base]:-}" ]] && continue
+    if grep -qE '^[[:space:]]*id\(\)' "$f" \
+       && { grep -qE '^[[:space:]]*id\(\).*\-un' "$f" \
+            || grep -qzE 'id\(\)[[:space:]]*\{[^}]*\-un' "$f"; }; then a=$((a+1)); fi
+    grep -qE '^[[:space:]]*_gate_(caller_uid|passwd_stream)\(\)|actor_seam_as' "$f" && b=$((b+1))
+  done
+  printf '%s %s' "$a" "$b"
 }
 
 FIX='tests/gate_enforce_env_bypass_unit.sh:127-154 is the in-tree pattern to copy'
@@ -98,6 +141,7 @@ got="$(_scan_identity_stubs "$TMP")"
 
 # ── A2 the second half of the rule: pinned but unasserted is still a violation ─
 cat > "$TMP/violator_unit.sh" <<'EOF'
+source "$SRC/lib/actor.sh"
 FAKE_CALLER="root"
 id() { if [[ "${1:-}" == -un ]]; then echo "$FAKE_CALLER"; else command id "$@"; fi; }
 _gate_caller_uid() { printf 0; }
@@ -107,8 +151,40 @@ got="$(_scan_identity_stubs "$TMP")"
   && ok_t "A2 a pinned-but-unasserted harness is flagged (the DIVE-2588 shape)" \
   || bad_t "A2 pinned-but-unasserted is flagged" "scan returned '${got:-<nothing>}' — a pin that silently yields nothing would pass this guard"
 
+# ── A2c rule (0): pinned, asserted, but lib/actor.sh never sourced ────────────
+# The iteration-2 defect, as a fixture. Everything the old guard looked for is
+# present — the pin, and the resolver named in an assertion — and NONE of it runs:
+# `_gate_uid_to_agent` is command-not-found, the capture is '', and the file's own
+# `[[ -z ... ]]` check passes on the failure. This is the arm that would have caught
+# it, and it is why rule (0) exists.
+cat > "$TMP/violator_unit.sh" <<'EOF'
+FAKE_CALLER="root"
+id() { if [[ "${1:-}" == -un ]]; then echo "$FAKE_CALLER"; else command id "$@"; fi; }
+_gate_caller_uid() { printf 0; }
+_pin=$(_gate_uid_to_agent "$(_gate_caller_uid)")
+[[ -z "$_pin" ]] || exit 1
+EOF
+got="$(_scan_identity_stubs "$TMP")"
+[[ "$got" == *"never sources lib/actor.sh"* ]] \
+  && ok_t "A2c a pin with no lib/actor.sh source is flagged (the iteration-2 defect)" \
+  || bad_t "A2c unsourced-resolver is flagged" "scan returned '${got:-<nothing>}' — an assertion calling a function that does not exist reads as compliant"
+
+# ── A2d rule (0) applies to population B: pinning ALONE is enough to be graded ──
+# The remediation removes the `id()` stub. If the population were still gated on that
+# stub, every file this ticket fixed would leave the guard's view at the moment it
+# was fixed. Same bytes as A2c minus the stub — it must STILL be flagged.
+cat > "$TMP/violator_unit.sh" <<'EOF'
+_gate_caller_uid() { printf 0; }
+_pin=$(_gate_uid_to_agent "$(_gate_caller_uid)")
+EOF
+got="$(_scan_identity_stubs "$TMP")"
+[[ "$got" == *"never sources lib/actor.sh"* ]] \
+  && ok_t "A2d a pinning harness with NO id() stub is still graded (remediated files stay in view)" \
+  || bad_t "A2d population B is graded" "scan returned '${got:-<nothing>}' — the guard stops watching a file the moment its stub is removed, which is the moment it is remediated"
+
 # ── A2b negative control: the compliant shape is NOT flagged ──────────────────
 cat > "$TMP/violator_unit.sh" <<'EOF'
+source "$SRC/lib/actor.sh"
 FAKE_CALLER="root"
 id() { if [[ "${1:-}" == -un ]]; then echo "$FAKE_CALLER"; else command id "$@"; fi; }
 _gate_caller_uid() { printf 0; }
@@ -116,7 +192,7 @@ _pin=$(_gate_uid_to_agent "$(_gate_caller_uid)")
 EOF
 got="$(_scan_identity_stubs "$TMP")"
 [[ -z "$got" ]] \
-  && ok_t "A2b the compliant shape (pin + assertion) is not flagged" \
+  && ok_t "A2b the compliant shape (source + pin + assertion) is not flagged" \
   || bad_t "A2b compliant fixture passes" "scan flagged it: '$got' — a guard that rejects the fix it demands cannot be satisfied"
 
 # ── A3 self-exclusion actually works, and is load-bearing ────────────────────
@@ -160,6 +236,22 @@ for base in "${!ALLOW[@]}"; do
     bad_t "A5 allowlist entry $base still exists" "allowlisted file is gone — drop the entry rather than leaving a silent exemption"
   fi
 done
+
+# ── A6 the census, PRINTED ────────────────────────────────────────────────────
+# A4 says "no violations". That reads identically whether the guard looked at forty
+# files or zero, and this guard's population shrinks as its subject is repaired — the
+# `id()` stub is what the fix deletes. So print who is being graded. The floor is
+# deliberately low: it is a tripwire for the population COLLAPSING (a renamed seam, a
+# tightened predicate), not a target to keep topped up.
+read -r CA CB < <(_census tests)
+printf '     census: population A (stubs `id -un`) = %s, population B (pins the seams) = %s, allowlisted = %s\n' \
+  "$CA" "$CB" "${#ALLOW[@]}"
+printf '     graded population B:\n'
+grep -lE '^[[:space:]]*_gate_(caller_uid|passwd_stream)\(\)|actor_seam_as' tests/*.sh \
+  | xargs -r -n1 basename | sort | sed 's/^/       /'
+(( CB >= 20 )) \
+  && ok_t "A6 the guard's population is non-trivial and named (B=$CB files pinning the seams)" \
+  || bad_t "A6 population is non-trivial" "only $CB file(s) matched the pin predicate — either the corpus changed shape or the predicate stopped matching, and a guard grading nothing reports the same clean corpus as a guard grading everything"
 
 printf '\n%s: %d passed, %d failed\n' "$SELF" "$PASS" "$FAIL"
 (( FAIL == 0 ))
