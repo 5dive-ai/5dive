@@ -333,11 +333,8 @@ else bad "a FAILING harness is not also accused of header drift" "rc=$RC out=$OU
 #
 # Graded with a 1s cap against ONE real harness (`--only`), because the probe globs
 # tests/*.sh and has no --corpus-dir seam. Cost: two kills, ~2s.
-# LIMIT, stated rather than implied: this forces the kill BEFORE the canary prints.
-# The killed-after-the-canary shape (the false `wired`) shares the same guard — it is
-# placed ahead of the canary grep precisely so both land in one class — but forcing it
-# live would need a harness that hangs after its verdict line, and inventing one is a
-# corpus file added by a row about not adding corpus files.
+# These arms force the kill BEFORE the canary prints. The killed-AFTER-the-canary
+# shape — the false `wired`, and the half that matters — is arms 26-29 below.
 PROBE="tests/meta/harness-verdict-probe.sh"
 VICTIM="gate_nonce_unit.sh"
 if [[ -r "$PROBE" && -r "tests/$VICTIM" ]]; then
@@ -354,6 +351,70 @@ if [[ -r "$PROBE" && -r "tests/$VICTIM" ]]; then
   else bad "the report row is timed-out and is NOT in the union's probed set" "$(cat "$TMP/probe.txt")"; fi
 else
   bad "probe timeout arms" "NOT REACHED: $PROBE or tests/$VICTIM missing — arms 23-25 graded nothing"
+fi
+
+# --------------- 26-29 DIVE-2555: the kill that arrives AFTER the canary has printed
+# THE HALF THAT MATTERS, and the one nothing in tests/*.sh can reach:
+# `grep -rln '__PROBE_REACHED__' tests/*.sh` is empty, so no real harness exercises
+# the mutant phase's kill at all. The arms above force the kill BEFORE the canary
+# (the old false `not-reached`). This forces it AFTER, which is the FALSE PASS: the
+# canary has printed, so the probe believes the mutation executed, and `timeout`
+# hands it a non-zero exit for free — so an UNWIRED harness banks a `wired` row and
+# the union counts it as probed. The one check that exists to find harnesses which
+# cannot fail CI then reports that they can. The two halves fail in opposite
+# directions and neither subsumes the other (DIVE-2464), so both need an arm.
+#
+# THE SEAM. The probe roots itself at `dirname "$BASH_SOURCE"/../..` and globs
+# `tests/*.sh` from there, so a throwaway tree with a SYMLINK to the probe in
+# tests/meta/ becomes a corpus of exactly one stub — no file added to tests/, per
+# this row's own rule. Symlink and not a copy, deliberately: the arm grades the probe
+# in THIS checkout, so deleting the mutant-phase kill classification reds it here.
+#
+# THE STUB is green and instant on its clean run and hangs only once MUTATED: the
+# injected `fail=$((fail+1))` lands after the canary and before the verdict, and the
+# sleep is downstream of the verdict and gated on `fail`. `STUB_HANG` makes the hang
+# itself a variable, which buys the control below. Cost: one kill, ~2s.
+FAKE="$TMP/fakerepo"
+mkdir -p "$FAKE/tests/meta"
+STUB=hang_after_verdict.sh
+if ln -s "$PWD/$PROBE" "$FAKE/tests/meta/$(basename "$PROBE")" 2>/dev/null; then
+  cat > "$FAKE/tests/$STUB" <<'STUBEOF'
+#!/usr/bin/env bash
+# Stub corpus for DIVE-2555. Its exit status IS wired to its counter; the probe
+# injects its canary and `fail=$((fail+1))` immediately before the verdict line.
+fail=0
+(( fail == 0 ))
+rc=$?
+# Downstream of the verdict and gated on the MUTATED counter: the clean run never
+# sleeps, the mutant always does. STUB_HANG=0 turns the hang off for the control.
+if (( fail != 0 )); then sleep "${STUB_HANG:-20}"; fi
+exit "$rc"
+STUBEOF
+  FAKE_PROBE="$FAKE/tests/meta/$(basename "$PROBE")"
+  # CONTROL FIRST, and it is what makes the arm below non-vacuous. Same stub, same
+  # mutation, hang switched off: the canary prints, the mutant exits non-zero on its
+  # own, and the probe correctly says `wired`. That is the exact shape the kill
+  # arrives in — so a `timed-out` verdict below cannot be the canary going unreached
+  # (that would be `not-reached`), and `wired` is demonstrably what this stub earns
+  # when the CLOCK does not intervene. Without this, arm 28 passes just as well
+  # against a stub that never reached its verdict line at all.
+  COUT="$(STUB_HANG=0 PROBE_TIMEOUT=20 bash "$FAKE_PROBE" --label=ctl --report="$TMP/probe-ctl.txt" 2>/dev/null)"; CRC=$?
+  if (( CRC == 0 )) && grep -q "^wired	$STUB$" "$TMP/probe-ctl.txt"; then
+    ok "control: the canary IS reached and this stub earns 'wired' when nothing kills it"
+  else bad "control: the canary IS reached and this stub earns 'wired' when nothing kills it" "rc=$CRC $(cat "$TMP/probe-ctl.txt" 2>&1)"; fi
+
+  # Now the same stub, killed after the canary. rc is non-zero and the canary is in
+  # the output — every precondition the old code read as `wired`.
+  KOUT="$(PROBE_TIMEOUT=2 bash "$FAKE_PROBE" --label=cap2 --report="$TMP/probe-kill.txt" 2>/dev/null)"; KRC=$?
+  want "a mutant killed after the canary does not fail the probe" "0" "$KRC"
+  if [[ "$KOUT" == *"0 wired"* && "$KOUT" == *"1 timed-out (cap 2s)"* ]]; then
+    ok "the kill is classified timed-out and is NOT counted wired (the false PASS)"
+  else bad "the kill is classified timed-out and is NOT counted wired (the false PASS)" "$KOUT"; fi
+  if grep -q "^timed-out	$STUB$" "$TMP/probe-kill.txt" && ! grep -qE "^(wired|UNWIRED)	$STUB$" "$TMP/probe-kill.txt"; then
+    ok "the killed mutant is absent from the union's probed set, so coverage is not banked"
+  else bad "the killed mutant is absent from the union's probed set, so coverage is not banked" "$(cat "$TMP/probe-kill.txt" 2>&1)"; fi
+else
+  bad "probe mutant-kill arms" "NOT REACHED: could not symlink $PROBE into $FAKE — arms 26-29 graded nothing"
 fi
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
