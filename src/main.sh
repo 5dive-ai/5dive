@@ -456,6 +456,7 @@ main() {
       [[ $# -gt 0 ]] || { usage; exit "$E_USAGE"; }
       local sub="$1"; shift
       case "$sub" in
+        -h|--help|help) usage ;;
         list)    cmd_list "$@" ;;
         info)    cmd_info "$@" ;;
         types)   cmd_types "$@" ;;
@@ -613,9 +614,10 @@ main() {
           AUDIT_CMD="agent skill"; AUDIT_ARGS=("$@")
           cmd_skill "$@" ;;     # add/list/rm operate on the agent type's skills dir
         auth)
-          [[ $# -gt 0 ]] || fail "$E_USAGE" "usage: 5dive agent auth status|login|set|start|poll|submit|cancel"
+          [[ $# -gt 0 ]] || fail "$E_USAGE" "usage: 5dive agent auth status|login|set|start|poll|submit|cancel|reap"
           local authcmd="$1"; shift
           case "$authcmd" in
+            -h|--help|help) usage ;;
             status) cmd_auth_status "$@" ;;
             poll)   cmd_auth_poll "$@" ;;
             login)
@@ -637,7 +639,7 @@ main() {
             reap)
               AUDIT_CMD="agent auth reap"; AUDIT_ARGS=("$@")
               cmd_auth_reap "$@" ;;
-            *) fail "$E_USAGE" "unknown auth command: $authcmd" ;;
+            *) fail "$E_USAGE" "unknown auth command: $authcmd (status|login|set|start|poll|submit|cancel|reap)" ;;
           esac ;;
         *)
           # `5dive agent <name> tui` — name-first form for terminal attach.
