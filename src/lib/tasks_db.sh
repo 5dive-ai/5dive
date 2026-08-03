@@ -225,6 +225,12 @@ CREATE TABLE IF NOT EXISTS tasks (
   -- the one case a developer with a working board never exercises. Caught by
   -- council_schedule_e2e, whose rig starts from an empty dir.
   derived_actor TEXT,
+  -- DIVE-2615: why this gate has this tier — axis=pinned|type-default|secret-type
+  -- |ask|title|title-fallback|none, plus ;term=<t> where a term is what fired.
+  -- Declared HERE as well as in _tasks_db_migrate: a fresh store takes this CREATE
+  -- and never runs the migration, so the array entry alone left the column missing
+  -- on exactly the boxes that have no history to migrate.
+  floor_provenance TEXT,
   parent_id   INTEGER REFERENCES tasks(id) ON DELETE CASCADE,
   created_at  TEXT NOT NULL DEFAULT (datetime('now')),
   started_at  TEXT,
@@ -673,7 +679,8 @@ CREATE TABLE IF NOT EXISTS gate_history (
   need_answer_sig   TEXT,
   human_nonce_hash  TEXT,
   retired_by        TEXT NOT NULL,
-  retired_at        TEXT NOT NULL DEFAULT (datetime('now'))
+  retired_at        TEXT NOT NULL DEFAULT (datetime('now')),
+  floor_provenance  TEXT
 );
 CREATE INDEX IF NOT EXISTS gate_history_task_idx ON gate_history(task_id, id);
 
@@ -1071,7 +1078,8 @@ _tasks_db_migrate() {
            'originated_by_objective INTEGER' 'originated_cycle INTEGER' \
            'verify_unavailable INTEGER' 'last_skipped_at TEXT' \
            'human_evidence TEXT' \
-           'derived_actor TEXT'; do
+           'derived_actor TEXT' \
+           'floor_provenance TEXT'; do
     # DIVE-2418: herestring, NOT a pipe. `printf | grep -q` lets grep exit on its
     # first match while printf is still writing, and printf then takes SIGPIPE and
     # emits "write error: Broken pipe" on stderr. This runs from tasks_db_init on
@@ -1346,10 +1354,28 @@ CREATE TABLE IF NOT EXISTS gate_history (
   need_answer_sig   TEXT,
   human_nonce_hash  TEXT,
   retired_by        TEXT NOT NULL,
-  retired_at        TEXT NOT NULL DEFAULT (datetime('now'))
+  retired_at        TEXT NOT NULL DEFAULT (datetime('now')),
+  floor_provenance  TEXT
 );
 CREATE INDEX IF NOT EXISTS gate_history_task_idx ON gate_history(task_id, id);
 MIG
+  fi
+
+  # DIVE-2615 — additive floor_provenance on an ALREADY-CREATED gate_history. The
+  # block above only runs when the table is ABSENT, so on every store that already
+  # has one (i.e. every box that has ever filed a gate) a new column in the CREATE
+  # reaches nothing. Same one-shot pragma check the tasks columns use.
+  #
+  # This box is the reason the check is a pragma read and not a bare ALTER: it
+  # already carries `floor_provenance TEXT`, added out-of-band by something that
+  # left no trace in this repo — the column existed with no writer, no migration
+  # and no reference in src/ or tests/, which is why it read NULL on all 79 rows.
+  local has_gh_floorprov
+  has_gh_floorprov=$(sqlite3 -cmd ".timeout 5000" "$TASKS_DB" \
+    "SELECT 1 FROM pragma_table_info('gate_history') WHERE name='floor_provenance' LIMIT 1;" 2>/dev/null)
+  if [[ "$has_gh_floorprov" != "1" ]]; then
+    sqlite3 -cmd ".timeout 5000" "$TASKS_DB" \
+      "ALTER TABLE gate_history ADD COLUMN floor_provenance TEXT;" >/dev/null 2>&1 || true
   fi
 
   # DIVE-748 — additive scorecard column on already-created loop_runs tables.
@@ -1893,11 +1919,11 @@ _gate_archive_and_clear_sql() {
     "INSERT INTO gate_history (task_id, ident, need_type, ask, need_options, recommend," \
     "                          tier, need_asked_at, need_answer, need_answered_at," \
     "                          need_answered_by, need_answered_uid, need_answer_sig," \
-    "                          human_nonce_hash, retired_by)" \
+    "                          human_nonce_hash, retired_by, floor_provenance)" \
     "  SELECT id, ident, need_type, ask, need_options, recommend," \
     "         tier, need_asked_at, need_answer, need_answered_at," \
     "         need_answered_by, need_answered_uid, need_answer_sig," \
-    "         human_nonce_hash, $(sqlq "$verb")" \
+    "         human_nonce_hash, $(sqlq "$verb"), floor_provenance" \
     "    FROM tasks" \
     "   WHERE (${pred})" \
     "     AND (need_type IS NOT NULL OR need_answer IS NOT NULL" \
