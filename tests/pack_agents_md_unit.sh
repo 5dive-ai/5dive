@@ -324,9 +324,12 @@ truthy "export direction: THIS FILE installs nothing, on any harness" \
   $(grep -q 'own installs nothing, on any harness' "$MD83"; echo $?)
 truthy "import direction is named as a separate mechanism" \
   $(grep -q '5dive agent import` re-resolves' "$MD83"; echo $?)
-# 4. And the load half stays UNMEASURED rather than being upgraded to a promise:
-#    we install a body, we do not claim the harness reads it.
-truthy "the text states landing, not loading (no codex seat has ever been measured)" \
+# 4. And the load half stays a non-promise: we install a body, we do not claim
+#    the harness reads it. NB codex HAS since been measured to scan
+#    $HOME/.agents/skills (DIVE-2583 amendment), so the reason this arm exists is
+#    not "nobody has looked" — it is that 5dive performs no runtime check, and
+#    every other harness (opencode included) is still unmeasured.
+truthy "the text states landing, not loading (5dive does not verify the load at runtime)" \
   $(grep -q 'does not verify it' "$MD83"; echo $?)
 
 printf '\n%s: %d passed, %d failed\n' "$(basename "$0")" "$PASS" "$FAIL"
