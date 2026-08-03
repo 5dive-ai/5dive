@@ -1906,6 +1906,18 @@ _hb_gate_shipped_sweep() {
     [[ -n "$grow" ]] || continue
     IFS=$'\x1f' read -r gid gident gtype gowner <<<"$grow"
     [[ -n "$gid" && -n "$gident" ]] || continue
+    # DIVE-2068: type=secret is satisfied ONLY by a human handing over a
+    # credential — that event cannot appear in a commit or a merged PR, ever.
+    # So for this type a commit/PR hit carries ZERO information and "likely
+    # shipped, verify and close" would be a false positive 100% of the time.
+    # Skip both evidence paths below (subject-PR and row-commit) up front;
+    # decision/approval/manual are unaffected — a commit genuinely can be
+    # evidence for those.
+    if [[ "$gtype" == "secret" ]]; then
+      _hb_log "[gate-shipped] ${gident} — type=secret: a commit/PR can never be evidence a credential was handed over (DIVE-2068); NOT flagging, gate stays eligible"
+      _task_store_audit_log "gate shipped-flag" "skip" 0 -- "task=$gident" "reason=type-secret" || true
+      continue
+    fi
     # DIVE-2414: READ WHAT THE GATE IS ABOUT BEFORE READING THE ROW.
     # The commit-stream lookup below is row-level evidence: it answers "did
     # something naming this ROW land", which on a multi-item row is routinely a
