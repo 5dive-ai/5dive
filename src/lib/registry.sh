@@ -73,6 +73,44 @@ envelope_tier() {
   printf '%s\n' "$t"
 }
 
+# DIVE-2552: COMPARE the claimed sender against the measured caller, and stamp the
+# comparison. Both values are already in hand at every envelope site — `sender`
+# (from `--from`, format-validated only) and the caller `envelope_tier` is fed —
+# and until now no site put them next to each other. So `--from=marcus` run by dev
+# rendered byte-for-byte identical to a send marcus actually made.
+#
+# tier= does NOT close this. DIVE-1064/2210 built it against a CROSS-tier peer;
+# dev and marcus are both admin, so the one unforgeable field AGREES with the
+# forged one. Same-tier impersonation has no tell at all today.
+#
+# NOT a refusal, deliberately. The obvious remedy — reject `--from=X` unless X is
+# the caller — breaks the legitimate synthetic-label senders, which are not agent
+# names and never derive as one: `loop`, `task-engine`, `council`, `verifier`,
+# `ask`, `comment-watch`, `blocker-push`, `community-heartbeat`. Enumerating the
+# acceptors before gating is the lesson of
+# community/wiki/a-control-partitions-a-population-and-populations-drift.md. A
+# marker keeps every one of them working and hands the receiver the fact instead.
+#
+# THE DIVE-2210 PROPERTY, CARRIED FORWARD. Absence must mean exactly one thing.
+# Empty output here is produced by exactly ONE branch — measured, and the claim
+# matched — so a missing via= is itself a measurement. Every path that did not
+# measure returns an `unknown:<reason>` token instead, because a claim we could
+# not check must never render the same as a claim we checked and confirmed.
+#   (empty)                  measured: claimed == caller, nothing asserted
+#   <caller>                 measured: claimed != caller — the real one, named
+#   unknown:no-caller        no caller could be derived; the claim is UNCHECKED
+#   unknown:malformed-caller caller present but not a bare header-safe token
+envelope_via() {
+  local claimed="${1:-}" measured="${2:-}"
+  [[ -n "$measured" ]] || { printf 'unknown:no-caller\n'; return 0; }
+  # Same injection surface as tier=: the value lands in a space-delimited header,
+  # so a caller carrying a space would forge a second envelope field.
+  [[ "$measured" =~ ^[a-z][a-z0-9_-]{0,31}$ ]] \
+    || { printf 'unknown:malformed-caller\n'; return 0; }
+  [[ "$claimed" == "$measured" ]] && return 0
+  printf '%s\n' "$measured"
+}
+
 # ---------------------------------------------------------------------------
 # DIVE-2213: the SAME not-measured-vs-measured-absent collapse as DIVE-2210, but
 # at a DECISION site (the heartbeat's privilege-escalation-by-queue guard) rather

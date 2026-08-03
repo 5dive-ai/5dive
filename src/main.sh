@@ -141,6 +141,10 @@ Agents:
                                                      # When called from another agent, auto-wraps as
                                                      # [5dive-msg from=<caller> id=<id>] so the
                                                      # receiver sees who's pinging it. --raw skips wrapping.
+                                                     # --from is a CLAIM. When it does not match the
+                                                     # measured caller the envelope also carries
+                                                     # via=<real-caller> (DIVE-2552); an unverifiable
+                                                     # claim reads via=unknown:no-caller.
                                                      # --reply-to-chat adds a hint telling the receiver
                                                      # to reply directly in that Telegram/Discord chat
                                                      # via its own bot (see SKILL.md).
