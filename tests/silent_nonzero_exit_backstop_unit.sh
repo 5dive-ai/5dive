@@ -26,16 +26,42 @@
 # So every reported-exit shape gets an arm: fail()'s own path, the
 # `<verb>_usage; exit "$E_USAGE"` sites that never reach fail(), and success.
 #
-# MUTATION GRADE (by hand, each must turn this file red):
-#   * `mark_reported() { :; }`            -> arms 3/4 FAIL (backstop fires after a
-#                                            message that was printed).
-#   * drop `mark_reported` from fail()    -> arm 3 FAILS.
-#   * drop `mark_reported` from the usage sites -> arm 4 FAILS.
-#   * `_report_silent_exit() { :; }`      -> arms 1/6/7/9 FAIL (this is arm 2's
-#                                            mutant, made permanent).
+# HOW THE POPULATION WAS ENUMERATED, because reading did not find it. The backstop
+# has to stay quiet for every deliberate non-zero exit that prints its own reason
+# and never routes through fail(). Reading src/ found the seven
+# `<verb>_usage; exit "$E_USAGE"` sites and cmd_account's in-use refusal. It MISSED
+# `cmd_whoami.sh`'s UNMEASURABLE refusal, which builds its own
+# `{ok:false,…,data:{…}}` envelope (fail() cannot carry `data`) — the core tier
+# caught that one red, which is the only reason the count is not still wrong.
+# So the set is enumerated by OPERATION over the BUILT bundle, not by inspection:
+#
+#   grep -nE '(^|[;&|[:space:]])exit[[:space:]]+("?\$[A-Za-z_]\w*"?|[1-9][0-9]*)' 5dive
+#   grep -rn 'ok:false' src/ | grep -v src/lib/output.sh      # the whoami shape
+#
+# 35 hits, classified: 10 marked in-process sites (fail() itself, cmd_account,
+# cmd_whoami, 7 usage exits) + 2 `trap '… exit 130' INT TERM` (covered by the
+# signal rule) + 2 `_tasks_alarm …; exit 3` inside a `( flock 9 )` SUBSHELL, which
+# cannot double-report because a `( )` subshell does not run the parent's EXIT trap
+# (measured, bash 5.2) + 12 inside heredoc'd `bash -s` installers that are a
+# DIFFERENT PROCESS and never reach our trap + 9 that are comments, awk programs or
+# JS. The second grep answers "what else builds its own envelope": exactly two,
+# cmd_account and cmd_whoami, both marked. Re-run both greps when this file is
+# touched — the population is the thing that drifts, not the mechanism.
+#
+# MUTATION GRADE — RUN, not asserted. Six mutations against the committed tree at
+# a2c41bf (rebased onto b64b6da), each reverted after; every one turns this file
+# red, and on the arms named. Baseline 11/0. Later commits on this branch touch
+# only this header — `git diff a2c41bf HEAD -- src/` is EMPTY, so the graded
+# mechanism is the shipped one.
+#   * `mark_reported() { : ; }`                    -> 8/3  (arms 3, 4, 7)
+#   * drop `mark_reported` from fail()             -> 9/2  (arms 3, 7)
+#   * drop `mark_reported` from the usage sites    -> 10/1 (arm 4)
+#   * `_report_silent_exit() { return 0; }`        -> 6/5  (arms 1, 1b, 6, 8-liveness, 9)
 #   * move `_report_silent_exit` BELOW the `[[ -n "$AUDIT_CMD" ]]` return in
-#     on_exit_audit -> arms 1 and 9 FAIL (read-only verbs go silent again).
-#   * drop the 130/143 suppression       -> arm 8's first half FAILS.
+#     on_exit_audit                                -> 7/4  (arms 1, 1b, 6, 9)
+#   * drop the 130/143 suppression                 -> 10/1 (arm 8, first half)
+# Arm 7 survives the reporter being dead ON PURPOSE — it asserts the real message
+# is still printed and the backstop stays quiet, so only the marker can move it.
 #
 # Runs the SHIPPED artifact: builds a throwaway bundle via BUILD_OUT (43ms) and
 # executes it. The only verbs it runs are read-only (`task ls`, `--version`) or
