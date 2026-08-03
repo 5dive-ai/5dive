@@ -4635,7 +4635,16 @@ _gate_needs_human() {
 # filer dev reports_to main. That is _gate_route_reviewer, not the floor, and main
 # explicitly did not diagnose it — do not fold it in here.
 _GATE_PUSH_FOR_REVIEW_RX='delegated push|push[- ]for[- ]review|5dive push|push[^.]*(for review|for a pr|for code review|branch)'
-_GATE_PUSH_NOT_INERT_RX='\bmerg(e|es|ed|ing)\b|deploy|redeploy|\brelease\b|roll ?out|\broll(ing|ed)? out\b|roll[^.]*fleet|fleet[- ]?roll|push(es|ed|ing)? to (main|prod|production)|\bland (the|it|this)\b'
+# The DESTINATION clause is `\bto\b … (main|master|prod)`, NOT `push to (main|…)`.
+# Found by the pre-land corpus sweep, and it is the one arm the fix got wrong on
+# first writing: DIVE-1940's real ask is "Push branch dive-1940-token-ux @ 3d9851a0
+# to 5dive-frontend MAIN". The adjacent form `push to main` cannot see a repo name
+# sitting between the verb and its destination, so a push to a repo's default
+# branch was inheriting the inert-push exemption. It floored before this change
+# only by accident — on the word 'token' inside the branch name — so the sweep is
+# what caught it, not the defect it was sweeping for. Bounded distance is safe here
+# in a way DIVE-2224 forbids across a seam: this matches inside ONE field.
+_GATE_PUSH_NOT_INERT_RX='\bmerg(e|es|ed|ing)\b|deploy|redeploy|\brelease\b|roll ?out|\broll(ing|ed)? out\b|roll[^.]*fleet|fleet[- ]?roll|\bto\b[^.]{0,60}\b(main|master|prod|production|trunk)\b|\bland (the|it|this)\b'
 
 # 0 iff the text describes an INERT push-for-review: a feature branch going to a
 # remote for PR review. Fails closed — anything that also names a prod-touching

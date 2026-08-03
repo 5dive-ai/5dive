@@ -26,15 +26,31 @@
 # fails against exempting the whole _gate_eng_ship_hit class instead of the inert
 # push-for-review subset.
 #
-# MUTATION GRADE (all four run, all four go red where stated):
+# MUTATION GRADE (all five run, all five go red where stated):
 #   M1  remove the `if _gate_push_for_review_hit` block from _gate_tier2_floor_hit
 #       -> T1/T2 red (the fix is gone).
 #   M2  drop the _GATE_PUSH_NOT_INERT_RX check from _gate_push_for_review_hit
 #       -> T6 red (a merge/deploy ask would inherit the exemption).
+#   M2b write the not-inert destination clause as the ADJACENT `push to (main|...)`
+#       instead of `\bto\b … (main|master|prod)` -> T6f/T6g red. This is the one
+#       the fix got WRONG on first writing, and T6f is the live DIVE-1940 ask that
+#       caught it: an adjacent pattern cannot see a repo name sitting between the
+#       verb and its destination ("push branch X to 5dive-frontend MAIN").
 #   M3  redact every token containing a hyphen (drop the slug-shape test)
 #       -> T5 red ('auto-teardown' in prose would stop flooring).
 #   M4  omit the mirrored redaction in _gate_tier2_floor_term
 #       -> T7 red (the helper reports a term the floor did not use).
+#
+# PRE-LAND CORPUS SWEEP (main's condition on the ticket: "how many rows are floored
+# this way, and would any legitimately-destructive gate be downgraded"). Ran
+# _gate_floor_axis over all 435 gate rows in the live store (tasks + gate_history),
+# old code vs new. THREE change, all `ask` -> `title` — meaning they become
+# LEAD-ROUTED with floored_by=title, not unfloored: DIVE-2613 and DIVE-2034 (both
+# `…-teardown-…` in the branch name, both inert push-or-PR asks) and DIVE-2068
+# (`…-secret-gate-shipflag`). The 2068 variant that says "Open PR + MERGE" is NOT
+# among them — it still floors, which is M2's guard doing its job on real data.
+# A fourth row, DIVE-1940, changed on the first draft and does NOT change now; it
+# is T6f.
 #
 # TIER: core — 0.6s measured on the 5dive control-plane host (bash, no root, no
 # network): source-and-call only, no DB writes beyond tasks_db_init.
@@ -149,6 +165,14 @@ floors "T6c roll to the fleet is not inert" \
   'approve delegated push for branch dive-2613-teardown-foo and roll to the fleet'
 floors "T6d push to prod is not inert" \
   'approve push to prod of branch dive-2613-teardown-foo'
+# T6f/T6g are the REAL DIVE-1940 ask, verbatim from the live corpus, and they are
+# the arm the fix failed on first writing: an adjacent `push to main` pattern
+# cannot see a repo name between the verb and the destination. Caught by the
+# pre-land sweep, not by the ticket. Commit sha is a public repo ref, not PII.
+floors "T6f push to a REPO's main is not inert (DIVE-1940, verbatim)" \
+  'Push branch dive-1940-token-ux @ 3d9851a0 to 5dive-frontend main? I have no push creds; the work is built and verified.'
+floors "T6g push to master is not inert" \
+  'approve delegated push of branch dive-2613-teardown-foo to the app repo master'
 if _gate_eng_ship_hit 'approve deploy of branch dive-2613-teardown-outcomes-hetzner-only'; then
   ok_t "T6e the T6b text IS eng-ship, so T6b proves the exemption is narrower than eng-ship"
 else
