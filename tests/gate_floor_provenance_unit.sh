@@ -50,6 +50,24 @@
 # that whatever the floor decided is WRITTEN DOWN, on the same statement that writes
 # the tier, and that it survives into gate_history when the gate is retired.
 #
+# MUTATION GRADE — RUN against the committed tree at efd1fa9, each reverted after
+# (`git checkout -- src/`, tree verified clean at the end). Baseline 19/0, 2.4s.
+#   * drop `floor_provenance=` from the filing UPDATE   -> 7/12
+#   * read `tier` instead of `tier_arg` for pinned      -> 16/3  (arms 2, 2-diff, 7)
+#   * drop the `;term=` suffix                          -> 13/6
+#   * emit NULL instead of `axis=none`                  -> 17/2  (arms 6, 8b)
+#   * drop the withdraw clear                           -> 18/1  (arm 9)
+#   * drop floor_provenance from the gate_history INSERT-> 17/2  (arms 8, 9-liveness)
+#   * drop the additive gate_history ALTER              -> 18/1  (arm 10)
+#   * drop the column from the fresh `tasks` CREATE     -> 18/1  (arm 0)
+# The NULL-vs-none mutation was TAKEN TWICE. Written first as a regex over the
+# assignment, it reddened six arms — more than it should, because the rewrite
+# mangled the whole expression rather than the one case, so it graded "the writer is
+# broken" and not "the distinction is gone". Re-taken surgically (append one line
+# blanking `_floor_prov` when the axis is `none`, every other path untouched) it
+# reds exactly arms 6 and 8b, which is the claim. A mutation that reds too much is
+# not a stronger result, it is a different experiment.
+#
 # Run: bash tests/gate_floor_provenance_unit.sh   (no root, no network.)
 set -uo pipefail
 
