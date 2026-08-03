@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# TIER: core — 1.4s measured (DIVE-2525): fits the 300s PR core; stated, not defaulted.
 # DIVE-2102 — the capability registry answers "confirmed holder" and nothing else.
 #
 # The assertions that matter are the NEGATIVE-SPACE ones: absence, staleness and

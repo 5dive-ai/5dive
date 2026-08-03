@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# TIER: core — 2.4s measured (DIVE-2525): fits the 300s PR core; stated, not defaulted.
 # tests/broker_surface_unit.sh — INST-5.
 #
 # Two questions, and the first is the one that decides whether this refactor was

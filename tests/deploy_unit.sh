@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# TIER: core — 5.0s measured (DIVE-2525): fits the 300s PR core; stated, not defaulted.
 # deploy_unit — INST-5: the delegated-deploy EXECUTOR (src/cmd_deploy.sh).
 #
 # tests/broker_surface_unit.sh grades the POLICY stage under the deploy surface
