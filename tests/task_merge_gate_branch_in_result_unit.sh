@@ -195,5 +195,38 @@ run_done DIVE-9001 --result='decision recorded, no code changed — closing per 
   && ok_t 'a close that mentions "branch" in prose but names no ident-prefixed slug is untouched' \
   || bad_t 'plain-prose close must not be blocked' "rc=$RC status=$(statusof DIVE-9001) refusals=$(refusals DIVE-9001) out=$OUT"
 
+
+# DIVE-2603: the extractor is a PROBE that legitimately finds nothing, and its
+# pipeline ends in `grep`, which exits 1 on no-match. Under `set -euo pipefail`
+# an UNGUARDED `var=$(...)` around it kills the caller — which is exactly what
+# v0.18.3 shipped: `task done` exited 1 with EMPTY stdout AND stderr for every
+# caller holding a gh token whose result text named no branch. The die happened
+# before anything printed, which is why it presented as a silent failure.
+#
+# Two arms as a PAIR. The no-match arm alone passes for an extractor that is
+# never reached; the match arm proves the probe still works and that the no-match
+# arm is not green by vacuity.
+_rc_probe() {  # $1 = text ; echoes "rc|output"
+  local out rc=0
+  out=$(bash -c '
+    set -euo pipefail
+    '"$(declare -f _gate_branch_refs_from_text 2>/dev/null || true)"'
+    _gate_branch_refs_from_text "$1" "$2"
+  ' _ "$1" "DIVE-999") || rc=$?
+  printf '%s|%s' "$rc" "$out"
+}
+_r_none="$(_rc_probe 'this result names no branch at all')"
+_r_hit="$(_rc_probe 'landed on DIVE-999-some-slug today')"
+[[ "${_r_none%%|*}" == "1" ]] \
+  && ok_t "DIVE-2603: the extractor itself EXITS 1 on no-match (the hazard is real, not hypothetical)" \
+  || bad_t "DIVE-2603: extractor exits 1 on no-match" "expected rc=1, got ${_r_none%%|*} — if this changed, the guard below is grading nothing"
+[[ "${_r_hit%%|*}" == "0" && "${_r_hit#*|}" == "dive-999-some-slug" ]] \
+  && ok_t "DIVE-2603: positive control — the extractor still finds a real branch (rc=0)" \
+  || bad_t "DIVE-2603: positive control" "expected rc=0 and dive-999-some-slug, got ${_r_hit}"
+grep -qE '_br_cands=\$\(_gate_branch_refs_from_text [^)]*\) \|\| _br_cands=' "$SRC/cmd_task.sh" \
+  && ok_t "DIVE-2603: the call site GUARDS the assignment so a no-match cannot kill the close" \
+  || bad_t "DIVE-2603: call site guarded" "the \$( ) assignment is unguarded — under set -e + pipefail a result naming no branch kills 'task done' with empty stdout and stderr"
+
+
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [[ $FAIL -eq 0 ]]
