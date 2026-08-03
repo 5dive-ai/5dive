@@ -243,6 +243,37 @@ run_done B-5 --result='landed'
   && ok_t 'T5b one repo answered and two did not — refuses as PARTIAL COVERAGE, not as absent' \
   || bad_t 'T5b partial coverage' "rc=$RC slug=[$(slugof B-5)] out=$OUT"
 
+# T5c — DIVE-2324: ACCUMULATE every unreachable repo, not just the last one seen.
+# A plain overwrite (`_attr_unreach="$_slug"`) named only the FINAL unreachable repo
+# of a multi-repo search, under-reporting the coverage gap this message exists to
+# describe — the same overwrite-vs-accumulate bug DIVE-2266 fixed for `_attr_bound`.
+# Stub the attribution seam directly (as ANC-2266 does) rather than the raw gh commit
+# pages: it gives exact per-repo control without depending on pagination fixtures.
+attr_impl=$(declare -f _gate_branch_ident_on_main)
+_gate_branch_ident_on_main() {
+  case "$1" in
+    5dive-ai/5dive)       printf '0' ;;  # one repo answers cleanly (exhausted, no hit)
+    lodar/5dive-api)      printf ''  ;;  # unreachable
+    lodar/5dive-frontend) printf ''  ;;  # unreachable
+  esac
+}
+clear_fx; a_token
+seed B-6 'Branch: dive-2324-multi-unreach'
+FIVE_GATE_REPOS='5dive-ai/5dive,lodar/5dive-api,lodar/5dive-frontend' \
+  run_done B-6 --result='landed'
+eval "$attr_impl"
+# ANCHORED, not a bare substring match: $_searched (every repo that was searched,
+# regardless of whether it answered) ALSO contains 'lodar/5dive-api' and
+# 'lodar/5dive-frontend', so asserting on the names alone is true whether
+# _attr_unreach accumulated or overwrote — it does not grade the fix (main, on
+# review: verified by mutation, the overwrite-reverted source still passed this
+# exact assertion). Pin the phrase that immediately precedes $_attr_unreach in the
+# message instead, so the comma-joined list is graded in its own position.
+[[ $RC -eq $E_CONFLICT && "$(slugof B-6)" == "done-attribution-unresolved" \
+   && "$OUT" == *"COULD NOT SCAN main in lodar/5dive-api, lodar/5dive-frontend for a commit naming"* ]] \
+  && ok_t 'T5c DIVE-2324: names EVERY unreachable repo, not just the last' \
+  || bad_t 'T5c accumulate unreachable' "rc=$RC slug=[$(slugof B-6)] out=$OUT"
+
 # ---------------------------------------------------------------------------
 # T6 — token present, main's history EXHAUSTED with no commit naming the ident and
 # no merged PR. This is the one true "not landed" on the branch path. It must
