@@ -47,11 +47,24 @@ reds if it lands — DIVE-2520's "forge an actor, the rail goes red" one layer u
 answers a second gate down a real human path, because a floor that refuses everything and a
 floor that refuses the forge are the same observation from the refusal alone.
 
-Tests: `tests/gate_enforce_env_bypass_unit.sh` (19 arms; graded against the pre-fix code,
+Tests: `tests/gate_enforce_env_bypass_unit.sh` (23 arms; graded against the pre-fix code,
 which reproduces the exploit inside the harness at `state=closed prov=human:dev`).
 `tests/gate_tier2_floor_unit.sh` and `tests/gate_t2_routed_escalate_unit.sh` had arms
 asserting the *opposite* contract — that clearing the flag made the floor dormant — and now
 assert that it does not.
+
+Both the harness and the probe had a defect worth naming, because it is the same class this
+row is about. Each stubbed `id -un` to model "the caller is an agent" — and the uid-first
+resolver has not read `id -un` since DIVE-2330; it walks `/etc/passwd` for `$EUID` in pure
+bash, precisely so a PATH shim cannot forge it. The stub was inert, so agent-ness was
+supplied BY THE HOST: `agent-dev` owns uid 1007 on a 5dive box, and 19/19 green there said
+nothing about the property. On a CI runner the same uid is `runner`, no agent claims it, and
+the forge arm was a *legitimate human tap* — 8 arms red, and the probe reported a bypass that
+had not happened. Both now pin `_gate_caller_uid` and `_gate_passwd_stream`, the seams
+`lib/actor.sh` publishes for this, and both assert the pin through the real resolver first: a
+pin that silently yields nothing would make every refusal look right for the wrong reason.
+The probe reports `not-reached` rather than `pass` when its caller does not resolve as an
+agent, since a refusal it cannot attribute measures nothing.
 ## Unreleased — feat(agent): `agent list` reports credential health, so a lapsed seat stops rendering live (DIVE-1953)
 
 On the DIVE-1868 flagship demo a grok seat's credential lapsed. The systemd unit stayed

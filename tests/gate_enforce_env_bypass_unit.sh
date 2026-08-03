@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# TIER: nightly — 8.6s measured on the 5dive host (uid 1007, warm tree). The budget number
+# TIER: nightly — 9.5s measured on the 5dive host (uid 1007, warm tree). The budget number
 # that gates is CI's, not mine: PR #395 read 209 harnesses / 289s / 96% of the 300s cap, so a
 # new core harness would spend most of the remaining 11s of headroom. (This box reads 309s for
 # the same 209 — ~7% slower than the runner, which is why the CI figure is the one quoted.)
@@ -72,6 +72,29 @@ ok_t()  { PASS=$((PASS+1)); printf 'ok   - %s\n' "$1"; }
 bad_t() { FAIL=$((FAIL+1)); printf 'FAIL - %s\n   %s\n' "$1" "${2:-}"; }
 
 tasks_db_init
+
+# ── I: STORE ISOLATION, PROVED BEFORE THE FIRST WRITE (DIVE-2518) ────────────────
+# An empty scratch store is not evidence of isolation — a read that merely ERRORED is
+# also empty. So assert both sides in the same breath: the db this harness writes to
+# is the one under $TMP, and the box's real store is a different file reading a
+# non-zero count. A pristine runner has no real store; that is REPORTED as the reason
+# the differential is unavailable, not folded into a pass on its own.
+DEFAULT_DB="${FIVE_DEFAULT_DB:-/var/lib/5dive/tasks/tasks.db}"
+[[ "$TASKS_DB" == "$TMP/"* ]] \
+  && ok_t "I1 the resolved tasks db is this harness's throwaway ($TASKS_DB)" \
+  || bad_t "I1 store isolation" "TASKS_DB='$TASKS_DB' is not under $TMP — every write below would land in a shared store"
+if [[ -r "$DEFAULT_DB" ]] && command -v sqlite3 >/dev/null 2>&1; then
+  _live=$(sqlite3 "$DEFAULT_DB" "SELECT COUNT(*) FROM tasks;" 2>/dev/null)
+  _scratch=$(db "SELECT COUNT(*) FROM tasks;" 2>/dev/null)
+  if [[ "${_live:-0}" =~ ^[0-9]+$ && "${_live:-0}" -gt 0 && "${_scratch:-x}" == "0" ]]; then
+    ok_t "I2 differential: the box's store reads $_live rows and this harness's reads 0, printed together — two different files"
+  else
+    bad_t "I2 differential isolation" "live='${_live:-unreadable}' scratch='${_scratch:-unreadable}' — an all-zero or unreadable pair proves nothing"
+  fi
+else
+  ok_t "I2 differential unavailable: no readable store at $DEFAULT_DB on this host (a pristine runner has none), so I1 is what pins the write target here"
+fi
+
 task_need_notify() { :; }
 audit_log() { :; }
 # The answer path pings the gate's owner over `cmd_send` — a REAL inter-agent rail
@@ -79,7 +102,18 @@ audit_log() { :; }
 # therefore sends live traffic about a fixture row unless it is stubbed here.
 cmd_send() { return 1; }
 
-seed_task() { db "INSERT INTO tasks (ident, title, status, created_by) VALUES ('$1','t','todo','main');"; }
+# A colliding ident is NOT a benign duplicate. The row it lands on already carries a
+# filed gate, so the arm goes on to grade an EARLIER arm's row while sqlite prints a
+# bare `UNIQUE constraint failed: tasks.ident` that reads exactly like a store-isolation
+# defect. On PR #399 that line sat one line above eight unrelated failures and cost a
+# reviewer the wrong root cause. Red the arm and name it instead.
+seed_task() {
+  if [[ -n "$(db "SELECT ident FROM tasks WHERE ident='$1';")" ]]; then
+    bad_t "seed $1" "ident already exists in this harness's OWN store — a later arm would grade the row an earlier one filed"
+    return 1
+  fi
+  db "INSERT INTO tasks (ident, title, status, created_by) VALUES ('$1','t','todo','main');"
+}
 answered() { db "SELECT CASE WHEN need_answered_at IS NULL THEN 'open' ELSE 'closed' END FROM tasks WHERE ident='$1';"; }
 provby()   { db "SELECT COALESCE(need_answered_by,'') FROM tasks WHERE ident='$1';"; }
 tierof()   { db "SELECT COALESCE(tier,'') FROM tasks WHERE ident='$1';"; }
@@ -89,13 +123,55 @@ hashof()   { db "SELECT COALESCE(human_nonce_hash,'') FROM tasks WHERE ident='$1
 # THE ATTACKER is the ordinary case, not a privileged one: an agent, unprivileged, no
 # sudo — exactly what every agent on every box already is. That is the whole severity
 # argument, so it is the default posture here.
-FAKE_CALLER="agent-dev"
-id() { if [[ "${1:-}" == -un ]]; then echo "$FAKE_CALLER"; else command id "$@"; fi; }
-as_agent()        { FAKE_CALLER="agent-dev"; unset SUDO_UID; _gate_is_root() { return 1; }; }
+#
+# CALLER-IDENTITY PIN (DIVE-2365 / DIVE-2330). The first cut of this file stubbed only
+# `id -un`, and the resolver has not read `id -un` since DIVE-2330 — it walks
+# /etc/passwd for $EUID in pure bash, precisely because a PATH shim could forge `id`.
+# So the stub was INERT and the caller's agent-ness came FROM THE HOST: uid 1007 is
+# `agent-dev` on this box, and 19/19 green here said nothing about the property. On the
+# CI runner the same uid is `runner`, no agent row claims it, and the "forge" arm was a
+# legitimate human tap — 8 arms red, including the baseline the whole file rests on.
+# `lib/actor.sh` exposes `_gate_passwd_stream` and `_gate_caller_uid` as seams for
+# exactly this. Pin BOTH, keep the resolver's own agent-*/registry logic real, and
+# assert the pin through the real resolver before any arm leans on it — a pin that
+# silently yields '' would make every refusal below look correct for the wrong reason.
+AGENT_UID=987654
+FAKE_CALLER="agent-dev"; CALLER_UID="$AGENT_UID"
+_agentrow() { printf 'agent-fixture:x:%s:%s::/home/agent-fixture:/bin/bash\n' "$AGENT_UID" "$AGENT_UID"; }
+# `id -u` and `getent` are still read by `_gate_sudo_uid_nonagent` (the type guard on
+# approval/manual/access), which is NOT part of the uid-first derivation and keeps its
+# own seams. The scope table below depends on that guard, so pin it too.
+id() {
+  if   [[ "${1:-}" == -un ]]; then echo "$FAKE_CALLER"
+  elif [[ "${1:-}" == -u  ]]; then printf '%s\n' "$CALLER_UID"
+  else command id "$@"; fi
+}
+getent() {
+  if [[ "${1:-}" == passwd && "${2:-}" == "$AGENT_UID" ]]; then _agentrow; return 0; fi
+  command getent "$@"
+}
+_gate_passwd_stream() { _agentrow; printf '%s\n' "$(</etc/passwd)"; }
+_gate_caller_uid() { printf '%s' "$CALLER_UID"; }
+as_agent()        { FAKE_CALLER="agent-dev"; CALLER_UID="$AGENT_UID"; unset SUDO_UID; _gate_is_root() { return 1; }; }
 # The human-on-box / dashboard-exec path: a NON-agent SUDO_UID, trusted only at EUID 0
 # (DIVE-1413), which is why the root seam is stubbed rather than the assertion weakened.
-as_human_on_box() { FAKE_CALLER="root"; export SUDO_UID=0; _gate_is_root() { return 0; }; }
+as_human_on_box() { FAKE_CALLER="root"; CALLER_UID=0; export SUDO_UID=0; _gate_is_root() { return 0; }; }
 as_agent
+
+# The two preconditions every arm below inherits, asserted through the REAL resolvers
+# rather than assumed. These are the arms that would have gone red on the runner
+# instead of eight downstream ones naming the wrong thing.
+_pin_actor="$(_gate_authenticated_actor)"
+[[ "$_pin_actor" == "fixture" ]] \
+  && ok_t "precond: the pinned caller resolves as AGENT 'fixture' through the real uid-first resolver" \
+  || bad_t "precond: pinned caller resolves as an agent" \
+     "resolver returned '${_pin_actor:-empty}' — the caller is not an agent here, so every 'refused' arm below would grade a human tap, not a forge (DIVE-2365)"
+if _gate_sudo_uid_nonagent; then
+  bad_t "precond: caller carries no NON-agent human evidence" \
+    "_gate_sudo_uid_nonagent still reports non-agent evidence — the scope table below would grade the type guard's human branch"
+else
+  ok_t "precond: the pinned caller carries no non-agent human evidence (the type guard sees an agent)"
+fi
 
 file_gate() { # file_gate <ident> <type> [extra args...]
   local ident="$1" type="$2"; shift 2
@@ -214,7 +290,7 @@ out=$(answer DIVE-404 --value=A); rc=$?
 #      this change (an independent type guard, not the flag). Anchor that they still
 #      do — a fix to the decision path must not have moved them.
 : > "$DEFAULT_SENTINEL"
-n=405
+n=410      # NOT 405: DIVE-406 is already filed above, and seed_task now reds on collision
 for ty in approval manual access; do
   idt="DIVE-$n"; n=$((n+1))
   case "$ty" in

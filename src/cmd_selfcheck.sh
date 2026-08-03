@@ -248,17 +248,45 @@ _sc_probe_t2_forge() {
     by() { db "SELECT COALESCE(need_answered_by,'') FROM tasks WHERE ident='$1';"; }
 
     # (a) THE FORGE: an ordinary agent, unprivileged, no sudo — what every agent is.
-    id() { if [[ "${1:-}" == -un ]]; then echo "agent-selfcheck"; else command id "$@"; fi; }
+    #
+    # PIN THE CALLER, do not inherit it (DIVE-2365). The first cut stubbed `id -un`,
+    # which the uid-first resolver has not read since DIVE-2330 — it walks /etc/passwd
+    # for $EUID in pure bash. So the stub was inert and "is the caller an agent?" was
+    # answered by whoever ran the probe: an `agent-*` uid on a 5dive box (where it
+    # passed) and `runner` in CI, where the forge arm was a legitimate HUMAN tap and
+    # this probe reported a bypass that had not happened. `lib/actor.sh` publishes
+    # _gate_passwd_stream / _gate_caller_uid as the seams for modelling a caller uid;
+    # `id -u` + `getent` stay stubbed for `_gate_sudo_uid_nonagent`, which is a
+    # separate resolver with separate seams.
+    AUID=987654
+    _agentrow() { printf 'agent-fixture:x:%s:%s::/home/agent-fixture:/bin/bash\n' "$AUID" "$AUID"; }
+    id() {
+      if   [[ "${1:-}" == -un ]]; then echo "agent-fixture"
+      elif [[ "${1:-}" == -u  ]]; then printf '%s\n' "$AUID"
+      else command id "$@"; fi
+    }
+    getent() {
+      if [[ "${1:-}" == passwd && "${2:-}" == "$AUID" ]]; then _agentrow; return 0; fi
+      command getent "$@"
+    }
+    _gate_passwd_stream() { _agentrow; printf '%s\n' "$(</etc/passwd)"; }
+    _gate_caller_uid() { printf '%s' "$AUID"; }
     _gate_is_root() { return 1; }
     unset SUDO_UID
+    printf 'pinned=%s\n' "$(_gate_authenticated_actor)"
     seed DIVE-990001
     printf 'tier=%s\n' "$(db "SELECT COALESCE(tier,'') FROM tasks WHERE ident='DIVE-990001';")"
     ( GATE_PROOF_ENFORCE=/nonexistent/nope cmd_task_answer DIVE-990001 --value=A --human ) >/dev/null 2>&1
     printf 'forged=%s\n' "$(by DIVE-990001)"
 
-    # (b) LIVENESS: a real human path on an identical gate must still clear.
+    # (b) LIVENESS: a real human path on an identical gate must still clear. The pin
+    # from (a) is REMOVED here rather than overridden — leaving _gate_caller_uid
+    # pointing at the fixture agent would resolve this caller as an agent too and the
+    # liveness arm would grade a refusal.
     seed DIVE-990002
-    id() { if [[ "${1:-}" == -un ]]; then echo "root"; else command id "$@"; fi; }
+    unset -f id getent _gate_passwd_stream _gate_caller_uid 2>/dev/null
+    _gate_caller_uid() { printf '%s' "0"; }
+    _gate_passwd_stream() { printf '%s\n' "$(</etc/passwd)"; }
     _gate_is_root() { return 0; }
     export SUDO_UID=0
     ( cmd_task_answer DIVE-990002 --value=A --human ) >/dev/null 2>&1
@@ -266,10 +294,17 @@ _sc_probe_t2_forge() {
   )
   rm -rf "$d"
 
-  local tier forged human
+  local tier forged human pinned
   tier=$(sed -n 's/^tier=//p' <<<"$out" | head -1)
   forged=$(sed -n 's/^forged=//p' <<<"$out" | head -1)
   human=$(sed -n 's/^human=//p' <<<"$out" | head -1)
+  pinned=$(sed -n 's/^pinned=//p' <<<"$out" | head -1)
+
+  # The forge arm is only a FORGE if the caller reads as an agent. If the pin did not
+  # take, a clean "refused" and a clean "cleared" are both unreadable — that is not a
+  # pass and it is not a failure, it is nothing measured, and it must say so.
+  [[ "$pinned" == "fixture" ]] \
+    || { _sc_notreached "caller-not-pinned-as-agent" "the probe's fixture caller resolved as '${pinned:-nobody}', not an agent, so its forge arm would have graded a legitimate human tap — the seams in lib/actor.sh did not take in this build"; return; }
 
   [[ "$tier" == "2" ]] \
     || { _sc_notreached "no-tier2-gate" "the probe's own gate filed as tier '${tier:-?}', so the tier-2 floor was never in play — nothing was measured"; return; }
