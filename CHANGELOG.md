@@ -1,5 +1,37 @@
 # Changelog
 
+## Unreleased — feat(agent): `agent list` reports credential health, so a lapsed seat stops rendering live (DIVE-1953)
+
+On the DIVE-1868 flagship demo a grok seat's credential lapsed. The systemd unit stayed
+`active`, `5dive agent list` kept showing the seat live, and the only signal was a line in
+the runtime's own log — so a `council convene` dispatched a ballot to a dead seat and
+recorded it as a normal-looking abstain (DIVE-1869 item 3). DIVE-1803 is the same shape:
+an unauthed runtime rendering as healthy. `active` answers whether the PROCESS is up; it
+was being read as an answer to whether that process can reach its provider.
+
+`agent list` now carries an `AUTH` column and `--json` a `health.auth`
+`{state, expiresAt, refreshable}` object, beside the DIVE-1219 deaf/asleep badges. States
+are `ok` / `needs_login` / `expired` / `unknown`. It is file state, not a probe: one read
+per row, no network, because this is the survey people re-run constantly (`5dive auth
+status` still owns probing).
+
+Two things keep the badge believable, and both are mutation-covered by
+`tests/agent_list_auth_health_unit.sh`:
+
+- **Presence is delegated to `auth_creds_present`**, the same instrument `agent create`,
+  `auth status` and `doctor` gate on — not a second, cheaper check under a friendlier
+  name. It matters concretely: a claude agent authenticates by the env-token in its
+  profile's `combined.env` and never writes `.credentials.json`, so a bare sentinel-path
+  test marked every healthy claude agent on the control plane `needs_login`.
+- **`expired` requires that nothing can renew the token.** codex and claude both store a
+  short-lived access/id token next to a long-lived refresh token, so "expiry is in the
+  past" is their normal steady state; flagging it would have put a red badge on every
+  healthy agent on the box.
+
+An unreadable credential is `unknown`, never an alarm — the same rule the deaf check
+follows, and the legend says outright that `ok` means the credential file is present and
+unexpired, not that it was probed.
+
 ## Unreleased — fix(task): the mandatory merge-gate now catches a branch cited in prose, not just a PR (DIVE-2577)
 
 DIVE-2556 closed `done`, verified by olivia, with its OWN result text stating "commit dc336f7

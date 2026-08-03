@@ -58,9 +58,10 @@ cmd_list() {
     # Surface bot-to-bot status (DIVE-161) so the dashboard can flag which agents
     # can message bots outside the team — without N per-agent access fetches.
     # It lives in the agent's access.json, not the registry; read it here (root).
-    local b2b="false" ltype lchan lsd
+    local b2b="false" ltype lchan lsd lprof
     ltype=$(jq -r --arg n "$name" '.agents[$n].type' <<<"$reg")
     lchan=$(jq -r --arg n "$name" '.agents[$n].channels' <<<"$reg")
+    lprof=$(jq -r --arg n "$name" '.agents[$n].authProfile // ""' <<<"$reg")
     if [[ "$lchan" == "telegram" ]]; then
       lsd=$(_tg_access_state_dir "agent-${name}" "$ltype" 2>/dev/null || echo "")
       if [[ -n "$lsd" && -f "$lsd/access.json" ]]; then
@@ -105,6 +106,20 @@ cmd_list() {
     done
     _hc_hb=$(jq -r --arg n "$name" '.agents[$n].heartbeat.enabled // false' <<<"$reg" 2>/dev/null || echo false)
     [[ "$_hc_hb" == "true" ]] || hasleep="true"
+    # DIVE-1953: the third badge in this set. deaf/asleep answer "can anything
+    # reach it" and "will it act on its own"; neither asks whether the runtime
+    # can still reach its PROVIDER. A lapsed credential leaves the unit active
+    # and the seat useless, which is how a council convene dispatched a ballot
+    # to a dead grok seat and recorded a normal-looking abstain (DIVE-1869 item
+    # 3). File-state only — see agent_auth_health for why it never flags a
+    # refreshable token, and why an unreadable credential is `unknown` rather
+    # than an alarm. `|| true` keeps a best-effort read from aborting the list.
+    local _ha _ha_state _ha_exp _ha_refresh
+    _ha=$(agent_auth_health "$ltype" "$lprof" || true)
+    [[ -n "$_ha" ]] || _ha="unknown|-|false"
+    _ha_state="${_ha%%|*}"
+    _ha_exp="${_ha#*|}"; _ha_exp="${_ha_exp%%|*}"
+    _ha_refresh="${_ha##*|}"
     # DIVE-2088: measure the ENFORCED sudo grant here too. DIVE-2079 fixed the
     # per-agent DRILL-DOWN (`agent info`), but `list` is the SURVEY surface — the
     # command you run to notice something is off, not the one you run once you
@@ -131,6 +146,7 @@ cmd_list() {
     enriched=$(jq -c --arg n "$name" --arg a "$active" --arg e "$sub" --argjson b2b "$b2b" \
       --arg model "$amodel" --arg effort "$aeffort" \
       --argjson hdeaf "$hdeaf" --argjson hasleep "$hasleep" \
+      --arg haState "$_ha_state" --arg haExp "$_ha_exp" --arg haRefresh "$_ha_refresh" \
       --arg sgClass "$_sg_class" --arg sgRunas "$_sg_runas" \
       --arg sgExtra "$_sg_extra" --arg sgImplied "$_sg_implied" \
       '.[$n] = {active: $a, enabled: $e, botToBotEnabled: $b2b,
@@ -139,7 +155,11 @@ cmd_list() {
                 sudo: {grant: $sgClass, runas: $sgRunas, impliedIsolation: $sgImplied,
                        measured: ($sgClass != "unknown"),
                        extraEntries: ($sgExtra == "1")},
-                health: {deaf: $hdeaf, asleep: $hasleep}}' <<<"$enriched")
+                health: {deaf: $hdeaf, asleep: $hasleep,
+                         auth: {state: $haState,
+                                expiresAt: (if $haExp == "-" then null
+                                            else ($haExp | tonumber | todate) end),
+                                refreshable: ($haRefresh == "true")}}}' <<<"$enriched")
   done
   local merged
   merged=$(jq -c --arg default_wd "$DEFAULT_WORKDIR" --argjson live "$enriched" '.agents | to_entries | map({
@@ -171,8 +191,9 @@ cmd_list() {
   else
     echo "$merged" | jq -r '
       if length == 0 then "no agents" else
-        (["NAME","TYPE","CHANNELS","PROFILE","SUDO","ACTIVE","ENABLED"] | @tsv),
+        (["NAME","TYPE","CHANNELS","PROFILE","AUTH","SUDO","ACTIVE","ENABLED"] | @tsv),
         (.[] | [(.name + (if (.heartbeat.enabled // false) then " ∿" + ((.heartbeat.everyMin // 30)|tostring) + "m" else "" end)), .type, .channels, (.authProfile // "-"),
+                (.health.auth.state // "unknown"),
                 (if (.sudo.measured | not) then "unknown"
                  else .sudo.grant + (if .sudo.diverges then "!" else "" end) + (if .sudo.extraEntries then "+" else "" end) end),
                 .active, .enabled] | @tsv)
@@ -182,6 +203,27 @@ cmd_list() {
     # outright that nothing was measured rather than quietly falling back to the
     # label (falling back is what made the label authoritative-looking in the
     # first place). Detail deliberately stays in `agent info`; this is a survey.
+    # DIVE-1953: the AUTH column is file state, so the legend says what was
+    # observed and what the observation cannot cover. A `needs_login` row whose
+    # unit is ACTIVE is the exact defect this shipped for — call it out by name
+    # rather than leaving the reader to join two columns themselves.
+    local _lg_login _lg_exp _lg_aunk
+    _lg_login=$(jq -r '[.[] | select(.health.auth.state == "needs_login")] | length' <<<"$merged")
+    _lg_exp=$(jq -r '[.[] | select(.health.auth.state == "expired")] | length' <<<"$merged")
+    _lg_aunk=$(jq -r '[.[] | select((.health.auth.state // "unknown") == "unknown")] | length' <<<"$merged")
+    if (( _lg_login || _lg_exp )); then
+      echo
+      local _lg_live
+      _lg_live=$(jq -r '[.[] | select(.active == "active"
+                        and ((.health.auth.state == "needs_login") or (.health.auth.state == "expired")))
+                        | .name] | join(", ")' <<<"$merged")
+      echo "AUTH: $(( _lg_login + _lg_exp )) agent(s) have no usable credential (5dive agent auth start <type> --auth-profile=<p>)"
+      [[ -n "$_lg_live" ]] && echo "      RUNNING but unauthed — the unit is up and the runtime cannot reach its provider: ${_lg_live}"
+    fi
+    if (( _lg_aunk )); then
+      (( _lg_login || _lg_exp )) || echo
+      echo "AUTH unknown = credential not readable as $(id -un); re-run as root. ok = the credential FILE is present/unexpired, not probed (5dive auth status)"
+    fi
     local _lg_unk _lg_div _lg_ext
     _lg_unk=$(jq -r '[.[] | select(.sudo.measured | not)] | length' <<<"$merged")
     _lg_div=$(jq -r '[.[] | select(.sudo.diverges)] | length' <<<"$merged")
