@@ -2165,6 +2165,35 @@ _task_status_cmd() {
   done
   [[ ${#positional[@]} -gt 0 ]] || fail "$E_USAGE" "usage: 5dive task $verb <id|DIVE-N> [--result=<text>] [--notify]"
   resolve_task_id "${positional[0]}"; local id="$RESOLVED_TASK_ID" ident="$RESOLVED_TASK_IDENT"
+  # DIVE-2179: `task done` on a live, unacknowledged handoff must stamp the SAME
+  # ack the DIVE-1378 `start` block stamps below — even when this `done` is about
+  # to be REFUSED further down (DIVE-2464/DIVE-477/DIVE-2007/DIVE-555, or the
+  # DIVE-1830/DIVE-1835 merge gate). The ack means "the verifier attempted to
+  # grade this", not "the close succeeded". `start`'s ack can defer its write into
+  # `extra` because nothing after it in the `start` path refuses; `done` has no
+  # such guarantee — every refusal below goes through policy_refuse -> fail,
+  # which exits immediately, so anything only staged in `extra` never reaches the
+  # final UPDATE. A verifier who runs `done` straight (skipping `start`) against
+  # an unmerged PR/branch binding gets structurally refused by the merge gate,
+  # and without this, handoff_ack_at stays NULL forever — the heartbeat stall
+  # sweep (_hb_stall_sweep, src/cmd_heartbeat.sh) then nags them forever with two
+  # dead-end remedies: `done` is the very thing just refused, and `reject` would
+  # write a false FAIL over work the verifier meant to grade PASS. So this write
+  # is immediate and separately committed, not deferred, and placed as early in
+  # the `done` path as the resolved id allows. Same predicate as the `start` ack
+  # below, plus excluding an already-closed row (a `done`/`cancel` can land here
+  # on a closed task where there is nothing live left to ack). COALESCE keeps
+  # repeat attempts idempotent.
+  if [[ "$verb" == "done" ]]; then
+    local _done_ack_actor; _done_ack_actor=$(task_actor)
+    db "UPDATE tasks SET handoff_ack_at=COALESCE(handoff_ack_at, datetime('now'))
+        WHERE id=${id}
+          AND maker_agent IS NOT NULL
+          AND assignee=verifier
+          AND assignee=$(sqlq "$_done_ack_actor")
+          AND handoff_ack_at IS NULL
+          AND status NOT IN ('done','cancelled');"
+  fi
   # DIVE-2059: 'task start' on a recurring TEMPLATE was never meaningful — it
   # sets status='in_progress', and post-DIVE-2055 the materializer's fire
   # predicate requires status='todo', so this silently retired the template's
