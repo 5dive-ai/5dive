@@ -289,13 +289,39 @@ for t in work:
 
 def line(t):
     who = t.get("assignee") or "unassigned"
+    # DIVE-2556: `assignee` is the row's CURRENT owner, and on a maker/verifier
+    # loop it moves to the VERIFIER at delivery — the verifier then closes the
+    # row, so it is still theirs at close. Crediting a completion to `assignee`
+    # therefore credits the grader and zeroes the builder: measured 2026-08-03,
+    # dev built 10 of the 28 rows closed in 24h and its credited count was 0.
+    # Fall back to `assignee` rather than swapping to maker_agent outright —
+    # maker_agent is NULL on every row that never ran a loop, and those rows
+    # would vanish from the count entirely.
+    maker = t.get("maker_agent") or who
+    ver = t.get("verifier") or ""
     return {"ident": t.get("ident"), "title": (t.get("title") or "").strip(),
-            "assignee": who, "ask": (t.get("ask") or "").strip(),
+            "assignee": who, "maker": maker, "verifier": ver,
+            "ask": (t.get("ask") or "").strip(),
             "need_type": t.get("need_type")}
 
 done_l = [line(t) for t in done]
 ip_l = [line(t) for t in in_progress]
 blk_l = [line(t) for t in blocked]
+
+# DIVE-2556: maker and verifier as two SEPARATE series, never one merged
+# per-owner tally. A row that was built by one agent and graded by another is a
+# unit of work for both, counted under each — summing byMaker gives the fleet's
+# build throughput, summing byVerifier its review load, and neither number is
+# the other's. Keyed on the same COALESCE(maker_agent, assignee) as the lines
+# above so a loopless row still lands on whoever holds it.
+def _tally(items, key):
+    d = {}
+    for x in items:
+        k = x.get(key)
+        if k:
+            d[k] = d.get(k, 0) + 1
+    return dict(sorted(d.items(), key=lambda kv: (-kv[1], kv[0])))
+throughput = {"byMaker": _tally(done_l, "maker"), "byVerifier": _tally(done_l, "verifier")}
 
 # DIVE-891: gates the tier system cleared without a ping (tier-0 immediate or
 # tier-1 48h TTL — need_answered_by 'auto:t0' / 'auto:ttl') inside the window.
@@ -560,6 +586,7 @@ if as_json:
         "pointInTime": point_in_time,
         "objectives": objectives,
         "done": done_l, "inProgress": ip_l, "blocked": blk_l, "autoCleared": auto_l,
+        "throughput": throughput,
         "zeroHuman": {"shipped": len(done_l), "humanTouches": len(ht_l), "gates": ht_l},
         "autonomy": autonomy,
         "precedentPrefill": {"count": len(prefilled), "accepted": len(accepted),
@@ -611,11 +638,22 @@ else:
     out.append("")
     out.append(f"✅ Shipped ({len(done_l)})")
     for t in done_l[:8]:
-        out.append(f"  • {t['ident']} {short(t['title'])} — {t['assignee']}")
+        # DIVE-2556: name the MAKER, and the verifier beside it when they differ.
+        # The old line printed `assignee`, which on a graded row is the verifier.
+        cred = t["maker"]
+        if t["verifier"] and t["verifier"] != t["maker"]:
+            cred += f" (verified by {t['verifier']})"
+        out.append(f"  • {t['ident']} {short(t['title'])} — {cred}")
     if not done_l:
         out.append("  (nothing closed)")
     if len(done_l) > 8:
         out.append(f"  … +{len(done_l) - 8} more")
+    if throughput["byMaker"]:
+        _bm = ", ".join(f"{k} {v}" for k, v in list(throughput["byMaker"].items())[:6])
+        out.append(f"  built by: {_bm}")
+    if throughput["byVerifier"]:
+        _bv = ", ".join(f"{k} {v}" for k, v in list(throughput["byVerifier"].items())[:6])
+        out.append(f"  verified by: {_bv}")
     out.append("")
     out.append(f"\U0001F501 In progress ({len(ip_l)})")
     for t in ip_l[:8]:

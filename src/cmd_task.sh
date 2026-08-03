@@ -919,7 +919,7 @@ cmd_task_ls() {
     # the mark stands AND no verifier has since been assigned; the dashboard renders
     # it as an "Unverified" badge. NB: no inline SQL `--` comments in this string —
     # dbfmt flattens newlines, so a `--` would comment out the rest of the query.
-    rows=$(dbfmt -json "SELECT id, ident, title, status, priority, assignee, created_by, parent_id, created_at, done_at, body, result, need_type, ask, need_options, recommend, precedent_ref, precedent_kind, need_answer, need_answered_at, need_answered_by, tier, kind, schedule, last_fired_at, last_skipped_at, parked_at, park_reason, wake_at, project_key,
+    rows=$(dbfmt -json "SELECT id, ident, title, status, priority, assignee, created_by, parent_id, created_at, done_at, body, result, need_type, ask, need_options, recommend, precedent_ref, precedent_kind, need_answer, need_answered_at, need_answered_by, tier, kind, schedule, last_fired_at, last_skipped_at, parked_at, park_reason, wake_at, project_key, maker_agent, verifier,
              CASE WHEN maker_agent IS NOT NULL AND assignee=verifier AND status NOT IN ('done','cancelled')
                   THEN CASE WHEN handoff_ack_at IS NOT NULL THEN 'reviewing' ELSE 'delivered' END
                   ELSE NULL END AS handoff_state,

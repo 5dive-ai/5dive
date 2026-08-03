@@ -1,5 +1,40 @@
 # Changelog
 
+## Unreleased — fix(digest): a completion was credited to whoever OWNED the row at close, which on a graded row is the verifier (DIVE-2556)
+
+On a maker/verifier loop the row's `assignee` moves to the verifier at delivery,
+and the verifier still owns it when it closes. Every read that attributes a
+completion to `assignee` therefore credits the grader and zeroes the builder.
+Measured 2026-08-03: of 28 rows closed in 24h, ten were built by `dev`; dev's
+credited count for the same window was **zero**, while it held 119 of 170 open
+todos and seven agents sat empty. The remedy that follows from that chart — move
+work off the idle-looking builder — is the exact inverse of what the board needs,
+and the bias is not noise: reassignment is *caused* by progress, so a per-owner
+count drops precisely the rows that completed and keeps the untouched ones
+(`community/wiki/counting-throughput-by-a-mutable-owner-field-hides-the-completed-work.md`).
+
+`5dive digest` now credits **`COALESCE(maker_agent, assignee)`** and reports the
+verifier as a **separate series**, never merged into the maker's:
+
+- `throughput.byMaker` / `throughput.byVerifier` in `--json`, plus `built by:` and
+  `verified by:` lines under Shipped in the text digest;
+- each `done` entry carries `maker` and `verifier` alongside the unchanged
+  `assignee` (still the current owner — no consumer's field changed meaning);
+- the Shipped line names the maker, with `(verified by <agent>)` beside it.
+
+The fallback is load-bearing and is not cosmetic: a bare swap to `maker_agent`
+would drop every row that never ran a loop, since `maker_agent` is NULL there.
+`tests/digest_maker_credit_unit.sh` pins that (arm E) and grades the whole seam
+end-to-end — real `task add/start/done` verbs, the real `task ls --json` producer
+(which had to start emitting `maker_agent`/`verifier` for the fix to reach the
+digest at all), the digest's own embedded python. Arm B is the control: on the
+same three rows the old by-assignee instrument still returns dev **0** / olivia
+**2**, so the green arms are graded against an instrument that fails.
+
+Sibling, same morning and same shape: DIVE-2554 (the human-ask counter reads only
+the live tasks table and renders 0 on days that had asks). Both attribute to the
+wrong party rather than losing data.
+
 ## Unreleased — feat(pack): export an agent as ONE AGENTS.md that codex and opencode read as-is (DIVE-2565)
 
 A tarball pack is a fine archive and a poor artefact: you cannot read it, diff it,
