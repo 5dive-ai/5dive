@@ -615,7 +615,8 @@ _sup_watch() {
   [[ -t 1 && -t 0 ]] || fail "$E_USAGE" "supervisor --watch requires a TTY (try running it directly, not piped)"
   _sup_watch_teardown() { printf '%s%s%s' "$WATCH_SHOW" "$WATCH_RESET" "$WATCH_ALT_OFF"; }
   trap '_sup_watch_teardown; exit 130' INT TERM
-  trap '_sup_watch_teardown' EXIT
+  # See cmd_watch.sh — chain, never replace (DIVE-2598 it2).
+  push_exit_handler _sup_watch_teardown
   printf '%s%s' "$WATCH_ALT_ON" "$WATCH_HIDE"
   _sup_cli_check   # once per watch session, in this shell (see _sup_snapshot)
   while true; do

@@ -70,11 +70,21 @@ exit says something.
   print two messages for every subshell error — the real one, and a backstop claiming there
   wasn't one.
 - Signals (130/143) are not unreported failures and stay quiet.
+- **A verb's own cleanup no longer unseats it.** `trap … EXIT` **replaces**; it does not
+  stack. `watch` and `supervisor --watch` each installed their alt-screen teardown that
+  way, silently discarding `trap on_exit_audit EXIT` for the rest of the process — so
+  inside those two verbs there was no backstop *and* no audit record. Cleanup now
+  registers with `push_exit_handler`, which the one process-wide trap runs LIFO **before**
+  the report, so a teardown restores the terminal and the diagnostic lands somewhere
+  readable. Measured on a built bundle: an induced death in `watch` printed **476 bytes**
+  naming the verb; the same death with the old trap printed **18** (terminal-reset escapes
+  only).
 
 `tests/silent_nonzero_exit_backstop_unit.sh` grades it against a real induced death in a
-real built bundle (`sqlite3` stubbed dead on `PATH`), with the same run against a
-backstop-neutered mutant of that bundle as the differential — so the arm cannot pass by
-grading a death that no longer happens.
+real built bundle, with the same run against a backstop-neutered mutant of that bundle as
+the differential — so the arm cannot pass by grading a death that no longer happens. It
+also censuses the bundle's `trap … EXIT` population, because the line that switched the
+property off contains no `exit` and no census of exit *sites* could ever see it.
 
 ## Unreleased — fix(init): the `codex` recipe asked nvm which node it SELECTED, not npm where it INSTALLED (DIVE-2596)
 

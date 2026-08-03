@@ -264,6 +264,11 @@ declare -a AUDIT_ARGS=()
 
 on_exit_audit() {
   local code=$?
+  # DIVE-2598 it2: verb-local cleanup first (LIFO), because a `watch` teardown has
+  # to leave the alt-screen before anything below prints — a diagnostic written
+  # into a screen that is about to be torn down is a diagnostic the caller never
+  # sees. These used to be their own `trap ... EXIT`, which replaced this one.
+  declare -F _five_run_exit_handlers >/dev/null && _five_run_exit_handlers
   # DIVE-2598: the silent-non-zero backstop runs FIRST and unconditionally —
   # deliberately ahead of the AUDIT_CMD early-return below. AUDIT_CMD is only set
   # for mutating verbs, so hanging the report off it would have left every

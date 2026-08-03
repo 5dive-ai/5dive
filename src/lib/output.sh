@@ -63,6 +63,44 @@ rm -f "$FIVE_REPORTED_FLAG" 2>/dev/null || true
 # `<verb>_usage; exit "$E_USAGE"` sites — calls it too.
 mark_reported() { : > "$FIVE_REPORTED_FLAG" 2>/dev/null || true; }
 
+# push_exit_handler <function-or-snippet> — register verb-local cleanup on the
+# process EXIT chain.
+#
+# DIVE-2598 iteration 2. The backstop below is hung off the process EXIT trap,
+# and bash traps REPLACE rather than stack: a verb that wrote the obvious thing —
+# `trap '_watch_teardown' EXIT`, as `watch` and `supervisor --watch` both did —
+# silently discarded `trap on_exit_audit EXIT` for the rest of the process,
+# taking the never-exit-silently report AND the audit record with it. Measured on
+# a built bundle: an induced death before that line printed a 461-byte diagnostic,
+# the same death after it printed nothing.
+#
+# No census of exit SITES can catch this, because the line that disables the
+# backstop contains no `exit`. So the fix is not another audit — it is removing
+# the ability to write it: cmd_* register here, `on_exit_audit` stays the one and
+# only EXIT trap in the bundle, and tests/silent_nonzero_exit_backstop_unit.sh
+# pins that population.
+#
+# Handlers run LIFO and BEFORE the report, so an alt-screen teardown restores the
+# terminal first and the diagnostic lands somewhere the caller can actually read.
+# A handler that fails cannot change the exit code — it is already captured — and
+# cannot stop the ones behind it.
+declare -a _FIVE_EXIT_STACK=()
+push_exit_handler() { _FIVE_EXIT_STACK+=("$1"); }
+
+# Drained into a local copy and cleared BEFORE anything runs, so a handler that
+# exits (or a second trip through the trap) cannot re-run the chain. The local
+# declaration is also what keeps `${#…[@]}` resolvable inside this function —
+# tests/local_array_unbound_default_unit.sh arm G resolves a read only against
+# what its own function creates, and the array above is file-scope.
+_five_run_exit_handlers() {
+  local -a stack=("${_FIVE_EXIT_STACK[@]+"${_FIVE_EXIT_STACK[@]}"}")
+  _FIVE_EXIT_STACK=()
+  local i
+  for (( i=${#stack[@]} - 1; i >= 0; i-- )); do
+    eval "${stack[$i]}" || true
+  done
+}
+
 # _report_silent_exit <code> — the backstop itself, fired from the EXIT trap.
 _report_silent_exit() {
   local code="${1:-0}"

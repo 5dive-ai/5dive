@@ -280,7 +280,9 @@ HELP
     printf '%s%s%s' "$WATCH_SHOW" "$WATCH_RESET" "$WATCH_ALT_OFF"
   }
   trap '_watch_teardown; exit 130' INT TERM
-  trap '_watch_teardown' EXIT
+  # NOT `trap '_watch_teardown' EXIT` (DIVE-2598 it2): that REPLACES the process
+  # EXIT trap and takes the never-exit-silently backstop with it.
+  push_exit_handler _watch_teardown
   printf '%s%s' "$WATCH_ALT_ON" "$WATCH_HIDE"
 
   while (( ! quit )); do
