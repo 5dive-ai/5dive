@@ -6,7 +6,7 @@ Every `[5dive-msg ...]` stamp site already held both values and never compared t
 
 ```bash
 sender="$from"                       # CLAIMED  — from --from=, format-validated only
-_caller="$(_envelope_caller)"        # MEASURED — EUID-first, not settable by a flag
+_caller="$(_envelope_caller)"        # MEASURED — a --from flag cannot move it (this is cmd_send)
 _tier="$(envelope_tier "$_caller")"  # ...the measured one was used for tier=, and nothing else
 ```
 
@@ -37,8 +37,15 @@ nothing, which is DIVE-2210's property carried onto the new field. Reading the o
 absence of `via=` means "built before this release" **or** "the claim matched" — it does
 not mean "unchecked".
 
-`via=` is exactly as trustworthy as `tier=` and no more: both come from the same
-EUID-first `_envelope_caller` resolver.
+`via=` is exactly as trustworthy as `tier=` and no more, and that holds at every site:
+both fields read the same measured caller there, so neither can be true while the other
+is forged. **What that caller is differs by site, though, and the marker inherits it.**
+`send` and `ask` resolve it through `_envelope_caller`, which reads the real EUID first —
+a forged `SUDO_USER` cannot move it. `_deliver` does not: it takes `${SUDO_USER#agent-}`
+directly with no EUID fallback, so its `via=` carries `tier=`'s existing dependency on
+`SUDO_USER` unchanged, and a caller that is not `agent-*` reads as `human` there rather
+than resolving. That is pre-existing behaviour on the tier field and this change neither
+worsens nor repairs it; `envelope_sender_fallback_unit` T6c pins it so it stays visible.
 
 ## Unreleased — fix(push): resolve the App installation PER REPO, not from one pinned id (DIVE-2563)
 
