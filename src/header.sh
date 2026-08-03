@@ -760,6 +760,15 @@ declare -A OPENCLAW_PROVIDER_MODEL=(
   # have cleared two genuinely stale pins. Only the list that resolves the pin
   # has authority over it (DIVE-2631).
   #
+  # WHAT "STALE" MEANS HERE, AND WHAT IT DOES NOT. None of the replaced ids is
+  # retired upstream. Google's own v1beta still serves gemini-2.0-flash (50
+  # models, HTTP 200, queried with our key by main 2026-08-03), and models.dev
+  # still lists gpt-4o. A pin is wrong here when the list that RESOLVES it does
+  # not carry it, which is a property of the vendor agent's catalog, not of the
+  # model's lifecycle. Write it that way in any future ticket or commit: "absent
+  # from <the resolving list>, still present at <upstream>" — never "the vendor
+  # dropped it". The two get fixed differently and only one of them is our bug.
+  #
   # Measured on openclaw 2026.7.1-2: openai carries no gpt-4 family at all (20
   # ids, starting at gpt-5.3), google carries only 2.5.x/3.x (7 ids), moonshot
   # only k2.6 / k2.7-code, deepseek only chat / reasoner (DIVE-2628, DIVE-2631).
