@@ -473,6 +473,41 @@ _proof_build() {
   git config user.name "$git_name"
   git config user.email "$git_email"
 
+  # DIVE-2654 (spec settled in DIVE-2652): two denominator-side corroborator
+  # fields ship alongside the badge inside zero-human.json — the badge MESSAGE
+  # itself stays untouched (DIVE-1924), only the JSON gains fields. Both share
+  # the badge's own rolling 7d window so a reader never reconciles a third span.
+  #
+  # LEAD — verifier first-pass rate, carrying its own coverage (how much of the
+  # window's shipped standard work got graded at all, same shipped_db source as
+  # `proof scorecard`'s tier coverage) and the iteration-NULL disclosure: a NULL
+  # iteration reads as first-pass (COALESCE(iteration,1)<=1), which biases the
+  # rate UP by however many of the graded rows that affects.
+  local sql_window="-7 days" corr_rows
+  corr_rows="$(db "SELECT
+      (SELECT COUNT(*) FROM tasks WHERE status='done' AND kind='standard' AND done_at>=datetime('now',$(sqlq "$sql_window"))) || '|' ||
+      (SELECT COUNT(*) FROM tasks WHERE status='done' AND kind='standard' AND done_at>=datetime('now',$(sqlq "$sql_window")) AND verifier IS NOT NULL AND verifier<>'') || '|' ||
+      (SELECT COUNT(*) FROM tasks WHERE status='done' AND kind='standard' AND done_at>=datetime('now',$(sqlq "$sql_window")) AND verifier IS NOT NULL AND verifier<>'' AND COALESCE(iteration,1)<=1) || '|' ||
+      (SELECT COUNT(*) FROM tasks WHERE status='done' AND kind='standard' AND done_at>=datetime('now',$(sqlq "$sql_window")) AND verifier IS NOT NULL AND verifier<>'' AND iteration IS NULL);" 2>/dev/null || true)"
+
+  # SECOND — policy-blocked attempts, carrying the fired-vs-instrumented site
+  # split (a silent site is not evidence of compliance, DIVE-1922) and the
+  # ledger's own age (a young ledger has no baseline to compare against yet).
+  # Rollback is DROPPED per DIVE-2652: its aggregate has never moved, so it
+  # cannot constrain the claim in either direction.
+  local corr_refusals="" corr_fired_win="" corr_fired_life="" corr_sites="" corr_since=""
+  if [ "$(db "SELECT 1 FROM sqlite_master WHERE type='table' AND name='policy_refusals' LIMIT 1;" 2>/dev/null)" = "1" ]; then
+    corr_refusals="$(db "SELECT COUNT(*) FROM policy_refusals WHERE ts>=datetime('now',$(sqlq "$sql_window"));" 2>/dev/null || true)"
+    corr_fired_win="$(db "SELECT COUNT(DISTINCT policy) FROM policy_refusals WHERE ts>=datetime('now',$(sqlq "$sql_window"));" 2>/dev/null || true)"
+    corr_fired_life="$(db "SELECT COUNT(DISTINCT policy) FROM policy_refusals;" 2>/dev/null || true)"
+    corr_since="$(db "SELECT COALESCE(MIN(ts),'') FROM policy_refusals;" 2>/dev/null || true)"
+    # Same grep `proof scorecard` uses: instrumented sites are DERIVED from the
+    # resolved bundle, not hand-maintained, so the denominator cannot drift out
+    # from under the count.
+    corr_sites="$( { grep -oE 'policy_refuse "[^"]+" [a-z0-9-]+' "$self" 2>/dev/null || true; } \
+                 | awk '{print $NF}' | sort -u | wc -l | tr -d ' ')"
+  fi
+
   # Build the three files from the digest output verbatim. The builder is the
   # honesty-critical core (unit-tested via tests/proof_publish_unit.sh, which
   # extracts this exact python block): it reads the digest numbers from a file
@@ -493,6 +528,10 @@ _proof_build() {
     NOW_ISO="$now_iso" CLI_VERSION="$cli_version" \
     PUB_HOST="$(_proof_host)" PUB_USER="$(id -un)" \
     METHODOLOGY_URL="$_PROOF_METHODOLOGY_URL" \
+    CORR_ROWS="$corr_rows" \
+    CORR_REFUSALS="$corr_refusals" CORR_FIRED_WINDOW="$corr_fired_win" \
+    CORR_FIRED_LIFETIME="$corr_fired_life" CORR_SITES="$corr_sites" \
+    CORR_LEDGER_SINCE="$corr_since" \
     python3 <<'PROOFPY'
 import json, os, pathlib, sys
 
@@ -557,6 +596,101 @@ cum = {
     "since": hist[0]["date"],
 }
 
+# DIVE-2654 (spec: DIVE-2652) — two denominator-side corroborator fields, so
+# the badge is not published bare. Same honesty rule as `proof scorecard`: a
+# number ships only with the sample/coverage it rests on, or it degrades to an
+# explicit no-data marker naming why — never a bare 0.
+corroborators = {}
+
+_cr = (os.environ.get("CORR_ROWS") or "").strip().split("|")
+def _corr_int(i):
+    try: return int(_cr[i])
+    except Exception: return None
+
+shipped_db, graded_db, first_pass_db, iter_null_db = (
+    _corr_int(0), _corr_int(1), _corr_int(2), _corr_int(3))
+
+if graded_db:
+    fp_entry = {
+        "value": f"{round(first_pass_db / graded_db * 100, 1)}%",
+        "window": "7d",
+        "firstPass": first_pass_db,
+        "graded": graded_db,
+    }
+    if shipped_db:
+        # DIVE-2654 review (main2): NOT named "shipped" — this datapoint's own
+        # week.shipped above is a DIVE-1552 FROZEN SUM over the last 7
+        # PUBLISHED daily datapoints (overwritten in from `hist[-7:]` after
+        # `row` is built), while this is a LIVE datetime('now','-7 days') SQL
+        # count. Two instruments both labelled "7d" in the same file is
+        # exactly the defect this row exists to prevent, and the gap between
+        # them WIDENS for as long as publishing stays paused (hist[-7:] then
+        # spans more than 7 calendar days while this SQL span stays exactly
+        # 7) — so the name and basis travel with the number rather than
+        # trusting a shared label.
+        fp_entry["shippedStandardTasks"] = shipped_db
+        fp_entry["coveragePct"] = round(graded_db / shipped_db * 100, 1)
+        fp_entry["basis"] = ("live tasks.db query: status='done' AND kind='standard' AND done_at "
+                              "within the last 7 calendar days from datetime('now') — a DIFFERENT "
+                              "instrument from this datapoint's own week.shipped above (a frozen sum "
+                              "of the last 7 PUBLISHED daily datapoints, DIVE-1552, which can span "
+                              "more than 7 calendar days while publishing is paused). Do not read "
+                              "the two as the same number.")
+    if iter_null_db:
+        fp_entry["iterationNullGraded"] = iter_null_db
+        fp_entry["iterationNullBiasPctPtsMax"] = round(iter_null_db / graded_db * 100, 1)
+        fp_entry["note"] = ("rows with a NULL iteration count as first-pass, biasing this "
+                             "rate UP by at most iterationNullBiasPctPtsMax")
+    corroborators["verifierFirstPassRate"] = fp_entry
+else:
+    corroborators["verifierFirstPassRate"] = {
+        "value": None, "window": "7d",
+        "nodata": "no verifier-graded standard tasks in the 7d window",
+    }
+
+_pref   = (os.environ.get("CORR_REFUSALS") or "").strip()
+_psites = (os.environ.get("CORR_SITES") or "").strip()
+_pfw    = (os.environ.get("CORR_FIRED_WINDOW") or "").strip()
+_pfl    = (os.environ.get("CORR_FIRED_LIFETIME") or "").strip()
+_psince = (os.environ.get("CORR_LEDGER_SINCE") or "").strip()
+
+if _pref.isdigit() and _psites.isdigit() and int(_psites) > 0:
+    pb_entry = {
+        "value": int(_pref),
+        "window": "7d",
+        "instrumentedSites": int(_psites),
+    }
+    if _pfw.isdigit():
+        pb_entry["firedSites"] = int(_pfw)
+    if _pfl.isdigit():
+        pb_entry["firedSitesLifetime"] = int(_pfl)
+    if _psince:
+        pb_entry["ledgerSince"] = _psince
+        try:
+            from datetime import datetime, timezone
+            _since_dt = datetime.strptime(_psince[:19], "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+            _now_dt = datetime.strptime(os.environ["NOW_ISO"][:19], "%Y-%m-%dT%H:%M:%S").replace(tzinfo=timezone.utc)
+            pb_entry["ledgerAgeDays"] = round((_now_dt - _since_dt).total_seconds() / 86400, 1)
+        except Exception:
+            pass
+    _never_fired = (int(_psites) - int(_pfl)) if _pfl.isdigit() else None
+    _note = "a site that never fires is not evidence of compliance"
+    if _never_fired is not None:
+        _note += (f" — {_never_fired} of {_psites} instrumented sites have never fired lifetime")
+    _note += "; no baseline exists yet while the ledger is young (see ledgerAgeDays)"
+    pb_entry["note"] = _note
+    corroborators["policyBlockedAttempts"] = pb_entry
+elif _psites.isdigit() and int(_psites) == 0:
+    corroborators["policyBlockedAttempts"] = {
+        "value": None, "window": "7d",
+        "nodata": "the running 5dive bundle has no instrumented policy sites — upgrade it to record refusals (DIVE-1922)",
+    }
+else:
+    corroborators["policyBlockedAttempts"] = {
+        "value": None, "window": "7d",
+        "nodata": "no policy_refusals table in this store — nothing has recorded a refused attempt (DIVE-1922)",
+    }
+
 w_ship = row["week"]["shipped"]
 w_ask = row["week"]["humanAsks"]
 ask_word = "ask" if w_ask == 1 else "asks"
@@ -613,6 +747,9 @@ datapoint = {
     "cliVersion": os.environ["CLI_VERSION"],
     "source": "5dive digest --json [--7d]",
     "methodology": os.environ["METHODOLOGY_URL"],
+    # DIVE-2654: denominator-side signals the badge does not carry on its own
+    # face. Additive-only, same zero-human.json API contract as publishedBy.
+    "corroborators": corroborators,
 }
 if _pub:
     datapoint["publishedBy"] = _pub
