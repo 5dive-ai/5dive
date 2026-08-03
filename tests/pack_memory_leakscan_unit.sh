@@ -311,6 +311,20 @@ grep -q -- '--audience=\*' <<<"$EXPORT_BODY" \
 grep -qE 'audience.*publish.*\|\|.*audience.*self|"\$audience" == "publish" \|\| "\$audience" == "self"' <<<"$EXPORT_BODY" \
   && ok_t "wiring: an unknown --audience value is rejected (a typo is not a bypass)" \
   || bad_t "wiring: an unknown --audience value is rejected" "no validation found"
+# ORDER IS THE PROPERTY, not the call. After DIVE-2565 the stage becomes TWO
+# containers; a gate placed below the format branch would still be "called" and
+# would still pass every arm above it, while covering only the tarball.
+GATE_LN=$(grep -n '_pack_memory_publish_gate' <<<"$EXPORT_BODY" | head -1 | cut -d: -f1)
+MD_LN=$(grep -n '_agents_md_render' <<<"$EXPORT_BODY" | head -1 | cut -d: -f1)
+TAR_LN=$(grep -n 'tar -czf' <<<"$EXPORT_BODY" | head -1 | cut -d: -f1)
+if [[ -z "$MD_LN" || -z "$TAR_LN" ]]; then
+  bad_t "the gate precedes BOTH export containers" "cmd_export no longer renders agents-md (${MD_LN:-none}) or tars (${TAR_LN:-none}) — this arm grades nothing"
+elif [[ -n "$GATE_LN" && "$GATE_LN" -lt "$MD_LN" && "$GATE_LN" -lt "$TAR_LN" ]]; then
+  ok_t "the gate precedes BOTH export containers (gate@$GATE_LN < agents-md@$MD_LN, tarball@$TAR_LN)"
+else
+  bad_t "the gate precedes BOTH export containers" "gate@${GATE_LN:-none} does not precede agents-md@$MD_LN and tarball@$TAR_LN — one route is unguarded"
+fi
+
 grep -q -- '--audience' <<<"$(_pack_usage)" \
   && ok_t "wiring: usage documents --audience" || bad_t "wiring: usage documents --audience" "absent from usage"
 
