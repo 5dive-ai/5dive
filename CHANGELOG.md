@@ -85,6 +85,54 @@ Still open on `deliver`, named in the source rather than implied to be covered: 
 deliver` with no `--result=` re-stamps `delivery_ref`/`delivered_at` on a closed row, and on a
 closed row with a distinct verifier it still routes. Both are the no-result population this guard
 cannot see.
+## Unreleased — feat(pack): a marketplace pack imports onto codex and opencode, not only Claude (DIVE-2568)
+
+All 19 packs in `character-packs` declare `config.type` `"claude"` and not one
+declares another harness, so "import from the marketplace" meant "import into
+Claude". Nothing in packFormat 1 was actually Claude-specific: `persona.yaml`,
+`card.md`, the manifest, the avatar and `memory/` are harness-neutral markdown
+and data. Only two questions were harness-bound — where the identity doc goes and
+where skills go — and both were already answered per type by `TYPE_PERSONA_FILE`
+and `SKILLS_INSTALL_DIR`.
+
+A pack is now **target-agnostic**, and the set of harnesses it lands on is
+**derived from the CLI rather than declared by the publisher**: every known type
+whose persona doc has a probe-verified home (DIVE-2223). The consequence is the
+point — **no pack has to be republished** to become importable onto codex or
+opencode, and a publisher cannot get compatibility wrong because a publisher does
+not state it. The optional manifest key `config.targets` **narrows** the set and
+can never widen it; `cmd_export` deliberately does not write it, because the set
+is a property of the CLI and baking it in would freeze it on the day the pack was
+packed.
+
+- **The set is stated everywhere an install decision is made**, from one source:
+  `agent inspect`, the import-time disclosure, `market show` and the `market`
+  footer all render `landsOn` out of `_pack_disclosure_json`. `type` in the
+  catalog is shown as *what it was packed as* — the import default, never a
+  ceiling.
+- **A silent drop is fixed.** `settings.json` is Claude Code's file and the only
+  sink for a pack's `model`, `effort`, `hooks` and `plugins`. Importing onto a
+  codex seat dropped all four with nothing on screen: the agent ran the harness
+  default while the manifest still read `model: opus`. Import now names each one
+  **by value**. It is a report, never a refusal — the persona, memory, avatar and
+  skills all land.
+- **An unhostable target is refused before provisioning.** `hermes` and
+  `openclaw` pass `is_known_type` but have no persona path, so an import created
+  a unix account, a home and a unit, then dropped the pack's entire payload and
+  reported success. The fence sits above `cmd_create` and names the harnesses the
+  pack *does* land on.
+- **Distilled memory is now in *effect* on a foreign seat, not merely present.**
+  Import seeds facts to `~/.claude/projects/<slug>/memory` — 5dive's own store,
+  which `5dive memory search` reads for any agent, so the facts were always
+  reachable. They were not *loaded*: it is the Claude Code harness that
+  auto-injects that store each session, and a codex seat reads `.codex/AGENTS.md`
+  and nothing else. The DIVE-2565 renderer is applied to the import direction to
+  inline the facts into the instruction file the target harness actually reads,
+  with the same fenced sections and sentinels the single-file export emits.
+  Claude is deliberately excluded — there the store *is* the loading mechanism,
+  and duplicating every fact into `CLAUDE.md` would double the system prompt to
+  fix a problem that harness does not have. The import envelope reports
+  `memoryInEffect` so the mechanism is stated rather than inferred from the type.
 
 ## Unreleased — fix(digest): a completion was credited to whoever OWNED the row at close, which on a graded row is the verifier (DIVE-2556)
 
