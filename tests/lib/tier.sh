@@ -60,6 +60,36 @@
 TIER_BUDGET_CORE=300
 TIER_BUDGET_FULL=1320
 
+# DIVE-2555: HOW FAR A HEADER'S OWN MEASUREMENT MAY DRIFT FROM THE CLOCK.
+#
+# A demotion is argued in the diff with a number — `14.3s measured: does not fit
+# the 300s PR core`. That number is the whole evidence a reviewer has that a cost
+# was moved rather than hidden, and NOTHING GRADED IT: it is free text in a comment,
+# written once, never re-read. Measured 2026-08-03 on the control plane,
+# gate_channel_session_t2_mutation.sh claimed 300.0s and ran 335s (+12%), and the
+# claim had no environment and no date on it, so neither reading could refute the
+# other.
+#
+# The fix costs nothing to run, because the runner already times every harness in
+# the run it was doing anyway (property 2: enforce on the number you MEASURE, never
+# on a table of per-file costs — this grades the table AGAINST the measurement
+# instead of trusting it). Two thresholds, not one:
+#
+#   WARN  measured exceeds the claim by >= 10% AND by >= 1s. Printed with the exact
+#         replacement line. This is the band a busier host or a slower runner can
+#         produce, and the honest remedy is to update the number, not to red a build.
+#   FAIL  >= 50% AND >= 3s over  ->  exit 5. Runner variance does not double a
+#         harness that is already several seconds long. A claim that far under is
+#         not a stale measurement, it is a wrong one, and it was load-bearing
+#         evidence in a review that already happened.
+#
+# Exit 5 is its OWN code for the same reason over-budget is 4 and a red harness is
+# 1: a red that could mean either gets triaged as neither.
+TIER_CLAIM_DRIFT_WARN_PCT=10
+TIER_CLAIM_DRIFT_WARN_S=1
+TIER_CLAIM_DRIFT_FAIL_PCT=50
+TIER_CLAIM_DRIFT_FAIL_S=3
+
 # Match the marker on the harness's own header. Anchored to a comment so a string
 # inside a heredoc or an assertion cannot demote a file by accident.
 TIER_MARKER_RE='^[[:space:]]*#[[:space:]]*TIER:[[:space:]]*([a-z-]+)[[:space:]]*(.*)$'
@@ -106,6 +136,17 @@ tier_reason() {
   printf '%s\n' "${line#"${line%%[![:space:]]*}"}"
 }
 
+# tier_claim <file> -> the number of SECONDS the header claims was MEASURED for this
+# harness ("14.3s measured"), or nothing when the demotion reason argues from
+# something other than a clock ("40s of container setup" is prose, not a claim this
+# can grade, and inventing a number from it would be worse than having none).
+tier_claim() {
+  local r re='([0-9]+(\.[0-9]+)?)s[[:space:]]+measured'
+  r="$(tier_reason "$1")" || return 0
+  [[ -n "$r" && "$r" =~ $re ]] || return 0
+  printf '%s\n' "${BASH_REMATCH[1]}"
+}
+
 # tier_list <core|nightly|full> [corpus-dir=tests] -> harness paths, one per line.
 # `full` is every harness; it is the union, not a third tier.
 # Exits 3 if ANY harness in the corpus has an unreadable marker — a selection built
@@ -145,7 +186,8 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
     list)   tier_list "${2:?list <core|nightly|full>}" "${3:-tests}" ;;
     of)     tier_of "${2:?of <file>}" ;;
     reason) tier_reason "${2:?reason <file>}" ;;
+    claim)  tier_claim  "${2:?claim <file>}" ;;
     budget) tier_budget "${2:?budget <core|full>}" ;;
-    *) printf 'usage: tier.sh {list core|nightly|full [dir] | of <file> | reason <file> | budget core|full}\n' >&2; exit 2 ;;
+    *) printf 'usage: tier.sh {list core|nightly|full [dir] | of <file> | reason <file> | claim <file> | budget core|full}\n' >&2; exit 2 ;;
   esac
 fi
