@@ -112,6 +112,12 @@ EOF
       --arg m2 "actor is UNMEASURABLE ($ACTOR_REASON) — refusing to guess" \
       "{ok:false, error:{code:\$c, class:\$cl, message:\$m2}, data: ($expr)}"
     echo "error: actor is UNMEASURABLE ($ACTOR_REASON) — refusing to guess" >&2
+    # DIVE-2598: this refusal builds its own --json envelope (it carries `data`
+    # alongside the error, which fail() cannot express) and exits directly. It has
+    # already said why, so the EXIT-trap backstop must not append a second
+    # envelope — two objects on stdout is not JSON, and the caller parsing it gets
+    # nothing at all from a command that answered correctly.
+    mark_reported
     exit "$E_AUTH_REQUIRED"
   fi
 

@@ -527,6 +527,7 @@ cmd_account_remove() {
           message:("account \($n) is in use by: " + ($a | join(", "))),
           details:{agents:$a}}}'
       echo "error: account '$name' is in use by: $list" >&2
+      mark_reported  # DIVE-2598: reason already printed above; not a silent exit
       exit "$E_CONFLICT"
     fi
     fail "$E_CONFLICT" "account '$name' is in use by: $list — rebind or remove those agents first"

@@ -260,7 +260,7 @@ cmd_task_reclaim() {
 }
 
 cmd_task() {
-  [[ $# -gt 0 ]] || { _task_usage; exit "$E_USAGE"; }
+  [[ $# -gt 0 ]] || { _task_usage; mark_reported; exit "$E_USAGE"; }
   local sub="$1"; shift
   case "$sub" in
     init)            cmd_task_init "$@" ;;

@@ -51,7 +51,7 @@ _valid_env_key() { [[ "$1" =~ ^[A-Z_][A-Z0-9_]*$ ]]; }
 _valid_connector() { [[ "$1" =~ ^[a-z0-9][a-z0-9-]*$ ]]; }
 
 cmd_secret() {
-  [[ $# -gt 0 ]] || { _secret_usage; exit "$E_USAGE"; }
+  [[ $# -gt 0 ]] || { _secret_usage; mark_reported; exit "$E_USAGE"; }
   local sub="$1"; shift
   case "$sub" in
     write) _secret_write "$@" ;;

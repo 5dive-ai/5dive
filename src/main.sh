@@ -360,7 +360,7 @@ main() {
   done
   set -- "${rest[@]+"${rest[@]}"}"
 
-  [[ $# -gt 0 ]] || { usage; exit "$E_USAGE"; }
+  [[ $# -gt 0 ]] || { usage; mark_reported; exit "$E_USAGE"; }
   local top="$1"; shift
   # DIVE-2323: the one place that sees every dispatch, so fail()'s E_GENERIC
   # hint can name the verb that broke. Set unconditionally, even for a $top
@@ -468,7 +468,7 @@ main() {
         with_registry_lock cmd_hire "$@"
       fi ;;
     agent)
-      [[ $# -gt 0 ]] || { usage; exit "$E_USAGE"; }
+      [[ $# -gt 0 ]] || { usage; mark_reported; exit "$E_USAGE"; }
       local sub="$1"; shift
       case "$sub" in
         -h|--help|help) usage ;;
