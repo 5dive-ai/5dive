@@ -1930,7 +1930,30 @@ _gate_proof_ct_equal() {
 # Enforcement is OFF until the sentinel exists. DIVE-519 ships DORMANT (audit-only):
 # flip on only after the plugin mint is confirmed live on the box, else live taps
 # that can't mint yet would fail closed. Root toggles it.
-_gate_proof_enforced() { [[ -f "$(_gate_proof_enforce_file)" ]]; }
+#
+# DIVE-2588 — THE OVERRIDE MAY ONLY MAKE THIS STRICTER, NEVER WEAKER. This used to
+# read the ENV-OR-DEFAULT path, so an unprivileged agent turned the whole enforcement
+# envelope off with one variable and no sudo:
+#
+#   GATE_PROOF_ENFORCE=/nonexistent/nope  5dive task answer <T2-decision> --value=A --human
+#
+# succeeded where the identical command without it was refused, and landed
+# need_answered_by=human:<agent> — byte-identical to a real relayed human tap. A file-
+# EXISTENCE test on a path the constrained party supplies is not a control: its OFF
+# position was reachable by its own subject. Reversing the sense fixes that without
+# taking the override away — an existing sentinel at EITHER path arms enforcement, so
+# a harness can still turn it ON for an isolated store (which is all any of them do:
+# every caller in tests/ sets it to "$STATE_DIR/gate-proof.enforce", the default it
+# would have resolved anyway), and pointing it at an absent path now says nothing at
+# all instead of saying "off".
+#
+# STATE_DIR is deliberately read directly here rather than through
+# _gate_proof_enforce_file: that helper resolves the override, and the whole point of
+# this branch is that the root-owned default is consulted whether or not one is set.
+_gate_proof_enforced() {
+  [[ -f "${STATE_DIR}/gate-proof.enforce" ]] && return 0
+  [[ -n "${GATE_PROOF_ENFORCE:-}" && -f "$GATE_PROOF_ENFORCE" ]]
+}
 
 # ── DIVE-2235: the HUMAN CLASS, and class-over-tier ──────────────────────────
 # The gate types that mint and verify a one-time human nonce. This list already

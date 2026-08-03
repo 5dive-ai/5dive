@@ -1,5 +1,71 @@
 # Changelog
 
+## Unreleased — SECURITY fix(gate): a tier-2 human floor whose OFF switch was reachable by the agents it constrains (DIVE-2588)
+
+Any agent, unprivileged and without sudo, could forge a human tap on a tier-2 **decision**
+gate with one environment variable:
+
+```
+GATE_PROOF_ENFORCE=/nonexistent/nope  5dive task answer <T2-decision> --value=A --human
+```
+
+succeeded where the identical command without it was refused, and wrote
+`need_answered_by=human:<agent>` — the same row the human's own relayed tap writes, so the
+record could not tell them apart. Found by main while grading DIVE-2515 on the released
+v0.18.2 artifact; reproduced on the installed 0.18.0+dive2563 in an isolated store.
+`_gate_proof_enforced` was a file-**existence** test on a path the constrained party
+supplies, so pointing it at anything absent evaluated the whole tier-2 branch false. Scope
+was exactly `decision`: approval/secret/manual/access carry an independent type guard that
+never consults the flag.
+
+Two independent halves, because either alone would have closed the reported command while
+leaving the shape intact:
+
+- **The override may only make enforcement stricter.** An existing sentinel at *either* the
+  root-owned default or the `GATE_PROOF_ENFORCE` path arms it; an absent path now says
+  nothing at all instead of saying "off". Harnesses keep the override they already use —
+  every caller in `tests/` points it at `$STATE_DIR/gate-proof.enforce`, the default it
+  would have resolved anyway.
+- **The tier-2 human floor no longer consults the flag**, in either direction. It was a
+  rollout envelope for a rollout that finished 2026-07-30, and while it stood it made a hard
+  human floor switchable. Safe to make unconditional: the provenance floor refuses only a
+  *non-human* answer on a tier-2 gate, and the evidence block is already scoped to gates
+  carrying a minted nonce — so a box that mints nothing reaches no new assertion, and every
+  real human path passes `--human` (DIVE-525 holds by construction).
+
+Behaviour change worth naming, and its bound: on a box where the sentinel was never armed,
+tier-2 gates now behave as they already do everywhere else. That population is small by
+construction — `install.sh` arms enforcement on every box, fresh install and upgrade alike
+(DIVE-758, "secure-by-default"), so an unarmed box is one where that line failed (it is
+`|| true`) or one that predates it. Both now match the fleet, which is the direction that
+cannot refuse a tap the rest of the fleet accepts. `gate-proof enforce off` no longer leaves
+the default sentinel behind — it used to print OFF while the predicate read ON — and `status`
+now reports which sentinel armed it (`default` / `env-override` / `both`).
+
+New: `5dive selfcheck --only=t2-forge` performs the forge for real in a throwaway store and
+reds if it lands — DIVE-2520's "forge an actor, the rail goes red" one layer up. It also
+answers a second gate down a real human path, because a floor that refuses everything and a
+floor that refuses the forge are the same observation from the refusal alone.
+
+Tests: `tests/gate_enforce_env_bypass_unit.sh` (23 arms; graded against the pre-fix code,
+which reproduces the exploit inside the harness at `state=closed prov=human:dev`).
+`tests/gate_tier2_floor_unit.sh` and `tests/gate_t2_routed_escalate_unit.sh` had arms
+asserting the *opposite* contract — that clearing the flag made the floor dormant — and now
+assert that it does not.
+
+Both the harness and the probe had a defect worth naming, because it is the same class this
+row is about. Each stubbed `id -un` to model "the caller is an agent" — and the uid-first
+resolver has not read `id -un` since DIVE-2330; it walks `/etc/passwd` for `$EUID` in pure
+bash, precisely so a PATH shim cannot forge it. The stub was inert, so agent-ness was
+supplied BY THE HOST: `agent-dev` owns uid 1007 on a 5dive box, and 19/19 green there said
+nothing about the property. On a CI runner the same uid is `runner`, no agent claims it, and
+the forge arm was a *legitimate human tap* — 8 arms red, and the probe reported a bypass that
+had not happened. Both now pin `_gate_caller_uid` and `_gate_passwd_stream`, the seams
+`lib/actor.sh` publishes for this, and both assert the pin through the real resolver first: a
+pin that silently yields nothing would make every refusal look right for the wrong reason.
+The probe reports `not-reached` rather than `pass` when its caller does not resolve as an
+agent, since a refusal it cannot attribute measures nothing.
+
 ## Unreleased — fix(task): `task done` died with empty output when the result named no branch (DIVE-2603)
 
 v0.18.3 shipped DIVE-2577's merge-gate extractor with an **unguarded** command substitution:

@@ -8451,16 +8451,31 @@ cmd_gate_proof() {
     case "${2:-status}" in
       on)  : > "$_ef"; chmod 0644 "$_ef" 2>/dev/null || true
            ok "gate-proof enforcement ON: approval/secret/manual answers now require human evidence (a valid --human-proof nonce or a non-agent SUDO_UID)" ;;
-      off) rm -f "$_ef"
-           ok "gate-proof enforcement OFF: audit-only; approval/secret/manual answers allowed without human evidence" ;;
+      off) # DIVE-2588: enforcement is now armed by EITHER sentinel, so removing only
+           # the override path would print OFF while the default kept it ON — a status
+           # line that disagrees with the predicate is how the flag got trusted in the
+           # first place. Root asked for off; take both. (Still root-only: this widens
+           # nothing an unprivileged caller can reach.)
+           rm -f "$_ef" "${STATE_DIR}/gate-proof.enforce"
+           ok "gate-proof enforcement OFF: audit-only; approval/secret/manual answers allowed without human evidence. NOTE the tier-2 human floor is NOT affected — since DIVE-2588 it is unconditional and no flag can lower it." ;;
       status)
-           local _e _k
+           local _e _k _src
            _gate_proof_enforced && _e=on || _e=off
            [[ -s "$(_gate_proof_key_file)" ]] && _k=present || _k=absent
+           # DIVE-2588: name WHICH sentinel armed it. "on" alone cannot tell an
+           # operator that an env override is in play on this invocation.
+           _src=none
+           [[ -f "${STATE_DIR}/gate-proof.enforce" ]] && _src=default
+           if [[ -n "${GATE_PROOF_ENFORCE:-}" && -f "$GATE_PROOF_ENFORCE" ]]; then
+             [[ "$_src" == default ]] && _src=both || _src=env-override
+           fi
            if (( JSON_MODE )); then
-             ok "gate-proof: enforce=$_e key=$_k" '{enforce:$e, key:$k}' --arg e "$_e" --arg k "$_k"
+             ok "gate-proof: enforce=$_e key=$_k armed_by=$_src" \
+               '{enforce:$e, key:$k, armedBy:$s, t2FloorUnconditional:true}' \
+               --arg e "$_e" --arg k "$_k" --arg s "$_src"
            else
-             echo "enforce: $_e"; echo "key: $_k"
+             echo "enforce: $_e"; echo "key: $_k"; echo "armed by: $_src"
+             echo "tier-2 human floor: unconditional (DIVE-2588 — not switchable by this flag)"
            fi ;;
       *) fail "$E_USAGE" "usage: 5dive gate-proof enforce on|off|status" ;;
     esac
@@ -9031,7 +9046,17 @@ cmd_task_answer() {
   # first; do not infer that it has drained. NO downgrade path from the answer side by design: an over-fired T2
   # (the heuristic can over-match) waits for a human — the conservative correct
   # default for a hard floor; re-file at a lower --tier if the floor misfired.
-  if [[ "$gtier" == "2" ]] && (( ! human )) && _gate_proof_enforced; then
+  # DIVE-2588: NO LONGER CONTINGENT ON THE ROLLOUT FLAG. The `_gate_proof_enforced`
+  # conjunct was a staging envelope for a rollout that completed on 2026-07-30, and
+  # while it stood it made a hard human floor switchable — the same variable that
+  # armed it could disarm it, and until DIVE-2588 the party it constrains could set
+  # that variable. A control whose OFF position is reachable by its subject is not a
+  # control. The flag can now only make the floor STRICTER (see _gate_proof_enforced),
+  # and this branch does not consult it at all. Safe to make unconditional: it refuses
+  # only a NON-human answer on a tier-2 gate, which is precisely what a hard human
+  # floor means on every box, armed or not — every real human path passes --human, so
+  # DIVE-525 ("a real tap is never rejected") still holds by construction.
+  if [[ "$gtier" == "2" ]] && (( ! human )); then
     local _caller3; _caller3=$(_gate_caller_user)
     # DIVE-1437: a tier-2 gate that was LEAD-ROUTED (routed_reviewer set) but is an
     # approval/manual builder gate is the DIVE-1429 stall — the DIVE-1145/1182
@@ -9102,9 +9127,16 @@ cmd_task_answer() {
   # rendered without a nonce in its callback_data. `human_nonce_hash` non-empty is the
   # exact, per-row witness that this gate's buttons CAN carry proof.
   #
-  # Runs under `_gate_proof_enforced` for the same rollout envelope as every other
-  # evidence rule (enforce is ON fleet-wide since DIVE-950).
-  if [[ "$gtier" == "2" ]] && (( human )) && _gate_proof_enforced; then
+  # DIVE-2588: the `_gate_proof_enforced` conjunct is GONE here too, and this is the
+  # branch the bypass actually rode. A forged `--human` was already refused by this
+  # block on any gate carrying a minted nonce — main measured that on v0.18.2 AND
+  # v0.17.11 — so the exploit was not the flag; it was that ONE env var switched this
+  # block off and the floor above at the same time. Making it unconditional costs
+  # nothing on a box where the rollout never happened: the block is already scoped to
+  # gates whose `human_nonce_hash` is non-empty, i.e. the per-row witness that this
+  # gate's buttons CAN carry proof, so a box that mints nothing reaches no assertion
+  # here. That scoping, not the flag, was always what kept real taps safe.
+  if [[ "$gtier" == "2" ]] && (( human )); then
     local _t2_hash; _t2_hash=$(db "SELECT COALESCE(human_nonce_hash,'') FROM tasks WHERE id=${id};")
     if [[ -n "$_t2_hash" ]]; then
       local _t2_hp=0 _t2_su=0
