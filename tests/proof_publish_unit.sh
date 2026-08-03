@@ -169,5 +169,62 @@ OUT6="$( cd "$W6" && \
 [[ "$(jget "$W6/badge.json" "['message']")" == "100%" ]] \
   && ok_t "big-file badge computes verbatim (6 shipped / 0 asks -> 100%)" || bad_t "big-file badge" "$(cat "$W6/badge.json" 2>/dev/null)"
 
+# --- Case 7 (DIVE-2654, spec: DIVE-2652): corroborators ship inside
+# zero-human.json, carrying their own scope; the badge MESSAGE stays untouched.
+# Numbers pinned to the exact fixture named in DIVE-2652's SHIP SHAPE:
+# 124/192 graded (59.1% coverage of 325 shipped), 3 iteration-NULL graded rows
+# (<=1.6pp upward bias); 126 policy-blocked, 13 of 26 sites fired in 7d, 16 of
+# 26 lifetime, ledger opened 2026-07-25 12:04.
+W7="$TMP/w7"; mkdir -p "$W7"
+OUT7="$( cd "$W7" && \
+  DAY_JSON='{"zeroHuman":{"shipped":5,"humanTouches":1}}' \
+  WEEK_JSON='{"zeroHuman":{"shipped":27,"humanTouches":2}}' \
+  TODAY="2026-08-03" NOW_ISO="2026-08-03T21:00:00Z" \
+  CLI_VERSION="0.18.0" METHODOLOGY_URL="https://example.test/zero-human.md" \
+  CORR_ROWS="325|192|124|3" \
+  CORR_REFUSALS="126" CORR_FIRED_WINDOW="13" CORR_FIRED_LIFETIME="16" CORR_SITES="26" \
+  CORR_LEDGER_SINCE="2026-07-25 12:04:00" \
+  python3 "$TMP/proof.py" )"; RC7=$?
+[[ $RC7 -eq 0 ]] && ok_t "corroborator fixture builds" || bad_t "corroborator build" "rc=$RC7"
+[[ "$(jget "$W7/zero-human.json" "['corroborators']['verifierFirstPassRate']['value']")" == "64.6%" ]] \
+  && ok_t "LEAD: verifier first-pass rate = 124/192 = 64.6%" || bad_t "first-pass value" "$(cat "$W7/zero-human.json")"
+[[ "$(jget "$W7/zero-human.json" "['corroborators']['verifierFirstPassRate']['coveragePct']")" == "59.1" ]] \
+  && ok_t "LEAD carries its own coverage: 192 of 325 shipped = 59.1%" || bad_t "coveragePct"
+[[ "$(jget "$W7/zero-human.json" "['corroborators']['verifierFirstPassRate']['iterationNullBiasPctPtsMax']")" == "1.6" ]] \
+  && ok_t "LEAD discloses the iteration-NULL upward bias (3/192 <= 1.6pp)" || bad_t "iterationNullBiasPctPtsMax"
+[[ "$(jget "$W7/zero-human.json" "['corroborators']['policyBlockedAttempts']['value']")" == "126" ]] \
+  && ok_t "SECOND: policy-blocked attempts = 126" || bad_t "policy-blocked value"
+[[ "$(jget "$W7/zero-human.json" "['corroborators']['policyBlockedAttempts']['firedSites']")" == "13" \
+   && "$(jget "$W7/zero-human.json" "['corroborators']['policyBlockedAttempts']['instrumentedSites']")" == "26" \
+   && "$(jget "$W7/zero-human.json" "['corroborators']['policyBlockedAttempts']['firedSitesLifetime']")" == "16" ]] \
+  && ok_t "SECOND carries fired-vs-instrumented site split (13/26 window, 16/26 lifetime)" || bad_t "site split"
+[[ "$(jget "$W7/zero-human.json" "['corroborators']['policyBlockedAttempts']['ledgerAgeDays']")" != "" \
+   && "$(jget "$W7/zero-human.json" "['corroborators']['policyBlockedAttempts']['ledgerAgeDays']")" != "None" ]] \
+  && ok_t "SECOND carries the ledger's own age" || bad_t "ledgerAgeDays missing"
+BADGE7_MSG="$(jget "$W7/badge.json" "['message']")"
+[[ "$BADGE7_MSG" == "80%" ]] \
+  && ok_t "DIVE-1924 preserved: badge message is unaffected by corroborators shipping" \
+  || bad_t "badge untouched" "expected '80%', got '$BADGE7_MSG'"
+[[ "$(python3 -c "import json; print(sorted(json.load(open('$W7/badge.json')).keys()))")" == "['color', 'label', 'message', 'schemaVersion']" ]] \
+  && ok_t "badge.json schema unchanged (still exactly schemaVersion/label/message/color)" || bad_t "badge schema shape"
+
+# --- Case 8 (DIVE-2654): honesty invariant carries over — no source means an
+# explicit no-data marker, never a bare 0/0%, same rule `proof scorecard` uses.
+W8="$TMP/w8"; mkdir -p "$W8"
+( cd "$W8" && \
+  DAY_JSON='{"zeroHuman":{"shipped":5,"humanTouches":1}}' \
+  WEEK_JSON='{"zeroHuman":{"shipped":27,"humanTouches":2}}' \
+  TODAY="2026-08-03" NOW_ISO="2026-08-03T21:00:00Z" \
+  CLI_VERSION="0.18.0" METHODOLOGY_URL="https://example.test/zero-human.md" \
+  python3 "$TMP/proof.py" ) >/dev/null
+[[ "$(jget "$W8/zero-human.json" "['corroborators']['verifierFirstPassRate']['value']")" == "None" \
+   && "$(jget "$W8/zero-human.json" "['corroborators']['verifierFirstPassRate']['nodata']")" != "" ]] \
+  && ok_t "no CORR_ROWS -> verifier first-pass degrades to NO DATA with a reason, not 0%" \
+  || bad_t "first-pass no-data" "$(cat "$W8/zero-human.json")"
+[[ "$(jget "$W8/zero-human.json" "['corroborators']['policyBlockedAttempts']['value']")" == "None" \
+   && "$(jget "$W8/zero-human.json" "['corroborators']['policyBlockedAttempts']['nodata']")" != "" ]] \
+  && ok_t "no CORR_REFUSALS/CORR_SITES -> policy-blocked degrades to NO DATA with a reason, never 0" \
+  || bad_t "policy-blocked no-data" "$(cat "$W8/zero-human.json")"
+
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [[ $FAIL -eq 0 ]] || exit 1
