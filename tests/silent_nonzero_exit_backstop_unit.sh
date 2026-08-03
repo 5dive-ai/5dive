@@ -50,9 +50,10 @@
 #
 # MUTATION GRADE — RUN, not asserted. Six mutations against the committed tree at
 # a2c41bf (rebased onto b64b6da), each reverted after; every one turns this file
-# red, and on the arms named. Baseline 11/0. Later commits on this branch touch
-# only this header — `git diff a2c41bf HEAD -- src/` is EMPTY, so the graded
-# mechanism is the shipped one.
+# red, and on the arms named. Baseline 11/0. Re-taken unchanged after the induction
+# moved from a stubbed `sqlite3` to the injection above. Later commits on this
+# branch touch only this file — `git diff a2c41bf HEAD -- src/` is EMPTY, so the
+# graded mechanism is the shipped one.
 #   * `mark_reported() { : ; }`                    -> 8/3  (arms 3, 4, 7)
 #   * drop `mark_reported` from fail()             -> 9/2  (arms 3, 7)
 #   * drop `mark_reported` from the usage sites    -> 10/1 (arm 4)
@@ -92,28 +93,34 @@ if ! BUILD_OUT="$BIN" bash build.sh >"$TMP/build.log" 2>&1; then
   printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"; exit 1
 fi
 
-# THE MUTANT: the same bundle with the backstop's body replaced by `:`. This is
-# the pre-DIVE-2598 CLI, built from THIS tree, so arm 2 measures the difference
-# the change makes rather than asserting a remembered fact about an old release.
-MUT="$TMP/5dive-mutant"
-awk '
-  /^_report_silent_exit\(\) \{/ { print "_report_silent_exit() { : ; }"; skip=1; next }
-  skip && /^\}/                 { skip=0; next }
-  skip                          { next }
-  { print }
-' "$BIN" > "$MUT"
-chmod +x "$MUT"
-if ! grep -q '^_report_silent_exit() { : ; }' "$MUT"; then
-  bad_t 'build the neutered-backstop mutant' 'the awk rewrite did not take — arm 2 would grade nothing'
-fi
-
-# `sqlite3` dead on PATH is the induction: every store read in this CLI goes
-# through it, and an unguarded one dies exactly the DIVE-2598 way. Chosen over
-# patching a source line so the arm cannot be satisfied by a guard added to one
-# call site.
-mkdir -p "$TMP/bin"
-printf '#!/bin/sh\nexit 1\n' > "$TMP/bin/sqlite3"; chmod +x "$TMP/bin/sqlite3"
-DEADPATH="$TMP/bin:$PATH"
+# THE INDUCTION, AND WHY IT IS NOT A STORE-READING VERB. The first version of this
+# harness killed `task ls` by stubbing `sqlite3` dead on PATH. It passed here and
+# FAILED in CI: a fresh runner has no tasks store, so `task ls` refuses early and
+# correctly ("tasks store not initialised", rc=10, through fail()) and never reaches
+# sqlite3 at all. The arm was measuring a death that only happens on a provisioned
+# host. So the death is now INJECTED into the built bundle instead — one unguarded
+# `var=$(… | grep <no-match>)` at the top of a handler, which is the DIVE-2598
+# mechanism exactly: grep exits 1 on no-match, pipefail promotes it, `set -e` ends
+# the run before anything prints. `whoami` is the carrier because it needs no host
+# state beyond /etc/passwd, and CURRENT_VERB is already set by the time it runs, so
+# the report can be checked for the verb it names.
+inject() {  # inject <src-bundle> <dst> [extra-awk-rewrite]
+  awk -v extra="${3:-}" '
+    /^cmd_whoami\(\) \{/ {
+      print; print "  _dive2598_induced=$(printf %s \"\" | grep -m1 zzz-no-match)"; next
+    }
+    extra == "neuter" && /^_report_silent_exit\(\) \{/ { print "_report_silent_exit() { : ; }"; skip=1; next }
+    skip && /^\}/ { skip=0; next }
+    skip { next }
+    { print }
+  ' "$1" > "$2"
+  chmod +x "$2"
+}
+INJ="$TMP/5dive-injected"; inject "$BIN" "$INJ"
+MUT="$TMP/5dive-injected-nobackstop"; inject "$BIN" "$MUT" neuter
+grep -q 'zzz-no-match' "$INJ" && grep -q 'zzz-no-match' "$MUT" \
+  && grep -q '^_report_silent_exit() { : ; }' "$MUT" \
+  || bad_t 'build the injected bundles' 'an awk rewrite did not take — arms 1, 2 and 6 would grade nothing'
 
 RC=0; OUT=""; ERR=""
 run() {  # run <bin> [args...] — captures rc, stdout (OUT), stderr (ERR) separately
@@ -122,23 +129,22 @@ run() {  # run <bin> [args...] — captures rc, stdout (OUT), stderr (ERR) separ
   OUT=$("$bin" "$@" 2>"$TMP/err.txt") || RC=$?
   ERR=$(cat "$TMP/err.txt")
 }
-run_dead() { local bin="$1"; shift; PATH="$DEADPATH" run "$bin" "$@"; }
 
 # --- 1. THE DEFECT, REPRODUCED AND REPORTED ----------------------------------
-# `task ls` is READ-ONLY, so AUDIT_CMD is unset for it: this arm also proves the
+# `whoami` is READ-ONLY, so AUDIT_CMD is unset for it: this arm also proves the
 # report is not hung off the audit subsystem's early return.
-run_dead "$BIN" task ls
+run "$INJ" whoami
 if [[ $RC -ne 0 && "$ERR" =~ $BACKSTOP_RE ]]; then
   ok_t "an induced set -e death exits non-zero AND says so (DIVE-2598 shape, read-only verb)"
 else
   bad_t 'induced silent death must be reported' "rc=$RC stdout=${#OUT}B stderr=[${ERR:0:200}]"
 fi
-[[ "$ERR" == *"5dive task"* && "$ERR" == *"5dive bug"* ]] \
+[[ "$ERR" == *"5dive whoami"* && "$ERR" == *"5dive bug"* ]] \
   && ok_t 'the report names the verb that died and where to file it' \
   || bad_t 'report should name verb + 5dive bug' "stderr=[${ERR:0:300}]"
 
 # --- 2. THE DIFFERENTIAL: the same run, backstop neutered --------------------
-run_dead "$MUT" task ls
+run "$MUT" whoami
 if [[ $RC -ne 0 && -z "$OUT" && -z "$ERR" ]]; then
   ok_t "non-vacuity: with the backstop neutered the SAME run is rc=$RC with zero bytes on both streams"
 else
@@ -173,7 +179,7 @@ run "$BIN" --version
 # A silent death under --json is WORSE than in text mode: the caller is parsing
 # stdout, and an empty stdout with a bare rc is indistinguishable from a crash of
 # the pipeline itself.
-run_dead "$BIN" --json task ls
+run "$INJ" --json whoami
 if [[ $RC -ne 0 ]] && jq -e '.ok == false and (.error.message | test("without reporting a reason"))' <<<"$OUT" >/dev/null 2>&1; then
   ok_t '--json emits {ok:false,error:{...}} on stdout instead of nothing'
 else
