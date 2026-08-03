@@ -54,8 +54,11 @@ echo "PASS: codex install recipe provisions Node 24 before Codex"
 # reported success but bin still missing" on a box where codex works.
 # ---------------------------------------------------------------------------
 
+ln_stmt='ln -sfn "$(npm prefix -g)/bin/codex" /home/claude/.local/bin/codex'
+assert_tail=' && [[ -x /home/claude/.local/bin/codex ]]; }'
+
 # The shipping locator asks the npm that performed the install.
-[[ "$recipe" == *'ln -sfn "$(npm prefix -g)/bin/codex" /home/claude/.local/bin/codex'* ]] || {
+[[ "$recipe" == *"$ln_stmt"* ]] || {
   echo "FAIL: codex symlink must target \$(npm prefix -g)/bin/codex — the npm that installed it" >&2
   exit 1
 }
@@ -65,8 +68,24 @@ echo "PASS: codex install recipe provisions Node 24 before Codex"
   exit 1
 }
 # A dangling link must fail the recipe instead of being reported as success.
-[[ "$recipe" == *'&& [[ -x /home/claude/.local/bin/codex ]]'* ]] || {
-  echo "FAIL: recipe must assert the symlink resolves before reporting success" >&2
+#
+# DIVE-2596 iteration 1 shipped this arm as a bare `*'&& [[ -x …codex ]]'*`
+# substring test and it graded NOTHING: the recipe opens with
+# `{ [[ -z "${FORCE_INSTALL:-}" ]] && [[ -x /home/claude/.local/bin/codex ]]; }`
+# — the FORCE_INSTALL short-circuit — which contains that substring verbatim.
+# The pattern was therefore satisfied by the PRE-FIX recipe, and deleting the
+# real trailing assert left the harness green. An unanchored substring arm
+# cannot distinguish two identical substrings in one string; anchor it by
+# POSITION and by COUNT.
+[[ "$recipe" == *"$ln_stmt$assert_tail" ]] || {
+  echo "FAIL: recipe must END with the symlink followed by '$assert_tail' — assert the link resolves before reporting success" >&2
+  exit 1
+}
+# Second, independent anchor: the -x test must appear TWICE (short-circuit +
+# trailing assert). Counted off the raw string, not a deduped view.
+n_asserts="$(grep -o -F -- '[[ -x /home/claude/.local/bin/codex ]]' <<<"$recipe" | wc -l)"
+(( n_asserts == 2 )) || {
+  echo "FAIL: expected 2 occurrences of the -x test (FORCE_INSTALL short-circuit + trailing assert), found $n_asserts" >&2
   exit 1
 }
 # The -x short-circuit stays FIRST. `nvm install 24` resolves 24 against the
@@ -107,8 +126,19 @@ old_recipe='{ [[ -z "${FORCE_INSTALL:-}" ]] && [[ -x /home/claude/.local/bin/cod
 # Rig: fake nvm SELECTS one prefix; fake npm reports and installs into ANOTHER.
 # Reproduces the measured divergence (nvm which 24 -> v24.19.0, npm prefix -g ->
 # v24.18.0) without needing two real node builds.
+#
+# `lands=no` is the second rig: npm reports the SAME prefix and exits 0 having
+# put no codex under it. The locator is then correct and the link still
+# dangles — which is the shape the trailing -x assert exists to catch, and the
+# only rig on which a no-assert recipe is distinguishable from the shipping one
+# (with a correct locator and a real install, both always resolve).
 build_rig() {
-  local root="$1"
+  local root="$1" lands="${2:-yes}" install_body
+  if [[ "$lands" == yes ]]; then
+    install_body="printf '#!/bin/sh\necho codex\n' > \"$root/prefix/bin/codex\"; chmod +x \"$root/prefix/bin/codex\""
+  else
+    install_body=":"
+  fi
   rm -rf "$root"; mkdir -p "$root"/{nvm,localbin,selected/bin,prefix/bin,path}
   cat >"$root/nvm/nvm.sh" <<RIG
 nvm() {
@@ -122,8 +152,7 @@ RIG
 #!/usr/bin/env bash
 case "\$1 \$2" in
   "prefix -g") echo "$root/prefix" ;;
-  "install -g") printf '#!/bin/sh\necho codex\n' > "$root/prefix/bin/codex"
-                chmod +x "$root/prefix/bin/codex" ;;
+  "install -g") $install_body ;;
 esac
 RIG
   chmod +x "$root/path/npm"
@@ -171,3 +200,40 @@ echo "  SHIPPING recipe -> $green"
   exit 1
 }
 echo "PASS: pre-fix locator dangles at rc=0; shipping locator resolves"
+
+# --- assert-half arm: the -x assert graded by its EFFECT, not its presence ---
+# The two arms above cover the LOCATOR half. Neither covers the trailing -x
+# assert behaviourally: on the rig above the shipping locator always resolves,
+# so a recipe with the assert and a recipe without it produce the same verdict.
+# Grade it on the rig where the locator is RIGHT and the binary is still absent
+# from the prefix — then the assert is the only thing standing between rc=0 and
+# an honest failure.
+#
+# The mutant is DERIVED from the shipping recipe by removing exactly the assert,
+# never hand-written: a hand-written twin grades a string this repo does not
+# ship. The round-trip check below proves the removal is the only difference.
+noassert_recipe="${recipe%"$assert_tail"}; }"
+[[ "${noassert_recipe%'; }'}$assert_tail" == "$recipe" ]] || {
+  echo "FAIL: could not derive the no-assert twin by removing exactly '$assert_tail'; the differential below would grade the wrong mutation" >&2
+  exit 1
+}
+
+build_rig "$TMP/ship_noland" no; ship_noland="$(run_recipe "$TMP/ship_noland" "$recipe")"
+build_rig "$TMP/mut_noland"  no; mut_noland="$(run_recipe "$TMP/mut_noland" "$noassert_recipe")"
+echo "  SHIPPING  recipe, npm lands nothing -> $ship_noland"
+echo "  NO-ASSERT twin,   npm lands nothing -> $mut_noland"
+
+# Liveness: without the assert the recipe reports SUCCESS on a dangling link —
+# verbatim the "install reported success but bin still missing" shape this
+# ticket is about. If this is not rc=0 the rig is not exercising the assert and
+# the shipping verdict below is vacuous.
+[[ "$mut_noland" == "VERDICT=dangling rc=0" ]] || {
+  echo "FAIL: no-assert twin did not exit 0 on a dangling link ($mut_noland); this arm is not grading the -x assert" >&2
+  exit 1
+}
+# The differential: same rig, same locator, assert present -> non-zero rc.
+[[ "$ship_noland" == VERDICT=dangling* && "$ship_noland" != *"rc=0"* ]] || {
+  echo "FAIL: shipping recipe reported success on a dangling link ($ship_noland); the trailing -x assert is not doing its job" >&2
+  exit 1
+}
+echo "PASS: -x assert turns a dangling link into a non-zero rc (no-assert twin: rc=0)"
