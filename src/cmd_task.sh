@@ -1485,6 +1485,31 @@ _gate_text_names_a_ref() {
   return 1
 }
 
+# DIVE-2577: every parser above this line only ever recognizes a PR — '#N', a pull
+# URL, the word "PR". DIVE-2556 closed done with its OWN result stating "commit
+# dc336f7 on branch dive-2556-maker-credit is UNPUSHED (dev3 has no push route)" —
+# real, checkable evidence of unlanded work, and nothing upstream of this function
+# could see it, because a branch was never a PR. The declared-binding gate (DIVE-1830,
+# above in this file) already runs the ancestry+attribution scan for a `Branch:` line
+# the maker BOUND; this teaches the mandatory auto-detect gate to run that same scan
+# for a branch the maker's own TEXT names but never bound, so describing the branch
+# in prose instead of `task set-branch`-ing it is not an escape from the gate.
+#
+# Anchored to the task's own ident (case-insensitive), followed by our house
+# kebab-case branch convention — a candidate MUST carry "<ident>-" as a prefix, the
+# same word-boundary discipline the PR-title/head-branch scan already applies. This
+# is deliberately narrow: ordinary prose that happens to contain the word "branch"
+# ("three branches of this problem") can never match, so closes with no code at all
+# (research, decisions, coordination) are untouched — this is the DIVE-1690 shape
+# named as itself, not a blanket PR-or-branch requirement.
+_gate_branch_refs_from_text() {
+  local text="$1" ident="$2"
+  printf '%s\n' "$text" \
+    | grep -ioE "(^|[^A-Za-z0-9])${ident}-[A-Za-z0-9][A-Za-z0-9_.-]*" 2>/dev/null \
+    | sed -E 's/^[^A-Za-z0-9]//' \
+    | tr 'A-Z' 'a-z' | sort -u
+}
+
 # DIVE-1955: the repos the merge-gate knows about, one slug per line, CLI first.
 # `_PUSH_DEFAULT_REPO` used to be the whole world: every bare `#N` resolved against
 # 5dive-ai/5dive, so lodar/5dive-api (== prod) and lodar/5dive-frontend had ZERO
@@ -2935,6 +2960,41 @@ $_body"
     fi
     if [[ -n "$_txt_red" && $force_merge_gate -eq 0 ]]; then
       policy_refuse "$E_CONFLICT" done-after-named-red-merge DIVE-1935 "$ident" "$ident cannot close: PR ${_txt_red//,/, } named in its result/body is merged but its checks are RED. done=merged-AND-green (DIVE-1935) — fix main (or re-run the failed check), then task done, or \`task done $ident --force-merge-gate\` to override (audited)."
+    fi
+    # DIVE-2577: the DIVE-2556 shape — a result/body that names a BRANCH, never a
+    # PR. Run only when nothing above already found (or is about to refuse on) a
+    # PR, and only when a token resolved (fail-open on missing credential, same
+    # design as the rest of this mandatory gate — a gh outage must never stall the
+    # fleet). `_gate_branch_refs_from_text` is the anchor: it can only return a hit
+    # when the text carries this task's OWN ident as a branch-slug prefix, so a
+    # close that names no branch at all (the overwhelming majority) never enters
+    # this block.
+    if [[ -z "$_auto_hit" && $force_merge_gate -eq 0 && -n "$_ghtok2" ]]; then
+      local _br_cands; _br_cands=$(_gate_branch_refs_from_text "$_mg_txt" "$ident")
+      if [[ -n "$_br_cands" ]]; then
+        _mg_had_subject=1
+        local _cand _slug3 _attr3 _bm3 _bl_hit="" _bl_hit_slug="" _bl_hit_how="" _bl_searched2="" _bl_any_unreach=0
+        while IFS= read -r _cand; do
+          [[ -n "$_cand" ]] || continue
+          while IFS= read -r _slug3; do
+            [[ -n "$_slug3" ]] || continue
+            [[ ",$_bl_searched2," == *",$_slug3,"* ]] || _bl_searched2="${_bl_searched2:+$_bl_searched2,}$_slug3"
+            _attr3=$(_gate_branch_ident_on_main "$_slug3" "$_cand" "$_ghtok2" "$ident")
+            if [[ "$_attr3" == "1" ]]; then _bl_hit="$_cand"; _bl_hit_slug="$_slug3"; _bl_hit_how="attribution"; break 2; fi
+            [[ -z "$_attr3" ]] && _bl_any_unreach=1
+            _bm3=$(GH_TOKEN="$_ghtok2" gh pr list --repo "$_slug3" --head "$_cand" --state merged --json mergedAt -q '.[0].mergedAt' 2>/dev/null || echo "")
+            if [[ -n "$_bm3" && "$_bm3" != "null" ]]; then _bl_hit="$_cand"; _bl_hit_slug="$_slug3"; _bl_hit_how="a merged PR"; break 2; fi
+          done < <(if [[ -n "$_task_slug" ]]; then printf '%s\n' "$_task_slug"; else _gate_repo_slugs; fi)
+        done < <(printf '%s\n' "$_br_cands")
+        if [[ -n "$_bl_hit" ]]; then
+          warn "$ident: branch '$_bl_hit', named in the result/body, is on ${FIVE_GATE_MAIN_BRANCH:-main} in $_bl_hit_slug via $_bl_hit_how. done=merged-to-main satisfied (DIVE-2577)."
+        elif [[ $_bl_any_unreach -eq 1 ]]; then
+          warn "$ident: result/body names branch(es) ${_br_cands//$'\n'/, } but the merge-gate could not fully scan ${_bl_searched2//,/, } for them (API/timeout on at least one repo) — this close is UNVERIFIED for the branch, not verified-clean (DIVE-2318 pattern)."
+          _mg_unverified="${_mg_unverified:+$_mg_unverified; }branch named in result/body (${_br_cands//$'\n'/, }) could not be fully scanned"
+        else
+          policy_refuse "$E_CONFLICT" done-with-unlanded-branch-in-result DIVE-2577 "$ident" "$ident cannot close: its result/body names branch(es) ${_br_cands//$'\n'/, } but nothing on ${FIVE_GATE_MAIN_BRANCH:-main} in ${_bl_searched2//,/, } shows any of them landed — no commit there names $ident and no PR with that head is merged. done=merged-to-main (DIVE-2577) — push it (\`5dive push $ident\`) and land it, bind it (\`task set-branch $ident <branch>\`) so the DIVE-1830 gate can re-check it directly, \`task cancel\` to abandon, or \`task done $ident --force-merge-gate\` to override (audited)."
+        fi
+      fi
     fi
     if [[ $force_merge_gate -eq 1 ]]; then
       # Never a silent bypass: record the forced close (with the overridden PR #

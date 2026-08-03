@@ -1,5 +1,31 @@
 # Changelog
 
+## Unreleased — fix(task): the mandatory merge-gate now catches a branch cited in prose, not just a PR (DIVE-2577)
+
+DIVE-2556 closed `done`, verified by olivia, with its OWN result text stating "commit dc336f7
+on branch dive-2556-maker-credit is UNPUSHED (dev3 has no push route)" — real, checkable
+evidence the work never reached main. Nothing caught it: the task carried no `Branch:` line and
+no `delivery_ref`, so the DIVE-1830 declared-binding gate never fired; the DIVE-1835 auto-detect
+gate that runs on every unbound close can only find an OPEN PR (by title/head-branch) or a cited
+`#N`/pull-URL — never a bare branch name — so a maker who names a branch in prose instead of
+binding it slips through even though the auto-detect gate is "mandatory". The row read `done`
+for 30 minutes on a counter lodar was actively asking about while the fix sat on a laptop.
+
+`_gate_branch_refs_from_text` (`src/cmd_task.sh`) closes that specific hole: when an unbound
+close's result/body names `<ident>-<slug>` — our house branch-naming convention, and the same
+word-boundary anchor the PR-title/head-branch scan already uses — the gate now runs that branch
+through the identical ancestry+attribution+merged-PR scan the DIVE-1830 declared path already
+runs for a bound `Branch:` line, and refuses (`done-with-unlanded-branch-in-result`) if nothing
+on main shows it landed. Deliberately narrow: a candidate MUST carry the task's own ident as a
+prefix, so ordinary prose that happens to contain the word "branch" (research, decisions,
+coordination — the population this ticket explicitly did NOT want gated) is untouched. Fails
+open on a missing gh credential, same design as the rest of the auto-detect gate — a gh outage
+must never stall the fleet. `--force-merge-gate` remains the audited escape.
+
+Tests: `tests/task_merge_gate_branch_in_result_unit.sh`, reproducing DIVE-2556's exact shape
+(refuses), the two accepting arms (attribution, merged PR), the force-merge-gate override, and
+that a close naming no ident-prefixed branch at all stays untouched.
+
 ## Unreleased — fix(task): `task deliver --result=` destroyed a closed row's result too (DIVE-2476)
 
 DIVE-2464 guarded `task done|cancel`. It did not guard the verb next door. `cmd_task_deliver` ended
