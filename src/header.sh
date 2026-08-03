@@ -313,18 +313,53 @@ declare -A TYPE_INSTALL=(
   # dir even when the `v24` alias has drifted (same drift the nightly
   # soft-updates hit — DIVE-1189). We then one-hop-symlink the just-installed
   # codex into ~/.local/bin (where TYPE_BIN[codex] and the agent unit's PATH
-  # look). We resolve its real path deterministically as
-  # `dirname $(nvm which 24)/codex` — NOT `command -v codex`, which can land on
-  # a stray /usr/bin/codex, and NOT the `/home/.../v24/bin` alias, which lags
-  # real node upgrades (a box on v24.18.0 left the alias pointing at v24.16.0
-  # and surfaced codex as not_installed — DIVE-1329). `npm install -g` lands the
-  # binary in exactly this dir (== `npm prefix -g`/bin), so the symlink is
-  # guaranteed to point at the codex we just installed. Mirrors opencode below.
+  # look). We resolve its real path as `$(npm prefix -g)/bin/codex` — NOT
+  # `command -v codex`, which can land on a stray /usr/bin/codex, and NOT
+  # `dirname $(nvm which 24)`, which is what this recipe used until DIVE-2596.
+  #
+  # DIVE-2596: `nvm which 24` and `npm prefix -g` are NOT the same directory,
+  # and the comment that used to sit here asserted they were ("== `npm prefix
+  # -g`/bin, so the symlink is guaranteed to point at the codex we just
+  # installed"). They are two different questions:
+  #   nvm which 24  — which node did nvm SELECT   (an intent)
+  #   npm prefix -g — which node is RUNNING npm   (the outcome of this install)
+  # They diverge because ~/.local/bin precedes nvm's bin dir on PATH and holds a
+  # `node` symlink planted by the openclaw recipe below, pinned at whatever
+  # `nvm which 24` meant on the day openclaw was last installed. npm is a
+  # `#!/usr/bin/env node` script, so nvm's npm gets EXECUTED BY that pinned
+  # node, and `npm prefix -g` (derived from process.execPath) reports the
+  # pinned node's prefix — which is where `npm install -g` then puts the
+  # binary. `nvm use` cannot correct this: it edits PATH, and the shadow is
+  # EARLIER on PATH. Measured on the 5dive host: nvm which 24 -> v24.19.0,
+  # npm prefix -g -> v24.18.0, codex under v24.18.0/bin, symlink dangling,
+  # create aborting with "install reported success but bin still missing" on a
+  # box where codex works fine.
+  #
+  # `npm prefix -g` is immune by construction: the same npm process answers the
+  # locator query and performs the install, so target and outcome cannot
+  # disagree. Mirrors openclaw below, which already derives its target this way.
+  # Note we do NOT copy openclaw's `nvm use 24 --silent`: measured on the host,
+  # it does not move `npm prefix -g` (the shadow is earlier on PATH than
+  # anything `nvm use` edits), and tests/codex_install_node24_unit.sh forbids
+  # the substring outright because `nvm use` alone cannot provision a fresh box
+  # (DIVE-1329). Adding it would buy nothing and cost that guard.
+  #
+  # `nvm install 24` also resolves 24 against the REMOTE, so it downloads and
+  # installs a brand-new v24 whenever upstream cuts one — which is what makes
+  # `nvm which 24` move out from under a box that has not changed. That is why
+  # the -x short-circuit stays FIRST: an already-installed codex must not drag
+  # a node download onto every create.
+  #
+  # The trailing `-x` assert is the second half of the fix: a dangling symlink
+  # now fails the recipe with an honest rc instead of being reported as a
+  # successful install and re-diagnosed downstream (cmd_auth.sh) as a missing
+  # binary, which is a true statement about the wrong object — codex IS
+  # installed; the LOCATOR was wrong.
   # DIVE-1189: `5dive agent install codex --upgrade` sets FORCE_INSTALL=1 to skip
   # the -x short-circuit and reinstall @latest in place; without it (the
   # provisioning path) an existing codex is left untouched. \$-escaped so the
   # var expands when the recipe runs under `bash -lc`, not at array-definition time.
-  [codex]="{ [[ -z \"\${FORCE_INSTALL:-}\" ]] && [[ -x /home/claude/.local/bin/codex ]]; } || { . /home/claude/.nvm/nvm.sh && nvm install 24 >/dev/null && npm install -g @openai/codex@latest && mkdir -p /home/claude/.local/bin && ln -sfn \"\$(dirname \"\$(nvm which 24)\")/codex\" /home/claude/.local/bin/codex; }"
+  [codex]="{ [[ -z \"\${FORCE_INSTALL:-}\" ]] && [[ -x /home/claude/.local/bin/codex ]]; } || { . /home/claude/.nvm/nvm.sh && nvm install 24 >/dev/null && npm install -g @openai/codex@latest && mkdir -p /home/claude/.local/bin && ln -sfn \"\$(npm prefix -g)/bin/codex\" /home/claude/.local/bin/codex && [[ -x /home/claude/.local/bin/codex ]]; }"
   # opencode.ai's installer drops the binary at ~/.opencode/bin/opencode and
   # only adds it to PATH via .bashrc — but bash -lc skips .bashrc on
   # non-interactive shells, so neither the verify check below nor the agent

@@ -1,5 +1,73 @@
 # Changelog
 
+## Unreleased — fix(init): the `codex` recipe asked nvm which node it SELECTED, not npm where it INSTALLED (DIVE-2596)
+
+`sudo 5dive agent create --type=codex` aborted with
+
+```
+error: codex install reported success but /home/claude/.local/bin/codex still missing — investigate manually
+```
+
+on a host where codex works fine. The message is a true statement about the wrong object:
+codex was installed. The **locator** was wrong.
+
+The recipe aimed the `~/.local/bin/codex` symlink at `` `dirname $(nvm which 24)` `` and the
+comment above it asserted that this equals `` `npm prefix -g`/bin ``, "so the symlink is
+guaranteed to point at the codex we just installed". It is not, and it is not. They answer
+two different questions:
+
+| | question | value on the 5dive host |
+|---|---|---|
+| `nvm which 24` | which node did nvm **select**? (an intent) | `…/v24.19.0/bin/node` |
+| `npm prefix -g` | which node is **running npm**? (the outcome) | `…/v24.18.0` |
+
+They diverge because `~/.local/bin` precedes nvm's bin dir on `PATH` and holds a `node`
+symlink — planted by the **openclaw** recipe, pinned at whatever `nvm which 24` meant the
+day openclaw was last installed. npm is a `#!/usr/bin/env node` script, so nvm's npm is
+**executed by that pinned node**, and `npm prefix -g` (derived from `process.execPath`)
+reports the pinned node's prefix — which is where `npm install -g` then puts the binary.
+`nvm use` cannot correct this: it edits `PATH`, and the shadow is *earlier* on `PATH`.
+
+Compounding it, `nvm install 24` resolves `24` against the **remote**, so it downloads a
+brand-new v24 whenever upstream cuts one — measured, it pulled `v24.19.0` onto a host that
+already had `v24.18.1`. That is what moves `nvm which 24` out from under a box nobody
+touched, and it is why the `-x` short-circuit stays first: an already-installed codex must
+not drag a node download onto every create.
+
+The symlink now targets `` `$(npm prefix -g)/bin/codex` ``, which is immune by construction —
+the same npm process answers the locator query and performs the install, so target and
+outcome cannot disagree. Mirrors the openclaw recipe, which already derives its target this
+way. The recipe also now asserts the link resolves (`-x`) before reporting success, so a
+dangling link fails with an honest rc instead of being re-diagnosed downstream as a missing
+binary.
+
+Graded in `tests/codex_install_node24_unit.sh` (folded in there rather than shipped as a
+218th harness file — the core tier is over its 300s cap and the budget guard's first
+preference is to merge by subject). The behavioural arm runs the **real** recipe in a mount
+namespace where the two locators disagree, and runs the **pre-fix** locator through the same
+rig as a red anchor: it dangles *at rc=0*, which is the "reported success" half.
+
+The rig **builds** the recipe's hardcoded `/home/claude` inside the namespace (tmpfs over
+`/home`, then `mkdir`) rather than borrowing the host's. The first cut bind-mounted straight
+onto `/home/claude/.nvm` and `/home/claude/.local/bin` — the right addresses, since they are
+what the recipe reads, but they exist only on a 5dive host. On a GitHub runner home is
+`/home/runner`, both mounts failed with *mount point does not exist*, and the driver — `set -u`
+with no `-e` — graded an unrigged namespace and returned `VERDICT=absent rc=1` from both arms.
+Deriving the mount point from `$HOME` does not fix that: the literal `/home/claude` is in the
+**recipe under test**, so a rig at `/home/runner` is just as unrigged, only quieter. The path
+has to be created, not relocated — which also removes the host-dependence that let this pass
+locally and only locally. Everything is namespace-local (unshare defaults to private
+propagation); a host that has `/home/claude` gets it shadowed, never touched.
+
+Two guards keep the arm honest rather than merely working. The driver **refuses** — printing
+nothing verdict-shaped — if any rig step fails, so a rig that did not build can no longer
+emit a string shaped exactly like a measurement; and the environment guard now grades *the
+rig it needs* (build one, check it reports `RIGOK`) instead of the proxy question "is
+`unshare` permitted", which answers **yes** on a runner and was why the unrigged run got
+through. Where no launcher can build the rig the arm skips loudly, naming each candidate's
+failure. Both guards are themselves graded: breaking a rig on purpose asserts the refusal
+fires, names the failed step, and leaks no `VERDICT`.
+
 ## Unreleased — SECURITY fix(gate): a tier-2 human floor whose OFF switch was reachable by the agents it constrains (DIVE-2588)
 
 Any agent, unprivileged and without sudo, could forge a human tap on a tier-2 **decision**

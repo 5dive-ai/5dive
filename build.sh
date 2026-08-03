@@ -78,6 +78,7 @@ cat \
   src/cmd_push.sh \
   src/cmd_deploy.sh \
   src/cmd_gh.sh \
+  src/cmd_bug.sh \
   src/cmd_memory.sh \
   src/cmd_pack.sh \
   src/cmd_secret.sh \
