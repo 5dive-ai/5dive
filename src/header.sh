@@ -747,15 +747,25 @@ declare -A HERMES_PROVIDER_MODEL=(
   [openrouter]="openrouter/auto"
 )
 declare -A OPENCLAW_PROVIDER_MODEL=(
-  [openai]="openai/gpt-4o"
+  # Grade a pin here with `openclaw models list --provider <native> --plain`,
+  # NEVER with `--all`: `--all` is a SUBSET that omits the openai/ and google/
+  # namespaces entirely, and reading that omission as "no oracle" is what left
+  # [openai] and [google] ungraded until DIVE-2631. The per-provider list is the
+  # same static catalog (byte-identical to --all on `anthropic`, and unchanged
+  # with the network cut, so it cannot flap).
+  #
+  # And do NOT settle one of these against a DIFFERENT tool's catalog: models.dev
+  # — which hermes itself prefers at runtime — lists both the old openai/gpt-4o
+  # and the old google/gemini-2.0-flash as PRESENT. A cross-oracle read would
+  # have cleared two genuinely stale pins. Only the list that resolves the pin
+  # has authority over it (DIVE-2631).
+  #
+  # Measured on openclaw 2026.7.1-2: openai carries no gpt-4 family at all (20
+  # ids, starting at gpt-5.3), google carries only 2.5.x/3.x (7 ids), moonshot
+  # only k2.6 / k2.7-code, deepseek only chat / reasoner (DIVE-2628, DIVE-2631).
+  [openai]="openai/gpt-5.6"
   [anthropic]="anthropic/claude-sonnet-5"
-  # openclaw's catalog is namespace-qualified and it enumerates no `google/`
-  # lines at all, so [google] cannot be graded by that oracle and is left as it
-  # is — an absence there means nothing (DIVE-2626). deepseek/moonshot ARE
-  # enumerated, and both pins below were absent from their own namespace until
-  # DIVE-2628 (openclaw 2026.7.1-2: moonshot carries only k2.6 / k2.7-code,
-  # deepseek only chat / reasoner).
-  [google]="google/gemini-2.0-flash"
+  [google]="google/gemini-3.5-flash"
   [deepseek]="deepseek/deepseek-chat"
   [moonshot]="moonshot/kimi-k2.6"
   [openrouter]="openrouter/auto"
