@@ -22,6 +22,12 @@ err_class_for() {
 #   - step() still emits progress to stderr (stdout stays clean)
 JSON_MODE=0
 
+# The top-level verb main() is currently dispatching, set once near the top of
+# main() (DIVE-2323). Read by fail()'s E_GENERIC hint so it can point at
+# `5dive bug` with the actual failing verb filled in, without fail() itself
+# needing to know how it was reached.
+CURRENT_VERB=""
+
 # fail <code> <message>
 # Always exits. In JSON mode, prints envelope on stdout AND a plain line on
 # stderr (for logs). In text mode, prints prose on stderr only. Exit status
@@ -58,6 +64,14 @@ fail() {
       '{ok:false, error:{code:$c, class:$cl, message:$m}}'
   fi
   echo "error: $msg" >&2
+  # DIVE-2323: E_GENERIC is the catch-all/internal bucket (never a usage or
+  # validation mistake — see src/lib/error_codes.sh), so this is the one place
+  # in the CLI that reliably sees "something we didn't expect broke". Point at
+  # the bug-report verb there, with the actual verb/code filled in, rather than
+  # leaving discovery to whoever happens to read .github/ISSUE_TEMPLATE.
+  if [[ "$code" == "${E_GENERIC:-1}" ]]; then
+    echo "hint: run '5dive bug --verb=\"${CURRENT_VERB:-unknown}\" --exit=$code' to preview a diagnostic bug report (allowlisted fields only; nothing is filed until you add --file)" >&2
+  fi
   exit "$code"
 }
 
