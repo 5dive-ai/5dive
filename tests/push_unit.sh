@@ -771,12 +771,35 @@ wf() { ( _push_touches_workflows "$WFREPO" "$WFREPO" "$1" ) 2>/dev/null; }
 [[ "$(wf touches-ci)" == "yes" ]] \
   && ok_t "workflows scope: a branch touching .github/workflows/ needs workflows:write" \
   || bad_t "workflows scope: workflow-touching branch" "got '$(wf touches-ci)', want 'yes'"
-# No reachable default branch -> no range to diff. Must be 'unknown' (which the
-# caller treats as "include the permission and say so"), never a silent 'no' —
-# a false 'no' is a push that fails AFTER the human cleared the gate.
+# Neither a live NOR a cached bound -> no range to diff. Must be 'unknown' (which
+# the caller treats as "include the permission and say so"), never a silent 'no' —
+# a false 'no' is a push that fails AFTER the human cleared the gate. WFREPO has no
+# remote-tracking refs, so this arm exercises the both-bounds-missing path.
 [[ "$( ( _push_touches_workflows "$WFREPO" "/nonexistent/remote.git" touches-ci ) 2>/dev/null )" == "unknown" ]] \
-  && ok_t "workflows scope: unreachable remote -> unknown (fails open, loudly)" \
-  || bad_t "workflows scope: unreachable remote" "want 'unknown'"
+  && ok_t "workflows scope: no live AND no cached bound -> unknown (fails open, loudly)" \
+  || bad_t "workflows scope: no live and no cached bound" "want 'unknown'"
+
+# DIVE-2547: the live fetch is UNAUTHENTICATED, so on a PRIVATE repo it can never
+# succeed and the old code demanded workflows:write on every push forever. With a
+# cached remote-tracking ref present the probe must fall back to it and MEASURE,
+# rather than escalating the token. Same fixture, plus refs/remotes/origin/main.
+WFCACHED="$TMP/wfcached"
+cp -r "$WFREPO" "$WFCACHED" 2>/dev/null
+( cd "$WFCACHED" && git update-ref refs/remotes/origin/main refs/heads/main ) >/dev/null 2>&1
+wfc() { ( _push_touches_workflows "$WFCACHED" "/nonexistent/remote.git" "$1" ) 2>/dev/null; }
+
+[[ "$(wfc code-only)" == "no" ]] \
+  && ok_t "workflows scope: unreachable remote + cached ref -> measures 'no', does NOT escalate" \
+  || bad_t "workflows scope: cached-ref fallback on a code-only branch" "got '$(wfc code-only)', want 'no'"
+[[ "$(wfc touches-ci)" == "yes" ]] \
+  && ok_t "workflows scope: cached-ref fallback still catches a workflow-touching branch" \
+  || bad_t "workflows scope: cached-ref fallback on a ci branch" "got '$(wfc touches-ci)', want 'yes'"
+# The degradation must SAY it degraded (DIVE-2161: a cached bound that hides its
+# staleness is the failure this whole class is about).
+( _push_touches_workflows "$WFCACHED" "/nonexistent/remote.git" code-only ) 2>&1 >/dev/null \
+  | grep -q 'may be stale' \
+  && ok_t "workflows scope: the cached-bound fallback names its own staleness on stderr" \
+  || bad_t "workflows scope: cached fallback is silent" "no staleness warning emitted"
 # And the caller wires it: the wide body is reachable only when not 'no'.
 grep -q 'workflows:"write"' "$SRC/cmd_push.sh" \
   && ok_t "workflows scope: _push_do can request workflows:write" \

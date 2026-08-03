@@ -1,5 +1,36 @@
 # Changelog
 
+## Unreleased — fix(push): the workflow-scope probe fetched unauthenticated, so every private-repo push demanded `workflows:write` (DIVE-2547)
+
+`_push_touches_workflows` decides whether a delegated push needs `workflows:write`
+on top of `contents:write`. It ranged the branch by running `git fetch <repourl>`
+with **no credential**. Against a private repo that can never succeed, so the probe
+returned `unknown` and the caller escalated the token request — on every push, to
+every private repo, forever. A probe that never measures anything is not insurance;
+it is a permanently over-scoped token minted by a check that always abstains, which
+is the exact inversion of the one-permission scope DIVE-1460 exists to hold.
+
+It also did not degrade gracefully: the App is not granted `workflows:write`, so the
+defensive request **422s** and the push fails *after* a human already cleared the
+gate. Measured 2026-08-03, it blocked three agents across three repos — dev on
+`lodar/5dive-api` (DIVE-1999) and `lodar/5dive-frontend` (DIVE-2535), dev2 on
+`lodar/5dive-api` (DIVE-2033).
+
+The probe now degrades to the **cached** remote-tracking ref, exactly as the author
+scan one function over already did (DIVE-2161: *resolve the bound, degrade to a
+cached bound and say it may be stale, or refuse and name what is missing*). The same
+lesson was learned here and never applied.
+
+The staleness is safe in the direction that matters: `base...branch` reports what the
+branch *adds*, so an older base widens the range and can only over-report touched
+files. It can turn a `no` into a `yes` (request a scope we did not need) but never a
+`yes` into a `no` (push a workflow change under `contents:write` alone). Only when
+neither a live nor a cached bound resolves is the answer still `unknown`.
+
+`tests/push_unit.sh` 86 → 89 arms: the cached fallback measures `no` on a code-only
+branch, still catches a workflow-touching branch, and names its own staleness on
+stderr. The both-bounds-missing path still returns `unknown`.
+
 ## Unreleased — feat(actor): `5dive whoami`, one sealed actor derivation (DIVE-2517)
 
 The CLI had **six** actor derivations and they disagreed. Only one failed closed;

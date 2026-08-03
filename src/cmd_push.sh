@@ -273,6 +273,37 @@ _push_touches_workflows() { # <repopath> <repourl> <branch>
   for b in main master; do
     if "${g[@]}" fetch --quiet "$repourl" "$b" 2>/dev/null; then base="FETCH_HEAD"; break; fi
   done
+  # DIVE-2547: that fetch is UNAUTHENTICATED — it hands git a bare $repourl with no
+  # credential — so against a PRIVATE repo it can never succeed. The old code then
+  # returned "unknown" and the caller requested workflows:write defensively, on
+  # EVERY push to every private repo, forever. That is a permanently over-scoped
+  # token minted by a probe that never once measured anything, which is the exact
+  # inversion of what DIVE-1460's one-permission scope is for. Measured 2026-08-03:
+  # it blocked dev on lodar/5dive-api (DIVE-1999) and dev2 on the same repo
+  # (DIVE-2033), and the escalated request 422s because the App is not granted
+  # workflows:write — so the defensive branch does not even degrade gracefully, it
+  # fails the push outright after the human already cleared the gate.
+  #
+  # Degrade to the CACHED remote-tracking ref instead, exactly as the author scan
+  # one function over already does (DIVE-2161: "resolve the bound, degrade to a
+  # CACHED bound and SAY it may be stale, or refuse and name what is missing").
+  # The same lesson was learned here and never applied.
+  #
+  # A stale cached base is SAFE IN THE DIRECTION THAT MATTERS: base...branch shows
+  # what the branch adds relative to base, so an older base widens the range and can
+  # only report MORE files. It can therefore turn a "no" into a "yes" (request the
+  # scope we did not need) but never a "yes" into a "no" (push a workflow change
+  # under contents:write alone). Only when neither a live nor a cached bound exists
+  # is the answer genuinely unknown.
+  if [[ -z "$base" ]]; then
+    for b in main master; do
+      if "${g[@]}" rev-parse --verify --quiet "refs/remotes/origin/${b}" >/dev/null 2>&1; then
+        base="refs/remotes/origin/${b}"
+        echo "[5dive] could not fetch the remote default branch (unauthenticated probe); diffing '${branch}' against the cached ${base}, which may be stale — a stale base can only over-report touched files, never under-report them" >&2
+        break
+      fi
+    done
+  fi
   [[ -n "$base" ]] || { echo "unknown"; return; }
   files=$("${g[@]}" diff --name-only "${base}...refs/heads/${branch}" 2>/dev/null)     || { echo "unknown"; return; }
   if grep -qE '^\.github/workflows/' <<<"$files"; then echo "yes"; else echo "no"; fi
