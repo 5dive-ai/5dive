@@ -1,5 +1,51 @@
 # Changelog
 
+## Unreleased — feat(pack): export an agent as ONE AGENTS.md that codex and opencode read as-is (DIVE-2565)
+
+A tarball pack is a fine archive and a poor artefact: you cannot read it, diff it,
+paste it into a chat, or hand it to a harness that has never heard of 5dive. And
+every published pack hardcoded `config.type: "claude"` — the ONLY Claude-specific
+thing about the format. Memory is plain markdown and needs no porting at all.
+
+`5dive agent export <name> --format=agents-md [-o <path>]` renders the SAME staged
+pack as one markdown file that IS an AGENTS.md: YAML frontmatter carries the agent
+spec (type, model, effort, isolation, channels, skills, plugins), the body is the
+persona doc verbatim, and `--with-memory` adds fenced `## memory/<file>` sections.
+`5dive agent import <file.md>` splits it back. Since `AGENTS.md -> CLAUDE.md` is
+already the convention, the export degrades into something useful instead of a dead
+archive: drop it in a repo with no 5dive installed and codex or opencode reads it.
+
+**One renderer, not one adapter per harness.** Import explodes the file back into a
+v1 pack stage and re-tars it, so safe-extract, manifest validation, the DIVE-995
+disclosure, hook stripping, memory seeding and skill re-add all run on the identical
+path — one import flow, not two.
+
+**No new policy surface.** The renderer runs over the stage `cmd_export` already
+built, *after* the secret tripwire, so it inherits the deny-by-default
+{reference,project}-only memory scoping and the mandatory two-phase approve gate
+unchanged: `--format=agents-md --with-memory` still writes a draft and stops.
+
+Two things are deliberately not carried, and the file **says so** rather than
+dropping them silently — a silent drop was the failure mode to avoid:
+
+- **hooks**: arbitrary shell auto-run on tool events. A pasteable single file is the
+  worst possible carrier, and import strips hooks by default anyway (DIVE-995), so
+  carrying them would only ever be a trap. Export warns; frontmatter reads
+  `hooks: dropped`.
+- **avatar**: a PNG. A file whose whole value is being human-sized and pasteable
+  cannot carry it and base64 would defeat the point, so the frontmatter reads
+  `avatar: dropped` when there was one and `avatar: none` when there wasn't, and
+  export warns. `--format=pack` still carries the real `avatar.png`.
+- **skill bodies**: names travel as refs, exactly as the tarball manifest does.
+  Inlining bodies would balloon a file whose whole value is being human-sized. The
+  names stay visible in the frontmatter, are restated in a `## Skills` section that
+  states plainly that a harness with no skills directory installs none of them, and
+  import now warns **by name** for every skill it could not install.
+
+The memory-section filename is read off an HTML-comment sentinel and becomes a path,
+so it is validated against `^[A-Za-z0-9._-]+\.md$` — a traversal name is dropped
+while clean facts in the same file still land.
+
 ## Unreleased — fix(push): resolve the App installation PER REPO, not from one pinned id (DIVE-2563)
 
 `_push_do` minted every installation token against a single `GITHUB_APP_INSTALLATION_ID`

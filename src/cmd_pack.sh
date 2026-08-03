@@ -774,8 +774,17 @@ _pack_usage() {
   cat <<USAGE
 5dive agent export / import — portable agent packs (DIVE-39)
 
-  5dive agent export <name> [--with-memory] [--approve-memory=<dir>] [--out=<path>]
-                                  # write a shareable pack (.tar.gz). Default = config only.
+  5dive agent export <name> [--format=pack|agents-md] [--with-memory]
+                            [--approve-memory=<dir>] [-o <path>|--out=<path>]
+                                  # write a shareable pack. Default = config only.
+                                  # --format=agents-md (DIVE-2565) writes ONE markdown
+                                  # file that IS an AGENTS.md: YAML frontmatter = the
+                                  # agent spec, body = the persona doc, memory as fenced
+                                  # '## memory/<file>' sections. Readable, diffable,
+                                  # pasteable — and codex/opencode read it as-is with no
+                                  # 5dive installed. Skills travel as NAMES not bodies and
+                                  # hooks are never carried; the file says both out loud.
+                                  # 'agent import <file.md>' splits it back.
                                   # --with-memory is a TWO-PHASE deny-by-default flow:
                                   #   1) export <name> --with-memory  -> writes a scoped persona
                                   #      DRAFT (only reference/project knowledge facts; private
@@ -889,20 +898,279 @@ _pack_scope_memory() {
   printf '%s %s\n' "$kept" "$excluded"
 }
 
+# -------- DIVE-2565: single-file agent export/import (AGENTS.md) -----------
+#
+# A tarball pack is a fine ARCHIVE and a poor ARTEFACT: you cannot read it, diff
+# it, paste it into a chat, or hand it to a harness that has never heard of
+# 5dive. This renders the very same staged pack as ONE markdown file that IS an
+# AGENTS.md — YAML frontmatter carrying the agent spec, the persona doc as the
+# body, and (opt-in) memory as fenced `## memory/<file>` sections.
+#
+# ONE RENDERER, NOT ONE ADAPTER PER HARNESS. Nothing in the format is
+# Claude-specific: `type` is a field, and memory is plain markdown that needs no
+# porting at all. `AGENTS.md -> CLAUDE.md` is already the convention, so codex or
+# opencode reads the export as-is with no 5dive installed — the file degrades
+# into something useful instead of a dead archive.
+#
+# SECURITY — this path invents NO new policy. It renders the stage cmd_export
+# already built, so it inherits, unchanged: the deny-by-default {reference,
+# project}-only memory scoping, the mandatory two-phase approve gate, and the
+# secret tripwire (which runs over the whole stage BEFORE we render). Two things
+# are deliberately NOT carried, and the file SAYS SO rather than dropping them
+# silently:
+#   - hooks: arbitrary shell auto-run on tool events. A pasteable single file is
+#     the worst possible carrier for it, and import already strips hooks by
+#     default anyway (DIVE-995), so carrying them would only ever be a trap.
+#   - skill BODIES: names travel as refs (exactly as the tarball manifest does).
+#     Inlining bodies would balloon a file whose whole value is being
+#     human-sized, and a harness with no skills directory still gets the NAMES —
+#     visible in the frontmatter, restated in a `## Skills` section, and warned
+#     about by name on import.
+AGENTS_MD_FORMAT_VERSION=1
+
+# Sentinels are HTML comments: invisible in every markdown renderer, ignored by
+# any harness reading the file as instructions, and exact for the parser — which
+# is what lets the persona body stay UNFENCED (codex must read it verbatim)
+# without its own `##` headings colliding with our section headings.
+AGENTS_MD_S_SKILLS='<!-- 5dive:skills -->'
+AGENTS_MD_S_MEMORY='<!-- 5dive:memory -->'
+
+# Longest tilde-fence in <file>, so we can open a longer one and contain content
+# that itself contains fences (memory facts routinely hold ``` code blocks).
+_agents_md_fence() {
+  local f="$1" n
+  n=$(grep -oE '^~{3,}' "$f" 2>/dev/null | awk '{ if (length($0) > m) m = length($0) } END { print m + 0 }')
+  (( n < 5 )) && n=5
+  printf '%*s\n' "$((n + 1))" '' | tr ' ' '~'
+}
+
+# Render a staged pack (the dir cmd_export builds) as one AGENTS.md on stdout.
+_agents_md_render() {
+  local stage="$1"
+  local mf="$stage/manifest.json"   # separate stmt: ${stage} aborts under set -u if same line
+  [[ -f "$mf" ]] || return 1
+
+  # Frontmatter. Every scalar goes through jq's @json: a JSON string is a valid
+  # YAML 1.2 double-quoted scalar, so this is exact quoting with no YAML emitter
+  # dependency — and it round-trips through `fromjson` on the parse side.
+  local hasav=false
+  [[ -f "$stage/avatar.png" ]] && hasav=true
+  jq -r --argjson amf "$AGENTS_MD_FORMAT_VERSION" --argjson hasav "$hasav" '
+    def s: if . == null or . == "" then "null" else (. | tostring | @json) end;
+    [ "---",
+      "agentsMdFormat: \($amf)",
+      "packFormat: \(.packFormat)",
+      "name: \(.agentName | s)",
+      "type: \(.config.type | s)",
+      "model: \(.config.model | s)",
+      "effort: \(.config.effort | s)",
+      "isolation: \(.config.isolation | s)",
+      "channels: \(.config.channels | s)",
+      "workdir: \(.config.workdir | s)",
+      "createdWith: \(.createdWith | s)",
+      "includesMemory: \(.includes.memory | if . == false then "false" else (. | @json) end)",
+      "hooks: dropped   # never carried by a single-file export (see Skills note)",
+      # The avatar is a PNG. A file whose whole value is being human-sized and
+      # pasteable cannot carry it, and base64 would defeat the point — but a
+      # QUIET drop is precisely the failure mode this format exists to avoid, so
+      # the absence is declared. Export --format=pack keeps the real avatar.png.
+      "avatar: \(if $hasav then "dropped   # binary; use --format=pack to carry avatar.png" else "none" end)"
+    ]
+    + (if ((.skills // []) | length) == 0 then ["skills: []"]
+       else ["skills:"] + ((.skills // []) | map("  - " + @json)) end)
+    + ["plugins: " + ((.plugins // []) | tojson), "---", ""]
+    | .[]' "$mf" || return 1
+
+  # Persona doc — verbatim and unfenced: this IS the AGENTS.md body a foreign
+  # harness reads as its instructions.
+  if [[ -f "$stage/CLAUDE.md" ]]; then
+    cat "$stage/CLAUDE.md"
+  else
+    printf '# %s\n\n(no persona document in this export)\n' "$(jq -r '.agentName // "agent"' "$mf")"
+  fi
+  printf '\n'
+
+  # Skills: names, never bodies — and say so, because a silent drop is the bad
+  # outcome for a harness that has no skills directory.
+  local nskills; nskills=$(jq -r '(.skills // []) | length' "$mf")
+  if (( nskills > 0 )); then
+    printf '%s\n' "$AGENTS_MD_S_SKILLS"
+    printf '## Skills\n\n'
+    printf 'This agent expects the skills below. They travel as NAMES, not bodies —\n'
+    printf 'the same refs the tarball pack records. `5dive agent import` re-installs\n'
+    printf 'them where it can and reports by name the ones it could not. On a harness\n'
+    printf 'with no skills directory (codex, opencode) NONE are installed: treat this\n'
+    printf 'list as the capabilities the agent was written to assume.\n\n'
+    jq -r '(.skills // [])[] | "- `" + . + "`"' "$mf"
+    printf '\n'
+  fi
+
+  # Memory: fenced, one section per fact, opt-in and already scoped upstream.
+  if [[ -d "$stage/memory" ]] && find "$stage/memory" -maxdepth 1 -name '*.md' 2>/dev/null | grep -q .; then
+    printf '%s\n' "$AGENTS_MD_S_MEMORY"
+    printf '# Memory\n\n'
+    printf 'Distilled persona memory, one fact per section. `5dive agent import`\n'
+    printf 'writes each back to `memory/<file>`; any other harness just reads them.\n\n'
+    local f base fence
+    while IFS= read -r f; do
+      base=$(basename "$f")
+      fence=$(_agents_md_fence "$f")
+      printf '<!-- 5dive:memory-file: %s -->\n' "$base"
+      printf '## memory/%s\n\n' "$base"
+      printf '%s\n' "$fence"
+      cat "$f"
+      # A fact not ending in a newline would swallow the closing fence.
+      [[ -n "$(tail -c1 "$f")" ]] && printf '\n'
+      printf '%s\n\n' "$fence"
+    done < <(find "$stage/memory" -maxdepth 1 -name '*.md' 2>/dev/null | sort)
+  fi
+}
+
+# Is <file> a 5dive single-file agent export? Anchored on the frontmatter key we
+# emit, so a persona.yaml or a plain hand-written AGENTS.md never misfires.
+_agents_md_is() {
+  local f="$1"
+  [[ -f "$f" ]] || return 1
+  [[ "$(head -c3 "$f" 2>/dev/null)" == "---" ]] || return 1
+  awk 'NR==1 && $0 != "---" { exit 1 }
+       NR>1 && /^---[[:space:]]*$/ { exit 1 }
+       NR>1 && /^agentsMdFormat:[[:space:]]*[0-9]+[[:space:]]*$/ { exit 0 }
+       NR>200 { exit 1 }' "$f"
+}
+
+# Explode a single-file export back into a pack STAGE at <outdir>: manifest.json,
+# CLAUDE.md, memory/*.md. Deliberately reconstructs a v1 pack rather than a
+# second import path, so everything downstream in cmd_import is untouched.
+_agents_md_explode() {
+  local file="$1" outdir="$2"
+  _agents_md_is "$file" || return 1
+  mkdir -p "$outdir" || return 1
+
+  # --- frontmatter -> manifest.json
+  local fm; fm=$(mktemp)
+  awk 'NR==1 { next } /^---[[:space:]]*$/ { exit } { print }' "$file" > "$fm"
+
+  local amf; amf=$(awk -F': *' '/^agentsMdFormat:/ { print $2; exit }' "$fm" | tr -d '[:space:]')
+  [[ "$amf" =~ ^[0-9]+$ ]] || { rm -f "$fm"; return 1; }
+  (( amf <= AGENTS_MD_FORMAT_VERSION )) || { rm -f "$fm"; return 1; }
+
+  # Scalars were emitted as JSON, so `fromjson` unquotes exactly; a human who
+  # hand-edited the file into a bare word still parses via the `// .` fallback.
+  _amd_get() {
+    awk -v k="$1" 'index($0, k ": ") == 1 { sub("^" k ": ", ""); sub(/[[:space:]]+#.*$/, ""); sub(/[[:space:]]+$/, ""); print; exit }' "$fm" \
+      | jq -r 'fromjson? // .' 2>/dev/null
+  }
+  local pf name type model effort iso channels workdir cwith meminc
+  pf=$(_amd_get packFormat);   [[ "$pf" =~ ^[0-9]+$ ]] || pf=1
+  name=$(_amd_get name); type=$(_amd_get type); model=$(_amd_get model)
+  effort=$(_amd_get effort); iso=$(_amd_get isolation); channels=$(_amd_get channels)
+  workdir=$(_amd_get workdir); cwith=$(_amd_get createdWith); meminc=$(_amd_get includesMemory)
+  local v; for v in name type model effort iso channels workdir cwith meminc; do
+    [[ "${!v}" == "null" ]] && printf -v "$v" '%s' ''
+  done
+  [[ -n "$name" && -n "$type" ]] || { rm -f "$fm"; unset -f _amd_get; return 1; }
+
+  # skills: block list OR inline `[]`.
+  local skills
+  skills=$(awk '/^skills:[[:space:]]*\[\][[:space:]]*$/ { exit }
+                /^skills:[[:space:]]*$/ { inl = 1; next }
+                inl && /^  - / { sub(/^  - /, ""); print; next }
+                inl { exit }' "$fm" | jq -Rc 'fromjson? // .' 2>/dev/null | jq -cs '.' 2>/dev/null)
+  [[ -n "$skills" ]] || skills='[]'
+  local plugins
+  plugins=$(awk 'index($0, "plugins: ") == 1 { sub(/^plugins: /, ""); print; exit }' "$fm")
+  # settings.json's enabledPlugins is an OBJECT map in the field
+  # ({"telegram@5dive-plugins":true}), not an array — an array-only check here
+  # silently DROPPED every real agent's plugins on round-trip. Accept either;
+  # cmd_import's `($plugins|length) > 0` works for both.
+  jq -e 'type == "array" or type == "object"' <<<"$plugins" >/dev/null 2>&1 || plugins='[]'
+  rm -f "$fm"; unset -f _amd_get
+
+  # A single-file export never carries hooks (see the header) — reconstruct an
+  # EMPTY hooks block rather than omitting the key, so the manifest stays v1-shaped.
+  jq -n --argjson fmt "$pf" --arg name "$name" --arg ver "$cwith" \
+        --arg type "$type" --arg iso "$iso" --arg ch "$channels" --arg wd "$workdir" \
+        --arg model "$model" --arg effort "$effort" --arg mem "$meminc" \
+        --argjson skills "$skills" --argjson plugins "$plugins" '
+    def n: if . == "" then null else . end;
+    { packFormat: $fmt, agentName: $name, createdWith: $ver,
+      includes: { memory: (if $mem == "" or $mem == "false" then false else $mem end), persona: false },
+      config: { type: $type, isolation: ($iso | n), channels: (if $ch == "" then "none" else $ch end),
+                workdir: ($wd | n), authProfile: null, model: ($model | n), effort: ($effort | n) },
+      plugins: $plugins, skills: $skills, hooks: {} }' > "$outdir/manifest.json" || return 1
+
+  # --- persona body: everything between the frontmatter and the first sentinel.
+  awk -v sk="$AGENTS_MD_S_SKILLS" -v me="$AGENTS_MD_S_MEMORY" '
+    NR == 1 { next }
+    !seen && /^---[[:space:]]*$/ { seen = 1; next }
+    !seen { next }
+    $0 == sk || $0 == me { exit }
+    # Drop the blank line the renderer puts after the closing "---" (and any
+    # others), so render->explode->render is byte-stable on the persona doc.
+    !started && /^[[:space:]]*$/ { next }
+    { started = 1; print }' "$file" > "$outdir/CLAUDE.md"
+  # Trim the blank lines the renderer padded with, so a render->parse->render
+  # round-trip is byte-stable.
+  awk 'BEGIN { RS = "\0" } { sub(/\n+$/, "\n"); printf "%s", $0 }' "$outdir/CLAUDE.md" > "$outdir/.cm" \
+    && mv "$outdir/.cm" "$outdir/CLAUDE.md"
+  [[ -s "$outdir/CLAUDE.md" ]] || rm -f "$outdir/CLAUDE.md"
+
+  # --- memory sections. The filename comes off the sentinel and is validated
+  # here: it becomes a path, and this file may have crossed a trust boundary.
+  if grep -qxF "$AGENTS_MD_S_MEMORY" "$file"; then
+    mkdir -p "$outdir/memory"
+    awk -v me="$AGENTS_MD_S_MEMORY" -v dir="$outdir/memory" '
+      $0 == me { inmem = 1; next }
+      !inmem { next }
+      /^<!-- 5dive:memory-file: .* -->$/ {
+        f = $0; sub(/^<!-- 5dive:memory-file: /, "", f); sub(/ -->$/, "", f)
+        # Reject anything that is not a plain <name>.md — no traversal, no path.
+        if (f !~ /^[A-Za-z0-9._-]+\.md$/ || f ~ /^\.\.?$/ || index(f, "..") > 0) { cur = ""; next }
+        cur = dir "/" f; printf "" > cur; body = 0; fence = ""; next
+      }
+      cur == "" { next }
+      fence == "" && /^~{3,}[[:space:]]*$/ { fence = $0; sub(/[[:space:]]+$/, "", fence); body = 1; next }
+      body && $0 == fence { cur = ""; fence = ""; body = 0; next }
+      body { print >> cur }' "$file"
+    find "$outdir/memory" -maxdepth 1 -name '*.md' 2>/dev/null | grep -q . || rm -rf "$outdir/memory"
+  fi
+  return 0
+}
+
+# Explode + re-tar into a v1 pack tarball; echoes the path. cmd_import then runs
+# its existing safe-extract / manifest-validation / disclosure path over it, so a
+# single-file import is graded by exactly the same gates as a tarball import.
+_agents_md_to_pack() {
+  local file="$1" stage tgz
+  stage=$(mktemp -d) || return 1
+  if ! _agents_md_explode "$file" "$stage"; then rm -rf "$stage"; return 1; fi
+  tgz=$(mktemp -u /tmp/5dive-agentsmd-XXXXXX.tar.gz)
+  if ! tar -czf "$tgz" -C "$stage" . 2>/dev/null; then rm -rf "$stage" "$tgz"; return 1; fi
+  rm -rf "$stage"
+  printf '%s\n' "$tgz"
+}
+
 cmd_export() {
   require_root
-  local name="" with_memory=0 out="" approve_memory=""
+  local name="" with_memory=0 out="" approve_memory="" format="pack"
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --with-memory)      with_memory=1 ;;
       --approve-memory=*) approve_memory="${1#--approve-memory=}"; with_memory=1 ;;
       --out=*)            out="${1#--out=}" ;;
+      # DIVE-2565: -o is the spelling the single-file flow is documented with.
+      -o)                 shift; [[ $# -gt 0 ]] || fail "$E_USAGE" "-o needs a path"; out="$1" ;;
+      --format=*)         format="${1#--format=}" ;;
       -*)                 fail "$E_USAGE" "unknown flag: $1" ;;
       *)                  [[ -z "$name" ]] && name="$1" || fail "$E_USAGE" "extra arg: $1" ;;
     esac
     shift
   done
-  [[ -n "$name" ]] || fail "$E_USAGE" "usage: 5dive agent export <name> [--with-memory] [--approve-memory=<dir>] [--out=<path>]"
+  [[ -n "$name" ]] || fail "$E_USAGE" "usage: 5dive agent export <name> [--format=pack|agents-md] [--with-memory] [--approve-memory=<dir>] [-o <path>]"
+  case "$format" in
+    pack|agents-md) ;;
+    *) fail "$E_USAGE" "unknown --format '$format' (known: pack, agents-md)" ;;
+  esac
   require_agent "$name"
   local user="agent-${name}" cdir="/home/agent-${name}/.claude"
 
@@ -1041,6 +1309,27 @@ cmd_export() {
     fail "$E_GENERIC" "refusing to export: a staged file looks like it contains a secret (safety tripwire). Nothing written."
   fi
 
+  # DIVE-2565: same stage, different container. Renders AFTER the tripwire above,
+  # so the single-file export can never carry something the tarball would refuse.
+  if [[ "$format" == "agents-md" ]]; then
+    [[ -n "$out" ]] || out="/tmp/${name}-AGENTS.md"
+    if ! _agents_md_render "$stage" > "$out"; then
+      rm -f "$out"; rm -rf "$stage" "$mem_tmp"
+      fail "$E_GENERIC" "failed to render the single-file export"
+    fi
+    chmod 644 "$out"
+    local n_hooks; n_hooks=$(jq -r '(.hooks // {}) | length' "$stage/manifest.json" 2>/dev/null || echo 0)
+    rm -rf "$stage"; [[ -n "$mem_tmp" ]] && rm -rf "$mem_tmp"
+    (( has_avatar )) && warn "dropped the avatar (binary): a single-file export carries no image — use --format=pack to keep avatar.png"
+    (( n_hooks > 0 )) && warn "dropped $n_hooks hook block(s): a single-file export never carries arbitrary shell (export --format=pack if you need them)"
+    local skill_n; skill_n=$(jq -r 'length' <<<"$skills" 2>/dev/null || echo 0)
+    (( skill_n > 0 )) && warn "skills travel as NAMES, not bodies ($skill_n listed in the file) — a harness with no skills directory installs none of them; the file says so"
+    ok "exported '$name' as a single-file AGENTS.md (memory: $mem_inc) -> $out" \
+       '{name:$n, file:$o, format:"agents-md", agentsMdFormat:$f, withMemory:($m != "false"), memory:$m, skills:$s, hooks:"dropped"}' \
+       --arg n "$name" --arg o "$out" --argjson f "$AGENTS_MD_FORMAT_VERSION" --arg m "$mem_inc" --argjson s "$skills"
+    return 0
+  fi
+
   [[ -n "$out" ]] || out="/tmp/${name}-pack-v${PACK_FORMAT_VERSION}.tar.gz"
   tar -czf "$out" -C "$stage" . 2>/dev/null || { rm -rf "$stage" "$mem_tmp"; fail "$E_GENERIC" "failed to write pack tarball"; }
   chmod 644 "$out"
@@ -1111,6 +1400,18 @@ cmd_import() {
   fi
   [[ -n "$pack" ]] || fail "$E_USAGE" "usage: 5dive agent import <pack>|--from-persona=<file.persona.yaml> --as=<name> [--type=claude] [--channels=...] [--telegram-token=...] [--discord-token=...] [--auth-profile=...] [--workdir=...]"
 
+  # DIVE-2565: a single-file AGENTS.md export is a pack too. Explode it back into
+  # a v1 stage and re-tar, so EVERYTHING below — safe-extract, manifest
+  # validation, the DIVE-995 disclosure, hook stripping, memory seeding, skill
+  # re-add — runs on the identical path. One import flow, not two.
+  local md_tmp=""
+  if [[ -f "$pack" ]] && _agents_md_is "$pack"; then
+    step "Reading single-file agent export '$pack' (AGENTS.md)"
+    md_tmp=$(_agents_md_to_pack "$pack") \
+      || fail "$E_VALIDATION" "could not parse '$pack' as a 5dive single-file agent export"
+    pack="$md_tmp"
+  fi
+
   # A bare slug (not a local file) → resolve from the character-pack git registry.
   local resolved_tmp=""
   if [[ ! -f "$pack" ]]; then
@@ -1132,11 +1433,12 @@ cmd_import() {
 
   # Unpack into an isolated stage and validate the manifest before touching anything.
   local stage; stage=$(mktemp -d)
-  _pack_safe_extract "$pack" "$stage" || { local rc=$?; rm -rf "$stage" "$resolved_tmp" "$persona_tmp"
+  _pack_safe_extract "$pack" "$stage" || { local rc=$?; rm -rf "$stage" "$resolved_tmp" "$persona_tmp" "$md_tmp"
     (( rc == 2 )) && fail "$E_VALIDATION" "pack rejected: contains unsafe members (path traversal, absolute paths, or sym/hardlinks), refusing to extract"
     fail "$E_GENERIC" "could not read pack (expected a .tar.gz from 'agent export')"; }
   [[ -n "$resolved_tmp" ]] && rm -f "$resolved_tmp"
   [[ -n "$persona_tmp" ]] && rm -f "$persona_tmp"
+  [[ -n "$md_tmp" ]] && rm -f "$md_tmp"
   [[ -f "$stage/manifest.json" ]] \
     || { rm -rf "$stage"; fail "$E_VALIDATION" "pack has no manifest.json — not a 5dive agent pack"; }
 
@@ -1423,6 +1725,12 @@ cmd_import() {
       skipped+=("$sk")
     fi
   done < <(jq -r '.skills[]? // empty' "$stage/manifest.json")
+
+  # DIVE-2565: a silent skill drop is the bad outcome the single-file format was
+  # explicitly not allowed to have. Name them, on every harness.
+  if (( ${#skipped[@]} > 0 )); then
+    warn "skills NOT installed on this '$type' agent: ${skipped[*]} — the agent's instructions still assume them"
+  fi
 
   rm -rf "$stage"
 
