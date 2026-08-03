@@ -1157,6 +1157,92 @@ _resolve_inherit_sources() {
   done
 }
 
+# DIVE-2025: can the agent actually READ its credential?
+#
+# The self-check used to answer this by reading `defer_auth` — a flag recording
+# what the OPERATOR CHOSE, not what the agent GOT. On the completed-login path
+# nothing was checked at all (not even an ok entry), so a credential that
+# silently never reached the agent still printed "self-check PASS — reachable &
+# autonomous". That is the DIVE-1900 shape: every status surface agrees and
+# every one is wrong.
+#
+# THE PROBE MUST BE GROUNDED IN THE AGENT'S UID. `agent create` runs as root,
+# and root reads every credential on the box, so a readability test run from
+# here would pass unconditionally and prove nothing — it would replace a lie
+# with a vacuous truth. Presence is answered as root (root traverses every
+# 0700 dir, so its `-e` is the only trustworthy ABSENT verdict); readability is
+# answered as agent-<name>. Two different questions, two different uids.
+#
+# ABSENT and UNREADABLE stay distinct because they take different fixes:
+# absence is "go log in", unreadability is "the credential is fine, the perms
+# are not" (and presents as `invalid_grant "Malformed auth code"`, which reads
+# as an EXPIRED token, so the intuitive fix — a re-tap — changes nothing).
+#
+# The single seam where the agent-uid read happens, so a harness can stub it
+# without needing a real agent user, real sudo, or root.
+cred_readable_by_agent() { # <agent-user> <path>
+  sudo -n -u "$1" test -r "$2" 2>/dev/null
+}
+
+# selfcheck_cred_reached_agent <name> <type> <profile> <byo_provider>
+# Emits zero or more `ok:<text>` / `issue:<text>` lines on stdout. Never fails.
+# Kept as a named function (rather than inlined in the self-check) so the
+# agent-list health-badge rail (DIVE-1219) can call the same probe and re-check
+# continuously instead of only once at creation.
+selfcheck_cred_reached_agent() { # <name> <type> <profile> <byo_provider>
+  local name="$1" type="$2" profile="$3" byo="${4:-}"
+  local user="agent-${name}"
+
+  # Witness 1: the boot seed's own breadcrumb. 5dive-agent-start runs AS the
+  # agent and records a failed seed at ~/.5dive-cred-seed-failed (removing it
+  # on success), with ABSENT vs UNREADABLE already resolved by cred_seed_why.
+  # Until now that verdict only reached the unit's journal, where nobody looks.
+  # Reading it here costs nothing and duplicates no path knowledge.
+  # AGENT_HOME_ROOT is a test seam (default /home, as everywhere else in this
+  # file); a harness cannot create /home/agent-<name> without root.
+  local bc="${AGENT_HOME_ROOT:-/home}/${user}/.5dive-cred-seed-failed" why=""
+  if [[ -s "$bc" ]]; then
+    why=$(tr -d '\n' < "$bc" 2>/dev/null | cut -c1-400)
+    printf 'issue:credential did NOT reach the agent (it is UNAUTHED despite a completed login) — the boot seed recorded: %s. Re-seed as root: sudo 5dive agent restart %s\n' \
+      "$why" "$name"
+    return 0
+  fi
+
+  # Witness 2: the source the seed reads from, probed as the agent. Catches
+  # what the breadcrumb cannot — a seed that never ran because the unit had not
+  # reached it yet, and the no-seed types that never write a breadcrumb at all.
+  local src=""
+  if [[ -n "$byo" ]]; then
+    # BYO writes an API key into combined.env, not the type's OAuth sentinel;
+    # probing the sentinel would report a false ABSENT.
+    [[ -n "$profile" ]] && src="${AUTH_PROFILES_DIR}/${profile}/combined.env"
+  elif [[ -n "$profile" && -s "${AUTH_PROFILES_DIR}/${profile}/combined.env" ]]; then
+    # api-key / claude-OAuth path: create's own auth gate accepts combined.env
+    # in place of the per-type file, so the probe has to accept it too.
+    src="${AUTH_PROFILES_DIR}/${profile}/combined.env"
+  else
+    src=$(profile_type_auth_path "$profile" "$type" 2>/dev/null) || src=""
+    # `claude` is the one type whose shared sentinel is a `path:jsonkey` pair
+    # (DIVE-1803); every other type's is a bare path.
+    src="${src%%:*}"
+  fi
+  [[ -n "$src" ]] || return 0        # opencode/pi/devin: no credential sentinel
+
+  if [[ ! -e "$src" ]]; then
+    printf 'issue:no auth credential at %s (agent is UNAUTHED — it cannot think until you log in): sudo 5dive agent auth login %s%s\n' \
+      "$src" "$type" "${profile:+ --auth-profile=$profile}"
+  elif [[ ! -s "$src" ]]; then
+    printf 'issue:auth credential at %s is EMPTY (a login was started but never finalized) — re-run: sudo 5dive agent auth login %s%s\n' \
+      "$src" "$type" "${profile:+ --auth-profile=$profile}"
+  elif cred_readable_by_agent "$user" "$src"; then
+    printf 'ok:auth credential readable by %s\n' "$user"
+  else
+    printf 'issue:auth credential EXISTS at %s but is NOT readable by %s — a perms fault, NOT an expired token (the agent will fail token exchange with '"'"'Malformed auth code'"'"'; re-tapping the login changes nothing). Re-normalize perms as root: sudo 5dive agent restart %s\n' \
+      "$src" "$user" "$name"
+  fi
+  return 0
+}
+
 # Top-level seeding (root): builds the target store, seeds every resolved
 # source, rebuilds the index, and hands the whole tree to the agent user.
 seed_inherited_memory() {
@@ -2061,6 +2147,18 @@ cmd_create() {
   # auth: deferred login still pending, so the first turn will stall.
   if (( defer_auth )); then
     _hc_issues+=("auth was deferred (agent is UNAUTHED — can't think until you log in): sudo 5dive agent auth login $type${profile:+ --auth-profile=$profile}")
+  else
+    # DIVE-2025: a completed login used to be checked by NOTHING — not even an
+    # ok entry — so a credential that never reached the agent still printed
+    # "self-check PASS". Probe the credential itself, as the agent's own uid.
+    local _cred_line
+    while IFS= read -r _cred_line; do
+      [[ -n "$_cred_line" ]] || continue
+      case "$_cred_line" in
+        ok:*)    _hc_ok+=("${_cred_line#ok:}") ;;
+        issue:*) _hc_issues+=("${_cred_line#issue:}") ;;
+      esac
+    done < <(selfcheck_cred_reached_agent "$name" "$type" "$profile" "$byo_provider")
   fi
   if (( ${#_hc_issues[@]} == 0 )); then
     warn "self-check PASS for '$name' — reachable & autonomous (${_hc_ok[*]})."
