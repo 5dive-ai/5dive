@@ -270,8 +270,9 @@ g_bad=$(printf '%s\n' "$g_all" | _violations)
   && ok_t "G: EVERY status write against the answered row carries a status fence" \
   || bad_t "G: an UNFENCED status write against the answered row" "$(printf '%s' "$g_bad" | head -2)"
 # The exemption is GRADED, not silently skipped. The bounce arm reopens the
-# PREVIOUS step, and that step is ALWAYS done at the moment of a bounce — a
-# status fence there would not harden the bounce, it would delete it.
+# PREVIOUS step. DIVE-2261 separately preflights and refuses CANCELLED before
+# any answer write; a status fence at this later write would partially commit
+# the answer and silently omit the redo.
 [[ "$g_prev" -eq 1 ]] \
   && ok_t "G: the one cross-row write (\${_prev}, the bounce reopen) is a named exemption, not an oversight" \
   || bad_t "G: expected exactly 1 write against \${_prev}, found $g_prev" "a new cross-row write needs its own reasoning"

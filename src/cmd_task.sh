@@ -8535,7 +8535,33 @@ cmd_task_answer() {
   # land after the task closed. The refusal fires here rather than at the write
   # so the command is all-or-nothing: past this point the answer is already
   # recorded, and refusing there would leave a gate answered under a non-zero rc.
-  local _lk; _lk=$(_loop_kind "$id")
+  local _lk _loop_bounce=0 _run="" _prev="" _prev_status="" _prev_ident="" _lv=""
+  _lk=$(_loop_kind "$id")
+  if [[ "$_lk" == gate:* ]]; then
+    # Resolve the relay direction before any answer write.  A refusal below must
+    # leave the gate pending; discovering the cancelled predecessor after the
+    # answer was stamped would make a non-zero return lie about what committed.
+    _lv=$(printf '%s' "${value:-}" | tr '[:upper:]' '[:lower:]')
+    if [[ "$_lv" == *"better"* || "$_lv" == *"reject"* || "$_lv" == *"deny"* || "$_lv" == *"denied"* || "$_lv" == *"declin"* ]]; then
+      _loop_bounce=1
+      _run=$(db "SELECT COALESCE(parent_id,'') FROM tasks WHERE id=${id};")
+      _prev=$(db "SELECT id FROM tasks WHERE parent_id=${_run:-0} AND id<${id} AND body LIKE '%${_LOOP_MARK}:%' ORDER BY id DESC LIMIT 1;")
+      if [[ -n "$_prev" ]]; then
+        _prev_status=$(db "SELECT status FROM tasks WHERE id=${_prev};")
+        _prev_ident=$(db "SELECT ident FROM tasks WHERE id=${_prev};")
+      fi
+    fi
+  fi
+  # DIVE-2261: cancellation is an abandonment record, not completed work ready
+  # for another iteration.  Refuse conservatively instead of skipping farther
+  # back (which silently changes which work the human rejected) or resurrecting
+  # the cancelled row.  This is deliberately before every answer write, so both
+  # rows and their dependency graph remain untouched and the same gate can be
+  # answered after a human repairs the anomalous relay.
+  if (( _loop_bounce )) && [[ "$_prev_status" == "cancelled" ]]; then
+    policy_refuse "$E_CONFLICT" "task_loop_bounce_cancelled_previous" "DIVE-2261" "$ident" \
+      "$ident cannot bounce to previous loop step ${_prev_ident:-$_prev}: it is cancelled, so reopening it would resurrect deliberately abandoned work. The gate is still open; resolve the cancelled step or choose an advancing answer."
+  fi
   local _close_done=0
   if [[ "$nt" == "manual" && "$_lk" != gate:* ]]; then
     local _dv; _dv=$(printf '%s' "${value:-}" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')
@@ -9258,21 +9284,16 @@ cmd_task_answer() {
       # substring "deny", so it must be matched explicitly; missing it would let a
       # human's DENY silently ADVANCE the loop. Anything else (approve/approved)
       # advances.
-      local _lv; _lv=$(printf '%s' "${value:-}" | tr '[:upper:]' '[:lower:]')
-      if [[ "$_lv" == *"better"* || "$_lv" == *"reject"* || "$_lv" == *"deny"* || "$_lv" == *"denied"* || "$_lv" == *"declin"* ]]; then
-        local _run _prev
-        _run=$(db "SELECT COALESCE(parent_id,'') FROM tasks WHERE id=${id};")
-        _prev=$(db "SELECT id FROM tasks WHERE parent_id=${_run:-0} AND id<${id} AND body LIKE '%${_LOOP_MARK}:%' ORDER BY id DESC LIMIT 1;")
+      if (( _loop_bounce )); then
         if [[ -n "$_prev" ]]; then
           # DIVE-2228: the fence goes IN THE WHERE, matching the idiom the
           # else-branch above has always used, so a future write here either
           # copies its neighbours or looks visibly different from all of them.
           # THE ${_prev} WRITE IS DELIBERATELY NOT FENCED — it targets a
-          # DIFFERENT row, and reopening it is the whole point of a bounce: the
-          # previous step is ALWAYS done at that moment, so a status fence there
-          # would not harden the bounce, it would delete it. (A bounce onto a
-          # CANCELLED _prev would be wrong for a different reason; that is
-          # DIVE-552's semantics, unmeasured, and deliberately not changed here.)
+          # DIFFERENT row, and reopening completed work is the whole point of a
+          # bounce. DIVE-2261 preflights the exceptional CANCELLED state before
+          # any answer write; a WHERE status fence here would create a partial
+          # commit (answered gate, no redo) instead of an honest refusal.
           # tests/task_answer_closed_row_unit.sh enumerates these writes and
           # asserts the rule per target, so the exemption is graded, not assumed.
           db "INSERT OR IGNORE INTO task_deps (task_id, blocked_by) VALUES (${id}, ${_prev});
