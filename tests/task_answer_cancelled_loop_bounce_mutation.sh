@@ -15,10 +15,14 @@ trap 'rm -rf "$TMP"' EXIT
 mkdir -p "$TMP/tree"
 cp -r src "$TMP/tree/src"
 
+PASS=0; FAIL=0
+ok_t()  { PASS=$((PASS+1)); printf 'ok   - %s\n' "$1"; }
+bad_t() { FAIL=$((FAIL+1)); printf 'FAIL - %s\n       %s\n' "$1" "${2:-}"; }
+
 target="$TMP/tree/src/cmd_task.sh"
 old='  if (( _loop_bounce )) && [[ "$_prev_status" == "cancelled" ]]; then'
 new='  if false; then'
-OLD="$old" NEW="$new" F="$target" python3 - <<'PY'
+if OLD="$old" NEW="$new" F="$target" python3 - <<'PY'
 import os, sys
 p, old, new = os.environ["F"], os.environ["OLD"], os.environ["NEW"]
 s = open(p).read()
@@ -28,24 +32,25 @@ if n != 1:
     sys.exit(1)
 open(p, "w").write(s.replace(old, new))
 PY
-mut_rc=$?
-if [[ $mut_rc -ne 0 ]]; then
-  printf 'FAIL - mutation anchor applies exactly once\n'
-  exit 1
-fi
-if ! bash -n "$target"; then
-  printf 'FAIL - mutated source parses\n'
-  exit 1
+then
+  ok_t "mutation anchor applies exactly once"
+  if bash -n "$target"; then
+    ok_t "mutated source still parses"
+    out=$(DIVE2261_SRC_DIR="$TMP/tree/src" bash tests/task_answer_cancelled_loop_bounce_unit.sh 2>&1)
+    rc=$?
+    if [[ $rc -eq 0 ]]; then
+      bad_t "suite goes red after deleting the cancelled-step refusal" "$out"
+    elif grep -q '^FAIL - C1 cancelled previous step is refused' <<<"$out"; then
+      ok_t "landed source mutation kills the C1 refusal arm"
+    else
+      bad_t "mutant kills the named C1 refusal arm" "$out"
+    fi
+  else
+    bad_t "mutated source still parses" "the mutation produced a syntax error"
+  fi
+else
+  bad_t "mutation anchor applies exactly once" "the anchor is absent or duplicated"
 fi
 
-out=$(DIVE2261_SRC_DIR="$TMP/tree/src" bash tests/task_answer_cancelled_loop_bounce_unit.sh 2>&1)
-rc=$?
-if [[ $rc -eq 0 ]]; then
-  printf 'FAIL - suite stayed green after deleting the cancelled-step refusal\n%s\n' "$out"
-  exit 1
-fi
-if ! grep -q '^FAIL - C1 cancelled previous step is refused' <<<"$out"; then
-  printf 'FAIL - mutant failed, but not on the named refusal arm\n%s\n' "$out"
-  exit 1
-fi
-printf 'ok   - landed source mutation kills the C1 refusal arm\n'
+printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
+(( FAIL == 0 ))
