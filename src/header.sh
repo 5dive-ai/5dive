@@ -686,7 +686,12 @@ declare -A OPENCLAW_PROVIDER_URL=(
 # renamed upstream), the user can override via `5dive agent <name> tui`
 # and the agent CLI's own model picker.
 declare -A HERMES_PROVIDER_MODEL=(
-  [anthropic]="claude-sonnet-4-5"
+  # Both catalogs are PER-PROVIDER: grade a pin against its own provider's list,
+  # never against a grep of the whole catalog file. hermes' curated anthropic list
+  # (hermes_cli/models.py) carries claude-sonnet-5 and the DATED
+  # claude-sonnet-4-5-20250929, but not a bare claude-sonnet-4-5 — which does
+  # appear in that same file under `copilot` and `opencode-zen`. See DIVE-2607.
+  [anthropic]="claude-sonnet-5"
   [google]="gemini-2.0-flash"
   [deepseek]="deepseek-v4-pro"
   [moonshot]="kimi-k2-turbo-preview"
