@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased — feat(pack): export an agent as ONE AGENTS.md that codex and opencode read as-is (DIVE-2565)
+## v0.18.2 — feat(pack): export an agent as ONE AGENTS.md that codex and opencode read as-is (DIVE-2565)
 
 A tarball pack is a fine archive and a poor artefact: you cannot read it, diff it,
 paste it into a chat, or hand it to a harness that has never heard of 5dive. And
@@ -45,7 +45,7 @@ dropping them silently — a silent drop was the failure mode to avoid:
 The memory-section filename is read off an HTML-comment sentinel and becomes a path,
 so it is validated against `^[A-Za-z0-9._-]+\.md$` — a traversal name is dropped
 while clean facts in the same file still land.
-## Unreleased — feat(a2a): stamp `via=` when the claimed sender and the measured caller diverge (DIVE-2552)
+## v0.18.2 — feat(a2a): stamp `via=` when the claimed sender and the measured caller diverge (DIVE-2552)
 
 Every `[5dive-msg ...]` stamp site already held both values and never compared them:
 
@@ -92,7 +92,7 @@ directly with no EUID fallback, so its `via=` carries `tier=`'s existing depende
 than resolving. That is pre-existing behaviour on the tier field and this change neither
 worsens nor repairs it; `envelope_sender_fallback_unit` T6c pins it so it stays visible.
 
-## Unreleased — fix(push): resolve the App installation PER REPO, not from one pinned id (DIVE-2563)
+## v0.18.2 — fix(push): resolve the App installation PER REPO, not from one pinned id (DIVE-2563)
 
 `_push_do` minted every installation token against a single `GITHUB_APP_INSTALLATION_ID`
 read from `github-app.env`. A GitHub App gets a **separate installation per account**
@@ -128,7 +128,7 @@ be installed there; that is a human step, tracked separately.
 
 `tests/push_unit.sh` 89 → 92 arms.
 
-## Unreleased — fix(push): the workflow-scope probe fetched unauthenticated, so every private-repo push demanded `workflows:write` (DIVE-2547)
+## v0.18.2 — fix(push): the workflow-scope probe fetched unauthenticated, so every private-repo push demanded `workflows:write` (DIVE-2547)
 
 `_push_touches_workflows` decides whether a delegated push needs `workflows:write`
 on top of `contents:write`. It ranged the branch by running `git fetch <repourl>`
@@ -159,7 +159,7 @@ neither a live nor a cached bound resolves is the answer still `unknown`.
 branch, still catches a workflow-touching branch, and names its own staleness on
 stderr. The both-bounds-missing path still returns `unknown`.
 
-## Unreleased — feat(actor): `5dive whoami`, one sealed actor derivation (DIVE-2517)
+## v0.18.2 — feat(actor): `5dive whoami`, one sealed actor derivation (DIVE-2517)
 
 The CLI had **six** actor derivations and they disagreed. Only one failed closed;
 the rest resolved identity from something the caller can set — `--from` on argv,
@@ -180,7 +180,7 @@ verb wires it.
 printed with `rc=0` — that refusal is the point of the verb, and it is
 mutation-graded rather than asserted.
 
-## Unreleased — feat(task): merge-audit LABELS findings delivered-vs-cited, and never filters them (DIVE-1975)
+## v0.18.2 — feat(task): merge-audit LABELS findings delivered-vs-cited, and never filters them (DIVE-1975)
 
 DIVE-1965 taught the merge *gate* to tell "I shipped this PR" from "I am writing about this PR",
 and to skip the second. `task merge-audit` is the same predicate over the same data feeding a
@@ -210,7 +210,7 @@ differential on the same PR number in the same repo so a hardcoded label fails a
 Graded by mutation: always-cited, always-delivered, filter-cited-out, and drop-the-column each
 turn arms red.
 
-## Unreleased — feat(broker): generalize the capability broker and fold in delegated deploy (INST-5)
+## v0.18.2 — feat(broker): generalize the capability broker and fold in delegated deploy (INST-5)
 
 `5dive push` was our only brokered capability: a dangerous action an agent can take without ever
 holding a credential, gated on a cleared human/lead decision and executed atomically as root.
@@ -241,7 +241,7 @@ our projects at a repo it chose. The capability is a separate axis from `--can-p
 (`agent create --can-deploy`), because shipping a branch for review and shipping to production are
 different authorities.
 
-## Unreleased — fix(task): refuse a close that would REPLACE an already-closed row's result (DIVE-2464)
+## v0.18.2 — fix(task): refuse a close that would REPLACE an already-closed row's result (DIVE-2464)
 
 `5dive task done <id> --result=...` on a row that was already done overwrote the result column and
 said nothing about it — no warning, no refusal, no merge, exit 0. It happened on DIVE-2451: one
@@ -293,7 +293,7 @@ defect (prior result destroyed) reproduces there, and the idempotence and DIVE-4
 arms pass on both trees, which is what makes them regression guards rather than evidence for the
 fix.
 
-## Unreleased — fix(release-cut): move the nightly off the contended top-of-hour and poll for CI to settle (DIVE-2466)
+## v0.18.2 — fix(release-cut): move the nightly off the contended top-of-hour and poll for CI to settle (DIVE-2466)
 
 The nightly cut has never once run on time. `- cron: '0 3 * * *'` was byte-identical across all six
 revisions of this file, and the top of the hour is the slot GitHub documents as worst for
@@ -322,7 +322,7 @@ value falls back to the ceiling. `tests/release_cut_guards_unit.sh` grows from 2
 driving the extracted block with a stubbed fetch that returns a different board per look, plus a
 mutant that drops the re-read and must turn the in-flight-then-green arm red.
 
-## Unreleased — fix(release): the release page says WHAT shipped, and the tag stamps the CHANGELOG (DIVE-2452)
+## v0.18.2 — fix(release): the release page says WHAT shipped, and the tag stamps the CHANGELOG (DIVE-2452)
 
 Every release published a body describing how it was cut. v0.17.9 carried 256 characters of
 dispatch reason for 76 commits; v0.17.0 and v0.17.1 were the same shape. `gh release create` was
@@ -347,7 +347,7 @@ workflow body cannot be unit-tested. `tests/release_notes_unit.sh` covers them a
 throwaway repo (27 assertions), including the arm that matters: an underivable body exits 1
 rather than publishing the cut reason again.
 
-## Unreleased — feat(gh): route agent GitHub writes through the machine account (DIVE-2448)
+## v0.18.2 — feat(gh): route agent GitHub writes through the machine account (DIVE-2448)
 
 An agent `gh` write authenticated as the human account, so no field anywhere could tell an
 agent action from a human one — measured across the PR actor field, the org audit log and the
@@ -371,7 +371,7 @@ caller cannot talk the bot into an operation it must not perform. The sudoers gr
 existing `--can-push` builder capability. `tests/gh_actor_routing_unit.sh` covers the whole
 non-credential surface (62 assertions).
 
-## Unreleased — feat(task): CHANNEL PROOF of the human's answer clears a tier-2 gate, so a decision already made in chat is not re-entered as a button tap (DIVE-2412)
+## v0.18.2 — feat(task): CHANNEL PROOF of the human's answer clears a tier-2 gate, so a decision already made in chat is not re-entered as a button tap (DIVE-2412)
 
 DIVE-2382 fix #4, approved 2026-07-30 04:27. A tier-2 gate could be cleared by exactly two
 things: a per-gate nonce (the Telegram button) or a non-agent SUDO_UID (the dashboard exec).
@@ -461,7 +461,7 @@ Consumers are NOT wired yet and this ships inert until they are: the telegram pl
 pass `--channel-msg`, and the dashboard (DIVE-2371) is the second surface on the same rail.
 DIVE-2371's fail-closed prefix change must still land AFTER them, or the dashboard's tier-2
 clear goes offline with it.
-## Unreleased — fix(task): pronoun options resolve to an account frame (DIVE-2212)
+## v0.18.2 — fix(task): pronoun options resolve to an account frame (DIVE-2212)
 
 Two parties can no longer select the same second-person gate option and receive
 only a confirmation whose actor silently changes with the reader. `task need`
@@ -474,7 +474,7 @@ JSON callers receive the same mapping in `option_account_frame` while retaining
 the raw `need_answer`. `tests/gate_option_account_frame_unit.sh` reproduces the
 dev3-to-main incident, checks prose and JSON receipts, and guards word boundaries.
 
-## Unreleased — feat(ledger): one append-only lifecycle log with the authority envelope (INST-4, phase A)
+## v0.18.2 — feat(ledger): one append-only lifecycle log with the authority envelope (INST-4, phase A)
 
 We were already event-sourcing, in four separate append-only silos — `supervisor_events`,
 `objective_readings`, the council lineage, and the `_audit_append` log. Each is correct and each
@@ -504,7 +504,7 @@ silos still write only where they write today; folding them in is the next phase
 marker idempotency, the no-raw-payload property (mutation-graded), idempotency in both
 directions, and the never-fails-the-caller contract.
 
-## Unreleased — feat(task): displaced gates have a reader with an honest coverage boundary (DIVE-2133)
+## v0.18.2 — feat(task): displaced gates have a reader with an honest coverage boundary (DIVE-2133)
 
 `gate_history` stopped gate retirement from destroying the previous ask, answer and
 provenance, but nothing could read the table. `task show` now carries a compact previous-gate
@@ -521,7 +521,7 @@ say `0 recorded` and name the unknown earlier era. `tests/gate_history_unit.sh` 
 reader, both `task show` surfaces, secret redaction, complete-vs-partial zero, and the one-time
 migration stamp.
 
-## Unreleased — fix(up): a skill that FAILED to install is no longer summarised as `errors=0` (DIVE-2347)
+## v0.18.2 — fix(up): a skill that FAILED to install is no longer summarised as `errors=0` (DIVE-2347)
 
 `agent create` does not fail when a preseeded skill won't install, and that is the right
 call — the agent itself is up and a rerun fixes the skill. The consequence was not: the
@@ -549,7 +549,7 @@ exit code or scraping its render. Display only; it cannot fail a create.
 
 Not fixed here, and deliberately: the templates that request the missing skill. That is a
 separate call about what the templates should ask for — see DIVE-2347.
-## Unreleased — fix(doctor): a FAILED env-override report no longer reads as "no overrides set" (DIVE-2336)
+## v0.18.2 — fix(doctor): a FAILED env-override report no longer reads as "no overrides set" (DIVE-2336)
 
 Both consumers of `_env_overrides_json` wrapped it twice — `|| printf '{}'` and
 `[[ -n "$X" ]] || X='{}'` — so a hard failure rendered as `{}`: no process list, no
@@ -595,7 +595,7 @@ four original predictions wrong**: restoring either call-site coercion reds only
 unreachable defence-in-depth. That reachability is the finding, and it is why the structural
 arm is a grep rather than a run.
 
-## Unreleased — feat(doctor): REPORT the FIVE_* knobs in effect and configured (DIVE-2328/2327)
+## v0.18.2 — feat(doctor): REPORT the FIVE_* knobs in effect and configured (DIVE-2328/2327)
 
 `doctor` and `selfcheck` answer "what is true on this box". A product knob in effect is
 true on this box, and no surface said so. That silence is correct for an **intended** knob
@@ -658,7 +658,7 @@ parsed, so both branches died at the permission check; only the anchor went red)
 first run stopped mid-file with fifteen `ok`, no `FAIL` and **no summary**, because
 sourcing `src/header.sh` re-enables `errexit`.
 
-## Unreleased — fix(tests): harnesses no longer inherit the caller's product knobs (DIVE-2325)
+## v0.18.2 — fix(tests): harnesses no longer inherit the caller's product knobs (DIVE-2325)
 
 `task_core_unit` (28/7) and `task_verifier_rail_unit` (17/6) were red on the control-plane
 host and GREEN in CI at the same commit. It presented as host state — the DIVE-1919 class
@@ -709,7 +709,7 @@ export. A live environ reflects the env file as of that session's **last exec**,
 sweep measured RESTART ORDER, not configuration. Read the config source, not the running
 processes.
 
-## Unreleased — fix(gate): the merge gate stops reporting COULD-NOT-CHECK as NOT-MERGED (DIVE-2318)
+## v0.18.2 — fix(gate): the merge gate stops reporting COULD-NOT-CHECK as NOT-MERGED (DIVE-2318)
 
 `task done`'s merge gate makes four GitHub queries. Every one of them can come back
 empty for reasons that have nothing to do with the merge, and all four empties were
@@ -747,7 +747,7 @@ empty anyway. What changed is which cause the refusal names. `tests/task_merge_g
 pins both directions, with anchor arms on the accepting side so a guard that simply
 refused everything would go red.
 
-## Unreleased — fix(loop): a spend read that FAILED is NOT-REACHED, not zero — and no longer clobbers the running total (DIVE-2304)
+## v0.18.2 — fix(loop): a spend read that FAILED is NOT-REACHED, not zero — and no longer clobbers the running total (DIVE-2304)
 
 `_loop_refresh_spend` had three fail-open sites feeding one control decision: a missing
 `loop_runs` row returned `0`, a python recompute that exited non-zero returned `0` with its
@@ -778,7 +778,7 @@ arm is paired with a healthy arm on the same fixture, and the consumer arms driv
 `src/` the harness reds 13 and keeps 4 healthy arms green — including the clobber (60000 -> 0)
 and a `--wait` that ran to its deadline instead of halting.
 
-## Unreleased — fix(task): the tier-2 category floor stops reading `press` inside `suppression`, without dropping `$500` out of the un-appealable half (DIVE-2301)
+## v0.18.2 — fix(task): the tier-2 category floor stops reading `press` inside `suppression`, without dropping `$500` out of the un-appealable half (DIVE-2301)
 
 The floor terms were a bare alternation with no boundary, which made every one of them a
 SUBSTRING matcher. `press` fired on suppression, expression, compressed, impressive and
@@ -817,7 +817,7 @@ stripping the former erases the latter — is now asserted by a test instead of 
 `tests/gate_floor_word_boundary_unit.sh`: 32 arms, both halves graded on purpose so a later
 "fix" for the false positives cannot quietly break the true ones.
 
-## Unreleased — fix(tasks): the production task board refuses a write from a sourced-library caller, so a harness cannot leak fixture rows onto it (DIVE-2249)
+## v0.18.2 — fix(tasks): the production task board refuses a write from a sourced-library caller, so a harness cannot leak fixture rows onto it (DIVE-2249)
 
 On 2026-07-27 a run of `tests/gate_verifier_route_unit.sh` appended six fixture rows to the
 LIVE board — DIVE-501 through DIVE-506, `created_by=dev`, empty bodies, all inside a
@@ -872,7 +872,7 @@ one. A change to shared plumbing is graded by the corpus, not by the arm you wro
 RESIDUE, named rather than implied: this fences the shell library's writers. It does NOT
 fence a process that opens the .db with its own sqlite3 or node client — the dashboard API
 reads the board that way. Closing that needs file-level permissions, not a function guard.
-## Unreleased — fix(heartbeat): the dispatcher claims the task it nudges, so the whole stuck-work recovery layer stops reading a dead field (DIVE-2244)
+## v0.18.2 — fix(heartbeat): the dispatcher claims the task it nudges, so the whole stuck-work recovery layer stops reading a dead field (DIVE-2244)
 
 A fleet-stall alarm fired on a fleet that was not stalled. Root-causing it found something more
 expensive than the alarm — and re-measuring at implementation time corrected the diagnosis.
@@ -931,7 +931,7 @@ question instead of asserting the finding. Deliberately a language change and no
 change — requiring a conclusive probe to fire would fail open exactly when panes are
 uncapturable, which is when the fleet is most likely to be genuinely wedged.
 
-## Unreleased — fix(task): a failed open-instance read no longer forges a `last_skipped_at` suppression that never happened (DIVE-2273)
+## v0.18.2 — fix(task): a failed open-instance read no longer forges a `last_skipped_at` suppression that never happened (DIVE-2273)
 
 The recurring materializer decided whether an instance was already open with
 
@@ -960,7 +960,7 @@ belongs with `--on-overlap` (DIVE-2270 / DIVE-2272), and that ticket now has a p
 it: the failure must never reach the bound comparison, because the sentinel `1` is
 conservative against a boolean test and PERMISSIVE against a bound of 3, and the bound is
 spawn's safety valve computed from the very read it backstops.
-## Unreleased — fix(council): the veto principal is redacted where it is GENERATED, not per-file (DIVE-2278)
+## v0.18.2 — fix(council): the veto principal is redacted where it is GENERATED, not per-file (DIVE-2278)
 
 `council roster`, the `council init` summary and the veto-exercise line printed the veto
 principal verbatim. Seeded as `tg:<user_id>` — which is what a live install does — that put a
@@ -986,7 +986,7 @@ genesis/lineage/receipt bytes, which are immutable and publishable, and no displ
 reach them afterwards. `--veto=human:<agent>` reaches the same recipient with only a name in the
 seal.
 
-## Unreleased — feat(task): a gate can DECLARE that it needs a human, and stop being answered by whoever is grading the ticket (DIVE-2241)
+## v0.18.2 — feat(task): a gate can DECLARE that it needs a human, and stop being answered by whoever is grading the ticket (DIVE-2241)
 
 A gate filed on a task that carries a maker→verifier loop routes to the VERIFIER by kind
 (DIVE-1495), and that routing reads the task, never the ask. So "may I spend this" and "may
@@ -1020,7 +1020,7 @@ audited at file time, including when it resolved to nothing.
 Agent-held capabilities (`gh_push`, `root`, `delegated_push`) are explicitly NOT routable
 this way yet — they need a different source, not a longer wait.
 
-## Unreleased — fix(council): the founder veto has never been exercisable — the hold window had already closed on all six offers ever sent (DIVE-2257)
+## v0.18.2 — fix(council): the founder veto has never been exercisable — the hold window had already closed on all six offers ever sent (DIVE-2257)
 
 lodar forwarded two veto offers on 2026-07-28 and asked "why two? why no details?". Both
 questions had answers and both were defects. Measured against
@@ -1063,7 +1063,7 @@ Both omission and refusal are RECORDED, never printed: `council convene --json` 
 callers that capture `2>&1`, so a warn on stderr corrupts the envelope (caught by
 `council_capture_e2e.sh` during this build). Regenerated `cmd_council.sh` via gen_cmd.
 
-## Unreleased — fix(task): a recurring template that the scheduler SKIPPED now says so, instead of reading exactly like one it never reached (DIVE-2237)
+## v0.18.2 — fix(task): a recurring template that the scheduler SKIPPED now says so, instead of reading exactly like one it never reached (DIVE-2237)
 
 The materializer's skip-if-open dedup is right for a chore: don't pile up dailies when the
 assignee is behind. Two properties made it dangerous for anything that reports on the
@@ -1094,7 +1094,7 @@ separate call and deliberately not made here: Tuesday's recap is not satisfied b
 Wednesday's run, but changing the dedup is not needed to make a skip visible, and the two
 should not ride together.
 
-## Unreleased — fix(ask): a reply fence whose markers sit INLINE is now harvested, so a grok seat stops reading as a silent abstain (DIVE-2216)
+## v0.18.2 — fix(ask): a reply fence whose markers sit INLINE is now harvested, so a grok seat stops reading as a silent abstain (DIVE-2216)
 
 `agent ask` returned nothing from a grok seat that had answered correctly. Reproduced
 live on the released 0.16.32, twice, on the demo box's `creative` seat:
@@ -1141,7 +1141,7 @@ would mean recognising a right-margin clock — a per-harness chrome signature, 
 what DIVE-1901 refused to grow. The answer itself is intact and a ballot line survives,
 so the silent abstain is gone; a caller doing an exact string compare against a wrapped
 grok reply should expect it.
-## Unreleased — fix(heartbeat): an UNMEASURABLE tier no longer disables the privilege-escalation-by-queue guard (DIVE-2213)
+## v0.18.2 — fix(heartbeat): an UNMEASURABLE tier no longer disables the privilege-escalation-by-queue guard (DIVE-2213)
 
 Second instance of the DIVE-2210 shape, at a **decision** site rather than a display
 one. DIVE-1065 refuses to auto-drive a higher-tier agent from a lower-tier creator's
@@ -1198,7 +1198,7 @@ checked first — `origin/main` across 5dive-cli / api / app / plugins / mcp has
 consumer of that line other than the site emitting it, and the machine path is
 `--json`, which never carried it.
 
-## Unreleased — fix(a2a): the envelope's tier= field is now always stamped, with a reason when it cannot be measured (DIVE-2210)
+## v0.18.2 — fix(a2a): the envelope's tier= field is now always stamped, with a reason when it cannot be measured (DIVE-2210)
 
 `tier=` is the ONE unforgeable field in `[5dive-msg from=X id=Y tier=Z]`. `from=` is
 caller-supplied (`--from=`) and only format-validated, so `tier=` is the field that
@@ -1243,7 +1243,7 @@ tier ranks 0, and the guard is skipped entirely when either rank is 0) and
 `task show`'s `created_by_tier` display line. Both are filed separately; the first
 changes fleet-wide auto-run behaviour and needs its own verification.
 
-## Unreleased — feat(digest): a 30-day window, with the aggregates it does NOT scope named out loud (DIVE-1921)
+## v0.18.2 — feat(digest): a 30-day window, with the aggregates it does NOT scope named out loud (DIVE-1921)
 
 `digest` offered only `--7d`, so `proof scorecard` (specified as `[--7d|--30d]` in DIVE-1914)
 shipped 7d-only and refused `--30d` outright. The value is not the flag: a 7-day window is why
@@ -1271,7 +1271,7 @@ Widening is not uniform, so each aggregate was classified before it moved:
 all nine SQL spans and the token read derive from a single mapping, because a site left at 7 days
 would not render as a wrong window but as a plausible rate whose numerator and denominator were
 measured over different spans.
-## Unreleased — fix(heartbeat/task): a verifier who filed a human gate has ACTED, and neither verb may resolve that gate by side effect (DIVE-2196)
+## v0.18.2 — fix(heartbeat/task): a verifier who filed a human gate has ACTED, and neither verb may resolve that gate by side effect (DIVE-2196)
 
 The stall-sweep nagged a verifier who had already reviewed the work and escalated a policy
 question to a human. It selects delivered maker->verifier rows on `status NOT IN
@@ -1316,7 +1316,7 @@ closing it as delivered; the nag pushed one of those options on a schedule.
   for the other. The arm now runs on a live-gate/no-ACK row, which is DIVE-2146's shape today
   and the shape of every gate-blocked row already on the board.
 
-## Unreleased — fix(gate): a gate escalates from the agent that FILED it, not from whoever created the task (DIVE-1945)
+## v0.18.2 — fix(gate): a gate escalates from the agent that FILED it, not from whoever created the task (DIVE-1945)
 
 `task gate-escalate` derived the gate's filer as `COALESCE(created_by, assignee)`. Those agree
 only when the filer also created the task. When one agent files a gate on another's task the
@@ -1337,7 +1337,7 @@ that env var cannot reach it and the filer has to come off the row.
   olivia, main -> olivia) so the correct and the buggy reading deliver to DIFFERENT agents; the
   legacy no-stamp row is the non-vacuity control.
 
-## Unreleased — feat(comms): the terse rule now bounds HOW OFTEN you send, and covers agent-to-agent (DIVE-2191)
+## v0.18.2 — feat(comms): the terse rule now bounds HOW OFTEN you send, and covers agent-to-agent (DIVE-2191)
 
 DIVE-1613 ships a terse-comms fragment into every claude agent at create. Measured against one
 day of main's own traffic, it has two holes. It governs SHAPE, not VOLUME — main followed all six
@@ -1357,7 +1357,7 @@ larger bill by more than 2.2x — and it is the bill the customer pays.
   not the checking. Sending work to another agent to verify, and answering as the verifier, is the
   work — the fragment says so in the same breath, so no agent reads "send less" as "verify less".
 
-## Unreleased — feat(task): the tier-2 floor says WHY it fired, and a design decision can appeal it on the record instead of by rewording (DIVE-2089)
+## v0.18.2 — feat(task): the tier-2 floor says WHY it fired, and a design decision can appeal it on the record instead of by rewording (DIVE-2089)
 
 The T2 category floor reads SUBJECT MATTER as risk and picks the gate's audience from it. dev3
 filed a tier-1 sizing gate — "should an agent's right to act derive from the credentials it holds,
@@ -1479,7 +1479,7 @@ Regression: `tests/agent_home_teardown_unit.sh` (17 assertions), including the g
 keeps the recursive `chown`/`rm -rf` off any path that is not this agent's own conventional
 home, and off a symlink at that path.
 
-## Unreleased — fix(proof): the daily publisher no longer dies on its own log, and a successful tick finally says so (DIVE-2044)
+## v0.18.2 — fix(proof): the daily publisher no longer dies on its own log, and a successful tick finally says so (DIVE-2044)
 
 The public zero-human badge stopped publishing for 26 hours and every signal said the
 job was running. The publisher logic was never the problem.
@@ -1512,7 +1512,7 @@ DIVE-2042 window again). Its verdict now comes from the GitHub API ref, with raw
 as a labelled fallback and its disagreement written to the log rather than silently
 resolved in the CDN's favour.
 
-## Unreleased — fix(agent): typed sends REFUSE a credential/login pane, so an inter-agent message can no longer become the agent's API key (DIVE-2137, gh#214)
+## v0.18.2 — fix(agent): typed sends REFUSE a credential/login pane, so an inter-agent message can no longer become the agent's API key (DIVE-2137, gh#214)
 
 Reported by A-MO7SEN (gh#214), his fourth confirmed find.
 
@@ -1546,7 +1546,7 @@ failure is named at the moment it bites rather than at boot.
 
 Also fixes the seed unit test itself, which ran the shipped blocks in an environment where
 their own helpers were undefined — a mutation to the failure path left it green.
-## Unreleased — fix(agent): the sudo-grant measurement can finally see a PEER, via one privileged read (DIVE-2135)
+## v0.18.2 — fix(agent): the sudo-grant measurement can finally see a PEER, via one privileged read (DIVE-2135)
 
 DIVE-2079 and DIVE-2088 (below) replaced a stored label with a measurement. The measurement
 was caller-scoped: `/etc/sudoers.d` is `0700 root`, so a non-root caller could read only its
@@ -1576,7 +1576,7 @@ succeeds is discarded whole, so rows it could not cover never inherit rows it co
 New harness `tests/agent_sudo_fallback_unit.sh` (44 assertions), stubbed at the single
 privileged-exec seam so it grades this code rather than the sudo policy of whoever runs it.
 
-## Unreleased — fix(agent): `agent list` carries the measured sudo grant too, so the SURVEY surface stops reading as authoritative (DIVE-2088)
+## v0.18.2 — fix(agent): `agent list` carries the measured sudo grant too, so the SURVEY surface stops reading as authoritative (DIVE-2088)
 
 DIVE-2079 (below) fixed `agent info`, the per-agent drill-down. `agent list` was outside
 that ticket's scope and kept emitting `isolation` — the same unmeasured stored label — with
