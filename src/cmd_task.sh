@@ -77,7 +77,7 @@ _task_usage() {
   5dive task done|cancel ... [--keep-worktree]       # DIVE-1967: a close RECLAIMS node_modules from that task's worktrees (gitignored,
                                                      # 'npm ci'-regenerable -> structurally data-loss-free). --keep-worktree opts out.
                                                      # The worktree DIRECTORY is never deleted — it may hold unpushed commits.
-  5dive task done|cancel ... [--append-result]       # DIVE-2464: a close on an ALREADY-closed row that carries a result is REFUSED —
+  5dive task done|cancel|deliver ... [--append-result]  # DIVE-2464/DIVE-2476: a close, or a 'deliver --result=', on an ALREADY-closed row that carries a result is REFUSED —
                      [--force-result]                # it used to silently REPLACE it, and the ledger stores only a sha256, so the prior
                                                      # text was unrecoverable. --append-result keeps theirs verbatim and adds yours under
                                                      # it (the common case: two closers, one task). --force-result replaces (audited).
@@ -2048,6 +2048,58 @@ _gate_branch_ident_on_main() {
   printf 'bound:%s' "$walked"
 }
 
+# DIVE-2464 / DIVE-2476: the one guard standing between a `--result=` write and an
+# ALREADY-CLOSED row's recorded result. Extracted from `_task_status_cmd` so the
+# refusal text, the --append-result ordering and the --force-result audit row are
+# LITERALLY the same across every verb that writes the column, rather than a second
+# variant that drifts apart from it. DIVE-2476 is why it is a function: the rule
+# belongs to the COLUMN — whose ledger copy is a sha256, so a silent replace is
+# unrecoverable — and not to the verb, and `task deliver --result=` was destroying
+# the same value through the door next to the guarded one. Measured on origin/main
+# e935d82 AND on #357's tip, so pre-existing rather than a #357 regression.
+#
+# Callers decide WHEN to consult it (which verbs, and only when a result was
+# actually passed); it decides what happens. It is NOT safe to call inside a command
+# substitution: the refusal path ends in `fail`, which exits, and a subshell would
+# turn the refusal into a shrug the caller then writes straight past. So the
+# (possibly appended) text it wants written comes back in a global, not on stdout.
+#
+# args: <id> <ident> <verb> <result> [append_result] [force_result] [policy-slug]
+# out:  _TASK_GUARDED_RESULT — the text the caller must write from here on.
+_task_guard_result_over_closed() {
+  local id="$1" ident="$2" verb="$3" result="$4"
+  local append_result="${5:-0}" force_result="${6:-0}" policy="${7:-done-over-closed-result}"
+  _TASK_GUARDED_RESULT="$result"
+  local _cl_st _cl_prev
+  _cl_st=$(db "SELECT COALESCE(status,'') FROM tasks WHERE id=${id};")
+  if [[ "$_cl_st" == "done" || "$_cl_st" == "cancelled" ]]; then
+    _cl_prev=$(db "SELECT COALESCE(result,'') FROM tasks WHERE id=${id};")
+    if [[ -n "$_cl_prev" && "$_cl_prev" != "$result" ]]; then
+      if (( append_result )); then
+        # Prior text FIRST and untouched: the existing record is the one that
+        # must survive verbatim, and the addition is what is new.
+        result="${_cl_prev}"$'\n\n'"--- appended by a later close (DIVE-2464) ---"$'\n'"${result}"
+      elif (( force_result )); then
+        # The only lossy path, so it is the only one that leaves a row behind.
+        # The overwritten text goes in the audit args, not just its hash — the
+        # whole point of this ticket is that a hash is not a backup.
+        _task_store_audit_log "task.force-result-over-closed" ok 0 -- \
+          "$ident" "closed_status=$_cl_st" "overwritten_result=$_cl_prev"
+        warn "$ident: --force-result REPLACED the result recorded at close. The overwritten text is in the audit log (task.force-result-over-closed); the board copy is gone (DIVE-2464)."
+      else
+        local _cl_at _cl_asg _cl_vf _cl_mk
+        _cl_at=$(db  "SELECT COALESCE(done_at,'unknown')     FROM tasks WHERE id=${id};")
+        _cl_asg=$(db "SELECT COALESCE(assignee,'unassigned') FROM tasks WHERE id=${id};")
+        _cl_vf=$(db  "SELECT COALESCE(verifier,'')           FROM tasks WHERE id=${id};")
+        _cl_mk=$(db  "SELECT COALESCE(maker_agent,'')        FROM tasks WHERE id=${id};")
+        policy_refuse "$E_CONFLICT" "$policy" DIVE-2464 "$ident" \
+          "$ident is ALREADY ${_cl_st} (closed ${_cl_at}; assignee '${_cl_asg}'${_cl_vf:+, verifier '${_cl_vf}'}${_cl_mk:+, maker '${_cl_mk}'}) and carries a result — a bare '5dive task ${verb} --result=' here would REPLACE that record with no warning, and the ledger keeps only a sha256 of it, so it could not be restored (DIVE-2464). Run '5dive trace $ident' to see who wrote it. If you are ADDING your half of the work, say so: '5dive task ${verb} $ident --append-result --result=<your text>' (keeps theirs verbatim, adds yours under it). Only if the recorded text is genuinely WRONG: '--force-result' (replaces it, audited with the overwritten text)."
+      fi
+    fi
+  fi
+  _TASK_GUARDED_RESULT="$result"
+}
+
 _task_status_cmd() {
   local newstatus="$1" extra="$2" verb="$3"; shift 3
   tasks_db_init
@@ -2290,8 +2342,14 @@ _task_status_cmd() {
   # block correctly stays silent. Ordering alone does not reach it.
   #
   # NOT FIXED HERE, named so none of it is mistaken for covered:
-  #   * `task deliver --result=` clobbers a closed row the same way (main's probe
-  #     P4, filed as DIVE-2476);
+  #   * (CLOSED by DIVE-2476: `task deliver --result=` clobbered a closed row the
+  #     same way — main's probe P4. It now consults the SAME guard, extracted above,
+  #     and consults it BEFORE it stamps delivery_ref. Still open on that verb, and
+  #     measured: a BARE `task deliver` with no --result= re-stamps delivery_ref and
+  #     delivered_at on a closed row, and on a closed row carrying a distinct
+  #     verifier it still ROUTES — resurrecting it to 'todo' — the shape DIVE-2464
+  #     iter 2 excluded on the `task done` rail only. Both live in the no-result
+  #     population this guard is blind to by construction, so neither is covered.)
   #   * `_task_route_to_verifier` still writes unconditionally over an OPEN row's
   #     existing result — a different population than this ticket measured;
   #   * a BARE re-close still REFRESHES done_at (both close verbs pass
@@ -2316,33 +2374,8 @@ _task_status_cmd() {
   # actor lives in the audit trail, so the message sends the reader to `5dive
   # trace` for it rather than implying the row knows.
   if [[ "$verb" == "done" || "$verb" == "cancel" ]] && (( want_result )); then
-    local _cl_st _cl_prev
-    _cl_st=$(db "SELECT COALESCE(status,'') FROM tasks WHERE id=${id};")
-    if [[ "$_cl_st" == "done" || "$_cl_st" == "cancelled" ]]; then
-      _cl_prev=$(db "SELECT COALESCE(result,'') FROM tasks WHERE id=${id};")
-      if [[ -n "$_cl_prev" && "$_cl_prev" != "$result" ]]; then
-        if (( append_result )); then
-          # Prior text FIRST and untouched: the existing record is the one that
-          # must survive verbatim, and the addition is what is new.
-          result="${_cl_prev}"$'\n\n'"--- appended by a later close (DIVE-2464) ---"$'\n'"${result}"
-        elif (( force_result )); then
-          # The only lossy path, so it is the only one that leaves a row behind.
-          # The overwritten text goes in the audit args, not just its hash — the
-          # whole point of this ticket is that a hash is not a backup.
-          _task_store_audit_log "task.force-result-over-closed" ok 0 -- \
-            "$ident" "closed_status=$_cl_st" "overwritten_result=$_cl_prev"
-          warn "$ident: --force-result REPLACED the result recorded at close. The overwritten text is in the audit log (task.force-result-over-closed); the board copy is gone (DIVE-2464)."
-        else
-          local _cl_at _cl_asg _cl_vf _cl_mk
-          _cl_at=$(db  "SELECT COALESCE(done_at,'unknown')     FROM tasks WHERE id=${id};")
-          _cl_asg=$(db "SELECT COALESCE(assignee,'unassigned') FROM tasks WHERE id=${id};")
-          _cl_vf=$(db  "SELECT COALESCE(verifier,'')           FROM tasks WHERE id=${id};")
-          _cl_mk=$(db  "SELECT COALESCE(maker_agent,'')        FROM tasks WHERE id=${id};")
-          policy_refuse "$E_CONFLICT" done-over-closed-result DIVE-2464 "$ident" \
-            "$ident is ALREADY ${_cl_st} (closed ${_cl_at}; assignee '${_cl_asg}'${_cl_vf:+, verifier '${_cl_vf}'}${_cl_mk:+, maker '${_cl_mk}'}) and carries a result — a bare '5dive task ${verb} --result=' here would REPLACE that record with no warning, and the ledger keeps only a sha256 of it, so it could not be restored (DIVE-2464). Run '5dive trace $ident' to see who wrote it. If you are ADDING your half of the work, say so: '5dive task ${verb} $ident --append-result --result=<your text>' (keeps theirs verbatim, adds yours under it). Only if the recorded text is genuinely WRONG: '--force-result' (replaces it, audited with the overwritten text)."
-        fi
-      fi
-    fi
+    _task_guard_result_over_closed "$id" "$ident" "$verb" "$result" "$append_result" "$force_result"
+    result="$_TASK_GUARDED_RESULT"
   fi
   # DIVE-477: maker→verifier routing. A `task done` on a task that carries a
   # `verifier` distinct from its current assignee is NOT a close — it's a handoff.
@@ -3135,22 +3168,37 @@ cmd_task_cancel() { _task_status_cmd cancelled ", done_at=COALESCE(done_at, date
 cmd_task_deliver() {
   tasks_db_init
   local task="" pr="" result="" want_result=0
+  local append_result=0 force_result=0   # DIVE-2476: the two sanctioned answers to the
+                                         # already-closed-row refusal, spelled exactly
+                                         # as `task done|cancel` spells them.
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      --pr=*)      pr="${1#*=}" ;;
-      --result=*)  result="${1#*=}"; want_result=1 ;;
-      -*)          fail "$E_USAGE" "unknown flag: $1" ;;
-      *)           [[ -z "$task" ]] && task="$1" || fail "$E_USAGE" "unexpected arg: $1" ;;
+      --pr=*)          pr="${1#*=}" ;;
+      --result=*)      result="${1#*=}"; want_result=1 ;;
+      --append-result) append_result=1 ;;
+      --force-result)  force_result=1 ;;
+      -*)              fail "$E_USAGE" "unknown flag: $1" ;;
+      *)               [[ -z "$task" ]] && task="$1" || fail "$E_USAGE" "unexpected arg: $1" ;;
     esac
     shift
   done
-  [[ -n "$task" ]] || fail "$E_USAGE" "usage: 5dive task deliver <id|DIVE-N> --pr=<url> [--result=<text>]"
+  [[ -n "$task" ]] || fail "$E_USAGE" "usage: 5dive task deliver <id|DIVE-N> --pr=<url> [--result=<text>] [--append-result|--force-result]"
   [[ -n "$pr" ]]   || fail "$E_USAGE" "task deliver requires --pr=<url> (the PR that delivers this task; done stays blocked until it is MERGED — DIVE-1830)"
   # Basic sanity: a delivery ref must look like a PR URL, not a bare word.
   if [[ "$pr" != http*://* && "$pr" != *github.com* ]]; then
     fail "$E_VALIDATION" "--pr must be a URL (e.g. https://github.com/<org>/<repo>/pull/<n>) — got '$pr'"
   fi
   resolve_task_id "$task"; local id="$RESOLVED_TASK_ID" ident="$RESOLVED_TASK_IDENT"
+  # DIVE-2476: consult the shared already-closed-row guard BEFORE anything is
+  # written. The ordering IS the fix and not a detail — the delivery stamp on the
+  # next line lands on a closed row too, so a refusal that fired after it would
+  # leave delivery_ref/delivered_at rewritten on the very row it just declined to
+  # touch. It sits above the routed/not-routed fork, so both deliver rails reach it.
+  if (( want_result )); then
+    _task_guard_result_over_closed "$id" "$ident" deliver "$result" \
+      "$append_result" "$force_result" deliver-over-closed-result
+    result="$_TASK_GUARDED_RESULT"
+  fi
   # Record the delivery ref + timestamp before the handoff, so the merge-gate can
   # see it regardless of where the task lands next.
   db "UPDATE tasks SET delivery_ref=$(sqlq "$pr"), delivered_at=datetime('now') WHERE id=${id};"

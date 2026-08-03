@@ -1,5 +1,33 @@
 # Changelog
 
+## Unreleased — fix(task): `task deliver --result=` destroyed a closed row's result too (DIVE-2476)
+
+DIVE-2464 guarded `task done|cancel`. It did not guard the verb next door. `cmd_task_deliver` ended
+in an unconditional `UPDATE tasks SET result=` with no status check anywhere in the function, so
+`5dive task deliver <id> --pr=... --result=<text>` on an already done or cancelled row replaced the
+recorded result the same silent way, exit 0 — and stamped `delivery_ref`/`delivered_at` over that
+closed row on the line above. Found by main while reviewing DIVE-2464's PR and measured on both
+trees (origin/main `e935d82` and that PR's tip), so it was pre-existing rather than a regression.
+
+The reason it is a real second hole and not a tidy-up: what makes the clobber unrecoverable is that
+the ledger keeps a sha256 of the result and not the text, and that property belongs to the *column*,
+not to the verb that writes it. Guarding one writer leaves the value exactly as destroyable through
+the others.
+
+So the fix is one guard, not a second variant of it: the DIVE-2464 block is now the shared
+`_task_guard_result_over_closed`, and `task deliver` consults it — same refusal text, same
+`--append-result` ordering (prior text verbatim and first), same audited `--force-result` escape,
+which `deliver` now accepts as well. A reader who learns the rule from one verb is not surprised by
+another. It is consulted *before* the delivery stamp, so a refused delivery leaves no
+`delivery_ref` behind, and it sits above the routed/unrouted fork, so it also covers the shape that
+hands off through `_task_route_to_verifier` — which additionally sets `status='todo'` and would have
+resurrected the closed row on top of destroying its record.
+
+Still open on `deliver`, named in the source rather than implied to be covered: a *bare* `task
+deliver` with no `--result=` re-stamps `delivery_ref`/`delivered_at` on a closed row, and on a
+closed row with a distinct verifier it still routes. Both are the no-result population this guard
+cannot see.
+
 ## Unreleased — fix(digest): a completion was credited to whoever OWNED the row at close, which on a graded row is the verifier (DIVE-2556)
 
 On a maker/verifier loop the row's `assignee` moves to the verifier at delivery,
