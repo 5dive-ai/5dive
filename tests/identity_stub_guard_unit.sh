@@ -30,11 +30,13 @@
 # never needed would leave A3 passing vacuously. See
 # community/wiki/a-consistency-check-cannot-see-a-substitution-that-rewrote-both-sides.md
 #
-# COST: 6.0s measured on the dev3 worktree (5dive-cli-wt-2601, agent-dev3). A7/A8
-# mutate and re-scan 51 real harnesses and that is nearly all of it. Stays `core`
-# deliberately: the class this catches is silent by construction — a green arm that
-# grades nothing looks exactly like a green arm that grades something — and 6s
-# against a 300s per-job budget is not the line item worth demoting.
+# COST: 9.6s measured on the dev3 worktree (5dive-cli-wt-2601, agent-dev3; three runs
+# 9.22/9.56/9.61). Up from well under a second: A7/A8 mutate and re-scan 51 real
+# harnesses, and the three construct-anchored predicates run an awk per file across
+# four passes over tests/. Stays `core` deliberately — the class this catches is
+# silent by construction (a green arm that grades nothing looks exactly like a green
+# arm that grades something) and 10s against a 300s per-job budget is not the line
+# item worth demoting. If the tier gets tight, A7's 43 mutants are the knob.
 
 set -u
 # shellcheck source=/dev/null
@@ -138,6 +140,27 @@ _asserts_resolver() {
   ' "$1"
 }
 
+# _pins_seams <file> — is this file in population B (it pins the identity seams)?
+#
+# THE THIRD INSTANCE OF THE SAME SHAPE, closed here rather than at iteration 5. The
+# `_gate_(caller_uid|passwd_stream)\(\)` half was always anchored — a function
+# DEFINITION at line start is not something prose produces. The `actor_seam_as` half
+# was a bare token, so a file that merely NAMED the seam in a comment would enrol in
+# population B, and worse: for a file that also stubs `id -un`, a prose `pins=1`
+# SUPPRESSES rule (1)'s "stubs `id -un` but never pins" violation. Audited on the
+# corpus 2026-08-03: all ~150 occurrences in tests/*.sh are real calls, so there is no
+# victim today — this is the shape being closed, not a live defect. A2g is the
+# fixture; the guard's own line 353 census listing uses this same function so the two
+# cannot drift.
+_pins_seams() {
+  grep -qE '^[[:space:]]*_gate_(caller_uid|passwd_stream)\(\)' "$1" && return 0
+  awk '
+    /^[[:space:]]*#/ { next }
+    /(^|\$\(|`|[;&|({])[[:space:]]*actor_seam_as([[:space:]]|$)/ { f=1 }
+    END { exit !f }
+  ' "$1"
+}
+
 _scan_identity_stubs() {
   local dir="$1" f base claims_id pins
   for f in "$dir"/*.sh; do
@@ -155,7 +178,7 @@ _scan_identity_stubs() {
             || grep -qzE 'id\(\)[[:space:]]*\{[^}]*\-un' "$f"; }; then claims_id=1; fi
     # Population B — pins the seams the derivation actually reads.
     pins=0
-    grep -qE '^[[:space:]]*_gate_(caller_uid|passwd_stream)\(\)|actor_seam_as' "$f" && pins=1
+    _pins_seams "$f" && pins=1
 
     (( claims_id || pins )) || continue
 
@@ -193,7 +216,7 @@ _census() {
     if grep -qE '^[[:space:]]*id\(\)' "$f" \
        && { grep -qE '^[[:space:]]*id\(\).*\-un' "$f" \
             || grep -qzE 'id\(\)[[:space:]]*\{[^}]*\-un' "$f"; }; then a=$((a+1)); fi
-    grep -qE '^[[:space:]]*_gate_(caller_uid|passwd_stream)\(\)|actor_seam_as' "$f" && b=$((b+1))
+    _pins_seams "$f" && b=$((b+1))
   done
   printf '%s %s' "$a" "$b"
 }
@@ -298,6 +321,21 @@ got="$(_scan_identity_stubs "$TMP")"
   && ok_t "A2f rule (2) is not satisfied by a comment naming the resolver" \
   || bad_t "A2f prose does not satisfy rule (2)" "scan returned '${got:-<nothing>}' — a file that never calls the resolver passes for mentioning it"
 
+# ── A2g the POPULATION predicate may not be satisfied by prose either ────────
+# Third instance of the shape. A prose `actor_seam_as` used to set pins=1, which
+# SUPPRESSES rule (1) — so naming the seam in a comment bought a file an exemption
+# from the rule that it pin the seam. This fixture stubs `id -un`, mentions the seam
+# only in a comment, and pins nothing: it must be flagged as UNPINNED, not enrolled.
+cat > "$TMP/violator_unit.sh" <<'EOF'
+FAKE_CALLER="root"
+# this file used to impersonate via actor_seam_as before someone deleted the call
+id() { if [[ "${1:-}" == -un ]]; then echo "$FAKE_CALLER"; else command id "$@"; fi; }
+EOF
+got="$(_scan_identity_stubs "$TMP")"
+[[ "$got" == *"never pins _gate_caller_uid"* ]] \
+  && ok_t "A2g a prose mention of actor_seam_as does not enrol a file as pinned" \
+  || bad_t "A2g prose does not satisfy the population predicate" "scan returned '${got:-<nothing>}' — naming the seam in a comment exempts a file from having to pin it"
+
 # ── A3 self-exclusion actually works, and is load-bearing ────────────────────
 # This file necessarily contains the pattern it hunts for. The pair below is what
 # makes the skip observable: IDENTICAL BYTES, one under this file's basename and
@@ -350,8 +388,7 @@ read -r CA CB < <(_census tests)
 printf '     census: population A (stubs `id -un`) = %s, population B (pins the seams) = %s, allowlisted = %s\n' \
   "$CA" "$CB" "${#ALLOW[@]}"
 printf '     graded population B:\n'
-grep -lE '^[[:space:]]*_gate_(caller_uid|passwd_stream)\(\)|actor_seam_as' tests/*.sh \
-  | xargs -r -n1 basename | sort | sed 's/^/       /'
+for f in tests/*.sh; do _pins_seams "$f" && basename "$f"; done | sort | sed 's/^/       /'
 (( CB >= 20 )) \
   && ok_t "A6 the guard's population is non-trivial and named (B=$CB files pinning the seams)" \
   || bad_t "A6 population is non-trivial" "only $CB file(s) matched the pin predicate — either the corpus changed shape or the predicate stopped matching, and a guard grading nothing reports the same clean corpus as a guard grading everything"
@@ -382,7 +419,7 @@ a7_n=0; a7_prose=0; a7_missed=()
 for f in tests/*.sh; do
   base="$(basename "$f")"
   [[ "$base" == "$SELF" || -n "${ALLOW[$base]:-}" ]] && continue
-  grep -qE '^[[:space:]]*_gate_(caller_uid|passwd_stream)\(\)|actor_seam_as' "$f" || continue
+  _pins_seams "$f" || continue
   _sources_actor "$f" || continue                       # only files that currently PASS rule (0)
   got="$(_mutate_and_scan "$base" "$DROP_ACTOR")"
   grep -qE 'lib/actor\.sh' "$TMP/$base" && a7_prose=$((a7_prose+1))
