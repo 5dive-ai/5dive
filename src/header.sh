@@ -686,7 +686,15 @@ declare -A OPENCLAW_PROVIDER_URL=(
 # renamed upstream), the user can override via `5dive agent <name> tui`
 # and the agent CLI's own model picker.
 declare -A HERMES_PROVIDER_MODEL=(
-  [anthropic]="claude-sonnet-4-5"
+  # Both catalogs are PER-PROVIDER, and so is the SPELLING: grade a pin against
+  # its own provider's list, never against a grep of the whole catalog file.
+  # hermes' curated anthropic list (hermes_cli/models.py) carries claude-sonnet-5
+  # and the DATED claude-sonnet-4-5-20250929, but no bare claude-sonnet-4-5.
+  # That bare id does appear in the same file, DASHED under `opencode-zen` and
+  # `novita`, and DOTTED as claude-sonnet-4.5 under `copilot` and `novita`.
+  # So a grep is blind twice over: wrong provider, and wrong spelling of the
+  # same model. See DIVE-2607.
+  [anthropic]="claude-sonnet-5"
   [google]="gemini-2.0-flash"
   [deepseek]="deepseek-v4-pro"
   [moonshot]="kimi-k2-turbo-preview"
@@ -694,7 +702,7 @@ declare -A HERMES_PROVIDER_MODEL=(
 )
 declare -A OPENCLAW_PROVIDER_MODEL=(
   [openai]="openai/gpt-4o"
-  [anthropic]="anthropic/claude-sonnet-4-5"
+  [anthropic]="anthropic/claude-sonnet-5"
   [google]="google/gemini-2.0-flash"
   [deepseek]="deepseek/deepseek-v4-pro"
   [moonshot]="moonshot/kimi-k2-instruct"
