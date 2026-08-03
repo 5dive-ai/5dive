@@ -66,8 +66,15 @@ _human_nonce_mint() { printf '%s' "$KNOWN_NONCE"; }
 # whether the immediate (pre-sudo) caller is an agent (the forge) or not (human/box).
 FAKE_NONAGENT=1   # 1 = non-agent (human), 0 = agent (forge)
 _gate_sudo_uid_nonagent() { [[ "$FAKE_NONAGENT" == "1" ]]; }
-# Keep `id -un` a non-agent so the DIVE-394 caller-uid block never masks the result.
-id() { if [[ "${1:-}" == -un ]]; then echo "root"; else command id "$@"; fi; }
+# Keep the CALLER a non-agent so the DIVE-394 caller-uid block never masks the
+# result. DIVE-2601: this was an `id -un` stub, which the derivation has not read
+# since DIVE-2330 — measured at ZERO calls here, so the caller's agent-ness was
+# decided by whoever ran the suite. uid 0 is root everywhere and no agent claims it.
+_PIN_UID=0
+_gate_caller_uid() { printf '%s' "$_PIN_UID"; }
+_pin_check="$(_gate_uid_to_agent "$(_gate_caller_uid)")"
+[[ -z "$_pin_check" ]] \
+  || { printf 'NOT OK - identity pin is inert: uid %s resolved to agent %s, expected a NON-agent caller\n' "$_PIN_UID" "'$_pin_check'"; exit 1; }
 
 seed()    { db "INSERT INTO tasks (ident, title, status, created_by) VALUES ('$1','t','todo','main');"; }
 answered(){ db "SELECT CASE WHEN need_answered_at IS NULL THEN 'open' ELSE 'closed' END FROM tasks WHERE ident='$1';"; }
