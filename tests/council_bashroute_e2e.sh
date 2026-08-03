@@ -12,7 +12,7 @@
 # It builds a throwaway ./5dive to a temp dir (build.sh is pure-bash + fast, honours BUILD_OUT) so
 # it GATES in CI too (CI never builds ./5dive, and no root/sudo/seal is needed — these verbs are
 # pure). SKIPs green only when node/jq/openssl are missing or the build fails. Exit 0 == green.
-set -u
+set -uo pipefail
 
 # DIVE-2211: name the tree this harness grades (tests/lib/grading_tree.sh).
 # Three-state: if the helper is unreachable (a staged copy that did not carry

@@ -6,7 +6,7 @@
 # revert to built-in defaults after upgrading to a post-rename build. Exercises the BUILT binary via
 # `constitution show --json` (the READ verb resolves the path the same way every reader does).
 # SKIPs green when node/jq missing or the build fails. Exit 0 == green.
-set -u
+set -uo pipefail
 
 # DIVE-2211: name the tree this harness grades (tests/lib/grading_tree.sh).
 # Three-state: if the helper is unreachable (a staged copy that did not carry

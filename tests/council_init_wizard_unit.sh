@@ -4,7 +4,7 @@
 # SAME contract the non-interactive seal path already consumes. Drives the wizard
 # over piped stdin (its dumb-terminal numbered branch), so it gates in CI with no
 # TTY, no root, and no gate-proof key. Exit 0 == green.
-set -u
+set -uo pipefail
 
 # DIVE-2211: name the tree this harness grades (tests/lib/grading_tree.sh).
 # Three-state: if the helper is unreachable (a staged copy that did not carry
