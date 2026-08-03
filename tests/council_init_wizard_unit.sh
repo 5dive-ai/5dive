@@ -5,6 +5,7 @@
 # over piped stdin (its dumb-terminal numbered branch), so it gates in CI with no
 # TTY, no root, and no gate-proof key. Exit 0 == green.
 set -uo pipefail
+trap 'rc=$?; rm -rf "${TMP:-}"; echo "HARNESS-RC=$rc"' EXIT   # DIVE-2573: fires on every exit path (incl. SKIP/precondition-fail early-exits); folds in tempdir cleanup so the two EXIT traps don't clobber each other.
 
 # DIVE-2211: name the tree this harness grades (tests/lib/grading_tree.sh).
 # Three-state: if the helper is unreachable (a staged copy that did not carry
@@ -22,7 +23,7 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 # Stub the two council seams the wizard leans on so the test needs no live state:
 #   · _council_resolve_principal — resolve human:main / tg:<id>, refuse the rest
 #   · _council_constitution_path — point at a scratch file we control
-TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
+TMP="$(mktemp -d)"
 export STATE_DIR="$TMP"          # the template derives COUNCIL_* paths from this at source time
 source "$ROOT/src/cmd_init.sh"
 # shellcheck disable=SC1090
@@ -124,4 +125,5 @@ chk "E missing custom const aborts" "yes" "$([ "$?" -ne 0 ] && echo yes || echo 
 
 echo
 echo "DIVE-1861 council init wizard unit: $P passed, $F failed"
-[ "$F" -eq 0 ] || exit 1
+rc=0; [ "$F" -eq 0 ] || rc=1
+exit "$rc"

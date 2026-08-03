@@ -9,6 +9,7 @@
 # for the fleet (agent list / task add / task show / agent ask). SKIPs green when node/jq are
 # missing or the build fails. Exit 0 == green.
 set -uo pipefail
+trap 'rc=$?; rm -rf "${TMP:-}"; echo "HARNESS-RC=$rc"' EXIT   # DIVE-2573: fires on every exit path (incl. SKIP/precondition-fail early-exits); folds in tempdir cleanup so the two EXIT traps don't clobber each other.
 
 # DIVE-2211: name the tree this harness grades (tests/lib/grading_tree.sh).
 # Three-state: if the helper is unreachable (a staged copy that did not carry
@@ -25,7 +26,7 @@ for b in node jq; do
   command -v "$b" >/dev/null 2>&1 || { echo "SKIP: $b not on PATH (council ballot e2e needs it)"; exit 0; }
 done
 
-TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
+TMP="$(mktemp -d)"
 FIVE="$TMP/5dive"
 if ! BUILD_OUT="$FIVE" bash "$ROOT/build.sh" >/dev/null 2>&1 || [[ ! -x "$FIVE" ]]; then
   echo "SKIP: could not build a throwaway ./5dive (build.sh failed)"; exit 0
@@ -80,4 +81,5 @@ if grep -q "^agent ask" "$FLOG"; then chk "--ask-rail uses the agent-ask rail" "
 if grep -q "^task add" "$FLOG"; then chk "--ask-rail does NOT mint a ballot task" "no" "yes"; else chk "--ask-rail does NOT mint a ballot task" "no" "no"; fi
 
 echo "CNCL-18 ballot E2E: $P passed, $F failed"
-[ "$F" -eq 0 ]
+rc=0; [ "$F" -eq 0 ] || rc=1
+exit "$rc"

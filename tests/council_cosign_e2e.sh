@@ -3,6 +3,7 @@
 # REAL on-disk Ed25519 keys and proves: keys are 0600 owner-only, the honest path verifies green,
 # and forged / cross-convene-replay / revoked-key votes are all rejected (non-zero exit). Exit 0 == green.
 set -uo pipefail
+trap 'rc=$?; rm -rf "${TMP:-}"; echo "HARNESS-RC=$rc"' EXIT   # DIVE-2573: fires on every exit path (incl. SKIP/precondition-fail early-exits); folds in tempdir cleanup so the two EXIT traps don't clobber each other.
 
 # DIVE-2211: name the tree this harness grades (tests/lib/grading_tree.sh).
 # Three-state: if the helper is unreachable (a staged copy that did not carry
@@ -16,7 +17,7 @@ set -uo pipefail
   || printf 'grading tree: UNRESOLVED (tests/lib/grading_tree.sh not reachable; no tree named)\n' >&2
 ENGINE="$(cd "$(dirname "$0")/.." && pwd)/src/council/engine.mjs"
 CLI="$(cd "$(dirname "$0")/.." && pwd)/src/council/cli.mjs"
-TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
+TMP="$(mktemp -d)"
 P=0; F=0
 chk(){ if [ "$2" = "$3" ]; then P=$((P+1)); else F=$((F+1)); echo "FAIL: $1 (want=$2 got=$3)"; fi; }
 
@@ -61,4 +62,5 @@ node "$CLI" verify-votes --votes="$VOTES" --roster="$REVROSTER" --convene="$CV" 
 chk "revoked-key vote rejected (exit 5)" "5" "$?"
 
 echo "CNCL-10 co-sign E2E: $P passed, $F failed"
-[ "$F" -eq 0 ]
+rc=0; [ "$F" -eq 0 ] || rc=1
+exit "$rc"
