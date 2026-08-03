@@ -694,7 +694,7 @@ declare -A HERMES_PROVIDER_MODEL=(
 )
 declare -A OPENCLAW_PROVIDER_MODEL=(
   [openai]="openai/gpt-4o"
-  [anthropic]="anthropic/claude-sonnet-4-5"
+  [anthropic]="anthropic/claude-sonnet-5"
   [google]="google/gemini-2.0-flash"
   [deepseek]="deepseek/deepseek-v4-pro"
   [moonshot]="moonshot/kimi-k2-instruct"
