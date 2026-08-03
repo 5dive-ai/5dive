@@ -222,17 +222,26 @@ out=$(cmd_task_answer DIVE-305 --value=approved --human 2>&1); rc=$?
   && ok_t "E3b bare --human from an agent (the DIVE-2131 forge) is REFUSED on the same gate" \
   || bad_t "E3b forge refused" "rc=$rc state=$(answered DIVE-305) out=$out"
 
-# --- E4: rollout safety — enforcement OFF => the floor (and thus the escalation) is
-#     dormant; a routed tier-2 manual gate is cleared by its lead directly (DIVE-1182). -
+# --- E4: DIVE-2588 — enforcement OFF IS NO LONGER A DOWNGRADE PATH. This arm used
+#     to assert that clearing the flag made the floor (and this escalation) dormant,
+#     so a routed tier-2 manual gate fell to a direct lead clear. That dormancy is
+#     what the DIVE-2588 bypass bought with one env var, and the tier-2 floor no
+#     longer consults the flag at all. With it OFF the box now behaves exactly as it
+#     does with it ON — which, since the rollout completed 2026-07-30, is what every
+#     live box was already doing. Same assertions as E1, deliberately: the claim is
+#     that the two are INDISTINGUISHABLE, so they must be graded the same way.
 rm -f "$GATE_PROOF_ENFORCE"
 seed_task DIVE-304
 cmd_task_need DIVE-304 --type=manual --ask="run the physical box swap" >/dev/null 2>&1
 route_to DIVE-304 marcus
 _nf_reset
-cmd_task_answer DIVE-304 --value=approved >/dev/null 2>&1
-[[ "$(answered DIVE-304)" == "closed" && -z "$(_nf)" ]] \
-  && ok_t "E4 enforce OFF => floor dormant, lead clears routed gate directly (no escalation)" \
-  || bad_t "E4 enforce OFF dormant" "state=$(answered DIVE-304) notified='$(_nf)'"
+out=$(cmd_task_answer DIVE-304 --value=approved 2>&1); rc=$?
+[[ "$(answered DIVE-304)" == "open" ]] \
+  && ok_t "E4 enforce OFF: routed tier-2 gate still NOT lead-cleared — stays open for the human (DIVE-2588)" \
+  || bad_t "E4 floor survives enforce OFF" "rc=$rc state=$(answered DIVE-304) out=$out"
+[[ -n "$(_nf)" ]] \
+  && ok_t "E4 enforce OFF: the human was notified with a tap — escalation fires identically to enforce ON" \
+  || bad_t "E4 escalation fires with enforce OFF" "notified='$(_nf)'"
 touch "$GATE_PROOF_ENFORCE"
 
 echo "-----"

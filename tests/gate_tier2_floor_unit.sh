@@ -136,15 +136,37 @@ else
   bad_t "T4 category heuristic floored to tier 2" "got tier '$(tierof DIVE-104)' (keyword floor may have moved)"
 fi
 
-# --- T5: rollout safety — enforcement OFF => the floor is dormant (audit-only), a
-#     bare-agent answer on a tier-2 gate clears (matches the evidence-block envelope).
+# --- T5: DIVE-2588 — THE FLOOR IS NOT SWITCHABLE. This arm asserted the OPPOSITE
+#     until 2026-08-03 (enforcement OFF => floor dormant, bare-agent clears), and
+#     that dormancy was the whole exploit: the flag reached the floor, and one env
+#     var reached the flag. `_gate_proof_enforced` was a ROLLOUT envelope, not an
+#     authority decision, and it finished rolling out on 2026-07-30. The floor no
+#     longer consults it in either direction.
+#     Captured in a command substitution ON PURPOSE: `fail` exits, and calling the
+#     answer bare would end the harness at status 6 instead of reddening one arm.
 rm -f "$GATE_PROOF_ENFORCE"
 seed_task DIVE-105
 cmd_task_need DIVE-105 --type=decision --ask="ship it?" --options="A|B" --recommend="A" --tier=2 >/dev/null 2>&1
-cmd_task_answer DIVE-105 --value=A >/dev/null 2>&1
-[[ "$(answered DIVE-105)" == "closed" ]] \
-  && ok_t "T5 enforce OFF => tier-2 floor dormant, bare-agent clears (audit-only)" \
-  || bad_t "T5 enforce OFF dormant" "still $(answered DIVE-105)"
+out=$(cmd_task_answer DIVE-105 --value=A 2>&1); rc=$?
+[[ $rc -ne 0 && "$(answered DIVE-105)" == "open" ]] \
+  && ok_t "T5 enforce OFF does NOT lower the tier-2 floor — bare-agent answer still REFUSED (DIVE-2588)" \
+  || bad_t "T5 floor survives enforce OFF" "rc=$rc state=$(answered DIVE-105) out=$out"
+# The reason matters as much as the refusal: an rc alone would pass on ANY error,
+# including one that never reached the floor.
+grep -qi 'tier-2' <<<"$out" \
+  && ok_t "T5 the refusal names the tier-2 floor (not some incidental error)" \
+  || bad_t "T5 refusal names the floor" "out=$out"
+
+# --- T5b: the reported DIVE-2588 bypass, at this layer. An unprivileged caller
+#     pointing GATE_PROOF_ENFORCE at an absent path used to switch the whole
+#     enforcement envelope off. It must now say NOTHING — the floor stands, and
+#     the sentinel that is present (none here) is the only thing that can speak.
+seed_task DIVE-106
+cmd_task_need DIVE-106 --type=decision --ask="ship it?" --options="A|B" --recommend="A" --tier=2 >/dev/null 2>&1
+out=$(GATE_PROOF_ENFORCE=/nonexistent/nope cmd_task_answer DIVE-106 --value=A 2>&1); rc=$?
+[[ $rc -ne 0 && "$(answered DIVE-106)" == "open" ]] \
+  && ok_t "T5b GATE_PROOF_ENFORCE=/nonexistent does not clear a tier-2 gate (DIVE-2588 bypass)" \
+  || bad_t "T5b env bypass refused" "rc=$rc state=$(answered DIVE-106) out=$out"
 touch "$GATE_PROOF_ENFORCE"
 
 echo "-----"
