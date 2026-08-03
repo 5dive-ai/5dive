@@ -77,7 +77,7 @@ _task_usage() {
   5dive task done|cancel ... [--keep-worktree]       # DIVE-1967: a close RECLAIMS node_modules from that task's worktrees (gitignored,
                                                      # 'npm ci'-regenerable -> structurally data-loss-free). --keep-worktree opts out.
                                                      # The worktree DIRECTORY is never deleted — it may hold unpushed commits.
-  5dive task done|cancel|deliver ... [--append-result]  # DIVE-2464/DIVE-2476: a close, or a `deliver --result=`, on an ALREADY-closed row that carries a result is REFUSED —
+  5dive task done|cancel|deliver ... [--append-result]  # DIVE-2464/DIVE-2476: a close, or a 'deliver --result=', on an ALREADY-closed row that carries a result is REFUSED —
                      [--force-result]                # it used to silently REPLACE it, and the ledger stores only a sha256, so the prior
                                                      # text was unrecoverable. --append-result keeps theirs verbatim and adds yours under
                                                      # it (the common case: two closers, one task). --force-result replaces (audited).
