@@ -1002,7 +1002,12 @@ cmd_task_show() {
                       CASE WHEN need_options IS NOT NULL THEN '  options: '||need_options ELSE '' END||
                       CASE WHEN recommend IS NOT NULL THEN x'0a'||'recommend: '||recommend ELSE '' END||
                       CASE WHEN precedent_ref IS NOT NULL
-                           THEN x'0a'||'precedent: '||COALESCE((SELECT ident FROM tasks p WHERE p.id=tasks.precedent_ref),'#'||precedent_ref) ELSE '' END||x'0a'||
+                           THEN x'0a'||'precedent: '||COALESCE((SELECT ident FROM tasks p WHERE p.id=tasks.precedent_ref),'#'||precedent_ref) ELSE '' END||
+                      -- DIVE-2615: why this gate has this tier. Absent on rows filed
+                      -- before this shipped, which is a real distinction and not a
+                      -- rendering gap — see the NULL-vs-axis=none note in cmd_task_need.
+                      CASE WHEN floor_provenance IS NOT NULL AND floor_provenance <> ''
+                           THEN x'0a'||'tier set by: '||floor_provenance ELSE '' END||x'0a'||
                       'ask:  '||COALESCE(ask,'')||
                       CASE WHEN need_answered_at IS NOT NULL
                            THEN x'0a'||'answer: '||CASE WHEN need_type='secret' THEN '(provided — loaded out-of-band)' ELSE COALESCE(need_answer,'') END||'  ('||need_answered_at||')'
@@ -5609,6 +5614,10 @@ cmd_task_need() {
               secret_key=NULL, connector=NULL, secret_oob=NULL, ask_shape=NULL,
               precedent_ref=NULL, precedent_kind=NULL, routed_reviewer=NULL,
               needs_capability=NULL,
+              -- DIVE-2615: a withdrawn gate has no tier, so it must not keep
+              -- reporting why it had one. The archive above already copied this
+              -- value onto the history row, which is where it belongs afterwards.
+              floor_provenance=NULL,
               need_asked_at=NULL, gate_pinged_at=NULL, gate_filed_by=NULL
         WHERE id=${id};
         UPDATE tasks SET status='todo'
@@ -5798,13 +5807,48 @@ cmd_task_need() {
   fi
   local tier_floored=0
   local _floored_by_title=0 _floor_axis=none _ft_title=""   # DIVE-2224
+  # DIVE-2615: WHY this gate has the tier it has, recorded at the moment it is
+  # decided. Every input below is computed here and then thrown away, so the store
+  # could say a gate was tier 2 and never say what made it tier 2 — floor_provenance
+  # was NULL on all 79 gate_history rows because nothing has ever written it.
+  # Answering "how many of tonight's human pings were the floor over-firing?" needed
+  # a bundle rig sourcing this file's predicates against asks re-read from the store,
+  # two of my attempts at which were void. That is a question the store should
+  # answer, and after this it does.
+  #
+  # NULL vs 'axis=none' IS THE WHOLE POINT and they are not the same fact. NULL means
+  # this build never recorded it (a pre-DIVE-2615 row). 'axis=none' means the floor
+  # RAN and did not fire. Conflating them is exactly what made the existing column
+  # unusable — an empty value that means both "no data" and "no hit" measures nothing.
+  local _floor_prov=""
+  if [[ "$tier" == "2" ]]; then
+    # Tier 2 BEFORE the floor is consulted, and the two ways of getting there are
+    # different facts about different people, so they get different values.
+    # `pinned` is the caller's explicit --tier=2 — a LARGE population (12 of the 48
+    # tier-2 gates that pinged the human in the 7 days to 2026-08-03) and invisible
+    # from the row today, which makes the filer's own choice read as the
+    # classifier's doing. `type-default` is manual/secret/access, where 2 is the
+    # type's default and nobody chose anything. Reading `tier_arg`, not `tier`, is
+    # what separates them: by this line the type default has already been applied,
+    # so the effective tier cannot tell them apart — the same distinction DIVE-1182
+    # captured `tier_arg` for two lines above.
+    if [[ "$tier_arg" == "2" ]]; then _floor_prov="axis=pinned"; else _floor_prov="axis=type-default"; fi
+  fi
   if [[ "$tier" != "2" ]]; then
     if [[ "$type" == "secret" ]]; then
       tier=2; tier_floored=1
+      _floor_prov="axis=secret-type"
     else
       local ttl_title; ttl_title=$(db "SELECT COALESCE(title,'') FROM tasks WHERE id=${id};")
       # DIVE-2224: per-field, never the join; and the ASK is the subject (answer A).
       _floor_axis=$(_gate_floor_axis "$ask" "$ttl_title")
+      local _floor_term=""
+      case "$_floor_axis" in
+        ask)  _floor_term=$(_gate_tier2_floor_term "$ask" 2>/dev/null) || _floor_term="" ;;
+        title|title-fallback)
+          _floor_term=$(_gate_tier2_floor_term "$ttl_title" 2>/dev/null) || _floor_term="" ;;
+      esac
+      _floor_prov="axis=${_floor_axis}${_floor_term:+;term=${_floor_term}}"
       case "$_floor_axis" in
         ask) tier=2; tier_floored=1 ;;
         title-fallback)
@@ -6256,6 +6300,9 @@ cmd_task_need() {
             ask_shape=$(sqlq_or_null "$ask_shape"),
             precedent_ref=${precedent_ref:-NULL},
             precedent_kind=$(sqlq_or_null "$precedent_kind"),
+            -- DIVE-2615: why this gate has this tier. Written on the SAME statement
+            -- that writes the tier, so the two can never disagree about one filing.
+            floor_provenance=$(sqlq_or_null "$_floor_prov"),
             -- DIVE-2241: the capability the filer DECLARED, recorded verbatim —
             -- including one that resolved to nothing. What was claimed is the
             -- provenance; whether it resolved is recomputable from the sealed

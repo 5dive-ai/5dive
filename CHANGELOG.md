@@ -1,5 +1,56 @@
 # Changelog
 
+## Unreleased — feat(gate): a gate now records WHY it has the tier it has (DIVE-2615)
+
+lodar was interrupted three times in ten minutes on 2026-08-03 by gates that were not
+his to answer. The first question anyone asks about that — *how many of these did the
+tier-2 floor over-fire on?* — turned out to be unanswerable from the store.
+
+`gate_history.floor_provenance` existed on the live box and was **NULL on all 79 rows**:
+a column with no writer, no migration and no reference anywhere in `src/` or `tests/`.
+Every input to the tier decision is computed in `cmd_task_need` and then thrown away, so
+the split had to be reconstructed by building a bundle, stripping its `main` call,
+sourcing it, and re-running the CLI's own predicates over asks read back out of the
+store. **Two attempts at that were void** — one built from a dirty feature branch that
+contained no DIVE-2629, one ran the bare per-field predicate instead of
+`_gate_floor_axis`, which is what the filing path actually calls.
+
+The tier decision is now written on the **same statement that writes the tier**, in six
+values that each name whose decision it was:
+
+| value | who decided |
+|---|---|
+| `axis=pinned` | the FILER passed `--tier=2`; the floor was never consulted |
+| `axis=type-default` | manual/secret/access — 2 is the type's default and nobody chose |
+| `axis=secret-type` | filed below tier 2 and forced up by its type |
+| `axis=ask` | the floor fired on the ask |
+| `axis=title` | term in the title only — **not** floored, routed to the lead (DIVE-2224) |
+| `axis=title-fallback` | floored on the title because the ask states nothing of its own |
+| `axis=none` | the floor ran and did not fire |
+
+plus `;term=<t>` wherever a term is what fired, so *"floored on `publish`"* is a stored
+fact rather than something a reader re-derives with a regex.
+
+**`NULL` and `axis=none` are deliberately different facts.** NULL means this build never
+recorded it; `axis=none` means the floor ran and found nothing. An empty cell meaning
+both is precisely what made the pre-existing column measure nothing, so a writer that
+emitted NULL on a clean gate would have reproduced the defect while looking like a fix.
+
+`pinned` vs `type-default` reads `tier_arg`, not `tier`: by that line the type default
+has already been applied and the effective tier cannot tell a filer's choice from a
+type's default — the same distinction DIVE-1182 captured `tier_arg` for, two lines up.
+
+Schema is additive on both tables, declared in the fresh-store CREATE **and** in the
+migration: a fresh box never runs the migration, and the create-if-absent block never
+reaches a `gate_history` that already exists, so either one alone leaves a live box
+without the column.
+
+`tests/gate_floor_provenance_unit.sh` — 19 arms. Two were written asserting the wrong
+thing and the harness said so: a plain `secret` gate is a *type-default*, not a
+type-floor (the default lands before the floor block), and a migration fixture holding
+only `gate_history` takes the fresh-create path, so it proved nothing until it carried a
+`tasks` table.
+
 ## Unreleased — fix(gate): the tier-2 destructive floor graded the BRANCH NAME in a push-for-review ask (DIVE-2629)
 
 `approve delegated push for review of branch dive-2613-teardown-outcomes-hetzner-only`
