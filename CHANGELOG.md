@@ -47,6 +47,27 @@ preference is to merge by subject). The behavioural arm runs the **real** recipe
 namespace where the two locators disagree, and runs the **pre-fix** locator through the same
 rig as a red anchor: it dangles *at rc=0*, which is the "reported success" half.
 
+The rig **builds** the recipe's hardcoded `/home/claude` inside the namespace (tmpfs over
+`/home`, then `mkdir`) rather than borrowing the host's. The first cut bind-mounted straight
+onto `/home/claude/.nvm` and `/home/claude/.local/bin` — the right addresses, since they are
+what the recipe reads, but they exist only on a 5dive host. On a GitHub runner home is
+`/home/runner`, both mounts failed with *mount point does not exist*, and the driver — `set -u`
+with no `-e` — graded an unrigged namespace and returned `VERDICT=absent rc=1` from both arms.
+Deriving the mount point from `$HOME` does not fix that: the literal `/home/claude` is in the
+**recipe under test**, so a rig at `/home/runner` is just as unrigged, only quieter. The path
+has to be created, not relocated — which also removes the host-dependence that let this pass
+locally and only locally. Everything is namespace-local (unshare defaults to private
+propagation); a host that has `/home/claude` gets it shadowed, never touched.
+
+Two guards keep the arm honest rather than merely working. The driver **refuses** — printing
+nothing verdict-shaped — if any rig step fails, so a rig that did not build can no longer
+emit a string shaped exactly like a measurement; and the environment guard now grades *the
+rig it needs* (build one, check it reports `RIGOK`) instead of the proxy question "is
+`unshare` permitted", which answers **yes** on a runner and was why the unrigged run got
+through. Where no launcher can build the rig the arm skips loudly, naming each candidate's
+failure. Both guards are themselves graded: breaking a rig on purpose asserts the refusal
+fires, names the failed step, and leaks no `VERDICT`.
+
 ## Unreleased — SECURITY fix(gate): a tier-2 human floor whose OFF switch was reachable by the agents it constrains (DIVE-2588)
 
 Any agent, unprivileged and without sudo, could forge a human tap on a tier-2 **decision**

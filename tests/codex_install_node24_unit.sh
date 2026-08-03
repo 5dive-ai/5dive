@@ -104,17 +104,35 @@ echo "PASS: codex locator targets the installing npm's prefix and asserts it res
 # locator through the SAME rig as a red anchor — a green here with no red
 # anchor would also pass on a rig that cannot fail.
 #
-# The recipe hardcodes /home/claude/.nvm and /home/claude/.local/bin, so the rig
-# needs a mount namespace. Where that is not permitted, SKIP LOUDLY: a silent
-# skip reads as coverage this harness did not provide.
-if unshare -m --map-root-user true 2>/dev/null; then
-  UNSHARE=(unshare -m --map-root-user)
-elif sudo -n unshare -m true 2>/dev/null; then
-  UNSHARE=(sudo -n unshare -m)
-else
-  echo "SKIP: codex locator behavioural arm (no usable 'unshare -m'; static arms only)" >&2
-  exit 0
-fi
+# ITERATION 3 — why this arm is built the way it is. Iteration 2 bind-mounted
+# the rig straight onto /home/claude/.nvm and /home/claude/.local/bin. Those
+# are the right ADDRESSES (they are what the recipe reads) but they exist only
+# on a 5dive host. On a GitHub runner home is /home/runner, both mounts failed
+# with "mount point does not exist", and because the driver ran `set -u` with
+# no `-e` the failures went to stderr and the recipe was graded in an UNRIGGED
+# namespace: both arms returned `VERDICT=absent rc=1`, a string shaped exactly
+# like a measurement. Two independent holes, two independent repairs:
+#
+#  1. The rig SYNTHESISES /home/claude inside the namespace (tmpfs over /home,
+#     then mkdir) rather than borrowing the host's. Deriving the mount point
+#     from $HOME — the obvious fix — does NOT work here: the literal string
+#     /home/claude is hardcoded in the RECIPE UNDER TEST, so a rig mounted at
+#     /home/runner would be just as unrigged, only quieter. The path has to be
+#     CREATED, not relocated. Doing it unconditionally is also what kills the
+#     host-dependence that hid the CI failure from every local run: this host
+#     has /home/claude, so borrowing it passed here and only here. Everything
+#     below is namespace-local — unshare(1) defaults to private propagation —
+#     and on a host that DOES have /home/claude it is shadowed, never touched.
+#
+#  2. The driver REFUSES rather than emitting a verdict when any rig step
+#     fails, and the environment guard now grades THE RIG IT NEEDS (build one,
+#     check it reports RIGOK) instead of the proxy question "is unshare
+#     permitted". On a runner unshare IS permitted, which is exactly why the
+#     old guard let the run through to an unrigged measurement.
+#
+# Where the rig genuinely cannot be built, SKIP LOUDLY with the named reason
+# from each candidate: a silent skip reads as coverage this harness did not
+# provide, and an unnamed one cannot be told from a rig that is merely broken.
 
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
@@ -159,25 +177,103 @@ RIG
   # The SELECTED prefix has a node but no codex — that is the whole point.
   printf '#!/bin/sh\necho node\n' >"$root/selected/bin/node"
   chmod +x "$root/selected/bin/node"
+  # Witness file. `mount --bind` reporting success is not the same claim as the
+  # rig being VISIBLE at the path the recipe reads; the driver checks for this
+  # mark on the far side of the bind rather than trusting mount's exit status.
+  : >"$root/localbin/.rigmark"
 }
 
-# Runs one recipe in a namespace with the rig bound over the hardcoded paths.
-run_recipe() {
-  local root="$1" script="$2"
-  printf '%s\n' "$script" >"$root/recipe.sh"
-  cat >"$root/drive.sh" <<RIG
-set -u
-mount --bind "$root/nvm" /home/claude/.nvm
-mount --bind "$root/localbin" /home/claude/.local/bin
-export PATH="$root/path:/usr/bin:/bin"
-bash "$root/recipe.sh" >/dev/null 2>&1; rc=\$?
-link=/home/claude/.local/bin/codex
-if [[ ! -L \$link && ! -e \$link ]]; then echo "VERDICT=absent rc=\$rc"
-elif [[ -x \$link ]]; then echo "VERDICT=ok rc=\$rc"
-else echo "VERDICT=dangling rc=\$rc"; fi
+# Everything that must run INSIDE the namespace before a recipe can be graded.
+# Emitted from ONE function so the preflight and every measurement drive the
+# same mechanism — a preflight that exercised a different code path would be
+# back to grading a proxy.
+rig_preamble() {
+  printf 'set -u\nexport PATH=/usr/sbin:/usr/bin:/sbin:/bin\n'
+  printf 'RIG_ROOT=%q\n' "$1"
+  cat <<'RIG'
+fail() { echo "RIGFAIL=$1"; exit 3; }
+# Build the recipe's hardcoded home, do not borrow the host's.
+mount -t tmpfs tmpfs /home                                || fail "tmpfs-over-home"
+[[ ! -e /home/claude ]]                                   || fail "tmpfs-did-not-shadow-home"
+mkdir -p /home/claude/.nvm /home/claude/.local/bin        || fail "mkdir-bind-targets"
+mount --bind "$RIG_ROOT/nvm" /home/claude/.nvm            || fail "bind-nvm"
+mount --bind "$RIG_ROOT/localbin" /home/claude/.local/bin || fail "bind-localbin"
+export PATH="$RIG_ROOT/path:/usr/bin:/bin"
+# Witnesses, read through the paths the recipe will use.
+[[ -r /home/claude/.nvm/nvm.sh ]]                         || fail "nvm-not-visible"
+[[ -e /home/claude/.local/bin/.rigmark ]]                 || fail "localbin-not-visible"
+[[ "$(command -v npm)" == "$RIG_ROOT/path/npm" ]]         || fail "npm-not-rigged"
 RIG
-  "${UNSHARE[@]}" bash "$root/drive.sh"
 }
+
+# The measurement itself. Separate from the preamble so a rig failure can never
+# reach it: `fail` exits 3 before this line is ever read.
+drive_tail='bash "$RIG_ROOT/recipe.sh" >/dev/null 2>&1; rc=$?
+link=/home/claude/.local/bin/codex
+if [[ ! -L $link && ! -e $link ]]; then echo "VERDICT=absent rc=$rc"
+elif [[ -x $link ]]; then echo "VERDICT=ok rc=$rc"
+else echo "VERDICT=dangling rc=$rc"; fi'
+
+# Runs one recipe in a namespace with the rig bound over the recipe's hardcoded
+# paths. REFUSES — loudly, and without printing anything verdict-shaped — if the
+# namespace it got back was not actually rigged.
+run_recipe() {
+  local root="$1" script="$2" out
+  printf '%s\n' "$script" >"$root/recipe.sh"
+  { rig_preamble "$root"; printf '%s\n' "$drive_tail"; } >"$root/drive.sh"
+  out="$("${UNSHARE[@]}" bash "$root/drive.sh" 2>"$root/drive.err")" || true
+  [[ "$out" =~ ^VERDICT=(ok|dangling|absent)\ rc=[0-9]+$ ]] || {
+    echo "FAIL: the rig did not build under '${UNSHARE[*]}' — refusing to emit a verdict from an unrigged namespace" >&2
+    echo "      driver stdout: [${out:-<empty>}]" >&2
+    echo "      driver stderr: [$(tr '\n' ' ' <"$root/drive.err")]" >&2
+    exit 1
+  }
+  printf '%s\n' "$out"
+}
+
+# Environment guard: pick the first launcher under which a rig ACTUALLY BUILDS.
+# Not "is unshare permitted" — that question is answered YES on a GitHub runner,
+# where the rig then failed to build anyway.
+rig_reasons=()
+for cand in "unshare -m --map-root-user" "sudo -n unshare -m"; do
+  read -r -a UNSHARE <<<"$cand"
+  build_rig "$TMP/preflight"
+  { rig_preamble "$TMP/preflight"; printf 'echo RIGOK\n'; } >"$TMP/preflight/drive.sh"
+  pf="$("${UNSHARE[@]}" bash "$TMP/preflight/drive.sh" 2>&1)" || true
+  [[ "$pf" == *RIGOK ]] && break
+  rig_reasons+=("$cand -> ${pf:-<no output>}")
+  UNSHARE=()
+done
+if (( ${#UNSHARE[@]} == 0 )); then
+  echo "SKIP: codex locator behavioural arm — no launcher could build the mount-namespace rig; static arms only" >&2
+  printf '  tried: %s\n' "${rig_reasons[@]}" >&2
+  exit 0
+fi
+
+# --- rig-integrity arm ------------------------------------------------------
+# The refusal above is the only thing standing between a broken rig and a
+# verdict-shaped string, and iteration 2 proved that gap is not hypothetical.
+# Grade the refusal by BREAKING a rig on purpose: remove the bind source, so the
+# driver hits `fail bind-nvm` exactly where the runner hit "mount point does not
+# exist". The driver must refuse, name the reason, and emit no VERDICT at all.
+integrity_root="$TMP/rigfail"; build_rig "$integrity_root"; rm -rf "$integrity_root/nvm"
+if rigfail_out="$(run_recipe "$integrity_root" "$recipe" 2>&1)"; then
+  echo "FAIL: driver emitted a verdict from a rig that did not build ($rigfail_out)" >&2
+  exit 1
+fi
+[[ "$rigfail_out" == *"refusing to emit a verdict from an unrigged namespace"* ]] || {
+  echo "FAIL: driver failed on a broken rig but did not name it as a rig failure ($rigfail_out)" >&2
+  exit 1
+}
+[[ "$rigfail_out" == *"RIGFAIL=bind-nvm"* ]] || {
+  echo "FAIL: expected the driver to stop at the failed bind; got ($rigfail_out)" >&2
+  exit 1
+}
+[[ "$rigfail_out" != *"VERDICT="* ]] || {
+  echo "FAIL: the refusal still leaked a verdict-shaped string ($rigfail_out)" >&2
+  exit 1
+}
+echo "PASS: driver refuses, names the failed rig step, and emits no VERDICT when the rig does not build"
 
 build_rig "$TMP/red";   red="$(run_recipe "$TMP/red" "$old_recipe")"
 build_rig "$TMP/green"; green="$(run_recipe "$TMP/green" "$recipe")"
