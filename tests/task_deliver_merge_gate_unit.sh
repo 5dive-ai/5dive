@@ -203,6 +203,33 @@ GH_STUB_STATE="OPEN" GH_STUB_MERGED="" \
   && ok_t "Td plain task (no delivery_ref) closes unchanged" \
   || bad_t "Td regression" "rc=$rc status=$(statusof DIVE-202) out=$out"
 
+# --- Te/Tf (DIVE-2204): `deliver`'s no-distinct-verifier branch covers TWO
+#     different rows and must not claim the stronger one for both. Te has a
+#     verifier, just not distinct from the assignee (self-assigned rail from
+#     community/wiki/deliver-branches-on-verifier-vs-assignee.md); Tf has none
+#     at all. The old single message ("it has no distinct verifier") was true
+#     for Tf but FALSE for Te, and reads as "unverified — safe to self-close".
+# The prose only exists outside JSON_MODE (src/lib/output.sh ok(): JSON_MODE=1
+# drops it entirely) — switch off for these two so the assertions see it.
+JSON_MODE=0
+seed_task DIVE-220 main main
+out=$(cmd_task_deliver DIVE-220 --pr="$PR" 2>&1); rc=$?
+[[ $rc -eq 0 && "$(statusof DIVE-220)" == "in_progress" ]] \
+  && ok_t "Te deliver on verifier==assignee stays in_progress" \
+  || bad_t "Te deliver exit/status" "rc=$rc status=$(statusof DIVE-220) out=$out"
+[[ "$out" == *"verifier is the current assignee"* && "$out" != *"no distinct verifier"* && "$out" != *"no verifier is set"* ]] \
+  && ok_t "Te message says verifier==assignee, not 'no verifier'" \
+  || bad_t "Te message" "out=$out"
+
+seed_task DIVE-221 main ''
+out=$(cmd_task_deliver DIVE-221 --pr="$PR" 2>&1); rc=$?
+[[ $rc -eq 0 && "$(statusof DIVE-221)" == "in_progress" ]] \
+  && ok_t "Tf deliver with no verifier stays in_progress" \
+  || bad_t "Tf deliver exit/status" "rc=$rc status=$(statusof DIVE-221) out=$out"
+[[ "$out" == *"no verifier is set"* && "$out" != *"verifier is the current assignee"* ]] \
+  && ok_t "Tf message says no verifier is set" \
+  || bad_t "Tf message" "out=$out"
+
 echo "-----"
 printf 'task_deliver_merge_gate_unit: %d passed, %d failed\n' "$PASS" "$FAIL"
 [[ $FAIL -eq 0 ]]
