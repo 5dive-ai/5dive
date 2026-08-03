@@ -577,6 +577,160 @@ profile_type_auth_path() {
   esac
 }
 
+# -------- credential health for the `agent list` survey (DIVE-1953) --------
+#
+# DIVE-1869 finding 3: a grok seat whose credential had lapsed still rendered
+# ACTIVE in `agent list`, and the only signal was a line in the runtime's own
+# log. DIVE-1803 is the same shape (an unauthed antigravity runtime rendering
+# healthy). A running unit says the PROCESS is up; it says nothing about
+# whether that process can reach its provider, and those two facts were
+# reported through one badge.
+#
+# This is the cheap FILE-STATE half of that answer — no network, no probe, one
+# read per row (the survey is re-run constantly; `auth status` already owns the
+# probing path via auth_probe_one). It is deliberately conservative in the same
+# way the DIVE-1219 deaf check is: only a POSITIVE observation flags, and
+# anything we could not read stays `unknown` rather than becoming a false alarm.
+#
+# _cred_expiry_epoch <blob> — epoch SECONDS on stdout when the credential
+# carries a machine-readable expiry, nothing otherwise. Never fails a caller.
+_cred_expiry_epoch() {
+  local blob="$1" v
+  # Explicit expiry fields, in the shapes vendors actually write. Numbers are
+  # epoch (seconds or milliseconds); strings are anything `date -d` parses.
+  # Guarded on `type == "object"` because a credential file is not always one
+  # (openclaw writes a map, antigravity writes a bare token blob).
+  v=$(jq -r 'if type != "object" then empty else
+               first((.claudeAiOauth.expiresAt?, .expiresAt?, .expires_at?, .expiry?)
+                     | select(type == "number" or type == "string")) // empty
+             end' <<<"$blob" 2>/dev/null) || v=""
+  if [[ -n "$v" ]]; then
+    if [[ "$v" =~ ^[0-9]+$ ]]; then
+      # >1e11 cannot be epoch seconds this century, so it is milliseconds.
+      (( v > 100000000000 )) && v=$(( v / 1000 ))
+      echo "$v"; return 0
+    fi
+    local iso; iso=$(date -u -d "$v" +%s 2>/dev/null || true)
+    [[ -n "$iso" ]] && { echo "$iso"; return 0; }
+  fi
+  # No explicit field: fall back to the `exp` claim of a JWT the file carries
+  # (codex stores tokens.id_token). base64url -> base64, then pad.
+  #
+  # CREDENTIAL-BEARING LOCALS AHEAD (main, DIVE-1953 push review): `$jwt` is a
+  # live bearer token and `$pay` is its decoded payload. Nothing here prints
+  # them — only `$exp` is echoed, and the whole `$blob` argument is likewise
+  # never emitted — but a `set -x`, a debug echo, or a BASH_XTRACEFD added
+  # anywhere in this function WOULD dump a usable token into whatever the
+  # caller's stderr happens to be (a systemd journal, a dashboard exec tunnel,
+  # a CI log). Read that as a constraint on this function, not a warning: if
+  # you need to trace it, trace around it.
+  local jwt
+  jwt=$(jq -r 'if type != "object" then empty else
+                 first((.tokens.id_token?, .tokens.access_token?, .id_token?, .access_token?)
+                       | select(type == "string" and test("^[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+\\."))) // empty
+               end' <<<"$blob" 2>/dev/null) || jwt=""
+  [[ -n "$jwt" ]] || return 1
+  local pay="${jwt#*.}"; pay="${pay%%.*}"
+  pay=$(printf '%s' "$pay" | tr '_-' '/+')
+  while (( ${#pay} % 4 )); do pay+="="; done
+  local exp
+  exp=$(printf '%s' "$pay" | base64 -d 2>/dev/null | jq -r '.exp // empty' 2>/dev/null || true)
+  [[ "$exp" =~ ^[0-9]+$ ]] || return 1
+  echo "$exp"
+}
+
+# _cred_refreshable <blob> — 0 when the credential carries a refresh token.
+# This is what keeps the expiry check honest: codex and claude both store a
+# SHORT-lived access/id token next to a long-lived refresh token and renew it
+# themselves, so "expiresAt is in the past" is the NORMAL steady state for
+# them. Flagging that would have put a red badge on every healthy claude agent
+# on the box — a column nobody would believe twice. Expiry only means dead
+# when nothing can renew it.
+_cred_refreshable() {
+  local blob="$1" r
+  r=$(jq -r 'if type != "object" then empty else
+               first((.claudeAiOauth.refreshToken?, .refreshToken?, .refresh_token?,
+                      .tokens.refresh_token?)
+                     | select(type == "string" and length > 0)) // empty
+             end' <<<"$blob" 2>/dev/null) || r=""
+  [[ -n "$r" ]]
+}
+
+# agent_auth_health <type> <profile> — "<state>|<expiryEpoch|->|<refreshable>"
+# for one agent. Never fails, never blocks; unreadable input yields `unknown`.
+#
+#   ok          — credential present (and either unexpired, or renewable)
+#   needs_login — the credential file is provably ABSENT or empty
+#   expired     — it carries an expiry that has passed and no refresh token
+#   unknown     — could not be read (EACCES, or the path is not derivable)
+#
+# `not_required` collapses into ok: a type with no TYPE_AUTH sentinel (opencode)
+# ships with free models and needs no sign-in, which is the same answer to the
+# only question this column asks.
+agent_auth_health() {
+  local type="$1" profile="${2:-}"
+  local sentinel="${TYPE_AUTH[$type]:-}"
+  [[ -n "$sentinel" ]] || { echo "ok|-|false"; return 0; }
+  # Sentinels are "<path>" or "<path>:<key>"; only the path half is needed here
+  # (auth_creds_present owns the key half).
+  local path="${sentinel%%:*}"
+  if [[ -n "$profile" ]]; then
+    local ppath
+    ppath=$(profile_type_auth_path "$profile" "$type" 2>/dev/null) || ppath=""
+    [[ -n "$ppath" ]] && path="$ppath"
+  fi
+  [[ -n "$path" ]] || { echo "unknown|-|false"; return 0; }
+  # PRESENCE is delegated to auth_creds_present — the same instrument `agent
+  # create`, `auth status` and `doctor` gate on. A second, cheaper-but-weaker
+  # presence check here would answer a slightly different question under a
+  # friendlier name, which is how a column starts disagreeing with the rest of
+  # the CLI. It matters concretely: a claude agent authenticates by the
+  # env-token in its profile's combined.env and never writes .credentials.json,
+  # so a bare sentinel-path test marks every healthy claude agent on the box
+  # `needs_login` (observed on the control plane before this call replaced it).
+  if ! auth_creds_present "$type" "$profile" 2>/dev/null; then
+    # Absent, or unreadable? Absence is only a FACT when we could have seen the
+    # file: the containing directory must be readable. An EACCES anywhere in
+    # the candidate set means we learned nothing and must say so.
+    local _c _dir observable=1
+    local -a cands=("$path")
+    if [[ -n "$profile" ]]; then
+      cands+=("${AUTH_PROFILES_DIR}/${profile}/combined.env")
+    elif [[ -n "${TYPE_API_FILE[$type]:-}" ]]; then
+      # `:-` on the READ as well as the guard above: TYPE_API_FILE is an
+      # optional map, and under `set -u` a bare variable-keyed read of a missing
+      # key aborts the whole `agent list` rather than degrading one row
+      # (tests/type_map_registration_contract_unit.sh enforces this shape).
+      cands+=("${CONNECTORS_DIR}/${TYPE_API_FILE[$type]:-}")
+    fi
+    for _c in "${cands[@]}"; do
+      [[ -r "$_c" ]] && continue                  # readable: we looked, it had nothing
+      _dir=$(dirname "$_c")
+      [[ -r "$_dir" && ! -e "$_c" ]] && continue  # provably absent
+      observable=0; break
+    done
+    (( observable )) && { echo "needs_login|-|false"; return 0; }
+    echo "unknown|-|false"; return 0
+  fi
+  # Present. The expiry half needs the credential BLOB, which we may not be able
+  # to read even when presence resolved through the env-file fallback — no blob
+  # simply means no expiry information, never a downgrade of a proven presence.
+  # Plain read FIRST: profile credentials are group-`claude`-readable and the two
+  # readers that matter (the dashboard's exec tunnel as `claude`, and any agent
+  # in group claude) already reach them, so the common path adds no auth-log row
+  # per agent per run. `sudo -n` is the fallback for a 0600 default-home path.
+  local blob
+  blob=$(cat "$path" 2>/dev/null || sudo -n cat "$path" 2>/dev/null || true)
+  [[ -n "$blob" ]] || { echo "ok|-|false"; return 0; }
+  local refreshable=false exp=""
+  _cred_refreshable "$blob" && refreshable=true
+  exp=$(_cred_expiry_epoch "$blob" 2>/dev/null || true)
+  if [[ -n "$exp" ]] && (( exp < $(date +%s) )) && [[ "$refreshable" == "false" ]]; then
+    echo "expired|${exp}|false"; return 0
+  fi
+  echo "ok|${exp:--}|${refreshable}"
+}
+
 # paperclip_seed_for_type <type> <profile> — wire the host-default credential
 # location (the path the `claude` Linux user reads) to a profile's credential
 # file, so paperclipai (which runs as user `claude`) and any other host-level
