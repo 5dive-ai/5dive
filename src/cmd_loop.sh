@@ -32,7 +32,7 @@ cmd_loop() {
     uninstall) cmd_loop_pack uninstall "$@" ;;
     show)      cmd_loop_pack show "$@" ;;
     help|-h|--help) _loop_help ;;
-    *)         fail "$E_USAGE" "unknown loop command: $sub (spawn|verify|grade|panel|map|until-dry|collect|status|install|show)" ;;
+    *)         fail "$E_USAGE" "unknown loop command: $sub (spawn|verify|grade|panel|map|until-dry|collect|status|install|uninstall|show)" ;;
   esac
 }
 

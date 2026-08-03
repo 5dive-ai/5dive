@@ -1537,6 +1537,6 @@ are separate on purpose — a scheduled run treats 3 as success, so a refusal
 sharing that code would report a permanently broken box as a healthy night.
 HELP
       ;;
-    *) fail "$E_USAGE" "proof: unknown subcommand: ${1:-} (publish|on|off|status|tick)" ;;
+    *) fail "$E_USAGE" "proof: unknown subcommand: ${1:-} (publish|on|off|status|scorecard|tick)" ;;
   esac
 }
