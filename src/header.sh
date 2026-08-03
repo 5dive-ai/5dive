@@ -729,18 +729,54 @@ declare -A HERMES_PROVIDER_MODEL=(
   # `novita`, and DOTTED as claude-sonnet-4.5 under `copilot` and `novita`.
   # So a grep is blind twice over: wrong provider, and wrong spelling of the
   # same model. See DIVE-2607.
+  #
+  # And hermes has TWO catalogs per provider, which disagree:
+  # curated_models_for_provider() prefers a LIVE models.dev/API fetch
+  # (provider_model_ids) and falls back to the static _PROVIDER_MODELS only when
+  # that fetch fails. `gemini` and `deepseek` are both in _MODELS_DEV_PREFERRED,
+  # so the live list is the one that resolves a BYO pin — and it is SMALLER:
+  # static deepseek carries deepseek-v4-pro, live carries only chat/reasoner.
+  # DIVE-2607 cleared deepseek-v4-pro against the weaker list. So these pins are
+  # chosen from the INTERSECTION of live and static: the pin then resolves
+  # whichever catalog wins at runtime, including with the network down.
+  # See DIVE-2628 and community/wiki/a-byo-model-pin-can-only-be-graded-off-ci.md.
   [anthropic]="claude-sonnet-5"
-  [google]="gemini-2.0-flash"
-  [deepseek]="deepseek-v4-pro"
+  [google]="gemini-3.5-flash"
+  [deepseek]="deepseek-chat"
   [moonshot]="kimi-k2-turbo-preview"
   [openrouter]="openrouter/auto"
 )
 declare -A OPENCLAW_PROVIDER_MODEL=(
-  [openai]="openai/gpt-4o"
+  # Grade a pin here with `openclaw models list --provider <native> --plain`,
+  # NEVER with `--all`: `--all` is a SUBSET that omits the openai/ and google/
+  # namespaces entirely, and reading that omission as "no oracle" is what left
+  # [openai] and [google] ungraded until DIVE-2631. The per-provider list is the
+  # same static catalog (byte-identical to --all on `anthropic`, and unchanged
+  # with the network cut, so it cannot flap).
+  #
+  # And do NOT settle one of these against a DIFFERENT tool's catalog: models.dev
+  # — which hermes itself prefers at runtime — lists both the old openai/gpt-4o
+  # and the old google/gemini-2.0-flash as PRESENT. A cross-oracle read would
+  # have cleared two genuinely stale pins. Only the list that resolves the pin
+  # has authority over it (DIVE-2631).
+  #
+  # WHAT "STALE" MEANS HERE, AND WHAT IT DOES NOT. None of the replaced ids is
+  # retired upstream. Google's own v1beta still serves gemini-2.0-flash (50
+  # models, HTTP 200, queried with our key by main 2026-08-03), and models.dev
+  # still lists gpt-4o. A pin is wrong here when the list that RESOLVES it does
+  # not carry it, which is a property of the vendor agent's catalog, not of the
+  # model's lifecycle. Write it that way in any future ticket or commit: "absent
+  # from <the resolving list>, still present at <upstream>" — never "the vendor
+  # dropped it". The two get fixed differently and only one of them is our bug.
+  #
+  # Measured on openclaw 2026.7.1-2: openai carries no gpt-4 family at all (20
+  # ids, starting at gpt-5.3), google carries only 2.5.x/3.x (7 ids), moonshot
+  # only k2.6 / k2.7-code, deepseek only chat / reasoner (DIVE-2628, DIVE-2631).
+  [openai]="openai/gpt-5.6"
   [anthropic]="anthropic/claude-sonnet-5"
-  [google]="google/gemini-2.0-flash"
-  [deepseek]="deepseek/deepseek-v4-pro"
-  [moonshot]="moonshot/kimi-k2-instruct"
+  [google]="google/gemini-3.5-flash"
+  [deepseek]="deepseek/deepseek-chat"
+  [moonshot]="moonshot/kimi-k2.6"
   [openrouter]="openrouter/auto"
 )
 declare -A BYO_PROVIDER_LABEL=(
