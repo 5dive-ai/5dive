@@ -371,7 +371,7 @@ restart_profile_agents() {
     return 0
   fi
 
-  step "Restarting $n agent(s) to load the fresh token (DIVE-383)"
+  step "Restarting $n agent(s) to load the fresh token"
   local agent
   while IFS= read -r agent; do
     [[ -n "$agent" ]] || continue
