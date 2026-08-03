@@ -5,7 +5,19 @@
 # nobody watches. The SAME file with the SAME assertions cost 174.1s on that run, 57.5s
 # on main in CI four hours earlier, and 2.4s on the control plane (agent-dev, same day,
 # 18 passed / 0 failed). Nothing in the file changed between those three readings. Its
-# cost is REMOTE RESOLUTION: arm C verifies that every pinned baseline is a commit that
+# WHICH READING THE DECISION RESTS ON, because three figures from three environments
+# are three different claims and a demotion argued on the wrong one is argued on
+# nothing (olivia, grading DIVE-2592). It rests on 57.5s — the CI reading on MAIN,
+# the ordinary case, the one that is charged to every PR on a good day. 174.1s is the
+# tail and shows the SPREAD, not the cost; on its own it would be an argument from an
+# outlier. 2.4s on the control plane is not evidence for demotion at all — it is the
+# CONTROL that rules out the alternative explanation, because a file that costs 2.4s
+# here and 57.5s there is not an expensive file, it is an environment-priced one, and
+# that is the difference between "merge or retire this" and "a wall-clock cap is the
+# wrong instrument for it". Even at the ordinary reading it is 19% of the entire 300s
+# core; the demotion would still be right if the 174.1s tail had never happened.
+#
+# Its cost is REMOTE RESOLUTION: arm C verifies that every pinned baseline is a commit that
 # resolves HERE, and a pin absent from the local object store falls back to
 # `git fetch origin <sha>` — one network round trip to github.com per unresolved pin.
 # So its wall-clock is a property of the runner's link, not of the corpus, which makes

@@ -25,13 +25,16 @@
 #         exits 1 even when also over budget (the failure is what you fix first);
 #         an empty selection is exit 1, never a green run over nothing; the report
 #         carries the wall-clock header the nightly summary reads.
-#  31-38 DIVE-2592: an over-budget run RE-TIMES its slowest files and keeps the
+#  31-41 DIVE-2592: an over-budget run RE-TIMES its slowest files and keeps the
 #         smaller sample, so a red that flips on a re-run of the same commit cannot
 #         reach a PR author. Paired arms: the rescue, the corpus that is over on
 #         BOTH samples anyway, and --confirm-top=0 (an override may only make the
 #         control stricter). Plus: the red says NO TEST FAILED and names the set
 #         that COVERS the overage, min-of-two never RAISES a total, a re-run
-#         failure keeps its pass, and no workflow passes the new flag.
+#         failure keeps its pass, and no workflow passes the new flag. The CONTROL
+#         olivia asked for: same flapping harness, one real harness added between
+#         two runs — the min rescues the first and reds the second, so it removes
+#         weather and not cost, measured rather than argued.
 #  13-14  the over-budget message actually names a remedy and the slowest file —
 #         a budget that reds without saying what to retire is a warning with a
 #         worse exit code (feedback: grade the REMEDY half, not only the predicate).
@@ -476,7 +479,7 @@ else
   bad "probe mutant-kill arms" "NOT REACHED: could not symlink $PROBE into $FAKE — arms 27-30 graded nothing"
 fi
 
-# ------------------------------------- 31-38 DIVE-2592: A BUDGET RED CONFIRMS ITSELF
+# ------------------------------------- 31-41 DIVE-2592: A BUDGET RED CONFIRMS ITSELF
 # The measurement that forced this: PR #395 red at 356s and green at 289s on the SAME
 # commit, no rebase — a 67s swing, all of it inside one network-priced harness. A cap
 # compared against ONE noisy sample reds PRs on content they did not change, so an
@@ -564,6 +567,41 @@ C4="$(bash "$RUNNER" --corpus-dir="$TMP" --tier=full --budget=1 --label=t 2>&1)"
 if (( RC4 == 4 )) && [[ "$C4" == *"FLAKE"* && "$C4" == *"flake.sh"* ]]; then
   ok "a harness that fails its RE-RUN keeps its pass (exit 4, not 1) and is reported as a flake"
 else bad "a harness that fails its RE-RUN keeps its pass (exit 4, not 1) and is reported as a flake" "rc=$RC4 out=$C4"; fi
+
+# CONTROL (olivia, grading DIVE-2592): DOES THE MIN STILL SEE GROWTH?
+# The whole defence of min-of-two is that it removes WEATHER and keeps GROWTH — and
+# that was an argument, not a measurement, which is exactly the kind of claim this
+# corpus is supposed to refuse. So measure it, differentially: the SAME flapping
+# harness in both runs, one harness of real cost ADDED between them, nothing else
+# changed. If the min hid growth, the grown corpus would be rescued too.
+rm -f "$TMP"/*.sh "$TMP"/*.seen
+cat > "$TMP/flaps.sh" <<'FLAPS'
+#!/usr/bin/env bash
+[[ -e "$0.seen" ]] && exit 0
+touch "$0.seen"; sleep 1.2; exit 0
+FLAPS
+printf '#!/usr/bin/env bash\nexit 0\n' > "$TMP/tiny.sh"
+G1="$(bash "$RUNNER" --corpus-dir="$TMP" --tier=full --budget=1 --label=t 2>&1)"; GRC1=$?
+g1="$(sed -n 's/.*confirmed \([0-9]*\)s.*/\1/p' <<<"$G1" | head -1)"
+# GROW IT: one more harness that costs its time every single run.
+rm -f "$TMP"/*.seen
+printf '#!/usr/bin/env bash\nsleep 1.2\nexit 0\n' > "$TMP/grew.sh"
+G2="$(bash "$RUNNER" --corpus-dir="$TMP" --tier=full --budget=1 --label=t 2>&1)"; GRC2=$?
+g2="$(sed -n 's/.*confirmed \([0-9]*\)s.*/\1/p' <<<"$G2" | head -1)"
+if (( GRC1 == 0 && GRC2 == 4 )); then
+  ok "GROWTH SURVIVES THE MIN: the confirmation that rescues the flapping corpus does NOT rescue it once one real harness is added"
+else bad "GROWTH SURVIVES THE MIN: the confirmation that rescues the flapping corpus does NOT rescue it once one real harness is added" "rc1=$GRC1 rc2=$GRC2"; fi
+# And the growth is VISIBLE IN THE CONFIRMED NUMBER, not only in the exit code — a
+# min that reported a flat total while reddening would be measuring something else.
+if [[ -n "$g1" && -n "$g2" ]] && (( g2 > g1 )); then
+  ok "the CONFIRMED total rises with the added harness (${g1}s -> ${g2}s): the min removes weather, not cost"
+else bad "the CONFIRMED total rises with the added harness: the min removes weather, not cost" "g1=[$g1] g2=[$g2]"; fi
+# Non-vacuity for the pair above: the second run must have actually RUN the
+# confirmation and reclaimed the flap, or "it went red" proves only that nothing
+# confirmed anything.
+if [[ "$G2" == *"BUDGET CONFIRMATION"* && "$G2" == *"flaps.sh"* ]]; then
+  ok "the grown corpus DID confirm and DID reclaim the flap, and reds anyway"
+else bad "the grown corpus DID confirm and DID reclaim the flap, and reds anyway" "$G2"; fi
 
 # The hatch arm the --budget flag never got (community/wiki/a-budget-with-a-free-
 # escape-hatch-is-a-second-budget-nobody-watches.md): enumerate the hatches from the

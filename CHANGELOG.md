@@ -230,8 +230,11 @@ corpus grew), reds PRs at random on content they did not change.
   states that no test failed, whether the number was measured twice, and the SMALLEST set of
   harnesses that covers the overage — the actionable set, not the top-10 leaderboard.
 - **`tests/baseline_pin_unit.sh` is demoted to the nightly tier**, with the measurement and
-  the cost of the demotion in its header: the same file with the same assertions cost 174.1s
-  in CI, 57.5s in CI four hours earlier, and 2.4s on the control plane.
+  the cost of the demotion in its header. The decision rests on **57.5s — the CI reading on
+  main**, the ordinary case charged to every PR, which is 19% of the whole core budget on its
+  own; 174.1s is the tail and shows the spread, not the cost; 2.4s on the control plane is
+  the control that rules out "expensive file" in favour of "environment-priced file", which
+  is the difference between merge-or-retire and *a wall-clock cap is the wrong instrument*.
 - **HELD BACK, not dropped:** the matching `budget-report` change — printing the nightly
   total in the units of the policy dial, i.e. the minimum number of shards the corpus now
   needs beside the number configured — edits `.github/workflows/full-sweep.yml`, and
