@@ -1496,14 +1496,14 @@ usage: 5dive proof status [--json]                    # LOCAL autonomy badge + c
 per run naming the outcome (PUBLISHED / no-op / FAILED, success included) and
 falls back to journald when the path is unwritable. The installed cron carries
 no `>>` redirect on purpose — the shell opens a redirect BEFORE the publisher
-runs, and an unwritable log silently killed 26h of publishes (DIVE-2044).
+runs, and an unwritable log silently killed 26h of publishes.
 
 `proof status` shows this company's autonomy badge — 1 − asks/shipped over the
-lifetime ledger (OSS-38), materialized from task data: a shipped action is a
+lifetime ledger, materialized from task data: a shipped action is a
 done task; it "needed a human" only if it carried a gate a HUMAN answered (a
 lead/agent clearance does not count). Read-only, local, no publish.
 
-`proof scorecard` (DIVE-1914) breaks autonomy into several dimensions by risk
+`proof scorecard` breaks autonomy into several dimensions by risk
 tier, so a single score is not the only score and therefore not worth gaming.
 The badge stays the HEADLINE number. Local and read-only, like `proof status`.
 Every rendered number is backed by a source proven to exist before the metric
@@ -1521,7 +1521,7 @@ tap. `proof on/off` toggle the daily publisher; `--user` sets the cron's
 effective user (default root), which must own the box's git push credentials or
 the nightly push fails silently as visible staleness. See docs/zero-human.md.
 
-PUBLISHING IDENTITY (DIVE-2051): these are public, permanent commits, so the
+PUBLISHING IDENTITY: these are public, permanent commits, so the
 author is never inferred. It resolves ZH_GIT_NAME/ZH_GIT_EMAIL (env) > the
 identity pinned by `proof on --as-name= --as-email=` > the publishing user's
 `git config --global` — and if none of those is set, `proof publish` REFUSES
