@@ -70,4 +70,8 @@ OUTC="$(ASLEEP_BB=1 COUNCIL_5DIVE_BIN="$FAKE" "$FIVE" council convene "ship it?"
 chk "ordinary motion is NOT liveness-gated" "real-agents" "$(echo "$OUTC" | jq -r '.data.dispatch' 2>/dev/null)"
 
 echo "DIVE-1739 liveness E2E: $P passed, $F failed"
-[ "$F" -eq 0 ]
+rc=0; [ "$F" -eq 0 ] || rc=1
+# DIVE-2573: last stdout line carries the real rc, so a caller who pipes this
+# harness through tail/head still sees the true verdict instead of the pipe's.
+echo "HARNESS-RC=$rc"
+exit "$rc"

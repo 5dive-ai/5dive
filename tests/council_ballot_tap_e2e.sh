@@ -91,4 +91,8 @@ chk "unknown ref -> miss"   "no match" "$(run --ref=DIVE-9999 --vote=a --nonce="
 chk "agent ballot not tap-closable" "no match" "$(run --ref=DIVE-1601 --vote=a --nonce="$NONCE" | jq -r '.reason' 2>/dev/null)"
 
 echo "DIVE-1565 ballot-tap E2E: $P passed, $F failed"
-[ "$F" -eq 0 ]
+rc=0; [ "$F" -eq 0 ] || rc=1
+# DIVE-2573: last stdout line carries the real rc, so a caller who pipes this
+# harness through tail/head still sees the true verdict instead of the pipe's.
+echo "HARNESS-RC=$rc"
+exit "$rc"

@@ -79,4 +79,8 @@ DIG1="$(sha256sum < "$CY" | awk '{print $1}')"
 chk "C file untouched under seal" "$DIG1" "$(sha256sum < "$CY" | awk '{print $1}')"
 
 echo "DIVE-1701 constitution init e2e: $P passed, $F failed"
-[ "$F" -eq 0 ]
+rc=0; [ "$F" -eq 0 ] || rc=1
+# DIVE-2573: last stdout line carries the real rc, so a caller who pipes this
+# harness through tail/head still sees the true verdict instead of the pipe's.
+echo "HARNESS-RC=$rc"
+exit "$rc"

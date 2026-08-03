@@ -105,4 +105,8 @@ chk "D sealedDigest unchanged" "$DIG"   "$(jq -r '.data.sealedDigest' <<<"$D")"
 "$FIVE" constitution show >/dev/null 2>&1; chk "human render exit 0" "0" "$?"
 
 echo "DIVE-1742 constitution show e2e: $P passed, $F failed"
-[ "$F" -eq 0 ]
+rc=0; [ "$F" -eq 0 ] || rc=1
+# DIVE-2573: last stdout line carries the real rc, so a caller who pipes this
+# harness through tail/head still sees the true verdict instead of the pipe's.
+echo "HARNESS-RC=$rc"
+exit "$rc"

@@ -137,4 +137,8 @@ chk "ls empty after rm" "0" "$(5dive --json council schedule ls 2>/dev/null | jq
 5dive council schedule rm ghost >/dev/null 2>&1; chk "rm unknown fails closed (exit 3)" "3" "$?"
 
 echo "CNCL-23 schedule E2E: $P passed, $F failed"
-[ "$F" -eq 0 ]
+rc=0; [ "$F" -eq 0 ] || rc=1
+# DIVE-2573: last stdout line carries the real rc, so a caller who pipes this
+# harness through tail/head still sees the true verdict instead of the pipe's.
+echo "HARNESS-RC=$rc"
+exit "$rc"

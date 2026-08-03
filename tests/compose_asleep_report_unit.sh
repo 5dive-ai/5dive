@@ -94,4 +94,8 @@ fi
 
 echo "-----"
 echo "compose_asleep_report_unit: $pass passed, $fail failed"
-[[ $fail -eq 0 ]]
+rc=0; [[ $fail -eq 0 ]] || rc=1
+# DIVE-2573: last stdout line carries the real rc, so a caller who pipes this
+# harness through tail/head still sees the true verdict instead of the pipe's.
+echo "HARNESS-RC=$rc"
+exit "$rc"

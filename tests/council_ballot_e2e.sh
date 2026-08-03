@@ -80,4 +80,8 @@ if grep -q "^agent ask" "$FLOG"; then chk "--ask-rail uses the agent-ask rail" "
 if grep -q "^task add" "$FLOG"; then chk "--ask-rail does NOT mint a ballot task" "no" "yes"; else chk "--ask-rail does NOT mint a ballot task" "no" "no"; fi
 
 echo "CNCL-18 ballot E2E: $P passed, $F failed"
-[ "$F" -eq 0 ]
+rc=0; [ "$F" -eq 0 ] || rc=1
+# DIVE-2573: last stdout line carries the real rc, so a caller who pipes this
+# harness through tail/head still sees the true verdict instead of the pipe's.
+echo "HARNESS-RC=$rc"
+exit "$rc"
