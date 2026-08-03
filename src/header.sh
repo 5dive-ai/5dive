@@ -694,18 +694,35 @@ declare -A HERMES_PROVIDER_MODEL=(
   # `novita`, and DOTTED as claude-sonnet-4.5 under `copilot` and `novita`.
   # So a grep is blind twice over: wrong provider, and wrong spelling of the
   # same model. See DIVE-2607.
+  #
+  # And hermes has TWO catalogs per provider, which disagree:
+  # curated_models_for_provider() prefers a LIVE models.dev/API fetch
+  # (provider_model_ids) and falls back to the static _PROVIDER_MODELS only when
+  # that fetch fails. `gemini` and `deepseek` are both in _MODELS_DEV_PREFERRED,
+  # so the live list is the one that resolves a BYO pin — and it is SMALLER:
+  # static deepseek carries deepseek-v4-pro, live carries only chat/reasoner.
+  # DIVE-2607 cleared deepseek-v4-pro against the weaker list. So these pins are
+  # chosen from the INTERSECTION of live and static: the pin then resolves
+  # whichever catalog wins at runtime, including with the network down.
+  # See DIVE-2628 and community/wiki/a-byo-model-pin-can-only-be-graded-off-ci.md.
   [anthropic]="claude-sonnet-5"
-  [google]="gemini-2.0-flash"
-  [deepseek]="deepseek-v4-pro"
+  [google]="gemini-3.5-flash"
+  [deepseek]="deepseek-chat"
   [moonshot]="kimi-k2-turbo-preview"
   [openrouter]="openrouter/auto"
 )
 declare -A OPENCLAW_PROVIDER_MODEL=(
   [openai]="openai/gpt-4o"
   [anthropic]="anthropic/claude-sonnet-5"
+  # openclaw's catalog is namespace-qualified and it enumerates no `google/`
+  # lines at all, so [google] cannot be graded by that oracle and is left as it
+  # is — an absence there means nothing (DIVE-2626). deepseek/moonshot ARE
+  # enumerated, and both pins below were absent from their own namespace until
+  # DIVE-2628 (openclaw 2026.7.1-2: moonshot carries only k2.6 / k2.7-code,
+  # deepseek only chat / reasoner).
   [google]="google/gemini-2.0-flash"
-  [deepseek]="deepseek/deepseek-v4-pro"
-  [moonshot]="moonshot/kimi-k2-instruct"
+  [deepseek]="deepseek/deepseek-chat"
+  [moonshot]="moonshot/kimi-k2.6"
   [openrouter]="openrouter/auto"
 )
 declare -A BYO_PROVIDER_LABEL=(
