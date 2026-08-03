@@ -68,14 +68,14 @@
 # cmd_watch.sh, which build.sh ships verbatim) out of the census. Re-run all three
 # when this file is touched — the population is what drifts, not the mechanism.
 #
-# MUTATION GRADE — RUN, not asserted. RE-TAKEN AT 1b50763 (this branch rebased onto
-# 089f7d2), twice: once before the rebase and once after, identical both times.
-# Re-taken because iteration 2 changed src/ and the previous table's
+# MUTATION GRADE — RUN, not asserted. RE-TAKEN AT 6c35c00, on the branch merged with
+# main (8412b71). Re-taken because iteration 2 changed src/, so the previous table's
 # "`git diff a2c41bf HEAD -- src/` is EMPTY" no longer held — a mutation score
-# transfers only while the graded tree is the shipped one, and a rebase moves the
-# tree. Nothing after 1b50763 touches src/ (only this comment block), so
-# `git diff 1b50763 HEAD -- src/` is empty and the graded mechanism is the shipped
-# one. Eight mutations, each applied to the committed tree and reverted
+# transfers only while the graded tree is the shipped one. Taken three times in all
+# (pre-merge, on a rebase that was abandoned to keep the PR fast-forward, and here)
+# with identical results. Nothing after 6c35c00 touches src/ (only this comment
+# block), so `git diff 6c35c00 HEAD -- src/` is empty and the graded mechanism is
+# the shipped one. Eight mutations, each applied to the committed tree and reverted
 # after (`git checkout -- src/`, tree verified clean at the end); every one turns
 # this file red, on the arms named. Baseline 15/0, 1.7s on the dev box.
 #   * `push_exit_handler() { : ; }`                -> 14/1 (arm 10)
