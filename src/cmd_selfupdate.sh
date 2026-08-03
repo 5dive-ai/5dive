@@ -85,6 +85,23 @@ cmd_self_update() {
     fi
   fi
 
+  # DIVE-2214: install.sh (refresh_managed_files, --upgrade path included) just
+  # wrote its provenance to $STATE_DIR/last-install.json — read it back so this
+  # JSON says WHAT landed, not just what got restarted afterward. A roll that
+  # lands the wrong tree and one that lands the right one used to print
+  # identically; carrying sha/version here is how a caller tells them apart.
+  # Absent/unreadable is reported as nulls, never fatal — the upgrade already
+  # succeeded (line 51) by the time we get here.
+  local prov='{}' prov_version="null" prov_sha="null" prov_tag="null"
+  if [[ -f "$STATE_DIR/last-install.json" ]]; then
+    prov="$(cat "$STATE_DIR/last-install.json" 2>/dev/null)" || prov='{}'
+    if jq -e . <<<"$prov" >/dev/null 2>&1; then
+      prov_version="$(jq -c '.version // null' <<<"$prov")"
+      prov_sha="$(jq -c '.sha // null' <<<"$prov")"
+      prov_tag="$(jq -c '.tag // null' <<<"$prov")"
+    fi
+  fi
+
   local r f prose
   r=$(json_array "${restarted[@]}")
   f=$(json_array "${failed[@]}")
@@ -92,8 +109,9 @@ cmd_self_update() {
   (( ${#failed[@]} )) && prose+=", ${#failed[@]} failed to restart"
   [[ "$listener_refreshed" == "true" ]] && prose+=", team-bot listener refreshed"
   ok "$prose" \
-     '{restarted:$r, restarted_count:($r|length), failed:$f, listener_refreshed:$lr}' \
-     --argjson r "$r" --argjson f "$f" --argjson lr "$listener_refreshed"
+     '{restarted:$r, restarted_count:($r|length), failed:$f, listener_refreshed:$lr, version:$v, sha:$s, tag:$t}' \
+     --argjson r "$r" --argjson f "$f" --argjson lr "$listener_refreshed" \
+     --argjson v "$prov_version" --argjson s "$prov_sha" --argjson t "$prov_tag"
 }
 
 # version_lt A B — true when semver A is strictly older than B (sort -V).

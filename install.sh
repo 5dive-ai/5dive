@@ -882,6 +882,33 @@ MANAGED
       git -C "$_cli_co" config --local core.hooksPath scripts/git-hooks 2>/dev/null         && ok "pii-push-guard wired ($_cli_co)"
     fi
   done
+
+  # DIVE-2214: GH_PINNED_SHA/GH_PINNED_TAG are resolved above (DIVE-1977 block)
+  # but were local to THIS process — nothing downstream could see which tree
+  # actually landed. `5dive self-update`'s JSON reports only what it restarted
+  # ({restarted, restarted_count, failed, listener_refreshed}), never what it
+  # installed, so a roll that lands the wrong tree and one that lands the right
+  # one print identically. Persist the provenance every refresh resolves so
+  # callers (cmd_selfupdate.sh, 5dive-api's update.sh) can read and carry it
+  # instead of re-deriving or omitting it. Best-effort, like record_sibling_sha:
+  # a box that can't write its own receipt should still finish updating.
+  if command -v jq >/dev/null 2>&1 && [[ -d "$STATE_DIR" ]]; then
+    local _prov_tmp _prov_ver
+    _prov_ver="$(grep -m1 'readonly FIVE_VERSION=' "$BIN_DIR/5dive" 2>/dev/null | sed -E 's/.*="([^"]+)".*/\1/')" || _prov_ver=""
+    _prov_tmp="$(mktemp "$STATE_DIR/.last-install.XXXXXX" 2>/dev/null)" || _prov_tmp=""
+    if [[ -n "$_prov_tmp" ]] && jq -cn \
+         --arg version "$_prov_ver" --arg sha "${GH_PINNED_SHA:-}" \
+         --arg tag "${GH_PINNED_TAG:-}" --arg at "$(date -u +%FT%TZ)" \
+         '{version: (if $version == "" then null else $version end),
+           sha: (if $sha == "" then null else $sha end),
+           tag: (if $tag == "" then null else $tag end),
+           installed_at: $at}' \
+         >"$_prov_tmp" 2>/dev/null; then
+      mv -f "$_prov_tmp" "$STATE_DIR/last-install.json"
+    else
+      rm -f "$_prov_tmp"
+    fi
+  fi
 }
 
 # --- Subcommand dispatch ---------------------------------------------------
