@@ -1,4 +1,25 @@
 #!/usr/bin/env bash
+# TIER: nightly — 174.1s measured (CI pristine, 2026-08-03, PR #395 attempt 1): priced by the network, not by its assertions, so a wall-clock cap cannot budget it.
+#
+# THE DEMOTION ARGUMENT, because a demotion nobody has to justify is a second budget
+# nobody watches. The SAME file with the SAME assertions cost 174.1s on that run, 57.5s
+# on main in CI four hours earlier, and 2.4s on the control plane (agent-dev, same day,
+# 18 passed / 0 failed). Nothing in the file changed between those three readings. Its
+# cost is REMOTE RESOLUTION: arm C verifies that every pinned baseline is a commit that
+# resolves HERE, and a pin absent from the local object store falls back to
+# `git fetch origin <sha>` — one network round trip to github.com per unresolved pin.
+# So its wall-clock is a property of the runner's link, not of the corpus, which makes
+# it UNBUDGETABLE IN A WALL-CLOCK CAP BY CONSTRUCTION rather than merely expensive: at
+# its high end it is 58% of the entire 300s PR core on its own, and it red-flagged PR
+# #395 on content that never touched it (DIVE-2592).
+#
+# WHAT THE DEMOTION COSTS, said plainly rather than left for the next reader to find: a
+# PR that introduces a NEW branch-ref baseline is now caught by the nightly sweep rather
+# than at review time. That is the whole loss. The nightly still runs this file every
+# day, `changed-harnesses` still runs it on any diff that touches it, and arm C's own
+# subject — that a pin resolves in the environment that gates the merge — is graded in
+# the environment that has always had the full history (full-sweep checks out depth 0).
+#
 # DIVE-2229 unit: a test baseline must name a COMMIT, and it must RESOLVE in the
 # environment that gates the merge.
 #
