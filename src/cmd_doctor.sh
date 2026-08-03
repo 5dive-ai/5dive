@@ -90,6 +90,57 @@ doctor_check_audit_drop_dir() {
     "$dir is a directory with mode 2770 and group $expected_group; lost audit rows can leave a drop marker"
 }
 
+# doctor_check_reaped_homes [dir]
+#
+# DIVE-2138 quarantines a removed agent's home under REAPED_DIR instead of
+# deleting it: the home can hold credentials (auth.json, credentials.toml,
+# channel .env) an operator still wants, and delete is not the moment to make
+# that call irreversibly. DIVE-2165 is lodar's decision on what happens next —
+# option B: no TTL, stay operator-managed forever, but STOP being invisible
+# (root:root 0700 means it never shows up in a normal `ls`). This check is
+# that visibility, and nothing else: count + oldest age, never a size (`du`
+# here would slow the periodic `doctor --json` poll the same way the
+# worktree-residue check below avoids it), and it never deletes anything.
+doctor_check_reaped_homes() {
+  local dir="${1:-$REAPED_DIR}"
+  if [[ ! -e "$dir" ]]; then
+    doctor_add host reaped-homes ok "$dir does not exist — no quarantined agent homes"
+    return 0
+  fi
+  if [[ ! -d "$dir" || -L "$dir" ]]; then
+    doctor_add host reaped-homes error \
+      "$dir exists but is not a real directory — quarantine (DIVE-2138) cannot land there; a later \`agent rm\` will warn and leave the home in place"
+    return 0
+  fi
+
+  local mode
+  mode=$(stat -c '%a' "$dir" 2>/dev/null) || mode="unknown"
+  if [[ "$mode" != "700" ]]; then
+    doctor_add host reaped-homes warn \
+      "$dir is mode $mode, not 700 — quarantined homes here can hold credentials (auth.json, credentials.toml, channel .env) and must not be group/world-readable"
+  fi
+
+  local n=0 oldest_ts=0 oldest_name="" entry ts
+  while IFS= read -r entry; do
+    [[ -n "$entry" ]] || continue
+    n=$((n + 1))
+    ts=$(stat -c '%Y' "$entry" 2>/dev/null || echo 0)
+    if (( oldest_ts == 0 || ts < oldest_ts )); then
+      oldest_ts=$ts
+      oldest_name=$(basename "$entry")
+    fi
+  done < <(find "$dir" -mindepth 1 -maxdepth 1 2>/dev/null)
+
+  if (( n == 0 )); then
+    doctor_add host reaped-homes ok "$dir exists, 0 quarantined agent homes"
+    return 0
+  fi
+
+  local days=$(( ($(date +%s) - oldest_ts) / 86400 ))
+  doctor_add host reaped-homes ok \
+    "$n quarantined agent home(s) under $dir, oldest is ${oldest_name} (~${days}d old) — operator-managed by design (DIVE-2165, no TTL); delete by hand once you're sure: sudo rm -rf $dir/<name>"
+}
+
 cmd_doctor() {
   require_root
   local filter="" want_fix=0 dry=0
@@ -634,6 +685,9 @@ cmd_doctor() {
     else
       doctor_add host worktrees ok "${_wtn} worktrees under $WORKTREE_ROOT, ${_nmn} node_modules trees"
     fi
+
+    # --- quarantined agent homes (report only, DIVE-2165) ---
+    doctor_check_reaped_homes
 
     if ! command -v needrestart >/dev/null 2>&1 && [[ ! -d /etc/needrestart ]]; then
       doctor_add host needrestart ok "needrestart not installed — no auto-restart cascade risk"
