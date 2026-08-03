@@ -26,7 +26,7 @@ USAGE
 }
 
 cmd_org() {
-  [[ $# -gt 0 ]] || { _org_usage; exit "$E_USAGE"; }
+  [[ $# -gt 0 ]] || { _org_usage; mark_reported; exit "$E_USAGE"; }
   local sub="$1"; shift
   case "$sub" in
     set)             cmd_org_set "$@" ;;

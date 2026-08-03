@@ -1,5 +1,40 @@
 # Changelog
 
+## Unreleased — fix(cli): a non-zero exit now always carries a reason (DIVE-2598)
+
+`5dive task done DIVE-XXXX --result="plain text no refs"` exited **1** with zero bytes on
+stdout *and* stderr, and left the row open. Nothing printed, nothing logged to the caller.
+A caller that pipes to `head` and reads `$?` sees a number with no message attached to it;
+one that reads only output sees success. It took a `bash -x` of the installed binary to
+find, which is the tell: the product itself said nothing.
+
+The line was an unguarded `_br_cands=$(_gate_branch_refs_from_text ...)`. That pipeline ends
+in `grep`, which exits 1 when it matches nothing — the normal case, since most results name
+no branch. `pipefail` promotes it, and under `set -euo pipefail` a bare `var=$(...)` takes
+the whole process down **before any handler runs**. DIVE-2603 guarded that line. DIVE-2566
+was the same shape in `5dive push` one file over, in the same release.
+
+Two per-line guards do not make the third unguarded substitution less likely, so this
+release adds the missing **property** rather than a third guard: whatever kills the CLI, the
+exit says something.
+
+- `fail()` — which every reported error funnels through, `policy_refuse()` included — now
+  marks the exit **reported**, after it prints.
+- The `EXIT` trap reports anything else: verb, code, that the command did **not** run to
+  completion so its effect is unknown, how to locate it (`bash -x $(command -v 5dive) …`),
+  and `5dive bug`. Under `--json` it emits a real `{ok:false,error:{…}}` envelope, because
+  an empty stdout is worse for a parser than for a person.
+- The marker is a **file**, not a variable: `fail()` runs inside command substitutions and
+  `flock` subshells whose writes the exiting parent cannot see. Getting this wrong would
+  print two messages for every subshell error — the real one, and a backstop claiming there
+  wasn't one.
+- Signals (130/143) are not unreported failures and stay quiet.
+
+`tests/silent_nonzero_exit_backstop_unit.sh` grades it against a real induced death in a
+real built bundle (`sqlite3` stubbed dead on `PATH`), with the same run against a
+backstop-neutered mutant of that bundle as the differential — so the arm cannot pass by
+grading a death that no longer happens.
+
 ## Unreleased — fix(init): the `codex` recipe asked nvm which node it SELECTED, not npm where it INSTALLED (DIVE-2596)
 
 `sudo 5dive agent create --type=codex` aborted with

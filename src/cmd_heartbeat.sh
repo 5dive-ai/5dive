@@ -337,7 +337,7 @@ USAGE
 }
 
 cmd_heartbeat() {
-  [[ $# -gt 0 ]] || { _hb_usage; exit "$E_USAGE"; }
+  [[ $# -gt 0 ]] || { _hb_usage; mark_reported; exit "$E_USAGE"; }
   local sub="$1"; shift
   case "$sub" in
     on|enable)       with_registry_lock cmd_heartbeat_on "$@" ;;

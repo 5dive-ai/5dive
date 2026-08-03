@@ -28,6 +28,61 @@ JSON_MODE=0
 # needing to know how it was reached.
 CURRENT_VERB=""
 
+# ---------------------------------------------------------------------------
+# DIVE-2598 — THE SILENT NON-ZERO, AND WHY IT NEEDS A BACKSTOP AND NOT A FIX.
+#
+# `set -euo pipefail` (src/header.sh) is the right default for this script and it
+# is not going away. Its cost is that ANY unguarded command failure terminates the
+# process AT THAT LINE — before the handler reaches its own error path, so nothing
+# is printed on stdout OR stderr and the caller gets a bare exit code with no
+# reason attached to it. Twice in one release that was a `var=$(<probe>)` around a
+# pipeline ending in `grep`, which exits 1 on no-match: DIVE-2566 killed `5dive
+# push`, DIVE-2603 killed `5dive task done` for every caller whose result text
+# named no branch. Both were found by `bash -x` on the installed binary, because
+# the product itself said nothing at all.
+#
+# Each of those got its own `|| var=""`. That is the correct fix for the line, and
+# it is not a fix for the CLASS: the next unguarded substitution is a normal thing
+# to write and will present identically. What is missing is not another guard, it
+# is a REPORTER — the property that this CLI never exits non-zero silently,
+# whatever killed it.
+#
+# WHY A FILE AND NOT A VARIABLE. `fail()` runs inside command substitutions and
+# `flock` subshells, whose variable writes are invisible to the parent that will
+# actually exit and fire the EXIT trap. A marker file is written by the subshell
+# and read by the trap. `$$` (deliberately, not `$BASHPID`) is the same value in
+# every subshell of one invocation and different in a nested `5dive` child, so the
+# path is exactly per-invocation. Cleared at load, so a stale file from a
+# same-pid predecessor can only make us MISS a report — never invent one.
+FIVE_REPORTED_FLAG="${TMPDIR:-/tmp}/.5dive-reported.$(id -u 2>/dev/null || echo x).$$"
+rm -f "$FIVE_REPORTED_FLAG" 2>/dev/null || true
+
+# mark_reported — "this exit already told the caller why". Called by fail(), which
+# every reported error in this CLI funnels through (including policy_refuse). Any
+# other deliberate non-zero exit that prints its own reason first — the
+# `<verb>_usage; exit "$E_USAGE"` sites — calls it too.
+mark_reported() { : > "$FIVE_REPORTED_FLAG" 2>/dev/null || true; }
+
+# _report_silent_exit <code> — the backstop itself, fired from the EXIT trap.
+_report_silent_exit() {
+  local code="${1:-0}"
+  if (( code == 0 )) || [[ -e "$FIVE_REPORTED_FLAG" ]]; then
+    rm -f "$FIVE_REPORTED_FLAG" 2>/dev/null || true
+    return 0
+  fi
+  # 130/143 are Ctrl-C and SIGTERM. A signal is not an unreported failure — the
+  # person who sent it knows why it died, and `watch`/`supervisor` exit this way
+  # by design.
+  (( code == 130 || code == 143 )) && return 0
+  local verb="${CURRENT_VERB:-}"
+  local msg="5dive${verb:+ $verb} exited $code without reporting a reason. This is a bug in the CLI, not a refusal: a command failed under \`set -euo pipefail\` and ended the run before any error path could print. The command did NOT run to completion and its effect is UNKNOWN — re-read the object (\`5dive task show\`, \`5dive agent list\`) before retrying. To locate it: \`bash -x \$(command -v 5dive) ${verb:-<verb>} ...\` and read the last line before the exit. Please file it: \`5dive bug\`."
+  if (( JSON_MODE )); then
+    jq -cn --argjson c "$code" --arg m "$msg" \
+      '{ok:false, error:{code:$c, class:"generic", message:$m}}' 2>/dev/null || true
+  fi
+  echo "error: $msg" >&2
+}
+
 # fail <code> <message>
 # Always exits. In JSON mode, prints envelope on stdout AND a plain line on
 # stderr (for logs). In text mode, prints prose on stderr only. Exit status
@@ -72,6 +127,11 @@ fail() {
   if [[ "$code" == "${E_GENERIC:-1}" ]]; then
     echo "hint: run '5dive bug --verb=\"${CURRENT_VERB:-unknown}\" --exit=$code' to preview a diagnostic bug report (allowlisted fields only; nothing is filed until you add --file)" >&2
   fi
+  # DIVE-2598: this exit carries a reason, so the EXIT-trap backstop stays quiet
+  # for it. Set AFTER the message is emitted, never before — the flag asserts "the
+  # caller WAS told", and claiming it earlier would silence the backstop for a
+  # death between the claim and the print.
+  mark_reported
   exit "$code"
 }
 
