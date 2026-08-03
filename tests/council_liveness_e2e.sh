@@ -6,7 +6,7 @@
 # ordinary-class motion is NOT gated. A FAKE `5dive` at COUNCIL_5DIVE_BIN stands in for the fleet
 # (agent list health / agent send / task add|show). SKIPs green when node/jq missing or build fails.
 # Exit 0 == green.
-set -u
+set -uo pipefail
 
 # DIVE-2211: name the tree this harness grades (tests/lib/grading_tree.sh).
 # Three-state: if the helper is unreachable (a staged copy that did not carry

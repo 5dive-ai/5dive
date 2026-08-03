@@ -45,6 +45,52 @@ dropping them silently — a silent drop was the failure mode to avoid:
 The memory-section filename is read off an HTML-comment sentinel and becomes a path,
 so it is validated against `^[A-Za-z0-9._-]+\.md$` — a traversal name is dropped
 while clean facts in the same file still land.
+## Unreleased — feat(a2a): stamp `via=` when the claimed sender and the measured caller diverge (DIVE-2552)
+
+Every `[5dive-msg ...]` stamp site already held both values and never compared them:
+
+```bash
+sender="$from"                       # CLAIMED  — from --from=, format-validated only
+_caller="$(_envelope_caller)"        # MEASURED — a --from flag cannot move it (this is cmd_send)
+_tier="$(envelope_tier "$_caller")"  # ...the measured one was used for tier=, and nothing else
+```
+
+So `5dive agent send X --from=marcus`, run by dev, rendered
+`[5dive-msg from=marcus id=... tier=admin]` — byte-for-byte identical to a send marcus
+actually made. `tier=` does not catch it: DIVE-1064/2210 built that field against a
+**cross-tier** peer, and dev and marcus are both `admin`, so the unforgeable field agrees
+with the forged one and corroborates it.
+
+Now the two are compared at all three acceptors (`send`, `ask`, `_deliver`) and the result
+is stamped:
+
+```
+[5dive-msg from=marcus id=… tier=admin]                              marcus really sent it
+[5dive-msg from=marcus id=… tier=admin via=dev]                      dev asserted --from=marcus
+[5dive-msg from=marcus id=… tier=unknown:no-caller via=unknown:no-caller]   nothing measured the claim
+```
+
+Not a refusal, deliberately: rejecting a `--from` that is not the caller breaks the
+legitimate synthetic-label senders (`loop`, `task-engine`, `council`, `verifier`, `ask`,
+`comment-watch`, `blocker-push`, `community-heartbeat`), none of which are agent names.
+The marker keeps them working and hands the receiver the fact instead.
+
+`via=` is absent on the ordinary path, and absence is itself a measurement — it is
+produced by exactly one branch (measured, and the claim matched). Every path that could
+not measure stamps a reason (`unknown:no-caller`, `unknown:malformed-caller`) rather than
+nothing, which is DIVE-2210's property carried onto the new field. Reading the output:
+absence of `via=` means "built before this release" **or** "the claim matched" — it does
+not mean "unchecked".
+
+`via=` is exactly as trustworthy as `tier=` and no more, and that holds at every site:
+both fields read the same measured caller there, so neither can be true while the other
+is forged. **What that caller is differs by site, though, and the marker inherits it.**
+`send` and `ask` resolve it through `_envelope_caller`, which reads the real EUID first —
+a forged `SUDO_USER` cannot move it. `_deliver` does not: it takes `${SUDO_USER#agent-}`
+directly with no EUID fallback, so its `via=` carries `tier=`'s existing dependency on
+`SUDO_USER` unchanged, and a caller that is not `agent-*` reads as `human` there rather
+than resolving. That is pre-existing behaviour on the tier field and this change neither
+worsens nor repairs it; `envelope_sender_fallback_unit` T6c pins it so it stays visible.
 
 ## Unreleased — fix(push): resolve the App installation PER REPO, not from one pinned id (DIVE-2563)
 
