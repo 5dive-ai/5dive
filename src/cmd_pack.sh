@@ -775,7 +775,7 @@ _pack_usage() {
 5dive agent export / import — portable agent packs (DIVE-39)
 
   5dive agent export <name> [--format=pack|agents-md] [--with-memory]
-                            [--approve-memory=<dir>] [-o <path>|--out=<path>]
+                            [--approve-memory=<dir>] [--audience=publish|self] [-o <path>|--out=<path>]
                                   # write a shareable pack. Default = config only.
                                   # --format=agents-md (DIVE-2565) writes ONE markdown
                                   # file that IS an AGENTS.md: YAML frontmatter = the
@@ -785,6 +785,17 @@ _pack_usage() {
                                   # 5dive installed. Skills travel as NAMES not bodies and
                                   # hooks are never carried; the file says both out loud.
                                   # 'agent import <file.md>' splits it back.
+                                  # --audience (DIVE-2567) picks who the pack is FOR, and
+                                  # DEFAULTS TO publish: staged memory is scanned for
+                                  # operational detail (host paths, agent/human names,
+                                  # hostnames, task ids, repo names, chat ids, sudo posture,
+                                  # credential locations) and the export is REFUSED naming
+                                  # file, line and category. Nothing is ever silently
+                                  # redacted. --audience=self (own backup / clone on your own
+                                  # box) skips that scan — never publish a self pack.
+                                  # It gates BOTH containers: the scan runs before the
+                                  # format branch, so the tarball and the single-file
+                                  # AGENTS.md are covered by construction, not by two rules.
                                   # --with-memory is a TWO-PHASE deny-by-default flow:
                                   #   1) export <name> --with-memory  -> writes a scoped persona
                                   #      DRAFT (only reference/project knowledge facts; private
@@ -845,6 +856,154 @@ _pack_secret_tripwire() {
     return 1
   fi
   return 0
+}
+
+# --- DIVE-2567: the memory leak-check, ENFORCED on the export path -----------
+#
+# character-packs/README.md has always REQUIRED that a published pack carry
+# "distilled seed memory ... never raw private memory or secrets". That rule was
+# DOCUMENTED AND NOT ENFORCED: nothing in the CLI or CI had ever looked at memory
+# CONTENT on the way out. It survived only because five packs ship memory and a
+# human wrote each one. A one-command memory export (DIVE-2565) makes raw memory
+# an artifact users hand to strangers, at a volume where hand-review is fiction.
+#
+# IT DETECTS CATEGORIES, NOT KNOWN VALUES. The repo-scoped pre-push guard
+# (DIVE-1774) hashes a curated denylist — correct for its job and zero false
+# positives — but it only ever sees the value it was told about. Agent memory is
+# written at RUNTIME by an agent recording the operational specifics of a real
+# deployment, so the leaky value is by definition the one nobody enrolled. Each
+# rule below therefore describes a SHAPE of operational fact, and the identity
+# roster is derived from the box at scan time rather than maintained by hand.
+#
+# IT NEVER REDACTS. A silent scrub teaches the operator their memory exported
+# clean when it did not; every hit is refused with file, line and category so the
+# human distills that fact — states the LESSON without the host/name/id.
+
+# Names this deployment knows: agent accounts on the box + the registry. DERIVED,
+# so it covers whoever exists HERE rather than a list someone must remember to
+# update. Empty is a legitimate answer (no agents) — the pattern rules still run.
+# Roster entries that are ORDINARY ENGLISH or a generic role noun are dropped.
+# Measured, not guessed: with them in, all five published character-packs failed
+# this gate, on lines like "commit to main" and "Creative lessons distilled" —
+# a gate that red-flags every honest pack is a gate somebody turns off.
+# The cost is a real blind spot (an agent literally named 'main' goes unnamed),
+# and it is the SAFE direction to be wrong in: this list can only make the scan
+# quieter about generic words, never about a specific one, and such a fact almost
+# always carries a path, host or task id on the same line anyway.
+_PACK_LEAK_GENERIC='main|dev|ops|admin|root|test|demo|prod|staging|sandbox|agent|user|team|lead|bot|api|app|web|data|core|base|node|host|code|claude|marketing|creative|design|sales|support|product|research|engineering|finance|legal|security|growth|docs|infra|platform|mobile|council|blog|api'
+
+_pack_leak_roster_raw() {
+  { ls -1 /home 2>/dev/null | sed -n 's/^agent-//p'
+    registry_read 2>/dev/null | jq -r '.agents | keys[]' 2>/dev/null
+  } | tr 'A-Z' 'a-z' | grep -xE '[a-z][a-z0-9_-]{2,}' 2>/dev/null | sort -u || true
+}
+
+# Names that are unambiguous: a hit anywhere in the text is a hit.
+_pack_leak_roster() { _pack_leak_roster_raw | grep -xvE "$_PACK_LEAK_GENERIC" || true; }
+
+# Names that collide with ordinary English. Dropping them outright left a hole
+# olivia named at review: an agent literally called 'main' would never be caught.
+# They are not dropped — they are held to a NARROWER rule, and fire only where the
+# word is used as an ACTOR ("hand it back to main"), never as a noun ("commit to
+# main"). The discriminator is the verb in front, which is what distinguishes a
+# person from a branch; a stop-list alone cannot see that difference.
+_pack_leak_roster_generic() { _pack_leak_roster_raw | grep -xE "$_PACK_LEAK_GENERIC" || true; }
+
+# Verbs and role labels that take a PERSON as their object. Deliberately excludes
+# bare prepositions ("to", "from"): "commit to main" and "rebased from main" are
+# the exact false positives that made the first cut unusable.
+_PACK_LEAK_ACTOR_CUE='(ask|asked|ping|pinged|tell|told|dm|dmed|notify|notified|escalate|escalated|delegate|delegated|route|routed|reassign|assign|assigned|hand|handed|handoff|reviewer|verifier|maker|assignee|owner|owned|cc)'
+
+# Values that are reserved-fake BY CONVENTION (CLAUDE.md) or unroutable by RFC,
+# plus public standards ids. Anchored to the match, which is what `grep -o` emits.
+# The optional `(.* )?` prefix matters: a keyword-anchored rule captures its
+# keyword too ("chat_id 1234567890"), so anchoring the exemption to the START of
+# the match would let a reserved placeholder trip the gate wherever a rule
+# happened to swallow the words in front of it.
+_PACK_LEAK_EXEMPT_RE=': (.* )?((1234567890)'
+_PACK_LEAK_EXEMPT_RE+='|([A-Za-z0-9._%+-]+@example\.(com|org|net))'
+_PACK_LEAK_EXEMPT_RE+='|(([A-Za-z0-9-]+\.)*example\.(com|org|net))|(localhost)'
+_PACK_LEAK_EXEMPT_RE+='|(192\.0\.2\.[0-9]{1,3})|(198\.51\.100\.[0-9]{1,3})|(203\.0\.113\.[0-9]{1,3})'
+_PACK_LEAK_EXEMPT_RE+='|(127\.[0-9.]+)|(10\.[0-9.]+)|(192\.168\.[0-9.]+)|(172\.(1[6-9]|2[0-9]|3[01])\.[0-9.]+)'
+_PACK_LEAK_EXEMPT_RE+='|(0\.0\.0\.0)|(20[0-9]{6})'
+_PACK_LEAK_EXEMPT_RE+='|((RFC|SHA|SHA256|ISO|UTF|AES|RSA|SSH|TLS|HTTP|HTTPS|IPV|UTC|CVE|MD|UUID|OAUTH|ASCII|PBKDF2|BASE)-[0-9]+))$'
+
+# Two name-shaped false positives, both measured against the published packs:
+#   - a roster name inside a contraction. "don" is an agent here AND the stem of
+#     "don't", so the roster fired on ordinary prose. The rule captures the
+#     apostrophe tail so the whole contraction is the match and is dropped here —
+#     which keeps "ask don to review" a hit, where stop-listing the name would not.
+#   - agent-<participle>. "an agent-relayed approval" is a compound adjective, not
+#     an account; the suffix, not a word list, is what tells them apart.
+_PACK_LEAK_NAME_EXEMPT_RE=": identity-name: ([^ ]*'[a-z]{1,3}|agent-[a-z]+(ed|ing|ly|able|ible|less|wide|based|driven|facing))$"
+
+# Scan a memory dir for the categories a published pack must not carry.
+# Prints "<file>:<line>: <category>: <match>" per hit to stderr; 0 clean, 1 hits.
+# <dir> [self-name]. The EXPORTING agent's own name is not a leak in its own pack
+# — the pack is published under it — so it is dropped from the roster. Measured:
+# the shipped 'don' pack opens "# Don — seed memory", and a gate that refuses a
+# persona for being itself is one nobody can satisfy.
+_pack_memory_leakscan() {
+  local dir="$1" self="${2:-}"
+  [[ -d "$dir" ]] || return 0
+  local roster roster_alt="" gen gen_alt="" found
+  roster=$(_pack_leak_roster | grep -xv "${self:-__no_self__}" | paste -sd'|' - 2>/dev/null || true)
+  [[ -n "$roster" ]] && roster_alt="|\\b(${roster})\\b"
+  gen=$(_pack_leak_roster_generic | grep -xv "${self:-__no_self__}" | paste -sd'|' - 2>/dev/null || true)
+  # {0,24}: an actor cue and its object sit in the same clause. Wider, and "ask
+  # olivia whether the deploy to main is safe" reads 'main' as the person asked.
+  [[ -n "$gen" ]] && gen_alt="|\\b${_PACK_LEAK_ACTOR_CUE}\\b[^.!?]{0,24}\\b(${gen})\\b"
+
+  # <category> <case-insensitive:0|1> <ERE>. Categories are exactly the ones the
+  # row enumerates, so a reviewer can map a hit back to the reason it is a leak.
+  local rules=(
+    "host-path|0|(/home/[A-Za-z0-9._-]+|/root\\b|/Users/[A-Za-z0-9._-]+|/srv/[A-Za-z0-9._-]+)"
+    "identity-name|1|(\\bagent-[a-z][a-z0-9_-]*\\b|@[A-Za-z0-9_]{2,}bot\\b|[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.[A-Za-z]{2,}${roster_alt})('[a-z]{1,3})?${gen_alt}"
+    "hostname|1|(\\b[a-z0-9][a-z0-9-]*(\\.[a-z0-9-]+)*\\.(com|ai|io|net|org|dev|sh|app|cloud|xyz|de|co)\\b|\\b([0-9]{1,3}\\.){3}[0-9]{1,3}\\b)"
+    "task-id|0|\\b[A-Z][A-Z0-9]{1,9}-[0-9]{2,6}\\b"
+    "repo-name|1|((git@|https?://)?(github|gitlab|bitbucket)\\.com[:/][A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+|\\brepos?(itory)?[: ]+[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)"
+    "chat-id|1|((chat|message|msg|user|thread|group|telegram|discord)[ _-]?id[ =:#]+[0-9]+|\\b[0-9]{7,19}\\b)"
+    "sudo-posture|1|(\\b(sudo|nopasswd|sudoers|visudo|setuid|euid|uid=0|passwordless root)\\b|root@)"
+    "credential-location|1|(\\b(id_ed25519|id_rsa|\\.netrc|credentials\\.json|secrets?\\.(json|ya?ml|env|txt)|bot_token|api_key|keychain)\\b|\\.ssh/|\\.env\\b|auth[ _-]?profile|token (lives|is stored|sits))"
+  )
+
+  found=$(
+    local rule ctg ci re raw
+    for rule in "${rules[@]}"; do
+      ctg="${rule%%|*}"; rule="${rule#*|}"
+      ci="${rule%%|*}";  re="${rule#*|}"
+      if [[ "$ci" == "1" ]]; then raw=$(grep -rInioE "$re" "$dir" 2>/dev/null || true)
+      else                        raw=$(grep -rInoE  "$re" "$dir" 2>/dev/null || true); fi
+      [[ -n "$raw" ]] || continue
+      # grep -o emits "<path>:<line>:<match>"; a match may itself contain colons,
+      # so take the first two fields and treat the whole remainder as the match.
+      printf '%s\n' "$raw" | awk -F: -v c="$ctg" -v d="$dir/" '
+        { f=$1; l=$2; sub(/^[^:]*:[^:]*:/, "");
+          sub("^" d, "", f); printf "%s:%s: %s: %s\n", f, l, c, $0 }'
+    # Dedupe on the WHOLE finding, then sort STABLY by file+line. `sort -u` with a
+    # field key would have deduped on <file>:<line> alone and silently dropped the
+    # second category on a line that leaks two things — which is the common case
+    # (a repo URL is also a hostname), so the report would under-name the work.
+    done | grep -vE "$_PACK_LEAK_EXEMPT_RE" | grep -vE "$_PACK_LEAK_NAME_EXEMPT_RE" \
+         | awk '!seen[$0]++' | sort -t: -k1,1 -k2,2n -s
+  )
+
+  [[ -n "$found" ]] || return 0
+  printf '%s\n' "$found" >&2
+  return 1
+}
+
+# Two audiences (DIVE-2565). A self-backup or clone-on-my-own-box never crosses
+# the operator's trust boundary, so no scan is required; anything that may be
+# PUBLISHED is scanned and fails closed. The CLI cannot know where a tarball
+# ends up, so PUBLISH is the default and --audience=self is the explicit opt-out.
+_pack_memory_publish_gate() {
+  local audience="$1" dir="$2" self="${3:-}"
+  if [[ "$audience" == "self" ]]; then
+    warn "audience=self — memory leak-check SKIPPED. This pack is for YOUR OWN backup/clone; do not publish it or hand it to anyone else."
+    return 0
+  fi
+  _pack_memory_leakscan "$dir" "$self"
 }
 
 # Locate an agent's persona-memory dir. Memory is keyed by project slug
@@ -1152,11 +1311,12 @@ _agents_md_to_pack() {
 
 cmd_export() {
   require_root
-  local name="" with_memory=0 out="" approve_memory="" format="pack"
+  local name="" with_memory=0 out="" approve_memory="" format="pack" audience="publish"
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --with-memory)      with_memory=1 ;;
       --approve-memory=*) approve_memory="${1#--approve-memory=}"; with_memory=1 ;;
+      --audience=*)       audience="${1#--audience=}" ;;
       --out=*)            out="${1#--out=}" ;;
       # DIVE-2565: -o is the spelling the single-file flow is documented with.
       -o)                 shift; [[ $# -gt 0 ]] || fail "$E_USAGE" "-o needs a path"; out="$1" ;;
@@ -1166,11 +1326,15 @@ cmd_export() {
     esac
     shift
   done
-  [[ -n "$name" ]] || fail "$E_USAGE" "usage: 5dive agent export <name> [--format=pack|agents-md] [--with-memory] [--approve-memory=<dir>] [-o <path>]"
+  [[ -n "$name" ]] || fail "$E_USAGE" "usage: 5dive agent export <name> [--format=pack|agents-md] [--with-memory] [--approve-memory=<dir>] [--audience=publish|self] [-o <path>]"
   case "$format" in
     pack|agents-md) ;;
     *) fail "$E_USAGE" "unknown --format '$format' (known: pack, agents-md)" ;;
   esac
+  # DIVE-2567: default is the STRICT audience. An operator who wants the scan off
+  # has to say which audience they are exporting for; a typo is not a bypass.
+  [[ "$audience" == "publish" || "$audience" == "self" ]] \
+    || fail "$E_USAGE" "--audience must be 'publish' (default, memory leak-check enforced) or 'self' (own backup/clone, scan skipped)"
   require_agent "$name"
   local user="agent-${name}" cdir="/home/agent-${name}/.claude"
 
@@ -1200,10 +1364,19 @@ cmd_export() {
         rm -rf "$draft"
         fail "$E_GENERIC" "a scoped fact tripped the secret tripwire (paths above) — refusing. Tag it 'private: true' or remove the secret, then retry."
       fi
+      # DIVE-2567: the draft exists to be REVIEWED, so here the leak-check REPORTS
+      # rather than refuses — refusing to write the draft would leave the human
+      # nothing to edit. The refusal is at seal time, over the same scan.
+      local leaky=0
+      if [[ "$audience" != "self" ]] && ! _pack_memory_leakscan "$draft" "$name"; then
+        leaky=1
+        warn "the lines above (file:line:category) carry operational detail a PUBLISHED pack must not: distill each one — state the LESSON without the host, name, id or path — or delete it. Sealing REFUSES while any remain (--audience=self exports it unscanned for your own backup)."
+      fi
       chown -R "agent-${name}:agent-${name}" "/home/agent-${name}/.claude/pack-staging" 2>/dev/null || true
       ok "memory DRAFT ready for review — kept $kept knowledge fact(s), excluded $excluded private/opted-out (deny-by-default). REVIEW + EDIT: $draft — then SEAL: 5dive agent export $name --approve-memory=$draft. Nothing is packed until you approve." \
-         '{name:$n, phase:"draft", draft:$d, kept:$k, excluded:$e}' \
-         --arg n "$name" --arg d "$draft" --argjson k "$kept" --argjson e "$excluded"
+         '{name:$n, phase:"draft", draft:$d, kept:$k, excluded:$e, leakCheck:(if $lk==1 then "hits" elif $a=="self" then "skipped" else "clean" end)}' \
+         --arg n "$name" --arg d "$draft" --argjson k "$kept" --argjson e "$excluded" \
+         --argjson lk "$leaky" --arg a "$audience"
       return 0
     else
       # --- SEAL phase: the human reviewed/edited this dir; re-validate + pack it.
@@ -1307,6 +1480,17 @@ cmd_export() {
   if ! _pack_secret_tripwire "$stage"; then
     rm -rf "$stage" "$mem_tmp"
     fail "$E_GENERIC" "refusing to export: a staged file looks like it contains a secret (safety tripwire). Nothing written."
+  fi
+
+  # DIVE-2567: memory CONTENT gate — ONE enforcement point, over the same staged
+  # bytes both containers are built from, placed BEFORE the format branch below.
+  # After DIVE-2565 memory can leave the box by two routes (the .tar.gz and the
+  # single-file AGENTS.md); gating the stage rather than either writer is what
+  # makes that two-and-only-two count irrelevant, and covers the third route the
+  # next format adds. Fails closed for the publish audience.
+  if [[ -d "$stage/memory" ]] && ! _pack_memory_publish_gate "$audience" "$stage/memory" "$name"; then
+    rm -rf "$stage" "$mem_tmp"
+    fail "$E_GENERIC" "refusing to export: staged memory carries operational detail a published pack must not (file:line:category above — host paths, agent/human names, hostnames, task ids, repo names, chat ids, sudo posture, credential locations). Distill those facts — the LESSON without the specifics — and retry; or, for YOUR OWN backup/clone only, re-run with --audience=self. Nothing was written and nothing was silently redacted."
   fi
 
   # DIVE-2565: same stage, different container. Renders AFTER the tripwire above,
