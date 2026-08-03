@@ -103,7 +103,11 @@ _install_bundled_skill() {
   [[ -f "$srcdir/SKILL.md" ]] || return 1
   local user="agent-${name}" home="/home/agent-${name}" type install_dir
   type=$(agent_type "$name"); [[ -n "$type" ]] || return 1
-  install_dir="${SKILLS_INSTALL_DIR[$type]:-.claude/skills}"
+  # DIVE-2583: through the shared resolver, so the destination this function
+  # actually writes to is the same value the export text quotes. Note what this
+  # function does NOT do — it is not type-gated. It runs for EVERY type, which is
+  # why "codex/opencode install none" was wrong in the import direction.
+  install_dir=$(skills_install_dir "$type")
   # DIVE-2370 — THE DESTRUCTIVE SITE. $id reaches here from the pack manifest's skills[]
   # (jq over $stage/manifest.json, i.e. third-party content) via parse_skill_spec, which
   # splits on ":" and validates NOTHING. With id="..", dest resolves to $home/.claude and
@@ -1212,9 +1216,11 @@ _pack_scope_memory() {
 #     default anyway (DIVE-995), so carrying them would only ever be a trap.
 #   - skill BODIES: names travel as refs (exactly as the tarball manifest does).
 #     Inlining bodies would balloon a file whose whole value is being
-#     human-sized, and a harness with no skills directory still gets the NAMES —
-#     visible in the frontmatter, restated in a `## Skills` section, and warned
-#     about by name on import.
+#     human-sized, and every harness still gets the NAMES — visible in the
+#     frontmatter, restated in a `## Skills` section, and warned about by name on
+#     import. DIVE-2583: that is a claim about THIS CONTAINER only. It says
+#     nothing about where import puts a body it CAN resolve — that answer is
+#     skills_install_dir(<type>) and it is non-empty for every type.
 AGENTS_MD_FORMAT_VERSION=1
 
 # Sentinels are HTML comments: invisible in every markdown renderer, ignored by
@@ -1279,17 +1285,33 @@ _agents_md_render() {
   fi
   printf '\n'
 
-  # Skills: names, never bodies — and say so, because a silent drop is the bad
-  # outcome for a harness that has no skills directory.
+  # Skills: names, never bodies — and say so, PER DIRECTION (DIVE-2583). One
+  # sentence used to fuse two different mechanisms and got the joint wrong:
+  #   - EXPORT (this file): carries refs, not bodies. True for EVERY harness.
+  #   - the parenthetical "(codex, opencode)" have no skills directory: false
+  #     about all of them. SKILLS_INSTALL_DIR maps every known type and unmapped
+  #     types fall back, so the category the sentence named is empty.
+  #   - IMPORT: _install_bundled_skill is NOT type-gated and cmd_skill_add resolves
+  #     the same map, so a codex seat that imports DOES get bodies under $HOME.
+  #     Telling that reader "NONE are installed" is the permissive, dangerous half.
+  # So: name the direction, and take the destination from skills_install_dir —
+  # the resolver the installer itself calls — instead of restating a type list.
   local nskills; nskills=$(jq -r '(.skills // []) | length' "$mf")
   if (( nskills > 0 )); then
+    local sk_type sk_dir
+    sk_type=$(jq -r '.config.type // "claude"' "$mf")
+    sk_dir=$(skills_install_dir "$sk_type")
     printf '%s\n' "$AGENTS_MD_S_SKILLS"
     printf '## Skills\n\n'
-    printf 'This agent expects the skills below. They travel as NAMES, not bodies —\n'
-    printf 'the same refs the tarball pack records. `5dive agent import` re-installs\n'
-    printf 'them where it can and reports by name the ones it could not. On a harness\n'
-    printf 'with no skills directory (codex, opencode) NONE are installed: treat this\n'
-    printf 'list as the capabilities the agent was written to assume.\n\n'
+    printf 'This agent expects the skills below. THIS FILE carries their NAMES, not\n'
+    printf 'their bodies — the same refs the tarball pack records — so the file on its\n'
+    printf 'own installs nothing, on any harness.\n\n'
+    printf 'Importing it is the other direction. `5dive agent import` re-resolves each\n'
+    printf 'name from its source repo, installs the ones it can and reports by name the\n'
+    printf 'ones it could not; on a `%s` seat an installed body lands in\n' "$sk_type"
+    printf '`~/%s/<skill>/`. Whether %s then LOADS that directory is the\n' "$sk_dir" "$sk_type"
+    printf "harness's own behaviour and 5dive does not verify it — so treat this list as\n"
+    printf 'the capabilities the agent was written to assume, not as proof it has them.\n\n'
     jq -r '(.skills // [])[] | "- `" + . + "`"' "$mf"
     printf '\n'
   fi
@@ -1696,7 +1718,13 @@ cmd_export() {
     (( has_avatar )) && warn "dropped the avatar (binary): a single-file export carries no image — use --format=pack to keep avatar.png"
     (( n_hooks > 0 )) && warn "dropped $n_hooks hook block(s): a single-file export never carries arbitrary shell (export --format=pack if you need them)"
     local skill_n; skill_n=$(jq -r 'length' <<<"$skills" 2>/dev/null || echo 0)
-    (( skill_n > 0 )) && warn "skills travel as NAMES, not bodies ($skill_n listed in the file) — a harness with no skills directory installs none of them; the file says so"
+    # DIVE-2583: same correction as the rendered section — the FILE carries no
+    # bodies (true everywhere); importing it still installs into the importing
+    # seat's mapped skills dir, so do not tell the exporter that nothing lands
+    # anywhere. No dir is named here on purpose: at export time we do not know
+    # which type the file will be imported onto, and the old text's mistake was
+    # exactly this kind of unearned specificity.
+    (( skill_n > 0 )) && warn "skills travel as NAMES, not bodies ($skill_n listed in the file); the file says so. Importing it re-resolves each name from its source repo and installs what it can into the importing seat's skills dir — every harness has one"
     ok "exported '$name' as a single-file AGENTS.md (memory: $mem_inc) -> $out" \
        '{name:$n, file:$o, format:"agents-md", agentsMdFormat:$f, withMemory:($m != "false"), memory:$m, skills:$s, hooks:"dropped"}' \
        --arg n "$name" --arg o "$out" --argjson f "$AGENTS_MD_FORMAT_VERSION" --arg m "$mem_inc" --argjson s "$skills"

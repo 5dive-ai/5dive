@@ -416,8 +416,27 @@ declare -A SKILLS_AGENT_ID=(
 # and cmd_skill_rm. Probed empirically against npx skills v0.x — if upstream
 # changes a path, update here. Unknown types fall through to ".claude/skills"
 # in the lookup sites below.
+#
+# DIVE-2583 — THE CONTRACT, because prose elsewhere in this repo contradicted it:
+# every value here is $HOME-RELATIVE (it is joined to /home/agent-<name>/ at every
+# call site), and EVERY known type has one. There is no such thing as a 5dive type
+# "with no skills directory": an unmapped type does not get nothing, it gets the
+# .claude/skills fallback. Any sentence claiming a harness has no skills dir is
+# false about this map — see skills_install_dir() below for the resolver that
+# decides it, and use that rather than restating a type list in prose.
+#
+# What this map does NOT claim: that the harness READS the directory. Landing a
+# body is our side; loading it is the harness's. Two entries here are landed-but-
+# unverified and are marked as such (codex/opencode, antigravity) — do not upgrade
+# either note without a live seat.
 declare -A SKILLS_INSTALL_DIR=(
   [claude]=".claude/skills"
+  # codex/opencode: the upstream `npx skills --agent {codex,opencode}` install
+  # path. UNMEASURED, DIVE-2583: whether either binary then SCANS ~/.agents/skills
+  # has never been checked on a live seat — codex is not installed on this box and
+  # its installer fails partway. So a body we land here is landed, not proven
+  # loaded. State the mechanism ("import installs to <dir>"), never the outcome
+  # ("the agent has the skill"), until someone measures it.
   [codex]=".agents/skills"
   [hermes]=".hermes/skills"
   [openclaw]="skills"
@@ -426,6 +445,15 @@ declare -A SKILLS_INSTALL_DIR=(
   # by grepping the antigravity binary for the path constant. Earlier map said
   # .gemini/antigravity-cli/skills (matching its state dir), which was a guess
   # — wrong. Upstream npx skills fallback already lands at .agents/skills.
+  #
+  # DIVE-2583, the unreconciled half of that note: {workspace} is NOT $HOME for a
+  # 5dive agy seat (workdir is a project dir under /home/claude/projects), while
+  # every writer we have — preseed_antigravity_agent, the notify-user seed in the
+  # channel installer, install_default_skill_for_agent — joins this value to
+  # /home/agent-<name>/. If the binary really is workspace-relative, those bodies
+  # are present-but-inert, the same "present is not in effect" trap DIVE-2568 hit
+  # for memory. Nobody has run an agy seat to settle it (no antigravity agent
+  # exists in the fleet — DIVE-2037), so it stays recorded, not resolved.
   [antigravity]=".agents/skills"
   # pi reads user skills from ~/.pi/agent/skills AND ~/.agents/skills (per its
   # resource-loader). We target .agents/skills — the cross-CLI shared dir agy/
@@ -435,6 +463,18 @@ declare -A SKILLS_INSTALL_DIR=(
   [pi]=".agents/skills"
   [grok]=".grok/skills"
 )
+
+# skills_install_dir <type> -> the $HOME-relative dir an installed skill body
+# lands in for that type. THE resolver: this is the expression cmd_pack.sh's
+# import path, cmd_skill add/list/rm and agent_setup.sh each spell by hand, and
+# DIVE-2583 exists because a rendered sentence stated a DIFFERENT answer than the
+# one the installer computed. Anything that TELLS a user where skills go must ask
+# this function, so the claim and the behaviour cannot drift apart. Total by
+# construction — never empty, for any input — which is exactly why "a harness with
+# no skills directory" describes nothing here.
+skills_install_dir() {
+  printf '%s\n' "${SKILLS_INSTALL_DIR[${1:-}]:-.claude/skills}"
+}
 
 # api-key target per type: the env file (in /etc/5dive/connectors for the
 # default profile) and the env var inside it. Claude-family is special-cased
