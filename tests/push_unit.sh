@@ -805,6 +805,35 @@ grep -q 'workflows:"write"' "$SRC/cmd_push.sh" \
   && ok_t "workflows scope: _push_do can request workflows:write" \
   || bad_t "workflows scope: _push_do can request workflows:write" "no workflows grant in the token body"
 
+# --- DIVE-2562: the installation is resolved PER REPO, not pinned -------------
+# A GitHub App gets one installation per ACCOUNT it is installed on, and the token
+# exchange refuses any repo outside the installation it is addressed to. A single
+# pinned GITHUB_APP_INSTALLATION_ID therefore works only while the whole fleet
+# lives in one account — which stopped being true the moment a repo sat under a
+# different owner. Measured 2026-08-03: 5dive-ai/5dive resolves to the pinned
+# installation; lodar/5dive-api and lodar/5dive-frontend resolve to none at all.
+grep -q 'repos/\${slug}/installation' "$SRC/cmd_push.sh" \
+  && ok_t "installation: _push_do asks GitHub which installation owns the repo" \
+  || bad_t "installation: per-repo lookup" "no /repos/<slug>/installation call before the mint"
+
+# The lookup needs the owner/repo slug, and it runs BEFORE the mint. The first cut
+# of this fix referenced \$slug 40 lines above its assignment, which expands to
+# empty and silently queries /repos//installation — a lookup that cannot fail
+# loudly. Pin the ordering, not just the presence.
+_slug_ln=$(grep -n '^  slug=\$(_push_repo_slug "\$repourl")' "$SRC/cmd_push.sh" | head -1 | cut -d: -f1)
+_inst_ln=$(grep -n 'repos/\${slug}/installation' "$SRC/cmd_push.sh" | head -1 | cut -d: -f1)
+[[ -n "$_slug_ln" && -n "$_inst_ln" && "$_slug_ln" -lt "$_inst_ln" ]] \
+  && ok_t "installation: slug is assigned BEFORE the installation lookup reads it" \
+  || bad_t "installation: slug assigned before use" "slug at line ${_slug_ln:-none}, lookup at ${_inst_ln:-none}"
+
+# A refusal must carry what GitHub actually said. `curl -fsS` prints nothing on a
+# 4xx, so the old code rendered "There is at least one repository that does not
+# exist or is not accessible to the parent installation" as "installation token
+# exchange failed" and the operator had to re-run the call by hand to find out.
+grep -q "message // empty" "$SRC/cmd_push.sh" \
+  && ok_t "installation: a failed mint surfaces GitHub's own message" \
+  || bad_t "installation: mint failure names the cause" "the API error body is discarded"
+
 echo "-----"
 printf 'push_unit: %d passed, %d failed\n' "$PASS" "$FAIL"
 [[ $FAIL -eq 0 ]]

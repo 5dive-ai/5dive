@@ -568,8 +568,11 @@ cmd_push_do() {
   # Exchange for an installation token SCOPED to just the target repo +
   # contents:write (DIVE-1460 refinement 1) — a captured token can't touch other
   # org repos, and the scoped body caps the permission to the one op we need.
-  local reponame body tok
+  local reponame body tok slug
   reponame=$(_push_repo_name "$repourl")
+  # owner/repo, needed by the DIVE-2562 installation lookup below. Declared here
+  # rather than at the summary line further down, which ran AFTER the mint.
+  slug=$(_push_repo_slug "$repourl")
   # gh#250: contents:write alone CANNOT push .github/workflows/* — GitHub
   # refuses the push outright, and the error names the App's permissions rather
   # than this token's, so the operator chases the wrong thing. Ask for
@@ -588,14 +591,56 @@ cmd_push_do() {
       && echo "[5dive] cannot diff ${branch} against the remote default branch — requesting workflows:write defensively" >&2
     body=$(jq -cn --arg r "$reponame" '{repositories:[$r],permissions:{contents:"write",workflows:"write"}}')
   fi
-  tok=$(curl -fsS --max-time 15 -X POST \
+  # DIVE-2562: RESOLVE THE INSTALLATION FOR THIS REPO'S OWNER, don't mint against a
+  # single pinned id. GITHUB_APP_INSTALLATION_ID is one number in one env file, so
+  # every push on this box minted against whichever account was installed first.
+  # A GitHub App gets a SEPARATE installation per account it is installed on, and
+  # the token exchange refuses any repository outside the installation it is
+  # addressed to — with a message that names the repository rather than the
+  # installation ("There is at least one repository that does not exist or is not
+  # accessible to the parent installation"), which reads as a missing repo.
+  #
+  # Measured 2026-08-03: the App's only installation is the 5dive-ai ORG (20 repos,
+  # all 5dive-ai/*), while `5dive-api` and `5dive-frontend` are `lodar/*` on a
+  # PERSONAL account. So 5dive-ai/5dive pushed fine and every customer-facing repo
+  # 422'd, and had since the rail was built. Pinning also means that installing the
+  # App on the personal account does NOT fix it on its own: that mints a SECOND
+  # installation id and the box would keep addressing the first one.
+  #
+  # Ask GitHub which installation owns the repo. Fall back to the pinned id when the
+  # lookup cannot answer, so a box with one installation and no extra permission
+  # behaves exactly as before.
+  local _inst_for_repo
+  _inst_for_repo=$(curl -fsS --max-time 15 \
+        -H "Authorization: Bearer ${jwt}" \
+        -H "Accept: application/vnd.github+json" \
+        -H "X-GitHub-Api-Version: 2022-11-28" \
+        "https://api.github.com/repos/${slug}/installation" 2>/dev/null \
+        | jq -r '.id // empty')
+  if [[ -n "$_inst_for_repo" && "$_inst_for_repo" != "$inst" ]]; then
+    echo "[5dive] ${slug} belongs to installation ${_inst_for_repo}, not the pinned ${inst} — minting against the repo's own installation" >&2
+    inst="$_inst_for_repo"
+  elif [[ -z "$_inst_for_repo" ]]; then
+    echo "[5dive] could not resolve an installation for ${slug}; falling back to the pinned id ${inst}. If the exchange refuses, the App is probably not installed on $(printf '%s' "$slug" | cut -d/ -f1)." >&2
+  fi
+
+  # Keep the response body: `curl -fsS` prints nothing on a 4xx, so the old code
+  # turned GitHub's own explanation into "installation token exchange failed" and
+  # the operator had to re-run the call by hand to see the cause. A refusal must
+  # carry what the remote actually said (DIVE-2143).
+  local _tokresp _tokrc=0
+  _tokresp=$(curl -sS --max-time 15 -X POST \
         -H "Authorization: Bearer ${jwt}" \
         -H "Accept: application/vnd.github+json" \
         -H "X-GitHub-Api-Version: 2022-11-28" \
         -d "$body" \
-        "https://api.github.com/app/installations/${inst}/access_tokens" \
-        | jq -r '.token // empty')
-  [[ -n "$tok" ]] || fail "$E_GENERIC" "installation token exchange failed"
+        "https://api.github.com/app/installations/${inst}/access_tokens" 2>&1) || _tokrc=$?
+  tok=$(printf '%s' "$_tokresp" | jq -r '.token // empty' 2>/dev/null)
+  if [[ -z "$tok" ]]; then
+    local _why; _why=$(printf '%s' "$_tokresp" | jq -r '.message // empty' 2>/dev/null)
+    [[ -n "$_why" ]] || _why="$(printf '%s' "$_tokresp" | head -c 300)"
+    fail "$E_GENERIC" "installation token exchange failed for ${slug} against installation ${inst}: ${_why:-no response body} — if that names an inaccessible repository, the App is not installed on '$(printf '%s' "$slug" | cut -d/ -f1)'."
+  fi
 
   # Push ONLY the named branch, token via extraheader so it never lands in argv
   # (no leak via ps/audit). Discard the token immediately after.
@@ -606,7 +651,7 @@ cmd_push_do() {
   tok=""; authhdr=""   # discard
 
   [[ $rc -eq 0 ]] || fail "$E_GENERIC" "push failed (branch ${branch}); see output above."
-  local slug sha; slug=$(_push_repo_slug "$repourl")
+  local sha
   sha=$("${G[@]}" rev-parse --short "refs/heads/${branch}")
   # DIVE-1923: ship ledger. After the push, never before — this records what
   # landed, so a failed push must leave no trace. Never fatal.
