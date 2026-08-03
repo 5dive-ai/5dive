@@ -1140,19 +1140,42 @@ _hb_reclaim_to_todo() {
 # (a)/(b)/(c) all reclaim the work (it still needs doing); (c) additionally
 # escalates a repeat offender. Nothing is ever cancelled here. Echoes
 # "<reclaimed> <escalated>". Uses started_at (falls back to created_at).
+#
+# DIVE-2560: (b) and (c) both read claim age as evidence of stall, but a row
+# the CURRENT holder is verifying — delivered by its maker, assignee flipped to
+# the verifier, handoff_ack_at still NULL — is not stalled at all: the maker's
+# job is done and the age on the claim is verifier think-time, not neglect.
+# Before this fix that state was indistinguishable from ordinary abandoned
+# work, so a verifier who claimed a delivery and sat with it (reading, or just
+# between heartbeat ticks) got it yanked back to todo and re-nudged on a loop —
+# the exact "claimed then went idle" churn _hb_stall_sweep already has a
+# correct, slower-cadence nag for. Rows in that state now skip (b) and (c)
+# entirely; (a) still fires, because a truly gone session is a real reason to
+# re-present the row fresh regardless of handoff state.
 _hb_reclaim() {
   local name="$1" everyMin="$2"
   local budget=$(( everyMin * _HB_STALE_MULT ))
   (( budget < _HB_STALE_MIN_MINUTES )) && budget=$_HB_STALE_MIN_MINUTES
   local proc_start; proc_start=$(_hb_claude_started "$name" 2>/dev/null || true)
-  local reclaimed=0 escalated=0 id started_epoch age_min
-  while IFS='|' read -r id started_epoch age_min; do
+  local reclaimed=0 escalated=0 id started_epoch age_min awaiting_verifier
+  while IFS='|' read -r id started_epoch age_min awaiting_verifier; do
     [[ -n "$id" ]] || continue
     # (a) the claiming session is gone — process is newer than the claim.
     if [[ -n "$proc_start" && -n "$started_epoch" ]] \
        && (( proc_start > started_epoch + _HB_PROC_SKEW_SEC )); then
       _hb_reclaim_to_todo "$name" "$id" "claiming session gone (claude restarted $(( (proc_start - started_epoch) / 60 ))m after the claim)"
       reclaimed=$((reclaimed + 1)); continue
+    fi
+    # DIVE-2560: a row currently held by its own VERIFIER, delivered but not yet
+    # ACKed (same predicate _hb_stall_sweep already uses to nag the verifier
+    # instead), is not stalled — it is sitting in the reviewer's queue, and the
+    # clock that matters is the verifier's latency, not this claim's age. Neither
+    # the hard-cap nor the idle-stall arm below may reclaim it; only rule (a)
+    # above (the holder's session is actually gone) still applies. A row bounced
+    # BACK to the maker by a reject is NOT this state — assignee != verifier once
+    # that happens — so ordinary rework still reclaims normally.
+    if (( awaiting_verifier )); then
+      continue
     fi
     # (c) hard cap before stall: in_progress past the budget but rule (a) didn't
     # fire (the claiming process did NOT restart — e.g. an in-process /clear or
@@ -1186,7 +1209,10 @@ _hb_reclaim() {
     fi
   done < <(db "SELECT id || '|' ||
                  strftime('%s', COALESCE(started_at, created_at)) || '|' ||
-                 CAST((julianday('now') - julianday(COALESCE(started_at, created_at))) * 1440 AS INTEGER)
+                 CAST((julianday('now') - julianday(COALESCE(started_at, created_at))) * 1440 AS INTEGER) || '|' ||
+                 CASE WHEN verifier IS NOT NULL AND verifier = assignee
+                           AND handoff_delivered_at IS NOT NULL AND handoff_ack_at IS NULL
+                      THEN 1 ELSE 0 END
                FROM tasks
                WHERE assignee=$(sqlq "$name") AND status='in_progress';" 2>/dev/null || true)
   printf '%s %s\n' "$reclaimed" "$escalated"
