@@ -29,6 +29,7 @@
 # precisely the failure mode this refuses to build.
 
 _bug_usage() {
+  local _org; _org=$(gh_org)
   cat >&2 <<EOF
 5dive bug [--verb=<name>] [--exit=<code>] [--no-probes] [--file]
 
@@ -40,7 +41,7 @@ Preview (default): builds the diagnostic payload and prints it. Files nothing.
                   fields underneath them)
 
   --file          re-print the SAME payload, then open it as a GitHub issue
-                  against $(gh_org)/5dive (via '5dive gh issue create', so it
+                  against ${_org}/5dive (via '5dive gh issue create', so it
                   files as 5dive-bot when this account can write). A TTY also
                   gets an interactive y/N; nothing is ever filed by default.
 

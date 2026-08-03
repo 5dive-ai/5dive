@@ -308,9 +308,9 @@ Health:
     Payload is a fixed ALLOWLIST — version, OS, bash version, install method,
     the verb that failed + its exit code, and selfcheck probe name+verdict
     pairs — never the free-text reason/detail fields underneath them. Bare
-    `5dive bug` only builds and prints the payload; NEVER auto-files. --file
-    re-prints the identical payload and then opens it (via `5dive gh issue
-    create`, so it lands as 5dive-bot); a TTY also gets an interactive y/N.
+    \`5dive bug\` only builds and prints the payload; NEVER auto-files. --file
+    re-prints the identical payload and then opens it (via \`5dive gh issue
+    create\`, so it lands as 5dive-bot); a TTY also gets an interactive y/N.
     Agents take the same --file flag a human does — no separate unattended path.
 
   5dive doctor [--fix] [--dry-run] [--category=deps|types|auth|creds|registry|shelld|channels|host|memory]
