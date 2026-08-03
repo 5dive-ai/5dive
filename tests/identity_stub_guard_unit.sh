@@ -29,6 +29,12 @@
 # working would make the guard flag itself forever, and a self-exclusion that was
 # never needed would leave A3 passing vacuously. See
 # community/wiki/a-consistency-check-cannot-see-a-substitution-that-rewrote-both-sides.md
+#
+# COST: 6.0s measured on the dev3 worktree (5dive-cli-wt-2601, agent-dev3). A7/A8
+# mutate and re-scan 51 real harnesses and that is nearly all of it. Stays `core`
+# deliberately: the class this catches is silent by construction — a green arm that
+# grades nothing looks exactly like a green arm that grades something — and 6s
+# against a 300s per-job budget is not the line item worth demoting.
 
 set -u
 # shellcheck source=/dev/null
@@ -64,6 +70,74 @@ declare -A ALLOW=(
 # host again. A checker whose population shrinks as its subject is repaired watches
 # nobody. Population B below is that set: any harness that PINS the seams, stub or no
 # stub. A6 prints both censuses so shrinkage is visible rather than inferred.
+
+# ── the two predicates that must be ANCHORED ON A CONSTRUCT ───────────────────
+# THE DEFECT THESE REPLACE (iteration 3, measured by olivia at uid 1011). Both
+# rules used to be bare `grep -q <token>` over the whole file — and the remediation
+# this guard demands WRITES both tokens into every file it repairs. Rule (0) looked
+# for `lib/actor.sh`, which the liveness probe's hint string ends with ("Is
+# lib/actor.sh in the source list?") plus two comment lines. Rule (2) looked for
+# `_gate_uid_to_agent`, which that same probe names in the message it prints WHEN THE
+# RESOLVER IS DEAD. So a repaired file satisfied both rules out of its own prose.
+#
+# MEASURED: delete ` lib/actor.sh` from the source list of
+# gate_tier2_nonce_evidence_unit.sh — the one token rule (0) is about. The harness
+# correctly reds rc=1 and this guard stayed green, printing the broken file in the A6
+# census as a healthy population-B member. Enrollment worked; DETECTION on an
+# enrolled file did not. Rule (2) had a live corpus victim as well:
+# gate_lead_standing_unit.sh passed it out of a TRAILING COMMENT (`# not agent-* ->
+# _gate_authenticated_actor is EMPTY`) while making no such call anywhere.
+#
+# This is the lesson already compiled on this ticket's wiki page — anchor an
+# applied-check on the LINE THE MUTATION EDITS, never a token the file may mention
+# elsewhere — which the guard's own detector had not carried across. A7/A8 below
+# mutation-grade the fix on the real corpus, because A2c/A2d prove only that a rule
+# is well-formed on synthetic input and say nothing about whether its predicate is
+# violable by a real repaired file.
+
+# _sources_actor <file> — does the file actually SOURCE the actor lib? Three
+# constructs do it in tests/ today and all three are accepted:
+#   (a) `source "$SRC/lib/actor.sh"` / `. src/lib/actor.sh`
+#   (b) a `for f in ... lib/actor.sh ...; do source "$SRC/$f"; done` list — the token
+#       sits on a CONTINUATION line, so the list is collected from `for` through `do`
+#   (c) surgical extraction — `eval "$(sed -n ... src/lib/actor.sh)"`, `_load_from src/lib/actor.sh`
+# A prose mention is none of these. Note the `source|\.` preceding-character class
+# deliberately excludes `)`: without that, the probe hint's "...(expected probe). Is
+# lib/actor.sh..." reads as a `.` command and the hole reopens.
+_sources_actor() {
+  awk '
+    /^[[:space:]]*#/ { next }
+    inlist {
+      list = list " " $0
+      if ($0 ~ /(^|;)[[:space:]]*do([[:space:]]|$)/) { inlist=0; if (list ~ /lib\/(actor|actor_seam)\.sh/) f=1 }
+      next
+    }
+    /^[[:space:]]*for[[:space:]]+[A-Za-z_][A-Za-z_0-9]*[[:space:]]+in[[:space:]]/ {
+      list=$0; inlist=1
+      if ($0 ~ /(^|;)[[:space:]]*do([[:space:]]|$)/) { inlist=0; if (list ~ /lib\/(actor|actor_seam)\.sh/) f=1 }
+      next
+    }
+    /lib\/(actor|actor_seam)\.sh/ {
+      if ($0 ~ /(^|[;&|({])[[:space:]]*(source|\.)[[:space:]]/) f=1
+      else if ($0 ~ /(^|[;&|({[:space:]])(eval[[:space:]]+"?\$\(|_load_from[[:space:]])/) f=1
+    }
+    END { exit !f }
+  ' "$1"
+}
+
+# _asserts_resolver <file> — is the pin asserted through a real CALL to the resolver,
+# rather than a mention of its name? A call site is in COMMAND POSITION: line start,
+# inside `$(`/backtick, or after a `;` `&&` `||` `(` `{` separator. Every prose
+# mention in the corpus is preceded by a word character or sentence punctuation
+# (`: `, `-> `), which no call site is.
+_asserts_resolver() {
+  awk '
+    /^[[:space:]]*#/ { next }
+    /(^|\$\(|`|[;&|({])[[:space:]]*(_gate_authenticated_actor|_gate_uid_to_agent|actor_seam_selftest)([[:space:]]|$|\)|")/ { f=1 }
+    END { exit !f }
+  ' "$1"
+}
+
 _scan_identity_stubs() {
   local dir="$1" f base claims_id pins
   for f in "$dir"/*.sh; do
@@ -91,7 +165,7 @@ _scan_identity_stubs() {
     # '' — so `[[ -z "$pin" ]]` becomes "the empty string is empty" and cannot fail —
     # and the product code under test runs with its actor derivation missing. All
     # three symptoms are silent. Measured in gate_tier2_nonce_evidence_unit.sh.
-    if (( pins )) && ! grep -qE 'lib/actor\.sh|actor_seam\.sh' "$f"; then
+    if (( pins )) && ! _sources_actor "$f"; then
       printf '%s\tpins the identity seams but never sources lib/actor.sh — the override lands on nothing, any assertion through the resolver is command-not-found (yields '"''"', which is the PASS value), and the product code runs with its actor derivation missing\n' "$base"
       continue
     fi
@@ -101,7 +175,7 @@ _scan_identity_stubs() {
       continue
     fi
     # (2) and the pin must be asserted through the real resolver
-    if (( claims_id )) && ! grep -qE '_gate_authenticated_actor|_gate_uid_to_agent|actor_seam_selftest' "$f"; then
+    if (( claims_id )) && ! _asserts_resolver "$f"; then
       printf '%s\tpins the identity seams but never asserts the pin through the real resolver (_gate_authenticated_actor / _gate_uid_to_agent / actor_seam_selftest)\n' "$base"
     fi
   done
@@ -195,6 +269,35 @@ got="$(_scan_identity_stubs "$TMP")"
   && ok_t "A2b the compliant shape (source + pin + assertion) is not flagged" \
   || bad_t "A2b compliant fixture passes" "scan flagged it: '$got' — a guard that rejects the fix it demands cannot be satisfied"
 
+# ── A2e rule (0) may not be satisfied by PROSE — the iteration-3 defect ──────
+# Everything rule (0) used to look for is here and NONE of it sources anything: the
+# only `lib/actor.sh` in the file is the hint string the remediation itself writes.
+# Under the old whole-file grep this fixture passed. It must be flagged.
+cat > "$TMP/violator_unit.sh" <<'EOF'
+_gate_caller_uid() { printf 0; }
+_probe=$(_gate_uid_to_agent 424242)
+[[ "$_probe" == probe ]] || { printf 'NOT OK - resolver not live. Is lib/actor.sh in the source list?\n'; exit 1; }
+EOF
+got="$(_scan_identity_stubs "$TMP")"
+[[ "$got" == *"never sources lib/actor.sh"* ]] \
+  && ok_t "A2e rule (0) is not satisfied by a prose mention of lib/actor.sh" \
+  || bad_t "A2e prose does not satisfy rule (0)" "scan returned '${got:-<nothing>}' — the predicate reads the token the remediation writes, so every repaired file discharges the rule with its own hint string"
+
+# ── A2f rule (2) may not be satisfied by PROSE either ────────────────────────
+# The corpus instance was gate_lead_standing_unit.sh, which named the resolver ONLY
+# in a trailing comment. Same shape as A2e, other rule.
+cat > "$TMP/violator_unit.sh" <<'EOF'
+source "$SRC/lib/actor.sh"
+FAKE_CALLER="root"
+id() { if [[ "${1:-}" == -un ]]; then echo "$FAKE_CALLER"; else command id "$@"; fi; }
+_gate_caller_uid() { printf 0; }
+FAKE_CALLER="claude"   # not agent-* -> _gate_authenticated_actor is EMPTY
+EOF
+got="$(_scan_identity_stubs "$TMP")"
+[[ "$got" == *"never asserts the pin"* ]] \
+  && ok_t "A2f rule (2) is not satisfied by a comment naming the resolver" \
+  || bad_t "A2f prose does not satisfy rule (2)" "scan returned '${got:-<nothing>}' — a file that never calls the resolver passes for mentioning it"
+
 # ── A3 self-exclusion actually works, and is load-bearing ────────────────────
 # This file necessarily contains the pattern it hunts for. The pair below is what
 # makes the skip observable: IDENTICAL BYTES, one under this file's basename and
@@ -252,6 +355,62 @@ grep -lE '^[[:space:]]*_gate_(caller_uid|passwd_stream)\(\)|actor_seam_as' tests
 (( CB >= 20 )) \
   && ok_t "A6 the guard's population is non-trivial and named (B=$CB files pinning the seams)" \
   || bad_t "A6 population is non-trivial" "only $CB file(s) matched the pin predicate — either the corpus changed shape or the predicate stopped matching, and a guard grading nothing reports the same clean corpus as a guard grading everything"
+
+# ── A7/A8 the rules are VIOLABLE BY THE REAL CORPUS, not only by fixtures ─────
+# A1-A2f grade the rules on synthetic input: they prove each rule is well-formed.
+# They say NOTHING about whether a rule's predicate can be violated by a file this
+# ticket actually repaired — and for three iterations rule (0) could not, because the
+# remediation writes the token the predicate reads. A4 cannot see that: a rule nobody
+# can violate reports the same clean corpus as a rule that works. So mutate the REAL
+# files, one at a time, and require the guard to red on each.
+#
+# The mutation is olivia's, generalised: strip the anchor token from every line that
+# is neither a comment nor a printf — i.e. out of the CONSTRUCT, leaving the prose the
+# old predicate was accidentally reading. The count of mutants whose prose SURVIVES is
+# reported, because those are the ones that grade the anchoring rather than the token.
+rm -f "$TMP"/*.sh
+_mutate_and_scan() {   # <basename> <awk-program> — returns the scan output
+  local base="$1" prog="$2"
+  rm -f "$TMP"/*.sh
+  awk "$prog" "tests/$base" > "$TMP/$base"
+  _scan_identity_stubs "$TMP"
+}
+DROP_ACTOR='{ if ($0 ~ /^[[:space:]]*#/ || $0 ~ /printf/) print; else { gsub(/lib\/actor\.sh/,"lib/__absent__.sh"); gsub(/lib\/actor_seam\.sh/,"lib/__absent__.sh"); print } }'
+DROP_RESOLVER='{ if ($0 ~ /^[[:space:]]*#/ || $0 ~ /printf/) print; else { gsub(/_gate_authenticated_actor|_gate_uid_to_agent|actor_seam_selftest/,"_gate_absent_resolver"); print } }'
+
+a7_n=0; a7_prose=0; a7_missed=()
+for f in tests/*.sh; do
+  base="$(basename "$f")"
+  [[ "$base" == "$SELF" || -n "${ALLOW[$base]:-}" ]] && continue
+  grep -qE '^[[:space:]]*_gate_(caller_uid|passwd_stream)\(\)|actor_seam_as' "$f" || continue
+  _sources_actor "$f" || continue                       # only files that currently PASS rule (0)
+  got="$(_mutate_and_scan "$base" "$DROP_ACTOR")"
+  grep -qE 'lib/actor\.sh' "$TMP/$base" && a7_prose=$((a7_prose+1))
+  [[ "$got" == *"never sources lib/actor.sh"* ]] || a7_missed+=("$base")
+  a7_n=$((a7_n+1))
+done
+(( a7_n >= 20 && ${#a7_missed[@]} == 0 )) \
+  && ok_t "A7 rule (0) reds on every real repaired file whose source construct is broken ($a7_n mutants, $a7_prose still mention lib/actor.sh in surviving prose)" \
+  || bad_t "A7 rule (0) is violable on the real corpus" \
+     "$(printf '%s of %s mutant(s) went UNDETECTED:\n' "${#a7_missed[@]}" "$a7_n"; printf '     %s\n' "${a7_missed[@]:-<none — but only $a7_n file(s) were mutable, the population collapsed>}")"
+
+a8_n=0; a8_prose=0; a8_missed=()
+for f in tests/*.sh; do
+  base="$(basename "$f")"
+  [[ "$base" == "$SELF" || -n "${ALLOW[$base]:-}" ]] && continue
+  grep -qE '^[[:space:]]*id\(\)' "$f" \
+    && { grep -qE '^[[:space:]]*id\(\).*\-un' "$f" || grep -qzE 'id\(\)[[:space:]]*\{[^}]*\-un' "$f"; } || continue
+  _asserts_resolver "$f" || continue                    # only files that currently PASS rule (2)
+  got="$(_mutate_and_scan "$base" "$DROP_RESOLVER")"
+  grep -qE '_gate_authenticated_actor|_gate_uid_to_agent|actor_seam_selftest' "$TMP/$base" && a8_prose=$((a8_prose+1))
+  [[ "$got" == *"never asserts the pin"* ]] || a8_missed+=("$base")
+  a8_n=$((a8_n+1))
+done
+rm -f "$TMP"/*.sh
+(( a8_n >= 5 && ${#a8_missed[@]} == 0 )) \
+  && ok_t "A8 rule (2) reds on every real \`id -un\` harness whose resolver call is removed ($a8_n mutants, $a8_prose still name it in surviving prose)" \
+  || bad_t "A8 rule (2) is violable on the real corpus" \
+     "$(printf '%s of %s mutant(s) went UNDETECTED:\n' "${#a8_missed[@]}" "$a8_n"; printf '     %s\n' "${a8_missed[@]:-<none — but only $a8_n file(s) were mutable>}")"
 
 printf '\n%s: %d passed, %d failed\n' "$SELF" "$PASS" "$FAIL"
 (( FAIL == 0 ))
