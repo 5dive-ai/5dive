@@ -29,6 +29,13 @@ decision to add one is ever wrong on its own merits. See
   In the harness header (first 40 lines). **The reason is mandatory** — a bare
   `# TIER: nightly` is a refusal, not a default. Demotion moves the cost, it does
   not delete it, which is why it is third and why it must be argued in the diff.
+- **Say WHERE you measured, and expect the number to be graded** (DIVE-2555). The
+  runner compares every `Ns measured` claim against the clock in the run it is
+  already doing: 10% under is reported with the replacement line, 50%-and-3s under
+  is `exit 5` (its own code — the remedy is "correct a number", not "fix a test" or
+  "retire a guard"). A figure with no environment on it cannot be refuted by the
+  next reading, only silently disagreed with: one header claimed `300.0s` while
+  the same file measured 335s and 378s on the control plane.
 - **Editing a harness always runs it**, whatever its tier: the `changed-harnesses`
   job runs and verdict-probes every harness your diff touches. Tier membership is
   a default, and a default loses to an explicit signal.

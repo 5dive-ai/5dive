@@ -275,6 +275,21 @@ jobs:
   # Scoped with --only on purpose: raising PROBE_TIMEOUT for the whole sweep would
   # also raise how long a genuinely hung harness can stall CI, which is the property
   # the 180s default is buying. Named harnesses pay 900s; nothing else changes.
+  #
+  # DIVE-2555: THE KILL NOW HAS ITS OWN NAME. `not-reached` was the right verdict to
+  # act on and the wrong sentence to read — it says the harness "skips before its
+  # verdict here", which this one never did; it was killed. The probe reports
+  # `timed-out` for a kill in either position now, and — this is the half that
+  # mattered — a mutant killed AFTER its canary printed used to be counted `wired`,
+  # because the non-zero exit `timeout` produces is indistinguishable from a harness
+  # reporting its own failure. That is a false PASS in the coverage direction, in the
+  # one check that exists to find harnesses which cannot fail CI. `timed-out` is not
+  # in the union's probed set, so a harness killed in every lane reds the union as
+  # NEVER PROBED, which is what it is. If that fires, the remedy is this list, not an
+  # allowlist entry: it is probeable and slow, not unprobeable.
+  #
+  # This harness measures 378s (control plane, 2026-08-03), not the 300.0s its header
+  # claimed — so the 900s here is ~2.4x the slowest reading we have, not 3x.
   harness-verdict-slow:
     runs-on: ubuntu-latest
     needs: full-pristine
