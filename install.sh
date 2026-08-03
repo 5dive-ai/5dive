@@ -156,6 +156,57 @@ resolve_gh_sha() {
   return 1
 }
 
+# Commit sha for branch $2 of repo $1 on stdout, or return 1. Same three-rung
+# ladder as resolve_gh_sha above, against refs/heads instead of refs/tags — no
+# peel needed since branch refs are never annotated.
+#
+# DIVE-2214: skills and 5dive-plugins are fetched by BRANCH tarball (below),
+# not through the tag-pinned $REPO. `git ls-remote --tags` against both
+# confirmed neither publishes a single tag, so the DIVE-1977 "resolve once,
+# pin every fetch" pattern has no rail to pin to — there is no tag whose
+# resolution failing should brick an install the way an unresolved 5dive
+# release tag does. The floor here is a DERIVED RECEIPT instead: best-effort,
+# non-fatal, resolved as close to the fetch as practical, so a box can at
+# least SAY which commit of each sibling repo it installed.
+resolve_gh_branch_sha() {
+  local repo="$1" branch="$2" sha=""
+  if command -v git >/dev/null 2>&1; then
+    sha="$(git ls-remote --heads "https://github.com/$GH_ORG/$repo.git" "refs/heads/$branch" 2>/dev/null | awk 'NR==1 {print $1}')" || sha=""
+    if [[ "$sha" =~ ^[0-9a-f]{40}$ ]]; then printf '%s\n' "$sha"; return 0; fi
+  fi
+  sha="$(curl -fsSL --max-time 10 "https://github.com/$GH_ORG/$repo/commits/$branch.atom" 2>/dev/null \
+    | sed -n 's#.*Grit::Commit/\([0-9a-f]\{40\}\).*#\1#p' | head -1)" || sha=""
+  if [[ "$sha" =~ ^[0-9a-f]{40}$ ]]; then printf '%s\n' "$sha"; return 0; fi
+  sha="$(curl -fsSL --max-time 10 "https://api.github.com/repos/$GH_ORG/$repo/commits/$branch" 2>/dev/null \
+    | sed -n 's/.*"sha"[[:space:]]*:[[:space:]]*"\([0-9a-f]\{40\}\)".*/\1/p' | head -1)" || sha=""
+  if [[ "$sha" =~ ^[0-9a-f]{40}$ ]]; then printf '%s\n' "$sha"; return 0; fi
+  return 1
+}
+
+# record_sibling_sha <state-dir> <repo> <sha-or-empty> — best-effort receipt
+# write, never fatal: a box that can't record what it installed should still
+# finish installing it. $sha empty means resolution failed; recorded as a
+# null sha (not a missing key) so "we tried and don't know" is distinguishable
+# from "this repo was never staged".
+record_sibling_sha() {
+  local dir="$1" repo="$2" sha="$3"
+  [[ -d "$dir" ]] || return 0
+  command -v jq >/dev/null 2>&1 || return 0
+  local existing='{}' tmp
+  if [[ -f "$dir/sibling-repos.json" ]]; then
+    existing="$(cat "$dir/sibling-repos.json" 2>/dev/null)"
+    [[ -n "$existing" ]] || existing='{}'
+  fi
+  tmp="$(mktemp "$dir/.sibling-repos.XXXXXX" 2>/dev/null)" || return 0
+  if jq -c --arg repo "$repo" --arg sha "$sha" --arg at "$(date -u +%FT%TZ)" \
+       '.[$repo] = {sha: (if $sha == "" then null else $sha end), resolved_at: $at}' \
+       <<<"$existing" >"$tmp" 2>/dev/null; then
+    mv -f "$tmp" "$dir/sibling-repos.json"
+  else
+    rm -f "$tmp"
+  fi
+}
+
 # Source for binaries / hooks / skills. Overridable for offline installs,
 # enterprise mirrors, and pre-publish smoke tests (which point this at a
 # `file://` bundle of the working tree) — an explicit REPO is never re-pinned,
@@ -450,6 +501,9 @@ JOURNALD
   # next --upgrade, root-installed, with no tag and no review in THIS repo.
   # The SKILLS_REPO_TARBALL override exists to pin it; the DEFAULT is mutable.
   SKILLS_REPO_TARBALL="${SKILLS_REPO_TARBALL:-https://github.com/$GH_ORG/skills/archive/refs/heads/main.tar.gz}"
+  # DIVE-2214: skills has no tag rail (see resolve_gh_branch_sha) — resolve
+  # main's HEAD as close to the fetch as practical and record it, best-effort.
+  record_sibling_sha "$STATE_DIR" skills "$(resolve_gh_branch_sha skills main || true)"
   install -d -m 755 "$LIB_DIR/skills/5dive-cli"
   _skill_tmp=$(mktemp -d)
   if curl -fsSL "$SKILLS_REPO_TARBALL" \
@@ -481,6 +535,12 @@ JOURNALD
   # next --upgrade, root-installed, with no tag and no review in THIS repo.
   # The CODEX_PLUGIN_TARBALL override exists to pin it; the DEFAULT is mutable.
   CODEX_PLUGIN_TARBALL="${CODEX_PLUGIN_TARBALL:-https://github.com/$GH_ORG/5dive-plugins/archive/refs/heads/main.tar.gz}"
+  # DIVE-2214: 5dive-plugins has no tag rail either. Resolve main's HEAD ONCE
+  # here and record it — all five telegram-* plugin blocks below fetch this
+  # same repo/branch moments apart, so one resolution covers all five instead
+  # of five slightly-different reads of a ref that can move between them.
+  _plugins_sha="$(resolve_gh_branch_sha 5dive-plugins main || true)"
+  record_sibling_sha "$STATE_DIR" 5dive-plugins "$_plugins_sha"
   _cdx_tmp=$(mktemp -d)
   if curl -fsSL "$CODEX_PLUGIN_TARBALL" \
       | tar -xz -C "$_cdx_tmp" --strip-components=1 '5dive-plugins-main/plugins/telegram-codex' 2>/dev/null \

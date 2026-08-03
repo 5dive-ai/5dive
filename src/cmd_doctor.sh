@@ -90,6 +90,44 @@ doctor_check_audit_drop_dir() {
     "$dir is a directory with mode 2770 and group $expected_group; lost audit rows can leave a drop marker"
 }
 
+# doctor_check_sibling_repos [state-dir]
+#
+# DIVE-2214: skills and 5dive-plugins are fetched by mutable BRANCH tarball
+# (install.sh), not through the tag-pinned $REPO — neither repo publishes a
+# tag, so there is nothing to pin to (verified via `git ls-remote --tags`).
+# install.sh's record_sibling_sha writes a best-effort derived receipt at
+# every install/--upgrade; this surfaces it so a box can say what it has, and
+# flags the two ways that receipt stops meaning anything: never written
+# (pre-DIVE-2214 install, never upgraded since) or a resolution that failed
+# outright (sha recorded as null — network/API hiccup at fetch time).
+doctor_check_sibling_repos() {
+  local dir="${1:-$STATE_DIR}" file
+  file="$dir/sibling-repos.json"
+  if [[ ! -f "$file" ]]; then
+    doctor_add supply-chain sibling-repos warn \
+      "$file missing — no receipt yet for skills/5dive-plugins (installed before DIVE-2214, or never upgraded since); run 5dive self-update"
+    return 0
+  fi
+  local repo sha at line
+  for repo in skills 5dive-plugins; do
+    line="$(jq -r --arg r "$repo" '.[$r] | if . == null then "absent" elif .sha == null then "unresolved@" + (.resolved_at // "unknown") else .sha + "@" + (.resolved_at // "unknown") end' "$file" 2>/dev/null)" || line=""
+    if [[ -z "$line" || "$line" == "absent" ]]; then
+      doctor_add supply-chain "sibling-repos/$repo" warn \
+        "no receipt entry for $repo in $file — staged before DIVE-2214, or the repo was never fetched this box"
+      continue
+    fi
+    if [[ "$line" == unresolved@* ]]; then
+      at="${line#unresolved@}"
+      doctor_add supply-chain "sibling-repos/$repo" warn \
+        "$repo's HEAD sha could not be resolved at last fetch ($at) — installed from the mutable main tarball with no record of which commit"
+      continue
+    fi
+    sha="${line%%@*}"; at="${line#*@}"
+    doctor_add supply-chain "sibling-repos/$repo" ok \
+      "$repo installed from ${sha:0:12}… (resolved $at)"
+  done
+}
+
 # doctor_check_reaped_homes [dir]
 #
 # DIVE-2138 quarantines a removed agent's home under REAPED_DIR instead of
@@ -642,6 +680,7 @@ cmd_doctor() {
     # shape itself; testing a marker path for writability cannot distinguish a
     # missing parent (partial/hand-built provision) from an actual disk fault.
     doctor_check_audit_drop_dir
+    doctor_check_sibling_repos
 
     # --- disk headroom (DIVE-1966/1967) ---
     #
