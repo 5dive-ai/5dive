@@ -8,7 +8,7 @@
 # FAKE `5dive` at COUNCIL_5DIVE_BIN stands in for the board: `task ls --json` returns one OPEN human
 # ballot whose body carries nonceDigest=sha256(NONCE); `task done` is logged. SKIPs green when node/
 # jq/sha256sum are missing or the build fails. Exit 0 == green.
-set -u
+set -uo pipefail
 
 # DIVE-2211: name the tree this harness grades (tests/lib/grading_tree.sh).
 # Three-state: if the helper is unreachable (a staged copy that did not carry

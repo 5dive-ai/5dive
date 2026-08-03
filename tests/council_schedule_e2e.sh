@@ -14,7 +14,7 @@
 # scripts' STANDUP_PARSE_TEST) so the runner is exercised offline with zero network / no seat
 # dispatch. Builds a throwaway ./5dive (BUILD_OUT) so it GATES in CI; SKIPs green if it can't
 # build or node/jq are missing. Exit 0 == green.
-set -u
+set -uo pipefail
 
 # DIVE-2211: name the tree this harness grades (tests/lib/grading_tree.sh).
 # Three-state: if the helper is unreachable (a staged copy that did not carry

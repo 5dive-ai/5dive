@@ -6,7 +6,7 @@
 # (sealedDigest + amendment receipts), and DRIFT detection. The READ path needs NO gate-proof key
 # (only WRITE/verify do), so a hand-synthesized lineage exercises the sealed case root-free — this
 # GATES in CI. SKIPs green when node/jq missing or the build fails. Exit 0 == green.
-set -u
+set -uo pipefail
 
 # DIVE-2211: name the tree this harness grades (tests/lib/grading_tree.sh).
 # Three-state: if the helper is unreachable (a staged copy that did not carry
