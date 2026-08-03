@@ -1,5 +1,72 @@
 # Changelog
 
+## Unreleased — fix(push): resolve the App installation PER REPO, not from one pinned id (DIVE-2563)
+
+`_push_do` minted every installation token against a single `GITHUB_APP_INSTALLATION_ID`
+read from `github-app.env`. A GitHub App gets a **separate installation per account**
+it is installed on, and the token exchange refuses any repository outside the
+installation it is addressed to — with a message that names the *repository*
+(`There is at least one repository that does not exist or is not accessible to the
+parent installation`), so it reads as a missing repo rather than a wrong installation.
+
+Measured 2026-08-03: the App's only installation is the **5dive-ai org** (20 repos, all
+`5dive-ai/*`), while `5dive-api` and `5dive-frontend` live under a **personal account**.
+So `5dive-ai/5dive` pushed fine and every customer-facing repo 422'd — and had since the
+rail was built. Pinning also means installing the App on the second account would *not*
+fix it alone: that mints a second installation id and the box would keep addressing the
+first.
+
+`_push_do` now asks `GET /repos/{owner}/{repo}/installation` which installation owns the
+target repo, and falls back to the pinned id when the lookup cannot answer — so a box
+with one installation behaves exactly as before.
+
+Two supporting fixes in the same block:
+
+- **The refusal carries GitHub's own words.** `curl -fsS` prints nothing on a 4xx, so the
+  mint failure rendered as a bare `installation token exchange failed` and the operator
+  had to re-run the call by hand to learn the cause (DIVE-2143). It now reports the API
+  `message` and names the owner the App is probably missing from.
+- **`slug` is assigned before the lookup reads it.** The first cut of this change
+  referenced it 40 lines above its assignment, which expands to empty and silently
+  queries `/repos//installation` — a lookup that cannot fail loudly. `push_unit` pins
+  the ordering, not just the presence.
+
+This is the **code** half. Pushing to a repo on another account still requires the App to
+be installed there; that is a human step, tracked separately.
+
+`tests/push_unit.sh` 89 → 92 arms.
+
+## Unreleased — fix(push): the workflow-scope probe fetched unauthenticated, so every private-repo push demanded `workflows:write` (DIVE-2547)
+
+`_push_touches_workflows` decides whether a delegated push needs `workflows:write`
+on top of `contents:write`. It ranged the branch by running `git fetch <repourl>`
+with **no credential**. Against a private repo that can never succeed, so the probe
+returned `unknown` and the caller escalated the token request — on every push, to
+every private repo, forever. A probe that never measures anything is not insurance;
+it is a permanently over-scoped token minted by a check that always abstains, which
+is the exact inversion of the one-permission scope DIVE-1460 exists to hold.
+
+It also did not degrade gracefully: the App is not granted `workflows:write`, so the
+defensive request **422s** and the push fails *after* a human already cleared the
+gate. Measured 2026-08-03, it blocked three agents across three repos — dev on
+`lodar/5dive-api` (DIVE-1999) and `lodar/5dive-frontend` (DIVE-2535), dev2 on
+`lodar/5dive-api` (DIVE-2033).
+
+The probe now degrades to the **cached** remote-tracking ref, exactly as the author
+scan one function over already did (DIVE-2161: *resolve the bound, degrade to a
+cached bound and say it may be stale, or refuse and name what is missing*). The same
+lesson was learned here and never applied.
+
+The staleness is safe in the direction that matters: `base...branch` reports what the
+branch *adds*, so an older base widens the range and can only over-report touched
+files. It can turn a `no` into a `yes` (request a scope we did not need) but never a
+`yes` into a `no` (push a workflow change under `contents:write` alone). Only when
+neither a live nor a cached bound resolves is the answer still `unknown`.
+
+`tests/push_unit.sh` 86 → 89 arms: the cached fallback measures `no` on a code-only
+branch, still catches a workflow-touching branch, and names its own staleness on
+stderr. The both-bounds-missing path still returns `unknown`.
+
 ## Unreleased — feat(actor): `5dive whoami`, one sealed actor derivation (DIVE-2517)
 
 The CLI had **six** actor derivations and they disagreed. Only one failed closed;
@@ -50,6 +117,37 @@ Seven arms added to `tests/task_merge_gate_delivered_vs_cited_unit.sh` (39 total
 differential on the same PR number in the same repo so a hardcoded label fails at least one.
 Graded by mutation: always-cited, always-delivered, filter-cited-out, and drop-the-column each
 turn arms red.
+
+## Unreleased — feat(broker): generalize the capability broker and fold in delegated deploy (INST-5)
+
+`5dive push` was our only brokered capability: a dangerous action an agent can take without ever
+holding a credential, gated on a cleared human/lead decision and executed atomically as root.
+INST-5 asked to extend that template to the next surfaces — email, deploy, DNS, payments, secrets,
+data-export. This lands the primitive and the first new surface.
+
+The counterintuitive part is which half of delegated push generalizes. Its headline security
+property is a repo-SCOPED, SHORT-LIVED token minted per use, and that half does NOT port: it
+exists only because GitHub Apps expose a mint-on-demand API we can drive from the control plane.
+Measured against our own Vercel credential, `POST /v3/user/tokens` returns HTTP 403 — there is no
+equivalent to drive. Defining the broker as "it mints scoped short-lived credentials" would put
+five of six surfaces out of scope by definition. The portable contract is the part that reads as
+plumbing: a policy predicate plus a target binding, feeding a root-only single-action executor
+that takes its parameters on stdin, feeding an audit record and a capability row.
+
+`src/lib/broker.sh` holds that, surface-agnostic, plus the one surface table the sudoers policy,
+the capability registry and every refusal string now derive from. `_push_gate_check` and
+`_push_bind_branch` become one-line bindings of it, and the move is proven inert rather than
+asserted to be: `tests/broker_surface_unit.sh` runs both the new and the pre-refactor
+implementations over the same 13 fixture states and compares refusal text and exit status byte for
+byte.
+
+`5dive deploy <task>` is the first new executor. It deploys only the `Deploy: <project>@<ref>` the
+task itself declares, only after that task's gate clears, with `VERCEL_TOKEN` read root-only and
+never handed to the agent. It also gets a bound push does not have: the git repo is not a
+parameter — it is read from the Vercel project's own link, so a granted agent cannot point one of
+our projects at a repo it chose. The capability is a separate axis from `--can-push`
+(`agent create --can-deploy`), because shipping a branch for review and shipping to production are
+different authorities.
 
 ## Unreleased — fix(task): refuse a close that would REPLACE an already-closed row's result (DIVE-2464)
 

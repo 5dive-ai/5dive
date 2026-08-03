@@ -38,8 +38,9 @@ trap 'rm -rf "$TMP"' EXIT
 
 # shellcheck disable=SC1090
 for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh \
-         lib/agent_setup.sh lib/state.sh lib/audit.sh lib/registry.sh \
-         lib/tasks_db.sh lib/actor.sh cmd_task.sh cmd_push.sh cmd_agent_create.sh; do
+         lib/agent_setup.sh lib/state.sh lib/broker.sh lib/audit.sh \
+         lib/registry.sh lib/tasks_db.sh lib/actor.sh cmd_task.sh cmd_push.sh \
+         cmd_agent_create.sh; do
   # shellcheck source=/dev/null
   source "$SRC/$f"
 done
@@ -166,6 +167,26 @@ seed_task DIVE-907 "Branch: feature-ok" approval "2026-07-18 00:00:00" "yes ship
 out=$(run_push DIVE-907 --dry-run); rc=$?
 { [[ $rc -eq 0 ]] && grep -qi "dry-run: would push" <<<"$out"; } \
   && ok_t "happy dry-run -> ok" || bad_t "happy dry-run -> ok" "rc=$rc :: $out"
+
+# 7b) INST-5 FAIL-CLOSED ON A MISSING PREDICATE. Extracting push's gate check into
+# lib/broker.sh created a failure mode the inline code could not have: if the lib
+# is not loaded the call is merely "command not found" (rc 127) and, as a bare
+# statement, execution CONTINUES — CI caught exactly this, with push printing
+# "would push ... (gate cleared)" for a task whose gate it never read. The control
+# is arm 7 directly above: the SAME fixture, the SAME command, one predicate
+# removed. If this pair ever stops differing, the guard has gone vacuous.
+for _pred in broker_gate_check broker_bind_target; do
+  out=$( cd "$REPO"; unset -f "$_pred"; cmd_push DIVE-907 --repo="file://$REPO" --dry-run 2>&1 ); rc=$?
+  # The ACTION must not have happened — an rc alone would also pass on the wrong refusal.
+  { [[ $rc -ne 0 ]] && ! grep -qi "would push" <<<"$out"; } \
+    && ok_t "missing $_pred -> refuses, and no push is reported" \
+    || bad_t "missing $_pred -> refuses, and no push is reported" "rc=$rc :: $out"
+  # …and the refusal NAMES the absent predicate, so the operator is not left guessing.
+  grep -q "$_pred" <<<"$out" \
+    && ok_t "…and the refusal names '$_pred' as the missing predicate" \
+    || bad_t "…and the refusal names '$_pred' as the missing predicate" "$out"
+done
+unset _pred
 
 # 8) DIVE-1462 branch binding: a --branch that DISAGREES with the task's declared
 # branch is refused — the cleared gate binds to the task's own branch, so an agent
@@ -750,16 +771,68 @@ wf() { ( _push_touches_workflows "$WFREPO" "$WFREPO" "$1" ) 2>/dev/null; }
 [[ "$(wf touches-ci)" == "yes" ]] \
   && ok_t "workflows scope: a branch touching .github/workflows/ needs workflows:write" \
   || bad_t "workflows scope: workflow-touching branch" "got '$(wf touches-ci)', want 'yes'"
-# No reachable default branch -> no range to diff. Must be 'unknown' (which the
-# caller treats as "include the permission and say so"), never a silent 'no' —
-# a false 'no' is a push that fails AFTER the human cleared the gate.
+# Neither a live NOR a cached bound -> no range to diff. Must be 'unknown' (which
+# the caller treats as "include the permission and say so"), never a silent 'no' —
+# a false 'no' is a push that fails AFTER the human cleared the gate. WFREPO has no
+# remote-tracking refs, so this arm exercises the both-bounds-missing path.
 [[ "$( ( _push_touches_workflows "$WFREPO" "/nonexistent/remote.git" touches-ci ) 2>/dev/null )" == "unknown" ]] \
-  && ok_t "workflows scope: unreachable remote -> unknown (fails open, loudly)" \
-  || bad_t "workflows scope: unreachable remote" "want 'unknown'"
+  && ok_t "workflows scope: no live AND no cached bound -> unknown (fails open, loudly)" \
+  || bad_t "workflows scope: no live and no cached bound" "want 'unknown'"
+
+# DIVE-2547: the live fetch is UNAUTHENTICATED, so on a PRIVATE repo it can never
+# succeed and the old code demanded workflows:write on every push forever. With a
+# cached remote-tracking ref present the probe must fall back to it and MEASURE,
+# rather than escalating the token. Same fixture, plus refs/remotes/origin/main.
+WFCACHED="$TMP/wfcached"
+cp -r "$WFREPO" "$WFCACHED" 2>/dev/null
+( cd "$WFCACHED" && git update-ref refs/remotes/origin/main refs/heads/main ) >/dev/null 2>&1
+wfc() { ( _push_touches_workflows "$WFCACHED" "/nonexistent/remote.git" "$1" ) 2>/dev/null; }
+
+[[ "$(wfc code-only)" == "no" ]] \
+  && ok_t "workflows scope: unreachable remote + cached ref -> measures 'no', does NOT escalate" \
+  || bad_t "workflows scope: cached-ref fallback on a code-only branch" "got '$(wfc code-only)', want 'no'"
+[[ "$(wfc touches-ci)" == "yes" ]] \
+  && ok_t "workflows scope: cached-ref fallback still catches a workflow-touching branch" \
+  || bad_t "workflows scope: cached-ref fallback on a ci branch" "got '$(wfc touches-ci)', want 'yes'"
+# The degradation must SAY it degraded (DIVE-2161: a cached bound that hides its
+# staleness is the failure this whole class is about).
+( _push_touches_workflows "$WFCACHED" "/nonexistent/remote.git" code-only ) 2>&1 >/dev/null \
+  | grep -q 'may be stale' \
+  && ok_t "workflows scope: the cached-bound fallback names its own staleness on stderr" \
+  || bad_t "workflows scope: cached fallback is silent" "no staleness warning emitted"
 # And the caller wires it: the wide body is reachable only when not 'no'.
 grep -q 'workflows:"write"' "$SRC/cmd_push.sh" \
   && ok_t "workflows scope: _push_do can request workflows:write" \
   || bad_t "workflows scope: _push_do can request workflows:write" "no workflows grant in the token body"
+
+# --- DIVE-2563: the installation is resolved PER REPO, not pinned -------------
+# A GitHub App gets one installation per ACCOUNT it is installed on, and the token
+# exchange refuses any repo outside the installation it is addressed to. A single
+# pinned GITHUB_APP_INSTALLATION_ID therefore works only while the whole fleet
+# lives in one account — which stopped being true the moment a repo sat under a
+# different owner. Measured 2026-08-03: 5dive-ai/5dive resolves to the pinned
+# installation; lodar/5dive-api and lodar/5dive-frontend resolve to none at all.
+grep -q 'repos/\${slug}/installation' "$SRC/cmd_push.sh" \
+  && ok_t "installation: _push_do asks GitHub which installation owns the repo" \
+  || bad_t "installation: per-repo lookup" "no /repos/<slug>/installation call before the mint"
+
+# The lookup needs the owner/repo slug, and it runs BEFORE the mint. The first cut
+# of this fix referenced \$slug 40 lines above its assignment, which expands to
+# empty and silently queries /repos//installation — a lookup that cannot fail
+# loudly. Pin the ordering, not just the presence.
+_slug_ln=$(grep -n '^  slug=\$(_push_repo_slug "\$repourl")' "$SRC/cmd_push.sh" | head -1 | cut -d: -f1)
+_inst_ln=$(grep -n 'repos/\${slug}/installation' "$SRC/cmd_push.sh" | head -1 | cut -d: -f1)
+[[ -n "$_slug_ln" && -n "$_inst_ln" && "$_slug_ln" -lt "$_inst_ln" ]] \
+  && ok_t "installation: slug is assigned BEFORE the installation lookup reads it" \
+  || bad_t "installation: slug assigned before use" "slug at line ${_slug_ln:-none}, lookup at ${_inst_ln:-none}"
+
+# A refusal must carry what GitHub actually said. `curl -fsS` prints nothing on a
+# 4xx, so the old code rendered "There is at least one repository that does not
+# exist or is not accessible to the parent installation" as "installation token
+# exchange failed" and the operator had to re-run the call by hand to find out.
+grep -q "message // empty" "$SRC/cmd_push.sh" \
+  && ok_t "installation: a failed mint surfaces GitHub's own message" \
+  || bad_t "installation: mint failure names the cause" "the API error body is discarded"
 
 echo "-----"
 printf 'push_unit: %d passed, %d failed\n' "$PASS" "$FAIL"

@@ -3,6 +3,7 @@ create_agent_user() {
   # tier (cmd_create resolves standard-by-default + bootstrap-admin). The
   # fallback here is 'standard', never 'admin', so no path silently grants root.
   local name="$1" isolation="${2:-standard}" can_push="${3:-0}"
+  local can_deploy="${4:-0}"     # INST-5: the broker's delegated-deploy surface
   local user="agent-${name}"
   if ! id -u "$user" &>/dev/null; then
     adduser --disabled-password --gecos "" "$user" >/dev/null
@@ -33,7 +34,7 @@ create_agent_user() {
   if [[ "$isolation" == "admin" ]]; then
     write_admin_sudoers "$user"
   elif [[ "$isolation" == "standard" ]]; then
-    write_standard_sudoers "$user" "$can_push"
+    write_standard_sudoers "$user" "$can_push" "$can_deploy"
   else
     rm -f "/etc/sudoers.d/${user}"
   fi
@@ -513,6 +514,8 @@ agent_sudo_grant() {
 # visudo-validates + installs it.
 render_standard_sudoers() {
   local user="$1" can_push="${2:-0}"
+  # INST-5: delegated deploy, the broker's second surface, on its own axis.
+  local can_deploy="${3:-0}"
   cat <<SUDOERS
 # Managed by 5dive (DIVE-1065/1074). Scoped inter-agent a2a grants for standard agent ${user}.
 # Do not edit by hand; regenerated on agent create/provision.
@@ -544,12 +547,30 @@ ${user} ALL=(root) NOPASSWD: /usr/local/bin/5dive _push_do
 ${user} ALL=(root) NOPASSWD: /usr/local/bin/5dive _gh_do
 SUDOERS
   fi
+  if [[ "$can_deploy" == "1" ]]; then
+    cat <<SUDOERS
+# INST-5: delegated-deploy capability, the capability broker's SECOND surface.
+# Same template as the push grant: exact command path, params over stdin (no arg
+# wildcard, so it holds identically under classic sudo and sudo-rs), gate
+# re-verified authoritatively inside _deploy_do under signature, and the target
+# bound to the Deploy line the task itself declares.
+# Deliberately a SEPARATE axis from can_push: shipping a branch for review and
+# shipping to PRODUCTION are different authorities, and the capability registry
+# records them under different names.
+# NOTE FOR THE NEXT EDITOR: this heredoc is UNQUOTED (it interpolates the user),
+# so a backtick or a dollar sign in a COMMENT is executed and its output lands
+# in the sudoers file. Keep this block free of both.
+${user} ALL=(root) NOPASSWD: /usr/local/bin/5dive _deploy_do
+SUDOERS
+  fi
 }
 
 write_standard_sudoers() {
-  local user="$1" can_push="${2:-0}" f="/etc/sudoers.d/${user}" tmp
+  local user="$1" can_push="${2:-0}"
+  local can_deploy="${3:-0}"
+  local f="/etc/sudoers.d/${user}" tmp
   tmp=$(mktemp)
-  render_standard_sudoers "$user" "$can_push" > "$tmp"
+  render_standard_sudoers "$user" "$can_push" "$can_deploy" > "$tmp"
   chmod 440 "$tmp"
   if visudo -cf "$tmp" >/dev/null 2>&1; then
     chown root:root "$tmp"
@@ -562,7 +583,7 @@ write_standard_sudoers() {
     # copies minted at different moments IS the drift shape. This is the record
     # OF the authoritative write, taken at the instant it succeeds.
     # Best-effort: it never fails the install (see capability_declare_standard).
-    capability_declare_standard "$user" "$can_push" provisioned
+    capability_declare_standard "$user" "$can_push" provisioned "$can_deploy"
   else
     rm -f "$tmp"
     fail "$E_GENERIC" "generated sudoers for ${user} failed visudo validation; aborting (no partial install)"
@@ -724,6 +745,11 @@ write_agent_env() {
   if [[ -z "$can_push" && -r "$env_file" ]]; then
     can_push=$(sed -n 's/^AGENT_CAN_PUSH=//p' "$env_file" | head -1)
   fi
+  # INST-5: same PRESERVE-unless-overridden discipline for delegated deploy.
+  local can_deploy="${_CAN_DEPLOY_OVERRIDE:-}"
+  if [[ -z "$can_deploy" && -r "$env_file" ]]; then
+    can_deploy=$(sed -n 's/^AGENT_CAN_DEPLOY=//p' "$env_file" | head -1)
+  fi
   {
     printf 'AGENT_NAME=%s\n' "$name"
     printf 'AGENT_TYPE=%s\n' "$type"
@@ -733,6 +759,7 @@ write_agent_env() {
     printf 'AGENT_ISOLATION=%s\n' "$isolation"
     [[ -n "$autonomy" && "$autonomy" != "standard" ]] && printf 'AGENT_AUTONOMY=%s\n' "$autonomy"
     [[ "$can_push" == "1" ]] && printf 'AGENT_CAN_PUSH=1\n'
+    [[ "$can_deploy" == "1" ]] && printf 'AGENT_CAN_DEPLOY=1\n'
     # New telegram agents flow through our 5dive-plugins fork (bundled
     # hooks, richer slash commands). 5dive-agent-start reads this var to
     # build the runtime --channels arg, defaulting to claude-plugins-official
@@ -1130,6 +1157,92 @@ _resolve_inherit_sources() {
   done
 }
 
+# DIVE-2025: can the agent actually READ its credential?
+#
+# The self-check used to answer this by reading `defer_auth` — a flag recording
+# what the OPERATOR CHOSE, not what the agent GOT. On the completed-login path
+# nothing was checked at all (not even an ok entry), so a credential that
+# silently never reached the agent still printed "self-check PASS — reachable &
+# autonomous". That is the DIVE-1900 shape: every status surface agrees and
+# every one is wrong.
+#
+# THE PROBE MUST BE GROUNDED IN THE AGENT'S UID. `agent create` runs as root,
+# and root reads every credential on the box, so a readability test run from
+# here would pass unconditionally and prove nothing — it would replace a lie
+# with a vacuous truth. Presence is answered as root (root traverses every
+# 0700 dir, so its `-e` is the only trustworthy ABSENT verdict); readability is
+# answered as agent-<name>. Two different questions, two different uids.
+#
+# ABSENT and UNREADABLE stay distinct because they take different fixes:
+# absence is "go log in", unreadability is "the credential is fine, the perms
+# are not" (and presents as `invalid_grant "Malformed auth code"`, which reads
+# as an EXPIRED token, so the intuitive fix — a re-tap — changes nothing).
+#
+# The single seam where the agent-uid read happens, so a harness can stub it
+# without needing a real agent user, real sudo, or root.
+cred_readable_by_agent() { # <agent-user> <path>
+  sudo -n -u "$1" test -r "$2" 2>/dev/null
+}
+
+# selfcheck_cred_reached_agent <name> <type> <profile> <byo_provider>
+# Emits zero or more `ok:<text>` / `issue:<text>` lines on stdout. Never fails.
+# Kept as a named function (rather than inlined in the self-check) so the
+# agent-list health-badge rail (DIVE-1219) can call the same probe and re-check
+# continuously instead of only once at creation.
+selfcheck_cred_reached_agent() { # <name> <type> <profile> <byo_provider>
+  local name="$1" type="$2" profile="$3" byo="${4:-}"
+  local user="agent-${name}"
+
+  # Witness 1: the boot seed's own breadcrumb. 5dive-agent-start runs AS the
+  # agent and records a failed seed at ~/.5dive-cred-seed-failed (removing it
+  # on success), with ABSENT vs UNREADABLE already resolved by cred_seed_why.
+  # Until now that verdict only reached the unit's journal, where nobody looks.
+  # Reading it here costs nothing and duplicates no path knowledge.
+  # AGENT_HOME_ROOT is a test seam (default /home, as everywhere else in this
+  # file); a harness cannot create /home/agent-<name> without root.
+  local bc="${AGENT_HOME_ROOT:-/home}/${user}/.5dive-cred-seed-failed" why=""
+  if [[ -s "$bc" ]]; then
+    why=$(tr -d '\n' < "$bc" 2>/dev/null | cut -c1-400)
+    printf 'issue:credential did NOT reach the agent (it is UNAUTHED despite a completed login) — the boot seed recorded: %s. Re-seed as root: sudo 5dive agent restart %s\n' \
+      "$why" "$name"
+    return 0
+  fi
+
+  # Witness 2: the source the seed reads from, probed as the agent. Catches
+  # what the breadcrumb cannot — a seed that never ran because the unit had not
+  # reached it yet, and the no-seed types that never write a breadcrumb at all.
+  local src=""
+  if [[ -n "$byo" ]]; then
+    # BYO writes an API key into combined.env, not the type's OAuth sentinel;
+    # probing the sentinel would report a false ABSENT.
+    [[ -n "$profile" ]] && src="${AUTH_PROFILES_DIR}/${profile}/combined.env"
+  elif [[ -n "$profile" && -s "${AUTH_PROFILES_DIR}/${profile}/combined.env" ]]; then
+    # api-key / claude-OAuth path: create's own auth gate accepts combined.env
+    # in place of the per-type file, so the probe has to accept it too.
+    src="${AUTH_PROFILES_DIR}/${profile}/combined.env"
+  else
+    src=$(profile_type_auth_path "$profile" "$type" 2>/dev/null) || src=""
+    # `claude` is the one type whose shared sentinel is a `path:jsonkey` pair
+    # (DIVE-1803); every other type's is a bare path.
+    src="${src%%:*}"
+  fi
+  [[ -n "$src" ]] || return 0        # opencode/pi/devin: no credential sentinel
+
+  if [[ ! -e "$src" ]]; then
+    printf 'issue:no auth credential at %s (agent is UNAUTHED — it cannot think until you log in): sudo 5dive agent auth login %s%s\n' \
+      "$src" "$type" "${profile:+ --auth-profile=$profile}"
+  elif [[ ! -s "$src" ]]; then
+    printf 'issue:auth credential at %s is EMPTY (a login was started but never finalized) — re-run: sudo 5dive agent auth login %s%s\n' \
+      "$src" "$type" "${profile:+ --auth-profile=$profile}"
+  elif cred_readable_by_agent "$user" "$src"; then
+    printf 'ok:auth credential readable by %s\n' "$user"
+  else
+    printf 'issue:auth credential EXISTS at %s but is NOT readable by %s — a perms fault, NOT an expired token (the agent will fail token exchange with '"'"'Malformed auth code'"'"'; re-tapping the login changes nothing). Re-normalize perms as root: sudo 5dive agent restart %s\n' \
+      "$src" "$user" "$name"
+  fi
+  return 0
+}
+
 # Top-level seeding (root): builds the target store, seeds every resolved
 # source, rebuilds the index, and hands the whole tree to the agent user.
 seed_inherited_memory() {
@@ -1164,6 +1277,7 @@ cmd_create() {
   local isolation="" isolation_explicit=0 no_team_bot=0
   local autonomy="standard"   # DIVE-499
   local can_push=0            # DIVE-1462/STEER-4: delegated-push (builder) capability
+  local can_deploy=0          # INST-5: delegated-deploy (production ship) capability
   local inherit_memory=""     # DIVE-990 memory-as-onboarding
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -1189,12 +1303,13 @@ cmd_create() {
       --isolation=*)               isolation="${1#--isolation=}"; isolation_explicit=1 ;;
       --inherit-memory=*)          inherit_memory="${1#--inherit-memory=}" ;;
       --can-push)                  can_push=1 ;;
+      --can-deploy)                can_deploy=1 ;;
       -*)                          fail "$E_USAGE" "unknown flag: $1" ;;
       *)                           [[ -z "$name" ]] && name="$1" || fail "$E_USAGE" "extra arg: $1" ;;
     esac
     shift
   done
-  [[ -n "$name" ]] || fail "$E_USAGE" "usage: 5dive agent create <name> --type=<type> [--channels=none|telegram|discord|dashboard[,ch...]] [--telegram-token=<token|->] [--telegram-cos=<child-username>] [--telegram-cos-avatar=<png>] [--telegram-home-channel=<id>] [--telegram-allowed-users=<csv>] [--discord-token=<token|->] [--workdir=<path>] [--auth-profile=<name>] [--provider=<id> --api-key=<key|->] [--model=<slug>] [--with-skills=<spec>[,...]] [--no-skills] [--no-team-bot] [--defer-auth] [--isolation=admin|standard|sandboxed] [--can-push] [--inherit-memory=wiki|all|team|<agent>[,...]]"
+  [[ -n "$name" ]] || fail "$E_USAGE" "usage: 5dive agent create <name> --type=<type> [--channels=none|telegram|discord|dashboard[,ch...]] [--telegram-token=<token|->] [--telegram-cos=<child-username>] [--telegram-cos-avatar=<png>] [--telegram-home-channel=<id>] [--telegram-allowed-users=<csv>] [--discord-token=<token|->] [--workdir=<path>] [--auth-profile=<name>] [--provider=<id> --api-key=<key|->] [--model=<slug>] [--with-skills=<spec>[,...]] [--no-skills] [--no-team-bot] [--defer-auth] [--isolation=admin|standard|sandboxed] [--can-push] [--can-deploy] [--inherit-memory=wiki|all|team|<agent>[,...]]"
   [[ -n "$type" ]] || fail "$E_USAGE" "--type is required"
   valid_name "$name" || fail "$E_VALIDATION" "invalid name (lowercase letters/digits/hyphens, start letter, <=16 chars)"
   is_known_type "$type" || fail "$E_NOT_FOUND" "unknown type: $type (known: ${!TYPE_BIN[*]})"
@@ -1252,6 +1367,13 @@ cmd_create() {
     case "$isolation" in
       sandboxed) fail "$E_VALIDATION" "--can-push is incompatible with --isolation=sandboxed (a sandboxed agent gets no sudoers, so it cannot be granted delegated push)." ;;
       admin)     can_push=0; warn "--can-push is redundant for an admin agent (admin sudo already permits '5dive _push_do'); ignoring." ;;
+    esac
+  fi
+  # INST-5: --can-deploy, identical posture to --can-push above.
+  if (( can_deploy )); then
+    case "$isolation" in
+      sandboxed) fail "$E_VALIDATION" "--can-deploy is incompatible with --isolation=sandboxed (a sandboxed agent gets no sudoers, so it cannot be granted delegated deploy)." ;;
+      admin)     can_deploy=0; warn "--can-deploy is redundant for an admin agent (admin sudo already permits '5dive _deploy_do'); ignoring." ;;
     esac
   fi
   # DIVE-990: validate every inherit-memory scope token (wiki|all|team|<agent-name>).
@@ -1603,7 +1725,7 @@ cmd_create() {
   fi
 
   step "Creating user agent-${name}"
-  create_agent_user "$name" "$isolation" "$can_push"
+  create_agent_user "$name" "$isolation" "$can_push" "$can_deploy"
 
   if [[ "$isolation" == "sandboxed" ]]; then
     step "Applying sandbox resource limits for agent-${name}"
@@ -1766,7 +1888,7 @@ cmd_create() {
   step "Writing agent env"
   # DIVE-499: stamp the autonomy mode into the env file (yolo/son-of-anton add the
   # approved directive at launch; standard = nothing).
-  _AUTONOMY_OVERRIDE="$autonomy" _CAN_PUSH_OVERRIDE="$can_push" \
+  _AUTONOMY_OVERRIDE="$autonomy" _CAN_PUSH_OVERRIDE="$can_push" _CAN_DEPLOY_OVERRIDE="$can_deploy" \
     write_agent_env "$name" "$type" "$channels" "$workdir" "$profile" "$isolation"
   link_agent_profile "$name" "$profile"
 
@@ -2025,6 +2147,18 @@ cmd_create() {
   # auth: deferred login still pending, so the first turn will stall.
   if (( defer_auth )); then
     _hc_issues+=("auth was deferred (agent is UNAUTHED — can't think until you log in): sudo 5dive agent auth login $type${profile:+ --auth-profile=$profile}")
+  else
+    # DIVE-2025: a completed login used to be checked by NOTHING — not even an
+    # ok entry — so a credential that never reached the agent still printed
+    # "self-check PASS". Probe the credential itself, as the agent's own uid.
+    local _cred_line
+    while IFS= read -r _cred_line; do
+      [[ -n "$_cred_line" ]] || continue
+      case "$_cred_line" in
+        ok:*)    _hc_ok+=("${_cred_line#ok:}") ;;
+        issue:*) _hc_issues+=("${_cred_line#issue:}") ;;
+      esac
+    done < <(selfcheck_cred_reached_agent "$name" "$type" "$profile" "$byo_provider")
   fi
   if (( ${#_hc_issues[@]} == 0 )); then
     warn "self-check PASS for '$name' — reachable & autonomous (${_hc_ok[*]})."

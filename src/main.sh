@@ -258,6 +258,8 @@ Zero-human proof (publish your own badge — OSS-17):
 
 Delegated push (bring your own GitHub App — DIVE-1376):
   5dive push <id|DIVE-N> [--branch=<b>] [--dry-run]  # push ONLY the task's branch, ONLY after its gate clears; author enforced
+  5dive deploy <id|DIVE-N> [--target=<project@ref>] [--env=production|preview] [--dry-run]
+                                                     # INST-5: deploy ONLY the project@ref the task declares, ONLY after its gate clears
   5dive push setup                                   # scaffold + check the GitHub App credential (bring-your-own; root)
   # Branch comes from --branch or a 'Branch: <name>' line in the task body. The credential is YOUR GitHub App
   # (contents:write, installed on your ship repos), held root-side in /etc/5dive/connectors — never a human token.
@@ -401,6 +403,17 @@ main() {
       # an environment prefix. The agent process never holds the token. Not
       # audited itself (the parent `gh` verb is) and never advertised.
       cmd_gh_do "$@"
+      exit $? ;;
+    _deploy_do)
+      # INST-5: hidden, privileged, ATOMIC delegated deploy — the capability
+      # broker's SECOND surface, same template as _push_do. Reachable ONLY via
+      # NOPASSWD sudo. Reads <ident> <project> <ref> <env> on STDIN (never argv,
+      # so the grant stays exact-path / sudo-rs safe), re-verifies the cleared
+      # gate under signature, re-binds the target to the task's own Deploy line,
+      # reads VERCEL_TOKEN root-only and fires ONE deployment of the repo the
+      # project is ALREADY linked to. The agent process never holds the token.
+      # Not audited itself (the parent `deploy` verb is) and never advertised.
+      cmd_deploy_do "$@"
       exit $? ;;
     _push_do)
       # DIVE-1376/1460: hidden, privileged, ATOMIC delegated push. Reachable ONLY
@@ -798,6 +811,15 @@ main() {
         AUDIT_CMD="push"; AUDIT_ARGS=("$@")
         cmd_push "$@"
       fi ;;
+    deploy)
+      # INST-5: delegated PRODUCTION deploy — the capability broker generalized
+      # off delegated push. Deploys ONLY the project@ref the task declares, ONLY
+      # after that task's gate clears, and only into the repo the Vercel project
+      # is already linked to. The privileged gate+bind+credential+deploy runs
+      # atomically in the root-only _deploy_do helper; the agent never holds the
+      # token. Mutating + credential-bearing -> audited.
+      AUDIT_CMD="deploy"; AUDIT_ARGS=("$@")
+      cmd_deploy "$@" ;;
     proof)
       # OSS-17: publish this box's zero-human proof (badge.json/zero-human.json/
       # history.jsonl) to a git status branch, computed verbatim from `digest`.

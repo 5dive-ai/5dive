@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# TIER: core — 1.4s measured (DIVE-2525): fits the 300s PR core; stated, not defaulted.
 # DIVE-2102 — the capability registry answers "confirmed holder" and nothing else.
 #
 # The assertions that matter are the NEGATIVE-SPACE ones: absence, staleness and
@@ -87,19 +88,51 @@ echo "-- the declared set matches what the sudoers policy actually grants"
 # The registry claiming a grant the policy does not emit is the drift this
 # ticket exists to prevent, so assert against render_standard_sudoers itself
 # rather than against a second hand-written list.
+#
+# INST-5 widened this from "does the push grant agree" to "does EVERY brokered
+# surface agree", enumerated from broker_surfaces() rather than from a list
+# written here. That matters for the surface AFTER deploy: folding in email or
+# DNS means adding a sudoers block and a registry name, and the way that goes
+# wrong is landing one without the other — a granted authority nobody records,
+# or a recorded authority nobody granted. Enumerating the table means the next
+# surface is covered by this loop on the day its row is added, with no second
+# edit here to forget.
 # shellcheck source=../src/cmd_agent_create.sh
 fail() { printf 'fail: %s\n' "$*" >&2; return 1; }
+E_GENERIC=1
+# shellcheck source=../src/lib/broker.sh
+source "$ROOT/src/lib/broker.sh"
 eval "$(awk '/^render_standard_sudoers\(\) \{/,/^\}/' "$ROOT/src/cmd_agent_create.sh")"
 for cp in 0 1; do
-  policy=$(render_standard_sudoers testuser "$cp")
-  emits_push=0; grep -q '5dive _push_do' <<<"$policy" && emits_push=1
-  declares_push=0
-  _capability_names_for_standard "$cp" | grep -qx delegated_push && declares_push=1
-  want "can_push=$cp: policy emits push ($emits_push) == registry declares it ($declares_push)" \
-       "[[ $emits_push -eq $declares_push ]]"
+ for cd in 0 1; do
+  policy=$(render_standard_sudoers testuser "$cp" "$cd")
+  for surface in $(broker_surfaces); do
+    verb=$(broker_surface "$surface" verb)
+    cap=$(broker_surface "$surface" cap)
+    emits=0;    grep -qE "5dive ${verb}\$" <<<"$policy" && emits=1
+    declares=0; _capability_names_for_standard "$cp" "$cd" | grep -qx "$cap" && declares=1
+    want "can_push=$cp can_deploy=$cd / ${surface}: policy emits ($emits) == registry declares ($declares)" \
+         "[[ $emits -eq $declares ]]"
+  done
+ done
 done
+# NON-VACUITY. Every arm above is an equality, and 0==0 satisfies it — a
+# render_ that emitted nothing and a registry that declared nothing would pass
+# the whole loop. So assert the loop actually reached the granting corner.
+#
+# NOTE THE SUBSHELL PARENS, they are not style. `want` runs its argument through
+# `eval` in the HARNESS shell, so a bare `exit` inside the expression exits the
+# HARNESS — silently, with status 0, skipping every remaining arm and the final
+# tally. Written without them, this pair passed while the mutation that deletes
+# the delegated_deploy declaration stayed green, because the run ended here.
+want "the fully-granted corner really emits every brokered verb" \
+     '( p=$(render_standard_sudoers testuser 1 1); for s in $(broker_surfaces); do grep -qE "5dive $(broker_surface "$s" verb)\$" <<<"$p" || exit 1; done )'
+want "the ungranted corner emits NONE of them" \
+     '( p=$(render_standard_sudoers testuser 0 0); for s in $(broker_surfaces); do grep -qE "5dive $(broker_surface "$s" verb)\$" <<<"$p" && exit 1; done; exit 0 )'
 want "unconditional grants are always declared" \
      '[[ "$(_capability_names_for_standard 0 | wc -l)" -eq 4 ]]'
+want "an omitted can_deploy arg defaults to NOT granted (every pre-INST-5 caller)" \
+     '[[ "$(render_standard_sudoers testuser 1)" == "$(render_standard_sudoers testuser 1 0)" ]] && ! grep -q "_deploy_do" <<<"$(render_standard_sudoers testuser 1)"'
 
 echo "-- the store must be READABLE BY AGENTS, not just written by root"
 # olivia, DIVE-2102 iteration 1: the writer shipped chmod and dropped chown, so
@@ -178,6 +211,22 @@ rm -f "$sudoers_dir/rvC"
 want "C: confirmed BEFORE"          'capability_confirmed_holder a2a_deliver rvC'
 capability_reverify_from_sudoers rvC
 want "C: ALL rows gone after"       '! capability_confirmed_holder a2a_deliver rvC && ! capability_confirmed_holder delegated_push rvC'
+
+# INST-5 / E. the SECOND brokered surface must reverify from the artifact too.
+# Iteration-1 coverage stopped at push, so a deploy grant could have been
+# installed and never recorded — an authority the sudoers file gives out and
+# the registry answers "not confirmed" about. Both directions, because the
+# dangerous one is the DROP: a pulled deploy grant that stays confirmed hands a
+# revoked production-ship capability to a router as a live fact.
+reset_rv rvE; capability_forget_agent rvE
+render_standard_sudoers rvE 0 1 > "$sudoers_dir/rvE"
+capability_reverify_from_sudoers rvE
+want "E: deploy confirmed from a deploy-only policy" 'capability_confirmed_holder delegated_deploy rvE'
+want "E: …and push is NOT claimed from it"           '! capability_confirmed_holder delegated_push rvE'
+render_standard_sudoers rvE 1 0 > "$sudoers_dir/rvE"
+capability_reverify_from_sudoers rvE
+want "E: policy loses deploy -> row DROPPED"         '! capability_confirmed_holder delegated_deploy rvE'
+want "E: …and push is picked up in the same pass"    'capability_confirmed_holder delegated_push rvE'
 
 # D. a policy that is NOT a standard policy -> decline, do not claim standard caps
 reset_rv rvD

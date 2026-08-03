@@ -149,8 +149,13 @@ capability_forget_agent() {
 # it, and the unit test asserts they agree.
 _capability_names_for_standard() {
   local can_push="${1:-0}"
+  # INST-5: the broker's second surface. Its own axis, not a rider on can_push —
+  # shipping a branch for review and shipping to PRODUCTION are different
+  # authorities, so they are different rows a router can ask about separately.
+  local can_deploy="${2:-0}"
   printf '%s\n' a2a_deliver a2a_capture audit_append self_restart
   [[ "$can_push" == "1" ]] && printf '%s\n' delegated_push
+  [[ "$can_deploy" == "1" ]] && printf '%s\n' delegated_deploy
   return 0
 }
 
@@ -199,8 +204,9 @@ _capability_reconcile_locked() {
 # record. A failure warns and returns 0, because failing the install would turn
 # a bookkeeping error into a provisioning outage. Absent reads as undeclared.
 capability_declare_standard() {
-  local user="$1" can_push="${2:-0}" source="${3:-provisioned}" caps
-  caps=$(_capability_names_for_standard "$can_push")
+  local user="$1" can_push="${2:-0}" source="${3:-provisioned}"
+  local can_deploy="${4:-0}" caps
+  caps=$(_capability_names_for_standard "$can_push" "$can_deploy")
   _capability_lock _capability_reconcile_locked "$user" root "$source" "$caps" \
     || warn "capability registry: could not record capabilities for ${user} (the sudoers grant IS installed; the rows are absent, which reads as undeclared)"
   return 0
@@ -218,7 +224,9 @@ capability_declare_standard() {
 # and would convert an expired-and-therefore-safe row into a confidently wrong
 # one. If the file is gone, the grant is gone, so the rows go too.
 capability_reverify_from_sudoers() {
-  local user="$1" can_push=0 f
+  local user="$1" can_push=0
+  local can_deploy=0
+  local f
   [[ -n "$user" ]] || return 2
   # NOT one `local` line. `local a="$1" b="...${a}"` expands every word before it
   # assigns any, so ${a} resolves to whatever `a` meant in the CALLER's scope
@@ -238,8 +246,9 @@ capability_reverify_from_sudoers() {
     return 0
   fi
   grep -q '5dive _push_do' "$f" && can_push=1
+  grep -q '5dive _deploy_do' "$f" && can_deploy=1
   # Only a STANDARD policy is modelled here; an admin policy is a different
   # shape and claiming standard capabilities from it would be a false record.
   grep -q '5dive agent _deliver' "$f" || { capability_forget_agent "$user"; return 0; }
-  capability_declare_standard "$user" "$can_push" reverified
+  capability_declare_standard "$user" "$can_push" reverified "$can_deploy"
 }

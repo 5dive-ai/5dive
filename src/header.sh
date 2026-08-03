@@ -771,3 +771,22 @@ declare -A TYPE_PROBE=(
   # File-presence via the TYPE_AUTH sentinel.
   [devin]=''
 )
+
+# require_loaded <context> <fn>... — INST-5: fail-closed dependency assertion.
+#
+# The broker refactor moved push's security predicates out of cmd_push.sh and
+# into src/lib/broker.sh. That introduced a failure mode the inline code could
+# not have had: if the lib is not loaded, `broker_gate_check ...` is just
+# "command not found" (rc 127), and as a BARE STATEMENT execution simply
+# continues — push then reports "gate cleared" for a task carrying no gate at
+# all. Extracting a predicate turns "cannot fail" into "fails open", so each
+# brokered surface asserts its predicates are really loaded before it acts.
+# Lives in header.sh deliberately: a guard against a missing file cannot itself
+# live in the file that might be missing.
+require_loaded() {
+  local ctx="$1" fn; shift
+  for fn in "$@"; do
+    declare -F "$fn" >/dev/null && continue
+    fail "$E_GENERIC" "${ctx}: required predicate '${fn}' is not loaded (src/lib/broker.sh missing from this build) — refusing rather than proceeding unchecked."
+  done
+}
