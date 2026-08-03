@@ -111,6 +111,66 @@ out=$(tasks_db_init 2>&1); rc=$?
 [[ $rc -eq 0 && "$(row_count)" == "3" ]] && ok "idempotent: re-init keeps rows" || bad "idempotent: rc=$rc rows=$(row_count)"
 grep -q 'MISSING\|AUTO-RESTORED' <<<"$out" && bad "idempotent: spurious alarm ($out)" || ok "idempotent: no alarm"
 
+# --- Case 6 (DIVE-1986): TASKS_DB aimed elsewhere must NOT inherit this board --
+# The reported shape: TASKS_DB overridden ALONE at a throwaway path, STATE_DIR (and
+# so TASKS_DIR + tasks-backups) left pointing at a populated board. Before the fix
+# the sentinel and the snapshots of THIS board answered "has the board existed?"
+# for a store they have never met, and init auto-restored every row of it into the
+# throwaway path. Here the populated tree stands in for prod, so the case runs the
+# real shape without going near the live board.
+fresh_tree
+tasks_db_init >/dev/null 2>&1
+seed_rows
+snapshot "20260725T154721Z"                        # this board HAS a restorable history
+home_db="$TASKS_DB"; home_sentinel="$(_tasks_sentinel)"
+foreign="$TMP/foreign"; mkdir -p "$foreign"        # a dir the caller just created
+TASKS_DB="$foreign/tasks.db"                       # ONLY TASKS_DB moves — the reported shape
+out=$(tasks_db_init 2>&1); rc=$?
+[[ $rc -eq 0 ]] && ok "foreign: init succeeds" || bad "foreign: rc=$rc ($out)"
+[[ "$(row_count)" == "0" ]] && ok "foreign: store is EMPTY (no rows imported)" \
+  || bad "foreign: imported $(row_count) rows from another board"
+grep -q 'AUTO-RESTORED' <<<"$out" && bad "foreign: auto-restored into a foreign store ($out)" \
+  || ok "foreign: no auto-restore alarm"
+[[ -f "$foreign/.board-initialized" ]] && ok "foreign: sentinel stamped BESIDE the foreign store" \
+  || bad "foreign: sentinel not scoped to the store"
+[[ ! -e "$TASKS_DIR/.recover.lock" ]] && ok "foreign: no recover lock left in the other board's dir" \
+  || bad "foreign: wrote .recover.lock into the other board's dir"
+# The board that was NOT the target must be untouched by any of the above.
+[[ "$(sqlite3 "$home_db" 'SELECT count(*) FROM tasks;' 2>/dev/null)" == "3" ]] \
+  && ok "foreign: the other board still has its 3 rows" || bad "foreign: the other board changed"
+[[ -f "$home_sentinel" ]] && ok "foreign: the other board's sentinel intact" || bad "foreign: other sentinel gone"
+
+# --- Case 7 (DIVE-1986): a foreign store still gets the guard ON ITS OWN TERMS --
+# Scoping the lookup must not disarm the guard for non-prod stores: once a store
+# has its own sentinel, a vanished table there is still an incident, and with no
+# snapshot of ITS OWN it must fail loudly rather than silently create an empty
+# board — and must not reach for the other board's snapshots to fill the gap.
+rm -f "$TASKS_DB" "$TASKS_DB-wal" "$TASKS_DB-shm"   # wipe the foreign store; its sentinel survives
+[[ -f "$foreign/.board-initialized" ]] || bad "case7: foreign sentinel should survive a bare rm"
+out=$( ( tasks_db_init ) 2>&1 ); rc=$?
+[[ $rc -ne 0 ]] && ok "foreign-wipe: fails LOUDLY (rc=$rc)" || bad "foreign-wipe: silently succeeded"
+grep -q 'MANUAL recovery required\|no backup' <<<"$out" \
+  && ok "foreign-wipe: alarm names manual recovery" || bad "foreign-wipe: weak msg ($out)"
+[[ "$(row_count)" == "ERR" || "$(row_count)" == "0" ]] \
+  && ok "foreign-wipe: no rows pulled from the other board's snapshot" \
+  || bad "foreign-wipe: imported $(row_count) rows from the other board"
+
+# --- Case 8 (DIVE-1986): an explicit TASKS_BACKUP_DIR pairing still restores ----
+# The caller who names a backup dir is pairing it with their store deliberately,
+# so the scoping check must not fence that off — otherwise recovering a relocated
+# board by hand becomes impossible.
+fresh_tree
+tasks_db_init >/dev/null 2>&1
+seed_rows
+snapshot "20260725T160000Z"
+paired_backups="$STATE_DIR/tasks-backups"
+elsewhere="$TMP/elsewhere"; mkdir -p "$elsewhere"
+TASKS_DB="$elsewhere/tasks.db"
+out=$(TASKS_BACKUP_DIR="$paired_backups" tasks_db_init 2>&1); rc=$?
+[[ $rc -eq 0 ]] && ok "paired: init succeeds" || bad "paired: rc=$rc ($out)"
+[[ "$(row_count)" == "3" ]] && ok "paired: explicit TASKS_BACKUP_DIR still restores" \
+  || bad "paired: rows=$(row_count) ($out)"
+
 echo
 echo "tasks-db restore guard: $PASS passed, $FAIL failed"
 [[ $FAIL -eq 0 ]]

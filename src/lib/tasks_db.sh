@@ -860,15 +860,54 @@ SQL
 #
 # Paths are resolved at CALL time (not sourced into constants) so the DIVE-1475
 # STATE_DIR/TASKS_DIR test-isolation overrides still redirect them to a temp tree.
-# The sentinel lives in TASKS_DIR (2770 group-writable, so any agent can write
+# The sentinel lives beside the active store — for prod that is TASKS_DIR
+# (2770 group-writable, so any agent can write
 # it and it survives a bare `rm tasks.db`); the backups + incident log live in
 # the sibling tasks-backups dir. If the whole TASKS_DIR is wiped the sentinel
 # goes with it, but the backup snapshots in the sibling dir still trip the alarm.
 _tasks_backup_dir() { printf '%s' "${TASKS_BACKUP_DIR:-${STATE_DIR}/tasks-backups}"; }
-_tasks_sentinel()   { printf '%s' "${TASKS_SENTINEL:-${TASKS_DIR}/.board-initialized}"; }
+# DIVE-1986: the sentinel is a fact about the store BESIDE it, so derive it from
+# the active store's own directory rather than from TASKS_DIR. Identical whenever
+# TASKS_DB is that dir's tasks.db (every isolated harness, and prod); different
+# only in the case this fixes — TASKS_DB aimed elsewhere with TASKS_DIR left at
+# its default, where reading the prod sentinel makes prod's history testify about
+# a store it has never met.
+_tasks_store_dir() { local d; d="$(dirname -- "$TASKS_DB" 2>/dev/null)"; printf '%s' "${d:-$TASKS_DIR}"; }
+_tasks_sentinel()  { printf '%s' "${TASKS_SENTINEL:-$(_tasks_store_dir)/.board-initialized}"; }
 
-# Newest backup snapshot path (most recent first), or empty when none exist.
+# DIVE-1986: do the snapshots in the backup dir belong to the ACTIVE store?
+#
+# 5dive-tasks-backup.sh snapshots ONE board: ${TASKS_DIR}/tasks.db. Those .db.gz
+# files are that board's history and no other's. The restore path did not check,
+# so `TASKS_DB=/tmp/x/tasks.db 5dive task init` — TASKS_DB overridden alone,
+# STATE_DIR left at its default, which is what a harness that only wants a
+# throwaway store naturally writes — found the prod sentinel, then the prod
+# snapshots, and auto-restored 579 rows of production task bodies, results and
+# gate ASK text into /tmp. Two costs, both real: task content that names people,
+# decisions and spend lands wherever the caller pointed, and a fixture store the
+# author believes is empty silently is not.
+#
+# An explicit TASKS_BACKUP_DIR is the caller pairing a backup set with their own
+# store on purpose, so it is honoured as-is — the override cannot be the source of
+# the mismatch it would have to describe.
+#
+# readlink -f prints nothing when a path's PARENT does not exist, so fall back to
+# the literal path rather than comparing "" == "" and matching everything — the
+# same three-state care _tasks_store_is_prod takes, and the opposite failure
+# direction matters just as much here: an empty result must not read as a match.
+_tasks_backups_match_store() {
+  [[ -n "${TASKS_BACKUP_DIR:-}" ]] && return 0
+  local active canon ra rc
+  active="$TASKS_DB"; canon="${TASKS_DIR}/tasks.db"
+  ra="$(readlink -f "$active" 2>/dev/null)"; [[ -n "$ra" ]] || ra="$active"
+  rc="$(readlink -f "$canon"  2>/dev/null)"; [[ -n "$rc" ]] || rc="$canon"
+  [[ "$ra" == "$rc" ]]
+}
+
+# Newest backup snapshot path (most recent first), or empty when none exist —
+# or when the snapshots are a DIFFERENT board's history (DIVE-1986).
 _tasks_newest_backup() {
+  _tasks_backups_match_store || return 0
   ls -1t "$(_tasks_backup_dir)"/tasks-*.db.gz 2>/dev/null | head -n1
 }
 
@@ -929,7 +968,7 @@ _tasks_board_recover() {
     rm -f "${TASKS_DB}-wal" "${TASKS_DB}-shm" 2>/dev/null || true
     mv -f "$tmp" "$TASKS_DB" && chmod 0660 "$TASKS_DB" 2>/dev/null
     _tasks_alarm "AUTO-RESTORED $rows rows from $(basename "$newest") — verify integrity."
-  ) 9>"${TASKS_DIR}/.recover.lock"
+  ) 9>"$(_tasks_store_dir)/.recover.lock"   # DIVE-1986: lock beside the store being recovered, not always prod's
   # Confirm we ended with a real table; if not, fail loudly rather than proceed empty.
   local h3
   h3=$(sqlite3 -cmd ".timeout 5000" "$TASKS_DB" \
