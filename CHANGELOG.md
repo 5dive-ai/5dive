@@ -1,5 +1,46 @@
 # Changelog
 
+## Unreleased — fix(gate): the tier-2 destructive floor graded the BRANCH NAME in a push-for-review ask (DIVE-2629)
+
+`approve delegated push for review of branch dive-2613-teardown-outcomes-hetzner-only`
+filed as a **tier-2 human-only** gate. Delete the single word `teardown` from that
+branch name and the identical ask filed tier-1. Graft it onto an unrelated branch and
+that one floored too.
+
+The floor exists to catch **destructive actions**. The action here is "push a feature
+branch to a remote for review" — no merge, no prod touch, reversible, destroys nothing.
+What was destructive-sounding is the **subject of the code on the branch**. The floor was
+reading what the work is *about* and grading it as what the gate *does*, so the better a
+branch name described the work, the likelier it floored: the naming convention we want is
+the one that tripped it.
+
+**Why that was a ratchet, not one extra tap.** A tier-2 approval is filed with no
+`routed_reviewer`, and `cmd_task_answer`'s designated-reviewer exception requires
+`actor == routed_reviewer`. Once floored, **no agent could ever clear it** — not the filer,
+not their lead, not the org coordinator — and no agent action handed it back. DIVE-2613 was
+one of six engineering gates that reached the paired human on 2026-08-03, and dev2 stayed
+blocked behind it.
+
+The fix **scopes the match, not the verdict**: when — and only when — the text is recognised
+as an *inert* push-for-review, the git branch identifier is removed before the floor reads
+it. A branch name is a label, never a statement of the action a gate authorises. Everything
+else in the ask is still read unchanged, so a push ask that **also** names a spend, a secret,
+a publish or a customer email still floors on its own prose.
+
+Three narrowings, all biased toward keeping the floor on:
+
+- **Not the whole eng-ship class.** `merge`, `deploy`, roll-to-fleet and push-to-`main` touch
+  prod and keep flooring on their subject matter.
+- **Only branch-*shaped* tokens are redacted** — a slash (`feat/x`), a ticket prefix
+  (`dive-2613-…`), or two-plus hyphens. Hyphenated prose like `auto-teardown` is a word, not
+  a ref, and still floors.
+- **Applied at the single match site**, so the filing floor, the approval/manual routing arm
+  and `cmd_goal`'s low-risk check all inherit the same verdict from the same inputs.
+
+`tests/gate_floor_branch_name_unit.sh` (33 arms) grades both directions, and four mutations
+are documented in its header — removing the redaction, dropping the not-inert guard, widening
+the slug shape to any hyphen, and un-mirroring the reporter each redden a named arm.
+
 ## Unreleased — fix(cli): a non-zero exit now always carries a reason (DIVE-2598)
 
 `5dive task done DIVE-XXXX --result="plain text no refs"` exited **1** with zero bytes on
