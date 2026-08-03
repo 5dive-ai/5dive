@@ -184,8 +184,8 @@ out=$(cmd_task_done DIVE-201 2>&1); rc=$?
 [[ "$(statusof DIVE-201)" != "done" ]] \
   && ok_t "Tb the task did NOT close" \
   || bad_t "Tb not closed" "status=$(statusof DIVE-201)"
-[[ "$out" == *"DIVE-1830"* ]] \
-  && ok_t "Tb refusal cites the merge-gate (DIVE-1830)" \
+[[ "$out" == *"not merged to main"* ]] \
+  && ok_t "Tb refusal names the merge gate's criterion" \
   || bad_t "Tb message" "out=$out"
 
 # --- Tc: same task, but gh now reports MERGED + a mergedAt → closes for real. ---
@@ -209,8 +209,8 @@ out=$(cmd_task_done DIVE-210 2>&1); rc=$?
 [[ $rc -eq $E_CONFLICT && "$(statusof DIVE-210)" != "done" ]] \
   && ok_t "Tc2 done refused when the Branch: head has no merged PR (E_CONFLICT)" \
   || bad_t "Tc2 refused" "rc=$rc (want $E_CONFLICT) status=$(statusof DIVE-210) out=$out"
-[[ "$out" == *"DIVE-1830"* && "$out" == *"feat/dive-210-thing"* ]] \
-  && ok_t "Tc2 refusal cites DIVE-1830 + the branch name" \
+[[ "$out" == *"landed"* && "$out" == *"feat/dive-210-thing"* ]] \
+  && ok_t "Tc2 refusal names the criterion + the branch name" \
   || bad_t "Tc2 message" "out=$out"
 
 # --- Tc3: same Branch:-bound task, but gh now reports a merged PR for the head

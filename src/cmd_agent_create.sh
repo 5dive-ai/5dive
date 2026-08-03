@@ -24,7 +24,7 @@ create_agent_user() {
   # The real fix (relocate the runtime out of /home/claude) is DIVE-1034.
   if [[ "$isolation" == "sandboxed" ]]; then
     if ! setfacl -m "u:${user}:--x" /home/claude 2>/dev/null; then
-      warn "setfacl failed granting ${user} traverse on /home/claude (is the 'acl' package installed?); the sandboxed agent will not reach the shared runtime — plugin install and startup will fail (DIVE-1033)"
+      warn "setfacl failed granting ${user} traverse on /home/claude — install the 'acl' package, then re-run"
     fi
   fi
   # Admin gets sudo SCOPED to fleet-management ops (not blanket root). standard
@@ -717,7 +717,7 @@ agent_home_conflict_check() {
   # Name the uid explicitly: the whole failure mode is uid recycling, and on the
   # reported box the owner did not resolve to a name at all (uid 1006, no such
   # user) — a report that only prints a name says nothing in exactly that case.
-  fail "$E_CONFLICT" "${home} already exists, owned by ${owner_n} (uid ${owner_u}) — not by the agent-${name} user this create would make. That is a leftover home from a previously removed agent, and uids get recycled, so continuing would hand the new agent someone else's home and any credentials left in it (DIVE-2138). Move it aside first: sudo mv ${home} ${REAPED_DIR}/${name}-\$(date +%Y%m%d%H%M%S)"
+  fail "$E_CONFLICT" "${home} is a leftover home owned by ${owner_n} (uid ${owner_u}) — move it aside before creating ${name}"
 }
 
 # DIVE-499: accepted autonomy modes. 'son-of-anton' is a yolo synonym (a Silicon
@@ -842,7 +842,7 @@ _apply_byo_claude() {
     || fail "$E_USAGE" "claude BYO provider requires --auth-profile (custom-provider creds are profile-scoped)"
   local base_url="${CLAUDE_PROVIDER_BASEURL[$canonical]:-}"
   [[ -n "$base_url" ]] \
-    || fail "$E_VALIDATION" "claude does not support provider '$canonical' (${BYO_PROVIDER_LABEL[$canonical]:-unknown}: no Anthropic-compatible endpoint)"
+    || fail "$E_VALIDATION" "claude does not support provider '$canonical' — no Anthropic-compatible endpoint"
   step "Configuring claude BYO provider '$canonical' → ${base_url} (profile=$profile)"
   printf '%s' "$base_url"  | profile_set_var "$profile" ANTHROPIC_BASE_URL
   printf '%s' "$api_key"   | profile_set_var "$profile" ANTHROPIC_AUTH_TOKEN
@@ -970,7 +970,7 @@ KIMI_ENV
   # A standard prepaid/API-only z.ai key may 401 "Provider authentication failed"
   # there. Surface it so an auth failure reads as key-type, not a broken config.
   if [[ "$canonical" == "zai" ]]; then
-    step "z.ai note: use your GLM Coding-Plan key (z.ai → Coding Plan) for GLM coding models; a standard prepaid API key may fail auth on the anthropic endpoint."
+    step "z.ai note: GLM coding models need your GLM Coding-Plan key; a prepaid API key may fail auth here"
   fi
   local model="${override_model:-${HERMES_PROVIDER_MODEL[$canonical]:-}}"
   if [[ -n "$model" ]]; then
@@ -1060,7 +1060,7 @@ _apply_byo_openclaw() {
   # standard prepaid / API-only z.ai key may 401 there, so surface it — an auth
   # failure then reads as key-type, not a broken config.
   if [[ "$canonical" == "zai" ]]; then
-    step "z.ai note: use your GLM Coding-Plan key (z.ai → Coding Plan) for GLM coding models; a standard prepaid API key may fail auth on the coding endpoint."
+    step "z.ai note: GLM coding models need your GLM Coding-Plan key; a prepaid API key may fail auth here"
   fi
 }
 
@@ -1322,7 +1322,7 @@ cmd_create() {
   # version, NEVER the server-side toggle alone. The override below exists ONLY
   # for that verified-unfreeze moment; do NOT set it to work around the freeze.
   if [[ "$type" == "grok" && "${FIVE_GROK_UNFREEZE_VERIFIED:-}" != "1" ]]; then
-    fail "$E_VALIDATION" "grok provisioning is frozen (DIVE-1221): Grok Build has an unpatched codebase-exfiltration issue and xAI has shipped only a revocable server-side mitigation. Unfreeze needs a verified xAI client-side fix + pinnable version. See DIVE-1221."
+    fail "$E_VALIDATION" "grok provisioning is frozen — unfreeze needs a verified xAI client-side fix and a pinnable version"
   fi
   if [[ "$type" == "grok" ]]; then
     warn "FIVE_GROK_UNFREEZE_VERIFIED=1 set, bypassing the DIVE-1221 Grok exfiltration freeze. Only valid if a VERIFIED xAI client-side patch is pinned."
@@ -1365,14 +1365,14 @@ cmd_create() {
   # so the capability is impossible. Refuse only the sandboxed contradiction.
   if (( can_push )); then
     case "$isolation" in
-      sandboxed) fail "$E_VALIDATION" "--can-push is incompatible with --isolation=sandboxed (a sandboxed agent gets no sudoers, so it cannot be granted delegated push)." ;;
+      sandboxed) fail "$E_VALIDATION" "--can-push is incompatible with --isolation=sandboxed — a sandboxed agent gets no sudoers" ;;
       admin)     can_push=0; warn "--can-push is redundant for an admin agent (admin sudo already permits '5dive _push_do'); ignoring." ;;
     esac
   fi
   # INST-5: --can-deploy, identical posture to --can-push above.
   if (( can_deploy )); then
     case "$isolation" in
-      sandboxed) fail "$E_VALIDATION" "--can-deploy is incompatible with --isolation=sandboxed (a sandboxed agent gets no sudoers, so it cannot be granted delegated deploy)." ;;
+      sandboxed) fail "$E_VALIDATION" "--can-deploy is incompatible with --isolation=sandboxed — a sandboxed agent gets no sudoers" ;;
       admin)     can_deploy=0; warn "--can-deploy is redundant for an admin agent (admin sudo already permits '5dive _deploy_do'); ignoring." ;;
     esac
   fi
@@ -1450,7 +1450,7 @@ cmd_create() {
   [[ "$telegram_token" == "-" ]] && (( ++_stdin_sentinels ))
   [[ "$discord_token" == "-" ]]  && (( ++_stdin_sentinels ))
   (( _stdin_sentinels <= 1 )) \
-    || fail "$E_USAGE" "only one of --api-key=- / --telegram-token=- / --discord-token=- can read from stdin per create (the exec tunnel has a single stdin channel)"
+    || fail "$E_USAGE" "only one of --api-key=- / --telegram-token=- / --discord-token=- can read stdin per create"
 
   # BYO API-key path (--provider=<canonical> + --api-key=<key|->).
   # Mutually exclusive with --defer-auth: BYO is the alternative to "I'll sign in
@@ -1592,7 +1592,7 @@ cmd_create() {
           # tapped yet, OR the Chief-of-Staff account is at its managed-bot cap
           # (20 free / 40 with Telegram Premium). Name both so a whale is not
           # left guessing. (DIVE-323)
-          fail "$E_TIMEOUT" "no bot @$telegram_cos appeared within the claim window — either you have not tapped the Create link in Telegram yet, or your Chief of Staff has hit its managed-bot limit (20 free, 40 with Telegram Premium). Tap the link to create it, or free a slot / upgrade to Premium, then retry"
+          fail "$E_TIMEOUT" "no bot @$telegram_cos appeared in the claim window — tap the Create link in Telegram, or free a bot slot, then retry"
         elif [[ "$_cos_reason" == "cos_token_stale" || "$_cos_reason" == "child_token_stale" ]]; then
           # DIVE-482: the CoS (or the just-minted child) token is dead — the bot
           # was deleted+recreated, so Telegram issued a new token and deactivated
@@ -1600,7 +1600,7 @@ cmd_create() {
           # validation error (not a generic JSON blob) so the dashboard can route
           # the user to re-paste / rotate the token instead of a cryptic failure.
           local _cos_detail; _cos_detail=$(jq -r '.detail // empty' <<<"$_cos_json" 2>/dev/null)
-          fail "$E_VALIDATION" "${_cos_detail:-Your Chief-of-Staff bot token is no longer valid — rotate it in BotFather and re-run: 5dive agent cos set --token=<new token>}"
+          fail "$E_VALIDATION" "${_cos_detail:-Chief-of-Staff bot token invalid — rotate it in BotFather: 5dive agent cos set --token=<new>}"
         elif (( _cos_rc == E_NOT_FOUND )); then
           fail "$E_NOT_FOUND" "no Chief-of-Staff bot configured — run: 5dive agent cos set --token=<token>"
         fi
@@ -1619,7 +1619,7 @@ cmd_create() {
     fi
     if [[ -z "$telegram_token" ]]; then
       telegram_token=$(prompt_secret "Telegram bot token for agent '$name'") \
-        || fail "$E_USAGE" "--channels=telegram requires --telegram-token=<token> or --telegram-cos=<child-username> (or run interactively to be prompted)"
+        || fail "$E_USAGE" "--channels=telegram needs --telegram-token=<token> or --telegram-cos=<child-username>"
     fi
     valid_telegram_token "$telegram_token" \
       || fail "$E_VALIDATION" "telegram token format looks wrong (expected <digits>:<20+ chars>)"
@@ -1715,12 +1715,12 @@ cmd_create() {
       [[ -n "$_profile_auth_path" && -s "$_profile_auth_path" ]] && _profile_authed=1
     fi
     (( _profile_authed )) \
-      || fail "$E_AUTH_REQUIRED" "auth profile '$profile' is empty — run: sudo 5dive agent auth login $type --auth-profile=$profile (or: sudo 5dive agent auth set $type --api-key=... --auth-profile=$profile)"
+      || fail "$E_AUTH_REQUIRED" "auth profile '$profile' is empty — run: sudo 5dive agent auth login $type --auth-profile=$profile"
   else
     local auth
     auth=$(auth_status_one "$type" --no-probe)
     if [[ "$auth" != "ok" ]]; then
-      fail "$E_AUTH_REQUIRED" "$type is not authenticated ($auth) — run: sudo 5dive agent auth login $type (or: sudo 5dive agent auth set $type --api-key=<key>)"
+      fail "$E_AUTH_REQUIRED" "$type is not authenticated ($auth) — run: sudo 5dive agent auth login $type"
     fi
   fi
 

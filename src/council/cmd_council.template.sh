@@ -161,7 +161,7 @@ _council_help() {
                                      [--bench=<name>] [--class=<decisionClass>]
                                      [--threshold=<n>]
                                      [--timeout=120] [--idle-secs=5] [--poll-secs=2] [--standalone]
-      Convene a council over a question. By DEFAULT (CNCL-7) it DISPATCHES the question
+      Convene a council over a question. By DEFAULT it DISPATCHES the question
       to the real seated agents — each seat votes via its OWN harness over the
       `5dive agent ask` rail, no shared model key. A seat that times out or replies
       without a COUNCIL-VOTE line is a recorded ABSTAIN; a convene that falls below
@@ -169,7 +169,7 @@ _council_help() {
       is BLIND (no seat sees another before its own vote); adversarial adds a rebuttal
       round, recorded separately. Emits an auditable verdict (deterministic tally over
       the current roster) and a tamper-evident, root-signed receipt. On a primary-council
-      PASS it also OFFERS the founder veto to the genesis principal (CNCL-9, non-blocking):
+      PASS it also OFFERS the founder veto to the genesis principal (, non-blocking):
       the pass stands, the receipt stamps executeAfter + a one-time tap nonce, and a ping
       fires. Defaults to the 5-seat standing Council. --standalone selects the deferred
       single-key modelCall seam instead of dispatch.
@@ -179,14 +179,14 @@ _council_help() {
                             [--bench=<name>] [--mode=quick|deliberate|adversarial] [--class=<c>]
                             [--max-actions=N] [--ballot-deadline=<secs>] [--context-cmd="<sh>"] [--no-cron]
   5dive council schedule ls | show <name> | rm <name> | run <name> [--dry]
-      Productize a recurring convene (CNCL-23). `add` binds a NAMED convene template to a cron
+      Productize a recurring convene. `add` binds a NAMED convene template to a cron
       expression and installs a managed crontab line (rides the existing cron rail — NO daemon;
       --no-cron just saves the config + prints the line). The question template may embed {{date}}
       and {{context}}; --context-cmd is a shell snippet run at each fire whose (bounded) stdout fills
       {{context}} (e.g. funnel numbers + open queue). `run <name>` is what cron calls: it gathers
-      context, convenes on the DEFAULT ballot rail (no pane-scrape, CNCL-18 — convene seals its own
+      context, convenes on the DEFAULT ballot rail (no pane-scrape, — convene seals its own
       receipt into the lineage), then files up to --max-actions `ACTION: <title>` items from seat
-      rationales as `--from=council` board tasks. An inquorate run is a CNCL-18 signal, never fatal.
+      rationales as `--from=council` board tasks. An inquorate run is a signal, never fatal.
       `schedule add|rm` write the root-owned council dir — run under sudo. Config: schedules.json.
 
   5dive council veto exercise --receipt=<sealed digest> --nonce=<tap nonce>
@@ -201,14 +201,14 @@ _council_help() {
   5dive council sign-vote --seat=<id> --vote=<approve|reject|escalate|abstain>
                           --convene=<id> (--qdigest=<hex> | --question=<text>)
                           --key-file=<seat PKCS8 PEM | "-"> [--rationale=…] [--emit=line|json]
-      (CNCL-10) A SEAT signs its own vote at source, from its OWN harness — sign-at-source,
+ A SEAT signs its own vote at source, from its OWN harness — sign-at-source,
       so the shell is the surface (a seat has no node of its own). Emits the `COUNCIL-SIG:`
       line the seat pastes after its COUNCIL-VOTE line (--emit=json for the full row). The
       convene id + question digest are in the signed bytes, so the signature is replay-proof.
 
   5dive council verify-votes --votes=<json|@file> --roster=<json|@file>
                              --convene=<id> (--qdigest=<hex> | --question=<text>)
-      (CNCL-10) Re-check EVERY co-signed vote against the roster pubkeys + revocation, bound
+ Re-check EVERY co-signed vote against the roster pubkeys + revocation, bound
       to THIS convene. Exits non-zero if any non-abstain vote is unsigned/forged/replayed/
       revoked, so a caller can gate on the exit code.
 
@@ -221,7 +221,7 @@ _council_help() {
       privileged governance writes and need sudo).
 
   5dive council gate-clear <task|DIVE-N> [--mode=deliberate] [--seats=a,b,c] [--dry-run]
-      (CNCL-12) Route an OPEN tier-1 gate to the council. The escalate-only guardrail
+ Route an OPEN tier-1 gate to the council. The escalate-only guardrail
       runs first: a tier>=2 gate or a human-only type (secret/approval/manual/access)
       is NEVER self-cleared — it is bumped to a human with a one-paragraph brief. A genuine
       tier-1 gate is convened (default: the primary Council), and the sealed verdict either
@@ -229,7 +229,7 @@ _council_help() {
       --dry-run prints the planned action without touching the gate.
 
   5dive council rot-triage [<task|DIVE-N> | --all] [--older-than-hours=48] [--dry-run]
-      (CNCL-12) Rot-triage stale tier-2 gates: a tier-2 gate left UNANSWERED for 48h+
+ Rot-triage stale tier-2 gates: a tier-2 gate left UNANSWERED for 48h+
       is convened ONLY to re-brief it sharper for the human (and, in that brief, propose
       a rescope or a park+wake). It NEVER clears a tier-2 gate — tier-2 stays human-only
       (fail-closed). --all scans every stale tier-2 gate; --dry-run lists them without
@@ -585,7 +585,7 @@ _council_veto() {
   [[ -n "$rcanon" ]] || fail "$E_GENERIC" "sealed receipt carries no canonical bytes to re-verify (fail-closed)"
   if [[ "$(id -u)" -eq 0 ]]; then rseal="$(printf '%s' "$rcanon" | cmd_gate_proof_sign_stdin 2>/dev/null)" || rseal=""
   else rseal="$(printf '%s' "$rcanon" | sudo -n 5dive gate-proof sign 2>/dev/null)" || rseal=""; fi
-  [[ -n "$rseal" ]] || fail "$E_GENERIC" "cannot re-seal the receipt canonical (need root + an enforce key) — refusing to trust an unverifiable receipt (fail-closed)"
+  [[ -n "$rseal" ]] || fail "$E_GENERIC" "cannot re-seal the receipt canonical (needs root + an enforce key) — refusing an unverifiable receipt"
   [[ "$rseal" == "$rcpt_digest" ]] || { _council_veto_audit "receipt-tampered" "$rcpt_digest"; fail "$E_PERMISSION" "receipt canonical does not re-seal to its sealedDigest — the receipt was tampered (refused + logged, fail-closed)"; }
 
   # AUTHENTICATE the tap: sha256(presented nonce) must equal the nonce DIGEST minted for THIS offer.
@@ -864,7 +864,7 @@ _council_init_or_lineage() {
 
   # ---- init (sudo-gated, one-time) ----------------------------------------
   if [[ ! -w "$COUNCIL_DIR" ]]; then
-    fail "$E_PERMISSION" "council init seeds the governance body — it writes ${COUNCIL_DIR} (root-owned) and must be human/sudo-run: sudo 5dive council init $*"
+    fail "$E_PERMISSION" "council init writes root-owned governance files — run: sudo 5dive council init $*"
   fi
   # Resolve the veto principal up front so init refuses an unresolvable one BEFORE any write.
   local principal="" seats_flag="" threshold_flag="" assume_yes=0 forced=0 a
@@ -894,7 +894,7 @@ _council_init_or_lineage() {
 
   [[ -n "$principal" ]] || fail "$E_USAGE" "council init needs --veto=<principal> (e.g. human:main)"
   local resolved; resolved="$(_council_resolve_principal "$principal")"
-  [[ -n "$resolved" ]] || fail "$E_USAGE" "veto principal '$principal' did not resolve to a real recipient — init rejects an unknown principal (fail-closed). Use human:<agent> (a paired agent) or tg:<user_id>."
+  [[ -n "$resolved" ]] || fail "$E_USAGE" "veto principal '$principal' did not resolve — use human:<agent> (a paired agent) or tg:<user_id>"
 
   # DIVE-2278: a tg:<digits> principal is the ONE form the display filter cannot save. The
   # principal string is copied verbatim into the canonical bytes that get SEALED into genesis,
@@ -1157,7 +1157,7 @@ _council_seal_stdin() {
 # founder-veto principal (from genesis), and the sealed lineage head (seq + digest).
 _council_roster() {
   local dir="$1"
-  [[ -f "$COUNCIL_GENESIS" ]] || fail "$E_VALIDATION" "the Council has no genesis roster — human-seed it first: sudo 5dive council init --seats=<a:chair,b,c> --threshold=<spec> --veto=<principal>"
+  [[ -f "$COUNCIL_GENESIS" ]] || fail "$E_VALIDATION" "the Council has no genesis roster — seed it: sudo 5dive council init --seats=<a:chair,b,c> --threshold=<spec> --veto=<p>"
   # DIVE-1664: derive the roster VIEW from the ROOT-SEALED lineage — the SAME source `promote`/
   # `demote` mutate — so `roster` can never disagree with `log`/the lineage about membership. The
   # current roster = the LATEST lineage record that carries seats (genesis or a motion; a veto entry
@@ -1325,7 +1325,7 @@ _council_motion() {
   local dir="$1" kind="$2"; shift 2
   mkdir -p "$COUNCIL_DIR" 2>/dev/null || true
   if [[ ! -w "$COUNCIL_DIR" ]]; then
-    fail "$E_PERMISSION" "council $kind mutates the governance roster — it writes ${COUNCIL_DIR} (root-owned) and must be sudo-run: sudo 5dive council $kind $*"
+    fail "$E_PERMISSION" "council $kind writes the root-owned governance roster — run: sudo 5dive council $kind $*"
   fi
   [[ -f "$COUNCIL_GENESIS" && -f "$COUNCIL_LINEAGE" ]] || fail "$E_VALIDATION" "the Council has no genesis roster — seed it first: sudo 5dive council init …"
   local subject="" lens="" mode="adversarial" dry=0 a
@@ -1419,7 +1419,7 @@ _council_amend() {
   local dir="$1"; shift
   mkdir -p "$COUNCIL_DIR" 2>/dev/null || true
   if [[ ! -w "$COUNCIL_DIR" ]]; then
-    fail "$E_PERMISSION" "council amend rewrites the constitution — it writes ${COUNCIL_DIR} + $(_council_constitution_path) (root-owned) and must be sudo-run: sudo 5dive council amend $*"
+    fail "$E_PERMISSION" "council amend rewrites the root-owned constitution — run: sudo 5dive council amend $*"
   fi
   [[ -f "$COUNCIL_GENESIS" && -f "$COUNCIL_LINEAGE" ]] || fail "$E_VALIDATION" "the Council has no genesis roster — seed it first: sudo 5dive council init …"
   local file="" mode="deliberate" dry=0 a
@@ -1689,7 +1689,7 @@ cmd_council() {
   case "$sub" in
     ""|-h|--help|help) _council_help; return 0 ;;
     convene|schedule|bench|init|lineage|veto|gate-clear|rot-triage|roster|log|record|verify|promote|demote|expel|amend|sign-vote|verify-votes|ballot-tap) ;;
-    *) fail "$E_USAGE" "unknown council command: $sub (convene|schedule|bench|init|lineage|roster|log|record|verify|promote|demote|expel|amend|veto|gate-clear|rot-triage|sign-vote|verify-votes|ballot-tap)" ;;
+    *) fail "$E_USAGE" "unknown council command: $sub (try: 5dive council --help)" ;;
   esac
 
   local dir; dir="$(mktemp -d -t 5dive-council.XXXXXX)" || fail "$E_GENERIC" "mktemp failed"

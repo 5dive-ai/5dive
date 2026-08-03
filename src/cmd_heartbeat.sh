@@ -312,18 +312,18 @@ _hb_usage() {
   5dive heartbeat ls                      # show enrolled agents + next-wake + queued count
   5dive heartbeat tick                    # cron driver: wake every due agent that has work
   5dive heartbeat wake-mode <name> [always_on|cold] [--cap=<n>] [--sleep-after=<min>]
-                                          # DIVE-1858: opt-in reactive wake mode + wake-budget + auto-sleep.
+                                          # opt-in reactive wake mode + wake-budget + auto-sleep.
                                           # no args after <name> => show current mode/budget/sleep/cost.
 
   <dur>: minutes (e.g. 30), or 45m / 2h / 1h30m.
-  wake-mode (DIVE-1858 Phase 1): 'cold' opts an agent into reactive
+  wake-mode ( Phase 1): 'cold' opts an agent into reactive
         wake-on-alert with a wakes/day budget cap (default ${_HB_WAKE_DEFAULT_CAP}) so a chatty
         trigger can't thrash it; cost-per-wake is surfaced (display only, zero
         billing). A cold agent that goes idle with no open work is auto-slept
         (systemctl stop) after --sleep-after minutes (default ${_HB_SLEEP_AFTER_MIN}m) and is
         woken again by the next trigger. 'always_on' (default) is unchanged;
         main + marketing are pinned always-on and refuse 'cold'.
-  fresh (default off, DIVE-1210): --fresh sends /clear before each task so
+  fresh (default off,): --fresh sends /clear before each task so
         context starts clean, at the cost of a full CLAUDE.md/project re-prime
         on every wake (up to ~48x/day on the default 30m cadence). Off keeps
         the running conversation across tasks — cheaper, and what main/
@@ -471,7 +471,7 @@ cmd_heartbeat_wake_mode() {
     *) fail "$E_VALIDATION" "bad mode '$mode' (use: always_on | cold)" ;;
   esac
   if [[ "$mode" == "cold" ]] && _hb_wake_protected "$name"; then
-    fail "$E_VALIDATION" "'$name' is a protected always-on agent (customer-facing/critical; e.g. main, marketing) — refusing wake_mode=cold (olivia condition 3)"
+    fail "$E_VALIDATION" "'$name' is a protected always-on agent — refusing wake_mode=cold"
   fi
   [[ -z "$cap" || "$cap" =~ ^[0-9]+$ ]] || fail "$E_VALIDATION" "bad --cap '$cap' (whole number of wakes/day)"
   [[ -z "$sleep_after" || ( "$sleep_after" =~ ^[0-9]+$ && "$sleep_after" -gt 0 ) ]] || fail "$E_VALIDATION" "bad --sleep-after '$sleep_after' (whole number of idle minutes > 0)"

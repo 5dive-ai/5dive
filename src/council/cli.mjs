@@ -453,7 +453,7 @@ function knownRegistryAgents() {
 function preflightSeats(seats) {
   const known = knownRegistryAgents()
   if (known === null) {
-    die("council pre-flight FAILED: could not read the agent registry (`5dive agent list --json`) — refusing to convene rather than silently abstain unreachable seats.", 6)
+    die(`council pre-flight FAILED: could not read the agent registry (5dive agent list --json) — refusing to convene`, 6)
   }
   const unresolved = seats
     .map(s => ({ id: (s && s.id) || String(s), agent: E.resolveSeatAgent(s) }))
@@ -482,7 +482,7 @@ function canDeliver() {
 }
 function preflightDelivery() {
   if (canDeliver()) return
-  die("council pre-flight FAILED: this caller cannot reach the seat-delivery rail — `5dive agent _deliver` is root-scoped and `sudo -n` is denied here, so EVERY seat ballot would fail on delivery and be recorded as an abstain (a permissions outage sealing as a unanimous abstention). Re-run the convene as root (`sudo 5dive council convene ...`), or re-provision this agent so it holds the `_deliver` grant. Refusing to convene.", 6)
+  die(`council pre-flight FAILED: cannot reach the seat-delivery rail — no \`_deliver\` grant here; re-run with sudo`, 6)
 }
 
 // DIVE-1739: seat LIVENESS map — registry name -> health {asleep,deaf,...} from `agent list --json`.
@@ -798,7 +798,7 @@ async function cmdConvene() {
         }))
       } catch { /* best-effort: the loud refusal below is unaffected */ }
     }
-    die(`council convene FAILED TO DELIVER — 0 of ${vf.seatCount} seats were reached (${vf.captureFailed} capture failure(s): ${who}). This is a TRANSPORT/PERMISSIONS outage, NOT an abstention, so no verdict was reached and NO receipt was sealed. First failure: ${why}. Fix the rail (root/_deliver grant, agent running, task queue writable) and re-convene.`, 7)
+    die(`council convene FAILED TO DELIVER — 0 of ${vf.seatCount} seats reached (${vf.captureFailed} capture failure(s): ${who}). Transport/permissions outage, NOT an abstention: no verdict, NO receipt was sealed. First failure: ${why}. Fix the rail, then re-convene.`, 7)
   }
   out({
     council: input.councilName, mode: result.mode, question,
@@ -848,7 +848,7 @@ function cmdBench() {
   // `sudo bench rm council` would bypass the whole governance layer). Motions land in a later
   // wave; until then the guard is the load-bearing invariant.
   if ((action === 'add' || action === 'rm') && positionals[1] === 'council') {
-    die("'council' is the primary governance body — its seats change ONLY via promote/demote motions, never raw bench add/rm (re-seed the whole roster with: sudo 5dive council init --force).", 7)
+    die("'council' seats change only via promote/demote motions — to re-seed: sudo 5dive council init --force", 7)
   }
   if (action === 'add') {
     const name = positionals[1]; if (!name) die('bench add needs a name')
@@ -978,7 +978,7 @@ function cmdInit() {
   const principal = flag('veto')
   if (!principal || principal === true) die('init needs --veto=<principal> (a resolvable human, e.g. human:main)')
   const resolved = flag('veto-resolved')   // bash resolves the principal -> tg user_id
-  if (!resolved || resolved === true) die(`veto principal "${principal}" did not resolve to a real recipient — init rejects an unknown/unresolvable principal (fail-closed).`, 6)
+  if (!resolved || resolved === true) die(`veto principal "${principal}" did not resolve — use human:<agent> (a paired agent) or tg:<user_id>`, 6)
   let rec
   try {
     rec = E.buildGenesisRecord({
@@ -1065,7 +1065,7 @@ function cmdConstitutionMerge() {
   else baseText = E.renderConstitutionV0()
   let raw
   try { raw = E.parseConstitutionFrontmatter(baseText) }
-  catch (e) { die(`constitution-merge: the current constitution does not parse (${String(e && e.message || e)}) — refusing a structured write onto an unreadable base (fail-closed)`, 4) }
+  catch (e) { die(`constitution-merge: current constitution does not parse (${String(e && e.message || e)}) — refusing to write onto it`, 4) }
 
   // Read + STRICTLY whitelist the STDIN patch. Anything outside hard_gates/ship/comms is refused.
   let patch
@@ -1073,7 +1073,7 @@ function cmdConstitutionMerge() {
   catch (e) { die(`constitution-merge: invalid JSON on stdin (${String(e && e.message || e)})`, 2) }
   if (!patch || typeof patch !== 'object' || Array.isArray(patch)) die('constitution-merge: stdin must be a JSON object of structured fields', 2)
   const badTop = Object.keys(patch).filter(k => !MERGE_TOP.has(k))
-  if (badTop.length) die(`constitution-merge: field(s) not settable via the structured write path: ${badTop.join(', ')} (only hard_gates/ship/comms — governance changes go through 'council amend')`, 2)
+  if (badTop.length) die(`constitution-merge: not settable here: ${badTop.join(', ')} — only hard_gates/ship/comms (governance: council amend)`, 2)
 
   if (Object.hasOwn(patch, 'hard_gates')) {
     const hg = patch.hard_gates
@@ -1102,7 +1102,7 @@ function cmdConstitutionMerge() {
   // write can never produce a constitution that would not parse under the one shared parser.
   const text = serializeConstitution(raw)
   try { E.normalizeConstitution(E.parseConstitutionFrontmatter(text)) }
-  catch (e) { die(`constitution-merge: the merged constitution failed validation (${String(e && e.message || e)}) — refusing to emit (fail-closed)`, 4) }
+  catch (e) { die(`constitution-merge: merged constitution failed validation (${String(e && e.message || e)}) — refusing to emit`, 4) }
   process.stdout.write(text)
 }
 
@@ -1126,7 +1126,7 @@ function cmdAmendPlan() {
   if (!proposed || proposed === true) die('amend-plan needs --constitution=@<file> (the proposed constitution.yaml)')
   const text = String(proposed).startsWith('@') ? fs.readFileSync(String(proposed).slice(1), 'utf-8') : String(proposed)
   try { E.normalizeConstitution(E.parseConstitutionFrontmatter(text)) }
-  catch (e) { die(`the proposed constitution.yaml is not a valid constitution — refusing to convene an amendment on it: ${String(e && e.message || e)}`, 4) }
+  catch (e) { die(`proposed constitution.yaml is not valid — refusing to convene an amendment: ${String(e && e.message || e)}`, 4) }
   const digest = flag('constitution-digest') === true || flag('constitution-digest') == null ? '' : String(flag('constitution-digest'))
   const question = `Constitution amendment motion (constitutional): should the Council RATIFY the proposed constitution.yaml `
     + `(digest ${digest ? digest.slice(0, 12) + '…' : '?'})? This is the hardest bar — a 2/3 supermajority of ALL `
@@ -1143,7 +1143,7 @@ function cmdAmendApply() {
   if (!Array.isArray(roster) || !roster.length) die('amend-apply needs the current roster --seats-json (fail-closed)', 3)
   const verdict = readJsonFlag('verdict')
   if (!verdict || verdict.recommendation !== 'approve' || verdict.escalated) {
-    die(`amendment did not carry (recommendation=${verdict && verdict.recommendation}) — the constitution is unchanged, no lineage record written`, 5)
+    die(`amendment did not carry (${verdict && verdict.recommendation}) — constitution unchanged, no lineage record`, 5)
   }
   const digest = flag('constitution-digest') === true || flag('constitution-digest') == null ? '' : String(flag('constitution-digest'))
   if (!digest) die('amend-apply needs --constitution-digest=<sha256 of the ratified constitution.yaml> (fail-closed)', 4)
@@ -1402,7 +1402,7 @@ function cmdMotionApply() {
   const roster = readJsonFlag('seats-json')
   const verdict = readJsonFlag('verdict')
   if (!verdict || verdict.recommendation !== 'approve' || verdict.escalated) {
-    die(`motion did not carry (recommendation=${verdict && verdict.recommendation}) — the roster is unchanged, no lineage record written`, 5)
+    die(`motion did not carry (${verdict && verdict.recommendation}) — roster unchanged, no lineage record`, 5)
   }
   const cls = E.classifyMotion(motion)
   let newSeats
@@ -1472,7 +1472,7 @@ const main = async () => {
   if (sub === 'sign-vote') return cmdSignVote()
   if (sub === 'verify-votes') return cmdVerifyVotes()
   if (sub === 'ballot-tap') return cmdBallotTap()
-  die(`unknown council subcommand: ${sub} (constitution|convene|schedule|bench|init|veto|gate-map|seal-augment|read-binding|sign-vote|verify-votes|ballot-tap|roster|motion-plan|motion-apply|verify-chain)`)
+  die(`unknown council subcommand: ${sub} (try: 5dive council --help)`)
 }
 // Run as the CLI entrypoint only when executed directly (node cli.mjs …). Guarded so a test can
 // `import` this module (e.g. to exercise dispatchBallotVote's pure logic) WITHOUT triggering the

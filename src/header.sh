@@ -922,6 +922,6 @@ require_loaded() {
   local ctx="$1" fn; shift
   for fn in "$@"; do
     declare -F "$fn" >/dev/null && continue
-    fail "$E_GENERIC" "${ctx}: required predicate '${fn}' is not loaded (src/lib/broker.sh missing from this build) — refusing rather than proceeding unchecked."
+    fail "$E_GENERIC" "${ctx}: required predicate '${fn}' is not loaded (src/lib/broker.sh missing from this build) — refusing"
   done
 }

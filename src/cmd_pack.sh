@@ -461,7 +461,7 @@ cmd_marketplace() {
 #   5dive market show <slug>               # preview one persona (tier, skills, card, DID)
 _market_usage() {
   cat <<'USAGE'
-5dive market — browse & search the agent market before you hire (DIVE-1020)
+5dive market — browse & search the agent market before you hire
 
   5dive market                          # browse every pack, rarity-first
   5dive market <keyword>                # search slug/name/tagline/role/tags/skills
@@ -475,7 +475,7 @@ _market_usage() {
   Then: 5dive hire <role> --from-market --dry-run   (preview a real hire, provisions nothing)
         5dive agent inspect <slug>                  (full install-time disclosure, incl. which harnesses it lands on)
         5dive agent import <slug> --as=<name>       (clone this exact persona)
-        5dive agent import <slug> --as=<name> --type=codex     (DIVE-2568: onto a non-Claude harness)
+        5dive agent import <slug> --as=<name> --type=codex     (onto a non-Claude harness)
 
   A pack is HARNESS-AGNOSTIC. `type` in the catalog is what it was packed as and
   is only the import default — the persona, memory, avatar and skills are plain
@@ -906,12 +906,12 @@ cmd_inspect() {
 
 _pack_usage() {
   cat <<USAGE
-5dive agent export / import — portable agent packs (DIVE-39)
+5dive agent export / import — portable agent packs
 
   5dive agent export <name> [--format=pack|agents-md] [--with-memory]
                             [--approve-memory=<dir>] [--audience=publish|self] [-o <path>|--out=<path>]
                                   # write a shareable pack. Default = config only.
-                                  # --format=agents-md (DIVE-2565) writes ONE markdown
+                                  # --format=agents-md writes ONE markdown
                                   # file that IS an AGENTS.md: YAML frontmatter = the
                                   # agent spec, body = the persona doc, memory as fenced
                                   # '## memory/<file>' sections. Readable, diffable,
@@ -919,7 +919,7 @@ _pack_usage() {
                                   # 5dive installed. Skills travel as NAMES not bodies and
                                   # hooks are never carried; the file says both out loud.
                                   # 'agent import <file.md>' splits it back.
-                                  # --audience (DIVE-2567) picks who the pack is FOR, and
+                                  # --audience picks who the pack is FOR, and
                                   # DEFAULTS TO publish: staged memory is scanned for
                                   # operational detail (host paths, agent/human names,
                                   # hostnames, task ids, repo names, chat ids, sudo posture,
@@ -937,7 +937,7 @@ _pack_usage() {
                                   #   2) export <name> --approve-memory=<draft dir>  -> seals the
                                   #      reviewed memory into the pack. Nothing is packed unreviewed.
   5dive agent marketplace [ls]    # browse the character-pack registry (<org>/character-packs)
-  5dive agent inspect <pack|slug> # DIVE-995: read-only "this pack runs X" disclosure —
+  5dive agent inspect <pack|slug> # read-only "this pack runs X" disclosure —
                                   # hooks (arbitrary shell), skills, plugins, whether it
                                   # re-renders the system prompt, seeds memory, or adopts a
                                   # signing key. Run this BEFORE importing a third-party pack.
@@ -1569,11 +1569,11 @@ cmd_export() {
       kept="${counts%% *}"; excluded="${counts##* }"
       if (( kept == 0 )); then
         rm -rf "$draft"
-        fail "$E_GENERIC" "nothing shareable: 0 reference/project knowledge facts ($excluded private user/feedback or opted-out facts excluded). Nothing written."
+        fail "$E_GENERIC" "nothing shareable: 0 reference/project knowledge facts ($excluded private or opted-out). Nothing written."
       fi
       if ! _pack_secret_tripwire "$draft"; then
         rm -rf "$draft"
-        fail "$E_GENERIC" "a scoped fact tripped the secret tripwire (paths above) — refusing. Tag it 'private: true' or remove the secret, then retry."
+        fail "$E_GENERIC" "a scoped fact tripped the secret tripwire (paths above) — tag it 'private: true' or remove the secret"
       fi
       # DIVE-2567: the draft exists to be REVIEWED, so here the leak-check REPORTS
       # rather than refuses — refusing to write the draft would leave the human
@@ -1701,7 +1701,7 @@ cmd_export() {
   # next format adds. Fails closed for the publish audience.
   if [[ -d "$stage/memory" ]] && ! _pack_memory_publish_gate "$audience" "$stage/memory" "$name"; then
     rm -rf "$stage" "$mem_tmp"
-    fail "$E_GENERIC" "refusing to export: staged memory carries operational detail a published pack must not (file:line:category above — host paths, agent/human names, hostnames, task ids, repo names, chat ids, sudo posture, credential locations). Distill those facts — the LESSON without the specifics — and retry; or, for YOUR OWN backup/clone only, re-run with --audience=self. Nothing was written and nothing was silently redacted."
+    fail "$E_GENERIC" "refusing to export: staged memory carries operational detail (file:line above) — distill it, or use --audience=self"
   fi
 
   # DIVE-2565: same stage, different container. Renders AFTER the tripwire above,

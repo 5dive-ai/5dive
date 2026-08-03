@@ -234,7 +234,7 @@ _sup_goal_drift() {  # <type> <home> <name> <now> <act_epoch>
 
 _sup_usage() {
   cat <<USAGE
-5dive supervisor — observe-only fleet health board (DIVE-724 P1)
+5dive supervisor — observe-only fleet health board ( P1)
 
   5dive supervisor                 # per-agent board: detect + classify, zero actions
   5dive supervisor --watch[=secs]  # live repaint (default 5s; q quits)
@@ -247,7 +247,7 @@ Classification (conservative — see docs/fleet-supervisor-design.md §4):
   healthy         running + progressing, or legitimately idle/stopped with no active work
   slow            active work but no transcript progress for ${_SUP_T_SLOW_MIN}m+ — recorded, never acted on
   update-pending  box CLI is behind the published release — an update signal, NOT
-                  a wedged agent (cause: stale-cli); recorded, NEVER acted on (DIVE-974)
+                  a wedged agent (cause: stale-cli); recorded, NEVER acted on
   stuck           service/tmux/poller dead, a loop self-flagged stuck, or no progress
                   for ${_SUP_T_STUCK_MIN}m+ with active work
                   (cause: service-dead|tmux-dead|poller-dead|loop-stuck|no-progress)
@@ -255,12 +255,12 @@ Classification (conservative — see docs/fleet-supervisor-design.md §4):
                   progresses elsewhere (cause: goal-drift) — recorded, NEVER acted on
   stalled         NO active work (no in_progress, no running loop) but a todo
                   task has sat assigned to this agent, untouched, for
-                  ${_SUP_T_STRANDED_MIN}m+ (cause: idle-stranded) — DIVE-1416 gap#3:
+                  ${_SUP_T_STRANDED_MIN}m+ (cause: idle-stranded) — gap#3:
                   "idle" alone used to read as healthy even while actionable
                   work was stranded; recorded, NEVER acted on (observe-only,
                   same as slow/drift/update-pending)
 
-Poller + activity signals cover claude/codex/grok/antigravity/opencode (DIVE-971).
+Poller + activity signals cover claude/codex/grok/antigravity/opencode.
 P1 takes ZERO recovery actions. Add --json to any form for machine output.
 USAGE
 }

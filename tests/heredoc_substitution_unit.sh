@@ -157,9 +157,9 @@ done
 
 # The task help specifically must still SHOW the commands it used to run.
 out=$(render src/cmd_task.sh _task_usage)
-{ grep -q "npm ci" <<<"$out" && grep -q "task verify" <<<"$out"; } \
-  && ok_t "task help still documents 'npm ci' and 'task verify' as text" \
-  || bad_t "task help still documents 'npm ci' and 'task verify' as text" "$(head -3 <<<"$out")"
+{ grep -q "reclaim" <<<"$out" && grep -q "verify" <<<"$out"; } \
+  && ok_t "task help still documents the verbs whose examples used to be executed" \
+  || bad_t "task help still documents the verbs whose examples used to be executed" "$(head -3 <<<"$out")"
 # ${STATE_DIR} interpolation is the reason the delimiter can't just be quoted —
 # assert it still expands, or the fix has broken what it was protecting.
 grep -q "$TMP/state/tasks/tasks.db" <<<"$out" \

@@ -1588,7 +1588,7 @@ agent_wake_gate_ready() {
     return 0
   fi
   if ! wait_agent_input_ready "$name" "$budget"; then
-    fail "$E_NOT_RUNNING" "woke agent '$name' but its input prompt never rendered within ${budget}s — refusing to type into a booting TUI and report a send that would be lost. --wake budgets ${AGENT_WAKE_BUDGET_SECS}s in total for the wake and this wait; size a scheduler's timeout against that."
+    fail "$E_NOT_RUNNING" "woke agent '$name' but its input prompt never rendered in ${budget}s — refusing to type into a booting TUI"
   fi
   AGENT_WAKE_READY="proven"
 }
@@ -1642,7 +1642,7 @@ cmd_send() {
   # message the flag exists to prevent, with an exit 0 printed over it. Checked
   # BEFORE the exec for that reason.
   if (( wake )) && a2a_needs_scoped "$name"; then
-    fail "$E_PERMISSION" "--wake starts the target's systemd unit and needs admin/root; this caller only holds the scoped a2a delivery grant. Re-run via sudo, or schedule the work as a task row instead."
+    fail "$E_PERMISSION" "--wake needs admin/root; this caller holds only the a2a delivery grant — re-run via sudo, or file a task row"
   fi
   if a2a_needs_scoped "$name"; then
     exec sudo -n /usr/local/bin/5dive agent _deliver "$name" "$message"
@@ -1833,7 +1833,7 @@ cmd_ask() {
   # (abstainKind=capture-failed), which convene already records distinguishably
   # from a real abstention.
   if (( allow_unfenced )) && [[ "$from" == council* ]]; then
-    fail "$E_VALIDATION" "--allow-unfenced is refused on a council ask: a ballot may never fall back to pane scraping (it is the path that returns furniture as a vote). A seat that cannot fence must record as a CAPTURE FAILURE, not as an abstention."
+    fail "$E_VALIDATION" "--allow-unfenced is refused on a council ask — a seat that cannot fence records as a CAPTURE FAILURE, not an abstain"
   fi
   if [[ -z "$message" && ${#positional[@]} -gt 0 ]]; then
     message="${positional[*]}"

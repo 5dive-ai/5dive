@@ -38,7 +38,7 @@ cmd_crew() {
   # admin->root escalation. Run crews as yourself, without sudo. (help is
   # allowed as root so `sudo 5dive crew` still prints usage.)
   if [[ "$sub" != "help" && "$sub" != "-h" && "$sub" != "--help" && "$(id -u)" == "0" ]]; then
-    fail "$E_PERMISSION" "5dive crew must run as your own user, not root — crews execute agent-authored code from their venv, so running as root would be a privilege escalation. Re-run without sudo (crews live in your \$HOME)."
+    fail "$E_PERMISSION" "5dive crew runs agent-authored code — run it as your own user, not root (re-run without sudo)"
   fi
   case "$sub" in
     install)          cmd_crew_install "$@" ;;
