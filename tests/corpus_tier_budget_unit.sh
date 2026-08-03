@@ -564,9 +564,16 @@ cat > "$TMP/flake.sh" <<'FLK'
 touch "$0.seen"; sleep 1.2; exit 0
 FLK
 C4="$(bash "$RUNNER" --corpus-dir="$TMP" --tier=full --budget=1 --label=t 2>&1)"; RC4=$?
-if (( RC4 == 4 )) && [[ "$C4" == *"FLAKE"* && "$C4" == *"flake.sh"* ]]; then
-  ok "a harness that fails its RE-RUN keeps its pass (exit 4, not 1) and is reported as a flake"
-else bad "a harness that fails its RE-RUN keeps its pass (exit 4, not 1) and is reported as a flake" "rc=$RC4 out=$C4"; fi
+if (( RC4 == 4 )) && [[ "$C4" == *"RE-RUN DISAGREED (observed)"* && "$C4" == *"flake.sh"* ]]; then
+  ok "a harness that fails its RE-RUN keeps its pass (exit 4, not 1) and the disagreement is reported"
+else bad "a harness that fails its RE-RUN keeps its pass (exit 4, not 1) and the disagreement is reported" "rc=$RC4 out=$C4"; fi
+# olivia, DIVE-2592: the observation and the CAUSE are different claims, and a guess
+# printed among measured sentences inherits their authority. The hedge lives in the
+# string, which is read forever, not only in the handoff, which is read once — so it
+# is graded here rather than trusted.
+if [[ "$C4" == *"CAUSE NOT MEASURED (inferred)"* ]]; then
+  ok "the re-run disagreement marks its CAUSE as inferred, in the output string itself"
+else bad "the re-run disagreement marks its CAUSE as inferred, in the output string itself" "$C4"; fi
 
 # CONTROL (olivia, grading DIVE-2592): DOES THE MIN STILL SEE GROWTH?
 # The whole defence of min-of-two is that it removes WEATHER and keeps GROWTH — and

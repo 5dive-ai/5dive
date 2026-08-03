@@ -175,7 +175,14 @@ pct=0; (( BUDGET > 0 )) && pct=$(( total_s * 100 / BUDGET ))
 #
 # A HARNESS THAT FAILS ITS RE-RUN keeps its original timing AND its original pass: the
 # graded run is the first one, and flipping a pass to a fail on a second sample is
-# this same one-sample error inverted. It is reported as the flake it is.
+# this same one-sample error inverted.
+#
+# WHAT THAT EVENT IS, AND WHAT IT IS NOT (olivia, grading DIVE-2592). Two runs
+# disagreeing is OBSERVED. Calling it a flaky harness is INFERRED, and it is only one
+# of at least three candidates: the harness may be non-deterministic, or the FIRST run
+# may have left state the second tripped on, or the runner changed underneath both. A
+# guess printed among measured sentences inherits their authority, so the output says
+# which half is which rather than naming a cause it did not measure.
 # ---------------------------------------------------------------------------------
 first_total_s="$total_s"; first_pct="$pct"; confirmed=0
 declare -a SWING=() FLAKED=()
@@ -299,9 +306,13 @@ if (( confirmed )); then
   fi
   for fl in "${FLAKED[@]}"; do
     IFS=$'\t' read -r nm rc2 <<<"$fl"
-    printf 'FLAKE: %s PASSED in the graded run and FAILED (rc=%s) on its re-timing.\n' "$nm" "$rc2"
-    printf '       Its pass stands (the graded run is the first one) and its timing was not\n'
-    printf '       replaced — but a harness that is not deterministic is worth its own row.\n'
+    printf 'RE-RUN DISAGREED (observed): %s PASSED in the graded run and FAILED (rc=%s) when\n' "$nm" "$rc2"
+    printf '  it was re-timed. Its pass STANDS — the graded run is the first one — and its timing\n'
+    printf '  was not replaced.\n'
+    printf '  CAUSE NOT MEASURED (inferred): this is consistent with a non-deterministic harness,\n'
+    printf '  with state the first run left behind, or with the runner changing under both. This\n'
+    printf '  line cannot tell them apart and neither can the exit code. Worth its own row; not\n'
+    printf '  worth a diagnosis from here.\n'
   done
 fi
 
