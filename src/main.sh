@@ -303,6 +303,16 @@ Health:
     two environments (tests/meta/selfcheck-union.sh) to prove no probe is
     skipped everywhere.
 
+  5dive bug [--verb=<name>] [--exit=<code>] [--no-probes] [--file]
+    Preview (default) or file a diagnostic bug report against 5dive-ai/5dive.
+    Payload is a fixed ALLOWLIST — version, OS, bash version, install method,
+    the verb that failed + its exit code, and selfcheck probe name+verdict
+    pairs — never the free-text reason/detail fields underneath them. Bare
+    \`5dive bug\` only builds and prints the payload; NEVER auto-files. --file
+    re-prints the identical payload and then opens it (via \`5dive gh issue
+    create\`, so it lands as 5dive-bot); a TTY also gets an interactive y/N.
+    Agents take the same --file flag a human does — no separate unattended path.
+
   5dive doctor [--fix] [--dry-run] [--category=deps|types|auth|creds|registry|shelld|channels|host|memory]
     Walks deps (tmux/jq/bun/python3/nvm/node/npm), type bins, live auth
     probes, stale shadow-credential heal (creds), registry integrity, channel
@@ -352,6 +362,11 @@ main() {
 
   [[ $# -gt 0 ]] || { usage; exit "$E_USAGE"; }
   local top="$1"; shift
+  # DIVE-2323: the one place that sees every dispatch, so fail()'s E_GENERIC
+  # hint can name the verb that broke. Set unconditionally, even for a $top
+  # the case below rejects — that path fails E_USAGE, which the hint never
+  # fires on, so an unvalidated verb string never actually reaches it.
+  CURRENT_VERB="$top"
   # Handle --version / -v / version before the dispatch table so it stays a
   # zero-dependency one-liner check (reviewers grep for it first).
   case "$top" in
@@ -720,6 +735,19 @@ main() {
       # audited: it mutates nothing outside its own temp dirs (same posture as
       # doctor without --fix).
       cmd_selfcheck "$@" ;;
+    bug)
+      # DIVE-2323: diagnostic bug-report verb against 5dive-ai/5dive. Preview
+      # (the default) only builds and prints an allowlisted payload — no lock,
+      # no audit, nothing leaves the box. Only --file performs the network
+      # write (via `5dive gh issue create`), so that's the only arm audited,
+      # same gating style as doctor's --repair/--fix above.
+      for a in "$@"; do
+        if [[ "$a" == "--file" ]]; then
+          AUDIT_CMD="bug"; AUDIT_ARGS=("$@")
+          break
+        fi
+      done
+      cmd_bug "$@" ;;
     task)
       # Shared task queue (sqlite). Group-writable store, so no root/lock and
       # no audit — these are high-frequency, low-risk ops any agent runs. SQLite
