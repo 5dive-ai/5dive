@@ -51,8 +51,7 @@ trap 'rm -rf "$TMP"' EXIT
 for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh \
          lib/agent_setup.sh lib/state.sh lib/broker.sh lib/audit.sh \
          lib/registry.sh lib/disk.sh lib/tasks_db.sh lib/actor.sh cmd_task.sh \
-         cmd_push.sh cmd_org.sh; do
-         cmd_project.sh cmd_heartbeat.sh; do
+         cmd_push.sh cmd_org.sh cmd_project.sh cmd_heartbeat.sh; do
   # shellcheck source=/dev/null
   source "$SRC/$f"
 done
