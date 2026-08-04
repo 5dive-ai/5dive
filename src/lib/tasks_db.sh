@@ -376,6 +376,16 @@ CREATE TABLE IF NOT EXISTS tasks (
   handoff_delivered_at    TEXT,
   handoff_stale_pinged_at TEXT,
   handoff_rejected_at     TEXT,
+  -- DIVE-2693: recurring_stall_pinged_at throttles the recurring-instance stall
+  -- sweep to one surface-ping per instance (same shipped_flag_at pattern as
+  -- handoff_stale_pinged_at above). A materialized instance that is never STARTED
+  -- has no handoff_delivered_at, so gap#2's sweep cannot see it — and skip-if-open
+  -- dedup means the template's next slot is suppressed for as long as it sits, so
+  -- one unworked instance silently eats every subsequent occurrence of the beat.
+  -- Measured twice on DIVE-1237 (the OpenAgent drip): DIVE-2026 ate 07-27..07-28,
+  -- DIVE-2403 ate 07-31..08-04. Both recovered cleanly downstream, which is exactly
+  -- what kept the fault quiet.
+  recurring_stall_pinged_at TEXT,
   -- DIVE-891: risk-tiered gates (adopted design DIVE-861). tier is set when the
   -- gate is filed: 0 = auto-clear (rec applies immediately, digest line only),
   -- 1 = agent-clearable + 48h TTL auto-applies the recommendation, 2 = hard
@@ -1082,6 +1092,7 @@ _tasks_db_migrate() {
            'iteration INTEGER' 'maker_agent TEXT' 'handoff_ack_at TEXT' 'task_budget TEXT' \
            'handoff_delivered_at TEXT' 'handoff_stale_pinged_at TEXT' \
            'handoff_rejected_at TEXT' \
+           'recurring_stall_pinged_at TEXT' \
            'tier INTEGER' 'need_asked_at TEXT' 'gate_pinged_at TEXT' 'wake_at TEXT' \
            'gate_filed_by TEXT' \
            'secret_key TEXT' 'connector TEXT' 'secret_oob TEXT' 'human_nonce_hash TEXT' \
