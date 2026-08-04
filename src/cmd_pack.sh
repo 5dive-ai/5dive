@@ -96,6 +96,42 @@ _marketplace_fetch_pack() {
   rm -rf "$dl"; echo "$out"
 }
 
+# _pack_skill_refs <skills-dir> -> JSON array of skill specs for the manifest.
+#
+# DIVE-2678. Export used to emit the bare directory names here. That is lossy in the
+# one way that matters: import re-resolves a bare name through parse_skill_spec, which
+# defaults to `<org>/skills` and tries NOTHING else, so a skill from any other repo
+# came out of an export unresolvable and the importer could only skip it. Measured on
+# two fresh seats from one exported AGENTS.md: 4 of 22 installed, and all 18 skipped
+# were third-party (none published in 5dive-ai/skills — verified by fetching each).
+# The provenance was never missing, only unread: `.skills-manifest.json`, written by
+# cmd_skill_add next to the skills themselves, records the source each was installed
+# from. Emit the qualified `<owner/repo>:<id>` form when the source is known and is not
+# the default repo; keep the bare form otherwise, so the common case and the
+# human-readable AGENTS.md rendering are unchanged.
+#
+# A skill with no manifest entry (hand-seeded, or bundled by an earlier import) still
+# comes out bare — there is no fact to carry. That is the case the import-side warning
+# now names out loud instead of folding into a count.
+_pack_skill_refs() {
+  local sdir="$1"
+  [[ -d "$sdir" ]] || { echo '[]'; return 0; }
+  local mf='{}'
+  if [[ -f "$sdir/.skills-manifest.json" ]]; then
+    mf=$(jq -c 'if type == "object" then . else {} end' "$sdir/.skills-manifest.json" 2>/dev/null) || mf='{}'
+    [[ -n "$mf" ]] || mf='{}'
+  fi
+  # Skills install as real dirs OR symlinks (per-agent skill layout), so match
+  # both — -type d alone misses the symlinked majority.
+  find "$sdir" -maxdepth 1 -mindepth 1 \( -type d -o -type l \) -printf '%f\n' 2>/dev/null \
+    | sort | jq -R . \
+    | jq -cs --argjson m "$mf" --arg def "$(gh_org)/skills" '
+        map(. as $id
+            | (($m[$id].source // "") | tostring) as $s
+            | if ($s == "" or $s == $def) then $id else ($s + ":" + $id) end)' 2>/dev/null \
+    || echo '[]'
+}
+
 # Install a bundled skill (a local <dir>/SKILL.md) directly into the agent's
 # skills dir — used on import when the pack carries the skill body.
 _install_bundled_skill() {
@@ -1632,14 +1668,20 @@ cmd_export() {
   if [[ -f "$cdir/avatar.png" ]]; then
     cp "$cdir/avatar.png" "$stage/avatar.png" 2>/dev/null && has_avatar=1
   fi
-  # Skills as source refs (reuse the skills spec; import re-adds them) — names only.
-  local skills='[]'
-  if [[ -d "$cdir/skills" ]]; then
-    # Skills install as real dirs OR symlinks (per-agent skill layout), so match
-    # both — -type d alone misses the symlinked majority.
-    skills=$(find "$cdir/skills" -maxdepth 1 -mindepth 1 \( -type d -o -type l \) -printf '%f\n' 2>/dev/null \
-             | sort | jq -R . | jq -cs '.' 2>/dev/null || echo '[]')
-  fi
+  # Skills as source refs (reuse the skills spec; import re-adds them).
+  #
+  # DIVE-2678: this used to emit the skills DIRECTORY NAMES and nothing else, which
+  # throws away the one fact import needs. A bare name is re-resolved by
+  # parse_skill_spec against `<org>/skills` and NOWHERE else, so every skill that came
+  # from any other repo became unresolvable the moment it was exported — the importer
+  # then correctly, and silently-by-design, skipped it. Measured on two fresh seats:
+  # 4 of 22 installed, the other 18 all third-party (none of them exist in
+  # 5dive-ai/skills, verified by fetch). The skill's origin is not lost data: the
+  # per-agent `.skills-manifest.json` already records the source cmd_skill_add
+  # resolved it from. Carry it as the qualified `<owner/repo>:<id>` form whenever it
+  # is NOT the default repo, and keep the short bare form when it is — so an
+  # AGENTS.md stays readable and the common case is unchanged.
+  local skills; skills=$(_pack_skill_refs "$cdir/skills")
   # Hooks subset from settings (structure only; if a hook command embeds a
   # secret that is on the operator — we copy the hooks block verbatim from
   # settings, which by convention holds no tokens).
@@ -2170,8 +2212,23 @@ cmd_import() {
 
   # DIVE-2565: a silent skill drop is the bad outcome the single-file format was
   # explicitly not allowed to have. Name them, on every harness.
+  #
+  # DIVE-2678: naming them was not enough. "Skills added: 4, skipped: 18" reads as a
+  # broken importer, and the reader's next move (re-run it, file a bug) is the wrong
+  # one in both cases — the skip is CORRECT, the skill genuinely is not fetchable from
+  # the repo that was tried. So say which repo was tried, why that one, and the exact
+  # command that fixes it. A bare ref and a qualified ref fail for different reasons
+  # and get different sentences.
   if (( ${#skipped[@]} > 0 )); then
     warn "skills NOT installed on this '$type' agent: ${skipped[*]} — the agent's instructions still assume them"
+    local sk_
+    for sk_ in "${skipped[@]}"; do
+      if [[ "$sk_" == *:* ]]; then
+        warn "  '${sk_#*:}' — '${sk_%%:*}' did not serve it (missing, private, or unreachable from this host)"
+      else
+        warn "  '$sk_' — no source recorded in the pack, so only '$(gh_org)/skills' was tried and it is not published there; re-add it by hand: 5dive agent skill $as add --source=<owner/repo> --skill=$sk_"
+      fi
+    done
   fi
 
   rm -rf "$stage"
