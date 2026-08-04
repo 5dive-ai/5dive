@@ -519,9 +519,27 @@ _push_open_pr() {
 
   # Same handoff as the push: NUL-separated over stdin, exact command path, and
   # `_gh_do` re-derives the routing class as root rather than trusting this caller.
-  local rc=0
-  url=$(printf '%s\0' "${args[@]}" | sudo -n /usr/local/bin/5dive _gh_do) || rc=$?
+  # stderr is CAPTURED rather than passed through because one specific failure has
+  # to be read, not just relayed — see the already-exists arm below.
+  local rc=0 out
+  out=$(printf '%s\0' "${args[@]}" | sudo -n /usr/local/bin/5dive _gh_do 2>&1) || rc=$?
+  url="$out"
+
+  # ALREADY EXISTS IS THE DESIRED END STATE, not a failure. `--open-pr` means "make
+  # sure this branch has a pull request", and re-running a push (a second commit on
+  # the same branch, a retry after a red) hits this every time. Reporting it as a
+  # failure and then advising `5dive gh pr create` — the exact command that just
+  # refused — is advice that is wrong in the most likely failure mode there is.
+  # gh names the existing PR and its URL in that message; surface those.
+  if [[ $rc -ne 0 && "$out" == *"already exists"* ]]; then
+    local existing; existing=$(printf '%s' "$out" | grep -oE 'https://github\.com/[^ ]+/pull/[0-9]+' | head -1)
+    ok "${ident} already has a pull request (${existing:-see above}) for ${branch} -> ${base} in ${slug} — branch pushed, nothing more to open" \
+       "$(jq -n --arg t "$ident" --arg u "${existing:-}" --arg b "$branch" --arg base "$base" --arg r "$slug" \
+             '{task:$t,pr:$u,branch:$b,base:$base,repo:$r,actor:"5dive-bot",created:false}')"
+    return 0
+  fi
   if [[ $rc -ne 0 ]]; then
+    printf '%s\n' "$out" >&2
     # Distinguish "you may not route" from "the routed call failed" — sudo exits 1
     # for a missing grant and gh exits 1 for its own errors, so rc alone cannot tell
     # them apart. Ask sudo directly, and only after a failure.

@@ -63,6 +63,7 @@ for a in "${args[@]}"; do [[ "$a" == "-l" ]] && listing=1; done
 # The real thing: read the NUL-separated argv off stdin and record it verbatim.
 : >"${GHDO_ARGS_LOG:-/dev/null}"
 while IFS= read -r -d '' a; do printf '%s\n<<ARG>>\n' "$a" >>"${GHDO_ARGS_LOG:-/dev/null}"; done
+if [[ -n "${GHDO_ERR:-}" ]]; then printf '%s\n' "$GHDO_ERR" >&2; exit 1; fi
 [[ -n "${GHDO_FAIL:-}" ]] && exit 1
 printf '%s\n' "${GHDO_OUT:-}"
 STUB
@@ -256,6 +257,30 @@ if [[ $RAIL_TESTABLE -eq 1 ]]; then
     || bad_t "T8 failed open" "returned 0"
 else
   skip_t "T8 failed PR open" "/usr/local/bin/5dive is not executable here"
+fi
+
+# --- T10: "a PR already exists" is the DESIRED END STATE, not a failure. -------
+# Measured live on 2026-08-04: re-running `push --open-pr` after a second commit on
+# the same branch hits this every time, and the first cut reported it as a failure
+# and then advised `5dive gh pr create` — the exact command that had just refused.
+# Advice that is wrong in the most likely failure mode is worse than none.
+if [[ $RAIL_TESTABLE -eq 1 ]]; then
+  out=$(SUDO_MODE=grant GHDO_ERR='a pull request for branch "feat/x" into branch "main" already exists:
+https://github.com/o/r/pull/431' _push_open_pr DIVE-2605 o/r feat/x "" "" "" 0 2>&1); rc=$?
+  if [[ $rc -eq 0 && "$out" == *"already has a pull request"* && "$out" == *"pull/431"* ]]; then
+    ok_t "T10 an existing PR is reported as success and names the PR's URL"
+  else
+    bad_t "T10 already-exists" "rc=$rc out=$out"
+  fi
+  # ANCHOR: a DIFFERENT failure must still be a failure — otherwise T10 would have
+  # been bought by swallowing every error, which is the cheap wrong version of it.
+  SUDO_MODE=grant GHDO_ERR='HTTP 403: Resource not accessible by integration' \
+    _push_open_pr DIVE-2605 o/r feat/x "" "" "" 0 >/dev/null 2>&1
+  [[ $? -ne 0 ]] \
+    && ok_t "T10 ANCHOR: a 403 is still a failure (the already-exists arm is specific, not a blanket swallow)" \
+    || bad_t "T10 anchor" "a 403 returned 0"
+else
+  skip_t "T10 already-exists handling" "/usr/local/bin/5dive is not executable here"
 fi
 
 # --- T9: the PR flags refuse to be silently inert without --open-pr. ----------

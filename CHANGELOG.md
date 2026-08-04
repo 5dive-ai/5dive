@@ -51,10 +51,15 @@ a token today changes path at all. Where the bot cannot see a repo the query sti
 empty, which is the same unverified verdict a builder gets now: this can add answers,
 never subtract one.
 
-`tests/builder_gh_rail_unit.sh` (14 arms, **1.0s measured on the control-plane host**,
+`--open-pr` also treats **"a pull request already exists" as the desired end state**, not a
+failure: re-running a push after a second commit hits that every time, and the first cut
+reported it as failed and then advised the exact command that had just refused.
+
+`tests/builder_gh_rail_unit.sh` (16 arms, **1.1s measured on the control-plane host**,
 core tier) pins it, including the positive control that no-token-and-no-grant still refuses.
 Mutation-graded: reverting the reachability predicate, forcing the token rail, flattening
-the timeouts, and moving the PR body into argv each red exactly the arm that names them.
+the timeouts, moving the PR body into argv, and widening the already-exists arm into a
+blanket swallow each red exactly the arm that names them.
 
 ## Unreleased — feat(gate): a gate now records WHY it has the tier it has (DIVE-2615)
 
