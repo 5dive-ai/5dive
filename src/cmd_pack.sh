@@ -1074,7 +1074,13 @@ _pack_agent_config() {
 # Net effect on detection is POSITIVE — gh_/AWS tokens and PEM blocks were not
 # covered before and are now, while prose about credentials no longer refuses.
 _PACK_SECRET_VALUE_RULES=(
-  'private-key-block:-----BEGIN[A-Z ]*PRIVATE KEY-----'
+  # The trailing [A-Z ]* is load-bearing and was missing: an armoured PGP secret key
+  # is `-----BEGIN PGP PRIVATE KEY BLOCK-----`, so the word after "PRIVATE KEY" put it
+  # out of reach of a trailing literal and it exported CLEAN (caught in review). A
+  # suffix class rather than `( BLOCK)?` so any future armour label is covered too.
+  # `-----BEGIN CERTIFICATE-----` deliberately does NOT match: a certificate is public,
+  # and the old bare `-----BEGIN` refused on one. That is a narrowing, on purpose.
+  'private-key-block:-----BEGIN[A-Z ]*PRIVATE KEY[A-Z ]*-----'
   'openai-style-key:(^|[^A-Za-z0-9])sk-[A-Za-z0-9_-]{20,}'
   'github-token:(^|[^A-Za-z0-9])gh[pousr]_[A-Za-z0-9]{30,}'
   'slack-token:(^|[^A-Za-z0-9])xox[abposr]-[A-Za-z0-9-]{10,}'

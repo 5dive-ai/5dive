@@ -69,6 +69,11 @@ probe() {  # probe <label> <content> refuse:<rule>|clean
 printf '\n1. every VALUE rule fires, in isolation (reserved fakes only)\n'
 probe "openssh private key"  '-----BEGIN OPENSSH PRIVATE KEY-----'                 refuse:private-key-block
 probe "rsa private key"      '-----BEGIN RSA PRIVATE KEY-----'                     refuse:private-key-block
+# Caught in review: an armoured PGP secret key carries a word AFTER "PRIVATE KEY",
+# so a trailing literal could not reach it and it exported clean. Its own fixture,
+# because the three PEM shapes are one rule and only this one was broken.
+probe "pgp private key block" '-----BEGIN PGP PRIVATE KEY BLOCK-----'              refuse:private-key-block
+probe "encrypted private key" '-----BEGIN ENCRYPTED PRIVATE KEY-----'              refuse:private-key-block
 probe "openai-style key"     'k=sk-abcdefghijklmnopqrstuvwxyz0123'                 refuse:openai-style-key
 probe "github token"         'ghp_abcdefghijklmnopqrstuvwxyz0123456789'            refuse:github-token
 probe "slack token"          'xoxb-1234567890-abcdefghijklm'                       refuse:slack-token
@@ -84,6 +89,9 @@ probe "elided key value"       'run OPENROUTER_API_KEY=... opencode models'     
 probe "bare key NAME"          'git grep GH_BOT_TOKEN over the tree is EMPTY'       clean
 probe "PEM words in prose"     'we discussed BEGIN and PRIVATE KEY handling'        clean
 probe "short assignment"       'PASSWORD=hunter2'                                   clean
+# A DELIBERATE narrowing, asserted so nobody "restores" it as a missing case: the
+# old bare `-----BEGIN` refused on a certificate. A certificate is public material.
+probe "certificate (public)"   '-----BEGIN CERTIFICATE-----'                        clean
 
 printf '\n3. a staged credential FILE is caught by name (the allowlist regression)\n'
 D="$TMP/files"; mkdir -p "$D"
