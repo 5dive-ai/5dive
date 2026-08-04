@@ -205,6 +205,45 @@ through. Where no launcher can build the rig the arm skips loudly, naming each c
 failure. Both guards are themselves graded: breaking a rig on purpose asserts the refusal
 fires, names the failed step, and leaks no `VERDICT`.
 
+## Unreleased — fix(ci): a wall-clock budget red that flipped on a re-run of the same commit (DIVE-2592)
+
+PR #395 — one line of code and two test arms — failed CI on `exit 4` with zero assertion
+failures. The decisive measurement is a re-run of the IDENTICAL head, no rebase:
+356s (118% of the 300s core budget) then 289s (96%). A 67s swing with nothing changed, and
+all of it inside one harness: `tests/baseline_pin_unit.sh`, 57.5s on main and 174.1s on that
+attempt, because it resolves pinned baseline COMMITS against the remote and is therefore
+priced by the network rather than by its assertions.
+
+The cap is not the defect and it has **not** been raised — 300 to 450 buys three weeks and
+re-installs the ratchet DIVE-2525 exists to remove. The COMPARISON was the defect: one noisy
+sample against a hard threshold, on a base with no headroom left (52% to 80% to 96% as the
+corpus grew), reds PRs at random on content they did not change.
+
+- **A budget red now confirms itself.** Over budget, `scripts/run-harnesses.sh` re-times the
+  3 slowest harnesses and keeps the SMALLER sample per file — noise is one-sided (contention
+  and a slow remote only ADD time), so the low sample is the least contaminated estimate,
+  while real corpus growth appears in BOTH samples and survives. Paid only on the red path;
+  a green run re-times nothing. `--confirm-top=0` disables it, which can only make the gate
+  STRICTER, and an arm pins that no CI job passes it.
+- **A budget red now says it is one.** `exit 4` beside a green assertion count read as
+  systemic to the PR author and as flake to the next reader; it is neither. The message
+  states that no test failed, whether the number was measured twice, and the SMALLEST set of
+  harnesses that covers the overage — the actionable set, not the top-10 leaderboard.
+- **`tests/baseline_pin_unit.sh` is demoted to the nightly tier**, with the measurement and
+  the cost of the demotion in its header. The decision rests on **57.5s — the CI reading on
+  main**, the ordinary case charged to every PR, which is 19% of the whole core budget on its
+  own; 174.1s is the tail and shows the spread, not the cost; 2.4s on the control plane is
+  the control that rules out "expensive file" in favour of "environment-priced file", which
+  is the difference between merge-or-retire and *a wall-clock cap is the wrong instrument*.
+- **HELD BACK, not dropped:** the matching `budget-report` change — printing the nightly
+  total in the units of the policy dial, i.e. the minimum number of shards the corpus now
+  needs beside the number configured — edits `.github/workflows/full-sweep.yml`, and
+  `5dive push` cannot ship a workflow file: GitHub withholds the `workflows` scope from
+  Apps on purpose, because a credential that can rewrite CI can rewrite what CI requires
+  of it (DIVE-2229/2262, Marcus). It is not in this branch. The nightly tier is at 126% of
+  its per-job budget un-sharded (DIVE-1986), so that half is still owed and needs the
+  `5dive-bot` machine account (DIVE-2232 option A) or a one-off human push.
+
 ## Unreleased — SECURITY fix(gate): a tier-2 human floor whose OFF switch was reachable by the agents it constrains (DIVE-2588)
 
 Any agent, unprivileged and without sudo, could forge a human tap on a tier-2 **decision**

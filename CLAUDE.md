@@ -17,6 +17,20 @@ decision to add one is ever wrong on its own merits. See
 - **Over budget, CI FAILS** (`exit 4`, distinct from a test failure's `exit 1`) and
   names the slowest files in the tier. Past the cap a new guard **replaces or
   merges** an existing one — that is the reverse gear, and it is the point.
+- **A budget red confirms itself first** (DIVE-2592). PR #395 went red at 356s and
+  green at 289s on the *same commit, no rebase* — a 67s swing, all of it in one
+  network-priced harness. So when the sum comes in over, the runner **re-times the
+  3 slowest files and keeps the smaller sample per file**: noise is one-sided
+  (contention and a slow remote only *add* time), so the low sample is the least
+  contaminated estimate, while real growth appears in both samples and survives.
+  Paid only on the red path; a green run re-times nothing. `--confirm-top=0`
+  disables it, which can only make the gate **stricter** — there is no flag that
+  confirms more, and no CI job passes one.
+- **A budget red says it is a budget red.** `exit 4` beside "0 failed" reads as
+  systemic to the author and as flake to the next reader; it is neither. The
+  message now states that no test failed, whether the number was confirmed twice,
+  and **the smallest set of harnesses that covers the overage** — the actionable
+  set, not the top-10 leaderboard.
 - **Three ways out, in order:** merge by subject (hundreds of harness *files* for
   one CLI means the unit of organisation is the incident, not the subject —
   folding two files about one subject reclaims their setup cost and drops no
