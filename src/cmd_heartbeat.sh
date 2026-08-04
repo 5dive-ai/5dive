@@ -2368,8 +2368,20 @@ _hb_stall_sweep() {
   # `parked_at IS NULL` is one clause BEYOND the DIVE-2207 spec (olivia's constraint
   # 2), added deliberately and mirroring the (a2) rail directly above: a parked row
   # was set aside on purpose and nudging it is noise. Measured when added: 22 parked
-  # rows live fleet-wide, 0 of them inside this window, so it changes no count today
-  # and closes the exposure before it has a victim.
+  # rows live fleet-wide, 0 of them inside this window.
+  #
+  # WHERE THE SAFETY COMES FROM, AND IT IS NOT IN THIS PREDICATE (olivia, DIVE-2207
+  # ruling). The clause is only ever a DEFERRAL rather than a permanent exclusion
+  # because `cmd_task_park` MANDATES --wake and refuses without it (E_USAGE,
+  # DIVE-1357: "a park with no revisit date is the block graveyard"), so every
+  # parked row carries its own clock back. That is a structural guarantee, not a
+  # property of today's board — the 22/0 measurement above says this moves no count
+  # TODAY, which is a different and much weaker claim.
+  # SAFE ONLY WHILE THAT MANDATE HOLDS. A new park path that does not require a
+  # wake, or a direct `parked_at` write via sqlite, bypasses it and silently
+  # converts this deferral into a permanent exclusion — and nothing in THIS file
+  # would say so. The bypass is not hypothetical: an unaudited direct UPDATE on the
+  # tasks table is how a title got corrected on 2026-08-04.
   local grow gid gident gfier ganswered gmins
   while IFS= read -r grow; do
     [[ -n "$grow" ]] || continue
