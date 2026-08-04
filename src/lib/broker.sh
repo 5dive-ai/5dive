@@ -129,7 +129,15 @@ broker_gate_check() {
   # falls through the reject check below (no verdict word to match).
   local gverdict
   gverdict=$(printf '%s\n' "$ganswer" | grep -m1 -v '^[[:space:]]*$') || gverdict=""
-  if printf '%s' "$gverdict" | grep -qiE '^\s*(no|reject|rejected|deny|denied|block)\b'; then
+  # Every stem's inflected forms are enumerated explicitly (reject/rejected,
+  # deny/denied, block/blocked) rather than matched with an ending like
+  # `(reject|deny|block)(ed|ing)?\b` — `\b` alone doesn't extend a bare stem
+  # to its inflections ("block" has no boundary inside "blocked"), and a
+  # collapsed `(ed|ing)?` re-admits "Blocking issues: none" and "Rejecting
+  # the null hypothesis" as false positives (main, DIVE-2614 review). Any new
+  # stem added here needs its own inflected forms added too, deliberately —
+  # this list is maintained by hand, not enforced by the pattern.
+  if printf '%s' "$gverdict" | grep -qiE '^\s*(no|reject|rejected|deny|denied|block|blocked)\b'; then
     audit_log "${surface} gate" error "$E_VALIDATION" -- "ident=${ident}" "line=${gverdict}"
     fail "$E_VALIDATION" "gate on ${ident} was REJECTED ('${ganswer}') — ${noun} refused."
   fi

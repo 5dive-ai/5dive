@@ -353,6 +353,30 @@ out=$(run broker_gate_check push 7 DIVE-7)
 want "'Rejected' (inflected) still refuses, not just bare 'Reject'" \
      '[[ "$out" == *"REJECTED"* && "$out" == *"rc=9" ]]'
 
+# main (2026-08-04, second review pass): "block" was left bare while
+# reject/rejected and deny/denied were both split — with the word boundary,
+# "block" no longer prefix-matches "blocked" ('k' then 'e', both word chars,
+# no boundary), the exact same inflection gap as "rejected". "Blocked —
+# needs a rebase first" is how a reviewer actually refuses, not an exotic
+# phrasing, and it's on the cmd_deploy.sh path.
+reset_row; ROW[need_type]=approval; ROW[need_answered_at]=t
+ROW[need_answer]="Blocked — needs a rebase first"; ROW[need_answered_by]="human:lodar"
+out=$(run broker_gate_check push 7 DIVE-7)
+want "'Blocked' (inflected) still refuses, not just bare 'Block'" \
+     '[[ "$out" == *"REJECTED"* && "$out" == *"rc=9" ]]'
+# ...and it trips on nothing else it shouldn't: the false positives this row
+# exists to fix stay fixed with 'blocked' added to the alternation.
+reset_row; ROW[need_type]=approval; ROW[need_answered_at]=t
+ROW[need_answer]="Blocking issues: none"; ROW[need_answered_by]="human:lodar"
+out=$(run broker_gate_check push 7 DIVE-7)
+want "adding 'blocked' didn't re-admit 'Blocking issues: none'" '[[ "$out" == "rc=0" ]]'
+
+reset_row; ROW[need_type]=approval; ROW[need_answered_at]=t
+ROW[need_answer]="Denied for now"; ROW[need_answered_by]="human:lodar"
+out=$(run broker_gate_check push 7 DIVE-7)
+want "'Denied' still refuses (existing stem, non-regression check)" \
+     '[[ "$out" == *"REJECTED"* && "$out" == *"rc=9" ]]'
+
 # An answer that is nothing but blank lines must not crash broker_gate_check
 # under set -euo pipefail (the real caller's mode, per header.sh — `run()`
 # above does not set -e, so this needs its own subshell to actually exercise
