@@ -230,6 +230,11 @@ Org chart (who reports to whom):
   5dive org tree | show <agent> | ls | rm <agent>
   # full surface: 5dive org --help
 
+Web UI for this host (org chart, queue, gates):
+  5dive ui [--port=8735] [--host=127.0.0.1]          # open the three views in a browser. Read-only, no sign-in.
+  5dive ui --data | --html                           # the JSON the views render / the page itself
+  # full surface: 5dive ui --help
+
 Heartbeat (wake an agent only when it has queued tasks, one per tick):
   5dive heartbeat on  <name> [--every=<dur>] [--fresh]      # enrol (default 30m, fresh off: no /clear between tasks)
   5dive heartbeat off <name>
@@ -774,6 +779,11 @@ main() {
     org)
       # Agent org chart (sqlite, same store as tasks). Read/write, no audit/lock.
       cmd_org "$@" ;;
+    ui)
+      # DIVE-2655: the free single-host web UI (org chart / queue / gates).
+      # Reads the same group-writable store as tasks + org; GET/HEAD only, no
+      # root, no lock, no write path. Loopback bind unless the caller opts out.
+      cmd_ui "$@" ;;
     project|projects)
       # Project namespaces for the task queue (DIVE-484). Same group-writable
       # store as tasks; read/write, no root/lock.
