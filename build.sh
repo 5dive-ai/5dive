@@ -21,6 +21,27 @@ cd "$(dirname "$0")"
 # temp dir without dirtying the tracked ./5dive artifact. Defaults to the repo ./5dive.
 OUT="${BUILD_OUT:-5dive}"
 
+# DIVE-2681: BUILD_OUT may name the bundle ANYTHING, and .gitignore only knows
+# about `/5dive` + `/5dive.sha256` (DIVE-2091). So `BUILD_OUT=./5dive-fix` builds
+# a 3.3MB bundle that git happily tracks, and one `git add -A` puts it on main —
+# which is exactly what happened in #434. The ignore rule was never wrong; the
+# output name walked around it.
+#
+# Refuse rather than widen the glob: a name list only ever covers the names
+# someone already used, and `5dive-agent-start` / `5dive-refresh-*.sh` are real
+# tracked files, so `/5dive-*` would be worse than the disease. Build inside the
+# tree ONLY as the ignored ./5dive; anywhere else, build outside it.
+_out_abs=$(cd "$(dirname "$OUT")" 2>/dev/null && pwd)/$(basename "$OUT")
+_repo_abs=$(pwd)
+if [[ "$_out_abs" == "$_repo_abs"/* && "$(basename "$OUT")" != "5dive" ]]; then
+  printf 'build.sh: refusing to write %s inside the repo.\n' "$(basename "$OUT")" >&2
+  printf '  Only ./5dive is gitignored here (DIVE-2091); any other in-tree name is TRACKED\n' >&2
+  printf '  and a `git add -A` will commit a multi-megabyte bundle (DIVE-2681, PR #434).\n' >&2
+  printf '  Build to a path outside the repo instead: BUILD_OUT=/tmp/5dive-test ./build.sh\n' >&2
+  exit 2
+fi
+unset _out_abs _repo_abs
+
 cat \
   src/header.sh \
   src/lib/error_codes.sh \
@@ -78,6 +99,7 @@ cat \
   src/cmd_push.sh \
   src/cmd_deploy.sh \
   src/cmd_gh.sh \
+  src/cmd_bug.sh \
   src/cmd_memory.sh \
   src/cmd_pack.sh \
   src/cmd_secret.sh \
@@ -106,6 +128,30 @@ chmod +x "$OUT" 2>/dev/null || true
 # when someone empties out FIVE_VERSION by accident.
 if ! grep -qE '^readonly FIVE_VERSION="[^"]+"' "$OUT"; then
   echo "error: $OUT is missing FIVE_VERSION — check src/header.sh" >&2
+  exit 1
+fi
+
+# DIVE-2097: src/lib/self.sh must precede every five_self_bundle consumer in the cat
+# list above. Each consumer opens with `declare -F five_self_bundle ||
+# source ".../lib/self.sh"` — dead code in the bundle, load-bearing in the split tree
+# (see src/lib/self.sh and community/wiki/command-v-answers-the-wrong-question.md
+# rule 5). That property only held because the cat list ABOVE was hand-ordered with a
+# prose comment ("Order matters: ... lib/ helpers -> cmd_*"); nothing enforced it. If a
+# future consumer ever lands ahead of lib/self.sh in the list, the guard fires inside
+# the bundle where dirname "$BASH_SOURCE" is the INSTALL dir and lib/self.sh does not
+# exist — the source fails, and `set -euo pipefail` (src/header.sh) takes the whole CLI
+# down. Checked on the built artifact rather than the cat list text so this also catches
+# a future refactor that stops concatenating from a fixed file list.
+def_line="$(grep -n '^five_self_bundle() {' "$OUT" | head -1 | cut -d: -f1)"
+if [[ -z "$def_line" ]]; then
+  echo "error: $OUT has no five_self_bundle definition — check src/lib/self.sh" >&2
+  exit 1
+fi
+guard_line="$(grep -n 'declare -F five_self_bundle' "$OUT" | head -1 | cut -d: -f1)"
+if [[ -n "$guard_line" && "$def_line" -gt "$guard_line" ]]; then
+  echo "error: $OUT defines five_self_bundle at line $def_line, AFTER the first" >&2
+  echo "  consumer guard at line $guard_line. src/lib/self.sh must be cat'd before" >&2
+  echo "  every five_self_bundle consumer — fix the file order in build.sh." >&2
   exit 1
 fi
 

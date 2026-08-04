@@ -119,7 +119,7 @@ truthy "hooks are declared dropped, not omitted" $(grep -q '^hooks: dropped' "$M
 # both arms, or "says dropped" would also pass on a stage that has no avatar.
 truthy "an avatar present in the stage is declared dropped, not omitted" $(grep -q "^avatar: dropped" "$MD"; echo $?)
 truthy "the file STATES that skills are names not bodies" \
-  $(grep -q 'travel as NAMES, not bodies' "$MD"; echo $?)
+  $(grep -q 'carries their NAMES, not' "$MD"; echo $?)
 truthy "memory sections are human-readable headings" \
   $(grep -qx '## memory/reference_thing.md' "$MD"; echo $?)
 # Non-vacuity for the tripwire below: the fixture really does hold both fences.
@@ -252,6 +252,85 @@ truthy "the tarball is what _pack_safe_extract accepts" \
   $(_pack_safe_extract "$TGZ" "$TMP/x" >/dev/null 2>&1; echo $?)
 check "extracted manifest is the same one" "$(jq -r '.agentName' "$TMP/x/manifest.json")" "ada"
 rm -f "$TGZ"
+
+# ------------------------------------------ DIVE-2583: the skills statement ---
+# The old text asserted "on a harness with no skills directory (codex, opencode)
+# NONE are installed". Both halves are gradable WITHOUT a codex seat, and neither
+# is graded by looking for words: the claim is a PREDICATE over SKILLS_INSTALL_DIR,
+# so run the predicate. (DIVE-2568 shipped three findings where a string survived
+# dead code — a grep for the sentence would have passed on either wording.)
+
+# 1. The category the sentence named is empty. Decided by the resolver every
+#    install site calls, over every key in the map.
+# NB: grade the MAP here, not the resolver — `${m[$k]:-default}` substitutes on
+# EMPTY as well as unset, so a resolver-side probe can never observe a type that
+# was mapped to "". Reading the array directly is the only way this arm can red.
+_empty=""; _swept=0; _disagree=""
+for _t in "${!SKILLS_INSTALL_DIR[@]}"; do
+  [[ -n "${SKILLS_INSTALL_DIR[$_t]}" ]] || _empty="$_empty $_t"
+  [[ "$(skills_install_dir "$_t")" == "${SKILLS_INSTALL_DIR[$_t]}" ]] || _disagree="$_disagree $_t"
+  _swept=$((_swept + 1))
+done
+check "no known type is mapped to an empty skills dir" "$_empty" ""
+check "the resolver returns the mapped value for every known type" "$_disagree" ""
+# ...and that sweep is only worth anything if it actually swept. A map that lost
+# its entries would satisfy the arm above vacuously.
+truthy "the sweep was non-vacuous (every mapped type visited)" \
+  $([[ "$_swept" -ge 8 && "$_swept" -eq "${#SKILLS_INSTALL_DIR[@]}" ]]; echo $?)
+check "codex — the type the old text called dir-less — maps to a real dir" \
+  "$(skills_install_dir codex)" ".agents/skills"
+check "opencode likewise" "$(skills_install_dir opencode)" ".agents/skills"
+# The resolver is TOTAL: an unmapped type does not get "no skills directory",
+# it gets the fallback. That is why the category cannot be non-empty.
+check "an unknown type falls back rather than resolving to nothing" \
+  "$(skills_install_dir definitely-not-a-type)" ".claude/skills"
+
+# 2. The rendered sentence is DERIVED from that resolver, not copied from it.
+#    Render once per mapped type and require the dir in the prose to EQUAL what
+#    the installer would compute. A hardcoded string passes for at most one type;
+#    this arm only goes green if the text moves with the map.
+_S83="$TMP/s2583"; _bad=""; _rendered=0
+for _t in "${!SKILLS_INSTALL_DIR[@]}"; do
+  rm -rf "$_S83"; mkdir -p "$_S83"
+  printf '# A\n\nbody\n' > "$_S83/CLAUDE.md"
+  jq -n --arg t "$_t" '{ packFormat: 1, agentName: "ada", createdWith: "0.99.0",
+     includes: { memory: false, persona: true },
+     config: { type: $t, isolation: "admin", channels: "telegram", workdir: "/w",
+               authProfile: null, model: "opus", effort: "high" },
+     plugins: [], skills: ["deep-research"], hooks: {} }' > "$_S83/manifest.json"
+  _md83="$TMP/A-$_t.md"; _agents_md_render "$_S83" > "$_md83" || { _bad="$_bad $_t(render)"; continue; }
+  _got=$(grep -oE '~/[A-Za-z0-9._/-]+/<skill>/' "$_md83" | head -1)
+  _got="${_got#\~/}"; _got="${_got%/<skill>/}"
+  [[ "$_got" == "$(skills_install_dir "$_t")" ]] || _bad="$_bad $_t(said:${_got:-none})"
+  _rendered=$((_rendered + 1))
+done
+check "the rendered skills dir equals the resolver's answer, for every type" "$_bad" ""
+truthy "…and every mapped type was actually rendered (arm above is not vacuous)" \
+  $([[ "$_rendered" -eq "${#SKILLS_INSTALL_DIR[@]}" ]]; echo $?)
+
+# 3. The two directions are stated separately, and the permissive one is gone.
+#    Graded on a CODEX render — the exact reader the old text misled.
+MD83="$TMP/A-codex.md"
+truthy "a codex export names .agents/skills as where an import lands a body" \
+  $(grep -q '`~/.agents/skills/<skill>/`' "$MD83"; echo $?)
+truthy "the file no longer claims any harness has no skills directory" \
+  $(! grep -qi 'no skills directory' "$MD83"; echo $?)
+truthy "nor that NONE are installed" $(! grep -q 'NONE are installed' "$MD83"; echo $?)
+# Negative arms need a liveness partner or they pass on an empty file: the
+# section must still be there, saying the export-direction truth.
+truthy "the Skills section still renders (negatives above are not vacuous)" \
+  $(grep -qx '## Skills' "$MD83"; echo $?)
+truthy "export direction: THIS FILE installs nothing, on any harness" \
+  $(grep -q 'own installs nothing, on any harness' "$MD83"; echo $?)
+truthy "import direction is named as a separate mechanism" \
+  $(grep -q '5dive agent import` re-resolves' "$MD83"; echo $?)
+# 4. And the load half stays a non-promise: we install a body, we do not claim
+#    the harness reads it. NB codex HAS since been measured to scan
+#    $HOME/.agents/skills (DIVE-2583 amendment), so the reason this arm exists is
+#    not "nobody has looked" — it is that 5dive performs no runtime check, and
+#    every other harness (opencode included) is still unmeasured.
+truthy "the text states landing, not loading (5dive does not verify the load at runtime)" \
+  $(grep -q 'does not verify it' "$MD83"; echo $?)
 
 printf '\n%s: %d passed, %d failed\n' "$(basename "$0")" "$PASS" "$FAIL"
 (( FAIL == 0 ))

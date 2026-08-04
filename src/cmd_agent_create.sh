@@ -1897,7 +1897,7 @@ cmd_create() {
   # Best-effort: a network blip here shouldn't fail agent creation — the
   # `agent telegram-info <name>` command can backfill on demand later.
   local bot_username=""
-  if [[ "$channels" == "telegram" && -n "$telegram_token" ]]; then
+  if channel_in_list telegram "$channels" && [[ -n "$telegram_token" ]]; then
     bot_username=$(fetch_bot_username "$telegram_token" 2>/dev/null) || bot_username=""
   fi
 
@@ -1977,7 +1977,7 @@ cmd_create() {
   # the gateway can't talk to the model. See ensure_hermes_gateway for
   # the underlying systemd-user plumbing.
   if [[ "$type" == "hermes" ]] \
-      && [[ "$channels" == "telegram" || "$channels" == "discord" ]] \
+      && { channel_in_list telegram "$channels" || channel_in_list discord "$channels"; } \
       && (( ! defer_auth )); then
     ensure_hermes_gateway "$name"
   fi

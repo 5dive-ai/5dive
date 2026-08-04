@@ -259,6 +259,30 @@ ct_epoch=1767225600   # 2026-01-01Z, the COMMITTER date
 [[ "$ctf3" == "$ct_epoch" ]] \
   && ok_t "DIVE-2014: field 3 is the COMMITTER date (%ct), not the author date (%at)" \
   || bad_t "DIVE-2014: field 3 is not %ct" "got [$ctf3]; %at would be $at_epoch, %ct is $ct_epoch"
+# --- Case 13 (DIVE-2068): type=secret is never flagged, even on a commit hit ---
+# A secret gate is satisfied only by a human handing over a credential — that
+# event cannot appear in a commit, so a commit citing the ident carries zero
+# information about it. Same MERGED fixture as Case 1 (which DOES flag for
+# decision), just a different need_type, to prove the type check is what's
+# gating this and not some other difference in the fixture.
+reset
+gid=$(mk_gate 1 secret)
+MERGED="DIVE-${gid}"
+out=$(_hb_gate_shipped_sweep 2>&1)
+flag=$(db "SELECT COALESCE(shipped_flag_at,'NULL') FROM tasks WHERE id=${gid};")
+[[ "$flag" == "NULL" ]] \
+  && ok_t "DIVE-2068: type=secret gate is NOT flagged on a commit hit (a commit can never be the evidence)" \
+  || bad_t "DIVE-2068: secret gate was flagged" "shipped_flag_at=$flag"
+[[ ! -s "$SEND_LOG" ]] \
+  && ok_t "DIVE-2068: type=secret gate's owner is not pinged" \
+  || bad_t "DIVE-2068: secret gate owner was pinged" "sent=[$(tr '\n' ',' <"$SEND_LOG")]"
+grep -q "reason=type-secret" "$AUDIT_LOG_CALLS" \
+  && ok_t "DIVE-2068: the skip is recorded in the audit log (reason=type-secret)" \
+  || bad_t "DIVE-2068: no audit row for the type-secret skip" "audit=[$(tr '\n' ',' <"$AUDIT_LOG_CALLS")]"
+grep -q "type=secret" <<<"$out" \
+  && ok_t "DIVE-2068: the skip is announced in _hb_log" \
+  || bad_t "DIVE-2068: skip not logged" "out=[${out//$'\n'/ | }]"
+
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 # DIVE-2003 (olivia's reject): this MUST be the LAST command in the file. When the
 # tally printf was moved to the end, this line was left stranded mid-file and the

@@ -225,6 +225,12 @@ CREATE TABLE IF NOT EXISTS tasks (
   -- the one case a developer with a working board never exercises. Caught by
   -- council_schedule_e2e, whose rig starts from an empty dir.
   derived_actor TEXT,
+  -- DIVE-2615: why this gate has this tier — axis=pinned|type-default|secret-type
+  -- |ask|title|title-fallback|none, plus ;term=<t> where a term is what fired.
+  -- Declared HERE as well as in _tasks_db_migrate: a fresh store takes this CREATE
+  -- and never runs the migration, so the array entry alone left the column missing
+  -- on exactly the boxes that have no history to migrate.
+  floor_provenance TEXT,
   parent_id   INTEGER REFERENCES tasks(id) ON DELETE CASCADE,
   created_at  TEXT NOT NULL DEFAULT (datetime('now')),
   started_at  TEXT,
@@ -673,7 +679,8 @@ CREATE TABLE IF NOT EXISTS gate_history (
   need_answer_sig   TEXT,
   human_nonce_hash  TEXT,
   retired_by        TEXT NOT NULL,
-  retired_at        TEXT NOT NULL DEFAULT (datetime('now'))
+  retired_at        TEXT NOT NULL DEFAULT (datetime('now')),
+  floor_provenance  TEXT
 );
 CREATE INDEX IF NOT EXISTS gate_history_task_idx ON gate_history(task_id, id);
 
@@ -860,15 +867,54 @@ SQL
 #
 # Paths are resolved at CALL time (not sourced into constants) so the DIVE-1475
 # STATE_DIR/TASKS_DIR test-isolation overrides still redirect them to a temp tree.
-# The sentinel lives in TASKS_DIR (2770 group-writable, so any agent can write
+# The sentinel lives beside the active store — for prod that is TASKS_DIR
+# (2770 group-writable, so any agent can write
 # it and it survives a bare `rm tasks.db`); the backups + incident log live in
 # the sibling tasks-backups dir. If the whole TASKS_DIR is wiped the sentinel
 # goes with it, but the backup snapshots in the sibling dir still trip the alarm.
 _tasks_backup_dir() { printf '%s' "${TASKS_BACKUP_DIR:-${STATE_DIR}/tasks-backups}"; }
-_tasks_sentinel()   { printf '%s' "${TASKS_SENTINEL:-${TASKS_DIR}/.board-initialized}"; }
+# DIVE-1986: the sentinel is a fact about the store BESIDE it, so derive it from
+# the active store's own directory rather than from TASKS_DIR. Identical whenever
+# TASKS_DB is that dir's tasks.db (every isolated harness, and prod); different
+# only in the case this fixes — TASKS_DB aimed elsewhere with TASKS_DIR left at
+# its default, where reading the prod sentinel makes prod's history testify about
+# a store it has never met.
+_tasks_store_dir() { local d; d="$(dirname -- "$TASKS_DB" 2>/dev/null)"; printf '%s' "${d:-$TASKS_DIR}"; }
+_tasks_sentinel()  { printf '%s' "${TASKS_SENTINEL:-$(_tasks_store_dir)/.board-initialized}"; }
 
-# Newest backup snapshot path (most recent first), or empty when none exist.
+# DIVE-1986: do the snapshots in the backup dir belong to the ACTIVE store?
+#
+# 5dive-tasks-backup.sh snapshots ONE board: ${TASKS_DIR}/tasks.db. Those .db.gz
+# files are that board's history and no other's. The restore path did not check,
+# so `TASKS_DB=/tmp/x/tasks.db 5dive task init` — TASKS_DB overridden alone,
+# STATE_DIR left at its default, which is what a harness that only wants a
+# throwaway store naturally writes — found the prod sentinel, then the prod
+# snapshots, and auto-restored 579 rows of production task bodies, results and
+# gate ASK text into /tmp. Two costs, both real: task content that names people,
+# decisions and spend lands wherever the caller pointed, and a fixture store the
+# author believes is empty silently is not.
+#
+# An explicit TASKS_BACKUP_DIR is the caller pairing a backup set with their own
+# store on purpose, so it is honoured as-is — the override cannot be the source of
+# the mismatch it would have to describe.
+#
+# readlink -f prints nothing when a path's PARENT does not exist, so fall back to
+# the literal path rather than comparing "" == "" and matching everything — the
+# same three-state care _tasks_store_is_prod takes, and the opposite failure
+# direction matters just as much here: an empty result must not read as a match.
+_tasks_backups_match_store() {
+  [[ -n "${TASKS_BACKUP_DIR:-}" ]] && return 0
+  local active canon ra rc
+  active="$TASKS_DB"; canon="${TASKS_DIR}/tasks.db"
+  ra="$(readlink -f "$active" 2>/dev/null)"; [[ -n "$ra" ]] || ra="$active"
+  rc="$(readlink -f "$canon"  2>/dev/null)"; [[ -n "$rc" ]] || rc="$canon"
+  [[ "$ra" == "$rc" ]]
+}
+
+# Newest backup snapshot path (most recent first), or empty when none exist —
+# or when the snapshots are a DIFFERENT board's history (DIVE-1986).
 _tasks_newest_backup() {
+  _tasks_backups_match_store || return 0
   ls -1t "$(_tasks_backup_dir)"/tasks-*.db.gz 2>/dev/null | head -n1
 }
 
@@ -929,7 +975,7 @@ _tasks_board_recover() {
     rm -f "${TASKS_DB}-wal" "${TASKS_DB}-shm" 2>/dev/null || true
     mv -f "$tmp" "$TASKS_DB" && chmod 0660 "$TASKS_DB" 2>/dev/null
     _tasks_alarm "AUTO-RESTORED $rows rows from $(basename "$newest") — verify integrity."
-  ) 9>"${TASKS_DIR}/.recover.lock"
+  ) 9>"$(_tasks_store_dir)/.recover.lock"   # DIVE-1986: lock beside the store being recovered, not always prod's
   # Confirm we ended with a real table; if not, fail loudly rather than proceed empty.
   local h3
   h3=$(sqlite3 -cmd ".timeout 5000" "$TASKS_DB" \
@@ -1032,7 +1078,8 @@ _tasks_db_migrate() {
            'originated_by_objective INTEGER' 'originated_cycle INTEGER' \
            'verify_unavailable INTEGER' 'last_skipped_at TEXT' \
            'human_evidence TEXT' \
-           'derived_actor TEXT'; do
+           'derived_actor TEXT' \
+           'floor_provenance TEXT'; do
     # DIVE-2418: herestring, NOT a pipe. `printf | grep -q` lets grep exit on its
     # first match while printf is still writing, and printf then takes SIGPIPE and
     # emits "write error: Broken pipe" on stderr. This runs from tasks_db_init on
@@ -1307,10 +1354,28 @@ CREATE TABLE IF NOT EXISTS gate_history (
   need_answer_sig   TEXT,
   human_nonce_hash  TEXT,
   retired_by        TEXT NOT NULL,
-  retired_at        TEXT NOT NULL DEFAULT (datetime('now'))
+  retired_at        TEXT NOT NULL DEFAULT (datetime('now')),
+  floor_provenance  TEXT
 );
 CREATE INDEX IF NOT EXISTS gate_history_task_idx ON gate_history(task_id, id);
 MIG
+  fi
+
+  # DIVE-2615 — additive floor_provenance on an ALREADY-CREATED gate_history. The
+  # block above only runs when the table is ABSENT, so on every store that already
+  # has one (i.e. every box that has ever filed a gate) a new column in the CREATE
+  # reaches nothing. Same one-shot pragma check the tasks columns use.
+  #
+  # This box is the reason the check is a pragma read and not a bare ALTER: it
+  # already carries `floor_provenance TEXT`, added out-of-band by something that
+  # left no trace in this repo — the column existed with no writer, no migration
+  # and no reference in src/ or tests/, which is why it read NULL on all 79 rows.
+  local has_gh_floorprov
+  has_gh_floorprov=$(sqlite3 -cmd ".timeout 5000" "$TASKS_DB" \
+    "SELECT 1 FROM pragma_table_info('gate_history') WHERE name='floor_provenance' LIMIT 1;" 2>/dev/null)
+  if [[ "$has_gh_floorprov" != "1" ]]; then
+    sqlite3 -cmd ".timeout 5000" "$TASKS_DB" \
+      "ALTER TABLE gate_history ADD COLUMN floor_provenance TEXT;" >/dev/null 2>&1 || true
   fi
 
   # DIVE-748 — additive scorecard column on already-created loop_runs tables.
@@ -1854,11 +1919,11 @@ _gate_archive_and_clear_sql() {
     "INSERT INTO gate_history (task_id, ident, need_type, ask, need_options, recommend," \
     "                          tier, need_asked_at, need_answer, need_answered_at," \
     "                          need_answered_by, need_answered_uid, need_answer_sig," \
-    "                          human_nonce_hash, retired_by)" \
+    "                          human_nonce_hash, retired_by, floor_provenance)" \
     "  SELECT id, ident, need_type, ask, need_options, recommend," \
     "         tier, need_asked_at, need_answer, need_answered_at," \
     "         need_answered_by, need_answered_uid, need_answer_sig," \
-    "         human_nonce_hash, $(sqlq "$verb")" \
+    "         human_nonce_hash, $(sqlq "$verb"), floor_provenance" \
     "    FROM tasks" \
     "   WHERE (${pred})" \
     "     AND (need_type IS NOT NULL OR need_answer IS NOT NULL" \
@@ -1891,7 +1956,30 @@ _gate_proof_ct_equal() {
 # Enforcement is OFF until the sentinel exists. DIVE-519 ships DORMANT (audit-only):
 # flip on only after the plugin mint is confirmed live on the box, else live taps
 # that can't mint yet would fail closed. Root toggles it.
-_gate_proof_enforced() { [[ -f "$(_gate_proof_enforce_file)" ]]; }
+#
+# DIVE-2588 — THE OVERRIDE MAY ONLY MAKE THIS STRICTER, NEVER WEAKER. This used to
+# read the ENV-OR-DEFAULT path, so an unprivileged agent turned the whole enforcement
+# envelope off with one variable and no sudo:
+#
+#   GATE_PROOF_ENFORCE=/nonexistent/nope  5dive task answer <T2-decision> --value=A --human
+#
+# succeeded where the identical command without it was refused, and landed
+# need_answered_by=human:<agent> — byte-identical to a real relayed human tap. A file-
+# EXISTENCE test on a path the constrained party supplies is not a control: its OFF
+# position was reachable by its own subject. Reversing the sense fixes that without
+# taking the override away — an existing sentinel at EITHER path arms enforcement, so
+# a harness can still turn it ON for an isolated store (which is all any of them do:
+# every caller in tests/ sets it to "$STATE_DIR/gate-proof.enforce", the default it
+# would have resolved anyway), and pointing it at an absent path now says nothing at
+# all instead of saying "off".
+#
+# STATE_DIR is deliberately read directly here rather than through
+# _gate_proof_enforce_file: that helper resolves the override, and the whole point of
+# this branch is that the root-owned default is consulted whether or not one is set.
+_gate_proof_enforced() {
+  [[ -f "${STATE_DIR}/gate-proof.enforce" ]] && return 0
+  [[ -n "${GATE_PROOF_ENFORCE:-}" && -f "$GATE_PROOF_ENFORCE" ]]
+}
 
 # ── DIVE-2235: the HUMAN CLASS, and class-over-tier ──────────────────────────
 # The gate types that mint and verify a one-time human nonce. This list already

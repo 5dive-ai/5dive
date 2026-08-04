@@ -222,6 +222,25 @@ _gate_passwd_stream() {
   printf '%s\n' "$(</etc/passwd)"
 }
 
+# DIVE-2601: ASSERT THE PIN, do not assume it. Two checks, and the first is the one
+# that is easy to leave out. The stream above names the caller from `$(id -un)` at
+# call time, so a LITERAL expectation is required here: derive the expectation from
+# `id -un` as well and an inert stub moves BOTH sides together, which is precisely
+# the failure being fixed — the assertion would agree with the host and print ok.
+# Without the pin, every arm below grades WHOEVER RAN THE SUITE: green on the box
+# where the host happens to match, 8 arms red on a CI runner (DIVE-2588).
+_pin_expect_un="lodar"
+_pin_who="$(id -un)"
+[[ "$_pin_who" == "$_pin_expect_un" ]] \
+  || { printf 'NOT OK - the fixture caller went INERT: `id -un` answered %s, this harness models %s\n' \
+       "'$_pin_who'" "'$_pin_expect_un'"; exit 1; }
+# ...and the pin resolved through the REAL resolver, which is what the code reads.
+if [[ "$_pin_expect_un" == agent-* ]]; then _pin_want="${_pin_expect_un#agent-}"; else _pin_want=""; fi
+_pin_got="$(_gate_uid_to_agent "$(_gate_caller_uid)")"
+[[ "$_pin_got" == "$_pin_want" ]] \
+  || { printf 'NOT OK - identity pin is inert: uid %s resolved to agent %s, expected %s\n' \
+       "$_PIN_UID" "'$_pin_got'" "'${_pin_want:-<non-agent>}'"; exit 1; }
+
 ( cmd_task_answer "$a" --value=done --human ) >/dev/null 2>&1
 unset -f id
 [[ "$(st "$a")" == "done" && "$(st "$b")" == "todo" && "$(edges "$b")" == "0" ]] \

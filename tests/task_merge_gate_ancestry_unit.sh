@@ -407,6 +407,34 @@ else
   bad_t 'bound remediation must cover work outside the searched set' "out=$OUT"
 fi
 
+# --- DIVE-2324: A BOUND-HIT REFUSAL ALSO NAMES ANY UNREACHABLE SIBLING ---------
+# The bound arm wins ahead of the unreachable-sibling arm (deliberately — see that
+# arm's own ordering comment), but winning silently dropped the fact that the scan
+# was ALSO incomplete elsewhere. Mix one bound repo with one unreachable repo: the
+# refusal must still fire under the bound slug (it is the more specific, measured
+# finding) AND must say the unreachable repo was never answered.
+attr_impl=$(declare -f _gate_branch_ident_on_main)
+_gate_branch_ident_on_main() {
+  case "$1" in
+    5dive-ai/5dive)  printf 'bound:3' ;;
+    lodar/5dive-api) printf ''       ;;  # unreachable
+  esac
+}
+clear_fx
+seed ANC-2324 'Branch: lives-somewhere-in-the-set'
+FIVE_GATE_REPOS='5dive-ai/5dive,lodar/5dive-api' \
+  run_done ANC-2324 --result='landed somewhere'
+eval "$attr_impl"
+slug=$(db "SELECT COALESCE(policy,'') FROM policy_refusals WHERE ident='ANC-2324' ORDER BY rowid DESC LIMIT 1;")
+# ANCHORED on the exact clause, not bare substrings (DIVE-2324, per main's review of
+# T5c's same class of gap): pin the sentence that names the unreachable repo so the
+# assertion cannot pass for a reason unrelated to the note actually being emitted.
+[[ $RC -ne 0 && "$slug" == "done-ident-not-found-within-scan-bound" \
+   && "$OUT" == *"5dive-ai/5dive:3 COMMITS WALKED"* \
+   && "$OUT" == *"Additionally, lodar/5dive-api never answered at all (unreachable, not merely bounded)"* ]] \
+  && ok_t 'DIVE-2324: a bound-hit refusal also names an unreachable sibling in the same set' \
+  || bad_t 'bound refusal must not hide a sibling scan gap' "rc=$RC slug=[$slug] out=$OUT"
+
 # --- DIVE-2120: AN INCIDENTAL MENTION IS NOT A DELIVERY -------------------------
 # Searching main widened the attribution set: every commit reachable from a branch tip
 # is on main, but not every commit on main is reachable from that tip — so a

@@ -226,7 +226,7 @@ Org chart (who reports to whom):
   # full surface: 5dive org --help
 
 Heartbeat (wake an agent only when it has queued tasks, one per tick):
-  5dive heartbeat on  <name> [--every=<dur>] [--no-fresh]   # enrol (default 30m, /clear before each task)
+  5dive heartbeat on  <name> [--every=<dur>] [--fresh]      # enrol (default 30m, fresh off: no /clear between tasks)
   5dive heartbeat off <name>
   5dive heartbeat ls                                        # enrolled agents + next-wake + queued count
   5dive heartbeat tick                                      # cron driver (root); wakes due agents that have work
@@ -262,6 +262,7 @@ Zero-human proof (publish your own badge — OSS-17):
 
 Delegated push (bring your own GitHub App — DIVE-1376):
   5dive push <id|DIVE-N> [--branch=<b>] [--dry-run]  # push ONLY the task's branch, ONLY after its gate clears; author enforced
+  5dive push <id|DIVE-N> --open-pr[=<base>]          # ...and open its pull request on the same root-side rail, as 5dive-bot (DIVE-2605)
   5dive deploy <id|DIVE-N> [--target=<project@ref>] [--env=production|preview] [--dry-run]
                                                      # INST-5: deploy ONLY the project@ref the task declares, ONLY after its gate clears
   5dive push setup                                   # scaffold + check the GitHub App credential (bring-your-own; root)
@@ -303,7 +304,17 @@ Health:
     two environments (tests/meta/selfcheck-union.sh) to prove no probe is
     skipped everywhere.
 
-  5dive doctor [--fix] [--dry-run] [--category=deps|types|auth|creds|registry|shelld|channels|host|memory]
+  5dive bug [--verb=<name>] [--exit=<code>] [--no-probes] [--file]
+    Preview (default) or file a diagnostic bug report against 5dive-ai/5dive.
+    Payload is a fixed ALLOWLIST — version, OS, bash version, install method,
+    the verb that failed + its exit code, and selfcheck probe name+verdict
+    pairs — never the free-text reason/detail fields underneath them. Bare
+    \`5dive bug\` only builds and prints the payload; NEVER auto-files. --file
+    re-prints the identical payload and then opens it (via \`5dive gh issue
+    create\`, so it lands as 5dive-bot); a TTY also gets an interactive y/N.
+    Agents take the same --file flag a human does — no separate unattended path.
+
+  5dive doctor [--fix] [--dry-run] [--category=deps|types|auth|creds|registry|shelld|channels|host|memory|policy|plugins]
     Walks deps (tmux/jq/bun/python3/nvm/node/npm), type bins, live auth
     probes, stale shadow-credential heal (creds), registry integrity, channel
     health (allowlist + dead inbound telegram poller), host safety (needrestart
@@ -350,8 +361,13 @@ main() {
   done
   set -- "${rest[@]+"${rest[@]}"}"
 
-  [[ $# -gt 0 ]] || { usage; exit "$E_USAGE"; }
+  [[ $# -gt 0 ]] || { usage; mark_reported; exit "$E_USAGE"; }
   local top="$1"; shift
+  # DIVE-2323: the one place that sees every dispatch, so fail()'s E_GENERIC
+  # hint can name the verb that broke. Set unconditionally, even for a $top
+  # the case below rejects — that path fails E_USAGE, which the hint never
+  # fires on, so an unvalidated verb string never actually reaches it.
+  CURRENT_VERB="$top"
   # Handle --version / -v / version before the dispatch table so it stays a
   # zero-dependency one-liner check (reviewers grep for it first).
   case "$top" in
@@ -453,9 +469,10 @@ main() {
         with_registry_lock cmd_hire "$@"
       fi ;;
     agent)
-      [[ $# -gt 0 ]] || { usage; exit "$E_USAGE"; }
+      [[ $# -gt 0 ]] || { usage; mark_reported; exit "$E_USAGE"; }
       local sub="$1"; shift
       case "$sub" in
+        -h|--help|help) usage ;;
         list)    cmd_list "$@" ;;
         info)    cmd_info "$@" ;;
         types)   cmd_types "$@" ;;
@@ -613,9 +630,10 @@ main() {
           AUDIT_CMD="agent skill"; AUDIT_ARGS=("$@")
           cmd_skill "$@" ;;     # add/list/rm operate on the agent type's skills dir
         auth)
-          [[ $# -gt 0 ]] || fail "$E_USAGE" "usage: 5dive agent auth status|login|set|start|poll|submit|cancel"
+          [[ $# -gt 0 ]] || fail "$E_USAGE" "usage: 5dive agent auth status|login|set|start|poll|submit|cancel|reap"
           local authcmd="$1"; shift
           case "$authcmd" in
+            -h|--help|help) usage ;;
             status) cmd_auth_status "$@" ;;
             poll)   cmd_auth_poll "$@" ;;
             login)
@@ -637,7 +655,7 @@ main() {
             reap)
               AUDIT_CMD="agent auth reap"; AUDIT_ARGS=("$@")
               cmd_auth_reap "$@" ;;
-            *) fail "$E_USAGE" "unknown auth command: $authcmd" ;;
+            *) fail "$E_USAGE" "unknown auth command: $authcmd (status|login|set|start|poll|submit|cancel|reap)" ;;
           esac ;;
         *)
           # `5dive agent <name> tui` — name-first form for terminal attach.
@@ -718,6 +736,19 @@ main() {
       # audited: it mutates nothing outside its own temp dirs (same posture as
       # doctor without --fix).
       cmd_selfcheck "$@" ;;
+    bug)
+      # DIVE-2323: diagnostic bug-report verb against 5dive-ai/5dive. Preview
+      # (the default) only builds and prints an allowlisted payload — no lock,
+      # no audit, nothing leaves the box. Only --file performs the network
+      # write (via `5dive gh issue create`), so that's the only arm audited,
+      # same gating style as doctor's --repair/--fix above.
+      for a in "$@"; do
+        if [[ "$a" == "--file" ]]; then
+          AUDIT_CMD="bug"; AUDIT_ARGS=("$@")
+          break
+        fi
+      done
+      cmd_bug "$@" ;;
     task)
       # Shared task queue (sqlite). Group-writable store, so no root/lock and
       # no audit — these are high-frequency, low-risk ops any agent runs. SQLite

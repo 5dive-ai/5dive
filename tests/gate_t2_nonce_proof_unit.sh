@@ -27,10 +27,10 @@
 . "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh" \
   || printf 'grading tree: UNRESOLVED (tests/lib/grading_tree.sh not reachable; no tree named)\n' >&2
 set -o pipefail
+trap 'rc=$?; rm -rf "${TMP:-}"; echo "HARNESS-RC=$rc"' EXIT   # DIVE-2573: fires on every exit path (incl. SKIP/precondition-fail early-exits); folds in tempdir cleanup so the two EXIT traps don't clobber each other.
 cd "$(dirname "$0")/.."
 SRC=src
 TMP="$(mktemp -d /tmp/gate-t2-nonce-proof.XXXXXX)"
-trap 'rm -rf "$TMP"' EXIT
 
 # STATE_DIR must be set BEFORE cmd_council.sh is sourced (COUNCIL_DIR/COUNCIL_LINEAGE are
 # source-time globals derived from it).
@@ -72,10 +72,27 @@ last_nonce() { cat "$NONCE_FILE" 2>/dev/null; }
 # isolated, so open it or every row is withheld and the audit assertions pass vacuously.
 _task_human_send_allowed() { return 0; }
 
-# Only `id -un` is stubbed. _gate_authenticated_actor, _gate_route_reviewer,
+# Only the CALLER IDENTITY is pinned. _gate_authenticated_actor, _gate_route_reviewer,
 # _task_resolve_coordinator and the whole _council_* chain run for real — THEY decide.
+#
+# DIVE-2601: the pin used to be an `id -un` stub, and the derivation has not read
+# `id` since DIVE-2330 (it resolves $EUID over a passwd stream in pure bash, so a
+# PATH shim cannot forge it). Measured over a full run of this file the stub took
+# ZERO calls — "the caller is agent-marcus" was decided by whoever ran the suite.
+# The passwd fixture is derived from FAKE_CALLER at call time so the flip to
+# agent-main further down keeps working, and it is PREPENDED to the real
+# /etc/passwd so every other uid on the box still resolves.
 FAKE_CALLER="agent-marcus"
-id() { if [[ "${1:-}" == -un ]]; then echo "$FAKE_CALLER"; else command id "$@"; fi; }
+_PIN_UID=987654
+_gate_caller_uid()    { printf '%s' "$_PIN_UID"; }
+_gate_passwd_stream() {
+  printf '%s:x:%s:%s::/nonexistent:/bin/false\n' "$FAKE_CALLER" "$_PIN_UID" "$_PIN_UID"
+  printf '%s\n' "$(</etc/passwd)"
+}
+# Assert the pin through the real resolver before any arm leans on it (DIVE-2588).
+_pin_check="$(_gate_uid_to_agent "$(_gate_caller_uid)")"
+[[ "$_pin_check" == "${FAKE_CALLER#agent-}" ]] \
+  || { printf 'NOT OK - identity pin is inert: uid %s resolved to %s, expected %s\n' "$_PIN_UID" "'$_pin_check'" "'${FAKE_CALLER#agent-}'"; exit 1; }
 
 # Org chart: marcus is the lead, dev reports to marcus.
 db "INSERT INTO agents_org (name, role, reports_to) VALUES ('marcus','coordinator',NULL);"
@@ -432,4 +449,5 @@ out=$(cmd_task_need DIVE-522 --type=decision --tier=2 --options="A|B" \
 
 printf '\n%s\n' "-----------------------------------------------"
 printf 'DIVE-2233 item 2 — tier-2 nonce: mint, emit, verify: %d passed, %d failed\n' "$PASS" "$FAIL"
-[[ $FAIL -eq 0 ]]
+rc=0; [[ $FAIL -eq 0 ]] || rc=1
+exit "$rc"

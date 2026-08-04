@@ -337,7 +337,7 @@ USAGE
 }
 
 cmd_heartbeat() {
-  [[ $# -gt 0 ]] || { _hb_usage; exit "$E_USAGE"; }
+  [[ $# -gt 0 ]] || { _hb_usage; mark_reported; exit "$E_USAGE"; }
   local sub="$1"; shift
   case "$sub" in
     on|enable)       with_registry_lock cmd_heartbeat_on "$@" ;;
@@ -1750,6 +1750,70 @@ _hb_gate_renag_batch() { # <recipient_agent> <comma-separated task ids> <route_l
   return 0
 }
 
+# DIVE-2587 — the AGENT RAIL for lead-routed re-nags.
+#
+# MEASURED, not inferred (prod board + /var/log/5dive-heartbeat.log, 2026-08-03):
+# every engineering approval that reached the human that day on the T1 lane was
+# ALREADY correctly routed. One row isolates it — a push-for-review approval
+# filed 09:20:21 with routed_reviewer=olivia, gate_pinged_at 09:40:02, and the
+# heartbeat log carries the matching `[gate-renag] delivered <row> via olivia`
+# line for that exact second. The ping came from THIS sweep, not from filing:
+# the file-time routed rail (_task_need_route_deliver) never touches Telegram at
+# all, it hands off over `5dive agent send`, and every gate it filed that day
+# still has gate_pinged_at NULL. Routing was never the defect.
+#
+# WHY MORE ROUTING CANNOT FIX IT: `_task_agent_channel olivia` resolves olivia's
+# PAIRED channel, and on this host every paired agent is paired to the SAME human
+# chat. "Send it to the lead" and "send it to the human" are the same Bot API
+# call with a different bot token. Routing decides who may CLEAR a gate; it has
+# never decided whose phone rings. This sweep predates the lead-route rail and
+# has no agent branch at all, so it converts a correctly routed gate back into a
+# human ping — with tap buttons, which is why the human then answers it and the
+# record reads `human:olivia` on a row nobody mis-routed.
+#
+# So an AGENT reviewer's re-nag goes over the agent rail, the same rail the
+# file-time handoff already uses. It falls back to the paired-human channel when
+# that rail cannot deliver, and the caller keeps the human channel for gates past
+# _HB_GATE_AGENT_RAIL_HOURS. That backstop is what makes this a QUIETING change
+# and not a SILENCING one: a lead-routed gate nobody clears still reaches a
+# person, just not inside the first day.
+#
+# Synchronous by choice, unlike the file-time rail's detached poll: the org-parent
+# escalation a few lines up already calls `cmd_send` synchronously in this same
+# sweep, there are at most a handful of reviewers per tick, and an rc we can
+# branch on is the whole basis of the fallback. An unobserved send here would
+# reproduce DIVE-2011 on a fresh rail.
+_hb_gate_renag_agent_rail() { # <reviewer> <ids> -> 0 delivered, 1 = caller must fall back
+  local reviewer="$1" idlist="$2"
+  [[ "${FIVEDIVE_GATE_RENAG_AGENT_RAIL:-1}" != "0" ]] || return 1
+  [[ -n "$reviewer" && "$idlist" =~ ^[0-9]+(,[0-9]+)*$ ]] || return 1
+  # Only an agent has a terminal to read this in. A reviewer who is not on the
+  # org chart is not one, and keeps the human channel.
+  [[ -n "$(db "SELECT name FROM agents_org WHERE name=$(sqlq "$reviewer");")" ]] || return 1
+  local text row
+  text="🔁 Gate reminder — gate(s) routed to you for review, still unanswered:"
+  while IFS= read -r row; do
+    [[ -n "$row" ]] || continue
+    text+=$'\n'"• ${row}"
+  done < <(db "SELECT '['||ident||'] '||COALESCE(need_type,'gate')||' — '||substr(replace(COALESCE(ask,''),x'0a',' '),1,240)
+               FROM tasks WHERE id IN (${idlist}) ORDER BY COALESCE(need_asked_at,updated_at,created_at),id;")
+  text+=$'\n\n'"Clear one with: 5dive task answer <ident> --value=\"<choice>\" — or re-file to escalate to the human."
+  local out="" rc=0
+  out=$(cmd_send "$reviewer" --message="$text" 2>&1) || rc=$?
+  if (( rc != 0 )); then
+    _hb_log "[gate-renag] agent rail to ${reviewer} FAILED rc=${rc} for rows ${idlist}; falling back to the paired channel: ${out//$'\n'/ }"
+    return 1
+  fi
+  # gate_pinged_at is the receipt AND the throttle (see _HB_GATE_RENAG_WHERE).
+  # Not stamping it here would re-send to the lead on EVERY tick.
+  db "UPDATE tasks SET gate_pinged_at=datetime('now')
+      WHERE id IN (${idlist}) AND need_type IS NOT NULL AND need_answered_at IS NULL;" 2>/dev/null || true
+  _task_gate_delivery_log ok "$idlist" "agent:${reviewer}" "" \
+    "gate re-nag delivered to ${reviewer} over the agent rail (no human channel send)" || true
+  _hb_log "[gate-renag] delivered ${idlist} via agent rail to ${reviewer}"
+  return 0
+}
+
 _hb_gate_renag_sweep() {
   [[ "${FIVEDIVE_GATE_RENAG:-1}" != "0" ]] || return 0
   local owner ids
@@ -1791,8 +1855,25 @@ _hb_gate_renag_sweep() {
   done < <(db "SELECT id||x'1f'||COALESCE(NULLIF(gate_filed_by,''),NULLIF(created_by,''),assignee,'')||x'1f'||COALESCE(routed_reviewer,'')
                FROM tasks WHERE ${_HB_GATE_RENAG_WHERE} AND tier=1
                ORDER BY COALESCE(need_asked_at,updated_at,created_at),id;")
+  # DIVE-2587: split each reviewer's batch by AGE. Fresh gates go over the agent
+  # rail (quiet, in-band, no human push); anything past the backstop window keeps
+  # the paired-human channel, because in-band nagging has demonstrably not worked
+  # by then. A rail that refuses or fails hands its rows straight back to the
+  # human batch — the failure direction is LOUD, never dropped.
+  local _rail_h _fresh _stale
+  _rail_h="${FIVEDIVE_GATE_RENAG_AGENT_RAIL_HOURS:-24}"
+  [[ "$_rail_h" =~ ^[0-9]+$ ]] || _rail_h=24
   for reviewer in "${!lead_ids[@]}"; do
-    _hb_gate_renag_batch "$reviewer" "${lead_ids[$reviewer]}" "org lead"
+    _fresh=$(db "SELECT id FROM tasks WHERE id IN (${lead_ids[$reviewer]})
+                 AND COALESCE(need_asked_at,updated_at,created_at) > datetime('now','-${_rail_h} hours')
+                 ORDER BY id;" | paste -sd, -)
+    _stale=$(db "SELECT id FROM tasks WHERE id IN (${lead_ids[$reviewer]})
+                 AND COALESCE(need_asked_at,updated_at,created_at) <= datetime('now','-${_rail_h} hours')
+                 ORDER BY id;" | paste -sd, -)
+    if [[ -n "$_fresh" ]] && ! _hb_gate_renag_agent_rail "$reviewer" "$_fresh"; then
+      _stale="${_stale:+${_stale},}${_fresh}"
+    fi
+    [[ -n "$_stale" ]] && _hb_gate_renag_batch "$reviewer" "$_stale" "org lead"
   done
   return 0
 }
@@ -1906,6 +1987,18 @@ _hb_gate_shipped_sweep() {
     [[ -n "$grow" ]] || continue
     IFS=$'\x1f' read -r gid gident gtype gowner <<<"$grow"
     [[ -n "$gid" && -n "$gident" ]] || continue
+    # DIVE-2068: type=secret is satisfied ONLY by a human handing over a
+    # credential — that event cannot appear in a commit or a merged PR, ever.
+    # So for this type a commit/PR hit carries ZERO information and "likely
+    # shipped, verify and close" would be a false positive 100% of the time.
+    # Skip both evidence paths below (subject-PR and row-commit) up front;
+    # decision/approval/manual are unaffected — a commit genuinely can be
+    # evidence for those.
+    if [[ "$gtype" == "secret" ]]; then
+      _hb_log "[gate-shipped] ${gident} — type=secret: a commit/PR can never be evidence a credential was handed over (DIVE-2068); NOT flagging, gate stays eligible"
+      _task_store_audit_log "gate shipped-flag" "skip" 0 -- "task=$gident" "reason=type-secret" || true
+      continue
+    fi
     # DIVE-2414: READ WHAT THE GATE IS ABOUT BEFORE READING THE ROW.
     # The commit-stream lookup below is row-level evidence: it answers "did
     # something naming this ROW land", which on a multi-item row is routinely a

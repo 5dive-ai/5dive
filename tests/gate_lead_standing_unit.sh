@@ -93,6 +93,18 @@ _gate_passwd_stream() {
   printf '%s:x:%s:%s::/nonexistent:/bin/false\n' "$(id -un)" "$_PIN_UID" "$_PIN_UID"
   printf '%s\n' "$(</etc/passwd)"
 }
+# ASSERT THE PIN THROUGH THE REAL RESOLVER (DIVE-2601 iteration 4). Every arm below
+# leans on the caller being agent-marcus, and the two overrides above are the only
+# thing making that true; if either stops being read the resolver yields '', which is
+# indistinguishable from a legitimately non-agent caller. S8b in particular asserts
+# that an EMPTY identity grants nothing — it would pass for exactly the wrong reason
+# on a dead pin, and the arms that need marcus would fail somewhere obscure instead.
+# This file was the corpus instance of the rule-(2) hole: it satisfied
+# identity_stub_guard_unit's "asserts the pin" predicate out of a TRAILING COMMENT on
+# line 359 and made no such call anywhere. Resolve it once, loudly, before any arm.
+_pin_check="$(_gate_uid_to_agent "$(_gate_caller_uid)")"
+[[ "$_pin_check" == "marcus" ]] \
+  || { printf 'NOT OK - identity pin is inert: uid %s resolved to agent %s, expected marcus (is the actor lib in the source list?)\n' "$_PIN_UID" "'$_pin_check'"; exit 1; }
 
 
 # Org chart: marcus is the coordinator (the org lead), dev reports to marcus.

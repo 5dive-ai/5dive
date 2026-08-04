@@ -278,7 +278,7 @@ _published_cli_probe() {
   # vMAJOR.MINOR.PATCH release tag, so an rc or a `nightly` can never become the
   # thing we advertise — same filter install.sh applies before installing one.
   [[ -n "$tags" ]] && ref=$(printf '%s\n' "$tags" \
-    | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1)
+    | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1) || ref=""
   if [[ -z "$ref" ]]; then
     _pcp_out unavailable "" "no release tag resolves — the installer could not upgrade this box either"
     return 0
@@ -368,7 +368,7 @@ cmd_update_check() {
   local last_ok_json="null" last_at_json="null" last_epoch=""
   if [[ -r "$log" ]]; then
     local start_line
-    start_line=$(grep -n "soft updates start" "$log" | tail -1 | cut -d: -f1)
+    start_line=$(grep -n "soft updates start" "$log" | tail -1 | cut -d: -f1) || start_line=""
     if [[ -n "$start_line" ]]; then
       if tail -n "+${start_line}" "$log" | grep -q "CLI upgrade via install.5dive.com failed"; then
         last_ok_json="false"
@@ -378,7 +378,7 @@ cmd_update_check() {
     fi
     local last_at
     last_at=$(grep -oE "[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:+-]+ soft updates done" "$log" \
-      | tail -1 | grep -oE "^[^ ]+")
+      | tail -1 | grep -oE "^[^ ]+") || last_at=""
     if [[ -n "$last_at" ]]; then
       last_at_json="\"$last_at\""
       last_epoch=$(date -d "$last_at" +%s 2>/dev/null || echo "")

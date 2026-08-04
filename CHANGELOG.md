@@ -1,5 +1,598 @@
 # Changelog
 
+## Unreleased — fix(cli): 38 unguarded `$( )` probes that killed the caller on the QUIET path (DIVE-2604)
+
+The class that shipped three times in one day — DIVE-2566 (`5dive push`, `curl -f` rc=22),
+DIVE-2603 (`5dive task done`, rc=1 with **zero bytes on both streams**), DIVE-2598 (the
+report of the second) — swept across the whole tree instead of patched instance by instance.
+
+The bundle runs under `set -euo pipefail`. A bare `var=$(… grep …)` therefore **kills the
+caller** when the probe finds nothing: `grep` exits 1, `pipefail` promotes it out of the
+pipeline, and a bare assignment has no `||` to absorb it. The die happens *before* the
+handler that would have explained it, so the caller gets a bare exit code with no reason
+attached — and a caller that reads only output sees success.
+
+`grep -c .` is the nastiest member: on empty input it **prints `0` and exits `1`**. The
+value it computes is correct and the command still kills the caller, so a reader checking
+"does it produce the right number" finds nothing wrong.
+
+**Every one of these is a probe that is ALLOWED to find nothing** — an objective with no
+readings, a task citing no PRs, a `.env` without the key, a selfcheck naming no wired count,
+a supervisor line naming no ident, a memory pack with no leaks. Empty is the *ordinary*
+case, which is why the class fires on the quiet path and why nobody writes a test for it.
+
+**38 distinct sites guarded** — 35 in `src/*.sh` (concatenated under `src/header.sh` into
+the bundle) and 3 in `tests/` harnesses that themselves run under `set -euo pipefail`. Five
+were named in the ticket; the sweep found the other 33. The diff carries **40 guard lines for
+those 38 sites**: `src/cmd_council.sh` is GENERATED from `src/council/cmd_council.template.sh`
+by `src/council/gen_cmd.mjs`, so the 2 council sites are guarded in the generator source *and*
+in its derived artifact — a regen from an unguarded template would silently revert the fix.
+The scanner classifies the template as `src/` for that same reason, so its `src/` population is
+**37 lines over 35 distinct sites**: an instrument has to read the file that regenerates
+the tree, even though counting both copies as members would double-count one class member. The ones
+where the guard makes an unreachable handler reachable are the interesting ones:
+`cmd_auth`'s "opencode has no model X — close matches: …" `fail` never printed when there
+were no close matches; `cmd_selfupdate`'s "no release tag resolves" branch was unreachable
+whenever tags existed but none was a plain release tag; `cmd_agent_runtime`'s
+`${reset:-no reset time shown}` fallback could not run. The remedy is `|| var=""` (or `|| var=0` for
+a counter), **not** `|| true`: the empty/zero assignment states the post-condition the code
+below actually reads, where `|| true` leaves the value to the substitution's behaviour and
+reads as noise-suppression to the next person. And **not** `local var=$(…)`, which returns 0
+unconditionally and so trades a loud death for a silent wrong value.
+
+Two of the 38 were previously unreported and neither was in the ticket:
+
+- `_pack_memory_leakscan` (`cmd_pack.sh`) ended `… | grep -vE "$exempt" | awk | sort` inside
+  the substitution, so **a pack with no leaks at all** made the whole subshell exit 1. Latent
+  rather than live: both callers invoke it as `! _pack_memory_leakscan …`, which suppresses
+  `set -e` — one refactor away from taking down `5dive pack export` on its success path.
+- `_agents_md_fence` (`cmd_pack.sh`) died on any memory file containing no `~~~` fence.
+
+**The guard is a scanner, not another guard.** Two fixes in one release did not make the
+third unguarded substitution less likely, because writing `var=$(…)` is normal.
+`scripts/unguarded-probe-scan.sh` walks `src/` and `scripts/` with real paren/quote tracking
+(it must know where a `$( )` ends and whether a `||` sits at the probe's own group level),
+and fails on any bare assignment whose substitution contains a probe — `grep`/`rg`/`jq -e`/
+`curl -f` — with no fallback. shellcheck 0.9 cannot express this and no general checker can:
+whether a non-zero exit is a defect depends on whether the probe is *allowed* to find
+nothing, which is a fact about intent, so the scanner encodes that intent as a command list.
+
+`tests/unguarded_probe_substitution_unit.sh` (42 arms, 5.9s measured on the control plane,
+core tier) grades it by
+**running** the shapes rather than grepping for guards: each of four shapes under the real
+flags with a positive control, the remedy's post-condition, the scanner against synthetic
+bad/good input, and — the load-bearing arm — a **mutation** pass that strips the guard off
+each of twelve fixed sites in a copy of the tree and requires the scanner to name that exact
+`file:line` back. `tests/` is held to the same gate at **zero**.
+
+**Two of the 38 were caught by this branch's own scanner, in code that merged the same night
+the sweep was written** — the strongest evidence available that the instrument, not the
+per-line fix, is the deliverable. Rebasing onto `main` turned the scan red:
+
+- `src/cmd_push.sh` (DIVE-2605) — the `--open-pr` *already exists* path. Its pipeline ends in
+  `head`, which exits 0; `pipefail` promotes `grep`'s 1 out of the **middle**. A `gh` message
+  carrying no PR URL therefore killed the caller, and the `ok()` line written to explain that
+  exact situation never printed. The class does not require the pipeline to END in a probe.
+- `tests/create_channel_list_guards_unit.sh` (DIVE-2381) — the sharpest instance yet. The very
+  next line is `[[ -n "$start" ]] || { echo "FAIL: anchor not found …"; exit 1; }`. That
+  handler, written deliberately for the anchor-missing case, **could not run**: the test died
+  at `rc=1` with no output instead of saying "re-anchor this test, do not delete it".
+
+Both were confirmed fatal by *running* the shape with a positive control, not by reading it.
+
+**The scanner's own three bugs are the transferable part**, because every one of them
+reported the tree CLEAN:
+
+1. A here-**string** in a *comment* (`# <<< DIVE-2287 …`) matched a `<<WORD` heredoc regex
+   at the second `<`, terminator `DIVE`, and the rest of that file was skipped.
+2. `'\''` — a backslash-escaped quote outside quotes — flipped the quote state and lost a
+   real offender inside a `sed` script.
+3. The scanner was anchored at **line start** and so could not see `local n; n=$(… | grep …)`,
+   the recommended split-declaration habit written compactly. **Six live sites wore exactly
+   that form.** Keying a sweep on the shape of the instance you already found is how a class
+   survives its own sweep — the same error the ticket was filed to correct, repeated one
+   level up, in the tool written to prevent it.
+
+A fourth was a false-positive engine rather than a blind spot, and it is the one that
+changed the shape of the deliverable: **the class needs `set -e`.** Without it a failed
+assignment just leaves an empty value and execution continues. 16 of 83 files under
+`scripts/`, and **282 of 303 under `tests/`**, run `set -uo pipefail` with **no `-e`** — so
+the first honest-looking measurement of `tests/` said **128 instances** when the real number
+was **2**. A debt ceiling pinned at 128 would have enshrined 126 non-defects as work owed.
+`src/*.sh` are the exception and must not be judged on their own text: they carry no `set`
+line at all because `build.sh` concatenates them under `src/header.sh`. The harness grades
+that discriminator in **both** directions, plus the `src/` exception.
+## Unreleased — feat(push,task): a builder opens its own PR and satisfies its own merge gate (DIVE-2605)
+
+Every builder's work funnelled through one agent for two steps that carry no judgement:
+opening the pull request, and running `task done` on a merge-gated row. Five proxied
+closes landed on 2026-08-03 (DIVE-2068, 1953, 2179, 1986, 2165), all of them work that
+was already finished and already verified, waiting on a credential.
+
+**The rail was already built.** DIVE-2448 shipped `_gh_do`, a root-only helper that reads
+the machine account's PAT root-side and execs `gh` with it. Nothing routed either step
+onto it. Measured 2026-08-04 **from agent-dev2's own uid**, which is the only uid the
+answer is true of — agent-dev is `NOPASSWD: ALL` and resolves a token, so probing from
+there answers a different question:
+
+| probe, as agent-dev2 | result |
+|---|---|
+| `gh auth token` | empty |
+| `sudo -n -u claude gh auth token` (the gate's last resort) | `sudo: a password is required` |
+| `sudo -n -l /usr/local/bin/5dive _gh_do` | permitted |
+| that rail, `api user` | `5dive-bot` |
+| that rail, `pr view 430 --json state,mergedAt` | real state |
+
+A standard-isolation builder's sudoers is `ALL=(root) NOPASSWD: /usr/local/bin/5dive *`
+— one binary as root and **nothing** as `claude`. DIVE-2318 already named that cause and
+made the refusal honest; this makes it rare.
+
+- **`5dive push --open-pr[=<base>]`** (plus `--pr-title=`, `--pr-body-file=`, `--pr-draft`)
+  opens the PR through the same root-side executor that just pushed the branch. The body
+  travels NUL-separated **over stdin**, so a multi-paragraph PR body never lands in the
+  process table — strictly better than the `gh pr create --body "$(cat f)"` a human types.
+  It runs **after** the push and is never fatal to it: the push is the irreversible half,
+  and a red exit there invites a re-push for a step anyone can redo by hand.
+- **The merge gate asks whether GitHub is REACHABLE, not whether a token resolved.** Those
+  were the same question until a second rail existed. All nine `gh` call sites go through
+  one `_gate_gh` helper that takes the token rail when a token resolves and the bot rail
+  when it does not. Each site's **own** wall-clock bound is carried rather than flattened
+  to one number — the autodetect scan's 5s is load-bearing because that path is fail-open.
+
+**The remainder, measured rather than left to be discovered.** The bot rail closes this for
+**9 of the 11 repos the merge gate knows about**; `lodar/5dive-blog` and `lodar/5dive-mobile`
+return 404 to the machine account, so a token-less maker still cannot verify a merge there
+and the gate still refuses. That is unchanged behaviour for those two, not a new hole —
+but it is the reason this is "rare", not "gone", and it is the same App-installation gap
+DIVE-2033 tracks on lodar's personal account.
+
+**No credential moves and no agent gains one.** The rail is read-only for the gate,
+`_gh_do` re-derives its own routing class as root and refuses admin, and the bot arm is
+tried only after every caller-credential arm comes back empty — so no close that resolves
+a token today changes path at all. Where the bot cannot see a repo the query still yields
+empty, which is the same unverified verdict a builder gets now: this can add answers,
+never subtract one.
+
+`--open-pr` also treats **"a pull request already exists" as the desired end state**, not a
+failure: re-running a push after a second commit hits that every time, and the first cut
+reported it as failed and then advised the exact command that had just refused.
+
+`tests/builder_gh_rail_unit.sh` (16 arms, **1.1s measured on the control-plane host**,
+core tier) pins it, including the positive control that no-token-and-no-grant still refuses.
+Mutation-graded: reverting the reachability predicate, forcing the token rail, flattening
+the timeouts, moving the PR body into argv, and widening the already-exists arm into a
+blanket swallow each red exactly the arm that names them.
+
+## Unreleased — feat(gate): a gate now records WHY it has the tier it has (DIVE-2615)
+
+lodar was interrupted three times in ten minutes on 2026-08-03 by gates that were not
+his to answer. The first question anyone asks about that — *how many of these did the
+tier-2 floor over-fire on?* — turned out to be unanswerable from the store.
+
+`gate_history.floor_provenance` existed on the live box and was **NULL on all 79 rows**:
+a column with no writer, no migration and no reference anywhere in `src/` or `tests/`.
+Every input to the tier decision is computed in `cmd_task_need` and then thrown away, so
+the split had to be reconstructed by building a bundle, stripping its `main` call,
+sourcing it, and re-running the CLI's own predicates over asks read back out of the
+store. **Two attempts at that were void** — one built from a dirty feature branch that
+contained no DIVE-2629, one ran the bare per-field predicate instead of
+`_gate_floor_axis`, which is what the filing path actually calls.
+
+The tier decision is now written on the **same statement that writes the tier**, in six
+values that each name whose decision it was:
+
+| value | who decided |
+|---|---|
+| `axis=pinned` | the FILER passed `--tier=2`; the floor was never consulted |
+| `axis=type-default` | manual/secret/access — 2 is the type's default and nobody chose |
+| `axis=secret-type` | filed below tier 2 and forced up by its type |
+| `axis=ask` | the floor fired on the ask |
+| `axis=title` | term in the title only — **not** floored, routed to the lead (DIVE-2224) |
+| `axis=title-fallback` | floored on the title because the ask states nothing of its own |
+| `axis=none` | the floor ran and did not fire |
+
+plus `;term=<t>` wherever a term is what fired, so *"floored on `publish`"* is a stored
+fact rather than something a reader re-derives with a regex.
+
+**`NULL` and `axis=none` are deliberately different facts.** NULL means this build never
+recorded it; `axis=none` means the floor ran and found nothing. An empty cell meaning
+both is precisely what made the pre-existing column measure nothing, so a writer that
+emitted NULL on a clean gate would have reproduced the defect while looking like a fix.
+
+`pinned` vs `type-default` reads `tier_arg`, not `tier`: by that line the type default
+has already been applied and the effective tier cannot tell a filer's choice from a
+type's default — the same distinction DIVE-1182 captured `tier_arg` for, two lines up.
+
+Schema is additive on both tables, declared in the fresh-store CREATE **and** in the
+migration: a fresh box never runs the migration, and the create-if-absent block never
+reaches a `gate_history` that already exists, so either one alone leaves a live box
+without the column.
+
+`tests/gate_floor_provenance_unit.sh` — 19 arms. Two were written asserting the wrong
+thing and the harness said so: a plain `secret` gate is a *type-default*, not a
+type-floor (the default lands before the floor block), and a migration fixture holding
+only `gate_history` takes the fresh-create path, so it proved nothing until it carried a
+`tasks` table.
+
+## Unreleased — fix(gate): the tier-2 destructive floor graded the BRANCH NAME in a push-for-review ask (DIVE-2629)
+
+`approve delegated push for review of branch dive-2613-teardown-outcomes-hetzner-only`
+filed as a **tier-2 human-only** gate. Delete the single word `teardown` from that
+branch name and the identical ask filed tier-1. Graft it onto an unrelated branch and
+that one floored too.
+
+The floor exists to catch **destructive actions**. The action here is "push a feature
+branch to a remote for review" — no merge, no prod touch, reversible, destroys nothing.
+What was destructive-sounding is the **subject of the code on the branch**. The floor was
+reading what the work is *about* and grading it as what the gate *does*, so the better a
+branch name described the work, the likelier it floored: the naming convention we want is
+the one that tripped it.
+
+**Why that was a ratchet, not one extra tap.** A tier-2 approval is filed with no
+`routed_reviewer`, and `cmd_task_answer`'s designated-reviewer exception requires
+`actor == routed_reviewer`. Once floored, **no agent could ever clear it** — not the filer,
+not their lead, not the org coordinator — and no agent action handed it back. DIVE-2613 was
+one of six engineering gates that reached the paired human on 2026-08-03, and dev2 stayed
+blocked behind it.
+
+The fix **scopes the match, not the verdict**: when — and only when — the text is recognised
+as an *inert* push-for-review, the git branch identifier is removed before the floor reads
+it. A branch name is a label, never a statement of the action a gate authorises. Everything
+else in the ask is still read unchanged, so a push ask that **also** names a spend, a secret,
+a publish or a customer email still floors on its own prose.
+
+Three narrowings, all biased toward keeping the floor on:
+
+- **Not the whole eng-ship class.** `merge`, `deploy`, roll-to-fleet and push-to-`main` touch
+  prod and keep flooring on their subject matter.
+- **Only branch-*shaped* tokens are redacted** — a slash (`feat/x`), a ticket prefix
+  (`dive-2613-…`), or two-plus hyphens. Hyphenated prose like `auto-teardown` is a word, not
+  a ref, and still floors.
+- **Applied at the single match site**, so the filing floor, the approval/manual routing arm
+  and `cmd_goal`'s low-risk check all inherit the same verdict from the same inputs.
+
+`tests/gate_floor_branch_name_unit.sh` (33 arms) grades both directions, and four mutations
+are documented in its header — removing the redaction, dropping the not-inert guard, widening
+the slug shape to any hyphen, and un-mirroring the reporter each redden a named arm.
+
+## Unreleased — fix(cli): a non-zero exit now always carries a reason (DIVE-2598)
+
+`5dive task done DIVE-XXXX --result="plain text no refs"` exited **1** with zero bytes on
+stdout *and* stderr, and left the row open. Nothing printed, nothing logged to the caller.
+A caller that pipes to `head` and reads `$?` sees a number with no message attached to it;
+one that reads only output sees success. It took a `bash -x` of the installed binary to
+find, which is the tell: the product itself said nothing.
+
+The line was an unguarded `_br_cands=$(_gate_branch_refs_from_text ...)`. That pipeline ends
+in `grep`, which exits 1 when it matches nothing — the normal case, since most results name
+no branch. `pipefail` promotes it, and under `set -euo pipefail` a bare `var=$(...)` takes
+the whole process down **before any handler runs**. DIVE-2603 guarded that line. DIVE-2566
+was the same shape in `5dive push` one file over, in the same release.
+
+Two per-line guards do not make the third unguarded substitution less likely, so this
+release adds the missing **property** rather than a third guard: whatever kills the CLI, the
+exit says something.
+
+- `fail()` — which every reported error funnels through, `policy_refuse()` included — now
+  marks the exit **reported**, after it prints.
+- The `EXIT` trap reports anything else: verb, code, that the command did **not** run to
+  completion so its effect is unknown, how to locate it (`bash -x $(command -v 5dive) …`),
+  and `5dive bug`. Under `--json` it emits a real `{ok:false,error:{…}}` envelope, because
+  an empty stdout is worse for a parser than for a person.
+- The marker is a **file**, not a variable: `fail()` runs inside command substitutions and
+  `flock` subshells whose writes the exiting parent cannot see. Getting this wrong would
+  print two messages for every subshell error — the real one, and a backstop claiming there
+  wasn't one.
+- Signals (130/143) are not unreported failures and stay quiet.
+- **A verb's own cleanup no longer unseats it.** `trap … EXIT` **replaces**; it does not
+  stack. `watch` and `supervisor --watch` each installed their alt-screen teardown that
+  way, silently discarding `trap on_exit_audit EXIT` for the rest of the process — so
+  inside those two verbs there was no backstop *and* no audit record. Cleanup now
+  registers with `push_exit_handler`, which the one process-wide trap runs LIFO **before**
+  the report, so a teardown restores the terminal and the diagnostic lands somewhere
+  readable. Measured on a built bundle: an induced death in `watch` printed **476 bytes**
+  naming the verb; the same death with the old trap printed **18** (terminal-reset escapes
+  only).
+
+`tests/silent_nonzero_exit_backstop_unit.sh` grades it against a real induced death in a
+real built bundle, with the same run against a backstop-neutered mutant of that bundle as
+the differential — so the arm cannot pass by grading a death that no longer happens. It
+also censuses the bundle's `trap … EXIT` population, because the line that switched the
+property off contains no `exit` and no census of exit *sites* could ever see it.
+
+## Unreleased — fix(init): the `codex` recipe asked nvm which node it SELECTED, not npm where it INSTALLED (DIVE-2596)
+
+`sudo 5dive agent create --type=codex` aborted with
+
+```
+error: codex install reported success but /home/claude/.local/bin/codex still missing — investigate manually
+```
+
+on a host where codex works fine. The message is a true statement about the wrong object:
+codex was installed. The **locator** was wrong.
+
+The recipe aimed the `~/.local/bin/codex` symlink at `` `dirname $(nvm which 24)` `` and the
+comment above it asserted that this equals `` `npm prefix -g`/bin ``, "so the symlink is
+guaranteed to point at the codex we just installed". It is not, and it is not. They answer
+two different questions:
+
+| | question | value on the 5dive host |
+|---|---|---|
+| `nvm which 24` | which node did nvm **select**? (an intent) | `…/v24.19.0/bin/node` |
+| `npm prefix -g` | which node is **running npm**? (the outcome) | `…/v24.18.0` |
+
+They diverge because `~/.local/bin` precedes nvm's bin dir on `PATH` and holds a `node`
+symlink — planted by the **openclaw** recipe, pinned at whatever `nvm which 24` meant the
+day openclaw was last installed. npm is a `#!/usr/bin/env node` script, so nvm's npm is
+**executed by that pinned node**, and `npm prefix -g` (derived from `process.execPath`)
+reports the pinned node's prefix — which is where `npm install -g` then puts the binary.
+`nvm use` cannot correct this: it edits `PATH`, and the shadow is *earlier* on `PATH`.
+
+Compounding it, `nvm install 24` resolves `24` against the **remote**, so it downloads a
+brand-new v24 whenever upstream cuts one — measured, it pulled `v24.19.0` onto a host that
+already had `v24.18.1`. That is what moves `nvm which 24` out from under a box nobody
+touched, and it is why the `-x` short-circuit stays first: an already-installed codex must
+not drag a node download onto every create.
+
+The symlink now targets `` `$(npm prefix -g)/bin/codex` ``, which is immune by construction —
+the same npm process answers the locator query and performs the install, so target and
+outcome cannot disagree. Mirrors the openclaw recipe, which already derives its target this
+way. The recipe also now asserts the link resolves (`-x`) before reporting success, so a
+dangling link fails with an honest rc instead of being re-diagnosed downstream as a missing
+binary.
+
+Graded in `tests/codex_install_node24_unit.sh` (folded in there rather than shipped as a
+218th harness file — the core tier is over its 300s cap and the budget guard's first
+preference is to merge by subject). The behavioural arm runs the **real** recipe in a mount
+namespace where the two locators disagree, and runs the **pre-fix** locator through the same
+rig as a red anchor: it dangles *at rc=0*, which is the "reported success" half.
+
+The rig **builds** the recipe's hardcoded `/home/claude` inside the namespace (tmpfs over
+`/home`, then `mkdir`) rather than borrowing the host's. The first cut bind-mounted straight
+onto `/home/claude/.nvm` and `/home/claude/.local/bin` — the right addresses, since they are
+what the recipe reads, but they exist only on a 5dive host. On a GitHub runner home is
+`/home/runner`, both mounts failed with *mount point does not exist*, and the driver — `set -u`
+with no `-e` — graded an unrigged namespace and returned `VERDICT=absent rc=1` from both arms.
+Deriving the mount point from `$HOME` does not fix that: the literal `/home/claude` is in the
+**recipe under test**, so a rig at `/home/runner` is just as unrigged, only quieter. The path
+has to be created, not relocated — which also removes the host-dependence that let this pass
+locally and only locally. Everything is namespace-local (unshare defaults to private
+propagation); a host that has `/home/claude` gets it shadowed, never touched.
+
+Two guards keep the arm honest rather than merely working. The driver **refuses** — printing
+nothing verdict-shaped — if any rig step fails, so a rig that did not build can no longer
+emit a string shaped exactly like a measurement; and the environment guard now grades *the
+rig it needs* (build one, check it reports `RIGOK`) instead of the proxy question "is
+`unshare` permitted", which answers **yes** on a runner and was why the unrigged run got
+through. Where no launcher can build the rig the arm skips loudly, naming each candidate's
+failure. Both guards are themselves graded: breaking a rig on purpose asserts the refusal
+fires, names the failed step, and leaks no `VERDICT`.
+
+## Unreleased — fix(ci): a wall-clock budget red that flipped on a re-run of the same commit (DIVE-2592)
+
+PR #395 — one line of code and two test arms — failed CI on `exit 4` with zero assertion
+failures. The decisive measurement is a re-run of the IDENTICAL head, no rebase:
+356s (118% of the 300s core budget) then 289s (96%). A 67s swing with nothing changed, and
+all of it inside one harness: `tests/baseline_pin_unit.sh`, 57.5s on main and 174.1s on that
+attempt, because it resolves pinned baseline COMMITS against the remote and is therefore
+priced by the network rather than by its assertions.
+
+The cap is not the defect and it has **not** been raised — 300 to 450 buys three weeks and
+re-installs the ratchet DIVE-2525 exists to remove. The COMPARISON was the defect: one noisy
+sample against a hard threshold, on a base with no headroom left (52% to 80% to 96% as the
+corpus grew), reds PRs at random on content they did not change.
+
+- **A budget red now confirms itself.** Over budget, `scripts/run-harnesses.sh` re-times the
+  3 slowest harnesses and keeps the SMALLER sample per file — noise is one-sided (contention
+  and a slow remote only ADD time), so the low sample is the least contaminated estimate,
+  while real corpus growth appears in BOTH samples and survives. Paid only on the red path;
+  a green run re-times nothing. `--confirm-top=0` disables it, which can only make the gate
+  STRICTER, and an arm pins that no CI job passes it.
+- **A budget red now says it is one.** `exit 4` beside a green assertion count read as
+  systemic to the PR author and as flake to the next reader; it is neither. The message
+  states that no test failed, whether the number was measured twice, and the SMALLEST set of
+  harnesses that covers the overage — the actionable set, not the top-10 leaderboard.
+- **`tests/baseline_pin_unit.sh` is demoted to the nightly tier**, with the measurement and
+  the cost of the demotion in its header. The decision rests on **57.5s — the CI reading on
+  main**, the ordinary case charged to every PR, which is 19% of the whole core budget on its
+  own; 174.1s is the tail and shows the spread, not the cost; 2.4s on the control plane is
+  the control that rules out "expensive file" in favour of "environment-priced file", which
+  is the difference between merge-or-retire and *a wall-clock cap is the wrong instrument*.
+- **HELD BACK, not dropped:** the matching `budget-report` change — printing the nightly
+  total in the units of the policy dial, i.e. the minimum number of shards the corpus now
+  needs beside the number configured — edits `.github/workflows/full-sweep.yml`, and
+  `5dive push` cannot ship a workflow file: GitHub withholds the `workflows` scope from
+  Apps on purpose, because a credential that can rewrite CI can rewrite what CI requires
+  of it (DIVE-2229/2262, Marcus). It is not in this branch. The nightly tier is at 126% of
+  its per-job budget un-sharded (DIVE-1986), so that half is still owed and needs the
+  `5dive-bot` machine account (DIVE-2232 option A) or a one-off human push.
+
+## Unreleased — SECURITY fix(gate): a tier-2 human floor whose OFF switch was reachable by the agents it constrains (DIVE-2588)
+
+Any agent, unprivileged and without sudo, could forge a human tap on a tier-2 **decision**
+gate with one environment variable:
+
+```
+GATE_PROOF_ENFORCE=/nonexistent/nope  5dive task answer <T2-decision> --value=A --human
+```
+
+succeeded where the identical command without it was refused, and wrote
+`need_answered_by=human:<agent>` — the same row the human's own relayed tap writes, so the
+record could not tell them apart. Found by main while grading DIVE-2515 on the released
+v0.18.2 artifact; reproduced on the installed 0.18.0+dive2563 in an isolated store.
+`_gate_proof_enforced` was a file-**existence** test on a path the constrained party
+supplies, so pointing it at anything absent evaluated the whole tier-2 branch false. Scope
+was exactly `decision`: approval/secret/manual/access carry an independent type guard that
+never consults the flag.
+
+Two independent halves, because either alone would have closed the reported command while
+leaving the shape intact:
+
+- **The override may only make enforcement stricter.** An existing sentinel at *either* the
+  root-owned default or the `GATE_PROOF_ENFORCE` path arms it; an absent path now says
+  nothing at all instead of saying "off". Harnesses keep the override they already use —
+  every caller in `tests/` points it at `$STATE_DIR/gate-proof.enforce`, the default it
+  would have resolved anyway.
+- **The tier-2 human floor no longer consults the flag**, in either direction. It was a
+  rollout envelope for a rollout that finished 2026-07-30, and while it stood it made a hard
+  human floor switchable. Safe to make unconditional: the provenance floor refuses only a
+  *non-human* answer on a tier-2 gate, and the evidence block is already scoped to gates
+  carrying a minted nonce — so a box that mints nothing reaches no new assertion, and every
+  real human path passes `--human` (DIVE-525 holds by construction).
+
+Behaviour change worth naming, and its bound: on a box where the sentinel was never armed,
+tier-2 gates now behave as they already do everywhere else. That population is small by
+construction — `install.sh` arms enforcement on every box, fresh install and upgrade alike
+(DIVE-758, "secure-by-default"), so an unarmed box is one where that line failed (it is
+`|| true`) or one that predates it. Both now match the fleet, which is the direction that
+cannot refuse a tap the rest of the fleet accepts. `gate-proof enforce off` no longer leaves
+the default sentinel behind — it used to print OFF while the predicate read ON — and `status`
+now reports which sentinel armed it (`default` / `env-override` / `both`).
+
+New: `5dive selfcheck --only=t2-forge` performs the forge for real in a throwaway store and
+reds if it lands — DIVE-2520's "forge an actor, the rail goes red" one layer up. It also
+answers a second gate down a real human path, because a floor that refuses everything and a
+floor that refuses the forge are the same observation from the refusal alone.
+
+Tests: `tests/gate_enforce_env_bypass_unit.sh` (23 arms; graded against the pre-fix code,
+which reproduces the exploit inside the harness at `state=closed prov=human:dev`).
+`tests/gate_tier2_floor_unit.sh` and `tests/gate_t2_routed_escalate_unit.sh` had arms
+asserting the *opposite* contract — that clearing the flag made the floor dormant — and now
+assert that it does not.
+
+Both the harness and the probe had a defect worth naming, because it is the same class this
+row is about. Each stubbed `id -un` to model "the caller is an agent" — and the uid-first
+resolver has not read `id -un` since DIVE-2330; it walks `/etc/passwd` for `$EUID` in pure
+bash, precisely so a PATH shim cannot forge it. The stub was inert, so agent-ness was
+supplied BY THE HOST: `agent-dev` owns uid 1007 on a 5dive box, and 19/19 green there said
+nothing about the property. On a CI runner the same uid is `runner`, no agent claims it, and
+the forge arm was a *legitimate human tap* — 8 arms red, and the probe reported a bypass that
+had not happened. Both now pin `_gate_caller_uid` and `_gate_passwd_stream`, the seams
+`lib/actor.sh` publishes for this, and both assert the pin through the real resolver first: a
+pin that silently yields nothing would make every refusal look right for the wrong reason.
+The probe reports `not-reached` rather than `pass` when its caller does not resolve as an
+agent, since a refusal it cannot attribute measures nothing.
+
+## Unreleased — fix(task): `task done` died with empty output when the result named no branch (DIVE-2603)
+
+v0.18.3 shipped DIVE-2577's merge-gate extractor with an **unguarded** command substitution:
+
+```sh
+local _br_cands; _br_cands=$(_gate_branch_refs_from_text "$_mg_txt" "$ident")
+```
+
+`_gate_branch_refs_from_text` is a **probe that legitimately finds nothing** — most results
+name no branch. Its pipeline ends in `grep`, which exits 1 on no-match; `pipefail` promotes
+that through `sed | tr | sort`, and `set -euo pipefail` kills the caller. So `task done`
+exited **1 with empty stdout AND empty stderr** — the die happens before anything prints,
+which is why it presented as a silent failure rather than an error.
+
+Scope: callers holding a gh token (the block is guarded on `-n "$_ghtok2"`) whose result text
+names no `<ident>-slug`. `task reject` was unaffected.
+
+Fix is `|| _br_cands=""` — empty rather than `|| true`, because it states the post-condition
+the `[[ -z "$_br_cands" ]]` test below actually reads.
+
+**This is the same defect and the same fix as DIVE-2566, one file over and in the same
+release.** An unguarded `$( )` around a probe that is *allowed* to fail, under `set -e` +
+`pipefail`, with `local` split onto its own line so the failure is not masked. Splitting the
+declaration is the correct habit for *seeing* a failure and is not sufficient for *handling*
+one. Worth grepping the tree for the pattern rather than waiting for the third instance.
+
+Regression arms are a PAIR, mutation-graded: one asserts the extractor really does exit 1 on
+no-match (so the hazard is measured, not assumed), one is a positive control proving it still
+finds a real branch, and one greps the call site for the guard. Reverting the guard reddens
+the call-site arm (12/1); restoring returns 13/0.
+
+## Unreleased — feat(agent): `agent list` reports credential health, so a lapsed seat stops rendering live (DIVE-1953)
+
+On the DIVE-1868 flagship demo a grok seat's credential lapsed. The systemd unit stayed
+`active`, `5dive agent list` kept showing the seat live, and the only signal was a line in
+the runtime's own log — so a `council convene` dispatched a ballot to a dead seat and
+recorded it as a normal-looking abstain (DIVE-1869 item 3). DIVE-1803 is the same shape:
+an unauthed runtime rendering as healthy. `active` answers whether the PROCESS is up; it
+was being read as an answer to whether that process can reach its provider.
+
+`agent list` now carries an `AUTH` column and `--json` a `health.auth`
+`{state, expiresAt, refreshable}` object, beside the DIVE-1219 deaf/asleep badges. States
+are `ok` / `needs_login` / `expired` / `unknown`. It is file state, not a probe: one read
+per row, no network, because this is the survey people re-run constantly (`5dive auth
+status` still owns probing).
+
+Two things keep the badge believable, and both are mutation-covered by
+`tests/agent_list_auth_health_unit.sh`:
+
+- **Presence is delegated to `auth_creds_present`**, the same instrument `agent create`,
+  `auth status` and `doctor` gate on — not a second, cheaper check under a friendlier
+  name. It matters concretely: a claude agent authenticates by the env-token in its
+  profile's `combined.env` and never writes `.credentials.json`, so a bare sentinel-path
+  test marked every healthy claude agent on the control plane `needs_login`.
+- **`expired` requires that nothing can renew the token.** codex and claude both store a
+  short-lived access/id token next to a long-lived refresh token, so "expiry is in the
+  past" is their normal steady state; flagging it would have put a red badge on every
+  healthy agent on the box.
+
+An unreadable credential is `unknown`, never an alarm — the same rule the deaf check
+follows, and the legend says outright that `ok` means the credential file is present and
+unexpired, not that it was probed.
+## Unreleased — fix(push): the per-repo installation lookup could not fail, so its own fallback was dead code (DIVE-2566)
+
+DIVE-2563 taught `_push_do` to ask GitHub which installation owns the target repo instead of
+minting against one pinned `GITHUB_APP_INSTALLATION_ID`, with a documented fallback to the
+pinned id "when the lookup cannot answer". That fallback was **unreachable in exactly the case
+it was written for.**
+
+`curl -fsS` exits 22 on any HTTP >= 400, `pipefail` promotes that through the `| jq`, and a bare
+`var=$(...)` under the `set -euo pipefail` in `src/header.sh` takes the whole script down. The
+lookup 404s precisely when the repo sits outside every installation — which is the condition the
+fallback exists to survive — so delegated push to any `lodar/*` repo died with a bare `rc=22`,
+curl's exit code, from a namespace that shares no numbers with our own `E_` codes and carries no
+message. dev3 lost an hour to it on DIVE-1560 reading it as a sudo-grant problem.
+
+The fix is `|| _inst_for_repo=""` on the assignment. Empty rather than `|| true` because it
+states the post-condition the fallback branch actually reads.
+
+**The trap worth naming, because the code was written the careful way.** `local _inst_for_repo`
+sits on its own line, split from the assignment — the standard habit, since `local x=$(cmd)`
+always returns 0 and hides the command's failure. Here that correct habit is what made the
+failure fatal: splitting the declaration *stops masking* an error, and this probe is *allowed*
+to fail. **Splitting the declaration is necessary to see a probe's failure and not sufficient to
+handle it**; a probe that may legitimately fail needs the failure handled explicitly.
+
+Graded by mutation rather than by assertion count: removing the guard reddens both new arms
+(92/2), restoring it returns 94/0. `push_unit` 92 -> 94. The behavioural arm derives the shape it
+runs **from `cmd_push.sh` itself** — an inline guarded-vs-unguarded demo stayed green under that
+mutation on the first cut of this test, which is the reason the arm is written the way it is.
+
+This does not make `lodar/*` repos pushable. The App still has no installation on that account
+(DIVE-2033, a human-only step); this converts a silent `rc=22` into the intended named refusal.
+
+## Unreleased — fix(task): the mandatory merge-gate now catches a branch cited in prose, not just a PR (DIVE-2577)
+
+DIVE-2556 closed `done`, verified by olivia, with its OWN result text stating "commit dc336f7
+on branch dive-2556-maker-credit is UNPUSHED (dev3 has no push route)" — real, checkable
+evidence the work never reached main. Nothing caught it: the task carried no `Branch:` line and
+no `delivery_ref`, so the DIVE-1830 declared-binding gate never fired; the DIVE-1835 auto-detect
+gate that runs on every unbound close can only find an OPEN PR (by title/head-branch) or a cited
+`#N`/pull-URL — never a bare branch name — so a maker who names a branch in prose instead of
+binding it slips through even though the auto-detect gate is "mandatory". The row read `done`
+for 30 minutes on a counter lodar was actively asking about while the fix sat on a laptop.
+
+`_gate_branch_refs_from_text` (`src/cmd_task.sh`) closes that specific hole: when an unbound
+close's result/body names `<ident>-<slug>` — our house branch-naming convention, and the same
+word-boundary anchor the PR-title/head-branch scan already uses — the gate now runs that branch
+through the identical ancestry+attribution+merged-PR scan the DIVE-1830 declared path already
+runs for a bound `Branch:` line, and refuses (`done-with-unlanded-branch-in-result`) if nothing
+on main shows it landed. Deliberately narrow: a candidate MUST carry the task's own ident as a
+prefix, so ordinary prose that happens to contain the word "branch" (research, decisions,
+coordination — the population this ticket explicitly did NOT want gated) is untouched. Fails
+open on a missing gh credential, same design as the rest of the auto-detect gate — a gh outage
+must never stall the fleet. `--force-merge-gate` remains the audited escape.
+
+Tests: `tests/task_merge_gate_branch_in_result_unit.sh`, reproducing DIVE-2556's exact shape
+(refuses), the two accepting arms (attribution, merged PR), the force-merge-gate override, and
+that a close naming no ident-prefixed branch at all stays untouched.
+
 ## Unreleased — fix(task): `task deliver --result=` destroyed a closed row's result too (DIVE-2476)
 
 DIVE-2464 guarded `task done|cancel`. It did not guard the verb next door. `cmd_task_deliver` ended
@@ -27,6 +620,54 @@ Still open on `deliver`, named in the source rather than implied to be covered: 
 deliver` with no `--result=` re-stamps `delivery_ref`/`delivered_at` on a closed row, and on a
 closed row with a distinct verifier it still routes. Both are the no-result population this guard
 cannot see.
+## Unreleased — feat(pack): a marketplace pack imports onto codex and opencode, not only Claude (DIVE-2568)
+
+All 19 packs in `character-packs` declare `config.type` `"claude"` and not one
+declares another harness, so "import from the marketplace" meant "import into
+Claude". Nothing in packFormat 1 was actually Claude-specific: `persona.yaml`,
+`card.md`, the manifest, the avatar and `memory/` are harness-neutral markdown
+and data. Only two questions were harness-bound — where the identity doc goes and
+where skills go — and both were already answered per type by `TYPE_PERSONA_FILE`
+and `SKILLS_INSTALL_DIR`.
+
+A pack is now **target-agnostic**, and the set of harnesses it lands on is
+**derived from the CLI rather than declared by the publisher**: every known type
+whose persona doc has a probe-verified home (DIVE-2223). The consequence is the
+point — **no pack has to be republished** to become importable onto codex or
+opencode, and a publisher cannot get compatibility wrong because a publisher does
+not state it. The optional manifest key `config.targets` **narrows** the set and
+can never widen it; `cmd_export` deliberately does not write it, because the set
+is a property of the CLI and baking it in would freeze it on the day the pack was
+packed.
+
+- **The set is stated everywhere an install decision is made**, from one source:
+  `agent inspect`, the import-time disclosure, `market show` and the `market`
+  footer all render `landsOn` out of `_pack_disclosure_json`. `type` in the
+  catalog is shown as *what it was packed as* — the import default, never a
+  ceiling.
+- **A silent drop is fixed.** `settings.json` is Claude Code's file and the only
+  sink for a pack's `model`, `effort`, `hooks` and `plugins`. Importing onto a
+  codex seat dropped all four with nothing on screen: the agent ran the harness
+  default while the manifest still read `model: opus`. Import now names each one
+  **by value**. It is a report, never a refusal — the persona, memory, avatar and
+  skills all land.
+- **An unhostable target is refused before provisioning.** `hermes` and
+  `openclaw` pass `is_known_type` but have no persona path, so an import created
+  a unix account, a home and a unit, then dropped the pack's entire payload and
+  reported success. The fence sits above `cmd_create` and names the harnesses the
+  pack *does* land on.
+- **Distilled memory is now in *effect* on a foreign seat, not merely present.**
+  Import seeds facts to `~/.claude/projects/<slug>/memory` — 5dive's own store,
+  which `5dive memory search` reads for any agent, so the facts were always
+  reachable. They were not *loaded*: it is the Claude Code harness that
+  auto-injects that store each session, and a codex seat reads `.codex/AGENTS.md`
+  and nothing else. The DIVE-2565 renderer is applied to the import direction to
+  inline the facts into the instruction file the target harness actually reads,
+  with the same fenced sections and sentinels the single-file export emits.
+  Claude is deliberately excluded — there the store *is* the loading mechanism,
+  and duplicating every fact into `CLAUDE.md` would double the system prompt to
+  fix a problem that harness does not have. The import envelope reports
+  `memoryInEffect` so the mechanism is stated rather than inferred from the type.
 
 ## Unreleased — fix(digest): a completion was credited to whoever OWNED the row at close, which on a graded row is the verifier (DIVE-2556)
 

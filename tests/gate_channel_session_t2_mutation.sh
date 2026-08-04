@@ -1,5 +1,11 @@
 #!/usr/bin/env bash
-# TIER: nightly — 300.0s measured (DIVE-2525): does not fit the 300s PR core; the nightly sweep runs it.
+# TIER: nightly — 378s measured (control plane, 2026-08-03, DIVE-2555): does not fit the 300s PR core; the nightly sweep runs it.
+# The 300.0s this file shipped with named NO environment and NO date, so neither later
+# reading could refute it, only disagree: 335s (main, control plane) and 378s (dev3,
+# same box, `time bash tests/gate_channel_session_t2_mutation.sh` -> rc 0, 14 mutants
+# killed). scripts/run-harnesses.sh now grades this number against its own clock every
+# time the sweep runs it, so the next reading refutes it in the log instead of in a
+# ticket. Quote the environment when you replace it.
 # DIVE-2412 mutation grader for tests/gate_channel_session_t2_unit.sh.
 #
 # WHY THIS FILE EXISTS. Most of what DIVE-2412 ships is REFUSALS, and "it must

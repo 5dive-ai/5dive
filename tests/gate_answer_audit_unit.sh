@@ -50,7 +50,29 @@ set -uo pipefail
 cd "$(dirname "$0")/.."
 SRC=src
 TMP="$(mktemp -d /tmp/gate-answer-audit.XXXXXX)"
-trap 'rm -rf "$TMP"' EXIT
+FAILURES=()
+# DIVE-2187: an unexplained rc=1 under concurrent runs (11/12) was only ever
+# seen live, because a green-or-red exit both nuked $TMP on the way out — the
+# next occurrence had nothing to inspect and needed a repro. On failure, keep
+# the dir and dump every captured artifact instead of deleting the evidence.
+cleanup() {
+  local rc=$?
+  if [[ "${FAIL:-0}" -gt 0 || "$rc" -ne 0 ]]; then
+    printf '\n=== FAILURE: TMP preserved for inspection: %s ===\n' "$TMP" >&2
+    if [[ ${#FAILURES[@]} -gt 0 ]]; then
+      printf -- '--- failing assertions (repeated so scrollback does not need a repro) ---\n' >&2
+      printf '%s\n' "${FAILURES[@]}" >&2
+    fi
+    for f in "${AUDIT_CALLS:-}" "$TMP"/*.out "$TMP"/*.err; do
+      [[ -n "$f" && -s "$f" ]] || continue
+      printf -- '--- %s ---\n' "$f" >&2
+      cat "$f" >&2
+    done
+  else
+    rm -rf "$TMP"
+  fi
+}
+trap cleanup EXIT
 
 # shellcheck disable=SC1090
 for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh \
@@ -74,7 +96,11 @@ tasks_db_init
 
 PASS=0; FAIL=0
 ok_t()  { PASS=$((PASS+1)); printf 'ok   - %s\n' "$1"; }
-bad_t() { FAIL=$((FAIL+1)); printf 'FAIL - %s\n   %s\n' "$1" "${2:-}"; }
+bad_t() {
+  FAIL=$((FAIL+1))
+  printf 'FAIL - %s\n   %s\n' "$1" "${2:-}"
+  FAILURES+=("FAIL - $1"$'\n'"   ${2:-}")
+}
 addt()  { ( cmd_task_add "$@" ) 2>/dev/null | jq -r '.data.id'; }
 
 AUDIT_CALLS="$TMP/audit.calls"; : >"$AUDIT_CALLS"

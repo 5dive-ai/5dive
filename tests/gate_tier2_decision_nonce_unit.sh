@@ -35,7 +35,20 @@ set -uo pipefail
 cd "$(dirname "$0")/.."
 SRC=src
 TMP="$(mktemp -d /tmp/gate-t2-decision-nonce.XXXXXX)"
-trap 'rm -rf "$TMP"' EXIT
+# DIVE-2610: every cmd_task_* call below runs UNSUBSHELLED, and the CLI's `fail`
+# EXITS rather than returning. A refusal therefore truncates this harness mid-run:
+# the remaining arms never grade, no FAIL prints, and the summary line never
+# prints either — so a scan for FAIL/NOT OK reads the truncation as a pass.
+# Name it. See community/wiki/a-refusal-that-exits-truncates-its-caller.md.
+# fd 8 is a duplicate of the harness's REAL stderr. It must not be plain `>&2`:
+# every cmd_task_* call below is invoked as `... >/dev/null 2>&1`, and a `fail`
+# that EXITS terminates the shell while that redirection is still in effect — so
+# an EXIT trap writing to fd 2 lands in /dev/null and the marker never appears.
+# Measured in DIVE-2610: the marker is swallowed by the very redirect that hides
+# the refusal it is meant to name.
+exec 8>&2
+REACHED_END=0
+trap 'rc=$?; if (( ! REACHED_END )); then printf "ABORT - gate_tier2_decision_nonce_unit truncated at rc=%d after %d ok / %d FAIL: an unsubshelled cmd_task_* call exited instead of grading. NOT a pass.\n" "$rc" "${PASS:-0}" "${FAIL:-0}" >&8; fi; rm -rf "$TMP"' EXIT
 
 # shellcheck disable=SC1090
 for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh \
@@ -65,8 +78,58 @@ audit_log() { :; }
 
 # Non-agent immediate caller, as in gate_tier2_floor_unit.sh, so nothing here is
 # decided by the DIVE-394 agent-uid guard.
+#
+# DIVE-2610: `-u` MUST be stubbed too, not just `-un`. The T6 answer path runs
+# through _gate_sudo_uid_nonagent (src/lib/tasks_db.sh), which consults SUDO_UID
+# ONLY when the process is genuinely root ($EUID -eq 0) and otherwise resolves the
+# REAL uid via `id -u` -> getent passwd -> "is it agent-*". Unprivileged, the
+# `export SUDO_UID=0` above is therefore never read, `command id -u` returns the
+# real caller, and on any agent-* uid the tier-2 human-evidence guard refuses with
+# `fail 6` -> exit 6, truncating T6/T7 and the summary. On CI (runner, non-agent)
+# the same code passes. That is the whole green-on-CI / red-on-every-agent-box
+# split: environment, not the fix under test. Pinning `-u` to 0 makes the arm read
+# the same on both.
 FAKE_CALLER="root"
-id() { if [[ "${1:-}" == -un ]]; then echo "$FAKE_CALLER"; else command id "$@"; fi; }
+FAKE_CALLER_UID=0
+id() {
+  case "${1:-}" in
+    -un) echo "$FAKE_CALLER" ;;
+    -u)  echo "$FAKE_CALLER_UID" ;;
+    *)   command id "$@" ;;
+  esac
+}
+#
+# DIVE-2601 + DIVE-2610, RECONCILED: BOTH pins are load-bearing and neither
+# subsumes the other. `_gate_sudo_uid_nonagent` (src/lib/tasks_db.sh) calls
+# `id -u` DIRECTLY and never routes through `_gate_caller_uid`, so the seam
+# override below does NOT cover the T6 answer path — dropping the `id -u` stub
+# reverts DIVE-2610 and reds this harness at rc=6 on any agent-* box. Conversely
+# `_gate_uid_to_agent`/`task_actor` read `_gate_caller_uid`, which the `id` stub
+# does not reach. Keep both; assert both.
+# DIVE-2601: ALSO pinned through the seam the derivation reads ($EUID via
+# `_gate_caller_uid`). The `id -un` stub alone left that derivation unpinned, so
+# the caller's agent-ness on those arms came from the host. (The original DIVE-2601
+# note said the `id` stub was dead here; DIVE-2610 measured it live on the T6 path
+# via `id -u` — it is not dead, it is merely incomplete. Both pins stay.) uid 0 is
+# root on every host and claimed by no agent-*, so no passwd fixture is needed.
+_PIN_UID=0
+_gate_caller_uid() { printf '%s' "$_PIN_UID"; }
+# Assert the pin through the real resolver before any arm depends on it.
+# LIVENESS FIRST. The unclaimed check below FAILS OPEN: an unsourced lib/actor.sh, a
+# renamed resolver, a typo — every one arrives as '', which IS the pass value.
+# Measured on DIVE-2601 iteration 2 in gate_tier2_nonce_evidence_unit.sh, which
+# omitted lib/actor.sh: the assertion reduced to "the empty string is empty" and
+# could not fail. Probe with a SYNTHETIC passwd row in a subshell so the POSITIVE
+# case holds on any host, including a CI runner with no agent-* accounts.
+_probe="$(
+  _gate_passwd_stream() { printf 'agent-probe:x:424242:424242::/nonexistent:/bin/false\n'; }
+  _gate_uid_to_agent 424242
+)"
+[[ "$_probe" == "probe" ]] \
+  || { printf 'NOT OK - the identity resolver is not live: _gate_uid_to_agent returned %s for a synthetic agent-probe row (expected probe). Is lib/actor.sh in the source list?\n' "'$_probe'"; exit 1; }
+_pin_check="$(_gate_uid_to_agent "$(_gate_caller_uid)")"
+[[ -z "$_pin_check" ]] \
+  || { printf 'NOT OK - identity pin is inert: uid %s resolved to agent %s, expected a NON-agent caller\n' "$_PIN_UID" "'$_pin_check'"; exit 1; }
 export SUDO_UID=0
 
 seed_task() { db "INSERT INTO tasks (ident, title, status, created_by) VALUES ('$1','t','todo','main');"; }
@@ -207,6 +270,7 @@ out=$(cmd_task_answer DIVE-207 --value=A 2>&1); rc=$?
   && ok_t "T7 bare-agent answer on tier-2 decision still REFUSED (DIVE-1117 floor intact)" \
   || bad_t "T7 bare-agent tier-2 still refused" "rc=$rc state=$(answered DIVE-207) out=$out"
 
+REACHED_END=1
 echo "-----"
 printf 'gate_tier2_decision_nonce_unit: %d passed, %d failed\n' "$PASS" "$FAIL"
 [[ $FAIL -eq 0 ]]

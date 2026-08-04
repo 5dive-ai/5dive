@@ -53,10 +53,38 @@ task_need_notify() { :; }
 audit_log() { :; }
 
 # The immediate caller is a non-agent (post-sudo root / dashboard-as-claude). This
-# isolates the tier-2 provenance floor from the DIVE-394 `id -un` agent block so a
-# rejection here proves the FLOOR fired, not the caller-uid guard.
-FAKE_CALLER="root"
-id() { if [[ "${1:-}" == -un ]]; then echo "$FAKE_CALLER"; else command id "$@"; fi; }
+# isolates the tier-2 provenance floor from the DIVE-394 caller-uid agent block so a
+# rejection here proves the FLOOR fired, not that guard.
+#
+# DIVE-2601: that isolation was NOT happening. The lines here used to be
+# `FAKE_CALLER=root` plus an `id()` stub answering `-un`, and since DIVE-2330 the
+# derivation does not read `id` at all — `_gate_caller_uid` reports $EUID and
+# `_gate_passwd_stream` walks /etc/passwd in pure bash, precisely so a PATH-shimmed
+# `id` cannot answer. Measured over a full run of this file the stub took ZERO
+# calls: the "non-agent caller" the comment promised was supplied by whoever ran
+# the suite — an agent uid on a dev box, an unclaimed `runner` uid on CI. Pin the
+# seam the derivation actually reads. uid 0 needs no passwd fixture: it is root on
+# every host and no agent-* account claims it, so this is true on CI too.
+_PIN_UID=0
+_gate_caller_uid() { printf '%s' "$_PIN_UID"; }
+# ...and ASSERT the pin through the real resolver before any arm leans on it. A pin
+# that silently yields nothing would make every refusal below look correct for the
+# wrong reason — the DIVE-2588 shape. Pattern: tests/gate_enforce_env_bypass_unit.sh:127-154.
+# LIVENESS FIRST. The unclaimed check below FAILS OPEN: an unsourced lib/actor.sh, a
+# renamed resolver, a typo — every one arrives as '', which IS the pass value.
+# Measured on DIVE-2601 iteration 2 in gate_tier2_nonce_evidence_unit.sh, which
+# omitted lib/actor.sh: the assertion reduced to "the empty string is empty" and
+# could not fail. Probe with a SYNTHETIC passwd row in a subshell so the POSITIVE
+# case holds on any host, including a CI runner with no agent-* accounts.
+_probe="$(
+  _gate_passwd_stream() { printf 'agent-probe:x:424242:424242::/nonexistent:/bin/false\n'; }
+  _gate_uid_to_agent 424242
+)"
+[[ "$_probe" == "probe" ]] \
+  || { printf 'NOT OK - the identity resolver is not live: _gate_uid_to_agent returned %s for a synthetic agent-probe row (expected probe). Is lib/actor.sh in the source list?\n' "'$_probe'"; exit 1; }
+_pin_check="$(_gate_uid_to_agent "$(_gate_caller_uid)")"
+[[ -z "$_pin_check" ]] \
+  || { printf 'NOT OK - identity pin is inert: uid %s resolved to agent %s, expected a NON-agent caller\n' "$_PIN_UID" "'$_pin_check'"; exit 1; }
 
 seed_task() { db "INSERT INTO tasks (ident, title, status, created_by) VALUES ('$1','t','todo','main');"; }
 answered() { db "SELECT CASE WHEN need_answered_at IS NULL THEN 'open' ELSE 'closed' END FROM tasks WHERE ident='$1';"; }
@@ -136,15 +164,37 @@ else
   bad_t "T4 category heuristic floored to tier 2" "got tier '$(tierof DIVE-104)' (keyword floor may have moved)"
 fi
 
-# --- T5: rollout safety — enforcement OFF => the floor is dormant (audit-only), a
-#     bare-agent answer on a tier-2 gate clears (matches the evidence-block envelope).
+# --- T5: DIVE-2588 — THE FLOOR IS NOT SWITCHABLE. This arm asserted the OPPOSITE
+#     until 2026-08-03 (enforcement OFF => floor dormant, bare-agent clears), and
+#     that dormancy was the whole exploit: the flag reached the floor, and one env
+#     var reached the flag. `_gate_proof_enforced` was a ROLLOUT envelope, not an
+#     authority decision, and it finished rolling out on 2026-07-30. The floor no
+#     longer consults it in either direction.
+#     Captured in a command substitution ON PURPOSE: `fail` exits, and calling the
+#     answer bare would end the harness at status 6 instead of reddening one arm.
 rm -f "$GATE_PROOF_ENFORCE"
 seed_task DIVE-105
 cmd_task_need DIVE-105 --type=decision --ask="ship it?" --options="A|B" --recommend="A" --tier=2 >/dev/null 2>&1
-cmd_task_answer DIVE-105 --value=A >/dev/null 2>&1
-[[ "$(answered DIVE-105)" == "closed" ]] \
-  && ok_t "T5 enforce OFF => tier-2 floor dormant, bare-agent clears (audit-only)" \
-  || bad_t "T5 enforce OFF dormant" "still $(answered DIVE-105)"
+out=$(cmd_task_answer DIVE-105 --value=A 2>&1); rc=$?
+[[ $rc -ne 0 && "$(answered DIVE-105)" == "open" ]] \
+  && ok_t "T5 enforce OFF does NOT lower the tier-2 floor — bare-agent answer still REFUSED (DIVE-2588)" \
+  || bad_t "T5 floor survives enforce OFF" "rc=$rc state=$(answered DIVE-105) out=$out"
+# The reason matters as much as the refusal: an rc alone would pass on ANY error,
+# including one that never reached the floor.
+grep -qi 'tier-2' <<<"$out" \
+  && ok_t "T5 the refusal names the tier-2 floor (not some incidental error)" \
+  || bad_t "T5 refusal names the floor" "out=$out"
+
+# --- T5b: the reported DIVE-2588 bypass, at this layer. An unprivileged caller
+#     pointing GATE_PROOF_ENFORCE at an absent path used to switch the whole
+#     enforcement envelope off. It must now say NOTHING — the floor stands, and
+#     the sentinel that is present (none here) is the only thing that can speak.
+seed_task DIVE-106
+cmd_task_need DIVE-106 --type=decision --ask="ship it?" --options="A|B" --recommend="A" --tier=2 >/dev/null 2>&1
+out=$(GATE_PROOF_ENFORCE=/nonexistent/nope cmd_task_answer DIVE-106 --value=A 2>&1); rc=$?
+[[ $rc -ne 0 && "$(answered DIVE-106)" == "open" ]] \
+  && ok_t "T5b GATE_PROOF_ENFORCE=/nonexistent does not clear a tier-2 gate (DIVE-2588 bypass)" \
+  || bad_t "T5b env bypass refused" "rc=$rc state=$(answered DIVE-106) out=$out"
 touch "$GATE_PROOF_ENFORCE"
 
 echo "-----"

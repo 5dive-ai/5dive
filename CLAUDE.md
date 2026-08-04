@@ -17,6 +17,20 @@ decision to add one is ever wrong on its own merits. See
 - **Over budget, CI FAILS** (`exit 4`, distinct from a test failure's `exit 1`) and
   names the slowest files in the tier. Past the cap a new guard **replaces or
   merges** an existing one — that is the reverse gear, and it is the point.
+- **A budget red confirms itself first** (DIVE-2592). PR #395 went red at 356s and
+  green at 289s on the *same commit, no rebase* — a 67s swing, all of it in one
+  network-priced harness. So when the sum comes in over, the runner **re-times the
+  3 slowest files and keeps the smaller sample per file**: noise is one-sided
+  (contention and a slow remote only *add* time), so the low sample is the least
+  contaminated estimate, while real growth appears in both samples and survives.
+  Paid only on the red path; a green run re-times nothing. `--confirm-top=0`
+  disables it, which can only make the gate **stricter** — there is no flag that
+  confirms more, and no CI job passes one.
+- **A budget red says it is a budget red.** `exit 4` beside "0 failed" reads as
+  systemic to the author and as flake to the next reader; it is neither. The
+  message now states that no test failed, whether the number was confirmed twice,
+  and **the smallest set of harnesses that covers the overage** — the actionable
+  set, not the top-10 leaderboard.
 - **Three ways out, in order:** merge by subject (hundreds of harness *files* for
   one CLI means the unit of organisation is the incident, not the subject —
   folding two files about one subject reclaims their setup cost and drops no
@@ -29,6 +43,13 @@ decision to add one is ever wrong on its own merits. See
   In the harness header (first 40 lines). **The reason is mandatory** — a bare
   `# TIER: nightly` is a refusal, not a default. Demotion moves the cost, it does
   not delete it, which is why it is third and why it must be argued in the diff.
+- **Say WHERE you measured, and expect the number to be graded** (DIVE-2555). The
+  runner compares every `Ns measured` claim against the clock in the run it is
+  already doing: 10% under is reported with the replacement line, 50%-and-3s under
+  is `exit 5` (its own code — the remedy is "correct a number", not "fix a test" or
+  "retire a guard"). A figure with no environment on it cannot be refuted by the
+  next reading, only silently disagreed with: one header claimed `300.0s` while
+  the same file measured 335s and 378s on the control plane.
 - **Editing a harness always runs it**, whatever its tier: the `changed-harnesses`
   job runs and verdict-probes every harness your diff touches. Tier membership is
   a default, and a default loses to an explicit signal.

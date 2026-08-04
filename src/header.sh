@@ -313,18 +313,53 @@ declare -A TYPE_INSTALL=(
   # dir even when the `v24` alias has drifted (same drift the nightly
   # soft-updates hit — DIVE-1189). We then one-hop-symlink the just-installed
   # codex into ~/.local/bin (where TYPE_BIN[codex] and the agent unit's PATH
-  # look). We resolve its real path deterministically as
-  # `dirname $(nvm which 24)/codex` — NOT `command -v codex`, which can land on
-  # a stray /usr/bin/codex, and NOT the `/home/.../v24/bin` alias, which lags
-  # real node upgrades (a box on v24.18.0 left the alias pointing at v24.16.0
-  # and surfaced codex as not_installed — DIVE-1329). `npm install -g` lands the
-  # binary in exactly this dir (== `npm prefix -g`/bin), so the symlink is
-  # guaranteed to point at the codex we just installed. Mirrors opencode below.
+  # look). We resolve its real path as `$(npm prefix -g)/bin/codex` — NOT
+  # `command -v codex`, which can land on a stray /usr/bin/codex, and NOT
+  # `dirname $(nvm which 24)`, which is what this recipe used until DIVE-2596.
+  #
+  # DIVE-2596: `nvm which 24` and `npm prefix -g` are NOT the same directory,
+  # and the comment that used to sit here asserted they were ("== `npm prefix
+  # -g`/bin, so the symlink is guaranteed to point at the codex we just
+  # installed"). They are two different questions:
+  #   nvm which 24  — which node did nvm SELECT   (an intent)
+  #   npm prefix -g — which node is RUNNING npm   (the outcome of this install)
+  # They diverge because ~/.local/bin precedes nvm's bin dir on PATH and holds a
+  # `node` symlink planted by the openclaw recipe below, pinned at whatever
+  # `nvm which 24` meant on the day openclaw was last installed. npm is a
+  # `#!/usr/bin/env node` script, so nvm's npm gets EXECUTED BY that pinned
+  # node, and `npm prefix -g` (derived from process.execPath) reports the
+  # pinned node's prefix — which is where `npm install -g` then puts the
+  # binary. `nvm use` cannot correct this: it edits PATH, and the shadow is
+  # EARLIER on PATH. Measured on the 5dive host: nvm which 24 -> v24.19.0,
+  # npm prefix -g -> v24.18.0, codex under v24.18.0/bin, symlink dangling,
+  # create aborting with "install reported success but bin still missing" on a
+  # box where codex works fine.
+  #
+  # `npm prefix -g` is immune by construction: the same npm process answers the
+  # locator query and performs the install, so target and outcome cannot
+  # disagree. Mirrors openclaw below, which already derives its target this way.
+  # Note we do NOT copy openclaw's `nvm use 24 --silent`: measured on the host,
+  # it does not move `npm prefix -g` (the shadow is earlier on PATH than
+  # anything `nvm use` edits), and tests/codex_install_node24_unit.sh forbids
+  # the substring outright because `nvm use` alone cannot provision a fresh box
+  # (DIVE-1329). Adding it would buy nothing and cost that guard.
+  #
+  # `nvm install 24` also resolves 24 against the REMOTE, so it downloads and
+  # installs a brand-new v24 whenever upstream cuts one — which is what makes
+  # `nvm which 24` move out from under a box that has not changed. That is why
+  # the -x short-circuit stays FIRST: an already-installed codex must not drag
+  # a node download onto every create.
+  #
+  # The trailing `-x` assert is the second half of the fix: a dangling symlink
+  # now fails the recipe with an honest rc instead of being reported as a
+  # successful install and re-diagnosed downstream (cmd_auth.sh) as a missing
+  # binary, which is a true statement about the wrong object — codex IS
+  # installed; the LOCATOR was wrong.
   # DIVE-1189: `5dive agent install codex --upgrade` sets FORCE_INSTALL=1 to skip
   # the -x short-circuit and reinstall @latest in place; without it (the
   # provisioning path) an existing codex is left untouched. \$-escaped so the
   # var expands when the recipe runs under `bash -lc`, not at array-definition time.
-  [codex]="{ [[ -z \"\${FORCE_INSTALL:-}\" ]] && [[ -x /home/claude/.local/bin/codex ]]; } || { . /home/claude/.nvm/nvm.sh && nvm install 24 >/dev/null && npm install -g @openai/codex@latest && mkdir -p /home/claude/.local/bin && ln -sfn \"\$(dirname \"\$(nvm which 24)\")/codex\" /home/claude/.local/bin/codex; }"
+  [codex]="{ [[ -z \"\${FORCE_INSTALL:-}\" ]] && [[ -x /home/claude/.local/bin/codex ]]; } || { . /home/claude/.nvm/nvm.sh && nvm install 24 >/dev/null && npm install -g @openai/codex@latest && mkdir -p /home/claude/.local/bin && ln -sfn \"\$(npm prefix -g)/bin/codex\" /home/claude/.local/bin/codex && [[ -x /home/claude/.local/bin/codex ]]; }"
   # opencode.ai's installer drops the binary at ~/.opencode/bin/opencode and
   # only adds it to PATH via .bashrc — but bash -lc skips .bashrc on
   # non-interactive shells, so neither the verify check below nor the agent
@@ -416,8 +451,39 @@ declare -A SKILLS_AGENT_ID=(
 # and cmd_skill_rm. Probed empirically against npx skills v0.x — if upstream
 # changes a path, update here. Unknown types fall through to ".claude/skills"
 # in the lookup sites below.
+#
+# DIVE-2583 — THE CONTRACT, because prose elsewhere in this repo contradicted it:
+# every value here is $HOME-RELATIVE (it is joined to /home/agent-<name>/ at every
+# call site), and EVERY known type has one. There is no such thing as a 5dive type
+# "with no skills directory": an unmapped type does not get nothing, it gets the
+# .claude/skills fallback. Any sentence claiming a harness has no skills dir is
+# false about this map — see skills_install_dir() below for the resolver that
+# decides it, and use that rather than restating a type list in prose.
+#
+# What this map does NOT claim: that the harness READS the directory. Landing a
+# body is our side; loading it is the harness's. Two entries here are landed-but-
+# unverified and are marked as such (codex/opencode, antigravity) — do not upgrade
+# either note without a live seat.
 declare -A SKILLS_INSTALL_DIR=(
   [claude]=".claude/skills"
+  # codex/opencode: the upstream `npx skills --agent {codex,opencode}` install
+  # path.
+  #
+  # codex: MEASURED 2026-08-03 (DIVE-2583), codex-cli 0.146.0 — it DOES scan
+  # $HOME/.agents/skills. Method, because it matters: two canary SKILL.md files
+  # in one throwaway HOME, one under .agents/skills and one under .codex/skills,
+  # then `codex debug prompt-input` — BOTH appear in the injected
+  # <skills_instructions> block with their real paths. The .codex one is the
+  # positive control (it proves the probe can see a skill at all), so the
+  # .agents one is a discovery, not an absence.
+  #
+  # THE TRAP, worth more than the result: `strings` on the real binary shows
+  # $CODEX_HOME/skills everywhere and ZERO hits for "agents/skills". Grepping the
+  # binary for the path constant would have concluded the exact opposite of the
+  # truth. That is the same method the antigravity note below rests on — treat it
+  # as a hint, never as the measurement.
+  #
+  # opencode: still UNMEASURED. Not installed on this box, so nothing to run.
   [codex]=".agents/skills"
   [hermes]=".hermes/skills"
   [openclaw]="skills"
@@ -426,6 +492,19 @@ declare -A SKILLS_INSTALL_DIR=(
   # by grepping the antigravity binary for the path constant. Earlier map said
   # .gemini/antigravity-cli/skills (matching its state dir), which was a guess
   # — wrong. Upstream npx skills fallback already lands at .agents/skills.
+  #
+  # ...and per the codex entry above, a binary grep is NOT a measurement: codex
+  # scans a root whose constant does not appear in its binary at all. So read the
+  # claim below as an open question, not as a finding.
+  #
+  # DIVE-2583, the unreconciled half of that note: {workspace} is NOT $HOME for a
+  # 5dive agy seat (workdir is a project dir under /home/claude/projects), while
+  # every writer we have — preseed_antigravity_agent, the notify-user seed in the
+  # channel installer, install_default_skill_for_agent — joins this value to
+  # /home/agent-<name>/. If the binary really is workspace-relative, those bodies
+  # are present-but-inert, the same "present is not in effect" trap DIVE-2568 hit
+  # for memory. Nobody has run an agy seat to settle it (no antigravity agent
+  # exists in the fleet — DIVE-2037), so it stays recorded, not resolved.
   [antigravity]=".agents/skills"
   # pi reads user skills from ~/.pi/agent/skills AND ~/.agents/skills (per its
   # resource-loader). We target .agents/skills — the cross-CLI shared dir agy/
@@ -435,6 +514,18 @@ declare -A SKILLS_INSTALL_DIR=(
   [pi]=".agents/skills"
   [grok]=".grok/skills"
 )
+
+# skills_install_dir <type> -> the $HOME-relative dir an installed skill body
+# lands in for that type. THE resolver: this is the expression cmd_pack.sh's
+# import path, cmd_skill add/list/rm and agent_setup.sh each spell by hand, and
+# DIVE-2583 exists because a rendered sentence stated a DIFFERENT answer than the
+# one the installer computed. Anything that TELLS a user where skills go must ask
+# this function, so the claim and the behaviour cannot drift apart. Total by
+# construction — never empty, for any input — which is exactly why "a harness with
+# no skills directory" describes nothing here.
+skills_install_dir() {
+  printf '%s\n' "${SKILLS_INSTALL_DIR[${1:-}]:-.claude/skills}"
+}
 
 # api-key target per type: the env file (in /etc/5dive/connectors for the
 # default profile) and the env var inside it. Claude-family is special-cased
@@ -630,18 +721,62 @@ declare -A OPENCLAW_PROVIDER_URL=(
 # renamed upstream), the user can override via `5dive agent <name> tui`
 # and the agent CLI's own model picker.
 declare -A HERMES_PROVIDER_MODEL=(
-  [anthropic]="claude-sonnet-4-5"
-  [google]="gemini-2.0-flash"
-  [deepseek]="deepseek-v4-pro"
+  # Both catalogs are PER-PROVIDER, and so is the SPELLING: grade a pin against
+  # its own provider's list, never against a grep of the whole catalog file.
+  # hermes' curated anthropic list (hermes_cli/models.py) carries claude-sonnet-5
+  # and the DATED claude-sonnet-4-5-20250929, but no bare claude-sonnet-4-5.
+  # That bare id does appear in the same file, DASHED under `opencode-zen` and
+  # `novita`, and DOTTED as claude-sonnet-4.5 under `copilot` and `novita`.
+  # So a grep is blind twice over: wrong provider, and wrong spelling of the
+  # same model. See DIVE-2607.
+  #
+  # And hermes has TWO catalogs per provider, which disagree:
+  # curated_models_for_provider() prefers a LIVE models.dev/API fetch
+  # (provider_model_ids) and falls back to the static _PROVIDER_MODELS only when
+  # that fetch fails. `gemini` and `deepseek` are both in _MODELS_DEV_PREFERRED,
+  # so the live list is the one that resolves a BYO pin — and it is SMALLER:
+  # static deepseek carries deepseek-v4-pro, live carries only chat/reasoner.
+  # DIVE-2607 cleared deepseek-v4-pro against the weaker list. So these pins are
+  # chosen from the INTERSECTION of live and static: the pin then resolves
+  # whichever catalog wins at runtime, including with the network down.
+  # See DIVE-2628 and community/wiki/a-byo-model-pin-can-only-be-graded-off-ci.md.
+  [anthropic]="claude-sonnet-5"
+  [google]="gemini-3.5-flash"
+  [deepseek]="deepseek-chat"
   [moonshot]="kimi-k2-turbo-preview"
   [openrouter]="openrouter/auto"
 )
 declare -A OPENCLAW_PROVIDER_MODEL=(
-  [openai]="openai/gpt-4o"
-  [anthropic]="anthropic/claude-sonnet-4-5"
-  [google]="google/gemini-2.0-flash"
-  [deepseek]="deepseek/deepseek-v4-pro"
-  [moonshot]="moonshot/kimi-k2-instruct"
+  # Grade a pin here with `openclaw models list --provider <native> --plain`,
+  # NEVER with `--all`: `--all` is a SUBSET that omits the openai/ and google/
+  # namespaces entirely, and reading that omission as "no oracle" is what left
+  # [openai] and [google] ungraded until DIVE-2631. The per-provider list is the
+  # same static catalog (byte-identical to --all on `anthropic`, and unchanged
+  # with the network cut, so it cannot flap).
+  #
+  # And do NOT settle one of these against a DIFFERENT tool's catalog: models.dev
+  # — which hermes itself prefers at runtime — lists both the old openai/gpt-4o
+  # and the old google/gemini-2.0-flash as PRESENT. A cross-oracle read would
+  # have cleared two genuinely stale pins. Only the list that resolves the pin
+  # has authority over it (DIVE-2631).
+  #
+  # WHAT "STALE" MEANS HERE, AND WHAT IT DOES NOT. None of the replaced ids is
+  # retired upstream. Google's own v1beta still serves gemini-2.0-flash (50
+  # models, HTTP 200, queried with our key by main 2026-08-03), and models.dev
+  # still lists gpt-4o. A pin is wrong here when the list that RESOLVES it does
+  # not carry it, which is a property of the vendor agent's catalog, not of the
+  # model's lifecycle. Write it that way in any future ticket or commit: "absent
+  # from <the resolving list>, still present at <upstream>" — never "the vendor
+  # dropped it". The two get fixed differently and only one of them is our bug.
+  #
+  # Measured on openclaw 2026.7.1-2: openai carries no gpt-4 family at all (20
+  # ids, starting at gpt-5.3), google carries only 2.5.x/3.x (7 ids), moonshot
+  # only k2.6 / k2.7-code, deepseek only chat / reasoner (DIVE-2628, DIVE-2631).
+  [openai]="openai/gpt-5.6"
+  [anthropic]="anthropic/claude-sonnet-5"
+  [google]="google/gemini-3.5-flash"
+  [deepseek]="deepseek/deepseek-chat"
+  [moonshot]="moonshot/kimi-k2.6"
   [openrouter]="openrouter/auto"
 )
 declare -A BYO_PROVIDER_LABEL=(

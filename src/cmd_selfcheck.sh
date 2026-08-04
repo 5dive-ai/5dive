@@ -59,6 +59,7 @@ fi
 # the union script's contract all read this, so they cannot drift into three lists.
 SELFCHECK_PROBES=(
   lead-clear-seal
+  t2-forge
   gate-delivery
   audit-root
   audit-nonroot
@@ -71,6 +72,7 @@ SELFCHECK_PROBES=(
 _sc_title() {
   case "$1" in
     lead-clear-seal)   echo "the sealed lead-clear allowlist is armed, or reported inert before a gate hits it" ;;
+    t2-forge)          echo "an agent forging a human tap on a tier-2 gate is refused, and a real human path still clears" ;;
     gate-delivery)     echo "a filed gate leaves a delivery row on the filer's own channel" ;;
     audit-root)        echo "a privileged action lands an audit row" ;;
     audit-nonroot)     echo "an UNPRIVILEGED agent action lands an audit row, or leaves a drop marker" ;;
@@ -183,7 +185,7 @@ _sc_probe_lead_clear_seal() {
 
   local names; names="$(_gate_clear_leads 2>/dev/null || true)"
   if [[ -n "$names" ]]; then
-    local n; n=$(printf '%s\n' "$names" | grep -c .)
+    local n; n=$(printf '%s\n' "$names" | grep -c .) || n=0
     _sc_pass "routed lead-clear is ARMED: $n sealed lead(s) [$(printf '%s' "$names" | tr '\n' ' ')] may clear a gate routed to them; $standing"
     return
   fi
@@ -197,6 +199,125 @@ _sc_probe_lead_clear_seal() {
     *)
       _sc_pass "routed lead-clear is INERT on this box ($why): NO agent can clear an approval/manual/access gate routed to it, and every such gate falls through to a human. Fail-closed and safe — arming it means sealing authority.gate_clear_leads via a council motion, which is deliberately not something an agent can do for itself. $standing" ;;
   esac
+}
+
+# --- probe: forge a human tap, the rail must go RED (DIVE-2588) ----------------
+# DIVE-2520 proved an actor rail by FORGING an actor and demanding the rail notice.
+# This is that probe one layer up, and it exists because the thing it measures was
+# real: until 2026-08-03 an ordinary agent cleared a tier-2 DECISION gate with
+#
+#   GATE_PROOF_ENFORCE=/nonexistent/nope  5dive task answer <gate> --value=A --human
+#
+# no sudo, landing need_answered_by=human:<agent> — a row indistinguishable from the
+# human's own relayed tap. Two guards protected that gate and BOTH consulted one
+# caller-supplied file-existence test.
+#
+# The probe does the forge for real, in a throwaway store, as a stubbed agent caller.
+# It reports fail if the forge lands. It ALSO answers a second gate down a real human
+# path, because a floor that refuses everything and a floor that refuses the forge are
+# the same observation from the refusal alone — and this file's whole thesis is that
+# an instrument reporting success while measuring something else is the defect class.
+_sc_probe_t2_forge() {
+  declare -F cmd_task_answer >/dev/null 2>&1 \
+    || { _sc_notreached "no-answer-path" "cmd_task_answer is not defined in this build"; return; }
+  declare -F _gate_proof_enforced >/dev/null 2>&1 \
+    || { _sc_notreached "no-enforce-predicate" "_gate_proof_enforced is not defined in this build"; return; }
+  local d; d=$(_sc_tmp) || { _sc_notreached "no-tmpdir" "could not create an isolated state dir"; return; }
+  local out; out=$(
+    set +e
+    STATE_DIR="$d"; TASKS_DIR="$d/tasks"; TASKS_DB="$d/tasks/tasks.db"
+    GATE_PROOF_KEY="$d/gate-proof.key"
+    mkdir -p "$TASKS_DIR"
+    export FIVEDIVE_NO_HUMAN_SEND=1
+    JSON_MODE=1
+    tasks_db_init >/dev/null 2>&1
+    task_need_notify() { :; }
+    audit_log() { :; }
+    # FENCE THE OUTBOUND RAIL TOO. The header's two fences (FIVEDIVE_NO_HUMAN_SEND +
+    # a non-prod TASKS_DB) cover the HUMAN send; the answer path's "gate cleared —
+    # resume the task" ping goes out over `cmd_send`, which is the AGENT rail, and it
+    # is not covered by either. Caught the honest way on 2026-08-03: the first run of
+    # this probe delivered a real 5dive-msg about a fixture gate to a live agent.
+    # A prover that emits real traffic is contaminating the evidence base it exists
+    # to protect (DIVE-2010, and the DIVE-1506 fixture leak before it).
+    cmd_send() { return 1; }
+    : > "$d/gate-proof.enforce"     # the live fleet posture since 2026-07-30
+
+    seed() { db "INSERT INTO tasks (ident,title,status,created_by) VALUES ('$1','selfcheck','todo','main');" >/dev/null 2>&1
+             cmd_task_need "$1" --type=decision --ask="pick a lane" --options="A|B" --recommend="A" --tier=2 >/dev/null 2>&1; }
+    by() { db "SELECT COALESCE(need_answered_by,'') FROM tasks WHERE ident='$1';"; }
+
+    # (a) THE FORGE: an ordinary agent, unprivileged, no sudo — what every agent is.
+    #
+    # PIN THE CALLER, do not inherit it (DIVE-2365). The first cut stubbed `id -un`,
+    # which the uid-first resolver has not read since DIVE-2330 — it walks /etc/passwd
+    # for $EUID in pure bash. So the stub was inert and "is the caller an agent?" was
+    # answered by whoever ran the probe: an `agent-*` uid on a 5dive box (where it
+    # passed) and `runner` in CI, where the forge arm was a legitimate HUMAN tap and
+    # this probe reported a bypass that had not happened. `lib/actor.sh` publishes
+    # _gate_passwd_stream / _gate_caller_uid as the seams for modelling a caller uid;
+    # `id -u` + `getent` stay stubbed for `_gate_sudo_uid_nonagent`, which is a
+    # separate resolver with separate seams.
+    AUID=987654
+    _agentrow() { printf 'agent-fixture:x:%s:%s::/home/agent-fixture:/bin/bash\n' "$AUID" "$AUID"; }
+    id() {
+      if   [[ "${1:-}" == -un ]]; then echo "agent-fixture"
+      elif [[ "${1:-}" == -u  ]]; then printf '%s\n' "$AUID"
+      else command id "$@"; fi
+    }
+    getent() {
+      if [[ "${1:-}" == passwd && "${2:-}" == "$AUID" ]]; then _agentrow; return 0; fi
+      command getent "$@"
+    }
+    _gate_passwd_stream() { _agentrow; printf '%s\n' "$(</etc/passwd)"; }
+    _gate_caller_uid() { printf '%s' "$AUID"; }
+    _gate_is_root() { return 1; }
+    unset SUDO_UID
+    printf 'pinned=%s\n' "$(_gate_authenticated_actor)"
+    seed DIVE-990001
+    printf 'tier=%s\n' "$(db "SELECT COALESCE(tier,'') FROM tasks WHERE ident='DIVE-990001';")"
+    ( GATE_PROOF_ENFORCE=/nonexistent/nope cmd_task_answer DIVE-990001 --value=A --human ) >/dev/null 2>&1
+    printf 'forged=%s\n' "$(by DIVE-990001)"
+
+    # (b) LIVENESS: a real human path on an identical gate must still clear. The pin
+    # from (a) is REMOVED here rather than overridden — leaving _gate_caller_uid
+    # pointing at the fixture agent would resolve this caller as an agent too and the
+    # liveness arm would grade a refusal.
+    seed DIVE-990002
+    unset -f id getent _gate_passwd_stream _gate_caller_uid 2>/dev/null
+    _gate_caller_uid() { printf '%s' "0"; }
+    _gate_passwd_stream() { printf '%s\n' "$(</etc/passwd)"; }
+    _gate_is_root() { return 0; }
+    export SUDO_UID=0
+    ( cmd_task_answer DIVE-990002 --value=A --human ) >/dev/null 2>&1
+    printf 'human=%s\n' "$(by DIVE-990002)"
+  )
+  rm -rf "$d"
+
+  local tier forged human pinned
+  tier=$(sed -n 's/^tier=//p' <<<"$out" | head -1)
+  forged=$(sed -n 's/^forged=//p' <<<"$out" | head -1)
+  human=$(sed -n 's/^human=//p' <<<"$out" | head -1)
+  pinned=$(sed -n 's/^pinned=//p' <<<"$out" | head -1)
+
+  # The forge arm is only a FORGE if the caller reads as an agent. If the pin did not
+  # take, a clean "refused" and a clean "cleared" are both unreadable — that is not a
+  # pass and it is not a failure, it is nothing measured, and it must say so.
+  [[ "$pinned" == "fixture" ]] \
+    || { _sc_notreached "caller-not-pinned-as-agent" "the probe's fixture caller resolved as '${pinned:-nobody}', not an agent, so its forge arm would have graded a legitimate human tap — the seams in lib/actor.sh did not take in this build"; return; }
+
+  [[ "$tier" == "2" ]] \
+    || { _sc_notreached "no-tier2-gate" "the probe's own gate filed as tier '${tier:-?}', so the tier-2 floor was never in play — nothing was measured"; return; }
+
+  if [[ -n "$forged" ]]; then
+    _sc_fail "AN AGENT FORGED A HUMAN TAP: a tier-2 decision gate was cleared by an unprivileged agent with GATE_PROOF_ENFORCE pointed at an absent path, and the row reads need_answered_by='$forged' — indistinguishable from the human's own tap (DIVE-2588)"
+    return
+  fi
+  if [[ "$human" != human:* ]]; then
+    _sc_fail "the forge was refused, but so was a REAL human path on an identical gate (need_answered_by='${human:-empty}') — this probe cannot tell a working floor from a store that refuses everything, so its pass would be meaningless"
+    return
+  fi
+  _sc_pass "the forge is refused (gate left unanswered, nothing stamped) while a real human path on an identical tier-2 gate clears as '$human' — the floor discriminates rather than blocking everything"
 }
 
 _sc_probe_gate_delivery() {
@@ -378,8 +499,8 @@ _sc_probe_harness_verdicts() {
   rc=${PIPESTATUS[0]}
   out=$(cat "$logf"); rm -f "$logf"
   local corpus nwired
-  corpus=$(grep -oE '[0-9]+ wired' <<<"$out" | head -1)
-  nwired=$(grep -oE '[0-9]+ wired' <<<"$out" | head -1 | grep -oE '^[0-9]+')
+  corpus=$(grep -oE '[0-9]+ wired' <<<"$out" | head -1) || corpus=""
+  nwired=$(grep -oE '[0-9]+ wired' <<<"$out" | head -1 | grep -oE '^[0-9]+') || nwired=""
   local scoped; scoped=$( ((SELFCHECK_FULL)) && echo 'tests/*.sh' || echo "$SELFCHECK_HARNESS_SAMPLE")
 
   if (( rc != 0 )); then
@@ -606,6 +727,7 @@ _sc_probe_scorecard_honesty() {
 _sc_dispatch() {
   case "$1" in
     lead-clear-seal)   _sc_probe_lead_clear_seal ;;
+    t2-forge)          _sc_probe_t2_forge ;;
     gate-delivery)     _sc_probe_gate_delivery ;;
     audit-root)        _sc_probe_audit_root ;;
     audit-nonroot)     _sc_probe_audit_nonroot ;;

@@ -30,7 +30,7 @@ trap 'rm -rf "$TMP"' EXIT
 # shellcheck disable=SC1090
 for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh \
          lib/agent_setup.sh lib/state.sh lib/audit.sh lib/registry.sh \
-         lib/tasks_db.sh cmd_task.sh; do
+         lib/tasks_db.sh lib/actor.sh cmd_task.sh; do
   # shellcheck source=/dev/null
   source "$SRC/$f"
 done
@@ -66,8 +66,30 @@ _human_nonce_mint() { printf '%s' "$KNOWN_NONCE"; }
 # whether the immediate (pre-sudo) caller is an agent (the forge) or not (human/box).
 FAKE_NONAGENT=1   # 1 = non-agent (human), 0 = agent (forge)
 _gate_sudo_uid_nonagent() { [[ "$FAKE_NONAGENT" == "1" ]]; }
-# Keep `id -un` a non-agent so the DIVE-394 caller-uid block never masks the result.
-id() { if [[ "${1:-}" == -un ]]; then echo "root"; else command id "$@"; fi; }
+# Keep the CALLER a non-agent so the DIVE-394 caller-uid block never masks the
+# result. DIVE-2601: this was an `id -un` stub, which the derivation has not read
+# since DIVE-2330 — measured at ZERO calls here, so the caller's agent-ness was
+# decided by whoever ran the suite. uid 0 is root everywhere and no agent claims it.
+_PIN_UID=0
+_gate_caller_uid() { printf '%s' "$_PIN_UID"; }
+# LIVENESS FIRST, and this is the arm iteration 2 was missing. The unclaimed check
+# below FAILS OPEN: an unsourced lib/actor.sh, a renamed resolver, a typo — every one
+# of them arrives as '', which IS the pass value. Measured: this file omitted
+# lib/actor.sh from the source list above, so `_gate_uid_to_agent` was
+# command-not-found, `_pin_check` was unconditionally empty, and the check was
+# asserting that the empty string is empty. It could not fail, and the eleven arms
+# below ran with the product's actor derivation missing underneath them.
+# The probe pins a SYNTHETIC passwd row in a subshell, so the POSITIVE case holds on
+# any host — including a CI runner where no agent-* account exists.
+_probe="$(
+  _gate_passwd_stream() { printf 'agent-probe:x:424242:424242::/nonexistent:/bin/false\n'; }
+  _gate_uid_to_agent 424242
+)"
+[[ "$_probe" == "probe" ]] \
+  || { printf 'NOT OK - the identity resolver is not live: _gate_uid_to_agent returned %s for a synthetic agent-probe row (expected probe). Is lib/actor.sh in the source list?\n' "'$_probe'"; exit 1; }
+_pin_check="$(_gate_uid_to_agent "$(_gate_caller_uid)")"
+[[ -z "$_pin_check" ]] \
+  || { printf 'NOT OK - identity pin is inert: uid %s resolved to agent %s, expected a NON-agent caller\n' "$_PIN_UID" "'$_pin_check'"; exit 1; }
 
 seed()    { db "INSERT INTO tasks (ident, title, status, created_by) VALUES ('$1','t','todo','main');"; }
 answered(){ db "SELECT CASE WHEN need_answered_at IS NULL THEN 'open' ELSE 'closed' END FROM tasks WHERE ident='$1';"; }
