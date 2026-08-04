@@ -361,8 +361,21 @@ CREATE TABLE IF NOT EXISTS tasks (
   -- per delivery (shipped_flag_at pattern): stamped when the sweep flags a
   -- delivery that's sat past its staleness window, cleared on the next fresh
   -- handoff so a redelivered task gets a clean chance to alert again.
+  -- DIVE-2624: handoff_rejected_at stamps the verifier's FAIL bounce
+  -- (cmd_task_reject). It exists so `iteration` can mean what every reader already
+  -- assumes it means — verifier rejections — instead of "number of task done calls".
+  -- It is a ONE-SHOT TOKEN, not a clock to compare: the next delivery bumps the
+  -- counter iff this is set (or it is the first delivery ever) and CLEARS it in the
+  -- same UPDATE. A re-delivery with no reject outstanding — restoring a handoff, say
+  -- — therefore does not bump. Deliberately not compared against
+  -- handoff_delivered_at: both are datetime('now') at one-second resolution, so a
+  -- reject and the delivery answering it land in the same second often enough that
+  -- either side of that tie is wrong somewhere. The timestamp is kept (rather than a
+  -- boolean) because WHEN the bounce happened is worth having; only the ordering
+  -- decision is made by presence.
   handoff_delivered_at    TEXT,
   handoff_stale_pinged_at TEXT,
+  handoff_rejected_at     TEXT,
   -- DIVE-891: risk-tiered gates (adopted design DIVE-861). tier is set when the
   -- gate is filed: 0 = auto-clear (rec applies immediately, digest line only),
   -- 1 = agent-clearable + 48h TTL auto-applies the recommendation, 2 = hard
@@ -1068,6 +1081,7 @@ _tasks_db_migrate() {
            'acceptance_criteria TEXT' 'verify_command TEXT' 'max_iterations INTEGER' 'verifier TEXT' \
            'iteration INTEGER' 'maker_agent TEXT' 'handoff_ack_at TEXT' 'task_budget TEXT' \
            'handoff_delivered_at TEXT' 'handoff_stale_pinged_at TEXT' \
+           'handoff_rejected_at TEXT' \
            'tier INTEGER' 'need_asked_at TEXT' 'gate_pinged_at TEXT' 'wake_at TEXT' \
            'gate_filed_by TEXT' \
            'secret_key TEXT' 'connector TEXT' 'secret_oob TEXT' 'human_nonce_hash TEXT' \

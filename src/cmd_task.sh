@@ -3680,14 +3680,43 @@ _task_route_to_verifier() {
   # sweep uses to detect a delivery sitting unacknowledged too long. Clear any
   # prior stale-ping flag so a redelivered task gets a clean shot at surfacing
   # again if it goes stale a second time.
+  # DIVE-2624 (b): THE COUNTER MEANS "how many times has the verifier sent this
+  # back", because that is what every reader assumes it means — a high iteration
+  # is read as a maker who keeps missing the bar, and `task loops` flags a loop as
+  # STUCK off it. It used to bump on EVERY `task done`, so a delivery that merely
+  # RESTORED a handoff the gate path had just destroyed (DIVE-2624 (a)) inflated it:
+  # DIVE-2594 read iteration 3 for two real passes plus one accounting ghost, and
+  # the maker had to write "that bump was a restore" into the result by hand.
+  #
+  # A pass counts when the verifier REJECTED it, and that is the only signal that
+  # can distinguish the two — handoff_delivered_at IS NOT NULL alone cannot, because
+  # it is equally true of a genuine second pass after a bounce-back. cmd_task_reject
+  # stamps handoff_rejected_at on the bounce, and THIS delivery spends it.
+  #
+  # A TOKEN, NOT A CLOCK COMPARISON, and the first cut got that wrong. Comparing
+  # handoff_rejected_at against handoff_delivered_at looks equivalent and is not:
+  # both are datetime('now') at ONE-SECOND resolution, so a reject and the delivery
+  # that answers it routinely land in the SAME second. Any comparison then has to
+  # pick a side of the tie and is wrong on the other — `>=` leaves the reject looking
+  # permanently outstanding, so every later re-delivery re-bumps; `>` drops a reject
+  # answered inside a second. My local box was slow enough to separate them and
+  # passed; CI was not, and T9 came back iteration=3. Consuming the token has no tie
+  # to break: the reject is spent exactly once, whatever the clock says.
+  local prev_iter; prev_iter=$(db "SELECT COALESCE(iteration,0) FROM tasks WHERE id=${id};")
   db "UPDATE tasks
         SET status='todo', assignee=$(sqlq "$vfier"),
             maker_agent=COALESCE(maker_agent, $(sqlq_or_null "$maker")),
-            iteration=COALESCE(iteration,0)+1,
+            iteration=CASE
+              WHEN handoff_delivered_at IS NULL OR handoff_rejected_at IS NOT NULL
+              THEN COALESCE(iteration,0)+1
+              ELSE COALESCE(iteration,0) END,
+            handoff_rejected_at=NULL,
             started_at=NULL, handoff_ack_at=NULL,
             handoff_delivered_at=datetime('now'), handoff_stale_pinged_at=NULL${set_result}
       WHERE id=${id};"
   local iter; iter=$(db "SELECT iteration FROM tasks WHERE id=${id};")
+  local iter_note=""
+  [[ "$iter" == "$prev_iter" ]] && iter_note=" — re-delivery of the same pass, not rework"
   local ident; ident=$(ident_of "$id")
   # INST-4: the maker→verifier DELIVERY.
   #
@@ -3702,8 +3731,8 @@ _task_route_to_verifier() {
   # while it is still waiting to be graded — the precise overstatement the
   # verifier rail exists to prevent, asserted by our own evidence base.
   ledger_emit task.delivered ident="$ident" task_id="$id" actor="$(task_actor "")" \
-    out="${result:-}" detail="delivered to verifier ${vfier} (iteration ${iter}; awaiting ACK)"
-  ok "$ident ready for review — delivered to verifier '$vfier' (iteration $iter; awaiting ACK)" \
+    out="${result:-}" detail="delivered to verifier ${vfier} (iteration ${iter}${iter_note}; awaiting ACK)"
+  ok "$ident ready for review — delivered to verifier '$vfier' (iteration ${iter}${iter_note}; awaiting ACK)" \
      '{id:($i|tonumber), ident:$id, status:"todo", routedTo:$v, role:"verifier", handoff:"delivered", acknowledged:false, iteration:($n|tonumber)}' \
      --arg i "$id" --arg id "$ident" --arg v "$vfier" --arg n "$iter"
 }
@@ -3863,7 +3892,14 @@ cmd_task_reject() {
   # DIVE-2113 refuses `task start` for. Latent before; load-bearing now that the
   # close verbs COALESCE, because a stale done_at would be PRESERVED as the real
   # close time on the next pass instead of stamped fresh.
+  # DIVE-2624 (b): stamp the bounce. This is the ONLY event that makes the next
+  # delivery a genuine second pass rather than a re-delivery of this one, and until
+  # now it left no trace a later `task done` could read — which is why the iteration
+  # counter had to bump on every delivery and so counted restores as rework. It is a
+  # dedicated clock for the same reason handoff_delivered_at is one: updated_at moves
+  # on any row touch and cannot answer "was there a reject since the last delivery".
   db "UPDATE tasks SET status='todo', assignee=$(sqlq "$maker"), started_at=NULL, handoff_ack_at=NULL,
+        handoff_rejected_at=datetime('now'),
         done_at=NULL, result=$(sqlq "$fb_txt") WHERE id=${id};"
   ok "$ident rejected — bounced back to maker '$maker' (iteration $iter${maxi:+/$maxi})" \
      '{id:($i|tonumber), ident:$id, status:"todo", bouncedTo:$m, role:"maker", iteration:($n|tonumber)}' \
@@ -6487,7 +6523,46 @@ cmd_task_need() {
   db "BEGIN IMMEDIATE;
       $(_gate_archive_and_clear_sql file "id=${id}")
       UPDATE tasks
-        SET status='blocked', assignee=$(sqlq "$actor"),
+        -- DIVE-2624: DO NOT STEAL THE ASSIGNEE off a live maker-to-verifier handoff.
+        -- The handoff line in task show is DERIVED (assignee=verifier AND
+        -- maker_agent IS NOT NULL AND status NOT IN done/cancelled), so writing
+        -- assignee=<filer> unconditionally FALSIFIED THE PREDICATE and the delivery
+        -- vanished from the board. Nothing was lost -- handoff_delivered_at was never
+        -- touched -- but every reader (task show, the loop board, the stall sweep)
+        -- reads the predicate, not the column, so the work sat in the verifier
+        -- queue looking un-delivered. Measured on DIVE-2619/DIVE-2594; the
+        -- withdraw+re-file was only the filing someone happened to watch, a single
+        -- fresh gate does it too.
+        --
+        -- This is the exact CONVERSE of the handoff_ack_at CASE directly below,
+        -- which already asks whether the filer is the verifier of a delivered row.
+        -- When the filer IS the verifier this CASE is a no-op by construction
+        -- (assignee=verifier=actor), so the only behaviour it changes is the
+        -- third-party filing -- which is the one that did the damage.
+        --
+        -- Column refs on the right of SET are evaluated against the PRE-update row
+        -- (same property cmd_task_assign relies on), so this and the ACK CASE below
+        -- both see the original assignee regardless of clause order.
+        --
+        -- The assignee was doing a second job here -- task answer read it to know
+        -- who to ping to resume -- so preserving it would have moved the resume ping
+        -- onto the verifier. That reader now prefers gate_filed_by, the column
+        -- that actually records the filer (see cmd_task_answer). One fact, one
+        -- column: the filer is provenance, the assignee is who holds the row.
+        --
+        -- NO BACKTICKS AND NO DOUBLE QUOTES IN THIS COMMENT, and that is not style.
+        -- An SQL comment here is bash-parsed BEFORE sqlite ever sees it, because the
+        -- whole statement is one double-quoted bash string: a backtick runs a command
+        -- and a double quote ends the string. The first draft of this block did both,
+        -- handed sqlite an incomplete statement, wrote NO GATE, and still printed a
+        -- successful filing -- which is what the post-write assertion below now
+        -- refuses to let happen again.
+        SET status='blocked',
+            assignee=CASE
+              WHEN maker_agent IS NOT NULL AND verifier IS NOT NULL
+                   AND assignee=verifier AND handoff_delivered_at IS NOT NULL
+                   AND verifier IS NOT $(sqlq "$actor")
+              THEN assignee ELSE $(sqlq "$actor") END,
             handoff_ack_at=CASE
               WHEN maker_agent IS NOT NULL AND verifier IS NOT NULL
                    AND assignee=verifier AND verifier=$(sqlq "$_ack_actor")
@@ -6515,6 +6590,21 @@ cmd_task_need() {
             gate_filed_by=$(sqlq "$actor")
       WHERE id=${id};
       COMMIT;"
+
+  # DIVE-2624: ASSERT THE WRITE LANDED. `db` is not checked anywhere on this path,
+  # so a statement sqlite refuses (it prints "Error: in prepare, incomplete input"
+  # to stderr and returns) wrote NO gate — and every line below still ran: the
+  # ledger recorded gate.filed, the router pinged a reviewer about a question the
+  # row does not hold, and the caller was told the gate was filed. That is not a
+  # hypothetical: it is how the first cut of the assignee CASE above failed, and
+  # nothing in the output distinguished it from success. One cheap read-back turns
+  # the whole class (bad SQL, a locked store, a failed BEGIN IMMEDIATE) from a
+  # false green into a refusal, BEFORE anyone is notified about it.
+  if [[ "$(db "SELECT CASE WHEN status='blocked' AND need_type IS NOT NULL
+                             AND need_asked_at IS NOT NULL THEN 1 ELSE 0 END
+               FROM tasks WHERE id=${id};" 2>/dev/null)" != "1" ]]; then
+    fail "$E_GENERIC" "$ident: the gate write did not land — the task store still shows no filed gate on this row, so nothing has been asked of anyone. Nothing was notified and no ledger entry was made. Re-run; if it repeats, the task store is refusing the write (check for a lock or a schema mismatch with 5dive task show $ident)."
+  fi
 
   # INST-4: the gate is the authority record — who asked whom for permission, at
   # what tier. The ask text is hashed, not stored: a tier-2 ask routinely names
@@ -9559,8 +9649,17 @@ cmd_task_answer() {
     fi
   fi
 
-  # Who resumes: the agent that hit the gate (assignee), else the creator.
-  local owner; owner=$(db "SELECT COALESCE(NULLIF(assignee,''), NULLIF(created_by,''), '') FROM tasks WHERE id=${id};")
+  # Who resumes: the agent that FILED the gate, else the assignee, else the creator.
+  # DIVE-2624: this used to read `assignee` first, and that reading is what forced
+  # `task need` to overwrite the assignee at file time ("the agent hitting the gate
+  # becomes the owner-of-record so task answer knows who to ping"). On a row already
+  # delivered to a verifier that overwrite destroyed the derived handoff. gate_filed_by
+  # is the column that records the filer — it is written in the same transaction as
+  # the gate and reset by _gate_archive_and_clear_sql — so reading it here lets the
+  # assignee go back to meaning only "who holds this row". The COALESCE tail keeps
+  # pre-DIVE-1958 rows (gate_filed_by NULL) resolving exactly as before; the identical
+  # COALESCE is already used by the DIVE-2011 delivery frame a few hundred lines down.
+  local owner; owner=$(db "SELECT COALESCE(NULLIF(gate_filed_by,''), NULLIF(assignee,''), NULLIF(created_by,''), '') FROM tasks WHERE id=${id};")
   # DIVE-394 provenance: record WHO answered. `human:` prefix when a trusted path
   # passed --human; otherwise the resolved actor label.
   local answered_by; answered_by=$(task_actor "$from")
