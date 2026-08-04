@@ -435,5 +435,73 @@ actor_seam_as main; cmd_task_need DIVE-57 --type=decision --ask="which copy vari
   && ok_t "DIVE-2004: a non-eng-ship unrouted decision does NOT warn (no wallpaper)" \
   || bad_t "DIVE-2004 non-eng-ship must not warn" "warn=$(w2004_of "$TMP/n57")"
 
+# --- DIVE-2612: the unrouted APPROVAL, and the remedy that lies to the root -----
+# DIVE-2610's shape: a tier-1 eng-ship APPROVAL filed by the org root. The org
+# resolver returns empty for the root by construction (_gate_route_reviewer tries
+# reports_to then _task_resolve_coordinator and skips any candidate equal to the
+# filer -- for the root both ARE the filer), so the gate is born unrouted, pings
+# the human, and can then be lead-cleared by nobody: approval/manual are human-only
+# unless routed. DIVE-2004 warned about the RECOVERABLE case (unrouted decision =
+# any agent can answer) and stayed silent for the unrecoverable one.
+# In this fixture `main` is the lone root and `dev` reports to main, so main IS the
+# org root -- the same relation olivia holds on the live chart.
+w2612_of()    { grep -c "NO AGENT CAN CLEAR THIS GATE" "$1" 2>/dev/null | head -1; }
+remedy_of()   { grep -c "Re-file with --type=approval" "$1" 2>/dev/null | head -1; }
+noremedy_of() { grep -c "Do NOT re-file it as --type=approval" "$1" 2>/dev/null | head -1; }
+ESHIP_ASK="approve delegated push for review of the dive-2612 branch?"
+# A: the DIVE-2610 shape itself. Root files a tier-1 eng-ship approval -> unrouted
+# -> new warning fires. Asserted WITH routed_reviewer='' and HUMAN_PINGED=1 so a
+# pass cannot come from a gate that quietly routed.
+seed DIVE-58; HUMAN_PINGED=0; route_reset
+actor_seam_as main; cmd_task_need DIVE-58 --type=approval --tier=1 --ask="$ESHIP_ASK" --from=main >/dev/null 2>"$TMP/n58"
+{ [[ "$(w2612_of "$TMP/n58")" -ge 1 ]] \
+  && [[ -z "$(db "SELECT COALESCE(routed_reviewer,'') FROM tasks WHERE ident='DIVE-58';")" ]] \
+  && [[ "$HUMAN_PINGED" == "1" ]]; } \
+  && ok_t "DIVE-2612: an unrouted eng-ship APPROVAL warns that no agent can clear it" \
+  || bad_t "DIVE-2612 unrouted approval warning" "warn=$(w2612_of "$TMP/n58") rr='$(db "SELECT COALESCE(routed_reviewer,'') FROM tasks WHERE ident='DIVE-58';")' human=$HUMAN_PINGED"
+# B: THE CONTROL olivia asked for. The SAME ask from a builder resolves main, so
+# the gate routes and the warning must stay silent. routed_reviewer='main' is the
+# non-vacuity check: silent because it ROUTED, not because the classifier missed.
+seed DIVE-59; HUMAN_PINGED=0; route_reset
+actor_seam_as dev; cmd_task_need DIVE-59 --type=approval --tier=1 --ask="$ESHIP_ASK" --from=dev >/dev/null 2>"$TMP/n59"
+{ [[ "$(w2612_of "$TMP/n59")" == "0" ]] \
+  && [[ "$(db "SELECT COALESCE(routed_reviewer,'') FROM tasks WHERE ident='DIVE-59';")" == "main" ]]; } \
+  && ok_t "DIVE-2612 CONTROL: the same approval from a builder ROUTES and does NOT warn" \
+  || bad_t "DIVE-2612 control must not warn" "warn=$(w2612_of "$TMP/n59") rr='$(db "SELECT COALESCE(routed_reviewer,'') FROM tasks WHERE ident='DIVE-59';")'"
+# C: the remedy text was FALSE for the one filer it could not help. The root's
+# unrouted DECISION used to be told "re-file with --type=approval (it routes to the
+# org lead)" -- which for the root does not route either, and turns a gate ANY agent
+# could answer into one NO agent can. The clause must be replaced, not just dropped.
+seed DIVE-60; HUMAN_PINGED=0; route_reset
+actor_seam_as main; cmd_task_need DIVE-60 --type=decision --ask="$ESHIP_ASK" --from=main >/dev/null 2>"$TMP/n60"
+{ [[ "$(w2004_of "$TMP/n60")" -ge 1 ]] && [[ "$(remedy_of "$TMP/n60")" == "0" ]] \
+  && [[ "$(noremedy_of "$TMP/n60")" -ge 1 ]]; } \
+  && ok_t "DIVE-2612: the root's unrouted decision is NOT told to re-file as approval" \
+  || bad_t "DIVE-2612 remedy clause for root" "w2004=$(w2004_of "$TMP/n60") remedy=$(remedy_of "$TMP/n60") noremedy=$(noremedy_of "$TMP/n60")"
+# D: ...and the clause is CONDITIONED, not deleted. A builder who pinned --tier=2
+# is unrouted (the DIVE-1957 veto) but the resolver still returns main, so the
+# original advice is true for them and must still print. Without this arm, deleting
+# the clause outright would pass C.
+seed DIVE-61; HUMAN_PINGED=0; route_reset
+actor_seam_as dev; cmd_task_need DIVE-61 --type=decision --tier=2 --ask="$ESHIP_ASK" --from=dev >/dev/null 2>"$TMP/n61"
+{ [[ "$(w2004_of "$TMP/n61")" -ge 1 ]] && [[ "$(remedy_of "$TMP/n61")" -ge 1 ]]; } \
+  && ok_t "DIVE-2612: a filer whose resolver DOES return someone still gets the re-file remedy" \
+  || bad_t "DIVE-2612 remedy still prints when a reviewer exists" "w2004=$(w2004_of "$TMP/n61") remedy=$(remedy_of "$TMP/n61")"
+# E: no wallpaper. A money-floored eng-ship approval is human-only BY DESIGN (the
+# T2 category floor fired, _routable=0), so announcing "no agent can clear this" is
+# noise, not news. The new arm is scoped to gates where human-only is an ACCIDENT.
+seed DIVE-62; HUMAN_PINGED=0; route_reset
+actor_seam_as main; cmd_task_need DIVE-62 --type=approval --ask="approve delegated push for review AND the \$900 vercel invoice?" --from=main >/dev/null 2>"$TMP/n62"
+{ [[ "$(w2612_of "$TMP/n62")" == "0" ]] && [[ "$HUMAN_PINGED" == "1" ]]; } \
+  && ok_t "DIVE-2612: a FLOORED (money) approval is human-only by design and does NOT warn" \
+  || bad_t "DIVE-2612 floored must not warn" "warn=$(w2612_of "$TMP/n62") human=$HUMAN_PINGED"
+# F: still narrow on the classifier. An unrouted approval that is not a ship ask
+# stays silent, same discipline DIVE-2004 set for decisions.
+seed DIVE-63; HUMAN_PINGED=0; route_reset
+actor_seam_as main; cmd_task_need DIVE-63 --type=approval --tier=1 --ask="which copy variant should we use on the pricing page?" --from=main >/dev/null 2>"$TMP/n63"
+[[ "$(w2612_of "$TMP/n63")" == "0" ]] \
+  && ok_t "DIVE-2612: a non-eng-ship unrouted approval does NOT warn (no wallpaper)" \
+  || bad_t "DIVE-2612 non-eng-ship approval must not warn" "warn=$(w2612_of "$TMP/n63")"
+
 echo "----"; echo "PASS=$PASS FAIL=$FAIL"
 [[ "$FAIL" == "0" ]]

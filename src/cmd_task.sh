@@ -7221,8 +7221,62 @@ cmd_task_need() {
   # must LOOK like a push gate, the type must be the one push cannot attribute, and
   # the gate must be unrouted — a warning that fires on ordinary decisions would be
   # wallpaper (DIVE-1955).
-  if [[ "$type" == "decision" ]] && _gate_eng_ship_hit "$ask"; then
-    warn "$ident is a push-for-review ask filed as --type=decision with no routed reviewer, so '5dive push' will REFUSE it: an unrouted decision can be answered by any agent, and push only accepts a human, a lead-clear, or a decision answered by this gate's own routed reviewer. Re-file with --type=approval (it routes to the org lead as a tier-1 they can clear), or keep the decision and route it to a reviewer."
+  #
+  # DIVE-2612 extends this, and it is two separate defects — both found by grading
+  # DIVE-2610, a tier-1 eng-ship APPROVAL filed by the org root that came out
+  # unrouted, pinged the human, and could then be lead-cleared by nobody.
+  #
+  #   1. THE SCOPE WAS INVERTED. An unrouted `decision` is answerable by ANY agent;
+  #      an unrouted `approval`/`manual` is answerable by NO agent — cmd_task_answer's
+  #      provenance floor makes those types human-only, and routed_reviewer is the
+  #      SOLE basis for the designated-reviewer exception to it. The warning fired
+  #      for the recoverable case and stayed silent for the unrecoverable one.
+  #   2. THE REMEDY TEXT WAS FALSE FOR THE ONE FILER IT COULD NOT HELP. "Re-file
+  #      with --type=approval (it routes to the org lead ...)" assumes the org
+  #      resolver returns somebody. For the ROOT of the org chart it never can:
+  #      _gate_route_reviewer tries reports_to, then _task_resolve_coordinator, and
+  #      skips any candidate equal to the filer — and absent a literal
+  #      role='coordinator' row the coordinator IS the unique root, so both
+  #      candidates are the filer and it falls off the end empty. Following that
+  #      advice would move the root from "clearable by any agent" to "clearable by
+  #      none". So the clause is now printed ONLY when the resolver returns a name.
+  #
+  # The approval/manual arm is scoped to `_routable=1` on purpose. A tier-2 floored
+  # or human-class-declared gate is human-only BY DESIGN, and announcing that there
+  # would be the wallpaper DIVE-1955 warns about. This fires only where human-only
+  # is an ACCIDENT of the resolver coming back empty.
+  local _u_warn=0
+  if _gate_eng_ship_hit "$ask"; then
+    case "$type" in
+      decision)        _u_warn=1 ;;
+      approval|manual) [[ "$_routable" == "1" ]] && _u_warn=1 ;;
+    esac
+  fi
+  if (( _u_warn )); then
+    # Resolved here rather than reused from `_es_reviewer`: that one is set only
+    # inside the eng-ship downgrade block (tier_floored=0, ask-OR-title hit), so it
+    # is unset on paths that reach here — and an unset remedy predicate is exactly
+    # the defect being fixed.
+    local _u_filer _u_reviewer _u_msg
+    _u_filer=$(task_actor "")
+    _u_reviewer=$(_gate_route_reviewer "$_u_filer")
+    local _u_noroute="the org chart resolves no reviewer for ${_u_filer} (for the root of the chart the coordinator fallback resolves to themselves), so re-filing will not route it either"
+    if [[ "$type" == "decision" ]]; then
+      _u_msg="$ident is a push-for-review ask filed as --type=decision with no routed reviewer, so '5dive push' will REFUSE it: an unrouted decision can be answered by any agent, and push only accepts a human, a lead-clear, or a decision answered by this gate's own routed reviewer."
+      if [[ -n "$_u_reviewer" ]]; then
+        _u_msg+=" Re-file with --type=approval (it routes to $_u_reviewer as a tier-1 they can clear), or keep the decision and route it to a reviewer."
+      else
+        _u_msg+=" Do NOT re-file it as --type=approval: ${_u_noroute} — and an unrouted approval can be cleared by NO agent at all, only by the paired human. Keep the decision (any agent can answer it) or route it to a reviewer explicitly."
+      fi
+    else
+      _u_msg="$ident is a push-for-review ask filed as --type=$type with no routed reviewer, so NO AGENT CAN CLEAR THIS GATE — it is human-only. approval/manual are human-only unless routed, and routed_reviewer is the sole basis for the designated-reviewer exception in 'task answer', so this gate now sits on the paired human and no agent can lift it."
+      if [[ -n "$_u_reviewer" ]]; then
+        _u_msg+=" $_u_reviewer is your reviewer in the org chart but this gate did not route to them — re-file as --type=decision (lead-clearable by design) if a lead can resolve it."
+      else
+        _u_msg+=" ${_u_noroute}; --type=decision is the only shape any agent could clear."
+      fi
+    fi
+    warn "$_u_msg"
   fi
 
   # DIVE-105: DM the paired human right now so the gate doesn't sit unseen.
