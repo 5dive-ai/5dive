@@ -2023,9 +2023,18 @@ _gate_slug_from_url() {
 # get a prompt, and each names the surface that actually measures THAT artifact: the
 # host CLI check cannot see a marketplace clone and vice versa, so naming one for the
 # other would be a check that cannot answer the question it was cited for.
+#
+# WHICH IS WHY THE GENERIC HALF NAMES BARE `5dive doctor` AND NO CATEGORY. It said
+# `--category=host` in the first cut, and that is only right for the host binary: on a
+# marketplace row the FIRST surface the reader was handed was the one that reads
+# /usr/local/bin/5dive and can say nothing about a clone in an agent's own $HOME. Bare
+# `5dive doctor` runs every category (cmd_doctor.sh: an empty filter sets run_host=1 AND
+# run_plugins=1), so it is true for every repo and the keyed half below narrows it.
+# Caught by RENDERING the three shapes and reading them, not by any assertion — the two
+# arms that now grade it (D5/D6) were written after the fact, which is the honest ordering.
 _gate_merged_not_deployed() {
   local _slug="${1:-}"
-  printf '%s' ' NOT ESTABLISHED by this: that the change is DEPLOYED — merged is a property of the repo, not of the artifact anyone is RUNNING, so check the installed side (`5dive doctor --category=host`) before you report this live (DIVE-2621/2641).'
+  printf '%s' ' NOT ESTABLISHED by this: that the change is DEPLOYED — merged is a property of the repo, not of the artifact anyone is RUNNING, so check the installed side (`5dive doctor`) before you report this live (DIVE-2621/2641).'
   case "${_slug##*/}" in
     5dive|5dive-cli)
       printf ' DEPLOYED-ARTIFACT ROW: %s ships /usr/local/bin/5dive, which cron and every agent execute — a host still on the previous release runs the OLD code whatever main says; `5dive doctor --category=host` reports installed vs published (DIVE-2640).' "$_slug" ;;

@@ -54,6 +54,11 @@
 #   M5  revert ONLY the D2 call site              -> 16/5: D2, and D5/D6 with it since
 #                                                   they accept through the same
 #                                                   attribution arm, plus both D8 arms.
+#   M6  ANCHOR: put `--category=host` back into the GENERIC half (its first shape)
+#                                                 -> 19/2: D5 and D6, the two arms added
+#                                                   for it. A fix nobody can red is a fix
+#                                                   nobody is grading.
+#
 # WHAT THE FIRST RUN CORRECTED, recorded because the prediction was wrong in a way that
 # would have shipped: M2 was predicted to red D1-D4 and, run against the FIRST version of
 # this file, it red only D1 and D6 (19/2). D2/D3/D4 asserted the SURFACE string, which the
@@ -268,8 +273,8 @@ FIVE_GATE_REPOS='lodar/5dive-api' run_done DEP-5 --result='landed in the api'
 [[ "$OUT" == *"$NOTE"* ]] \
   && ok_t 'D5: the merged-is-not-deployed note is UNIVERSAL — every accept carries it' \
   || bad_t 'D5 must still carry the generic note' "out=$OUT"
-[[ "$OUT" != *"$PROMPT"* && "$OUT" != *"/usr/local/bin/5dive"* ]] \
-  && ok_t 'D5: but the DEPLOYED-ARTIFACT prompt does NOT fire for lodar/5dive-api (keyed, not unconditional)' \
+[[ "$OUT" != *"$PROMPT"* && "$OUT" != *"/usr/local/bin/5dive"* && "$OUT" != *"$CLI_SURFACE"* ]] \
+  && ok_t 'D5: no prompt and no host-binary check for lodar/5dive-api (keyed, not unconditional)' \
   || bad_t 'D5 prompt must be keyed to the accepting repo' "out=$OUT"
 
 # --- D6. the marketplace repo gets the PER-CLONE surface ----------------------
@@ -283,8 +288,14 @@ FIVE_GATE_REPOS='5dive-ai/5dive-plugins' run_done DEP-6 --result='landed in plug
 [[ $RC -eq 0 && "$(statusof DEP-6)" == "done" ]] \
   && ok_t 'D6: a plugins-repo close still closes' \
   || bad_t 'D6 must close' "rc=$RC status=$(statusof DEP-6) out=$OUT"
-[[ "$OUT" == *"$PROMPT"* && "$OUT" == *"$CLONE_SURFACE"* && "$OUT" != *"/usr/local/bin/5dive"* ]] \
-  && ok_t 'D6: the marketplace repo is prompted for PER-CLONE freshness, not the host binary' \
+# `!= $CLI_SURFACE` is the arm that matters here and it is not decoration: the first cut
+# of the generic half named `--category=host` unconditionally, so a marketplace close
+# handed the reader a check that reads /usr/local/bin/5dive and is silent about clones.
+# The `/usr/local/bin/5dive` arm alone did NOT catch it — the generic half never carried
+# that path — so the assertion has to name the CATEGORY, which is the thing that was wrong.
+[[ "$OUT" == *"$PROMPT"* && "$OUT" == *"$CLONE_SURFACE"* \
+   && "$OUT" != *"/usr/local/bin/5dive"* && "$OUT" != *"$CLI_SURFACE"* ]] \
+  && ok_t 'D6: the marketplace repo is prompted for PER-CLONE freshness and never handed the host check' \
   || bad_t 'D6 must name the clone surface and not the host one' "out=$OUT"
 
 # --- D7. a REFUSAL carries neither -------------------------------------------
