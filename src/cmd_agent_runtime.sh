@@ -1596,10 +1596,19 @@ agent_wake_gate_ready() {
 cmd_send() {
   local name="" message="" from="" from_set=0 raw=0 wake=0
   local reply_to_chat="" reply_to_msg=""
+  # DIVE-2627: which flag supplied the body, so --message and --message-file
+  # cannot silently race each other. See _read_prose_file in lib/validation.sh.
+  local msg_src=""
   local -a positional=()
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      --message=*)        message="${1#--message=}" ;;
+      --message=*)        _prose_flag_dupe --message "$msg_src"; message="${1#--message=}"; msg_src="--message" ;;
+      # DIVE-2627: the body read VERBATIM from a file, so the caller's shell never
+      # assembles it. `5dive agent send dev --message="… \`task need\` …"` executes
+      # those backticks AS YOU, deletes the words, and still prints "OK — sent".
+      --message-file=*)   _prose_flag_dupe --message-file "$msg_src"
+                          _read_prose_file --message-file "${1#--message-file=}"
+                          message="$_PROSE_FILE_VALUE"; msg_src="--message-file" ;;
       --from=*)           from="${1#--from=}"; from_set=1 ;;
       --raw)              raw=1 ;;
       --wake)             wake=1 ;;
@@ -1615,7 +1624,15 @@ cmd_send() {
     name="${positional[0]}"
     positional=("${positional[@]:1}")
   fi
-  [[ -n "$name" ]] || fail "$E_USAGE" "usage: 5dive agent send <name> <text...> | --message=<text> [--from=<sender>] [--raw] [--wake] [--reply-to-chat=<id> [--reply-to-msg=<id>]]"
+  [[ -n "$name" ]] || fail "$E_USAGE" "usage: 5dive agent send <name> <text...> | --message=<text> | --message-file=<path> [--from=<sender>] [--raw] [--wake] [--reply-to-chat=<id> [--reply-to-msg=<id>]]"
+  # DIVE-2627: positional text is the third way to supply the body. With
+  # --message-file set, the `-z "$message"` guard below would DROP trailing
+  # positional words without a word about it, so refuse instead. Deliberately
+  # scoped to the NEW flag: `--message=` + positional has always silently
+  # preferred the flag, and re-litigating that is a different change with live
+  # callers. --message-file has no callers yet, so this costs nothing today.
+  [[ "$msg_src" != "--message-file" || ${#positional[@]} -eq 0 ]] \
+    || fail "$E_USAGE" "--message-file conflicts with the positional text — pass the body exactly once, either inline or from a file."
   if [[ -z "$message" && ${#positional[@]} -gt 0 ]]; then
     message="${positional[*]}"
   fi
