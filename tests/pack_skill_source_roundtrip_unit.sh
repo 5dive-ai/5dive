@@ -142,5 +142,89 @@ has "$IMPORT_ARM" 'did not serve it' "cmd_import still distinguishes a qualified
 STAGE_ARM=$(grep -c '_pack_skill_refs "\$cdir/skills"' "$SRC/cmd_pack.sh")
 check "export calls the helper (not an inlined copy)" "$STAGE_ARM" "1"
 
+printf '\n5. NO MANIFEST AT ALL — the shape every real seat actually has\n'
+# THE LESSON THIS SECTION EXISTS FOR. Sections 1-4 build their own fixture manifest,
+# so they pass on a precondition that does not hold anywhere in production: measured
+# 2026-08-04, `find /home -name .skills-manifest.json` returns ZERO across the fleet,
+# including the seat whose export produced the reported "added 4, skipped 18". A
+# fixture that SUPPLIES the precondition can never discover that the precondition is
+# never met — so this section removes it and grades the fleet-real shape.
+NOMAN="$TMP/noman/skills"
+mkdir -p "$NOMAN"/{find-skills,5dive-cli,animejs}
+for s in find-skills 5dive-cli animejs; do printf '# %s\n' "$s" > "$NOMAN/$s/SKILL.md"; done
+check "the fixture really has no manifest" "$([[ -e "$NOMAN/.skills-manifest.json" ]] && echo yes || echo no)" "no"
+
+NREFS=$(_pack_skill_refs "$NOMAN")
+has "$NREFS" '"vercel-labs/skills:find-skills"' \
+  "find-skills resolves with NO manifest — the default table carries it"
+check "and it round-trips to the repo that actually serves it" \
+  "$(rt "vercel-labs/skills:find-skills")" "vercel-labs/skills|find-skills"
+has "$NREFS" '"5dive-cli"' "a default-repo default stays bare"
+has "$NREFS" '"animejs"' "an unpublished local-only skill still exports bare"
+hasnt "$NREFS" '"vercel-labs/skills:animejs"' \
+  "the table never INVENTS a source for a skill it does not know"
+
+# Precedence: a manifest is authoritative because it can carry third-party sources the
+# table cannot know. If the table won instead, a relocated skill would silently export
+# the wrong repo.
+mkdir -p "$TMP/prec/skills/find-skills"; printf '# f\n' > "$TMP/prec/skills/find-skills/SKILL.md"
+jq -n '{"find-skills":{source:"example-org/tools"}}' > "$TMP/prec/skills/.skills-manifest.json"
+has "$(_pack_skill_refs "$TMP/prec/skills")" '"example-org/tools:find-skills"' \
+  "an explicit manifest entry OVERRIDES the default table"
+
+printf '\n6. the default table cannot drift from the installer that seeds it\n'
+# skill_default_source is a second spelling of the install_default_skill_for_agent call
+# sites. Two spellings of one fact drift, so derive the truth from agent_setup.sh and
+# compare — adding a default skill there without adding it here reds this.
+DRIFT=0
+while read -r src_ skill_; do
+  [[ -n "$skill_" ]] || continue
+  got=$(skill_default_source "$skill_" 2>/dev/null) || got="<unknown>"
+  if [[ "$got" != "$src_" ]]; then
+    bad_ "skill_default_source $skill_ -> want [$src_] got [$got]"; DRIFT=1
+  fi
+done < <(grep -oE 'install_default_skill_for_agent "\$name" [a-z]+ (vercel-labs/skills|"\$\(gh_org\)/skills") [a-z0-9-]+' \
+           "$SRC/lib/agent_setup.sh" \
+         | sed -E 's/.* (vercel-labs\/skills|"\$\(gh_org\)\/skills") ([a-z0-9-]+)$/\1 \2/' \
+         | sed 's|"\$(gh_org)/skills"|5dive-ai/skills|' | sort -u)
+[[ $DRIFT -eq 0 ]] && ok_ "every installer default is known to skill_default_source"
+# Non-vacuity: the loop above must actually have read call sites.
+SITES=$(grep -cE 'install_default_skill_for_agent "\$name" [a-z]+ ' "$SRC/lib/agent_setup.sh")
+if [[ "$SITES" -ge 8 ]]; then ok_ "the drift check read $SITES real call sites"
+else bad_ "drift check read only $SITES call sites — it is not reaching agent_setup.sh"; fi
+check "an id that is not a 5dive default is rejected" \
+  "$(skill_default_source not-a-5dive-skill >/dev/null 2>&1; echo $?)" "1"
+
+printf '\n7. the create path RECORDS provenance (why no seat had a manifest)\n'
+# The writer existed in cmd_skill_add since DIVE-2282/PR #291 and still no seat had a
+# manifest, because installs do not go through `agent skill add` — they go through
+# install_default_skill_for_agent, which recorded nothing. Assert every arm now notes.
+SETUP=$(sed -n '/^install_default_skill_for_agent()/,/^}/p' "$SRC/lib/agent_setup.sh")
+NOTES=$(grep -c '_skill_manifest_note "\$user" "\$home" "\$install_dir" "\$skill" "\$source"' <<<"$SETUP")
+check "all three install arms record the source (npx, manual, already-present)" "$NOTES" "3"
+has "$SETUP" 'BACKFILLS' "the already-present arm is documented as the backfill it is"
+# The note helper must write the key export reads. Grade the shape, not the prose.
+NOTE_FN=$(sed -n '/^_skill_manifest_note()/,/^}/p' "$SRC/lib/agent_setup.sh")
+has "$NOTE_FN" '.skills-manifest.json' "the helper writes the file export reads"
+has "$NOTE_FN" 'source:$s' "the helper records the SOURCE field _pack_skill_refs consumes"
+has "$NOTE_FN" '|| true' "a manifest write can never fail an install"
+
+# Behavioural: run the helper's body against a throwaway HOME and read the result back
+# through _pack_skill_refs. Source-level greps above say the call sites exist; this says
+# the thing they call produces a manifest export can actually use.
+NHOME="$TMP/nhome"; mkdir -p "$NHOME/.claude/skills/find-skills"
+printf '# f\n' > "$NHOME/.claude/skills/find-skills/SKILL.md"
+( sed -n '/^_skill_manifest_note()/,/^}/p' "$SRC/lib/agent_setup.sh" \
+    | sed -n '/<<.MANIFEST_NOTE./,/^MANIFEST_NOTE$/p' | sed '1d;$d' \
+    | HOME="$NHOME" INSTALL_DIR=".claude/skills" SKILL="find-skills" \
+      SOURCE="vercel-labs/skills" bash -s ) >/dev/null 2>&1
+check "the helper body actually wrote a manifest" \
+  "$([[ -s "$NHOME/.claude/skills/.skills-manifest.json" ]] && echo yes || echo no)" "yes"
+check "and it recorded the source export needs" \
+  "$(jq -r '."find-skills".source // "<none>"' "$NHOME/.claude/skills/.skills-manifest.json" 2>/dev/null)" \
+  "vercel-labs/skills"
+has "$(_pack_skill_refs "$NHOME/.claude/skills")" '"vercel-labs/skills:find-skills"' \
+  "a seat seeded by the create path now exports its source"
+
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [[ $FAIL -eq 0 ]]

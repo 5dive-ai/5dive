@@ -515,6 +515,32 @@ declare -A SKILLS_INSTALL_DIR=(
   [grok]=".grok/skills"
 )
 
+# skill_default_source <id> -> the repo a 5dive DEFAULT skill is installed from,
+# or non-zero for any id that is not one of ours.
+#
+# DIVE-2678 iteration 3. The manifest is the authoritative provenance record, but
+# it only ever describes skills that arrived via `agent skill add` — and MEASURED
+# 2026-08-04, zero seats on this fleet carry one, because the create path
+# (install_default_skill_for_agent) never wrote it. So on every seat that exists
+# today the manifest answers nothing, and a default skill installed from a repo
+# that is NOT <org>/skills exported bare and came back unresolvable.
+#
+# find-skills is exactly that case and it is not an edge: it ships on EVERY seat
+# of every type, from vercel-labs/skills, and it was in the 18 skipped names on
+# the measured export. This table is what lets provenance be recovered for a
+# skill installed before the writer existed, with no network and no manifest.
+#
+# It must agree with the install_default_skill_for_agent call sites in
+# agent_setup.sh; tests/pack_skill_source_roundtrip_unit.sh asserts that it does,
+# so adding a default skill there without adding it here reds the suite.
+skill_default_source() {
+  case "$1" in
+    find-skills) echo "vercel-labs/skills" ;;
+    5dive-cli|compile-knowledge|openagent) echo "$(gh_org)/skills" ;;
+    *) return 1 ;;
+  esac
+}
+
 # skills_install_dir <type> -> the $HOME-relative dir an installed skill body
 # lands in for that type. THE resolver: this is the expression cmd_pack.sh's
 # import path, cmd_skill add/list/rm and agent_setup.sh each spell by hand, and
