@@ -238,6 +238,64 @@ if grep -q 'mapfile -t _nc < <(_pack_unapplied_on "\$type"' "$SRC/cmd_pack.sh"; 
   ok_ "T4o cmd_import calls the graded predicate (no second copy)"
 else bad_ "T4o cmd_import does not call _pack_unapplied_on — this file grades dead code"; fi
 
+# --------------------------------- 4B. can the imported agent think at all? ---
+# DIVE-2676. Section 4 grades which claude-only KEYS are dropped. That report is
+# correct and still let the worse outcome through: an import onto an API-key-only
+# seat produced an agent with no credential and no model, reported OK, and every
+# ask timed out at 120s. _pack_seat_needs_key is the predicate that separates
+# "auth deferred to a sign-in that exists" from "auth omitted, permanently".
+#
+# DIFFERENTIAL BY CONSTRUCTION: the arms below are the reason this can't be a
+# "not claude" test. codex, pi and grok are all non-claude AND all have a real
+# sign-in flow, so a predicate that answered `type != claude` would pass T4p and
+# fail T4q/T4r/T4s. That is the whole content of the row.
+_needs() { if _pack_seat_needs_key "$1"; then echo yes; else echo no; fi; }
+check "T4p opencode: API key is the only route (no TYPE_AUTH entry)" "$(_needs opencode)" "yes"
+check "T4q codex: has an interactive sign-in, so deferring auth is honest"  "$(_needs codex)"  "no"
+check "T4r pi: API-key type BUT has a sign-in flow — not inert"             "$(_needs pi)"     "no"
+check "T4s grok: same shape as pi"                                          "$(_needs grok)"   "no"
+check "T4t claude: the baseline seat"                                       "$(_needs claude)" "no"
+# In NEITHER map: hermes has no api-file row at all, so there is no key route to
+# assert. Silence is right — the predicate must not fire on "I don't know".
+check "T4u hermes: absent from TYPE_API_FILE, so no claim is made" "$(_needs hermes)" "no"
+# Pins the derivation to the MAPS, not to a hardcoded name list. A type that
+# gains a sign-in flow must drop out of the predicate on the spot.
+#
+# Save/restore in THIS shell rather than wrapping the check in ( ) — a subshell
+# swallows the FAIL increment, so the arm prints red and the harness still exits
+# 0. Caught by mutation-grading this very file: the always-fires mutant printed
+# six FAIL lines and reported fail=4.
+_SV_AUTH_OC="${TYPE_AUTH[opencode]:-}"
+TYPE_AUTH[opencode]="/tmp/sentinel-not-read"
+check "T4v a type that GAINS a TYPE_AUTH row stops being inert" "$(_needs opencode)" "no"
+if [[ -n "$_SV_AUTH_OC" ]]; then TYPE_AUTH[opencode]="$_SV_AUTH_OC"; else unset 'TYPE_AUTH[opencode]'; fi
+
+_SV_API_CODEX="${TYPE_API_FILE[codex]:-}"
+unset 'TYPE_API_FILE[codex]'
+check "T4w a type that LOSES its api-file row makes no claim" "$(_needs codex)" "no"
+[[ -n "$_SV_API_CODEX" ]] && TYPE_API_FILE[codex]="$_SV_API_CODEX"
+# The restore is itself graded — a leaked mutation would silently rewrite the
+# premise of every arm after it (and of section 5, which reads the same maps).
+check "T4v2 TYPE_AUTH restored (opencode inert again)"      "$(_needs opencode)" "yes"
+check "T4w2 TYPE_API_FILE restored (codex api-file back)"   "${TYPE_API_FILE[codex]:-MISSING}" "openai.env"
+# ...and the shipped path consumes it. Same dead-code lesson as T4o.
+if grep -q '_pack_seat_needs_key "\$type"' "$SRC/cmd_pack.sh"; then
+  ok_ "T4x cmd_import calls the graded predicate"
+else bad_ "T4x cmd_import does not call _pack_seat_needs_key — this section grades dead code"; fi
+# The verdict must reach BOTH readers. A warn alone is invisible to the dashboard,
+# which renders the JSON envelope and would keep showing an inert seat as a hire.
+check "T4y canThink rides in the ok envelope" \
+      "$(grep -c 'canThink:\$ct' "$SRC/cmd_pack.sh")" "1"
+# MUTUAL EXCLUSION, graded by line order: cmd_create hard-fails
+# "--defer-auth and --provider/--api-key are mutually exclusive", so the BYO
+# branch must add the creds and the non-BYO branch must add --defer-auth. If
+# --defer-auth were unconditional again, every BYO import would die at create.
+L_BYO=$(grep -n -- '--provider=\$p_provider' "$SRC/cmd_pack.sh" | head -1 | cut -d: -f1)
+L_DEFER=$(grep -n -- 'cargs+=("--defer-auth")' "$SRC/cmd_pack.sh" | head -1 | cut -d: -f1)
+if [[ -n "$L_BYO" && -n "$L_DEFER" ]] && (( L_BYO < L_DEFER )); then
+  ok_ "T4z --defer-auth is the ELSE of the BYO branch, not unconditional"
+else bad_ "T4z BYO creds and --defer-auth are not exclusive branches (byo=$L_BYO defer=$L_DEFER)"; fi
+
 # ------------------------------------------- 5. the import-time target fence ---
 # cmd_import must refuse an unhostable target BEFORE cmd_create makes an account.
 # Grade the ORDER, not just the presence — a fence below the create is not a
