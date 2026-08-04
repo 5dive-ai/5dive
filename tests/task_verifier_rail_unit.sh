@@ -228,5 +228,94 @@ run_as carol done "$low_id" --result="graded PASS" >/dev/null
   || bad_t "T10f the re-pointed grader's own 'task done' closes the task" \
            "status=$(db "SELECT status FROM tasks WHERE id=${low_id};") $(cat "$TMP"/err)"
 
+# --- T11: THE FILING CAP (DIVE-2681) ----------------------------------------
+# Folded into this harness rather than given its own file: it is a second reason
+# the SAME rail declines, and it reaches the board through the SAME announced
+# skip path T1 covers. A separate harness would re-pay this file's setup to
+# assert against the same code (5dive-cli/CLAUDE.md: merge by subject).
+#
+# The window is fleet-wide over the last 20 standard rows, so these arms build
+# their own ratio explicitly instead of inheriting whatever T1-T10 happened to
+# leave behind — an assertion that depends on the arms above it is not an
+# assertion, it is an ordering.
+db "DELETE FROM tasks;"
+for i in 1 2 3 4 5 6 7 8 9 10; do
+  run add --assignee=alice --priority=medium -- "ship customer feature number ${i}" >/dev/null
+done
+
+# T11a: the classifier is a candidate set — assert it on a title, not a vibe.
+[[ -n "$(_task_internal_subject_reason 'the smoke-gate harness dies on pipefail')" \
+   && -z "$(_task_internal_subject_reason 'web push on the dashboard PWA')" ]] \
+  && ok_t "T11a classifier hits our own machinery and leaves a product title alone" \
+  || bad_t "T11a classifier hits our own machinery and leaves a product title alone" \
+           "internal='$(_task_internal_subject_reason 'the smoke-gate harness dies on pipefail')' product='$(_task_internal_subject_reason 'web push on the dashboard PWA')'"
+
+# T11b: UNDER the cap, an internal row is accepted — and books NO grading pass.
+# This is the half that moves tokens: the row used to cost a grading round-trip.
+int_json=$(run add --assignee=alice --priority=high -- "the release-cut harness is red")
+int_id=$(printf '%s' "$int_json" | jf '.data.id')
+[[ -n "$int_id" && "$int_id" != "null" \
+   && "$(printf '%s' "$int_json" | jf '.data.verifySkipReason')" == "internal machinery" \
+   && -z "$(db "SELECT COALESCE(verifier,'') FROM tasks WHERE id=${int_id};")" ]] \
+  && ok_t "T11b an internal row under the cap is accepted and books NO verifier" \
+  || bad_t "T11b an internal row under the cap is accepted and books NO verifier" "$int_json"
+
+# T11c: an explicit --verifier still forces grading ON. The skip is a default,
+# not a ceiling — same contract T3 asserts for the low-priority skip.
+fv_json=$(run add --assignee=alice --priority=high --verifier=boss -- "the CI job budget-report must be graded")
+fv_id=$(printf '%s' "$fv_json" | jf '.data.id')
+[[ "$(db "SELECT verifier FROM tasks WHERE id=${fv_id};")" == "boss" ]] \
+  && ok_t "T11c --verifier forces grading ON for an internal row" \
+  || bad_t "T11c --verifier forces grading ON for an internal row" "$fv_json"
+
+# T11d: OVER the cap, the next internal row is REFUSED at the keystroke.
+for i in 1 2 3 4 5; do
+  run add --assignee=alice --priority=medium -- "worktree cleanup sweep ${i}" >/dev/null
+done
+over_out=$(run add --assignee=alice --priority=high -- "another harness is flaky"); over_rc=$?
+(( over_rc != 0 )) && has "$(cat "$TMP"/err)$over_out" "filing cap" \
+  && ok_t "T11d over the cap, an internal row is REFUSED" \
+  || bad_t "T11d over the cap, an internal row is REFUSED" "rc=$over_rc $over_out $(cat "$TMP"/err)"
+
+# T11e: the refusal NAMES both escapes. A gate that refuses without naming the
+# way through is the defect DIVE-1880 fixed one control over.
+has "$(cat "$TMP"/err)$over_out" "--already-blocked" \
+  && has "$(cat "$TMP"/err)$over_out" "--customer" \
+  && ok_t "T11e the refusal names both declared escapes" \
+  || bad_t "T11e the refusal names both declared escapes" "$(cat "$TMP"/err)"
+
+# T11f: a CUSTOMER-facing row is never capped, however full the window is.
+cust_json=$(run add --assignee=alice --priority=high -- "dashboard billing page renders a stale plan")
+cust_id=$(printf '%s' "$cust_json" | jf '.data.id')
+[[ -n "$cust_id" && "$cust_id" != "null" ]] \
+  && ok_t "T11f a customer-surface row is unaffected by a full window" \
+  || bad_t "T11f a customer-surface row is unaffected by a full window" "$cust_json"
+
+# T11g: --customer overrides a WRONG classification. The product row that named
+# this arm is real: "Free OSS web UI: three views (org chart, queue, gates)" is a
+# customer surface that matches the scan on two words.
+fp_json=$(run add --assignee=alice --priority=high --customer -- "free OSS web UI: org chart, queue and gates served by the CLI")
+fp_id=$(printf '%s' "$fp_json" | jf '.data.id')
+[[ -n "$fp_id" && "$fp_id" != "null" \
+   && "$(db "SELECT verifier FROM tasks WHERE id=${fp_id};")" == "boss" ]] \
+  && ok_t "T11g --customer clears a false positive AND restores its grading" \
+  || bad_t "T11g --customer clears a false positive AND restores its grading" "$fp_json"
+
+# T11h: --already-blocked lands the row over the cap AND records why on it.
+# An exception that leaves no trace is an opt-out, not an exception.
+ab_json=$(run add --assignee=alice --priority=high --already-blocked="took task done down fleet-wide for 40m" -- "the merge gate harness is wrong")
+ab_id=$(printf '%s' "$ab_json" | jf '.data.id')
+[[ -n "$ab_id" && "$ab_id" != "null" ]] \
+  && has "$(db "SELECT COALESCE(body,'') FROM tasks WHERE id=${ab_id};")" "took task done down fleet-wide" \
+  && ok_t "T11h --already-blocked lands over the cap and records the reason in the body" \
+  || bad_t "T11h --already-blocked lands over the cap and records the reason in the body" "$ab_json"
+
+# T11i: the fleet kill-switch, so an incident is never gated by a filing rule.
+kill_json=$(FIVE_FILING_CAP=0 run add --assignee=alice --priority=high -- "yet another harness is flaky")
+[[ "$(printf '%s' "$kill_json" | jf '.data.id')" != "null" \
+   && -n "$(printf '%s' "$kill_json" | jf '.data.id')" ]] \
+  && ok_t "T11i FIVE_FILING_CAP=0 disables the refusal fleet-wide" \
+  || bad_t "T11i FIVE_FILING_CAP=0 disables the refusal fleet-wide" "$kill_json"
+
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]
