@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# TIER: nightly — 12.4s measured (DIVE-2525): does not fit the 300s PR core; the nightly sweep runs it.
+# TIER: nightly — 20.3s measured on the 5dive host, worktree 5dive-cli-wt-2207 (DIVE-2525): does not fit the 300s PR core; the nightly sweep runs it. Was 12.4s; DIVE-2207 added 14 arms (the (a3) post-gate-answer rail and the gap#3 label/parked-term arms), each of which drives a full _hb_stall_sweep.
 # DIVE-1416 isolated unit harness for _hb_stall_sweep (cmd_heartbeat.sh) —
 # fleet-stall self-heal gaps #2 and #3 (gap #1 is _hb_blocked_sweep, covered by
 # tests/task_cascade_unblock_unit.sh):
@@ -142,6 +142,93 @@ _hb_stall_sweep >/dev/null 2>&1
   || bad_t "acked handoff surfaced" "$(cat "$SEND_LOG")"
 
 # =============================================================================
+# (a3) DIVE-2207 — the POST-GATE-ANSWER predicate
+#
+# THE FIXTURE IS THE POINT. Every arm below starts from a row that defeats every
+# OTHER exclusion in this sweep at once: delivered, ack STAMPED, gate ANSWERED, and
+# handoff_stale_pinged_at ALREADY BURNED. That is not a contrived shape — it is the
+# shape of the rows actually on the board (30 fleet-wide had burned the throttle
+# when this was written, including the live specimen DIVE-2146). If any arm here
+# goes green with the new predicate deleted, the row was caught for another reason
+# and the arm proves nothing.
+# =============================================================================
+
+# --- A5: the load-bearing arm. Nothing else in this sweep can see this row.
+reset_all
+ag=$(addt --assignee=dev --verifier=olivia -- "graded after a gate")
+( cmd_task_done "$ag" ) >/dev/null 2>&1
+db "UPDATE tasks SET handoff_delivered_at=datetime('now','-999 minutes'),
+       handoff_ack_at=datetime('now','-500 minutes'),
+       handoff_stale_pinged_at=datetime('now','-400 minutes'),
+       need_type='decision', need_asked_at=datetime('now','-300 minutes'),
+       need_answered_at=datetime('now','-${_HB_VERIFY_STALE_MIN} minutes','-5 minutes')
+     WHERE id=${ag};"
+: >"$SEND_LOG"
+_hb_stall_sweep >/dev/null 2>&1
+grep -q $'^olivia\t.*gate that was blocking it was ANSWERED' "$SEND_LOG" \
+  && ok_t "A5 answered-gate delivery nudges the verifier (ack stamped, old throttle burned)" \
+  || bad_t "A5 answered-gate delivery not surfaced" "$(cat "$SEND_LOG")"
+grep -q $'^main\t.*Answered-gate delivery' "$SEND_LOG" \
+  && ok_t "A5 it also reaches main (never invisible)" || bad_t "A5 main not pinged" "$(cat "$SEND_LOG")"
+
+# --- A6: the MESSAGE must not be gap#2's. "still unacknowledged" is false here —
+#     the verifier did act, and DIVE-2196 is the row that proves a false nudge costs
+#     more than a missing one.
+grep -q 'still unacknowledged' "$SEND_LOG" \
+  && bad_t "A6 post-answer nudge reused gap#2's false 'still unacknowledged' text" "$(cat "$SEND_LOG")" \
+  || ok_t "A6 the post-answer nudge does NOT claim the verifier never acknowledged"
+
+# --- A7: throttle is the NEW column, and it is stamped
+[[ "$(db "SELECT COALESCE(gate_answered_nudged_at,'NULL') FROM tasks WHERE id=${ag};")" != "NULL" ]] \
+  && ok_t "A7 gate_answered_nudged_at stamped" || bad_t "A7 new throttle not stamped" ""
+: >"$SEND_LOG"
+_hb_stall_sweep >/dev/null 2>&1
+grep -q 'ANSWERED' "$SEND_LOG" \
+  && bad_t "A7 answered-gate row re-nudged despite its throttle" "$(cat "$SEND_LOG")" \
+  || ok_t "A7 throttled — a second sweep does not re-nudge"
+
+# --- A8: THE SAFETY ARM. While the gate is still OPEN this rail must be silent.
+#     Nudging here prescribes closing a row whose human question is undecided —
+#     literally the DIVE-2196 defect this whole thread exists to avoid.
+reset_all
+ah=$(addt --assignee=dev --verifier=olivia -- "still blocked on a human")
+( cmd_task_done "$ah" ) >/dev/null 2>&1
+db "UPDATE tasks SET handoff_delivered_at=datetime('now','-999 minutes'),
+       handoff_ack_at=datetime('now','-500 minutes'),
+       handoff_stale_pinged_at=datetime('now','-400 minutes'),
+       need_type='decision', need_asked_at=datetime('now','-300 minutes'),
+       need_answered_at=NULL WHERE id=${ah};"
+: >"$SEND_LOG"
+_hb_stall_sweep >/dev/null 2>&1
+grep -q 'ANSWERED' "$SEND_LOG" \
+  && bad_t "A8 nudged a row whose gate is STILL OPEN (DIVE-2196 defect)" "$(cat "$SEND_LOG")" \
+  || ok_t "A8 an OPEN gate is never nudged — the rail is post-answer only"
+
+# --- A9: answered, but not yet past the window -> not yet
+db "UPDATE tasks SET need_answered_at=datetime('now') WHERE id=${ah};"
+: >"$SEND_LOG"
+_hb_stall_sweep >/dev/null 2>&1
+grep -q 'ANSWERED' "$SEND_LOG" \
+  && bad_t "A9 nudged a gate answered seconds ago" "$(cat "$SEND_LOG")" \
+  || ok_t "A9 a freshly-answered gate waits out _HB_VERIFY_STALE_MIN first"
+
+# --- A10: parked rows are left alone. One clause beyond the DIVE-2207 spec,
+#     mirroring the (a2) rail; 22 parked rows were live fleet-wide when it was added.
+db "UPDATE tasks SET need_answered_at=datetime('now','-${_HB_VERIFY_STALE_MIN} minutes','-5 minutes'),
+       parked_at=datetime('now') WHERE id=${ah};"
+: >"$SEND_LOG"
+_hb_stall_sweep >/dev/null 2>&1
+grep -q 'ANSWERED' "$SEND_LOG" \
+  && bad_t "A10 nudged a PARKED row" "$(cat "$SEND_LOG")" \
+  || ok_t "A10 a parked row is not nudged"
+db "UPDATE tasks SET parked_at=NULL WHERE id=${ah};"
+: >"$SEND_LOG"
+_hb_stall_sweep >/dev/null 2>&1
+grep -q 'ANSWERED' "$SEND_LOG" \
+  && ok_t "A10 CONTROL un-parking the same row makes it fire (A10 was not vacuous)" \
+  || bad_t "A10 control failed — the row never fires, so A10 proved nothing" "$(cat "$SEND_LOG")"
+
+# =============================================================================
 # (b) gap#3 core — fleet-idle-while-actionable-work-is-open, persisting
 # =============================================================================
 
@@ -240,6 +327,50 @@ _hb_stall_sweep >/dev/null 2>&1
 [[ -n "$(db "SELECT value FROM task_prefs WHERE key='stall_first_seen_at';")" ]] \
   && ok_t "a never-surfaced tier-2 gate (no need_asked_at, no gate_pinged_at) counts as stranded" \
   || bad_t "never-surfaced gate not counted" ""
+
+# --- B10/B11 DIVE-2207: the RENDERED LABELS, and the parked term that must not
+#     reach the arithmetic. Fixture: 2 assigned-but-unstarted todos (so the alarm
+#     fires at all) + 3 PINGED tier-2 gates (parked). The correct alert says
+#     "2 stranded ... (2 assigned-but-unstarted, 0 fleet-actionable gate(s)) ...
+#     3 parked on the human". The number that must NOT move is the 2.
+reset_all
+p1=$(addt --assignee=dev -- "unstarted one"); p2=$(addt --assignee=bob -- "unstarted two")
+for _i in 1 2 3; do
+  pg=$(addt --assignee=dev -- "parked gate $_i")
+  db "UPDATE tasks SET status='blocked', need_type='approval', tier=2,
+         need_asked_at=datetime('now','-2 days'), gate_pinged_at=datetime('now','-1 days')
+       WHERE id=${pg};"
+done
+_hb_stall_sweep >/dev/null 2>&1
+db "UPDATE task_prefs SET value=datetime('now','-${_HB_STALL_MIN_MINUTES} minutes','-1 minutes')
+    WHERE key='stall_first_seen_at';"
+: >"$SEND_LOG"
+_hb_stall_sweep >/dev/null 2>&1
+_alert=$(grep $'^main\t' "$SEND_LOG" | grep 'fleet-stall' | head -1)
+
+[[ -n "$_alert" ]] \
+  && ok_t "B10 the stall alert fired (fixture is live, the label arms below are not vacuous)" \
+  || bad_t "B10 no alert — every label arm below would pass vacuously" "$(cat "$SEND_LOG")"
+
+[[ "$_alert" == *"assigned-but-unstarted"* && "$_alert" != *"unclaimed todo"* ]] \
+  && ok_t "B10 stranded_todo renders as 'assigned-but-unstarted', not the disjoint 'unclaimed todo'" \
+  || bad_t "B10 wrong stranded_todo label" "$_alert"
+
+[[ "$_alert" == *"fleet-actionable gate(s)"* && "$_alert" != *"open gate(s)"* ]] \
+  && ok_t "B10 open_gates renders as 'fleet-actionable gate(s)', not the superset 'open gate(s)'" \
+  || bad_t "B10 wrong open_gates label" "$_alert"
+
+[[ "$_alert" == *"3 parked on the human"* ]] \
+  && ok_t "B11 the parked count is rendered as its own term" \
+  || bad_t "B11 parked term missing or miscounted" "$_alert"
+
+# THE LOAD-BEARING ONE. 3 parked gates are present; total_stranded must still be 2.
+# If parked_gates ever reaches the sum, this reads 5 and the alert re-alarms every
+# _HB_STALL_MIN_MINUTES on a night whose only "work" is waiting on a human — the
+# alert-fatigue regression DIVE-2207 exists to avoid while still surfacing the count.
+[[ "$_alert" == *"2 stranded actionable item(s)"* ]] \
+  && ok_t "B11 parked gates do NOT feed total_stranded (2, not 5)" \
+  || bad_t "B11 parked gates leaked into total_stranded" "$_alert"
 
 # =============================================================================
 # (c) gap#3 canary — pinger liveness
