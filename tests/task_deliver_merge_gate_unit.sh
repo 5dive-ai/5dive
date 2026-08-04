@@ -108,6 +108,12 @@ if [[ "$argv" == *"pr list"* && "$state" == "open" ]]; then
   printf '%s' "${GH_STUB_PRLIST:-[]}" | jq -r "$q" 2>/dev/null
   exit 0
 fi
+# DIVE-2656: the head/merge sha probe. Keyed on the -q expression naming
+# headRefOid so it cannot be confused with the state/mergedAt arms above.
+if [[ "$q" == *headRefOid* ]]; then
+  printf '%s|%s\n' "${GH_STUB_HEAD_SHA-}" "${GH_STUB_MERGE_SHA-}"
+  exit 0
+fi
 case "$q" in
   .state)          printf '%s\n' "${GH_STUB_STATE:-}" ;;
   .mergedAt|.\[0\].mergedAt|'.[0].mergedAt') printf '%s\n' "${GH_STUB_MERGED:-}" ;;
@@ -257,6 +263,119 @@ out=$(cmd_task_deliver DIVE-221 --pr="$PR" 2>&1); rc=$?
 [[ "$out" == *"no verifier is set"* && "$out" != *"verifier is the current assignee"* ]] \
   && ok_t "Tf message says no verifier is set" \
   || bad_t "Tf message" "out=$out"
+
+# === DIVE-2656: head-sha vs the sha the VERIFIER STATES it graded ==============
+# Every arm below runs against a MERGED PR — i.e. a row that satisfies DIVE-1830,
+# DIVE-1935 and every other predicate on this gate. That is the point: the shape
+# this guards (PR #425 carrying a REJECTED commit while GitHub read CLEAN and 14
+# checks green) is invisible to all of them.
+HEAD_SHA="aa11bb22cc33dd44ee55ff6600112233445566aa"
+MERGE_SHA="99887766554433221100ffeeddccbbaa99887766"
+OTHER_SHA="deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
+
+# deliver_merged <ident> — seed a maker->verifier loop row, bind a delivery PR,
+# and put gh into "that PR is MERGED". Leaves the row assigned to the verifier
+# (dev == the pinned actor) so `task done` is a REAL close and reaches the gate.
+deliver_merged() {
+  seed_task "$1" main dev
+  cmd_task_deliver "$1" --pr="$PR" >/dev/null 2>&1
+  export GH_STUB_STATE="MERGED" GH_STUB_MERGED="2026-08-04T10:00:00Z"
+}
+
+# --- Te1: the stated graded sha IS the merged head → the row closes. -----------
+# The ACCEPT arm, and it is the control for the whole block: a guard that only
+# ever refuses passes every reject arm below trivially.
+deliver_merged DIVE-260
+export GH_STUB_HEAD_SHA="$HEAD_SHA" GH_STUB_MERGE_SHA="$MERGE_SHA"
+out=$(cmd_task_done DIVE-260 --result="PASS. graded-sha: $HEAD_SHA" 2>&1); rc=$?
+[[ $rc -eq 0 && "$(statusof DIVE-260)" == "done" ]] \
+  && ok_t "Te1 graded-sha == merged head → closes (ACCEPT control)" \
+  || bad_t "Te1 close" "rc=$rc status=$(statusof DIVE-260) out=$out"
+
+# --- Te2: the stated graded sha is NEITHER the head NOR the merge commit → the
+#     close is REFUSED even though the PR is MERGED. This is DIVE-2654's shape. -
+deliver_merged DIVE-261
+export GH_STUB_HEAD_SHA="$HEAD_SHA" GH_STUB_MERGE_SHA="$MERGE_SHA"
+out=$(cmd_task_done DIVE-261 --result="PASS. graded-sha: $OTHER_SHA" 2>&1); rc=$?
+[[ $rc -eq $E_CONFLICT ]] \
+  && ok_t "Te2 graded-sha != merged sha is REFUSED on a MERGED PR (E_CONFLICT)" \
+  || bad_t "Te2 refused rc" "rc=$rc (want $E_CONFLICT) out=$out"
+[[ "$(statusof DIVE-261)" != "done" ]] \
+  && ok_t "Te2 the task did NOT close" \
+  || bad_t "Te2 not closed" "status=$(statusof DIVE-261)"
+[[ "$out" == *"DIVE-2656"* && "$out" == *"$OTHER_SHA"* && "$out" == *"$HEAD_SHA"* ]] \
+  && ok_t "Te2 refusal cites DIVE-2656 and BOTH operands" \
+  || bad_t "Te2 message" "out=$out"
+
+# --- Te3: --force-merge-gate is the audited override on the same row. ----------
+out=$(cmd_task_done DIVE-261 --force-merge-gate --result="PASS. graded-sha: $OTHER_SHA" 2>&1); rc=$?
+[[ $rc -eq 0 && "$(statusof DIVE-261)" == "done" ]] \
+  && ok_t "Te3 --force-merge-gate overrides the sha mismatch" \
+  || bad_t "Te3 override" "rc=$rc status=$(statusof DIVE-261) out=$out"
+
+# --- Te4: THE SQUASH CASE. A verifier that graded the LANDED result names the
+#     MERGE COMMIT, not the branch head. Refusing that would false-RED every
+#     squash-merged PR, which is worse than the false green this guard fixes. ---
+deliver_merged DIVE-262
+export GH_STUB_HEAD_SHA="$HEAD_SHA" GH_STUB_MERGE_SHA="$MERGE_SHA"
+out=$(cmd_task_done DIVE-262 --result="PASS. graded-sha: $MERGE_SHA" 2>&1); rc=$?
+[[ $rc -eq 0 && "$(statusof DIVE-262)" == "done" ]] \
+  && ok_t "Te4 graded-sha == the MERGE COMMIT also closes (squash path)" \
+  || bad_t "Te4 close" "rc=$rc status=$(statusof DIVE-262) out=$out"
+
+# --- Te5: an ABBREVIATED stated sha matches by prefix. -------------------------
+deliver_merged DIVE-263
+export GH_STUB_HEAD_SHA="$HEAD_SHA" GH_STUB_MERGE_SHA="$MERGE_SHA"
+out=$(cmd_task_done DIVE-263 --result="PASS. graded-sha: ${HEAD_SHA:0:9}" 2>&1); rc=$?
+[[ $rc -eq 0 && "$(statusof DIVE-263)" == "done" ]] \
+  && ok_t "Te5 an abbreviated graded-sha matches by prefix" \
+  || bad_t "Te5 close" "rc=$rc status=$(statusof DIVE-263) out=$out"
+
+# --- Te6: THE FENCE. A bare 40-hex sha in prose is NOT a graded-sha claim. A
+#     result routinely names shas it did not grade (a base, a cited squash, a
+#     sha inside a quoted error). Scraping those would manufacture refusals on
+#     honest closes, so only the LABELLED form may drive the comparison. -------
+deliver_merged DIVE-264
+export GH_STUB_HEAD_SHA="$HEAD_SHA" GH_STUB_MERGE_SHA="$MERGE_SHA"
+out=$(cmd_task_done DIVE-264 --result="PASS. Rebased onto $OTHER_SHA before review." 2>&1); rc=$?
+[[ $rc -eq 0 && "$(statusof DIVE-264)" == "done" ]] \
+  && ok_t "Te6 an UNLABELLED sha in prose is not a claim → no refusal" \
+  || bad_t "Te6 fence" "rc=$rc status=$(statusof DIVE-264) out=$out"
+
+# --- Te7: PART 2's nudge. A loop row closed with NO stated sha still closes —
+#     the enabling half costs nothing — but says the comparison did not run. ----
+[[ "$out" == *"no \`graded-sha: <sha>\` in the result"* && "$out" == *"DIVE-2656"* ]] \
+  && ok_t "Te7 a loop close with no stated sha is NUDGED (comparison did not run)" \
+  || bad_t "Te7 nudge" "out=$out"
+
+# --- Te8: the probe could not be reached → NOT CHECKED, not a mismatch. A query
+#     that never ran must never render as a negative verdict (DIVE-2318's rule,
+#     one level down). The close proceeds and says so out loud. ----------------
+deliver_merged DIVE-265
+export GH_STUB_HEAD_SHA="" GH_STUB_MERGE_SHA=""
+out=$(cmd_task_done DIVE-265 --result="PASS. graded-sha: $OTHER_SHA" 2>&1); rc=$?
+[[ $rc -eq 0 && "$(statusof DIVE-265)" == "done" ]] \
+  && ok_t "Te8 an unreadable head/merge sha does NOT refuse" \
+  || bad_t "Te8 unreached" "rc=$rc status=$(statusof DIVE-265) out=$out"
+[[ "$out" == *"COULD NOT BE READ"* && "$out" == *"not checked"* ]] \
+  && ok_t "Te8 it says NOT CHECKED rather than accepting silently" \
+  || bad_t "Te8 message" "out=$out"
+
+# --- Te9: the extractor itself, direct. Last labelled occurrence wins (an
+#     --append-result close prepends the earlier text), separators are all
+#     accepted, and prose without the label yields nothing. --------------------
+[[ "$(_gate_graded_sha "graded-sha: ${HEAD_SHA^^}")" == "$HEAD_SHA" ]] \
+  && ok_t "Te9a extractor lowercases an UPPERCASE sha" \
+  || bad_t "Te9a" "got=$(_gate_graded_sha "graded-sha: ${HEAD_SHA^^}")"
+[[ "$(_gate_graded_sha "graded-sha: $OTHER_SHA"$'\n'"--- appended ---"$'\n'"graded sha = $HEAD_SHA")" == "$HEAD_SHA" ]] \
+  && ok_t "Te9b extractor takes the LAST labelled statement" \
+  || bad_t "Te9b" "got=$(_gate_graded_sha "graded-sha: $OTHER_SHA"$'\n'"graded sha = $HEAD_SHA")"
+[[ -z "$(_gate_graded_sha "merged $OTHER_SHA and shipped")" ]] \
+  && ok_t "Te9c extractor ignores an unlabelled sha" \
+  || bad_t "Te9c" "got=$(_gate_graded_sha "merged $OTHER_SHA and shipped")"
+[[ -z "$(_gate_graded_sha "graded-sha: nothex")" ]] \
+  && ok_t "Te9d extractor ignores a non-hex label value" \
+  || bad_t "Te9d" "got=$(_gate_graded_sha "graded-sha: nothex")"
 
 echo "-----"
 printf 'task_deliver_merge_gate_unit: %d passed, %d failed\n' "$PASS" "$FAIL"
