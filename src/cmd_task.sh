@@ -541,7 +541,21 @@ _task_verify_skip_reason() {
 # completion-incentive (`task done --no-verify`). This asserts nothing. The input
 # is the diff the work already produced — to be classified shallow you must have
 # genuinely changed only tests/docs, and if you did, there is nothing for a
-# grader to grade. The add-time opt-out (`--no-verify`) is untouched.
+# grader to grade.
+#
+# THE ADD-TIME OPT-OUT IS NOT PRESERVED HERE, which is the accurate form of a
+# claim this comment made the other way round until main's review caught it.
+# Nothing persists `--no-verify`: it is a local var (declared 866, set 903) read
+# only by `task add`'s own branches (1051, 1063), with no column behind it. So at
+# `task done` a `--no-verify` row is INDISTINGUISHABLE from a DIVE-969
+# auto-skipped one — both read verifier NULL, verify_unavailable NULL — and the
+# UPGRADE arm below tests exactly that shape, so it re-attaches a grader to an
+# explicit opt-out whose diff reached the blast radius. The direction is
+# conservative: it can only ADD a rail, never waive one, so DIVE-969's posture is
+# intact. What it does override is an explicit filer instruction. Accepted, not
+# unnoticed — DIVE-2730 persists the flag and makes the original claim true.
+# (`verify_unavailable=1` self-handles: _task_default_verifier returns empty
+# again in that org, so the upgrade cannot fire.)
 #
 # Print the changed paths of the delivery bound to task <id>, one per line.
 # Empty output means UNKNOWN — no binding, no gh, no credential, no PR found —
