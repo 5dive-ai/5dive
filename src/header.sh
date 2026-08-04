@@ -906,6 +906,33 @@ resolve_native_provider() {
   esac
 }
 
+# Reverse of resolve_native_provider for hermes: map a hermes-native provider id
+# back to its canonical UI id. Needed anywhere a native id observed at runtime
+# (e.g. a credential_pool key in auth.json, which is native — see cmd_account.sh
+# set-active-provider) has to index a table keyed CANONICAL, like
+# HERMES_PROVIDER_MODEL (DIVE-2666: that lookup used $native directly and
+# silently no-op'd for the three providers HERMES_PROVIDER_ID renames — google,
+# moonshot, qwen). Scans HERMES_PROVIDER_ID rather than a hand-maintained
+# reverse table so the two tables can't drift out of sync.
+#
+# Echoes empty when $native doesn't match any HERMES_PROVIDER_ID value — the
+# caller should treat that as a real key-space miss (an id our own table
+# doesn't know, e.g. a future provider, a typo, or hermes' own further
+# normalization of "kimi" to "kimi-coding") and warn rather than silently
+# fall through, since every native id OUR code hands out does come from this
+# same table and is expected to resolve.
+resolve_canonical_provider_hermes() {
+  local native="$1" canonical
+  [[ -n "$native" ]] || { echo ""; return; }
+  for canonical in "${!HERMES_PROVIDER_ID[@]}"; do
+    if [[ "${HERMES_PROVIDER_ID[$canonical]}" == "$native" ]]; then
+      echo "$canonical"
+      return
+    fi
+  done
+  echo ""
+}
+
 # Live auth probe: run "<cli> <args>" as user `claude` with a 5s wall-clock
 # cap and see if exit==0. Empty string disables the probe for that type
 # (fall back to sentinel-file presence). Args deliberately keep the prompt

@@ -957,7 +957,19 @@ cmd_account_set_active_provider() {
   # pin the gateway at the wrong endpoint.
   sudo -u claude -H env HERMES_HOME="$prof_hermes" \
     "$bin" config set model.base_url "" >&2 2>/dev/null || true
-  local model="${HERMES_PROVIDER_MODEL[$provider]:-}"
+  # HERMES_PROVIDER_MODEL is keyed CANONICAL but $provider here is the NATIVE
+  # hermes id (validated above against auth.json's credential_pool, which is
+  # native-keyed). Canonicalize before the lookup — indexing with $provider
+  # directly missed silently for every provider HERMES_PROVIDER_ID renames
+  # (google->gemini, moonshot->kimi, qwen->alibaba) and left model.default on
+  # whatever the PREVIOUS provider had (DIVE-2666).
+  local canonical_provider
+  canonical_provider="$(resolve_canonical_provider_hermes "$provider")"
+  if [[ -z "$canonical_provider" ]]; then
+    warn "no canonical id maps to hermes native provider '$provider' — check HERMES_PROVIDER_ID; leaving model.default unchanged"
+    canonical_provider="$provider"
+  fi
+  local model="${HERMES_PROVIDER_MODEL[$canonical_provider]:-}"
   if [[ -n "$model" ]]; then
     sudo -u claude -H env HERMES_HOME="$prof_hermes" \
       "$bin" config set model.default "$model" >&2 \
