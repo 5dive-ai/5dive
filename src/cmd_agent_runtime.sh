@@ -371,8 +371,9 @@ _mirror_send() {
   # synthetic ok so delivery receipts/stamping still exercise downstream logic.
   if [[ -n "${FIVEDIVE_NOTIFY_DRYRUN:-}" && "${FIVEDIVE_NOTIFY_DRYRUN}" != "0" ]]; then
     local dry_line
-    dry_line=$(printf 'notify-dryrun chat=%s thread=%s markup=%s text=%q' \
-      "$chat" "${thread:-none}" "$([[ -n "$reply_markup" ]] && echo yes || echo no)" "$text")
+    dry_line=$(printf 'notify-dryrun chat=%s thread=%s markup=%s silent=%s text=%q' \
+      "$chat" "${thread:-none}" "$([[ -n "$reply_markup" ]] && echo yes || echo no)" \
+      "$([[ -n "${FIVEDIVE_NOTIFY_SILENT:-}" && "${FIVEDIVE_NOTIFY_SILENT}" != "0" ]] && echo yes || echo no)" "$text")
     if [[ -n "${FIVEDIVE_NOTIFY_DRYRUN_LOG:-}" ]]; then
       printf '%s\n' "$dry_line" >>"$FIVEDIVE_NOTIFY_DRYRUN_LOG" 2>/dev/null || true
     fi
@@ -383,6 +384,15 @@ _mirror_send() {
   local args=(--data-urlencode "chat_id=${chat}" --data-urlencode "text=${text}")
   [[ -n "$thread" ]] && args+=(--data-urlencode "message_thread_id=${thread}")
   [[ -n "$reply_markup" ]] && args+=(--data-urlencode "reply_markup=${reply_markup}")
+  # DIVE-2712: opt-in SILENT delivery. Set by the /inbox digest for every message
+  # after the first, so N gates cost the human ONE buzz and N readable messages
+  # instead of N buzzes. Deliberately an env var rather than a 5th positional:
+  # this is the single POST every owner/gate/mirror notify funnels through, and
+  # widening four call signatures across the notify rail to carry a UX flag is a
+  # bigger change than the feature. Default-empty, so every existing caller is
+  # byte-identical on the wire.
+  [[ -n "${FIVEDIVE_NOTIFY_SILENT:-}" && "${FIVEDIVE_NOTIFY_SILENT}" != "0" ]] \
+    && args+=(--data-urlencode "disable_notification=true")
   # Bounded so a hung/slow Telegram API can't wedge the FOREGROUND callers
   # (task_need_notify runs this after the gate UPDATE has already committed;
   # mirror_interagent_outbound likewise). --connect-timeout caps the TCP/TLS

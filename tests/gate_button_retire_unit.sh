@@ -398,5 +398,81 @@ else
       "$(grep -c 'cannot read the gate-delivery log' <<<"$out")"
 fi
 
+# --- DIVE-2712: /inbox sends ONE MESSAGE PER GATE, first pings, rest silent -----
+# The defect: every gate shared ONE message with one merged keyboard, so answering
+# any gate retired the keyboard for ALL of them (retire edits the message that
+# delivered the gate, and that message was everyone's). Graded on the SHAPE OF THE
+# SENDS, not by reading the code — the send stub records one line per call.
+# cmd_task_inbox's send path opens with require_root, so unprivileged this whole
+# block died at that line with E_AUTH_REQUIRED and every arm below asserted against
+# an EMPTY log — which reads as "the feature sent nothing", not as "the test never
+# ran". Same stub the sibling harnesses use (capture_accumulate_unit.sh:41,
+# gate_proof_verify_unit.sh, gate_tier2_decision_nonce_unit.sh). Defined HERE rather
+# than at file scope so the arms above keep the real predicate.
+require_root() { :; }
+SENDS="$TMP/sends.log"; : >"$SENDS"
+# olivia's DIVE-2712 iteration-2 defect, and the fix is WHERE we cut, not what we assert.
+# The previous stub REPLACED _mirror_send and re-implemented the silent predicate in its
+# own printf — so the arms graded "did cmd_task_inbox export the env var", not "does the
+# wire carry disable_notification". Deleting the real line at cmd_agent_runtime.sh:394
+# left the suite at 42/0. The dry-run line at :376 cannot catch it either: it is a
+# PARALLEL EVALUATION of the same condition inside the same function, a mirror rather
+# than a measurement.
+# So restore the REAL _mirror_send and stub the TRANSPORT instead. Everything above this
+# point keeps the cheap stub; re-sourcing here rebinds the genuine implementation, and
+# curl on PATH captures the argv it actually composes.
+#
+# ONE SEND MUST BE ONE RECORD (olivia, iteration 3). The gate TEXT contains
+# newlines, so a plain printf of "$*" wrote ~7 lines per call: line 1 was the argv
+# prefix and disable_notification landed at the END of the argv, i.e. on that send's
+# LAST line. Every arm below is indexed by LINE, so `head -1` could never see the
+# flag (structurally always "absent" — a vacuous arm that survives a build which
+# silences the human's only ping) and `tail -n +2` still contained most of MESSAGE
+# ONE (so the "after the first" count was over the wrong population, and redded for
+# the right verdict by the wrong mechanism). Collapsing the newlines makes head -1
+# message 1 entire and tail -n +2 messages 2..N entire, which is the unit the arms
+# claim to measure. Generalisation worth keeping: an assertion indexed by LINE over
+# a log whose records are MULTI-LINE is measuring a unit the feature does not have.
+source "$SRC/cmd_agent_runtime.sh"
+mkdir -p "$TMP/bin"
+cat >"$TMP/bin/curl" <<'CURLSTUB'
+#!/usr/bin/env bash
+printf '%s\n' "${*//$'\n'/ }" >>"$SENDS"
+printf '%s' '{"ok":true,"result":{"message_id":15491}}'
+CURLSTUB
+chmod +x "$TMP/bin/curl"
+export PATH="$TMP/bin:$PATH" SENDS
+seed_gate() { # <id> <ident> <type>
+  db "INSERT INTO tasks (id,ident,title,status,priority,assignee,need_type,tier,ask,recommend,need_options,created_at)
+      VALUES ($1,'$2','t','blocked','high','main','$3',2,'ask?','A','A|B',datetime('now'));" 2>/dev/null
+}
+db "DELETE FROM tasks;" 2>/dev/null
+seed_gate 9001 DIVE-9001 decision
+seed_gate 9002 DIVE-9002 approval
+seed_gate 9003 DIVE-9003 decision
+# Subshell: cmd_task_inbox ends in ok/fail, which exit — `|| true` cannot catch an
+# exit in the current shell, and the harness must survive either outcome.
+# REACHABILITY FIRST, and it is the arm this block cost a delivery for. olivia's
+# point: stubbing require_root fixes THIS instance, it does not fix the property
+# that an unreached path reports as an empty measurement rather than a red one.
+# So grade the INSTRUMENT before grading the feature — a non-zero expectation that
+# can only be met if the code actually ran. Without this, every arm below reads
+# "expected 3, got 0" whether the split is broken or the harness never reached it,
+# and those two need different fixes.
+( cmd_task_inbox --send ) >/dev/null 2>&1; inbox_rc=$?
+chk "REACHABILITY: cmd_task_inbox --send actually RAN (rc 0, not a root/precondition refusal)" "0" "$inbox_rc"
+sends_n=$(grep -c 'sendMessage' "$SENDS" 2>/dev/null || echo 0)
+chk "REACHABILITY: the send log is NON-EMPTY before anything asserts what is IN it" \
+    "yes" "$([[ "$sends_n" -gt 0 ]] && echo yes || echo "no (rc=$inbox_rc)")"
+sends_n=$(grep -c 'sendMessage' "$SENDS" 2>/dev/null || echo 0)
+chk "3 open gates produce 3 SEPARATE messages, not one digest" "3" "$sends_n"
+# BOTH DIRECTIONS, deliberately. "assert it is present on 2..N" alone degrades into
+# "always pass it" — the absent-on-first arm is what stops that.
+chk "the FIRST gate message PINGS (no disable_notification on the wire)" "absent" \
+    "$(head -1 "$SENDS" | grep -q 'disable_notification=true' && echo present || echo absent)"
+chk "every message after the first carries disable_notification=true ON THE WIRE" "2" \
+    "$(tail -n +2 "$SENDS" | grep -c 'disable_notification=true')"
+chk "each gate carries its OWN keyboard" "3" "$(grep -c 'reply_markup=' "$SENDS" 2>/dev/null || echo 0)"
+
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" == "0" ]]

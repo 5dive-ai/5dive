@@ -9145,71 +9145,86 @@ _task_inbox_send() {
     ok "inbox empty — nothing to send" '{sent:false, gates:0}'
     return
   fi
-  local shown=$(( total < cap ? total : cap ))
 
-  local text="🗂 Gate inbox — waiting on you now:"
-  local kbrows='[]' row id ident prio ntype options recommend gtier ask nonce="" markup="" idlist="" _mint_n=0
-  local -a nonce_ids=() nonce_hashes=()
+  # DIVE-2712 (lodar, 2026-08-04): ONE MESSAGE PER GATE, not one digest.
+  #
+  # It used to accumulate every gate into one message with one merged keyboard.
+  # Two complaints, one root: answering ANY gate called _task_gate_retire_buttons,
+  # which edits the message that delivered it — and with every gate sharing one
+  # message, Telegram's keyboard-removal took ALL of them, so picking a second gate
+  # meant running /inbox again. The digest was also unreadable once several gates
+  # were open.
+  #
+  # Sending one message per gate fixes both AND DELETES THE HARD PART. The
+  # alternative — keep the digest and subtract only the answered gate's rows —
+  # needs the ORIGINAL button nonces to survive the edit, and only their SHA is
+  # persisted (human_nonce_hash), so the surviving rows would have to be re-minted
+  # and their hashes rotated, which silently kills those same gates' buttons on
+  # every OTHER message that delivered them. One gate per message makes the
+  # existing retire path correct BY CONSTRUCTION: the message carries exactly one
+  # gate, so removing its keyboard can affect nothing else.
+  #
+  # THE COST IS THE PUSH COUNT, and it is paid rather than ignored: N gates would
+  # be N buzzes. The first message pings, every one after it is SILENT
+  # (FIVEDIVE_NOTIFY_SILENT -> disable_notification), so the human gets one ping
+  # and a readable stack.
+  local id ident prio ntype options recommend gtier ask nonce="" markup=""
+  local gate_text sent=0 failed=0 first_sent=0 all_ids="" all_mids="" _mint_n=0
+  local _prev_silent="${FIVEDIVE_NOTIFY_SILENT:-}"
   while IFS= read -r row; do
     [[ -n "$row" ]] || continue
     IFS=$'\x1f' read -r id ident prio ntype options recommend gtier ask <<<"$row"
     [[ -n "$id" && -n "$ident" ]] || continue
-    idlist+="${idlist:+,}${id}"
-    text+=$'\n\n'"• [${ident}] ${ntype}, ${prio} — ${ask} /task_${id}"
-    [[ -n "$recommend" ]] && text+=$'\n'"  ✅ Recommended: ${recommend}"
-    [[ -n "$options" ]] && text+=$'\n'"  Options: ${options}"
-    # DIVE-2356: same widened condition as the cmd_task_need mint — hard-human
-    # TYPE **or** tier>=2. Without the tier arm a tier-2 `decision` filed before
-    # that change stays nonce-less forever, since this rotation is the only other
-    # write to human_nonce_hash on the non-escalation path. `tier` is now selected
-    # below, spliced in AHEAD of `ask` so `ask` stays the greedy tail of the read.
+    gate_text="🗂 Gate waiting on you:"$'\n\n'"[${ident}] ${ntype}, ${prio} — ${ask} /task_${id}"
+    [[ -n "$recommend" ]] && gate_text+=$'\n'"✅ Recommended: ${recommend}"
+    [[ -n "$options" ]]   && gate_text+=$'\n'"Options: ${options}"
+    gate_text+=$'\n\n'"Tap a button, open the /task link, or answer from the dashboard."
+    # DIVE-2356: hard-human TYPE **or** tier>=2. Unchanged by the split.
     nonce=""; _mint_n=0
     case "$ntype" in approval|secret|manual) _mint_n=1 ;; esac
     [[ "${gtier:-}" =~ ^[0-9]+$ ]] && (( gtier >= 2 )) && _mint_n=1
-    if (( _mint_n )); then
-      nonce=$(_human_nonce_mint)
-      if [[ -n "$nonce" ]]; then
-        nonce_ids+=("$id")
-        nonce_hashes+=("$(_human_nonce_sha "$nonce")")
-      fi
-    fi
+    (( _mint_n )) && nonce=$(_human_nonce_mint)
     markup=$(_task_gate_reply_markup "$id" "$ntype" "$options" "$recommend" "$nonce" "$TASK_CH_TYPE" "$ident")
-    if [[ -n "$markup" ]]; then
-      kbrows=$(jq -cn --argjson a "$kbrows" --argjson b "$markup" '$a + ($b.inline_keyboard // [])' 2>/dev/null) || kbrows='[]'
+    # First message pings; the rest arrive silently.
+    if (( first_sent )); then export FIVEDIVE_NOTIFY_SILENT=1; fi
+    _task_send_owner "$gate_text" "$markup" "$id"
+    if [[ "${TASK_SEND_DELIVERED:-0}" == "1" ]]; then
+      sent=$(( sent + 1 )); first_sent=1
+      all_ids+="${all_ids:+,}${id}"
+      [[ -n "${TASK_SEND_MESSAGE_IDS:-}" ]] && all_mids+="${all_mids:+,}${TASK_SEND_MESSAGE_IDS}"
+      # Rotate this gate's hash ONLY after ITS OWN confirmed receipt. Per-gate now,
+      # which is strictly better than the old batch rotation: a partial delivery no
+      # longer rotates hashes for gates whose message never landed.
+      if [[ -n "$nonce" ]]; then
+        db "UPDATE tasks SET human_nonce_hash=$(sqlq "$(_human_nonce_sha "$nonce")")
+            WHERE id=${id} AND need_answered_at IS NULL;" 2>/dev/null || true
+      fi
+    else
+      failed=$(( failed + 1 ))
     fi
   done < <(db "SELECT id||x'1f'||ident||x'1f'||priority||x'1f'||need_type||x'1f'||COALESCE(need_options,'')||x'1f'||COALESCE(recommend,'')||x'1f'||COALESCE(tier,'')||x'1f'||substr(replace(COALESCE(ask,''),x'0a',' '),1,240)
                FROM tasks WHERE ${where} ${order} LIMIT ${cap};")
-  if (( total > cap )); then
-    text+=$'\n\n'"…and $(( total - cap )) more — 5dive task inbox on the box or the dashboard."
+  if (( total > cap )) && (( sent > 0 )); then
+    export FIVEDIVE_NOTIFY_SILENT=1
+    _task_send_owner "…and $(( total - cap )) more gate(s) — 5dive task inbox on the box, or the dashboard." "" ""
   fi
-  text+=$'\n\n'"Tap a button, open a /task link, or answer from the dashboard."
-
-  local reply_markup=""
-  [[ "$kbrows" != "[]" ]] && reply_markup=$(jq -cn --argjson rows "$kbrows" '{inline_keyboard:$rows}' 2>/dev/null) || true
-
-  _task_send_owner "$text" "$reply_markup" "$idlist"
-  if [[ "${TASK_SEND_DELIVERED:-0}" == "1" ]]; then
-    # Rotate hashes only after a confirmed receipt (same ordering as the
-    # heartbeat re-nag): an earlier alert's button dies only once a live
-    # replacement is in the human's chat.
-    local i
-    for (( i=0; i<${#nonce_ids[@]}; i++ )); do
-      db "UPDATE tasks SET human_nonce_hash=$(sqlq "${nonce_hashes[$i]}")
-          WHERE id=${nonce_ids[$i]} AND need_answered_at IS NULL;" 2>/dev/null || true
-    done
-    # DIVE-2054: DELIBERATELY UNFENCED, same shape as "task clear-recs" (5389) —
-    # carries chat_proof=$channel_proof, proof a real channel was (or wasn't) hit
-    # for this digest send. A fixture store must never be able to suppress that.
+  if [[ -n "$_prev_silent" ]]; then export FIVEDIVE_NOTIFY_SILENT="$_prev_silent"; else unset FIVEDIVE_NOTIFY_SILENT; fi
+  TASK_SEND_MESSAGE_IDS="$all_mids"
+  if (( sent > 0 )); then
+    # DIVE-2054: DELIBERATELY UNFENCED, same shape as "task clear-recs".
     audit_log "task inbox send" "ok" 0 -- \
-      "gates=${shown}/${total}" "chat_proof=${channel_proof:-none}" "message_id=${TASK_SEND_MESSAGE_IDS:-none}"
-    ok "inbox digest sent (${shown}/${total} gates)" \
-      '{sent:true, gates:($g|tonumber), total:($t|tonumber), message_ids:$m}' \
-      --arg g "$shown" --arg t "$total" --arg m "${TASK_SEND_MESSAGE_IDS:-}"
+      "gates=${sent}/${total}" "delivery=per-gate" "failed=${failed}" \
+      "chat_proof=${channel_proof:-none}" "message_id=${all_mids:-none}"
+    ok "inbox sent (${sent}/${total} gates, one message each)" \
+      '{sent:true, gates:($g|tonumber), total:($t|tonumber), failed:($f|tonumber), message_ids:$m}' \
+      --arg g "$sent" --arg t "$total" --arg f "$failed" --arg m "${all_mids:-}"
   else
-    # DIVE-2054: DELIBERATELY UNFENCED, same exemption as the "ok" branch above.
+    # DIVE-2054: DELIBERATELY UNFENCED, same exemption as the "ok" branch above —
+    # chat_proof is the proof a real channel was (or was not) hit for this send, and
+    # a fixture store must not be able to suppress that record.
     audit_log "task inbox send" "error" 1 -- \
-      "gates=${shown}/${total}" "chat_proof=${channel_proof:-none}"
-    fail "$E_GENERIC" "inbox digest delivery unconfirmed — nonce hashes left unrotated, earlier alert buttons remain valid"
+      "gates=0/${total}" "delivery=per-gate" "failed=${failed}" "chat_proof=${channel_proof:-none}"
+    fail "$E_GENERIC" "inbox delivery unconfirmed — no gate message landed, so nonce hashes are left unrotated and earlier alert buttons remain valid (DIVE-2712: per-gate send)"
   fi
 }
 
