@@ -48,6 +48,7 @@ set -uo pipefail
 # 210 harnesses at once while every other check in this change stayed green.
 . "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh" \
   || printf 'grading tree: UNRESOLVED (tests/lib/grading_tree.sh not reachable; no tree named)\n' >&2
+trap 'rc=$?; rm -rf "${TMP:-}"; echo "HARNESS-RC=$rc"' EXIT   # DIVE-2692: fires on every exit path (incl. SKIP/precondition-fail early-exits); folds in tempdir cleanup so the two EXIT traps don't clobber each other.
 cd "$(dirname "$0")/.."
 
 PASS=0; FAIL=0
@@ -67,7 +68,7 @@ for fn in registry_read registry_read_checked envelope_tier; do
     || { echo "FAIL: could not extract ${fn} from $SRC (function missing?)"; exit 1; }
 done
 
-TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
+TMP="$(mktemp -d)"
 
 # ---------------------------------------------------------------------------
 # A. envelope_tier(): every path yields a non-empty, self-describing value.

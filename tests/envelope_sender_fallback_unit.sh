@@ -31,6 +31,7 @@ set -uo pipefail
 # fifteen ok, no summary, rc=10. 132 sibling harnesses carry this; grade the summary.
 set +e
 
+trap 'rc=$?; echo "HARNESS-RC=$rc"' EXIT   # DIVE-2692: fires on every exit path (incl. SKIP/precondition-fail early-exits); folds in tempdir cleanup so the two EXIT traps don't clobber each other.
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"
 SRC="$ROOT/src/cmd_agent_runtime.sh"

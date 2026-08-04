@@ -39,7 +39,7 @@ cd "$(dirname "$0")/.."
 
 SRC=src
 TMP="$(mktemp -d /tmp/whoami-for-chain-unit.XXXXXX)"
-trap 'rm -rf "$TMP"' EXIT
+trap 'rc=$?; rm -rf "${TMP:-}"; echo "HARNESS-RC=$rc"' EXIT   # DIVE-2692: fires on every exit path (incl. SKIP/precondition-fail early-exits); folds in tempdir cleanup so the two EXIT traps don't clobber each other.
 
 for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh \
          lib/agent_setup.sh lib/state.sh lib/audit.sh lib/registry.sh \

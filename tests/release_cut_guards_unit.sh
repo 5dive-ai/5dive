@@ -27,6 +27,7 @@ set -uo pipefail
 # 210 harnesses at once while every other check in this change stayed green.
 . "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh" \
   || printf 'grading tree: UNRESOLVED (tests/lib/grading_tree.sh not reachable; no tree named)\n' >&2
+trap 'rc=$?; rm -rf "${POLLDIR:-}"; echo "HARNESS-RC=$rc"' EXIT   # DIVE-2692: fires on every exit path (incl. SKIP/precondition-fail early-exits); folds in tempdir cleanup so the two EXIT traps don't clobber each other.
 cd "$(dirname "$0")/.."
 
 WF=.github/workflows/release-cut.yml
@@ -167,7 +168,6 @@ echo "== DIVE-2466: the guard POLLS instead of refusing on the first look =="
 # function outside the fence: with no stub these would hit the network, and a deleted
 # stub fails loudly rather than quietly grading one look.
 POLLDIR=$(mktemp -d /tmp/relcut-poll.XXXXXX)
-trap 'rm -rf "$POLLDIR"' EXIT
 
 poll_run(){ # $1.. = one check-runs fixture per look ; echoes "<verdict> looks=<n>"
   local i=0 f out rc

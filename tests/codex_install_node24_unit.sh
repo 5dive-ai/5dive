@@ -12,6 +12,7 @@ set -euo pipefail
 . "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh" \
   || printf 'grading tree: UNRESOLVED (tests/lib/grading_tree.sh not reachable; no tree named)\n' >&2
 
+trap 'rc=$?; rm -rf "${TMP:-}"; echo "HARNESS-RC=$rc"' EXIT   # DIVE-2692: fires on every exit path (incl. SKIP/precondition-fail early-exits); folds in tempdir cleanup so the two EXIT traps don't clobber each other.
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 # shellcheck source=../src/header.sh
@@ -135,7 +136,6 @@ echo "PASS: codex locator targets the installing npm's prefix and asserts it res
 # provide, and an unnamed one cannot be told from a rig that is merely broken.
 
 TMP="$(mktemp -d)"
-trap 'rm -rf "$TMP"' EXIT
 
 # The PRE-FIX locator, verbatim from before DIVE-2596, so the red anchor grades
 # the shape that actually shipped rather than a paraphrase of it.

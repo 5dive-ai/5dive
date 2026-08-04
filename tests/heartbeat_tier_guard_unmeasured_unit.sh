@@ -67,6 +67,7 @@ set -uo pipefail
 # DIVE-2229: pinned-commit baselines, fail-closed. Same no-2>/dev/null rule.
 . "$(dirname "${BASH_SOURCE[0]}")/lib/pinned_baseline.sh" \
   || printf 'pinned baseline helper: UNRESOLVED (tests/lib/pinned_baseline.sh not reachable)\n' >&2
+trap 'rc=$?; rm -rf "${TMP:-}"; echo "HARNESS-RC=$rc"' EXIT   # DIVE-2692: fires on every exit path (incl. SKIP/precondition-fail early-exits); folds in tempdir cleanup so the two EXIT traps don't clobber each other.
 cd "$(dirname "$0")/.."
 
 PASS=0; FAIL=0; SKIP=0
@@ -92,7 +93,7 @@ done
 eval "$(awk '/^_hb_tier_rank\(\) \{$/ { on=1 } on { print } on && $0 == "}" { exit }' src/cmd_heartbeat.sh)"
 declare -F _hb_tier_rank >/dev/null || { echo "FAIL: could not extract _hb_tier_rank"; exit 1; }
 
-TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
+TMP="$(mktemp -d)"
 
 FIXTURE='{"agents":{
   "dev":{"isolation":"admin"},

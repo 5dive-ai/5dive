@@ -7,6 +7,7 @@
 # "never ran" reproduces that defect one layer down, so every arm below is about
 # keeping those two apart.
 set -uo pipefail
+trap 'rc=$?; rm -rf "${T:-}"; echo "HARNESS-RC=$rc"' EXIT   # DIVE-2692: fires on every exit path (incl. SKIP/precondition-fail early-exits); folds in tempdir cleanup so the two EXIT traps don't clobber each other.
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 GRADE="${GRADE:-$HERE/../scripts/grade-release-commit.sh}"
 
@@ -18,7 +19,7 @@ GRADE="${GRADE:-$HERE/../scripts/grade-release-commit.sh}"
 pass=0; fail=0
 ok(){ if eval "$2"; then echo "ok   - $1"; pass=$((pass+1)); else echo "FAIL - $1"; fail=$((fail+1)); fi; }
 
-T=$(mktemp -d); trap 'rm -rf "$T"' EXIT
+T=$(mktemp -d)
 
 # A stand-in bundle whose behaviour each arm controls. The real bundle is 53k lines;
 # what is being graded here is the GRADER, so the artifact is stubbed deliberately.

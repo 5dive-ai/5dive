@@ -29,6 +29,7 @@
 # tasks.db. Actor is forced per-case via FIVE_SENDER/USER rather than sudo.
 # Run: bash tests/task_verify_over_closed_unit.sh
 set -uo pipefail
+trap 'rc=$?; rm -rf "${TMP:-}"; echo "HARNESS-RC=$rc"' EXIT   # DIVE-2692: fires on every exit path (incl. SKIP/precondition-fail early-exits); folds in tempdir cleanup so the two EXIT traps don't clobber each other.
 cd "$(dirname "$0")/.."
 # DIVE-2518: `USER=agent-x` no longer moves the actor; derive as them instead.
 . "$(dirname "${BASH_SOURCE[0]}")/lib/actor_seam.sh"
@@ -36,7 +37,6 @@ as_agent() { local _w="$1"; shift; ( actor_seam_as "$_w"; "$@" ); }
 SRC=src
 
 TMP="$(mktemp -d /tmp/task-verify-closed-unit.XXXXXX)"
-trap 'rm -rf "$TMP"' EXIT
 
 # shellcheck disable=SC1090
 for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh \

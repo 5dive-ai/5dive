@@ -56,7 +56,7 @@ FAILURES=()
 # next occurrence had nothing to inspect and needed a repro. On failure, keep
 # the dir and dump every captured artifact instead of deleting the evidence.
 cleanup() {
-  local rc=$?
+  local rc="$1"
   if [[ "${FAIL:-0}" -gt 0 || "$rc" -ne 0 ]]; then
     printf '\n=== FAILURE: TMP preserved for inspection: %s ===\n' "$TMP" >&2
     if [[ ${#FAILURES[@]} -gt 0 ]]; then
@@ -72,7 +72,7 @@ cleanup() {
     rm -rf "$TMP"
   fi
 }
-trap cleanup EXIT
+trap 'rc=$?; cleanup "$rc"; echo "HARNESS-RC=$rc"' EXIT   # DIVE-2692: cleanup() used to read $? itself; now takes it as $1 so this wrapper's own `rc=$?` doesn't clobber it before cleanup runs.
 
 # shellcheck disable=SC1090
 for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh \

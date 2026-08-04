@@ -13,6 +13,7 @@ set -euo pipefail
 # 210 harnesses at once while every other check in this change stayed green.
 . "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh" \
   || printf 'grading tree: UNRESOLVED (tests/lib/grading_tree.sh not reachable; no tree named)\n' >&2
+trap 'rc=$?; rm -f "${capture:-}" "${captured_settings:-}"; echo "HARNESS-RC=$rc"' EXIT   # DIVE-2692: fires on every exit path (incl. SKIP/precondition-fail early-exits); folds in tempdir cleanup so the two EXIT traps don't clobber each other.
 cd "$(dirname "$0")/.."
 
 # shellcheck disable=SC1091
@@ -26,7 +27,6 @@ source src/cmd_agent_create.sh
 
 capture=$(mktemp)
 captured_settings=$(mktemp)
-trap 'rm -f "$capture" "$captured_settings"' EXIT
 step() { :; }
 warn() { printf 'WARN %s\n' "$*" >>"$capture"; }
 profile_set_var() {

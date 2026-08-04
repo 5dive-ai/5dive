@@ -4,6 +4,7 @@
 # submission. This exercises the real interactive (PTY) branch of _init_pick.
 set -euo pipefail
 
+trap 'rc=$?; echo "HARNESS-RC=$rc"' EXIT   # DIVE-2692: fires on every exit path (incl. SKIP/precondition-fail early-exits); folds in tempdir cleanup so the two EXIT traps don't clobber each other.
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 # Driver script run *inside* a PTY: source the wizard's helpers, pick via the

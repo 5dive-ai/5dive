@@ -48,7 +48,7 @@ TMP="$(mktemp -d /tmp/gate-t2-decision-nonce.XXXXXX)"
 # the refusal it is meant to name.
 exec 8>&2
 REACHED_END=0
-trap 'rc=$?; if (( ! REACHED_END )); then printf "ABORT - gate_tier2_decision_nonce_unit truncated at rc=%d after %d ok / %d FAIL: an unsubshelled cmd_task_* call exited instead of grading. NOT a pass.\n" "$rc" "${PASS:-0}" "${FAIL:-0}" >&8; fi; rm -rf "$TMP"' EXIT
+trap 'rc=$?; if (( ! REACHED_END )); then printf "ABORT - gate_tier2_decision_nonce_unit truncated at rc=%d after %d ok / %d FAIL: an unsubshelled cmd_task_* call exited instead of grading. NOT a pass.\n" "$rc" "${PASS:-0}" "${FAIL:-0}" >&8; fi; rm -rf "$TMP"; echo "HARNESS-RC=$rc"' EXIT   # DIVE-2692: appends the HARNESS-RC line to this harness's pre-existing abort-backstop trap; trap stays where it was (TMP/REACHED_END/fd8 are all already live by this point) rather than moving to the top.
 
 # shellcheck disable=SC1090
 for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh \

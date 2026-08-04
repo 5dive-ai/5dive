@@ -29,6 +29,7 @@ set -uo pipefail
 # swallows the helper's own stderr line, which IS the payload.
 . "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh" \
   || printf 'grading tree: UNRESOLVED (tests/lib/grading_tree.sh not reachable; no tree named)\n' >&2
+trap 'rc=$?; rm -rf "${TMP:-}"; echo "HARNESS-RC=$rc"' EXIT   # DIVE-2692: fires on every exit path (incl. SKIP/precondition-fail early-exits); folds in tempdir cleanup so the two EXIT traps don't clobber each other.
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"; cd "$ROOT"
 
 for b in jq sha256sum date sed; do
@@ -38,7 +39,7 @@ SRC="$ROOT/src/cmd_council.sh"
 [[ -r "$SRC" ]] || { echo "SKIP: $SRC not readable"; exit 0; }
 date -u -d "+900 seconds" +%s >/dev/null 2>&1 || { echo "SKIP: GNU date -d not available"; exit 0; }
 
-TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
+TMP="$(mktemp -d)"
 pass=0; fail=0
 ok(){ echo "  ok:   $1"; pass=$((pass+1)); }
 no(){ echo "  FAIL: $1"; fail=$((fail+1)); }

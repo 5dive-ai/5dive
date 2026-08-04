@@ -40,7 +40,7 @@ PII_SCAN_SH="$ROOT/scripts/pii-scan.sh"
 
 TMP="$(mktemp -d /tmp/pii-scan-range-unit.XXXXXX)"
 cleanup() { rm -rf "$TMP"; }
-trap cleanup EXIT
+trap 'rc=$?; cleanup; echo "HARNESS-RC=$rc"' EXIT   # DIVE-2692: fires on every exit path; cleanup() has no $? dependency of its own so wrapping it is safe.
 
 PASS=0; FAIL=0
 ok_t()  { PASS=$((PASS+1)); printf 'ok   - %s\n' "$1"; }

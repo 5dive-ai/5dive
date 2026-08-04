@@ -46,12 +46,12 @@ set -uo pipefail
 # `set -e` harness is not killed by a failed source.
 . "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh" \
   || printf 'grading tree: UNRESOLVED (tests/lib/grading_tree.sh not reachable; no tree named)\n' >&2
+trap 'rc=$?; rm -rf "${TMP:-}"; echo "HARNESS-RC=$rc"' EXIT   # DIVE-2692: fires on every exit path (incl. SKIP/precondition-fail early-exits); folds in tempdir cleanup so the two EXIT traps don't clobber each other.
 cd "$(dirname "$0")/.."
 
 TIER_LIB="tests/lib/tier.sh"
 RUNNER="scripts/run-harnesses.sh"
 TMP="$(mktemp -d /tmp/corpus-tier-budget.XXXXXX)"
-trap 'rm -rf "$TMP"' EXIT
 
 pass=0; fail=0
 ok()  { pass=$((pass+1)); printf 'ok   %s\n' "$1"; }
