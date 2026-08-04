@@ -61,6 +61,10 @@ _task_usage() {
                                                      # -> done; --result captures the agent's response. --result-file reads it
                                                      # VERBATIM from a file (DIVE-2627) — the close record is permanent and the
                                                      # creator/dashboard read it, so a shell-eaten word is a wrong record forever.
+                                                     # VERIFIERS: put `graded-sha: <sha>` in the result. On a delivery-bound row the
+                                                     # gate compares it to what actually merged (PR head OR merge commit) and REFUSES
+                                                     # a mismatch — the sha that was graded is not always the sha that landed
+                                                     # (DIVE-2656). Say nothing and you get a nudge, not a block.
   5dive task deliver <id|DIVE-N> --pr=<url> [--result=<text>]
                                                      # maker: record the delivery PR + hand to verifier; 'task done' stays
                                                      # BLOCKED until the work is MERGED to main (opt-in merge-gate, DIVE-1830).
@@ -2229,6 +2233,57 @@ _gate_pr_state() {
       2>/dev/null || true
 }
 
+# DIVE-2656 PART 2: _gate_graded_sha <text> — the sha a verifier STATES it graded.
+#
+# This is a FENCE, not a scrape. It matches only a labelled declaration —
+# `graded-sha: <7-40 hex>` (also `graded sha`, `graded_sha`, `=` for `:`,
+# any case) — and deliberately NOT a bare 40-hex string sitting in prose. A
+# result routinely names shas it did not grade (the base it rebased onto, a
+# squash sha it is citing, a sha in a quoted error), so "there is a hex blob in
+# here" is a different claim from "this is what I graded" and only the second
+# one may drive a refusal. Prose that forks the map is how this surface breaks;
+# an explicit label is the whole reason the comparison downstream is safe.
+#
+# LAST occurrence wins: `--append-result` prepends the earlier close's text, so
+# the most recent statement is the later one.
+# Prints lowercase hex, or EMPTY when the result makes no such claim. Empty is
+# "the verifier said nothing", never "it matched" — the caller must not read it
+# as a pass.
+_gate_graded_sha() {
+  local txt="${1:-}" line sha=""
+  while IFS= read -r line; do
+    if [[ "$line" =~ [Gg][Rr][Aa][Dd][Ee][Dd][-_\ ][Ss][Hh][Aa][[:space:]]*[:=][[:space:]]*([0-9a-fA-F]{7,40}) ]]; then
+      sha="${BASH_REMATCH[1]}"
+    fi
+  done <<<"$txt"
+  printf '%s' "${sha,,}"
+}
+
+# DIVE-2656 PART 1: _gate_pr_shas <ref> <tok> — the two shas a merged PR can be
+# legitimately said to carry, as `<headRefOid>|<mergeCommit.oid>`.
+#
+# BOTH, on purpose. A verifier who graded the BRANCH states its head; one who
+# graded the LANDED result states the merge commit. Accepting only the first
+# would false-REFUSE the second, and a false refuse blocks every close while a
+# false green closes one row wrongly (community/wiki/a-stored-graded-sha-cannot-
+# survive-a-squash-merge.md). Note what is NOT asked here: ancestry. Under
+# squash the branch head is never an ancestor of main, so ancestry against a
+# stored sha false-REDs 100% of rows — this is an EQUALITY test between the sha
+# the verifier named and the sha the PR actually carried, which squash does not
+# touch. GitHub keeps headRefOid on a merged PR even after the branch is deleted.
+#
+# Prints EMPTY (or `|`) when the query could not be reached; the caller renders
+# that as NOT CHECKED, never as a mismatch.
+_gate_pr_shas() {
+  local ref="$1" tok="$2" slug="${3:-}"
+  local -a repo_arg=()
+  [[ "$ref" =~ ^[0-9]+$ ]] && repo_arg=(--repo "$slug")
+  _gate_gh "$tok" 10 pr view "$ref" "${repo_arg[@]}" \
+      --json headRefOid,mergeCommit \
+      -q '[(.headRefOid // ""), (.mergeCommit.oid // "")] | join("|")' \
+      2>/dev/null || true
+}
+
 # DIVE-2101: _gate_branch_ancestry <slug> <branch> <tok> — is <branch>'s tip an
 # ANCESTOR of that repo's main? Prints "1" (yes: every commit on the branch is
 # already on main), "0" (demonstrably not) or EMPTY when the question could not be
@@ -2918,6 +2973,62 @@ _task_status_cmd() {
         fi
         if [[ "$_state" != "MERGED" || -z "$_merged" || "$_merged" == "null" ]]; then
           policy_refuse "$E_CONFLICT" done-before-pr-merged DIVE-1830 "$ident" "$ident cannot close: its delivery PR is not merged to main yet ($_dref, state=$_state — MEASURED, not assumed). done=merged-to-main (DIVE-1830) — merge the PR, then run task done. Use \`task cancel\` to abandon."
+        fi
+        # DIVE-2656: MERGED is not the same as MERGED-WHAT-THE-VERIFIER-GRADED.
+        #
+        # ORIGIN, measured: PR #425 (DIVE-2654) carried the commit main2 had
+        # REJECTED while GitHub read CLEAN / MERGEABLE / 14 checks green. The
+        # graded fix existed only on dev2's local branch and was never pushed.
+        # Every predicate above this line was satisfied and every one of them was
+        # answering a question about the PR, not about the VERDICT. A merge was
+        # one command from landing rejected code and it was caught by hand.
+        #
+        # The check is an EQUALITY between two shas: the one the verifier NAMED
+        # in its result (`graded-sha: <hex>`) and the one the PR actually carried
+        # (head, or the merge commit — see _gate_pr_shas for why both). It is
+        # explicitly NOT ancestry: a squash rewrites the sha, so ancestry against
+        # a stated sha false-REDs every squash-merged PR
+        # (community/wiki/a-stored-graded-sha-cannot-survive-a-squash-merge.md).
+        #
+        # WHY IT IS WORTH MORE THAN THE ROWS IT CATCHES, and this is main's
+        # argument rather than mine: A CHECK THAT FORCES A PATH TO RUN FINDS MORE
+        # THAN A CHECK THAT INSPECTS IT. On the night this was filed two fail-opens
+        # sat on one path and suppressed each other — agent-main2 could not sign a
+        # gate proof (three gates answered with an EMPTY signature, never failing),
+        # and the graded fix was never pushed. Each defect's SYMPTOM was the other
+        # defect's ABSENCE, so inspecting either in isolation surfaced nothing.
+        # Comparing the stated sha to the merged one EXERCISES the delivery step on
+        # every close, which is what makes a pair like that observable at all.
+        #
+        # OPT-IN BY CONSTRUCTION, and that is deliberate: it fires only when the
+        # result MAKES the claim. A verifier that says nothing gets a nudge, never
+        # a refusal — the enabling half costs nothing, so it must not be able to
+        # block a close on a row whose verifier has not adopted the form yet.
+        local _graded; _graded=$(_gate_graded_sha "$result")
+        if [[ -n "$_graded" ]]; then
+          local _prshas _headsha _mcsha
+          _prshas=$(_gate_pr_shas "$_dref" "$_ghtok" "$(_gate_slug_from_url "$_dref")")
+          _headsha="${_prshas%%|*}"; _mcsha="${_prshas##*|}"
+          _headsha="${_headsha,,}"; _mcsha="${_mcsha,,}"
+          if [[ -z "$_headsha" && -z "$_mcsha" ]]; then
+            # DIVE-2318's rule, one level down: a query that did not run is not a
+            # mismatch. Say NOT CHECKED out loud rather than accepting silently —
+            # the close proceeds, but nobody may later read it as "the shas matched".
+            warn "$ident: the result states graded-sha $_graded, but $_dref's head/merge sha COULD NOT BE READ — the comparison did NOT run (DIVE-2656). This is 'not checked', not 'matched'; verify by hand with \`gh pr view $_dref --json headRefOid,mergeCommit\`."
+          elif [[ ( -n "$_headsha" && "$_headsha" == "$_graded"* ) || ( -n "$_mcsha" && "$_mcsha" == "$_graded"* ) ]]; then
+            step "$ident: graded-sha $_graded matches $_dref (head ${_headsha:0:12}${_mcsha:+, merge ${_mcsha:0:12}}) — the merged work IS the graded work (DIVE-2656)."
+          elif [[ $force_merge_gate -eq 1 ]]; then
+            _task_store_audit_log "task.force-merge-gate" ok 0 -- "$ident" "override_graded_sha_mismatch=$_dref graded=$_graded head=$_headsha merge=$_mcsha"
+            warn "$ident: graded-sha $_graded matches NEITHER $_dref's head ($_headsha) nor its merge commit ($_mcsha) — closing anyway (--force-merge-gate, audited)."
+          else
+            policy_refuse "$E_CONFLICT" done-graded-sha-not-the-merged-sha DIVE-2656 "$ident" "$ident cannot close: its result states it graded $_graded, but $_dref merged ${_headsha:+head $_headsha}${_headsha:+${_mcsha:+ / }}${_mcsha:+merge commit $_mcsha} — the sha that was GRADED is not the sha that LANDED (DIVE-2656; MEASURED, both operands read from GitHub). A merged PR is not evidence the verdict was cleared: on a maker->verifier loop the maker can push after the verdict, or fix in a NEW PR and leave this row bound to the old one, and every other check on this gate would still pass. Resolve it, do not route around it: if the graded work is in a different PR, re-point the binding (\`task deliver $ident --pr=<url>\`) and close against that; if this PR is right and the sha statement is stale, re-grade the head that actually merged and state THAT sha. \`task done $ident --force-merge-gate\` overrides (audited) — use it only when you have confirmed by hand that the merged content is the graded content."
+          fi
+        elif [[ "$(db "SELECT CASE WHEN maker_agent IS NOT NULL AND verifier IS NOT NULL AND verifier<>'' THEN 1 ELSE 0 END FROM tasks WHERE id=${id};")" == "1" ]]; then
+          # PART 2, the enabling half. A nudge and never a refusal: without the
+          # stated sha there is no second operand, so the guard above is inert on
+          # this row — say so at the moment it would have fired, which is the only
+          # moment the closer can act on it.
+          warn "$ident: closed on a maker->verifier loop with no \`graded-sha: <sha>\` in the result, so the DIVE-2656 head-vs-graded comparison did NOT run — $_dref merged unverified against any stated verdict. State the sha you graded in every done/reject result; it is what makes the guard possible."
         fi
         # DIVE-1935: MERGED is not the same as GREEN.
         # Slug pairing: this DECLARED-binding site is `done-after-red-merge`; the
