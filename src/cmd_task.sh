@@ -537,9 +537,19 @@ _task_internal_recent_ratio() {
   while IFS= read -r line; do
     [[ -z "$line" ]] && continue
     n=$((n + 1))
-    [[ -n "$(_task_internal_subject_reason "$line")" ]] && hits=$((hits + 1))
+    # `if`, not `[[ ]] && ...`: as the LAST command in a loop body a false
+    # `&&` list makes the body — and so the loop — exit 1, which `set -e`
+    # takes as a failure. Same family as the defect this whole ticket exists
+    # to stop generating.
+    if [[ -n "$(_task_internal_subject_reason "$line")" ]]; then
+      hits=$((hits + 1))
+    fi
   done < <(db "SELECT REPLACE(title, char(10), ' ') FROM tasks WHERE kind='standard' ORDER BY id DESC LIMIT ${window};")
-  printf '%s %s' "$hits" "$n"
+  # THE TRAILING NEWLINE IS LOAD-BEARING. `read` returns 1 when it hits EOF
+  # without a delimiter, so a bare "%s %s" makes the CALLER's `read` fail, and
+  # under src/header.sh's `set -euo pipefail` that killed `task add` outright
+  # with no error path reached — the exact silent-death class of DIVE-2604.
+  printf '%s %s\n' "$hits" "$n"
 }
 
 # Resolve the lone org root (the single top of the chart — reports_to NULL or a
@@ -829,7 +839,14 @@ cmd_task_add() {
     internal_reason=$(_task_internal_subject_reason "$title")
   fi
   if [[ -n "$internal_reason" && -z "$already_blocked" && "${FIVE_FILING_CAP:-1}" != "0" ]]; then
-    local _hits _win; read -r _hits _win < <(_task_internal_recent_ratio 20)
+    # `|| true` on the read as well as the newline at the producer: two
+    # independent guards, because a filing rule must never be able to take
+    # `task add` down. If the read ever comes back empty the cap declines to
+    # enforce rather than dying — a control that fails OPEN is the right
+    # posture for a quota, and the wrong one for a security check.
+    local _hits=0 _win=0; read -r _hits _win < <(_task_internal_recent_ratio 20) || true
+    [[ "$_hits" =~ ^[0-9]+$ ]] || _hits=0
+    [[ "$_win"  =~ ^[0-9]+$ ]] || _win=0
     # Only enforce once the window is big enough to mean anything — on a fresh
     # board a 1-in-4 rule computed over three rows is noise, not a signal.
     if (( _win >= 8 )) && (( (_hits + 1) * 4 > (_win + 1) )); then
