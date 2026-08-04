@@ -1888,7 +1888,7 @@ _gate_subject_verdict() {
   _gate_pr_refs_engine_ok || { printf 'UNKNOWN|ref-parser-broken'; return 0; }
   command -v gh >/dev/null 2>&1 || { printf 'UNKNOWN|gh-absent'; return 0; }
   [[ -n "$tok" ]] || { printf 'UNKNOWN|no-gh-token'; return 0; }
-  n=$(printf '%s\n' "$refs" | grep -c .)
+  n=$(printf '%s\n' "$refs" | grep -c .) || n=0
   local states open="" merged="" unk=""
   states=$(printf '%s\n' "$refs" | head -n "$_GATE_SUBJECT_CAP" | _gate_ref_states "$tok" "$ident" "$task_slug")
   local num st where
@@ -1924,7 +1924,7 @@ _gate_cited_state_note() {
   refs=$(printf '%s\n' "$qrefs" | grep . || true)
   [[ -n "$refs" ]] || { printf 'no cited reference resolved to read'; return 0; }
   [[ -n "$tok" ]] || { printf 'state NOT read (no gh credential resolved)'; return 0; }
-  n=$(printf '%s\n' "$refs" | grep -c .)
+  n=$(printf '%s\n' "$refs" | grep -c .) || n=0
   while IFS='|' read -r num st where; do
     [[ -n "$num" ]] || continue
     out="${out:+$out; }#${num} ${st} in ${where}"

@@ -532,7 +532,7 @@ _push_open_pr() {
   # refused — is advice that is wrong in the most likely failure mode there is.
   # gh names the existing PR and its URL in that message; surface those.
   if [[ $rc -ne 0 && "$out" == *"already exists"* ]]; then
-    local existing; existing=$(printf '%s' "$out" | grep -oE 'https://github\.com/[^ ]+/pull/[0-9]+' | head -1)
+    local existing; existing=$(printf '%s' "$out" | grep -oE 'https://github\.com/[^ ]+/pull/[0-9]+' | head -1) || existing=""
     ok "${ident} already has a pull request (${existing:-see above}) for ${branch} -> ${base} in ${slug} — branch pushed, nothing more to open" \
        "$(jq -n --arg t "$ident" --arg u "${existing:-}" --arg b "$branch" --arg base "$base" --arg r "$slug" \
              '{task:$t,pr:$u,branch:$b,base:$base,repo:$r,actor:"5dive-bot",created:false}')"

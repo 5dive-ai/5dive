@@ -157,7 +157,7 @@ cmd_loop_pack_install() {
   if (( JSON_MODE )); then
     ident=$(jq -r '.data.ident // empty' <<<"$out" 2>/dev/null)
   else
-    ident=$(grep -oE 'DIVE-[0-9]+' <<<"$out" | head -1)
+    ident=$(grep -oE 'DIVE-[0-9]+' <<<"$out" | head -1) || ident=""
   fi
   [[ -n "$ident" ]] || fail "$E_GENERIC" "failed to register the recurring job for loop '$slug'"
 

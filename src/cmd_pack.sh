@@ -1120,7 +1120,7 @@ _pack_memory_leakscan() {
     # (a repo URL is also a hostname), so the report would under-name the work.
     done | grep -vE "$_PACK_LEAK_EXEMPT_RE" | grep -vE "$_PACK_LEAK_NAME_EXEMPT_RE" \
          | awk '!seen[$0]++' | sort -t: -k1,1 -k2,2n -s
-  )
+  ) || found=""
 
   [[ -n "$found" ]] || return 0
   printf '%s\n' "$found" >&2
@@ -1234,7 +1234,7 @@ AGENTS_MD_S_MEMORY='<!-- 5dive:memory -->'
 # that itself contains fences (memory facts routinely hold ``` code blocks).
 _agents_md_fence() {
   local f="$1" n
-  n=$(grep -oE '^~{3,}' "$f" 2>/dev/null | awk '{ if (length($0) > m) m = length($0) } END { print m + 0 }')
+  n=$(grep -oE '^~{3,}' "$f" 2>/dev/null | awk '{ if (length($0) > m) m = length($0) } END { print m + 0 }') || n=0
   (( n < 5 )) && n=5
   printf '%*s\n' "$((n + 1))" '' | tr ' ' '~'
 }

@@ -412,7 +412,7 @@ cmd_agent_cos() {
     [[ -r "$avatar" ]] || fail "$E_NOT_FOUND" "--avatar not readable: $avatar"
     local tok_env="$(dirname "$cos_env")/telegram-${agent}.env" atok
     [[ -r "$tok_env" ]] || fail "$E_NOT_FOUND" "no telegram token for agent '$agent' at $tok_env (is it a telegram agent?)"
-    atok=$(sudo grep -m1 -oP '(?<=^TELEGRAM_BOT_TOKEN=).*' "$tok_env" 2>/dev/null | tr -d '"'"'"'' | tr -d '[:space:]')
+    atok=$(sudo grep -m1 -oP '(?<=^TELEGRAM_BOT_TOKEN=).*' "$tok_env" 2>/dev/null | tr -d '"'"'"'' | tr -d '[:space:]') || atok=""
     [[ -n "$atok" ]] || fail "$E_NOT_FOUND" "TELEGRAM_BOT_TOKEN empty/missing in $tok_env"
     COS_TOKEN_OVERRIDE="$atok" "$bun" "$COS_RUN_DIR/cos-runner.ts" set-avatar --avatar="$avatar"
     return $?
@@ -434,7 +434,7 @@ cmd_agent_cos() {
       [[ -r "$cos_env" ]] || fail "$E_NOT_FOUND" "no CoS token at $cos_env — run: 5dive agent cos set --token=<token>"
       local tok_env="$(dirname "$cos_env")/telegram-${r_agent}.env" atok
       [[ -r "$tok_env" ]] || fail "$E_NOT_FOUND" "no telegram token for agent '$r_agent' at $tok_env (is it a telegram agent?)"
-      atok=$(sudo grep -m1 -oP '(?<=^TELEGRAM_BOT_TOKEN=).*' "$tok_env" 2>/dev/null | tr -d '"'"'"'' | tr -d '[:space:]')
+      atok=$(sudo grep -m1 -oP '(?<=^TELEGRAM_BOT_TOKEN=).*' "$tok_env" 2>/dev/null | tr -d '"'"'"'' | tr -d '[:space:]') || atok=""
       [[ -n "$atok" ]] || fail "$E_NOT_FOUND" "TELEGRAM_BOT_TOKEN empty/missing in $tok_env"
       local botid="${atok%%:*}"
       [[ "$botid" =~ ^[0-9]+$ ]] || fail "$E_VALIDATION" "could not derive a bot-id from agent '$r_agent' token (is it a CoS-minted bot?)"

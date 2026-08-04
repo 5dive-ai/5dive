@@ -34,7 +34,7 @@ SRC=src/cmd_agent_create.sh
 # is exactly "  fi" — the shipped text, indentation and continuations included.
 extract_guard() {
   local anchor="$1" start
-  start=$(grep -nF -- "$anchor" "$SRC" | head -1 | cut -d: -f1)
+  start=$(grep -nF -- "$anchor" "$SRC" | head -1 | cut -d: -f1) || start=""
   [[ -n "$start" ]] || {
     echo "FAIL: anchor not found in $SRC: $anchor" >&2
     echo "      (the guard moved or was reworded — re-anchor this test, do not delete it)" >&2
