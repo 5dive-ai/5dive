@@ -311,6 +311,79 @@ r4=$(run add --assignee=@eng --body="w" -- "at-name form")
 [[ "$(echo "$r4" | jf '.data.assignee')" == "eng" ]] \
   && ok_t "@name is stripped to bare name" || bad_t "@name" "$(echo "$r4" | jf '.data.assignee')"
 
+# --- T-2719: verification DEPTH is re-measured at delivery, and the default
+# GRADER is no longer structurally a leader.
+#
+# _task_delivery_depth is the pure half (path list on stdin -> class), so it is
+# graded directly: no gh, no network, no PR. The gh-backed half
+# (_task_delivery_paths) is exercised on the box, not here — every one of its
+# failure paths prints nothing, and "prints nothing" is the input the class
+# function already gets its unknown-stays-unknown arm from (T-2719d).
+d=$(printf 'tests/foo_unit.sh\ndocs/x.md\nchangelog.d/DIVE-1.md\n' | _task_delivery_depth)
+[[ "$d" == "shallow" ]] \
+  && ok_t "delivery depth: tests/docs/changelog only -> shallow" || bad_t "shallow class" "got '$d'"
+
+# deep WINS over shallow — a mixed set is never downgraded, and the deep path is
+# read even though it arrives after two shallow ones.
+d=$(printf 'docs/x.md\ntests/y.sh\nsrc/cmd_heartbeat.sh\n' | _task_delivery_depth)
+[[ "$d" == "deep" ]] \
+  && ok_t "delivery depth: a blast-radius path beats a shallow majority" || bad_t "deep wins" "got '$d'"
+
+# ORDINARY code is neither: the class must stay EMPTY so the caller changes
+# nothing. Without this arm the two above are satisfied by a function that only
+# ever answers deep-or-shallow, which would rewrite every close on the fleet.
+d=$(printf 'src/cmd_agent.sh\ntests/y.sh\n' | _task_delivery_depth)
+[[ -z "$d" ]] \
+  && ok_t "delivery depth: ordinary code -> unchanged behaviour (empty)" || bad_t "ordinary class" "got '$d'"
+
+# T-2719d: an EMPTY list is UNKNOWN, not shallow. This is the arm that keeps a
+# missing gh credential from silently waiving the rail — the all_shallow flag is
+# vacuously true on an empty list, so nothing but the `have` guard stops it.
+d=$(printf '' | _task_delivery_depth)
+[[ -z "$d" ]] \
+  && ok_t "delivery depth: no paths -> unknown, never shallow" || bad_t "empty list class" "got '$d'"
+
+# The named exclusion list: data, not a code change.
+FIVE_VERIFY_EXCLUDE="main, dev2" _task_verify_excluded main \
+  && ok_t "verify exclusion: a listed name is excluded" || bad_t "exclusion hit" "main not excluded"
+FIVE_VERIFY_EXCLUDE="main, dev2" _task_verify_excluded eng \
+  && bad_t "exclusion miss" "eng excluded by a list that does not name it" \
+  || ok_t "verify exclusion: an unlisted name is untouched"
+_task_verify_excluded main \
+  && bad_t "exclusion default" "excluded with FIVE_VERIFY_EXCLUDE unset" \
+  || ok_t "verify exclusion: ships inert (unset list excludes nobody)"
+
+# BASELINE FIRST, so the QA rung below is proven to be what moved the answer and
+# not something the fixture already did: with no QA agent in the chart, the
+# picker walks up and lands on the leader.
+org_seed vfmaker --manager=vflead
+org_seed vflead --title="Engineering Lead"
+base_v=$(_task_default_verifier vfmaker "")
+[[ -n "$base_v" && "$base_v" != "vfmaker" ]] \
+  && ok_t "default verifier baseline: walks up to '$base_v' with no QA in the chart" \
+  || bad_t "verifier baseline" "got '$base_v'"
+
+# Now name a QA agent. It must win — the chart had already answered who grades.
+org_seed vfquinn --title="QA / testing"
+v=$(_task_default_verifier vfmaker "")
+[[ "$v" == "vfquinn" ]] \
+  && ok_t "default verifier: a designated QA agent outranks the up-chain leader" \
+  || bad_t "QA rung" "got '$v' (baseline was '$base_v')"
+[[ "$v" != "$base_v" ]] \
+  && ok_t "default verifier: the QA rung CHANGED the answer (not a coincidence)" \
+  || bad_t "QA rung non-vacuity" "same answer as the baseline"
+
+# ...and the exclusion list reaches the picker, not just the predicate.
+v=$(FIVE_VERIFY_EXCLUDE="vfquinn" _task_default_verifier vfmaker "")
+[[ -n "$v" && "$v" != "vfquinn" ]] \
+  && ok_t "default verifier: an excluded candidate is skipped for the next rung" \
+  || bad_t "picker exclusion" "got '$v'"
+
+# The maker is still never their own grader, with or without the new rungs.
+v=$(_task_default_verifier vfquinn "")
+[[ "$v" != "vfquinn" ]] \
+  && ok_t "default verifier: the QA agent does not grade its own work" || bad_t "self-grade" "got '$v'"
+
 echo "-----"
 echo "task_core_unit: $PASS passed, $FAIL failed"
 [[ $FAIL -eq 0 ]]
