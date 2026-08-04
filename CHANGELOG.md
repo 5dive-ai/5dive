@@ -1,5 +1,332 @@
 # Changelog
 
+## v0.19.1 — fix(heartbeat): a tier HOLD skips the held TASK, not the whole agent (DIVE-2716)
+
+The wake loop picked ONE todo per agent (`_hb_pick_task`, LIMIT 1) and, when DIVE-1065's
+tier guard refused to auto-drive it, ran `continue` on the AGENT. Task selection is
+deterministic, so the same row was re-picked and re-held every tick and everything queued
+behind it was unreachable forever. Measured on the live board 2026-08-04: five held rows
+head-of-line blocking 122 runnable ones, the fleet idle for 2h35m, `main`'s queue stuck
+since 2026-07-30.
+
+The guard itself was right and is unchanged — a standard-tier creator still cannot make an
+admin-tier agent execute work. What changed is the scope of the verdict: the wake loop now
+walks the candidate list in the same DIVE-979 priority/critical-path order and takes the
+first row the guard clears. A held row stays held, is never the wake target, and still names
+itself in the log; the tick additionally reports how many rows it stepped over, and the tick
+summary carries a `tierHeld` count. The scan is bounded (`_HB_PICK_SCAN=25`) and hitting that
+bound is logged as "rows past the cap were not examined" rather than passed off as an idle
+agent.
+
+The falsified premise is worth stating because it is not specific to this guard: the block's
+own comment argued "a hold skips ONE agent's wake this tick and never aborts the tick". Both
+halves are true per tick. Per-event isolation says nothing about an event that repeats with
+identical input, and this one repeated every five minutes.
+
+`tests/heartbeat_tier_head_of_line_unit.sh` drives the REAL `cmd_heartbeat_tick` on a scratch
+board and anchors against the pre-fix `cmd_heartbeat.sh` from a pinned commit: same fixture,
+pre-fix reaches ZERO of the five runnable rows queued behind a held head, post-fix reaches one
+— with the anchor graded for vacuity (the pre-fix run must still log the hold, or "no wake"
+would prove nothing).
+
+Two of the arms exist to keep the guard and the scheduler separable, because most of the
+obvious assertions cannot tell them apart: anything of the form "the tick wakes row X" reds
+both when the guard stops refusing and when the scheduler stops stepping over. So the guard
+half is pinned by "a fully-held queue wakes NOBODY" and the scheduler half by "a queue holding
+runnable work never leaves the agent idle" — the latter names no particular row and therefore
+survives a neutered guard while reding the moment a held head blocks the agent again.
+
+The `tierHeld` counter is graded rather than merely emitted. Stepping over a held head removes
+the blocking symptom that made this bug findable at all — DIVE-2459 sat held from 2026-07-30
+and went unnoticed for five days — so an unobservable skip would trade a loud permanent stall
+for a quiet permanent hold and make the next occurrence harder to find than this one was.
+
+## v0.19.1 — fix(council): a failed `verify` is a verdict, not a silent crash (DIVE-2711)
+
+`council verify` returned `E_GENERIC` on a legitimate failure — a drifted `constitution.yaml`,
+which it is *supposed* to fail closed on — without calling `mark_reported`. The EXIT backstop in
+`lib/output.sh` then treated that deliberate non-zero exit as an unreported one and appended its
+generic *"exited 1 without reporting a reason … this is a bug in the CLI"* text.
+
+On the stderr rail that is only noise. Under `--json` it is a **correctness bug**: the backstop
+emits a SECOND JSON object on stdout, so the command stops returning one document. Every reader
+breaks the same way — `jq -r '.data.constitutionOk'` returns `"false\nnull"` instead of `"false"`,
+so a caller checking `== "false"` sees a drifted constitution as *not flagged*. The verdict was
+right and unreadable, which is worse than either alone.
+
+Fixed by marking the failure reported: both rails already print the reason (the JSON envelope
+carries `constitutionOk` and `constitution`, the prose rail prints the `council verify: FAILED`
+block), so the backstop has nothing to add.
+
+**Why it only ever showed up on the installed-host CI matrix.** The environment did not change the
+bug; it changed how far the harness got. `council_amend_e2e.sh` drives real `convene` calls whose
+preflight needs a reachable agent registry, so on a pristine runner it stops before the drift arm
+and the defect is never reached. On a box with 5dive installed the preflight passes, the arm runs,
+and the second JSON object appears. `council_unit.sh` reds only because it aggregates that file.
+
+Also: the arm's failure message now prints the rc, stdout and stderr it rejected. It previously
+said only "verify json did not flag the drift", which is the one thing the payload already made
+obvious while hiding the second envelope that was the actual cause.
+
+## v0.19.1 — fix(merge-gate): a dead GitHub query no longer counts as a completed scan (DIVE-2705)
+
+`_gate_gh` ended `|| true; return 0` on **both** rails and discarded stderr on both, so a call
+that DIED and a call that succeeded and found nothing were indistinguishable on every channel at
+once: same empty stdout, same empty stderr, same exit 0.
+
+Most call sites were unharmed because the contract is carried by OUTPUT — DIVE-2318 reads
+`-z "$_state"` / `-z "$_attr"` and refuses as UNRESOLVED, which is why those paths were already
+honest. The autodetect scan is the exception: it counts a repo as scanned on the **exit status**
+(`_hit=$(_gate_gh …) && _sc_ok=$((_sc_ok+1))`), so an unlistable repo incremented `_sc_ok`,
+`_sc_ok == _sc_total` set `_scan_ran=1`, and the whole partial-repo-scan block — warn, audit row,
+`merge-gate: UNVERIFIED` stamp — never fired. Partial coverage was announced as a clean scan:
+the exact defect DIVE-1955 exists to delete, surviving one level down inside its own remedy.
+
+**Blast radius is refusals only, never acceptances.** `_GATE_ROLLUP_JQ` maps an empty rollup to
+`NONE` and never to `OK`, so no dead call could ever manufacture a green. No bad `done` was
+admitted by this bug.
+
+Three changes:
+
+1. **Both rails return the real status**, and stderr is captured into `_GATE_GH_LAST_ERR` rather
+   than discarded. An unusable bot rail now returns non-zero too — "there was nothing to run it
+   with" is not "the query ran and found nothing". Stderr is captured rather than passed through
+   deliberately: a repo a token cannot see is an ordinary condition on a multi-repo close, and
+   printing gh's error text on every gate would be the alarm fatigue DIVE-2711 names.
+2. **`_scan_why` stops using the token as a proxy for reachability.** `no-gh-token` is now only
+   reported when no rail answered at all (`_sc_total == 0`), and partial coverage is judged on how
+   many repos ANSWERED rather than on which rail asked. This was the same token-as-proxy that
+   DIVE-2605 replaced with `_gate_gh_reachable` one level up, left behind here — with the bot rail
+   reporting real failures it made a partial bot-rail scan announce itself as `no-gh-token`, which
+   is wrong and is the more reassuring of the two errors.
+3. **An arm that drives the bot rail.** The fixture exports `GH_STUB_AUTH_TOKEN`, so every
+   pre-existing arm in `task_merge_gate_multirepo_unit.sh` took the token rail and none could see
+   the bot rail's copy of the defect — a token-rail-only fix would have turned the corpus green
+   with the bot rail still laundering partial coverage, and the green is what would have stopped
+   anyone looking. The sudo stub gained a `BOT_RAIL_ON` mode serving the same fixtures over
+   stdin-delivered args; default behaviour is unchanged, so no existing arm moved.
+
+## v0.19.1 — fix(release): the changelog.d fold's deletions are part of the release commit (DIVE-2700)
+
+release-cut could not complete ANY cut while a `changelog.d` fragment existed. DIVE-2582
+added the fragment fold to the release commit — it merges `changelog.d/*.md` into
+`CHANGELOG.md` and deletes the fragments — but `grade-release-commit.sh`'s allowed-path set
+was never extended, so the inheritance premise reported the deletions as paths "OUTSIDE the
+release-commit set" and refused. The guard was correct; its premise had gone stale. v0.19.0
+was the first cut attempted afterwards and it died on 7 fragment deletions. Patch and minor
+cuts were equally affected, and the pipeline could not drain itself because the fold is what
+removes the fragments.
+
+The drift check that exists to catch exactly this (`grade_release_commit_unit.sh` section 11)
+missed it: its census matched the literal string `git add -f`, and the new writer is
+`git add -A -f changelog.d` behind an `if [ -d ]` guard, so it counted 4 of 5 writers and
+reported none unlisted. Both halves are fixed — the path set now admits `changelog.d/*`
+(entries are globs, split with `read -ra` so the pattern is not glob-expanded against the
+working directory before it can be used), and the census matches any `git add` regardless of
+flag order or guard shape.
+
+**This entry missed v0.19.0.** Its first version opened with `### Fixed` rather than the
+required `## Unreleased` heading, so the fold skipped it — correctly, and loudly enough to
+print, but non-fatally by design, because a cut must not die over a malformed fragment. The
+fix it describes did ship in v0.19.0; only the note is late.
+
+## v0.19.1 — fix(ci): full-sweep runs on every push to main, cost-bounded (DIVE-2667)
+
+`full-sweep.yml` has carried the comment **"A RED HERE IS NOT IGNORABLE"** since
+DIVE-2525. On 2026-08-03 it was ignored for about seventeen hours. "Not ignorable"
+was a property of the **consequence** — release-cut grades the same corpus, so a
+week-old red is a release that will not cut — and never of the **signal**.
+
+Two halves, each survivable alone:
+
+- **Cadence.** One `schedule:` at 03:17 UTC. Last green nightly `1cc1ce1e5`
+  (06:39Z), next observation `193e91291` (23:55Z) FAILURE, ~12 commits between
+  them — so the break was not attributable to a merge without bisecting.
+- **Surface.** full-sweep is **not in the per-PR check set**. PR #429 merged on
+  15/15 green with full-sweep not among the fifteen. Every PR that day could be
+  green *on its own checks* while the corpus rotted underneath. Nobody ignored a
+  red; the red was not on a surface anyone reads before merging.
+
+`push: branches: [main]` closes both: the latency to notice drops from up to a day
+to the length of one sweep, and the tier runs at the granularity that **attributes
+a break to one merge — between bursts** (the qualifier is real; see below). The
+`schedule:` stays — it is the arm that catches a break with **no commit behind it**
+(a runner image change, an expiring fixture, a rate limit).
+
+**Frequency and affordability are one change, not two.** The cost is **not money** —
+this repo is public and every job is `ubuntu-latest`, so standard runners are free.
+It is **wall-clock and queue contention**: six jobs at ~10 minutes, at ~20
+merges/day, against a pool every other workflow is also waiting on. So the push
+trigger ships with
+`concurrency: {group: full-sweep-${{ github.ref }}, cancel-in-progress: true}`: a
+burst of merges collapses into one sweep of the newest tip, and **nothing goes
+ungraded, because the cancelled run's tree is a strict ancestor of the survivor's**
+— it is graded later, at a tip that also contains it. Grouping on the ref keeps a
+PR-triggered sweep (the tiering-machinery `paths:` filter) from being cancelled by
+a merge to main.
+
+**What the bound spends is attribution, and that is the thing this row buys.** A
+collapsed burst grades N commits in one verdict, so a red *inside* a burst still
+needs a bisect over that burst. The window goes from a day's merges to a burst's;
+it does not go to one. The trade is taken knowingly and the qualifier sits next to
+the attribution claim in the workflow itself, not further down.
+
+No `paths:` filter on the push trigger, deliberately: the harnesses that went red
+here were broken by commits touching `src/`, not `tests/`, and any filter narrow
+enough to be cheap is narrow enough to miss that class again.
+
+`tests/corpus_tier_budget_unit.sh` pins both properties **in the same arm block**,
+by parsing the workflow rather than grepping it (a `grep 'push:'` matches the word
+inside this file's own comments and passes against the unchanged file). Red anchor,
+measured: against `origin/main`'s workflow the two new arms FAIL and the three
+control arms — parse liveness, absent-trigger discrimination, and the
+`unit-tests.yml` neighbour anchor — still pass.
+
+Full write-up, including the misplaced-`concurrency:` trap that `yaml.safe_load`
+accepts and only `actionlint` names:
+`community/wiki/a-tier-that-runs-nightly-cannot-attribute-a-break.md`.
+
+## v0.19.1 — feat(gate): the merge gate compares the merged sha against the sha the verifier says it graded (DIVE-2656)
+
+`task done` on a delivery-bound row already asks *did the PR merge*, *did it merge
+green*, *did the branch land*. Every one of those is a question about the **PR**.
+None of them is a question about the **verdict**.
+
+PR #425 (DIVE-2654) carried the commit its verifier had **REJECTED** while GitHub
+read CLEAN / MERGEABLE / 14 checks green — the graded fix existed only on a local
+branch and was never pushed. A merge was one command from landing rejected code,
+and it was caught by hand.
+
+Two halves, and the second is inert without the first:
+
+- **A verifier states the sha it graded.** Any `graded-sha: <7-40 hex>` line in the
+  `--result` text (also `graded sha`, `graded_sha`, `=` for `:`, any case; the last
+  one wins so `--append-result` behaves). A **labelled** declaration only — a bare
+  hex blob in prose is a different claim and never drives a refusal. A loop close
+  that states nothing gets a **nudge**, never a block: the enabling half costs
+  nothing, so it must not be able to stop a close.
+- **The gate compares it to what actually merged** — the PR's `headRefOid` **or**
+  its `mergeCommit.oid`, and refuses on mismatch (`--force-merge-gate` overrides,
+  audited). Both operands accepted on purpose: a verifier who graded the branch
+  names its head, one who graded the landed result names the merge commit.
+
+It is an **equality** test, deliberately not ancestry. We squash-merge, so a branch
+head is never an ancestor of `main` afterwards and an ancestry version would false-RED
+every squash-merged PR — worse than the false green it fixes
+(`community/wiki/a-stored-graded-sha-cannot-survive-a-squash-merge.md`). Equality is
+untouched by squash. A probe that cannot be reached prints **NOT CHECKED** and closes;
+a query that never ran is not a mismatch.
+
+The reason this is worth more than the rows it catches is that **a check that FORCES a
+path to run finds more than one that INSPECTS it**. On the night this was filed two
+fail-opens sat on one path and suppressed each other — a verifier whose gate proofs
+stored an empty signature and never failed, and a graded fix that was never pushed.
+Each defect's symptom was the other's absence. Comparing the stated sha to the merged
+one exercises the delivery step on **every** close, which is what makes a pair like
+that observable at all.
+
+## v0.19.1 — feat(ui): `5dive ui`, three read-only views served by the CLI itself (DIVE-2655)
+
+The org layer has always been the product and it has never been visible: to see who reports to
+whom, what is queued, and what is parked on a human, you had to run three commands and hold the
+join in your head. `5dive ui` serves that as a page, from the same single-file bundle, with no
+install, no build step, no account and no sign-in.
+
+Three views over ONE host. **Org chart** renders `agents_org` as a tree, each agent carrying what
+it is actually holding, and under it every live handoff on the board: who gave the work, who holds
+it, who grades it. The headline is a count off the data, not a claim in copy — how many of those
+handoffs run agent to agent with no human anywhere in the path. **Queue** is the open rows with
+assignee, verifier and maker-to-verifier handoff state. **Gates** is what is blocked on a person,
+at which tier, with the asking agent's own recommendation.
+
+It reads the local task store and the local org chart and nothing else. There is deliberately no
+endpoint that aggregates across boxes: multi-box, the marketplace and hosted council are a
+different product, and `tests/ui_views_e2e.sh` asserts the payload's key set WHOLE so a fleet key
+cannot arrive unnoticed.
+
+Read-only is a property of the server, not a promise about the client: GET and HEAD answer on
+exactly three paths, every write method returns 405, and anything that changes state already has a
+CLI verb. There is no sign-in, so the bind is loopback and `--host` refuses a routable address
+unless `FIVE_UI_ALLOW_REMOTE=1` says otherwise. The page is one self-contained file with no
+absolute URL in it, so it renders on a box with no egress. python3 (stdlib only) holds the socket
+because bash cannot, and the server script is generated at runtime into a private temp dir, so the
+shipped artifact is still exactly one file.
+
+A box whose task store has not been initialised yet still gets all three views: `task init` is
+root-only, so refusing there would mean a fresh install cannot open the UI at all. The empty board
+is NAMED (`store: "absent"`) and the page says which command fixes it, because three empty arrays
+on their own read as "nothing is queued" on a host that cannot queue anything.
+
+`5dive ui --data` prints the JSON both the page and any other consumer render. Every field in it
+comes from the predicates the CLI already uses (`handoff_state` and `gate_live` are the `task ls`
+expressions verbatim), so a view cannot tell a different story than the queue it is showing.
+
+## v0.19.1 — feat(task): every merge-gate accept now says merged is not deployed (DIVE-2641)
+
+The close gate prints `done=merged-to-main satisfied` — which is true — at the exact moment
+the reader assumes the stronger claim nobody checked: that the change is **running**. Four
+agents made that substitution independently on 2026-08-03 while the artifact their readers
+execute was an older bundle. The gate is the cheapest place to interrupt it, because the
+system is what tells the reader they are done.
+
+Every accepting arm now appends, in the same breath, what it did **not** establish, and
+rows whose deliverable is a deployed artifact get a second sentence naming the check that
+can actually answer for that artifact — `5dive doctor --category=host` for the bundled CLI
+at `/usr/local/bin/5dive`, `--category=plugins` for the marketplace clone each agent runs
+out of its own `$HOME`. The prompt is keyed off the repo the **accepting evidence** was
+found in, never off the task's own prose.
+
+The ticket named two accepting arms and a `grep -c` correction said three. There are
+**four**: the declared-`delivery_ref` path accepted while emitting no line at all, so no
+enumeration keyed on the accept string could return it — and it is the most-travelled close
+route in the product. It is now audible. Patching only the three that already spoke would
+have removed every visible symptom while leaving the defect intact for every row that binds
+a PR.
+
+Nothing about acceptance changes: text is appended to warns on paths that already passed,
+and no refusal is touched.
+
+## v0.19.1 — feat(doctor): per-host CLI freshness, so a verifier can tell INSTALLED from MERGED (DIVE-2640)
+
+Nothing on the board distinguished **merged** from **installed**. On 2026-08-03 four agents
+who did not know about each other closed rows against `origin/main` while the artifact their
+readers actually execute — `/usr/local/bin/5dive`, driven by cron every five minutes — was an
+older bundle.
+
+`5dive doctor --category=host` now answers *is what is RUNNING what we merged?* in three rows,
+because they are three different facts and collapsing them is how the strong claim gets read
+off the weak one:
+
+- **`cli-installed`** — what the binary *is*: path, the `FIVE_VERSION` it declares, mtime, sha256.
+- **`cli-freshness`** — is it *behind*: declared version vs the newest tag the installer would
+  actually resolve. `STALE` is an error, `AHEAD` a warn (a box above the newest release is
+  refused every upgrade by the monotonicity guard, so it never self-corrects).
+- **`cli-provenance`** — is that version *true*: sha256 of the installed bytes against the
+  bundle published at that tag.
+
+Provenance is its own row because a version string is a claim a bundle makes about itself —
+`0.18.0+dive2563` satisfied a "runtime reads 0.18.x" criterion while hand-built, carrying
+unmerged code, and missing two published releases. Only the bytes make the version a
+consequence of provenance instead of an assertion about it. On a hand-stamped bundle
+`cli-freshness` legitimately reads `ok` while `cli-provenance` reads `error`; one row would
+have to pick, and the cheap check is the one that answers.
+
+**Ancestry is a positive-only oracle and the row inherits that rather than fighting it.** Under
+squash merges a sha comparison answers FALSE for reasons unrelated to whether the work landed.
+So a non-match is rendered as **UNPROVEN**, with the reason, at `warn` — never as "not merged".
+A row printing the strong negative would manufacture alarms about healthy boxes, which is this
+row's own defect class pointed backwards. Bytes escalate to `error` in exactly one case: the
+declared version *equals* the newest published one, which is the hand stamp and nothing else.
+
+**No green the check did not earn.** An absent binary, an unreadable one, a bundle with no
+`FIVE_VERSION`, an unresolvable tag and an indeterminate probe each read `UNKNOWN` at `warn`.
+The reference is resolved from the remote through the installer's own `_published_cli_probe`
+rather than a second resolver that would drift from it; that probe now emits the published
+bundle's sha256 as a fourth line, empty unless the answer is `consistent`.
+
+Found a real one on its first live run: a control-plane box on `0.18.6`, bundle dated
+2026-08-03 14:21:10, against a published `0.19.0` — reproduced on a second box the next day.
+
 ## v0.19.0 — fix(heartbeat): surface a recurring instance that was never started (DIVE-2693)
 
 The stall sweep keys on `handoff_delivered_at`. A materialized recurring instance
