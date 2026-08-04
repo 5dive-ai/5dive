@@ -229,6 +229,13 @@ printf 'readonly FIVE_VERSION="0.0.0-dev"\n' > "$T/repo/src/header.sh"
 printf 'x\n' > "$T/repo/CHANGELOG.md"
 printf '### fragment\n' > "$T/repo/changelog.d/DIVE-1.md"
 printf '### fragment\n' > "$T/repo/changelog.d/DIVE-2.md"
+# README.md SURVIVES the fold, and that is not decoration — it is the arm's whole
+# point. An earlier version of this fixture left changelog.d/ EMPTY after the fold, so
+# a `changelog.d/*` entry matched nothing on disk, stayed literal through the
+# pattern-list loop, and the arm passed while the real cut still refused. A surviving
+# file is what makes an accidental pathname expansion of the pattern list resolve to
+# something WRONG instead of harmlessly to itself. Real changelog.d/ has this file.
+printf '# fragments go here\n' > "$T/repo/changelog.d/README.md"
 _git add -A >/dev/null; _git commit -qm parent
 PARENT=$(_git rev-parse HEAD)
 # The release commit, exactly as the cut builds it: version assigned, CHANGELOG

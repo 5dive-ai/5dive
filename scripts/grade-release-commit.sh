@@ -195,6 +195,12 @@ if [[ -n "$PARENT_SHA" && -z "${GRC_FULL_CORPUS:-}" ]]; then
     exit 2
   fi
   _unexpected=()
+  # Split the pattern list ONCE, with `read -ra` rather than unquoted word splitting.
+  # read does IFS splitting and NO pathname expansion, which is the whole point: a bare
+  # `for _allowed in $GRC_DELTA_PATHS` expands globs against the working directory, and
+  # `changelog.d/*` would resolve to the files that SURVIVE the fold instead of staying
+  # a pattern (DIVE-2700).
+  read -ra _allowed_pats <<< "$GRC_DELTA_PATHS"
   while IFS= read -r _p; do
     [[ -n "$_p" ]] || continue
     _ok=0
@@ -202,8 +208,15 @@ if [[ -n "$PARENT_SHA" && -z "${GRC_FULL_CORPUS:-}" ]]; then
     # removes a whole directory of fragments whose names cannot be enumerated ahead of
     # time. The four literal entries carry no glob metacharacters, so this is inert for
     # them and changes only what a pattern entry can express.
+    #
+    # The patterns come from _allowed_pats, split ONCE by `read -ra` above, and are
+    # expanded QUOTED here. Both halves are load-bearing: an unquoted
+    # `for _allowed in $GRC_DELTA_PATHS` would PATHNAME-EXPAND the list against the
+    # working directory, so `changelog.d/*` would silently become whatever files
+    # survive the fold (changelog.d/README.md does) and the pattern would never reach
+    # this comparison at all.
     # shellcheck disable=SC2053  # glob matching is the point here, not an oversight
-    for _allowed in $GRC_DELTA_PATHS; do [[ "$_p" == $_allowed ]] && { _ok=1; break; }; done
+    for _allowed in "${_allowed_pats[@]}"; do [[ "$_p" == $_allowed ]] && { _ok=1; break; }; done
     (( _ok )) || _unexpected+=("$_p")
   done <<< "$_delta"
   if (( ${#_unexpected[@]} > 0 )); then
