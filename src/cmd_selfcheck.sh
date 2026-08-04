@@ -185,7 +185,7 @@ _sc_probe_lead_clear_seal() {
 
   local names; names="$(_gate_clear_leads 2>/dev/null || true)"
   if [[ -n "$names" ]]; then
-    local n; n=$(printf '%s\n' "$names" | grep -c .)
+    local n; n=$(printf '%s\n' "$names" | grep -c .) || n=0
     _sc_pass "routed lead-clear is ARMED: $n sealed lead(s) [$(printf '%s' "$names" | tr '\n' ' ')] may clear a gate routed to them; $standing"
     return
   fi
@@ -499,8 +499,8 @@ _sc_probe_harness_verdicts() {
   rc=${PIPESTATUS[0]}
   out=$(cat "$logf"); rm -f "$logf"
   local corpus nwired
-  corpus=$(grep -oE '[0-9]+ wired' <<<"$out" | head -1)
-  nwired=$(grep -oE '[0-9]+ wired' <<<"$out" | head -1 | grep -oE '^[0-9]+')
+  corpus=$(grep -oE '[0-9]+ wired' <<<"$out" | head -1) || corpus=""
+  nwired=$(grep -oE '[0-9]+ wired' <<<"$out" | head -1 | grep -oE '^[0-9]+') || nwired=""
   local scoped; scoped=$( ((SELFCHECK_FULL)) && echo 'tests/*.sh' || echo "$SELFCHECK_HARNESS_SAMPLE")
 
   if (( rc != 0 )); then

@@ -30,7 +30,7 @@ SUMMARY_PRINTED=0
 # kills the shell while that redirect is live, so a trap printing to fd 2 lands in
 # /dev/null and the truncation is silent again. Graded by tests/truncation_marker_guard_unit.sh.
 exec 8>&2
-trap 'rc=$?; rm -rf "$TMP"; [[ "$SUMMARY_PRINTED" == 1 ]] || printf "ABORTED - gate_verifier_route_unit exited early (rc=%s) before its summary; every assertion after the last ok above was SKIPPED, not passed\n" "$rc" >&8' EXIT
+trap 'rc=$?; rm -rf "$TMP"; [[ "$SUMMARY_PRINTED" == 1 ]] || printf "ABORTED - gate_verifier_route_unit exited early (rc=%s) before its summary; every assertion after the last ok above was SKIPPED, not passed\n" "$rc" >&8; echo "HARNESS-RC=$rc"' EXIT   # DIVE-2692: appends the HARNESS-RC line to this harness's pre-existing abort-backstop trap; trap stays where it was (TMP/SUMMARY_PRINTED/fd8 are all already live by this point) rather than moving to the top.
 
 for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh \
          lib/agent_setup.sh lib/state.sh lib/audit.sh lib/registry.sh \

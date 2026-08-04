@@ -29,6 +29,7 @@ set -uo pipefail
 # 210 harnesses at once while every other check in this change stayed green.
 . "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh" \
   || printf 'grading tree: UNRESOLVED (tests/lib/grading_tree.sh not reachable; no tree named)\n' >&2
+trap 'rc=$?; rm -rf "${TMP:-}"; echo "HARNESS-RC=$rc"' EXIT   # DIVE-2692: fires on every exit path (incl. SKIP/precondition-fail early-exits); folds in tempdir cleanup so the two EXIT traps don't clobber each other.
 cd "$(dirname "$0")/.."
 # DIVE-2518: impersonate through the SEALED seam. `USER=agent-x` no longer moves
 # the actor — that env path WAS the forgery this ticket closed, and these arms
@@ -36,7 +37,6 @@ cd "$(dirname "$0")/.."
 . "$(dirname "${BASH_SOURCE[0]}")/lib/actor_seam.sh"
 SRC=src
 TMP="$(mktemp -d /tmp/task-verifier-rail-unit.XXXXXX)"
-trap 'rm -rf "$TMP"' EXIT
 
 # shellcheck disable=SC1090
 for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh \
@@ -227,6 +227,134 @@ run_as carol done "$low_id" --result="graded PASS" >/dev/null
   && ok_t "T10f the re-pointed grader's own 'task done' closes the task" \
   || bad_t "T10f the re-pointed grader's own 'task done' closes the task" \
            "status=$(db "SELECT status FROM tasks WHERE id=${low_id};") $(cat "$TMP"/err)"
+
+# --- T11: THE FILING CAP (DIVE-2681) ----------------------------------------
+# Folded into this harness rather than given its own file: it is a second reason
+# the SAME rail declines, and it reaches the board through the SAME announced
+# skip path T1 covers. A separate harness would re-pay this file's setup to
+# assert against the same code (5dive-cli/CLAUDE.md: merge by subject).
+#
+# The window is fleet-wide over the last 20 standard rows, so these arms build
+# their own ratio explicitly instead of inheriting whatever T1-T10 happened to
+# leave behind — an assertion that depends on the arms above it is not an
+# assertion, it is an ordering.
+db "DELETE FROM tasks;"
+for i in 1 2 3 4 5 6 7 8 9 10; do
+  run add --assignee=alice --priority=medium -- "ship customer feature number ${i}" >/dev/null
+done
+
+# T11a: the classifier is a candidate set — assert it on a title, not a vibe.
+[[ -n "$(_task_internal_subject_reason 'the smoke-gate harness dies on pipefail')" \
+   && -z "$(_task_internal_subject_reason 'web push on the dashboard PWA')" ]] \
+  && ok_t "T11a classifier hits our own machinery and leaves a product title alone" \
+  || bad_t "T11a classifier hits our own machinery and leaves a product title alone" \
+           "internal='$(_task_internal_subject_reason 'the smoke-gate harness dies on pipefail')' product='$(_task_internal_subject_reason 'web push on the dashboard PWA')'"
+
+# T11b: UNDER the cap, an internal row is accepted — and books NO grading pass.
+# This is the half that moves tokens: the row used to cost a grading round-trip.
+int_json=$(run add --assignee=alice --priority=high -- "the release-cut harness is red")
+int_id=$(printf '%s' "$int_json" | jf '.data.id')
+[[ -n "$int_id" && "$int_id" != "null" \
+   && "$(printf '%s' "$int_json" | jf '.data.verifySkipReason')" == "internal machinery" \
+   && -z "$(db "SELECT COALESCE(verifier,'') FROM tasks WHERE id=${int_id};")" ]] \
+  && ok_t "T11b an internal row under the cap is accepted and books NO verifier" \
+  || bad_t "T11b an internal row under the cap is accepted and books NO verifier" "$int_json"
+
+# T11c: an explicit --verifier still forces grading ON. The skip is a default,
+# not a ceiling — same contract T3 asserts for the low-priority skip.
+fv_json=$(run add --assignee=alice --priority=high --verifier=boss -- "the CI job budget-report must be graded")
+fv_id=$(printf '%s' "$fv_json" | jf '.data.id')
+[[ "$(db "SELECT verifier FROM tasks WHERE id=${fv_id};")" == "boss" ]] \
+  && ok_t "T11c --verifier forces grading ON for an internal row" \
+  || bad_t "T11c --verifier forces grading ON for an internal row" "$fv_json"
+
+# T11d: OVER the cap, the next internal row is REFUSED at the keystroke.
+for i in 1 2 3 4 5; do
+  run add --assignee=alice --priority=medium -- "worktree cleanup sweep ${i}" >/dev/null
+done
+over_out=$(run add --assignee=alice --priority=high -- "another harness is flaky"); over_rc=$?
+(( over_rc != 0 )) && has "$(cat "$TMP"/err)$over_out" "filing cap" \
+  && ok_t "T11d over the cap, an internal row is REFUSED" \
+  || bad_t "T11d over the cap, an internal row is REFUSED" "rc=$over_rc $over_out $(cat "$TMP"/err)"
+
+# T11e: the refusal NAMES both escapes. A gate that refuses without naming the
+# way through is the defect DIVE-1880 fixed one control over.
+has "$(cat "$TMP"/err)$over_out" "--already-blocked" \
+  && has "$(cat "$TMP"/err)$over_out" "--customer" \
+  && ok_t "T11e the refusal names both declared escapes" \
+  || bad_t "T11e the refusal names both declared escapes" "$(cat "$TMP"/err)"
+
+# T11f: a CUSTOMER-facing row is never capped, however full the window is.
+cust_json=$(run add --assignee=alice --priority=high -- "dashboard billing page renders a stale plan")
+cust_id=$(printf '%s' "$cust_json" | jf '.data.id')
+[[ -n "$cust_id" && "$cust_id" != "null" ]] \
+  && ok_t "T11f a customer-surface row is unaffected by a full window" \
+  || bad_t "T11f a customer-surface row is unaffected by a full window" "$cust_json"
+
+# T11g: --customer overrides a WRONG classification. The product row that named
+# this arm is real: "Free OSS web UI: three views (org chart, queue, gates)" is a
+# customer surface that matches the scan on two words.
+fp_json=$(run add --assignee=alice --priority=high --customer -- "free OSS web UI: org chart, queue and gates served by the CLI")
+fp_id=$(printf '%s' "$fp_json" | jf '.data.id')
+[[ -n "$fp_id" && "$fp_id" != "null" \
+   && "$(db "SELECT verifier FROM tasks WHERE id=${fp_id};")" == "boss" ]] \
+  && ok_t "T11g --customer clears a false positive AND restores its grading" \
+  || bad_t "T11g --customer clears a false positive AND restores its grading" "$fp_json"
+
+# T11h: --already-blocked lands the row over the cap AND records why on it.
+# An exception that leaves no trace is an opt-out, not an exception.
+ab_json=$(run add --assignee=alice --priority=high --already-blocked="took task done down fleet-wide for 40m" -- "the merge gate harness is wrong")
+ab_id=$(printf '%s' "$ab_json" | jf '.data.id')
+[[ -n "$ab_id" && "$ab_id" != "null" ]] \
+  && has "$(db "SELECT COALESCE(body,'') FROM tasks WHERE id=${ab_id};")" "took task done down fleet-wide" \
+  && ok_t "T11h --already-blocked lands over the cap and records the reason in the body" \
+  || bad_t "T11h --already-blocked lands over the cap and records the reason in the body" "$ab_json"
+
+# T11i: the fleet kill-switch, so an incident is never gated by a filing rule.
+kill_json=$(FIVE_FILING_CAP=0 run add --assignee=alice --priority=high -- "yet another harness is flaky")
+[[ "$(printf '%s' "$kill_json" | jf '.data.id')" != "null" \
+   && -n "$(printf '%s' "$kill_json" | jf '.data.id')" ]] \
+  && ok_t "T11i FIVE_FILING_CAP=0 disables the refusal fleet-wide" \
+  || bad_t "T11i FIVE_FILING_CAP=0 disables the refusal fleet-wide" "$kill_json"
+
+# --- T12: THE CAP PATH SURVIVES `set -e`, which is how it ships -------------
+# This harness runs under `set +e` (line ~52) so that arms can assert non-zero
+# exits. That is correct for the arms — and it meant T11a-i could not see the
+# defect they were supposedly covering: `_task_internal_recent_ratio` printed
+# with no trailing newline, the caller's `read` returned 1 at EOF, and under
+# src/header.sh's real `set -euo pipefail` `task add` died before any error
+# path printed. 32/32 green, and the shipped command was broken for every
+# internal title. A test that disables the condition it is testing under is
+# not a test of that condition.
+#
+# So this arm restores the SHIPPING shell options around the call and asserts
+# the classifier path returns a value instead of killing the shell.
+db "DELETE FROM tasks;"
+for i in 1 2 3 4 5 6 7 8; do
+  run add --assignee=alice --priority=medium -- "ship customer feature ${i}" >/dev/null
+done
+sete_out=$( set -euo pipefail
+            _task_internal_recent_ratio 20 ) ; sete_rc=$?
+[[ $sete_rc -eq 0 && "$sete_out" =~ ^[0-9]+\ [0-9]+$ ]] \
+  && ok_t "T12a the ratio helper returns 'N M' under set -euo pipefail (not a silent death)" \
+  || bad_t "T12a the ratio helper returns 'N M' under set -euo pipefail (not a silent death)" "rc=$sete_rc out='$sete_out'"
+
+# T12b: the CALLER's read is the site that actually died. Reproduce the exact
+# construct under the shipping options, with a positive control on the value.
+readback=$( set -euo pipefail
+            _h=0; _w=0; read -r _h _w < <(_task_internal_recent_ratio 20) || true
+            printf 'h=%s w=%s' "$_h" "$_w" ) ; read_rc=$?
+[[ $read_rc -eq 0 && "$readback" == "h=0 w=8" ]] \
+  && ok_t "T12b the caller's read survives set -e AND reads the right window (0 internal of 8)" \
+  || bad_t "T12b the caller's read survives set -e AND reads the right window (0 internal of 8)" "rc=$read_rc '$readback'"
+
+# T12c: end-to-end — an internal-titled add under the shipping options either
+# creates a row or refuses, but ALWAYS says something. Silence is the bug.
+e2e_out=$( set -euo pipefail
+           JSON_MODE=0; cmd_task_add --assignee=alice --priority=high -- "the nightly sweep harness is flaky" 2>&1 ) ; e2e_rc=$?
+[[ -n "$e2e_out" ]] \
+  && ok_t "T12c an internal-titled add under set -e produces OUTPUT, never a silent exit" \
+  || bad_t "T12c an internal-titled add under set -e produces OUTPUT, never a silent exit" "rc=$e2e_rc (empty output)"
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]

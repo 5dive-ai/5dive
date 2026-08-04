@@ -1060,7 +1060,7 @@ opencode_validate_model_or_fail() {
   [[ -n "$catalog" ]] || return 0
   grep -qxF "$model_id" <<<"$catalog" && return 0
   local sugg; sugg=$(grep -F "${model_id%/*}/" <<<"$catalog" | head -5 \
-    | awk 'NR>1{printf ", "}{printf "%s", $0}')
+    | awk 'NR>1{printf ", "}{printf "%s", $0}') || sugg=""
   fail "$E_VALIDATION" "opencode has no model '$model_id' for provider '$provider'. A fresh agent would silently fall back to an unrelated default that may not support tool use.${sugg:+ Close matches: $sugg.} Run 'opencode models' for the full list."
 }
 
@@ -1140,7 +1140,7 @@ pi_validate_model_or_fail() {
   [[ -n "$catalog" ]] || return 0
   grep -qxF "$slug" <<<"$catalog" && return 0
   local sugg; sugg=$(grep -F "${slug%%/*}/" <<<"$catalog" | head -5 \
-    | awk 'NR>1{printf ", "}{printf "%s", $0}')
+    | awk 'NR>1{printf ", "}{printf "%s", $0}') || sugg=""
   fail "$E_VALIDATION" "pi has no model '$slug' for provider '$provider'. A fresh agent would boot without the pinned model (no runnable default).${sugg:+ Close matches: $sugg.} Run 'pi --list-models $provider' for the full list."
 }
 

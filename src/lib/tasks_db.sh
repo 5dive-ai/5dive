@@ -361,8 +361,31 @@ CREATE TABLE IF NOT EXISTS tasks (
   -- per delivery (shipped_flag_at pattern): stamped when the sweep flags a
   -- delivery that's sat past its staleness window, cleared on the next fresh
   -- handoff so a redelivered task gets a clean chance to alert again.
+  -- DIVE-2624: handoff_rejected_at stamps the verifier's FAIL bounce
+  -- (cmd_task_reject). It exists so `iteration` can mean what every reader already
+  -- assumes it means — verifier rejections — instead of "number of task done calls".
+  -- It is a ONE-SHOT TOKEN, not a clock to compare: the next delivery bumps the
+  -- counter iff this is set (or it is the first delivery ever) and CLEARS it in the
+  -- same UPDATE. A re-delivery with no reject outstanding — restoring a handoff, say
+  -- — therefore does not bump. Deliberately not compared against
+  -- handoff_delivered_at: both are datetime('now') at one-second resolution, so a
+  -- reject and the delivery answering it land in the same second often enough that
+  -- either side of that tie is wrong somewhere. The timestamp is kept (rather than a
+  -- boolean) because WHEN the bounce happened is worth having; only the ordering
+  -- decision is made by presence.
   handoff_delivered_at    TEXT,
   handoff_stale_pinged_at TEXT,
+  handoff_rejected_at     TEXT,
+  -- DIVE-2693: recurring_stall_pinged_at throttles the recurring-instance stall
+  -- sweep to one surface-ping per instance (same shipped_flag_at pattern as
+  -- handoff_stale_pinged_at above). A materialized instance that is never STARTED
+  -- has no handoff_delivered_at, so gap#2's sweep cannot see it — and skip-if-open
+  -- dedup means the template's next slot is suppressed for as long as it sits, so
+  -- one unworked instance silently eats every subsequent occurrence of the beat.
+  -- Measured twice on DIVE-1237 (the OpenAgent drip): DIVE-2026 ate 07-27..07-28,
+  -- DIVE-2403 ate 07-31..08-04. Both recovered cleanly downstream, which is exactly
+  -- what kept the fault quiet.
+  recurring_stall_pinged_at TEXT,
   -- DIVE-891: risk-tiered gates (adopted design DIVE-861). tier is set when the
   -- gate is filed: 0 = auto-clear (rec applies immediately, digest line only),
   -- 1 = agent-clearable + 48h TTL auto-applies the recommendation, 2 = hard
@@ -1068,13 +1091,15 @@ _tasks_db_migrate() {
            'acceptance_criteria TEXT' 'verify_command TEXT' 'max_iterations INTEGER' 'verifier TEXT' \
            'iteration INTEGER' 'maker_agent TEXT' 'handoff_ack_at TEXT' 'task_budget TEXT' \
            'handoff_delivered_at TEXT' 'handoff_stale_pinged_at TEXT' \
+           'handoff_rejected_at TEXT' \
+           'recurring_stall_pinged_at TEXT' \
            'tier INTEGER' 'need_asked_at TEXT' 'gate_pinged_at TEXT' 'wake_at TEXT' \
            'gate_filed_by TEXT' \
            'secret_key TEXT' 'connector TEXT' 'secret_oob TEXT' 'human_nonce_hash TEXT' \
            'ask_shape TEXT' 'precedent_ref INTEGER' 'precedent_kind TEXT' \
            'needs_capability TEXT' \
            'shipped_flag_at TEXT' 'routed_reviewer TEXT' \
-           'delivery_ref TEXT' 'delivered_at TEXT' \
+           'delivery_ref TEXT' 'delivered_at TEXT' 'delivery_ref_iteration INTEGER' \
            'originated_by_objective INTEGER' 'originated_cycle INTEGER' \
            'verify_unavailable INTEGER' 'last_skipped_at TEXT' \
            'human_evidence TEXT' \

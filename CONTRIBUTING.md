@@ -152,6 +152,11 @@ caught.
   at tag time (DIVE-2091) and are not tracked on `main`; `bundle-drift` CI
   checks that `build.sh` is reproducible from `src/`, not that a committed
   bundle matches.
+- Changelog entry: editing the top of `CHANGELOG.md` directly still works, but
+  every PR that does it collides with every other open PR touching the same
+  spot (DIVE-2582). Prefer adding `changelog.d/<ident>.md` instead — see
+  `changelog.d/README.md` — it never conflicts, and folds into `CHANGELOG.md`
+  automatically at the next release cut.
 
 ## Reporting bugs / requesting features
 

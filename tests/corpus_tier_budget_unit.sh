@@ -25,6 +25,16 @@
 #         exits 1 even when also over budget (the failure is what you fix first);
 #         an empty selection is exit 1, never a green run over nothing; the report
 #         carries the wall-clock header the nightly summary reads.
+#  31-41 DIVE-2592: an over-budget run RE-TIMES its slowest files and keeps the
+#         smaller sample, so a red that flips on a re-run of the same commit cannot
+#         reach a PR author. Paired arms: the rescue, the corpus that is over on
+#         BOTH samples anyway, and --confirm-top=0 (an override may only make the
+#         control stricter). Plus: the red says NO TEST FAILED and names the set
+#         that COVERS the overage, min-of-two never RAISES a total, a re-run
+#         failure keeps its pass, and no workflow passes the new flag. The CONTROL
+#         olivia asked for: same flapping harness, one real harness added between
+#         two runs — the min rescues the first and reds the second, so it removes
+#         weather and not cost, measured rather than argued.
 #  13-14  the over-budget message actually names a remedy and the slowest file —
 #         a budget that reds without saying what to retire is a warning with a
 #         worse exit code (feedback: grade the REMEDY half, not only the predicate).
@@ -36,12 +46,12 @@ set -uo pipefail
 # `set -e` harness is not killed by a failed source.
 . "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh" \
   || printf 'grading tree: UNRESOLVED (tests/lib/grading_tree.sh not reachable; no tree named)\n' >&2
+trap 'rc=$?; rm -rf "${TMP:-}"; echo "HARNESS-RC=$rc"' EXIT   # DIVE-2692: fires on every exit path (incl. SKIP/precondition-fail early-exits); folds in tempdir cleanup so the two EXIT traps don't clobber each other.
 cd "$(dirname "$0")/.."
 
 TIER_LIB="tests/lib/tier.sh"
 RUNNER="scripts/run-harnesses.sh"
 TMP="$(mktemp -d /tmp/corpus-tier-budget.XXXXXX)"
-trap 'rm -rf "$TMP"' EXIT
 
 pass=0; fail=0
 ok()  { pass=$((pass+1)); printf 'ok   %s\n' "$1"; }
@@ -468,6 +478,207 @@ STUBEOF
 else
   bad "probe mutant-kill arms" "NOT REACHED: could not symlink $PROBE into $FAKE — arms 27-30 graded nothing"
 fi
+
+# ------------------------------------- 31-41 DIVE-2592: A BUDGET RED CONFIRMS ITSELF
+# The measurement that forced this: PR #395 red at 356s and green at 289s on the SAME
+# commit, no rebase — a 67s swing, all of it inside one network-priced harness. A cap
+# compared against ONE noisy sample reds PRs on content they did not change, so an
+# over-budget run now re-times its slowest files and keeps the SMALLER sample per file.
+#
+# Every arm below is one this mechanism can get wrong, and they are deliberately
+# PAIRED: a rescue arm alone is satisfied by "confirmation always rescues", which is
+# the budget silently switched off. Sleeps are 1.2s against a 1s budget — the smallest
+# pair the runner's second-resolution clock can tell apart — because this file is
+# itself charged to the tier it enforces.
+rm -f "$TMP"/*.sh "$TMP"/*.seen
+# Slow once, then free: the shape of a harness whose cost was the runner, not itself.
+cat > "$TMP/flaps.sh" <<'FLAPS'
+#!/usr/bin/env bash
+[[ -e "$0.seen" ]] && exit 0
+touch "$0.seen"; sleep 1.2; exit 0
+FLAPS
+printf '#!/usr/bin/env bash\nexit 0\n' > "$TMP/tiny.sh"
+
+C1="$(bash "$RUNNER" --corpus-dir="$TMP" --tier=full --budget=1 --label=t 2>&1)"; RC1=$?
+if (( RC1 == 0 )); then
+  ok "a run OVER on its first sample and INSIDE on its second exits 0"
+else bad "a run OVER on its first sample and INSIDE on its second exits 0" "rc=$RC1"; fi
+# A rescue that prints nothing is a budget that relaxed itself in silence. Both
+# numbers, or the trend this row exists to keep legible is gone on exactly the runs
+# where it moved.
+if [[ "$C1" == *"BUDGET CONFIRMATION"* && "$C1" == *"first sample"* && "$C1" == *"confirmed"* ]]; then
+  ok "the rescue SAYS SO, with both the first and the confirmed number"
+else bad "the rescue SAYS SO, with both the first and the confirmed number" "$C1"; fi
+if [[ "$C1" == *"flaps.sh"* && "$C1" == *"->"* ]]; then
+  ok "the rescue NAMES the harness whose timing swung"
+else bad "the rescue NAMES the harness whose timing swung" "$C1"; fi
+
+# NON-VACUITY. Same runner, same budget, a corpus that is over on BOTH samples: if
+# this passed too, the arm above would be measuring nothing but the retry existing.
+# Slow EVERY time: the shape of a corpus that genuinely does not fit its cap.
+rm -f "$TMP"/*.seen "$TMP/flaps.sh"
+printf '#!/usr/bin/env bash\nsleep 1.2\nexit 0\n' > "$TMP/always.sh"
+C2="$(bash "$RUNNER" --corpus-dir="$TMP" --tier=full --budget=1 --label=t 2>&1)"; RC2=$?
+want "a corpus that is over on BOTH samples still exits 4" "4" "$RC2"
+if [[ "$C2" == *"NO TEST FAILED"* && "$C2" == *"BUDGET failure"* ]]; then
+  ok "the budget red says NO TEST FAILED — the sentence exit 4 alone does not carry"
+else bad "the budget red says NO TEST FAILED — the sentence exit 4 alone does not carry" "$C2"; fi
+if [[ "$C2" == *"cover it"* && "$C2" == *"always.sh"* ]]; then
+  ok "the budget red names the smallest set of harnesses that COVERS the overage"
+else bad "the budget red names the smallest set of harnesses that COVERS the overage" "$C2"; fi
+
+# --confirm-top may only make this gate STRICTER. The rescued corpus, confirmation
+# off, must red — an override that can turn a red green is the hatch, not the control.
+cat > "$TMP/flaps.sh" <<'FLAPS'
+#!/usr/bin/env bash
+[[ -e "$0.seen" ]] && exit 0
+touch "$0.seen"; sleep 1.2; exit 0
+FLAPS
+rm -f "$TMP/always.sh" "$TMP"/*.seen
+bash "$RUNNER" --corpus-dir="$TMP" --tier=full --budget=1 --label=t --confirm-top=0 >/dev/null 2>&1
+want "--confirm-top=0 reds the SAME corpus the confirmation rescues (stricter, never looser)" "4" "$?"
+
+# MIN OF TWO NEVER RAISES A TIMING. A harness slower on its re-run keeps its first
+# sample: a confirmation that could INVENT a red is a second, worse coin flip.
+rm -f "$TMP"/*.sh "$TMP"/*.seen
+cat > "$TMP/rev.sh" <<'REV'
+#!/usr/bin/env bash
+[[ -e "$0.seen" ]] || { touch "$0.seen"; exit 0; }
+sleep 1.2; exit 0
+REV
+printf '#!/usr/bin/env bash\nsleep 1.2\nexit 0\n' > "$TMP/always.sh"
+C3="$(bash "$RUNNER" --corpus-dir="$TMP" --tier=full --budget=1 --label=t 2>&1)"
+f3="$(sed -n 's/.*first sample \([0-9]*\)s.*/\1/p' <<<"$C3" | head -1)"
+c3="$(sed -n 's/.*confirmed \([0-9]*\)s.*/\1/p' <<<"$C3" | head -1)"
+if [[ -n "$f3" && -n "$c3" ]] && (( c3 <= f3 )); then
+  ok "a harness SLOWER on its re-run keeps its first sample (confirmation never raises a total)"
+else bad "a harness SLOWER on its re-run keeps its first sample (confirmation never raises a total)" "first=[$f3] confirmed=[$c3]"; fi
+
+# A harness that FAILS its re-run keeps its PASS. The graded run is the first one, and
+# flipping a pass to a fail on a second sample is this same one-sample error inverted —
+# but the non-determinism is reported, not swallowed.
+rm -f "$TMP"/*.sh "$TMP"/*.seen
+cat > "$TMP/flake.sh" <<'FLK'
+#!/usr/bin/env bash
+[[ -e "$0.seen" ]] && exit 1
+touch "$0.seen"; sleep 1.2; exit 0
+FLK
+C4="$(bash "$RUNNER" --corpus-dir="$TMP" --tier=full --budget=1 --label=t 2>&1)"; RC4=$?
+if (( RC4 == 4 )) && [[ "$C4" == *"RE-RUN DISAGREED (observed)"* && "$C4" == *"flake.sh"* ]]; then
+  ok "a harness that fails its RE-RUN keeps its pass (exit 4, not 1) and the disagreement is reported"
+else bad "a harness that fails its RE-RUN keeps its pass (exit 4, not 1) and the disagreement is reported" "rc=$RC4 out=$C4"; fi
+# olivia, DIVE-2592: the observation and the CAUSE are different claims, and a guess
+# printed among measured sentences inherits their authority. The hedge lives in the
+# string, which is read forever, not only in the handoff, which is read once — so it
+# is graded here rather than trusted.
+if [[ "$C4" == *"CAUSE NOT MEASURED (inferred)"* ]]; then
+  ok "the re-run disagreement marks its CAUSE as inferred, in the output string itself"
+else bad "the re-run disagreement marks its CAUSE as inferred, in the output string itself" "$C4"; fi
+
+# CONTROL (olivia, grading DIVE-2592): DOES THE MIN STILL SEE GROWTH?
+# The whole defence of min-of-two is that it removes WEATHER and keeps GROWTH — and
+# that was an argument, not a measurement, which is exactly the kind of claim this
+# corpus is supposed to refuse. So measure it, differentially: the SAME flapping
+# harness in both runs, one harness of real cost ADDED between them, nothing else
+# changed. If the min hid growth, the grown corpus would be rescued too.
+rm -f "$TMP"/*.sh "$TMP"/*.seen
+cat > "$TMP/flaps.sh" <<'FLAPS'
+#!/usr/bin/env bash
+[[ -e "$0.seen" ]] && exit 0
+touch "$0.seen"; sleep 1.2; exit 0
+FLAPS
+printf '#!/usr/bin/env bash\nexit 0\n' > "$TMP/tiny.sh"
+G1="$(bash "$RUNNER" --corpus-dir="$TMP" --tier=full --budget=1 --label=t 2>&1)"; GRC1=$?
+g1="$(sed -n 's/.*confirmed \([0-9]*\)s.*/\1/p' <<<"$G1" | head -1)"
+# GROW IT: one more harness that costs its time every single run.
+rm -f "$TMP"/*.seen
+printf '#!/usr/bin/env bash\nsleep 1.2\nexit 0\n' > "$TMP/grew.sh"
+G2="$(bash "$RUNNER" --corpus-dir="$TMP" --tier=full --budget=1 --label=t 2>&1)"; GRC2=$?
+g2="$(sed -n 's/.*confirmed \([0-9]*\)s.*/\1/p' <<<"$G2" | head -1)"
+if (( GRC1 == 0 && GRC2 == 4 )); then
+  ok "GROWTH SURVIVES THE MIN: the confirmation that rescues the flapping corpus does NOT rescue it once one real harness is added"
+else bad "GROWTH SURVIVES THE MIN: the confirmation that rescues the flapping corpus does NOT rescue it once one real harness is added" "rc1=$GRC1 rc2=$GRC2"; fi
+# And the growth is VISIBLE IN THE CONFIRMED NUMBER, not only in the exit code — a
+# min that reported a flat total while reddening would be measuring something else.
+if [[ -n "$g1" && -n "$g2" ]] && (( g2 > g1 )); then
+  ok "the CONFIRMED total rises with the added harness (${g1}s -> ${g2}s): the min removes weather, not cost"
+else bad "the CONFIRMED total rises with the added harness: the min removes weather, not cost" "g1=[$g1] g2=[$g2]"; fi
+# Non-vacuity for the pair above: the second run must have actually RUN the
+# confirmation and reclaimed the flap, or "it went red" proves only that nothing
+# confirmed anything.
+if [[ "$G2" == *"BUDGET CONFIRMATION"* && "$G2" == *"flaps.sh"* ]]; then
+  ok "the grown corpus DID confirm and DID reclaim the flap, and reds anyway"
+else bad "the grown corpus DID confirm and DID reclaim the flap, and reds anyway" "$G2"; fi
+
+# The hatch arm the --budget flag never got (community/wiki/a-budget-with-a-free-
+# escape-hatch-is-a-second-budget-nobody-watches.md): enumerate the hatches from the
+# RUNNER'S FLAG SURFACE, not from the policy. --confirm-top is safe only while no job
+# passes it, and "no job does today" is not a control until something pins it.
+rm -f "$TMP"/*.sh "$TMP"/*.seen
+if grep -rn -- '--confirm-top' .github/workflows/ >/dev/null 2>&1; then
+  bad "no CI workflow passes --confirm-top" "$(grep -rn -- '--confirm-top' .github/workflows/)"
+else ok "no CI workflow passes --confirm-top"; fi
+
+# --- DIVE-2667: the tier must run often enough to ATTRIBUTE a break ------------
+# The nightly was red on main for ~17h across ~12 commits because full-sweep ran
+# once a day and is not in the per-PR check set. Two properties are pinned here,
+# and they only mean something together: `push: main` is what makes the sweep
+# frequent enough to name one merge, and `cancel-in-progress` is what makes that
+# frequency affordable. Ship one without the other and the next person deletes it.
+#
+# Graded by PARSING the workflow, not by grepping it. A `grep 'push:'` matches the
+# word inside any of this file's own comments, and would have passed against the
+# unchanged file. Note the YAML 1.1 gotcha the parse has to survive: the `on:` key
+# loads as the BOOLEAN True, not the string 'on'.
+_wf_on() {  # <file> -> the on: keys, one per line
+  python3 - "$1" <<'PY' 2>/dev/null
+import sys, yaml
+d = yaml.safe_load(open(sys.argv[1]))
+on = d.get(True, d.get('on', {})) or {}
+print('\n'.join(sorted(on)) if isinstance(on, dict) else '')
+PY
+}
+_wf_push_branches() {
+  python3 - "$1" <<'PY' 2>/dev/null
+import sys, yaml
+d = yaml.safe_load(open(sys.argv[1]))
+on = d.get(True, d.get('on', {})) or {}
+p = (on.get('push') or {}) if isinstance(on, dict) else {}
+print(' '.join(p.get('branches', []) or []))
+PY
+}
+SWEEP=.github/workflows/full-sweep.yml
+SWEEP_ON="$(_wf_on "$SWEEP")"
+# Liveness first: a parser that returns nothing makes every membership test below
+# vacuously... false, which is the safe direction, but says the wrong thing about WHY.
+if [[ -n "$SWEEP_ON" ]] && grep -qx 'schedule' <<<"$SWEEP_ON"; then
+  ok "full-sweep's on: block PARSES and still carries the nightly schedule"
+else bad "full-sweep's on: block PARSES and still carries the nightly schedule" "on=[$SWEEP_ON]"; fi
+if grep -qx 'push' <<<"$SWEEP_ON" && [[ " $(_wf_push_branches "$SWEEP") " == *" main "* ]]; then
+  ok "full-sweep runs on PUSH TO MAIN: a break is attributable to one merge, not to a day's window (DIVE-2667)"
+else bad "full-sweep runs on PUSH TO MAIN: a break is attributable to one merge, not to a day's window (DIVE-2667)" \
+       "on=[$(tr '\n' ',' <<<"$SWEEP_ON")] branches=[$(_wf_push_branches "$SWEEP")]"; fi
+# The parser is discriminating, not just permissive: a trigger this workflow does
+# NOT declare must come back absent from the same call that reported push present.
+if ! grep -qx 'release' <<<"$SWEEP_ON"; then
+  ok "the same parse reports an ABSENT trigger as absent (the membership test discriminates)"
+else bad "the same parse reports an ABSENT trigger as absent (the membership test discriminates)" "on=[$SWEEP_ON]"; fi
+# Cost bound. Without cancel-in-progress, push-on-main is 6 jobs per merge with no
+# collapse, and the first person to read the bill deletes the trigger this row added.
+if python3 - "$SWEEP" <<'PY' 2>/dev/null
+import sys, yaml
+c = (yaml.safe_load(open(sys.argv[1])) or {}).get('concurrency') or {}
+sys.exit(0 if isinstance(c, dict) and c.get('cancel-in-progress') is True and 'github.ref' in str(c.get('group','')) else 1)
+PY
+then
+  ok "the push trigger is cost-bounded: concurrency cancels in progress, grouped per REF so a PR sweep is not cancelled by a merge"
+else bad "the push trigger is cost-bounded: concurrency cancels in progress, grouped per REF so a PR sweep is not cancelled by a merge" \
+       "$(grep -A3 '^concurrency:' "$SWEEP" 2>&1)"; fi
+# Anchor: the neighbour workflow must NOT satisfy the same assertion, or "full-sweep
+# has push: main" is a claim about every workflow in the directory and grades nothing.
+if ! grep -qx 'schedule' <<<"$(_wf_on .github/workflows/unit-tests.yml)"; then
+  ok "ANCHOR: the neighbour (unit-tests.yml) parses to a DIFFERENT trigger set — the assertions above are about this file"
+else bad "ANCHOR: the neighbour (unit-tests.yml) parses to a DIFFERENT trigger set" "unit-tests on=[$(tr '\n' ',' <<<"$(_wf_on .github/workflows/unit-tests.yml)")]"; fi
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 (( fail == 0 ))

@@ -188,7 +188,7 @@ cmd_trace() {
     # grep exits 1 on no-match; { …; || true; } stops that poisoning pipefail
     # and double-firing the fallback (which would concat two '[]' → invalid JSON).
     audit_json=$({ grep -F -- "$ident" "$AUDIT_LOG" 2>/dev/null || true; } | tail -20 \
-      | jq -c -s 'map({ts,user,cmd,result})' 2>/dev/null)
+      | jq -c -s 'map({ts,user,cmd,result})' 2>/dev/null) || audit_json=''
     [[ -n "$audit_json" ]] || audit_json='[]'
     local _drops="${AUDIT_LOG%/*}/notify/audit-drops.log"
     if [[ -r "$_drops" ]]; then

@@ -47,6 +47,7 @@ set -uo pipefail
 
 . "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh" \
   || printf 'grading tree: UNRESOLVED (tests/lib/grading_tree.sh not reachable; no tree named)\n' >&2
+trap 'rc=$?; rm -rf "${tmp:-}"; echo "HARNESS-RC=$rc"' EXIT   # DIVE-2692: fires on every exit path (incl. SKIP/precondition-fail early-exits); folds in tempdir cleanup so the two EXIT traps don't clobber each other.
 cd "$(dirname "$0")/.."
 LIB="tests/lib/env_isolation.sh"
 SEAM="tests/lib/grading_tree.sh"
@@ -118,7 +119,7 @@ out=$(FIVE_VERIFY_DEFAULT=0 bash tests/task_verifier_rail_unit.sh 2>/dev/null | 
 # --- T8: an unreachable helper is its own third state — it must SAY so and must
 #     not kill a `set -e` harness. Same discipline grading_tree.sh applies to
 #     itself; a fix that turns a knob leak into a dead suite is not a fix.
-tmp=$(mktemp -d /tmp/env-iso-unit.XXXXXX); trap 'rm -rf "$tmp"' EXIT
+tmp=$(mktemp -d /tmp/env-iso-unit.XXXXXX)
 mkdir -p "$tmp/lib"; cp "$SEAM" "$tmp/lib/"          # copy the seam WITHOUT the helper
 out=$(set -e; bash -c 'set -e; . '"$tmp"'/lib/grading_tree.sh || printf "fallback\n" >&2; printf STILLALIVE' 2>"$tmp/err"); rc=$?
 [[ $rc -eq 0 && "$out" == "STILLALIVE" ]] \

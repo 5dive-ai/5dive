@@ -205,7 +205,7 @@ while read -r local_ref local_oid remote_ref remote_oid; do
     if [[ -f "$VERSION_GUARD" ]]; then
       bash "$VERSION_GUARD" "$local_oid" "$remote_oid" || rc=1
     else
-      echo "version-bump-guard: script not found ($VERSION_GUARD); skipping (CI version-uniqueness check is the net)." >&2
+      echo "version-bump-guard: script not found ($VERSION_GUARD); skipping. Net: release-cut.yml refuses to cut when it cannot write FIVE_VERSION into src/header.sh (the CI version-uniqueness job it used to name was deleted by DIVE-2247; see DIVE-2585)." >&2
     fi
   fi
 done
@@ -214,7 +214,7 @@ if [[ $rc -ne 0 ]]; then
   echo "" >&2
   echo "pre-push: BLOCKED — see the specific guard message(s) above." >&2
   echo "  pii-push-guard: scrub the real id/email/phone (use placeholders like <user-id>, 1234567890) and re-commit." >&2
-  echo "  version-bump-guard: this should be unreachable since DIVE-2247 — the bundle is not tracked on main and FIVE_VERSION is assigned at tag time. If you are seeing this, a bundle has been committed to main; remove it rather than bumping the version by hand." >&2
+  echo "  version-bump-guard: src/header.sh at the pushed commit has no readable 'readonly FIVE_VERSION=' anchor. Fix the anchor — do NOT assign a version by hand; main carries the 0.0.0-dev sentinel and the real number is written at tag time (DIVE-2247). The version-COLLISION assertion this guard used to carry was retired by DIVE-2585; that property now lives in release-cut.yml (DIVE-2118)." >&2
   echo "  harness-tree-guard: paste the printed source-line snippet into the named harness and recommit." >&2
   echo "  actionlint-push-guard: the named workflow file does not parse. Run: bash scripts/actionlint-scan.sh" >&2
   echo "  Emergency override (discouraged; the matching CI job is still the net): git push --no-verify" >&2

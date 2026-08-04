@@ -86,6 +86,12 @@ _HB_GATE_SHIPPED_REF="${HEARTBEAT_GATE_SHIPPED_REF:-origin/main}"
 # escape-hatch pattern as _HB_GATE_ESCALATE_DAYS.
 _HB_VERIFY_STALE_MIN="${HEARTBEAT_VERIFY_STALE_MIN:-60}"
 [[ "$_HB_VERIFY_STALE_MIN" =~ ^[0-9]+$ ]] || _HB_VERIFY_STALE_MIN=60
+# DIVE-2693: how long a materialized RECURRING instance may sit todo-and-never-
+# started before the sweep surfaces it. Hours, not minutes: a daily beat is
+# allowed to be worked late in its own day, and only becomes a fault once it has
+# outlived its own cadence and started suppressing the NEXT slot.
+_HB_RECURRING_STALL_HOURS="${HEARTBEAT_RECURRING_STALL_HOURS:-24}"
+[[ "$_HB_RECURRING_STALL_HOURS" =~ ^[0-9]+$ ]] || _HB_RECURRING_STALL_HOURS=24
 _HB_STALL_MIN_MINUTES="${HEARTBEAT_STALL_MIN_MINUTES:-30}"
 [[ "$_HB_STALL_MIN_MINUTES" =~ ^[0-9]+$ ]] || _HB_STALL_MIN_MINUTES=30
 # Orphan reclaim. An in_progress task whose claiming claude session is GONE — the
@@ -337,7 +343,7 @@ USAGE
 }
 
 cmd_heartbeat() {
-  [[ $# -gt 0 ]] || { _hb_usage; exit "$E_USAGE"; }
+  [[ $# -gt 0 ]] || { _hb_usage; mark_reported; exit "$E_USAGE"; }
   local sub="$1"; shift
   case "$sub" in
     on|enable)       with_registry_lock cmd_heartbeat_on "$@" ;;
@@ -2282,6 +2288,50 @@ _hb_stall_sweep() {
                  AND handoff_delivered_at IS NOT NULL
                  AND NOT (need_type IS NOT NULL AND need_answered_at IS NULL)
                  AND handoff_delivered_at <= datetime('now','-${_HB_VERIFY_STALE_MIN} minutes');")
+
+  # (a2) DIVE-2693 — a materialized RECURRING instance that was never STARTED.
+  #
+  # WHY THIS IS NOT COVERED BY (a) ABOVE, which is the whole reason it needed its
+  # own predicate: gap#2 keys on handoff_delivered_at, and a plain never-started
+  # todo has none — it was never delivered to anyone, it was simply never picked
+  # up. The two stall shapes are disjoint and a query for one cannot see the other.
+  #
+  # WHY IT MATTERS MORE THAN ONE LATE TASK: the materializer is skip-if-open, so
+  # while an instance sits open the template's NEXT slot is suppressed. One
+  # unworked instance therefore does not delay a beat, it DELETES every subsequent
+  # occurrence of it for as long as it sits. Measured twice on DIVE-1237: DIVE-2026
+  # ate 07-27..07-28, DIVE-2403 ate 07-31..08-04 (five slots, nothing shipped).
+  #
+  # WHY IT STAYED INVISIBLE BOTH TIMES: the downstream producer's own precondition
+  # check absorbs the stall correctly — it declines to activate, so nothing errors
+  # and the only symptom is a green-looking no-op a day or two later. A fault whose
+  # recovery is clean is a fault nobody reports.
+  #
+  # NOT KEYED TO ANY IDENT. DIVE-1237 is only where we noticed it; the defect is a
+  # property of skip-if-open dedup on ANY template, and DIVE-1155/DIVE-1236 sit on
+  # the same mechanism and would fail identically and just as quietly.
+  local rrow rid rident rasg rcreated rtmpl rhours
+  while IFS= read -r rrow; do
+    [[ -n "$rrow" ]] || continue
+    IFS=$'\x1f' read -r rid rident rasg rcreated rtmpl <<<"$rrow"
+    [[ -n "$rid" ]] || continue
+    rhours=$(( ($(date -u +%s) - $(date -u -d "$rcreated" +%s 2>/dev/null || date -u +%s)) / 3600 ))
+    if [[ -n "$rasg" ]]; then
+      ( cmd_send "$rasg" --from="task-engine" \
+          --message="⏳ ${rident} is a RECURRING instance you have never started — ${rhours}h old. While it sits open the schedule's next slot is SUPPRESSED (skip-if-open), so the beat is not late, it is not happening. Work it or close it: \`5dive task start ${rident}\`, or \`5dive task cancel ${rident} --result=...\` to let the schedule re-fire." ) >/dev/null 2>&1 || true
+    fi
+    ( cmd_send "main" --from="task-engine" \
+        --message="⏳ Recurring beat stalled: ${rident} (from template ${rtmpl}) has sat todo and never-started for ${rhours}h, assignee '${rasg:-unassigned}' — every slot since is suppressed by skip-if-open (DIVE-2693)." ) >/dev/null 2>&1 || true
+    db "UPDATE tasks SET recurring_stall_pinged_at=datetime('now') WHERE id=${rid};"
+    _hb_log "[recurring-stall] ${rident} never-started ${rhours}h (template ${rtmpl}) -> surfaced"
+  done < <(db "SELECT t.id||x'1f'||COALESCE(t.ident,'DIVE-'||t.id)||x'1f'||COALESCE(t.assignee,'')||x'1f'||t.created_at||x'1f'||COALESCE(p.ident,'DIVE-'||t.from_template_id)
+               FROM tasks t LEFT JOIN tasks p ON p.id=t.from_template_id
+               WHERE t.kind='standard' AND t.from_template_id IS NOT NULL
+                 AND t.status='todo' AND t.started_at IS NULL
+                 AND t.recurring_stall_pinged_at IS NULL
+                 AND NOT (t.need_type IS NOT NULL AND t.need_answered_at IS NULL)
+                 AND t.parked_at IS NULL
+                 AND t.created_at <= datetime('now','-${_HB_RECURRING_STALL_HOURS} hours');")
 
   # (b) GAP#3 core — fleet-idle-while-actionable-work-is-open, persisting.
   local in_prog running_loops stranded_todo open_gates total_stranded

@@ -15,13 +15,13 @@ set -uo pipefail
 # shellcheck source=tests/lib/grading_tree.sh
 . "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh" \
   || printf 'grading tree: UNRESOLVED (tests/lib/grading_tree.sh not reachable; no tree named)\n' >&2
+trap 'rc=$?; rm -rf "${TMP:-}"; echo "HARNESS-RC=$rc"' EXIT   # DIVE-2692: fires on every exit path (incl. SKIP/precondition-fail early-exits); folds in tempdir cleanup so the two EXIT traps don't clobber each other.
 cd "$(dirname "$0")/.." || exit
 # shellcheck source=tests/lib/actor_seam.sh
 . "$(dirname "${BASH_SOURCE[0]}")/lib/actor_seam.sh"
 
 SRC="${DIVE2261_SRC_DIR:-src}"
 TMP="$(mktemp -d /tmp/task-answer-cancelled-loop-bounce.XXXXXX)"
-trap 'rm -rf "$TMP"' EXIT
 
 for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh \
          lib/agent_setup.sh lib/state.sh lib/broker.sh lib/audit.sh \

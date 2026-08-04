@@ -12,6 +12,7 @@ set -uo pipefail
 # 210 harnesses at once while every other check in this change stayed green.
 . "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh" \
   || printf 'grading tree: UNRESOLVED (tests/lib/grading_tree.sh not reachable; no tree named)\n' >&2
+trap 'rc=$?; rm -rf "${TMP:-}"; echo "HARNESS-RC=$rc"' EXIT   # DIVE-2692: fires on every exit path (incl. SKIP/precondition-fail early-exits); folds in tempdir cleanup so the two EXIT traps don't clobber each other.
 cd "$(dirname "$0")/.."
 
 for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh \
@@ -22,7 +23,6 @@ for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh \
 done
 
 TMP="$(mktemp -d /tmp/constitution-floor.XXXXXX)"
-trap 'rm -rf "$TMP"' EXIT
 STATE_DIR="$TMP"
 export FIVEDIVE_CONSTITUTION_FILE="$TMP/constitution.yaml"
 # DIVE-1752: hermetic council seal. cmd_council.sh (sourced above) sets

@@ -20,10 +20,10 @@ set -uo pipefail
 # 210 harnesses at once while every other check in this change stayed green.
 . "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh" \
   || printf 'grading tree: UNRESOLVED (tests/lib/grading_tree.sh not reachable; no tree named)\n' >&2
+trap 'rc=$?; rm -rf "${TMP:-}"; echo "HARNESS-RC=$rc"' EXIT   # DIVE-2692: fires on every exit path (incl. SKIP/precondition-fail early-exits); folds in tempdir cleanup so the two EXIT traps don't clobber each other.
 cd "$(dirname "$0")/.."
 
 TMP="$(mktemp -d /tmp/proof-publish.XXXXXX)"
-trap 'rm -rf "$TMP"' EXIT
 
 # Extract the embedded python builder (between the PROOFPY heredoc markers).
 awk "/python3 <<'PROOFPY'/{f=1;next} f&&/^PROOFPY\$/{f=0} f" src/cmd_proof.sh > "$TMP/proof.py"
@@ -168,6 +168,97 @@ OUT6="$( cd "$W6" && \
 [[ $RC6 -eq 0 ]] && ok_t "DIVE-1864: >128KB digest via *_FILE builds (no E2BIG)" || bad_t "big-file build" "rc=$RC6"
 [[ "$(jget "$W6/badge.json" "['message']")" == "100%" ]] \
   && ok_t "big-file badge computes verbatim (6 shipped / 0 asks -> 100%)" || bad_t "big-file badge" "$(cat "$W6/badge.json" 2>/dev/null)"
+
+# --- Case 7 (DIVE-2654, spec: DIVE-2652): corroborators ship inside
+# zero-human.json, carrying their own scope; the badge MESSAGE stays untouched.
+# Numbers pinned to the exact fixture named in DIVE-2652's SHIP SHAPE:
+# 124/192 graded (59.1% coverage of 325 shipped), 3 iteration-NULL graded rows
+# (<=1.6pp upward bias); 126 policy-blocked, 13 of 26 sites fired in 7d, 16 of
+# 26 lifetime, ledger opened 2026-07-25 12:04.
+W7="$TMP/w7"; mkdir -p "$W7"
+OUT7="$( cd "$W7" && \
+  DAY_JSON='{"zeroHuman":{"shipped":5,"humanTouches":1}}' \
+  WEEK_JSON='{"zeroHuman":{"shipped":27,"humanTouches":2}}' \
+  TODAY="2026-08-03" NOW_ISO="2026-08-03T21:00:00Z" \
+  CLI_VERSION="0.18.0" METHODOLOGY_URL="https://example.test/zero-human.md" \
+  CORR_ROWS="325|192|124|3" \
+  CORR_REFUSALS="126" CORR_FIRED_WINDOW="13" CORR_FIRED_LIFETIME="16" CORR_SITES="26" \
+  CORR_LEDGER_SINCE="2026-07-25 12:04:00" \
+  python3 "$TMP/proof.py" )"; RC7=$?
+[[ $RC7 -eq 0 ]] && ok_t "corroborator fixture builds" || bad_t "corroborator build" "rc=$RC7"
+[[ "$(jget "$W7/zero-human.json" "['corroborators']['verifierFirstPassRate']['value']")" == "64.6%" ]] \
+  && ok_t "LEAD: verifier first-pass rate = 124/192 = 64.6%" || bad_t "first-pass value" "$(cat "$W7/zero-human.json")"
+[[ "$(jget "$W7/zero-human.json" "['corroborators']['verifierFirstPassRate']['coveragePct']")" == "59.1" ]] \
+  && ok_t "LEAD carries its own coverage: 192 of 325 shipped = 59.1%" || bad_t "coveragePct"
+[[ "$(jget "$W7/zero-human.json" "['corroborators']['verifierFirstPassRate']['shippedStandardTasks']")" == "325" ]] \
+  && ok_t "LEAD names its denominator shippedStandardTasks (NOT the bare key 'shipped', DIVE-2654 review)" || bad_t "shippedStandardTasks key"
+[[ "$(jget "$W7/zero-human.json" "['corroborators']['verifierFirstPassRate']['basis']")" == *"week.shipped"* \
+   && "$(jget "$W7/zero-human.json" "['corroborators']['verifierFirstPassRate']['basis']")" == *"DIVE-1552"* ]] \
+  && ok_t "LEAD discloses it is a DIFFERENT instrument from week.shipped (frozen sum, DIVE-1552)" || bad_t "basis disclosure" "$(jget "$W7/zero-human.json" "['corroborators']['verifierFirstPassRate']['basis']")"
+[[ "$(jget "$W7/zero-human.json" "['corroborators']['verifierFirstPassRate']['iterationNullBiasPctPtsMax']")" == "1.6" ]] \
+  && ok_t "LEAD discloses the iteration-NULL upward bias (3/192 <= 1.6pp)" || bad_t "iterationNullBiasPctPtsMax"
+[[ "$(jget "$W7/zero-human.json" "['corroborators']['policyBlockedAttempts']['value']")" == "126" ]] \
+  && ok_t "SECOND: policy-blocked attempts = 126" || bad_t "policy-blocked value"
+[[ "$(jget "$W7/zero-human.json" "['corroborators']['policyBlockedAttempts']['firedSites']")" == "13" \
+   && "$(jget "$W7/zero-human.json" "['corroborators']['policyBlockedAttempts']['instrumentedSites']")" == "26" \
+   && "$(jget "$W7/zero-human.json" "['corroborators']['policyBlockedAttempts']['firedSitesLifetime']")" == "16" ]] \
+  && ok_t "SECOND carries fired-vs-instrumented site split (13/26 window, 16/26 lifetime)" || bad_t "site split"
+[[ "$(jget "$W7/zero-human.json" "['corroborators']['policyBlockedAttempts']['ledgerAgeDays']")" != "" \
+   && "$(jget "$W7/zero-human.json" "['corroborators']['policyBlockedAttempts']['ledgerAgeDays']")" != "None" ]] \
+  && ok_t "SECOND carries the ledger's own age" || bad_t "ledgerAgeDays missing"
+BADGE7_MSG="$(jget "$W7/badge.json" "['message']")"
+[[ "$BADGE7_MSG" == "80%" ]] \
+  && ok_t "DIVE-1924 preserved: badge message is unaffected by corroborators shipping" \
+  || bad_t "badge untouched" "expected '80%', got '$BADGE7_MSG'"
+[[ "$(python3 -c "import json; print(sorted(json.load(open('$W7/badge.json')).keys()))")" == "['color', 'label', 'message', 'schemaVersion']" ]] \
+  && ok_t "badge.json schema unchanged (still exactly schemaVersion/label/message/color)" || bad_t "badge schema shape"
+
+# --- Case 8 (DIVE-2654): honesty invariant carries over — no source means an
+# explicit no-data marker, never a bare 0/0%, same rule `proof scorecard` uses.
+W8="$TMP/w8"; mkdir -p "$W8"
+( cd "$W8" && \
+  DAY_JSON='{"zeroHuman":{"shipped":5,"humanTouches":1}}' \
+  WEEK_JSON='{"zeroHuman":{"shipped":27,"humanTouches":2}}' \
+  TODAY="2026-08-03" NOW_ISO="2026-08-03T21:00:00Z" \
+  CLI_VERSION="0.18.0" METHODOLOGY_URL="https://example.test/zero-human.md" \
+  python3 "$TMP/proof.py" ) >/dev/null
+[[ "$(jget "$W8/zero-human.json" "['corroborators']['verifierFirstPassRate']['value']")" == "None" \
+   && "$(jget "$W8/zero-human.json" "['corroborators']['verifierFirstPassRate']['nodata']")" != "" ]] \
+  && ok_t "no CORR_ROWS -> verifier first-pass degrades to NO DATA with a reason, not 0%" \
+  || bad_t "first-pass no-data" "$(cat "$W8/zero-human.json")"
+[[ "$(jget "$W8/zero-human.json" "['corroborators']['policyBlockedAttempts']['value']")" == "None" \
+   && "$(jget "$W8/zero-human.json" "['corroborators']['policyBlockedAttempts']['nodata']")" != "" ]] \
+  && ok_t "no CORR_REFUSALS/CORR_SITES -> policy-blocked degrades to NO DATA with a reason, never 0" \
+  || bad_t "policy-blocked no-data" "$(cat "$W8/zero-human.json")"
+
+# --- Case 9 (DIVE-2654 review, main2): a fixture that CANNOT agree for the
+# wrong reason. Case 7 seeded no prior history, so week.shipped (frozen sum)
+# and shippedStandardTasks (live SQL) both landed on whatever the single fresh
+# day supplied and collapsed to the SAME value — a fixture in that shape is
+# structurally incapable of telling the two instruments apart
+# (community/wiki/an-empty-fixture-makes-a-frozen-sum-impersonate-a-live-count.md).
+# Seed >=7 prior daily datapoints so the frozen week.shipped sum is a real,
+# different number from the live shippedStandardTasks the corroborator reports,
+# and assert they stay visibly distinguishable in the same emitted file.
+W9="$TMP/w9"; mkdir -p "$W9"
+: > "$W9/history.jsonl"
+for i in 1 2 3 4 5 6 7; do
+  printf '{"cliVersion":"0.18.0","date":"2026-07-%02d","day":{"humanAsks":1,"shipped":10},"week":{"humanAsks":0,"shipped":0}}\n' "$((3+i))" >> "$W9/history.jsonl"
+done
+( cd "$W9" && \
+  DAY_JSON='{"zeroHuman":{"shipped":12,"humanTouches":2}}' \
+  WEEK_JSON='{"zeroHuman":{"shipped":3,"humanTouches":0}}' \
+  TODAY="2026-07-11" NOW_ISO="2026-07-11T00:00:00Z" \
+  CLI_VERSION="0.18.0" METHODOLOGY_URL="https://example.test/zero-human.md" \
+  CORR_ROWS="325|192|124|3" \
+  CORR_REFUSALS="126" CORR_FIRED_WINDOW="13" CORR_FIRED_LIFETIME="16" CORR_SITES="26" \
+  CORR_LEDGER_SINCE="2026-07-25 12:04:00" \
+  python3 "$TMP/proof.py" ) >/dev/null
+W9_WEEK="$(jget "$W9/zero-human.json" "['week']['shipped']")"                                          # frozen: 6*10+12=72
+W9_CORR="$(jget "$W9/zero-human.json" "['corroborators']['verifierFirstPassRate']['shippedStandardTasks']")"  # live fixture: 325
+[[ -n "$W9_WEEK" && -n "$W9_CORR" && "$W9_WEEK" != "$W9_CORR" ]] \
+  && ok_t "DIVE-2654 point 4: populated history makes frozen week.shipped ($W9_WEEK) and live shippedStandardTasks ($W9_CORR) DISAGREE, proving the fixture can detect the two instruments" \
+  || bad_t "frozen vs live no longer distinguishable" "week.shipped=$W9_WEEK shippedStandardTasks=$W9_CORR"
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [[ $FAIL -eq 0 ]] || exit 1

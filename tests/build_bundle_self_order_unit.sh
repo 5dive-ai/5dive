@@ -25,12 +25,12 @@ set -uo pipefail
 . "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh" \
   || printf 'grading tree: UNRESOLVED (tests/lib/grading_tree.sh not reachable; no tree named)\n' >&2
 
+trap 'rc=$?; rm -rf "${TMP:-}" "${MUT_BUILD:-}"; echo "HARNESS-RC=$rc"' EXIT   # DIVE-2692: fires on every exit path (incl. SKIP/precondition-fail early-exits); folds in tempdir cleanup so the two EXIT traps don't clobber each other.
 cd "$(dirname "$0")/.."
 ROOT="$PWD"
 
 TMP="$(mktemp -d /tmp/bundle-order.XXXXXX)"
 MUT_BUILD="$ROOT/.dive2097-mutant-build.sh"
-trap 'rm -rf "$TMP" "$MUT_BUILD"' EXIT
 
 PASS=0; FAIL=0
 ok_t()  { PASS=$((PASS+1)); printf 'ok   - %s\n' "$1"; }

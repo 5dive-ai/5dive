@@ -96,6 +96,69 @@ _marketplace_fetch_pack() {
   rm -rf "$dl"; echo "$out"
 }
 
+# _pack_skill_refs <skills-dir> -> JSON array of skill specs for the manifest.
+#
+# DIVE-2678. Export used to emit the bare directory names here. That is lossy in the
+# one way that matters: import re-resolves a bare name through parse_skill_spec, which
+# defaults to `<org>/skills` and tries NOTHING else, so a skill from any other repo
+# came out of an export unresolvable and the importer could only skip it. Measured on
+# two fresh seats from one exported AGENTS.md: 4 of 22 installed, and all 18 skipped
+# were third-party (none published in 5dive-ai/skills — verified by fetching each).
+# Provenance comes from `.skills-manifest.json`, written beside the skills by
+# cmd_skill_add. Emit the qualified `<owner/repo>:<id>` form when the source is known
+# and is not the default repo; keep the bare form otherwise, so the common case and the
+# human-readable AGENTS.md rendering are unchanged.
+#
+# ITERATION 3 CORRECTS THE CLAIM ABOVE THIS LINE. The first cut said "the provenance was
+# never missing, only unread". On this fleet it IS missing: MEASURED 2026-08-04,
+# `find /home -name .skills-manifest.json` returns ZERO — not one seat has one, including
+# agent-creative, the very seat whose export produced "added 4, skipped 18". The writer
+# has been live since DIVE-2282/PR #291, so the reason is not that it is new: it lives
+# only in `agent skill add`, and that is not how skills reach a seat. The create path
+# (install_default_skill_for_agent) installed and recorded NOTHING. Reading a manifest
+# therefore reached zero seats and could not have fixed the case it was filed against.
+#
+# So provenance is recovered in two tiers, and the fleet runs on the second:
+#   1. the manifest, when there is one (authoritative — it carries third-party sources
+#      this table cannot know). The create path now writes it, so new seats have one.
+#   2. skill_default_source, for the 5dive defaults. No network, no manifest. This is
+#      what recovers find-skills — installed on EVERY seat from vercel-labs/skills, and
+#      one of the 18 skipped names on the measured export.
+#
+# HONEST SCOPE, because the fix is partial and the shape of the remainder matters:
+# re-probed 2026-08-04, of those 18 exactly ONE (find-skills) is published anywhere
+# reachable — `vercel-labs/skills` serves it under `skills/find-skills`. The other 17
+# (animejs, gsap, the hyperframes family, lodar-voice, ...) 404 in both candidate repos
+# under both layouts, so they are genuinely local-only and skipping them stays correct;
+# no table or probe can reinstall a skill that is not published. Those keep exporting
+# bare, and the import warning names each one with the command to seed it by hand.
+_pack_skill_refs() {
+  local sdir="$1"
+  [[ -d "$sdir" ]] || { echo '[]'; return 0; }
+  local mf='{}'
+  if [[ -f "$sdir/.skills-manifest.json" ]]; then
+    mf=$(jq -c 'if type == "object" then . else {} end' "$sdir/.skills-manifest.json" 2>/dev/null) || mf='{}'
+    [[ -n "$mf" ]] || mf='{}'
+  fi
+  # Skills install as real dirs OR symlinks (per-agent skill layout), so match
+  # both — -type d alone misses the symlinked majority.
+  local ids
+  ids=$(find "$sdir" -maxdepth 1 -mindepth 1 \( -type d -o -type l \) -printf '%f\n' 2>/dev/null | sort)
+  # Tier 2, built only for the ids actually present: {"find-skills":"vercel-labs/skills"}.
+  local defs='{}' id src
+  while IFS= read -r id; do
+    [[ -n "$id" ]] || continue
+    src=$(skill_default_source "$id") || continue
+    defs=$(jq -c --arg k "$id" --arg v "$src" '.[$k] = $v' <<<"$defs" 2>/dev/null) || defs='{}'
+  done <<<"$ids"
+  printf '%s\n' "$ids" | sed '/^$/d' | jq -R . \
+    | jq -cs --argjson m "$mf" --argjson d "$defs" --arg def "$(gh_org)/skills" '
+        map(. as $id
+            | (($m[$id].source // $d[$id] // "") | tostring) as $s
+            | if ($s == "" or $s == $def) then $id else ($s + ":" + $id) end)' 2>/dev/null \
+    || echo '[]'
+}
+
 # Install a bundled skill (a local <dir>/SKILL.md) directly into the agent's
 # skills dir — used on import when the pack carries the skill body.
 _install_bundled_skill() {
@@ -738,6 +801,29 @@ _pack_unapplied_on() {   # _pack_unapplied_on <type> <model> <effort> <hooks-pre
   return 0
 }
 
+# _pack_seat_needs_key <type> — 0 when an API key is this seat's ONLY route to a
+# model, 1 otherwise. DIVE-2676.
+#
+# The distinction that matters at import time is not "claude vs not". It is
+# whether deferring auth leaves a route open at all:
+#   * TYPE_AUTH holds the file a harness writes after an INTERACTIVE sign-in, so
+#     a type listed there (claude, codex, pi, grok, ...) boots credential-less on
+#     purpose — first-run UI finishes the job, and --defer-auth is honest.
+#   * A type in TYPE_API_FILE but NOT in TYPE_AUTH has no such flow. opencode is
+#     the one on this box: its key is injected from the connector file and there
+#     is nothing a human can click later. Deferring auth there does not postpone
+#     the credential, it omits it — and the seat additionally never gets the
+#     opencode.json model pin that only the create path's --provider branch
+#     writes. Measured 2026-08-04: 'agent info' shows model: — and every ask
+#     times out at 120s, after an import that reported OK.
+#
+# Derived from the maps rather than a hardcoded list so a new API-key-only type
+# is covered the day it is added, and a type that gains a sign-in flow drops out.
+_pack_seat_needs_key() {
+  local t="${1:-}"
+  [[ -n "${TYPE_API_FILE[$t]:-}" && -z "${TYPE_AUTH[$t]:-}" ]]
+}
+
 _pack_disclosure_json() {
   local stage="$1" mf="$1/manifest.json"
   [[ -f "$mf" ]] || { echo '{}'; return 1; }
@@ -926,7 +1012,11 @@ _pack_usage() {
                                   # credential locations) and the export is REFUSED naming
                                   # file, line and category. Nothing is ever silently
                                   # redacted. --audience=self (own backup / clone on your own
-                                  # box) skips that scan — never publish a self pack.
+                                  # box) skips THAT scan and ONLY that scan — never publish a
+                                  # self pack. DIVE-2679: the secret tripwire (real tokens/keys)
+                                  # is a separate control and runs on BOTH audiences, always.
+                                  # 'self' is not a force flag; there is deliberately no way to
+                                  # export a staged credential.
                                   # It gates BOTH containers: the scan runs before the
                                   # format branch, so the tarball and the single-file
                                   # AGENTS.md are covered by construction, not by two rules.
@@ -944,6 +1034,12 @@ _pack_usage() {
   5dive agent import <pack|slug> --as=<name> [--channels=none|telegram|discord|dashboard[,ch...]]
                             [--telegram-token=<tok>] [--discord-token=<tok>]
                             [--auth-profile=<name>] [--workdir=<path>] [--report-import] [--allow-hooks]
+                            [--type=<type>] [--provider=<id> --api-key=<key|->] [--model=<slug>]
+                                  # --provider/--api-key (DIVE-2676): provision the seat's
+                                  # credentials AND model in the same command. An API-key-only
+                                  # harness (opencode) has no interactive sign-in, so without
+                                  # these the import lands the persona onto an agent that has
+                                  # no model and CANNOT ANSWER. "-" reads the key from stdin.
                                   # --allow-hooks (default OFF): keep the pack's hooks. Without
                                   # it, a pack's arbitrary-shell hooks are STRIPPED on import.
                                   # recreate an agent from a pack into a FRESH name.
@@ -979,17 +1075,79 @@ _pack_agent_config() {
 }
 
 # Secret tripwire — refuse if any staged file looks like it holds a token/key.
-# Returns 0 (clean) or 1 (hit); on hit, prints the offending paths to stderr.
+# Returns 0 (clean) or 1 (hit); on hit, prints file:line: <class> to stderr.
 # Belt + braces: the real safety is the allowlist + type-scoping, this catches
 # a regression that widens either.
+#
+# DIVE-2679 — WHY THIS IS THREE RULE KINDS AND NOT ONE ALTERNATION. The original
+# was a single case-insensitive alternation over the staged dir, and two of its
+# branches matched ENGLISH rather than secrets. `sk-[A-Za-z0-9]` is unanchored, so
+# it fires on ta"sk-"need, a"sk-"rail, ri"sk-"tier, ma"sk-"wt — measured against a
+# real 411-fact memory store it hit 41 files and NOT ONE held a key; with a word
+# boundary and a realistic length it hits zero. On a board whose vocabulary is
+# literally task/ask/risk that single rule refuses every export the feature has.
+# `credentials` and a bare `API_KEY` are the same mistake in slower motion: agent
+# memory is ABOUT operations, so it discusses credentials by name constantly, and
+# the matched lines were things like "a workflow-file push is NOT blocked by
+# credentials" and `OPENROUTER_API_KEY=…` with the value already elided.
+#
+# So the fix is not a looser tripwire, it is a tripwire that distinguishes a
+# secret's VALUE from a secret's NAME:
+#   value rules  — shapes only a real credential has; match anywhere.
+#   assign rules — a key NAME is a secret only when something is assigned to it.
+#   file rules   — a staged file that IS a credential store. This is the actual
+#                  "allowlist regression" case the tripwire was written for, and
+#                  it was never checked: only content was.
+# Net effect on detection is POSITIVE — gh_/AWS tokens and PEM blocks were not
+# covered before and are now, while prose about credentials no longer refuses.
+_PACK_SECRET_VALUE_RULES=(
+  # The trailing [A-Z ]* is load-bearing and was missing: an armoured PGP secret key
+  # is `-----BEGIN PGP PRIVATE KEY BLOCK-----`, so the word after "PRIVATE KEY" put it
+  # out of reach of a trailing literal and it exported CLEAN (caught in review). A
+  # suffix class rather than `( BLOCK)?` so any future armour label is covered too.
+  # `-----BEGIN CERTIFICATE-----` deliberately does NOT match: a certificate is public,
+  # and the old bare `-----BEGIN` refused on one. That is a narrowing, on purpose.
+  'private-key-block:-----BEGIN[A-Z ]*PRIVATE KEY[A-Z ]*-----'
+  'openai-style-key:(^|[^A-Za-z0-9])sk-[A-Za-z0-9_-]{20,}'
+  'github-token:(^|[^A-Za-z0-9])gh[pousr]_[A-Za-z0-9]{30,}'
+  'slack-token:(^|[^A-Za-z0-9])xox[abposr]-[A-Za-z0-9-]{10,}'
+  'aws-access-key-id:(^|[^A-Za-z0-9])AKIA[0-9A-Z]{16}([^0-9A-Z]|$)'
+  'telegram-bot-token:(^|[^A-Za-z0-9])[0-9]{8,}:[A-Za-z0-9_-]{30,}'
+)
+_PACK_SECRET_ASSIGN_RULES=(
+  "assigned-credential:(BOT_TOKEN|API_?KEY|ACCESS_TOKEN|AUTH_TOKEN|SECRET_KEY|CLIENT_SECRET|PASSWORD|CREDENTIALS?)[[:space:]]*[:=][[:space:]]*['\"]?[A-Za-z0-9_./+-]{16,}"
+)
+# Anchored at a path segment so a FACT named e.g. 'dive931-secret-drop.md' is not a
+# credential store, but a staged '.env' or 'id_ed25519' is.
+_PACK_SECRET_FILE_RE='(^|/)(\.env(\.[A-Za-z0-9_-]+)?|credentials(\.(json|ya?ml))?|id_(rsa|ed25519|ecdsa)|.*\.(pem|p12|pfx|keystore))$'
+
 _pack_secret_tripwire() {
-  local dir="$1" hits
-  hits=$(grep -rilE 'BOT_TOKEN|API_KEY|-----BEGIN|credentials|sk-[A-Za-z0-9]|[0-9]{8,}:[A-Za-z0-9_-]{30,}' "$dir" 2>/dev/null || true)
-  if [[ -n "$hits" ]]; then
-    printf '%s\n' "$hits" >&2
-    return 1
-  fi
-  return 0
+  local dir="$1" hit=0 rule class re f line rel
+
+  # 1. A staged file that IS a credential store, by name.
+  while IFS= read -r f; do
+    [[ -n "$f" ]] || continue
+    printf '%s: credential-file\n' "${f#"$dir"/}" >&2
+    hit=1
+  done < <(find "$dir" -type f 2>/dev/null | grep -E "$_PACK_SECRET_FILE_RE" || true)
+
+  # 2. Content. -I skips binaries (avatar.png is staged alongside memory and its
+  # bytes will eventually match any long-enough character class by chance).
+  # NEVER echo the match itself — the report is file:line and the rule that fired,
+  # so a refusal is actionable without the refusal becoming its own leak.
+  for rule in "${_PACK_SECRET_VALUE_RULES[@]}" "${_PACK_SECRET_ASSIGN_RULES[@]}"; do
+    class="${rule%%:*}"; re="${rule#*:}"
+    while IFS= read -r line; do
+      [[ -n "$line" ]] || continue
+      rel="${line#"$dir"/}"
+      printf '%s: %s\n' "$(cut -d: -f1,2 <<<"$rel")" "$class" >&2
+      hit=1
+    # -e is NOT optional: the private-key rule begins with '-' and grep reads a bare
+    # leading-dash pattern as flags. It silently matched nothing, and the miss was
+    # invisible because a fixture holding a PEM block usually trips some other rule too.
+    done < <(grep -rnIE -e "$re" "$dir" 2>/dev/null || true)
+  done
+  return "$hit"
 }
 
 # --- DIVE-2567: the memory leak-check, ENFORCED on the export path -----------
@@ -1120,7 +1278,7 @@ _pack_memory_leakscan() {
     # (a repo URL is also a hostname), so the report would under-name the work.
     done | grep -vE "$_PACK_LEAK_EXEMPT_RE" | grep -vE "$_PACK_LEAK_NAME_EXEMPT_RE" \
          | awk '!seen[$0]++' | sort -t: -k1,1 -k2,2n -s
-  )
+  ) || found=""
 
   [[ -n "$found" ]] || return 0
   printf '%s\n' "$found" >&2
@@ -1234,7 +1392,7 @@ AGENTS_MD_S_MEMORY='<!-- 5dive:memory -->'
 # that itself contains fences (memory facts routinely hold ``` code blocks).
 _agents_md_fence() {
   local f="$1" n
-  n=$(grep -oE '^~{3,}' "$f" 2>/dev/null | awk '{ if (length($0) > m) m = length($0) } END { print m + 0 }')
+  n=$(grep -oE '^~{3,}' "$f" 2>/dev/null | awk '{ if (length($0) > m) m = length($0) } END { print m + 0 }') || n=0
   (( n < 5 )) && n=5
   printf '%*s\n' "$((n + 1))" '' | tr ' ' '~'
 }
@@ -1545,7 +1703,7 @@ cmd_export() {
   # DIVE-2567: default is the STRICT audience. An operator who wants the scan off
   # has to say which audience they are exporting for; a typo is not a bypass.
   [[ "$audience" == "publish" || "$audience" == "self" ]] \
-    || fail "$E_USAGE" "--audience must be 'publish' (default, memory leak-check enforced) or 'self' (own backup/clone, scan skipped)"
+    || fail "$E_USAGE" "--audience must be 'publish' (default, memory leak-check enforced) or 'self' (own backup/clone, leak-check skipped; the secret tripwire still runs)"
   require_agent "$name"
   local user="agent-${name}" cdir="/home/agent-${name}/.claude"
 
@@ -1560,7 +1718,11 @@ cmd_export() {
   if (( with_memory )); then
     if [[ -z "$approve_memory" ]]; then
       # --- DRAFT phase: scope (L1) + tripwire (L3), write a review draft, STOP.
-      local memdir; memdir=$(_pack_memory_dir "$name")
+      # DIVE-2680: _pack_memory_dir returns 1 (not just empty) when the agent has
+      # no ~/.claude/projects dir at all — true of every non-claude-type seat
+      # (opencode, codex never create it). Unguarded under set -e that assignment
+      # killed the script before the very next line's fail() could print anything.
+      local memdir; memdir=$(_pack_memory_dir "$name") || memdir=""
       [[ -n "$memdir" ]] || fail "$E_NOT_FOUND" "agent '$name' has no persona memory to export"
       local draft="/home/agent-${name}/.claude/pack-staging/memory-draft"
       rm -rf "$draft"; mkdir -p "$draft"
@@ -1569,11 +1731,14 @@ cmd_export() {
       kept="${counts%% *}"; excluded="${counts##* }"
       if (( kept == 0 )); then
         rm -rf "$draft"
-        fail "$E_GENERIC" "nothing shareable: 0 reference/project knowledge facts ($excluded private user/feedback or opted-out facts excluded). Nothing written."
+        fail "$E_GENERIC" "nothing shareable: 0 reference/project knowledge facts ($excluded private user/feedback or opted-out facts excluded). Only metadata.type 'reference' or 'project' facts are eligible — 'user' and 'feedback' are private by definition and never exported. This agent has none of the former, so there is nothing to distil; write the shareable knowledge as reference/project facts first. Nothing written."
       fi
       if ! _pack_secret_tripwire "$draft"; then
         rm -rf "$draft"
-        fail "$E_GENERIC" "a scoped fact tripped the secret tripwire (paths above) — refusing. Tag it 'private: true' or remove the secret, then retry."
+        # DIVE-2679: name the ONE wrong turn this refusal invites. The reporter's next
+        # move was --audience=self, because the usage text presents it as the escape
+        # hatch; it is not one, and finding that out by re-running is a wasted cycle.
+        fail "$E_GENERIC" "a scoped fact tripped the secret tripwire (file:line: rule above) — refusing. Remove the credential from that fact, or tag the fact 'private: true' to exclude it, then retry. NOTE: --audience=self does NOT bypass this — it only skips the operational-detail leak-check; a real token never leaves in either audience."
       fi
       # DIVE-2567: the draft exists to be REVIEWED, so here the leak-check REPORTS
       # rather than refuses — refusing to write the draft would leave the human
@@ -1605,7 +1770,7 @@ cmd_export() {
       (( skept > 0 )) || { rm -rf "$mem_tmp"; fail "$E_GENERIC" "approved dir has 0 shareable knowledge facts after scoping ($sexcl excluded). Nothing sealed."; }
       if ! _pack_secret_tripwire "$mem_tmp"; then
         rm -rf "$mem_tmp"
-        fail "$E_GENERIC" "approved memory tripped the secret tripwire (paths above) — refusing to seal. Remove/tag the secret and retry."
+        fail "$E_GENERIC" "approved memory tripped the secret tripwire (file:line: rule above) — refusing to seal. Remove the credential from that fact, or tag it 'private: true', then retry. --audience=self does NOT bypass this (it only skips the operational-detail leak-check)."
       fi
       (( sexcl > 0 )) && warn "seal dropped $sexcl non-shareable fact(s) from the approved dir (type-gate re-enforced)"
       mem_src="$mem_tmp"
@@ -1632,14 +1797,20 @@ cmd_export() {
   if [[ -f "$cdir/avatar.png" ]]; then
     cp "$cdir/avatar.png" "$stage/avatar.png" 2>/dev/null && has_avatar=1
   fi
-  # Skills as source refs (reuse the skills spec; import re-adds them) — names only.
-  local skills='[]'
-  if [[ -d "$cdir/skills" ]]; then
-    # Skills install as real dirs OR symlinks (per-agent skill layout), so match
-    # both — -type d alone misses the symlinked majority.
-    skills=$(find "$cdir/skills" -maxdepth 1 -mindepth 1 \( -type d -o -type l \) -printf '%f\n' 2>/dev/null \
-             | sort | jq -R . | jq -cs '.' 2>/dev/null || echo '[]')
-  fi
+  # Skills as source refs (reuse the skills spec; import re-adds them).
+  #
+  # DIVE-2678: this used to emit the skills DIRECTORY NAMES and nothing else, which
+  # throws away the one fact import needs. A bare name is re-resolved by
+  # parse_skill_spec against `<org>/skills` and NOWHERE else, so every skill that came
+  # from any other repo became unresolvable the moment it was exported — the importer
+  # then correctly, and silently-by-design, skipped it. Measured on two fresh seats:
+  # 4 of 22 installed, the other 18 all third-party (none of them exist in
+  # 5dive-ai/skills, verified by fetch). The skill's origin is not lost data: the
+  # per-agent `.skills-manifest.json` already records the source cmd_skill_add
+  # resolved it from. Carry it as the qualified `<owner/repo>:<id>` form whenever it
+  # is NOT the default repo, and keep the short bare form when it is — so an
+  # AGENTS.md stays readable and the common case is unchanged.
+  local skills; skills=$(_pack_skill_refs "$cdir/skills")
   # Hooks subset from settings (structure only; if a hook command embeds a
   # secret that is on the operator — we copy the hooks block verbatim from
   # settings, which by convention holds no tokens).
@@ -1760,6 +1931,9 @@ cmd_import() {
   # "explicitly asked for <type>" apart from "took the pack's baked-in type";
   # the from-persona synth defaults it to claude locally below.
   local from_persona="" p_type="" p_iso="standard" p_model="" p_effort=""
+  # DIVE-2676: BYO credentials on the import path. Without these an import onto
+  # an API-key-only seat provisions an agent that cannot reach a model at all.
+  local p_provider="" p_api_key=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --as=*)              as="${1#--as=}" ;;
@@ -1773,6 +1947,8 @@ cmd_import() {
       --isolation=*)       p_iso="${1#--isolation=}" ;;
       --model=*)           p_model="${1#--model=}" ;;
       --effort=*)          p_effort="${1#--effort=}" ;;
+      --provider=*)        p_provider="${1#--provider=}" ;;
+      --api-key=*)         p_api_key="${1#--api-key=}" ;;
       # DIVE-644: opt-in, default-OFF import telemetry. Only meaningful for a
       # registry-slug import (a local .tar.gz has no public slug to report).
       --report-import)     report_import=1 ;;
@@ -1973,7 +2149,34 @@ cmd_import() {
   # symlink from creation, while first-run UI still does the actual sign-in. With
   # FIX A above $profile is always set (defaults to $as), so the prior bare
   # --defer-auth (no profile, no symlink) branch is gone.
-  cargs+=("--auth-profile=$profile" "--defer-auth")
+  #
+  # DIVE-2676: ...unless the importer brought credentials. --defer-auth and
+  # --provider/--api-key are mutually exclusive in cmd_create (BYO is the
+  # ALTERNATIVE to signing in later), so the BYO branch must not add it. Going
+  # through cmd_create rather than re-implementing here is the whole point: that
+  # path already writes the connector key AND calls {pi,opencode}_apply_model_default,
+  # which is the opencode.json model pin an import has never written.
+  local byo=0
+  if [[ -n "$p_provider" || -n "$p_api_key" ]]; then
+    [[ -n "$p_provider" && -n "$p_api_key" ]] \
+      || { rm -rf "$stage"; fail "$E_USAGE" "--provider and --api-key must be passed together"; }
+    byo=1
+  fi
+  cargs+=("--auth-profile=$profile")
+  if (( byo )); then
+    cargs+=("--provider=$p_provider" "--api-key=$p_api_key")
+    # Forward the model only when it can be MEANT for this seat: an explicit
+    # --model=, or a claude seat where the pack's baked id is already native.
+    # A pack's "claude-opus-5" is not a slug an openrouter-backed opencode seat
+    # can resolve, and DIVE-1395 catalog validation hard-fails an unresolvable
+    # one at create — so forwarding it blindly would turn a working import into
+    # a failed one.
+    if [[ -n "$model" ]] && { [[ -n "$p_model" ]] || [[ "$type" == "claude" ]]; }; then
+      cargs+=("--model=$model")
+    fi
+  else
+    cargs+=("--defer-auth")
+  fi
   if [[ -n "$channels" ]]; then
     cargs+=("--channels=$channels")
   elif [[ -n "$tg_token" ]]; then
@@ -2075,6 +2278,30 @@ cmd_import() {
     warn "NOT applied on this '$type' seat (settings.json is Claude Code's file): ${_nc[*]} — set these in the harness's own config; the persona, memory and skills DID land"
     cross_dropped=$(printf '%s\n' "${_nc[@]}" | jq -R . | jq -cs .)
   fi
+
+  # DIVE-2676: the warn above is about KEYS. This one is about whether the agent
+  # we just built can think at all, which is a different — and strictly worse —
+  # outcome, and the one an import has been reporting as success. Measured
+  # 2026-08-04: import OK, persona byte-identical at the seat's own AGENTS.md,
+  # 'agent info' model: — (empty), every ask "no idle reply within 120s". Every
+  # step passed and the end-to-end result still failed, so the summary has to
+  # carry the end-to-end verdict, not the per-step one. --provider/--api-key
+  # above is the fix; this is what the operator sees when they skipped it.
+  #
+  # The fix names a RE-IMPORT rather than a repair, because there is no repair.
+  # `agent auth set $type --api-key=` can still deliver the credential, but the
+  # model pin has no post-hoc verb at all: `agent config <name> set model=`
+  # accepts claude/codex/grok/antigravity ONLY and hard-fails "type '$type' does
+  # not support 'model' config" for exactly the seats this branch fires on
+  # (write_runtime_model has no opencode row). So the one command that produces a
+  # thinking agent is the create path — which is why the flags were added above,
+  # and why pointing at a nonexistent repair verb would just move the dead end.
+  local can_think="yes" think_fix=""
+  if (( ! byo )) && _pack_seat_needs_key "$type"; then
+    can_think="no"
+    think_fix="sudo 5dive agent rm $as && sudo 5dive agent import <pack> --as=$as --type=$type --provider=<id> --api-key=<key|-> --model=<slug>"
+    warn "agent '$as' CANNOT ANSWER YET: a '$type' seat authenticates by API key only (no interactive sign-in), and this import deferred auth — so it has no credential AND no model pin, and this CLI has no verb that adds a model to a live '$type' seat. The persona landed; the agent behind it is inert. Re-run the import with credentials: $think_fix"
+  fi
   if [[ "$type" == "claude" ]]; then
     local sfile="$cdir/settings.json" hooks plugins cur
     hooks=$(jq -c '.hooks // {}'     "$stage/manifest.json")
@@ -2170,8 +2397,33 @@ cmd_import() {
 
   # DIVE-2565: a silent skill drop is the bad outcome the single-file format was
   # explicitly not allowed to have. Name them, on every harness.
+  #
+  # DIVE-2678: naming them was not enough. "Skills added: 4, skipped: 18" reads as a
+  # broken importer, and the reader's next move (re-run it, file a bug) is the wrong
+  # one in both cases — the skip is CORRECT, the skill genuinely is not fetchable from
+  # the repo that was tried. So say which repo was tried, why that one, and the exact
+  # command that fixes it. A bare ref and a qualified ref fail for different reasons
+  # and get different sentences.
+  #
+  # DIVE-2677: "the agent's instructions still assume them" used to close this line,
+  # and it is false on EVERY type, not just opencode — _agents_md_explode truncates
+  # stage/CLAUDE.md at the `<!-- 5dive:skills -->` sentinel before persona_install_doc
+  # ever runs (this file, above), so the installed doc never carries that paragraph
+  # for any seat. A claude seat only LOOKS unaffected because cmd_create seeds a
+  # default CLAUDE.md whose own boilerplate happens to occupy the same line range
+  # afterward — an artifact of persona_install_doc's prepend, not a surviving
+  # reference to the skipped skill. Say what's actually true instead: the pack
+  # recorded these as expected, and nothing installed now provides or mentions them.
   if (( ${#skipped[@]} > 0 )); then
-    warn "skills NOT installed on this '$type' agent: ${skipped[*]} — the agent's instructions still assume them"
+    warn "skills NOT installed on this '$type' agent: ${skipped[*]} — the pack recorded these as expected skills, but nothing installed on this agent provides or references them now"
+    local sk_
+    for sk_ in "${skipped[@]}"; do
+      if [[ "$sk_" == *:* ]]; then
+        warn "  '${sk_#*:}' — '${sk_%%:*}' did not serve it (missing, private, or unreachable from this host)"
+      else
+        warn "  '$sk_' — no source recorded in the pack, so only '$(gh_org)/skills' was tried and it is not published there; re-add it by hand: 5dive agent skill $as add --source=<owner/repo> --skill=$sk_"
+      fi
+    done
   fi
 
   rm -rf "$stage"
@@ -2206,8 +2458,15 @@ cmd_import() {
   # absence of an error.
   local persona_at; persona_at=$(persona_target "$as" "$type" 2>/dev/null || echo "")
   local lands_j; lands_j=$(printf '%s\n' "${_lands[@]+"${_lands[@]}"}" | jq -R . | jq -cs 'map(select(. != ""))')
-  ok "imported '$as' from pack onto a '$type' seat ($mem_note). Skills added: ${#added[@]}, skipped: ${#skipped[@]}; template: $templated; avatar: $avatar_note; hooks: $hooks_note." \
-     '{name:$n, type:$t, persona:$pa, landsOn:$lands, notApplied:$nap, memory:$mem, memorySeeded:$ms, memoryInEffect:$me, skillsAdded:$a, skillsSkipped:$s, template:$tpl, avatar:$av, reported:$ri, hooks:$hk, disclosure:$disc}' \
+  # DIVE-2676: canThink/thinkFix ride in the SAME envelope as the success text so
+  # neither a human skimming the last line nor the dashboard rendering the JSON
+  # can read an inert seat as a healthy hire. An import that cannot produce an
+  # agent that answers is not a green import, and the summary line says so.
+  local think_note=""
+  [[ "$can_think" == "no" ]] && think_note=" INERT: no credential and no model on this '$type' seat — see the warning above."
+  ok "imported '$as' from pack onto a '$type' seat ($mem_note). Skills added: ${#added[@]}, skipped: ${#skipped[@]}; template: $templated; avatar: $avatar_note; hooks: $hooks_note.${think_note}" \
+     '{name:$n, type:$t, persona:$pa, landsOn:$lands, notApplied:$nap, canThink:$ct, thinkFix:$tf, memory:$mem, memorySeeded:$ms, memoryInEffect:$me, skillsAdded:$a, skillsSkipped:$s, template:$tpl, avatar:$av, reported:$ri, hooks:$hk, disclosure:$disc}' \
+     --arg ct "$can_think" --arg tf "$think_fix" \
      --arg n "$as" --arg t "$type" --arg pa "$persona_at" --argjson lands "$lands_j" --argjson nap "$cross_dropped" \
      --arg mem "$mem_inc" --arg ms "$mem_seeded" --arg me "$mem_effect" --argjson a "$added_j" --argjson s "$skipped_j" --arg tpl "$templated" --arg av "$avatar_note" --arg ri "$reported" --arg hk "$hooks_note" --argjson disc "$disclosure"
 }

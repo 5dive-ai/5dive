@@ -22,6 +22,7 @@ set -uo pipefail
 # 210 harnesses at once while every other check in this change stayed green.
 . "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh" \
   || printf 'grading tree: UNRESOLVED (tests/lib/grading_tree.sh not reachable; no tree named)\n' >&2
+trap 'rc=$?; rm -rf "${TMP:-}"; echo "HARNESS-RC=$rc"' EXIT   # DIVE-2692: fires on every exit path (incl. SKIP/precondition-fail early-exits); folds in tempdir cleanup so the two EXIT traps don't clobber each other.
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"; cd "$ROOT"
 FIVE="$ROOT/5dive"
 
@@ -36,7 +37,20 @@ if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
   exit 0
 fi
 
-TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
+# DIVE-2703: this e2e drives REAL `council convene` calls (offline via COUNCIL_MOCK
+# below, but the amend flow classifies as a constitutional/full-quorum motion, whose
+# preflight is only skipped when the process can see COUNCIL_MOCK end-to-end). A CI
+# runner with no live `5dive agent list --json` registry — the same reachability
+# preflightSeats()/preflightLiveness() gate on (src/council/cli.mjs) — is not this
+# e2e's target environment. Probed with the SAME command those preflights use, so a
+# real registry re-arms this gate automatically. Do NOT touch the actual
+# refusing-to-convene behavior this guards (DIVE-2039 NOT-REACHED, not a fix).
+if ! "$FIVE" agent list --json >/dev/null 2>&1; then
+  echo "SKIP: council amend e2e needs a live agent registry (\`5dive agent list --json\`) reachable — none here"
+  exit 0
+fi
+
+TMP="$(mktemp -d)"
 export STATE_DIR="$TMP" COUNCIL_MOCK=1 COUNCIL_5DIVE_BIN="$FIVE"
 CFILE="$TMP/constitution.yaml"
 LIN="$TMP/council/lineage.jsonl"

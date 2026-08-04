@@ -13,6 +13,7 @@
 #      the drift in property 1, so a change that widens the list while dropping the
 #      disclosure has not kept this file green.
 set -uo pipefail
+trap 'rc=$?; echo "HARNESS-RC=$rc"' EXIT   # DIVE-2692: fires on every exit path (incl. SKIP/precondition-fail early-exits); folds in tempdir cleanup so the two EXIT traps don't clobber each other.
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SRC="${SRC:-$HERE/../src}"
 

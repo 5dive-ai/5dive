@@ -260,7 +260,20 @@ function arg(name: string): string | undefined {
   return p ? p.slice(name.length + 3) : undefined;
 }
 
+// Every failure call site below emits { ok:false, reason, detail } — the shape
+// claim/rotate's internal bash parsing (`.token`/`.reason`) relies on. But
+// src/lib/output.sh's fail() is the ONLY other place in the codebase that sets
+// the documented --json contract's failure shape, {ok:false,error:{message}},
+// and the dashboard's execAgent parses envelopes against that contract
+// literally (DIVE-2331/DIVE-2334, see community/wiki/cos-runner-emits-ok-false-without-an-error-key.md).
+// Inject `error` here instead of at each call site so both shapes are always
+// satisfied without touching the reason/detail parsing.
 function out(obj: Record<string, unknown>): never {
+  if (obj.ok === false && !("error" in obj)) {
+    const message =
+      typeof obj.detail === "string" ? obj.detail : typeof obj.reason === "string" ? obj.reason : "cos command failed";
+    obj = { ...obj, error: { message } };
+  }
   process.stdout.write(JSON.stringify(obj) + "\n");
   process.exit(obj.ok ? 0 : 1);
 }
@@ -412,7 +425,7 @@ cmd_agent_cos() {
     [[ -r "$avatar" ]] || fail "$E_NOT_FOUND" "--avatar not readable: $avatar"
     local tok_env="$(dirname "$cos_env")/telegram-${agent}.env" atok
     [[ -r "$tok_env" ]] || fail "$E_NOT_FOUND" "no telegram token for agent '$agent' at $tok_env (is it a telegram agent?)"
-    atok=$(sudo grep -m1 -oP '(?<=^TELEGRAM_BOT_TOKEN=).*' "$tok_env" 2>/dev/null | tr -d '"'"'"'' | tr -d '[:space:]')
+    atok=$(sudo grep -m1 -oP '(?<=^TELEGRAM_BOT_TOKEN=).*' "$tok_env" 2>/dev/null | tr -d '"'"'"'' | tr -d '[:space:]') || atok=""
     [[ -n "$atok" ]] || fail "$E_NOT_FOUND" "TELEGRAM_BOT_TOKEN empty/missing in $tok_env"
     COS_TOKEN_OVERRIDE="$atok" "$bun" "$COS_RUN_DIR/cos-runner.ts" set-avatar --avatar="$avatar"
     return $?
@@ -434,7 +447,7 @@ cmd_agent_cos() {
       [[ -r "$cos_env" ]] || fail "$E_NOT_FOUND" "no CoS token at $cos_env — run: 5dive agent cos set --token=<token>"
       local tok_env="$(dirname "$cos_env")/telegram-${r_agent}.env" atok
       [[ -r "$tok_env" ]] || fail "$E_NOT_FOUND" "no telegram token for agent '$r_agent' at $tok_env (is it a telegram agent?)"
-      atok=$(sudo grep -m1 -oP '(?<=^TELEGRAM_BOT_TOKEN=).*' "$tok_env" 2>/dev/null | tr -d '"'"'"'' | tr -d '[:space:]')
+      atok=$(sudo grep -m1 -oP '(?<=^TELEGRAM_BOT_TOKEN=).*' "$tok_env" 2>/dev/null | tr -d '"'"'"'' | tr -d '[:space:]') || atok=""
       [[ -n "$atok" ]] || fail "$E_NOT_FOUND" "TELEGRAM_BOT_TOKEN empty/missing in $tok_env"
       local botid="${atok%%:*}"
       [[ "$botid" =~ ^[0-9]+$ ]] || fail "$E_VALIDATION" "could not derive a bot-id from agent '$r_agent' token (is it a CoS-minted bot?)"

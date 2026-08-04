@@ -313,6 +313,9 @@ cmd_push() {
   require_loaded push broker_gate_check broker_bind_target broker_task_target
   tasks_db_init
   local branch="" repo="" dry=0 yes=0
+  # DIVE-2605: --open-pr and its two body sources. Parsed here, validated before the
+  # push so a bad --pr-body-file cannot cost you a push you then cannot follow up.
+  local open_pr=0 pr_base="" pr_title="" pr_body_file="" pr_draft=0
   local -a positional=()
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -320,6 +323,11 @@ cmd_push() {
       --repo=*)   repo="${1#*=}" ;;
       --dry-run)  dry=1 ;;
       --yes|-y)   yes=1 ;;
+      --open-pr)      open_pr=1 ;;
+      --open-pr=*)    open_pr=1; pr_base="${1#*=}" ;;
+      --pr-title=*)   pr_title="${1#*=}" ;;
+      --pr-body-file=*) pr_body_file="${1#*=}" ;;
+      --pr-draft)     pr_draft=1 ;;
       --) shift; positional+=("$@"); break ;;
       -*) fail "$E_USAGE" "unknown flag: $1" ;;
       *)  positional+=("$1") ;;
@@ -327,7 +335,16 @@ cmd_push() {
     shift
   done
   [[ ${#positional[@]} -gt 0 ]] || fail "$E_USAGE" \
-    "usage: 5dive push <id|DIVE-N> [--branch=<b>] [--repo=<url>] [--dry-run]"
+    "usage: 5dive push <id|DIVE-N> [--branch=<b>] [--repo=<url>] [--dry-run] [--open-pr[=<base>]] [--pr-title=<t>] [--pr-body-file=<f>] [--pr-draft]"
+  # A PR flag without --open-pr is silently inert otherwise, and a silently inert
+  # flag on a verb you run once per branch is a body you think you attached.
+  if [[ $open_pr -eq 0 ]]; then
+    [[ -n "$pr_title" || -n "$pr_body_file" || $pr_draft -eq 1 ]] && fail "$E_USAGE" \
+      "--pr-title/--pr-body-file/--pr-draft do nothing without --open-pr; add --open-pr or drop them."
+  fi
+  if [[ -n "$pr_body_file" ]]; then
+    [[ -r "$pr_body_file" ]] || fail "$E_USAGE" "--pr-body-file: '${pr_body_file}' is not readable."
+  fi
 
   resolve_task_id "${positional[0]}"
   local id="$RESOLVED_TASK_ID" ident="$RESOLVED_TASK_IDENT"
@@ -419,9 +436,20 @@ cmd_push() {
     # DIVE-1970: the dry-run names WHERE the target came from, not just what it
     # is — "5dive-ai/5dive" alone looks equally right whether it was resolved or
     # merely defaulted to, which is why --dry-run did not catch the wrong-repo bug.
-    ok "dry-run: would push ${branch}@${sha} to ${slug} — target from ${repo_src} (gate cleared, author ${author_state})" \
+    # DIVE-2605: --open-pr is part of what the dry run is previewing, and a dry run
+    # that stays silent about it reads as "this flag was ignored".
+    local pr_preview="" pr_base_preview="${pr_base:-${FIVE_GATE_MAIN_BRANCH:-main}}"
+    if [[ $open_pr -eq 1 ]]; then
+      if sudo -n -l /usr/local/bin/5dive _gh_do >/dev/null 2>&1; then
+        pr_preview=" then open a PR ${branch} -> ${pr_base_preview} as 5dive-bot"
+      else
+        pr_preview=" — but NOT open a PR: this account has no '_gh_do' grant, so --open-pr would warn and leave the branch for someone else to open"
+      fi
+    fi
+    ok "dry-run: would push ${branch}@${sha} to ${slug}${pr_preview} — target from ${repo_src} (gate cleared, author ${author_state})" \
        "$(jq -n --arg t "$ident" --arg b "$branch" --arg s "$sha" --arg r "$slug" --arg a "$author_state" --arg rs "$repo_src" \
-             '{task:$t,branch:$b,sha:$s,repo:$r,repoSource:$rs,dryRun:true,gate:"cleared",author:$a}')"
+             --argjson op "$open_pr" --arg pb "$pr_base_preview" \
+             '{task:$t,branch:$b,sha:$s,repo:$r,repoSource:$rs,dryRun:true,gate:"cleared",author:$a,openPr:($op==1),prBase:$pb}')"
     return 0
   fi
 
@@ -436,6 +464,94 @@ cmd_push() {
     fail "$E_GENERIC" \
       "delegated push failed — the task gate is not cleared, the GitHub App credential is not provisioned (${_PUSH_APP_ENV_DEFAULT}), the NOPASSWD grant for '_push_do' is missing, or the push itself failed (see above). See DIVE-1376/1460."
   fi
+
+  # DIVE-2605: the branch is up; open the PR on the SAME rail rather than messaging
+  # an agent that holds a credential. Deliberately AFTER the push and never fatal to
+  # it — a failed PR open leaves a pushed branch anyone can open a PR from by hand,
+  # while making it fatal would turn a successful push into a red exit and invite a
+  # re-push. The push is the irreversible half; the PR is the recoverable one.
+  if [[ $open_pr -eq 1 ]]; then
+    _push_open_pr "$ident" "$slug" "$branch" "$pr_base" "$pr_title" "$pr_body_file" "$pr_draft" \
+      || warn "the branch pushed but the pull request was not opened (see above) — re-run just the PR with: 5dive gh pr create --repo ${slug} --head ${branch}"
+  fi
+}
+
+# _push_open_pr <ident> <slug> <branch> <base> <title> <body-file> <draft>
+# DIVE-2605, blockage #1. A builder holds no gh credential of any kind, so after
+# `5dive push` puts the branch up they have historically messaged main with a
+# prepared PR body for main to paste — two round-trips of agent-to-agent messaging
+# and one agent's attention, for a step that carries no judgement. Five such proxied
+# closes landed in one day (measured by main, 2026-08-03).
+#
+# The rail this uses is not new and no credential moves: `gh pr create` is class
+# `write` in DIVE-2448's routing map, so it already goes out as 5dive-bot through the
+# root-only `_gh_do`, which reads the PAT root-side and execs gh with it. Measured
+# 2026-08-04 from agent-dev2 (standard isolation, `ALL=(root) NOPASSWD:
+# /usr/local/bin/5dive *`): the rail answers, and the bot holds `push:true` on
+# 5dive-ai/5dive, which is the permission `pr create` needs. So this verb adds a
+# CALL, not a capability — the same posture as _push_do, one API call further on.
+#
+# The body travels over STDIN with the rest of the argv, NUL-separated, so a
+# multi-paragraph PR body never lands in the process table. That is strictly better
+# than the `gh pr create --body "$(cat f)"` a human would type.
+_push_open_pr() {
+  local ident="$1" slug="$2" branch="$3" base="$4" title="$5" body_file="$6" draft="$7"
+  local body="" url
+
+  [[ -n "$base" ]] || base="${FIVE_GATE_MAIN_BRANCH:-main}"
+  if [[ -z "$title" ]]; then
+    local t; t=$(db "SELECT COALESCE(title,'') FROM tasks WHERE ident=$(sqlq "$ident");" 2>/dev/null || true)
+    # The task title is the honest default, but it is prose written for a board and
+    # can run long; a PR title is a subject line. Truncate rather than refuse, and
+    # keep the ident so the merge gate's own ident-match evidence still binds.
+    [[ ${#t} -gt 80 ]] && t="${t:0:77}..."
+    title="${ident}: ${t:-delegated push}"
+  fi
+  if [[ -n "$body_file" ]]; then
+    body=$(cat "$body_file")
+  else
+    body="Delivers ${ident}."$'\n\n'"Opened by \`5dive push --open-pr\` (DIVE-2605): the branch and this pull request went out on the same root-side rail, as 5dive-bot. The authoring agent holds no GitHub credential."
+  fi
+
+  local -a args=(pr create --repo "$slug" --head "$branch" --base "$base"
+                 --title "$title" --body "$body")
+  [[ "$draft" == "1" ]] && args+=(--draft)
+
+  # Same handoff as the push: NUL-separated over stdin, exact command path, and
+  # `_gh_do` re-derives the routing class as root rather than trusting this caller.
+  # stderr is CAPTURED rather than passed through because one specific failure has
+  # to be read, not just relayed — see the already-exists arm below.
+  local rc=0 out
+  out=$(printf '%s\0' "${args[@]}" | sudo -n /usr/local/bin/5dive _gh_do 2>&1) || rc=$?
+  url="$out"
+
+  # ALREADY EXISTS IS THE DESIRED END STATE, not a failure. `--open-pr` means "make
+  # sure this branch has a pull request", and re-running a push (a second commit on
+  # the same branch, a retry after a red) hits this every time. Reporting it as a
+  # failure and then advising `5dive gh pr create` — the exact command that just
+  # refused — is advice that is wrong in the most likely failure mode there is.
+  # gh names the existing PR and its URL in that message; surface those.
+  if [[ $rc -ne 0 && "$out" == *"already exists"* ]]; then
+    local existing; existing=$(printf '%s' "$out" | grep -oE 'https://github\.com/[^ ]+/pull/[0-9]+' | head -1) || existing=""
+    ok "${ident} already has a pull request (${existing:-see above}) for ${branch} -> ${base} in ${slug} — branch pushed, nothing more to open" \
+       "$(jq -n --arg t "$ident" --arg u "${existing:-}" --arg b "$branch" --arg base "$base" --arg r "$slug" \
+             '{task:$t,pr:$u,branch:$b,base:$base,repo:$r,actor:"5dive-bot",created:false}')"
+    return 0
+  fi
+  if [[ $rc -ne 0 ]]; then
+    printf '%s\n' "$out" >&2
+    # Distinguish "you may not route" from "the routed call failed" — sudo exits 1
+    # for a missing grant and gh exits 1 for its own errors, so rc alone cannot tell
+    # them apart. Ask sudo directly, and only after a failure.
+    if ! sudo -n -l /usr/local/bin/5dive _gh_do >/dev/null 2>&1; then
+      warn "opening the PR needs the NOPASSWD grant for '/usr/local/bin/5dive _gh_do', which this account does not have — so nothing ran and this says NOTHING about the PR itself. A builder gets the grant with 'agent create --can-push'."
+    fi
+    return 1
+  fi
+  url="${url##*$'\n'}"
+  ok "opened ${url:-the pull request} for ${ident} (${branch} -> ${base} in ${slug}, as 5dive-bot)" \
+     "$(jq -n --arg t "$ident" --arg u "$url" --arg b "$branch" --arg base "$base" --arg r "$slug" \
+           '{task:$t,pr:$u,branch:$b,base:$base,repo:$r,actor:"5dive-bot"}')"
 }
 
 # cmd_push_do — ROOT-ONLY, the atomic gated push (DIVE-1460). Reads four lines on

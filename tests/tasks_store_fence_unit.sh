@@ -30,7 +30,7 @@ SUMMARY_PRINTED=0
 # kills the shell while that redirect is live, so a trap printing to fd 2 lands in
 # /dev/null and the truncation is silent again. Graded by tests/truncation_marker_guard_unit.sh.
 exec 8>&2
-trap 'rc=$?; rm -rf "$TMP" "$PWD/tests/.dive2249-mutant.sh"; [[ "$SUMMARY_PRINTED" == 1 ]] || printf "ABORTED - tasks_store_fence_unit exited early (rc=%s) before its summary; every assertion after the last ok above was SKIPPED, not passed\n" "$rc" >&8' EXIT
+trap 'rc=$?; rm -rf "$TMP" "$PWD/tests/.dive2249-mutant.sh"; [[ "$SUMMARY_PRINTED" == 1 ]] || printf "ABORTED - tasks_store_fence_unit exited early (rc=%s) before its summary; every assertion after the last ok above was SKIPPED, not passed\n" "$rc" >&8; echo "HARNESS-RC=$rc"' EXIT   # DIVE-2692: appends the HARNESS-RC line to this harness's pre-existing abort-backstop trap; trap stays where it was (TMP/SUMMARY_PRINTED/fd8 are all already live by this point) rather than moving to the top.
 
 PASS=0; FAIL=0
 ok_t()  { PASS=$((PASS+1)); printf 'ok   - %s\n' "$1"; }

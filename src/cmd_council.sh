@@ -4625,7 +4625,7 @@ _council_record() {
     return 0
   fi
   local receipts; receipts="$(jq -s '[.[] | {subject:(.subject // ""), question:(.question // ""), canonical:(.canonical // "")}]' "${COUNCIL_RECEIPTS}"/*.json 2>/dev/null)" || receipts='[]'
-  local subjects; subjects="$(printf '%s' "$receipts" | jq -r '.[] | (if (.subject|length)>0 then .subject else ((.question|capture("(?<i>[A-Z][A-Z0-9]+-[0-9]+)")|.i) // "") end)' 2>/dev/null | grep -E '^[A-Za-z0-9]+-[0-9]+$' | sort -u)"
+  local subjects; subjects="$(printf '%s' "$receipts" | jq -r '.[] | (if (.subject|length)>0 then .subject else ((.question|capture("(?<i>[A-Z][A-Z0-9]+-[0-9]+)")|.i) // "") end)' 2>/dev/null | grep -E '^[A-Za-z0-9]+-[0-9]+$' | sort -u)" || subjects=""
   local outcomes='{}' subj st oc
   while IFS= read -r subj; do
     [[ -n "$subj" ]] || continue
@@ -4923,7 +4923,7 @@ _council_sched_crontab_upsert() {
   # (crontab -l non-zero) degrades to an empty current set, so the first add still installs.
   local name="$1" line="$2" marker="# 5dive-council-schedule:$1" cur next
   cur="$(crontab -l 2>/dev/null)"
-  next="$(printf '%s\n' "$cur" | grep -vF "$marker")"
+  next="$(printf '%s\n' "$cur" | grep -vF "$marker")" || next=""
   { [[ -n "${next//[$'\n\t ']/}" ]] && printf '%s\n' "$next"; printf '%s\n' "$line"; } | crontab - 2>/dev/null
 }
 _council_sched_crontab_remove() {

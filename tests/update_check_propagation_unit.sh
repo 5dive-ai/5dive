@@ -27,6 +27,7 @@ set -uo pipefail
 # 210 harnesses at once while every other check in this change stayed green.
 . "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh" \
   || printf 'grading tree: UNRESOLVED (tests/lib/grading_tree.sh not reachable; no tree named)\n' >&2
+trap 'rc=$?; rm -rf "${FIX:-}"; echo "HARNESS-RC=$rc"' EXIT   # DIVE-2692: fires on every exit path (incl. SKIP/precondition-fail early-exits); folds in tempdir cleanup so the two EXIT traps don't clobber each other.
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"; cd "$ROOT" || exit 1
 PASS=0; FAIL=0
 ok_t(){ PASS=$((PASS+1)); printf 'ok   - %s\n' "$1"; }
@@ -49,7 +50,7 @@ fi
 # ---------------------------------------------------------------- fixtures --
 # Two real bundles a release apart, and the REAL sha256 of each. Serving
 # bundle-old beside sum-new is the exact split the CDN produced on 2026-07-26.
-FIX="$(mktemp -d)"; trap 'rm -rf "$FIX"' EXIT
+FIX="$(mktemp -d)"
 printf '#!/usr/bin/env bash\nreadonly FIVE_VERSION="0.15.34"\n' > "$FIX/bundle-old"
 printf '#!/usr/bin/env bash\nreadonly FIVE_VERSION="0.15.35"\n' > "$FIX/bundle-new"
 printf '#!/usr/bin/env bash\n# a bundle with no version line\n'  > "$FIX/bundle-nover"

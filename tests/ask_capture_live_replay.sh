@@ -48,6 +48,7 @@ set -euo pipefail
 # 210 harnesses at once while every other check in this change stayed green.
 . "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh" \
   || printf 'grading tree: UNRESOLVED (tests/lib/grading_tree.sh not reachable; no tree named)\n' >&2
+trap 'rc=$?; rm -rf "${W:-}" "${W2:-}"; echo "HARNESS-RC=$rc"' EXIT   # DIVE-2692: fires on every exit path (incl. SKIP/precondition-fail early-exits); folds in tempdir cleanup so the two EXIT traps don't clobber each other.
 cd "$(dirname "$0")/.."
 
 # shellcheck disable=SC1091
@@ -61,7 +62,7 @@ pass=0
 ok_() { pass=$((pass+1)); echo "  ok: $1"; }
 die() { echo "FAIL: $*" >&2; exit 1; }
 
-W="$(mktemp -d)"; trap 'rm -rf "$W"' EXIT
+W="$(mktemp -d)"
 msg="$W/msg"; acc="$W/acc"; : > "$acc"
 { printf 'CONTEXT LINE 1: filler to push this ask past one screen height so any marker scrolls off an alt-screen pane. '
   printf 'Reply with exactly this token and nothing else: AFTER-AGY-LONG-R2K7 '
@@ -102,7 +103,7 @@ fi
 # replay earlier frames out of order to force the mis-alignment, and require the
 # reply back intact with its relative indentation.
 # ---------------------------------------------------------------------------
-W2="$(mktemp -d)"; trap 'rm -rf "$W" "$W2"' EXIT
+W2="$(mktemp -d)"
 M2=abc12345; acc2="$W2/a"; : > "$acc2"; base2="$W2/b"; msg2="$W2/m"
 printf 'vote please\n' > "$msg2"
 printf '  idle\n──────\n>\n──────\n? for shortcuts   Model X\n' > "$base2"

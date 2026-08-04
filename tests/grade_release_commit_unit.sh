@@ -7,6 +7,7 @@
 # "never ran" reproduces that defect one layer down, so every arm below is about
 # keeping those two apart.
 set -uo pipefail
+trap 'rc=$?; rm -rf "${T:-}"; echo "HARNESS-RC=$rc"' EXIT   # DIVE-2692: fires on every exit path (incl. SKIP/precondition-fail early-exits); folds in tempdir cleanup so the two EXIT traps don't clobber each other.
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 GRADE="${GRADE:-$HERE/../scripts/grade-release-commit.sh}"
 
@@ -18,7 +19,7 @@ GRADE="${GRADE:-$HERE/../scripts/grade-release-commit.sh}"
 pass=0; fail=0
 ok(){ if eval "$2"; then echo "ok   - $1"; pass=$((pass+1)); else echo "FAIL - $1"; fail=$((fail+1)); fi; }
 
-T=$(mktemp -d); trap 'rm -rf "$T"' EXIT
+T=$(mktemp -d)
 
 # A stand-in bundle whose behaviour each arm controls. The real bundle is 53k lines;
 # what is being graded here is the GRADER, so the artifact is stubbed deliberately.
@@ -212,6 +213,47 @@ ok "UNRESOLVABLE-PARENT: a parent git cannot resolve is UNDETERMINED, not an inh
 ok "UNRESOLVABLE-PARENT: says the inheritance is unproven" \
   "grep -q 'unproven' <<<\"\$OUT\" && grep -q 'NOT a pass' <<<\"\$OUT\""
 
+# DIVE-2700: THE FOLD'S DELETIONS ARE PART OF THE RELEASE COMMIT, AND THEY ARE THE
+# ONLY WRITE IN IT THAT REMOVES A PATH. release-cut.yml:450 runs
+# fold-changelog-fragments.sh, which REMOVES every changelog.d/*.md it folds into
+# CHANGELOG.md, and :493 stages that removal with `git add -A -f changelog.d`. The
+# deletions land in the delta, so delta mode must tolerate them or no cut can complete
+# while a single fragment exists — which is exactly how v0.19.0 died (run 30885717462,
+# 7 fragment deletions reported "OUTSIDE the release-commit set").
+#
+# mk_repo cannot express this: it only ADDS paths on top of the parent, and the shape
+# under test is a path present in the PARENT and absent from the RELEASE commit. Built
+# by hand for that reason.
+rm -rf "$T/repo"; mkdir -p "$T/repo/src" "$T/repo/tests" "$T/repo/changelog.d"
+_git init -q 2>/dev/null || git -C "$T/repo" init -q
+printf 'readonly FIVE_VERSION="0.0.0-dev"\n' > "$T/repo/src/header.sh"
+printf 'x\n' > "$T/repo/CHANGELOG.md"
+printf '### fragment\n' > "$T/repo/changelog.d/DIVE-1.md"
+printf '### fragment\n' > "$T/repo/changelog.d/DIVE-2.md"
+# README.md SURVIVES the fold, and that is not decoration — it is the arm's whole
+# point. An earlier version of this fixture left changelog.d/ EMPTY after the fold, so
+# a `changelog.d/*` entry matched nothing on disk, stayed literal through the
+# pattern-list loop, and the arm passed while the real cut still refused. A surviving
+# file is what makes an accidental pathname expansion of the pattern list resolve to
+# something WRONG instead of harmlessly to itself. Real changelog.d/ has this file.
+printf '# fragments go here\n' > "$T/repo/changelog.d/README.md"
+_git add -A >/dev/null; _git commit -qm parent
+PARENT=$(_git rev-parse HEAD)
+# The release commit, exactly as the cut builds it: version assigned, CHANGELOG
+# stamped, fragments folded away.
+printf 'readonly FIVE_VERSION="0.17.11"\n' > "$T/repo/src/header.sh"
+printf 'x\nfolded\n' > "$T/repo/CHANGELOG.md"
+rm -f "$T/repo/changelog.d/DIVE-1.md" "$T/repo/changelog.d/DIVE-2.md"
+_git add -A >/dev/null; _git commit -qm release
+repo_bundle 0.17.11; repo_tests 0
+runr 0.17.11 "$PARENT"
+ok "FOLD-DELTA: DELETED changelog.d fragments are inside the release-commit set and grade 0" \
+  "[[ $RC -eq 0 ]]"
+ok "FOLD-DELTA: no fragment is reported as an offending path" \
+  "! grep -q 'OUTSIDE the release-commit set' <<<\"\$OUT\""
+ok "FOLD-DELTA: still INHERITS rather than silently falling back to the full corpus" \
+  "grep -q 'inheriting the parent' <<<\"\$OUT\""
+
 # ---- 7. THE EXPENSIVE PATH IS THE DEFAULT ----
 # Without a parent there is no premise, so there is nothing to inherit. The arm that
 # matters is the COUNT: delta mode would have run 1, the full corpus runs 3.
@@ -322,11 +364,35 @@ ok "SHIPPED-LIST: the excluded main-tree harness is NAMED in it, so its SKIP sho
 # and fail HERE, at PR time, instead.
 _wf="$_repo/.github/workflows/release-cut.yml"
 _pathset=$(GRC_DELTA_PATHS= bash -c '. /dev/stdin <<< "$(sed -n "/^GRC_DELTA_PATHS=/p" "$1")"; echo "$GRC_DELTA_PATHS"' _ "$GRADE" 2>/dev/null)
-# Every pathspec the cut stages, read out of the `git add -f` lines themselves.
-_staged=$(grep -oE '^\s*(if \[ -f [^]]+\]; then )?git add -f [^;|&]+' "$_wf" 2>/dev/null \
-          | sed -E 's/.*git add -f //' | tr ' ' '\n' | sed '/^$/d' | sort -u)
+# Every pathspec the cut stages, read out of the `git add` lines themselves.
+#
+# DIVE-2700 — THIS CENSUS IS WHY THE DRIFT WENT UNNOTICED, and the PARSER is the
+# defect, not the list. It used to require a literal `git add -f ` optionally behind
+# `if [ -f ...]; then`. DIVE-2582 added a fifth writer phrased two ordinary ways the
+# pattern did not admit: `git add -A -f changelog.d` (a flag inserted BETWEEN `add`
+# and `-f`) behind `if [ -d changelog.d ]` (a DIRECTORY test, not a file test). So the
+# census counted 4 of 5 writers and printed "0 unlisted", and this arm was GREEN on
+# the exact commit whose cut refused. A census that silently under-counts prints the
+# same "none" as one that checked everything.
+#
+# Now: match ANY `git add`, then strip the flags whatever their order. Over-matching
+# here is safe — an extra pathspec can only add a drift complaint at PR time, never
+# suppress one.
+_staged=$(grep -oE 'git add [^;|&]+' "$_wf" 2>/dev/null \
+          | sed -E 's/^git add //' \
+          | tr ' ' '\n' | sed -E '/^-/d; /^$/d' | sort -u)
 _drift=(); _sn=0
-for _s in $_staged; do _sn=$((_sn+1)); grep -qw -- "$_s" <<< "$_pathset" || _drift+=("$_s"); done
+for _s in $_staged; do
+  _sn=$((_sn+1))
+  _hit=0
+  # Entries are GLOBS (DIVE-2700), so compare by pattern. `changelog.d` staged as a
+  # DIRECTORY must be recognised by the `changelog.d/*` entry, which a literal
+  # `grep -w` over the pathset would miss.
+  for _a in $_pathset; do
+    [[ "$_s" == $_a || "$_a" == "$_s"/* ]] && { _hit=1; break; }
+  done
+  (( _hit )) || _drift+=("$_s")
+done
 ok "PATHSET: the workflow's release-commit block was found and stages something" \
   "[[ -f \"\$_wf\" && $_sn -gt 0 ]]"
 ok "PATHSET: every path release-cut.yml stages is ALLOWED by GRC_DELTA_PATHS (${_sn} staged, ${#_drift[@]} unlisted: ${_drift[*]:-none})" \

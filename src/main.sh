@@ -135,8 +135,13 @@ Agents:
                                                      # handle instead of numeric id.
   5dive agent <name> tui                             # attach your terminal to the agent's tmux session
   5dive agent logs <name> [--follow] [--lines=N] [--tmux]
-  5dive agent send <name> <text...> [--from=<sender>] [--raw] [--wake]
+  5dive agent send <name> <text...>|--message=<text>|--message-file=<path>
+                                    [--from=<sender>] [--raw] [--wake]
                                     [--reply-to-chat=<id> [--reply-to-msg=<id>]]
+                                                     # --message-file reads the body VERBATIM from a file (DIVE-2627).
+                                                     # Use it for ANY message that quotes CLI verbs: inside a double-quoted
+                                                     # --message=, backtick-quoted verbs RUN as command substitution (as you),
+                                                     # the words are deleted, and the send still prints OK.
                                                      # inject a message (tmux send-keys + Enter).
                                                      # When called from another agent, auto-wraps as
                                                      # [5dive-msg from=<caller> id=<id>] so the
@@ -267,6 +272,7 @@ Zero-human proof (publish your own badge — OSS-17):
 
 Delegated push (bring your own GitHub App — DIVE-1376):
   5dive push <id|DIVE-N> [--branch=<b>] [--dry-run]  # push ONLY the task's branch, ONLY after its gate clears; author enforced
+  5dive push <id|DIVE-N> --open-pr[=<base>]          # ...and open its pull request on the same root-side rail, as 5dive-bot (DIVE-2605)
   5dive deploy <id|DIVE-N> [--target=<project@ref>] [--env=production|preview] [--dry-run]
                                                      # INST-5: deploy ONLY the project@ref the task declares, ONLY after its gate clears
   5dive push setup                                   # scaffold + check the GitHub App credential (bring-your-own; root)
@@ -282,7 +288,9 @@ Actor-routed gh (DIVE-2448):
   # (DIVE-2232). The PAT stays root-side in /etc/5dive/connectors/github-bot.env — the agent never holds it.
 
 Identity:
-  5dive whoami [--json]
+  5dive whoami [--json]                    # the CURRENT process: actor, authority, tier + the SOURCE of each; exit 6 if unmeasurable
+  5dive whoami --for=<id|DIVE-N> [--json]  # the RECORDED authority chain for one row; EXIT 1 when a link that HAPPENED is unmeasurable
+                                           # scope it: --for=task:DIVE-N | gate:DIVE-N | action:DIVE-N
     Who is acting, under whose authority, at what tier — and the SOURCE of each.
     Identity is uid-first: \$EUID (or sudo's \$SUDO_UID at real root) resolved
     against /etc/passwd in pure bash. Never argv/--from, \$USER, \$SUDO_USER or
@@ -365,7 +373,7 @@ main() {
   done
   set -- "${rest[@]+"${rest[@]}"}"
 
-  [[ $# -gt 0 ]] || { usage; exit "$E_USAGE"; }
+  [[ $# -gt 0 ]] || { usage; mark_reported; exit "$E_USAGE"; }
   local top="$1"; shift
   # DIVE-2323: the one place that sees every dispatch, so fail()'s E_GENERIC
   # hint can name the verb that broke. Set unconditionally, even for a $top
@@ -473,7 +481,7 @@ main() {
         with_registry_lock cmd_hire "$@"
       fi ;;
     agent)
-      [[ $# -gt 0 ]] || { usage; exit "$E_USAGE"; }
+      [[ $# -gt 0 ]] || { usage; mark_reported; exit "$E_USAGE"; }
       local sub="$1"; shift
       case "$sub" in
         -h|--help|help) usage ;;

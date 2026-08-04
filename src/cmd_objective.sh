@@ -634,7 +634,7 @@ _objective_no_progress() {
   [[ "$lim" =~ ^[0-9]+$ && "$lim" -gt 0 ]] || return 1
   local vals n
   vals=$(db "SELECT reading_value FROM objective_cycles WHERE objective_id=$obj_id AND reading_value IS NOT NULL ORDER BY id DESC LIMIT $lim;")
-  n=$(printf '%s\n' "$vals" | grep -c .)
+  n=$(printf '%s\n' "$vals" | grep -c .) || n=0
   [[ "$n" -ge "$lim" ]] || return 1         # need at least lim recorded readings to judge
   local newest oldest stop
   newest=$(printf '%s\n' "$vals" | head -n1)

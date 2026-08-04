@@ -28,7 +28,7 @@ cmd_telegram_discover() {
     [[ -r "$env_file" ]] \
       || fail "$E_NOT_FOUND" "no telegram connector for agent '$agent' (looked at $env_file)"
     token=$(grep -E '^TELEGRAM_BOT_TOKEN=' "$env_file" 2>/dev/null \
-            | head -1 | cut -d= -f2-)
+            | head -1 | cut -d= -f2-) || token=""
     [[ -n "$token" ]] \
       || fail "$E_NOT_FOUND" "no TELEGRAM_BOT_TOKEN in $env_file"
   fi

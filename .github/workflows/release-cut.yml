@@ -442,6 +442,16 @@ jobs:
           sed -i -E "s/^readonly FIVE_VERSION=\"[^\"]+\"/readonly FIVE_VERSION=\"${version}\"/" src/header.sh
           [ "$(grep -m1 -oE '^readonly FIVE_VERSION="[^"]+"' src/header.sh)" = "readonly FIVE_VERSION=\"${version}\"" ] \
             || { echo "::error::could not write FIVE_VERSION=${version} into src/header.sh (the 'readonly FIVE_VERSION=' anchor drifted?) — refusing to cut ${tag} rather than publish the sentinel"; exit 1; }
+          # DIVE-2582: FOLD changelog.d/*.md FRAGMENTS into CHANGELOG.md's top,
+          # BEFORE the stamp below — same detached-commit-only rule (never main),
+          # so stamp-changelog.sh sees the folded headings same as a manually-typed
+          # one. Not fatal for the same reason the stamp isn't: a cut must not die
+          # because a fragment drifted from the expected format.
+          if _folded=$(bash scripts/fold-changelog-fragments.sh 2>&1); then
+            echo "changelog.d fragments folded for ${tag}: ${_folded} (DIVE-2582)"
+          else
+            echo "::warning::changelog.d fragments could not be folded for ${tag} (${_folded}) — publishing anyway"
+          fi
           # DIVE-2452: STAMP THE CHANGELOG onto this release commit, same rule as the
           # FIVE_VERSION write above — the detached release tree only, never main
           # (DIVE-2247 removed this job's ability to push a protected branch, and the
@@ -477,6 +487,10 @@ jobs:
           # a pathspec that matches nothing, and the stamp is explicitly non-fatal —
           # a cut must not die because a repo has no CHANGELOG.md.
           if [ -f CHANGELOG.md ]; then git add -f CHANGELOG.md; fi
+          # DIVE-2582: the fold step above deletes any folded changelog.d/
+          # fragments from the working tree — stage that removal too, same guard
+          # shape (dir may legitimately not exist).
+          if [ -d changelog.d ]; then git add -A -f changelog.d; fi
           git -c user.name=lodar -c user.email=markounik@gmail.com \
               commit -q -m "release ${tag}: assign ${version} + built bundle (DIVE-2091 bundle-at-tag-time, DIVE-2247 version-at-tag-time)"
           # DIVE-2433: `sha` is about to stop meaning "the commit whose check-runs we

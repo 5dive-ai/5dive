@@ -74,7 +74,7 @@ HOMEDIR="$USAGE_HOME_ROOT/agent-$AGENT"
 PROJDIR="$HOMEDIR/.claude/projects/dive2058-unittest-$$"
 mkdir -p "$PROJDIR"
 cleanup() { rm -rf "$TMP"; }
-trap cleanup EXIT
+trap 'rc=$?; cleanup; echo "HARNESS-RC=$rc"' EXIT   # DIVE-2692: fires on every exit path; cleanup() has no $? dependency of its own so wrapping it is safe.
 
 STATE_DIR="$TMP"; TASKS_DIR="$STATE_DIR/tasks"; TASKS_DB="$TASKS_DIR/tasks.db"
 REGISTRY="$TMP/registry.json"

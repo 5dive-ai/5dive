@@ -29,6 +29,7 @@
 # re-enables errexit and the first non-zero command substitution kills the file.
 set +e
 
+trap 'rc=$?; rm -rf "$(dirname "${BASE:-}")"; echo "HARNESS-RC=$rc"' EXIT   # DIVE-2692: fires on every exit path (incl. SKIP/precondition-fail early-exits); folds in tempdir cleanup so the two EXIT traps don't clobber each other.
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"
 SRC="$ROOT/src/cmd_skill.sh"
@@ -53,7 +54,6 @@ FN_IN="$(awk '/^skill_target_within\(\) \{/,/^\}/' "$VSRC")"
 eval "$FN_ID"; eval "$FN_IN"
 
 BASE="$(mktemp -d)/skills"; mkdir -p "$BASE"
-trap 'rm -rf "$(dirname "$BASE")"' EXIT
 
 # --- T1 the NAME check refuses the traversal tokens --------------------------
 for tok in ".." "."; do

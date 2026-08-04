@@ -14,6 +14,7 @@ set -uo pipefail
 # 210 harnesses at once while every other check in this change stayed green.
 . "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh" \
   || printf 'grading tree: UNRESOLVED (tests/lib/grading_tree.sh not reachable; no tree named)\n' >&2
+trap 'rc=$?; rm -rf "${TMP:-}"; echo "HARNESS-RC=$rc"' EXIT   # DIVE-2692: fires on every exit path (incl. SKIP/precondition-fail early-exits); folds in tempdir cleanup so the two EXIT traps don't clobber each other.
 cd "$(dirname "$0")/.."
 # DIVE-2518: identity comes from the uid now — `USER=agent-x` no longer moves it.
 # Impersonate through the sealed seam instead. The subshell keeps each call's
@@ -22,7 +23,6 @@ cd "$(dirname "$0")/.."
 as_agent() { local _w="$1"; shift; ( actor_seam_as "$_w"; "$@" ); }
 SRC=src
 TMP="$(mktemp -d /tmp/handoff-ack-unit.XXXXXX)"
-trap 'rm -rf "$TMP"' EXIT
 
 # shellcheck disable=SC1090
 for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh \

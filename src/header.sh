@@ -515,6 +515,32 @@ declare -A SKILLS_INSTALL_DIR=(
   [grok]=".grok/skills"
 )
 
+# skill_default_source <id> -> the repo a 5dive DEFAULT skill is installed from,
+# or non-zero for any id that is not one of ours.
+#
+# DIVE-2678 iteration 3. The manifest is the authoritative provenance record, but
+# it only ever describes skills that arrived via `agent skill add` — and MEASURED
+# 2026-08-04, zero seats on this fleet carry one, because the create path
+# (install_default_skill_for_agent) never wrote it. So on every seat that exists
+# today the manifest answers nothing, and a default skill installed from a repo
+# that is NOT <org>/skills exported bare and came back unresolvable.
+#
+# find-skills is exactly that case and it is not an edge: it ships on EVERY seat
+# of every type, from vercel-labs/skills, and it was in the 18 skipped names on
+# the measured export. This table is what lets provenance be recovered for a
+# skill installed before the writer existed, with no network and no manifest.
+#
+# It must agree with the install_default_skill_for_agent call sites in
+# agent_setup.sh; tests/pack_skill_source_roundtrip_unit.sh asserts that it does,
+# so adding a default skill there without adding it here reds the suite.
+skill_default_source() {
+  case "$1" in
+    find-skills) echo "vercel-labs/skills" ;;
+    5dive-cli|compile-knowledge|openagent) echo "$(gh_org)/skills" ;;
+    *) return 1 ;;
+  esac
+}
+
 # skills_install_dir <type> -> the $HOME-relative dir an installed skill body
 # lands in for that type. THE resolver: this is the expression cmd_pack.sh's
 # import path, cmd_skill add/list/rm and agent_setup.sh each spell by hand, and
@@ -878,6 +904,33 @@ resolve_native_provider() {
     claude)   [[ -n "${CLAUDE_PROVIDER_BASEURL[$canonical]:-}" ]] && echo "$canonical" ;;
     *)        echo "" ;;
   esac
+}
+
+# Reverse of resolve_native_provider for hermes: map a hermes-native provider id
+# back to its canonical UI id. Needed anywhere a native id observed at runtime
+# (e.g. a credential_pool key in auth.json, which is native — see cmd_account.sh
+# set-active-provider) has to index a table keyed CANONICAL, like
+# HERMES_PROVIDER_MODEL (DIVE-2666: that lookup used $native directly and
+# silently no-op'd for the three providers HERMES_PROVIDER_ID renames — google,
+# moonshot, qwen). Scans HERMES_PROVIDER_ID rather than a hand-maintained
+# reverse table so the two tables can't drift out of sync.
+#
+# Echoes empty when $native doesn't match any HERMES_PROVIDER_ID value — the
+# caller should treat that as a real key-space miss (an id our own table
+# doesn't know, e.g. a future provider, a typo, or hermes' own further
+# normalization of "kimi" to "kimi-coding") and warn rather than silently
+# fall through, since every native id OUR code hands out does come from this
+# same table and is expected to resolve.
+resolve_canonical_provider_hermes() {
+  local native="$1" canonical
+  [[ -n "$native" ]] || { echo ""; return; }
+  for canonical in "${!HERMES_PROVIDER_ID[@]}"; do
+    if [[ "${HERMES_PROVIDER_ID[$canonical]}" == "$native" ]]; then
+      echo "$canonical"
+      return
+    fi
+  done
+  echo ""
 }
 
 # Live auth probe: run "<cli> <args>" as user `claude` with a 5s wall-clock

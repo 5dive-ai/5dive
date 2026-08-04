@@ -18,6 +18,7 @@
 # harness anyone adds, and its absence looks exactly like its presence -- a
 # green suite either way.  That is the same wrong-target shape one level up.
 set -uo pipefail
+trap 'rc=$?; echo "HARNESS-RC=$rc"' EXIT   # DIVE-2692: fires on every exit path (incl. SKIP/precondition-fail early-exits); folds in tempdir cleanup so the two EXIT traps don't clobber each other.
 cd "$(dirname "$0")/.."
 
 # shellcheck source=lib/grading_tree.sh
