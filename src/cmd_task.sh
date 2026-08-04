@@ -3945,7 +3945,7 @@ _task_route_to_verifier() {
   # re-delivery passes 0 and deliberately leaves the stamp behind at its old
   # iteration — that gap IS the signal the gate reads.
   local set_binding_iter=""
-  # DIVE-2682 + DIVE-2601 interaction, found by rebasing onto 8051cb1: the counter's
+  # DIVE-2682 + DIVE-2624 interaction, found by rebasing onto 8051cb1: the counter's
   # bump became CONDITIONAL ("re-delivery of the same pass, not rework" — it only
   # increments on a first delivery or after a reject). An unconditional +1 here then
   # stamped the binding at iteration+1 while `iteration` itself stayed put, leaving

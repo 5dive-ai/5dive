@@ -452,7 +452,7 @@ out=$( actor_seam_as dev; cmd_task_done DIVE-270 2>&1 ); rc=$?
   || bad_t "Tgd remedy is inert — false refuse on a correctly-bound row" "rc=$rc status=$(statusof DIVE-270) out=$out"
 
 # ARM (e) — THE SAME-PASS RE-DELIVERY, and it exists because the first version of
-# this fix was UNGRADED. DIVE-2701 made the counter's bump CONDITIONAL ("re-delivery
+# this fix was UNGRADED. DIVE-2624 made the counter's bump CONDITIONAL ("re-delivery
 # of the same pass, not rework": iteration moves only on a first delivery or after a
 # reject). The stamp was still an unconditional +1, so a same-pass re-delivery left
 # bind = iter+1 — a state the guard's predicate (bind < iter) can NEVER flag, i.e. it
