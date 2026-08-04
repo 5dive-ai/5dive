@@ -61,7 +61,7 @@ _task_usage() {
                                                      # -> done; --result captures the agent's response. --result-file reads it
                                                      # VERBATIM from a file (DIVE-2627) — the close record is permanent and the
                                                      # creator/dashboard read it, so a shell-eaten word is a wrong record forever.
-                                                     # VERIFIERS: put `graded-sha: <sha>` in the result. On a delivery-bound row the
+                                                     # VERIFIERS: put \`graded-sha: <sha>\` in the result. On a delivery-bound row the
                                                      # gate compares it to what actually merged (PR head OR merge commit) and REFUSES
                                                      # a mismatch — the sha that was graded is not always the sha that landed
                                                      # (DIVE-2656). Say nothing and you get a nudge, not a block.
