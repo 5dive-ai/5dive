@@ -104,15 +104,34 @@ _marketplace_fetch_pack() {
 # came out of an export unresolvable and the importer could only skip it. Measured on
 # two fresh seats from one exported AGENTS.md: 4 of 22 installed, and all 18 skipped
 # were third-party (none published in 5dive-ai/skills — verified by fetching each).
-# The provenance was never missing, only unread: `.skills-manifest.json`, written by
-# cmd_skill_add next to the skills themselves, records the source each was installed
-# from. Emit the qualified `<owner/repo>:<id>` form when the source is known and is not
-# the default repo; keep the bare form otherwise, so the common case and the
+# Provenance comes from `.skills-manifest.json`, written beside the skills by
+# cmd_skill_add. Emit the qualified `<owner/repo>:<id>` form when the source is known
+# and is not the default repo; keep the bare form otherwise, so the common case and the
 # human-readable AGENTS.md rendering are unchanged.
 #
-# A skill with no manifest entry (hand-seeded, or bundled by an earlier import) still
-# comes out bare — there is no fact to carry. That is the case the import-side warning
-# now names out loud instead of folding into a count.
+# ITERATION 3 CORRECTS THE CLAIM ABOVE THIS LINE. The first cut said "the provenance was
+# never missing, only unread". On this fleet it IS missing: MEASURED 2026-08-04,
+# `find /home -name .skills-manifest.json` returns ZERO — not one seat has one, including
+# agent-creative, the very seat whose export produced "added 4, skipped 18". The writer
+# has been live since DIVE-2282/PR #291, so the reason is not that it is new: it lives
+# only in `agent skill add`, and that is not how skills reach a seat. The create path
+# (install_default_skill_for_agent) installed and recorded NOTHING. Reading a manifest
+# therefore reached zero seats and could not have fixed the case it was filed against.
+#
+# So provenance is recovered in two tiers, and the fleet runs on the second:
+#   1. the manifest, when there is one (authoritative — it carries third-party sources
+#      this table cannot know). The create path now writes it, so new seats have one.
+#   2. skill_default_source, for the 5dive defaults. No network, no manifest. This is
+#      what recovers find-skills — installed on EVERY seat from vercel-labs/skills, and
+#      one of the 18 skipped names on the measured export.
+#
+# HONEST SCOPE, because the fix is partial and the shape of the remainder matters:
+# re-probed 2026-08-04, of those 18 exactly ONE (find-skills) is published anywhere
+# reachable — `vercel-labs/skills` serves it under `skills/find-skills`. The other 17
+# (animejs, gsap, the hyperframes family, lodar-voice, ...) 404 in both candidate repos
+# under both layouts, so they are genuinely local-only and skipping them stays correct;
+# no table or probe can reinstall a skill that is not published. Those keep exporting
+# bare, and the import warning names each one with the command to seed it by hand.
 _pack_skill_refs() {
   local sdir="$1"
   [[ -d "$sdir" ]] || { echo '[]'; return 0; }
@@ -123,11 +142,19 @@ _pack_skill_refs() {
   fi
   # Skills install as real dirs OR symlinks (per-agent skill layout), so match
   # both — -type d alone misses the symlinked majority.
-  find "$sdir" -maxdepth 1 -mindepth 1 \( -type d -o -type l \) -printf '%f\n' 2>/dev/null \
-    | sort | jq -R . \
-    | jq -cs --argjson m "$mf" --arg def "$(gh_org)/skills" '
+  local ids
+  ids=$(find "$sdir" -maxdepth 1 -mindepth 1 \( -type d -o -type l \) -printf '%f\n' 2>/dev/null | sort)
+  # Tier 2, built only for the ids actually present: {"find-skills":"vercel-labs/skills"}.
+  local defs='{}' id src
+  while IFS= read -r id; do
+    [[ -n "$id" ]] || continue
+    src=$(skill_default_source "$id") || continue
+    defs=$(jq -c --arg k "$id" --arg v "$src" '.[$k] = $v' <<<"$defs" 2>/dev/null) || defs='{}'
+  done <<<"$ids"
+  printf '%s\n' "$ids" | sed '/^$/d' | jq -R . \
+    | jq -cs --argjson m "$mf" --argjson d "$defs" --arg def "$(gh_org)/skills" '
         map(. as $id
-            | (($m[$id].source // "") | tostring) as $s
+            | (($m[$id].source // $d[$id] // "") | tostring) as $s
             | if ($s == "" or $s == $def) then $id else ($s + ":" + $id) end)' 2>/dev/null \
     || echo '[]'
 }
