@@ -10,6 +10,14 @@
 # and nothing to retire, so nightly is the honest third door rather than adding 17.2s to
 # a tier that is already 97s past its ratchet. Coverage on THIS PR is unaffected: the
 # changed-harnesses job runs every harness the diff touches whatever its tier.
+#
+# THE BILL FOR THAT, stated so the next reader does not have to rediscover it
+# (main, reviewing #449): nightly is what let DIVE-2588 red main invisibly. A
+# src/ change that breaks this file reds it AFTER the PR responsible has merged,
+# so its author never sees the red. changed-harnesses covers the PR that touches
+# THIS file; it does not cover a future PR that breaks it from somewhere else.
+# That cost is knowingly paid here, not overlooked — and it is the argument for
+# promoting this back to core the moment the tier has room.
 # DIVE-2627 unit harness for the *-file prose flags.
 #
 # WHAT IT GRADES. Every prose flag in this CLI used to be argv-only, so the
