@@ -507,6 +507,22 @@ CREATE TABLE IF NOT EXISTS tasks (
   -- which is what the ladder means and is immune to the band moving underneath it.
   nudge_escalated_n INTEGER,
   nudge_parked_at TEXT,
+  -- DIVE-2207: gate_answered_nudged_at throttles the POST-GATE-ANSWER nudge
+  -- (gap#2's second predicate) to once per row. It is a SEPARATE column from
+  -- handoff_stale_pinged_at on purpose, and reusing that one would have shipped
+  -- this fix dead: 30 rows fleet-wide had already burned handoff_stale_pinged_at
+  -- when this was written, INCLUDING DIVE-2146 (burned 2026-07-27 21:40), which is
+  -- the specimen the rail was written for. A throttle already spent by a different
+  -- rail is not a throttle, it is an exclusion.
+  -- WHY THE RAIL EXISTS: a delivered row blocked on a human gate is excluded from
+  -- the gap#2 sweep (DIVE-2196 — nagging there prescribes resolving the human's
+  -- gate by side effect). The instant that gate is ANSWERED the wait is back on the
+  -- verifier, but nothing re-arms: handoff_ack_at may already be stamped (any
+  -- verifier who ran `task start` before getting blocked stamped it), so the
+  -- original predicate can never fire again. Measured on the live board 2026-07-28:
+  -- 20 rows have entered that blind window, 17 graded within the hour, 1 took over
+  -- 24h. Low frequency, silent failure — which is the case for a rail, not against.
+  gate_answered_nudged_at TEXT,
   -- DIVE-891: risk-tiered gates (adopted design DIVE-861). tier is set when the
   -- gate is filed: 0 = auto-clear (rec applies immediately, digest line only),
   -- 1 = agent-clearable + 48h TTL auto-applies the recommendation, 2 = hard
@@ -1341,6 +1357,7 @@ _TASKS_ADDITIVE_COLUMNS=(
   'iteration INTEGER' 'maker_agent TEXT' 'handoff_ack_at TEXT' 'task_budget TEXT'
   'handoff_delivered_at TEXT' 'handoff_stale_pinged_at TEXT' 'handoff_rejected_at TEXT'
   'recurring_stall_pinged_at TEXT' 'recurring_stall_escalated_at TEXT'
+  'gate_answered_nudged_at TEXT'
   'nudge_escalated_at TEXT' 'nudge_escalated_n INTEGER' 'nudge_parked_at TEXT'
   'tier INTEGER' 'need_asked_at TEXT' 'gate_pinged_at TEXT' 'wake_at TEXT'
   'gate_filed_by TEXT'
