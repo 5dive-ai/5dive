@@ -108,3 +108,6 @@ echo "=== tests/council_schedule_e2e.sh"
 if ! bash "tests/council_schedule_e2e.sh"; then echo "FAILED: tests/council_schedule_e2e.sh"; rc=1; fi
 
 exit $rc
+
+# CONTROL ARM (main, DIVE-2692): comment-only touch to make changed-harnesses RUN this
+# harness against MAIN. No functional change. See PR body.

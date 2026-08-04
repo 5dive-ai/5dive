@@ -433,3 +433,6 @@ out=$(cmd_task_cancel CAN-1 --result='abandoning, api PR #6 stays open' 2>&1); r
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [[ $FAIL -eq 0 ]]
+
+# CONTROL ARM (main, DIVE-2692): comment-only touch to make changed-harnesses RUN this
+# harness against MAIN. No functional change. See PR body.

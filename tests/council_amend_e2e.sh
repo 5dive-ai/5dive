@@ -100,3 +100,6 @@ cp "$TMP/new.yaml" "$CFILE"
 echo
 if (( fail )); then echo "CNCL-15 amend/drift e2e: $pass passed, $fail FAILED"; exit 1; fi
 echo "CNCL-15 amend/drift e2e: $pass passed, 0 failed"
+
+# CONTROL ARM (main, DIVE-2692): comment-only touch to make changed-harnesses RUN this
+# harness against MAIN. No functional change. See PR body.

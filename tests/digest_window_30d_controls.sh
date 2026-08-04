@@ -230,3 +230,6 @@ fi
 printf '\n%s assertions passed, %s failed  (+%s precondition, which grades the INSTRUMENT, not the code)\n' \
   "$PASS" "$FAIL" "$PRECOND"
 [[ "$FAIL" -eq 0 ]]
+
+# CONTROL ARM (main, DIVE-2692): comment-only touch to make changed-harnesses RUN this
+# harness against MAIN. No functional change. See PR body.
