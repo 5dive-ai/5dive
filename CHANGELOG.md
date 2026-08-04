@@ -1,44 +1,5 @@
 # Changelog
 
-## Unreleased — feat(gate): the merge gate compares the merged sha against the sha the verifier says it graded (DIVE-2656)
-
-`task done` on a delivery-bound row already asks *did the PR merge*, *did it merge
-green*, *did the branch land*. Every one of those is a question about the **PR**.
-None of them is a question about the **verdict**.
-
-PR #425 (DIVE-2654) carried the commit its verifier had **REJECTED** while GitHub
-read CLEAN / MERGEABLE / 14 checks green — the graded fix existed only on a local
-branch and was never pushed. A merge was one command from landing rejected code,
-and it was caught by hand.
-
-Two halves, and the second is inert without the first:
-
-- **A verifier states the sha it graded.** Any `graded-sha: <7-40 hex>` line in the
-  `--result` text (also `graded sha`, `graded_sha`, `=` for `:`, any case; the last
-  one wins so `--append-result` behaves). A **labelled** declaration only — a bare
-  hex blob in prose is a different claim and never drives a refusal. A loop close
-  that states nothing gets a **nudge**, never a block: the enabling half costs
-  nothing, so it must not be able to stop a close.
-- **The gate compares it to what actually merged** — the PR's `headRefOid` **or**
-  its `mergeCommit.oid`, and refuses on mismatch (`--force-merge-gate` overrides,
-  audited). Both operands accepted on purpose: a verifier who graded the branch
-  names its head, one who graded the landed result names the merge commit.
-
-It is an **equality** test, deliberately not ancestry. We squash-merge, so a branch
-head is never an ancestor of `main` afterwards and an ancestry version would false-RED
-every squash-merged PR — worse than the false green it fixes
-(`community/wiki/a-stored-graded-sha-cannot-survive-a-squash-merge.md`). Equality is
-untouched by squash. A probe that cannot be reached prints **NOT CHECKED** and closes;
-a query that never ran is not a mismatch.
-
-The reason this is worth more than the rows it catches is that **a check that FORCES a
-path to run finds more than one that INSPECTS it**. On the night this was filed two
-fail-opens sat on one path and suppressed each other — a verifier whose gate proofs
-stored an empty signature and never failed, and a graded fix that was never pushed.
-Each defect's symptom was the other's absence. Comparing the stated sha to the merged
-one exercises the delivery step on **every** close, which is what makes a pair like
-that observable at all.
-
 ## v0.19.0 — fix(heartbeat): surface a recurring instance that was never started (DIVE-2693)
 
 The stall sweep keys on `handoff_delivered_at`. A materialized recurring instance
