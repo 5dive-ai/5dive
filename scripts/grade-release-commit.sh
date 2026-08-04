@@ -108,11 +108,24 @@ TESTS_GLOB="${GRC_TESTS_GLOB:-tests/*.sh}"
 GRC_TAIL="${GRC_TAIL:-25}"
 
 # Paths a release commit is ALLOWED to differ from its parent by. Derived from the
-# DIVE-2091 release-commit block in release-cut.yml, which is the only writer:
-# src/header.sh (the DIVE-2247 version assignment), the built bundle and its
-# checksum, and the DIVE-2452 CHANGELOG stamp. Anything else and the parent's CI no
+# writers in release-cut.yml's release-commit block: src/header.sh (the DIVE-2247
+# version assignment), the built bundle and its checksum, the DIVE-2452 CHANGELOG
+# stamp, and the DIVE-2582 changelog.d fold. Anything else and the parent's CI no
 # longer describes this tree.
-GRC_DELTA_PATHS="${GRC_DELTA_PATHS:-src/header.sh 5dive 5dive.sha256 CHANGELOG.md}"
+#
+# DIVE-2700: this comment said "which is the only writer" and named only the first
+# four for as long as that was true. DIVE-2582 then added a SECOND writer — the fold
+# at release-cut.yml:450 runs fold-changelog-fragments.sh, which DELETES every
+# changelog.d/*.md it folds into CHANGELOG.md, staged at :493 — and nobody extended
+# this list. The first cut attempted afterwards (v0.19.0, run 30885717462) refused
+# with 7 fragment deletions "OUTSIDE the release-commit set", and every cut, patch or
+# minor, would have refused identically for as long as any fragment existed. The guard
+# was right; its premise had gone stale underneath it.
+#
+# ENTRIES ARE GLOB PATTERNS — see the matcher below. Keep this list and the workflow's
+# writers in sync; tests/grade_release_commit_unit.sh section 11 derives the truth from
+# the workflow and reds here at PR time, which is the only reason a human need not.
+GRC_DELTA_PATHS="${GRC_DELTA_PATHS:-src/header.sh 5dive 5dive.sha256 CHANGELOG.md changelog.d/*}"
 # The path whose presence in the delta proves the cut actually did something. Without
 # it the subset assertion above is vacuous.
 GRC_DELTA_REQUIRED="${GRC_DELTA_REQUIRED:-src/header.sh}"
@@ -182,10 +195,28 @@ if [[ -n "$PARENT_SHA" && -z "${GRC_FULL_CORPUS:-}" ]]; then
     exit 2
   fi
   _unexpected=()
+  # Split the pattern list ONCE, with `read -ra` rather than unquoted word splitting.
+  # read does IFS splitting and NO pathname expansion, which is the whole point: a bare
+  # `for _allowed in $GRC_DELTA_PATHS` expands globs against the working directory, and
+  # `changelog.d/*` would resolve to the files that SURVIVE the fold instead of staying
+  # a pattern (DIVE-2700).
+  read -ra _allowed_pats <<< "$GRC_DELTA_PATHS"
   while IFS= read -r _p; do
     [[ -n "$_p" ]] || continue
     _ok=0
-    for _allowed in $GRC_DELTA_PATHS; do [[ "$_p" == "$_allowed" ]] && { _ok=1; break; }; done
+    # RHS deliberately UNQUOTED so entries act as GLOB PATTERNS (DIVE-2700): the fold
+    # removes a whole directory of fragments whose names cannot be enumerated ahead of
+    # time. The four literal entries carry no glob metacharacters, so this is inert for
+    # them and changes only what a pattern entry can express.
+    #
+    # The patterns come from _allowed_pats, split ONCE by `read -ra` above, and are
+    # expanded QUOTED here. Both halves are load-bearing: an unquoted
+    # `for _allowed in $GRC_DELTA_PATHS` would PATHNAME-EXPAND the list against the
+    # working directory, so `changelog.d/*` would silently become whatever files
+    # survive the fold (changelog.d/README.md does) and the pattern would never reach
+    # this comparison at all.
+    # shellcheck disable=SC2053  # glob matching is the point here, not an oversight
+    for _allowed in "${_allowed_pats[@]}"; do [[ "$_p" == $_allowed ]] && { _ok=1; break; }; done
     (( _ok )) || _unexpected+=("$_p")
   done <<< "$_delta"
   if (( ${#_unexpected[@]} > 0 )); then
