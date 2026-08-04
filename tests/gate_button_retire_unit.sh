@@ -411,12 +411,25 @@ fi
 # than at file scope so the arms above keep the real predicate.
 require_root() { :; }
 SENDS="$TMP/sends.log"; : >"$SENDS"
-_mirror_send() {
-  printf 'send silent=%s markup=%s\n' \
-    "$([[ -n "${FIVEDIVE_NOTIFY_SILENT:-}" && "${FIVEDIVE_NOTIFY_SILENT}" != "0" ]] && echo yes || echo no)" \
-    "$([[ -n "${5:-}" ]] && echo yes || echo no)" >>"$SENDS"
-  printf '%s' '{"ok":true,"result":{"message_id":15491}}'
-}
+# olivia's DIVE-2712 iteration-2 defect, and the fix is WHERE we cut, not what we assert.
+# The previous stub REPLACED _mirror_send and re-implemented the silent predicate in its
+# own printf — so the arms graded "did cmd_task_inbox export the env var", not "does the
+# wire carry disable_notification". Deleting the real line at cmd_agent_runtime.sh:394
+# left the suite at 42/0. The dry-run line at :376 cannot catch it either: it is a
+# PARALLEL EVALUATION of the same condition inside the same function, a mirror rather
+# than a measurement.
+# So restore the REAL _mirror_send and stub the TRANSPORT instead. Everything above this
+# point keeps the cheap stub; re-sourcing here rebinds the genuine implementation, and
+# curl on PATH captures the argv it actually composes.
+source "$SRC/cmd_agent_runtime.sh"
+mkdir -p "$TMP/bin"
+cat >"$TMP/bin/curl" <<'CURLSTUB'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >>"$SENDS"
+printf '%s' '{"ok":true,"result":{"message_id":15491}}'
+CURLSTUB
+chmod +x "$TMP/bin/curl"
+export PATH="$TMP/bin:$PATH" SENDS
 seed_gate() { # <id> <ident> <type>
   db "INSERT INTO tasks (id,ident,title,status,priority,assignee,need_type,tier,ask,recommend,need_options,created_at)
       VALUES ($1,'$2','t','blocked','high','main','$3',2,'ask?','A','A|B',datetime('now'));" 2>/dev/null
@@ -436,13 +449,18 @@ seed_gate 9003 DIVE-9003 decision
 # and those two need different fixes.
 ( cmd_task_inbox --send ) >/dev/null 2>&1; inbox_rc=$?
 chk "REACHABILITY: cmd_task_inbox --send actually RAN (rc 0, not a root/precondition refusal)" "0" "$inbox_rc"
-sends_n=$(grep -c '^send ' "$SENDS" 2>/dev/null || echo 0)
+sends_n=$(grep -c 'sendMessage' "$SENDS" 2>/dev/null || echo 0)
 chk "REACHABILITY: the send log is NON-EMPTY before anything asserts what is IN it" \
     "yes" "$([[ "$sends_n" -gt 0 ]] && echo yes || echo "no (rc=$inbox_rc)")"
-chk "3 open gates produce 3 SEPARATE messages, not one digest" "3" "$(grep -c '^send ' "$SENDS" 2>/dev/null || echo 0)"
-chk "the FIRST gate message pings the human" "silent=no" "$(head -1 "$SENDS" 2>/dev/null | grep -o 'silent=[a-z]*')"
-chk "every message after the first is SILENT (one buzz, not N)" "2" "$(tail -n +2 "$SENDS" 2>/dev/null | grep -c 'silent=yes')"
-chk "each gate carries its OWN keyboard" "3" "$(grep -c 'markup=yes' "$SENDS" 2>/dev/null || echo 0)"
+sends_n=$(grep -c 'sendMessage' "$SENDS" 2>/dev/null || echo 0)
+chk "3 open gates produce 3 SEPARATE messages, not one digest" "3" "$sends_n"
+# BOTH DIRECTIONS, deliberately. "assert it is present on 2..N" alone degrades into
+# "always pass it" — the absent-on-first arm is what stops that.
+chk "the FIRST gate message PINGS (no disable_notification on the wire)" "absent" \
+    "$(head -1 "$SENDS" | grep -q 'disable_notification=true' && echo present || echo absent)"
+chk "every message after the first carries disable_notification=true ON THE WIRE" "2" \
+    "$(tail -n +2 "$SENDS" | grep -c 'disable_notification=true')"
+chk "each gate carries its OWN keyboard" "3" "$(grep -c 'reply_markup=' "$SENDS" 2>/dev/null || echo 0)"
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" == "0" ]]

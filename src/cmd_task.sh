@@ -9219,6 +9219,9 @@ _task_inbox_send() {
       '{sent:true, gates:($g|tonumber), total:($t|tonumber), failed:($f|tonumber), message_ids:$m}' \
       --arg g "$sent" --arg t "$total" --arg f "$failed" --arg m "${all_mids:-}"
   else
+    # DIVE-2054: DELIBERATELY UNFENCED, same exemption as the "ok" branch above —
+    # chat_proof is the proof a real channel was (or was not) hit for this send, and
+    # a fixture store must not be able to suppress that record.
     audit_log "task inbox send" "error" 1 -- \
       "gates=0/${total}" "delivery=per-gate" "failed=${failed}" "chat_proof=${channel_proof:-none}"
     fail "$E_GENERIC" "inbox delivery unconfirmed — no gate message landed, so nonce hashes are left unrotated and earlier alert buttons remain valid (DIVE-2712: per-gate send)"
