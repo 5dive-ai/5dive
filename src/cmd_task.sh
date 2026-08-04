@@ -1997,6 +1997,43 @@ _gate_slug_from_url() {
     | head -1 | sed -E 's#^(https://github\.com/|git@github\.com:)##; s#\.git$##' || true
 }
 
+# _gate_merged_not_deployed <accepting-repo-slug> — DIVE-2641 (split from DIVE-2621,
+# item b+c). The sentence EVERY accepting arm of the merge gate appends to its own
+# receipt.
+#
+# WHY HERE. Each accepting arm prints `done=merged-to-main satisfied`, which is TRUE,
+# at the exact moment the reader assumes the STRONGER claim nobody checked: that the
+# change is RUNNING. Four agents made that substitution independently on 2026-08-03
+# (olivia DIVE-2587, dev DIVE-2571, dev3 on marketplace clones, main across the
+# v0.18.3-v0.18.6 cuts). They were not careless — the system told them they were done.
+# So the close gate is the cheapest place to interrupt it: same breath as the grade.
+#
+# THIS CHANGES NO ACCEPTANCE. It appends text to warns that already fire on paths that
+# already passed; no arm refuses, no new failure mode exists, and every refusal is
+# untouched. Merged-to-main is necessary and correctly verified — this only stops the
+# SENTENCE AFTER the grade travelling further than the evidence.
+# community/wiki/merged-to-main-is-a-claim-about-the-authors-artifact-not-the-readers.md
+#
+# ONE SHORT SENTENCE, deliberately. A paragraph gets skipped, and the entire value is
+# that it is read at the instant of the inference.
+#
+# The DEPLOYED-ARTIFACT prompt (item c) is keyed off the repo the ACCEPTING EVIDENCE
+# was found in — never off the task text, which is the maker's prose and describes what
+# they meant rather than where it landed. Only repos whose artifact a reader EXECUTES
+# get a prompt, and each names the surface that actually measures THAT artifact: the
+# host CLI check cannot see a marketplace clone and vice versa, so naming one for the
+# other would be a check that cannot answer the question it was cited for.
+_gate_merged_not_deployed() {
+  local _slug="${1:-}"
+  printf '%s' ' NOT ESTABLISHED by this: that the change is DEPLOYED — merged is a property of the repo, not of the artifact anyone is RUNNING, so check the installed side (`5dive doctor --category=host`) before you report this live (DIVE-2621/2641).'
+  case "${_slug##*/}" in
+    5dive|5dive-cli)
+      printf ' DEPLOYED-ARTIFACT ROW: %s ships /usr/local/bin/5dive, which cron and every agent execute — a host still on the previous release runs the OLD code whatever main says; `5dive doctor --category=host` reports installed vs published (DIVE-2640).' "$_slug" ;;
+    5dive-plugins)
+      printf ' DEPLOYED-ARTIFACT ROW: %s ships the marketplace clone each agent runs out of its OWN $HOME, so freshness is per-agent and one refresh does not fix the fleet — `5dive doctor --category=plugins` reports it per clone (DIVE-2642).' "$_slug" ;;
+  esac
+}
+
 # _gate_task_repo_slug <delivery_ref> <body> — the repo THIS TASK DECLARED, or empty.
 # Precedence: the delivery_ref URL (a delivered PR carries its own repo, which is why
 # ask 1 says prefer it) > an explicit `Repo: owner/repo` body line, the sibling of the
@@ -2908,6 +2945,15 @@ _task_status_cmd() {
           '') warn "$ident: could not verify the check status of $_dref (no gh token / network / gh) — merged-state confirmed, checks UNVERIFIED."
               _mg_unverified="${_mg_unverified:+$_mg_unverified; }checks of $_dref unresolved (merged-state confirmed)" ;;
         esac
+        # DIVE-2641: THE FOURTH ACCEPTING PATH, and until now the SILENT one. The row
+        # bound a delivery_ref, the PR is MERGED (every refusal above returned), and
+        # this path printed nothing at all — so the most common close route in the
+        # product was the one arm that could not carry the deployed-vs-merged note, and
+        # patching only the three arms that already spoke would have re-created the
+        # defect for exactly the rows that bind a PR. Same reasoning DIVE-2217 applied
+        # to the merged-PR arm below: an accept that says nothing is indistinguishable
+        # from every other accept in the durable operator record.
+        warn "$ident: delivery PR $_dref is MERGED (at $_merged) — GitHub's merged-PR record on the DECLARED delivery is the accepting evidence. done=merged-to-main satisfied.$(_gate_merged_not_deployed "$(_gate_slug_from_url "$_dref")")"
       else
         # DIVE-1955: a `Branch:` line names no repo, so this used to look for the
         # merged PR in the CLI repo ONLY — an api/frontend branch could never satisfy
@@ -3013,7 +3059,7 @@ _task_status_cmd() {
           if [[ -z "$_task_slug" ]]; then
             _attr_scope=" SCOPE: this task declares no repo, so the gate searched $_searched and stopped at the first hit — repos outside that set were NOT looked at. If the delivery landed somewhere else, this accept is about a DIFFERENT repo's commit; declare it with a \`Repo: <owner>/<repo>\` line or bind the delivery_ref, and re-check."
           fi
-          warn "$ident: a commit on ${FIVE_GATE_MAIN_BRANCH:-main} in $_attr_slug names $ident in its SUBJECT — the work is on main (attribution, DIVE-2120). This does NOT establish HOW it landed: a delegated push and a squash-merged PR are indistinguishable to a subject scan, because a squash rewrites the sha. done=merged-to-main satisfied.$_attr_scope"
+          warn "$ident: a commit on ${FIVE_GATE_MAIN_BRANCH:-main} in $_attr_slug names $ident in its SUBJECT — the work is on main (attribution, DIVE-2120). This does NOT establish HOW it landed: a delegated push and a squash-merged PR are indistinguishable to a subject scan, because a squash rewrites the sha. done=merged-to-main satisfied.$_attr_scope$(_gate_merged_not_deployed "$_attr_slug")"
         elif [[ -n "$_attr_bound" && -z "$_bmerged" ]]; then
           # DIVE-2120: the scan stopped AT THE BOUND without finding the ident. That is NOT
           # a miss and must not read as one — a bounded search whose negative looks like an
@@ -3068,7 +3114,7 @@ _task_status_cmd() {
           # named for the evidence that assigned it, just as _attr_slug is owned by
           # _gate_branch_ident_on_main above. A silent success here made a merged-PR
           # close indistinguishable from attribution in the durable operator record.
-          warn "$ident: branch '$_branch' is the head of a MERGED PR in $_merged_slug (merged at $_bmerged) — GitHub's merged-PR record is the accepting evidence. done=merged-to-main satisfied."
+          warn "$ident: branch '$_branch' is the head of a MERGED PR in $_merged_slug (merged at $_bmerged) — GitHub's merged-PR record is the accepting evidence. done=merged-to-main satisfied.$(_gate_merged_not_deployed "$_merged_slug")"
         fi
       fi
     fi
@@ -3292,7 +3338,7 @@ $_body"
           done < <(if [[ -n "$_task_slug" ]]; then printf '%s\n' "$_task_slug"; else _gate_repo_slugs; fi)
         done < <(printf '%s\n' "$_br_cands")
         if [[ -n "$_bl_hit" ]]; then
-          warn "$ident: branch '$_bl_hit', named in the result/body, is on ${FIVE_GATE_MAIN_BRANCH:-main} in $_bl_hit_slug via $_bl_hit_how. done=merged-to-main satisfied (DIVE-2577)."
+          warn "$ident: branch '$_bl_hit', named in the result/body, is on ${FIVE_GATE_MAIN_BRANCH:-main} in $_bl_hit_slug via $_bl_hit_how. done=merged-to-main satisfied (DIVE-2577).$(_gate_merged_not_deployed "$_bl_hit_slug")"
         elif [[ $_bl_any_unreach -eq 1 ]]; then
           warn "$ident: result/body names branch(es) ${_br_cands//$'\n'/, } but the merge-gate could not fully scan ${_bl_searched2//,/, } for them (API/timeout on at least one repo) — this close is UNVERIFIED for the branch, not verified-clean (DIVE-2318 pattern)."
           _mg_unverified="${_mg_unverified:+$_mg_unverified; }branch named in result/body (${_br_cands//$'\n'/, }) could not be fully scanned"
