@@ -2373,8 +2373,18 @@ cmd_import() {
   # the repo that was tried. So say which repo was tried, why that one, and the exact
   # command that fixes it. A bare ref and a qualified ref fail for different reasons
   # and get different sentences.
+  #
+  # DIVE-2677: "the agent's instructions still assume them" used to close this line,
+  # and it is false on EVERY type, not just opencode — _agents_md_explode truncates
+  # stage/CLAUDE.md at the `<!-- 5dive:skills -->` sentinel before persona_install_doc
+  # ever runs (this file, above), so the installed doc never carries that paragraph
+  # for any seat. A claude seat only LOOKS unaffected because cmd_create seeds a
+  # default CLAUDE.md whose own boilerplate happens to occupy the same line range
+  # afterward — an artifact of persona_install_doc's prepend, not a surviving
+  # reference to the skipped skill. Say what's actually true instead: the pack
+  # recorded these as expected, and nothing installed now provides or mentions them.
   if (( ${#skipped[@]} > 0 )); then
-    warn "skills NOT installed on this '$type' agent: ${skipped[*]} — the agent's instructions still assume them"
+    warn "skills NOT installed on this '$type' agent: ${skipped[*]} — the pack recorded these as expected skills, but nothing installed on this agent provides or references them now"
     local sk_
     for sk_ in "${skipped[@]}"; do
       if [[ "$sk_" == *:* ]]; then
