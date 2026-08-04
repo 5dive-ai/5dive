@@ -121,6 +121,13 @@ db() {
 }
 _gate_closure_verify() { return "${CLOSURE_RC:-0}"; }
 _gate_agent_for_uid()  { printf '%s' "${UID_AGENT:-}"; }
+# DIVE-2614: broker_gate_check now audit_logs the rejected-gate refusal before
+# fail()ing. This harness doesn't source lib/audit.sh, so stub it. `run()`
+# below exercises broker_gate_check in a subshell (to contain fail()'s exit),
+# so a plain array wouldn't survive back to the parent shell — a file does.
+AUDIT_LOG_CALLS="$TMP/audit_log_calls"
+: > "$AUDIT_LOG_CALLS"
+audit_log() { printf '%s\n' "$*" >> "$AUDIT_LOG_CALLS"; }
 
 # shellcheck source=../src/lib/broker.sh
 . "$ROOT/src/lib/broker.sh"
@@ -273,6 +280,68 @@ _seen=$(for _t in "$ROOT"/tests/*.sh; do
         done | grep -c x)
 want "non-vacuity: the harness sweep inspected at least 15 harnesses (saw $_seen)" \
      '[[ "$_seen" -ge 15 ]]'
+
+echo
+echo "== 8. DIVE-2614: verdict is read off the FIRST LINE ONLY, as a WHOLE WORD"
+# Each case is authorized (human:lodar) so a rc=0 unambiguously means the
+# reject-check let it through; these are direct broker_gate_check calls, not
+# the old/new differential above — the pinned baseline still carries the bug,
+# so diffing against it here would assert the fix never happened.
+reset_row; ROW[need_type]=approval; ROW[need_answered_at]=t
+ROW[need_answer]=$'approve — ship it.\nNote: this line used to trip the prefix list.'
+ROW[need_answered_by]="human:lodar"
+out=$(run broker_gate_check push 7 DIVE-7)
+want "a later line beginning 'Note:' no longer inverts a first-line approval" '[[ "$out" == "rc=0" ]]'
+
+reset_row; ROW[need_type]=approval; ROW[need_answered_at]=t
+ROW[need_answer]="Nothing blocks this"; ROW[need_answered_by]="human:lodar"
+out=$(run broker_gate_check push 7 DIVE-7)
+want "'Nothing' no longer prefix-matches 'no'" '[[ "$out" == "rc=0" ]]'
+
+reset_row; ROW[need_type]=approval; ROW[need_answered_at]=t
+ROW[need_answer]="Blocking issues: none"; ROW[need_answered_by]="human:lodar"
+out=$(run broker_gate_check push 7 DIVE-7)
+want "'Blocking' no longer prefix-matches 'block'" '[[ "$out" == "rc=0" ]]'
+
+reset_row; ROW[need_type]=approval; ROW[need_answered_at]=t
+ROW[need_answer]="non-agent, same sha: exit 0, 12 arms"; ROW[need_answered_by]="human:lodar"
+out=$(run broker_gate_check push 7 DIVE-7)
+want "'non-agent' no longer prefix-matches 'no'" '[[ "$out" == "rc=0" ]]'
+
+reset_row; ROW[need_type]=approval; ROW[need_answered_at]=t
+ROW[need_answer]="Reject as-is — rebase first"; ROW[need_answered_by]="human:lodar"
+out=$(run broker_gate_check push 7 DIVE-7)
+want "a genuine first-line reject ('Reject as-is') still refuses" \
+     '[[ "$out" == *"REJECTED"* && "$out" == *"rc=9" ]]'
+
+# "not" was never one of the five stems (no|reject|deny|denied|block) — it only
+# ever tripped via the OLD "no" prefix bug, the same bug that caught "Note"/
+# "Nothing"/"None". Required property #2 in DIVE-2614 names "Not" explicitly
+# among the words that must stop reading as a veto, so this is the intended
+# behavior change, not a miss — though it means a real reject that opens with
+# a bare "Not ..." (DIVE-2577's "NOT AS-IS — rebase first" is exactly this
+# shape) now needs "no"/"reject"/"deny"/"denied"/"block" as its actual first
+# word to be caught. Flagged, not silently resolved: see the DIVE-2614 result.
+reset_row; ROW[need_type]=approval; ROW[need_answered_at]=t
+ROW[need_answer]="Not a blocker"; ROW[need_answered_by]="human:lodar"
+out=$(run broker_gate_check push 7 DIVE-7)
+want "'Not' alone no longer prefix-matches 'no' (required property #2)" '[[ "$out" == "rc=0" ]]'
+
+echo
+echo "== 9. DIVE-2614: the rejected-gate refusal is audit-logged"
+: > "$AUDIT_LOG_CALLS"
+reset_row; ROW[need_type]=approval; ROW[need_answered_at]=t; ROW[need_answer]="no, not yet"
+run broker_gate_check push 7 DIVE-7 >/dev/null
+want "exactly one audit_log call fired on the reject path" \
+     '[[ "$(wc -l < "$AUDIT_LOG_CALLS")" -eq 1 ]]'
+want "the audit call names the surface and ident" \
+     '[[ "$(cat "$AUDIT_LOG_CALLS")" == *"push gate"* && "$(cat "$AUDIT_LOG_CALLS")" == *"ident=DIVE-7"* ]]'
+
+: > "$AUDIT_LOG_CALLS"
+reset_row; ROW[need_type]=approval; ROW[need_answered_at]=t
+ROW[need_answer]="Nothing blocks this"; ROW[need_answered_by]="human:lodar"
+run broker_gate_check push 7 DIVE-7 >/dev/null
+want "no audit_log call on a clean approval" '[[ "$(wc -l < "$AUDIT_LOG_CALLS")" -eq 0 ]]'
 
 echo
 echo "broker surface unit: ${PASS} passed, ${FAIL} failed"
