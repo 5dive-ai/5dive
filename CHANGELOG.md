@@ -1,5 +1,66 @@
 # Changelog
 
+## Unreleased — feat(push,task): a builder opens its own PR and satisfies its own merge gate (DIVE-2605)
+
+Every builder's work funnelled through one agent for two steps that carry no judgement:
+opening the pull request, and running `task done` on a merge-gated row. Five proxied
+closes landed on 2026-08-03 (DIVE-2068, 1953, 2179, 1986, 2165), all of them work that
+was already finished and already verified, waiting on a credential.
+
+**The rail was already built.** DIVE-2448 shipped `_gh_do`, a root-only helper that reads
+the machine account's PAT root-side and execs `gh` with it. Nothing routed either step
+onto it. Measured 2026-08-04 **from agent-dev2's own uid**, which is the only uid the
+answer is true of — agent-dev is `NOPASSWD: ALL` and resolves a token, so probing from
+there answers a different question:
+
+| probe, as agent-dev2 | result |
+|---|---|
+| `gh auth token` | empty |
+| `sudo -n -u claude gh auth token` (the gate's last resort) | `sudo: a password is required` |
+| `sudo -n -l /usr/local/bin/5dive _gh_do` | permitted |
+| that rail, `api user` | `5dive-bot` |
+| that rail, `pr view 430 --json state,mergedAt` | real state |
+
+A standard-isolation builder's sudoers is `ALL=(root) NOPASSWD: /usr/local/bin/5dive *`
+— one binary as root and **nothing** as `claude`. DIVE-2318 already named that cause and
+made the refusal honest; this makes it rare.
+
+- **`5dive push --open-pr[=<base>]`** (plus `--pr-title=`, `--pr-body-file=`, `--pr-draft`)
+  opens the PR through the same root-side executor that just pushed the branch. The body
+  travels NUL-separated **over stdin**, so a multi-paragraph PR body never lands in the
+  process table — strictly better than the `gh pr create --body "$(cat f)"` a human types.
+  It runs **after** the push and is never fatal to it: the push is the irreversible half,
+  and a red exit there invites a re-push for a step anyone can redo by hand.
+- **The merge gate asks whether GitHub is REACHABLE, not whether a token resolved.** Those
+  were the same question until a second rail existed. All nine `gh` call sites go through
+  one `_gate_gh` helper that takes the token rail when a token resolves and the bot rail
+  when it does not. Each site's **own** wall-clock bound is carried rather than flattened
+  to one number — the autodetect scan's 5s is load-bearing because that path is fail-open.
+
+**The remainder, measured rather than left to be discovered.** The bot rail closes this for
+**9 of the 11 repos the merge gate knows about**; `lodar/5dive-blog` and `lodar/5dive-mobile`
+return 404 to the machine account, so a token-less maker still cannot verify a merge there
+and the gate still refuses. That is unchanged behaviour for those two, not a new hole —
+but it is the reason this is "rare", not "gone", and it is the same App-installation gap
+DIVE-2033 tracks on lodar's personal account.
+
+**No credential moves and no agent gains one.** The rail is read-only for the gate,
+`_gh_do` re-derives its own routing class as root and refuses admin, and the bot arm is
+tried only after every caller-credential arm comes back empty — so no close that resolves
+a token today changes path at all. Where the bot cannot see a repo the query still yields
+empty, which is the same unverified verdict a builder gets now: this can add answers,
+never subtract one.
+
+`--open-pr` also treats **"a pull request already exists" as the desired end state**, not a
+failure: re-running a push after a second commit hits that every time, and the first cut
+reported it as failed and then advised the exact command that had just refused.
+
+`tests/builder_gh_rail_unit.sh` (16 arms, **1.1s measured on the control-plane host**,
+core tier) pins it, including the positive control that no-token-and-no-grant still refuses.
+Mutation-graded: reverting the reachability predicate, forcing the token rail, flattening
+the timeouts, moving the PR body into argv, and widening the already-exists arm into a
+blanket swallow each red exactly the arm that names them.
+
 ## Unreleased — feat(gate): a gate now records WHY it has the tier it has (DIVE-2615)
 
 lodar was interrupted three times in ten minutes on 2026-08-03 by gates that were not
