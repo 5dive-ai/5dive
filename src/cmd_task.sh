@@ -1530,17 +1530,57 @@ _gate_gh_reachable() {
 # Args reach `_gh_do` NUL-separated over STDIN (never argv), the same posture
 # `cmd_gh` uses: the jq filters below carry newlines and quotes, and the NOPASSWD
 # grant stays an exact command path with no argument wildcard.
+# DIVE-2705: the stderr of the most recent _gate_gh call, or empty. Read it to
+# tell a DEAD call apart from a successful empty one — see the contract below.
+_GATE_GH_LAST_ERR=""
+
+# DIVE-2705 — THE CONTRACT, and why it needed both halves.
+#
+# This used to end `|| true; return 0` on BOTH rails, and swallow stderr on both.
+# That left a failed call and a successful-but-empty one indistinguishable on
+# EVERY channel at once: same empty stdout, same empty stderr, same exit 0. Most
+# call sites are output-driven and were unharmed (DIVE-2318 reads `-z "$_state"`
+# / `-z "$_attr"` and refuses as UNRESOLVED, which is why those paths were already
+# honest). But the autodetect scan counts a repo as SCANNED on the exit status:
+#   _hit=$(_gate_gh ...) && _sc_ok=$((_sc_ok+1)) || _hit=""
+# so an unlistable repo incremented _sc_ok, _sc_ok==_sc_total set _scan_ran=1, and
+# the whole DIVE-1935/1955 partial-repo-scan block — warn, audit row, UNVERIFIED
+# stamp — never fired. Partial coverage was announced as a clean scan, which is
+# the exact defect DIVE-1955 exists to delete, surviving one level down inside its
+# own remedy.
+#
+# So: the status is now REAL, and stderr is CAPTURED rather than discarded. Empty
+# stdout keeps its documented meaning (COULD NOT RESOLVE, never "fine"); the
+# status says whether the call itself ran; _GATE_GH_LAST_ERR says why it did not.
+# Stderr is captured rather than passed through on purpose — a repo this token
+# cannot see is an ordinary, expected condition on a multi-repo close, and
+# spraying gh's error text on every gate would be noise that trains readers to
+# ignore it (the alarm-fatigue shape DIVE-2711 names).
 _gate_gh() {
   local tok="${1:-}" secs="${2:-0}"; shift 2
   local -a bound=()
+  local _rc=0 _errf
+  _GATE_GH_LAST_ERR=""
+  _errf="${TMPDIR:-/tmp}/.5dive-gate-gh-err.$$"
   if [[ -n "$tok" ]]; then
     [[ "$secs" != "0" ]] && bound=(timeout "${secs}s")
-    GH_TOKEN="$tok" "${bound[@]}" gh "$@" 2>/dev/null || true
-    return 0
+    GH_TOKEN="$tok" "${bound[@]}" gh "$@" 2>"$_errf" || _rc=$?
+  else
+    # No rail at all is NOT "the query ran and found nothing" — there was nothing
+    # to run it with. Returning 0 here made an unusable bot rail count as a
+    # completed scan, which is the same laundering as a failed listing.
+    if ! _gate_gh_bot_ok; then
+      _GATE_GH_LAST_ERR="no gh rail: no token, and the gate bot is not usable here"
+      rm -f "$_errf" 2>/dev/null || true
+      printf ''
+      return 1
+    fi
+    [[ "$secs" == "0" ]] && secs=10
+    printf '%s\0' "$@" | timeout "${secs}s" sudo -n "$_GATE_GH_DO" _gh_do 2>"$_errf" || _rc=$?
   fi
-  _gate_gh_bot_ok || { printf ''; return 0; }
-  [[ "$secs" == "0" ]] && secs=10
-  printf '%s\0' "$@" | timeout "${secs}s" sudo -n "$_GATE_GH_DO" _gh_do 2>/dev/null || true
+  [[ -s "$_errf" ]] && _GATE_GH_LAST_ERR="$(cat "$_errf" 2>/dev/null || printf '')"
+  rm -f "$_errf" 2>/dev/null || true
+  return "$_rc"
 }
 
 # DIVE-1935: extract every PR REFERENCE a piece of prose names, one number per
@@ -3331,10 +3371,20 @@ _task_status_cmd() {
     if [[ $_scan_ran -eq 0 ]]; then
       local _scan_why="query-failed"
       command -v gh >/dev/null 2>&1 || _scan_why="gh-absent"
-      [[ -n "$_ghtok2" ]] || _scan_why="no-gh-token"
+      # DIVE-2705: "no token" is a statement about ONE rail, and it is only the
+      # right label when NO rail answered — i.e. the loop was never entered, so
+      # _sc_total is still 0. Gating it on the token alone predates the bot rail
+      # and mislabels a bot-rail scan that ran and partly failed.
+      [[ $_sc_total -eq 0 && -z "$_ghtok2" ]] && _scan_why="no-gh-token"
       # DIVE-1955: "3 repos, 2 listed" is partial coverage, and partial coverage
       # announced as a clean scan is the defect this ticket is about, one level up.
-      [[ -n "$_ghtok2" && $_sc_total -gt 0 && $_sc_ok -lt $_sc_total ]] && _scan_why="partial-repo-scan-${_sc_ok}-of-${_sc_total}"
+      # DIVE-2705: partial coverage is a fact about how many repos ANSWERED, never
+      # about WHICH RAIL asked — the `-n "$_ghtok2"` that used to guard this was
+      # the same token-as-proxy-for-reachability that DIVE-2605 replaced with
+      # _gate_gh_reachable one level up, left behind here. With the bot rail now
+      # reporting real failures, that proxy made a partial bot-rail scan announce
+      # itself as "no-gh-token": wrong, and the more reassuring of the two.
+      [[ $_sc_total -gt 0 && $_sc_ok -lt $_sc_total ]] && _scan_why="partial-repo-scan-${_sc_ok}-of-${_sc_total}"
       warn "$ident: merge-gate could not query GitHub ($_scan_why) — this close is UNVERIFIED, not verified-clean (DIVE-1935)."
       _task_store_audit_log "task.merge-gate-unverified" ok 0 -- "$ident" "reason=$_scan_why"
       _mg_unverified="${_mg_unverified:+$_mg_unverified; }repo scan did not complete ($_scan_why)"
