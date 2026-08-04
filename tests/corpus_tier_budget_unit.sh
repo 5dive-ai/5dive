@@ -619,6 +619,66 @@ if grep -rn -- '--confirm-top' .github/workflows/ >/dev/null 2>&1; then
   bad "no CI workflow passes --confirm-top" "$(grep -rn -- '--confirm-top' .github/workflows/)"
 else ok "no CI workflow passes --confirm-top"; fi
 
+# --- DIVE-2667: the tier must run often enough to ATTRIBUTE a break ------------
+# The nightly was red on main for ~17h across ~12 commits because full-sweep ran
+# once a day and is not in the per-PR check set. Two properties are pinned here,
+# and they only mean something together: `push: main` is what makes the sweep
+# frequent enough to name one merge, and `cancel-in-progress` is what makes that
+# frequency affordable. Ship one without the other and the next person deletes it.
+#
+# Graded by PARSING the workflow, not by grepping it. A `grep 'push:'` matches the
+# word inside any of this file's own comments, and would have passed against the
+# unchanged file. Note the YAML 1.1 gotcha the parse has to survive: the `on:` key
+# loads as the BOOLEAN True, not the string 'on'.
+_wf_on() {  # <file> -> the on: keys, one per line
+  python3 - "$1" <<'PY' 2>/dev/null
+import sys, yaml
+d = yaml.safe_load(open(sys.argv[1]))
+on = d.get(True, d.get('on', {})) or {}
+print('\n'.join(sorted(on)) if isinstance(on, dict) else '')
+PY
+}
+_wf_push_branches() {
+  python3 - "$1" <<'PY' 2>/dev/null
+import sys, yaml
+d = yaml.safe_load(open(sys.argv[1]))
+on = d.get(True, d.get('on', {})) or {}
+p = (on.get('push') or {}) if isinstance(on, dict) else {}
+print(' '.join(p.get('branches', []) or []))
+PY
+}
+SWEEP=.github/workflows/full-sweep.yml
+SWEEP_ON="$(_wf_on "$SWEEP")"
+# Liveness first: a parser that returns nothing makes every membership test below
+# vacuously... false, which is the safe direction, but says the wrong thing about WHY.
+if [[ -n "$SWEEP_ON" ]] && grep -qx 'schedule' <<<"$SWEEP_ON"; then
+  ok "full-sweep's on: block PARSES and still carries the nightly schedule"
+else bad "full-sweep's on: block PARSES and still carries the nightly schedule" "on=[$SWEEP_ON]"; fi
+if grep -qx 'push' <<<"$SWEEP_ON" && [[ " $(_wf_push_branches "$SWEEP") " == *" main "* ]]; then
+  ok "full-sweep runs on PUSH TO MAIN: a break is attributable to one merge, not to a day's window (DIVE-2667)"
+else bad "full-sweep runs on PUSH TO MAIN: a break is attributable to one merge, not to a day's window (DIVE-2667)" \
+       "on=[$(tr '\n' ',' <<<"$SWEEP_ON")] branches=[$(_wf_push_branches "$SWEEP")]"; fi
+# The parser is discriminating, not just permissive: a trigger this workflow does
+# NOT declare must come back absent from the same call that reported push present.
+if ! grep -qx 'release' <<<"$SWEEP_ON"; then
+  ok "the same parse reports an ABSENT trigger as absent (the membership test discriminates)"
+else bad "the same parse reports an ABSENT trigger as absent (the membership test discriminates)" "on=[$SWEEP_ON]"; fi
+# Cost bound. Without cancel-in-progress, push-on-main is 6 jobs per merge with no
+# collapse, and the first person to read the bill deletes the trigger this row added.
+if python3 - "$SWEEP" <<'PY' 2>/dev/null
+import sys, yaml
+c = (yaml.safe_load(open(sys.argv[1])) or {}).get('concurrency') or {}
+sys.exit(0 if isinstance(c, dict) and c.get('cancel-in-progress') is True and 'github.ref' in str(c.get('group','')) else 1)
+PY
+then
+  ok "the push trigger is cost-bounded: concurrency cancels in progress, grouped per REF so a PR sweep is not cancelled by a merge"
+else bad "the push trigger is cost-bounded: concurrency cancels in progress, grouped per REF so a PR sweep is not cancelled by a merge" \
+       "$(grep -A3 '^concurrency:' "$SWEEP" 2>&1)"; fi
+# Anchor: the neighbour workflow must NOT satisfy the same assertion, or "full-sweep
+# has push: main" is a claim about every workflow in the directory and grades nothing.
+if ! grep -qx 'schedule' <<<"$(_wf_on .github/workflows/unit-tests.yml)"; then
+  ok "ANCHOR: the neighbour (unit-tests.yml) parses to a DIFFERENT trigger set — the assertions above are about this file"
+else bad "ANCHOR: the neighbour (unit-tests.yml) parses to a DIFFERENT trigger set" "unit-tests on=[$(tr '\n' ',' <<<"$(_wf_on .github/workflows/unit-tests.yml)")]"; fi
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 (( fail == 0 ))
