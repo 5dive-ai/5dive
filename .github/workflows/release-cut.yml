@@ -447,7 +447,17 @@ jobs:
           # so stamp-changelog.sh sees the folded headings same as a manually-typed
           # one. Not fatal for the same reason the stamp isn't: a cut must not die
           # because a fragment drifted from the expected format.
-          if _folded=$(bash scripts/fold-changelog-fragments.sh 2>&1); then
+          #
+          # DIVE-2702: PASS THE ALREADY-CONSUMED BASELINE. The fold deletes fragments
+          # in this detached tree only — main keeps them (DIVE-2247: no push to a
+          # protected branch) — so without this the NEXT cut re-folds every fragment
+          # ever written and each release's notes repeat all previous releases'.
+          # "${incumbent}^" is main's tip as of the last cut, and it is the SAME
+          # incumbent this job already derived and asserted above, so this is not a
+          # third copy of the tag-resolution rule. Empty incumbent (first cut ever) is
+          # passed through as set-but-empty on purpose: it means "nothing has shipped
+          # yet, fold everything", which is different from the unset auto-detect case.
+          if _folded=$(FOLD_RELEASED_BASELINE="${incumbent:+${incumbent}^}" bash scripts/fold-changelog-fragments.sh 2>&1); then
             echo "changelog.d fragments folded for ${tag}: ${_folded} (DIVE-2582)"
           else
             echo "::warning::changelog.d fragments could not be folded for ${tag} (${_folded}) — publishing anyway"
