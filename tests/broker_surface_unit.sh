@@ -327,6 +327,43 @@ ROW[need_answer]="Not a blocker"; ROW[need_answered_by]="human:lodar"
 out=$(run broker_gate_check push 7 DIVE-7)
 want "'Not' alone no longer prefix-matches 'no' (required property #2)" '[[ "$out" == "rc=0" ]]'
 
+# main (2026-08-04, reviewing this same fix): `head -n1` reads "line 1", not
+# "the first line" — the moment line 1 is blank/whitespace, a genuine
+# rejection on a LATER line cleared the gate. A false APPROVE is worse than
+# the false REJECT this row exists to fix, and it lands on cmd_deploy.sh too.
+reset_row; ROW[need_type]=approval; ROW[need_answered_at]=t
+ROW[need_answer]=$'\nNo — rejected'; ROW[need_answered_by]="human:lodar"
+out=$(run broker_gate_check push 7 DIVE-7)
+want "a leading blank line no longer hides a rejection on line 2" \
+     '[[ "$out" == *"REJECTED"* && "$out" == *"rc=9" ]]'
+
+reset_row; ROW[need_type]=approval; ROW[need_answered_at]=t
+ROW[need_answer]=$'  \nrejected, do not push'; ROW[need_answered_by]="human:lodar"
+out=$(run broker_gate_check push 7 DIVE-7)
+want "a whitespace-only line 1 no longer hides 'rejected' on line 2" \
+     '[[ "$out" == *"REJECTED"* && "$out" == *"rc=9" ]]'
+
+# "rejected" needs its own stem, same as deny/denied already had — with a
+# word boundary, "reject" (no trailing \b match into "...ed") no longer
+# prefix-matches "rejected", so the inflected form would silently stop
+# tripping without this entry.
+reset_row; ROW[need_type]=approval; ROW[need_answered_at]=t
+ROW[need_answer]="Rejected — needs another pass"; ROW[need_answered_by]="human:lodar"
+out=$(run broker_gate_check push 7 DIVE-7)
+want "'Rejected' (inflected) still refuses, not just bare 'Reject'" \
+     '[[ "$out" == *"REJECTED"* && "$out" == *"rc=9" ]]'
+
+# An answer that is nothing but blank lines must not crash broker_gate_check
+# under set -euo pipefail (the real caller's mode, per header.sh — `run()`
+# above does not set -e, so this needs its own subshell to actually exercise
+# it): gverdict's `grep -m1 -v` finds no non-blank line and exits 1, and
+# pipefail promotes that to the whole substitution unless it's guarded.
+reset_row; ROW[need_type]=approval; ROW[need_answered_at]=t
+ROW[need_answer]=$'   \n   '; ROW[need_answered_by]="human:lodar"
+out=$(( set -euo pipefail; broker_gate_check push 7 DIVE-7 ) 2>/dev/null; printf 'rc=%s' "$?")
+want "a wholly-blank answer doesn't crash the guarded gverdict assignment under set -e" \
+     '[[ "$out" == "rc=0" ]]'
+
 echo
 echo "== 9. DIVE-2614: the rejected-gate refusal is audit-logged"
 : > "$AUDIT_LOG_CALLS"

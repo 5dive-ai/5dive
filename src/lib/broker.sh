@@ -108,8 +108,8 @@ broker_gate_check() {
   if [[ -z "$gansweredat" ]]; then
     fail "$E_VALIDATION" "gate on ${ident} is OPEN (unanswered ${gtype}) — ${noun} refused until it clears (5dive task answer ${ident} ...)."
   fi
-  # DIVE-2614: the verdict word is read off the FIRST LINE ONLY, as a whole
-  # word (`\b`). Either half of the old check alone still misreads real
+  # DIVE-2614: the verdict word is read off the FIRST NON-BLANK LINE, as a
+  # whole word (`\b`). Either half of the old check alone still misreads real
   # approvals — `grep -qiE` with no `-z`/`^` scope is line-based, so a verdict
   # word on ANY later line of a multi-line answer tripped it (an approval whose
   # line 3 says "BLOCKING NOTHING, BUT FIX BEFORE MERGE" inverted); and with no
@@ -118,8 +118,18 @@ broker_gate_check() {
   # required together: line-scoping alone still prefix-matches a first line
   # that opens with "Nothing to fix.", and a word boundary alone still reads a
   # later "Blocking issues: none" as the verdict.
-  local gverdict; gverdict=$(printf '%s\n' "$ganswer" | head -n1)
-  if printf '%s' "$gverdict" | grep -qiE '^\s*(no|reject|deny|denied|block)\b'; then
+  # NOT `head -n1`: "the first line" and "line 1" diverge the moment line 1 is
+  # blank/whitespace-only (main, 2026-08-04) — `head -n1` on
+  # $'\nNo — rejected' reads as '', which cleared the gate on a genuine
+  # rejection. `grep -m1 -v` skips blank lines to find the first one that
+  # actually has content.
+  # Guarded: under `set -euo pipefail`, an all-blank $ganswer makes grep exit
+  # 1 (no non-blank line found) and pipefail promotes that to the whole
+  # substitution, which would kill this function. An empty gverdict correctly
+  # falls through the reject check below (no verdict word to match).
+  local gverdict
+  gverdict=$(printf '%s\n' "$ganswer" | grep -m1 -v '^[[:space:]]*$') || gverdict=""
+  if printf '%s' "$gverdict" | grep -qiE '^\s*(no|reject|rejected|deny|denied|block)\b'; then
     audit_log "${surface} gate" error "$E_VALIDATION" -- "ident=${ident}" "line=${gverdict}"
     fail "$E_VALIDATION" "gate on ${ident} was REJECTED ('${ganswer}') — ${noun} refused."
   fi
