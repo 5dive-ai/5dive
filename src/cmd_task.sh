@@ -3945,7 +3945,18 @@ _task_route_to_verifier() {
   # re-delivery passes 0 and deliberately leaves the stamp behind at its old
   # iteration — that gap IS the signal the gate reads.
   local set_binding_iter=""
-  (( stamp_binding )) && set_binding_iter=", delivery_ref_iteration=COALESCE(iteration,0)+1"
+  # DIVE-2682 + DIVE-2601 interaction, found by rebasing onto 8051cb1: the counter's
+  # bump became CONDITIONAL ("re-delivery of the same pass, not rework" — it only
+  # increments on a first delivery or after a reject). An unconditional +1 here then
+  # stamped the binding at iteration+1 while `iteration` itself stayed put, leaving
+  # bind > iter on every same-pass re-delivery — a state the guard's own predicate
+  # (bind < iter) can never flag, so it fails SILENTLY rather than loudly. The stamp
+  # must mirror the counter's CASE exactly, or the two answers are read from
+  # different moments again, which is the hazard this row's body opens with.
+  (( stamp_binding )) && set_binding_iter=", delivery_ref_iteration=CASE
+              WHEN handoff_delivered_at IS NULL OR handoff_rejected_at IS NOT NULL
+              THEN COALESCE(iteration,0)+1
+              ELSE COALESCE(iteration,0) END"
   # DIVE-1416 (gap#2): stamp handoff_delivered_at fresh on EVERY delivery (incl.
   # a re-delivery after a reject/bounce-back) — the dedicated clock the stall
   # sweep uses to detect a delivery sitting unacknowledged too long. Clear any
