@@ -429,6 +429,28 @@ out=$( actor_seam_as dev; cmd_task_done DIVE-261 2>&1 ); rc=$?
   && ok_t "Tgb close on a RE-POINTED binding is ACCEPTED and the task closes" \
   || bad_t "Tgb accepted" "rc=$rc status=$(statusof DIVE-261) out=$out"
 
+# ARM (d) — THE REMEDY ARM, and it INHERITS arm (a)'s refused row rather than
+# re-seeding one that resembles it. dev's reject (iteration 1) found that arm (b),
+# though an honest control, re-seeds assignee='main' BEFORE re-pointing, which puts
+# it on the ROUTING deliver arm. A real maker reading the refusal is not there: the
+# gate fires on a VERIFIER's close, so at that instant assignee IS the verifier and
+# `task deliver --pr=<new>` takes the NON-routing arm. That arm stamped nothing, so
+# the remedy the refusal printed re-pointed the binding for real and then refused
+# again, naming the CORRECT new PR as "recorded at loop iteration 1".
+# A refusal that prints an instruction has made a testable claim about reachability.
+# This arm runs that instruction VERBATIM, from the state the refusal left behind.
+[[ "$(assigneeof DIVE-260)" == "dev" && "$(iterof DIVE-260)" == "2" && "$(binditerof DIVE-260)" == "1" ]] \
+  && ok_t "Tgd inherits arm (a)'s refused row (assignee=verifier, iter=2, bind=1)" \
+  || bad_t "Tgd wrong start state" "assignee=$(assigneeof DIVE-260) iter=$(iterof DIVE-260) bind=$(binditerof DIVE-260)"
+( actor_seam_as main; cmd_task_deliver DIVE-260 --pr="$PR2" ) >/dev/null 2>&1
+[[ "$(iterof DIVE-260)" == "2" && "$(binditerof DIVE-260)" == "2" ]] \
+  && ok_t "Tgd the printed remedy stamps the binding at the CURRENT iteration, no bump" \
+  || bad_t "Tgd remedy did not move the stamp" "iter=$(iterof DIVE-260) bind=$(binditerof DIVE-260)"
+out=$( actor_seam_as dev; cmd_task_done DIVE-260 2>&1 ); rc=$?
+[[ $rc -eq 0 && "$(statusof DIVE-260)" == "done" ]] \
+  && ok_t "Tgd following the refusal's OWN remedy makes the close succeed" \
+  || bad_t "Tgd remedy is inert — false refuse on a correctly-bound row" "rc=$rc status=$(statusof DIVE-260) out=$out"
+
 # ARM (c): a row bound BEFORE this column existed has a NULL stamp. NULL is not
 # stale — "I cannot judge" must never become a refusal, or the gate false-REDs
 # every legacy row on the board the moment it ships.

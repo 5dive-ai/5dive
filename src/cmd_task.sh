@@ -3760,7 +3760,20 @@ cmd_task_deliver() {
   fi
   # Record the delivery ref + timestamp before the handoff, so the merge-gate can
   # see it regardless of where the task lands next.
-  db "UPDATE tasks SET delivery_ref=$(sqlq "$pr"), delivered_at=datetime('now') WHERE id=${id};"
+  # DIVE-2682 (dev's reject, iteration 1): stamp the binding's iteration HERE, beside
+  # the delivery_ref write, so BOTH deliver arms record it. The routing arm below
+  # overwrites this with iteration+1 inside the same UPDATE that bumps the counter.
+  # The non-routing arm (verifier == assignee) previously stamped NOTHING — and that
+  # is exactly the arm a maker lands in when it follows the refusal's own printed
+  # remedy, because the gate fires on a VERIFIER's close, when assignee IS the
+  # verifier. So `task deliver --pr=<new>` re-pointed the binding for real while the
+  # stamp stayed behind, and the next close refused again naming the CORRECT new PR
+  # as recorded at the old iteration: a false refuse on a correctly-bound row, which
+  # is the hazard class this row exists to prevent.
+  # CURRENT iteration, never a bump: re-pointing is the legitimate act the gate
+  # demands, so recording it cannot weaken the gate — the stamp still only ever
+  # equals an iteration at which a PR was actually named.
+  db "UPDATE tasks SET delivery_ref=$(sqlq "$pr"), delivered_at=datetime('now'), delivery_ref_iteration=COALESCE(iteration,0) WHERE id=${id};"
   local _vfier _asignee
   _vfier=$(db "SELECT COALESCE(verifier,'')  FROM tasks WHERE id=${id};")
   _asignee=$(db "SELECT COALESCE(assignee,'') FROM tasks WHERE id=${id};")
