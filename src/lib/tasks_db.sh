@@ -361,8 +361,17 @@ CREATE TABLE IF NOT EXISTS tasks (
   -- per delivery (shipped_flag_at pattern): stamped when the sweep flags a
   -- delivery that's sat past its staleness window, cleared on the next fresh
   -- handoff so a redelivered task gets a clean chance to alert again.
+  -- DIVE-2624: handoff_rejected_at stamps the verifier's FAIL bounce
+  -- (cmd_task_reject). It exists so `iteration` can mean what every reader already
+  -- assumes it means — verifier rejections — instead of "number of task done calls".
+  -- Compared against handoff_delivered_at at the next delivery: a reject at or after
+  -- the current delivery clock is a real second pass, anything else is a re-delivery
+  -- of the same pass (e.g. restoring a handoff a gate filing destroyed) and must not
+  -- bump. Never cleared: the comparison against the delivery clock is what makes it
+  -- self-expiring.
   handoff_delivered_at    TEXT,
   handoff_stale_pinged_at TEXT,
+  handoff_rejected_at     TEXT,
   -- DIVE-891: risk-tiered gates (adopted design DIVE-861). tier is set when the
   -- gate is filed: 0 = auto-clear (rec applies immediately, digest line only),
   -- 1 = agent-clearable + 48h TTL auto-applies the recommendation, 2 = hard
@@ -1068,6 +1077,7 @@ _tasks_db_migrate() {
            'acceptance_criteria TEXT' 'verify_command TEXT' 'max_iterations INTEGER' 'verifier TEXT' \
            'iteration INTEGER' 'maker_agent TEXT' 'handoff_ack_at TEXT' 'task_budget TEXT' \
            'handoff_delivered_at TEXT' 'handoff_stale_pinged_at TEXT' \
+           'handoff_rejected_at TEXT' \
            'tier INTEGER' 'need_asked_at TEXT' 'gate_pinged_at TEXT' 'wake_at TEXT' \
            'gate_filed_by TEXT' \
            'secret_key TEXT' 'connector TEXT' 'secret_oob TEXT' 'human_nonce_hash TEXT' \
