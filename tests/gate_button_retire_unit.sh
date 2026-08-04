@@ -403,6 +403,13 @@ fi
 # any gate retired the keyboard for ALL of them (retire edits the message that
 # delivered the gate, and that message was everyone's). Graded on the SHAPE OF THE
 # SENDS, not by reading the code — the send stub records one line per call.
+# cmd_task_inbox's send path opens with require_root, so unprivileged this whole
+# block died at that line with E_AUTH_REQUIRED and every arm below asserted against
+# an EMPTY log — which reads as "the feature sent nothing", not as "the test never
+# ran". Same stub the sibling harnesses use (capture_accumulate_unit.sh:41,
+# gate_proof_verify_unit.sh, gate_tier2_decision_nonce_unit.sh). Defined HERE rather
+# than at file scope so the arms above keep the real predicate.
+require_root() { :; }
 SENDS="$TMP/sends.log"; : >"$SENDS"
 _mirror_send() {
   printf 'send silent=%s markup=%s\n' \
@@ -420,7 +427,18 @@ seed_gate 9002 DIVE-9002 approval
 seed_gate 9003 DIVE-9003 decision
 # Subshell: cmd_task_inbox ends in ok/fail, which exit — `|| true` cannot catch an
 # exit in the current shell, and the harness must survive either outcome.
-( cmd_task_inbox --send ) >/dev/null 2>&1 || true
+# REACHABILITY FIRST, and it is the arm this block cost a delivery for. olivia's
+# point: stubbing require_root fixes THIS instance, it does not fix the property
+# that an unreached path reports as an empty measurement rather than a red one.
+# So grade the INSTRUMENT before grading the feature — a non-zero expectation that
+# can only be met if the code actually ran. Without this, every arm below reads
+# "expected 3, got 0" whether the split is broken or the harness never reached it,
+# and those two need different fixes.
+( cmd_task_inbox --send ) >/dev/null 2>&1; inbox_rc=$?
+chk "REACHABILITY: cmd_task_inbox --send actually RAN (rc 0, not a root/precondition refusal)" "0" "$inbox_rc"
+sends_n=$(grep -c '^send ' "$SENDS" 2>/dev/null || echo 0)
+chk "REACHABILITY: the send log is NON-EMPTY before anything asserts what is IN it" \
+    "yes" "$([[ "$sends_n" -gt 0 ]] && echo yes || echo "no (rc=$inbox_rc)")"
 chk "3 open gates produce 3 SEPARATE messages, not one digest" "3" "$(grep -c '^send ' "$SENDS" 2>/dev/null || echo 0)"
 chk "the FIRST gate message pings the human" "silent=no" "$(head -1 "$SENDS" 2>/dev/null | grep -o 'silent=[a-z]*')"
 chk "every message after the first is SILENT (one buzz, not N)" "2" "$(tail -n +2 "$SENDS" 2>/dev/null | grep -c 'silent=yes')"
