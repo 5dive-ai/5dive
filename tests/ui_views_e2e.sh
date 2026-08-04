@@ -48,20 +48,27 @@ trap 'rc=$?; [[ -n "${SRV_PID:-}" ]] && kill "$SRV_PID" 2>/dev/null; rm -rf "${T
   || printf 'grading tree: UNRESOLVED (tests/lib/grading_tree.sh not reachable; no tree named)\n' >&2
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+
+P=0; F=0; S=0
+chk(){ if [ "$2" = "$3" ]; then P=$((P+1)); else F=$((F+1)); echo "FAIL: $1 (want=$2 got=$3)"; fi; }
+# An environment this harness cannot run in exits 0 — but it prints the SAME
+# summary line a real run prints, with SKIP=1 and PASS=0. A whole-harness bail
+# that printed nothing read to CI as a green that had graded 64 assertions; the
+# reader could not tell "all arms passed" from "no arm ran" (DIVE-2663).
+bail_skip(){ S=$((S+1)); echo "SKIP: $1"; summary; exit 0; }
+summary(){ echo "PASS=$P FAIL=$F SKIP=$S"; }
+
 for b in python3 jq sqlite3; do
-  command -v "$b" >/dev/null 2>&1 || { echo "SKIP: $b not on PATH (5dive ui needs it)"; exit 0; }
+  command -v "$b" >/dev/null 2>&1 || bail_skip "$b not on PATH (5dive ui needs it)"
 done
 
 TMP="$(mktemp -d)"
 FIVE="$TMP/5dive"
 if ! BUILD_OUT="$FIVE" bash "$ROOT/build.sh" >/dev/null 2>&1 || [[ ! -x "$FIVE" ]]; then
-  echo "SKIP: could not build a throwaway ./5dive (build.sh failed)"; exit 0
+  bail_skip "could not build a throwaway ./5dive (build.sh failed)"
 fi
 export STATE_DIR="$TMP"          # isolate — never touch a live state dir
 DB="$TMP/tasks/tasks.db"
-
-P=0; F=0
-chk(){ if [ "$2" = "$3" ]; then P=$((P+1)); else F=$((F+1)); echo "FAIL: $1 (want=$2 got=$3)"; fi; }
 
 # --- seed a board -----------------------------------------------------------
 # The store dir is created here rather than by `task init`: init is a root-only
@@ -70,7 +77,15 @@ chk(){ if [ "$2" = "$3" ]; then P=$((P+1)); else F=$((F+1)); echo "FAIL: $1 (wan
 # Names are reserved fakes, never a real agent or person on any host.
 mkdir -p "$TMP/tasks"
 "$FIVE" ui --data >/dev/null 2>&1
-[[ -f "$DB" ]] || { echo "SKIP: ui --data did not create a task store at $DB"; exit 0; }
+# NOT a skip. Every environmental precondition is already proven above (the three
+# binaries resolve, build.sh produced an executable), so a store that is absent
+# HERE is the subject failing to open one, not a box this harness cannot run on.
+# Bailing green at this line was the one path that could report a run of 0 arms
+# as a pass on a working box.
+if [[ ! -f "$DB" ]]; then
+  F=$((F+1)); echo "FAIL: 0 seed: ui --data did not create a task store at $DB"
+  summary; exit 1
+fi
 sq(){ sqlite3 "$DB" "$1"; }
 
 sq "INSERT INTO agents_org (name, reports_to, role, title) VALUES
@@ -276,6 +291,6 @@ chk "13 listed in top-level help" "1" \
 chk "13 unknown flag is a usage error" "2" \
     "$("$FIVE" ui --fleet >/dev/null 2>&1; echo $?)"
 
-echo "PASS=$P FAIL=$F"
+summary
 [ "$F" -eq 0 ] || exit 1
 exit 0

@@ -1,41 +1,5 @@
 # Changelog
 
-## Unreleased — feat(ui): `5dive ui`, three read-only views served by the CLI itself (DIVE-2655)
-
-The org layer has always been the product and it has never been visible: to see who reports to
-whom, what is queued, and what is parked on a human, you had to run three commands and hold the
-join in your head. `5dive ui` serves that as a page, from the same single-file bundle, with no
-install, no build step, no account and no sign-in.
-
-Three views over ONE host. **Org chart** renders `agents_org` as a tree, each agent carrying what
-it is actually holding, and under it every live handoff on the board: who gave the work, who holds
-it, who grades it. The headline is a count off the data, not a claim in copy — how many of those
-handoffs run agent to agent with no human anywhere in the path. **Queue** is the open rows with
-assignee, verifier and maker-to-verifier handoff state. **Gates** is what is blocked on a person,
-at which tier, with the asking agent's own recommendation.
-
-It reads the local task store and the local org chart and nothing else. There is deliberately no
-endpoint that aggregates across boxes: multi-box, the marketplace and hosted council are a
-different product, and `tests/ui_views_e2e.sh` asserts the payload's key set WHOLE so a fleet key
-cannot arrive unnoticed.
-
-Read-only is a property of the server, not a promise about the client: GET and HEAD answer on
-exactly three paths, every write method returns 405, and anything that changes state already has a
-CLI verb. There is no sign-in, so the bind is loopback and `--host` refuses a routable address
-unless `FIVE_UI_ALLOW_REMOTE=1` says otherwise. The page is one self-contained file with no
-absolute URL in it, so it renders on a box with no egress. python3 (stdlib only) holds the socket
-because bash cannot, and the server script is generated at runtime into a private temp dir, so the
-shipped artifact is still exactly one file.
-
-A box whose task store has not been initialised yet still gets all three views: `task init` is
-root-only, so refusing there would mean a fresh install cannot open the UI at all. The empty board
-is NAMED (`store: "absent"`) and the page says which command fixes it, because three empty arrays
-on their own read as "nothing is queued" on a host that cannot queue anything.
-
-`5dive ui --data` prints the JSON both the page and any other consumer render. Every field in it
-comes from the predicates the CLI already uses (`handoff_state` and `gate_live` are the `task ls`
-expressions verbatim), so a view cannot tell a different story than the queue it is showing.
-
 ## Unreleased — feat(gate): a gate now records WHY it has the tier it has (DIVE-2615)
 
 lodar was interrupted three times in ten minutes on 2026-08-03 by gates that were not
