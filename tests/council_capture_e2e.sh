@@ -26,6 +26,7 @@ set -uo pipefail
 # 210 harnesses at once while every other check in this change stayed green.
 . "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh" \
   || printf 'grading tree: UNRESOLVED (tests/lib/grading_tree.sh not reachable; no tree named)\n' >&2
+trap 'rc=$?; rm -rf "${TMP:-}"; echo "HARNESS-RC=$rc"' EXIT   # DIVE-2692: fires on every exit path (incl. SKIP/precondition-fail early-exits); folds in tempdir cleanup so the two EXIT traps don't clobber each other.
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"; cd "$ROOT"
 
 pass=0; fail=0
@@ -36,7 +37,6 @@ command -v node >/dev/null 2>&1 || { echo "SKIP: node not on PATH"; exit 0; }
 command -v jq   >/dev/null 2>&1 || { echo "SKIP: jq not on PATH"; exit 0; }
 
 TMP="$(mktemp -d -t 5dive-1869.XXXXXX)" || { echo "SKIP: mktemp failed"; exit 0; }
-trap 'rm -rf "$TMP"' EXIT
 
 BIN="$TMP/5dive"
 if ! BUILD_OUT="$BIN" ./build.sh >/dev/null 2>&1; then echo "SKIP: could not build a throwaway binary"; exit 0; fi

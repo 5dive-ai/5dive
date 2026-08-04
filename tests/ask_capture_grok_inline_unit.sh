@@ -47,6 +47,7 @@ set -euo pipefail
 # 210 harnesses at once while every other check in this change stayed green.
 . "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh" \
   || printf 'grading tree: UNRESOLVED (tests/lib/grading_tree.sh not reachable; no tree named)\n' >&2
+trap 'rc=$?; rm -rf "${W:-}"; echo "HARNESS-RC=$rc"' EXIT   # DIVE-2692: fires on every exit path (incl. SKIP/precondition-fail early-exits); folds in tempdir cleanup so the two EXIT traps don't clobber each other.
 cd "$(dirname "$0")/.."
 
 # shellcheck disable=SC1091
@@ -67,7 +68,7 @@ ok_() { if (( dirty )); then dirty=0; return; fi; pass=$((pass+1)); echo "  ok: 
 fails=0
 bad() { echo "FAIL: $*" >&2; fails=$((fails+1)); dirty=1; }
 
-W="$(mktemp -d)"; trap 'rm -rf "$W"' EXIT
+W="$(mktemp -d)"
 base="$W/base"; msg="$W/msg"
 # The grok pane's own furniture. Nothing in the extractor may know these strings;
 # they exist so a leak is caught by equality AND by name.

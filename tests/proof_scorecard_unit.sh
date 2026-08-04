@@ -23,10 +23,10 @@ set -uo pipefail
 # 210 harnesses at once while every other check in this change stayed green.
 . "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh" \
   || printf 'grading tree: UNRESOLVED (tests/lib/grading_tree.sh not reachable; no tree named)\n' >&2
+trap 'rc=$?; rm -rf "${TMP:-}"; echo "HARNESS-RC=$rc"' EXIT   # DIVE-2692: fires on every exit path (incl. SKIP/precondition-fail early-exits); folds in tempdir cleanup so the two EXIT traps don't clobber each other.
 cd "$(dirname "$0")/.."
 
 TMP="$(mktemp -d /tmp/proof-scorecard.XXXXXX)"
-trap 'rm -rf "$TMP"' EXIT
 
 awk "/python3 <<'SCOREPY'/{f=1;next} f&&/^SCOREPY\$/{f=0} f" src/cmd_proof.sh > "$TMP/score.py"
 [[ -s "$TMP/score.py" ]] || { echo "FAIL - could not extract scorecard python"; exit 1; }

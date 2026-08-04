@@ -64,10 +64,10 @@ set -uo pipefail
 # 210 harnesses at once while every other check in this change stayed green.
 . "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh" \
   || printf 'grading tree: UNRESOLVED (tests/lib/grading_tree.sh not reachable; no tree named)\n' >&2
+trap 'rc=$?; rm -rf "${TMP:-}"; echo "HARNESS-RC=$rc"' EXIT   # DIVE-2692: fires on every exit path (incl. SKIP/precondition-fail early-exits); folds in tempdir cleanup so the two EXIT traps don't clobber each other.
 cd "$(dirname "$0")/.."
 SRC=src
 TMP="$(mktemp -d /tmp/gate-ancestry-unit.XXXXXX)"
-trap 'rm -rf "$TMP"' EXIT
 
 # --- stub gh. Three surfaces matter here:
 #   `api repos/<slug>/compare/<base>...<head>` -> GH_STUB_CMP_<REPO>_<HEAD> (JSON).

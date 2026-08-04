@@ -11,6 +11,7 @@
 # handle -- a clean repo, a dirty repo, a non-repo -- rather than stubbing git.
 # A stubbed observable would make these vacuously green.
 set -uo pipefail
+trap 'rc=$?; rm -rf "${TMP:-}"; echo "HARNESS-RC=$rc"' EXIT   # DIVE-2692: fires on every exit path (incl. SKIP/precondition-fail early-exits); folds in tempdir cleanup so the two EXIT traps don't clobber each other.
 cd "$(dirname "$0")/.."
 
 # shellcheck source=lib/grading_tree.sh
@@ -25,7 +26,6 @@ cd "$(dirname "$0")/.."
   || printf 'grading tree: UNRESOLVED (tests/lib/grading_tree.sh not reachable; no tree named)\n' >&2
 
 TMP="$(mktemp -d /tmp/grading-tree.XXXXXX)"
-trap 'rm -rf "$TMP"' EXIT
 
 PASS=0; FAIL=0
 ok()   { PASS=$((PASS+1)); printf 'ok   - %s\n' "$1"; }

@@ -23,10 +23,10 @@ set -uo pipefail
 # harnesses for why silencing it would swallow the payload, not just the noise.
 . "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh" \
   || printf 'grading tree: UNRESOLVED (tests/lib/grading_tree.sh not reachable; no tree named)\n' >&2
+trap 'rc=$?; rm -rf "${TMP:-}"; echo "HARNESS-RC=$rc"' EXIT   # DIVE-2692: fires on every exit path (incl. SKIP/precondition-fail early-exits); folds in tempdir cleanup so the two EXIT traps don't clobber each other.
 cd "$(dirname "$0")/.."
 SRC=src
 TMP="$(mktemp -d /tmp/done-ack-before-gate-unit.XXXXXX)"
-trap 'rm -rf "$TMP"' EXIT
 
 # --- stub gh + sudo, same convention as tests/task_deliver_merge_gate_unit.sh ---
 # (fail-closed sudo so the token resolver never reaches a real host credential;
