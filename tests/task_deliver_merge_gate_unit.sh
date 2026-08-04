@@ -376,7 +376,69 @@ out=$(cmd_task_done DIVE-265 --result="PASS. graded-sha: $OTHER_SHA" 2>&1); rc=$
 [[ -z "$(_gate_graded_sha "graded-sha: nothex")" ]] \
   && ok_t "Te9d extractor ignores a non-hex label value" \
   || bad_t "Te9d" "got=$(_gate_graded_sha "graded-sha: nothex")"
+# --- Tg: DIVE-2682 — a binding that PREDATES the current loop iteration is stale,
+#     and a close on it is refused. Graded by mutation, both arms, because a fix
+#     that only ever refuses passes the refusing arm trivially. ------------------
+iterof()  { db "SELECT COALESCE(iteration,0) FROM tasks WHERE ident='$1';"; }
+binditerof() { db "SELECT COALESCE(CAST(delivery_ref_iteration AS TEXT),'NULL') FROM tasks WHERE ident='$1';"; }
+PR2="https://github.com/5dive-ai/5dive/pull/1000"
 
+# The well-behaved delivery first: deliver stamps the binding's iteration in the
+# SAME update that bumps the counter, so the two agree. If these ever disagree at
+# this point the ordering hazard is live and every arm below is meaningless.
+seed_task DIVE-260 main dev
+cmd_task_deliver DIVE-260 --pr="$PR" >/dev/null 2>&1
+[[ "$(iterof DIVE-260)" == "1" && "$(binditerof DIVE-260)" == "1" ]] \
+  && ok_t "Tg0 deliver stamps binding-iteration == iteration (no two-moment read)" \
+  || bad_t "Tg0 stamp/bump agree" "iter=$(iterof DIVE-260) bind=$(binditerof DIVE-260)"
+
+# ARM (a): the loop bounces and the maker re-delivers WITHOUT re-pointing the
+# binding — `task done` from the maker routes to the verifier again and bumps the
+# counter, leaving the binding behind at iteration 1. The close must REFUSE.
+db "UPDATE tasks SET assignee='main', status='in_progress' WHERE ident='DIVE-260';"   # verifier rejected → back to maker
+( actor_seam_as main; cmd_task_done DIVE-260 --result="fixed, re-delivering" ) >/dev/null 2>&1
+[[ "$(iterof DIVE-260)" == "2" && "$(binditerof DIVE-260)" == "1" ]] \
+  && ok_t "Tga re-delivery bumps the counter and leaves the binding at its old iteration" \
+  || bad_t "Tga stale gap created" "iter=$(iterof DIVE-260) bind=$(binditerof DIVE-260)"
+export GH_STUB_STATE="MERGED" GH_STUB_MERGED="2026-08-04T00:00:00Z"
+out=$( actor_seam_as dev; cmd_task_done DIVE-260 2>&1 ); rc=$?
+[[ $rc -eq $E_CONFLICT ]] \
+  && ok_t "Tga close on a STALE binding is REFUSED even though the PR is MERGED" \
+  || bad_t "Tga refused rc" "rc=$rc (want $E_CONFLICT) out=$out"
+[[ "$out" == *"DIVE-2682"* || "$out" == *"iteration"* ]] \
+  && ok_t "Tga the refusal names the iteration mismatch, not the merge state" \
+  || bad_t "Tga refusal message" "out=$out"
+[[ "$(statusof DIVE-260)" != "done" ]] \
+  && ok_t "Tga the task did NOT close" \
+  || bad_t "Tga task closed anyway" "status=$(statusof DIVE-260)"
+
+# ARM (b) — THE CONTROL, and the one that catches the ordering hazard. Same loop,
+# but the maker RE-POINTS the binding with `task deliver --pr=<new>`. The stamp
+# and the bump happen in one update, so they agree, and the close is ACCEPTED.
+# Without this arm a fix that refuses unconditionally would pass arm (a) and look
+# correct while blocking every legitimate close on the board.
+seed_task DIVE-261 main dev
+cmd_task_deliver DIVE-261 --pr="$PR" >/dev/null 2>&1
+db "UPDATE tasks SET assignee='main', status='in_progress' WHERE ident='DIVE-261';"   # rejected → back to maker
+( actor_seam_as main; cmd_task_deliver DIVE-261 --pr="$PR2" ) >/dev/null 2>&1
+[[ "$(iterof DIVE-261)" == "2" && "$(binditerof DIVE-261)" == "2" ]] \
+  && ok_t "Tgb re-pointing the binding stamps it at the NEW iteration (no false refuse)" \
+  || bad_t "Tgb re-point stamp" "iter=$(iterof DIVE-261) bind=$(binditerof DIVE-261)"
+out=$( actor_seam_as dev; cmd_task_done DIVE-261 2>&1 ); rc=$?
+[[ $rc -eq 0 && "$(statusof DIVE-261)" == "done" ]] \
+  && ok_t "Tgb close on a RE-POINTED binding is ACCEPTED and the task closes" \
+  || bad_t "Tgb accepted" "rc=$rc status=$(statusof DIVE-261) out=$out"
+
+# ARM (c): a row bound BEFORE this column existed has a NULL stamp. NULL is not
+# stale — "I cannot judge" must never become a refusal, or the gate false-REDs
+# every legacy row on the board the moment it ships.
+seed_task DIVE-262 main dev
+cmd_task_deliver DIVE-262 --pr="$PR" >/dev/null 2>&1
+db "UPDATE tasks SET delivery_ref_iteration=NULL, iteration=7 WHERE ident='DIVE-262';"
+out=$( actor_seam_as dev; cmd_task_done DIVE-262 2>&1 ); rc=$?
+[[ $rc -eq 0 && "$(statusof DIVE-262)" == "done" ]] \
+  && ok_t "Tgc a NULL binding-iteration (legacy row) is NOT treated as stale" \
+  || bad_t "Tgc legacy row false-refused" "rc=$rc status=$(statusof DIVE-262) out=$out"
 echo "-----"
 printf 'task_deliver_merge_gate_unit: %d passed, %d failed\n' "$PASS" "$FAIL"
 [[ $FAIL -eq 0 ]]

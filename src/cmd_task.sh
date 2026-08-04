@@ -2895,6 +2895,34 @@ _task_status_cmd() {
     if [[ -z "$_dref" ]]; then
       _branch=$(_push_branch_from_body "$_body")
     fi
+    # DIVE-2682 (implements the DIVE-2671 design call): a binding can OUTLIVE the
+    # iteration it was made for. The gate below asks "did the bound PR land"; it
+    # never asks "did the sha the verifier graded land", and a maker→verifier loop
+    # separates those two by design. DIVE-2057 is the clean instance: bound to #45
+    # at first delivery, #45 was REJECTED, the fix landed in a new PR #51, and the
+    # row still pointed at #45 — a credential-holding close would have greened off
+    # a PR that does not contain the passed work.
+    #
+    # Keyed on ITERATION, not on the graded sha and not on timestamps. The sha
+    # variant is refuted: we squash-merge, so a graded head is NEVER an ancestor
+    # of main and every squash-merged PR would false-RED. The timestamp variant is
+    # refuted too — DIVE-2057's binding legitimately predates its latest ACK.
+    #
+    # This check is PURELY LOCAL. No token, no API, no rail — so unlike every
+    # GitHub-query arm below it, it cannot vary by caller, which is the exact
+    # failure mode that made a missing credential do the work of a control.
+    #
+    # NULL is not stale: rows bound before this column existed cannot be judged,
+    # and a gate that refuses on "I do not know" is a false red.
+    if [[ -n "$_dref" ]]; then
+      local _bind_iter _cur_iter
+      _bind_iter=$(db "SELECT COALESCE(CAST(delivery_ref_iteration AS TEXT),'') FROM tasks WHERE id=${id};")
+      _cur_iter=$(db "SELECT COALESCE(iteration,0) FROM tasks WHERE id=${id};")
+      if [[ -n "$_bind_iter" ]] && (( _bind_iter < _cur_iter )); then
+        policy_refuse "$E_CONFLICT" done-with-stale-delivery-binding DIVE-2682 "$ident" \
+          "$ident cannot close: its delivery binding ${_dref} was recorded at loop iteration ${_bind_iter}, and the loop is now at ${_cur_iter}. The work bounced back to the maker and was re-delivered after that PR was bound, so closing here would grade a PR that does not contain the re-delivered work (DIVE-2057 is the clean instance of that). Re-point the binding to the PR carrying the CURRENT iteration — \`task deliver $ident --pr=https://github.com/<owner>/<repo>/pull/N\` — then \`task done\`."
+      fi
+    fi
     if [[ -n "$_dref" || -n "$_branch" ]]; then
       _mg_had_subject=1     # a declared delivery IS something to verify
       if ! command -v gh >/dev/null 2>&1; then
@@ -3738,7 +3766,9 @@ cmd_task_deliver() {
   _asignee=$(db "SELECT COALESCE(assignee,'') FROM tasks WHERE id=${id};")
   if [[ -n "$_vfier" && "$_vfier" != "$_asignee" ]]; then
     # Hand off to the verifier exactly like a maker's `task done` (DIVE-477).
-    _task_route_to_verifier "$id" "$_vfier" "$_asignee" "$result" "$want_result"
+    # DIVE-2682: the trailing 1 stamps delivery_ref_iteration alongside the bump —
+    # this verb, and only this verb, just wrote delivery_ref above.
+    _task_route_to_verifier "$id" "$_vfier" "$_asignee" "$result" "$want_result" 1
     return
   fi
   # No distinct verifier: record the delivery but do NOT close — a verifier must
@@ -3887,9 +3917,22 @@ cmd_task_merge_audit() {
 # in their queue (no heartbeat change needed). No status='done' is written: the
 # work is not closed until the verifier signs off.
 _task_route_to_verifier() {
-  local id="$1" vfier="$2" maker="$3" result="$4" want_result="$5"
+  local id="$1" vfier="$2" maker="$3" result="$4" want_result="$5" stamp_binding="${6:-0}"
   local set_result=""
   (( want_result )) && set_result=", result=$(sqlq_or_null "$result")"
+  # DIVE-2682: stamp the binding's iteration in the SAME UPDATE that bumps the
+  # counter, never in a second statement. Both right-hand sides evaluate against
+  # the PRE-update row, so delivery_ref_iteration and iteration land on the same
+  # number — which is the whole point. Reading the counter at two different
+  # moments is what would false-REFUSE the well-behaved maker who re-points the
+  # binding and delivers in one breath.
+  #
+  # Only cmd_task_deliver passes 1: it is the sole writer of delivery_ref, so it
+  # is the only caller that just (re)pointed the binding. A plain `task done`
+  # re-delivery passes 0 and deliberately leaves the stamp behind at its old
+  # iteration — that gap IS the signal the gate reads.
+  local set_binding_iter=""
+  (( stamp_binding )) && set_binding_iter=", delivery_ref_iteration=COALESCE(iteration,0)+1"
   # DIVE-1416 (gap#2): stamp handoff_delivered_at fresh on EVERY delivery (incl.
   # a re-delivery after a reject/bounce-back) — the dedicated clock the stall
   # sweep uses to detect a delivery sitting unacknowledged too long. Clear any
@@ -3927,7 +3970,7 @@ _task_route_to_verifier() {
               ELSE COALESCE(iteration,0) END,
             handoff_rejected_at=NULL,
             started_at=NULL, handoff_ack_at=NULL,
-            handoff_delivered_at=datetime('now'), handoff_stale_pinged_at=NULL${set_result}
+            handoff_delivered_at=datetime('now'), handoff_stale_pinged_at=NULL${set_result}${set_binding_iter}
       WHERE id=${id};"
   local iter; iter=$(db "SELECT iteration FROM tasks WHERE id=${id};")
   local iter_note=""

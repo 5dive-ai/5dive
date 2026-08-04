@@ -1099,7 +1099,7 @@ _tasks_db_migrate() {
            'ask_shape TEXT' 'precedent_ref INTEGER' 'precedent_kind TEXT' \
            'needs_capability TEXT' \
            'shipped_flag_at TEXT' 'routed_reviewer TEXT' \
-           'delivery_ref TEXT' 'delivered_at TEXT' \
+           'delivery_ref TEXT' 'delivered_at TEXT' 'delivery_ref_iteration INTEGER' \
            'originated_by_objective INTEGER' 'originated_cycle INTEGER' \
            'verify_unavailable INTEGER' 'last_skipped_at TEXT' \
            'human_evidence TEXT' \
