@@ -421,11 +421,23 @@ SENDS="$TMP/sends.log"; : >"$SENDS"
 # So restore the REAL _mirror_send and stub the TRANSPORT instead. Everything above this
 # point keeps the cheap stub; re-sourcing here rebinds the genuine implementation, and
 # curl on PATH captures the argv it actually composes.
+#
+# ONE SEND MUST BE ONE RECORD (olivia, iteration 3). The gate TEXT contains
+# newlines, so a plain printf of "$*" wrote ~7 lines per call: line 1 was the argv
+# prefix and disable_notification landed at the END of the argv, i.e. on that send's
+# LAST line. Every arm below is indexed by LINE, so `head -1` could never see the
+# flag (structurally always "absent" — a vacuous arm that survives a build which
+# silences the human's only ping) and `tail -n +2` still contained most of MESSAGE
+# ONE (so the "after the first" count was over the wrong population, and redded for
+# the right verdict by the wrong mechanism). Collapsing the newlines makes head -1
+# message 1 entire and tail -n +2 messages 2..N entire, which is the unit the arms
+# claim to measure. Generalisation worth keeping: an assertion indexed by LINE over
+# a log whose records are MULTI-LINE is measuring a unit the feature does not have.
 source "$SRC/cmd_agent_runtime.sh"
 mkdir -p "$TMP/bin"
 cat >"$TMP/bin/curl" <<'CURLSTUB'
 #!/usr/bin/env bash
-printf '%s\n' "$*" >>"$SENDS"
+printf '%s\n' "${*//$'\n'/ }" >>"$SENDS"
 printf '%s' '{"ok":true,"result":{"message_id":15491}}'
 CURLSTUB
 chmod +x "$TMP/bin/curl"
