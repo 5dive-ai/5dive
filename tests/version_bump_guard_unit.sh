@@ -111,11 +111,55 @@ c2="$(commit_release 0.1.1 0.1.1 shaC "proper bump")"
 
 # --- version-bump-guard.sh: push-time, single BASE..NEW comparison -----
 
+# DIVE-2585: the version-COLLISION assertion is RETIRED, so the DIVE-2065
+# incident shape is deliberately CLEAR here now. Its predicate ("src/ moved but
+# FIVE_VERSION did not") was written for a world where main carried a real
+# release version; under DIVE-2247's tag-time assignment main's header is the
+# 0.0.0-dev sentinel at EVERY commit, so the second half was true by
+# construction and the check blocked every source-changing push to main.
+# The property did not disappear, it moved to the publish act: release-cut.yml
+# refuses a derived tag that already exists (DIVE-2118), and
+# tests/release_cut_bundle_unit.sh asserts main still carries the sentinel.
 bash "$BUMP_GUARD" "$c1" "$c0" >/dev/null 2>&1
-assert_exit "bump-guard: blocks the incident shape (bundle changed, version reused)" 1 "$?"
+assert_exit "bump-guard: same-version src-changing range is CLEAR (collision assertion retired to release-cut.yml, DIVE-2585)" 0 "$?"
 
 bash "$BUMP_GUARD" "$c2" "$c1" >/dev/null 2>&1
 assert_exit "bump-guard: allows a genuine forward bump" 0 "$?"
+
+# DIVE-2585, THE ARM THAT REDS ON THE PRE-FIX SCRIPT. This is the exact shape of
+# every real push to main since DIVE-2247 — sentinel to sentinel, src/ changed —
+# reproduced against the sentinel string itself rather than a stand-in version,
+# because "0.0.0-dev == 0.0.0-dev" is precisely what made the retired assertion
+# fire unconditionally. Measured pre-fix on already-landed main commits
+# (785e391 vs its parent): BLOCKED, rc=1.
+git checkout -q "$c2"
+s0="$(commit_release 0.0.0-dev 0.0.0-dev shaS0 "sentinel main, baseline")"
+git checkout -q "$s0"
+s1="$(commit_release 0.0.0-dev 0.0.0-dev shaS1 "sentinel main, ordinary source change")"
+out="$(bash "$BUMP_GUARD" "$s1" "$s0" 2>&1)"; rc=$?
+assert_exit "bump-guard: an ordinary 0.0.0-dev -> 0.0.0-dev src-changing push to main is CLEAR" 0 "$rc"
+
+# The two stale STRINGS are defects in their own right (DIVE-2585), independent
+# of the exit code: the remedy told the reader to hand-bump main, which the
+# tag-time model forbids, and the override cited a CI job DIVE-2247 deleted
+# (bundle-drift.yml carries its headstone). Grade the file, not just its rc — an
+# rc-only assertion passes happily with the wrong advice still printed.
+# Scoped to NON-COMMENT lines (`^[^#]*`, the idiom the artifact arm above uses).
+# The assertion is "must not PRINT this advice", and a bare file-wide grep does
+# not say that — the fixed header deliberately QUOTES both retired strings to
+# record what they said and why they were wrong, and a file-wide grep reds on
+# that documentation. A grep answers "string in file", never "string in the
+# scope that emits it".
+if grep -qE '^[^#]*Bump FIVE_VERSION in src/header\.sh' "$BUMP_GUARD"; then
+  bad_t "bump-guard: must not advise hand-bumping FIVE_VERSION (forbidden since DIVE-2247)" "$(grep -nE '^[^#]*Bump FIVE_VERSION' "$BUMP_GUARD")"
+else
+  ok_t "bump-guard: does not advise hand-bumping FIVE_VERSION"
+fi
+if grep -qE '^[^#]*(CI )?version-uniqueness check is the net' "$BUMP_GUARD" "$ROOT/scripts/git-hooks/pre-push"; then
+  bad_t "bump-guard/pre-push: must not cite the deleted CI version-uniqueness job as the net" "$(grep -nE '^[^#]*version-uniqueness check is the net' "$BUMP_GUARD" "$ROOT/scripts/git-hooks/pre-push")"
+else
+  ok_t "bump-guard/pre-push: cites no deleted CI job as its net"
+fi
 
 # DIVE-2091: the "committed bundle embeds a version disagreeing with header.sh"
 # assertion is GONE, and deliberately so — it is now UNREACHABLE, not relaxed.
