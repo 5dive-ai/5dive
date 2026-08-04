@@ -24,34 +24,10 @@ name: full-sweep
 #
 # A RED HERE IS NOT IGNORABLE. release-cut grades the same corpus before publishing,
 # so a sweep that has been red for a week is a release that will not cut.
-#
-# DIVE-2667: AND IT WAS IGNORED FOR ~17 HOURS, because "not ignorable" was a property
-# of the consequence, not of the signal. Between the green nightly at 2026-08-03T06:39
-# and the next observation, ~12 commits landed on main and the sweep went red; the
-# only scheduled run is once a day, and full-sweep is NOT in the per-PR check set, so
-# every PR merged that day was green on its own checks while the corpus rotted
-# underneath. Recovering "which merge did it" then costs a bisect over the window.
-# `push: main` is the smallest change that removes both halves at once: the tier runs
-# at the granularity that ATTRIBUTES a break to one merge — BETWEEN BURSTS, and that
-# qualifier is load-bearing (see the concurrency block below: merges closer together
-# than one sweep collapse into a single run of the newest tip, and inside such a burst
-# you are back to a bisect over those N commits, which is the 12-commit position this
-# row is about). The trade is deliberate and it is still a large win: the window shrinks
-# from a day's merges to a burst's, and most merges here are not in a burst. The latency
-# to notice drops from up to a day to the length of one sweep in every case. The nightly
-# stays — it is the arm that catches a break with no commit behind it (a runner image
-# change, an expiring fixture, a rate limit).
 on:
   schedule:
     # 03:17 UTC — off the hour, because the hour is where every other fleet cron is.
     - cron: '17 3 * * *'
-  # DIVE-2667: no `paths:` filter, deliberately. The subject of this workflow is the
-  # WHOLE corpus against the WHOLE source tree; a path filter would reintroduce the
-  # exact gap — the four harnesses that went red on 2026-08-03 were broken by commits
-  # that touched src/, not tests/, and any filter narrow enough to be cheap is narrow
-  # enough to miss that class again.
-  push:
-    branches: [main]
   workflow_dispatch:
   # The tiering machinery itself must be graded on the PR that changes it, or the
   # first evidence that a budget is mis-set arrives a day late on main.
@@ -60,36 +36,6 @@ on:
       - 'tests/lib/tier.sh'
       - 'scripts/run-harnesses.sh'
       - '.github/workflows/full-sweep.yml'
-
-# DIVE-2667: what makes `push: main` affordable, and WHAT IT COSTS TO BUY THAT.
-#
-# The cost is NOT money (main, reviewing this change): this repo is public and every
-# job here is `ubuntu-latest`, so standard runners are free. It is WALL-CLOCK and QUEUE
-# CONTENTION — six jobs x ~10 min per merge, at ~20 merges/day, against a runner pool
-# every other workflow in the repo is also waiting on. Saying "cost" and meaning dollars
-# would invite a reviewer to check the dollars, find none, and distrust the rest.
-#
-# Grouped per ref with cancel-in-progress, a burst of merges collapses into ONE sweep of
-# the newest tip. Nothing goes UNGRADED: the cancelled run's tree is a strict ancestor of
-# the survivor's, so every commit it would have graded is graded later, at a tip that also
-# contains it. But something IS spent, and it is the thing this row exists to buy —
-# ATTRIBUTION. A collapsed burst grades N commits in one verdict, so a red inside a burst
-# still needs a bisect over that burst. The window goes from a day's merges to a burst's;
-# it does not go to one. Take the trade knowingly, and do not read the `push:` comment
-# above as a promise of per-merge attribution in all cases.
-#
-# The group is keyed on the ref, so a PR-triggered sweep (the tiering-machinery paths
-# above) is never cancelled by a merge to main.
-#
-# This block LIVES BELOW `on:` and that placement is load-bearing, not cosmetic. Put
-# it between two `on:` children and `pull_request:` becomes a child of `concurrency:`;
-# yaml.safe_load accepts that file, this repo's own tier harness passes on it, and
-# only actionlint says 'unexpected key "pull_request" for "concurrency" section'.
-# Measured here on 2026-08-04, which is the second time that gap has been paid
-# (DIVE-2539/2540): community/wiki/an-actions-expression-is-parsed-inside-shell-comments.md
-concurrency:
-  group: full-sweep-${{ github.ref }}
-  cancel-in-progress: true
 
 jobs:
   # DIVE-2525 (main, reviewing #376): SHARDED, not given a bigger number. The first
