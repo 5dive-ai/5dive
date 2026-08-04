@@ -985,7 +985,11 @@ _pack_usage() {
                                   # credential locations) and the export is REFUSED naming
                                   # file, line and category. Nothing is ever silently
                                   # redacted. --audience=self (own backup / clone on your own
-                                  # box) skips that scan — never publish a self pack.
+                                  # box) skips THAT scan and ONLY that scan — never publish a
+                                  # self pack. DIVE-2679: the secret tripwire (real tokens/keys)
+                                  # is a separate control and runs on BOTH audiences, always.
+                                  # 'self' is not a force flag; there is deliberately no way to
+                                  # export a staged credential.
                                   # It gates BOTH containers: the scan runs before the
                                   # format branch, so the tarball and the single-file
                                   # AGENTS.md are covered by construction, not by two rules.
@@ -1044,17 +1048,73 @@ _pack_agent_config() {
 }
 
 # Secret tripwire — refuse if any staged file looks like it holds a token/key.
-# Returns 0 (clean) or 1 (hit); on hit, prints the offending paths to stderr.
+# Returns 0 (clean) or 1 (hit); on hit, prints file:line: <class> to stderr.
 # Belt + braces: the real safety is the allowlist + type-scoping, this catches
 # a regression that widens either.
+#
+# DIVE-2679 — WHY THIS IS THREE RULE KINDS AND NOT ONE ALTERNATION. The original
+# was a single case-insensitive alternation over the staged dir, and two of its
+# branches matched ENGLISH rather than secrets. `sk-[A-Za-z0-9]` is unanchored, so
+# it fires on ta"sk-"need, a"sk-"rail, ri"sk-"tier, ma"sk-"wt — measured against a
+# real 411-fact memory store it hit 41 files and NOT ONE held a key; with a word
+# boundary and a realistic length it hits zero. On a board whose vocabulary is
+# literally task/ask/risk that single rule refuses every export the feature has.
+# `credentials` and a bare `API_KEY` are the same mistake in slower motion: agent
+# memory is ABOUT operations, so it discusses credentials by name constantly, and
+# the matched lines were things like "a workflow-file push is NOT blocked by
+# credentials" and `OPENROUTER_API_KEY=…` with the value already elided.
+#
+# So the fix is not a looser tripwire, it is a tripwire that distinguishes a
+# secret's VALUE from a secret's NAME:
+#   value rules  — shapes only a real credential has; match anywhere.
+#   assign rules — a key NAME is a secret only when something is assigned to it.
+#   file rules   — a staged file that IS a credential store. This is the actual
+#                  "allowlist regression" case the tripwire was written for, and
+#                  it was never checked: only content was.
+# Net effect on detection is POSITIVE — gh_/AWS tokens and PEM blocks were not
+# covered before and are now, while prose about credentials no longer refuses.
+_PACK_SECRET_VALUE_RULES=(
+  'private-key-block:-----BEGIN[A-Z ]*PRIVATE KEY-----'
+  'openai-style-key:(^|[^A-Za-z0-9])sk-[A-Za-z0-9_-]{20,}'
+  'github-token:(^|[^A-Za-z0-9])gh[pousr]_[A-Za-z0-9]{30,}'
+  'slack-token:(^|[^A-Za-z0-9])xox[abposr]-[A-Za-z0-9-]{10,}'
+  'aws-access-key-id:(^|[^A-Za-z0-9])AKIA[0-9A-Z]{16}([^0-9A-Z]|$)'
+  'telegram-bot-token:(^|[^A-Za-z0-9])[0-9]{8,}:[A-Za-z0-9_-]{30,}'
+)
+_PACK_SECRET_ASSIGN_RULES=(
+  "assigned-credential:(BOT_TOKEN|API_?KEY|ACCESS_TOKEN|AUTH_TOKEN|SECRET_KEY|CLIENT_SECRET|PASSWORD|CREDENTIALS?)[[:space:]]*[:=][[:space:]]*['\"]?[A-Za-z0-9_./+-]{16,}"
+)
+# Anchored at a path segment so a FACT named e.g. 'dive931-secret-drop.md' is not a
+# credential store, but a staged '.env' or 'id_ed25519' is.
+_PACK_SECRET_FILE_RE='(^|/)(\.env(\.[A-Za-z0-9_-]+)?|credentials(\.(json|ya?ml))?|id_(rsa|ed25519|ecdsa)|.*\.(pem|p12|pfx|keystore))$'
+
 _pack_secret_tripwire() {
-  local dir="$1" hits
-  hits=$(grep -rilE 'BOT_TOKEN|API_KEY|-----BEGIN|credentials|sk-[A-Za-z0-9]|[0-9]{8,}:[A-Za-z0-9_-]{30,}' "$dir" 2>/dev/null || true)
-  if [[ -n "$hits" ]]; then
-    printf '%s\n' "$hits" >&2
-    return 1
-  fi
-  return 0
+  local dir="$1" hit=0 rule class re f line rel
+
+  # 1. A staged file that IS a credential store, by name.
+  while IFS= read -r f; do
+    [[ -n "$f" ]] || continue
+    printf '%s: credential-file\n' "${f#"$dir"/}" >&2
+    hit=1
+  done < <(find "$dir" -type f 2>/dev/null | grep -E "$_PACK_SECRET_FILE_RE" || true)
+
+  # 2. Content. -I skips binaries (avatar.png is staged alongside memory and its
+  # bytes will eventually match any long-enough character class by chance).
+  # NEVER echo the match itself — the report is file:line and the rule that fired,
+  # so a refusal is actionable without the refusal becoming its own leak.
+  for rule in "${_PACK_SECRET_VALUE_RULES[@]}" "${_PACK_SECRET_ASSIGN_RULES[@]}"; do
+    class="${rule%%:*}"; re="${rule#*:}"
+    while IFS= read -r line; do
+      [[ -n "$line" ]] || continue
+      rel="${line#"$dir"/}"
+      printf '%s: %s\n' "$(cut -d: -f1,2 <<<"$rel")" "$class" >&2
+      hit=1
+    # -e is NOT optional: the private-key rule begins with '-' and grep reads a bare
+    # leading-dash pattern as flags. It silently matched nothing, and the miss was
+    # invisible because a fixture holding a PEM block usually trips some other rule too.
+    done < <(grep -rnIE -e "$re" "$dir" 2>/dev/null || true)
+  done
+  return "$hit"
 }
 
 # --- DIVE-2567: the memory leak-check, ENFORCED on the export path -----------
@@ -1610,7 +1670,7 @@ cmd_export() {
   # DIVE-2567: default is the STRICT audience. An operator who wants the scan off
   # has to say which audience they are exporting for; a typo is not a bypass.
   [[ "$audience" == "publish" || "$audience" == "self" ]] \
-    || fail "$E_USAGE" "--audience must be 'publish' (default, memory leak-check enforced) or 'self' (own backup/clone, scan skipped)"
+    || fail "$E_USAGE" "--audience must be 'publish' (default, memory leak-check enforced) or 'self' (own backup/clone, leak-check skipped; the secret tripwire still runs)"
   require_agent "$name"
   local user="agent-${name}" cdir="/home/agent-${name}/.claude"
 
@@ -1634,11 +1694,14 @@ cmd_export() {
       kept="${counts%% *}"; excluded="${counts##* }"
       if (( kept == 0 )); then
         rm -rf "$draft"
-        fail "$E_GENERIC" "nothing shareable: 0 reference/project knowledge facts ($excluded private user/feedback or opted-out facts excluded). Nothing written."
+        fail "$E_GENERIC" "nothing shareable: 0 reference/project knowledge facts ($excluded private user/feedback or opted-out facts excluded). Only metadata.type 'reference' or 'project' facts are eligible — 'user' and 'feedback' are private by definition and never exported. This agent has none of the former, so there is nothing to distil; write the shareable knowledge as reference/project facts first. Nothing written."
       fi
       if ! _pack_secret_tripwire "$draft"; then
         rm -rf "$draft"
-        fail "$E_GENERIC" "a scoped fact tripped the secret tripwire (paths above) — refusing. Tag it 'private: true' or remove the secret, then retry."
+        # DIVE-2679: name the ONE wrong turn this refusal invites. The reporter's next
+        # move was --audience=self, because the usage text presents it as the escape
+        # hatch; it is not one, and finding that out by re-running is a wasted cycle.
+        fail "$E_GENERIC" "a scoped fact tripped the secret tripwire (file:line: rule above) — refusing. Remove the credential from that fact, or tag the fact 'private: true' to exclude it, then retry. NOTE: --audience=self does NOT bypass this — it only skips the operational-detail leak-check; a real token never leaves in either audience."
       fi
       # DIVE-2567: the draft exists to be REVIEWED, so here the leak-check REPORTS
       # rather than refuses — refusing to write the draft would leave the human
@@ -1670,7 +1733,7 @@ cmd_export() {
       (( skept > 0 )) || { rm -rf "$mem_tmp"; fail "$E_GENERIC" "approved dir has 0 shareable knowledge facts after scoping ($sexcl excluded). Nothing sealed."; }
       if ! _pack_secret_tripwire "$mem_tmp"; then
         rm -rf "$mem_tmp"
-        fail "$E_GENERIC" "approved memory tripped the secret tripwire (paths above) — refusing to seal. Remove/tag the secret and retry."
+        fail "$E_GENERIC" "approved memory tripped the secret tripwire (file:line: rule above) — refusing to seal. Remove the credential from that fact, or tag it 'private: true', then retry. --audience=self does NOT bypass this (it only skips the operational-detail leak-check)."
       fi
       (( sexcl > 0 )) && warn "seal dropped $sexcl non-shareable fact(s) from the approved dir (type-gate re-enforced)"
       mem_src="$mem_tmp"
