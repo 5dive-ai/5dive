@@ -2387,6 +2387,15 @@ _hb_stall_sweep() {
                WHERE verifier IS NOT NULL AND maker_agent IS NOT NULL
                  AND assignee=verifier AND status NOT IN ('done','cancelled')
                  AND handoff_delivered_at IS NOT NULL
+                 -- `need_answered_at IS NOT NULL` is SUBSUMED by the comparison at
+                 -- the bottom and is kept only to state the intent (post-answer
+                 -- only) where a reader looks first. Proven, not assumed: in SQLite
+                 -- `NULL <= datetime(...)` is NULL, not true, so an open gate is
+                 -- already excluded by the window clause. Deleting this line reds
+                 -- NOTHING — it is the one clause here that no mutation can grade,
+                 -- so do not read arm A8 as evidence that it works. A8 grades the
+                 -- BEHAVIOUR (an open gate is never nudged); the window clause is
+                 -- what guards it.
                  AND need_type IS NOT NULL AND need_answered_at IS NOT NULL
                  AND gate_answered_nudged_at IS NULL
                  AND parked_at IS NULL
