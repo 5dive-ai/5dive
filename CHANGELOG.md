@@ -21,8 +21,15 @@ readings, a task citing no PRs, a `.env` without the key, a selfcheck naming no 
 a supervisor line naming no ident, a memory pack with no leaks. Empty is the *ordinary*
 case, which is why the class fires on the quiet path and why nobody writes a test for it.
 
-**36 sites guarded** — 34 in `src/`, 2 in `tests/` harnesses that themselves run under
-`set -euo pipefail`. Five were named in the ticket; the sweep found the other 31. The ones
+**36 distinct sites guarded** — 34 in `src/*.sh` (concatenated under `src/header.sh` into
+the bundle) and 2 in `tests/` harnesses that themselves run under `set -euo pipefail`. Five
+were named in the ticket; the sweep found the other 31. The diff carries **38 guard lines for
+those 36 sites**: `src/cmd_council.sh` is GENERATED from `src/council/cmd_council.template.sh`
+by `src/council/gen_cmd.mjs`, so the 2 council sites are guarded in the generator source *and*
+in its derived artifact — a regen from an unguarded template would silently revert the fix.
+The scanner classifies the template as `src/` for that same reason, so its `src/` population is
+**36 lines over 34 distinct sites**: an instrument has to read the file that regenerates
+the tree, even though counting both copies as members would double-count one class member. The ones
 where the guard makes an unreachable handler reachable are the interesting ones:
 `cmd_auth`'s "opencode has no model X — close matches: …" `fail` never printed when there
 were no close matches; `cmd_selfupdate`'s "no release tag resolves" branch was unreachable
@@ -33,7 +40,7 @@ below actually reads, where `|| true` leaves the value to the substitution's beh
 reads as noise-suppression to the next person. And **not** `local var=$(…)`, which returns 0
 unconditionally and so trades a loud death for a silent wrong value.
 
-Two of the 24 were previously unreported and neither was in the ticket:
+Two of the 36 were previously unreported and neither was in the ticket:
 
 - `_pack_memory_leakscan` (`cmd_pack.sh`) ended `… | grep -vE "$exempt" | awk | sort` inside
   the substitution, so **a pack with no leaks at all** made the whole subshell exit 1. Latent
