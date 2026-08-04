@@ -37,6 +37,13 @@ made the refusal honest; this makes it rare.
   when it does not. Each site's **own** wall-clock bound is carried rather than flattened
   to one number — the autodetect scan's 5s is load-bearing because that path is fail-open.
 
+**The remainder, measured rather than left to be discovered.** The bot rail closes this for
+**9 of the 11 repos the merge gate knows about**; `lodar/5dive-blog` and `lodar/5dive-mobile`
+return 404 to the machine account, so a token-less maker still cannot verify a merge there
+and the gate still refuses. That is unchanged behaviour for those two, not a new hole —
+but it is the reason this is "rare", not "gone", and it is the same App-installation gap
+DIVE-2033 tracks on lodar's personal account.
+
 **No credential moves and no agent gains one.** The rail is read-only for the gate,
 `_gh_do` re-derives its own routing class as root and refuses admin, and the bot arm is
 tried only after every caller-credential arm comes back empty — so no close that resolves
