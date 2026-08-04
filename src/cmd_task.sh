@@ -16,6 +16,16 @@ _task_usage() {
                                                      # 'task done' closes). Trivial/low-priority chores skip it automatically
                                                      # — the skip is ANNOUNCED on the add line (DIVE-1880), and an explicit
                                                      # --verifier=<agent> forces the rail ON at ANY priority.
+                            [--customer] [--already-blocked=<what it blocked>]
+                                                     # DIVE-2681 THE FILING CAP: a row whose TITLE reads as our own machinery
+                                                     # (harness, gate, CI, worktree, release-cut, task-engine…) (a) does NOT book
+                                                     # a verifier pass by default — filing one used to cost a row PLUS a grading
+                                                     # round-trip — and (b) is REFUSED when >1 in 4 of the last 20 rows are
+                                                     # already internal. Escapes, both announced, both recorded:
+                                                     #   --customer          the scan is wrong, this is a customer surface
+                                                     #   --already-blocked=  it IS internal and already blocked shipped work
+                                                     #                       (the reason is written into the body)
+                                                     # Fleet override: FIVE_FILING_CAP=0. --verifier=<agent> still forces grading ON.
                             [--task-budget=<tokens|\$cost>]  # per-run spend cap for the on-host loop (DIVE-824)
                                                      # loop spec: declarative verify loop (DIVE-476). --verify is
                                                      # the default cmd for 'task verify'; --verifier grades (writer!=grader)
@@ -486,6 +496,52 @@ _task_is_trivial() {
   [[ -n "$(_task_verify_skip_reason "$1" "$2" "$3")" ]]
 }
 
+# ---------------------------------------------------------------------------
+# THE FILING CAP (DIVE-2681). Two controls over one classifier.
+#
+# The measured problem: across the 508 rows filed in the 8 days to 2026-08-02,
+# 54% concerned our own machinery and 5.5% touched anything a customer sees —
+# roughly 10:1. The fleet audits itself because auditing is always available,
+# and every internal row costs TWICE, because the DIVE-969 rail then books a
+# grading pass against it. The rule has existed as a directive since 2026-08-02
+# and did not hold: the agent that wrote it filed 55 rows the next day. A rule
+# recalled BY TOPIC cannot fire at a MOMENT, and `task add` is the moment.
+#
+# So the cap lives here, at the keystroke, and not in anyone's instructions.
+#
+# THE CLASSIFIER IS A CANDIDATE SET, NEVER AN ACTION SET. A title-keyword scan
+# cannot tell a harness row from a product row that happens to say "queue" —
+# "Free OSS web UI: three views (org chart, queue, gates)" is a customer
+# surface and matches on two words. So every consequence below is (a) announced
+# in the output, never silent, and (b) one declared flag away from off:
+#   --customer          this touches a customer surface; classifier was wrong
+#   --already-blocked=  it IS internal, and it is the stated exception
+# A false positive costs one flag. It never costs the row.
+_task_internal_subject_reason() {
+  local t="${1,,}"
+  # Our own machinery: the task engine, gates, verifier rails, CI, the release
+  # cut, harnesses, the board, agent plumbing. Deliberately narrow — anything
+  # ambiguous is left OUT, because a miss here is cheap and a false hit taxes
+  # someone's real work.
+  [[ "$t" =~ (^|[^a-z])(harness|harnesses|smoke[-_ ]gate|full[-_ ]sweep|pipefail|shellcheck|actionlint|verifier[[:space:]]rail|merge[[:space:]]gate|gate[-_ ]history|task[[:space:]](add|done|need|ls)|taskboard|worktree|worktrees|heartbeat|release[-_ ]cut|version[-_ ]bump|changelog|pre[-_ ]push[[:space:]]hook|ci[[:space:]](check|job|run)|nightly[[:space:]]sweep|budget[-_ ]report)([^a-z]|$) ]] \
+    && { printf 'internal machinery'; return 0; }
+  return 0
+}
+
+# How many of the last N standard rows read as internal machinery. Counted by
+# running the SAME classifier over recent titles rather than storing a column —
+# no schema change, and the count can never disagree with the rule that gates
+# the next add. Prints "<internal> <total>".
+_task_internal_recent_ratio() {
+  local window="${1:-20}" n=0 hits=0 line
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    n=$((n + 1))
+    [[ -n "$(_task_internal_subject_reason "$line")" ]] && hits=$((hits + 1))
+  done < <(db "SELECT REPLACE(title, char(10), ' ') FROM tasks WHERE kind='standard' ORDER BY id DESC LIMIT ${window};")
+  printf '%s %s' "$hits" "$n"
+}
+
 # Resolve the lone org root (the single top of the chart — reports_to NULL or a
 # dangling manager). Prints the name, or nothing when the org is empty or has
 # more than one root (ambiguous — never guess). Mirrors the coordinator's
@@ -645,6 +701,7 @@ cmd_task_add() {
   tasks_db_init
   local body="" priority="medium" assignee="" parent="" from="" recurring="" fresh="" project="dive"
   local accept="" verify_cmd="" max_iters="" verifier="" task_budget="" no_verify="" branch=""
+  local customer_facing="" already_blocked=""
   local -a words=()
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -667,6 +724,14 @@ cmd_task_add() {
       # DIVE-969: explicit opt-out of the verifier-by-default posture. A plain
       # `task done` closes the resulting task directly (no maker→grader handoff).
       --no-verify)   no_verify="1" ;;
+      # DIVE-2681 (the filing cap): the two declared escapes from the internal
+      # classifier. --customer says the scan was WRONG (this is a customer
+      # surface); --already-blocked=<what> says the scan was RIGHT and this is
+      # the stated exception — it already blocked shipped work. The reason is
+      # mandatory on the exception and is written into the body, because an
+      # exception nobody can audit later is not an exception, it is an opt-out.
+      --customer)          customer_facing="1" ;;
+      --already-blocked=*) already_blocked="${1#*=}" ;;
       # DIVE-824: per-run spend cap carried on the row (sibling to verify --timeout).
       # Value is either a bare token count or a "$cost" dollar figure.
       --task-budget=*) task_budget="${1#*=}" ;;
@@ -754,6 +819,34 @@ cmd_task_add() {
     [[ -z "$assignee" ]] && assignee=$(_task_resolve_coordinator)
     [[ -n "$assignee" ]] && auto_coordinated=1
   fi
+  # DIVE-2681: the filing cap, enforced at the keystroke. Classify FIRST, because
+  # the classification feeds two separate controls below (the refusal here, and
+  # the verifier-rail skip further down). --customer declares the classifier
+  # wrong and turns both off; --already-blocked declares the stated exception and
+  # turns off only the refusal, recording its reason in the body.
+  local internal_reason=""
+  if [[ "$kind" == "standard" && -z "$customer_facing" ]]; then
+    internal_reason=$(_task_internal_subject_reason "$title")
+  fi
+  if [[ -n "$internal_reason" && -z "$already_blocked" && "${FIVE_FILING_CAP:-1}" != "0" ]]; then
+    local _hits _win; read -r _hits _win < <(_task_internal_recent_ratio 20)
+    # Only enforce once the window is big enough to mean anything — on a fresh
+    # board a 1-in-4 rule computed over three rows is noise, not a signal.
+    if (( _win >= 8 )) && (( (_hits + 1) * 4 > (_win + 1) )); then
+      fail "$E_VALIDATION" "filing cap: ${_hits} of the last ${_win} rows are already internal machinery — this one would make it $((_hits + 1))/$((_win + 1)), over the 1-in-4 cap.
+An internal-machinery finding gets its own ident ONLY if it has ALREADY blocked shipped work. Otherwise it belongs in the body of the row it was found on, or in the team wiki.
+  · it already blocked something   →  --already-blocked='<what it blocked>'
+  · the scan is wrong, this is a customer surface  →  --customer
+  · fleet-wide override (emergencies)  →  FIVE_FILING_CAP=0"
+    fi
+  fi
+  # The exception is recorded ON THE ROW, not just consumed at the prompt. A cap
+  # you can step over leaves no trace is a cap nobody can audit afterwards.
+  if [[ -n "$already_blocked" ]]; then
+    body="${body:+$body
+
+}FILING-CAP EXCEPTION (already blocked shipped work): ${already_blocked}"
+  fi
   # DIVE-969: verifier-by-default posture. For a NON-TRIVIAL standard task where
   # the creator neither wired the loop themselves (--accept/--verify/--verifier)
   # nor opted out (--no-verify), engage grading by default: derive acceptance
@@ -774,6 +867,14 @@ cmd_task_add() {
   if [[ "$kind" == "standard" && -z "$no_verify" && "${FIVE_VERIFY_DEFAULT:-1}" != "0" \
         && -z "$accept" && -z "$verify_cmd" && -z "$verifier" ]]; then
    verify_skipped=$(_task_verify_skip_reason "$title" "$body" "$priority")
+   # DIVE-2681, the half that actually moves tokens: an internal-machinery row
+   # does not book a grading pass by default. Filing one used to cost a row PLUS
+   # a full verifier round-trip against it, which is how a self-auditing fleet
+   # multiplies its own spend. Announced through the existing DIVE-1880 path —
+   # never silent — and an explicit --verifier=<agent> still forces the rail ON,
+   # exactly as it does for the low-priority skip. This is a DEFAULT, not a
+   # ceiling; `task verifier <id> <agent>` attaches grading afterwards.
+   [[ -z "$verify_skipped" && -n "$internal_reason" ]] && verify_skipped="$internal_reason"
   fi
   if [[ "$kind" == "standard" && -z "$no_verify" && "${FIVE_VERIFY_DEFAULT:-1}" != "0" \
         && -z "$accept" && -z "$verify_cmd" && -z "$verifier" && -z "$verify_skipped" ]]; then
