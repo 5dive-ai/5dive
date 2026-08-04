@@ -398,5 +398,33 @@ else
       "$(grep -c 'cannot read the gate-delivery log' <<<"$out")"
 fi
 
+# --- DIVE-2712: /inbox sends ONE MESSAGE PER GATE, first pings, rest silent -----
+# The defect: every gate shared ONE message with one merged keyboard, so answering
+# any gate retired the keyboard for ALL of them (retire edits the message that
+# delivered the gate, and that message was everyone's). Graded on the SHAPE OF THE
+# SENDS, not by reading the code — the send stub records one line per call.
+SENDS="$TMP/sends.log"; : >"$SENDS"
+_mirror_send() {
+  printf 'send silent=%s markup=%s\n' \
+    "$([[ -n "${FIVEDIVE_NOTIFY_SILENT:-}" && "${FIVEDIVE_NOTIFY_SILENT}" != "0" ]] && echo yes || echo no)" \
+    "$([[ -n "${5:-}" ]] && echo yes || echo no)" >>"$SENDS"
+  printf '%s' '{"ok":true,"result":{"message_id":15491}}'
+}
+seed_gate() { # <id> <ident> <type>
+  db "INSERT INTO tasks (id,ident,title,status,priority,assignee,need_type,tier,ask,recommend,need_options,created_at)
+      VALUES ($1,'$2','t','blocked','high','main','$3',2,'ask?','A','A|B',datetime('now'));" 2>/dev/null
+}
+db "DELETE FROM tasks;" 2>/dev/null
+seed_gate 9001 DIVE-9001 decision
+seed_gate 9002 DIVE-9002 approval
+seed_gate 9003 DIVE-9003 decision
+# Subshell: cmd_task_inbox ends in ok/fail, which exit — `|| true` cannot catch an
+# exit in the current shell, and the harness must survive either outcome.
+( cmd_task_inbox --send ) >/dev/null 2>&1 || true
+chk "3 open gates produce 3 SEPARATE messages, not one digest" "3" "$(grep -c '^send ' "$SENDS" 2>/dev/null || echo 0)"
+chk "the FIRST gate message pings the human" "silent=no" "$(head -1 "$SENDS" 2>/dev/null | grep -o 'silent=[a-z]*')"
+chk "every message after the first is SILENT (one buzz, not N)" "2" "$(tail -n +2 "$SENDS" 2>/dev/null | grep -c 'silent=yes')"
+chk "each gate carries its OWN keyboard" "3" "$(grep -c 'markup=yes' "$SENDS" 2>/dev/null || echo 0)"
+
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" == "0" ]]
