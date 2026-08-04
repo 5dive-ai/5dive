@@ -12,8 +12,23 @@ import os from 'node:os'
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 const R = (p) => fs.readFileSync(path.join(root, p), 'utf-8')
-let pass = 0, fail = 0
+let pass = 0, fail = 0, skipped = 0
 const ok = (name, cond) => { if (cond) { pass++ } else { fail++; console.error(`FAIL: ${name}`) } }
+const skip = (name, reason) => { skipped++; console.error(`SKIP: ${name} — ${reason}`) }
+// Mirrors src/council/cli.mjs's own canDeliver(): root always delivers; otherwise the
+// probe asks sudo whether THIS caller may run the _deliver grant, never prompts, fails
+// closed. DIVE-2703: the --ask-rail path below is refused by the CLI itself ("cannot
+// reach the seat-delivery rail") on any caller without that grant — true on a bare CI
+// runner and on an unprivileged dev box alike — and that refusal is not this contract's
+// subject. Checked with the SAME probe the CLI uses so a real grant re-arms the gate.
+const canDeliver = (bin) => {
+  if (typeof process.getuid === 'function' && process.getuid() === 0) return true
+  try {
+    execFileSync('sudo', ['-n', '-l', bin, 'agent', '_deliver'],
+      { encoding: 'utf-8', timeout: 15000, stdio: ['ignore', 'ignore', 'ignore'] })
+    return true
+  } catch { return false }
+}
 const cliPath = path.join(root, 'src', 'council', 'cli.mjs')
 const runCli = (args, env = {}) => {
   try {
@@ -184,18 +199,30 @@ ok('CNCL-16 ballot REACHES creative (persona lilbro resolved)', /(^|\n)creative(
 ok('CNCL-16 ballot never mints to the bare persona id', !/(^|\n)(theo|lilbro)(\n|$)/.test(asked))
 
 // --ask-rail escape hatch: the OLD `agent ask` pane-scrape still reaches the resolved agent.
-try { fs.writeFileSync(askLog, '') } catch {}
-r = runCli(['convene', 'Ship it?', '--seats=theo,lilbro,main', '--mode=deliberate', '--stamped-at=T', '--ask-rail', '--timeout=5'], REAL)
-ok('CNCL-18 --ask-rail convene exits 0', r.code === 0)
-asked = (() => { try { return fs.readFileSync(askLog, 'utf-8') } catch { return '' } })()
-ok('CNCL-18 --ask-rail REACHES marketing over agent ask', /(^|\n)marketing(\n|$)/.test(asked))
-ok('CNCL-18 --ask-rail REACHES creative over agent ask', /(^|\n)creative(\n|$)/.test(asked))
+const askRailReachable = canDeliver(fakeBin)
+if (askRailReachable) {
+  try { fs.writeFileSync(askLog, '') } catch {}
+  r = runCli(['convene', 'Ship it?', '--seats=theo,lilbro,main', '--mode=deliberate', '--stamped-at=T', '--ask-rail', '--timeout=5'], REAL)
+  ok('CNCL-18 --ask-rail convene exits 0', r.code === 0)
+  asked = (() => { try { return fs.readFileSync(askLog, 'utf-8') } catch { return '' } })()
+  ok('CNCL-18 --ask-rail REACHES marketing over agent ask', /(^|\n)marketing(\n|$)/.test(asked))
+  ok('CNCL-18 --ask-rail REACHES creative over agent ask', /(^|\n)creative(\n|$)/.test(asked))
+} else {
+  const why = 'no _deliver grant reachable here (not root, no passwordless sudo for `agent _deliver`)'
+  skip('CNCL-18 --ask-rail convene exits 0', why)
+  skip('CNCL-18 --ask-rail REACHES marketing over agent ask', why)
+  skip('CNCL-18 --ask-rail REACHES creative over agent ask', why)
+}
 
 // COUNCIL_ASK_RAIL=1 selects the escape hatch too (env parity with the flag).
-try { fs.writeFileSync(askLog, '') } catch {}
-r = runCli(['convene', 'Ship it?', '--seats=main', '--mode=deliberate', '--stamped-at=T', '--timeout=5'], { ...REAL, COUNCIL_ASK_RAIL: '1' })
-asked = (() => { try { return fs.readFileSync(askLog, 'utf-8') } catch { return '' } })()
-ok('CNCL-18 COUNCIL_ASK_RAIL=1 selects the ask rail', r.code === 0 && /(^|\n)main(\n|$)/.test(asked))
+if (askRailReachable) {
+  try { fs.writeFileSync(askLog, '') } catch {}
+  r = runCli(['convene', 'Ship it?', '--seats=main', '--mode=deliberate', '--stamped-at=T', '--timeout=5'], { ...REAL, COUNCIL_ASK_RAIL: '1' })
+  asked = (() => { try { return fs.readFileSync(askLog, 'utf-8') } catch { return '' } })()
+  ok('CNCL-18 COUNCIL_ASK_RAIL=1 selects the ask rail', r.code === 0 && /(^|\n)main(\n|$)/.test(asked))
+} else {
+  skip('CNCL-18 COUNCIL_ASK_RAIL=1 selects the ask rail', 'no _deliver grant reachable here (not root, no passwordless sudo for `agent _deliver`)')
+}
 
 // an unresolvable seat FAILS CLOSED at pre-flight (loud, exit 6) — not a silent abstain.
 r = runCli(['convene', 'Ship it?', '--seats=theo,ghostseat', '--mode=deliberate', '--stamped-at=T'], REAL)
@@ -237,5 +264,5 @@ ok('CNCL-23 rm unknown fails closed (exit 3)', runCli(['schedule', 'rm', 'ghost'
 
 try { fs.rmSync(tmp, { recursive: true, force: true }) } catch {}
 
-console.error(`\nCNCL-6/7/8 CLI contract: ${pass} passed, ${fail} failed`)
+console.error(`\nCNCL-6/7/8 CLI contract: ${pass} passed, ${fail} failed, ${skipped} skipped`)
 process.exit(fail ? 1 : 0)
