@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased — fix(cli): 36 unguarded `$( )` probes that killed the caller on the QUIET path (DIVE-2604)
+## Unreleased — fix(cli): 38 unguarded `$( )` probes that killed the caller on the QUIET path (DIVE-2604)
 
 The class that shipped three times in one day — DIVE-2566 (`5dive push`, `curl -f` rc=22),
 DIVE-2603 (`5dive task done`, rc=1 with **zero bytes on both streams**), DIVE-2598 (the
@@ -21,14 +21,14 @@ readings, a task citing no PRs, a `.env` without the key, a selfcheck naming no 
 a supervisor line naming no ident, a memory pack with no leaks. Empty is the *ordinary*
 case, which is why the class fires on the quiet path and why nobody writes a test for it.
 
-**36 distinct sites guarded** — 34 in `src/*.sh` (concatenated under `src/header.sh` into
-the bundle) and 2 in `tests/` harnesses that themselves run under `set -euo pipefail`. Five
-were named in the ticket; the sweep found the other 31. The diff carries **38 guard lines for
-those 36 sites**: `src/cmd_council.sh` is GENERATED from `src/council/cmd_council.template.sh`
+**38 distinct sites guarded** — 35 in `src/*.sh` (concatenated under `src/header.sh` into
+the bundle) and 3 in `tests/` harnesses that themselves run under `set -euo pipefail`. Five
+were named in the ticket; the sweep found the other 33. The diff carries **40 guard lines for
+those 38 sites**: `src/cmd_council.sh` is GENERATED from `src/council/cmd_council.template.sh`
 by `src/council/gen_cmd.mjs`, so the 2 council sites are guarded in the generator source *and*
 in its derived artifact — a regen from an unguarded template would silently revert the fix.
 The scanner classifies the template as `src/` for that same reason, so its `src/` population is
-**36 lines over 34 distinct sites**: an instrument has to read the file that regenerates
+**37 lines over 35 distinct sites**: an instrument has to read the file that regenerates
 the tree, even though counting both copies as members would double-count one class member. The ones
 where the guard makes an unreachable handler reachable are the interesting ones:
 `cmd_auth`'s "opencode has no model X — close matches: …" `fail` never printed when there
@@ -40,7 +40,7 @@ below actually reads, where `|| true` leaves the value to the substitution's beh
 reads as noise-suppression to the next person. And **not** `local var=$(…)`, which returns 0
 unconditionally and so trades a loud death for a silent wrong value.
 
-Two of the 36 were previously unreported and neither was in the ticket:
+Two of the 38 were previously unreported and neither was in the ticket:
 
 - `_pack_memory_leakscan` (`cmd_pack.sh`) ended `… | grep -vE "$exempt" | awk | sort` inside
   the substitution, so **a pack with no leaks at all** made the whole subshell exit 1. Latent
@@ -64,6 +64,21 @@ flags with a positive control, the remedy's post-condition, the scanner against 
 bad/good input, and — the load-bearing arm — a **mutation** pass that strips the guard off
 each of twelve fixed sites in a copy of the tree and requires the scanner to name that exact
 `file:line` back. `tests/` is held to the same gate at **zero**.
+
+**Two of the 38 were caught by this branch's own scanner, in code that merged the same night
+the sweep was written** — the strongest evidence available that the instrument, not the
+per-line fix, is the deliverable. Rebasing onto `main` turned the scan red:
+
+- `src/cmd_push.sh` (DIVE-2605) — the `--open-pr` *already exists* path. Its pipeline ends in
+  `head`, which exits 0; `pipefail` promotes `grep`'s 1 out of the **middle**. A `gh` message
+  carrying no PR URL therefore killed the caller, and the `ok()` line written to explain that
+  exact situation never printed. The class does not require the pipeline to END in a probe.
+- `tests/create_channel_list_guards_unit.sh` (DIVE-2381) — the sharpest instance yet. The very
+  next line is `[[ -n "$start" ]] || { echo "FAIL: anchor not found …"; exit 1; }`. That
+  handler, written deliberately for the anchor-missing case, **could not run**: the test died
+  at `rc=1` with no output instead of saying "re-anchor this test, do not delete it".
+
+Both were confirmed fatal by *running* the shape with a positive control, not by reading it.
 
 **The scanner's own three bugs are the transferable part**, because every one of them
 reported the tree CLEAN:
