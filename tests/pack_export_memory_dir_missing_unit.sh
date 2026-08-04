@@ -27,6 +27,7 @@
 #
 # Run: bash tests/pack_export_memory_dir_missing_unit.sh
 set -uo pipefail
+trap 'rc=$?; echo "HARNESS-RC=$rc"' EXIT   # DIVE-2692: fires on every exit path (incl. SKIP/precondition-fail early-exits).
 
 # DIVE-2211: name the tree this harness grades.
 . "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh" \
