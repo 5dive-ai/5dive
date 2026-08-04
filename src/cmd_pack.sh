@@ -1718,7 +1718,11 @@ cmd_export() {
   if (( with_memory )); then
     if [[ -z "$approve_memory" ]]; then
       # --- DRAFT phase: scope (L1) + tripwire (L3), write a review draft, STOP.
-      local memdir; memdir=$(_pack_memory_dir "$name")
+      # DIVE-2680: _pack_memory_dir returns 1 (not just empty) when the agent has
+      # no ~/.claude/projects dir at all — true of every non-claude-type seat
+      # (opencode, codex never create it). Unguarded under set -e that assignment
+      # killed the script before the very next line's fail() could print anything.
+      local memdir; memdir=$(_pack_memory_dir "$name") || memdir=""
       [[ -n "$memdir" ]] || fail "$E_NOT_FOUND" "agent '$name' has no persona memory to export"
       local draft="/home/agent-${name}/.claude/pack-staging/memory-draft"
       rm -rf "$draft"; mkdir -p "$draft"
