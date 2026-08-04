@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# TIER: nightly — 24.4s measured (DIVE-2525): does not fit the 300s PR core; the nightly sweep runs it.
+# TIER: nightly — 27s measured on the dev VM 2026-08-04 (DIVE-2719; was 24.4s, DIVE-2525): does not fit the 300s PR core; the nightly sweep runs it.
 # OSS-7 isolated unit harness for the task-core verbs — the most-used surface
 # that had no coverage (only the loop/gate slices were tested). Same isolation
 # contract as the loop harnesses: source src/ directly, point STATE_DIR at a
