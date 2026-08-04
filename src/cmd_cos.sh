@@ -260,7 +260,20 @@ function arg(name: string): string | undefined {
   return p ? p.slice(name.length + 3) : undefined;
 }
 
+// Every failure call site below emits { ok:false, reason, detail } — the shape
+// claim/rotate's internal bash parsing (`.token`/`.reason`) relies on. But
+// src/lib/output.sh's fail() is the ONLY other place in the codebase that sets
+// the documented --json contract's failure shape, {ok:false,error:{message}},
+// and the dashboard's execAgent parses envelopes against that contract
+// literally (DIVE-2331/DIVE-2334, see community/wiki/cos-runner-emits-ok-false-without-an-error-key.md).
+// Inject `error` here instead of at each call site so both shapes are always
+// satisfied without touching the reason/detail parsing.
 function out(obj: Record<string, unknown>): never {
+  if (obj.ok === false && !("error" in obj)) {
+    const message =
+      typeof obj.detail === "string" ? obj.detail : typeof obj.reason === "string" ? obj.reason : "cos command failed";
+    obj = { ...obj, error: { message } };
+  }
   process.stdout.write(JSON.stringify(obj) + "\n");
   process.exit(obj.ok ? 0 : 1);
 }
