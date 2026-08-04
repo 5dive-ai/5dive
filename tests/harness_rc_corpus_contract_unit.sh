@@ -60,7 +60,20 @@ ok "corpus enumerates ${#CORPUS[@]} harnesses"
 # pre-existing ABORT-marker trap, ${VAR:-} hardening for set -u, ...) — the
 # invariant is trap ... HARNESS-RC=$rc ... EXIT co-occurring on one line,
 # which is how bash traps are written throughout this corpus.
-RC_RE='trap.*HARNESS-RC=\$rc.*EXIT'
+#
+# olivia (reviewing this file at e6524ed): presence-and-reference alone is
+# not enough. `trap 'cleanup; rc=$?; echo "HARNESS-RC=$rc"' EXIT` matches a
+# looser regex here but is the EXACT hazard this ticket hand-fixed in 3 files
+# and threaded through cleanup's own $1 in gate_answer_audit_unit.sh: if
+# cleanup runs (or fails) before `rc=$?` captures the real exit code, $? has
+# already been overwritten by cleanup's own status by the time it's read.
+# Measured: `cleanup(){ :; }; trap 'cleanup; rc=$?; echo HARNESS-RC=$rc' EXIT;
+# exit 7` reports HARNESS-RC=0, not 7. The invariant this regex enforces is
+# therefore narrower than "references $rc somewhere" — it requires `rc=$?` to
+# be the FIRST thing the trap body does, before any cleanup can run and
+# disturb $?. Measured against the pushed tree: rejects 0 of 309 (every
+# current file already opens this way).
+RC_RE='trap .rc=\$\?;.*HARNESS-RC=\$rc.*EXIT'
 
 MISSING=()
 for t in "${CORPUS[@]}"; do
@@ -112,6 +125,26 @@ if grep -qE "$RC_RE" "$MUTTMP/cleanup_only_unit.sh"; then
   nok "mutation: a trap with cleanup but no HARNESS-RC echo is (wrongly) reported present"
 else
   ok "mutation: a trap with cleanup but no HARNESS-RC echo is correctly reported MISSING"
+fi
+
+# THE HAZARDOUS ORDERING (olivia's finding): cleanup BEFORE rc=$? captures the
+# real exit code, so by the time it's read $? has already been overwritten by
+# cleanup's own status. This is a static grep check, but its value is what it
+# discriminates at RUNTIME, so confirm both halves: the static detector must
+# reject the file, AND actually running the hazardous form on a real non-zero
+# exit must misreport 0 -- proving there is a live bug here for the detector
+# to be worth rejecting, not just a shape the regex happens to dislike.
+printf '#!/usr/bin/env bash\nset -uo pipefail\ncleanup() { :; }\ntrap '"'"'cleanup; rc=$?; echo "HARNESS-RC=$rc"'"'"' EXIT\nexit 7\n' > "$MUTTMP/hazardous_order_unit.sh"
+if grep -qE "$RC_RE" "$MUTTMP/hazardous_order_unit.sh"; then
+  nok "mutation: the hazardous cleanup-before-rc ordering is (wrongly) reported present"
+else
+  ok "mutation: the hazardous cleanup-before-rc ordering is correctly reported MISSING"
+fi
+HAZ_OUT="$(bash "$MUTTMP/hazardous_order_unit.sh" 2>&1)"
+if [[ "$HAZ_OUT" == *"HARNESS-RC=0"* ]]; then
+  ok "mutation: the hazardous form is a LIVE bug, not just a disliked shape -- exit 7 misreports as HARNESS-RC=0 at runtime"
+else
+  nok "mutation: expected the hazardous form to misreport rc at runtime (got: $HAZ_OUT) -- the arm above is not grading a real hazard"
 fi
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
