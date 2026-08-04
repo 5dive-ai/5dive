@@ -40,6 +40,14 @@
 #   D9  ZERO ACCEPTANCE CHANGE: the gate still refuses what it refused. The constraint
 #       on the ticket is that this must not weaken the merge gate or add failure modes.
 #
+# HOW "NO ACCEPTANCE CHANGE" IS PROVEN RATHER THAN ASSERTED. Under M1 — the helper
+# neutered to `:` — SEVEN arms go red and every one of them is a MESSAGE assertion. Not
+# one status arm and not one refusal-count arm moves: D1-D6 still close, D7 still refuses
+# with its one policy_refusals row, D9 is untouched. A function whose total removal cannot
+# move any verdict is not in the acceptance decision, and that is a stronger statement than
+# reading the diff and observing that only strings were appended. M7 supplies the missing
+# half — that the verdict arms can move at all.
+#
 # MUTATION GRADE — RUN, not predicted. Baseline 21/0; each mutant applied to the
 # committed tree, `git checkout --` between, tree clean before and after:
 #   M1  `_gate_merged_not_deployed() { :; }`      -> 14/7: every note arm on all four
@@ -54,6 +62,14 @@
 #   M5  revert ONLY the D2 call site              -> 16/5: D2, and D5/D6 with it since
 #                                                   they accept through the same
 #                                                   attribution arm, plus both D8 arms.
+#   M7  neuter `policy_refuse ... done-before-branch-merged` on the branch path
+#                                                 -> 20/1: D7 alone. This is what makes
+#                                                   "no acceptance change" a MEASUREMENT
+#                                                   rather than a claim, from the other
+#                                                   direction: D7 demonstrably reds when a
+#                                                   refusal stops happening, so its green
+#                                                   under this change means the refusal
+#                                                   still happens.
 #   M6  ANCHOR: put `--category=host` back into the GENERIC half (its first shape)
 #                                                 -> 19/2: D5 and D6, the two arms added
 #                                                   for it. A fix nobody can red is a fix
