@@ -140,8 +140,16 @@ grade "M9-form-not-recorded" "CS1 records the form as channel-session" \
 # ── the tier-2 floor itself, which is the ONLY guard on a decision gate ──────
 # The approval/secret/manual evidence block does not run for `decision`, so if the
 # citation stopped raising `human` the decision arms would be the ones to notice.
+#
+# RE-ANCHORED 2026-08-04 (DIVE-2589). DIVE-2588 (#399) dropped the
+# `&& _gate_proof_enforced` conjunct from this floor — it was a rollout envelope the
+# constrained party could switch off — so the anchor stopped matching and this mutant
+# reported "mutation applies to the current source", i.e. it graded NOTHING and said
+# so. That is the harness's own self-check working exactly as its header promises,
+# and it is why the mutation is asserted to apply rather than assumed to: a
+# no-op mutant is otherwise indistinguishable from a killed one.
 grade "M10-floor-provenance" "CS11 the same tier-2 DECISION gate REFUSES" \
-  '  if [[ "$gtier" == "2" ]] && (( ! human )) && _gate_proof_enforced; then' \
+  '  if [[ "$gtier" == "2" ]] && (( ! human )); then' \
   '  if false; then'
 
 # ── the freshness bound, which iteration 1 let the caller set ────────────────
