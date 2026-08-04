@@ -50,7 +50,8 @@ and fails on any bare assignment whose substitution contains a probe — `grep`/
 whether a non-zero exit is a defect depends on whether the probe is *allowed* to find
 nothing, which is a fact about intent, so the scanner encodes that intent as a command list.
 
-`tests/unguarded_probe_substitution_unit.sh` (37 arms, 3.3s, core tier) grades it by
+`tests/unguarded_probe_substitution_unit.sh` (42 arms, 5.9s measured on the control plane,
+core tier) grades it by
 **running** the shapes rather than grepping for guards: each of four shapes under the real
 flags with a positive control, the remedy's post-condition, the scanner against synthetic
 bad/good input, and — the load-bearing arm — a **mutation** pass that strips the guard off
