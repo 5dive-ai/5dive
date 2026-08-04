@@ -169,6 +169,17 @@ i3=$(db "SELECT iteration FROM tasks WHERE id=$rid;")
   && ok_t "T8 a delivery after a verifier reject DOES bump the counter" \
   || bad_t "T8 rework not counted" "iteration=$i3 (want 2)"
 
+# T8b — the reject is a TOKEN and the delivery SPENDS it. Graded directly, because
+# the alternative implementation (compare handoff_rejected_at against
+# handoff_delivered_at) is observationally identical to this one whenever the two
+# writes land in different seconds — and passes T9 by luck on a slow box while
+# failing it on CI, which is exactly what happened. Asserting the clear makes the
+# distinction visible without depending on how fast the machine is.
+spent=$(db "SELECT COALESCE(handoff_rejected_at,'CLEARED') FROM tasks WHERE id=$rid;")
+[[ "$spent" == "CLEARED" ]] \
+  && ok_t "T8b the delivery that counts a reject also consumes it" \
+  || bad_t "T8b reject token not consumed" "handoff_rejected_at=$spent"
+
 # T9 — and the restore rule still holds on the far side of a real bump, so the
 # reject clock is compared against the CURRENT delivery and not merely "ever set".
 # Without this arm T8 would also pass on a naive "bump whenever handoff_rejected_at

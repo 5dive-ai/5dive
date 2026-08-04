@@ -364,11 +364,15 @@ CREATE TABLE IF NOT EXISTS tasks (
   -- DIVE-2624: handoff_rejected_at stamps the verifier's FAIL bounce
   -- (cmd_task_reject). It exists so `iteration` can mean what every reader already
   -- assumes it means — verifier rejections — instead of "number of task done calls".
-  -- Compared against handoff_delivered_at at the next delivery: a reject at or after
-  -- the current delivery clock is a real second pass, anything else is a re-delivery
-  -- of the same pass (e.g. restoring a handoff a gate filing destroyed) and must not
-  -- bump. Never cleared: the comparison against the delivery clock is what makes it
-  -- self-expiring.
+  -- It is a ONE-SHOT TOKEN, not a clock to compare: the next delivery bumps the
+  -- counter iff this is set (or it is the first delivery ever) and CLEARS it in the
+  -- same UPDATE. A re-delivery with no reject outstanding — restoring a handoff, say
+  -- — therefore does not bump. Deliberately not compared against
+  -- handoff_delivered_at: both are datetime('now') at one-second resolution, so a
+  -- reject and the delivery answering it land in the same second often enough that
+  -- either side of that tie is wrong somewhere. The timestamp is kept (rather than a
+  -- boolean) because WHEN the bounce happened is worth having; only the ordering
+  -- decision is made by presence.
   handoff_delivered_at    TEXT,
   handoff_stale_pinged_at TEXT,
   handoff_rejected_at     TEXT,

@@ -3689,22 +3689,28 @@ _task_route_to_verifier() {
   # the maker had to write "that bump was a restore" into the result by hand.
   #
   # A pass counts when the verifier REJECTED it, and that is the only signal that
-  # can distinguish the two — `handoff_delivered_at IS NOT NULL` alone cannot,
-  # because it is equally true of a genuine second pass after a bounce-back.
-  # cmd_task_reject stamps handoff_rejected_at on the bounce; a reject at or after
-  # the current delivery clock is a real rework, anything else is a re-delivery of
-  # the same pass. `>=` and not `>`: a reject in the SAME second as the delivery it
-  # rejects is still a reject, and both clocks have one-second resolution.
+  # can distinguish the two — handoff_delivered_at IS NOT NULL alone cannot, because
+  # it is equally true of a genuine second pass after a bounce-back. cmd_task_reject
+  # stamps handoff_rejected_at on the bounce, and THIS delivery spends it.
+  #
+  # A TOKEN, NOT A CLOCK COMPARISON, and the first cut got that wrong. Comparing
+  # handoff_rejected_at against handoff_delivered_at looks equivalent and is not:
+  # both are datetime('now') at ONE-SECOND resolution, so a reject and the delivery
+  # that answers it routinely land in the SAME second. Any comparison then has to
+  # pick a side of the tie and is wrong on the other — `>=` leaves the reject looking
+  # permanently outstanding, so every later re-delivery re-bumps; `>` drops a reject
+  # answered inside a second. My local box was slow enough to separate them and
+  # passed; CI was not, and T9 came back iteration=3. Consuming the token has no tie
+  # to break: the reject is spent exactly once, whatever the clock says.
   local prev_iter; prev_iter=$(db "SELECT COALESCE(iteration,0) FROM tasks WHERE id=${id};")
   db "UPDATE tasks
         SET status='todo', assignee=$(sqlq "$vfier"),
             maker_agent=COALESCE(maker_agent, $(sqlq_or_null "$maker")),
             iteration=CASE
-              WHEN handoff_delivered_at IS NOT NULL
-                   AND (handoff_rejected_at IS NULL
-                        OR handoff_rejected_at < handoff_delivered_at)
-              THEN COALESCE(iteration,0)
-              ELSE COALESCE(iteration,0)+1 END,
+              WHEN handoff_delivered_at IS NULL OR handoff_rejected_at IS NOT NULL
+              THEN COALESCE(iteration,0)+1
+              ELSE COALESCE(iteration,0) END,
+            handoff_rejected_at=NULL,
             started_at=NULL, handoff_ack_at=NULL,
             handoff_delivered_at=datetime('now'), handoff_stale_pinged_at=NULL${set_result}
       WHERE id=${id};"
