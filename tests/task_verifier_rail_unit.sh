@@ -317,5 +317,44 @@ kill_json=$(FIVE_FILING_CAP=0 run add --assignee=alice --priority=high -- "yet a
   && ok_t "T11i FIVE_FILING_CAP=0 disables the refusal fleet-wide" \
   || bad_t "T11i FIVE_FILING_CAP=0 disables the refusal fleet-wide" "$kill_json"
 
+# --- T12: THE CAP PATH SURVIVES `set -e`, which is how it ships -------------
+# This harness runs under `set +e` (line ~52) so that arms can assert non-zero
+# exits. That is correct for the arms — and it meant T11a-i could not see the
+# defect they were supposedly covering: `_task_internal_recent_ratio` printed
+# with no trailing newline, the caller's `read` returned 1 at EOF, and under
+# src/header.sh's real `set -euo pipefail` `task add` died before any error
+# path printed. 32/32 green, and the shipped command was broken for every
+# internal title. A test that disables the condition it is testing under is
+# not a test of that condition.
+#
+# So this arm restores the SHIPPING shell options around the call and asserts
+# the classifier path returns a value instead of killing the shell.
+db "DELETE FROM tasks;"
+for i in 1 2 3 4 5 6 7 8; do
+  run add --assignee=alice --priority=medium -- "ship customer feature ${i}" >/dev/null
+done
+sete_out=$( set -euo pipefail
+            _task_internal_recent_ratio 20 ) ; sete_rc=$?
+[[ $sete_rc -eq 0 && "$sete_out" =~ ^[0-9]+\ [0-9]+$ ]] \
+  && ok_t "T12a the ratio helper returns 'N M' under set -euo pipefail (not a silent death)" \
+  || bad_t "T12a the ratio helper returns 'N M' under set -euo pipefail (not a silent death)" "rc=$sete_rc out='$sete_out'"
+
+# T12b: the CALLER's read is the site that actually died. Reproduce the exact
+# construct under the shipping options, with a positive control on the value.
+readback=$( set -euo pipefail
+            _h=0; _w=0; read -r _h _w < <(_task_internal_recent_ratio 20) || true
+            printf 'h=%s w=%s' "$_h" "$_w" ) ; read_rc=$?
+[[ $read_rc -eq 0 && "$readback" == "h=0 w=8" ]] \
+  && ok_t "T12b the caller's read survives set -e AND reads the right window (0 internal of 8)" \
+  || bad_t "T12b the caller's read survives set -e AND reads the right window (0 internal of 8)" "rc=$read_rc '$readback'"
+
+# T12c: end-to-end — an internal-titled add under the shipping options either
+# creates a row or refuses, but ALWAYS says something. Silence is the bug.
+e2e_out=$( set -euo pipefail
+           JSON_MODE=0; cmd_task_add --assignee=alice --priority=high -- "the nightly sweep harness is flaky" 2>&1 ) ; e2e_rc=$?
+[[ -n "$e2e_out" ]] \
+  && ok_t "T12c an internal-titled add under set -e produces OUTPUT, never a silent exit" \
+  || bad_t "T12c an internal-titled add under set -e produces OUTPUT, never a silent exit" "rc=$e2e_rc (empty output)"
+
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]
