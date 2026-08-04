@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
-# TIER: nightly — the core PR tier measured 270s of a 300s cap (DIVE-2525), so a new
-# harness goes to the nightly sweep rather than eating the remaining headroom.
+# TIER: nightly — 5.0s measured on the 5dive dev host (slowest of three consecutive
+# local runs of this file; 4.3/4.7/5.0). Demotion is argued, not defaulted: the core PR
+# tier last read 270s against its 300s cap (DIVE-2525), so 30s of headroom is all that
+# is left for every future harness, and this file needs no PR-time signal that the
+# nightly sweep cannot give a day later.
 #
 # DIVE-2641 isolated unit harness — EVERY accepting arm of the merge gate must say
 # what it did NOT establish.
@@ -37,16 +40,28 @@
 #   D9  ZERO ACCEPTANCE CHANGE: the gate still refuses what it refused. The constraint
 #       on the ticket is that this must not weaken the merge gate or add failure modes.
 #
-# MUTATION GRADE (run by hand against src/cmd_task.sh; each must go red):
-#   * `_gate_merged_not_deployed() { :; }`            -> D1-D6 FAIL (all four paths).
-#   * drop the `case` from the helper (always print the generic half only)
-#                                                     -> D1-D4, D6 FAIL.
-#   * make the helper print the prompt unconditionally (delete the `case`, print the
-#     CLI arm always)                                 -> D5 FAILS (and only D5 — that
-#     is the arm that exists for it).
-#   * revert ANY ONE call site                        -> that path's case FAILS and the
-#     other three still pass, which is the point of one case per path.
-#   * revert any one call site                        -> D8 FAILS structurally too.
+# MUTATION GRADE — RUN, not predicted. Baseline 21/0; each mutant applied to the
+# committed tree, `git checkout --` between, tree clean before and after:
+#   M1  `_gate_merged_not_deployed() { :; }`      -> 14/7: every note arm on all four
+#                                                   paths, plus D5 and D6.
+#   M2  helper keeps the generic half, `case` cut -> 16/5: D1-D4 and D6, i.e. the
+#                                                   prompt is graded on every path.
+#   M3  helper prints the CLI prompt UNCONDITIONALLY (the keying cut)
+#                                                 -> 19/2: D5 (the arm that exists for
+#                                                   it) and D6 (wrong surface cited).
+#   M4  revert ONLY the D1 call site              -> 17/4: D1's two note arms and BOTH
+#                                                   D8 arms (shape + non-vacuity).
+#   M5  revert ONLY the D2 call site              -> 16/5: D2, and D5/D6 with it since
+#                                                   they accept through the same
+#                                                   attribution arm, plus both D8 arms.
+# WHAT THE FIRST RUN CORRECTED, recorded because the prediction was wrong in a way that
+# would have shipped: M2 was predicted to red D1-D4 and, run against the FIRST version of
+# this file, it red only D1 and D6 (19/2). D2/D3/D4 asserted the SURFACE string, which the
+# generic half also contains, so deleting the prompt entirely could not move them. They
+# now assert $PROMPT as well and M2 was RE-RUN against the tightened arms for the 16/5
+# above — a mutant graded before the test changed is a reading of a file that no longer
+# exists. The mutation is what found the hole, which is the argument for grading a suite
+# by mutation rather than by reading its assertions.
 # Isolation matches the sibling gate harnesses: source src/ into a throwaway STATE_DIR
 # (the live tasks.db is NEVER touched); gh is STUBBED on PATH.
 # Run: bash tests/task_merge_gate_deploy_note_unit.sh  (no root, no network).
@@ -206,8 +221,9 @@ run_done DEP-2 --result='landed by delegated push'
 [[ $RC -eq 0 && "$(statusof DEP-2)" == "done" && "$(refusals DEP-2)" == "0" ]] \
   && ok_t 'D2: the attribution arm still closes (acceptance unchanged)' \
   || bad_t 'D2 must close' "rc=$RC status=$(statusof DEP-2) refusals=$(refusals DEP-2) out=$OUT"
-[[ "$OUT" == *"names DEP-2 in its SUBJECT"* && "$OUT" == *"$NOTE"* && "$OUT" == *"$CLI_SURFACE"* ]] \
-  && ok_t 'D2: the ATTRIBUTION receipt carries the note and the surface' \
+[[ "$OUT" == *"names DEP-2 in its SUBJECT"* && "$OUT" == *"$NOTE"* \
+   && "$OUT" == *"$PROMPT"* && "$OUT" == *"$CLI_SURFACE"* ]] \
+  && ok_t 'D2: the ATTRIBUTION receipt carries the note, the prompt and the surface' \
   || bad_t 'D2 attribution arm must carry the note' "out=$OUT"
 
 # --- D3. `Branch:` binding, MERGED PR for the head ----------------------------
@@ -219,8 +235,9 @@ run_done DEP-3 --result='squash-merged'
 [[ $RC -eq 0 && "$(statusof DEP-3)" == "done" && "$(refusals DEP-3)" == "0" ]] \
   && ok_t 'D3: the merged-PR arm still closes (acceptance unchanged)' \
   || bad_t 'D3 must close' "rc=$RC status=$(statusof DEP-3) refusals=$(refusals DEP-3) out=$OUT"
-[[ "$OUT" == *"is the head of a MERGED PR"* && "$OUT" == *"$NOTE"* && "$OUT" == *"$CLI_SURFACE"* ]] \
-  && ok_t 'D3: the MERGED-PR receipt carries the note and the surface' \
+[[ "$OUT" == *"is the head of a MERGED PR"* && "$OUT" == *"$NOTE"* \
+   && "$OUT" == *"$PROMPT"* && "$OUT" == *"$CLI_SURFACE"* ]] \
+  && ok_t 'D3: the MERGED-PR receipt carries the note, the prompt and the surface' \
   || bad_t 'D3 merged-PR arm must carry the note' "out=$OUT"
 
 # --- D4. branch named in the RESULT/BODY (DIVE-2577) --------------------------
@@ -231,8 +248,9 @@ run_done DEP-4 --result='landed via delegated push on branch dep-4-maker-credit'
 [[ $RC -eq 0 && "$(statusof DEP-4)" == "done" && "$(refusals DEP-4)" == "0" ]] \
   && ok_t 'D4: the result/body branch arm still closes (acceptance unchanged)' \
   || bad_t 'D4 must close' "rc=$RC status=$(statusof DEP-4) refusals=$(refusals DEP-4) out=$OUT"
-[[ "$OUT" == *"named in the result/body"* && "$OUT" == *"$NOTE"* && "$OUT" == *"$CLI_SURFACE"* ]] \
-  && ok_t 'D4: the result/body receipt carries the note and the surface' \
+[[ "$OUT" == *"named in the result/body"* && "$OUT" == *"$NOTE"* \
+   && "$OUT" == *"$PROMPT"* && "$OUT" == *"$CLI_SURFACE"* ]] \
+  && ok_t 'D4: the result/body receipt carries the note, the prompt and the surface' \
   || bad_t 'D4 result/body arm must carry the note' "out=$OUT"
 
 # --- D5. THE DIFFERENTIAL: a repo that ships no installed artifact ------------
