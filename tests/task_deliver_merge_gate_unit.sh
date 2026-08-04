@@ -376,7 +376,113 @@ out=$(cmd_task_done DIVE-265 --result="PASS. graded-sha: $OTHER_SHA" 2>&1); rc=$
 [[ -z "$(_gate_graded_sha "graded-sha: nothex")" ]] \
   && ok_t "Te9d extractor ignores a non-hex label value" \
   || bad_t "Te9d" "got=$(_gate_graded_sha "graded-sha: nothex")"
+# --- Tg: DIVE-2682 — a binding that PREDATES the current loop iteration is stale,
+#     and a close on it is refused. Graded by mutation, both arms, because a fix
+#     that only ever refuses passes the refusing arm trivially. ------------------
+iterof()  { db "SELECT COALESCE(iteration,0) FROM tasks WHERE ident='$1';"; }
+binditerof() { db "SELECT COALESCE(CAST(delivery_ref_iteration AS TEXT),'NULL') FROM tasks WHERE ident='$1';"; }
+PR2="https://github.com/5dive-ai/5dive/pull/1000"
 
+# The well-behaved delivery first: deliver stamps the binding's iteration in the
+# SAME update that bumps the counter, so the two agree. If these ever disagree at
+# this point the ordering hazard is live and every arm below is meaningless.
+seed_task DIVE-270 main dev
+cmd_task_deliver DIVE-270 --pr="$PR" >/dev/null 2>&1
+[[ "$(iterof DIVE-270)" == "1" && "$(binditerof DIVE-270)" == "1" ]] \
+  && ok_t "Tg0 ROUTING deliver stamps binding-iteration == iteration (no two-moment read)" \
+  || bad_t "Tg0 stamp/bump agree" "iter=$(iterof DIVE-270) bind=$(binditerof DIVE-270)"
+
+# ARM (a): the loop bounces and the maker re-delivers WITHOUT re-pointing the
+# binding — `task done` from the maker routes to the verifier again and bumps the
+# counter, leaving the binding behind at iteration 1. The close must REFUSE.
+db "UPDATE tasks SET assignee='main', status='in_progress', handoff_rejected_at=datetime('now') WHERE ident='DIVE-270';"   # verifier rejected → back to maker
+( actor_seam_as main; cmd_task_done DIVE-270 --result="fixed, re-delivering" ) >/dev/null 2>&1
+[[ "$(iterof DIVE-270)" == "2" && "$(binditerof DIVE-270)" == "1" ]] \
+  && ok_t "Tga re-delivery bumps the counter and leaves the binding at its old iteration" \
+  || bad_t "Tga stale gap created" "iter=$(iterof DIVE-270) bind=$(binditerof DIVE-270)"
+export GH_STUB_STATE="MERGED" GH_STUB_MERGED="2026-08-04T00:00:00Z"
+out=$( actor_seam_as dev; cmd_task_done DIVE-270 2>&1 ); rc=$?
+[[ $rc -eq $E_CONFLICT ]] \
+  && ok_t "Tga close on a STALE binding is REFUSED even though the PR is MERGED" \
+  || bad_t "Tga refused rc" "rc=$rc (want $E_CONFLICT) out=$out"
+[[ "$out" == *"DIVE-2682"* || "$out" == *"iteration"* ]] \
+  && ok_t "Tga the refusal names the iteration mismatch, not the merge state" \
+  || bad_t "Tga refusal message" "out=$out"
+[[ "$(statusof DIVE-270)" != "done" ]] \
+  && ok_t "Tga the task did NOT close" \
+  || bad_t "Tga task closed anyway" "status=$(statusof DIVE-270)"
+
+# ARM (b) — THE CONTROL, and the one that catches the ordering hazard. Same loop,
+# but the maker RE-POINTS the binding with `task deliver --pr=<new>`. The stamp
+# and the bump happen in one update, so they agree, and the close is ACCEPTED.
+# Without this arm a fix that refuses unconditionally would pass arm (a) and look
+# correct while blocking every legitimate close on the board.
+seed_task DIVE-271 main dev
+cmd_task_deliver DIVE-271 --pr="$PR" >/dev/null 2>&1
+db "UPDATE tasks SET assignee='main', status='in_progress', handoff_rejected_at=datetime('now') WHERE ident='DIVE-271';"   # rejected → back to maker
+( actor_seam_as main; cmd_task_deliver DIVE-271 --pr="$PR2" ) >/dev/null 2>&1
+[[ "$(iterof DIVE-271)" == "2" && "$(binditerof DIVE-271)" == "2" ]] \
+  && ok_t "Tgb re-pointing the binding stamps it at the NEW iteration (no false refuse)" \
+  || bad_t "Tgb re-point stamp" "iter=$(iterof DIVE-271) bind=$(binditerof DIVE-271)"
+out=$( actor_seam_as dev; cmd_task_done DIVE-271 2>&1 ); rc=$?
+[[ $rc -eq 0 && "$(statusof DIVE-271)" == "done" ]] \
+  && ok_t "Tgb close on a RE-POINTED binding is ACCEPTED and the task closes" \
+  || bad_t "Tgb accepted" "rc=$rc status=$(statusof DIVE-271) out=$out"
+
+# ARM (d) — THE REMEDY ARM, and it INHERITS arm (a)'s refused row rather than
+# re-seeding one that resembles it. dev's reject (iteration 1) found that arm (b),
+# though an honest control, re-seeds assignee='main' BEFORE re-pointing, which puts
+# it on the ROUTING deliver arm. A real maker reading the refusal is not there: the
+# gate fires on a VERIFIER's close, so at that instant assignee IS the verifier and
+# `task deliver --pr=<new>` takes the NON-routing arm. That arm stamped nothing, so
+# the remedy the refusal printed re-pointed the binding for real and then refused
+# again, naming the CORRECT new PR as "recorded at loop iteration 1".
+# A refusal that prints an instruction has made a testable claim about reachability.
+# This arm runs that instruction VERBATIM, from the state the refusal left behind.
+[[ "$(assigneeof DIVE-270)" == "dev" && "$(iterof DIVE-270)" == "2" && "$(binditerof DIVE-270)" == "1" ]] \
+  && ok_t "Tgd inherits arm (a)'s refused row (assignee=verifier, iter=2, bind=1)" \
+  || bad_t "Tgd wrong start state" "assignee=$(assigneeof DIVE-270) iter=$(iterof DIVE-270) bind=$(binditerof DIVE-270)"
+( actor_seam_as main; cmd_task_deliver DIVE-270 --pr="$PR2" ) >/dev/null 2>&1
+[[ "$(iterof DIVE-270)" == "2" && "$(binditerof DIVE-270)" == "2" ]] \
+  && ok_t "Tgd the printed remedy stamps the binding at the CURRENT iteration, no bump" \
+  || bad_t "Tgd remedy did not move the stamp" "iter=$(iterof DIVE-270) bind=$(binditerof DIVE-270)"
+out=$( actor_seam_as dev; cmd_task_done DIVE-270 2>&1 ); rc=$?
+[[ $rc -eq 0 && "$(statusof DIVE-270)" == "done" ]] \
+  && ok_t "Tgd following the refusal's OWN remedy makes the close succeed" \
+  || bad_t "Tgd remedy is inert — false refuse on a correctly-bound row" "rc=$rc status=$(statusof DIVE-270) out=$out"
+
+# ARM (e) — THE SAME-PASS RE-DELIVERY, and it exists because the first version of
+# this fix was UNGRADED. DIVE-2624 made the counter's bump CONDITIONAL ("re-delivery
+# of the same pass, not rework": iteration moves only on a first delivery or after a
+# reject). The stamp was still an unconditional +1, so a same-pass re-delivery left
+# bind = iter+1 — a state the guard's predicate (bind < iter) can NEVER flag, i.e. it
+# fails SILENTLY. Every other arm here bounces via handoff_rejected_at, which takes
+# the +1 branch and makes the two forms identical, so mutating the CASE back to +1
+# scored 41/0 and proved nothing. This arm is the one that reds it.
+seed_task DIVE-273 main dev
+cmd_task_deliver DIVE-273 --pr="$PR" >/dev/null 2>&1
+# Re-deliver with NO reject in between: assignee back to the maker, handoff_rejected_at
+# left NULL — the "same pass" state.
+db "UPDATE tasks SET assignee='main', status='in_progress' WHERE ident='DIVE-273';"
+( actor_seam_as main; cmd_task_deliver DIVE-273 --pr="$PR2" ) >/dev/null 2>&1
+[[ "$(iterof DIVE-273)" == "$(binditerof DIVE-273)" ]] \
+  && ok_t "Tge same-pass re-delivery keeps stamp == counter (no silent bind>iter)" \
+  || bad_t "Tge stamp outran the counter" "iter=$(iterof DIVE-273) bind=$(binditerof DIVE-273)"
+out=$( actor_seam_as dev; cmd_task_done DIVE-273 2>&1 ); rc=$?
+[[ $rc -eq 0 && "$(statusof DIVE-273)" == "done" ]] \
+  && ok_t "Tge and the close is ACCEPTED (bind>iter would have been unflaggable, not refused)" \
+  || bad_t "Tge same-pass close" "rc=$rc status=$(statusof DIVE-273) out=$out"
+
+# ARM (c): a row bound BEFORE this column existed has a NULL stamp. NULL is not
+# stale — "I cannot judge" must never become a refusal, or the gate false-REDs
+# every legacy row on the board the moment it ships.
+seed_task DIVE-272 main dev
+cmd_task_deliver DIVE-272 --pr="$PR" >/dev/null 2>&1
+db "UPDATE tasks SET delivery_ref_iteration=NULL, iteration=7 WHERE ident='DIVE-272';"
+out=$( actor_seam_as dev; cmd_task_done DIVE-272 2>&1 ); rc=$?
+[[ $rc -eq 0 && "$(statusof DIVE-272)" == "done" ]] \
+  && ok_t "Tgc a NULL binding-iteration (legacy row) is NOT treated as stale" \
+  || bad_t "Tgc legacy row false-refused" "rc=$rc status=$(statusof DIVE-272) out=$out"
 echo "-----"
 printf 'task_deliver_merge_gate_unit: %d passed, %d failed\n' "$PASS" "$FAIL"
 [[ $FAIL -eq 0 ]]
