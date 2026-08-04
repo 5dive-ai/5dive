@@ -1302,6 +1302,84 @@ _gate_gh_token() {
   printf ''
 }
 
+# DIVE-2605: THE BOT RAIL — a second way to ASK GitHub, for callers who can never
+# HOLD a token.
+#
+# Everything above resolves a token the caller may then use. For a standard-isolation
+# builder that resolution is empty by construction, and DIVE-2318 already wrote down
+# why: their sudoers is `ALL=(root) NOPASSWD: /usr/local/bin/5dive *`, which permits
+# exactly one binary as root and nothing as `claude`, so the last-resort arm above
+# ("sudo -n -u claude gh auth token") exits "a password is required". Measured again
+# 2026-08-04 from agent-dev2's own uid, which is the only uid the answer is true of.
+#
+# DIVE-2318 made that refusal HONEST — it stopped rendering "no credential" as "not
+# merged". This makes it RARE. The same builder that cannot borrow a token CAN run
+# `sudo -n /usr/local/bin/5dive _gh_do`: it is that one permitted binary, and DIVE-2448
+# already built it to read the machine account's PAT root-side and exec gh with it.
+# Measured from agent-dev2: `_gh_do` returns `5dive-bot` for `api user` and answers
+# `pr view 430 --repo 5dive-ai/5dive --json state,mergedAt` with real state. The rail
+# the gate needs was already shipped; nothing routed the gate onto it.
+#
+# WHY THIS DOES NOT WEAKEN THE GATE. The rail is READ-ONLY here (`pr view`, `pr list`,
+# `api` GETs) and `_gh_do` re-derives its own routing class as root, so a caller cannot
+# talk it into a write. It is tried ONLY after every caller-credential arm comes back
+# empty, so no close that resolves a token today changes path at all.
+#
+# WHY THE BOT AND NOT THE CALLER, when `5dive gh` routes reads the other way: that
+# preference exists because the bot's visibility is NARROWER, so routing a read there
+# could turn a working query into a 404. That trade needs a working caller credential
+# to be a trade. Here there is none — the choice is the bot or no query — and a repo
+# the bot cannot see still yields empty, which is the SAME unverified verdict the
+# caller gets today. This arm can only ever add answers, never subtract one.
+readonly _GATE_GH_DO=/usr/local/bin/5dive
+
+# _gate_gh_bot_ok — 0 when THIS caller may route through the root-only `_gh_do`.
+# Asks sudo, not the sudoers text: `sudo -n -l <cmd>` is 0 exactly when this account
+# may run it, which is the property that matters and the one an admin's blanket
+# `NOPASSWD: ALL` also satisfies. No network, no token, no side effect.
+_gate_gh_bot_ok() {
+  command -v sudo >/dev/null 2>&1 || return 1
+  [[ -x "$_GATE_GH_DO" ]] || return 1
+  sudo -n -l "$_GATE_GH_DO" _gh_do >/dev/null 2>&1
+}
+
+# _gate_gh_reachable <tok> — 0 when SOME way to ask GitHub exists. This is the
+# predicate the refusals want; `[[ -z "$tok" ]]` was only ever a proxy for it, and
+# it stopped being a correct one the moment a second rail existed.
+_gate_gh_reachable() {
+  [[ -n "${1:-}" ]] && return 0
+  _gate_gh_bot_ok
+}
+
+# _gate_gh <tok> <secs> <gh args...> — run ONE read-only gh call by whichever rail
+# is available, printing gh's stdout and nothing else. Empty output keeps its
+# existing meaning at every call site: COULD NOT RESOLVE, never "fine".
+#
+# <secs> is the call site's OWN wall-clock bound, carried in rather than fixed here:
+# the sites do not agree (10s on the declared-ref probes, 5s on the fail-open
+# autodetect scan, none at all on four others) and each number is load-bearing where
+# it sits — the 5s one is what keeps a slow gh from stalling a close that is allowed
+# to proceed. `0` means the site had no bound and keeps none on the token rail.
+# The BOT rail is always bounded (10s when the site names nothing) because it spends
+# a sudo round-trip on top of the network, and an unbounded new rail is a new way to
+# hang a close.
+#
+# Args reach `_gh_do` NUL-separated over STDIN (never argv), the same posture
+# `cmd_gh` uses: the jq filters below carry newlines and quotes, and the NOPASSWD
+# grant stays an exact command path with no argument wildcard.
+_gate_gh() {
+  local tok="${1:-}" secs="${2:-0}"; shift 2
+  local -a bound=()
+  if [[ -n "$tok" ]]; then
+    [[ "$secs" != "0" ]] && bound=(timeout "${secs}s")
+    GH_TOKEN="$tok" "${bound[@]}" gh "$@" 2>/dev/null || true
+    return 0
+  fi
+  _gate_gh_bot_ok || { printf ''; return 0; }
+  [[ "$secs" == "0" ]] && secs=10
+  printf '%s\0' "$@" | timeout "${secs}s" sudo -n "$_GATE_GH_DO" _gh_do 2>/dev/null || true
+}
+
 # DIVE-1935: extract every PR REFERENCE a piece of prose names, one number per
 # line (deduped, first-seen order). DIVE-1922 closed with an empty delivery_ref
 # and no Branch: line, but its own done result said "PR #156" in prose — the
@@ -1844,7 +1922,7 @@ _gate_search_scope() {
 # That evidence is what lets a bare "#N" bind at all without guessing a repo.
 _gate_pr_probe() {
   local n="$1" tok="$2" slug="$3" ident="$4"
-  GH_TOKEN="$tok" timeout 10s gh pr view "$n" --repo "$slug" \
+  _gate_gh "$tok" 10 pr view "$n" --repo "$slug" \
       --json state,mergedAt,statusCheckRollup,title,headRefName \
       -q "[ .state,
             (.mergedAt // \"null\"),
@@ -1940,7 +2018,7 @@ _gate_pr_state() {
   local ref="$1" tok="$2" slug="$3"
   local -a repo_arg=()
   [[ "$ref" =~ ^[0-9]+$ ]] && repo_arg=(--repo "$slug")
-  GH_TOKEN="$tok" timeout 10s gh pr view "$ref" "${repo_arg[@]}" \
+  _gate_gh "$tok" 10 pr view "$ref" "${repo_arg[@]}" \
       --json state,mergedAt,statusCheckRollup \
       -q "[ .state, (.mergedAt // \"null\"), $_GATE_ROLLUP_JQ ] | join(\"|\")" \
       2>/dev/null || true
@@ -1966,7 +2044,7 @@ _gate_pr_state() {
 # Read-only, bounded by `timeout`, token passed via env and never in argv.
 _gate_branch_ancestry() {
   local slug="$1" branch="$2" tok="$3" out st ahead
-  out=$(GH_TOKEN="$tok" timeout 10s gh api \
+  out=$(_gate_gh "$tok" 10 api \
         "repos/${slug}/compare/${FIVE_GATE_MAIN_BRANCH:-main}...${branch}" \
         -q '[(.status // ""), ((.ahead_by // "") | tostring)] | join("|")' 2>/dev/null || true)
   out="${out%%$'\n'*}"
@@ -2058,7 +2136,7 @@ _gate_branch_ident_on_main() {
   walked=0; page=1
   while (( walked < n )); do
     per=$(( n - walked )); (( per > 100 )) && per=100
-    out=$(GH_TOKEN="$tok" timeout 10s gh api \
+    out=$(_gate_gh "$tok" 10 api \
           "repos/${slug}/commits?sha=${main_br}&per_page=${per}&page=${page}" \
           -q "[ .[] | ((.commit.message // \"\") | split(\"\\n\")[0]) ] | [length, ([ .[]
                | select(test(\"(^|[^A-Za-z0-9])${ident}([^A-Za-z0-9]|\$)\";\"i\")) ] | length)] | @tsv" \
@@ -2589,8 +2667,12 @@ _task_status_cmd() {
       # agent-dev2/dev3 (`ALL=(root) NOPASSWD: /usr/local/bin/5dive *`) cannot run
       # anything as `claude`, so they resolve EMPTY. "Builders hold no gh token" is the
       # right conclusion for the wrong reason — it is scoped sudo, and it is per-agent.
-      if [[ -z "$_ghtok" ]]; then
-        policy_refuse "$E_CONFLICT" done-merge-gate-no-credential DIVE-2318 "$ident" "$ident cannot close: the merge gate COULD NOT CHECK whether ${_dref:-branch '$_branch'} landed — no gh credential resolved in this caller's environment, so no query ran at all. This says NOTHING about the merge; do not read it as 'not merged'. Resolution order is GH_TOKEN/GITHUB_TOKEN in env, then \`gh auth token\` for the sudo invoker, then your own, then \`sudo -n -u claude gh auth token\` — the last needs sudoers scope most agents do not have. Either re-run with a token (\`GH_TOKEN=\$(sudo -u claude gh auth token) 5dive task done $ident ...\`) or hand the close to an agent that holds one (agent-main); a maker who cannot query GitHub cannot satisfy done=merged-to-main (DIVE-1830) and this gate defers to a token-holding closer by design. Verify with \`5dive task merge-audit --limit=1\`, which reports the same missing credential."
+      # DIVE-2605: ask whether GitHub is REACHABLE, not whether a token was resolved.
+      # Those were the same question until the bot rail existed; the refusal below now
+      # fires only when BOTH rails are gone, which for a builder means the `_gh_do`
+      # grant is missing — a provisioning fault with a name, not a standing condition.
+      if ! _gate_gh_reachable "$_ghtok"; then
+        policy_refuse "$E_CONFLICT" done-merge-gate-no-credential DIVE-2318 "$ident" "$ident cannot close: the merge gate COULD NOT CHECK whether ${_dref:-branch '$_branch'} landed — no gh credential resolved in this caller's environment AND the machine-account rail is unreachable, so no query ran at all. This says NOTHING about the merge; do not read it as 'not merged'. Resolution order is GH_TOKEN/GITHUB_TOKEN in env, then \`gh auth token\` for the sudo invoker, then your own, then \`sudo -n -u claude gh auth token\` (needs sudoers scope most agents do not have), and finally the root-only \`_gh_do\` rail as 5dive-bot (DIVE-2605), which needs the NOPASSWD grant a builder gets from \`agent create --can-push\`. Check that grant with \`5dive gh whoami\`; if the bot line is UNRESOLVED that is the thing to fix. Otherwise re-run with a token (\`GH_TOKEN=\$(sudo -u claude gh auth token) 5dive task done $ident ...\`) or hand the close to an agent that holds one (agent-main). Verify with \`5dive task merge-audit --limit=1\`, which reports the same missing credential."
       fi
       if [[ -n "$_dref" ]]; then
         # DIVE-1955: a delivery_ref that is a full pull URL carries its own repo and
@@ -2609,8 +2691,8 @@ _task_status_cmd() {
           warn "$ident: bare delivery_ref resolved to $_dref by ident evidence (DIVE-1955) — bind the full URL next time."
         fi
         local _state _merged
-        _state=$(GH_TOKEN="$_ghtok" gh pr view "$_dref" --json state,mergedAt -q '.state' 2>/dev/null || echo "")
-        _merged=$(GH_TOKEN="$_ghtok" gh pr view "$_dref" --json state,mergedAt -q '.mergedAt' 2>/dev/null || echo "")
+        _state=$(_gate_gh "$_ghtok" 0 pr view "$_dref" --json state,mergedAt -q '.state' 2>/dev/null || echo "")
+        _merged=$(_gate_gh "$_ghtok" 0 pr view "$_dref" --json state,mergedAt -q '.mergedAt' 2>/dev/null || echo "")
         # DIVE-2318: an EMPTY state is "the question was not answered", not "the answer
         # was no". A token is present by here (guarded above), so an empty state means
         # the query itself failed — network, timeout, a PR/repo this token cannot see,
@@ -2730,7 +2812,7 @@ _task_status_cmd() {
           # LAST unreachable repo of a set search, under-reporting the coverage gap the
           # variable exists to describe. Same fix as DIVE-2266 made for _attr_bound above.
           [[ -z "$_attr" ]] && _attr_unreach="${_attr_unreach:+$_attr_unreach, }$_slug"
-          _bmerged=$(GH_TOKEN="$_ghtok" gh pr list --repo "$_slug" --head "$_branch" --state merged --json number,mergedAt -q '.[0].mergedAt' 2>/dev/null || echo "")
+          _bmerged=$(_gate_gh "$_ghtok" 0 pr list --repo "$_slug" --head "$_branch" --state merged --json number,mergedAt -q '.[0].mergedAt' 2>/dev/null || echo "")
           if [[ -n "$_bmerged" && "$_bmerged" != "null" ]]; then
             _merged_slug="$_slug"
             break
@@ -2851,7 +2933,10 @@ _task_status_cmd() {
     # not run the query and then read its empty result as "repo is clean". That
     # inference is precisely how this gate reported a clean close for every unauthed
     # agent on the box. An empty token short-circuits to the unverified branch below.
-    if [[ -n "$_ghtok2" ]]; then
+    # DIVE-2605: "no token" is no longer the same as "cannot ask" — a builder with no
+    # token reaches the same API through the bot rail. Unreachable still short-circuits
+    # to unverified exactly as before; this only stops calling a reachable host unauthed.
+    if _gate_gh_reachable "$_ghtok2"; then
       # One bounded, read-only listing PER KNOWN REPO; filter title/headRefName
       # client-side so a body-only mention can't match. `timeout 5s` + `|| echo ""`
       # => any slow/failed/absent gh yields no hit and the close proceeds (fail-open).
@@ -2868,7 +2953,7 @@ _task_status_cmd() {
         [[ -n "$_slug2" ]] || continue
         _sc_total=$((_sc_total+1))
         local _hit
-        _hit=$(GH_TOKEN="$_ghtok2" timeout 5s gh pr list --repo "$_slug2" \
+        _hit=$(_gate_gh "$_ghtok2" 5 pr list --repo "$_slug2" \
                     --state open --limit 200 --json number,headRefName,title \
                     -q "[.[] | select((.title // \"\" | test(\"(^|[^A-Za-z0-9])${ident}([^A-Za-z0-9]|\$)\";\"i\")) or (.headRefName // \"\" | test(\"(^|[^A-Za-z0-9])${ident}([^A-Za-z0-9]|\$)\";\"i\"))) | .number] | .[0] // empty" \
                     2>/dev/null) && _sc_ok=$((_sc_ok+1)) || _hit=""
@@ -3035,7 +3120,7 @@ $_body"
             _attr3=$(_gate_branch_ident_on_main "$_slug3" "$_cand" "$_ghtok2" "$ident")
             if [[ "$_attr3" == "1" ]]; then _bl_hit="$_cand"; _bl_hit_slug="$_slug3"; _bl_hit_how="attribution"; break 2; fi
             [[ -z "$_attr3" ]] && _bl_any_unreach=1
-            _bm3=$(GH_TOKEN="$_ghtok2" gh pr list --repo "$_slug3" --head "$_cand" --state merged --json mergedAt -q '.[0].mergedAt' 2>/dev/null || echo "")
+            _bm3=$(_gate_gh "$_ghtok2" 0 pr list --repo "$_slug3" --head "$_cand" --state merged --json mergedAt -q '.[0].mergedAt' 2>/dev/null || echo "")
             if [[ -n "$_bm3" && "$_bm3" != "null" ]]; then _bl_hit="$_cand"; _bl_hit_slug="$_slug3"; _bl_hit_how="a merged PR"; break 2; fi
           done < <(if [[ -n "$_task_slug" ]]; then printf '%s\n' "$_task_slug"; else _gate_repo_slugs; fi)
         done < <(printf '%s\n' "$_br_cands")
@@ -3367,7 +3452,7 @@ cmd_task_merge_audit() {
   done
   command -v gh >/dev/null 2>&1 || fail "$E_GENERIC" "task merge-audit needs \`gh\` to resolve PR state — install gh."
   local tok slugs; tok=$(_gate_gh_token); slugs=$(_gate_repo_slugs | paste -sd, -)
-  [[ -n "$tok" ]] || fail "$E_GENERIC" "task merge-audit could not resolve a gh token — every PR would report 'unverified', which is not an audit. Authenticate gh (or export GH_TOKEN) and re-run."
+  _gate_gh_reachable "$tok" || fail "$E_GENERIC" "task merge-audit cannot reach GitHub — no gh token resolved for this caller AND no \`_gh_do\` grant to route through 5dive-bot (DIVE-2605), so every PR would report 'unverified', which is not an audit. Check \`5dive gh whoami\`; authenticate gh (or export GH_TOKEN) and re-run."
   _gate_pr_refs_engine_ok || fail "$E_GENERIC" "task merge-audit cannot parse PR references on this host (grep -oE unusable) — it would report a clean sweep by finding nothing at all. Fix grep and re-run."
   local rows findings=0 unver=0 amb=0 deliv_n=0 cited_n=0 json_rows=""
   rows=$(db "SELECT ident || '|' || COALESCE(delivery_ref,'') || '|' || REPLACE(REPLACE(COALESCE(delivery_ref,'') || ' ' || COALESCE(result,'') || ' ' || COALESCE(body,''), char(10), ' '), '|', ' ')

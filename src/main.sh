@@ -262,6 +262,7 @@ Zero-human proof (publish your own badge — OSS-17):
 
 Delegated push (bring your own GitHub App — DIVE-1376):
   5dive push <id|DIVE-N> [--branch=<b>] [--dry-run]  # push ONLY the task's branch, ONLY after its gate clears; author enforced
+  5dive push <id|DIVE-N> --open-pr[=<base>]          # ...and open its pull request on the same root-side rail, as 5dive-bot (DIVE-2605)
   5dive deploy <id|DIVE-N> [--target=<project@ref>] [--env=production|preview] [--dry-run]
                                                      # INST-5: deploy ONLY the project@ref the task declares, ONLY after its gate clears
   5dive push setup                                   # scaffold + check the GitHub App credential (bring-your-own; root)
