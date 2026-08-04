@@ -1313,6 +1313,16 @@ _council_verify() {
       [[ -n "$target" && "$rcpt_ok" != "1" ]] && echo "  receipt: $target not found or does not re-seal" >&2
     fi
   fi
+  # DIVE-2711: a FAILED verify has already printed its reason on both rails above
+  # (the JSON envelope with constitutionOk/constitution, or the "council verify:
+  # FAILED" block on stderr), so mark it reported. Without this, the EXIT backstop
+  # in lib/output.sh treats the non-zero return as a SILENT exit and appends its
+  # generic "exited N without reporting a reason … this is a bug in the CLI" text.
+  # On the stderr rail that is merely noise; under --json it emits a SECOND JSON
+  # object on STDOUT, so the output stops being one document and every reader
+  # breaks — `jq -r .data.constitutionOk` returns "false\nnull" rather than
+  # "false". A drift verdict is a correct, deliberate non-zero exit, not a crash.
+  (( all_ok )) || mark_reported
   (( all_ok )) && return 0 || return "$E_GENERIC"
 }
 

@@ -99,8 +99,8 @@ CHAIN_DIGEST="$(jq -r 'select((.record.constitutionDigest // "")!="") | .record.
 # --- (3) drift FAILS CLOSED: hand-edit -> verify RED + convene ESCALATE --------------------------
 printf '\n# sneaky unsanctioned edit\n' >> "$CFILE"
 if "$FIVE" council verify >/dev/null 2>&1; then no "verify GREEN on a drifted (hand-edited) constitution"; else ok "verify RED on a drifted constitution (fail-closed)"; fi
-V="$("$FIVE" council verify --json 2>/dev/null)"
-[[ "$(printf '%s' "$V" | jq -r '.data.constitutionOk')" == "false" ]] && ok "verify --json flags constitutionOk=false on drift" || no "verify json did not flag the drift"
+V="$("$FIVE" council verify --json 2>"$TMP/verify.err")"; V_RC=$?
+[[ "$(printf '%s' "$V" | jq -r '.data.constitutionOk')" == "false" ]] && ok "verify --json flags constitutionOk=false on drift" || no "verify json did not flag the drift (rc=$V_RC stdout=<$V> stderr=<$(cat "$TMP/verify.err")>)"
 # a primary-council convene under drift ESCALATES (does not enforce forged governance)
 C="$("$FIVE" council convene "Ship the thing?" --subject="DIVE-2257 drift leg" --json 2>/dev/null)"
 [[ "$(printf '%s' "$C" | jq -r '.data.driftEscalated')" == "true" ]] && ok "primary-council convene ESCALATES under drift" || no "convene did not drift-escalate ($C)"
