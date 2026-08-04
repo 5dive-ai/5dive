@@ -15,6 +15,7 @@
 # keep passing while doing so. Same reasoning as tests that derive a table from its
 # call sites instead of pinning a literal.
 set -euo pipefail
+trap 'rc=$?; rm -rf "${TMP:-}"; echo "HARNESS-RC=$rc"' EXIT   # DIVE-2692: fires on every exit path (incl. SKIP/precondition-fail early-exits); folds in tempdir cleanup so the two EXIT traps don't clobber each other.
 
 # DIVE-2211: name the tree this harness grades (tests/lib/grading_tree.sh).
 # Three-state: if the helper is unreachable (a staged copy that did not carry
@@ -35,7 +36,7 @@ bad_t() { printf 'FAIL - %s\n' "$1"; [ -n "${2:-}" ] && printf '   %s\n' "$2"; F
 
 command -v sqlite3 >/dev/null 2>&1 || { echo "SKIP: sqlite3 not present"; exit 0; }
 
-TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
+TMP=$(mktemp -d)
 DB="$TMP/t.db"
 
 # ---------------------------------------------------------------------------

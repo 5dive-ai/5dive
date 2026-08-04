@@ -22,6 +22,7 @@
 # written.md, DIVE-2666 addendum, for the full scope correction.
 
 set -uo pipefail
+trap 'rc=$?; echo "HARNESS-RC=$rc"' EXIT   # DIVE-2692: fires on every exit path (incl. SKIP/precondition-fail early-exits).
 
 # DIVE-2211: name the tree this harness grades (tests/lib/grading_tree.sh).
 . "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh" \
