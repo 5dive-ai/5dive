@@ -6,7 +6,11 @@ _task_usage() {
 5dive task — shared task queue (sqlite at ${STATE_DIR}/tasks/tasks.db)
 
   5dive task init                                    # one-time root bootstrap of the store
-  5dive task add <title...> [--body=<text>] [--priority=low|medium|high|urgent]
+  5dive task add <title...> [--body=<text>|--body-file=<path>] [--accept-file=<path>] [--priority=low|medium|high|urgent]
+                                                     # DIVE-2627: every *-file flag reads its prose VERBATIM from a file.
+                                                     # Prefer them for anything quoting CLI verbs or shell metacharacters:
+                                                     # in a double-quoted argv value your shell runs backticks as command
+                                                     # substitution and silently deletes the words BEFORE the CLI is invoked.
                             [--assignee=<agent|role:<r>|charter:<kw>>] [--parent=<id|DIVE-N>] [--from=<who>]
                                                      # --assignee token routes via the org chart (DIVE-980); omit = org lead/coordinator
                             [--recurring="<cron>"]  # recurring=template (5-field cron, e.g. "0 2 * * *")
@@ -45,13 +49,18 @@ _task_usage() {
                                                      # the task to the new grader. No detach: opting out is add-time only.
   5dive task set-branch <id|DIVE-N> <branch>         # bind the task to a git branch for delegated push (DIVE-1462/1697);
                                                      # writes/updates a 'Branch: <name>' line in the body. Also: task add --branch=<name>
-  5dive task set-body <id|DIVE-N> <text...> [--append]
+  5dive task set-body <id|DIVE-N> <text...>|--file=<path> [--append]
+                                                     # --file reads the body VERBATIM from a file (DIVE-2627) and is the only
+                                                     # form that preserves newlines: positional words are re-joined with spaces.
                                                      # DIVE-1920: edit a task's body after creation (--body was add-time only).
                                                      # Default OVERWRITES the whole body; --append tacks text on instead (the
                                                      # common case — a finding/addendum after filing). Works on recurring
                                                      # templates too. Refused on a closed (done/cancelled) task.
   5dive task start  <id|DIVE-N>                      # -> in_progress
-  5dive task done   <id|DIVE-N> [--result=<text>]    # -> done; --result captures the agent's response
+  5dive task done   <id|DIVE-N> [--result=<text>|--result-file=<path>]
+                                                     # -> done; --result captures the agent's response. --result-file reads it
+                                                     # VERBATIM from a file (DIVE-2627) — the close record is permanent and the
+                                                     # creator/dashboard read it, so a shell-eaten word is a wrong record forever.
   5dive task deliver <id|DIVE-N> --pr=<url> [--result=<text>]
                                                      # maker: record the delivery PR + hand to verifier; 'task done' stays
                                                      # BLOCKED until the work is MERGED to main (opt-in merge-gate, DIVE-1830).
@@ -103,7 +112,11 @@ _task_usage() {
   5dive task escalate <id|DIVE-N> [--from=<who>]     # flag for attention: bump priority a tier (cap urgent) + ping owning agent & paired human
 
   # Human Task Inbox — park a task on a human and clear it
-  5dive task need <id|DIVE-N> --type=decision|secret|approval|manual|access --ask="..." [--options=A|B] [--recommend="A"] [--tier=0|1|2]
+  5dive task need <id|DIVE-N> --type=decision|secret|approval|manual|access --ask="..."|--ask-file=<path> [--options=A|B] [--recommend="A"|--recommend-file=<path>] [--tier=0|1|2]
+                                                     # DIVE-2627: --ask-file/--recommend-file read the prose VERBATIM from a file.
+                                                     # Highest-value pair in the CLI to get right — the ask is a permanent gate
+                                                     # record AND the text a HUMAN is paged to read, so nobody is present to
+                                                     # notice the words the caller's shell removed.
                                                      # --type=access: manager-clearable "grant me X" gate — routes to the org lead first (any tier), lead-clearable; add --probe='test -w /path' to self-check the block
                                                      # --type=secret MUST name a delivery path (DIVE-2411): --secret-key=<ENV_NAME> --connector=<stem> mints a one-time drop link, or --out-of-band="<where the value lands>" declares out-of-band delivery explicitly. Neither = refused at filing (the ask would read complete with nowhere for the value to go).
   5dive task need <id|DIVE-N> --withdraw            # DIVE-1401: cancel a still-pending gate the team filed but that's now moot — filer or org lead, no human tap. NOT a grant (never records a secret/approval); genuine clears stay human-only.
@@ -379,11 +392,20 @@ cmd_task_set_branch() {
 cmd_task_set_body() {
   tasks_db_init
   local append=0 task=""
+  # DIVE-2627: --file's text, kept separate until the positional words are known.
+  local file_text="" text_src=""
   local -a words=()
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --append)      append=1 ;;
       --append=*)    fail "$E_USAGE" '--append is a boolean flag; pass the text as a positional argument: task set-body <id> --append "<text>"' ;;
+      # DIVE-2627: the body read VERBATIM from a file. Note this is strictly more
+      # faithful than the positional form even with a well-behaved shell: the
+      # positional words are re-joined with single spaces below, so a multi-line
+      # body typed inline is already flattened before it reaches the row.
+      --file=*)      _prose_flag_dupe --file "$text_src"
+                     _read_prose_file --file "${1#*=}"
+                     file_text="$_PROSE_FILE_VALUE"; text_src="--file" ;;
       --)            shift; words+=("$@"); break ;;
       -*)            fail "$E_USAGE" "unknown flag: $1" ;;
       *)             if [[ -z "$task" ]]; then task="$1"; else words+=("$1"); fi ;;
@@ -391,8 +413,13 @@ cmd_task_set_body() {
     shift
   done
   local text="${words[*]:-}"
+  if [[ -n "$text_src" ]]; then
+    [[ -z "$text" ]] \
+      || fail "$E_USAGE" "--file conflicts with the positional text — pass the body exactly once, either inline or from a file."
+    text="$file_text"
+  fi
   [[ -n "$task" && -n "$text" ]] \
-    || fail "$E_USAGE" "usage: 5dive task set-body <id|DIVE-N> <text...> [--append]"
+    || fail "$E_USAGE" "usage: 5dive task set-body <id|DIVE-N> <text...>|--file=<path> [--append]"
   resolve_task_id "$task"; local id="$RESOLVED_TASK_ID" ident="$RESOLVED_TASK_IDENT"
   local st
   st=$(db "SELECT status FROM tasks WHERE id=${id};")
@@ -712,10 +739,18 @@ cmd_task_add() {
   local body="" priority="medium" assignee="" parent="" from="" recurring="" fresh="" project="dive"
   local accept="" verify_cmd="" max_iters="" verifier="" task_budget="" no_verify="" branch=""
   local customer_facing="" already_blocked=""
+  # DIVE-2627: which flag supplied each prose value (see _read_prose_file).
+  local body_src="" accept_src=""
   local -a words=()
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      --body=*)      body="${1#*=}" ;;
+      --body=*)      _prose_flag_dupe --body "$body_src"; body="${1#*=}"; body_src="--body" ;;
+      # DIVE-2627: the body read VERBATIM from a file. A task body is the
+      # permanent spec a verifier grades against, so a backtick the caller's
+      # shell ate is a silently wrong record nobody can detect afterwards.
+      --body-file=*) _prose_flag_dupe --body-file "$body_src"
+                     _read_prose_file --body-file "${1#*=}"
+                     body="$_PROSE_FILE_VALUE"; body_src="--body-file" ;;
       --priority=*)  priority="${1#*=}" ;;
       --assignee=*)  assignee="${1#*=}" ;;
       --parent=*)    parent="${1#*=}" ;;
@@ -727,7 +762,13 @@ cmd_task_add() {
       --no-fresh)    fresh="0" ;;
       # DIVE-476: loop-spec — declarative verify loop persisted on the row so the
       # (c) verify-runner reads its inputs off the task instead of re-passing them.
-      --accept=*)    accept="${1#*=}" ;;
+      --accept=*)    _prose_flag_dupe --accept "$accept_src"; accept="${1#*=}"; accept_src="--accept" ;;
+      # DIVE-2627: acceptance criteria read VERBATIM from a file. This is the
+      # single highest-value member of the class after --ask: it is literally the
+      # text the VERIFIER grades the work against.
+      --accept-file=*) _prose_flag_dupe --accept-file "$accept_src"
+                       _read_prose_file --accept-file "${1#*=}"
+                       accept="$_PROSE_FILE_VALUE"; accept_src="--accept-file" ;;
       --verify=*)    verify_cmd="${1#*=}" ;;
       --max-iters=*) max_iters="${1#*=}" ;;
       --verifier=*)  verifier="${1#*=}" ;;
@@ -2342,10 +2383,18 @@ _task_status_cmd() {
   # _gate_text_names_a_ref: an unverified reason only earns a mark on the record when
   # something was actually pending verification.
   local _mg_had_subject=0
+  # DIVE-2627: which flag supplied the result (see _read_prose_file).
+  local result_src=""
   local -a positional=()
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      --result=*)     result="${1#*=}"; want_result=1 ;;
+      --result=*)     _prose_flag_dupe --result "$result_src"; result="${1#*=}"; want_result=1; result_src="--result" ;;
+      # DIVE-2627: the result read VERBATIM from a file. `--result` is the widest
+      # site in the class (32 call sites on origin/main @ 2e0e876) and it is the
+      # permanent close record the dashboard and the task's creator read.
+      --result-file=*) _prose_flag_dupe --result-file "$result_src"
+                       _read_prose_file --result-file "${1#*=}"
+                       result="$_PROSE_FILE_VALUE"; want_result=1; result_src="--result-file" ;;
       --notify)       notify=1 ;;
       --no-preflight) no_preflight=1 ;;
       --force-merge-gate) force_merge_gate=1 ;;  # DIVE-1835: audited escape from the mandatory auto-detect gate
@@ -5710,13 +5759,27 @@ _gate_option_has_second_person() {
 cmd_task_need() {
   tasks_db_init
   local type="" ask="" options="" recommend="" from="" tier="" secret_key="" connector="" probe="" withdraw="" discusses="" needs="" oob=""
+  # DIVE-2627: which flag supplied each prose value (see _read_prose_file).
+  local ask_src="" recommend_src=""
   local -a positional=()
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --type=*)      type="${1#*=}" ;;
-      --ask=*)       ask="${1#*=}" ;;
+      --ask=*)       _prose_flag_dupe --ask "$ask_src"; ask="${1#*=}"; ask_src="--ask" ;;
+      # DIVE-2627: the ask read VERBATIM from a file. This is the WORST member of
+      # the class to corrupt: it is a permanent gate record AND the text a HUMAN is
+      # paged to read, with no reader present at the file to notice the missing
+      # words. A gate that asks half a question gets half an answer.
+      --ask-file=*)  _prose_flag_dupe --ask-file "$ask_src"
+                     _read_prose_file --ask-file "${1#*=}"
+                     ask="$_PROSE_FILE_VALUE"; ask_src="--ask-file" ;;
       --options=*)   options="${1#*=}" ;;
-      --recommend=*) recommend="${1#*=}" ;;
+      --recommend=*) _prose_flag_dupe --recommend "$recommend_src"; recommend="${1#*=}"; recommend_src="--recommend" ;;
+      # DIVE-2627: the recommendation read VERBATIM from a file — it is what the
+      # owner sees FIRST on the gate, so a hole in it steers the answer.
+      --recommend-file=*) _prose_flag_dupe --recommend-file "$recommend_src"
+                          _read_prose_file --recommend-file "${1#*=}"
+                          recommend="$_PROSE_FILE_VALUE"; recommend_src="--recommend-file" ;;
       --tier=*)      tier="${1#*=}" ;;
       --from=*)      from="${1#*=}" ;;
       # DIVE-1401: withdraw a still-pending gate the team ITSELF filed but that is

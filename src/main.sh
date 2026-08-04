@@ -135,8 +135,13 @@ Agents:
                                                      # handle instead of numeric id.
   5dive agent <name> tui                             # attach your terminal to the agent's tmux session
   5dive agent logs <name> [--follow] [--lines=N] [--tmux]
-  5dive agent send <name> <text...> [--from=<sender>] [--raw] [--wake]
+  5dive agent send <name> <text...>|--message=<text>|--message-file=<path>
+                                    [--from=<sender>] [--raw] [--wake]
                                     [--reply-to-chat=<id> [--reply-to-msg=<id>]]
+                                                     # --message-file reads the body VERBATIM from a file (DIVE-2627).
+                                                     # Use it for ANY message that quotes CLI verbs: inside a double-quoted
+                                                     # --message=, backtick-quoted verbs RUN as command substitution (as you),
+                                                     # the words are deleted, and the send still prints OK.
                                                      # inject a message (tmux send-keys + Enter).
                                                      # When called from another agent, auto-wraps as
                                                      # [5dive-msg from=<caller> id=<id>] so the
