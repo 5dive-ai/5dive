@@ -56,6 +56,14 @@ _HB_STALE_MIN_MINUTES=45
 # the claim is stamped AFTER _hb_mark_run — see the call site.
 _HB_STARVE_AFTER=3
 
+# DIVE-2716 — how many of an agent's runnable todos the wake loop will step
+# through looking for one the tier guard clears. Bounded on purpose: each
+# candidate costs two small queries plus a registry read, and a queue where the
+# first 25 rows are ALL held is a tier misconfiguration, not a scheduling
+# problem. Hitting the cap is logged loudly (it means runnable rows past it were
+# never examined) rather than passed off as "nothing to do".
+_HB_PICK_SCAN=25
+
 # A reaped task (in_progress past the budget) is requeued to todo, never
 # cancelled — silently losing real mid-flight work is worse than a re-run
 # (DIVE-482/200). But a task that keeps overrunning even after a clean requeue
@@ -791,8 +799,20 @@ _hb_press_continue() {
 # dependents) and is depth-capped at 64 so a pathological/cyclic graph can't spin.
 # Priority stays the primary key (an urgent task never waits behind a medium
 # critical-path task); critical-path depth is the tiebreaker, then id for stability.
-_hb_pick_task() {
-  local name="$1"
+#
+# DIVE-2716 — this is now the LIST form. It used to be `_hb_pick_task`, hard
+# LIMIT 1, and that single row was the agent's entire chance to be woken this
+# tick: when the tier guard below held it, the tick gave up on the AGENT, and
+# because selection is deterministic the same row was re-picked and re-held every
+# five minutes forever. Five held rows head-of-line blocked 122 runnable ones.
+# Handing the caller an ORDERED list is what lets a held head be stepped over
+# without weakening the guard — the order is unchanged, so the first runnable
+# candidate is exactly the row the old picker would have returned once the held
+# ones ahead of it are gone. `_hb_pick_task` is kept as the LIMIT-1 wrapper.
+_hb_pick_tasks() {
+  local name="$1" lim="${2:-1}"
+  # A non-numeric/zero limit must not become an unbounded scan.
+  [[ "$lim" =~ ^[1-9][0-9]*$ ]] || lim=1
   db "WITH RECURSIVE
         cp(root, node, depth) AS (
           SELECT id, id, 0 FROM tasks
@@ -812,8 +832,13 @@ _hb_pick_task() {
         ORDER BY CASE t.priority WHEN 'urgent' THEN 0 WHEN 'high' THEN 1
                                  WHEN 'medium' THEN 2 ELSE 3 END,
                  COALESCE(c.cp,0) DESC, t.id
-        LIMIT 1;" 2>/dev/null || echo ""
+        LIMIT ${lim};" 2>/dev/null || echo ""
 }
+
+# The historical single-row picker: same rows, same order, first one only. Kept
+# because the direct-claim path and tests/heartbeat_pick_unit.sh want exactly
+# one id, and because it keeps DIVE-979's ordering rules stated in ONE query.
+_hb_pick_task() { _hb_pick_tasks "$1" 1; }
 
 # DIVE-1065: privilege ordering for the auto-wake tier guard. admin > standard >
 # sandboxed; 0 for unknown/human — an unknown creator never blocks a wake.
@@ -2774,7 +2799,7 @@ cmd_heartbeat_tick() {
   require_root "heartbeat tick"
   tasks_db_init
   local reg now; reg=$(registry_read); now=$(date +%s)
-  local checked=0 woke=0 reaped=0 reclaimed=0 starved=0 sk_notdue=0 sk_busy=0 sk_nowork=0 sk_fail=0 sk_spread=0 sk_active=0 sk_budget=0
+  local checked=0 woke=0 reaped=0 reclaimed=0 starved=0 sk_notdue=0 sk_busy=0 sk_nowork=0 sk_fail=0 sk_spread=0 sk_active=0 sk_budget=0 sk_held=0
   local today; today=$(date +%F)   # DIVE-1858 wake-budget day key (YYYY-MM-DD)
   # DIVE-138: materialize due recurring templates FIRST so a freshly-cloned todo
   # is eligible for the wake loop below this same tick. Isolated — a failure here
@@ -2888,16 +2913,29 @@ cmd_heartbeat_tick() {
     if [[ "${inprog:-0}" != "0" ]]; then
       sk_busy=$((sk_busy + 1)); _hb_log "[$name] busy — $inprog in_progress, skip"; continue
     fi
-    # Pick the single highest-priority todo and wake the agent against that exact
-    # id — the /goal condition needs a concrete DIVE-N to evaluate reliably.
-    local task_id
-    task_id=$(_hb_pick_task "$name")
-    if [[ -z "$task_id" ]]; then
-      sk_nowork=$((sk_nowork + 1)); _hb_log "[$name] no todo — stay idle"; continue
-    fi
-    # The /goal + every log below must name the task by its DISPLAY ident, not the
-    # raw row id — they diverge once a non-default project exists (DIVE-484).
-    local task_ident; task_ident=$(_hb_ident "$task_id")
+    # Wake the agent against ONE concrete todo — the /goal condition needs a
+    # concrete DIVE-N to evaluate reliably — but consider the queue IN ORDER
+    # until one is actually runnable.
+    #
+    # DIVE-2716: the tier guard below is a per-TASK verdict, and it used to be
+    # spent as a per-AGENT one. With a single pick, a held head meant `continue`
+    # on the whole agent; selection is deterministic, so the identical row was
+    # re-picked and re-held every tick and the runnable rows behind it were
+    # unreachable FOREVER (measured 2026-08-04: 5 held rows head-of-line blocking
+    # 122, fleet idle 2h35m, main's queue stuck 5 days). The guard's own comment
+    # bounded the wrong axis — "a hold skips ONE agent's wake this tick" is true
+    # per tick and says nothing about a tick that repeats with identical input.
+    # Stepping past the held row keeps the guard's whole safety property (a held
+    # task is still never auto-run, and still names itself in the log) and lets
+    # everything behind it flow.
+    local task_id="" task_ident="" _cand _cand_n=0 _picked=0
+    while IFS= read -r _cand; do
+      [[ -n "$_cand" ]] || continue
+      _cand_n=$((_cand_n + 1))
+      task_id="$_cand"
+      # The /goal + every log below must name the task by its DISPLAY ident, not
+      # the raw row id — they diverge once a non-default project exists (DIVE-484).
+      task_ident=$(_hb_ident "$task_id")
 
     # --- DIVE-1065 tier guard --------------------------------------------------
     # Refuse to AUTO-DRIVE a higher-tier agent from a lower-tier creator's task.
@@ -2935,15 +2973,20 @@ cmd_heartbeat_tick() {
     # are NOT envelope_tier(), which folds both populations into
     # `unknown:unregistered` because a wire format has no decision to make.
     #
-    # Still isolated: a hold skips ONE agent's wake this tick and never aborts
-    # the tick. A self-assigned task and an equal/higher-tier creator are
-    # unaffected.
+    # Isolation, restated correctly (DIVE-2716). This block used to claim "a hold
+    # skips ONE agent's wake this tick and never aborts the tick". Both halves
+    # are true PER TICK and the conclusion still did not hold: the tick repeats
+    # with identical input, so a per-tick skip of a deterministically re-picked
+    # row is a PERMANENT skip of that agent. The hold is now what it always said
+    # it was — scoped to the TASK: the held row is not auto-run, the next
+    # candidate in the same priority order is considered, and a self-assigned
+    # task or an equal/higher-tier creator is unaffected.
     local _cby _ctier _atier
     _cby=$(db "SELECT COALESCE(created_by,'') FROM tasks WHERE id=${task_id};" 2>/dev/null || echo "")
     if [[ -n "$_cby" && "$_cby" != "$name" ]]; then
       _ctier=$(agent_tier "$_cby"); _atier=$(agent_tier "$name")
       if tier_unmeasured "$_ctier" || tier_unmeasured "$_atier"; then
-        _hb_log "[$name] task ${task_ident} tier NOT MEASURED (creator ${_cby}=${_ctier}, assignee ${name}=${_atier}) — holding, not auto-running (DIVE-2213)"
+        _hb_log "[$name] task ${task_ident} tier NOT MEASURED (creator ${_cby}=${_ctier}, assignee ${name}=${_atier}) — holding, not auto-running (DIVE-2213); considering the next candidate"
         continue
       fi
       # Only measured values reach the ranking. `unknown:unregistered` ranks 0
@@ -2951,9 +2994,36 @@ cmd_heartbeat_tick() {
       local _cr _ar
       _cr=$(_hb_tier_rank "$_ctier"); _ar=$(_hb_tier_rank "$_atier")
       if (( _cr > 0 && _ar > 0 && _cr < _ar )); then
-        _hb_log "[$name] task ${task_ident} created by lower-tier ${_cby}(${_ctier}) < assignee(${_atier}) — holding, not auto-running"
+        _hb_log "[$name] task ${task_ident} created by lower-tier ${_cby}(${_ctier}) < assignee(${_atier}) — holding, not auto-running; considering the next candidate"
         continue
       fi
+    fi
+    # --- end DIVE-1065 tier guard ----------------------------------------------
+    # (Sentinel for tests/heartbeat_tier_guard_unmeasured_unit.sh, which extracts
+    # the block above VERBATIM and evals it: everything below closes the candidate
+    # loop and must stay outside that extraction.)
+
+      _picked=1; break
+    done < <(_hb_pick_tasks "$name" "$_HB_PICK_SCAN")
+    if (( _picked == 0 )); then
+      task_id=""; task_ident=""
+      if (( _cand_n == 0 )); then
+        sk_nowork=$((sk_nowork + 1)); _hb_log "[$name] no todo — stay idle"; continue
+      fi
+      # Every candidate we looked at was held. Not silent, and it names the cap:
+      # if _cand_n hit _HB_PICK_SCAN there may be runnable rows we never reached,
+      # which is a different (and much louder) situation than "the queue is held".
+      sk_held=$((sk_held + _cand_n))
+      if (( _cand_n >= _HB_PICK_SCAN )); then
+        _hb_log "[$name] tier guard held all ${_cand_n} candidate(s) SCANNED — scan cap _HB_PICK_SCAN=${_HB_PICK_SCAN} reached, runnable rows past it were NOT examined; authorize a held task (5dive task authorize) or fix the creator/assignee tiers"
+      else
+        _hb_log "[$name] tier guard held all ${_cand_n} runnable todo(s) — stay idle"
+      fi
+      continue
+    fi
+    if (( _cand_n > 1 )); then
+      sk_held=$((sk_held + _cand_n - 1))
+      _hb_log "[$name] tier guard held $((_cand_n - 1)) higher-priority todo(s); waking on ${task_ident} instead (DIVE-2716)"
     fi
 
     # --- Same-account spread ---------------------------------------------------
@@ -3158,8 +3228,8 @@ cmd_heartbeat_tick() {
                   | sort_by(.value.heartbeat.lastRunAt // 0)
                   | .[].key' <<<"$reg")
 
-  ok "heartbeat tick: woke ${woke} / slept ${_HB_SLEPT} / reclaimed ${reclaimed} / reaped ${reaped} / starved ${starved} / spread-deferred ${sk_spread} / active-deferred ${sk_active} / budget-skipped ${sk_budget} / checked ${checked}" \
+  ok "heartbeat tick: woke ${woke} / slept ${_HB_SLEPT} / reclaimed ${reclaimed} / reaped ${reaped} / starved ${starved} / tier-held ${sk_held} / spread-deferred ${sk_spread} / active-deferred ${sk_active} / budget-skipped ${sk_budget} / checked ${checked}" \
      '{checked:($c|tonumber), woke:($w|tonumber), slept:($sl|tonumber), sleepArmed:($sa|tonumber), reclaimed:($rc|tonumber), reaped:($r|tonumber), starved:($st|tonumber),
-       skipped:{notDue:($nd|tonumber), busy:($b|tonumber), noWork:($nw|tonumber), spread:($sp|tonumber), active:($ac|tonumber), budget:($bu|tonumber), failed:($sf|tonumber)}}' \
-     --arg c "$checked" --arg w "$woke" --arg sl "$_HB_SLEPT" --arg sa "$_HB_SLEEP_ARMED" --arg rc "$reclaimed" --arg r "$reaped" --arg st "$starved" --arg nd "$sk_notdue" --arg b "$sk_busy" --arg nw "$sk_nowork" --arg sp "$sk_spread" --arg ac "$sk_active" --arg bu "$sk_budget" --arg sf "$sk_fail"
+       skipped:{notDue:($nd|tonumber), busy:($b|tonumber), noWork:($nw|tonumber), spread:($sp|tonumber), active:($ac|tonumber), budget:($bu|tonumber), failed:($sf|tonumber), tierHeld:($th|tonumber)}}' \
+     --arg c "$checked" --arg w "$woke" --arg sl "$_HB_SLEPT" --arg sa "$_HB_SLEEP_ARMED" --arg rc "$reclaimed" --arg r "$reaped" --arg st "$starved" --arg nd "$sk_notdue" --arg b "$sk_busy" --arg nw "$sk_nowork" --arg sp "$sk_spread" --arg ac "$sk_active" --arg bu "$sk_budget" --arg sf "$sk_fail" --arg th "$sk_held"
 }
