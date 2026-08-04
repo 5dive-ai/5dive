@@ -3,7 +3,19 @@
 # answer "is what is RUNNING on this host what we merged?", and must NEVER
 # answer it green when it could not run.
 #
-# TIER: nightly — 0.6s measured on the control-plane box (agent-dev uid, offline, no root, `time bash tests/doctor_cli_freshness_unit.sh` = 0.57s over 5 runs). It is not the runtime that demotes it: core is ALREADY over its own 300s cap at 397s, so a new guard there is charged to every contributor on every push against a budget that is red before it arrives. `changed-harnesses` runs and verdict-probes this file at introduction regardless of tier, so the demotion moves the recurring cost without giving up the grade that matters.
+# TIER: core (the default — no marker needed, recorded here because the first cut of
+# this file demoted it and the demotion was argued from a FALSE premise). I carried
+# "core is already over its 300s cap at 397s" as settled. The number that governs is
+# the one CI measures, because CI is where the budget is enforced: run 30892536614
+# on this branch reported `harness-budget[core/pristine]: 233 harnesses, 270s
+# wall-clock, budget 300s (90% of budget)`, and 255s on the installed-host job. The
+# 397s figure was a control-plane reading, a contended box that is not the gate. At
+# 0.6s measured (`time bash tests/doctor_cli_freshness_unit.sh` = 0.57s over 5 runs,
+# agent-dev uid, offline, no root) against ~30s of headroom, the demotion argument
+# does not survive its premise being corrected, so this stays where the default puts
+# it. The runner's own warning that "the next few guards will not be" inside the cap
+# is real and is a reason to merge or retire a guard — not a reason to launder a new
+# one into the nightly on a number nobody re-measured.
 #
 # THE ACCEPTING EVIDENCE IS THE STALE ARM GOING RED. A freshness check that
 # passes on a host which happens to be current proves nothing — that arm is a
