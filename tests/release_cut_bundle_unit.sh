@@ -50,7 +50,7 @@ run_block(){ # $1 = build.sh body, $2 = tag ; prints output, returns the block's
     # so the tree must carry the sentinel the real main carries. Seeding it here is
     # what lets the extracted bytes be run as-shipped rather than around the bump.
     mkdir -p src; printf 'readonly FIVE_VERSION="0.0.0-dev"\n' > src/header.sh
-    git add src/header.sh build.sh
+    git add src/header.sh build.sh .gitignore
     git -c user.name=t -c user.email=a@b commit -q -m seed2
   ) >/dev/null 2>&1
   ( cd "$d"
@@ -67,7 +67,7 @@ run_block(){ # $1 = build.sh body, $2 = tag ; prints output, returns the block's
 GOOD='#!/usr/bin/env bash
 # stands in for the real build.sh: the bundle takes its version FROM src/header.sh,
 # so a bump that did not land shows up as a bundle carrying the sentinel.
-printf "%s\n" "#!/usr/bin/env bash" "$(grep -m1 "^readonly FIVE_VERSION=" src/header.sh)" "true" > 5dive
+printf "%s\n" "#!/usr/bin/env bash" "$(grep -m1 "^readonly FIVE_VERSION=" src/header.sh)" "readonly FIVE_BUILD_SHA=\"$(git rev-parse HEAD)\"" "true" > 5dive
 sha256sum 5dive | cut -d" " -f1 > 5dive.sha256'
 NOBUNDLE='#!/usr/bin/env bash
 true'
@@ -104,6 +104,9 @@ out=$(run_block "$GOOD" v9.9.9); rc=$?
 grep -q 'release commit .* carries bundle' <<<"$out" \
   && ok_t 'the accepted cut names the bundle it committed' \
   || bad_t 'accepted cut must state what it published' "out=$out"
+grep -qE 'FIVE_BUILD_SHA=[0-9a-f]{40}' <<<"$out" \
+  && ok_t 'the accepted bundle names the clean source commit it was built from' \
+  || bad_t 'accepted cut must carry a usable build identity' "out=$out"
 
 echo "-- the bundle must not be tracked on main (the defect this ticket removed)"
 for f in 5dive 5dive.sha256; do
@@ -186,6 +189,30 @@ out=$(run_mutant); rc=$?
 grep -q '0\.0\.0-dev' <<<"$out" \
   && ok_t 'and it names the sentinel it refused to publish' \
   || ok_t 'refused (message does not name the sentinel, which is acceptable)'
+
+echo "-- DIVE-2603: the version assignment must be committed before build.sh stamps HEAD"
+SOURCE_COMMIT_MUTANT=$(printf '%s\n' "$BLOCK" | awk '
+  /git -c user.name=lodar -c user.email=markounik@gmail.com \\$/ {
+    first=$0
+    if ((getline second) > 0 && second ~ /commit -q -m "release \$\{tag\}: assign \$\{version\} before bundle build/) {
+      print ":"
+      next
+    }
+    print first
+    print second
+    next
+  }
+  { print }
+')
+[[ "$SOURCE_COMMIT_MUTANT" != "$BLOCK" ]] || bad_t 'source-commit mutation did not change the block (anchor drifted)' ''
+MUTANT="$SOURCE_COMMIT_MUTANT"
+out=$(run_mutant); rc=$?
+[[ $rc -ne 0 ]] \
+  && ok_t 'removing the pre-build source commit makes the extracted release cut REFUSE' \
+  || bad_t 'release cut built from an uncommitted version assignment — every published stamp would be dirty or false' "rc=$rc out=$out"
+grep -q 'tracked release source is dirty' <<<"$out" \
+  && ok_t 'the refusal names the dirty tracked source rather than publishing an inert identity' \
+  || bad_t 'source-commit mutant failed for an unrelated reason' "out=$out"
 
 echo "-- and main itself must carry the sentinel, not a real version"
 _hdr=$(grep -m1 -oE '^readonly FIVE_VERSION="[^"]+"' "$ROOT/src/header.sh" | cut -d'"' -f2)

@@ -3571,15 +3571,113 @@ _task_status_cmd() {
   # a task that still has an UNANSWERED human gate — that's how DIVE-535's
   # public-publish approval got bypassed (the task was marked done while its
   # approval gate sat 'pending', so the public ship happened with no recorded
-  # sign-off). Block the close: the gate must be answered (`task answer`) or the
-  # task abandoned (`task cancel`, which legitimately closes a gated task).
+  # sign-off). Block the close: the gate must be answered (`task answer`) or
+  # WITHDRAWN (`task need --withdraw`).
   # Verifier routing already returned above; only a real `done` reaches here.
-  if [[ "$verb" == "done" ]]; then
+  #
+  # DIVE-2773: this refusal used to name `task cancel` as the legitimate way out,
+  # and that is now false — cancel is refused over a live gate too, immediately
+  # below. It was never as safe as it read: a cancel does not ANSWER the gate, it
+  # deletes the question, and it silently retires the human's buttons on the way
+  # (_task_gate_retire_buttons, further down this same function). Naming it here
+  # published the route that DIVE-2758 took.
+  if [[ "$verb" == "done" || "$verb" == "cancel" ]]; then
     local _gt _ga
     _gt=$(db "SELECT COALESCE(need_type,'')        FROM tasks WHERE id=${id};")
     _ga=$(db "SELECT COALESCE(need_answered_at,'') FROM tasks WHERE id=${id};")
     if [[ -n "$_gt" && -z "$_ga" ]]; then
-      policy_refuse "$E_CONFLICT" done-over-open-gate DIVE-555 "$ident" "$ident has a pending '${_gt}' gate awaiting a human — answer it (5dive task answer $ident ...) or abandon the task (5dive task cancel $ident) instead of marking done. A gated/public ship must not close ahead of its gate (DIVE-555)."
+      if [[ "$verb" == "done" ]]; then
+        policy_refuse "$E_CONFLICT" done-over-open-gate DIVE-555 "$ident" "$ident has a pending '${_gt}' gate awaiting a human — answer it (5dive task answer $ident ...), or withdraw it if it is genuinely moot (5dive task need $ident --withdraw), instead of marking done. A gated/public ship must not close ahead of its gate (DIVE-555)."
+      fi
+      # DIVE-2773: THE CANCEL HALF, and it is a STRONGER condition than the
+      # reason requirement below rather than a case of it — it fires with a
+      # perfectly good reason attached.
+      #
+      # MEASURED (main, 2026-08-05): the 06:18:33 empty cancel of DIVE-2758 also
+      # destroyed a LIVE tier-2 human gate — `agent-olivia gate button retire
+      # [ok]` twice at that timestamp, ~8 minutes after the gate reached
+      # marketing, on lodar's own surface decision, and the row still reads
+      # `answer: — pending`. So the loss was not merely the record of a decision:
+      # it was the AFFORDANCE BY WHICH A HUMAN COULD STILL MAKE ONE. A reason
+      # field cannot repair that, which is why this is not folded into the check
+      # below.
+      #
+      # WHY IT REFUSES RATHER THAN WARNS: the retire is already silent-by-design
+      # (best-effort, `|| true`, no stderr), and the operator population here is
+      # exactly callers clearing a board at speed. A warning is read after the
+      # write; the buttons are gone by then.
+      #
+      # THE EXITS ARE NAMED ON PURPOSE, against the DIVE-2067 rule that a refusal
+      # should not publish a route around itself — because here the alternative is
+      # WORSE than a published route. Refusing `done` (DIVE-555) and `cancel`
+      # (this) with no exit leaves a gated row with NO close verb at all, so the
+      # next agent invents one: a raw UPDATE, a --force flag request, or an
+      # `answer` typed on the human's behalf, which is the forgery DIVE-1117's
+      # tier floor exists to prevent. `--withdraw` is the honest exit and it is
+      # recorded as a withdrawal in gate_history, never as an answer. See
+      # community/wiki/a-default-action-that-terminates-on-a-human-held-surface-is-a-queue.md.
+      local _cg_filer; _cg_filer=$(db "SELECT COALESCE(NULLIF(gate_filed_by,''), assignee, '') FROM tasks WHERE id=${id};")
+      policy_refuse "$E_CONFLICT" cancel-over-open-gate DIVE-2773 "$ident" \
+        "$ident has a PENDING '${_gt}' gate still awaiting a human, and a cancel does not answer it — it deletes the question and silently retires the human's buttons on the way out (measured on DIVE-2758: a live tier-2 gate on lodar's own surface decision was retired by an empty cancel and still reads 'pending' with nobody having answered). Abandoning the WORK is legitimate; abandoning the QUESTION out from under the person it was asked of is not. Retire the gate explicitly first, then cancel: '5dive task need $ident --withdraw' (a recorded withdrawal, not an answer put in anyone's mouth) — filed by '${_cg_filer:-unknown}', so their lead can withdraw it too. If the question still matters, let them answer it instead: '5dive task answer $ident --value=...'."
+    fi
+  fi
+  # DIVE-2773: A FIRST CLOSE REQUIRES A NON-EMPTY REASON, ON BOTH VERBS.
+  #
+  # This is NOT the DIVE-2483/DIVE-2464 guard ported to `cancel`, and the
+  # difference is the whole ticket. That guard is DESTROY-protection: its own
+  # first lines return early when the row carries no result yet
+  # (`if [[ -z "$_cl_prev" ... ]]`), because with nothing recorded there are no
+  # bytes at risk. Correct for what it does — and it means a FIRST close with a
+  # blank reason was accepted by BOTH verbs all along (demonstrated by olivia on
+  # scratch row DIVE-2774: open row, `task done --result=""`, rc=0, empty result
+  # stored). Shipping "give cancel the check done already has" would have
+  # delivered destroy-protection that misses every blank first close and leaves
+  # `done`, the commoner verb, exactly as open. So this is a new predicate keyed
+  # on the other thing entirely: THIS ROW IS BEING CLOSED AND NOTHING HAS EVER
+  # BEEN WRITTEN ABOUT WHY.
+  #
+  # MEASURED POPULATION (main, from lifecycle_events, actor column read not
+  # inferred): seven empty-result cancels in three days, five by main and two by
+  # olivia, EVERY ONE of them a daily recurring row, arriving in bursts — three
+  # inside 186 seconds on 08-05, two inside 23 seconds on 08-04. The record they
+  # left is unreadable: DIVE-2472 was the same act by the same actor on the same
+  # template WITH a reason ("a stale dated instance, not work declined") and is
+  # still explicable six days on; DIVE-2683 and DIVE-2737 are not. Identical
+  # verb, identical author, opposite legibility, and the only difference is
+  # whether the field was filled.
+  #
+  # NO FLAG BYPASSES THIS, deliberately. The population is precisely callers
+  # clearing a board at speed, and a flag is what they reach for; an escape hatch
+  # would be taken by exactly the people this exists to slow down. The cost of
+  # being wrong is one sentence.
+  #
+  # SCOPE, kept narrow so no false refusal is possible:
+  #   * only a REAL close — a maker→verifier delivery routes and returns above,
+  #     so a bare `task done` handoff is untouched;
+  #   * only a FIRST close — an already done/cancelled row keeps its long-standing
+  #     idempotent bare re-close (rc=0 no-op). "First" is meant literally;
+  #   * only when the column is empty AND nothing is being written. A row that
+  #     already carries text is the other guard's population, and a close that
+  #     supplies text is what this asks for.
+  if [[ "$verb" == "done" || "$verb" == "cancel" ]]; then
+    local _fc_st _fc_prev
+    _fc_st=$(db   "SELECT COALESCE(status,'') FROM tasks WHERE id=${id};")
+    _fc_prev=$(db "SELECT COALESCE(result,'') FROM tasks WHERE id=${id};")
+    if [[ "$_fc_st" != "done" && "$_fc_st" != "cancelled" && -z "$_fc_prev" && -z "$result" ]]; then
+      # NAME THE SHAPE OF A GOOD REASON, not just the flag. The useful cancel
+      # reasons say what was NOT concluded — main's own DIVE-2472 text is the
+      # model — and a caller under load writes "n/a" unless told otherwise, which
+      # satisfies a non-empty check while recording nothing. A refusal that only
+      # says "pass --result" buys the string and not the sentence.
+      local _fc_shape _fc_past="closed"
+      [[ "$verb" == "cancel" ]] && _fc_past="cancelled"
+      if [[ "$verb" == "cancel" ]]; then
+        _fc_shape="Say what was NOT concluded, not just that you stopped: 'CANCELLED as a stale dated instance, not as work declined — an overnight recap cannot usefully be back-sent three days later' (DIVE-2472) is still readable six days later; 'n/a' and 'done' are not. If the row is a stale recurring instance, say so; if the work was declined, say why."
+      else
+        _fc_shape="Say what the reader needs — what shipped or what was concluded, and where to look (a PR, a sha, a file). The dashboard and this row's creator read this field and nothing else."
+      fi
+      policy_refuse "$E_VALIDATION" close-without-reason DIVE-2773 "$ident" \
+        "$ident is being ${_fc_past} for the first time and nothing has ever been recorded about why — '5dive task ${verb}' here would close it with a permanently blank result. The ledger keeps only a sha256 of that field, so an empty one is indistinguishable from one nobody ever wrote and the loss is undetectable afterwards (DIVE-2483's reasoning, which is about the COLUMN, not the verb). Pass '--result=<why>' (or '--result-file=<path>'). ${_fc_shape} No flag bypasses this."
     fi
   fi
   # DIVE-1830 merge-gate (opt-in): a task that declared DELIVERED WORK cannot
@@ -4374,6 +4472,19 @@ $_body"
   # retired at answer time, and re-editing would only add a "not modified" row.
   # Independent of --notify (that flag governs the human's ✅/⚠️ ping, a different
   # question from whether a dead control is still on their screen).
+  #
+  # DIVE-2773: THIS IS NOW UNREACHABLE BY CONSTRUCTION and is kept anyway, which is
+  # a claim that needs its reasons stated rather than left for the next reader to
+  # rediscover. Both close verbs are refused above while a gate is unanswered, so
+  # no `done`/`cancel` can arrive here with `need_answered_at IS NULL`; the retire
+  # WIRING is still exercised by `task answer`, `task need --withdraw`, a re-filed
+  # gate and `task park`, which are the paths that legitimately moot a question.
+  # It stays because it is idempotent and free on the reachable path (the SELECT
+  # returns nothing), and because it is the backstop if either refusal above is
+  # ever scoped narrower — a close that lands on a live gate must not leave a
+  # button that looks answerable. Its old test arm was inverted rather than
+  # deleted (tests/gate_button_retire_unit.sh): over a live gate the cancel is
+  # refused and the button must SURVIVE, because the question is still open.
   if [[ "$verb" == "done" || "$verb" == "cancel" ]]; then
     local _open_gate
     _open_gate=$(db "SELECT 1 FROM tasks WHERE id=${id} AND need_type IS NOT NULL AND need_answered_at IS NULL;" 2>/dev/null || echo "")
@@ -4863,16 +4974,45 @@ cmd_task_reject() {
     policy_refuse "$E_CONFLICT" reject-over-closed DIVE-2112 "$ident" \
       "$ident is already done and was graded by '${vfier}', not by you ('${_rj_actor}'). Reopening it here would discard that grade and file the reopen under '${vfier}''s name. '${vfier}' can reopen their own grade; anyone else should raise a NEW task citing $ident."
   fi
-  _rj_prev=$(db "SELECT COALESCE(result,'') FROM tasks WHERE id=${id};")
   # (3) attribute to the REAL actor, never to the recorded verifier by assumption.
   local fb_txt="❌ ${_rj_actor} rejected (iteration ${iter}): ${feedback:-no feedback given}"
-  # (4) never silently discard a landed record.
-  if [[ "$_rj_st" == 'done' && -n "$_rj_prev" ]]; then
-    # ONE marker, deliberately shared with the verify path (olivia, DIVE-2112: "extend,
-    # do not fork the marker") so a single grep finds every superseded record. The
-    # ticket in the string names the CONVENTION's origin, not this call site.
-    fb_txt="${fb_txt}"$'\n'"--- superseded result (DIVE-2067, preserved) ---"$'\n'"${_rj_prev}"
-  fi
+  # (4) never silently discard a landed record — VIA THE SHARED GUARD, not a
+  # private copy of it.
+  #
+  # DIVE-2773. `reject` cannot write a BLANK (a missing --feedback substitutes
+  # "no feedback given" above), so it is not in the first-close-needs-a-reason
+  # population at all. Its defect was the other one, and it is DIVE-2762 EXACTLY,
+  # one verb over: the hand-rolled preservation this replaces read
+  #
+  #     if [[ "$_rj_st" == 'done' && -n "$_rj_prev" ]]; then ... fi
+  #
+  # so the preservation FIRED ONLY ON A `done` ROW. A row delivered to a verifier
+  # is `todo` BY DESIGN — that is the rail's own contract, a correct `task done`
+  # delivers it, status stays todo, assignee moves to the verifier. So on the
+  # ORDINARY reject path, the one the loop manufactures on every bounce, `_rj_st`
+  # is 'todo', the branch did not fire, and the bare UPDATE below replaced the
+  # MAKER'S RESULT with the rejection text. No warning, no marker, no audit of
+  # the overwritten value.
+  #
+  # That is DIVE-2762's finding verbatim: the guard keyed on CLOSED-NESS while
+  # the population is CARRIES-A-RESULT. DIVE-2483 repaired exactly that for
+  # done/deliver/verify by routing all three through
+  # `_task_guard_result_over_closed`. `cmd_task_reject` was never one of its call
+  # sites; it kept a private copy of the OLD, WRONG predicate and so survived the
+  # fix meant to kill the class — while wearing a DIVE-2067 marker that made it
+  # look handled. Fixing a class in three places and leaving a fourth hand-rolled
+  # copy is how this got here, which is why the remedy is one predicate and not a
+  # fourth condition: the next verb added inherits the guard instead of a habit.
+  #
+  # append_result=1 rather than 0, and that is load-bearing: on a CLOSED row the
+  # guard's default is to REFUSE, which would break the one legitimate reopen
+  # DIVE-2112 allows (the recorded verifier withdrawing their own grade) — the
+  # very case the old private branch existed to serve. Asking for the append is
+  # what makes this a strict widening. Note the seam puts the PRIOR text first
+  # now, where the old marker put it last; that is the shared convention's order
+  # and a single grep still finds every superseded record.
+  _task_guard_result_over_closed "$id" "$ident" reject "$fb_txt" 1 0 reject-result-over-open
+  fb_txt="$_TASK_GUARDED_RESULT"
   # DIVE-1495: a reject supersedes any still-open need-gate on this task. Leaving
   # it 'pending' (need_answered_at NULL) let the DIVE-1490 re-nag ladder keep
   # firing a question the reject already mooted (CNCL-9: lodar was re-nagged AFTER

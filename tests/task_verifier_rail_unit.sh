@@ -156,7 +156,7 @@ self_out=$(run verifier "$med_id" alice); self_rc=$?
 
 closed_json=$(run add --assignee=alice --priority=low -- "already finished chore")
 closed_id=$(printf '%s' "$closed_json" | jf '.data.id')
-run done "$closed_id" >/dev/null
+run done "$closed_id" --result="chore finished (DIVE-2773: a first close must carry a reason)" >/dev/null
 cl_out=$(run verifier "$closed_id" boss); cl_rc=$?
 (( cl_rc != 0 )) && has "$(cat "$TMP"/err)$cl_out" "task reject" \
   && ok_t "T9b refuses to retro-grade a CLOSED task and points at 'task reject'" \

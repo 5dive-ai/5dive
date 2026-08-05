@@ -70,7 +70,7 @@ edges() { db "SELECT COUNT(*) FROM task_deps WHERE task_id=$1;"; }
 a=$(addt --assignee=alice -- "blocker A"); b=$(addt --assignee=bob -- "dependent B")
 ( cmd_task_block "$b" --by="$a" ) >/dev/null 2>&1
 [[ "$(st "$b")" == "blocked" && "$(edges "$b")" == "1" ]] || bad_t "T1 setup" "B not blocked"
-( cmd_task_done "$a" ) >/dev/null 2>&1
+( cmd_task_done "$a" --result="closed in fixture setup (DIVE-2773: a first close must carry a reason)" ) >/dev/null 2>&1
 [[ "$(st "$b")" == "todo" && "$(edges "$b")" == "0" ]] \
   && ok_t "done blocker -> dependent flips todo, edge dropped" \
   || bad_t "single cascade" "B status=$(st "$b") edges=$(edges "$b")"
@@ -83,9 +83,9 @@ grep -q $'^bob\t' "$SEND_LOG" \
 a1=$(addt -- "A1"); a2=$(addt -- "A2"); d=$(addt --assignee=dora -- "D two-blockers")
 ( cmd_task_block "$d" --by="$a1" ) >/dev/null 2>&1
 ( cmd_task_block "$d" --by="$a2" ) >/dev/null 2>&1
-( cmd_task_done "$a1" ) >/dev/null 2>&1
+( cmd_task_done "$a1" --result="closed in fixture setup (DIVE-2773: a first close must carry a reason)" ) >/dev/null 2>&1
 half="$(st "$d")/$(edges "$d")"
-( cmd_task_done "$a2" ) >/dev/null 2>&1
+( cmd_task_done "$a2" --result="closed in fixture setup (DIVE-2773: a first close must carry a reason)" ) >/dev/null 2>&1
 full="$(st "$d")/$(edges "$d")"
 [[ "$half" == "blocked/1" && "$full" == "todo/0" ]] \
   && ok_t "two blockers: stays blocked after 1, flips after both ($half -> $full)" \
@@ -94,7 +94,7 @@ full="$(st "$d")/$(edges "$d")"
 # --- T3: CANCELLING a blocker cascades just like done
 a=$(addt -- "A cancel"); b=$(addt --assignee=bob -- "B via cancel")
 ( cmd_task_block "$b" --by="$a" ) >/dev/null 2>&1
-( cmd_task_cancel "$a" ) >/dev/null 2>&1
+( cmd_task_cancel "$a" --result="closed in fixture setup (DIVE-2773: a first close must carry a reason)" ) >/dev/null 2>&1
 [[ "$(st "$b")" == "todo" && "$(edges "$b")" == "0" ]] \
   && ok_t "cancelled blocker also cascades" || bad_t "cancel cascade" "B status=$(st "$b")"
 
@@ -102,7 +102,7 @@ a=$(addt -- "A cancel"); b=$(addt --assignee=bob -- "B via cancel")
 a=$(addt -- "A gate"); b=$(addt --assignee=bob -- "B gated")
 ( cmd_task_block "$b" --by="$a" ) >/dev/null 2>&1
 ( cmd_task_need "$b" --type=decision --options="X|Y" --ask="pick one" ) >/dev/null 2>&1
-( cmd_task_done "$a" ) >/dev/null 2>&1
+( cmd_task_done "$a" --result="closed in fixture setup (DIVE-2773: a first close must carry a reason)" ) >/dev/null 2>&1
 [[ "$(st "$b")" == "blocked" && "$(edges "$b")" == "0" ]] \
   && ok_t "need-gated dependent stays blocked (edge dropped, not flipped)" \
   || bad_t "gate guardrail" "B status=$(st "$b") edges=$(edges "$b")"
@@ -111,7 +111,7 @@ a=$(addt -- "A gate"); b=$(addt --assignee=bob -- "B gated")
 a=$(addt -- "A park"); b=$(addt --assignee=bob -- "B parked")
 ( cmd_task_block "$b" --by="$a" ) >/dev/null 2>&1
 db "UPDATE tasks SET parked_at=datetime('now'), park_reason='holding' WHERE id=$b;"
-( cmd_task_done "$a" ) >/dev/null 2>&1
+( cmd_task_done "$a" --result="closed in fixture setup (DIVE-2773: a first close must carry a reason)" ) >/dev/null 2>&1
 [[ "$(st "$b")" == "blocked" ]] \
   && ok_t "parked dependent stays blocked (park owns the hold)" \
   || bad_t "park guardrail" "B status=$(st "$b")"

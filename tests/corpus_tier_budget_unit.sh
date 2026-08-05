@@ -869,5 +869,125 @@ if [[ -z "$_ord" ]]; then
   ok "every job that runs the budgeted runner BUILDS THE BUNDLE FIRST, in that job — the calibration probe spawns it, and a missing bundle now fails closed"
 else bad "every job that runs the budgeted runner builds the bundle first, in that job" "offending job(s): $_ord"; fi
 
+# ------------------------ 61-73 DIVE-2736: THE PROBE IS GRADED AGAINST THE CORPUS
+# THE MEASUREMENT THAT FORCED THIS, on core/installed-host, same PR, 13 minutes apart:
+#
+#     01:47   237 harnesses   282s   calibration 117714us/iter (68% of a normal)
+#     02:00   236 harnesses   372s   calibration  82218us/iter (47% of a normal)
+#
+# ONE FEWER harness, 90s SLOWER corpus, and the probe reported the runner 31 points
+# FASTER. That is DIVE-2710's premise inverted — the ratio's two halves moved in
+# opposite directions — and because the clamp floors at 100%, a probe that under-reads
+# can NEVER widen the cap. The mechanism gave zero relief on the one run it existed for.
+#
+# TWO THINGS SHIP HERE AND NEITHER OF THEM IS A REMEDY. A post-corpus probe (the
+# discriminator between "the probe sampled the wrong moment" and "the probe measures the
+# wrong mix"), and a cross-run reader. The remedy waits for the data, which is why arm 65
+# below — the post probe changes NO verdict — is the load-bearing one in this section:
+# wiring the second reading into the scale is a one-line edit anybody might make while
+# "finishing the job", and it would ship a fix for a cause that is still n=1.
+rm -f "$TMP"/*.sh "$TMP"/*.seen
+
+# ---- 61-63 the arithmetic. SIGNED, because the two directions mean different things:
+# the corpus warms the cache and biases the post probe FAST, so only "post slower"
+# survives the confound. An absolute value would fold the clean signal into the dirty one.
+want "the post probe reading SLOWER than the pre probe is a POSITIVE divergence" \
+  "20" "$(tier_cal_diverge_pct 100000 120000)"
+want "the post probe reading FASTER is NEGATIVE (the direction a warm cache also produces)" \
+  "-30" "$(tier_cal_diverge_pct 100000 70000)"
+if tier_cal_diverge_pct 0 100000 >/dev/null 2>&1; then
+  bad "a zero pre-probe REFUSES rather than dividing by it" "returned 0"
+else ok "a zero pre-probe REFUSES rather than dividing by it"; fi
+
+# ---- 64 the report carries the pair, or the cross-run reader has nothing to read
+printf '#!/usr/bin/env bash\nexit 0\n' > "$TMP/w.sh"
+bash "$RUNNER" --corpus-dir="$TMP" --tier=full --budget=1 --label=t \
+  --cal-baseline-us=100000 --cal-us=120000 --cal-post-us=150000 --confirm-top=0 \
+  --report="$TMP/rep2.txt" >/dev/null 2>&1
+_miss=""
+for f in cal_post_status cal_post_us_per_iter cal_post_delta_pct; do
+  grep -q "^# $f=" "$TMP/rep2.txt" || _miss="$_miss $f"
+done
+want "the report's post-probe delta is computed, not just echoed" \
+  "# cal_post_delta_pct=25" "$(grep -m1 '^# cal_post_delta_pct=' "$TMP/rep2.txt")"
+if [[ -z "$_miss" ]]; then
+  ok "the report carries the post-probe fields beside the pre-probe ones — a window read needs BOTH readings from the same run or it is comparing runs to each other on one number"
+else bad "the report carries the post-probe fields" "missing:$_miss"; fi
+
+# ---- 65 THE LOAD-BEARING ARM: THE SECOND PROBE GRADES NOTHING.
+# 1.4s of corpus against a 1s cap on a runner measured NORMAL is exit 4. The post probe
+# says 300% — under any bracket-on-max remedy that is a 150% clamp, a 1.5s cap, and a
+# PASS. So this arm goes green if and only if the discriminator stayed out of the
+# verdict. Paired, as the 2592 arms are, with the run that must NOT red: same post
+# probe, corpus inside the cap.
+printf '#!/usr/bin/env bash\nsleep 1.4\nexit 0\n' > "$TMP/w.sh"
+relrun --budget=1 --cal-us=100000 --cal-post-us=300000 --confirm-top=0
+want "a post probe reading 3x slow does NOT rescue an over-budget run (it is a discriminator, not an input)" "4" "$RC"
+printf '#!/usr/bin/env bash\nsleep 0.3\nexit 0\n' > "$TMP/w.sh"
+relrun --budget=1 --cal-us=100000 --cal-post-us=300000 --confirm-top=0
+want "and the same post probe does not RED a run that was inside its cap either" "0" "$RC"
+
+# ---- 66-68 the three branches of the diagnosis. A branch that prints the wrong verdict
+# is invisible: every branch exits 0 and the run passes regardless, so the TEXT is the
+# only observable and each one has to be named separately.
+printf '#!/usr/bin/env bash\nexit 0\n' > "$TMP/w.sh"
+relrun --budget=1 --cal-us=100000 --cal-post-us=104000 --confirm-top=0
+if [[ "$OUT" == *"PROBE BRACKET"* && "$OUT" == *"AGREES"* && "$OUT" == *"cache"* ]]; then
+  ok "probes within the threshold say AGREES — and say in the same breath that the corpus warmed what the probe pays for, so agreement is weak evidence, not a clearance"
+else bad "probes within the threshold say AGREES, with the confound named" "$OUT"; fi
+relrun --budget=1 --cal-us=100000 --cal-post-us=140000 --confirm-top=0
+if [[ "$OUT" == *"DIVERGES"* && "$OUT" == *"SLOWER after the corpus"* && "$OUT" == *"COUNTERFACTUAL, NOT APPLIED"* ]]; then
+  ok "a post probe 40% slower says DIVERGES, names the direction that survives the confound, and prints the cap a max-bracket WOULD have set — labelled as not applied"
+else bad "a slower post probe prints the counterfactual, labelled as not applied" "$OUT"; fi
+relrun --budget=1 --cal-us=100000 --cal-post-us=60000 --confirm-top=0
+if [[ "$OUT" == *"DIVERGES"* && "$OUT" == *"FASTER after the corpus"* ]]; then
+  ok "a post probe 40% faster diverges in the direction that costs nobody a red, and is reported as such rather than as the same event"
+else bad "a faster post probe is reported as its own direction" "$OUT"; fi
+
+# ---- 69 the off switch, and that it is an off switch and not a lie
+relrun --budget=1 --cal-us=100000 --no-cal-post --confirm-top=0 --report="$TMP/rep3.txt"
+want "--no-cal-post records the probe as skipped rather than as a reading of zero" \
+  "# cal_post_status=skipped" "$(grep -m1 '^# cal_post_status=' "$TMP/rep3.txt")"
+
+# ---- 70 no workflow injects the new seams either, same rule as --cal-us
+_wfp="$(grep -rn -- '--cal-post-us=' .github/workflows/ 2>/dev/null || true)"
+if [[ -z "$_wfp" ]]; then
+  ok "NO workflow injects a post-probe reading — the discriminator must measure the runner it is standing on, or it discriminates nothing"
+else bad "NO workflow injects a post-probe reading" "$_wfp"; fi
+
+# ---- 71-73 the cross-run reader. TWO OF THESE ROWS ARE THE REAL MEASUREMENT (the
+# 01:47 and 02:00 installed-host runs above); the third is CONSTRUCTED to complete a
+# window, and is labelled so nobody later reads it as a fourth CI reading.
+WIN="scripts/tier-cal-window.sh"
+mkrep() { # mkrep <file> <label> <harnesses> <wall_s> <cal_us> <post_us> <delta>
+  printf '# run-harnesses report\n# tier=core\n# label=%s\n# harnesses=%d\n# wall_clock_s=%d\n# cal_status=measured\n# cal_us_per_iter=%d\n# cal_post_us_per_iter=%d\n# cal_post_delta_pct=%d\n' \
+    "$2" "$3" "$4" "$5" "$6" "$7" > "$TMP/$1"
+}
+mkrep r1.txt installed-host 237 282 117714 0 0      # MEASURED, gh run 30962...  01:47
+mkrep r2.txt installed-host 236 372  82218 0 0      # MEASURED, gh run 30967674559 02:00
+mkrep r3.txt installed-host 237 275 120693 0 0      # CONSTRUCTED to make a window of 3
+_w="$(bash "$WIN" "$TMP/r1.txt" "$TMP/r2.txt" "$TMP/r3.txt" --strict 2>&1)"; _wrc=$?
+if (( _wrc == 7 )) && [[ "$_w" == *"UNPROTECTED"* ]]; then
+  ok "the measured anti-correlated pair is read as UNPROTECTED and FAILS --strict (exit 7) — probe below the window median while the corpus sat above it is the case the clamp floor guarantees no relief for"
+else bad "the measured anti-correlated pair fails --strict as UNPROTECTED" "rc=$_wrc $_w"; fi
+
+# A window of two has no interior. Refusing is exit 2, and exit 2 is NOT a pass — the
+# same three-state the tier resolver and the runner both keep.
+bash "$WIN" "$TMP/r1.txt" "$TMP/r2.txt" >/dev/null 2>&1
+want "a window shorter than three REFUSES rather than reporting a verdict from an endpoint" "2" "$?"
+
+# THE CONTROL, and it is the arm that grades the normalisation rather than the counting:
+# a corpus that TRIPLES in size while the runner drifts mildly must read CONCORDANT. On
+# raw wall-clock it would not — run g3 has the largest wall-clock in the window and the
+# fastest probe, which is the anti-correlation signature — so this arm reds if anyone
+# ever compares wall_clock_s directly, which is the obvious way to write this tool.
+mkrep g1.txt pristine 100 100 100000 0 0
+mkrep g2.txt pristine 200 220 110000 0 0
+mkrep g3.txt pristine 300 270  90000 0 0
+_g="$(bash "$WIN" "$TMP/g1.txt" "$TMP/g2.txt" "$TMP/g3.txt" --strict 2>&1)"; _grc=$?
+if (( _grc == 0 )) && [[ "$_g" == *"concordant 2"* ]]; then
+  ok "CORPUS GROWTH is not anti-correlation: normalising wall-clock to us/harness keeps a window concordant that raw wall-clock would have called discordant"
+else bad "corpus growth is not read as anti-correlation" "rc=$_grc $_g"; fi
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 (( fail == 0 ))
