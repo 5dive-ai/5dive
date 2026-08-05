@@ -192,7 +192,10 @@ _install_bundled_skill() {
 # --as=cris leaves "You are Dario" in CLAUDE.md). Rewrite the persona name across
 # the identity + memory docs so the imported agent owns its chosen name. Both the
 # Capitalized display form (Dario) and the lowercase slug form (dario) are
-# replaced; word-boundary anchored so we don't mangle substrings.
+# replaced. A lowercase slug is a complete lexical token here: apostrophe-linked
+# continuations count as part of the token, so the agent `don` does not corrupt
+# ordinary prose such as "don't". The display form deliberately permits a
+# following apostrophe so possessives still rename (`Don's` -> `Cris's`).
 _pack_rename_persona() {
   local dir="$1" old="$2" new="$3"
   local old_l="${old,,}" new_l="${new,,}"
@@ -201,7 +204,31 @@ _pack_rename_persona() {
   local f
   for f in "$dir/CLAUDE.md" "$dir/card.md" "$dir/persona.yaml" "$dir"/memory/*.md; do
     [[ -f "$f" ]] || continue
-    sed -i -E "s/\\b${old_c}\\b/${new_c}/g; s/\\b${old_l}\\b/${new_l}/g" "$f" 2>/dev/null || true
+    # `\b` splits at punctuation, including the apostrophe inside a contraction.
+    # Lookarounds let adjacent names share a delimiter without consuming it, and
+    # one combined substitution never re-processes a replacement that happens to
+    # contain the old slug (e.g. `a` -> `a-one`). re.escape also keeps a malformed
+    # third-party manifest value from becoming regex syntax.
+    python3 - "$f" "$old_l" "$new_l" "$old_c" "$new_c" 2>/dev/null <<'PY' || true
+import pathlib
+import re
+import sys
+
+path = pathlib.Path(sys.argv[1])
+old_l, new_l, old_c, new_c = sys.argv[2:]
+pattern = re.compile(
+    # Match the display name before a possessive suffix without consuming that
+    # suffix, but reject every other apostrophe-linked continuation (notably a
+    # sentence-leading contraction such as "Don't").
+    rf"(?P<display>(?<![\w'’]){re.escape(old_c)}(?=(?:['’]s)?(?![\w'’])))"
+    rf"|(?P<slug>(?<![\w'’]){re.escape(old_l)}(?![\w'’]))"
+)
+with path.open("r", encoding="utf-8", errors="surrogateescape", newline="") as handle:
+    text = handle.read()
+text = pattern.sub(lambda match: new_c if match.group("display") else new_l, text)
+with path.open("w", encoding="utf-8", errors="surrogateescape", newline="") as handle:
+    handle.write(text)
+PY
   done
 }
 
