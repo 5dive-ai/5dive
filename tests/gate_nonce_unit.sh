@@ -190,6 +190,21 @@ out=$(SUDO_UID="$AGENT_UID" cmd_task_answer DIVE-400 --value=approved --human --
 [[ "$(answered DIVE-400)" == "open" && $rc -ne 0 ]] && ok_t "T4 DIVE-950: --proof no longer clears (form b dropped)" \
   || bad_t "T4 --proof dropped" "rc=$rc state=$(answered DIVE-400) out=$out"
 
+# DIVE-2371: authorization is now the uid test AND a structural cgroup test, and
+# this file's uid stubs cannot reach that read. Unpinned, T5 below (a human-on-box
+# clearing with no proof) is refused, its pre-existing `fail 6` exits this
+# UNSUBSHELLED harness, and the file truncates at 12 of 19 arms with rc=6 — no
+# summary, no HARNESS-RC, and nothing that greps for a FAIL line notices.
+#
+# Pinned to the DASHBOARD/drop surface these arms DESCRIBE, once, rather than
+# inherited from whatever ran the suite (the DIVE-2365 rule this file already
+# applies to the caller uid). The refusal arms below are unaffected: T6 is refused
+# on the agent SUDO_UID and T8 on the DIVE-394 caller guard, neither of which this
+# touches. Cgroup coverage itself belongs to gate_cgroup_human_principal_unit.sh —
+# this file grades the NONCE and SUDO_UID evidence forms, and it should grade them
+# without the structural half silently deciding every arm.
+_gate_caller_cgroup() { printf '%s' '/system.slice/shelld.service'; }
+
 # --- T5: (c) non-agent SUDO_UID clears with NO proof (drop / human-on-box) ----
 seed_task DIVE-500; cmd_task_need DIVE-500 --type=secret --ask="drop key" --secret-key=FIXTURE_TOKEN --connector=fixture >/dev/null 2>&1
 SUDO_UID=0 cmd_task_answer DIVE-500 --human --from=drop >/dev/null 2>&1
