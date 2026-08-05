@@ -672,7 +672,10 @@ _task_unparented_followup_advisory() {
       _candidate_ident=$(db "SELECT ident FROM tasks WHERE id=${_candidate_id};")
       _matches+="${_matches:+,}${_candidate_ident}"
     fi
-  done < <(db "SELECT id FROM tasks WHERE status NOT IN ('done','cancelled') ORDER BY id;")
+  done < <(db "SELECT id FROM tasks
+               WHERE status NOT IN ('done','cancelled')
+                 AND instr(upper(title), $(sqlq "$_target_ident")) > 0
+               ORDER BY id;")
 
   _TASK_FOLLOWUP_WARN_IDENT="$_target_ident"
   _TASK_FOLLOWUP_WARN_KIND="$_target_kind"
