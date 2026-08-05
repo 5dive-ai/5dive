@@ -1678,6 +1678,28 @@ _agents_md_is() {
 # Explode a single-file export back into a pack STAGE at <outdir>: manifest.json,
 # CLAUDE.md, memory/*.md. Deliberately reconstructs a v1 pack rather than a
 # second import path, so everything downstream in cmd_import is untouched.
+# _agents_md_tool_refs <rendered-file> — echo the harness-bound tool identifiers
+# named in an exported body, space-separated and de-duplicated; empty if none.
+#
+# DIVE-2749. Pure and file-in/string-out ON PURPOSE: the warning it feeds lives
+# inline in the export path, which no harness drives, so the detection is split
+# out here where tests/pack_agents_md_unit.sh can grade it directly. A guard
+# that cannot be graded is the class this whole ticket is about.
+#
+# NOT EXHAUSTIVE, and every caller must say so. Two shapes:
+#   * `mcp__*` — structural, any MCP tool on any harness.
+#   * a named set — the Claude-native pickers that actually appear in persona
+#     bodies (measured on DIVE-2575's `creative` export).
+# A hardcoded name list is brittle by construction, which is why the structural
+# half carries most of the weight and why an empty result means "none of the
+# shapes we look for", never "this body is portable".
+_agents_md_tool_refs() {
+  local f="$1"
+  [[ -r "$f" ]] || return 0
+  grep -oE 'mcp__[A-Za-z0-9_]+|\<(AskUserQuestion|ExitPlanMode|TodoWrite|NotebookEdit|SlashCommand)\>' "$f" 2>/dev/null \
+    | sort -u | paste -sd' ' - 2>/dev/null || true
+}
+
 _agents_md_explode() {
   local file="$1" outdir="$2"
   _agents_md_is "$file" || return 1
@@ -1997,6 +2019,35 @@ cmd_export() {
     rm -rf "$stage"; [[ -n "$mem_tmp" ]] && rm -rf "$mem_tmp"
     (( has_avatar )) && warn "dropped the avatar (binary): a single-file export carries no image — use --format=pack to keep avatar.png"
     (( n_hooks > 0 )) && warn "dropped $n_hooks hook block(s): a single-file export never carries arbitrary shell (export --format=pack if you need them)"
+    # DIVE-2749: hooks and avatar get a `dropped` declaration because they
+    # VISIBLY cannot travel. Tool references inside the persona body get none,
+    # because nothing knows they are harness-bound — so the body travels
+    # byte-faithfully and instructs the reader to use tools it may not have.
+    # Measured on DIVE-2575: `creative` is a claude agent, its exported body
+    # names mcp__plugin_telegram_telegram__reply / AskUserQuestion /
+    # ExitPlanMode, and a codex seat handed that file did NOT error — it
+    # believed the instruction and asserted "the user reads my messages on
+    # Telegram", false of a codex seat with channels none.
+    #
+    # NO EXISTING TEST CAN CATCH THIS CLASS: a round-trip test is
+    # export/import/diff, and byte equality is MAXIMISED by exactly this
+    # failure. The assertion that catches it is about the INTERSECTION with the
+    # importing harness, which is a different question.
+    #
+    # We deliberately do NOT claim the target lacks these. Same discipline as
+    # the skills warning below (DIVE-2583): at export time we do not know which
+    # harness the file lands on, and unearned specificity is the mistake that
+    # text already made once. The honest claim is narrower and still actionable
+    # — these identifiers belong to THIS seat's harness, the file does not say
+    # so, and a reader will follow them.
+    #
+    # Detection is two-part and NOT exhaustive, and the warning says so rather
+    # than letting a clean run read as "no harness-bound references": `mcp__*`
+    # is structural (any MCP tool, any harness), the named set is the Claude
+    # pickers that actually show up in persona bodies. A silent pass here means
+    # "none of the shapes we look for", never "portable".
+    local tool_refs; tool_refs=$(_agents_md_tool_refs "$out")
+    [[ -n "$tool_refs" ]] && warn "the body names harness-bound tool reference(s) and does not declare them as such: ${tool_refs} — these are identifiers of THIS seat's harness, they travel verbatim, and an importing harness that lacks them will not error, it will believe them (DIVE-2575). Verify each exists where you import, or edit the body. Detection covers mcp__* plus common native pickers and is NOT exhaustive"
     local skill_n; skill_n=$(jq -r 'length' <<<"$skills" 2>/dev/null || echo 0)
     # DIVE-2583: same correction as the rendered section — the FILE carries no
     # bodies (true everywhere); importing it still installs into the importing

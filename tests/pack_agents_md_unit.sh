@@ -332,5 +332,39 @@ truthy "import direction is named as a separate mechanism" \
 truthy "the text states landing, not loading (5dive does not verify the load at runtime)" \
   $(grep -q 'does not verify it' "$MD83"; echo $?)
 
+
+# --- DIVE-2749: harness-bound tool references in an exported body -------------
+# The export declares hooks/avatar as dropped because they visibly cannot
+# travel; body-level TOOL references get no such declaration, so the body goes
+# out byte-faithful and instructs the reader to use tools it may lack. A
+# ROUND-TRIP TEST CANNOT SEE THIS: byte equality is maximised by the failure.
+# These arms grade the detector, not the round-trip.
+T2749="$TMP/t2749.md"
+
+printf 'reply via mcp__plugin_telegram_telegram__reply and use AskUserQuestion then ExitPlanMode\n' > "$T2749"
+check "2749 detects mcp__ + both native pickers, sorted and deduped" \
+  "$(_agents_md_tool_refs "$T2749")" \
+  "AskUserQuestion ExitPlanMode mcp__plugin_telegram_telegram__reply"
+
+printf 'reply via mcp__plugin_telegram_telegram__reply twice: mcp__plugin_telegram_telegram__reply\n' > "$T2749"
+check "2749 de-duplicates a repeated identifier" \
+  "$(_agents_md_tool_refs "$T2749")" "mcp__plugin_telegram_telegram__reply"
+
+# NEGATIVE CONTROL, and it is the one that makes a clean run mean anything: a
+# body with no harness-bound identifiers must come back EMPTY, or the warning
+# fires on every export and gets ignored — which is how the class got here.
+printf 'A persona body about writing copy, telegram, planning and questions.\n' > "$T2749"
+check "2749 negative control: ordinary prose yields no refs" \
+  "$(_agents_md_tool_refs "$T2749")" ""
+
+# Substring must NOT match: \< \> word boundaries, or 'MyAskUserQuestionHelper'
+# in prose would be reported as a tool the target lacks.
+printf 'the MyAskUserQuestionHelper class and ExitPlanModeish notes\n' > "$T2749"
+check "2749 word-boundary: substrings are not tool references" \
+  "$(_agents_md_tool_refs "$T2749")" ""
+
+check "2749 unreadable file yields empty, never an error" \
+  "$(_agents_md_tool_refs "$TMP/does-not-exist.md")" ""
+
 printf '\n%s: %d passed, %d failed\n' "$(basename "$0")" "$PASS" "$FAIL"
 (( FAIL == 0 ))
