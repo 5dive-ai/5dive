@@ -168,6 +168,46 @@ out=$( cmd_task_done "$id" --result="$THEIRS" 2>&1 ); rc=$?
 res=$(db "SELECT COALESCE(result,'') FROM tasks WHERE id=$id;")
 [ "$res" = "$THEIRS" ] && ok "N3 an IDENTICAL --result= is a no-op, not a self-append (no duplication)" || no "N3 identical no-op" "$res"
 
+echo "== O. WHAT THE OPERATOR SEES — a different assertion shape, deliberately =="
+# DIVE-2483 iteration 2, from olivia's reject. Every arm above this point ends in
+# SELECT result FROM tasks and compares strings. The gate answer named FOUR
+# conditions; the two expressible as COLUMN STATE shipped, and the two about what
+# the operator SEES were dropped — and this harness had zero arms on either,
+# because an arm about stdout needs a different shape than an arm about the DB.
+# That is the transferable finding: a state-asserting harness has no natural home
+# for an output condition, so those are exactly the conditions a maker's own
+# harness declines to grade. These arms are that home.
+id=$(seed in_progress "$THEIRS")
+out=$( cmd_task_done "$id" --result="$MINE" 2>&1 ); rc=$?
+res=$(db "SELECT COALESCE(result,'') FROM tasks WHERE id=$id;")
+grep -q "PRESERVED, not replaced" <<<"$out" \
+  && ok "O1 the append is ANNOUNCED — a bare open-row close no longer prints only 'done'" \
+  || no "O1 preservation announced" "operator saw: ${out:0:200}"
+grep -qE "[0-9]+ bytes kept" <<<"$out" \
+  && ok "O2 the announcement carries the PRIOR BYTE COUNT (falsifiable at a glance)" \
+  || no "O2 byte count present" "$out"
+grep -qF "${#THEIRS} bytes kept" <<<"$out" \
+  && ok "O3 ...and the byte count is CORRECT (${#THEIRS})" \
+  || no "O3 byte count correct" "expected ${#THEIRS}; saw: $out"
+# THE SEAM IS THE PROVENANCE — there is no result_by column, so an undated marker
+# says two texts were joined and nothing about when.
+grep -qE 'appended [0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}Z by a later write' <<<"$res" \
+  && ok "O4 the seam marker carries a UTC TIMESTAMP, not a static string" \
+  || no "O4 seam is dated" "$res"
+# NOT NOISE: the announcement must not fire when there was nothing to preserve.
+id=$(seed in_progress "")
+out=$( cmd_task_done "$id" --result="$MINE" 2>&1 ); rc=$?
+! grep -q "PRESERVED, not replaced" <<<"$out" \
+  && ok "O5 no announcement when the column was empty (it is a signal, not a banner)" \
+  || no "O5 announcement not always-on" "$out"
+# AND IT REACHES THE VERIFY PATH, which is the third writer and the one DIVE-2624
+# lost a record through.
+id=$(seedv in_progress "$THEIRS" olivia "")
+out=$( cmd_task_verify "$id" --cmd="true" --no-done 2>&1 ); rc=$?
+grep -q "PRESERVED, not replaced" <<<"$out" \
+  && ok "O6 'task verify' announces the preservation too (DIVE-2624's writer)" \
+  || no "O6 verify announces" "${out:0:200}"
+
 echo
 echo "DIVE-2483 result-loss-on-open-row guard: passed: $P  failed: $F"
 [ "$F" -eq 0 ]

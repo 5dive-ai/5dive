@@ -151,7 +151,14 @@ as_human cmd_task_answer "$a" --value=done >/dev/null; rca=$?
 [[ "$(doneat_of "$a")" == "$a_d0" ]] \
   && ok_t "A: done_at preserved — the verifier's close time survives" \
   || bad_t "A: done_at RE-STAMPED on a closed row" "was '$a_d0' now '$(doneat_of "$a")'"
-[[ "$(status_of "$a")" == "done" && "$(res_of "$a")" == "$ACK" ]] \
+# DIVE-2483 (iteration 2): this arm used to assert result == "$ACK" EXACTLY.
+# That equality pinned the WIPE: seed_closed builds its fixture by having the
+# verifier close over the maker's "maker delivery v1", which under the old guard
+# DESTROYED it. The fixture performed the very data loss DIVE-2483 was filed to
+# stop, then asserted it had happened. The contract now is that the ACK is
+# PRESENT and the maker's record SURVIVES beneath it, which is what this checks.
+[[ "$(status_of "$a")" == "done" && "$(res_of "$a")" == *"$ACK"* \
+   && "$(res_of "$a")" == *"maker delivery v1"* ]] \
   && ok_t "A: status and the verifier's ACK untouched" \
   || bad_t "A: graded record moved" "status=$(status_of "$a") result=$(res_of "$a")"
 [[ -z "$(nat_of "$a")" ]] \
