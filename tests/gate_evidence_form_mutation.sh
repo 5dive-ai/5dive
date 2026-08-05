@@ -1,6 +1,34 @@
 #!/usr/bin/env bash
-# TIER: core — ~50s measured (dev3, control plane, 2026-08-05, `time bash tests/gate_evidence_form_mutation.sh` -> rc 0, 8 mutants killed). Quote the environment when you replace this number.
+# TIER: nightly — 54.4s measured (dev3, control plane, 2026-08-05, wall-clock around `bash tests/gate_evidence_form_mutation.sh` -> rc 0, 8 mutants killed). Quote the environment when you replace this number. It does not fit the 300s PR core; the nightly sweep runs it. The argument is on the WHY NOT CORE lines below, because a demotion is third-preference and has to be read, not just parsed.
 # DIVE-2799 mutation grader for tests/gate_evidence_form_unit.sh.
+#
+# WHY NOT CORE (DIVE-2824). This file does not cost what it asserts. It costs 8 x a full
+# run of tests/gate_evidence_form_unit.sh, each against a mutated copy of src, so its
+# price is set by the harness it grades and by the runner — and nothing a PR diff
+# contains moves it. That is precisely the shape a wall-clock PR budget is the wrong
+# instrument for: the cap exists to make a diff's own cost legible, and this file's cost
+# is constant with respect to every diff that is not this file.
+#
+# At 54.4s it was the largest single item in the core tier and ~18% of the 300s cap,
+# which is how an unrelated +1.1s guard went over the line: test-installed-host on PR
+# #517 exited 4 with "OVER BUDGET by 1s (313s > 312s effective cap). NO TEST FAILED —
+# 251 of 251 harnesses passed." Reclaiming only that 1.1s would have landed the corpus at
+# 311.9s against a 312s cap, which is not a fix — it is the next author's red, and the
+# runner's own >=80%-of-budget warning fires there for that reason.
+#
+# The gate-family siblings were demoted for exactly this argument and are already
+# nightly: gate_channel_session_t2_mutation.sh (378s, DIVE-2555) and
+# secret_gate_delivery_path_mutation.sh (55.7s, DIVE-2525). This file at core was the
+# outlier, not the precedent. The two mutation graders that STAY in core measure 4.5s and
+# 7.7s (task_add_parent_citation_warning, task_answer_cancelled_loop_bounce, same host and
+# method) — the discriminator is COST, not the `_mutation` in the filename.
+#
+# WHAT THIS MOVES, stated rather than left to be discovered: no PRODUCT coverage leaves
+# the PR core. tests/gate_evidence_form_unit.sh — the harness that grades the evidence-form
+# behaviour itself — stays core. What moves to the nightly sweep is the proof that THAT
+# FILE's arms are non-vacuous, which is a property of a test file and changes only when
+# someone edits it. Editing it runs this grader anyway: the `changed-harnesses` job runs
+# and verdict-probes every harness a diff touches, whatever tier it sits in.
 #
 # WHY THIS FILE EXISTS. Most of the unit suite asserts a field is PRESENT and
 # carries a particular string, and presence-assertions are the easiest kind to
