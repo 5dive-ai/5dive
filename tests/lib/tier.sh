@@ -60,6 +60,123 @@
 TIER_BUDGET_CORE=300
 TIER_BUDGET_FULL=1320
 
+# DIVE-2728: A SECOND IS NOT A STABLE UNIT ON RENTED HARDWARE, so the cap above is
+# spent in units of a CALIBRATION WORKLOAD carried in the same job.
+#
+# WHAT FORCED THIS (DIVE-2667, community/wiki/an-absolute-time-budget-on-a-variable-
+# platform-measures-the-runner.md): PR #461 red-gated at 322s with 234 of 234
+# harnesses passing and a diff worth +0.1s. Per-harness, against the identical corpus
+# on main, unrelated files ran 10-36% slower while the ONE file the diff touched moved
+# +0.3%. Five recent runs of that same corpus: 253/256/260/261/273s. That is 27s of
+# headroom on the worst normal run — 9% — against a platform that draws 10-36% slow.
+# The gate had stopped failing when the corpus grows and started failing when the VM
+# is slow, and those are different events wearing the same red.
+#
+# THE FIX IS A RATIO, NOT A BIGGER NUMBER. Raising 300 buys time until the corpus
+# catches up and re-installs the ratchet DIVE-2525 exists to remove (olivia, DIVE-2710:
+# explicitly NOT the remedy). Instead the runner times a small fixed workload in the
+# same job and spends the budget in units of it: a uniformly slow VM scales the
+# calibration and the corpus together, and the ratio cancels.
+#
+# THREE THINGS THIS GETS WRONG IF BUILT CARELESSLY, all of them designed against here:
+#
+#   1. A RELATIVE BUDGET REPLACES ONE NOISY NUMBER WITH A RATIO OF TWO. A 3s probe
+#      swinging +-20% hands the effective cap that same swing, and the gate ends up
+#      NOISIER than the absolute one it replaced. So the probe is sampled to a WALL-
+#      CLOCK TARGET (TIER_CAL_TARGET_MS, ~10s) rather than to a fixed iteration count,
+#      and min-of-TIER_CAL_SAMPLES is kept — reusing DIVE-2592's one-sided-noise
+#      argument (contention only ADDS time, so the low sample is the least
+#      contaminated estimate).
+#
+#      The unit is therefore MICROSECONDS PER ITERATION, not milliseconds per probe.
+#      Auto-sizing to a time target means two runs do different iteration counts, so a
+#      raw probe duration is not comparable across runs; normalising per iteration
+#      makes the sampling length a PRECISION knob that cannot move the unit.
+#
+#   2. UNCLAMPED, THE SCALE FACTOR IS ITSELF THE ESCAPE HATCH. A cap that grows with
+#      the runner draw licenses an arbitrarily larger corpus, which is DIVE-2525's
+#      ratchet re-installed through the back door. Hence TIER_CAL_SCALE_MAX_PCT: past
+#      it the run is UNDETERMINED with its own non-zero exit, never green (cf.
+#      DIVE-2555 — a run that could not measure has not passed).
+#
+#   3. THE PROBE MUST MATCH THE CORPUS'S COST MIX, NOT MERELY ITS DURATION. The
+#      observed 10-36% spread was across process spawn, bash startup, the built CLI's
+#      own startup and small file I/O. A CPU spin is the tempting probe and the wrong
+#      one: it calibrates a dimension these harnesses barely pay for, so it would
+#      track a draw the corpus does not feel. See scripts/run-harnesses.sh:cal_probe.
+#
+# THE LOWER CLAMP IS 1.0 — a fast VM never TIGHTENS the cap. Symmetric scaling is the
+# purer reading OF THE MEASUREMENT, and it was left open for the builder to argue
+# (DIVE-2710 §2.2). The argument against it: 300s is lodar's agreed number, and
+# scaling below it reds a PR that would pass on a normal runner, on a signal its
+# author cannot reproduce and cannot act on. That is precisely the unactionable red
+# this row exists to remove, merely inverted — and it ratchets the agreed policy
+# tighter with nobody agreeing to it. The gate is a policy instrument, not an
+# estimator, so it rounds in the direction the policy was set.
+#
+# ALL FOUR CONSTANTS BELOW ARE STARTING VALUES TO BE RE-DERIVED FROM A REAL CI RUN,
+# not findings (DIVE-2710 says so explicitly). TIER_CAL_BASELINE_US in particular was
+# measured on the CONTROL PLANE, not on a GitHub runner — see its own note.
+TIER_CAL_SCALE_MIN_PCT=100
+TIER_CAL_SCALE_MAX_PCT=150
+
+# TIER_CAL_BASELINE_US — the calibration workload's cost, in MICROSECONDS PER
+# ITERATION, on a runner drawing normal.
+#
+# MEASURED 2026-08-05 ON THE CONTROL PLANE (5dive host, agent-dev3), min of 2
+# auto-sized samples, twice: 173186us/iter (59 iters) and 172907us/iter (54 iters).
+# Two independent runs 0.16% apart, which is the number that says the probe is fit for
+# purpose: its own error has to sit far under the 9% headroom it is protecting, or a
+# relative budget is just a noisier absolute one (trap 1). 173000 is that reading.
+#
+# IT IS NOT A GITHUB-RUNNER NUMBER, and this line says so on purpose — DIVE-2555's
+# whole finding is that a measurement with no environment attached cannot be refuted
+# by the next reading, only silently disagreed with. The first CI run prints its own
+# cal_us_per_iter in the report and will trip the re-baseline warning below if the two
+# environments differ by >= TIER_CAL_REBASELINE_PCT. THAT WARNING FIRING ON THE FIRST
+# CI RUN IS THE MECHANISM WORKING, and the number it prints is what this constant
+# should be re-set to. Until then the clamp bounds the blast radius in both
+# directions: a CI runner slower than this box gets at most 1.5x, and one faster than
+# it gets exactly today's 300s.
+TIER_CAL_BASELINE_US=173000
+
+# How long ONE sample of the probe should run. This is the PRECISION knob from note 1:
+# the probe's own relative error must sit well under the headroom being protected (9%
+# today), and a ~10s sample of a ~180ms unit is ~55 iterations, whose spread is small
+# beside a 10-36% platform draw. Two samples ~= 20s of job time, which is deliberately
+# NOT counted toward the corpus total — the runner says so in its report.
+TIER_CAL_TARGET_MS=10000
+TIER_CAL_PILOT_ITERS=5
+TIER_CAL_MIN_ITERS=5
+TIER_CAL_MAX_ITERS=20000
+TIER_CAL_SAMPLES=2
+
+# DIVE-2710 §2.5: TIER_CAL_BASELINE_US is a measurement with no environment attached,
+# which is exactly the thing nobody ever re-reads. The runner measures it every run, so
+# grading it is free: past this drift the run says RE-BASELINE rather than absorbing the
+# drift silently. A GitHub runner image change is precisely the event that moves it.
+TIER_CAL_REBASELINE_PCT=25
+
+# tier_cal_scale_pct <measured_us> [<baseline_us>] -> the RAW, UNCLAMPED scale, in
+# percent. Kept separate from the clamp so the runner can tell "slow" (clamped, still
+# graded) from "too slow to grade" (past the clamp, undetermined) — one number cannot
+# carry both and the difference is a different exit code.
+tier_cal_scale_pct() {
+  local m="${1:?tier_cal_scale_pct <measured_us> [baseline_us]}" b="${2:-$TIER_CAL_BASELINE_US}"
+  if (( b <= 0 )); then
+    printf 'tier_cal_scale_pct: baseline must be > 0, got %s\n' "$b" >&2; return 2
+  fi
+  printf '%s\n' "$(( m * 100 / b ))"
+}
+
+# tier_cal_clamp_pct <raw_pct> -> the scale actually applied to the budget.
+tier_cal_clamp_pct() {
+  local p="${1:?tier_cal_clamp_pct <raw_pct>}"
+  if (( p < TIER_CAL_SCALE_MIN_PCT )); then p=$TIER_CAL_SCALE_MIN_PCT; fi
+  if (( p > TIER_CAL_SCALE_MAX_PCT )); then p=$TIER_CAL_SCALE_MAX_PCT; fi
+  printf '%s\n' "$p"
+}
+
 # DIVE-2555: HOW FAR A HEADER'S OWN MEASUREMENT MAY DRIFT FROM THE CLOCK.
 #
 # A demotion is argued in the diff with a number — `14.3s measured: does not fit
@@ -188,6 +305,8 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
     reason) tier_reason "${2:?reason <file>}" ;;
     claim)  tier_claim  "${2:?claim <file>}" ;;
     budget) tier_budget "${2:?budget <core|full>}" ;;
-    *) printf 'usage: tier.sh {list core|nightly|full [dir] | of <file> | reason <file> | claim <file> | budget core|full}\n' >&2; exit 2 ;;
+    scale)  tier_cal_scale_pct "${2:?scale <measured_us> [baseline_us]}" "${3:-$TIER_CAL_BASELINE_US}" ;;
+    clamp)  tier_cal_clamp_pct "${2:?clamp <raw_pct>}" ;;
+    *) printf 'usage: tier.sh {list core|nightly|full [dir] | of <file> | reason <file> | claim <file> | budget core|full | scale <us> [baseline] | clamp <pct>}\n' >&2; exit 2 ;;
   esac
 fi
