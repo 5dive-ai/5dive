@@ -3282,6 +3282,21 @@ _task_status_cmd() {
       _cd=$(db "SELECT COALESCE(done_at,'unknown') FROM tasks WHERE id=${id};")
       policy_refuse "$E_CONFLICT" start-on-closed-task DIVE-2113 "$ident" "$ident is CLOSED (status='${_cs}', closed ${_cd}) — 'task start' would silently reopen it to in_progress while LEAVING done_at set, so the row contradicts itself and any recorded grade would describe a task the board shows as open. If it genuinely must be reopened, that is a deliberate decision and belongs on the record; no alternative verb is named here on purpose, because a refusal that lists exits publishes a route around itself (DIVE-2067)."
     fi
+    # DIVE-2317: status='blocked' is only a reason to refuse while the edge is
+    # still live. The cascade normally flips a dependent back to todo when its
+    # last blocker closes, but stale blocked statuses can exist; refusing those
+    # would strand otherwise-actionable work. Conversely, starting a row with an
+    # OPEN blocker leaves the edge in place while changing only the status, so
+    # the board and dependency graph immediately disagree. Name one deterministic
+    # live blocker so the refusal is evidence, not a generic state assertion.
+    if [[ "$_cs" == "blocked" ]]; then
+      local _start_ob _start_obi _start_obs
+      _start_ob=$(_task_live_blocker "$id")
+      if [[ -n "$_start_ob" ]]; then
+        _start_obi="${_start_ob%%|*}"; _start_obs="${_start_ob#*|}"
+        policy_refuse "$E_CONFLICT" start-on-open-blocker DIVE-2317 "$ident" "$ident is BLOCKED by open task ${_start_obi} (status='${_start_obs}') — 'task start' would silently set this row to in_progress while its live blocked_by edge remains, so the status and dependency graph would contradict each other. It becomes startable when every blocker is done or cancelled; a stale status='blocked' with no open blocker is deliberately allowed (DIVE-2317)."
+      fi
+    fi
     # DIVE-2510: `task start` was the LAST status writer with no delivered-loop
     # guard. `task done` refuses a non-verifier over a live delivery (DIVE-2007),
     # `task reject` refuses the maker (DIVE-2112), `task start` refuses a closed
@@ -4639,6 +4654,21 @@ cmd_task_start()  { _task_status_cmd in_progress ", started_at=COALESCE(started_
 cmd_task_done()   { _task_status_cmd done ", done_at=COALESCE(done_at, datetime('now'))" done "$@"; }
 cmd_task_cancel() { _task_status_cmd cancelled ", done_at=COALESCE(done_at, datetime('now'))" cancel "$@"; }
 
+# Print one deterministic nonterminal blocker as IDENT|STATUS, or nothing.
+# Shared by status-changing entry points that must preserve the blocked-edge
+# invariant. Terminal blockers deliberately do not count: a stale blocked row
+# whose dependencies are all done/cancelled must remain actionable (DIVE-2317).
+_task_live_blocker() {
+  local id="$1"
+  db "SELECT b.ident || '|' || b.status
+      FROM task_deps d
+      JOIN tasks b ON b.id=d.blocked_by
+      WHERE d.task_id=${id}
+        AND b.status NOT IN ('done','cancelled')
+      ORDER BY b.id
+      LIMIT 1;"
+}
+
 # DIVE-1830: `task deliver` — the maker records the PR that delivers this task,
 # then hands off to the verifier for review. This is the OPT-IN half of the
 # merge-gate: once a task carries a delivery_ref, its `task done` will not close
@@ -4670,6 +4700,19 @@ cmd_task_deliver() {
     fail "$E_VALIDATION" "--pr must be a URL (e.g. https://github.com/<org>/<repo>/pull/<n>) — got '$pr'"
   fi
   resolve_task_id "$task"; local id="$RESOLVED_TASK_ID" ident="$RESOLVED_TASK_IDENT"
+  # DIVE-2317 follow-through: the ticket asked whether deliver has the same
+  # hole as start. It does on the distinct-verifier arm: delivery routes the row
+  # to status=todo while preserving its live blocked_by edge. Refuse before the
+  # delivery_ref/timestamp write so a failed delivery is wholly non-mutating.
+  local _deliver_st; _deliver_st=$(db "SELECT status FROM tasks WHERE id=${id};")
+  if [[ "$_deliver_st" == "blocked" ]]; then
+    local _deliver_ob _deliver_obi _deliver_obs
+    _deliver_ob=$(_task_live_blocker "$id")
+    if [[ -n "$_deliver_ob" ]]; then
+      _deliver_obi="${_deliver_ob%%|*}"; _deliver_obs="${_deliver_ob#*|}"
+      policy_refuse "$E_CONFLICT" deliver-on-open-blocker DIVE-2317 "$ident" "$ident is BLOCKED by open task ${_deliver_obi} (status='${_deliver_obs}') — 'task deliver' would stamp a delivery and may route this row to status=todo while its live blocked_by edge remains, so the status and dependency graph would contradict each other. Deliver after every blocker is done or cancelled (DIVE-2317)."
+    fi
+  fi
   # DIVE-2476: consult the shared already-closed-row guard BEFORE anything is
   # written. The ordering IS the fix and not a detail — the delivery stamp on the
   # next line lands on a closed row too, so a refusal that fired after it would
