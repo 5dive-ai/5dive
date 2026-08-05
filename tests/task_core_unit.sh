@@ -111,6 +111,35 @@ da=$(db "SELECT done_at IS NOT NULL FROM tasks WHERE id=$id3;")
 [[ "$st" == "in_progress" && "$st2" == "done" && "$res" == "all good" && "$da" == "1" ]] \
   && ok_t "lifecycle start->done with result + done_at" || bad_t "lifecycle" "st=$st st2=$st2 res=$res"
 
+# --- DIVE-2316: delivery_ref is visible through the CLI, including absence.
+# JSON show already reads the whole row; the regression was the human presenter
+# omitting the enforcement field. Prove both states before the list audit below.
+show_absent=$( (JSON_MODE=0 cmd_task_show "$id3") 2>"$TMP"/err )
+echo "$show_absent" | grep -q '^delivery_ref = absent$' \
+  && ok_t "DIVE-2316: task show makes an absent delivery_ref explicit" \
+  || bad_t "DIVE-2316 show absent" "$show_absent"
+
+delivery_url='https://github.com/example/project/pull/999'
+db "UPDATE tasks SET delivery_ref=$(sqlq "$delivery_url") WHERE id=$id3;"
+show_bound=$( (JSON_MODE=0 cmd_task_show "$id3") 2>"$TMP"/err )
+echo "$show_bound" | grep -Fqx "delivery_ref = $delivery_url" \
+  && ok_t "DIVE-2316: task show prints the bound delivery_ref" \
+  || bad_t "DIVE-2316 show bound" "$show_bound"
+
+# The operator's audit is normally list-shaped. Seed a second DONE row with no
+# binding, then require the human table to distinguish the bound and absent rows.
+id_no_ref=$(run add -- "done without a delivery binding" | jf '.data.id')
+run done "$id_no_ref" --result="no code delivery" >/dev/null
+done_ls=$( (JSON_MODE=0 cmd_task_ls --status=done) 2>"$TMP"/err )
+[[ "$done_ls" == *"delivery_ref"* && "$done_ls" == *"$delivery_url"* && "$done_ls" == *"absent"* ]] \
+  && ok_t "DIVE-2316: task ls --status=done surfaces bound and absent delivery_ref values" \
+  || bad_t "DIVE-2316 done listing" "$done_ls"
+
+ls_json_ref=$(run ls --status=done | jq -r --argjson i "$id3" '.data.tasks[] | select(.id==$i) | .delivery_ref')
+[[ "$ls_json_ref" == "$delivery_url" ]] \
+  && ok_t "DIVE-2316: task ls JSON carries delivery_ref" \
+  || bad_t "DIVE-2316 ls JSON" "got=$ls_json_ref"
+
 # --- T5: cancel is terminal with done_at
 idc=$(run add -- "doomed" | jf '.data.id')
 run cancel "$idc" --result="not needed" >/dev/null

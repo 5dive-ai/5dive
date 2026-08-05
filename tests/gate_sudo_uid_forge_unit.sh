@@ -158,6 +158,18 @@ out=$(SUDO_UID="$CLAUDE_UID" cmd_task_answer DIVE-9601 --value=approved --human 
   && ok_t "T-FORGE non-root agent forging SUDO_UID=claude is REJECTED end-to-end" \
   || bad_t "T-FORGE forge rejected" "rc=$rc state=$(answered DIVE-9601) out=$out"
 
+# DIVE-2371: from here down the arms assert that a HUMAN path still CLEARS, and
+# authorization is now the uid test AND a structural cgroup test. The uid stubs
+# above cannot reach that read, so unpinned both arms below are refused, the
+# refusal's pre-existing `fail 6` exits this UNSUBSHELLED harness, and the file
+# truncates after T-FORGE at rc=6 — 6 ok, no summary, no HARNESS-RC. It reads as a
+# pass to anything that greps for a FAIL line, which is how it survived my own
+# sweep. Both remaining arms describe the SAME surface — shelld: T-SHELLD is the
+# dashboard exec, and T-DROP is root via the sudo drop that shelld spawns the CLI
+# through — so one accepted pin covers both, and it is the surface the accept list
+# exists for. Stub the READER only; accept/deny stays the shipped bytes.
+_gate_caller_cgroup() { printf '%s' '/system.slice/shelld.service'; }
+
 # T-DROP: the DIVE-931 drop context (root, SUDO_UID=claude, --from=drop) still clears.
 IS_ROOT=1; REAL_UID="0"; REAL_UN="root"
 seed_gate DIVE-9602 secret
@@ -173,6 +185,22 @@ SUDO_UID="" cmd_task_answer DIVE-9603 --value=approved --human >/dev/null 2>&1
 [[ "$(answered DIVE-9603)" == "closed" ]] \
   && ok_t "T-SHELLD non-root real-claude (dashboard exec) still clears end-to-end" \
   || bad_t "T-SHELLD shelld clears" "still $(answered DIVE-9603)"
+
+# T-CGROUP: DIVE-2371's half of this file's own subject. T-SHELLD above is the
+# dashboard clearing with real uid=claude; this is the SAME uid and the SAME gate
+# shape from an AGENT cgroup, and it must be REFUSED. Before DIVE-2371 `claude` was
+# trusted by name, so this input cleared — that was the forge this row closed, and
+# without this arm nothing in this file (the SUDO_UID forge harness) pins it.
+# Subshelled because the refusal is a `fail 6` exit by design.
+IS_ROOT=0; REAL_UID="$CLAUDE_UID"; REAL_UN="claude"
+seed_gate DIVE-9604 approval
+_cg_prev=$(declare -f _gate_caller_cgroup)
+_gate_caller_cgroup() { printf '%s' '/system.slice/system-5dive.slice/5dive-agent@dev.service'; }
+_tcg_out=$( SUDO_UID="" cmd_task_answer DIVE-9604 --value=approved --human 2>&1 ); _tcg_rc=$?
+eval "$_cg_prev"
+[[ "$(answered DIVE-9604)" != "closed" && $_tcg_rc -ne 0 ]] \
+  && ok_t "T-CGROUP real-claude from an AGENT cgroup is REFUSED (the DIVE-2371 forge)" \
+  || bad_t "T-CGROUP agent cgroup refused" "rc=$_tcg_rc state=$(answered DIVE-9604) out=$_tcg_out"
 
 echo "-----"
 printf 'gate_sudo_uid_forge_unit: %d passed, %d failed\n' "$PASS" "$FAIL"

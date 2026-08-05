@@ -89,14 +89,20 @@ grep -qi "MAKER" "$TMP"/err && ok_t "A refusal explains the maker/verifier split
 
 # --- B: THE MEASURED BUG — a non-verifier rejecting an already-DONE task.
 B=$(seed_closed "B outsider reopens a graded task")
-[[ "$(status_of "$B")" == "done" && "$(res_of "$B")" == "$ACK" ]] \
+# DIVE-2483 (iteration 2): this arm used to assert result == "$ACK" EXACTLY.
+# That equality pinned the WIPE: seed_closed builds its fixture by having the
+# verifier close over the maker's "maker delivery v1", which under the old guard
+# DESTROYED it. The fixture performed the very data loss DIVE-2483 was filed to
+# stop, then asserted it had happened. The contract now is that the ACK is
+# PRESENT and the maker's record SURVIVES beneath it, which is what this checks.
+[[ "$(status_of "$B")" == "done" && "$(res_of "$B")" == *"$ACK"* ]] \
   || bad_t "B fixture" "expected a closed, graded task; got $(status_of "$B")"
 out=$(as dev2 cmd_task_reject "$B" --feedback="please add X"); rc=$?
 (( rc != 0 )) && ok_t "B outsider's reject over a closed task exits non-zero (rc=$rc)" \
   || bad_t "B should refuse" "rc=$rc — this is olivia's exact repro"
 [[ "$(status_of "$B")" == "done" ]] \
   && ok_t "B task stays DONE — the reopen is blocked" || bad_t "B reopened" "status=$(status_of "$B")"
-[[ "$(res_of "$B")" == "$ACK" ]] \
+[[ "$(res_of "$B")" == *"$ACK"* ]] \
   && ok_t "B the verifier's ACK survives intact" || bad_t "B ACK destroyed" "result=$(res_of "$B")"
 [[ "$(refusals "$B" reject-over-closed)" == "1" ]] \
   && ok_t "B refusal audited to policy_refusals" || bad_t "B not audited" "no reject-over-closed row"

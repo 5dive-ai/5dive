@@ -241,8 +241,17 @@ _pin_got="$(_gate_uid_to_agent "$(_gate_caller_uid)")"
   || { printf 'NOT OK - identity pin is inert: uid %s resolved to agent %s, expected %s\n' \
        "$_PIN_UID" "'$_pin_got'" "'${_pin_want:-<non-agent>}'"; exit 1; }
 
+# DIVE-2371: the human-evidence test grew a STRUCTURAL half — authorization calls
+# `_gate_human_principal` = the uid test AND `_gate_cgroup_human_capable`, and the
+# `id` stub above cannot reach the cgroup read. Unpinned, this answer is REFUSED on
+# any agent box or CI runner, A never closes, and the arm reds as a cascade failure
+# when nothing about the cascade changed. The caller this case DESCRIBES is a person
+# at a login session, which is an accepted surface, so pin it for the same scope as
+# the `id` stub. Stub the READER only; the accept list stays the shipped bytes.
+_gate_caller_cgroup() { printf '%s' '/user.slice/user-1000.slice/session-1.scope'; }
 ( cmd_task_answer "$a" --value=done --human ) >/dev/null 2>&1
 unset -f id
+unset -f _gate_caller_cgroup
 [[ "$(st "$a")" == "done" && "$(st "$b")" == "todo" && "$(edges "$b")" == "0" ]] \
   && ok_t "manual-gate 'done' answer cascades dependent blocked->todo" \
   || bad_t "manual-gate cascade" "A=$(st "$a") B=$(st "$b") edges=$(edges "$b")"
