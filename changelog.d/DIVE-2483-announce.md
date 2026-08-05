@@ -16,8 +16,16 @@ exactly the conditions a maker's own harness declines to grade.*
   never does. On `task done` **and** `task verify`.
 - **The seam is dated.** There is no `result_by` column — that was this row's first blocker — so the seam
   marker *is* the provenance, and an undated one says two texts were joined and nothing about when.
-- **Six new arms in a section with a different assertion shape**, asserting stdout rather than the column,
-  including a negative (no announcement when there was nothing to preserve) and the `verify` path.
+- **Six new arms in a section with a different assertion shape**, reading the verb's OUTPUT rather than the
+  column, including a negative (no announcement when there was nothing to preserve) and the `verify` path.
+
+**Which stream the announcement uses, stated because it is a real limit and not a detail** (olivia, verifying):
+it goes to **stderr**, via the fleet's `warn()` (`echo "warn: $*" >&2`). That is the right convention for an
+advisory that must not corrupt a parsed stdout, and it is visible at any terminal. But the gate answer's
+condition 1 said *stdout*, and the O arms capture `2>&1` — so **a caller that keeps only stdout still sees a
+bare `ok - <ident> done`**, exactly the pre-fix shape. Scripted callers and log pipelines that drop fd 2 are
+therefore still blind to the preservation. Left as a convention-consistent limit rather than a code change,
+and recorded here so the next reader does not have to re-derive it from the harness's redirect.
 
 ## Three harnesses on main were reddened by the original fix, and they were a shipping freeze
 
