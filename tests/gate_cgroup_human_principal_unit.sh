@@ -22,6 +22,10 @@
 #
 # Usage: ./tests/gate_cgroup_human_principal_unit.sh   (no root, no network, no db)
 set -uo pipefail
+# DIVE-2692 corpus contract: report our own rc honestly. Registered BEFORE the
+# two `exit 2` precondition guards below, so an unreadable lib or a lost accept
+# list is reported as a nonzero HARNESS-RC rather than as a silent short read.
+trap 'rc=$?; echo "HARNESS-RC=$rc"' EXIT
 
 # DIVE-2211: name the tree this harness grades (tests/lib/grading_tree.sh).
 # Three-state: if the helper is unreachable (a staged copy that did not carry
