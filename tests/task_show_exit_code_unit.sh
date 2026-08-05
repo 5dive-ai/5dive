@@ -22,9 +22,17 @@
 # Arms: no-dep (the bug) / subtasks-but-no-dep / gate-but-no-dep / --json / and
 # the WITH-dep control that was already green (so a fix that hard-codes rc=0
 # without keeping the block is still distinguishable by its text assertion).
-# Also covers the second instance of the same shape found tree-wide,
-# usage_render_board (`5dive usage` (the default board) exited 1 whenever nobody was over
-# budget), and the one unguarded `_gate_tier2_floor_term` assignment.
+# FOUR instances of the shape, not two. Iteration 1 claimed "exactly one other"
+# and shipped a guard that could only see `[[ ]]` with a braced block; main2 found
+# `(( n_unknown > 0 )) && echo ...` in cmd_usage_budget_check, which failed every
+# HEALTHY heartbeat tick. The count was wrong because the instrument was narrow,
+# so the guard below now finds the last statement STRUCTURALLY and is itself
+# graded against that exact syntax by a positive control.
+#   cmd_task_show          - the reported bug (rc 1 on any row with no dep edge)
+#   usage_render_board     - bare `5dive usage` on the healthy no-overage path
+#   cmd_usage_budget_check - LIVE CALLER: _hb_budget_sweep, every healthy tick (main2)
+#   wt_task_num            - latent; both call sites assign plainly under set -e
+# Plus the one unguarded `_gate_tier2_floor_term` assignment.
 #
 # Sources src/ against a throwaway tasks.db (same posture as
 # project_show_graph_unit.sh) so it NEVER touches the shared queue.
@@ -169,25 +177,111 @@ else
   bad_t "_gate_tier2_floor_term missing" "helper was renamed or removed"
 fi
 
+# ---- the structural detector, used by the three sections below ----
+# Defined here because the budget-check arms grade it before the class guard runs.
+cat > "$TMP/detect.awk" <<'AWK'
+/^[a-zA-Z_][a-zA-Z0-9_]*[ \t]*\([ \t]*\)[ \t]*\{/ { fn=$0; sub(/[ \t]*\(.*/,"",fn); inf=1; n=0; next }
+inf && /^\}/ {
+  for (i=n; i>=1; i--) {
+    l=buf[i]; s=l; gsub(/[ \t]/,"",s)
+    if (s=="" || s ~ /^#/ || s=="fi" || s=="done" || s=="esac" || s=="else" || s==";;" || s=="}") continue
+    # Must START a statement, or a jq continuation line and an `&&` inside an
+    # awk program string both read as shell operators. A `||` fallback makes the
+    # compound succeed regardless, so it is not this defect.
+    if (l ~ /^[ \t]*(\[\[|\(\(|\[ |test |grep |declare )/ &&    \
+        l ~ /&&/ && l !~ /\|\|/ &&                              \
+        l ~ /&&[ \t]*[{(]?[ \t]*(echo|printf|cat |indent2)/ &&  \
+        l !~ /return|exit/)
+      print FILENAME":"lno[i]"  "fn
+    break
+  }
+  inf=0; next
+}
+inf { n++; buf[n]=$0; lno[n]=FNR }
+AWK
+
+# ================= third instance: cmd_usage_budget_check (found by main2) ==========
+# Executing it needs the whole usage plan, so grade it through the detector below
+# instead — and grade it BY MUTATION, or this is just the guard agreeing with
+# itself. Strip the fix from a COPY and the detector must name the function; with
+# the fix in place it must not. The live-caller consequence is what made this the
+# serious one: _hb_budget_sweep does `out=$(cmd_usage_budget_check) || return 1`,
+# and the test is inverted relative to health, so a HEALTHY tick returned 1.
+mkdir -p "$TMP/mut/lib"; : > "$TMP/mut/lib/empty.sh"
+sed '/DIVE-2751 (found by main2 on iteration 1)/,/^  return 0$/d' "$SRC/cmd_usage.sh" > "$TMP/mut/cmd_usage.sh"
+if ! cmp -s "$SRC/cmd_usage.sh" "$TMP/mut/cmd_usage.sh"; then
+  ok_t "[budget-check] the mutation applied (fix removed from the copy)"
+else
+  bad_t "[budget-check] mutation did NOT apply — the arm below would prove nothing" "sed matched nothing"
+fi
+mut_hit=$(awk -f "$TMP/detect.awk" "$TMP/mut/cmd_usage.sh" "$TMP/mut"/lib/*.sh 2>/dev/null || true)
+[[ "$mut_hit" == *cmd_usage_budget_check* ]] \
+  && ok_t "[budget-check] detector names it once the fix is removed" \
+  || bad_t "[budget-check] detector CANNOT see main2's instance" "hit=$mut_hit"
+live_hit=$(awk -f "$TMP/detect.awk" "$SRC/cmd_usage.sh" 2>/dev/null || true)
+[[ "$live_hit" != *cmd_usage_budget_check* ]] \
+  && ok_t "[budget-check] fixed in the live tree" || bad_t "[budget-check] still live" "$live_hit"
+
+# ================= fourth instance: wt_task_num (latent, worktree reclaim) ==========
+# Cheap to execute, so execute it. A non-numeric ident must report "no number" as
+# EMPTY OUTPUT, not as a failure — cmd_task.sh:199's `[[ -n "$num" ]] || return 0`
+# is proof the empty case was meant to be handled, and errexit killed the caller
+# before that guard could run.
+if source "$SRC/lib/disk.sh" 2>/dev/null && declare -F wt_task_num >/dev/null; then
+  wtout=$( set -euo pipefail; v=$(wt_task_num "not-a-number-xyz"); printf 'REACHED[%s]' "$v" )
+  [[ "$wtout" == "REACHED[]" ]] \
+    && ok_t "[wt_task_num] non-numeric ident yields empty output, rc 0 (caller survives set -e)" \
+    || bad_t "[wt_task_num] non-numeric ident still kills the caller" "got='$wtout'"
+  wtok=$( set -euo pipefail; v=$(wt_task_num "DIVE-2751"); printf '%s' "$v" )
+  [[ "$wtok" == "2751" ]] && ok_t "[wt_task_num] still extracts the number (not silenced)" \
+    || bad_t "[wt_task_num] stopped returning the number" "got='$wtok'"
+else
+  bad_t "[wt_task_num] not loadable" "src/lib/disk.sh did not source"
+fi
+
 # ================= class guard: no NEW trailing conditional render =================
-# The bug is a shape, not a line. A function whose last statement is a
-# conditional render block re-introduces it silently — this is what makes the
-# class extinct rather than this one instance. Predicate functions ending in a
-# bare test are legitimate and deliberately NOT flagged: the signal is the
-# printing side effect in the `&&` block.
-offenders=""
-while IFS=: read -r f l rest; do
-  [[ -n "$f" ]] || continue
-  n=$((l+1))
-  while :; do
-    ln=$(sed -n "${n}p" "$f"); ln="${ln//[[:space:]]/}"
-    case "$ln" in ''|'#'*|fi|done|esac|else) n=$((n+1)) ;; *) break ;; esac
-    (( n > l + 40 )) && break
-  done
-  [[ "$(sed -n "${n}p" "$f")" == "}" ]] && offenders+="$f:$l:${rest# }"$'\n'
-done < <(grep -nE '^\s*\[\[[^]]*\]\]\s*&&\s*\{[^}]*(echo|printf)' "$SRC"/*.sh)
-[[ -z "$offenders" ]] && ok_t "no function ends in a trailing conditional render (class guard)" \
+# The bug is a shape, not a line, so this guard is what makes the class extinct
+# rather than the three fixes above.
+#
+# ITERATION 1 SHIPPED A GUARD THAT COULD NOT SEE THE CLASS IT CLAIMED TO CLOSE.
+# It grepped for `[[ ... ]] && { ...echo... }` — a bracket test AND a braced
+# block — so `(( n_unknown > 0 )) && echo ...` was invisible, and that was a live
+# third instance (cmd_usage_budget_check, failing every healthy heartbeat tick).
+# main2 caught it. The lesson is not "add `((` to the regex": enumerating test
+# syntaxes is how the first pattern went wrong. So this finds the last statement
+# STRUCTURALLY — walk back from the function's closing brace, skipping blanks,
+# comments and block closers — and only then asks whether that statement is a
+# conditional with a printing side effect and no `||` fallback.
+#
+# Predicate functions ending in a bare test stay legitimately excluded: the
+# signal is the PRINTING side effect, not the trailing test.
+# Two DELIBERATE survivors, allow-listed by name with the reason, so the guard
+# stays armed for anything new instead of being widened until it is quiet:
+#   _gate_tier2_floor_term — value producer; rc 1 means "named no term". Contract
+#     is intentional and every call site absorbs it (asserted above).
+#   _compose_create_args   — its only caller reads it through a process
+#     substitution (`mapfile -t args < <(...)`), where the rc never reaches
+#     errexit. Fragile but not live; changing its contract is not this row's job.
+offenders=$(awk -f "$TMP/detect.awk" "$SRC"/*.sh "$SRC"/lib/*.sh \
+            | grep -vE '  (_gate_tier2_floor_term|_compose_create_args)$' || true)
+[[ -z "$offenders" ]] && ok_t "no function ends in a trailing conditional render (class guard, structural)" \
   || bad_t "trailing conditional render is the last statement of a function" "$offenders"
+
+# The guard must be able to SEE the shape that defeated iteration 1. A guard
+# whose only evidence is its own silence is the thing this harness exists to
+# refuse — so hand it that exact syntax and require it to fire.
+mkdir -p "$TMP/canary/lib"
+cat > "$TMP/canary/fixture.sh" <<'CANARY'
+some_render() {
+  local n=0
+  (( n > 0 )) && echo "the unbraced arithmetic form that iteration 1 could not see"
+}
+CANARY
+: > "$TMP/canary/lib/empty.sh"
+canary=$(awk -f "$TMP/detect.awk" "$TMP/canary"/*.sh "$TMP/canary"/lib/*.sh || true)
+[[ "$canary" == *some_render* ]] \
+  && ok_t "class guard FIRES on the (( )) unbraced form (positive control)" \
+  || bad_t "class guard is blind to the form that defeated iteration 1" "canary=$canary"
 
 printf '\n%s passed, %s failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]

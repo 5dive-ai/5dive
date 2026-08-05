@@ -926,6 +926,16 @@ cmd_usage_budget_check() {
     echo "budget check: ${checked} agent(s) — ${n_soft} soft, ${n_hard} at ceiling, ${n_stop} stopped$( ((dry)) && echo ' (dry-run)')"
     (( n_unknown > 0 )) && echo "  ⚠ ${n_unknown} NOT checked — transcripts unreadable from here, burn is unknown (not 0): ${unknown_names}"
   fi
+  # DIVE-2751 (found by main2 on iteration 1): third instance, and the one with a
+  # live caller. The test above is INVERTED relative to health — n_unknown == 0 is
+  # the GOOD state — so as the last statement of this branch it returned 1 on every
+  # healthy run. cmd_heartbeat.sh's `_hb_budget_sweep` does
+  #   out=$(cmd_usage_budget_check 2>/dev/null) || return 1
+  # so the budget sweep reported failure on every healthy tick and only "succeeded"
+  # when some agent's transcripts were unreadable. My first sweep missed this
+  # because its pattern required `[[ ]]` AND a braced block; this is `(( ))` and
+  # unbraced — see the widened guard in tests/task_show_exit_code_unit.sh.
+  return 0
 }
 
 # cmd_cost — DIVE-1019 budget-focused burn view. Reuses the usage plumbing: one
