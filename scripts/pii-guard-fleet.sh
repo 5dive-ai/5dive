@@ -148,11 +148,25 @@ for slug in $(printf '%s\n' "${!CLONES_OF_REMOTE[@]}" | sort); do
   if [[ $DO_SCAN -eq 1 ]]; then
     src="local:$clone"; scandir="$clone"
     if [[ $DO_FRESH -eq 1 ]]; then
+      # --depth=1, and each clone is freed the moment it is scanned (below).
+      # A full clone of every remote is what makes this flag unrunnable: 23 of
+      # them accumulated on the first real run, filled the disk, and every
+      # remaining row then reported UNKNOWN — one systemic failure wearing the
+      # costume of 19 independent unreadable repos, which is the exact reading
+      # error this tool exists to prevent. The collateral was worse than the bad
+      # report: the host's disk-cleanup sweep fired and reclaimed worktrees.
+      #
+      # The label says HEAD because that is what depth=1 answers. It is NOT an
+      # all-refs answer, and a shallow clone's ref COUNT is an artifact of the
+      # fetch — this row has already been bitten by reading one as a repo's
+      # branch count.
       scandir="$tmproot/${slug//\//__}"
-      if gh repo clone "$slug" "$scandir" -- --quiet >/dev/null 2>&1; then
-        src="fresh-clone"
+      cerr="$(gh repo clone "$slug" "$scandir" -- --quiet --depth=1 2>&1 >/dev/null)"
+      if [[ -d "$scandir/.git" ]]; then
+        src="fresh-HEAD"
       else
         scandir=""; src="fresh-clone-FAILED"
+        echo "  ! $slug: fresh clone failed: $(head -c 160 <<<"$cerr")" >&2
       fi
     fi
     if [[ -z "$scandir" ]]; then
@@ -180,6 +194,9 @@ for slug in $(printf '%s\n' "${!CLONES_OF_REMOTE[@]}" | sort); do
         residue="$n HIT($src@$ref/$when)"; resid_hits=$((resid_hits+1))
         HIT_DETAIL="${HIT_DETAIL:-}$slug:$files"$'\n'
       fi
+      # Free each fresh clone as soon as its verdict is recorded. Holding them
+      # all to the end is what filled the disk.
+      [[ $DO_FRESH -eq 1 && -n "$scandir" ]] && rm -rf "$scandir"
     fi
   fi
 
