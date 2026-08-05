@@ -3252,6 +3252,19 @@ _task_status_cmd() {
         local _state _merged
         _state=$(_gate_gh "$_ghtok" 0 pr view "$_dref" --json state,mergedAt -q '.state' 2>/dev/null || echo "")
         _merged=$(_gate_gh "$_ghtok" 0 pr view "$_dref" --json state,mergedAt -q '.mergedAt' 2>/dev/null || echo "")
+        # DIVE-2720: NORMALISE the literal 'null' to empty, at CAPTURE, so every
+        # reader below inherits it. `gh -q .state` renders a MISSING .state as the
+        # four-character string 'null' — not empty — so a SUCCESSFUL query with an
+        # unusable payload slipped the `-z "$_state"` guard below and landed on the
+        # DIVE-1830 refusal, which printed "not merged to main yet (..., state=null
+        # — MEASURED, not assumed)". Same defect class as DIVE-2318/2705 by a third
+        # route: the earlier two reached it through a FAILED call, this one through a
+        # call that succeeded and answered nothing. jq's null and a query that never
+        # returned are the same epistemic state — unresolved — so they get the same
+        # representation here rather than a second parallel branch that can drift
+        # from the first. Line ~3265 already special-cased 'null' for _merged and
+        # nothing did for _state; that asymmetry was the hole.
+        if [[ "$_state" == "null" ]]; then _state=""; fi
         # DIVE-2318: an EMPTY state is "the question was not answered", not "the answer
         # was no". A token is present by here (guarded above), so an empty state means
         # the query itself failed — network, timeout, a PR/repo this token cannot see,
