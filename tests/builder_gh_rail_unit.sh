@@ -37,6 +37,17 @@ set -uo pipefail
 
 . "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh" \
   || printf 'grading tree: UNRESOLVED (tests/lib/grading_tree.sh not reachable; no tree named)\n' >&2
+
+# DIVE-2770: this file grades the TOKEN rail and the BOT rail. A THIRD rail now
+# exists — an unauthenticated read of a public repo — and `_gate_gh_reachable` is
+# true on its strength alone, which is the whole point of it. Isolating the two
+# under test means turning the third one off; the third has its own file
+# (tests/task_merge_gate_anon_rail_unit.sh) and is not graded here.
+#
+# It MUST sit after lib/grading_tree.sh, which sources lib/env_isolation.sh and
+# clears inherited FIVE_* knobs — set above it, this line is wiped and T1 fails
+# with the rail still live.
+export FIVE_GATE_NO_ANON=1
 trap 'rc=$?; rm -rf "${TMP:-}"; echo "HARNESS-RC=$rc"' EXIT   # DIVE-2692: fires on every exit path (incl. SKIP/precondition-fail early-exits); folds in tempdir cleanup so the two EXIT traps don't clobber each other.
 cd "$(dirname "$0")/.."
 SRC=src
@@ -119,9 +130,16 @@ export SUDO_USER=""
 # --- T1: POSITIVE CONTROL — no token, no grant => not reachable. --------------
 # Every arm below is a difference from this line. If T1 ever passes for the wrong
 # reason the whole file is vacuous, so it is asserted, not assumed.
+#
+# READ THE SCOPE, because the sentence is narrower than it was (DIVE-2770). This is
+# "not reachable BY THE TWO RAILS THIS FILE GRADES", not "not reachable" — the
+# anonymous rail is disabled at the top of this file, and with it live a caller
+# holding nothing CAN reach GitHub on a public repo. That is deliberate, and it is
+# what unblocked a merged row nobody could close. Do not read a green T1 as evidence
+# that a credential-less caller is blind.
 SUDO_MODE=deny GH_STUB_AUTH_TOKEN="" _gate_gh_reachable "" \
-  && bad_t "T1 no token + no grant must NOT be reachable" "reachable anyway" \
-  || ok_t "T1 no token + no grant is not reachable (fail-safe preserved)"
+  && bad_t "T1 no token + no grant must NOT be reachable (token/bot rails)" "reachable anyway" \
+  || ok_t "T1 no token + no grant is not reachable by the token or bot rail (fail-safe preserved)"
 
 # --- T2: THE FIX — no token, grant present => reachable. ----------------------
 if [[ $RAIL_TESTABLE -eq 1 ]]; then
