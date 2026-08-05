@@ -620,6 +620,70 @@ _task_is_trivial() {
   [[ -n "$(_task_verify_skip_reason "$1" "$2" "$3")" ]]
 }
 
+# DIVE-2449: parse the narrow title shape that implies a numbered follow-up to
+# an existing epic. This is deliberately NOT a generic DIVE-N mention parser:
+# "follow-up to DIVE-2382" is ordinary prose, while "DIVE-2382 fix #3" carries
+# the series coordinate that board readers otherwise mistake for a real parent
+# link. Results are globals so callers can invoke this bare (rather than through
+# a command substitution that would hide assignments).
+_task_numbered_followup_parse() {
+  local _title="${1^^}"
+  local _re='(^|[^A-Z0-9])(DIVE-[0-9]+)[[:space:]]+(FIX|ORPHAN|PART|ITEM)[[:space:]]*#?([0-9]+)([^A-Z0-9]|$)'
+  _TASK_FOLLOWUP_IDENT=""
+  _TASK_FOLLOWUP_KIND=""
+  _TASK_FOLLOWUP_NUMBER=""
+  if [[ "$_title" =~ $_re ]]; then
+    _TASK_FOLLOWUP_IDENT="${BASH_REMATCH[2]}"
+    _TASK_FOLLOWUP_KIND="${BASH_REMATCH[3],,}"
+    _TASK_FOLLOWUP_NUMBER="${BASH_REMATCH[4]}"
+  fi
+  return 0
+}
+
+# Inspect an unparented title and expose an advisory only when all of these are
+# measured: the numbered-follow-up shape above, the cited ident exists, and no
+# --parent was supplied by the caller. Open rows with the SAME coordinate are
+# returned as a comma-separated ident list so the add output answers the
+# existence question by text as well as warning that no graph edge was made.
+# Empty/no-match is a normal result and always returns zero: an advisory must
+# never make `task add` fail under set -e.
+_task_unparented_followup_advisory() {
+  local _title="$1" _target_ident _target_kind _target_number
+  local _candidate_id _candidate_title _candidate_ident _matches=""
+  _TASK_FOLLOWUP_WARN_IDENT=""
+  _TASK_FOLLOWUP_WARN_KIND=""
+  _TASK_FOLLOWUP_WARN_NUMBER=""
+  _TASK_FOLLOWUP_WARN_MATCHES=""
+
+  _task_numbered_followup_parse "$_title"
+  _target_ident="$_TASK_FOLLOWUP_IDENT"
+  _target_kind="$_TASK_FOLLOWUP_KIND"
+  _target_number="$_TASK_FOLLOWUP_NUMBER"
+  [[ -n "$_target_ident" ]] || return 0
+  [[ "$(db "SELECT COUNT(*) FROM tasks WHERE upper(ident)=$(sqlq "$_target_ident");")" == "1" ]] || return 0
+
+  while IFS= read -r _candidate_id; do
+    [[ -n "$_candidate_id" ]] || continue
+    _candidate_title=$(db "SELECT title FROM tasks WHERE id=${_candidate_id};")
+    _task_numbered_followup_parse "$_candidate_title"
+    if [[ "$_TASK_FOLLOWUP_IDENT" == "$_target_ident" \
+       && "$_TASK_FOLLOWUP_KIND" == "$_target_kind" \
+       && "$_TASK_FOLLOWUP_NUMBER" == "$_target_number" ]]; then
+      _candidate_ident=$(db "SELECT ident FROM tasks WHERE id=${_candidate_id};")
+      _matches+="${_matches:+,}${_candidate_ident}"
+    fi
+  done < <(db "SELECT id FROM tasks
+               WHERE status NOT IN ('done','cancelled')
+                 AND instr(upper(title), $(sqlq "$_target_ident")) > 0
+               ORDER BY id;")
+
+  _TASK_FOLLOWUP_WARN_IDENT="$_target_ident"
+  _TASK_FOLLOWUP_WARN_KIND="$_target_kind"
+  _TASK_FOLLOWUP_WARN_NUMBER="$_target_number"
+  _TASK_FOLLOWUP_WARN_MATCHES="$_matches"
+  return 0
+}
+
 # ---------------------------------------------------------------------------
 # THE FILING CAP (DIVE-2681). Two controls over one classifier.
 #
@@ -976,6 +1040,18 @@ cmd_task_add() {
   if [[ -n "$parent" ]]; then
     resolve_task_id "$parent"; parent_sql="$RESOLVED_TASK_ID"
   fi
+  # DIVE-2449: an explicit --parent is the graph edge, so it suppresses this
+  # advisory regardless of prose. Without one, measure the narrow numbered
+  # follow-up title before inserting the row; the warning itself is emitted only
+  # after the new ident exists, and JSON carries the same receipt.
+  local followup_warn_ident="" followup_warn_kind="" followup_warn_number="" followup_warn_matches=""
+  if [[ "$kind" == "standard" && -z "$parent" ]]; then
+    _task_unparented_followup_advisory "$title"
+    followup_warn_ident="$_TASK_FOLLOWUP_WARN_IDENT"
+    followup_warn_kind="$_TASK_FOLLOWUP_WARN_KIND"
+    followup_warn_number="$_TASK_FOLLOWUP_WARN_NUMBER"
+    followup_warn_matches="$_TASK_FOLLOWUP_WARN_MATCHES"
+  fi
   # DIVE-980: an explicit --assignee may be a literal agent name OR an org-chart
   # TOKEN (role:<r> / charter:<kw> / @name). Route tokens through the org chart;
   # a literal name is trusted verbatim (explicit --assignee always wins). A token
@@ -1139,6 +1215,13 @@ An internal-machinery finding gets its own ident ONLY if it has ALREADY blocked 
        '{id:($i|tonumber), ident:$id, project:$pr, title:$t, priority:$p, assignee:$a, created_by:$c, kind:"recurring", schedule:$s, fresh:($f=="1")}' \
        --arg i "$id" --arg id "$ident" --arg pr "$project" --arg t "$title" --arg p "$priority" --arg a "${assignee:-}" --arg c "$creator" --arg s "$recurring" --arg f "$fresh_sql"
   else
+    if [[ -n "$followup_warn_ident" ]]; then
+      local _followup_match_note=""
+      if [[ -n "$followup_warn_matches" ]]; then
+        _followup_match_note=" Open title match(es) for the same token: ${followup_warn_matches}."
+      fi
+      warn "$ident: title cites existing ${followup_warn_ident} ${followup_warn_kind} #${followup_warn_number} without --parent, so no child link was created.${_followup_match_note} If this is a child, file it with --parent=${followup_warn_ident}."
+    fi
     local coord_note=""
     (( auto_coordinated )) && coord_note=" → coordinator: $assignee"
     local verify_note=""
@@ -1152,8 +1235,9 @@ An internal-machinery finding gets its own ident ONLY if it has ALREADY blocked 
     [[ -n "$verify_skipped" ]] \
       && verify_note=" · NOT verifier-graded ($verify_skipped) — 'task done' will close it outright; attach a grader with: 5dive task verifier $ident <agent>"
     ok "created ${ident} — $title${coord_note}${verify_note}" \
-       '{id:($i|tonumber), ident:$id, project:$pr, title:$t, priority:$p, assignee:$a, created_by:$c, kind:"standard", autoCoordinated:($ac=="1"), verifyDefaulted:($vd=="1"), verifyUnavailable:($vu=="1"), verifySkipped:($vs!=""), verifySkipReason:$vs, verifier:$v}' \
-       --arg i "$id" --arg id "$ident" --arg pr "$project" --arg t "$title" --arg p "$priority" --arg a "${assignee:-}" --arg c "$creator" --arg ac "$auto_coordinated" --arg vd "$verify_defaulted" --arg vu "$verify_unavailable" --arg vs "$verify_skipped" --arg v "${verifier:-}"
+       '{id:($i|tonumber), ident:$id, project:$pr, title:$t, priority:$p, assignee:$a, created_by:$c, kind:"standard", autoCoordinated:($ac=="1"), verifyDefaulted:($vd=="1"), verifyUnavailable:($vu=="1"), verifySkipped:($vs!=""), verifySkipReason:$vs, verifier:$v, parentLinkWarning:($wi!=""), citedParent:$wi, citedSeries:(if $wi=="" then "" else ($wk+" #"+$wn) end), openTitleMatches:($wm|split(",")|map(select(length>0)))}' \
+       --arg i "$id" --arg id "$ident" --arg pr "$project" --arg t "$title" --arg p "$priority" --arg a "${assignee:-}" --arg c "$creator" --arg ac "$auto_coordinated" --arg vd "$verify_defaulted" --arg vu "$verify_unavailable" --arg vs "$verify_skipped" --arg v "${verifier:-}" \
+       --arg wi "$followup_warn_ident" --arg wk "$followup_warn_kind" --arg wn "$followup_warn_number" --arg wm "$followup_warn_matches"
   fi
 }
 
