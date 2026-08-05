@@ -5,6 +5,15 @@
 # the prose/--parent/nonexistent-ident controls remain green.
 set -uo pipefail
 
+# DIVE-2211: name the tree this harness grades (tests/lib/grading_tree.sh).
+# Three-state: if the helper is unreachable (a staged copy that did not carry
+# tests/lib/), the log says NO TREE WAS NAMED rather than falling silent, and a
+# set -e harness is not killed by a failed source. Keep stderr visible: the
+# helper's own stderr line is the payload.
+# shellcheck disable=SC1091
+. "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh" \
+  || printf 'grading tree: UNRESOLVED (tests/lib/grading_tree.sh not reachable; no tree named)\n' >&2
+
 # shellcheck disable=SC2154
 trap 'rc=$?; rm -rf "${MUT_TMP:-}"; echo "HARNESS-RC=$rc"' EXIT
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
