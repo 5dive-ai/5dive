@@ -53,8 +53,34 @@ decision to add one is ever wrong on its own merits. See
 - **Editing a harness always runs it**, whatever its tier: the `changed-harnesses`
   job runs and verdict-probes every harness your diff touches. Tier membership is
   a default, and a default loses to an explicit signal.
+- **The budget is spent in a RELATIVE unit** (DIVE-2728). PR #461 red-gated at 322s
+  with 234 of 234 harnesses passing and a diff worth +0.1s, while unrelated files ran
+  10-36% slower and the file the diff touched moved +0.3%. With 9% headroom against a
+  10-36% platform draw, the cap had stopped measuring the corpus. So the runner now
+  **times a small calibration workload in the same job** — process spawn, bash
+  startup, the CLI's own startup, small file I/O, auto-sized to ~10s, min of 2 — and
+  spends the cap in units of it. A uniformly slow VM scales both sides and cancels.
+  - **Clamped to 100-150%.** The floor means a fast VM never *tightens* the agreed
+    cap; the ceiling is the escape-hatch guard, because a cap that grows without
+    limit with the runner draw licenses an arbitrarily larger corpus.
+  - **Past the ceiling, or with a probe that cannot run, the verdict is
+    UNDETERMINED — `exit 6`, never green and never `exit 4`.** "The corpus is over
+    its cap" and "this box could not measure that cap" are different events with
+    different remedies (re-run, not retire a guard). A *failing harness still exits
+    1*: a slow box must never hide a broken test.
+  - **Read the two percentages together.** Every run prints the run against the raw
+    cap and against the effective one: **raw high + effective low = the VM was slow;
+    both high = the corpus grew.** That separation is the deliverable.
+  - Calibration time is **not** counted toward the total. `TIER_CAL_BASELINE_US` is
+    graded against itself every run and says RE-BASELINE past 25% drift — a runner
+    image change is exactly the event that moves it.
+  - `--no-calibrate` grades against the raw cap (useful with no built bundle). The
+    clamp floor is 1.0, so that is the **strictest** this gate gets, never a
+    relaxation. `--cal-us=` / `--cal-baseline-us=` / `--cal-cli=` are harness seams;
+    no workflow passes them, for the same reason no workflow passes `--budget`.
 - Locally: `bash scripts/run-harnesses.sh --tier=core` (or `--tier=full`). Both
-  budgets and the tier marker live in `tests/lib/tier.sh`, one place.
+  budgets, the calibration constants and the tier marker live in `tests/lib/tier.sh`,
+  one place.
 - **The nightly is sharded, not given a bigger number.** The cap is per job, so
   splitting the sweep cuts each job's wall-clock without relaxing it. Aggregate
   capacity is 3 x 1320s and the shard count is fixed in the matrix, so adding a
