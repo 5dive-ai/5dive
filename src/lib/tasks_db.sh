@@ -165,6 +165,7 @@ require_sqlite() {
 # NOTE: projects/loop_runs/supervisor_events are ALSO defined inside gated
 # one-shot migration blocks in _tasks_db_migrate() below — edit both copies
 # together; tests/schema_sync_unit.sh fails CI if they diverge.
+_TASKS_SCHEMA_EPOCH='2808-1'
 _tasks_schema() {
   cat <<'SQL'
 PRAGMA journal_mode=WAL;
@@ -884,6 +885,11 @@ CREATE UNIQUE INDEX IF NOT EXISTS lifecycle_events_idem_idx ON lifecycle_events(
 CREATE INDEX IF NOT EXISTS lifecycle_events_ident_idx ON lifecycle_events(ident, id);
 CREATE INDEX IF NOT EXISTS lifecycle_events_ts_idx ON lifecycle_events(ts, kind);
 SQL
+  # DIVE-2808: a fresh store is born at the current whole-schema epoch in the
+  # SAME sqlite invocation. Existing stores earn this receipt only after the
+  # complete migration and canonical-surface assertion below.
+  printf "INSERT INTO task_prefs(key,value) VALUES ('schema_epoch',%s);\n" \
+    "$(sqlq "$_TASKS_SCHEMA_EPOCH")"
 }
 
 # -------- DIVE-1479: silent-recreate trap guard --------
@@ -1051,7 +1057,7 @@ tasks_db_init() {
   # WAL read-lock, which never blocks writers. .timeout lets a genuine
   # first-run race serialise instead of erroring. stdout is discarded because
   # `PRAGMA journal_mode=WAL` echoes "wal".
-  local has
+  local has created_fresh=0
   has=$(sqlite3 -cmd ".timeout 5000" "$TASKS_DB" \
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name='tasks' LIMIT 1;" 2>/dev/null)
   if [[ "$has" != "1" ]]; then
@@ -1061,16 +1067,30 @@ tasks_db_init() {
     if _tasks_board_existed; then
       _tasks_board_recover
     else
-      sqlite3 -cmd ".timeout 5000" "$TASKS_DB" < <(_tasks_schema) >/dev/null \
-        || fail "$E_GENERIC" "failed to initialise tasks db at $TASKS_DB"
+      local fresh_payload row
+      fresh_payload=$(sqlite3 -cmd ".timeout 5000" "$TASKS_DB" < <(
+        _tasks_schema
+        printf "SELECT 'column:'||name FROM pragma_table_info('tasks');\n"
+      )) || fail "$E_GENERIC" "failed to initialise tasks db at $TASKS_DB"
+      _TASKS_DB_GATE_COLUMNS=''
+      while IFS= read -r row; do
+        [[ "$row" == column:* ]] || continue  # ignores PRAGMA journal_mode's "wal"
+        _TASKS_DB_GATE_COLUMNS+="${row#column:}"$'\n'
+      done <<<"$fresh_payload"
+      _TASKS_DB_GATE_COLUMNS="${_TASKS_DB_GATE_COLUMNS%$'\n'}"
       chmod 0660 "$TASKS_DB" 2>/dev/null || true
+      created_fresh=1
     fi
   fi
   # DIVE-2808: the canonical schema is complete, so almost every invocation can
-  # skip the expensive reconciliation. The gate and the migration consume the
-  # SAME array below; pure-Bash membership avoids one grep process per column.
-  # Both arms retain DIVE-2197's resulting-set assertion.
-  if _tasks_db_migration_needed; then
+  # skip the expensive reconciliation. The gate requires the whole-schema epoch
+  # plus the SAME tasks-column array the migration consumes; pure-Bash membership
+  # avoids one grep process per column. Both arms retain DIVE-2197's assertion.
+  if ((created_fresh)); then
+    # The CREATE and epoch stamp succeeded in one sqlite invocation. Preserve DIVE-2197's
+    # independent resulting-set assertion without paying a redundant epoch read.
+    _tasks_db_assert_required_columns "$_TASKS_DB_GATE_COLUMNS"
+  elif _tasks_db_migration_needed; then
     _tasks_db_migrate
   else
     _tasks_db_assert_required_columns "$_TASKS_DB_GATE_COLUMNS"
@@ -1109,6 +1129,7 @@ _TASKS_ADDITIVE_COLUMNS=(
   'human_evidence TEXT' 'derived_actor TEXT' 'floor_provenance TEXT'
 )
 _TASKS_DB_GATE_COLUMNS=''
+_TASKS_DB_GATE_EPOCH=''
 
 # Exact newline membership without a subprocess. The newline frame prevents a
 # prefix (need_ty) from satisfying a full column name (need_type).
@@ -1123,9 +1144,68 @@ _tasks_columns_have_all_additive() { # <newline-delimited pragma names>
 }
 
 _tasks_db_migration_needed() {
-  _TASKS_DB_GATE_COLUMNS=$(sqlite3 -cmd ".timeout 5000" "$TASKS_DB" \
-    "SELECT name FROM pragma_table_info('tasks');" 2>/dev/null) || return 0
+  local payload row
+  payload=$(sqlite3 -cmd ".timeout 5000" "$TASKS_DB" \
+    "SELECT 'epoch:'||COALESCE((SELECT value FROM task_prefs WHERE key='schema_epoch'),'')
+       UNION ALL
+     SELECT 'column:'||name FROM pragma_table_info('tasks');" 2>/dev/null) || return 0
+  _TASKS_DB_GATE_COLUMNS=''
+  _TASKS_DB_GATE_EPOCH=''
+  while IFS= read -r row; do
+    case "$row" in
+      epoch:*)  _TASKS_DB_GATE_EPOCH="${row#epoch:}" ;;
+      column:*) _TASKS_DB_GATE_COLUMNS+="${row#column:}"$'\n' ;;
+    esac
+  done <<<"$payload"
+  _TASKS_DB_GATE_COLUMNS="${_TASKS_DB_GATE_COLUMNS%$'\n'}"
+  [[ "$_TASKS_DB_GATE_EPOCH" == "$_TASKS_SCHEMA_EPOCH" ]] || return 0
   ! _tasks_columns_have_all_additive "$_TASKS_DB_GATE_COLUMNS"
+}
+
+_tasks_db_schema_manifest_sql() {
+  printf '%s\n' "SELECT item FROM (
+    SELECT 'table:'||name AS item FROM sqlite_schema
+      WHERE type='table' AND name NOT LIKE 'sqlite_%'
+    UNION ALL
+    SELECT 'column:'||m.name||'.'||p.name AS item
+      FROM sqlite_schema AS m, pragma_table_info(m.name) AS p
+      WHERE m.type='table' AND m.name NOT LIKE 'sqlite_%' AND m.name!='tasks'
+    UNION ALL
+    SELECT 'index:'||name AS item FROM sqlite_schema
+      WHERE type='index' AND name NOT LIKE 'sqlite_%'
+  ) ORDER BY item;"
+}
+
+# The epoch is a receipt for the WHOLE migration, not only tasks columns. Before
+# stamping it, prove every canonical table, non-tasks column and named index
+# exists; tasks columns are proved by the dedicated assertion above. Extras are
+# allowed for forward compatibility and local extensions.
+_tasks_db_assert_canonical_surface() {
+  local manifest_sql canonical observed item framed
+  manifest_sql=$(_tasks_db_schema_manifest_sql)
+  canonical=$(
+    {
+      printf '.output /dev/null\n'
+      _tasks_schema
+      printf '.output stdout\n%s\n' "$manifest_sql"
+    } | sqlite3 -cmd ".timeout 5000" :memory:
+  ) || fail "$E_GENERIC" "could not build canonical tasks-db schema manifest (DIVE-2808)"
+  observed=$(sqlite3 -cmd ".timeout 5000" "$TASKS_DB" "$manifest_sql" 2>/dev/null) \
+    || fail "$E_GENERIC" "could not read migrated tasks-db schema manifest (DIVE-2808)"
+  framed=$'\n'"$observed"$'\n'
+  while IFS= read -r item; do
+    [[ -n "$item" ]] || continue
+    [[ "$framed" == *$'\n'"$item"$'\n'* ]] || fail "$E_GENERIC" \
+      "tasks db canonical surface incomplete after migration — missing $item (DIVE-2808)"
+  done <<<"$canonical"
+}
+
+_tasks_db_stamp_schema_epoch() {
+  sqlite3 -cmd ".timeout 5000" "$TASKS_DB" \
+    "INSERT INTO task_prefs(key,value,updated_at)
+       VALUES ('schema_epoch',$(sqlq "$_TASKS_SCHEMA_EPOCH"),datetime('now'))
+       ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=datetime('now');" \
+    >/dev/null 2>&1 || fail "$E_GENERIC" "failed to stamp tasks-db schema epoch (DIVE-2808)"
 }
 
 # DIVE-2197's resulting-set assertion. It is called after a real migration and
@@ -1639,6 +1719,8 @@ MIG
         "ALTER TABLE objectives ADD COLUMN run_mode TEXT NOT NULL DEFAULT 'live';" >/dev/null 2>&1 || true
     fi
   fi
+  _tasks_db_assert_canonical_surface
+  _tasks_db_stamp_schema_epoch
 }
 
 # Per-connection setup, passed via -cmd / .timeout so it produces NO output

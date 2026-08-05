@@ -258,6 +258,28 @@ probe=$(sqlite3 "$TASKS_DB" \
 [[ $rc -eq 0 && "$probe" == "1" ]] \
   && ok "derived gate: migration follows the same array and adds its column" \
   || bad "derived gate: migration did not follow the array" "rc=$rc probe=$probe out=$out"
+unset '_TASKS_ADDITIVE_COLUMNS[${#_TASKS_ADDITIVE_COLUMNS[@]}-1]'
+
+# --- Case 13 (DIVE-2808): epoch covers non-tasks migration surfaces -----------
+# A tasks-only gate would skip this store because all 71 tasks columns remain.
+# A pre-epoch store with a hole elsewhere must run the whole migration once and
+# earn the receipt only after the canonical surface is complete.
+fresh_tree
+tasks_db_init >/dev/null 2>&1
+sqlite3 "$TASKS_DB" "ALTER TABLE gate_history DROP COLUMN floor_provenance;
+                     DELETE FROM task_prefs WHERE key='schema_epoch';"
+if _tasks_db_migration_needed; then
+  ok "schema epoch: a non-tasks hole on a pre-epoch store enters migration"
+else
+  bad "schema epoch: tasks-only currency hid a non-tasks migration"
+fi
+out=$(tasks_db_init 2>&1); rc=$?
+gh_col=$(sqlite3 "$TASKS_DB" \
+  "SELECT count(*) FROM pragma_table_info('gate_history') WHERE name='floor_provenance';")
+epoch=$(sqlite3 "$TASKS_DB" "SELECT value FROM task_prefs WHERE key='schema_epoch';")
+[[ $rc -eq 0 && "$gh_col" == "1" && "$epoch" == "$_TASKS_SCHEMA_EPOCH" ]] \
+  && ok "schema epoch: full migration repairs the hole and stamps its receipt" \
+  || bad "schema epoch: repair/receipt incomplete" "rc=$rc column=$gh_col epoch=$epoch out=$out"
 
 echo
 echo "tasks-db restore guard: $PASS passed, $FAIL failed"
