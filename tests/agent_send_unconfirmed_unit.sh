@@ -28,11 +28,15 @@ source src/lib/validation.sh
 # shellcheck disable=SC1091
 source src/cmd_agent_runtime.sh
 
-PASS=0; FAIL=0
+PASS=0; FAIL=0; NOT_REACHED=0
 REAL_SUDO=$(command -v sudo)
 SCOPED_DELIVER_ARGV=$(mktemp)
 ok_t()  { PASS=$((PASS+1)); printf 'ok   - %s\n' "$1"; }
 bad_t() { FAIL=$((FAIL+1)); printf 'FAIL - %s\n   %s\n' "$1" "${2:-}"; }
+not_reached_t() {
+  NOT_REACHED=$((NOT_REACHED+1))
+  printf 'NOT-REACHED - %s\n   %s\n' "$1" "${2:-}"
+}
 is() {
   local label="$1" want="$2" got="$3"
   if [[ "$got" == "$want" ]]; then
@@ -148,7 +152,15 @@ if [[ "$(<"$SCOPED_DELIVER_ARGV")" == "-n /usr/local/bin/5dive agent _deliver --
 else
   bad_t 'T16 scoped ask argv cannot match the standard sudoers grant' "$(<"$SCOPED_DELIVER_ARGV")"
 fi
-if "$REAL_SUDO" -n -l /usr/local/bin/5dive agent _deliver --json --id=feed2362 ada policy-probe >/dev/null 2>&1; then
+# This is a bonus environment probe: T16 carries the source-connected regression.
+# Only grade the live argv when this identity has an explicit 5dive sudoers grant.
+# A generic CI runner has no such policy to measure, which is NOT-REACHED rather
+# than evidence that the standard-agent grant denies the corrected argv.
+live_policy=$("$REAL_SUDO" -n -l 2>/dev/null || true)
+if ! grep -Eq '/usr/local/bin/5dive(,|[[:space:]]+\*|[[:space:]]+agent[[:space:]]+_deliver)' <<<"$live_policy"; then
+  not_reached_t 'T17 live scoped-delivery policy probe' \
+    'this identity has no explicit /usr/local/bin/5dive sudoers grant; T16 carries the environment-free regression'
+elif "$REAL_SUDO" -n -l /usr/local/bin/5dive agent _deliver --json --id=feed2362 ada policy-probe >/dev/null 2>&1; then
   ok_t 'T17 exact scoped-delivery argv is admitted by the live non-executing policy probe'
 else
   bad_t 'T17 exact scoped-delivery argv is denied by the live sudoers policy' 'sudo -n -l returned nonzero'
@@ -181,5 +193,5 @@ else
   bad_t 'T21 confirmed scoped delivery renderer changed' 'rc=0 must stay on the original expression'
 fi
 
-printf 'agent_send_unconfirmed_unit: %d passed, %d failed\n' "$PASS" "$FAIL"
+printf 'agent_send_unconfirmed_unit: %d passed, %d failed, %d not reached\n' "$PASS" "$FAIL" "$NOT_REACHED"
 [[ "$FAIL" -eq 0 ]]
