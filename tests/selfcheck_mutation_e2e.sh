@@ -221,6 +221,71 @@ mut_bundle() {
 }
 assert_mutation bundle-integrity "the tracked checksum describes another bundle" mut_bundle "different generations"
 
+# ── rail 4b: THE RELEASE-COMMIT SHAPE (DIVE-2798) ────────────────────────────
+# The shape this harness never built, and the reason a green corpus still could not
+# cut v0.19.3. `release-cut.yml` commits the source, builds the bundle (stamped with
+# that source commit), then commits the BUNDLE onto a second commit. So on the commit
+# that gets tagged, HEAD is the bundle commit and the bundle names HEAD^ — and the
+# probe's rebuild stamps HEAD. A raw `cmp` is unsatisfiable there BY CONSTRUCTION:
+# a bundle cannot carry the sha of the commit that contains it.
+#
+# Every arm below runs in that shape rather than in the working-tree shape, because
+# the defect is invisible in the working-tree shape — which is precisely why every
+# PR was green and the failure waited for a release. And the shape is BUILT here, not
+# asserted: the arms after it must still go red, or "release commits pass" would be
+# indistinguishable from "the probe stopped checking".
+_release_commit_shape() {   # leaves $WORK at: HEAD = bundle commit, bundle stamped HEAD^
+  git -C "$WORK" add -A >/dev/null 2>&1 || return 1
+  git -C "$WORK" -c user.name='harness' -c user.email='harness@example.com' \
+      -c commit.gpgsign=false commit -qm 'release: assign version before bundle build' >/dev/null 2>&1 || return 1
+  (cd "$WORK" && bash build.sh >/dev/null 2>&1) || return 1
+  git -C "$WORK" add -A -f 5dive 5dive.sha256 >/dev/null 2>&1 || return 1
+  git -C "$WORK" -c user.name='harness' -c user.email='harness@example.com' \
+      -c commit.gpgsign=false commit -qm 'release: bundle built from the parent' >/dev/null 2>&1 || return 1
+}
+if _release_commit_shape; then
+  _rc_head=$(git -C "$WORK" rev-parse HEAD)
+  _rc_parent=$(git -C "$WORK" rev-parse 'HEAD^1')
+  _rc_stamp=$(grep -m1 -E '^readonly FIVE_BUILD_SHA="[^"]*"$' "$WORK/5dive" | sed -E 's/.*="([^"]*)".*/\1/')
+  # The fixture must actually BE the shape, or the arms below prove nothing about it.
+  [[ "$_rc_stamp" == "$_rc_parent" && "$_rc_stamp" != "$_rc_head" ]] \
+    && ok_t "[bundle-integrity] fixture IS the release shape: bundle stamps HEAD^ (${_rc_stamp:0:12}), not HEAD (${_rc_head:0:12})" \
+    || fail_t "[bundle-integrity] fixture is NOT the release shape (stamp=${_rc_stamp:0:12} head=${_rc_head:0:12} parent=${_rc_parent:0:12}) — every arm below would be vacuous"
+
+  probe bundle-integrity
+  [[ $RC -eq 0 ]] \
+    && ok_t "[bundle-integrity] PASSES on a release commit (DIVE-2798: the cut is no longer self-blocking)" \
+    || fail_t "[bundle-integrity] still red on a release commit — the v0.19.3 blocker is not fixed: $OUT"
+
+  # ACCEPTANCE, and the whole point: a stale bundle must STILL be caught in this
+  # shape. If tolerating the stamp had widened into tolerating the bundle, this is
+  # where it shows, so it is asserted here rather than only in the working-tree shape.
+  printf '\n# DIVE-2798 staleness probe\n' >> "$WORK/src/cmd_selfcheck.sh"
+  probe bundle-integrity
+  [[ $RC -ne 0 ]] && grep -q 'is not what src/ builds' <<<"$OUT" \
+    && ok_t "[bundle-integrity] a STALE bundle is still RED on a release commit (not weakened to a no-op)" \
+    || fail_t "[bundle-integrity] stale bundle passed on a release commit — the fix is a no-op: $OUT"
+  git -C "$WORK" checkout -q -- src/cmd_selfcheck.sh 2>/dev/null || true
+
+  # And the stamp itself is ASSERTED, not exempted: a bundle whose only difference
+  # from src/ is a stamp naming a commit this checkout cannot corroborate is a
+  # forged identity, and comparing modulo the stamp without this arm would pass it.
+  # The checksum is regenerated so the red can only come from the identity check.
+  sed -i -E 's/^readonly FIVE_BUILD_SHA="[^"]*"$/readonly FIVE_BUILD_SHA="deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"/' "$WORK/5dive"
+  sha256sum "$WORK/5dive" | awk '{print $1}' > "$WORK/5dive.sha256"
+  probe bundle-integrity
+  [[ $RC -ne 0 ]] && grep -q 'cannot corroborate' <<<"$OUT" \
+    && ok_t "[bundle-integrity] a FORGED build stamp is RED (the stamp is asserted, not waived)" \
+    || fail_t "[bundle-integrity] a bundle claiming a foreign build sha passed: $OUT"
+
+  restore
+  probe bundle-integrity
+  [[ $RC -eq 0 ]] && ok_t "[bundle-integrity] green again once restored (release shape left no residue)" \
+    || fail_t "[bundle-integrity] did not recover after the release-shape arms: $OUT"
+else
+  fail_t "[bundle-integrity] could not build the release-commit fixture — DIVE-2798 is UNPROVEN, not passing"
+fi
+
 # ── rail 5: the audit log, PRIVILEGED half ───────────────────────────────────
 # Same mutation as rail 2, measured from the other side. Skipped-not-silent when
 # there is no passwordless sudo: naming what went unproven is the entire point of
