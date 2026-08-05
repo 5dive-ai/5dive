@@ -51,6 +51,40 @@ proj=$(db "SELECT key FROM projects WHERE key='dive' AND status='active';")
 ( cmd_loop_until_dry --agent=main --round=x >/dev/null 2>&1 ); [[ $? -ne 0 ]] && ok_t "until-dry: missing --dedup-key fails" || bad_t "ud key" "exit 0"
 ( cmd_loop_collect >/dev/null 2>&1 ); [[ $? -ne 0 ]] && ok_t "collect: missing --handles fails" || bad_t "collect handles" "exit 0"
 
+# ---- DIVE-2126: map ceiling halt is observable and actually reached ----
+# This is the sixth collapsed-halt site found after DIVE-2083/DIVE-2105, but
+# unlike those siblings there was no map ceiling case to repair. Two independent
+# mechanisms can otherwise make the assertion lie:
+#   1. the product can label a real breach "escalated", indistinguishable from
+#      timeout in the existing status field; haltReason is the discriminator;
+#   2. the real refresher recomputes spend from agent transcripts this isolated
+#      harness does not own, replacing the poked value with 0 so the case times
+#      out. Stub the producer, not the ceiling decision, so tokens_spent remains
+#      the input the product reads.
+_loop_refresh_spend() { db "SELECT COALESCE(tokens_spent,0) FROM loop_runs WHERE loop_id='$1';"; }
+( cmd_loop_map --agent=main --do='CEILING_HOLD ITEM={}' --over='[1]' \
+    --ceiling=1000 --timeout=8 --stage=DIVE-2126-ceiling >"$TMP/map-ceil.out" 2>"$TMP/map-ceil.err" ) &
+map_bgpid=$!
+map_lid=""
+for _ in $(seq 1 100); do
+  map_lid=$(db "SELECT loop_id FROM loop_runs WHERE topology='map' AND stage='DIVE-2126-ceiling' ORDER BY started_at DESC LIMIT 1;")
+  [[ -n "$map_lid" ]] && break
+  sleep 0.1
+done
+if [[ -n "$map_lid" ]]; then
+  db "UPDATE loop_runs SET tokens_spent=5000 WHERE loop_id=$(sqlq "$map_lid");"
+else
+  bad_t "map ceiling setup" "poll timed out — the map row never appeared, so no ceiling breach was created"
+fi
+wait "$map_bgpid"; map_wait_rc=$?
+map_cst=$(jq -r '.data.status' "$TMP/map-ceil.out" 2>/dev/null)
+map_chr=$(jq -r '.data.haltReason' "$TMP/map-ceil.out" 2>/dev/null)
+if [[ "$map_wait_rc" == "0" && "$map_cst" == "escalated" && "$map_chr" == "ceiling" ]]; then
+  ok_t "map: ceiling breach → status=escalated, haltReason=ceiling (not timeout)"
+else
+  bad_t "map ceiling halt" "wait_rc=$map_wait_rc status=$map_cst haltReason=$map_chr out=$(cat "$TMP/map-ceil.out") err=$(cat "$TMP/map-ceil.err")"
+fi
+
 # ---- background fleet simulator: complete any loop-spawned todo task ----
 # Each map item task body contains "ITEM=<n>"; we echo it back so we can assert
 # index-alignment. until-dry finder tasks get a round-specific canned array.
