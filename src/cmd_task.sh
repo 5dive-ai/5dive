@@ -2695,7 +2695,27 @@ _task_guard_result_over_closed() {
         "$ident" "open_status=$_cl_st" "overwritten_result=$_cl_prev"
       warn "$ident: --force-result REPLACED a result this OPEN row already carried. The overwritten text is in the audit log (task.force-result-over-open); the board copy is gone (DIVE-2483)."
     else
-      result="${_cl_prev}"$'\n\n'"--- appended by a later write (DIVE-2483); the text above was already on the row ---"$'\n'"${result}"
+      # DIVE-2483 iteration 2 (olivia's reject). The gate answer named FOUR
+      # conditions; the two expressible as DB-column state shipped, and the two
+      # about what the OPERATOR SEES were dropped. Both are here now.
+      #
+      # CONDITION 2 — DATE THE SEAM. There is no result_by column (that was this
+      # row's first blocker), so the seam marker IS the provenance: it is the only
+      # thing on the board that says a second writer arrived and when. An undated
+      # marker tells a reader that two texts were joined and nothing about the
+      # order of events, which is most of what provenance is for.
+      local _seam_at; _seam_at=$(date -u '+%Y-%m-%d %H:%M:%SZ')
+      result="${_cl_prev}"$'\n\n'"--- appended ${_seam_at} by a later write (DIVE-2483); the text above was already on the row ---"$'\n'"${result}"
+      # CONDITION 1 — SAY IT HAPPENED. This is the one the gate answer flagged as
+      # "most likely to be dropped as cosmetic", and it was dropped. Without it a
+      # bare open-row close prints exactly `ok - <ident> done` — BYTE-IDENTICAL to
+      # the output that accompanied the DIVE-2712 wipe. The bytes were rescued and
+      # the silence that made their loss undetectable was shipped intact, so an
+      # operator cannot tell the fixed behaviour from the defect at the terminal.
+      # The byte count is not decoration: it is the cheapest thing that makes the
+      # claim falsifiable at a glance — a reader who expected 2.6KB and sees 40
+      # knows to look, and one who sees nothing at all never does.
+      warn "$ident: this row already carried a result and it was PRESERVED, not replaced — ${#_cl_prev} bytes kept above your text, under a dated seam (DIVE-2483). Run '5dive task show $ident' to read both, or '5dive trace $ident' for who wrote the earlier one."
     fi
   fi
   _TASK_GUARDED_RESULT="$result"
