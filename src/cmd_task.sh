@@ -10388,7 +10388,8 @@ cmd_task_answer() {
     # sufficient — that was the sudo→--human forge (DIVE-916 threat).
     # (_hp/_su declared at function scope above — DIVE-2406 reads them at the stamp.)
     [[ -n "$human_proof" ]] && _human_nonce_verify "$id" "$human_proof" && _hp=1
-    _gate_sudo_uid_nonagent && _su=1
+    # DIVE-2371: AUTHORIZATION site — structural principal test, fails closed.
+    _gate_human_principal && _su=1
     # DIVE-1305: a verified paired-human channel proof is the fourth evidence
     # form — but _cp_ok is already gated to tier<2 above, so it can satisfy the
     # evidence rule only for a tier-1 approval/access gate (never a tier-2 hard
@@ -10553,7 +10554,8 @@ cmd_task_answer() {
     if [[ -n "$_t2_hash" ]]; then
       local _t2_hp=0 _t2_su=0
       [[ -n "$human_proof" ]] && _human_nonce_verify "$id" "$human_proof" && _t2_hp=1
-      _gate_sudo_uid_nonagent && _t2_su=1
+      # DIVE-2371: AUTHORIZATION site (tier-2 floor) — same structural test.
+      _gate_human_principal && _t2_su=1
       # DIVE-2412: THE CITATION IS THE THIRD EVIDENCE FORM, and it has to be named
       # HERE rather than only in the `human` flag it also raises. This site is what
       # decides whether a tier-2 `--human` claim was PROVED, and it is scoped to

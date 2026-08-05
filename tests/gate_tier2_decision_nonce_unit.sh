@@ -132,6 +132,27 @@ _pin_check="$(_gate_uid_to_agent "$(_gate_caller_uid)")"
   || { printf 'NOT OK - identity pin is inert: uid %s resolved to agent %s, expected a NON-agent caller\n' "$_PIN_UID" "'$_pin_check'"; exit 1; }
 export SUDO_UID=0
 
+# DIVE-2371: authorization acquired a SECOND, STRUCTURAL half. The answer path no
+# longer calls `_gate_sudo_uid_nonagent` directly — it calls `_gate_human_principal`,
+# = that uid test AND `_gate_cgroup_human_capable`, which reads /proc/self/cgroup.
+# NEITHER `id` pin above can reach that read. Unstubbed, T6 sees the HOST's real
+# cgroup (an agent unit on a box, a runner cgroup on CI), the tier-2 guard refuses
+# CORRECTLY, and its pre-existing `fail 6` exits this UNSUBSHELLED harness — 10 ok /
+# 0 FAIL and then truncation. That is the same rc=6 shape this file's DIVE-2610 note
+# describes for `id -u`, one predicate later, and it is why the arm below is a pin
+# and not a behaviour change: nothing about the shipped predicate is relaxed here.
+# Stub the READER only (as tests/gate_cgroup_human_principal_unit.sh does); the
+# accept/deny logic stays shipped bytes, and no env override exists on purpose — a
+# widening knob on a fail-closed accept list IS the forge class DIVE-2371 closes.
+_CGROUP_PIN='/user.slice/user-0.slice/session-1.scope'   # a real login session
+_gate_caller_cgroup() { printf '%s' "$_CGROUP_PIN"; }
+# LIVENESS, BOTH DIRECTIONS. Unstubbed this fails CLOSED (loud truncation), but a
+# stub wired to the wrong SENSE fails open — so assert the negative before T6 leans on it.
+_gate_human_principal \
+  || { printf 'NOT OK - human-principal pin inert: the pinned login-session cgroup did not read as a human principal\n'; exit 1; }
+( _CGROUP_PIN='/system.slice/system-5dive.slice/5dive-agent@dev.service'; _gate_human_principal ) \
+  && { printf 'NOT OK - human-principal pin inert: an agent cgroup read as a human principal\n'; exit 1; }
+
 seed_task() { db "INSERT INTO tasks (ident, title, status, created_by) VALUES ('$1','t','todo','main');"; }
 hashof()  { db "SELECT COALESCE(human_nonce_hash,'') FROM tasks WHERE ident='$1';"; }
 tierof()  { db "SELECT COALESCE(tier,'')             FROM tasks WHERE ident='$1';"; }
@@ -259,6 +280,19 @@ cmd_task_answer DIVE-206 --value=A --human >/dev/null 2>&1
 [[ "$(answered DIVE-206)" == "closed" ]] \
   && ok_t "T6 ordering guard: --human answer on a NONCE-BEARING tier-2 decision still clears" \
   || bad_t "T6 --human tier-2 decision still clears" "still $(answered DIVE-206) — refuse-on-NULL may have landed early"
+
+# --- T6b: DIVE-2371 — T6's PARTNER, and the reason T6 stays an ORDERING guard rather
+#     than quietly becoming a "human principals clear" guard. Identical input to T6,
+#     identical uid pins, ONLY the cgroup differs: an agent unit must be REFUSED.
+#     Together the pair says minting changed nothing about WHO can answer while the
+#     structural half decides who that is. Subshelled: the refusal is a `fail 6` by design.
+seed_task DIVE-216
+cmd_task_need DIVE-216 --type=decision --ask="pick a lane" --options="A|B" --recommend="A" --tier=2 >/dev/null 2>&1
+_t6b_out=$( _CGROUP_PIN='/system.slice/system-5dive.slice/5dive-agent@dev.service'
+            cmd_task_answer DIVE-216 --value=A --human 2>&1 ); _t6b_rc=$?
+[[ "$(answered DIVE-216)" == "open" && $_t6b_rc -ne 0 ]] \
+  && ok_t "T6b agent CGROUP on the same shape is REFUSED (the bare --human tier-2 forge)" \
+  || bad_t "T6b agent cgroup refused" "rc=$_t6b_rc state=$(answered DIVE-216) out=$_t6b_out — structural half not reached on the answer path"
 
 # --- T7: the pre-existing DIVE-1117 floor is untouched — a BARE-AGENT answer on
 #     the same shape is still refused. Pairs with T6: together they pin the answer
