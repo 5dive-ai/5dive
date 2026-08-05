@@ -254,6 +254,45 @@ version_lt() {
   [[ "$1" != "$2" ]] && [[ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | head -1)" == "$1" ]]
 }
 
+# Only plain release versions carry ordering meaning. In particular,
+# 0.0.0-dev is a tag-time sentinel, not a version below every release.
+release_version() { [[ "$1" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; }
+
+bundle_build_sha() {
+  local _sha=""
+  _sha="$(grep -m1 'readonly FIVE_BUILD_SHA=' "$1" 2>/dev/null | sed -E 's/.*="([^"]+)".*/\1/')" || _sha=""
+  [[ "$_sha" =~ ^[0-9a-f]{40}$ ]] || return 1
+  printf '%s\n' "$_sha"
+}
+
+# Legacy release bundles predate FIVE_BUILD_SHA. Their tag points at a detached
+# release commit whose first parent is the main commit the bundle was built
+# from, so recover that parent rather than comparing against the detached child.
+legacy_release_build_sha() {
+  local _version="$1" _json="" _line="" _sha=""
+  release_version "$_version" || return 1
+  _json="$(curl -fsSL --max-time 10 \
+    "https://api.github.com/repos/$GH_ORG/5dive/commits/v${_version}" 2>/dev/null)" || return 1
+  _line="$(printf '%s\n' "$_json" | awk '/"parents"[[:space:]]*:/ { parents=1; next } parents && /"sha"[[:space:]]*:/ { print; exit }')"
+  _sha="$(printf '%s\n' "$_line" | sed -n 's/.*"sha"[[:space:]]*:[[:space:]]*"\([0-9a-f]\{40\}\)".*/\1/p')"
+  [[ "$_sha" =~ ^[0-9a-f]{40}$ ]] || return 1
+  printf '%s\n' "$_sha"
+}
+
+# Prints ahead|behind|identical|diverged for installed...candidate.
+build_relation() {
+  local _installed="$1" _candidate="$2" _json="" _status=""
+  _json="$(curl -fsSL --max-time 10 \
+    "https://api.github.com/repos/$GH_ORG/5dive/compare/${_installed}...${_candidate}" 2>/dev/null)" || return 1
+  _status="$(printf '%s\n' "$_json" | sed -n 's/.*"status"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)"
+  case "$_status" in ahead|behind|identical|diverged) printf '%s\n' "$_status" ;; *) return 1 ;; esac
+}
+
+# Read by the --upgrade report after refresh_managed_files swaps the bundle.
+INSTALL_DIRECTION=""
+INSTALL_INSTALLED_SHA=""
+INSTALL_CANDIDATE_SHA=""
+
 # assert_version_monotonic <installed-bin> <candidate-bundle>
 # 0 = proceed, 1 = refuse (message already on stderr; caller cleans up + exits).
 # Deliberately does NOT call die(): the caller holds a temp bundle in $BIN_DIR
@@ -261,15 +300,57 @@ version_lt() {
 # directory it just refused to touch is its own small mess.
 assert_version_monotonic() {
   local _inst_bin="$1" _cand_file="$2" _inst="" _cand="" _src=""
+  local _inst_sha="" _cand_sha="" _relation="" _identity_note=""
+  INSTALL_DIRECTION="" INSTALL_INSTALLED_SHA="" INSTALL_CANDIDATE_SHA=""
   # Fresh install: nothing to move backwards from.
-  [[ -f "$_inst_bin" ]] || return 0
+  if [[ ! -f "$_inst_bin" ]]; then INSTALL_DIRECTION="fresh"; return 0; fi
   _inst="$(grep -m1 'readonly FIVE_VERSION=' "$_inst_bin" 2>/dev/null | sed -E 's/.*="([^"]+)".*/\1/')" || _inst=""
   _cand="$(grep -m1 'readonly FIVE_VERSION=' "$_cand_file" 2>/dev/null | sed -E 's/.*="([^"]+)".*/\1/')" || _cand=""
-  if [[ -z "$_inst" || -z "$_cand" ]]; then
-    echo "  ! version not comparable (installed='${_inst:-unreadable}', candidate='${_cand:-unreadable}') — direction unchecked, proceeding" >&2
+  _inst_sha="$(bundle_build_sha "$_inst_bin" || true)"
+  _cand_sha="$(bundle_build_sha "$_cand_file" || true)"
+  if [[ -z "$_inst_sha" && -n "$_cand_sha" && -n "$_inst" ]]; then
+    _inst_sha="$(legacy_release_build_sha "$_inst" || true)"
+    [[ -z "$_inst_sha" ]] || _identity_note=" (installed v${_inst} mapped to its release parent)"
+  fi
+  INSTALL_INSTALLED_SHA="$_inst_sha" INSTALL_CANDIDATE_SHA="$_cand_sha"
+
+  if [[ -n "$_inst_sha" && -n "$_cand_sha" ]]; then
+    _relation="$(build_relation "$_inst_sha" "$_cand_sha" || true)"
+    case "$_relation" in
+      ahead) INSTALL_DIRECTION="forward"; return 0 ;;
+      identical) INSTALL_DIRECTION="same"; return 0 ;;
+      behind)
+        INSTALL_DIRECTION="rollback"
+        if [[ "${FIVE_ALLOW_DOWNGRADE:-0}" == "1" ]]; then
+          echo "  ! ROLLBACK build ${_inst_sha} -> ${_cand_sha}${_identity_note} — allowed by FIVE_ALLOW_DOWNGRADE=1" >&2
+          return 0
+        fi
+        printf 'error: refusing to install older 5dive build: candidate %s is an ancestor of installed %s%s.\n' \
+          "$_cand_sha" "$_inst_sha" "$_identity_note" >&2
+        printf '       Nothing was changed. If this rollback is deliberate, re-run with FIVE_ALLOW_DOWNGRADE=1.\n' >&2
+        return 1
+        ;;
+      diverged)
+        echo "  ! build identity diverged (installed=${_inst_sha}, candidate=${_cand_sha}) — falling back to release-version ordering when available" >&2
+        ;;
+      *)
+        echo "  ! build ancestry unavailable (installed=${_inst_sha}, candidate=${_cand_sha}) — falling back to release-version ordering when available" >&2
+        ;;
+    esac
+  fi
+
+  # Version ordering is still authoritative when both artifacts carry real
+  # release versions. A sentinel or unreadable value is not rollback evidence.
+  if ! release_version "$_inst" || ! release_version "$_cand"; then
+    INSTALL_DIRECTION="unchecked"
+    echo "  ! release versions not comparable (installed='${_inst:-unreadable}', candidate='${_cand:-unreadable}') — direction unchecked, proceeding" >&2
     return 0
   fi
-  version_lt "$_cand" "$_inst" || return 0
+  if ! version_lt "$_cand" "$_inst"; then
+    if version_lt "$_inst" "$_cand"; then INSTALL_DIRECTION="forward"; else INSTALL_DIRECTION="same"; fi
+    return 0
+  fi
+  INSTALL_DIRECTION="rollback"
   # Name where the lower version came from — the whole point is that a backwards
   # move is traceable to the thing that resolved it.
   _src="${GH_PINNED_TAG:-}"
@@ -954,17 +1035,17 @@ if [[ "${1:-}" == "--upgrade" ]]; then
   # DIVE-1260: report the version actually swapped in, read from the new bundle.
   _new_ver="$(grep -m1 'readonly FIVE_VERSION=' "$BIN_DIR/5dive" 2>/dev/null | sed -E 's/.*="([^"]+)".*/\1/')"
   # >>> DIVE-2243 upgrade report (extracted verbatim by tests/install_monotonicity_unit.sh)
-  # DIVE-2243: never call a backwards move an upgrade. Reachable only via
-  # FIVE_ALLOW_DOWNGRADE=1 now that the guard above refuses otherwise — but this
-  # line is what made the fleet-wide downgrade invisible, so it states the
-  # direction it actually measured rather than the one it assumed.
-  if [[ -n "${_old_ver:-}" && -n "${_new_ver:-}" ]] && version_lt "$_new_ver" "$_old_ver"; then
-    echo "5dive DOWNGRADED: ${_old_ver} -> ${_new_ver}"
-  elif [[ -n "${_old_ver:-}" && "${_old_ver}" != "${_new_ver:-}" ]]; then
-    echo "5dive upgraded: ${_old_ver} -> ${_new_ver:-unknown}"
-  else
-    echo "5dive upgraded (now ${_new_ver:-unknown})"
-  fi
+  # Report the direction the guard measured. A current-main bundle legitimately
+  # says 0.0.0-dev, so comparing that sentinel after the swap would recreate the
+  # false "DOWNGRADED" message DIVE-2603 removes.
+  _old_id="${_old_ver:-unknown}${INSTALL_INSTALLED_SHA:+ at ${INSTALL_INSTALLED_SHA}}"
+  _new_id="${_new_ver:-unknown}${INSTALL_CANDIDATE_SHA:+ at ${INSTALL_CANDIDATE_SHA}}"
+  case "${INSTALL_DIRECTION:-unchecked}" in
+    rollback) echo "5dive DOWNGRADED: ${_old_id} -> ${_new_id}" ;;
+    same) echo "5dive refreshed: ${_old_id} -> ${_new_id} (build identity unchanged)" ;;
+    forward) echo "5dive upgraded: ${_old_id} -> ${_new_id}" ;;
+    *) echo "5dive updated: ${_old_id} -> ${_new_id} (direction unchecked)" ;;
+  esac
   # <<< DIVE-2243 upgrade report
   exit 0
 fi
