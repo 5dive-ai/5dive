@@ -822,5 +822,38 @@ if [[ -z "$_wfcal" ]]; then
   ok "NO workflow injects a calibration — the seam is for this harness and for a human measuring, never for a caller picking its own cap"
 else bad "NO workflow injects a calibration" "$_wfcal"; fi
 
+# ---- 60 the precondition this row MADE load-bearing
+# Before DIVE-2728 a job that forgot ./build.sh ran the corpus anyway (some earlier
+# harness builds the bundle as a side effect — the ordering accident unit-tests.yml
+# already documents at its own build step). Now the calibration probe SPAWNS that
+# bundle, and a missing one fails closed at exit 6. Fail-closed is correct and it also
+# means a mis-ordered workflow reds the whole sweep for a reason whose message is
+# about calibration, not about YAML. So the ordering gets an assertion.
+#
+# WHAT THIS CHECKS AND WHAT IT DOES NOT: step INDEX within the SAME JOB, parsed, not
+# grepped — a file-wide "both strings appear" test would pass a workflow where the two
+# live in different jobs, which is precisely the arrangement that breaks. It does not
+# follow composite actions or `uses:` steps that might build; if one is ever added,
+# this arm will complain and the fix is to teach it, not to delete it.
+_ord="$(python3 - <<'PY' 2>&1
+import glob, yaml
+bad = []
+for f in sorted(glob.glob('.github/workflows/*.yml')):
+    d = yaml.safe_load(open(f)) or {}
+    for jn, j in (d.get('jobs') or {}).items():
+        steps = j.get('steps') or []
+        run = [i for i, s in enumerate(steps) if 'run-harnesses.sh' in str((s or {}).get('run', ''))]
+        if not run:
+            continue
+        build = [i for i, s in enumerate(steps) if './build.sh' in str((s or {}).get('run', ''))]
+        if not build or min(build) > min(run):
+            bad.append(f'{f}:{jn}')
+print(' '.join(bad))
+PY
+)"
+if [[ -z "$_ord" ]]; then
+  ok "every job that runs the budgeted runner BUILDS THE BUNDLE FIRST, in that job — the calibration probe spawns it, and a missing bundle now fails closed"
+else bad "every job that runs the budgeted runner builds the bundle first, in that job" "offending job(s): $_ord"; fi
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 (( fail == 0 ))
