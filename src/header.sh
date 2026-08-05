@@ -829,6 +829,51 @@ valid_byo_provider() {
   [[ -n "${BYO_PROVIDER_LABEL[$1]:-}" ]]
 }
 
+# The canonical id a claude BYO agent carries when its endpoint came from
+# --base-url rather than from the CLAUDE_PROVIDER_BASEURL catalog. It is a
+# LABEL, not a vendor: nothing keys a model default or a native provider id off
+# it, and it is deliberately absent from BYO_PROVIDER_LABEL so the pickers that
+# enumerate that table (init step 6, the dashboard tiles) do not offer a vendor
+# with no endpoint behind it (DIVE-2757).
+CLAUDE_CUSTOM_PROVIDER_ID="custom"
+
+# Validate an operator-supplied Anthropic-compatible endpoint for claude BYO.
+#
+# This value is written into an auth profile's combined.env and loaded by
+# systemd as an EnvironmentFile, so the syntactic rules are not cosmetic: a
+# newline forges a second variable in that file, and whitespace or a quote
+# changes how systemd parses the line. Reject anything but a bare URL.
+#
+# SCHEME. https:// is required, because the agent's API key rides this URL on
+# every request and a plaintext http:// endpoint puts it on the wire. The one
+# exception is a loopback host — a local inference server (vLLM, llama.cpp,
+# Ollama's anthropic shim) is reached over http://127.0.0.1 and never leaves the
+# box, so requiring TLS there would refuse the most common self-hosted shape for
+# no gain. A private-LAN address is NOT exempt: it is off-box, it is a real
+# network, and "the LAN is trusted" is exactly the assumption that is wrong.
+valid_base_url() {
+  local url="$1" host=""
+  [[ -n "$url" ]] || return 1
+  (( ${#url} <= 512 )) || return 1
+  # No whitespace (incl. newline/tab), quotes, backslash, or shell metacharacters.
+  # Single-quoted so nothing in the class is expanded; `-` is last, `]` absent.
+  # `]` must be first in the class and `-` last for both to be literal.
+  local _re='^[]A-Za-z0-9._~:/?#@!$&*+,;=%[-]+$'
+  [[ "$url" =~ $_re ]] || return 1
+  case "$url" in
+    https://*) return 0 ;;
+    http://*)
+      # Strip scheme, then any /path or ?query — what remains is host[:port].
+      host="${url#http://}"; host="${host%%/*}"; host="${host%%\?*}"
+      # A bracketed IPv6 literal is full of colons, so the port strip has to
+      # respect the brackets or `[::1]:8080` truncates to `[:`.
+      if [[ "$host" == \[*\]* ]]; then host="${host%%\]*}]"; else host="${host%:*}"; fi
+      [[ "$host" == "127.0.0.1" || "$host" == "localhost" || "$host" == "[::1]" ]]
+      return $? ;;
+    *) return 1 ;;
+  esac
+}
+
 # --- Claude (Claude Code) harness BYO custom-provider catalog -----------------
 # The claude harness can be pointed at any third-party provider that ships an
 # Anthropic Messages-API-compatible endpoint by overriding ANTHROPIC_BASE_URL +
