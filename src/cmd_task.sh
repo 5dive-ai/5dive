@@ -1894,6 +1894,12 @@ _gate_anon_get() {
 _gate_anon_why() {
   local _st="" _code="" _reset=""
   _st=$(cat "$_GATE_ANON_STATEF" 2>/dev/null || printf '')
+  # Read once, then unlink: this is a per-invocation crumb in TMPDIR, and the only
+  # reader is the refusal it was written for. A close that never refuses leaves one
+  # ~12-byte file behind, which is the same shape as the `.5dive-gate-gh-err.$$`
+  # sibling and is bounded at ONE per CLI invocation (fixed name, last write wins)
+  # rather than one per request.
+  rm -f "$_GATE_ANON_STATEF" 2>/dev/null || true
   _code="${_st%%|*}"; _reset="${_st#*|}"
   case "$_code" in
     ""|2*)     printf '' ;;
