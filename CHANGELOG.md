@@ -1,5 +1,37 @@
 # Changelog
 
+## v0.19.1 — fix(objective): the planner could not see that its own task was dead (OSS-37)
+
+`task reject` at `max_iterations` does not close or reopen the row. It writes the
+feedback, files a `manual` gate on a human, and returns — so the task stays **open**
+at `status='blocked'`.
+
+The objective planner reads its open originated tasks as a status column, where that
+row renders `(blocked, high)` — byte-identical to a task blocked on a sibling
+dependency, which is a row you wait for. So the planner waited. A task whose whole
+maker→verifier budget is spent counted as in-flight progress, cycle after cycle, and
+the objective re-planned around work that was never coming: the "just parks" failure
+OSS-19 phase A2 names.
+
+Nothing was broken enough to report. The gate reached a human, the loop stopped
+bouncing, the audit row was written — every mechanism did its job, and the only
+casualty was the one reader that had no way to ask.
+
+The injected context now marks such a row `** STUCK: verifier rejected it N/Nx, the
+loop is spent **`, and names the unanswered human gate when one is parked on it. The
+contract tells the planner what that obliges: re-plan around it — cancel it (it is
+its own) and/or originate a smaller approach — and that the human gate is **not**
+its to clear, answer, or wait on.
+
+The marker reuses the SAME stuck predicate as `loop board --stuck` /
+`--escalate-stuck` (verifier + cap + cap reached + still open), so one definition of
+"stuck" serves the board and the planner rather than two that drift.
+
+Read-only: this changes what the planner is **told**, not what it may **do**. Every
+anti-Goodhart guard is untouched — cancel/reprioritize stay restricted to the
+objective's own originated tasks, origination still rides the count checkpoint, and
+a T2 create still gates hard.
+
 ## v0.19.0 — fix(heartbeat): surface a recurring instance that was never started (DIVE-2693)
 
 The stall sweep keys on `handoff_delivered_at`. A materialized recurring instance

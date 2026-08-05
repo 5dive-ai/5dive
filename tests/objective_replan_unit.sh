@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# TIER: nightly — 21.5s measured (DIVE-2525): does not fit the 300s PR core; the nightly sweep runs it.
+# TIER: nightly — 24.1s measured on the 5dive host (OSS-37 re-measured it after adding
+# the 6 STUCK arms; was 21.5s, DIVE-2525): does not fit the 300s PR core; the nightly sweep runs it.
 # OSS-27 isolated unit harness for the objective RE-PLAN cycle (cmd_objective.sh).
 # Feeds diffs via --diff=<json> (the test seam, like goal add --plan) so no live
 # planner agent is needed. Asserts the anti-Goodhart spine inherited from
@@ -218,6 +219,66 @@ r=$(run replan "dogfood-run" --diff="$(jq -cn --arg id "$SOWN" '{reprioritize:[{
 r=$(run replan "dogfood-run" --propose-only --diff="$(jq -cn --arg id "$SOWN" '{reprioritize:[{ident:$id,priority:"low"}]}')")
 [[ "$(echo "$r" | jf '.data.gated')" == "true" && "$(db "SELECT priority FROM tasks WHERE ident=$(sqlq "$SOWN");")" == "high" ]] \
   && ok_t "--propose-only forces the gate on a live objective" || bad_t "propose-only flag" "$r"
+
+# --- T15 (OSS-37): a burnt-out maker→verifier loop is marked STUCK in the injected
+# context. `task reject` at max_iterations parks the row on a human without closing
+# it, so without a marker the planner reads a dead task as in-flight and re-plans
+# around nothing. Rendered by _objective_build_contract, which the --diff seam never
+# reaches (it bypasses the live planner), so the arms call it directly.
+( cmd_objective_add "stuck-probe" --metric-cmd="echo 1" --target=10 --direction=up ) >/dev/null 2>&1
+PID=$(objid "stuck-probe")
+LOOPT=$( ( cmd_task_add --assignee=alice -- "loop task with a verifier" ) | jf '.data.ident' )
+PLAINT=$( ( cmd_task_add --assignee=alice -- "plain task, no verifier" ) | jf '.data.ident' )
+db "UPDATE tasks SET originated_by_objective=$PID, originated_cycle=1 WHERE ident IN ($(sqlq "$LOOPT"), $(sqlq "$PLAINT"));"
+# a live loop BELOW its cap: attached verifier, 1 of 3 iterations spent
+db "UPDATE tasks SET verifier='bob', max_iterations=3, iteration=1 WHERE ident=$(sqlq "$LOOPT");"
+ctx=$(_objective_build_contract "stuck-probe" "$PID" "1" "" "flat" "10" "up" "" "2")
+
+# A1 baseline: the row renders and its LINE is NOT marked — proves the marker is
+# absent before the condition holds, so A2 is not asserting a string that is always
+# present. Graded on the task's own line, never on the whole context: the standing
+# guidance paragraph names STUCK verbatim, so a whole-context match is true from the
+# first render and would grade nothing.
+line=$(printf '%s\n' "$ctx" | grep -F "$LOOPT")
+[[ -n "$line" && "$line" != *"STUCK"* ]] \
+  && ok_t "OSS-37: a loop below its cap renders unmarked (baseline)" \
+  || bad_t "stuck baseline" "line=$line"
+
+# A2: burn the cap -> STUCK, naming the spent iterations
+db "UPDATE tasks SET iteration=3, status='blocked' WHERE ident=$(sqlq "$LOOPT");"
+ctx=$(_objective_build_contract "stuck-probe" "$PID" "1" "" "flat" "10" "up" "" "2")
+line=$(printf '%s\n' "$ctx" | grep -F "$LOOPT")
+[[ "$line" == *"STUCK"* && "$line" == *"3/3"* ]] \
+  && ok_t "OSS-37: a loop at its cap is marked STUCK with its spent iterations" \
+  || bad_t "stuck marker" "line=$line"
+
+# A3: isolating witness — the sibling open originated task with NO verifier is
+# rendered in the SAME context and stays unmarked, so the marker is per-row and
+# has not degraded into a blanket applied to every open task.
+pline=$(printf '%s\n' "$ctx" | grep -F "$PLAINT")
+[[ -n "$pline" && "$pline" != *"STUCK"* ]] \
+  && ok_t "OSS-37: a non-loop sibling in the same render stays unmarked" \
+  || bad_t "stuck bleed" "pline=$pline"
+
+# A4: the unanswered human gate the escalation filed is named — the planner must
+# not treat cancelling its own task as having resolved that gate.
+db "UPDATE tasks SET need_type='manual', ask='loop stuck, review + decide', need_answered_at=NULL WHERE ident=$(sqlq "$LOOPT");"
+ctx=$(_objective_build_contract "stuck-probe" "$PID" "1" "" "flat" "10" "up" "" "2")
+line=$(printf '%s\n' "$ctx" | grep -F "$LOOPT")
+[[ "$line" == *"parked on an unanswered human gate"* ]] \
+  && ok_t "OSS-37: a stuck task parked on an open human gate says so" || bad_t "stuck gate note" "line=$line"
+
+# A5: an ANSWERED gate drops the parked note (the marker tracks the gate's live
+# state, not the mere presence of a need_type).
+db "UPDATE tasks SET need_answered_at=datetime('now'), need_answered_by='human:tester' WHERE ident=$(sqlq "$LOOPT");"
+line=$(_objective_build_contract "stuck-probe" "$PID" "1" "" "flat" "10" "up" "" "2" | grep -F "$LOOPT")
+[[ "$line" == *"STUCK"* && "$line" != *"parked on an unanswered"* ]] \
+  && ok_t "OSS-37: an answered gate drops the parked note, STUCK stays" || bad_t "stuck gate answered" "line=$line"
+
+# A6: the prompt tells the planner what STUCK obliges — re-plan around it, and the
+# human gate is not its to clear.
+[[ "$ctx" == *"** STUCK **"* && "$ctx" == *"NOT yours to clear"* ]] \
+  && ok_t "OSS-37: the contract explains STUCK and fences the human gate" || bad_t "stuck guidance" "missing guidance"
 
 echo "-----"
 echo "objective_replan_unit: $PASS passed, $FAIL failed"
