@@ -1506,7 +1506,13 @@ if [[ "$TYPE" == "claude" && -n "${ANTHROPIC_API_KEY:-}" ]]; then
       if printf '%s\n' "$_cak_next" > "$_cak_tmp" 2>/dev/null \
          && chmod 600 "$_cak_tmp" 2>/dev/null \
          && mv "$_cak_tmp" "$_cak_cfg" 2>/dev/null; then
-        :
+        # Say so. A silent success and a block that never ran are the same
+        # journal, and that ambiguity cost a whole smoke cycle on 2026-08-05:
+        # the gate came back armed and nothing on the box could tell us whether
+        # the seed had been written, skipped for an empty key, or never reached.
+        # Only the last 6 chars of the tail — enough to correlate with the key
+        # in the prompt, never enough to be a credential.
+        echo "[5dive] agent=${NAME} seeded claude custom-API-key approval (…${ANTHROPIC_API_KEY: -6})" >&2
       else
         rm -f "$_cak_tmp" 2>/dev/null || :
         echo "[5dive] agent=${NAME} WARN: could not write ${_cak_cfg} — custom-API-key prompt may stall this session" >&2
@@ -1518,6 +1524,14 @@ if [[ "$TYPE" == "claude" && -n "${ANTHROPIC_API_KEY:-}" ]]; then
     echo "[5dive] agent=${NAME} WARN: could not build the custom-API-key approval — prompt may stall this session" >&2
   fi
   unset _cak_cfg _cak_base _cak_next _cak_tmp 2>/dev/null || :
+elif [[ "$TYPE" == "claude" ]]; then
+  # The other silent path, and the one that is indistinguishable from "the fix
+  # is not installed" when you are reading a journal from a box you cannot ssh
+  # into. An empty ANTHROPIC_API_KEY here is NORMAL for an OAuth'd agent — but
+  # if claude then shows the custom-API-key prompt anyway, this line is the
+  # proof that systemd handed claude a key the launcher never saw, which is a
+  # different bug from the seed failing.
+  echo "[5dive] agent=${NAME} no ANTHROPIC_API_KEY in the launcher env — custom-API-key seed not needed (skipped)" >&2
 fi
 
 CMD_STR=$(printf '%q ' "$BIN" "${ARGS[@]}")

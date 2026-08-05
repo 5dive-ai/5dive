@@ -77,7 +77,19 @@ check "byo: trust-dialog preseed survives" \
   "$(jqf "$H" '.projects["/home/claude/projects"].hasTrustDialogAccepted')" "true"
 check "byo: theme preseed survives"         "$(jqf "$H" '.theme')" "dark"
 check "byo: config stays mode 600"          "$(stat -c '%a' "$H/.claude.json")" "600"
-check "byo: no warning on the happy path"   "$(wc -c <"$H/.stderr")" "0"
+check "byo: no WARN on the happy path"      "$(grep -c 'WARN' "$H/.stderr")" "0"
+# The happy path must SAY it seeded. A silent success and a block that never ran
+# produce the same journal, and on 2026-08-05 that ambiguity cost a full smoke
+# cycle: the gate came back armed on a box we could not ssh into, and nothing
+# recorded which of the two had happened. Assert the line AND that it carries the
+# key's last 6 chars, since a line with no correlator cannot be matched to the key
+# in the prompt. Assert the FULL key never appears — this line is a journal entry.
+check "byo: happy path announces the seed" \
+  "$(grep -c 'seeded claude custom-API-key approval' "$H/.stderr")" "1"
+check "byo: seed line carries the last-6 correlator" \
+  "$(grep -c "…${KEY: -6}" "$H/.stderr")" "1"
+check "byo: seed line does not leak the key" \
+  "$(grep -c -- "$KEY" "$H/.stderr")" "0"
 
 # --- 2. the stray-Enter case -------------------------------------------------
 # The prompt's DEFAULT is "2. No (recommended)", so one blind Enter into that
@@ -108,9 +120,20 @@ check "idempotent: approved is exactly the one tail" \
 # is that control — the same block DOES write when the guard passes.
 H=$(run nokey claude "__unset__")
 check "no key: config untouched" "$(jqf "$H" 'has("customApiKeyResponses")')" "false"
+# A claude agent that skips must SAY it skipped, and only a claude agent may.
+# Without this line, "no key in the launcher env" and "the fix is not installed"
+# read identically in a journal — which is exactly the state DIVE-1591 got stuck
+# in. If the prompt then appears anyway, this line localises the bug to systemd
+# handing claude a key the launcher never saw.
+check "no key: claude announces the skip" \
+  "$(grep -c 'no ANTHROPIC_API_KEY in the launcher env' "$H/.stderr")" "1"
 H=$(run empty claude "")
 check "empty key: config untouched" "$(jqf "$H" 'has("customApiKeyResponses")')" "false"
+check "empty key: claude announces the skip" \
+  "$(grep -c 'no ANTHROPIC_API_KEY in the launcher env' "$H/.stderr")" "1"
 H=$(run hermes hermes "$KEY")
+check "non-claude: stays silent (the skip line is claude-only)" \
+  "$(grep -c 'no ANTHROPIC_API_KEY in the launcher env' "$H/.stderr")" "0"
 check "non-claude type: config untouched" "$(jqf "$H" 'has("customApiKeyResponses")')" "false"
 
 # --- 6. shapes the trim/slice must get right --------------------------------
