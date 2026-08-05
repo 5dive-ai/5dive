@@ -9758,6 +9758,100 @@ cmd_task_clear_recs() {
      '{cleared:($n|tonumber), gates:$g}' --arg n "$n" --argjson g "$gates_json"
 }
 
+# DIVE-2572: does a loop-gate answer BOUNCE to the previous step, or ADVANCE?
+#
+# THE DEFECT THIS REPLACES: five BARE SUBSTRING tests over the whole free-text
+# answer — *"better"*, *"reject"*, *"deny"*, *"denied"*, *"declin"*. Any answer
+# containing those letters ANYWHERE was classified as a bounce, whatever it
+# actually decided.
+#
+# MEASURED ON THE LIVE BOARD before choosing a fix, because the row asked for
+# that rather than a hunch: 268 answered gates, 14 carry a trigger substring. Of
+# the answers that are a HUMAN decision on a loop-shaped row, FIVE OF FIVE would
+# have been misclassified as bounces, and every one of them APPROVES:
+#   DIVE-2552  "approve — ..."      trigger: "uppercase is rejected" (what a regex does)
+#   DIVE-2565  "approve — ..."      trigger: "deny-by-default flow"  (a design pattern's NAME)
+#   DIVE-2596  "approve — ..."      trigger: "See my reject feedback on this task"
+#   CNCL-9     "clear-now ..."      trigger: "the rebase I filed in the reject"
+#   DIVE-1572  "a — render inline"  trigger: "B rejected:" (naming the option NOT chosen)
+# The only true denials in the whole set are the bare word "denied" (DIVE-1513,
+# DIVE-1614) — short, leading, unambiguous.
+#
+# THE FAILURE IS SYSTEMATIC, NOT RANDOM, and that is what settles the design: an
+# approval that RESOLVES a previous bounce naturally cites that bounce ("see my
+# reject feedback", "the rebase I filed in the reject"), and a decision between
+# options names the option it turned down ("B rejected"). So the reviewer doing
+# the most careful job — referring back to what they asked for — is the one most
+# likely to be read as bouncing. Option (d) from the row ("prose answers are the
+# exception") is refuted by the same data: prose is what substantive answers ARE.
+#
+# SO: read the decision out of the DECISION SEGMENT (option (b)) — the first
+# non-blank line up to the first em-dash, colon, semicolon, comma or stop — and
+# warn rather than silently choose when a trigger appears later in the prose.
+#
+# Option (a), anchoring to the leading TOKEN, was built first and refuted by the
+# existing suite: task_answer_cancelled_loop_bounce_unit went 5/7 on the fixture
+# "Do better ↩", an ordinary bounce whose decision word is the SECOND token.
+# Short imperatives are the register a real bounce is written in, so the leading
+# token trades one systematic miss for another. Recorded because it generalises:
+# the measurement above sampled only FALSE POSITIVES and said nothing about what
+# TRUE bounces look like, and the true-bounce shape is what killed design (a).
+#
+# THREE THINGS INHERITED FROM THE SAME DEFECT ONE FILE OVER (DIVE-2614,
+# community/wiki/a-verdict-regex-scans-every-line-not-the-verdict.md), applied
+# here deliberately rather than rediscovered:
+#   1. WORD BOUNDARY. Without \b, "deny" prefix-matches nothing useful but
+#      "better" matches "betterment" and "decline" matches "declined" only by
+#      accident of stemming.
+#   2. INFLECTIONS ARE ENUMERATED BY HAND. With \b, `reject` no longer matches
+#      "rejected" — that gap has now been confirmed three times in this codebase.
+#      Collapsing to (reject|deny|declin)(e|es|ed|ing)?\b is NOT equivalent: it
+#      re-admits stems we never intended. Any new stem needs its forms added here.
+#   3. FIRST NON-BLANK LINE, NOT LINE 1. A leading blank line would otherwise
+#      make the verdict read empty — and empty means ADVANCE here, i.e. a false
+#      APPROVE, which is the worse direction and exactly the trap main caught in
+#      review on DIVE-2614. `|| true` because grep exits 1 on an all-blank value
+#      and pipefail would kill the caller.
+#
+# "better" is kept, but only inside the decision segment. Unanchored it was the
+# worst arm in the set ("approve, this is better than the alternative" bounced);
+# in a decision segment it is a real bounce signal ("better: rework it", "Do
+# better").
+#
+# THE SAFETY PROPERTY THIS RELIES ON IS ABOUT SEGMENTS, NOT ABOUT FIRST WORDS, and
+# it is measured rather than assumed (olivia's reject, iteration 1 — the earlier
+# comment claimed "no answer on the board STARTS with it", which is a different
+# and weaker claim than the code needs). Swept all 268 answered gates on the live
+# board and extracted each one's decision segment: exactly TWO carry any stem at
+# all — DIVE-1513 and DIVE-1614, both the bare word "denied", both true denials —
+# and ZERO carry "better". So on the entire recorded population this rule fires
+# twice and is right both times.
+# Note the scope: that is a statement about answers ALREADY WRITTEN, not a
+# guarantee about future phrasing. It is why the advisory below exists.
+#
+# Returns 0 for BOUNCE, 1 for ADVANCE. Sets _LOOP_BOUNCE_AMBIGUOUS=1 when the
+# answer ADVANCES but carries a trigger word later on, so the caller can say so.
+_LOOP_BOUNCE_STEMS='reject|rejects|rejected|rejecting|deny|denies|denied|denying|decline|declines|declined|declining|better'
+_loop_answer_is_bounce() {
+  local _v="${1:-}" _first="" _seg=""
+  _LOOP_BOUNCE_AMBIGUOUS=0
+  _first=$(printf '%s' "$_v" | grep -m1 -v '^[[:space:]]*$' || true)
+  _first="${_first#"${_first%%[![:space:]]*}"}"
+  # THE DECISION SEGMENT: the first non-blank line, cut at the first em-dash,
+  # colon, semicolon, comma or sentence stop. Everything after that is the
+  # REASONING, and the reasoning is where the false positives live.
+  _seg="${_first%%[—:;,.]*}"
+  if printf '%s' "$_seg" | grep -qE "\b(${_LOOP_BOUNCE_STEMS})\b"; then
+    return 0
+  fi
+  # Advancing — but say so when the vocabulary appears anywhere, rather than
+  # silently choosing. This is the compatibility window: it surfaces the real
+  # population before anything is gated on it
+  # (community/wiki/a-control-partitions-a-population-and-populations-drift.md).
+  printf '%s' "$_v" | grep -qE "\b(${_LOOP_BOUNCE_STEMS})\b" && _LOOP_BOUNCE_AMBIGUOUS=1
+  return 1
+}
+
 cmd_task_answer() {
   tasks_db_init
   local value="" value_set=0 from="" human=0 human_proof="" channel_proof="" channel_msg=""
@@ -9881,12 +9975,15 @@ cmd_task_answer() {
   # recorded, and refusing there would leave a gate answered under a non-zero rc.
   local _lk _loop_bounce=0 _run="" _prev="" _prev_status="" _prev_ident="" _lv=""
   _lk=$(_loop_kind "$id")
+  # DIVE-2572: the bounce/advance decision is read from the DECISION SEGMENT (the
+  # first non-blank line up to its first dash/colon/comma/stop), not from a bare
+  # substring over the whole answer. See _loop_answer_is_bounce.
   if [[ "$_lk" == gate:* ]]; then
     # Resolve the relay direction before any answer write.  A refusal below must
     # leave the gate pending; discovering the cancelled predecessor after the
     # answer was stamped would make a non-zero return lie about what committed.
     _lv=$(printf '%s' "${value:-}" | tr '[:upper:]' '[:lower:]')
-    if [[ "$_lv" == *"better"* || "$_lv" == *"reject"* || "$_lv" == *"deny"* || "$_lv" == *"denied"* || "$_lv" == *"declin"* ]]; then
+    if _loop_answer_is_bounce "$_lv"; then
       _loop_bounce=1
       _run=$(db "SELECT COALESCE(parent_id,'') FROM tasks WHERE id=${id};")
       _prev=$(db "SELECT id FROM tasks WHERE parent_id=${_run:-0} AND id<${id} AND body LIKE '%${_LOOP_MARK}:%' ORDER BY id DESC LIMIT 1;")
@@ -9894,6 +9991,14 @@ cmd_task_answer() {
         _prev_status=$(db "SELECT status FROM tasks WHERE id=${_prev};")
         _prev_ident=$(db "SELECT ident FROM tasks WHERE id=${_prev};")
       fi
+    elif (( ${_LOOP_BOUNCE_AMBIGUOUS:-0} )); then
+      # DIVE-2572: ADVANCING, and the answer carries bounce vocabulary later in
+      # its prose. Under the old bare-substring matcher this exact shape was
+      # classified as a BOUNCE — five for five on the live board. Naming it is
+      # the compatibility window: a reader who genuinely meant to bounce learns
+      # the form in the one place they will read it, and nobody's careful prose
+      # is silently reinterpreted in the meantime.
+      warn "$ident: answered as ADVANCE. The decision is read from the first line up to its first dash/colon/comma/stop, and this answer carries bounce vocabulary only AFTER that — under the previous matcher its presence anywhere would have bounced this to the previous loop step (DIVE-2572). If you meant to BOUNCE, put the word in that opening segment: 'reject — <why>', or 'do better'."
     fi
   fi
   # DIVE-2261: cancellation is an abandonment record, not completed work ready
