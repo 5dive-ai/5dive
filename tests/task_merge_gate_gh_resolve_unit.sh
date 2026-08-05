@@ -126,7 +126,7 @@ cmd_task_set_branch DIVE-834 feat/dive-834-thing >/dev/null 2>&1
 : >"$GH_ARGS_LOG"
 export GH_STUB_STATE="" GH_STUB_MERGED="2026-07-23T12:00:00Z" GH_STUB_AUTH_TOKEN="tok"
 NONREPO="$TMP/nonrepo"; mkdir -p "$NONREPO"
-out=$( cd "$NONREPO" && cmd_task_done DIVE-834 2>&1 ); rc=$?
+out=$( cd "$NONREPO" && cmd_task_done DIVE-834 --result="close under test (DIVE-2773: a first close must carry a reason)" 2>&1 ); rc=$?
 [[ $rc -eq 0 && "$(statusof DIVE-834)" == "done" ]] \
   && ok_t "T3 Branch:-bound task closes from a non-repo CWD when its head is merged" \
   || bad_t "T3 close from non-repo CWD" "rc=$rc status=$(statusof DIVE-834) out=$out"
@@ -143,7 +143,7 @@ unset GH_TOKEN GITHUB_TOKEN
 export GH_STUB_STATE="MERGED" GH_STUB_MERGED="2026-07-23T13:00:00Z" GH_STUB_AUTH_TOKEN="deleg-tok-789"
 # delivery_ref path: bind a PR url directly.
 db "UPDATE tasks SET delivery_ref='https://github.com/5dive-ai/5dive/pull/835', delivered_at=datetime('now') WHERE ident='DIVE-835';"
-out=$(cmd_task_done DIVE-835 2>&1); rc=$?
+out=$(cmd_task_done DIVE-835 --result="close under test (DIVE-2773: a first close must carry a reason)" 2>&1); rc=$?
 [[ $rc -eq 0 && "$(statusof DIVE-835)" == "done" ]] \
   && ok_t "T4 delivery_ref task closes when merged (resolved token, no env GH_TOKEN)" \
   || bad_t "T4 close" "rc=$rc status=$(statusof DIVE-835) out=$out"
@@ -156,7 +156,7 @@ grep -q 'TOKEN=deleg-tok-789 ARGS=pr view' "$GH_ARGS_LOG" \
 seed_task DIVE-836 main main
 db "UPDATE tasks SET delivery_ref='https://github.com/5dive-ai/5dive/pull/836', delivered_at=datetime('now') WHERE ident='DIVE-836';"
 export GH_STUB_STATE="" GH_STUB_MERGED="" GH_STUB_AUTH_TOKEN=""
-out=$(cmd_task_done DIVE-836 2>&1); rc=$?
+out=$(cmd_task_done DIVE-836 --result="close under test (DIVE-2773: a first close must carry a reason)" 2>&1); rc=$?
 [[ $rc -eq $E_CONFLICT && "$(statusof DIVE-836)" != "done" ]] \
   && ok_t "T5 unknown/empty state still BLOCKS (fail-safe, never false-close)" \
   || bad_t "T5 fail-safe" "rc=$rc status=$(statusof DIVE-836) out=$out"

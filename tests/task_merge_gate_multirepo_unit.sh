@@ -230,10 +230,15 @@ if [[ "$res" == *"merge-gate: UNVERIFIED"* && "$res" == *"AMBIGUOUS"* \
 else
   bad_t 'ambiguous must be durable in the record' "result=[$res]"
 fi
-# The stamp must also appear when the maker passed NO --result at all: that row is the
-# emptiest-looking one there is, so it is the one most in need of the disclaimer.
+# The stamp must also appear on the emptiest close the rail allows, because that row is
+# the one most in need of the disclaimer.
+# DIVE-2773: that used to be a close with NO --result at all; a FIRST close with a blank
+# reason is now refused on both verbs, so the emptiest REACHABLE shape is a minimal one.
+# The arm is adapted rather than dropped: what it grades is that the stamp APPENDS to
+# whatever the maker wrote instead of depending on there being room, and a one-word
+# result exercises that as well as an absent one did.
 seed AMB-2 'delivery is PR #6'
-run_done AMB-2
+run_done AMB-2 --result="delivered"
 res2=$(db "SELECT COALESCE(result,'') FROM tasks WHERE ident='AMB-2';")
 [[ $RC -eq 0 && "$res2" == *"merge-gate: UNVERIFIED"* ]] \
   && ok_t 'the UNVERIFIED stamp lands even on a close with no --result of its own' \
