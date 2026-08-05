@@ -9743,6 +9743,88 @@ _task_secret_gate_cta() {
   fi
 }
 
+# DIVE-2818: IS THIS GATE HIGH-STAKES? lodar scoped the reply-to-clear prompt on
+# the DIVE-2802 gate (answered 2026-08-05) to "spend / secrets / irreversible",
+# explicitly NOT to every tier-2 gate, because the citation window is a hardcoded
+# 3600s ceiling and a prompt that pushes everyone at a path that expires is a tax
+# on the routine case.
+#
+# THE DISCRIMINATOR IS DECLARED, NEVER INFERRED FROM THE ASK'S WORDING. The other
+# way to write this is keyword-sniffing the prose for "spend"/"delete"/"prod", and
+# DIVE-2629 already measured what that costs on this exact rail: the word
+# `teardown` appearing only inside a git BRANCH NAME moved a gate's tier. A rule
+# that decides how a human is asked to authenticate must not be guessable from
+# text the filer wrote for a different purpose.
+#
+# Two declarations qualify, and between them they cover lodar's three words:
+#
+#   --needs=<capability>   the DIVE-2241 sealed constants. `spend_authority` IS
+#                          "spend"; `secret_provision` IS "secrets"; and
+#                          `human_tap` is documented at the constant itself as
+#                          "a person's call: brand, strategy, AN IRREVERSIBLE
+#                          CHOICE", which is the third word.
+#   --type=secret          a gate that hands over a credential is "secrets" by its
+#                          own declared type, whether or not it ALSO declared the
+#                          capability. This is not an inference: the filer typed
+#                          the type.
+#
+# A bare approval / manual / decision gate that declared no capability is the
+# routine tier-2 case lodar excluded, and its message is unchanged.
+#
+# Read from the ROW, not from a parameter (DIVE-2090): both notify sites call this
+# and the persisted gate is the state that decides. `needs_capability` is stored
+# VERBATIM as the filer typed it, so the normalising `_gate_needs_human` is what
+# must read it — comparing against the constant list directly would make
+# `--needs=Human-Tap` silently not-high-stakes, which is the DIVE-2241 near-miss
+# class landing again one layer up.
+_task_gate_high_stakes() { # <row_id>
+  local _rid="${1:-}" _cap="" _ty=""
+  [[ "$_rid" =~ ^[0-9]+$ ]] || return 1
+  _cap=$(db "SELECT COALESCE(needs_capability,'') FROM tasks WHERE id=${_rid};" 2>/dev/null || printf '')
+  _ty=$(db "SELECT COALESCE(need_type,'') FROM tasks WHERE id=${_rid};" 2>/dev/null || printf '')
+  [[ "$_ty" == "secret" ]] && return 0
+  _gate_needs_human "$_cap"
+}
+
+# DIVE-2818: the reply-to-clear CTA. It must print the EXACT string to send,
+# because `_gate_channel_session_ok` condition 5 requires the human's own text to
+# contain BOTH the ident AND the answer value — "yes" alone refuses, and so does
+# a reply that names the gate but not the decision. The DIVE-2802 trial is the
+# evidence that prose alone does not move anyone: lodar was invited to reply, with
+# the exact string in the ask, and tapped the button anyway. So this is the
+# DEFAULT affordance on these gates, not a footnote under one.
+#
+# The value emitted here is the same string `task answer --value` receives on the
+# tap path (approved/denied, done, provided, or the option VALUE), so the human's
+# message and the agent's `--value` corroborate instead of merely coexisting.
+_task_gate_reply_cta() { # <ident> <need_type> <options> <recommend>
+  local _id="${1:-}" _ty="${2:-}" _opts="${3:-}" _rec="${4:-}" _ex="" _alt="" _out=""
+  [[ -n "$_id" ]] || return 0
+  case "$_ty" in
+    approval) _ex="approved"; _alt="denied" ;;
+    manual)   _ex="done" ;;
+    secret)   _ex="provided" ;;
+    decision)
+      # Same split rule as _task_gate_reply_markup (split '|', trim, drop empties)
+      # so the string offered here cannot drift from the option the buttons carry.
+      _ex=$(printf '%s' "$_opts" | jq -Rr --arg r "$_rec" '
+        ($r | gsub("^\\s+|\\s+$"; "")) as $rr
+        | [ split("|")[] | gsub("^\\s+|\\s+$"; "") | select(length > 0) ] as $o
+        | (if ($rr|length) > 0 and ($o | index($rr)) != null then $rr else ($o[0] // "") end)' 2>/dev/null) || _ex=""
+      _alt=$(printf '%s' "$_opts" | jq -Rr --arg c "$_ex" '
+        [ split("|")[] | gsub("^\\s+|\\s+$"; "") | select(length > 0) | select(. != $c) ] | (.[0] // "")' 2>/dev/null) || _alt=""
+      ;;
+    *) return 0 ;;
+  esac
+  [[ -n "$_ex" ]] || return 0
+  _out="🔐 High-stakes gate (spend, secrets or irreversible)."$'\n'
+  _out+="Strongest clear: REPLY in this chat with exactly"$'\n'
+  _out+="    ${_id} ${_ex}"
+  [[ -n "$_alt" ]] && _out+=$'\n'"(or:  ${_id} ${_alt})"
+  _out+=$'\n\n'"Your own reply is attested by Telegram, so the record can show a human answered rather than the agent that asked. A reply stays citable for 1 hour. The buttons still work and are never rejected."
+  printf '%s' "$_out"
+}
+
 _task_gate_reply_markup() { # <row_id> <type> <options> <recommend> <nonce> <channel_type> [label]
   local numid="$1" need_type="$2" options="$3" recommend="$4" human_nonce="$5" channel_type="$6" label="${7:-}"
   [[ -n "$label" ]] && label="[${label}] "
@@ -10215,6 +10297,26 @@ _task_need_notify_deliver() {
     access) text+=$'\n\n'"🔓 This is a grant request that reached you directly (human-territory, or no lead available). Clear it on the box: sudo 5dive task answer ${ident} --value=\"granted\" (or denied)" ;;
   esac
 
+  # DIVE-2818: the reply-to-clear prompt, on HIGH-STAKES gates only.
+  #
+  # NARROWER THAN THE TAP ALLOWLIST, and the narrowing is measured rather than
+  # cautious. The DIVE-118 rule is that an affordance must not be offered where no
+  # handler answers it, and a dead PROMPT is worse than a dead button because the
+  # human has to type before finding out. The tap list is
+  # claude|codex|grok|antigravity because all four ship a `tna:` callback handler
+  # — but the inbound-message handler this prompt depends on
+  # (`plugins/telegram/gatereply.ts`, DIVE-2818) exists on the CLAUDE plugin only.
+  #
+  # The runtimes do NOT share a server: `plugins/telegram` is hand-maintained at
+  # ~5.5k lines while `generator/generate.ts` builds agy/qwen from a DIFFERENT base
+  # (`telegram-grok`, ~2.8k lines), and codex/pi/opencode are separate again. So
+  # "add it to the plugin" is one job per runtime, not one job. Widen this regex in
+  # the same change that lands each fork's handler, never before.
+  if [[ "$TASK_CH_TYPE" == "claude" ]] && _task_gate_high_stakes "$numid"; then
+    local _reply_cta; _reply_cta=$(_task_gate_reply_cta "$ident" "$need_type" "$options" "$recommend")
+    [[ -n "$_reply_cta" ]] && text+=$'\n\n'"$_reply_cta"
+  fi
+
   # DIVE-117/118 tap-to-answer buttons. GATED to the plugin types whose `tna:`
   # callback_query handler exists AND splits options byte-identically to this
   # emit: claude, codex, grok, antigravity (DIVE-118 — parity verified against
@@ -10375,6 +10477,15 @@ _task_inbox_send() {
     [[ -n "$recommend" ]] && gate_text+=$'\n'"✅ Recommended: ${recommend}"
     [[ -n "$options" ]]   && gate_text+=$'\n'"Options: ${options}"
     gate_text+=$'\n\n'"Tap a button, open the /task link, or answer from the dashboard."
+    # DIVE-2818: the high-stakes reply-to-clear prompt reaches the BATCH re-send
+    # too. DIVE-1490's rule applies unchanged — the initial alert and every re-nag
+    # share one renderer so the affordance cannot drift between first delivery and
+    # the reminders — and a re-nag is exactly when a gate has sat long enough to be
+    # worth the stronger clear.
+    if [[ "$TASK_CH_TYPE" == "claude" ]] && _task_gate_high_stakes "$id"; then
+      local _batch_cta; _batch_cta=$(_task_gate_reply_cta "$ident" "$ntype" "$options" "$recommend")
+      [[ -n "$_batch_cta" ]] && gate_text+=$'\n\n'"$_batch_cta"
+    fi
     # DIVE-2356: hard-human TYPE **or** tier>=2. Unchanged by the split.
     nonce=""; _mint_n=0
     case "$ntype" in approval|secret|manual) _mint_n=1 ;; esac
