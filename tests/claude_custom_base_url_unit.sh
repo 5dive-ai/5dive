@@ -160,7 +160,7 @@ fi
 #
 # Driven through the REAL profile_set_var (src/cmd_auth.sh), not a re-typed
 # copy, so the arm grades the writer that ships.
-. "$REPO_ROOT/src/cmd_auth.sh" 2>/dev/null || . ./src/cmd_auth.sh
+. ./src/cmd_auth.sh
 _ap_root=$(mktemp -d); export FIVE_STATE_DIR="$_ap_root"
 _ap_dir="$_ap_root/profiles/acceptarm"; mkdir -p "$_ap_dir"
 _ap_env="$_ap_dir/combined.env"; : > "$_ap_env"
