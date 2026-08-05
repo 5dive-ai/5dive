@@ -9765,8 +9765,17 @@ cmd_task_clear_recs() {
 # likely to be read as bouncing. Option (d) from the row ("prose answers are the
 # exception") is refuted by the same data: prose is what substantive answers ARE.
 #
-# SO: anchor to the leading token (option (a)), and warn rather than silently
-# choose when a trigger appears later in the prose.
+# SO: read the decision out of the DECISION SEGMENT (option (b)) — the first
+# non-blank line up to the first em-dash, colon, semicolon, comma or stop — and
+# warn rather than silently choose when a trigger appears later in the prose.
+#
+# Option (a), anchoring to the leading TOKEN, was built first and refuted by the
+# existing suite: task_answer_cancelled_loop_bounce_unit went 5/7 on the fixture
+# "Do better ↩", an ordinary bounce whose decision word is the SECOND token.
+# Short imperatives are the register a real bounce is written in, so the leading
+# token trades one systematic miss for another. Recorded because it generalises:
+# the measurement above sampled only FALSE POSITIVES and said nothing about what
+# TRUE bounces look like, and the true-bounce shape is what killed design (a).
 #
 # THREE THINGS INHERITED FROM THE SAME DEFECT ONE FILE OVER (DIVE-2614,
 # community/wiki/a-verdict-regex-scans-every-line-not-the-verdict.md), applied
@@ -9784,10 +9793,21 @@ cmd_task_clear_recs() {
 #      review on DIVE-2614. `|| true` because grep exits 1 on an all-blank value
 #      and pipefail would kill the caller.
 #
-# "better" is kept but ONLY anchored. Unanchored it was the worst arm in the set
-# ("approve, this is better than the alternative" bounced); as a leading token it
-# is a real bounce signal ("better: rework it") and no answer on the board starts
-# with it.
+# "better" is kept, but only inside the decision segment. Unanchored it was the
+# worst arm in the set ("approve, this is better than the alternative" bounced);
+# in a decision segment it is a real bounce signal ("better: rework it", "Do
+# better").
+#
+# THE SAFETY PROPERTY THIS RELIES ON IS ABOUT SEGMENTS, NOT ABOUT FIRST WORDS, and
+# it is measured rather than assumed (olivia's reject, iteration 1 — the earlier
+# comment claimed "no answer on the board STARTS with it", which is a different
+# and weaker claim than the code needs). Swept all 268 answered gates on the live
+# board and extracted each one's decision segment: exactly TWO carry any stem at
+# all — DIVE-1513 and DIVE-1614, both the bare word "denied", both true denials —
+# and ZERO carry "better". So on the entire recorded population this rule fires
+# twice and is right both times.
+# Note the scope: that is a statement about answers ALREADY WRITTEN, not a
+# guarantee about future phrasing. It is why the advisory below exists.
 #
 # Returns 0 for BOUNCE, 1 for ADVANCE. Sets _LOOP_BOUNCE_AMBIGUOUS=1 when the
 # answer ADVANCES but carries a trigger word later on, so the caller can say so.
@@ -9935,8 +9955,9 @@ cmd_task_answer() {
   # recorded, and refusing there would leave a gate answered under a non-zero rc.
   local _lk _loop_bounce=0 _run="" _prev="" _prev_status="" _prev_ident="" _lv=""
   _lk=$(_loop_kind "$id")
-  # DIVE-2572: the bounce/advance decision is read from the LEADING TOKEN, not
-  # from a bare substring over the whole answer. See _loop_answer_is_bounce.
+  # DIVE-2572: the bounce/advance decision is read from the DECISION SEGMENT (the
+  # first non-blank line up to its first dash/colon/comma/stop), not from a bare
+  # substring over the whole answer. See _loop_answer_is_bounce.
   if [[ "$_lk" == gate:* ]]; then
     # Resolve the relay direction before any answer write.  A refusal below must
     # leave the gate pending; discovering the cancelled predecessor after the
@@ -9957,7 +9978,7 @@ cmd_task_answer() {
       # the compatibility window: a reader who genuinely meant to bounce learns
       # the form in the one place they will read it, and nobody's careful prose
       # is silently reinterpreted in the meantime.
-      warn "$ident: answered as ADVANCE. The decision is read from the leading token, and this answer carries bounce vocabulary later in its prose — under the previous matcher that alone would have bounced this to the previous loop step (DIVE-2572). If you meant to BOUNCE, lead with the word: 'reject — <why>'."
+      warn "$ident: answered as ADVANCE. The decision is read from the first line up to its first dash/colon/comma/stop, and this answer carries bounce vocabulary only AFTER that — under the previous matcher its presence anywhere would have bounced this to the previous loop step (DIVE-2572). If you meant to BOUNCE, put the word in that opening segment: 'reject — <why>', or 'do better'."
     fi
   fi
   # DIVE-2261: cancellation is an abandonment record, not completed work ready

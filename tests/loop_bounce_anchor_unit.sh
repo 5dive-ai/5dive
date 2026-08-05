@@ -2,7 +2,11 @@
 # TIER: core — pure-function harness, no DB, no network, sub-second.
 . "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh" \
   || printf 'grading tree: UNRESOLVED (tests/lib/grading_tree.sh not reachable; no tree named)\n' >&2
-# DIVE-2572 — the loop bounce/advance decision is read from the LEADING TOKEN.
+# DIVE-2572 — the loop bounce/advance decision is read from the DECISION SEGMENT:
+# the first non-blank line up to its first em-dash, colon, semicolon, comma or stop.
+# (The file is named ...anchor... because the rule anchors the decision to that
+# segment. An earlier cut anchored to the leading TOKEN and section B's own
+# specimen "Do better" refuted it — see the note above section G.)
 #
 # It used to be five BARE SUBSTRING tests over the whole free-text answer, so any
 # answer containing "better"/"reject"/"deny"/"denied"/"declin" ANYWHERE was
