@@ -1179,6 +1179,26 @@ cmd_deliver() {
   header+="]"
   local payload="${header} ${message}"
 
+  # DIVE-2797: the row for the SCOPED delivery path. `s` here is already derived
+  # from the real sudo caller — _deliver accepts no --from — so from_claimed and
+  # from_derived agree by construction for an agent caller, and the verdict reads
+  # `corroborated`. The one case it does not: a non-agent caller renders the
+  # synthetic `from=human` with nothing measured behind it, which envelope_via
+  # already reports as unknown:no-caller and this row now preserves.
+  #
+  # The independent check on this path is the row's own top-level `derived` field:
+  # audit_log resolves it through actor_derive, which behind a REAL root check
+  # prefers SUDO_UID (DIVE-1413) — so it names the pre-elevation caller by uid, not
+  # `root`, and not anything this process was told.
+  AUDIT_ARGS=(
+    "to=${target}"
+    "from_claimed=${s}"
+    "from_derived=${_caller:-<unmeasured>}"
+    "provenance=$(envelope_provenance "$s" "$_caller")"
+    "bytes=${#message}"
+    "msg_id=${msgid:-<none>}"
+  )
+
   # Same boot-race guard as cmd_send, then deliver by REUSING the literal-inject
   # primitive. The message is passed to send-keys with `-l --` (literal) and is
   # never interpreted as a command.
@@ -1802,6 +1822,35 @@ cmd_send() {
     fi
   fi
 
+  # DIVE-2797: the audit row for this send. Populated HERE, after parsing, because
+  # the dispatcher's placeholder cannot tell a target from a message body.
+  #
+  # `from_derived` is the measurement and `from_claimed` is the assertion, and they
+  # are separate keys on purpose: a row that carries only `--from=` has logged the
+  # unverified string it exists to check, which produces an audit trail that looks
+  # complete and establishes nothing. The derivation goes through `_envelope_caller`
+  # — the same resolver the rendered envelope uses — so the log and the header a
+  # recipient reads can never disagree about who called.
+  #
+  # Derived UNCONDITIONALLY, including under --raw. A raw send is anonymous to the
+  # RECIPIENT by design; that is not a reason for it to be anonymous to the log.
+  # Before this, --raw was the one send with no envelope and no row at all.
+  #
+  # The body is NOT logged — `bytes` is. agent-audit.log is world-appendable via
+  # the privileged fallback and read by anyone with the box; message bodies carry
+  # gate asks, prose and pasted output, and the attribution question this ticket is
+  # about is answered by WHO and TO WHOM, never by the text.
+  local _audit_caller; _audit_caller="$(_envelope_caller)"
+  AUDIT_ARGS=(
+    "to=${name}"
+    "from_claimed=${sender:-<none>}"
+    "from_derived=${_audit_caller:-<unmeasured>}"
+    "provenance=$(envelope_provenance "$sender" "$_audit_caller")"
+    "bytes=${#message}"
+    "msg_id=${msg_id:-<none>}"
+    "raw=${raw}"
+  )
+
   # Don't fire keystrokes into a still-booting TUI — they'd be dropped and the
   # message lost. Wait for the input prompt to render (fast no-op when already
   # up). On timeout we still send best-effort and warn, rather than hang.
@@ -1949,6 +1998,25 @@ cmd_ask() {
   valid_sender_label "$sender" \
     || fail "$E_VALIDATION" "invalid --from label '$sender' (lowercase letter start, [a-z0-9-], <=32 chars)"
   msg_id="$(gen_msg_id)"
+
+  # DIVE-2797: same row shape as cmd_send — `ask` is a send that waits, and it
+  # accepts the same forgeable `--from=`. Auditing `send` alone would have left the
+  # identical spoof unrecorded one verb over.
+  #
+  # A SCOPED ask writes two rows, not one: this one, plus the `agent _deliver` row
+  # from the privileged subprocess that performs the injection. That is the honest
+  # record — two invocations happened — and anyone counting rows to prove the
+  # logging works must count per `cmd`, not in total.
+  local _audit_caller; _audit_caller="$(_envelope_caller)"
+  AUDIT_ARGS=(
+    "to=${name}"
+    "from_claimed=${sender}"
+    "from_derived=${_audit_caller:-<unmeasured>}"
+    "provenance=$(envelope_provenance "$sender" "$_audit_caller")"
+    "bytes=${#message}"
+    "msg_id=${msg_id}"
+    "scoped=${use_scoped}"
+  )
 
   # DIVE-1901: snapshot the pane BEFORE injecting. Two uses, both load-bearing:
   # the baseline is the chrome list (everything already on screen is furniture,
