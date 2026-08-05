@@ -1439,6 +1439,16 @@ cmd_task_show() {
     deps=$(db "SELECT t.ident||'  ['||t.status||']  '||t.title FROM task_deps d JOIN tasks t ON t.id=d.blocked_by WHERE d.task_id=${id} ORDER BY t.id;")
     [[ -n "$deps" ]] && { echo; echo "blocked by:"; printf '%s\n' "$deps" | indent2; }
   fi
+  # DIVE-2751: the `blocked by` block above is a CONDITIONAL RENDER whose test is
+  # the last command in this function, so on a row with no dependency edge the
+  # false test became `task show`'s exit status and `set -euo pipefail` killed the
+  # script — after the row had already printed in full. That is the majority of the
+  # board, and `5dive task show <id>` is the canonical verification command a /goal
+  # stop-hook is pointed at, so a correctly-rendered row read as a failed command
+  # whose effect the trap then declared UNKNOWN. Terminate the function on its own
+  # status: a render that reached the end SUCCEEDED, whatever the last block chose
+  # not to print. Covers the --json branch too (jq's status is not a render verdict).
+  return 0
 }
 
 # DIVE-2133 — gate_history was an append-only WRITE path with no reader. Keep
@@ -8281,7 +8291,12 @@ cmd_task_need() {
     floor_note=" [tier 2 — DECLARED --needs=${needs}, a human-held capability; routed to the paired human, not to a lead or verifier]"
     warn "this gate is hard-human because you DECLARED --needs=${needs}. It bypasses lead- and verifier-routing by constant, and only the paired human can answer it. If the ask does not actually consume that capability, withdraw and re-file without --needs — do not appeal it, the declaration is yours."
   elif (( tier_floored )); then
-    floor_term=$(_gate_tier2_floor_term "${ask} $(db "SELECT COALESCE(title,'') FROM tasks WHERE id=${id};")")
+    # DIVE-2751: `_gate_tier2_floor_term` is trailing-test-terminated — it returns 1
+    # when it finds no term — so this PLAIN assignment made "the floor fired but the
+    # helper could not name the word" kill `task need` under `set -e`. The helper's
+    # own rc contract is left alone (a value producer may report "no match"); the
+    # call site absorbs it, exactly as the two sites at _floor_term above already do.
+    floor_term=$(_gate_tier2_floor_term "${ask} $(db "SELECT COALESCE(title,'') FROM tasks WHERE id=${id};")") || floor_term=""
     floor_note=" [tier forced to 2 — T2 category floor${floor_term:+: matched '$floor_term'}]"
     local _fw="this gate was FORCED to tier 2 (hard human) by the T2 category floor"
     [[ -n "$floor_term" ]] && _fw="$_fw because the ask or the task title contains '${floor_term}'"

@@ -563,6 +563,12 @@ usage_render_board() {
           else empty end ]
     | .[]' --argjson b "$budgets" <<<"$data" 2>/dev/null)
   [[ -n "$over" ]] && { echo; echo "$over"; }
+  # DIVE-2751: second instance of the same shape as cmd_task_show — this trailing
+  # conditional render is the last command in the last function `cmd_usage` calls,
+  # so `5dive usage` (the default board render; `usage board` parses "board" as an
+  # AGENT name) exited 1 whenever NO agent was over its budget, i.e. on
+  # the healthy path. Measured rc=1 on the installed CLI before this fix.
+  return 0
 }
 
 # usage_render_agent — one agent: per-model breakdown + its tasks in window.
