@@ -280,6 +280,41 @@ line=$(_objective_build_contract "stuck-probe" "$PID" "1" "" "flat" "10" "up" ""
 [[ "$ctx" == *"** STUCK **"* && "$ctx" == *"NOT yours to clear"* ]] \
   && ok_t "OSS-37: the contract explains STUCK and fences the human gate" || bad_t "stuck guidance" "missing guidance"
 
+# A7 (main's review of OSS-37): the planner and `loop board --stuck` share ONE
+# definition of stuck — they do not merely agree. Two copies that match today buy
+# does-not-currently-drift; only a shared definition buys cannot-drift, and the two
+# are indistinguishable by any assertion that reads the CURRENT output of each.
+#
+# So mutate the definition and require BOTH to move. Overriding
+# _task_stuck_loop_pred to a never-true predicate must strip the marker from the
+# planner's context AND drop the row from the loops board's stuck set. A consumer
+# that re-typed the predicate inline would be untouched by the override and stay
+# marked — which is exactly the drift this arm exists to catch, made observable
+# instead of left to a future reader to notice.
+_orig_stuck_pred=$(declare -f _task_stuck_loop_pred)
+_task_stuck_loop_pred() { printf '%s' "(1=0)"; }
+
+mline=$(_objective_build_contract "stuck-probe" "$PID" "1" "" "flat" "10" "up" "" "2" | grep -F "$LOOPT")
+mboard=$( ( JSON_MODE=1 cmd_task_loops --stuck ) 2>/dev/null | jf '[.data.loops[]?.ident] | join(",")' )
+eval "$_orig_stuck_pred"                      # restore before asserting, so a failed
+                                              # arm cannot leave the override in place
+                                              # for every later arm in this file.
+[[ "$mline" != *"STUCK"* ]] \
+  && ok_t "OSS-37: overriding the shared predicate unmarks the planner's context" \
+  || bad_t "planner re-types the predicate" "planner still marks the row with the definition mutated: $mline"
+[[ "$mboard" != *"$LOOPT"* ]] \
+  && ok_t "OSS-37: the same override drops the row from \`task loops --stuck\`" \
+  || bad_t "board re-types the predicate" "board still lists $LOOPT with the definition mutated: $mboard"
+
+# A7 is only meaningful if the row IS stuck under the REAL definition — otherwise both
+# halves pass vacuously on a row nothing would ever mark. Re-assert the positive here,
+# after the restore, so the control and the mutation are graded against one another.
+rline=$(_objective_build_contract "stuck-probe" "$PID" "1" "" "flat" "10" "up" "" "2" | grep -F "$LOOPT")
+rboard=$( ( JSON_MODE=1 cmd_task_loops --stuck ) 2>/dev/null | jf '[.data.loops[]?.ident] | join(",")' )
+[[ "$rline" == *"STUCK"* && "$rboard" == *"$LOOPT"* ]] \
+  && ok_t "OSS-37: with the real predicate restored, BOTH consumers mark the row (A7 non-vacuous)" \
+  || bad_t "A7 vacuity control" "line=$rline board=$rboard"
+
 echo "-----"
 echo "objective_replan_unit: $PASS passed, $FAIL failed"
 [[ "$FAIL" -eq 0 ]]

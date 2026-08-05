@@ -765,15 +765,18 @@ _objective_build_contract() {
   # status 'blocked'. Injected as just "(blocked, high)" that is indistinguishable
   # from a task blocked on a sibling dependency, so the planner reads a dead task as
   # in-flight progress and re-plans around nothing, cycle after cycle — the "just
-  # parks" failure OSS-19 phase A2 names. Annotate it with the SAME stuck predicate
-  # `loop board --stuck` / `--escalate-stuck` uses (verifier + cap + cap reached +
-  # still open), so one definition of "stuck" serves the board and the planner.
+  # parks" failure OSS-19 phase A2 names. Annotate it with _task_stuck_loop_pred — the
+  # SHARED definition `loop board --stuck` / `--escalate-stuck` also calls, not a copy
+  # of it. Re-typing the predicate inline here (the first draft did) buys
+  # does-not-currently-drift; calling the one definition is what buys cannot-drift.
+  # Its `status NOT IN ('done','cancelled')` is redundant against the WHERE below and
+  # is kept anyway: dropping the redundant clause is precisely how a second copy starts.
   # Every operand of a `||` chain is COALESCE-guarded: one NULL in SQLite collapses
   # the whole concatenation to NULL, which would silently DROP the task's line
   # rather than lose the marker. (max_iterations is non-NULL inside the WHEN.)
+  local stuck_pred; stuck_pred="$(_task_stuck_loop_pred)"
   local open_tasks; open_tasks=$(db "SELECT '  ['||ident||']  ('||status||', '||priority||')  '||title
-      || CASE WHEN (verifier IS NOT NULL AND max_iterations IS NOT NULL
-                    AND COALESCE(iteration,0) >= max_iterations)
+      || CASE WHEN ${stuck_pred}
               THEN '   ** STUCK: verifier rejected it '||COALESCE(iteration,0)||'/'||max_iterations
                    ||'x, the loop is spent'
                    || CASE WHEN (need_type IS NOT NULL AND need_answered_at IS NULL)

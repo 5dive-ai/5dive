@@ -4449,9 +4449,10 @@ cmd_task_loops() {
 
   [[ "$watch_secs" =~ ^[1-9][0-9]*$ ]] || fail "$E_VALIDATION" "--watch=<seconds> must be a positive integer"
   # A loop is "stuck" once it has a cap, has reached it, and still isn't closed.
-  local stuck_pred="(verifier IS NOT NULL AND max_iterations IS NOT NULL
-                     AND COALESCE(iteration,0) >= max_iterations
-                     AND status NOT IN ('done','cancelled'))"
+  # OSS-37: the definition moved to _task_stuck_loop_pred (lib/tasks_db.sh) when the
+  # objective planner became its second caller. Held here as a local it could only be
+  # reused by re-typing, and two copies that agree today is the thing DIVE-1963 named.
+  local stuck_pred; stuck_pred="$(_task_stuck_loop_pred)"
   local where="verifier IS NOT NULL"
   (( show_all )) || where+=" AND status NOT IN ('done','cancelled')"
   (( only_stuck )) && where+=" AND ${stuck_pred}"
