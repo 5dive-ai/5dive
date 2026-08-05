@@ -11298,18 +11298,29 @@ cmd_task_answer() {
   # the non-root trusted path (dashboard exec as claude) we re-exec the root-only
   # `gate-proof sign` over sudo. Best-effort — a box that can't sign just stores
   # an empty sig (verify reports "unsigned"); the answer NEVER fails on this.
+  #
+  # DIVE-2760: best-effort is still the right posture for the WRITE — losing a
+  # human's answer because a box cannot sign would be worse than storing it
+  # unsigned — but "never fails" was implemented as "never says anything", and
+  # those are different. Record WHY the mint came back empty so the notice below
+  # can name it. The three causes have three different remedies and are otherwise
+  # indistinguishable from an empty column.
   local _uid; _uid=$(_gate_closure_subject_uid)
   local _ts; _ts=$(date -u '+%Y-%m-%d %H:%M:%S')
   local _vfs=""; [[ "$nt" != "secret" ]] && _vfs="$value"
-  local _sig=""
+  local _sig="" _sig_why=""
   if [[ -n "$_uid" ]]; then
     if [[ $EUID -eq 0 ]]; then
       _gate_proof_ensure_key 2>/dev/null || true
       _sig=$(_gate_closure_sign "$id" "$nt" "$_vfs" "$answered_by" "$_ts" "$_uid" 2>/dev/null || echo "")
+      [[ -n "$_sig" ]] || _sig_why="running as root, but the gate-proof key could not be created or read on this box"
     else
       _sig=$(_gate_closure_payload "$id" "$nt" "$_vfs" "$answered_by" "$_ts" "$_uid" \
                | sudo -n 5dive gate-proof sign 2>/dev/null || echo "")
+      [[ -n "$_sig" ]] || _sig_why="this seat has no passwordless sudo for \`5dive gate-proof sign\` (cli-scoped agents do not; root-all and cli-root seats do)"
     fi
+  else
+    _sig_why="no invoker uid could be derived, so the closure has no subject to sign for"
   fi
   local _uidsql="NULL"; [[ -n "$_uid" ]] && _uidsql="$_uid"
 
@@ -11323,6 +11334,39 @@ cmd_task_answer() {
   else
     (( value_set )) || fail "$E_USAGE" "--value is required (the human's answer)"
     db "UPDATE tasks SET need_answer=$(sqlq "$value"), need_answered_at=$(sqlq "$_ts"), need_answered_by=$(sqlq "$answered_by"), need_answered_uid=${_uidsql}, need_answer_sig=$(sqlq "$_sig") WHERE id=${id};"
+  fi
+
+  # DIVE-2760: an unsigned closure is stored, reported OK, and then refused by a
+  # broker somewhere else, later, in a different command, to a DIFFERENT agent —
+  # with a message about tampering. Say it HERE, at the moment the row is written,
+  # because this is the only point where the cause and the remedy are both in view.
+  #
+  # Three facts the reader cannot derive from an empty column, so all three are
+  # stated: (1) the answer LANDED — this is not a failed answer and re-answering
+  # is not a retry of a lost write; (2) WHO gets refused is not who is being
+  # warned — the signature is minted here by the ANSWERER and nothing re-signs at
+  # act time (broker.sh:103 reads the stored `need_answer_sig`, and the acting
+  # agent's tier never enters the check), so the refusal surfaces on the maker's
+  # next round-trip; (3) the remedy is a different ANSWERER, not a new grant.
+  #
+  # Deliberately a warn and not a `fail`: `require_sig` is 1 only on the push and
+  # deploy root executors, so a gate that no broker will ever check is unharmed by
+  # an empty sig and must not lose its answer over one. This fires exactly when
+  # something is already broken — the legitimate non-root path (dashboard exec as
+  # `claude`) signs fine, so a healthy box prints nothing.
+  if [[ -z "$_sig" ]]; then
+    warn "gate closure for ${ident} was stored UNSIGNED (need_answer_sig is empty)."
+    warn "  The answer IS recorded and the gate is cleared — what is missing is the"
+    warn "  DIVE-756 tamper-evidence signature over the closure."
+    warn "  why: ${_sig_why:-the signing step produced no signature}"
+    warn "  consequence: a DELEGATED PUSH or DEPLOY on ${ident} will be REFUSED later"
+    warn "    (\"gate on ${ident} has no valid signed closure\"). The closure is signed by"
+    warn "    the ANSWERER, not by the agent acting on it, so that refusal lands on the"
+    warn "    maker's next round-trip and reads as tampering rather than as this."
+    warn "  fix: have this gate re-answered from a seat that can sign — root"
+    warn "    (\`sudo 5dive task answer ${ident} ...\`) or an agent whose sudo covers"
+    warn "    \`5dive gate-proof sign\`. Do NOT grant that to a cli-scoped seat: it signs"
+    warn "    arbitrary stdin, so the grant forges any closure, including a human:* one."
   fi
 
   # DIVE-2410: the gate is settled, so its buttons must stop looking tappable.
