@@ -11,7 +11,19 @@ decision to add one is ever wrong on its own merits. See
 | tier | runs | budget |
 |---|---|---|
 | `core` (**the default**) | every PR, both CI environments | **300s** per job |
-| `nightly` | `full-sweep.yml` (03:17 UTC + dispatch) | **1320s** per job, corpus split across 3 shards |
+| `nightly` | `full-sweep.yml` — 03:17 UTC, dispatch, **every push to main** (DIVE-2667), and **every PR touching `build.sh`, `install.sh` or `src/**`** (DIVE-2789) | **1320s** per job, corpus split across 3 shards |
+
+- **The PR trigger is ADVISORY. It does not block a merge**, and it is deliberately not
+  a required context: it is paths-filtered, so it is absent from ~28% of PRs, and GitHub
+  leaves a required check that never reports pending forever. A red there is a signal to
+  read, not a gate. It also covers ONE axis — a regression in the harness corpus outside
+  the core tier — and **not** the release path (`release-cut.yml` never runs on a PR) or
+  the selfcheck probe class, which the corpus never reaches. Do not read "full-sweep runs
+  on branches" as "a tree-level regression can no longer land behind a green PR".
+- **The nightly tier is not a cheap subset**: 25% of the corpus by file count and **81%
+  of it by wall-clock** (1210s of 1481s, measured DIVE-2789), because membership is
+  selected on cost. Cost any plan that leans on the core/nightly split in seconds, not in
+  files — `community/wiki/a-demoted-tier-is-not-a-cheap-subset-it-holds-almost-all-the-cost.md`.
 
 - **A new harness is `core` unless you say otherwise.** Nothing to write.
 - **Over budget, CI FAILS** (`exit 4`, distinct from a test failure's `exit 1`) and
