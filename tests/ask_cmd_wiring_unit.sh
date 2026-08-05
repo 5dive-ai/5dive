@@ -80,7 +80,7 @@ sudo() {
   case "$*" in
     *"tmux has-session"*)  return 0 ;;
     *"tmux capture-pane"*) _frame ;;
-    *"--json agent _deliver"*) printf '%s\n' '{"ok":true,"data":{"delivered":true}}'; return 0 ;;
+    *"agent _deliver"*)        printf '%s\n' '{"ok":true,"data":{"delivered":true}}'; return 0 ;;
     *"agent _capture"*)    _frame ;;
     *)                     return 0 ;;
   esac

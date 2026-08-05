@@ -14,7 +14,7 @@ set -euo pipefail
 . "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh" \
   || printf 'grading tree: UNRESOLVED (tests/lib/grading_tree.sh not reachable; no tree named)\n' >&2
 # shellcheck disable=SC2154
-trap 'rc=$?; echo "HARNESS-RC=$rc"' EXIT
+trap 'rc=$?; [[ -n "${SCOPED_DELIVER_ARGV:-}" ]] && rm -f "$SCOPED_DELIVER_ARGV"; echo "HARNESS-RC=$rc"' EXIT
 cd "$(dirname "$0")/.."
 
 # shellcheck disable=SC1091
@@ -29,6 +29,8 @@ source src/lib/validation.sh
 source src/cmd_agent_runtime.sh
 
 PASS=0; FAIL=0
+REAL_SUDO=$(command -v sudo)
+SCOPED_DELIVER_ARGV=$(mktemp)
 ok_t()  { PASS=$((PASS+1)); printf 'ok   - %s\n' "$1"; }
 bad_t() { FAIL=$((FAIL+1)); printf 'FAIL - %s\n   %s\n' "$1" "${2:-}"; }
 is() {
@@ -46,7 +48,10 @@ require_root()               { :; }
 require_agent()              { :; }
 a2a_needs_scoped()           { [[ "${USE_SCOPED:-0}" == 1 ]]; }
 sudo() {
-  if [[ "$*" == *"--json agent _deliver"* ]]; then
+  # Do not encode the expected flag position in the stub: T16 owns that
+  # assertion, so a source mutation can reach it and fail exactly there.
+  if [[ "$*" == *"agent _deliver"* ]]; then
+    printf '%s\n' "$*" >"$SCOPED_DELIVER_ARGV"
     if [[ "${INJECT_RC:-0}" == 1 ]]; then
       printf '%s\n' '{"ok":true,"data":{"delivered":false,"reason":"pane still shows an unsent paste buffer after retries (large-paste submit race, DIVE-147)"}}'
     else
@@ -138,17 +143,27 @@ is 'T14 scoped ask propagates _deliver sent:false' false "$(jq -r '.data.sent' <
 is 'T15 scoped ask carries the shared reason' \
   'pane still shows an unsent paste buffer after retries (large-paste submit race, DIVE-147)' \
   "$(jq -r '.data.reason' <<<"$out")"
+if [[ "$(<"$SCOPED_DELIVER_ARGV")" == "-n /usr/local/bin/5dive agent _deliver --json --id=feed2362 ada "* ]]; then
+  ok_t 'T16 scoped ask keeps _deliver in the sudoers-granted argv position'
+else
+  bad_t 'T16 scoped ask argv cannot match the standard sudoers grant' "$(<"$SCOPED_DELIVER_ARGV")"
+fi
+if "$REAL_SUDO" -n -l /usr/local/bin/5dive agent _deliver --json --id=feed2362 ada policy-probe >/dev/null 2>&1; then
+  ok_t 'T17 exact scoped-delivery argv is admitted by the live non-executing policy probe'
+else
+  bad_t 'T17 exact scoped-delivery argv is denied by the live sudoers policy' 'sudo -n -l returned nonzero'
+fi
 out=$(run_ask_text 1 0)
 if [[ "$out" == *"OK — question to agent 'ada' is unconfirmed"* ]]; then
-  ok_t 'T16 direct ask rc=1 final prose carries the doubt'
+  ok_t 'T18 direct ask rc=1 final prose carries the doubt'
 else
-  bad_t 'T16 direct ask rc=1 final prose still looks successful' "$out"
+  bad_t 'T18 direct ask rc=1 final prose still looks successful' "$out"
 fi
 out=$(run_ask_text 1 1)
 if [[ "$out" == *"OK — question to agent 'ada' is unconfirmed"* ]]; then
-  ok_t 'T17 scoped ask rc=1 final prose carries the doubt'
+  ok_t 'T19 scoped ask rc=1 final prose carries the doubt'
 else
-  bad_t 'T17 scoped ask rc=1 final prose still looks successful' "$out"
+  bad_t 'T19 scoped ask rc=1 final prose still looks successful' "$out"
 fi
 
 # Approval condition: the rc=0 renderer itself stays the old expression. This
@@ -156,14 +171,14 @@ fi
 # merely an equivalent boolean after a jq rewrite.
 SRC=src/cmd_agent_runtime.sh
 if grep -Fq "'{name:\$n, sent:true, bytes:(\$p|length), woken:(\$w==\"1\"), ready:(\$rd|select(length>0)), from:(\$s|select(length>0)), msg_id:(\$i|select(length>0)), reply_to_chat:(\$rc|select(length>0)), reply_to_msg:(\$rm|select(length>0))}'" "$SRC"; then
-  ok_t 'T18 confirmed send keeps the pre-DIVE-2362 renderer byte-for-byte'
+  ok_t 'T20 confirmed send keeps the pre-DIVE-2362 renderer byte-for-byte'
 else
-  bad_t 'T18 confirmed send renderer changed' 'rc=0 must stay on the original expression'
+  bad_t 'T20 confirmed send renderer changed' 'rc=0 must stay on the original expression'
 fi
 if grep -Fq "'{name:\$n, delivered:true, from:\$s, tier:(\$t|select(length>0))}'" "$SRC"; then
-  ok_t 'T19 confirmed scoped delivery keeps the pre-DIVE-2362 renderer byte-for-byte'
+  ok_t 'T21 confirmed scoped delivery keeps the pre-DIVE-2362 renderer byte-for-byte'
 else
-  bad_t 'T19 confirmed scoped delivery renderer changed' 'rc=0 must stay on the original expression'
+  bad_t 'T21 confirmed scoped delivery renderer changed' 'rc=0 must stay on the original expression'
 fi
 
 printf 'agent_send_unconfirmed_unit: %d passed, %d failed\n' "$PASS" "$FAIL"

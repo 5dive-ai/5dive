@@ -1993,7 +1993,10 @@ cmd_ask() {
     # with delivered:false. Capture its JSON receipt instead of discarding stdout;
     # otherwise scoped ask would wait for a reply after hiding the exact doubt
     # direct ask now reports. stderr stays separate so rc=3 retains its refusal.
-    _dout=$(sudo -n /usr/local/bin/5dive --json agent _deliver --id="$msg_id" "$name" "$ask_message" 2>"$_derr_file") || _drc=$?
+    # Keep `agent _deliver` immediately after the binary: standard agents are
+    # granted exactly `/usr/local/bin/5dive agent _deliver *` in sudoers, so a
+    # global flag before the subcommand is a positional policy denial.
+    _dout=$(sudo -n /usr/local/bin/5dive agent _deliver --json --id="$msg_id" "$name" "$ask_message" 2>"$_derr_file") || _drc=$?
     _derr=$(<"$_derr_file")
     if (( _drc == E_AUTH_REQUIRED )); then
       fail "$E_AUTH_REQUIRED" "${_derr#*: }"
