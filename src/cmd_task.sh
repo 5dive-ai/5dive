@@ -522,6 +522,99 @@ _task_verify_skip_reason() {
   return 0
 }
 
+# DIVE-2719: THE DEPTH DECISION IS MADE AT THE ONE MOMENT IT CANNOT BE ANSWERED.
+# _task_verify_skip_reason above runs at `task add`, where there is no branch, no
+# diff and no PR — so it is forced onto the only axis that exists then: the words
+# in the title. Measured on DIVE-2712: the title described a real user-facing
+# Telegram defect (correctly), so it earned the full rail; the delivered change
+# was ONE LINE in a test stub, and four verifier iterations graded it. No title
+# classifier could have known — the fact had not happened yet.
+#
+# So re-ask the question at DELIVERY, where the answer is a MEASUREMENT instead
+# of a guess: the paths the work actually touched. `task add`'s guess stays the
+# provisional default; delivery either confirms it, downgrades it (nothing here
+# a human round-trip can catch that CI does not) or upgrades it (a "docs" row
+# that turned out to touch the scheduler).
+#
+# WHY THIS IS NOT THE done-time WAIVER DIVE-969 BANNED, which is the obvious
+# objection: that ruling refuses a waiver the MAKER ASSERTS at peak
+# completion-incentive (`task done --no-verify`). This asserts nothing. The input
+# is the diff the work already produced — to be classified shallow you must have
+# genuinely changed only tests/docs, and if you did, there is nothing for a
+# grader to grade.
+#
+# THE ADD-TIME OPT-OUT IS NOT PRESERVED HERE, which is the accurate form of a
+# claim this comment made the other way round until main's review caught it.
+# Nothing persists `--no-verify`: it is a local var (declared 866, set 903) read
+# only by `task add`'s own branches (1051, 1063), with no column behind it. So at
+# `task done` a `--no-verify` row is INDISTINGUISHABLE from a DIVE-969
+# auto-skipped one — both read verifier NULL, verify_unavailable NULL — and the
+# UPGRADE arm below tests exactly that shape, so it re-attaches a grader to an
+# explicit opt-out whose diff reached the blast radius. The direction is
+# conservative: it can only ADD a rail, never waive one, so DIVE-969's posture is
+# intact. What it does override is an explicit filer instruction. Accepted, not
+# unnoticed — DIVE-2730 persists the flag and makes the original claim true.
+# (`verify_unavailable=1` self-handles: _task_default_verifier returns empty
+# again in that org, so the upgrade cannot fire.)
+#
+# Print the changed paths of the delivery bound to task <id>, one per line.
+# Empty output means UNKNOWN — no binding, no gh, no credential, no PR found —
+# and unknown must stay unknown: every caller below treats it as "change
+# nothing", so a missing credential can never widen OR narrow the rail.
+_task_delivery_paths() {
+  local _id="$1" _dref _body _branch="" _slug _tok _pr="" _n
+  _dref=$(db "SELECT COALESCE(delivery_ref,'') FROM tasks WHERE id=${_id};")
+  _body=$(db "SELECT COALESCE(body,'')         FROM tasks WHERE id=${_id};")
+  [[ -n "$_dref" ]] || _branch=$(_push_branch_from_body "$_body")
+  # No declared delivery at all -> return before spending a single gh call, so an
+  # ordinary unbound close keeps its current latency exactly.
+  [[ -n "$_dref" || -n "$_branch" ]] || return 0
+  command -v gh >/dev/null 2>&1 || return 0
+  _tok=$(_gate_gh_token); [[ -n "$_tok" ]] || return 0
+  _slug=$(_gate_task_repo_slug "$_dref" "$_body")
+  if [[ "$_dref" =~ ^https?:// ]]; then
+    _pr="$_dref"
+  else
+    # A bare `#N` delivery_ref is left to the merge gate's own DIVE-1955 refusal;
+    # here it simply reads as unknown rather than being resolved against a guess.
+    [[ -n "$_branch" && -n "$_slug" ]] || return 0
+    _n=$(GH_TOKEN="$_tok" gh pr list --repo "$_slug" --head "$_branch" --state all \
+           --json number -q '.[0].number' 2>/dev/null || echo "")
+    [[ -n "$_n" ]] || return 0
+    _pr="https://github.com/${_slug}/pull/${_n}"
+  fi
+  GH_TOKEN="$_tok" gh pr view "$_pr" --json files -q '.files[].path' 2>/dev/null || return 0
+}
+
+# Classify a path list (on stdin) as 'deep' | 'shallow' | '' (unknown/ordinary).
+# PATH GLOBS ONLY — deliberately not a taxonomy (scope cap from the ticket: if
+# this needs more than about ten entries the design is wrong).
+#   deep    — any path in the blast radius where a human round-trip earns its
+#             cost: the scheduler, the task store itself, credentials, deploy.
+#   shallow — EVERY path is a test, a doc or a changelog fragment. CI is already
+#             the gate for those; a verifier round adds latency and no signal.
+#   ''      — anything else, and any empty list: current behaviour, unchanged.
+# deep is checked first and wins outright, so a mixed set is never downgraded.
+_task_delivery_depth() {
+  local p have=0 all_shallow=1
+  while IFS= read -r p; do
+    [[ -n "$p" ]] || continue
+    have=1
+    case "$p" in
+      src/cmd_heartbeat.sh|src/cmd_task.sh|src/cmd_auth*|lib/db.sh|scripts/deploy*|\
+      .github/workflows/*|install.sh|*credential*|*secret*|*token*)
+        printf 'deep'; return 0 ;;
+    esac
+    case "$p" in
+      tests/*|docs/*|changelog.d/*|*.md) ;;
+      *) all_shallow=0 ;;
+    esac
+  done
+  (( have )) || return 0
+  (( all_shallow )) && printf 'shallow'
+  return 0
+}
+
 # Boolean form, kept for readability at the call site.
 _task_is_trivial() {
   [[ -n "$(_task_verify_skip_reason "$1" "$2" "$3")" ]]
@@ -625,9 +718,52 @@ _task_resolve_deputy() {
 #                         work still gets a distinct grader
 # The silent no-op survives ONLY when none of these yields a distinct agent (a
 # genuinely solo org, or nobody but the maker anywhere). Prints the grader name.
+# DIVE-2719: the org's DESIGNATED GRADER — the agent whose own role/title says
+# QA / testing / verification — excluding $1 (the maker). Same shape as
+# _task_resolve_deputy (leading-space-anchored keyword scan, must be UNIQUE, >1
+# is ambiguous and yields nothing), because it answers the same kind of question
+# off the same table.
+#
+# It goes FIRST in the chain below, and that placement is the fix for a live
+# directive violation, not a preference. lodar ruled 2026-08-04 07:51: "you
+# should never be verifier yourself" / "why our ceo acts as ci tool". The remedy
+# applied that morning MOVED 58 rows off main and cleared 6 more — it did not
+# touch this picker, so by 21:1x six MORE rows created that same day had
+# regenerated verifier=main. Correcting the output of a rule leaves the rule
+# producing it. Every rung this function had walks UP the chart (lead,
+# coordinator, manager, root, deputy), so a leader was structurally guaranteed to
+# win; a chart that names a QA agent has already answered who should grade, and
+# nobody had asked it.
+_task_resolve_qa() {
+  local _skip="$1"
+  local _pred="( lower(' '||COALESCE(role,'')||' '||COALESCE(title,'')) LIKE '% qa%'
+                 OR lower(' '||COALESCE(role,'')||' '||COALESCE(title,'')) LIKE '% test%'
+                 OR lower(' '||COALESCE(role,'')||' '||COALESCE(title,'')) LIKE '% verif%'
+                 OR lower(' '||COALESCE(role,'')||' '||COALESCE(title,'')) LIKE '% quality%' )
+               AND name <> $(sqlq "$_skip")"
+  [[ "$(db "SELECT COUNT(*) FROM agents_org WHERE ${_pred};")" == "1" ]] || return
+  db "SELECT name FROM agents_org WHERE ${_pred} LIMIT 1;"
+}
+
+# DIVE-2719: a NAMED EXCLUSION LIST, so the next such ruling is data rather than
+# a code change. Comma/space separated agent names in FIVE_VERIFY_EXCLUDE are
+# excluded from the default chain exactly the way the maker is — they can still
+# be set explicitly with `--verifier=` / `task verifier`, which stays a deliberate
+# human act. Empty by default: this ships INERT and changes no selection until an
+# org sets it.
+_task_verify_excluded() {
+  local _n="$1" _e _list="${FIVE_VERIFY_EXCLUDE:-}"
+  [[ -n "$_n" ]] || return 1
+  for _e in ${_list//,/ }; do
+    [[ "$_e" == "$_n" ]] && return 0
+  done
+  return 1
+}
+
 _task_default_verifier() {
   local _assignee="$1" _proj_lead="$2" c=""
   local -a cands=(
+    "$(_task_resolve_qa "$_assignee")"
     "$_proj_lead"
     "$(_task_resolve_coordinator)"
     "$(db "SELECT COALESCE(reports_to,'') FROM agents_org WHERE name=$(sqlq "$_assignee") LIMIT 1;")"
@@ -635,7 +771,7 @@ _task_default_verifier() {
     "$(_task_resolve_deputy "$_assignee")"
   )
   for c in "${cands[@]}"; do
-    if [[ -n "$c" && "$c" != "$_assignee" ]]; then
+    if [[ -n "$c" && "$c" != "$_assignee" ]] && ! _task_verify_excluded "$c"; then
       printf '%s' "$c"; return
     fi
   done
@@ -2910,10 +3046,40 @@ _task_status_cmd() {
     # below is idempotent on an already-closed row, so a bare repeat `task done`
     # keeps its long-standing rc=0 no-op behaviour instead of newly erroring.
     _route_st=$(db "SELECT COALESCE(status,'') FROM tasks WHERE id=${id};")
+    # DIVE-2719: the depth `task add` GUESSED from the title, re-measured here
+    # from the paths this delivery actually touched (see _task_delivery_depth).
+    # Empty = unknown = every branch below behaves exactly as it did before.
+    local _depth=""
+    if [[ "$_route_st" != "done" && "$_route_st" != "cancelled" ]]; then
+      _depth=$(_task_delivery_paths "$id" | _task_delivery_depth)
+    fi
     if [[ -n "$_vfier" && "$_vfier" != "$_asignee" \
           && "$_route_st" != "done" && "$_route_st" != "cancelled" ]]; then
-      _task_route_to_verifier "$id" "$_vfier" "$_asignee" "$result" "$want_result"
-      return
+      if [[ "$_depth" == "shallow" ]]; then
+        # DOWNGRADE. The rail was earned by the title; the diff says tests/docs
+        # only. Fall through to the ordinary close — which still has to satisfy
+        # the DIVE-1830 merge gate below, so "no verifier round" never becomes
+        # "no gate at all". The verifier column is left in place: it records who
+        # WOULD have graded, and `5dive trace` can still answer why nobody did.
+        warn "$ident: verifier round skipped (DIVE-2719) — the delivered diff touches only tests/docs/changelog, where CI is the gate and a grading round-trip adds latency and no signal. Grader on the row was '$_vfier'; force the review with '5dive task verifier $ident $_vfier' after re-opening if you disagree."
+      else
+        _task_route_to_verifier "$id" "$_vfier" "$_asignee" "$result" "$want_result"
+        return
+      fi
+    elif [[ -z "$_vfier" && "$_depth" == "deep" && -n "$_asignee" \
+            && "$_route_st" != "done" && "$_route_st" != "cancelled" \
+            && "${FIVE_VERIFY_DEFAULT:-1}" != "0" ]]; then
+      # UPGRADE. `task add` read this row as trivial (bodyless chore title, or
+      # low priority) and gave it no grader — but the diff reached the scheduler,
+      # the task store, credentials or deploy. This is a ROUND TRIP, not a block:
+      # the grader's own `task done` (verifier==assignee) closes it normally.
+      local _up; _up=$(_task_default_verifier "$_asignee" "")
+      if [[ -n "$_up" ]]; then
+        db "UPDATE tasks SET verifier=$(sqlq "$_up") WHERE id=${id};"
+        warn "$ident: graded after all (DIVE-2719) — filed without a verifier, but the delivered diff touches the blast radius (scheduler/task store/credentials/deploy), so it routes to '$_up' instead of closing outright."
+        _task_route_to_verifier "$id" "$_up" "$_asignee" "$result" "$want_result"
+        return
+      fi
     fi
     # DIVE-2007: the DELIVERED state must be durable against its own MAKER. The
     # routing test above is positional (`verifier != assignee`), and delivery
