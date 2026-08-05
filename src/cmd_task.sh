@@ -1300,13 +1300,30 @@ cmd_task_ls() {
     # INST-2: emit verify_unavailable — the canonical "no independent verifier
     # available" flag (verifier-by-default no-opped in a solo org). True only while
     # the mark stands AND no verifier has since been assigned; the dashboard renders
-    # it as an "Unverified" badge. NB: no inline SQL `--` comments in this string —
+    # it as an "Unverified" badge.
+    # DIVE-2777: emit handoff_delivered_at and handoff_rejected_at. They were
+    # ABSENT from this projection, not nulled — a distinction with no difference to
+    # a consumer (`r.get('handoff_delivered_at')` is None either way) and all the
+    # difference to the fix: include the fields, do not repair a write. `task show
+    # --json` already returned them correctly and matched sqlite the whole time, so
+    # the two surfaces disagreed and the list one was the one people reached for
+    # first. It cost a real wrong answer: DIVE-2207 was read off this list as never
+    # re-delivered when the DB had it delivered at 2026-08-04 17:40:13.
+    #
+    # TWO fields, not three. `handoff_ack_at` is already here and works; it merely
+    # reads absent on rows whose value is NULL, because this projection drops
+    # null-valued keys generally. That is also why the trap took three hands: you
+    # cannot tell "omitted by the serializer" from "null in the DB" by looking at a
+    # row whose value is null, and every row anyone reached for first was null
+    # here. Only a row with a NON-NULL clock discriminates — which is what the
+    # regression test asserts against (tests/task_reject_trace_unit.sh, arm C).
+    # NB: no inline SQL `--` comments in this string —
     # dbfmt flattens newlines, so a `--` would comment out the rest of the query.
     rows=$(dbfmt -json "SELECT id, ident, title, status, priority, assignee, created_by, parent_id, created_at, done_at, body, result, delivery_ref, need_type, ask, need_options, recommend, precedent_ref, precedent_kind, need_answer, need_answered_at, need_answered_by, tier, kind, schedule, last_fired_at, last_skipped_at, parked_at, park_reason, wake_at, project_key, maker_agent, verifier,
              CASE WHEN maker_agent IS NOT NULL AND assignee=verifier AND status NOT IN ('done','cancelled')
                   THEN CASE WHEN handoff_ack_at IS NOT NULL THEN 'reviewing' ELSE 'delivered' END
                   ELSE NULL END AS handoff_state,
-             handoff_ack_at,
+             handoff_ack_at, handoff_delivered_at, handoff_rejected_at,
              CASE WHEN need_type IS NOT NULL AND need_answered_at IS NULL AND status NOT IN ('done','cancelled') THEN 1 ELSE 0 END AS gate_live,
              CASE WHEN verify_unavailable = 1 AND verifier IS NULL AND status NOT IN ('done','cancelled') THEN 1 ELSE 0 END AS verify_unavailable,
              CASE WHEN kind='recurring' THEN (SELECT i.ident FROM tasks i WHERE i.from_template_id=tasks.id AND i.status NOT IN ('done','cancelled') ORDER BY i.id LIMIT 1) ELSE NULL END AS blocked_by
@@ -4931,6 +4948,31 @@ _task_route_to_verifier() {
 # reached max_iterations, where the loop is stuck and we park it on a human
 # (`task need`) rather than ping-pong forever. Only meaningful mid-loop
 # (maker_agent set); a plain task has no maker to bounce to.
+# DIVE-2777: the ONE emitter for a bounce, shared by both of `reject`'s write
+# sites — the ordinary bounce-back and the max_iterations escalation. It is a
+# function rather than two call-sites-worth of inline `ledger_emit` for the exact
+# reason this ticket exists: DIVE-2483 fixed a class in three places and left a
+# fourth hand-rolled copy, which then survived the fix meant to kill it. The next
+# path added to `reject` should inherit this rather than re-derive it.
+#
+# `out` is the SUPERSEDED text, deliberately, not the rejection line. output_hash
+# is then sha256 of what was on the row when the bounce landed, so it EQUALS the
+# `task.delivered` output_hash for the same ident and a reader can say WHICH
+# delivery this bounce displaced. The rejection text itself is on the row and
+# needs no hash.
+_task_reject_emit_event() {
+  local ident="$1" id="$2" actor="$3" prev="$4" iter="$5" maxi="$6" disposition="$7"
+  local prior
+  if (( ${#prev} )); then
+    prior="superseded (${#prev} bytes, preserved on the row)"
+  else
+    prior="none"
+  fi
+  ledger_emit task.rejected ident="$ident" task_id="$id" actor="$actor" \
+    out="$prev" \
+    detail="rejected by ${actor} at iteration ${iter}${maxi:+/$maxi}, ${disposition}; prior_result=${prior}"
+}
+
 cmd_task_reject() {
   tasks_db_init
   local task="" feedback=""
@@ -5011,6 +5053,11 @@ cmd_task_reject() {
   # what makes this a strict widening. Note the seam puts the PRIOR text first
   # now, where the old marker put it last; that is the shared convention's order
   # and a single grep still finds every superseded record.
+  #
+  # DIVE-2777. Read the prior text BEFORE the guard runs, for the lifecycle event
+  # below — after it, `$fb_txt` is the merged string and the question "was there a
+  # record here to supersede" is no longer answerable from the row.
+  local _rj_prev; _rj_prev=$(db "SELECT COALESCE(result,'') FROM tasks WHERE id=${id};")
   _task_guard_result_over_closed "$id" "$ident" reject "$fb_txt" 1 0 reject-result-over-open
   fb_txt="$_TASK_GUARDED_RESULT"
   # DIVE-1495: a reject supersedes any still-open need-gate on this task. Leaving
@@ -5097,6 +5144,18 @@ cmd_task_reject() {
   # tests/task_close_preserves_done_at_unit.sh (arm G).
   if (( maxi > 0 && iter >= maxi )); then
     db "UPDATE tasks SET result=$(sqlq "$fb_txt") WHERE id=${id};"
+    # DIVE-2777: THE SECOND WRITE SITE GETS THE EVENT TOO, and this branch is the
+    # one that most needs it — it is the terminal reject, the bounce that ends the
+    # loop and parks it on a human, and it `return`s before the emit below.
+    #
+    # Emitting only from the ordinary path would have rebuilt this row's own
+    # defect in the fix for it: DIVE-2483 routed three verbs through the shared
+    # guard and left `reject`'s fourth site hand-rolled, which is the entire reason
+    # this ticket exists. A trace that covers the routine bounce and goes silent on
+    # the escalation is the same shape — the population is EVERY reject, not every
+    # reject that happens to fall through.
+    _task_reject_emit_event "$ident" "$id" "$_rj_actor" "$_rj_prev" "$iter" "$maxi" \
+      "escalated to human review at the iteration cap (loop stuck, not bounced back)"
     warn "$ident hit max_iterations ($maxi) — escalating to human review"
     cmd_task_need "$id" --type=manual --from="${vfier:-verifier}" \
       --ask="Maker→verifier loop stuck: $ident failed verification ${iter}× (max ${maxi}). Last feedback: ${feedback:-none}. Review + decide."
@@ -5119,6 +5178,36 @@ cmd_task_reject() {
   db "UPDATE tasks SET status='todo', assignee=$(sqlq "$maker"), started_at=NULL, handoff_ack_at=NULL,
         handoff_rejected_at=datetime('now'),
         done_at=NULL, result=$(sqlq "$fb_txt") WHERE id=${id};"
+  # DIVE-2777: THE BOUNCE IS A LIFECYCLE EVENT. Until now `reject` emitted nothing
+  # — the distinct kinds in the table were gate.answered, gate.filed,
+  # policy.refused, ship, task.cancelled, task.created, task.delivered, task.done,
+  # task.review, task.started, and no `task.rejected` among them. So a reject's
+  # only trace was `handoff_rejected_at`, and :4426 NULLs that on the very next
+  # delivery because it is an iteration-increment signal, not a log. A row that
+  # goes rejected -> re-delivered -> closed therefore left NO machine-readable
+  # trace that a bounce ever happened, which is why the historical count of
+  # DIVE-2762-class destruction is a floor (3 known) rather than a number.
+  #
+  # It goes to lifecycle_events specifically because that table is APPEND-ONLY and
+  # nothing on the re-delivery path touches it — the same property that makes
+  # task.delivered's output_hash survive. A marker in `result` would not do: the
+  # next delivery overwrites the column and takes the marker with it, which is the
+  # design constraint olivia raised and then withdrew once main2 reproduced that
+  # the surviving store already ships. So: emit the event, do NOT invent a new
+  # durable column, and do NOT touch how handoff_rejected_at is spent.
+  #
+  # `out` carries the SUPERSEDED text, not the rejection line. output_hash is then
+  # sha256 of what was on the row when the bounce landed, which is exactly the
+  # value a later reader wants to compare against the task.delivered hash for the
+  # same ident: same hash -> this bounce is the one that displaced that delivery.
+  # The rejection text itself is on the row and needs no hash.
+  #
+  # This buys FORWARD countability only. It cannot backfill: an ordinary verifier
+  # close also replaces `result`, so a destructive reject and a legitimate close
+  # are indistinguishable by hash across the 278 existing task.delivered events
+  # (270 mismatch — essentially the whole population). The census starts here.
+  _task_reject_emit_event "$ident" "$id" "$_rj_actor" "$_rj_prev" "$iter" "$maxi" \
+    "bounced back to maker ${maker}"
   ok "$ident rejected — bounced back to maker '$maker' (iteration $iter${maxi:+/$maxi})" \
      '{id:($i|tonumber), ident:$id, status:"todo", bouncedTo:$m, role:"maker", iteration:($n|tonumber)}' \
      --arg i "$id" --arg id "$ident" --arg m "$maker" --arg n "$iter"
