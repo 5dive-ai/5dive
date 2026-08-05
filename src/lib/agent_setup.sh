@@ -494,7 +494,8 @@ install_default_skill_for_agent() {
   local name="$1" type="$2" source="$3" skill="$4"
   local user="agent-${name}" home="/home/agent-${name}"
   local agent_id="${SKILLS_AGENT_ID[$type]:-claude-code}"
-  local install_dir="${SKILLS_INSTALL_DIR[$type]:-.claude/skills}"
+  local install_dir
+  install_dir=$(skills_install_dir "$type")
   # DIVE-2370: today every caller passes an internal template constant, so this is a
   # pre-emptive guard rather than a fix for a live hole HERE — recorded as such so nobody
   # reads it as an incident. It is still the right place for it: the sibling site in
