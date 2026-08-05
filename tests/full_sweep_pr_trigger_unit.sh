@@ -184,12 +184,20 @@ fi
 CAVEAT="$(awk '/AND TWO THINGS THIS DOES NOT COVER AT ALL/{f=1}
                f{ if ($0 !~ /^[[:space:]]*#/) exit; print }' "$WF")"
 
-# Arm 7 grades the EXTRACTION. Without it, a reworded or deleted heading makes
-# $CAVEAT empty and arms 8-9 go red for a reason their own messages misname.
-if [[ -n "$CAVEAT" ]]; then
-  ok 'the "TWO THINGS THIS DOES NOT COVER AT ALL" caveat block is present and locatable'
-else
+# Arm 7 grades the EXTRACTION, and grades it for COMPLETENESS, not just presence.
+# Narrowing arms 8-9 from the file to a block does not remove their failure mode, it
+# MOVES it: anything that makes the block short — a reworded heading, or a blank line
+# inserted mid-paragraph, which ends the contiguous comment run — reds them under
+# messages that name the wrong cause ("no longer names release-cut.yml"), sending the
+# next reader to re-add a sentence that is already there. So the block is required to
+# reach its own closing sentence. A legitimately deleted bullet leaves that sentence
+# in place, so this arm stays green and exactly the right content arm goes red.
+if [[ -z "$CAVEAT" ]]; then
   no 'the caveat block is GONE or its heading was reworded — arms 8-9 below cannot grade what they cannot find'
+elif ! grep -q 'This row closes ONE axis' <<<"$CAVEAT"; then
+  no 'the caveat block is TRUNCATED — it does not reach its closing sentence, so any red below names the wrong cause (a blank line inside the paragraph ends the comment run)'
+else
+  ok 'the "TWO THINGS THIS DOES NOT COVER AT ALL" caveat block is present, locatable and complete'
 fi
 
 if grep -q 'release-cut.yml' <<<"$CAVEAT"; then
