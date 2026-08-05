@@ -1,5 +1,70 @@
 # Changelog
 
+## v0.19.0 — feat(pii): the pre-push guard reaches the fleet, not one repo (DIVE-2788)
+
+`scripts/install-pii-push-guard.sh` said **"fleet-wide"** in its own docstring and
+refused every origin but `5dive-ai/5dive`. Not an oversight — the install mechanism
+could not express anything else. It set `core.hooksPath=scripts/git-hooks`, a
+**relative** path, which is exactly right in this repo (the hook is versioned with
+the branch it gates) and unimplementable anywhere else, because no other repo
+carries the hook, the scanner or the denylist.
+
+Measured on this host with the tool this change adds: **23 distinct remotes, 1
+guarded.** Four rows of PII program (DIVE-1774, DIVE-1797, DIVE-2267, DIVE-2268)
+were each scoped to that one repo, so *"the class is closed going forward"* — written
+into the DIVE-1997 decision of record — was true for `5dive-ai/5dive` and false for
+the fleet. The id reached current `main` of two PUBLIC repos and rendered as an
+`<input placeholder>` in the customer dashboard's Telegram modal.
+
+**A skip indistinguishable from a success is a silent scope.** The old `exit 0` was
+the right call for blind provisioning and the reason nothing noticed.
+
+New **portable mode**: for any non-`5dive-ai/5dive` origin the installer
+materialises a guard home (`/usr/local/share/5dive/pii-guard` by default) holding a
+PII-only hook plus verbatim copies of `scripts/pii-scan.sh` and
+`.github/pii-denylist.txt`, and points `core.hooksPath` at it absolutely. In-repo
+mode is unchanged for this repo, which keeps its version-bump, harness-tree and
+actionlint guards. The origin match is now anchored on the repo name — the old
+`*5dive-ai/5dive*` glob also matched `5dive-plugins` and `5dive-mcp` and would have
+pointed a relative hooksPath at a directory that does not exist there.
+
+**The denylist is read from a host path, not shipped into each repo, and the reason
+is drift, not secrecy.** It is sha256-only and already public. N in-repo copies are N
+things to update when an identifier is added, and a denylist current in one repo and
+stale in 21 is a guard that reports itself installed while grading against a
+population that no longer matches — the same failure again. Stated cost: an absolute
+hooksPath is not versioned with the branch and does not travel with a fresh clone.
+
+New `scripts/pii-guard-fleet.sh` enumerates, installs and optionally scans — and
+**prints a population, not a verdict**: roots walked, checkouts found (`find -name
+.git` at any depth; `ls -d */` had missed 12 nested and one hidden, including a live
+push remote under `marketing/.work`), how they fold into clones and remotes, and per
+row where the answer came from. An install that did not take says **why**
+(`none:EPERM(owner=…)`) and retries as the owning uid — failure and never-attempted
+otherwise print identically. Unreadable is `UNKNOWN`, never counted clean; unknown
+visibility is `UNKNOWN`, never "private".
+
+Three git facts this cost, each of which broke the fix before it worked, all in
+`tests/pii_guard_fleet_unit.sh` (27 arms, 1.2s):
+
+- **`git rev-parse --git-path hooks/pre-push` HONOURS `core.hooksPath`.** A portable
+  hook resolving "the repo's own hook, so I can chain to it" that way gets *itself*.
+  Unbounded recursion on every push; found by the harness on its first run, and
+  invisible to review because that expression is the obvious one and reads correctly.
+- **`core.hooksPath` REPLACES `$GIT_DIR/hooks`, it does not add to it.**
+  `lodar/5dive-frontend` has a `$GIT_DIR/hooks/pre-push` (the DIVE-2203 reminder), so
+  a naive install would have deleted a live control while reporting a guard installed.
+  The portable hook chains, and replays the ref-update list on the chained hook's
+  stdin — a chained hook handed an empty stdin scans nothing and exits 0.
+- **A pre-existing foreign `core.hooksPath` is refused, not clobbered.** It is
+  single-valued, so "install" would silently mean "delete theirs".
+
+Demonstrated end to end against the real remote: a throwaway commit carrying a
+denylisted value was **refused on push to `5dive-ai/5dive-plugins`** (PUBLIC) and the
+branch does not exist on the remote. Fleet coverage on this host went **1 → 22 of
+23**; the remaining one is a worktree owned by a uid this session cannot assume, and
+its origin is a local path whose target is guarded.
+
 ## v0.19.0 — fix(heartbeat): surface a recurring instance that was never started (DIVE-2693)
 
 The stall sweep keys on `handoff_delivered_at`. A materialized recurring instance
