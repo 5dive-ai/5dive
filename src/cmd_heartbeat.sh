@@ -1475,7 +1475,7 @@ _hb_wake() {
 # coarse (daily/hourly) recurring jobs; minute granularity finer than the tick
 # interval can also be missed. Both documented in the CHANGELOG.
 _hb_materialize_recurring() {
-  local now="$1" minute_start tid sched last_fired open open_read open_rc n_made=0
+  local now="$1" minute_start tid sched last_fired open open_read open_rc stamp_err n_made=0
   minute_start=$(date -u -d "@${now}" +'%Y-%m-%d %H:%M:00')
   while IFS=$'\t' read -r tid sched last_fired; do
     [[ -n "$tid" ]] || continue
@@ -1527,7 +1527,9 @@ _hb_materialize_recurring() {
       # one the scheduler never reached, and a monitor implemented as a
       # recurring task can switch itself off in silence. Best-effort: a failed
       # stamp must never change whether the pass fires anything.
-      db "UPDATE tasks SET last_skipped_at=datetime('now') WHERE id=${tid};" >/dev/null 2>&1 || true
+      stamp_err=$(db "UPDATE tasks SET last_skipped_at=datetime('now') WHERE id=${tid};" 2>&1) \
+        || _hb_log "[materializer] $(_hb_ident "$tid") last_skipped_at stamp FAILED: ${stamp_err//$'\n'/ }" \
+        || true
       _hb_log "[materializer] $(_hb_ident "$tid") due but an open instance exists — skip"
       continue
     fi
