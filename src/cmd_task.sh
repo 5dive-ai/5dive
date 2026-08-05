@@ -1300,13 +1300,30 @@ cmd_task_ls() {
     # INST-2: emit verify_unavailable — the canonical "no independent verifier
     # available" flag (verifier-by-default no-opped in a solo org). True only while
     # the mark stands AND no verifier has since been assigned; the dashboard renders
-    # it as an "Unverified" badge. NB: no inline SQL `--` comments in this string —
+    # it as an "Unverified" badge.
+    # DIVE-2777: emit handoff_delivered_at and handoff_rejected_at. They were
+    # ABSENT from this projection, not nulled — a distinction with no difference to
+    # a consumer (`r.get('handoff_delivered_at')` is None either way) and all the
+    # difference to the fix: include the fields, do not repair a write. `task show
+    # --json` already returned them correctly and matched sqlite the whole time, so
+    # the two surfaces disagreed and the list one was the one people reached for
+    # first. It cost a real wrong answer: DIVE-2207 was read off this list as never
+    # re-delivered when the DB had it delivered at 2026-08-04 17:40:13.
+    #
+    # TWO fields, not three. `handoff_ack_at` is already here and works; it merely
+    # reads absent on rows whose value is NULL, because this projection drops
+    # null-valued keys generally. That is also why the trap took three hands: you
+    # cannot tell "omitted by the serializer" from "null in the DB" by looking at a
+    # row whose value is null, and every row anyone reached for first was null
+    # here. Only a row with a NON-NULL clock discriminates — which is what the
+    # regression test asserts against (tests/task_reject_trace_unit.sh, arm C).
+    # NB: no inline SQL `--` comments in this string —
     # dbfmt flattens newlines, so a `--` would comment out the rest of the query.
     rows=$(dbfmt -json "SELECT id, ident, title, status, priority, assignee, created_by, parent_id, created_at, done_at, body, result, delivery_ref, need_type, ask, need_options, recommend, precedent_ref, precedent_kind, need_answer, need_answered_at, need_answered_by, tier, kind, schedule, last_fired_at, last_skipped_at, parked_at, park_reason, wake_at, project_key, maker_agent, verifier,
              CASE WHEN maker_agent IS NOT NULL AND assignee=verifier AND status NOT IN ('done','cancelled')
                   THEN CASE WHEN handoff_ack_at IS NOT NULL THEN 'reviewing' ELSE 'delivered' END
                   ELSE NULL END AS handoff_state,
-             handoff_ack_at,
+             handoff_ack_at, handoff_delivered_at, handoff_rejected_at,
              CASE WHEN need_type IS NOT NULL AND need_answered_at IS NULL AND status NOT IN ('done','cancelled') THEN 1 ELSE 0 END AS gate_live,
              CASE WHEN verify_unavailable = 1 AND verifier IS NULL AND status NOT IN ('done','cancelled') THEN 1 ELSE 0 END AS verify_unavailable,
              CASE WHEN kind='recurring' THEN (SELECT i.ident FROM tasks i WHERE i.from_template_id=tasks.id AND i.status NOT IN ('done','cancelled') ORDER BY i.id LIMIT 1) ELSE NULL END AS blocked_by
@@ -1439,6 +1456,16 @@ cmd_task_show() {
     deps=$(db "SELECT t.ident||'  ['||t.status||']  '||t.title FROM task_deps d JOIN tasks t ON t.id=d.blocked_by WHERE d.task_id=${id} ORDER BY t.id;")
     [[ -n "$deps" ]] && { echo; echo "blocked by:"; printf '%s\n' "$deps" | indent2; }
   fi
+  # DIVE-2751: the `blocked by` block above is a CONDITIONAL RENDER whose test is
+  # the last command in this function, so on a row with no dependency edge the
+  # false test became `task show`'s exit status and `set -euo pipefail` killed the
+  # script — after the row had already printed in full. That is the majority of the
+  # board, and `5dive task show <id>` is the canonical verification command a /goal
+  # stop-hook is pointed at, so a correctly-rendered row read as a failed command
+  # whose effect the trap then declared UNKNOWN. Terminate the function on its own
+  # status: a render that reached the end SUCCEEDED, whatever the last block chose
+  # not to print. Covers the --json branch too (jq's status is not a render verdict).
+  return 0
 }
 
 # DIVE-2133 — gate_history was an append-only WRITE path with no reader. Keep
@@ -4921,6 +4948,31 @@ _task_route_to_verifier() {
 # reached max_iterations, where the loop is stuck and we park it on a human
 # (`task need`) rather than ping-pong forever. Only meaningful mid-loop
 # (maker_agent set); a plain task has no maker to bounce to.
+# DIVE-2777: the ONE emitter for a bounce, shared by both of `reject`'s write
+# sites — the ordinary bounce-back and the max_iterations escalation. It is a
+# function rather than two call-sites-worth of inline `ledger_emit` for the exact
+# reason this ticket exists: DIVE-2483 fixed a class in three places and left a
+# fourth hand-rolled copy, which then survived the fix meant to kill it. The next
+# path added to `reject` should inherit this rather than re-derive it.
+#
+# `out` is the SUPERSEDED text, deliberately, not the rejection line. output_hash
+# is then sha256 of what was on the row when the bounce landed, so it EQUALS the
+# `task.delivered` output_hash for the same ident and a reader can say WHICH
+# delivery this bounce displaced. The rejection text itself is on the row and
+# needs no hash.
+_task_reject_emit_event() {
+  local ident="$1" id="$2" actor="$3" prev="$4" iter="$5" maxi="$6" disposition="$7"
+  local prior
+  if (( ${#prev} )); then
+    prior="superseded (${#prev} bytes, preserved on the row)"
+  else
+    prior="none"
+  fi
+  ledger_emit task.rejected ident="$ident" task_id="$id" actor="$actor" \
+    out="$prev" \
+    detail="rejected by ${actor} at iteration ${iter}${maxi:+/$maxi}, ${disposition}; prior_result=${prior}"
+}
+
 cmd_task_reject() {
   tasks_db_init
   local task="" feedback=""
@@ -5001,6 +5053,11 @@ cmd_task_reject() {
   # what makes this a strict widening. Note the seam puts the PRIOR text first
   # now, where the old marker put it last; that is the shared convention's order
   # and a single grep still finds every superseded record.
+  #
+  # DIVE-2777. Read the prior text BEFORE the guard runs, for the lifecycle event
+  # below — after it, `$fb_txt` is the merged string and the question "was there a
+  # record here to supersede" is no longer answerable from the row.
+  local _rj_prev; _rj_prev=$(db "SELECT COALESCE(result,'') FROM tasks WHERE id=${id};")
   _task_guard_result_over_closed "$id" "$ident" reject "$fb_txt" 1 0 reject-result-over-open
   fb_txt="$_TASK_GUARDED_RESULT"
   # DIVE-1495: a reject supersedes any still-open need-gate on this task. Leaving
@@ -5087,6 +5144,18 @@ cmd_task_reject() {
   # tests/task_close_preserves_done_at_unit.sh (arm G).
   if (( maxi > 0 && iter >= maxi )); then
     db "UPDATE tasks SET result=$(sqlq "$fb_txt") WHERE id=${id};"
+    # DIVE-2777: THE SECOND WRITE SITE GETS THE EVENT TOO, and this branch is the
+    # one that most needs it — it is the terminal reject, the bounce that ends the
+    # loop and parks it on a human, and it `return`s before the emit below.
+    #
+    # Emitting only from the ordinary path would have rebuilt this row's own
+    # defect in the fix for it: DIVE-2483 routed three verbs through the shared
+    # guard and left `reject`'s fourth site hand-rolled, which is the entire reason
+    # this ticket exists. A trace that covers the routine bounce and goes silent on
+    # the escalation is the same shape — the population is EVERY reject, not every
+    # reject that happens to fall through.
+    _task_reject_emit_event "$ident" "$id" "$_rj_actor" "$_rj_prev" "$iter" "$maxi" \
+      "escalated to human review at the iteration cap (loop stuck, not bounced back)"
     warn "$ident hit max_iterations ($maxi) — escalating to human review"
     cmd_task_need "$id" --type=manual --from="${vfier:-verifier}" \
       --ask="Maker→verifier loop stuck: $ident failed verification ${iter}× (max ${maxi}). Last feedback: ${feedback:-none}. Review + decide."
@@ -5109,6 +5178,36 @@ cmd_task_reject() {
   db "UPDATE tasks SET status='todo', assignee=$(sqlq "$maker"), started_at=NULL, handoff_ack_at=NULL,
         handoff_rejected_at=datetime('now'),
         done_at=NULL, result=$(sqlq "$fb_txt") WHERE id=${id};"
+  # DIVE-2777: THE BOUNCE IS A LIFECYCLE EVENT. Until now `reject` emitted nothing
+  # — the distinct kinds in the table were gate.answered, gate.filed,
+  # policy.refused, ship, task.cancelled, task.created, task.delivered, task.done,
+  # task.review, task.started, and no `task.rejected` among them. So a reject's
+  # only trace was `handoff_rejected_at`, and :4426 NULLs that on the very next
+  # delivery because it is an iteration-increment signal, not a log. A row that
+  # goes rejected -> re-delivered -> closed therefore left NO machine-readable
+  # trace that a bounce ever happened, which is why the historical count of
+  # DIVE-2762-class destruction is a floor (3 known) rather than a number.
+  #
+  # It goes to lifecycle_events specifically because that table is APPEND-ONLY and
+  # nothing on the re-delivery path touches it — the same property that makes
+  # task.delivered's output_hash survive. A marker in `result` would not do: the
+  # next delivery overwrites the column and takes the marker with it, which is the
+  # design constraint olivia raised and then withdrew once main2 reproduced that
+  # the surviving store already ships. So: emit the event, do NOT invent a new
+  # durable column, and do NOT touch how handoff_rejected_at is spent.
+  #
+  # `out` carries the SUPERSEDED text, not the rejection line. output_hash is then
+  # sha256 of what was on the row when the bounce landed, which is exactly the
+  # value a later reader wants to compare against the task.delivered hash for the
+  # same ident: same hash -> this bounce is the one that displaced that delivery.
+  # The rejection text itself is on the row and needs no hash.
+  #
+  # This buys FORWARD countability only. It cannot backfill: an ordinary verifier
+  # close also replaces `result`, so a destructive reject and a legitimate close
+  # are indistinguishable by hash across the 278 existing task.delivered events
+  # (270 mismatch — essentially the whole population). The census starts here.
+  _task_reject_emit_event "$ident" "$id" "$_rj_actor" "$_rj_prev" "$iter" "$maxi" \
+    "bounced back to maker ${maker}"
   ok "$ident rejected — bounced back to maker '$maker' (iteration $iter${maxi:+/$maxi})" \
      '{id:($i|tonumber), ident:$id, status:"todo", bouncedTo:$m, role:"maker", iteration:($n|tonumber)}' \
      --arg i "$id" --arg id "$ident" --arg m "$maker" --arg n "$iter"
@@ -7512,7 +7611,20 @@ cmd_task_need() {
         # Rule 3: a non-appealable class (money / real comms / irreversible infra)
         # is present. Name the surviving term so the refusal is actionable rather
         # than mysterious — the filer can see it is not the word they meant.
-        local _dd_term; _dd_term=$(_gate_tier2_floor_term "$_dd_residual")
+        # DIVE-2751 iteration 4 (main2): TWO defects on the one line this replaces.
+        # `$_dd_residual` occurred exactly ONCE in the whole repo — here — so it
+        # has never held a value: under `set -u` the substitution died "unbound
+        # variable" and the plain assignment inherited its rc, aborting `task need`
+        # with no message on the Rule 3 path. And the term must be read off the
+        # residual that ACTUALLY hit; concatenating the two would re-open the
+        # phantom seam match the DIVE-2224 comment above forbids, so this mirrors
+        # _gate_hit_either's own order (ask first, then title) and absorbs the rc.
+        local _dd_term=""
+        if _gate_tier2_floor_hit "$_dd_res_ask"; then
+          _dd_term=$(_gate_tier2_floor_term "$_dd_res_ask" 2>/dev/null) || _dd_term=""
+        else
+          _dd_term=$(_gate_tier2_floor_term "$_dd_res_title" 2>/dev/null) || _dd_term=""
+        fi
         warn "--discusses REFUSED: this gate names a non-appealable category (matched '${_dd_term}'). Money, outbound customer comms and irreversible infra/access stay hard-human however they are framed. Staying at tier 2."
       else
         local _dd_reviewer; _dd_reviewer=$(_gate_route_reviewer "$(task_actor "")")   # DIVE-2518: tier-flag only; see note above
@@ -8222,8 +8334,19 @@ cmd_task_need() {
         # TITLE, say so HERE. A stderr warn is not the durable surface -- the routed
         # reviewer reads this line, and "escalate if the ask really is asking for
         # that" is only actionable if they are told which term and from where.
-        local _fbt=""
-        [[ "$_floored_by_title" == "1" ]] && _fbt=" [floored_by=title: the T2 category floor matched '$(_gate_tier2_floor_term "$_ft_title")' in the TASK TITLE, not in the ask — escalate to the human if the ask really is asking for that]"
+        # DIVE-2751 iteration 4 — decided explicitly rather than left as "guarded in
+        # practice". An assignment's rc is its LAST command substitution's, so
+        # `[[ test ]] && v="...$(f)..."` hands f's status to the compound with the
+        # test TRUE. `_ft_title` is the text that just matched, so the helper does
+        # return 0 here — but "in practice" is exactly the reasoning the previous
+        # three iterations got wrong, and this false rc arrives from the RHS, where
+        # no detector that classifies the LEFT side of `&&` can ever see it. Split
+        # so the status is absorbed instead of argued about.
+        local _fbt="" _fbt_term=""
+        if [[ "$_floored_by_title" == "1" ]]; then
+          _fbt_term=$(_gate_tier2_floor_term "$_ft_title" 2>/dev/null) || _fbt_term=""
+          _fbt=" [floored_by=title: the T2 category floor matched '${_fbt_term}' in the TASK TITLE, not in the ask — escalate to the human if the ask really is asking for that]"
+        fi
         ok "$ident routed to $_reviewer for ${_rrole} ($type, tier $tier)${_rnote}${_fbt} — $ask" \
            '{id:($i|tonumber), ident:$id, status:"blocked", need_type:$ty, tier:($tr|tonumber), routed_to:$rv, delivery:$ds, notified:($ds=="delivered"), ask:$ak, recommend:(($rc|select(length>0)) // null)}' \
            --arg i "$id" --arg id "$ident" --arg ty "$type" --arg tr "$tier" --arg rv "$_reviewer" --arg ds "$_rstate" --arg ak "$ask" --arg rc "$recommend"
@@ -8421,7 +8544,12 @@ cmd_task_need() {
     floor_note=" [tier 2 — DECLARED --needs=${needs}, a human-held capability; routed to the paired human, not to a lead or verifier]"
     warn "this gate is hard-human because you DECLARED --needs=${needs}. It bypasses lead- and verifier-routing by constant, and only the paired human can answer it. If the ask does not actually consume that capability, withdraw and re-file without --needs — do not appeal it, the declaration is yours."
   elif (( tier_floored )); then
-    floor_term=$(_gate_tier2_floor_term "${ask} $(db "SELECT COALESCE(title,'') FROM tasks WHERE id=${id};")")
+    # DIVE-2751: `_gate_tier2_floor_term` is trailing-test-terminated — it returns 1
+    # when it finds no term — so this PLAIN assignment made "the floor fired but the
+    # helper could not name the word" kill `task need` under `set -e`. The helper's
+    # own rc contract is left alone (a value producer may report "no match"); the
+    # call site absorbs it, exactly as the two sites at _floor_term above already do.
+    floor_term=$(_gate_tier2_floor_term "${ask} $(db "SELECT COALESCE(title,'') FROM tasks WHERE id=${id};")") || floor_term=""
     floor_note=" [tier forced to 2 — T2 category floor${floor_term:+: matched '$floor_term'}]"
     local _fw="this gate was FORCED to tier 2 (hard human) by the T2 category floor"
     [[ -n "$floor_term" ]] && _fw="$_fw because the ask or the task title contains '${floor_term}'"
