@@ -91,7 +91,7 @@ run set_body "$tid" "template instructions live here" >/dev/null
 
 # --- T6: refused on a closed (done) task
 id4=$(run add --assignee=alice --no-verify -- "closeable task" | jf '.data.id')
-run done "$id4" >/dev/null
+run done "$id4" --result="closed in fixture setup (DIVE-2773: a first close must carry a reason)" >/dev/null
 e6=$(run set_body "$id4" "too late"); rc=$?
 [[ $rc -ne 0 ]] && printf '%s' "$e6" | grep -q "already done" \
   && ok_t "set-body refuses a closed (done) task" || bad_t "set-body refuses a closed task" "rc=$rc $e6"
