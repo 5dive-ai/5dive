@@ -10960,7 +10960,18 @@ cmd_task_answer() {
       # No audit_log here: the blocked caller is an agent user that can't write
       # the root-owned audit log anyway (it would only leak a perms error to
       # stderr). The fail + non-zero exit is the record.
-      fail "$E_AUTH_REQUIRED" "$ident is a '$nt' gate — only a human can clear it. Answer it from Telegram (tap the button) or the dashboard; an agent can't self-answer an approval/secret/manual gate."
+      # DIVE-2801: state the CALLER's standing, not a law about the gate type.
+      # "an agent can't self-answer an approval gate" is false — the gate's
+      # lead-clear seat reaches here with _lead_clear=1 and clears it with no
+      # human at all (see the branch above; DIVE-2599/2665/2654 are live
+      # instances). Human-only is the FALL-THROUGH for a caller without that
+      # standing, not the rule for the type. The old wording was read as a
+      # general rule by the agent it refused, who then rebuilt the gate around
+      # it — a refusal that describes the wrong subject sends the reader to fix
+      # the wrong thing, and unlike a wrong answer nobody audits a reason.
+      local _who_can="a human"
+      [[ -n "$_routed_rev" ]] && _who_can="'${_routed_rev}' (this gate's routed reviewer) or a human"
+      fail "$E_AUTH_REQUIRED" "$ident is a '$nt' gate and you ('${_caller}') do not hold lead-clear standing on it, so your answer is refused — this is about YOUR standing on THIS gate, not about the gate type: its lead-clear seat can answer it with no human involved. It can be cleared by ${_who_can}. A human answers from Telegram (tap the button) or the dashboard."
     fi
     # DIVE-2054: routed_reviewer is task-store state for $ident — fenced.
     # DIVE-2099: `standing=` distinguishes the two clearances that reach here.

@@ -112,17 +112,50 @@ before this shipped can be re-provisioned, or you can add that one line to their
 
 From inside the repo's work tree, on the branch you want to ship:
 
-```sh
-# dry run — checks gate + author, mints nothing, pushes nothing:
-5dive push DIVE-123 --branch=my-feature --dry-run
+**First add a `Branch:` line to the task body.** This is required, not an
+alternative to `--branch` — the cleared gate binds to the branch the *task*
+declares (DIVE-1462), so a push whose task body names no branch is refused even
+when `--branch` is passed:
 
-# real push (after the task's ship gate has been answered):
-5dive push DIVE-123 --branch=my-feature
+```
+Branch: my-feature
 ```
 
-The branch can also come from a `Branch: my-feature` line in the task body
-instead of `--branch`. Point at a different repo with `--repo=https://github.com/<org>/<repo>`
-(defaults to the repo configured for your deployment).
+Then, from inside the repo's work tree:
+
+```sh
+# dry run — checks gate authority + author, mints nothing, pushes nothing:
+5dive push DIVE-123 --dry-run
+
+# real push (after the task's ship gate has been answered):
+5dive push DIVE-123
+```
+
+`--branch=my-feature` overrides *which* branch is read; it does not remove the
+need for the body line. Point at a different repo with
+`--repo=https://github.com/<org>/<repo>` (defaults to the repo configured for
+your deployment).
+
+### What the dry run does NOT check
+
+The dry run is a **rehearsal, not the performance**. It runs the agent-side
+preflight, which checks gate *authority*; the real push re-verifies everything
+inside root and additionally requires a **signed closure**. Signing needs a seat
+whose sudo grant reaches `5dive gate-proof sign` — a narrowly-scoped agent seat
+silently stores an unsigned closure when it answers a gate, and the refusal only
+surfaces at push time (DIVE-2760).
+
+So the dry run names its own limits rather than implying it checked them:
+
+- `signature verified` — the root executor ran; this is the real verdict.
+- `signature present but NOT verified here` — the closure is signed, but this
+  rehearsal did not check the signature. Normal for a dry run.
+- `closure carries NO signature — the root executor verifies it and WILL refuse
+  this push` — knowable now, so the dry run reports `would NOT push` rather than
+  previewing a push that cannot happen. Get the gate answered by a seat that can
+  sign.
+
+Confirm a closure with `sudo 5dive gate-proof verify <task>` (root only).
 
 ## Security model
 
