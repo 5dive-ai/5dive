@@ -65,6 +65,19 @@ branch does not exist on the remote. Fleet coverage on this host went **1 → 22
 23**; the remaining one is a worktree owned by a uid this session cannot assume, and
 its origin is a local path whose target is guarded.
 
+## v0.19.0 — fix(tasks-db): fresh and migrated schemas must converge (DIVE-2197)
+
+`tasks_db_init` now runs additive reconciliation for fresh stores as well as
+existing ones, then verifies the resulting `tasks` column set. This restores six
+columns that the canonical fresh schema omitted (`delivery_ref`, `delivered_at`,
+`parked_at`, `park_reason`, `escalated_at`, `escalated_by`) and turns a failed
+`ALTER TABLE` into a loud initialization failure instead of a healthy-looking
+partial schema.
+
+The isolated restore harness asserts all six columns on a fresh `STATE_DIR` and
+injects a failure into the `delivery_ref` ALTER. Removing only the resulting-set
+assertion makes that arm red, proving the refusal is connected to the source path.
+
 ## v0.19.0 — fix(heartbeat): surface a recurring instance that was never started (DIVE-2693)
 
 The stall sweep keys on `handoff_delivered_at`. A materialized recurring instance
