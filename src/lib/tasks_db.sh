@@ -2125,6 +2125,73 @@ _gate_sudo_uid_nonagent() {
   [[ "$uname" != agent-* ]]
 }
 
+# ── DIVE-2371: the STRUCTURAL half of the human-evidence test ────────────────
+# The uid test above asks "is this name absent from a list I maintain", so every
+# principal NOT enumerated is promoted to human: `claude` (an agent runtime, not
+# a person — the pre-`agent-*` session present on every box), `hello`, `dmarc`,
+# CI's `runner`, and any future service account. A human-evidence test whose
+# DEFAULT is *human* has its fail direction backwards, and on the one account
+# present everywhere it gave the wrong answer: a bare `--human` from any process
+# running as claude cleared a tier-2 gate.
+#
+# WHY A CGROUP AND NOT A BETTER NAME LIST: /proc/self/cgroup is written by systemd
+# at fork and an unprivileged process cannot rewrite its own. Crucially `sudo` does
+# NOT move cgroups, so it survives the EUID-0 hop $SUDO_UID exists for — the same
+# hop that makes that env var forgeable off-root (DIVE-1413).
+#
+# THE LIST IS ON THE ACCEPT SIDE, which is what makes it fail closed: a principal
+# nobody enumerated is REFUSED, where the uid test admitted it. lodar answered
+# "Ship it" 2026-08-05 07:40 knowing the consequence — a tier-2 gate can no longer
+# be cleared from a shell on the box as user claude. Telegram taps are untouched:
+# they clear through the nonce arm, not this one.
+_gate_caller_cgroup() {
+  # cgroup v2 emits a single `0::<path>` line; take everything after the last ':'.
+  local line; line=$(head -1 /proc/self/cgroup 2>/dev/null) || return 1
+  [[ -n "$line" ]] || return 1
+  printf '%s' "${line##*:}"
+}
+
+_gate_cgroup_human_capable() {
+  local cg; cg=$(_gate_caller_cgroup) || return 1
+  [[ -n "$cg" ]] || return 1
+
+  # ACCEPT 1 — THE DASHBOARD. It is the only non-Telegram surface a customer
+  # clears a gate from, and it has neither a nonce (the nonce is minted into
+  # Telegram callback_data, never to a browser) nor a login session. shelld is a
+  # plain system service, User=claude, no Slice=, so /system.slice/shelld.service.
+  # MEASURED on a freshly provisioned box 2026-08-05, not derived from the unit
+  # file: ControlGroup and the running process's own /proc/<pid>/cgroup agree, and
+  # shelld spawns the CLI as a PLAIN sudo child, so the answerer inherits this.
+  #
+  # HARDCODED ON PURPOSE — no env override. My first draft read this list from
+  # $FIVE_GATE_CGROUP_ACCEPT, a plain env var any non-root process sets freely: an
+  # agent could name its OWN cgroup and pass. That is the exact env-forge class
+  # DIVE-1413 hardened $SUDO_UID against, reintroduced into the predicate written
+  # to close it. A widening knob on a fail-closed accept list IS the failure mode.
+  [[ "$cg" == "/system.slice/shelld.service" ]] && return 0
+
+  # ACCEPT 2 — A REAL LOGIN SESSION, structural rather than named: a person who
+  # logs in and sudo's lands in /user.slice/user-<uid>.slice/session-<n>.scope.
+  # No unit name to forget, and no system service can manufacture one.
+  [[ "$cg" == /user.slice/*/session-*.scope ]] && return 0
+
+  # Everything else refused: agent units, the primary claude runtime, an
+  # unreadable cgroup, a non-systemd host. An unresolved principal is not a
+  # verified one — the same rule the served/expected commit checks use.
+  return 1
+}
+
+# The AUTHORIZATION predicate. Requires BOTH halves on purpose, so it can only
+# tighten: nothing the uid test refused becomes permitted, and the structural test
+# removes the principals it wrongly admitted. ATTRIBUTION does not use this —
+# `_gate_withdraw_actor` keeps the uid test, because authorization must fail closed
+# while attribution must stay TRUTHFUL, and degrading a real person's withdrawal to
+# 'none' would make the record worse rather than safer.
+_gate_human_principal() {
+  _gate_sudo_uid_nonagent || return 1
+  _gate_cgroup_human_capable
+}
+
 # ── DIVE-756: persisted closure signature (tamper-evidence) ──────────────────
 # Unlike the short-lived answer-time --proof (bound to id:type, TTL 120s, then
 # discarded), this HMAC is STORED on the row and binds the durable closure facts,
