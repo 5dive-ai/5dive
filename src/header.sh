@@ -36,6 +36,12 @@ esac
 # the floor if it is not. Graded by tests/release_cut_assign_unit.sh.
 readonly FIVE_VERSION="0.0.0-dev"
 
+# Build identity, not a release number. build.sh replaces this sentinel only in
+# the generated bundle with the 40-hex commit whose source it concatenated.
+# Keeping the source sentinel non-hex makes an unbuilt split tree impossible to
+# mistake for an artifact whose ancestry install.sh can verify (DIVE-2603).
+readonly FIVE_BUILD_SHA="unbuilt"
+
 # GitHub org our repos live under. The org is being renamed
 # 5dive-com -> 5dive-ai (2026-06); fetches must work on either side of the
 # rename, so probe the new org once per process and fall back to the old
