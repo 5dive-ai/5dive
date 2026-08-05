@@ -433,6 +433,20 @@ _proof_build() {
     return 4
   fi
 
+  # DIVE-2745 (lodar's call, gate answer "30d-derived-label"): the badge's rolling
+  # window is 30 days, and it is defined ONCE here. Every sense of it below derives
+  # from this: the digest sub-call's flag, the corroborators' SQL span, the history
+  # slice, and every rendered label. That is not tidiness — the window is used in
+  # FOUR different kinds here (a CLI flag, a SQLite date expression, a COUNT OF
+  # ROWS, and a string), and DIVE-1552 happened precisely because one moved and the
+  # others did not (the badge published 51/7 against a true ~343/53). Changing the
+  # window must mean changing one number in one place.
+  #
+  # WHY 30 AND NOT 7: the badge is 1 - asks/shipped. At 7 days the denominator is
+  # small enough that a single human ask moves the published figure several points,
+  # so it reads as noise rather than a claim. 30 is steadier and harder to game.
+  local win_days=30 win_flag
+  win_flag="--${win_days}d"
   local self day_json week_json today now_iso cli_version
   # DIVE-2080: the published badge IS the evidence, so it must be computed by the
   # bundle that is publishing it. `command -v 5dive` sat here and handed the job to
@@ -440,7 +454,7 @@ _proof_build() {
   self="$(five_self_bundle)" \
     || { echo "proof badges: could not identify the running 5dive bundle to compute the digest" >&2; return "$E_GENERIC"; }
   day_json="$("$self" digest --json 2>/dev/null)"
-  week_json="$("$self" digest --json --7d 2>/dev/null)"
+  week_json="$("$self" digest --json "$win_flag" 2>/dev/null)"
   [ -n "$day_json" ] && [ -n "$week_json" ] || { echo "digest produced no output" >&2; return "$E_GENERIC"; }
   # DIVE-1908: today_label ("%b %-d") was computed and exported for years and
   # read by NOTHING — which is how the missing badge date stayed invisible. The
@@ -476,14 +490,14 @@ _proof_build() {
   # DIVE-2654 (spec settled in DIVE-2652): two denominator-side corroborator
   # fields ship alongside the badge inside zero-human.json — the badge MESSAGE
   # itself stays untouched (DIVE-1924), only the JSON gains fields. Both share
-  # the badge's own rolling 7d window so a reader never reconciles a third span.
+  # the badge's own rolling window so a reader never reconciles a third span.
   #
   # LEAD — verifier first-pass rate, carrying its own coverage (how much of the
   # window's shipped standard work got graded at all, same shipped_db source as
   # `proof scorecard`'s tier coverage) and the iteration-NULL disclosure: a NULL
   # iteration reads as first-pass (COALESCE(iteration,1)<=1), which biases the
   # rate UP by however many of the graded rows that affects.
-  local sql_window="-7 days" corr_rows
+  local sql_window="-${win_days} days" corr_rows
   corr_rows="$(db "SELECT
       (SELECT COUNT(*) FROM tasks WHERE status='done' AND kind='standard' AND done_at>=datetime('now',$(sqlq "$sql_window"))) || '|' ||
       (SELECT COUNT(*) FROM tasks WHERE status='done' AND kind='standard' AND done_at>=datetime('now',$(sqlq "$sql_window")) AND verifier IS NOT NULL AND verifier<>'') || '|' ||
@@ -528,6 +542,7 @@ _proof_build() {
     NOW_ISO="$now_iso" CLI_VERSION="$cli_version" \
     PUB_HOST="$(_proof_host)" PUB_USER="$(id -un)" \
     METHODOLOGY_URL="$_PROOF_METHODOLOGY_URL" \
+    WINDOW_DAYS="$win_days" \
     CORR_ROWS="$corr_rows" \
     CORR_REFUSALS="$corr_refusals" CORR_FIRED_WINDOW="$corr_fired_win" \
     CORR_FIRED_LIFETIME="$corr_fired_life" CORR_SITES="$corr_sites" \
@@ -575,20 +590,70 @@ if _pub:
     row["publishedBy"] = _pub
 hist.append(row)
 
-# DIVE-1552: derive the rolling 7-day window from the append-only daily
-# datapoints (which survive a board wipe), NOT the live-board WEEK_JSON set
-# above. After the 2026-07-19 board wipe the live board lost pre-wipe history,
-# so its 7d query under-counted (badge read 51/7 vs the true ~343/53). Daily
-# datapoints are non-overlapping 24h counts (same basis as `cum`), so summing
-# the last 7 is the true rolling week — and immune to future wipes.
-_last7 = hist[-7:]
+# DIVE-1552: derive the rolling window from the append-only daily datapoints
+# (which survive a board wipe), NOT the live-board WEEK_JSON set above. After
+# the 2026-07-19 board wipe the live board lost pre-wipe history, so its span
+# query under-counted (badge read 51/7 vs the true ~343/53). Daily datapoints
+# are non-overlapping 24h counts (same basis as `cum`), so summing the last N is
+# the true rolling window — and immune to future wipes.
+#
+# DIVE-2745: N is the window in DAYS, passed in from the single definition in
+# _proof_build. The default here is the same 30 and exists only so the extracted
+# python (tests/proof_publish_unit.sh drives this block directly) still runs
+# standalone — it is not a second source of truth to be edited on its own.
+_win_days = int(os.environ.get("WINDOW_DAYS") or 30)
+_last = hist[-_win_days:]
 row["week"] = {
-    "shipped": sum(h["day"]["shipped"] for h in _last7),
-    "humanAsks": sum(h["day"]["humanAsks"] for h in _last7),
+    "shipped": sum(h["day"]["shipped"] for h in _last),
+    "humanAsks": sum(h["day"]["humanAsks"] for h in _last),
 }
 
+# DIVE-2745: THE LABEL IS DERIVED FROM WHAT THE SLICE ACTUALLY HELD, never
+# hardcoded. `hist[-30:]` returns min(30, len(hist)) rows, so on the day this
+# shipped — 26 published datapoints — the honest label is "26d", and it becomes
+# "30d" once the 30th datapoint lands, with no code change and no second gate.
+# A hardcoded "30d" over 26 datapoints would be the DIVE-1552 defect one layer
+# over: there the NUMBER disagreed with its window, here the WINDOW would
+# disagree with itself, on a public artifact.
+#
+# And the count is DATAPOINTS, not calendar days — those diverge the moment the
+# publisher misses a day, exactly as the corroborator note below describes. So
+# the calendar span travels alongside rather than being implied by the label.
+_win_points = len(_last)
+_win_label = f"{_win_points}d"
+_win_span = None
+try:
+    from datetime import date as _date
+    _win_span = (_date.fromisoformat(_last[-1]["date"])
+                 - _date.fromisoformat(_last[0]["date"])).days + 1
+except Exception:
+    _win_span = None
+
+_win_obj = {
+    "label": _win_label,
+    "requestedDays": _win_days,
+    "datapoints": _win_points,
+    "calendarSpanDays": _win_span,
+}
+# DIVE-2745: stamp the window onto the HISTORY ROW as well, not just the current
+# datapoint. history.jsonl is append-only and public, so it now spans a window
+# change: every row before 2026-08-06 carries a 7-day `week` and every row after
+# carries a 30-day one, under the same key. Without this stamp a reader plotting
+# `week.shipped` across that boundary would compare two different measurements
+# and see a step change that is an artefact of the window, not of the company.
+# Rows written before this fix have no `window` key, which is itself the marker:
+# absent means the 7-day definition.
+row["window"] = dict(_win_obj)
+
+# The SQL-side corroborators below are a DIFFERENT instrument: a live
+# datetime('now','-N days') span that is always exactly N, whatever the history
+# holds. It therefore gets its own label, and the two are deliberately allowed
+# to disagree (26d vs 30d) rather than sharing one string that can only be right
+# for one of them.
+_sql_label = f"{_win_days}d"
+
 # Cumulative totals sum the non-overlapping 24h datapoints, never the rolling
-# 7d windows (those overlap and would double-count).
+# windows (those overlap and would double-count).
 cum = {
     "daysPublished": len(hist),
     "shipped": sum(h["day"]["shipped"] for h in hist),
@@ -613,28 +678,30 @@ shipped_db, graded_db, first_pass_db, iter_null_db = (
 if graded_db:
     fp_entry = {
         "value": f"{round(first_pass_db / graded_db * 100, 1)}%",
-        "window": "7d",
+        "window": _sql_label,
         "firstPass": first_pass_db,
         "graded": graded_db,
     }
     if shipped_db:
         # DIVE-2654 review (main2): NOT named "shipped" — this datapoint's own
-        # week.shipped above is a DIVE-1552 FROZEN SUM over the last 7
-        # PUBLISHED daily datapoints (overwritten in from `hist[-7:]` after
-        # `row` is built), while this is a LIVE datetime('now','-7 days') SQL
-        # count. Two instruments both labelled "7d" in the same file is
-        # exactly the defect this row exists to prevent, and the gap between
-        # them WIDENS for as long as publishing stays paused (hist[-7:] then
-        # spans more than 7 calendar days while this SQL span stays exactly
-        # 7) — so the name and basis travel with the number rather than
-        # trusting a shared label.
+        # week.shipped above is a DIVE-1552 FROZEN SUM over the last N
+        # PUBLISHED daily datapoints (overwritten in from `hist[-N:]` after
+        # `row` is built), while this is a LIVE datetime('now','-N days') SQL
+        # count. Two instruments sharing one label in the same file is exactly
+        # the defect this row exists to prevent, and the gap between them
+        # WIDENS for as long as publishing stays paused (the slice then spans
+        # more than N calendar days while this SQL span stays exactly N) — so
+        # the name and basis travel with the number rather than trusting a
+        # shared label. DIVE-2745 goes one step further: the two now carry
+        # DIFFERENT labels (_win_label vs _sql_label), so a reader sees them
+        # disagree instead of having to read this comment to learn they can.
         fp_entry["shippedStandardTasks"] = shipped_db
         fp_entry["coveragePct"] = round(graded_db / shipped_db * 100, 1)
         fp_entry["basis"] = ("live tasks.db query: status='done' AND kind='standard' AND done_at "
-                              "within the last 7 calendar days from datetime('now') — a DIFFERENT "
+                              f"within the last {_win_days} calendar days from datetime('now') — a DIFFERENT "
                               "instrument from this datapoint's own week.shipped above (a frozen sum "
-                              "of the last 7 PUBLISHED daily datapoints, DIVE-1552, which can span "
-                              "more than 7 calendar days while publishing is paused). Do not read "
+                              f"of the last {_win_days} PUBLISHED daily datapoints, DIVE-1552, which can span "
+                              f"more than {_win_days} calendar days while publishing is paused). Do not read "
                               "the two as the same number.")
     if iter_null_db:
         fp_entry["iterationNullGraded"] = iter_null_db
@@ -644,8 +711,8 @@ if graded_db:
     corroborators["verifierFirstPassRate"] = fp_entry
 else:
     corroborators["verifierFirstPassRate"] = {
-        "value": None, "window": "7d",
-        "nodata": "no verifier-graded standard tasks in the 7d window",
+        "value": None, "window": _sql_label,
+        "nodata": f"no verifier-graded standard tasks in the {_sql_label} window",
     }
 
 _pref   = (os.environ.get("CORR_REFUSALS") or "").strip()
@@ -657,7 +724,7 @@ _psince = (os.environ.get("CORR_LEDGER_SINCE") or "").strip()
 if _pref.isdigit() and _psites.isdigit() and int(_psites) > 0:
     pb_entry = {
         "value": int(_pref),
-        "window": "7d",
+        "window": _sql_label,
         "instrumentedSites": int(_psites),
     }
     if _pfw.isdigit():
@@ -682,12 +749,12 @@ if _pref.isdigit() and _psites.isdigit() and int(_psites) > 0:
     corroborators["policyBlockedAttempts"] = pb_entry
 elif _psites.isdigit() and int(_psites) == 0:
     corroborators["policyBlockedAttempts"] = {
-        "value": None, "window": "7d",
+        "value": None, "window": _sql_label,
         "nodata": "the running 5dive bundle has no instrumented policy sites — upgrade it to record refusals (DIVE-1922)",
     }
 else:
     corroborators["policyBlockedAttempts"] = {
-        "value": None, "window": "7d",
+        "value": None, "window": _sql_label,
         "nodata": "no policy_refusals table in this store — nothing has recorded a refused attempt (DIVE-1922)",
     }
 
@@ -695,12 +762,13 @@ w_ship = row["week"]["shipped"]
 w_ask = row["week"]["humanAsks"]
 ask_word = "ask" if w_ask == 1 else "asks"
 
-# Message is the self-shipped ratio over the rolling 7-day window,
-# 1 - asks/shipped, with the shipped count as the sample size. One decimal,
-# trailing .0 dropped. The window deliberately lives only in
-# zero-human.json/history.jsonl so the badge stays tight. A week with more
-# asks than ships goes negative and publishes anyway; a week with zero ships
-# has no ratio, so the raw counts show instead.
+# Message is the self-shipped ratio over the rolling window (DIVE-2745: 30 days,
+# was 7), 1 - asks/shipped, with the shipped count as the sample size. One
+# decimal, trailing .0 dropped. The window deliberately lives only in
+# zero-human.json/history.jsonl so the badge stays tight — which is also why
+# widening it costs the badge face nothing. A window with more asks than ships
+# goes negative and publishes anyway; one with zero ships has no ratio, so the
+# raw counts show instead.
 if w_ship > 0:
     pct = (1 - w_ask / w_ship) * 100
     pct_str = f"{pct:.1f}".rstrip("0").rstrip(".")
@@ -745,8 +813,24 @@ datapoint = {
     "day": row["day"],
     "cumulative": cum,
     "cliVersion": os.environ["CLI_VERSION"],
-    "source": "5dive digest --json [--7d]",
+    "source": f"5dive digest --json [--{_win_days}d]",
     "methodology": os.environ["METHODOLOGY_URL"],
+    # DIVE-2745: the window ships WITH the number instead of being implied by a
+    # key called "week". `week` keeps its name because history.jsonl is
+    # append-only and every published row and consumer already carries it — a
+    # rename would rewrite the past — so this object is how a reader learns what
+    # the sum actually spans. label is the DERIVED one (datapoints), and
+    # requestedDays is what was asked for: while they differ, the badge is
+    # standing on less data than the policy wants, and says so out loud.
+    "window": {
+        **_win_obj,
+        "basis": ("week above sums the last N PUBLISHED daily datapoints (DIVE-1552: "
+                  "non-overlapping 24h counts, immune to a board wipe). label counts "
+                  "DATAPOINTS, not calendar days — they diverge if the publisher misses "
+                  "a day, which is why calendarSpanDays is carried separately. The "
+                  "corroborators below use a live SQL span instead and carry their own "
+                  "window label; the two are different instruments and may disagree."),
+    },
     # DIVE-2654: denominator-side signals the badge does not carry on its own
     # face. Additive-only, same zero-human.json API contract as publishedBy.
     "corroborators": corroborators,
@@ -769,7 +853,7 @@ pathlib.Path("README.md").write_text(
     "- `zero-human.json` is the full current datapoint\n"
     "- `history.jsonl` is every daily datapoint, append-only\n"
 )
-print(f"{today} (7d: {w_ship} shipped, {w_ask} {ask_word})")
+print(f"{today} ({_win_label}: {w_ship} shipped, {w_ask} {ask_word})")
 PROOFPY
 )"
   rc=$?
@@ -1245,7 +1329,14 @@ _proof_scorecard() {
   # --json is stripped GLOBALLY by main.sh before dispatch (it sets JSON_MODE),
   # so a local `--json)` case here would be dead code that silently never fires
   # and leaves --json rendering text. Read the global.
-  local json="${JSON_MODE:-0}" window="7d" by="tier"
+  # DIVE-2745: the DEFAULT is 30d, matching the published badge. This verb is the
+  # team-facing half of the same claim, and a scorecard defaulting to a different
+  # span from the badge is how two surfaces quoting "the" autonomy number end up
+  # quoting two. --7d is retained, because a deliberate narrow read is a different
+  # act from inheriting a narrow read by default. Thin-n is the other half of the
+  # reason: median recovery time off one episode and precedent acceptance off n=2
+  # are what a 7-day denominator produces here.
+  local json="${JSON_MODE:-0}" window="30d" by="tier"
   while [ $# -gt 0 ]; do
     case "$1" in
       --7d)   window="7d" ;;
@@ -1622,7 +1713,7 @@ cmd_proof() {
     -h|--help|"")
       cat <<'HELP'
 usage: 5dive proof status [--json]                    # LOCAL autonomy badge + config (no network)
-       5dive proof scorecard [--json] [--7d|--30d] [--by=tier|class]   # LOCAL multi-dim metrics by risk tier
+       5dive proof scorecard [--json] [--7d|--30d] [--by=tier|class]   # LOCAL multi-dim metrics by risk tier (default 30d)
        5dive proof on --repo=<url> [--branch=status] [--at=<0-23>] [--user=<u>]
                       [--as-name=<n> --as-email=<e>]   # identity commits are authored with
        5dive proof off
