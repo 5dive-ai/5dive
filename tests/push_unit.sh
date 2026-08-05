@@ -617,7 +617,7 @@ grep -Eq "cached refs/remotes/origin/main|could not fetch" <<<"$out" \
 # ...and a cached bound still CATCHES a genuinely mis-authored commit — exactly
 # one, the branch's own, not the pre-policy history behind it.
 out=$(scan3 feature-dirty "$UNFETCHABLE" authoritative); rc=$?
-n=$(grep -cE "^  [0-9a-f]{40} " <<<"$out")
+n=$(grep -cE "^  [0-9a-f]{40} " <<<"$out") || n=0
 { [[ $rc -ne 0 ]] && grep -q "author check FAILED" <<<"$out" && [[ "$n" -eq 1 ]] \
     && grep -q "MAY BE STALE" <<<"$out"; } \
   && ok_t "2161: cached bound catches a real bad author — exactly 1 offender, flagged stale" \
@@ -820,8 +820,8 @@ grep -q 'repos/\${slug}/installation' "$SRC/cmd_push.sh" \
 # of this fix referenced \$slug 40 lines above its assignment, which expands to
 # empty and silently queries /repos//installation — a lookup that cannot fail
 # loudly. Pin the ordering, not just the presence.
-_slug_ln=$(grep -n '^  slug=\$(_push_repo_slug "\$repourl")' "$SRC/cmd_push.sh" | head -1 | cut -d: -f1)
-_inst_ln=$(grep -n 'repos/\${slug}/installation' "$SRC/cmd_push.sh" | head -1 | cut -d: -f1)
+_slug_ln=$(grep -n '^  slug=\$(_push_repo_slug "\$repourl")' "$SRC/cmd_push.sh" | head -1 | cut -d: -f1) || _slug_ln=""
+_inst_ln=$(grep -n 'repos/\${slug}/installation' "$SRC/cmd_push.sh" | head -1 | cut -d: -f1) || _inst_ln=""
 [[ -n "$_slug_ln" && -n "$_inst_ln" && "$_slug_ln" -lt "$_inst_ln" ]] \
   && ok_t "installation: slug is assigned BEFORE the installation lookup reads it" \
   || bad_t "installation: slug assigned before use" "slug at line ${_slug_ln:-none}, lookup at ${_inst_ln:-none}"
@@ -855,9 +855,9 @@ grep -q "message // empty" "$SRC/cmd_push.sh" \
 # ASSERT THE ANCHORS FIRST. If the extraction misses, the arm must FAIL LOUDLY
 # rather than silently grade an empty string — an arm that cannot find its subject
 # is exactly the vacuous pass this whole ticket is about.
-_a_start=$(grep -n 'if \[\[ -n "\$_inst_for_repo" && "\$_inst_for_repo" != "\$inst" \]\]' "$SRC/cmd_push.sh" | head -1 | cut -d: -f1)
+_a_start=$(grep -n 'if \[\[ -n "\$_inst_for_repo" && "\$_inst_for_repo" != "\$inst" \]\]' "$SRC/cmd_push.sh" | head -1 | cut -d: -f1) || _a_start=""
 _a_end=$(awk -v s="${_a_start:-0}" 'NR>s && /^  fi$/ {print NR; exit}' "$SRC/cmd_push.sh")
-_a_url=$(grep -c 'app/installations/\${inst}/access_tokens' "$SRC/cmd_push.sh")
+_a_url=$(grep -c 'app/installations/\${inst}/access_tokens' "$SRC/cmd_push.sh") || _a_url=0
 if [[ -z "$_a_start" || -z "$_a_end" || "$_a_url" -eq 0 ]]; then
   bad_t "installation: ARM A could not locate its subject (DIVE-2566)" \
         "adoption block ${_a_start:-none}..${_a_end:-none}, mint-URL hits ${_a_url} — the arm graded nothing"
@@ -882,7 +882,7 @@ fi
 # Extracts the mint's failure block and runs it with a real GitHub 404 body, with
 # `fail` stubbed to capture what the operator would actually see. Greping that the
 # body is PARSED cannot tell that apart from a fail() that drops it on the floor.
-_b_start=$(grep -n 'if \[\[ -z "\$tok" \]\]; then' "$SRC/cmd_push.sh" | head -1 | cut -d: -f1)
+_b_start=$(grep -n 'if \[\[ -z "\$tok" \]\]; then' "$SRC/cmd_push.sh" | head -1 | cut -d: -f1) || _b_start=""
 _b_end=$(awk -v s="${_b_start:-0}" 'NR>s && /^  fi$/ {print NR; exit}' "$SRC/cmd_push.sh")
 if [[ -z "$_b_start" || -z "$_b_end" ]]; then
   bad_t "installation: ARM B could not locate its subject (DIVE-2566)" \
