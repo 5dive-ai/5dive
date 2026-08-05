@@ -217,7 +217,10 @@ import sys
 path = pathlib.Path(sys.argv[1])
 old_l, new_l, old_c, new_c = sys.argv[2:]
 pattern = re.compile(
-    rf"(?P<display>(?<![\w'’]){re.escape(old_c)}(?!\w))"
+    # Match the display name before a possessive suffix without consuming that
+    # suffix, but reject every other apostrophe-linked continuation (notably a
+    # sentence-leading contraction such as "Don't").
+    rf"(?P<display>(?<![\w'’]){re.escape(old_c)}(?=(?:['’]s)?(?![\w'’])))"
     rf"|(?P<slug>(?<![\w'’]){re.escape(old_l)}(?![\w'’]))"
 )
 with path.open("r", encoding="utf-8", errors="surrogateescape", newline="") as handle:
