@@ -214,7 +214,14 @@ seed_gate() { # <title> -> ident on stdout; files a real gate through the real n
   printf '%s' "$ident"
 }
 
-for arm in answer withdraw done; do
+# DIVE-2773: the `done` arm was `cmd_task_cancel --result="moot"` over a LIVE gate,
+# and that close is now REFUSED on both verbs — a cancel does not answer a gate, it
+# deletes the question, and it was retiring the human's buttons on the way out
+# (measured on DIVE-2758). So the arm is inverted rather than deleted: over a still-open
+# gate the button must SURVIVE, because the question is still answerable. That is a
+# stronger assertion than the one it replaces, and the retire WIRING it used to cover is
+# still graded three ways below by the answer/withdraw/refile arms.
+for arm in answer withdraw; do
   ident=$(seed_gate "DIVE-2410 wiring arm: $arm")
   if [[ -z "$ident" ]]; then chk "wiring/$arm: seeded a gate" "yes" "no"; continue; fi
   chk "wiring/$arm: the real emitter logged a retirable delivery" "1" \
@@ -223,11 +230,28 @@ for arm in answer withdraw done; do
   case "$arm" in
     answer)   ( cmd_task_answer   "$ident" --value=A ) >/dev/null 2>&1 ;;
     withdraw) ( cmd_task_need     "$ident" --withdraw ) >/dev/null 2>&1 ;;
-    done)     ( cmd_task_cancel   "$ident" --result="moot" ) >/dev/null 2>&1 ;;
   esac
   chk "wiring/$arm: the close path retired the delivered button" \
       "tok-marketing|1234567890|15491" "$(edits)"
 done
+
+# DIVE-2773 (replaces the old `done` arm above): a cancel over a LIVE gate is refused,
+# and the button it used to strip must still be there afterwards. Both halves are
+# asserted — a refusal that left the button retired anyway would pass a bare
+# "did it refuse" check while shipping the exact harm.
+ident=$(seed_gate "DIVE-2773 wiring arm: cancel over a live gate")
+if [[ -z "$ident" ]]; then chk "wiring/cancel-refused: seeded a gate" "yes" "no"; else
+  chk "wiring/cancel-refused: the real emitter logged a retirable delivery" "1" \
+      "$(_task_gate_deliveries "$ident" | grep -c '15491')"
+  reset_edits
+  ( cmd_task_cancel "$ident" --result="moot" ) >/dev/null 2>&1; _c2773_rc=$?
+  chk "wiring/cancel-refused: the cancel is REFUSED over a live gate" "refused" \
+      "$( (( _c2773_rc != 0 )) && echo refused || echo "landed rc=$_c2773_rc" )"
+  chk "wiring/cancel-refused: the human's button SURVIVES (the question is still answerable)" \
+      "" "$(edits)"
+  chk "wiring/cancel-refused: ...and the gate is still pending" "decision/pending" \
+      "$(db "SELECT COALESCE(need_type,'-')||'/'||CASE WHEN need_answered_at IS NULL THEN 'pending' ELSE 'answered' END FROM tasks WHERE ident=$(sqlq "$ident");")"
+fi
 
 # The stub above is load-bearing containment, not decoration: if cmd_send stops
 # being the resume path, this reads 0 and the next reader learns the harness lost

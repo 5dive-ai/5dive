@@ -125,8 +125,20 @@ D=$(seed_closed "D verifier reopens own grade")
 out=$(as main cmd_task_reject "$D" --feedback="I was wrong, reopening"); rc=$?
 (( rc == 0 )) && ok_t "D the grader may reopen their own grade (rc=0)" \
   || bad_t "D grader locked out" "rc=$rc $(cat "$TMP"/err)"
-[[ "$(res_of "$D")" == *"superseded result (DIVE-2067, preserved)"* ]] \
-  && ok_t "D prior result preserved under a superseded marker" || bad_t "D marker missing" "$(res_of "$D")"
+# DIVE-2773: reject no longer hand-rolls this preservation — it routes through
+# `_task_guard_result_over_closed`, the one predicate DIVE-2483 extracted, so the seam it
+# writes on a CLOSED row is that guard's DIVE-2464 marker rather than reject's private
+# DIVE-2067 copy. The MARKER CHANGED and the GUARANTEE DID NOT, so this arm asserts the
+# guarantee first and the marker second: what must never regress is that the prior record
+# survives verbatim. (`task verify`'s closed path still writes the DIVE-2067 marker; a
+# grep for superseded records wants both strings. The reason reject moved is that its
+# private predicate fired only on a `done` row, so on the ordinary delivered-`todo` bounce
+# it preserved nothing at all — see tests/task_close_needs_a_reason_unit.sh arm K.)
+[[ "$(res_of "$D")" == *"I was wrong, reopening"* ]] \
+  && ok_t "D the reject feedback is recorded" || bad_t "D feedback missing" "$(res_of "$D")"
+[[ "$(res_of "$D")" == *"appended by a later close (DIVE-2464)"* ]] \
+  && ok_t "D prior result preserved under the SHARED guard's seam (DIVE-2773: was reject's private DIVE-2067 marker)" \
+  || bad_t "D marker missing" "$(res_of "$D")"
 [[ "$(res_of "$D")" == *"the seal only grades the bundle"* ]] \
   && ok_t "D the ACK's actual TEXT survives, not just a marker" || bad_t "D ACK text lost" "$(res_of "$D")"
 
