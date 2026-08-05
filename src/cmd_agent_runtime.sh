@@ -731,6 +731,14 @@ inject_and_submit() {
   return 1
 }
 
+# rc=1 from inject_and_submit means the payload was typed, but the pane still
+# looked idle after every submit retry. Keep one machine-stable reason for both
+# public receipts: `send` and the scoped `_deliver` path must not disagree about
+# why their success boolean is false (DIVE-2362).
+_agent_submit_unconfirmed_reason() {
+  printf '%s\n' 'pane still shows an unsent paste buffer after retries (large-paste submit race, DIVE-147)'
+}
+
 # _ask_accumulate <transcript-file> — reassemble a scrolling stream from repeated
 # screen snapshots. Reads one snapshot on stdin, folds it into the transcript,
 # prints the whole transcript. DIVE-1901: a full-screen TUI is an alternate-screen
@@ -1167,16 +1175,24 @@ cmd_deliver() {
   if ! wait_agent_input_ready "$target"; then
     step "agent '$target' input prompt not detected after 45s — sending best-effort (may be lost if still booting)"
   fi
-  local _rc=0
+  local _rc=0 _delivered=1 _reason="" _summary=""
   inject_and_submit "$target" "$payload" || _rc=$?
   if (( _rc == 3 )); then
     fail "$E_AUTH_REQUIRED" "$(_agent_credential_refusal_msg "$target")"
   elif (( _rc != 0 )); then
-    step "agent '$target': payload may not have submitted — pane still shows an unsent paste buffer after retries (large-paste submit race, DIVE-147)"
+    _delivered=0
+    _reason="$(_agent_submit_unconfirmed_reason)"
   fi
-  ok "delivered to agent '$target'." \
-     '{name:$n, delivered:true, from:$s, tier:($t|select(length>0))}' \
-     --arg n "$target" --arg s "$s" --arg t "$tier"
+  if (( _delivered )); then
+    _summary="delivered to agent '$target'."
+  else
+    _summary="delivery to agent '$target' is unconfirmed — ${_reason}."
+  fi
+  ok "$_summary" \
+     '({name:$n, delivered:($d=="1"), from:$s}
+       + (if ($t|length) > 0 then {tier:$t} else {} end)
+       + (if ($r|length) > 0 then {reason:$r} else {} end))' \
+     --arg n "$target" --arg s "$s" --arg t "$tier" --arg d "$_delivered" --arg r "$_reason"
 }
 
 # DIVE-1074: privileged inter-agent READ primitive — the read half of `ask` for a
@@ -1788,12 +1804,13 @@ cmd_send() {
     step "agent '$name' input prompt not detected after 45s — sending best-effort (may be lost if still booting)"
   fi
 
-  local _rc=0
+  local _rc=0 _sent=1 _reason="" _summary=""
   inject_and_submit "$name" "$payload" || _rc=$?
   if (( _rc == 3 )); then
     fail "$E_AUTH_REQUIRED" "$(_agent_credential_refusal_msg "$name")"
   elif (( _rc != 0 )); then
-    step "agent '$name': payload may not have submitted — pane still shows an unsent paste buffer after retries (large-paste submit race, DIVE-147)"
+    _sent=0
+    _reason="$(_agent_submit_unconfirmed_reason)"
   fi
 
   # Mirror the outbound into the sender's group chat (best-effort). Gated on a
@@ -1810,9 +1827,20 @@ cmd_send() {
   # key was typed. "unprovable" = this runtime has no prompt marker, so the delivery
   # is an assumption. A scheduler that treats those the same is making the exact
   # mistake this ticket is about.
-  ok "sent to agent '$name'." \
-     '{name:$n, sent:true, bytes:($p|length), woken:($w=="1"), ready:($rd|select(length>0)), from:($s|select(length>0)), msg_id:($i|select(length>0)), reply_to_chat:($rc|select(length>0)), reply_to_msg:($rm|select(length>0))}' \
-     --arg n "$name" --arg p "$payload" --arg s "$sender" --arg i "$msg_id" --arg rc "$reply_to_chat" --arg rm "$reply_to_msg" --arg w "$woken" --arg rd "$AGENT_WAKE_READY"
+  if (( _sent )); then
+    _summary="sent to agent '$name'."
+  else
+    _summary="send to agent '$name' is unconfirmed — ${_reason}."
+  fi
+  ok "$_summary" \
+     '({name:$n, sent:($sent=="1"), bytes:($p|length), woken:($w=="1")}
+       + (if ($rd|length) > 0 then {ready:$rd} else {} end)
+       + (if ($s|length) > 0 then {from:$s} else {} end)
+       + (if ($i|length) > 0 then {msg_id:$i} else {} end)
+       + (if ($rc|length) > 0 then {reply_to_chat:$rc} else {} end)
+       + (if ($rm|length) > 0 then {reply_to_msg:$rm} else {} end)
+       + (if ($reason|length) > 0 then {reason:$reason} else {} end))' \
+     --arg n "$name" --arg p "$payload" --arg s "$sender" --arg i "$msg_id" --arg rc "$reply_to_chat" --arg rm "$reply_to_msg" --arg w "$woken" --arg rd "$AGENT_WAKE_READY" --arg sent "$_sent" --arg reason "$_reason"
 }
 
 # Synchronous send + wait — the inter-agent counterpart to cmd_send. Drops the
