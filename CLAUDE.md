@@ -74,6 +74,21 @@ decision to add one is ever wrong on its own merits. See
   - Calibration time is **not** counted toward the total. `TIER_CAL_BASELINE_US` is
     graded against itself every run and says RE-BASELINE past 25% drift — a runner
     image change is exactly the event that moves it.
+  - **The baseline is a CI number and carries its environment** (DIVE-2736): 119000,
+    the median of six `ubuntu-latest` readings. The 173000 it replaced was measured on
+    the control plane, and the failure that produced was **silent** — every CI probe
+    read as a *fast* runner, the 100% floor clamped all six, and the relative budget
+    stopped existing while still printing a ratio. **A local run now prints
+    RE-BASELINE, and that is correct**; do not re-derive it from the box you are on.
+  - **Two probes, one verdict** (DIVE-2736). A second probe runs *after* the corpus
+    and **grades nothing** — it exists because on one run the probe read 30% fast
+    while the corpus ran 90s slow, and nothing noticed a ratio whose halves moved in
+    opposite directions. `cal_post_delta_pct` is signed; **post slower than pre** is
+    the clean signal, because the corpus warms what the probe pays for and biases the
+    second reading fast, so *agreement* is weak evidence rather than a clearance.
+    `--no-cal-post` skips it. Across runs: `scripts/tier-cal-window.sh <reports…>`
+    (normalises wall-clock to µs/harness first, or deleting a harness reads as
+    anti-correlation).
   - `--no-calibrate` grades against the raw cap (useful with no built bundle). The
     clamp floor is 1.0, so that is the **strictest** this gate gets, never a
     relaxation. `--cal-us=` / `--cal-baseline-us=` / `--cal-cli=` are harness seams;

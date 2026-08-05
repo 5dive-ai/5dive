@@ -114,31 +114,55 @@ TIER_BUDGET_FULL=1320
 # tighter with nobody agreeing to it. The gate is a policy instrument, not an
 # estimator, so it rounds in the direction the policy was set.
 #
-# ALL FOUR CONSTANTS BELOW ARE STARTING VALUES TO BE RE-DERIVED FROM A REAL CI RUN,
-# not findings (DIVE-2710 says so explicitly). TIER_CAL_BASELINE_US in particular was
-# measured on the CONTROL PLANE, not on a GitHub runner — see its own note.
+# THE CLAMP PAIR IS STILL POLICY, NOT MEASUREMENT (DIVE-2710 set them as starting
+# values). TIER_CAL_BASELINE_US is no longer among them: it was re-derived from CI on
+# 2026-08-05 (DIVE-2736) and carries its environment — see its own note.
 TIER_CAL_SCALE_MIN_PCT=100
 TIER_CAL_SCALE_MAX_PCT=150
 
 # TIER_CAL_BASELINE_US — the calibration workload's cost, in MICROSECONDS PER
 # ITERATION, on a runner drawing normal.
 #
-# MEASURED 2026-08-05 ON THE CONTROL PLANE (5dive host, agent-dev3), min of 2
-# auto-sized samples, twice: 173186us/iter (59 iters) and 172907us/iter (54 iters).
-# Two independent runs 0.16% apart, which is the number that says the probe is fit for
-# purpose: its own error has to sit far under the 9% headroom it is protecting, or a
-# relative budget is just a noisier absolute one (trap 1). 173000 is that reading.
+# RE-DERIVED FROM CI 2026-08-05 (DIVE-2736). ENVIRONMENT, because a figure without one
+# cannot be refuted by the next reading (DIVE-2555): GitHub-hosted `ubuntu-latest`,
+# both PR jobs (core/pristine and core/installed-host), six readings across three
+# commits, each the min of 2 auto-sized samples:
 #
-# IT IS NOT A GITHUB-RUNNER NUMBER, and this line says so on purpose — DIVE-2555's
-# whole finding is that a measurement with no environment attached cannot be refuted
-# by the next reading, only silently disagreed with. The first CI run prints its own
-# cal_us_per_iter in the report and will trip the re-baseline warning below if the two
-# environments differ by >= TIER_CAL_REBASELINE_PCT. THAT WARNING FIRING ON THE FIRST
-# CI RUN IS THE MECHANISM WORKING, and the number it prints is what this constant
-# should be re-set to. Until then the clamp bounds the blast radius in both
-# directions: a CI runner slower than this box gets at most 1.5x, and one faster than
-# it gets exactly today's 300s.
-TIER_CAL_BASELINE_US=173000
+#     116662   117714   120693   121231   121382      <- five, within 4%, BOTH job types
+#      82218                                          <- one, ONE job, ONE run
+#
+# 119000 is the MEDIAN OF ALL SIX (119203, rounded down). The median is the estimator
+# on purpose: it lands within 0.5% of the mean of the tight five (119536) WITHOUT
+# anyone having to first win the argument about excluding the sixth. An outlier you
+# have to argue away before you can compute is an outlier your estimator is too fragile
+# to see. The sixth reading is a real event and it has its own row — it is the
+# anti-correlated run this constant's row was filed for — but it is not evidence about
+# where NORMAL sits, and n=1 cannot make it so.
+#
+# WHY THE OLD NUMBER WAS NOT MERELY IMPRECISE, AND THIS IS THE FINDING: 173000 was
+# measured on the CONTROL PLANE, which is ~45% slower per iteration than the runner it
+# was grading. A baseline set too HIGH does not misgrade in some visible direction — it
+# reads every CI probe as a FAST runner, and because the lower clamp is 1.0 by policy, a
+# fast reading can never widen the cap. All six readings came in at 47-70% of baseline;
+# all six clamped to the 100% floor; the effective cap was exactly 300s on every run
+# observed. So a baseline attached to the wrong environment SILENTLY DISABLES the
+# relative mechanism rather than skewing it, and the gate goes on behaving exactly like
+# the absolute one DIVE-2728 replaced, while every log line claims a ratio was applied.
+# A one-directional clamp turns a mis-set baseline into a no-op instead of an error.
+#
+# THE RE-BASELINE WARNING BELOW FIRED ON ALL SIX RUNS (30-53% off), from the first CI
+# run onward. It was right, it was in the log every time, and nothing read it until this
+# row. Recording that here because the instrument working is not the same as the
+# instrument being read, and the second one is the part that has no test.
+# RUNNING THIS LOCALLY NOW TRIPS THE RE-BASELINE WARNING, AND THAT IS CORRECT. The
+# control plane measures ~168900us/iter against this 119000, so a local run prints "41%
+# off". The number is attached to GitHub `ubuntu-latest` on purpose, because that is the
+# environment the gate actually fires in; a warning on your laptop is the constant
+# telling you truthfully that you are not standing in it. DO NOT "fix" it by re-deriving
+# from the box you happen to be on — that is exactly how 173000 got here, and the
+# failure mode is silent (every CI probe then reads fast, the floor clamps, and the
+# relative budget quietly stops existing while still printing a ratio).
+TIER_CAL_BASELINE_US=119000
 
 # How long ONE sample of the probe should run. This is the PRECISION knob from note 1:
 # the probe's own relative error must sit well under the headroom being protected (9%
@@ -156,6 +180,63 @@ TIER_CAL_SAMPLES=2
 # grading it is free: past this drift the run says RE-BASELINE rather than absorbing the
 # drift silently. A GitHub runner image change is precisely the event that moves it.
 TIER_CAL_REBASELINE_PCT=25
+
+# DIVE-2736: A RATIO WHOSE NUMERATOR AND DENOMINATOR CAN MOVE IN OPPOSITE DIRECTIONS IS
+# NOT A RATIO, AND NOTHING NOTICED WHEN THEY DID.
+#
+# MEASURED on core/installed-host, run 30967674559: the probe read 82218us/iter — 30%
+# FASTER than its own cluster — on the run whose corpus came in at 372s against a 282s
+# reading 13 minutes earlier, with ONE FEWER harness. Probe fast, corpus slow, same job,
+# same commit. DIVE-2710's premise ("a uniformly slow VM scales both sides and the ratio
+# cancels") inverted, on the one run that needed the relief: scale_raw 47%, clamped to
+# the floor, no scaling applied, exit 4. A probe that under-reads is strictly WORSE than
+# no probe on a slow run — it cannot widen the cap past the 1.0 floor, and it spends
+# ~20s of job time not helping.
+#
+# TWO CANDIDATE CAUSES, AND THEY HAVE DIFFERENT REMEDIES:
+#
+#   TEMPORAL — the probe is a ~20s point sample taken BEFORE a ~6-minute corpus, and the
+#     runner's draw varies within the job. Remedy: BRACKET the corpus (probe before and
+#     after, scale on the mean or the max), which costs another probe and no new design.
+#   STRUCTURAL (trap 3 above) — the probe's cost mix omits what the corpus actually pays
+#     (sqlite, deeper process trees, I/O under contention), so it is systematically blind
+#     to the dimension that got slow. Remedy: re-shape cal_probe, which is a redesign.
+#
+# THE EVIDENCE FAVOURS TEMPORAL AND SAYS SO OUT LOUD: on that same run the OTHER job's
+# probe (core/pristine, 121231) sat squarely in the cluster with a normal corpus. A
+# structural mix mismatch would under-read on every run in both jobs; five of six agree
+# within 4%. A one-off confined to one job on one run is the shape of transient
+# contention. But a prior is not a measurement, so what ships here is the DISCRIMINATOR,
+# not either remedy: a second probe AFTER the corpus, recorded and reported, never
+# graded on. See scripts/run-harnesses.sh (the post probe) and scripts/tier-cal-window.sh
+# (the across-runs read). What falsifies TEMPORAL: a post probe that AGREES with the pre
+# probe on a run whose corpus was slow.
+#
+# THE DISCRIMINATOR IS ONE-SIDED, and reading it as symmetric would be the mistake here.
+# The corpus warms the page cache and the CLI it just spawned 236 times, so the post
+# probe is biased FAST for a benign reason. POST SLOWER THAN PRE is therefore the clean
+# signal (it survives a confound pushing the other way) and confirms TEMPORAL. POST
+# AGREEING is consistent with structural blindness, with contention that ended, AND with
+# cache warmth masking a real slowdown — it weakens TEMPORAL without establishing trap 3.
+#
+# THE THRESHOLD IS DERIVED, NOT PICKED. The five clustered CI readings span 4%
+# (116662-121382), which is this probe's observed run-to-run spread on this platform.
+# 15% is comfortably outside that and comfortably inside the 30% divergence actually
+# measured, so it can fire on the event and not on the weather.
+TIER_CAL_POST_DIVERGE_PCT=15
+
+# tier_cal_diverge_pct <pre_us> <post_us> -> how far the post-corpus probe moved from
+# the pre-corpus one, in SIGNED percent of the pre reading. POSITIVE means the runner
+# was SLOWER after the corpus than before it (the TEMPORAL signal); negative means
+# faster. Signed on purpose: an absolute value would fold the one clean direction into
+# the confounded one, which is the whole distinction this number exists to carry.
+tier_cal_diverge_pct() {
+  local pre="${1:?tier_cal_diverge_pct <pre_us> <post_us>}" post="${2:?tier_cal_diverge_pct <pre_us> <post_us>}"
+  if (( pre <= 0 )); then
+    printf 'tier_cal_diverge_pct: pre must be > 0, got %s\n' "$pre" >&2; return 2
+  fi
+  printf '%s\n' "$(( (post - pre) * 100 / pre ))"
+}
 
 # tier_cal_scale_pct <measured_us> [<baseline_us>] -> the RAW, UNCLAMPED scale, in
 # percent. Kept separate from the clamp so the runner can tell "slow" (clamped, still
@@ -307,6 +388,7 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
     budget) tier_budget "${2:?budget <core|full>}" ;;
     scale)  tier_cal_scale_pct "${2:?scale <measured_us> [baseline_us]}" "${3:-$TIER_CAL_BASELINE_US}" ;;
     clamp)  tier_cal_clamp_pct "${2:?clamp <raw_pct>}" ;;
-    *) printf 'usage: tier.sh {list core|nightly|full [dir] | of <file> | reason <file> | claim <file> | budget core|full | scale <us> [baseline] | clamp <pct>}\n' >&2; exit 2 ;;
+    diverge) tier_cal_diverge_pct "${2:?diverge <pre_us> <post_us>}" "${3:?diverge <pre_us> <post_us>}" ;;
+    *) printf 'usage: tier.sh {list core|nightly|full [dir] | of <file> | reason <file> | claim <file> | budget core|full | scale <us> [baseline] | clamp <pct> | diverge <pre_us> <post_us>}\n' >&2; exit 2 ;;
   esac
 fi
