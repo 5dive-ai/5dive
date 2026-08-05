@@ -9404,6 +9404,75 @@ _task_human_send_allowed() {
 # (tracked in DIVE-2045) — untested is not the same claim as leak-free.
 # Withholding is announced ONCE per process — a silent fence is the same
 # fail-open shape as no fence (DIVE-1968 assertion 2).
+# DIVE-2799: the evidence form was ALREADY named — in the wrong place.
+#
+# DIVE-2412 named it in `tasks.human_evidence`, which is the right fact in a
+# column that cannot answer the question this row asks. That column is ONE cell on
+# ONE mutable row: a re-answer overwrites it, `_gate_archive_and_clear_sql` clears
+# it when the gate retires, and it is not a history at all — so "grep separates the
+# evidence forms ACROSS HISTORY" (DIVE-2799 acceptance clause 3) is unanswerable
+# from it, for every gate that has since been retired or re-answered. The
+# append-only audit log is the only sink with that property, and it carried the
+# per-form BOOLEANS but never the form's NAME.
+#
+# WHY THE BOOLEANS ARE NOT ALREADY THE ANSWER, which is the substance and not a
+# style preference. A reader asking "which form cleared this?" had to AND together
+# `nonce_valid`/`sudo_nonagent`/`channel_session`/`cs_ok`/`cp_ok` — a DIFFERENT
+# subset at each of the two audit sites, and a subset that has grown over time.
+# That makes the answer PATH-DEPENDENT: a sweep keyed on a field under-counts by
+# exactly the paths that log a different arg set, and a query against a field that
+# did not exist yet returns a confident zero. Both failures happened inside this
+# very row's own measurement (main's five, then olivia's 37-as-a-floor).
+#
+# THIS FUNCTION IS EXTRACTED FROM the DIVE-2412 inline block at the write site,
+# not written beside it. Two vocabularies for one fact is the DIVE-2777 shape this
+# ticket explicitly warns about — a class fixed at the call sites someone happened
+# to be looking at. The token spelling is therefore UNCHANGED and load-bearing:
+# `nonce`, `sudo-uid`, `channel-session`, `channel-chat`, `lead`, `+`-joined in
+# this order, `none` when empty. The column and the log now say the same word for
+# the same thing, so a historical sweep can join them.
+#
+# THE VALUE IS EXACT-MATCHABLE ON PURPOSE. In the JSON audit log each arg is its
+# own array element, so `grep '"evidence=nonce"'` — WITH the closing quote —
+# selects the sole-nonce class and does NOT prefix-match
+# `evidence=nonce+channel-session`. Never reorder the tokens or vary the
+# separator: a historical sweep compares string literals across months of rows.
+#
+# WHAT THIS DOES **NOT** BUY, stated here because the field name invites the
+# stronger reading. It does not separate a relayed human tap from a
+# filer-presented nonce. It cannot: the deployed Telegram plugin's tap sends
+# `--human --human-proof=<nonce>` and nothing else, so the two are byte-identical
+# AT THE INPUT and no CLI-side field can tell them apart. What it buys is that the
+# nonce-only class stops being a reconstruction and becomes a fact the row states
+# about itself — which is what makes the population countable and a floor legible
+# AS a floor.
+_gate_evidence_form() { # <nonce> <sudo_uid> <channel_session> <channel_chat> <lead>
+  local out=""
+  if [[ "${1:-0}" == "1" ]]; then out+="${out:++}nonce"; fi
+  if [[ "${2:-0}" == "1" ]]; then out+="${out:++}sudo-uid"; fi
+  if [[ "${3:-0}" == "1" ]]; then out+="${out:++}channel-session"; fi
+  if [[ "${4:-0}" == "1" ]]; then out+="${out:++}channel-chat"; fi
+  if [[ "${5:-0}" == "1" ]]; then out+="${out:++}lead"; fi
+  printf '%s' "${out:-none}"
+}
+
+# DIVE-2799: the one discriminator that IS available CLI-side — is the caller
+# answering a gate IT filed? `gate_filed_by` is written in the same transaction
+# as the gate, so the filer of record is not the caller's to choose at answer
+# time. `filer_answered=1` does not mean a forge (a legitimate relayed tap runs
+# under the paired agent's own uid and will read 1 too); `filer_answered=0`
+# means the answer came from a DIFFERENT principal than the one holding the
+# minted proof, which is the strictly narrower and more exonerating case. Recorded
+# because it is the only field on this rail that can ever exonerate, and a control
+# that cannot exonerate is as broken as one that cannot convict.
+# Falls back to `unknown` on a pre-DIVE-1958 row with gate_filed_by NULL — never
+# to `0`, which would read as a positive finding it has not measured.
+_gate_filer_answered() { # <task id> <caller os user>
+  local _f; _f=$(db "SELECT COALESCE(gate_filed_by,'') FROM tasks WHERE id=${1};")
+  if [[ -z "$_f" ]]; then printf 'unknown'; return; fi
+  if [[ "${2#agent-}" == "$_f" ]]; then printf '1'; else printf '0'; fi
+}
+
 _TASK_STORE_AUDIT_FENCED=""
 _task_store_audit_log() { # <cmd> <result> <code> -- <args...>
   if _task_human_send_allowed; then
@@ -11030,11 +11099,17 @@ cmd_task_answer() {
     # DIVE-2054: the human-proof/nonce evidence being scored here is stored
     # against $ident in TASKS_DB (not an independent channel/delivery fact like
     # the 3 named exemptions) — fenced.
+    # DIVE-2799: `evidence=` names the form(s) that satisfied the rule; the
+    # per-form booleans stay for continuity of the historical sweeps that
+    # already key on them.
     _task_store_audit_log "task answer gate" "$([[ $_evid -eq 1 ]] && echo ok || echo error)" 0 -- \
       "task=$ident" "type=$nt" "channel_proof=$([[ -n "$channel_proof" ]] && echo present || echo absent)" "cp_ok=$_cp_ok" \
       "channel_msg=${channel_msg:-none}" "cs_ok=$_cs_ok" "cs_origin=${TASK_CS_ORIGIN:-none}" "cs_age=${TASK_CS_AGE:-none}" \
       "human_proof=$([[ -n "$human_proof" ]] && echo present || echo absent)" "nonce_valid=$_hp" \
-      "sudo_nonagent=$_su" "human=$human" "caller=$_caller2" "sudo_uid=${SUDO_UID:-}" \
+      "sudo_nonagent=$_su" "human=$human" \
+      "evidence=$(_gate_evidence_form "$_hp" "$_su" "$_cs_ok" "$_cp_ok" "$_lead_clear")" \
+      "filer_answered=$(_gate_filer_answered "$id" "$_caller2")" \
+      "caller=$_caller2" "sudo_uid=${SUDO_UID:-}" \
       "enforce=$(_gate_proof_enforced && echo on || echo off)"
     # DIVE-525: a real human tap is NEVER rejected — every trusted path supplies
     # at least one evidence form (plugin→nonce, dashboard→proof/SUDO_UID=claude,
@@ -11193,11 +11268,19 @@ cmd_task_answer() {
       local _t2_cs="${_cs_ok:-0}"
       local _t2_caller; _t2_caller=$(_gate_caller_user)
       # DIVE-2054: the nonce being scored is task-store state for $ident — fenced.
+      # DIVE-2799: same canonical `evidence=` field as the site below, so ONE
+      # grep spans both audit sites and the `tasks.human_evidence` column.
+      # `channel-chat` and `lead` are 0 here BY CONSTRUCTION — neither is admitted
+      # at the tier-2 floor (`_cp_ok` is tier-fenced to <2, and a lead-clear is not
+      # human evidence) — and they are passed explicitly rather than omitted so the
+      # arity and token order are identical at both sites.
       _task_store_audit_log "task answer t2-human-evidence" \
         "$([[ $(( _t2_hp || _t2_su || _t2_cs )) -eq 1 ]] && echo ok || echo error)" 0 -- \
         "task=$ident" "type=$nt" "tier=$gtier" "nonce_valid=$_t2_hp" "sudo_nonagent=$_t2_su" \
         "channel_session=$_t2_cs" \
         "human_proof=$([[ -n "$human_proof" ]] && echo present || echo absent)" \
+        "evidence=$(_gate_evidence_form "$_t2_hp" "$_t2_su" "$_t2_cs" 0 0)" \
+        "filer_answered=$(_gate_filer_answered "$id" "$_t2_caller")" \
         "caller=$_t2_caller" "sudo_uid=${SUDO_UID:-}" 2>/dev/null || true
       if (( ! _t2_hp && ! _t2_su && ! _t2_cs )); then
         fail "$E_AUTH_REQUIRED" "$ident is a tier-2 human gate ($nt) and the --human claim is unproven: no valid per-gate proof, no non-agent SUDO_UID and no attested channel citation. Tap the button in Telegram (it carries the proof), cite the human's own message with --channel-msg, or answer from the dashboard. A bare 'sudo 5dive task answer --human' is exactly the forge this refuses."
@@ -11362,12 +11445,34 @@ cmd_task_answer() {
   # _hp/_su are function-scope locals initialized to 0 since DIVE-2406, and the
   # other flags are set only on the paths that raise them — hence the :-0
   # defaults, which are belt-and-braces rather than a guess.
-  local _evform=""
-  [[ "${_hp:-0}" == "1" ]] && _evform="${_evform:+$_evform+}nonce"
-  [[ "${_su:-0}" == "1" ]] && _evform="${_evform:+$_evform+}sudo-uid"
-  [[ "${_cs_ok:-0}" == "1" ]] && _evform="${_evform:+$_evform+}channel-session"
-  [[ "${_cp_ok:-0}" == "1" ]] && _evform="${_evform:+$_evform+}channel-chat"
-  [[ "${_lead_clear:-0}" == "1" ]] && _evform="${_evform:+$_evform+}lead"
+  # DIVE-2799: the five append lines that used to sit here are now
+  # `_gate_evidence_form`, because the SAME string has to reach the append-only
+  # audit log as well and two copies of this vocabulary would drift. The token
+  # spelling and order are unchanged, so this column's values are byte-identical
+  # to what DIVE-2412 shipped — EXCEPT for the tier-2 decision case below, which
+  # they were wrong about.
+  #
+  # THE `_t2_*` OR IS A BUG FIX, NOT DEFENSIVENESS, and it was found by the
+  # harness for this change rather than reasoned out. `_hp`/`_su` are raised ONLY
+  # inside the approval/secret/manual/access evidence block, which does not run
+  # for a `decision` gate. The tier-2 floor computes its OWN `_t2_hp`/`_t2_su` and
+  # never fed them back here. So a tier-2 DECISION gate cleared by a valid nonce
+  # stored `human_evidence='none'` — the form was verified, admitted, and then not
+  # recorded. Measured on this tree: the t2 audit row read `nonce_valid=1` while
+  # the column on the same answer read `none`.
+  #
+  # That is precisely the population DIVE-2799's body flags as separately
+  # unmeasured ("decision-type tier-2 gates ... never reach this audit line"), so
+  # a fix that named the form everywhere EXCEPT there would have reproduced the
+  # ticket at a different address — the DIVE-2777 shape the body warns about.
+  #
+  # SCOPED TO THE RECORD ON PURPOSE: `_hp`/`_su` themselves are left alone because
+  # DIVE-2406 reads them at the provenance stamp, and this change must not move
+  # any authorization or provenance outcome — only what the record SAYS about one.
+  # `${_t2_*:-0}` because those locals exist only when the tier-2 branch ran.
+  local _evform; _evform=$(_gate_evidence_form \
+    "$(( ${_hp:-0} || ${_t2_hp:-0} ))" "$(( ${_su:-0} || ${_t2_su:-0} ))" \
+    "${_cs_ok:-0}" "${_cp_ok:-0}" "${_lead_clear:-0}")
   db "UPDATE tasks SET human_evidence=$(sqlq "${_evform:-none}") WHERE id=${id};"
 
   # DIVE-2099: the authoritative record of a STANDING-authority clear. Emitted
@@ -11426,12 +11531,27 @@ cmd_task_answer() {
   # worse, and the caller has no way to retry a half-applied answer). NEVER logs
   # $value: a secret gate stores nothing, and a decision answer is the human's
   # prose, neither of which belongs in the fleet log.
+  #
+  # DIVE-2799: `evidence=` BELONGS HERE most of all, and putting it only at the
+  # pre-check sites would have missed the population the ticket flags as
+  # separately unmeasured. The approval/secret/manual evidence block does not run
+  # for a `decision` gate at all, so a tier-2 decision clear reaches NEITHER
+  # pre-check row — "decision-type tier-2 gates never reach this audit line" is
+  # written into DIVE-2799's own body as an unmeasured class. This site fires for
+  # EVERY answered gate regardless of type, and per the paragraph above its
+  # presence implies a WRITE rather than a passed check. So this is the row that
+  # makes "grep separates the evidence forms across history" true of the whole
+  # population instead of only the human-gate subset.
+  # `$_evform` is the SAME string written to `tasks.human_evidence` sixty lines
+  # up — deliberately the same variable, not a recomputation, so the column and
+  # the log cannot disagree about one answer.
   local _caller4; _caller4=$(_gate_caller_user)
   _task_store_audit_log "task answer gate" ok 0 -- \
     "task=$ident" "type=$nt" "tier=${gtier:-}" "answered_by=$answered_by" \
     "uid=${_uid:-}" "sig=$([[ -n "$_sig" ]] && echo present || echo absent)" \
     "human=$human" "lead_clear=$_lead_clear" "cp_ok=$_cp_ok" \
     "human_claim=$_human_claim" \
+    "evidence=${_evform:-none}" "filer_answered=$(_gate_filer_answered "$id" "$_caller4")" \
     "caller=$_caller4" "sudo_uid=${SUDO_UID:-}" || true
 
   # DIVE-909: a standalone MANUAL gate answered "done" is the human saying "this
