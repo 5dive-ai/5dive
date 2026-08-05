@@ -1,21 +1,4 @@
 #!/usr/bin/env bash
-# TIER: nightly — 2.0s measured on the control plane (two runs, 1.18s/2.03s; the
-# 2.0s figure is the one with the provenance arms). The core tier came in at
-# 322s against a 318s effective cap on the installed-host job of PR #503 —
-# OVER BUDGET by 4s, confirmed twice (323s then 322s) — and this harness is
-# essentially that overage. Demotion is the THIRD option and has to be argued,
-# so: MERGE-by-subject does not apply (tests/pii_scan_range_unit.sh grades the
-# scanner over a commit range; this grades installation and push refusal across
-# repos — no shared setup to reclaim, and folding them would drop neither file's
-# assertions but would hide two subjects behind one name). RETIRE does not apply
-# to a guard for a class that just fired. What is left is moving the cost, and
-# this is a good candidate for it: it drives real `git push` against local bare
-# remotes, so its cost is process spawns rather than logic, and it guards an
-# INSTALL path that changes rarely. Editing it always runs it regardless of tier
-# (the changed-harnesses job), so the demotion does not make a change to this
-# file unguarded — it only keeps a rarely-changing integration test out of every
-# unrelated PR.
-#
 # DIVE-2788 — the pre-push PII guard reaches repos that are NOT 5dive-ai/5dive.
 #
 # THE MEASURED DEFECT. scripts/install-pii-push-guard.sh called itself
@@ -258,7 +241,16 @@ for d in plain not-a-repo/.work/nested .hidden-wt; do
   git init -q "$FROOT/$d"
   git -C "$FROOT/$d" remote add origin "https://github.com/5dive-ai/fixture-$(basename "$d").git"
 done
-frep="$(bash "$FLEET" --root "$FROOT" 2>&1)"
+# `gh` is STUBBED for these arms, and that is an assertion, not just hygiene.
+# Without a stub, "visibility is UNKNOWN" passes for two different reasons — the
+# tool correctly refusing to guess, or the network merely having failed — and a
+# harness that cannot tell those apart is asserting nothing. It also makes the
+# arm hermetic: a network-priced harness is what swings this corpus's budget
+# (DIVE-2592 measured a 67s swing on one file), and the tier cap is spent in
+# wall-clock.
+STUBBIN="$TMP/stubbin"; mkdir -p "$STUBBIN"
+printf '#!/bin/sh\nexit 1\n' > "$STUBBIN/gh"; chmod +x "$STUBBIN/gh"
+frep="$(PATH="$STUBBIN:$PATH" bash "$FLEET" --root "$FROOT" 2>&1)"
 got="$(sed -n 's/^checkouts found: *//p' <<<"$frep")"
 chk "arm8 enumerator finds all three checkouts (nested + hidden included)" 3 "$got"
 case "$frep" in *"roots walked:"*) ok_t "arm8 the report names the roots it walked" ;;
@@ -267,6 +259,16 @@ case "$frep" in *"POPULATION, NOT A VERDICT"*) ok_t "arm8 the report states it i
   *) fail_t "arm8 the report omits the population caveat" ;; esac
 case "$frep" in *"UNKNOWN"*) ok_t "arm8 unreadable visibility reports UNKNOWN (not private)" ;;
   *) fail_t "arm8 no UNKNOWN row — an unmeasured value was given a value" ;; esac
+
+# POSITIVE CONTROL for the arm above: with a gh that ANSWERS, the report must
+# carry the answer. Without this, "prints UNKNOWN" is equally satisfied by a
+# tool that prints UNKNOWN unconditionally — which would pass the arm while
+# reporting nothing, the failure mode this whole file is about.
+printf '#!/bin/sh\ncase "$*" in *visibility*) echo PUBLIC;; *) exit 1;; esac\n' > "$STUBBIN/gh"
+chmod +x "$STUBBIN/gh"
+frep2="$(PATH="$STUBBIN:$PATH" bash "$FLEET" --root "$FROOT" 2>&1)"
+case "$frep2" in *PUBLIC*) ok_t "arm8 positive control: a gh that ANSWERS is reported (UNKNOWN is not unconditional)" ;;
+  *) fail_t "arm8 visibility is UNKNOWN even when gh answers — the column asserts nothing" ;; esac
 
 echo
 echo "$PASS passed, $FAIL failed"
