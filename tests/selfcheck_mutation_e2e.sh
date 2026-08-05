@@ -37,16 +37,46 @@ command -v sqlite3 >/dev/null 2>&1 || { printf 'skip - sqlite3 absent\n'; exit 0
 
 TMP=$(mktemp -d "${TMPDIR:-/tmp}/sc-mut.XXXXXX") || exit 2
 PASS=0; FAIL=0
-ok_t()   { PASS=$((PASS+1)); printf 'ok   - %s\n' "$1"; }
-fail_t() { FAIL=$((FAIL+1)); printf 'FAIL - %s\n' "$1"; }
+# DIVE-2783: record WHICH rail each arm belonged to, so the end of the run can prove
+# the corpus was exercised. `$FAIL -eq 0` alone cannot: it is equally true of a run
+# that proved six rails and of a run that proved nothing, which is the
+# succeeding-in-appearance shape this whole harness exists to catch — and is exactly
+# how it failed, dying before any arm ran.
+RAILS_SEEN=""
+_rail() { case "$1" in \[*\]*) RAILS_SEEN="$RAILS_SEEN ${1%%]*}]" ;; esac; }
+ok_t()   { PASS=$((PASS+1)); _rail "$1"; printf 'ok   - %s\n' "$1"; }
+fail_t() { FAIL=$((FAIL+1)); _rail "$1"; printf 'FAIL - %s\n' "$1"; }
 
 # A pristine copy of the tree, rebuilt into its own bundle.
 WORK="$TMP/repo"
 mkdir -p "$WORK"
 cp -R "$REPO/src" "$REPO/tests" "$REPO/build.sh" "$WORK/" 2>/dev/null
 cp "$REPO/5dive.sha256" "$WORK/" 2>/dev/null || true
+# DIVE-2783: build.sh has hard-required a resolvable source commit since DIVE-2603
+# (#488) — `git rev-parse --verify 'HEAD^{commit}'` or exit 1. This copy is
+# deliberately NOT a git repo (it is a throwaway precisely so the prover never
+# mutates the tree it grades), so every rebuild() failed and the harness died at the
+# line below before a single arm ran — on BOTH full-sweep shards, main's only red.
+#
+# Give the copy its own one-commit history rather than teaching build.sh to build
+# without one: the identity stamp is the whole point of DIVE-2603, and weakening it
+# to accommodate a test fixture is the tail wagging the dog. Mutations after this
+# point leave the copy dirty, which build.sh stamps `<sha>-dirty` BY DESIGN — that
+# is a stamp, not a refusal, so every later rebuild() still succeeds.
+git -C "$WORK" init -q \
+  && git -C "$WORK" add -A \
+  && git -C "$WORK" -c user.name='harness' -c user.email='harness@example.com' \
+       -c commit.gpgsign=false commit -qm 'throwaway baseline for the mutation prover' -q \
+  || { printf 'FAIL: could not give the pristine copy a git identity (build.sh needs one since DIVE-2603)\n'; exit 1; }
 rebuild() { (cd "$WORK" && bash build.sh >/dev/null 2>&1); }
-rebuild || { printf 'FAIL: could not build the pristine copy\n'; exit 1; }
+# Name the reason. The bare message here cost a full triage cycle: it says the build
+# failed but not why, so a red on a shard nobody can shell into is unattributable and
+# gets guessed at from commit timing instead of read off the error.
+rebuild || {
+  printf 'FAIL: could not build the pristine copy:\n%s\n' \
+    "$( (cd "$WORK" && bash build.sh 2>&1) | tail -5 )"
+  exit 1
+}
 
 # Run one probe against the throwaway bundle, with the probes that read a checkout
 # pointed at the throwaway checkout rather than the live one.
@@ -348,6 +378,20 @@ else
 fi
 SC_ENV=()
 rm -rf "$SC_LC"
+
+# DIVE-2783: prove the corpus RAN. Every rail below is unconditional on every box;
+# audit-nonroot is deliberately absent from the list because it self-skips as root,
+# and a floor that reds on a legitimate skip would be its own false signal.
+#
+# This is the arm that makes the fix gradeable. Restoring the build and leaving the
+# prover silent — an early exit, a copy that builds but produces no bundle, a rail
+# that stops being invoked — passes `$FAIL -eq 0` and fails here.
+for _r in gate-delivery harness-verdicts bundle-integrity scorecard-honesty lead-clear-seal; do
+  case "$RAILS_SEEN" in
+    *"[$_r]"*) ;;
+    *) fail_t "[corpus] rail '$_r' produced NO arm at all — the prover was SILENT on it, which is indistinguishable from a pass on \$FAIL alone" ;;
+  esac
+done
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [[ $FAIL -eq 0 ]]
