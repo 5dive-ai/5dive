@@ -7512,7 +7512,18 @@ cmd_task_need() {
         # Rule 3: a non-appealable class (money / real comms / irreversible infra)
         # is present. Name the surviving term so the refusal is actionable rather
         # than mysterious — the filer can see it is not the word they meant.
-        local _dd_term; _dd_term=$(_gate_tier2_floor_term "$_dd_residual")
+        # DIVE-2012: this read `$_dd_residual`, the JOINED residual DIVE-2224
+        # deleted when it split the strip per field. The variable has not existed
+        # since, so under `set -u` the refusal raised an unbound-variable error and
+        # otherwise printed `matched ''` — every appeal refusal since DIVE-2224 has
+        # named NO term. That is the defect the appeal exists to fix, one layer up:
+        # DIVE-2089's whole promise is that a refusal is LOUD and actionable rather
+        # than mysterious, and a refusal that names nothing is mysterious.
+        # Ask first (it is the subject, per DIVE-2224), then the title, so the term
+        # reported is the one on the field the floor actually decided on.
+        local _dd_term
+        _dd_term=$(_gate_tier2_floor_term "$_dd_res_ask")
+        [[ -n "$_dd_term" ]] || _dd_term=$(_gate_tier2_floor_term "$_dd_res_title")
         warn "--discusses REFUSED: this gate names a non-appealable category (matched '${_dd_term}'). Money, outbound customer comms and irreversible infra/access stay hard-human however they are framed. Staying at tier 2."
       else
         local _dd_reviewer; _dd_reviewer=$(_gate_route_reviewer "$(task_actor "")")   # DIVE-2518: tier-flag only; see note above
@@ -7529,6 +7540,59 @@ cmd_task_need() {
     _task_store_audit_log "task need floor-appeal" \
       "$( ((_discusses_applied)) && echo applied || echo refused )" 0 -- \
       "task=$ident" "filer=$(task_actor "$from")" "declared=$discusses" || true
+  fi
+
+  # DIVE-2012: THE VERIFIER-SCOPING DEAD-END, made visible.
+  #
+  # The shape: the MAKER of a live maker→verifier loop files a `decision` gate
+  # asking the VERIFIER to scope that task's own acceptance criteria — a question
+  # whose only correct answerer is that verifier — and the ask NARRATES the work
+  # under test, so the T2 category floor fires on the narration. Measured on the
+  # ticket's own repro: tier goes to 2, the DIVE-1495 verifier-route below is
+  # guarded on `tier != 2` so it never runs, `routed_reviewer` stays NULL, and the
+  # DIVE-1117 provenance floor then refuses the verifier's answer. Net: the paired
+  # human is pinged for a call that was never theirs AND the designated answerer is
+  # locked out. dev's actual remedy on DIVE-1968 was to message olivia out of band.
+  #
+  # WHY THIS IS A WARNING AND NOT A SIXTH DOWNGRADE CLASS. The ticket asks for an
+  # exemption ("routed decision gates should skip the floor"). Building one means a
+  # sixth vocabulary guesser, and DIVE-2099's design note is explicit that adding
+  # one reproduces this bug with the polarity REVERSED — a false negative there
+  # routes a real money/secret ask to whichever agent happens to be grading the
+  # ticket, which is the exact defect DIVE-2241 had just closed. The appeal
+  # DIVE-2089 shipped is the supported answer and it already lands correctly:
+  # `--discusses` downgrades to tier 1, and because the verifier-route below runs
+  # AFTER every downgrade class, the gate then routes to the VERIFIER rather than
+  # the lead. Measured: tier=1, routed_reviewer=<verifier>, human not pinged.
+  #
+  # So the residual defect is not the tier — it is that the remedy is INVISIBLE at
+  # exactly the moment it is needed. `--discusses` landed after this ticket was
+  # filed, the floor's own warning never mentions it, and nothing tells the filer
+  # that the agent they are trying to reach is one flag away. An undiscoverable
+  # remedy is indistinguishable from no remedy, which is why this ticket exists.
+  #
+  # The trigger is STRUCTURAL, never vocabulary: a live loop (both ends present),
+  # the filer IS the maker, the verifier is someone else, and the type is the one
+  # type an appeal exists for. It changes NO tier and NO route — a floored gate
+  # still reaches the human, and the floor is untouched. It only ensures the filer
+  # is told, on the record, who they were trying to reach and how to reach them.
+  if [[ "$tier_floored" == "1" && "$type" == "decision" && "$_discusses_applied" == "0" \
+        && "$_curation" == "0" && "$_internal_ops" == "0" && "$_needs_human" == "0" \
+        && "$tier_arg" != "2" ]]; then
+    local _vs_filer; _vs_filer=$(task_actor "")
+    local _vs_vf _vs_mk
+    _vs_vf=$(db "SELECT COALESCE(verifier,'') FROM tasks WHERE id=${id};")
+    _vs_mk=$(db "SELECT COALESCE(maker_agent,'') FROM tasks WHERE id=${id};")
+    if [[ -n "$_vs_vf" && -n "$_vs_mk" && "$_vs_vf" != "$_vs_filer" && "$_vs_mk" == "$_vs_filer" ]]; then
+      local _vs_term; _vs_term=$(_gate_tier2_floor_term "$ask")
+      [[ -n "$_vs_term" ]] || _vs_term=$(_gate_tier2_floor_term "$_ft_title")
+      warn "this gate is floored to tier 2 (matched '${_vs_term}'), so it pings the paired human and ${_vs_vf} — the verifier on this task's loop, and the only agent who can answer a question about your own acceptance criteria — CANNOT clear it (tier-2 gates refuse a non-human answer, DIVE-1117). If the term is narration of the work under test rather than something you are asking to DO, re-file with --discusses=\"<why>\": the appeal downgrades the gate to tier 1 and routes it to ${_vs_vf}, not to the human. If you really are asking for that, leave it — the human is the right answerer."
+      # The dead-end this ticket was filed about was invisible in the record: the
+      # gate simply sat there while dev messaged olivia out of band. Audit the
+      # occurrence, not just the advice, so the NEXT instance is countable.
+      _task_store_audit_log "task need verifier-scoping floored" "warned" 0 -- \
+        "task=$ident" "filer=$_vs_filer" "verifier=$_vs_vf" "term=$_vs_term" || true
+    fi
   fi
 
   # DIVE-1359: eng-ship downgrade. A builder cannot file a hard-human (tier-2)
