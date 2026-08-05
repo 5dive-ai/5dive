@@ -22,16 +22,29 @@
 # Arms: no-dep (the bug) / subtasks-but-no-dep / gate-but-no-dep / --json / and
 # the WITH-dep control that was already green (so a fix that hard-codes rc=0
 # without keeping the block is still distinguishable by its text assertion).
-# FOUR instances of the shape, not two. Iteration 1 claimed "exactly one other"
-# and shipped a guard that could only see `[[ ]]` with a braced block; main2 found
-# `(( n_unknown > 0 )) && echo ...` in cmd_usage_budget_check, which failed every
-# HEALTHY heartbeat tick. The count was wrong because the instrument was narrow,
-# so the guard below now finds the last statement STRUCTURALLY and is itself
-# graded against that exact syntax by a positive control.
+#
+# NINE instances of the shape, not two. The count was wrong twice because the
+# instrument was narrower than the class each time, and each miss was found by
+# main2 re-deriving the sweep rather than reading the count:
+#   iteration 1 guard: `[[ ]]` + a braced block -> blind to `(( )) && echo`
+#   iteration 2 guard: the last PHYSICAL line   -> blind to a wrapped `&& printf \`
+# So the guard no longer lives here as a regex. scripts/scan-trailing-conditional.sh
+# joins continuations, walks back from the closing brace, follows a bare `return`
+# to the statement whose $? it inherits, and decides by ELIMINATION rather than by
+# listing printers. It is graded below by a control SET built from shapes that were
+# not yet found when it was written, plus a negative control, because a guard whose
+# only evidence is its own silence is what produced both wrong counts.
 #   cmd_task_show          - the reported bug (rc 1 on any row with no dep edge)
 #   usage_render_board     - bare `5dive usage` on the healthy no-overage path
 #   cmd_usage_budget_check - LIVE CALLER: _hb_budget_sweep, every healthy tick (main2)
 #   wt_task_num            - latent; both call sites assign plainly under set -e
+#   cmd_project_show x2    - the early `return` that inherits $? from
+#                            `(( n > 0 )) && printf` is LIVE (`5dive project show
+#                            <a project with no dependency edge>`); the trailing
+#                            wrapped `[[ ]] && printf \` is LATENT — see below
+#   paperclip_seed_all_from_registry - LIVE: main.sh:738, bare, from update.sh
+#   paperclip_unseed_for_profile     - same shape; caller absorbs with `|| true`
+#   link_agent_profile               - latent at five bare call sites
 # Plus the one unguarded `_gate_tier2_floor_term` assignment.
 #
 # Sources src/ against a throwaway tasks.db (same posture as
@@ -177,28 +190,79 @@ else
   bad_t "_gate_tier2_floor_term missing" "helper was renamed or removed"
 fi
 
-# ---- the structural detector, used by the three sections below ----
-# Defined here because the budget-check arms grade it before the class guard runs.
-cat > "$TMP/detect.awk" <<'AWK'
-/^[a-zA-Z_][a-zA-Z0-9_]*[ \t]*\([ \t]*\)[ \t]*\{/ { fn=$0; sub(/[ \t]*\(.*/,"",fn); inf=1; n=0; next }
-inf && /^\}/ {
-  for (i=n; i>=1; i--) {
-    l=buf[i]; s=l; gsub(/[ \t]/,"",s)
-    if (s=="" || s ~ /^#/ || s=="fi" || s=="done" || s=="esac" || s=="else" || s==";;" || s=="}") continue
-    # Must START a statement, or a jq continuation line and an `&&` inside an
-    # awk program string both read as shell operators. A `||` fallback makes the
-    # compound succeed regardless, so it is not this defect.
-    if (l ~ /^[ \t]*(\[\[|\(\(|\[ |test |grep |declare )/ &&    \
-        l ~ /&&/ && l !~ /\|\|/ &&                              \
-        l ~ /&&[ \t]*[{(]?[ \t]*(echo|printf|cat |indent2)/ &&  \
-        l !~ /return|exit/)
-      print FILENAME":"lno[i]"  "fn
-    break
+# ================= fifth+sixth instance: cmd_project_show (found by main2) ==========
+# The sibling of the command in this row's title. TWO sites in one function, and
+# they are NOT equally live — say which is which, because "both are live" is the
+# same kind of unchecked claim as the wrong counts:
+#   - the EARLY bare `return` inheriting $? from `(( n > 0 )) && printf` is LIVE:
+#     `5dive project show <a project with no dependency edge>` rendered in full
+#     and then printed the identical "exited 1 without reporting a reason" trap.
+#     Measured on the installed CLI before the fix, rc 0 after. Executed below.
+#   - the trailing `[[ -n "$chain" ]] && printf ... \` wrapped onto a continuation
+#     line — the shape that defeated the iteration-2 detector — is LATENT: it is
+#     only reached when edges > 0, and every graph with an edge that I could
+#     construct yields a non-empty critical chain, so the test is true. It is
+#     graded by mutation and by the detector, NOT by execution, and this note is
+#     what makes that gap refutable rather than invisible.
+if source "$SRC/cmd_org.sh" 2>/dev/null && source "$SRC/cmd_project.sh" 2>/dev/null \
+   && declare -F cmd_project_show >/dev/null; then
+  db "INSERT INTO projects (key, prefix, name) VALUES ('empty','EMP','Empty');
+      INSERT INTO projects (key, prefix, name) VALUES ('flat','FLT','Flat');
+      INSERT INTO projects (key, prefix, name) VALUES ('dag','DAG','Dag');"
+  pshow() { # -> PS_OUT / PS_RC
+    PS_OUT=$( JSON_MODE=0; set -euo pipefail; cmd_project_show "$1" 2>&1; echo "__REACHED__" )
+    PS_RC=$?
   }
-  inf=0; next
-}
-inf { n++; buf[n]=$0; lno[n]=FNR }
-AWK
+  # (a) zero tasks: `(( n > 0 ))` is false, so the bare `return` returned 1.
+  pshow empty
+  [[ "$PS_RC" == "0" ]] && ok_t "[project show] zero-task project exits 0 (early bare return)" \
+    || bad_t "[project show] zero-task project exits $PS_RC" "$PS_OUT"
+  [[ "$PS_OUT" == *"__REACHED__"* ]] && ok_t "[project show] script survives the early-return path" \
+    || bad_t "[project show] script died on the early-return path" "$PS_OUT"
+
+  # (b) tasks but no edges: the `(( n > 0 ))` block MUST still print, or `return 0`
+  #     would be satisfied by a function that silently stopped rendering.
+  f1=$(db "INSERT INTO tasks (title, assignee, created_by, project_key, kind, status)
+           VALUES ('flat one','dev','dev','flat','standard','todo');
+           SELECT last_insert_rowid();")
+  pshow flat
+  [[ "$PS_RC" == "0" ]] && ok_t "[project show] no-edge project exits 0" \
+    || bad_t "[project show] no-edge project exits $PS_RC" "$PS_OUT"
+  [[ "$PS_OUT" == *"no task_deps recorded"* ]] \
+    && ok_t "[project show] the no-deps line still renders" \
+    || bad_t "[project show] the no-deps line stopped printing" "$PS_OUT"
+
+  # (c) control — a project WITH an edge reaches the trailing wrapped conditional
+  #     and must both exit 0 and still print the Critical path line.
+  d1=$(db "INSERT INTO tasks (title, assignee, created_by, project_key, kind, status)
+           VALUES ('dag blocker','dev','dev','dag','standard','todo');
+           SELECT last_insert_rowid();")
+  d2=$(db "INSERT INTO tasks (title, assignee, created_by, project_key, kind, status)
+           VALUES ('dag blocked','dev','dev','dag','standard','todo');
+           SELECT last_insert_rowid();")
+  db "INSERT OR IGNORE INTO task_deps (task_id, blocked_by) VALUES (${d2},${d1});"
+  pshow dag
+  [[ "$PS_RC" == "0" ]] && ok_t "[project show] project WITH an edge exits 0 (control)" \
+    || bad_t "[project show] dep project exits $PS_RC" "$PS_OUT"
+  [[ "$PS_OUT" == *"Critical path:"* ]] \
+    && ok_t "[project show] the Critical path line still renders (control)" \
+    || bad_t "[project show] the Critical path line stopped printing" "$PS_OUT"
+else
+  bad_t "[project show] not loadable" "cmd_project.sh did not source, or cmd_project_show is gone"
+fi
+
+# ---- the structural detector ----
+# scripts/scan-trailing-conditional.sh. Exit 0 = clean, 1 = offenders on stdout,
+# 2 = could not scan (never a pass — a scanner that cannot run must not read as
+# silence, which is the failure this whole row is about).
+SCAN="scripts/scan-trailing-conditional.sh"
+scan() { bash "$SCAN" "$@"; }   # rc 1 is a normal "found something" here
+
+if [[ -x "$SCAN" || -r "$SCAN" ]]; then
+  ok_t "detector present ($SCAN)"
+else
+  bad_t "detector missing" "$SCAN is not readable — every arm below would read as clean"
+fi
 
 # ================= third instance: cmd_usage_budget_check (found by main2) ==========
 # Executing it needs the whole usage plan, so grade it through the detector below
@@ -207,20 +271,44 @@ AWK
 # the fix in place it must not. The live-caller consequence is what made this the
 # serious one: _hb_budget_sweep does `out=$(cmd_usage_budget_check) || return 1`,
 # and the test is inverted relative to health, so a HEALTHY tick returned 1.
-mkdir -p "$TMP/mut/lib"; : > "$TMP/mut/lib/empty.sh"
+mkdir -p "$TMP/mut"
 sed '/DIVE-2751 (found by main2 on iteration 1)/,/^  return 0$/d' "$SRC/cmd_usage.sh" > "$TMP/mut/cmd_usage.sh"
 if ! cmp -s "$SRC/cmd_usage.sh" "$TMP/mut/cmd_usage.sh"; then
   ok_t "[budget-check] the mutation applied (fix removed from the copy)"
 else
   bad_t "[budget-check] mutation did NOT apply — the arm below would prove nothing" "sed matched nothing"
 fi
-mut_hit=$(awk -f "$TMP/detect.awk" "$TMP/mut/cmd_usage.sh" "$TMP/mut"/lib/*.sh 2>/dev/null || true)
+mut_hit=$(scan "$TMP/mut/cmd_usage.sh" 2>&1)
 [[ "$mut_hit" == *cmd_usage_budget_check* ]] \
   && ok_t "[budget-check] detector names it once the fix is removed" \
   || bad_t "[budget-check] detector CANNOT see main2's instance" "hit=$mut_hit"
-live_hit=$(awk -f "$TMP/detect.awk" "$SRC/cmd_usage.sh" 2>/dev/null || true)
+live_hit=$(scan "$SRC/cmd_usage.sh" 2>&1)
 [[ "$live_hit" != *cmd_usage_budget_check* ]] \
   && ok_t "[budget-check] fixed in the live tree" || bad_t "[budget-check] still live" "$live_hit"
+
+# Same mutation grade for the two cmd_project_show sites main2 found on iteration
+# 2 — strip each `return 0` from a COPY and the detector must name the function
+# for BOTH reasons (the wrapped trailing conditional, and the bare early return).
+sed -e 's|^    return 0   # DIVE-2751: a BARE.*|    return|' \
+    -e '/# project with zero tasks rendered in full/d' \
+    "$SRC/cmd_project.sh" > "$TMP/mut/cmd_project_a.sh"
+sed '/DIVE-2751: a render that reached the end succeeded/,+1d; /^  return 0   #/d' \
+    "$SRC/cmd_project.sh" > "$TMP/mut/cmd_project_b.sh"
+for pair in "a:bare return inherits this" "b:function rc"; do
+  m="${pair%%:*}"; why="${pair#*:}"
+  if cmp -s "$SRC/cmd_project.sh" "$TMP/mut/cmd_project_$m.sh"; then
+    bad_t "[project show/$m] mutation did NOT apply" "sed matched nothing"
+  else
+    ok_t "[project show/$m] the mutation applied"
+  fi
+  hit=$(scan "$TMP/mut/cmd_project_$m.sh" 2>&1)
+  [[ "$hit" == *cmd_project_show* && "$hit" == *"$why"* ]] \
+    && ok_t "[project show/$m] detector names it as '$why' once the fix is removed" \
+    || bad_t "[project show/$m] detector cannot see it" "hit=$hit"
+done
+live_hit=$(scan "$SRC/cmd_project.sh" 2>&1)
+[[ "$live_hit" != *cmd_project_show* ]] \
+  && ok_t "[project show] fixed in the live tree" || bad_t "[project show] still live" "$live_hit"
 
 # ================= fourth instance: wt_task_num (latent, worktree reclaim) ==========
 # Cheap to execute, so execute it. A non-numeric ident must report "no number" as
@@ -240,48 +328,81 @@ else
 fi
 
 # ================= class guard: no NEW trailing conditional render =================
-# The bug is a shape, not a line, so this guard is what makes the class extinct
-# rather than the three fixes above.
+# The bug is a shape, not a line, so the sweep — not the nine fixes — is what
+# closes the class. What this guard does NOT claim is that the class is extinct:
+# two iterations made exactly that claim in the same change that shipped a blind
+# instrument, so the claim is now the control set below, not a comment.
 #
-# ITERATION 1 SHIPPED A GUARD THAT COULD NOT SEE THE CLASS IT CLAIMED TO CLOSE.
-# It grepped for `[[ ... ]] && { ...echo... }` — a bracket test AND a braced
-# block — so `(( n_unknown > 0 )) && echo ...` was invisible, and that was a live
-# third instance (cmd_usage_budget_check, failing every healthy heartbeat tick).
-# main2 caught it. The lesson is not "add `((` to the regex": enumerating test
-# syntaxes is how the first pattern went wrong. So this finds the last statement
-# STRUCTURALLY — walk back from the function's closing brace, skipping blanks,
-# comments and block closers — and only then asks whether that statement is a
-# conditional with a printing side effect and no `||` fallback.
-#
-# Predicate functions ending in a bare test stay legitimately excluded: the
-# signal is the PRINTING side effect, not the trailing test.
-# Two DELIBERATE survivors, allow-listed by name with the reason, so the guard
-# stays armed for anything new instead of being widened until it is quiet:
-#   _gate_tier2_floor_term — value producer; rc 1 means "named no term". Contract
-#     is intentional and every call site absorbs it (asserted above).
-#   _compose_create_args   — its only caller reads it through a process
-#     substitution (`mapfile -t args < <(...)`), where the rc never reaches
-#     errexit. Fragile but not live; changing its contract is not this row's job.
-offenders=$(awk -f "$TMP/detect.awk" "$SRC"/*.sh "$SRC"/lib/*.sh \
-            | grep -vE '  (_gate_tier2_floor_term|_compose_create_args)$' || true)
-[[ -z "$offenders" ]] && ok_t "no function ends in a trailing conditional render (class guard, structural)" \
-  || bad_t "trailing conditional render is the last statement of a function" "$offenders"
+# The deliberate survivors are named in the script's ALLOWLIST with their reasons
+# (_gate_tier2_floor_term, _compose_create_args, _gate_anon_ok) so the guard stays
+# armed for anything new instead of being widened until it goes quiet.
+offenders=$(scan 2>&1)
+[[ -z "$offenders" ]] && ok_t "no function's rc is supplied by a false-able conditional (class guard)" \
+  || bad_t "a conditional that may be false supplies a function's exit status" "$offenders"
 
-# The guard must be able to SEE the shape that defeated iteration 1. A guard
-# whose only evidence is its own silence is the thing this harness exists to
-# refuse — so hand it that exact syntax and require it to fire.
-mkdir -p "$TMP/canary/lib"
-cat > "$TMP/canary/fixture.sh" <<'CANARY'
-some_render() {
+# ---- the control SET ----
+# The recurring failure is a detector whose only evidence of completeness is its
+# own silence on the instances already known. So it is handed a set built from
+# the shapes that were NOT yet found when each earlier version was written — one
+# fixture per shape, each of which must be named — plus negative controls that
+# must NOT be named, so "widen it until it is quiet" also fails.
+mkdir -p "$TMP/ctl"
+cat > "$TMP/ctl/positive.sh" <<'CTL'
+arith_unbraced() {          # defeated iteration 1: (( )) with no braced block
   local n=0
-  (( n > 0 )) && echo "the unbraced arithmetic form that iteration 1 could not see"
+  (( n > 0 )) && echo "unseen by a [[ ]]-plus-brace pattern"
 }
-CANARY
-: > "$TMP/canary/lib/empty.sh"
-canary=$(awk -f "$TMP/detect.awk" "$TMP/canary"/*.sh "$TMP/canary"/lib/*.sh || true)
-[[ "$canary" == *some_render* ]] \
-  && ok_t "class guard FIRES on the (( )) unbraced form (positive control)" \
-  || bad_t "class guard is blind to the form that defeated iteration 1" "canary=$canary"
+wrapped_printf() {          # defeated iteration 2: the central [[ ]] && printf form,
+  local chain=""            # wrapped, so the last PHYSICAL line is not the statement
+  [[ -n "$chain" ]] && printf 'Critical path: %s (%s)\n' \
+    "$chain" "1"
+}
+early_bare_return() {       # unreachable by any walk-back from the closing brace
+  local n=0
+  if true; then
+    (( n > 0 )) && printf 'nothing to graph\n'
+    return
+  fi
+  printf 'graph\n'
+}
+trailing_loop() {           # a for-loop returns its LAST iteration's status
+  local t p
+  for t in a b c; do
+    p=""
+    [[ -n "$p" ]] && seed_it "$t" "$p"
+  done
+}
+CTL
+cat > "$TMP/ctl/negative.sh" <<'CTL'
+pure_predicate() {          # && lives INSIDE the test — rc IS the contract
+  [[ -n "$1" && "$1" == "$2" ]]
+}
+test_consequent() {         # consequent is only another test, so still a predicate
+  [ -r "$1" ] && [ -s "$1" ]
+}
+has_fallback() {            # a || fallback makes the compound always succeed
+  [[ -n "$1" ]] && printf '%s\n' "$1" || printf 'none\n'
+}
+pipeline_tail() {           # rc comes from the pipe's tail, not the conditional
+  { [[ -n "$1" ]] && printf '%s\n' "$1"; printf 'x\n'; } | cat
+}
+states_its_status() {       # the status is stated explicitly on the line
+  [[ -n "$1" ]] && printf '%s\n' "$1"; return 0
+}
+CTL
+pos=$(scan "$TMP/ctl/positive.sh" 2>&1)
+for shape in arith_unbraced wrapped_printf early_bare_return trailing_loop; do
+  [[ "$pos" == *"$shape"* ]] && ok_t "detector FIRES on $shape (positive control)" \
+    || bad_t "detector is BLIND to $shape" "$pos"
+done
+neg=$(scan "$TMP/ctl/negative.sh" 2>&1)
+[[ -z "$neg" ]] && ok_t "detector stays silent on all five predicate/absorbed shapes (negative control)" \
+  || bad_t "detector fires on a legitimate contract — it would be widened-then-muted" "$neg"
+
+# A scanner that cannot run must not read as clean: exit 2, never 0.
+unreadable=$(scan "$TMP/ctl/does-not-exist.sh" 2>/dev/null; echo "rc=$?")
+[[ "$unreadable" == *"rc=2"* ]] && ok_t "unscannable input exits 2, not 0 (silence is not a pass)" \
+  || bad_t "scanner reported clean on input it could not read" "$unreadable"
 
 printf '\n%s passed, %s failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]

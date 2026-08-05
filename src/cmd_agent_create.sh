@@ -793,6 +793,9 @@ link_agent_profile() {
   # this lib is also sourced in contexts without cmd_auth.sh.
   declare -F normalize_profile_seed_perms >/dev/null 2>&1 \
     && normalize_profile_seed_perms "$profile"
+  return 0   # DIVE-2751: the guard above is the point — in a context WITHOUT
+             # cmd_auth.sh the declare fails, and as the last statement that
+             # false test became this function's rc at five bare call sites.
 }
 
 # Write a BYO (bring-your-own) API-key credential for hermes/openclaw into
