@@ -2877,9 +2877,11 @@ _task_status_cmd() {
     #
     # DO NOT go looking for cleared delivery columns; there are none, and a
     # reading of this rail that expects them is wrong at the schema level.
-    # `delivered_at` and `delivery_ref` have exactly ONE writer — cmd_task_deliver,
-    # the `task deliver --pr=` flow — so on a loop delivered by `task done` they
-    # are NULL and always were. `handoff_ack_at` is set to NULL by
+    # A maker→verifier handoff returns before the merge-gate, so on a loop
+    # delivered by `task done` these columns are NULL and always were. The two
+    # writers — explicit `task deliver --pr=` and DIVE-2316's later merge-gate
+    # discovery write — are both unreachable on this early-return path.
+    # `handoff_ack_at` is set to NULL by
     # _task_route_to_verifier as PART of delivering. All three are therefore NULL
     # *while the row is legitimately delivered*, which is why observing them NULL
     # after a stray `task start` says nothing about that start. T6 of the harness
@@ -3630,6 +3632,32 @@ _task_status_cmd() {
       [[ $_sc_ok -eq $_sc_total && $_sc_total -gt 0 ]] && _scan_ran=1
       [[ -n "$_auto_hit" ]] && _scan_ran=1
     fi
+    # DIVE-2316: the mandatory gate already resolved a concrete PR in a concrete
+    # repo. Persist that identity before refusing the premature close, so the
+    # next invocation takes the declared, fail-closed path instead of throwing
+    # the discovery away and starting from an unbound row again. This is also
+    # provenance: the compliant "PR open -> refused -> merge -> close" sequence
+    # must not leave a weaker record than a post-hoc `task deliver --pr=` repair.
+    #
+    # Never overwrite a concurrently supplied binding. The initial read above
+    # was empty, but a `task deliver` can race this network scan; the WHERE keeps
+    # its explicit pointer authoritative. Stamp the current loop iteration for
+    # the DIVE-2682 stale-binding guard, even though ordinary non-loop rows use 0.
+    if [[ -n "$_auto_hit" && -n "$_sc_hit_slug" ]]; then
+      local _auto_ref _stored_ref
+      _auto_ref="https://github.com/${_sc_hit_slug}/pull/${_auto_hit}"
+      db "UPDATE tasks
+            SET delivery_ref=$(sqlq "$_auto_ref"),
+                delivered_at=datetime('now'),
+                delivery_ref_iteration=COALESCE(iteration,0)
+          WHERE id=${id} AND COALESCE(delivery_ref,'')='';"
+      _stored_ref=$(db "SELECT COALESCE(delivery_ref,'') FROM tasks WHERE id=${id};")
+      if [[ "$_stored_ref" == "$_auto_ref" ]]; then
+        warn "$ident: auto-detected delivery PR $_auto_ref from its title/head branch and persisted the binding (DIVE-2316)."
+      else
+        warn "$ident: auto-detected delivery PR $_auto_ref, but preserved the concurrently recorded binding $_stored_ref (DIVE-2316)."
+      fi
+    fi
     # DIVE-1935: SAY SO when the scan could not run. A fail-open gate that returns
     # "no hit" for a gh outage and "no hit" for a clean repo is indistinguishable
     # from a working one — the same succeeding-in-appearance shape DIVE-1922 was
@@ -4257,8 +4285,10 @@ _task_route_to_verifier() {
   # moments is what would false-REFUSE the well-behaved maker who re-points the
   # binding and delivers in one breath.
   #
-  # Only cmd_task_deliver passes 1: it is the sole writer of delivery_ref, so it
-  # is the only caller that just (re)pointed the binding. A plain `task done`
+  # Only cmd_task_deliver passes 1: it is the only caller of THIS helper that
+  # just (re)pointed the binding. DIVE-2316's merge-gate discovery write is a
+  # separate writer on the non-loop close path and never calls this helper.
+  # A plain `task done`
   # re-delivery passes 0 and deliberately leaves the stamp behind at its old
   # iteration — that gap IS the signal the gate reads.
   local set_binding_iter=""
