@@ -2308,6 +2308,27 @@ ship_ledger_record() {
 # never prevent the refusal: if the write fails the action is still refused,
 # because a policy that stops working when its telemetry breaks is a worse
 # failure than a missing row.
+# OSS-37: the ONE definition of a spent maker→verifier loop, as a SQL predicate over
+# `tasks`. A loop is "stuck" once it has a cap, has reached it, and still isn't closed.
+#
+# It lives here, not in cmd_task.sh, because it has two callers in different command
+# files — `loop board --stuck` / `--escalate-stuck` and the objective planner's injected
+# context — and a predicate held as a local shell var in one of them can only be REUSED
+# by re-typing it. Re-typing buys does-not-currently-drift; a shared definition is what
+# buys cannot-drift, and the difference is invisible on the day you write it. This
+# codebase already paid for that lesson once (DIVE-1963, `_gate_bind_slug` in
+# cmd_push.sh: "they agreed, but that is parallel derivation").
+#
+# Callers must NOT re-type it or "simplify" it at the call site — the second copy that
+# omits a clause because the local WHERE already covers it is exactly the copy that
+# stops matching when this one changes. `tests/objective_replan_unit.sh` fails if either
+# call site inlines the predicate instead of calling this.
+_task_stuck_loop_pred() {
+  printf '%s' "(verifier IS NOT NULL AND max_iterations IS NOT NULL
+                AND COALESCE(iteration,0) >= max_iterations
+                AND status NOT IN ('done','cancelled'))"
+}
+
 policy_refuse() {
   local code="$1" policy="$2" ticket="$3" ident="$4"; shift 4
   local msg="$*" actor
