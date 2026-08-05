@@ -9793,11 +9793,15 @@ cmd_task_clear_recs() {
 # answer ADVANCES but carries a trigger word later on, so the caller can say so.
 _LOOP_BOUNCE_STEMS='reject|rejects|rejected|rejecting|deny|denies|denied|denying|decline|declines|declined|declining|better'
 _loop_answer_is_bounce() {
-  local _v="${1:-}" _first=""
+  local _v="${1:-}" _first="" _seg=""
   _LOOP_BOUNCE_AMBIGUOUS=0
   _first=$(printf '%s' "$_v" | grep -m1 -v '^[[:space:]]*$' || true)
   _first="${_first#"${_first%%[![:space:]]*}"}"
-  if printf '%s' "$_first" | grep -qE "^(${_LOOP_BOUNCE_STEMS})\b"; then
+  # THE DECISION SEGMENT: the first non-blank line, cut at the first em-dash,
+  # colon, semicolon, comma or sentence stop. Everything after that is the
+  # REASONING, and the reasoning is where the false positives live.
+  _seg="${_first%%[—:;,.]*}"
+  if printf '%s' "$_seg" | grep -qE "\b(${_LOOP_BOUNCE_STEMS})\b"; then
     return 0
   fi
   # Advancing — but say so when the vocabulary appears anywhere, rather than

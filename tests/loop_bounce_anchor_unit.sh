@@ -47,7 +47,7 @@ bounce() {
 
 echo "== A. real BOUNCES still bounce (the guard must not go vacuous) =="
 for v in "denied" "reject — the error path is untested" "Rejected: needs a rebase first" \
-         "deny" "declined, see feedback" "better: rework the guard first" "DENIED"; do
+         "deny" "declined, see feedback" "better: rework the guard first" "DENIED" "Do better" "Do better ↩"; do
   r=$(bounce "$v")
   [ "$r" = "BOUNCE" ] && ok "A: '${v:0:34}' -> BOUNCE" || no "A: '${v:0:34}' should BOUNCE" "got $r"
 done
@@ -100,6 +100,21 @@ r=$(bounce "")
 [ "$r" = "ADVANCE" ] && ok "E3 an empty answer does not crash and does not bounce" || no "E3 empty answer" "got $r"
 r=$(bounce "$(printf '\n \n')")
 [ "$r" = "ADVANCE" ] && ok "E4 an all-blank answer survives grep rc=1 under pipefail" || no "E4 all-blank answer" "got $r"
+
+echo "== G. THE RULE'S KNOWN LIMIT, graded rather than glossed =="
+# The decision segment is the first non-blank line up to the first dash/colon/
+# comma/stop. A decision word placed AFTER that separator reads as reasoning, so
+# "needs work — reject" ADVANCES. That is a real limit and it is the deliberate
+# failure direction: it does not silently misread, it advances AND says so, which
+# is the safe polarity here (a wrong bounce reopens finished work; a wrong advance
+# is caught by the verifier still holding the row). Graded so the boundary moves
+# only on purpose.
+r=$(bounce "needs work — reject")
+[ "$r" = "ADVANCE+AMBIG" ] \
+  && ok "G1 a decision word AFTER the separator advances WITH the advisory (known limit, not silent)" \
+  || no "G1 known limit" "got $r"
+r=$(bounce "approve")
+[ "$r" = "ADVANCE" ] && ok "G2 ...and the advisory is not simply always-on" || no "G2 advisory not always-on" "got $r"
 
 echo "== F. NON-VACUITY: the old matcher must FAIL section B =="
 # Without this, every arm above is satisfied by a function that always returns
