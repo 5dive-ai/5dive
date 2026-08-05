@@ -2480,9 +2480,36 @@ _task_guard_result_over_closed() {
   _TASK_GUARDED_RESULT="$result"
   local _cl_st _cl_prev
   _cl_st=$(db "SELECT COALESCE(status,'') FROM tasks WHERE id=${id};")
+  _cl_prev=$(db "SELECT COALESCE(result,'') FROM tasks WHERE id=${id};")
+  # DIVE-2483: THE KEY IS THE COLUMN, NOT THE ROW STATE. Both reads now happen
+  # unconditionally, and the gate below is "bytes are about to be lost" — the
+  # thing this guard is actually for. Keyed on closed-ness it missed the cell the
+  # maker→verifier rail MANUFACTURES on every loop: a delivered row is OPEN and
+  # already carries the maker's record, so the guard protected the rare cell and
+  # skipped the routine one. Three verbs hit that cell (done, deliver, verify) and
+  # each was found separately, which is what a status key buys you.
+  #
+  # Nothing recorded, or nothing changing -> no bytes at risk, and in particular a
+  # bare repeat close (no --result at all) never reaches here because the callers
+  # only consult the guard when a result was actually passed.
+  if [[ -z "$_cl_prev" || "$_cl_prev" == "$result" ]]; then
+    _TASK_GUARDED_RESULT="$result"; return 0
+  fi
+
+  # DIVE-2483, and this one is unconditional on purpose: an EMPTY --result= over a
+  # non-empty column is refused at EVERY status and under EVERY flag, --force-result
+  # included. There is no legitimate reason to blank a result, and the value arrives
+  # from ordinary shell accidents rather than from a decision — an unset variable, a
+  # killed heredoc, a truncated arg. It is also the least visible loss available: a
+  # zero-length result renders as a blank field, indistinguishable from "nobody ever
+  # wrote one", so unlike a replacement with real text it leaves nothing for a reader
+  # to notice. That is why it does not get the escape hatch the lossy path gets.
+  if [[ -z "$result" ]]; then
+    policy_refuse "$E_CONFLICT" result-blanked DIVE-2483 "$ident" \
+      "$ident carries a result and '5dive task ${verb} --result=' was given an EMPTY value — that would blank the record, and the ledger keeps only a sha256 of it, so it could not be restored (DIVE-2483). This is refused at every status and under every flag (including --force-result): a zero-length result is indistinguishable from one that was never written, so nobody would ever notice the loss. Almost always this is a shell accident rather than an intent — an unset variable, a killed heredoc, a truncated argument. Check the value you passed. If you genuinely mean to REPLACE the text, pass the replacement; if you mean to ADD to it, that is the default on an open row and '--append-result' on a closed one."
+  fi
+
   if [[ "$_cl_st" == "done" || "$_cl_st" == "cancelled" ]]; then
-    _cl_prev=$(db "SELECT COALESCE(result,'') FROM tasks WHERE id=${id};")
-    if [[ -n "$_cl_prev" && "$_cl_prev" != "$result" ]]; then
       if (( append_result )); then
         # Prior text FIRST and untouched: the existing record is the one that
         # must survive verbatim, and the addition is what is new.
@@ -2503,6 +2530,36 @@ _task_guard_result_over_closed() {
         policy_refuse "$E_CONFLICT" "$policy" DIVE-2464 "$ident" \
           "$ident is ALREADY ${_cl_st} (closed ${_cl_at}; assignee '${_cl_asg}'${_cl_vf:+, verifier '${_cl_vf}'}${_cl_mk:+, maker '${_cl_mk}'}) and carries a result — a bare '5dive task ${verb} --result=' here would REPLACE that record with no warning, and the ledger keeps only a sha256 of it, so it could not be restored (DIVE-2464). Run '5dive trace $ident' to see who wrote it. If you are ADDING your half of the work, say so: '5dive task ${verb} $ident --append-result --result=<your text>' (keeps theirs verbatim, adds yours under it). Only if the recorded text is genuinely WRONG: '--force-result' (replaces it, audited with the overwritten text)."
       fi
+  else
+    # DIVE-2483: OPEN row already carrying someone's result. AUTO-APPEND — the
+    # decision on the row (olivia, 2026-08-04), and it is not the same answer as
+    # the closed cell above on purpose.
+    #
+    # Refusing here instead would have been the "uniform" choice and it WEDGES the
+    # rail: `task reject` writes the VERIFIER'S feedback into `result` (see the
+    # UPDATE in _task_reject_cmd), so after any rejection the row is open and
+    # carries someone else's non-empty text — and the maker's next
+    # `task done --result=` at iteration 2 is exactly this cell. Uniform refusal
+    # would turn the second iteration of every graded task into a refusal, which
+    # trains people to reach for --force-result. Appending cannot wedge anything.
+    #
+    # It also removes the DIVE-2717 class rather than patching it: --append-result
+    # was PARSED, accepted and silently INERT here, because the remedy lived inside
+    # the closed-row branch. A flag that no-ops in the situation its help text
+    # describes is worse than an absent one — an operator reaches for it precisely
+    # when they perceive the risk, and a clean OK is affirmative evidence that the
+    # protection ran. Making preservation the DEFAULT means the protection no
+    # longer depends on remembering a flag whose habit only forms where it works.
+    # (--append-result is therefore a no-op here, not an error: it asks for what
+    # already happens.)
+    if (( force_result )); then
+      # Same lossy escape as the closed cell, same audit obligation: the
+      # overwritten TEXT, not just its hash.
+      _task_store_audit_log "task.force-result-over-open" ok 0 -- \
+        "$ident" "open_status=$_cl_st" "overwritten_result=$_cl_prev"
+      warn "$ident: --force-result REPLACED a result this OPEN row already carried. The overwritten text is in the audit log (task.force-result-over-open); the board copy is gone (DIVE-2483)."
+    else
+      result="${_cl_prev}"$'\n\n'"--- appended by a later write (DIVE-2483); the text above was already on the row ---"$'\n'"${result}"
     fi
   fi
   _TASK_GUARDED_RESULT="$result"
@@ -4703,6 +4760,35 @@ cmd_task_verify() {
   else
     verdict="fail"
     result_txt="❌ verify FAIL (exit ${rc}): ${cmd}"$'\n'"--- output tail ---"$'\n'"${tail_out}"
+  fi
+
+  # DIVE-2483: `task verify` is the THIRD writer of this column and the only one
+  # that reached the OPEN cell completely unguarded. DIVE-2067 added preservation
+  # here, but inside `if [[ "$_v_st" == 'done' ]]` — so every not-done write below
+  # (the pending-gate refusal, the auth-failure exit, the done-flip, and the FAIL
+  # branch) put result_txt straight over whatever was there.
+  #
+  # A DELIVERED row is not done, which is what makes this live rather than
+  # theoretical: it is the cell a maker→verifier loop is in for its whole life.
+  # Measured on DIVE-2624 — dev's maker-delivery record was replaced by
+  # "✅ verify PASS (exit 0): bash /tmp/.../prove_2624.sh" and was gone from the
+  # board. That path is not an accident either: the DIVE-2318 merge-gate refuses a
+  # `task done` with no gh credential and suggests handing the close to an agent
+  # that holds one, DIVE-477 forbids that, and the refusal at :2707 then NAMES
+  # `task verify --cmd=` among its exits — so a no-gh verifier is ROUTED here by
+  # construction. The verb that a whole class of agents is funnelled into is the
+  # last one that should be the unguarded one.
+  #
+  # Deliberately scoped to the NOT-done cell: the closed cell already has
+  # DIVE-2067's own refusal and its "superseded result (DIVE-2067, preserved)"
+  # append below, and running both would append twice. This is keyed on status at
+  # the CALL SITE — which is fine and is not the defect this ticket is about — to
+  # avoid two preservation mechanisms overlapping on one write.
+  local _v_guard_st
+  _v_guard_st=$(db "SELECT COALESCE(status,'') FROM tasks WHERE id=${id};")
+  if [[ "$_v_guard_st" != "done" && "$_v_guard_st" != "cancelled" ]]; then
+    _task_guard_result_over_closed "$id" "$ident" verify "$result_txt" 0 0 verify-result-over-open
+    result_txt="$_TASK_GUARDED_RESULT"
   fi
 
   local flipped=0 self_verified_close=0

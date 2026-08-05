@@ -137,10 +137,19 @@ out=$( cmd_task_done "$id" --result="$MINE" 2>&1 ); rc=$?
 res=$(db "SELECT COALESCE(result,'') FROM tasks WHERE id=$id;")
 [ "$rc" -eq 0 ] && [ "$res" = "$MINE" ] && ok "D3 a done row with an EMPTY result accepts one (nothing to destroy)" || no "D3 empty prior result" "rc=$rc res=$res $out"
 
+# D4 CHANGED BY DIVE-2483, and the old assertion is worth recording because it is
+# the defect written down as expected behaviour: it seeded an open row ALREADY
+# CARRYING "notes so far", closed it with a different --result, and asserted the
+# column now equals the new text EXACTLY — i.e. it pinned the silent wipe. An open
+# row carrying someone's result is the cell the maker→verifier rail manufactures on
+# every loop, so this arm was green throughout the defect's entire life. It still
+# must not REFUSE (that would wedge the rail); it must PRESERVE.
 id=$(seed in_progress "notes so far")
 out=$( cmd_task_done "$id" --result="$MINE" 2>&1 ); rc=$?
 res=$(db "SELECT COALESCE(result,'') FROM tasks WHERE id=$id;")
-[ "$rc" -eq 0 ] && [ "$res" = "$MINE" ] && ok "D4 a FIRST close of an open row is untouched by the guard" || no "D4 first close of open row" "rc=$rc res=$res $out"
+[ "$rc" -eq 0 ] && [ "${res#notes so far}" != "$res" ] && [ "${res%"$MINE"}" != "$res" ] \
+  && ok "D4 an open row carrying a result AUTO-APPENDS: prior text kept, new text under it (DIVE-2483)" \
+  || no "D4 open row auto-append" "rc=$rc res=$res $out"
 
 # --- E. cancel writes the same column, so it is guarded the same --------------
 id=$(seed done "$THEIRS")
