@@ -1742,7 +1742,309 @@ _gate_gh_bot_ok() {
 # it stopped being a correct one the moment a second rail existed.
 _gate_gh_reachable() {
   [[ -n "${1:-}" ]] && return 0
+  _gate_gh_bot_ok && return 0
+  # DIVE-2770: a third way to ASK — see the anonymous rail below.
+  _gate_anon_ok
+}
+
+# _gate_gh_credentialed <tok> — 0 when the caller HOLDS a rail of its OWN (a token,
+# or the `_gh_do` grant), as opposed to only the anonymous one.
+#
+# DIVE-2770: `_gate_gh_reachable` is now true for a caller holding nothing, because
+# the anon rail can answer for a PUBLIC repo. That is the fix — and it makes the two
+# states downstream diverge. "A credential resolved and the query came back empty"
+# and "there was never a credential, and the credential-free rail could not see this
+# repo either" have DIFFERENT remedies, and a refusal that prints the first sentence
+# for the second case is the exact DIVE-2318 defect this ticket inherited, one
+# refusal further down: measured here on a private-repo close, which landed on
+# `done-pr-state-unresolved` saying "a gh credential resolved" to a seat that has
+# never held one. Reachability decides whether to ASK; this decides what an empty
+# answer MEANS.
+_gate_gh_credentialed() {
+  [[ -n "${1:-}" ]] && return 0
   _gate_gh_bot_ok
+}
+
+# DIVE-2770: ONE refusal string, TWO sites. The EARLY site fires when no rail of any
+# kind exists (no token, no bot grant, and no curl/jq to read anonymously with). The
+# LATE site fires when the anonymous rail was the only one and it could not see this
+# repo — a private repo, which is the ordinary case. Same epistemic state and the same
+# remedy, so the same words, emitted from one place: two copies of a refusal this long
+# drift, and then they disagree about which remedies a verifier seat can reach, which
+# is the failure this ticket is about.
+_gate_refuse_no_rail() {
+  local ident="$1" subject="$2"
+  # DIVE-2770: name WHICH way the credential-free rail failed. Rate-limited clears
+  # by itself; a private repo never will. One sentence, and it decides whether the
+  # reader waits or reaches for `task verify`.
+  local _why; _why="$(_gate_anon_why)"
+  policy_refuse "$E_CONFLICT" done-merge-gate-no-credential DIVE-2318 "$ident" "$ident cannot close: the merge gate COULD NOT CHECK whether ${subject} landed — no gh credential resolved in this caller's environment, the machine-account rail is unreachable, AND the credential-free rail could not answer either (DIVE-2770: an unauthenticated read of a public repo). No query ran at all. ${_why} This says NOTHING about the merge; do not read it as 'not merged'. WHICH OF TWO CAUSES THIS IS decides what you should do, and the gate cannot tell them apart from here. (a) BY FAULT: a builder that should hold the \`_gh_do\` grant is missing it — a provisioning problem with a name. Check it with \`5dive gh whoami\`; if the bot line is UNRESOLVED and you are a builder, that is the thing to fix (\`agent create --can-push\`), or re-run with a token (\`GH_TOKEN=\$(sudo -u claude gh auth token) 5dive task done $ident ...\`). (b) BY DESIGN: on a VERIFIER seat an UNRESOLVED bot line is the CORRECT state — \`_gh_do\` is the can-push grant a grader must not hold, so no credential is coming, and handing the close to agent-main is not open to you either when the DIVE-477 writer-is-not-grader rail names YOU as the verifier of record. In case (b) the authorised terminal move is \`5dive task verify $ident --cmd=<script>\`, where the script'\''s EXIT STATUS proves the merge rather than asserting it — e.g. \`git ls-remote <repo-url> refs/heads/main | grep -q <merge-sha> && git fetch -q origin main && git grep -q <a-symbol-the-PR-added> origin/main -- <path>\`. That answers this gate'\''s question by another instrument instead of bypassing it, and it is squash-proof where a sha comparison is not. \`--force-merge-gate\` does NOT reach this refusal: it escapes a gate that RAN and disagreed, never one that asked nothing. Copy your verdict into the BODY before you close (\`task set-body --append\`) — \`task verify\` OVERWRITES result, and a closed body is frozen. \`task merge-audit --limit=1\` reports the same missing credential."
+}
+
+# DIVE-2770: THE ANONYMOUS RAIL — the gate's own question has a credential-free
+# answer, and demanding a credential for it deadlocked a MERGED row.
+#
+# ORIGIN, measured (DIVE-2449 / PR #483, squash 0396d920). The DIVE-477 rail
+# requires a close come from the VERIFIER OF RECORD. That seat holds no gh
+# credential BY DESIGN — `_gh_do` is the can-push grant a grader must not hold —
+# so `_gate_gh_reachable` was false and the close refused. The one agent permitted
+# to close could not see the evidence; the one who could see it was barred from
+# closing. Neither was misconfigured. The two rails enclosed each other, and the
+# refusal printed two remedies (`5dive gh whoami`, "hand it to agent-main") that
+# the caller the rail requires cannot reach.
+#
+# THE DEFECT IS THE PREMISE, NOT THE PLUMBING. "Did pull/483 land?" is answerable
+# ANONYMOUSLY on a public repo: `GET /repos/O/R/pulls/N` needs no token, and
+# `git ls-remote` reads refs without one. The gate was asking a public question
+# through a private door. This rail asks it through the public one, and it is
+# tried LAST — after the caller's token and after the bot rail — so no close that
+# resolves a credential today changes path at all. The rail can only ever ADD an
+# answer where there was none.
+#
+# WHY THIS IS NOT A WIDENING, which is the objection to answer first. It grants
+# nobody anything: an unauthenticated read of a public repo is available to the
+# whole internet, and it is READ-ONLY by construction (a curl GET with no
+# credential to escalate with). On a PRIVATE repo it 404s and the close lands on
+# exactly the refusal it lands on today. This is the fix DIVE-2770 asked for in
+# preference to granting verifier seats `_gh_do`, which would trade a bookkeeping
+# problem for a security regression.
+#
+# SQUASH IS THE SECOND BUG WEARING THE FIRST ONE'S CLOTHES, and it lives in the
+# reshape below rather than in a separate branch. REST reports a squash-merged PR
+# as `state: "closed"`; gh's `--json state` reports `"MERGED"`. Copying `.state`
+# across would render every merged PR as CLOSED and false-refuse
+# `done-before-pr-merged` on precisely the population this rail exists to unblock.
+# So gh's state is DERIVED from `.merged`, never copied — and `merged` is a fact a
+# squash does not disturb, which is why this rail answers "did it land" for a
+# squash merge where no sha comparison can.
+_GATE_ANON_API="${FIVE_GATE_ANON_API:-https://api.github.com}"
+
+# _gate_anon_ok — 0 when an unauthenticated GitHub read is even possible here.
+# FIVE_GATE_NO_ANON=1 turns the rail off: harnesses that grade the no-rail
+# refusal need the pre-DIVE-2770 world back, and so does any operator who wants
+# it. It is an opt-OUT, not an opt-in — a fix nobody enables is not a fix.
+_gate_anon_ok() {
+  [[ "${FIVE_GATE_NO_ANON:-0}" == "1" ]] && return 1
+  command -v curl >/dev/null 2>&1 && command -v jq >/dev/null 2>&1
+}
+
+# DIVE-2770: THE ANONYMOUS RAIL HAS A BUDGET, AND IT IS SHARED. Unauthenticated
+# api.github.com is 60 requests/hour PER IP — not per agent, per IP — so the whole
+# fleet on one box draws from one bucket, and the bucket is small enough to empty by
+# hand (measured: exhausted during this ticket's own end-to-end run, with
+# `x-ratelimit-remaining: 0`, and the rail correctly declined rather than guessing).
+# Two consequences are designed for here rather than discovered later:
+#
+#   1. EXHAUSTION MUST NOT WEAR THE PRIVATE-REPO COSTUME. A 403-with-remaining-0 and
+#      a 404 are both "the rail could not answer", and stopping there prints "this
+#      repo is private" for a condition that clears by itself inside an hour. That is
+#      the same defect this whole ticket is about — an unreached question rendered as
+#      an answered one — so the code that cannot tell them apart is the code that has
+#      to. `_gate_anon_why` is where the difference is spent.
+#   2. SPEND LESS. The declared path asks for the SAME PR twice (once for `.state`,
+#      once for `.mergedAt`) and `_gate_pr_shas` asks a third time. Memoising the
+#      response for the life of the process turns three requests into one, which is
+#      the difference between ~10 closes an hour and ~30 for the whole fleet.
+# SUBSHELL, AND WHY THIS IS A FILE. Every gate call site reads `_gate_gh` through a
+# command substitution — `_state=$(_gate_gh ... || echo "")` — so the rail runs in a
+# CHILD shell and any variable it sets dies with that child. Measured here: a shell
+# variable carrying the outcome read back EMPTY at the refusal, and an in-memory
+# response cache never hit once because each call had its own copy. So the outcome
+# crosses the boundary in a file, keyed by the top-level pid (`$$` is the parent's
+# even inside `$( )`, which is exactly the property needed). The sibling
+# `.5dive-gate-gh-err.$$` file next door is the same idiom for the same reason.
+#
+# An in-memory cache is deliberately NOT reinstated on top of this: it would be
+# inert for the same reason, and an optimisation that a test asserts but that never
+# fires is worse than no optimisation. The duplicate reads were removed at the CALL
+# SITE instead (one `pr view` for state AND mergedAt), which spends less on every
+# rail rather than only on this one.
+_GATE_ANON_STATEF="${TMPDIR:-/tmp}/.5dive-anon-outcome.$$"
+
+# _gate_anon_get <secs> <api-path> — ONE bounded, unauthenticated GET.
+# stdout is the body; a NON-ZERO rc means the read did not happen. The outcome is
+# recorded for `_gate_anon_why`: an absent answer is unresolved, never "no"
+# (DIVE-2318, one rail further down), and the three ways it can be absent have three
+# different remedies.
+_gate_anon_get() {
+  local secs="${1:-10}" path="${2#/}" code="" out="" reset="" _b _h
+  [[ "$secs" == "0" ]] && secs=10
+  _b="${TMPDIR:-/tmp}/.5dive-anon.$$.$BASHPID"; _h="${_b}.h"
+  code=$(timeout "${secs}s" curl -sSL -o "$_b" -D "$_h" -w '%{http_code}' \
+          -H 'Accept: application/vnd.github+json' \
+          -H 'X-GitHub-Api-Version: 2022-11-28' \
+          "${_GATE_ANON_API}/${path}" 2>/dev/null) || code=""
+  out=$(cat "$_b" 2>/dev/null || printf '')
+  if [[ "$code" == "403" || "$code" == "429" ]] \
+     && grep -qi '^x-ratelimit-remaining:[[:space:]]*0' "$_h" 2>/dev/null; then
+    reset=$(grep -i '^x-ratelimit-reset:' "$_h" 2>/dev/null | tr -dc '0-9' || printf '')
+    printf 'ratelimit|%s' "$reset" >"$_GATE_ANON_STATEF" 2>/dev/null || true
+  else
+    printf '%s|' "${code:-network}" >"$_GATE_ANON_STATEF" 2>/dev/null || true
+  fi
+  rm -f "$_b" "$_h" 2>/dev/null || true
+  [[ "$code" == 2* ]] || return 1
+  printf '%s' "$out"
+}
+
+# _gate_anon_why — ONE clause naming why the anonymous rail could not answer, for a
+# refusal to paste. Empty when the rail answered or was never tried: a refusal that
+# explains a rail nobody used is noise, and noise is how a reader learns to skip the
+# sentence that matters.
+_gate_anon_why() {
+  local _st="" _code="" _reset=""
+  _st=$(cat "$_GATE_ANON_STATEF" 2>/dev/null || printf '')
+  _code="${_st%%|*}"; _reset="${_st#*|}"
+  case "$_code" in
+    ""|2*)     printf '' ;;
+    ratelimit) local _w=""
+               [[ -n "$_reset" ]] \
+                 && _w=" (it refills at $(date -u -d "@${_reset}" '+%H:%M UTC' 2>/dev/null || printf 'the top of the hour'))"
+               printf 'AND NOTE WHICH FAILURE THIS WAS: the credential-free rail is RATE-LIMITED, not blind — unauthenticated api.github.com allows 60 requests per hour PER IP, and this host shares one IP across every agent on it%s. That is TRANSIENT: re-run `task done` after it refills and the gate should answer without any credential.' "$_w" ;;
+    404)       printf 'AND NOTE WHICH FAILURE THIS WAS: the credential-free rail got a 404, which for an unauthenticated read means the repo is PRIVATE (or the ref is gone). There is no anonymous read of it at all, so waiting will not clear this one.' ;;
+    network)   printf 'AND NOTE WHICH FAILURE THIS WAS: the credential-free rail could not reach github.com at all — network or timeout, so retry is worth one attempt.' ;;
+    *)         printf 'AND NOTE WHICH FAILURE THIS WAS: the credential-free rail was refused with HTTP %s.' "$_code" ;;
+  esac
+}
+
+# The REST->gh reshape. Only the fields the gate actually asks for, so a shape it
+# has never requested cannot be silently invented. `statusCheckRollup` is injected
+# by the caller as $roll because it is a SECOND request — leaving the key absent
+# would let the rollup filter render NONE ("no checks reported") for a question
+# nobody asked, which is the succeeding-in-appearance shape DIVE-1935 is about.
+readonly _GATE_ANON_PR_SHAPE='{
+  state: (if (.merged // false) then "MERGED"
+          elif ((.state // "") == "open") then "OPEN"
+          else "CLOSED" end),
+  mergedAt: .merged_at,
+  title: (.title // ""),
+  headRefName: (.head.ref // ""),
+  headRefOid: (.head.sha // ""),
+  mergeCommit: (if ((.merge_commit_sha // "") == "") then null
+                else {oid: .merge_commit_sha} end),
+  number: (.number // 0),
+  url: (.html_url // "")
+}'
+
+# _gate_anon_rollup <secs> <slug> <sha> — the check state of one commit, as a
+# gh-shaped statusCheckRollup array. Two GETs because GitHub keeps check-runs
+# (Actions) and commit statuses (legacy/external) in different places and gh
+# merges them; asking only one would report OK for a repo whose reds live in the
+# other. Conclusions are upcased because the rollup filter matches "FAILURE",
+# and REST spells it "failure".
+_gate_anon_rollup() {
+  local secs="${1:-10}" slug="$2" sha="$3" cr="" st=""
+  [[ -n "$sha" ]] || { printf '[]'; return 1; }
+  cr=$(_gate_anon_get "$secs" "repos/${slug}/commits/${sha}/check-runs" \
+        | jq -c '[ (.check_runs // [])[]
+                   | {name: (.name // ""),
+                      conclusion: ((.conclusion // "") | ascii_upcase),
+                      completedAt: (.completed_at // .started_at // "")} ]' 2>/dev/null) || cr=""
+  st=$(_gate_anon_get "$secs" "repos/${slug}/commits/${sha}/status" \
+        | jq -c '[ (.statuses // [])[]
+                   | {context: (.context // ""),
+                      state: ((.state // "") | ascii_upcase),
+                      createdAt: (.created_at // "")} ]' 2>/dev/null) || st=""
+  # Both unreachable is UNRESOLVED, not "no checks" — say so with the rc.
+  if [[ -z "$cr" && -z "$st" ]]; then printf '[]'; return 1; fi
+  jq -cn --argjson a "${cr:-[]}" --argjson b "${st:-[]}" '$a + $b' 2>/dev/null || { printf '[]'; return 1; }
+}
+
+# _gate_anon_gh <secs> <gh args...> — serve a READ-ONLY gh call over the anon rail.
+#
+# rc 0 with output = ANSWERED. rc 1 = this rail could not answer, for any reason:
+# an unsupported query shape, a private repo, a network failure, OR a listing that
+# matched nothing. That last one is deliberate and is the whole discipline of this
+# function: the anon rail cannot see a fork-headed PR and does not paginate a long
+# closed-PR list, so an empty listing here is a question that was not REACHED, and
+# rendering it as "not merged" would reintroduce DIVE-2318 on a new rail. Only a
+# POSITIVE finding is allowed to travel.
+#
+# Shapes served, and the omission is deliberate: `pr view` and `pr list --head
+# --state merged` are the two ways the fail-CLOSED gate asks "did this land", and
+# `api` passes through because those call sites are written against REST already.
+# `pr list --state open` — the fail-OPEN auto-detect scan — is NOT served: it is a
+# 200-row listing whose emptiness the scan reads as coverage, and an anon rail
+# that pages differently would convert "I did not see it" into "there is none".
+# That scan keeps reporting UNVERIFIED for a credential-less caller, exactly as
+# it does today.
+_gate_anon_gh() {
+  local secs="${1:-10}"; shift
+  _gate_anon_ok || return 1
+  local -a a=("$@") pos=()
+  local expr='.' repo="" json="" head="" pstate="" i=0
+  while [[ $i -lt ${#a[@]} ]]; do
+    case "${a[$i]}" in
+      -q|--jq)  expr="${a[$((i+1))]:-.}";  i=$((i+2)) ;;
+      -q*)      expr="${a[$i]#-q}";        i=$((i+1)) ;;
+      --repo)   repo="${a[$((i+1))]:-}";   i=$((i+2)) ;;
+      --json)   json="${a[$((i+1))]:-}";   i=$((i+2)) ;;
+      --head)   head="${a[$((i+1))]:-}";   i=$((i+2)) ;;
+      --state)  pstate="${a[$((i+1))]:-}"; i=$((i+2)) ;;
+      --limit)  i=$((i+2)) ;;
+      -*)       i=$((i+1)) ;;
+      *)        pos+=("${a[$i]}");         i=$((i+1)) ;;
+    esac
+  done
+  local _body="" _out="" _slug="" _num="" _roll="null" _sha=""
+  case "${pos[0]:-}" in
+    api)
+      # REST in, REST out — these call sites already speak this schema.
+      [[ -n "${pos[1]:-}" ]] || return 1
+      _body=$(_gate_anon_get "$secs" "${pos[1]}") || return 1
+      ;;
+    pr)
+      case "${pos[1]:-}" in
+        view)
+          local _ref="${pos[2]:-}"
+          if [[ "$_ref" =~ ^https?://[^/]+/([^/]+)/([^/]+)/pull/([0-9]+) ]]; then
+            _slug="${BASH_REMATCH[1]}/${BASH_REMATCH[2]}"; _num="${BASH_REMATCH[3]}"
+          elif [[ "$_ref" =~ ^[0-9]+$ && -n "$repo" ]]; then
+            _slug="$repo"; _num="$_ref"
+          else
+            return 1
+          fi
+          _body=$(_gate_anon_get "$secs" "repos/${_slug}/pulls/${_num}") || return 1
+          ;;
+        list)
+          # Only the fail-CLOSED "did this branch land" listing. See the header.
+          [[ -n "$repo" && -n "$head" && "$pstate" == "merged" ]] || return 1
+          _slug="$repo"
+          _body=$(_gate_anon_get "$secs" \
+                    "repos/${_slug}/pulls?state=closed&per_page=100&head=${_slug%%/*}:${head}") || return 1
+          _body=$(printf '%s' "$_body" | jq -c '[ .[] | select((.merged_at // null) != null) ]' 2>/dev/null) || return 1
+          # Nothing matched is NOT REACHED, never "not merged" (see the header).
+          [[ -n "$_body" && "$_body" != "[]" ]] || return 1
+          ;;
+        *) return 1 ;;
+      esac
+      ;;
+    *) return 1 ;;
+  esac
+  [[ -n "$_body" ]] || return 1
+  if [[ "${pos[0]:-}" == "api" ]]; then
+    _out=$(printf '%s' "$_body" | jq -r "($expr)" 2>/dev/null) || return 1
+    [[ -n "$_out" ]] || return 1
+    printf '%s' "$_out"
+    return 0
+  fi
+  # A rollup is fetched only when the caller ASKED for one, and a rollup that
+  # could not be read declines the whole call rather than answering "no checks".
+  if [[ ",${json}," == *,statusCheckRollup,* ]]; then
+    _sha=$(printf '%s' "$_body" | jq -r 'if type == "array" then (.[0].head.sha // "") else (.head.sha // "") end' 2>/dev/null) || _sha=""
+    _roll=$(_gate_anon_rollup "$secs" "$_slug" "$_sha") || return 1
+  fi
+  if [[ "${pos[1]:-}" == "list" ]]; then
+    _out=$(printf '%s' "$_body" \
+            | jq -r --argjson roll "$_roll" \
+                "[ .[] | ${_GATE_ANON_PR_SHAPE} + {statusCheckRollup: \$roll} ] | ($expr)" 2>/dev/null) || return 1
+  else
+    _out=$(printf '%s' "$_body" \
+            | jq -r --argjson roll "$_roll" \
+                "${_GATE_ANON_PR_SHAPE} + {statusCheckRollup: \$roll} | ($expr)" 2>/dev/null) || return 1
+  fi
+  [[ -n "$_out" ]] || return 1
+  printf '%s' "$_out"
 }
 
 # _gate_gh <tok> <secs> <gh args...> — run ONE read-only gh call by whichever rail
@@ -1801,7 +2103,18 @@ _gate_gh() {
     # to run it with. Returning 0 here made an unusable bot rail count as a
     # completed scan, which is the same laundering as a failed listing.
     if ! _gate_gh_bot_ok; then
-      _GATE_GH_LAST_ERR="no gh rail: no token, and the gate bot is not usable here"
+      # DIVE-2770: LAST rail, and only reached when the caller holds nothing.
+      # An unauthenticated read of a public repo answers "did this land" without
+      # any grant at all; on a private repo it declines and we fall through to
+      # the same no-rail state as before.
+      local _anon_out=""
+      if _anon_out=$(_gate_anon_gh "$secs" "$@"); then
+        _GATE_GH_LAST_ERR=""
+        rm -f "$_errf" 2>/dev/null || true
+        printf '%s' "$_anon_out"
+        return 0
+      fi
+      _GATE_GH_LAST_ERR="no gh rail: no token, the gate bot is not usable here, and the anonymous rail could not answer (private repo, or a query it does not serve)"
       rm -f "$_errf" 2>/dev/null || true
       printf ''
       return 1
@@ -3348,7 +3661,7 @@ _task_status_cmd() {
       # fires only when BOTH rails are gone, which for a builder means the `_gh_do`
       # grant is missing — a provisioning fault with a name, not a standing condition.
       if ! _gate_gh_reachable "$_ghtok"; then
-        policy_refuse "$E_CONFLICT" done-merge-gate-no-credential DIVE-2318 "$ident" "$ident cannot close: the merge gate COULD NOT CHECK whether ${_dref:-branch '$_branch'} landed — no gh credential resolved in this caller's environment AND the machine-account rail is unreachable, so no query ran at all. This says NOTHING about the merge; do not read it as 'not merged'. Resolution order is GH_TOKEN/GITHUB_TOKEN in env, then \`gh auth token\` for the sudo invoker, then your own, then \`sudo -n -u claude gh auth token\` (needs sudoers scope most agents do not have), and finally the root-only \`_gh_do\` rail as 5dive-bot (DIVE-2605), which needs the NOPASSWD grant a builder gets from \`agent create --can-push\`. Check that grant with \`5dive gh whoami\`; if the bot line is UNRESOLVED that is the thing to fix. Otherwise re-run with a token (\`GH_TOKEN=\$(sudo -u claude gh auth token) 5dive task done $ident ...\`) or hand the close to an agent that holds one (agent-main). Verify with \`5dive task merge-audit --limit=1\`, which reports the same missing credential."
+        _gate_refuse_no_rail "$ident" "${_dref:-branch '$_branch'}"
       fi
       if [[ -n "$_dref" ]]; then
         # DIVE-1955: a delivery_ref that is a full pull URL carries its own repo and
@@ -3367,6 +3680,16 @@ _task_status_cmd() {
           warn "$ident: bare delivery_ref resolved to $_dref by ident evidence (DIVE-1955) — bind the full URL next time."
         fi
         local _state _merged
+        # DIVE-2770 considered joining these two reads into one (they ask for the
+        # SAME PR, and the credential-free rail draws on a 60-request hourly budget
+        # shared by the whole host). It is REVERTED on purpose: five sibling
+        # harnesses stub `gh` by dispatching on the exact `-q` filter string, so
+        # changing the filter silently returns nothing and reads as a merge-gate
+        # failure in files that have nothing to do with this rail. Saving two
+        # requests is not worth editing five fixtures, each edit being a chance to
+        # weaken a guard. The cost is instead made VISIBLE and asserted —
+        # tests/task_merge_gate_anon_rail_unit.sh T9 pins how many requests one
+        # graded close spends, so a future change that multiplies it is caught.
         _state=$(_gate_gh "$_ghtok" 0 pr view "$_dref" --json state,mergedAt -q '.state' 2>/dev/null || echo "")
         _merged=$(_gate_gh "$_ghtok" 0 pr view "$_dref" --json state,mergedAt -q '.mergedAt' 2>/dev/null || echo "")
         # DIVE-2720: NORMALISE the literal 'null' to empty, at CAPTURE, so every
@@ -3390,6 +3713,15 @@ _task_status_cmd() {
         # nobody measured. Own slug, because a refusal record that cannot answer WHICH
         # of the two happened is the same defect one level down.
         if [[ -z "$_state" ]]; then
+          # DIVE-2770: WHICH unresolved is this? A caller that holds a rail got an
+          # empty answer from it; a caller that holds nothing never had one to get an
+          # empty answer from — the anonymous rail simply cannot see a private repo.
+          # Printing "a gh credential resolved" at a seat that has never held one is
+          # DIVE-2318's own defect one refusal further down, so route by what the
+          # caller actually holds rather than by what it could reach.
+          if ! _gate_gh_credentialed "$_ghtok"; then
+            _gate_refuse_no_rail "$ident" "$_dref"
+          fi
           policy_refuse "$E_CONFLICT" done-pr-state-unresolved DIVE-2318 "$ident" "$ident cannot close: the merge gate COULD NOT READ the state of $_dref — a gh credential resolved, but the query returned nothing. This is NOT a finding that the PR is unmerged; it was never answered. Likely: the PR/repo is not visible to this token, the ref is wrong or deleted, or gh/the network failed. Check by hand (\`gh pr view $_dref --json state,mergedAt\`); if it IS merged, re-run \`task done\` from an environment whose token can see it. Use \`task cancel\` to abandon."
         fi
         if [[ "$_state" != "MERGED" || -z "$_merged" || "$_merged" == "null" ]]; then
@@ -3764,6 +4096,23 @@ _task_status_cmd() {
       # reporting real failures, that proxy made a partial bot-rail scan announce
       # itself as "no-gh-token": wrong, and the more reassuring of the two.
       [[ $_sc_total -gt 0 && $_sc_ok -lt $_sc_total ]] && _scan_why="partial-repo-scan-${_sc_ok}-of-${_sc_total}"
+      # DIVE-2770: the anonymous rail makes _gate_gh_reachable true for a caller
+      # who holds nothing, so this loop is now ENTERED where it used to be skipped
+      # — and every repo declines, because the anon rail deliberately does not
+      # serve the open-PR listing (see _gate_anon_gh). "partial-repo-scan-0-of-3"
+      # would then name a coverage problem where there is a credential one: zero
+      # answers with no token and no bot is not partial coverage, it is no rail for
+      # THIS query.
+      #
+      # NOTE THE `_sc_total -gt 0`, which is the whole care in this line. Without it
+      # this also relabels the case where the loop was never ENTERED at all — the
+      # pre-2770 no-rail state, which three sibling harnesses assert as
+      # `no-gh-token` and which this ticket did not change. A new label belongs only
+      # on the new situation; widening it to an old one is churn wearing a fix's
+      # clothes.
+      if [[ $_sc_total -gt 0 && $_sc_ok -eq 0 && -z "$_ghtok2" ]] && ! _gate_gh_bot_ok; then
+        _scan_why="no-gh-rail-for-listing"
+      fi
       warn "$ident: merge-gate could not query GitHub ($_scan_why) — this close is UNVERIFIED, not verified-clean (DIVE-1935)."
       _task_store_audit_log "task.merge-gate-unverified" ok 0 -- "$ident" "reason=$_scan_why"
       _mg_unverified="${_mg_unverified:+$_mg_unverified; }repo scan did not complete ($_scan_why)"
