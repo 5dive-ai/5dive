@@ -1447,6 +1447,79 @@ if [[ "$TYPE" == "claude" && -n "${WORKDIR:-}" ]]; then
   unset _wtr_cfg _wtr_dir _wtr_root _wtr_base _wtr_next _wtr_tmp 2>/dev/null || :
 fi
 
+# DIVE-1591: pre-answer Claude Code's custom-API-key gate.
+#
+# A non-empty ANTHROPIC_API_KEY — every BYO-provider auth profile carries one,
+# and so does any profile set up by pasting a key — arms a first-boot prompt
+# that a normally-OAuth'd claude agent NEVER sees:
+#
+#     Detected a custom API key in your environment
+#     ANTHROPIC_API_KEY: sk-ant-...<tail>
+#         1. Yes
+#       > 2. No (recommended)          <-- default selection
+#
+# Nothing in 5dive answers it, so the session parks on that pane forever and
+# the agent is BORN ASLEEP: it never reaches a live session unattended, no
+# matter how correct its create-time wiring is. That is the whole of DIVE-1591
+# ("dashboard chat broken on claude agents with the openrouter provider,
+# --channels ignored"): the flag was always fine — AGENT_CHANNELS lands in the
+# registry and reaches the claude argv — but the channel plugin's connect races
+# the stalled window, fails, and is cached in ~/.claude/mcp-needs-auth-cache.json,
+# which Claude Code never retries (the DIVE-841 gotcha). Deleting that cache
+# does not help; the next boot re-writes it from the same stall.
+#
+# Answer it the way the interactive toggle does. Measured in the 2.1.222 bundle
+# on this host: the key is normalised by `e.trim().slice(-20)` and membership in
+# `.customApiKeyResponses.approved` gates BOTH the prompt AND the credential
+# lookup (`if (t && config.customApiKeyResponses?.approved?.includes(Jne(t)))
+# return {key:t, source:"ANTHROPIC_API_KEY"}`) — so seeding it is what makes the
+# key usable at all, not merely what silences a dialog.
+#
+# Runs on EVERY boot rather than once at create:
+#   - the tail is key-specific, so a rotated profile key re-approves itself
+#     instead of silently re-arming the prompt on the next restart;
+#   - it back-fills agents that were created before this fix without a recreate.
+# The .rejected removal is not belt-and-braces: the prompt's default selection
+# is "No (recommended)", so a single stray Enter into that pane (heartbeat
+# injector, poller wake, a trust-accepter aimed at a different dialog) pins the
+# agent off permanently — the first DIVE-1591 probe ended up with the same key
+# in BOTH lists. Best-effort throughout: a malformed or unwritable config must
+# never keep the agent from launching.
+if [[ "$TYPE" == "claude" && -n "${ANTHROPIC_API_KEY:-}" ]]; then
+  _cak_cfg="$HOME/.claude.json"
+  _cak_base='{}'
+  if [[ -r "$_cak_cfg" ]] && jq -e 'type == "object"' "$_cak_cfg" >/dev/null 2>&1; then
+    _cak_base=$(cat "$_cak_cfg")
+  elif [[ -e "$_cak_cfg" ]]; then
+    echo "[5dive] agent=${NAME} WARN: ${_cak_cfg} unreadable or not a JSON object — seeding a fresh one" >&2
+  fi
+  # `.[-20:]` on a shorter string yields the whole string, matching slice(-20).
+  _cak_next=$(jq -c --arg k "${ANTHROPIC_API_KEY}" '
+      ($k | sub("^[[:space:]]+"; "") | sub("[[:space:]]+$"; "") | .[-20:]) as $tail
+      | .customApiKeyResponses = {
+          approved: ((((.customApiKeyResponses.approved // []) | map(select(. != $tail))) + [$tail])),
+          rejected: ((.customApiKeyResponses.rejected // []) | map(select(. != $tail)))
+        }
+    ' <<<"$_cak_base" 2>/dev/null) || _cak_next=""
+  if [[ -n "$_cak_next" ]]; then
+    if _cak_tmp=$(mktemp "${_cak_cfg}.XXXXXX" 2>/dev/null); then
+      if printf '%s\n' "$_cak_next" > "$_cak_tmp" 2>/dev/null \
+         && chmod 600 "$_cak_tmp" 2>/dev/null \
+         && mv "$_cak_tmp" "$_cak_cfg" 2>/dev/null; then
+        :
+      else
+        rm -f "$_cak_tmp" 2>/dev/null || :
+        echo "[5dive] agent=${NAME} WARN: could not write ${_cak_cfg} — custom-API-key prompt may stall this session" >&2
+      fi
+    else
+      echo "[5dive] agent=${NAME} WARN: could not stage a temp file next to ${_cak_cfg} — custom-API-key prompt may stall this session" >&2
+    fi
+  else
+    echo "[5dive] agent=${NAME} WARN: could not build the custom-API-key approval — prompt may stall this session" >&2
+  fi
+  unset _cak_cfg _cak_base _cak_next _cak_tmp 2>/dev/null || :
+fi
+
 CMD_STR=$(printf '%q ' "$BIN" "${ARGS[@]}")
 
 # Headless first-boot for openclaw with no channel. The old prelude ran the
