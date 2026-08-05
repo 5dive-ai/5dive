@@ -985,3 +985,5 @@ require_loaded() {
     fail "$E_GENERIC" "${ctx}: required predicate '${fn}' is not loaded (src/lib/broker.sh missing from this build) — refusing rather than proceeding unchecked."
   done
 }
+
+# DIVE-2789 trigger probe: this comment is the entire diff. Throwaway branch.
