@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# TIER: pr
+# TIER: core
 # DIVE-2449 connection proof. Disconnect the production advisory with a
 # syntax-valid source mutation, then prove only the warning arm goes red while
 # the prose/--parent/nonexistent-ident controls remain green.

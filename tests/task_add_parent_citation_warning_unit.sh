@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# TIER: pr
+# TIER: core
 # DIVE-2449 regression harness. A numbered follow-up coordinate in a title is
 # not a parent edge. `task add` must warn when --parent is absent, name an open
 # row carrying the same coordinate, and stay quiet for prose-only mentions and
