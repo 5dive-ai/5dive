@@ -23,7 +23,10 @@ OUT="${BUILD_OUT:-5dive}"
 
 # DIVE-2603: FIVE_VERSION is assigned only when a release tag is cut, so a
 # working-tree bundle permanently says 0.0.0-dev. Carry the source identity as
-# a separate fact that remains meaningful both before and after tag time.
+# a separate fact that remains meaningful both before and after tag time. A
+# dirty tree is deliberately stamped <sha>-dirty: the artifact contains bytes
+# HEAD does not, so install.sh must reject the stamp as ancestry evidence and
+# fall back to the version path instead of trusting a false identity.
 BUILD_SHA="$(git rev-parse --verify 'HEAD^{commit}' 2>/dev/null)" || {
   echo "error: cannot resolve the source commit for $OUT" >&2
   exit 1
@@ -31,6 +34,9 @@ BUILD_SHA="$(git rev-parse --verify 'HEAD^{commit}' 2>/dev/null)" || {
 if [[ ! "$BUILD_SHA" =~ ^[0-9a-f]{40}$ ]]; then
   echo "error: source commit is not a full git sha: $BUILD_SHA" >&2
   exit 1
+fi
+if [[ -n "$(git status --porcelain --untracked-files=normal 2>/dev/null)" ]]; then
+  BUILD_SHA="${BUILD_SHA}-dirty"
 fi
 
 # DIVE-2681: BUILD_OUT may name the bundle ANYTHING, and .gitignore only knows

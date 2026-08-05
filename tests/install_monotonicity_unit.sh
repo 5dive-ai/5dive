@@ -107,6 +107,17 @@ else
   bad_t "current main was mistaken for a downgrade" "rc=$rc out: ${out//$'\n'/ | }"
 fi
 
+# The highest-consequence fallback: GitHub ancestry is unavailable (offline or
+# rate-limited), the installed release is real, and the candidate carries the
+# tag-time sentinel. release_version() is the only line preventing the original
+# false DOWNGRADE refusal here, so this case must reach and grade it directly.
+out="$(run_guard 0.18.0 0.0.0-dev 0 '' '' "$NEW_SHA" '' "$OLD_SHA")"; rc=$?
+if (( rc == 0 )) && [[ "$out" == *"__DIRECTION=unchecked __INSTALLED_SHA=$OLD_SHA __CANDIDATE_SHA=$NEW_SHA"* && "$out" == *"release versions not comparable"* && "$out" != *"refusing to DOWNGRADE"* ]]; then
+  ok_t "ancestry unavailable + sentinel candidate PROCEEDS through the version fallback"
+else
+  bad_t "sentinel fallback recreated the false downgrade" "rc=$rc out: ${out//$'\n'/ | }"
+fi
+
 # A candidate whose stamped build is an ancestor of the installed build is the
 # real rollback. The refusal names identities, not misleading version numbers.
 out="$(run_guard 0.0.0-dev 0.0.0-dev 0 '' "$NEW_SHA" "$OLD_SHA" behind)"; rc=$?
@@ -228,16 +239,42 @@ fi
 build_out="$TD/built-5dive"
 build_log="$(BUILD_OUT="$build_out" ./build.sh 2>&1)"; rc=$?
 expected_sha="$(git rev-parse HEAD)"
+expected_identity="$expected_sha"
+[[ -z "$(git status --porcelain --untracked-files=normal)" ]] || expected_identity="${expected_sha}-dirty"
 stamped_sha="$(grep -m1 '^readonly FIVE_BUILD_SHA=' "$build_out" 2>/dev/null | cut -d'"' -f2)"
-if (( rc == 0 )) && [[ "$stamped_sha" == "$expected_sha" && "$build_log" == *"at ${expected_sha:0:12}"* ]]; then
-  ok_t "build.sh stamps the generated bundle with its full source sha"
+if (( rc == 0 )) && [[ "$stamped_sha" == "$expected_identity" && "$build_log" == *"at ${expected_sha:0:12}"* ]]; then
+  ok_t "build.sh stamps the generated bundle with its honest source identity"
 else
-  bad_t "bundle build identity is missing or wrong" "rc=$rc expected=$expected_sha stamped=${stamped_sha:-missing} log=$build_log"
+  bad_t "bundle build identity is missing or wrong" "rc=$rc expected=$expected_identity stamped=${stamped_sha:-missing} log=$build_log"
 fi
 if grep -qx 'readonly FIVE_BUILD_SHA="unbuilt"' src/header.sh && ! grep -q 'FIVE_BUILD_SHA="unbuilt"' "$build_out"; then
   ok_t "split source sentinel cannot masquerade as a built artifact identity"
 else
   bad_t "build/source identity sentinel contract drifted" ""
+fi
+
+# A dirty checkout must not claim its clean HEAD. Clone the committed fixture,
+# copy in this harness's build.sh (so an uncommitted maker run grades the new
+# code too), dirty a bundle input, and inspect the artifact it really produces.
+dirty_repo="$TD/dirty-repo"
+git clone -q "$ROOT" "$dirty_repo"
+cp "$ROOT/build.sh" "$dirty_repo/build.sh"
+printf '\n# dirty fixture\n' >> "$dirty_repo/src/header.sh"
+dirty_head="$(git -C "$dirty_repo" rev-parse HEAD)"
+dirty_out="$TD/dirty-5dive"
+dirty_log="$(cd "$dirty_repo" && BUILD_OUT="$dirty_out" ./build.sh 2>&1)"; rc=$?
+dirty_stamp="$(grep -m1 '^readonly FIVE_BUILD_SHA=' "$dirty_out" 2>/dev/null | cut -d'"' -f2)"
+if (( rc == 0 )) && [[ "$dirty_stamp" == "${dirty_head}-dirty" ]]; then
+  ok_t "dirty tree is stamped sha-dirty instead of claiming clean HEAD"
+else
+  bad_t "dirty tree claimed a clean build identity" "rc=$rc head=$dirty_head stamp=${dirty_stamp:-missing} log=$dirty_log"
+fi
+
+out="$(run_guard 0.18.0 0.18.1 0 '' '' "${NEW_SHA}-dirty")"; rc=$?
+if (( rc == 0 )) && [[ "$out" == *"__DIRECTION=forward __INSTALLED_SHA= __CANDIDATE_SHA="* && "$out" != *"refusing to DOWNGRADE"* ]]; then
+  ok_t "install guard rejects a sha-dirty stamp and uses the safe fallback"
+else
+  bad_t "install guard trusted a dirty build identity" "rc=$rc out: ${out//$'\n'/ | }"
 fi
 
 # --- wiring -----------------------------------------------------------------

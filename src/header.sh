@@ -37,9 +37,10 @@ esac
 readonly FIVE_VERSION="0.0.0-dev"
 
 # Build identity, not a release number. build.sh replaces this sentinel only in
-# the generated bundle with the 40-hex commit whose source it concatenated.
-# Keeping the source sentinel non-hex makes an unbuilt split tree impossible to
-# mistake for an artifact whose ancestry install.sh can verify (DIVE-2603).
+# the generated bundle with the 40-hex commit whose clean source it concatenated
+# (or <sha>-dirty when the bytes do not equal HEAD). Both sentinels are non-hex,
+# so neither an unbuilt nor a dirty artifact can masquerade as identity whose
+# ancestry install.sh can verify (DIVE-2603).
 readonly FIVE_BUILD_SHA="unbuilt"
 
 # GitHub org our repos live under. The org is being renamed
