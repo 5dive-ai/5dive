@@ -239,8 +239,20 @@ M5="${BLOCK// \&\& \"\$_wtr_dir\" != \"\$_wtr_root\"\/\*/}"
 mut_red "equality-only skip (ignores the bundle's parent walk)" "$M5" eqonly "$ROOT/5dive" "$(preseed)" \
   '.projects | length' "1"
 
+# M6 — THE NAMED MUTATION from the ticket, transplanted. The create-path patch
+# (thread $workdir through to preseed_claude_agent at cmd_agent_create.sh:1752)
+# resolves the workdir BEFORE :1885 sets the sandboxed default, so it seeds with
+# an EMPTY string for exactly the sandboxed case: it looks like a fix, changes no
+# behaviour, and stays green under any harness that passes an explicit --workdir.
+# Here that is the same block reading a workdir that is unset for this arm. It
+# must go RED on the SANDBOXED arm — which is the whole reason the seed lives at
+# boot, where WORKDIR is already resolved, rather than on the create path.
+M6="${BLOCK//WORKDIR/_WD_RESOLVED_TOO_EARLY}"
+mut_red "workdir resolved too early (the create-path patch: empty for sandboxed)" "$M6" tooearly "$SANDBOX" "$(preseed)" \
+  ".projects[\"$SANDBOX\"].hasTrustDialogAccepted" "true"
+
 # Every mutant must actually differ from the block, or mut_red graded a typo.
-for m in M2 M3 M4 M5; do
+for m in M2 M3 M4 M5 M6; do
   check "mutant $m really differs from the shipped block" \
     "$([[ "${!m}" != "$BLOCK" ]] && echo differs || echo identical)" "differs"
 done
