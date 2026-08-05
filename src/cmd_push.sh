@@ -118,8 +118,20 @@ _push_repo_from_worktree() {
 _push_fetch_why() {
   local err="$1"
   case "$err" in
-    *"could not read Username"*|*"Authentication failed"*|*"terminal prompts disabled"*)
-      printf 'no git credential is available to this user for that repo' ;;
+    # DIVE-2566: these three used to share ONE string — 'no git credential is
+    # available to this user for that repo'. They are different faults and the
+    # collapsed wording sent a builder after the wrong one: on DIVE-1560 it read
+    # as a missing sudo grant for an hour, when the real cause was a GitHub App
+    # with no installation on the target account. A cause list is not a cause.
+    #
+    # ASKED-AND-COULD-NOT-ASK: git wanted to PROMPT, and prompting is disabled.
+    # Nothing was presented, so nothing was rejected.
+    *"could not read Username"*|*"terminal prompts disabled"*)
+      printf 'this user has no git credential helper for that repo, so git fell back to prompting and prompts are disabled here' ;;
+    # PRESENTED-AND-REJECTED: a credential existed and the remote turned it down.
+    # The opposite diagnosis from the arm above, and the fix is different too.
+    *"Authentication failed"*)
+      printf 'a git credential WAS presented and the remote REJECTED it — this is a wrong/expired credential, not a missing one' ;;
     *FETCH_HEAD*|*"Permission denied"*|*"unable to create"*|*"Unable to create"*|*"cannot open"*)
       printf "this user cannot write .git/ in that work tree — a root-owned FETCH_HEAD left by an earlier root-run fetch is the known cause; 'sudo chgrp -R claude <repo>/.git && sudo chmod -R g+w <repo>/.git' clears it" ;;
     *"Could not resolve host"*|*"Connection timed out"*|*"unable to access"*)
@@ -772,7 +784,34 @@ cmd_push_do() {
   if [[ -z "$tok" ]]; then
     local _why; _why=$(printf '%s' "$_tokresp" | jq -r '.message // empty' 2>/dev/null)
     [[ -n "$_why" ]] || _why="$(printf '%s' "$_tokresp" | head -c 300)"
-    fail "$E_GENERIC" "installation token exchange failed for ${slug} against installation ${inst}: ${_why:-no response body} — if that names an inaccessible repository, the App is not installed on '$(printf '%s' "$slug" | cut -d/ -f1)'."
+    local _owner; _owner="${slug%%/*}"
+    # DIVE-2566: NOT $E_GENERIC, and not a number from someone else's namespace.
+    # The original symptom of this whole row was an operator seeing rc=22 — curl's
+    # exit for HTTP>=400 — which is not a 5dive code at all (error_codes.sh tops out
+    # at E_PERMISSION=10), so the number carried no meaning and the message named
+    # four possible causes at once. E_AUTH_REQUIRED is the honest class: the App
+    # cannot authenticate FOR THIS REPO. It is deliberately distinct from
+    # E_PERMISSION (which means "must run as root" here) and from the git-credential
+    # faults _push_fetch_why now separates.
+    #
+    # No NEW code was added to the ladder on purpose: error_codes.sh says "keep
+    # err_class_for() in sync if you add a code", so a new code has a reader outside
+    # this file, and this failure genuinely IS an authentication class rather than a
+    # class of its own. Widening a shared ladder for one call site is a bigger blast
+    # radius than the fix needs.
+    #
+    # The no-installation case gets its own SENTENCE because it is the one an
+    # operator cannot act on by retrying, and it is the case that actually happens:
+    # the App is installed on the 5dive-ai org, while lodar/5dive-api and
+    # lodar/5dive-frontend live on a personal account. Installing it there is
+    # DIVE-2033, a human-only step. Until then this refusal is CORRECT behaviour and
+    # only has to say why.
+    case "$_why" in
+      *"not installed"*|*"Not Found"*|*"not accessible"*|*"does not exist"*)
+        fail "$E_AUTH_REQUIRED" "the GitHub App has no installation covering ${slug} — it cannot mint a token for a repo it was never installed on, so this push CANNOT succeed and retrying will not help. GitHub said: ${_why}. Install the App on '${_owner}' (DIVE-2033, a human-only account-level step), or relay this push to someone holding credentials for ${slug}. This is NOT a missing sudo grant and NOT a git-credential problem." ;;
+      *)
+        fail "$E_AUTH_REQUIRED" "installation token exchange failed for ${slug} against installation ${inst}. GitHub said: ${_why:-no response body}. If that names an inaccessible repository, the App is not installed on '${_owner}'." ;;
+    esac
   fi
 
   # Push ONLY the named branch, token via extraheader so it never lands in argv
