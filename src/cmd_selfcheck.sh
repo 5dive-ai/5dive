@@ -623,14 +623,14 @@ _sc_probe_bundle_integrity() {
     # and would fail a naive stamp-to-stamp check for a reason that is not the
     # bundle's fault.
     local stamp_rx='^readonly FIVE_BUILD_SHA="[^"]*"$'
-    local n_stamp; n_stamp=$(grep -cE "$stamp_rx" "$root/5dive" 2>/dev/null) || true
+    local n_stamp; n_stamp=$(grep -cE "$stamp_rx" "$root/5dive" 2>/dev/null) || n_stamp=0
     if [[ "$n_stamp" != "1" ]]; then
       bad+=("the tracked bundle carries ${n_stamp:-0} FIVE_BUILD_SHA lines rather than exactly one, so its build identity cannot be read or compared")
     elif ! cmp -s "$tmpb" "$root/5dive"; then
       if diff -q <(grep -vE "$stamp_rx" "$tmpb") <(grep -vE "$stamp_rx" "$root/5dive") >/dev/null 2>&1; then
         # Only the stamp line differs — legitimate on a release commit, a lie anywhere else.
         local _tracked _head _parent
-        _tracked=$(grep -m1 -E "$stamp_rx" "$root/5dive" | sed -E 's/.*="([^"]*)".*/\1/')
+        _tracked=$(grep -m1 -E "$stamp_rx" "$root/5dive" | sed -E 's/.*="([^"]*)".*/\1/') || _tracked=""
         _head=$(git -C "$root" rev-parse --verify 'HEAD^{commit}' 2>/dev/null) || _head=""
         _parent=$(git -C "$root" rev-parse --verify 'HEAD^1^{commit}' 2>/dev/null) || _parent=""
         if [[ -z "$_head" ]]; then
